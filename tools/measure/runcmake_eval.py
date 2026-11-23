@@ -37,6 +37,14 @@ SUITES = (
     "Policy", "get_property", "set_property", "define_property",
     "cmake_host_system_information", "variable_watch", "CMP0219",
 )
+M3_SUITES = (
+    "CPackCommandLine", "discover_tests", "CMakePresetsTest", "CMakePresetsPackage",
+    "CMakePresetsWorkflow", "CTestCommandLine", "CPackConfig", "FileSet-SOURCES",
+    "FileSetProperties", "GoogleTest", "find_package-CPS", "InstallPackageInfo",
+    "ExportPackageInfo", "InstallSbom", "ExportSbom", "CPack", "ctest_test",
+    "ctest_start", "ctest_fixtures", "Instrumentation", "CXXModules",
+)
+SUITE_GROUPS = {"m1m2": SUITES, "m3": M3_SUITES, "all": SUITES + M3_SUITES}
 ALIASES = {
     "macro": ("Syntax", "function", "CMP0219"),
     "unset": ("set", "CommandLine"),
@@ -113,6 +121,22 @@ def run_suite(driver, target, source, build, wrapper, settings, env, timeout):
         "RunCMake_TEST_TIMEOUT": min(timeout, 20),
         "EVAL_TEST_BINARY": target,
     }
+    if source.name in M3_SUITES:
+        if target == driver:
+            ctest = os.environ.get("RCMAKE_ORACLE_CTEST", driver.with_name("ctest"))
+            cpack = os.environ.get("RCMAKE_ORACLE_CPACK", driver.with_name("cpack"))
+        else:
+            ctest, cpack = build / "ctest", build / "cpack"
+            ctest.symlink_to(target)
+            cpack.symlink_to(target)
+        variables.update(
+            EVAL_TEST_CTEST=ctest, EVAL_TEST_CPACK=cpack,
+            IMAGE_DIR=source.parents[2] / "Utilities/Sphinx/static",
+        )
+    if source.name == "CPack":
+        config_file = build / "TGZ_config.cmake"
+        config_file.touch()
+        variables.update(TEST_TYPE="TGZ", config_file=config_file)
     command = [driver, *(f"-D{key}={value}" for key, value in variables.items()), "-P", wrapper]
     code, timed_out, log = run(command, build, env, timeout)
     cases = {}
@@ -185,6 +209,10 @@ def evaluate(suites, driver, candidate, source, timeout):
         wrapper = work / "driver.cmake"
         wrapper.write_text(
             'set(CMAKE_COMMAND "${EVAL_TEST_BINARY}")\n'
+            'if(DEFINED EVAL_TEST_CTEST)\n'
+            '  set(CMAKE_CTEST_COMMAND "${EVAL_TEST_CTEST}")\n'
+            '  set(CMAKE_CPACK_COMMAND "${EVAL_TEST_CPACK}")\n'
+            'endif()\n'
             'include("${RunCMake_SOURCE_DIR}/RunCMakeTest.cmake" NO_POLICY_SCOPE)\n'
             'message(STATUS "runcmake_eval: suite complete")\n', encoding="utf-8",
         )
@@ -247,8 +275,13 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--suite", action="append", metavar="NAME",
-        help="Select a suite by name. Repeat to select more. Use all for every Wave 3 suite.",
+        help="Select a suite by name. Repeat to select more. Use all for the selected group.",
     )
+    parser.add_argument(
+        "--suite-group", choices=SUITE_GROUPS, default="m1m2",
+        help="Select a suite group. The default is m1m2.",
+    )
+    parser.add_argument("--list", action="store_true", help="List the selected upstream suites.")
     parser.add_argument("--json", type=Path, metavar="PATH", help="Write the case report to PATH.")
     parser.add_argument(
         "--timeout", type=float, default=180, metavar="SECONDS",
@@ -265,20 +298,26 @@ def main():
         parser.error("This evaluator requires a POSIX host.")
     try:
         source = Path(os.environ["RCMAKE_ORACLE_RUNCMAKE_DIR"]).resolve()
-        driver = Path(os.environ["RCMAKE_ORACLE_CMAKE"]).absolute()
-        candidate = args.rcmake_bin or Path(os.environ["RCMAKE_ROOT"]) / "target/stage/bin/cmake"
     except KeyError as exc:
         parser.error(f"Source env/env.sh to set {exc.args[0]}.")
     if source.parts[-2:] != ("Tests", "RunCMake") or not (source / "RunCMake.cmake").is_file():
         parser.error("RCMAKE_ORACLE_RUNCMAKE_DIR must select Tests/RunCMake in the CMake source tree.")
-    candidate = candidate.absolute()  # Keep the cmake symlink for multi-call dispatch.
     suites = list(dict.fromkeys(
         suite for name in (args.suite or ["all"])
-        for suite in (SUITES if name == "all" else ALIASES.get(name, (name,)))
+        for suite in (SUITE_GROUPS[args.suite_group] if name == "all" else ALIASES.get(name, (name,)))
     ))
     for suite in suites:
         if suite.startswith(".") or "/" in suite or not (source / suite / "RunCMakeTest.cmake").is_file():
             parser.error(f"Unknown upstream RunCMake suite {suite!r}.")
+    if args.list:
+        print("\n".join(suites))
+        return 0
+    try:
+        driver = Path(os.environ["RCMAKE_ORACLE_CMAKE"]).absolute()
+        candidate = args.rcmake_bin or Path(os.environ["RCMAKE_ROOT"]) / "target/stage/bin/cmake"
+    except KeyError as exc:
+        parser.error(f"Source env/env.sh to set {exc.args[0]}.")
+    candidate = candidate.absolute()  # Keep the cmake symlink for multi-call dispatch.
     try:
         version = subprocess.check_output(
             [driver, "--version"], timeout=args.timeout, text=True,

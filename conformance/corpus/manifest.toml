@@ -156,3 +156,73 @@ enable_testing()
 add_test(NAME query COMMAND sqlite_shell ":memory:" "SELECT 6 * 7;")
 set_tests_properties(query PROPERTIES PASS_REGULAR_EXPRESSION "42")
 '''
+
+[[project]]
+name = "googletest"
+tier = 3
+version = "1.18.0"
+url = "https://codeload.github.com/google/googletest/tar.gz/refs/tags/v1.18.0"
+sha256 = "6e3191c1455468b3fc35a417fb565c1c5071aee1b7e7f85e30cf48a98d37d8b5"
+licence = "BSD-3-Clause"
+configure_args = ["-Dgtest_build_tests=ON"]
+test_enabled = true
+
+[[project]]
+name = "abseil-cpp"
+tier = 3
+version = "20260817.0"
+url = "https://codeload.github.com/abseil/abseil-cpp/tar.gz/refs/tags/20260817.0"
+sha256 = "f7e05179df39c45434cad433f5783840bb3788ef322976f9138bc6b72b3a107d"
+licence = "Apache-2.0"
+configure_args = ["-DCMAKE_CXX_STANDARD=17", "-DBUILD_TESTING=ON", "-DABSL_BUILD_TESTING=ON"]
+fetch_sources = { googletest = { project = "googletest", configure_variable = "ABSL_LOCAL_GOOGLETEST_DIR" } }
+test_enabled = true
+notes = "Abseil uses its local GoogleTest source setting. The evaluator supplies the pinned source directory."
+
+[[project]]
+name = "protobuf"
+tier = 3
+version = "36.2"
+url = "https://github.com/protocolbuffers/protobuf/releases/download/v36.2/protobuf-36.2.tar.gz"
+sha256 = "3d9642a662d10e68ebae5e53f14dcce5105684212d5078f8e0d47d1ab3ae6b64"
+licence = "BSD-3-Clause"
+depends_on = ["abseil-cpp"]
+configure_args = [
+    "-DCMAKE_CXX_STANDARD=17",
+    "-Dprotobuf_LOCAL_DEPENDENCIES_ONLY=ON",
+    "-Dprotobuf_BUILD_TESTS=OFF",
+]
+test_enabled = false
+notes = "Protobuf 36.2 finds the installed Abseil package and uses the UTF-8 library from the release archive."
+
+[[project]]
+name = "curl"
+tier = 3
+version = "8.23.0"
+url = "https://curl.se/download/curl-8.23.0.tar.gz"
+sha256 = "e3de77cfa6367083c776a26647fc9f633b538c06c3baa73d931a252ac8f72b49"
+licence = "curl"
+depends_on = ["zlib"]
+configure_args = [
+    "-DCURL_ZLIB=ON",
+    "-DCURL_ENABLE_SSL=OFF",
+    "-DCURL_USE_LIBPSL=OFF",
+    "-DUSE_LIBIDN2=OFF",
+    "-DUSE_NGHTTP2=OFF",
+    "-DCURL_BROTLI=OFF",
+    "-DCURL_ZSTD=OFF",
+    "-DBUILD_TESTING=OFF",
+]
+test_enabled = false
+notes = "Enable the pinned zlib library and disable optional protocol and compression dependencies."
+
+[[project]]
+name = "glfw"
+tier = 3
+version = "3.4"
+url = "https://codeload.github.com/glfw/glfw/tar.gz/refs/tags/3.4"
+sha256 = "c038d34200234d071fae9345bc455e4a8f2f544ab60150765d7704e08f3dac01"
+licence = "Zlib"
+configure_args = []
+test_enabled = false
+notes = "Build the default Cocoa backend on macOS. GLFW has no headless CTest suite."
