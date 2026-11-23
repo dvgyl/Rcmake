@@ -186,26 +186,6 @@ fn run_with(
         }
         environment = preset.environment;
     }
-    if let Some(flag) = [
-        (opts.quiet, "--quiet"),
-        (
-            matches!(
-                opts.verbosity,
-                Some(TestVerbosity::Verbose | TestVerbosity::Extra)
-            ),
-            "--verbose",
-        ),
-        (opts.show_only.is_some(), "--show-only"),
-        (opts.timeout.is_some(), "--timeout"),
-    ]
-    .into_iter()
-    .find_map(|(enabled, flag)| enabled.then_some(flag))
-    {
-        return error(
-            host.as_ref(),
-            &format!("The CTest runner does not support {flag} yet."),
-        );
-    }
     let env_get = |key: &[u8]| match environment.get(key) {
         Some(value) => value.clone(),
         None => host.env_get(key),
@@ -229,6 +209,14 @@ fn run_with(
         output_on_failure: opts.output_on_failure
             || env_get(b"CTEST_OUTPUT_ON_FAILURE")
                 .is_some_and(|value| rcmake_base::truth::is_on(&value)),
+        verbose: matches!(
+            opts.verbosity,
+            Some(TestVerbosity::Verbose | TestVerbosity::Extra)
+        ),
+        quiet: opts.quiet,
+        show_only: opts.show_only.is_some(),
+        timeout: opts.timeout.map(std::time::Duration::from_secs_f64),
+        ..CtestOptions::default()
     };
     let mut previous = Vec::new();
     for (key, value) in environment {
@@ -302,6 +290,7 @@ mod tests {
                     exclude: Some("override".into()),
                     jobs: 4,
                     output_on_failure: true,
+                    ..CtestOptions::default()
                 }
             );
             assert_eq!(host.env_get(b"PRESET_ENV"), Some("child".into()));

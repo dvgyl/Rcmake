@@ -386,12 +386,18 @@ version = "0.1.0"
 dependencies = [
  "rcmake-base",
  "rcmake-commands",
+ "rcmake-ctest",
  "rcmake-diag",
  "rcmake-eval",
+ "rcmake-gen-common",
+ "rcmake-gen-make",
+ "rcmake-gen-ninja",
+ "rcmake-genex",
  "rcmake-host",
  "rcmake-json",
  "rcmake-model",
  "rcmake-presets",
+ "rcmake-resolve",
  "rcmake-syntax",
  "rcmake-tool-e",
 ]
@@ -424,7 +430,9 @@ dependencies = [
  "rcmake-base",
  "rcmake-diag",
  "rcmake-eval",
+ "rcmake-expr",
  "rcmake-host",
+ "rcmake-regex",
  "thiserror",
 ]
 

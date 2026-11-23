@@ -240,6 +240,21 @@ fn run(
         || build_dir.to_path_buf(),
         |dir| build_dir.join(path::to_native(dir)),
     );
+    if let [e, rm, flag, files @ ..] = args.as_slice()
+        && e.as_slice() == b"-E"
+        && rm.as_slice() == b"rm"
+        && flag.as_slice() == b"-f"
+    {
+        for file in files {
+            let target = cwd.join(path::to_native(file));
+            if let Err(err) = host.remove_file(&target)
+                && err.kind != std::io::ErrorKind::NotFound
+            {
+                return Err(err);
+            }
+        }
+        return Ok(0);
+    }
     let result = host.run(
         &RunRequest {
             pipeline: vec![CommandSpec { program, args }],

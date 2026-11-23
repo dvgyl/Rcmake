@@ -115,7 +115,11 @@ fn write_common(
             )?;
         }
     }
-    match common::fileapi::write_replies(result, host, bin) {
+    let api_result = {
+        let mut cx = interp.cx();
+        common::fileapi::write_replies(cx.project(), result, host, bin)
+    };
+    match api_result {
         Err(GenError::Unimplemented(_)) => Ok(()),
         result => result,
     }

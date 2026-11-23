@@ -1804,6 +1804,10 @@ mod tests {
             b"int main(void) { return 0; }",
         )?;
         host.seed_file(
+            Path::new("/work/sub/missing.c"),
+            b"int main(void) { return 0; }",
+        )?;
+        host.seed_file(
             Path::new("/work/sub/CMakeLists.txt"),
             br#"
 cmake_minimum_required(VERSION 4.5)
