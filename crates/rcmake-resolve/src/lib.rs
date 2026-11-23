@@ -773,7 +773,9 @@ fn resolve_target<'a>(
             source.value = paths.resolve_at(model, dir, &source)?;
         }
         if !inputs.sources.insert(source.value.clone())
-            || unity.is_some_and(|plan| plan.batched.contains(&source.value))
+            || unity
+                .and_then(|plan| plan.file_for_source(&source.value, &ctx.config))
+                .is_some()
         {
             continue;
         }

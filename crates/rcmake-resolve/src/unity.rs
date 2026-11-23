@@ -17,7 +17,21 @@ pub(crate) type UnityPlan = IndexMap<TargetId, TargetUnity>;
 #[derive(Default)]
 pub(crate) struct TargetUnity {
     pub(crate) files: IndexMap<BString, UnityFile>,
-    pub(crate) batched: IndexSet<BString>,
+    batched: IndexMap<BString, BatchedSource>,
+}
+
+struct BatchedSource {
+    file: BString,
+    configs: IndexSet<ConfigId>,
+}
+
+impl TargetUnity {
+    pub(crate) fn file_for_source(&self, source: &BString, config: &ConfigId) -> Option<&BString> {
+        self.batched
+            .get(source)
+            .filter(|source| source.configs.contains(config))
+            .map(|source| &source.file)
+    }
 }
 
 pub(crate) struct UnityFile {
@@ -341,7 +355,13 @@ impl UnityWriter<'_> {
                 let mut config_guard = false;
                 for (source, candidate) in members {
                     config_guard |= self.append_member(&mut content, &path, source, candidate);
-                    plan.batched.insert(source.clone());
+                    plan.batched.insert(
+                        source.clone(),
+                        BatchedSource {
+                            file: path.clone(),
+                            configs: candidate.configs.clone(),
+                        },
+                    );
                 }
                 write_if_changed(self.host, &path, &content)?;
                 let suffix_key = [b"CMAKE_", language, b"_OUTPUT_EXTENSION"].concat();

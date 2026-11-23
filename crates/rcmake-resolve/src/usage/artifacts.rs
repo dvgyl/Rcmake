@@ -433,7 +433,9 @@ impl UsageResolver<'_> {
                     .is_none_or(|filter| filter.contains(source))
             })
             .filter(|(source, explicit_language)| {
-                unity.is_none_or(|plan| !plan.batched.contains(source))
+                unity
+                    .and_then(|plan| plan.file_for_source(source, config))
+                    .is_none()
                     && !external_object(dir, source)
                     && !file_set_headers.contains(source)
                     && !properties(dir, source)

@@ -3,7 +3,7 @@
 use indexmap::{IndexMap, IndexSet};
 use rcmake_base::{BString, list, truth};
 use rcmake_genex::ConfigId;
-use rcmake_model::{DirId, ProjectModel, Target, TargetEvent, TargetId, TargetKind};
+use rcmake_model::{DirId, GeneratorKind, ProjectModel, Target, TargetEvent, TargetId, TargetKind};
 
 use super::artifacts::build_relative;
 use super::compile::compile;
@@ -72,6 +72,15 @@ pub(crate) fn lower_with_inputs(
         );
         let mut steps = IndexSet::new();
         let dir = model.dir(target.dir);
+        let unity = usage
+            .source_paths()
+            .and_then(|paths| paths.unity.as_ref())
+            .and_then(|plan| plan.get(&resolved.id));
+        let mut unity_inputs = IndexMap::<_, IndexSet<_>>::new();
+        let ninja = matches!(
+            model.generator,
+            Some(GeneratorKind::Ninja | GeneratorKind::NinjaMultiConfig)
+        );
         let target_inputs = inputs.get(&resolved.id);
         let paths = if let Some(inputs) = target_inputs {
             Box::new(inputs.sources.iter().cloned()) as Box<dyn Iterator<Item = BString>>
@@ -91,40 +100,53 @@ pub(crate) fn lower_with_inputs(
         };
         for path in paths {
             for base in [&dir.source_dir, &dir.binary_dir] {
-                if let Some(step) = commands.producer(&command_path(model, base, &path)) {
+                let input = command_path(model, base, &path);
+                if let Some(step) = commands.producer(&input) {
                     commands.add_producers([step], &mut steps, &mut dependencies)?;
+                    if ninja
+                        && let Some(file) =
+                            unity.and_then(|plan| plan.file_for_source(&path, config))
+                    {
+                        unity_inputs.entry(file).or_default().insert(input);
+                    }
                 }
             }
         }
 
         let artifacts = artifacts(model, target, resolved);
-        let unity_prerequisite = if !steps.is_empty()
-            && usage
-                .source_paths()
-                .and_then(|paths| paths.unity.as_ref())
-                .and_then(|plan| plan.get(&resolved.id))
-                .is_some_and(|plan| !plan.files.is_empty())
-        {
-            // An included source can be an output of a custom command.
-            let index = target_indices.len() + unity_prerequisites.len();
-            let mut name = BString::from(format!("cmake_object_order_depends_unity_{index}"));
-            while model.find_target(DirId::ROOT, &name).is_some() {
-                name.push(b'_');
-            }
-            unity_prerequisites.push(GraphTarget {
-                name,
-                steps: std::mem::take(&mut steps).into_iter().collect(),
-                depends: dependencies
-                    .iter()
-                    .filter(|id| **id != resolved.id)
-                    .filter_map(|id| target_indices.get(id).copied())
-                    .collect(),
-                in_all: false,
-            });
-            Some(index)
-        } else {
-            None
-        };
+        let unity_prerequisite =
+            if !steps.is_empty() && unity.is_some_and(|plan| !plan.files.is_empty()) {
+                // An included source can be an output of a custom command.
+                let index = target_indices.len() + unity_prerequisites.len();
+                let mut name = BString::from(format!("cmake_object_order_depends_unity_{index}"));
+                while model.find_target(DirId::ROOT, &name).is_some() {
+                    name.push(b'_');
+                }
+                unity_prerequisites.push(GraphTarget {
+                    name,
+                    steps: std::mem::take(&mut steps).into_iter().collect(),
+                    depends: dependencies
+                        .iter()
+                        .filter(|id| **id != resolved.id)
+                        .filter_map(|id| target_indices.get(id).copied())
+                        .collect(),
+                    in_all: false,
+                });
+                Some(index)
+            } else {
+                None
+            };
+        for (file, generated_sources) in unity_inputs {
+            // Connect the unity file to its generated includes without changing its timestamp.
+            steps.insert(push(
+                &mut graph.steps,
+                BuildStep::Custom(CustomStep {
+                    outputs: vec![build_relative(model, file)],
+                    depends: generated_sources.into_iter().collect(),
+                    ..CustomStep::default()
+                }),
+            ));
+        }
         let mut objects = target_inputs
             .into_iter()
             .flat_map(|inputs| inputs.objects.iter().cloned())
