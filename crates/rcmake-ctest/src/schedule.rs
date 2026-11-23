@@ -28,6 +28,14 @@ enum FixtureMode {
 }
 
 impl FixtureMode {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Separate => "EACH_TEST_SEPARATELY",
+            Self::Once => "AROUND_ALL_REPEATS",
+            Self::Together => "AROUND_EACH_REPEAT",
+        }
+    }
+
     fn parse(value: &[u8]) -> Option<Self> {
         match value {
             b"EACH_TEST_SEPARATELY" => Some(Self::Separate),
@@ -41,7 +49,7 @@ impl FixtureMode {
 #[derive(Default)]
 struct Fixture {
     members: Vec<usize>,
-    requested: Option<FixtureMode>,
+    requested: Option<(FixtureMode, usize)>,
     default: Option<FixtureMode>,
 }
 
@@ -84,13 +92,16 @@ impl Repetition {
                 let fixture = fixtures.entry(name.clone()).or_default();
                 fixture.members.push(id);
                 if let Some(mode) = FixtureMode::parse(test.property(b"FIXTURE_REPEAT_MODE"))
-                    && fixture
-                        .requested
-                        .replace(mode)
-                        .is_some_and(|previous| previous != mode)
+                    && let Some((previous, owner)) = fixture.requested.replace((mode, id))
+                    && previous != mode
                 {
+                    let mut requests = [(&test.name, mode), (&plan.tests[owner].name, previous)];
+                    requests.sort_by(|a, b| a.0.cmp(b.0));
+                    let [(first, first_mode), (second, second_mode)] = requests;
                     return Err(CtestError::Schedule(format!(
-                        "The setup and cleanup tests for fixture {name} specify different repeat modes."
+                        "Error: the setup and cleanup tests of fixture \"{name}\" request conflicting FIXTURE_REPEAT_MODE values:\n  \"{first}\" requests {}\n  \"{second}\" requests {}\nAll setup and cleanup tests of a fixture must request the same mode.",
+                        first_mode.name(),
+                        second_mode.name()
                     )));
                 }
                 fixture.default = fixture.default.or_else(|| {
@@ -104,19 +115,21 @@ impl Repetition {
         for (name, fixture) in fixtures {
             let mode = fixture
                 .requested
+                .map(|(mode, _)| mode)
                 .or(fixture.default)
                 .unwrap_or(FixtureMode::Separate);
             let Some(&first) = fixture.members.first() else {
                 continue;
             };
             for id in fixture.members {
-                if modes[id]
-                    .replace(mode)
-                    .is_some_and(|previous| previous != mode)
+                if let Some((previous, fixture)) = modes[id].replace((mode, name.clone()))
+                    && previous != mode
                 {
                     return Err(CtestError::Schedule(format!(
-                        "Test {} uses fixture {name} with a different repeat mode.",
-                        plan.tests[id].name
+                        "Error: test \"{}\" takes part in fixtures with conflicting FIXTURE_REPEAT_MODE values:\n  fixture \"{name}\" uses {}\n  fixture \"{fixture}\" uses {}\nFixtures that share a test must use the same mode.",
+                        plan.tests[id].name,
+                        mode.name(),
+                        previous.name()
                     )));
                 }
                 if mode == FixtureMode::Together {
@@ -129,7 +142,7 @@ impl Repetition {
 
         let mut groups = BTreeMap::<usize, Vec<usize>>::new();
         for (id, mode) in modes.into_iter().enumerate() {
-            match mode {
+            match mode.map(|(mode, _)| mode) {
                 Some(FixtureMode::Together) => {
                     groups.entry(root(&mut connected, id)).or_default().push(id);
                     result.modes[id] = FixtureMode::Together;
@@ -161,6 +174,12 @@ impl Repetition {
             }
         }
         Ok(result)
+    }
+
+    fn numbered_run(&self, id: usize, run: i32) -> Option<(i32, i32)> {
+        self.repeat
+            .filter(|_| self.modes[id] != FixtureMode::Once)
+            .map(|repeat| (run, repeat.count))
     }
 
     fn individual(&self, id: usize) -> Option<TestRepeat> {
@@ -298,7 +317,7 @@ pub(crate) fn stop_deadline(host: &dyn Host, stop_time: Option<u32>) -> Option<D
     )
 }
 
-fn load_budget(host: &dyn Host, limit: u64) -> usize {
+fn system_load(host: &dyn Host) -> u64 {
     let output = if host.system().sysname == "Darwin" {
         host.run(
             &RunRequest {
@@ -328,7 +347,7 @@ fn load_budget(host: &dyn Host, limit: u64) -> usize {
         )
         .ok()
     };
-    let load = output
+    output
         .as_deref()
         .and_then(|bytes| std::str::from_utf8(bytes).ok())
         .and_then(|line| {
@@ -338,8 +357,8 @@ fn load_budget(host: &dyn Host, limit: u64) -> usize {
         })
         .and_then(|value| value.parse::<f64>().ok())
         .filter(|load| load.is_finite() && *load >= 0.0)
-        .unwrap_or_default();
-    usize::try_from(limit.saturating_sub(load.ceil() as u64)).unwrap_or(usize::MAX)
+        .unwrap_or_default()
+        .ceil() as u64
 }
 
 struct Attempt {
@@ -451,8 +470,14 @@ impl<'a> RunState<'a> {
             Status::Skipped => "Test Skipped.",
             Status::NotRun => "Test Not Run.",
         };
+        let reason = result
+            .regex_reason
+            .as_ref()
+            .map_or_else(String::new, |reason| {
+                format!("Test Pass Reason:\n{reason}\n")
+            });
         let footer = format!(
-            "\n<end of output>\nTest time = {:6.2} sec\n{status}\n",
+            "\n<end of output>\nTest time = {:6.2} sec\n{status}\n{reason}",
             result.elapsed.as_secs_f64()
         );
         let limit = Limits::default().max_value_bytes;
@@ -547,6 +572,7 @@ pub(crate) fn run(
     plan: &Plan,
     report: &Report<'_>,
     deadline: Option<Duration>,
+    coverage_tool: &[u8],
 ) -> Result<Vec<Option<Status>>, CtestError> {
     let options = &invocation.options;
     let jobs = options.jobs.max(1);
@@ -567,6 +593,11 @@ pub(crate) fn run(
     let mut running = Running::default();
     let mut requests = BTreeMap::new();
     let limit = invocation.test_load.filter(|&limit| limit > 0);
+    let mut simulated_load = host
+        .env_get(b"__CTEST_FAKE_LOAD_AVERAGE_FOR_TESTING")
+        .and_then(|value| value.to_string().parse::<u64>().ok());
+    let mut load = 0;
+    let mut runs = vec![0; plan.tests.len()];
 
     thread::scope(|scope| -> Result<(), CtestError> {
         let (send, receive) = mpsc::sync_channel::<Attempt>(jobs.min(64));
@@ -579,8 +610,12 @@ pub(crate) fn run(
                 budget = None;
                 completion
             } else if !expired && !scheduler.ready.ordered.is_empty() && running.slots < jobs {
-                let spare = *budget
-                    .get_or_insert_with(|| limit.map_or(jobs, |limit| load_budget(host, limit)));
+                let spare = *budget.get_or_insert_with(|| {
+                    limit.map_or(jobs, |limit| {
+                        load = simulated_load.unwrap_or_else(|| system_load(host));
+                        usize::try_from(limit.saturating_sub(load)).unwrap_or(usize::MAX)
+                    })
+                });
                 let spare = spare.min(jobs - running.slots);
                 if let Some(&(rank, id)) = scheduler
                     .ready
@@ -594,9 +629,17 @@ pub(crate) fn run(
                         scheduler.advance(id);
                         continue;
                     }
+                    runs[id] += 1;
+                    let run = scheduler.repetition.numbered_run(id, runs[id]);
                     let result = match prepare(host, options, plan, &scheduler.statuses, test) {
-                        Ok(request) => {
-                            report.start(test, Some(&request));
+                        Ok(mut request) => {
+                            if coverage_tool == b"LLVM-COV" {
+                                let name = test.name.to_string().replace(['/', '\\'], "_");
+                                let profile = from_native(&dir.join(format!("{name}_%p.profraw")));
+                                request.env.retain(|(name, _)| name != "LLVM_PROFILE_FILE");
+                                request.env.push(("LLVM_PROFILE_FILE".into(), profile));
+                            }
+                            report.start(test, Some(&request), run);
                             let send = send.clone();
                             let repeat = scheduler.repetition.individual(id);
                             let worker_request = request.clone();
@@ -636,7 +679,7 @@ pub(crate) fn run(
                             }
                         }
                         Err(result) => {
-                            report.start(test, None);
+                            report.start(test, None, run);
                             result
                         }
                     };
@@ -646,6 +689,18 @@ pub(crate) fn run(
                         again: false,
                     }
                 } else if running.slots == 0 {
+                    if let Some(limit) = limit {
+                        let smallest = scheduler
+                            .ready
+                            .ordered
+                            .iter()
+                            .map(|&(_, id)| (&plan.tests[id], resources[id].slots))
+                            .min_by_key(|(_, slots)| *slots);
+                        report.wait_for_load(load, limit, smallest);
+                    }
+                    if simulated_load.is_some() {
+                        simulated_load = Some(0);
+                    }
                     let wait = remaining_time(host, deadline).unwrap_or(Duration::MAX);
                     host.sleep(wait.min(Duration::from_secs(1)));
                     budget = None;
@@ -675,9 +730,18 @@ pub(crate) fn run(
             let Attempt { id, result, again } = attempt;
             let test = &plan.tests[id];
             state.record(test, &result, requests.get(&id))?;
-            report.finish(test, &result, scheduler.completed + 1);
+            let progress = match scheduler.repetition.individual(id) {
+                Some(repeat) if repeat.mode == RepeatMode::UntilFail => runs[id] == repeat.count,
+                _ => runs[id] == 1 || scheduler.repetition.group_of[id].is_some(),
+            };
+            report.finish(test, &result, progress.then_some(scheduler.completed + 1));
             if again {
-                report.start(test, requests.get(&id));
+                runs[id] += 1;
+                report.start(
+                    test,
+                    requests.get(&id),
+                    scheduler.repetition.numbered_run(id, runs[id]),
+                );
                 continue;
             }
             if requests.remove(&id).is_some() {
@@ -717,6 +781,24 @@ fn prepare(
             "Failed test dependencies: {}",
             failed_setups.join(" ")
         )));
+    }
+    let mode = test.property(b"FIXTURE_REPEAT_MODE");
+    if !mode.is_empty() && FixtureMode::parse(mode).is_none() {
+        return Err(ResultLine::not_run(format!(
+            "FIXTURE_REPEAT_MODE \"{}\" not recognized. Must be AROUND_ALL_REPEATS, AROUND_EACH_REPEAT, or EACH_TEST_SEPARATELY.",
+            BString::from(mode)
+        )));
+    }
+    for dependency in test.list(b"_CMAKE_TEST_BUILD_DEPENDS") {
+        let path = test
+            .directory
+            .join(rcmake_host::path::to_native(&dependency));
+        if host.metadata(&path, rcmake_host::Follow::Yes).is_err() {
+            return Err(ResultLine::not_run(format!(
+                "Unable to find build dependency: {}",
+                path.display()
+            )));
+        }
     }
     execution::request(host, test, options).map_err(ResultLine::not_run)
 }

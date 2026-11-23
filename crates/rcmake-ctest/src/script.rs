@@ -18,7 +18,7 @@ use rcmake_host::{
     Stream, path,
 };
 
-use crate::cli::{Invocation, Script};
+use crate::cli::{self, Invocation, Script};
 use crate::dart::{self, Configuration, Dashboard, Model, Tag};
 use crate::{CtestError, CtestOptions, run_tests_with_dashboard};
 
@@ -35,6 +35,13 @@ struct Settings {
     quiet: bool,
     depth: usize,
     config: Option<BString>,
+    include: Option<BString>,
+    exclude: Option<BString>,
+    selection: crate::selection::SelectionOptions,
+    interactive_debugging: Option<bool>,
+    no_tests_action: Option<rcmake_presets::NoTestsAction>,
+    include_labels: Vec<BString>,
+    exclude_labels: Vec<BString>,
     definitions: BTreeMap<BString, BString>,
 }
 
@@ -42,6 +49,7 @@ struct Session {
     host: Arc<dyn Host>,
     settings: Settings,
     start: Option<Start>,
+    failed: bool,
 }
 
 #[derive(Clone)]
@@ -82,6 +90,13 @@ pub(crate) fn run_script(
             .and_then(|n| n.to_string().parse().ok())
             .unwrap_or_default(),
         config: invocation.options.config.clone(),
+        include: invocation.options.include.clone(),
+        exclude: invocation.options.exclude.clone(),
+        selection: invocation.selection.clone(),
+        interactive_debugging: invocation.execution.interactive_debugging,
+        no_tests_action: invocation.execution.no_tests_action,
+        include_labels: invocation.options.include_labels.clone(),
+        exclude_labels: invocation.options.exclude_labels.clone(),
         definitions: invocation
             .definitions
             .iter()
@@ -152,15 +167,7 @@ fn execute_script(
         );
         return Ok(1);
     }
-    let exe = host.current_exe().unwrap_or_else(|_| cwd.join("cmake"));
-    let candidate = exe.with_file_name(if cfg!(windows) { "cmake.exe" } else { "cmake" });
-    let cmake_command = if host.metadata(&candidate, Follow::Yes).is_ok()
-        || exe.file_stem().is_some_and(|name| name == "ctest")
-    {
-        candidate
-    } else {
-        exe
-    };
+    let cmake_command = cmake_executable(host.as_ref());
     let cmake_root = host
         .env_get(b"RCMAKE_VENDORED_DATA_ROOT")
         .map(|root| absolute(&cwd, &root))
@@ -211,13 +218,36 @@ fn execute_script(
         host: Arc::clone(host),
         settings,
         start: None,
+        failed: false,
     })));
     let code = interp.run_script(&file).exit_code;
-    Ok(if code == 1 && interp.diag_engine().error_occurred() {
-        255
-    } else {
-        code
-    })
+    let failed =
+        SESSION.with_borrow(|session| session.as_ref().is_some_and(|session| session.failed));
+    if code == 0 && failed {
+        return Ok(255);
+    }
+    Ok(
+        if code == 1 && (interp.diag_engine().error_occurred() || interp.fatal_occurred()) {
+            255
+        } else {
+            code
+        },
+    )
+}
+
+pub(crate) fn cmake_executable(host: &dyn Host) -> PathBuf {
+    let exe = host
+        .current_exe()
+        .unwrap_or_else(|_| host.initial_cwd().join("cmake"));
+    let executable = host.canonicalize(&exe).unwrap_or_else(|_| exe.clone());
+    let cmake_name = if cfg!(windows) { "cmake.exe" } else { "cmake" };
+    [
+        exe.with_file_name(cmake_name),
+        executable.with_file_name(cmake_name),
+    ]
+    .into_iter()
+    .find(|candidate| host.metadata(candidate, Follow::Yes).is_ok())
+    .unwrap_or(executable)
 }
 
 fn register(registry: &mut Registry) {
@@ -268,6 +298,8 @@ fn configuration(
         (b"CTEST_SITE".as_slice(), &mut config.site),
         (b"CTEST_BUILD_NAME", &mut config.build_name),
         (b"CTEST_NIGHTLY_START_TIME", &mut config.nightly_start),
+        (b"CTEST_CHANGE_ID", &mut config.change_id),
+        (b"CTEST_TEST_COVERAGE_TOOL", &mut config.coverage_tool),
     ] {
         if cx.var_defined(key) {
             *value = cx.var_or_empty(key);
@@ -365,8 +397,14 @@ fn ctest_start(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
         host.write_out(Stream::Stdout, message.as_bytes());
     }
     let tag = if append {
-        let mut tag =
-            Tag::read_with_model(host, &build, model).map_err(|err| error(err.to_string()))?;
+        let mut tag = Tag::read_with_model(host, &build, model).map_err(|err| {
+            if err.os_message == dart::TAG_MISSING_MODEL {
+                host.write_out(Stream::Stderr, format!("{}\n", err.os_message).as_bytes());
+                error("unknown error.")
+            } else {
+                error(err.to_string())
+            }
+        })?;
         if model.is_some_and(|model| model != tag.model) {
             host.write_out(
                 Stream::Stderr,
@@ -388,6 +426,10 @@ fn ctest_start(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
         }
         tag
     } else {
+        if model == Some(Model::Nightly) && config.nightly_start.is_empty() {
+            host.write_out(Stream::Stderr, b"WARNING: No nightly start time found please set in CTestConfig.cmake or DartConfig.cmake\n");
+            return Err(error("unknown error."));
+        }
         Tag::create(
             host,
             &build,
@@ -463,7 +505,13 @@ impl<'a> Arguments<'a> {
                         break;
                     }
                 }
-                if values.is_empty() {
+                if values.is_empty() && matches!(key, b"INCLUDE_LABEL" | b"EXCLUDE_LABEL") {
+                    return Err(error(format!(
+                        "Error after keyword \"{}\":\n  missing required value",
+                        BString::from(key)
+                    )));
+                }
+                if values.is_empty() && key != b"PARALLEL_LEVEL" {
                     return Err(error(format!(
                         "requires a value for {}",
                         String::from_utf8_lossy(key)
@@ -477,7 +525,7 @@ impl<'a> Arguments<'a> {
             }
             if parsed.insert(key, values).is_some() {
                 return Err(error(format!(
-                    "called with duplicate argument \"{}\"",
+                    "called with more than one value for {}",
                     String::from_utf8_lossy(key)
                 )));
             }
@@ -532,22 +580,45 @@ fn with_capture(
             if result.capture_error { "-1" } else { "0" },
         );
         if result.capture_error && !args.flag(b"CAPTURE_CMAKE_ERROR") {
-            return Err(error("could not complete the dashboard command"));
+            SESSION.with_borrow_mut(|session| {
+                if let Some(session) = session {
+                    session.failed = true;
+                }
+            });
         }
         Ok(Flow::Normal)
     });
-    if let Err(CmdError::Status(message)) = &result
-        && let Some([_, var]) = args.windows(2).find(|pair| {
+    if let Err(CmdError::Status(message)) = &result {
+        if let Some([_, var]) = args.windows(2).find(|pair| {
             pair.first()
                 .is_some_and(|arg| arg.value == "CAPTURE_CMAKE_ERROR")
-        })
-    {
-        cx.host()
-            .write_out(Stream::Stderr, format!("{message}\n").as_bytes());
-        cx.set_var(&var.value, "-1".into());
-        return Ok(Flow::Normal);
+        }) {
+            cx.host()
+                .write_out(Stream::Stderr, format!("{message}\n").as_bytes());
+            cx.set_var(&var.value, "-1".into());
+            return Ok(Flow::Normal);
+        }
+        if message.starts_with(b"Error after keyword ") {
+            cx.issue(
+                rcmake_diag::MessageKind::Error,
+                rcmake_diag::Effect::Fatal,
+                None,
+                message.clone(),
+            );
+            return Err(CmdError::Reported);
+        }
     }
     result
+}
+
+fn dashboard_argument_error(cx: &mut Cx<'_>, args: &Arguments<'_>, message: String) -> CmdError {
+    if args.flag(b"CAPTURE_CMAKE_ERROR") {
+        return error(message);
+    }
+    cx.host()
+        .write_out(Stream::Stderr, format!("{message}\n").as_bytes());
+    cx.set_fatal();
+    CmdError::Reported
 }
 
 fn ctest_configure(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
@@ -564,23 +635,23 @@ fn ctest_configure(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
                 b"CTEST_BINARY_DIRECTORY",
                 previous.as_ref().map(|start| start.build.as_path()),
             )?;
+            let source = directory(
+                cx,
+                args.value(b"SOURCE"),
+                b"CTEST_SOURCE_DIRECTORY",
+                previous.as_ref().map(|start| start.source.as_path()),
+            )?;
+            if !cx
+                .host()
+                .metadata(&source.join("CMakeLists.txt"), Follow::Yes)
+                .is_ok_and(|meta| meta.kind == FileKind::File)
+            {
+                return Err(error(
+                    "called with invalid source directory. CTEST_SOURCE_DIRECTORY must be set to a directory that contains CMakeLists.txt.",
+                ));
+            }
             let custom = cx.var_or_empty(b"CTEST_CONFIGURE_COMMAND");
             let command = if custom.is_empty() {
-                let source = directory(
-                    cx,
-                    args.value(b"SOURCE"),
-                    b"CTEST_SOURCE_DIRECTORY",
-                    previous.as_ref().map(|start| start.source.as_path()),
-                )?;
-                if !cx
-                    .host()
-                    .metadata(&source.join("CMakeLists.txt"), Follow::Yes)
-                    .is_ok_and(|meta| meta.kind == FileKind::File)
-                {
-                    return Err(error(
-                        "requires a source directory that contains CMakeLists.txt",
-                    ));
-                }
                 let generator = cx.var_or_empty(b"CTEST_CMAKE_GENERATOR");
                 if generator.is_empty() {
                     return Err(error(
@@ -621,6 +692,10 @@ fn ctest_configure(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
             }
             let output = handler_process(cx, args, build, command)?;
             let code = process_code(&output).unwrap_or(-1);
+            if code != 0 {
+                cx.host()
+                    .write_out(Stream::Stderr, b"Error(s) when configuring the project\n");
+            }
             Ok(HandlerResult {
                 code,
                 capture_error: code != 0,
@@ -706,6 +781,10 @@ fn ctest_build(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
             args.set(cx, b"NUMBER_ERRORS", errors.to_string());
             let warnings = warnings + usize::from(code != 0);
             args.set(cx, b"NUMBER_WARNINGS", warnings.to_string());
+            if code != 0 {
+                cx.host()
+                    .write_out(Stream::Stderr, b"Error(s) when building project\n");
+            }
             if log {
                 cx.host().write_out(
                     Stream::Stdout,
@@ -721,7 +800,7 @@ fn ctest_build(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
     )
 }
 
-fn split_command(cx: &mut Cx<'_>, command: &[u8]) -> Result<Vec<BString>, CmdError> {
+pub(crate) fn split_command(cx: &mut Cx<'_>, command: &[u8]) -> Result<Vec<BString>, CmdError> {
     const VAR: &[u8] = b"_RCMAKE_CTEST_COMMAND_LINE";
     let previous = cx.var_normal_only(VAR);
     cx.set_var(VAR, command.into());
@@ -759,7 +838,7 @@ fn handler_process(
     .map_err(|err| error(err.to_string()))
 }
 
-fn run_process(
+pub(crate) fn run_process(
     host: &dyn Host,
     cwd: PathBuf,
     program: BString,
@@ -798,7 +877,15 @@ fn ctest_test(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
             b"EXCLUDE",
             b"INCLUDE_LABEL",
             b"EXCLUDE_LABEL",
+            b"EXCLUDE_FIXTURE",
+            b"EXCLUDE_FIXTURE_SETUP",
+            b"EXCLUDE_FIXTURE_CLEANUP",
+            b"INCLUDE_FROM_FILE",
+            b"EXCLUDE_FROM_FILE",
+            b"COVERAGE_TOOL",
             b"PARALLEL_LEVEL",
+            b"PRESET",
+            b"PRESETS_FILE",
             b"OUTPUT_JUNIT",
             b"REPEAT",
             b"TEST_LOAD",
@@ -827,50 +914,126 @@ fn ctest_test(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
             .map(|var| cx.var_or_empty(var))
             .find(|value| !value.is_empty())
             .or(settings.config);
-            let timeout = crate::execution::parse_timeout(&cx.var_or_empty(b"CTEST_TEST_TIMEOUT"));
+            let timeout = cli::number_prefix(&cx.var_or_empty(b"CTEST_TEST_TIMEOUT"));
             let parallel = args
                 .value(b"PARALLEL_LEVEL")
-                .cloned()
-                .or_else(|| host.env_get(b"CTEST_PARALLEL_LEVEL"));
-            let jobs = match parallel.as_ref().map(|value| value.as_slice()) {
-                None => 1,
-                Some(b"") => host.system().cpu_count.max(2) as usize,
-                Some(value) => {
-                    let jobs = parse_number(value).ok_or_else(|| {
-                        error("requires a non-negative integer for PARALLEL_LEVEL")
-                    })?;
-                    if jobs == 0 { usize::MAX } else { jobs }
-                }
+                .map(|value| value.as_slice())
+                .or_else(|| args.flag(b"PARALLEL_LEVEL").then_some(b"".as_slice()));
+            let jobs = parallel
+                .map(|value| {
+                    if value.is_empty() {
+                        return Ok(rcmake_presets::TestJobs::Automatic);
+                    }
+                    parse_number(value)
+                        .and_then(|jobs| u32::try_from(jobs).ok())
+                        .map(rcmake_presets::TestJobs::Count)
+                        .ok_or_else(|| {
+                            dashboard_argument_error(
+                                cx,
+                                args,
+                                format!("ParallelLevel invalid value: {}", BString::from(value)),
+                            )
+                        })
+                })
+                .transpose()?;
+            let (test_load, load_diagnostic) = args.value(b"TEST_LOAD").map_or_else(
+                || {
+                    (
+                        cx.var_or_empty(b"CTEST_TEST_LOAD"),
+                        "Invalid value for 'CTEST_TEST_LOAD' : ",
+                    )
+                },
+                |value| (value.clone(), "Invalid value for 'TEST_LOAD' : "),
+            );
+            let test_load = if test_load.is_empty() {
+                None
+            } else {
+                cli::warning_number(host.as_ref(), &test_load, load_diagnostic)
             };
-            let test_load = args
-                .value(b"TEST_LOAD")
-                .cloned()
-                .unwrap_or_else(|| cx.var_or_empty(b"CTEST_TEST_LOAD"));
+            let setting = |key, vars: &[&[u8]]| {
+                args.value(key).cloned().or_else(|| {
+                    vars.iter()
+                        .map(|var| cx.var_or_empty(var))
+                        .find(|value| !value.is_empty())
+                })
+            };
+            let source = previous.as_ref().map_or_else(
+                || {
+                    absolute(
+                        &host.initial_cwd(),
+                        &cx.var_or_empty(b"CTEST_SOURCE_DIRECTORY"),
+                    )
+                },
+                |start| start.source.clone(),
+            );
             let mut invocation = Invocation {
                 options: CtestOptions {
                     test_dir: build.clone(),
                     config,
-                    include: args
-                        .value(b"INCLUDE")
-                        .cloned()
-                        .filter(|value| !value.is_empty()),
-                    exclude: args
-                        .value(b"EXCLUDE")
-                        .cloned()
-                        .filter(|value| !value.is_empty()),
-                    include_labels: args.labels(b"INCLUDE_LABEL"),
-                    exclude_labels: args.labels(b"EXCLUDE_LABEL"),
-                    jobs,
-                    quiet: !verbose(),
-                    verbose: extra_verbose(),
-                    stop_on_failure: args.flag(b"STOP_ON_FAILURE"),
-                    timeout,
+                    include: args.value(b"INCLUDE").cloned().or(settings.include),
+                    exclude: args.value(b"EXCLUDE").cloned().or(settings.exclude),
+                    include_labels: if args.flag(b"INCLUDE_LABEL") {
+                        args.labels(b"INCLUDE_LABEL")
+                    } else {
+                        settings.include_labels
+                    },
+                    exclude_labels: if args.flag(b"EXCLUDE_LABEL") {
+                        args.labels(b"EXCLUDE_LABEL")
+                    } else {
+                        settings.exclude_labels
+                    },
                     ..CtestOptions::default()
                 },
-                test_load: parse_number(&test_load).map(|load| load as u64),
+                preset: setting(b"PRESET", &[b"CTEST_TEST_PRESET", b"CTEST_PRESET"]),
+                presets_file: setting(b"PRESETS_FILE", &[b"CTEST_PRESETS_FILE"])
+                    .map(|file| absolute(&source, &file)),
+                selection: settings.selection,
+                test_load,
                 ..Invocation::default()
             };
+            for (option, var) in [
+                (
+                    &mut invocation.selection.exclude_fixture,
+                    b"EXCLUDE_FIXTURE".as_slice(),
+                ),
+                (
+                    &mut invocation.selection.exclude_fixture_setup,
+                    b"EXCLUDE_FIXTURE_SETUP",
+                ),
+                (
+                    &mut invocation.selection.exclude_fixture_cleanup,
+                    b"EXCLUDE_FIXTURE_CLEANUP",
+                ),
+            ] {
+                if let Some(value) = args.value(var) {
+                    *option = Some(value.clone());
+                }
+            }
+            if let Some(file) = args.value(b"INCLUDE_FROM_FILE") {
+                invocation.selection.tests_from_file = Some(path::to_native(file));
+            }
+            if let Some(file) = args.value(b"EXCLUDE_FROM_FILE") {
+                invocation.selection.exclude_from_file = Some(path::to_native(file));
+            }
+            invocation.coverage_tool = args.value(b"COVERAGE_TOOL").cloned();
+            invocation.execution.no_tests_action = settings.no_tests_action;
+            invocation.execution.interactive_debugging =
+                settings.interactive_debugging.or(Some(false));
+            invocation.output.max_passed_test_output_size =
+                parse_output_limit(cx, b"CTEST_CUSTOM_MAXIMUM_PASSED_TEST_OUTPUT_SIZE");
+            invocation.output.max_failed_test_output_size =
+                parse_output_limit(cx, b"CTEST_CUSTOM_MAXIMUM_FAILED_TEST_OUTPUT_SIZE");
+            let truncation = cx.var_or_empty(b"CTEST_CUSTOM_TEST_OUTPUT_TRUNCATION");
+            if !truncation.is_empty() {
+                invocation.output.test_output_truncation = Some(cli::truncation_mode(&truncation)
+                    .ok_or_else(|| dashboard_argument_error(cx, args, format!("Invalid value for CTEST_CUSTOM_TEST_OUTPUT_TRUNCATION: {truncation}")))?);
+            }
+            invocation.output.quiet = (!verbose()).then_some(true);
+            invocation.output.verbosity =
+                extra_verbose().then_some(rcmake_presets::TestVerbosity::Extra);
             invocation.output.output_junit_file = args.value(b"OUTPUT_JUNIT").cloned();
+            invocation.execution.stop_on_failure = args.flag(b"STOP_ON_FAILURE").then_some(true);
+            invocation.execution.jobs = jobs;
             if let Some(repeat) = args.value(b"REPEAT") {
                 let mut repeat = repeat.to_ascii_lowercase();
                 for byte in &mut repeat {
@@ -879,8 +1042,29 @@ fn ctest_test(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
                     }
                 }
                 invocation.execution.repeat =
-                    Some(crate::cli::parse_repeat(b"--repeat", &repeat).map_err(error)?);
+                    Some(cli::parse_repeat(b"--repeat", &repeat).map_err(|_| {
+                        let value = args.value(b"REPEAT").cloned().unwrap_or_default();
+                        dashboard_argument_error(
+                            cx,
+                            args,
+                            format!("Repeat option invalid value: {value}"),
+                        )
+                    })?);
             }
+            invocation
+                .load_test_preset(host.as_ref(), &source, false)
+                .map_err(|message| {
+                    host.write_out(
+                        Stream::Stderr,
+                        b"Cannot instantiate test handler ctest_test\n",
+                    );
+                    error(message)
+                })?;
+            invocation
+                .resolve_options(host.as_ref(), timeout)
+                .map_err(error)?;
+            let _environment =
+                crate::PresetEnvironment::apply(host.as_ref(), &invocation.environment);
             let configuration = configuration(
                 cx,
                 &build,
@@ -896,9 +1080,24 @@ fn ctest_test(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
                 configuration,
                 show_project: !args.flag(b"QUIET"),
             };
-            let run =
-                run_tests_with_dashboard(Arc::clone(&host), &invocation, true, Some(dashboard))
-                    .map_err(|err| error(err.to_string()))?;
+            let run = match run_tests_with_dashboard(
+                Arc::clone(&host),
+                &invocation,
+                true,
+                Some(dashboard),
+            ) {
+                Ok(run) => run,
+                Err(failure @ (CtestError::DependencyCycle(_) | CtestError::TestList(_))) => {
+                    host.write_out(Stream::Stderr, format!("{failure}\n").as_bytes());
+                    cx.set_fatal();
+                    return Err(CmdError::Reported);
+                }
+                Err(failure) => return Err(error(failure.to_string())),
+            };
+            if run.no_tests && !invocation.options.ignore_no_tests && !args.flag(b"RETURN_VALUE") {
+                cx.set_fatal();
+                return Err(CmdError::Reported);
+            }
             for message in &run.not_run {
                 host.write_out(Stream::Stderr, message);
                 host.write_out(Stream::Stderr, b"\n");
@@ -909,6 +1108,10 @@ fn ctest_test(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
             })
         },
     )
+}
+
+fn parse_output_limit(cx: &Cx<'_>, name: &[u8]) -> Option<i32> {
+    cx.var_or_empty(name).to_string().parse().ok()
 }
 
 fn parse_number(value: &[u8]) -> Option<usize> {
@@ -998,6 +1201,39 @@ mod tests {
             .map(BString::from)
             .collect::<Vec<_>>();
         crate::main(&argv, host)
+    }
+
+    #[test]
+    fn configures_from_a_ctest_link_outside_the_install_directory() -> Result<(), Box<dyn Error>> {
+        let host = Arc::new(PureHost::new("/work".into(), "/work/ctest".into()));
+        let binary = Path::new("/install/bin/rcmake");
+        let cmake = Path::new("/install/bin/cmake");
+        host.seed_file(binary, b"")?;
+        host.symlink(binary, Path::new("/work/ctest"))?;
+        host.symlink(binary, cmake)?;
+        host.seed_file(
+            Path::new("/work/src/CMakeLists.txt"),
+            b"project(sample NONE)",
+        )?;
+        host.seed_file(
+            Path::new("/work/dashboard.cmake"),
+            br#"
+            set(CTEST_SOURCE_DIRECTORY "/work/src")
+            set(CTEST_BINARY_DIRECTORY "/work/build")
+            set(CTEST_CMAKE_GENERATOR Ninja)
+            ctest_start(Experimental)
+            ctest_configure()
+        "#,
+        )?;
+        host.set_command_handler(move |_, request, _| {
+            assert_eq!(request.pipeline[0].program, path::from_native(cmake));
+            Ok(RunOutput {
+                results: vec![ProcessResult::Exited(0)],
+                ..RunOutput::default()
+            })
+        })?;
+        assert_eq!(invoke(host, &["-S", "dashboard.cmake"]), 0);
+        Ok(())
     }
 
     #[test]

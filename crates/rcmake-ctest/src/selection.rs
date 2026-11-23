@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
 
 use rcmake_base::{BString, Limits, truth};
-use rcmake_host::{FileKind, Follow, Host, HostError, path::to_native};
+use rcmake_host::{FileKind, Follow, Host, path::to_native};
 use rcmake_presets::TestIndex as PresetIndex;
 use rcmake_regex::Regex;
 
@@ -12,14 +12,14 @@ use crate::discovery::Test;
 use crate::{CtestError, CtestOptions, state};
 
 /// Index settings from the command line or a test preset.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum IndexSource {
     Argument(BString),
     Preset(PresetIndex),
 }
 
 /// Selection and priority settings beyond the basic runner options.
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct SelectionOptions {
     pub(crate) indices: Option<IndexSource>,
     pub(crate) union: bool,
@@ -63,19 +63,28 @@ pub(crate) struct Plan {
 }
 
 impl Plan {
-    pub(crate) fn is_acyclic(&self) -> bool {
+    pub(crate) fn dependency_cycle(&self) -> Option<&BString> {
+        if let Some(id) = self
+            .dependents
+            .iter()
+            .enumerate()
+            .find_map(|(id, children)| children.contains(&id).then_some(id))
+        {
+            return self.tests.get(id).map(|test| &test.name);
+        }
         let mut remaining = self.prerequisites.clone();
         let mut ready: VecDeque<_> = remaining
             .iter()
             .enumerate()
             .filter_map(|(id, &count)| (count == 0).then_some(id))
             .collect();
-        let mut visited = 0;
         while let Some(id) = ready.pop_front() {
-            visited += 1;
             ready.extend(self.complete(id, &mut remaining));
         }
-        visited == self.tests.len()
+        self.tests
+            .iter()
+            .zip(remaining)
+            .find_map(|(test, count)| (count > 0).then_some(&test.name))
     }
 
     pub(crate) fn complete<'a>(
@@ -125,13 +134,13 @@ fn matches(pattern: &Regex, value: &[u8]) -> Result<bool, CtestError> {
         .map_err(|_| CtestError::RegexLimit)
 }
 
-pub(crate) fn any_match(patterns: &[Regex], value: &[u8]) -> Result<bool, CtestError> {
-    for pattern in patterns {
+pub(crate) fn first_match(patterns: &[Regex], value: &[u8]) -> Result<Option<usize>, CtestError> {
+    for (index, pattern) in patterns.iter().enumerate() {
         if matches(pattern, value)? {
-            return Ok(true);
+            return Ok(Some(index));
         }
     }
-    Ok(false)
+    Ok(None)
 }
 
 pub(crate) struct OutputChecks {
@@ -342,27 +351,20 @@ fn build_graph(mut tests: Vec<PlannedTest>) -> Plan {
     for fixture in fixtures.values() {
         for &cleanup in &fixture.cleanups {
             if let Some(deps) = cleanup_dependencies.get_mut(cleanup) {
-                deps.extend(
-                    fixture
-                        .setups
-                        .iter()
-                        .chain(&fixture.users)
-                        .copied()
-                        .filter(|&id| id != cleanup),
-                );
+                deps.extend(fixture.setups.iter().chain(&fixture.users).copied());
             }
         }
     }
 
     let mut edges = Vec::with_capacity(tests.len());
-    for (id, (test, mut deps)) in tests.iter_mut().zip(cleanup_dependencies).enumerate() {
+    for (test, mut deps) in tests.iter_mut().zip(cleanup_dependencies) {
         for name in test.list(b"DEPENDS") {
             deps.extend(names.get(&name).into_iter().flatten().copied());
         }
         let mut setups = Vec::new();
         for name in test.list(b"FIXTURES_REQUIRED") {
             if let Some(fixture) = fixtures.get(&name) {
-                setups.extend(fixture.setups.iter().copied().filter(|&setup| setup != id));
+                setups.extend(fixture.setups.iter().copied());
             }
         }
         setups.sort_unstable();
@@ -543,20 +545,16 @@ fn test_names(
 ) -> Result<Option<BTreeSet<BString>>, CtestError> {
     let Some(file) = file else { return Ok(None) };
     let path = dir.join(file);
-    let data = state::read_optional(host, &path)?.ok_or_else(|| missing_file(path))?;
+    let data = state::read_optional(host, &path)
+        .ok()
+        .flatten()
+        .ok_or(CtestError::TestList(path))?;
     Ok(Some(
         state::lines(&data)
             .filter(|line| !line.is_empty())
             .map(Into::into)
             .collect(),
     ))
-}
-
-fn missing_file(path: PathBuf) -> CtestError {
-    CtestError::Access {
-        source: HostError::from_io(std::io::ErrorKind::NotFound.into(), Some(path.clone())),
-        path,
-    }
 }
 
 fn out_of_date(host: &dyn Host, dir: &Path, test: &Test) -> Result<bool, CtestError> {

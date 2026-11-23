@@ -31,6 +31,7 @@ pub(crate) enum Mode {
     ListPresets {
         defined: bool,
     },
+    CollectInstrumentation(PathBuf),
     Instrument {
         args: Vec<BString>,
         command: Vec<BString>,
@@ -54,6 +55,8 @@ pub(crate) struct Invocation {
     pub(crate) environment: BTreeMap<BString, Option<BString>>,
     pub(crate) preset: Option<BString>,
     pub(crate) presets_file: Option<PathBuf>,
+    pub(crate) source_dir: Option<PathBuf>,
+    pub(crate) build_dir: Option<PathBuf>,
     pub(crate) actions: Vec<BString>,
     pub(crate) dashboard_model: Option<crate::dart::Model>,
     pub(crate) definitions: Vec<BString>,
@@ -62,12 +65,21 @@ pub(crate) struct Invocation {
     /// Local clock time, in seconds since midnight.
     pub(crate) stop_time: Option<u32>,
     pub(crate) test_load: Option<u64>,
+    pub(crate) coverage_tool: Option<BString>,
     pub(crate) overwrite_configuration_file: Vec<BString>,
 }
 
 type Arguments<'a> = std::iter::Peekable<std::slice::Iter<'a, BString>>;
 
 fn split_flag(raw: &[u8]) -> (&[u8], Option<&[u8]>) {
+    for flag in [b"--max-width".as_slice(), b"-W"] {
+        if let Some(value) = raw
+            .strip_prefix(flag)
+            .and_then(|rest| rest.strip_prefix(b" "))
+        {
+            return (flag, Some(value));
+        }
+    }
     let mut parts = raw.splitn(2, |&byte| byte == b'=');
     (parts.next().unwrap_or_default(), parts.next())
 }
@@ -96,6 +108,14 @@ pub(crate) fn parse(args: &[BString], host: &dyn Host) -> Result<Invocation, Str
             mode,
             ..Invocation::default()
         });
+    }
+    if args
+        .iter()
+        .take_while(|arg| *arg != "--")
+        .any(|arg| arg == "--build-and-test")
+        && args.iter().any(|arg| arg == "--")
+    {
+        return Err("The -- option cannot be used with --build-and-test. Use --build-options or --test-command to forward arguments.".into());
     }
     let mut cli = Invocation::default();
     let mut timeout = None;
@@ -142,7 +162,12 @@ pub(crate) fn parse(args: &[BString], host: &dyn Host) -> Result<Invocation, Str
                 cli.execution.test_passthrough_arguments = Some(args.cloned().collect());
                 break;
             }
-            b"--test-dir" | b"--build-dir" => cli.options.test_dir = to_native(value()?),
+            b"--test-dir" | b"--build-dir" => {
+                let dir = to_native(value()?);
+                cli.options.test_dir = dir.clone();
+                cli.build_dir = Some(dir);
+            }
+            b"--source-dir" => cli.source_dir = Some(to_native(value()?)),
             b"-C" | b"--build-config" => cli.options.config = Some(value()?.into()),
             b"-R" | b"--tests-regex" => cli.options.include = Some(value()?.into()),
             b"-E" | b"--exclude-regex" => cli.options.exclude = Some(value()?.into()),
@@ -214,7 +239,7 @@ pub(crate) fn parse(args: &[BString], host: &dyn Host) -> Result<Invocation, Str
             b"--no-label-summary" => cli.output.label_summary = Some(false),
             b"--no-subproject-summary" => cli.output.subproject_summary = Some(false),
             b"--debug" => cli.output.debug = Some(true),
-            b"--max-width" => {
+            b"-W" | b"--max-width" => {
                 cli.output.max_test_name_width = Some(output_integer(flag, value()?)?)
             }
             b"--test-output-size-passed" => {
@@ -225,17 +250,13 @@ pub(crate) fn parse(args: &[BString], host: &dyn Host) -> Result<Invocation, Str
             }
             b"--test-output-truncation" => {
                 let raw = value()?;
-                cli.output.test_output_truncation = Some(match raw {
-                    b"tail" => OutputTruncation::Tail,
-                    b"middle" => OutputTruncation::Middle,
-                    b"head" => OutputTruncation::Head,
-                    _ => {
-                        return Err(format!(
+                cli.output.test_output_truncation =
+                    Some(truncation_mode(raw).ok_or_else(|| {
+                        format!(
                             "Invalid value for '--test-output-truncation': {}",
                             display(raw)
-                        ));
-                    }
-                });
+                        )
+                    })?);
             }
             b"-F" => cli.execution.enable_failover = Some(true),
             b"--resource-spec-file" => cli.execution.resource_spec_file = Some(value()?.into()),
@@ -257,6 +278,13 @@ pub(crate) fn parse(args: &[BString], host: &dyn Host) -> Result<Invocation, Str
             }),
             b"--preset" => cli.preset = Some(value()?.into()),
             b"--presets-file" => cli.presets_file = Some(to_native(value()?)),
+            b"--collect-instrumentation" => {
+                let dir = value().map_err(|_| unknown(arg))?;
+                return Ok(Invocation {
+                    mode: Mode::CollectInstrumentation(host.initial_cwd().join(to_native(dir))),
+                    ..Invocation::default()
+                });
+            }
             b"--list-presets" => {
                 let defined = match inline {
                     None => false,
@@ -279,6 +307,7 @@ pub(crate) fn parse(args: &[BString], host: &dyn Host) -> Result<Invocation, Str
             _ if arg.starts_with(b"-D") => cli
                 .definitions
                 .push(parse_definition(arg.get(2..).unwrap_or_default())?),
+            _ if !arg.starts_with(b"-") => {}
             _ => return Err(unknown(arg)),
         }
     }
@@ -324,9 +353,58 @@ fn display(raw: &[u8]) -> std::borrow::Cow<'_, str> {
     String::from_utf8_lossy(raw)
 }
 
+pub(crate) fn preset_diagnostic(error: rcmake_presets::PresetsError) -> String {
+    if let Some((header, details)) = error.message.split_once('\n')
+        && details
+            .lines()
+            .nth(1)
+            .is_some_and(|line| line.trim_ascii_start().starts_with("\"jobs\":"))
+    {
+        if details
+            .lines()
+            .next()
+            .is_some_and(|line| line.ends_with(": Expected an integer"))
+            && details
+                .lines()
+                .nth(1)
+                .is_some_and(|line| line.trim_ascii_end().ends_with("\"\""))
+        {
+            return format!(
+                "{header}\nFile version must be 11 or higher for processor-count-based jobs preset support"
+            );
+        }
+        if let Some((location, detail)) = details.split_once(": Expected a non-negative integer") {
+            return format!("{header}\n{location}: Invalid preset{detail}");
+        }
+    }
+    error
+        .message
+        .replace(
+            "for testOutputTruncation support",
+            "for testOutputTruncation preset support",
+        )
+        .replace(
+            "for outputJUnitFile support",
+            "for CTest JUnit output support",
+        )
+        .replace(
+            "for testPassthroughArguments support",
+            "for testPassthroughArguments preset support",
+        )
+        .replace(
+            "Invalid TestIndexRange",
+            "Invalid \"filter.include.index\" field: expected a string or object",
+        )
+}
+
 fn missing_value(flag: &[u8]) -> String {
     match flag {
-        b"--test-dir" | b"--build-dir" | b"--repeat-until-fail" => {
+        b"--test-dir"
+        | b"--build-dir"
+        | b"--source-dir"
+        | b"--repeat-until-fail"
+        | b"--preset"
+        | b"--presets-file" => {
             format!("'{}' requires an argument", display(flag))
         }
         b"-D" => "-D must be followed by dashboard mode or VAR=VALUE.".into(),
@@ -335,10 +413,65 @@ fn missing_value(flag: &[u8]) -> String {
 }
 
 fn unknown(arg: &[u8]) -> String {
+    const OPTIONS: &[&str] = &[
+        "--build-dir",
+        "--debug",
+        "--exclude-regex",
+        "--interactive-debug-mode",
+        "--label-regex",
+        "--list-presets",
+        "--no-tests",
+        "--output-junit",
+        "--output-log",
+        "--output-on-failure",
+        "--parallel",
+        "--preset",
+        "--presets-file",
+        "--quiet",
+        "--repeat",
+        "--show-only",
+        "--source-dir",
+        "--stop-on-failure",
+        "--test-dir",
+        "--tests-regex",
+        "--test-load",
+        "--timeout",
+        "--verbose",
+    ];
+    let suggestion = OPTIONS
+        .iter()
+        .find(|option| {
+            let (long, short) = if option.len() > arg.len() {
+                (option.as_bytes(), arg)
+            } else {
+                (arg, option.as_bytes())
+            };
+            let common = long
+                .iter()
+                .zip(short)
+                .take_while(|(left, right)| left == right)
+                .count();
+            match (long.get(common..), short.get(common..)) {
+                (Some(left), Some(right)) if left.len() == right.len() + 1 => {
+                    left.get(1..) == Some(right)
+                }
+                (Some(left), Some(right)) if left.len() == right.len() => {
+                    left.get(1..) == right.get(1..)
+                }
+                _ => false,
+            }
+        })
+        .map_or_else(String::new, |option| format!(". Did you mean: {option}?"));
     format!(
-        "Unknown argument: {}\nCMake Error: Run 'ctest --help' for all supported options.",
+        "Unknown argument: {}{suggestion}\nCMake Error: Run 'ctest --help' for all supported options.",
         display(arg)
     )
+}
+
+pub(crate) fn processor_count(host: &dyn Host) -> usize {
+    host.env_get(b"__CTEST_FAKE_PROCESSOR_COUNT_FOR_TESTING")
+        .and_then(|value| value.to_string().parse::<usize>().ok())
+        .unwrap_or_else(|| host.system().cpu_count as usize)
 }
 
 fn parse_jobs(flag: &[u8], raw: Option<&[u8]>) -> Result<TestJobs, String> {
@@ -414,6 +547,15 @@ fn parse_show_only(raw: &[u8]) -> Result<ShowOnly, String> {
     }
 }
 
+pub(crate) fn truncation_mode(raw: &[u8]) -> Option<OutputTruncation> {
+    match raw {
+        b"head" => Some(OutputTruncation::Head),
+        b"middle" => Some(OutputTruncation::Middle),
+        b"tail" => Some(OutputTruncation::Tail),
+        _ => None,
+    }
+}
+
 fn output_integer(flag: &[u8], raw: &[u8]) -> Result<i32, String> {
     std::str::from_utf8(raw)
         .ok()
@@ -421,7 +563,7 @@ fn output_integer(flag: &[u8], raw: &[u8]) -> Result<i32, String> {
         .ok_or_else(|| format!("Invalid value for '{}': {}", display(flag), display(raw)))
 }
 
-fn warning_number(host: &dyn Host, raw: &[u8], message: &str) -> Option<u64> {
+pub(crate) fn warning_number(host: &dyn Host, raw: &[u8], message: &str) -> Option<u64> {
     let number = std::str::from_utf8(raw)
         .ok()
         .and_then(|value| value.trim_start().parse().ok());
@@ -543,26 +685,74 @@ impl Invocation {
     fn resolve(&mut self, host: &dyn Host, timeout: Option<f64>) -> Result<(), String> {
         let cwd = host.initial_cwd();
         self.presets_file = self.presets_file.take().map(|file| cwd.join(file));
-        if let Some(name) = &self.preset {
-            let presets = match &self.presets_file {
-                Some(file) => rcmake_presets::load_file(&cwd, file, host),
-                None => rcmake_presets::load(&cwd, host),
-            }
-            .map_err(|error| error.message)?;
-            let preset = presets
-                .resolve(PresetKind::Test, name, &EnvSnapshot::from_host(host))
-                .map_err(|error| error.message)?;
-            if self.options.test_dir.as_os_str().is_empty()
-                && let Some(binary) = preset.binary_dir
+        if !matches!(self.mode, Mode::ListPresets { .. }) {
+            if self.preset.is_some() {
+                self.load_test_preset(host, &cwd, true)?;
+            } else if self.scripts.is_empty()
+                && (self.actions.is_empty() || self.actions.iter().any(|action| action == "test"))
             {
-                self.options.test_dir = to_native(&binary);
-            }
-            self.environment = preset.environment;
-            if let PresetSettings::Test(settings) = preset.settings {
-                self.apply_preset(*settings);
+                let preset = self
+                    .definitions
+                    .iter()
+                    .find_map(|definition| definition.strip_prefix(b"CTEST_TEST_PRESET="))
+                    .or_else(|| {
+                        self.definitions
+                            .iter()
+                            .find_map(|definition| definition.strip_prefix(b"CTEST_PRESET="))
+                    });
+                if let Some(preset) = preset {
+                    let build = cwd.join(&self.options.test_dir);
+                    let config = crate::dart::Configuration::load(
+                        host,
+                        &build,
+                        &self.overwrite_configuration_file,
+                    )
+                    .map_err(|error| error.to_string())?;
+                    self.preset = Some(preset.into());
+                    let source = build.join(to_native(&config.source_directory));
+                    self.load_test_preset(host, &source, false)?;
+                }
             }
         }
-        self.options.test_dir = cwd.join(&self.options.test_dir);
+        self.options.test_dir = cwd.join(&self.options.test_dir).components().collect();
+        self.resolve_options(host, timeout)
+    }
+
+    pub(crate) fn load_test_preset(
+        &mut self,
+        host: &dyn Host,
+        source: &std::path::Path,
+        use_binary_dir: bool,
+    ) -> Result<(), String> {
+        let Some(name) = &self.preset else {
+            return Ok(());
+        };
+        let presets = match &self.presets_file {
+            Some(file) => rcmake_presets::load_file(source, file, host),
+            None => rcmake_presets::load(source, host),
+        }
+        .map_err(preset_diagnostic)?;
+        let preset = presets
+            .resolve(PresetKind::Test, name, &EnvSnapshot::from_host(host))
+            .map_err(preset_diagnostic)?;
+        if use_binary_dir
+            && self.options.test_dir.as_os_str().is_empty()
+            && let Some(binary) = preset.binary_dir
+        {
+            self.options.test_dir = to_native(&binary);
+        }
+        self.environment = preset.environment;
+        if let PresetSettings::Test(settings) = preset.settings {
+            self.apply_preset(*settings);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn resolve_options(
+        &mut self,
+        host: &dyn Host,
+        timeout: Option<f64>,
+    ) -> Result<(), String> {
         let env = |name: &[u8]| {
             self.environment
                 .get(name)
@@ -575,7 +765,7 @@ impl Invocation {
         });
         self.options.jobs = match jobs {
             None => 1,
-            Some(TestJobs::Automatic) => host.system().cpu_count.max(2) as usize,
+            Some(TestJobs::Automatic) => processor_count(host).max(2),
             Some(TestJobs::Count(0)) => usize::MAX,
             Some(TestJobs::Count(count)) => count as usize,
         };
@@ -604,7 +794,7 @@ impl Invocation {
             self.output.verbosity,
             Some(TestVerbosity::Verbose | TestVerbosity::Extra)
         );
-        self.selection.schedule_random = self.execution.schedule_random.unwrap_or(false);
+        self.selection.schedule_random |= self.execution.schedule_random.unwrap_or(false);
         self.test_load = self.test_load.or(self
             .execution
             .test_load
@@ -675,9 +865,17 @@ impl Invocation {
                 interactive_debugging,
                 schedule_random,
                 timeout,
-                no_tests_action,
-                test_passthrough_arguments
+                no_tests_action
             );
+            if let Some(mut args) = execution.test_passthrough_arguments {
+                args.extend(
+                    self.execution
+                        .test_passthrough_arguments
+                        .take()
+                        .unwrap_or_default(),
+                );
+                self.execution.test_passthrough_arguments = Some(args);
+            }
         }
         self.overwrite_configuration_file.splice(
             0..0,
@@ -1056,7 +1254,7 @@ mod tests {
         assert_eq!(overridden.options.test_dir, Path::new("/work/local"));
         assert_eq!(
             overridden.execution.test_passthrough_arguments,
-            Some(vec!["cli".into()])
+            Some(vec!["preset".into(), "cli".into()])
         );
         Ok(())
     }

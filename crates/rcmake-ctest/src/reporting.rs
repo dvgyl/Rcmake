@@ -1,11 +1,11 @@
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 use std::time::SystemTime;
 
 use rcmake_base::{BString, list};
-use rcmake_host::{FileKind, FileTime, Follow, Host, RunRequest, Stream, path};
+use rcmake_host::{FileKind, FileTime, Follow, Host, RunRequest, Stream, WriteMode, path};
 use rcmake_json::Value;
 
 use crate::execution::{ResultLine, SkipReason, Status};
@@ -20,6 +20,7 @@ pub(crate) struct Report<'a> {
     number_width: usize,
     label_summary: bool,
     capture: bool,
+    log_file: Option<PathBuf>,
     records: RefCell<BTreeMap<usize, TestRecord>>,
 }
 
@@ -29,20 +30,44 @@ impl<'a> Report<'a> {
         invocation: &'a cli::Invocation,
         plan: &Plan,
         capture: bool,
-    ) -> Self {
+    ) -> Result<Self, crate::CtestError> {
         let options = &invocation.options;
-        let name_width = plan
-            .tests
-            .iter()
-            .map(|test| test.name.len())
-            .max()
-            .unwrap_or(0)
-            .max(30);
+        let name_width = invocation.output.max_test_name_width.map_or_else(
+            || {
+                plan.tests
+                    .iter()
+                    .map(|test| test.name.len())
+                    .max()
+                    .unwrap_or(0)
+                    .max(30)
+            },
+            |width| width.max(0) as usize,
+        );
         let number_width = plan
             .tests
             .last()
             .map_or(1, |test| test.number.to_string().len());
-        Self {
+        let log_file = invocation
+            .output
+            .output_log_file
+            .as_ref()
+            .filter(|file| !file.is_empty())
+            .map(|file| {
+                let dir = if invocation.preset.is_some() {
+                    invocation.options.test_dir.clone()
+                } else {
+                    host.initial_cwd()
+                };
+                dir.join(path::to_native(file))
+            });
+        if let Some(file) = &log_file {
+            host.write(file, b"", WriteMode::Truncate)
+                .map_err(|source| crate::CtestError::Access {
+                    path: file.clone(),
+                    source,
+                })?;
+        }
+        Ok(Self {
             host,
             options,
             total: plan.tests.len(),
@@ -50,15 +75,44 @@ impl<'a> Report<'a> {
             number_width,
             label_summary: invocation.output.label_summary.unwrap_or(true),
             capture,
+            log_file,
             records: RefCell::new(BTreeMap::new()),
-        }
+        })
     }
 
     fn write(&self, message: std::fmt::Arguments<'_>) {
-        if !self.options.quiet {
-            self.host
-                .write_out(Stream::Stdout, message.to_string().as_bytes());
+        self.emit(Stream::Stdout, message.to_string().as_bytes());
+    }
+
+    fn emit(&self, stream: Stream, bytes: &[u8]) {
+        if let Some(file) = &self.log_file {
+            let _ = self.host.write(file, bytes, WriteMode::Append);
         }
+        if !self.options.quiet {
+            self.host.write_out(stream, bytes);
+        }
+    }
+
+    pub(crate) fn announce_tests(&self) {
+        if self.options.verbose {
+            self.write(format_args!("Constructing a list of tests\nDone constructing a list of tests\nUpdating test list for fixtures\n"));
+        }
+    }
+
+    pub(crate) fn wait_for_load(
+        &self,
+        load: u64,
+        limit: u64,
+        smallest: Option<(&PlannedTest, usize)>,
+    ) {
+        let detail = smallest
+            .filter(|_| load < limit)
+            .map_or_else(String::new, |(test, slots)| {
+                format!(", Smallest test {} requires {slots}", test.name)
+            });
+        self.write(format_args!(
+            "***** WAITING, System Load: {load}, Max Allowed Load: {limit}{detail}*****\n"
+        ));
     }
 
     pub(crate) fn project(&self, path: &Path) {
@@ -66,9 +120,7 @@ impl<'a> Report<'a> {
     }
 
     pub(crate) fn list(&self, plan: &Plan) {
-        if self.options.verbose {
-            self.write(format_args!("Constructing a list of tests\nDone constructing a list of tests\nUpdating test list for fixtures\n"));
-        }
+        self.announce_tests();
         for test in &plan.tests {
             let command = resolved_command(self.host, test, self.options);
             if command.is_none()
@@ -136,7 +188,12 @@ impl<'a> Report<'a> {
         }
     }
 
-    pub(crate) fn start(&self, test: &PlannedTest, request: Option<&RunRequest>) {
+    pub(crate) fn start(
+        &self,
+        test: &PlannedTest,
+        request: Option<&RunRequest>,
+        run: Option<(i32, i32)>,
+    ) {
         if self.capture {
             let mut records = self.records.borrow_mut();
             let record = records.entry(test.number).or_default();
@@ -145,8 +202,12 @@ impl<'a> Report<'a> {
                 .map_or_else(String::new, display_command);
             record.started = request.map(|_| self.host.now());
         }
+        if self.options.verbose {
+            self.write(format_args!("test {}\n", test.number));
+        }
+        let repeat = run.map_or_else(String::new, |(run, total)| format!(" (run {run}/{total})"));
         self.write(format_args!(
-            "    Start {:>width$}: {}\n",
+            "    Start {:>width$}: {}{repeat}\n",
             test.number,
             test.name,
             width = self.number_width
@@ -167,6 +228,16 @@ impl<'a> Report<'a> {
                 test.number,
                 request.cwd.display()
             ));
+            if let Some((_, profile)) = request
+                .env
+                .iter()
+                .find(|(name, _)| name == "LLVM_PROFILE_FILE")
+            {
+                self.write(format_args!(
+                    "{}: Using environment variable LLVM_PROFILE_FILE={profile}\n",
+                    test.number
+                ));
+            }
             if let Some(timeout) = request.timeout {
                 self.write(format_args!(
                     "{}: Test timeout computed to be: {}\n",
@@ -177,7 +248,7 @@ impl<'a> Report<'a> {
         }
     }
 
-    pub(crate) fn finish(&self, test: &PlannedTest, result: &ResultLine, completed: usize) {
+    pub(crate) fn finish(&self, test: &PlannedTest, result: &ResultLine, completed: Option<usize>) {
         if self.capture || self.label_summary {
             let mut records = self.records.borrow_mut();
             let record = records.entry(test.number).or_default();
@@ -206,42 +277,67 @@ impl<'a> Report<'a> {
         {
             self.missing_command(test);
         } else if let Some(detail) = &result.detail {
-            self.write(format_args!("{detail}\n"));
+            let stream = if detail.starts_with("Unable to find build dependency:") {
+                Stream::Stderr
+            } else {
+                Stream::Stdout
+            };
+            self.emit(stream, format!("{detail}\n").as_bytes());
         }
         if self.options.verbose {
             for line in result.output.split_inclusive(|&byte| byte == b'\n') {
                 self.write(format_args!("{}: ", test.number));
-                self.host.write_out(Stream::Stdout, line);
+                self.emit(Stream::Stdout, line);
             }
             self.end_output_line(&result.output);
         }
-        let dots = ".".repeat(self.name_width + 3 - test.name.len());
+        if result.status == Status::NotRun
+            && test.command.program != "NOT_AVAILABLE"
+            && resolved_command(self.host, test, self.options).is_none()
+            && result
+                .detail
+                .as_ref()
+                .is_some_and(|detail| !detail.starts_with("Failed test dependencies:"))
+        {
+            self.emit(
+                Stream::Stderr,
+                format!("Unable to find executable: {}\n", test.command.program).as_bytes(),
+            );
+        }
+        let dots = ".".repeat(self.name_width.saturating_sub(test.name.len()).min(4096) + 3);
+        let progress_width = self.total.to_string().len();
+        let progress = completed.map_or_else(
+            || " ".repeat(progress_width * 2 + 1),
+            |completed| format!("{completed:>progress_width$}/{}", self.total),
+        );
+        let number = format!("#{}", test.number);
         self.write(format_args!(
-            "{completed:>progress_width$}/{} Test #{:>width$}: {} {dots}{} {:>6.2} sec\n",
-            self.total,
-            test.number,
+            "{progress} Test {number:>width$}: {} {dots}{} {:>6.2} sec\n",
             test.name,
             status_text(result.status),
             result.elapsed.as_secs_f64(),
-            width = self.number_width,
-            progress_width = self.total.to_string().len(),
+            width = self.number_width + 1,
         ));
         if !self.options.verbose && result.status.failed() && self.options.output_on_failure {
-            self.host.write_out(Stream::Stdout, &result.output);
+            self.emit(Stream::Stdout, &result.output);
             self.end_output_line(&result.output);
         }
     }
 
     fn end_output_line(&self, output: &[u8]) {
         if output.last().is_some_and(|&byte| byte != b'\n') {
-            self.host.write_out(Stream::Stdout, b"\n");
+            self.emit(Stream::Stdout, b"\n");
         }
     }
 
-    pub(crate) fn summary(&self, plan: &Plan, statuses: &[Option<Status>], elapsed: Duration) {
-        if self.options.quiet {
-            return;
-        }
+    pub(crate) fn summary(
+        &self,
+        plan: &Plan,
+        statuses: &[Option<Status>],
+        elapsed: Duration,
+        dir: &Path,
+        dashboard: bool,
+    ) {
         let mut counted = 0;
         let mut failed = 0;
         let mut skipped = false;
@@ -252,8 +348,15 @@ impl<'a> Report<'a> {
         }
         if counted == 0 {
             if !self.options.ignore_no_tests {
-                self.host
-                    .write_out(Stream::Stderr, b"No tests were found!!!\n");
+                if dashboard {
+                    self.host
+                        .write_out(Stream::Stderr, b"No tests were found!!!\n");
+                } else {
+                    self.emit(Stream::Stderr, b"No tests were found!!!\n");
+                }
+                if self.options.error_on_no_tests && !dashboard {
+                    self.failure_summary(dir);
+                }
             }
             return;
         }
@@ -282,9 +385,14 @@ impl<'a> Report<'a> {
         if failed != 0 {
             self.write(format_args!("\nThe following tests FAILED:\n"));
             self.status_list(plan, statuses, Status::failed);
-            self.host
-                .write_out(Stream::Stderr, b"Errors while running CTest\n");
+            if !dashboard {
+                self.failure_summary(dir);
+            }
         }
+    }
+
+    fn failure_summary(&self, dir: &Path) {
+        self.emit(Stream::Stderr, failure_message(dir).as_bytes());
     }
 
     fn label_summary(&self, plan: &Plan, statuses: &[Option<Status>]) {
@@ -311,7 +419,7 @@ impl<'a> Report<'a> {
         if let Some(width) = totals.keys().map(|label| label.len()).max() {
             self.write(format_args!("\nLabel Time Summary:\n"));
             for (label, (time, count)) in totals {
-                let spaces = " ".repeat(width + 3 - label.len());
+                let spaces = " ".repeat(width + 4 - label.len());
                 let suffix = if count == 1 { "" } else { "s" };
                 self.write(format_args!(
                     "{label}{spaces}= {:>6.2} sec*proc ({count} test{suffix})\n",
@@ -335,15 +443,38 @@ impl<'a> Report<'a> {
             if let Some(status) = status.filter(|&status| predicate(status)) {
                 let label = match status {
                     Status::Disabled => "Disabled",
-                    _ => status_text(status).trim_start_matches(['*', ' ']),
+                    _ => status_text(status).trim_start_matches('*').trim(),
                 };
-                self.write(format_args!(
-                    "\t{:>3} - {} ({label})\n",
-                    test.number, test.name
-                ));
+                let name = format!("{} ({label})", test.name);
+                let labels = labels(test);
+                if labels.is_empty() || !status.failed() {
+                    self.write(format_args!("\t{:>3} - {name}\n", test.number));
+                } else {
+                    let padding = " ".repeat(50usize.saturating_sub(name.len()).max(1));
+                    let labels = labels
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    self.write(format_args!(
+                        "\t{:>3} - {name}{padding}{labels}\n",
+                        test.number
+                    ));
+                }
             }
         }
     }
+}
+
+fn failure_message(dir: &Path) -> String {
+    format!(
+        "Errors while running CTest\nOutput from these tests are in: {}\nUse \"--rerun-failed --output-on-failure\" to re-run the failed cases verbosely.\n",
+        dir.join("Testing/Temporary/LastTest.log").display()
+    )
+}
+
+pub(crate) fn failure_summary(host: &dyn Host, dir: &Path) {
+    host.write_out(Stream::Stderr, failure_message(dir).as_bytes());
 }
 
 fn status_text(status: Status) -> &'static str {
@@ -406,16 +537,21 @@ impl BacktraceGraph {
         if !parts.len().is_multiple_of(3) {
             return None;
         }
+        for frame in parts.chunks(3) {
+            if let Some(file) = frame.first().filter(|file| !file.is_empty()) {
+                self.file_ids.entry(file.clone()).or_insert_with(|| {
+                    let index = self.files.len() as u64;
+                    self.files.push(Value::string(file.clone()));
+                    index
+                });
+            }
+        }
         let mut parent = None;
         for frame in parts.chunks(3).rev() {
             let Some(file) = frame.first().filter(|file| !file.is_empty()) else {
                 continue;
             };
-            let file_id = *self.file_ids.entry(file.clone()).or_insert_with(|| {
-                let index = self.files.len() as u64;
-                self.files.push(Value::string(file.clone()));
-                index
-            });
+            let file_id = *self.file_ids.get(file)?;
             let line = frame
                 .get(1)
                 .and_then(|line| json_integer(line))
@@ -515,6 +651,7 @@ pub(crate) fn show_json(host: &dyn Host, plan: &Plan, options: &CtestOptions, ra
     let tests = plan
         .tests
         .iter()
+        .filter(|test| test.command.program != "NOT_AVAILABLE")
         .map(|test| {
             let mut fields = BTreeMap::from([("name".into(), Value::string(test.name.clone()))]);
             if let Some(command) = resolved_command(host, test, options) {
@@ -691,6 +828,7 @@ const JSON_PROPERTIES: &[&[u8]] = &[
     b"FIXTURES_CLEANUP",
     b"FIXTURES_REQUIRED",
     b"FIXTURES_SETUP",
+    b"GENERATED_RESOURCE_SPEC_FILE",
     b"LABELS",
     b"MEASUREMENT",
     b"PASS_REGULAR_EXPRESSION",
@@ -854,7 +992,7 @@ mod tests {
         let host = make_host()?;
         assert_eq!(invoke(host.clone(), &[]), 0);
         let stdout = host.stream_bytes(Stream::Stdout).to_string();
-        assert!(stdout.contains("Label Time Summary:\ngroup   =   0.30 sec*proc (2 tests)"));
+        assert!(stdout.contains("Label Time Summary:\ngroup    =   0.30 sec*proc (2 tests)"));
         let host = make_host()?;
         assert_eq!(invoke(host.clone(), &["--no-label-summary".into()]), 0);
         assert!(

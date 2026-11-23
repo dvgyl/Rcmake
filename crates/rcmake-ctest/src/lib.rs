@@ -8,13 +8,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use rcmake_base::BString;
-use rcmake_host::{Host, HostError, Stream, WriteMode, path};
+use rcmake_host::{FileKind, Follow, Host, HostError, Stream, WriteMode, path};
 use rcmake_presets::{EnvSnapshot, PresetKind, ShowOnly};
 
 use crate::cli::{Invocation, Mode};
 
 mod cli;
 mod dart;
+mod dashboard;
 mod discover;
 mod discovery;
 mod execution;
@@ -105,6 +106,9 @@ pub enum CtestError {
     /// Matching a test name or label exceeded the regular expression step limit.
     #[error("Regular expression matching exceeded the step limit")]
     RegexLimit,
+    /// The test list file could not be read.
+    #[error("Problem reading test list file: {} while generating list of tests to run.", .0.display())]
+    TestList(PathBuf),
     /// The interpreter could not evaluate the test file.
     #[error("Cannot load test definitions from {}", .0.display())]
     Load(PathBuf),
@@ -116,6 +120,11 @@ pub enum CtestError {
         /// Host error for the file.
         source: HostError,
     },
+    /// The test dependency graph contains a cycle.
+    #[error(
+        "Error: a cycle exists in the test dependency graph for the test \"{0}\".\nPlease fix the cycle and run ctest again."
+    )]
+    DependencyCycle(BString),
     /// Test dependencies or fixture repeat modes prevent scheduling.
     #[error("{0}")]
     Schedule(String),
@@ -149,11 +158,18 @@ pub fn main(argv: &[BString], host: Arc<dyn Host>) -> i32 {
     {
         Ok(code) => code,
         Err(error) => {
-            host.write_out(Stream::Stderr, format!("CTest Error: {error}\n").as_bytes());
+            let prefix = if error.starts_with("Unknown value for CTEST_NO_TESTS_ACTION:") {
+                ""
+            } else {
+                "CMake Error: "
+            };
+            host.write_out(Stream::Stderr, format!("{prefix}{error}\n").as_bytes());
             1
         }
     }
 }
+
+const USAGE: &[u8] = b"Usage\n\n  ctest [options]\n\n";
 
 fn dispatch(
     host: &Arc<dyn Host>,
@@ -161,6 +177,20 @@ fn dispatch(
     args: &[BString],
 ) -> Result<i32, String> {
     match &invocation.mode {
+        Mode::CollectInstrumentation(dir) => {
+            if host
+                .metadata(dir, Follow::Yes)
+                .is_ok_and(|meta| meta.kind == FileKind::Dir)
+            {
+                rcmake_instrument::hooks::run_hook(
+                    host.as_ref(),
+                    dir,
+                    rcmake_instrument::Hook::Manual,
+                )
+                .map_err(|error| error.to_string())?;
+            }
+            Ok(0)
+        }
         Mode::Instrument { .. } => rcmake_instrument::launcher::run_launcher(host.as_ref(), args)
             .map_err(|error| error.to_string()),
         Mode::ListPresets { .. } => list_presets(host.as_ref(), invocation),
@@ -189,20 +219,93 @@ fn dispatch(
             Ok(0)
         }
         Mode::Help(_) => {
-            host.write_out(Stream::Stdout, b"Usage: ctest [options]\n");
+            host.write_out(Stream::Stdout, USAGE);
             Ok(0)
         }
         Mode::Test => {
             let _environment = PresetEnvironment::apply(host.as_ref(), &invocation.environment);
             if invocation.scripts.is_empty() {
+                if let Some(code) = dashboard::run(host.as_ref(), invocation)? {
+                    return Ok(code);
+                }
+                let dir = &invocation.options.test_dir;
+                let metadata = host.metadata(dir, Follow::Yes);
+                if !metadata
+                    .as_ref()
+                    .is_ok_and(|meta| meta.kind == FileKind::Dir)
+                    && (invocation.build_dir.is_some()
+                        || invocation.preset.is_none()
+                        || !metadata
+                            .as_ref()
+                            .is_err_and(|error| error.kind == std::io::ErrorKind::NotFound))
+                {
+                    let message = metadata
+                        .err()
+                        .map_or_else(|| "Not a directory".into(), |error| error.os_message);
+                    host.write_out(
+                        Stream::Stderr,
+                        format!(
+                            "Failed to change working directory to \"{}\": {message}\n",
+                            dir.display()
+                        )
+                        .as_bytes(),
+                    );
+                    return Ok(1);
+                }
+                if args.is_empty()
+                    && host
+                        .metadata(&dir.join("CTestTestfile.cmake"), Follow::Yes)
+                        .is_err()
+                {
+                    host.write_out(Stream::Stdout, USAGE);
+                    host.write_out(Stream::Stderr, b"*********************************\nNo test configuration file found!\n*********************************\n");
+                    return Ok(1);
+                }
+                if invocation.actions.iter().any(|action| action == "test")
+                    && [
+                        "CTestConfiguration.ini",
+                        "DartConfiguration.tcl",
+                        "CTestTestfile.cmake",
+                    ]
+                    .iter()
+                    .all(|name| host.metadata(&dir.join(name), Follow::Yes).is_err())
+                {
+                    host.write_out(
+                        Stream::Stderr,
+                        format!(
+                            "Cannot find file: {}\n",
+                            dir.join("DartConfiguration.tcl").display()
+                        )
+                        .as_bytes(),
+                    );
+                }
                 return match run_tests(Arc::clone(host), invocation, true) {
                     Ok(outcome) => Ok(outcome.exit_code),
-                    Err(error @ (CtestError::Load(_) | CtestError::Schedule(_))) => {
+                    Err(error @ CtestError::DependencyCycle(_)) => {
+                        host.write_out(Stream::Stderr, format!("{error}\n").as_bytes());
+                        Ok(8)
+                    }
+                    Err(CtestError::Load(_)) => {
+                        reporting::failure_summary(host.as_ref(), dir);
+                        Ok(8)
+                    }
+                    Err(error @ CtestError::Schedule(_)) => {
+                        host.write_out(Stream::Stderr, format!("{error}\n").as_bytes());
+                        reporting::failure_summary(host.as_ref(), dir);
+                        Ok(8)
+                    }
+                    Err(CtestError::TestList(file)) => {
+                        if !invocation.options.quiet {
+                            host.write_out(
+                                Stream::Stdout,
+                                format!("Test project {}\n", dir.display()).as_bytes(),
+                            );
+                        }
                         host.write_out(
                             Stream::Stderr,
-                            format!("CTest Error: {error}\n").as_bytes(),
+                            format!("{}\n", CtestError::TestList(file)).as_bytes(),
                         );
-                        Ok(8)
+                        Ok(1)
                     }
                     Err(error) => Err(error.to_string()),
                 };
@@ -253,7 +356,7 @@ fn list_presets(host: &dyn Host, invocation: &Invocation) -> Result<i32, String>
         Some(file) => rcmake_presets::load_file(&cwd, file, host),
         None => rcmake_presets::load(&cwd, host),
     }
-    .map_err(|error| error.message)?;
+    .map_err(cli::preset_diagnostic)?;
     let summaries = presets.list_visible(PresetKind::Test, &EnvSnapshot::from_host(host));
     if summaries.is_empty() {
         return Ok(0);
@@ -288,6 +391,7 @@ fn run_tests(
 struct TestRunOutcome {
     outcome: CtestOutcome,
     not_run: Vec<BString>,
+    no_tests: bool,
 }
 
 fn run_tests_with_dashboard(
@@ -308,7 +412,18 @@ fn run_tests_with_dashboard(
         }
     }
     let plan = if full_selection {
-        selection::plan_with(host.as_ref(), &dir, tests, options, &invocation.selection)?
+        match selection::plan_with(host.as_ref(), &dir, tests, options, &invocation.selection) {
+            Err(error @ CtestError::TestList(_)) if dashboard.is_some() => {
+                if !options.quiet {
+                    host.write_out(
+                        Stream::Stdout,
+                        format!("Test project {}\n", dir.display()).as_bytes(),
+                    );
+                }
+                return Err(error);
+            }
+            result => result?,
+        }
     } else {
         selection::plan(tests, options)?
     };
@@ -319,10 +434,7 @@ fn run_tests_with_dashboard(
         dart::Model::parse(model)
     });
     let write_dashboard = dashboard.is_some()
-        || invocation
-            .actions
-            .iter()
-            .any(|action| action.eq_ignore_ascii_case(b"Test"))
+        || invocation.actions.iter().any(|action| action == "test")
         || dashboard_model.is_some();
     let dashboard_model = invocation.dashboard_model.or(dashboard_model);
     let junit = invocation
@@ -335,7 +447,7 @@ fn run_tests_with_dashboard(
         invocation,
         &plan,
         write_dashboard || junit.is_some(),
-    );
+    )?;
     let show_only = invocation.execution.show_only;
     if let Some(format @ (ShowOnly::JsonV1 | ShowOnly::JsonV1Raw)) = show_only {
         if !options.quiet {
@@ -360,12 +472,13 @@ fn run_tests_with_dashboard(
         return Ok(TestRunOutcome::default());
     }
 
-    if !plan.is_acyclic() {
+    if let Some(name) = plan.dependency_cycle() {
+        let failure = CtestError::DependencyCycle(name.clone());
+        if full_selection {
+            return Err(failure);
+        }
         if !options.quiet {
-            host.write_out(
-                Stream::Stderr,
-                b"Error: a cycle exists in the test dependency graph.\n",
-            );
+            host.write_out(Stream::Stderr, format!("{failure}\n").as_bytes());
         }
         return Ok(TestRunOutcome {
             outcome: CtestOutcome {
@@ -376,6 +489,7 @@ fn run_tests_with_dashboard(
         });
     }
 
+    report.announce_tests();
     let wall_clock_start = host.now();
     let dashboard = if let Some(dashboard) = dashboard {
         Some(dashboard)
@@ -423,7 +537,53 @@ fn run_tests_with_dashboard(
         None
     };
     let started = host.monotonic();
-    let results = schedule::run(host.as_ref(), &dir, invocation, &plan, &report, deadline)?;
+    let configuration;
+    let coverage_tool = if let Some(tool) = &invocation.coverage_tool {
+        tool
+    } else if let Some(dashboard) = &dashboard {
+        &dashboard.configuration.coverage_tool
+    } else {
+        configuration = dart::Configuration::load(
+            host.as_ref(),
+            &dir,
+            &invocation.overwrite_configuration_file,
+        )
+        .map_err(|source| CtestError::Access {
+            path: dir.clone(),
+            source,
+        })?;
+        &configuration.coverage_tool
+    };
+    let custom = discovery::custom_commands(Arc::clone(&host), &dir)?;
+    run_custom_commands(host.as_ref(), &dir, custom.before, options.quiet)?;
+    let interactive = invocation
+        .execution
+        .interactive_debugging
+        .unwrap_or_else(|| {
+            dashboard.is_none()
+                && invocation.actions.is_empty()
+                && invocation.dashboard_model.is_none()
+                && !invocation
+                    .definitions
+                    .iter()
+                    .any(|definition| !definition.contains(&b'='))
+        });
+    let environment = if interactive {
+        BTreeMap::from([("CTEST_INTERACTIVE_DEBUG_MODE".into(), Some("1".into()))])
+    } else {
+        BTreeMap::from([("DASHBOARD_TEST_FROM_CTEST".into(), Some(BString::default()))])
+    };
+    let _debug_environment =
+        full_selection.then(|| PresetEnvironment::apply(host.as_ref(), &environment));
+    let results = schedule::run(
+        host.as_ref(),
+        &dir,
+        invocation,
+        &plan,
+        &report,
+        deadline,
+        coverage_tool,
+    )?;
     if let Err(error) =
         rcmake_instrument::hooks::run_hook(host.as_ref(), &dir, rcmake_instrument::Hook::PostCTest)
     {
@@ -433,7 +593,8 @@ fn run_tests_with_dashboard(
         );
     }
     let elapsed = host.monotonic().saturating_sub(started);
-    report.summary(&plan, &results, elapsed);
+    report.summary(&plan, &results, elapsed, &dir, write_dashboard);
+    run_custom_commands(host.as_ref(), &dir, custom.after, options.quiet)?;
     let records = report.records();
     if let Some(file) = junit {
         let file = dir.join(path::to_native(file));
@@ -470,6 +631,7 @@ fn run_tests_with_dashboard(
             records: &records,
             started: wall_clock_start,
             elapsed,
+            output: &invocation.output,
         };
         dart::write_test_xml(host.as_ref(), dashboard, &run).map_err(|source| {
             CtestError::Access {
@@ -502,7 +664,43 @@ fn run_tests_with_dashboard(
     if !outcome.failed.is_empty() || (options.error_on_no_tests && no_tests) {
         outcome.exit_code = 8;
     }
-    Ok(TestRunOutcome { outcome, not_run })
+    Ok(TestRunOutcome {
+        outcome,
+        not_run,
+        no_tests: plan.tests.is_empty(),
+    })
+}
+
+fn run_custom_commands(
+    host: &dyn Host,
+    dir: &std::path::Path,
+    commands: Vec<rcmake_host::CommandSpec>,
+    quiet: bool,
+) -> Result<(), CtestError> {
+    for command in commands {
+        let program = command.program;
+        let result = script::run_process(
+            host,
+            dir.to_path_buf(),
+            program.clone(),
+            command.args,
+            host.env_all(),
+            !quiet,
+        )
+        .map_err(|source| CtestError::Access {
+            path: dir.to_path_buf(),
+            source,
+        })?;
+        if !matches!(
+            result.results.as_slice(),
+            [rcmake_host::ProcessResult::Exited(0)]
+        ) {
+            return Err(CtestError::Schedule(format!(
+                "CTest custom command failed: {program}"
+            )));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

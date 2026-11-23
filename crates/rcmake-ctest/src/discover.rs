@@ -58,11 +58,11 @@ fn parse(args: &[ExpandedArg]) -> Result<BTreeMap<&[u8], Vec<BString>>, CmdError
     Ok(fields)
 }
 
-fn properties(values: &[BString]) -> Result<BTreeMap<BString, BString>, CmdError> {
+fn properties(key: &str, values: &[BString]) -> Result<BTreeMap<BString, BString>, CmdError> {
     let (pairs, remainder) = values.as_chunks::<2>();
     if !remainder.is_empty() {
         return Err(CmdError::Status(
-            "properties require key-value pairs".into(),
+            format!("{key} must be key-value pairs.").into(),
         ));
     }
     Ok(pairs
@@ -92,9 +92,16 @@ pub(crate) fn run(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
     if anchored.len() < 2 || !pattern.ends_with(b"$") {
         anchored.push(b'$');
     }
-    let regex =
-        Regex::new(&anchored).map_err(|error| CmdError::Status(error.to_string().into()))?;
-    let test_properties = properties(values(b"TEST_PROPERTIES"))?;
+    let regex = Regex::new(&anchored).map_err(|_| {
+        CmdError::Status(
+            format!(
+                "DISCOVERY_MATCH failed to compile regex \"{}\".",
+                BString::from(pattern)
+            )
+            .into(),
+        )
+    })?;
+    let test_properties = properties("TEST_PROPERTIES", values(b"TEST_PROPERTIES"))?;
     let discovery = Test {
         name: BString::default(),
         command: CommandSpec {
@@ -102,7 +109,7 @@ pub(crate) fn run(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
             args: command_args.to_vec(),
         },
         directory: cx.current_binary_dir(),
-        properties: properties(values(b"DISCOVERY_PROPERTIES"))?,
+        properties: properties("DISCOVERY_PROPERTIES", values(b"DISCOVERY_PROPERTIES"))?,
     };
     let mut command = discovery.command.clone();
     command.args.extend_from_slice(values(b"DISCOVERY_ARGS"));
@@ -125,18 +132,28 @@ pub(crate) fn run(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
         .filter(|timeout| !timeout.is_zero()),
         tee: false,
     };
+    let failure = |detail: &str| {
+        CmdError::Status(format!("failed to run command: {program}\n\n{detail}").into())
+    };
     let output = cx
         .host()
         .run(&request, &mut |_, _| {})
-        .map_err(|error| CmdError::Status(error.to_string().into()))?;
-    if !matches!(output.results.as_slice(), [ProcessResult::Exited(0)]) {
-        return Err(CmdError::Status(
-            format!(
-                "discovery command failed: {program}\n{}",
-                BString::from(output.stderr)
-            )
-            .into(),
-        ));
+        .map_err(|error| failure(&error.to_string()))?;
+    match output.results.as_slice() {
+        [ProcessResult::Exited(0)] => {}
+        [ProcessResult::TimedOut] => return Err(failure("Process terminated due to timeout")),
+        [ProcessResult::SpawnFailed(error)] => {
+            let detail = if error.kind == std::io::ErrorKind::NotFound {
+                "no such file or directory"
+            } else {
+                &error.os_message
+            };
+            return Err(failure(detail));
+        }
+        _ => {
+            let detail = String::from_utf8_lossy(&output.stderr);
+            return Err(failure(detail.trim_end()));
+        }
     }
 
     let limits = Limits::default();

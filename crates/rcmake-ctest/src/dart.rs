@@ -19,6 +19,10 @@ pub(crate) struct Configuration {
     pub(crate) site: BString,
     pub(crate) build_name: BString,
     pub(crate) nightly_start: BString,
+    pub(crate) source_directory: BString,
+    pub(crate) build_directory: BString,
+    pub(crate) coverage_tool: BString,
+    pub(crate) change_id: BString,
 }
 
 impl Configuration {
@@ -46,11 +50,60 @@ impl Configuration {
         Ok(config)
     }
 
+    pub(crate) fn update_file(
+        &self,
+        host: &dyn Host,
+        source: &Path,
+        build: &Path,
+    ) -> HostResult<()> {
+        let file = build.join("DartConfiguration.tcl");
+        let previous = match host.read(&file, ReadRange::All { limit: 1024 * 1024 }) {
+            Ok(data) => data,
+            Err(error) if error.kind == ErrorKind::NotFound => Vec::new(),
+            Err(error) => return Err(error),
+        };
+        let source = path::from_native(source);
+        let build = path::from_native(build);
+        let fields = [
+            (b"Site".as_slice(), self.site.as_slice()),
+            (b"BuildName", self.build_name.as_slice()),
+            (b"SourceDirectory", source.as_slice()),
+            (b"BuildDirectory", build.as_slice()),
+        ];
+        let mut data = Vec::new();
+        for line in previous
+            .split(|&byte| byte == b'\n')
+            .filter(|line| !line.is_empty())
+        {
+            if !split(line, b':')
+                .is_some_and(|(key, _)| fields.iter().any(|(field, _)| *field == key.trim_ascii()))
+            {
+                data.extend_from_slice(line);
+                data.push(b'\n');
+            }
+        }
+        for (key, value) in fields {
+            data.extend_from_slice(key);
+            data.extend_from_slice(b": ");
+            data.extend(
+                value
+                    .iter()
+                    .copied()
+                    .filter(|byte| !matches!(byte, b'\r' | b'\n')),
+            );
+            data.push(b'\n');
+        }
+        write_file(host, &file, &data)
+    }
+
     fn set(&mut self, key: &[u8], value: &[u8]) {
         match key {
             b"Site" => self.site = value.into(),
             b"BuildName" => self.build_name = value.into(),
             b"NightlyStartTime" => self.nightly_start = value.into(),
+            b"SourceDirectory" => self.source_directory = value.into(),
+            b"BuildDirectory" => self.build_directory = value.into(),
+            b"CTestTestCoverageTool" => self.coverage_tool = value.into(),
             _ => {}
         }
     }
@@ -92,6 +145,9 @@ impl Model {
     }
 }
 
+pub(crate) const TAG_MISSING_MODEL: &str =
+    "TAG file does not contain model and no model specified in start command";
+
 impl Tag {
     pub(crate) fn stamp(&self) -> &str {
         &self.stamp
@@ -127,8 +183,7 @@ impl Tag {
         {
             return Err(HostError::unsupported("Invalid Testing/TAG file"));
         }
-        let model =
-            model.ok_or_else(|| HostError::unsupported("Testing/TAG has no dashboard model"))?;
+        let model = model.ok_or_else(|| HostError::unsupported(TAG_MISSING_MODEL))?;
         Ok(Self {
             stamp: stamp.to_owned(),
             track: track.to_owned(),
@@ -228,6 +283,7 @@ pub(crate) struct TestRun<'a> {
     pub(crate) records: &'a BTreeMap<usize, TestRecord>,
     pub(crate) started: FileTime,
     pub(crate) elapsed: Duration,
+    pub(crate) output: &'a rcmake_presets::TestOutput,
 }
 
 pub(crate) fn write_test_xml(
@@ -270,6 +326,9 @@ pub(crate) fn write_test_xml(
     ] {
         let separator = if key == "BuildName" { " " } else { "\n\t" };
         let _ = write!(xml, "{separator}{key}=\"{}\"", escape(value, true));
+    }
+    if !config.change_id.is_empty() {
+        let _ = write!(xml, "\n\tChangeId=\"{}\"", escape(&config.change_id, true));
     }
     xml.push_str("\n\t>\n\t<Testing>\n");
     date_elements(host, &mut xml, "Start", run.started);
@@ -354,7 +413,26 @@ pub(crate) fn write_test_xml(
         } else {
             completion(status, record)
         };
-        measurement(&mut xml, "text/string", "Completion Status", &reason);
+        let mut labels: std::collections::BTreeSet<_> = labels(test).into_iter().collect();
+        let raw_output = output(test, status, record);
+        let mut contents = Vec::new();
+        let mut details = None;
+        for line in raw_output.split_inclusive(|&byte| byte == b'\n') {
+            let text = line.trim_ascii();
+            if let Some(label) = element_value(text, b"<CTestLabel>", b"</CTestLabel>") {
+                labels.insert(BString::from(label));
+            } else if let Some(value) = element_value(text, b"<CTestDetails>", b"</CTestDetails>") {
+                details = Some(String::from_utf8_lossy(value));
+            } else {
+                contents.extend_from_slice(line);
+            }
+        }
+        measurement(
+            &mut xml,
+            "text/string",
+            "Completion Status",
+            details.as_deref().unwrap_or(&reason),
+        );
         measurement(&mut xml, "text/string", "Command Line", command);
         let mut environment = Vec::new();
         if !command.is_empty() {
@@ -368,9 +446,18 @@ pub(crate) fn write_test_xml(
             .join("\n");
         measurement(&mut xml, "text/string", "Environment", &environment);
         xml.push_str("\t\t\t\t<Measurement>\n");
-        element(&mut xml, 5, "Value", &output(test, status, record));
+        let limit = if status.failed() {
+            run.output.max_failed_test_output_size
+        } else {
+            run.output.max_passed_test_output_size
+        };
+        element(
+            &mut xml,
+            5,
+            "Value",
+            &truncate_output(&contents, limit, run.output.test_output_truncation),
+        );
         xml.push_str("\t\t\t\t</Measurement>\n\t\t\t</Results>\n");
-        let labels = labels(test);
         if !labels.is_empty() {
             xml.push_str("\t\t\t<Labels>\n");
             for label in labels {
@@ -397,6 +484,42 @@ pub(crate) fn write_test_xml(
             .join("Test.xml"),
         xml.as_bytes(),
     )
+}
+
+fn element_value<'a>(text: &'a [u8], start: &[u8], end: &[u8]) -> Option<&'a [u8]> {
+    text.strip_prefix(start)?.strip_suffix(end)
+}
+
+fn truncate_output<'a>(
+    output: &'a [u8],
+    limit: Option<i32>,
+    mode: Option<rcmake_presets::OutputTruncation>,
+) -> std::borrow::Cow<'a, [u8]> {
+    use rcmake_presets::OutputTruncation;
+    let Some(limit) = limit
+        .and_then(|limit| usize::try_from(limit).ok())
+        .filter(|&limit| limit > 0 && output.len() > limit)
+    else {
+        return output.into();
+    };
+    let (head, tail) = match mode.unwrap_or(OutputTruncation::Tail) {
+        OutputTruncation::Head => (0, limit),
+        OutputTruncation::Middle => (limit / 2, limit - limit / 2),
+        OutputTruncation::Tail => (limit, 0),
+    };
+    let mut result = Vec::new();
+    if head > 0 {
+        result.extend_from_slice(output.get(..head).unwrap_or_default());
+        result.extend_from_slice(b"...");
+    }
+    result.extend_from_slice(format!(
+        "\n[This part of the test output was removed since it exceeds the threshold of {limit} bytes.]\n"
+    ).as_bytes());
+    if tail > 0 {
+        result.extend_from_slice(b"...");
+        result.extend_from_slice(output.get(output.len() - tail..).unwrap_or_default());
+    }
+    result.into()
 }
 
 fn site_value(value: &[u8]) -> &[u8] {

@@ -7,7 +7,7 @@ use rcmake_host::{CommandSpec, FileKind, Follow, Host, Input, Output, ProcessRes
 
 use crate::CtestOptions;
 use crate::discovery::Test;
-use crate::selection::{OutputChecks, PlannedTest, any_match};
+use crate::selection::{OutputChecks, PlannedTest, first_match};
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10_000_000);
 
@@ -38,6 +38,7 @@ pub(crate) struct ResultLine {
     pub(crate) detail: Option<String>,
     pub(crate) exit_code: Option<i32>,
     pub(crate) skip_reason: Option<SkipReason>,
+    pub(crate) regex_reason: Option<String>,
 }
 
 impl ResultLine {
@@ -49,6 +50,7 @@ impl ResultLine {
             detail: None,
             exit_code: None,
             skip_reason: None,
+            regex_reason: None,
         }
     }
 
@@ -251,30 +253,68 @@ fn exited(test: &PlannedTest, code: i32, output: &[u8]) -> ResultLine {
         };
     }
     let OutputChecks { pass, fail, skip } = &test.checks;
-    let status = (|| {
-        if any_match(skip, output)? {
-            return Ok(Status::Skipped);
+    let reason = |message: &str, property: &[u8], matched: Option<usize>| {
+        let values = test.list(property);
+        let patterns = if let Some(index) = matched {
+            values
+                .get(index)
+                .map_or_else(String::new, ToString::to_string)
+        } else {
+            values
+                .iter()
+                .map(|value| format!("{value}\n"))
+                .collect::<String>()
+        };
+        format!("{message} Regex=[{patterns}]")
+    };
+    let result = (|| {
+        if let Some(index) = first_match(skip, output)? {
+            return Ok(ResultLine {
+                skip_reason: Some(SkipReason::RegularExpression),
+                regex_reason: Some(reason(
+                    "Skip regular expression found in output.",
+                    b"SKIP_REGULAR_EXPRESSION",
+                    Some(index),
+                )),
+                ..ResultLine::new(Status::Skipped)
+            });
         }
-        let passed = (if pass.is_empty() {
+        let required = first_match(pass, output)?;
+        let rejected = first_match(fail, output)?;
+        let passed = if pass.is_empty() {
             code == 0
         } else {
-            any_match(pass, output)?
-        }) && !any_match(fail, output)?;
-        Ok::<_, crate::CtestError>(if passed != truth::is_on(test.property(b"WILL_FAIL")) {
+            required.is_some()
+        };
+        let status = if (passed && rejected.is_none()) != truth::is_on(test.property(b"WILL_FAIL"))
+        {
             Status::Passed
         } else {
             Status::Failed
+        };
+        let regex_reason = if rejected.is_some() {
+            Some(reason(
+                "Error regular expression found in output.",
+                b"FAIL_REGULAR_EXPRESSION",
+                rejected,
+            ))
+        } else if !pass.is_empty() {
+            let message = if required.is_some() {
+                "Required regular expression found."
+            } else {
+                "Required regular expression not found."
+            };
+            Some(reason(message, b"PASS_REGULAR_EXPRESSION", required))
+        } else {
+            None
+        };
+        Ok::<_, crate::CtestError>(ResultLine {
+            regex_reason,
+            ..ResultLine::new(status)
         })
     })();
-    match status {
-        Ok(Status::Skipped) => ResultLine {
-            skip_reason: Some(SkipReason::RegularExpression),
-            ..ResultLine::new(Status::Skipped)
-        },
-        Ok(status) => ResultLine::new(status),
-        Err(error) => ResultLine {
-            detail: Some(error.to_string()),
-            ..ResultLine::new(Status::Failed)
-        },
-    }
+    result.unwrap_or_else(|error| ResultLine {
+        detail: Some(error.to_string()),
+        ..ResultLine::new(Status::Failed)
+    })
 }

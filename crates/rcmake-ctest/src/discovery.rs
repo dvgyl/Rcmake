@@ -75,14 +75,35 @@ pub(crate) fn load(
         Err(error) if error.kind == ErrorKind::NotFound => return Ok(Vec::new()),
         Err(source) => return Err(CtestError::Access { path, source }),
     }
-    let executable = host.current_exe().unwrap_or_else(|_| dir.join("cmake"));
+    let mut interp = interpreter(host, dir, register);
+    interp.cx().set_var(
+        b"CTEST_CONFIGURATION_TYPE",
+        config.cloned().unwrap_or_default(),
+    );
+    let _scope = DiscoveryScope::enter();
+    if interp.run_script(&path).exit_code != 0 {
+        return Err(CtestError::Load(path));
+    }
+    let labels = interp.cx().directory_props().get(b"LABELS").cloned();
+    let mut tests = COLLECTOR.take().tests;
+    if let Some(labels) = labels.filter(|labels| !labels.is_empty()) {
+        for test in tests.iter_mut().filter(|test| test.directory == dir) {
+            let property = test.properties.entry("LABELS".into()).or_default();
+            let mut all = list::split(&labels, list::Empty::Drop);
+            all.extend(list::split(property, list::Empty::Drop));
+            *property = list::join(&all);
+        }
+    }
+    Ok(tests)
+}
+
+fn interpreter(host: Arc<dyn Host>, dir: &Path, commands: fn(&mut Registry)) -> Interp {
+    let cmake_command = crate::script::cmake_executable(host.as_ref());
     let cmake_root = host
         .env_get(b"RCMAKE_VENDORED_DATA_ROOT")
         .map(|root| dir.join(to_native(&root)))
-        .or_else(|| Some(executable.parent()?.parent()?.join("share/cmake-4.5")))
+        .or_else(|| Some(cmake_command.parent()?.parent()?.join("share/cmake-4.5")))
         .unwrap_or_default();
-    let cmake_command =
-        executable.with_file_name(if cfg!(windows) { "cmake.exe" } else { "cmake" });
     let mut interp = Interp::new(
         InterpConfig {
             host,
@@ -98,18 +119,56 @@ pub(crate) fn load(
             defines: Vec::new(),
             script_args: Vec::new(),
         },
-        register,
+        commands,
     );
     interp.set_log_level(Some(LogLevel::Notice));
-    interp.cx().set_var(
-        b"CTEST_CONFIGURATION_TYPE",
-        config.cloned().unwrap_or_default(),
-    );
-    let _scope = DiscoveryScope::enter();
+    interp
+}
+
+#[derive(Default)]
+pub(crate) struct CustomCommands {
+    pub(crate) before: Vec<CommandSpec>,
+    pub(crate) after: Vec<CommandSpec>,
+}
+
+pub(crate) fn custom_commands(
+    host: Arc<dyn Host>,
+    dir: &Path,
+) -> Result<CustomCommands, CtestError> {
+    let path = dir.join("CTestCustom.cmake");
+    match host.metadata(&path, Follow::Yes) {
+        Ok(_) => {}
+        Err(error) if error.kind == ErrorKind::NotFound => return Ok(CustomCommands::default()),
+        Err(source) => return Err(CtestError::Access { path, source }),
+    }
+    let mut interp = interpreter(host, dir, rcmake_commands::register_all);
     if interp.run_script(&path).exit_code != 0 {
         return Err(CtestError::Load(path));
     }
-    Ok(COLLECTOR.take().tests)
+    let mut cx = interp.cx();
+    let mut read = |key: &[u8]| {
+        let value = cx.var_or_empty(key);
+        list::split(&value, list::Empty::Drop)
+            .iter()
+            .map(|raw| {
+                let words = crate::script::split_command(&mut cx, raw)
+                    .map_err(|_| CtestError::Load(path.clone()))?;
+                let mut words = words.into_iter();
+                let program = words
+                    .next()
+                    .filter(|word| !word.is_empty())
+                    .ok_or_else(|| CtestError::Load(path.clone()))?;
+                Ok(CommandSpec {
+                    program,
+                    args: words.collect(),
+                })
+            })
+            .collect::<Result<Vec<_>, CtestError>>()
+    };
+    Ok(CustomCommands {
+        before: read(b"CTEST_CUSTOM_PRE_TEST")?,
+        after: read(b"CTEST_CUSTOM_POST_TEST")?,
+    })
 }
 
 fn register(registry: &mut Registry) {
@@ -166,8 +225,16 @@ fn set_properties(_: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
                 for &id in ids {
                     if let Some(test) = state.tests.get_mut(id) {
                         for [key, value] in pairs {
-                            test.properties
-                                .insert(key.value.clone(), value.value.clone());
+                            if key.value == "REQUIRED_FILES" {
+                                let current = test.properties.entry(key.value.clone()).or_default();
+                                if !current.is_empty() && !value.value.is_empty() {
+                                    current.push(b';');
+                                }
+                                current.extend_from_slice(&value.value);
+                            } else {
+                                test.properties
+                                    .insert(key.value.clone(), value.value.clone());
+                            }
                         }
                     }
                 }
@@ -185,6 +252,11 @@ fn add_subdirectory(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
 }
 
 fn subdirs(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
+    if args.is_empty() {
+        return Err(CmdError::Status(
+            "called with incorrect number of arguments".into(),
+        ));
+    }
     if cx
         .backtrace()
         .frames()
