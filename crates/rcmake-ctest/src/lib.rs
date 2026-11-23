@@ -2,14 +2,13 @@
 
 #![forbid(unsafe_code)]
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use rcmake_base::BString;
 use rcmake_host::{Host, HostError, Stream, WriteMode, path};
-use rcmake_json::Value;
 use rcmake_presets::{EnvSnapshot, PresetKind, ShowOnly};
 
 use crate::cli::{Invocation, Mode};
@@ -22,10 +21,6 @@ mod execution;
 mod junit;
 mod reporting;
 mod schedule;
-#[allow(
-    unfulfilled_lint_expectations,
-    reason = "CTest calls the script stub before dashboard support is implemented"
-)]
 mod script;
 mod selection;
 mod state;
@@ -214,17 +209,9 @@ fn dispatch(
             }
             let mut code = 0;
             for script in &invocation.scripts {
-                let file = script
-                    .argument
-                    .split(|&byte| byte == b',')
-                    .next()
-                    .unwrap_or_default();
                 code = code.max(
-                    script::run_script(
-                        host.as_ref(),
-                        &host.initial_cwd().join(path::to_native(file)),
-                    )
-                    .map_err(|error| error.to_string())?,
+                    script::run_script(host, invocation, script)
+                        .map_err(|error| error.to_string())?,
                 );
             }
             Ok(code)
@@ -294,11 +281,26 @@ fn run_tests(
     invocation: &Invocation,
     full_selection: bool,
 ) -> Result<CtestOutcome, CtestError> {
+    run_tests_with_dashboard(host, invocation, full_selection, None).map(|run| run.outcome)
+}
+
+#[derive(Default)]
+struct TestRunOutcome {
+    outcome: CtestOutcome,
+    not_run: Vec<BString>,
+}
+
+fn run_tests_with_dashboard(
+    host: Arc<dyn Host>,
+    invocation: &Invocation,
+    full_selection: bool,
+    dashboard: Option<dart::Dashboard>,
+) -> Result<TestRunOutcome, CtestError> {
     let options = &invocation.options;
     let deadline = schedule::stop_deadline(host.as_ref(), invocation.stop_time);
     let dir = host.initial_cwd().join(&options.test_dir);
-    let dir =
-        path::to_native(&rcmake_base::path_lex::Lexical::new(&path::from_native(&dir)).normalize());
+    let normalized = rcmake_base::path_lex::Lexical::new(&path::from_native(&dir)).normalize();
+    let dir: PathBuf = path::to_native(&normalized).components().collect();
     let mut tests = discovery::load(Arc::clone(&host), &dir, options.config.as_ref())?;
     if let Some(args) = &invocation.execution.test_passthrough_arguments {
         for test in &mut tests {
@@ -310,24 +312,52 @@ fn run_tests(
     } else {
         selection::plan(tests, options)?
     };
-    let report = reporting::Report::new(host.as_ref(), options, &plan);
+    let dashboard_model = invocation.definitions.iter().find_map(|definition| {
+        let model = [b"Experimental".as_slice(), b"Continuous", b"Nightly"]
+            .into_iter()
+            .find(|&model| matches!(definition.strip_prefix(model), Some(b"" | b"Test")))?;
+        dart::Model::parse(model)
+    });
+    let write_dashboard = dashboard.is_some()
+        || invocation
+            .actions
+            .iter()
+            .any(|action| action.eq_ignore_ascii_case(b"Test"))
+        || dashboard_model.is_some();
+    let dashboard_model = invocation.dashboard_model.or(dashboard_model);
+    let junit = invocation
+        .output
+        .output_junit_file
+        .as_ref()
+        .filter(|path| !path.is_empty());
+    let report = reporting::Report::new(
+        host.as_ref(),
+        invocation,
+        &plan,
+        write_dashboard || junit.is_some(),
+    );
     let show_only = invocation.execution.show_only;
     if let Some(format @ (ShowOnly::JsonV1 | ShowOnly::JsonV1Raw)) = show_only {
         if !options.quiet {
-            show_json(host.as_ref(), &plan, options, format == ShowOnly::JsonV1Raw);
+            reporting::show_json(host.as_ref(), &plan, options, format == ShowOnly::JsonV1Raw);
         }
-        return Ok(CtestOutcome::default());
+        return Ok(TestRunOutcome::default());
     }
-    report.project(&dir);
+    if dashboard
+        .as_ref()
+        .is_none_or(|dashboard| dashboard.show_project)
+    {
+        report.project(&dir);
+    }
     if invocation.print_labels {
         if !options.quiet {
-            print_labels(host.as_ref(), &plan);
+            reporting::print_labels(host.as_ref(), &plan);
         }
-        return Ok(CtestOutcome::default());
+        return Ok(TestRunOutcome::default());
     }
     if options.show_only {
         report.list(&plan);
-        return Ok(CtestOutcome::default());
+        return Ok(TestRunOutcome::default());
     }
 
     if !plan.is_acyclic() {
@@ -337,12 +367,61 @@ fn run_tests(
                 b"Error: a cycle exists in the test dependency graph.\n",
             );
         }
-        return Ok(CtestOutcome {
-            exit_code: 8,
-            ..CtestOutcome::default()
+        return Ok(TestRunOutcome {
+            outcome: CtestOutcome {
+                exit_code: 8,
+                ..CtestOutcome::default()
+            },
+            ..TestRunOutcome::default()
         });
     }
 
+    let wall_clock_start = host.now();
+    let dashboard = if let Some(dashboard) = dashboard {
+        Some(dashboard)
+    } else if write_dashboard {
+        let configuration = dart::Configuration::load(
+            host.as_ref(),
+            &dir,
+            &invocation.overwrite_configuration_file,
+        )
+        .map_err(|source| CtestError::Access {
+            path: dir.clone(),
+            source,
+        })?;
+        let tag = match dashboard_model {
+            None => dart::Tag::read(host.as_ref(), &dir).or_else(|_| {
+                dart::Tag::create(
+                    host.as_ref(),
+                    &dir,
+                    wall_clock_start,
+                    dart::Model::Experimental,
+                    None,
+                    b"",
+                )
+            }),
+            Some(model) => dart::Tag::create(
+                host.as_ref(),
+                &dir,
+                wall_clock_start,
+                model,
+                None,
+                &configuration.nightly_start,
+            ),
+        }
+        .map_err(|source| CtestError::Access {
+            path: dir.join("Testing/TAG"),
+            source,
+        })?;
+        Some(dart::Dashboard {
+            directory: dir.clone(),
+            tag,
+            configuration,
+            show_project: true,
+        })
+    } else {
+        None
+    };
     let started = host.monotonic();
     let results = schedule::run(host.as_ref(), &dir, invocation, &plan, &report, deadline)?;
     if let Err(error) =
@@ -353,226 +432,77 @@ fn run_tests(
             format!("CTest instrumentation error: {error}\n").as_bytes(),
         );
     }
-    report.summary(&plan, &results, host.monotonic().saturating_sub(started));
+    let elapsed = host.monotonic().saturating_sub(started);
+    report.summary(&plan, &results, elapsed);
+    let records = report.records();
+    if let Some(file) = junit {
+        let file = dir.join(path::to_native(file));
+        let configuration;
+        let config = if let Some(dashboard) = &dashboard {
+            &dashboard.configuration
+        } else {
+            configuration = dart::Configuration::load(
+                host.as_ref(),
+                &dir,
+                &invocation.overwrite_configuration_file,
+            )
+            .map_err(|source| CtestError::Access {
+                path: dir.clone(),
+                source,
+            })?;
+            &configuration
+        };
+        junit::write(
+            host.as_ref(),
+            &file,
+            config,
+            &plan,
+            &results,
+            &records,
+            elapsed,
+        )
+        .map_err(|source| CtestError::Access { path: file, source })?;
+    }
+    if let Some(dashboard) = &dashboard {
+        let run = dart::TestRun {
+            plan: &plan,
+            statuses: &results,
+            records: &records,
+            started: wall_clock_start,
+            elapsed,
+        };
+        dart::write_test_xml(host.as_ref(), dashboard, &run).map_err(|source| {
+            CtestError::Access {
+                path: dashboard.directory.join("Testing"),
+                source,
+            }
+        })?;
+    }
     let no_tests = results
         .iter()
         .flatten()
         .all(|status| *status == execution::Status::Disabled);
     let mut outcome = CtestOutcome::default();
+    let mut not_run = Vec::new();
     for (test, result) in plan.tests.iter().zip(results) {
         match result {
             Some(execution::Status::Passed) => outcome.passed.push(test.name.clone()),
-            Some(status) if status.failed() => outcome.failed.push(test.name.clone()),
+            Some(status) if status.failed() => {
+                outcome.failed.push(test.name.clone());
+                if status == execution::Status::NotRun
+                    && let Some(record) = records.get(&test.number)
+                    && junit::completion(status, record) != "Fixture dependency failed"
+                {
+                    not_run.push(junit::output(test, status, record).into_owned().into());
+                }
+            }
             _ => {}
         }
     }
     if !outcome.failed.is_empty() || (options.error_on_no_tests && no_tests) {
         outcome.exit_code = 8;
     }
-    Ok(outcome)
-}
-
-fn print_labels(host: &dyn Host, plan: &selection::Plan) {
-    let labels: BTreeSet<_> = plan
-        .tests
-        .iter()
-        .flat_map(|test| test.list(b"LABELS"))
-        .collect();
-    if labels.is_empty() {
-        host.write_out(Stream::Stdout, b"No Labels Exist\n");
-    } else {
-        host.write_out(Stream::Stdout, b"All Labels:\n");
-        for label in labels {
-            host.write_out(Stream::Stdout, format!("  {label}\n").as_bytes());
-        }
-    }
-}
-
-fn object<const N: usize>(fields: [(&str, Value); N]) -> Value {
-    Value::Object(
-        fields
-            .into_iter()
-            .map(|(name, value)| (name.into(), value))
-            .collect(),
-    )
-}
-
-#[derive(PartialEq, Eq, PartialOrd, Ord)]
-struct BacktraceNode {
-    file: u64,
-    line: Option<u64>,
-    command: Option<u64>,
-    parent: Option<u64>,
-}
-
-#[derive(Default)]
-struct BacktraceGraph {
-    files: Vec<Value>,
-    commands: Vec<Value>,
-    nodes: Vec<Value>,
-    file_ids: BTreeMap<BString, u64>,
-    command_ids: BTreeMap<BString, u64>,
-    node_ids: BTreeMap<BacktraceNode, u64>,
-}
-
-impl BacktraceGraph {
-    fn push(&mut self, triples: &[u8]) -> Option<Value> {
-        let parts = rcmake_base::list::split(triples, rcmake_base::list::Empty::Keep);
-        if !parts.len().is_multiple_of(3) {
-            return None;
-        }
-        let mut parent = None;
-        for frame in parts.chunks(3).rev() {
-            let Some(file) = frame.first().filter(|file| !file.is_empty()) else {
-                continue;
-            };
-            let file_id = *self.file_ids.entry(file.clone()).or_insert_with(|| {
-                let index = self.files.len() as u64;
-                self.files.push(Value::string(file.clone()));
-                index
-            });
-            let line = frame
-                .get(1)
-                .and_then(|line| json_integer(line))
-                .filter(|line| *line > 0)
-                .map(|line| line as u64);
-            let command = frame
-                .get(2)
-                .filter(|command| !command.is_empty())
-                .map(|command| {
-                    *self.command_ids.entry(command.clone()).or_insert_with(|| {
-                        let index = self.commands.len() as u64;
-                        self.commands.push(Value::string(command.clone()));
-                        index
-                    })
-                });
-            let id = *self
-                .node_ids
-                .entry(BacktraceNode {
-                    file: file_id,
-                    line,
-                    command,
-                    parent,
-                })
-                .or_insert_with(|| {
-                    let mut node = BTreeMap::from([("file".into(), Value::UInt(file_id))]);
-                    for (field, value) in [("line", line), ("command", command), ("parent", parent)]
-                    {
-                        if let Some(value) = value {
-                            node.insert(field.into(), Value::UInt(value));
-                        }
-                    }
-                    let index = self.nodes.len() as u64;
-                    self.nodes.push(Value::Object(node));
-                    index
-                });
-            parent = Some(id);
-        }
-        parent.map(Value::UInt)
-    }
-}
-
-fn json_integer(value: &[u8]) -> Option<i64> {
-    std::str::from_utf8(value).ok()?.trim().parse().ok()
-}
-
-fn json_property(key: &[u8], value: &BString, raw: bool) -> Value {
-    if raw {
-        return Value::string(value.clone());
-    }
-    use rcmake_base::{list, truth};
-    match key {
-        b"DISABLED" | b"RUN_SERIAL" | b"WILL_FAIL" => Value::Bool(truth::is_on(value)),
-        b"PROCESSORS" | b"SKIP_RETURN_CODE" => Value::Int(json_integer(value).unwrap_or(0)),
-        b"TIMEOUT" | b"COST" => Value::Real(
-            cli::number_prefix(value)
-                .filter(|value| value.is_finite())
-                .unwrap_or_default(),
-        ),
-        b"DEPENDS" | b"FIXTURES_SETUP" | b"FIXTURES_CLEANUP" | b"FIXTURES_REQUIRED" | b"LABELS"
-        | b"RESOURCE_LOCK" => {
-            let values: BTreeSet<_> = list::split(value, list::Empty::Drop).into_iter().collect();
-            Value::Array(values.into_iter().map(Value::string).collect())
-        }
-        b"ATTACHED_FILES"
-        | b"ATTACHED_FILES_ON_FAIL"
-        | b"ENVIRONMENT"
-        | b"ENVIRONMENT_MODIFICATION"
-        | b"FAIL_REGULAR_EXPRESSION"
-        | b"PASS_REGULAR_EXPRESSION"
-        | b"SKIP_REGULAR_EXPRESSION" => Value::Array(
-            list::split(value, list::Empty::Drop)
-                .into_iter()
-                .map(Value::string)
-                .collect(),
-        ),
-        _ => Value::string(value.clone()),
-    }
-}
-
-fn show_json(host: &dyn Host, plan: &selection::Plan, options: &CtestOptions, raw: bool) {
-    let mut graph = BacktraceGraph::default();
-    let tests = plan
-        .tests
-        .iter()
-        .map(|test| {
-            let mut fields = BTreeMap::from([("name".into(), Value::string(test.name.clone()))]);
-            if test.command.program != "NOT_AVAILABLE" {
-                let mut command = test.command.clone();
-                execution::resolve_program(host, test, &mut command, options);
-                fields.insert(
-                    "command".into(),
-                    Value::Array(
-                        std::iter::once(command.program)
-                            .chain(command.args)
-                            .map(Value::string)
-                            .collect(),
-                    ),
-                );
-            }
-            if let Some(config) = &options.config {
-                fields.insert("config".into(), Value::string(config.clone()));
-            }
-            if let Some(frame) = graph.push(test.property(b"_BACKTRACE_TRIPLES")) {
-                fields.insert("backtrace".into(), frame);
-            }
-            let mut properties = test.properties.clone();
-            properties.retain(|key, _| !key.starts_with(b"_"));
-            properties
-                .entry("WORKING_DIRECTORY".into())
-                .or_insert_with(|| path::from_native(&test.directory));
-            fields.insert(
-                "properties".into(),
-                Value::Array(
-                    properties
-                        .into_iter()
-                        .map(|(name, value)| {
-                            let value = json_property(&name, &value, raw);
-                            object([("name", Value::string(name)), ("value", value)])
-                        })
-                        .collect(),
-                ),
-            );
-            Value::Object(fields)
-        })
-        .collect();
-    let data = object([
-        ("kind", Value::string("ctestInfo")),
-        (
-            "version",
-            object([("major", Value::UInt(1)), ("minor", Value::UInt(0))]),
-        ),
-        (
-            "backtraceGraph",
-            object([
-                ("commands", Value::Array(graph.commands)),
-                ("files", Value::Array(graph.files)),
-                ("nodes", Value::Array(graph.nodes)),
-            ]),
-        ),
-        ("tests", Value::Array(tests)),
-    ]);
-    host.write_out(Stream::Stdout, &rcmake_json::write_styled(&data, "  "));
+    Ok(TestRunOutcome { outcome, not_run })
 }
 
 #[cfg(test)]
@@ -585,6 +515,7 @@ mod wave_two_tests {
     use rcmake_host::{HostResult, ProcessResult, PureHost, RunOutput};
 
     use super::*;
+    use rcmake_json::Value;
 
     type TestResult = Result<(), Box<dyn Error>>;
 

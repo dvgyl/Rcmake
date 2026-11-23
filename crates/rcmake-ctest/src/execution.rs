@@ -36,6 +36,8 @@ pub(crate) struct ResultLine {
     pub(crate) elapsed: Duration,
     pub(crate) output: Vec<u8>,
     pub(crate) detail: Option<String>,
+    pub(crate) exit_code: Option<i32>,
+    pub(crate) skip_reason: Option<SkipReason>,
 }
 
 impl ResultLine {
@@ -45,6 +47,8 @@ impl ResultLine {
             elapsed: Duration::ZERO,
             output: Vec::new(),
             detail: None,
+            exit_code: None,
+            skip_reason: None,
         }
     }
 
@@ -54,6 +58,12 @@ impl ResultLine {
             ..Self::new(Status::NotRun)
         }
     }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum SkipReason {
+    ReturnCode(i32),
+    RegularExpression,
 }
 
 pub(crate) type Environment = BTreeMap<BString, BString>;
@@ -208,7 +218,10 @@ pub(crate) fn execute(host: &dyn Host, test: &PlannedTest, request: &RunRequest)
             let mut output = run.stdout;
             output.extend(run.stderr);
             let mut result = match run.results.first() {
-                Some(ProcessResult::Exited(code)) => exited(test, *code, &output),
+                Some(ProcessResult::Exited(code)) => ResultLine {
+                    exit_code: Some(*code),
+                    ..exited(test, *code, &output)
+                },
                 Some(ProcessResult::TimedOut) => ResultLine::new(Status::Timeout),
                 Some(ProcessResult::Signaled(signal)) => ResultLine {
                     detail: Some(format!("The test stopped with signal {signal}.")),
@@ -232,7 +245,10 @@ fn exited(test: &PlannedTest, code: i32, output: &[u8]) -> ResultLine {
         .and_then(|value| value.trim().parse::<i32>().ok())
         .filter(|code| (0..=255).contains(code));
     if skip_code == Some(code) {
-        return ResultLine::new(Status::Skipped);
+        return ResultLine {
+            skip_reason: Some(SkipReason::ReturnCode(code)),
+            ..ResultLine::new(Status::Skipped)
+        };
     }
     let OutputChecks { pass, fail, skip } = &test.checks;
     let status = (|| {
@@ -251,6 +267,10 @@ fn exited(test: &PlannedTest, code: i32, output: &[u8]) -> ResultLine {
         })
     })();
     match status {
+        Ok(Status::Skipped) => ResultLine {
+            skip_reason: Some(SkipReason::RegularExpression),
+            ..ResultLine::new(Status::Skipped)
+        },
         Ok(status) => ResultLine::new(status),
         Err(error) => ResultLine {
             detail: Some(error.to_string()),

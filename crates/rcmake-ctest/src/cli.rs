@@ -55,6 +55,7 @@ pub(crate) struct Invocation {
     pub(crate) preset: Option<BString>,
     pub(crate) presets_file: Option<PathBuf>,
     pub(crate) actions: Vec<BString>,
+    pub(crate) dashboard_model: Option<crate::dart::Model>,
     pub(crate) definitions: Vec<BString>,
     pub(crate) scripts: Vec<Script>,
     pub(crate) print_labels: bool,
@@ -127,6 +128,7 @@ pub(crate) fn parse(args: &[BString], host: &dyn Host) -> Result<Invocation, Str
                     | b"--quiet"
                     | b"--progress"
                     | b"--print-labels"
+                    | b"--no-compress-output"
                     | b"--no-label-summary"
                     | b"--no-subproject-summary"
                     | b"--debug"
@@ -208,6 +210,7 @@ pub(crate) fn parse(args: &[BString], host: &dyn Host) -> Result<Invocation, Str
             b"-Q" | b"--quiet" => cli.output.quiet = Some(true),
             b"--progress" => cli.output.short_progress = Some(true),
             b"--print-labels" => cli.print_labels = true,
+            b"--no-compress-output" => {}
             b"--no-label-summary" => cli.output.label_summary = Some(false),
             b"--no-subproject-summary" => cli.output.subproject_summary = Some(false),
             b"--debug" => cli.output.debug = Some(true),
@@ -238,6 +241,13 @@ pub(crate) fn parse(args: &[BString], host: &dyn Host) -> Result<Invocation, Str
             b"--resource-spec-file" => cli.execution.resource_spec_file = Some(value()?.into()),
             b"--interactive-debug-mode" => {
                 cli.execution.interactive_debugging = Some(truth::is_on(value()?));
+            }
+            b"-M" | b"--test-model" => {
+                let raw = value()?;
+                cli.dashboard_model = Some(
+                    crate::dart::Model::parse(raw)
+                        .ok_or_else(|| format!("Unknown dashboard model: {}", display(raw)))?,
+                );
             }
             b"-T" | b"--test-action" => cli.actions.push(parse_action(value()?)?),
             b"-D" | b"--dashboard" => cli.definitions.push(parse_definition(value()?)?),
@@ -342,7 +352,7 @@ fn parse_jobs(flag: &[u8], raw: Option<&[u8]>) -> Result<TestJobs, String> {
     }
 }
 
-fn parse_repeat(flag: &[u8], raw: &[u8]) -> Result<TestRepeat, String> {
+pub(crate) fn parse_repeat(flag: &[u8], raw: &[u8]) -> Result<TestRepeat, String> {
     let parse_count = |count| {
         std::str::from_utf8(count)
             .ok()?
