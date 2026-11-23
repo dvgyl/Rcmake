@@ -136,6 +136,91 @@ fn creates_targets_and_captures_creation_properties() -> TestResult {
 }
 
 #[test]
+fn captures_generated_properties_at_target_creation() -> TestResult {
+    let (_, mut interp) = configure(
+        r#"
+        set(CMAKE_AUTOMOC ON)
+        set(CMAKE_CXX_STANDARD 23)
+        set(CMAKE_C_VISIBILITY_PRESET hidden)
+        set(CMAKE_INTERPROCEDURAL_OPTIMIZATION TRUE)
+        set(CMAKE_INSTALL_RPATH "first;second")
+        set(CMAKE_PDB_OUTPUT_DIRECTORY pdb)
+        set(CMAKE_MACOSX_RPATH OFF)
+        set(CMAKE_COMPILE_WARNING_AS_ERROR ON)
+        add_library(lib STATIC lib.c)
+        set(CMAKE_AUTOMOC OFF)
+        unset(CMAKE_CXX_STANDARD)
+        set(CMAKE_C_VISIBILITY_PRESET default)
+        set(CMAKE_INTERPROCEDURAL_OPTIMIZATION FALSE)
+        set(CMAKE_INSTALL_RPATH "")
+        set(CMAKE_PDB_OUTPUT_DIRECTORY app-pdb)
+        set(CMAKE_MACOSX_RPATH ON)
+        add_executable(app app.c)
+        add_library(iface INTERFACE)
+        add_library(imported STATIC IMPORTED)
+        foreach(target lib app iface imported)
+          foreach(property AUTOMOC CXX_STANDARD C_VISIBILITY_PRESET
+                           INTERPROCEDURAL_OPTIMIZATION INSTALL_RPATH
+                           PDB_OUTPUT_DIRECTORY MACOSX_RPATH COMPILE_WARNING_AS_ERROR)
+            get_target_property(${target}_${property} ${target} ${property})
+          endforeach()
+        endforeach()
+        "#,
+        &[],
+        0,
+    )?;
+    for (name, value) in [
+        ("lib_AUTOMOC", "ON"),
+        ("lib_CXX_STANDARD", "23"),
+        ("lib_C_VISIBILITY_PRESET", "hidden"),
+        ("lib_INTERPROCEDURAL_OPTIMIZATION", "TRUE"),
+        ("lib_INSTALL_RPATH", "first;second"),
+        ("lib_PDB_OUTPUT_DIRECTORY", "pdb"),
+        ("lib_MACOSX_RPATH", "OFF"),
+        ("lib_COMPILE_WARNING_AS_ERROR", "ON"),
+        ("app_AUTOMOC", "OFF"),
+        ("app_CXX_STANDARD", "app_CXX_STANDARD-NOTFOUND"),
+        ("app_C_VISIBILITY_PRESET", "default"),
+        ("app_INTERPROCEDURAL_OPTIMIZATION", "FALSE"),
+        ("app_INSTALL_RPATH", ""),
+        ("app_PDB_OUTPUT_DIRECTORY", "app-pdb"),
+        ("app_MACOSX_RPATH", "ON"),
+        ("app_COMPILE_WARNING_AS_ERROR", "ON"),
+        ("iface_AUTOMOC", "iface_AUTOMOC-NOTFOUND"),
+        ("imported_AUTOMOC", "imported_AUTOMOC-NOTFOUND"),
+    ] {
+        var(&mut interp, name, value);
+    }
+    Ok(())
+}
+
+#[test]
+fn selects_enable_exports_initializer_by_target_type() -> TestResult {
+    let (_, mut interp) = configure(
+        r#"
+        set(CMAKE_ENABLE_EXPORTS ON)
+        set(CMAKE_SHARED_LIBRARY_ENABLE_EXPORTS ON)
+        add_executable(legacy)
+        set(CMAKE_EXECUTABLE_ENABLE_EXPORTS OFF)
+        add_executable(app)
+        add_library(shared SHARED)
+        add_library(static STATIC)
+        get_target_property(legacy_exports legacy ENABLE_EXPORTS)
+        get_target_property(app_exports app ENABLE_EXPORTS)
+        get_target_property(shared_exports shared ENABLE_EXPORTS)
+        get_target_property(static_exports static ENABLE_EXPORTS)
+        "#,
+        &[],
+        0,
+    )?;
+    var(&mut interp, "legacy_exports", "ON");
+    var(&mut interp, "app_exports", "OFF");
+    var(&mut interp, "shared_exports", "ON");
+    var(&mut interp, "static_exports", "static_exports-NOTFOUND");
+    Ok(())
+}
+
+#[test]
 fn captures_properties_for_each_active_configuration() -> TestResult {
     let (_, mut interp) = configure(
         r#"
@@ -146,11 +231,18 @@ fn captures_properties_for_each_active_configuration() -> TestResult {
         set(CMAKE_CUSTOM_POSTFIX _custom)
         set(CMAKE_RELEASE_POSTFIX _release)
         set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY_CUSTOM out/custom)
+        set(CMAKE_FRAMEWORK_MULTI_CONFIG_POSTFIX_CUSTOM _fw)
+        set(CMAKE_MAP_IMPORTED_CONFIG_CUSTOM Release)
+        set(CMAKE_OSX_ARCHITECTURES_CUSTOM arm64)
         add_library(lib STATIC)
+        add_library(imported INTERFACE IMPORTED)
         get_target_property(debug lib DEBUG_POSTFIX)
         get_target_property(custom lib CUSTOM_POSTFIX)
         get_target_property(release lib RELEASE_POSTFIX)
         get_target_property(output lib ARCHIVE_OUTPUT_DIRECTORY_CUSTOM)
+        get_target_property(framework lib FRAMEWORK_MULTI_CONFIG_POSTFIX_CUSTOM)
+        get_target_property(imported_config imported MAP_IMPORTED_CONFIG_CUSTOM)
+        get_target_property(architectures lib OSX_ARCHITECTURES_CUSTOM)
         "#,
         &[],
         0,
@@ -159,6 +251,9 @@ fn captures_properties_for_each_active_configuration() -> TestResult {
     var(&mut interp, "custom", "_custom");
     var(&mut interp, "release", "release-NOTFOUND");
     var(&mut interp, "output", "out/custom");
+    var(&mut interp, "framework", "_fw");
+    var(&mut interp, "imported_config", "Release");
+    var(&mut interp, "architectures", "arm64");
     Ok(())
 }
 
