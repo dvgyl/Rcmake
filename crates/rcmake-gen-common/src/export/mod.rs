@@ -15,11 +15,13 @@ use crate::{GenError, quote, quoted_content, write_error, write_if_changed};
 
 pub mod cps;
 mod generate;
+mod modules;
 pub(crate) mod provenance;
 pub use generate::{
     FileGenerateContext, FileGenerateInput, FileGenerateNewline, FileGeneratePermissions,
     FileGenerateRequest, write_generated_files,
 };
+pub use modules::{ModuleExportJob, write_module_exports};
 
 const IMPORT_PREFIX: &[u8] = b"${_IMPORT_PREFIX}";
 const IMPORT_VERSION: &[u8] = b"set(CMAKE_IMPORT_FILE_VERSION 1)\n";
@@ -28,7 +30,7 @@ const END_IMPORT_VERSION: &[u8] = b"unset(CMAKE_IMPORT_FILE_VERSION)\n";
 /// Render the main export file. For an install export, assume the file goes in the
 /// root of the install prefix. The main file loads any installed configuration files.
 pub fn render(plan: &ExportPlan) -> Result<BString, GenError> {
-    render_main(plan, b"", None)
+    render_main(plan, b"", None, b"")
 }
 
 /// Write the main export file and return its path first. For an install export,
@@ -54,8 +56,9 @@ pub fn write_export_plan_with_prefix(
     install_prefix: Option<&[u8]>,
     host: &dyn Host,
 ) -> Result<Vec<PathBuf>, GenError> {
-    let main = render_main(plan, install_dest.unwrap_or_default(), install_prefix)?;
-    let path = out_dir.join(to_native(&plan.file));
+    let destination = install_dest.unwrap_or_default();
+    let main = render_main(plan, destination, install_prefix, b"")?;
+    let path = export_output_directory(plan, out_dir, destination).join(to_native(&plan.file));
     let mut files = vec![(path.clone(), main)];
     if plan.install {
         for (config, targets) in configurations(plan) {
@@ -87,10 +90,27 @@ pub fn write_export_plan_with_prefix(
     Ok(files.into_iter().map(|(path, _)| path).collect())
 }
 
+fn export_output_directory(plan: &ExportPlan, out_dir: &Path, destination: &[u8]) -> PathBuf {
+    if plan.install
+        && plan.cxx_modules_directory.is_some()
+        && out_dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.parse::<usize>().is_ok())
+        && let Some(parent) = out_dir
+            .parent()
+            .filter(|parent| parent.ends_with("CMakeFiles/Export"))
+    {
+        return parent.join(rcmake_base::hash::HashAlgo::Md5.hex_digest(destination));
+    }
+    out_dir.to_owned()
+}
+
 fn render_main(
     plan: &ExportPlan,
     install_dest: &[u8],
     install_prefix: Option<&[u8]>,
+    module_properties: &[u8],
 ) -> Result<BString, GenError> {
     if !Lexical::new(&plan.file).filename().ends_with(b".cmake") {
         return Err(output_error(
@@ -114,6 +134,7 @@ cmake_policy(VERSION 3.0...4.3)
     for target in &plan.targets {
         render_target(&mut out, plan, target)?;
     }
+    out.extend_from_slice(module_properties);
     if plan.install {
         render_installed_configurations(&mut out, export_stem(plan));
     } else {
@@ -238,9 +259,19 @@ fn render_target(
         }
     }
     out.extend_from_slice(b" IMPORTED)\n");
-    if !target.properties.is_empty() {
+    let mut properties = target
+        .properties
+        .iter()
+        .filter(|(property, _)| {
+            !matches!(
+                property.as_slice(),
+                b"INTERFACE_CXX_MODULE_SETS" | b"INTERFACE_FILE_SETS_CXX_MODULES"
+            )
+        })
+        .peekable();
+    if properties.peek().is_some() {
         start_properties(out, &name);
-        for (property, value) in &target.properties {
+        for (property, value) in properties {
             render_property(out, property, value, plan.install);
         }
         out.extend_from_slice(b")\n");

@@ -5,7 +5,9 @@ use std::path::Path;
 
 use rcmake_base::{BString, path_lex::Lexical};
 use rcmake_gen_common::GenError;
-use rcmake_host::path;
+use rcmake_gen_common::export::ModuleExportJob;
+use rcmake_host::{Follow, Host, path};
+use rcmake_model::ProjectModel;
 use rcmake_resolve::{ArtifactSet, BuildGraph, BuildStep, Invocation, LinkKind};
 
 use crate::syntax::{Edge, Ninja, shell_word};
@@ -19,6 +21,7 @@ pub(crate) struct Graph<'a> {
     aliases: Vec<BString>,
     artifact_targets: HashSet<usize>,
     producers: HashMap<BString, usize>,
+    generated_inputs: HashMap<BString, BString>,
     steps: Vec<StepNodes>,
 }
 
@@ -44,6 +47,7 @@ impl<'a> Graph<'a> {
             aliases: Vec::new(),
             artifact_targets: HashSet::new(),
             producers: HashMap::new(),
+            generated_inputs: HashMap::new(),
             steps: Vec::new(),
         };
         for (index, target) in input.targets.iter().enumerate() {
@@ -191,6 +195,34 @@ impl<'a> Graph<'a> {
         self.aliases.get(*index).cloned()
     }
 
+    pub(crate) fn resolve_custom_inputs(&mut self, model: Option<&ProjectModel>, host: &dyn Host) {
+        let Some(model) = model else {
+            return;
+        };
+        let mut directories: Vec<_> = model.dirs().map(|(_, directory)| directory).collect();
+        directories.sort_by_key(|dir| std::cmp::Reverse(dir.source_dir.len()));
+        for dir in directories {
+            let source_dir = path::to_native(&dir.source_dir);
+            let binary_dir = path::to_native(&dir.binary_dir);
+            for source in dir.source_props.keys() {
+                let source_path = path::to_native(source);
+                let Ok(relative) = source_path.strip_prefix(&source_dir) else {
+                    continue;
+                };
+                let input = self.node(source);
+                let output = self.node(&path::from_native(&binary_dir.join(relative)));
+                if !self.producers.contains_key(&input)
+                    && self.producers.get(&output).is_some_and(|&index| {
+                        matches!(self.input.steps.get(index), Some(BuildStep::Custom(_)))
+                    })
+                    && host.metadata(&source_path, Follow::Yes).is_err()
+                {
+                    self.generated_inputs.entry(input).or_insert(output);
+                }
+            }
+        }
+    }
+
     fn connect_targets(&mut self) -> Result<(), GenError> {
         for (target, alias) in self.input.targets.iter().zip(&self.aliases) {
             let dependencies: Vec<_> = target
@@ -236,9 +268,15 @@ impl<'a> Graph<'a> {
         Ok(())
     }
 
-    pub(crate) fn emit(&self, ninja: &mut Ninja, cmake: &[u8], modmap_flag: &[u8]) {
+    pub(crate) fn emit(
+        &self,
+        ninja: &mut Ninja,
+        cmake: &[u8],
+        modmap_flag: &[u8],
+        exports: &[ModuleExportJob],
+    ) {
         for (step, nodes) in self.input.steps.iter().zip(&self.steps) {
-            self.emit_step(ninja, step, nodes, cmake, modmap_flag);
+            self.emit_step(ninja, step, nodes, cmake, modmap_flag, exports);
         }
 
         let mut all = Vec::new();
@@ -279,6 +317,9 @@ impl<'a> Graph<'a> {
 
     fn custom_input(&self, input: &[u8]) -> BString {
         let node = self.node(input);
+        if let Some(output) = self.generated_inputs.get(&node) {
+            return output.clone();
+        }
         let Some(&index) = self.names.get(&node) else {
             return node;
         };
@@ -298,6 +339,7 @@ impl<'a> Graph<'a> {
         self.aliases.get(index).cloned().unwrap_or(node)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn emit_step(
         &self,
         ninja: &mut Ninja,
@@ -305,8 +347,11 @@ impl<'a> Graph<'a> {
         nodes: &StepNodes,
         cmake: &[u8],
         modmap_flag: &[u8],
+        exports: &[ModuleExportJob],
     ) {
         let mut implicit = Vec::new();
+        let mut implicit_outputs = nodes.byproducts.clone();
+        let mut export_commands = Vec::new();
         let mut dyndep_node = None;
         let (rule, inputs, invocations, depfile) = match step {
             BuildStep::Compile {
@@ -348,6 +393,7 @@ impl<'a> Graph<'a> {
                 depfile.as_ref(),
             ),
             BuildStep::Collate {
+                dd,
                 ddis,
                 tdi,
                 implicit_inputs,
@@ -355,6 +401,14 @@ impl<'a> Graph<'a> {
             } => {
                 implicit.push(self.node(tdi));
                 implicit.extend(implicit_inputs.iter().map(|input| self.node(input)));
+                for export in exports.iter().filter(|export| export.dyndep == *dd) {
+                    implicit.push(self.node(&export.script));
+                    implicit_outputs.push(self.node(&export.output));
+                    export_commands.extend_from_slice(b" && ");
+                    export_commands.extend_from_slice(cmake);
+                    export_commands.extend_from_slice(b" -P ");
+                    shell_word(&self.node(&export.script), &mut export_commands);
+                }
                 (
                     b"CXX_DYNDEP".as_slice(),
                     ddis.iter().map(|ddi| self.node(ddi)).collect(),
@@ -417,7 +471,7 @@ impl<'a> Graph<'a> {
             rule,
             Edge {
                 outputs: &nodes.outputs,
-                implicit_outputs: &nodes.byproducts,
+                implicit_outputs: &implicit_outputs,
                 inputs: &inputs,
                 implicit_inputs: &implicit,
                 order_only: &order_only,
@@ -432,9 +486,15 @@ impl<'a> Graph<'a> {
             ninja.binding(b"CMAKE_COMMAND", cmake);
             ninja.binding(b"in_tdi", &tdi_arg);
             ninja.binding(b"MODMAP_FLAG", modmap_flag);
+            if !export_commands.is_empty() {
+                ninja.binding(b"MODULE_EXPORT_COMMANDS", &export_commands);
+            }
             return;
         }
-        ninja.binding(b"COMMAND", &command_line(invocations));
+        ninja.binding(
+            b"COMMAND",
+            &command_line(invocations, matches!(step, BuildStep::Custom(_))),
+        );
         if let Some(depfile) = depfile {
             let key: &[u8] = if matches!(step, BuildStep::Compile { .. } | BuildStep::Scan { .. }) {
                 b"DEP_FILE"
@@ -485,7 +545,7 @@ fn unique(nodes: impl IntoIterator<Item = BString>) -> Vec<BString> {
         .collect()
 }
 
-fn command_line(invocations: &[Invocation]) -> Vec<u8> {
+fn command_line(invocations: &[Invocation], custom: bool) -> Vec<u8> {
     let mut result = Vec::new();
     for invocation in invocations {
         if !result.is_empty() {
@@ -500,13 +560,30 @@ fn command_line(invocations: &[Invocation]) -> Vec<u8> {
             shell_word(directory, &mut result);
             result.extend_from_slice(b" && ");
         }
-        if !invocation.shell.is_empty() {
+        if !invocation.shell.is_empty() && (!custom || invocation.argv.is_empty()) {
             result.extend_from_slice(&invocation.shell);
         } else if let Some((first, rest)) = invocation.argv.split_first() {
             shell_word(first, &mut result);
             for arg in rest {
                 result.push(b' ');
-                shell_word(arg, &mut result);
+                if custom
+                    && matches!(
+                        arg.as_slice(),
+                        b"<" | b">"
+                            | b"<<"
+                            | b">>"
+                            | b"2>"
+                            | b"2>>"
+                            | b"2>&1"
+                            | b"|"
+                            | b"||"
+                            | b"&&"
+                    )
+                {
+                    result.extend_from_slice(arg);
+                } else {
+                    shell_word(arg, &mut result);
+                }
             }
         } else {
             result.push(b':');

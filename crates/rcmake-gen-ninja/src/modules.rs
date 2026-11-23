@@ -27,7 +27,7 @@ rule CXX_SCAN_NO_DEPFILE
   description = Scanning $in for C++ dependencies
 
 rule CXX_DYNDEP
-  command = ${CMAKE_COMMAND} -E cmake_ninja_dyndep --tdi=$in_tdi --lang=CXX $MODMAP_FLAG --dd=$out @$out.rsp
+  command = ${CMAKE_COMMAND} -E cmake_ninja_dyndep --tdi=$in_tdi --lang=CXX $MODMAP_FLAG --dd=$out @$out.rsp$MODULE_EXPORT_COMMANDS
   description = Generating C++ dyndep file $out
   rspfile = $out.rsp
   rspfile_content = $in_newline

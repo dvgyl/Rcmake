@@ -11,9 +11,10 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use rcmake_base::BString;
+use rcmake_gen_common::export::write_module_exports;
 use rcmake_gen_common::{GenError, write_if_changed};
-use rcmake_host::{Host, ReadRange, path};
-use rcmake_model::ProjectModel;
+use rcmake_host::{FileKind, Follow, Host, ReadRange, path};
+use rcmake_model::{DirId, ProjectModel};
 use rcmake_resolve::{ArtifactSet, BuildGraph, BuildStep, GenerationResult};
 
 use graph::{Graph, qualified};
@@ -108,9 +109,10 @@ fn generate_single(
 ) -> Result<(), GenError> {
     let empty = BuildGraph::default();
     let input = result.graphs.first().unwrap_or(&empty);
-    let graph = Graph::new(input, &config_artifacts(result, input), build_dir, None)?;
+    let mut graph = Graph::new(input, &config_artifacts(result, input), build_dir, None)?;
+    graph.resolve_custom_inputs(model, host);
     let prep = PrepTargets::new(&graph, result, model)?;
-    let programs = Programs::new(result, host, build_dir);
+    let programs = Programs::new(result, host, build_dir, model);
     let uses_modules = modules::uses_modules(input);
     let module_flag = if uses_modules {
         modules::modmap_flag(result, build_dir)?
@@ -118,7 +120,12 @@ fn generate_single(
         BString::default()
     };
     prepare_directory(host, build_dir)?;
+    let exports = model
+        .map(|model| write_module_exports(result, model, host, build_dir, false))
+        .transpose()?
+        .unwrap_or_default();
     let mut manifests = vec![BString::from("build.ninja"), RULES_PATH.into()];
+    manifests.extend(exports.iter().map(|job| graph.node(&job.script)));
     if uses_modules {
         manifests.extend(
             modules::write_metadata(result, model, &[input], host, build_dir, false)?
@@ -128,7 +135,7 @@ fn generate_single(
     }
     let mut ninja = Ninja::default();
     ninja.include(RULES_PATH.as_bytes());
-    graph.emit(&mut ninja, &programs.cmake, &module_flag);
+    graph.emit(&mut ninja, &programs.cmake, &module_flag, &exports);
     prep.emit(&mut ninja, &graph);
     emit_regeneration(
         &mut ninja,
@@ -211,12 +218,13 @@ fn generate_multi(
             .ok_or_else(|| {
                 generation_error(build_dir, "A Ninja configuration has no build graph.")
             })?;
-        let graph = Graph::new(
+        let mut graph = Graph::new(
             input,
             &config_artifacts(result, input),
             build_dir,
             Some(name),
         )?;
+        graph.resolve_custom_inputs(model, host);
         let prep = PrepTargets::new(&graph, result, model)?;
         configs.push((graph, ConfigFiles::new(name, prep)));
     }
@@ -253,6 +261,11 @@ fn generate_multi(
         BString::default()
     };
     prepare_directory(host, build_dir)?;
+    let exports = model
+        .map(|model| write_module_exports(result, model, host, build_dir, true))
+        .transpose()?
+        .unwrap_or_default();
+    manifests.extend(exports.iter().map(|job| default.node(&job.script)));
     if uses_modules {
         manifests.extend(
             modules::write_metadata(result, model, &graphs, host, build_dir, true)?
@@ -261,13 +274,13 @@ fn generate_multi(
         );
     }
     write_rules(result, host, build_dir, uses_modules)?;
-    let programs = Programs::new(result, host, build_dir);
+    let programs = Programs::new(result, host, build_dir, model);
     let rebuild = configure_command(result, build_dir, &programs.cmake, false);
     let regenerate = configure_command(result, build_dir, &programs.cmake, true);
     for (graph, files) in &configs {
         let mut ninja = Ninja::default();
         ninja.include(RULES_PATH.as_bytes());
-        graph.emit(&mut ninja, &programs.cmake, &module_flag);
+        graph.emit(&mut ninja, &programs.cmake, &module_flag, &exports);
         files.prep.emit(&mut ninja, graph);
         emit_regeneration(&mut ninja, graph, &manifests, result, &regenerate);
         write_if_changed(
@@ -542,6 +555,41 @@ fn emit_utilities(
             },
         );
     }
+    for (name, config_file, enabled, inputs) in [
+        (
+            "package",
+            b"./CPackConfig.cmake".as_slice(),
+            programs.package,
+            programs.package_inputs.as_slice(),
+        ),
+        (
+            "package_source",
+            b"./CPackSourceConfig.cmake",
+            programs.package_source,
+            &[],
+        ),
+    ] {
+        if enabled {
+            let mut command = programs.cpack.clone();
+            if let Some(config) = graph.config {
+                command.extend_from_slice(b" -C ");
+                shell_word(config, &mut command);
+            }
+            command.extend_from_slice(b" --config ");
+            shell_word(config_file, &mut command);
+            emit_utility(
+                ninja,
+                graph,
+                Utility {
+                    name,
+                    command: &command,
+                    inputs,
+                    pool: b"console",
+                    rule: b"CUSTOM_COMMAND",
+                },
+            );
+        }
+    }
     emit_utility(
         ninja,
         graph,
@@ -616,18 +664,30 @@ fn cache_setting(cache: &[u8], name: &[u8]) -> Option<BString> {
 struct Programs {
     cmake: Vec<u8>,
     ctest: Vec<u8>,
+    cpack: Vec<u8>,
+    package: bool,
+    package_source: bool,
+    package_inputs: Vec<BString>,
 }
 
 impl Programs {
-    fn new(result: &GenerationResult, host: &dyn Host, build_dir: &Path) -> Self {
+    fn new(
+        result: &GenerationResult,
+        host: &dyn Host,
+        build_dir: &Path,
+        model: Option<&ProjectModel>,
+    ) -> Self {
         let cache = read_cache(host, build_dir);
-        let program = |configured: Option<&BString>, key: &[u8], fallback: &[u8]| {
+        let definition = |key: &[u8]| model.and_then(|model| model.definition(DirId::ROOT, key));
+        let setting = |configured: Option<&BString>, key: &[u8]| {
             let saved = || cache_setting(cache.as_deref()?, key).filter(|value| !value.is_empty());
-            let resolved = configured
+            configured
                 .filter(|value| !value.is_empty())
                 .cloned()
                 .or_else(saved)
-                .or_else(|| host.env_get(key).filter(|value| !value.is_empty()));
+                .or_else(|| host.env_get(key).filter(|value| !value.is_empty()))
+        };
+        let program = |resolved: Option<BString>, fallback: &[u8]| {
             let mut command = Vec::new();
             shell_word(
                 resolved.as_ref().map_or(fallback, |value| value.as_slice()),
@@ -635,17 +695,52 @@ impl Programs {
             );
             command
         };
+        let cmake = setting(result.metadata.cmake_command.as_ref(), b"CMAKE_COMMAND");
+        let cpack =
+            setting(definition(b"CMAKE_CPACK_COMMAND"), b"CMAKE_CPACK_COMMAND").or_else(|| {
+                let sibling = |executable: &Path| {
+                    let name = if executable
+                        .extension()
+                        .is_some_and(|ext| ext.eq_ignore_ascii_case("exe"))
+                    {
+                        "cpack.exe"
+                    } else {
+                        "cpack"
+                    };
+                    executable.with_file_name(name)
+                };
+                let configured = cmake.as_ref().map(|path| sibling(&path::to_native(path)));
+                configured
+                    .filter(|path| path.components().count() > 1)
+                    .or_else(|| host.current_exe().ok().map(|exe| sibling(&exe)))
+                    .map(|path| path::from_native(&path))
+            });
+        let has_config = |name| {
+            host.metadata(&build_dir.join(name), Follow::Yes)
+                .is_ok_and(|metadata| metadata.kind == FileKind::File)
+        };
+        let skip_all = setting(
+            definition(b"CMAKE_SKIP_PACKAGE_ALL_DEPENDENCY"),
+            b"CMAKE_SKIP_PACKAGE_ALL_DEPENDENCY",
+        )
+        .is_some_and(|value| rcmake_base::truth::is_on(&value));
         Self {
-            cmake: program(
-                result.metadata.cmake_command.as_ref(),
-                b"CMAKE_COMMAND",
-                b"cmake",
-            ),
+            cmake: program(cmake, b"cmake"),
             ctest: program(
-                result.metadata.ctest_command.as_ref(),
-                b"CMAKE_CTEST_COMMAND",
+                setting(
+                    result.metadata.ctest_command.as_ref(),
+                    b"CMAKE_CTEST_COMMAND",
+                ),
                 b"ctest",
             ),
+            cpack: program(cpack, b"cpack"),
+            package: has_config("CPackConfig.cmake"),
+            package_source: has_config("CPackSourceConfig.cmake"),
+            package_inputs: if skip_all {
+                Vec::new()
+            } else {
+                vec!["all".into()]
+            },
         }
     }
 }

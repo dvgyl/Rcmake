@@ -218,7 +218,7 @@ fn link_byproducts_use_unique_paths_on_the_link_edge() -> Result<(), Box<dyn std
             Some(b"Debug"),
         )?;
         let mut ninja = Ninja::default();
-        graph.emit(&mut ninja, b"cmake", b"");
+        graph.emit(&mut ninja, b"cmake", b"", &[]);
         graph.emit_entry_aliases(&mut ninja);
         let manifest = String::from_utf8(ninja.0)?;
         assert_eq!(
@@ -312,7 +312,7 @@ fn target_dependencies_use_the_library_when_its_name_matches_an_executable_outpu
             config.map(str::as_bytes),
         )?;
         let mut ninja = Ninja::default();
-        graph.emit(&mut ninja, b"cmake", b"");
+        graph.emit(&mut ninja, b"cmake", b"", &[]);
         if config.is_some() {
             graph.emit_entry_aliases(&mut ninja);
         }
@@ -389,6 +389,32 @@ fn generator_commands_use_metadata_and_the_requested_build_cache() {
     assert!(
         implementation.contains("  COMMAND = '/current$ tools/rcmake'$ --regenerate-during-build$")
     );
+}
+
+#[test]
+fn package_targets_use_only_their_own_config_files() -> Result<(), Box<dyn std::error::Error>> {
+    let host = PureHost::default();
+    let dir = Path::new("/work/build");
+    let mut result = GenerationResult::default();
+    result.metadata.cmake_command = Some("/tool bin/cmake".into());
+    host.seed_file(&dir.join("CPackSourceConfig.cmake"), b"")?;
+    generate_single_config(&result, &host, dir)?;
+    let build = read(&host, "build.ninja");
+    assert!(!build.contains("build package:"));
+    assert!(build.contains("build CMakeFiles/package_source.util: CUSTOM_COMMAND\n"));
+    assert!(build.contains("'/tool$ bin/cpack'$ --config$ ./CPackSourceConfig.cmake"));
+
+    host.seed_file(
+        &dir.join("CMakeCache.txt"),
+        b"CMAKE_CPACK_COMMAND:FILEPATH=/tools/packer\nCMAKE_SKIP_PACKAGE_ALL_DEPENDENCY:BOOL=ON\n",
+    )?;
+    host.seed_file(&dir.join("CPackConfig.cmake"), b"")?;
+    generate_single_config(&result, &host, dir)?;
+    let build = read(&host, "build.ninja");
+    assert!(build.contains("build package: phony CMakeFiles/package.util"));
+    assert!(build.contains("build CMakeFiles/package.util: CUSTOM_COMMAND\n"));
+    assert!(build.contains("/tools/packer$ --config$ ./CPackConfig.cmake"));
+    Ok(())
 }
 
 #[test]
