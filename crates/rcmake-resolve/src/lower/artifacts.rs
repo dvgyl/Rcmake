@@ -285,7 +285,7 @@ fn source_extension(
 
 /// Return the build path of a source's object file.
 ///
-/// The path keeps files outside the source directory distinct from files inside it.
+/// Use paths relative to the source or build tree when possible.
 #[must_use]
 pub fn object_path(
     model: &ProjectModel,
@@ -294,26 +294,43 @@ pub fn object_path(
     source: &[u8],
 ) -> BString {
     let dir = model.dir(target.dir);
-    let base = Lexical::new(&dir.source_dir).normalize();
-    let base = Lexical::new(&base);
+    let root = model.dir(DirId::ROOT);
     let absolute = Lexical::new(&join(&dir.source_dir, source)).normalize();
     let absolute = Lexical::new(&absolute);
     let parent_count = absolute
         .components()
         .take_while(|part| *part == b"..")
         .count();
-    let mut relative = if parent_count == 0 && base.prefix(absolute) {
-        let mut parts = absolute
-            .components()
-            .skip(base.components().count())
-            .peekable();
-        let reserved = parts.peek() == Some(&b"__".as_slice());
-        let path = list_path(parts);
-        if reserved {
-            join(b"__/source", &path)
-        } else {
-            path
+
+    let relative_to_tree = |current: &[u8], top: &[u8]| {
+        let current = Lexical::new(current).normalize();
+        let top = Lexical::new(top).normalize();
+        let current = Lexical::new(&current);
+        let top = Lexical::new(&top);
+        (parent_count == 0
+            && (current.prefix(absolute) || (top.prefix(current) && top.prefix(absolute))))
+        .then(|| absolute.relative(current))
+        .flatten()
+    };
+    let relative_source = relative_to_tree(&dir.source_dir, &root.source_dir);
+    let relative_binary = relative_to_tree(&dir.binary_dir, &root.binary_dir);
+    let rank = |path: &BString| (path.starts_with(b"."), path.len());
+    let relative = [relative_source, relative_binary]
+        .into_iter()
+        .flatten()
+        .min_by_key(rank);
+
+    let mut relative = if let Some(path) = relative {
+        let mut parts = Lexical::new(&path).components().peekable();
+        let mut relative = BString::default();
+        while parts.next_if_eq(&b"..".as_slice()).is_some() {
+            relative.extend_from_slice(b"__/");
         }
+        if relative.is_empty() && parts.peek() == Some(&b"__".as_slice()) {
+            relative.extend_from_slice(b"__/source/");
+        }
+        relative.extend_from_slice(&list_path(parts));
+        relative
     } else {
         let mut path = if absolute.root_directory().is_empty() {
             BString::from(format!("__/external/relative-{parent_count}"))

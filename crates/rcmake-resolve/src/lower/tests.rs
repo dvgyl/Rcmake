@@ -381,14 +381,27 @@ fn compile_flag_order_matches_the_lowering_contract() -> TestResult {
         return Err("Expected a C++ compile group.".into());
     };
     group.flags.push(bt("-Werror"));
-    group.defines.push(bt("NAME=Some 'text'"));
+    group.defines.extend([
+        bt("lowercase"),
+        bt("NAME=Some 'text'"),
+        bt("NAME=Some 'text'"),
+        bt("FIRST"),
+    ]);
     group.includes.extend([
         InterfaceInclude {
-            path: bt("/ordinary include"),
+            path: bt("/ordinary include///"),
             system: false,
         },
         InterfaceInclude {
-            path: bt("/system include"),
+            path: bt("/"),
+            system: false,
+        },
+        InterfaceInclude {
+            path: bt("/system include/"),
+            system: true,
+        },
+        InterfaceInclude {
+            path: bt("/system dot/./"),
             system: true,
         },
         InterfaceInclude {
@@ -400,15 +413,12 @@ fn compile_flag_order_matches_the_lowering_contract() -> TestResult {
     let Some(BuildStep::Compile { invocation, .. }) = graph.steps.first() else {
         return Err("Expected a compile step.".into());
     };
-    assert!(invocation.argv.windows(14).any(|flags| flags
+    assert!(invocation.argv.windows(15).any(|flags| flags
         == [
             "-Wall",
             "-Wextra",
             "-g",
             "-std=c++17",
-            "-fPIC",
-            "-fvisibility=hidden",
-            "-fvisibility-inlines-hidden",
             "-arch",
             "arm64",
             "-arch",
@@ -416,24 +426,96 @@ fn compile_flag_order_matches_the_lowering_contract() -> TestResult {
             "-isysroot",
             "/SDK Dir",
             "-mmacosx-version-min=12.0",
+            "-fPIC",
+            "-fvisibility=hidden",
+            "-fvisibility-inlines-hidden",
+            "-Werror",
         ]));
-    assert!(
-        invocation
-            .argv
-            .windows(2)
-            .any(|args| args == ["-mmacosx-version-min=12.0", "-Werror"])
-    );
-    assert!(invocation.argv.windows(5).any(|args| args
+    assert!(invocation.argv.windows(10).any(|args| args
         == [
+            "-DFIRST",
             "-DNAME=Some 'text'",
+            "-Dlowercase",
             "-I/ordinary include",
+            "-I/",
             "-isystem",
             "/system include",
+            "-isystem",
+            "/system dot/.",
             "-F/Framework Path/"
         ]));
     assert!(
         matches!(graph.steps.last(), Some(BuildStep::Link { step, .. }) if step.language == "CXX")
     );
+    Ok(())
+}
+
+#[test]
+fn compile_architecture_defaults_follow_darwin_initialization() -> TestResult {
+    let config = ConfigId("Debug".into());
+    for (system, default, explicit, configured, compiler_target, expected) in [
+        ("Darwin", "", "", None, "", None),
+        ("Darwin", "arm64", "", None, "", Some("arm64")),
+        ("Darwin", "arm64", "x86_64", None, "", Some("x86_64")),
+        ("Darwin", "arm64", "x86_64", Some(""), "", Some("arm64")),
+        ("Darwin", "arm64", "", Some("x86_64"), "", Some("x86_64")),
+        ("Darwin", "arm64", "", None, "x86_64-apple-darwin", None),
+        ("Linux", "arm64", "", None, "", None),
+    ] {
+        let mut model = fixture(system);
+        var(&mut model, "_CMAKE_APPLE_ARCHS_DEFAULT", default);
+        var(&mut model, "CMAKE_OSX_ARCHITECTURES", explicit);
+        var(&mut model, "CMAKE_C_COMPILER_TARGET", compiler_target);
+        let mut raw = raw_target("foo", TargetKind::ObjectLibrary);
+        if let Some(arch) = configured {
+            raw.props.set("OSX_ARCHITECTURES_DEBUG".into(), arch.into());
+        }
+        let target = resolve_target(&mut model, raw, &config, &["a.c"])?;
+        let graph = lower(&model, &[target], &config)?;
+        let Some(BuildStep::Compile { invocation, .. }) = graph.steps.first() else {
+            return Err("Expected a compile step.".into());
+        };
+        let architecture = invocation.argv.windows(2).find_map(|args| match args {
+            [flag, value] if flag == "-arch" => Some(value.as_slice()),
+            _ => None,
+        });
+        assert_eq!(architecture, expected.map(str::as_bytes));
+    }
+    Ok(())
+}
+
+#[test]
+fn object_paths_use_the_project_source_and_build_trees() -> TestResult {
+    let mut model = fixture("Linux");
+    let mut raw = raw_target("scan-test", TargetKind::ObjectLibrary);
+    raw.dir = model.add_directory(
+        DirId::ROOT,
+        "/project/test/detail".into(),
+        "/build/test/detail".into(),
+        Default::default(),
+    )?;
+    let config = ConfigId::default();
+    for (source, object) in [
+        ("scan.cc", "scan.cc.o"),
+        ("../src/os.cc", "__/src/os.cc.o"),
+        ("../../src/os.cc", "__/__/src/os.cc.o"),
+        ("/build/test/generated.c", "__/generated.c.o"),
+        ("/build/test/detail/generated.c", "generated.c.o"),
+        (
+            "/build-other/generated.c",
+            "__/external/root-/build-other/generated.c.o",
+        ),
+        (
+            "../../../external/os.cc",
+            "__/external/root-/external/os.cc.o",
+        ),
+    ] {
+        let expected = format!("test/detail/CMakeFiles/scan-test.dir/{object}");
+        assert_eq!(
+            object_path(&model, &raw, &config, source.as_bytes()),
+            expected.as_str()
+        );
+    }
     Ok(())
 }
 

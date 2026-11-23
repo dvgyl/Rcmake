@@ -28,20 +28,44 @@ pub(super) fn apple_flags(
     target: &Target,
     config: &ConfigId,
 ) -> Vec<BString> {
+    apple_flags_for_language(model, target, config, None)
+}
+
+fn apple_flags_for_language(
+    model: &ProjectModel,
+    target: &Target,
+    config: &ConfigId,
+    language: Option<&[u8]>,
+) -> Vec<BString> {
     if !is_darwin(model, target.dir) {
         return Vec::new();
     }
-    let architectures = [&b"OSX_ARCHITECTURES_"[..], &config.0.to_ascii_uppercase()].concat();
-    let mut flags = Vec::new();
-    if let Some(architectures) = target
-        .props
-        .get(&architectures)
+    let key = [&b"OSX_ARCHITECTURES_"[..], &config.0.to_ascii_uppercase()].concat();
+    let mut architectures = (!config.0.is_empty())
+        .then(|| target.props.get(&key))
+        .flatten()
         .or_else(|| target_property(model, target, b"OSX_ARCHITECTURES"))
+        .map_or_else(Vec::new, |value| list::split(value, list::Empty::Drop));
+    if architectures.is_empty()
+        && let Some(language) = language
+        && matches!(
+            language,
+            b"C" | b"CXX" | b"OBJC" | b"OBJCXX" | b"ASM" | b"SYCL"
+        )
+        && definition(
+            model,
+            target.dir,
+            &[b"CMAKE_", language, b"_COMPILER_TARGET"].concat(),
+        )
+        .is_none_or(|value| value.is_empty())
+        && let Some(default) = definition(model, target.dir, b"_CMAKE_APPLE_ARCHS_DEFAULT")
     {
-        for arch in list::split(architectures, list::Empty::Drop) {
-            flags.push("-arch".into());
-            flags.push(quote(&arch));
-        }
+        architectures = list::split(default, list::Empty::Drop);
+    }
+    let mut flags = Vec::new();
+    for arch in architectures {
+        flags.push("-arch".into());
+        flags.push(quote(&arch));
     }
     if let Some(sdk) = definition(model, target.dir, b"CMAKE_OSX_SYSROOT").filter(|v| !v.is_empty())
     {
@@ -110,6 +134,12 @@ fn compile_flags(
     let language = group.language.as_slice();
     let mut flags = language_flags(model, target, config, language);
     flags.extend(standard_flag(model, target, language));
+    flags.extend(apple_flags_for_language(
+        model,
+        target,
+        config,
+        Some(language),
+    ));
     let pic = target_property(model, target, b"POSITION_INDEPENDENT_CODE").map_or(
         matches!(
             target.kind,
@@ -139,7 +169,6 @@ fn compile_flags(
     {
         flags.push("-fvisibility-inlines-hidden".into());
     }
-    flags.extend(apple_flags(model, target, config));
     flags.extend(
         group
             .flags
@@ -158,6 +187,13 @@ fn includes(model: &ProjectModel, target: &Target, group: &CompileGroup) -> BStr
     let darwin = is_darwin(model, target.dir);
     join_words(group.includes.iter().map(|include| {
         let path = include.path.value.as_slice();
+        let root = Lexical::new(path);
+        let root_len = root.root_name().len() + root.root_directory().len();
+        let end = path
+            .iter()
+            .rposition(|&byte| byte != b'/')
+            .map_or(0, |i| i + 1);
+        let path = path.get(..end.max(root_len)).unwrap_or(path);
         if darwin
             && let Some(end) = path
                 .split(|&b| b == b'/')
@@ -189,11 +225,17 @@ pub(super) fn compile(
 ) -> Result<BuildStep, ResolveError> {
     let language = group.language.as_slice();
     let mut flags = compile_flags(model, target, config, group);
+    let mut defines: Vec<_> = group
+        .defines
+        .iter()
+        .map(|define| define.value.as_slice())
+        .collect();
+    defines.sort_unstable();
+    defines.dedup();
     let defines = join_words(
-        group
-            .defines
-            .iter()
-            .map(|define| quote(&[b"-D", define.value.as_slice()].concat())),
+        defines
+            .into_iter()
+            .map(|define| quote(&[b"-D", define].concat())),
     );
     let includes = includes(model, target, group);
     let source = join(&model.dir(target.dir).source_dir, &unit.source.value);
