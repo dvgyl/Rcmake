@@ -20,6 +20,14 @@ VER_RE = re.compile(r"\.\.\s+versionadded::\s*(\d+)\.(\d+)(?:\.(\d+))?")
 CMAKE_VER_RE = re.compile(r"introduced in CMake version\s+(\d+)\.(\d+)(?:\.(\d+))?", re.IGNORECASE)
 
 
+# Empirically observed CMake 4.5.1 runtime policy summaries that differ from the
+# first line of `--help-policy <CMP>`.
+RUNTIME_SUMMARY_OVERRIDES: dict[int, str] = {
+    140: "The ``return()`` command checks its arguments.",
+    219: "Macro invocations preserve backslashes in arguments.",
+}
+
+
 def main() -> int:
     cmake = os.environ.get("RCMAKE_ORACLE_CMAKE")
     if not cmake or not pathlib.Path(cmake).is_file():
@@ -59,6 +67,7 @@ def main() -> int:
                 continue
             summary = s
             break
+        summary = RUNTIME_SUMMARY_OVERRIDES.get(num, summary)
         summary = summary.replace("\\", "\\\\").replace('"', '\\"')
         removed_old = num <= 65
         rows.append((num, major, minor, patch, removed_old, summary))

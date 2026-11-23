@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use rcmake_base::BString;
 use rcmake_diag::DiagState;
-use rcmake_eval::{CacheDefine, LogLevel};
+use rcmake_eval::{CacheDefine, LogLevel, TraceConfig, TraceFormat};
 use rcmake_host::{Host, Stream, WriteMode};
 use rcmake_model::CacheType;
 
@@ -40,6 +40,7 @@ pub(crate) struct Options {
     pub list_cache: Option<ListCache>,
     pub profile_output: Option<PathBuf>,
     pub graphviz: Option<PathBuf>,
+    pub trace: Option<TraceConfig>,
 }
 
 #[derive(Default)]
@@ -268,25 +269,38 @@ fn parse_args(args: &[BString], host: &dyn Host) -> Result<Option<Options>, Stri
                         value!("No file specified for --graphviz"),
                     ));
                 }
-                b"--trace" => out(host, "Put cmake in trace mode.\n"),
-                b"--trace-expand" => out(
-                    host,
-                    "Put cmake in trace mode, but with variables expanded.\n",
-                ),
+                b"--trace" => {
+                    out(host, "Put cmake in trace mode.\n");
+                    opts.trace.get_or_insert_with(TraceConfig::default);
+                }
+                b"--trace-expand" => {
+                    out(
+                        host,
+                        "Put cmake in trace mode, but with variables expanded.\n",
+                    );
+                    let trace = opts.trace.get_or_insert_with(TraceConfig::default);
+                    trace.expand = true;
+                }
                 b"--trace-format" => {
                     out(
                         host,
                         "Put cmake in trace mode and sets the trace output format.\n",
                     );
-                    if !matches!(
-                        value!("No format specified for --trace-format"),
-                        b"human" | b"json-v1"
-                    ) {
-                        return Err("Invalid format specified for --trace-format. Valid formats are human, json-v1.".into());
-                    }
+                    let fmt = value!("No format specified for --trace-format");
+                    let format = match fmt {
+                        b"human" => TraceFormat::Human,
+                        b"json-v1" => TraceFormat::JsonV1,
+                        _ => {
+                            return Err("Invalid format specified for --trace-format. Valid formats are human, json-v1.".into());
+                        }
+                    };
+                    let trace = opts.trace.get_or_insert_with(TraceConfig::default);
+                    trace.format = format;
                 }
                 b"--trace-source" => {
-                    let _ = value!("No file specified for --trace-source");
+                    let src = value!("No file specified for --trace-source");
+                    let trace = opts.trace.get_or_insert_with(TraceConfig::default);
+                    trace.sources.push(src.into());
                 }
                 b"--trace-redirect" => {
                     let path = value!("No file specified for --trace-redirect");
@@ -308,6 +322,8 @@ fn parse_args(args: &[BString], host: &dyn Host) -> Result<Option<Options>, Stri
                             absolute.display()
                         ),
                     );
+                    let trace = opts.trace.get_or_insert_with(TraceConfig::default);
+                    trace.redirect = Some(absolute);
                 }
                 b"--profiling-format" => {
                     profile_format =

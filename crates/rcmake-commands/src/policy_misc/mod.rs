@@ -46,7 +46,7 @@ pub(crate) fn register(registry: &mut Registry) {
     );
     registry.add("get_cmake_property", properties::get_cmake, script);
     registry.add("cmake_host_system_information", system::query, script);
-    registry.add("cmake_language", language::language, script);
+    registry.add_raw("cmake_language", language::language, script);
     registry.add("site_name", system::site_name, script);
     registry.add("variable_watch", system::variable_watch, script);
     registry.add("define_property", properties::define, project_only);

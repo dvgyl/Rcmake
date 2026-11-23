@@ -12,7 +12,7 @@
 
 use rcmake_base::BString;
 
-use crate::{DiagCategory, Diagnostic, Location, MessageKind};
+use crate::{DiagCategory, Diagnostic, FrameKind, Location, MessageKind};
 
 /// Options controlling terminal rendering of a [`Diagnostic`].
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -82,7 +82,11 @@ pub fn render(diag: &Diagnostic, opts: &RenderOptions) -> BString {
 
             let display_file = display_path(top.file.as_ref(), base);
             out.extend_from_slice(prefix);
-            if top.line == 0 {
+            if top.kind == FrameKind::Deferred {
+                out.extend_from_slice(b" at ");
+                out.extend_from_slice(display_file);
+                out.extend_from_slice(b":DEFERRED");
+            } else if top.line == 0 {
                 out.extend_from_slice(b" in ");
                 out.extend_from_slice(display_file);
             } else {
@@ -109,7 +113,9 @@ pub fn render(diag: &Diagnostic, opts: &RenderOptions) -> BString {
                     let cf = display_path(frame.file.as_ref(), base);
                     out.extend_from_slice(b"  ");
                     out.extend_from_slice(cf);
-                    if frame.line > 0 {
+                    if frame.kind == FrameKind::Deferred {
+                        out.extend_from_slice(b":DEFERRED");
+                    } else if frame.line > 0 {
                         out.push(b':');
                         out.extend_from_slice(frame.line.to_string().as_bytes());
                     }
@@ -143,18 +149,33 @@ fn warning_footer(diag: &Diagnostic) -> Option<&'static [u8]> {
         Some(DiagCategory::Policy) if is_warning_kind(diag.kind) => Some(
             b"This warning is for project developers.  Use -Wno-author or -Wno-policy to\nsuppress it.\n",
         ),
+        Some(DiagCategory::Policy) if is_error_kind(diag.kind) => Some(
+            b"This error is for project developers.  Use -Wno-error=author or\n-Wno-error=policy to suppress it.\n",
+        ),
         Some(DiagCategory::Deprecated) if is_warning_kind(diag.kind) => Some(
             b"This warning is for project developers.  Use -Wno-author or -Wno-deprecated\nto suppress it.\n",
         ),
+        Some(DiagCategory::Deprecated) if is_error_kind(diag.kind) => Some(
+            b"This error is for project developers.  Use -Wno-error=author or\n-Wno-error=deprecated to suppress it.\n",
+        ),
         Some(DiagCategory::Author) if is_warning_kind(diag.kind) => {
             Some(b"This warning is for project developers.  Use -Wno-author to suppress it.\n")
+        }
+        Some(DiagCategory::Author) if is_error_kind(diag.kind) => {
+            Some(b"This error is for project developers.  Use -Wno-error=author to suppress it.\n")
         }
         _ => match diag.kind {
             MessageKind::AuthorWarning => {
                 Some(b"This warning is for project developers.  Use -Wno-author to suppress it.\n")
             }
+            MessageKind::AuthorError => Some(
+                b"This error is for project developers.  Use -Wno-error=author to suppress it.\n",
+            ),
             MessageKind::DeprecationWarning => Some(
                 b"This warning is for project developers.  Use -Wno-author or -Wno-deprecated\nto suppress it.\n",
+            ),
+            MessageKind::DeprecationError => Some(
+                b"This error is for project developers.  Use -Wno-error=author or\n-Wno-error=deprecated to suppress it.\n",
             ),
             _ => None,
         },
@@ -165,6 +186,13 @@ const fn is_warning_kind(kind: MessageKind) -> bool {
     matches!(
         kind,
         MessageKind::Warning | MessageKind::AuthorWarning | MessageKind::DeprecationWarning
+    )
+}
+
+const fn is_error_kind(kind: MessageKind) -> bool {
+    matches!(
+        kind,
+        MessageKind::Error | MessageKind::AuthorError | MessageKind::DeprecationError
     )
 }
 
@@ -241,6 +269,10 @@ pub fn format_paragraphs(text: &[u8], indent: usize, width: usize) -> BString {
         }
     }
 
+    if prev_preformatted && text.ends_with(b"\n") {
+        out.push(b'\n');
+    }
+
     BString::from(out)
 }
 
@@ -287,7 +319,7 @@ fn header_prefix(diag: &Diagnostic) -> &'static [u8] {
         MessageKind::AuthorError => b"CMake Error (author)",
         MessageKind::DeprecationWarning => b"CMake Warning (deprecated)",
         MessageKind::DeprecationError => b"CMake Error (deprecated)",
-        MessageKind::Log => b"CMake",
+        MessageKind::Log => b"CMake Debug Log",
     }
 }
 

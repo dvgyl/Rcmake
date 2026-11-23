@@ -2,11 +2,12 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use rcmake_base::BString;
-use rcmake_eval::{CacheDefine, LogLevel};
-use rcmake_host::{Host, ReadRange};
+use rcmake_eval::{CacheDefine, LogLevel, TraceConfig, TraceFormat as EvalTraceFormat};
+use rcmake_host::{Host, WriteMode};
 use rcmake_model::CacheType;
 use rcmake_presets::{
     ConfigureSettings, EnvSnapshot, PresetKind, PresetSettings, Presets, Strategy,
+    TraceFormat as PresetTraceFormat, TraceMode,
 };
 
 use crate::options::{self, CacheEdit, Options};
@@ -22,7 +23,7 @@ const KINDS: [(PresetKind, &str); 5] = [
 
 fn load(host: &dyn Host, src: &Path, custom: Option<&Path>) -> Result<Presets, i32> {
     let result = if let Some(file) = custom {
-        load_custom(host, src, file)
+        rcmake_presets::load_file(src, file, host).map_err(|err| err.message)
     } else {
         rcmake_presets::load(src, host).map_err(|err| err.message)
     };
@@ -33,27 +34,6 @@ fn load(host: &dyn Host, src: &Path, custom: Option<&Path>) -> Result<Presets, i
         );
         1
     })
-}
-
-fn load_custom(host: &dyn Host, src: &Path, file: &Path) -> Result<Presets, String> {
-    let data = host
-        .read(
-            file,
-            ReadRange::All {
-                limit: 16 * 1024 * 1024,
-            },
-        )
-        .map_err(|err| {
-            if err.kind == std::io::ErrorKind::NotFound {
-                format!("File not found: {}", file.display())
-            } else {
-                format!("{}: {err}", file.display())
-            }
-        })?;
-    let document = rcmake_json::parse(&data, &Default::default())
-        .map_err(|err| format!("JSON Parse Error: {}:\n{err}", file.display()))?;
-    let values = BTreeMap::from([(src.join("CMakePresets.json"), document)]);
-    rcmake_presets::load_from_values(src, host, &values).map_err(|err| err.message)
 }
 
 pub(crate) fn list(host: &dyn Host, src: &Path, custom: Option<&Path>, mode: &[u8]) -> i32 {
@@ -277,6 +257,60 @@ pub(crate) fn apply(host: &dyn Host, src: &Path, opts: &mut Options) -> Result<A
                 }),
             );
         }
+    }
+    if let Some(trace) = &settings.trace
+        && opts.trace.is_none()
+        && trace.mode != Some(TraceMode::Off)
+        && (trace.mode.is_some()
+            || trace.format.is_some()
+            || trace.source.is_some()
+            || trace.redirect.is_some())
+    {
+        let mut cfg = TraceConfig::default();
+        if trace.mode == Some(TraceMode::Expand) {
+            cfg.expand = true;
+            options::out(
+                host,
+                "Put cmake in trace mode, but with variables expanded.\n",
+            );
+        } else if trace.mode == Some(TraceMode::On) {
+            options::out(host, "Put cmake in trace mode.\n");
+        }
+        if let Some(fmt) = trace.format {
+            options::out(
+                host,
+                "Put cmake in trace mode and sets the trace output format.\n",
+            );
+            cfg.format = match fmt {
+                PresetTraceFormat::Human => EvalTraceFormat::Human,
+                PresetTraceFormat::JsonV1 => EvalTraceFormat::JsonV1,
+            };
+        }
+        if let Some(sources) = &trace.source {
+            cfg.sources.extend(sources.iter().cloned());
+        }
+        if let Some(redirect) = &trace.redirect {
+            let absolute = resolve_cli_path(host, redirect);
+            if let Err(err) = host.write(&absolute, b"", WriteMode::Truncate) {
+                emit_cli_error(
+                    host,
+                    format!(
+                        "Error opening trace file {}: {err}",
+                        String::from_utf8_lossy(redirect)
+                    ),
+                );
+                return Err(1);
+            }
+            options::out(
+                host,
+                &format!(
+                    "Put cmake in trace mode and redirect trace output to a file instead of stderr.\nTrace will be written to {}\n",
+                    absolute.display()
+                ),
+            );
+            cfg.redirect = Some(absolute);
+        }
+        opts.trace = Some(cfg);
     }
     Ok(Application {
         binary,

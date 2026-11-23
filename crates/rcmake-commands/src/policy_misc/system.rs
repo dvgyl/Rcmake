@@ -36,7 +36,7 @@ pub(super) fn site_name(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
     Ok(Flow::Normal)
 }
 
-pub(super) fn variable_watch(_: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
+pub(super) fn variable_watch(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
     let Some(var) = args.first() else {
         return Err(status("must be called with at least one argument."));
     };
@@ -45,7 +45,7 @@ pub(super) fn variable_watch(_: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult 
             "cannot be set on the variable: CMAKE_CURRENT_LIST_FILE",
         ));
     }
-    // Variable access callbacks need evaluator support.
+    cx.add_variable_watch(&var.value, args.get(1).map(|a| a.value.as_slice()));
     Ok(Flow::Normal)
 }
 

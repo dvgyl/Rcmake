@@ -855,7 +855,7 @@ pub static POLICIES: &[PolicyInfo] = &[
         id: PolicyId::new(140),
         introduced: (3, 25, 0),
         removed_old: false,
-        summary: "The ``return()`` command checks its parameters.",
+        summary: "The ``return()`` command checks its arguments.",
     },
     PolicyInfo {
         id: PolicyId::new(141),
@@ -1329,7 +1329,7 @@ pub static POLICIES: &[PolicyInfo] = &[
         id: PolicyId::new(219),
         introduced: (4, 4, 0),
         removed_old: false,
-        summary: "``macro()`` invocations preserve backslashes in arguments.",
+        summary: "Macro invocations preserve backslashes in arguments.",
     },
     PolicyInfo {
         id: PolicyId::new(220),

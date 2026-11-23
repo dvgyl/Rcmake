@@ -230,6 +230,7 @@ fn new_interp(argv: &[BString], opts: &Options, mode: RunMode, host: Arc<dyn Hos
     let mut interp = Interp::new(cfg, rcmake_commands::register_all);
     interp.set_log_level(opts.log_level);
     interp.set_log_context(opts.log_context);
+    interp.set_trace_config(opts.trace.clone());
     interp
 }
 

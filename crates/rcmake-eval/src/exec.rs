@@ -1164,25 +1164,31 @@ impl Interp {
         let text: Arc<[u8]> = Arc::from(data);
         let id = self.sources.add(BString::from(path), kind, text)?;
         let file: Arc<[u8]> = Arc::from(path);
-        let parsed = rcmake_syntax::parse_list_file(data, id, kind, &self.config.limits);
-        match parsed {
-            Ok(list) => {
-                for mut warning in list.warnings {
-                    let line = match &warning.location {
-                        Location::FileLine { line, .. } => *line,
-                        _ => 0,
-                    };
-                    warning.location = Location::Backtrace(self.bt.push(Frame {
-                        file: Arc::clone(&file),
-                        line,
-                        name: None,
-                        kind: FrameKind::Command,
-                    }));
-                    let state = *self.diag_top();
-                    self.emit(&warning, &state);
+        let (parsed, warnings) =
+            match rcmake_syntax::parse_list_file_with_warnings(data, id, kind, &self.config.limits)
+            {
+                Ok(mut list) => {
+                    let warnings = std::mem::take(&mut list.warnings);
+                    (Ok(list), warnings)
                 }
-                Some(Code::new(list.commands, file))
-            }
+                Err((err, warnings)) => (Err(err), warnings),
+            };
+        for mut warning in warnings {
+            let line = match &warning.location {
+                Location::FileLine { line, .. } => *line,
+                _ => 0,
+            };
+            warning.location = Location::Backtrace(self.bt.push(Frame {
+                file: Arc::clone(&file),
+                line,
+                name: None,
+                kind: FrameKind::Command,
+            }));
+            let state = *self.diag_top();
+            self.emit(&warning, &state);
+        }
+        match parsed {
+            Ok(list) => Some(Code::new(list.commands, file)),
             Err(err) => {
                 self.report_parse_error(&file, &err);
                 None
