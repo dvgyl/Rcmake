@@ -95,14 +95,13 @@ pub fn create_archive(
 
 /// Extract or list an archive at absolute path `archive_path`.
 ///
-/// Each symbolic link must have a relative target. After normalizing the target
-/// path without following links, the path must stay within the destination.
-/// The host does not support setting permissions or times on symbolic links.
+/// Symbolic links preserve their targets. Extraction rejects paths that pass
+/// through symbolic links inside the destination and skips tar device and FIFO entries.
 ///
 /// # Errors
 ///
 /// Returns an error for an invalid archive, unsafe paths, unmatched patterns,
-/// unsupported entries, size limits, or host errors.
+/// unsupported formats or entries, size limits, or host errors.
 pub fn extract_archive(
     host: &dyn Host,
     archive_path: &Path,

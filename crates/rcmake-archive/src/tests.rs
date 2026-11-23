@@ -3,7 +3,7 @@ use std::io::{Cursor, Write};
 use std::path::{Path, PathBuf};
 
 use rcmake_host::{FileKind, FileTime, Follow, PureHost, WriteMode};
-use tar::{Builder, Header};
+use tar::{Builder, EntryType, Header};
 use zip::{ZipArchive, ZipWriter, extra_fields::ExtraField, write::SimpleFileOptions};
 
 use super::*;
@@ -333,6 +333,21 @@ fn add_test_tar_file(builder: &mut Builder<Vec<u8>>, name: &str) -> std::io::Res
     builder.append_data(&mut header, name, b"x".as_slice())
 }
 
+fn add_test_tar_link(
+    builder: &mut Builder<Vec<u8>>,
+    name: &str,
+    kind: EntryType,
+    target: &[u8],
+) -> std::io::Result<()> {
+    let mut header = Header::new_gnu();
+    header.set_entry_type(kind);
+    header.set_size(0);
+    header.set_mode(0o755);
+    header.set_mtime(123);
+    header.set_link_name_literal(target)?;
+    builder.append_data(&mut header, name, &[][..])
+}
+
 #[test]
 fn rejects_unsafe_zip_entry_paths() -> TestResult {
     let host = test_host();
@@ -356,7 +371,7 @@ fn rejects_unsafe_zip_entry_paths() -> TestResult {
 }
 
 #[test]
-fn rejects_paths_through_links() -> TestResult {
+fn replaces_leaf_links_without_changing_their_targets() -> TestResult {
     let host = test_host();
     host.seed_file(Path::new("/source/tree/file"), b"archive")?;
     host.seed_file(Path::new("/outside/file"), b"outside")?;
@@ -375,12 +390,65 @@ fn rejects_paths_through_links() -> TestResult {
     assert!(extract_archive(&host, archive, &extract_options()).is_err());
     host.remove_file(Path::new("/extract/tree"))?;
     host.create_dir_all(Path::new("/extract/tree"))?;
-    host.symlink(Path::new("/outside/file"), Path::new("/extract/tree/file"))?;
-    assert!(extract_archive(&host, archive, &extract_options()).is_err());
+    let file = Path::new("/extract/tree/file");
+    let outside = Path::new("/outside/file");
+    host.symlink(outside, file)?;
+    extract_archive(&host, archive, &extract_options())?;
+    assert_eq!(host.metadata(file, Follow::No)?.kind, FileKind::File);
+    assert_eq!(read_bytes(&host, file, 16)?, b"archive");
 
-    host.remove_file(Path::new("/extract/tree/file"))?;
-    host.hard_link(Path::new("/outside/file"), Path::new("/extract/tree/file"))?;
+    host.remove_file(file)?;
+    host.hard_link(outside, file)?;
+    extract_archive(&host, archive, &extract_options())?;
+    assert_eq!(read_bytes(&host, file, 16)?, b"archive");
+    assert_eq!(read_bytes(&host, outside, 16)?, b"outside");
+    assert_eq!(host.metadata(outside, Follow::No)?.nlink, 1);
+    Ok(())
+}
+
+#[test]
+fn round_trips_absolute_and_parent_symlink_targets_twice() -> TestResult {
+    for format in ALL_FORMATS {
+        let host = test_host();
+        let archive = Path::new("/archive");
+        let links = [
+            ("absolute", Path::new("/etc/hosts")),
+            ("relative", Path::new("../outside")),
+        ];
+        for (name, target) in links {
+            host.symlink(target, &Path::new("/source").join(name))?;
+        }
+        create_archive(
+            &host,
+            archive,
+            Path::new("/source"),
+            &[PathBuf::from("absolute"), PathBuf::from("relative")],
+            &create_options(format),
+        )?;
+        for _ in 0..2 {
+            extract_archive(&host, archive, &extract_options())?;
+            for (name, target) in links {
+                assert_eq!(host.read_link(&Path::new("/extract").join(name))?, target);
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn rejects_writes_through_an_extracted_symlink() -> TestResult {
+    let host = test_host();
+    host.seed_file(Path::new("/outside/file"), b"outside")?;
+    let archive = Path::new("/archive");
+    let mut builder = Builder::new(Vec::new());
+    add_test_tar_link(&mut builder, "link", EntryType::Symlink, b"/outside")?;
+    add_test_tar_file(&mut builder, "link/file")?;
+    host.seed_file(archive, &builder.into_inner()?)?;
     assert!(extract_archive(&host, archive, &extract_options()).is_err());
+    assert_eq!(
+        host.read_link(Path::new("/extract/link"))?,
+        Path::new("/outside")
+    );
     assert_eq!(
         read_bytes(&host, Path::new("/outside/file"), 16)?,
         b"outside"
@@ -389,17 +457,138 @@ fn rejects_paths_through_links() -> TestResult {
 }
 
 #[test]
-fn rejects_an_escaping_symbolic_link_target() -> TestResult {
+fn extracts_tar_hard_links_twice() -> TestResult {
     let host = test_host();
-    host.symlink(Path::new("../outside"), Path::new("/source/link"))?;
     let archive = Path::new("/archive");
+    let mut builder = Builder::new(Vec::new());
+    add_test_tar_file(&mut builder, "nested/file")?;
+    add_test_tar_link(&mut builder, "link", EntryType::Link, b"./nested/file")?;
+    host.seed_file(archive, &builder.into_inner()?)?;
+    for _ in 0..2 {
+        assert_eq!(
+            extract_archive(&host, archive, &extract_options())?,
+            names(&["nested/file", "link"])
+        );
+        let file = host.metadata(Path::new("/extract/nested/file"), Follow::No)?;
+        let link = Path::new("/extract/link");
+        assert_eq!(host.metadata(link, Follow::No)?, file);
+        assert_eq!(file.nlink, 2);
+        assert_eq!(file.mode, 0o644);
+        assert_eq!(file.mtime, timestamp::seconds(0));
+        assert_eq!(read_bytes(&host, link, 16)?, b"x");
+    }
+    Ok(())
+}
+
+#[test]
+fn rejects_unsafe_tar_hard_link_targets_before_writing() -> TestResult {
+    let host = test_host();
+    let archive = Path::new("/archive");
+    for target in [b"../outside".as_slice(), b"/outside", b"./link", b"."] {
+        let mut builder = Builder::new(Vec::new());
+        add_test_tar_file(&mut builder, "valid")?;
+        add_test_tar_link(&mut builder, "link", EntryType::Link, target)?;
+        host.write(archive, &builder.into_inner()?, WriteMode::Truncate)?;
+        assert!(extract_archive(&host, archive, &extract_options()).is_err());
+        assert!(absent(&host, "/extract"));
+    }
+    Ok(())
+}
+
+#[test]
+fn rejects_hard_link_targets_through_symlinks() -> TestResult {
+    for target in [b"parent/file".as_slice(), b"leaf"] {
+        let host = test_host();
+        host.seed_file(Path::new("/outside/file"), b"outside")?;
+        let archive = Path::new("/archive");
+        let mut builder = Builder::new(Vec::new());
+        add_test_tar_link(&mut builder, "parent", EntryType::Symlink, b"/outside")?;
+        add_test_tar_link(&mut builder, "leaf", EntryType::Symlink, b"/outside/file")?;
+        add_test_tar_link(&mut builder, "link", EntryType::Link, target)?;
+        host.seed_file(archive, &builder.into_inner()?)?;
+        assert!(extract_archive(&host, archive, &extract_options()).is_err());
+        assert!(absent(&host, "/extract/link"));
+    }
+    Ok(())
+}
+
+#[test]
+fn skips_tar_fifos_and_devices() -> TestResult {
+    let host = test_host();
+    let archive = Path::new("/archive");
+    let mut builder = Builder::new(Vec::new());
+    for (name, kind) in [
+        ("pipe", EntryType::Fifo),
+        ("char", EntryType::Char),
+        ("block", EntryType::Block),
+    ] {
+        let mut header = Header::new_gnu();
+        header.set_entry_type(kind);
+        header.set_size(0);
+        builder.append_data(&mut header, name, &[][..])?;
+    }
+    add_test_tar_file(&mut builder, "file")?;
+    host.seed_file(archive, &builder.into_inner()?)?;
+    extract_archive(&host, archive, &extract_options())?;
+    for path in ["/extract/pipe", "/extract/char", "/extract/block"] {
+        assert!(absent(&host, path));
+    }
+    assert_eq!(read_bytes(&host, Path::new("/extract/file"), 16)?, b"x");
+    Ok(())
+}
+
+#[test]
+fn identifies_unsupported_compression() -> TestResult {
+    let host = test_host();
+    let archive = Path::new("/archive");
+    for (magic, message) in [
+        (b"\xfd7zXZ\0".as_slice(), "XZ compression not yet supported"),
+        (
+            b"\x28\xb5\x2f\xfd".as_slice(),
+            "Zstd compression not yet supported",
+        ),
+        (b"BZh".as_slice(), "BZip2 compression not yet supported"),
+    ] {
+        host.write(archive, magic, WriteMode::Truncate)?;
+        assert_eq!(
+            extract_archive(&host, archive, &extract_options()),
+            Err(ArchiveError::new(message))
+        );
+        assert!(absent(&host, "/extract"));
+    }
+    Ok(())
+}
+
+#[test]
+fn rejects_truncated_tar_payload_before_writing() -> TestResult {
+    let host = test_host();
+    let archive = Path::new("/archive");
+    let mut builder = Builder::new(Vec::new());
+    add_test_tar_file(&mut builder, "valid")?;
+    add_test_tar_file(&mut builder, "truncated")?;
+    let mut bytes = builder.into_inner()?;
+    bytes.truncate(1536);
+    host.seed_file(archive, &bytes)?;
+    assert!(extract_archive(&host, archive, &extract_options()).is_err());
+    assert!(absent(&host, "/extract"));
+    Ok(())
+}
+
+#[test]
+fn rejects_truncated_gzip_trailer_before_writing() -> TestResult {
+    let host = test_host();
+    let archive = Path::new("/archive");
+    host.seed_file(Path::new("/source/input"), b"input")?;
     create_archive(
         &host,
         archive,
         Path::new("/source"),
-        &[PathBuf::from("link")],
-        &create_options(ArchiveFormat::Tar),
+        &[PathBuf::from("input")],
+        &create_options(ArchiveFormat::TarGz),
     )?;
+    let mut bytes = read_bytes(&host, archive, size_limit())?;
+    bytes.truncate(bytes.len() - 1);
+    host.write(archive, &bytes, WriteMode::Truncate)?;
     assert!(extract_archive(&host, archive, &extract_options()).is_err());
     assert!(absent(&host, "/extract"));
     Ok(())
