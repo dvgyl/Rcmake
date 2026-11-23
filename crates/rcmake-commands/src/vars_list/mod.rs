@@ -8,7 +8,7 @@ use rcmake_expr::ExpandedArg;
 
 mod callbacks;
 mod lists;
-mod separate;
+pub(crate) mod separate;
 mod sort;
 mod transform;
 mod variables;

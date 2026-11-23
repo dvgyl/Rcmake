@@ -994,3 +994,69 @@ fn find_package_global_promotes_targets_from_a_subdirectory() -> HostResult<()> 
     );
     Ok(())
 }
+
+#[test]
+fn pkg_config_extract_prefers_uninstalled_and_preserves_exact_version() -> HostResult<()> {
+    let (host, mut interp) = setup();
+    let search = if cfg!(windows) {
+        b"/first;/second"
+    } else {
+        b"/first:/second"
+    };
+    host.env_set(b"PKG_CONFIG_PATH", Some(search));
+    interp
+        .cx()
+        .set_var(b"CMAKE_PKG_CONFIG_PC_SYSROOT_DIR", "/sys root".into());
+    host.seed_file(
+        Path::new("/first/demo.pc"),
+        b"Name: Installed\nDescription: Test package\nVersion: 1",
+    )?;
+    host.seed_file(
+        Path::new("/second/demo-uninstalled.pc"),
+        br#"prefix=/prefix
+Name: Uninstalled
+Description: Test package
+Version: 01
+Cflags: -I${prefix}/include -DTEST
+Libs: -L${prefix}/lib -ldemo
+Libs.private: -lm
+Requires: core >= 1, extra
+"#,
+    )?;
+    assert_eq!(
+        run(
+            &host,
+            &mut interp,
+            r#"
+cmake_pkg_config(EXTRACT demo 1 REQUIRED)
+cmake_pkg_config(EXTRACT demo 1 EXACT QUIET)
+cmake_pkg_config(POPULATE demo REQUIRED DISABLE_UNINSTALLED ON)
+cmake_pkg_config(IMPORT demo REQUIRED NAME renamed)
+"#,
+        )?,
+        0,
+        "{}",
+        host.stream_bytes(Stream::Stderr)
+    );
+    assert_eq!(var(&mut interp, b"CMAKE_PKG_CONFIG_NAME"), "Uninstalled");
+    assert_eq!(var(&mut interp, b"CMAKE_PKG_CONFIG_VERSION"), "01");
+    assert_eq!(
+        var(&mut interp, b"CMAKE_PKG_CONFIG_INCLUDES"),
+        "-I/sys root/prefix/include"
+    );
+    assert_eq!(
+        var(&mut interp, b"CMAKE_PKG_CONFIG_LIBNAMES_PRIVATE"),
+        "-lm"
+    );
+    assert_eq!(var(&mut interp, b"CMAKE_PKG_CONFIG_REQUIRES"), "core;extra");
+    assert_eq!(var(&mut interp, b"PKGCONFIG_demo_FOUND"), "TRUE");
+    assert!(
+        interp
+            .cx()
+            .project()
+            .find_target(rcmake_model::DirId::ROOT, b"PkgConfig::renamed")
+            .is_some()
+    );
+    assert!(host.stream_bytes(Stream::Stderr).is_empty());
+    Ok(())
+}

@@ -11,6 +11,7 @@ mod environment;
 mod execute;
 mod find;
 mod find_package;
+mod pkg_config;
 #[cfg(test)]
 mod tests;
 
@@ -22,6 +23,7 @@ pub(crate) fn register(registry: &mut Registry) {
     registry.add("find_program", find::find_program, flags);
     registry.add("find_library", find::find_library, flags);
     registry.add("find_package", find_package::find_package, flags);
+    registry.add("cmake_pkg_config", pkg_config::run, flags);
 }
 
 fn diagnostic(cx: &mut Cx<'_>, text: BString) -> CmdError {

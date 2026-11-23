@@ -150,14 +150,14 @@ fn find_program(cx: &Cx<'_>, token: &[u8]) -> Option<BString> {
     None
 }
 
-struct Arguments<'a> {
+pub(crate) struct Arguments<'a> {
     input: &'a [u8],
     offset: usize,
     windows: bool,
 }
 
 impl<'a> Arguments<'a> {
-    fn new(input: &'a [u8], windows: bool) -> Self {
+    pub(crate) fn new(input: &'a [u8], windows: bool) -> Self {
         Self {
             input,
             offset: 0,

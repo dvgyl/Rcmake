@@ -195,20 +195,11 @@ fn callback(args: &[ExpandedArg]) -> BString {
         if i != 0 {
             command.push(b' ');
         }
-        let quote = arg.value.is_empty()
-            || arg
-                .value
-                .iter()
-                .any(|byte| byte.is_ascii_whitespace() || matches!(byte, b'\'' | b'"' | b'\\'));
+        let quote = arg.value.contains(&b' ');
         if quote {
             command.push(b'"');
         }
-        for &byte in arg.value.iter() {
-            if matches!(byte, b'"' | b'\\') {
-                command.push(b'\\');
-            }
-            command.push(byte);
-        }
+        command.extend_from_slice(&arg.value);
         if quote {
             command.push(b'"');
         }
@@ -261,7 +252,7 @@ cmake_minimum_required(VERSION 4.5)
 cmake_instrumentation(API_VERSION 1 DATA_VERSION 1.2
   HOOKS postGenerate manual postGenerate
   OPTIONS processMetrics trace
-  CALLBACK tool "two words" CALLBACK other
+  CALLBACK [=["/path/tool"]=] "two words" CALLBACK other
   CUSTOM_CONTENT greeting STRING hello
   CUSTOM_CONTENT enabled BOOL OFF
   CUSTOM_CONTENT members LIST "a;;b"
@@ -279,7 +270,7 @@ cmake_instrumentation(DATA_VERSION 1 API_VERSION 1)
         assert_eq!(parsed.version, DATA_VERSION);
         assert_eq!(
             parsed.callbacks,
-            [BString::from("tool \"two words\""), "other".into()]
+            [BString::from(r#""/path/tool" "two words""#), "other".into()]
         );
         assert_eq!(parsed.hooks, [Hook::PostGenerate, Hook::Manual]);
         assert_eq!(
