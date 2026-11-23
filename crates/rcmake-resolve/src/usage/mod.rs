@@ -110,6 +110,10 @@ impl<'a> UsageResolver<'a> {
         }
     }
 
+    pub(crate) fn source_paths(&self) -> Option<&'a SourcePaths<'a>> {
+        self.source_paths
+    }
+
     /// Borrow a generator expression host with the given default lookup directory.
     pub fn host(&mut self, lookup_dir: DirId) -> ModelGenexHost<'a, '_> {
         ModelGenexHost::new(self, lookup_dir)
@@ -377,6 +381,17 @@ impl<'a> UsageResolver<'a> {
         let mut result = UsageValue::default();
         self.eval_entries(owner, property, entries, ctx, &mut result)?;
         Ok(result.entries)
+    }
+
+    pub(crate) fn eval_source_compile_flags(
+        &mut self,
+        target: TargetId,
+        entry: &BT<BString>,
+        ctx: &EvalContext,
+    ) -> Result<BString, ResolveError> {
+        let dir = self.target(target)?.dir;
+        let (value, _) = self.eval_entry(target, dir, b"COMPILE_FLAGS", entry, ctx, false)?;
+        Ok(value)
     }
 
     fn eval_entries<'entry>(

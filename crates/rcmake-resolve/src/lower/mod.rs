@@ -17,7 +17,7 @@ mod tests;
 use rcmake_base::{BString, path_lex::Lexical};
 use rcmake_model::{DirId, ProjectModel, Target};
 
-pub(crate) use artifacts::build_relative;
+pub(crate) use artifacts::{build_relative, is_darwin};
 pub use artifacts::{compute_artifacts, linker_language, object_path, source_language};
 pub(crate) use custom::command_outputs;
 pub use graph::lower;

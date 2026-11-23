@@ -236,7 +236,7 @@ pub struct InterfaceInclude {
 pub struct CompileGroup {
     /// Compile language.
     pub language: BString,
-    /// Compile flag fragments in command-line order.
+    /// Compile flag fragments in command-line order. The `SHELL:` prefix marks raw shell text.
     pub flags: Vec<BT<BString>>,
     /// Preprocessor definitions (`NAME` or `NAME=value`).
     pub defines: Vec<BT<BString>>,
@@ -797,6 +797,7 @@ fn resolve_target<'a>(
                 .filter(|props| {
                     [
                         b"COMPILE_OPTIONS".as_slice(),
+                        b"COMPILE_FLAGS",
                         b"COMPILE_DEFINITIONS",
                         b"INCLUDE_DIRECTORIES",
                     ]
@@ -818,9 +819,15 @@ fn resolve_target<'a>(
                         .standard_requirements
                         .insert(language.clone(), standard);
                 }
-                let flags = usage
-                    .collect(id, UsageField::CompileOptions, &compile_ctx)?
-                    .entries;
+                let mut flags = Vec::new();
+                if let Some(value) = target.props.get(b"COMPILE_FLAGS") {
+                    sources::append_compile_flags(&mut flags, value, Backtrace::default());
+                }
+                flags.extend(
+                    usage
+                        .collect(id, UsageField::CompileOptions, &compile_ctx)?
+                        .entries,
+                );
                 let mut defines = usage
                     .collect(id, UsageField::CompileDefinitions, &compile_ctx)?
                     .entries;
@@ -1613,8 +1620,16 @@ fn resolve_link(
         ));
     }
     for item in &items {
-        append_link_item(model, resolved, &ctx.config, item, &mut fragments);
+        append_link_item(
+            model,
+            resolved,
+            target.dir,
+            &ctx.config,
+            item,
+            &mut fragments,
+        );
     }
+    fragments.sort_by_key(|fragment| fragment.role == LinkFragmentRole::Libraries);
     for item in link_items(&items) {
         if let ResolvedLinkKind::Objects(id) = item.kind {
             if let Some(facts) = resolved.get(&id) {
@@ -1650,6 +1665,7 @@ fn link_items(items: &[ResolvedLinkItem]) -> impl Iterator<Item = &ResolvedLinkI
 fn append_link_item(
     model: &ProjectModel,
     resolved: &IndexMap<TargetId, ResolvedTarget>,
+    dir: DirId,
     config: &ConfigId,
     item: &ResolvedLinkItem,
     fragments: &mut Vec<LinkFragment>,
@@ -1665,7 +1681,7 @@ fn append_link_item(
             );
             let path = artifacts.linker_file.or(artifacts.file);
             if let Some(path) = path {
-                append_library_path(&path, &item.text, fragments);
+                append_library_path(model, dir, &path, &item.text, fragments);
                 return;
             }
             (raw_library(value), Libraries)
@@ -1673,30 +1689,64 @@ fn append_link_item(
         ResolvedLinkKind::Objects(_) | ResolvedLinkKind::Interface(_) => return,
         ResolvedLinkKind::Group { members, .. } => {
             for member in members {
-                append_link_item(model, resolved, config, member, fragments);
+                append_link_item(model, resolved, dir, config, member, fragments);
             }
             return;
         }
         ResolvedLinkKind::ObjectFile => (shell_quote(value), Libraries),
         ResolvedLinkKind::Raw if value.contains(&b'/') && !value.starts_with(b"-") => {
-            append_library_path(value, &item.text, fragments);
+            append_library_path(model, dir, value, &item.text, fragments);
             return;
+        }
+        ResolvedLinkKind::Raw if is_framework_option(value) && lower::is_darwin(model, dir) => {
+            (value.into(), Libraries)
         }
         ResolvedLinkKind::Raw => (raw_library(value), Libraries),
     };
     fragments.push(link_fragment(text, &item.text, role));
 }
 
-fn append_library_path(path: &[u8], origin: &BT<BString>, fragments: &mut Vec<LinkFragment>) {
+fn is_framework_option(value: &[u8]) -> bool {
+    matches!(
+        value.split(|byte| byte.is_ascii_whitespace()).next(),
+        Some(
+            b"-framework"
+                | b"-weak_framework"
+                | b"-needed_framework"
+                | b"-reexport_framework"
+                | b"-lazy_framework"
+        )
+    )
+}
+
+fn append_library_path(
+    model: &ProjectModel,
+    dir: DirId,
+    path: &[u8],
+    origin: &BT<BString>,
+    fragments: &mut Vec<LinkFragment>,
+) {
     let path_view = Lexical::new(path);
     if let Some(name) = path_view.filename().strip_suffix(b".framework")
         && !name.is_empty()
     {
+        let parent = Lexical::new(path_view.parent()).normalize();
+        let implicit = lower::definition(
+            model,
+            dir,
+            b"CMAKE_PLATFORM_IMPLICIT_LINK_FRAMEWORK_DIRECTORIES",
+        )
+        .is_some_and(|dirs| {
+            list::split(dirs, list::Empty::Drop)
+                .iter()
+                .any(|path| Lexical::new(path).normalize() == parent)
+        });
         let directory = shell_quote(&[b"-F", path_view.parent()].concat());
         let role = LinkFragmentRole::FrameworkPath;
-        if !fragments
-            .iter()
-            .any(|fragment| fragment.role == role && fragment.text.value == directory)
+        if !implicit
+            && !fragments
+                .iter()
+                .any(|fragment| fragment.role == role && fragment.text.value == directory)
         {
             fragments.push(link_fragment(directory, origin, role));
         }

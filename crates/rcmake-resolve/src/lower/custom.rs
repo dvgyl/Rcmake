@@ -13,8 +13,9 @@ use rcmake_model::{
 use super::graph::push;
 use super::shell::direct;
 use super::{build_relative, compute_artifacts, join};
+use crate::sources::SourcePaths;
 use crate::usage::{ModelGenexHost, UsageResolver, handle};
-use crate::{ArtifactSet, BuildStep, CustomStep, ResolveError, ResolvedTarget};
+use crate::{ArtifactSet, BuildStep, CustomStep, ResolveError, ResolvedTarget, absolute_path};
 
 pub(super) struct Commands<'a> {
     model: &'a ProjectModel,
@@ -68,6 +69,7 @@ impl<'a> Commands<'a> {
     ) -> Result<(CustomStep, IndexSet<TargetId>), ResolveError> {
         let binary = &self.model.dir(command.dir).binary_dir;
         let artifact_dependencies = RefCell::new(IndexSet::new());
+        let paths = usage.source_paths();
         let mut eval = CommandEvaluation::new(command, self.config, usage);
         let outputs = eval.paths(binary, &command.outputs)?;
         let byproducts = eval.paths(binary, &command.byproducts)?;
@@ -93,7 +95,7 @@ impl<'a> Commands<'a> {
             .chain(command.implicit_depends.iter().map(|(_, file)| file))
         {
             for dep in list::split(&eval.value(dep)?, list::Empty::Drop) {
-                depends.insert(self.dependency_path(command.dir, &dep, &mut dependencies));
+                depends.insert(self.dependency_path(command.dir, &dep, paths, &mut dependencies));
             }
         }
         let mut invocations = Vec::new();
@@ -159,6 +161,7 @@ impl<'a> Commands<'a> {
         &self,
         dir: DirId,
         dep: &BString,
+        paths: Option<&SourcePaths<'_>>,
         dependencies: &mut IndexSet<TargetId>,
     ) -> BString {
         if let Some(id) = self.model.find_target(dir, dep)
@@ -170,12 +173,13 @@ impl<'a> Commands<'a> {
                 .map_or_else(|| dep.clone(), |path| build_relative(self.model, &path));
         }
         let dir = self.model.dir(dir);
-        let file = Lexical::new(&join(&dir.source_dir, dep)).normalize();
-        if dir.source_props.contains_key(&file) {
-            build_relative(self.model, &file)
-        } else {
-            command_path(self.model, &dir.binary_dir, dep)
-        }
+        let source = absolute_path(&dir.source_dir, dep);
+        let binary = absolute_path(&dir.binary_dir, dep);
+        let in_source = paths.map_or_else(
+            || dir.source_props.contains_key(&source),
+            |paths| paths.is_source_dependency(dir, &source, &binary),
+        );
+        build_relative(self.model, if in_source { &source } else { &binary })
     }
 
     fn artifact(&self, id: TargetId, target: &Target) -> Option<BString> {

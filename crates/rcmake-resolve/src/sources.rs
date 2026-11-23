@@ -25,6 +25,11 @@ pub(crate) fn apply_compile_properties(
 ) -> Result<(), ResolveError> {
     let mut ctx = ctx.clone();
     ctx.head = Some(usage::handle(target));
+    if let Some(value) = source_props.and_then(|props| props.get(b"COMPILE_FLAGS")) {
+        let entry = BT::new(value.clone(), source.backtrace.clone());
+        let flags = usage.eval_source_compile_flags(target, &entry, &ctx)?;
+        append_compile_flags(&mut group.flags, &flags, entry.backtrace);
+    }
     for name in [
         b"COMPILE_OPTIONS".as_slice(),
         b"COMPILE_DEFINITIONS",
@@ -82,6 +87,16 @@ pub(crate) fn apply_compile_properties(
         }
     }
     Ok(())
+}
+
+pub(crate) fn append_compile_flags(
+    flags: &mut Vec<BT<BString>>,
+    value: &[u8],
+    backtrace: Backtrace,
+) {
+    if !value.is_empty() {
+        flags.push(BT::new([b"SHELL:", value].concat().into(), backtrace));
+    }
 }
 
 #[derive(Default)]
@@ -146,6 +161,16 @@ impl<'a> SourcePaths<'a> {
             .into_iter()
             .map(|base| absolute_path(base, source))
             .any(|path| self.generated.contains(&path))
+    }
+
+    pub(crate) fn is_source_dependency(
+        &self,
+        dir: &Directory,
+        source: &BString,
+        binary: &BString,
+    ) -> bool {
+        self.host.metadata(&to_native(source), Follow::Yes).is_ok()
+            || (!self.generated.contains(binary) && dir.source_props.contains_key(source))
     }
 
     pub(crate) fn find(&self, dir: &Directory, source: &[u8]) -> Option<BString> {

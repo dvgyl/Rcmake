@@ -70,6 +70,129 @@ fn link_item(name: &str) -> LinkItem {
 }
 
 #[test]
+fn compile_flags_keep_shell_arguments_and_property_order() -> TestResult {
+    let mut model = project();
+    for (name, value) in [
+        ("CMAKE_CXX_FLAGS", "-DLANGUAGE_FLAG"),
+        ("CMAKE_CXX_FLAGS_DEBUG", "-g"),
+        ("CMAKE_OSX_ARCHITECTURES", "arm64"),
+    ] {
+        model.global.props.set(name.into(), value.into());
+    }
+    let mut app = target(
+        "app",
+        TargetKind::SharedLibrary,
+        &["a.cpp", "b.cpp", "c.cpp"],
+    );
+    app.props.set(
+        "COMPILE_FLAGS".into(),
+        r#"-DTARGET_TEXT="a b" -DESCAPED=a\ b"#.into(),
+    );
+    app.usage
+        .push(UsageField::CompileOptions, entry("-DTARGET_OPTION"));
+    app.usage
+        .push(UsageField::CompileDefinitions, entry("TARGET_DEF"));
+    model.add_target(app)?;
+    let source = model
+        .dir_mut(DirId::ROOT)
+        .source_props
+        .entry("/src/b.cpp".into())
+        .or_default();
+    source.set("COMPILE_FLAGS".into(), "-DSOURCE='$<CONFIG>;a b'".into());
+    source.set("COMPILE_OPTIONS".into(), "-DSOURCE_OPTION".into());
+    model
+        .dir_mut(DirId::ROOT)
+        .source_props
+        .entry("/src/c.cpp".into())
+        .or_default()
+        .set("COMPILE_FLAGS".into(), "-DSOURCE_ONLY".into());
+    let host = PureHost::default();
+    for path in ["/src/a.cpp", "/src/b.cpp", "/src/c.cpp"] {
+        host.seed_file(Path::new(path), b"")?;
+    }
+
+    let result = resolve(&model, &host, &[ConfigId("Debug".into())])?;
+    let compile_args = result.graphs[0]
+        .steps
+        .iter()
+        .filter_map(|step| match step {
+            BuildStep::Compile { invocation, .. } => Some(&invocation.argv),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let [plain, with_source_flags, flags_only] = compile_args.as_slice() else {
+        return Err("Expected three compile commands.".into());
+    };
+    let shared = [
+        "-DTARGET_DEF",
+        "-Dapp_EXPORTS",
+        "-DLANGUAGE_FLAG",
+        "-g",
+        "-arch",
+        "arm64",
+        "-fPIC",
+        "-DTARGET_TEXT=a b",
+        "-DESCAPED=a b",
+        "-DTARGET_OPTION",
+    ];
+    assert_eq!(&plain[1..=shared.len()], shared);
+    assert_eq!(&with_source_flags[1..=shared.len()], shared);
+    assert!(!plain.iter().any(|arg| arg.starts_with(b"-DSOURCE")));
+    assert_eq!(
+        &with_source_flags[shared.len() + 1..=shared.len() + 2],
+        ["-DSOURCE=Debug;a b", "-DSOURCE_OPTION"],
+    );
+    assert_eq!(flags_only[shared.len() + 1], "-DSOURCE_ONLY");
+    Ok(())
+}
+
+#[test]
+fn darwin_framework_items_keep_linker_argument_boundaries() -> TestResult {
+    let mut model = project();
+    model.global.props.set(
+        "CMAKE_PLATFORM_IMPLICIT_LINK_FRAMEWORK_DIRECTORIES".into(),
+        "/SDK/System/Library/Frameworks".into(),
+    );
+    let mut app = target("app", TargetKind::Executable, &["main.c"]);
+    app.usage.link_libraries = Some(vec![
+        link_item("-framework Cocoa"),
+        link_item(r#"-weak_framework "Two Words""#),
+        link_item("/SDK/System/Library/Frameworks/IOKit.framework"),
+        link_item("/framework dir/Local Name.framework"),
+        link_item("/framework dir/Other.framework"),
+    ]);
+    model.add_target(app)?;
+    let host = PureHost::default();
+    host.seed_file(Path::new("/src/main.c"), b"")?;
+    let result = resolve(&model, &host, &[])?;
+    let Some(BuildStep::Link { invocations, .. }) = result.graphs[0].steps.last() else {
+        return Err("Expected a link command.".into());
+    };
+    let [link] = invocations.as_slice() else {
+        return Err("Expected one linker invocation.".into());
+    };
+    assert!(
+        link.argv.ends_with(
+            &[
+                "-F/framework dir",
+                "-framework",
+                "Cocoa",
+                "-weak_framework",
+                "Two Words",
+                "-framework",
+                "IOKit",
+                "-framework",
+                "Local Name",
+                "-framework",
+                "Other",
+            ]
+            .map(BString::from),
+        )
+    );
+    Ok(())
+}
+
+#[test]
 fn resolves_build_install_and_export_for_each_config() -> TestResult {
     let mut model = project();
     model.cache.insert(
@@ -239,9 +362,9 @@ fn resolves_build_install_and_export_for_each_config() -> TestResult {
         [
             (b"-v".as_slice(), LinkFragmentRole::Flags),
             (b"'-L/out/lib path'", LinkFragmentRole::LibraryPath),
+            (b"-F/SDK/Frameworks", LinkFragmentRole::FrameworkPath),
             (b"/out/libmath.a", LinkFragmentRole::Libraries),
             (b"-lm", LinkFragmentRole::Libraries),
-            (b"-F/SDK/Frameworks", LinkFragmentRole::FrameworkPath),
             (b"-framework Foo", LinkFragmentRole::Libraries),
         ],
     );
@@ -779,6 +902,65 @@ fn external_object_source_is_linked_without_compilation() -> TestResult {
     let result = resolve(&model, &host, &[])?;
     assert_eq!(result.targets[0].compile_units.len(), 1);
     assert_object_input(&result.graphs[0], "app", &"/src/prebuilt.data".into())
+}
+
+#[test]
+fn relative_custom_dependencies_resolve_to_source_files_or_generated_outputs() -> TestResult {
+    use rcmake_model::{CustomCommand, CustomCommandKind};
+
+    let mut model = project();
+    let command = |output| {
+        let mut command = CustomCommand::new(
+            DirId::ROOT,
+            CustomCommandKind::Output,
+            backtrace(7),
+            Default::default(),
+        );
+        command.outputs.push(entry(output));
+        command
+    };
+    let mut consumer = command("result");
+    consumer.depends.extend(
+        [
+            "source.txt",
+            "both.txt",
+            "generated.txt",
+            "byproduct.txt",
+            "missing.txt",
+        ]
+        .map(entry),
+    );
+    model.add_command(consumer)?;
+    model.add_command(command("both.txt"))?;
+    let mut producer = command("generated.txt");
+    producer.byproducts.push(entry("byproduct.txt"));
+    model.add_command(producer)?;
+    model
+        .dir_mut(DirId::ROOT)
+        .source_props
+        .entry("/src/generated.txt".into())
+        .or_default()
+        .set("GENERATED".into(), "1".into());
+    let host = PureHost::default();
+    for source in ["/src/source.txt", "/src/both.txt"] {
+        host.seed_file(Path::new(source), b"")?;
+    }
+
+    let result = resolve(&model, &host, &[])?;
+    let Some(BuildStep::Custom(recipe)) = result.graphs[0].steps.first() else {
+        return Err("Expected a custom command.".into());
+    };
+    assert_eq!(
+        recipe.depends,
+        [
+            "/src/source.txt",
+            "/src/both.txt",
+            "generated.txt",
+            "byproduct.txt",
+            "missing.txt"
+        ],
+    );
+    Ok(())
 }
 
 #[test]

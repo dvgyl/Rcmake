@@ -7,7 +7,7 @@ use rcmake_model::{DirId, ProjectModel, Target, TargetKind};
 use super::{definition, join, target_property};
 use crate::ArtifactSet;
 
-pub(super) fn is_darwin(model: &ProjectModel, dir: DirId) -> bool {
+pub(crate) fn is_darwin(model: &ProjectModel, dir: DirId) -> bool {
     if let Some(system) = definition(model, dir, b"CMAKE_SYSTEM_NAME") {
         return matches!(
             system.as_slice(),
