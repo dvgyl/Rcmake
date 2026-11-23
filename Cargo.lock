@@ -446,6 +446,7 @@ name = "rcmake-build"
 version = "0.1.0"
 dependencies = [
  "rcmake-base",
+ "rcmake-cxxmodules",
  "rcmake-diag",
  "rcmake-host",
  "rcmake-resolve",
@@ -615,8 +616,10 @@ name = "rcmake-gen-ninja"
 version = "0.1.0"
 dependencies = [
  "rcmake-base",
+ "rcmake-cxxmodules",
  "rcmake-diag",
  "rcmake-gen-common",
+ "rcmake-genex",
  "rcmake-host",
  "rcmake-model",
  "rcmake-resolve",
@@ -707,9 +710,11 @@ version = "0.1.0"
 dependencies = [
  "indexmap",
  "rcmake-base",
+ "rcmake-cxxmodules",
  "rcmake-diag",
  "rcmake-genex",
  "rcmake-host",
+ "rcmake-json",
  "rcmake-model",
  "thiserror",
 ]
