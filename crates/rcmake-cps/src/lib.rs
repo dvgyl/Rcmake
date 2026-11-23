@@ -14,6 +14,8 @@ use std::collections::BTreeMap;
 
 use rcmake_base::BString;
 
+mod paths;
+
 pub mod naming;
 pub mod reader;
 pub mod writer;
@@ -27,7 +29,7 @@ pub const CPS_VERSION: &str = "0.15.0";
 /// Error of a CPS operation.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum CpsError {
-    /// The operation is not implemented yet.
+    /// The operation is unavailable.
     #[error("{0} is not supported yet")]
     Unsupported(&'static str),
     /// The CPS document is not valid. The text is the CMake-style message.
@@ -97,6 +99,8 @@ pub struct CpsUsage {
     pub location: Option<BString>,
     /// `link_location`: the file to link against, when it is not `location`.
     pub link_location: Option<BString>,
+    /// `link_name`: the runtime name of the library.
+    pub link_name: Option<BString>,
     /// `includes`: include directories by language.
     pub includes: BTreeMap<BString, Vec<BString>>,
     /// `definitions`: preprocessor definitions by language (`None` value means
@@ -108,16 +112,37 @@ pub struct CpsUsage {
     pub compile_flags: BTreeMap<BString, Vec<BString>>,
     /// `link_features`.
     pub link_features: Vec<BString>,
+    /// `link_directories`: directories searched by the linker.
+    pub link_directories: Vec<BString>,
     /// `link_flags`.
     pub link_flags: Vec<BString>,
     /// `link_languages`.
     pub link_languages: Vec<BString>,
     /// `link_libraries`: plain library names or paths.
     pub link_libraries: Vec<BString>,
+    /// `compile_requires`: components needed only to compile.
+    pub compile_requires: Vec<BString>,
+    /// `dyld_requires`: components needed by the runtime linker.
+    pub dyld_requires: Vec<BString>,
     /// `link_requires`: components needed only to link (`:comp` or `pkg:comp`).
     pub link_requires: Vec<BString>,
     /// `requires`: components whose usage requirements propagate.
     pub requires: Vec<BString>,
+    /// `file_sets`: collections of files with a common root.
+    pub file_sets: Vec<CpsTargetFileSet>,
+}
+
+/// One entry in a component's `file_sets` array.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CpsTargetFileSet {
+    /// `type`, such as `includes` for a set of headers.
+    pub ty: BString,
+    /// `root`: base directory of the files.
+    pub root: BString,
+    /// `files`: file names relative to the root.
+    pub files: Vec<BString>,
+    /// `extensions.cmake["name@v1"]`: CMake file set name.
+    pub name: Option<BString>,
 }
 
 /// One component of a CPS package (`components.<name>`).
@@ -142,6 +167,8 @@ pub struct CpsRequirement {
     pub version: Option<BString>,
     /// `hints`: directories to search for the dependency.
     pub hints: Vec<BString>,
+    /// `extensions.cmake["domains@v1"]`: external package domains.
+    pub domains: Vec<BString>,
 }
 
 /// A CPS package file (`<Pkg>.cps` or appendix `<Pkg>-<appendix>.cps`).
@@ -167,6 +194,8 @@ pub struct CpsPackage {
     pub default_license: Option<BString>,
     /// `cps_path`: prefix of the package (`@prefix@/...`).
     pub cps_path: Option<BString>,
+    /// `prefix`: absolute installation prefix, when present.
+    pub prefix: Option<BString>,
     /// `configurations`: configuration names in preference order.
     pub configurations: Vec<BString>,
     /// `default_components`.
@@ -184,9 +213,9 @@ pub struct CpsPackage {
 pub struct CpsConfigSupplement {
     /// `name`: the package name.
     pub name: BString,
-    /// `cps_version`.
+    /// Optional input `cps_version`. CMake omits it when writing supplements.
     pub cps_version: BString,
-    /// `configuration`: lowercase configuration name (`noconfig` when empty).
+    /// `configuration`: case-preserving name (`noconfig` for an empty configuration).
     pub configuration: BString,
     /// `components`: requirements of this configuration, by component name.
     pub components: BTreeMap<BString, CpsUsage>,
@@ -201,4 +230,34 @@ pub struct CpsFileSet {
     pub package: CpsPackage,
     /// Configuration supplements with their file names.
     pub supplements: Vec<(BString, CpsConfigSupplement)>,
+}
+
+fn version_core(version: &[u8]) -> &[u8] {
+    version
+        .split(|byte| matches!(byte, b'-' | b'+'))
+        .next()
+        .unwrap_or_default()
+}
+
+fn validate_version(package: &CpsPackage) -> Result<(), CpsError> {
+    if package
+        .version_schema
+        .as_ref()
+        .is_none_or(|schema| schema.is_empty() || schema.eq_ignore_ascii_case(b"simple"))
+    {
+        for version in [&package.version, &package.compat_version]
+            .into_iter()
+            .flatten()
+        {
+            if !version_core(version)
+                .split(|byte| *byte == b'.')
+                .all(|part| !part.is_empty() && part.iter().all(u8::is_ascii_digit))
+            {
+                return Err(CpsError::Invalid(
+                    format!("Version {version:?} does not conform to the simple schema.").into(),
+                ));
+            }
+        }
+    }
+    Ok(())
 }
