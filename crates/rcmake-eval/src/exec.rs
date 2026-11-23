@@ -265,11 +265,81 @@ impl Interp {
             .or_else(|| self.cache.get(name).map(|e| &e.value))
     }
 
-    pub(crate) fn current_source_dir(&self) -> PathBuf {
-        match self.vars.get(b"CMAKE_CURRENT_SOURCE_DIR") {
-            Some(v) if !v.is_empty() => rcmake_host::path::to_native(v),
-            _ => self.config.cwd.clone(),
+    pub(crate) fn run_configure_impl(
+        &mut self,
+        source_dir: &Path,
+        binary_dir: &Path,
+        preload_scripts: &[PathBuf],
+    ) -> RunOutcome {
+        let cwd = rcmake_host::path::from_native(&self.config.cwd);
+        let src_abs = collapse_full_path(&rcmake_host::path::from_native(source_dir), &cwd);
+        let bin_abs = collapse_full_path(&rcmake_host::path::from_native(binary_dir), &cwd);
+        let src_native = rcmake_host::path::to_native(&src_abs);
+        let bin_native = rcmake_host::path::to_native(&bin_abs);
+
+        self.source_dir = src_native.clone();
+        self.binary_dir = bin_native.clone();
+        self.render.relative_base = Some(src_abs.clone());
+
+        for var in [b"CMAKE_SOURCE_DIR".as_slice(), b"CMAKE_CURRENT_SOURCE_DIR"] {
+            self.vars.set(var, src_abs.clone());
         }
+        for var in [b"CMAKE_BINARY_DIR".as_slice(), b"CMAKE_CURRENT_BINARY_DIR"] {
+            self.vars.set(var, bin_abs.clone());
+        }
+
+        let _ = self.config.host.create_dir_all(&bin_native);
+        for preload in preload_scripts {
+            self.run_preload_script_impl(preload);
+            if self.fatal {
+                return RunOutcome {
+                    exit_code: self.exit_code(),
+                };
+            }
+        }
+
+        let lists_path = src_native.join("CMakeLists.txt");
+        let lists_bytes = rcmake_host::path::from_native(&lists_path);
+        if !self.is_regular_file(&lists_bytes) {
+            self.error_no_location(cat(&[
+                b"The source directory \"",
+                &src_abs,
+                b"\" does not appear to contain CMakeLists.txt.\nSpecify --help for usage, or press the help button on the CMake GUI.",
+            ]));
+            return RunOutcome {
+                exit_code: self.exit_code(),
+            };
+        }
+
+        let _ = self.read_list_file(&lists_bytes);
+        if self.exit_code() != 0 && self.exit_override.is_none() {
+            self.config.host.write_out(
+                Stream::Stdout,
+                b"-- Configuring incomplete, errors occurred!\n",
+            );
+        }
+        RunOutcome {
+            exit_code: self.exit_code(),
+        }
+    }
+
+    pub(crate) fn run_preload_script_impl(&mut self, path: &Path) -> bool {
+        let cwd = rcmake_host::path::from_native(&self.config.cwd);
+        let abs = collapse_full_path(&rcmake_host::path::from_native(path), &cwd);
+        let display = path.to_string_lossy();
+        self.config.host.write_out(
+            Stream::Stdout,
+            format!("loading initial cache file {display}\n").as_bytes(),
+        );
+        if !self.is_regular_file(&abs) {
+            self.error_no_location(cat(&[b"Error processing file: ", &abs]));
+            return false;
+        }
+        self.read_list_file(&abs)
+    }
+
+    pub(crate) fn current_source_dir(&self) -> PathBuf {
+        self.source_dir.clone()
     }
 
     fn current_source_dir_bytes(&self) -> BString {

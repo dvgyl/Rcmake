@@ -340,6 +340,12 @@ pub struct Interp {
     show_log_context: bool,
     /// Host monotonic time at session start (wall-clock budget).
     started: core::time::Duration,
+    /// True source directory for the active directory frame (not affected by user `set()`).
+    source_dir: PathBuf,
+    /// True binary directory for the active directory frame (not affected by user `set()`).
+    binary_dir: PathBuf,
+    /// Optional explicit exit code requested by `cmake_language(EXIT <code>)`.
+    exit_override: Option<i32>,
     frontend: Frontend,
 }
 
@@ -374,6 +380,7 @@ impl Interp {
             ..RenderOptions::default()
         };
         let started = config.host.monotonic();
+        let initial_dir = config.cwd.clone();
         let mut interp = Self {
             config,
             cache,
@@ -404,6 +411,9 @@ impl Interp {
             log_level: None,
             show_log_context: false,
             started,
+            source_dir: initial_dir.clone(),
+            binary_dir: initial_dir,
+            exit_override: None,
             frontend: Frontend::default(),
         };
         interp.init_default_vars();
@@ -413,6 +423,22 @@ impl Interp {
     /// Execute a standalone `-P` script at `path`.
     pub fn run_script(&mut self, path: &Path) -> RunOutcome {
         self.run_script_impl(path)
+    }
+
+    /// Execute a project configure session (`source_dir/CMakeLists.txt` with `binary_dir`
+    /// and optional `-C` preload scripts).
+    pub fn run_configure(
+        &mut self,
+        source_dir: &Path,
+        binary_dir: &Path,
+        preload_scripts: &[PathBuf],
+    ) -> RunOutcome {
+        self.run_configure_impl(source_dir, binary_dir, preload_scripts)
+    }
+
+    /// Execute one `-C` initial cache script in the current session.
+    pub fn run_preload_script(&mut self, path: &Path) -> bool {
+        self.run_preload_script_impl(path)
     }
 
     /// Execution context for embedding code (CLI setup, presets, tests).
@@ -443,10 +469,11 @@ impl Interp {
         self.fatal
     }
 
-    /// Exit code for the current state (`1` if any error was issued).
+    /// Exit code for the current state (`1` if any error was issued, or explicit `cmake_language(EXIT)` code).
     #[must_use]
     pub fn exit_code(&self) -> i32 {
-        i32::from(self.fatal || self.engine.error_occurred())
+        self.exit_override
+            .unwrap_or_else(|| i32::from(self.fatal || self.engine.error_occurred()))
     }
 }
 
@@ -527,9 +554,49 @@ impl Cx<'_> {
         names
     }
 
-    /// Set a normal variable in the current scope.
+    /// Set a normal variable in the current scope, enforcing `limits.max_value_bytes`.
     pub fn set_var(&mut self, name: &[u8], value: BString) {
+        if value.len() > self.interp.config.limits.max_value_bytes {
+            self.interp
+                .error_here(b"Variable value exceeded maximum allowed byte length.".into());
+            self.interp.fatal = true;
+            return;
+        }
         self.interp.vars.set(name, value);
+    }
+
+    /// Request immediate termination with exit code `code` (`cmake_language(EXIT <code>)`).
+    pub fn request_exit(&mut self, code: i32) {
+        self.interp.exit_override = Some(code);
+        self.interp.fatal = true;
+    }
+
+    /// All registered builtin + user-defined command names, sorted (`COMMANDS` property).
+    #[must_use]
+    pub fn registered_command_names(&self) -> Vec<BString> {
+        let mut names: Vec<BString> = self.interp.registry.names().cloned().collect();
+        names.extend(self.interp.scripted.keys().cloned());
+        for kw in [
+            "if",
+            "elseif",
+            "else",
+            "endif",
+            "foreach",
+            "endforeach",
+            "while",
+            "endwhile",
+            "function",
+            "endfunction",
+            "macro",
+            "endmacro",
+            "block",
+            "endblock",
+        ] {
+            names.push(BString::from(kw));
+        }
+        names.sort();
+        names.dedup();
+        names
     }
 
     /// Unset a normal variable in the current scope.
@@ -589,15 +656,11 @@ impl Cx<'_> {
         self.interp.current_source_dir()
     }
 
-    /// `CMAKE_CURRENT_BINARY_DIR` as a native path.
+    /// `CMAKE_CURRENT_BINARY_DIR` as a native path (backed by true directory state, not
+    /// user-mutated variables).
     #[must_use]
     pub fn current_binary_dir(&self) -> PathBuf {
-        let v = self.var_or_empty(b"CMAKE_CURRENT_BINARY_DIR");
-        if v.is_empty() {
-            self.interp.config.cwd.clone()
-        } else {
-            rcmake_host::path::to_native(&v)
-        }
+        self.interp.binary_dir.clone()
     }
 
     /// Line of the command being executed.

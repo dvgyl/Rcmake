@@ -2,14 +2,17 @@
 //!
 //! Empirically verified against pinned CMake 4.5.1:
 //! - Default line wrap width is **77 bytes** including the 2-space indent.
-//! - Each `\n` starts a new paragraph separated by a blank line; lines starting with
-//!   a space are emitted preformatted without wrapping.
-//! - Framed diagnostics terminate with `\n\n\n` (two trailing blank lines).
+//! - Consecutive blank lines collapse to a single paragraph separator; lines starting
+//!   with a space are emitted preformatted without wrapping.
+//! - Double spaces in prose (such as after sentence-ending periods) are preserved.
+//! - Categorized developer warnings print `(author)`, `(deprecated)`, or `(policy)`
+//!   with the matching suppression footer followed by one blank line; other framed
+//!   diagnostics terminate with two trailing blank lines (`\n\n\n`).
 //! - No-location diagnostics (`Location::None`) render `CMake Error: <body...>\n`.
 
 use rcmake_base::BString;
 
-use crate::{Diagnostic, Location, MessageKind};
+use crate::{DiagCategory, Diagnostic, Location, MessageKind};
 
 /// Options controlling terminal rendering of a [`Diagnostic`].
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -32,7 +35,8 @@ impl Default for RenderOptions {
 /// Render a [`Diagnostic`] to exact CMake 4.5.1 terminal bytes.
 #[must_use]
 pub fn render(diag: &Diagnostic, opts: &RenderOptions) -> BString {
-    let prefix = kind_prefix(diag.kind);
+    let prefix = header_prefix(diag);
+    let base = opts.relative_base.as_ref().map(|b| b.as_slice());
     let mut out = Vec::new();
 
     match &diag.location {
@@ -46,10 +50,7 @@ pub fn render(diag: &Diagnostic, opts: &RenderOptions) -> BString {
             return BString::from(out);
         }
         Location::FileLine { file, line } => {
-            let display_file = display_path(
-                file.as_ref(),
-                opts.relative_base.as_ref().map(|b| b.as_slice()),
-            );
+            let display_file = display_path(file.as_ref(), base);
             out.extend_from_slice(prefix);
             if *line == 0 {
                 out.extend_from_slice(b" in ");
@@ -65,7 +66,7 @@ pub fn render(diag: &Diagnostic, opts: &RenderOptions) -> BString {
             out.extend_from_slice(
                 format_paragraphs(diag.body.as_slice(), 2, opts.wrap_width).as_slice(),
             );
-            out.extend_from_slice(b"\n\n");
+            append_footer_and_trailer(diag, &mut out);
         }
         Location::Backtrace(bt) => {
             let mut frames = bt.frames();
@@ -79,10 +80,7 @@ pub fn render(diag: &Diagnostic, opts: &RenderOptions) -> BString {
                 return BString::from(out);
             };
 
-            let display_file = display_path(
-                top.file.as_ref(),
-                opts.relative_base.as_ref().map(|b| b.as_slice()),
-            );
+            let display_file = display_path(top.file.as_ref(), base);
             out.extend_from_slice(prefix);
             if top.line == 0 {
                 out.extend_from_slice(b" in ");
@@ -108,10 +106,7 @@ pub fn render(diag: &Diagnostic, opts: &RenderOptions) -> BString {
             if !callers.is_empty() {
                 out.extend_from_slice(b"Call Stack (most recent call first):\n");
                 for frame in callers {
-                    let cf = display_path(
-                        frame.file.as_ref(),
-                        opts.relative_base.as_ref().map(|b| b.as_slice()),
-                    );
+                    let cf = display_path(frame.file.as_ref(), base);
                     out.extend_from_slice(b"  ");
                     out.extend_from_slice(cf);
                     if frame.line > 0 {
@@ -127,19 +122,50 @@ pub fn render(diag: &Diagnostic, opts: &RenderOptions) -> BString {
                 }
             }
 
-            if matches!(
-                diag.kind,
-                MessageKind::AuthorWarning | MessageKind::AuthorError
-            ) {
-                out.extend_from_slice(
-                    b"This warning is for project developers.  Use -Wno-dev to suppress it.\n",
-                );
-            }
-            out.extend_from_slice(b"\n\n");
+            append_footer_and_trailer(diag, &mut out);
         }
     }
 
     BString::from(out)
+}
+
+fn append_footer_and_trailer(diag: &Diagnostic, out: &mut Vec<u8>) {
+    if let Some(footer) = warning_footer(diag) {
+        out.extend_from_slice(footer);
+        out.push(b'\n');
+    } else {
+        out.extend_from_slice(b"\n\n");
+    }
+}
+
+fn warning_footer(diag: &Diagnostic) -> Option<&'static [u8]> {
+    match diag.category {
+        Some(DiagCategory::Policy) if is_warning_kind(diag.kind) => Some(
+            b"This warning is for project developers.  Use -Wno-author or -Wno-policy to\nsuppress it.\n",
+        ),
+        Some(DiagCategory::Deprecated) if is_warning_kind(diag.kind) => Some(
+            b"This warning is for project developers.  Use -Wno-author or -Wno-deprecated\nto suppress it.\n",
+        ),
+        Some(DiagCategory::Author) if is_warning_kind(diag.kind) => {
+            Some(b"This warning is for project developers.  Use -Wno-author to suppress it.\n")
+        }
+        _ => match diag.kind {
+            MessageKind::AuthorWarning => {
+                Some(b"This warning is for project developers.  Use -Wno-author to suppress it.\n")
+            }
+            MessageKind::DeprecationWarning => Some(
+                b"This warning is for project developers.  Use -Wno-author or -Wno-deprecated\nto suppress it.\n",
+            ),
+            _ => None,
+        },
+    }
+}
+
+const fn is_warning_kind(kind: MessageKind) -> bool {
+    matches!(
+        kind,
+        MessageKind::Warning | MessageKind::AuthorWarning | MessageKind::DeprecationWarning
+    )
 }
 
 /// Clean-room implementation of CMake's paragraph formatter (`indent` leading spaces,
@@ -147,18 +173,21 @@ pub fn render(diag: &Diagnostic, opts: &RenderOptions) -> BString {
 #[must_use]
 pub fn format_paragraphs(text: &[u8], indent: usize, width: usize) -> BString {
     let mut out = Vec::new();
-    let mut first_para = true;
+    let mut wrote_any = false;
+    let mut prev_preformatted = false;
 
     for raw_line in text.split(|&b| b == b'\n') {
-        if !first_para {
-            out.push(b'\n');
-        }
-        first_para = false;
-
         if raw_line.is_empty() {
             continue;
         }
-        if raw_line.first() == Some(&b' ') {
+        let is_pre = raw_line.first() == Some(&b' ');
+        if wrote_any && !(is_pre && prev_preformatted) {
+            out.push(b'\n');
+        }
+        wrote_any = true;
+        prev_preformatted = is_pre;
+
+        if is_pre {
             out.extend(core::iter::repeat_n(b' ', indent));
             out.extend_from_slice(raw_line);
             out.push(b'\n');
@@ -167,11 +196,14 @@ pub fn format_paragraphs(text: &[u8], indent: usize, width: usize) -> BString {
 
         let mut col = 0usize;
         let mut line_started = false;
+        let mut prev_ended_sentence = false;
         let mut i = 0usize;
         while i < raw_line.len() {
+            let space_start = i;
             while raw_line.get(i) == Some(&b' ') {
                 i += 1;
             }
+            let raw_spaces = i - space_start;
             if i >= raw_line.len() {
                 break;
             }
@@ -185,16 +217,24 @@ pub fn format_paragraphs(text: &[u8], indent: usize, width: usize) -> BString {
                 out.extend_from_slice(word);
                 col = indent + word.len();
                 line_started = true;
-            } else if col + 1 + word.len() <= width {
-                out.push(b' ');
-                out.extend_from_slice(word);
-                col += 1 + word.len();
             } else {
-                out.push(b'\n');
-                out.extend(core::iter::repeat_n(b' ', indent));
-                out.extend_from_slice(word);
-                col = indent + word.len();
+                let sep_len = if prev_ended_sentence || raw_spaces >= 2 {
+                    2
+                } else {
+                    1
+                };
+                if col + sep_len + word.len() <= width {
+                    out.extend(core::iter::repeat_n(b' ', sep_len));
+                    out.extend_from_slice(word);
+                    col += sep_len + word.len();
+                } else {
+                    out.push(b'\n');
+                    out.extend(core::iter::repeat_n(b' ', indent));
+                    out.extend_from_slice(word);
+                    col = indent + word.len();
+                }
             }
+            prev_ended_sentence = word.ends_with(b".");
         }
         if line_started {
             out.push(b'\n');
@@ -204,15 +244,49 @@ pub fn format_paragraphs(text: &[u8], indent: usize, width: usize) -> BString {
     BString::from(out)
 }
 
-fn kind_prefix(kind: MessageKind) -> &'static [u8] {
-    match kind {
+fn header_prefix(diag: &Diagnostic) -> &'static [u8] {
+    if let Some(cat) = diag.category {
+        let is_err = matches!(
+            diag.kind,
+            MessageKind::Error
+                | MessageKind::AuthorError
+                | MessageKind::DeprecationError
+                | MessageKind::InternalError
+        );
+        return match (cat, is_err) {
+            (DiagCategory::Author, false) => b"CMake Warning (author)",
+            (DiagCategory::Author, true) => b"CMake Error (author)",
+            (DiagCategory::Deprecated, false) => b"CMake Warning (deprecated)",
+            (DiagCategory::Deprecated, true) => b"CMake Error (deprecated)",
+            (DiagCategory::Policy, false) => b"CMake Warning (policy)",
+            (DiagCategory::Policy, true) => b"CMake Error (policy)",
+            (DiagCategory::Experimental, false) => b"CMake Warning (experimental)",
+            (DiagCategory::Experimental, true) => b"CMake Error (experimental)",
+            (DiagCategory::Strict, false) => b"CMake Warning (strict)",
+            (DiagCategory::Strict, true) => b"CMake Error (strict)",
+            (DiagCategory::NonTargetDirective, false) => b"CMake Warning (non-target-directive)",
+            (DiagCategory::NonTargetDirective, true) => b"CMake Error (non-target-directive)",
+            (DiagCategory::InstallAbsoluteDestination, false) => {
+                b"CMake Warning (install-absolute-destination)"
+            }
+            (DiagCategory::InstallAbsoluteDestination, true) => {
+                b"CMake Error (install-absolute-destination)"
+            }
+            (DiagCategory::Uninitialized, false) => b"CMake Warning (uninitialized)",
+            (DiagCategory::Uninitialized, true) => b"CMake Error (uninitialized)",
+            (DiagCategory::UnusedCli, false) => b"CMake Warning (unused-cli)",
+            (DiagCategory::UnusedCli, true) => b"CMake Error (unused-cli)",
+        };
+    }
+
+    match diag.kind {
         MessageKind::Error => b"CMake Error",
         MessageKind::InternalError => b"CMake Internal Error",
         MessageKind::Warning => b"CMake Warning",
-        MessageKind::AuthorWarning => b"CMake Warning (dev)",
-        MessageKind::AuthorError => b"CMake Error (dev)",
-        MessageKind::DeprecationWarning => b"CMake Deprecation Warning",
-        MessageKind::DeprecationError => b"CMake Deprecation Error",
+        MessageKind::AuthorWarning => b"CMake Warning (author)",
+        MessageKind::AuthorError => b"CMake Error (author)",
+        MessageKind::DeprecationWarning => b"CMake Warning (deprecated)",
+        MessageKind::DeprecationError => b"CMake Error (deprecated)",
         MessageKind::Log => b"CMake",
     }
 }
@@ -261,6 +335,45 @@ mod tests {
             rendered,
             BString::from(
                 "CMake Warning at /tmp/p4.cmake:1 (message):\n  1234567890 1234567890 1234567890 1234567890 1234567890 1234567890\n  1234567890 1234567890 1234567890\n\n\n"
+            )
+        );
+    }
+
+    #[test]
+    fn author_and_deprecated_warnings_match_cmake_4_5_1() {
+        let bt = Backtrace::default().push(Frame {
+            file: Arc::from(&b"/tmp/d.cmake"[..]),
+            line: 1,
+            name: Some(Arc::from(&b"message"[..])),
+            kind: FrameKind::Command,
+        });
+        let author = Diagnostic {
+            kind: MessageKind::AuthorWarning,
+            effect: crate::Effect::None,
+            category: Some(DiagCategory::Author),
+            policy: None,
+            location: Location::Backtrace(bt.clone()),
+            body: BString::from("First sentence. Second sentence."),
+        };
+        assert_eq!(
+            render(&author, &RenderOptions::default()),
+            BString::from(
+                "CMake Warning (author) at /tmp/d.cmake:1 (message):\n  First sentence.  Second sentence.\nThis warning is for project developers.  Use -Wno-author to suppress it.\n\n"
+            )
+        );
+
+        let dep = Diagnostic {
+            kind: MessageKind::DeprecationWarning,
+            effect: crate::Effect::None,
+            category: Some(DiagCategory::Deprecated),
+            policy: None,
+            location: Location::Backtrace(bt),
+            body: BString::from("Line one.\n\nUpdate value.  Or try this."),
+        };
+        assert_eq!(
+            render(&dep, &RenderOptions::default()),
+            BString::from(
+                "CMake Warning (deprecated) at /tmp/d.cmake:1 (message):\n  Line one.\n\n  Update value.  Or try this.\nThis warning is for project developers.  Use -Wno-author or -Wno-deprecated\nto suppress it.\n\n"
             )
         );
     }

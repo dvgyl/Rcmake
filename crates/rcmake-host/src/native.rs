@@ -46,13 +46,31 @@ impl NativeHost {
                 crate::path::from_native(Path::new(&v)),
             );
         }
-        let initial_cwd = std::env::current_dir().map_err(|e| HostError::from_io(e, None))?;
+        let physical_cwd = std::env::current_dir().map_err(|e| HostError::from_io(e, None))?;
+        let initial_cwd = logical_cwd(&physical_cwd);
         Ok(Self {
             env: RwLock::new(map),
             initial_cwd,
             start: Instant::now(),
         })
     }
+}
+
+fn logical_cwd(physical: &Path) -> PathBuf {
+    let Some(pwd_os) = std::env::var_os("PWD") else {
+        return physical.to_path_buf();
+    };
+    let pwd = PathBuf::from(pwd_os);
+    if !pwd.is_absolute() {
+        return physical.to_path_buf();
+    }
+    if let (Ok(m_phys), Ok(m_pwd)) = (fs::metadata(physical), fs::metadata(&pwd))
+        && m_phys.dev() == m_pwd.dev()
+        && m_phys.ino() == m_pwd.ino()
+    {
+        return pwd;
+    }
+    physical.to_path_buf()
 }
 
 fn io_at<T>(result: io::Result<T>, path: &Path) -> HostResult<T> {

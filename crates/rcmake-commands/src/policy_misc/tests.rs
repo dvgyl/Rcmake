@@ -290,16 +290,10 @@ fn parse_modes_validate_the_signature() -> TestResult {
 #[test]
 fn configure_file_expands_templates_and_preserves_mtime() -> TestResult {
     let (host, mut interp) = context(RunMode::Script);
-    let source = Path::new("/src/config.in");
-    let output = Path::new("/build/sub/config.out");
+    let source = Path::new("/work/config.in");
+    let output = Path::new("/work/sub/config.out");
     host.seed_file(source, b"#cmakedefine01 ENABLE\r\n@NAME@ ${NAME}\nlast")?;
     host.set_permissions(source, 0o751)?;
-    interp
-        .cx()
-        .set_var(b"CMAKE_CURRENT_SOURCE_DIR", "/src".into());
-    interp
-        .cx()
-        .set_var(b"CMAKE_CURRENT_BINARY_DIR", "/build".into());
     interp.cx().set_var(b"ENABLE", "ON".into());
     interp.cx().set_var(b"NAME", "a\"b".into());
     let script = "configure_file(config.in sub/config.out @ONLY ESCAPE_QUOTES NEWLINE_STYLE CRLF)";
@@ -317,14 +311,14 @@ fn configure_file_expands_templates_and_preserves_mtime() -> TestResult {
     run(&host, &mut interp, script, 0)?;
     assert!(host.metadata(output, Follow::Yes)?.mtime > first.mtime);
 
-    host.create_dir_all(Path::new("/build/copy"))?;
+    host.create_dir_all(Path::new("/work/copy"))?;
     run(
         &host,
         &mut interp,
         "configure_file(config.in copy COPYONLY NO_SOURCE_PERMISSIONS)",
         0,
     )?;
-    let copied = Path::new("/build/copy/config.in");
+    let copied = Path::new("/work/copy/config.in");
     assert_eq!(read(copied)?, read(source)?);
     assert_eq!(host.metadata(copied, Follow::Yes)?.mode, 0o644);
 
@@ -334,7 +328,7 @@ fn configure_file_expands_templates_and_preserves_mtime() -> TestResult {
         "configure_file(config.in explicit FILE_PERMISSIONS OWNER_READ GROUP_READ NEWLINE_STYLE LF)",
         0,
     )?;
-    let explicit = Path::new("/build/explicit");
+    let explicit = Path::new("/work/explicit");
     assert_eq!(
         read(explicit)?,
         b"#define ENABLE 1\nchanged changed\nlast\n"

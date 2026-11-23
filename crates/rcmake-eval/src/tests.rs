@@ -543,7 +543,7 @@ fn unknown_command_is_fatal_with_suggestion() {
     let o = run("mesage(x)\n");
     assert!(
         o.stderr
-            .contains("Unknown CMake command \"mesage\". Did you mean: \"message\"?")
+            .contains("Unknown CMake command \"mesage\".  Did you mean: \"message\"?")
     );
 }
 
