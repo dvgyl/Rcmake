@@ -20,16 +20,52 @@ pub fn configure(
     env: &mut dyn ExpandEnv,
     options: ConfigureOptions,
 ) -> Result<BString, ExpandError> {
+    configure_lines(input, env, options, false)
+}
+
+/// Expand the contents of a file for `configure_file` without `COPYONLY`.
+///
+/// Reject UTF-16 and UTF-32 byte-order marks. Use `source_path` to identify the
+/// input file in the error message.
+pub fn configure_file(
+    input: &[u8],
+    source_path: &[u8],
+    env: &mut dyn ExpandEnv,
+    options: ConfigureOptions,
+) -> Result<BString, ExpandError> {
+    if matches!(
+        input,
+        [0xff, 0xfe, ..] | [0xfe, 0xff, ..] | [0, 0, 0xfe, 0xff, ..]
+    ) {
+        let mut message = b"File starts with a Byte-Order-Mark that is not UTF-8:\n\n  ".to_vec();
+        message.extend_from_slice(source_path);
+        return Err(error(message));
+    }
+    configure_lines(input, env, options, true)
+}
+
+fn configure_lines(
+    input: &[u8],
+    env: &mut dyn ExpandEnv,
+    options: ConfigureOptions,
+    file: bool,
+) -> Result<BString, ExpandError> {
     let mut output = Vec::new();
     let line_number = env.current_line();
     let mode = Mode::Template {
         at_only: options.at_only,
         escape_quotes: options.escape_quotes,
+        file,
     };
     let limit = Limits::default().max_value_bytes;
     for line in input.split_inclusive(|&byte| byte == b'\n') {
         let line = line.strip_suffix(b"\n").unwrap_or(line);
         let line = line.strip_suffix(b"\r").unwrap_or(line);
+        let line = if file {
+            line.split(|&byte| byte == 0).next().unwrap_or_default()
+        } else {
+            line
+        };
         let directive = find_directive(line, b"cmakedefine")
             .map(|directive| (directive, false))
             .or_else(|| find_directive(line, b"cmakedefine01").map(|directive| (directive, true)));

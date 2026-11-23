@@ -52,6 +52,14 @@ pub trait ExpandEnv {
 
     /// Current 1-based listfile line number for `${CMAKE_CURRENT_LIST_LINE}`.
     fn current_line(&self) -> u32;
+
+    /// Path to the listfile that contains the command being expanded.
+    ///
+    /// Evaluators can override this method to use the command's source path
+    /// when it differs from `CMAKE_CURRENT_LIST_FILE`.
+    fn current_list_file(&mut self) -> Option<BString> {
+        self.var(b"CMAKE_CURRENT_LIST_FILE")
+    }
 }
 
 /// Error produced during variable or escape expansion.

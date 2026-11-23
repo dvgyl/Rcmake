@@ -73,11 +73,19 @@ fn bom_rules_depend_on_source_kind() {
         b"\x00\x00\xfe\xff",
         b"\xff\xfe\x00\x00",
     ] {
+        let error = file_error(bom);
+        assert_eq!(error.line, 0);
         assert_eq!(
-            file_error(bom).message.as_slice(),
+            error.message.as_slice(),
             b"File starts with a Byte-Order-Mark that is not UTF-8."
         );
     }
+    let error = file_error(b"\xff\xfe\x00");
+    assert_eq!(error.line, 1);
+    assert_eq!(
+        error.message.as_slice(),
+        b"Parse error.  Expected a command name, got bad character with text \"\xff\xfe\x00\"."
+    );
     let error = parse_with_limits(
         b"\xef\xbb\xbfx()",
         SourceKind::VirtualEval,
@@ -88,6 +96,31 @@ fn bom_rules_depend_on_source_kind() {
         error.message.as_slice(),
         b"Parse error.  Expected a command name, got unquoted argument with text \"\xef\xbb\xbfx\"."
     );
+}
+
+#[test]
+fn parse_failure_keeps_earlier_warnings() {
+    use rcmake_diag::Location;
+
+    let src = b"x(\"a\"b)\nx(\"a\"[[b]])\nx(\"a\"b)";
+    let mut sources = SourceMap::default();
+    let source = sources
+        .add(
+            "test.cmake".into(),
+            SourceKind::File,
+            Arc::from(src.as_slice()),
+        )
+        .expect("available source ID");
+    let (error, warnings) =
+        parse_list_file_with_warnings(src, source, SourceKind::File, &Limits::default())
+            .expect_err("bracket argument requires whitespace");
+
+    assert_eq!((error.line, error.column), (2, 6));
+    assert_eq!(warnings.len(), 1);
+    assert!(matches!(
+        warnings[0].location,
+        Location::FileLine { line: 1, .. }
+    ));
 }
 
 #[test]

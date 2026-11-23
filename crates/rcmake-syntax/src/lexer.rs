@@ -64,12 +64,9 @@ impl<'a> Lexer<'a> {
     pub(super) fn new(src: &'a [u8], kind: SourceKind) -> Result<Self, ParseError> {
         let mut rest = src;
         if kind == SourceKind::File {
-            if src.starts_with(b"\xff\xfe")
-                || src.starts_with(b"\xfe\xff")
-                || src.starts_with(b"\x00\x00\xfe\xff")
-            {
+            if has_unsupported_file_bom(src) {
                 return Err(ParseError {
-                    line: 1,
+                    line: 0,
                     column: 0,
                     command: None,
                     message: "File starts with a Byte-Order-Mark that is not UTF-8.".into(),
@@ -249,6 +246,15 @@ impl<'a> Lexer<'a> {
         };
         (kind, text.into())
     }
+}
+
+fn has_unsupported_file_bom(src: &[u8]) -> bool {
+    // A three-byte input can match the UTF-8 or UTF-16BE mark, but cannot
+    // match the UTF-16LE mark because UTF-32LE has the same first two bytes.
+    matches!(
+        src,
+        [0xff, 0xfe] | [0xff, 0xfe, _, _, ..] | [0xfe, 0xff, ..] | [0, 0, 0xfe, 0xff, ..]
+    )
 }
 
 fn check_nul(kind: Kind, text: &[u8]) -> Kind {

@@ -7,7 +7,7 @@ use rcmake_diag::{DiagCategory, SourceMap, source::SourceKind};
 use rcmake_host::{PureHost, WriteMode};
 use rcmake_syntax::parse_list_file;
 
-use crate::configure::{ConfigureOptions, configure};
+use crate::configure::{ConfigureOptions, configure, configure_file};
 use crate::*;
 
 struct Env {
@@ -234,6 +234,34 @@ fn expansion_tracks_raw_lines_and_reports_errors() {
     }
     let deep = format!("{}x{}", "${".repeat(257), "}".repeat(257));
     assert!(expand_string(deep.as_bytes(), &mut env).is_err());
+}
+
+#[test]
+fn listfile_expansion_errors_include_the_source_and_argument() {
+    let mut env = Env::new();
+    env.set("CMAKE_CURRENT_LIST_FILE", "/work/check.cmake");
+    let args = [
+        rcmake_syntax::Argument {
+            kind: ArgKind::Unquoted,
+            text: "first".into(),
+            line: 1,
+            span: 0..5,
+        },
+        rcmake_syntax::Argument {
+            kind: ArgKind::Quoted,
+            text: b"a\n\\z".as_slice().into(),
+            line: 2,
+            span: 6..12,
+        },
+    ];
+    let mut out = Vec::new();
+    let error = expand_args(&args, &mut env, &mut out).unwrap_err();
+    assert!(out.is_empty());
+    assert_eq!(
+        error.message,
+        "Syntax error in cmake code at\n\n  /work/check.cmake:3\n\n\
+         when parsing string\n\n  a\n\\z\n\nInvalid character escape '\\z'."
+    );
 }
 
 #[test]
@@ -533,4 +561,35 @@ fn configure_expands_directives_and_preserves_template_bytes() {
     );
     assert!(configure(b"${oops", &mut env, ConfigureOptions::default()).is_err());
     assert!(configure(b"", &mut env, options).unwrap().is_empty());
+}
+
+#[test]
+fn file_templates_reject_non_utf8_boms_and_stop_each_line_at_nul() {
+    let mut env = Env::new();
+    let options = ConfigureOptions::default();
+    let path = b"/work/template.in";
+    for bom in [
+        b"\xfe\xff".as_slice(),
+        b"\xff\xfe",
+        b"\x00\x00\xfe\xff",
+        b"\xff\xfe\x00\x00",
+    ] {
+        assert_eq!(
+            configure_file(bom, path, &mut env, options)
+                .unwrap_err()
+                .message,
+            "File starts with a Byte-Order-Mark that is not UTF-8:\n\n  /work/template.in"
+        );
+    }
+    assert_eq!(
+        configure_file(
+            b"\xef\xbb\xbftext\r\nx\0ignored\nz",
+            path,
+            &mut env,
+            options
+        )
+        .unwrap()
+        .as_slice(),
+        b"\xef\xbb\xbftext\nx\nz\n"
+    );
 }

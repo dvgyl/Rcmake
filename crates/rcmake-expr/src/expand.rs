@@ -23,7 +23,7 @@ pub fn expand_args(
         let value = if arg.kind == ArgKind::Bracket {
             arg.text.clone()
         } else {
-            expand(&arg.text, arg.line, env, Mode::Argument)?
+            expand(&arg.text, arg.line, env, Mode::ListfileArgument)?
         };
         let expanded = |value| ExpandedArg {
             value,
@@ -49,7 +49,12 @@ pub fn expand_string(src: &[u8], env: &mut dyn ExpandEnv) -> Result<BString, Exp
 #[derive(Clone, Copy)]
 pub(crate) enum Mode {
     Argument,
-    Template { at_only: bool, escape_quotes: bool },
+    ListfileArgument,
+    Template {
+        at_only: bool,
+        escape_quotes: bool,
+        file: bool,
+    },
 }
 
 #[derive(Clone, Copy)]
@@ -66,6 +71,7 @@ pub(crate) fn expand(
     mode: Mode,
 ) -> Result<BString, ExpandError> {
     let mut scanner = Scanner {
+        source: src,
         remaining: src,
         line,
         env,
@@ -76,6 +82,7 @@ pub(crate) fn expand(
 }
 
 struct Scanner<'a, 'env> {
+    source: &'a [u8],
     remaining: &'a [u8],
     line: u32,
     env: &'env mut dyn ExpandEnv,
@@ -94,7 +101,7 @@ impl<'a> Scanner<'a, '_> {
             self.remaining = rest;
             match byte {
                 b'}' if reference.is_some() => return Ok(output),
-                b'\\' if matches!(self.mode, Mode::Argument) => {
+                b'\\' if matches!(self.mode, Mode::Argument | Mode::ListfileArgument) => {
                     let escape = self.escape(reference.is_some())?;
                     self.append(&mut output, escape)?;
                 }
@@ -109,7 +116,7 @@ impl<'a> Scanner<'a, '_> {
                     }
                 }
                 b'$' if !matches!(self.mode, Mode::Template { at_only: true, .. }) => {
-                    if let Some((reference, rest)) = reference_start(rest)? {
+                    if let Some((reference, rest)) = self.reference_start(rest)? {
                         self.remaining = rest;
                         let line = self.line;
                         let name = self.scan(Some(reference), depth + 1)?;
@@ -123,7 +130,7 @@ impl<'a> Scanner<'a, '_> {
             }
         }
         if reference.is_some() {
-            return Err(error("There is an unterminated variable reference."));
+            return Err(self.syntax_error("There is an unterminated variable reference."));
         }
         Ok(output)
     }
@@ -143,14 +150,14 @@ impl<'a> Scanner<'a, '_> {
             message.extend_from_slice(b"') in a variable name: '");
             message.extend_from_slice(output);
             message.push(b'\'');
-            return Err(error(message));
+            return Err(self.syntax_error(message));
         }
         self.append(output, &[byte])
     }
 
     fn escape(&mut self, in_reference: bool) -> Result<&'a [u8], ExpandError> {
         let Some((byte, rest)) = self.remaining.split_first() else {
-            return Err(error("Invalid character escape '\\' (at end of input)."));
+            return Err(self.syntax_error("Invalid character escape '\\' (at end of input)."));
         };
         self.remaining = rest;
         match byte {
@@ -166,10 +173,54 @@ impl<'a> Scanner<'a, '_> {
                 let mut message = b"Invalid character escape '\\".to_vec();
                 message.push(*byte);
                 message.extend_from_slice(b"'.");
-                Err(error(message))
+                Err(self.syntax_error(message))
             }
             _ => Ok(core::slice::from_ref(byte)),
         }
+    }
+
+    fn reference_start(
+        &mut self,
+        src: &'a [u8],
+    ) -> Result<Option<(Reference, &'a [u8])>, ExpandError> {
+        for (prefix, reference) in [
+            (b"{".as_slice(), Reference::Normal),
+            (b"ENV{".as_slice(), Reference::Environment),
+            (b"CACHE{".as_slice(), Reference::Cache),
+        ] {
+            if let Some(rest) = src.strip_prefix(prefix) {
+                return Ok(Some((reference, rest)));
+            }
+        }
+        if let Some((name, _)) = delimited_name(src, b'{') {
+            let mut message = b"Syntax $".to_vec();
+            message.extend_from_slice(name);
+            message.extend_from_slice(
+                b"{{} is not supported.  Only ${}, $ENV{}, and $CACHE{} are allowed.",
+            );
+            return Err(self.syntax_error(message));
+        }
+        Ok(None)
+    }
+
+    fn syntax_error(&mut self, message: impl Into<BString>) -> ExpandError {
+        let message = message.into();
+        if matches!(
+            self.mode,
+            Mode::ListfileArgument | Mode::Template { file: true, .. }
+        ) && let Some(path) = self.env.current_list_file().filter(|path| !path.is_empty())
+        {
+            let mut body = b"Syntax error in cmake code at\n\n  ".to_vec();
+            body.extend_from_slice(&path);
+            body.push(b':');
+            body.extend_from_slice(self.line.to_string().as_bytes());
+            body.extend_from_slice(b"\n\nwhen parsing string\n\n  ");
+            body.extend_from_slice(self.source);
+            body.extend_from_slice(b"\n\n");
+            body.extend_from_slice(&message);
+            return error(body);
+        }
+        error(message)
     }
 
     fn lookup(&mut self, reference: Reference, name: &[u8], line: u32) -> BString {
@@ -227,28 +278,6 @@ fn delimited_name(src: &[u8], delimiter: u8) -> Option<(&[u8], &[u8])> {
     }
     let (name, tail) = src.split_at_checked(end)?;
     Some((name, tail.strip_prefix(&[delimiter])?))
-}
-
-fn reference_start(src: &[u8]) -> Result<Option<(Reference, &[u8])>, ExpandError> {
-    for (prefix, reference) in [
-        (b"{".as_slice(), Reference::Normal),
-        (b"ENV{".as_slice(), Reference::Environment),
-        (b"CACHE{".as_slice(), Reference::Cache),
-    ] {
-        if let Some(rest) = src.strip_prefix(prefix) {
-            return Ok(Some((reference, rest)));
-        }
-    }
-    if let Some((name, _)) = delimited_name(src, b'{') {
-        let mut message = b"Syntax $".to_vec();
-        message.extend_from_slice(name);
-        // Upstream CMake 4.5.1 literally emits `{{}` here (verified empirically).
-        message.extend_from_slice(
-            b"{{} is not supported.  Only ${}, $ENV{}, and $CACHE{} are allowed.",
-        );
-        return Err(error(message));
-    }
-    Ok(None)
 }
 
 pub(crate) fn error(message: impl Into<BString>) -> ExpandError {

@@ -3,21 +3,19 @@
 use std::sync::Arc;
 
 use rcmake_base::{BString, Limits};
-use rcmake_diag::{
-    DiagCategory, Diagnostic, Effect, Location, MessageKind, SourceId, source::SourceKind,
-};
+use rcmake_diag::{DiagCategory, Diagnostic, Effect, Location, MessageKind, source::SourceKind};
 
 use crate::lexer::{Kind, Lexer, Position, Token};
-use crate::{ArgKind, Argument, CommandInvocation, ListFile, ParseError};
+use crate::{ArgKind, Argument, CommandInvocation, ParseError};
 
 const WHITESPACE_MESSAGE: &str = "Argument not separated from preceding token by whitespace.";
 
 pub(super) fn parse(
     src: &[u8],
-    source: SourceId,
     kind: SourceKind,
     limits: &Limits,
-) -> Result<ListFile, ParseError> {
+    warnings: &mut Vec<Diagnostic>,
+) -> Result<Arc<[CommandInvocation]>, ParseError> {
     let over_limit = match kind {
         SourceKind::File => src.len() as u64 > limits.max_file_read,
         SourceKind::VirtualEval => src.len() > limits.max_value_bytes,
@@ -33,7 +31,6 @@ pub(super) fn parse(
 
     let mut lexer = Lexer::new(src, kind)?;
     let mut commands = Vec::new();
-    let mut warnings = Vec::new();
     let mut need_newline = false;
     while let Some(token) = lexer.next() {
         match token.kind {
@@ -47,7 +44,7 @@ pub(super) fn parse(
                 ));
             }
             Kind::Identifier => {
-                commands.push(parse_command(&mut lexer, token, &mut warnings)?);
+                commands.push(parse_command(&mut lexer, token, warnings)?);
                 need_newline = true;
             }
             _ => {
@@ -61,11 +58,7 @@ pub(super) fn parse(
 
     validate_flow_control(&commands)?;
 
-    Ok(ListFile {
-        source,
-        commands: commands.into(),
-        warnings,
-    })
+    Ok(commands.into())
 }
 
 fn parse_command(

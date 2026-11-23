@@ -85,7 +85,7 @@ pub struct Argument {
 #[derive(Clone, Debug, PartialEq, Eq, Error)]
 #[error("Parse error at line {line}, column {column}: {message}")]
 pub struct ParseError {
-    /// 1-based line number.
+    /// 1-based line number, or `0` for an error that applies to the whole file.
     pub line: u32,
     /// 1-based byte column number (`0` if line-only).
     pub column: u32,
@@ -105,5 +105,26 @@ pub fn parse_list_file(
     kind: SourceKind,
     limits: &Limits,
 ) -> Result<ListFile, ParseError> {
-    parser::parse(src, source, kind, limits)
+    parse_list_file_with_warnings(src, source, kind, limits).map_err(|(error, _)| error)
+}
+
+/// Parse a listfile and keep any warnings that occur before a fatal error.
+///
+/// On success, the warnings are in the returned listfile. On failure, they are
+/// in the error tuple, in source order.
+pub fn parse_list_file_with_warnings(
+    src: &[u8],
+    source: SourceId,
+    kind: SourceKind,
+    limits: &Limits,
+) -> Result<ListFile, (ParseError, Vec<Diagnostic>)> {
+    let mut warnings = Vec::new();
+    match parser::parse(src, kind, limits, &mut warnings) {
+        Ok(commands) => Ok(ListFile {
+            source,
+            commands,
+            warnings,
+        }),
+        Err(error) => Err((error, warnings)),
+    }
 }
