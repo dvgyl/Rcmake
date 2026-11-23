@@ -6,6 +6,7 @@ use rcmake_genex::ConfigId;
 use rcmake_model::{ProjectModel, Target, TargetKind};
 
 use super::artifacts::is_darwin;
+use super::launcher;
 use super::shell::{command, join_words, quote, rule_invocations};
 use super::standard::standard_flag;
 use super::{definition, expand_rule, join, object_path, target_property};
@@ -358,6 +359,14 @@ pub(super) fn compile(
             command(line)
         }
     };
+    let invocation = launcher::Command {
+        role: "compile",
+        config,
+        output: &object,
+        source: Some(&source),
+        language: &group.language,
+    }
+    .wrap(model, target, invocation);
     let writes_depfile = dep_flags.is_some_and(|f| has_placeholder(f, b"<DEP_FILE>"))
         || has_placeholder(template_text, b"<DEP_FILE>");
     Ok(BuildStep::Compile {

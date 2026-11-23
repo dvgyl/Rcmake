@@ -208,8 +208,7 @@ cmake_instrumentation(API_VERSION 1 DATA_VERSION 1.2
     );
     let oracle_snippet = read_json(&host, &only_file(&host, &oracle_data)).expect("oracle snippet");
     let our_data = our_build.join(".cmake/instrumentation/v1/data");
-    let our_snippet =
-        read_json(&host, &only_file(&host, &our_data.join("v1"))).expect("our snippet");
+    let our_snippet = read_json(&host, &only_file(&host, &our_data)).expect("our snippet");
     assert!(
         object(&our_snippet)
             .keys()
@@ -265,7 +264,7 @@ cmake_instrumentation(API_VERSION 1 DATA_VERSION 1.2
     let oracle_trace = load_trace(&oracle_data, &oracle_index);
     let our_trace = load_trace(&our_data, &our_index);
     let oracle_event = array(&oracle_trace).first().expect("one oracle event");
-    let events = array(field(&our_trace, "traceEvents"));
+    let events = array(&our_trace);
     assert_eq!(events.len(), 1);
     let event = events.first().expect("one event");
     assert!(object(event).keys().eq(object(oracle_event).keys()));

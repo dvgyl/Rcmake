@@ -269,7 +269,7 @@ fn launcher_records_metadata_and_hook_dispatches_callbacks_once_per_batch() {
             &data.join(path::to_native(text(field(&index, "trace")))),
         )
         .expect("trace");
-        let events = array(field(&trace, "traceEvents"));
+        let events = array(&trace);
         assert_eq!(events.len(), items.len());
         for (item, event) in items.iter().zip(events) {
             let value =
@@ -313,8 +313,7 @@ fn launcher_records_metadata_and_hook_dispatches_callbacks_once_per_batch() {
         launcher::run_launcher(&host, &argv).expect("run launcher"),
         37
     );
-    let snippet_dir = data.join("v1");
-    let value = read_json(&host, &only_file(&host, &snippet_dir)).expect("read snippet");
+    let value = read_json(&host, &only_file(&host, &data)).expect("read snippet");
     assert_eq!(*field(&value, "stdout"), Value::string("out\n"));
     assert_eq!(*field(&value, "stderr"), Value::string("err\n"));
     assert_eq!(*field(&value, "duration"), Value::Int(25));
@@ -343,11 +342,7 @@ fn launcher_records_metadata_and_hook_dispatches_callbacks_once_per_batch() {
         host.stream_bytes(Stream::Stdout),
         "out\ncallback 1\ncallback 1\ncallback 0\ncallback 0\n"
     );
-    assert!(
-        json_files(&host, &snippet_dir)
-            .expect("list snippets")
-            .is_empty()
-    );
+    assert!(json_files(&host, &data).expect("list snippets").is_empty());
     assert!(
         json_files(&host, &data.join("index"))
             .expect("list indexes")
@@ -376,7 +371,7 @@ fn interrupted_command_records_signal() {
         .expect("run launcher"),
         130
     );
-    let data = build.join(".cmake/instrumentation/v1/data/v1");
+    let data = build.join(".cmake/instrumentation/v1/data");
     let value = read_json(&host, &only_file(&host, &data)).expect("read snippet");
     assert_eq!(*field(&value, "result"), Value::Null);
     assert_eq!(*field(&value, "interruptSignal"), Value::Int(2));

@@ -9,12 +9,21 @@ use rcmake_eval::Interp;
 use rcmake_gen_common::{self as common, GenError};
 use rcmake_genex::ConfigId;
 use rcmake_host::{Host, path};
-use rcmake_model::GeneratorKind;
+use rcmake_instrument::snippet::{self, ContentTarget};
+use rcmake_instrument::{
+    CustomContent, CustomContentType, InstrumentError, InstrumentOption, Query,
+};
+use rcmake_model::{GeneratorKind, ProjectModel, TargetOrigin};
 use rcmake_resolve::{GenerationResult, InstallActionKind, InstallManifest, ResolveError};
 
 mod file_generate;
 
-pub(crate) fn run(interp: &mut Interp, host: &dyn Host, bin: &Path) -> Result<bool, String> {
+pub(crate) fn run(
+    interp: &mut Interp,
+    host: &dyn Host,
+    bin: &Path,
+    queries: &[Query],
+) -> Result<bool, String> {
     let Some(kind) = interp.cx().project().generator else {
         return Ok(false);
     };
@@ -32,26 +41,106 @@ pub(crate) fn run(interp: &mut Interp, host: &dyn Host, bin: &Path) -> Result<bo
     } else {
         vec![ConfigId(interp.cx().var_or_empty(b"CMAKE_BUILD_TYPE"))]
     };
-    let result = match rcmake_resolve::resolve(interp.cx().project(), host, &configs) {
+    let resolved = {
+        let mut cx = interp.cx();
+        let model = cx.project();
+        let key = b"_RCMAKE_INSTRUMENTATION_QUERIES";
+        if queries.is_empty() || !model.global.instrumentation.is_empty() {
+            rcmake_resolve::resolve(model, host, &configs)
+        } else {
+            let previous = model.global.props.get(key).cloned();
+            model.global.props.set(key.as_slice().into(), "1".into());
+            let resolved = rcmake_resolve::resolve(model, host, &configs);
+            if let Some(previous) = previous {
+                model.global.props.set(key.as_slice().into(), previous);
+            } else {
+                model.global.props.unset(key);
+            }
+            resolved
+        }
+    };
+    let result = match resolved {
         Ok(result) => result,
         Err(ResolveError::Unimplemented(_)) => return Ok(false),
         Err(err) => return Err(err.to_string()),
     };
     write_common(interp, host, bin, &result, kind).map_err(|err| err.to_string())?;
     let result = match kind {
-        GeneratorKind::Ninja => rcmake_gen_ninja::generate_single_config(&result, host, bin),
-        GeneratorKind::NinjaMultiConfig => {
-            rcmake_gen_ninja::generate_multi_config(&result, host, bin)
-        }
+        GeneratorKind::Ninja => rcmake_gen_ninja::generate_single_config_with_model(
+            &result,
+            host,
+            bin,
+            interp.cx().project(),
+        ),
+        GeneratorKind::NinjaMultiConfig => rcmake_gen_ninja::generate_multi_config_with_model(
+            &result,
+            host,
+            bin,
+            interp.cx().project(),
+        ),
         GeneratorKind::UnixMakefiles => {
             rcmake_gen_make::generate_unix_makefiles(&result, host, bin)
         }
     };
     match result {
-        Ok(()) => Ok(true),
+        Ok(()) => {
+            if !queries.is_empty() {
+                let project_name = interp.cx().var_or_empty(b"CMAKE_PROJECT_NAME");
+                write_instrumentation_content(
+                    host,
+                    bin,
+                    interp.cx().project(),
+                    &project_name,
+                    queries,
+                )
+                .map_err(|err| err.to_string())?;
+            }
+            Ok(true)
+        }
         Err(GenError::Unimplemented(_)) => Ok(false),
         Err(err) => Err(err.to_string()),
     }
+}
+
+fn write_instrumentation_content(
+    host: &dyn Host,
+    bin: &Path,
+    model: &ProjectModel,
+    project_name: &[u8],
+    queries: &[Query],
+) -> Result<(), InstrumentError> {
+    let entries = model
+        .global
+        .instrumentation
+        .iter()
+        .flat_map(|request| &request.custom_content)
+        .filter_map(|entry| {
+            Some(CustomContent {
+                name: entry.name.clone(),
+                ty: CustomContentType::from_name(&entry.ty)?,
+                content: entry.content.clone(),
+            })
+        })
+        .collect::<Vec<_>>();
+    let targets = model
+        .targets()
+        .filter(|(_, target)| target.origin == TargetOrigin::Normal)
+        .map(|(_, target)| ContentTarget {
+            name: target.name.clone(),
+            kind: target.kind.as_str().into(),
+            labels: target
+                .props
+                .get(b"LABELS")
+                .map_or_else(Vec::new, |v| split(v, Empty::Drop)),
+        })
+        .collect::<Vec<_>>();
+    let include_static = queries.iter().any(|query| {
+        query
+            .options
+            .contains(&InstrumentOption::StaticSystemInformation)
+    });
+    snippet::write_content(host, bin, project_name, &entries, &targets, include_static)?;
+    Ok(())
 }
 
 fn write_common(
@@ -246,5 +335,165 @@ fn write(host: &dyn Host, path: &Path, content: Result<BString, GenError>) -> Re
         Ok(content) => common::write_if_changed(host, path, &content),
         Err(GenError::Unimplemented(_)) => Ok(()),
         Err(err) => Err(err),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use rcmake_host::{Follow, ProcessResult, PureHost, ReadRange, RunOutput, Stream};
+
+    use super::*;
+
+    #[test]
+    fn configure_and_build_collect_instrumentation() {
+        let host = Arc::new(PureHost::default());
+        let source = Path::new("/work/CMakeLists.txt");
+        let bin = Path::new("/work/out");
+        let api = bin.join(".cmake/instrumentation/v1");
+        let data = api.join("data");
+        let project = br#"cmake_minimum_required(VERSION 4.5)
+project(example NONE)
+set(CMAKE_C_COMPILER cc)
+add_executable(app main.c)
+"#;
+        host.seed_file(source, project).unwrap();
+        host.seed_file(Path::new("/work/main.c"), b"int main(void) { return 0; }\n")
+            .unwrap();
+
+        let invoke = |args: &[&str]| {
+            let argv: Vec<_> = args.iter().copied().map(BString::from).collect();
+            assert_eq!(
+                crate::run(&argv, host.clone()),
+                0,
+                "{}",
+                host.stream_bytes(Stream::Stderr)
+            );
+        };
+        let configure = || {
+            invoke(&[
+                "cmake",
+                "-S",
+                ".",
+                "-B",
+                "out",
+                "-G",
+                "Ninja",
+                "-DCMAKE_MAKE_PROGRAM=ninja",
+                "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON",
+            ]);
+        };
+        let read = |name: &str| {
+            BString::from(
+                host.read(&bin.join(name), ReadRange::All { limit: 65536 })
+                    .unwrap(),
+            )
+        };
+        configure();
+        let manifest = read("build.ninja");
+        let commands = read("compile_commands.json");
+        assert!(!manifest.to_string().contains("--instrument"));
+        assert!(!commands.to_string().contains("--instrument"));
+        assert!(host.metadata(&api, Follow::Yes).is_err());
+
+        let mut instrumented = project.to_vec();
+        instrumented.extend_from_slice(
+            br#"
+cmake_instrumentation(API_VERSION 1 DATA_VERSION 1.2
+  HOOKS postGenerate preCMakeBuild postCMakeBuild postCMakeInstall
+  CALLBACK record)
+"#,
+        );
+        host.seed_file(source, &instrumented).unwrap();
+        let callback_dir = data.clone();
+        host.set_command_handler(move |host, request, _| {
+            let command = &request.pipeline[0];
+            if command.program == "record" {
+                let index = path::to_native(&command.args[0]);
+                assert!(index.starts_with(callback_dir.join("index")));
+                assert!(
+                    host.metadata(Path::new("/work/out/CMakeCache.txt"), Follow::Yes)
+                        .is_ok()
+                );
+                let index = host.read(&index, ReadRange::All { limit: 65536 })?;
+                let index =
+                    rcmake_json::parse(&index, &rcmake_json::ReadOptions::default()).unwrap();
+                let rcmake_json::Value::Object(fields) = index else {
+                    panic!("Expected an index object.");
+                };
+                let rcmake_json::Value::String(hook) = &fields[b"hook".as_slice()] else {
+                    panic!("Expected the hook name.");
+                };
+                let rcmake_json::Value::Array(snippets) = &fields[b"snippets".as_slice()] else {
+                    panic!("Expected a list of snippet files.");
+                };
+                let roles: Vec<_> = snippets
+                    .iter()
+                    .map(|snippet| {
+                        let rcmake_json::Value::String(name) = snippet else {
+                            panic!("Expected a snippet file name.");
+                        };
+                        assert!(
+                            host.metadata(&callback_dir.join(path::to_native(name)), Follow::Yes)
+                                .is_ok()
+                        );
+                        name.split(|byte| *byte == b'-').next().unwrap()
+                    })
+                    .collect();
+                let expected: &[&[u8]] = match hook.as_slice() {
+                    b"postGenerate" => &[b"configure", b"generate"],
+                    b"preCMakeBuild" => &[],
+                    b"postCMakeBuild" => &[b"cmakeBuild"],
+                    b"postCMakeInstall" => &[b"cmakeInstall"],
+                    _ => panic!("Unexpected hook {hook}."),
+                };
+                assert_eq!(roles, expected);
+                host.write_out(Stream::Stdout, hook);
+            } else {
+                assert_eq!(command.program, "ninja");
+            }
+            Ok(RunOutput {
+                results: vec![ProcessResult::Exited(0)],
+                ..RunOutput::default()
+            })
+        })
+        .unwrap();
+        configure();
+        let wrapped = read("build.ninja").to_string().replace("$ ", " ");
+        assert!(wrapped.contains("--instrument --command-type compile"));
+        assert!(wrapped.contains("--instrument --command-type link"));
+        assert!(
+            host.read_dir(&api.join("query/generated"))
+                .unwrap()
+                .iter()
+                .any(|entry| entry.name.starts_with(b"query-"))
+        );
+        assert!(
+            host.read_dir(&data.join("content"))
+                .unwrap()
+                .iter()
+                .any(|entry| entry.name.starts_with(b"cmake-"))
+        );
+        invoke(&["cmake", "--build", "out"]);
+        invoke(&["cmake", "--install", "out"]);
+        let stdout = host.stream_bytes(Stream::Stdout).to_string();
+        for hook in [
+            "postGenerate",
+            "preCMakeBuild",
+            "postCMakeBuild",
+            "postCMakeInstall",
+        ] {
+            assert!(stdout.contains(hook));
+        }
+
+        host.seed_file(source, project).unwrap();
+        configure();
+        assert_eq!(read("build.ninja"), manifest);
+        assert_eq!(read("compile_commands.json"), commands);
+        assert!(
+            host.metadata(&api.join("query/generated"), Follow::Yes)
+                .is_err()
+        );
     }
 }

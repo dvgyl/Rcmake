@@ -8,6 +8,7 @@ use rcmake_cxxmodules::{
 use rcmake_model::{DirId, ProjectModel, Target};
 
 use super::compile::compile_arguments;
+use super::launcher;
 use super::shell::{command, join_words, quote, rule_invocations};
 use super::{definition, expand_rule};
 use crate::{BuildStep, CompileUnit, ResolveError, ResolvedTarget};
@@ -187,11 +188,10 @@ pub(super) fn lower_modules_with_standard(
         let step = scan(
             model,
             target,
+            &resolved.config,
             unit,
             &template,
-            join_words(flags),
-            defines,
-            includes,
+            (join_words(flags), defines, includes),
         )?;
         if let BuildStep::Scan { ddi, .. } = &step {
             ddis.push(ddi.clone());
@@ -226,11 +226,10 @@ pub(super) fn lower_modules_with_standard(
 fn scan(
     model: &ProjectModel,
     target: &Target,
+    config: &rcmake_genex::ConfigId,
     unit: &CompileUnit,
     template: &[u8],
-    flags: BString,
-    defines: BString,
-    includes: BString,
+    (flags, defines, includes): (BString, BString, BString),
 ) -> Result<BuildStep, ResolveError> {
     let object = unit.object.as_slice();
     let ddi: BString = [object, b".ddi"].concat().into();
@@ -259,6 +258,14 @@ fn scan(
                 .into(),
         ),
     };
+    let invocation = launcher::Command {
+        role: "compile",
+        config,
+        output: &ddi,
+        source: Some(&unit.source.value),
+        language: &"CXX".into(),
+    }
+    .wrap(model, target, invocation);
     Ok(BuildStep::Scan {
         source: unit.source.value.clone(),
         ddi,

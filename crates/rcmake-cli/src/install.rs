@@ -164,6 +164,18 @@ pub(crate) fn run(argv: &[BString], args: &[BString], host: Arc<dyn Host>) -> i3
             return 1;
         }
     };
+    let dir = opts.dir.clone();
+    crate::instrument_lifecycle(
+        host.as_ref(),
+        &dir,
+        argv,
+        rcmake_instrument::SnippetRole::CMakeInstall,
+        rcmake_instrument::Hook::PostCMakeInstall,
+        || install(argv, opts, Arc::clone(&host)),
+    )
+}
+
+fn install(argv: &[BString], opts: Options, host: Arc<dyn Host>) -> i32 {
     let script = opts.dir.join("cmake_install.cmake");
     let components = if opts.components.is_empty() {
         vec![None]

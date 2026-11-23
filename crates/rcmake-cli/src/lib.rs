@@ -5,6 +5,7 @@
 mod build;
 mod cache;
 mod configure;
+#[cfg(test)]
 mod ctest;
 mod generate;
 mod install;
@@ -20,6 +21,7 @@ use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use options::{Options, ParseResult};
 use rcmake_base::{
@@ -31,7 +33,8 @@ use rcmake_diag::{
     RenderOptions, render,
 };
 use rcmake_eval::{CacheDefine, Interp, InterpConfig, RunMode};
-use rcmake_host::{Host, Stream, WriteMode};
+use rcmake_host::{Host, Stream, WriteMode, path};
+use rcmake_instrument::{Hook, InstrumentError, Snippet, SnippetRole, hooks, query, snippet};
 use rcmake_json::Value;
 use rcmake_model::CacheType;
 
@@ -108,7 +111,7 @@ pub fn run(argv: &[BString], host: Arc<dyn Host>) -> i32 {
 
     match tool {
         Tool::Cmake => run_cmake(argv, rest, host),
-        Tool::Ctest => ctest::run(rest, host),
+        Tool::Ctest => rcmake_ctest::main(argv, host),
         Tool::Cpack => rcmake_cpack::main(argv, host),
     }
 }
@@ -185,7 +188,7 @@ fn run_cmake(argv: &[BString], rest: &[BString], host: Arc<dyn Host>) -> i32 {
     }
 
     if let Some(args) = rest.strip_prefix(&[BString::from("--build")]) {
-        return build::run(args, host.as_ref());
+        return build::run(argv, args, host.as_ref());
     }
     if let Some(args) = rest.strip_prefix(&[BString::from("--install")]) {
         return install::run(argv, args, host);
@@ -220,6 +223,98 @@ fn run_cmake(argv: &[BString], rest: &[BString], host: Arc<dyn Host>) -> i32 {
         return outcome.exit_code;
     }
     configure::run(argv, opts, host)
+}
+
+struct InstrumentationStep {
+    start: Duration,
+    time_start: u64,
+}
+
+impl InstrumentationStep {
+    fn start(host: &dyn Host) -> Self {
+        let time = host.now();
+        Self {
+            start: host.monotonic(),
+            time_start: u64::try_from(time.secs)
+                .unwrap_or_default()
+                .saturating_mul(1000)
+                .saturating_add(u64::from(time.nanos / 1_000_000)),
+        }
+    }
+
+    fn record(
+        self,
+        host: &dyn Host,
+        build_dir: &Path,
+        argv: &[BString],
+        role: SnippetRole,
+        exit_code: i32,
+    ) -> Result<(), InstrumentError> {
+        let duration = host.monotonic().saturating_sub(self.start);
+        let command = argv
+            .iter()
+            .map(|arg| arg.as_slice())
+            .collect::<Vec<_>>()
+            .join(b" ".as_slice());
+        let snippet = Snippet {
+            role,
+            command: command.into(),
+            working_dir: path::from_native(&host.initial_cwd()),
+            result: Some(i64::from(exit_code)),
+            time_start: self.time_start,
+            duration: u64::try_from(duration.as_millis()).unwrap_or(u64::MAX),
+            target: None,
+            outputs: Vec::new(),
+            source: None,
+            language: None,
+            test_name: None,
+            config: None,
+            stdout: None,
+            stderr: None,
+        };
+        snippet::write_snippet(
+            host,
+            &build_dir.join(".cmake/instrumentation/v1/data"),
+            &snippet,
+        )?;
+        Ok(())
+    }
+}
+
+fn instrument_lifecycle(
+    host: &dyn Host,
+    build_dir: &Path,
+    argv: &[BString],
+    role: SnippetRole,
+    post_hook: Hook,
+    run: impl FnOnce() -> i32,
+) -> i32 {
+    let queries = match query::read_queries(host, build_dir) {
+        Ok(queries) => queries,
+        Err(err) => {
+            emit_cli_error(host, err.to_string());
+            return 1;
+        }
+    };
+    if queries.is_empty() {
+        return run();
+    }
+    if role == SnippetRole::CMakeBuild
+        && let Err(err) = hooks::run_hook(host, build_dir, Hook::PreCMakeBuild)
+    {
+        emit_cli_error(host, err.to_string());
+        return 1;
+    }
+    let step = InstrumentationStep::start(host);
+    let code = run();
+    if let Err(err) = step
+        .record(host, build_dir, argv, role, code)
+        .and_then(|()| hooks::run_hook(host, build_dir, post_hook))
+    {
+        emit_cli_error(host, err.to_string());
+        return if code == 0 { 1 } else { code };
+    }
+    code
 }
 
 fn new_interp(argv: &[BString], opts: &Options, mode: RunMode, host: Arc<dyn Host>) -> Interp {
@@ -437,6 +532,19 @@ fn build_capabilities_json() -> Value {
         ])
     });
     root.insert("generators".into(), Value::Array(generators.into()));
+    root.insert(
+        "instrumentation".into(),
+        object([
+            ("apiVersion", Value::UInt(rcmake_instrument::API_VERSION)),
+            (
+                "dataVersion",
+                object([
+                    ("major", Value::UInt(rcmake_instrument::DATA_VERSION.major)),
+                    ("minor", Value::UInt(rcmake_instrument::DATA_VERSION.minor)),
+                ]),
+            ),
+        ]),
+    );
     root.insert(BString::from("serverMode"), Value::Bool(false));
     root.insert(BString::from("tls"), Value::Bool(false));
     root.insert(BString::from("version"), Value::Object(version));
@@ -485,6 +593,16 @@ mod tests {
         assert_eq!(code, 0);
         let out = host.stream_bytes(Stream::Stdout);
         assert!(out.starts_with(b"cmake version 4.5.1\n\n"));
+    }
+
+    #[test]
+    fn capabilities_include_instrumentation_versions() {
+        let host = Arc::new(PureHost::default());
+        let args = ["cmake", "-E", "capabilities"].map(BString::from);
+        assert_eq!(run(&args, host.clone()), 0);
+        let field = br#""instrumentation":{"apiVersion":1,"dataVersion":{"major":1,"minor":2}}"#;
+        let output = host.stream_bytes(Stream::Stdout);
+        assert!(output.windows(field.len()).any(|value| value == field));
     }
 
     #[test]

@@ -249,7 +249,26 @@ pub(crate) fn run(argv: &[BString], mut opts: Options, host: Arc<dyn Host>) -> i
             .cx()
             .include_file(&toolchain, IncludeOptions::default());
     }
+    if let Err(err) = rcmake_instrument::query::clear_generated_queries(host.as_ref(), &bin) {
+        return error(host.as_ref(), err.to_string());
+    }
+    let configure_step = crate::InstrumentationStep::start(host.as_ref());
     let result = interp.run_configure(&src, &bin, &[]);
+    let queries = match rcmake_instrument::query::read_queries(host.as_ref(), &bin) {
+        Ok(queries) => queries,
+        Err(err) => return error(host.as_ref(), err.to_string()),
+    };
+    if !queries.is_empty()
+        && let Err(err) = configure_step.record(
+            host.as_ref(),
+            &bin,
+            argv,
+            rcmake_instrument::SnippetRole::Configure,
+            result.exit_code,
+        )
+    {
+        return error(host.as_ref(), err.to_string());
+    }
     let show_status = opts
         .log_level
         .is_none_or(|level| level >= rcmake_eval::LogLevel::Status);
@@ -298,16 +317,39 @@ pub(crate) fn run(argv: &[BString], mut opts: Options, host: Arc<dyn Host>) -> i
         return 1;
     }
     let start = host.monotonic();
-    let generated = match crate::generate::run(&mut interp, host.as_ref(), &bin) {
+    let generate_step = crate::InstrumentationStep::start(host.as_ref());
+    let generated = match crate::generate::run(&mut interp, host.as_ref(), &bin, &queries) {
         Ok(generated) => generated,
         Err(err) => return error(host.as_ref(), format!("{err}\nCMake Generate step failed.")),
     };
     let elapsed = host.monotonic().saturating_sub(start);
+    if generated
+        && !queries.is_empty()
+        && let Err(err) = generate_step.record(
+            host.as_ref(),
+            &bin,
+            argv,
+            rcmake_instrument::SnippetRole::Generate,
+            0,
+        )
+    {
+        return error(host.as_ref(), err.to_string());
+    }
     if let Err(err) = cache::save(host.as_ref(), &bin, interp.cx().cache()) {
         return error(
             host.as_ref(),
             format!("Could not write CMakeCache.txt: {err}"),
         );
+    }
+    if generated
+        && !queries.is_empty()
+        && let Err(err) = rcmake_instrument::hooks::run_hook(
+            host.as_ref(),
+            &bin,
+            rcmake_instrument::Hook::PostGenerate,
+        )
+    {
+        return error(host.as_ref(), err.to_string());
     }
     if generated && show_status {
         options::out(

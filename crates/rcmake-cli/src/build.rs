@@ -225,7 +225,7 @@ impl Options {
     }
 }
 
-pub(crate) fn run(args: &[BString], host: &dyn Host) -> i32 {
+pub(crate) fn run(argv: &[BString], args: &[BString], host: &dyn Host) -> i32 {
     let mut opts = match parse(host, args) {
         Ok(opts) => opts,
         Err(message) => return usage(host, &message),
@@ -283,7 +283,14 @@ pub(crate) fn run(args: &[BString], host: &dyn Host) -> i32 {
         }
     }
     opts.verbose |= env.contains_key(b"VERBOSE".as_slice());
-    dispatch(host, dir, &opts, env.into_iter().collect())
+    crate::instrument_lifecycle(
+        host,
+        dir,
+        argv,
+        rcmake_instrument::SnippetRole::CMakeBuild,
+        rcmake_instrument::Hook::PostCMakeBuild,
+        || dispatch(host, dir, &opts, env.into_iter().collect()),
+    )
 }
 
 fn error(host: &dyn Host, message: &str) -> i32 {

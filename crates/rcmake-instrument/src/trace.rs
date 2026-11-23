@@ -122,10 +122,7 @@ pub(crate) fn trace_value(
             event.json(thread)
         })
         .collect();
-    Ok(Value::Object(Object::from([(
-        "traceEvents".into(),
-        Value::Array(events),
-    )])))
+    Ok(Value::Array(events))
 }
 
 /// Return the trace JSON for `snippets`.

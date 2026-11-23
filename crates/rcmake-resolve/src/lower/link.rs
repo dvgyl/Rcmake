@@ -7,6 +7,7 @@ use rcmake_model::{DirId, ProjectModel, Target};
 
 use super::artifacts::{build_relative, is_darwin};
 use super::compile::{apple_flags, language_flags};
+use super::launcher;
 use super::shell::{direct, join_words, quote, rule_invocations, simple_args};
 use super::{definition, join, target_property};
 use crate::{ArtifactSet, BuildStep, Invocation, LinkFragmentRole, LinkKind, LinkStep};
@@ -260,6 +261,16 @@ pub(super) fn link(
             &objects,
         )
     };
+    for invocation in invocations.iter_mut().skip(usize::from(static_archive)) {
+        *invocation = launcher::Command {
+            role: "link",
+            config,
+            output: &step.output,
+            source: None,
+            language: &step.language,
+        }
+        .wrap(model, target, std::mem::take(invocation));
+    }
     if shared
         && let (Some(file), Some(soname), Some(linker)) = (
             &artifacts.file,

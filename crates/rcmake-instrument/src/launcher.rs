@@ -188,7 +188,7 @@ fn run(
         target_labels: Some(metadata.labels),
         show_only: false,
     };
-    write_snippet_with_details(host, &data.join("v1"), &snippet, &details)?;
+    write_snippet_with_details(host, &data, &snippet, &details)?;
     Ok(code)
 }
 
