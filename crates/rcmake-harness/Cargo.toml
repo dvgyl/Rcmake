@@ -1,0 +1,21 @@
+[package]
+name = "rcmake-harness"
+description = "Isolated black-box differential oracle harness comparing staged Rcmake against pinned CMake 4.5.1."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "rcmake-harness"
+path = "src/main.rs"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+similar.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true

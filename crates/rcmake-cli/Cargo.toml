@@ -1,0 +1,21 @@
+[package]
+name = "rcmake-cli"
+description = "Unified multi-call CLI (rcmake / cmake / ctest / cpack) for Rcmake."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "rcmake"
+path = "src/main.rs"
+
+[dependencies]
+rcmake-base.workspace = true
+rcmake-diag.workspace = true
+rcmake-host.workspace = true
+rcmake-syntax.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,34 @@
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true
+allow-indexing-slicing-in-tests = true
+
+disallowed-methods = [
+    { path = "std::fs::read", reason = "Use rcmake_host::Host instead of direct std::fs access" },
+    { path = "std::fs::read_to_string", reason = "Use rcmake_host::Host instead of direct std::fs access" },
+    { path = "std::fs::write", reason = "Use rcmake_host::Host instead of direct std::fs access" },
+    { path = "std::fs::metadata", reason = "Use rcmake_host::Host instead of direct std::fs access" },
+    { path = "std::fs::symlink_metadata", reason = "Use rcmake_host::Host instead of direct std::fs access" },
+    { path = "std::fs::read_dir", reason = "Use rcmake_host::Host instead of direct std::fs access" },
+    { path = "std::fs::create_dir", reason = "Use rcmake_host::Host instead of direct std::fs access" },
+    { path = "std::fs::create_dir_all", reason = "Use rcmake_host::Host instead of direct std::fs access" },
+    { path = "std::fs::remove_file", reason = "Use rcmake_host::Host instead of direct std::fs access" },
+    { path = "std::fs::remove_dir", reason = "Use rcmake_host::Host instead of direct std::fs access" },
+    { path = "std::fs::remove_dir_all", reason = "Use rcmake_host::Host instead of direct std::fs access" },
+    { path = "std::fs::rename", reason = "Use rcmake_host::Host instead of direct std::fs access" },
+    { path = "std::fs::copy", reason = "Use rcmake_host::Host instead of direct std::fs access" },
+    { path = "std::fs::canonicalize", reason = "Use rcmake_host::Host instead of direct std::fs access" },
+    { path = "std::fs::read_link", reason = "Use rcmake_host::Host instead of direct std::fs access" },
+    { path = "std::fs::File::open", reason = "Use rcmake_host::Host instead of direct std::fs access" },
+    { path = "std::fs::File::create", reason = "Use rcmake_host::Host instead of direct std::fs access" },
+    { path = "std::env::var", reason = "Use rcmake_host::Host::env_get instead of std::env" },
+    { path = "std::env::var_os", reason = "Use rcmake_host::Host::env_get instead of std::env" },
+    { path = "std::env::vars", reason = "Use rcmake_host::Host::env_all instead of std::env" },
+    { path = "std::env::vars_os", reason = "Use rcmake_host::Host::env_all instead of std::env" },
+    { path = "std::env::current_dir", reason = "Use explicit paths via Host/Cx instead of process cwd" },
+    { path = "std::env::set_current_dir", reason = "Never mutate process cwd; pass explicit paths" },
+    { path = "std::process::Command::new", reason = "Use rcmake_host::Host::run instead of std::process::Command" },
+    { path = "std::process::exit", reason = "Return exit codes up to rcmake-cli::main" },
+    { path = "std::time::SystemTime::now", reason = "Use rcmake_host::Host::now for determinism" },
+    { path = "std::time::Instant::now", reason = "Use rcmake_host::Host::monotonic for determinism" },
+]

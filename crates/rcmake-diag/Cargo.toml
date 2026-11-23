@@ -1,0 +1,16 @@
+[package]
+name = "rcmake-diag"
+description = "Source maps, persistent backtraces, CMake 4.5.1 diagnostics, policies (CMP0000-CMP0226), and SARIF 2.1.0."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+rcmake-base.workspace = true
+rcmake-json.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

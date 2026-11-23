@@ -1,0 +1,17 @@
+[package]
+name = "rcmake-host"
+description = "Deterministic Host trait, NativeHost, PureHost, and shared host conformance suite for Rcmake."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+jiff.workspace = true
+rcmake-base.workspace = true
+rustix.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

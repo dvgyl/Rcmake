@@ -1,0 +1,15 @@
+[package]
+name = "rcmake-json"
+description = "jsoncpp-compatible JSON parser and writers for Rcmake."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+rcmake-base.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

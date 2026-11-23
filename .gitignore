@@ -1,6 +1,6 @@
-# Build artifacts & local environment
+# Build artifacts & local oracle downloads
 /target/
-/env/
+/env/oracle/
 *.rs.bk
 
 # macOS & exFAT junk
@@ -15,4 +15,3 @@ __pycache__/
 
 # Temporary test outputs
 *.tmp
-*.log

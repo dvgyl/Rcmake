@@ -1,0 +1,73 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/rcmake-base",
+    "crates/rcmake-json",
+    "crates/rcmake-diag",
+    "crates/rcmake-syntax",
+    "crates/rcmake-host",
+    "crates/rcmake-cli",
+    "crates/rcmake-harness",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/dvgyl/Rcmake"
+homepage = "https://github.com/dvgyl/Rcmake"
+
+[workspace.dependencies]
+bstr = { version = "1.12", default-features = false, features = ["std", "alloc"] }
+indexmap = "2"
+jiff = "0.2"
+memchr = "2"
+rustix = { version = "1", features = ["fs", "process", "system"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+similar = "2"
+tempfile = "3"
+thiserror = "2"
+
+# Internal workspace crates
+rcmake-base = { path = "crates/rcmake-base" }
+rcmake-json = { path = "crates/rcmake-json" }
+rcmake-diag = { path = "crates/rcmake-diag" }
+rcmake-syntax = { path = "crates/rcmake-syntax" }
+rcmake-host = { path = "crates/rcmake-host" }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+unreachable_pub = "warn"
+rust_2018_idioms = { level = "warn", priority = -1 }
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"
+todo = "warn"
+unimplemented = "warn"
+dbg_macro = "warn"
+print_stdout = "warn"
+print_stderr = "warn"
+exit = "warn"
+indexing_slicing = "warn"
+string_slice = "warn"
+iter_over_hash_type = "warn"
+disallowed_methods = "warn"
+
+[workspace.lints.rustdoc]
+broken_intra_doc_links = "warn"
+
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
