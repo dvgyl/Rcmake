@@ -20,7 +20,12 @@ pub(super) fn language(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
                 return Err(status("called with incorrect number of arguments"));
             };
             if code.value != b"CODE" {
-                return Err(status("called without CODE argument"));
+                let message = if args.iter().any(|arg| arg.value == b"CODE") {
+                    "called with unsupported arguments between EVAL and CODE arguments"
+                } else {
+                    "called without CODE argument"
+                };
+                return Err(status(message));
             }
             let mut code = BString::default();
             for (i, arg) in args.iter().enumerate() {

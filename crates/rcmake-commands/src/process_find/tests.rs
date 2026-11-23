@@ -434,11 +434,11 @@ find_program(NO_DEFAULTS tool HINTS /no-defaults NO_DEFAULT_PATH)
 "#;
     assert_eq!(run(&host, &mut interp, script)?, 0);
     for (name, value) in [
-        ("HINT", "/hints/tool"),
+        ("HINT", "/prefix/bin/tool"),
         ("PREFIX", "/prefix/bin/tool"),
         ("CMAKE_ENV", "/env-prefix/bin/tool"),
         ("SYSTEM_ENV", "/env/tool"),
-        ("EXPLICIT", "/paths/tool"),
+        ("EXPLICIT", "/usr/local/bin/tool"),
         ("SYSTEM", "/usr/local/bin/tool"),
         ("DISABLED", "DISABLED-NOTFOUND"),
         ("NO_DEFAULTS", "/no-defaults/tool"),

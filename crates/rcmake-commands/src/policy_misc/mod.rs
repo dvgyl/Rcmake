@@ -28,6 +28,22 @@ pub(crate) fn register(registry: &mut Registry) {
     registry.add("get_filename_component", files::filename_component, script);
     registry.add("set_property", properties::set, script);
     registry.add("get_property", properties::get, script);
+    registry.add("get_directory_property", properties::get_directory, script);
+    registry.add(
+        "set_directory_properties",
+        properties::set_directory,
+        script,
+    );
+    registry.add(
+        "set_source_files_properties",
+        properties::set_sources,
+        project_only,
+    );
+    registry.add(
+        "get_source_file_property",
+        properties::get_source,
+        project_only,
+    );
     registry.add("get_cmake_property", properties::get_cmake, script);
     registry.add("cmake_host_system_information", system::query, script);
     registry.add("cmake_language", language::language, script);

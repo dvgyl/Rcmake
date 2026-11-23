@@ -61,6 +61,7 @@ impl FileOptions {
                 b"FILE_PERMISSIONS" => {
                     let mut mode = 0;
                     let mut found = false;
+                    let mut invalid = Vec::new();
                     while let Some((name, rest)) = args.split_first() {
                         if matches!(
                             *name,
@@ -74,12 +75,20 @@ impl FileOptions {
                         ) {
                             break;
                         }
-                        let bit = permission(name).ok_or_else(|| {
-                            status(quoted("given invalid permission \"", name, "\"."))
-                        })?;
-                        mode |= bit;
+                        if let Some(bit) = permission(name) {
+                            mode |= bit;
+                        } else {
+                            invalid.push(*name);
+                        }
                         found = true;
                         args = rest;
+                    }
+                    if !invalid.is_empty() {
+                        return Err(status(quoted(
+                            "given invalid permission \"",
+                            &invalid.join(b"\",\"".as_slice()),
+                            "\".",
+                        )));
                     }
                     if !found {
                         return Err(status("given FILE_PERMISSIONS without any options. "));
@@ -88,17 +97,17 @@ impl FileOptions {
                 }
                 b"NEWLINE_STYLE" => {
                     let Some((style, rest)) = args.split_first() else {
-                        return Err(status("NEWLINE_STYLE requires a style argument"));
+                        return Err(status(
+                            "NEWLINE_STYLE must set a style: LF, CRLF, UNIX, DOS, or WIN32",
+                        ));
                     };
                     options.newline = Some(match *style {
                         b"UNIX" | b"LF" => false,
                         b"DOS" | b"WIN32" | b"CRLF" => true,
-                        other => {
-                            return Err(status(quoted(
-                                "NEWLINE_STYLE given invalid argument \"",
-                                other,
-                                "\"",
-                            )));
+                        _ => {
+                            return Err(status(
+                                "NEWLINE_STYLE sets an unknown style, only LF, CRLF, UNIX, DOS, and WIN32 are supported",
+                            ));
                         }
                     });
                     args = rest;
@@ -121,10 +130,16 @@ impl FileOptions {
         if let Some(previous) = self.permissions
             && previous.name() != permissions.name()
         {
+            let (first, second) = match (previous, permissions) {
+                (_, Permissions::Explicit(_)) | (Permissions::Default, Permissions::Source) => {
+                    (permissions, previous)
+                }
+                _ => (previous, permissions),
+            };
             return Err(status(format!(
                 "given both {} and {}.  Only one option allowed. ",
-                previous.name(),
-                permissions.name()
+                first.name(),
+                second.name()
             )));
         }
         self.permissions = Some(permissions);
@@ -152,7 +167,9 @@ fn permission(name: &[u8]) -> Option<u32> {
 pub(super) fn configure_file(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
     let args = values(args);
     let [input, output, flags @ ..] = args.as_slice() else {
-        return Err(status("called with incorrect number of arguments"));
+        return Err(status(
+            "called with incorrect number of arguments, expected 2",
+        ));
     };
     let options = FileOptions::parse(flags)?;
     if !options.unknown.is_empty() {
@@ -200,6 +217,20 @@ pub(super) fn configure_file(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult
         limit: cx.limits().max_file_read,
     };
     let input = cx.host().read(&source, range).map_err(file_error)?;
+    if !options.copy
+        && [b"\xff\xfe".as_slice(), b"\xfe\xff", b"\0\0\xfe\xff"]
+            .iter()
+            .any(|bom| input.starts_with(bom))
+    {
+        return Err(crate::command_error(
+            cx,
+            quoted(
+                "File starts with a Byte-Order-Mark that is not UTF-8:\n  ",
+                &path::from_native(&source),
+                "",
+            ),
+        ));
+    }
     let content = if options.copy {
         input
     } else {
@@ -295,7 +326,10 @@ impl ExpandEnv for TemplateEnv<'_, '_> {
 pub(super) fn filename_component(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
     let args = values(args);
     let [var, input, component, flags @ ..] = args.as_slice() else {
-        return Err(status("called with incorrect number of arguments"));
+        return Err(crate::command_error(
+            cx,
+            "get_filename_component called with incorrect number of arguments",
+        ));
     };
     let mut flags = flags;
     let mut cache = false;
@@ -343,7 +377,11 @@ pub(super) fn filename_component(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdRe
         }
         b"ABSOLUTE" | b"REALPATH" => {
             let base = base_dir.unwrap_or_else(|| cx.current_source_dir());
-            let input = if let Some(tail) = path_input.strip_prefix(b"~/")
+            let input = if let Some(drive) = drive_root(&path_input).filter(|_| !cfg!(windows)) {
+                let absolute = path::to_native(path_input.get(2..).unwrap_or_default());
+                let clean = path::from_native(&normalize(&absolute));
+                path::to_native(&[drive, clean.as_slice()].concat())
+            } else if let Some(tail) = path_input.strip_prefix(b"~/")
                 && let Some(home) = cx.host().env_get(b"HOME")
             {
                 path::to_native(&home).join(path::to_native(tail))
@@ -363,7 +401,12 @@ pub(super) fn filename_component(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdRe
             program_tail = Some(tail);
             program
         }
-        other => return Err(status(quoted("unknown component ", other, ""))),
+        other => {
+            return Err(crate::command_error(
+                cx,
+                quoted("get_filename_component unknown component ", other, ""),
+            ));
+        }
     };
     if let (Some(var), Some(tail)) = (program_args, program_tail)
         && !tail.is_empty()
@@ -392,6 +435,13 @@ fn filename_result(cx: &mut Cx<'_>, name: &[u8], value: BString, cache: bool) {
     }
 }
 
+fn drive_root(input: &[u8]) -> Option<&[u8]> {
+    match input {
+        [drive, b':', b'/', ..] if drive.is_ascii_alphabetic() => input.get(..2),
+        _ => None,
+    }
+}
+
 fn directory(input: &[u8]) -> &[u8] {
     let Some(end) = input.iter().rposition(|byte| *byte != b'/') else {
         return input
@@ -402,6 +452,9 @@ fn directory(input: &[u8]) -> &[u8] {
     let Some(slash) = prefix.iter().rposition(|byte| *byte == b'/') else {
         return b"";
     };
+    if slash == 2 && drive_root(input).is_some() {
+        return input.get(..3).unwrap_or_default();
+    }
     let parent = prefix.get(..slash).unwrap_or_default();
     if parent.is_empty() {
         return b"/";
@@ -476,8 +529,8 @@ fn program_path(cx: &Cx<'_>, name: &[u8], whole_path_search: bool) -> Option<BSt
         .host()
         .metadata(&local, Follow::Yes)
         .is_ok_and(|metadata| {
-            metadata.kind == FileKind::File
-                && (!whole_path_search || cfg!(windows) || metadata.mode & 0o111 != 0)
+            !whole_path_search
+                || metadata.kind == FileKind::File && (cfg!(windows) || metadata.mode & 0o111 != 0)
         })
     {
         return Some(if path::to_native(&name).is_absolute() {

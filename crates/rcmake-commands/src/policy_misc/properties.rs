@@ -33,14 +33,22 @@ pub(super) fn define(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
         full_docs: BString::default(),
     };
     let mut docs = None;
-    for arg in tail {
-        match *arg {
+    let mut tail = tail.iter().copied();
+    while let Some(arg) = tail.next() {
+        match arg {
             b"INHERITED" => {
                 entry.inherited = true;
                 docs = None;
             }
             b"BRIEF_DOCS" => docs = Some(&mut entry.brief_docs),
             b"FULL_DOCS" => docs = Some(&mut entry.full_docs),
+            b"INITIALIZE_FROM_VARIABLE" => {
+                let variable = tail.next().ok_or_else(|| {
+                    status("missing variable name after INITIALIZE_FROM_VARIABLE")
+                })?;
+                validate_initializer(scope, name, variable)?;
+                docs = None;
+            }
             other => {
                 let Some(target) = docs.as_deref_mut() else {
                     return Err(status(quoted("given invalid argument \"", other, "\".")));
@@ -57,6 +65,122 @@ pub(super) fn define(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
         definitions.push(entry);
     }
     Ok(Flow::Normal)
+}
+
+fn validate_initializer(scope: &[u8], property: &[u8], variable: &[u8]) -> Result<(), CmdError> {
+    if scope != b"TARGET" {
+        return Err(status(
+            "Scope must be TARGET if INITIALIZE_FROM_VARIABLE is specified",
+        ));
+    }
+    if variable.starts_with(b"CMAKE_") || variable.starts_with(b"_CMAKE_") {
+        return Err(status(quoted(
+            "variable name \"",
+            variable,
+            "\" is reserved",
+        )));
+    }
+    if !variable.ends_with(property) {
+        return Err(status(
+            [
+                b"Variable name \"".as_slice(),
+                variable,
+                b"\" does not end with property name \"",
+                property,
+                b"\"",
+            ]
+            .concat(),
+        ));
+    }
+    if !property.contains(&b'_') {
+        return Err(status(quoted(
+            "Property name \"",
+            property,
+            "\" defined with INITIALIZE_FROM_VARIABLE does not contain underscore",
+        )));
+    }
+    Ok(())
+}
+
+pub(super) fn get_directory(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
+    let args = values(args);
+    let [out, args @ ..] = args.as_slice() else {
+        return Err(status("called with incorrect number of arguments"));
+    };
+    let (directory, query) = match args {
+        [b"DIRECTORY", dir, rest @ ..] => (Some(*dir), rest),
+        _ => (None, args),
+    };
+    check_directory(cx, &directory.into_iter().collect::<Vec<_>>())?;
+    let result = match query {
+        [b"DEFINITION", name] => cx.var(name),
+        [name] => {
+            let inherited = is_inherited(cx, b"DIRECTORY", name);
+            directory_value(cx, name)
+                .or_else(|| inherited.then(|| global_value(cx, name)).flatten())
+        }
+        _ => return Err(status("called with incorrect number of arguments")),
+    };
+    cx.set_var(out, result.unwrap_or_default());
+    Ok(Flow::Normal)
+}
+
+pub(super) fn set_directory(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
+    let args = values(args);
+    let [b"PROPERTIES", pairs @ ..] = args.as_slice() else {
+        return Err(status("Wrong number of arguments"));
+    };
+    for [name, value] in property_pairs(pairs)? {
+        cx.directory_props().set((*name).into(), (*value).into());
+    }
+    Ok(Flow::Normal)
+}
+
+pub(super) fn set_sources(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
+    let args = values(args);
+    let Some(split) = args.iter().position(|arg| *arg == b"PROPERTIES") else {
+        return Err(status("called with incorrect number of arguments"));
+    };
+    let (sources, tail) = args.split_at(split);
+    let pairs = property_pairs(tail.get(1..).unwrap_or_default())?;
+    for source in source_names(cx, sources, false)? {
+        let source = path::from_native(&cx.resolve_path(source));
+        for [name, value] in pairs {
+            let key = object_key(b"SOURCE", &source, name);
+            cx.directory_props().set(key, (*value).into());
+        }
+    }
+    Ok(Flow::Normal)
+}
+
+pub(super) fn get_source(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
+    let args = values(args);
+    let [out, source, options @ .., name] = args.as_slice() else {
+        return Err(status("called with incorrect number of arguments"));
+    };
+    let mut names = vec![*source];
+    names.extend_from_slice(options);
+    let selected = source_names(cx, &names, true)?;
+    let source = selected.first().copied().unwrap_or_default();
+    let inherited = is_inherited(cx, b"SOURCE", name);
+    let value = source_value(cx, source, name, inherited).unwrap_or_else(|| "NOTFOUND".into());
+    cx.set_var(out, value);
+    Ok(Flow::Normal)
+}
+
+fn property_pairs<'a, 'b>(args: &'a [&'b [u8]]) -> Result<&'a [[&'b [u8]; 2]], CmdError> {
+    let (pairs, extra) = args.as_chunks::<2>();
+    if !extra.is_empty() {
+        return Err(status("called with incorrect number of arguments"));
+    }
+    Ok(pairs)
+}
+
+fn is_inherited(cx: &mut Cx<'_>, scope: &[u8], name: &[u8]) -> bool {
+    cx.global()
+        .defined_props
+        .iter()
+        .any(|entry| entry.scope == scope && entry.name == name && entry.inherited)
 }
 
 #[derive(Clone, Copy)]
@@ -120,7 +244,8 @@ pub(super) fn set(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
         }
         b"SOURCE" => {
             for source in source_names(cx, &names, false)? {
-                let key = object_key(b"SOURCE", source, name);
+                let source = path::from_native(&cx.resolve_path(source));
+                let key = object_key(b"SOURCE", &source, name);
                 update.property(cx.directory_props(), &key, value.clone());
             }
         }
@@ -349,13 +474,14 @@ fn source_names<'a>(
 }
 
 fn source_value(cx: &mut Cx<'_>, source: &[u8], name: &[u8], inherited: bool) -> Option<BString> {
-    let key = object_key(b"SOURCE", source, name);
+    let source = path::from_native(&cx.resolve_path(source));
+    let key = object_key(b"SOURCE", &source, name);
     cx.directory_props()
         .get(&key)
         .cloned()
         .or_else(|| match name {
             b"GENERATED" => Some("0".into()),
-            b"LOCATION" => Some(path::from_native(&normalize(&cx.resolve_path(source)))),
+            b"LOCATION" => Some(path::from_native(&normalize(&path::to_native(&source)))),
             _ if inherited => directory_value(cx, name).or_else(|| global_value(cx, name)),
             _ => None,
         })

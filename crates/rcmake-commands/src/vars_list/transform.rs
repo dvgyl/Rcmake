@@ -288,11 +288,12 @@ pub(super) fn apply(
                 }
                 (selector, rest) = Selector::parse(cx, selector_name, tail)?;
             }
-            (bad, _) => {
+            _ => {
+                let unexpected: Vec<_> = rest.iter().map(bytes).collect();
                 return Err(status(cat(&[
                     CONTEXT,
                     b"'",
-                    bad,
+                    &unexpected.join(b" ".as_slice()),
                     b"': unexpected argument(s).",
                 ])));
             }

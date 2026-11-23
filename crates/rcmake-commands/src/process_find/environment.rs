@@ -1,7 +1,6 @@
 use std::collections::BTreeMap;
 
 use rcmake_base::BString;
-use rcmake_eval::CmdError;
 use rcmake_eval::args::Parsed;
 use rcmake_host::Host;
 
@@ -10,7 +9,7 @@ use super::text;
 pub(super) fn child_environment(
     host: &dyn Host,
     parsed: &Parsed,
-) -> Result<Vec<(BString, BString)>, CmdError> {
+) -> Result<Vec<(BString, BString)>, BString> {
     let mut env: BTreeMap<_, _> = host.env_all().into_iter().collect();
     for arg in parsed.multi("ENVIRONMENT") {
         if let Some((name, value)) = split(arg, b'=')
@@ -74,6 +73,6 @@ fn split(value: &[u8], separator: u8) -> Option<(&[u8], &[u8])> {
     Some((parts.next()?, parts.next()?))
 }
 
-fn error(message: &[u8], argument: &[u8]) -> CmdError {
-    CmdError::Status(text(&[message, argument]))
+fn error(message: &[u8], argument: &[u8]) -> BString {
+    text(&[b"Error: ", message, argument])
 }

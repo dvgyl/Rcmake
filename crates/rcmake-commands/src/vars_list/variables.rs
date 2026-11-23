@@ -40,10 +40,10 @@ pub(super) fn set(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
                 ]),
             );
         }
-        cx.host().env_set(
-            key,
-            rest.first().map(bytes).filter(|value| !value.is_empty()),
-        );
+        let value = rest.first().map_or(b"".as_slice(), bytes);
+        if !value.is_empty() || cx.host().env_get(key).is_some() {
+            cx.host().env_set(key, Some(value));
+        }
     } else if let Some(key) = wrapped(name, b"CACHE{") {
         set_cache_keywords(cx, key, rest)?;
     } else {
@@ -125,13 +125,11 @@ fn set_cache_keywords(cx: &mut Cx<'_>, name: &[u8], args: &[ExpandedArg]) -> Res
     let (options, value) = args.split_at(value_index + 1);
     let parsed = KeywordParser::new()
         .keyword("TYPE", Slot::Single)
-        .keyword("HELP", Slot::Single)
+        .keyword("HELP", Slot::MultiNonEmpty)
         .keyword("FORCE", Slot::Flag)
         .keyword("VALUE", Slot::Flag)
         .parse(options);
-    let ty = parsed
-        .single("TYPE")
-        .map_or(Some(CacheType::String), |ty| cache_type(ty));
+    let ty = parsed.single("TYPE").and_then(|ty| cache_type(ty));
     let mut errors = parsed
         .report_error_text()
         .map_or_else(Vec::new, |text| text.to_vec());
@@ -159,12 +157,21 @@ fn set_cache_keywords(cx: &mut Cx<'_>, name: &[u8], args: &[ExpandedArg]) -> Res
             b".",
         ])));
     }
+    let existing = cx.cache().get(name);
+    let ty = ty
+        .or_else(|| existing.map(|entry| entry.ty))
+        .unwrap_or(CacheType::String);
+    let help = if parsed.seen("HELP") {
+        BString::from(parsed.multi("HELP").concat())
+    } else {
+        existing.map_or_else(BString::default, |entry| entry.help.clone())
+    };
     assign_cache(
         cx,
         name,
         list::join(value.iter().map(bytes)),
-        ty.unwrap_or(CacheType::String),
-        parsed.single("HELP").map_or(b"", |help| help.as_slice()),
+        ty,
+        &help,
         parsed.flag("FORCE"),
     );
     Ok(())

@@ -198,7 +198,9 @@ pub(super) fn timestamp(cx: &mut Cx<'_>, args: &[&[u8]]) -> CmdResult {
         let secs = std::str::from_utf8(trim_start(&epoch))
             .ok()
             .and_then(|epoch| epoch.parse::<i64>().ok())
-            .ok_or_else(|| status("Cannot parse SOURCE_DATE_EPOCH as integer"))?;
+            .ok_or_else(|| {
+                crate::exit_with_error(cx, 27, b"Cannot parse SOURCE_DATE_EPOCH as integer")
+            })?;
         if secs < 0 {
             return set(cx, out, "");
         }

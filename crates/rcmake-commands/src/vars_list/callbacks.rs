@@ -37,7 +37,7 @@ impl<'a> Callback<'a> {
         let mut number = 0_u64;
         let output = loop {
             let candidate = BString::from(format!("_cmake_{purpose}_out_{number}_"));
-            if !cx.var_defined(&candidate) {
+            if !cx.var_defined(&candidate) && !cx.var_defined(&reservation(&candidate)) {
                 break candidate;
             }
             number += 1;
@@ -64,7 +64,10 @@ impl<'a> Callback<'a> {
                 line,
             })
             .collect();
+        let reserved = reservation(&self.output);
+        cx.set_var(&reserved, BString::default());
         let call = cx.call_command(self.command, args);
+        cx.unset_var(&reserved);
         let result = cx.var(&self.output);
         cx.unset_var(&self.output);
         call?;
@@ -85,4 +88,8 @@ impl<'a> Callback<'a> {
     ) -> Result<bool, CmdError> {
         self.call(cx, input).map(|value| truth::is_on(&value))
     }
+}
+
+fn reservation(output: &[u8]) -> BString {
+    cat(&[b"_cmake_callback_active_", output])
 }

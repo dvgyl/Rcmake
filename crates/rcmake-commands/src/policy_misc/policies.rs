@@ -5,6 +5,7 @@ use rcmake_diag::{
 };
 use rcmake_eval::{CmdError, CmdResult, Cx, Flow};
 use rcmake_expr::ExpandedArg;
+use rcmake_model::{CacheEntry, CacheType};
 
 use super::{quoted, status, values};
 
@@ -13,6 +14,7 @@ const VERSION_ADVICE: &str = "Update the VERSION argument <min> value.  Or, use 
 pub(super) fn minimum_required(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
     let args = values(args);
     let mut version = None;
+    let mut unknown = None;
     let mut iter = args.into_iter();
     while let Some(arg) = iter.next() {
         match arg {
@@ -24,13 +26,18 @@ pub(super) fn minimum_required(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResu
             }
             b"FATAL_ERROR" => {}
             _ => {
-                return Err(status(quoted(
-                    "called with unknown argument \"",
-                    arg,
-                    "\".",
-                )));
+                unknown.get_or_insert(arg);
             }
         }
+    }
+    if let Some(arg) = unknown
+        && !version.is_some_and(allows_future_options)
+    {
+        return Err(status(quoted(
+            "called with unknown argument \"",
+            arg,
+            "\".",
+        )));
     }
     match version {
         Some(raw) if !raw.is_empty() => apply_version(cx, raw, true),
@@ -45,9 +52,7 @@ pub(super) fn policy(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
         [b"VERSION", raw] => return apply_version(cx, raw, false),
         [b"VERSION"] => return Err(status("VERSION not given an argument")),
         [b"VERSION", ..] => {
-            return Err(status(
-                "VERSION must be given exactly one additional argument.",
-            ));
+            return Err(status("VERSION given too many arguments"));
         }
         [b"SET", name, value] => {
             let id = policy_id(name, "SET")?;
@@ -138,6 +143,22 @@ fn parse_version(raw: &[u8]) -> Option<Version> {
     Version::parse_strict(raw.get(..end)?)
 }
 
+fn running_version() -> Version {
+    Version::from_tuple(
+        rcmake_base::CMAKE_VERSION_MAJOR,
+        rcmake_base::CMAKE_VERSION_MINOR,
+        rcmake_base::CMAKE_VERSION_PATCH,
+    )
+}
+
+fn allows_future_options(raw: &[u8]) -> bool {
+    let policy_version = raw
+        .find(b"...")
+        .and_then(|at| raw.get(at + 3..))
+        .unwrap_or(raw);
+    parse_version(policy_version).is_some_and(|version| version > running_version())
+}
+
 fn apply_version(cx: &mut Cx<'_>, raw: &[u8], required: bool) -> CmdResult {
     let (minimum, maximum) = match raw.find(b"...") {
         Some(at) => {
@@ -161,12 +182,7 @@ fn apply_version(cx: &mut Cx<'_>, raw: &[u8], required: bool) -> CmdResult {
             invalid_version(cx, "policy version", minimum)
         }
     })?;
-    let running = Version::from_tuple(
-        rcmake_base::CMAKE_VERSION_MAJOR,
-        rcmake_base::CMAKE_VERSION_MINOR,
-        rcmake_base::CMAKE_VERSION_PATCH,
-    );
-    if minimum_version > running {
+    if minimum_version > running_version() {
         let body = if required {
             quoted(
                 "CMake ",
@@ -183,11 +199,14 @@ fn apply_version(cx: &mut Cx<'_>, raw: &[u8], required: bool) -> CmdResult {
         return Err(fatal(cx, body));
     }
 
+    if !required && minimum_version < Version::from_tuple(2, 4, 0) {
+        return Err(fatal(cx, "Compatibility with CMake < 2.4 is not supported by CMake >= 3.0.  For compatibility with older versions please use any CMake 2.8.x release or lower.".into()));
+    }
     let mut effective = if let Some(max) = maximum {
         let version =
             parse_version(max).ok_or_else(|| invalid_version(cx, "policy max version", max))?;
         if version < minimum_version {
-            return Err(fatal(
+            return Err(version_error(
                 cx,
                 quoted(
                     "Policy VERSION range \"",
@@ -200,10 +219,25 @@ fn apply_version(cx: &mut Cx<'_>, raw: &[u8], required: bool) -> CmdResult {
     } else {
         minimum_version
     };
-    let floor = cx
-        .var(b"CMAKE_POLICY_VERSION_MINIMUM")
-        .or_else(|| cx.host().env_get(b"CMAKE_POLICY_VERSION_MINIMUM"))
-        .unwrap_or_default();
+    let floor_name = b"CMAKE_POLICY_VERSION_MINIMUM";
+    if !cx.var_defined(floor_name)
+        && let Some(value) = cx
+            .host()
+            .env_get(floor_name)
+            .filter(|value| !value.is_empty())
+    {
+        cx.cache().insert(
+            floor_name.as_slice().into(),
+            CacheEntry {
+                value,
+                ty: CacheType::String,
+                help: "Minimum policy version".into(),
+                advanced: false,
+                props: Default::default(),
+            },
+        );
+    }
+    let floor = cx.var_or_empty(floor_name);
     if !floor.is_empty() {
         let version = parse_version(&floor)
             .ok_or_else(|| invalid_version(cx, "CMAKE_POLICY_VERSION_MINIMUM", &floor))?;
@@ -251,7 +285,7 @@ fn apply_version(cx: &mut Cx<'_>, raw: &[u8], required: bool) -> CmdResult {
 }
 
 fn invalid_version(cx: &mut Cx<'_>, field: &str, raw: &[u8]) -> CmdError {
-    fatal(
+    version_error(
         cx,
         quoted(
             &format!("Invalid {field} value \""),
@@ -259,6 +293,11 @@ fn invalid_version(cx: &mut Cx<'_>, field: &str, raw: &[u8]) -> CmdError {
             "\".  A numeric major.minor[.patch[.tweak]] must be given.",
         ),
     )
+}
+
+fn version_error(cx: &mut Cx<'_>, message: BString) -> CmdError {
+    cx.issue(MessageKind::Error, Effect::SetError, None, message);
+    CmdError::Reported
 }
 
 fn policy_error(cx: &mut Cx<'_>, error: PolicyError) -> CmdError {

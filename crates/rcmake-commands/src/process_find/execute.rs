@@ -77,7 +77,8 @@ pub(super) fn execute_process(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResul
 
     let request = RunRequest {
         pipeline,
-        env: environment::child_environment(cx.host(), &parsed)?,
+        env: environment::child_environment(cx.host(), &parsed)
+            .map_err(|error| crate::exit_with_error(cx, 1, &error))?,
         stdin: value(&parsed, "INPUT_FILE").map_or(Input::Inherit, |file| {
             Input::File(cwd.join(path::to_native(file)))
         }),
@@ -132,7 +133,12 @@ pub(super) fn execute_process(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResul
     }
     let results: Vec<_> = run.results.iter().map(result_text).collect();
     if let (Some(var), Some(last)) = (value(&parsed, "RESULT_VARIABLE"), results.last()) {
-        cx.set_var(var, last.clone());
+        let result = if run.results.contains(&ProcessResult::TimedOut) {
+            TIMEOUT_MESSAGE.into()
+        } else {
+            last.clone()
+        };
+        cx.set_var(var, result);
     }
     if let Some(var) = value(&parsed, "RESULTS_VARIABLE") {
         cx.set_var(var, list::join(&results));

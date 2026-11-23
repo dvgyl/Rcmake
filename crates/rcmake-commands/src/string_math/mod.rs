@@ -201,7 +201,7 @@ fn transform(cx: &mut Cx<'_>, mode: &[u8], args: &[&[u8]]) -> CmdResult {
     match mode {
         b"LENGTH" => set(cx, out, input.len().to_string()),
         b"STRIP" => set(cx, out, trim_start(input).trim_end_with(is_space)),
-        b"GENEX_STRIP" => set(cx, out, strip_genex(input)),
+        b"GENEX_STRIP" => set(cx, out, drop_empty_elements(strip_genex(input))),
         b"MAKE_C_IDENTIFIER" => {
             let mut result = Vec::with_capacity(input.len());
             if input.first().is_some_and(u8::is_ascii_digit) {
@@ -257,6 +257,37 @@ fn strip_genex(input: &[u8]) -> Vec<u8> {
         remaining = tail;
     }
     result.extend_from_slice(remaining);
+    result
+}
+
+fn drop_empty_elements(input: Vec<u8>) -> Vec<u8> {
+    let mut result = Vec::new();
+    let mut start = 0;
+    let mut depth = 0_isize;
+    let mut previous = None;
+    for (index, &byte) in input.iter().enumerate() {
+        match byte {
+            b'[' => depth += 1,
+            b']' => depth -= 1,
+            b';' if depth == 0 && previous != Some(b'\\') => {
+                if start < index {
+                    if !result.is_empty() {
+                        result.push(b';');
+                    }
+                    result.extend_from_slice(input.get(start..index).unwrap_or_default());
+                }
+                start = index + 1;
+            }
+            _ => {}
+        }
+        previous = Some(byte);
+    }
+    if start < input.len() {
+        if !result.is_empty() {
+            result.push(b';');
+        }
+        result.extend_from_slice(input.get(start..).unwrap_or_default());
+    }
     result
 }
 
@@ -328,12 +359,15 @@ fn substring(cx: &mut Cx<'_>, args: &[&[u8]]) -> CmdResult {
 
 fn repeat(cx: &mut Cx<'_>, args: &[&[u8]]) -> CmdResult {
     let [input, count, out] = args else {
-        return Err(status("sub-command REPEAT requires three arguments."));
+        return Err(crate::command_error(
+            cx,
+            "sub-command REPEAT requires three arguments.",
+        ));
     };
     let count = std::str::from_utf8(trim_start(count))
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
-        .ok_or_else(|| status("repeat count is not a positive number."))?;
+        .ok_or_else(|| crate::command_error(cx, "repeat count is not a positive number."))?;
     if input.is_empty() {
         return set(cx, out, "");
     }

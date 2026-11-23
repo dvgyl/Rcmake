@@ -3,10 +3,13 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use rcmake_base::{BString, ByteSlice, truth};
-use rcmake_diag::{PolicyId, PolicyStatus};
+use rcmake_diag::{DiagCategory, Effect, MessageKind, PolicyId, PolicyStatus};
+use rcmake_eval::args::{KeywordParser, Slot};
 use rcmake_eval::{CmdError, CmdResult, Cx, Flow};
 use rcmake_expr::ExpandedArg;
-use rcmake_host::{CommandSpec, Input, Output, ProcessResult, ReadRange, RunRequest, SystemInfo};
+use rcmake_host::{
+    CommandSpec, Input, Output, ProcessResult, ReadRange, RunRequest, SystemInfo, path,
+};
 use rcmake_model::{CacheEntry, CacheType};
 
 use super::{quoted, status, values};
@@ -47,21 +50,26 @@ pub(super) fn variable_watch(_: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult 
 }
 
 pub(super) fn query(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
-    let args = values(args);
-    let [b"RESULT", out, b"QUERY", keys @ ..] = args.as_slice() else {
-        return Err(status("called with incorrect number of arguments"));
+    let [result, out, args @ ..] = args else {
+        return Err(status("missing RESULT specification."));
     };
-    if let [b"WINDOWS_REGISTRY", _, options @ ..] = keys {
-        if let Some([_, error_var]) = options
-            .windows(2)
-            .find(|pair| pair.first() == Some(&b"ERROR_VARIABLE".as_slice()))
-        {
-            cx.set_var(error_var, "No Registry on this platform.".into());
-        }
-        cx.set_var(out, BString::default());
-        return Ok(Flow::Normal);
+    if result.value != b"RESULT" {
+        return Err(status("missing RESULT specification."));
     }
-    let (requested_root, keys) = query_options(keys)?;
+    let [query, keys @ ..] = args else {
+        return Err(status("missing QUERY specification"));
+    };
+    if query.value != b"QUERY" {
+        return Err(status("missing QUERY specification"));
+    }
+    let out = out.value.as_slice();
+    if let Some((query, args)) = keys.split_first()
+        && query.value == b"WINDOWS_REGISTRY"
+    {
+        return registry(cx, out, args);
+    }
+    let keys = values(keys);
+    let (requested_root, keys) = query_options(&keys)?;
     if keys.is_empty() {
         return Err(status("missing QUERY specification"));
     }
@@ -72,7 +80,12 @@ pub(super) fn query(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
         && !cx.var_or_empty(b"CMAKE_SYSROOT").is_empty()
         && keys.iter().any(|key| key.starts_with(b"DISTRIB_"))
     {
-        cx.issue_policy_warning(policy, b"", b"");
+        cx.issue(
+            MessageKind::AuthorWarning,
+            Effect::None,
+            Some(DiagCategory::Policy),
+            "Policy CMP0221 is not set: cmake_host_system_information() DISTRIB_* queries read the host os-release.  Run \"cmake --help-policy CMP0221\" for policy details.  Use the cmake_policy command to set the policy and suppress this warning.".into(),
+        );
         if cx.fatal_occurred() {
             return Err(CmdError::Reported);
         }
@@ -83,11 +96,14 @@ pub(super) fn query(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
     let mut result = BString::default();
     for key in keys {
         let item = if let Some(name) = key.strip_prefix(b"DISTRIB_") {
-            let fields = distro.get_or_insert_with(|| distribution(cx, sysroot));
+            if distro.is_none() {
+                distro = Some(distribution(cx, sysroot)?);
+            }
+            let Some(fields) = &distro else { continue };
             if name == b"INFO" {
                 let mut variables = Vec::with_capacity(fields.len());
                 for (key, value) in fields.iter() {
-                    let var: BString = [*out, b"_", key.as_slice()].concat().into();
+                    let var: BString = [out, b"_", key.as_slice()].concat().into();
                     cx.set_var(&var, value.clone());
                     variables.push(var);
                 }
@@ -106,6 +122,42 @@ pub(super) fn query(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
         result.extend_from_slice(&item);
     }
     cx.set_var(out, result);
+    Ok(Flow::Normal)
+}
+
+fn registry(cx: &mut Cx<'_>, out: &[u8], args: &[ExpandedArg]) -> CmdResult {
+    let [_, options @ ..] = args else {
+        return Err(status("missing <key> specification."));
+    };
+    let parsed = KeywordParser::new()
+        .keyword("VALUE", Slot::Single)
+        .keyword("VIEW", Slot::Single)
+        .keyword("ERROR_VARIABLE", Slot::Single)
+        .keyword("VALUE_NAMES", Slot::Flag)
+        .keyword("SUBKEYS", Slot::Flag)
+        .parse(options);
+    if !parsed.unparsed().is_empty() {
+        return Err(status(quoted(
+            "given invalid argument(s) \"",
+            &parsed.unparsed().join(b";".as_slice()),
+            "\".",
+        )));
+    }
+    if let Some(error) = parsed.report_error_text() {
+        return Err(crate::command_error(cx, error));
+    }
+    if let Some(view) = parsed.single("VIEW")
+        && !matches!(
+            view.as_slice(),
+            b"32" | b"64" | b"32_64" | b"64_32" | b"HOST" | b"TARGET" | b"BOTH"
+        )
+    {
+        return Err(status(quoted("given invalid value for VIEW: ", view, ".")));
+    }
+    if let Some(error) = parsed.single("ERROR_VARIABLE") {
+        cx.set_var(error, "No Registry on this platform.".into());
+    }
+    cx.set_var(out, BString::default());
     Ok(Flow::Normal)
 }
 
@@ -285,7 +337,16 @@ impl HostFacts {
                         .map(|num| num.to_string().into())
                 })
                 .unwrap_or_default(),
-            b"PROCESSOR_CLOCK_FREQUENCY" => cpu_field(b"cpu MHz").unwrap_or_default(),
+            b"PROCESSOR_CLOCK_FREQUENCY" => {
+                let frequency =
+                    |value: BString| std::str::from_utf8(&value).ok()?.parse::<f64>().ok();
+                let mhz = apple(b"hw.cpufrequency")
+                    .and_then(frequency)
+                    .map(|hz| hz / 1_000_000.0)
+                    .or_else(|| cpu_field(b"cpu MHz").and_then(frequency))
+                    .unwrap_or_default();
+                format!("{mhz:.6}").into()
+            }
             b"VENDOR_ID" | b"VENDOR_STRING" => apple(b"machdep.cpu.vendor")
                 .or_else(|| cpu_field(b"vendor_id"))
                 .unwrap_or_default(),
@@ -366,7 +427,7 @@ fn locale_charset(cx: &Cx<'_>) -> BString {
     "US-ASCII".into()
 }
 
-fn distribution(cx: &Cx<'_>, sysroot: bool) -> BTreeMap<BString, BString> {
+fn distribution(cx: &mut Cx<'_>, sysroot: bool) -> Result<BTreeMap<BString, BString>, CmdError> {
     let root = cx.var_or_empty(b"CMAKE_SYSROOT");
     let root = if sysroot && !root.is_empty() {
         cx.resolve_path(&root)
@@ -376,45 +437,139 @@ fn distribution(cx: &Cx<'_>, sysroot: bool) -> BTreeMap<BString, BString> {
     for name in ["etc/os-release", "usr/lib/os-release"] {
         let input = read(cx, &root.join(name));
         if !input.is_empty() {
-            return fields(
-                input
-                    .lines()
-                    .filter(|line| !line.trim_ascii_start().starts_with(b"#")),
-                b'=',
-            )
-            .into_iter()
-            .map(|(key, value)| (key, unquote(&value)))
-            .collect();
+            return Ok(fields(input.lines(), b'=')
+                .into_iter()
+                .filter_map(|(key, value)| {
+                    if key.is_empty()
+                        || !key
+                            .iter()
+                            .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+                    {
+                        return None;
+                    }
+                    release_value(&value).map(|value| (key, value))
+                })
+                .collect());
         }
     }
-    BTreeMap::new()
+    distribution_fallback(cx, &root)
 }
 
-fn unquote(value: &[u8]) -> BString {
-    if let Some(inner) = value
-        .strip_prefix(b"'")
-        .and_then(|value| value.strip_suffix(b"'"))
-    {
-        return inner.into();
-    }
-    let Some(inner) = value
-        .strip_prefix(b"\"")
-        .and_then(|value| value.strip_suffix(b"\""))
-    else {
-        return value.into();
+fn release_value(value: &[u8]) -> Option<BString> {
+    let Some(&quote @ (b'"' | b'\'')) = value.first() else {
+        let unquoted = value.split(|&byte| byte == b'#').next()?.trim_ascii_end();
+        return (!unquoted
+            .iter()
+            .any(|byte| matches!(byte, b'\\' | b'\'' | b'"')))
+        .then(|| unquoted.into());
     };
-    let mut bytes = inner.iter().copied().peekable();
+    let mut bytes = value.get(1..)?.iter().copied().peekable();
     let mut result = BString::default();
     while let Some(byte) = bytes.next() {
+        if byte == quote {
+            let tail = bytes.collect::<Vec<_>>();
+            let tail = tail.trim_ascii_start();
+            return (tail.is_empty() || tail.starts_with(b"#")).then_some(result);
+        }
         if byte == b'\\'
-            && let Some(escaped) = bytes.next_if(|byte| matches!(byte, b'\\' | b'"' | b'$' | b'`'))
+            && let Some(escaped) =
+                bytes.next_if(|byte| *byte == quote || matches!(byte, b'\\' | b'$' | b'`'))
         {
             result.push(escaped);
         } else {
             result.push(byte);
         }
     }
-    result
+    None
+}
+
+fn distribution_fallback(
+    cx: &mut Cx<'_>,
+    root: &Path,
+) -> Result<BTreeMap<BString, BString>, CmdError> {
+    const PREFIX: &[u8] = b"CMAKE_GET_OS_RELEASE_FALLBACK_RESULT_";
+    let builtins =
+        path::to_native(&cx.var_or_empty(b"CMAKE_ROOT")).join("Modules/Internal/OSRelease");
+    let mut scripts: Vec<_> = cx
+        .host()
+        .read_dir(&builtins)
+        .unwrap_or_default()
+        .iter()
+        .filter(|entry| entry.name.ends_with(b".cmake"))
+        .map(|entry| builtins.join(path::to_native(&entry.name)))
+        .collect();
+    scripts.extend(
+        rcmake_base::list::split(
+            &cx.var_or_empty(b"CMAKE_GET_OS_RELEASE_FALLBACK_SCRIPTS"),
+            rcmake_base::list::Empty::Drop,
+        )
+        .iter()
+        .map(|script| cx.resolve_path(script)),
+    );
+    scripts.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
+    let token = (0..)
+        .map(|index| format!("_rcmake_release_{index}"))
+        .find(|prefix| {
+            [
+                prefix.clone(),
+                format!("{prefix}_root"),
+                format!("{prefix}_script"),
+            ]
+            .iter()
+            .all(|key| !cx.var_defined(key.as_bytes()))
+        })
+        .unwrap_or_default();
+    let root_var = format!("{token}_root");
+    let script_var = format!("{token}_script");
+    let code = format!(
+        r#"
+block(SCOPE_FOR VARIABLES PROPAGATE {token})
+  set(CMAKE_SYSROOT "${{{root_var}}}")
+  unset(CMAKE_GET_OS_RELEASE_FALLBACK_RESULT)
+  include("${{{script_var}}}" OPTIONAL)
+  set({token})
+  foreach(_rcmake_release_field IN LISTS CMAKE_GET_OS_RELEASE_FALLBACK_RESULT)
+    string(HEX "${{${{_rcmake_release_field}}}}" _rcmake_release_value)
+    list(APPEND {token} "${{_rcmake_release_field}}=${{_rcmake_release_value}}")
+  endforeach()
+endblock()
+"#
+    );
+    cx.set_var(root_var.as_bytes(), path::from_native(root));
+    let mut fields = BTreeMap::new();
+    for script in scripts {
+        cx.set_var(script_var.as_bytes(), path::from_native(&script));
+        let result = cx.eval_code(code.as_bytes());
+        let values = cx.var_or_empty(token.as_bytes());
+        cx.unset_var(token.as_bytes());
+        if let Err(error) = result {
+            cx.unset_var(root_var.as_bytes());
+            cx.unset_var(script_var.as_bytes());
+            return Err(error);
+        }
+        if cx.fatal_occurred() {
+            break;
+        }
+        fields.extend(values.split(|&byte| byte == b';').filter_map(|entry| {
+            let (name, value) = entry.split_once_str(b"=")?;
+            let name = name.strip_prefix(PREFIX)?;
+            let decoded: Option<Vec<u8>> = value
+                .chunks(2)
+                .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).ok()?, 16).ok())
+                .collect();
+            Some((BString::from(name), BString::from(decoded?)))
+        }));
+        if !fields.is_empty() {
+            fields.insert("USED_FALLBACK_SCRIPT".into(), path::from_native(&script));
+            break;
+        }
+    }
+    cx.unset_var(root_var.as_bytes());
+    cx.unset_var(script_var.as_bytes());
+    if cx.fatal_occurred() {
+        return Err(CmdError::Reported);
+    }
+    Ok(fields)
 }
 
 fn read(cx: &Cx<'_>, path: &Path) -> Vec<u8> {
