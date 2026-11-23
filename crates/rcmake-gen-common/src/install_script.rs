@@ -2,6 +2,10 @@
 
 use std::path::Path;
 
+pub(crate) mod file_sets;
+mod supplementary;
+pub use supplementary::write_supplementary_outputs;
+
 use rcmake_base::BString;
 use rcmake_host::{Host, path::from_native};
 use rcmake_resolve::{InstallAction, InstallActionKind, InstallManifest};
@@ -133,6 +137,20 @@ fn render_action(
         b"  ".as_slice()
     };
 
+    render_payload(out, action, options, indent)?;
+    if guarded {
+        out.extend_from_slice(b"  endif()\n");
+    }
+    out.extend_from_slice(b"endif()\n\n");
+    Ok(())
+}
+
+fn render_payload(
+    out: &mut BString,
+    action: &InstallAction,
+    options: &InstallScriptOptions<'_>,
+    indent: &[u8],
+) -> Result<(), GenError> {
     out.extend_from_slice(indent);
     match &action.kind {
         InstallActionKind::Files {
@@ -190,10 +208,6 @@ fn render_action(
             out.extend_from_slice(b")\n");
         }
     }
-    if guarded {
-        out.extend_from_slice(b"  endif()\n");
-    }
-    out.extend_from_slice(b"endif()\n\n");
     Ok(())
 }
 

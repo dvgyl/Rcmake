@@ -444,14 +444,14 @@ fn quote_export_content(out: &mut BString, mut value: &[u8], install: bool, list
     }
 }
 
-fn output_error(path: &[u8], message: impl Into<BString>) -> GenError {
+pub(crate) fn output_error(path: &[u8], message: impl Into<BString>) -> GenError {
     GenError::Write {
         path: path.into(),
         message: message.into(),
     }
 }
 
-fn write_output(host: &dyn Host, path: &Path, content: &[u8]) -> Result<(), GenError> {
+pub(crate) fn write_output(host: &dyn Host, path: &Path, content: &[u8]) -> Result<(), GenError> {
     if let Some(parent) = path.parent() {
         host.create_dir_all(parent)
             .map_err(|error| write_error(parent, error))?;

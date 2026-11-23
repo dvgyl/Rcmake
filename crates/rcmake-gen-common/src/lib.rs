@@ -7,6 +7,7 @@
 use std::path::Path;
 
 use rcmake_base::BString;
+use rcmake_genex::{EvalContext, PreprocessMode};
 use rcmake_host::{Host, HostError, path::from_native};
 
 pub mod compile_commands;
@@ -18,8 +19,12 @@ pub mod fileapi;
 pub mod install_script;
 pub mod sbom;
 
+pub use install_script::write_supplementary_outputs;
+
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod wave3_tests;
 
 /// Error of a generator or writer.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
@@ -35,6 +40,9 @@ pub enum GenError {
     /// An install action refers to an export file that the caller did not supply.
     #[error("missing generated install export file for plan {0}")]
     MissingExport(usize),
+    /// The output data is invalid.
+    #[error("{0}")]
+    Invalid(BString),
     /// The output is not implemented yet.
     #[error("{0} is not implemented yet")]
     Unimplemented(&'static str),
@@ -101,4 +109,54 @@ fn configuration_pattern(configurations: &[BString]) -> BString {
     }
     pattern.extend_from_slice(b")$");
     pattern
+}
+
+fn script_argument(out: &mut BString, value: &[u8]) {
+    if !value
+        .iter()
+        .any(|&byte| matches!(byte, b'"' | b'\\' | b'$'))
+    {
+        quote(out, value);
+        return;
+    }
+    bracket_argument(out, value);
+}
+
+fn bracket_argument(out: &mut BString, value: &[u8]) {
+    // Leave room for any closing delimiter inside the argument or at its end.
+    let width = value
+        .split(|&byte| byte == b']')
+        .skip(1)
+        .map(|part| part.iter().take_while(|&&byte| byte == b'=').count() + 1)
+        .max()
+        .unwrap_or_default();
+    let delimiter = std::iter::repeat_n(b'=', width);
+    out.push(b'[');
+    out.extend(delimiter.clone());
+    out.push(b'[');
+    if value.starts_with(b"\n") {
+        out.push(b'\n');
+    }
+    out.extend_from_slice(value);
+    out.push(b']');
+    out.extend(delimiter);
+    out.push(b']');
+}
+
+fn genex(
+    resolver: &mut rcmake_resolve::usage::UsageResolver<'_>,
+    dir: rcmake_model::DirId,
+    context: &EvalContext,
+    value: &[u8],
+    mode: Option<PreprocessMode>,
+) -> Result<BString, GenError> {
+    let mut evaluate = || -> Result<BString, rcmake_genex::GenexError> {
+        let ast = rcmake_genex::parse(value)?;
+        let ast = match mode {
+            Some(mode) => rcmake_genex::strip(&ast, mode),
+            None => ast,
+        };
+        rcmake_genex::evaluate(&ast, context, &mut resolver.host(dir)).map(|(value, _)| value)
+    };
+    evaluate().map_err(|error| GenError::Invalid(error.to_string().into()))
 }
