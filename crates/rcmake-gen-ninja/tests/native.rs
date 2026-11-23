@@ -544,6 +544,8 @@ printf '%s\n' 'module\ state/unit.o.ddi: main.c' > "$2"
                     dd: dd.clone(),
                     modmaps: vec![map.clone()],
                     tdi: "module state/CXXDependInfo.json".into(),
+                    depend_info: Box::default(),
+                    modmap_format: rcmake_cxxmodules::ModmapFormat::Clang,
                     implicit_inputs: vec![],
                 },
                 BuildStep::Compile {

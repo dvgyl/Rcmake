@@ -490,6 +490,8 @@ fn module_pipeline_writes_edges_and_target_metadata() -> Result<(), Box<dyn std:
                     dd: dd.clone(),
                     modmaps: vec![map.clone()],
                     tdi: format!("{base}/CXXDependInfo.json").into(),
+                    depend_info: Box::default(),
+                    modmap_format: rcmake_cxxmodules::ModmapFormat::Clang,
                     implicit_inputs,
                 },
                 BuildStep::Compile {
@@ -560,6 +562,7 @@ fn module_pipeline_writes_edges_and_target_metadata() -> Result<(), Box<dyn std:
                     file_set: "modules".into(),
                     public: true,
                     bmi_only: false,
+                    ..ModuleUnit::default()
                 }],
                 module_dir: producer.into(),
                 bmi_install: Some(BmiInstall {
