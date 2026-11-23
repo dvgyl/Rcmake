@@ -364,11 +364,7 @@ pub(crate) fn run(argv: &[BString], mut opts: Options, host: Arc<dyn Host>) -> i
     if generated && show_status {
         options::out(
             host.as_ref(),
-            &format!(
-                "-- Generating done ({:.1}s)\n-- Build files have been written to: {}\n",
-                elapsed.as_secs_f64(),
-                bin.display(),
-            ),
+            &format!("-- Generating done ({:.1}s)\n", elapsed.as_secs_f64()),
         );
     }
     if generated
@@ -380,6 +376,12 @@ pub(crate) fn run(argv: &[BString], mut opts: Options, host: Arc<dyn Host>) -> i
         )
     {
         return error(host.as_ref(), err.to_string());
+    }
+    if generated && show_status {
+        options::out(
+            host.as_ref(),
+            &format!("-- Build files have been written to: {}\n", bin.display()),
+        );
     }
     0
 }
