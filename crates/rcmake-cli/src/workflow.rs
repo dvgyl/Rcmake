@@ -7,10 +7,9 @@ use std::sync::Arc;
 use rcmake_base::BString;
 use rcmake_host::{Host, Stream};
 use rcmake_instrument::{Hook, hooks::run_hook};
-use rcmake_presets::{
-    EnvSnapshot, PresetKind, Presets, PresetsError, ResolvedPreset, WorkflowStep,
-};
+use rcmake_presets::{EnvSnapshot, PresetKind, Presets, WorkflowStep};
 
+use crate::presets::{self, Listing};
 use crate::{options, resolve_cli_path};
 
 const USAGE: &str = "Usage: cmake --workflow <options>\n\
@@ -24,11 +23,6 @@ const FLAGS: &[&[u8]] = &[
     b"--list-presets",
     b"--fresh",
 ];
-
-enum Listing {
-    Available,
-    Defined,
-}
 
 #[derive(Default)]
 struct Options {
@@ -68,12 +62,19 @@ impl Options {
                     options.file = Some(resolve_cli_path(host, file));
                 }
                 b"--list-presets" => {
-                    options.listing = Some(match value() {
-                        None if inline.is_none() => Listing::Available,
-                        None => return Err("CMake Error: Invalid value used with --list-presets".into()),
-                        Some(b"defined") => Listing::Defined,
-                        Some(_) => return Err("Invalid value specified for --list-presets.\nThe only supported value in workflow mode is \"defined\".".into()),
+                    let mode = inline.or_else(|| {
+                        args.next_if(|(_, arg)| !arg.starts_with(b"-"))
+                            .map(|(_, arg)| arg.as_slice())
                     });
+                    options.listing = Some(Listing::for_kind(PresetKind::Workflow, mode).map_err(
+                        |err| {
+                            if mode == Some(b"") {
+                                format!("CMake Error: {err}")
+                            } else {
+                                err.to_owned()
+                            }
+                        },
+                    )?);
                 }
                 b"--fresh" if inline.is_none() => options.fresh = true,
                 _ if index == 0 && !arg.starts_with(b"-") && !arg.is_empty() => {
@@ -112,25 +113,13 @@ pub(crate) fn run(args: &[BString], host: Arc<dyn Host>) -> i32 {
         }
     };
     let cwd = host.initial_cwd();
-    let presets = match &options.file {
-        Some(file) => rcmake_presets::load_file(&cwd, file, host.as_ref()),
-        None => rcmake_presets::load(&cwd, host.as_ref()),
-    };
-    let presets = match presets {
+    let presets = match presets::load(host.as_ref(), &cwd, options.file.as_deref()) {
         Ok(presets) => presets,
-        Err(err) => {
-            let message = if err.message.starts_with("Could not read presets from ") {
-                err.message
-            } else {
-                format!("Could not read presets from {}:\n{err}", cwd.display())
-            };
-            error(host.as_ref(), &message);
-            return 1;
-        }
+        Err(code) => return code,
     };
     let env = EnvSnapshot::from_host(host.as_ref());
-    if let Some(listing) = &options.listing {
-        print_presets(host.as_ref(), &presets, &env, listing);
+    if let Some(listing) = options.listing {
+        presets::print_list(host.as_ref(), &presets, &env, listing);
         return 0;
     }
     let Some(name) = &options.preset else {
@@ -144,7 +133,12 @@ pub(crate) fn run(args: &[BString], host: Arc<dyn Host>) -> i32 {
             host.as_ref(),
             &format!("No such workflow preset in {}: \"{name}\"", cwd.display()),
         );
-        print_presets(host.as_ref(), &presets, &env, &Listing::Available);
+        presets::print_list(
+            host.as_ref(),
+            &presets,
+            &env,
+            Listing::available(PresetKind::Workflow),
+        );
         return 1;
     };
     let binary_dir = match validate(&workflow.steps, &presets, &env, &cwd) {
@@ -224,77 +218,6 @@ fn validate(
         }
     }
     Ok(binary_dir)
-}
-
-fn print_presets(host: &dyn Host, presets: &Presets, env: &EnvSnapshot, listing: &Listing) {
-    let defined = matches!(listing, Listing::Defined);
-    let entries: Vec<_> = presets
-        .workflow_definitions()
-        .filter_map(|(preset, workflow)| {
-            let reason = workflow.steps.iter().enumerate().find_map(|(index, step)| {
-                let reason = unavailable(presets, env, step)?;
-                Some(format!(
-                    "step {}: {} preset \"{}\": {reason}",
-                    index + 1,
-                    step.kind.label(),
-                    step.name
-                ))
-            });
-            (defined || reason.is_none()).then_some((preset, reason))
-        })
-        .collect();
-    let Some(width) = entries.iter().map(|(preset, _)| preset.name.len()).max() else {
-        return;
-    };
-    let heading = if defined { "Defined" } else { "Available" };
-    let mut output = format!("{heading} workflow presets:\n\n");
-    for (index, (preset, reason)) in entries.iter().enumerate() {
-        let name = &preset.name;
-        output.push_str(&format!("  \"{name}\""));
-        if let Some(display) = preset
-            .display_name
-            .as_ref()
-            .filter(|display| !display.is_empty())
-        {
-            let pad = width - name.len() + 1;
-            output.push_str(&format!("{:pad$}- {display}", ""));
-        }
-        output.push('\n');
-        if let Some(reason) = reason {
-            output.push_str(&format!("    Unavailable: {reason}\n"));
-            if index + 1 < entries.len() {
-                output.push('\n');
-            }
-        }
-    }
-    host.write_out(Stream::Stdout, output.as_bytes());
-}
-
-fn unavailable(presets: &Presets, env: &EnvSnapshot, step: &WorkflowStep) -> Option<String> {
-    match presets.resolve(step.kind, &step.name, env) {
-        Ok(ResolvedPreset {
-            generator: Some(generator),
-            ..
-        }) if step.kind == PresetKind::Configure && !options::is_generator(&generator) => {
-            Some(format!("generator \"{generator}\" is not available"))
-        }
-        Ok(_) => None,
-        Err(PresetsError { message }) if message.starts_with("Cannot use hidden ") => {
-            Some("hidden".into())
-        }
-        Err(PresetsError { message }) if message.starts_with("Cannot use disabled ") => {
-            Some(presets.preset_condition(step.kind, &step.name).map_or_else(
-                || "condition evaluated to false".into(),
-                |condition| {
-                    format!(
-                        "condition evaluated to false: {}",
-                        rcmake_json::write_compact(condition)
-                    )
-                },
-            ))
-        }
-        Err(_) => Some("unsupported macro expansion".into()),
-    }
 }
 
 fn run_step(

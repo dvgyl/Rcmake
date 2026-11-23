@@ -133,6 +133,10 @@ file(WRITE "${CMAKE_BINARY_DIR}/CPackConfig.cmake"
     let root = &fixture.root;
     for (args, expected) in [
         (
+            vec!["--list-presets=defined", "--presets-file=custom.json"],
+            "Defined configure presets:\n\n  \"cfg\"\n  \"disabled\"\n    Unavailable: condition evaluated to false: false\n",
+        ),
+        (
             vec!["--workflow", "--list-presets", "--presets-file=custom.json"],
             "Available workflow presets:\n\n  \"all\" - Build and package\n",
         ),

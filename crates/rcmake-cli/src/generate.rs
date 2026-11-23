@@ -455,6 +455,12 @@ cmake_instrumentation(API_VERSION 1 DATA_VERSION 1.2
                 host.write_out(Stream::Stdout, hook);
             } else {
                 assert_eq!(command.program, "ninja");
+                if command.args.iter().any(|arg| arg == "interrupted") {
+                    return Ok(RunOutput {
+                        results: vec![ProcessResult::Signaled(2)],
+                        ..RunOutput::default()
+                    });
+                }
             }
             Ok(RunOutput {
                 results: vec![ProcessResult::Exited(0)],
@@ -489,6 +495,37 @@ cmake_instrumentation(API_VERSION 1 DATA_VERSION 1.2
         ] {
             assert!(stdout.contains(hook));
         }
+
+        assert!(stdout.contains("-- Build files have been written to: /work/out\npostGenerate"));
+
+        let interrupted = ["cmake", "--build", "out", "--target", "interrupted"].map(BString::from);
+        assert_eq!(crate::run(&interrupted, host.clone()), 130);
+        let after_interrupt = host.stream_bytes(Stream::Stdout).to_string();
+        assert_eq!(after_interrupt.strip_prefix(&stdout), Some("preCMakeBuild"));
+        let snippet = host
+            .read_dir(&data)
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.name.starts_with(b"cmakeBuild-"))
+            .unwrap();
+        let snippet = host
+            .read(
+                &data.join(path::to_native(&snippet.name)),
+                ReadRange::All { limit: 65536 },
+            )
+            .unwrap();
+        let snippet = rcmake_json::parse(&snippet, &rcmake_json::ReadOptions::default()).unwrap();
+        let rcmake_json::Value::Object(fields) = snippet else {
+            panic!("Expected a snippet object.");
+        };
+        assert_eq!(
+            fields.get(b"result".as_slice()),
+            Some(&rcmake_json::Value::Null)
+        );
+        assert_eq!(
+            fields.get(b"interruptSignal".as_slice()),
+            Some(&rcmake_json::Value::Int(2))
+        );
 
         host.seed_file(source, project).unwrap();
         configure();

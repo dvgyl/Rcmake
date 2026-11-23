@@ -9,7 +9,8 @@ use rcmake_model::GeneratorKind;
 use rcmake_presets::{BuildSettings, PresetKind, PresetSettings};
 
 use crate::options::{split_flag, take_value, unknown_mode_option};
-use crate::{cache, presets, resolve_cli_path};
+use crate::presets::{self, Listing};
+use crate::{CommandExit, cache, resolve_cli_path};
 
 const USAGE: &str = "Usage: cmake --build <dir>             [options] [-- [native-options]]
        cmake --build --preset <preset> [options] [-- [native-options]]
@@ -60,7 +61,7 @@ struct Options {
     dir: Option<PathBuf>,
     preset: Option<BString>,
     presets_file: Option<PathBuf>,
-    list_presets: bool,
+    list_presets: Option<Listing>,
     jobs: Option<Jobs>,
     targets: Vec<BString>,
     config: Option<BString>,
@@ -169,8 +170,12 @@ fn parse(host: &dyn Host, args: &[BString]) -> Result<Options, String> {
         match flag {
             b"--preset" => opts.preset = Some(required()?.into()),
             b"--presets-file" => opts.presets_file = Some(resolve_cli_path(host, required()?)),
-            b"--list-presets" if matches!(inline, None | Some(b"defined")) => {
-                opts.list_presets = true
+            b"--list-presets" => {
+                let value = inline.or_else(|| take_value(&mut args));
+                opts.list_presets = Some(
+                    Listing::for_kind(PresetKind::Build, value)
+                        .map_err(|err| format!("CMake Error: {err}"))?,
+                );
             }
             b"--config" => opts.config = Some(required()?.into()),
             b"--target" | b"-t" => {
@@ -230,12 +235,12 @@ pub(crate) fn run(argv: &[BString], args: &[BString], host: &dyn Host) -> i32 {
         Ok(opts) => opts,
         Err(message) => return usage(host, &message),
     };
-    if opts.list_presets {
+    if let Some(listing) = opts.list_presets {
         return presets::list(
             host,
             &host.initial_cwd(),
             opts.presets_file.as_deref(),
-            b"build",
+            listing,
         );
     }
 
@@ -293,12 +298,17 @@ pub(crate) fn run(argv: &[BString], args: &[BString], host: &dyn Host) -> i32 {
     )
 }
 
-fn error(host: &dyn Host, message: &str) -> i32 {
+fn error(host: &dyn Host, message: &str) -> CommandExit {
     host.write_out(Stream::Stderr, format!("Error: {message}\n").as_bytes());
-    1
+    CommandExit::Code(1)
 }
 
-fn dispatch(host: &dyn Host, dir: &Path, opts: &Options, env: Vec<(BString, BString)>) -> i32 {
+fn dispatch(
+    host: &dyn Host,
+    dir: &Path,
+    opts: &Options,
+    env: Vec<(BString, BString)>,
+) -> CommandExit {
     if !host
         .metadata(dir, Follow::Yes)
         .is_ok_and(|meta| meta.kind == FileKind::Dir)
@@ -369,20 +379,20 @@ fn dispatch(host: &dyn Host, dir: &Path, opts: &Options, env: Vec<(BString, BStr
     };
     let clean = [BString::from("clean")];
     if opts.clean_first && opts.targets.as_slice() != clean {
-        let code = run_native(host, &request(&clean));
-        if code != 0 {
-            return code;
+        let exit = run_native(host, &request(&clean));
+        if exit.code() != 0 {
+            return exit;
         }
     }
     run_native(host, &request(&opts.targets))
 }
 
-fn run_native(host: &dyn Host, request: &RunRequest) -> i32 {
+fn run_native(host: &dyn Host, request: &RunRequest) -> CommandExit {
     let result = host.run(request, &mut |stream, bytes| host.write_out(stream, bytes));
     match result {
         Ok(output) => match output.results.first() {
-            Some(ProcessResult::Exited(code)) => *code,
-            Some(ProcessResult::Signaled(signal)) => 128 + signal,
+            Some(ProcessResult::Exited(code)) => CommandExit::Code(*code),
+            Some(ProcessResult::Signaled(signal)) => CommandExit::Signal(*signal),
             Some(ProcessResult::SpawnFailed(err)) => error(host, &err.to_string()),
             _ => error(host, "build command did not complete"),
         },

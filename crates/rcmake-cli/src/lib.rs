@@ -33,8 +33,11 @@ use rcmake_diag::{
     RenderOptions, render,
 };
 use rcmake_eval::{CacheDefine, Interp, InterpConfig, RunMode};
-use rcmake_host::{Host, Stream, WriteMode, path};
-use rcmake_instrument::{Hook, InstrumentError, Snippet, SnippetRole, hooks, query, snippet};
+use rcmake_host::{FileKind, Host, HostError, Stream, WriteMode, path};
+use rcmake_instrument::{
+    Hook, InstrumentError, InstrumentOption, Query, Snippet, SnippetRole, hooks, query,
+    snippet::{self, SnippetDetails, SystemSample},
+};
 use rcmake_json::Value;
 use rcmake_model::CacheType;
 
@@ -111,9 +114,36 @@ pub fn run(argv: &[BString], host: Arc<dyn Host>) -> i32 {
 
     match tool {
         Tool::Cmake => run_cmake(argv, rest, host),
-        Tool::Ctest => rcmake_ctest::main(argv, host),
-        Tool::Cpack => rcmake_cpack::main(argv, host),
+        Tool::Ctest => {
+            presets::list_for_tool(host.as_ref(), rcmake_presets::PresetKind::Test, rest)
+                .unwrap_or_else(|| run_ctest(argv, rest, host))
+        }
+        Tool::Cpack => {
+            presets::list_for_tool(host.as_ref(), rcmake_presets::PresetKind::Package, rest)
+                .unwrap_or_else(|| rcmake_cpack::main(argv, host))
+        }
     }
+}
+
+fn run_ctest(argv: &[BString], args: &[BString], host: Arc<dyn Host>) -> i32 {
+    // CTest ignores positional arguments before its options.
+    let first_option = args
+        .iter()
+        .position(|arg| {
+            let (flag, _) = options::split_flag(arg, b'=');
+            flag.starts_with(b"-") || matches!(flag, b"/?" | b"/V" | b"/version")
+        })
+        .unwrap_or(args.len());
+    if first_option == 0 {
+        return rcmake_ctest::main(argv, host);
+    }
+    let argv = argv
+        .iter()
+        .take(1)
+        .chain(args.iter().skip(first_option))
+        .cloned()
+        .collect::<Vec<_>>();
+    rcmake_ctest::main(&argv, host)
 }
 
 fn run_version_format(tool: Tool, fmt: &[u8], host: &dyn Host) -> i32 {
@@ -225,13 +255,29 @@ fn run_cmake(argv: &[BString], rest: &[BString], host: Arc<dyn Host>) -> i32 {
     configure::run(argv, opts, host)
 }
 
+enum CommandExit {
+    Code(i32),
+    Signal(i32),
+}
+
+impl CommandExit {
+    fn code(&self) -> i32 {
+        match *self {
+            Self::Code(code) => code,
+            Self::Signal(signal) => 128_i32.saturating_add(signal),
+        }
+    }
+}
+
 struct InstrumentationStep {
     start: Duration,
     time_start: u64,
+    before: Option<SystemSample>,
 }
 
 impl InstrumentationStep {
-    fn start(host: &dyn Host) -> Self {
+    fn start(host: &dyn Host, sample: bool) -> Self {
+        let before = sample.then(|| SystemSample::collect(host));
         let time = host.now();
         Self {
             start: host.monotonic(),
@@ -239,6 +285,7 @@ impl InstrumentationStep {
                 .unwrap_or_default()
                 .saturating_mul(1000)
                 .saturating_add(u64::from(time.nanos / 1_000_000)),
+            before,
         }
     }
 
@@ -248,19 +295,18 @@ impl InstrumentationStep {
         build_dir: &Path,
         argv: &[BString],
         role: SnippetRole,
-        exit_code: i32,
+        exit: &CommandExit,
     ) -> Result<(), InstrumentError> {
         let duration = host.monotonic().saturating_sub(self.start);
-        let command = argv
-            .iter()
-            .map(|arg| arg.as_slice())
-            .collect::<Vec<_>>()
-            .join(b" ".as_slice());
+        let (result, interrupt_signal) = match *exit {
+            CommandExit::Code(code) => (Some(i64::from(code)), None),
+            CommandExit::Signal(signal) => (None, Some(signal)),
+        };
         let snippet = Snippet {
             role,
-            command: command.into(),
+            command: instrumentation_command(argv),
             working_dir: path::from_native(&host.initial_cwd()),
-            result: Some(i64::from(exit_code)),
+            result,
             time_start: self.time_start,
             duration: u64::try_from(duration.as_millis()).unwrap_or(u64::MAX),
             target: None,
@@ -272,13 +318,81 @@ impl InstrumentationStep {
             stdout: None,
             stderr: None,
         };
-        snippet::write_snippet(
-            host,
-            &build_dir.join(".cmake/instrumentation/v1/data"),
-            &snippet,
-        )?;
+        let data = build_dir.join(".cmake/instrumentation/v1/data");
+        if self.before.is_none() && interrupt_signal.is_none() {
+            snippet::write_snippet(host, &data, &snippet)?;
+        } else {
+            let cmake_content = if role == SnippetRole::Configure {
+                None
+            } else {
+                instrumentation_content(host, &data)?
+            };
+            let details = SnippetDetails {
+                interrupt_signal,
+                dynamic: self
+                    .before
+                    .map(|before| (before, SystemSample::collect(host))),
+                cmake_content,
+                ..SnippetDetails::default()
+            };
+            snippet::write_snippet_with_details(host, &data, &snippet, &details)?;
+        }
         Ok(())
     }
+}
+
+fn instrumentation_command(argv: &[BString]) -> BString {
+    let mut command = BString::default();
+    for (index, arg) in argv.iter().enumerate() {
+        if index > 0 {
+            command.push(b' ');
+        }
+        let quote = arg.is_empty()
+            || arg
+                .iter()
+                .any(|byte| byte.is_ascii_whitespace() || matches!(byte, b'"' | b'\\'));
+        if quote {
+            command.push(b'"');
+        }
+        for &byte in arg.iter() {
+            if quote && matches!(byte, b'"' | b'\\') {
+                command.push(b'\\');
+            }
+            command.push(byte);
+        }
+        if quote {
+            command.push(b'"');
+        }
+    }
+    command
+}
+
+fn instrumentation_content(host: &dyn Host, data: &Path) -> Result<Option<BString>, HostError> {
+    let entries = match host.read_dir(&data.join("content")) {
+        Ok(entries) => entries,
+        Err(err) if err.kind == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err),
+    };
+    Ok(entries
+        .into_iter()
+        .filter(|entry| matches!(entry.kind, FileKind::File | FileKind::Symlink))
+        .filter_map(|entry| {
+            (entry.name.starts_with(b"cmake-") && entry.name.ends_with(b".json"))
+                .then_some(entry.name)
+        })
+        .max_by(|left, right| {
+            left.strip_suffix(b".json")
+                .cmp(&right.strip_suffix(b".json"))
+        })
+        .map(|name| path::from_native(&Path::new("content").join(path::to_native(&name)))))
+}
+
+fn sample_instrumentation(queries: &[Query]) -> bool {
+    queries.iter().any(|query| {
+        query
+            .options
+            .contains(&InstrumentOption::DynamicSystemInformation)
+    })
 }
 
 fn instrument_lifecycle(
@@ -287,7 +401,7 @@ fn instrument_lifecycle(
     argv: &[BString],
     role: SnippetRole,
     post_hook: Hook,
-    run: impl FnOnce() -> i32,
+    run: impl FnOnce() -> CommandExit,
 ) -> i32 {
     let queries = match query::read_queries(host, build_dir) {
         Ok(queries) => queries,
@@ -297,7 +411,7 @@ fn instrument_lifecycle(
         }
     };
     if queries.is_empty() {
-        return run();
+        return run().code();
     }
     if role == SnippetRole::CMakeBuild
         && let Err(err) = hooks::run_hook(host, build_dir, Hook::PreCMakeBuild)
@@ -305,11 +419,17 @@ fn instrument_lifecycle(
         emit_cli_error(host, err.to_string());
         return 1;
     }
-    let step = InstrumentationStep::start(host);
-    let code = run();
+    let step = InstrumentationStep::start(host, sample_instrumentation(&queries));
+    let exit = run();
+    let code = exit.code();
     if let Err(err) = step
-        .record(host, build_dir, argv, role, code)
-        .and_then(|()| hooks::run_hook(host, build_dir, post_hook))
+        .record(host, build_dir, argv, role, &exit)
+        .and_then(|()| {
+            if matches!(exit, CommandExit::Signal(_)) {
+                return Ok(());
+            }
+            hooks::run_hook(host, build_dir, post_hook)
+        })
     {
         emit_cli_error(host, err.to_string());
         return if code == 0 { 1 } else { code };

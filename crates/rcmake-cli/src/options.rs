@@ -6,6 +6,7 @@ use rcmake_eval::{CacheDefine, LogLevel, TraceConfig, TraceFormat};
 use rcmake_host::{Host, Stream, WriteMode};
 use rcmake_model::CacheType;
 
+use crate::presets::Listing;
 use crate::{apply_warning_flag, parse_define, resolve_cli_path};
 
 pub(crate) enum CacheEdit {
@@ -35,7 +36,7 @@ pub(crate) struct Options {
     pub script: Option<PathBuf>,
     pub preset: Option<BString>,
     pub presets_file: Option<PathBuf>,
-    pub list_presets: Option<BString>,
+    pub list_presets: Option<Listing>,
     pub view: bool,
     pub fresh: bool,
     pub list_cache: Option<ListCache>,
@@ -160,17 +161,15 @@ fn parse_args(args: &[BString], host: &dyn Host) -> Result<Option<Options>, Stri
                     ));
                 }
                 b"--list-presets" => {
-                    let value = inline.unwrap_or(b"configure");
-                    if !matches!(
-                        value,
-                        b"configure" | b"build" | b"test" | b"package" | b"workflow" | b"all"
-                    ) {
-                        if value.starts_with(b"-") {
-                            return Err(unknown_option(value));
-                        }
-                        return Err("Invalid value specified for --list-presets.\nValid values are configure, build, test, package, workflow, all, defined, or any of the type values suffixed with -defined. When no value is passed the default is configure.".into());
+                    let mode = inline.or_else(|| take_value(&mut iter));
+                    if let Some(value) = mode.filter(|value| value.starts_with(b"-")) {
+                        return Err(unknown_option(value));
                     }
-                    opts.list_presets = Some(value.into());
+                    if mode == Some(b"") {
+                        crate::emit_cli_error(host, "Invalid value used with --list-presets");
+                        return Err(String::new());
+                    }
+                    opts.list_presets = Some(Listing::parse(mode)?);
                 }
                 b"--fresh" => opts.fresh = true,
                 b"--log-context" => opts.log_context = true,
@@ -417,7 +416,11 @@ fn parse_args(args: &[BString], host: &dyn Host) -> Result<Option<Options>, Stri
                         });
                     }
                     b"-C" => {
-                        let path = value(&mut iter).ok_or("-C must be followed by a file name.")?;
+                        let path = if tail.is_empty() {
+                            take_value(&mut iter).ok_or("-C must be followed by a file name.")?
+                        } else {
+                            tail.strip_prefix(b"=").unwrap_or(tail).trim_ascii_start()
+                        };
                         if path.is_empty() {
                             return Err("No file name specified for -C".into());
                         }

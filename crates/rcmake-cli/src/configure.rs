@@ -18,6 +18,21 @@ const DIAG_INIT: &[u8] = b"CMAKE_DIAGNOSTIC_INIT";
 pub(crate) fn run(argv: &[BString], mut opts: Options, host: Arc<dyn Host>) -> i32 {
     let (mut src, mut bin) = resolve_directories(host.as_ref(), &opts.directories);
     let cwd = host.initial_cwd();
+    if let Some(listing) = opts.list_presets
+        && (src.is_some()
+            || bin.is_none()
+            || opts
+                .directories
+                .iter()
+                .any(|arg| matches!(arg, DirectoryArg::Binary(_))))
+    {
+        return presets::list(
+            host.as_ref(),
+            src.as_deref().unwrap_or(&cwd),
+            opts.presets_file.as_deref(),
+            listing,
+        );
+    }
     let cache_in = bin.as_deref().unwrap_or(&cwd);
     let mut saved = match cache::load(host.as_ref(), cache_in) {
         Ok(entries) => entries,
@@ -37,7 +52,7 @@ pub(crate) fn run(argv: &[BString], mut opts: Options, host: Arc<dyn Host>) -> i
     let had_bin = bin.is_some();
     let src = src.unwrap_or_else(|| cwd.clone());
 
-    if let Some(mode) = &opts.list_presets {
+    if let Some(mode) = opts.list_presets {
         return presets::list(host.as_ref(), &src, opts.presets_file.as_deref(), mode);
     }
     let mut preset = presets::Application::default();
@@ -252,19 +267,24 @@ pub(crate) fn run(argv: &[BString], mut opts: Options, host: Arc<dyn Host>) -> i
     if let Err(err) = rcmake_instrument::query::clear_generated_queries(host.as_ref(), &bin) {
         return error(host.as_ref(), err.to_string());
     }
-    let configure_step = crate::InstrumentationStep::start(host.as_ref());
+    // Configure scripts can add a query that requests the initial sample.
+    let mut configure_step = crate::InstrumentationStep::start(host.as_ref(), true);
     let result = interp.run_configure(&src, &bin, &[]);
     let queries = match rcmake_instrument::query::read_queries(host.as_ref(), &bin) {
         Ok(queries) => queries,
         Err(err) => return error(host.as_ref(), err.to_string()),
     };
+    let sample = crate::sample_instrumentation(&queries);
+    if !sample {
+        configure_step.before = None;
+    }
     if !queries.is_empty()
         && let Err(err) = configure_step.record(
             host.as_ref(),
             &bin,
             argv,
             rcmake_instrument::SnippetRole::Configure,
-            result.exit_code,
+            &crate::CommandExit::Code(result.exit_code),
         )
     {
         return error(host.as_ref(), err.to_string());
@@ -317,7 +337,7 @@ pub(crate) fn run(argv: &[BString], mut opts: Options, host: Arc<dyn Host>) -> i
         return 1;
     }
     let start = host.monotonic();
-    let generate_step = crate::InstrumentationStep::start(host.as_ref());
+    let generate_step = crate::InstrumentationStep::start(host.as_ref(), sample);
     let generated = match crate::generate::run(&mut interp, host.as_ref(), &bin, &queries) {
         Ok(generated) => generated,
         Err(err) => return error(host.as_ref(), format!("{err}\nCMake Generate step failed.")),
@@ -330,7 +350,7 @@ pub(crate) fn run(argv: &[BString], mut opts: Options, host: Arc<dyn Host>) -> i
             &bin,
             argv,
             rcmake_instrument::SnippetRole::Generate,
-            0,
+            &crate::CommandExit::Code(0),
         )
     {
         return error(host.as_ref(), err.to_string());
@@ -339,6 +359,16 @@ pub(crate) fn run(argv: &[BString], mut opts: Options, host: Arc<dyn Host>) -> i
         return error(
             host.as_ref(),
             format!("Could not write CMakeCache.txt: {err}"),
+        );
+    }
+    if generated && show_status {
+        options::out(
+            host.as_ref(),
+            &format!(
+                "-- Generating done ({:.1}s)\n-- Build files have been written to: {}\n",
+                elapsed.as_secs_f64(),
+                bin.display(),
+            ),
         );
     }
     if generated
@@ -350,16 +380,6 @@ pub(crate) fn run(argv: &[BString], mut opts: Options, host: Arc<dyn Host>) -> i
         )
     {
         return error(host.as_ref(), err.to_string());
-    }
-    if generated && show_status {
-        options::out(
-            host.as_ref(),
-            &format!(
-                "-- Generating done ({:.1}s)\n-- Build files have been written to: {}\n",
-                elapsed.as_secs_f64(),
-                bin.display(),
-            ),
-        );
     }
     0
 }

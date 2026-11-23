@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use rcmake_base::BString;
 use rcmake_eval::{CacheDefine, LogLevel, TraceConfig, TraceFormat as EvalTraceFormat};
-use rcmake_host::{Host, WriteMode};
+use rcmake_host::{Host, Stream, WriteMode};
 use rcmake_model::CacheType;
 use rcmake_presets::{
     ConfigureSettings, EnvSnapshot, PresetKind, PresetSettings, Presets, ResolvedPreset, Strategy,
@@ -13,28 +13,95 @@ use rcmake_presets::{
 use crate::options::{self, CacheEdit, Options};
 use crate::{emit_cli_error, resolve_cli_path};
 
-const KINDS: [(PresetKind, &str); 5] = [
-    (PresetKind::Configure, "configure"),
-    (PresetKind::Build, "build"),
-    (PresetKind::Test, "test"),
-    (PresetKind::Package, "package"),
-    (PresetKind::Workflow, "workflow"),
+const KINDS: [PresetKind; 5] = [
+    PresetKind::Configure,
+    PresetKind::Build,
+    PresetKind::Test,
+    PresetKind::Package,
+    PresetKind::Workflow,
 ];
 
-fn load(host: &dyn Host, src: &Path, custom: Option<&Path>) -> Result<Presets, i32> {
+const INVALID_LIST_MODE: &str = "Invalid value specified for --list-presets.\nValid values are configure, build, test, package, workflow, all, defined, or any of the type values suffixed with -defined. When no value is passed the default is configure.";
+const EMPTY_LIST_MODE: &str = "Invalid value used with --list-presets";
+
+#[derive(Clone, Copy)]
+pub(crate) struct Listing {
+    kind: Option<PresetKind>,
+    defined: bool,
+}
+
+impl Listing {
+    pub(crate) fn available(kind: PresetKind) -> Self {
+        Self {
+            kind: Some(kind),
+            defined: false,
+        }
+    }
+
+    pub(crate) fn parse(value: Option<&[u8]>) -> Result<Self, &'static str> {
+        match value {
+            None => Ok(Self::available(PresetKind::Configure)),
+            Some(b"") => Err(EMPTY_LIST_MODE),
+            Some(b"defined") => Self::for_kind(PresetKind::Configure, value),
+            Some(value) => {
+                let suffix = value.strip_suffix(b"-defined");
+                let kind = match suffix.unwrap_or(value) {
+                    b"all" => None,
+                    label => Some(
+                        KINDS
+                            .into_iter()
+                            .find(|kind| kind.label().as_bytes() == label)
+                            .ok_or(INVALID_LIST_MODE)?,
+                    ),
+                };
+                Ok(Self {
+                    kind,
+                    defined: suffix.is_some(),
+                })
+            }
+        }
+    }
+
+    pub(crate) fn for_kind(kind: PresetKind, value: Option<&[u8]>) -> Result<Self, &'static str> {
+        let mut listing = Self::available(kind);
+        match value {
+            None => {}
+            Some(b"defined") => listing.defined = true,
+            Some(b"") => return Err(EMPTY_LIST_MODE),
+            Some(_) if kind == PresetKind::Workflow => {
+                return Err(
+                    "Invalid value specified for --list-presets.\nThe only supported value in workflow mode is \"defined\".",
+                );
+            }
+            Some(_) => {
+                return Err(
+                    "Invalid value specified for --list-presets.\nThe only supported value is \"defined\".",
+                );
+            }
+        }
+        Ok(listing)
+    }
+}
+
+pub(crate) fn load(host: &dyn Host, src: &Path, custom: Option<&Path>) -> Result<Presets, i32> {
+    read(host, src, custom).map_err(|message| {
+        emit_cli_error(host, message);
+        1
+    })
+}
+
+fn read(host: &dyn Host, src: &Path, custom: Option<&Path>) -> Result<Presets, String> {
     let result = if let Some(file) = custom {
         rcmake_presets::load_file(src, file, host).map_err(|err| err.message)
     } else {
         rcmake_presets::load(src, host).map_err(|err| err.message)
     };
     result.map_err(|err| {
-        let msg = if err.starts_with("Could not read presets from ") {
+        if err.starts_with("Could not read presets from ") {
             err
         } else {
             format!("Could not read presets from {}:\n{err}", src.display())
-        };
-        emit_cli_error(host, msg);
-        1
+        }
     })
 }
 
@@ -54,55 +121,202 @@ pub(crate) fn resolve_for_mode(
         })
 }
 
-pub(crate) fn list(host: &dyn Host, src: &Path, custom: Option<&Path>, mode: &[u8]) -> i32 {
+pub(crate) fn list(host: &dyn Host, src: &Path, custom: Option<&Path>, listing: Listing) -> i32 {
     let presets = match load(host, src, custom) {
         Ok(presets) => presets,
         Err(code) => return code,
     };
-    print_list(host, &presets, &EnvSnapshot::from_host(host), mode);
+    print_list(host, &presets, &EnvSnapshot::from_host(host), listing);
     0
 }
 
-fn print_list(host: &dyn Host, presets: &Presets, env: &EnvSnapshot, mode: &[u8]) {
+pub(crate) fn list_for_tool(host: &dyn Host, kind: PresetKind, args: &[BString]) -> Option<i32> {
+    if kind == PresetKind::Test && args.first().is_some_and(|arg| arg == "--instrument") {
+        return None;
+    }
+    let tokens = args
+        .iter()
+        .map(|arg| arg.as_slice())
+        .take_while(|arg| *arg != b"--");
+    if !tokens
+        .clone()
+        .any(|arg| options::split_flag(arg, b'=').0 == b"--list-presets")
+    {
+        return None;
+    }
+
+    let mut file = None;
+    let mut listing = Listing::available(kind);
+    let mut tokens = tokens.peekable();
+    while let Some(arg) = tokens.next() {
+        let (flag, inline) = options::split_flag(arg, b'=');
+        match flag {
+            _ if kind == PresetKind::Test
+                && (matches!(
+                    flag,
+                    b"-h"
+                        | b"-H"
+                        | b"--help"
+                        | b"-help"
+                        | b"-usage"
+                        | b"/?"
+                        | b"--version"
+                        | b"-version"
+                        | b"/V"
+                        | b"/version"
+                ) || flag.starts_with(b"--help-")) =>
+            {
+                return None;
+            }
+            b"--preset" | b"--presets-file" => {
+                let value = inline.or_else(|| options::take_value(&mut tokens));
+                if let Some(value) = value.filter(|value| !value.is_empty()) {
+                    if flag == b"--presets-file" {
+                        file = Some(resolve_cli_path(host, value));
+                    }
+                } else {
+                    let flag = String::from_utf8_lossy(flag);
+                    if kind == PresetKind::Test {
+                        emit_cli_error(host, format!("'{flag}' requires an argument"));
+                        return Some(1);
+                    }
+                    let label = if flag == "--preset" { "preset" } else { "file" };
+                    emit_cli_error(host, format!("No {label} specified for {flag}"));
+                }
+            }
+            b"--list-presets" => {
+                let value = inline.or_else(|| options::take_value(&mut tokens));
+                match Listing::for_kind(kind, value) {
+                    Ok(mode) => listing = mode,
+                    Err(message) => {
+                        emit_cli_error(host, message);
+                        return Some(1);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let cwd = host.initial_cwd();
+    match read(host, &cwd, file.as_deref()) {
+        Ok(presets) => {
+            print_list(host, &presets, &EnvSnapshot::from_host(host), listing);
+            Some(0)
+        }
+        Err(message) => {
+            let label = if kind == PresetKind::Package {
+                "CPack"
+            } else {
+                "CMake"
+            };
+            host.write_out(
+                Stream::Stderr,
+                format!("{label} Error: {message}\n").as_bytes(),
+            );
+            Some(1)
+        }
+    }
+}
+
+pub(crate) fn print_list(host: &dyn Host, presets: &Presets, env: &EnvSnapshot, listing: Listing) {
     let mut output = String::new();
-    for (kind, label) in KINDS {
-        if mode != b"all" && mode != label.as_bytes() {
+    for kind in KINDS {
+        if listing.kind.is_some_and(|selected| selected != kind) {
             continue;
         }
-        let mut entries = presets.list_visible(kind, env);
-        if kind == PresetKind::Configure {
-            entries.retain(|item| {
-                presets
-                    .resolve(kind, &item.name, env)
-                    .is_ok_and(|resolved| {
-                        resolved
-                            .generator
-                            .is_none_or(|generator| options::is_generator(&generator))
-                    })
-            });
-        }
-        if entries.is_empty() {
+        let entries: Vec<_> = presets
+            .list_defined(kind)
+            .filter_map(|preset| {
+                let reason = unavailable(presets, env, kind, &preset.name);
+                (listing.defined || reason.is_none()).then_some((preset, reason))
+            })
+            .collect();
+        let Some(width) = entries.iter().map(|(preset, _)| preset.name.len()).max() else {
             continue;
-        }
+        };
         if !output.is_empty() {
             output.push('\n');
         }
-        output.push_str(&format!("Available {label} presets:\n\n"));
-        let width = entries
-            .iter()
-            .map(|entry| entry.name.len())
-            .max()
-            .unwrap_or(0);
-        for item in entries {
-            if let Some(display) = item.display_name {
-                let pad = width.saturating_sub(item.name.len()) + 1;
-                output.push_str(&format!("  \"{}\"{:pad$}- {display}\n", item.name, ""));
-            } else {
-                output.push_str(&format!("  \"{}\"\n", item.name));
+        let heading = if listing.defined {
+            "Defined"
+        } else {
+            "Available"
+        };
+        output.push_str(&format!("{heading} {} presets:\n\n", kind.label()));
+        for (index, (preset, reason)) in entries.iter().enumerate() {
+            let name = &preset.name;
+            output.push_str(&format!("  \"{name}\""));
+            if let Some(display) = preset.display_name.as_ref().filter(|name| !name.is_empty()) {
+                let pad = width - name.len() + 1;
+                output.push_str(&format!("{:pad$}- {display}", ""));
+            }
+            output.push('\n');
+            if let Some(reason) = reason {
+                output.push_str(&format!("    Unavailable: {reason}\n"));
+                if index + 1 < entries.len() {
+                    output.push('\n');
+                }
             }
         }
     }
     options::out(host, &output);
+}
+
+fn unavailable(
+    presets: &Presets,
+    env: &EnvSnapshot,
+    kind: PresetKind,
+    name: &[u8],
+) -> Option<String> {
+    let resolved = match presets.resolve_definition(kind, name, env) {
+        Ok(preset) => preset,
+        Err(err) if err.message.starts_with("Cannot use hidden ") => return Some("hidden".into()),
+        Err(err) if err.message.starts_with("Cannot use disabled ") => {
+            let condition = presets.preset_condition(kind, name);
+            return Some(condition.map_or_else(
+                || "condition evaluated to false".into(),
+                |condition| {
+                    format!(
+                        "condition evaluated to false: {}",
+                        rcmake_json::write_compact(condition)
+                    )
+                },
+            ));
+        }
+        Err(_) => return Some("unsupported macro expansion".into()),
+    };
+    if let Some(configure) = resolved.configure_preset
+        && let Some(reason) = unavailable(presets, env, PresetKind::Configure, &configure)
+    {
+        return Some(format!("configure preset \"{configure}\": {reason}"));
+    }
+    match resolved.settings {
+        PresetSettings::Configure(_) => resolved
+            .generator
+            .filter(|generator| !options::is_generator(generator))
+            .map(|generator| format!("generator \"{generator}\" is not available")),
+        PresetSettings::Package(settings) => settings
+            .generators
+            .is_some_and(|names| {
+                names
+                    .iter()
+                    .any(|name| rcmake_cpack::generators::create(name).is_none())
+            })
+            .then(|| "one or more package generators are not available".into()),
+        PresetSettings::Workflow(workflow) => {
+            workflow.steps.iter().enumerate().find_map(|(index, step)| {
+                let reason = unavailable(presets, env, step.kind, &step.name)?;
+                Some(format!(
+                    "step {}: {} preset \"{}\": {reason}",
+                    index + 1,
+                    step.kind.label(),
+                    step.name,
+                ))
+            })
+        }
+        _ => None,
+    }
 }
 
 #[derive(Default)]
@@ -134,7 +348,12 @@ pub(crate) fn apply(host: &dyn Host, src: &Path, opts: &mut Options) -> Result<A
             };
             if let Some(reason) = reason {
                 emit_cli_error(host, format!("{reason} in {}: \"{name}\"", src.display()));
-                print_list(host, &presets, &env, b"configure");
+                print_list(
+                    host,
+                    &presets,
+                    &env,
+                    Listing::available(PresetKind::Configure),
+                );
             } else if err.message.contains("unsupported vendor macro") {
                 emit_cli_error(
                     host,

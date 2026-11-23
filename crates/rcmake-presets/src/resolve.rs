@@ -27,6 +27,16 @@ impl Presets {
             })
     }
 
+    /// List presets in declaration order, excluding hidden presets.
+    pub fn list_defined(&self, kind: PresetKind) -> impl Iterator<Item = &PresetSummary> {
+        self.records
+            .get(&kind)
+            .into_iter()
+            .flat_map(|records| records.values())
+            .filter(|record| !record.hidden)
+            .map(|record| &record.summary)
+    }
+
     /// Get the JSON condition of a preset, including a condition it inherits.
     #[must_use]
     pub fn preset_condition(&self, kind: PresetKind, name: &[u8]) -> Option<&rcmake_json::Value> {
@@ -68,6 +78,29 @@ impl Presets {
         name: &[u8],
         env: &EnvSnapshot,
     ) -> Result<ResolvedPreset, PresetsError> {
+        let mut result = self.resolve_definition(kind, name, env)?;
+        if let Some(associated) = &result.configure_preset {
+            result.binary_dir = self
+                .resolve(PresetKind::Configure, associated.as_slice(), env)?
+                .binary_dir;
+        }
+        if let PresetSettings::Workflow(workflow) = &result.settings {
+            for step in &workflow.steps {
+                self.resolve(step.kind, step.name.as_slice(), env)?;
+            }
+        }
+        Ok(result)
+    }
+
+    /// Resolve the fields and condition of one preset.
+    ///
+    /// The caller checks the availability of its configure preset or workflow steps.
+    pub fn resolve_definition(
+        &self,
+        kind: PresetKind,
+        name: &[u8],
+        env: &EnvSnapshot,
+    ) -> Result<ResolvedPreset, PresetsError> {
         let record = self.get(kind, name).ok_or_else(|| {
             PresetsError::new(format!(
                 "No such {} preset in {}: \"{}\"",
@@ -84,7 +117,7 @@ impl Presets {
                 record.summary.name
             )));
         }
-        let (mut result, enabled) = self.expand_record(record, env).map_err(|error| {
+        let (result, enabled) = self.expand_record(record, env).map_err(|error| {
             if expand::is_vendor_error(&error) {
                 PresetsError::new(format!(
                     "Could not evaluate {} preset \"{}\": Invalid macro expansion",
@@ -102,16 +135,6 @@ impl Presets {
                 self.source_dir.display(),
                 record.summary.name
             )));
-        }
-        if let Some(associated) = &result.configure_preset {
-            result.binary_dir = self
-                .resolve(PresetKind::Configure, associated.as_slice(), env)?
-                .binary_dir;
-        }
-        if let PresetSettings::Workflow(workflow) = &result.settings {
-            for step in &workflow.steps {
-                self.resolve(step.kind, step.name.as_slice(), env)?;
-            }
         }
         Ok(result)
     }

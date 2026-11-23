@@ -171,7 +171,7 @@ pub(crate) fn run(argv: &[BString], args: &[BString], host: Arc<dyn Host>) -> i3
         argv,
         rcmake_instrument::SnippetRole::CMakeInstall,
         rcmake_instrument::Hook::PostCMakeInstall,
-        || install(argv, opts, Arc::clone(&host)),
+        || crate::CommandExit::Code(install(argv, opts, Arc::clone(&host))),
     )
 }
 
