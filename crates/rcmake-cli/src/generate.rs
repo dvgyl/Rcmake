@@ -176,7 +176,10 @@ fn write_common(
     } else {
         configuration.as_slice()
     };
-    let (manifest, export_files) = write_exports(result, bin, prefix, host)?;
+    let (mut manifest, export_files) = write_exports(result, bin, prefix, host)?;
+    let supplementary =
+        common::write_supplementary_outputs(interp.cx().project(), result, host, bin)?;
+    manifest.actions.extend(supplementary.actions);
     write(
         host,
         &bin.join("cmake_install.cmake"),
@@ -233,7 +236,7 @@ fn write_common(
             write(
                 host,
                 &test_file,
-                common::ctest_file::render_resolved(model, id, result),
+                common::ctest_file::render_resolved_with_host(model, id, result, host),
             )?;
         }
     }

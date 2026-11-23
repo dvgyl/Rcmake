@@ -591,9 +591,11 @@ dependencies = [
 name = "rcmake-gen-common"
 version = "0.1.0"
 dependencies = [
+ "jiff",
  "rcmake-base",
  "rcmake-cps",
  "rcmake-diag",
+ "rcmake-genex",
  "rcmake-host",
  "rcmake-json",
  "rcmake-model",
