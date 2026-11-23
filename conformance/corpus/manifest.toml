@@ -1,0 +1,158 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+# The licence field identifies the upstream project licence.
+# The evaluator downloads the archives into the local cache for tests.
+
+[[project]]
+name = "zlib"
+tier = 1
+version = "1.3.1"
+url = "https://zlib.net/fossils/zlib-1.3.1.tar.gz"
+sha256 = "9a93b2b7dfdac77ceba5a558a580e74667dd6fede4585b91eefb60f03b72df23"
+licence = "Zlib"
+configure_args = ["-DZLIB_BUILD_EXAMPLES=ON"]
+test_enabled = true
+notes = "The example programs are the upstream CTest tests. The configure step can rename zconf.h in the source tree."
+
+[[project]]
+name = "fmt"
+tier = 1
+version = "11.2.0"
+url = "https://codeload.github.com/fmtlib/fmt/tar.gz/refs/tags/11.2.0"
+sha256 = "bc23066d87ab3168f27cef3e97d545fa63314f5c79df5ea444d41d56f962c6af"
+licence = "MIT with an optional exception for compiled object code"
+configure_args = [
+    "-DCMAKE_BUILD_TYPE=Debug",
+    "-DFMT_DOC=OFF",
+    "-DFMT_INSTALL=ON",
+    "-DFMT_TEST=ON",
+]
+test_enabled = true
+notes = "Build and install the Debug library and run the upstream tests within the evaluator's build timeout."
+
+[[project]]
+name = "nlohmann/json"
+tier = 1
+version = "3.12.0"
+url = "https://codeload.github.com/nlohmann/json/tar.gz/refs/tags/v3.12.0"
+sha256 = "4b92eb0c06d10683f7447ce9406cb97cd4b453be18d7279320f7b2f025c10187"
+licence = "MIT"
+configure_args = [
+    "-DJSON_BuildTests=ON",
+    "-DJSON_Install=ON",
+    "-DJSON_FastTests=ON",
+    "-DJSON_TestStandards=11",
+    "-DJSON_32bitTest=OFF",
+]
+test_enabled = true
+git_snapshot = true
+notes = "Run the upstream C++11 test profile. The FetchContent tests clone the local source snapshot. The evaluator supplies the pinned test data."
+
+[project.test_dependency]
+version = "3.1.0"
+url = "https://codeload.github.com/nlohmann/json_test_data/tar.gz/refs/tags/v3.1.0"
+sha256 = "884b1e21f38cfd6a62c159f1b7e0a8f5168ae5daaa384ed4dc0c0fa6660f21bd"
+configure_variable = "JSON_TestDataDirectory"
+
+[[project]]
+name = "cJSON"
+tier = 1
+version = "1.7.18"
+url = "https://codeload.github.com/DaveGamble/cJSON/tar.gz/refs/tags/v1.7.18"
+sha256 = "3aa806844a03442c00769b83e99970be70fbef03735ff898f4811dd03b9f5ee5"
+licence = "MIT"
+configure_args = ["-DCMAKE_POLICY_VERSION_MINIMUM=3.5", "-DENABLE_CJSON_TEST=ON"]
+test_enabled = true
+notes = "CMake 4.5.1 requires the policy override because this release requests CMake 3.0 compatibility."
+
+[[project]]
+name = "doctest"
+tier = 1
+version = "2.4.12"
+url = "https://codeload.github.com/doctest/doctest/tar.gz/refs/tags/v2.4.12"
+sha256 = "73381c7aa4dee704bd935609668cf41880ea7f19fa0504a200e13b74999c2d70"
+licence = "MIT"
+configure_args = [
+    "-DDOCTEST_WITH_TESTS=ON",
+    "-DDOCTEST_NO_INSTALL=OFF",
+    "-DCMAKE_CXX_FLAGS=-Wno-thread-safety-negative -Wno-poison-system-directories -Wno-nrvo -Wno-missing-noreturn -Wno-unknown-warning-option",
+]
+test_enabled = true
+notes = "Build the upstream examples and install the headers and default main library. Disable Clang warnings that this release treats as errors on macOS."
+
+[[project]]
+name = "Catch2"
+tier = 2
+version = "3.16.1"
+url = "https://codeload.github.com/catchorg/Catch2/tar.gz/refs/tags/v3.16.1"
+sha256 = "d16bd1b8b2364918bd472cb216394acb93bde6784890df0d91bccfb3f28d777d"
+licence = "BSL-1.0"
+configure_args = ["-DBUILD_TESTING=ON", "-DCATCH_DEVELOPMENT_BUILD=ON", "-DCATCH_ENABLE_WERROR=OFF"]
+test_enabled = true
+notes = "Enable the upstream SelfTest suite. Allow compiler warnings."
+
+[[project]]
+name = "libpng"
+tier = 2
+version = "1.6.50"
+url = "https://codeload.github.com/pnggroup/libpng/tar.gz/refs/tags/v1.6.50"
+sha256 = "71158e53cfdf2877bc99bcab33641d78df3f48e6e0daad030afe9cb8c031aa46"
+licence = "libpng-2.0"
+configure_args = ["-DPNG_TESTS=ON", "-DPNG_FRAMEWORK=OFF"]
+test_enabled = true
+notes = "The build uses the host zlib development library."
+
+[[project]]
+name = "spdlog"
+tier = 2
+version = "1.15.3"
+url = "https://codeload.github.com/gabime/spdlog/tar.gz/refs/tags/v1.15.3"
+sha256 = "15a04e69c222eb6c01094b5c7ff8a249b36bb22788d72519646fb85feb267e67"
+licence = "MIT"
+configure_args = [
+    "-DSPDLOG_BUILD_TESTS=ON",
+    "-DSPDLOG_BUILD_EXAMPLE=OFF",
+    "-DSPDLOG_INSTALL=ON",
+    "-DCMAKE_DISABLE_FIND_PACKAGE_Catch2=ON",
+]
+test_enabled = true
+notes = "The release includes fmt. The evaluator supplies the Catch2 release selected by the upstream test suite."
+
+[project.test_dependency]
+version = "3.5.0"
+url = "https://codeload.github.com/catchorg/Catch2/tar.gz/refs/tags/v3.5.0"
+sha256 = "f6d4f8d78a9b59ec72a81d49f58d18eb317372ac07f8d9432710a079e69fd66a"
+configure_variable = "FETCHCONTENT_SOURCE_DIR_CATCH2"
+
+[[project]]
+name = "sqlite"
+tier = 2
+version = "3.50.4"
+url = "https://www.sqlite.org/2025/sqlite-autoconf-3500400.tar.gz"
+sha256 = "a3db587a1b92ee5ddac2f66b3edb41b26f9c867275782d46c3a088977d6a5b18"
+licence = "Public domain"
+configure_args = []
+test_enabled = true
+notes = "The evaluator uses this CMake wrapper to build the upstream amalgamation and test an in-memory query."
+cmakelists = '''
+cmake_minimum_required(VERSION 3.15)
+project(sqlite LANGUAGES C)
+
+find_package(Threads REQUIRED)
+add_library(sqlite3 sqlite3.c)
+target_link_libraries(sqlite3 PRIVATE Threads::Threads ${CMAKE_DL_LIBS})
+
+add_executable(sqlite_shell shell.c)
+set_target_properties(sqlite_shell PROPERTIES OUTPUT_NAME sqlite3)
+target_link_libraries(sqlite_shell PRIVATE sqlite3)
+if(UNIX)
+    target_link_libraries(sqlite_shell PRIVATE m)
+endif()
+
+include(GNUInstallDirs)
+install(TARGETS sqlite3 sqlite_shell)
+install(FILES sqlite3.h sqlite3ext.h DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}")
+
+enable_testing()
+add_test(NAME query COMMAND sqlite_shell ":memory:" "SELECT 6 * 7;")
+set_tests_properties(query PROPERTIES PASS_REGULAR_EXPRESSION "42")
+'''
