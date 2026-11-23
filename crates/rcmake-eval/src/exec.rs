@@ -376,6 +376,7 @@ impl Interp {
         }
 
         let _ = self.read_list_file_impl(&lists_bytes, true);
+        self.snapshot_dir_vars(DirId::ROOT);
         if self.exit_code() != 0 && self.exit_override.is_none() {
             self.config.host.write_out(
                 Stream::Stdout,
@@ -504,6 +505,7 @@ impl Interp {
         self.define(b"CMAKE_CURRENT_BINARY_DIR", bin_abs);
 
         let _ = self.read_list_file_impl(&lists, true);
+        self.snapshot_dir_vars(id);
 
         self.dir_stack.pop();
         self.diags.pop_above(diag_base);
@@ -512,6 +514,20 @@ impl Interp {
         self.vars.pop();
         self.depth = self.depth.saturating_sub(1);
         Ok(id)
+    }
+
+    /// Capture all visible normal variable definitions onto `Directory::vars` before a
+    /// directory scope exits so generate-time resolution and lowering observe normal
+    /// compiler rules, flags, and platform variables.
+    fn snapshot_dir_vars(&mut self, id: DirId) {
+        let names = self.vars.visible_names();
+        let mut snap = indexmap::IndexMap::with_capacity(names.len());
+        for name in names {
+            if let Some(val) = self.vars.get(&name) {
+                snap.insert(name, val.clone());
+            }
+        }
+        self.project.dir_mut(id).vars = snap;
     }
 
     fn current_source_dir_bytes(&self) -> BString {

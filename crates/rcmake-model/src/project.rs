@@ -76,6 +76,16 @@ impl ProjectModel {
     // Directories.
     // ----------------------------------------------------------------------------------
 
+    /// Look up a variable definition as seen at the end of configuring `dir`:
+    /// normal variable snapshot first, else `CMakeCache.txt` value.
+    #[must_use]
+    pub fn definition(&self, dir: DirId, name: &[u8]) -> Option<&BString> {
+        self.dir(dir)
+            .vars
+            .get(name)
+            .or_else(|| self.cache.get(name).map(|e| &e.value))
+    }
+
     /// Directory `id`. An id from a different model resolves to the root directory.
     #[must_use]
     pub fn dir(&self, id: DirId) -> &Directory {

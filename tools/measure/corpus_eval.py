@@ -335,9 +335,9 @@ def main() -> int:
     parser.add_argument("--project", help="Project name, for example zlib or nlohmann/json.")
     parser.add_argument("--generator", choices=("Ninja", "Unix Makefiles"), default="Ninja")
     parser.add_argument("--oracle-only", action="store_true", help="Run only the pinned CMake oracle.")
-    parser.add_argument("--rcmake-bin", type=Path, default=ROOT / "target/debug/rcmake")
+    parser.add_argument("--rcmake-bin", type=Path, default=ROOT / "target/stage/bin/rcmake")
     parser.add_argument("--json", type=Path, metavar="PATH", help="Write the complete results as JSON.")
-    parser.add_argument("--timeout", type=int, default=300, help="Timeout in seconds for each command.")
+    parser.add_argument("--timeout", type=int, default=600, help="Timeout in seconds for each command.")
     args = parser.parse_args()
     if args.timeout < 1:
         parser.error("--timeout must be positive.")

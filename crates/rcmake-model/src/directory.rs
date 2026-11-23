@@ -41,4 +41,7 @@ pub struct Directory {
     pub local_targets: IndexMap<BString, TargetBinding>,
     /// Tests created in this directory (`TESTS`).
     pub tests: IndexMap<BString, TestId>,
+    /// Final visible normal variable snapshot captured when this directory finishes
+    /// configuring (used by generate-time resolution and lowering).
+    pub vars: IndexMap<BString, BString>,
 }

@@ -22,6 +22,8 @@ pub struct InstallOptions {
     pub exclude_from_all: bool,
     /// `RENAME`.
     pub rename: Option<BString>,
+    /// `INCLUDES DESTINATION` paths from `install(TARGETS ... INCLUDES DESTINATION ...)`.
+    pub includes_destination: Vec<BString>,
 }
 
 /// The `install()` signature of a rule.
