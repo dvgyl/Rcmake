@@ -5,10 +5,10 @@ use std::path::Path;
 use rcmake_base::BString;
 use rcmake_host::{Follow, Host, PureHost, ReadRange};
 use rcmake_resolve::{
-    BuildGraph, BuildStep, CustomStep, GraphTarget, Invocation, LinkKind, LinkStep,
+    ArtifactSet, BuildGraph, BuildStep, CustomStep, GraphTarget, Invocation, LinkKind, LinkStep,
 };
 
-use super::{GenerationResult, Ninja, generate_multi_config, generate_single_config};
+use super::{GenerationResult, Graph, Ninja, generate_multi_config, generate_single_config};
 
 fn read(host: &PureHost, file: &str) -> String {
     let bytes = host
@@ -167,6 +167,69 @@ fn continues_ninja_lines_and_keeps_escaped_values() {
         ninja.0,
         b"ninja_pipe = |\nbuild a$ b$:c$$$\nrest${ninja_pipe}here: phony\n  VAR = a$ b$:c$$$\nrest|here\n"
     );
+}
+
+#[test]
+fn link_byproducts_use_unique_paths_on_the_link_edge() -> Result<(), Box<dyn std::error::Error>> {
+    let input = BuildGraph {
+        steps: vec![
+            BuildStep::Link {
+                inputs: Vec::new(),
+                step: LinkStep {
+                    kind: LinkKind::SharedLibrary,
+                    language: "C".into(),
+                    fragments: Vec::new(),
+                    output: "libdemo.so.1".into(),
+                },
+                invocations: Vec::new(),
+            },
+            BuildStep::Custom(CustomStep {
+                outputs: vec!["check".into()],
+                depends: vec!["/work/build/libdemo.so".into()],
+                ..CustomStep::default()
+            }),
+        ],
+        targets: vec![GraphTarget {
+            name: "libdemo.so".into(),
+            steps: vec![0],
+            in_all: true,
+            ..GraphTarget::default()
+        }],
+        ..BuildGraph::default()
+    };
+
+    for soname in ["/work/build/libdemo.so.1", "/work/build/libdemo.so"] {
+        let artifacts = ArtifactSet {
+            file: Some("libdemo.so.1".into()),
+            soname_file: Some(soname.into()),
+            linker_file: Some("./libdemo.so".into()),
+            import_file: Some("/work/build/libdemo.lib".into()),
+            pdb_file: Some("debug/../libdemo.pdb".into()),
+            ..ArtifactSet::default()
+        };
+        let graph = Graph::new(
+            &input,
+            &[(b"libdemo.so".as_slice(), &artifacts)].into(),
+            Path::new("/work/build"),
+            Some(b"Debug"),
+        )?;
+        let mut ninja = Ninja::default();
+        graph.emit(&mut ninja);
+        graph.emit_entry_aliases(&mut ninja);
+        let manifest = String::from_utf8(ninja.0)?;
+        assert_eq!(
+            manifest,
+            concat!(
+                "build libdemo.so.1 | libdemo.so libdemo.lib libdemo.pdb: LINK_SHARED_LIBRARY\n",
+                "  COMMAND = $:\n",
+                "build check: phony libdemo.so\n",
+                "build libdemo.so$:Debug: phony libdemo.so.1 libdemo.so libdemo.lib libdemo.pdb\n",
+                "build all$:Debug: phony libdemo.so$:Debug\n",
+                "build all: phony all$:Debug\n"
+            )
+        );
+    }
+    Ok(())
 }
 
 #[test]

@@ -6,7 +6,7 @@ use std::path::Path;
 use rcmake_base::{BString, path_lex::Lexical};
 use rcmake_gen_common::GenError;
 use rcmake_host::path;
-use rcmake_resolve::{BuildGraph, BuildStep, Invocation, LinkKind};
+use rcmake_resolve::{ArtifactSet, BuildGraph, BuildStep, Invocation, LinkKind};
 
 use crate::generation_error;
 use crate::syntax::{Edge, Ninja, shell_word};
@@ -30,6 +30,7 @@ struct StepNodes {
 impl<'a> Graph<'a> {
     pub(crate) fn new(
         input: &'a BuildGraph,
+        artifacts: &HashMap<&[u8], &ArtifactSet>,
         build_dir: &'a Path,
         config: Option<&'a [u8]>,
     ) -> Result<Self, GenError> {
@@ -74,6 +75,10 @@ impl<'a> Graph<'a> {
                     }
                 }
             }
+            graph.steps.push(nodes);
+        }
+        graph.add_link_byproducts(artifacts);
+        for (index, nodes) in graph.steps.iter().enumerate() {
             for node in nodes.outputs.iter().chain(&nodes.byproducts) {
                 if node.is_empty()
                     || node == "all"
@@ -85,10 +90,38 @@ impl<'a> Graph<'a> {
                     ));
                 }
             }
-            graph.steps.push(nodes);
         }
         graph.connect_targets()?;
         Ok(graph)
+    }
+
+    fn add_link_byproducts(&mut self, artifacts: &HashMap<&[u8], &ArtifactSet>) {
+        for target in &self.input.targets {
+            let Some(artifacts) = artifacts.get(target.name.as_slice()) else {
+                continue;
+            };
+            let paths: Vec<_> = [
+                &artifacts.soname_file,
+                &artifacts.linker_file,
+                &artifacts.import_file,
+                &artifacts.pdb_file,
+            ]
+            .into_iter()
+            .filter_map(Option::as_ref)
+            .map(|path| self.node(path))
+            .collect();
+            for &index in &target.steps {
+                if matches!(self.input.steps.get(index), Some(BuildStep::Link { .. }))
+                    && let Some(nodes) = self.steps.get_mut(index)
+                {
+                    for path in &paths {
+                        if !nodes.outputs.contains(path) && !nodes.byproducts.contains(path) {
+                            nodes.byproducts.push(path.clone());
+                        }
+                    }
+                }
+            }
+        }
     }
 
     pub(crate) fn node(&self, value: &[u8]) -> BString {

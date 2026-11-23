@@ -12,8 +12,11 @@ use rcmake_host::{
     CommandSpec, Follow, Host, Input, NativeHost, Output, ProcessResult, ReadRange, RunOutput,
     RunRequest, WriteMode, path,
 };
+use rcmake_model::{
+    BT, DirId, GeneratorKind, LinkItem, ProjectModel, Target, TargetKind, TargetOrigin,
+};
 use rcmake_resolve::{
-    BuildGraph, BuildStep, GenerationResult, GraphTarget, Invocation, LinkKind, LinkStep,
+    BuildGraph, BuildStep, GenerationResult, GraphTarget, Invocation, LinkKind, LinkStep, resolve,
 };
 
 const LIB_SOURCE: &[u8] = b"#include \"value.h\"\nint answer(void) { return VALUE; }\n";
@@ -298,4 +301,139 @@ fn ninja_builds_the_requested_configuration_and_default() {
             .metadata(&build.join("Debug/app"), Follow::Yes)
             .is_ok()
     );
+}
+
+fn versioned_library_model(
+    project: &Project,
+    build: &Path,
+    generator: GeneratorKind,
+) -> Result<ProjectModel, Box<dyn std::error::Error>> {
+    let symlink = project.dir.join("symlink-library");
+    project.write(
+        "symlink-library",
+        b"#!/bin/sh\n\
+          set -eu\n\
+          test \"$1\" = -E\n\
+          test \"$2\" = cmake_symlink_library\n\
+          ln -sfn \"${3##*/}\" \"$4\"\n\
+          ln -sfn \"${4##*/}\" \"$5\"\n",
+    );
+    project.host.set_permissions(&symlink, 0o700)?;
+
+    let mut model = ProjectModel::default();
+    model.set_root_dirs(path::from_native(&project.dir), path::from_native(build));
+    model.generator = Some(generator);
+    let vars = &mut model.dir_mut(DirId::ROOT).vars;
+    vars.insert("CMAKE_C_COMPILER".into(), "cc".into());
+    vars.insert("CMAKE_COMMAND".into(), path::from_native(&symlink));
+    let target = |name: &str, kind, source: &str| {
+        let mut target = Target::new(
+            name.into(),
+            kind,
+            TargetOrigin::Normal,
+            DirId::ROOT,
+            Default::default(),
+            Default::default(),
+        );
+        target
+            .sources
+            .push(BT::new(source.into(), Default::default()));
+        target
+    };
+    let mut library = target("demo", TargetKind::SharedLibrary, "lib source$.c");
+    library.props.set("VERSION".into(), "1.2.3".into());
+    library.props.set("SOVERSION".into(), "1".into());
+    model.add_target(library)?;
+    let mut app = target("app", TargetKind::Executable, "main.c");
+    app.usage.link_libraries = Some(vec![LinkItem {
+        text: BT::new("demo".into(), Default::default()),
+        lookup_dir: DirId::ROOT,
+    }]);
+    model.add_target(app)?;
+    Ok(model)
+}
+
+#[test]
+fn ninja_links_and_rebuilds_a_versioned_shared_library() -> Result<(), Box<dyn std::error::Error>> {
+    let project = Project::new();
+    let [file, soname, linker] = if cfg!(target_os = "macos") {
+        ["libdemo.1.2.3.dylib", "libdemo.1.dylib", "libdemo.dylib"]
+    } else {
+        ["libdemo.so.1.2.3", "libdemo.so.1", "libdemo.so"]
+    };
+    let mut debug = BuildGraph::default().config;
+    debug.0 = "Debug".into();
+    let mut release = debug.clone();
+    release.0 = "Release".into();
+    let configs = [debug, release];
+
+    for generator in [GeneratorKind::Ninja, GeneratorKind::NinjaMultiConfig] {
+        let build = project.dir.join(generator.name());
+        let model = versioned_library_model(&project, &build, generator)?;
+        let (entries, prefix, all, clean): (&[&str], &str, &str, &str) = if generator.multi_config()
+        {
+            let result = resolve(&model, &project.host, &configs)?;
+            generate_multi_config(&result, &project.host, &build)?;
+            project.run(&build, "ninja", &["-j", "2"]);
+            assert_eq!(
+                project.run(&build, "./Debug/app", &[]).stdout,
+                b"answer=42\n"
+            );
+            (
+                &["-f", "build-Release.ninja"],
+                "Release/",
+                "all:Release",
+                "clean:Release",
+            )
+        } else {
+            let result = resolve(&model, &project.host, &[])?;
+            generate_single_config(&result, &project.host, &build)?;
+            (&[], "", "all", "clean")
+        };
+
+        let args = [entries, &["-j", "2", all]].concat();
+        let app = format!("./{prefix}app");
+        let output_dir = build.join(prefix);
+        project.run(&build, "ninja", &args);
+        assert_eq!(project.run(&build, &app, &[]).stdout, b"answer=42\n");
+        assert_eq!(
+            project.host.read_link(&output_dir.join(soname))?,
+            Path::new(file)
+        );
+        assert_eq!(
+            project.host.read_link(&output_dir.join(linker))?,
+            Path::new(soname)
+        );
+        assert_eq!(
+            project.run(&build, "ninja", &args).stdout,
+            b"ninja: no work to do.\n"
+        );
+
+        project.host.remove_file(&output_dir.join(linker))?;
+        project.run(&build, "ninja", &args);
+        assert_eq!(
+            project.host.read_link(&output_dir.join(linker))?,
+            Path::new(soname)
+        );
+        assert_eq!(project.run(&build, &app, &[]).stdout, b"answer=42\n");
+
+        project.run(&build, "ninja", &[entries, &[clean]].concat());
+        for output in [file, soname, linker, "app"] {
+            assert!(
+                project
+                    .host
+                    .metadata(&output_dir.join(output), Follow::No)
+                    .is_err()
+            );
+        }
+        if generator.multi_config() {
+            assert!(
+                project
+                    .host
+                    .metadata(&build.join("Debug").join(linker), Follow::Yes)
+                    .is_ok()
+            );
+        }
+    }
+    Ok(())
 }

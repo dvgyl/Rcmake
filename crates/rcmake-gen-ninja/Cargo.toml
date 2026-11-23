@@ -14,5 +14,8 @@ rcmake-gen-common.workspace = true
 rcmake-host.workspace = true
 rcmake-resolve.workspace = true
 
+[dev-dependencies]
+rcmake-model = { path = "../rcmake-model" }
+
 [lints]
 workspace = true

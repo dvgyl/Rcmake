@@ -5,13 +5,13 @@
 mod graph;
 mod syntax;
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 
 use rcmake_base::BString;
 use rcmake_gen_common::{GenError, write_if_changed};
 use rcmake_host::{Host, ReadRange, path};
-use rcmake_resolve::{BuildGraph, BuildStep, GenerationResult};
+use rcmake_resolve::{ArtifactSet, BuildGraph, BuildStep, GenerationResult};
 
 use graph::{Graph, qualified};
 use syntax::{Edge, Ninja, shell_word};
@@ -80,7 +80,7 @@ pub fn generate_single_config(
 ) -> Result<(), GenError> {
     let empty = BuildGraph::default();
     let input = result.graphs.first().unwrap_or(&empty);
-    let graph = Graph::new(input, build_dir, None)?;
+    let graph = Graph::new(input, &config_artifacts(result, input), build_dir, None)?;
     let programs = Programs::new(result, host, build_dir);
     let manifests = [BString::from("build.ninja"), RULES_PATH.into()];
     let mut ninja = Ninja::default();
@@ -145,7 +145,12 @@ pub fn generate_multi_config(
                 generation_error(build_dir, "A Ninja configuration has no build graph.")
             })?;
         configs.push((
-            Graph::new(input, build_dir, Some(name))?,
+            Graph::new(
+                input,
+                &config_artifacts(result, input),
+                build_dir,
+                Some(name),
+            )?,
             ConfigFiles::new(name),
         ));
     }
@@ -208,6 +213,18 @@ pub fn generate_multi_config(
         &programs,
         &rebuild,
     )
+}
+
+fn config_artifacts<'a>(
+    result: &'a GenerationResult,
+    input: &BuildGraph,
+) -> HashMap<&'a [u8], &'a ArtifactSet> {
+    result
+        .targets
+        .iter()
+        .filter(|target| target.config == input.config)
+        .map(|target| (target.metadata.name.as_slice(), &target.artifacts))
+        .collect()
 }
 
 struct ConfigFiles {
