@@ -2,6 +2,7 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use rcmake_base::{BString, ByteSlice as _, list, list_ops, truth, version};
+use rcmake_cps::{CpsPackage, naming};
 use rcmake_diag::{DiagCategory, Effect, MessageKind, PolicyId, PolicyStatus};
 use rcmake_eval::{CmdError, CmdResult, Cx, Flow, IncludeOptions};
 use rcmake_expr::ExpandedArg;
@@ -9,7 +10,7 @@ use rcmake_host::{FileKind, Follow, path};
 use rcmake_model::{CacheEntry, CacheType};
 use rcmake_syntax::ArgKind;
 
-use super::{diagnostic, text};
+use super::{cps_import, diagnostic, text};
 
 const PROVIDER: &[u8] = b"_RCMAKE_FIND_PACKAGE_PROVIDER";
 const PACKAGE_ROOTS: &[u8] = b"_RCMAKE_FIND_PACKAGE_ROOTS";
@@ -24,18 +25,18 @@ enum RootMode {
 }
 
 #[derive(Default)]
-struct Request {
-    version: Option<VersionRequest>,
-    exact: bool,
+pub(super) struct Request {
+    pub(super) version: Option<VersionRequest>,
+    pub(super) exact: bool,
     quiet: bool,
     required: bool,
     optional: bool,
     module: bool,
-    global: bool,
+    pub(super) global: bool,
     no_policy_scope: bool,
     bypass_provider: bool,
     registry_view: Option<BString>,
-    components: Vec<(BString, bool)>,
+    pub(super) components: Vec<(BString, bool)>,
     config_options: Vec<BString>,
     names: Vec<BString>,
     configs: Vec<BString>,
@@ -260,11 +261,11 @@ fn list_lines<'a>(values: impl IntoIterator<Item = &'a BString>) -> BString {
 }
 
 #[derive(Clone)]
-struct VersionRequest {
+pub(super) struct VersionRequest {
     full: BString,
-    min: BString,
-    max: Option<BString>,
-    exclusive: bool,
+    pub(super) min: BString,
+    pub(super) max: Option<BString>,
+    pub(super) exclusive: bool,
 }
 
 impl VersionRequest {
@@ -315,7 +316,7 @@ impl VersionRequest {
     }
 }
 
-fn version_bindings(prefix: &[u8], value: &[u8], vars: &mut Bindings) {
+pub(super) fn version_bindings(prefix: &[u8], value: &[u8], vars: &mut Bindings) {
     vars.add(prefix.into(), BString::from(value));
     let numeric = value
         .split(|byte| !byte.is_ascii_digit() && *byte != b'.')
@@ -337,10 +338,10 @@ fn version_bindings(prefix: &[u8], value: &[u8], vars: &mut Bindings) {
 }
 
 #[derive(Default)]
-struct Bindings(Vec<(BString, BString)>);
+pub(super) struct Bindings(Vec<(BString, BString)>);
 
 impl Bindings {
-    fn add(&mut self, name: BString, value: impl Into<BString>) {
+    pub(super) fn add(&mut self, name: BString, value: impl Into<BString>) {
         self.0.push((name, value.into()));
     }
 
@@ -654,13 +655,15 @@ struct ConfigSearch<'a> {
     names: Vec<BString>,
     configs: Vec<BString>,
     redirect: Option<PathBuf>,
-    visited: BTreeSet<PathBuf>,
-    considered: Vec<(BString, BString)>,
+    visited: BTreeSet<(PathBuf, bool)>,
+    considered: Vec<(BString, BString, Option<BString>)>,
+    cps_names: Vec<BString>,
 }
 
 struct ConfigMatch {
     file: BString,
     version: BString,
+    cps: Option<Box<CpsPackage>>,
 }
 
 impl<'a> ConfigSearch<'a> {
@@ -683,10 +686,30 @@ impl<'a> ConfigSearch<'a> {
         } else {
             request.configs.clone()
         };
+        let cps_names = if request
+            .config_options
+            .iter()
+            .any(|option| option == b"CONFIGS")
+        {
+            Vec::new()
+        } else {
+            names
+                .iter()
+                .flat_map(|name| {
+                    [false, true].into_iter().filter_map(move |lower| {
+                        if lower && !name.iter().any(u8::is_ascii_uppercase) {
+                            return None;
+                        }
+                        naming::package_file_name(name, None, lower).ok()
+                    })
+                })
+                .collect()
+        };
         Self {
             name,
             request,
             names,
+            cps_names,
             configs,
             redirect: None,
             visited: BTreeSet::new(),
@@ -719,10 +742,15 @@ impl<'a> ConfigSearch<'a> {
             .redirect
             .clone()
             .or_else(|| (!dir.is_empty() && !truth::is_off(&dir)).then(|| cx.resolve_path(&dir)));
-        if let Some(dir) = preferred
-            && let Some(found) = self.in_directory(cx, &dir)?
-        {
-            return Ok(Some(found));
+        if let Some(dir) = preferred {
+            if self.redirect.is_none()
+                && let Some(found) = self.in_directory(cx, &dir, true)?
+            {
+                return Ok(Some(found));
+            }
+            if let Some(found) = self.in_directory(cx, &dir, false)? {
+                return Ok(Some(found));
+            }
         }
 
         let ignored = paths_from_vars(cx, &[b"CMAKE_IGNORE_PATH", b"CMAKE_SYSTEM_IGNORE_PATH"]);
@@ -740,7 +768,7 @@ impl<'a> ConfigSearch<'a> {
             {
                 continue;
             }
-            for dir in self.layout(cx, &prefix) {
+            for (dir, cps) in self.layout(cx, &prefix) {
                 let suffixes = self.request.suffixes.iter().map(|suffix| {
                     let suffix: PathBuf = path::to_native(suffix)
                         .components()
@@ -755,7 +783,7 @@ impl<'a> ConfigSearch<'a> {
                 });
                 for dir in std::iter::once(dir.clone()).chain(suffixes) {
                     if !ignored.contains(&dir)
-                        && let Some(found) = self.in_directory(cx, &dir)?
+                        && let Some(found) = self.in_directory(cx, &dir, cps)?
                     {
                         return Ok(Some(found));
                     }
@@ -769,9 +797,13 @@ impl<'a> ConfigSearch<'a> {
         &mut self,
         cx: &mut Cx<'_>,
         dir: &Path,
+        cps: bool,
     ) -> Result<Option<ConfigMatch>, CmdError> {
-        if !self.visited.insert(dir.to_path_buf()) {
+        if !self.visited.insert((dir.to_path_buf(), cps)) {
             return Ok(None);
+        }
+        if cps {
+            return self.in_cps_directory(cx, dir);
         }
         for config in &self.configs {
             let file = dir.join(path::to_native(config));
@@ -790,12 +822,82 @@ impl<'a> ConfigSearch<'a> {
             } else {
                 checked.version.clone()
             };
-            self.considered.push((file.clone(), version));
+            self.considered.push((file.clone(), version, None));
             if checked.accepted {
                 return Ok(Some(ConfigMatch {
                     file,
                     version: checked.version,
+                    cps: None,
                 }));
+            }
+        }
+        Ok(None)
+    }
+
+    fn in_cps_directory(
+        &mut self,
+        cx: &mut Cx<'_>,
+        dir: &Path,
+    ) -> Result<Option<ConfigMatch>, CmdError> {
+        let mut visited = BTreeSet::new();
+        for filename in &self.cps_names {
+            let file = dir.join(path::to_native(filename));
+            if !is_file(cx, &file) {
+                continue;
+            }
+            let file = if cx.var_is_on(b"CMAKE_FIND_PACKAGE_RESOLVE_SYMLINKS") {
+                cx.host().canonicalize(&file).unwrap_or(file)
+            } else {
+                let entries = cx.host().read_dir(dir).unwrap_or_default();
+                entries
+                    .iter()
+                    .find(|entry| entry.name == filename.as_slice())
+                    .or_else(|| {
+                        entries
+                            .iter()
+                            .find(|entry| entry.name.eq_ignore_ascii_case(filename))
+                    })
+                    .map_or(file, |entry| dir.join(path::to_native(&entry.name)))
+            };
+            if !visited.insert(file.clone()) {
+                continue;
+            }
+            let mut found_version = BString::default();
+            let result = match cps_import::read_root(cx, &file) {
+                Ok(mut package) if package.name == self.name => {
+                    found_version = package.version.clone().unwrap_or_default();
+                    match cps_import::check_version(&package, self.request) {
+                        Ok(()) => cps_import::prepare(cx, &file, &mut package, self.request)?
+                            .map(|()| package),
+                        Err(reason) => Err(reason),
+                    }
+                }
+                Ok(package) => Err(format!(
+                    "The file describes the package {:?}, which is not the requested package.",
+                    package.name
+                )
+                .into()),
+                Err(reason) => Err(reason),
+            };
+            let file = path::from_native(&file);
+            let considered_version = if found_version.is_empty() {
+                "unknown".into()
+            } else {
+                found_version.clone()
+            };
+            match result {
+                Ok(package) => {
+                    self.considered
+                        .push((file.clone(), considered_version, None));
+                    return Ok(Some(ConfigMatch {
+                        file,
+                        version: found_version,
+                        cps: Some(Box::new(package)),
+                    }));
+                }
+                Err(reason) => self
+                    .considered
+                    .push((file, considered_version, Some(reason))),
             }
         }
         Ok(None)
@@ -842,15 +944,35 @@ impl<'a> ConfigSearch<'a> {
             if found.version.is_empty() {
                 cx.set_var(&text(&[&prefix, b"_COUNT"]), "0".into());
             } else {
-                version_bindings(&prefix, &found.version, &mut vars);
+                if let Some(package) = &found.cps {
+                    cps_import::version_bindings(package, &prefix, &mut vars);
+                } else {
+                    version_bindings(&prefix, &found.version, &mut vars);
+                }
                 vars.apply(cx);
             }
             cx.unset_var(found_var);
             cx.unset_var(&message);
-            cx.include_file(
-                &path::to_native(&found.file),
-                self.request.include_options(),
-            )?;
+            if let Some(package) = found.cps {
+                cps_import::import(cx, &package, &found.file)?;
+                for (component, entry) in &package.components {
+                    let supported = cps_import::target_kind(&entry.ty).is_some();
+                    cx.set_var(
+                        &text(&[self.name, b"_", component, b"_FOUND"]),
+                        flag(supported).into(),
+                    );
+                }
+                for (component, _) in &self.request.components {
+                    if !package.components.contains_key(component) {
+                        cx.set_var(&text(&[self.name, b"_", component, b"_FOUND"]), "0".into());
+                    }
+                }
+            } else {
+                cx.include_file(
+                    &path::to_native(&found.file),
+                    self.request.include_options(),
+                )?;
+            }
             if cx.fatal_occurred() {
                 return Err(CmdError::Reported);
             }
@@ -865,14 +987,23 @@ impl<'a> ConfigSearch<'a> {
         } else {
             cx.unset_var(&config);
             cx.set_var(found_var, "0".into());
+            if self
+                .considered
+                .iter()
+                .any(|(_, _, reason)| reason.is_some())
+            {
+                for (component, _) in &self.request.components {
+                    cx.set_var(&text(&[self.name, b"_", component, b"_FOUND"]), "0".into());
+                }
+            }
         }
         cx.set_var(
             &text(&[self.name, b"_CONSIDERED_CONFIGS"]),
-            list::join(self.considered.iter().map(|(path, _)| path)),
+            list::join(self.considered.iter().map(|(path, _, _)| path)),
         );
         cx.set_var(
             &text(&[self.name, b"_CONSIDERED_VERSIONS"]),
-            list::join(self.considered.iter().map(|(_, version)| version)),
+            list::join(self.considered.iter().map(|(_, version, _)| version)),
         );
         Ok(cx.var_is_on(found_var))
     }
@@ -903,31 +1034,39 @@ impl<'a> ConfigSearch<'a> {
                 text(&[b" that ", kind, b"\"", &v.full, b"\""])
             });
         if !self.considered.is_empty() {
+            let requested: &[u8] = if requested.is_empty()
+                && self
+                    .considered
+                    .iter()
+                    .any(|(_, _, reason)| reason.is_some())
+            {
+                b" that is compatible with requested version \"\""
+            } else {
+                &requested
+            };
             let files: Vec<_> = self
                 .considered
                 .iter()
-                .map(|(file, version)| text(&[file, b", version: ", version]))
+                .map(|(file, version, reason)| {
+                    let mut entry = text(&[file, b", version: ", version]);
+                    if let Some(reason) = reason {
+                        entry.extend_from_slice(b"\n      ");
+                        entry.extend_from_slice(reason);
+                    }
+                    entry
+                })
                 .collect();
             return text(&[
                 &preface,
                 b"Could not find a configuration file for package \"",
                 name,
                 b"\"",
-                &requested,
+                requested,
                 b".\n\nThe following configuration files were considered but not accepted:\n",
                 &list_lines(&files),
             ]);
         }
-        let mut configs = Vec::new();
-        if self.request.configs.is_empty() {
-            for name in &self.names {
-                configs.push(text(&[name, b".cps"]));
-                let lowercase = name.to_ascii_lowercase();
-                if name.as_slice() != lowercase.as_slice() {
-                    configs.push(text(&[&lowercase, b".cps"]));
-                }
-            }
-        }
+        let mut configs = self.cps_names.clone();
         configs.extend_from_slice(&self.configs);
         let requested = self
             .request
@@ -1024,7 +1163,7 @@ impl ConfigSearch<'_> {
         reroot(cx, request.root_mode, prefixes)
     }
 
-    fn layout(&self, cx: &mut Cx<'_>, prefix: &Path) -> Vec<PathBuf> {
+    fn layout(&self, cx: &mut Cx<'_>, prefix: &Path) -> Vec<(PathBuf, bool)> {
         let mut dirs = Vec::new();
         let framework = cx.var_or_empty(b"CMAKE_FIND_FRAMEWORK");
         let bundle = cx.var_or_empty(b"CMAKE_FIND_APPBUNDLE");
@@ -1036,21 +1175,62 @@ impl ConfigSearch<'_> {
             self.bundles(cx, prefix, &mut dirs);
         }
         if framework != b"ONLY" && bundle != b"ONLY" {
-            dirs.push(prefix.to_path_buf());
-            dirs.extend(cmake_children(cx, prefix));
+            if !self.cps_names.is_empty() {
+                let packages = self.cps_packages(cx, prefix);
+                for package in &packages {
+                    dirs.extend(cps_children(cx, package).into_iter().map(|dir| (dir, true)));
+                }
+                for package in &packages {
+                    for version in children(cx, package, |_| true) {
+                        dirs.extend(
+                            cps_children(cx, &version)
+                                .into_iter()
+                                .map(|dir| (dir, true)),
+                        );
+                    }
+                }
+                self.cps_layout(cx, &cps_children(cx, prefix), &mut dirs);
+            }
+
             let packages = self.children(cx, prefix);
+            dirs.push((prefix.to_path_buf(), false));
+            dirs.extend(
+                cmake_children(cx, prefix)
+                    .into_iter()
+                    .map(|dir| (dir, false)),
+            );
+            dirs.extend(packages.iter().cloned().map(|dir| (dir, false)));
             for package in &packages {
-                dirs.push(package.clone());
+                dirs.extend(
+                    cmake_children(cx, package)
+                        .into_iter()
+                        .map(|dir| (dir, false)),
+                );
+            }
+            for package in &packages {
                 for cmake in cmake_children(cx, package) {
-                    dirs.push(cmake.clone());
-                    dirs.extend(self.children(cx, &cmake));
+                    dirs.extend(
+                        self.children(cx, &cmake)
+                            .into_iter()
+                            .map(|dir| (dir, false)),
+                    );
                 }
             }
+
             let lib_dirs = library_dirs(cx);
-            self.unix_layout(cx, prefix, &lib_dirs, &mut dirs);
-            for package in packages {
-                self.unix_layout(cx, &package, &lib_dirs, &mut dirs);
+            if !self.cps_names.is_empty() {
+                let lib_cps: Vec<_> = lib_dirs
+                    .iter()
+                    .map(|lib| prefix.join(lib).join("cps"))
+                    .collect();
+                self.cps_layout(cx, &lib_cps, &mut dirs);
             }
+            let mut cmake_dirs = Vec::new();
+            self.unix_layout(cx, prefix, &lib_dirs, &mut cmake_dirs);
+            for package in packages {
+                self.unix_layout(cx, &package, &lib_dirs, &mut cmake_dirs);
+            }
+            dirs.extend(cmake_dirs.into_iter().map(|dir| (dir, false)));
         }
         if framework == b"LAST" {
             self.frameworks(cx, prefix, &mut dirs);
@@ -1059,6 +1239,30 @@ impl ConfigSearch<'_> {
             self.bundles(cx, prefix, &mut dirs);
         }
         dirs
+    }
+
+    fn cps_packages(&self, cx: &Cx<'_>, dir: &Path) -> Vec<PathBuf> {
+        children(cx, dir, |entry| {
+            self.names
+                .iter()
+                .any(|name| name.eq_ignore_ascii_case(entry))
+        })
+    }
+
+    fn cps_layout(&self, cx: &Cx<'_>, roots: &[PathBuf], dirs: &mut Vec<(PathBuf, bool)>) {
+        let packages: Vec<_> = roots
+            .iter()
+            .flat_map(|root| self.cps_packages(cx, root))
+            .collect();
+        dirs.extend(packages.iter().cloned().map(|dir| (dir, true)));
+        for package in packages {
+            dirs.extend(
+                children(cx, &package, |_| true)
+                    .into_iter()
+                    .map(|dir| (dir, true)),
+            );
+        }
+        dirs.extend(roots.iter().cloned().map(|dir| (dir, true)));
     }
 
     fn unix_layout(
@@ -1095,21 +1299,31 @@ impl ConfigSearch<'_> {
         })
     }
 
-    fn frameworks(&self, cx: &Cx<'_>, prefix: &Path, dirs: &mut Vec<PathBuf>) {
-        for framework in self.apple_children(cx, prefix, b".framework") {
+    fn frameworks(&self, cx: &Cx<'_>, prefix: &Path, dirs: &mut Vec<(PathBuf, bool)>) {
+        let frameworks = self.apple_children(cx, prefix, b".framework");
+        for framework in &frameworks {
+            if !self.cps_names.is_empty() {
+                for version in children(cx, &framework.join("Versions"), |_| true) {
+                    dirs.push((version.join("Resources/CPS"), true));
+                }
+                dirs.push((framework.join("Resources/CPS"), true));
+            }
             let root = framework.join("Resources");
-            dirs.extend([root.clone(), root.join("CMake")]);
+            dirs.extend([(root.clone(), false), (root.join("CMake"), false)]);
             for version in children(cx, &framework.join("Versions"), |_| true) {
                 let root = version.join("Resources");
-                dirs.extend([root.clone(), root.join("CMake")]);
+                dirs.extend([(root.clone(), false), (root.join("CMake"), false)]);
             }
         }
     }
 
-    fn bundles(&self, cx: &Cx<'_>, prefix: &Path, dirs: &mut Vec<PathBuf>) {
+    fn bundles(&self, cx: &Cx<'_>, prefix: &Path, dirs: &mut Vec<(PathBuf, bool)>) {
         for bundle in self.apple_children(cx, prefix, b".app") {
             let root = bundle.join("Contents/Resources");
-            dirs.extend([root.clone(), root.join("CMake")]);
+            if !self.cps_names.is_empty() {
+                dirs.push((root.join("CPS"), true));
+            }
+            dirs.extend([(root.clone(), false), (root.join("CMake"), false)]);
         }
     }
 
@@ -1297,6 +1511,10 @@ fn children(cx: &Cx<'_>, dir: &Path, matches: impl Fn(&[u8]) -> bool) -> Vec<Pat
             directory.then_some(child)
         })
         .collect()
+}
+
+fn cps_children(cx: &Cx<'_>, dir: &Path) -> Vec<PathBuf> {
+    children(cx, dir, |name| name.eq_ignore_ascii_case(b"cps"))
 }
 
 fn cmake_children(cx: &Cx<'_>, dir: &Path) -> Vec<PathBuf> {
