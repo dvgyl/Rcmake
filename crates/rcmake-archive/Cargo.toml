@@ -13,7 +13,7 @@ rcmake-base.workspace = true
 rcmake-host.workspace = true
 tar.workspace = true
 thiserror.workspace = true
-zip.workspace = true
+zip = { workspace = true, features = ["unreserved"] }
 
 [lints]
 workspace = true
