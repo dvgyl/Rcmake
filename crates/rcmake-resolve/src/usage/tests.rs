@@ -1,4 +1,4 @@
-use rcmake_diag::{Backtrace, PolicyId, PolicyMap, PolicyStatus};
+use rcmake_diag::{Backtrace, FrameKind, PolicyId, PolicyMap, PolicyStatus};
 use rcmake_genex::{ArtifactKind, ArtifactPart, ConfigId, GenexHost};
 use rcmake_model::{GeneratorKind, ImportedVisibility, LinkItem, TargetKind, TargetOrigin};
 
@@ -83,6 +83,159 @@ fn values(entries: &[BT<BString>]) -> BString {
 
 fn link_line(items: &[ResolvedLinkItem]) -> BString {
     list::join(items.iter().map(|entry| &entry.text.value))
+}
+
+fn command_entry(value: &str, command: &str, line: u32) -> BT<BString> {
+    BT::new(
+        value.into(),
+        Backtrace::default().push(Frame {
+            file: b"/src/CMakeLists.txt".as_slice().into(),
+            line,
+            name: Some(command.as_bytes().into()),
+            kind: FrameKind::Command,
+        }),
+    )
+}
+
+#[test]
+fn compile_definitions_use_current_values_from_the_targets_directory() {
+    use UsageField::CompileDefinitions;
+
+    let mut model = model("Linux");
+    let early = add(&mut model, "early", TargetKind::StaticLibrary);
+    let root = DirId::ROOT;
+    let before = command_entry("BEFORE", "add_definitions", 2);
+    let removed = command_entry("REMOVED", "add_compile_definitions", 3);
+    let app = add(&mut model, "app", TargetKind::StaticLibrary);
+    let target = &mut model.target_mut(app).unwrap().usage;
+    for entry in [
+        before.clone(),
+        removed,
+        command_entry("OWN", "target_compile_definitions", 5),
+    ] {
+        target.push(CompileDefinitions, entry);
+    }
+    model.dir_mut(root).usage.push(CompileDefinitions, before);
+    model.dir_mut(root).usage.push(
+        CompileDefinitions,
+        command_entry("AFTER", "add_definitions", 7),
+    );
+    let child = model
+        .add_directory(
+            root,
+            "/src/child".into(),
+            "/build/child".into(),
+            Backtrace::default(),
+        )
+        .unwrap();
+    let child_app = add_in(
+        &mut model,
+        "child",
+        TargetKind::StaticLibrary,
+        TargetOrigin::Normal,
+        child,
+    );
+    model.dir_mut(root).usage.push(
+        CompileDefinitions,
+        command_entry("PARENT_AFTER", "add_compile_definitions", 9),
+    );
+    let imported = add_in(
+        &mut model,
+        "imported",
+        TargetKind::StaticLibrary,
+        TargetOrigin::Imported(ImportedVisibility::Global),
+        root,
+    );
+    let interface = add(&mut model, "interface", TargetKind::InterfaceLibrary);
+    let mut resolver = UsageResolver::new(&model);
+    for (id, expected) in [
+        (early, "BEFORE;AFTER;PARENT_AFTER"),
+        (app, "OWN;BEFORE;AFTER;PARENT_AFTER"),
+        (child_app, "BEFORE;AFTER"),
+        (imported, ""),
+        (interface, ""),
+    ] {
+        let result = resolver
+            .collect_property(
+                id,
+                CompileDefinitions.name().as_bytes(),
+                &EvalContext::default(),
+            )
+            .unwrap();
+        assert_eq!(values(&result.entries), expected);
+    }
+}
+
+#[test]
+fn directory_includes_keep_target_search_order_and_options_keep_their_snapshot() {
+    use UsageField::*;
+
+    let mut model = model("Linux");
+    let app = add(&mut model, "app", TargetKind::StaticLibrary);
+    let early = add(&mut model, "early", TargetKind::StaticLibrary);
+    let override_target = add(&mut model, "override_target", TargetKind::StaticLibrary);
+    let directory = &mut model.dir_mut(DirId::ROOT).usage;
+    directory.push(
+        IncludeDirectories,
+        command_entry("/before", "include_directories", 2),
+    );
+    directory.push(
+        IncludeDirectories,
+        command_entry("/initial", "include_directories", 1),
+    );
+    directory.push(
+        IncludeDirectories,
+        command_entry("/after", "include_directories", 6),
+    );
+    let initial_includes = directory.entries(IncludeDirectories).to_vec();
+    for (field, first, last) in [
+        (CompileOptions, "-fno-common", "-fno-omit-frame-pointer"),
+        (LinkOptions, "-L/initial", "-L/after"),
+        (LinkDirectories, "/initial-lib", "/after-lib"),
+    ] {
+        directory.push(field, BT::new(first.into(), Backtrace::default()));
+        directory.push(field, BT::new(last.into(), Backtrace::default()));
+    }
+    for entry in initial_includes {
+        model
+            .target_mut(app)
+            .unwrap()
+            .usage
+            .push(IncludeDirectories, entry);
+    }
+    model
+        .target_mut(app)
+        .unwrap()
+        .usage
+        .fields
+        .get_mut(&IncludeDirectories)
+        .unwrap()
+        .insert(2, command_entry("/own", "target_include_directories", 4));
+    usage(&mut model, override_target, IncludeDirectories, "/override");
+    for (field, first) in [
+        (CompileOptions, "-fno-common"),
+        (LinkOptions, "-L/initial"),
+        (LinkDirectories, "/initial-lib"),
+    ] {
+        usage(&mut model, app, field, first);
+    }
+    let mut resolver = UsageResolver::new(&model);
+    let ctx = EvalContext::default();
+    for (id, field, expected) in [
+        (app, IncludeDirectories, "/before;/initial;/own;/after"),
+        (override_target, IncludeDirectories, "/override"),
+        (app, CompileOptions, "-fno-common"),
+        (app, LinkOptions, "-L/initial"),
+        (app, LinkDirectories, "/initial-lib"),
+        (early, CompileOptions, ""),
+        (early, LinkOptions, ""),
+        (early, LinkDirectories, ""),
+    ] {
+        let result = resolver
+            .collect_property(id, field.name().as_bytes(), &ctx)
+            .unwrap();
+        assert_eq!(values(&result.entries), expected);
+    }
 }
 
 #[test]
@@ -289,6 +442,97 @@ fn active_property_cycle_is_distinct_from_a_static_link_cycle() {
             .unwrap_err()
             .to_string(),
         "Self reference on target \"app\"."
+    );
+}
+
+#[test]
+fn system_public_includes_mark_the_targets_own_matching_paths() {
+    use UsageField::*;
+
+    let mut model = model("Linux");
+    let lib = add(&mut model, "lib", TargetKind::StaticLibrary);
+    let app = add(&mut model, "app", TargetKind::Executable);
+    link(&mut model, app, false, &["lib"]);
+    prop(&mut model, lib, "SYSTEM", "ON");
+    let target = &mut model.target_mut(lib).unwrap().usage;
+    let public = command_entry(
+        "$<$<CONFIG:Debug>:/public/.>",
+        "target_include_directories",
+        2,
+    );
+    for field in [
+        IncludeDirectories,
+        InterfaceIncludeDirectories,
+        InterfaceSystemIncludeDirectories,
+    ] {
+        target.push(field, public.clone());
+    }
+
+    let ordinary = command_entry("/ordinary", "target_include_directories", 3);
+    for field in [IncludeDirectories, InterfaceIncludeDirectories] {
+        target.push(field, ordinary.clone());
+    }
+    target.push(
+        InterfaceSystemIncludeDirectories,
+        command_entry("/ordinary", "set_property", 4),
+    );
+    target.push(
+        IncludeDirectories,
+        command_entry("/interface", "target_include_directories", 5),
+    );
+    let interface = command_entry("/interface", "target_include_directories", 6);
+    for field in [
+        InterfaceIncludeDirectories,
+        InterfaceSystemIncludeDirectories,
+    ] {
+        target.push(field, interface.clone());
+    }
+    usage(&mut model, lib, IncludeDirectories, "/target-system");
+    prop(
+        &mut model,
+        lib,
+        "SYSTEM_INCLUDE_DIRECTORIES",
+        "/target-system",
+    );
+    let mut resolver = UsageResolver::new(&model);
+    let mut includes = |id, config: &str| {
+        resolver
+            .collect_includes(
+                id,
+                &EvalContext {
+                    config: ConfigId(config.into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+            .into_iter()
+            .map(|include| (include.path.value, include.system))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        includes(lib, "Debug"),
+        [
+            ("/ordinary".into(), false),
+            ("/interface".into(), false),
+            ("/public/.".into(), true),
+            ("/target-system".into(), true),
+        ]
+    );
+    assert_eq!(
+        includes(lib, "Release"),
+        [
+            ("/ordinary".into(), false),
+            ("/interface".into(), false),
+            ("/target-system".into(), true),
+        ]
+    );
+    assert_eq!(
+        includes(app, "Debug"),
+        [
+            ("/public/.".into(), true),
+            ("/ordinary".into(), true),
+            ("/interface".into(), true),
+        ]
     );
 }
 

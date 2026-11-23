@@ -7,11 +7,12 @@
 use std::collections::{HashMap, HashSet};
 
 use rcmake_base::{BString, Limits, list, truth};
+use rcmake_diag::Frame;
 use rcmake_genex::{
     EvalContext, EvalFlags, EvalSite, GenexError, GenexNode, TargetHandle, UsageTraversal,
     evaluate, parse,
 };
-use rcmake_model::{BT, DirId, ProjectModel, Target, TargetId, UsageField};
+use rcmake_model::{BT, DirId, ProjectModel, Target, TargetId, TargetKind, UsageField};
 
 use crate::{InterfaceInclude, sources::SourcePaths};
 
@@ -270,21 +271,37 @@ impl<'a> UsageResolver<'a> {
         let target = self.target(id)?;
         let mut own = UsageValue::default();
         if let Some(field) = UsageField::from_name(name) {
-            // Target creation copies directory usage. Use the nearest directory entry as
-            // a fallback for models that leave that field unset on the target.
-            let entries = target
-                .usage
-                .fields
-                .get(&field)
-                .map(Vec::as_slice)
-                .unwrap_or_else(|| {
-                    if field.on_directory() && !target.is_imported() {
-                        self.directory_entries(target.dir, field)
-                    } else {
-                        &[]
-                    }
+            let directory = &self.model.dir(target.dir).usage;
+            let entries = target.usage.entries(field);
+            if field == UsageField::CompileDefinitions
+                && !target.is_imported()
+                && target.kind != TargetKind::InterfaceLibrary
+            {
+                // Replace the directory snapshot with the directory's current definitions.
+                let definitions = directory.entries(field);
+                let inherited: HashSet<_> = definitions.iter().map(entry_origin).collect();
+                let target_definitions = entries.iter().filter(|entry| {
+                    !is_directory_definition(entry) && !inherited.contains(&entry_origin(entry))
                 });
-            self.eval_entries(id, name, entries, ctx, &mut own)?;
+                self.eval_entries(
+                    id,
+                    name,
+                    target_definitions.chain(definitions),
+                    ctx,
+                    &mut own,
+                )?;
+            } else {
+                // include_directories() updates existing targets in search order.
+                let entries = if field == UsageField::IncludeDirectories
+                    && !target.is_imported()
+                    && !target.usage.fields.contains_key(&field)
+                {
+                    directory.entries(field)
+                } else {
+                    entries
+                };
+                self.eval_entries(id, name, entries, ctx, &mut own)?;
+            }
         } else if name == b"SOURCES" {
             self.eval_entries(id, name, &target.sources, ctx, &mut own)?;
         } else if let Some(raw) = target.props.get(name) {
@@ -317,24 +334,11 @@ impl<'a> UsageResolver<'a> {
         Ok(result)
     }
 
-    fn directory_entries(&self, dir: DirId, field: UsageField) -> &'a [BT<BString>] {
-        let mut current = Some(dir);
-        for _ in 0..MAX_WALK_DEPTH {
-            let Some(id) = current else { break };
-            let directory = self.model.dir(id);
-            if let Some(entries) = directory.usage.fields.get(&field) {
-                return entries;
-            }
-            current = directory.parent;
-        }
-        &[]
-    }
-
-    fn eval_entries(
+    fn eval_entries<'entry>(
         &mut self,
         target: TargetId,
         property: &[u8],
-        entries: &[BT<BString>],
+        entries: impl IntoIterator<Item = &'entry BT<BString>>,
         ctx: &EvalContext,
         result: &mut UsageValue,
     ) -> Result<(), ResolveError> {
@@ -397,7 +401,28 @@ impl<'a> UsageResolver<'a> {
         self.eval_entries(
             target,
             b"SYSTEM_INCLUDE_DIRECTORIES",
-            self.directory_entries(owner.dir, InterfaceSystemIncludeDirectories),
+            self.model
+                .dir(owner.dir)
+                .usage
+                .entries(InterfaceSystemIncludeDirectories),
+            &ctx,
+            &mut system,
+        )?;
+        // A SYSTEM PUBLIC include has matching entries from the same command.
+        let own_includes: HashSet<_> = owner
+            .usage
+            .entries(IncludeDirectories)
+            .iter()
+            .map(entry_origin)
+            .collect();
+        self.eval_entries(
+            target,
+            InterfaceSystemIncludeDirectories.name().as_bytes(),
+            owner
+                .usage
+                .entries(InterfaceSystemIncludeDirectories)
+                .iter()
+                .filter(|entry| own_includes.contains(&entry_origin(entry))),
             &ctx,
             &mut system,
         )?;
@@ -458,6 +483,30 @@ impl<'a> UsageResolver<'a> {
         includes.sort_by_key(|include| include.system);
         Ok(includes)
     }
+}
+
+fn entry_origin(entry: &BT<BString>) -> (&[u8], Option<*const Frame>) {
+    // Copies of an entry share the same backtrace frame.
+    (
+        entry.value.as_slice(),
+        entry.backtrace.top().map(std::ptr::from_ref),
+    )
+}
+
+fn is_directory_definition(entry: &BT<BString>) -> bool {
+    entry
+        .backtrace
+        .top()
+        .and_then(|frame| frame.name.as_deref())
+        .is_some_and(|name| {
+            [
+                b"add_definitions".as_slice(),
+                b"add_compile_definitions",
+                b"set_directory_properties",
+            ]
+            .iter()
+            .any(|command| name.eq_ignore_ascii_case(command))
+        })
 }
 
 /// Collect `field` for `target` and its transitive interface in `ctx`.
