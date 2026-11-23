@@ -3,9 +3,11 @@ use std::io::ErrorKind;
 use jiff::{
     Timestamp,
     civil::{Date, DateTime, Time},
+    tz::{Offset, TimeZone},
 };
 use rcmake_archive::{
-    ArchiveFormat, CreateOptions, ExtractOptions, create_archive, extract_archive,
+    ArchiveFormat, CreateOptions, ExtractOptions, create_command_archive, extract_archive,
+    list_command_archive,
 };
 use rcmake_base::BString;
 use rcmake_host::{Follow, Stream, path::to_native};
@@ -25,7 +27,6 @@ enum Compression {
 
 #[derive(Default)]
 struct TarOptions<'a> {
-    archive: Option<&'a [u8]>,
     inputs: Vec<BString>,
     compression: Option<Compression>,
     format: Option<&'a [u8]>,
@@ -39,17 +40,18 @@ const COMPRESSION_ERROR: &[u8] =
     b"CMake Error: Can only compress a tar file one way; at most one flag of z, j, or J may be used\n";
 
 pub(super) fn tar(args: &[BString], cx: &ToolCtx<'_>) -> i32 {
-    let [flags, rest @ ..] = args else {
+    let [flags, archive, rest @ ..] = args else {
         return usage(cx, 1);
     };
-    if rest.is_empty() {
-        return usage(cx, 1);
-    }
 
     let mut options = TarOptions::default();
+    if let Err(status) = parse_options(rest, &mut options, cx) {
+        return status;
+    }
+
     let mut action = None;
     let mut verbose = false;
-    for &flag in flags.strip_prefix(b"-").unwrap_or(flags) {
+    for &flag in flags.as_slice() {
         let compression = match flag {
             b'c' | b'x' | b't' => {
                 action = Some(flag);
@@ -59,7 +61,7 @@ pub(super) fn tar(args: &[BString], cx: &ToolCtx<'_>) -> i32 {
                 verbose = true;
                 None
             }
-            b'f' => None,
+            b'-' | b'f' => None,
             b'z' => Some(Compression::Gzip),
             b'j' => Some(Compression::Bzip2),
             b'J' => Some(Compression::Xz),
@@ -74,12 +76,9 @@ pub(super) fn tar(args: &[BString], cx: &ToolCtx<'_>) -> i32 {
             return error(cx, &[COMPRESSION_ERROR]);
         }
     }
-    if let Err(status) = parse_options(rest, &mut options, cx) {
+    if let Err(status) = validate_level(&options, cx) {
         return status;
     }
-    let Some(archive) = options.archive else {
-        return usage(cx, 1);
-    };
     match action {
         Some(b'c') => create(archive, options, verbose, cx),
         Some(b't') => extract(archive, options, true, verbose, cx),
@@ -99,8 +98,6 @@ fn parse_options<'a>(
             flags = false;
         } else if flags && arg.starts_with(b"--") {
             parse_option(arg, opts, cx)?;
-        } else if opts.archive.is_none() {
-            opts.archive = Some(arg);
         } else {
             opts.inputs.push(arg.clone());
         }
@@ -152,21 +149,19 @@ fn parse_option<'a>(arg: &'a [u8], opts: &mut TarOptions<'a>, cx: &ToolCtx<'_>) 
             }
         })
     } else if let Some(level) = arg.strip_prefix(b"--cmake-tar-compression-level=") {
-        let parsed = std::str::from_utf8(level)
-            .ok()
-            .and_then(|s| s.parse::<i32>().ok());
-        opts.level = Some(parsed.ok_or_else(|| {
-            error(
-                cx,
-                &[
-                    b"CMake Error: Invalid --cmake-tar-compression-level value: '",
-                    level,
-                    b"' - not a number\n",
-                ],
-            )
-        })?);
+        opts.level = Some(parse_integer(b"compression-level", level, cx)?);
+        None
+    } else if let Some(threads) = arg.strip_prefix(b"--cmake-tar-threads=") {
+        // The available compression methods use one thread.
+        parse_integer(b"threads", threads, cx)?;
         None
     } else if let Some(encoding) = arg.strip_prefix(b"--cmake-tar-encoding=") {
+        if encoding.is_empty() {
+            return Err(error(
+                cx,
+                &[b"CMake Error: Encoding value is empty - it must be filled if passed\n"],
+            ));
+        }
         opts.encoding = Some(encoding);
         None
     } else {
@@ -191,6 +186,30 @@ fn parse_option<'a>(arg: &'a [u8], opts: &mut TarOptions<'a>, cx: &ToolCtx<'_>) 
         return Err(error(cx, &[COMPRESSION_ERROR]));
     }
     Ok(())
+}
+
+fn parse_integer(option: &[u8], value: &[u8], cx: &ToolCtx<'_>) -> Result<i32, i32> {
+    let parsed = std::str::from_utf8(value)
+        .ok()
+        .and_then(|text| text.trim_ascii_start().parse::<std::ffi::c_long>().ok());
+    let reason = match parsed {
+        Some(number) if i32::try_from(number).is_ok() => return Ok(number as i32),
+        Some(number) if number < 0 => b"too small".as_slice(),
+        Some(_) => b"too large",
+        None => b"not a number",
+    };
+    Err(error(
+        cx,
+        &[
+            b"CMake Error: Invalid --cmake-tar-",
+            option,
+            b" value: '",
+            value,
+            b"' - ",
+            reason,
+            b"\n",
+        ],
+    ))
 }
 
 fn read_names(file: &[u8], names: &mut Vec<BString>, cx: &ToolCtx<'_>) -> Result<(), i32> {
@@ -238,6 +257,17 @@ fn read_names(file: &[u8], names: &mut Vec<BString>, cx: &ToolCtx<'_>) -> Result
 }
 
 fn create(archive: &[u8], opts: TarOptions<'_>, verbose: bool, cx: &ToolCtx<'_>) -> i32 {
+    if opts.format == Some(b"raw") {
+        return creation_error(
+            cx,
+            archive,
+            &[
+                b"CMake Error: archive_write_set_format_option(hdrcharset): Undefined option: `raw:hdrcharset=",
+                opts.encoding.unwrap_or(b"UTF-8"),
+                b"'\n",
+            ],
+        );
+    }
     let Some(format) = archive_format(&opts, cx) else {
         return 1;
     };
@@ -277,11 +307,22 @@ fn create(archive: &[u8], opts: TarOptions<'_>, verbose: bool, cx: &ToolCtx<'_>)
             .level
             .and_then(|level| u32::try_from(level).ok())
             .filter(|level| *level != 0),
-        verbose,
+        verbose: false,
     };
     let archive_path = path(cx, archive);
-    match create_archive(cx.host, &archive_path, cx.cwd, &inputs, &options) {
-        Ok(_) => 0,
+    match create_command_archive(cx.host, &archive_path, cx.cwd, &inputs, &options) {
+        Ok(names) => {
+            if verbose {
+                for name in names {
+                    write(
+                        cx,
+                        Stream::Stdout,
+                        &[name.strip_suffix(b"/").unwrap_or(&name), b"\n"],
+                    );
+                }
+            }
+            0
+        }
         Err(err) => {
             if let Some(name) = opts.inputs.iter().find(|name| {
                 cx.host
@@ -309,13 +350,12 @@ fn create(archive: &[u8], opts: TarOptions<'_>, verbose: bool, cx: &ToolCtx<'_>)
     }
 }
 
-fn archive_format(opts: &TarOptions<'_>, cx: &ToolCtx<'_>) -> Option<ArchiveFormat> {
+fn validate_level(opts: &TarOptions<'_>, cx: &ToolCtx<'_>) -> Result<(), i32> {
     let format = opts.format.unwrap_or(b"paxr");
     let zip = format == b"zip";
     if let Some(level) = opts.level {
         if opts.compression.is_none() && !zip && format != b"7zip" {
-            error(cx, &[b"CMake Error: Can not use --cmake-tar-compression-level without compression algorithm selection\n"]);
-            return None;
+            return Err(error(cx, &[b"CMake Error: Can not use --cmake-tar-compression-level without compression algorithm selection\n"]));
         }
         let max = if opts.compression == Some(Compression::Zstd) && !zip {
             19
@@ -323,23 +363,27 @@ fn archive_format(opts: &TarOptions<'_>, cx: &ToolCtx<'_>) -> Option<ArchiveForm
             9
         };
         if !(0..=max).contains(&level) {
-            error(
+            return Err(error(
                 cx,
                 &[format!(
                     "CMake Error: Compression level must be between 0 and {max}. Got {level}\n"
                 )
                 .as_bytes()],
-            );
-            return None;
+            ));
         }
     }
-    let compression = opts.compression.unwrap_or(Compression::None);
-    match (format, compression) {
-        (b"zip", _) if opts.compression.is_none() || compression == Compression::Gzip => {
-            Some(ArchiveFormat::Zip)
-        }
-        (b"gnutar" | b"pax" | b"paxr", Compression::None) => Some(ArchiveFormat::Tar),
-        (b"gnutar" | b"pax" | b"paxr", Compression::Gzip) => Some(ArchiveFormat::TarGz),
+    Ok(())
+}
+
+fn archive_format(opts: &TarOptions<'_>, cx: &ToolCtx<'_>) -> Option<ArchiveFormat> {
+    let format = opts.format.unwrap_or(b"paxr");
+    match (format, opts.compression) {
+        (b"zip", None | Some(Compression::Gzip)) => Some(ArchiveFormat::Zip),
+        (b"zip", Some(Compression::None)) => Some(ArchiveFormat::ZipStored),
+        (b"gnutar", None | Some(Compression::None)) => Some(ArchiveFormat::GnuTar),
+        (b"gnutar", Some(Compression::Gzip)) => Some(ArchiveFormat::GnuTarGz),
+        (b"pax" | b"paxr", None | Some(Compression::None)) => Some(ArchiveFormat::Tar),
+        (b"pax" | b"paxr", Some(Compression::Gzip)) => Some(ArchiveFormat::TarGz),
         _ => {
             error(cx, &[b"CMake Error: The archive backend does not support the requested format or compression method\n"]);
             None
@@ -348,28 +392,46 @@ fn archive_format(opts: &TarOptions<'_>, cx: &ToolCtx<'_>) -> Option<ArchiveForm
 }
 
 fn parse_mtime(value: &[u8], cx: &ToolCtx<'_>) -> Option<u64> {
-    let text = std::str::from_utf8(value).ok()?.trim_ascii();
+    let text = std::str::from_utf8(value).ok()?;
     if let Some(epoch) = text.strip_prefix('@') {
-        return epoch.parse().ok();
+        return u64::try_from(epoch.parse::<i64>().ok()?).ok();
     }
-    let zone = cx.host.time_zone();
-    let date_time = if let Ok(date) = text.parse::<Date>() {
-        date.at(0, 0, 0, 0)
-    } else if text.contains(' ')
+    let text = text.trim_ascii();
+    let upper = text.to_ascii_uppercase();
+    let utc = ["UTC", "GMT", "Z"]
+        .into_iter()
+        .find_map(|suffix| upper.strip_suffix(suffix));
+    let (text, zone) = if let Some(text) = utc {
+        (text.trim_ascii_end(), TimeZone::UTC)
+    } else if let Some((local, offset)) = mtime_offset(text) {
+        (local, TimeZone::fixed(offset))
+    } else {
+        (text, cx.host.time_zone())
+    };
+    let date_time = if text.contains(' ')
         && let Ok(date_time) = text.parse::<DateTime>()
     {
         date_time
+    } else if !text.contains([' ', 'T', 't'])
+        && let Ok(date) = text.parse::<Date>()
+    {
+        date.at(0, 0, 0, 0)
     } else {
         let time = if text.len() <= 4
-            && let Ok(number) = text.parse::<i16>()
+            && !text.is_empty()
+            && text.bytes().all(|byte| byte.is_ascii_digit())
         {
-            let (hour, minute) = if text.len() <= 2 {
+            let number = text.parse::<u32>().ok()?;
+            let (hour, minute) = if number < 100 {
                 (number, 0)
             } else {
                 (number / 100, number % 100)
             };
-            Time::new(i8::try_from(hour).ok()?, i8::try_from(minute).ok()?, 0, 0)
-                .unwrap_or(Time::MIN)
+            if hour > 23 || minute > 59 {
+                Time::MIN
+            } else {
+                Time::new(hour as i8, minute as i8, 0, 0).ok()?
+            }
         } else {
             text.parse::<Time>().ok()?
         };
@@ -379,6 +441,26 @@ fn parse_mtime(value: &[u8], cx: &ToolCtx<'_>) -> Option<u64> {
         now.date().to_datetime(time)
     };
     u64::try_from(date_time.to_zoned(zone).ok()?.timestamp().as_second()).ok()
+}
+
+fn mtime_offset(text: &str) -> Option<(&str, Offset)> {
+    let (local, offset) = text.split_at_checked(text.len().checked_sub(5)?)?;
+    let (sign, digits) = offset.split_at_checked(1)?;
+    if !local.contains(':')
+        || !matches!(sign, "+" | "-")
+        || !digits.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+    let (hours, minutes) = digits.split_at_checked(2)?;
+    let hours = hours.parse::<i32>().ok()?;
+    let minutes = minutes.parse::<i32>().ok()?;
+    if minutes > 59 {
+        return None;
+    }
+    let seconds = hours * 3_600 + minutes * 60;
+    let seconds = if sign == "-" { -seconds } else { seconds };
+    Some((local.trim_ascii_end(), Offset::from_seconds(seconds).ok()?))
 }
 
 fn creation_error(cx: &ToolCtx<'_>, archive: &[u8], message: &[&[u8]]) -> i32 {
@@ -397,14 +479,38 @@ fn extract(
     cx: &ToolCtx<'_>,
 ) -> i32 {
     let archive_path = path(cx, archive);
-    let options = ExtractOptions {
-        destination: cx.cwd.to_path_buf(),
-        patterns: opts.inputs,
-        list_only: list,
-        touch: opts.touch,
-        verbose: false,
+    let result = if list {
+        let zone = cx.host.time_zone();
+        let now = cx.host.now().secs;
+        let time = |value: rcmake_host::FileTime| {
+            let Ok(stamp) = Timestamp::from_second(value.secs) else {
+                return String::new();
+            };
+            let recent = value.secs.abs_diff(now) <= 365 * 86_400 / 2;
+            let format = match (cfg!(windows), recent) {
+                (true, true) => "%d %b %H:%M",
+                (true, false) => "%d %b  %Y",
+                (false, true) => "%e %b %H:%M",
+                (false, false) => "%e %b  %Y",
+            };
+            stamp.to_zoned(zone.clone()).strftime(format).to_string()
+        };
+        list_command_archive(
+            cx.host,
+            &archive_path,
+            opts.inputs,
+            verbose.then_some(&time),
+        )
+    } else {
+        let options = ExtractOptions {
+            destination: cx.cwd.to_path_buf(),
+            patterns: opts.inputs,
+            touch: opts.touch,
+            ..Default::default()
+        };
+        extract_archive(cx.host, &archive_path, &options)
     };
-    match extract_archive(cx.host, &archive_path, &options) {
+    match result {
         Ok(names) => {
             if list || verbose {
                 let prefix = if list { b"".as_slice() } else { b"x " };
@@ -427,6 +533,17 @@ fn extract(
                         b"CMake Error: Problem with archive_read_open_filename(): Failed to open '",
                         archive,
                         b"'\n",
+                    ],
+                );
+            } else if let Some((reason, name)) = err.unsafe_path() {
+                error(
+                    cx,
+                    &[
+                        b"CMake Error: Problem with archive_write_header(): ",
+                        reason.as_bytes(),
+                        b"\nCMake Error: Current file:\n  ",
+                        name,
+                        b"\n",
                     ],
                 );
             } else {

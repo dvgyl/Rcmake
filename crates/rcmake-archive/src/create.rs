@@ -1,4 +1,4 @@
-use std::io::{Cursor, Write};
+use std::io::{Cursor, Read, Write};
 use std::path::{Path, PathBuf};
 
 use flate2::{Compression, write::GzEncoder};
@@ -10,7 +10,7 @@ use zip::{CompressionMethod, ZipWriter, write::FullFileOptions};
 use crate::timestamp;
 use crate::{
     ArchiveError, ArchiveFormat, CreateOptions, MAX_ENTRIES, absolute, archive_error, archive_name,
-    emit_names, read_bytes, relative_path, size_limit,
+    checked_name, emit_names, read_bytes, relative_path, size_limit,
 };
 
 pub(super) fn run(
@@ -19,6 +19,7 @@ pub(super) fn run(
     base_dir: &Path,
     inputs: &[PathBuf],
     options: &CreateOptions,
+    command: bool,
 ) -> Result<Vec<BString>, ArchiveError> {
     absolute(output)?;
     absolute(base_dir)?;
@@ -34,26 +35,29 @@ pub(super) fn run(
         mtime,
         names: Vec::new(),
         bytes_left: size_limit(),
+        command,
     };
     for input in inputs {
-        let relative = if input.is_absolute() {
-            input.strip_prefix(base_dir).map_err(|_| {
-                ArchiveError::new(format!(
+        let name = if input.is_absolute() {
+            if let Ok(relative) = input.strip_prefix(base_dir) {
+                archive_name(relative)
+            } else if command {
+                command_name(base_dir, input)
+            } else {
+                return Err(ArchiveError::new(format!(
                     "Input is outside the base directory: {}",
                     input.display()
-                ))
-            })?
+                )));
+            }
         } else {
-            input
+            archive_name(input)
         };
-        let name = archive_name(relative);
         let name = if name.is_empty() {
             BString::from(".")
         } else {
             name
         };
-        relative_path(&name)?;
-        archive.add(&base_dir.join(relative), name)?;
+        archive.add(&base_dir.join(input), name)?;
     }
 
     let bytes = archive.writer.finish()?;
@@ -62,21 +66,45 @@ pub(super) fn run(
     Ok(archive.names)
 }
 
+fn command_name(base_dir: &Path, input: &Path) -> BString {
+    let common = base_dir
+        .components()
+        .zip(input.components())
+        .take_while(|(left, right)| left == right)
+        .count();
+    if common == 0 {
+        return from_native(input);
+    }
+    let mut relative = PathBuf::new();
+    for _ in base_dir.components().skip(common) {
+        relative.push("..");
+    }
+    for part in input.components().skip(common) {
+        relative.push(part);
+    }
+    archive_name(&relative)
+}
+
 struct Creation<'a> {
     host: &'a dyn Host,
     writer: Writer,
     mtime: Option<FileTime>,
     names: Vec<BString>,
     bytes_left: u64,
+    command: bool,
 }
 
 impl Creation<'_> {
     fn add(&mut self, path: &Path, mut name: BString) -> Result<(), ArchiveError> {
+        if self.command {
+            checked_name(&name)?;
+        } else {
+            relative_path(&name)?;
+        }
         let metadata = self.host.metadata(path, Follow::No)?;
         if metadata.kind == FileKind::Dir {
             name.push(b'/');
         }
-        relative_path(&name)?;
         self.bytes_left = self
             .bytes_left
             .checked_sub(name.len() as u64 + 512)
@@ -129,10 +157,11 @@ impl Creation<'_> {
 }
 
 enum Writer {
-    Tar(Builder<Vec<u8>>),
-    TarGz(Builder<GzEncoder<Vec<u8>>>),
+    Tar(Builder<Vec<u8>>, bool),
+    TarGz(Builder<GzEncoder<Vec<u8>>>, bool),
     Zip {
         writer: Box<ZipWriter<Cursor<Vec<u8>>>>,
+        method: CompressionMethod,
         level: Option<i64>,
     },
 }
@@ -145,15 +174,29 @@ impl Writer {
                 "The compression level must be between 0 and 9",
             ));
         }
+        let gnu = matches!(
+            options.format,
+            ArchiveFormat::GnuTar | ArchiveFormat::GnuTarGz
+        );
         Ok(match options.format {
-            ArchiveFormat::Tar => Self::Tar(Builder::new(Vec::new())),
-            ArchiveFormat::TarGz => Self::TarGz(Builder::new(GzEncoder::new(
-                Vec::new(),
-                level.map_or_else(Compression::default, Compression::new),
-            ))),
-            ArchiveFormat::Zip => Self::Zip {
+            ArchiveFormat::Tar | ArchiveFormat::GnuTar => Self::Tar(Builder::new(Vec::new()), gnu),
+            ArchiveFormat::TarGz | ArchiveFormat::GnuTarGz => Self::TarGz(
+                Builder::new(GzEncoder::new(
+                    Vec::new(),
+                    level.map_or_else(Compression::default, Compression::new),
+                )),
+                gnu,
+            ),
+            ArchiveFormat::Zip | ArchiveFormat::ZipStored => Self::Zip {
                 writer: Box::new(ZipWriter::new(Cursor::new(Vec::new()))),
-                level: level.map(i64::from),
+                method: if options.format == ArchiveFormat::ZipStored {
+                    CompressionMethod::Stored
+                } else {
+                    CompressionMethod::Deflated
+                },
+                level: level
+                    .filter(|_| options.format == ArchiveFormat::Zip)
+                    .map(i64::from),
             },
         })
     }
@@ -167,9 +210,13 @@ impl Writer {
         contents: &[u8],
     ) -> Result<(), ArchiveError> {
         match self {
-            Self::Tar(writer) => add_tar(writer, name, kind, mode, mtime, contents),
-            Self::TarGz(writer) => add_tar(writer, name, kind, mode, mtime, contents),
-            Self::Zip { writer, level } => {
+            Self::Tar(writer, gnu) => add_tar(writer, *gnu, name, kind, mode, mtime, contents),
+            Self::TarGz(writer, gnu) => add_tar(writer, *gnu, name, kind, mode, mtime, contents),
+            Self::Zip {
+                writer,
+                method,
+                level,
+            } => {
                 if name.contains(&b'\\') {
                     return Err(ArchiveError::new(
                         "ZIP input paths must use slash separators",
@@ -177,7 +224,7 @@ impl Writer {
                 }
                 let name = std::str::from_utf8(name).map_err(archive_error)?;
                 let mut options = FullFileOptions::default()
-                    .compression_method(CompressionMethod::Deflated)
+                    .compression_method(*method)
                     .compression_level(*level)
                     .unix_permissions(mode)
                     .last_modified_time(timestamp::zip_dos_time(mtime));
@@ -201,8 +248,8 @@ impl Writer {
 
     fn finish(self) -> Result<Vec<u8>, ArchiveError> {
         match self {
-            Self::Tar(writer) => writer.into_inner().map_err(archive_error),
-            Self::TarGz(writer) => writer
+            Self::Tar(writer, _) => writer.into_inner().map_err(archive_error),
+            Self::TarGz(writer, _) => writer
                 .into_inner()
                 .and_then(GzEncoder::finish)
                 .map_err(archive_error),
@@ -216,13 +263,18 @@ impl Writer {
 
 fn add_tar(
     writer: &mut Builder<impl Write>,
+    gnu: bool,
     name: &[u8],
     kind: FileKind,
     mode: u32,
     mtime: FileTime,
     contents: &[u8],
 ) -> Result<(), ArchiveError> {
-    let mut header = Header::new_gnu();
+    let mut header = if gnu {
+        Header::new_gnu()
+    } else {
+        Header::new_ustar()
+    };
     header.set_mode(mode);
     header.set_uid(0);
     header.set_gid(0);
@@ -238,26 +290,63 @@ fn add_tar(
         0
     });
 
-    let mut pax = Vec::new();
-    let time = timestamp::pax_time(mtime);
-    if let Some(time) = &time {
-        pax.push(("mtime", time.as_bytes()));
+    let long_link = kind == FileKind::Symlink && header.set_link_name_literal(contents).is_err();
+    if gnu {
+        if !copy_name(&mut header, name) {
+            gnu_long(writer, EntryType::GNULongName, name)?;
+            let field = &mut header.as_old_mut().name;
+            for (byte, &value) in field.iter_mut().zip(name) {
+                *byte = value;
+            }
+        }
+        if long_link {
+            gnu_long(writer, EntryType::GNULongLink, contents)?;
+        }
+    } else {
+        let mut pax = Vec::new();
+        let time = timestamp::pax_time(mtime);
+        if let Some(time) = &time {
+            pax.push(("mtime", time.as_bytes()));
+        }
+        if !copy_name(&mut header, name)
+            && (header.set_path(crate::to_native(name)).is_err() || header.path_bytes() != name)
+        {
+            header.set_path("PaxEntry").map_err(archive_error)?;
+            pax.push(("path", name));
+        }
+        if long_link {
+            pax.push(("linkpath", contents));
+        }
+        writer.append_pax_extensions(pax).map_err(archive_error)?;
     }
-    let path = rcmake_host::path::to_native(name);
-    // The tar writer removes a leading "./" from paths with more than one component.
-    if name.starts_with(b"./") && name != b"./" {
-        pax.push(("path", name));
-    }
-    if kind == FileKind::Symlink && header.set_link_name_literal(contents).is_err() {
-        pax.push(("linkpath", contents));
-    }
-    writer.append_pax_extensions(pax).map_err(archive_error)?;
     let data = if kind == FileKind::File {
         contents
     } else {
         &[]
     };
+    header.set_cksum();
+    writer.append(&header, data).map_err(archive_error)
+}
+
+fn copy_name(header: &mut Header, name: &[u8]) -> bool {
+    let Some(field) = header.as_old_mut().name.get_mut(..name.len()) else {
+        return false;
+    };
+    field.copy_from_slice(name);
+    true
+}
+
+fn gnu_long(
+    writer: &mut Builder<impl Write>,
+    kind: EntryType,
+    value: &[u8],
+) -> Result<(), ArchiveError> {
+    let mut header = Header::new_gnu();
+    header.set_entry_type(kind);
+    header.set_size(value.len() as u64 + 1);
+    header.set_path("././@LongLink").map_err(archive_error)?;
+    header.set_cksum();
     writer
-        .append_data(&mut header, path, data)
+        .append(&header, value.chain(b"\0".as_slice()))
         .map_err(archive_error)
 }

@@ -10,7 +10,7 @@ use std::path::{Component, Path, PathBuf};
 
 use rcmake_base::{BString, Limits};
 use rcmake_host::path::{from_native, to_native};
-use rcmake_host::{Host, HostError, ReadRange, Stream};
+use rcmake_host::{FileTime, Host, HostError, ReadRange, Stream};
 use thiserror::Error;
 
 mod create;
@@ -28,12 +28,18 @@ const MAX_NAME_BYTES: usize = u16::MAX as usize;
 /// Archive container and compression format.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ArchiveFormat {
-    /// Uncompressed POSIX tar (`pax`/`gnutar`).
+    /// Uncompressed POSIX tar (`pax` or `paxr`).
     Tar,
     /// Gzip-compressed tar (`.tar.gz` / `.tgz`).
     TarGz,
+    /// Uncompressed GNU tar.
+    GnuTar,
+    /// Gzip-compressed GNU tar.
+    GnuTarGz,
     /// ZIP archive with deflate compression (`.zip`).
     Zip,
+    /// ZIP archive with stored entries.
+    ZipStored,
 }
 
 /// Options for [`create_archive`].
@@ -72,6 +78,7 @@ pub struct ExtractOptions {
 pub struct ArchiveError {
     /// Human-readable error message.
     pub message: String,
+    unsafe_path: Option<(&'static str, BString)>,
 }
 
 /// Create an archive at absolute path `output` from `inputs` resolved relative to `base_dir`.
@@ -90,7 +97,22 @@ pub fn create_archive(
     inputs: &[PathBuf],
     options: &CreateOptions,
 ) -> Result<Vec<BString>, ArchiveError> {
-    create::run(host, output, base_dir, inputs, options)
+    create::run(host, output, base_dir, inputs, options, false)
+}
+
+/// Create an archive for `cmake -E tar`. The input paths can be outside `base_dir`.
+///
+/// # Errors
+///
+/// Returns the same errors as [`create_archive`] except for paths outside the base directory.
+pub fn create_command_archive(
+    host: &dyn Host,
+    output: &Path,
+    base_dir: &Path,
+    inputs: &[PathBuf],
+    options: &CreateOptions,
+) -> Result<Vec<BString>, ArchiveError> {
+    create::run(host, output, base_dir, inputs, options, true)
 }
 
 /// Extract or list an archive at absolute path `archive_path`.
@@ -107,13 +129,44 @@ pub fn extract_archive(
     archive_path: &Path,
     options: &ExtractOptions,
 ) -> Result<Vec<BString>, ArchiveError> {
-    extract::run(host, archive_path, options)
+    extract::run(host, archive_path, options, extract::Listing::Shared)
+}
+
+/// List entries for `cmake -E tar`. `format_time` enables detailed output when supplied.
+///
+/// # Errors
+///
+/// Returns an error for an invalid archive, unmatched patterns, size limits, or host errors.
+pub fn list_command_archive(
+    host: &dyn Host,
+    archive_path: &Path,
+    patterns: Vec<BString>,
+    format_time: Option<&dyn Fn(FileTime) -> String>,
+) -> Result<Vec<BString>, ArchiveError> {
+    extract::run(
+        host,
+        archive_path,
+        &ExtractOptions {
+            patterns,
+            list_only: true,
+            ..Default::default()
+        },
+        format_time.map_or(extract::Listing::Names, extract::Listing::Details),
+    )
 }
 
 impl ArchiveError {
+    /// Return the reason and original name for an unsafe archive entry path.
+    pub fn unsafe_path(&self) -> Option<(&'static str, &[u8])> {
+        self.unsafe_path
+            .as_ref()
+            .map(|(reason, name)| (*reason, name.as_slice()))
+    }
+
     fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
+            unsafe_path: None,
         }
     }
 }
@@ -146,30 +199,49 @@ fn rooted(path: &[u8]) -> bool {
 }
 
 fn relative_path(name: &[u8]) -> Result<PathBuf, ArchiveError> {
-    let path = to_native(name);
-    if name.is_empty()
-        || name.len() > MAX_NAME_BYTES
-        || name.contains(&0)
-        || rooted(name)
-        || name
-            .split(|&byte| byte == b'/' || byte == b'\\')
-            .any(|part| part == b"..")
-        || path.components().count() > MAX_DEPTH
-        || path.components().any(|component| match component {
-            Component::CurDir => false,
-            Component::Normal(part) => cfg!(windows) && part.as_encoded_bytes().contains(&b':'),
-            _ => true,
+    let path = checked_name(name)?;
+    let reason = if rooted(name) {
+        Some("Path is absolute")
+    } else if name
+        .split(|&byte| byte == b'/' || byte == b'\\')
+        .any(|part| part == b"..")
+    {
+        Some("Path contains '..'")
+    } else {
+        None
+    };
+    if let Some(reason) = reason {
+        let mut error = invalid_name(name);
+        error.unsafe_path = Some((reason, BString::from(name)));
+        return Err(error);
+    }
+    if cfg!(windows)
+        && path.components().any(|component| {
+            matches!(component, Component::Normal(part) if part.as_encoded_bytes().contains(&b':'))
         })
     {
-        return Err(ArchiveError::new(format!(
-            "Invalid archive path: {:?}",
-            BString::from(name)
-        )));
+        return Err(invalid_name(name));
     }
     Ok(path
         .components()
         .filter(|part| matches!(part, Component::Normal(_)))
         .collect())
+}
+
+fn checked_name(name: &[u8]) -> Result<PathBuf, ArchiveError> {
+    let path = to_native(name);
+    if name.is_empty()
+        || name.len() > MAX_NAME_BYTES
+        || name.contains(&0)
+        || path.components().count() > MAX_DEPTH
+    {
+        return Err(invalid_name(name));
+    }
+    Ok(path)
+}
+
+fn invalid_name(name: &[u8]) -> ArchiveError {
+    ArchiveError::new(format!("Invalid archive path: {:?}", BString::from(name)))
 }
 
 fn read_bytes(host: &dyn Host, path: &Path, limit: u64) -> Result<Vec<u8>, ArchiveError> {

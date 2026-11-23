@@ -11,14 +11,22 @@ use zip::ZipArchive;
 use crate::pattern::Patterns;
 use crate::timestamp;
 use crate::{
-    ArchiveError, ExtractOptions, MAX_ENTRIES, absolute, archive_error, emit_names, read_bounded,
-    read_bytes, relative_path, size_limit,
+    ArchiveError, ExtractOptions, MAX_ENTRIES, absolute, archive_error, checked_name, emit_names,
+    read_bounded, read_bytes, relative_path, size_limit,
 };
+
+#[derive(Clone, Copy)]
+pub(super) enum Listing<'a> {
+    Shared,
+    Names,
+    Details(&'a dyn Fn(FileTime) -> String),
+}
 
 pub(super) fn run(
     host: &dyn Host,
     archive_path: &Path,
     options: &ExtractOptions,
+    listing: Listing<'_>,
 ) -> Result<Vec<BString>, ArchiveError> {
     absolute(archive_path)?;
     if !options.list_only {
@@ -34,6 +42,7 @@ pub(super) fn run(
     let mut scan = Scan {
         patterns: Patterns::new(&options.patterns)?,
         list_only: options.list_only,
+        listing,
         touch: options.touch,
         names: Vec::new(),
         count: 0,
@@ -74,6 +83,7 @@ pub(super) fn run(
 struct Scan<'a> {
     patterns: Patterns<'a>,
     list_only: bool,
+    listing: Listing<'a>,
     touch: bool,
     names: Vec<BString>,
     count: usize,
@@ -88,11 +98,14 @@ impl Scan<'_> {
             .checked_sub(name.len() as u64 + 512)
             .filter(|_| self.count <= MAX_ENTRIES)
             .ok_or_else(|| ArchiveError::new("Archive exceeds the entry or size limit"))?;
-        if !self.patterns.matches(path, name.ends_with(b"/"))? {
-            return Ok(false);
+        self.patterns.matches(path, name.ends_with(b"/"))
+    }
+
+    fn path(&self, name: &[u8]) -> Result<PathBuf, ArchiveError> {
+        match self.listing {
+            Listing::Shared => relative_path(name),
+            _ => checked_name(name),
         }
-        self.names.push(BString::from(name));
-        Ok(!self.list_only)
     }
 
     fn reserve_payload(&mut self, size: u64) -> Result<(), ArchiveError> {
@@ -147,8 +160,20 @@ impl Scan<'_> {
                 continue;
             }
             let name = item.path_bytes();
-            let path = relative_path(&name)?;
+            let path = self.path(&name)?;
             if !self.select(&name, &path)? {
+                continue;
+            }
+            let entry_name = if let Listing::Details(format_time) = self.listing {
+                let name = name.into_owned();
+                let line = tar_listing(&mut item, &name, format_time)?;
+                self.reserve_payload(line.len().saturating_sub(name.len() + 512) as u64)?;
+                line
+            } else {
+                BString::from(name.into_owned())
+            };
+            self.names.push(entry_name);
+            if self.list_only {
                 continue;
             }
             let data = match kind {
@@ -227,9 +252,40 @@ impl Scan<'_> {
                 .iter()
                 .map(|&byte| if byte == b'\\' { b'/' } else { byte })
                 .collect();
-            drop(item);
-            let path = relative_path(&name)?;
+            let path = self.path(&name)?;
             if !self.select(&name, &path)? {
+                continue;
+            }
+            let entry_name = if let Listing::Details(format_time) = self.listing {
+                let is_link = item.is_symlink();
+                let mode =
+                    item.unix_mode()
+                        .unwrap_or(if item.is_dir() { 0o40755 } else { 0o100644 });
+                let mtime = timestamp::zip_time(&item).unwrap_or_default();
+                let size = if is_link { 0 } else { item.size() };
+                drop(item);
+                let mut line = listing_line(
+                    mode,
+                    b"0 ",
+                    b"0",
+                    &size.to_string(),
+                    &format_time(mtime),
+                    &name,
+                );
+                if is_link {
+                    let mut link = archive.by_index(index).map_err(archive_error)?;
+                    let size = link.size();
+                    self.reserve_payload(size)?;
+                    line.extend_from_slice(b" -> ");
+                    line.extend_from_slice(&read_bounded(&mut link, crate::MAX_NAME_BYTES as u64)?);
+                }
+                line
+            } else {
+                drop(item);
+                BString::from(name)
+            };
+            self.names.push(entry_name);
+            if self.list_only {
                 continue;
             }
             let mut item = archive.by_index(index).map_err(archive_error)?;
@@ -268,6 +324,115 @@ impl Scan<'_> {
         }
         Ok(entries)
     }
+}
+
+fn tar_listing<R: Read>(
+    item: &mut tar::Entry<'_, R>,
+    name: &[u8],
+    format_time: &dyn Fn(FileTime) -> String,
+) -> Result<BString, ArchiveError> {
+    let time = format_time(timestamp::tar_time(item)?);
+    let header = item.header();
+    let kind = header.entry_type();
+    let file_type = match kind {
+        EntryType::Directory => 0o40000,
+        EntryType::Symlink => 0o120000,
+        EntryType::Char => 0o20000,
+        EntryType::Block => 0o60000,
+        EntryType::Fifo => 0o10000,
+        _ => 0o100000,
+    };
+    let mode = file_type | (header.mode().map_err(archive_error)? & 0o7777);
+    let uid = format!("{} ", header.uid().unwrap_or_default());
+    let gid = header.gid().unwrap_or_default().to_string();
+    let owner = header
+        .username_bytes()
+        .filter(|name| !name.is_empty())
+        .unwrap_or(uid.as_bytes());
+    let group = header
+        .groupname_bytes()
+        .filter(|name| !name.is_empty())
+        .unwrap_or(gid.as_bytes());
+    let size = if matches!(kind, EntryType::Char | EntryType::Block) {
+        let major = header
+            .device_major()
+            .map_err(archive_error)?
+            .unwrap_or_default();
+        let minor = header
+            .device_minor()
+            .map_err(archive_error)?
+            .unwrap_or_default();
+        format!("{major},{minor}")
+    } else {
+        item.size().to_string()
+    };
+    let mut line = listing_line(mode, owner, group, &size, &time, name);
+    if let Some(target) = item
+        .link_name_bytes()
+        .filter(|_| matches!(kind, EntryType::Link | EntryType::Symlink))
+    {
+        if target.len() > crate::MAX_NAME_BYTES {
+            return Err(ArchiveError::new("The tar link target is too long"));
+        }
+        line.extend_from_slice(if kind == EntryType::Link {
+            b" link to "
+        } else {
+            b" -> "
+        });
+        line.extend_from_slice(&target);
+    }
+    Ok(line)
+}
+
+fn listing_line(
+    mode: u32,
+    owner: &[u8],
+    group: &[u8],
+    size: &str,
+    time: &str,
+    name: &[u8],
+) -> BString {
+    let file_type = match mode & 0o170000 {
+        0o40000 => b'd',
+        0o120000 => b'l',
+        0o20000 => b'c',
+        0o60000 => b'b',
+        0o10000 => b'p',
+        0o140000 => b's',
+        _ => b'-',
+    };
+    let mut line = BString::from([file_type].as_slice());
+    for (shift, special) in [(6, b's'), (3, b's'), (0, b't')] {
+        line.push(if mode & (0o4 << shift) != 0 {
+            b'r'
+        } else {
+            b'-'
+        });
+        line.push(if mode & (0o2 << shift) != 0 {
+            b'w'
+        } else {
+            b'-'
+        });
+        let execute = mode & (0o1 << shift) != 0;
+        let special_bit = 0o1000 << (shift / 3);
+        line.push(match (execute, mode & special_bit != 0) {
+            (true, true) => special,
+            (false, true) => special.to_ascii_uppercase(),
+            (true, false) => b'x',
+            (false, false) => b'-',
+        });
+    }
+    line.extend_from_slice(b"  0 ");
+    line.extend_from_slice(owner);
+    line.extend(std::iter::repeat_n(
+        b' ',
+        6_usize.saturating_sub(owner.len()) + 1,
+    ));
+    line.extend_from_slice(group);
+    let width = (13_usize.saturating_sub(group.len())).max(size.len() + 1);
+    line.extend_from_slice(format!("{size:>width$} {time} ").as_bytes());
+    line.extend_from_slice(name);
+    line
 }
 
 struct Entry {

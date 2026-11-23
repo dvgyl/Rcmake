@@ -529,6 +529,7 @@ fn tar_option_and_missing_archive_errors() -> HostResult<()> {
     f.seed("options", b"\n-file\n")?;
     assert_eq!(f.run(&["tar", "tjz", "out"]), 1);
     assert_eq!(f.run(&["tar", "cf", "out", "--format=invalid"]), 1);
+    assert_eq!(f.run(&["tar", "cf", "out", "--cmake-tar-threads=nan"]), 1);
     assert_eq!(f.run(&["tar", "cf", "out", "--files-from=options"]), 1);
     assert_eq!(f.run(&["tar", "tf", "missing"]), 1);
     assert_eq!(
@@ -536,6 +537,7 @@ fn tar_option_and_missing_archive_errors() -> HostResult<()> {
         concat!(
             "CMake Error: Can only compress a tar file one way; at most one flag of z, j, or J may be used\n",
             "CMake Error: Unknown -E tar --format= argument: invalid\n",
+            "CMake Error: Invalid --cmake-tar-threads value: 'nan' - not a number\n",
             "CMake Error: -E tar --files-from='options' file invalid line:\n-file\n\n",
             "CMake Error: Problem with archive_read_open_filename(): Failed to open 'missing'\n",
             "CMake Error: Problem listing tar: missing\n",
@@ -566,24 +568,18 @@ fn tar_reports_missing_members_for_extract_and_both_list_modes() -> HostResult<(
 
 #[test]
 fn tar_round_trip_with_the_shared_archive_backend() -> HostResult<()> {
-    for args in [
-        ["cf", "--format=paxr"],
-        ["czf", "--format=paxr"],
-        ["cf", "--format=zip"],
+    for [flags, format, mtime] in [
+        ["cf", "--format=gnutar", "--mtime=2023-11-14 23:13:20+0100"],
+        ["czf", "--format=gnutar", "--mtime=@1700000000"],
+        ["cf", "--format=paxr", "--mtime=2023-11-14 22:13:20 UTC"],
+        ["czf", "--format=paxr", "--mtime=@1700000000"],
+        ["cf", "--format=zip", "--mtime=@1700000000"],
     ] {
-        let [flags, format] = args;
         let f = Fixture::new();
         f.seed("-input", b"content")?;
         f.seed("paths", b"--add-file=-input\n")?;
         assert_eq!(
-            f.run(&[
-                "tar",
-                flags,
-                "archive",
-                format,
-                "--mtime=@1700000000",
-                "--files-from=paths"
-            ]),
+            f.run(&["tar", flags, "archive", format, mtime, "--files-from=paths"]),
             0,
             "{}",
             f.err()
@@ -603,6 +599,43 @@ fn tar_round_trip_with_the_shared_archive_backend() -> HostResult<()> {
             }
         );
     }
+    Ok(())
+}
+
+#[test]
+fn tar_records_and_lists_absolute_input_as_a_relative_path() -> HostResult<()> {
+    let f = Fixture::new();
+    let outside = f.cwd.with_file_name("outside");
+    f.host.seed_file(&outside, b"content")?;
+    f.host.set_permissions(&outside, 0o644)?;
+    assert_eq!(
+        f.run(&[
+            "tar",
+            "cfq",
+            "archive",
+            "--format=gnutar",
+            "--mtime=1970-01-01UTC",
+            "--cmake-tar-threads=4",
+            &outside.to_string_lossy(),
+        ]),
+        0,
+    );
+    assert_eq!(f.err(), b"tar: Unknown argument: q\n");
+    assert_eq!(
+        f.read("archive")?.get(257..265),
+        Some(b"ustar  \0".as_slice())
+    );
+    assert_eq!(f.run(&["tar", "tvf", "archive"]), 0);
+    let day = if cfg!(windows) { "01" } else { " 1" };
+    assert_eq!(
+        f.out(),
+        format!("-rw-r--r--  0 0      0           7 {day} Jan  1970 ../outside\n"),
+    );
+    assert_eq!(f.run(&["tar", "xf", "archive"]), 1);
+    assert!(f.err().ends_with(
+        b"CMake Error: Problem with archive_write_header(): Path contains '..'\nCMake Error: Current file:\n  ../outside\nCMake Error: Problem extracting tar:\n  archive\n",
+    ));
+    assert_eq!(f.host.read(&outside, read_all())?, b"content");
     Ok(())
 }
 
