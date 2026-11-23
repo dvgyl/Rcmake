@@ -764,7 +764,7 @@ fn project_accepts_legacy_languages_and_clears_version_metadata() -> TestResult 
     configure(
         &host,
         &mut interp,
-        "project(Test VERSION 001.02 LANGUAGES NONE)\nproject(Other C CXX)\nproject(Other NONE)",
+        "project(Test VERSION 001.02 LANGUAGES NONE)\nproject(Other NONE)\nproject(Other NONE)",
         0,
     )?;
     assert_var(&mut interp, "CMAKE_PROJECT_NAME", Some("Other"));

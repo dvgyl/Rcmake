@@ -22,7 +22,16 @@ pub(super) fn project(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
     let Some((name, tail)) = args.split_first() else {
         return Err(status("PROJECT called with incorrect number of arguments"));
     };
-    let metadata = parse_metadata(cx, tail)?;
+    crate::configure::project_include_hook(cx, b"CMAKE_PROJECT_INCLUDE_BEFORE")?;
+    crate::configure::project_include_hook(
+        cx,
+        &field(b"CMAKE_PROJECT_", &field(name, b"_INCLUDE_BEFORE")),
+    )?;
+    let Arguments {
+        metadata,
+        unparsed,
+        languages,
+    } = parse_metadata(cx, tail)?;
     let version = metadata.get(b"VERSION".as_slice()).copied();
     let compat = metadata.get(b"COMPAT_VERSION".as_slice()).copied();
     if compat.is_some() && version.is_none() {
@@ -100,25 +109,50 @@ pub(super) fn project(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
         }
     }
 
-    let system = cx.host().system();
-    if !cx.var_defined(b"CMAKE_SYSTEM_NAME") {
-        cx.set_var(b"CMAKE_SYSTEM_NAME", system.sysname);
+    for group in language_groups(&unparsed, languages.as_deref()) {
+        crate::configure::enable_languages(cx, &group, false)?;
     }
-    if !cx.var_defined(b"CMAKE_SYSTEM_PROCESSOR") {
-        cx.set_var(b"CMAKE_SYSTEM_PROCESSOR", system.machine);
-    }
+
+    crate::configure::project_include_hook(cx, b"CMAKE_PROJECT_INCLUDE")?;
+    crate::configure::project_include_hook(
+        cx,
+        &field(b"CMAKE_PROJECT_", &field(name, b"_INCLUDE")),
+    )?;
     Ok(Flow::Normal)
 }
 
-fn parse_metadata<'a>(
-    cx: &mut Cx<'_>,
-    args: &[&'a [u8]],
-) -> Result<BTreeMap<&'a [u8], &'a [u8]>, CmdError> {
+/// The `enable_languages` calls of `project()`: `C` and `CXX` without language
+/// arguments, `NONE` for an empty `LANGUAGES` list, otherwise the legacy language names
+/// and then the `LANGUAGES` list.
+fn language_groups(unparsed: &[&[u8]], languages: Option<&[&[u8]]>) -> Vec<Vec<BString>> {
+    let owned = |list: &[&[u8]]| list.iter().map(|lang| BString::from(*lang)).collect();
+    match languages {
+        None if unparsed.is_empty() => vec![vec!["C".into(), "CXX".into()]],
+        Some([]) if unparsed.is_empty() => vec![vec!["NONE".into()]],
+        languages => [unparsed, languages.unwrap_or_default()]
+            .into_iter()
+            .filter(|list| !list.is_empty())
+            .map(owned)
+            .collect(),
+    }
+}
+
+/// Parsed `project()` arguments after the project name.
+struct Arguments<'a> {
+    metadata: BTreeMap<&'a [u8], &'a [u8]>,
+    /// Arguments outside every keyword: legacy language names.
+    unparsed: Vec<&'a [u8]>,
+    /// The `LANGUAGES` list, when the keyword is present.
+    languages: Option<Vec<&'a [u8]>>,
+}
+
+fn parse_metadata<'a>(cx: &mut Cx<'_>, args: &[&'a [u8]]) -> Result<Arguments<'a>, CmdError> {
     let mut metadata = BTreeMap::new();
     let mut args = args.iter().copied().peekable();
     let mut languages_seen = false;
     let mut in_languages = false;
     let mut bare_languages = Vec::new();
+    let mut languages = Vec::new();
     while let Some(arg) = args.next() {
         if arg == b"LANGUAGES" {
             if languages_seen {
@@ -143,7 +177,9 @@ fn parse_metadata<'a>(
                 );
             }
             metadata.insert(arg, value.unwrap_or_default());
-        } else if !in_languages {
+        } else if in_languages {
+            languages.push(arg);
+        } else {
             bare_languages.push(arg);
         }
     }
@@ -165,7 +201,11 @@ fn parse_metadata<'a>(
             ),
         );
     }
-    Ok(metadata)
+    Ok(Arguments {
+        metadata,
+        unparsed: bare_languages,
+        languages: languages_seen.then_some(languages),
+    })
 }
 
 fn is_metadata(arg: &[u8]) -> bool {
