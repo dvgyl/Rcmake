@@ -1,6 +1,6 @@
 [package]
 name = "rcmake-ctest"
-description = "Minimal ctest runner for Rcmake: CTestTestfile.cmake execution with filters and parallel jobs."
+description = "Native CTest runner for Rcmake."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -11,7 +11,9 @@ repository.workspace = true
 rcmake-base.workspace = true
 rcmake-diag.workspace = true
 rcmake-eval.workspace = true
+rcmake-expr.workspace = true
 rcmake-host.workspace = true
+rcmake-regex.workspace = true
 thiserror.workspace = true
 
 [lints]

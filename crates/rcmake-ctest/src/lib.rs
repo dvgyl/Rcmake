@@ -1,33 +1,52 @@
-//! Minimal `ctest` runner (ADR-009 Wave 3): executes `CTestTestfile.cmake` with `-C`,
-//! `-R`, `-E`, `-j`, and `--output-on-failure`.
-//!
-//! # Status
-//!
-//! Wave 0 freezes the contract. [`run`] returns [`CtestError::Unimplemented`].
+//! Native CTest test discovery and execution.
 
 #![forbid(unsafe_code)]
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use rcmake_base::BString;
-use rcmake_host::Host;
+use rcmake_host::{Host, HostError, Stream};
 
-/// `ctest` command-line options that the minimal runner supports.
+mod discovery;
+mod execution;
+mod reporting;
+mod schedule;
+mod selection;
+
+#[cfg(test)]
+mod tests;
+
+/// Options for a CTest run.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CtestOptions {
-    /// Build directory that holds the top `CTestTestfile.cmake` (`--test-dir`).
+    /// Build directory that contains the top-level `CTestTestfile.cmake` (`--test-dir`).
     pub test_dir: PathBuf,
-    /// `-C <config>`.
+    /// Configuration to test (`-C`, `--build-config`).
     pub config: Option<BString>,
-    /// `-R <regex>`: run only matching tests.
+    /// Include tests with matching names (`-R`).
     pub include: Option<BString>,
-    /// `-E <regex>`: skip matching tests.
+    /// Exclude tests with matching names (`-E`).
     pub exclude: Option<BString>,
-    /// `-j <n>`: parallel test processes (at least 1).
+    /// Include tests with a matching label (`-L`). Each pattern must match a label.
+    pub include_labels: Vec<BString>,
+    /// Exclude tests by label (`-LE`). Each pattern must match a label to exclude a test.
+    pub exclude_labels: Vec<BString>,
+    /// Maximum number of concurrent test processes (`-j`). Zero uses one job.
     pub jobs: usize,
-    /// `--output-on-failure`.
+    /// Print output from failed tests (`--output-on-failure`).
     pub output_on_failure: bool,
+    /// Print commands and test output (`-V`, `--verbose`).
+    pub verbose: bool,
+    /// Suppress run reports (`-Q`, `--quiet`).
+    pub quiet: bool,
+    /// List selected tests without starting them (`-N`, `--show-only`).
+    pub show_only: bool,
+    /// Default timeout per test (`--timeout`).
+    pub timeout: Option<Duration>,
+    /// Stop starting regular tests after a failure (`--stop-on-failure`).
+    pub stop_on_failure: bool,
 }
 
 impl Default for CtestOptions {
@@ -37,36 +56,100 @@ impl Default for CtestOptions {
             config: None,
             include: None,
             exclude: None,
+            include_labels: Vec::new(),
+            exclude_labels: Vec::new(),
             jobs: 1,
             output_on_failure: false,
+            verbose: false,
+            quiet: false,
+            show_only: false,
+            timeout: None,
+            stop_on_failure: false,
         }
     }
 }
 
-/// Result of a test run.
+/// Result of a test run. Test names are in discovery order.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CtestOutcome {
-    /// Process exit code (`0` when every test passed).
+    /// Process exit code. Zero indicates success. Eight indicates failure.
     pub exit_code: i32,
-    /// Names of the tests that passed.
+    /// Names of tests that passed.
     pub passed: Vec<BString>,
-    /// Names of the tests that failed.
+    /// Names of tests that failed or could not run.
     pub failed: Vec<BString>,
 }
 
-/// Error that stops `ctest` before tests run.
+/// Error that prevents the runner from starting tests.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum CtestError {
-    /// `-R` or `-E` is not a valid regular expression.
-    #[error("invalid regular expression")]
+    /// A test filter or property contains an invalid regular expression.
+    #[error("Invalid regular expression: {}", .0)]
     BadRegex(BString),
-    /// The runner is not implemented yet.
-    #[error("{0} is not implemented yet")]
-    Unimplemented(&'static str),
+    /// Matching a test name or label exceeded the regular expression step limit.
+    #[error("Regular expression matching exceeded the step limit")]
+    RegexLimit,
+    /// The interpreter could not evaluate the test file.
+    #[error("Cannot load test definitions from {}", .0.display())]
+    Load(PathBuf),
+    /// The host could not access the test file.
+    #[error("Cannot access {}: {source}", path.display())]
+    Access {
+        /// Path to the test file.
+        path: PathBuf,
+        /// Host error for the file.
+        source: HostError,
+    },
 }
 
-/// Run the tests below `options.test_dir`. Each `CTestTestfile.cmake` runs in a script
-/// mode `rcmake_eval::Interp` that records `add_test()` and `subdirs()` calls.
-pub fn run(_host: Arc<dyn Host>, _options: &CtestOptions) -> Result<CtestOutcome, CtestError> {
-    Err(CtestError::Unimplemented("the ctest runner"))
+/// Discover and run the tests under `options.test_dir`. Write reports through `host`.
+///
+/// # Errors
+///
+/// Returns an error if discovery fails or a regular expression cannot be evaluated.
+pub fn run(host: Arc<dyn Host>, options: &CtestOptions) -> Result<CtestOutcome, CtestError> {
+    let mut dir = host.initial_cwd();
+    if !options.test_dir.as_os_str().is_empty() {
+        dir.push(&options.test_dir);
+    }
+    let dir = rcmake_host::path::to_native(
+        &rcmake_base::path_lex::Lexical::new(&rcmake_host::path::from_native(&dir)).normalize(),
+    );
+    let tests = discovery::load(Arc::clone(&host), &dir, options.config.as_ref())?;
+    let plan = selection::plan(tests, options)?;
+    let report = reporting::Report::new(host.as_ref(), options, &plan);
+    report.project(&dir);
+    if options.show_only {
+        report.list(&plan);
+        return Ok(CtestOutcome::default());
+    }
+
+    if !plan.is_acyclic() {
+        if !options.quiet {
+            host.write_out(
+                Stream::Stderr,
+                b"Error: a cycle exists in the test dependency graph.\n",
+            );
+        }
+        return Ok(CtestOutcome {
+            exit_code: 8,
+            ..CtestOutcome::default()
+        });
+    }
+
+    let started = host.monotonic();
+    let results = schedule::run(host.as_ref(), options, &plan, &report);
+    report.summary(&plan, &results, host.monotonic().saturating_sub(started));
+    let mut outcome = CtestOutcome::default();
+    for (test, result) in plan.tests.iter().zip(results) {
+        match result {
+            Some(execution::Status::Passed) => outcome.passed.push(test.name.clone()),
+            Some(status) if status.failed() => outcome.failed.push(test.name.clone()),
+            _ => {}
+        }
+    }
+    if !outcome.failed.is_empty() {
+        outcome.exit_code = 8;
+    }
+    Ok(outcome)
 }
