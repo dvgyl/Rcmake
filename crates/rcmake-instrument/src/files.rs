@@ -133,7 +133,11 @@ pub(crate) fn newest_content(
 ) -> Result<Option<BString>, InstrumentError> {
     Ok(json_files(host, &data.join("content"))?
         .into_iter()
-        .rev()
-        .find(|name| name.starts_with(b"cmake-"))
+        .filter(|name| name.starts_with(b"cmake-"))
+        .max_by(|left, right| file_stem(left).cmp(file_stem(right)))
         .map(|name| path::from_native(&Path::new("content").join(path::to_native(&name)))))
+}
+
+pub(crate) fn file_stem(name: &[u8]) -> &[u8] {
+    name.strip_suffix(b".json").unwrap_or(name)
 }

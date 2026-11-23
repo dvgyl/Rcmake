@@ -9,7 +9,7 @@ use rcmake_host::{
 };
 
 use crate::files::{
-    absolute, api_dir, epoch_millis, newest_content, publish_at, read_json, timestamp,
+    absolute, api_dir, epoch_millis, newest_content, publish_at, read_bytes, read_json, timestamp,
 };
 use crate::query::read_queries;
 use crate::snippet::{SnippetDetails, SystemSample, write_snippet_with_details};
@@ -103,6 +103,14 @@ fn compile_trace_path(
     None
 }
 
+fn comma_list(value: &[u8]) -> Vec<BString> {
+    value
+        .split(|byte| *byte == b',')
+        .filter(|item| !item.is_empty())
+        .map(BString::from)
+        .collect()
+}
+
 fn run(
     host: &dyn Host,
     build_dir: &Path,
@@ -182,7 +190,11 @@ fn run(
                     | SnippetRole::Test
             ))
         .then_some(None),
-        cmake_content: newest_content(host, &data)?,
+        cmake_content: if role == SnippetRole::Test {
+            None
+        } else {
+            newest_content(host, &data)?
+        },
         trace_file: (role == SnippetRole::Compile && enabled(InstrumentOption::CompileTrace))
             .then_some(saved_trace),
         target_labels: Some(metadata.labels),
@@ -216,7 +228,7 @@ pub fn run_instrumented(
 ///
 /// Returns an error if the arguments are invalid or a host operation fails.
 pub fn run_launcher(host: &dyn Host, argv: &[BString]) -> Result<i32, InstrumentError> {
-    let mut args = argv.iter();
+    let mut args = argv.iter().peekable();
     if argv
         .first()
         .is_some_and(|arg| arg.as_slice() == b"--instrument")
@@ -234,7 +246,16 @@ pub fn run_launcher(host: &dyn Host, argv: &[BString]) -> Result<i32, Instrument
                 .map_or_else(|| cwd.clone(), |dir| absolute(host, dir));
             let role =
                 role.ok_or_else(|| invalid("The instrumentation command type is missing."))?;
-            return run(host, &build, &cwd, role, args.as_slice(), metadata);
+            let command: Vec<_> = args.cloned().collect();
+            return run(host, &build, &cwd, role, &command, metadata);
+        }
+        if flag.as_slice() == b"--role" {
+            continue;
+        }
+        if matches!(flag.as_slice(), b"--target-name" | b"--config")
+            && args.peek().is_some_and(|arg| arg.starts_with(b"--"))
+        {
+            continue;
         }
         let value = args
             .next()
@@ -246,23 +267,17 @@ pub fn run_launcher(host: &dyn Host, argv: &[BString]) -> Result<i32, Instrument
                 })?)
             }
             b"--build-dir" => build = Some(path::to_native(value)),
-            b"--target-name" => metadata.target = Some(value.clone()),
+            b"--target-name" => metadata.target = (!value.is_empty()).then(|| value.clone()),
             b"--config" => metadata.config = Some(value.clone()),
             b"--source" => metadata.source = Some(value.clone()),
             b"--language" => metadata.language = Some(value.clone()),
             b"--test-name" => metadata.test_name = Some(value.clone()),
-            b"--output" => metadata.outputs.extend(
-                value
-                    .split(|byte| *byte == b',')
-                    .filter(|item| !item.is_empty())
-                    .map(BString::from),
-            ),
-            b"--target-labels" => metadata.labels.extend(
-                value
-                    .split(|byte| *byte == b',')
-                    .filter(|item| !item.is_empty())
-                    .map(BString::from),
-            ),
+            b"--output" => metadata.outputs = comma_list(value),
+            b"--output-as-file-name" => {
+                let file = absolute(host, &path::to_native(value));
+                metadata.outputs = comma_list(&read_bytes(host, &file)?);
+            }
+            b"--target-labels" => metadata.labels.extend(comma_list(value)),
             _ => {
                 return Err(invalid(format!(
                     "Unknown instrumentation launcher option: {flag}"

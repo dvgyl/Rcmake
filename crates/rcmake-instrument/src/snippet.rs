@@ -6,7 +6,7 @@ use rcmake_base::{BString, hash::HashAlgo, list, truth};
 use rcmake_host::{Follow, Host, path};
 use rcmake_json::{ReadOptions, Value, parse};
 
-use crate::files::{absolute, api_dir, publish_at, timestamp};
+use crate::files::{absolute, api_dir, newest_content, publish_at, timestamp};
 use crate::system::{dynamic_information, static_information};
 use crate::{
     CustomContent, CustomContentType, DATA_VERSION, IndexFile, InstrumentError, Object, Snippet,
@@ -154,7 +154,16 @@ pub fn write_snippet(
     data_dir: &Path,
     snippet: &Snippet,
 ) -> Result<PathBuf, InstrumentError> {
-    write_snippet_with_details(host, data_dir, snippet, &SnippetDetails::default())
+    let data = absolute(host, data_dir);
+    let cmake_content = match snippet.role {
+        SnippetRole::Configure | SnippetRole::Test => None,
+        _ => newest_content(host, &data)?,
+    };
+    let details = SnippetDetails {
+        cmake_content,
+        ..SnippetDetails::default()
+    };
+    write_snippet_with_details(host, &data, snippet, &details)
 }
 
 /// Write a snippet with optional system samples and metadata.

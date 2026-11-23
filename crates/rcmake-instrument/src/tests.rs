@@ -157,7 +157,6 @@ fn reads_user_project_and_generated_queries() {
             .collect::<Vec<_>>(),
         [
             Hook::Manual,
-            Hook::PrepareForCDash,
             Hook::PostCTest,
             Hook::PreBuild,
             Hook::PreBuild
@@ -174,6 +173,74 @@ fn reads_user_project_and_generated_queries() {
         json_files(&host, &generated_dir).expect("reset query numbers"),
         [BString::from("query-0.json")]
     );
+}
+
+#[test]
+fn query_errors_show_the_source_value_and_file() {
+    let host = host();
+    let build = Path::new("/build");
+    let query = build.join(".cmake/instrumentation/v1/query");
+    host.seed_file(
+        &query.join("invalid.json"),
+        b"{\n  \"version\": 1,\n  \"options\": [\"trace\", \"bad option\"]\n}\n",
+    )
+    .expect("write invalid query");
+    let error = query::read_queries(&host, build).expect_err("reject invalid query");
+    assert_eq!(
+        error.to_string(),
+        concat!(
+            "Could not load instrumentation queries from /build/.cmake/instrumentation/v1/query:\n",
+            "invalid.json:3: Not a valid option: \"bad option\"\n",
+            "  \"options\": [\"trace\", \"bad option\"]\n",
+            "                       ^",
+        ),
+    );
+}
+
+#[test]
+fn manual_index_preserves_data_covered_by_an_existing_index() {
+    let host = host();
+    let build = Path::new("/build");
+    let api = build.join(".cmake/instrumentation/v1");
+    let data = api.join("data");
+    host.seed_file(
+        &api.join("query/trace.json"),
+        br#"{"version":1,"options":["trace"]}"#,
+    )
+    .expect("write trace query");
+    for _ in 0..2 {
+        snippet::write_content(&host, build, b"example", &[], &[], false).expect("write content");
+    }
+    let run = || {
+        launcher::run_instrumented(&host, build, crate::SnippetRole::Custom, &["work".into()])
+            .expect("record command");
+    };
+    host.set_command_handler(|_, _, _| {
+        Ok(RunOutput {
+            results: vec![ProcessResult::Exited(0)],
+            ..RunOutput::default()
+        })
+    })
+    .expect("set command handler");
+    run();
+    host.sleep(Duration::from_secs(1));
+    let marker = data.join("index/index-existing.json");
+    host.seed_file(&marker, b"").expect("write existing index");
+    host.sleep(Duration::from_secs(1));
+    run();
+    hooks::run_hook(&host, build, Hook::Manual).expect("index the newer snippet");
+    assert_eq!(json_files(&host, &data).expect("list snippets").len(), 1);
+    assert_eq!(
+        json_files(&host, &data.join("content"))
+            .expect("list content")
+            .len(),
+        2
+    );
+    host.remove_file(&marker).expect("remove existing index");
+    hooks::run_hook(&host, build, Hook::Manual).expect("index the older snippet");
+    assert!(json_files(&host, &data).expect("list snippets").is_empty());
+    only_file(&host, &data.join("content"));
+    only_file(&host, &data.join("trace"));
 }
 
 #[test]
@@ -225,7 +292,7 @@ fn launcher_records_metadata_and_hook_dispatches_callbacks_once_per_batch() {
     let build = Path::new("/build");
     let api = build.join(".cmake/instrumentation/v1");
     let data = api.join("data");
-    host.seed_file(&api.join("query/one.json"), br#"{"version":1,"hooks":["postBuild"],"options":["processMetrics","dynamicSystemInformation","captureOutput","compileTrace","staticSystemInformation"]}"#).expect("query");
+    host.seed_file(&api.join("query/one.json"), br#"{"version":1,"hooks":["postBuild"],"options":["processMetrics","dynamicSystemInformation","captureOutput","compileTrace","staticSystemInformation","trace"]}"#).expect("query");
     host.seed_file(
         &api.join("query/two.json"),
         br#"{"version":1,"callbacks":["observe \"two words\" ''","observe next"]}"#,
@@ -238,6 +305,8 @@ fn launcher_records_metadata_and_hook_dispatches_callbacks_once_per_batch() {
     .expect("meminfo");
     host.seed_file(Path::new("/proc/loadavg"), b"0.25 0.42 0.88 1/10 1\n")
         .expect("loadavg");
+    host.seed_file(Path::new("/work/outputs.txt"), b"main.o,missing.o")
+        .expect("write output list");
     snippet::write_content(&host, build, b"example", &[], &[], false).expect("content");
     host.set_command_handler(|host, request, output| {
         let stage = request.pipeline.first().expect("one stage");
@@ -297,8 +366,8 @@ fn launcher_records_metadata_and_hook_dispatches_callbacks_once_per_batch() {
         "Debug",
         "--build-dir",
         "/build",
-        "--output",
-        "main.o,missing.o",
+        "--output-as-file-name",
+        "outputs.txt",
         "--source",
         "main.c",
         "--language",
@@ -408,8 +477,6 @@ fn simultaneous_hooks_do_not_index_the_same_snippet() {
                     .expect("wait lock")
                     .recv_timeout(Duration::from_secs(5))
                     .expect("second callback");
-            } else {
-                second_finished.send(()).expect("signal second callback");
             }
         }
         Ok(RunOutput {
@@ -427,6 +494,9 @@ fn simultaneous_hooks_do_not_index_the_same_snippet() {
             .recv_timeout(Duration::from_secs(5))
             .expect("first callback");
         hooks::run_hook(&host, build, Hook::PostBuild).expect("post-build hook");
+        second_finished
+            .send(())
+            .expect("signal second hook completion");
         pre.join()
             .expect("join pre-build hook")
             .expect("pre-build hook");

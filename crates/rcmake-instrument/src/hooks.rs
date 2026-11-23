@@ -7,10 +7,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use rcmake_base::BString;
-use rcmake_host::{Host, Stream, WriteMode, path};
+use rcmake_host::{FileTime, Follow, Host, Stream, WriteMode, path};
 use rcmake_json::Value;
 
-use crate::files::{absolute, api_dir, json_files, publish_at, read_json, timestamp};
+use crate::files::{absolute, api_dir, file_stem, json_files, publish_at, read_json, timestamp};
 use crate::launcher::execute;
 use crate::query::read_queries;
 use crate::snippet::index_value;
@@ -95,14 +95,24 @@ fn callback_arguments(command: &[u8]) -> Result<Vec<BString>, InstrumentError> {
     Ok(args)
 }
 
-fn pending(host: &dyn Host, data: &Path) -> Result<Vec<BString>, InstrumentError> {
+fn pending(host: &dyn Host, data: &Path) -> Result<(Vec<BString>, bool), InstrumentError> {
     let mut indexed = BTreeSet::new();
+    let mut watermark: Option<FileTime> = None;
     let index_dir = data.join("index");
     for name in json_files(host, &index_dir)? {
         if !name.starts_with(b"index-") {
             continue;
         }
         let file = index_dir.join(path::to_native(&name));
+        let metadata = match host.metadata(&file, Follow::No) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind == ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        watermark = Some(watermark.map_or(metadata.mtime, |old| old.max(metadata.mtime)));
+        if metadata.len == 0 {
+            continue;
+        }
         let value = match read_json(host, &file) {
             Ok(value) => value,
             Err(InstrumentError::Host(error)) if error.kind == ErrorKind::NotFound => continue,
@@ -122,12 +132,21 @@ fn pending(host: &dyn Host, data: &Path) -> Result<Vec<BString>, InstrumentError
     for prefix in ["", "v1"] {
         for name in json_files(host, &data.join(prefix))? {
             let name = path::from_native(&Path::new(prefix).join(path::to_native(&name)));
-            if !indexed.contains(&name) {
-                result.push(name);
+            if indexed.contains(&name) {
+                continue;
             }
+            if let Some(watermark) = watermark {
+                match host.metadata(&data.join(path::to_native(&name)), Follow::No) {
+                    Ok(metadata) if metadata.mtime > watermark => {}
+                    Ok(_) => continue,
+                    Err(error) if error.kind == ErrorKind::NotFound => continue,
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            result.push(name);
         }
     }
-    Ok(result)
+    Ok((result, watermark.is_some()))
 }
 
 fn write_batch(
@@ -139,11 +158,12 @@ fn write_batch(
     include_trace: bool,
 ) -> Result<(PathBuf, Vec<BString>), InstrumentError> {
     let _lock = IndexLock::acquire(host, data)?;
+    let (snippets, _) = pending(host, data)?;
     let mut index = IndexFile {
         build_dir: path::from_native(build),
         data_dir: path::from_native(data),
         hook: hook.as_str().into(),
-        snippets: pending(host, data)?,
+        snippets,
         trace: None,
     };
     let suffix = format!(
@@ -184,6 +204,25 @@ fn write_batch(
     Ok((file, index.snippets))
 }
 
+fn remove_file(host: &dyn Host, file: &Path) -> Result<(), InstrumentError> {
+    match host.remove_file(file) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind == ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn prune_artifacts(host: &dyn Host, dir: &Path, prefix: &[u8]) -> Result<(), InstrumentError> {
+    let mut files = json_files(host, dir)?;
+    files.retain(|name| name.starts_with(prefix));
+    files.sort_by(|left, right| file_stem(left).cmp(file_stem(right)));
+    files.pop();
+    for name in files {
+        remove_file(host, &dir.join(path::to_native(&name)))?;
+    }
+    Ok(())
+}
+
 /// Index pending snippets for a subscribed hook and pass the index to each callback.
 ///
 /// `Manual` can also be used to request indexing directly. The index and its
@@ -206,7 +245,7 @@ pub fn run_hook(host: &dyn Host, build_dir: &Path, hook: Hook) -> Result<(), Ins
         &data,
         hook,
         enabled(InstrumentOption::StaticSystemInformation),
-        enabled(InstrumentOption::Trace) || enabled(InstrumentOption::CompileTrace),
+        enabled(InstrumentOption::Trace),
     )?;
     for callback in queries.iter().flat_map(|query| &query.callbacks) {
         let result = callback_arguments(callback).and_then(|mut command| {
@@ -229,13 +268,17 @@ pub fn run_hook(host: &dyn Host, build_dir: &Path, hook: Hook) -> Result<(), Ins
             }
         }
     }
+    let _lock = IndexLock::acquire(host, &data)?;
     for name in snippets {
-        match host.remove_file(&data.join(path::to_native(&name))) {
-            Ok(()) => {}
-            Err(error) if error.kind == ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
+        remove_file(host, &data.join(path::to_native(&name)))?;
+    }
+    remove_file(host, &index)?;
+    let (pending, other_index) = pending(host, &data)?;
+    if !other_index {
+        prune_artifacts(host, &data.join("trace"), b"trace-")?;
+        if pending.is_empty() {
+            prune_artifacts(host, &data.join("content"), b"cmake-")?;
         }
     }
-    host.remove_file(&index)?;
     Ok(())
 }

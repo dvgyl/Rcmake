@@ -13,58 +13,199 @@ use crate::{
     strings, version_value,
 };
 
-fn integer(value: &Value) -> Option<u64> {
+mod source;
+
+use source::{Location, QueryDiagnostics};
+
+fn integer(value: &Value) -> Option<i128> {
     match value {
-        Value::Int(n) => u64::try_from(*n).ok(),
-        Value::UInt(n) => Some(*n),
+        Value::Int(n) => Some(i128::from(*n)),
+        Value::UInt(n) => Some(i128::from(*n)),
+        Value::Real(n) if n.is_finite() && n.fract() == 0.0 => Some(*n as i128),
         _ => None,
     }
 }
 
-fn version(value: &Value) -> Result<DataVersion, InstrumentError> {
+fn version(value: &Value, errors: &mut QueryDiagnostics<'_>) -> Option<DataVersion> {
     let (major, minor) = match value {
         Value::Object(fields) => {
-            let major = fields.get(b"major".as_slice()).and_then(integer);
-            let minor = match fields.get(b"minor".as_slice()) {
-                Some(value) => integer(value),
-                None => Some(0),
-            };
-            (major, minor)
+            let major = version_member(fields, "major", errors);
+            let minor = version_member(fields, "minor", errors);
+            for key in fields
+                .keys()
+                .filter(|key| !matches!(key.as_slice(), b"major" | b"minor"))
+            {
+                errors.add(
+                    Location::VersionMember(key),
+                    format!("Invalid extra field \"{key}\" in version object"),
+                );
+            }
+            (major?, minor?)
         }
-        _ => (integer(value), Some(0)),
+        _ => match integer(value) {
+            Some(major) => (major, 0),
+            None => {
+                errors.add(
+                    Location::Field(b"version"),
+                    "Version must be an integer or object",
+                );
+                return None;
+            }
+        },
     };
-    match (major, minor) {
-        (Some(1), Some(minor)) if minor <= DATA_VERSION.minor => {
-            Ok(DataVersion { major: 1, minor })
+    (major == 1 && (0..=i128::from(DATA_VERSION.minor)).contains(&minor)).then(|| DataVersion {
+        major: 1,
+        minor: u64::try_from(minor).unwrap_or_default(),
+    })
+}
+
+fn version_member(
+    fields: &Object,
+    key: &'static str,
+    errors: &mut QueryDiagnostics<'_>,
+) -> Option<i128> {
+    match fields.get(key.as_bytes()) {
+        None if key == "minor" => Some(0),
+        None => {
+            errors.add(
+                Location::Field(b"version"),
+                "Missing required field \"major\" in version object",
+            );
+            None
         }
-        (Some(_), Some(_)) => Err(InstrumentError::UnsupportedVersion),
-        _ => Err(invalid(
-            "The instrumentation query version must contain integers.",
-        )),
+        Some(value) => integer(value).or_else(|| {
+            let mut message = format!("\"{key}\" expected an integer");
+            if let Some(value) = scalar_text(value) {
+                message.push_str(&format!(", got: {value}"));
+            }
+            errors.add(Location::VersionMember(key.as_bytes()), message);
+            None
+        }),
+    }
+}
+
+fn scalar_text(value: &Value) -> Option<String> {
+    match value {
+        Value::Object(_) | Value::Array(_) => None,
+        Value::String(text) => Some(text.to_string()),
+        Value::Null => Some(String::new()),
+        _ => Some(String::from_utf8_lossy(&rcmake_json::write_compact(value)).into_owned()),
     }
 }
 
 fn entries<T>(
     root: &Object,
-    key: &str,
+    key: &'static [u8],
+    errors: &mut QueryDiagnostics<'_>,
     convert: impl Fn(&BString) -> Option<T>,
-) -> Result<Vec<T>, InstrumentError> {
-    match root.get(key.as_bytes()) {
-        None => Ok(Vec::new()),
+    invalid_entry: impl Fn(usize, &Value) -> String,
+) -> Vec<T> {
+    match root.get(key) {
+        None => Vec::new(),
         Some(Value::Array(values)) => values
             .iter()
-            .map(|value| match value {
-                Value::String(name) => convert(name).ok_or_else(|| {
-                    invalid(format!("Unknown instrumentation query {key} entry: {name}"))
-                }),
-                _ => Err(invalid(format!(
-                    "Instrumentation query {key} entries must be strings."
-                ))),
+            .enumerate()
+            .filter_map(|(index, value)| {
+                if let Value::String(name) = value
+                    && let Some(entry) = convert(name)
+                {
+                    return Some(entry);
+                }
+                errors.add(Location::Item(key, index), invalid_entry(index, value));
+                None
             })
             .collect(),
-        _ => Err(invalid(format!(
-            "Instrumentation query {key} must be an array."
-        ))),
+        Some(value) => {
+            let location = if matches!(value, Value::Null) {
+                Location::Absent
+            } else {
+                Location::Field(key)
+            };
+            errors.add(location, "Invalid Array");
+            Vec::new()
+        }
+    }
+}
+
+fn invalid_keyword(kind: &str, value: &Value) -> String {
+    scalar_text(value).map_or_else(
+        || format!("Expected a string for {kind}"),
+        |value| format!("Not a valid {kind}: \"{value}\""),
+    )
+}
+
+fn parse_query_file(text: &[u8], filename: &str) -> Result<Query, InstrumentError> {
+    let text = text.strip_prefix(b"\xef\xbb\xbf").unwrap_or(text);
+    let mut errors = QueryDiagnostics::new(text, filename);
+    let root = match parse(text, &ReadOptions::default()) {
+        Ok(Value::Object(root)) => root,
+        Ok(_) => {
+            errors.add(Location::Root, "Invalid root object");
+            return Err(errors.into_error());
+        }
+        Err(error) => {
+            errors.add_line(error.line as usize, error.column as usize, &error.message);
+            return Err(errors.into_error());
+        }
+    };
+    let version = if let Some(value) = root.get(b"version".as_slice()) {
+        version(value, &mut errors)
+    } else {
+        errors.add(
+            Location::Root,
+            "Missing required field \"version\" in root object",
+        );
+        None
+    };
+    if version.is_none() && errors.is_empty() {
+        return Err(InstrumentError::UnsupportedVersion);
+    }
+    let options = entries(
+        &root,
+        b"options",
+        &mut errors,
+        |name| InstrumentOption::from_name(name),
+        |_, value| invalid_keyword("option", value),
+    );
+    let hooks = entries(
+        &root,
+        b"hooks",
+        &mut errors,
+        |name| Hook::from_name(name),
+        |_, value| invalid_keyword("hook", value),
+    );
+    let callbacks = entries(
+        &root,
+        b"callbacks",
+        &mut errors,
+        |name| Some(name.clone()),
+        |index, value| {
+            let mut message = format!("\"$vector_item_{index}\" expected a string");
+            if let Some(value) = scalar_text(value) {
+                message.push_str(&format!(", got: {value}"));
+            }
+            message
+        },
+    );
+    for key in root.keys().filter(|key| {
+        !matches!(
+            key.as_slice(),
+            b"version" | b"options" | b"hooks" | b"callbacks"
+        )
+    }) {
+        errors.add(
+            Location::Field(key),
+            format!("Invalid extra field \"{key}\" in root object"),
+        );
+    }
+    match version {
+        Some(version) if errors.is_empty() => Ok(Query {
+            version,
+            options,
+            hooks,
+            callbacks,
+        }),
+        _ => Err(errors.into_error()),
     }
 }
 
@@ -74,21 +215,7 @@ fn entries<T>(
 ///
 /// Returns an error for invalid JSON, invalid fields, or an unsupported data version.
 pub fn parse_query(text: &[u8]) -> Result<Query, InstrumentError> {
-    let Value::Object(root) =
-        parse(text, &ReadOptions::default()).map_err(|error| invalid(error.to_string()))?
-    else {
-        return Err(invalid("An instrumentation query must be an object."));
-    };
-    let version = version(
-        root.get(b"version".as_slice())
-            .ok_or_else(|| invalid("The instrumentation query has no version."))?,
-    )?;
-    Ok(Query {
-        version,
-        callbacks: entries(&root, "callbacks", |name| Some(name.clone()))?,
-        hooks: entries(&root, "hooks", |name| Hook::from_name(name))?,
-        options: entries(&root, "options", |name| InstrumentOption::from_name(name))?,
-    })
+    parse_query_file(text, "")
 }
 
 fn user_config(host: &dyn Host) -> Option<PathBuf> {
@@ -118,26 +245,27 @@ pub fn read_queries(host: &dyn Host, build_dir: &Path) -> Result<Vec<Query>, Ins
     let project = api_dir(&absolute(host, build_dir)).join("query");
     let mut dirs = Vec::new();
     if let Some(config) = user_config(host) {
-        let config = absolute(host, &config);
-        dirs.push(config.join("instrumentation/v1/query"));
-        if host
-            .env_get(b"CMAKE_CONFIG_DIR")
-            .is_some_and(|value| !value.is_empty())
-        {
-            dirs.push(config.join("cmake/instrumentation/v1/query"));
-        }
+        dirs.push(absolute(host, &config).join("instrumentation/v1/query"));
     }
     dirs.extend([project.clone(), project.join("generated")]);
 
     let mut queries = Vec::new();
     for dir in dirs {
+        let mut errors = Vec::new();
         for name in json_files(host, &dir)? {
             let file = dir.join(path::to_native(&name));
-            match parse_query(&read_bytes(host, &file)?) {
+            match parse_query_file(&read_bytes(host, &file)?, &name.to_string()) {
                 Ok(query) => queries.push(query),
                 Err(InstrumentError::UnsupportedVersion) => {}
-                Err(error) => return Err(invalid(format!("{}: {error}", file.display()))),
+                Err(error) => errors.push(error.to_string()),
             }
+        }
+        if !errors.is_empty() {
+            return Err(invalid(format!(
+                "Could not load instrumentation queries from {}:\n{}",
+                dir.display(),
+                errors.join("\n")
+            )));
         }
     }
     Ok(queries)
@@ -170,8 +298,10 @@ pub fn write_generated_query(
     build_dir: &Path,
     query: &Query,
 ) -> Result<(), InstrumentError> {
+    if query.version.major != DATA_VERSION.major || query.version.minor > DATA_VERSION.minor {
+        return Err(InstrumentError::UnsupportedVersion);
+    }
     let data_version = version_value(query.version);
-    version(&data_version)?;
     let dir = generated_dir(host, build_dir);
     let value = Value::Object(Object::from([
         ("version".into(), data_version),
