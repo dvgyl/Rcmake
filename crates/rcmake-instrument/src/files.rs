@@ -1,0 +1,139 @@
+//! File layout and publication through the host.
+
+use std::io::ErrorKind;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use rcmake_base::BString;
+use rcmake_host::{FileKind, Follow, Host, HostError, ReadRange, WriteMode, path};
+use rcmake_json::{ReadOptions, Value, parse, write_styled};
+
+use crate::{InstrumentError, invalid};
+
+const JSON_LIMIT: u64 = 32 * 1024 * 1024;
+const FILE_NAME_ATTEMPTS: u64 = 65_536;
+static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn absolute(host: &dyn Host, path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        host.initial_cwd().join(path)
+    }
+}
+
+pub(crate) fn api_dir(build_dir: &Path) -> PathBuf {
+    build_dir.join(".cmake/instrumentation/v1")
+}
+
+pub(crate) fn json_files(host: &dyn Host, dir: &Path) -> Result<Vec<BString>, HostError> {
+    let entries = match host.read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind == ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
+    let mut files: Vec<_> = entries
+        .into_iter()
+        .filter(|entry| {
+            matches!(entry.kind, FileKind::File | FileKind::Symlink)
+                && !entry.name.starts_with(b".")
+                && entry.name.ends_with(b".json")
+        })
+        .map(|entry| entry.name)
+        .collect();
+    files.sort();
+    Ok(files)
+}
+
+pub(crate) fn read_bytes(host: &dyn Host, file: &Path) -> Result<Vec<u8>, HostError> {
+    if host.metadata(file, Follow::Yes)?.kind != FileKind::File {
+        return Err(HostError::from_io(
+            std::io::Error::new(ErrorKind::InvalidInput, "Expected a regular file."),
+            Some(file.to_path_buf()),
+        ));
+    }
+    host.read(file, ReadRange::All { limit: JSON_LIMIT })
+}
+
+pub(crate) fn read_json(host: &dyn Host, file: &Path) -> Result<Value, InstrumentError> {
+    parse(&read_bytes(host, file)?, &ReadOptions::default())
+        .map_err(|error| invalid(format!("{}: {error}", file.display())))
+}
+
+pub(crate) fn timestamp(host: &dyn Host) -> String {
+    let now = host.now();
+    format!("{:020}-{:09}", now.secs.max(0), now.nanos)
+}
+
+pub(crate) fn epoch_millis(host: &dyn Host) -> u64 {
+    let time = host.now();
+    u64::try_from(time.secs)
+        .unwrap_or_default()
+        .saturating_mul(1000)
+        .saturating_add(u64::from(time.nanos / 1_000_000))
+}
+
+/// The final name becomes visible only after the staged file is complete.
+pub(crate) fn publish(
+    host: &dyn Host,
+    dir: &Path,
+    value: &Value,
+    filename: impl Fn(u64) -> String,
+) -> Result<PathBuf, InstrumentError> {
+    host.create_dir_all(dir)?;
+    let data = write_styled(value, "\t");
+    let staged = (0..FILE_NAME_ATTEMPTS)
+        .find_map(|_| {
+            let serial = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
+            let temp = dir.join(format!(".instrument-{}-{serial}.tmp", host.system().pid));
+            match host.write(&temp, &data, WriteMode::CreateNew) {
+                Ok(()) => Some(Ok(temp)),
+                Err(error) if error.kind == ErrorKind::AlreadyExists => None,
+                Err(error) => Some(Err(error.into())),
+            }
+        })
+        .unwrap_or_else(|| {
+            Err(invalid(
+                "No temporary instrumentation file name is available.",
+            ))
+        })?;
+
+    let result = (0..FILE_NAME_ATTEMPTS)
+        .find_map(|n| {
+            let path = dir.join(filename(n));
+            match host.hard_link(&staged, &path) {
+                Ok(()) => Some(Ok(path)),
+                Err(error) if error.kind == ErrorKind::AlreadyExists => None,
+                Err(error) => Some(Err(error.into())),
+            }
+        })
+        .unwrap_or_else(|| Err(invalid("No instrumentation file name is available.")));
+    let _ = host.remove_file(&staged);
+    result
+}
+
+pub(crate) fn publish_at(
+    host: &dyn Host,
+    dir: &Path,
+    stem: &str,
+    value: &Value,
+) -> Result<PathBuf, InstrumentError> {
+    publish(host, dir, value, |n| {
+        if n == 0 {
+            format!("{stem}.json")
+        } else {
+            format!("{stem}-{n:020}.json")
+        }
+    })
+}
+
+pub(crate) fn newest_content(
+    host: &dyn Host,
+    data: &Path,
+) -> Result<Option<BString>, InstrumentError> {
+    Ok(json_files(host, &data.join("content"))?
+        .into_iter()
+        .rev()
+        .find(|name| name.starts_with(b"cmake-"))
+        .map(|name| path::from_native(&Path::new("content").join(path::to_native(&name)))))
+}

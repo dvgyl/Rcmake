@@ -18,6 +18,9 @@
 
 use rcmake_base::BString;
 
+mod files;
+mod system;
+
 pub mod hooks;
 pub mod launcher;
 pub mod query;
@@ -36,9 +39,9 @@ pub const DATA_VERSION: DataVersion = DataVersion { major: 1, minor: 2 };
 /// Error of an instrumentation operation.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum InstrumentError {
-    /// The operation is not implemented yet.
-    #[error("{0} is not supported yet")]
-    Unsupported(&'static str),
+    /// The query requests a data version that this implementation ignores.
+    #[error("unsupported instrumentation data version")]
+    UnsupportedVersion,
     /// A query or argument is not valid. The text is the CMake-style message.
     #[error("{0}")]
     Invalid(BString),
@@ -75,19 +78,25 @@ pub enum Hook {
     PostCMakeWorkflow,
     /// `postCTest`.
     PostCTest,
+    /// `prepareForCDash`.
+    PrepareForCDash,
+    /// `manual`.
+    Manual,
 }
 
 impl Hook {
-    /// All hooks in documentation order.
-    pub const ALL: [Self; 8] = [
+    /// All hooks in generated query order.
+    pub const ALL: [Self; 10] = [
         Self::PostGenerate,
         Self::PreBuild,
         Self::PostBuild,
         Self::PreCMakeBuild,
         Self::PostCMakeBuild,
+        Self::PostCTest,
         Self::PostCMakeInstall,
         Self::PostCMakeWorkflow,
-        Self::PostCTest,
+        Self::PrepareForCDash,
+        Self::Manual,
     ];
 
     /// The hook keyword.
@@ -102,6 +111,8 @@ impl Hook {
             Self::PostCMakeInstall => "postCMakeInstall",
             Self::PostCMakeWorkflow => "postCMakeWorkflow",
             Self::PostCTest => "postCTest",
+            Self::PrepareForCDash => "prepareForCDash",
+            Self::Manual => "manual",
         }
     }
 
@@ -136,13 +147,13 @@ pub enum InstrumentOption {
 }
 
 impl InstrumentOption {
-    /// All options in documentation order.
+    /// All options in generated query order.
     pub const ALL: [Self; 8] = [
         Self::StaticSystemInformation,
         Self::DynamicSystemInformation,
         Self::CaptureOutput,
-        Self::CompileTrace,
         Self::ProcessMetrics,
+        Self::CompileTrace,
         Self::CdashSubmit,
         Self::CdashVerbose,
         Self::Trace,
@@ -248,9 +259,32 @@ pub enum SnippetRole {
     CTest,
     /// `test`.
     Test,
+    /// `workflow`.
+    Workflow,
 }
 
 impl SnippetRole {
+    /// The role with keyword `name`.
+    #[must_use]
+    pub fn from_name(name: &[u8]) -> Option<Self> {
+        [
+            Self::Configure,
+            Self::Generate,
+            Self::Compile,
+            Self::Link,
+            Self::Custom,
+            Self::Build,
+            Self::CMakeBuild,
+            Self::CMakeInstall,
+            Self::Install,
+            Self::CTest,
+            Self::Test,
+            Self::Workflow,
+        ]
+        .into_iter()
+        .find(|role| role.as_str().as_bytes() == name)
+    }
+
     /// The role keyword.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
@@ -266,6 +300,7 @@ impl SnippetRole {
             Self::Install => "install",
             Self::CTest => "ctest",
             Self::Test => "test",
+            Self::Workflow => "workflow",
         }
     }
 }
@@ -316,4 +351,22 @@ pub struct IndexFile {
     pub snippets: Vec<BString>,
     /// `trace`: trace file path relative to `dataDir`.
     pub trace: Option<BString>,
+}
+
+fn invalid(message: impl Into<BString>) -> InstrumentError {
+    InstrumentError::Invalid(message.into())
+}
+
+type Object = std::collections::BTreeMap<BString, rcmake_json::Value>;
+
+fn version_value(version: DataVersion) -> rcmake_json::Value {
+    use rcmake_json::Value;
+    Value::Object(Object::from([
+        ("major".into(), Value::UInt(version.major)),
+        ("minor".into(), Value::UInt(version.minor)),
+    ]))
+}
+
+fn strings(values: impl IntoIterator<Item = impl Into<BString>>) -> rcmake_json::Value {
+    rcmake_json::Value::Array(values.into_iter().map(rcmake_json::Value::string).collect())
 }
