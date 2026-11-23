@@ -79,7 +79,7 @@ pub(crate) fn run(
             interp.cx().project(),
         ),
         GeneratorKind::UnixMakefiles => {
-            rcmake_gen_make::generate_unix_makefiles(&result, host, bin)
+            rcmake_gen_make::generate_with_model(&result, host, bin, interp.cx().project())
         }
     };
     match result {
