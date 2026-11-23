@@ -26,6 +26,9 @@ pub mod modmap;
 pub mod p1689;
 pub mod tdi;
 
+mod json;
+mod modules_json;
+
 #[cfg(test)]
 mod tests;
 
@@ -39,6 +42,14 @@ pub enum ModulesError {
     /// CMake-style message.
     #[error("{0}")]
     Invalid(BString),
+    /// A cycle prevents one or more modules from building.
+    #[error("Circular dependency detected in the C++ module import graph. See modules named: {0}")]
+    Cycle(BString),
+    /// An import names a private module from another target.
+    #[error(
+        "Unable to use module '{0}' as it is 'PRIVATE' and therefore not accessible outside of its owning target."
+    )]
+    PrivateImport(BString),
 }
 
 /// How a source names a required module (P1689r5 `lookup-method`).
@@ -77,7 +88,7 @@ impl LookupMethod {
 }
 
 /// One module that a source provides (P1689r5 `provides` entry).
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ModuleProvide {
     /// `logical-name`.
     pub logical_name: BString,
@@ -89,6 +100,18 @@ pub struct ModuleProvide {
     pub unique_on_source_path: bool,
     /// `is-interface` (default `true`).
     pub is_interface: bool,
+}
+
+impl Default for ModuleProvide {
+    fn default() -> Self {
+        Self {
+            logical_name: BString::default(),
+            source_path: None,
+            compiled_module_path: None,
+            unique_on_source_path: false,
+            is_interface: true,
+        }
+    }
 }
 
 /// One module that a source requires (P1689r5 `requires` entry).
@@ -111,6 +134,8 @@ pub struct ModuleRequire {
 pub struct P1689Rule {
     /// `primary-output`: the object file of the source.
     pub primary_output: Option<BString>,
+    /// `work-directory`: base directory for relative paths in this rule.
+    pub work_directory: Option<BString>,
     /// `outputs`: other outputs.
     pub outputs: Vec<BString>,
     /// `provides`.
@@ -178,7 +203,7 @@ pub enum ModuleVisibility {
 
 /// One `CXX_MODULES` source of a target (`cxx-modules.<object>` in
 /// `CXXDependInfo.json`).
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ModuleSourceInfo {
     /// `source`: absolute source path.
     pub source: BString,
@@ -188,10 +213,38 @@ pub struct ModuleSourceInfo {
     pub relative_directory: BString,
     /// `visibility`.
     pub visibility: ModuleVisibility,
+    /// `type`: file set type. `None` means the field was absent.
+    pub file_set_type: Option<BString>,
+    /// `compile-features`.
+    pub compile_features: Vec<BString>,
+    /// `compile-options`.
+    pub compile_options: Vec<BString>,
+    /// `definitions`.
+    pub definitions: Vec<BString>,
+    /// `include-directories`.
+    pub include_directories: Vec<BString>,
     /// `bmi-only`: the source compiles only to a module file.
     pub bmi_only: bool,
     /// `destination`: install destination of the source.
     pub destination: Option<BString>,
+}
+
+impl Default for ModuleSourceInfo {
+    fn default() -> Self {
+        Self {
+            source: BString::default(),
+            file_set: BString::default(),
+            relative_directory: BString::default(),
+            visibility: ModuleVisibility::default(),
+            file_set_type: Some("CXX_MODULES".into()),
+            compile_features: Vec::new(),
+            compile_options: Vec::new(),
+            definitions: Vec::new(),
+            include_directories: Vec::new(),
+            bmi_only: false,
+            destination: None,
+        }
+    }
 }
 
 /// One export of a target (`exports` in `CXXDependInfo.json`).
@@ -199,6 +252,8 @@ pub struct ModuleSourceInfo {
 pub struct ModuleExportInfo {
     /// `export-name`: exported target name.
     pub export_name: BString,
+    /// `filesystem-export-name`: name for the export file.
+    pub filesystem_export_name: BString,
     /// `namespace`.
     pub namespace: BString,
     /// `destination`: export file directory.
@@ -228,6 +283,33 @@ pub struct BmiInstallInfo {
     pub message_level: BString,
     /// `script-location`.
     pub script_location: BString,
+}
+
+/// Build database file paths.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DatabaseInfo {
+    /// `template-path`.
+    pub template_path: BString,
+    /// `output`.
+    pub output: BString,
+}
+
+/// A scanned source outside the module file sets.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ScannedSourceInfo {
+    /// `source`: absolute source path.
+    pub source: BString,
+    /// `language`.
+    pub language: BString,
+}
+
+/// Module objects available from interface libraries.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct InterfaceObjectInfo {
+    /// `rsp-file`: path to the link response file.
+    pub rsp_file: Option<BString>,
+    /// `module-objects`: object paths by logical module name.
+    pub module_objects: BTreeMap<BString, BString>,
 }
 
 /// Per-target collation input (`CXXDependInfo.json`, the "TDI").
@@ -265,6 +347,14 @@ pub struct TargetDependInfo {
     pub linked_target_dirs: Vec<BString>,
     /// `forward-modules-from-target-dirs`.
     pub forward_modules_from_target_dirs: Vec<BString>,
+    /// `sources`: other scanned sources by object path.
+    pub sources: BTreeMap<BString, ScannedSourceInfo>,
+    /// `database-info`.
+    pub database_info: Option<DatabaseInfo>,
+    /// `native-target-dir` of a synthetic target.
+    pub native_target_dir: Option<BString>,
+    /// `cxx-interface-objects`.
+    pub interface_objects: Option<InterfaceObjectInfo>,
 }
 
 /// One module file of `CXXModules.json` (`modules.<logical-name>`).
@@ -285,6 +375,15 @@ pub struct ModuleReference {
     pub lookup_method: LookupMethod,
 }
 
+/// Error to report if a dependent target imports one of the listed modules.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ModuleImportError {
+    /// Error message from the providing target.
+    pub message: BString,
+    /// Logical names that cause the error.
+    pub modules: Vec<BString>,
+}
+
 /// The module table of a target that dependent targets read (`CXXModules.json`).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CxxModulesJson {
@@ -294,4 +393,8 @@ pub struct CxxModulesJson {
     pub references: BTreeMap<BString, ModuleReference>,
     /// `usages`: transitive imports, by logical name.
     pub usages: BTreeMap<BString, Vec<BString>>,
+    /// `interface-objects`: object paths by logical module name.
+    pub interface_objects: BTreeMap<BString, BString>,
+    /// `import-error` from a target that cannot provide some of its modules.
+    pub import_error: Option<ModuleImportError>,
 }
