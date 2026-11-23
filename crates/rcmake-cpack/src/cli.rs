@@ -6,7 +6,16 @@ use rcmake_host::{Host, Stream};
 use crate::{CPackOptions, CpackError, error};
 
 const VALUE_OPTIONS: &[&str] = &[
-    "-G", "-C", "-B", "-P", "-R", "--vendor", "-D", "--config", "--preset",
+    "-G",
+    "-C",
+    "-B",
+    "-P",
+    "-R",
+    "--vendor",
+    "-D",
+    "--config",
+    "--preset",
+    "--presets-file",
 ];
 
 /// Parse the CPack arguments without the executable name.
@@ -62,6 +71,7 @@ pub fn parse(args: &[BString]) -> Result<CPackOptions, CpackError> {
                     b"--vendor" => &mut result.vendor,
                     b"--config" => &mut result.config_file,
                     b"--preset" => &mut result.preset,
+                    b"--presets-file" => &mut result.presets_file,
                     _ => {
                         let Some((name, value)) = split_option(value) else {
                             return Err(error("Please specify CPack definitions as: KEY=VALUE"));
@@ -83,10 +93,10 @@ fn split_option(option: &[u8]) -> Option<(&[u8], &[u8])> {
 }
 
 fn missing(flag: &[u8]) -> CpackError {
-    CpackError::Argument(if flag == b"--preset" {
-        "No preset specified for --preset".into()
-    } else {
-        format!("Invalid value used with {}", BString::from(flag)).into()
+    CpackError::Argument(match flag {
+        b"--preset" => "No preset specified for --preset".into(),
+        b"--presets-file" => "No file specified for --presets-file".into(),
+        _ => format!("Invalid value used with {}", BString::from(flag)).into(),
     })
 }
 
@@ -130,7 +140,7 @@ pub(crate) fn print_information(host: &dyn Host, options: &CPackOptions) -> bool
         );
         host.write_out(Stream::Stdout, text.as_bytes());
     } else if options.help {
-        host.write_out(Stream::Stdout, b"Usage\n\n  cpack [options]\n\nOptions\n  -G <generators>     = Override CPACK_GENERATOR\n  -C <configs>        = Select build configurations\n  -D <var>=<value>    = Set a CPack variable\n  --config <file>     = Select the CPack config file\n  -P <name>           = Set the package name\n  -R <version>        = Set the package version\n  -B <dir>            = Set the package directory\n  --vendor <name>     = Set the package vendor\n  --preset <name>     = Use a package preset\n  --list-presets      = List available package presets\n  -V, --verbose       = Enable verbose output\n  --debug             = Enable debug output\n  --trace             = Trace CMake scripts\n  --trace-expand      = Trace CMake scripts with variables expanded\n  --version           = Print the version\n  --help              = Print this help\n\nGenerators\n  TGZ TXZ TZST TBZ2 TZ TAR ZIP ZIP_DEFLATE ZIP_STORE Bundle DragNDrop\n");
+        host.write_out(Stream::Stdout, b"Usage\n\n  cpack [options]\n\nOptions\n  -G <generators>     = Override CPACK_GENERATOR\n  -C <configs>        = Select build configurations\n  -D <var>=<value>    = Set a CPack variable\n  --config <file>     = Select the CPack config file\n  -P <name>           = Set the package name\n  -R <version>        = Set the package version\n  -B <dir>            = Set the package directory\n  --vendor <name>     = Set the package vendor\n  --preset <name>     = Use a package preset\n  --presets-file <file> = Select a presets file\n  --list-presets      = List available package presets\n  -V, --verbose       = Enable verbose output\n  --debug             = Enable debug output\n  --trace             = Trace CMake scripts\n  --trace-expand      = Trace CMake scripts with variables expanded\n  --version           = Print the version\n  --help              = Print this help\n\nGenerators\n  TGZ TXZ TZST TBZ2 TZ TAR ZIP ZIP_DEFLATE ZIP_STORE Bundle DragNDrop\n");
     } else {
         return false;
     }

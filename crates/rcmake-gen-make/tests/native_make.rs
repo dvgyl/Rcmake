@@ -294,3 +294,161 @@ fn native_make_builds_c_archive_and_executable_incrementally() {
             .is_ok()
     );
 }
+
+#[test]
+fn native_make_builds_install_and_test_inputs_on_demand() {
+    use rcmake_base::hash::HashAlgo;
+    use rcmake_model::{
+        BT, DirId, InstallKind, InstallOptions, InstallRule, ProjectModel, TestEntry, TestKind,
+    };
+    use rcmake_resolve::lower::lower_install_manifest;
+
+    let host = NativeHost::new().expect("native host");
+    let temp = TempDir {
+        host: &host,
+        path: run(
+            &host,
+            Path::new("/tmp"),
+            "/usr/bin/mktemp",
+            &["-d", "/tmp/rcmake-prep.XXXXXX"],
+        )
+        .trim_end()
+        .into(),
+    };
+    let root = &temp.path;
+    let mut model = ProjectModel::default();
+    let binary = path::from_native(root);
+    model.set_root_dirs(binary.clone(), binary.clone());
+    let child_binary = path::from_native(&root.join("child"));
+    let child = model
+        .add_directory(
+            DirId::ROOT,
+            binary.clone(),
+            child_binary.clone(),
+            Default::default(),
+        )
+        .expect("add directory");
+    model
+        .dir_mut(child)
+        .props
+        .set("CMAKE_TEST_BUILD_DEPENDS".into(), "static.txt".into());
+    host.write(
+        &root.join("static.txt"),
+        b"source input\n",
+        WriteMode::Truncate,
+    )
+    .expect("write static input");
+    for (component, file, exclude_from_all) in [
+        ("runtime", "runtime.txt", false),
+        ("extra", "extra.txt", true),
+    ] {
+        model.add_install(InstallRule {
+            dir: DirId::ROOT,
+            backtrace: Default::default(),
+            kind: InstallKind::Files(vec![BT::new(
+                path::from_native(&root.join(file)),
+                Default::default(),
+            )]),
+            options: InstallOptions {
+                destination: Some("share".into()),
+                component: Some(component.into()),
+                exclude_from_all,
+                ..InstallOptions::default()
+            },
+        });
+    }
+    for (name, test_kind, input) in [
+        ("smoke", TestKind::Single, "smoke.txt"),
+        (
+            "discovery",
+            TestKind::Discover(Box::default()),
+            "$<1:discovery.txt>",
+        ),
+    ] {
+        model
+            .add_test(TestEntry {
+                name: name.into(),
+                kind: test_kind,
+                dir: DirId::ROOT,
+                backtrace: Default::default(),
+                command: vec!["true".into()],
+                configurations: Vec::new(),
+                working_directory: None,
+                command_expand_lists: false,
+                old_style: false,
+                props: Default::default(),
+                build_depends: vec![BT::new(input.into(), Default::default())],
+            })
+            .expect("add test");
+    }
+
+    let files = [
+        "runtime.txt",
+        "extra.txt",
+        "smoke.txt",
+        "discovery.txt",
+        "user.txt",
+    ];
+    let result = GenerationResult {
+        graphs: vec![BuildGraph {
+            steps: files
+                .iter()
+                .map(|file| {
+                    BuildStep::Custom(CustomStep {
+                        outputs: vec![(*file).into()],
+                        invocations: vec![invocation(&format!("touch {file}"))],
+                        ..CustomStep::default()
+                    })
+                })
+                .collect(),
+            targets: ["runtime", "extra", "smoke", "discovery", "test_prep"]
+                .iter()
+                .enumerate()
+                .map(|(index, name)| graph_target(name, vec![index], vec![], false))
+                .collect(),
+            ..BuildGraph::default()
+        }],
+        install: lower_install_manifest(&model, &[]),
+        ..GenerationResult::default()
+    };
+    rcmake_gen_make::generate_with_model(&result, &host, root, &model).expect("generate Makefiles");
+
+    let exists = |file: &str| host.metadata(&root.join(file), Follow::Yes).is_ok();
+    run(&host, root, "/usr/bin/make", &["install_prep"]);
+    assert!(exists("runtime.txt"));
+    assert!(!exists("extra.txt"));
+    assert!(!exists("smoke.txt"));
+
+    run(
+        &host,
+        root,
+        "/usr/bin/make",
+        &["install_prep/extra", "test_prep/smoke"],
+    );
+    assert!(exists("extra.txt"));
+    assert!(exists("smoke.txt"));
+    assert!(!exists("discovery.txt"));
+
+    let hash = HashAlgo::Md5.hex_digest(&binary);
+    let goal = format!(
+        "test_prep/directory_{}",
+        hash.get(..8).expect("directory id")
+    );
+    let child_hash = HashAlgo::Md5.hex_digest(&child_binary);
+    let child_goal = format!(
+        "test_prep/directory_{}",
+        child_hash.get(..8).expect("child directory id")
+    );
+    run(
+        &host,
+        root,
+        "/usr/bin/make",
+        &[&goal, &child_goal, "test_prep/all"],
+    );
+    assert!(exists("discovery.txt"));
+    assert!(!exists("user.txt"));
+
+    run(&host, root, "/usr/bin/make", &["test_prep"]);
+    assert!(exists("user.txt"));
+    assert!(read(&host, &root.join("Makefile")).contains("install_prep/runtime:"));
+}

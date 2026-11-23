@@ -32,7 +32,7 @@ pub(crate) struct Record {
     pub(crate) hidden: bool,
     pub(crate) source: Arc<Origin>,
     pub(crate) fields: Fields,
-    pub(crate) condition: Option<Arc<Condition>>,
+    pub(crate) condition: Option<Arc<(Condition, Arc<Value>)>>,
     pub(crate) vendor: Option<BTreeMap<BString, Value>>,
     offset: Option<usize>,
     inherits: Vec<BString>,
@@ -63,7 +63,7 @@ impl Record {
             (false, Vec::new())
         } else {
             if let Some(field) = reader.take("condition", 3, 13)? {
-                condition = Some(Arc::new(Condition::parse(&field, &name, 0)?));
+                condition = Some(Arc::new((Condition::parse(&field, &name, 0)?, field.value)));
             }
             let hidden = reader
                 .optional("hidden", 1, 13, &mut schema::literal)?
@@ -500,7 +500,7 @@ impl Inheritance<'_> {
                 merge_fields(&mut record.fields, &inherited.fields, "")?;
                 if record.condition.is_none()
                     && let Some(condition) = &inherited.condition
-                    && !matches!(condition.as_ref(), Condition::Null)
+                    && !matches!(condition.0, Condition::Null)
                 {
                     record.condition = Some(Arc::clone(condition));
                 }

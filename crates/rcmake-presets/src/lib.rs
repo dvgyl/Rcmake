@@ -44,7 +44,9 @@ impl PresetKind {
         (Self::Workflow, "workflowPresets"),
     ];
 
-    fn label(self) -> &'static str {
+    /// Get the lowercase name of this preset category.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
         match self {
             Self::Configure => "configure",
             Self::Build => "build",

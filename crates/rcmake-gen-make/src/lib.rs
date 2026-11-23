@@ -10,6 +10,7 @@ use std::path::Path;
 use rcmake_base::{BString, ByteVec};
 use rcmake_gen_common::{GenError, write_if_changed};
 use rcmake_host::{Host, WriteMode, path};
+use rcmake_model::ProjectModel;
 use rcmake_resolve::{BuildGraph, BuildStep, GenerationResult, Invocation};
 
 const MAKEFILE2: &[u8] = b"CMakeFiles/Makefile2";
@@ -34,6 +35,28 @@ pub fn generate_unix_makefiles(
     host: &dyn Host,
     build_dir: &Path,
 ) -> Result<(), GenError> {
+    generate_impl(result, host, build_dir, None)
+}
+
+pub use generate_unix_makefiles as generate;
+
+/// Write Unix Makefiles with targets that build the inputs of install rules
+/// and tests.
+pub fn generate_with_model(
+    result: &GenerationResult,
+    host: &dyn Host,
+    build_dir: &Path,
+    model: &ProjectModel,
+) -> Result<(), GenError> {
+    generate_impl(result, host, build_dir, Some(model))
+}
+
+fn generate_impl(
+    result: &GenerationResult,
+    host: &dyn Host,
+    build_dir: &Path,
+    model: Option<&ProjectModel>,
+) -> Result<(), GenError> {
     let build_dir = host.initial_cwd().join(build_dir);
     let empty = BuildGraph::default();
     let graph = result.graphs.first().unwrap_or(&empty);
@@ -42,8 +65,9 @@ pub fn generate_unix_makefiles(
         path: "Makefile".into(),
         message: error.to_string().into(),
     })?;
-    let top = top_level(result, &targets, &path::from_native(&cmake))?;
-    let dispatch = dispatch(graph, &targets);
+    let prep = prep::targets(result, graph, &targets, &build_dir, model)?;
+    let top = top_level(result, &targets, &path::from_native(&cmake), &prep)?;
+    let dispatch = dispatch(graph, &targets, &prep);
     let build_files = targets
         .iter()
         .map(build_file)
@@ -336,6 +360,7 @@ fn top_level(
     result: &GenerationResult,
     targets: &[Target<'_>],
     cmake: &[u8],
+    prep: &prep::Targets,
 ) -> Result<Vec<u8>, GenError> {
     let mut out = makefile();
     // Separate entry points can build the same target. Submakes still run in parallel.
@@ -403,6 +428,7 @@ fn top_level(
         .iter()
         .copied()
         .chain(targets.iter().map(|target| target.name))
+        .chain(prep.keys().map(|name| name.as_slice()))
     {
         out.push_str(b"\t@printf '%s\\n' ");
         make_recipe_text(&mut out, &shell_quote(&[b"... ", name].concat()))?;
@@ -416,10 +442,14 @@ fn top_level(
         );
         recursive_make(&mut out, MAKEFILE2, &target.goal);
     }
+    for name in prep.keys() {
+        phony(&mut out, name, [b"cmake_check_build_system".as_slice()]);
+        recursive_make(&mut out, MAKEFILE2, name);
+    }
     Ok(out)
 }
 
-fn dispatch(graph: &BuildGraph, targets: &[Target<'_>]) -> Vec<u8> {
+fn dispatch(graph: &BuildGraph, targets: &[Target<'_>], prep: &prep::Targets) -> Vec<u8> {
     let mut out = makefile();
     phony(
         &mut out,
@@ -450,6 +480,13 @@ fn dispatch(graph: &BuildGraph, targets: &[Target<'_>]) -> Vec<u8> {
         recursive_make(&mut out, &target.file, &target.goal);
         phony(&mut out, &target.clean_goal, []);
         recursive_make(&mut out, &target.file, &target.clean_goal);
+    }
+    for (name, dependencies) in prep {
+        phony(
+            &mut out,
+            name,
+            dependencies.iter().map(|goal| goal.as_slice()),
+        );
     }
     out
 }

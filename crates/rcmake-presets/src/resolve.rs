@@ -15,6 +15,25 @@ use crate::{
 };
 
 impl Presets {
+    /// Get workflow definitions in declaration order, including unavailable workflows.
+    pub fn workflow_definitions(&self) -> impl Iterator<Item = (&PresetSummary, WorkflowSettings)> {
+        self.records
+            .get(&PresetKind::Workflow)
+            .into_iter()
+            .flat_map(|records| records.values())
+            .filter_map(|record| match record.read(&mut schema::literal).ok()? {
+                PresetSettings::Workflow(workflow) => Some((&record.summary, workflow)),
+                _ => None,
+            })
+    }
+
+    /// Get the JSON condition of a preset, including a condition it inherits.
+    #[must_use]
+    pub fn preset_condition(&self, kind: PresetKind, name: &[u8]) -> Option<&rcmake_json::Value> {
+        let record = self.get(kind, name)?;
+        Some(&record.condition.as_ref()?.1)
+    }
+
     /// List presets of this kind in declaration order.
     ///
     /// The list contains presets that can be resolved in the supplied environment.
@@ -287,6 +306,7 @@ impl Presets {
             .as_ref()
             .map(|condition| {
                 condition
+                    .0
                     .evaluate(&mut |field| macros.expand(field))
                     .map_err(|error| expansion_error(record, error, Some("Invalid condition")))
             })

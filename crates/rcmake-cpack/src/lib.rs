@@ -80,6 +80,8 @@ pub struct CPackOptions {
     pub vendor: Option<BString>,
     /// `--preset <name>`.
     pub preset: Option<BString>,
+    /// `--presets-file <file>`.
+    pub presets_file: Option<BString>,
     /// `--list-presets`.
     pub list_presets: bool,
     /// `-V` / `--verbose`.

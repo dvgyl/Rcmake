@@ -60,7 +60,11 @@ pub(crate) fn resolve_options(
     let mut cwd = host.initial_cwd();
     let mut environment = BTreeMap::new();
     if cli.list_presets || cli.preset.is_some() {
-        let presets = rcmake_presets::load(&cwd, host).map_err(|err| {
+        let presets = match &cli.presets_file {
+            Some(file) => rcmake_presets::load_file(&cwd, &absolute(&cwd, file), host),
+            None => rcmake_presets::load(&cwd, host),
+        }
+        .map_err(|err| {
             error(format!(
                 "Could not read presets from {}:\n{err}",
                 cwd.display()
