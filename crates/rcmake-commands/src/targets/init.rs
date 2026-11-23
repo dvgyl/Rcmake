@@ -29,6 +29,7 @@ const BUILD_DEFAULTS: &[(&str, &str)] = &[
 ];
 
 pub(super) fn initialize(cx: &mut Cx<'_>, target: &mut Target) {
+    super::properties::initialize_file_set_properties(target);
     let builds = !target.is_imported() && target.kind != TargetKind::InterfaceLibrary;
     if builds {
         for &(property, value) in BUILD_DEFAULTS {

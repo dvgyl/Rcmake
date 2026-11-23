@@ -1,7 +1,7 @@
 use rcmake_base::BString;
 use rcmake_eval::{CmdError, CmdFlags, CmdResult, Cx, Flow, Registry};
 use rcmake_expr::ExpandedArg;
-use rcmake_model::{PropScope, TestEntry};
+use rcmake_model::{BT, PropScope, TestEntry};
 
 use super::{scoped_test_directory, status, values};
 
@@ -78,7 +78,7 @@ fn parse_test_options(test: &mut TestEntry, mut args: &[&[u8]]) -> Result<(), Cm
     while let Some((option, rest)) = args.split_first() {
         args = rest;
         match *option {
-            b"COMMAND" | b"CONFIGURATIONS" => {
+            b"COMMAND" | b"CONFIGURATIONS" | b"BUILD_DEPENDS" => {
                 let end = args
                     .iter()
                     .position(|arg| {
@@ -88,6 +88,7 @@ fn parse_test_options(test: &mut TestEntry, mut args: &[&[u8]]) -> Result<(), Cm
                                 | b"CONFIGURATIONS"
                                 | b"WORKING_DIRECTORY"
                                 | b"COMMAND_EXPAND_LISTS"
+                                | b"BUILD_DEPENDS"
                         )
                     })
                     .unwrap_or(args.len());
@@ -99,6 +100,12 @@ fn parse_test_options(test: &mut TestEntry, mut args: &[&[u8]]) -> Result<(), Cm
                     has_command = true;
                     test.command
                         .extend(items.iter().copied().map(BString::from));
+                } else if *option == b"BUILD_DEPENDS" {
+                    test.build_depends.extend(
+                        items
+                            .iter()
+                            .map(|item| BT::new((*item).into(), test.backtrace.clone())),
+                    );
                 } else {
                     if has_configurations {
                         return Err(status("may be given at most one set of CONFIGURATIONS."));

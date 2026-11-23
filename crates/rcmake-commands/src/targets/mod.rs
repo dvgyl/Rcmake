@@ -15,6 +15,8 @@ mod properties;
 mod sources;
 mod usage;
 
+pub(crate) use sources::{find_file_set, replace_file_set_paths, require_sycl, scope_name};
+
 #[cfg(test)]
 mod tests;
 

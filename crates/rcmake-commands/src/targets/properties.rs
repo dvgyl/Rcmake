@@ -1,9 +1,11 @@
+use std::collections::BTreeSet;
+
 use rcmake_base::{BString, list, truth};
 use rcmake_eval::{CmdError, CmdResult, Cx, Flow};
 use rcmake_expr::ExpandedArg;
 use rcmake_model::{
-    BT, DirId, FileSetKind, ModelError, ProjectModel, PropOrigin, PropScope, TargetBinding,
-    TargetId, UsageScope,
+    BT, DirId, FileSetId, FileSetKind, ModelError, ProjectModel, PropOrigin, PropScope, Target,
+    TargetBinding, TargetId, UsageScope,
 };
 
 use super::{bytes, model_error, status};
@@ -143,33 +145,96 @@ pub(super) fn get(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
     Ok(Flow::Normal)
 }
 
+const FILE_SET_KINDS: [(FileSetKind, &[u8]); 3] = [
+    (FileSetKind::Headers, b"HEADER"),
+    (FileSetKind::Sources, b"SOURCE"),
+    (FileSetKind::CxxModules, b"CXX_MODULE"),
+];
+
+fn file_set_list_properties(kind: FileSetKind, prefix: &[u8]) -> [BString; 4] {
+    let kind = kind.as_str().as_bytes();
+    [
+        [prefix, b"_SETS"].concat().into(),
+        [b"INTERFACE_", prefix, b"_SETS"].concat().into(),
+        [b"FILE_SETS_", kind].concat().into(),
+        [b"INTERFACE_FILE_SETS_", kind].concat().into(),
+    ]
+}
+
+pub(super) fn initialize_file_set_properties(target: &mut Target) {
+    target
+        .props
+        .set("FILE_SET_TYPES".into(), BString::default());
+    for (kind, prefix) in FILE_SET_KINDS {
+        for name in file_set_list_properties(kind, prefix) {
+            target.props.set(name, BString::default());
+        }
+    }
+}
+
+// Make the file set properties available through the model's target property lookup.
+pub(super) fn store_file_set_properties(model: &mut ProjectModel, set: FileSetId) {
+    let Some(set) = model.file_set(set) else {
+        return;
+    };
+    let id = set.target;
+    let Some((kind, prefix)) = FILE_SET_KINDS
+        .into_iter()
+        .find(|(kind, _)| *kind == set.kind)
+    else {
+        return;
+    };
+    let mut names = Vec::from(file_set_list_properties(kind, prefix));
+    names.push("FILE_SET_TYPES".into());
+    for field in [b"_SET".as_slice(), b"_DIRS"] {
+        names.push([prefix, field, b"_", set.name.as_slice()].concat().into());
+        if set.name == kind.as_str() {
+            names.push([prefix, field].concat().into());
+        }
+    }
+    let values: Vec<_> = names
+        .into_iter()
+        .filter_map(|name| {
+            let value = file_set_property(model, id, &name)?;
+            Some((name, value))
+        })
+        .collect();
+    if let Some(target) = model.target_mut(id) {
+        for (name, value) in values {
+            target.props.set(name, value);
+        }
+    }
+}
+
 fn file_set_property(model: &ProjectModel, id: TargetId, property: &[u8]) -> Option<BString> {
     let target = model.target(id)?;
-    for (kind, prefix) in [
-        (FileSetKind::Headers, b"HEADER".as_slice()),
-        (FileSetKind::Sources, b"SOURCE"),
-        (FileSetKind::CxxModules, b"CXX_MODULE"),
+    let sets = || target.file_sets.iter().filter_map(|&id| model.file_set(id));
+    if property == b"FILE_SET_TYPES" {
+        let types: BTreeSet<_> = sets().map(|set| set.kind.as_str()).collect();
+        return Some(list::join(types));
+    }
+    for (prefix, interface) in [
+        (b"FILE_SETS_".as_slice(), false),
+        (b"INTERFACE_FILE_SETS_", true),
     ] {
-        let sets = || {
-            target
-                .file_sets
-                .iter()
-                .filter_map(|&id| model.file_set(id))
-                .filter(move |set| set.kind == kind)
-        };
+        if let Some(kind) = property.strip_prefix(prefix) {
+            return Some(list::join(
+                sets()
+                    .filter(|set| set.kind.as_str().as_bytes() == kind)
+                    .filter(|set| visible(set.scope, interface))
+                    .map(|set| &set.name),
+            ));
+        }
+    }
+    for (kind, prefix) in FILE_SET_KINDS {
+        let sets = || sets().filter(|set| set.kind == kind);
         let own = [prefix, b"_SETS"].concat();
         let interface = [b"INTERFACE_".as_slice(), &own].concat();
         if property == own || property == interface {
             let interface = property == interface;
             return Some(list::join(
                 sets()
-                    .filter(|set| {
-                        if interface {
-                            set.scope != UsageScope::Private
-                        } else {
-                            set.scope != UsageScope::Interface
-                        }
-                    })
+                    .filter(|set| visible(set.scope, interface))
                     .map(|set| set.name.as_slice()),
             ));
         }
@@ -193,6 +258,15 @@ fn file_set_property(model: &ProjectModel, id: TargetId, property: &[u8]) -> Opt
         }
     }
     None
+}
+
+fn visible(scope: UsageScope, interface: bool) -> bool {
+    scope
+        != if interface {
+            UsageScope::Private
+        } else {
+            UsageScope::Interface
+        }
 }
 
 pub(super) fn add_dependencies(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {

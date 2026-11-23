@@ -402,7 +402,7 @@ fn records_sources_and_file_sets() -> TestResult {
         target_sources(lib PUBLIC src.c "$<1:unchanged>" PRIVATE private.c)
         target_sources(lib PUBLIC FILE_SET headers TYPE HEADERS BASE_DIRS include FILES include/lib.h)
         target_sources(lib PUBLIC FILE_SET headers FILES include/extra.h)
-        target_sources(lib FILE_SET HEADERS SCOPE INTERFACE FILES default.h)
+        target_sources(lib INTERFACE FILE_SET HEADERS FILES default.h)
         target_sources(lib PRIVATE FILE_SET CXX_MODULES BASE_DIRS modules FILES modules/example.cxx)
         get_target_property(sources lib SOURCES)
         get_target_property(api_src lib INTERFACE_SOURCES)
@@ -613,5 +613,404 @@ fn keeps_global_imports_in_global_lookup() -> TestResult {
         model.target(id).ok_or("missing target")?.origin,
         TargetOrigin::Imported(rcmake_model::ImportedVisibility::Global)
     );
+    Ok(())
+}
+
+#[test]
+fn source_sets_record_build_sources_and_target_properties() -> TestResult {
+    let (_, mut interp) = configure(
+        r#"
+        add_library(lib STATIC first.c)
+        get_property(initial TARGET lib PROPERTY SOURCE_SETS)
+        target_sources(lib PUBLIC FILE_SET SOURCES FILES pub.c
+                                  FILE_SET extra TYPE SOURCES BASE_DIRS more FILES more/a.c
+                           PRIVATE FILE_SET local TYPE SOURCES FILES local.c
+                           INTERFACE FILE_SET api TYPE SOURCES FILES api.c)
+        target_sources(lib PUBLIC FILE_SET extra FILES more/b.c)
+        get_target_property(src lib SOURCES)
+        get_property(own TARGET lib PROPERTY SOURCE_SETS)
+        get_target_property(api lib INTERFACE_SOURCE_SETS)
+        get_target_property(default lib SOURCE_SET)
+        get_property(named TARGET lib PROPERTY SOURCE_SET_extra)
+        get_target_property(bases lib SOURCE_DIRS_extra)
+        get_target_property(types lib FILE_SET_TYPES)
+        get_target_property(own_type lib FILE_SETS_SOURCES)
+        get_target_property(api_type lib INTERFACE_FILE_SETS_SOURCES)
+        "#,
+        &[],
+        0,
+    )?;
+    for (name, value) in [
+        ("initial", ""),
+        (
+            "src",
+            "first.c;/work/src/pub.c;/work/src/more/a.c;/work/src/local.c;/work/src/more/b.c",
+        ),
+        ("own", "SOURCES;extra;local"),
+        ("api", "SOURCES;extra;api"),
+        ("default", "/work/src/pub.c"),
+        ("named", "/work/src/more/a.c;/work/src/more/b.c"),
+        ("bases", "/work/src/more"),
+        ("types", "SOURCES"),
+        ("own_type", "SOURCES;extra;local"),
+        ("api_type", "SOURCES;extra;api"),
+    ] {
+        var(&mut interp, name, value);
+    }
+    Ok(())
+}
+
+#[test]
+fn module_file_sets_follow_target_scope_rules() -> TestResult {
+    for (target, scope, diagnostic) in [
+        (
+            "STATIC unit.c",
+            "INTERFACE",
+            "may not have \"INTERFACE\" scope",
+        ),
+        ("INTERFACE", "PUBLIC", "scope on INTERFACE libraries"),
+        ("INTERFACE", "PRIVATE", "scope on INTERFACE libraries"),
+        (
+            "STATIC IMPORTED",
+            "PRIVATE",
+            "may only set INTERFACE properties on IMPORTED targets",
+        ),
+    ] {
+        let (host, _) = configure(
+            &format!("add_library(lib {target})\ntarget_sources(lib {scope} FILE_SET CXX_MODULES)"),
+            &[],
+            1,
+        )?;
+        let stderr = host.stream_bytes(Stream::Stderr).to_string();
+        assert!(
+            stderr
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .contains(diagnostic),
+            "{stderr}"
+        );
+    }
+
+    let (_, mut interp) = configure(
+        r#"
+        add_library(lib STATIC IMPORTED)
+        target_sources(lib INTERFACE FILE_SET CXX_MODULES FILES module.cxx)
+        target_sources(lib INTERFACE FILE_SET other TYPE CXX_MODULES BASE_DIRS src FILES src/other.cxx)
+        get_target_property(own lib CXX_MODULE_SETS)
+        get_target_property(api lib INTERFACE_CXX_MODULE_SETS)
+        get_target_property(default lib CXX_MODULE_SET)
+        get_target_property(named lib CXX_MODULE_SET_other)
+        get_target_property(bases lib CXX_MODULE_DIRS_other)
+        get_target_property(types lib FILE_SET_TYPES)
+        get_target_property(api_type lib INTERFACE_FILE_SETS_CXX_MODULES)
+        "#,
+        &[],
+        0,
+    )?;
+    for (name, value) in [
+        ("own", ""),
+        ("api", "CXX_MODULES;other"),
+        ("default", "/work/src/module.cxx"),
+        ("named", "/work/src/src/other.cxx"),
+        ("bases", "/work/src/src"),
+        ("types", "CXX_MODULES"),
+        ("api_type", "CXX_MODULES;other"),
+    ] {
+        var(&mut interp, name, value);
+    }
+    Ok(())
+}
+
+#[test]
+fn file_set_membership_checks_paths_and_cmp0211() -> TestResult {
+    let (host, _) = configure(
+        "add_library(lib STATIC)\ntarget_sources(lib PRIVATE FILE_SET SOURCES BASE_DIRS src FILES src-other/a.c)",
+        &[],
+        1,
+    )?;
+    assert!(
+        host.stream_bytes(Stream::Stderr)
+            .to_string()
+            .contains("must be in one of the file set's base directories")
+    );
+
+    for (policy, exit, warning) in [("NEW", 1, true), ("OLD", 0, false), ("WARN", 0, true)] {
+        let change = if policy == "WARN" {
+            "cmake_policy(VERSION 4.3)".into()
+        } else {
+            format!("cmake_policy(SET CMP0211 {policy})")
+        };
+        let (host, _) = configure(
+            &format!(
+                "{change}\nadd_library(lib STATIC)\n\
+                 target_sources(lib PRIVATE FILE_SET SOURCES FILES a.c\n\
+                                    FILE_SET HEADERS FILES a.c\n\
+                                    FILE_SET other TYPE SOURCES FILES src/../a.c)"
+            ),
+            &[],
+            exit,
+        )?;
+        let stderr = host.stream_bytes(Stream::Stderr).to_string();
+        assert_eq!(
+            stderr.contains("already belongs to file set \"SOURCES\""),
+            warning,
+            "{stderr}"
+        );
+        if policy == "WARN" {
+            assert!(stderr.contains("Policy CMP0211 is not set"), "{stderr}");
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn file_set_properties_update_sources_and_preserve_scope() -> TestResult {
+    let (_, mut interp) = configure(
+        r#"
+        add_library(lib STATIC ordinary.c)
+        add_library(alias ALIAS lib)
+        target_sources(lib PUBLIC FILE_SET SOURCES FILES original.c
+                           PRIVATE FILE_SET HEADERS FILES header.h)
+        set_property(FILE_SET SOURCES HEADERS TARGET alias APPEND PROPERTY custom first)
+        set_property(FILE_SET SOURCES TARGET lib APPEND PROPERTY custom second)
+        set_property(FILE_SET SOURCES TARGET lib APPEND_STRING PROPERTY custom !)
+        set_property(FILE_SET SOURCES TARGET lib PROPERTY LANGUAGE CXX)
+        set_property(FILE_SET SOURCES TARGET lib PROPERTY BASE_DIRS changed)
+        set_property(FILE_SET SOURCES TARGET lib PROPERTY INTERFACE_SOURCES changed/new.c)
+        set_property(FILE_SET SOURCES TARGET lib APPEND PROPERTY SOURCES changed/next.c)
+        set_property(FILE_SET HEADERS TARGET lib PROPERTY INTERFACE_SOURCES ignored.h)
+        get_property(custom FILE_SET SOURCES TARGET alias PROPERTY custom)
+        get_property(header_custom FILE_SET HEADERS TARGET lib PROPERTY custom)
+        get_property(lang FILE_SET SOURCES TARGET lib PROPERTY LANGUAGE)
+        get_property(type FILE_SET SOURCES TARGET lib PROPERTY TYPE)
+        get_property(scope FILE_SET SOURCES TARGET lib PROPERTY SCOPE)
+        get_property(bases FILE_SET SOURCES TARGET lib PROPERTY BASE_DIRS)
+        get_property(src FILE_SET SOURCES TARGET lib PROPERTY SOURCES)
+        get_property(api FILE_SET SOURCES TARGET lib PROPERTY INTERFACE_SOURCES)
+        get_property(hidden FILE_SET HEADERS TARGET lib PROPERTY INTERFACE_SOURCES SET)
+        get_property(set FILE_SET SOURCES TARGET lib PROPERTY custom SET)
+        set_property(FILE_SET SOURCES TARGET lib PROPERTY custom)
+        get_property(unset FILE_SET SOURCES TARGET lib PROPERTY custom SET)
+        get_target_property(build lib SOURCES)
+        get_property(src_target TARGET lib PROPERTY SOURCE_SET)
+        "#,
+        &[],
+        0,
+    )?;
+    for (name, value) in [
+        ("custom", "first;second!"),
+        ("header_custom", "first"),
+        ("lang", "CXX"),
+        ("type", "SOURCES"),
+        ("scope", "PUBLIC"),
+        ("bases", "changed"),
+        ("src", "changed/new.c;changed/next.c"),
+        ("api", "changed/new.c;changed/next.c"),
+        ("hidden", "0"),
+        ("set", "1"),
+        ("unset", "0"),
+        ("build", "ordinary.c;changed/new.c;changed/next.c"),
+        ("src_target", "changed/new.c;changed/next.c"),
+    ] {
+        var(&mut interp, name, value);
+    }
+    Ok(())
+}
+
+#[test]
+fn file_set_property_errors_match_the_command() -> TestResult {
+    for (command, expected) in [
+        (
+            "set_property(FILE_SET HEADERS TARGET lib PROPERTY TYPE SOURCES)",
+            "TYPE property is read-only",
+        ),
+        (
+            "set_property(FILE_SET HEADERS TARGET lib PROPERTY LANGUAGE CXX)",
+            "must be enabled by the CMAKE_EXPERIMENTAL_SYCL gate",
+        ),
+        (
+            "set_property(FILE_SET SOURCES TARGET lib APPEND PROPERTY LANGUAGE CXX)",
+            "LANGUAGE file set property does not support appending values.",
+        ),
+        (
+            "get_property(v FILE_SET missing TARGET lib PROPERTY TYPE)",
+            "could not find FILE_SET missing for TARGET lib",
+        ),
+        (
+            "get_property(v FILE_SET HEADERS PROPERTY TYPE)",
+            "required TARGET option is missing",
+        ),
+    ] {
+        let (host, _) = configure(
+            &format!(
+                "add_library(lib STATIC)\ntarget_sources(lib PRIVATE FILE_SET HEADERS FILE_SET SOURCES)\n{command}"
+            ),
+            &[],
+            1,
+        )?;
+        let stderr = host.stream_bytes(Stream::Stderr).to_string();
+        assert!(
+            stderr
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .contains(expected),
+            "{stderr}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn sycl_file_set_aliases_use_the_experimental_gate() -> TestResult {
+    let (host, _) = configure(
+        "add_library(lib STATIC)\ntarget_sources(lib PRIVATE FILE_SET SYCL)",
+        &[],
+        1,
+    )?;
+    assert!(
+        host.stream_bytes(Stream::Stderr)
+            .to_string()
+            .contains("CMAKE_EXPERIMENTAL_SYCL")
+    );
+
+    let (_, mut interp) = configure(
+        r#"
+        set(CMAKE_EXPERIMENTAL_SYCL c0d1fb10-2ece-420e-9d29-7d7f2b300f25)
+        add_library(lib STATIC)
+        target_sources(lib PRIVATE FILE_SET SYCL FILES work.sycl
+                                   FILE_SET SYCL_HEADERS TYPE HEADERS FILES work.h)
+        get_property(src_lang FILE_SET SYCL TARGET lib PROPERTY LANGUAGE)
+        get_property(hdr_lang FILE_SET SYCL_HEADERS TARGET lib PROPERTY LANGUAGE)
+        get_target_property(types lib FILE_SET_TYPES)
+        get_target_property(src lib SOURCE_SET_SYCL)
+        get_target_property(hdr lib HEADER_SET_SYCL_HEADERS)
+        "#,
+        &[],
+        0,
+    )?;
+    for (name, value) in [
+        ("src_lang", "SYCL"),
+        ("hdr_lang", "SYCL"),
+        ("types", "HEADERS;SOURCES"),
+        ("src", "/work/src/work.sycl"),
+        ("hdr", "/work/src/work.h"),
+    ] {
+        var(&mut interp, name, value);
+    }
+    Ok(())
+}
+
+#[test]
+fn discover_tests_and_add_test_record_build_dependencies() -> TestResult {
+    let (_, mut interp) = configure(
+        r#"
+        enable_testing()
+        add_test(NAME single COMMAND echo BUILD_DEPENDS app "${CMAKE_CURRENT_BINARY_DIR}/data"
+                 WORKING_DIRECTORY here CONFIGURATIONS Debug)
+        discover_tests(COMMAND app "a;b" COMMAND_EXPAND_LISTS CONFIGURATIONS Debug
+                       COMMAND --flag CONFIGURATIONS Release
+                       DISCOVERY_ARGS --list DISCOVERY_MATCH "^(.+)$"
+                       DISCOVERY_PROPERTIES WORKING_DIRECTORY here TIMEOUT 5
+                       TEST_NAME [=[case.\1]=] TEST_ARGS --run [=[\1]=]
+                       TEST_PROPERTIES LABELS [=[\1]=]
+                       BUILD_DEPENDS app data)
+        discover_tests()
+        get_property(tests DIRECTORY PROPERTY TESTS)
+        "#,
+        &[],
+        0,
+    )?;
+    var(&mut interp, "tests", "single");
+    let mut cx = interp.cx();
+    let model = cx.project();
+    let single = model
+        .find_test(DirId::ROOT, b"single")
+        .and_then(|id| model.test(id))
+        .ok_or("Missing test")?;
+    assert_eq!(single.command, ["echo"]);
+    assert_eq!(
+        single
+            .build_depends
+            .iter()
+            .map(|dep| &dep.value)
+            .collect::<Vec<_>>(),
+        ["app", "/work/build/data"]
+    );
+    let [id, empty] = model.dir(DirId::ROOT).discoveries.as_slice() else {
+        return Err("Expected two discoveries".into());
+    };
+    let entry = model.test(*id).ok_or("Missing discovery")?;
+    let rcmake_model::TestKind::Discover(spec) = &entry.kind else {
+        return Err("Expected discovery options".into());
+    };
+    assert_eq!(entry.command, ["app", "a;b", "--flag"]);
+    assert_eq!(entry.configurations, ["Debug", "Release"]);
+    assert_eq!(
+        entry.working_directory.as_ref().map(|path| path.as_slice()),
+        Some(b"here".as_slice())
+    );
+    assert!(entry.command_expand_lists);
+    assert_eq!(
+        entry
+            .build_depends
+            .iter()
+            .map(|dep| &dep.value)
+            .collect::<Vec<_>>(),
+        ["app", "data"]
+    );
+    assert!(!entry.build_depends[0].backtrace.is_empty());
+    assert_eq!(spec.discovery_args, ["--list"]);
+    assert_eq!(spec.discovery_match, "^(.+)$");
+    assert_eq!(
+        spec.discovery_props,
+        [
+            ("WORKING_DIRECTORY".into(), "here".into()),
+            ("TIMEOUT".into(), "5".into())
+        ]
+    );
+    assert_eq!(spec.test_name, r"case.\1");
+    assert_eq!(spec.test_args, ["--run", r"\1"]);
+    assert_eq!(spec.test_props[0], ("LABELS".into(), r"\1".into()));
+    assert_eq!(
+        spec.test_props[1],
+        (
+            "_CMAKE_DEFAULT_FIXTURE_REPEAT_MODE".into(),
+            "AROUND_EACH_REPEAT".into()
+        )
+    );
+    assert!(
+        model
+            .test(*empty)
+            .ok_or("Missing empty discovery")?
+            .command
+            .is_empty()
+    );
+    Ok(())
+}
+
+#[test]
+fn discover_tests_validates_keyword_arguments() -> TestResult {
+    for (options, expected) in [
+        ("bad", "given unknown argument \"bad\"."),
+        (
+            "COMMAND DISCOVERY_MATCH a",
+            "Error after keyword \"COMMAND\":",
+        ),
+        ("TEST_NAME \"\"", "empty string not allowed"),
+        (
+            "DISCOVERY_PROPERTIES TIMEOUT",
+            "DISCOVERY_PROPERTIES must be key-value pairs.",
+        ),
+        (
+            "TEST_PROPERTIES LABELS",
+            "TEST_PROPERTIES must be key-value pairs.",
+        ),
+    ] {
+        let (host, _) = configure(&format!("discover_tests({options})"), &[], 1)?;
+        let stderr = host.stream_bytes(Stream::Stderr).to_string();
+        assert!(stderr.contains(expected), "{stderr}");
+    }
     Ok(())
 }

@@ -4,11 +4,12 @@ use rcmake_eval::{CmdError, CmdResult, Cx, Flow, RunMode, UserCommandKind};
 use rcmake_expr::ExpandedArg;
 use rcmake_host::path;
 use rcmake_model::{
-    AppendMode, CacheType, DefinedProperty, DirId, GeneratorKind, ModelError, PropOrigin,
-    PropScope, TargetBinding, TargetId, UsageField,
+    AppendMode, CacheType, DefinedProperty, DirId, FileSetId, FileSetKind, GeneratorKind,
+    ModelError, PropOrigin, PropScope, TargetBinding, TargetId, UsageField, UsageScope,
 };
 
 use crate::dirs::{find_directory, normalized_path, scoped_test_directory};
+use crate::targets::{find_file_set, replace_file_set_paths, require_sycl, scope_name};
 
 use super::{quoted, status, values};
 
@@ -301,6 +302,14 @@ pub(super) fn set(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
                 update_scoped(cx, &scope, name, value.clone(), update)?;
             }
         }
+        b"FILE_SET" => {
+            let (sets, target) = file_set_selection(&names)?;
+            let target_id = file_set_target(cx, target)?;
+            for set in sets {
+                let id = file_set_id(cx, target_id, target, set)?;
+                set_file_set(cx, id, name, value.clone(), update)?;
+            }
+        }
         b"TARGET" => {
             let targets = names
                 .iter()
@@ -487,6 +496,133 @@ fn set_cache(
     update_scoped(cx, &PropScope::Cache(entry.into()), name, value, update)
 }
 
+fn file_set_selection<'a, 'b>(
+    names: &'a [&'b [u8]],
+) -> Result<(&'a [&'b [u8]], &'b [u8]), CmdError> {
+    let Some(index) = names.iter().position(|word| *word == b"TARGET") else {
+        return Err(status("required TARGET option is missing"));
+    };
+    let (sets, tail) = names.split_at(index);
+    match tail {
+        [_, target] => Ok((sets, target)),
+        [_] => Err(status(
+            "called with incorrect number of arguments no value provided to the TARGET option",
+        )),
+        [_, _, extra, ..] => Err(status(quoted("given invalid argument \"", extra, "\"."))),
+        [] => Err(status("required TARGET option is missing")),
+    }
+}
+
+fn file_set_target(cx: &mut Cx<'_>, target: &[u8]) -> Result<TargetId, CmdError> {
+    let dir = cx.current_dir_id();
+    cx.project()
+        .find_target(dir, target)
+        .ok_or_else(|| status(quoted("given non-existent TARGET ", target, "")))
+}
+
+fn file_set_id(
+    cx: &mut Cx<'_>,
+    target_id: TargetId,
+    target: &[u8],
+    set: &[u8],
+) -> Result<FileSetId, CmdError> {
+    find_file_set(cx.project(), target_id, set).ok_or_else(|| {
+        status(format!(
+            "could not find FILE_SET {} for TARGET {}.  Perhaps it has not yet been created.",
+            BString::from(set),
+            BString::from(target)
+        ))
+    })
+}
+
+fn set_file_set(
+    cx: &mut Cx<'_>,
+    id: FileSetId,
+    name: &[u8],
+    value: Option<BString>,
+    update: Update,
+) -> Result<(), CmdError> {
+    let model = cx.project();
+    let set = model
+        .file_set(id)
+        .ok_or_else(|| status("file set does not exist"))?;
+    match name {
+        b"TYPE" | b"SCOPE" => {
+            let target = model
+                .target(set.target)
+                .ok_or_else(|| status("target does not exist"))?;
+            let body = format!(
+                "{} property is read-only for the file set \"{} of the target \"{}\"\n",
+                BString::from(name),
+                set.name,
+                target.name
+            );
+            cx.issue(MessageKind::Error, Effect::SetError, None, body.into());
+            Ok(())
+        }
+        b"BASE_DIRS" | b"SOURCES" | b"INTERFACE_SOURCES" => {
+            if (name == b"SOURCES" && set.scope == UsageScope::Interface)
+                || (name == b"INTERFACE_SOURCES" && set.scope == UsageScope::Private)
+                || (value.is_none() && !matches!(update, Update::Set))
+            {
+                return Ok(());
+            }
+            replace_file_set_paths(
+                cx,
+                id,
+                name == b"BASE_DIRS",
+                value,
+                !matches!(update, Update::Set),
+            )
+        }
+        b"LANGUAGE" => {
+            if !matches!(update, Update::Set) {
+                return Err(crate::command_error(
+                    cx,
+                    "LANGUAGE file set property does not support appending values.",
+                ));
+            }
+            if value
+                .as_ref()
+                .is_some_and(|value| value.windows(2).any(|pair| pair == b"$<"))
+            {
+                return Err(crate::command_error(
+                    cx,
+                    "LANGUAGE file set property does not support generator expressions.",
+                ));
+            }
+            match set.kind {
+                FileSetKind::Headers => {
+                    require_sycl(cx, "LANGUAGE property on a HEADERS file set")?
+                }
+                FileSetKind::CxxModules => {
+                    return Err(crate::command_error(
+                        cx,
+                        "LANGUAGE property may only be set on a SOURCES, HEADERS, or custom rule file set.",
+                    ));
+                }
+                FileSetKind::Sources => {}
+            }
+            update_scoped(cx, &PropScope::FileSet(id), name, value, update)
+        }
+        _ => update_scoped(cx, &PropScope::FileSet(id), name, value, update),
+    }
+}
+
+fn file_set_value(cx: &mut Cx<'_>, id: FileSetId, name: &[u8], inherited: bool) -> Option<BString> {
+    let set = cx.project().file_set(id)?;
+    let entries = match name {
+        b"TYPE" => return Some(set.kind.as_str().into()),
+        b"SCOPE" => return Some(scope_name(set.scope).into()),
+        b"BASE_DIRS" => &set.base_dirs,
+        b"SOURCES" if set.scope != UsageScope::Interface => &set.files,
+        b"INTERFACE_SOURCES" if set.scope != UsageScope::Private => &set.files,
+        b"SOURCES" | b"INTERFACE_SOURCES" => return None,
+        _ => return model_value(cx, &PropScope::FileSet(id), name, inherited),
+    };
+    (!entries.is_empty()).then(|| list::join(entries.iter().map(|entry| &entry.value)))
+}
+
 #[derive(Clone, Copy)]
 enum Query {
     Value,
@@ -535,9 +671,21 @@ pub(super) fn get(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
             other => return Err(status(quoted("given invalid argument \"", other, "\"."))),
         };
     }
+    let file_set = if *scope == b"FILE_SET" {
+        let (names, target) = file_set_selection(names)?;
+        let set = single_name(scope, names)?;
+        if set.is_empty() {
+            return Err(status("not given name for FILE_SET scope."));
+        }
+        Some((set, target))
+    } else {
+        None
+    };
     let mut object = None;
     match (*scope, names) {
-        (b"GLOBAL" | b"VARIABLE", []) | (b"CACHE" | b"INSTALL" | b"TARGET", [_]) => {}
+        (b"GLOBAL" | b"VARIABLE", [])
+        | (b"CACHE" | b"INSTALL" | b"TARGET", [_])
+        | (b"FILE_SET", _) => {}
         (b"DIRECTORY", _) => {
             object = Some(PropScope::Directory(check_directory(cx, names)?));
         }
@@ -604,6 +752,13 @@ pub(super) fn get(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
                         let scope = PropScope::Target(find_target(cx, target)?);
                         alias_value(cx, target, name)
                             .or_else(|| model_value(cx, &scope, name, inherited))
+                    }
+                    (b"FILE_SET", _) => {
+                        let (set, target) =
+                            file_set.ok_or_else(|| status("not given name for FILE_SET scope."))?;
+                        let target_id = file_set_target(cx, target)?;
+                        let id = file_set_id(cx, target_id, target, set)?;
+                        file_set_value(cx, id, name, inherited)
                     }
                     (b"CACHE", [entry]) => cx
                         .project()
