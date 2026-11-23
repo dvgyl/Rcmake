@@ -10,7 +10,7 @@ use rcmake_host::{FileKind, Follow, path};
 use rcmake_model::{CacheEntry, CacheType};
 use rcmake_syntax::ArgKind;
 
-use super::{diagnostic, text};
+use super::{RootMode, diagnostic, text};
 
 #[derive(Clone, Copy)]
 enum Kind {
@@ -68,6 +68,14 @@ impl Kind {
             },
         }
     }
+
+    fn root_mode_setting(self) -> &'static [u8] {
+        match self {
+            Self::File | Self::Path => b"CMAKE_FIND_ROOT_PATH_MODE_INCLUDE",
+            Self::Program => b"CMAKE_FIND_ROOT_PATH_MODE_PROGRAM",
+            Self::Library => b"CMAKE_FIND_ROOT_PATH_MODE_LIBRARY",
+        }
+    }
 }
 
 struct SearchVariables {
@@ -94,6 +102,7 @@ struct Options {
     no_system_env: bool,
     no_system: bool,
     no_install: bool,
+    root_mode: RootMode,
     validator: Option<BString>,
 }
 
@@ -164,6 +173,7 @@ impl Options {
                 b"NO_CMAKE_ENVIRONMENT_PATH" => options.no_cmake_env = true,
                 b"NO_SYSTEM_ENVIRONMENT_PATH" => options.no_system_env = true,
                 b"NO_CMAKE_SYSTEM_PATH" => options.no_system = true,
+                key if let Some(mode) = RootMode::option(key) => options.root_mode = mode,
                 b"ENV" if matches!(section, Section::Hints | Section::Paths) => {
                     if let Some(value) = args.next().and_then(|key| cx.host().env_get(&key.value)) {
                         options
@@ -335,6 +345,7 @@ fn use_existing(cx: &mut Cx<'_>, kind: Kind, var: &[u8], options: &Options) {
 fn directories(cx: &Cx<'_>, kind: Kind, options: &Options) -> Vec<PathBuf> {
     let variables = kind.paths();
     let mut paths = Vec::new();
+    let library = matches!(kind, Kind::Library);
 
     if use_default(
         cx,
@@ -352,6 +363,9 @@ fn directories(cx: &Cx<'_>, kind: Kind, options: &Options) -> Vec<PathBuf> {
                 .iter()
                 .map(|dir| cx.resolve_path(dir)),
         );
+        if library {
+            add_framework_dirs(cx, &mut paths, cmake_paths(cx, b"CMAKE_FRAMEWORK_PATH"));
+        }
     }
     if use_default(
         cx,
@@ -369,6 +383,9 @@ fn directories(cx: &Cx<'_>, kind: Kind, options: &Options) -> Vec<PathBuf> {
                 .iter()
                 .map(|dir| cx.resolve_path(dir)),
         );
+        if library {
+            add_framework_dirs(cx, &mut paths, env_paths(cx, b"CMAKE_FRAMEWORK_PATH"));
+        }
     }
     paths.extend(options.hints.iter().map(|dir| cx.resolve_path(dir)));
     if use_default(
@@ -391,9 +408,27 @@ fn directories(cx: &Cx<'_>, kind: Kind, options: &Options) -> Vec<PathBuf> {
                 .iter()
                 .map(|dir| cx.resolve_path(dir)),
         );
+        if library {
+            add_framework_dirs(
+                cx,
+                &mut paths,
+                cmake_paths(cx, b"CMAKE_SYSTEM_FRAMEWORK_PATH"),
+            );
+        }
     }
     paths.extend(options.paths.iter().map(|dir| cx.resolve_path(dir)));
     with_suffixes(paths, &options.suffixes)
+}
+
+fn add_framework_dirs(cx: &Cx<'_>, paths: &mut Vec<PathBuf>, values: Vec<BString>) {
+    paths.extend(values.iter().map(|value| {
+        if let Some(relative) = value.strip_prefix(b"~/")
+            && let Some(home) = cx.host().env_get(b"HOME").filter(|home| !home.is_empty())
+        {
+            return cx.resolve_path(&home).join(path::to_native(relative));
+        }
+        cx.resolve_path(value)
+    }));
 }
 
 fn system_prefixes(cx: &Cx<'_>, options: &Options) -> Vec<BString> {
@@ -592,6 +627,44 @@ struct Search<'a> {
     match_path: Option<PathBuf>,
 }
 
+#[derive(Clone, Copy)]
+enum SearchPass {
+    Regular,
+    Framework,
+}
+
+#[derive(Clone, Copy)]
+enum FrameworkOrder {
+    First,
+    Last,
+    Only,
+    Never,
+}
+
+impl FrameworkOrder {
+    fn new(cx: &Cx<'_>) -> Self {
+        match cx.var_or_empty(b"CMAKE_FIND_FRAMEWORK").as_slice() {
+            b"FIRST" => Self::First,
+            b"LAST" => Self::Last,
+            b"ONLY" => Self::Only,
+            b"NEVER" => Self::Never,
+            _ if cx.host().system().sysname == b"Darwin" => Self::First,
+            _ => Self::Never,
+        }
+    }
+
+    fn passes(self) -> &'static [SearchPass] {
+        use SearchPass::{Framework, Regular};
+
+        match self {
+            Self::First => &[Framework, Regular],
+            Self::Last => &[Regular, Framework],
+            Self::Only => &[Framework],
+            Self::Never => &[Regular],
+        }
+    }
+}
+
 impl<'a> Search<'a> {
     fn new(cx: &Cx<'_>, kind: Kind, options: &'a Options) -> Self {
         Self {
@@ -610,6 +683,13 @@ impl<'a> Search<'a> {
         mut dirs: Vec<PathBuf>,
     ) -> Result<Option<PathBuf>, CmdError> {
         dirs.retain(|dir| !self.ignored.ignores_directory(dir));
+        let mut dirs = self
+            .options
+            .root_mode
+            .resolve(cx, self.kind.root_mode_setting())
+            .reroot(cx, dirs);
+        let mut seen = BTreeSet::new();
+        dirs.retain(|dir| seen.insert(dir.clone()));
         let names: Vec<_> = self
             .options
             .names
@@ -651,15 +731,39 @@ impl<'a> Search<'a> {
                 return Ok(None);
             }
         }
+        let passes = if matches!(self.kind, Kind::Library) {
+            FrameworkOrder::new(cx).passes()
+        } else {
+            &[SearchPass::Regular]
+        };
+        for &pass in passes {
+            if let Some(found) = self.scan(cx, &dirs, &names, pass)? {
+                return Ok(Some(found));
+            }
+        }
+        Ok(None)
+    }
+
+    fn scan(
+        &mut self,
+        cx: &mut Cx<'_>,
+        dirs: &[PathBuf],
+        names: &[PathBuf],
+        pass: SearchPass,
+    ) -> Result<Option<PathBuf>, CmdError> {
+        let search = match pass {
+            SearchPass::Regular => Self::in_directory,
+            SearchPass::Framework => Self::framework,
+        };
         if self.options.names_per_dir {
             for name in names.iter().filter(|name| name.is_absolute()) {
-                if let Some(found) = self.in_directory(cx, Path::new(""), name)? {
+                if let Some(found) = search(self, cx, Path::new(""), name)? {
                     return Ok(Some(found));
                 }
             }
-            for dir in &dirs {
+            for dir in dirs {
                 for name in names.iter().filter(|name| !name.is_absolute()) {
-                    if let Some(found) = self.in_directory(cx, dir, name)? {
+                    if let Some(found) = search(self, cx, dir, name)? {
                         return Ok(Some(found));
                     }
                 }
@@ -669,13 +773,46 @@ impl<'a> Search<'a> {
                 let search_dirs = if name.is_absolute() {
                     &[PathBuf::new()][..]
                 } else {
-                    &dirs
+                    dirs
                 };
                 for dir in search_dirs {
-                    if let Some(found) = self.in_directory(cx, dir, &name)? {
+                    if let Some(found) = search(self, cx, dir, name)? {
                         return Ok(Some(found));
                     }
                 }
+            }
+        }
+        Ok(None)
+    }
+
+    fn framework(
+        &mut self,
+        cx: &mut Cx<'_>,
+        dir: &Path,
+        name: &Path,
+    ) -> Result<Option<PathBuf>, CmdError> {
+        if name.is_absolute() {
+            return Ok(None);
+        }
+        let name = path::from_native(name);
+        for extension in [b".xcframework".as_slice(), b".framework"] {
+            let path = normalize(&dir.join(path::to_native(&text(&[&name, extension]))));
+            if self.ignored.ignores_prefix(&path)
+                || !cx
+                    .host()
+                    .metadata(&path, Follow::Yes)
+                    .is_ok_and(|metadata| metadata.kind == FileKind::Dir)
+            {
+                continue;
+            }
+            let path = if cx.host().system().sysname == b"Darwin" {
+                disk_spelling(cx, &path)
+            } else {
+                path
+            };
+            if self.validate(cx, &path, false)? {
+                self.match_path = Some(path.clone());
+                return Ok(Some(path));
             }
         }
         Ok(None)
@@ -691,11 +828,19 @@ impl<'a> Search<'a> {
             return Ok(None);
         }
         let direct = normalize(&dir.join(name));
+        let try_direct = self
+            .decoration
+            .as_ref()
+            .is_none_or(|library| library.has_suffix(name));
         let alternatives = self
             .decoration
             .iter()
             .flat_map(|library| library.paths(dir, name));
-        for path in std::iter::once(direct.clone()).chain(alternatives) {
+        for path in try_direct
+            .then(|| direct.clone())
+            .into_iter()
+            .chain(alternatives)
+        {
             if let Some(found) = self.accept(cx, &path, dir)? {
                 if self.considered.is_some() {
                     self.match_path = Some(path);
@@ -736,9 +881,22 @@ impl<'a> Search<'a> {
         } else {
             path.to_path_buf()
         };
+        if self.validate(cx, &found, matches!(self.kind, Kind::Path))? {
+            Ok(Some(found))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn validate(
+        &self,
+        cx: &mut Cx<'_>,
+        found: &Path,
+        trailing_slash: bool,
+    ) -> Result<bool, CmdError> {
         if let Some(callback) = &self.options.validator {
-            let mut value = path::from_native(&found);
-            if matches!(self.kind, Kind::Path) && !value.ends_with(b"/") {
+            let mut value = path::from_native(found);
+            if trailing_slash && !value.ends_with(b"/") {
                 value.push(b'/');
             }
             let key = (0..)
@@ -759,11 +917,9 @@ impl<'a> Search<'a> {
             let valid = cx.var_is_on(key);
             cx.unset_var(key);
             result?;
-            if !valid {
-                return Ok(None);
-            }
+            return Ok(valid);
         }
-        Ok(Some(found))
+        Ok(true)
     }
 
     fn log(&self, cx: &Cx<'_>, var: &[u8]) {
@@ -795,8 +951,11 @@ impl<'a> Search<'a> {
             ("AppBundle", b"CMAKE_FIND_APPBUNDLE"),
         ] {
             let mode = cx.var_or_empty(key);
-            let first =
-                mode == b"FIRST" || mode.is_empty() && cx.host().system().sysname == b"Darwin";
+            let first = if label == "Framework" && matches!(self.kind, Kind::Library) {
+                matches!(FrameworkOrder::new(cx), FrameworkOrder::First)
+            } else {
+                mode == b"FIRST" || mode.is_empty() && cx.host().system().sysname == b"Darwin"
+            };
             let item = if label == "Framework" {
                 "Frameworks"
             } else {
@@ -858,6 +1017,30 @@ impl<'a> Search<'a> {
     }
 }
 
+fn disk_spelling(cx: &Cx<'_>, path: &Path) -> PathBuf {
+    // Keep symbolic links in the path and read the spelling of each component.
+    let mut result = PathBuf::new();
+    for component in path.components() {
+        let Component::Normal(name) = component else {
+            result.push(component);
+            continue;
+        };
+        let requested = path::from_native(Path::new(name));
+        let entries = cx.host().read_dir(&result).unwrap_or_default();
+        let mut matches = entries
+            .iter()
+            .filter(|entry| entry.name.eq_ignore_ascii_case(&requested));
+        let first = matches.next();
+        let exact = matches.find(|entry| entry.name == requested);
+        if let Some(entry) = exact.or(first) {
+            result.push(path::to_native(&entry.name));
+        } else {
+            result.push(name);
+        }
+    }
+    result
+}
+
 struct LibraryNames {
     prefixes: Vec<BString>,
     suffixes: Vec<BString>,
@@ -873,6 +1056,17 @@ impl LibraryNames {
         };
         let suffixes = library_parts(cx, b"CMAKE_FIND_LIBRARY_SUFFIXES", defaults);
         Self { prefixes, suffixes }
+    }
+
+    fn has_suffix(&self, name: &Path) -> bool {
+        name.file_name().is_some_and(|file| {
+            let file = path::from_native(Path::new(file));
+            self.suffixes
+                .iter()
+                .map(|suffix| suffix.as_slice())
+                .chain([b".a".as_slice(), b".so", b".dylib", b".tbd", b".lib"])
+                .any(|suffix| file.len() > suffix.len() && file.ends_with(suffix))
+        })
     }
 
     fn pattern(&self, dir: &Path, name: &Path) -> String {

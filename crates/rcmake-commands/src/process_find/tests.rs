@@ -364,6 +364,112 @@ find_library(CUSTOM NAMES tool PATHS custom NO_DEFAULT_PATH)
 }
 
 #[test]
+fn find_library_searches_frameworks_in_the_requested_order() -> HostResult<()> {
+    let (host, mut interp) = setup_package();
+    for directory in [
+        "/work/local/Panel.framework",
+        "/work/local/Panel.xcframework",
+        "/work/system/Other.framework",
+    ] {
+        host.create_dir_all(Path::new(directory))?;
+    }
+    host.seed_file(Path::new("/work/local/libPanel.a"), b"")?;
+    host.seed_file(Path::new("/work/local/Program"), b"")?;
+    let script = r#"
+set(CMAKE_FRAMEWORK_PATH /work/local)
+set(CMAKE_SYSTEM_FRAMEWORK_PATH /work/system)
+set(CMAKE_FIND_LIBRARY_PREFIXES lib)
+set(CMAKE_FIND_LIBRARY_SUFFIXES .a)
+function(accept_framework status item)
+  if(item MATCHES "[.]xcframework$")
+    set(${status} FALSE PARENT_SCOPE)
+  endif()
+endfunction()
+set(CMAKE_FIND_FRAMEWORK FIRST)
+find_library(FIRST Panel)
+find_library(VALIDATED Panel VALIDATOR accept_framework)
+find_library(NAMES_FIRST NAMES Other Panel)
+find_library(DIRS_FIRST NAMES Other Panel NAMES_PER_DIR)
+find_library(NO_DEFAULT Panel NO_DEFAULT_PATH)
+set(CMAKE_FIND_FRAMEWORK LAST)
+find_library(LAST Panel)
+find_library(FALLBACK Other)
+set(CMAKE_FIND_FRAMEWORK ONLY)
+find_library(ONLY Panel)
+find_library(PLAIN Program)
+find_library(NO_SYSTEM Other NO_CMAKE_SYSTEM_PATH)
+set(CMAKE_FIND_FRAMEWORK NEVER)
+find_library(NEVER Panel)
+find_library(NO_FRAMEWORK Other)
+find_library(NO_SUFFIX Program)
+"#;
+    assert_eq!(run(&host, &mut interp, script)?, 0);
+    for (name, expected) in [
+        ("FIRST", "/work/local/Panel.xcframework"),
+        ("VALIDATED", "/work/local/Panel.framework"),
+        ("NAMES_FIRST", "/work/system/Other.framework"),
+        ("DIRS_FIRST", "/work/local/Panel.xcframework"),
+        ("NO_DEFAULT", "NO_DEFAULT-NOTFOUND"),
+        ("LAST", "/work/local/libPanel.a"),
+        ("FALLBACK", "/work/system/Other.framework"),
+        ("ONLY", "/work/local/Panel.xcframework"),
+        ("PLAIN", "PLAIN-NOTFOUND"),
+        ("NO_SYSTEM", "NO_SYSTEM-NOTFOUND"),
+        ("NEVER", "/work/local/libPanel.a"),
+        ("NO_FRAMEWORK", "NO_FRAMEWORK-NOTFOUND"),
+        ("NO_SUFFIX", "NO_SUFFIX-NOTFOUND"),
+    ] {
+        assert_eq!(var(&mut interp, name.as_bytes()), expected, "{name}");
+    }
+    Ok(())
+}
+
+#[test]
+fn find_library_searches_framework_paths_under_the_find_root() -> HostResult<()> {
+    let (host, mut interp) = setup_package();
+    for directory in [
+        "/work/sdk/System/Library/Frameworks/Panel.framework",
+        "/System/Library/Frameworks/Panel.framework",
+        "/Library/Frameworks/Other.framework",
+    ] {
+        host.create_dir_all(Path::new(directory))?;
+    }
+    let script = r#"
+set(CMAKE_FIND_FRAMEWORK ONLY)
+set(CMAKE_FIND_ROOT_PATH /work/sdk)
+set(CMAKE_SYSTEM_FRAMEWORK_PATH /Library/Frameworks /System/Library/Frameworks)
+find_library(ROOTED Panel)
+find_library(HOST Panel NO_CMAKE_FIND_ROOT_PATH)
+find_library(ONLY_ROOT Other ONLY_CMAKE_FIND_ROOT_PATH)
+find_library(ALREADY_ROOTED Panel HINTS /work/sdk/System/Library/Frameworks NO_DEFAULT_PATH)
+set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY NEVER)
+find_library(MODE Panel)
+find_library(BOTH Panel CMAKE_FIND_ROOT_PATH_BOTH)
+"#;
+    assert_eq!(run(&host, &mut interp, script)?, 0);
+    for (name, expected) in [
+        (
+            "ROOTED",
+            "/work/sdk/System/Library/Frameworks/Panel.framework",
+        ),
+        ("HOST", "/System/Library/Frameworks/Panel.framework"),
+        ("ONLY_ROOT", "ONLY_ROOT-NOTFOUND"),
+        (
+            "ALREADY_ROOTED",
+            "/work/sdk/System/Library/Frameworks/Panel.framework",
+        ),
+        ("MODE", "/System/Library/Frameworks/Panel.framework"),
+        (
+            "BOTH",
+            "/work/sdk/System/Library/Frameworks/Panel.framework",
+        ),
+    ] {
+        assert_eq!(var(&mut interp, name.as_bytes()), expected, "{name}");
+    }
+    Ok(())
+}
+
+#[test]
 fn find_path_returns_the_search_directory_for_a_nested_file() -> HostResult<()> {
     let (host, mut interp) = setup();
     host.seed_file(Path::new("/work/inc/sub/h.h"), b"")?;

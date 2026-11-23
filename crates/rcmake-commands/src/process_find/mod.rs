@@ -2,9 +2,12 @@
 
 #![forbid(unsafe_code)]
 
-use rcmake_base::BString;
+use std::path::{Component, PathBuf};
+
+use rcmake_base::{BString, list, path_lex::Lexical};
 use rcmake_diag::{Effect, MessageKind};
 use rcmake_eval::{CmdError, CmdFlags, Cx, Registry};
+use rcmake_host::path;
 
 mod cps_import;
 mod environment;
@@ -33,4 +36,82 @@ fn diagnostic(cx: &mut Cx<'_>, text: BString) -> CmdError {
 
 fn text(parts: &[&[u8]]) -> BString {
     BString::from(parts.concat())
+}
+
+#[derive(Clone, Copy, Default)]
+enum RootMode {
+    #[default]
+    Default,
+    Both,
+    Only,
+    Never,
+}
+
+impl RootMode {
+    fn option(arg: &[u8]) -> Option<Self> {
+        match arg {
+            b"CMAKE_FIND_ROOT_PATH_BOTH" => Some(Self::Both),
+            b"ONLY_CMAKE_FIND_ROOT_PATH" => Some(Self::Only),
+            b"NO_CMAKE_FIND_ROOT_PATH" => Some(Self::Never),
+            _ => None,
+        }
+    }
+
+    fn resolve(self, cx: &Cx<'_>, setting: &[u8]) -> Self {
+        match self {
+            Self::Default => match cx.var_or_empty(setting).as_slice() {
+                b"ONLY" => Self::Only,
+                b"NEVER" => Self::Never,
+                _ => Self::Both,
+            },
+            mode => mode,
+        }
+    }
+
+    fn reroot(self, cx: &Cx<'_>, paths: Vec<PathBuf>) -> Vec<PathBuf> {
+        if matches!(self, Self::Never) {
+            return paths;
+        }
+        let paths_from_var = |key| {
+            list::split(&cx.var_or_empty(key), list::Empty::Drop)
+                .into_iter()
+                .map(|value| {
+                    let full = path::from_native(&cx.resolve_path(&value));
+                    path::to_native(&Lexical::new(&full).normalize())
+                })
+        };
+        let roots: Vec<_> = [
+            b"CMAKE_FIND_ROOT_PATH".as_slice(),
+            b"CMAKE_SYSROOT_COMPILE",
+            b"CMAKE_SYSROOT_LINK",
+            b"CMAKE_SYSROOT",
+        ]
+        .into_iter()
+        .flat_map(paths_from_var)
+        .collect();
+        if roots.is_empty() {
+            return paths;
+        }
+        let staging = paths_from_var(b"CMAKE_STAGING_PREFIX").next();
+        let mut dirs = Vec::new();
+        for root in roots {
+            for path in &paths {
+                if path.starts_with(&root)
+                    || staging.as_ref().is_some_and(|dir| path.starts_with(dir))
+                {
+                    dirs.push(path.clone());
+                } else {
+                    let relative: PathBuf = path
+                        .components()
+                        .filter(|part| matches!(part, Component::Normal(_)))
+                        .collect();
+                    dirs.push(root.join(relative));
+                }
+            }
+        }
+        if matches!(self, Self::Both) {
+            dirs.extend(paths);
+        }
+        dirs
+    }
 }

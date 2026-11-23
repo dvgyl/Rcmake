@@ -10,19 +10,10 @@ use rcmake_host::{FileKind, Follow, path};
 use rcmake_model::{CacheEntry, CacheType};
 use rcmake_syntax::ArgKind;
 
-use super::{cps_import, diagnostic, text};
+use super::{RootMode, cps_import, diagnostic, text};
 
 const PROVIDER: &[u8] = b"_RCMAKE_FIND_PACKAGE_PROVIDER";
 const PACKAGE_ROOTS: &[u8] = b"_RCMAKE_FIND_PACKAGE_ROOTS";
-
-#[derive(Clone, Copy, Default)]
-enum RootMode {
-    #[default]
-    Default,
-    Both,
-    Only,
-    Never,
-}
 
 #[derive(Default)]
 pub(super) struct Request {
@@ -116,15 +107,9 @@ impl Request {
                     request.config_options.push(value.clone());
                     request.no_defaults = true;
                 }
-                b"CMAKE_FIND_ROOT_PATH_BOTH"
-                | b"ONLY_CMAKE_FIND_ROOT_PATH"
-                | b"NO_CMAKE_FIND_ROOT_PATH" => {
+                key if let Some(mode) = RootMode::option(key) => {
                     request.config_options.push(value.clone());
-                    request.root_mode = match key {
-                        b"CMAKE_FIND_ROOT_PATH_BOTH" => RootMode::Both,
-                        b"ONLY_CMAKE_FIND_ROOT_PATH" => RootMode::Only,
-                        _ => RootMode::Never,
-                    };
+                    request.root_mode = mode;
                 }
                 _ => {
                     if let Some(source) = search_source(key) {
@@ -1242,7 +1227,10 @@ impl ConfigSearch<'_> {
             .filter(|value| !value.is_empty() && !value.starts_with(b"[HKEY_"))
             .map(|value| full_path(cx, &value))
             .collect();
-        reroot(cx, request.root_mode, prefixes)
+        request
+            .root_mode
+            .resolve(cx, b"CMAKE_FIND_ROOT_PATH_MODE_PACKAGE")
+            .reroot(cx, prefixes)
     }
 
     fn layout(&self, cx: &mut Cx<'_>, prefix: &Path) -> Vec<(PathBuf, bool)> {
@@ -1477,58 +1465,6 @@ fn paths_from_vars(cx: &Cx<'_>, keys: &[&[u8]]) -> Vec<PathBuf> {
         .flat_map(|key| cmake_paths(cx, key))
         .map(|value| full_path(cx, &value))
         .collect()
-}
-
-fn reroot(cx: &Cx<'_>, mode: RootMode, prefixes: Vec<PathBuf>) -> Vec<PathBuf> {
-    let mode = match mode {
-        RootMode::Default => match cx
-            .var_or_empty(b"CMAKE_FIND_ROOT_PATH_MODE_PACKAGE")
-            .as_slice()
-        {
-            b"ONLY" => RootMode::Only,
-            b"NEVER" => RootMode::Never,
-            _ => RootMode::Both,
-        },
-        mode => mode,
-    };
-    if matches!(mode, RootMode::Never) {
-        return prefixes;
-    }
-    let roots = paths_from_vars(
-        cx,
-        &[
-            b"CMAKE_FIND_ROOT_PATH",
-            b"CMAKE_SYSROOT_COMPILE",
-            b"CMAKE_SYSROOT_LINK",
-            b"CMAKE_SYSROOT",
-        ],
-    );
-    if roots.is_empty() {
-        return prefixes;
-    }
-    let staging = cmake_paths(cx, b"CMAKE_STAGING_PREFIX")
-        .first()
-        .map(|value| full_path(cx, value));
-    let mut dirs = Vec::new();
-    for root in roots {
-        for prefix in &prefixes {
-            if prefix.starts_with(&root)
-                || staging.as_ref().is_some_and(|dir| prefix.starts_with(dir))
-            {
-                dirs.push(prefix.clone());
-            } else {
-                let relative: PathBuf = prefix
-                    .components()
-                    .filter(|part| matches!(part, std::path::Component::Normal(_)))
-                    .collect();
-                dirs.push(root.join(relative));
-            }
-        }
-    }
-    if matches!(mode, RootMode::Both) {
-        dirs.extend(prefixes);
-    }
-    dirs
 }
 
 fn user_registry(cx: &Cx<'_>, name: &[u8]) -> Vec<BString> {
