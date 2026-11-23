@@ -23,3 +23,7 @@ All crates conform to the permissive allow-list in ADR-001 (`MIT`, `Apache-2.0`,
 | `serde` / `serde_json` (no `preserve_order`) | `1` | `MIT OR Apache-2.0` | `rcmake-harness` only | Baseline manifest serialization in isolated test harness |
 | `similar` | `2` | `Apache-2.0` | `rcmake-harness` only | Readable diff output on oracle mismatches |
 | `tempfile` | `3` | `MIT OR Apache-2.0` | `rcmake-harness` & tests | Isolated `/tmp` test sandboxes |
+| `md-5`, `sha1`, `sha2`, `sha3` | `0.10` | `MIT OR Apache-2.0` | `rcmake-base` | Pure-Rust cryptographic hashes for `string(<HASH>)`, `file(<HASH>)`, and `cmake -E *sum` |
+| `flate2` (default `miniz_oxide`) | `1` | `MIT OR Apache-2.0` | `rcmake-archive` | Pure-Rust gzip compression/decompression |
+| `tar` | `0.4` | `MIT OR Apache-2.0` | `rcmake-archive` | Pure-Rust POSIX/GNU tar creation & extraction |
+| `zip` (`deflate` only, no default features) | `2` | `MIT` | `rcmake-archive` | Pure-Rust ZIP archive creation & extraction without copyleft/bzip2 defaults |

@@ -1,0 +1,19 @@
+[package]
+name = "rcmake-tool-e"
+description = "Cross-platform `cmake -E` built-in command-line utilities for Rcmake."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+jiff.workspace = true
+rcmake-archive.workspace = true
+rcmake-base.workspace = true
+rcmake-diag.workspace = true
+rcmake-host.workspace = true
+rcmake-json.workspace = true
+
+[lints]
+workspace = true

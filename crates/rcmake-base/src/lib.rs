@@ -1,12 +1,13 @@
-//! Core byte-string, list, truthiness, version, and safety-limit primitives for Rcmake.
+//! Core byte-string, list, truthiness, version, hash, and safety-limit primitives for Rcmake.
 //!
 //! CMake values are arbitrary byte strings (not necessarily UTF-8), so this crate
 //! re-exports [`bstr`] types and implements CMake 4.5.1's exact list splitting,
-//! boolean truthiness, arbitrary-precision version comparison, and execution limits
-//! over byte slices.
+//! boolean truthiness, arbitrary-precision version comparison, cryptographic hashes,
+//! and execution limits over byte slices.
 
 #![forbid(unsafe_code)]
 
+pub mod hash;
 pub mod limits;
 pub mod list;
 pub mod truth;

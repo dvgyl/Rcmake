@@ -1,0 +1,19 @@
+[package]
+name = "rcmake-archive"
+description = "Shared pure-Rust archive creation, extraction, and listing engine (tar, tar.gz, zip) over Host."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+flate2.workspace = true
+rcmake-base.workspace = true
+rcmake-host.workspace = true
+tar.workspace = true
+thiserror.workspace = true
+zip.workspace = true
+
+[lints]
+workspace = true

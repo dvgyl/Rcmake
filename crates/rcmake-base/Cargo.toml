@@ -1,6 +1,6 @@
 [package]
 name = "rcmake-base"
-description = "Core byte-string, list, truthiness, version, and limit primitives for Rcmake."
+description = "Core byte-string, list, truthiness, version, hash, and limit primitives for Rcmake."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,7 +9,11 @@ repository.workspace = true
 
 [dependencies]
 bstr.workspace = true
+md-5.workspace = true
 memchr.workspace = true
+sha1.workspace = true
+sha2.workspace = true
+sha3.workspace = true
 
 [lints]
 workspace = true

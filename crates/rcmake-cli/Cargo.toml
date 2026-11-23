@@ -13,6 +13,7 @@ path = "src/main.rs"
 
 [dependencies]
 rcmake-base.workspace = true
+rcmake-commands.workspace = true
 rcmake-diag.workspace = true
 rcmake-eval.workspace = true
 rcmake-host.workspace = true
@@ -20,6 +21,7 @@ rcmake-json.workspace = true
 rcmake-model.workspace = true
 rcmake-presets.workspace = true
 rcmake-syntax.workspace = true
+rcmake-tool-e.workspace = true
 
 [lints]
 workspace = true

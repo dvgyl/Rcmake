@@ -102,6 +102,22 @@ fn run_cmake(argv: &[BString], rest: &[BString], host: Arc<dyn Host>) -> i32 {
 
     while let Some(arg) = rest.get(i) {
         let bytes = arg.as_slice();
+        if bytes == b"-E" {
+            let sub_args = rest.get(i + 1..).unwrap_or(&[]);
+            let cwd = host.initial_cwd();
+            let exe_display = host
+                .current_exe()
+                .map(|p| rcmake_host::path::from_native(&p))
+                .unwrap_or_else(|_| BString::from("cmake"));
+            let caps = || build_capabilities_json();
+            let ctx = rcmake_tool_e::ToolCtx {
+                host: host.as_ref(),
+                cwd: &cwd,
+                exe_display: exe_display.as_slice(),
+                capabilities: &caps,
+            };
+            return rcmake_tool_e::run(sub_args, &ctx);
+        }
         if bytes == b"-P" {
             let Some(script_arg) = rest.get(i + 1) else {
                 emit_cli_error(host.as_ref(), "No script specified for argument -P");
@@ -246,7 +262,7 @@ fn run_script_mode(
         script_args: argv.to_vec(),
     };
 
-    let mut interp = Interp::new(cfg, |_reg| {});
+    let mut interp = Interp::new(cfg, rcmake_commands::register_all);
     interp.set_log_level(log_level);
     if log_context {
         interp.set_log_context(true);
@@ -364,6 +380,37 @@ fn discover_cmake_paths(host: &dyn Host) -> (PathBuf, PathBuf) {
         .map(|p| p.join("share/cmake-4.5"))
         .unwrap_or_else(|| PathBuf::from("/usr/local/share/cmake-4.5"));
     (cmake_command, cmake_root)
+}
+
+fn build_capabilities_json() -> rcmake_json::Value {
+    use rcmake_json::Value;
+    use std::collections::BTreeMap;
+
+    let mut version = BTreeMap::new();
+    version.insert(BString::from("isDirty"), Value::Bool(false));
+    version.insert(
+        BString::from("major"),
+        Value::UInt(u64::from(rcmake_base::CMAKE_VERSION_MAJOR)),
+    );
+    version.insert(
+        BString::from("minor"),
+        Value::UInt(u64::from(rcmake_base::CMAKE_VERSION_MINOR)),
+    );
+    version.insert(
+        BString::from("patch"),
+        Value::UInt(u64::from(rcmake_base::CMAKE_VERSION_PATCH)),
+    );
+    version.insert(BString::from("string"), Value::string(CMAKE_VERSION_STR));
+    version.insert(BString::from("suffix"), Value::string(""));
+
+    let mut root = BTreeMap::new();
+    root.insert(BString::from("debugger"), Value::Bool(false));
+    root.insert(BString::from("fileApi"), Value::object());
+    root.insert(BString::from("generators"), Value::Array(Vec::new()));
+    root.insert(BString::from("serverMode"), Value::Bool(false));
+    root.insert(BString::from("tls"), Value::Bool(false));
+    root.insert(BString::from("version"), Value::Object(version));
+    Value::Object(root)
 }
 
 fn emit_cli_error(host: &dyn Host, body: impl Into<BString>) {
