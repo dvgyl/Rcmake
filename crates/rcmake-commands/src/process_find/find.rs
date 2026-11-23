@@ -247,7 +247,7 @@ fn find(cx: &mut Cx<'_>, args: &[ExpandedArg], kind: Kind) -> CmdResult {
 
     let directories = directories(cx, kind, &options);
     let mut search = Search::new(cx, kind, &options);
-    let found = search.run(cx, &directories)?;
+    let found = search.run(cx, directories)?;
     search.log(cx, var);
     let mut value = found
         .as_deref()
@@ -385,24 +385,7 @@ fn directories(cx: &Cx<'_>, kind: Kind, options: &Options) -> Vec<PathBuf> {
         options.no_defaults || options.no_system,
         b"CMAKE_FIND_USE_CMAKE_SYSTEM_PATH",
     ) {
-        let mut prefixes = if cx.var_defined(b"CMAKE_SYSTEM_PREFIX_PATH") {
-            cmake_paths(cx, b"CMAKE_SYSTEM_PREFIX_PATH")
-        } else {
-            let mut prefixes = vec!["/usr/local".into(), "/usr".into(), "/".into()];
-            if cx.host().system().sysname.as_slice() == b"Darwin" {
-                prefixes.push("/opt/homebrew".into());
-            }
-            prefixes
-        };
-        if use_default(cx, options.no_install, b"CMAKE_FIND_USE_INSTALL_PREFIX") {
-            for key in [b"CMAKE_INSTALL_PREFIX".as_slice(), b"CMAKE_STAGING_PREFIX"] {
-                let prefix = cx.var_or_empty(key);
-                if !prefix.is_empty() {
-                    prefixes.push(prefix);
-                }
-            }
-        }
-        add_prefixes(cx, &mut paths, prefixes, &variables);
+        add_prefixes(cx, &mut paths, system_prefixes(cx, options), &variables);
         paths.extend(
             cmake_paths(cx, variables.system)
                 .iter()
@@ -410,24 +393,78 @@ fn directories(cx: &Cx<'_>, kind: Kind, options: &Options) -> Vec<PathBuf> {
         );
     }
     paths.extend(options.paths.iter().map(|dir| cx.resolve_path(dir)));
-    let mut paths = with_suffixes(paths, &options.suffixes);
-    let ignored: Vec<_> = [b"CMAKE_IGNORE_PATH".as_slice(), b"CMAKE_SYSTEM_IGNORE_PATH"]
-        .into_iter()
-        .flat_map(|key| cmake_paths(cx, key))
-        .map(|dir| normalize(&cx.resolve_path(&dir)))
-        .collect();
-    let prefixes: Vec<_> = [
-        b"CMAKE_IGNORE_PREFIX_PATH".as_slice(),
-        b"CMAKE_SYSTEM_IGNORE_PREFIX_PATH",
-    ]
-    .into_iter()
-    .flat_map(|key| cmake_paths(cx, key))
-    .map(|dir| normalize(&cx.resolve_path(&dir)))
-    .collect();
-    paths.retain(|dir| {
-        !ignored.contains(dir) && !prefixes.iter().any(|prefix| dir.starts_with(prefix))
-    });
-    paths
+    with_suffixes(paths, &options.suffixes)
+}
+
+fn system_prefixes(cx: &Cx<'_>, options: &Options) -> Vec<BString> {
+    const USE_INSTALL_PREFIX: &[u8] = b"CMAKE_FIND_USE_INSTALL_PREFIX";
+    let platform_skips_install = cx.var_is_on(b"CMAKE_FIND_NO_INSTALL_PREFIX");
+    let use_install = use_default(cx, options.no_install, USE_INSTALL_PREFIX);
+    let install_prefixes = || {
+        [b"CMAKE_INSTALL_PREFIX".as_slice(), b"CMAKE_STAGING_PREFIX"]
+            .into_iter()
+            .flat_map(|key| cmake_paths(cx, key))
+    };
+
+    let has_system_prefixes = cx.var_defined(b"CMAKE_SYSTEM_PREFIX_PATH");
+    let mut prefixes = if has_system_prefixes {
+        cmake_paths(cx, b"CMAKE_SYSTEM_PREFIX_PATH")
+    } else {
+        let mut defaults = vec!["/usr/local".into(), "/usr".into(), "/".into()];
+        if cx.host().system().sysname.as_slice() == b"Darwin" {
+            defaults.push("/opt/homebrew".into());
+        }
+        if use_install && !platform_skips_install {
+            defaults.extend(install_prefixes());
+        }
+        defaults
+    };
+
+    if platform_skips_install {
+        if use_install && cx.var_defined(USE_INSTALL_PREFIX) {
+            prefixes.splice(..0, install_prefixes());
+        }
+    } else if !use_install && has_system_prefixes {
+        remove_install_prefixes(cx, &mut prefixes);
+    }
+    prefixes
+}
+
+fn remove_install_prefixes(cx: &Cx<'_>, prefixes: &mut Vec<BString>) {
+    // The platform records the occurrence of each prefix it added.
+    let recorded_index = |kind| {
+        let count_key = format!("_CMAKE_SYSTEM_PREFIX_PATH_{kind}_PREFIX_COUNT");
+        let value_key = format!("_CMAKE_SYSTEM_PREFIX_PATH_{kind}_PREFIX_VALUE");
+        let count = cx.var_or_empty(count_key.as_bytes());
+        let offset = std::str::from_utf8(&count)
+            .ok()?
+            .parse::<usize>()
+            .ok()?
+            .checked_sub(1)?;
+        let value = cx.var_or_empty(value_key.as_bytes());
+        prefixes
+            .iter()
+            .enumerate()
+            .filter(|(_, prefix)| **prefix == value)
+            .nth(offset)
+            .map(|(index, _)| index)
+    };
+    let install = recorded_index("INSTALL");
+    let mut staging = recorded_index("STAGING");
+    if let Some(index) = staging.filter(|_| staging == install) {
+        // If both prefixes have the same value, the platform records the same count.
+        staging = prefixes
+            .split_at_checked(index)
+            .and_then(|(earlier, rest)| {
+                let value = rest.first()?;
+                earlier.iter().rposition(|prefix| prefix == value)
+            });
+    }
+    let mut indices = [install, staging];
+    indices.sort_unstable();
+    for index in indices.into_iter().rev().flatten() {
+        prefixes.remove(index);
+    }
 }
 
 fn add_prefixes(
@@ -515,10 +552,42 @@ fn env_paths(cx: &Cx<'_>, var: &[u8]) -> Vec<BString> {
     })
 }
 
+struct IgnoredPaths {
+    directories: BTreeSet<PathBuf>,
+    prefixes: Vec<PathBuf>,
+}
+
+impl IgnoredPaths {
+    fn new(cx: &Cx<'_>) -> Self {
+        let paths = |keys: [&'static [u8]; 2]| {
+            keys.into_iter()
+                .flat_map(move |key| cmake_paths(cx, key))
+                .map(move |dir| normalize(&cx.resolve_path(&dir)))
+        };
+        Self {
+            directories: paths([b"CMAKE_IGNORE_PATH", b"CMAKE_SYSTEM_IGNORE_PATH"]).collect(),
+            prefixes: paths([
+                b"CMAKE_IGNORE_PREFIX_PATH",
+                b"CMAKE_SYSTEM_IGNORE_PREFIX_PATH",
+            ])
+            .collect(),
+        }
+    }
+
+    fn ignores_directory(&self, path: &Path) -> bool {
+        self.directories.contains(path) || self.ignores_prefix(path)
+    }
+
+    fn ignores_prefix(&self, path: &Path) -> bool {
+        self.prefixes.iter().any(|prefix| path.starts_with(prefix))
+    }
+}
+
 struct Search<'a> {
     kind: Kind,
     options: &'a Options,
     decoration: Option<LibraryNames>,
+    ignored: IgnoredPaths,
     considered: Option<String>,
     match_path: Option<PathBuf>,
 }
@@ -529,12 +598,18 @@ impl<'a> Search<'a> {
             kind,
             options,
             decoration: matches!(kind, Kind::Library).then(|| LibraryNames::new(cx)),
+            ignored: IgnoredPaths::new(cx),
             considered: cx.var_is_on(b"CMAKE_FIND_DEBUG_MODE").then(String::new),
             match_path: None,
         }
     }
 
-    fn run(&mut self, cx: &mut Cx<'_>, dirs: &[PathBuf]) -> Result<Option<PathBuf>, CmdError> {
+    fn run(
+        &mut self,
+        cx: &mut Cx<'_>,
+        mut dirs: Vec<PathBuf>,
+    ) -> Result<Option<PathBuf>, CmdError> {
+        dirs.retain(|dir| !self.ignored.ignores_directory(dir));
         let names: Vec<_> = self
             .options
             .names
@@ -560,10 +635,12 @@ impl<'a> Search<'a> {
                 {
                     let framework = cx.resolve_path(&root).join(path::to_native(&entry.name));
                     for headers in ["Headers", "PrivateHeaders"] {
+                        let dir = normalize(&framework.join(headers));
+                        if self.ignored.ignores_directory(&dir) {
+                            continue;
+                        }
                         for name in &names {
-                            if let Some(found) =
-                                self.in_directory(cx, &framework.join(headers), name)?
-                            {
+                            if let Some(found) = self.in_directory(cx, &dir, name)? {
                                 return Ok(Some(found));
                             }
                         }
@@ -580,7 +657,7 @@ impl<'a> Search<'a> {
                     return Ok(Some(found));
                 }
             }
-            for dir in dirs {
+            for dir in &dirs {
                 for name in names.iter().filter(|name| !name.is_absolute()) {
                     if let Some(found) = self.in_directory(cx, dir, name)? {
                         return Ok(Some(found));
@@ -592,7 +669,7 @@ impl<'a> Search<'a> {
                 let search_dirs = if name.is_absolute() {
                     &[PathBuf::new()][..]
                 } else {
-                    dirs
+                    &dirs
                 };
                 for dir in search_dirs {
                     if let Some(found) = self.in_directory(cx, dir, &name)? {
@@ -626,7 +703,7 @@ impl<'a> Search<'a> {
                 return Ok(Some(found));
             }
         }
-        if self.considered.is_some() {
+        if self.considered.is_some() && !self.ignored.ignores_prefix(&direct) {
             let path = self.decoration.as_ref().map_or_else(
                 || direct.display().to_string(),
                 |library| library.pattern(dir, name),
@@ -651,7 +728,7 @@ impl<'a> Search<'a> {
         path: &Path,
         dir: &Path,
     ) -> Result<Option<PathBuf>, CmdError> {
-        if !candidate(cx, self.kind, path) {
+        if self.ignored.ignores_prefix(path) || !candidate(cx, self.kind, path) {
             return Ok(None);
         }
         let found = if matches!(self.kind, Kind::Path) {

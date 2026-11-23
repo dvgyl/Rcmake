@@ -449,6 +449,115 @@ find_program(NO_DEFAULTS tool HINTS /no-defaults NO_DEFAULT_PATH)
 }
 
 #[test]
+fn find_install_prefix_option_uses_platform_records() -> HostResult<()> {
+    let (host, mut interp) = setup_package();
+    for file in [
+        "/install/lib/libinstalled.a",
+        "/staging/lib/libstaged.a",
+        "/original/lib/liboriginal.a",
+        "/independent/lib/libmanual.a",
+    ] {
+        host.seed_file(Path::new(file), b"")?;
+    }
+    let script = r#"
+set(CMAKE_INSTALL_PREFIX /install)
+set(CMAKE_STAGING_PREFIX /staging/)
+set(CMAKE_SYSTEM_PREFIX_PATH /independent;/original;/staging/)
+set(_CMAKE_SYSTEM_PREFIX_PATH_INSTALL_PREFIX_VALUE /original)
+set(_CMAKE_SYSTEM_PREFIX_PATH_INSTALL_PREFIX_COUNT 1)
+set(_CMAKE_SYSTEM_PREFIX_PATH_STAGING_PREFIX_VALUE /staging/)
+set(_CMAKE_SYSTEM_PREFIX_PATH_STAGING_PREFIX_COUNT 1)
+set(CMAKE_FIND_USE_INSTALL_PREFIX FALSE)
+find_library(DISABLED_INSTALL original)
+find_library(DISABLED_STAGING staged)
+find_library(MANUAL manual)
+find_library(EXPLICIT original PATHS /original/lib NO_DEFAULT_PATH)
+set(CMAKE_FIND_USE_INSTALL_PREFIX ON)
+find_library(ENABLED_INSTALL original)
+find_library(ENABLED_STAGING staged)
+find_library(CHANGED_INSTALL installed)
+find_library(COMMAND_DISABLED original NO_CMAKE_INSTALL_PREFIX)
+set(CMAKE_SYSTEM_PREFIX_PATH /original;/original;/staging/)
+set(_CMAKE_SYSTEM_PREFIX_PATH_INSTALL_PREFIX_COUNT 2)
+find_library(DUPLICATE original NO_CMAKE_INSTALL_PREFIX)
+set(CMAKE_SYSTEM_PREFIX_PATH /independent;/staging/;/staging/)
+set(_CMAKE_SYSTEM_PREFIX_PATH_INSTALL_PREFIX_VALUE /staging/)
+set(_CMAKE_SYSTEM_PREFIX_PATH_STAGING_PREFIX_COUNT 2)
+set(CMAKE_FIND_USE_INSTALL_PREFIX OFF)
+find_library(SHARED_PREFIX staged)
+set(CMAKE_SYSTEM_PREFIX_PATH /independent)
+set(CMAKE_FIND_NO_INSTALL_PREFIX ON)
+unset(CMAKE_FIND_USE_INSTALL_PREFIX)
+find_library(OMITTED installed)
+set(CMAKE_FIND_USE_INSTALL_PREFIX ON)
+find_library(ADDED_INSTALL installed)
+find_library(ADDED_STAGING staged)
+find_library(NO_SYSTEM installed NO_CMAKE_SYSTEM_PATH)
+"#;
+    let exit = run(&host, &mut interp, script)?;
+    assert_eq!(exit, 0, "{}", host.stream_bytes(Stream::Stderr));
+    for (name, value) in [
+        ("DISABLED_INSTALL", "DISABLED_INSTALL-NOTFOUND"),
+        ("DISABLED_STAGING", "DISABLED_STAGING-NOTFOUND"),
+        ("MANUAL", "/independent/lib/libmanual.a"),
+        ("EXPLICIT", "/original/lib/liboriginal.a"),
+        ("ENABLED_INSTALL", "/original/lib/liboriginal.a"),
+        ("ENABLED_STAGING", "/staging/lib/libstaged.a"),
+        ("CHANGED_INSTALL", "CHANGED_INSTALL-NOTFOUND"),
+        ("COMMAND_DISABLED", "COMMAND_DISABLED-NOTFOUND"),
+        ("DUPLICATE", "/original/lib/liboriginal.a"),
+        ("SHARED_PREFIX", "SHARED_PREFIX-NOTFOUND"),
+        ("OMITTED", "OMITTED-NOTFOUND"),
+        ("ADDED_INSTALL", "/install/lib/libinstalled.a"),
+        ("ADDED_STAGING", "/staging/lib/libstaged.a"),
+        ("NO_SYSTEM", "NO_SYSTEM-NOTFOUND"),
+    ] {
+        assert_eq!(var(&mut interp, name.as_bytes()), value, "{name}");
+    }
+    Ok(())
+}
+
+#[test]
+fn find_skips_candidates_under_ignored_prefixes() -> HostResult<()> {
+    let (host, mut interp) = setup_package();
+    for file in [
+        "/work/blocked/sub/header.h",
+        "/work/blocked/sub/libexample.a",
+        "/work/system/sub/header.h",
+        "/work/system/sub/tool",
+        "/work/blocked-extra/header.h",
+    ] {
+        host.seed_file(Path::new(file), b"")?;
+    }
+    host.set_permissions(Path::new("/work/system/sub/tool"), 0o755)?;
+    let script = r#"
+set(CMAKE_IGNORE_PREFIX_PATH "/work/blocked/")
+set(CMAKE_SYSTEM_IGNORE_PREFIX_PATH "/work/system")
+find_file(DIRECT header.h HINTS blocked/sub system/sub blocked-extra NO_DEFAULT_PATH)
+find_file(NESTED blocked/sub/header.h PATHS . NO_DEFAULT_PATH)
+find_path(INCLUDE system/sub/header.h PATHS . NO_DEFAULT_PATH)
+find_library(LIBRARY blocked/sub/example PATHS . NO_DEFAULT_PATH)
+find_program(PROGRAM /work/system/sub/tool NO_DEFAULT_PATH)
+unset(CMAKE_IGNORE_PREFIX_PATH)
+set(CMAKE_IGNORE_PATH "/work/blocked")
+find_file(EXACT_IGNORE header.h PATHS blocked PATH_SUFFIXES sub NO_DEFAULT_PATH)
+"#;
+    let exit = run(&host, &mut interp, script)?;
+    assert_eq!(exit, 0, "{}", host.stream_bytes(Stream::Stderr));
+    for (name, value) in [
+        ("DIRECT", "/work/blocked-extra/header.h"),
+        ("NESTED", "NESTED-NOTFOUND"),
+        ("INCLUDE", "INCLUDE-NOTFOUND"),
+        ("LIBRARY", "LIBRARY-NOTFOUND"),
+        ("PROGRAM", "PROGRAM-NOTFOUND"),
+        ("EXACT_IGNORE", "/work/blocked/sub/header.h"),
+    ] {
+        assert_eq!(var(&mut interp, name.as_bytes()), value, "{name}");
+    }
+    Ok(())
+}
+
+#[test]
 fn find_respects_existing_values_and_retries_notfound() -> HostResult<()> {
     let (host, mut interp) = setup();
     interp.cx().set_var(b"NORMAL", "keep".into());
