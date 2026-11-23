@@ -28,7 +28,7 @@ use rcmake_expr::{CondEnv, CondError, ExpandEnv, ExpandError, ExpandedArg};
 use rcmake_host::Host;
 use rcmake_model::{Cache, CacheType, GlobalState, ProjectModel, PropertyMap};
 use rcmake_regex::{Captures, Regex, RegexCache, RegexError};
-use rcmake_syntax::Argument;
+use rcmake_syntax::{Argument, CommandInvocation};
 
 /// Shared keyword argument parser helpers (`cmArgumentParser`-style) for command families.
 pub mod args;
@@ -38,6 +38,7 @@ mod code;
 mod env;
 mod exec;
 mod flow;
+mod hooks;
 mod md5;
 mod scope;
 mod stack;
@@ -46,6 +47,7 @@ mod util;
 #[cfg(test)]
 mod tests;
 
+pub use hooks::{TraceConfig, TraceFormat, WatchAccess};
 pub use scope::Binding;
 
 use code::Code;
@@ -96,13 +98,35 @@ pub struct CmdFlags {
 #[derive(Default)]
 pub struct Registry {
     builtins: BTreeMap<BString, (BuiltinFn, CmdFlags)>,
+    /// Commands that expand their own arguments ([`Self::add_raw`]).
+    raw: BTreeSet<BString>,
 }
 
 impl Registry {
     /// Register a built-in command under its canonical lowercase name.
     pub fn add(&mut self, name: &'static str, func: BuiltinFn, flags: CmdFlags) {
-        self.builtins
-            .insert(fold_command_name(name.as_bytes()), (func, flags));
+        let lower = fold_command_name(name.as_bytes());
+        self.raw.remove(&lower);
+        self.builtins.insert(lower, (func, flags));
+    }
+
+    /// Register a built-in command that expands its own arguments, as CMake commands
+    /// that take `cmListFileArgument`s do (`cmake_language`, so that
+    /// `cmake_language(DEFER CALL)` keeps the call arguments unexpanded).
+    ///
+    /// The evaluator does not expand the arguments of such a command and passes an
+    /// empty argument slice. The command reads [`Cx::raw_args`] and expands them with
+    /// [`Cx::expand_raw_args`].
+    pub fn add_raw(&mut self, name: &'static str, func: BuiltinFn, flags: CmdFlags) {
+        let lower = fold_command_name(name.as_bytes());
+        self.raw.insert(lower.clone());
+        self.builtins.insert(lower, (func, flags));
+    }
+
+    /// `true` if the command was registered with [`Self::add_raw`].
+    #[must_use]
+    pub fn takes_raw_args(&self, name: &[u8]) -> bool {
+        self.raw.contains(&fold_command_name(name))
     }
 
     /// Look up a built-in command by any-case name.
@@ -268,7 +292,9 @@ pub(crate) struct UserCommand {
 /// A command entry in the scripted command table.
 #[derive(Clone)]
 pub(crate) enum Command {
-    Builtin(BuiltinFn, CmdFlags),
+    /// A built-in command. The `bool` is `true` for a command that expands its own
+    /// arguments ([`Registry::add_raw`]).
+    Builtin(BuiltinFn, CmdFlags, bool),
     User(Arc<UserCommand>),
 }
 
@@ -347,6 +373,22 @@ pub struct Interp {
     /// Optional explicit exit code requested by `cmake_language(EXIT <code>)`.
     exit_override: Option<i32>,
     frontend: Frontend,
+    /// Variable watches by variable name (`cmVariableWatch`).
+    watches: BTreeMap<BString, Vec<hooks::Watch>>,
+    next_watch_id: u64,
+    /// Command tracing configuration (`--trace*`).
+    trace: Option<TraceConfig>,
+    /// Deferred-call queue of the directory listfile being processed.
+    defer: Option<Vec<hooks::DeferredCall>>,
+    next_defer_id: u64,
+    /// Identifier of the deferred call whose frame is on top of the backtrace.
+    top_defer_id: Option<BString>,
+    /// The listfile command being executed (raw arguments for [`Cx::raw_args`]).
+    cur_cmd: Option<(Arc<[CommandInvocation]>, usize)>,
+    /// `--trace-expand` is expanding the arguments of a traced command.
+    trace_expanding: bool,
+    /// Listfile of each file and function call scope (`LISTFILE_STACK`).
+    listfiles: Vec<Arc<[u8]>>,
 }
 
 impl Interp {
@@ -415,6 +457,15 @@ impl Interp {
             binary_dir: initial_dir,
             exit_override: None,
             frontend: Frontend::default(),
+            watches: BTreeMap::new(),
+            next_watch_id: 0,
+            trace: None,
+            defer: None,
+            next_defer_id: 0,
+            top_defer_id: None,
+            cur_cmd: None,
+            trace_expanding: false,
+            listfiles: Vec::new(),
         };
         interp.init_default_vars();
         interp
@@ -454,6 +505,23 @@ impl Interp {
     /// Show `CMAKE_MESSAGE_CONTEXT` in messages (`--log-context`).
     pub fn set_log_context(&mut self, show: bool) {
         self.show_log_context = show;
+    }
+
+    /// Turn command tracing on (`Some`) or off (`None`).
+    ///
+    /// Each traced command writes one line before it runs. End commands (`endif`,
+    /// `endforeach`, and so on) write their line after the block. With
+    /// [`TraceFormat::JsonV1`], this call first writes the version line
+    /// `{"version":{"major":1,"minor":2}}`. With [`TraceConfig::redirect`], this call
+    /// truncates the output file.
+    pub fn set_trace_config(&mut self, config: Option<TraceConfig>) {
+        self.install_trace(config);
+    }
+
+    /// Active trace configuration.
+    #[must_use]
+    pub fn trace_config(&self) -> Option<&TraceConfig> {
+        self.trace.as_ref()
     }
 
     /// Diagnostic engine with error flags and recorded SARIF results
@@ -507,9 +575,10 @@ impl Cx<'_> {
         &self.interp.config.limits
     }
 
-    /// Look up a normal variable (falling back to cache).
+    /// Look up a normal variable (falling back to cache). Notifies variable watches
+    /// (`READ_ACCESS` or `UNKNOWN_READ_ACCESS`).
     pub fn var(&mut self, name: &[u8]) -> Option<BString> {
-        self.interp.lookup_var(name).cloned()
+        self.interp.read_var(name)
     }
 
     /// Look up a normal variable only (no cache fallback).
@@ -555,6 +624,7 @@ impl Cx<'_> {
     }
 
     /// Set a normal variable in the current scope, enforcing `limits.max_value_bytes`.
+    /// Notifies variable watches (`MODIFIED_ACCESS`).
     pub fn set_var(&mut self, name: &[u8], value: BString) {
         if value.len() > self.interp.config.limits.max_value_bytes {
             self.interp
@@ -562,7 +632,7 @@ impl Cx<'_> {
             self.interp.fatal = true;
             return;
         }
-        self.interp.vars.set(name, value);
+        self.interp.define(name, value);
     }
 
     /// Request immediate termination with exit code `code` (`cmake_language(EXIT <code>)`).
@@ -599,15 +669,17 @@ impl Cx<'_> {
         names
     }
 
-    /// Unset a normal variable in the current scope.
+    /// Unset a normal variable in the current scope. Notifies variable watches
+    /// (`REMOVED_ACCESS`).
     pub fn unset_var(&mut self, name: &[u8]) {
-        self.interp.vars.unset(name);
+        self.interp.undefine(name);
     }
 
     /// Set (`Some`) or unset (`None`) a variable in the immediate parent scope (raise-then-set).
     ///
     /// At the outermost scope this issues the `CMD_AUTHOR` warning
-    /// `Cannot set "<name>": current scope has no parent.`.
+    /// `Cannot set "<name>": current scope has no parent.`. Otherwise this notifies
+    /// variable watches (`MODIFIED_ACCESS`).
     pub fn set_parent_scope(&mut self, name: &[u8], value: Option<BString>) {
         self.interp.raise_var(name, value);
     }
@@ -685,7 +757,11 @@ impl Cx<'_> {
     /// `cmake_policy(SET)`: update the top policy entry and the entries of enclosing
     /// function/macro calls up to the first strong entry.
     pub fn set_policy(&mut self, id: PolicyId, status: PolicyStatus) -> Result<(), PolicyError> {
-        self.interp.policies.try_update(|map| map.set(id, status))
+        self.interp.policies.try_update(|map| map.set(id, status))?;
+        if id == exec::CMP0198 {
+            self.interp.update_parent_list_file_var();
+        }
+        Ok(())
     }
 
     /// `cmake_policy(VERSION)` / `cmake_minimum_required()`: apply a policy version with
@@ -696,7 +772,9 @@ impl Cx<'_> {
     ) -> Result<(), PolicyError> {
         self.interp
             .policies
-            .try_update(|map| map.apply_version(version))
+            .try_update(|map| map.apply_version(version))?;
+        self.interp.update_parent_list_file_var();
+        Ok(())
     }
 
     /// `cmake_minimum_required(VERSION <v>)`: set `CMAKE_MINIMUM_REQUIRED_VERSION` and
@@ -861,5 +939,100 @@ impl Cx<'_> {
     /// Parse and execute virtual CMake code (`cmake_language(EVAL CODE ...)`).
     pub fn eval_code(&mut self, code: &[u8]) -> CmdResult {
         self.interp.eval_code(code)
+    }
+
+    /// Raw (unexpanded) arguments of the listfile command being executed. Empty for a
+    /// command run through [`Self::call_command`].
+    ///
+    /// Commands that delay expansion (`cmake_language(DEFER CALL)`) use this together
+    /// with [`Self::expand_raw_args`].
+    #[must_use]
+    pub fn raw_args(&self) -> &[Argument] {
+        self.interp
+            .cur_cmd
+            .as_ref()
+            .and_then(|(cmds, i)| cmds.get(*i))
+            .map_or(&[], |c| c.args.as_slice())
+    }
+
+    /// Expand raw arguments as command arguments are expanded. Reports expansion errors
+    /// and returns `Err(CmdError::Reported)` after an error.
+    pub fn expand_raw_args(&mut self, args: &[Argument]) -> Result<Vec<ExpandedArg>, CmdError> {
+        self.interp.expand(args)
+    }
+
+    // ----------------------------------------------------------------------------------
+    // Variable watches (`variable_watch()`).
+    // ----------------------------------------------------------------------------------
+
+    /// `variable_watch(<var> [<command>])`: add a watch. Every call adds a new watch,
+    /// also for the same variable and command.
+    ///
+    /// On each access to `var`, the watch calls `command` with the arguments
+    /// `<var> <access> <value> <CMAKE_CURRENT_LIST_FILE> <LISTFILE_STACK>` (see
+    /// [`WatchAccess`]). Without a command (`None` or empty), the watch prints
+    /// `Variable "<var>" was accessed using <access> with value "<value>".` as a log
+    /// message. A callback does not run again while it is running. `CMP0219` applies to
+    /// the callback arguments. The command checks `CMAKE_CURRENT_LIST_FILE` itself.
+    pub fn add_variable_watch(&mut self, var: &[u8], command: Option<&[u8]>) {
+        self.interp.add_watch(var, command.unwrap_or_default());
+    }
+
+    /// Remove the watches of `var` that call `command` (all watches of `var` when
+    /// `command` is `None`). Returns `true` if a watch was removed.
+    pub fn remove_variable_watch(&mut self, var: &[u8], command: Option<&[u8]>) -> bool {
+        self.interp.remove_watch(var, command)
+    }
+
+    /// Callback commands of the watches of `var` in registration order. An empty entry
+    /// is a watch without a command.
+    #[must_use]
+    pub fn variable_watches(&self, var: &[u8]) -> Vec<BString> {
+        self.interp.watch_commands(var)
+    }
+
+    // ----------------------------------------------------------------------------------
+    // Deferred calls (`cmake_language(DEFER)`).
+    // ----------------------------------------------------------------------------------
+
+    /// `true` while a directory listfile runs in configure mode, so that deferred calls
+    /// can be queued for the end of the directory.
+    #[must_use]
+    pub fn defer_active(&self) -> bool {
+        self.interp.defer.is_some()
+    }
+
+    /// A new unique deferred-call identifier (`__0`, `__1`, ...).
+    pub fn defer_new_id(&mut self) -> BString {
+        self.interp.new_defer_id()
+    }
+
+    /// Queue `command` with raw `args` (see [`Self::raw_args`]) for the end of the
+    /// current directory. The arguments are expanded when the call runs. The call keeps
+    /// the file and line of the current command, and runs with the policies that are
+    /// active at the end of the directory. Returns `false` when no queue is active
+    /// (`DEFER CALL may not be scheduled in directory ... at this time.`).
+    pub fn defer_call(&mut self, id: BString, command: &[u8], args: &[Argument]) -> bool {
+        self.interp.queue_deferred(id, command, args)
+    }
+
+    /// Identifiers of the queued calls that are not canceled, in queue order. `None`
+    /// when no queue is active.
+    #[must_use]
+    pub fn defer_get_call_ids(&self) -> Option<Vec<BString>> {
+        self.interp.deferred_ids()
+    }
+
+    /// `[command, args...]` of the queued call `id` (raw argument text), or an empty
+    /// list if `id` is unknown. `None` when no queue is active.
+    #[must_use]
+    pub fn defer_get_call(&self, id: &[u8]) -> Option<Vec<BString>> {
+        self.interp.deferred_call(id)
+    }
+
+    /// Cancel every queued call with identifier `id`. Returns `false` when no queue is
+    /// active.
+    pub fn defer_cancel_call(&mut self, id: &[u8]) -> bool {
+        self.interp.cancel_deferred(id)
     }
 }

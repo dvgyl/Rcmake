@@ -14,6 +14,11 @@ use crate::exec::{BodyMode, cat};
 use crate::util::{IntError, escape_for_cmake, stoi};
 use crate::{CmdError, CmdResult, Flow, Interp, UserCommand, UserCommandKind};
 
+/// Result of a block command. The outer `Err` means that the opener command failed and
+/// did not open a block, so the caller runs the body as ordinary commands. The inner
+/// result is the result of the block.
+pub(crate) type BlockResult = Result<CmdResult, CmdError>;
+
 /// Iteration plan computed by the `foreach()` command.
 enum ForeachPlan {
     /// No iterations (`foreach(x)` or empty lists).
@@ -78,6 +83,32 @@ impl Interp {
         self.cur_line = saved_line;
         self.bt = saved;
         r
+    }
+
+    /// Run the block opener `cmd` under a call frame and trace it.
+    fn run_opener(
+        &mut self,
+        code: &Code,
+        cmd: &CommandInvocation,
+        f: impl FnOnce(&mut Self) -> CmdResult,
+    ) -> CmdResult {
+        self.with_command_frame(&code.file, cmd.line, &cmd.name, |this| {
+            if this.trace.is_some() && !this.fatal {
+                this.trace_command(cmd, &code.file, false);
+            }
+            f(this)
+        })
+    }
+
+    /// Trace the command at `idx` that is evaluated without its own call frame (`else`,
+    /// `elseif`, and end commands).
+    fn trace_unframed(&mut self, code: &Code, idx: usize) {
+        if self.trace.is_none() {
+            return;
+        }
+        if let Some(cmd) = code.cmds.get(idx) {
+            self.trace_command(cmd, &code.file, true);
+        }
     }
 
     /// Run the commands in `start..end` as a block body.
@@ -175,19 +206,28 @@ impl Interp {
     // if / elseif / else / endif
     // ----------------------------------------------------------------------------------
 
-    pub(crate) fn exec_if(&mut self, code: &Code, i: usize) -> CmdResult {
+    pub(crate) fn exec_if(&mut self, code: &Code, i: usize) -> BlockResult {
         let cmds = Arc::clone(&code.cmds);
         let Some(cmd) = cmds.get(i) else {
-            return Ok(Flow::Normal);
+            return Ok(Ok(Flow::Normal));
         };
         let end = code.end_of(i);
         let mut truth = false;
-        self.with_command_frame(&code.file, cmd.line, &cmd.name, |this| {
+        if let Err(e) = self.run_opener(code, cmd, |this| {
             truth = this.eval_reporting(&cmd.args, b"if ")?;
             Ok(Flow::Normal)
-        })?;
+        }) {
+            // `cmIfCommand` adds its block before it reports a nested error.
+            return Ok(Err(e));
+        }
         self.check_block_end(code, i, &[]);
+        let result = self.run_if_branches(code, i, end, truth);
+        self.trace_unframed(code, end);
+        Ok(result)
+    }
 
+    fn run_if_branches(&mut self, code: &Code, i: usize, end: usize, truth: bool) -> CmdResult {
+        let cmds = Arc::clone(&code.cmds);
         let branches = code.if_branches(i);
         let first_stop = branches.first().copied().unwrap_or(end);
         if truth {
@@ -197,8 +237,10 @@ impl Interp {
             let stop = branches.get(n + 1).copied().unwrap_or(end);
             let Some(bc) = cmds.get(b) else { break };
             if bc.lower.as_slice() == b"else" {
+                self.trace_unframed(code, b);
                 return self.run_body(code, b + 1, stop);
             }
+            self.trace_unframed(code, b);
             let taken = self.with_plain_frame(&code.file, bc.line, &bc.name, |this| {
                 if bc.args.is_empty() {
                     this.issue_here(
@@ -222,22 +264,22 @@ impl Interp {
     // foreach / endforeach
     // ----------------------------------------------------------------------------------
 
-    pub(crate) fn exec_foreach(&mut self, code: &Code, i: usize) -> CmdResult {
+    pub(crate) fn exec_foreach(&mut self, code: &Code, i: usize) -> BlockResult {
         let cmds = Arc::clone(&code.cmds);
         let Some(cmd) = cmds.get(i) else {
-            return Ok(Flow::Normal);
+            return Ok(Ok(Flow::Normal));
         };
         let end = code.end_of(i);
         let mut plan = None;
         let mut opener = Vec::new();
-        self.with_command_frame(&code.file, cmd.line, &cmd.name, |this| {
+        self.run_opener(code, cmd, |this| {
             let args = this.expand(&cmd.args)?;
             plan = this.foreach_plan(&args)?;
             opener = args;
             Ok(Flow::Normal)
         })?;
         let Some(plan) = plan else {
-            return Ok(Flow::Normal);
+            return Err(CmdError::Reported);
         };
         self.check_block_end(code, i, &opener);
 
@@ -248,7 +290,8 @@ impl Interp {
         if let Some(top) = self.loop_blocks.last_mut() {
             *top = top.saturating_sub(1);
         }
-        result
+        self.trace_unframed(code, end);
+        Ok(result)
     }
 
     /// Parse `foreach()` arguments. `Ok(None)` means an error was already reported.
@@ -426,8 +469,8 @@ impl Interp {
 
     fn restore_loop_var(&mut self, name: &[u8], saved: Option<BString>) {
         match saved {
-            Some(v) => self.vars.set(name, v),
-            None => self.vars.unset(name),
+            Some(v) => self.define(name, v),
+            None => self.undefine(name),
         }
     }
 
@@ -471,7 +514,7 @@ impl Interp {
             ForeachPlan::Items { var, items } => {
                 let saved = self.loop_var_saved(&var);
                 for item in items {
-                    self.vars.set(&var, item);
+                    self.define(&var, item);
                     let pass = self.loop_pass(code, start, end);
                     restore = pass.restore;
                     flow = pass.flow;
@@ -492,7 +535,7 @@ impl Interp {
                 let saved = self.loop_var_saved(&var);
                 let mut value = first;
                 for _ in 0..count {
-                    self.vars.set(&var, value.to_string().into());
+                    self.define(&var, value.to_string().into());
                     value = value.saturating_add(step);
                     let pass = self.loop_pass(code, start, end);
                     restore = pass.restore;
@@ -512,8 +555,8 @@ impl Interp {
                 for n in 0..max {
                     for (var, list) in vars.iter().zip(&lists) {
                         match list.get(n) {
-                            Some(v) => self.vars.set(var, v.clone()),
-                            None => self.vars.unset(var),
+                            Some(v) => self.define(var, v.clone()),
+                            None => self.undefine(var),
                         }
                     }
                     let pass = self.loop_pass(code, start, end);
@@ -540,13 +583,13 @@ impl Interp {
     // while / endwhile
     // ----------------------------------------------------------------------------------
 
-    pub(crate) fn exec_while(&mut self, code: &Code, i: usize) -> CmdResult {
+    pub(crate) fn exec_while(&mut self, code: &Code, i: usize) -> BlockResult {
         let cmds = Arc::clone(&code.cmds);
         let Some(cmd) = cmds.get(i) else {
-            return Ok(Flow::Normal);
+            return Ok(Ok(Flow::Normal));
         };
         let end = code.end_of(i);
-        self.with_command_frame(&code.file, cmd.line, &cmd.name, |_| {
+        self.run_opener(code, cmd, |_| {
             if cmd.args.is_empty() {
                 Err(CmdError::Status(
                     "called with incorrect number of arguments".into(),
@@ -564,7 +607,8 @@ impl Interp {
         if let Some(top) = self.loop_blocks.last_mut() {
             *top = top.saturating_sub(1);
         }
-        result
+        self.trace_unframed(code, end);
+        Ok(result)
     }
 
     fn run_while(
@@ -642,14 +686,14 @@ impl Interp {
         code: &Code,
         i: usize,
         kind: UserCommandKind,
-    ) -> CmdResult {
+    ) -> BlockResult {
         let cmds = Arc::clone(&code.cmds);
         let Some(cmd) = cmds.get(i) else {
-            return Ok(Flow::Normal);
+            return Ok(Ok(Flow::Normal));
         };
         let end = code.end_of(i);
         let mut values: Vec<BString> = Vec::new();
-        self.with_command_frame(&code.file, cmd.line, &cmd.name, |this| {
+        self.run_opener(code, cmd, |this| {
             let args = this.expand(&cmd.args)?;
             if args.is_empty() {
                 return Err(CmdError::Status(
@@ -672,7 +716,7 @@ impl Interp {
 
         let mut values = values.into_iter();
         let Some(name) = values.next() else {
-            return Ok(Flow::Normal);
+            return Ok(Ok(Flow::Normal));
         };
         if kind == UserCommandKind::Macro
             && self.policy_status(PolicyId::new(217)) != PolicyStatus::New
@@ -691,10 +735,11 @@ impl Interp {
         let added = self.with_plain_frame(&code.file, cmd.line, &cmd.name, |this| {
             this.add_scripted_command(Arc::new(user))
         });
+        self.trace_unframed(code, end);
         if added {
-            Ok(Flow::Normal)
+            Ok(Ok(Flow::Normal))
         } else {
-            Err(CmdError::Reported)
+            Ok(Err(CmdError::Reported))
         }
     }
 
@@ -755,20 +800,20 @@ impl Interp {
         Ok(Some(plan))
     }
 
-    pub(crate) fn exec_block(&mut self, code: &Code, i: usize) -> CmdResult {
+    pub(crate) fn exec_block(&mut self, code: &Code, i: usize) -> BlockResult {
         let cmds = Arc::clone(&code.cmds);
         let Some(cmd) = cmds.get(i) else {
-            return Ok(Flow::Normal);
+            return Ok(Ok(Flow::Normal));
         };
         let end = code.end_of(i);
         let mut plan = None;
-        self.with_command_frame(&code.file, cmd.line, &cmd.name, |this| {
+        self.run_opener(code, cmd, |this| {
             let args = this.expand(&cmd.args)?;
             plan = this.block_plan(&args)?;
             Ok(Flow::Normal)
         })?;
         let Some(plan) = plan else {
-            return Ok(Flow::Normal);
+            return Err(CmdError::Reported);
         };
         self.check_block_end(code, i, &[]);
 
@@ -804,6 +849,7 @@ impl Interp {
             self.pop_snapshot(report);
             self.vars.pop();
         }
-        result
+        self.trace_unframed(code, end);
+        Ok(result)
     }
 }

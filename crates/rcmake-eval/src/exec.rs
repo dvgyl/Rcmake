@@ -17,11 +17,15 @@ use rcmake_regex::Captures;
 use rcmake_syntax::{ArgKind, Argument, CommandInvocation, ParseError};
 
 use crate::code::Code;
+use crate::hooks::{WatchAccess, display_line};
 use crate::util::{closest, collapse_full_path, filename_path};
 use crate::{
     CmdError, CmdResult, Command, Cx, FLOW_CONTROL, Flow, HARD_RECURSION_CEILING, IncludeOptions,
     Interp, LogLevel, RunMode, RunOutcome, Snapshot, UserCommand, UserCommandKind,
 };
+
+/// `CMP0198`: `CMAKE_PARENT_LIST_FILE` is not defined in `CMakeLists.txt`.
+pub(crate) const CMP0198: PolicyId = PolicyId::new(198);
 
 /// How a command sequence reacts to failed commands and control-flow transfers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -211,6 +215,8 @@ impl Interp {
         let abs = collapse_full_path(&rcmake_host::path::from_native(path), &cwd);
 
         self.vars.set(b"CMAKE_SCRIPT_MODE_FILE", abs.clone());
+        // The script-mode root snapshot has no listfile.
+        self.listfiles.push(Arc::from(&b""[..]));
         let argc = self.config.script_args.len();
         self.vars.set(b"CMAKE_ARGC", argc.to_string().into());
         for (i, arg) in self.config.script_args.clone().into_iter().enumerate() {
@@ -231,9 +237,24 @@ impl Interp {
     /// `cmMakefile::ReadListFile`: run a file without a policy scope. Returns `false`
     /// when the file can not be read or parsed.
     pub(crate) fn read_list_file(&mut self, abs: &[u8]) -> bool {
+        self.read_list_file_impl(abs, false)
+    }
+
+    /// Run a listfile. A directory listfile (`CMakeLists.txt` in configure mode) also
+    /// applies `CMP0198` and runs the deferred calls that it queues
+    /// (`cmMakefile::Configure` and `RunListFile`).
+    fn read_list_file_impl(&mut self, abs: &[u8], directory: bool) -> bool {
         let saved_bt = self.push_file_frame(abs);
         let vars = self.push_list_file_vars(abs);
+        if directory {
+            self.begin_directory_list_file();
+        }
         self.push_snapshot();
+        let saved_defer = if directory {
+            self.defer.replace(Vec::new())
+        } else {
+            None
+        };
         let read = match self.parse_file(abs) {
             Some(code) => {
                 let r = self.run_code(&code, 0, code.len(), BodyMode::File);
@@ -243,15 +264,53 @@ impl Interp {
                 {
                     self.raise_vars(names);
                 }
+                if directory {
+                    self.run_deferred(abs);
+                }
                 true
             }
             None => false,
         };
+        if directory {
+            self.defer = saved_defer;
+        }
         let report = !self.fatal;
         self.pop_list_file_vars(vars);
         self.pop_snapshot(report);
-        self.bt = saved_bt;
+        self.pop_file_frame(saved_bt);
         read
+    }
+
+    /// Start of a directory listfile: use `CMAKE_POLICY_DEFAULT_CMP0198` when the
+    /// policy is not set, then set `CMAKE_PARENT_LIST_FILE` for `CMP0198`.
+    fn begin_directory_list_file(&mut self) {
+        if self.policy_status(CMP0198) == PolicyStatus::Warn {
+            let default = self.read_var(b"CMAKE_POLICY_DEFAULT_CMP0198");
+            let status = match default.as_ref().map(|v| v.as_slice()) {
+                Some(b"NEW") => Some(PolicyStatus::New),
+                Some(b"OLD") => Some(PolicyStatus::Old),
+                _ => None,
+            };
+            if let Some(status) = status {
+                let _ = self.policies.try_update(|map| map.set(CMP0198, status));
+            }
+        }
+        self.update_parent_list_file_var();
+    }
+
+    /// `cmMakefile::UpdateParentListFileVariable` (configure mode only): with `CMP0198`
+    /// `NEW`, `CMAKE_PARENT_LIST_FILE` is undefined. Otherwise it names the
+    /// `CMakeLists.txt` of the current directory.
+    pub(crate) fn update_parent_list_file_var(&mut self) {
+        if self.config.mode != RunMode::Configure {
+            return;
+        }
+        if self.policy_status(CMP0198) == PolicyStatus::New {
+            self.undefine(b"CMAKE_PARENT_LIST_FILE");
+        } else {
+            let lists = cat(&[&self.current_source_dir_bytes(), b"/CMakeLists.txt"]);
+            self.define(b"CMAKE_PARENT_LIST_FILE", lists);
+        }
     }
 
     // ----------------------------------------------------------------------------------
@@ -311,7 +370,7 @@ impl Interp {
             };
         }
 
-        let _ = self.read_list_file(&lists_bytes);
+        let _ = self.read_list_file_impl(&lists_bytes, true);
         if self.exit_code() != 0 && self.exit_override.is_none() {
             self.config.host.write_out(
                 Stream::Stdout,
@@ -351,6 +410,7 @@ impl Interp {
         if name.is_empty() {
             return;
         }
+        let watched = self.watches.contains_key(name).then(|| value.clone());
         if !self.vars.set_parent(name, value) {
             self.issue_here(
                 MessageKind::AuthorWarning,
@@ -358,6 +418,14 @@ impl Interp {
                 Some(DiagCategory::Author),
                 cat(&[b"Cannot set \"", name, b"\": current scope has no parent."]),
                 true,
+            );
+            return;
+        }
+        if let Some(value) = watched {
+            self.fire_watches(
+                name,
+                WatchAccess::Modified,
+                value.as_ref().map(|v| v.as_slice()),
             );
         }
     }
@@ -370,12 +438,14 @@ impl Interp {
         }
     }
 
-    /// Push a file frame (`cmListFileContext::FromListFilePath`) and return the previous
-    /// backtrace.
+    /// Push a file frame (`cmListFileContext::FromListFilePath`) and a `LISTFILE_STACK`
+    /// entry. Returns the previous backtrace for [`Self::pop_file_frame`].
     pub(crate) fn push_file_frame(&mut self, abs: &[u8]) -> Backtrace {
         let saved = self.bt.clone();
+        let file: Arc<[u8]> = Arc::from(abs);
+        self.listfiles.push(Arc::clone(&file));
         self.bt = self.bt.push(Frame {
-            file: Arc::from(abs),
+            file,
             line: 0,
             name: None,
             kind: FrameKind::ModuleInclude,
@@ -383,16 +453,20 @@ impl Interp {
         saved
     }
 
+    /// Undo [`Self::push_file_frame`].
+    pub(crate) fn pop_file_frame(&mut self, saved: Backtrace) {
+        self.listfiles.pop();
+        self.bt = saved;
+    }
+
     pub(crate) fn push_list_file_vars(&mut self, new_current: &[u8]) -> ListFileVars {
-        let old_parent = self.lookup_var(b"CMAKE_PARENT_LIST_FILE").cloned();
-        let old_current = self.lookup_var(b"CMAKE_CURRENT_LIST_FILE").cloned();
+        let old_parent = self.read_var(b"CMAKE_PARENT_LIST_FILE");
+        let old_current = self.read_var(b"CMAKE_CURRENT_LIST_FILE");
         if let Some(c) = &old_current {
-            self.vars.set(b"CMAKE_PARENT_LIST_FILE", c.clone());
+            self.define(b"CMAKE_PARENT_LIST_FILE", c.clone());
         }
-        self.vars
-            .set(b"CMAKE_CURRENT_LIST_FILE", BString::from(new_current));
-        self.vars
-            .set(b"CMAKE_CURRENT_LIST_DIR", filename_path(new_current));
+        self.define(b"CMAKE_CURRENT_LIST_FILE", BString::from(new_current));
+        self.define(b"CMAKE_CURRENT_LIST_DIR", filename_path(new_current));
         ListFileVars {
             old_parent,
             old_current: old_current.unwrap_or_default(),
@@ -401,12 +475,12 @@ impl Interp {
 
     pub(crate) fn pop_list_file_vars(&mut self, saved: ListFileVars) {
         match saved.old_parent {
-            Some(p) => self.vars.set(b"CMAKE_PARENT_LIST_FILE", p),
-            None => self.vars.unset(b"CMAKE_PARENT_LIST_FILE"),
+            Some(p) => self.define(b"CMAKE_PARENT_LIST_FILE", p),
+            None => self.undefine(b"CMAKE_PARENT_LIST_FILE"),
         }
         let dir = filename_path(&saved.old_current);
-        self.vars.set(b"CMAKE_CURRENT_LIST_FILE", saved.old_current);
-        self.vars.set(b"CMAKE_CURRENT_LIST_DIR", dir);
+        self.define(b"CMAKE_CURRENT_LIST_FILE", saved.old_current);
+        self.define(b"CMAKE_CURRENT_LIST_DIR", dir);
     }
 
     /// `ClearMatches` followed by `StoreMatches` when `caps` is `Some`.
@@ -419,20 +493,20 @@ impl Interp {
                     .lookup_var(name.as_bytes())
                     .is_some_and(|v| !v.is_empty())
                 {
-                    self.vars.set(name.as_bytes(), BString::default());
+                    self.define(name.as_bytes(), BString::default());
                 }
             }
-            self.vars.set(b"CMAKE_MATCH_COUNT", "0".into());
+            self.define(b"CMAKE_MATCH_COUNT", "0".into());
         }
         let Some((caps, hay)) = caps else { return };
         let (values, highest) = caps.match_vars(hay);
         for (i, value) in values.into_iter().enumerate() {
             if !value.is_empty() {
-                self.vars.set(format!("CMAKE_MATCH_{i}").as_bytes(), value);
+                self.define(format!("CMAKE_MATCH_{i}").as_bytes(), value);
             }
         }
         let count = highest.map(|h| h.to_string()).unwrap_or_default();
-        self.vars.set(b"CMAKE_MATCH_COUNT", count.into());
+        self.define(b"CMAKE_MATCH_COUNT", count.into());
     }
 
     // ----------------------------------------------------------------------------------
@@ -688,7 +762,7 @@ impl Interp {
         }
         self.registry
             .get(lower)
-            .map(|(f, flags)| Command::Builtin(f, flags))
+            .map(|(f, flags)| Command::Builtin(f, flags, self.registry.takes_raw_args(lower)))
     }
 
     /// Sorted names of all known commands (`cmState::GetCommandNames`).
@@ -739,6 +813,19 @@ impl Interp {
         name: &[u8],
         f: impl FnOnce(&mut Self) -> CmdResult,
     ) -> CmdResult {
+        self.with_frame(file, line, name, None, f)
+    }
+
+    /// [`Self::with_command_frame`] with an optional deferred-call identifier
+    /// (`cmListFileContext::DeferId`).
+    fn with_frame(
+        &mut self,
+        file: &Arc<[u8]>,
+        line: u32,
+        name: &[u8],
+        defer_id: Option<BString>,
+        f: impl FnOnce(&mut Self) -> CmdResult,
+    ) -> CmdResult {
         let saved_bt = self.bt.clone();
         self.bt = self.bt.push(Frame {
             file: Arc::clone(file),
@@ -746,6 +833,7 @@ impl Interp {
             name: Some(Arc::from(name)),
             kind: FrameKind::Command,
         });
+        let saved_defer = core::mem::replace(&mut self.top_defer_id, defer_id);
         self.depth = self.depth.saturating_add(1);
         let saved_line = core::mem::replace(&mut self.cur_line, line);
         let saved_failed = core::mem::replace(&mut self.cmd_failed, false);
@@ -762,6 +850,7 @@ impl Interp {
         self.cmd_failed = saved_failed;
         self.cur_line = saved_line;
         self.depth = self.depth.saturating_sub(1);
+        self.top_defer_id = saved_defer;
         self.bt = saved_bt;
         result
     }
@@ -786,36 +875,93 @@ impl Interp {
         Err(CmdError::Reported)
     }
 
-    /// Expand arguments with `rcmake_expr::expand_args`. Reports expansion errors.
+    /// Expand arguments with `rcmake_expr::expand_args`, one argument at a time
+    /// (`cmMakefile::ExpandArguments`). An expansion error is fatal and reads
+    /// `Syntax error in cmake code at <file>:<line> when parsing string <arg> <error>`.
     pub(crate) fn expand(&mut self, args: &[Argument]) -> Result<Vec<ExpandedArg>, CmdError> {
         let mut out = Vec::new();
         let expand = self.frontend.expand;
-        match expand(args, self, &mut out) {
-            Ok(()) => Ok(out),
-            Err(e) => {
-                self.error_here(e.message);
-                Err(CmdError::Reported)
+        let mut failed = false;
+        for arg in args {
+            if let Err(e) = expand(core::slice::from_ref(arg), self, &mut out) {
+                let body = self.syntax_error_text(arg, e.message);
+                self.fatal_here(body);
+                failed = true;
             }
+        }
+        if failed {
+            Err(CmdError::Reported)
+        } else {
+            Ok(out)
         }
     }
 
-    /// Execute one ordinary command invocation from `code`.
-    pub(crate) fn exec_command(&mut self, code: &Code, cmd: &CommandInvocation) -> CmdResult {
-        self.with_command_frame(&code.file, cmd.line, &cmd.name, |this| this.dispatch(cmd))
+    /// `ExpandVariablesInStringImpl` error text for an argument of the command on top of
+    /// the backtrace.
+    fn syntax_error_text(&self, arg: &Argument, message: BString) -> BString {
+        const PREFIX: &[u8] = b"Syntax error in cmake code ";
+        if message.starts_with(PREFIX) {
+            return message;
+        }
+        let mut out = PREFIX.to_vec();
+        if let Some(top) = self.bt.top() {
+            out.extend_from_slice(b"at\n  ");
+            out.extend_from_slice(&top.file);
+            out.push(b':');
+            out.extend_from_slice(display_line(arg.line).as_bytes());
+            out.push(b'\n');
+        }
+        out.extend_from_slice(b"when parsing string\n  ");
+        out.extend_from_slice(&arg.text);
+        out.push(b'\n');
+        out.extend_from_slice(&message);
+        BString::from(out)
     }
 
-    fn dispatch(&mut self, cmd: &CommandInvocation) -> CmdResult {
+    /// Execute the ordinary command at index `i` of `code`.
+    pub(crate) fn exec_command(&mut self, code: &Code, i: usize) -> CmdResult {
+        let Some(cmd) = code.cmds.get(i) else {
+            return Ok(Flow::Normal);
+        };
+        let saved = self.cur_cmd.replace((Arc::clone(&code.cmds), i));
+        let result = self.with_command_frame(&code.file, cmd.line, &cmd.name, |this| {
+            this.dispatch(cmd, &code.file)
+        });
+        self.cur_cmd = saved;
+        result
+    }
+
+    /// Execute the deferred call in `code` (one command) with identifier `id`.
+    pub(crate) fn exec_deferred(&mut self, code: &Code, id: BString) {
+        let Some(cmd) = code.cmds.first() else {
+            return;
+        };
+        let saved = self.cur_cmd.replace((Arc::clone(&code.cmds), 0));
+        let _ = self.with_frame(&code.file, cmd.line, &cmd.name, Some(id), |this| {
+            this.dispatch(cmd, &code.file)
+        });
+        self.cur_cmd = saved;
+    }
+
+    fn dispatch(&mut self, cmd: &CommandInvocation, file: &[u8]) -> CmdResult {
         if self.fatal {
             return Ok(Flow::Normal);
         }
         let lower = cmd.lower.as_slice();
+        let command = self.lookup_command(lower);
+        if self.trace.is_some() && (command.is_some() || unexpected_text(lower).is_some()) {
+            self.trace_command(cmd, file, false);
+        }
         if let Some(text) = unexpected_text(lower) {
             return Err(CmdError::Status(text.into()));
         }
-        let Some(command) = self.lookup_command(lower) else {
+        let Some(command) = command else {
             self.unknown_command(&cmd.name);
             return Err(CmdError::Reported);
         };
+        if matches!(command, Command::Builtin(_, _, true)) {
+            return self.invoke(command, &[]);
+        }
         let args = self.expand(&cmd.args)?;
         self.invoke(command, &args)
     }
@@ -833,7 +979,7 @@ impl Interp {
 
     fn invoke(&mut self, command: Command, args: &[ExpandedArg]) -> CmdResult {
         match command {
-            Command::Builtin(f, flags) => {
+            Command::Builtin(f, flags, _) => {
                 if self.config.mode == RunMode::Script && !flags.scriptable {
                     return Err(CmdError::Status("command is not scriptable".into()));
                 }
@@ -867,7 +1013,33 @@ impl Interp {
             .top()
             .map_or_else(|| Arc::from(&b""[..]), |f| Arc::clone(&f.file));
         let line = self.cur_line;
-        self.with_command_frame(&file, line, name, |this| this.invoke(command, &args))
+        // A command that expands its own arguments reads them from `cur_cmd`. The
+        // arguments are expanded already, so pass them as bracket arguments.
+        let raw = matches!(command, Command::Builtin(_, _, true)).then(|| {
+            let args = args
+                .iter()
+                .map(|a| Argument {
+                    kind: ArgKind::Bracket,
+                    text: a.value.clone(),
+                    line,
+                    span: 0..0,
+                })
+                .collect();
+            let cmd = CommandInvocation {
+                name: BString::from(name),
+                lower: lower.clone(),
+                line,
+                close_line: line,
+                span: 0..0,
+                args,
+            };
+            (Arc::from(vec![cmd]), 0)
+        });
+        let args = if raw.is_some() { Vec::new() } else { args };
+        let saved = core::mem::replace(&mut self.cur_cmd, raw);
+        let result = self.with_command_frame(&file, line, name, |this| this.invoke(command, &args));
+        self.cur_cmd = saved;
+        result
     }
 
     /// Run commands `start..end` of `code`.
@@ -932,9 +1104,14 @@ impl Interp {
             b"function" => self.exec_define(code, i, UserCommandKind::Function),
             b"macro" => self.exec_define(code, i, UserCommandKind::Macro),
             b"block" => self.exec_block(code, i),
-            _ => return (self.exec_command(code, cmd), i + 1),
+            _ => return (self.exec_command(code, i), i + 1),
         };
-        (result, after)
+        match result {
+            Ok(result) => (result, after),
+            // The opener failed and did not open a block: run its body as ordinary
+            // commands, so that the end command reports its own error.
+            Err(e) => (Err(e), i + 1),
+        }
     }
 
     // ----------------------------------------------------------------------------------
@@ -1013,8 +1190,22 @@ impl Interp {
         }
     }
 
+    /// Report a listfile parse error.
+    ///
+    /// - A file-level error (no column and no command: a non-UTF-8 Byte-Order-Mark or an
+    ///   input over the size limit) is located `in <file>:` and does not stop processing
+    ///   (`IssueFileOpenError`).
+    /// - Other syntax and nesting errors are located at their line. They stop processing
+    ///   (`IssueError`, `SetFatalErrorOccurred`), except a missing `)` at the end of
+    ///   the file and an argument that is not separated by whitespace.
     fn report_parse_error(&mut self, file: &Arc<[u8]>, err: &ParseError) {
-        let bt = if err.line == 0 {
+        const NOT_FATAL: [&[u8]; 2] = [
+            b"Parse error.  Function missing ending \")\".  End of file reached.",
+            b"Syntax Error in cmake code at column ",
+        ];
+        let file_level = err.line == 0 || (err.column == 0 && err.command.is_none());
+        let fatal = !file_level && !NOT_FATAL.iter().any(|m| err.message.starts_with(m));
+        let bt = if file_level {
             self.bt.clone()
         } else {
             self.bt.push(Frame {
@@ -1024,9 +1215,14 @@ impl Interp {
                 kind: FrameKind::Command,
             })
         };
+        let effect = if fatal {
+            Effect::Fatal
+        } else {
+            Effect::SetError
+        };
         self.issue_at(
             MessageKind::Error,
-            Effect::SetError,
+            effect,
             None,
             None,
             Location::Backtrace(bt),
@@ -1070,7 +1266,7 @@ impl Interp {
             self.policies.pop_above(base.policy_base);
         }
         self.pop_snapshot(report);
-        self.bt = saved_bt;
+        self.pop_file_frame(saved_bt);
         read
     }
 
@@ -1139,7 +1335,7 @@ impl Interp {
         let report = !self.fatal;
         self.pop_list_file_vars(vars);
         self.pop_snapshot(report);
-        self.bt = saved_bt;
+        self.pop_file_frame(saved_bt);
         result
     }
 
@@ -1152,6 +1348,7 @@ impl Interp {
         if function {
             self.vars.push();
             self.loop_blocks.push(0);
+            self.listfiles.push(Arc::clone(&u.body.file));
         }
         self.policies.push_weak(u.policies);
         self.diags.push_weak(u.diags);
@@ -1165,6 +1362,7 @@ impl Interp {
         if function {
             self.vars.pop();
             self.loop_blocks.pop();
+            self.listfiles.pop();
         }
     }
 
@@ -1178,24 +1376,22 @@ impl Interp {
         }
         self.push_call_scope(u, true);
 
-        self.vars.set(b"ARGC", values.len().to_string().into());
+        self.define(b"ARGC", values.len().to_string().into());
         for (i, v) in values.iter().enumerate() {
-            self.vars.set(format!("ARGV{i}").as_bytes(), v.clone());
+            self.define(format!("ARGV{i}").as_bytes(), v.clone());
         }
         for (param, v) in u.params.iter().zip(values.iter()) {
-            self.vars.set(param, v.clone());
+            self.define(param, v.clone());
         }
         let argn = values.get(u.params.len()..).unwrap_or_default();
-        self.vars
-            .set(b"ARGV", rcmake_base::list::join(values.iter()));
-        self.vars.set(b"ARGN", rcmake_base::list::join(argn.iter()));
-        self.vars.set(b"ARGNC", argn.len().to_string().into());
-        self.vars.set(b"CMAKE_CURRENT_FUNCTION", u.name.clone());
+        self.define(b"ARGV", rcmake_base::list::join(values.iter()));
+        self.define(b"ARGN", rcmake_base::list::join(argn.iter()));
+        self.define(b"ARGNC", argn.len().to_string().into());
+        self.define(b"CMAKE_CURRENT_FUNCTION", u.name.clone());
         let file = BString::from(&u.body.file[..]);
-        self.vars
-            .set(b"CMAKE_CURRENT_FUNCTION_LIST_DIR", filename_path(&file));
-        self.vars.set(b"CMAKE_CURRENT_FUNCTION_LIST_FILE", file);
-        self.vars.set(
+        self.define(b"CMAKE_CURRENT_FUNCTION_LIST_DIR", filename_path(&file));
+        self.define(b"CMAKE_CURRENT_FUNCTION_LIST_FILE", file);
+        self.define(
             b"CMAKE_CURRENT_FUNCTION_LIST_LINE",
             u.line.to_string().into(),
         );
@@ -1213,7 +1409,7 @@ impl Interp {
     }
 
     /// `cmMakefile::CheckCMP0219`.
-    fn check_cmp0219(&mut self, callee: &BString, values: &[BString]) -> PolicyStatus {
+    pub(crate) fn check_cmp0219(&mut self, callee: &BString, values: &[BString]) -> PolicyStatus {
         let status = self.policy_status(PolicyId::new(219));
         let has_backslash = values.iter().any(|v| v.contains(&b'\\'));
         if status == PolicyStatus::Warn
@@ -1229,7 +1425,7 @@ impl Interp {
         }
     }
 
-    fn issue_cmp0219_warning(&mut self, callee: &[u8], values: &[BString]) {
+    pub(crate) fn issue_cmp0219_warning(&mut self, callee: &[u8], values: &[BString]) {
         let mut old_args = Vec::new();
         for v in values.iter().filter(|v| v.contains(&b'\\')) {
             if !old_args.is_empty() {

@@ -11,10 +11,23 @@ use rcmake_host::Host;
 use rcmake_regex::{Captures, Regex, RegexError};
 
 use crate::Interp;
+use crate::hooks::WatchAccess;
 
 impl ExpandEnv for Interp {
     fn var(&mut self, name: &[u8]) -> Option<BString> {
-        self.lookup_var(name).cloned()
+        if name == b"CMAKE_CURRENT_LIST_LINE" {
+            // `--trace-expand` expands without a file context, so the variable is not
+            // special there.
+            if self.trace_expanding {
+                return Some(self.read_var(name).unwrap_or_default());
+            }
+            if let Some(id) = &self.top_defer_id {
+                let mut line = b"DEFERRED:".to_vec();
+                line.extend_from_slice(id);
+                return Some(BString::from(line));
+            }
+        }
+        self.read_var(name)
     }
 
     fn cache_var(&mut self, name: &[u8]) -> Option<BString> {
@@ -32,7 +45,11 @@ impl ExpandEnv for Interp {
 
 impl CondEnv for Interp {
     fn is_defined(&mut self, name: &[u8]) -> bool {
-        self.vars.get(name).is_some() || self.cache.contains(name)
+        let defined = self.vars.get(name).is_some() || self.cache.contains(name);
+        if !defined {
+            self.fire_watches(name, WatchAccess::UnknownDefined, None);
+        }
+        defined
     }
 
     fn cache_defined(&mut self, name: &[u8]) -> bool {

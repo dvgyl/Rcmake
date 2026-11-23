@@ -78,9 +78,9 @@ fn expand_until(
                 *pos += skip;
                 let name = expand_until(src, pos, env, true)?;
                 let value = match kind {
-                    0 if name == b"CMAKE_CURRENT_LIST_LINE" => {
-                        Some(BString::from(env.current_line().to_string()))
-                    }
+                    0 if name == b"CMAKE_CURRENT_LIST_LINE" => env
+                        .var(&name)
+                        .or_else(|| Some(BString::from(env.current_line().to_string()))),
                     0 => env.var(&name),
                     1 => env.env_var(&name),
                     _ => env.cache_var(&name),
@@ -331,8 +331,52 @@ fn t_include_file(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
     )
 }
 
+fn t_variable_watch(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
+    let var = args.first().map(|a| a.value.clone()).unwrap_or_default();
+    cx.add_variable_watch(&var, args.get(1).map(|a| a.value.as_slice()));
+    Ok(Flow::Normal)
+}
+
+/// `test_defer(<id> <command> <args>...)`: queue `<command>` with raw arguments.
+fn t_defer(cx: &mut Cx<'_>, _: &[ExpandedArg]) -> CmdResult {
+    let raw = cx.raw_args().to_vec();
+    let head = cx.expand_raw_args(raw.get(..2).unwrap_or_default())?;
+    let (Some(id), Some(command)) = (head.first(), head.get(1)) else {
+        return Err(CmdError::Status("bad args".into()));
+    };
+    let rest = raw.get(2..).unwrap_or_default();
+    if cx.defer_call(id.value.clone(), &command.value, rest) {
+        Ok(Flow::Normal)
+    } else {
+        Err(CmdError::Status("no defer queue".into()))
+    }
+}
+
+/// `test_defer_query(<var> [CANCEL <id>] [GET <id>])`: store the queued call identifiers
+/// (or the call `<id>`) in `<var>`.
+fn t_defer_query(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
+    let v = vals(args);
+    let var = v.first().cloned().unwrap_or_default();
+    let value = match v.get(1).map(|s| s.as_slice()) {
+        Some(b"CANCEL") => {
+            cx.defer_cancel_call(v.get(2).map_or(&b""[..], |s| s.as_slice()));
+            cx.defer_get_call_ids()
+        }
+        Some(b"GET") => cx.defer_get_call(v.get(2).map_or(&b""[..], |s| s.as_slice())),
+        _ => cx.defer_get_call_ids(),
+    };
+    match value {
+        Some(items) => cx.set_var(&var, rcmake_base::list::join(items.iter())),
+        None => cx.set_var(&var, "inactive".into()),
+    }
+    Ok(Flow::Normal)
+}
+
 fn register_test(reg: &mut Registry) {
     let s = CmdFlags { scriptable: true };
+    reg.add("variable_watch", t_variable_watch, s);
+    reg.add_raw("test_defer", t_defer, s);
+    reg.add("test_defer_query", t_defer_query, s);
     reg.add("set", t_set, s);
     reg.add("unset", t_unset, s);
     reg.add("cmake_policy", t_policy, s);
@@ -399,6 +443,23 @@ fn run_files(main: &str, files: &[(&str, &str)]) -> Out {
 
 fn run(main: &str) -> Out {
     run_files(main, &[])
+}
+
+/// Configure `/work/src` (its `CMakeLists.txt` is `lists`) into `/work/build`.
+fn run_configure(lists: &str, files: &[(&str, &str)]) -> Out {
+    let mut all = vec![("/work/src/CMakeLists.txt", lists)];
+    all.extend_from_slice(files);
+    let (mut interp, host) = new_interp(&all, RunMode::Configure);
+    let outcome = interp.run_configure(
+        &PathBuf::from("/work/src"),
+        &PathBuf::from("/work/build"),
+        &[],
+    );
+    Out {
+        exit: outcome.exit_code,
+        stdout: String::from_utf8_lossy(&host.stream_bytes(Stream::Stdout)).into_owned(),
+        stderr: String::from_utf8_lossy(&host.stream_bytes(Stream::Stderr)).into_owned(),
+    }
 }
 
 /// Run on a thread with a large stack (deep recursion tests).
@@ -1289,9 +1350,6 @@ fn include_parse_error_shows_call_stack() {
             "  Flow control statements are not properly nested.\n",
             "Call Stack (most recent call first):\n",
             "  main.cmake:1 (include)\n\n\n",
-            "CMake Error at main.cmake:1 (include):\n",
-            "  include could not load requested file:\n\n",
-            "    bad.cmake\n\n\n",
         )
     );
 }
@@ -1652,4 +1710,403 @@ fn oracle_recorded_scripts_match_with_real_frontend() {
         assert_eq!(host.stream_bytes(Stream::Stderr), *stderr, "{name}: stderr");
         assert_eq!(code, *exit, "{name}: exit code");
     }
+}
+
+// ---------------------------------------------------------------------------------------
+// Opener failures, parse errors, and expansion errors.
+// ---------------------------------------------------------------------------------------
+
+#[test]
+fn failed_while_runs_body_and_reports_endwhile() {
+    let o = run_configure("while()\nmessage(inside)\nendwhile()\n", &[]);
+    assert_eq!(o.exit, 1);
+    assert_eq!(
+        o.stderr,
+        concat!(
+            "CMake Error at CMakeLists.txt:1 (while):\n",
+            "  while called with incorrect number of arguments\n\n\n",
+            "inside\n",
+            "CMake Error at CMakeLists.txt:3 (endwhile):\n",
+            "  endwhile An ENDWHILE command was found outside of a proper WHILE ENDWHILE\n",
+            "  structure.  Or its arguments did not match the opening WHILE command.\n\n\n",
+        )
+    );
+}
+
+#[test]
+fn failed_function_definition_runs_body_inline() {
+    let o = run_configure("function()\nmessage(body)\nendfunction()\n", &[]);
+    assert_eq!(o.exit, 1);
+    assert!(
+        o.stderr
+            .contains("function called with incorrect number of arguments")
+    );
+    assert!(o.stderr.contains("\nbody\n"), "{}", o.stderr);
+    assert!(
+        o.stderr
+            .contains("An ENDFUNCTION command was found outside")
+    );
+}
+
+#[test]
+fn nesting_error_stops_processing_without_include_error() {
+    let o = run_configure(
+        "include(bad.cmake)\nmessage(after)\n",
+        &[("/work/src/bad.cmake", "while(a)\n")],
+    );
+    assert_eq!(o.exit, 1);
+    assert_eq!(
+        o.stderr,
+        concat!(
+            "CMake Error at bad.cmake:1 (while):\n",
+            "  Flow control statements are not properly nested.\n",
+            "Call Stack (most recent call first):\n",
+            "  CMakeLists.txt:1 (include)\n\n\n",
+        )
+    );
+}
+
+#[test]
+fn missing_close_paren_at_end_of_file_is_not_fatal() {
+    let o = run_configure(
+        "include(bad.cmake)\nmessage(after)\n",
+        &[("/work/src/bad.cmake", "message(a\n")],
+    );
+    assert_eq!(o.exit, 1);
+    assert!(
+        o.stderr
+            .contains("Function missing ending \")\".  End of file reached.")
+    );
+    assert!(o.stderr.contains("include could not load requested file:"));
+    assert!(o.stderr.ends_with("after\n"), "{}", o.stderr);
+}
+
+#[test]
+fn non_utf8_bom_is_a_file_level_error() {
+    let (mut interp, host) = new_interp(
+        &[(
+            "/work/src/CMakeLists.txt",
+            "include(bom.cmake)\nmessage(after)\n",
+        )],
+        RunMode::Configure,
+    );
+    host.seed_file(&PathBuf::from("/work/src/bom.cmake"), b"\xff\xfem\x00")
+        .expect("seed file");
+    let code = interp
+        .run_configure(
+            &PathBuf::from("/work/src"),
+            &PathBuf::from("/work/build"),
+            &[],
+        )
+        .exit_code;
+    let stderr = String::from_utf8_lossy(&host.stream_bytes(Stream::Stderr)).into_owned();
+    assert_eq!(code, 1);
+    assert_eq!(
+        stderr,
+        concat!(
+            "CMake Error in bom.cmake:\n",
+            "  File starts with a Byte-Order-Mark that is not UTF-8.\n",
+            "Call Stack (most recent call first):\n",
+            "  CMakeLists.txt:1 (include)\n\n\n",
+            "CMake Error at CMakeLists.txt:1 (include):\n",
+            "  include could not load requested file:\n\n",
+            "    bom.cmake\n\n\n",
+            "after\n",
+        )
+    );
+}
+
+#[test]
+fn expansion_error_is_fatal_and_names_the_argument() {
+    let o = run("message(ok \"a\\q\" b)\nmessage(after)\n");
+    assert_eq!(o.exit, 1);
+    assert_eq!(
+        o.stderr,
+        concat!(
+            "CMake Error at main.cmake:1 (message):\n",
+            "  Syntax error in cmake code at\n\n",
+            "    /work/main.cmake:1\n\n",
+            "  when parsing string\n\n",
+            "    a\\q\n\n",
+            "  Invalid character escape '\\q'.\n\n\n",
+        )
+    );
+}
+
+// ---------------------------------------------------------------------------------------
+// CMP0198: CMAKE_PARENT_LIST_FILE in CMakeLists.txt.
+// ---------------------------------------------------------------------------------------
+
+#[test]
+fn cmp0198_controls_parent_list_file_in_directory_listfile() {
+    let o = run_configure(
+        concat!(
+            "message(\"[${CMAKE_PARENT_LIST_FILE}]\")\n",
+            "include(inc.cmake)\n",
+            "message(\"[${CMAKE_PARENT_LIST_FILE}]\")\n",
+            "cmake_policy(SET CMP0198 NEW)\n",
+            "message(\"[${CMAKE_PARENT_LIST_FILE}]\")\n",
+            "include(inc.cmake)\n",
+            "message(\"[${CMAKE_PARENT_LIST_FILE}]\")\n",
+        ),
+        &[(
+            "/work/src/inc.cmake",
+            "message(\"inc [${CMAKE_PARENT_LIST_FILE}]\")\n",
+        )],
+    );
+    assert_eq!(o.exit, 0, "{}", o.stderr);
+    assert_eq!(
+        o.stderr,
+        concat!(
+            "[/work/src/CMakeLists.txt]\n",
+            "inc [/work/src/CMakeLists.txt]\n",
+            "[/work/src/CMakeLists.txt]\n",
+            "[]\n",
+            "inc [/work/src/CMakeLists.txt]\n",
+            "[]\n",
+        )
+    );
+}
+
+#[test]
+fn cmp0198_does_not_apply_in_script_mode() {
+    let o = run("message(\"[${CMAKE_PARENT_LIST_FILE}]\")\n");
+    assert_eq!(o.stderr, "[]\n");
+}
+
+// ---------------------------------------------------------------------------------------
+// Variable watches.
+// ---------------------------------------------------------------------------------------
+
+#[test]
+fn variable_watch_reports_each_access_kind() {
+    let o = run(concat!(
+        "function(cb var access value file stack)\n",
+        "  message(\"${var} ${access} [${value}]\")\n",
+        "endfunction()\n",
+        "variable_watch(v cb)\n",
+        "set(v 1)\n",
+        "set(x \"${v}\")\n",
+        "unset(v)\n",
+        "set(y \"${v}\")\n",
+        "function(f)\n",
+        "  set(v 2 PARENT_SCOPE)\n",
+        "endfunction()\n",
+        "f()\n",
+    ));
+    assert_eq!(o.exit, 0, "{}", o.stderr);
+    assert_eq!(
+        o.stderr,
+        concat!(
+            "v MODIFIED_ACCESS [1]\n",
+            "v READ_ACCESS [1]\n",
+            "v REMOVED_ACCESS []\n",
+            "v UNKNOWN_READ_ACCESS []\n",
+            "v MODIFIED_ACCESS [2]\n",
+        )
+    );
+}
+
+#[test]
+fn variable_watch_passes_list_file_and_stack() {
+    let o = run(concat!(
+        "function(cb var access value file stack)\n",
+        "  message(\"${file}|${stack}\")\n",
+        "endfunction()\n",
+        "variable_watch(v cb)\n",
+        "set(v 1)\n",
+    ));
+    assert_eq!(o.stderr, "/work/main.cmake|;/work/main.cmake\n");
+}
+
+#[test]
+fn variable_watch_without_command_logs_the_access() {
+    let o = run("variable_watch(w)\nset(w 2)\n");
+    assert!(
+        o.stderr
+            .contains("  Variable \"w\" was accessed using MODIFIED_ACCESS with value \"2\".\n"),
+        "{}",
+        o.stderr
+    );
+    assert!(o.stderr.contains("main.cmake:2 (set):"), "{}", o.stderr);
+}
+
+#[test]
+fn variable_watch_callback_does_not_recurse() {
+    let o = run(concat!(
+        "function(cb var access value)\n",
+        "  message(cb)\n",
+        "  set(v x PARENT_SCOPE)\n",
+        "endfunction()\n",
+        "variable_watch(v cb)\n",
+        "set(v 0)\n",
+        "message(\"[${v}]\")\n",
+    ));
+    assert_eq!(o.exit, 0, "{}", o.stderr);
+    assert_eq!(o.stderr, "cb\ncb\n[x]\n");
+}
+
+#[test]
+fn variable_watch_runs_every_watch_once_per_access() {
+    let o = run(concat!(
+        "function(w1)\n  message(w1)\n  variable_watch(v w2)\nendfunction()\n",
+        "function(w2)\n  message(w2)\nendfunction()\n",
+        "variable_watch(v w1)\n",
+        "variable_watch(v w2)\n",
+        "set(x \"${v}\")\n",
+    ));
+    assert_eq!(o.stderr, "w1\nw2\n");
+}
+
+#[test]
+fn variable_watch_callback_failure_is_reported() {
+    let o = run("variable_watch(v nope)\nset(v 1)\n");
+    assert!(
+        o.stderr.contains("Unknown CMake command \"nope\"."),
+        "{}",
+        o.stderr
+    );
+}
+
+// ---------------------------------------------------------------------------------------
+// Deferred calls.
+// ---------------------------------------------------------------------------------------
+
+#[test]
+fn deferred_calls_run_at_directory_end_with_late_expansion() {
+    let o = run_configure(
+        concat!(
+            "test_defer(a message \"${x} ${CMAKE_CURRENT_LIST_LINE}\")\n",
+            "test_defer(b message never)\n",
+            "test_defer(c test_defer d message nested)\n",
+            "test_defer_query(ids)\n",
+            "test_defer_query(call GET a)\n",
+            "test_defer_query(left CANCEL b)\n",
+            "message(\"${ids}|${call}|${left}\")\n",
+            "set(x late)\n",
+        ),
+        &[],
+    );
+    assert_eq!(o.exit, 0, "{}", o.stderr);
+    assert_eq!(
+        o.stderr,
+        concat!(
+            "a;b;c|message;${x} ${CMAKE_CURRENT_LIST_LINE}|a;c\n",
+            "late DEFERRED:a\n",
+            "nested\n",
+        )
+    );
+}
+
+#[test]
+fn deferred_call_queue_is_inactive_in_script_mode() {
+    let o = run("test_defer_query(ids)\nmessage(\"${ids}\")\n");
+    assert_eq!(o.stderr, "inactive\n");
+}
+
+#[test]
+fn deferred_call_error_shows_deferred_frame() {
+    let o = run_configure("test_defer(a nope)\n", &[]);
+    assert_eq!(o.exit, 1);
+    assert!(
+        o.stderr
+            .starts_with("CMake Error at CMakeLists.txt:1 (nope):\n"),
+        "{}",
+        o.stderr
+    );
+}
+
+// ---------------------------------------------------------------------------------------
+// Tracing.
+// ---------------------------------------------------------------------------------------
+
+fn run_traced(main: &str, config: crate::TraceConfig) -> Out {
+    let (mut interp, host) = new_interp(&[("/work/main.cmake", main)], RunMode::Script);
+    interp.set_trace_config(Some(config));
+    let outcome = interp.run_script(&PathBuf::from("main.cmake"));
+    Out {
+        exit: outcome.exit_code,
+        stdout: String::from_utf8_lossy(&host.stream_bytes(Stream::Stdout)).into_owned(),
+        stderr: String::from_utf8_lossy(&host.stream_bytes(Stream::Stderr)).into_owned(),
+    }
+}
+
+#[test]
+fn trace_human_lists_commands_and_end_commands_after_bodies() {
+    let o = run_traced(
+        "set(a 1)\nif(a)\n  set(b \"${a}\")\nelse()\nendif()\nforeach(i 1 2)\nendforeach()\n",
+        crate::TraceConfig::default(),
+    );
+    assert_eq!(
+        o.stderr,
+        concat!(
+            "/work/main.cmake(1):  set(a 1 )\n",
+            "/work/main.cmake(2):  if(a )\n",
+            "/work/main.cmake(3):  set(b ${a} )\n",
+            "/work/main.cmake(5):  endif()\n",
+            "/work/main.cmake(6):  foreach(i 1 2 )\n",
+            "/work/main.cmake(7):  endforeach()\n",
+        )
+    );
+}
+
+#[test]
+fn trace_expand_and_json_v1() {
+    let o = run_traced(
+        "set(a \"x\\\"y\")\nmessage(\"${a}\")\n",
+        crate::TraceConfig {
+            format: crate::TraceFormat::JsonV1,
+            expand: true,
+            ..crate::TraceConfig::default()
+        },
+    );
+    let lines: Vec<&str> = o.stderr.lines().collect();
+    assert_eq!(
+        lines.first().copied(),
+        Some("{\"version\":{\"major\":1,\"minor\":2}}")
+    );
+    let msg = lines.get(2).copied().unwrap_or_default();
+    assert!(
+        msg.starts_with(
+            "{\"args\":[\"x\\\"y\"],\"cmd\":\"message\",\"file\":\"/work/main.cmake\",\"frame\":1,\"global_frame\":1,\"line\":2,\"time\":"
+        ),
+        "{msg}"
+    );
+}
+
+#[test]
+fn trace_source_filters_files() {
+    let o = run_traced(
+        "set(a 1)\n",
+        crate::TraceConfig {
+            sources: vec!["other.cmake".into()],
+            ..crate::TraceConfig::default()
+        },
+    );
+    assert_eq!(o.stderr, "");
+}
+
+#[test]
+fn variable_watch_stack_lists_files_and_function_scopes() {
+    let o = run_configure(
+        concat!(
+            "function(cb var access value file stack)\n",
+            "  message(\"${stack}\")\n",
+            "endfunction()\n",
+            "variable_watch(z cb)\n",
+            "set(z 1)\n",
+            "include(inc.cmake)\n",
+            "function(g)\n  set(z 3)\nendfunction()\n",
+            "g()\n",
+        ),
+        &[("/work/src/inc.cmake", "set(z 2)\n")],
+    );
+    assert_eq!(
+        o.stderr,
+        concat!(
+            "/work/src/CMakeLists.txt\n",
+            "/work/src/CMakeLists.txt;/work/src/inc.cmake\n",
+            "/work/src/CMakeLists.txt;/work/src/CMakeLists.txt\n",
+        )
+    );
 }
