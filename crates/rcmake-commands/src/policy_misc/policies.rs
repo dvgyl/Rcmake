@@ -87,6 +87,15 @@ pub(super) fn policy(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
             };
             cx.set_var(var, state.into());
         }
+        [b"GET", name, var, b"PARENT_SCOPE"] => {
+            let id = policy_id(name, "GET")?;
+            let state = match cx.parent_policy(id) {
+                Some(PolicyStatus::New) => "NEW",
+                Some(PolicyStatus::Old) => "OLD",
+                Some(PolicyStatus::Warn) | None => "",
+            };
+            cx.set_var(var, state.into());
+        }
         [b"SET" | b"GET", ..] => {
             return Err(subcommand_error(
                 args,

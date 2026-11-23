@@ -40,6 +40,15 @@ impl<T: Copy> LayeredStack<T> {
         self.above.last().map_or(&self.root, |e| &e.state)
     }
 
+    /// Parent state (the entry immediately below the top entry), if one exists.
+    pub(crate) fn parent(&self) -> Option<&T> {
+        match self.above.len() {
+            0 => None,
+            1 => Some(&self.root),
+            len => self.above.get(len - 2).map(|e| &e.state),
+        }
+    }
+
     /// Mutable access to the top entry only (no write-through).
     pub(crate) fn top_mut(&mut self) -> &mut T {
         match self.above.last_mut() {

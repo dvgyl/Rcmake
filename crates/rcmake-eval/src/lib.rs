@@ -794,6 +794,25 @@ impl Cx<'_> {
         self.interp.policy_status(id)
     }
 
+    /// Query a policy's status in the parent policy scope (`cmake_policy(GET ... PARENT_SCOPE)`).
+    /// Returns `None` when at the root policy scope.
+    #[must_use]
+    pub fn parent_policy(&self, id: PolicyId) -> Option<PolicyStatus> {
+        self.interp.policies.parent().map(|map| {
+            if id.info().is_some_and(|i| i.removed_old) {
+                PolicyStatus::New
+            } else {
+                map.get(id)
+            }
+        })
+    }
+
+    /// Active command tracing configuration (`--trace`), if enabled.
+    #[must_use]
+    pub fn trace_config(&self) -> Option<&TraceConfig> {
+        self.interp.trace.as_ref()
+    }
+
     /// Mutable access to the top of the policy stack (no weak write-through; prefer
     /// [`Self::set_policy`]).
     pub fn policies_mut(&mut self) -> &mut PolicyMap {
