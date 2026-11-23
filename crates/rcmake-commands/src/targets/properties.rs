@@ -1,0 +1,228 @@
+use rcmake_base::{BString, list, truth};
+use rcmake_eval::{CmdError, CmdResult, Cx, Flow};
+use rcmake_expr::ExpandedArg;
+use rcmake_model::{
+    BT, DirId, FileSetKind, ModelError, ProjectModel, PropOrigin, PropScope, TargetBinding,
+    TargetId, UsageScope,
+};
+
+use super::{bytes, model_error, status};
+
+pub(super) fn set(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
+    if args.len() < 2 {
+        return Err(status("called with incorrect number of arguments."));
+    }
+    let Some(marker) = args.iter().position(|arg| bytes(arg) == b"PROPERTIES") else {
+        return Err(status(
+            "called with illegal arguments, maybe missing a PROPERTIES specifier?",
+        ));
+    };
+    let (names, tail) = args.split_at(marker);
+    let [_, props @ ..] = tail else {
+        return Err(status("called with incorrect number of arguments."));
+    };
+    let (props, remainder) = props.as_chunks::<2>();
+    if !remainder.is_empty() {
+        return Err(status("called with incorrect number of arguments."));
+    }
+    let dir = cx.current_dir_id();
+    let bt = cx.backtrace();
+    let origin = PropOrigin {
+        dir,
+        backtrace: &bt,
+    };
+    let model = cx.project();
+    let targets = names
+        .iter()
+        .map(|name| {
+            model.find_target(dir, bytes(name)).ok_or_else(|| {
+                status(format!(
+                    "Can not find target to add properties to: {}",
+                    name.value
+                ))
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    for id in targets {
+        for [property, value] in props {
+            let property = bytes(property);
+            if property == b"IMPORTED_GLOBAL" {
+                promote(model, id, dir, bytes(value))?;
+                continue;
+            }
+            model
+                .set_prop(
+                    &PropScope::Target(id),
+                    property,
+                    Some(value.value.clone()),
+                    origin,
+                )
+                .map_err(|err| {
+                    if err == ModelError::ReadOnly {
+                        status(format!("{} property is read-only", BString::from(property)))
+                    } else {
+                        model_error(err)
+                    }
+                })?;
+        }
+    }
+    Ok(Flow::Normal)
+}
+
+fn promote(
+    model: &mut ProjectModel,
+    id: TargetId,
+    dir: DirId,
+    value: &[u8],
+) -> Result<(), CmdError> {
+    let target = model
+        .target(id)
+        .ok_or_else(|| model_error(ModelError::UnknownObject))?;
+    if !target.is_imported() || !truth::is_on(value) {
+        return Err(status(format!(
+            "IMPORTED_GLOBAL property can't be set to FALSE on targets (\"{}\")",
+            target.name
+        )));
+    }
+    if dir != target.dir {
+        return Err(status(format!(
+            "Attempt to promote imported target \"{}\" to global scope (by setting IMPORTED_GLOBAL) which is not built in this directory.",
+            target.name
+        )));
+    }
+    model.set_imported_global(id).map_err(model_error)
+}
+
+pub(super) fn get(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
+    let [var, name, property] = args else {
+        return Err(status("called with incorrect number of arguments"));
+    };
+    let dir = cx.current_dir_id();
+    let model = cx.project();
+    let Some(binding) = model.lookup_target(dir, bytes(name)) else {
+        return Err(super::reported(
+            cx,
+            format!(
+                "get_target_property() called with non-existent target \"{}\".",
+                name.value
+            ),
+        ));
+    };
+    let owner = PropScope::Target(binding.id());
+    let property = bytes(property);
+    let value = match (binding, property) {
+        (TargetBinding::Alias(id), b"ALIASED_TARGET") => {
+            model.target(id).map(|target| target.name.clone())
+        }
+        (TargetBinding::Alias(_), b"ALIAS_GLOBAL") => {
+            let local = model.dir(dir).local_targets.contains_key(bytes(name));
+            Some(if local { "FALSE" } else { "TRUE" }.into())
+        }
+        (_, b"MANUALLY_ADDED_DEPENDENCIES") => model.target(binding.id()).and_then(|target| {
+            let mut deps: Vec<_> = target
+                .utility_deps
+                .iter()
+                .map(|dep| dep.value.as_slice())
+                .collect();
+            deps.sort_unstable();
+            deps.dedup();
+            (!deps.is_empty()).then(|| list::join(deps))
+        }),
+        _ if model
+            .global
+            .defined_property(b"TARGET", property)
+            .is_some_and(|prop| prop.inherited) =>
+        {
+            model.get_prop_inherited(&owner, property)
+        }
+        _ => file_set_property(model, binding.id(), property)
+            .or_else(|| model.get_prop(&owner, property)),
+    };
+    let value = value.unwrap_or_else(|| [bytes(var), b"-NOTFOUND"].concat().into());
+    cx.set_var(bytes(var), value);
+    Ok(Flow::Normal)
+}
+
+fn file_set_property(model: &ProjectModel, id: TargetId, property: &[u8]) -> Option<BString> {
+    let target = model.target(id)?;
+    for (kind, prefix) in [
+        (FileSetKind::Headers, b"HEADER".as_slice()),
+        (FileSetKind::CxxModules, b"CXX_MODULE"),
+    ] {
+        let sets = || {
+            target
+                .file_sets
+                .iter()
+                .filter_map(|&id| model.file_set(id))
+                .filter(move |set| set.kind == kind)
+        };
+        let own = [prefix, b"_SETS"].concat();
+        let interface = [b"INTERFACE_".as_slice(), &own].concat();
+        if property == own || property == interface {
+            let interface = property == interface;
+            return Some(list::join(
+                sets()
+                    .filter(|set| {
+                        if interface {
+                            set.scope != UsageScope::Private
+                        } else {
+                            set.scope != UsageScope::Interface
+                        }
+                    })
+                    .map(|set| set.name.as_slice()),
+            ));
+        }
+        for (suffix, dirs) in [(b"_SET".as_slice(), false), (b"_DIRS", true)] {
+            let key = [prefix, suffix].concat();
+            let name = if property == key {
+                kind.as_str().as_bytes()
+            } else if let Some(name) = property
+                .strip_prefix(key.as_slice())
+                .and_then(|suffix| suffix.strip_prefix(b"_"))
+            {
+                name
+            } else {
+                continue;
+            };
+            let set = sets().find(|set| set.name == name)?;
+            let entries = if dirs { &set.base_dirs } else { &set.files };
+            return Some(list::join(
+                entries.iter().map(|entry| entry.value.as_slice()),
+            ));
+        }
+    }
+    None
+}
+
+pub(super) fn add_dependencies(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
+    let [name, deps @ ..] = args else {
+        return Err(status("called with incorrect number of arguments"));
+    };
+    let dir = cx.current_dir_id();
+    let bt = cx.backtrace();
+    let Some(id) = cx.project().find_target(dir, bytes(name)) else {
+        return Err(crate::command_error(
+            cx,
+            format!(
+                "Cannot add target-level dependencies to non-existent target \"{}\".\n\nThe add_dependencies works for top-level logical targets created by the add_executable, add_library, or add_custom_target commands.  If you want to add file-level dependencies see the DEPENDS option of the add_custom_target and add_custom_command commands.",
+                name.value
+            ),
+        ));
+    };
+    let target = cx
+        .project()
+        .target_mut(id)
+        .ok_or_else(|| model_error(ModelError::UnknownObject))?;
+    for dep in deps {
+        if !target
+            .utility_deps
+            .iter()
+            .any(|entry| entry.value == dep.value)
+        {
+            target
+                .utility_deps
+                .push(BT::new(dep.value.clone(), bt.clone()));
+        }
+    }
+    Ok(Flow::Normal)
+}
