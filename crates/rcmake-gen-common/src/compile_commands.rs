@@ -1,16 +1,52 @@
 //! `compile_commands.json` (`CMAKE_EXPORT_COMPILE_COMMANDS`).
 
-use std::path::Path;
+use std::{collections::HashMap, path::Path};
 
-use rcmake_base::BString;
+use rcmake_base::{BString, path_lex::Lexical};
 use rcmake_host::{Host, path::from_native};
 use rcmake_json::{Value, write_styled};
-use rcmake_resolve::{BuildGraph, BuildStep};
+use rcmake_model::GeneratorKind;
+use rcmake_resolve::{BuildGraph, BuildStep, GenerationResult};
 
 use crate::{GenError, write_if_changed};
 
 /// Render `compile_commands.json` for one build graph.
 pub fn render(graph: &BuildGraph, build_dir: &[u8]) -> Result<BString, GenError> {
+    render_with_directories(graph, build_dir, &HashMap::new())
+}
+
+/// Render `compile_commands.json` with the selected generator's path conventions.
+pub fn render_for_generator(
+    result: &GenerationResult,
+    graph: &BuildGraph,
+    build_dir: &[u8],
+    generator: GeneratorKind,
+) -> Result<BString, GenError> {
+    if generator != GeneratorKind::UnixMakefiles {
+        return render(graph, build_dir);
+    }
+
+    let directories = result
+        .targets
+        .iter()
+        .filter(|target| graph.config.matches(&target.config.0))
+        .flat_map(|target| {
+            target.compile_units.iter().map(|unit| {
+                (
+                    unit.object.as_slice(),
+                    target.metadata.binary_dir.as_slice(),
+                )
+            })
+        })
+        .collect();
+    render_with_directories(graph, build_dir, &directories)
+}
+
+fn render_with_directories(
+    graph: &BuildGraph,
+    build_dir: &[u8],
+    directories: &HashMap<&[u8], &[u8]>,
+) -> Result<BString, GenError> {
     let mut out = BString::from("[");
     let mut separator = b"\n".as_slice();
     for step in &graph.steps {
@@ -25,15 +61,36 @@ pub fn render(graph: &BuildGraph, build_dir: &[u8]) -> Result<BString, GenError>
         };
         out.extend_from_slice(separator);
         separator = b",\n";
-        let directory = invocation
-            .working_dir
-            .as_deref()
-            .map_or(build_dir, |v| v.as_ref());
+        let (directory, command) = if let Some(&directory) = directories.get(object.as_slice()) {
+            // Makefiles uses the target directory for the command and the build root for `output`.
+            let absolute_object = Lexical::new(build_dir).append(object);
+            let local_object = Lexical::new(&absolute_object).relative(Lexical::new(directory));
+            let paths = local_object
+                .filter(|path| path.as_slice() != object.as_slice())
+                .map(|path| (quote_shell_word(object), quote_shell_word(&path)));
+            (
+                directory,
+                compile_command(
+                    &invocation.shell,
+                    paths
+                        .as_ref()
+                        .map(|(from, to)| (from.as_slice(), to.as_slice())),
+                ),
+            )
+        } else {
+            (
+                invocation
+                    .working_dir
+                    .as_deref()
+                    .map_or(build_dir, |v| v.as_ref()),
+                compile_command(&invocation.shell, None),
+            )
+        };
         // Preserve the compile database's field order and use the JSON writer for values.
         out.extend_from_slice(b"{\n  \"directory\": ");
         json_string(&mut out, directory);
         out.extend_from_slice(b",\n  \"command\": ");
-        json_string(&mut out, &without_depfile_flags(&invocation.shell));
+        json_string(&mut out, &command);
         out.extend_from_slice(b",\n  \"file\": ");
         json_string(&mut out, source);
         out.extend_from_slice(b",\n  \"output\": ");
@@ -47,33 +104,57 @@ pub fn render(graph: &BuildGraph, build_dir: &[u8]) -> Result<BString, GenError>
     Ok(out)
 }
 
-fn without_depfile_flags(shell: &[u8]) -> BString {
+fn compile_command(shell: &[u8], object_paths: Option<(&[u8], &[u8])>) -> BString {
     let mut command = BString::default();
     let mut rest = shell;
     let mut skip_value = false;
-    let mut changed = false;
+    let mut removed_depfile_flags = false;
     while !rest.is_empty() {
         let (word, following) = rest
             .split_at_checked(shell_word_len(rest))
             .unwrap_or((rest, b""));
         if matches!(word, b"-MD" | b"-MMD" | b"-MT" | b"-MF") || skip_value {
             skip_value = !skip_value && matches!(word, b"-MT" | b"-MF");
-            changed = true;
+            removed_depfile_flags = true;
             let spaces = following
                 .iter()
                 .take_while(|byte| matches!(byte, b' ' | b'\t'))
                 .count();
             rest = following.get(spaces..).unwrap_or_default();
         } else {
+            let word = object_paths
+                .filter(|(original, _)| word == *original)
+                .map_or(word, |(_, local)| local);
             command.extend_from_slice(word);
             rest = following;
         }
     }
-    if changed {
+    if removed_depfile_flags {
         command.as_slice().trim_ascii_end().into()
     } else {
-        shell.into()
+        command
     }
+}
+
+// Use the same shell word form as the compile rule in the build graph.
+fn quote_shell_word(path: &[u8]) -> BString {
+    if !path.is_empty()
+        && path
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"_@%+=:,./-".contains(byte))
+    {
+        return path.into();
+    }
+    let mut word = BString::from("'");
+    for &byte in path {
+        if byte == b'\'' {
+            word.extend_from_slice(b"'\\''");
+        } else {
+            word.push(byte);
+        }
+    }
+    word.push(b'\'');
+    word
 }
 
 // Keep the original shell quoting, including quoted paths that contain spaces.
@@ -143,9 +224,90 @@ fn json_escaped_content(out: &mut BString, value: &[u8]) {
 
 #[cfg(test)]
 mod tests {
+    use rcmake_host::PureHost;
+    use rcmake_model::{BT, DirId, ProjectModel, Target, TargetKind, TargetOrigin};
     use rcmake_resolve::Invocation;
 
     use super::*;
+
+    fn subdirectory_project(generator: GeneratorKind, binary_dir: &str) -> GenerationResult {
+        let mut model = ProjectModel::default();
+        model.generator = Some(generator);
+        model.set_root_dirs("/src".into(), "/out".into());
+        let root = model.dir_mut(DirId::ROOT);
+        root.vars.insert("CMAKE_C_COMPILER".into(), "cc".into());
+        let child = model
+            .add_directory(
+                DirId::ROOT,
+                "/src/sub".into(),
+                binary_dir.into(),
+                Default::default(),
+            )
+            .unwrap();
+        let mut target = Target::new(
+            "sublib".into(),
+            TargetKind::StaticLibrary,
+            TargetOrigin::Normal,
+            child,
+            Default::default(),
+            Default::default(),
+        );
+        target
+            .sources
+            .push(BT::new("a.c".into(), Default::default()));
+        model.add_target(target).unwrap();
+        let host = PureHost::default();
+        host.seed_file(Path::new("/src/sub/a.c"), b"").unwrap();
+        rcmake_resolve::resolve(&model, &host, &[]).unwrap()
+    }
+
+    #[test]
+    fn ninja_uses_the_build_root_for_subdirectory_commands() {
+        let generator = GeneratorKind::Ninja;
+        let result = subdirectory_project(generator, "/out/sub");
+        let graph = &result.graphs[0];
+        let output = render_for_generator(&result, graph, b"/out", generator).unwrap();
+        assert_eq!(output, render(graph, b"/out").unwrap());
+        assert_eq!(
+            output.to_string(),
+            r#"[
+{
+  "directory": "/out",
+  "command": "cc   -o sub/CMakeFiles/sublib.dir/a.c.o -c /src/sub/a.c",
+  "file": "/src/sub/a.c",
+  "output": "sub/CMakeFiles/sublib.dir/a.c.o"
+}
+]"#
+        );
+    }
+
+    #[test]
+    fn makefiles_uses_the_target_directory_for_subdirectory_commands() {
+        let generator = GeneratorKind::UnixMakefiles;
+        for (directory, object) in [
+            ("/out/sub", "sub/CMakeFiles/sublib.dir/a.c.o"),
+            ("/out/sub build", "sub build/CMakeFiles/sublib.dir/a.c.o"),
+            ("/other build", "/other build/CMakeFiles/sublib.dir/a.c.o"),
+        ] {
+            let result = subdirectory_project(generator, directory);
+            let output = render_for_generator(&result, &result.graphs[0], b"/out", generator)
+                .unwrap()
+                .to_string();
+            assert_eq!(
+                output,
+                format!(
+                    r#"[
+{{
+  "directory": "{directory}",
+  "command": "cc   -o CMakeFiles/sublib.dir/a.c.o -c /src/sub/a.c",
+  "file": "/src/sub/a.c",
+  "output": "{object}"
+}}
+]"#
+                )
+            );
+        }
+    }
 
     #[test]
     fn omits_dependency_flags_from_the_database_command() {

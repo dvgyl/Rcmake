@@ -37,7 +37,7 @@ pub(crate) fn run(interp: &mut Interp, host: &dyn Host, bin: &Path) -> Result<bo
         Err(ResolveError::Unimplemented(_)) => return Ok(false),
         Err(err) => return Err(err.to_string()),
     };
-    write_common(interp, host, bin, &result).map_err(|err| err.to_string())?;
+    write_common(interp, host, bin, &result, kind).map_err(|err| err.to_string())?;
     let result = match kind {
         GeneratorKind::Ninja => rcmake_gen_ninja::generate_single_config(&result, host, bin),
         GeneratorKind::NinjaMultiConfig => {
@@ -59,6 +59,7 @@ fn write_common(
     host: &dyn Host,
     bin: &Path,
     result: &GenerationResult,
+    generator: GeneratorKind,
 ) -> Result<(), GenError> {
     let binary_dir = path::from_native(bin);
     let prefix = interp.cx().var(b"CMAKE_INSTALL_PREFIX");
@@ -123,7 +124,7 @@ fn write_common(
         write(
             host,
             &bin.join("compile_commands.json"),
-            common::compile_commands::render(graph, &binary_dir),
+            common::compile_commands::render_for_generator(result, graph, &binary_dir, generator),
         )?;
     }
     let testing = interp.cx().var_is_on(b"CMAKE_TESTING_ENABLED");
