@@ -427,7 +427,10 @@ fn conditions_support_all_operators_and_short_circuit() {
           {"name":"inherited","inherits":"never","condition":true},
           {"name":"always","hidden":true,"condition":true},
           {"name":"second-parent","inherits":["always","never"]},
+          {"name":"parent-false","inherits":["never","always"]},
+          {"name":"null-override","inherits":"never","condition":null},
           {"name":"null","condition":null},
+          {"name":"null-parent","inherits":["null","never"]},
           {"name":"any-empty","condition":{"type":"anyOf","conditions":[]}},
           {"name":"all-empty","condition":{"type":"allOf","conditions":[]}}
         ]}"#,
@@ -435,7 +438,15 @@ fn conditions_support_all_operators_and_short_circuit() {
     .expect("valid conditions");
     assert_eq!(
         names(&presets, PresetKind::Configure, &EnvSnapshot::default()),
-        ["all", "null", "all-empty"].map(BString::from)
+        [
+            "all",
+            "inherited",
+            "second-parent",
+            "null-override",
+            "null",
+            "all-empty"
+        ]
+        .map(BString::from)
     );
     assert!(root(r#"{"version":13,"configurePresets":[{"name":"bad","condition":{"type":"not","condition":null}}]}"#).is_err());
 }
@@ -503,7 +514,7 @@ fn resolves_build_test_package_and_workflow_settings() {
     let presets = root(r#"{
       "version":13,
       "configurePresets":[{"name":"cfg","generator":"Ninja","binaryDir":"out","environment":{"FROM_CFG":"${presetName}","TOOL":"cc"}}],
-      "buildPresets":[{"name":"build","configurePreset":"$penv{CONFIGURE}","jobs":0,"targets":["${configurePresetName}","${generator}"],
+      "buildPresets":[{"name":"build","configurePreset":"cfg","jobs":0,"targets":["${configurePresetName}","${generator}"],
         "nativeToolOptions":["$env{TOOL}"],"resolvePackageReferences":"only","cleanFirst":true}],
       "testPresets":[{"name":"test","configurePreset":"cfg","inheritConfigureEnvironment":false,
         "output":{"outputJUnitFile":"${configurePresetName}.xml","verbosity":"extra","testOutputTruncation":"middle"},
@@ -517,9 +528,7 @@ fn resolves_build_test_package_and_workflow_settings() {
       "workflowPresets":[{"name":"all","steps":[{"type":"configure","name":"cfg"},{"type":"build","name":"build"},
         {"type":"test","name":"test"},{"type":"package","name":"package"}]}]
     }"#).expect("valid presets");
-    let env = EnvSnapshot {
-        vars: BTreeMap::from([("CONFIGURE".into(), "cfg".into())]),
-    };
+    let env = EnvSnapshot::default();
     let build = presets
         .resolve(PresetKind::Build, b"build", &env)
         .expect("build preset");
@@ -597,6 +606,10 @@ fn invalid_references_and_workflow_steps_are_rejected() {
         (
             r#"{"version":13,"buildPresets":[{"name":"b","configurePreset":"missing"}]}"#,
             "references unknown configure preset",
+        ),
+        (
+            r#"{"version":13,"configurePresets":[{"name":"b"}],"buildPresets":[{"name":"b","configurePreset":"${presetName}"}]}"#,
+            r#"references unknown configure preset "${presetName}""#,
         ),
         (
             r#"{"version":13,"testPresets":[{"name":"t"}]}"#,
@@ -731,6 +744,104 @@ fn include_symlinks_share_file_identity_and_retain_the_first_path() {
         load(project, &host)
             .expect_err("cycle through alias")
             .message,
-        "Cyclic include among presets files: /project/sub/base.json"
+        "Could not read presets from /project:\nCyclic include among presets files: /project/sub/base.json"
+    );
+}
+
+#[test]
+fn reports_json_value_locations_in_included_files() {
+    let host = PureHost::default();
+    let project = Path::new("/project");
+    host.create_dir_all(project).expect("create project");
+    host.write(
+        &project.join("CMakePresets.json"),
+        br#"{"version":13,"include":["base.json"]}"#,
+        WriteMode::Truncate,
+    )
+    .expect("write root");
+    host.write(
+        &project.join("base.json"),
+        br#"{
+  "version": 13,
+  "configurePresets": [
+    {"name": "p", "b\u0069naryDir": []}
+  ]
+}"#,
+        WriteMode::Truncate,
+    )
+    .expect("write include");
+    assert_eq!(
+        load(project, &host).expect_err("invalid directory").message,
+        concat!(
+            "Could not read presets from /project:\n",
+            "base.json:4: \"binaryDir\" expected a string\n",
+            "    {\"name\": \"p\", \"b\\u0069naryDir\": []}\n",
+            "                                    ^",
+        )
+    );
+}
+
+#[test]
+fn validates_hidden_macros_and_skips_vendor_macros_during_load() {
+    let host = PureHost::default();
+    let project = Path::new("/project");
+    let file = project.join("CMakePresets.json");
+    host.create_dir_all(project).expect("create project");
+    host.write(
+        &file,
+        br#"{"version":13,"configurePresets":[{"name":"good"},{"name":"hidden","hidden":true,"binaryDir":"${unknown}"}]}"#,
+        WriteMode::Truncate,
+    )
+    .expect("write invalid macro");
+    assert_eq!(
+        load(project, &host).expect_err("invalid macro").message,
+        "Could not read presets from /project:\nInvalid macro expansion in \"hidden\""
+    );
+    host.write(
+        &file,
+        br#"{"version":13,"configurePresets":[{"name":"good"},{"name":"vendor","binaryDir":"$vendor{ext.value}"}]}"#,
+        WriteMode::Truncate,
+    )
+    .expect("write vendor macro");
+    let presets = load(project, &host).expect("load vendor macro");
+    assert_eq!(
+        names(&presets, PresetKind::Configure, &EnvSnapshot::default()),
+        [BString::from("good")]
+    );
+}
+
+#[test]
+fn explicit_file_uses_the_working_directory_and_its_own_includes() {
+    let host = PureHost::default();
+    let project = Path::new("/project/source");
+    for (path, contents) in [
+        ("/project/source/CMakePresets.json", "invalid"),
+        ("/project/source/CMakeUserPresets.json", "invalid"),
+        (
+            "/work/ci/custom.json",
+            r#"{"version":13,"include":["base.json"],"configurePresets":[{"name":"custom","inherits":"base"}]}"#,
+        ),
+        (
+            "/work/ci/base.json",
+            r#"{"version":12,"configurePresets":[{"name":"base","hidden":true,"binaryDir":"${sourceDir}/build","cacheVariables":{"META":"${fileDir}"}}]}"#,
+        ),
+    ] {
+        let file = Path::new(path);
+        host.create_dir_all(file.parent().expect("parent directory"))
+            .expect("create directory");
+        host.write(file, contents.as_bytes(), WriteMode::Truncate)
+            .expect("write file");
+    }
+    let presets =
+        load_file(project, Path::new("ci/custom.json"), &host).expect("load explicit file");
+    assert_eq!(presets.version, 13);
+    let preset = named(&presets, PresetKind::Configure, "custom");
+    assert_eq!(preset.binary_dir, Some("/project/source/build".into()));
+    let PresetSettings::Configure(settings) = preset.settings else {
+        panic!("configure settings")
+    };
+    assert_eq!(
+        settings.cache_variables.expect("cache variables")[b"META".as_slice()].value,
+        BString::from("/work/ci")
     );
 }

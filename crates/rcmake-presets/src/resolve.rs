@@ -51,31 +51,63 @@ impl Presets {
     ) -> Result<ResolvedPreset, PresetsError> {
         let record = self.get(kind, name).ok_or_else(|| {
             PresetsError::new(format!(
-                "No such {} preset: \"{}\"",
+                "No such {} preset in {}: \"{}\"",
                 kind.label(),
+                self.source_dir.display(),
                 String::from_utf8_lossy(name)
             ))
         })?;
         if record.hidden {
             return Err(PresetsError::new(format!(
-                "Cannot use hidden preset in {}: \"{}\"",
+                "Cannot use hidden {} preset in {}: \"{}\"",
                 kind.label(),
+                self.source_dir.display(),
                 record.summary.name
             )));
         }
-        self.resolve_record(record, env).map_err(|error| {
+        let (mut result, enabled) = self.expand_record(record, env).map_err(|error| {
             if expand::is_vendor_error(&error) {
-                record.invalid("Preset contains an unsupported vendor macro")
-            } else if error.message == "Invalid macro expansion" {
                 PresetsError::new(format!(
-                    "{}\nInvalid macro expansion in \"{}\"",
-                    record.invalid("Invalid macro expansion"),
+                    "Could not evaluate {} preset \"{}\": Invalid macro expansion",
+                    kind.label(),
                     record.summary.name
                 ))
             } else {
                 error
             }
-        })
+        })?;
+        if !enabled {
+            return Err(PresetsError::new(format!(
+                "Cannot use disabled {} preset in {}: \"{}\"",
+                kind.label(),
+                self.source_dir.display(),
+                record.summary.name
+            )));
+        }
+        if let Some(associated) = &result.configure_preset {
+            result.binary_dir = self
+                .resolve(PresetKind::Configure, associated.as_slice(), env)?
+                .binary_dir;
+        }
+        if let PresetSettings::Workflow(workflow) = &result.settings {
+            for step in &workflow.steps {
+                self.resolve(step.kind, step.name.as_slice(), env)?;
+            }
+        }
+        Ok(result)
+    }
+
+    pub(crate) fn validate_expansions(&self, env: &EnvSnapshot) -> Result<(), PresetsError> {
+        for records in self.records.values() {
+            for record in records.values() {
+                if let Err(error) = self.expand_record(record, env)
+                    && !expand::is_vendor_error(&error)
+                {
+                    return Err(error);
+                }
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn validate_references(
@@ -91,9 +123,7 @@ impl Presets {
                     }
                     _ if !record.hidden => {
                         let name = raw_configure_name(record)?;
-                        if !name.contains(&b'$') {
-                            self.configure_reference(record, &name, reachable)?;
-                        }
+                        self.configure_reference(record, &name, reachable)?;
                     }
                     _ => {}
                 }
@@ -173,7 +203,7 @@ impl Presets {
             };
             if let Some(field) = target.fields.get(b"configurePreset".as_slice()) {
                 let associated = schema::text(field)?;
-                if associated != &first.name && !associated.contains(&b'$') {
+                if associated != &first.name {
                     return Err(workflow_config_mismatch(
                         step.kind,
                         &step.name,
@@ -186,113 +216,100 @@ impl Presets {
         Ok(())
     }
 
-    fn resolve_record(
+    fn expand_record(
         &self,
         record: &Record,
         env: &EnvSnapshot,
-    ) -> Result<ResolvedPreset, PresetsError> {
+    ) -> Result<(ResolvedPreset, bool), PresetsError> {
         let kind = record.summary.kind;
         if kind == PresetKind::Workflow {
-            let PresetSettings::Workflow(workflow) = record.read(&mut schema::literal)? else {
-                return Err(record.invalid(""));
-            };
-            let first = workflow.steps.first().ok_or_else(|| record.invalid(""))?;
-            for step in &workflow.steps {
-                let resolved = self.resolve(step.kind, step.name.as_slice(), env)?;
-                if let Some(associated) = &resolved.configure_preset
-                    && associated != &first.name
-                {
-                    return Err(workflow_config_mismatch(
-                        step.kind,
-                        &step.name,
-                        associated,
-                        &first.name,
-                    ));
-                }
-            }
-            return Ok(result(
-                record,
-                None,
-                None,
-                None,
-                None,
-                BTreeMap::new(),
-                PresetSettings::Workflow(workflow),
+            return Ok((
+                result(
+                    record,
+                    None,
+                    None,
+                    None,
+                    None,
+                    BTreeMap::new(),
+                    record.read(&mut schema::literal)?,
+                ),
+                true,
             ));
         }
 
-        let own_environment = expand::environment_fields(record)?;
+        let mut variables = expand::environment_fields(record)?;
         let configure_name = if kind == PresetKind::Configure {
             record.summary.name.clone()
         } else {
-            let field = record
-                .fields
-                .get(b"configurePreset".as_slice())
-                .ok_or_else(|| missing_configure(record))?;
-            Macros::new(self, env, Some(record), own_environment.clone()).expand(field)?
+            optional_configure_name(record)?.unwrap_or_default()
         };
-        let mut variables = own_environment;
-        let (associated, inherit_environment) = if kind == PresetKind::Configure {
-            (None, None)
+        let config = if kind == PresetKind::Configure {
+            Some(record)
+        } else if record.hidden {
+            self.get(PresetKind::Configure, configure_name.as_slice())
         } else {
-            let config = self.configure_reference(record, &configure_name, &self.reachable)?;
+            Some(self.configure_reference(record, &configure_name, &self.reachable)?)
+        };
+        let inherit_environment = if kind == PresetKind::Configure {
+            None
+        } else {
             let inherit = record
                 .fields
                 .get(b"inheritConfigureEnvironment".as_slice())
                 .map(|field| bool::decode(field, &mut schema::literal))
                 .transpose()?
                 .unwrap_or(true);
-            if inherit {
+            if inherit && let Some(config) = config {
                 for (name, field) in expand::environment_fields(config)? {
                     variables.entry(name).or_insert(field);
                 }
             }
-            (
-                Some(self.resolve(PresetKind::Configure, configure_name.as_slice(), env)?),
-                Some(inherit),
-            )
+            Some(inherit)
         };
-        let generator = if let Some(configure) = &associated {
-            configure.generator.clone()
-        } else {
-            record
-                .fields
-                .get(b"generator".as_slice())
-                .map(schema::literal)
-                .transpose()?
-        };
+        let generator = config
+            .and_then(|config| config.fields.get(b"generator".as_slice()))
+            .map(schema::literal)
+            .transpose()?;
 
         let mut macros = Macros::new(self, env, Some(record), variables);
         macros.configure_name = Some(&configure_name);
         if kind != PresetKind::Package {
             macros.generator = generator.as_ref();
         }
-        let environment = macros.environment()?;
-        let mut settings = record.read(&mut |field| macros.expand(field))?;
-        for condition in record.conditions.values() {
-            if !condition.evaluate(&mut |field| macros.expand(field))? {
-                return Err(PresetsError::new(format!(
-                    "Cannot use disabled preset in {}: \"{}\"",
-                    kind.label(),
-                    record.summary.name
-                )));
-            }
-        }
+        let environment = macros
+            .environment()
+            .map_err(|error| expansion_error(record, error, Some("Invalid macro expansion")))?;
+        let mut settings = record
+            .read(&mut |field| macros.expand(field))
+            .map_err(|error| expansion_error(record, error, None))?;
+        let enabled = record
+            .condition
+            .as_ref()
+            .map(|condition| {
+                condition
+                    .evaluate(&mut |field| macros.expand(field))
+                    .map_err(|error| expansion_error(record, error, Some("Invalid condition")))
+            })
+            .transpose()?
+            .unwrap_or(true);
         let binary_dir = if let PresetSettings::Configure(configure) = &mut settings {
             self.source_relative(&mut configure.binary_dir);
             self.source_relative(&mut configure.install_dir);
             configure.binary_dir.clone()
         } else {
-            associated.and_then(|configure| configure.binary_dir)
+            None
         };
-        Ok(result(
-            record,
-            (kind != PresetKind::Configure).then_some(configure_name),
-            inherit_environment,
-            generator,
-            binary_dir,
-            environment,
-            settings,
+        Ok((
+            result(
+                record,
+                (kind != PresetKind::Configure).then_some(configure_name),
+                inherit_environment,
+                generator,
+                binary_dir,
+                environment,
+                settings,
+            ),
+            enabled,
         ))
     }
 
@@ -332,13 +349,29 @@ fn result(
 }
 
 fn raw_configure_name(record: &Record) -> Result<BString, PresetsError> {
+    optional_configure_name(record)?.ok_or_else(|| missing_configure(record))
+}
+
+fn optional_configure_name(record: &Record) -> Result<Option<BString>, PresetsError> {
     record
         .fields
         .get(b"configurePreset".as_slice())
         .map(schema::literal)
-        .transpose()?
-        .filter(|name| !name.is_empty())
-        .ok_or_else(|| missing_configure(record))
+        .transpose()
+        .map(|name| name.filter(|name| !name.is_empty()))
+}
+
+fn expansion_error(record: &Record, error: PresetsError, context: Option<&str>) -> PresetsError {
+    if expand::is_vendor_error(&error)
+        || (context.is_none() && error.message != "Invalid macro expansion")
+    {
+        return error;
+    }
+    let detail = format!("Invalid macro expansion in \"{}\"", record.summary.name);
+    match context {
+        Some(context) => PresetsError::new(format!("{}\n{detail}", record.invalid(context))),
+        None => PresetsError::new(detail),
+    }
 }
 
 fn missing_configure(record: &Record) -> PresetsError {

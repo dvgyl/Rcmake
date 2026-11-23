@@ -83,14 +83,13 @@ choices! {
     }
 }
 
-settings! {
-    /// Generator platform or toolset selection.
-    GeneratorSelection {
-        /// Selection value.
-        value: BString = "value",
-        /// How to apply the value. The default is `Set`.
-        strategy: Strategy = "strategy",
-    }
+/// Generator platform or toolset selection.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct GeneratorSelection {
+    /// Selection value.
+    pub value: Option<BString>,
+    /// How to apply the value. The default is `Set`.
+    pub strategy: Option<Strategy>,
 }
 
 fn selection(field: &Field, expand: &mut Expand<'_>) -> Result<GeneratorSelection, PresetsError> {
@@ -100,7 +99,14 @@ fn selection(field: &Field, expand: &mut Expand<'_>) -> Result<GeneratorSelectio
             strategy: None,
         });
     }
-    GeneratorSelection::decode(field, expand)
+    let mut reader = Reader::object(field, "preset")?;
+    let value = reader.optional("value", 1, 13, expand)?;
+    let strategy = reader
+        .take("strategy", 1, 13)?
+        .map(|field| Strategy::decode(&field, expand).map_err(|_| field.invalid("Invalid preset")))
+        .transpose()?;
+    reader.finish()?;
+    Ok(GeneratorSelection { value, strategy })
 }
 
 /// Cache variable value and optional type.
@@ -112,8 +118,8 @@ pub struct CacheVariable {
     pub value: BString,
 }
 
-impl Decode for CacheVariable {
-    fn decode(field: &Field, expand: &mut Expand<'_>) -> Result<Self, PresetsError> {
+impl CacheVariable {
+    fn read(field: &Field, label: &str, expand: &mut Expand<'_>) -> Result<Self, PresetsError> {
         match field.value.as_ref() {
             Value::String(_) => Ok(Self {
                 kind: None,
@@ -124,7 +130,8 @@ impl Decode for CacheVariable {
                 value: bool_text(*value),
             }),
             _ => {
-                let mut reader = Reader::object(field, "cache variable")?;
+                let mut reader = Reader::object(field, label)
+                    .map_err(|_| field.invalid(format_args!("Invalid CMake {label}")))?;
                 let kind = reader.optional("type", 1, 13, expand)?;
                 let field = reader.required("value")?;
                 let value = match field.value.as_ref() {
@@ -147,12 +154,20 @@ fn cache(
     expand: &mut Expand<'_>,
 ) -> Result<BTreeMap<BString, CacheVariable>, PresetsError> {
     let mut values = BTreeMap::new();
-    for (key, entry) in schema::fields(field)? {
+    let name = field
+        .preset_name
+        .as_ref()
+        .map(ToString::to_string)
+        .unwrap_or_default();
+    for (key, entry) in schema::fields(field).map_err(|_| field.invalid("Invalid preset"))? {
         if key.is_empty() {
-            return Err(field.invalid("Invalid preset cache variable"));
+            return Err(PresetsError::new(format!(
+                "Invalid configure preset: \"{name}\": Empty cache variable names are not allowed"
+            )));
         }
         if !matches!(entry.value.as_ref(), Value::Null) {
-            values.insert(key, CacheVariable::decode(&entry, expand)?);
+            let label = format!("variable \"{key}\" for preset \"{name}\"");
+            values.insert(key, CacheVariable::read(&entry, &label, expand)?);
         }
     }
     Ok(values)

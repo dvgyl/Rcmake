@@ -1,6 +1,6 @@
 //! Preset condition parsing and short-circuit evaluation.
 
-use rcmake_base::Limits;
+use rcmake_base::{BString, Limits};
 use rcmake_json::Value;
 use rcmake_regex::{MatchOptions, Regex};
 
@@ -9,6 +9,7 @@ use crate::schema::{self, Decode, Expand, Field, Reader};
 
 #[derive(Clone, Debug)]
 pub(crate) enum Condition {
+    Null,
     Const(bool),
     Equals(Field, Field, bool),
     InList(Field, Vec<Field>, bool),
@@ -18,12 +19,23 @@ pub(crate) enum Condition {
 }
 
 impl Condition {
-    pub(crate) fn parse(field: &Field, depth: usize) -> Result<Self, PresetsError> {
+    pub(crate) fn parse(field: &Field, name: &BString, depth: usize) -> Result<Self, PresetsError> {
         schema::depth(depth, "Preset condition")?;
         if let Value::Bool(value) = field.value.as_ref() {
             return Ok(Self::Const(*value));
         }
-        let mut reader = Reader::object(field, "Condition")?;
+        if matches!(field.value.as_ref(), Value::Null) {
+            return if depth == 0 {
+                Ok(Self::Null)
+            } else {
+                Err(PresetsError::new(format!(
+                    "Invalid condition for preset \"{name}\""
+                )))
+            };
+        }
+        let label = format!(" condition for preset \"{name}\"");
+        let mut reader = Reader::object(field, &label)
+            .map_err(|_| field.invalid(format_args!("Invalid condition for preset \"{name}\"")))?;
         let kind = reader.required("type")?;
         let condition = match schema::text(&kind)?.as_slice() {
             b"const" => Self::Const(bool::decode(
@@ -52,15 +64,16 @@ impl Condition {
             ),
             op @ (b"allOf" | b"anyOf") => {
                 let conditions = schema::array(&reader.required("conditions")?)?
-                    .map(|item| Self::parse(&item, depth + 1))
+                    .map(|item| Self::parse(&item, name, depth + 1))
                     .collect::<Result<_, _>>()?;
                 Self::Group(conditions, op == b"allOf")
             }
             b"not" => Self::Not(Box::new(Self::parse(
                 &reader.required("condition")?,
+                name,
                 depth + 1,
             )?)),
-            _ => return Err(kind.invalid("Invalid condition type")),
+            _ => return Err(kind.invalid(format_args!("Invalid condition for preset \"{name}\""))),
         };
         reader.finish()?;
         Ok(condition)
@@ -68,6 +81,7 @@ impl Condition {
 
     pub(crate) fn evaluate(&self, expand: &mut Expand<'_>) -> Result<bool, PresetsError> {
         match self {
+            Self::Null => Ok(true),
             Self::Const(value) => Ok(*value),
             Self::Equals(lhs, rhs, equals) => Ok((expand(lhs)? == expand(rhs)?) == *equals),
             Self::InList(needle, list, present) => {

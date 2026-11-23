@@ -233,9 +233,7 @@ pub(crate) fn include_path(
     if field.source.version < 7 {
         return schema::literal(field);
     }
-    Macros::new(presets, env, None, Fields::new())
-        .expand(field)
-        .map_err(|_| field.invalid("Invalid \"include\" field"))
+    Macros::new(presets, env, None, Fields::new()).expand(field)
 }
 
 pub(crate) fn environment_fields(preset: &Record) -> Result<Fields, PresetsError> {

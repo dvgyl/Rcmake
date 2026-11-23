@@ -5,6 +5,7 @@
 mod condition;
 mod expand;
 mod graph;
+mod location;
 mod resolve;
 mod schema;
 mod settings;
@@ -192,19 +193,28 @@ impl PresetsError {
 /// A relative source directory is interpreted relative to the host's initial directory.
 /// If neither preset file exists, this function reports a missing preset file.
 pub fn load(source_dir: &Path, host: &dyn Host) -> Result<Presets, PresetsError> {
-    graph::load(source_dir, host, None)
+    graph::load(source_dir, host, None, None)
+}
+
+/// Load an explicit preset file and its includes through the host.
+///
+/// A relative file path is interpreted relative to the host's initial directory.
+/// The source directory still supplies the project path for preset macros.
+pub fn load_file(source_dir: &Path, file: &Path, host: &dyn Host) -> Result<Presets, PresetsError> {
+    graph::load(source_dir, host, None, Some(file))
 }
 
 /// Load presets from parsed JSON documents indexed by absolute or source-relative paths.
 ///
 /// Use the same filenames as the project, user, and included files. This function uses
 /// the host for path and environment information. It obtains all JSON from `values`.
+/// Preset fields expand when a caller resolves a preset with an environment snapshot.
 pub fn load_from_values(
     source_dir: &Path,
     host: &dyn Host,
     values: &BTreeMap<PathBuf, Value>,
 ) -> Result<Presets, PresetsError> {
-    graph::load(source_dir, host, Some(values))
+    graph::load(source_dir, host, Some(values), None)
 }
 
 /// Resolve a named preset by kind.

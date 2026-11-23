@@ -11,6 +11,7 @@ use rcmake_json::{ReadOptions, Value};
 
 use crate::condition::Condition;
 use crate::expand;
+use crate::location::{self, Span};
 use crate::schema::{self, Field, Fields, Origin, Reader};
 use crate::settings::{
     BuildSettings, ConfigureSettings, PackageSettings, TestSettings, WorkflowSettings,
@@ -31,33 +32,38 @@ pub(crate) struct Record {
     pub(crate) hidden: bool,
     pub(crate) source: Arc<Origin>,
     pub(crate) fields: Fields,
-    pub(crate) conditions: BTreeMap<usize, Arc<Condition>>,
+    pub(crate) condition: Option<Arc<Condition>>,
     pub(crate) vendor: Option<BTreeMap<BString, Value>>,
+    offset: Option<usize>,
     inherits: Vec<BString>,
 }
 
 impl Record {
-    fn parse(kind: PresetKind, index: usize, field: &Field) -> Result<Self, PresetsError> {
+    fn parse(kind: PresetKind, field: &Field) -> Result<Self, PresetsError> {
         let mut reader = Reader::object(field, "Preset")?;
-        let name = schema::literal(&reader.required("name")?)?;
+        let name_field = reader.required("name")?;
+        let name =
+            schema::literal(&name_field).map_err(|_| name_field.invalid("Invalid Preset Name"))?;
         if name.is_empty() {
-            return Err(field.invalid("Invalid Preset Name"));
+            return Err(name_field.invalid("Invalid Preset Name"));
         }
         let display_name = reader.optional("displayName", 1, 13, &mut schema::literal)?;
         let description = reader.optional("description", 1, 13, &mut schema::literal)?;
         let vendor = reader
             .take("vendor", 1, 13)?
             .as_ref()
-            .map(|field| schema::object(field).cloned())
+            .map(|field| {
+                schema::object(field)
+                    .cloned()
+                    .map_err(|_| field.invalid("Invalid preset"))
+            })
             .transpose()?;
-        let mut conditions = BTreeMap::new();
+        let mut condition = None;
         let (hidden, inherits) = if kind == PresetKind::Workflow {
             (false, Vec::new())
         } else {
-            if let Some(field) = reader.take("condition", 3, 13)?
-                && !matches!(field.value.as_ref(), Value::Null)
-            {
-                conditions.insert(index, Arc::new(Condition::parse(&field, 0)?));
+            if let Some(field) = reader.take("condition", 3, 13)? {
+                condition = Some(Arc::new(Condition::parse(&field, &name, 0)?));
             }
             let hidden = reader
                 .optional("hidden", 1, 13, &mut schema::literal)?
@@ -65,7 +71,10 @@ impl Record {
             let inherits = reader
                 .take("inherits", 1, 13)?
                 .as_ref()
-                .map(|field| schema::string_or_array(field, &mut schema::literal))
+                .map(|field| {
+                    schema::string_or_array(field, &mut schema::literal)
+                        .map_err(|_| field.invalid("Invalid preset"))
+                })
                 .transpose()?
                 .unwrap_or_default();
             (hidden, inherits)
@@ -81,18 +90,21 @@ impl Record {
             hidden,
             source: Arc::clone(&field.source),
             fields,
-            conditions,
+            condition,
             vendor,
+            offset: field.offset(),
             inherits,
         };
         record.read(&mut schema::literal)?;
         if let Some(environment) = record.fields.get(b"environment".as_slice()) {
-            for (key, field) in schema::fields(environment)? {
+            for (key, field) in
+                schema::fields(environment).map_err(|_| environment.invalid("Invalid preset"))?
+            {
                 if key.is_empty() {
-                    return Err(field.invalid("Invalid preset environment variable"));
+                    return Err(record.invalid("Empty environment variable names are not allowed"));
                 }
                 if !matches!(field.value.as_ref(), Value::Null) {
-                    schema::text(&field)?;
+                    schema::text(&field).map_err(|_| field.invalid("Invalid preset"))?;
                 }
             }
         }
@@ -103,7 +115,8 @@ impl Record {
         &self,
         expand: &mut schema::Expand<'_>,
     ) -> Result<PresetSettings, PresetsError> {
-        let mut reader = Reader::new(self.fields.clone(), &self.source, "Preset");
+        let mut reader = Reader::new(self.fields.clone(), &self.source, "Preset", self.offset)
+            .with_preset(&self.summary.name);
         if self.summary.kind != PresetKind::Workflow {
             reader.take("environment", 1, 13)?;
         }
@@ -155,22 +168,41 @@ struct FileGraph<'a> {
     count: usize,
 }
 
+struct Document {
+    value: Value,
+    text: Option<Arc<[u8]>>,
+}
+
 pub(crate) fn load(
     source_dir: &Path,
     host: &dyn Host,
     values: Option<&BTreeMap<PathBuf, Value>>,
+    entry: Option<&Path>,
 ) -> Result<Presets, PresetsError> {
     let source_dir = if source_dir.is_absolute() {
         source_dir.to_path_buf()
     } else {
         host.initial_cwd().join(source_dir)
     };
-    let source_dir = if values.is_some() {
-        normalize(&source_dir)
-    } else {
-        host.canonicalize(&source_dir)
-            .unwrap_or_else(|_| normalize(&source_dir))
-    };
+    let source_dir = normalize(&source_dir);
+    load_graph(&source_dir, host, values, entry).map_err(|error| {
+        if values.is_some() {
+            error
+        } else {
+            PresetsError::new(format!(
+                "Could not read presets from {}:\n{error}",
+                source_dir.display()
+            ))
+        }
+    })
+}
+
+fn load_graph(
+    source_dir: &Path,
+    host: &dyn Host,
+    values: Option<&BTreeMap<PathBuf, Value>>,
+    entry: Option<&Path>,
+) -> Result<Presets, PresetsError> {
     let mut graph = FileGraph {
         host,
         values: values.map(|values| {
@@ -183,7 +215,7 @@ pub(crate) fn load(
         file_paths: BTreeMap::new(),
         reachable: BTreeMap::new(),
         presets: Presets {
-            source_dir,
+            source_dir: source_dir.to_path_buf(),
             host_system: host.system().sysname,
             ..Presets::default()
         },
@@ -191,17 +223,19 @@ pub(crate) fn load(
     };
     let project = graph.presets.source_dir.join(PROJECT);
     let user = graph.presets.source_dir.join(USER);
-    let project_value = graph.read(&project)?;
-    let user_value = graph.read(&user)?;
-    if let Some(user_value) = user_value {
-        let implicit = project_value.map(|value| (project.clone(), value));
-        graph.visit(&user, Some(user_value), implicit, 0)?;
-    } else if let Some(project_value) = project_value {
-        graph.visit(&project, Some(project_value), None, 0)?;
+    let roots = if let Some(entry) = entry {
+        let entry = normalize(&host.initial_cwd().join(entry));
+        vec![graph.visit(&entry, None, None, 0)?]
     } else {
-        return Err(file_not_found(&project));
-    }
-    graph.presets.version = [project, user]
+        let user_value = graph.read(&user)?;
+        if let Some(user_value) = user_value {
+            graph.visit(&user, Some(user_value), Some(project.clone()), 0)?;
+            vec![project, user]
+        } else {
+            vec![graph.visit(&project, None, None, 0)?]
+        }
+    };
+    graph.presets.version = roots
         .iter()
         .filter_map(|path| graph.file_paths.get(&graph.identity(path)))
         .filter_map(|path| graph.presets.files.get(path).map(|file| file.version))
@@ -210,17 +244,23 @@ pub(crate) fn load(
     graph.merge()?;
     graph.presets.validate_references(&graph.reachable)?;
     graph.presets.reachable = graph.reachable;
+    if values.is_none() {
+        graph.presets.validate_expansions(&graph.env)?;
+    }
     Ok(graph.presets)
 }
 
 impl FileGraph<'_> {
-    fn read(&self, path: &Path) -> Result<Option<Value>, PresetsError> {
+    fn read(&self, path: &Path) -> Result<Option<Document>, PresetsError> {
         if let Some(values) = &self.values {
             return values
                 .get(path)
                 .map(|value| {
                     schema::check_tree(value)?;
-                    Ok((*value).clone())
+                    Ok(Document {
+                        value: (*value).clone(),
+                        text: None,
+                    })
                 })
                 .transpose();
         }
@@ -251,14 +291,29 @@ impl FileGraph<'_> {
             .map_err(|error| {
                 PresetsError::new(format!("Could not read {}: {error}", path.display()))
             })?;
+        let bytes = bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(&bytes);
+        if bytes.is_empty() {
+            return Err(PresetsError::new("A JSON document cannot be empty"));
+        }
         let options = ReadOptions {
             allow_comments: false,
-            ..ReadOptions::default()
+            dup_keys_last_wins: false,
         };
-        let value = rcmake_json::parse(&bytes, &options)
-            .map_err(|error| PresetsError::new(format!("{}: {error}", path.display())))?;
+        let value = rcmake_json::parse(bytes, &options)
+            .map_err(|error| location::syntax_error(path, bytes, &error))?;
+        if !matches!(value, Value::Object(_) | Value::Array(_)) {
+            return Err(location::diagnostic(
+                path,
+                bytes,
+                0,
+                location::EXPECT_CONTAINER,
+            ));
+        }
         schema::check_tree(&value)?;
-        Ok(Some(value))
+        Ok(Some(Document {
+            value,
+            text: Some(Arc::from(bytes)),
+        }))
     }
 
     fn identity(&self, path: &Path) -> PathBuf {
@@ -274,8 +329,8 @@ impl FileGraph<'_> {
     fn visit(
         &mut self,
         path: &Path,
-        value: Option<Value>,
-        implicit: Option<(PathBuf, Value)>,
+        value: Option<Document>,
+        implicit: Option<PathBuf>,
         depth: usize,
     ) -> Result<PathBuf, PresetsError> {
         schema::depth(depth, "Preset include graph")?;
@@ -297,9 +352,9 @@ impl FileGraph<'_> {
             Some(value) => value,
             None => self.read(path)?.ok_or_else(|| file_not_found(path))?,
         };
-        let (source, root) = read_root(path, &value)?;
-        drop(value);
-        let mut reader = Reader::new(root, &source, "root object");
+        let root = read_root(path, value)?;
+        let source = &root.source;
+        let mut reader = Reader::object(&root, "root object")?;
         let minimum = reader
             .take("cmakeMinimumRequired", 1, 13)?
             .as_ref()
@@ -309,7 +364,11 @@ impl FileGraph<'_> {
         let vendor = reader
             .take("vendor", 1, 13)?
             .as_ref()
-            .map(|field| schema::object(field).cloned())
+            .map(|field| {
+                schema::object(field)
+                    .cloned()
+                    .map_err(|_| field.invalid("Invalid root object"))
+            })
             .transpose()?
             .unwrap_or_default();
         let includes = reader.take("include", 4, 13)?;
@@ -320,7 +379,9 @@ impl FileGraph<'_> {
                 PresetKind::Package | PresetKind::Workflow => 6,
             };
             if let Some(field) = reader.take(key, version, 13)? {
-                for item in schema::array(&field)? {
+                for item in schema::array(&field)
+                    .map_err(|_| field.invalid(format_args!("Invalid \"{key}\" field")))?
+                {
                     self.insert(kind, &item)?;
                 }
             }
@@ -329,15 +390,20 @@ impl FileGraph<'_> {
 
         let mut reachable = BTreeSet::from([path.to_path_buf()]);
         if let Some(includes) = &includes {
-            for include in schema::array(includes)? {
-                let text = expand::include_path(&self.presets, &include, &self.env)?;
+            for include in schema::array(includes)
+                .map_err(|_| includes.invalid("Invalid \"include\" field"))?
+            {
+                let text = expand::include_path(&self.presets, &include, &self.env)
+                    .map_err(|_| include.invalid("Invalid \"include\" field"))?;
                 let dir = path.parent().unwrap_or(&self.presets.source_dir);
                 let included = normalize(&dir.join(path::to_native(text.as_slice())));
                 let included = self.visit(&included, None, None, depth + 1)?;
                 reachable.extend(self.reachable.get(&included).into_iter().flatten().cloned());
             }
         }
-        if let Some((project, value)) = implicit {
+        if let Some(project) = implicit
+            && let Some(value) = self.read(&project)?
+        {
             let project = self.visit(&project, Some(value), None, depth + 1)?;
             reachable.extend(self.reachable.get(&project).into_iter().flatten().cloned());
         }
@@ -359,7 +425,7 @@ impl FileGraph<'_> {
         if self.count > MAX_PRESETS {
             return Err(PresetsError::new("Too many presets"));
         }
-        let record = Record::parse(kind, self.count, field)?;
+        let record = Record::parse(kind, field)?;
         let name = &record.summary.name;
         let records = self.presets.records.entry(kind).or_default();
         if records.contains_key(name) {
@@ -432,7 +498,12 @@ impl Inheritance<'_> {
             self.merge(parent, depth + 1)?;
             if let Some(inherited) = self.merged.get(parent) {
                 merge_fields(&mut record.fields, &inherited.fields, "")?;
-                record.conditions.extend(inherited.conditions.clone());
+                if record.condition.is_none()
+                    && let Some(condition) = &inherited.condition
+                    && !matches!(condition.as_ref(), Condition::Null)
+                {
+                    record.condition = Some(Arc::clone(condition));
+                }
             }
         }
         self.visiting.remove(name);
@@ -504,55 +575,63 @@ pub(crate) fn reachable(
         .is_some_and(|files| files.contains(&to.path))
 }
 
-fn read_root(path: &Path, value: &Value) -> Result<(Arc<Origin>, Fields), PresetsError> {
-    let Value::Object(root) = value else {
-        return Err(PresetsError::new("Invalid Root object"));
+fn read_root(path: &Path, document: Document) -> Result<Field, PresetsError> {
+    let span = document.text.as_deref().and_then(Span::scan);
+    let mut source = Arc::new(Origin {
+        path: path.to_path_buf(),
+        text: document.text,
+        version: 0,
+    });
+    let Value::Object(mut root) = document.value else {
+        return Err(source.invalid(span.as_ref().map(|span| span.start), "Invalid root object"));
     };
-    let version = match root.get(b"version".as_slice()) {
-        Some(Value::Int(version)) => i128::from(*version),
-        Some(Value::UInt(version)) => i128::from(*version),
+    let version_offset = span
+        .as_ref()
+        .and_then(|span| span.member(b"version"))
+        .map(|span| span.start);
+    let version = match root.remove(b"version".as_slice()) {
+        Some(Value::Int(version)) if i32::try_from(version).is_ok() => version as i32,
+        Some(Value::UInt(version)) if i32::try_from(version).is_ok() => version as i32,
         Some(Value::Real(version))
             if version.fract() == 0.0
-                && *version >= f64::from(i32::MIN)
-                && *version <= f64::from(i32::MAX) =>
+                && version >= f64::from(i32::MIN)
+                && version <= f64::from(i32::MAX) =>
         {
-            i128::from(*version as i32)
+            version as i32
         }
-        Some(_) => return Err(PresetsError::new("Invalid \"version\" field")),
+        Some(Value::Null) => return Err(PresetsError::new("Invalid \"version\" field")),
+        Some(_) => return Err(source.invalid(version_offset, "Invalid \"version\" field")),
         None => return Err(PresetsError::new("No \"version\" field")),
     };
     let version = u32::try_from(version)
         .ok()
         .filter(|version| (1..=13).contains(version))
         .ok_or_else(|| {
-            PresetsError::new(format!(
-                "Unrecognized \"version\" {version}: must be >=1 and <=13"
-            ))
+            source.invalid(
+                version_offset,
+                format_args!("Unrecognized \"version\" {version}: must be >=1 and <=13"),
+            )
         })?;
-    let source = Arc::new(Origin {
-        path: path.to_path_buf(),
-        version,
-    });
-    let fields = root
-        .iter()
-        .filter(|(key, _)| key.as_slice() != b"version")
-        .map(|(key, value)| (key.clone(), Field::new(&source, value)))
-        .collect();
-    Ok((source, fields))
+    Arc::make_mut(&mut source).version = version;
+    Ok(Field::new(&source, Value::Object(root), span))
 }
 
 fn minimum_version(field: &Field) -> Result<CmakeVersion, PresetsError> {
-    let mut reader = Reader::object(field, "cmakeMinimumRequired")?;
+    let mut reader = Reader::object(field, "cmakeMinimumRequired")
+        .map_err(|_| field.invalid("Invalid \"cmakeMinimumRequired\""))?;
+    let components = schema::fields(field)?;
+    let read_component = |key: &str, reader: &mut Reader<'_>| -> Result<u32, PresetsError> {
+        let Some(field) = reader.take(key, 1, 13)? else {
+            return Ok(0);
+        };
+        use crate::schema::Decode;
+        u32::decode(&field, &mut schema::literal)
+            .map_err(|_| field.invalid("Invalid \"version\" field"))
+    };
     let version = CmakeVersion {
-        major: reader
-            .optional("major", 1, 13, &mut schema::literal)?
-            .unwrap_or_default(),
-        minor: reader
-            .optional("minor", 1, 13, &mut schema::literal)?
-            .unwrap_or_default(),
-        patch: reader
-            .optional("patch", 1, 13, &mut schema::literal)?
-            .unwrap_or_default(),
+        major: read_component("major", &mut reader)?,
+        minor: read_component("minor", &mut reader)?,
+        patch: read_component("patch", &mut reader)?,
     };
     reader.finish()?;
     let minimum = [
@@ -562,9 +641,12 @@ fn minimum_version(field: &Field) -> Result<CmakeVersion, PresetsError> {
     ];
     for (actual, available, component) in minimum {
         match actual.cmp(&available) {
-            std::cmp::Ordering::Greater => return Err(field.invalid(format_args!(
-                "\"cmakeMinimumRequired\" {component} version {actual} must be less than {available}"
-            ))),
+            std::cmp::Ordering::Greater => {
+                let location = components.get(component.as_bytes()).unwrap_or(field);
+                return Err(location.invalid(format_args!(
+                    "\"cmakeMinimumRequired\" {component} version {actual} must be less than {available}"
+                )));
+            }
             std::cmp::Ordering::Less => break,
             std::cmp::Ordering::Equal => {}
         }
