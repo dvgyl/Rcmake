@@ -1,0 +1,19 @@
+=== CASE cmake-version ===
+# tool: cmake
+# args: --version
+# check_files: false
+
+=== CASE cmake-version-single-dash ===
+# tool: cmake
+# args: -version
+# check_files: false
+
+=== CASE ctest-version ===
+# tool: ctest
+# args: --version
+# check_files: false
+
+=== CASE cpack-version ===
+# tool: cpack
+# args: --version
+# check_files: false

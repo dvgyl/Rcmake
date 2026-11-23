@@ -1,0 +1,22 @@
+{
+  "cmake-version": {
+    "exit_code": 0,
+    "stdout": "cmake version 4.5.1\n\n<VERSION_ATTRIBUTION>\n",
+    "stderr": ""
+  },
+  "cmake-version-single-dash": {
+    "exit_code": 0,
+    "stdout": "cmake version 4.5.1\n\n<VERSION_ATTRIBUTION>\n",
+    "stderr": ""
+  },
+  "cpack-version": {
+    "exit_code": 0,
+    "stdout": "cpack version 4.5.1\n\n<VERSION_ATTRIBUTION>\n",
+    "stderr": ""
+  },
+  "ctest-version": {
+    "exit_code": 0,
+    "stdout": "ctest version 4.5.1\n\n<VERSION_ATTRIBUTION>\n",
+    "stderr": ""
+  }
+}

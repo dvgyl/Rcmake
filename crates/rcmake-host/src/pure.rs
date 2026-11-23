@@ -1,20 +1,21 @@
 //! Deterministic in-memory [`Host`] implementation for fast, reproducible unit tests.
 //!
-//! Full in-memory symlink resolution, permissions, mtime advancing, and scripted
-//! subprocess support are completed in Wave M0-b alongside [`crate::conformance`].
+mod fs;
 
 use core::time::Duration;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
+use std::fmt;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use jiff::tz::TimeZone;
 use rcmake_base::BString;
 
+use self::fs::FileSystem;
 use crate::error::{HostError, HostResult};
 use crate::{
     CopyOptions, DirEntry, FileTime, Follow, Host, Metadata, ReadRange, RunOutput, RunRequest,
-    Stream, SystemInfo, WriteMode,
+    Stream, SystemInfo, WriteMode, validate_run,
 };
 
 /// An ordered stdio output event recorded by [`PureHost`].
@@ -26,20 +27,29 @@ pub struct IoEvent {
     pub bytes: BString,
 }
 
-#[derive(Debug)]
+type CommandHandler = dyn Fn(&PureHost, &RunRequest, &mut dyn FnMut(Stream, &[u8])) -> HostResult<RunOutput>
+    + Send
+    + Sync;
+
 struct PureState {
     env: BTreeMap<BString, BString>,
     events: Vec<IoEvent>,
     cwd: PathBuf,
     exe: PathBuf,
-    now: FileTime,
-    monotonic: Duration,
+    fs: FileSystem,
+    stdin: VecDeque<u8>,
+    handler: Option<Arc<CommandHandler>>,
 }
 
 /// In-memory deterministic [`Host`] with recorded stdio event log and virtual clock.
-#[derive(Debug)]
 pub struct PureHost {
     state: Mutex<PureState>,
+}
+
+impl fmt::Debug for PureHost {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PureHost").finish_non_exhaustive()
+    }
 }
 
 impl Default for PureHost {
@@ -59,15 +69,50 @@ impl PureHost {
             state: Mutex::new(PureState {
                 env: BTreeMap::new(),
                 events: Vec::new(),
+                fs: FileSystem::new(&cwd),
                 cwd,
                 exe,
-                now: FileTime {
-                    secs: 1_700_000_000,
-                    nanos: 0,
-                },
-                monotonic: Duration::ZERO,
+                stdin: VecDeque::new(),
+                handler: None,
             }),
         }
+    }
+
+    fn lock(&self) -> HostResult<MutexGuard<'_, PureState>> {
+        self.state
+            .lock()
+            .map_err(|_| HostError::unsupported("PureHost lock poisoned"))
+    }
+
+    /// Replace the command handler. The handler receives the full request and an output
+    /// callback that forwards chunks only when the request enables tee output.
+    ///
+    /// The handler supplies the process results and can use the host to simulate I/O.
+    pub fn set_command_handler(
+        &self,
+        handler: impl Fn(&Self, &RunRequest, &mut dyn FnMut(Stream, &[u8])) -> HostResult<RunOutput>
+        + Send
+        + Sync
+        + 'static,
+    ) -> HostResult<()> {
+        self.lock()?.handler = Some(Arc::new(handler));
+        Ok(())
+    }
+
+    /// Replace the bytes available to subsequent calls to [`Host::read_stdin`].
+    pub fn seed_stdin(&self, bytes: &[u8]) -> HostResult<()> {
+        self.lock()?.stdin = bytes.iter().copied().collect();
+        Ok(())
+    }
+
+    /// Create any missing parent directories, then write the file.
+    pub fn seed_file(&self, path: &Path, bytes: &[u8]) -> HostResult<()> {
+        crate::require_absolute(path)?;
+        let mut state = self.lock()?;
+        if let Some(parent) = path.parent() {
+            state.fs.create_dir_all(parent)?;
+        }
+        state.fs.write(path, bytes, WriteMode::Truncate)
     }
 
     /// Return a snapshot of all recorded stdio events in order.
@@ -95,158 +140,73 @@ impl PureHost {
 }
 
 impl Host for PureHost {
-    fn metadata(&self, p: &Path, _follow: Follow) -> HostResult<Metadata> {
-        if !p.is_absolute() {
-            return Err(HostError::not_absolute(p.to_path_buf()));
-        }
-        Err(HostError::unsupported(
-            "PureHost::metadata scheduled for M0-b",
-        ))
+    fn metadata(&self, p: &Path, follow: Follow) -> HostResult<Metadata> {
+        self.lock()?.fs.metadata(p, follow)
     }
 
-    fn read(&self, p: &Path, _range: ReadRange) -> HostResult<Vec<u8>> {
-        if !p.is_absolute() {
-            return Err(HostError::not_absolute(p.to_path_buf()));
-        }
-        Err(HostError::unsupported("PureHost::read scheduled for M0-b"))
+    fn read(&self, p: &Path, range: ReadRange) -> HostResult<Vec<u8>> {
+        self.lock()?.fs.read(p, range)
     }
 
-    fn write(&self, p: &Path, _data: &[u8], _mode: WriteMode) -> HostResult<()> {
-        if !p.is_absolute() {
-            return Err(HostError::not_absolute(p.to_path_buf()));
-        }
-        Err(HostError::unsupported("PureHost::write scheduled for M0-b"))
+    fn write(&self, p: &Path, data: &[u8], mode: WriteMode) -> HostResult<()> {
+        self.lock()?.fs.write(p, data, mode)
     }
 
     fn read_dir(&self, p: &Path) -> HostResult<Vec<DirEntry>> {
-        if !p.is_absolute() {
-            return Err(HostError::not_absolute(p.to_path_buf()));
-        }
-        Err(HostError::unsupported(
-            "PureHost::read_dir scheduled for M0-b",
-        ))
+        self.lock()?.fs.read_dir(p)
     }
 
     fn create_dir_all(&self, p: &Path) -> HostResult<()> {
-        if !p.is_absolute() {
-            return Err(HostError::not_absolute(p.to_path_buf()));
-        }
-        Err(HostError::unsupported(
-            "PureHost::create_dir_all scheduled for M0-b",
-        ))
+        self.lock()?.fs.create_dir_all(p)
     }
 
     fn remove_file(&self, p: &Path) -> HostResult<()> {
-        if !p.is_absolute() {
-            return Err(HostError::not_absolute(p.to_path_buf()));
-        }
-        Err(HostError::unsupported(
-            "PureHost::remove_file scheduled for M0-b",
-        ))
+        self.lock()?.fs.remove_file(p)
     }
 
     fn remove_dir(&self, p: &Path) -> HostResult<()> {
-        if !p.is_absolute() {
-            return Err(HostError::not_absolute(p.to_path_buf()));
-        }
-        Err(HostError::unsupported(
-            "PureHost::remove_dir scheduled for M0-b",
-        ))
+        self.lock()?.fs.remove_dir(p)
     }
 
     fn remove_dir_all(&self, p: &Path) -> HostResult<()> {
-        if !p.is_absolute() {
-            return Err(HostError::not_absolute(p.to_path_buf()));
-        }
-        Err(HostError::unsupported(
-            "PureHost::remove_dir_all scheduled for M0-b",
-        ))
+        self.lock()?.fs.remove_dir_all(p)
     }
 
     fn rename(&self, from: &Path, to: &Path) -> HostResult<()> {
-        if !from.is_absolute() {
-            return Err(HostError::not_absolute(from.to_path_buf()));
-        }
-        if !to.is_absolute() {
-            return Err(HostError::not_absolute(to.to_path_buf()));
-        }
-        Err(HostError::unsupported(
-            "PureHost::rename scheduled for M0-b",
-        ))
+        self.lock()?.fs.rename(from, to)
     }
 
-    fn copy_file(&self, from: &Path, to: &Path, _opts: CopyOptions) -> HostResult<()> {
-        if !from.is_absolute() {
-            return Err(HostError::not_absolute(from.to_path_buf()));
-        }
-        if !to.is_absolute() {
-            return Err(HostError::not_absolute(to.to_path_buf()));
-        }
-        Err(HostError::unsupported(
-            "PureHost::copy_file scheduled for M0-b",
-        ))
+    fn copy_file(&self, from: &Path, to: &Path, opts: CopyOptions) -> HostResult<()> {
+        self.lock()?.fs.copy_file(from, to, opts)
     }
 
-    fn symlink(&self, _target: &Path, link: &Path) -> HostResult<()> {
-        if !link.is_absolute() {
-            return Err(HostError::not_absolute(link.to_path_buf()));
-        }
-        Err(HostError::unsupported(
-            "PureHost::symlink scheduled for M0-b",
-        ))
+    fn symlink(&self, target: &Path, link: &Path) -> HostResult<()> {
+        self.lock()?.fs.symlink(target, link)
     }
 
     fn hard_link(&self, src: &Path, dst: &Path) -> HostResult<()> {
-        if !src.is_absolute() {
-            return Err(HostError::not_absolute(src.to_path_buf()));
-        }
-        if !dst.is_absolute() {
-            return Err(HostError::not_absolute(dst.to_path_buf()));
-        }
-        Err(HostError::unsupported(
-            "PureHost::hard_link scheduled for M0-b",
-        ))
+        self.lock()?.fs.hard_link(src, dst)
     }
 
     fn read_link(&self, p: &Path) -> HostResult<PathBuf> {
-        if !p.is_absolute() {
-            return Err(HostError::not_absolute(p.to_path_buf()));
-        }
-        Err(HostError::unsupported(
-            "PureHost::read_link scheduled for M0-b",
-        ))
+        self.lock()?.fs.read_link(p)
     }
 
     fn canonicalize(&self, p: &Path) -> HostResult<PathBuf> {
-        if !p.is_absolute() {
-            return Err(HostError::not_absolute(p.to_path_buf()));
-        }
-        Err(HostError::unsupported(
-            "PureHost::canonicalize scheduled for M0-b",
-        ))
+        self.lock()?.fs.canonicalize(p)
     }
 
-    fn set_permissions(&self, p: &Path, _mode: u32) -> HostResult<()> {
-        if !p.is_absolute() {
-            return Err(HostError::not_absolute(p.to_path_buf()));
-        }
-        Err(HostError::unsupported(
-            "PureHost::set_permissions scheduled for M0-b",
-        ))
+    fn set_permissions(&self, p: &Path, mode: u32) -> HostResult<()> {
+        self.lock()?.fs.set_permissions(p, mode)
     }
 
     fn set_times(
         &self,
         p: &Path,
-        _atime: Option<FileTime>,
-        _mtime: Option<FileTime>,
+        atime: Option<FileTime>,
+        mtime: Option<FileTime>,
     ) -> HostResult<()> {
-        if !p.is_absolute() {
-            return Err(HostError::not_absolute(p.to_path_buf()));
-        }
-        Err(HostError::unsupported(
-            "PureHost::set_times scheduled for M0-b",
-        ))
+        self.lock()?.fs.set_times(p, atime, mtime)
     }
 
     fn env_get(&self, key: &[u8]) -> Option<BString> {
@@ -275,10 +235,20 @@ impl Host for PureHost {
 
     fn run(
         &self,
-        _req: &RunRequest,
-        _on_output: &mut dyn FnMut(Stream, &[u8]),
+        req: &RunRequest,
+        on_output: &mut dyn FnMut(Stream, &[u8]),
     ) -> HostResult<RunOutput> {
-        Err(HostError::unsupported("PureHost::run scheduled for M0-b"))
+        validate_run(req)?;
+        let handler = self
+            .lock()?
+            .handler
+            .clone()
+            .ok_or_else(|| HostError::unsupported("No command handler is registered"))?;
+        handler(self, req, &mut |stream, bytes| {
+            if req.tee {
+                on_output(stream, bytes);
+            }
+        })
     }
 
     fn write_out(&self, stream: Stream, bytes: &[u8]) {
@@ -290,8 +260,12 @@ impl Host for PureHost {
         }
     }
 
-    fn read_stdin(&self, _limit: u64) -> HostResult<Vec<u8>> {
-        Ok(Vec::new())
+    fn read_stdin(&self, limit: u64) -> HostResult<Vec<u8>> {
+        let mut state = self.lock()?;
+        let count = usize::try_from(limit)
+            .unwrap_or(usize::MAX)
+            .min(state.stdin.len());
+        Ok(state.stdin.drain(..count).collect())
     }
 
     fn is_terminal(&self, _stream: Stream) -> bool {
@@ -299,26 +273,19 @@ impl Host for PureHost {
     }
 
     fn now(&self) -> FileTime {
-        self.state.lock().map(|g| g.now).unwrap_or_default()
+        self.state.lock().map(|g| g.fs.now).unwrap_or_default()
     }
 
     fn monotonic(&self) -> Duration {
         self.state
             .lock()
-            .map(|g| g.monotonic)
+            .map(|g| g.fs.monotonic)
             .unwrap_or(Duration::ZERO)
     }
 
     fn sleep(&self, duration: Duration) {
         if let Ok(mut guard) = self.state.lock() {
-            guard.monotonic += duration;
-            let total_nanos = u64::from(guard.now.nanos) + u64::from(duration.subsec_nanos());
-            guard.now.secs = guard
-                .now
-                .secs
-                .saturating_add(i64::try_from(duration.as_secs()).unwrap_or(0))
-                .saturating_add(i64::try_from(total_nanos / 1_000_000_000).unwrap_or(0));
-            guard.now.nanos = u32::try_from(total_nanos % 1_000_000_000).unwrap_or(0);
+            guard.fs.advance(duration);
         }
     }
 
@@ -327,10 +294,7 @@ impl Host for PureHost {
     }
 
     fn current_exe(&self) -> HostResult<PathBuf> {
-        self.state
-            .lock()
-            .map(|g| g.exe.clone())
-            .map_err(|_| HostError::unsupported("PureHost lock poisoned"))
+        Ok(self.lock()?.exe.clone())
     }
 
     fn initial_cwd(&self) -> PathBuf {

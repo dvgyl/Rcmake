@@ -19,6 +19,12 @@ use rcmake_base::{BString, Limits};
 use rcmake_diag::{Diagnostic, SourceId, source::SourceKind};
 use thiserror::Error;
 
+mod lexer;
+mod parser;
+
+#[cfg(test)]
+mod tests;
+
 /// A parsed CMake listfile consisting of a flat command sequence and non-fatal syntax warnings.
 #[derive(Clone, Debug)]
 pub struct ListFile {
@@ -26,7 +32,8 @@ pub struct ListFile {
     pub source: SourceId,
     /// Ordered top-level command invocations.
     pub commands: Arc<[CommandInvocation]>,
-    /// Non-fatal author/syntax warnings emitted during parsing (e.g., adjacent arguments).
+    /// Non-fatal syntax warnings. A warning's file path is empty because the parser
+    /// receives only a source identifier. Resolve the path from [`Self::source`].
     pub warnings: Vec<Diagnostic>,
 }
 
@@ -90,17 +97,13 @@ pub struct ParseError {
 
 /// Parse a CMake 4.5.1 listfile from raw bytes.
 ///
-/// Full lexer, parser, adjacency warnings, and control-flow nesting validation are
-/// implemented in Wave M0-b.
+/// Returns an error for invalid syntax, invalid flow-control nesting, or input that
+/// exceeds the file size limit for files or the value size limit for `EVAL` buffers.
 pub fn parse_list_file(
-    _src: &[u8],
+    src: &[u8],
     source: SourceId,
-    _kind: SourceKind,
-    _limits: &Limits,
+    kind: SourceKind,
+    limits: &Limits,
 ) -> Result<ListFile, ParseError> {
-    Ok(ListFile {
-        source,
-        commands: Arc::from([]),
-        warnings: Vec::new(),
-    })
+    parser::parse(src, source, kind, limits)
 }

@@ -340,3 +340,27 @@ pub trait Host: Send + Sync {
     /// Static host OS and hardware identity.
     fn system(&self) -> SystemInfo;
 }
+
+fn require_absolute(path: &Path) -> HostResult<()> {
+    if path.is_absolute() {
+        Ok(())
+    } else {
+        Err(HostError::not_absolute(path.to_path_buf()))
+    }
+}
+
+fn validate_run(req: &RunRequest) -> HostResult<()> {
+    require_absolute(&req.cwd)?;
+    if let Input::File(path) = &req.stdin {
+        require_absolute(path)?;
+    }
+    for output in [&req.stdout, &req.stderr] {
+        if let Output::File { path, .. } = output {
+            require_absolute(path)?;
+        }
+    }
+    if req.pipeline.is_empty() || req.stdout == Output::SharedWithStdout {
+        return Err(error::from_errno(rustix::io::Errno::INVAL, None));
+    }
+    Ok(())
+}

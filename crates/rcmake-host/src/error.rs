@@ -2,7 +2,7 @@
 //! `" (os error N)"` suffix.
 
 use std::io::ErrorKind;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use thiserror::Error;
 
@@ -60,6 +60,10 @@ impl HostError {
             path: None,
         }
     }
+}
+
+pub(crate) fn from_errno(errno: rustix::io::Errno, path: Option<&Path>) -> HostError {
+    HostError::from_io(errno.into(), path.map(Path::to_path_buf))
 }
 
 fn strip_os_error_suffix(msg: &str) -> &str {

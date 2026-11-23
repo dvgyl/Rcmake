@@ -1,116 +1,250 @@
-//! Isolated black-box differential harness comparing staged `rcmake` binaries against
-//! the pinned official **CMake 4.5.1** oracle.
-//!
-//! By architectural rule, `rcmake-harness` links **zero** core engine crates and
-//! interacts with both `rcmake` and CMake 4.5.1 strictly as black-box subprocesses.
+//! Compare staged Rcmake tools with the CMake 4.5.1 oracle or a recorded baseline.
 
 #![forbid(unsafe_code)]
+#![allow(clippy::print_stdout, clippy::print_stderr)]
 #![allow(
     clippy::disallowed_methods,
-    clippy::print_stdout,
-    clippy::print_stderr,
-    clippy::exit
+    reason = "The harness links zero engine crates."
 )]
 
-use std::path::{Path, PathBuf};
-use std::process::{Command, ExitCode};
+mod case;
+mod run;
 
-fn normalize_banner(text: &str) -> String {
-    text.lines()
-        .map(|line| {
-            if line.starts_with("CMake suite maintained and supported by Kitware")
-                || line.starts_with("Rcmake native Rust drop-in replacement for CMake")
-            {
-                "<VERSION_ATTRIBUTION>"
-            } else {
-                line
+use std::collections::BTreeMap;
+use std::fs;
+use std::io::{self, Write};
+use std::path::{Component, Path};
+use std::process::ExitCode;
+
+use run::Outcome;
+
+type Baseline = BTreeMap<String, Outcome>;
+
+#[derive(Clone, Copy, Default)]
+enum Mode {
+    #[default]
+    Live,
+    Record,
+    Offline,
+}
+
+struct Options {
+    suite: String,
+    mode: Mode,
+    filter: Option<String>,
+}
+
+impl Options {
+    fn parse() -> Result<Self, String> {
+        let mut options = Self {
+            suite: "smoke".to_owned(),
+            mode: Mode::Live,
+            filter: None,
+        };
+        let mut args = std::env::args_os().skip(1).map(|arg| {
+            arg.into_string()
+                .map_err(|_| "Options must be valid UTF-8.".to_owned())
+        });
+        while let Some(arg) = args.next().transpose()? {
+            let mut value = || {
+                args.next()
+                    .transpose()?
+                    .filter(|value| !value.starts_with("--"))
+                    .ok_or_else(|| format!("expected a value for {arg}"))
+            };
+            match arg.as_str() {
+                "--suite" => options.suite = value()?,
+                "--filter" => options.filter = Some(value()?),
+                "--record" if !matches!(options.mode, Mode::Offline) => options.mode = Mode::Record,
+                "--offline" if !matches!(options.mode, Mode::Record) => {
+                    options.mode = Mode::Offline
+                }
+                "--record" | "--offline" => {
+                    return Err("--record and --offline cannot be used together".to_owned());
+                }
+                _ => return Err(format!("unknown option {arg:?}")),
             }
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-fn run_bin(bin: &Path, args: &[&str], cwd: &Path) -> Result<(i32, String, String), String> {
-    let output = Command::new(bin)
-        .args(args)
-        .current_dir(cwd)
-        .env_clear()
-        .env("PATH", "/usr/bin:/bin")
-        .env("LANG", "C")
-        .env("TZ", "UTC")
-        .output()
-        .map_err(|e| format!("failed to execute {}: {e}", bin.display()))?;
-    let code = output.status.code().unwrap_or(-1);
-    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-    Ok((code, stdout, stderr))
-}
-
-fn run_smoke() -> Result<(), String> {
-    let oracle_bin_dir = std::env::var_os("RCMAKE_ORACLE_BIN_DIR")
-        .map(PathBuf::from)
-        .ok_or_else(|| "RCMAKE_ORACLE_BIN_DIR is not set (source env/env.sh first)".to_owned())?;
-    let repo_root = std::env::var_os("RCMAKE_ROOT")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
-    let stage_bin_dir = repo_root.join("target/stage/bin");
-    if !stage_bin_dir.join("cmake").exists() {
-        return Err(format!(
-            "staged binary not found at {}; run scripts/stage.sh first",
-            stage_bin_dir.display()
-        ));
-    }
-
-    let tmp = tempfile::tempdir().map_err(|e| format!("tempdir failed: {e}"))?;
-    let mut passed = 0usize;
-    let cases = [
-        ("cmake", &["--version"][..]),
-        ("ctest", &["--version"][..]),
-        ("cpack", &["--version"][..]),
-    ];
-
-    for (tool, args) in cases {
-        let oracle_exe = oracle_bin_dir.join(tool);
-        let rcmake_exe = stage_bin_dir.join(tool);
-        let (o_code, o_out, o_err) = run_bin(&oracle_exe, args, tmp.path())?;
-        let (r_code, r_out, r_err) = run_bin(&rcmake_exe, args, tmp.path())?;
-
-        let o_norm = normalize_banner(&o_out);
-        let r_norm = normalize_banner(&r_out);
-        if o_code != r_code || o_norm != r_norm || o_err != r_err {
-            return Err(format!(
-                "MISMATCH on `{tool} {}`:\n  exit: oracle={o_code}, rcmake={r_code}\n  oracle stdout: {o_norm:?}\n  rcmake stdout: {r_norm:?}\n  oracle stderr: {o_err:?}\n  rcmake stderr: {r_err:?}",
-                args.join(" ")
-            ));
         }
-        passed += 1;
+        Ok(options)
     }
+}
 
-    println!(
-        "rcmake-harness smoke: {passed}/{} cases matched CMake 4.5.1",
-        cases.len()
-    );
-    Ok(())
+fn suites(case_dir: &Path, suite: &str) -> Result<Vec<String>, String> {
+    if suite != "all" {
+        let mut components = Path::new(suite).components();
+        if !matches!(components.next(), Some(Component::Normal(name)) if name == suite)
+            || components.next().is_some()
+        {
+            return Err(format!("invalid suite name {suite:?}"));
+        }
+        return Ok(vec![suite.to_owned()]);
+    }
+    let scan = || -> io::Result<Vec<String>> {
+        let mut names = Vec::new();
+        for entry in fs::read_dir(case_dir)? {
+            let path = entry?.path();
+            if path.extension().is_some_and(|ext| ext == "case")
+                && let Some(name) = path.file_stem().and_then(|name| name.to_str())
+                && !name.starts_with("._")
+            {
+                names.push(name.to_owned());
+            }
+        }
+        names.sort();
+        Ok(names)
+    };
+    scan().map_err(|error| format!("{}: {error}", case_dir.display()))
+}
+
+fn read_baseline(path: &Path, allow_missing: bool) -> Result<Baseline, String> {
+    let read = || -> io::Result<Baseline> {
+        match run::read_text(path) {
+            Ok(text) => Ok(serde_json::from_str(&text)?),
+            Err(error) if allow_missing && error.kind() == io::ErrorKind::NotFound => {
+                Ok(Baseline::new())
+            }
+            Err(error) => Err(error),
+        }
+    };
+    read().map_err(|error| format!("{}: {error}", path.display()))
+}
+
+fn write_baseline(dir: &Path, path: &Path, baseline: &Baseline) -> Result<(), String> {
+    let write = || -> io::Result<()> {
+        fs::create_dir_all(dir)?;
+        let mut output = tempfile::NamedTempFile::new_in(dir)?;
+        serde_json::to_writer_pretty(&mut output, baseline)?;
+        writeln!(output)?;
+        run::check_size(output.as_file().metadata()?.len())?;
+        output.persist(path)?;
+        Ok(())
+    };
+    write().map_err(|error| format!("{}: {error}", path.display()))
+}
+
+fn run_suites(options: &Options) -> Result<bool, String> {
+    let root = match std::env::var_os("RCMAKE_ROOT") {
+        Some(path) => std::path::absolute(path),
+        None => std::env::current_dir(),
+    }
+    .map_err(|error| format!("cannot resolve the Rcmake root: {error}"))?;
+    let case_dir = root.join("conformance/cases");
+    let baseline_dir = root.join("conformance/baselines");
+    let stage = root.join("target/stage/bin");
+    let oracle = if matches!(options.mode, Mode::Offline) {
+        None
+    } else {
+        let path = std::env::var_os("RCMAKE_ORACLE_BIN_DIR")
+            .ok_or_else(|| "RCMAKE_ORACLE_BIN_DIR is unset. Source env/env.sh.".to_owned())?;
+        Some(
+            std::path::absolute(path)
+                .map_err(|error| format!("cannot resolve the oracle path: {error}"))?,
+        )
+    };
+
+    let mut total = 0;
+    let mut all_passed = true;
+    for suite in suites(&case_dir, &options.suite)? {
+        let case_path = case_dir.join(format!("{suite}.case"));
+        let baseline_path = baseline_dir.join(format!("{suite}.json"));
+        let cases = run::read_text(&case_path)
+            .map_err(|error| format!("{}: {error}", case_path.display()))?;
+        let cases =
+            case::parse(&cases).map_err(|error| format!("{}: {error}", case_path.display()))?;
+        let mut selected = cases
+            .into_iter()
+            .filter(|case| {
+                options
+                    .filter
+                    .as_ref()
+                    .is_none_or(|filter| case.name.contains(filter))
+            })
+            .peekable();
+        if selected.peek().is_none() {
+            continue;
+        }
+        let mut baseline = match options.mode {
+            Mode::Offline => read_baseline(&baseline_path, false)?,
+            Mode::Record if options.filter.is_some() => read_baseline(&baseline_path, true)?,
+            _ => Baseline::new(),
+        };
+        let mut count = 0;
+        let mut matched = 0;
+        for case in selected {
+            count += 1;
+            let tool = case.tool.name();
+            let live = oracle
+                .as_ref()
+                .map(|dir| run::execute(&dir.join(tool), &case))
+                .transpose()?;
+            if matches!(options.mode, Mode::Record)
+                && let Some(outcome) = live
+            {
+                baseline.insert(case.name, outcome);
+                continue;
+            }
+            let expected = live
+                .as_ref()
+                .or_else(|| baseline.get(&case.name))
+                .ok_or_else(|| {
+                    format!(
+                        "{} has no entry for {}. Run --record.",
+                        baseline_path.display(),
+                        case.name
+                    )
+                })?;
+            let staged_exe = stage.join(tool);
+            if !staged_exe.is_file() {
+                return Err(format!(
+                    "Missing {}. Run scripts/stage.sh.",
+                    staged_exe.display()
+                ));
+            }
+            let actual = run::execute(&staged_exe, &case)?;
+            if *expected == actual {
+                matched += 1;
+            } else {
+                let label = if live.is_some() { "oracle" } else { "baseline" };
+                let metadata = if case.expect_fail_allowed {
+                    " (expect_fail_allowed=true)"
+                } else {
+                    ""
+                };
+                eprintln!(
+                    "Mismatch in {suite}/{}{metadata}\n{}",
+                    case.name,
+                    expected.diff(&actual, label).map_err(|error| {
+                        format!("cannot render the diff for {suite}/{}: {error}", case.name)
+                    })?
+                );
+            }
+        }
+        total += count;
+        if matches!(options.mode, Mode::Record) {
+            write_baseline(&baseline_dir, &baseline_path, &baseline)?;
+            println!("rcmake-harness {suite}: Recorded {count} cases from CMake 4.5.1");
+        } else {
+            let expected = if matches!(options.mode, Mode::Live) {
+                "CMake 4.5.1"
+            } else {
+                "the recorded baseline"
+            };
+            println!("rcmake-harness {suite}: {matched}/{count} cases matched {expected}");
+            all_passed &= matched == count;
+        }
+    }
+    if total == 0 {
+        return Err("No cases matched the suite and filter.".to_owned());
+    }
+    Ok(all_passed)
 }
 
 fn main() -> ExitCode {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let suite = if args.first().map(String::as_str) == Some("--suite") {
-        args.get(1).map(String::as_str).unwrap_or("smoke")
-    } else {
-        "smoke"
-    };
-
-    match suite {
-        "smoke" => match run_smoke() {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(err) => {
-                eprintln!("rcmake-harness ERROR: {err}");
-                ExitCode::FAILURE
-            }
-        },
-        other => {
-            eprintln!("rcmake-harness ERROR: unknown suite `{other}` (expected `smoke`)");
+    match Options::parse().and_then(|options| run_suites(&options)) {
+        Ok(true) => ExitCode::SUCCESS,
+        Ok(false) => ExitCode::FAILURE,
+        Err(error) => {
+            eprintln!("rcmake-harness: {error}");
             ExitCode::FAILURE
         }
     }
