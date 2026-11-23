@@ -28,6 +28,7 @@ use sources::{SourcePaths, TargetInputs, external_object};
 use usage::{ResolvedLinkItem, ResolvedLinkKind, UsageResolver};
 
 mod sources;
+mod unity;
 
 pub mod lower;
 pub mod usage;
@@ -527,6 +528,7 @@ pub fn resolve(
         configs.to_vec()
     };
     let mut paths = SourcePaths::new(host);
+    paths.unity = Some(unity::prepare(model, host, &mut paths, &configs)?);
     let mut targets = Vec::new();
     let mut graphs = Vec::with_capacity(configs.len());
     for config in &configs {
@@ -755,12 +757,24 @@ fn resolve_target<'a>(
     let mut groups = IndexMap::new();
     let (file_sets, members) = collect_file_sets(model, paths, usage, id, ctx)?;
     let sources = usage.collect_property(id, b"SOURCES", ctx)?.entries;
-    for mut source in sources
+    let unity = paths.unity.as_ref().and_then(|plan| plan.get(&id));
+    let collect_unity = paths.unity.is_none() && unity::enabled(target);
+    let unity_sources = unity.into_iter().flat_map(|plan| {
+        plan.files
+            .iter()
+            .map(|(path, file)| (BT::new(path.clone(), target.backtrace.clone()), Some(file)))
+    });
+    let original_sources = sources
         .into_iter()
         .chain(members.values().map(|member| member.source.clone()))
-    {
-        source.value = paths.resolve_at(model, dir, &source)?;
-        if !inputs.sources.insert(source.value.clone()) {
+        .map(|source| (source, None));
+    for (mut source, unity_file) in unity_sources.chain(original_sources) {
+        if unity_file.is_none() {
+            source.value = paths.resolve_at(model, dir, &source)?;
+        }
+        if !inputs.sources.insert(source.value.clone())
+            || unity.is_some_and(|plan| plan.batched.contains(&source.value))
+        {
             continue;
         }
         let owner = paths.object_owner(&source.value);
@@ -779,32 +793,48 @@ fn resolve_target<'a>(
             continue;
         }
         let member = members.get(&source.value);
+        let source_props = sources::properties(dir, &source.value);
+        if member.is_some_and(|member| member.set.kind == FileSetKind::Headers) {
+            continue;
+        }
         let module = member.filter(|member| member.set.kind == FileSetKind::CxxModules);
-        let source_props = dir.source_props.get(&source.value);
-        let language = member
-            .and_then(|member| member.set.props.get(b"LANGUAGE"))
-            .filter(|language| !language.is_empty())
-            .cloned()
-            .or_else(|| lower::source_language(model, target, &source.value));
+        let header_only = source_props
+            .get(b"HEADER_FILE_ONLY")
+            .is_some_and(|value| truth::is_on(value));
+        let language = if header_only {
+            None
+        } else {
+            unity_file
+                .map(|file| file.language.clone())
+                .or_else(|| {
+                    member
+                        .and_then(|member| member.set.props.get(b"LANGUAGE"))
+                        .or_else(|| source_props.get(b"LANGUAGE"))
+                        .filter(|language| !language.is_empty())
+                        .cloned()
+                })
+                .or_else(|| lower::source_language(model, target, &source.value))
+        };
         if module.is_some() {
             validate_module_source(model, paths, target, &source.value, language.as_ref())?;
         }
         let Some(language) = language else { continue };
+        if collect_unity && let Some(group) = unity::source_group(id, source_props, member) {
+            inputs.unity_groups.insert(source.value.clone(), group);
+        }
         let group_key = (
             language.clone(),
             member.map(|member| member.id),
-            source_props
-                .filter(|props| {
-                    [
-                        b"COMPILE_OPTIONS".as_slice(),
-                        b"COMPILE_FLAGS",
-                        b"COMPILE_DEFINITIONS",
-                        b"INCLUDE_DIRECTORIES",
-                    ]
-                    .iter()
-                    .any(|name| props.get(name).is_some())
-                })
-                .map(|_| source.value.clone()),
+            [
+                b"COMPILE_OPTIONS".as_slice(),
+                b"COMPILE_FLAGS",
+                b"COMPILE_DEFINITIONS",
+                b"INCLUDE_DIRECTORIES",
+            ]
+            .iter()
+            .any(|name| source_props.get(name).is_some())
+            .then(|| source.value.clone()),
+            unity_file.map(|file| (file.relocatable, file.config_guard)),
         );
         let (group, facts) = match groups.entry(group_key) {
             Entry::Occupied(entry) => (entry.index(), entry.into_mut()),
@@ -854,20 +884,35 @@ fn resolve_target<'a>(
                     source_props,
                     &mut facts,
                 )?;
+                if let Some(file) = unity_file {
+                    file.apply_compile_properties(model, &ctx.config, &mut facts);
+                }
                 let facts = entry.insert(facts);
                 (group, facts)
             }
         };
         facts.units.push(resolved.compile_units.len());
+        let object = unity_file.map_or_else(
+            || lower::object_path(model, target, &ctx.config, &source.value),
+            |file| file.object_path(model, target, &ctx.config, &source.value),
+        );
         resolved.compile_units.push(CompileUnit {
-            object: lower::object_path(model, target, &ctx.config, &source.value),
+            object,
             source,
             group,
             scan: false,
         });
     }
     resolved.compile_groups = groups.into_values().collect();
-    resolve_module_info(model, target, &inputs, &mut resolved, file_sets, &members);
+    resolve_module_info(
+        model,
+        target,
+        &inputs,
+        &mut resolved,
+        file_sets,
+        &members,
+        unity,
+    );
     if file_sets || resolved.compile_units.iter().any(|unit| unit.scan) {
         validate_module_scanning(model, paths, target, &inputs, file_sets)?;
     }
@@ -1067,6 +1112,7 @@ fn resolve_module_info(
     resolved: &mut ResolvedTarget,
     has_module_sets: bool,
     members: &IndexMap<BString, FileSetMember<'_>>,
+    unity: Option<&unity::TargetUnity>,
 ) {
     let allows_scanning = allows_module_scanning(model, target, inputs);
     let by_default = target.policies.policies.get(PolicyId::new(155)) == PolicyStatus::New
@@ -1079,6 +1125,9 @@ fn resolve_module_info(
     let mut destinations = IndexMap::new();
     let mut units = Vec::new();
     for (index, unit) in resolved.compile_units.iter_mut().enumerate() {
+        if unity.is_some_and(|plan| plan.files.contains_key(&unit.source.value)) {
+            continue;
+        }
         let member = members.get(&unit.source.value);
         if let Some(member) = member.filter(|member| member.set.kind == FileSetKind::CxxModules) {
             let visibility = match member.set.scope {
@@ -1119,9 +1168,7 @@ fn resolve_module_info(
             unit.scan = member
                 .and_then(|member| member.set.props.get(b"CXX_SCAN_FOR_MODULES"))
                 .or_else(|| {
-                    dir.source_props
-                        .get(&unit.source.value)
-                        .and_then(|props| props.get(b"CXX_SCAN_FOR_MODULES"))
+                    sources::properties(dir, &unit.source.value).get(b"CXX_SCAN_FOR_MODULES")
                 })
                 .or(target_setting)
                 .map_or(by_default, |value| truth::is_on(value));

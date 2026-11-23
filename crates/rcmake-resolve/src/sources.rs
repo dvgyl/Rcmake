@@ -20,12 +20,12 @@ pub(crate) fn apply_compile_properties(
     ctx: &EvalContext,
     source: &BT<BString>,
     member: Option<&FileSetMember<'_>>,
-    source_props: Option<&PropertyMap>,
+    source_props: SourceProperties<'_>,
     group: &mut CompileGroup,
 ) -> Result<(), ResolveError> {
     let mut ctx = ctx.clone();
     ctx.head = Some(usage::handle(target));
-    if let Some(value) = source_props.and_then(|props| props.get(b"COMPILE_FLAGS")) {
+    if let Some(value) = source_props.get(b"COMPILE_FLAGS") {
         let entry = BT::new(value.clone(), source.backtrace.clone());
         let flags = usage.eval_source_compile_flags(target, &entry, &ctx)?;
         append_compile_flags(&mut group.flags, &flags, entry.backtrace);
@@ -35,7 +35,7 @@ pub(crate) fn apply_compile_properties(
         b"COMPILE_DEFINITIONS",
         b"INCLUDE_DIRECTORIES",
     ] {
-        let source_values = match source_props.and_then(|props| props.get(name)) {
+        let source_values = match source_props.get(name) {
             Some(value) => usage.file_set_paths(
                 target,
                 name,
@@ -104,12 +104,14 @@ pub(crate) struct TargetInputs {
     pub(crate) sources: IndexSet<BString>,
     pub(crate) objects: IndexSet<BString>,
     pub(crate) standard_requirements: IndexMap<BString, &'static [u8]>,
+    pub(crate) unity_groups: IndexMap<BString, Option<BString>>,
 }
 
 pub(crate) struct SourcePaths<'a> {
     host: &'a dyn Host,
     generated: IndexSet<BString>,
     objects: IndexMap<BString, TargetId>,
+    pub(crate) unity: Option<crate::unity::UnityPlan>,
 }
 
 impl<'a> SourcePaths<'a> {
@@ -118,6 +120,7 @@ impl<'a> SourcePaths<'a> {
             host,
             generated: IndexSet::new(),
             objects: IndexMap::new(),
+            unity: None,
         }
     }
 
@@ -256,6 +259,38 @@ impl<'a> SourcePaths<'a> {
 pub(crate) fn external_object(dir: &Directory, path: &BString) -> bool {
     source_flag(dir, path, b"EXTERNAL_OBJECT")
         || matches!(Lexical::new(path).stem_extension(true).1, b".o" | b".obj")
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct SourceProperties<'a> {
+    path: Option<&'a PropertyMap>,
+    relative: Option<&'a PropertyMap>,
+}
+
+impl<'a> SourceProperties<'a> {
+    pub(crate) fn get(self, name: &[u8]) -> Option<&'a BString> {
+        self.path
+            .and_then(|props| props.get(name))
+            .or_else(|| self.relative.and_then(|props| props.get(name)))
+    }
+}
+
+pub(crate) fn properties<'a>(dir: &'a Directory, source: &BString) -> SourceProperties<'a> {
+    let relative = || {
+        let binary = Lexical::new(&dir.binary_dir);
+        let source = Lexical::new(source);
+        if !binary.prefix(source) {
+            return None;
+        }
+        // A property may use the relative name of a source in the build tree.
+        let relative = source.relative(binary)?;
+        dir.source_props
+            .get(&absolute_path(&dir.source_dir, &relative))
+    };
+    SourceProperties {
+        path: dir.source_props.get(source),
+        relative: relative(),
+    }
 }
 
 fn source_flag(dir: &Directory, source: &BString, property: &[u8]) -> bool {

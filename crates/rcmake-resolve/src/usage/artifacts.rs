@@ -1,10 +1,13 @@
 use indexmap::IndexSet;
-use rcmake_base::{BString, list, path_lex::Lexical};
+use rcmake_base::{BString, list, path_lex::Lexical, truth};
 use rcmake_genex::{ArtifactKind, ArtifactPart, ConfigId, EvalContext};
-use rcmake_model::{BT, DirId, Target, TargetId, TargetKind};
+use rcmake_model::{BT, DirId, FileSetKind, Target, TargetId, TargetKind};
 
 use super::{UsageResolver, handle, host::definition, on};
-use crate::{absolute_path, lower, sources::external_object};
+use crate::{
+    absolute_path, lower,
+    sources::{external_object, properties},
+};
 
 struct Artifact {
     path: BString,
@@ -384,7 +387,12 @@ impl UsageResolver<'_> {
                 .collect::<IndexSet<_>>()
         });
         let binary_root = &self.model.dir(DirId::ROOT).binary_dir;
+        let unity = self
+            .source_paths
+            .and_then(|paths| paths.unity.as_ref())
+            .and_then(|plan| plan.get(&id));
         let mut file_set_sources = Vec::new();
+        let mut file_set_headers = IndexSet::new();
         for (_, set) in resolver.source_file_sets(id, &ctx).ok()? {
             let owner = self.model.target(set.target)?;
             let dir = self.model.dir(owner.dir);
@@ -396,6 +404,10 @@ impl UsageResolver<'_> {
                     .source_paths
                     .and_then(|paths| paths.find(dir, &entry.value))
                     .unwrap_or_else(|| absolute_path(&dir.source_dir, &entry.value));
+                if set.kind == FileSetKind::Headers {
+                    file_set_headers.insert(source);
+                    continue;
+                }
                 file_set_sources.push((
                     source,
                     set.props
@@ -404,23 +416,37 @@ impl UsageResolver<'_> {
                 ));
             }
         }
-        let files = value
-            .entries
+        let files = unity
             .into_iter()
-            .map(|entry| (path(&entry.value), false))
-            .chain(file_set_sources)
+            .flat_map(|plan| plan.files.keys())
+            .map(|path| (path.clone(), true))
+            .chain(
+                value
+                    .entries
+                    .into_iter()
+                    .map(|entry| (path(&entry.value), false))
+                    .chain(file_set_sources),
+            )
             .filter(|(source, _)| {
                 source_filter
                     .as_ref()
                     .is_none_or(|filter| filter.contains(source))
             })
             .filter(|(source, explicit_language)| {
-                !external_object(dir, source)
+                unity.is_none_or(|plan| !plan.batched.contains(source))
+                    && !external_object(dir, source)
+                    && !file_set_headers.contains(source)
+                    && !properties(dir, source)
+                        .get(b"HEADER_FILE_ONLY")
+                        .is_some_and(|value| truth::is_on(value))
                     && (*explicit_language
                         || lower::source_language(self.model, target, source).is_some())
             })
             .map(|(source, _)| {
-                let object = lower::object_path(self.model, target, config, &source);
+                let object = unity.and_then(|plan| plan.files.get(&source)).map_or_else(
+                    || lower::object_path(self.model, target, config, &source),
+                    |file| file.object_path(self.model, target, config, &source),
+                );
                 absolute_path(binary_root, &object)
             })
             .collect::<IndexSet<_>>();

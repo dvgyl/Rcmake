@@ -1,8 +1,8 @@
 //! Artifact names and source classification.
 
-use rcmake_base::{BString, list, path_lex::Lexical, truth};
+use rcmake_base::{BString, hash::HashAlgo, list, path_lex::Lexical, truth};
 use rcmake_genex::ConfigId;
-use rcmake_model::{DirId, ProjectModel, Target, TargetKind};
+use rcmake_model::{DirId, GeneratorKind, ProjectModel, Target, TargetKind};
 
 use super::{definition, join, target_property};
 use crate::ArtifactSet;
@@ -187,18 +187,48 @@ fn multi_config(model: &ProjectModel) -> bool {
         .is_some_and(|generator| generator.multi_config())
 }
 
-fn object_dir(model: &ProjectModel, target: &Target, config: &ConfigId) -> BString {
+pub(crate) fn object_dir(model: &ProjectModel, target: &Target, config: &ConfigId) -> BString {
     let binary = &model.dir(target.dir).binary_dir;
     let relative = build_relative(model, binary);
-    let dir = join(
-        &relative,
-        &[b"CMakeFiles/", target.name.as_slice(), b".dir"].concat(),
-    );
+    let dir = if short_object_paths(model) {
+        let directory = if relative.is_empty() {
+            b".".as_slice()
+        } else {
+            &relative
+        };
+        let name_hash = sha3_prefix(&target.name, 4);
+        let directory_hash = sha3_prefix(directory, 4);
+        let short = format!(".o/{name_hash}{directory_hash}");
+        if model.generator == Some(GeneratorKind::UnixMakefiles) {
+            join(&relative, short.as_bytes())
+        } else {
+            short.into()
+        }
+    } else {
+        join(
+            &relative,
+            &[b"CMakeFiles/", target.name.as_slice(), b".dir"].concat(),
+        )
+    };
     if multi_config(model) {
         join(&dir, &config.0)
     } else {
         dir
     }
+}
+
+pub(crate) fn short_object_paths(model: &ProjectModel) -> bool {
+    model.generator.is_some()
+        && model
+            .cache
+            .get(b"CMAKE_INTERMEDIATE_DIR_STRATEGY")
+            .is_some_and(|entry| entry.value == "SHORT")
+}
+
+fn sha3_prefix(input: &[u8], length: usize) -> String {
+    let mut digest = HashAlgo::Sha3_512.hex_digest(input);
+    digest.truncate(length);
+    digest
 }
 
 pub(crate) fn build_relative(model: &ProjectModel, path: &[u8]) -> BString {
@@ -232,17 +262,14 @@ fn list_path<'a>(parts: impl Iterator<Item = &'a [u8]>) -> BString {
 pub fn source_language(model: &ProjectModel, target: &Target, source: &[u8]) -> Option<BString> {
     let directory = model.dir(target.dir);
     let absolute = Lexical::new(&join(&directory.source_dir, source)).normalize();
-    let props = directory.source_props.get(&absolute);
+    let props = crate::sources::properties(directory, &absolute);
     if props
-        .and_then(|p| p.get(b"HEADER_FILE_ONLY"))
+        .get(b"HEADER_FILE_ONLY")
         .is_some_and(|v| truth::is_on(v))
     {
         return None;
     }
-    if let Some(language) = props
-        .and_then(|p| p.get(b"LANGUAGE"))
-        .filter(|v| !v.is_empty())
-    {
+    if let Some(language) = props.get(b"LANGUAGE").filter(|v| !v.is_empty()) {
         return Some(language.clone());
     }
     let (_, extension) = Lexical::new(source).stem_extension(true);
@@ -320,6 +347,22 @@ pub fn object_path(
         .flatten()
         .min_by_key(rank);
 
+    let suffix = source_language(model, target, source)
+        .and_then(|lang| {
+            definition(
+                model,
+                target.dir,
+                &[b"CMAKE_", lang.as_slice(), b"_OUTPUT_EXTENSION"].concat(),
+            )
+        })
+        .map_or(b".o".as_slice(), |v| v.as_slice());
+    if short_object_paths(model) {
+        let hash_input = relative.unwrap_or_else(|| absolute.normalize());
+        let hash = sha3_prefix(&hash_input, 8);
+        let name = [hash.as_bytes(), suffix].concat();
+        return join(&object_dir(model, target, config), &name);
+    }
+
     let mut relative = if let Some(path) = relative {
         let mut parts = Lexical::new(&path).components().peekable();
         let mut relative = BString::default();
@@ -342,15 +385,6 @@ pub fn object_path(
         }
         join(&path, &list_path(absolute.components().skip(parent_count)))
     };
-    let suffix = source_language(model, target, source)
-        .and_then(|lang| {
-            definition(
-                model,
-                target.dir,
-                &[b"CMAKE_", lang.as_slice(), b"_OUTPUT_EXTENSION"].concat(),
-            )
-        })
-        .map_or(b".o".as_slice(), |v| v.as_slice());
     relative.extend_from_slice(suffix);
     join(&object_dir(model, target, config), &relative)
 }

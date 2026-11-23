@@ -782,6 +782,80 @@ fn target_objects_source_links_the_producer_object() -> TestResult {
 }
 
 #[test]
+fn unity_objects_use_shared_sources_and_config_specific_objects() -> TestResult {
+    let mut model = project();
+    model.generator = Some(rcmake_model::GeneratorKind::NinjaMultiConfig);
+    let mut library = target(
+        "obj",
+        TargetKind::ObjectLibrary,
+        &["always.c", "$<$<CONFIG:Debug>:debug.c>", "separate.c"],
+    );
+    library.props.set("UNITY_BUILD".into(), "ON".into());
+    let object_id = model.add_target(library)?;
+    model.add_target(target(
+        "app",
+        TargetKind::Executable,
+        &["$<TARGET_OBJECTS:obj>", "main.c"],
+    ))?;
+    model
+        .dir_mut(DirId::ROOT)
+        .source_props
+        .entry("/src/separate.c".into())
+        .or_default()
+        .set("COMPILE_OPTIONS".into(), "-DSEPARATE".into());
+    let host = PureHost::default();
+    for source in [
+        "/src/always.c",
+        "/src/debug.c",
+        "/src/separate.c",
+        "/src/main.c",
+    ] {
+        host.seed_file(Path::new(source), b"")?;
+    }
+
+    let configs = [ConfigId("Debug".into()), ConfigId("Release".into())];
+    let result = resolve(&model, &host, &configs)?;
+    let unity_file = "/out/CMakeFiles/obj.dir/Unity/unity_0_c.c";
+    let content = host.read(
+        Path::new(unity_file),
+        rcmake_host::ReadRange::All { limit: 4096 },
+    )?;
+    let content = String::from_utf8(content)?;
+    assert!(content.contains("#include \"/src/always.c\""));
+    assert!(content.contains("#if defined(CMAKE_UNITY_CONFIG_DEBUG)"));
+    assert!(content.contains("#include \"/src/debug.c\""));
+    assert!(!content.contains("separate.c"));
+    for (config, graph) in configs.iter().zip(&result.graphs) {
+        let facts = result
+            .targets
+            .iter()
+            .find(|target| target.id == object_id && target.config == *config)
+            .ok_or("Missing object library.")?;
+        let [unity, separate] = facts.compile_units.as_slice() else {
+            return Err("Expected one unity unit and one separate unit.".into());
+        };
+        assert_eq!(unity.source.value, unity_file);
+        assert_eq!(
+            unity.object,
+            format!("CMakeFiles/obj.dir/{}/Unity/unity_0_c.c.o", config.0)
+        );
+        let definition = format!(
+            "CMAKE_UNITY_CONFIG_{}",
+            config.0.to_string().to_ascii_uppercase()
+        );
+        assert!(
+            facts.compile_groups[unity.group]
+                .defines
+                .iter()
+                .any(|define| define.value == definition)
+        );
+        assert_object_input(graph, "app", &unity.object)?;
+        assert_object_input(graph, "app", &separate.object)?;
+    }
+    Ok(())
+}
+
+#[test]
 fn direct_link_to_object_library_includes_objects_and_usage() -> TestResult {
     let mut model = project();
     let mut obj = target("obj", TargetKind::ObjectLibrary, &["a.cpp"]);

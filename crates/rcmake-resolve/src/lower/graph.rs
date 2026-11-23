@@ -3,7 +3,7 @@
 use indexmap::{IndexMap, IndexSet};
 use rcmake_base::{BString, list, truth};
 use rcmake_genex::ConfigId;
-use rcmake_model::{ProjectModel, Target, TargetEvent, TargetId, TargetKind};
+use rcmake_model::{DirId, ProjectModel, Target, TargetEvent, TargetId, TargetKind};
 
 use super::artifacts::build_relative;
 use super::compile::compile;
@@ -61,6 +61,7 @@ pub(crate) fn lower_with_inputs(
         ..BuildGraph::default()
     };
     let commands = Commands::new(model, &resolved, config, usage, &mut graph.steps)?;
+    let mut unity_prerequisites = Vec::new();
     for (target, resolved) in local {
         let mut dependencies: IndexSet<_> = resolved.dependencies.iter().copied().collect();
         dependencies.extend(
@@ -97,6 +98,33 @@ pub(crate) fn lower_with_inputs(
         }
 
         let artifacts = artifacts(model, target, resolved);
+        let unity_prerequisite = if !steps.is_empty()
+            && usage
+                .source_paths()
+                .and_then(|paths| paths.unity.as_ref())
+                .and_then(|plan| plan.get(&resolved.id))
+                .is_some_and(|plan| !plan.files.is_empty())
+        {
+            // An included source can be an output of a custom command.
+            let index = target_indices.len() + unity_prerequisites.len();
+            let mut name = BString::from(format!("cmake_object_order_depends_unity_{index}"));
+            while model.find_target(DirId::ROOT, &name).is_some() {
+                name.push(b'_');
+            }
+            unity_prerequisites.push(GraphTarget {
+                name,
+                steps: std::mem::take(&mut steps).into_iter().collect(),
+                depends: dependencies
+                    .iter()
+                    .filter(|id| **id != resolved.id)
+                    .filter_map(|id| target_indices.get(id).copied())
+                    .collect(),
+                in_all: false,
+            });
+            Some(index)
+        } else {
+            None
+        };
         let mut objects = target_inputs
             .into_iter()
             .flat_map(|inputs| inputs.objects.iter().cloned())
@@ -223,6 +251,7 @@ pub(crate) fn lower_with_inputs(
                 .iter()
                 .filter(|id| **id != resolved.id)
                 .filter_map(|id| target_indices.get(id).copied())
+                .chain(unity_prerequisite)
                 .collect(),
             in_all: !resolved.metadata.exclude_from_all
                 && !excluded(model, target)
@@ -230,6 +259,7 @@ pub(crate) fn lower_with_inputs(
                     || !resolved.compile_units.is_empty()),
         });
     }
+    graph.targets.extend(unity_prerequisites);
     Ok(graph)
 }
 
