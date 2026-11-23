@@ -2289,3 +2289,17 @@ fn variable_watch_stack_lists_files_and_function_scopes() {
         )
     );
 }
+
+#[test]
+fn registry_add_replaces_earlier_registrations() {
+    let mut registry = crate::Registry::default();
+    let flags = CmdFlags { scriptable: true };
+    registry.add_raw("x_cmd", t_noop, flags);
+    registry.add("X_CMD", t_set, CmdFlags { scriptable: false });
+    assert!(!registry.takes_raw_args(b"x_cmd"));
+    let Some((func, got)) = registry.get(b"x_cmd") else {
+        panic!("command is not registered");
+    };
+    assert!(!got.scriptable);
+    assert!(std::ptr::fn_addr_eq(func, t_set as crate::BuiltinFn));
+}

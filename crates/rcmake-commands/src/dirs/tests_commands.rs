@@ -43,6 +43,8 @@ fn add_test(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
         command_expand_lists: false,
         old_style,
         props: Default::default(),
+        build_depends: Vec::new(),
+        kind: rcmake_model::TestKind::Single,
     };
     if old_style {
         test.command.extend(args.iter().copied().map(BString::from));

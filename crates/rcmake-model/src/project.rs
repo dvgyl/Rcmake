@@ -1,15 +1,17 @@
 //! The arena-based [`ProjectModel`] and its scoped property API.
 
+use std::collections::BTreeSet;
+
 use indexmap::IndexMap;
 use rcmake_base::{BString, list};
 use rcmake_diag::Backtrace;
 
 use crate::target::join_entries;
 use crate::{
-    AppendMode, BT, Cache, CacheEntry, CacheType, CommandId, CustomCommand, DirId, Directory,
-    ExportSet, FileSet, FileSetId, GeneratorKind, GlobalState, ImportedVisibility, InstallRule,
-    LinkItem, PropOrigin, PropScope, Target, TargetBinding, TargetId, TargetOrigin, TestEntry,
-    TestId, UsageField, UsageProps,
+    AppendMode, BT, BuildExport, Cache, CacheEntry, CacheType, CommandId, CustomCommand, DirId,
+    Directory, ExportSet, FileSet, FileSetId, GeneratorKind, GlobalState, ImportedVisibility,
+    InstallRule, LinkItem, PropOrigin, PropScope, Target, TargetBinding, TargetId, TargetOrigin,
+    TestEntry, TestId, UsageField, UsageProps,
 };
 
 /// Error of a [`ProjectModel`] operation.
@@ -52,6 +54,8 @@ pub struct ProjectModel {
     pub installs: Vec<InstallRule>,
     /// Export sets by name.
     pub exports: IndexMap<BString, ExportSet>,
+    /// `export()` calls that write build-tree files, in call order.
+    pub build_exports: Vec<BuildExport>,
     root: Directory,
     subdirs: Vec<Directory>,
     targets: Vec<Target>,
@@ -286,16 +290,37 @@ impl ProjectModel {
     }
 
     /// Add a test to its directory. Returns [`ModelError::DuplicateTest`] when the
-    /// directory already has a test with the same name.
+    /// directory already has a test with the same name. A `discover_tests()` entry
+    /// ([`crate::TestKind::Discover`]) goes into [`Directory::discoveries`] and never
+    /// conflicts with a name.
     pub fn add_test(&mut self, test: TestEntry) -> Result<TestId, ModelError> {
-        if let Some(&existing) = self.dir(test.dir).tests.get(&test.name) {
+        let dir = test.dir;
+        if test.is_discovery() {
+            let id = push_arena(&mut self.tests, test, TestId::from_index)?;
+            self.dir_mut(dir).discoveries.push(id);
+            return Ok(id);
+        }
+        if let Some(&existing) = self.dir(dir).tests.get(&test.name) {
             return Err(ModelError::DuplicateTest(existing));
         }
-        let dir = test.dir;
         let name = test.name.clone();
         let id = push_arena(&mut self.tests, test, TestId::from_index)?;
         self.dir_mut(dir).tests.insert(name, id);
         Ok(id)
+    }
+
+    /// Tests and `discover_tests()` entries of directory `dir` in call order.
+    pub fn dir_tests(&self, dir: DirId) -> impl Iterator<Item = (TestId, &TestEntry)> {
+        let directory = self.dir(dir);
+        let mut ids: Vec<TestId> = directory
+            .tests
+            .values()
+            .chain(&directory.discoveries)
+            .copied()
+            .collect();
+        ids.sort_unstable();
+        ids.into_iter()
+            .filter_map(|id| self.test(id).map(|test| (id, test)))
     }
 
     /// Test `id`.
@@ -345,6 +370,24 @@ impl ProjectModel {
         self.installs.len() - 1
     }
 
+    /// Names of all install components (`get_cmake_property(COMPONENTS)`), sorted. A
+    /// rule without `COMPONENT` uses `CMAKE_INSTALL_DEFAULT_COMPONENT_NAME` of its
+    /// directory, else `Unspecified`. Empty when the project has no install rules.
+    #[must_use]
+    pub fn install_components(&self) -> BTreeSet<BString> {
+        self.installs
+            .iter()
+            .map(|rule| match &rule.options.component {
+                Some(component) => component.clone(),
+                None => self
+                    .definition(rule.dir, b"CMAKE_INSTALL_DEFAULT_COMPONENT_NAME")
+                    .filter(|name| !name.is_empty())
+                    .cloned()
+                    .unwrap_or_else(|| BString::from("Unspecified")),
+            })
+            .collect()
+    }
+
     // ----------------------------------------------------------------------------------
     // Scoped properties.
     // ----------------------------------------------------------------------------------
@@ -364,6 +407,7 @@ impl ProjectModel {
                 self.test(id)?.props.get(name).cloned()
             }
             PropScope::Cache(entry) => cache_prop(self.cache.get(entry)?, name),
+            PropScope::FileSet(id) => self.file_set(*id)?.props.get(name).cloned(),
         }
     }
 
@@ -379,6 +423,7 @@ impl ProjectModel {
             }
             scope = match scope {
                 PropScope::Target(id) => PropScope::Directory(self.target(id)?.dir),
+                PropScope::FileSet(id) => PropScope::Target(self.file_set(id)?.target),
                 PropScope::Source { dir, .. } | PropScope::Test { dir, .. } => {
                     PropScope::Directory(dir)
                 }
@@ -436,6 +481,11 @@ impl ProjectModel {
             PropScope::Cache(entry) => {
                 let entry = self.cache.get_mut(entry).ok_or(ModelError::UnknownObject)?;
                 set_cache_prop(entry, name, value)
+            }
+            PropScope::FileSet(id) => {
+                let file_set = self.file_set_mut(*id).ok_or(ModelError::UnknownObject)?;
+                set_map(&mut file_set.props, name, value);
+                Ok(())
             }
         }
     }
@@ -893,5 +943,104 @@ mod tests {
             model.get_prop(&scope, b"COMPILE_FLAGS"),
             Some("-a -b".into())
         );
+    }
+
+    fn test_entry(name: &str, kind: crate::TestKind) -> TestEntry {
+        TestEntry {
+            name: name.into(),
+            dir: DirId::ROOT,
+            backtrace: Backtrace::default(),
+            command: vec!["run".into()],
+            configurations: Vec::new(),
+            working_directory: None,
+            command_expand_lists: false,
+            old_style: false,
+            props: crate::PropertyMap::default(),
+            build_depends: Vec::new(),
+            kind,
+        }
+    }
+
+    #[test]
+    fn file_set_properties_are_scoped_and_inherit_from_the_target() {
+        let bt = Backtrace::default();
+        let mut model = ProjectModel::default();
+        let lib = model
+            .add_target(target("lib", DirId::ROOT, TargetOrigin::Normal))
+            .unwrap();
+        let set = model
+            .add_file_set(FileSet {
+                target: lib,
+                name: "SOURCES".into(),
+                kind: crate::FileSetKind::Sources,
+                scope: crate::UsageScope::Private,
+                base_dirs: Vec::new(),
+                files: Vec::new(),
+                props: crate::PropertyMap::default(),
+            })
+            .unwrap();
+        let scope = PropScope::FileSet(set);
+        model
+            .set_prop(&scope, b"LANGUAGE", Some("CXX".into()), origin(&bt))
+            .unwrap();
+        assert_eq!(model.get_prop(&scope, b"LANGUAGE"), Some("CXX".into()));
+        assert_eq!(model.get_prop(&PropScope::Target(lib), b"LANGUAGE"), None);
+        model
+            .set_prop(
+                &PropScope::Target(lib),
+                b"FOLDER",
+                Some("f".into()),
+                origin(&bt),
+            )
+            .unwrap();
+        assert_eq!(
+            model.get_prop_inherited(&scope, b"FOLDER"),
+            Some("f".into())
+        );
+        model
+            .set_prop(&scope, b"LANGUAGE", None, origin(&bt))
+            .unwrap();
+        assert_eq!(model.get_prop(&scope, b"LANGUAGE"), None);
+    }
+
+    #[test]
+    fn discovery_entries_skip_name_lookup_but_keep_call_order() {
+        let mut model = ProjectModel::default();
+        let spec = crate::TestKind::Discover(Box::default());
+        let first = model
+            .add_test(test_entry("a", crate::TestKind::Single))
+            .unwrap();
+        let discover = model.add_test(test_entry("", spec.clone())).unwrap();
+        let again = model.add_test(test_entry("", spec)).unwrap();
+        let last = model
+            .add_test(test_entry("b", crate::TestKind::Single))
+            .unwrap();
+        assert_eq!(model.find_test(DirId::ROOT, b""), None);
+        assert_eq!(model.dir(DirId::ROOT).discoveries, vec![discover, again]);
+        assert_eq!(
+            model.get_prop(&PropScope::Directory(DirId::ROOT), b"TESTS"),
+            Some("a;b".into())
+        );
+        let order: Vec<_> = model.dir_tests(DirId::ROOT).map(|(id, _)| id).collect();
+        assert_eq!(order, vec![first, discover, again, last]);
+    }
+
+    #[test]
+    fn install_components_default_to_unspecified_and_sort() {
+        let mut model = ProjectModel::default();
+        assert!(model.install_components().is_empty());
+        for component in [Some("dev"), None, Some("dev")] {
+            model.add_install(InstallRule {
+                dir: DirId::ROOT,
+                backtrace: Backtrace::default(),
+                kind: crate::InstallKind::Code("x".into()),
+                options: crate::InstallOptions {
+                    component: component.map(BString::from),
+                    ..crate::InstallOptions::default()
+                },
+            });
+        }
+        let names: Vec<_> = model.install_components().into_iter().collect();
+        assert_eq!(names, vec![BString::from("Unspecified"), "dev".into()]);
     }
 }

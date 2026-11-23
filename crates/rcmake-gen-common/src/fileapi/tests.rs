@@ -255,6 +255,7 @@ fn fixture(source: &Path, build: &Path) -> (ProjectModel, GenerationResult) {
                 source: BT::new(from_native(&source.join("main.c")), backtrace),
                 object: format!("CMakeFiles/{name}.dir/main.c.o").into(),
                 group: 0,
+                scan: false,
             }],
             link: Some(LinkStep {
                 kind: if kind == TargetKind::Executable {
@@ -267,6 +268,7 @@ fn fixture(source: &Path, build: &Path) -> (ProjectModel, GenerationResult) {
                 output: output.into(),
             }),
             dependencies: library.into_iter().collect(),
+            cxx_modules: None,
         });
         library = Some(id);
     }
@@ -285,6 +287,10 @@ fn fixture(source: &Path, build: &Path) -> (ProjectModel, GenerationResult) {
             implicit_includes: vec!["/usr/include".into()],
             implicit_link_dirs: vec!["/usr/lib".into()],
             source_extensions: vec!["c".into()],
+            scandep_rule: None,
+            module_map_format: None,
+            module_map_flag: None,
+            compile_bmi_rule: None,
         },
     );
     cache_entry(&mut model, "CMAKE_ROOT", b"/cmake", CacheType::Internal, "");

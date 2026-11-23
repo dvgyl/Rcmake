@@ -364,6 +364,7 @@ mod tests {
                 compile_units: Vec::new(),
                 link: None,
                 dependencies: Vec::new(),
+                cxx_modules: None,
             });
         }
         let script = render_resolved(&model, dir, &result).unwrap().to_string();
@@ -517,6 +518,8 @@ mod tests {
             command_expand_lists: false,
             old_style: false,
             props: Default::default(),
+            build_depends: Vec::new(),
+            kind: rcmake_model::TestKind::Single,
         }
     }
 }

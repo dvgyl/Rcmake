@@ -1,0 +1,17 @@
+[package]
+name = "rcmake-instrument"
+description = "CMake Instrumentation API v1 (data v1.2): queries, snippets, index files, hooks, and trace output for Rcmake (ADR-013)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+rcmake-base.workspace = true
+rcmake-host.workspace = true
+rcmake-json.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

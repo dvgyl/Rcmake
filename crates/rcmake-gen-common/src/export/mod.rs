@@ -13,6 +13,7 @@ use rcmake_resolve::{ExportPlan, ExportedTarget};
 
 use crate::{GenError, quote, quoted_content, write_error, write_if_changed};
 
+pub mod cps;
 mod generate;
 pub use generate::{
     FileGenerateContext, FileGenerateInput, FileGenerateNewline, FileGeneratePermissions,

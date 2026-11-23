@@ -96,6 +96,8 @@ fn compile(source: &str, object: &str) -> BuildStep {
             "cc -MMD -MP -MF '{depfile}' -MQ '{object}' -I'gen $' -c '{source}' -o '{object}'",
         )),
         depfile: Some(depfile.into()),
+        modmap: None,
+        dyndep: None,
     }
 }
 

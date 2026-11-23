@@ -41,6 +41,10 @@ pub struct Directory {
     pub local_targets: IndexMap<BString, TargetBinding>,
     /// Tests created in this directory (`TESTS`).
     pub tests: IndexMap<BString, TestId>,
+    /// `discover_tests()` entries created in this directory, in call order. A smaller
+    /// [`TestId`] was created earlier, so ids order these entries against
+    /// [`Self::tests`].
+    pub discoveries: Vec<TestId>,
     /// Final visible normal variable snapshot captured when this directory finishes
     /// configuring (used by generate-time resolution and lowering).
     pub vars: IndexMap<BString, BString>,

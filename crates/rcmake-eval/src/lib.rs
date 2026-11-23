@@ -104,6 +104,11 @@ pub struct Registry {
 
 impl Registry {
     /// Register a built-in command under its canonical lowercase name.
+    ///
+    /// A later registration of the same name replaces the earlier one (also one from
+    /// [`Self::add_raw`]). `rcmake-ctest` uses this to override `add_test`,
+    /// `set_tests_properties`, `subdirs`, and other commands after
+    /// `rcmake_commands::register_all`.
     pub fn add(&mut self, name: &'static str, func: BuiltinFn, flags: CmdFlags) {
         let lower = fold_command_name(name.as_bytes());
         self.raw.remove(&lower);

@@ -162,6 +162,7 @@ fn resolves_build_install_and_export_for_each_config() -> TestResult {
             set: "sdk".into(),
             namespace: "sdk::".into(),
             file: None,
+            cxx_modules_directory: None,
         },
         options: InstallOptions {
             destination: Some("lib/cmake/sdk".into()),

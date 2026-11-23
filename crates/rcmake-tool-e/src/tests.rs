@@ -830,3 +830,33 @@ fn echo_color_uses_ansi_styles_when_color_is_forced() {
         b"plain\n\x1b[31mone\x1b[0m\n\x1b[1m\x1b[31mtwo\x1b[0m\nthree\n\x1b[0mfour\x1b[0m\n"
     );
 }
+
+#[test]
+fn ninja_dyndep_validates_arguments_like_the_oracle() {
+    let f = Fixture::new();
+    assert_eq!(f.run(&["cmake_ninja_dyndep"]), 1);
+    assert_eq!(
+        f.err(),
+        b"CMake Error: -E cmake_ninja_dyndep requires value for --tdi=\n"
+    );
+    let f = Fixture::new();
+    assert_eq!(f.run(&["cmake_ninja_dyndep", "--bogus"]), 1);
+    assert_eq!(
+        f.err(),
+        b"CMake Error: -E cmake_ninja_dyndep unknown argument: --bogus\n"
+    );
+    let f = Fixture::new();
+    assert_eq!(
+        f.run(&[
+            "cmake_ninja_dyndep",
+            "--tdi=x.json",
+            "--lang=CXX",
+            "--dd=o.dd"
+        ]),
+        1
+    );
+    assert_eq!(
+        f.err(),
+        b"CMake Error: -E cmake_ninja_dyndep failed to parse x.jsonFile not found: x.json\n"
+    );
+}

@@ -3,6 +3,8 @@
 #![forbid(unsafe_code)]
 
 mod graph;
+mod modules;
+mod prep;
 mod syntax;
 
 use std::collections::{BTreeMap, HashMap, HashSet};

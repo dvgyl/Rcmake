@@ -5,7 +5,9 @@ mod compile;
 mod custom;
 mod graph;
 mod install;
+mod launcher;
 mod link;
+mod modules;
 mod shell;
 mod standard;
 
@@ -22,6 +24,8 @@ pub use graph::lower;
 pub(crate) use graph::lower_with_inputs;
 pub(crate) use install::lower_install_manifest_with_configs;
 pub use install::{collect_metadata, lower_install_manifest};
+pub use launcher::instrumentation_launcher;
+pub use modules::lower_modules;
 pub(crate) use standard::required_standard;
 
 pub(crate) fn definition<'a>(

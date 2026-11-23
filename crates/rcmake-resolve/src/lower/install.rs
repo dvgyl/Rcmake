@@ -55,6 +55,7 @@ pub fn collect_metadata(model: &ProjectModel) -> ConfigureMetadata {
                 return None;
             }
             let value = |suffix| read(suffix).cloned().unwrap_or_default();
+            let optional = |suffix| read(suffix).filter(|v| !v.is_empty()).cloned();
             let paths =
                 |suffix| read(suffix).map_or_else(Vec::new, |v| list::split(v, list::Empty::Drop));
             let toolchain = Toolchain {
@@ -64,6 +65,10 @@ pub fn collect_metadata(model: &ProjectModel) -> ConfigureMetadata {
                 implicit_includes: paths(b"IMPLICIT_INCLUDE_DIRECTORIES"),
                 implicit_link_dirs: paths(b"IMPLICIT_LINK_DIRECTORIES"),
                 source_extensions: paths(b"SOURCE_FILE_EXTENSIONS"),
+                scandep_rule: optional(b"SCANDEP_SOURCE"),
+                module_map_format: optional(b"MODULE_MAP_FORMAT"),
+                module_map_flag: optional(b"MODULE_MAP_FLAG"),
+                compile_bmi_rule: optional(b"MODULE_BMI_ONLY_FLAG"),
             };
             Some((language, toolchain))
         })
@@ -287,6 +292,8 @@ fn lower_install_rules<E>(
                 export_plan += 1;
                 InstallActionKind::Export { plan }
             }
+            // CPS and SBOM files do not have install actions yet.
+            InstallKind::PackageInfo(_) | InstallKind::Sbom(_) => continue,
         };
         manifest
             .actions

@@ -6,6 +6,7 @@ use rcmake_base::BString;
 use rcmake_diag::{Effect, MessageKind};
 use rcmake_eval::{CmdError, CmdFlags, Cx, Registry};
 
+mod cps_import;
 mod environment;
 mod execute;
 mod find;

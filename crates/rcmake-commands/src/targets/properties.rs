@@ -147,6 +147,7 @@ fn file_set_property(model: &ProjectModel, id: TargetId, property: &[u8]) -> Opt
     let target = model.target(id)?;
     for (kind, prefix) in [
         (FileSetKind::Headers, b"HEADER".as_slice()),
+        (FileSetKind::Sources, b"SOURCE"),
         (FileSetKind::CxxModules, b"CXX_MODULE"),
     ] {
         let sets = || {

@@ -2,6 +2,8 @@
 
 #![forbid(unsafe_code)]
 
+mod prep;
+
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::Path;
 
@@ -192,6 +194,11 @@ fn plan_targets<'a>(
                     depfile: custom.depfile.as_ref().map(make_path),
                     always: custom.outputs.is_empty(),
                 },
+                BuildStep::Scan { .. } | BuildStep::Collate { .. } => {
+                    return Err(GenError::Unimplemented(
+                        "C++ module build steps for Unix Makefiles",
+                    ));
+                }
             };
             if matches!(action, BuildStep::Link { .. })
                 && let Some(artifacts) = artifacts.get(target.name)
@@ -526,6 +533,8 @@ fn write_step(out: &mut Vec<u8>, step: &Step<'_>, file: &[u8]) -> Result<(), Gen
                 .map_or_else(Vec::new, |comment| comment.to_vec()),
             custom.invocations.as_slice(),
         ),
+        // Step collection rejects module steps before recipes are written.
+        BuildStep::Scan { .. } | BuildStep::Collate { .. } => (Vec::new(), [].as_slice()),
     };
     if !message.is_empty() {
         let mut report = b"printf '%s\\n'".to_vec();

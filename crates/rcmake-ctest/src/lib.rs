@@ -9,11 +9,17 @@ use std::time::Duration;
 use rcmake_base::BString;
 use rcmake_host::{Host, HostError, Stream};
 
+mod cli;
+mod dart;
+mod discover;
 mod discovery;
 mod execution;
+mod junit;
 mod reporting;
 mod schedule;
+mod script;
 mod selection;
+mod state;
 
 #[cfg(test)]
 mod tests;
@@ -106,6 +112,9 @@ pub enum CtestError {
         /// Host error for the file.
         source: HostError,
     },
+    /// The option or feature is not implemented yet.
+    #[error("{0} is not supported yet")]
+    Unsupported(&'static str),
 }
 
 /// Discover and run the tests under `options.test_dir`. Write reports through `host`.

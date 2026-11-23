@@ -42,6 +42,8 @@ fn compile_step(
             working_dir: directory,
             ..Invocation::default()
         },
+        modmap: None,
+        dyndep: None,
     }
 }
 
@@ -284,6 +286,8 @@ fn ctest_file_keeps_test_arguments_properties_backtraces_and_children() {
             command_expand_lists: false,
             old_style: false,
             props,
+            build_depends: Vec::new(),
+            kind: rcmake_model::TestKind::Single,
         })
         .unwrap();
     model
@@ -297,6 +301,8 @@ fn ctest_file_keeps_test_arguments_properties_backtraces_and_children() {
             command_expand_lists: false,
             old_style: true,
             props: PropertyMap::default(),
+            build_depends: Vec::new(),
+            kind: rcmake_model::TestKind::Single,
         })
         .unwrap();
     host.create_dir_all(Path::new("/work/inner/child")).unwrap();
@@ -645,6 +651,8 @@ mod differential {
                 command_expand_lists: false,
                 old_style: false,
                 props: PropertyMap::default(),
+                build_depends: Vec::new(),
+                kind: rcmake_model::TestKind::Single,
             })
             .unwrap();
         ctest_file::write_ctest_file(&model, DirId::ROOT, &host).unwrap();

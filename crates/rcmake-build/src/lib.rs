@@ -68,6 +68,9 @@ pub enum BuildError {
     /// The host could not perform a build operation.
     #[error(transparent)]
     Host(#[from] HostError),
+    /// The graph has a step kind that the executor can not run yet.
+    #[error("{0} is not supported yet")]
+    Unsupported(&'static str),
 }
 
 /// Run the selected build steps in dependency order through `host`.
@@ -106,6 +109,20 @@ pub fn execute(
                         std::slice::from_ref(object),
                         std::slice::from_ref(invocation),
                     )
+                }
+                BuildStep::Scan {
+                    ddi,
+                    invocation,
+                    depfile,
+                    ..
+                } => {
+                    if let Some(depfile) = depfile {
+                        create_output_parent(host, &build_dir, depfile)?;
+                    }
+                    (std::slice::from_ref(ddi), std::slice::from_ref(invocation))
+                }
+                BuildStep::Collate { .. } => {
+                    return Err(BuildError::Unsupported("C++ module collation"));
                 }
                 BuildStep::Link {
                     step, invocations, ..

@@ -127,7 +127,7 @@ export(PACKAGE Enabled)
     assert!(script.options.exclude_from_all);
     assert_eq!(code.options.component, Some("Docs".into()));
     assert!(
-        matches!(&export.kind, InstallKind::Export { set, namespace, file: Some(file) } if set == b"sdk" && namespace == b"sdk::" && file == b"pkg.cmake")
+        matches!(&export.kind, InstallKind::Export { set, namespace, file: Some(file), .. } if set == b"sdk" && namespace == b"sdk::" && file == b"pkg.cmake")
     );
     for (key, value) in [
         ("_RCMAKE_INSTALL_0_ARG8", "ARCHIVE"),

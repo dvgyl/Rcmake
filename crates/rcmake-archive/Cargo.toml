@@ -1,6 +1,6 @@
 [package]
 name = "rcmake-archive"
-description = "Shared pure-Rust archive creation, extraction, and listing engine (tar, tar.gz, zip) over Host."
+description = "Shared archive creation, extraction, and listing engine (tar, gzip, xz, zstd, bzip2, zip) over Host."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,12 +8,15 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+bzip2.workspace = true
 flate2.workspace = true
+liblzma.workspace = true
 rcmake-base.workspace = true
 rcmake-host.workspace = true
 tar.workspace = true
 thiserror.workspace = true
 zip = { workspace = true, features = ["unreserved"] }
+zstd.workspace = true
 
 [lints]
 workspace = true

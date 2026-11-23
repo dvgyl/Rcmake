@@ -5,6 +5,7 @@
 mod archive;
 mod binary;
 mod depfile;
+mod dyndep;
 mod files;
 mod generator;
 mod process;
@@ -87,6 +88,7 @@ pub fn run(args: &[BString], cx: &ToolCtx<'_>) -> i32 {
         b"cmake_symlink_library" if args.len() == 3 => generator::symlink_library(args, cx),
         b"cmake_symlink_executable" if args.len() == 2 => generator::symlink_executable(args, cx),
         b"cmake_transform_depfile" if args.len() == 8 => depfile::transform(args, cx),
+        b"cmake_ninja_dyndep" => dyndep::run(args, cx),
         b"cmake_echo_color" => generator::echo_color(args, cx),
         b"cmake_progress_start" if args.len() == 2 => generator::progress_start(args, cx),
         // CMake 4.5.1 records progress in cmake_echo_color.

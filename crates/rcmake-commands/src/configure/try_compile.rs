@@ -1149,6 +1149,8 @@ impl DirectBuild {
                             argv,
                             ..Invocation::default()
                         },
+                        modmap: None,
+                        dyndep: None,
                     });
                     objects.push(object);
                 }

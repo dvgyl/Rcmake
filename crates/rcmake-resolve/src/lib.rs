@@ -96,6 +96,15 @@ pub struct Toolchain {
     pub implicit_link_dirs: Vec<BString>,
     /// `CMAKE_<LANG>_SOURCE_FILE_EXTENSIONS`.
     pub source_extensions: Vec<BString>,
+    /// `CMAKE_<LANG>_SCANDEP_SOURCE`: rule template of the module dependency scan.
+    pub scandep_rule: Option<BString>,
+    /// `CMAKE_<LANG>_MODULE_MAP_FORMAT` (`clang`, `gcc`, or `msvc`).
+    pub module_map_format: Option<BString>,
+    /// `CMAKE_<LANG>_MODULE_MAP_FLAG`: flag template that passes the module map.
+    pub module_map_flag: Option<BString>,
+    /// `CMAKE_<LANG>_MODULE_BMI_ONLY_FLAG`: flag template that makes a compile step
+    /// write only a module file.
+    pub compile_bmi_rule: Option<BString>,
 }
 
 /// Per-configuration facts of one target (layer 2).
@@ -117,6 +126,51 @@ pub struct ResolvedTarget {
     pub link: Option<LinkStep>,
     /// Targets that must build first, in order.
     pub dependencies: Vec<TargetId>,
+    /// C++20 module facts (`None` when no source of the target is scanned).
+    pub cxx_modules: Option<CxxModuleInfo>,
+}
+
+/// C++20 module facts of one target and configuration (ADR-012).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CxxModuleInfo {
+    /// Units of `CXX_MODULES` file sets.
+    pub units: Vec<ModuleUnit>,
+    /// Directory of the module files, relative to the build directory.
+    pub module_dir: BString,
+    /// Path of `CXXDependInfo.json`, relative to the build directory.
+    pub tdi: BString,
+    /// Path of the collated Ninja dyndep file, relative to the build directory.
+    pub dyndep: BString,
+    /// Install rule of the module files (`install(TARGETS ... CXX_MODULES_BMI)`).
+    pub bmi_install: Option<BmiInstall>,
+}
+
+/// One unit of a `CXX_MODULES` file set.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ModuleUnit {
+    /// Index into [`ResolvedTarget::compile_units`].
+    pub unit: usize,
+    /// File set name.
+    pub file_set: BString,
+    /// The file set is `PUBLIC` or `INTERFACE`.
+    pub public: bool,
+    /// The unit compiles only to a module file (no object file).
+    pub bmi_only: bool,
+}
+
+/// Install rule of the module files of a target.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct BmiInstall {
+    /// `DESTINATION`.
+    pub destination: BString,
+    /// Install component.
+    pub component: BString,
+    /// Permission keywords.
+    pub permissions: Vec<BString>,
+    /// `EXCLUDE_FROM_ALL`.
+    pub exclude_from_all: bool,
+    /// `OPTIONAL`.
+    pub optional: bool,
 }
 
 /// Descriptive target facts (`codemodel` target object fields).
@@ -190,6 +244,8 @@ pub struct CompileUnit {
     pub object: BString,
     /// Index into [`ResolvedTarget::compile_groups`].
     pub group: usize,
+    /// The unit needs a C++ module dependency scan (`CXX_SCAN_FOR_MODULES`).
+    pub scan: bool,
 }
 
 /// Kind of a link step.
@@ -285,6 +341,38 @@ pub enum BuildStep {
         invocation: Invocation,
         /// Compiler-written dependency file.
         depfile: Option<BString>,
+        /// Module map file that the compiler reads (scanned units only).
+        modmap: Option<BString>,
+        /// Ninja dyndep file of the unit's target (scanned units only).
+        dyndep: Option<BString>,
+    },
+    /// Scan one unit for C++ module dependencies (writes a P1689r5 `.ddi` file).
+    Scan {
+        /// Source path.
+        source: BString,
+        /// Output `.ddi` path.
+        ddi: BString,
+        /// Object path of the compile step that the scan serves.
+        object: BString,
+        /// Scanner invocation.
+        invocation: Invocation,
+        /// Scanner-written dependency file.
+        depfile: Option<BString>,
+    },
+    /// Collate the `.ddi` files of one target (`cmake -E cmake_ninja_dyndep`).
+    Collate {
+        /// Target name.
+        target: BString,
+        /// Input `.ddi` paths.
+        ddis: Vec<BString>,
+        /// Output dyndep file.
+        dd: BString,
+        /// Output module map files, one for each scanned unit.
+        modmaps: Vec<BString>,
+        /// `CXXDependInfo.json` path.
+        tdi: BString,
+        /// Other inputs (`CXXModules.json` of linked targets).
+        implicit_inputs: Vec<BString>,
     },
     /// Link or archive.
     Link {
@@ -499,6 +587,7 @@ fn resolve_target(
         compile_units: Vec::new(),
         link: None,
         dependencies: Vec::new(),
+        cxx_modules: None,
     };
 
     let export_symbol = export_symbol(target);
@@ -568,6 +657,7 @@ fn resolve_target(
             object: lower::object_path(model, target, &ctx.config, &source.value),
             source,
             group,
+            scan: false,
         });
     }
     resolved.compile_groups = groups.into_values().collect();
@@ -895,6 +985,7 @@ fn resolve_exports(
             set,
             namespace,
             file,
+            ..
         } = &rule.kind
         else {
             continue;

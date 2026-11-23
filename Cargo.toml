@@ -20,6 +20,10 @@ members = [
     "crates/rcmake-gen-ninja",
     "crates/rcmake-gen-make",
     "crates/rcmake-ctest",
+    "crates/rcmake-cps",
+    "crates/rcmake-cxxmodules",
+    "crates/rcmake-instrument",
+    "crates/rcmake-cpack",
     "crates/rcmake-tool-e",
     "crates/rcmake-cli",
     "crates/rcmake-harness",
@@ -35,9 +39,12 @@ homepage = "https://github.com/dvgyl/Rcmake"
 
 [workspace.dependencies]
 bstr = { version = "1.12", default-features = false, features = ["std", "alloc"] }
+# Default backend is the pure-Rust `libbz2-rs-sys` (no C compiler, no system libbz2).
+bzip2 = "0.6"
 flate2 = "1"
 indexmap = "2"
 jiff = "0.2"
+liblzma = { version = "0.4", default-features = false, features = ["static"] }
 md-5 = "0.10"
 memchr = "2"
 rustix = { version = "1", features = ["fs", "process", "system"] }
@@ -51,6 +58,7 @@ tar = "0.4"
 tempfile = "3"
 thiserror = "2"
 zip = { version = "2", default-features = false, features = ["deflate"] }
+zstd = { version = "0.14", default-features = false }
 
 # Internal workspace crates
 rcmake-base = { path = "crates/rcmake-base" }
@@ -73,6 +81,10 @@ rcmake-gen-common = { path = "crates/rcmake-gen-common" }
 rcmake-gen-ninja = { path = "crates/rcmake-gen-ninja" }
 rcmake-gen-make = { path = "crates/rcmake-gen-make" }
 rcmake-ctest = { path = "crates/rcmake-ctest" }
+rcmake-cps = { path = "crates/rcmake-cps" }
+rcmake-cxxmodules = { path = "crates/rcmake-cxxmodules" }
+rcmake-instrument = { path = "crates/rcmake-instrument" }
+rcmake-cpack = { path = "crates/rcmake-cpack" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

@@ -68,6 +68,9 @@ impl<'a> Graph<'a> {
             match step {
                 BuildStep::Compile { object, .. } => nodes.outputs.push(graph.node(object)),
                 BuildStep::Link { step, .. } => nodes.outputs.push(graph.node(&step.output)),
+                BuildStep::Scan { .. } | BuildStep::Collate { .. } => {
+                    return Err(crate::modules::unsupported());
+                }
                 BuildStep::Custom(custom) => {
                     nodes
                         .outputs
@@ -330,6 +333,8 @@ impl<'a> Graph<'a> {
                     custom.depfile.as_ref(),
                 )
             }
+            // `Graph::new` rejects module steps.
+            BuildStep::Scan { .. } | BuildStep::Collate { .. } => return,
         };
         let inputs = unique(inputs);
         let order_only = unique(

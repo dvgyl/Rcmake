@@ -19,3 +19,16 @@ All original Kitware and contributor copyright notices inside `modules/cmake-4.5
 ## 2. Rust Crate Dependencies
 
 *(Updated automatically/manually whenever workspace dependencies are added; all direct and transitive crates must be compatible with `MIT OR Apache-2.0`.)*
+
+### Compression codecs of `rcmake-archive` (ADR-010)
+
+These crates compile third-party codec code into the `rcmake` binary. Their licence texts are in `third_party/licences/`.
+
+| Component | Licence | Licence text |
+| --- | --- | --- |
+| Zstandard 1.5.7 C library (Meta Platforms, Inc. and affiliates), through `zstd-sys` | `BSD-3-Clause` (BSD option of the BSD/GPLv2 dual licence) | `third_party/licences/zstd-BSD-3-Clause.txt` |
+| `zstd` and `zstd-safe` Rust bindings (Alexandre Bury) | `BSD-3-Clause` | `third_party/licences/zstd-rs-BSD-3-Clause.txt` |
+| XZ Utils `liblzma` (Lasse Collin and contributors), through `liblzma-sys` | `0BSD` | `third_party/licences/xz-liblzma-0BSD.txt` |
+| `liblzma` and `liblzma-sys` Rust bindings | `MIT OR Apache-2.0` | Same terms as Rcmake (`LICENSE-MIT`, `LICENSE-APACHE`) |
+| `libbz2-rs-sys` (Rust port of bzip2/libbzip2 by Julian R Seward; Trifecta Tech Foundation and contributors) | `bzip2-1.0.6` | `third_party/licences/libbz2-rs-sys-bzip2-1.0.6.txt` |
+| `bzip2` Rust bindings | `MIT OR Apache-2.0` | Same terms as Rcmake (`LICENSE-MIT`, `LICENSE-APACHE`) |

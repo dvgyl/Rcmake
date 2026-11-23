@@ -113,6 +113,8 @@ fn compile(source: BString, object: BString) -> BuildStep {
         source,
         invocation,
         depfile: Some(depfile),
+        modmap: None,
+        dyndep: None,
     }
 }
 

@@ -140,6 +140,7 @@ fn add_file_set<'a>(
                 scope,
                 base_dirs: bases,
                 files: args.files,
+                props: rcmake_model::PropertyMap::default(),
             })
             .map_err(model_error)?;
     }

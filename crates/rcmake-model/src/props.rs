@@ -3,7 +3,7 @@
 use rcmake_base::BString;
 use rcmake_diag::Backtrace;
 
-use crate::{DirId, TargetId};
+use crate::{DirId, FileSetId, TargetId};
 
 /// The object that owns a property.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -30,6 +30,8 @@ pub enum PropScope {
     },
     /// `CACHE`: properties of a cache entry.
     Cache(BString),
+    /// `FILE_SET`: properties of one file set of a target.
+    FileSet(FileSetId),
 }
 
 /// `set_property(APPEND)` or `set_property(APPEND_STRING)`.

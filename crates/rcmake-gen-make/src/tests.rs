@@ -53,6 +53,8 @@ fn writes_hierarchy_and_escapes_make_and_shell_words() {
                     source: "/src/source file.c".into(),
                     invocation: invocation("cc -o 'obj $/foo.o' -c '/src/source file.c'"),
                     depfile: Some("obj $/foo.d".into()),
+                    modmap: None,
+                    dyndep: None,
                 },
             ],
             targets: vec![

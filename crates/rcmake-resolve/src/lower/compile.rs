@@ -325,6 +325,8 @@ pub(super) fn compile(
         source,
         invocation,
         depfile: writes_depfile.then_some(depfile),
+        modmap: None,
+        dyndep: None,
     })
 }
 

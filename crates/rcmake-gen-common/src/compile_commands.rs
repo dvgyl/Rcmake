@@ -322,8 +322,7 @@ mod tests {
                             "cc '-DVARIABLE=-MD -MF' {flag} -MT 'obj file.o' -MF \"obj file.o.d\" -o 'obj file.o' -c 'source file.c'"
                         ).into(),
                         ..Invocation::default()
-                    },
-                }],
+                    }, modmap: None, dyndep: None, }],
                 ..BuildGraph::default()
             };
             let output = render(&graph, b"/work").unwrap().to_string();

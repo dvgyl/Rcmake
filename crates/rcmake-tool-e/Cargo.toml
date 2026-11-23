@@ -11,6 +11,7 @@ repository.workspace = true
 jiff.workspace = true
 rcmake-archive.workspace = true
 rcmake-base.workspace = true
+rcmake-cxxmodules.workspace = true
 rcmake-diag.workspace = true
 rcmake-host.workspace = true
 rcmake-json.workspace = true

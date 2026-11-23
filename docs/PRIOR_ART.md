@@ -27,3 +27,10 @@ All crates conform to the permissive allow-list in ADR-001 (`MIT`, `Apache-2.0`,
 | `flate2` (default `miniz_oxide`) | `1` | `MIT OR Apache-2.0` | `rcmake-archive` | Pure-Rust gzip compression/decompression |
 | `tar` | `0.4` | `MIT OR Apache-2.0` | `rcmake-archive` | Pure-Rust POSIX/GNU tar creation & extraction |
 | `zip` (`deflate` only, no default features) | `2` | `MIT` | `rcmake-archive` | Pure-Rust ZIP archive creation & extraction without copyleft/bzip2 defaults |
+| `zstd` / `zstd-safe` (no default features) | `0.14` / `8.3` | `BSD-3-Clause` | `rcmake-archive` | Zstandard codec for `TZST`, `file(ARCHIVE_CREATE COMPRESSION Zstd)`, and `cmake -E tar --zstd` (ADR-010) |
+| `zstd-sys` (bundled Zstandard 1.5.7 C library, used under its BSD option) | `2.1` | `BSD-3-Clause AND BSD-2-Clause` | `rcmake-archive` (build) | Zstandard C sources compiled with `cc`; the GPLv2 alternative of the C library is not used |
+| `liblzma` / `liblzma-sys` (`static`, no `bindgen`) | `0.4` | `MIT OR Apache-2.0` | `rcmake-archive` | xz codec for `TXZ`, `COMPRESSION XZ`, and `cmake -E tar J` (ADR-010); maintained fork of the rejected `xz2` |
+| XZ Utils `liblzma` C sources (bundled in `liblzma-sys`) | `5.8` | `0BSD` | `rcmake-archive` (build) | Only `src/liblzma` and `src/common/tuklib_*` compile; the GPL/LGPL tools and scripts of XZ Utils are not built |
+| `bzip2` (default backend) | `0.6` | `MIT OR Apache-2.0` | `rcmake-archive` | bzip2 codec for `TBZ2`, `COMPRESSION BZip2`, and `cmake -E tar j` (ADR-010) |
+| `libbz2-rs-sys` | `0.2` | `bzip2-1.0.6` | `rcmake-archive` | Pure-Rust port of libbzip2 (no C compiler, no system `libbz2`); licence accepted by ADR-010 |
+| `cc`, `jobserver`, `find-msvc-tools`, `shlex`, `pkg-config` | `1` / `0.1` / `0.1` / `2` / `0.3` | `MIT OR Apache-2.0` | Build dependencies of `zstd-sys` and `liblzma-sys` | Compile the bundled C codec sources |

@@ -1171,3 +1171,32 @@ fn project_commands_are_unavailable_in_script_mode() -> TestResult {
     }
     Ok(())
 }
+
+#[test]
+fn components_property_lists_install_components() -> TestResult {
+    let (host, mut interp) = context(RunMode::Configure);
+    host.seed_file(Path::new("/work/src/a.c"), b"")?;
+    configure(
+        &host,
+        &mut interp,
+        r#"
+        project(P NONE)
+        get_cmake_property(none COMPONENTS)
+        install(FILES CMakeLists.txt DESTINATION x)
+        install(FILES CMakeLists.txt DESTINATION y COMPONENT dev)
+        get_property(global GLOBAL PROPERTY COMPONENTS)
+        get_cmake_property(components COMPONENTS)
+        add_library(x INTERFACE)
+        target_sources(x INTERFACE FILE_SET SOURCES FILES a.c)
+        get_target_property(sets x INTERFACE_SOURCE_SETS)
+        get_target_property(files x SOURCE_SET)
+        "#,
+        0,
+    )?;
+    assert_var(&mut interp, "none", Some(""));
+    assert_var(&mut interp, "global", None);
+    assert_var(&mut interp, "components", Some("Unspecified;dev"));
+    assert_var(&mut interp, "sets", Some("SOURCES"));
+    assert_var(&mut interp, "files", Some("/work/src/a.c"));
+    Ok(())
+}

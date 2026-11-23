@@ -903,13 +903,7 @@ pub(super) fn get_cmake(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
         b"VARIABLES" | b"MACROS" | b"CACHE_VARIABLES" => {
             directory_value(cx, dir, &name.value, false)
         }
-        b"COMPONENTS" => Some(
-            cx.global()
-                .props
-                .get(&name.value)
-                .cloned()
-                .unwrap_or_default(),
-        ),
+        b"COMPONENTS" => Some(list::join(cx.project().install_components())),
         _ => global_value(cx, &name.value),
     };
     cx.set_var(&out.value, value.unwrap_or_else(|| "NOTFOUND".into()));

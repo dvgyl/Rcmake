@@ -68,6 +68,7 @@ fn resolve_target(
             source: bt(source),
             object: object_path(model, &raw, config, source.as_bytes()),
             group,
+            scan: false,
         });
     }
     let metadata = TargetMetadata {
@@ -90,6 +91,7 @@ fn resolve_target(
         compile_units,
         link: None,
         dependencies: Vec::new(),
+        cxx_modules: None,
     })
 }
 
@@ -796,6 +798,7 @@ fn lowers_install_rules_and_collects_metadata() -> TestResult {
                 set: "pkg".into(),
                 namespace: "pkg::".into(),
                 file: None,
+                cxx_modules_directory: None,
             },
             InstallOptions {
                 destination: Some("lib64/cmake/pkg".into()),

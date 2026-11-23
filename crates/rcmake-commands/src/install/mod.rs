@@ -425,6 +425,7 @@ fn install_export(
     let set = value(args, b"EXPORT")?.into();
     let mut namespace = BString::default();
     let mut file = None;
+    let mut cxx_modules_directory = None;
     while let Some(key) = args.next() {
         match key {
             b"NAMESPACE" => namespace = value(args, key)?.into(),
@@ -436,9 +437,7 @@ fn install_export(
                 }
                 file = Some(name.into());
             }
-            b"CXX_MODULES_DIRECTORY" => {
-                value(args, key)?;
-            }
+            b"CXX_MODULES_DIRECTORY" => cxx_modules_directory = Some(value(args, key)?.into()),
             b"EXPORT_LINK_INTERFACE_LIBRARIES" => {}
             _ if common(cx, b"EXPORT", options, key, args)? => {}
             _ => return Err(unknown(key)),
@@ -455,6 +454,7 @@ fn install_export(
         set,
         namespace,
         file,
+        cxx_modules_directory,
     })
 }
 

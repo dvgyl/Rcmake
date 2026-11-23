@@ -51,6 +51,8 @@ fn single_config_writes_rules_edges_and_utilities() {
                         ..Invocation::default()
                     },
                     depfile: Some("obj/a $:file.d".into()),
+                    modmap: None,
+                    dyndep: None,
                 },
                 BuildStep::Link {
                     inputs: vec!["obj/a $:file.o".into()],
@@ -268,6 +270,8 @@ fn target_dependencies_use_the_library_when_its_name_matches_an_executable_outpu
                     source: "shell.c".into(),
                     invocation: Invocation::default(),
                     depfile: None,
+                    modmap: None,
+                    dyndep: None,
                 },
                 link(
                     LinkKind::Executable,

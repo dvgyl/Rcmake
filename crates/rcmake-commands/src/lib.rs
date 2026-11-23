@@ -10,6 +10,7 @@ mod custom;
 mod dirs;
 mod file_path;
 mod install;
+mod instrumentation;
 mod policy_misc;
 mod process_find;
 mod string_math;
@@ -28,16 +29,7 @@ pub fn register_all(registry: &mut Registry) {
     custom::register(registry);
     install::register(registry);
     configure::register(registry);
-}
-
-/// Placeholder for a project command that a later wave implements.
-fn pending_project_command(
-    _: &mut rcmake_eval::Cx<'_>,
-    _: &[rcmake_expr::ExpandedArg],
-) -> rcmake_eval::CmdResult {
-    Err(rcmake_eval::CmdError::Status(
-        "requires build-system support.".into(),
-    ))
+    instrumentation::register(registry);
 }
 
 fn command_error(

@@ -10,6 +10,7 @@
 
 use indexmap::IndexMap;
 use rcmake_base::{BString, list};
+use rcmake_diag::Backtrace;
 
 mod command;
 mod directory;
@@ -24,7 +25,10 @@ pub use command::{CustomCommand, CustomCommandKind, TargetEvent};
 pub use directory::Directory;
 pub use generator::GeneratorKind;
 pub use ids::{BT, CommandId, DirId, FileSetId, TargetId, TestId};
-pub use install::{ExportSet, InstallKind, InstallOptions, InstallRule, TestEntry};
+pub use install::{
+    BuildExport, DiscoverySpec, ExportKind, ExportSet, InstallKind, InstallOptions, InstallRule,
+    PackageInfoSpec, ProjectMetadata, SbomSpec, TestEntry, TestKind,
+};
 pub use project::{ModelError, ProjectModel};
 pub use props::{AppendMode, PropOrigin, PropScope};
 pub use target::{
@@ -219,6 +223,37 @@ pub struct DefinedProperty {
     pub initialize_from_variable: Option<BString>,
 }
 
+/// One `CUSTOM_CONTENT <name> <type> <content>` entry of `cmake_instrumentation()`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct InstrumentationContent {
+    /// Content name.
+    pub name: BString,
+    /// Content type keyword (`STRING`, `BOOL`, `LIST`, or `JSON`).
+    pub ty: BString,
+    /// Raw content.
+    pub content: BString,
+}
+
+/// One `cmake_instrumentation()` call, after argument parsing. `rcmake-instrument`
+/// writes it as a query file under `<build>/.cmake/instrumentation/v1/query/generated`.
+#[derive(Clone, Debug, Default)]
+pub struct InstrumentationRequest {
+    /// Backtrace of the call.
+    pub backtrace: Backtrace,
+    /// `API_VERSION`.
+    pub api_version: BString,
+    /// `DATA_VERSION` (`major` or `major.minor`).
+    pub data_version: BString,
+    /// `HOOKS` (for example `postGenerate`, `postCMakeBuild`).
+    pub hooks: Vec<BString>,
+    /// `OPTIONS` (for example `staticSystemInformation`, `trace`).
+    pub options: Vec<BString>,
+    /// `CALLBACK` command lines, one for each keyword.
+    pub callbacks: Vec<BString>,
+    /// `CUSTOM_CONTENT` entries.
+    pub custom_content: Vec<InstrumentationContent>,
+}
+
 /// Global properties and defined-property metadata shared across the build/script session.
 #[derive(Clone, Debug, Default)]
 pub struct GlobalState {
@@ -226,6 +261,8 @@ pub struct GlobalState {
     pub props: PropertyMap,
     /// Properties registered via `define_property()`.
     pub defined_props: Vec<DefinedProperty>,
+    /// `cmake_instrumentation()` calls in call order.
+    pub instrumentation: Vec<InstrumentationRequest>,
 }
 
 impl GlobalState {

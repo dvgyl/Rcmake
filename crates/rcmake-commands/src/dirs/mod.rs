@@ -11,6 +11,7 @@ use rcmake_expr::ExpandedArg;
 use rcmake_host::{FileKind, Follow, path};
 use rcmake_model::{BT, DirId, UsageField, UsageProps};
 
+mod discover;
 mod tests_commands;
 
 #[cfg(test)]
@@ -30,7 +31,7 @@ pub(crate) fn register(registry: &mut Registry) {
     registry.add("link_libraries", link_libraries, flags);
     registry.add("source_group", source_group, flags);
     tests_commands::register(registry, flags);
-    registry.add("discover_tests", crate::pending_project_command, flags);
+    registry.add("discover_tests", discover::discover_tests, flags);
 }
 
 fn status(text: impl Into<BString>) -> CmdError {

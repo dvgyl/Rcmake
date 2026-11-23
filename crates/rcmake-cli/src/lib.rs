@@ -11,6 +11,7 @@ mod install;
 mod options;
 mod presets;
 mod resource;
+mod workflow;
 
 #[cfg(test)]
 mod driver_tests;
@@ -105,22 +106,11 @@ pub fn run(argv: &[BString], host: Arc<dyn Host>) -> i32 {
         }
     }
 
-    if tool == Tool::Cmake {
-        return run_cmake(argv, rest, host);
+    match tool {
+        Tool::Cmake => run_cmake(argv, rest, host),
+        Tool::Ctest => ctest::run(rest, host),
+        Tool::Cpack => rcmake_cpack::main(argv, host),
     }
-
-    if tool == Tool::Ctest {
-        return ctest::run(rest, host);
-    }
-
-    emit_cli_error(
-        host.as_ref(),
-        format!(
-            "{} mode is not yet implemented (scheduled for Milestone 3)",
-            tool.name()
-        ),
-    );
-    1
 }
 
 fn run_version_format(tool: Tool, fmt: &[u8], host: &dyn Host) -> i32 {
@@ -199,6 +189,9 @@ fn run_cmake(argv: &[BString], rest: &[BString], host: Arc<dyn Host>) -> i32 {
     }
     if let Some(args) = rest.strip_prefix(&[BString::from("--install")]) {
         return install::run(argv, args, host);
+    }
+    if let Some(args) = rest.strip_prefix(&[BString::from("--workflow")]) {
+        return workflow::run(args, host.as_ref());
     }
 
     let mut opts = match options::parse(rest, host.as_ref()) {

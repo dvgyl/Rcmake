@@ -128,6 +128,9 @@ pub(crate) fn lower_with_inputs(
             }
             steps.insert(push(&mut graph.steps, step));
         }
+        for step in super::lower_modules(model, resolved)? {
+            steps.insert(push(&mut graph.steps, step));
+        }
         if let Some(mut step) = resolved.link.clone().or_else(|| {
             let kind = link_kind(target.kind)?;
             let output = build_relative(model, artifacts.file.as_ref()?);

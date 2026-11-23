@@ -184,6 +184,8 @@ fn uses_argv_and_shell_fallback_and_stops_at_first_failed_invocation() {
                 source: "main.c".into(),
                 invocation: invocation(&["compiler", "arg with spaces"]),
                 depfile: None,
+                modmap: None,
+                dyndep: None,
             },
             link(
                 "bin/main",
@@ -259,6 +261,8 @@ fn builds_and_links_c_with_native_host() -> Result<(), Box<dyn std::error::Error
                 source: "main.c".into(),
                 depfile: None,
                 invocation: invocation(&["/usr/bin/cc", "-v", "-c", "main.c", "-o", "obj/main.o"]),
+                modmap: None,
+                dyndep: None,
             },
             link(
                 "bin/main",

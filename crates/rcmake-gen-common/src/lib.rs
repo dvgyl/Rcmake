@@ -11,10 +11,12 @@ use rcmake_host::{Host, HostError, path::from_native};
 
 pub mod compile_commands;
 pub mod configure_log;
+pub mod cpack_properties;
 pub mod ctest_file;
 pub mod export;
 pub mod fileapi;
 pub mod install_script;
+pub mod sbom;
 
 #[cfg(test)]
 mod tests;

@@ -286,6 +286,8 @@ pub struct TargetPolicySnapshot {
 pub enum FileSetKind {
     /// `HEADERS`.
     Headers,
+    /// `SOURCES`.
+    Sources,
     /// `CXX_MODULES`.
     CxxModules,
 }
@@ -296,6 +298,7 @@ impl FileSetKind {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Headers => "HEADERS",
+            Self::Sources => "SOURCES",
             Self::CxxModules => "CXX_MODULES",
         }
     }
@@ -305,6 +308,7 @@ impl FileSetKind {
     pub fn from_name(name: &[u8]) -> Option<Self> {
         match name {
             b"HEADERS" => Some(Self::Headers),
+            b"SOURCES" => Some(Self::Sources),
             b"CXX_MODULES" => Some(Self::CxxModules),
             _ => None,
         }
@@ -326,6 +330,8 @@ pub struct FileSet {
     pub base_dirs: Vec<BT<BString>>,
     /// `FILES` entries.
     pub files: Vec<BT<BString>>,
+    /// File set properties (`set_property(FILE_SET ...)`).
+    pub props: PropertyMap,
 }
 
 /// A target in the project model (`cmTarget`).

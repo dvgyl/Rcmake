@@ -69,6 +69,7 @@ impl FileApi<'_, '_> {
                     compile_units: Vec::new(),
                     link: None,
                     dependencies: Vec::new(),
+                    cxx_modules: None,
                 };
                 target.config.0 = config.into();
                 target
@@ -627,6 +628,8 @@ impl FileApi<'_, '_> {
                     "script"
                 }
                 InstallKind::Code(_) => "code",
+                // The codemodel has no installer type for CPS and SBOM files.
+                InstallKind::PackageInfo(_) | InstallKind::Sbom(_) => continue,
                 InstallKind::Export { set, file, .. } => {
                     base.insert("exportName".into(), Value::string(set.clone()));
                     let file = file
