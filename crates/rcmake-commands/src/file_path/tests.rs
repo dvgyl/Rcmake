@@ -1,14 +1,21 @@
+#![allow(clippy::indexing_slicing)]
+
 use std::path::Path;
 use std::sync::Arc;
 
 use rcmake_base::{BString, hash::HashAlgo};
-use rcmake_eval::{Interp, InterpConfig, RunMode};
+use rcmake_eval::{Interp, InterpConfig, Registry, RunMode};
 use rcmake_host::{FileKind, Follow, Host, PureHost, ReadRange, Stream};
 
 type TestResult = std::result::Result<(), Box<dyn std::error::Error>>;
 
 fn interpreter() -> (Arc<PureHost>, Interp) {
     interpreter_with_mode(RunMode::Script)
+}
+
+fn register(registry: &mut Registry) {
+    super::register(registry);
+    crate::vars_list::register(registry);
 }
 
 fn interpreter_with_mode(mode: RunMode) -> (Arc<PureHost>, Interp) {
@@ -25,7 +32,7 @@ fn interpreter_with_mode(mode: RunMode) -> (Arc<PureHost>, Interp) {
             defines: Vec::new(),
             script_args: Vec::new(),
         },
-        super::register,
+        register,
     );
     (host, interp)
 }
@@ -990,6 +997,463 @@ file(GLOB_RECURSE chained FOLLOW_SYMLINKS RELATIVE /work/entry "entry/*")
             "  Cyclic recursion detected while globbing for 'entry/*':\n\n  /work/outer/inner\n\n  /work/outer/inner/loop\n"
         ),
         "{stderr}"
+    );
+    Ok(())
+}
+
+fn macho_header(cpu: u32, subtype: u32, wide: bool, little: bool) -> Vec<u8> {
+    let magic = if wide { 0xfeed_facfu32 } else { 0xfeed_face };
+    let mut header = Vec::new();
+    for value in [magic, cpu, subtype, 2, 0, 0, 0] {
+        let bytes = if little {
+            value.to_le_bytes()
+        } else {
+            value.to_be_bytes()
+        };
+        header.extend_from_slice(&bytes);
+    }
+    if wide {
+        header.extend_from_slice(&[0; 4]);
+    }
+    header
+}
+
+fn fat_macho(wide: bool, little: bool) -> Vec<u8> {
+    let mut fat = Vec::new();
+    let magic = if wide { 0xcafe_babfu32 } else { 0xcafe_babe };
+    let entries = [(0x0100_0007, 3), (0x0100_000c, 0x8000_0002)];
+    let word = |out: &mut Vec<u8>, value: u32| {
+        let bytes = if little {
+            value.to_le_bytes()
+        } else {
+            value.to_be_bytes()
+        };
+        out.extend_from_slice(&bytes);
+    };
+    word(&mut fat, magic);
+    word(&mut fat, 2);
+    let table_end = if wide { 72 } else { 48 };
+    for ((cpu, subtype), offset) in entries.iter().zip([table_end, table_end + 32]) {
+        word(&mut fat, *cpu);
+        word(&mut fat, *subtype);
+        if wide && !little {
+            word(&mut fat, 0);
+        }
+        word(&mut fat, offset);
+        if wide {
+            word(&mut fat, 0);
+        }
+        word(&mut fat, 32);
+        if wide && little {
+            word(&mut fat, 0);
+        }
+        word(&mut fat, 0);
+        if wide {
+            word(&mut fat, 0);
+        }
+    }
+    for (cpu, subtype) in entries {
+        fat.extend(macho_header(cpu, subtype, true, true));
+    }
+    fat
+}
+
+#[test]
+fn read_macho_handles_all_magic_values_and_reports_invalid_files() -> TestResult {
+    let (host, mut interp) = interpreter();
+    for (label, wide, little) in [
+        ("wide_le", true, true),
+        ("wide_be", true, false),
+        ("short_le", false, true),
+        ("short_be", false, false),
+    ] {
+        let (cpu, subtype, expected) = if wide {
+            (0x0100_000c, 12, "arm64e.x1")
+        } else {
+            (12, 9, "armv7")
+        };
+        host.seed_file(
+            Path::new("/work/thin"),
+            &macho_header(cpu, subtype, wide, little),
+        )?;
+        host.seed_file(Path::new("/work/fat"), &fat_macho(wide, little))?;
+        script(
+            &host,
+            &mut interp,
+            &format!(
+                r#"
+set(capture previous)
+file(READ_MACHO thin ARCHITECTURES {label} CAPTURE_ERROR capture)
+file(READ_MACHO fat ARCHITECTURES fat CAPTURE_ERROR capture)
+"#
+            ),
+        )?;
+        vars(
+            &mut interp,
+            &[
+                (label, expected),
+                ("fat", "x86_64;arm64e"),
+                ("capture", "previous"),
+            ],
+        );
+    }
+    host.seed_file(Path::new("/work/truncated"), &fat_macho(true, false)[..80])?;
+    script(
+        &host,
+        &mut interp,
+        r#"
+file(READ_MACHO truncated ARCHITECTURES truncated CAPTURE_ERROR bad)
+file(READ_MACHO missing ARCHITECTURES absent CAPTURE_ERROR missing)
+"#,
+    )?;
+    vars(
+        &mut interp,
+        &[
+            ("truncated", "unknown"),
+            ("bad", "truncated is not a valid Macho-O file"),
+            ("absent", "unknown"),
+            ("missing", "missing does not exist"),
+        ],
+    );
+    Ok(())
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
+fn read_macho_reads_system_and_compiler_binaries_on_macos() -> TestResult {
+    use rcmake_host::{
+        CommandSpec, Input, NativeHost, Output, ProcessResult, RunRequest, path::from_native,
+    };
+    use std::time::Duration;
+
+    let native = Arc::new(NativeHost::new()?);
+    let run = |program: BString, args: Vec<BString>| -> TestResultBytes {
+        let result = native.run(
+            &RunRequest {
+                pipeline: vec![CommandSpec { program, args }],
+                cwd: "/tmp".into(),
+                env: native.env_all(),
+                stdin: Input::Null,
+                stdout: Output::Capture,
+                stderr: Output::Capture,
+                timeout: Some(Duration::from_secs(30)),
+                tee: false,
+            },
+            &mut |_, _| {},
+        )?;
+        assert_eq!(
+            result.results,
+            [ProcessResult::Exited(0)],
+            "{}",
+            BString::from(result.stderr)
+        );
+        Ok(result.stdout)
+    };
+    type TestResultBytes = std::result::Result<Vec<u8>, Box<dyn std::error::Error>>;
+    let temp = run(
+        "mktemp".into(),
+        vec!["-d".into(), "/tmp/rcmake-macho.XXXXXXXX".into()],
+    )?;
+    let folder = std::path::PathBuf::from(std::str::from_utf8(&temp)?.trim());
+    struct Cleanup(std::path::PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            if let Ok(host) = NativeHost::new() {
+                let _ = host.remove_dir_all(&self.0);
+            }
+        }
+    }
+    let _cleanup = Cleanup(folder.clone());
+    let source = folder.join("arm.c");
+    let binary = folder.join("arm");
+    native.write(
+        &source,
+        b"int main(void) { return 0; }",
+        rcmake_host::WriteMode::Truncate,
+    )?;
+    run(
+        "cc".into(),
+        vec![
+            "-arch".into(),
+            "arm64".into(),
+            from_native(&source),
+            "-o".into(),
+            from_native(&binary),
+        ],
+    )?;
+    let input = folder.join("probe.cmake");
+    let code = format!(
+        r#"
+file(READ_MACHO /usr/bin/cc ARCHITECTURES cc)
+file(READ_MACHO /bin/ls ARCHITECTURES ls)
+file(READ_MACHO "{}" ARCHITECTURES arm)
+"#,
+        binary.display()
+    );
+    native.write(&input, code.as_bytes(), rcmake_host::WriteMode::Truncate)?;
+    let mut interp = Interp::new(
+        InterpConfig {
+            host: native,
+            mode: RunMode::Script,
+            cmake_root: folder.clone(),
+            cmake_command: folder.join("cmake"),
+            cwd: folder,
+            limits: Default::default(),
+            diag: Default::default(),
+            defines: Vec::new(),
+            script_args: Vec::new(),
+        },
+        register,
+    );
+    assert_eq!(interp.run_script(&input).exit_code, 0);
+    vars(&mut interp, &[("arm", "arm64")]);
+    for name in [b"cc".as_slice(), b"ls"] {
+        let value = interp.cx().var_or_empty(name);
+        assert!(
+            value
+                .split(|&byte| byte == b';')
+                .any(|arch| matches!(arch, b"arm64" | b"arm64e" | b"arm64e.x1")),
+            "{value}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn file_install_tracks_staged_files_and_checks_size_and_time() -> TestResult {
+    let (host, mut interp) = interpreter();
+    host.seed_file(Path::new("/work/src/keep.txt"), b"old")?;
+    host.seed_file(Path::new("/work/src/ignore.txt"), b"ignore")?;
+    host.seed_file(Path::new("/work/src/run"), b"run")?;
+    host.symlink(Path::new("run"), Path::new("/work/src/link"))?;
+    host.env_set(b"DESTDIR", Some(b"/work/stage"));
+    script(
+        &host,
+        &mut interp,
+        r#"
+file(INSTALL DESTINATION /prefix TYPE DIRECTORY FILES src/
+    FILES_MATCHING PATTERN "*.txt" PATTERN "ignore*" EXCLUDE)
+file(INSTALL DESTINATION /prefix TYPE PROGRAM FILES src/link FOLLOW_SYMLINK_CHAIN)
+file(INSTALL DESTINATION /prefix TYPE FILE FILES absent OPTIONAL)
+file(INSTALL DESTINATION /prefix TYPE FILE FILES src/keep.txt MESSAGE_LAZY)
+"#,
+    )?;
+    let dest = Path::new("/work/stage/prefix/keep.txt");
+    let source = Path::new("/work/src/keep.txt");
+    assert_eq!(
+        host.metadata(Path::new("/work/stage/prefix/run"), Follow::Yes)?
+            .mode
+            & 0o777,
+        0o755
+    );
+    assert_eq!(
+        host.read_link(Path::new("/work/stage/prefix/link"))?,
+        Path::new("run")
+    );
+    assert!(
+        host.metadata(Path::new("/work/stage/prefix/ignore.txt"), Follow::Yes)
+            .is_err()
+    );
+    vars(
+        &mut interp,
+        &[(
+            "CMAKE_INSTALL_MANIFEST_FILES",
+            "/prefix/keep.txt;/prefix/link;/prefix/run;/prefix/keep.txt",
+        )],
+    );
+    let metadata = host.metadata(dest, Follow::Yes)?;
+    host.seed_file(source, b"longer")?;
+    host.set_times(source, None, Some(metadata.mtime))?;
+    script(
+        &host,
+        &mut interp,
+        "file(INSTALL DESTINATION /prefix TYPE FILE FILES src/keep.txt)",
+    )?;
+    assert_eq!(host.read(dest, ReadRange::All { limit: 100 })?, b"longer");
+    assert!(
+        host.stream_bytes(Stream::Stdout)
+            .to_string()
+            .contains("-- Installing: /work/stage/prefix/keep.txt")
+    );
+    Ok(())
+}
+
+fn elf_with_path(wide: bool, little: bool, tag: u64) -> Vec<u8> {
+    let mut data = vec![0; 384];
+    data[..7].copy_from_slice(&[
+        0x7f,
+        b'E',
+        b'L',
+        b'F',
+        if wide { 2 } else { 1 },
+        if little { 1 } else { 2 },
+        1,
+    ]);
+    let mut field = |offset: usize, size: usize, value: u64| {
+        let bytes = if little {
+            value.to_le_bytes()
+        } else {
+            value.to_be_bytes()
+        };
+        let value = if little {
+            &bytes[..size]
+        } else {
+            &bytes[8 - size..]
+        };
+        data[offset..offset + size].copy_from_slice(value);
+    };
+    let (word, ph_offset, ph_size_at, ph_width, seg_offset, seg_address, seg_size) = if wide {
+        (8, 32, 54, 56, 8, 16, 32)
+    } else {
+        (4, 28, 42, 32, 4, 8, 16)
+    };
+    field(ph_offset, word, 64);
+    field(ph_size_at, 2, ph_width as u64);
+    field(ph_size_at + 2, 2, 2);
+    field(64, 4, 1);
+    field(64 + seg_address, word, 0x1000);
+    field(64 + seg_size, word, 384);
+    field(64 + ph_width, 4, 2);
+    field(64 + ph_width + seg_offset, word, 192);
+    field(64 + ph_width + seg_size, word, (word * 2 * 4) as u64);
+    for (index, (kind, value)) in [(5, 0x1140), (tag, 1), (10, 40), (0, 0)]
+        .into_iter()
+        .enumerate()
+    {
+        field(192 + word * 2 * index, word, kind);
+        field(192 + word * (2 * index + 1), word, value);
+    }
+    let path = b"/toolchain:/build/lib:/vendor";
+    data[321..321 + path.len()].copy_from_slice(path);
+    data
+}
+
+#[test]
+fn file_rpath_changes_and_removes_elf_dynamic_paths() -> TestResult {
+    let (host, mut interp) = interpreter();
+    let path = Path::new("/work/binary");
+    for (wide, little, tag) in [(true, true, 29), (false, false, 15)] {
+        host.seed_file(path, &elf_with_path(wide, little, tag))?;
+        script(
+            &host,
+            &mut interp,
+            r#"
+file(RPATH_CHANGE FILE binary OLD_RPATH /build/lib NEW_RPATH /lib)
+file(RPATH_CHECK FILE binary RPATH /lib)
+"#,
+        )?;
+        let data = host.read(path, ReadRange::All { limit: 512 })?;
+        assert!(
+            data.windows(b"/toolchain:/lib:/vendor".len())
+                .any(|part| part == b"/toolchain:/lib:/vendor")
+        );
+        script(
+            &host,
+            &mut interp,
+            r#"
+file(RPATH_REMOVE FILE binary)
+file(RPATH_CHECK FILE binary RPATH "")
+"#,
+        )?;
+        let data = host.read(path, ReadRange::All { limit: 512 })?;
+        assert!(data[321..360].iter().all(|&byte| byte == 0));
+        script(
+            &host,
+            &mut interp,
+            "file(RPATH_CHECK FILE binary RPATH /missing)",
+        )?;
+        assert!(host.metadata(path, Follow::Yes).is_err());
+    }
+    host.seed_file(path, b"plain data")?;
+    script(
+        &host,
+        &mut interp,
+        r#"
+file(RPATH_REMOVE FILE binary)
+file(RPATH_CHANGE FILE binary OLD_RPATH "" NEW_RPATH "")
+file(RPATH_CHECK FILE binary RPATH "")
+"#,
+    )?;
+    assert_eq!(
+        host.read(path, ReadRange::All { limit: 32 })?,
+        b"plain data"
+    );
+    Ok(())
+}
+
+#[test]
+fn file_lock_creates_directory_locks_and_releases_scope_locks() -> TestResult {
+    let (host, mut interp) = interpreter();
+    host.seed_file(
+        Path::new("/work/child.cmake"),
+        b"file(LOCK file.lk GUARD FILE RESULT_VARIABLE file_held)",
+    )?;
+    script(
+        &host,
+        &mut interp,
+        r#"
+file(LOCK lock-dir DIRECTORY RESULT_VARIABLE first)
+file(LOCK lock-dir DIRECTORY TIMEOUT 0 RESULT_VARIABLE duplicate)
+file(LOCK lock-dir DIRECTORY RELEASE RESULT_VARIABLE released)
+function(lock_once)
+  file(LOCK scoped.lk GUARD FUNCTION RESULT_VARIABLE got)
+  set(function_held "${got}" PARENT_SCOPE)
+endfunction()
+lock_once()
+file(LOCK scoped.lk TIMEOUT 0 RESULT_VARIABLE after_function)
+file(LOCK scoped.lk RELEASE)
+include(/work/child.cmake)
+file(LOCK file.lk TIMEOUT 0 RESULT_VARIABLE after_file)
+file(LOCK file.lk RELEASE)
+file(LOCK bad.lk GUARD FUNCTION RESULT_VARIABLE bad)
+"#,
+    )?;
+    vars(
+        &mut interp,
+        &[
+            ("first", "0"),
+            ("duplicate", "File already locked"),
+            ("released", "0"),
+            ("function_held", "0"),
+            ("after_function", "0"),
+            ("file_held", "0"),
+            ("after_file", "0"),
+            ("bad", "'GUARD FUNCTION' not used in function definition"),
+        ],
+    );
+    assert!(
+        host.metadata(Path::new("/work/lock-dir/cmake.lock"), Follow::Yes)
+            .is_ok()
+    );
+    Ok(())
+}
+
+#[test]
+fn file_generate_records_ordered_arguments_without_writing_output() -> TestResult {
+    let (host, mut interp) = interpreter();
+    script(
+        &host,
+        &mut interp,
+        r#"
+file(GENERATE OUTPUT "out-$<CONFIG>" CONTENT "one;two\n"
+     CONDITION "$<CONFIG:Debug>" TARGET later FILE_PERMISSIONS OWNER_READ NEWLINE_STYLE UNIX)
+file(GENERATE OUTPUT second INPUT in USE_SOURCE_PERMISSIONS)
+"#,
+    )?;
+    let mut cx = interp.cx();
+    let props = &cx.global().props;
+    for (key, value) in [
+        ("_RCMAKE_FILE_GENERATE_COUNT", "2"),
+        ("_RCMAKE_FILE_GENERATE_0_DIRECTORY", "0"),
+        ("_RCMAKE_FILE_GENERATE_0_ARG1", "out-$<CONFIG>"),
+        ("_RCMAKE_FILE_GENERATE_0_ARG3", "one;two\n"),
+        ("_RCMAKE_FILE_GENERATE_1_ARG4", "USE_SOURCE_PERMISSIONS"),
+    ] {
+        assert_eq!(props.get(key.as_bytes()), Some(&BString::from(value)));
+    }
+    assert!(
+        host.metadata(Path::new("/work/second"), Follow::Yes)
+            .is_err()
     );
     Ok(())
 }

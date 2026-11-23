@@ -16,12 +16,14 @@ use super::{Result, arg, error};
 use rcmake_base::path_lex::Lexical;
 
 #[derive(Default)]
-struct Options {
-    no_source_permissions: bool,
-    files_matching: bool,
-    follow_chain: bool,
-    modes: Modes,
+pub(super) struct Options {
+    pub(super) no_source_permissions: bool,
+    pub(super) files_matching: bool,
+    pub(super) follow_chain: bool,
+    pub(super) modes: Modes,
     rules: Vec<Rule>,
+    pub(super) install: bool,
+    pub(super) force: bool,
 }
 
 struct Rule {
@@ -50,7 +52,15 @@ pub(super) fn run(cx: &mut Cx<'_>, args: &[&[u8]]) -> Result {
         } else {
             destination.join(leaf)
         };
-        copy_entry(cx, &source, &output, &options, &mut budget, 0)?;
+        copy_entry(
+            cx,
+            &source,
+            &output,
+            &options,
+            &mut budget,
+            0,
+            &mut |_, _, _| {},
+        )?;
     }
     Ok(Flow::Normal)
 }
@@ -71,33 +81,10 @@ fn parse<'a>(cx: &mut Cx<'_>, args: &[&'a [u8]]) -> Result<(Vec<&'a [u8]>, PathB
             b"FOLLOW_SYMLINK_CHAIN" => options.follow_chain = true,
             b"PATTERN" | b"REGEX" => {
                 let input = arg(&mut args, option)?;
-                let filename_only = option == b"PATTERN" && !input.contains(&b'/');
-                let pattern = if filename_only {
-                    rcmake_regex::glob::to_regex(input)
-                } else if option == b"PATTERN" {
-                    let glob = rcmake_regex::glob::to_regex(input);
-                    [b"/", glob.strip_prefix(b"^").unwrap_or(&glob)]
-                        .concat()
-                        .into()
-                } else {
-                    BString::from(input)
-                };
-                options.rules.push(Rule {
-                    regex: cx.regex(&pattern).map_err(|e| error(e.to_string()))?,
-                    exclude: false,
-                    mode: None,
-                    filename_only,
-                });
+                options.match_rule(cx, option, input)?;
             }
             b"EXCLUDE" | b"PERMISSIONS" => {
-                let rule = options.rules.last_mut().ok_or_else(|| {
-                    error([b"COPY option ", option, b" requires PATTERN or REGEX."].concat())
-                })?;
-                if option == b"EXCLUDE" {
-                    rule.exclude = true;
-                } else {
-                    rule.mode = Some(permissions(&mut args)?);
-                }
+                options.match_option(option, &mut args)?;
             }
             _ if destination.is_none() && options.rules.is_empty() => inputs.push(option),
             _ => {
@@ -111,7 +98,67 @@ fn parse<'a>(cx: &mut Cx<'_>, args: &[&'a [u8]]) -> Result<(Vec<&'a [u8]>, PathB
     Ok((inputs, destination, options))
 }
 
-fn permissions<'a>(args: &mut std::iter::Peekable<impl Iterator<Item = &'a [u8]>>) -> Result<u32> {
+impl Options {
+    pub(super) fn for_install(force: bool) -> Self {
+        Self {
+            no_source_permissions: true,
+            install: true,
+            force,
+            ..Self::default()
+        }
+    }
+
+    fn command(&self) -> &'static str {
+        if self.install { "INSTALL" } else { "COPY" }
+    }
+
+    pub(super) fn match_rule(
+        &mut self,
+        cx: &mut Cx<'_>,
+        option: &[u8],
+        input: &[u8],
+    ) -> Result<()> {
+        let filename_only = option == b"PATTERN" && !input.contains(&b'/');
+        let pattern = if filename_only {
+            rcmake_regex::glob::to_regex(input)
+        } else if option == b"PATTERN" {
+            let glob = rcmake_regex::glob::to_regex(input);
+            [b"/", glob.strip_prefix(b"^").unwrap_or(&glob)]
+                .concat()
+                .into()
+        } else {
+            BString::from(input)
+        };
+        self.rules.push(Rule {
+            regex: cx.regex(&pattern).map_err(|e| error(e.to_string()))?,
+            exclude: false,
+            mode: None,
+            filename_only,
+        });
+        Ok(())
+    }
+
+    pub(super) fn match_option<'a>(
+        &mut self,
+        option: &[u8],
+        args: &mut std::iter::Peekable<impl Iterator<Item = &'a [u8]>>,
+    ) -> Result<()> {
+        let command = self.command().as_bytes();
+        let rule = self.rules.last_mut().ok_or_else(|| {
+            error([command, b" option ", option, b" requires PATTERN or REGEX."].concat())
+        })?;
+        if option == b"EXCLUDE" {
+            rule.exclude = true;
+        } else {
+            rule.mode = Some(permissions(args)?);
+        }
+        Ok(())
+    }
+}
+
+pub(super) fn permissions<'a>(
+    args: &mut std::iter::Peekable<impl Iterator<Item = &'a [u8]>>,
+) -> Result<u32> {
     let mut flags = None;
     while let Some(mode) = args.peek().and_then(|value| permission(value)) {
         args.next();
@@ -122,24 +169,36 @@ fn permissions<'a>(args: &mut std::iter::Peekable<impl Iterator<Item = &'a [u8]>
 
 pub(super) fn copy_directory(cx: &Cx<'_>, source: &Path, target: &Path) -> Result<()> {
     let mut budget = cx.limits().regex_steps;
-    copy_entry(cx, source, target, &Options::default(), &mut budget, 0)
+    copy_entry(
+        cx,
+        source,
+        target,
+        &Options::default(),
+        &mut budget,
+        0,
+        &mut |_, _, _| {},
+    )
 }
 
-fn copy_entry(
+pub(super) fn copy_entry(
     cx: &Cx<'_>,
     source: &Path,
     target: &Path,
     options: &Options,
     budget: &mut u64,
     depth: u32,
+    observe: &mut impl FnMut(&Path, bool, bool),
 ) -> Result<()> {
+    let command = options.command();
     if depth > cx.limits().max_recursion.min(256) {
-        return Err(error("COPY exceeds the directory depth limit"));
+        return Err(error(format!(
+            "{command} exceeds the directory depth limit"
+        )));
     }
     let host = cx.host();
     let meta = host
         .metadata(source, Follow::No)
-        .map_err(|e| copy_error("read", source, &e))?;
+        .map_err(|e| copy_error(command, "read", source, &e))?;
     let directory = meta.kind == FileKind::Dir;
     let name = from_native(source);
     let filename = source.file_name().map(|name| from_native(Path::new(name)));
@@ -177,24 +236,45 @@ fn copy_entry(
         }
     });
     let existing = host.metadata(target, Follow::No).ok();
+    if options.install
+        && (meta.kind == FileKind::Other
+            || existing
+                .as_ref()
+                .is_some_and(|meta| meta.kind == FileKind::Other))
+    {
+        return Err(error(
+            "INSTALL requires a regular file, directory, or symbolic link.",
+        ));
+    }
     if existing
         .as_ref()
         .is_some_and(|m| (m.dev, m.ino) == (meta.dev, meta.ino))
     {
+        observe(target, directory, true);
         return Ok(());
     }
     if directory {
         if depth == 0 && is_descendant(cx, source, target) {
             return Err(error(format!(
-                "COPY cannot copy directory \"{}\" into itself.",
+                "{command} cannot copy directory \"{}\" into itself.",
                 source.display()
             )));
         }
         host.create_dir_all(target)
-            .map_err(|e| copy_error("make directory", target, &e))?;
-        let children = host
+            .map_err(|e| copy_error(command, "make directory", target, &e))?;
+        observe(
+            target,
+            true,
+            existing
+                .as_ref()
+                .is_some_and(|meta| meta.kind == FileKind::Dir),
+        );
+        let mut children = host
             .read_dir(source)
-            .map_err(|e| copy_error("read directory", source, &e))?;
+            .map_err(|e| copy_error(command, "read directory", source, &e))?;
+        if options.install {
+            children.sort_by(|left, right| left.name.cmp(&right.name));
+        }
         for entry in children {
             let name = to_native(&entry.name);
             copy_entry(
@@ -204,17 +284,18 @@ fn copy_entry(
                 options,
                 budget,
                 depth + 1,
+                observe,
             )?;
         }
     } else {
         if let Some(parent) = target.parent() {
             host.create_dir_all(parent)
-                .map_err(|e| copy_error("make directory", parent, &e))?;
+                .map_err(|e| copy_error(command, "make directory", parent, &e))?;
         }
         if meta.kind == FileKind::Symlink {
             let link = host
                 .read_link(source)
-                .map_err(|e| copy_error("read link", source, &e))?;
+                .map_err(|e| copy_error(command, "read link", source, &e))?;
             let (link, next) = if options.follow_chain {
                 let leaf = link
                     .file_name()
@@ -225,29 +306,42 @@ fn copy_entry(
             } else {
                 (link, None)
             };
-            if host.read_link(target).ok() != Some(link.clone()) {
+            let current = !options.force && host.read_link(target).ok() == Some(link.clone());
+            if !current {
                 if existing.is_some() {
                     host.remove_file(target)
-                        .map_err(|e| copy_error("remove", target, &e))?;
+                        .map_err(|e| copy_error(command, "remove", target, &e))?;
                 }
                 host.symlink(&link, target)
-                    .map_err(|e| copy_error("create link", target, &e))?;
+                    .map_err(|e| copy_error(command, "create link", target, &e))?;
             }
+            observe(target, false, current);
             if let Some((next_source, next_target)) = next {
-                copy_entry(cx, &next_source, &next_target, options, budget, depth + 1)?;
+                copy_entry(
+                    cx,
+                    &next_source,
+                    &next_target,
+                    options,
+                    budget,
+                    depth + 1,
+                    observe,
+                )?;
             }
             return Ok(());
         }
-        if !existing
-            .as_ref()
-            .is_some_and(|m| m.kind == FileKind::File && m.mtime == meta.mtime)
-        {
+        let current = !options.force
+            && existing.as_ref().is_some_and(|m| {
+                m.kind == FileKind::File
+                    && m.mtime == meta.mtime
+                    && (!options.install || m.len == meta.len)
+            });
+        if !current {
             if existing
                 .as_ref()
                 .is_some_and(|m| m.kind == FileKind::Symlink)
             {
                 host.remove_file(target)
-                    .map_err(|e| copy_error("remove", target, &e))?;
+                    .map_err(|e| copy_error(command, "remove", target, &e))?;
             }
             host.copy_file(
                 source,
@@ -257,11 +351,12 @@ fn copy_entry(
                     preserve_mtime: true,
                 },
             )
-            .map_err(|e| copy_error("copy file", source, &e))?;
+            .map_err(|e| copy_error(command, "copy file", source, &e))?;
         }
+        observe(target, false, current);
     }
     host.set_permissions(target, mode)
-        .map_err(|e| copy_error("set permissions on", target, &e))?;
+        .map_err(|e| copy_error(command, "set permissions on", target, &e))?;
     Ok(())
 }
 
@@ -281,9 +376,14 @@ fn is_descendant(cx: &Cx<'_>, source: &Path, target: &Path) -> bool {
         .unwrap_or(false)
 }
 
-fn copy_error(operation: &str, path: &Path, err: &rcmake_host::HostError) -> rcmake_eval::CmdError {
+fn copy_error(
+    command: &str,
+    operation: &str,
+    path: &Path,
+    err: &rcmake_host::HostError,
+) -> rcmake_eval::CmdError {
     error(format!(
-        "COPY cannot {operation} \"{}\": {}.",
+        "{command} cannot {operation} \"{}\": {}.",
         path.display(),
         err.os_message
     ))

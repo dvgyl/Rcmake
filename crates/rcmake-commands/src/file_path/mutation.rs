@@ -453,7 +453,7 @@ impl Modes {
     }
 }
 
-pub(super) fn permission(value: &[u8]) -> Option<u32> {
+pub(crate) fn permission(value: &[u8]) -> Option<u32> {
     Some(match value {
         b"SETUID" => 0o4000,
         b"SETGID" => 0o2000,

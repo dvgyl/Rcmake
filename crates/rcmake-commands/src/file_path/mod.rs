@@ -8,13 +8,20 @@ use rcmake_eval::{CmdError, CmdFlags, Cx, Flow, Registry};
 
 mod archive;
 mod copy;
+mod elf_rpath;
 mod file;
+mod generate;
 mod glob;
+mod install_cmd;
+mod lock;
+mod macho;
 mod mutation;
 mod path_cmd;
 mod path_hash;
 mod reading;
 mod strings;
+
+pub(crate) use mutation::permission;
 
 #[cfg(test)]
 mod tests;
@@ -60,4 +67,13 @@ fn set(cx: &mut Cx<'_>, name: &[u8], value: impl Into<BString>) -> Result {
     }
     cx.set_var(name, value);
     Ok(Flow::Normal)
+}
+
+fn status(cx: &Cx<'_>, message: &[u8]) {
+    if cx.log_level() >= rcmake_eval::LogLevel::Status {
+        cx.host().write_out(
+            rcmake_host::Stream::Stdout,
+            &[b"-- ".as_slice(), message, b"\n"].concat(),
+        );
+    }
 }
