@@ -1,23 +1,207 @@
-//! Source packages (`cpack --config CPackSourceConfig.cmake`, `package_source`).
+//! Stage source files and apply CMake regular expressions to source paths.
 
+use std::io::ErrorKind;
 use std::path::Path;
+use std::sync::Arc;
 
-use rcmake_host::Host;
+use rcmake_base::Limits;
+use rcmake_eval::Interp;
+use rcmake_host::path::{from_native, to_native};
+use rcmake_host::{CopyOptions, FileKind, Follow, Host, ReadRange};
 
-use crate::CpackError;
-use crate::config::CpackConfig;
+use crate::config::{CpackConfig, absolute, interpreter};
+use crate::stage::{clear_output_file, ensure_dir, relative_install_path};
+use crate::{CpackError, error};
 
-/// Copy the source tree into `staging_dir`, without the files that match
-/// `CPACK_SOURCE_IGNORE_FILES`.
+/// Copy the configured source directories and apply `CPACK_SOURCE_IGNORE_FILES`.
 ///
 /// # Errors
 ///
-/// Returns [`CpackError::Unsupported`] until source staging is implemented.
+/// Returns an error if a directory pair, regular expression, or file operation fails.
 pub fn stage_sources(
-    host: &dyn Host,
+    host: &Arc<dyn Host>,
     config: &CpackConfig,
     staging_dir: &Path,
 ) -> Result<(), CpackError> {
-    let _ = (host, config, staging_dir);
-    Err(CpackError::Unsupported("CPack source packaging"))
+    let cwd = host.initial_cwd();
+    let mut interp = interpreter(host, &cwd, &Default::default());
+    host.create_dir_all(staging_dir)?;
+    copy_directories(host.as_ref(), config, &cwd, staging_dir, &mut interp)
+}
+
+pub(crate) fn copy_directories(
+    host: &dyn Host,
+    config: &CpackConfig,
+    cwd: &Path,
+    staging: &Path,
+    interp: &mut Interp,
+) -> Result<(), CpackError> {
+    let directories = config.list(b"CPACK_INSTALLED_DIRECTORIES");
+    let (pairs, remainder) = directories.as_chunks::<2>();
+    if !remainder.is_empty() {
+        return Err(error(
+            "CPACK_INSTALLED_DIRECTORIES requires pairs of source and destination directories",
+        ));
+    }
+    if directories.is_empty() {
+        return Ok(());
+    }
+    let patterns = if config.get(b"CPACK_IGNORE_FILES").is_some() {
+        config.list(b"CPACK_IGNORE_FILES")
+    } else {
+        config.list(b"CPACK_SOURCE_IGNORE_FILES")
+    };
+    let regexes = patterns
+        .iter()
+        .map(|pattern| {
+            interp.cx().regex(pattern).map_err(|err| {
+                error(format!(
+                    "Invalid CPack ignore expression \"{pattern}\": {err:?}"
+                ))
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut budget = interp.cx().limits().regex_steps;
+    let ignored = &mut |path: &Path, kind: FileKind| -> Result<bool, CpackError> {
+        let mut name = from_native(path);
+        if kind == FileKind::Dir {
+            name.push(b'/');
+        }
+        for regex in &regexes {
+            if regex
+                .find_at(&name, 0, Default::default(), &mut budget)
+                .map_err(|err| error(err.to_string()))?
+                .is_some()
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    };
+    let staging = host.canonicalize(staging)?;
+    let excluded = staging
+        .ancestors()
+        .find(|path| {
+            path.file_name()
+                .is_some_and(|name| name == "_CPack_Packages")
+        })
+        .unwrap_or(&staging);
+    for [src, dest] in pairs {
+        let src = host.canonicalize(&absolute(cwd, src))?;
+        let dest = staging.join(relative_install_path(dest)?);
+        ensure_dir(host, &staging, &dest)?;
+        let mut remaining = 100_000;
+        copy_tree(
+            host,
+            &src,
+            &dest,
+            0,
+            &mut remaining,
+            false,
+            &mut |path, kind| Ok(path.starts_with(excluded) || ignored(path, kind)?),
+        )?;
+    }
+    Ok(())
+}
+
+pub(crate) fn merge_component(
+    host: &dyn Host,
+    source: &Path,
+    dest: &Path,
+) -> Result<(), CpackError> {
+    let mut remaining = 100_000;
+    copy_tree(host, source, dest, 0, &mut remaining, true, &mut |_, _| {
+        Ok(false)
+    })
+}
+
+fn copy_tree(
+    host: &dyn Host,
+    source: &Path,
+    dest: &Path,
+    depth: usize,
+    remaining: &mut usize,
+    merge: bool,
+    ignored: &mut impl FnMut(&Path, FileKind) -> Result<bool, CpackError>,
+) -> Result<(), CpackError> {
+    if depth >= 256 {
+        return Err(error("CPack source directory depth exceeds the limit"));
+    }
+    for entry in host.read_dir(source)? {
+        *remaining = remaining
+            .checked_sub(1)
+            .ok_or_else(|| error("CPack source file count exceeds the limit"))?;
+        let name = to_native(&entry.name);
+        let input = source.join(&name);
+        if entry.name.starts_with(b"._") || ignored(&input, entry.kind)? {
+            continue;
+        }
+        let output = dest.join(name);
+        if merge && existing_component_entry(host, &input, &output, entry.kind)? {
+            continue;
+        }
+        match entry.kind {
+            FileKind::File => {
+                clear_output_file(host, &output)?;
+                host.copy_file(
+                    &input,
+                    &output,
+                    CopyOptions {
+                        preserve_permissions: true,
+                        preserve_mtime: true,
+                    },
+                )?;
+            }
+            FileKind::Symlink => {
+                clear_output_file(host, &output)?;
+                host.symlink(&host.read_link(&input)?, &output)?;
+            }
+            FileKind::Dir => {
+                ensure_dir(host, dest, &output)?;
+                copy_tree(host, &input, &output, depth + 1, remaining, merge, ignored)?;
+                let metadata = host.metadata(&input, Follow::No)?;
+                host.set_permissions(&output, metadata.mode & 0o7777)?;
+                host.set_times(&output, Some(metadata.atime), Some(metadata.mtime))?;
+            }
+            FileKind::Other => {}
+        }
+    }
+    Ok(())
+}
+
+fn existing_component_entry(
+    host: &dyn Host,
+    input: &Path,
+    output: &Path,
+    kind: FileKind,
+) -> Result<bool, CpackError> {
+    let existing = match host.metadata(output, Follow::No) {
+        Ok(meta) => meta,
+        Err(err) if err.kind == ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(err.into()),
+    };
+    if existing.kind == kind {
+        match kind {
+            FileKind::Dir => return Ok(false),
+            FileKind::Symlink if host.read_link(input)? == host.read_link(output)? => {
+                return Ok(true);
+            }
+            FileKind::File => {
+                let meta = host.metadata(input, Follow::No)?;
+                let range = ReadRange::All {
+                    limit: Limits::default().max_file_read,
+                };
+                if existing.len == meta.len
+                    && host.read(input, range)? == host.read(output, range)?
+                {
+                    return Ok(true);
+                }
+            }
+            _ => {}
+        }
+    }
+    Err(error(format!(
+        "CPack components install different files to {}",
+        input.display()
+    )))
 }
