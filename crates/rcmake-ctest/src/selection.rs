@@ -1,10 +1,38 @@
-use std::collections::{BTreeMap, VecDeque};
+//! Test selection, dependencies, and scheduling priority.
+
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::path::{Path, PathBuf};
 
 use rcmake_base::{BString, Limits, truth};
+use rcmake_host::{FileKind, Follow, Host, HostError, path::to_native};
+use rcmake_presets::TestIndex as PresetIndex;
 use rcmake_regex::Regex;
 
 use crate::discovery::Test;
-use crate::{CtestError, CtestOptions};
+use crate::{CtestError, CtestOptions, state};
+
+/// Index settings from the command line or a test preset.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum IndexSource {
+    Argument(BString),
+    Preset(PresetIndex),
+}
+
+/// Selection and priority settings beyond the basic runner options.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct SelectionOptions {
+    pub(crate) indices: Option<IndexSource>,
+    pub(crate) union: bool,
+    pub(crate) exclude_fixture: Option<BString>,
+    pub(crate) exclude_fixture_setup: Option<BString>,
+    pub(crate) exclude_fixture_cleanup: Option<BString>,
+    pub(crate) tests_from_file: Option<PathBuf>,
+    pub(crate) exclude_from_file: Option<PathBuf>,
+    pub(crate) rerun_failed: bool,
+    pub(crate) out_of_date: bool,
+    pub(crate) schedule_random: bool,
+    pub(crate) random_seed: Option<u32>,
+}
 
 pub(crate) struct PlannedTest {
     pub(crate) number: usize,
@@ -26,6 +54,12 @@ pub(crate) struct Plan {
     pub(crate) tests: Vec<PlannedTest>,
     pub(crate) dependents: Vec<Vec<usize>>,
     pub(crate) prerequisites: Vec<usize>,
+    /// Plan indices in scheduling priority order.
+    #[allow(
+        dead_code,
+        reason = "The scheduler will use this order in the integration wave"
+    )]
+    pub(crate) schedule_order: Vec<usize>,
 }
 
 impl Plan {
@@ -71,6 +105,7 @@ impl Plan {
             }
         }
         Self {
+            schedule_order: (0..tests.len()).collect(),
             tests,
             dependents,
             prerequisites,
@@ -131,16 +166,28 @@ struct Filters {
 impl Filters {
     fn new(options: &CtestOptions) -> Result<Self, CtestError> {
         Ok(Self {
-            include: options.include.as_ref().map(compile).transpose()?,
-            exclude: options.exclude.as_ref().map(compile).transpose()?,
+            include: options
+                .include
+                .as_ref()
+                .filter(|pattern| !pattern.is_empty())
+                .map(compile)
+                .transpose()?,
+            exclude: options
+                .exclude
+                .as_ref()
+                .filter(|pattern| !pattern.is_empty())
+                .map(compile)
+                .transpose()?,
             include_labels: options
                 .include_labels
                 .iter()
+                .filter(|pattern| !pattern.is_empty())
                 .map(compile)
                 .collect::<Result<_, _>>()?,
             exclude_labels: options
                 .exclude_labels
                 .iter()
+                .filter(|pattern| !pattern.is_empty())
                 .map(compile)
                 .collect::<Result<_, _>>()?,
         })
@@ -198,18 +245,50 @@ fn fixture_index(tests: impl Iterator<Item = (usize, Vec<BString>)>) -> TestInde
     index
 }
 
-fn fixture_selection(tests: &[(usize, Test)], selected: &mut [bool]) {
-    let helpers = fixture_index(tests.iter().enumerate().map(|(id, (_, test))| {
-        let mut fixtures = test.list(b"FIXTURES_SETUP");
-        fixtures.extend(test.list(b"FIXTURES_CLEANUP"));
-        (id, fixtures)
-    }));
+#[derive(Default)]
+struct FixtureFilters {
+    any: Option<Regex>,
+    setup: Option<Regex>,
+    cleanup: Option<Regex>,
+}
+
+impl FixtureFilters {
+    fn new(options: &SelectionOptions) -> Result<Self, CtestError> {
+        let fixture_regex = |pattern: Option<&BString>| {
+            pattern
+                .filter(|pattern| !pattern.is_empty())
+                .map(compile)
+                .transpose()
+        };
+        Ok(Self {
+            any: fixture_regex(options.exclude_fixture.as_ref())?,
+            setup: fixture_regex(options.exclude_fixture_setup.as_ref())?,
+            cleanup: fixture_regex(options.exclude_fixture_cleanup.as_ref())?,
+        })
+    }
+}
+
+fn fixture_selection(
+    tests: &[(usize, Test)],
+    selected: &mut [bool],
+    filters: &FixtureFilters,
+) -> Result<(), CtestError> {
+    let helpers = |property| {
+        fixture_index(
+            tests
+                .iter()
+                .enumerate()
+                .map(|(id, (_, test))| (id, test.list(property))),
+        )
+    };
+    let setups = helpers(b"FIXTURES_SETUP");
+    let cleanups = helpers(b"FIXTURES_CLEANUP");
     let mut queue: VecDeque<_> = selected
         .iter()
         .enumerate()
         .filter_map(|(id, &selected)| selected.then_some(id))
         .collect();
-    let mut visited = std::collections::BTreeSet::new();
+    let mut visited = BTreeSet::new();
     while let Some(id) = queue.pop_front() {
         let Some((_, test)) = tests.get(id) else {
             continue;
@@ -218,19 +297,29 @@ fn fixture_selection(tests: &[(usize, Test)], selected: &mut [bool]) {
             continue;
         }
         for name in test.list(b"FIXTURES_REQUIRED") {
-            if !visited.insert(name.clone()) {
+            if !visited.insert(name.clone()) || match_optional(filters.any.as_ref(), &name)? {
                 continue;
             }
-            for &helper in helpers.get(&name).into_iter().flatten() {
-                if let Some(chosen) = selected.get_mut(helper)
-                    && !*chosen
-                {
-                    *chosen = true;
-                    queue.push_back(helper);
+            for (helpers, excluded) in [(&setups, &filters.setup), (&cleanups, &filters.cleanup)] {
+                if match_optional(excluded.as_ref(), &name)? {
+                    continue;
+                }
+                for &helper in helpers.get(&name).into_iter().flatten() {
+                    if let Some(chosen) = selected.get_mut(helper)
+                        && !*chosen
+                    {
+                        *chosen = true;
+                        queue.push_back(helper);
+                    }
                 }
             }
         }
     }
+    Ok(())
+}
+
+fn match_optional(pattern: Option<&Regex>, value: &[u8]) -> Result<bool, CtestError> {
+    pattern.map_or(Ok(false), |pattern| matches(pattern, value))
 }
 
 fn build_graph(mut tests: Vec<PlannedTest>) -> Plan {
@@ -289,32 +378,76 @@ fn build_graph(mut tests: Vec<PlannedTest>) -> Plan {
 
 pub(crate) fn plan(tests: Vec<Test>, options: &CtestOptions) -> Result<Plan, CtestError> {
     let filters = Filters::new(options)?;
-    let tests: Vec<_> = tests
+    let tests = configured_tests(tests, options);
+    let selected = tests
+        .iter()
+        .map(|(_, test)| filters.includes(test))
+        .collect::<Result<_, _>>()?;
+    finish_plan(tests, selected, &FixtureFilters::default())
+}
+
+/// Select tests with the full command line filters and set their scheduling order.
+#[allow(
+    dead_code,
+    reason = "The runner will use this entry point in the integration wave"
+)]
+pub(crate) fn plan_with(
+    host: &dyn Host,
+    dir: &Path,
+    tests: Vec<Test>,
+    options: &CtestOptions,
+    selection: &SelectionOptions,
+) -> Result<Plan, CtestError> {
+    let mut tests = configured_tests(tests, options);
+    let selected = if selection.rerun_failed {
+        let failures: BTreeSet<_> = state::last_failed(host, dir)?
+            .into_iter()
+            .map(|test| test.number)
+            .collect();
+        tests
+            .iter()
+            .map(|(number, _)| failures.contains(number))
+            .collect()
+    } else {
+        select_tests(host, dir, options, selection, &mut tests)?
+    };
+    let mut plan = finish_plan(tests, selected, &FixtureFilters::new(selection)?)?;
+    if !options.show_only {
+        plan.schedule_order = schedule_order(host, dir, &plan, options, selection)?;
+    }
+    Ok(plan)
+}
+
+fn configured_tests(tests: Vec<Test>, options: &CtestOptions) -> Vec<(usize, Test)> {
+    tests
         .into_iter()
         .enumerate()
-        .filter(|(_, test)| {
+        .filter_map(|(index, test)| {
             let configurations = test.list(b"CONFIGURATIONS");
-            configurations.is_empty()
+            let included = configurations.is_empty()
                 || options.config.as_ref().is_some_and(|config| {
                     configurations
                         .iter()
                         .any(|candidate| candidate.eq_ignore_ascii_case(config))
-                })
+                });
+            included.then_some((index + 1, test))
         })
-        .collect();
-    let mut selected = tests
-        .iter()
-        .map(|(_, test)| filters.includes(test))
-        .collect::<Result<Vec<_>, _>>()?;
-    fixture_selection(&tests, &mut selected);
+        .collect()
+}
 
+fn finish_plan(
+    tests: Vec<(usize, Test)>,
+    mut selected: Vec<bool>,
+    fixture_filters: &FixtureFilters,
+) -> Result<Plan, CtestError> {
+    fixture_selection(&tests, &mut selected, fixture_filters)?;
     let tests = tests
         .into_iter()
         .zip(selected)
         .filter(|(_, selected)| *selected)
-        .map(|((index, test), _)| {
+        .map(|((number, test), _)| {
             Ok(PlannedTest {
-                number: index + 1,
+                number,
                 checks: OutputChecks::new(&test)?,
                 cleanup: !test.list(b"FIXTURES_CLEANUP").is_empty(),
                 test,
@@ -323,4 +456,681 @@ pub(crate) fn plan(tests: Vec<Test>, options: &CtestOptions) -> Result<Plan, Cte
         })
         .collect::<Result<_, _>>()?;
     Ok(build_graph(tests))
+}
+
+fn select_tests(
+    host: &dyn Host,
+    dir: &Path,
+    options: &CtestOptions,
+    selection: &SelectionOptions,
+    tests: &mut Vec<(usize, Test)>,
+) -> Result<Vec<bool>, CtestError> {
+    let mut filters = Filters::new(options)?;
+    // CTest removes name exclusions during discovery if there is no name inclusion filter.
+    if filters.include.is_none()
+        && let Some(exclude) = filters.exclude.take()
+    {
+        let mut kept = Vec::with_capacity(tests.len());
+        let mut removed = 0;
+        for (number, test) in std::mem::take(tests) {
+            if matches(&exclude, &test.name)? {
+                removed += 1;
+            } else {
+                kept.push((number - removed, test));
+            }
+        }
+        *tests = kept;
+    }
+    let by_regex = tests
+        .iter()
+        .map(|(_, test)| filters.includes(test))
+        .collect::<Result<Vec<_>, _>>()?;
+    let index_count = if selection.union {
+        tests.len()
+    } else {
+        by_regex.iter().filter(|&&included| included).count()
+    };
+    let indices = selection
+        .indices
+        .as_ref()
+        .map(|source| index_filter(host, dir, source, index_count))
+        .transpose()?
+        .flatten();
+    let from_file = test_names(host, dir, selection.tests_from_file.as_deref())?;
+    let exclude_file = test_names(host, dir, selection.exclude_from_file.as_deref())?;
+    let mut regex_number = 0;
+    tests
+        .iter()
+        .zip(by_regex)
+        .enumerate()
+        .map(|(id, ((_, test), by_regex))| {
+            regex_number += usize::from(by_regex);
+            let by_index = indices.as_ref().map(|filter| {
+                let number = if selection.union {
+                    id + 1
+                } else {
+                    regex_number
+                };
+                filter.contains(number)
+            });
+            let included = if selection.union {
+                by_regex || by_index.unwrap_or(true)
+            } else {
+                by_regex && by_index.unwrap_or(true)
+            };
+            if !included
+                || from_file
+                    .as_ref()
+                    .is_some_and(|names| !names.contains(&test.name))
+                || exclude_file
+                    .as_ref()
+                    .is_some_and(|names| names.contains(&test.name))
+            {
+                return Ok(false);
+            }
+            if selection.out_of_date {
+                return out_of_date(host, dir, test);
+            }
+            Ok(true)
+        })
+        .collect()
+}
+
+fn test_names(
+    host: &dyn Host,
+    dir: &Path,
+    file: Option<&Path>,
+) -> Result<Option<BTreeSet<BString>>, CtestError> {
+    let Some(file) = file else { return Ok(None) };
+    let path = dir.join(file);
+    let data = state::read_optional(host, &path)?.ok_or_else(|| missing_file(path))?;
+    Ok(Some(
+        state::lines(&data)
+            .filter(|line| !line.is_empty())
+            .map(Into::into)
+            .collect(),
+    ))
+}
+
+fn missing_file(path: PathBuf) -> CtestError {
+    CtestError::Access {
+        source: HostError::from_io(std::io::ErrorKind::NotFound.into(), Some(path.clone())),
+        path,
+    }
+}
+
+fn out_of_date(host: &dyn Host, dir: &Path, test: &Test) -> Result<bool, CtestError> {
+    let dependencies = test.list(b"_CMAKE_TEST_BUILD_DEPENDS");
+    if dependencies.is_empty() {
+        return Ok(false);
+    }
+    let Some(stamp) = state::read_stamp(host, dir, &test.name)? else {
+        return Ok(true);
+    };
+    for dependency in dependencies {
+        let path = dir.join(to_native(&dependency));
+        if state::modified(host, &path)?.is_none_or(|modified| modified >= stamp) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+struct IndexFilter {
+    start: i32,
+    end: i32,
+    stride: f64,
+    explicit: BTreeSet<i32>,
+}
+
+impl IndexFilter {
+    fn contains(&self, number: usize) -> bool {
+        let Ok(number) = i32::try_from(number) else {
+            return false;
+        };
+        if self.explicit.contains(&number) {
+            return true;
+        }
+        if number < self.start || number > self.end || self.stride <= 0.0 {
+            return false;
+        }
+        if self.stride <= 1.0 {
+            return true;
+        }
+        // Calculate only the steps that can produce this index after truncation.
+        let offset = f64::from(number) - f64::from(self.start);
+        let step = (offset / self.stride).floor();
+        let start = f64::from(self.start);
+        [step, step + 1.0].iter().any(|step| {
+            let value = start + step * self.stride;
+            value <= f64::from(self.end) && value.trunc() == f64::from(number)
+        })
+    }
+}
+
+fn index_filter(
+    host: &dyn Host,
+    dir: &Path,
+    source: &IndexSource,
+    count: usize,
+) -> Result<Option<IndexFilter>, CtestError> {
+    let fields = match source {
+        IndexSource::Preset(PresetIndex::Range(range)) => IndexFields {
+            start: range.start,
+            end: range.end,
+            stride: range.stride.map(f64::from),
+            explicit: range
+                .specific_tests
+                .clone()
+                .unwrap_or_default()
+                .into_iter()
+                .collect(),
+        },
+        IndexSource::Preset(PresetIndex::File(file)) | IndexSource::Argument(file) => {
+            let path = dir.join(to_native(file));
+            let data = if host
+                .metadata(&path, Follow::Yes)
+                .is_ok_and(|metadata| metadata.kind == FileKind::File)
+            {
+                state::read_optional(host, &path)?
+            } else {
+                None
+            };
+            let raw = match data.as_deref() {
+                Some(data) => {
+                    // CTest reads the first line. Without a newline, its buffer omits the last byte.
+                    let line = if let Some(end) = data.iter().position(|&byte| byte == b'\n') {
+                        data.get(..end).unwrap_or_default()
+                    } else {
+                        data.get(..data.len().saturating_sub(1)).unwrap_or_default()
+                    };
+                    line.strip_suffix(b"\r").unwrap_or(line)
+                }
+                None => file,
+            };
+            if raw.is_empty() {
+                return Ok(None);
+            }
+            parse_indices(raw)
+        }
+    };
+    let filter = IndexFilter {
+        start: fields.start.filter(|&start| start != -1).unwrap_or(1),
+        end: fields
+            .end
+            .filter(|&end| end != -1)
+            .unwrap_or_else(|| i32::try_from(count).unwrap_or(i32::MAX)),
+        stride: fields
+            .stride
+            .filter(|&stride| stride != -1.0)
+            .unwrap_or(1.0),
+        explicit: fields.explicit,
+    };
+    // A range that expands to no indices leaves the selection unrestricted.
+    Ok(
+        (!filter.explicit.is_empty() || (filter.stride > 0.0 && filter.start <= filter.end))
+            .then_some(filter),
+    )
+}
+
+struct IndexFields {
+    start: Option<i32>,
+    end: Option<i32>,
+    stride: Option<f64>,
+    explicit: BTreeSet<i32>,
+}
+
+fn parse_indices(raw: &[u8]) -> IndexFields {
+    let mut fields = raw.split(|&byte| byte == b',');
+    let integer = |field: &[u8]| {
+        if field.is_empty() {
+            return None;
+        }
+        let field = field.trim_ascii_start();
+        let digits = field
+            .strip_prefix(b"-")
+            .or_else(|| field.strip_prefix(b"+"))
+            .unwrap_or(field);
+        let len = field.len() - digits.len()
+            + digits
+                .iter()
+                .take_while(|byte| byte.is_ascii_digit())
+                .count();
+        Some(
+            field
+                .get(..len)
+                .and_then(|value| std::str::from_utf8(value).ok())
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(0),
+        )
+    };
+    IndexFields {
+        start: fields.next().and_then(integer),
+        end: fields.next().and_then(integer),
+        stride: fields
+            .next()
+            .filter(|field| !field.is_empty())
+            .map(|field| {
+                crate::cli::number_prefix(field)
+                    .filter(|number| number.is_finite())
+                    .unwrap_or(0.0)
+            }),
+        explicit: fields.map(|field| integer(field).unwrap_or(-1)).collect(),
+    }
+}
+
+fn schedule_order(
+    host: &dyn Host,
+    dir: &Path,
+    plan: &Plan,
+    options: &CtestOptions,
+    selection: &SelectionOptions,
+) -> Result<Vec<usize>, CtestError> {
+    let costs = state::read_costs(host, dir)?;
+    let failed: BTreeSet<_> = costs.failed.iter().collect();
+    let mut seed = selection.random_seed.map_or_else(
+        || {
+            let now = host.now();
+            now.secs as u64 ^ u64::from(now.nanos) ^ host.monotonic().as_nanos() as u64
+        },
+        u64::from,
+    );
+    // A random priority changes test order without changing the dependency graph.
+    let priorities: Vec<_> = plan
+        .tests
+        .iter()
+        .map(|test| {
+            let property = test.property(b"COST");
+            let cost = crate::cli::number_prefix(property)
+                .filter(|cost| cost.is_finite())
+                .unwrap_or_default();
+            let priority = if selection.schedule_random {
+                random_priority(&mut seed)
+            } else if cost == 0.0 && options.jobs > 1 {
+                costs
+                    .tests
+                    .get(&test.name)
+                    .map_or(0.0, |entry| entry.average)
+            } else {
+                cost
+            };
+            (options.jobs > 1 && failed.contains(&test.name), priority)
+        })
+        .collect();
+
+    let mut dependencies = vec![Vec::new(); plan.tests.len()];
+    for (parent, children) in plan.dependents.iter().enumerate() {
+        for &child in children {
+            if let Some(deps) = dependencies.get_mut(child) {
+                deps.push(parent);
+            }
+        }
+    }
+    let mut order: Vec<_> = (0..plan.tests.len()).collect();
+    let priority = |id: usize| priorities.get(id).copied().unwrap_or_default();
+    if options.jobs > 1 {
+        let levels = dependency_depths(plan, &dependencies);
+        order.sort_by(|&left, &right| {
+            let (left_failed, left_cost) = priority(left);
+            let (right_failed, right_cost) = priority(right);
+            right_failed
+                .cmp(&left_failed)
+                .then_with(|| levels.get(right).cmp(&levels.get(left)))
+                .then_with(|| right_cost.total_cmp(&left_cost))
+        });
+        return Ok(order);
+    }
+    order.sort_by(|&left, &right| priority(right).1.total_cmp(&priority(left).1));
+    Ok(serial_dependencies_first(order, &dependencies))
+}
+
+fn dependency_depths(plan: &Plan, deps: &[Vec<usize>]) -> Vec<usize> {
+    let mut levels = vec![0; deps.len()];
+    let mut remaining: Vec<_> = plan.dependents.iter().map(Vec::len).collect();
+    let mut ready: Vec<_> = remaining
+        .iter()
+        .enumerate()
+        .filter_map(|(id, &count)| (count == 0).then_some(id))
+        .collect();
+    while let Some(id) = ready.pop() {
+        let depth = levels.get(id).copied().unwrap_or_default() + 1;
+        for &dep in deps.get(id).into_iter().flatten() {
+            if let Some(level) = levels.get_mut(dep) {
+                *level = depth.max(*level);
+            }
+            if let Some(count) = remaining.get_mut(dep) {
+                *count -= 1;
+                if *count == 0 {
+                    ready.push(dep);
+                }
+            }
+        }
+    }
+    levels
+}
+
+fn serial_dependencies_first(order: Vec<usize>, dependencies: &[Vec<usize>]) -> Vec<usize> {
+    let mut priority = Vec::with_capacity(order.len());
+    let mut seen = vec![false; order.len()];
+    let mut stack = Vec::new();
+    for id in order {
+        stack.push((id, false));
+        while let Some((next, visited)) = stack.pop() {
+            if visited {
+                priority.push(next);
+            } else if let Some(mark) = seen.get_mut(next)
+                && !std::mem::replace(mark, true)
+            {
+                stack.push((next, true));
+                stack.extend(
+                    dependencies
+                        .get(next)
+                        .into_iter()
+                        .flatten()
+                        .rev()
+                        .map(|&dep| (dep, false)),
+                );
+            }
+        }
+    }
+    priority
+}
+
+fn random_priority(seed: &mut u64) -> f64 {
+    // SplitMix64 makes the same seed produce the same priorities on all hosts.
+    *seed = seed.wrapping_add(0x9e3779b97f4a7c15);
+    let mut value = *seed;
+    value = (value ^ (value >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94d049bb133111eb);
+    (value >> 11) as f64
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use rcmake_host::PureHost;
+
+    use super::*;
+    use crate::discovery;
+    use crate::state::{CostData, CostEntry, FailedTest};
+
+    fn tree(source: &str) -> Result<Arc<PureHost>, CtestError> {
+        let host = Arc::new(PureHost::default());
+        seed(&host, "CTestTestfile.cmake", source.as_bytes())?;
+        Ok(host)
+    }
+
+    fn seed(host: &PureHost, path: &str, contents: &[u8]) -> Result<(), CtestError> {
+        let path = Path::new("/work").join(path);
+        host.seed_file(&path, contents)
+            .map_err(|source| CtestError::Access { path, source })
+    }
+
+    fn select(
+        host: &Arc<PureHost>,
+        options: &CtestOptions,
+        selection: &SelectionOptions,
+    ) -> Result<Plan, CtestError> {
+        let dir = Path::new("/work");
+        let tests = discovery::load(host.clone(), dir, options.config.as_ref())?;
+        plan_with(host.as_ref(), dir, tests, options, selection)
+    }
+
+    fn chosen(plan: &Plan) -> Vec<(usize, &BString)> {
+        plan.tests
+            .iter()
+            .map(|test| (test.number, &test.name))
+            .collect()
+    }
+
+    fn assert_selection(plan: &Plan, expected: &[(usize, &str)]) {
+        let actual: Vec<_> = chosen(plan)
+            .into_iter()
+            .map(|(number, name)| (number, name.to_string()))
+            .collect();
+        let expected: Vec<_> = expected
+            .iter()
+            .map(|&(number, name)| (number, name.to_owned()))
+            .collect();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn indexes_filtered_list_and_uses_discovery_numbers_for_union() -> Result<(), CtestError> {
+        let host = tree(
+            "add_test(a run)\nadd_test(b run)\nadd_test(c run)\nadd_test(d run)\nadd_test(e run)\n",
+        )?;
+        let options = CtestOptions {
+            include: Some("[ace]".into()),
+            show_only: true,
+            ..CtestOptions::default()
+        };
+        let mut selection = SelectionOptions {
+            indices: Some(IndexSource::Argument("2,2".into())),
+            ..SelectionOptions::default()
+        };
+        assert_selection(&select(&host, &options, &selection)?, &[(3, "c")]);
+        selection.union = true;
+        assert_selection(
+            &select(&host, &options, &selection)?,
+            &[(1, "a"), (2, "b"), (3, "c"), (5, "e")],
+        );
+        let options = CtestOptions {
+            include: None,
+            ..options
+        };
+        selection.union = false;
+        selection.indices = Some(IndexSource::Argument("1,5,1.5,5".into()));
+        assert_selection(
+            &select(&host, &options, &selection)?,
+            &[(1, "a"), (2, "b"), (4, "d"), (5, "e")],
+        );
+        selection.indices = Some(IndexSource::Argument("bad".into()));
+        assert_selection(
+            &select(&host, &options, &selection)?,
+            &[(1, "a"), (2, "b"), (3, "c"), (4, "d"), (5, "e")],
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn reads_index_files_and_filters_exact_names() -> Result<(), CtestError> {
+        let host =
+            tree("add_test(a run)\nadd_test(\"b test\" run)\nadd_test(c run)\nadd_test(d run)\n")?;
+        seed(&host, "index.txt", b"2,4\r\n1,1\r\n")?;
+        seed(&host, "include.txt", b"a\r\nb test\r\nc\r\n d\r\n")?;
+        seed(&host, "exclude.txt", b"c\n")?;
+        let mut selection = SelectionOptions {
+            indices: Some(IndexSource::Argument("index.txt".into())),
+            tests_from_file: Some("include.txt".into()),
+            exclude_from_file: Some("exclude.txt".into()),
+            ..SelectionOptions::default()
+        };
+        assert_selection(
+            &select(&host, &CtestOptions::default(), &selection)?,
+            &[(2, "b test")],
+        );
+        // CTest uses the last byte of an unterminated line for its string terminator.
+        seed(&host, "index.txt", b"2,2")?;
+        selection.tests_from_file = None;
+        selection.exclude_from_file = None;
+        assert_selection(
+            &select(&host, &CtestOptions::default(), &selection)?,
+            &[(2, "b test"), (3, "c"), (4, "d")],
+        );
+        selection.indices = Some(IndexSource::Argument(
+            format!(",,0,{}2", "2,".repeat(300)).into(),
+        ));
+        assert_selection(
+            &select(&host, &CtestOptions::default(), &selection)?,
+            &[(2, "b test")],
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn rerun_matches_indices_and_skips_other_filters() -> Result<(), CtestError> {
+        let host = tree("add_test(a run)\nadd_test(b run)\nadd_test(c run)\n")?;
+        state::write_failed(
+            host.as_ref(),
+            Path::new("/work"),
+            &[FailedTest {
+                number: 2,
+                name: "old name".into(),
+            }],
+        )?;
+        let options = CtestOptions {
+            include: Some("[".into()),
+            exclude: Some("b".into()),
+            include_labels: vec!["[".into()],
+            exclude_labels: vec!["[".into()],
+            ..CtestOptions::default()
+        };
+        let selection = SelectionOptions {
+            rerun_failed: true,
+            out_of_date: true,
+            indices: Some(IndexSource::Argument("1,1".into())),
+            tests_from_file: Some("missing.txt".into()),
+            ..SelectionOptions::default()
+        };
+        assert_selection(&select(&host, &options, &selection)?, &[(2, "b")]);
+        Ok(())
+    }
+
+    #[test]
+    fn fixture_filters_apply_only_to_automatic_tests() -> Result<(), CtestError> {
+        let host = tree(
+            r#"
+            add_test(setup run)
+            add_test(cleanup run)
+            add_test(user run)
+            set_tests_properties(setup PROPERTIES FIXTURES_SETUP database)
+            set_tests_properties(cleanup PROPERTIES FIXTURES_CLEANUP database)
+            set_tests_properties(user PROPERTIES FIXTURES_REQUIRED database)
+        "#,
+        )?;
+        let mut options = CtestOptions {
+            include: Some("^user$".into()),
+            ..CtestOptions::default()
+        };
+        let mut selection = SelectionOptions::default();
+        assert_selection(
+            &select(&host, &options, &selection)?,
+            &[(1, "setup"), (2, "cleanup"), (3, "user")],
+        );
+        selection.exclude_fixture_setup = Some("^data".into());
+        assert_selection(
+            &select(&host, &options, &selection)?,
+            &[(2, "cleanup"), (3, "user")],
+        );
+        selection.exclude_fixture_setup = None;
+        selection.exclude_fixture_cleanup = Some("base$".into());
+        assert_selection(
+            &select(&host, &options, &selection)?,
+            &[(1, "setup"), (3, "user")],
+        );
+        selection.exclude_fixture = Some("database".into());
+        assert_selection(&select(&host, &options, &selection)?, &[(3, "user")]);
+        options.include = Some("setup|user".into());
+        assert_selection(
+            &select(&host, &options, &selection)?,
+            &[(1, "setup"), (3, "user")],
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn selects_tests_with_missing_or_newer_build_dependencies() -> Result<(), CtestError> {
+        let host = tree(
+            r#"
+            add_test(tracked run)
+            add_test(untracked run)
+            set_tests_properties(tracked PROPERTIES _CMAKE_TEST_BUILD_DEPENDS "dependency;/work/other")
+        "#,
+        )?;
+        let dir = Path::new("/work");
+        let options = CtestOptions {
+            show_only: true,
+            ..CtestOptions::default()
+        };
+        let selection = SelectionOptions {
+            out_of_date: true,
+            ..SelectionOptions::default()
+        };
+        assert_selection(&select(&host, &options, &selection)?, &[(1, "tracked")]);
+        seed(&host, "dependency", b"first")?;
+        seed(&host, "other", b"first")?;
+        host.sleep(Duration::from_secs(1));
+        state::write_stamp(host.as_ref(), dir, b"tracked")?;
+        assert_selection(&select(&host, &options, &selection)?, &[]);
+        host.sleep(Duration::from_secs(1));
+        seed(&host, "other", b"changed")?;
+        assert_selection(&select(&host, &options, &selection)?, &[(1, "tracked")]);
+        Ok(())
+    }
+
+    #[test]
+    fn orders_by_cost_and_seed_without_changing_test_numbers() -> Result<(), CtestError> {
+        let host = tree(
+            r#"
+            add_test(a run)
+            add_test(b run)
+            add_test(c run)
+            add_test(d run)
+            add_test(e run)
+            set_tests_properties(a PROPERTIES COST 10)
+            set_tests_properties(c PROPERTIES DEPENDS a)
+        "#,
+        )?;
+        let costs = CostData {
+            tests: BTreeMap::from([
+                (
+                    "a".into(),
+                    CostEntry {
+                        runs: 2,
+                        average: 1.0,
+                    },
+                ),
+                (
+                    "b".into(),
+                    CostEntry {
+                        runs: 2,
+                        average: 2.0,
+                    },
+                ),
+                (
+                    "c".into(),
+                    CostEntry {
+                        runs: 2,
+                        average: 100.0,
+                    },
+                ),
+            ]),
+            failed: vec!["d".into()],
+        };
+        state::write_costs(host.as_ref(), Path::new("/work"), &costs)?;
+        let mut options = CtestOptions {
+            jobs: 4,
+            ..CtestOptions::default()
+        };
+        let mut selection = SelectionOptions::default();
+        let plan = select(&host, &options, &selection)?;
+        assert_selection(&plan, &[(1, "a"), (2, "b"), (3, "c"), (4, "d"), (5, "e")]);
+        assert_eq!(plan.schedule_order, [3, 0, 2, 1, 4]);
+        options.jobs = 1;
+        assert_eq!(
+            select(&host, &options, &selection)?.schedule_order,
+            [0, 1, 2, 3, 4]
+        );
+        selection.schedule_random = true;
+        selection.random_seed = Some(17);
+        let first = select(&host, &options, &selection)?.schedule_order;
+        assert_eq!(select(&host, &options, &selection)?.schedule_order, first);
+        selection.random_seed = Some(18);
+        assert_ne!(select(&host, &options, &selection)?.schedule_order, first);
+        assert!(first.iter().position(|&id| id == 0) < first.iter().position(|&id| id == 2));
+        Ok(())
+    }
 }
