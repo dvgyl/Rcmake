@@ -62,6 +62,8 @@ pub(super) fn project(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
     let binary = path::from_native(&cx.current_binary_dir());
     let top_level = source == cx.var_or_empty(b"CMAKE_SOURCE_DIR");
     cx.set_var(b"PROJECT_NAME", (*name).into());
+    cx.directory_props()
+        .set("_RCMAKE_PROJECT_NAME".into(), (*name).into());
     if top_level {
         set_static(cx, b"CMAKE_PROJECT_NAME", name);
     }

@@ -108,6 +108,16 @@ fn add_file_set<'a>(
     let existing = find_file_set(model, id, &name.value);
     let previous = existing.and_then(|id| model.file_set(id));
     let (kind, sycl) = file_set_kind(&name.value, args.kind, previous)?;
+    if kind == FileSetKind::Headers
+        && target
+            .props
+            .get(b"FRAMEWORK")
+            .is_some_and(|value| rcmake_base::truth::is_on(value))
+    {
+        return Err(status(
+            "FILE_SETs, of type \"HEADERS\", may not be added to FRAMEWORK targets.",
+        ));
+    }
     if kind == FileSetKind::CxxModules && scope == UsageScope::Interface && !target.is_imported() {
         return Err(status(
             "File set TYPE \"CXX_MODULES\" may not have \"INTERFACE\" scope.",
@@ -161,11 +171,6 @@ fn add_file_set<'a>(
     let target = model
         .target_mut(id)
         .ok_or_else(|| model_error(ModelError::UnknownObject))?;
-    if kind == FileSetKind::Sources && scope != UsageScope::Interface {
-        target
-            .sources
-            .extend(set.files.iter().skip(first_new_file).cloned());
-    }
     if kind == FileSetKind::Headers {
         let include = list::join(
             set.base_dirs
@@ -326,9 +331,12 @@ pub(crate) fn require_sycl(
         }
         return Ok(());
     }
-    Err(status(format!(
-        "{subject} is experimental and must be enabled by the CMAKE_EXPERIMENTAL_SYCL gate."
-    )))
+    Err(crate::command_error(
+        cx,
+        format!(
+            "{subject} is experimental and must be enabled by the CMAKE_EXPERIMENTAL_SYCL gate."
+        ),
+    ))
 }
 
 /// Find a file set on a target by name.
@@ -484,11 +492,9 @@ pub(crate) fn replace_file_set_paths(
     } else {
         &mut set.files
     };
-    let previous = if append {
-        Vec::new()
-    } else {
-        std::mem::take(entries)
-    };
+    if !append {
+        entries.clear();
+    }
     let first_new_file = if bases { file_count } else { entries.len() };
     if let Some(value) = value {
         entries.push(BT::new(value, bt));
@@ -498,21 +504,6 @@ pub(crate) fn replace_file_set_paths(
         validate_file_set_membership(cx, &set, first_new_file)?;
     }
     let model = cx.project();
-    if !bases && set.kind == FileSetKind::Sources && set.scope != UsageScope::Interface {
-        let target = model
-            .target_mut(set.target)
-            .ok_or_else(|| model_error(ModelError::UnknownObject))?;
-        for old in previous {
-            if let Some(index) = target.sources.iter().rposition(|entry| {
-                entry.value == old.value && entry.backtrace.frames().eq(old.backtrace.frames())
-            }) {
-                target.sources.remove(index);
-            }
-        }
-        target
-            .sources
-            .extend(set.files.iter().skip(first_new_file).cloned());
-    }
     *model
         .file_set_mut(id)
         .ok_or_else(|| model_error(ModelError::UnknownObject))? = set;

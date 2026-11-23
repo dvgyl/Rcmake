@@ -251,7 +251,7 @@ fn invalid_argument(value: &[u8]) -> CmdError {
 fn list_lines<'a>(values: impl IntoIterator<Item = &'a BString>) -> BString {
     let mut out = BString::default();
     for value in values {
-        out.extend_from_slice(b"\n    ");
+        out.extend_from_slice(b"\n  ");
         out.extend_from_slice(value);
     }
     if !out.is_empty() {
@@ -371,6 +371,14 @@ impl Bindings {
 }
 
 pub(super) fn find_package(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
+    find_package_with_diagnostics(cx, args, None)
+}
+
+pub(super) fn find_package_with_diagnostics(
+    cx: &mut Cx<'_>,
+    args: &[ExpandedArg],
+    dependency: Option<&mut Vec<cps_import::PackageDiagnostic>>,
+) -> CmdResult {
     let Some((package, parameters)) = args.split_first() else {
         return Err(status(b"called with incorrect number of arguments"));
     };
@@ -478,7 +486,7 @@ pub(super) fn find_package(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
         vars.add(find(b"REGISTRY_VIEW"), registry_view.clone());
     }
     let found = vars.scoped(cx, |cx| {
-        search(cx, name, &found_var, &request, &package_roots)
+        search(cx, name, &found_var, &request, &package_roots, dependency)
     });
     match found {
         Ok(found) => finish(cx, name, &request, first_target, found),
@@ -501,17 +509,37 @@ fn finish(
     found: bool,
 ) -> CmdResult {
     record_result(cx, name, found);
-    if request.global || cx.var_is_on(b"CMAKE_FIND_PACKAGE_TARGETS_GLOBAL") {
-        let dir = cx.current_dir_id();
-        let project = cx.project();
-        let imported: Vec<_> = project
-            .targets()
-            .skip(first_target)
-            .filter_map(|(id, target)| {
-                (target.dir == dir && target.is_imported() && !target.is_global()).then_some(id)
-            })
-            .collect();
-        for id in imported {
+    let version = cx.var(&text(&[name, b"_VERSION"]));
+    let global = request.global || cx.var_is_on(b"CMAKE_FIND_PACKAGE_TARGETS_GLOBAL");
+    let dir = cx.current_dir_id();
+    let project = cx.project();
+    let imported: Vec<_> = project
+        .targets()
+        .skip(first_target)
+        .filter(|(_, target)| target.dir == dir && target.is_imported())
+        .map(|(id, _)| id)
+        .collect();
+    for id in imported {
+        if let Some(target) = project.target_mut(id)
+            && found
+            && target.props.get(b"_RCMAKE_FIND_PACKAGE_NAME").is_none()
+        {
+            target
+                .props
+                .set("_RCMAKE_FIND_PACKAGE_NAME".into(), name.into());
+            if let Some(version) = version.as_ref().filter(|version| !version.is_empty()) {
+                target
+                    .props
+                    .set("_RCMAKE_FIND_PACKAGE_VERSION".into(), version.clone());
+            }
+            if let Some(requested) = &request.version {
+                target.props.set(
+                    "_RCMAKE_FIND_PACKAGE_REQUESTED_VERSION".into(),
+                    requested.full.clone(),
+                );
+            }
+        }
+        if global {
             project
                 .set_imported_global(id)
                 .map_err(|err| CmdError::Status(err.to_string().into()))?;
@@ -546,6 +574,7 @@ fn search(
     found_var: &[u8],
     request: &Request,
     package_roots: &[BString],
+    mut dependency: Option<&mut Vec<cps_import::PackageDiagnostic>>,
 ) -> Result<bool, CmdError> {
     let mut config = ConfigSearch::new(name, request);
     let redirected = cx.var_or_empty(b"CMAKE_FIND_PACKAGE_REDIRECTS_DIR");
@@ -571,6 +600,25 @@ fn search(
             return Ok(found);
         }
         if let Some(file) = config_file {
+            if found && let Some(diagnostics) = dependency.as_deref_mut() {
+                let dir = cx.current_dir_id();
+                let targets = request
+                    .components
+                    .iter()
+                    .map(|(component, _)| text(&[name, b"::", component]))
+                    .filter(|target| cx.project().find_target(dir, target).is_none())
+                    .collect::<Vec<_>>();
+                if !targets.is_empty() {
+                    diagnostics.push(cps_import::PackageDiagnostic::new(text(&[
+                        b"Found package configuration file:\n\n  ",
+                        &file,
+                        b"\n\nbut the following required targets were not found: ",
+                        &list::join(targets.iter()),
+                    ])));
+                    cx.set_var(found_var, "0".into());
+                    return Ok(false);
+                }
+            }
             if !found {
                 let reason = cx.var_or_empty(&text(&[name, b"_NOT_FOUND_MESSAGE"]));
                 let message = text(&[
@@ -588,7 +636,11 @@ fn search(
                     },
                     &reason,
                 ]);
-                report_missing(cx, request, message)?;
+                if let Some(diagnostics) = dependency {
+                    diagnostics.push(cps_import::PackageDiagnostic::new(message));
+                } else {
+                    report_missing(cx, request, message)?;
+                }
             }
             return Ok(found);
         }
@@ -605,7 +657,22 @@ fn search(
     } else {
         config.missing_message(try_module)
     };
-    report_missing(cx, request, message)?;
+    if let Some(diagnostics) = dependency {
+        if let Some(rejection) = config.rejected_dependency {
+            diagnostics.extend(rejection.diagnostics);
+        } else {
+            diagnostics.push(cps_import::PackageDiagnostic::new(message));
+        }
+    } else if request.required
+        && let Some(rejection) = config.rejected_dependency
+    {
+        for diagnostic in rejection.diagnostics {
+            diagnostic.emit(cx);
+        }
+        report_missing(cx, request, rejection.reason)?;
+    } else {
+        report_missing(cx, request, message)?;
+    }
     Ok(false)
 }
 
@@ -657,6 +724,7 @@ struct ConfigSearch<'a> {
     redirect: Option<PathBuf>,
     visited: BTreeSet<(PathBuf, bool)>,
     considered: Vec<(BString, BString, Option<BString>)>,
+    rejected_dependency: Option<cps_import::Rejection>,
     cps_names: Vec<BString>,
 }
 
@@ -714,6 +782,7 @@ impl<'a> ConfigSearch<'a> {
             redirect: None,
             visited: BTreeSet::new(),
             considered: Vec::new(),
+            rejected_dependency: None,
         }
     }
 
@@ -869,15 +938,17 @@ impl<'a> ConfigSearch<'a> {
                     match cps_import::check_version(&package, self.request) {
                         Ok(()) => cps_import::prepare(cx, &file, &mut package, self.request)?
                             .map(|()| package),
-                        Err(reason) => Err(reason),
+                        Err(reason) => Err(reason.into()),
                     }
                 }
-                Ok(package) => Err(format!(
+                Ok(package) => Err(BString::from(format!(
                     "The file describes the package {:?}, which is not the requested package.",
                     package.name
-                )
+                ))
                 .into()),
-                Err(reason) => Err(reason),
+                Err(_) => {
+                    Err(BString::from("The package description file could not be read.").into())
+                }
             };
             let file = path::from_native(&file);
             let considered_version = if found_version.is_empty() {
@@ -895,9 +966,16 @@ impl<'a> ConfigSearch<'a> {
                         cps: Some(Box::new(package)),
                     }));
                 }
-                Err(reason) => self
-                    .considered
-                    .push((file, considered_version, Some(reason))),
+                Err(rejection) => {
+                    self.considered.push((
+                        file,
+                        considered_version,
+                        Some(rejection.reason.clone()),
+                    ));
+                    if !rejection.diagnostics.is_empty() && self.rejected_dependency.is_none() {
+                        self.rejected_dependency = Some(rejection);
+                    }
+                }
             }
         }
         Ok(None)
@@ -1010,7 +1088,11 @@ impl<'a> ConfigSearch<'a> {
 
     fn missing_message(&self, tried_module: bool) -> BString {
         let name = self.name;
-        let preface = if tried_module {
+        let cps_rejected = self
+            .considered
+            .iter()
+            .any(|(path, _, _)| path.ends_with(b".cps"));
+        let preface = if tried_module && !cps_rejected {
             text(&[
                 b"By not providing \"Find", name,
                 b".cmake\" in CMAKE_MODULE_PATH this project has asked CMake to find a package configuration file provided by \"",
@@ -1050,7 +1132,7 @@ impl<'a> ConfigSearch<'a> {
                 .map(|(file, version, reason)| {
                     let mut entry = text(&[file, b", version: ", version]);
                     if let Some(reason) = reason {
-                        entry.extend_from_slice(b"\n      ");
+                        entry.extend_from_slice(b"\n    ");
                         entry.extend_from_slice(reason);
                     }
                     entry

@@ -384,20 +384,42 @@ impl UsageResolver<'_> {
                 .collect::<IndexSet<_>>()
         });
         let binary_root = &self.model.dir(DirId::ROOT).binary_dir;
+        let mut file_set_sources = Vec::new();
+        for (_, set) in resolver.source_file_sets(id, &ctx).ok()? {
+            let owner = self.model.target(set.target)?;
+            let dir = self.model.dir(owner.dir);
+            for entry in resolver
+                .file_set_paths(set.target, b"SOURCES", &set.files, &ctx)
+                .ok()?
+            {
+                let source = self
+                    .source_paths
+                    .and_then(|paths| paths.find(dir, &entry.value))
+                    .unwrap_or_else(|| absolute_path(&dir.source_dir, &entry.value));
+                file_set_sources.push((
+                    source,
+                    set.props
+                        .get(b"LANGUAGE")
+                        .is_some_and(|value| !value.is_empty()),
+                ));
+            }
+        }
         let files = value
             .entries
             .into_iter()
-            .map(|entry| path(&entry.value))
-            .filter(|source| {
+            .map(|entry| (path(&entry.value), false))
+            .chain(file_set_sources)
+            .filter(|(source, _)| {
                 source_filter
                     .as_ref()
                     .is_none_or(|filter| filter.contains(source))
             })
-            .filter(|source| {
+            .filter(|(source, explicit_language)| {
                 !external_object(dir, source)
-                    && lower::source_language(self.model, target, source).is_some()
+                    && (*explicit_language
+                        || lower::source_language(self.model, target, source).is_some())
             })
-            .map(|source| {
+            .map(|(source, _)| {
                 let object = lower::object_path(self.model, target, config, &source);
                 absolute_path(binary_root, &object)
             })

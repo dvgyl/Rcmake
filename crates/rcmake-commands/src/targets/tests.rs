@@ -642,10 +642,7 @@ fn source_sets_record_build_sources_and_target_properties() -> TestResult {
     )?;
     for (name, value) in [
         ("initial", ""),
-        (
-            "src",
-            "first.c;/work/src/pub.c;/work/src/more/a.c;/work/src/local.c;/work/src/more/b.c",
-        ),
+        ("src", "first.c"),
         ("own", "SOURCES;extra;local"),
         ("api", "SOURCES;extra;api"),
         ("default", "/work/src/pub.c"),
@@ -810,7 +807,7 @@ fn file_set_properties_update_sources_and_preserve_scope() -> TestResult {
         ("hidden", "0"),
         ("set", "1"),
         ("unset", "0"),
-        ("build", "ordinary.c;changed/new.c;changed/next.c"),
+        ("build", "ordinary.c"),
         ("src_target", "changed/new.c;changed/next.c"),
     ] {
         var(&mut interp, name, value);

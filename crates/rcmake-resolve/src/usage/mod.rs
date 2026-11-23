@@ -12,7 +12,10 @@ use rcmake_genex::{
     EvalContext, EvalFlags, EvalSite, GenexError, GenexNode, TargetHandle, UsageTraversal,
     evaluate, parse,
 };
-use rcmake_model::{BT, DirId, ProjectModel, Target, TargetId, TargetKind, UsageField};
+use rcmake_model::{
+    BT, DirId, FileSet, FileSetId, FileSetKind, ProjectModel, Target, TargetId, TargetKind,
+    UsageField, UsageScope,
+};
 
 use crate::{InterfaceInclude, sources::SourcePaths};
 
@@ -332,6 +335,48 @@ impl<'a> UsageResolver<'a> {
             );
         }
         Ok(result)
+    }
+
+    pub(crate) fn source_file_sets(
+        &mut self,
+        target: TargetId,
+        ctx: &EvalContext,
+    ) -> Result<Vec<(FileSetId, &'a FileSet)>, ResolveError> {
+        let mut ctx = context(target, ctx, UsageTraversal::Compile);
+        ctx.head.get_or_insert(handle(target));
+        let owners = self.walk(target, b"SOURCES", &ctx)?.contributions;
+        let model = self.model;
+        Ok(owners
+            .into_iter()
+            .filter_map(|(owner, _)| model.target(owner))
+            .flat_map(|owner| owner.file_sets.iter())
+            .filter_map(|id| Some((*id, model.file_set(*id)?)))
+            .filter(|(_, set)| {
+                let own = set.target == target;
+                match set.kind {
+                    FileSetKind::Headers => false,
+                    FileSetKind::Sources if !own => set.scope != UsageScope::Private,
+                    _ => {
+                        own && (set.scope != UsageScope::Interface
+                            || model
+                                .target(target)
+                                .is_some_and(|target| target.name == crate::STD_MODULE_TARGET))
+                    }
+                }
+            })
+            .collect())
+    }
+
+    pub(crate) fn file_set_paths(
+        &mut self,
+        owner: TargetId,
+        property: &[u8],
+        entries: &[BT<BString>],
+        ctx: &EvalContext,
+    ) -> Result<Vec<BT<BString>>, ResolveError> {
+        let mut result = UsageValue::default();
+        self.eval_entries(owner, property, entries, ctx, &mut result)?;
+        Ok(result.entries)
     }
 
     fn eval_entries<'entry>(

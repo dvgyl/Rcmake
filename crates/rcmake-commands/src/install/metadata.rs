@@ -125,7 +125,7 @@ impl<'a> Arguments<'a> {
         }
         if let Some(key) = unknown.first() {
             return Err(fail(
-                [signature, b" given unknown argument:\n\n  \"", key, b"\"."].concat(),
+                [signature, b" given unknown argument: \"", key, b"\"."].concat(),
             ));
         }
         valid_name(signature, result.one(signature).unwrap_or_default())?;

@@ -21,6 +21,7 @@ struct Options {
     imported: bool,
     global: bool,
     exclude: bool,
+    symbolic: bool,
     win32: bool,
     bundle: bool,
 }
@@ -34,6 +35,7 @@ impl Options {
             b"WIN32" if executable => self.win32 = true,
             b"MACOSX_BUNDLE" if executable => self.bundle = true,
             _ if executable => return false,
+            b"SYMBOLIC" => self.symbolic = true,
             _ => {
                 self.kind = match arg {
                     b"STATIC" => Some(TargetKind::StaticLibrary),
@@ -96,6 +98,11 @@ fn add(cx: &mut Cx<'_>, args: &[ExpandedArg], executable: bool) -> CmdResult {
     }
     validate_name(cx, name, options.imported)?;
     let kind = options.target_kind(cx, executable)?;
+    if options.symbolic && kind != TargetKind::InterfaceLibrary {
+        return Err(status(
+            "SYMBOLIC option may only be used with INTERFACE libraries",
+        ));
+    }
     if options.imported {
         for (set, flag) in [
             (options.win32, "WIN32"),
@@ -121,7 +128,18 @@ fn add(cx: &mut Cx<'_>, args: &[ExpandedArg], executable: bool) -> CmdResult {
         policies,
     );
     init::initialize(cx, &mut target);
+    if options.symbolic {
+        target.props.set("SYMBOLIC".into(), "TRUE".into());
+    }
     if !options.imported {
+        let model = cx.project();
+        let project_name = std::iter::successors(Some(dir), |id| model.dir(*id).parent)
+            .find_map(|id| model.dir(id).props.get(b"_RCMAKE_PROJECT_NAME"));
+        if let Some(name) = project_name {
+            target
+                .props
+                .set("_RCMAKE_TARGET_PROJECT_NAME".into(), name.clone());
+        }
         for (flag, prop) in [
             (options.win32, "WIN32_EXECUTABLE"),
             (options.bundle, "MACOSX_BUNDLE"),
@@ -158,10 +176,15 @@ fn validate_name(cx: &mut Cx<'_>, name: &BString, special: bool) -> Result<(), C
             | b"install"
             | b"package"
             | b"package_source"
-            | b"test"
             | b"edit_cache"
             | b"rebuild_cache"
     );
+    if name == b"test" && cx.var_is_on(b"CMAKE_TESTING_ENABLED") {
+        return Err(crate::command_error(
+            cx,
+            "The target name \"test\" is reserved when CTest testing is enabled.",
+        ));
+    }
     if valid && (special || !reserved) {
         Ok(())
     } else {
@@ -186,6 +209,7 @@ fn alias(
     };
     if options.imported
         || options.exclude
+        || options.symbolic
         || options.win32
         || options.bundle
         || options.kind.is_some()

@@ -247,7 +247,7 @@ fn scan(
         _ => None,
     });
     let invocation = match commands.as_slice() {
-        [] => return Err(crate::missing_scanner(target)),
+        [] => command(":".into()),
         [invocation] => invocation.clone(),
         _ => command(
             commands

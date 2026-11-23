@@ -5,9 +5,13 @@ use std::path::{Path, PathBuf};
 
 use rcmake_base::{BString, ByteSlice as _, list, version};
 use rcmake_cps::{CpsComponentType, CpsError, CpsPackage, CpsRequirement, CpsUsage, reader};
+use rcmake_diag::{
+    Backtrace, Diagnostic, Effect, Frame, FrameKind, Location, MessageKind, RenderOptions, render,
+};
 use rcmake_eval::{CmdError, Cx};
 use rcmake_expr::ExpandedArg;
-use rcmake_host::{FileKind, Follow, ReadRange, path};
+use rcmake_host::{FileKind, Follow, ReadRange, Stream, path};
+use rcmake_json::{ReadOptions, Value};
 use rcmake_model::{
     BT, ImportedVisibility, LinkItem, Target, TargetKind, TargetOrigin, UsageField,
 };
@@ -18,6 +22,98 @@ use super::text;
 
 const ACTIVE: &[u8] = b"_RCMAKE_ACTIVE_CPS_PACKAGES";
 const SOURCE: &[u8] = b"_RCMAKE_CPS_SOURCE";
+
+pub(super) struct PackageDiagnostic {
+    pub(super) body: BString,
+    files: Vec<BString>,
+}
+
+impl PackageDiagnostic {
+    pub(super) fn new(body: BString) -> Self {
+        Self {
+            body,
+            files: Vec::new(),
+        }
+    }
+
+    pub(super) fn emit(&self, cx: &mut Cx<'_>) {
+        self.emit_as(cx, MessageKind::Error);
+    }
+
+    fn emit_as(&self, cx: &mut Cx<'_>, kind: MessageKind) {
+        let root = cx
+            .project()
+            .dir(rcmake_model::DirId::ROOT)
+            .source_dir
+            .clone();
+        let backtrace = cx.backtrace();
+        let commands: Vec<_> = backtrace
+            .frames()
+            .filter(|frame| frame.kind != FrameKind::ModuleInclude)
+            .collect();
+        let callers = commands
+            .into_iter()
+            .rev()
+            .fold(Backtrace::default(), |stack, frame| {
+                stack.push(frame.clone())
+            });
+        let backtrace = self.files.iter().rev().fold(callers, |stack, file| {
+            stack.push(Frame {
+                file: file.as_slice().into(),
+                line: 0,
+                name: None,
+                kind: FrameKind::ModuleInclude,
+            })
+        });
+        let diagnostic = Diagnostic {
+            kind,
+            effect: Effect::None,
+            category: None,
+            policy: None,
+            location: Location::Backtrace(backtrace),
+            body: self.body.clone(),
+        };
+        let options = RenderOptions {
+            relative_base: Some(root),
+            ..RenderOptions::default()
+        };
+        cx.host()
+            .write_out(Stream::Stderr, &render(&diagnostic, &options));
+    }
+}
+
+pub(super) struct Rejection {
+    pub(super) reason: BString,
+    pub(super) diagnostics: Vec<PackageDiagnostic>,
+}
+
+impl From<BString> for Rejection {
+    fn from(reason: BString) -> Self {
+        Self {
+            reason,
+            diagnostics: Vec::new(),
+        }
+    }
+}
+
+impl Rejection {
+    fn dependency(
+        package: &CpsPackage,
+        dependency: BString,
+        mut diagnostics: Vec<PackageDiagnostic>,
+        files: &[&Path],
+    ) -> Self {
+        for diagnostic in &mut diagnostics {
+            diagnostic
+                .files
+                .extend(files.iter().map(|file| path::from_native(file)));
+        }
+        Self {
+            reason: dependency_error(package, &dependency),
+            diagnostics,
+        }
+    }
+}
 
 fn read(cx: &Cx<'_>, file: &Path) -> Result<Vec<u8>, BString> {
     if !cx
@@ -44,8 +140,70 @@ fn message(error: CpsError) -> BString {
     }
 }
 
-pub(super) fn read_root(cx: &Cx<'_>, file: &Path) -> Result<CpsPackage, BString> {
-    reader::read_package(&read(cx, file)?, &path::from_native(file)).map_err(message)
+pub(super) fn read_root(cx: &mut Cx<'_>, file: &Path) -> Result<CpsPackage, BString> {
+    let bytes = read(cx, file)?;
+    let file = path::from_native(file);
+    match reader::read_package(&bytes, &file) {
+        Ok(package) => Ok(package),
+        Err(error) => recover_optional_attributes(cx, &bytes, &file).ok_or_else(|| message(error)),
+    }
+}
+
+fn recover_optional_attributes(
+    cx: &mut Cx<'_>,
+    bytes: &[u8],
+    file: &BString,
+) -> Option<CpsPackage> {
+    let mut value = rcmake_json::parse(bytes, &ReadOptions::default()).ok()?;
+    let Value::Object(root) = &mut value else {
+        return None;
+    };
+    let Value::String(package) = root.get(b"name".as_slice())?.clone() else {
+        return None;
+    };
+    let mut warnings = Vec::new();
+    for key in ["license", "default_license", "description", "homepage"] {
+        if root
+            .get(key.as_bytes())
+            .is_some_and(|value| !matches!(value, Value::String(_)))
+        {
+            root.remove(key.as_bytes());
+            warnings.push(format!("Package attribute {key:?} is not a string."));
+        }
+    }
+    if let Some(Value::Object(components)) = root.get_mut(b"components".as_slice()) {
+        components.retain(|name, value| {
+            let name = format!("{package}::{name}");
+            let Value::Object(component) = value else {
+                warnings.push(format!("Component {name:?} is not an object."));
+                return false;
+            };
+            let configurations = b"configurations".as_slice();
+            if component.get(configurations).is_some_and(|value| !matches!(value, Value::Object(_))) {
+                component.remove(configurations);
+                warnings.push(format!("Component {name:?} attribute \"configurations\" is not an object."));
+            }
+            for (key, property) in [("location", "LOCATION"), ("link_location", "IMPLIB")] {
+                if component.get(key.as_bytes()).is_some_and(|value| !matches!(value, Value::String(_))) {
+                    component.remove(key.as_bytes());
+                    warnings.push(format!("Failed to set property {property:?} on target {name:?}: attribute {key:?} is not a string."));
+                }
+            }
+            true
+        });
+    }
+    if warnings.is_empty() {
+        return None;
+    }
+    let parsed = reader::read_package(&rcmake_json::write_compact(&value), file).ok()?;
+    for body in warnings {
+        PackageDiagnostic {
+            body: body.into(),
+            files: vec![file.clone()],
+        }
+        .emit_as(cx, MessageKind::Warning);
+    }
+    Some(parsed)
 }
 
 pub(super) fn check_version(package: &CpsPackage, request: &Request) -> Result<(), BString> {
@@ -126,7 +284,7 @@ pub(super) fn prepare(
     file: &Path,
     package: &mut CpsPackage,
     request: &Request,
-) -> Result<Result<(), BString>, CmdError> {
+) -> Result<Result<(), Rejection>, CmdError> {
     let active = cx.var_normal_only(ACTIVE);
     let files = active
         .iter()
@@ -135,9 +293,10 @@ pub(super) fn prepare(
     if files.clone().any(|file| file == identity)
         || files.count() >= cx.limits().max_recursion.min(64) as usize
     {
-        return Ok(Err(
-            "Circular or excessively deep CPS package dependency.".into()
-        ));
+        return Ok(Err(BString::from(
+            "Circular or excessively deep CPS package dependency.",
+        )
+        .into()));
     }
     let mut active_value = active.clone().unwrap_or_default();
     if !active_value.is_empty() {
@@ -165,13 +324,16 @@ fn load_companions(
     file: &Path,
     package: &mut CpsPackage,
     request: &Request,
-) -> Result<Result<(), BString>, CmdError> {
+) -> Result<Result<(), Rejection>, CmdError> {
     let (Some(dir), Some(stem)) = (
         file.parent(),
         file.file_stem()
             .map(|stem| path::from_native(Path::new(stem))),
     ) else {
-        return Ok(Err("The CPS file has no package name or directory.".into()));
+        return Ok(Err(BString::from(
+            "The CPS file has no package name or directory.",
+        )
+        .into()));
     };
     let mut files: Vec<_> = cx
         .host()
@@ -225,7 +387,7 @@ fn load_companions(
         package,
         supplements.get(b"".as_slice()).map_or(&[], Vec::as_slice),
     ) {
-        return Ok(Err(reason));
+        return Ok(Err(reason.into()));
     }
     let mut wanted: BTreeSet<_> = request
         .components
@@ -235,8 +397,13 @@ fn load_companions(
         .chain(internal_requirements(package))
         .collect();
     let mut failed = BTreeMap::new();
-    if let Some(dependency) = missing_dependency(cx, package, request)? {
-        return Ok(Err(dependency_error(package, &dependency)));
+    if let Some((dependency, diagnostics)) = missing_dependency(cx, package, request)? {
+        return Ok(Err(Rejection::dependency(
+            package,
+            dependency,
+            diagnostics,
+            &[file],
+        )));
     }
     while let Some(index) = appendices.iter().position(|(_, appendix)| {
         request.components.is_empty()
@@ -252,12 +419,19 @@ fn load_companions(
             &mut appendix.package,
             supplements.get(&suffix).map_or(&[], Vec::as_slice),
         ) {
-            return Ok(Err(reason));
+            return Ok(Err(reason.into()));
         }
-        if let Some(dependency) = missing_dependency(cx, &appendix.package, request)? {
-            for name in appendix.package.components.keys() {
-                failed.insert(name.clone(), dependency.clone());
-            }
+        if let Some((dependency, diagnostics)) = missing_dependency(cx, &appendix.package, request)?
+        {
+            failed.insert(
+                appendix
+                    .package
+                    .components
+                    .keys()
+                    .cloned()
+                    .collect::<Vec<_>>(),
+                Rejection::dependency(package, dependency, diagnostics, &[&appendix.file, file]),
+            );
             continue;
         }
         if let Err(error) = reader::merge_appendix(
@@ -265,7 +439,7 @@ fn load_companions(
             &appendix.contents,
             &path::from_native(&appendix.file),
         ) {
-            return Ok(Err(message(error)));
+            return Ok(Err(message(error).into()));
         }
         wanted.extend(internal_requirements(&appendix.package));
         package.components.extend(appendix.package.components);
@@ -277,10 +451,15 @@ fn load_companions(
                 .get(component)
                 .is_some_and(|entry| target_kind(&entry.ty).is_some())
         {
-            return Ok(Err(failed.get(component).map_or_else(
-                || format!("Required component was not found: {component}.").into(),
-                |dependency| dependency_error(package, dependency),
-            )));
+            let rejection = failed
+                .into_iter()
+                .find_map(|(components, rejection)| {
+                    components.contains(component).then_some(rejection)
+                })
+                .unwrap_or_else(|| {
+                    BString::from(format!("Required component was not found: {component}.")).into()
+                });
+            return Ok(Err(rejection));
         }
     }
     for name in package
@@ -294,9 +473,10 @@ fn load_companions(
             .get(&name)
             .is_some_and(|component| target_kind(&component.ty).is_some())
         {
-            return Ok(Err(
-                format!("Required component was not found: {name}.").into()
-            ));
+            return Ok(Err(BString::from(format!(
+                "Required component was not found: {name}."
+            ))
+            .into()));
         }
     }
     Ok(Ok(()))
@@ -343,7 +523,7 @@ fn missing_dependency(
     cx: &mut Cx<'_>,
     package: &CpsPackage,
     request: &Request,
-) -> Result<Option<BString>, CmdError> {
+) -> Result<Option<(BString, Vec<PackageDiagnostic>)>, CmdError> {
     let mut dependencies = package.requires.clone();
     for reference in usages(package).flat_map(references) {
         if let Some((dependency, component)) = reference.split_once_str(b":")
@@ -358,8 +538,8 @@ fn missing_dependency(
         }
     }
     for (name, requirement) in dependencies {
-        if !find_dependency(cx, &name, &requirement, request.global)? {
-            return Ok(Some(name));
+        if let Some(diagnostics) = find_dependency(cx, &name, &requirement, request.global)? {
+            return Ok(Some((name, diagnostics)));
         }
     }
     Ok(None)
@@ -370,7 +550,7 @@ fn find_dependency(
     name: &[u8],
     requirement: &CpsRequirement,
     global: bool,
-) -> Result<bool, CmdError> {
+) -> Result<Option<Vec<PackageDiagnostic>>, CmdError> {
     let found = text(&[name, b"_FOUND"]);
     cx.unset_var(&found);
     let mut args = vec![name.into()];
@@ -388,23 +568,17 @@ fn find_dependency(
         args.extend(requirement.hints.iter().cloned());
     }
     let line = cx.current_line();
-    cx.call_command(
-        b"find_package",
-        args.into_iter()
-            .map(|value| ExpandedArg {
-                value,
-                line,
-                kind: ArgKind::Bracket,
-            })
-            .collect(),
-    )?;
-    let dir = cx.current_dir_id();
-    Ok(cx.var_is_on(&found)
-        && requirement.components.iter().all(|component| {
-            cx.project()
-                .find_target(dir, &text(&[name, b"::", component]))
-                .is_some()
-        }))
+    let args = args
+        .into_iter()
+        .map(|value| ExpandedArg {
+            value,
+            line,
+            kind: ArgKind::Bracket,
+        })
+        .collect::<Vec<_>>();
+    let mut diagnostics = Vec::new();
+    find_package::find_package_with_diagnostics(cx, &args, Some(&mut diagnostics))?;
+    Ok((!cx.var_is_on(&found)).then_some(diagnostics))
 }
 
 fn dependency_error(package: &CpsPackage, dependency: &[u8]) -> BString {
@@ -455,6 +629,15 @@ pub(super) fn import(
             continue;
         };
         let mut target = new_target(text(&[&package.name, b"::", component_name]), kind);
+        if let Some(license) = component
+            .license
+            .as_ref()
+            .or(package.default_license.as_ref())
+            .or(package.license.as_ref())
+            .filter(|license| !license.is_empty())
+        {
+            target.props.set("SPDX_LICENSE".into(), license.clone());
+        }
         if component.ty == CpsComponentType::Symbolic {
             target.props.set("SYMBOLIC".into(), "TRUE".into());
         }
@@ -489,6 +672,9 @@ pub(super) fn import(
     }
     if !package.default_components.is_empty() {
         let mut target = new_target(package.name.clone(), TargetKind::InterfaceLibrary);
+        if let Some(license) = &package.license {
+            target.props.set("SPDX_LICENSE".into(), license.clone());
+        }
         for component in &package.default_components {
             add_link(&mut target, text(&[&package.name, b"::", component]));
         }

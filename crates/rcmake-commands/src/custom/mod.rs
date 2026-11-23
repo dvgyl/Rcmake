@@ -401,13 +401,7 @@ fn add_event(
     let project = cx.project();
     let name_text = BString::from(name);
     let target = match project.lookup_target(body.dir, name) {
-        Some(TargetBinding::Target(id)) => id,
-        Some(TargetBinding::Alias(_)) => {
-            return Err(crate::command_error(
-                cx,
-                format!("TARGET '{name_text}' is an alias."),
-            ));
-        }
+        Some(TargetBinding::Target(id) | TargetBinding::Alias(id)) => id,
         None => {
             return Err(crate::command_error(
                 cx,
@@ -469,6 +463,12 @@ fn add_target(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
             format!(
                 "The target name \"{name}\" is reserved or not valid for certain CMake features, such as generator expressions, and may result in undefined behavior."
             ),
+        ));
+    }
+    if name == b"test" && cx.var_is_on(b"CMAKE_TESTING_ENABLED") {
+        return Err(crate::command_error(
+            cx,
+            "The target name \"test\" is reserved when CTest testing is enabled.",
         ));
     }
 

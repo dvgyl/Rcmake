@@ -96,6 +96,29 @@ pub(super) fn policy(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
             };
             cx.set_var(var, state.into());
         }
+        [b"ISSUE_WARNING", name, options @ ..] => {
+            let id = policy_id(name, "ISSUE_WARNING")?;
+            let (mut preface, mut postface) = (Vec::new(), Vec::new());
+            let mut destination: Option<&mut Vec<u8>> = None;
+            for option in options {
+                match *option {
+                    b"PRE" => destination = Some(&mut preface),
+                    b"POST" => destination = Some(&mut postface),
+                    value => {
+                        if let Some(destination) = &mut destination {
+                            destination.extend_from_slice(value);
+                        }
+                    }
+                }
+            }
+            issue_warning(cx, id, &preface, &postface);
+        }
+        [b"ISSUE_WARNING"] => {
+            return Err(subcommand_error(
+                args,
+                "must be given at least one additional argument.",
+            ));
+        }
         [b"SET" | b"GET", ..] => {
             return Err(subcommand_error(
                 args,
@@ -123,6 +146,31 @@ fn policy_id(name: &[u8], op: &str) -> Result<PolicyId, CmdError> {
             "\" which is not known to this version of CMake.",
         ))
     })
+}
+
+fn issue_warning(cx: &mut Cx<'_>, id: PolicyId, preface: &[u8], postface: &[u8]) {
+    let summary = match id.number() {
+        133 => "The CPack module disables SLA by default in the CPack DragNDrop Generator.",
+        161 => "CPACK_PRODUCTBUILD_DOMAINS defaults to true.",
+        172 => {
+            "The CPack module enables per-machine installation by default in the CPack WIX Generator."
+        }
+        _ => return cx.issue_policy_warning(id, preface, postface),
+    };
+    let message = format!(
+        "Policy {id} is not set: {summary}  Run \"cmake --help-policy {id}\" for policy details.  Use the cmake_policy command to set the policy and suppress this warning."
+    );
+    let body = [preface, message.as_bytes(), postface]
+        .into_iter()
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(b"\n".as_slice());
+    cx.issue(
+        MessageKind::AuthorWarning,
+        Effect::None,
+        Some(DiagCategory::Policy),
+        body.into(),
+    );
 }
 
 fn parse_version(raw: &[u8]) -> Option<Version> {

@@ -482,7 +482,12 @@ fn install_export(
     let mut cxx_modules_directory = None;
     while let Some(key) = args.next() {
         match key {
-            b"NAMESPACE" => namespace = value(args, key)?.into(),
+            b"NAMESPACE" => {
+                namespace = args
+                    .next_if(|token| !keyword(token))
+                    .unwrap_or_default()
+                    .into()
+            }
             b"FILE" => {
                 let name = value(args, key)?;
                 check_file(name)?;
@@ -629,6 +634,17 @@ fn export(cx: &mut Cx<'_>, input: &[ExpandedArg]) -> CmdResult {
                 file = Some(BString::from(name));
             }
             b"NAMESPACE" => {
+                if args.next_if(|token| !keyword(token)).is_none() {
+                    return Err(fail(
+                        [
+                            *signature,
+                            b" given invalid argument:\n\n  NAMESPACE: missing required value",
+                        ]
+                        .concat(),
+                    ));
+                }
+            }
+            b"CXX_MODULES_DIRECTORY" => {
                 value(&mut args, key)?;
             }
             b"APPEND" if name.is_none() => append = true,

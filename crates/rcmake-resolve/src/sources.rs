@@ -2,11 +2,87 @@
 
 use indexmap::{IndexMap, IndexSet};
 use rcmake_base::{BString, list, path_lex::Lexical, truth};
-use rcmake_genex::ConfigId;
-use rcmake_host::{FileKind, Follow, Host, path::to_native};
-use rcmake_model::{Directory, ProjectModel, TargetId, TargetKind};
+use rcmake_diag::{
+    Backtrace, Diagnostic, Effect, FrameKind, Location, MessageKind, RenderOptions, render,
+};
+use rcmake_genex::{ConfigId, EvalContext};
+use rcmake_host::{FileKind, Follow, Host, Stream, path::to_native};
+use rcmake_model::{BT, Directory, ProjectModel, PropertyMap, TargetId, TargetKind};
 
-use crate::{ResolveError, absolute_path, usage::UsageResolver};
+use crate::{
+    CompileGroup, FileSetMember, InterfaceInclude, ResolveError, absolute_path,
+    usage::{self, UsageResolver},
+};
+
+pub(crate) fn apply_compile_properties(
+    usage: &mut UsageResolver<'_>,
+    target: TargetId,
+    ctx: &EvalContext,
+    source: &BT<BString>,
+    member: Option<&FileSetMember<'_>>,
+    source_props: Option<&PropertyMap>,
+    group: &mut CompileGroup,
+) -> Result<(), ResolveError> {
+    let mut ctx = ctx.clone();
+    ctx.head = Some(usage::handle(target));
+    for name in [
+        b"COMPILE_OPTIONS".as_slice(),
+        b"COMPILE_DEFINITIONS",
+        b"INCLUDE_DIRECTORIES",
+    ] {
+        let source_values = match source_props.and_then(|props| props.get(name)) {
+            Some(value) => usage.file_set_paths(
+                target,
+                name,
+                &[BT::new(value.clone(), source.backtrace.clone())],
+                &ctx,
+            )?,
+            None => Vec::new(),
+        };
+        let set_values = if let Some(member) = member {
+            let owner = member.set.target;
+            let key = if owner == target {
+                name.into()
+            } else {
+                [b"INTERFACE_", name].concat()
+            };
+            match member.set.props.get(&key) {
+                Some(value) => usage.file_set_paths(
+                    owner,
+                    &key,
+                    &[BT::new(value.clone(), member.source.backtrace.clone())],
+                    &ctx,
+                )?,
+                None => Vec::new(),
+            }
+        } else {
+            Vec::new()
+        };
+        match name {
+            b"COMPILE_OPTIONS" => group
+                .flags
+                .extend(source_values.into_iter().chain(set_values)),
+            b"COMPILE_DEFINITIONS" => group
+                .defines
+                .extend(source_values.into_iter().chain(set_values)),
+            b"INCLUDE_DIRECTORIES" => {
+                let mut seen = IndexSet::new();
+                group.includes = set_values
+                    .into_iter()
+                    .chain(source_values)
+                    .map(|path| InterfaceInclude {
+                        path,
+                        system: false,
+                    })
+                    .chain(std::mem::take(&mut group.includes))
+                    .filter(|entry| seen.insert(entry.path.value.clone()))
+                    .collect();
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
 
 #[derive(Default)]
 pub(crate) struct TargetInputs {
@@ -65,6 +141,13 @@ impl<'a> SourcePaths<'a> {
         self.objects.get(&Lexical::new(path).normalize()).copied()
     }
 
+    pub(crate) fn is_generated(&self, dir: &Directory, source: &[u8]) -> bool {
+        [&dir.source_dir, &dir.binary_dir]
+            .into_iter()
+            .map(|base| absolute_path(base, source))
+            .any(|path| self.generated.contains(&path))
+    }
+
     pub(crate) fn find(&self, dir: &Directory, source: &[u8]) -> Option<BString> {
         let paths = [
             absolute_path(&dir.source_dir, source),
@@ -88,6 +171,60 @@ impl<'a> SourcePaths<'a> {
         self.find(dir, source).ok_or_else(|| {
             ResolveError::Message([b"Cannot find source file:\n\n  ", source].concat().into())
         })
+    }
+
+    pub(crate) fn resolve_at(
+        &self,
+        model: &ProjectModel,
+        dir: &Directory,
+        source: &BT<BString>,
+    ) -> Result<BString, ResolveError> {
+        self.resolve(dir, &source.value).inspect_err(|error| {
+            if !source.backtrace.is_empty() {
+                let frames: Vec<_> = source
+                    .backtrace
+                    .frames()
+                    .enumerate()
+                    .filter(|(index, frame)| *index == 0 || frame.kind != FrameKind::ModuleInclude)
+                    .map(|(_, frame)| frame)
+                    .collect();
+                let backtrace = frames
+                    .into_iter()
+                    .rev()
+                    .fold(Backtrace::default(), |stack, frame| {
+                        stack.push(frame.clone())
+                    });
+                self.emit(
+                    model,
+                    MessageKind::Error,
+                    Location::Backtrace(backtrace),
+                    error.to_string().into(),
+                );
+            }
+        })
+    }
+
+    pub(crate) fn emit(
+        &self,
+        model: &ProjectModel,
+        kind: MessageKind,
+        location: Location,
+        body: BString,
+    ) {
+        let options = RenderOptions {
+            relative_base: Some(model.dir(rcmake_model::DirId::ROOT).source_dir.clone()),
+            ..RenderOptions::default()
+        };
+        let diagnostic = Diagnostic {
+            kind,
+            effect: Effect::None,
+            category: None,
+            policy: None,
+            location,
+            body,
+        };
+        self.host
+            .write_out(Stream::Stderr, &render(&diagnostic, &options));
     }
 }
 

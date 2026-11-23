@@ -225,12 +225,13 @@ pub(super) fn compile_arguments(
             .map(|define| quote(&[b"-D", define].concat())),
     );
     let includes = includes(model, target, group);
-    if model
+    if (model
         .dir(target.dir)
         .source_props
         .get(&Lexical::new(source).normalize())
         .and_then(|props| props.get(b"LANGUAGE"))
         .is_some()
+        || super::source_language(model, target, source).is_none_or(|natural| natural != language))
         && let Some(options) = definition(
             model,
             target.dir,
