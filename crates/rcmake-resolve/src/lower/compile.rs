@@ -201,15 +201,14 @@ fn without_trailing_slashes(path: &[u8]) -> &[u8] {
     path.get(..end.max(root_len)).unwrap_or(path)
 }
 
-pub(super) fn compile(
+pub(super) fn compile_arguments(
     model: &ProjectModel,
     target: &Target,
     config: &ConfigId,
-    artifacts: &ArtifactSet,
-    unit: &CompileUnit,
     group: &CompileGroup,
     required_standard: Option<&[u8]>,
-) -> Result<BuildStep, ResolveError> {
+    source: &[u8],
+) -> (Vec<BString>, BString, BString) {
     let language = group.language.as_slice();
     let mut flags = compile_flags(model, target, config, group, required_standard);
     let mut defines: Vec<_> = group
@@ -225,17 +224,10 @@ pub(super) fn compile(
             .map(|define| quote(&[b"-D", define].concat())),
     );
     let includes = includes(model, target, group);
-    let source = join(&model.dir(target.dir).source_dir, &unit.source.value);
-    let object = if unit.object.is_empty() {
-        object_path(model, target, config, &source)
-    } else {
-        unit.object.clone()
-    };
-
     if model
         .dir(target.dir)
         .source_props
-        .get(&Lexical::new(&source).normalize())
+        .get(&Lexical::new(source).normalize())
         .and_then(|props| props.get(b"LANGUAGE"))
         .is_some()
         && let Some(options) = definition(
@@ -250,15 +242,63 @@ pub(super) fn compile(
                 .map(|value| quote(&value)),
         );
     }
+    (flags, defines, includes)
+}
+
+pub(super) fn compile(
+    model: &ProjectModel,
+    target: &Target,
+    config: &ConfigId,
+    artifacts: &ArtifactSet,
+    unit: &CompileUnit,
+    group: &CompileGroup,
+    required_standard: Option<&[u8]>,
+) -> Result<BuildStep, ResolveError> {
+    let language = group.language.as_slice();
+    let source = join(&model.dir(target.dir).source_dir, &unit.source.value);
+    let (mut flags, defines, includes) =
+        compile_arguments(model, target, config, group, required_standard, &source);
+    let object = if unit.object.is_empty() {
+        object_path(model, target, config, &source)
+    } else {
+        unit.object.clone()
+    };
+
     let depfile: BString = [object.as_slice(), b".d"].concat().into();
     let key = [b"CMAKE_", language, b"_COMPILE_OBJECT"].concat();
+    let bmi_only = unit.scan && super::modules::is_std_bmi(model, target);
+    let gcc = bmi_only
+        && super::modules::module_map_format(model, target)?
+            == rcmake_cxxmodules::ModmapFormat::Gcc;
+    let template = if bmi_only && !gcc {
+        definition(model, target.dir, b"CMAKE_CXX_COMPILE_BMI").filter(|v| !v.is_empty())
+    } else {
+        definition(model, target.dir, &key).filter(|v| !v.is_empty())
+    };
+    let action: &[u8] = if bmi_only && !gcc {
+        b" --precompile"
+    } else {
+        b" -c"
+    };
     let fallback = [
         b"<CMAKE_",
         language,
-        b"_COMPILER> <DEFINES> <INCLUDES> <FLAGS> -o <OBJECT> -c <SOURCE>",
+        b"_COMPILER> <DEFINES> <INCLUDES> <FLAGS> -o <OBJECT>",
+        action,
+        b" <SOURCE>",
     ]
     .concat();
-    let template = definition(model, target.dir, &key).filter(|v| !v.is_empty());
+    if bmi_only {
+        if let Some(flag) = definition(model, target.dir, b"CMAKE_CXX_MODULE_BMI_ONLY_FLAG") {
+            flags.push(flag.clone());
+        } else if gcc {
+            flags.push("-fmodule-only".into());
+        }
+    }
+    let modmap = unit.scan.then(|| super::modules::modmap_path(&object));
+    if let Some(path) = &modmap {
+        flags.push(super::modules::module_map_flag(model, target, path));
+    }
     let template_text = template.map_or(fallback.as_slice(), |v| v.as_slice());
     let dep_flags = definition(
         model,
@@ -325,7 +365,7 @@ pub(super) fn compile(
         source,
         invocation,
         depfile: writes_depfile.then_some(depfile),
-        modmap: None,
+        modmap,
         dyndep: None,
     })
 }

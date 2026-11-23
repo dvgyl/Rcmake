@@ -1,24 +1,272 @@
-//! Lowering of C++20 named modules: scan steps, the collate step, and the module map
-//! and dyndep inputs of compile steps (ADR-012).
+//! Lower C++ named module scans and collation.
 
-use rcmake_model::ProjectModel;
+use indexmap::IndexSet;
+use rcmake_base::{BString, path_lex::Lexical};
+use rcmake_cxxmodules::{
+    BmiInstallInfo, ModmapFormat, ModuleSourceInfo, ScannedSourceInfo, TargetDependInfo,
+};
+use rcmake_model::{DirId, ProjectModel, Target};
 
-use crate::{BuildStep, ResolveError, ResolvedTarget};
+use super::compile::compile_arguments;
+use super::shell::{command, join_words, quote, rule_invocations};
+use super::{definition, expand_rule};
+use crate::{BuildStep, CompileUnit, ResolveError, ResolvedTarget};
 
-/// Build steps that scan and collate the modules of `target`. Empty when the target
-/// has no scanned units.
+pub(super) fn modmap_path(object: &[u8]) -> BString {
+    [object, b".modmap"].concat().into()
+}
+
+pub(super) fn module_map_flag(model: &ProjectModel, target: &Target, path: &[u8]) -> BString {
+    let fallback: &[u8] = if module_map_format(model, target) == Ok(ModmapFormat::Gcc) {
+        b"-fmodules-ts -fmodule-mapper=<MODULE_MAP_FILE>"
+    } else {
+        b"@<MODULE_MAP_FILE>"
+    };
+    let template = definition(model, target.dir, b"CMAKE_CXX_MODULE_MAP_FLAG")
+        .filter(|flag| !flag.is_empty())
+        .map_or(fallback, |flag| flag.as_slice());
+    expand_rule(template, |key| {
+        (key == b"MODULE_MAP_FILE").then(|| quote(path))
+    })
+}
+
+pub(super) fn is_std_bmi(model: &ProjectModel, target: &Target) -> bool {
+    target.name == crate::STD_MODULE_TARGET
+        && definition(model, target.dir, b"CMAKE_CXX_COMPILER_ID")
+            .is_none_or(|id| id != b"MSVC".as_slice())
+}
+
+pub(super) fn module_map_format(
+    model: &ProjectModel,
+    target: &Target,
+) -> Result<ModmapFormat, ResolveError> {
+    let compiler = definition(model, target.dir, b"CMAKE_CXX_COMPILER_ID");
+    match definition(model, target.dir, b"CMAKE_CXX_MODULE_MAP_FORMAT").filter(|v| !v.is_empty()) {
+        Some(format) => ModmapFormat::from_name(format).ok_or_else(|| {
+            ResolveError::Message(format!("Unknown C++ module map format: {format}.").into())
+        }),
+        None => Ok(match compiler.map(|id| id.as_slice()) {
+            Some(b"GNU") => ModmapFormat::Gcc,
+            Some(b"MSVC") => ModmapFormat::Msvc,
+            _ => ModmapFormat::Clang,
+        }),
+    }
+}
+
+/// Build the scan and collation steps of `target`.
 ///
 /// # Errors
 ///
-/// Returns [`ResolveError::Unimplemented`] for a target with scanned units until module
-/// lowering is implemented.
+/// Returns an error if a scanned unit has no compile group, scan rule, or module metadata.
 pub fn lower_modules(
     model: &ProjectModel,
     target: &ResolvedTarget,
 ) -> Result<Vec<BuildStep>, ResolveError> {
-    let _ = model;
-    if target.cxx_modules.is_none() && !target.compile_units.iter().any(|unit| unit.scan) {
+    lower_modules_with_standard(model, target, None)
+}
+
+pub(super) fn lower_modules_with_standard(
+    model: &ProjectModel,
+    resolved: &ResolvedTarget,
+    standard: Option<&[u8]>,
+) -> Result<Vec<BuildStep>, ResolveError> {
+    if !resolved.compile_units.iter().any(|unit| unit.scan) {
         return Ok(Vec::new());
     }
-    Err(ResolveError::Unimplemented("C++ module scanning"))
+    let module_info = resolved.cxx_modules.as_ref().ok_or_else(|| {
+        ResolveError::Message("A scanned target has no C++ module metadata.".into())
+    })?;
+    let target = model
+        .target(resolved.id)
+        .ok_or_else(|| ResolveError::Message("The C++ module target is missing.".into()))?;
+    let dir = target.dir;
+    let root = model.dir(DirId::ROOT);
+    let compiler = |suffix: &[u8]| {
+        definition(model, dir, &[b"CMAKE_CXX_", suffix].concat())
+            .cloned()
+            .unwrap_or_default()
+    };
+    let template = compiler(b"SCANDEP_SOURCE");
+    let module_map_format = module_map_format(model, target)?;
+    let mut info = TargetDependInfo {
+        compiler_id: compiler(b"COMPILER_ID"),
+        compiler_frontend_variant: compiler(b"COMPILER_FRONTEND_VARIANT"),
+        compiler_simulate_id: compiler(b"SIMULATE_ID"),
+        language: "CXX".into(),
+        config: resolved.config.0.clone(),
+        module_dir: Lexical::new(&root.binary_dir).append(&module_info.module_dir),
+        dir_cur_bld: resolved.metadata.binary_dir.clone(),
+        dir_cur_src: resolved.metadata.source_dir.clone(),
+        dir_top_bld: root.binary_dir.clone(),
+        dir_top_src: root.source_dir.clone(),
+        linked_target_dirs: module_info.linked_target_dirs.clone(),
+        forward_modules_from_target_dirs: module_info.forward_from.clone(),
+        bmi_installation: module_info.bmi_install.as_ref().map(|rule| BmiInstallInfo {
+            destination: rule.destination.clone(),
+            component: rule.component.clone(),
+            permissions: join_words(rule.permissions.iter().cloned()),
+            optional: rule.optional,
+            exclude_from_all: rule.exclude_from_all,
+            ..BmiInstallInfo::default()
+        }),
+        ..TargetDependInfo::default()
+    };
+    let mut steps = Vec::new();
+    let mut ddis = Vec::new();
+    let mut modmaps = Vec::new();
+    let mut includes = IndexSet::new();
+    let members: indexmap::IndexMap<_, _> = module_info
+        .units
+        .iter()
+        .map(|unit| (unit.unit, unit))
+        .collect();
+    for (index, unit) in resolved
+        .compile_units
+        .iter()
+        .enumerate()
+        .filter(|(_, unit)| unit.scan)
+    {
+        let group = resolved.compile_groups.get(unit.group).ok_or_else(|| {
+            ResolveError::Message("The C++ module scan has no compile group.".into())
+        })?;
+        includes.extend(
+            group
+                .includes
+                .iter()
+                .map(|include| include.path.value.clone()),
+        );
+        if let Some(member) = members.get(&index) {
+            info.cxx_modules.insert(
+                unit.object.clone(),
+                ModuleSourceInfo {
+                    source: unit.source.value.clone(),
+                    file_set: member.file_set.clone(),
+                    visibility: member.visibility,
+                    bmi_only: member.bmi_only,
+                    relative_directory: member.relative_directory.clone(),
+                    destination: member.destination.clone(),
+                    compile_features: standard
+                        .map(|version| [b"cxx_std_".as_slice(), version].concat().into())
+                        .into_iter()
+                        .collect(),
+                    compile_options: group
+                        .flags
+                        .iter()
+                        .map(|entry| entry.value.clone())
+                        .collect(),
+                    definitions: group
+                        .defines
+                        .iter()
+                        .map(|entry| entry.value.clone())
+                        .collect(),
+                    include_directories: group
+                        .includes
+                        .iter()
+                        .map(|entry| entry.path.value.clone())
+                        .collect(),
+                    ..ModuleSourceInfo::default()
+                },
+            );
+        } else {
+            info.sources.insert(
+                unit.object.clone(),
+                ScannedSourceInfo {
+                    source: unit.source.value.clone(),
+                    language: group.language.clone(),
+                },
+            );
+        }
+        let (flags, defines, includes) = compile_arguments(
+            model,
+            target,
+            &resolved.config,
+            group,
+            standard,
+            &unit.source.value,
+        );
+        let step = scan(
+            model,
+            target,
+            unit,
+            &template,
+            join_words(flags),
+            defines,
+            includes,
+        )?;
+        if let BuildStep::Scan { ddi, .. } = &step {
+            ddis.push(ddi.clone());
+        }
+        steps.push(step);
+        modmaps.push(modmap_path(&unit.object));
+    }
+    info.include_dirs = includes.into_iter().collect();
+    let implicit_inputs = std::iter::once(module_info.tdi.clone())
+        .chain(
+            info.linked_target_dirs
+                .iter()
+                .chain(&info.forward_modules_from_target_dirs)
+                .map(|dir| Lexical::new(dir).append(b"CXXModules.json")),
+        )
+        .collect::<IndexSet<_>>()
+        .into_iter()
+        .collect();
+    steps.push(BuildStep::Collate {
+        target: resolved.metadata.name.clone(),
+        ddis,
+        dd: module_info.dyndep.clone(),
+        modmaps,
+        tdi: module_info.tdi.clone(),
+        depend_info: Box::new(info),
+        modmap_format: module_map_format,
+        implicit_inputs,
+    });
+    Ok(steps)
+}
+
+fn scan(
+    model: &ProjectModel,
+    target: &Target,
+    unit: &CompileUnit,
+    template: &[u8],
+    flags: BString,
+    defines: BString,
+    includes: BString,
+) -> Result<BuildStep, ResolveError> {
+    let object = unit.object.as_slice();
+    let ddi: BString = [object, b".ddi"].concat().into();
+    let depfile: BString = [object, b".ddi.d"].concat().into();
+    let preprocessed: BString = [object, b".ddi.i"].concat().into();
+    let commands = rule_invocations(model, target.dir, template, |key| match key {
+        b"FLAGS" => Some(flags.clone()),
+        b"DEFINES" => Some(defines.clone()),
+        b"INCLUDES" => Some(includes.clone()),
+        b"SOURCE" => Some(quote(&unit.source.value)),
+        b"OBJECT" | b"OBJ_FILE" => Some(quote(object)),
+        b"DYNDEP_FILE" | b"DYNDEP_INTERMEDIATE_FILE" => Some(quote(&ddi)),
+        b"DEP_FILE" => Some(quote(&depfile)),
+        b"PREPROCESSED_SOURCE" | b"PREPROCESSED_OUTPUT_FILE" => Some(quote(&preprocessed)),
+        _ => None,
+    });
+    let invocation = match commands.as_slice() {
+        [] => return Err(crate::missing_scanner(target)),
+        [invocation] => invocation.clone(),
+        _ => command(
+            commands
+                .iter()
+                .map(|invocation| invocation.shell.as_slice())
+                .collect::<Vec<_>>()
+                .join(b" && ".as_slice())
+                .into(),
+        ),
+    };
+    Ok(BuildStep::Scan {
+        source: unit.source.value.clone(),
+        ddi,
+        object: unit.object.clone(),
+        invocation,
+        depfile: template
+            .windows(b"<DEP_FILE>".len())
+            .any(|part| part == b"<DEP_FILE>")
+            .then_some(depfile),
+    })
 }

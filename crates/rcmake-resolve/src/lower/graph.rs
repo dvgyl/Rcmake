@@ -101,6 +101,11 @@ pub(crate) fn lower_with_inputs(
             .into_iter()
             .flat_map(|inputs| inputs.objects.iter().cloned())
             .collect::<Vec<_>>();
+        let cxx_standard = target_inputs
+            .and_then(|inputs| inputs.standard_requirements.get(b"CXX".as_slice()).copied());
+        for step in super::modules::lower_modules_with_standard(model, resolved, cxx_standard)? {
+            steps.insert(push(&mut graph.steps, step));
+        }
         for unit in &resolved.compile_units {
             let Some(group) = resolved.compile_groups.get(unit.group) else {
                 return Err(ResolveError::Message(
@@ -114,7 +119,7 @@ pub(crate) fn lower_with_inputs(
             };
             let required_standard = target_inputs
                 .and_then(|inputs| inputs.standard_requirements.get(&group.language).copied());
-            let step = compile(
+            let mut step = compile(
                 model,
                 target,
                 config,
@@ -123,12 +128,17 @@ pub(crate) fn lower_with_inputs(
                 group,
                 required_standard,
             )?;
-            if let BuildStep::Compile { object, .. } = &step {
-                objects.push(object.clone());
+            if let BuildStep::Compile { object, dyndep, .. } = &mut step {
+                if !super::modules::is_std_bmi(model, target) {
+                    objects.push(object.clone());
+                }
+                if unit.scan {
+                    *dyndep = resolved
+                        .cxx_modules
+                        .as_ref()
+                        .map(|info| info.dyndep.clone());
+                }
             }
-            steps.insert(push(&mut graph.steps, step));
-        }
-        for step in super::lower_modules(model, resolved)? {
             steps.insert(push(&mut graph.steps, step));
         }
         if let Some(mut step) = resolved.link.clone().or_else(|| {

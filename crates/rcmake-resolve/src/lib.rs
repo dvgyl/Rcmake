@@ -15,12 +15,13 @@
 
 use indexmap::{IndexMap, IndexSet, map::Entry};
 use rcmake_base::{BString, list, path_lex::Lexical, truth};
-use rcmake_diag::Backtrace;
+use rcmake_cxxmodules::{ModmapFormat, ModuleVisibility, TargetDependInfo};
+use rcmake_diag::{Backtrace, PolicyId, PolicyStatus};
 use rcmake_genex::{ConfigId, EvalContext, GenexNode, PreprocessMode, TargetHandle};
 use rcmake_host::{Host, path::to_native};
 use rcmake_model::{
-    BT, DirId, ExportSet, InstallKind, InstallRule, ProjectModel, Target, TargetId, TargetKind,
-    UsageField,
+    BT, DirId, ExportSet, FileSet, FileSetKind, InstallKind, InstallRule, ProjectModel, Target,
+    TargetId, TargetKind, TargetOrigin, UsageField, UsageScope,
 };
 
 use sources::{SourcePaths, TargetInputs, external_object};
@@ -141,6 +142,10 @@ pub struct CxxModuleInfo {
     pub tdi: BString,
     /// Path of the collated Ninja dyndep file, relative to the build directory.
     pub dyndep: BString,
+    /// Build directories of targets whose module tables this target reads.
+    pub linked_target_dirs: Vec<BString>,
+    /// Build directories of targets whose module tables this target forwards.
+    pub forward_from: Vec<BString>,
     /// Install rule of the module files (`install(TARGETS ... CXX_MODULES_BMI)`).
     pub bmi_install: Option<BmiInstall>,
 }
@@ -154,6 +159,12 @@ pub struct ModuleUnit {
     pub file_set: BString,
     /// The file set is `PUBLIC` or `INTERFACE`.
     pub public: bool,
+    /// Visibility of the file set.
+    pub visibility: ModuleVisibility,
+    /// Source directory relative to the matching file set base directory.
+    pub relative_directory: BString,
+    /// Install destination of the source file set.
+    pub destination: Option<BString>,
     /// The unit compiles only to a module file (no object file).
     pub bmi_only: bool,
 }
@@ -371,7 +382,11 @@ pub enum BuildStep {
         modmaps: Vec<BString>,
         /// `CXXDependInfo.json` path.
         tdi: BString,
-        /// Other inputs (`CXXModules.json` of linked targets).
+        /// Data to write to `CXXDependInfo.json`.
+        depend_info: Box<TargetDependInfo>,
+        /// Module map format of the compiler.
+        modmap_format: ModmapFormat,
+        /// The TDI file and the module tables that collation reads.
         implicit_inputs: Vec<BString>,
     },
     /// Link or archive.
@@ -528,6 +543,29 @@ pub fn resolve(
             resolved.insert(id, facts);
             inputs.insert(id, target_inputs);
         }
+        let std_model = if resolved
+            .values()
+            .any(|target| target.compile_units.iter().any(|unit| unit.scan))
+        {
+            std_module_model(model, host)?
+        } else {
+            None
+        };
+        let model = std_model.as_ref().map_or(model, |(model, _)| model);
+        let mut usage = if std_model.is_some() {
+            UsageResolver::with_source_paths(model, &paths)
+        } else {
+            usage
+        };
+        let std_id = std_model.as_ref().map(|(_, id)| *id);
+        if let Some(id) = std_id
+            && let Some(target) = model.target(id)
+        {
+            let (facts, target_inputs) =
+                resolve_target(model, &paths, &mut usage, id, target, &ctx)?;
+            resolved.insert(id, facts);
+            inputs.insert(id, target_inputs);
+        }
         let links = model
             .targets()
             .filter(|(_, target)| !target.is_imported())
@@ -535,10 +573,45 @@ pub fn resolve(
                 resolve_link(model, &mut usage, &paths, &resolved, id, target, &ctx)
             })
             .collect::<Result<Vec<_>, _>>()?;
+        let std_objects = std_id
+            .and_then(|id| resolved.get(&id))
+            .and_then(|target| Some((target, target.cxx_modules.as_ref()?)))
+            .into_iter()
+            .flat_map(|(target, info)| {
+                info.units
+                    .iter()
+                    .filter(|unit| !unit.bmi_only)
+                    .filter_map(|unit| target.compile_units.get(unit.unit))
+                    .map(|unit| unit.object.clone())
+            })
+            .collect::<Vec<_>>();
+        let module_dirs: IndexMap<_, _> = resolved
+            .values()
+            .filter_map(|target| {
+                let info = target.cxx_modules.as_ref()?;
+                (!info.units.is_empty()).then(|| (target.id, info.module_dir.clone()))
+            })
+            .collect();
         for ((target, inputs), link) in resolved.values_mut().zip(inputs.values_mut()).zip(links) {
             target.link = link.step;
             target.dependencies = link.dependencies;
             inputs.objects.extend(link.objects);
+            if let Some(info) = &mut target.cxx_modules {
+                let mut linked = link.module_links.into_iter().collect::<IndexSet<_>>();
+                if let Some(id) = std_id.filter(|id| {
+                    *id != target.id && target.compile_units.iter().any(|unit| unit.scan)
+                }) {
+                    linked.insert(id);
+                    target.dependencies.push(id);
+                    inputs.objects.extend(std_objects.iter().cloned());
+                }
+                info.linked_target_dirs.extend(
+                    linked
+                        .iter()
+                        .filter(|id| **id != target.id)
+                        .filter_map(|id| module_dirs.get(id).cloned()),
+                );
+            }
         }
         let resolved = resolved.into_values().collect::<Vec<_>>();
         graphs.push(lower::lower_with_inputs(
@@ -576,7 +649,8 @@ fn resolve_target(
         backtrace: target.backtrace.clone(),
         folder: target.props.get(b"FOLDER").cloned(),
         exclude_from_all: excluded(model, target),
-        generator_provided: target.kind == TargetKind::GlobalTarget,
+        generator_provided: target.kind == TargetKind::GlobalTarget
+            || target.name == STD_MODULE_TARGET,
     };
     let mut resolved = ResolvedTarget {
         id,
@@ -594,7 +668,14 @@ fn resolve_target(
     let mut dependencies = IndexSet::new();
     let mut inputs = TargetInputs::default();
     let mut groups = IndexMap::new();
-    for mut source in usage.collect_property(id, b"SOURCES", ctx)?.entries {
+    let (file_sets, members) = module_file_sets(model, paths, usage, id, target, ctx)?;
+    let sources = usage.collect_property(id, b"SOURCES", ctx)?.entries;
+    for mut source in sources.into_iter().chain(
+        members
+            .values()
+            .filter(|member| member.set.kind == FileSetKind::CxxModules)
+            .map(|member| member.source.clone()),
+    ) {
         source.value = paths.resolve(dir, &source.value)?;
         if !inputs.sources.insert(source.value.clone()) {
             continue;
@@ -604,7 +685,8 @@ fn resolve_target(
         if matches!(
             target.kind,
             TargetKind::Utility | TargetKind::GlobalTarget | TargetKind::InterfaceLibrary
-        ) {
+        ) && target.name != STD_MODULE_TARGET
+        {
             continue;
         }
         if owner.is_some() || external_object(dir, &source.value) {
@@ -613,7 +695,11 @@ fn resolve_target(
                 .insert(lower::build_relative(model, &source.value));
             continue;
         }
-        let Some(language) = lower::source_language(model, target, &source.value) else {
+        let member = members.get(&source.value);
+        let module = member.filter(|member| member.set.kind == FileSetKind::CxxModules);
+        let Some(language) = lower::source_language(model, target, &source.value)
+            .or_else(|| module.map(|_| "CXX".into()))
+        else {
             continue;
         };
         let (group, facts) = match groups.entry(language.clone()) {
@@ -661,8 +747,514 @@ fn resolve_target(
         });
     }
     resolved.compile_groups = groups.into_values().collect();
+    resolve_module_info(model, target, &inputs, &mut resolved, file_sets, &members);
+    if (file_sets || resolved.compile_units.iter().any(|unit| unit.scan))
+        && scan_rule(model, target).is_none()
+    {
+        return Err(missing_scanner(target));
+    }
     resolved.dependencies = dependencies.into_iter().collect();
     Ok((resolved, inputs))
+}
+
+const STD_MODULE_TARGET: &[u8] = b"@cmake_cxx_std";
+
+struct FileSetMember<'a> {
+    set: &'a FileSet,
+    source: BT<BString>,
+    relative_directory: BString,
+}
+
+fn module_file_sets<'a>(
+    model: &'a ProjectModel,
+    paths: &SourcePaths<'_>,
+    usage: &mut UsageResolver<'_>,
+    id: TargetId,
+    target: &Target,
+    ctx: &EvalContext,
+) -> Result<(bool, IndexMap<BString, FileSetMember<'a>>), ResolveError> {
+    let dir = model.dir(target.dir);
+    let mut has_modules = false;
+    let mut members = IndexMap::new();
+    let mut ctx = ctx.clone();
+    ctx.head = Some(usage::handle(id));
+    ctx.current = ctx.head;
+    let mut eval = |entry: &BT<BString>, property: &[u8]| -> Result<Vec<BString>, ResolveError> {
+        ctx.site = rcmake_genex::EvalSite {
+            backtrace: entry.backtrace.clone(),
+            property: Some(property.into()),
+        };
+        let ast = rcmake_genex::parse(&entry.value)?;
+        let (value, _) = rcmake_genex::evaluate(&ast, &ctx, &mut usage.host(target.dir))?;
+        Ok(list::split(&value, list::Empty::Drop))
+    };
+    for set in target.file_sets.iter().filter_map(|id| model.file_set(*id)) {
+        if set.scope == UsageScope::Interface && target.name != STD_MODULE_TARGET {
+            continue;
+        }
+        let is_module = set.kind == FileSetKind::CxxModules;
+        has_modules |= is_module;
+        if !is_module
+            && (set.kind != FileSetKind::Sources
+                || set.props.get(b"CXX_SCAN_FOR_MODULES").is_none())
+        {
+            continue;
+        }
+        let mut bases = Vec::new();
+        for base in &set.base_dirs {
+            for path in eval(base, b"BASE_DIRS")? {
+                bases.push(absolute_path(&dir.source_dir, &path));
+            }
+        }
+        if bases.is_empty() {
+            bases.push(dir.source_dir.clone());
+        }
+        for file in &set.files {
+            for path in eval(file, b"FILES")? {
+                let value = paths.resolve(dir, &path)?;
+                let parent = Lexical::new(&value).parent();
+                let relative_directory = bases.iter().find_map(|base| {
+                    let base = Lexical::new(base);
+                    let parent = Lexical::new(parent);
+                    base.prefix(parent).then(|| parent.relative(base)).flatten()
+                });
+                let relative_directory = match relative_directory {
+                    Some(path) if path == "." => BString::default(),
+                    Some(path) => path,
+                    None if !is_module => BString::default(),
+                    None => return Err(ResolveError::Message(
+                        format!(
+                            "File {value} must be in one of the base directories of file set {}.",
+                            set.name
+                        )
+                        .into(),
+                    )),
+                };
+                let member = FileSetMember {
+                    set,
+                    source: BT::new(value.clone(), file.backtrace.clone()),
+                    relative_directory,
+                };
+                match members.entry(value) {
+                    Entry::Occupied(mut entry) if is_module => {
+                        entry.insert(member);
+                    }
+                    Entry::Vacant(entry) => {
+                        entry.insert(member);
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    Ok((has_modules, members))
+}
+
+fn scan_rule<'a>(model: &'a ProjectModel, target: &Target) -> Option<&'a BString> {
+    lower::definition(model, target.dir, b"CMAKE_CXX_SCANDEP_SOURCE").filter(|v| !v.is_empty())
+}
+
+fn missing_scanner(target: &Target) -> ResolveError {
+    ResolveError::Message(format!(
+        "The target named \"{}\" has C++ sources that may use modules, but the compiler does not provide a way to discover the import graph dependencies.",
+        target.name
+    ).into())
+}
+
+fn resolve_module_info(
+    model: &ProjectModel,
+    target: &Target,
+    inputs: &TargetInputs,
+    resolved: &mut ResolvedTarget,
+    has_module_sets: bool,
+    members: &IndexMap<BString, FileSetMember<'_>>,
+) {
+    let standard = target
+        .props
+        .get(b"CXX_STANDARD")
+        .or_else(|| lower::definition(model, target.dir, b"CMAKE_CXX_STANDARD"))
+        .filter(|standard| !standard.is_empty())
+        .or_else(|| lower::definition(model, target.dir, b"CMAKE_CXX_STANDARD_DEFAULT"));
+    let modules_standard = |standard: &[u8]| matches!(standard, b"20" | b"23" | b"26");
+    let allows_scanning = standard.is_some_and(|v| modules_standard(v))
+        || inputs
+            .standard_requirements
+            .get(b"CXX".as_slice())
+            .is_some_and(|v| modules_standard(v));
+    let by_default = target.policies.policies.get(PolicyId::new(155)) == PolicyStatus::New
+        && scan_rule(model, target).is_some();
+    let target_setting = target
+        .props
+        .get(b"CXX_SCAN_FOR_MODULES")
+        .or_else(|| lower::definition(model, target.dir, b"CMAKE_CXX_SCAN_FOR_MODULES"));
+    let dir = model.dir(target.dir);
+    let mut destinations = IndexMap::new();
+    let mut units = Vec::new();
+    for (index, unit) in resolved.compile_units.iter_mut().enumerate() {
+        let member = members.get(&unit.source.value);
+        if let Some(member) = member.filter(|member| member.set.kind == FileSetKind::CxxModules) {
+            let visibility = match member.set.scope {
+                UsageScope::Private => ModuleVisibility::Private,
+                UsageScope::Public => ModuleVisibility::Public,
+                UsageScope::Interface => ModuleVisibility::Interface,
+            };
+            let bmi_only = target.name == STD_MODULE_TARGET
+                && lower::definition(model, target.dir, b"CMAKE_CXX_COMPILER_ID")
+                    .is_none_or(|id| id != b"MSVC".as_slice());
+            units.push(ModuleUnit {
+                unit: index,
+                file_set: member.set.name.clone(),
+                public: visibility != ModuleVisibility::Private,
+                visibility,
+                relative_directory: member.relative_directory.clone(),
+                destination: destinations
+                    .entry(&member.set.name)
+                    .or_insert_with(|| {
+                        module_install(model, resolved.id, &resolved.config, Some(&member.set.name))
+                            .map(|install| install.destination)
+                    })
+                    .clone(),
+                bmi_only,
+            });
+            if bmi_only {
+                unit.object.extend_from_slice(b".bmi");
+            }
+            unit.scan = true;
+            continue;
+        }
+        if allows_scanning
+            && resolved
+                .compile_groups
+                .get(unit.group)
+                .is_some_and(|group| group.language == "CXX")
+        {
+            unit.scan = member
+                .and_then(|member| member.set.props.get(b"CXX_SCAN_FOR_MODULES"))
+                .or_else(|| {
+                    dir.source_props
+                        .get(&unit.source.value)
+                        .and_then(|props| props.get(b"CXX_SCAN_FOR_MODULES"))
+                })
+                .or(target_setting)
+                .map_or(by_default, |value| truth::is_on(value));
+        }
+    }
+    if has_module_sets || resolved.compile_units.iter().any(|unit| unit.scan) {
+        let module_dir = resolved.artifacts.object_dir.clone().unwrap_or_default();
+        let directory = Lexical::new(&module_dir);
+        resolved.cxx_modules = Some(CxxModuleInfo {
+            units,
+            tdi: directory.append(b"CXXDependInfo.json"),
+            dyndep: directory.append(b"CXX.dd"),
+            module_dir,
+            bmi_install: module_install(model, resolved.id, &resolved.config, None),
+            ..CxxModuleInfo::default()
+        });
+    }
+}
+
+fn module_install(
+    model: &ProjectModel,
+    id: TargetId,
+    config: &ConfigId,
+    file_set: Option<&[u8]>,
+) -> Option<BmiInstall> {
+    model.installs.iter().enumerate().find_map(|(index, rule)| {
+        let InstallKind::Targets { targets, .. } = &rule.kind else {
+            return None;
+        };
+        if !targets.contains(&id) {
+            return None;
+        }
+        let prefix = format!("_RCMAKE_INSTALL_{index}_ARG");
+        let mut args = (0..)
+            .map_while(|i| {
+                model
+                    .global
+                    .props
+                    .get(format!("{prefix}{i}").as_bytes())
+                    .map(|value| value.as_slice())
+            })
+            .peekable();
+        if let Some(name) = file_set {
+            loop {
+                args.find(|arg| *arg == b"FILE_SET")?;
+                if args.next()? == name {
+                    break;
+                }
+            }
+        } else {
+            args.find(|arg| *arg == b"CXX_MODULES_BMI")?;
+        }
+        let options = &rule.options;
+        let mut install = BmiInstall {
+            component: options
+                .component
+                .clone()
+                .or_else(|| {
+                    lower::definition(model, rule.dir, b"CMAKE_INSTALL_DEFAULT_COMPONENT_NAME")
+                        .cloned()
+                })
+                .unwrap_or_else(|| "Unspecified".into()),
+            permissions: options.permissions.clone(),
+            exclude_from_all: options.exclude_from_all,
+            optional: options.optional,
+            ..BmiInstall::default()
+        };
+        let mut has_destination = file_set.is_some() && options.destination.is_some();
+        if has_destination {
+            install.destination = options.destination.clone().unwrap_or_default();
+        }
+        let mut configs = options.configurations.clone();
+        let is_keyword = |arg: &[u8]| {
+            matches!(
+                arg,
+                b"ARCHIVE"
+                    | b"LIBRARY"
+                    | b"RUNTIME"
+                    | b"FRAMEWORK"
+                    | b"BUNDLE"
+                    | b"OBJECTS"
+                    | b"PUBLIC_HEADER"
+                    | b"PRIVATE_HEADER"
+                    | b"RESOURCE"
+                    | b"FILE_SET"
+                    | b"CXX_MODULES_BMI"
+                    | b"INCLUDES"
+                    | b"DESTINATION"
+                    | b"COMPONENT"
+                    | b"PERMISSIONS"
+                    | b"OPTIONAL"
+                    | b"EXCLUDE_FROM_ALL"
+                    | b"CONFIGURATIONS"
+            )
+        };
+        while let Some(arg) = args.next() {
+            match arg {
+                b"DESTINATION" => {
+                    let destination = args.next()?;
+                    install.destination = if destination.is_empty() {
+                        BString::default()
+                    } else {
+                        Lexical::new(destination).normalize()
+                    };
+                    has_destination = true;
+                }
+                b"COMPONENT" => install.component = args.next()?.into(),
+                b"OPTIONAL" => install.optional = true,
+                b"EXCLUDE_FROM_ALL" => install.exclude_from_all = true,
+                b"PERMISSIONS" | b"CONFIGURATIONS" => {
+                    let values = std::iter::from_fn(|| args.next_if(|arg| !is_keyword(arg)))
+                        .map(BString::from)
+                        .collect();
+                    if arg == b"PERMISSIONS" {
+                        install.permissions = values;
+                    } else {
+                        configs = values;
+                    }
+                }
+                _ => break,
+            }
+        }
+        (has_destination && (configs.is_empty() || configs.iter().any(|name| config.matches(name))))
+            .then_some(install)
+    })
+}
+
+fn std_module_model(
+    model: &ProjectModel,
+    host: &dyn Host,
+) -> Result<Option<(ProjectModel, TargetId)>, ResolveError> {
+    use rcmake_json::{ReadOptions, Value};
+
+    let dir = model.dir(DirId::ROOT);
+    let Some(manifest) = lower::definition(model, DirId::ROOT, b"CMAKE_CXX_STDLIB_MODULES_JSON")
+        .filter(|path| !truth::is_off(path))
+    else {
+        return Ok(None);
+    };
+    let error = |reason: &dyn std::fmt::Display| {
+        ResolveError::Message(
+            format!(
+                "Failed to load C++ standard library modules metadata from \"{manifest}\": {reason}"
+            )
+            .into(),
+        )
+    };
+    let path = absolute_path(&dir.source_dir, manifest);
+    let data = host
+        .read(
+            &to_native(&path),
+            rcmake_host::ReadRange::All {
+                limit: rcmake_base::limits::Limits::default().max_value_bytes as u64,
+            },
+        )
+        .map_err(|err| error(&err))?;
+    let Value::Object(root) =
+        rcmake_json::parse(&data, &ReadOptions::default()).map_err(|err| error(&err))?
+    else {
+        return Err(error(&"Expected a JSON object."));
+    };
+    if !matches!(
+        root.get(b"version".as_slice()),
+        Some(Value::Int(1) | Value::UInt(1))
+    ) {
+        return Err(error(&"The manifest version must be 1."));
+    }
+    let Some(Value::Array(entries)) = root.get(b"modules".as_slice()) else {
+        return Err(error(&"The manifest has no modules array."));
+    };
+    let base = Lexical::new(&path).parent();
+    let mut sources = Vec::new();
+    let mut bases = IndexSet::new();
+    let mut target = Target::new(
+        STD_MODULE_TARGET.into(),
+        TargetKind::ObjectLibrary,
+        TargetOrigin::Normal,
+        DirId::ROOT,
+        Backtrace::default(),
+        Default::default(),
+    );
+    for entry in entries {
+        let Value::Object(entry) = entry else {
+            return Err(error(&"Expected a module object."));
+        };
+        if !matches!(entry.get(b"logical-name".as_slice()), Some(Value::String(name)) if !name.is_empty())
+        {
+            return Err(error(&"A module has no logical name."));
+        }
+        let Some(Value::String(source)) = entry
+            .get(b"source-path".as_slice())
+            .filter(|value| matches!(value, Value::String(path) if !path.is_empty()))
+        else {
+            return Err(error(&"A module has no source path."));
+        };
+        let source = absolute_path(base, source);
+        let lexical = Lexical::new(&source);
+        bases.insert(BString::from(
+            [lexical.root_name(), lexical.root_directory()].concat(),
+        ));
+        sources.push(BT::new(source, Backtrace::default()));
+        if let Some(local) = entry.get(b"local-arguments".as_slice()) {
+            std_module_arguments(&mut target, base, local).map_err(|reason| error(&reason))?;
+        }
+    }
+    if sources.is_empty() {
+        return Ok(None);
+    }
+    let mut model = model.clone();
+    target.props.set("EXCLUDE_FROM_ALL".into(), "ON".into());
+    target.usage.push(
+        UsageField::CompileFeatures,
+        BT::new("cxx_std_20".into(), Backtrace::default()),
+    );
+    if lower::definition(&model, DirId::ROOT, b"CMAKE_CXX_COMPILER_ID")
+        .is_some_and(|id| id.ends_with(b"Clang"))
+    {
+        target.usage.push(
+            UsageField::CompileOptions,
+            BT::new(
+                "-Wno-reserved-module-identifier".into(),
+                Backtrace::default(),
+            ),
+        );
+    }
+    let id = model.add_target(target).map_err(|err| error(&err))?;
+    model
+        .add_file_set(FileSet {
+            target: id,
+            name: "CXX_MODULES".into(),
+            kind: FileSetKind::CxxModules,
+            scope: UsageScope::Public,
+            base_dirs: bases
+                .into_iter()
+                .map(|path| BT::new(path, Backtrace::default()))
+                .collect(),
+            files: sources,
+            props: Default::default(),
+        })
+        .map_err(|err| error(&err))?;
+    Ok(Some((model, id)))
+}
+
+fn std_module_arguments(
+    target: &mut Target,
+    base: &[u8],
+    value: &rcmake_json::Value,
+) -> Result<(), &'static str> {
+    use rcmake_json::Value;
+
+    let Value::Object(local) = value else {
+        return Err("Expected a local-arguments object.");
+    };
+    for key in [
+        b"include-directories".as_slice(),
+        b"system-include-directories",
+    ] {
+        if let Some(value) = local.get(key) {
+            let Value::Array(dirs) = value else {
+                return Err("Expected an array of include paths.");
+            };
+            for dir in dirs {
+                let Value::String(dir) = dir else {
+                    return Err("Expected an include path.");
+                };
+                let path = absolute_path(base, dir);
+                target.usage.push(
+                    UsageField::IncludeDirectories,
+                    BT::new(path, Backtrace::default()),
+                );
+            }
+        }
+    }
+    if let Some(value) = local.get(b"definitions".as_slice()) {
+        let Value::Array(definitions) = value else {
+            return Err("Expected an array of definitions.");
+        };
+        for definition in definitions {
+            let Value::Object(definition) = definition else {
+                return Err("Expected a definition object.");
+            };
+            let Some(Value::String(name)) = definition.get(b"name".as_slice()) else {
+                return Err("A definition has no name.");
+            };
+            if matches!(definition.get(b"undef".as_slice()), Some(Value::Bool(true))) {
+                continue;
+            }
+            let value = match definition.get(b"value".as_slice()) {
+                Some(Value::String(value)) => [name.as_slice(), b"=", value].concat().into(),
+                None => name.clone(),
+                _ => return Err("Expected a string definition value."),
+            };
+            target.usage.push(
+                UsageField::CompileDefinitions,
+                BT::new(value, Backtrace::default()),
+            );
+        }
+    }
+    if let Some(Value::Object(vendor)) = local.get(b"vendor".as_slice())
+        && let Some(Value::Object(cmake)) = vendor.get(b"cmake".as_slice())
+    {
+        for (key, field) in [
+            (b"compile-options".as_slice(), UsageField::CompileOptions),
+            (b"compile-features".as_slice(), UsageField::CompileFeatures),
+        ] {
+            if let Some(value) = cmake.get(key) {
+                let Value::Array(values) = value else {
+                    return Err("Expected an array of compiler arguments.");
+                };
+                for value in values {
+                    let Value::String(value) = value else {
+                        return Err("Expected a compiler argument.");
+                    };
+                    target
+                        .usage
+                        .push(field, BT::new(value.clone(), Backtrace::default()));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn export_symbol(target: &Target) -> Option<BString> {
@@ -721,6 +1313,7 @@ fn build_path(model: &ProjectModel, path: &[u8]) -> BString {
 struct ResolvedLink {
     step: Option<LinkStep>,
     dependencies: Vec<TargetId>,
+    module_links: Vec<TargetId>,
     objects: IndexSet<BString>,
 }
 
@@ -787,17 +1380,22 @@ fn resolve_link(
             }
         }
     }
+    let linked_targets = usage.link_targets(id, &ctx)?;
     let mut link = ResolvedLink {
         dependencies: target
             .utility_deps
             .iter()
             .filter_map(|dep| model.find_target(target.dir, &dep.value))
-            .chain(usage.link_targets(id, &ctx)?)
+            .chain(linked_targets.iter().copied())
             .chain(facts.dependencies.iter().copied())
             .chain(link_items(&items).filter_map(|item| paths.object_owner(&item.text.value)))
             .filter(|dep| *dep != id && resolved.contains_key(dep))
             .collect::<IndexSet<_>>()
             .into_iter()
+            .collect(),
+        module_links: linked_targets
+            .into_iter()
+            .chain(facts.dependencies.iter().copied())
             .collect(),
         ..ResolvedLink::default()
     };

@@ -10,6 +10,8 @@ repository.workspace = true
 [dependencies]
 indexmap.workspace = true
 rcmake-base.workspace = true
+rcmake-cxxmodules.workspace = true
+rcmake-json.workspace = true
 rcmake-diag.workspace = true
 rcmake-genex.workspace = true
 rcmake-host.workspace = true

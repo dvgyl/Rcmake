@@ -2,12 +2,19 @@
 
 #![forbid(unsafe_code)]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use rcmake_base::BString;
-use rcmake_host::{CommandSpec, Host, HostError, Input, Output, ProcessResult, RunRequest, path};
+use rcmake_base::{BString, limits::Limits, path_lex::Lexical};
+use rcmake_cxxmodules::collate::{CollationInput, collate, read_modules_json, write_modules_json};
+use rcmake_cxxmodules::p1689::parse_ddi;
+use rcmake_cxxmodules::tdi::write_tdi;
+use rcmake_cxxmodules::{CxxModulesJson, ModulesError, P1689File};
+use rcmake_host::{
+    CommandSpec, Host, HostError, Input, Output, ProcessResult, ReadRange, RunRequest, WriteMode,
+    path,
+};
 use rcmake_resolve::{BuildGraph, BuildStep, Invocation};
 
 /// Options for one build.
@@ -68,6 +75,9 @@ pub enum BuildError {
     /// The host could not perform a build operation.
     #[error(transparent)]
     Host(#[from] HostError),
+    /// Module scans or collation produced an error.
+    #[error(transparent)]
+    Modules(#[from] ModulesError),
     /// The graph has a step kind that the executor can not run yet.
     #[error("{0} is not supported yet")]
     Unsupported(&'static str),
@@ -88,7 +98,56 @@ pub fn execute(
     if !order.is_empty() {
         let build_dir = host.initial_cwd().join(&options.build_dir);
         host.create_dir_all(&build_dir)?;
+        let scan_objects: BTreeMap<_, _> = order
+            .iter()
+            .filter_map(|step| match step {
+                BuildStep::Scan { ddi, object, .. } => Some((ddi, object)),
+                _ => None,
+            })
+            .collect();
+        let mut compile_steps: BTreeMap<_, BTreeMap<_, _>> = BTreeMap::new();
+        for &step in &order {
+            if let BuildStep::Compile {
+                object,
+                dyndep: Some(dd),
+                ..
+            } = step
+            {
+                compile_steps.entry(dd).or_default().insert(object, step);
+            }
+        }
+        let mut module_order: BTreeMap<_, VecDeque<_>> = BTreeMap::new();
         for step in order {
+            let step = match step {
+                BuildStep::Collate { ddis, dd, .. } => {
+                    let scans = collate_modules(host, &build_dir, step)?;
+                    let compiles = compile_steps.remove(dd).unwrap_or_default();
+                    if compiles.len() != ddis.len() {
+                        return Err(module_error("Module scans and compile steps do not match."));
+                    }
+                    let sorted = module_compile_order(&scans)?
+                        .into_iter()
+                        .map(|index| {
+                            ddis.get(index)
+                                .and_then(|ddi| scan_objects.get(ddi))
+                                .and_then(|object| compiles.get(object).copied())
+                                .ok_or_else(|| {
+                                    module_error("A C++ module scan has no compile step.")
+                                })
+                        })
+                        .collect::<Result<VecDeque<_>, _>>()?;
+                    module_order.insert(dd, sorted);
+                    steps_run += 1;
+                    continue;
+                }
+                BuildStep::Compile {
+                    dyndep: Some(dd), ..
+                } => module_order
+                    .get_mut(dd)
+                    .and_then(VecDeque::pop_front)
+                    .ok_or_else(|| module_error("A C++ compile step has no collated scan."))?,
+                _ => step,
+            };
             let (outputs, invocations): (&[BString], &[Invocation]) = match step {
                 BuildStep::Custom(step) => {
                     for byproduct in &step.byproducts {
@@ -122,7 +181,7 @@ pub fn execute(
                     (std::slice::from_ref(ddi), std::slice::from_ref(invocation))
                 }
                 BuildStep::Collate { .. } => {
-                    return Err(BuildError::Unsupported("C++ module collation"));
+                    return Err(module_error("Expected a compiler or scanner invocation."));
                 }
                 BuildStep::Link {
                     step, invocations, ..
@@ -149,6 +208,152 @@ pub fn execute(
         steps_run,
         output: output.into(),
     })
+}
+
+fn module_error(message: impl Into<BString>) -> BuildError {
+    ModulesError::Invalid(message.into()).into()
+}
+
+fn collate_modules(
+    host: &dyn Host,
+    build_dir: &Path,
+    step: &BuildStep,
+) -> Result<Vec<P1689File>, BuildError> {
+    let BuildStep::Collate {
+        ddis,
+        dd,
+        tdi,
+        depend_info,
+        modmap_format,
+        ..
+    } = step
+    else {
+        return Err(module_error("Expected a C++ module collation step."));
+    };
+    let limit = Limits::default().max_value_bytes as u64;
+    let read = |file: &[u8]| {
+        host.read(
+            &build_dir.join(path::to_native(file)),
+            ReadRange::All { limit },
+        )
+    };
+    let read_table = |directory: &BString| -> Result<CxxModulesJson, BuildError> {
+        let file = Lexical::new(directory).append(b"CXXModules.json");
+        Ok(read_modules_json(&read(&file)?)?)
+    };
+    let mut info = depend_info.as_ref().clone();
+    let module_dir = Lexical::new(dd).parent();
+    info.dir_top_bld = path::from_native(build_dir);
+    info.module_dir = Lexical::new(&info.dir_top_bld).append(module_dir);
+    write_module_file(host, build_dir, tdi, &write_tdi(&info)?)?;
+    let input = CollationInput {
+        linked: info
+            .linked_target_dirs
+            .iter()
+            .map(read_table)
+            .collect::<Result<_, _>>()?,
+        forwarded: info
+            .forward_modules_from_target_dirs
+            .iter()
+            .map(read_table)
+            .collect::<Result<_, _>>()?,
+        native: info
+            .native_target_dir
+            .as_ref()
+            .map(read_table)
+            .transpose()?,
+        tdi: info,
+        ddis: ddis
+            .iter()
+            .map(|ddi| Ok(parse_ddi(&read(ddi)?, ddi)?))
+            .collect::<Result<_, BuildError>>()?,
+        modmap_format: Some(*modmap_format),
+    };
+    let output = collate(&input)?;
+    if !output.diagnostics.is_empty() {
+        let message = output
+            .diagnostics
+            .iter()
+            .map(|message| message.as_slice())
+            .collect::<Vec<_>>()
+            .join(b"\n".as_slice());
+        return Err(module_error(message));
+    }
+    for (file, contents) in output.modmaps {
+        write_module_file(host, build_dir, &file, &contents)?;
+    }
+    let modules = Lexical::new(module_dir).append(b"CXXModules.json");
+    write_module_file(
+        host,
+        build_dir,
+        &modules,
+        &write_modules_json(&output.modules)?,
+    )?;
+    write_module_file(host, build_dir, dd, &output.dyndep)?;
+    Ok(input.ddis)
+}
+
+fn write_module_file(
+    host: &dyn Host,
+    build_dir: &Path,
+    file: &[u8],
+    contents: &[u8],
+) -> Result<(), HostError> {
+    create_output_parent(host, build_dir, file)?;
+    host.write(
+        &build_dir.join(path::to_native(file)),
+        contents,
+        WriteMode::Truncate,
+    )
+}
+
+fn module_compile_order(scans: &[P1689File]) -> Result<Vec<usize>, BuildError> {
+    let rules: Vec<_> = scans.iter().filter_map(|scan| scan.rules.first()).collect();
+    let providers: BTreeMap<_, _> = rules
+        .iter()
+        .enumerate()
+        .flat_map(|(index, rule)| {
+            rule.provides
+                .iter()
+                .map(move |module| (&module.logical_name, index))
+        })
+        .collect();
+    let mut dependents = vec![Vec::new(); rules.len()];
+    let mut pending = Vec::with_capacity(rules.len());
+    let mut ready = BTreeSet::new();
+    for (index, rule) in rules.iter().enumerate() {
+        let dependencies: BTreeSet<_> = rule
+            .requires
+            .iter()
+            .filter_map(|module| providers.get(&module.logical_name).copied())
+            .filter(|provider| *provider != index)
+            .collect();
+        pending.push(dependencies.len());
+        if dependencies.is_empty() {
+            ready.insert(index);
+        }
+        for provider in dependencies {
+            if let Some(dependents) = dependents.get_mut(provider) {
+                dependents.push(index);
+            }
+        }
+    }
+    let mut order = Vec::with_capacity(rules.len());
+    while let Some(index) = ready.pop_first() {
+        order.push(index);
+        for &dependent in dependents.get(index).into_iter().flatten() {
+            if let Some(count) = pending.get_mut(dependent) {
+                *count -= 1;
+                if *count == 0 {
+                    ready.insert(dependent);
+                }
+            }
+        }
+    }
+    if order.len() != scans.len() {
+        return Err(BuildError::Cycle);
+    }
+    Ok(order)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]

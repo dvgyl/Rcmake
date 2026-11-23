@@ -285,3 +285,114 @@ fn builds_and_links_c_with_native_host() -> Result<(), Box<dyn std::error::Error
     );
     Ok(())
 }
+
+#[test]
+fn scans_and_collates_before_compiling_module_providers() -> Result<(), Box<dyn std::error::Error>>
+{
+    use rcmake_cxxmodules::tdi::read_tdi;
+    use rcmake_cxxmodules::{ModmapFormat, ModuleSourceInfo, ModuleVisibility, TargetDependInfo};
+
+    let host = PureHost::default();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let observed = calls.clone();
+    host.set_command_handler(move |host, request, _| {
+        let command = &request.pipeline[0];
+        let file = &command.args[0];
+        observed.lock().unwrap().push(file.clone());
+        if command.program == "scan" {
+            let data = if file == "obj/use.o.ddi" {
+                br#"{"version":1,"rules":[{"primary-output":"obj/use.o","requires":[{"logical-name":"math"}]}]}"#.as_slice()
+            } else {
+                br#"{"version":1,"rules":[{"primary-output":"obj/math.o","provides":[{"logical-name":"math"}]}]}"#
+            };
+            host.write(&request.cwd.join(path::to_native(file)), data, WriteMode::Truncate)?;
+        } else {
+            let contents = host.read(&request.cwd.join("obj/CXX.dd"), ReadRange::All { limit: 1024 })?;
+            assert!(contents.starts_with(b"ninja_dyndep_version = 1.0"));
+            let map = &command.args[1];
+            let map = map.strip_prefix(b"@").unwrap();
+            let contents = host.read(&request.cwd.join(path::to_native(map)), ReadRange::All { limit: 1024 })?;
+            if file == "obj/use.o" {
+                assert!(contents.starts_with(br#"-fmodule-file="math=obj/math.pcm""#));
+                assert_eq!(host.metadata(&request.cwd.join("obj/math.o"), Follow::Yes)?.kind, FileKind::File);
+            }
+            host.write(&request.cwd.join(path::to_native(file)), b"object", WriteMode::Truncate)?;
+        }
+        Ok(RunOutput { results: vec![ProcessResult::Exited(0)], ..RunOutput::default() })
+    })?;
+    let scan = |source: &str, object: &str, ddi: &str| BuildStep::Scan {
+        source: source.into(),
+        object: object.into(),
+        ddi: ddi.into(),
+        invocation: invocation(&["scan", ddi]),
+        depfile: None,
+    };
+    let compile = |source: &str, object: &str, map: &str| BuildStep::Compile {
+        source: source.into(),
+        object: object.into(),
+        modmap: Some(map.into()),
+        invocation: invocation(&["compile", object, &format!("@{map}")]),
+        depfile: None,
+        dyndep: Some("obj/CXX.dd".into()),
+    };
+    let graph = BuildGraph {
+        steps: vec![
+            scan("use.cpp", "obj/use.o", "obj/use.o.ddi"),
+            scan("math.cppm", "obj/math.o", "obj/math.o.ddi"),
+            BuildStep::Collate {
+                target: "main".into(),
+                ddis: vec!["obj/use.o.ddi".into(), "obj/math.o.ddi".into()],
+                dd: "obj/CXX.dd".into(),
+                modmaps: vec!["obj/use.o.modmap".into(), "obj/math.o.modmap".into()],
+                tdi: "obj/CXXDependInfo.json".into(),
+                depend_info: Box::new(TargetDependInfo {
+                    language: "CXX".into(),
+                    cxx_modules: BTreeMap::from([(
+                        "obj/math.o".into(),
+                        ModuleSourceInfo {
+                            source: "/work/math.cppm".into(),
+                            file_set: "modules".into(),
+                            visibility: ModuleVisibility::Public,
+                            ..ModuleSourceInfo::default()
+                        },
+                    )]),
+                    ..TargetDependInfo::default()
+                }),
+                modmap_format: ModmapFormat::Clang,
+                implicit_inputs: vec!["obj/CXXDependInfo.json".into()],
+            },
+            compile("use.cpp", "obj/use.o", "obj/use.o.modmap"),
+            compile("math.cppm", "obj/math.o", "obj/math.o.modmap"),
+        ],
+        targets: vec![target("main", vec![0, 1, 2, 3, 4], vec![], true)],
+        ..BuildGraph::default()
+    };
+    let outcome = execute(
+        &graph,
+        &host,
+        &BuildOptions {
+            build_dir: "/work/build".into(),
+            ..BuildOptions::default()
+        },
+    )?;
+    assert!(outcome.success);
+    assert_eq!(outcome.steps_run, 5);
+    assert_eq!(
+        *calls.lock().unwrap(),
+        ["obj/use.o.ddi", "obj/math.o.ddi", "obj/math.o", "obj/use.o"]
+    );
+    let tdi = host.read(
+        Path::new("/work/build/obj/CXXDependInfo.json"),
+        ReadRange::All { limit: 8192 },
+    )?;
+    assert_eq!(read_tdi(&tdi)?.module_dir, "/work/build/obj");
+    let metadata = host.read(
+        Path::new("/work/build/obj/CXXModules.json"),
+        ReadRange::All { limit: 8192 },
+    )?;
+    assert_eq!(
+        read_modules_json(&metadata)?.modules["math".as_bytes()].bmi,
+        "/work/build/obj/math.pcm"
+    );
+    Ok(())
+}

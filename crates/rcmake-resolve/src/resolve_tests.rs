@@ -992,3 +992,320 @@ fn install_file_paths_use_target_artifacts_and_the_install_configuration() -> Te
     }
     Ok(())
 }
+
+fn clang_scan(model: &mut ProjectModel) {
+    for (key, value) in [
+        ("CMAKE_CXX_COMPILER_ID", "Clang"),
+        ("CMAKE_CXX_MODULE_MAP_FORMAT", "clang"),
+        ("CMAKE_CXX_MODULE_MAP_FLAG", "@<MODULE_MAP_FILE>"),
+        (
+            "CMAKE_CXX_SCANDEP_SOURCE",
+            "scan <CMAKE_CXX_COMPILER> <DEFINES> <INCLUDES> <FLAGS> <SOURCE> <DYNDEP_INTERMEDIATE_FILE> <OBJ_FILE> <DEP_FILE> <PREPROCESSED_OUTPUT_FILE>",
+        ),
+    ] {
+        model.global.props.set(key.into(), value.into());
+    }
+}
+
+fn module_set(model: &mut ProjectModel, target: TargetId, file: &str) -> TestResult {
+    model.add_file_set(FileSet {
+        target,
+        name: "modules".into(),
+        kind: FileSetKind::CxxModules,
+        scope: UsageScope::Public,
+        base_dirs: vec![entry("/src/lib")],
+        files: vec![entry(file)],
+        props: Default::default(),
+    })?;
+    Ok(())
+}
+
+#[test]
+fn lowers_clang_module_scans_and_linked_module_inputs() -> TestResult {
+    let mut model = project();
+    let host = PureHost::default();
+    host.seed_file(
+        Path::new("/src/lib/detail/math.cppm"),
+        b"export module math;",
+    )?;
+    host.seed_file(Path::new("/src/main.cpp"), b"import math;")?;
+    clang_scan(&mut model);
+    let mut library = target("math", TargetKind::StaticLibrary, &[]);
+    library
+        .usage
+        .push(UsageField::CompileFeatures, entry("cxx_std_20"));
+    library
+        .usage
+        .push(UsageField::CompileDefinitions, entry("TEST_MODULE"));
+    library
+        .usage
+        .push(UsageField::IncludeDirectories, entry("/src/include path"));
+    library
+        .props
+        .set("CXX_SCAN_FOR_MODULES".into(), "OFF".into());
+    let library = model.add_target(library)?;
+    module_set(&mut model, library, "lib/detail/math.cppm")?;
+
+    let mut app = target("app", TargetKind::Executable, &["main.cpp"]);
+    app.usage
+        .push(UsageField::CompileFeatures, entry("cxx_std_20"));
+    app.usage.link_libraries = Some(vec![link_item("math")]);
+    app.policies
+        .policies
+        .set(PolicyId::new(155), PolicyStatus::New)?;
+    model.add_target(app)?;
+
+    let result = resolve(&model, &host, &[])?;
+    let producer = result.targets[0]
+        .cxx_modules
+        .as_ref()
+        .ok_or("Missing producer module info")?;
+    let consumer = result.targets[1]
+        .cxx_modules
+        .as_ref()
+        .ok_or("Missing consumer module info")?;
+    assert_eq!(producer.units[0].relative_directory, "detail");
+    assert_eq!(producer.units[0].visibility, ModuleVisibility::Public);
+    assert_eq!(
+        consumer.linked_target_dirs,
+        std::slice::from_ref(&producer.module_dir)
+    );
+    let graph = &result.graphs[0];
+    let [scan, collate, compile, ..] = graph.targets[0].steps.as_slice() else {
+        return Err("Missing module build steps".into());
+    };
+    let BuildStep::Scan {
+        invocation,
+        ddi,
+        object,
+        depfile,
+        ..
+    } = &graph.steps[*scan]
+    else {
+        return Err("Missing scan step".into());
+    };
+    assert_eq!(
+        invocation.argv,
+        [
+            BString::from("scan"),
+            "/toolchain/c++".into(),
+            "-DTEST_MODULE".into(),
+            "-I/src/include path".into(),
+            "-std=gnu++20".into(),
+            "/src/lib/detail/math.cppm".into(),
+            ddi.clone(),
+            object.clone(),
+            depfile.clone().ok_or("Missing scan dependency file")?,
+            format!("{object}.ddi.i").into(),
+        ]
+    );
+    assert!(
+        matches!(&graph.steps[*collate], BuildStep::Collate { ddis, .. } if ddis == std::slice::from_ref(ddi))
+    );
+    assert!(matches!(&graph.steps[*compile], BuildStep::Compile {
+        modmap: Some(map), dyndep: Some(dd), invocation, ..
+    } if map == format!("{object}.modmap").as_str() && dd == &producer.dyndep
+        && invocation.argv.contains(&BString::from(format!("@{map}")))));
+    assert!(graph.steps.iter().any(|step| matches!(step, BuildStep::Collate {
+        target, implicit_inputs, depend_info, ..
+    } if target == "app"
+        && implicit_inputs == &[consumer.tdi.clone(), format!("{}/CXXModules.json", producer.module_dir).into()]
+        && depend_info.linked_target_dirs == consumer.linked_target_dirs)));
+    Ok(())
+}
+
+#[test]
+fn cpp20_without_a_scan_rule_only_errors_when_scanning_is_required() -> TestResult {
+    let mut model = project();
+    let host = PureHost::default();
+    host.seed_file(Path::new("/src/main.cpp"), b"int main() {}")?;
+    host.seed_file(Path::new("/src/lib/math.cppm"), b"export module math;")?;
+    model
+        .global
+        .props
+        .set("CMAKE_CXX_COMPILER_ID".into(), "AppleClang".into());
+    let mut app = target("app", TargetKind::Executable, &["main.cpp"]);
+    app.props.set("CXX_STANDARD".into(), "20".into());
+    app.policies
+        .policies
+        .set(PolicyId::new(155), PolicyStatus::New)?;
+    let app = model.add_target(app)?;
+
+    let result = resolve(&model, &host, &[])?;
+    assert!(!result.targets[0].compile_units[0].scan);
+    assert!(result.targets[0].cxx_modules.is_none());
+
+    model
+        .target_mut(app)
+        .ok_or("Missing app")?
+        .props
+        .set("CXX_SCAN_FOR_MODULES".into(), "ON".into());
+    let error = resolve(&model, &host, &[]).expect_err("Explicit scanning must fail");
+    assert!(
+        error
+            .to_string()
+            .contains("compiler does not provide a way to discover the import graph")
+    );
+
+    model
+        .target_mut(app)
+        .ok_or("Missing app")?
+        .props
+        .set("CXX_SCAN_FOR_MODULES".into(), "OFF".into());
+    module_set(&mut model, app, "lib/math.cppm")?;
+    let error = resolve(&model, &host, &[]).expect_err("Module file sets require scanning");
+    assert!(
+        error
+            .to_string()
+            .contains("compiler does not provide a way to discover the import graph")
+    );
+    Ok(())
+}
+
+#[test]
+fn module_scan_precedence_uses_file_set_source_target_and_policy() -> TestResult {
+    let mut model = project();
+    let host = PureHost::default();
+    for name in ["file_set.cpp", "source.cpp", "target.cpp"] {
+        host.seed_file(&Path::new("/src").join(name), b"int x;")?;
+    }
+    clang_scan(&mut model);
+    let mut library = target(
+        "library",
+        TargetKind::ObjectLibrary,
+        &["file_set.cpp", "source.cpp", "target.cpp"],
+    );
+    library.props.set("CXX_STANDARD".into(), "20".into());
+    library
+        .props
+        .set("CXX_SCAN_FOR_MODULES".into(), "ON".into());
+    let library = model.add_target(library)?;
+    for file in ["/src/file_set.cpp", "/src/source.cpp"] {
+        model
+            .dir_mut(DirId::ROOT)
+            .source_props
+            .entry(file.into())
+            .or_default()
+            .set("CXX_SCAN_FOR_MODULES".into(), "OFF".into());
+    }
+    let mut set = FileSet {
+        target: library,
+        name: "ordinary".into(),
+        kind: FileSetKind::Sources,
+        scope: UsageScope::Private,
+        base_dirs: vec![entry("/src")],
+        files: vec![entry("file_set.cpp")],
+        props: Default::default(),
+    };
+    set.props.set("CXX_SCAN_FOR_MODULES".into(), "ON".into());
+    model.add_file_set(set)?;
+    let result = resolve(&model, &host, &[])?;
+    assert_eq!(
+        result.targets[0]
+            .compile_units
+            .iter()
+            .map(|unit| unit.scan)
+            .collect::<Vec<_>>(),
+        [true, false, true]
+    );
+
+    model
+        .target_mut(library)
+        .ok_or("Missing target")?
+        .props
+        .set("CXX_STANDARD".into(), "17".into());
+    let result = resolve(&model, &host, &[])?;
+    assert!(
+        result.targets[0]
+            .compile_units
+            .iter()
+            .all(|unit| !unit.scan)
+    );
+    Ok(())
+}
+
+#[test]
+fn synthesizes_std_module_target_and_bmi_install_metadata() -> TestResult {
+    let mut model = project();
+    let host = PureHost::default();
+    clang_scan(&mut model);
+    for (file, contents) in [
+        ("/src/main.cpp", "import std;"),
+        ("/src/lib/part.cppm", "export module part;"),
+        ("/toolchain/stdlib/std.cppm", "export module std;"),
+        (
+            "/toolchain/modules.json",
+            r#"{"version":1,"modules":[{"logical-name":"std","source-path":"stdlib/std.cppm"}]}"#,
+        ),
+    ] {
+        host.seed_file(Path::new(file), contents.as_bytes())?;
+    }
+    model.global.props.set(
+        "CMAKE_CXX_STDLIB_MODULES_JSON".into(),
+        "/toolchain/modules.json".into(),
+    );
+    let mut lib = target("lib", TargetKind::StaticLibrary, &["main.cpp"]);
+    lib.props.set("CXX_STANDARD".into(), "23".into());
+    lib.props.set("CXX_SCAN_FOR_MODULES".into(), "ON".into());
+    let lib = model.add_target(lib)?;
+    module_set(&mut model, lib, "lib/part.cppm")?;
+    model.add_install(InstallRule {
+        dir: DirId::ROOT,
+        backtrace: backtrace(10),
+        kind: InstallKind::Targets {
+            targets: vec![lib],
+            export: None,
+        },
+        options: InstallOptions::default(),
+    });
+    for (index, arg) in [
+        "TARGETS",
+        "lib",
+        "FILE_SET",
+        "modules",
+        "DESTINATION",
+        "include/modules",
+        "CXX_MODULES_BMI",
+        "DESTINATION",
+        "bmi",
+        "COMPONENT",
+        "sdk",
+        "OPTIONAL",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        model
+            .global
+            .props
+            .set(format!("_RCMAKE_INSTALL_0_ARG{index}").into(), arg.into());
+    }
+
+    let result = resolve(&model, &host, &[])?;
+    let std = &result.targets[1];
+    assert_eq!(std.metadata.name, STD_MODULE_TARGET);
+    assert!(std.metadata.generator_provided);
+    let std_modules = std
+        .cxx_modules
+        .as_ref()
+        .ok_or("Missing standard library modules")?;
+    assert!(std_modules.units[0].bmi_only);
+    let modules = result.targets[0]
+        .cxx_modules
+        .as_ref()
+        .ok_or("Missing library modules")?;
+    assert_eq!(
+        modules.linked_target_dirs,
+        ["CMakeFiles/@cmake_cxx_std.dir"]
+    );
+    let install = modules
+        .bmi_install
+        .as_ref()
+        .ok_or("Missing BMI installation")?;
+    assert_eq!(install.destination, "bmi");
+    assert_eq!(install.component, "sdk");
+    assert!(install.optional);
+    assert_eq!(result.graphs[0].targets[0].depends, [1]);
+    assert!(!result.graphs[0].targets[1].in_all);
+    Ok(())
+}

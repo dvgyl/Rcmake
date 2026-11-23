@@ -9,6 +9,7 @@ repository.workspace = true
 
 [dependencies]
 rcmake-base.workspace = true
+rcmake-cxxmodules.workspace = true
 rcmake-diag.workspace = true
 rcmake-host.workspace = true
 rcmake-resolve.workspace = true
