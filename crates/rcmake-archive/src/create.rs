@@ -1,17 +1,17 @@
+use std::collections::HashMap;
 use std::io::{Cursor, Read, Write};
 use std::path::{Path, PathBuf};
 
-use flate2::{Compression, write::GzEncoder};
 use rcmake_base::BString;
-use rcmake_host::{FileKind, FileTime, Follow, Host, WriteMode, path::from_native};
+use rcmake_host::{FileKind, FileTime, Follow, Host, Metadata, WriteMode, path::from_native};
 use tar::{Builder, EntryType, Header};
 use zip::{CompressionMethod, ZipWriter, write::FullFileOptions};
 
-use crate::timestamp;
 use crate::{
     ArchiveError, ArchiveFormat, CreateOptions, MAX_ENTRIES, absolute, archive_error, archive_name,
     checked_name, emit_names, read_bytes, relative_path, size_limit,
 };
+use crate::{TarCompression, codec::Encoder, timestamp};
 
 pub(super) fn run(
     host: &dyn Host,
@@ -34,6 +34,7 @@ pub(super) fn run(
         writer: Writer::new(options)?,
         mtime,
         names: Vec::new(),
+        links: HashMap::new(),
         bytes_left: size_limit(),
         command,
     };
@@ -90,6 +91,7 @@ struct Creation<'a> {
     writer: Writer,
     mtime: Option<FileTime>,
     names: Vec<BString>,
+    links: HashMap<(u64, u64), (BString, PathBuf)>,
     bytes_left: u64,
     command: bool,
 }
@@ -111,7 +113,22 @@ impl Creation<'_> {
             .filter(|_| self.names.len() < MAX_ENTRIES)
             .ok_or_else(|| ArchiveError::new("Archive exceeds the entry or size limit"))?;
 
+        let identity = (metadata.dev, metadata.ino);
+        let link_name = if matches!(self.writer, Writer::Tar(..))
+            && metadata.kind == FileKind::File
+            && metadata.nlink > 1
+            && let Ok(relative) = relative_path(&name)
+        {
+            let (target, target_path) = self
+                .links
+                .entry(identity)
+                .or_insert_with(|| (name.clone(), relative.clone()));
+            (*target_path != relative).then_some(target.as_slice())
+        } else {
+            None
+        };
         let contents = match metadata.kind {
+            FileKind::File if link_name.is_some() => Vec::new(),
             FileKind::File => read_bytes(self.host, path, self.bytes_left)?,
             FileKind::Symlink => from_native(&self.host.read_link(path)?).into(),
             FileKind::Dir => Vec::new(),
@@ -124,14 +141,14 @@ impl Creation<'_> {
         };
         self.bytes_left = self
             .bytes_left
-            .checked_sub(contents.len() as u64)
+            .checked_sub(link_name.unwrap_or(&contents).len() as u64)
             .ok_or_else(|| ArchiveError::new("Archive exceeds the size limit"))?;
         self.writer.add(
             &name,
-            metadata.kind,
-            metadata.mode,
+            &metadata,
             self.mtime.unwrap_or(metadata.mtime),
             &contents,
+            link_name,
         )?;
 
         if metadata.kind == FileKind::Dir {
@@ -157,8 +174,7 @@ impl Creation<'_> {
 }
 
 enum Writer {
-    Tar(Builder<Vec<u8>>, bool),
-    TarGz(Builder<GzEncoder<Vec<u8>>>, bool),
+    Tar(Box<Builder<Encoder>>, bool),
     Zip {
         writer: Box<ZipWriter<Cursor<Vec<u8>>>>,
         method: CompressionMethod,
@@ -168,50 +184,73 @@ enum Writer {
 
 impl Writer {
     fn new(options: &CreateOptions) -> Result<Self, ArchiveError> {
+        use ArchiveFormat::*;
         let level = options.compression_level;
-        if level.is_some_and(|level| level > 9) {
-            return Err(ArchiveError::new(
-                "The compression level must be between 0 and 9",
-            ));
+        let (gnu, filter) = match options.format {
+            Tar => (false, None),
+            TarGz => (false, Some(TarCompression::Gzip)),
+            TarBz2 => (false, Some(TarCompression::Bzip2)),
+            TarXz => (false, Some(TarCompression::Xz)),
+            TarLzma => (false, Some(TarCompression::Lzma)),
+            TarZstd => (false, Some(TarCompression::Zstd)),
+            TarZ => (false, Some(TarCompression::Compress)),
+            GnuTar => (true, None),
+            GnuTarGz => (true, Some(TarCompression::Gzip)),
+            GnuTarCompressed(filter) => (true, Some(filter)),
+            Zip | ZipStored => (false, None),
+        };
+        let max_level = if filter == Some(TarCompression::Zstd) {
+            19
+        } else {
+            9
+        };
+        if level.is_some_and(|level| level > max_level) {
+            return Err(ArchiveError::new(format!(
+                "The compression level must be between 0 and {max_level}"
+            )));
         }
-        let gnu = matches!(
-            options.format,
-            ArchiveFormat::GnuTar | ArchiveFormat::GnuTarGz
-        );
-        Ok(match options.format {
-            ArchiveFormat::Tar | ArchiveFormat::GnuTar => Self::Tar(Builder::new(Vec::new()), gnu),
-            ArchiveFormat::TarGz | ArchiveFormat::GnuTarGz => Self::TarGz(
-                Builder::new(GzEncoder::new(
-                    Vec::new(),
-                    level.map_or_else(Compression::default, Compression::new),
-                )),
-                gnu,
-            ),
-            ArchiveFormat::Zip | ArchiveFormat::ZipStored => Self::Zip {
+        if matches!(options.format, Zip | ZipStored) {
+            let deflate = options.format == Zip;
+            return Ok(Self::Zip {
                 writer: Box::new(ZipWriter::new(Cursor::new(Vec::new()))),
-                method: if options.format == ArchiveFormat::ZipStored {
-                    CompressionMethod::Stored
-                } else {
+                method: if deflate {
                     CompressionMethod::Deflated
+                } else {
+                    CompressionMethod::Stored
                 },
-                level: level
-                    .filter(|_| options.format == ArchiveFormat::Zip)
-                    .map(i64::from),
-            },
-        })
+                level: level.filter(|_| deflate).map(i64::from),
+            });
+        }
+        let encoder = Encoder::new(filter, level)?;
+        Ok(Self::Tar(Box::new(Builder::new(encoder)), gnu))
     }
 
     fn add(
         &mut self,
         name: &[u8],
-        kind: FileKind,
-        mode: u32,
+        metadata: &Metadata,
         mtime: FileTime,
         contents: &[u8],
+        link_name: Option<&[u8]>,
     ) -> Result<(), ArchiveError> {
         match self {
-            Self::Tar(writer, gnu) => add_tar(writer, *gnu, name, kind, mode, mtime, contents),
-            Self::TarGz(writer, gnu) => add_tar(writer, *gnu, name, kind, mode, mtime, contents),
+            Self::Tar(writer, gnu) => {
+                let kind = match (metadata.kind, link_name) {
+                    (_, Some(_)) => EntryType::Link,
+                    (FileKind::Dir, None) => EntryType::Directory,
+                    (FileKind::Symlink, None) => EntryType::Symlink,
+                    _ => EntryType::Regular,
+                };
+                add_tar(
+                    writer,
+                    *gnu,
+                    name,
+                    kind,
+                    metadata.mode,
+                    mtime,
+                    link_name.unwrap_or(contents),
+                )
+            }
             Self::Zip {
                 writer,
                 method,
@@ -226,10 +265,10 @@ impl Writer {
                 let mut options = FullFileOptions::default()
                     .compression_method(*method)
                     .compression_level(*level)
-                    .unix_permissions(mode)
+                    .unix_permissions(metadata.mode)
                     .last_modified_time(timestamp::zip_dos_time(mtime));
                 timestamp::add_zip_time(&mut options, mtime)?;
-                match kind {
+                match metadata.kind {
                     FileKind::Dir => writer.add_directory(name, options).map_err(archive_error),
                     FileKind::Symlink => {
                         let target = std::str::from_utf8(contents).map_err(archive_error)?;
@@ -248,10 +287,9 @@ impl Writer {
 
     fn finish(self) -> Result<Vec<u8>, ArchiveError> {
         match self {
-            Self::Tar(writer, _) => writer.into_inner().map_err(archive_error),
-            Self::TarGz(writer, _) => writer
+            Self::Tar(writer, _) => writer
                 .into_inner()
-                .and_then(GzEncoder::finish)
+                .and_then(Encoder::finish)
                 .map_err(archive_error),
             Self::Zip { writer, .. } => writer
                 .finish()
@@ -265,7 +303,7 @@ fn add_tar(
     writer: &mut Builder<impl Write>,
     gnu: bool,
     name: &[u8],
-    kind: FileKind,
+    kind: EntryType,
     mode: u32,
     mtime: FileTime,
     contents: &[u8],
@@ -279,18 +317,15 @@ fn add_tar(
     header.set_uid(0);
     header.set_gid(0);
     header.set_mtime(u64::try_from(mtime.secs).unwrap_or_default());
-    header.set_entry_type(match kind {
-        FileKind::Dir => EntryType::Directory,
-        FileKind::Symlink => EntryType::Symlink,
-        _ => EntryType::Regular,
-    });
-    header.set_size(if kind == FileKind::File {
+    header.set_entry_type(kind);
+    header.set_size(if kind == EntryType::Regular {
         contents.len() as u64
     } else {
         0
     });
 
-    let long_link = kind == FileKind::Symlink && header.set_link_name_literal(contents).is_err();
+    let long_link = matches!(kind, EntryType::Link | EntryType::Symlink)
+        && header.set_link_name_literal(contents).is_err();
     if gnu {
         if !copy_name(&mut header, name) {
             gnu_long(writer, EntryType::GNULongName, name)?;
@@ -319,7 +354,7 @@ fn add_tar(
         }
         writer.append_pax_extensions(pax).map_err(archive_error)?;
     }
-    let data = if kind == FileKind::File {
+    let data = if kind == EntryType::Regular {
         contents
     } else {
         &[]

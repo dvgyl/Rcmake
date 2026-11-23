@@ -2,18 +2,17 @@ use std::collections::BTreeMap;
 use std::io::{self, Cursor, ErrorKind, Read};
 use std::path::{Path, PathBuf};
 
-use flate2::read::MultiGzDecoder;
 use rcmake_base::BString;
 use rcmake_host::{FileKind, FileTime, Follow, Host, Metadata, WriteMode, path::to_native};
 use tar::{Archive, EntryType};
 use zip::ZipArchive;
 
 use crate::pattern::Patterns;
-use crate::timestamp;
 use crate::{
     ArchiveError, ExtractOptions, MAX_ENTRIES, absolute, archive_error, checked_name, emit_names,
     read_bounded, read_bytes, relative_path, size_limit,
 };
+use crate::{codec, timestamp};
 
 #[derive(Clone, Copy)]
 pub(super) enum Listing<'a> {
@@ -48,17 +47,6 @@ pub(super) fn run(
         count: 0,
         bytes_left: size_limit(),
     };
-    for (magic, name) in [
-        (b"\xfd7zXZ\0".as_slice(), "XZ"),
-        (b"\x28\xb5\x2f\xfd".as_slice(), "Zstd"),
-        (b"BZh".as_slice(), "BZip2"),
-    ] {
-        if bytes.starts_with(magic) {
-            return Err(ArchiveError::new(format!(
-                "{name} compression not yet supported"
-            )));
-        }
-    }
     if bytes.starts_with(b"PK\x03\x04") || bytes.starts_with(b"PK\x05\x06") {
         let entries = scan.zip(&bytes)?;
         scan.patterns.finish()?;
@@ -69,12 +57,12 @@ pub(super) fn run(
             }
             unpack.finish()?;
         }
-    } else if bytes.starts_with(b"\x1f\x8b") {
+    } else if let Some(filter) = codec::detect(&bytes) {
         scan.tar(host, &options.destination, || {
-            MultiGzDecoder::new(bytes.as_slice())
+            codec::decoder(filter, &bytes)
         })?;
     } else {
-        scan.tar(host, &options.destination, || bytes.as_slice())?;
+        scan.tar(host, &options.destination, || Ok(bytes.as_slice()))?;
     }
     emit_names(host, &scan.names, options.verbose);
     Ok(scan.names)
@@ -120,9 +108,9 @@ impl Scan<'_> {
         &mut self,
         host: &dyn Host,
         destination: &Path,
-        reader: impl Fn() -> R,
+        reader: impl Fn() -> Result<R, ArchiveError>,
     ) -> Result<(), ArchiveError> {
-        let entries = self.tar_headers(reader())?;
+        let entries = self.tar_headers(reader()?)?;
         self.patterns.finish()?;
         if entries.is_empty() {
             return Ok(());
@@ -130,7 +118,7 @@ impl Scan<'_> {
 
         let mut unpack = Unpack::new(host, destination)?;
         let mut entries = entries.into_iter().peekable();
-        let mut archive = Archive::new(reader().take(size_limit() + 1));
+        let mut archive = Archive::new(reader()?.take(size_limit() + 1));
         for (index, item) in archive.entries().map_err(archive_error)?.enumerate() {
             let mut item = item.map_err(archive_error)?;
             let Some((_, entry)) = entries.next_if(|(selected, _)| *selected == index) else {
@@ -230,7 +218,7 @@ impl Scan<'_> {
                 },
             ));
         }
-        // Read past the tar end marker to check the gzip trailer and size limit.
+        // Read past the tar end marker to check the compression trailer and size limit.
         let mut remaining = archive.into_inner();
         io::copy(&mut remaining, &mut io::sink()).map_err(archive_error)?;
         if remaining.limit() == 0 {

@@ -6,8 +6,8 @@ use jiff::{
     tz::{Offset, TimeZone},
 };
 use rcmake_archive::{
-    ArchiveFormat, CreateOptions, ExtractOptions, create_command_archive, extract_archive,
-    list_command_archive,
+    ArchiveFormat, CreateOptions, ExtractOptions, TarCompression, create_command_archive,
+    extract_archive, list_command_archive,
 };
 use rcmake_base::BString;
 use rcmake_host::{Follow, Stream, path::to_native};
@@ -23,6 +23,7 @@ enum Compression {
     Lzma,
     Zstd,
     Ppmd,
+    Compress,
 }
 
 #[derive(Default)]
@@ -65,6 +66,7 @@ pub(super) fn tar(args: &[BString], cx: &ToolCtx<'_>) -> i32 {
             b'z' => Some(Compression::Gzip),
             b'j' => Some(Compression::Bzip2),
             b'J' => Some(Compression::Xz),
+            b'Z' => Some(Compression::Compress),
             _ => {
                 error(cx, &[b"tar: Unknown argument: ", &[flag], b"\n"]);
                 None
@@ -148,7 +150,10 @@ fn parse_option<'a>(arg: &'a [u8], opts: &mut TarOptions<'a>, cx: &ToolCtx<'_>) 
                 ));
             }
         })
-    } else if let Some(level) = arg.strip_prefix(b"--cmake-tar-compression-level=") {
+    } else if let Some(level) = arg
+        .strip_prefix(b"--cmake-tar-compression-level=")
+        .or_else(|| arg.strip_prefix(b"--cmake-compression-level="))
+    {
         opts.level = Some(parse_integer(b"compression-level", level, cx)?);
         None
     } else if let Some(threads) = arg.strip_prefix(b"--cmake-tar-threads=") {
@@ -268,8 +273,9 @@ fn create(archive: &[u8], opts: TarOptions<'_>, verbose: bool, cx: &ToolCtx<'_>)
             ],
         );
     }
-    let Some(format) = archive_format(&opts, cx) else {
-        return 1;
+    let format = match archive_format(&opts) {
+        Ok(format) => format,
+        Err(message) => return creation_error(cx, archive, &[message.as_bytes()]),
     };
     let mtime = if let Some(mtime) = opts.mtime {
         let Some(seconds) = parse_mtime(mtime, cx) else {
@@ -375,20 +381,50 @@ fn validate_level(opts: &TarOptions<'_>, cx: &ToolCtx<'_>) -> Result<(), i32> {
     Ok(())
 }
 
-fn archive_format(opts: &TarOptions<'_>, cx: &ToolCtx<'_>) -> Option<ArchiveFormat> {
+fn archive_format(opts: &TarOptions<'_>) -> Result<ArchiveFormat, String> {
     let format = opts.format.unwrap_or(b"paxr");
-    match (format, opts.compression) {
-        (b"zip", None | Some(Compression::Gzip)) => Some(ArchiveFormat::Zip),
-        (b"zip", Some(Compression::None)) => Some(ArchiveFormat::ZipStored),
-        (b"gnutar", None | Some(Compression::None)) => Some(ArchiveFormat::GnuTar),
-        (b"gnutar", Some(Compression::Gzip)) => Some(ArchiveFormat::GnuTarGz),
-        (b"pax" | b"paxr", None | Some(Compression::None)) => Some(ArchiveFormat::Tar),
-        (b"pax" | b"paxr", Some(Compression::Gzip)) => Some(ArchiveFormat::TarGz),
-        _ => {
-            error(cx, &[b"CMake Error: The archive backend does not support the requested format or compression method\n"]);
-            None
-        }
+    let compression = opts.compression.unwrap_or(Compression::None);
+    if format == b"zip" {
+        return match compression {
+            Compression::None if opts.compression.is_some() => Ok(ArchiveFormat::ZipStored),
+            Compression::None | Compression::Gzip => Ok(ArchiveFormat::Zip),
+            _ => Err(String::from(
+                "CMake Error: The archive backend does not support the requested ZIP compression method\n",
+            )),
+        };
     }
+    if format == b"7zip" {
+        return Err(String::from(
+            "CMake Error: The archive backend does not support 7zip\n",
+        ));
+    }
+
+    let (filter, tar) = match compression {
+        Compression::None => {
+            return Ok(if format == b"gnutar" {
+                ArchiveFormat::GnuTar
+            } else {
+                ArchiveFormat::Tar
+            });
+        }
+        Compression::Gzip => (TarCompression::Gzip, ArchiveFormat::TarGz),
+        Compression::Bzip2 => (TarCompression::Bzip2, ArchiveFormat::TarBz2),
+        Compression::Xz => (TarCompression::Xz, ArchiveFormat::TarXz),
+        Compression::Lzma => (TarCompression::Lzma, ArchiveFormat::TarLzma),
+        Compression::Zstd => (TarCompression::Zstd, ArchiveFormat::TarZstd),
+        Compression::Compress => (TarCompression::Compress, ArchiveFormat::TarZ),
+        Compression::Ppmd => {
+            return Err(format!(
+                "CMake Error: PPMd is not supported for {}\n",
+                String::from_utf8_lossy(format)
+            ));
+        }
+    };
+    Ok(if format == b"gnutar" {
+        ArchiveFormat::GnuTarCompressed(filter)
+    } else {
+        tar
+    })
 }
 
 fn parse_mtime(value: &[u8], cx: &ToolCtx<'_>) -> Option<u64> {
@@ -561,5 +597,60 @@ fn extract(
             };
             error(cx, &[message, archive, b"\n"])
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use rcmake_host::{Host, PureHost};
+
+    use super::*;
+
+    #[test]
+    fn tar_selects_compression_from_flags() -> Result<(), Box<dyn std::error::Error>> {
+        let cwd = Path::new("/work");
+        let host = PureHost::new(cwd.to_owned(), "/bin/cmake".into());
+        let cx = ToolCtx {
+            host: &host,
+            cwd,
+            exe_display: b"cmake",
+            capabilities: &|| rcmake_json::Value::Null,
+        };
+        let input = cwd.join("input");
+        let archive = cwd.join("archive");
+        for (flags, options, magic) in [
+            (
+                "cjf",
+                &["--cmake-tar-compression-level=1"][..],
+                b"BZh1".as_slice(),
+            ),
+            ("cJf", &["--format=gnutar"][..], b"\xfd7zXZ\0"),
+            ("cf", &["--lzma"][..], b"\x5d\0\0\x80\0"),
+            (
+                "cf",
+                &["--zstd", "--cmake-compression-level=19"][..],
+                b"\x28\xb5\x2f\xfd",
+            ),
+            ("cZf", &[][..], b"\x1f\x9d\x90"),
+        ] {
+            host.seed_file(&input, b"contents")?;
+            let args = ["tar", flags, "archive"]
+                .into_iter()
+                .chain(options.iter().copied())
+                .chain(["input"])
+                .map(BString::from)
+                .collect::<Vec<_>>();
+            assert_eq!(super::super::run(&args, &cx), 0, "{args:?}");
+            assert!(host.read(&archive, read_all())?.starts_with(magic));
+            host.remove_file(&input)?;
+            for action in ["tf", "xf"] {
+                let args = ["tar", action, "archive"].map(BString::from);
+                assert_eq!(super::super::run(&args, &cx), 0, "{args:?}");
+            }
+            assert_eq!(host.read(&input, read_all())?, b"contents");
+        }
+        Ok(())
     }
 }

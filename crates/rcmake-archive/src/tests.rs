@@ -10,8 +10,17 @@ use super::*;
 
 type TestResult = Result<(), Box<dyn Error>>;
 
-const ALL_FORMATS: [ArchiveFormat; 3] =
-    [ArchiveFormat::Tar, ArchiveFormat::TarGz, ArchiveFormat::Zip];
+const ALL_FORMATS: [ArchiveFormat; 9] = [
+    ArchiveFormat::Tar,
+    ArchiveFormat::TarGz,
+    ArchiveFormat::TarBz2,
+    ArchiveFormat::TarXz,
+    ArchiveFormat::TarLzma,
+    ArchiveFormat::TarZstd,
+    ArchiveFormat::TarZ,
+    ArchiveFormat::Zip,
+    ArchiveFormat::ZipStored,
+];
 
 fn test_host() -> PureHost {
     PureHost::new(PathBuf::from("/source"), PathBuf::from("/bin/rcmake"))
@@ -76,6 +85,10 @@ fn round_trips_all_formats_in_byte_order() -> TestResult {
         assert_eq!(
             read_bytes(&host, archive, size_limit())?,
             read_bytes(&host, duplicate, size_limit())?
+        );
+        assert_eq!(
+            list_command_archive(&host, archive, vec![], None)?,
+            expected
         );
         assert_eq!(
             extract_archive(&host, archive, &extract_options())?,
@@ -538,23 +551,47 @@ fn skips_tar_fifos_and_devices() -> TestResult {
 }
 
 #[test]
-fn identifies_unsupported_compression() -> TestResult {
+fn rejects_incomplete_compression_headers() -> TestResult {
     let host = test_host();
     let archive = Path::new("/archive");
-    for (magic, message) in [
-        (b"\xfd7zXZ\0".as_slice(), "XZ compression not yet supported"),
-        (
-            b"\x28\xb5\x2f\xfd".as_slice(),
-            "Zstd compression not yet supported",
-        ),
-        (b"BZh".as_slice(), "BZip2 compression not yet supported"),
+    for magic in [
+        b"\xfd7zXZ\0".as_slice(),
+        b"\x28\xb5\x2f\xfd",
+        b"BZh",
+        b"\x1f\x9d",
+        b"\x1f\x9d\xff",
+        b"\x1f\x9d\x90\x01",
+        b"\x1f\x8b",
     ] {
         host.write(archive, magic, WriteMode::Truncate)?;
-        assert_eq!(
-            extract_archive(&host, archive, &extract_options()),
-            Err(ArchiveError::new(message))
-        );
+        assert!(extract_archive(&host, archive, &extract_options()).is_err());
         assert!(absent(&host, "/extract"));
+    }
+    Ok(())
+}
+
+#[test]
+fn creates_tar_hard_links() -> TestResult {
+    for format in ALL_FORMATS
+        .into_iter()
+        .filter(|format| !matches!(format, ArchiveFormat::Zip | ArchiveFormat::ZipStored))
+    {
+        let host = test_host();
+        host.seed_file(Path::new("/source/tree/a"), b"shared")?;
+        host.hard_link(Path::new("/source/tree/a"), Path::new("/source/tree/b"))?;
+        let archive = Path::new("/archive");
+        create_archive(
+            &host,
+            archive,
+            Path::new("/source"),
+            &[PathBuf::from("tree")],
+            &create_options(format),
+        )?;
+        extract_archive(&host, archive, &extract_options())?;
+        let first = host.metadata(Path::new("/extract/tree/a"), Follow::No)?;
+        let second = host.metadata(Path::new("/extract/tree/b"), Follow::No)?;
+        assert_eq!(first, second);
+        assert_eq!(first.nlink, 2);
     }
     Ok(())
 }
@@ -575,22 +612,32 @@ fn rejects_truncated_tar_payload_before_writing() -> TestResult {
 }
 
 #[test]
-fn rejects_truncated_gzip_trailer_before_writing() -> TestResult {
-    let host = test_host();
-    let archive = Path::new("/archive");
-    host.seed_file(Path::new("/source/input"), b"input")?;
-    create_archive(
-        &host,
-        archive,
-        Path::new("/source"),
-        &[PathBuf::from("input")],
-        &create_options(ArchiveFormat::TarGz),
-    )?;
-    let mut bytes = read_bytes(&host, archive, size_limit())?;
-    bytes.truncate(bytes.len() - 1);
-    host.write(archive, &bytes, WriteMode::Truncate)?;
-    assert!(extract_archive(&host, archive, &extract_options()).is_err());
-    assert!(absent(&host, "/extract"));
+fn rejects_truncated_compression_trailers_before_writing() -> TestResult {
+    for format in [
+        ArchiveFormat::TarGz,
+        ArchiveFormat::TarBz2,
+        ArchiveFormat::TarXz,
+        ArchiveFormat::TarZstd,
+    ] {
+        let host = test_host();
+        let archive = Path::new("/archive");
+        host.seed_file(Path::new("/source/input"), b"input")?;
+        create_archive(
+            &host,
+            archive,
+            Path::new("/source"),
+            &[PathBuf::from("input")],
+            &create_options(format),
+        )?;
+        let mut bytes = read_bytes(&host, archive, size_limit())?;
+        bytes.pop();
+        host.write(archive, &bytes, WriteMode::Truncate)?;
+        assert!(
+            extract_archive(&host, archive, &extract_options()).is_err(),
+            "{format:?}"
+        );
+        assert!(absent(&host, "/extract"));
+    }
     Ok(())
 }
 
@@ -644,4 +691,186 @@ fn preserves_tar_names_that_are_not_utf8() -> TestResult {
         b"data"
     );
     Ok(())
+}
+
+#[cfg(unix)]
+mod oracle {
+    use std::time::Duration;
+
+    use rcmake_host::{CommandSpec, Input, NativeHost, Output, ProcessResult, RunRequest};
+
+    use super::*;
+
+    struct TempDir<'a> {
+        host: &'a NativeHost,
+        path: PathBuf,
+    }
+
+    impl Drop for TempDir<'_> {
+        fn drop(&mut self) {
+            let _ = self.host.remove_dir_all(&self.path);
+        }
+    }
+
+    fn run(
+        host: &NativeHost,
+        cwd: &Path,
+        program: BString,
+        arguments: &[&str],
+    ) -> Result<Vec<u8>, Box<dyn Error>> {
+        let request = RunRequest {
+            pipeline: vec![CommandSpec {
+                program,
+                args: names(arguments),
+            }],
+            cwd: cwd.to_owned(),
+            env: host.env_all(),
+            stdin: Input::Null,
+            stdout: Output::Capture,
+            stderr: Output::Capture,
+            timeout: Some(Duration::from_secs(15)),
+            tee: false,
+        };
+        let result = host.run(&request, &mut |_, _| {})?;
+        assert_eq!(
+            result.results,
+            [ProcessResult::Exited(0)],
+            "{:?}: {}",
+            request.pipeline,
+            String::from_utf8_lossy(&result.stderr)
+        );
+        Ok(result.stdout)
+    }
+
+    #[test]
+    #[ignore = "Set RCMAKE_ARCHIVE_INTEROP_CMAKE to the CMake executable"]
+    fn interops_with_cmake_archives() -> TestResult {
+        let host = NativeHost::new()?;
+        let cmake = host
+            .env_get(b"RCMAKE_ARCHIVE_INTEROP_CMAKE")
+            .ok_or("Set RCMAKE_ARCHIVE_INTEROP_CMAKE to the CMake executable")?;
+        let directory = run(&host, &host.initial_cwd(), BString::from("mktemp"), &["-d"])?;
+        let path = to_native(directory.strip_suffix(b"\n").unwrap_or(&directory));
+        let temporary = TempDir { host: &host, path };
+        let root = &temporary.path;
+        let source = root.join("source");
+        let output = root.join("output");
+        host.create_dir_all(&source)?;
+        host.create_dir_all(&output)?;
+
+        // Incompressible data fills the LZW dictionary. Repeated data also tests
+        // phrases that refer to the next dictionary entry.
+        let mut state = 0x2a9d_1701_u32;
+        let mut payload: Vec<_> = (0..196_608)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                state as u8
+            })
+            .collect();
+        payload.resize(2 * payload.len(), b'a');
+        host.write(&source.join("input"), &payload, WriteMode::CreateNew)?;
+        let rcmake_archive = root.join("rcmake-archive.Z");
+        let oracle_archive = root.join("oracle-archive");
+        let rcmake_path = rcmake_archive.to_str().ok_or("Invalid archive path")?;
+        let oracle_path = oracle_archive.to_str().ok_or("Invalid archive path")?;
+        for (format, flags, options) in [
+            (ArchiveFormat::Tar, "cf", &[][..]),
+            (ArchiveFormat::TarGz, "czf", &[][..]),
+            (ArchiveFormat::TarBz2, "cjf", &[][..]),
+            (ArchiveFormat::TarXz, "cJf", &[][..]),
+            (ArchiveFormat::TarLzma, "cf", &["--lzma"][..]),
+            (ArchiveFormat::TarZstd, "cf", &["--zstd"][..]),
+            (ArchiveFormat::TarZ, "cf", &[][..]),
+            (ArchiveFormat::Zip, "cf", &["--format=zip"][..]),
+            (
+                ArchiveFormat::ZipStored,
+                "cf",
+                &["--format=zip", "--cmake-tar-compression-method=store"][..],
+            ),
+        ] {
+            create_archive(
+                &host,
+                &rcmake_archive,
+                &source,
+                &[PathBuf::from("input")],
+                &create_options(format),
+            )?;
+            let list = run(
+                &host,
+                &output,
+                cmake.clone(),
+                &["-E", "tar", "tf", rcmake_path],
+            )?;
+            assert_eq!(list, b"input\n", "{format:?}");
+            run(
+                &host,
+                &output,
+                cmake.clone(),
+                &["-E", "tar", "xf", rcmake_path],
+            )?;
+            assert_eq!(
+                read_bytes(&host, &output.join("input"), size_limit())?,
+                payload
+            );
+            host.remove_file(&output.join("input"))?;
+
+            let mut args = vec!["-E", "tar", flags, oracle_path];
+            args.extend_from_slice(options);
+            args.push("input");
+            run(&host, &source, cmake.clone(), &args)?;
+            if format == ArchiveFormat::TarZ {
+                #[cfg(target_os = "macos")]
+                {
+                    let system_tar = run(
+                        &host,
+                        root,
+                        BString::from("/usr/bin/uncompress"),
+                        &["-c", rcmake_path],
+                    )?;
+                    assert_eq!(
+                        system_tar,
+                        read_bounded(
+                            compress::Decoder::new(&read_bytes(
+                                &host,
+                                &rcmake_archive,
+                                size_limit()
+                            )?)?,
+                            size_limit(),
+                        )?
+                    );
+                    let encoded = run(
+                        &host,
+                        root,
+                        BString::from("/usr/bin/compress"),
+                        &["-c", oracle_path],
+                    )?;
+                    host.write(&oracle_archive, &encoded, WriteMode::Truncate)?;
+                }
+                #[cfg(not(target_os = "macos"))]
+                continue;
+            }
+            assert_eq!(
+                list_command_archive(&host, &oracle_archive, names(&["input"]), None)?,
+                names(&["input"]),
+                "{format:?}"
+            );
+            extract_archive(
+                &host,
+                &oracle_archive,
+                &ExtractOptions {
+                    destination: output.clone(),
+                    patterns: names(&["input"]),
+                    ..Default::default()
+                },
+            )?;
+            assert_eq!(
+                read_bytes(&host, &output.join("input"), size_limit())?,
+                payload
+            );
+            host.remove_file(&output.join("input"))?;
+        }
+        Ok(())
+    }
 }

@@ -1,4 +1,4 @@
-//! Shared archive creation, extraction, and listing engine (`tar`, `tar.gz`, `zip`)
+//! Shared archive creation, extraction, and listing engine for tar and ZIP archives
 //! backed exclusively by [`rcmake_host::Host`], shared across `file(ARCHIVE_*)`,
 //! `cmake -E tar`, and `cpack`.
 
@@ -13,6 +13,8 @@ use rcmake_host::path::{from_native, to_native};
 use rcmake_host::{FileTime, Host, HostError, ReadRange, Stream};
 use thiserror::Error;
 
+mod codec;
+mod compress;
 mod create;
 mod extract;
 mod pattern;
@@ -32,14 +34,43 @@ pub enum ArchiveFormat {
     Tar,
     /// Gzip-compressed tar (`.tar.gz` / `.tgz`).
     TarGz,
+    /// Bzip2-compressed tar (`.tar.bz2` / `.tbz2`).
+    TarBz2,
+    /// XZ-compressed tar (`.tar.xz` / `.txz`).
+    TarXz,
+    /// LZMA-alone compressed tar (`.tar.lzma`).
+    TarLzma,
+    /// Zstandard-compressed tar (`.tar.zst`).
+    TarZstd,
+    /// Unix compress tar (`.tar.Z`).
+    TarZ,
     /// Uncompressed GNU tar.
     GnuTar,
     /// Gzip-compressed GNU tar.
     GnuTarGz,
+    /// GNU tar with the specified compression filter.
+    GnuTarCompressed(TarCompression),
     /// ZIP archive with deflate compression (`.zip`).
     Zip,
     /// ZIP archive with stored entries.
     ZipStored,
+}
+
+/// Compression filter for a tar archive.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TarCompression {
+    /// Gzip.
+    Gzip,
+    /// Bzip2.
+    Bzip2,
+    /// XZ.
+    Xz,
+    /// LZMA-alone.
+    Lzma,
+    /// Zstandard.
+    Zstd,
+    /// Unix compress (LZW).
+    Compress,
 }
 
 /// Options for [`create_archive`].
@@ -49,7 +80,8 @@ pub struct CreateOptions {
     pub format: ArchiveFormat,
     /// Optional explicit modification time in Unix seconds (`MTIME`).
     pub mtime: Option<u64>,
-    /// Optional compression level (`0..=9`).
+    /// Optional compression level (`0..=9`, or `0..=19` for Zstandard).
+    /// Bzip2 and Zstandard use their default levels for zero.
     pub compression_level: Option<u32>,
     /// Write archive entry names to the host standard output stream.
     pub verbose: bool,
