@@ -1,0 +1,117 @@
+{
+  "configure-file-at-only-and-escaped-quotes": {
+    "exit_code": 0,
+    "stdout": "",
+    "stderr": "",
+    "files": {
+      "input.in": {
+        "kind": "file",
+        "content": "#cmakedefine ENABLED \"@TITLE@\"\n#cmakedefine DISABLED disabled\n#cmakedefine01 ENABLED\n#cmakedefine01 DISABLED\nat=@TITLE@\ndollar=${TITLE}\n"
+      },
+      "out": {
+        "kind": "directory"
+      },
+      "out/config.h": {
+        "kind": "file",
+        "content": "#define ENABLED \"A \\\"quote\\\"\"\n/* #undef DISABLED */\n#define ENABLED 1\n#define DISABLED 0\nat=A \\\"quote\\\"\ndollar=${TITLE}\n"
+      },
+      "script.cmake": {
+        "kind": "file",
+        "content": "set(ENABLED ON)\nset(DISABLED OFF)\nset(TITLE [=[A \"quote\"]=])\nconfigure_file(input.in out/config.h @ONLY ESCAPE_QUOTES)\n"
+      }
+    }
+  },
+  "configure-file-copyonly-and-substitution": {
+    "exit_code": 0,
+    "stdout": "",
+    "stderr": "",
+    "files": {
+      "expanded.txt": {
+        "kind": "file",
+        "content": "value=changed / changed\n"
+      },
+      "input.in": {
+        "kind": "file",
+        "content": "value=@VALUE@ / ${VALUE}\n"
+      },
+      "raw.txt": {
+        "kind": "file",
+        "content": "value=@VALUE@ / ${VALUE}\n"
+      },
+      "script.cmake": {
+        "kind": "file",
+        "content": "set(VALUE changed)\nconfigure_file(input.in raw.txt COPYONLY)\nconfigure_file(input.in expanded.txt)\n"
+      }
+    }
+  },
+  "diagnostic-actions-and-stack": {
+    "exit_code": 0,
+    "stdout": "-- outer=WARN promoted=SEND_ERROR demoted=IGNORE restored=WARN\n",
+    "stderr": ""
+  },
+  "filename-components": {
+    "exit_code": 0,
+    "stdout": "-- dir=/work/pkg name=archive.tar.gz stem=archive ext=.tar.gz last=.gz abs=/work/out/file\n",
+    "stderr": ""
+  },
+  "language-call-eval-and-log-level": {
+    "exit_code": 0,
+    "stdout": "-- value=called-evaluated level=VERBOSE\n",
+    "stderr": ""
+  },
+  "minimum-required-3-5": {
+    "exit_code": 0,
+    "stdout": "-- minimum=3.5 CMP0054=NEW\n",
+    "stderr": "CMake Warning (deprecated) at script.cmake:1 (cmake_minimum_required):\n  Compatibility with CMake < 3.10 will be removed from a future version of\n  CMake.\n\n  Update the VERSION argument <min> value.  Or, use the <min>...<max> syntax\n  to tell CMake that the project requires at least <min> but has been updated\n  to work with policies introduced by <max> or earlier.\nThis warning is for project developers.  Use -Wno-author or -Wno-deprecated\nto suppress it.\n\n"
+  },
+  "minimum-required-policy-floor": {
+    "exit_code": 0,
+    "stdout": "-- minimum=3.0 CMP0054=NEW\n",
+    "stderr": "CMake Warning (deprecated) at script.cmake:1 (cmake_minimum_required):\n  Compatibility with CMake < 3.10 will be removed from a future version of\n  CMake.\n\n  Update the VERSION argument <min> value.  Or, use the <min>...<max> syntax\n  to tell CMake that the project requires at least <min> but has been updated\n  to work with policies introduced by <max> or earlier.\nThis warning is for project developers.  Use -Wno-author or -Wno-deprecated\nto suppress it.\n\n"
+  },
+  "minimum-required-removed-compatibility": {
+    "exit_code": 1,
+    "stdout": "",
+    "stderr": "CMake Error at script.cmake:1 (cmake_minimum_required):\n  Compatibility with CMake < 3.5 has been removed from CMake.\n\n  Update the VERSION argument <min> value.  Or, use the <min>...<max> syntax\n  to tell CMake that the project requires at least <min> but has been updated\n  to work with policies introduced by <max> or earlier.\n\n  Or, add -DCMAKE_POLICY_VERSION_MINIMUM=3.5 to try configuring anyway.\n\n\n"
+  },
+  "minimum-required-version-range": {
+    "exit_code": 0,
+    "stdout": "-- minimum=3.0 CMP0186=NEW\n",
+    "stderr": ""
+  },
+  "parse-argn-skips-named-parameters": {
+    "exit_code": 0,
+    "stdout": "-- fast=FALSE label=two words item=[a;b] extras=[stray]\n",
+    "stderr": ""
+  },
+  "parse-arguments-keywords-and-missing-values": {
+    "exit_code": 0,
+    "stdout": "-- options=TRUE/FALSE name=demo files=a;b\n-- unparsed=extra missing=TARGET\n",
+    "stderr": ""
+  },
+  "parse-argv-semicolons-and-empty-value": {
+    "exit_code": 0,
+    "stdout": "-- once=TRUE length=2 first=[a;b]\n-- name defined as []\n",
+    "stderr": ""
+  },
+  "policy-version-and-stack": {
+    "exit_code": 0,
+    "stdout": "-- outer=[] inner=NEW restored=[]\n",
+    "stderr": ""
+  },
+  "property-definition-and-value": {
+    "exit_code": 0,
+    "stdout": "loading initial cache file preload.cmake\n-- defined=1 initial=0 help=Short help value=first;second;third!\n-- defined=1 initial=0 help=Short help value=first;second;third!\n",
+    "stderr": ""
+  },
+  "property-definition-rejected-in-script": {
+    "exit_code": 1,
+    "stdout": "",
+    "stderr": "CMake Error at script.cmake:1 (define_property):\n  define_property command is not scriptable\n\n\n"
+  },
+  "property-set-and-get-in-script": {
+    "exit_code": 0,
+    "stdout": "-- initial=0 value=first;second;third! set=1 cleared=0\n",
+    "stderr": ""
+  }
+}

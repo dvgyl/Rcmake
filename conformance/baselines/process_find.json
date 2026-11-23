@@ -1,0 +1,37 @@
+{
+  "find-file-and-path": {
+    "exit_code": 0,
+    "stdout": "-- file=<TMP>/sandbox/include/probe.h path=<TMP>/sandbox/include\n-- missing=missing_file-NOTFOUND/missing_path-NOTFOUND\n",
+    "stderr": ""
+  },
+  "find-library-prefix-suffix-and-missing": {
+    "exit_code": 0,
+    "stdout": "-- found=<TMP>/lib/libsample.a missing=missing-NOTFOUND\n",
+    "stderr": ""
+  },
+  "find-program-executable-and-missing": {
+    "exit_code": 0,
+    "stdout": "-- found=<TMP>/bin/probe missing=missing-NOTFOUND\n",
+    "stderr": ""
+  },
+  "process-capture-output-and-error": {
+    "exit_code": 0,
+    "stdout": "-- out=[out] err=[err \n] status=7\n",
+    "stderr": ""
+  },
+  "process-pipeline-statuses": {
+    "exit_code": 0,
+    "stdout": "-- out=[ALPHA\nBETA] last=0 all=4;0\n",
+    "stderr": ""
+  },
+  "process-shared-output-and-error": {
+    "exit_code": 0,
+    "stdout": "-- combined=[out\nerr\nend] status=0\n",
+    "stderr": ""
+  },
+  "process-working-directory": {
+    "exit_code": 0,
+    "stdout": "-- text=Found in the working directory. status=0\n",
+    "stderr": ""
+  }
+}

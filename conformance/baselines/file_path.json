@@ -1,0 +1,276 @@
+{
+  "file-archive-gzip-round-trip": {
+    "exit_code": 0,
+    "stdout": "-- gzip magic=1f8b\n",
+    "stderr": "",
+    "files": {
+      "assets": {
+        "kind": "directory"
+      },
+      "assets/a.txt": {
+        "kind": "file",
+        "content": "Omit this file.\n"
+      },
+      "assets/b.txt": {
+        "kind": "file",
+        "content": "Keep this file.\n"
+      },
+      "script.cmake": {
+        "kind": "file",
+        "content": "file(ARCHIVE_CREATE OUTPUT bundle.tar.gz PATHS assets FORMAT paxr COMPRESSION GZip)\nfile(READ bundle.tar.gz magic LIMIT 2 HEX)\nfile(ARCHIVE_EXTRACT INPUT bundle.tar.gz DESTINATION unpacked PATTERNS \"assets/b.txt\")\nfile(REMOVE bundle.tar.gz)\nmessage(STATUS \"gzip magic=${magic}\")\n"
+      },
+      "unpacked": {
+        "kind": "directory"
+      },
+      "unpacked/assets": {
+        "kind": "directory"
+      },
+      "unpacked/assets/b.txt": {
+        "kind": "file",
+        "content": "Keep this file.\n"
+      }
+    }
+  },
+  "file-archive-tar-round-trip": {
+    "exit_code": 0,
+    "stdout": "-- tar magic=ustar\n\n",
+    "stderr": "",
+    "files": {
+      "assets": {
+        "kind": "directory"
+      },
+      "assets/a.txt": {
+        "kind": "file",
+        "content": "Plain tar payload.\n"
+      },
+      "assets/nested": {
+        "kind": "directory"
+      },
+      "assets/nested/b.txt": {
+        "kind": "file",
+        "content": "Nested payload.\n"
+      },
+      "script.cmake": {
+        "kind": "file",
+        "content": "file(ARCHIVE_CREATE OUTPUT bundle.tar PATHS assets FORMAT gnutar)\nfile(READ bundle.tar magic OFFSET 257 LIMIT 5)\nfile(ARCHIVE_EXTRACT INPUT bundle.tar DESTINATION unpacked)\nfile(REMOVE bundle.tar)\nmessage(STATUS \"tar magic=${magic}\")\n"
+      },
+      "unpacked": {
+        "kind": "directory"
+      },
+      "unpacked/assets": {
+        "kind": "directory"
+      },
+      "unpacked/assets/a.txt": {
+        "kind": "file",
+        "content": "Plain tar payload.\n"
+      },
+      "unpacked/assets/nested": {
+        "kind": "directory"
+      },
+      "unpacked/assets/nested/b.txt": {
+        "kind": "file",
+        "content": "Nested payload.\n"
+      }
+    }
+  },
+  "file-archive-zip-round-trip": {
+    "exit_code": 0,
+    "stdout": "-- zip magic=504b0304\n",
+    "stderr": "",
+    "files": {
+      "assets": {
+        "kind": "directory"
+      },
+      "assets/a.txt": {
+        "kind": "file",
+        "content": "ZIP payload.\n"
+      },
+      "script.cmake": {
+        "kind": "file",
+        "content": "file(ARCHIVE_CREATE OUTPUT bundle.zip PATHS assets FORMAT zip)\nfile(READ bundle.zip magic LIMIT 4 HEX)\nfile(ARCHIVE_EXTRACT INPUT bundle.zip DESTINATION unpacked)\nfile(REMOVE bundle.zip)\nmessage(STATUS \"zip magic=${magic}\")\n"
+      },
+      "unpacked": {
+        "kind": "directory"
+      },
+      "unpacked/assets": {
+        "kind": "directory"
+      },
+      "unpacked/assets/a.txt": {
+        "kind": "file",
+        "content": "ZIP payload.\n"
+      }
+    }
+  },
+  "file-copy-matching": {
+    "exit_code": 0,
+    "stdout": "",
+    "stderr": "",
+    "files": {
+      "output": {
+        "kind": "directory"
+      },
+      "output/a.txt": {
+        "kind": "file",
+        "content": "Keep.\n"
+      },
+      "output/nested": {
+        "kind": "directory"
+      },
+      "output/nested/b.txt": {
+        "kind": "file",
+        "content": "Keep.\n"
+      },
+      "script.cmake": {
+        "kind": "file",
+        "content": "file(COPY tree/ DESTINATION output FILES_MATCHING PATTERN \"*.txt\" PATTERN \"skip\" EXCLUDE)\n"
+      },
+      "tree": {
+        "kind": "directory"
+      },
+      "tree/a.log": {
+        "kind": "file",
+        "content": "Skip.\n"
+      },
+      "tree/a.txt": {
+        "kind": "file",
+        "content": "Keep.\n"
+      },
+      "tree/nested": {
+        "kind": "directory"
+      },
+      "tree/nested/b.txt": {
+        "kind": "file",
+        "content": "Keep.\n"
+      },
+      "tree/skip": {
+        "kind": "directory"
+      },
+      "tree/skip/c.txt": {
+        "kind": "file",
+        "content": "Skip.\n"
+      }
+    }
+  },
+  "file-glob-and-glob-recurse": {
+    "exit_code": 0,
+    "stdout": "-- top=tree/a.txt;tree/z.txt deep=tree/a.txt;tree/nested/m.txt;tree/z.txt\n",
+    "stderr": ""
+  },
+  "file-hashes-and-size": {
+    "exit_code": 0,
+    "stdout": "-- size=18 md5=48b18c2750add0ca35e89b75836b526b sha256=91a3c6a24f8f9f73575ab983ed9540b10904ce2454ca48c14f9432a7a74163a8\n",
+    "stderr": ""
+  },
+  "file-links-and-real-path": {
+    "exit_code": 0,
+    "stdout": "-- soft=0 hard=0 target=payload.txt real=<TMP>/payload.txt shared=[Before.\nafter\n]\n",
+    "stderr": "",
+    "files": {
+      "hard.txt": {
+        "kind": "file",
+        "content": "Before.\nafter\n"
+      },
+      "payload.txt": {
+        "kind": "file",
+        "content": "Before.\nafter\n"
+      },
+      "script.cmake": {
+        "kind": "file",
+        "content": "file(CREATE_LINK payload.txt soft.txt SYMBOLIC RESULT soft)\nfile(CREATE_LINK \"${CMAKE_CURRENT_SOURCE_DIR}/payload.txt\" hard.txt RESULT hard)\nfile(READ_SYMLINK soft.txt target)\nfile(REAL_PATH soft.txt real BASE_DIRECTORY \"${CMAKE_CURRENT_SOURCE_DIR}\")\nfile(APPEND payload.txt \"after\\n\")\nfile(READ hard.txt shared)\nmessage(STATUS \"soft=${soft} hard=${hard} target=${target} real=${real} shared=[${shared}]\")\n"
+      },
+      "soft.txt": {
+        "kind": "symlink",
+        "target": "payload.txt"
+      }
+    }
+  },
+  "file-make-and-remove": {
+    "exit_code": 0,
+    "stdout": "",
+    "stderr": "",
+    "files": {
+      "kept": {
+        "kind": "directory"
+      },
+      "kept/child": {
+        "kind": "directory"
+      },
+      "script.cmake": {
+        "kind": "file",
+        "content": "file(MAKE_DIRECTORY kept/child discarded/deep)\nfile(WRITE discarded/deep/leaf \"discard\")\nfile(REMOVE existing.txt absent.txt)\nfile(REMOVE_RECURSE discarded)\n"
+      }
+    }
+  },
+  "file-relative-path": {
+    "exit_code": 0,
+    "stdout": "-- sibling=../output/file child=sub/file\n",
+    "stderr": ""
+  },
+  "file-rename-and-copy-file": {
+    "exit_code": 0,
+    "stdout": "-- moved=0 copied=0 no-replace=NO_REPLACE\n",
+    "stderr": "",
+    "files": {
+      "output.txt": {
+        "kind": "file",
+        "content": "Keep this content.\n"
+      },
+      "script.cmake": {
+        "kind": "file",
+        "content": "file(RENAME input.txt temporary.txt RESULT moved)\nfile(COPY_FILE temporary.txt output.txt ONLY_IF_DIFFERENT RESULT copied)\nfile(RENAME temporary.txt output.txt NO_REPLACE RESULT exists)\nmessage(STATUS \"moved=${moved} copied=${copied} no-replace=${exists}\")\n"
+      },
+      "temporary.txt": {
+        "kind": "file",
+        "content": "Keep this content.\n"
+      }
+    }
+  },
+  "file-strings-regex": {
+    "exit_code": 0,
+    "stdout": "-- matches=key=one;key=two first=key=one\n",
+    "stderr": ""
+  },
+  "file-write-append-and-read": {
+    "exit_code": 0,
+    "stdout": "-- all=[line-one\nline-two\n] slice=one\n hex=0a6c\n",
+    "stderr": "",
+    "files": {
+      "data": {
+        "kind": "directory"
+      },
+      "data/value.txt": {
+        "kind": "file",
+        "content": "line-one\nline-two\n"
+      },
+      "script.cmake": {
+        "kind": "file",
+        "content": "file(WRITE data/value.txt \"old\")\nfile(WRITE data/value.txt \"line\" \"-one\\n\")\nfile(APPEND data/value.txt \"line-two\\n\")\nfile(READ data/value.txt all)\nfile(READ data/value.txt slice OFFSET 5 LIMIT 3)\nfile(READ data/value.txt hex OFFSET 8 LIMIT 2 HEX)\nmessage(STATUS \"all=[${all}] slice=${slice} hex=${hex}\")\n"
+      }
+    }
+  },
+  "path-append-remove-and-replace": {
+    "exit_code": 0,
+    "stdout": "-- start=/work no-last=/work/src/archive.tar dir=/work/src/ reset=/other/file\n",
+    "stderr": ""
+  },
+  "path-convert-search-list": {
+    "exit_code": 0,
+    "stdout": "-- list=/work/b;/tmp/d native=/work/b:/tmp/d\n",
+    "stderr": ""
+  },
+  "path-get-and-has-components": {
+    "exit_code": 0,
+    "stdout": "-- root=/ parent=/work/input name=archive.tar.gz ext=.tar.gz last=.gz stem=archive\n-- file=ON dir=OFF/OFF\n",
+    "stderr": ""
+  },
+  "path-is-and-compare": {
+    "exit_code": 0,
+    "stdout": "-- absolute=ON relative=ON prefix=ON/OFF compare=ON/ON\n",
+    "stderr": ""
+  },
+  "path-normal-relative-and-absolute": {
+    "exit_code": 0,
+    "stdout": "-- normalized=/work/b/leaf relative=../b/leaf absolute=/work/b/leaf\n",
+    "stderr": ""
+  }
+}

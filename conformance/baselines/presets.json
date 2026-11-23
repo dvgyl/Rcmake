@@ -1,0 +1,32 @@
+{
+  "presets-all-kinds-and-configure-name": {
+    "exit_code": 0,
+    "stdout": "Available configure presets:\n\n  \"configure-dev\"\n\nAvailable build presets:\n\n  \"build-fast\"\n\nAvailable test presets:\n\n  \"test-dev\"\n\nAvailable package presets:\n\n  \"package-dev\"\n\nAvailable workflow presets:\n\n  \"check-dev\"\n",
+    "stderr": ""
+  },
+  "presets-build-kind-from-user-file": {
+    "exit_code": 0,
+    "stdout": "Available build presets:\n\n  \"local\" - Local build\n  \"core\"\n",
+    "stderr": ""
+  },
+  "presets-conditions-and-environment-macros": {
+    "exit_code": 0,
+    "stdout": "Available configure presets:\n\n  \"debug\"\n",
+    "stderr": ""
+  },
+  "presets-inheritance-precedence": {
+    "exit_code": 0,
+    "stdout": "Available configure presets:\n\n  \"first-wins\"\n  \"override-wins\"\n",
+    "stderr": ""
+  },
+  "presets-nested-includes": {
+    "exit_code": 0,
+    "stdout": "Available configure presets:\n\n  \"default\"\n  \"platform\"\n",
+    "stderr": ""
+  },
+  "presets-project-and-user": {
+    "exit_code": 0,
+    "stdout": "Available configure presets:\n\n  \"local\"   - Local build\n  \"project\" - Project default\n",
+    "stderr": ""
+  }
+}

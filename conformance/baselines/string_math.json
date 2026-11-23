@@ -1,0 +1,92 @@
+{
+  "json-get-raw-and-type": {
+    "exit_code": 0,
+    "stdout": "-- value=ON raw=true null=[] text=\"a;b\" type=NULL\n",
+    "stderr": ""
+  },
+  "json-member-length-and-missing": {
+    "exit_code": 0,
+    "stdout": "-- key=a size=2 missing=absent-NOTFOUND error=member 'absent' not found\n",
+    "stderr": ""
+  },
+  "json-set-remove-and-equal": {
+    "exit_code": 0,
+    "stdout": "-- doc={\n  \"items\" : [ \"new\", 3 ]\n}\n-- equal=ON reversed=OFF\n",
+    "stderr": ""
+  },
+  "math-decimal-precedence": {
+    "exit_code": 0,
+    "stdout": "-- precedence=14 grouped=20 quotient=-3 remainder=-2\n",
+    "stderr": ""
+  },
+  "math-hex-and-bitwise": {
+    "exit_code": 0,
+    "stdout": "-- decimal=64 hex=0x2e complement=-1 negative=0xffffffffffffffd6\n",
+    "stderr": ""
+  },
+  "regex-anchor-cmp0186": {
+    "exit_code": 0,
+    "stdout": "-- new=z/Xzzt old=z;z;z/XXXt\n",
+    "stderr": ""
+  },
+  "regex-captures-and-backreferences": {
+    "exit_code": 0,
+    "stdout": "-- match=left-42 captures=left/42 count=2\n-- all=42;8 swapped=42:left 8:right\n",
+    "stderr": ""
+  },
+  "regex-empty-match-retry": {
+    "exit_code": 0,
+    "stdout": "-- first=[] all=[;a;] replaced=XbXX\n",
+    "stderr": ""
+  },
+  "string-ascii-hex-and-identifier": {
+    "exit_code": 0,
+    "stdout": "-- hex=410a5ac3a9 id=_9_spaces_and_dots\n",
+    "stderr": ""
+  },
+  "string-case-and-byte-indexes": {
+    "exit_code": 0,
+    "stdout": "-- case=case/CASE bytes=4 accent=é tail=ded\n",
+    "stderr": ""
+  },
+  "string-combine": {
+    "exit_code": 0,
+    "stdout": "-- value=pre-middle concat=ac join=a;b||c\n",
+    "stderr": ""
+  },
+  "string-compare": {
+    "exit_code": 0,
+    "stdout": "-- less=1 ge=1 equal=0 different=0\n",
+    "stderr": ""
+  },
+  "string-configure": {
+    "exit_code": 0,
+    "stdout": "-- at-only=a\\\"b|${value}|\n-- both=a\"b|a\"b|\n",
+    "stderr": ""
+  },
+  "string-find-and-replace": {
+    "exit_code": 0,
+    "stdout": "-- first=1 last=3 missing=-1 result=XXa\n",
+    "stderr": ""
+  },
+  "string-hashes": {
+    "exit_code": 0,
+    "stdout": "-- md5=f57ced98b4859a21c3398c5eac35b193 sha1=45b02fbb9eee1e6f290cb6ad9cb12557cd7cdd60 sha256=6d9f3543561e9444e70422028e8da510ea201952cf34145ce098dd09f12c710d sha3=8be9b2d51132e6cc2b09250176370f6f8898b1759c5055d7a56f88367af53b90\n",
+    "stderr": ""
+  },
+  "string-name-based-uuid": {
+    "exit_code": 0,
+    "stdout": "-- md5=c405a546-1d02-30af-8895-1f09556e2f8f sha1=A277865A-367A-54BA-8F91-28AD7A0DDF12\n",
+    "stderr": ""
+  },
+  "string-strip-genex-and-repeat": {
+    "exit_code": 0,
+    "stdout": "-- strip=[padded] literal=leftright repeated=padded,padded,padded,\n",
+    "stderr": ""
+  },
+  "string-timestamp-source-date-epoch": {
+    "exit_code": 0,
+    "stdout": "-- iso=2024-02-29T00:00:00Z fields=2024-02-29 00:00:00 060 1709164800 +0000\n",
+    "stderr": ""
+  }
+}

@@ -1,0 +1,77 @@
+{
+  "cache-shadow-force-and-unset": {
+    "exit_code": 0,
+    "stdout": "-- normal=normal cache=first\n-- fallback=forced\n-- cache binding removed\n",
+    "stderr": ""
+  },
+  "list-append-prepend-and-insert": {
+    "exit_code": 0,
+    "stdout": "-- items=start;center;before-end;end;after-end\n",
+    "stderr": ""
+  },
+  "list-filter-predicate": {
+    "exit_code": 0,
+    "stdout": "-- heavy=12;19 light=4;7\n",
+    "stderr": ""
+  },
+  "list-filter-regex": {
+    "exit_code": 0,
+    "stdout": "-- items=blue\n",
+    "stderr": ""
+  },
+  "list-length-get-and-join": {
+    "exit_code": 0,
+    "stdout": "-- length=4 joined=delta||alpha missing=0\n",
+    "stderr": ""
+  },
+  "list-pop-front-and-back": {
+    "exit_code": 0,
+    "stdout": "-- popped=e/d/a/b rest=[]\n",
+    "stderr": ""
+  },
+  "list-remove-and-reverse": {
+    "exit_code": 0,
+    "stdout": "-- items=c;d;a\n",
+    "stderr": ""
+  },
+  "list-sort-default-and-natural": {
+    "exit_code": 0,
+    "stdout": "-- default=FILE11;File3;file2;file20 natural=file20;FILE11;File3;file2\n",
+    "stderr": ""
+  },
+  "list-sublist-and-find": {
+    "exit_code": 0,
+    "stdout": "-- pair=blue;red tail=red;green first=0 absent=-1\n",
+    "stderr": ""
+  },
+  "list-transform-selectors": {
+    "exit_code": 0,
+    "stdout": "-- items=a!;Bee;cat!;dog upper=A;bee;cat;DOG\n",
+    "stderr": ""
+  },
+  "option-and-cmp0077": {
+    "exit_code": 0,
+    "stdout": "-- defaults=OFF/ON shadow=custom\n-- normal variable suppresses cache entry\n",
+    "stderr": ""
+  },
+  "parent-scope-set-and-unset": {
+    "exit_code": 0,
+    "stdout": "-- local=local\n-- parent=updated\n-- inherited=updated\n-- parent binding removed\n",
+    "stderr": ""
+  },
+  "separate-arguments-unix-quoting": {
+    "exit_code": 0,
+    "stdout": "-- arg=[tool]\n-- arg=[one two]\n-- arg=[three four]\n-- arg=[five six]\n-- arg=[]\n-- arg=[a;b]\n",
+    "stderr": ""
+  },
+  "set-and-unset-env": {
+    "exit_code": 0,
+    "stdout": "-- initial=initial\n-- updated=two words\n-- environment binding removed\n",
+    "stderr": ""
+  },
+  "set-and-unset-normal": {
+    "exit_code": 0,
+    "stdout": "-- list=[first;;third]\n-- empty but defined\n-- set without a value unsets\n-- unset removes the binding\n",
+    "stderr": ""
+  }
+}

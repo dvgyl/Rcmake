@@ -1,0 +1,150 @@
+=== CASE minimum-required-3-5 ===
+# args: -P script.cmake
+-- script.cmake --
+cmake_minimum_required(VERSION 3.5)
+cmake_policy(GET CMP0054 quoted_if)
+message(STATUS "minimum=${CMAKE_MINIMUM_REQUIRED_VERSION} CMP0054=${quoted_if}")
+=== CASE minimum-required-version-range ===
+# args: -P script.cmake
+-- script.cmake --
+cmake_minimum_required(VERSION 3.0...4.5)
+cmake_policy(GET CMP0186 regex_policy)
+message(STATUS "minimum=${CMAKE_MINIMUM_REQUIRED_VERSION} CMP0186=${regex_policy}")
+=== CASE minimum-required-removed-compatibility ===
+# args: -P script.cmake
+-- script.cmake --
+cmake_minimum_required(VERSION 3.4)
+message(STATUS "unreachable")
+=== CASE minimum-required-policy-floor ===
+# args: -DCMAKE_POLICY_VERSION_MINIMUM=3.5 -P script.cmake
+-- script.cmake --
+cmake_minimum_required(VERSION 3.0)
+cmake_policy(GET CMP0054 quoted_if)
+message(STATUS "minimum=${CMAKE_MINIMUM_REQUIRED_VERSION} CMP0054=${quoted_if}")
+=== CASE policy-version-and-stack ===
+# args: -P script.cmake
+-- script.cmake --
+cmake_policy(VERSION 3.20)
+cmake_policy(GET CMP0186 outer)
+cmake_policy(PUSH)
+cmake_policy(SET CMP0186 NEW)
+cmake_policy(GET CMP0186 inner)
+cmake_policy(POP)
+cmake_policy(GET CMP0186 restored)
+message(STATUS "outer=[${outer}] inner=${inner} restored=[${restored}]")
+=== CASE diagnostic-actions-and-stack ===
+# args: -P script.cmake
+-- script.cmake --
+cmake_diagnostic(SET CMD_AUTHOR WARN)
+cmake_diagnostic(GET CMD_AUTHOR outer)
+cmake_diagnostic(PUSH)
+cmake_diagnostic(PROMOTE CMD_AUTHOR SEND_ERROR NO_RECURSE)
+cmake_diagnostic(PROMOTE CMD_AUTHOR WARN NO_RECURSE)
+cmake_diagnostic(GET CMD_AUTHOR promoted)
+cmake_diagnostic(DEMOTE CMD_AUTHOR IGNORE NO_RECURSE)
+cmake_diagnostic(DEMOTE CMD_AUTHOR WARN NO_RECURSE)
+cmake_diagnostic(GET CMD_AUTHOR demoted)
+message(AUTHOR_WARNING "Suppressed by CMD_AUTHOR")
+cmake_diagnostic(POP)
+cmake_diagnostic(GET CMD_AUTHOR restored)
+message(STATUS "outer=${outer} promoted=${promoted} demoted=${demoted} restored=${restored}")
+=== CASE parse-arguments-keywords-and-missing-values ===
+# args: -P script.cmake
+-- script.cmake --
+cmake_parse_arguments(arg "VERBOSE;QUIET" "NAME;TARGET" "FILES" extra VERBOSE NAME demo FILES a b TARGET)
+message(STATUS "options=${arg_VERBOSE}/${arg_QUIET} name=${arg_NAME} files=${arg_FILES}")
+message(STATUS "unparsed=${arg_UNPARSED_ARGUMENTS} missing=${arg_KEYWORDS_MISSING_VALUES}")
+=== CASE parse-argv-semicolons-and-empty-value ===
+# args: -P script.cmake
+-- script.cmake --
+cmake_minimum_required(VERSION 4.5)
+function(parse ignored)
+  cmake_parse_arguments(PARSE_ARGV 1 arg "ONCE" "NAME" "ITEMS")
+  list(LENGTH arg_ITEMS length)
+  list(GET arg_ITEMS 0 first)
+  message(STATUS "once=${arg_ONCE} length=${length} first=[${first}]")
+  if(DEFINED arg_NAME)
+    message(STATUS "name defined as [${arg_NAME}]")
+  endif()
+endfunction()
+parse(skip ONCE ITEMS "a;b" c NAME "")
+=== CASE parse-argn-skips-named-parameters ===
+# args: -P script.cmake
+-- script.cmake --
+function(parse first second)
+  cmake_parse_arguments(PARSE_ARGN arg "FAST" "LABEL" "ITEMS")
+  list(GET arg_ITEMS 0 item)
+  message(STATUS "fast=${arg_FAST} label=${arg_LABEL} item=[${item}] extras=[${arg_UNPARSED_ARGUMENTS}]")
+endfunction()
+parse(FAST LABEL stray LABEL "two words" ITEMS "a;b")
+=== CASE configure-file-at-only-and-escaped-quotes ===
+# args: -P script.cmake
+# check_files: true
+-- script.cmake --
+set(ENABLED ON)
+set(DISABLED OFF)
+set(TITLE [=[A "quote"]=])
+configure_file(input.in out/config.h @ONLY ESCAPE_QUOTES)
+-- input.in --
+#cmakedefine ENABLED "@TITLE@"
+#cmakedefine DISABLED disabled
+#cmakedefine01 ENABLED
+#cmakedefine01 DISABLED
+at=@TITLE@
+dollar=${TITLE}
+=== CASE configure-file-copyonly-and-substitution ===
+# args: -P script.cmake
+# check_files: true
+-- script.cmake --
+set(VALUE changed)
+configure_file(input.in raw.txt COPYONLY)
+configure_file(input.in expanded.txt)
+-- input.in --
+value=@VALUE@ / ${VALUE}
+=== CASE filename-components ===
+# args: -P script.cmake
+-- script.cmake --
+get_filename_component(dir "/work/pkg/archive.tar.gz" DIRECTORY)
+get_filename_component(name "/work/pkg/archive.tar.gz" NAME)
+get_filename_component(stem "/work/pkg/archive.tar.gz" NAME_WE)
+get_filename_component(ext "/work/pkg/archive.tar.gz" EXT)
+get_filename_component(last "/work/pkg/archive.tar.gz" LAST_EXT)
+get_filename_component(abs "../out/./file" ABSOLUTE BASE_DIR "/work/pkg")
+message(STATUS "dir=${dir} name=${name} stem=${stem} ext=${ext} last=${last} abs=${abs}")
+=== CASE property-definition-rejected-in-script ===
+# args: -P script.cmake
+-- script.cmake --
+define_property(GLOBAL PROPERTY SAMPLE BRIEF_DOCS "Short help")
+=== CASE property-definition-and-value ===
+# args: -N -C preload.cmake -G "Unix Makefiles" -S . -B build
+-- preload.cmake --
+define_property(GLOBAL PROPERTY SAMPLE BRIEF_DOCS "Short help" FULL_DOCS "Full help")
+get_property(defined GLOBAL PROPERTY SAMPLE DEFINED)
+get_property(initial GLOBAL PROPERTY SAMPLE SET)
+get_property(help GLOBAL PROPERTY SAMPLE BRIEF_DOCS)
+set_property(GLOBAL PROPERTY SAMPLE first)
+set_property(GLOBAL APPEND PROPERTY SAMPLE second third)
+set_property(GLOBAL APPEND_STRING PROPERTY SAMPLE "!")
+get_property(value GLOBAL PROPERTY SAMPLE)
+message(STATUS "defined=${defined} initial=${initial} help=${help} value=${value}")
+=== CASE property-set-and-get-in-script ===
+# args: -P script.cmake
+-- script.cmake --
+get_property(initial GLOBAL PROPERTY SAMPLE SET)
+set_property(GLOBAL PROPERTY SAMPLE first)
+set_property(GLOBAL APPEND PROPERTY SAMPLE second third)
+set_property(GLOBAL APPEND_STRING PROPERTY SAMPLE "!")
+get_property(value GLOBAL PROPERTY SAMPLE)
+get_property(now_set GLOBAL PROPERTY SAMPLE SET)
+set_property(GLOBAL PROPERTY SAMPLE)
+get_property(cleared GLOBAL PROPERTY SAMPLE SET)
+message(STATUS "initial=${initial} value=${value} set=${now_set} cleared=${cleared}")
+=== CASE language-call-eval-and-log-level ===
+# args: --log-level=VERBOSE -P script.cmake
+-- script.cmake --
+set(command set)
+cmake_language(CALL "${command}" value called)
+cmake_language(EVAL CODE [=[string(APPEND value "-evaluated")]=])
+cmake_language(GET_MESSAGE_LOG_LEVEL log_level)
+message(VERBOSE "value=${value} level=${log_level}")
+message(DEBUG "below configured log level")

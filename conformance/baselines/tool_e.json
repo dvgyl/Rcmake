@@ -1,0 +1,295 @@
+{
+  "e-bin2c-stdin": {
+    "exit_code": 0,
+    "stdout": "  0x41, 0x3F\n",
+    "stderr": ""
+  },
+  "e-bin2c-template": {
+    "exit_code": 0,
+    "stdout": "",
+    "stderr": "",
+    "files": {
+      "data.in": {
+        "kind": "file",
+        "content": "static const unsigned char payload[] = {@BYTES@};\nenum { payload_length = @LENGTH@ };\n"
+      },
+      "data.txt": {
+        "kind": "file",
+        "content": "A?\n"
+      },
+      "payload.h": {
+        "kind": "file",
+        "content": "static const unsigned char payload[] = {\n  0x41, 0x3F, 0x0A\n};\nenum { payload_length = 3 };\n"
+      }
+    }
+  },
+  "e-capabilities": {
+    "exit_code": 0,
+    "stdout": "{\"debugger\":true,\"fileApi\":{\"requests\":[{\"kind\":\"codemodel\",\"version\":[{\"major\":2,\"minor\":12}]},{\"kind\":\"configureLog\",\"version\":[{\"major\":1,\"minor\":0}]},{\"kind\":\"cache\",\"version\":[{\"major\":2,\"minor\":0}]},{\"kind\":\"cmakeFiles\",\"version\":[{\"major\":1,\"minor\":1}]},{\"kind\":\"toolchains\",\"version\":[{\"major\":1,\"minor\":1}]}]},\"generators\":[{\"extraGenerators\":[\"Kate\"],\"name\":\"Ninja Multi-Config\",\"platformSupport\":false,\"toolsetSupport\":false},{\"extraGenerators\":[],\"name\":\"Watcom WMake\",\"platformSupport\":false,\"toolsetSupport\":false},{\"extraGenerators\":[],\"name\":\"FASTBuild\",\"platformSupport\":false,\"toolsetSupport\":false},{\"extraGenerators\":[],\"name\":\"Xcode\",\"platformSupport\":false,\"toolsetSupport\":true},{\"extraGenerators\":[\"CodeBlocks\",\"CodeLite\",\"Eclipse CDT4\",\"Kate\",\"Sublime Text 2\"],\"name\":\"Ninja\",\"platformSupport\":false,\"toolsetSupport\":false},{\"extraGenerators\":[\"CodeBlocks\",\"CodeLite\",\"Eclipse CDT4\",\"Kate\",\"Sublime Text 2\"],\"name\":\"Unix Makefiles\",\"platformSupport\":false,\"toolsetSupport\":false}],\"instrumentation\":{\"apiVersion\":1,\"dataVersion\":{\"major\":1,\"minor\":2}},\"serverMode\":false,\"tls\":true,\"version\":{\"isDirty\":false,\"major\":4,\"minor\":5,\"patch\":1,\"string\":\"4.5.1\",\"suffix\":\"\"}}\n",
+    "stderr": ""
+  },
+  "e-cat-files-and-stdin": {
+    "exit_code": 0,
+    "stdout": "head\nstdin texttail\n",
+    "stderr": ""
+  },
+  "e-chdir": {
+    "exit_code": 0,
+    "stdout": "Read from the new directory.\n",
+    "stderr": ""
+  },
+  "e-compare-files-different": {
+    "exit_code": 1,
+    "stdout": "",
+    "stderr": ""
+  },
+  "e-compare-files-ignore-eol": {
+    "exit_code": 0,
+    "stdout": "-- strict=1 ignore-eol=0\n",
+    "stderr": ""
+  },
+  "e-copy-directory": {
+    "exit_code": 0,
+    "stdout": "",
+    "stderr": "",
+    "files": {
+      "destination": {
+        "kind": "directory"
+      },
+      "destination/a.txt": {
+        "kind": "file",
+        "content": "A\n"
+      },
+      "destination/marker": {
+        "kind": "file",
+        "content": "Keep.\n"
+      },
+      "destination/sub": {
+        "kind": "directory"
+      },
+      "destination/sub/b.txt": {
+        "kind": "file",
+        "content": "B\n"
+      },
+      "source": {
+        "kind": "directory"
+      },
+      "source/a.txt": {
+        "kind": "file",
+        "content": "A\n"
+      },
+      "source/sub": {
+        "kind": "directory"
+      },
+      "source/sub/b.txt": {
+        "kind": "file",
+        "content": "B\n"
+      }
+    }
+  },
+  "e-copy-if-different": {
+    "exit_code": 0,
+    "stdout": "",
+    "stderr": "",
+    "files": {
+      "destination.txt": {
+        "kind": "file",
+        "content": "New bytes.\n"
+      },
+      "source.txt": {
+        "kind": "file",
+        "content": "New bytes.\n"
+      }
+    }
+  },
+  "e-copy-multiple-files": {
+    "exit_code": 0,
+    "stdout": "",
+    "stderr": "",
+    "files": {
+      "a space.txt": {
+        "kind": "file",
+        "content": "A\n"
+      },
+      "b.txt": {
+        "kind": "file",
+        "content": "B\n"
+      },
+      "into": {
+        "kind": "directory"
+      },
+      "into/a space.txt": {
+        "kind": "file",
+        "content": "A\n"
+      },
+      "into/b.txt": {
+        "kind": "file",
+        "content": "B\n"
+      },
+      "into/marker": {
+        "kind": "file",
+        "content": "Keep.\n"
+      }
+    }
+  },
+  "e-create-hardlink": {
+    "exit_code": 0,
+    "stdout": "",
+    "stderr": "",
+    "files": {
+      "data.txt": {
+        "kind": "file",
+        "content": "Link target.\n"
+      },
+      "hard": {
+        "kind": "file",
+        "content": "Link target.\n"
+      }
+    }
+  },
+  "e-create-symlink": {
+    "exit_code": 0,
+    "stdout": "",
+    "stderr": "",
+    "files": {
+      "data.txt": {
+        "kind": "file",
+        "content": "Link target.\n"
+      },
+      "symbolic": {
+        "kind": "symlink",
+        "target": "data.txt"
+      }
+    }
+  },
+  "e-echo": {
+    "exit_code": 0,
+    "stdout": "two words  tail\n",
+    "stderr": ""
+  },
+  "e-echo-append": {
+    "exit_code": 0,
+    "stdout": "two words  tail",
+    "stderr": ""
+  },
+  "e-env-set-and-unset": {
+    "exit_code": 0,
+    "stdout": "keep=[two words] removed=[]\n",
+    "stderr": ""
+  },
+  "e-false": {
+    "exit_code": 1,
+    "stdout": "",
+    "stderr": ""
+  },
+  "e-make-directory": {
+    "exit_code": 0,
+    "stdout": "",
+    "stderr": "",
+    "files": {
+      "one": {
+        "kind": "directory"
+      },
+      "one/two words": {
+        "kind": "directory"
+      },
+      "other": {
+        "kind": "directory"
+      }
+    }
+  },
+  "e-md5sum": {
+    "exit_code": 0,
+    "stdout": "280f662a05747e728c8a960847acb835  a space.txt\n3b2b0a9afe1e5f1ed3e07978e6efc916  b.txt\n",
+    "stderr": ""
+  },
+  "e-rename-replaces-file": {
+    "exit_code": 0,
+    "stdout": "",
+    "stderr": "",
+    "files": {
+      "destination": {
+        "kind": "file",
+        "content": "New bytes.\n"
+      }
+    }
+  },
+  "e-rm-recursive-and-force": {
+    "exit_code": 0,
+    "stdout": "",
+    "stderr": "",
+    "files": {
+      "keep": {
+        "kind": "directory"
+      },
+      "keep/data": {
+        "kind": "file",
+        "content": "Keep.\n"
+      }
+    }
+  },
+  "e-sha256sum": {
+    "exit_code": 0,
+    "stdout": "6bb43b87d0aff15d78e6e5294c585994074bcc576327d9ce1f6f323f39851b8a  a space.txt\n",
+    "stderr": ""
+  },
+  "e-tar-gzip-create-list-extract": {
+    "exit_code": 0,
+    "stdout": "-- create=0 list=0 extract=0 entries=[assets/\nassets/payload.txt\n]\n",
+    "stderr": "",
+    "files": {
+      "assets": {
+        "kind": "directory"
+      },
+      "assets/payload.txt": {
+        "kind": "file",
+        "content": "A gzip payload.\n"
+      },
+      "script.cmake": {
+        "kind": "file",
+        "content": "execute_process(\n  COMMAND \"${CMAKE_COMMAND}\" -E tar cfz bundle.tar.gz --mtime=2020-01-02 assets\n  RESULT_VARIABLE create\n)\nif(create EQUAL 0)\n  execute_process(\n    COMMAND \"${CMAKE_COMMAND}\" -E tar tfz bundle.tar.gz\n    OUTPUT_VARIABLE entries RESULT_VARIABLE list\n  )\n  file(MAKE_DIRECTORY unpacked)\n  execute_process(\n    COMMAND \"${CMAKE_COMMAND}\" -E tar xfz ../bundle.tar.gz\n    WORKING_DIRECTORY unpacked RESULT_VARIABLE extract\n  )\n  file(REMOVE bundle.tar.gz)\nendif()\nmessage(STATUS \"create=${create} list=${list} extract=${extract} entries=[${entries}]\")\n"
+      },
+      "unpacked": {
+        "kind": "directory"
+      },
+      "unpacked/assets": {
+        "kind": "directory"
+      },
+      "unpacked/assets/payload.txt": {
+        "kind": "file",
+        "content": "A gzip payload.\n"
+      }
+    }
+  },
+  "e-touch": {
+    "exit_code": 0,
+    "stdout": "",
+    "stderr": "",
+    "files": {
+      "existing": {
+        "kind": "file",
+        "content": "Keep the old bytes.\n"
+      },
+      "new": {
+        "kind": "file",
+        "content": ""
+      }
+    }
+  },
+  "e-touch-nocreate": {
+    "exit_code": 0,
+    "stdout": "",
+    "stderr": "",
+    "files": {
+      "existing": {
+        "kind": "file",
+        "content": "Keep the old bytes.\n"
+      }
+    }
+  },
+  "e-true": {
+    "exit_code": 0,
+    "stdout": "",
+    "stderr": ""
+  }
+}

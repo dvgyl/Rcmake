@@ -1,0 +1,187 @@
+=== CASE file-write-append-and-read ===
+# args: -P script.cmake
+# check_files: true
+-- script.cmake --
+file(WRITE data/value.txt "old")
+file(WRITE data/value.txt "line" "-one\n")
+file(APPEND data/value.txt "line-two\n")
+file(READ data/value.txt all)
+file(READ data/value.txt slice OFFSET 5 LIMIT 3)
+file(READ data/value.txt hex OFFSET 8 LIMIT 2 HEX)
+message(STATUS "all=[${all}] slice=${slice} hex=${hex}")
+=== CASE file-strings-regex ===
+# args: -P script.cmake
+-- script.cmake --
+file(STRINGS data.txt lines REGEX "^key=")
+file(STRINGS data.txt first REGEX "^key=" LIMIT_COUNT 1)
+message(STATUS "matches=${lines} first=${first}")
+-- data.txt --
+skip
+key=one
+key=two
+last
+=== CASE file-hashes-and-size ===
+# args: -P script.cmake
+-- script.cmake --
+file(MD5 payload md5)
+file(SHA256 payload sha256)
+file(SIZE payload size)
+message(STATUS "size=${size} md5=${md5} sha256=${sha256}")
+-- payload --
+A sample payload.
+=== CASE file-make-and-remove ===
+# args: -P script.cmake
+# check_files: true
+-- script.cmake --
+file(MAKE_DIRECTORY kept/child discarded/deep)
+file(WRITE discarded/deep/leaf "discard")
+file(REMOVE existing.txt absent.txt)
+file(REMOVE_RECURSE discarded)
+-- existing.txt --
+Remove this file.
+=== CASE file-rename-and-copy-file ===
+# args: -P script.cmake
+# check_files: true
+-- script.cmake --
+file(RENAME input.txt temporary.txt RESULT moved)
+file(COPY_FILE temporary.txt output.txt ONLY_IF_DIFFERENT RESULT copied)
+file(RENAME temporary.txt output.txt NO_REPLACE RESULT exists)
+message(STATUS "moved=${moved} copied=${copied} no-replace=${exists}")
+-- input.txt --
+Keep this content.
+=== CASE file-copy-matching ===
+# args: -P script.cmake
+# check_files: true
+-- script.cmake --
+file(COPY tree/ DESTINATION output FILES_MATCHING PATTERN "*.txt" PATTERN "skip" EXCLUDE)
+-- tree/a.txt --
+Keep.
+-- tree/a.log --
+Skip.
+-- tree/nested/b.txt --
+Keep.
+-- tree/skip/c.txt --
+Skip.
+=== CASE file-glob-and-glob-recurse ===
+# args: -P script.cmake
+-- script.cmake --
+file(GLOB top RELATIVE "${CMAKE_CURRENT_SOURCE_DIR}" LIST_DIRECTORIES false "tree/*.txt")
+file(GLOB_RECURSE deep RELATIVE "${CMAKE_CURRENT_SOURCE_DIR}" "tree/*.txt")
+message(STATUS "top=${top} deep=${deep}")
+-- tree/z.txt --
+Z
+-- tree/a.txt --
+A
+-- tree/a.log --
+Log
+-- tree/nested/m.txt --
+M
+=== CASE file-links-and-real-path ===
+# args: -P script.cmake
+# check_files: true
+-- script.cmake --
+file(CREATE_LINK payload.txt soft.txt SYMBOLIC RESULT soft)
+file(CREATE_LINK "${CMAKE_CURRENT_SOURCE_DIR}/payload.txt" hard.txt RESULT hard)
+file(READ_SYMLINK soft.txt target)
+file(REAL_PATH soft.txt real BASE_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}")
+file(APPEND payload.txt "after\n")
+file(READ hard.txt shared)
+message(STATUS "soft=${soft} hard=${hard} target=${target} real=${real} shared=[${shared}]")
+-- payload.txt --
+Before.
+=== CASE file-relative-path ===
+# args: -P script.cmake
+-- script.cmake --
+file(RELATIVE_PATH sibling "/workspace/source" "/workspace/output/file")
+file(RELATIVE_PATH child "/workspace/source" "/workspace/source/sub/file")
+message(STATUS "sibling=${sibling} child=${child}")
+=== CASE file-archive-tar-round-trip ===
+# args: -P script.cmake
+# check_files: true
+-- script.cmake --
+file(ARCHIVE_CREATE OUTPUT bundle.tar PATHS assets FORMAT gnutar)
+file(READ bundle.tar magic OFFSET 257 LIMIT 5)
+file(ARCHIVE_EXTRACT INPUT bundle.tar DESTINATION unpacked)
+file(REMOVE bundle.tar)
+message(STATUS "tar magic=${magic}")
+-- assets/a.txt --
+Plain tar payload.
+-- assets/nested/b.txt --
+Nested payload.
+=== CASE file-archive-gzip-round-trip ===
+# args: -P script.cmake
+# check_files: true
+-- script.cmake --
+file(ARCHIVE_CREATE OUTPUT bundle.tar.gz PATHS assets FORMAT paxr COMPRESSION GZip)
+file(READ bundle.tar.gz magic LIMIT 2 HEX)
+file(ARCHIVE_EXTRACT INPUT bundle.tar.gz DESTINATION unpacked PATTERNS "assets/b.txt")
+file(REMOVE bundle.tar.gz)
+message(STATUS "gzip magic=${magic}")
+-- assets/a.txt --
+Omit this file.
+-- assets/b.txt --
+Keep this file.
+=== CASE file-archive-zip-round-trip ===
+# args: -P script.cmake
+# check_files: true
+-- script.cmake --
+file(ARCHIVE_CREATE OUTPUT bundle.zip PATHS assets FORMAT zip)
+file(READ bundle.zip magic LIMIT 4 HEX)
+file(ARCHIVE_EXTRACT INPUT bundle.zip DESTINATION unpacked)
+file(REMOVE bundle.zip)
+message(STATUS "zip magic=${magic}")
+-- assets/a.txt --
+ZIP payload.
+=== CASE path-get-and-has-components ===
+# args: -P script.cmake
+-- script.cmake --
+set(path "/work/input/archive.tar.gz")
+cmake_path(GET path ROOT_DIRECTORY root)
+cmake_path(GET path PARENT_PATH parent)
+cmake_path(GET path FILENAME name)
+cmake_path(GET path EXTENSION ext)
+cmake_path(GET path EXTENSION LAST_ONLY last)
+cmake_path(GET path STEM stem)
+cmake_path(HAS_FILENAME path has_name)
+set(dir "/work/input/")
+cmake_path(HAS_FILENAME dir dir_has_name)
+cmake_path(HAS_EXTENSION dir dir_has_ext)
+message(STATUS "root=${root} parent=${parent} name=${name} ext=${ext} last=${last} stem=${stem}")
+message(STATUS "file=${has_name} dir=${dir_has_name}/${dir_has_ext}")
+=== CASE path-is-and-compare ===
+# args: -P script.cmake
+-- script.cmake --
+set(base "/work/src")
+set(rel "src/file")
+cmake_path(IS_ABSOLUTE base absolute)
+cmake_path(IS_RELATIVE rel relative)
+cmake_path(IS_PREFIX base "/work/src/dir/../file" NORMALIZE inside)
+cmake_path(IS_PREFIX base "/work/src2/file" outside)
+cmake_path(COMPARE "/work//src" EQUAL "/work/src" repeated_separator)
+cmake_path(COMPARE "/work/src/." NOT_EQUAL "/work/src" dot_component)
+message(STATUS "absolute=${absolute} relative=${relative} prefix=${inside}/${outside} compare=${repeated_separator}/${dot_component}")
+=== CASE path-append-remove-and-replace ===
+# args: -P script.cmake
+-- script.cmake --
+set(path "/work")
+cmake_path(APPEND path "src" "archive.tar.gz" OUTPUT_VARIABLE joined)
+cmake_path(REMOVE_EXTENSION joined LAST_ONLY OUTPUT_VARIABLE no_last)
+cmake_path(REPLACE_EXTENSION joined LAST_ONLY ".xz")
+cmake_path(REPLACE_FILENAME joined "result.txt")
+cmake_path(REMOVE_FILENAME joined OUTPUT_VARIABLE dir)
+cmake_path(APPEND joined "/other" "file")
+message(STATUS "start=${path} no-last=${no_last} dir=${dir} reset=${joined}")
+=== CASE path-normal-relative-and-absolute ===
+# args: -P script.cmake
+-- script.cmake --
+set(path "/work/a/../b/./leaf")
+cmake_path(NORMAL_PATH path OUTPUT_VARIABLE normalized)
+cmake_path(RELATIVE_PATH normalized BASE_DIRECTORY "/work/src" OUTPUT_VARIABLE relative)
+cmake_path(ABSOLUTE_PATH relative BASE_DIRECTORY "/work/src" NORMALIZE OUTPUT_VARIABLE absolute)
+message(STATUS "normalized=${normalized} relative=${relative} absolute=${absolute}")
+=== CASE path-convert-search-list ===
+# args: -P script.cmake
+-- script.cmake --
+cmake_path(CONVERT "/work/a/../b:/tmp/./d" TO_CMAKE_PATH_LIST list NORMALIZE)
+cmake_path(CONVERT "${list}" TO_NATIVE_PATH_LIST native)
+message(STATUS "list=${list} native=${native}")

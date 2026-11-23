@@ -1,0 +1,145 @@
+=== CASE e-true ===
+# args: -E true
+=== CASE e-false ===
+# args: -E false
+=== CASE e-echo ===
+# args: -E echo "two words" "" tail
+=== CASE e-echo-append ===
+# args: -E echo_append "two words" "" tail
+=== CASE e-cat-files-and-stdin ===
+# args: -E cat -- head.txt - -tail.txt
+# stdin: stdin text
+-- head.txt --
+head
+-- -tail.txt --
+tail
+=== CASE e-make-directory ===
+# args: -E make_directory "one/two words" other
+# check_files: true
+=== CASE e-touch ===
+# args: -E touch existing new
+# check_files: true
+-- existing --
+Keep the old bytes.
+=== CASE e-touch-nocreate ===
+# args: -E touch_nocreate existing missing
+# check_files: true
+-- existing --
+Keep the old bytes.
+=== CASE e-copy-multiple-files ===
+# args: -E copy "a space.txt" b.txt into
+# check_files: true
+-- a space.txt --
+A
+-- b.txt --
+B
+-- into/marker --
+Keep.
+=== CASE e-copy-if-different ===
+# args: -E copy_if_different source.txt destination.txt
+# check_files: true
+-- source.txt --
+New bytes.
+-- destination.txt --
+Old bytes.
+=== CASE e-copy-directory ===
+# args: -E copy_directory source destination
+# check_files: true
+-- source/a.txt --
+A
+-- source/sub/b.txt --
+B
+-- destination/marker --
+Keep.
+=== CASE e-rm-recursive-and-force ===
+# args: -E rm -rf -- tree absent
+# check_files: true
+-- tree/sub/data --
+Remove.
+-- keep/data --
+Keep.
+=== CASE e-rename-replaces-file ===
+# args: -E rename source destination
+# check_files: true
+-- source --
+New bytes.
+-- destination --
+Old bytes.
+=== CASE e-compare-files-different ===
+# args: -E compare_files left right
+-- left --
+Left
+-- right --
+Right
+=== CASE e-compare-files-ignore-eol ===
+# args: -P script.cmake
+-- script.cmake --
+file(WRITE lf "first\nsecond\n")
+file(WRITE crlf "first\r\nsecond\r\n")
+execute_process(COMMAND "${CMAKE_COMMAND}" -E compare_files lf crlf RESULT_VARIABLE strict)
+execute_process(COMMAND "${CMAKE_COMMAND}" -E compare_files --ignore-eol lf crlf RESULT_VARIABLE ignore)
+message(STATUS "strict=${strict} ignore-eol=${ignore}")
+=== CASE e-create-symlink ===
+# args: -E create_symlink data.txt symbolic
+# check_files: true
+-- data.txt --
+Link target.
+=== CASE e-create-hardlink ===
+# args: -E create_hardlink data.txt hard
+# check_files: true
+-- data.txt --
+Link target.
+=== CASE e-md5sum ===
+# args: -E md5sum "a space.txt" b.txt
+-- a space.txt --
+Hash me.
+-- b.txt --
+Hash me too.
+=== CASE e-sha256sum ===
+# args: -E sha256sum "a space.txt"
+-- a space.txt --
+Hash me.
+=== CASE e-env-set-and-unset ===
+# args: -E env --unset=RCMAKE_CASE_REMOVE "RCMAKE_CASE_KEEP=two words" /bin/sh -c 'printf "keep=[%s] removed=[%s]\n" "$RCMAKE_CASE_KEEP" "$RCMAKE_CASE_REMOVE"'
+# env: RCMAKE_CASE_REMOVE=stale
+# env: RCMAKE_CASE_KEEP=old
+=== CASE e-chdir ===
+# args: -E chdir "sub dir" /bin/cat marker
+-- sub dir/marker --
+Read from the new directory.
+=== CASE e-bin2c-stdin ===
+# args: -E bin2c
+# stdin: A?
+=== CASE e-bin2c-template ===
+# args: -E bin2c --template-file data.in --template-array-placeholder BYTES --template-length-placeholder LENGTH data.txt payload.h
+# check_files: true
+-- data.in --
+static const unsigned char payload[] = {@BYTES@};
+enum { payload_length = @LENGTH@ };
+-- data.txt --
+A?
+=== CASE e-tar-gzip-create-list-extract ===
+# args: -P script.cmake
+# check_files: true
+-- script.cmake --
+execute_process(
+  COMMAND "${CMAKE_COMMAND}" -E tar cfz bundle.tar.gz --mtime=2020-01-02 assets
+  RESULT_VARIABLE create
+)
+if(create EQUAL 0)
+  execute_process(
+    COMMAND "${CMAKE_COMMAND}" -E tar tfz bundle.tar.gz
+    OUTPUT_VARIABLE entries RESULT_VARIABLE list
+  )
+  file(MAKE_DIRECTORY unpacked)
+  execute_process(
+    COMMAND "${CMAKE_COMMAND}" -E tar xfz ../bundle.tar.gz
+    WORKING_DIRECTORY unpacked RESULT_VARIABLE extract
+  )
+  file(REMOVE bundle.tar.gz)
+endif()
+message(STATUS "create=${create} list=${list} extract=${extract} entries=[${entries}]")
+-- assets/payload.txt --
+A gzip payload.
+=== CASE e-capabilities ===
+# args: -E capabilities

@@ -1,0 +1,77 @@
+=== CASE process-capture-output-and-error ===
+# args: -P script.cmake
+-- script.cmake --
+execute_process(
+  COMMAND /bin/sh -c "printf 'out  \n'; printf 'err \n' >&2; exit 7"
+  OUTPUT_VARIABLE out ERROR_VARIABLE err OUTPUT_STRIP_TRAILING_WHITESPACE
+  RESULT_VARIABLE status
+)
+message(STATUS "out=[${out}] err=[${err}] status=${status}")
+=== CASE process-pipeline-statuses ===
+# args: -P script.cmake
+-- script.cmake --
+execute_process(
+  COMMAND /bin/sh -c "printf 'alpha\nbeta\n'; exit 4"
+  COMMAND /usr/bin/tr a-z A-Z
+  OUTPUT_VARIABLE out OUTPUT_STRIP_TRAILING_WHITESPACE
+  RESULT_VARIABLE last RESULTS_VARIABLE all
+)
+message(STATUS "out=[${out}] last=${last} all=${all}")
+=== CASE process-shared-output-and-error ===
+# args: -P script.cmake
+-- script.cmake --
+execute_process(
+  COMMAND /bin/sh -c "printf 'out\n'; printf 'err\n' >&2; printf 'end\n'"
+  OUTPUT_VARIABLE combined ERROR_VARIABLE combined
+  OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_STRIP_TRAILING_WHITESPACE
+  RESULT_VARIABLE status
+)
+message(STATUS "combined=[${combined}] status=${status}")
+=== CASE process-working-directory ===
+# args: -P script.cmake
+-- script.cmake --
+execute_process(
+  COMMAND /bin/cat marker
+  WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/sub dir"
+  OUTPUT_VARIABLE text OUTPUT_STRIP_TRAILING_WHITESPACE
+  RESULT_VARIABLE status
+)
+message(STATUS "text=${text} status=${status}")
+-- sub dir/marker --
+Found in the working directory.
+=== CASE find-file-and-path ===
+# args: -P script.cmake
+-- script.cmake --
+find_file(header NAMES missing.h probe.h PATHS "${CMAKE_CURRENT_SOURCE_DIR}/sandbox" PATH_SUFFIXES include NO_DEFAULT_PATH)
+find_path(headers NAMES probe.h PATHS "${CMAKE_CURRENT_SOURCE_DIR}/sandbox" PATH_SUFFIXES include NO_DEFAULT_PATH)
+find_file(missing_file NAMES absent.h PATHS "${CMAKE_CURRENT_SOURCE_DIR}/sandbox" PATH_SUFFIXES include NO_DEFAULT_PATH)
+find_path(missing_path NAMES absent.h PATHS "${CMAKE_CURRENT_SOURCE_DIR}/sandbox" PATH_SUFFIXES include NO_DEFAULT_PATH)
+message(STATUS "file=${header} path=${headers}")
+message(STATUS "missing=${missing_file}/${missing_path}")
+-- sandbox/include/probe.h --
+#define PROBE 7
+=== CASE find-program-executable-and-missing ===
+# args: -P script.cmake
+-- script.cmake --
+cmake_minimum_required(VERSION 4.5)
+file(CHMOD "${CMAKE_CURRENT_SOURCE_DIR}/bin/probe" PERMISSIONS OWNER_READ OWNER_EXECUTE)
+find_program(found NAMES plain probe PATHS "${CMAKE_CURRENT_SOURCE_DIR}/bin" NO_DEFAULT_PATH)
+find_program(missing NAMES absent PATHS "${CMAKE_CURRENT_SOURCE_DIR}/bin" NO_DEFAULT_PATH)
+message(STATUS "found=${found} missing=${missing}")
+-- bin/probe --
+#!/bin/sh
+exit 0
+-- bin/plain --
+No execute permission.
+=== CASE find-library-prefix-suffix-and-missing ===
+# args: -P script.cmake
+-- script.cmake --
+set(CMAKE_FIND_LIBRARY_PREFIXES "lib")
+set(CMAKE_FIND_LIBRARY_SUFFIXES ".a")
+find_library(found NAMES absent sample PATHS "${CMAKE_CURRENT_SOURCE_DIR}/lib" NO_DEFAULT_PATH)
+find_library(missing NAMES wrong PATHS "${CMAKE_CURRENT_SOURCE_DIR}/lib" NO_DEFAULT_PATH)
+message(STATUS "found=${found} missing=${missing}")
+-- lib/libsample.a --
+Library lookup only checks the file name.
+-- lib/libwrong.so --
+The suffix is outside the search list.

@@ -1,0 +1,167 @@
+=== CASE set-and-unset-normal ===
+# args: -P script.cmake
+-- script.cmake --
+set(value first "" third)
+message(STATUS "list=[${value}]")
+set(value "")
+if(DEFINED value)
+  message(STATUS "empty but defined")
+endif()
+set(value)
+if(NOT DEFINED value)
+  message(STATUS "set without a value unsets")
+endif()
+set(value present)
+unset(value)
+if(NOT DEFINED value)
+  message(STATUS "unset removes the binding")
+endif()
+=== CASE parent-scope-set-and-unset ===
+# args: -P script.cmake
+-- script.cmake --
+set(value original)
+function(change)
+  set(value local)
+  set(value updated PARENT_SCOPE)
+  message(STATUS "local=${value}")
+endfunction()
+function(clear)
+  unset(value PARENT_SCOPE)
+  message(STATUS "inherited=${value}")
+endfunction()
+change()
+message(STATUS "parent=${value}")
+clear()
+if(NOT DEFINED value)
+  message(STATUS "parent binding removed")
+endif()
+=== CASE cache-shadow-force-and-unset ===
+# args: -P script.cmake
+-- script.cmake --
+cmake_minimum_required(VERSION 4.5)
+set(choice normal)
+set(choice first CACHE STRING "Choice")
+set(choice ignored CACHE STRING "Choice")
+message(STATUS "normal=${choice} cache=$CACHE{choice}")
+set(choice forced CACHE STRING "Choice" FORCE)
+unset(choice)
+message(STATUS "fallback=${choice}")
+unset(choice CACHE)
+if(NOT DEFINED choice)
+  message(STATUS "cache binding removed")
+endif()
+=== CASE option-and-cmp0077 ===
+# args: -P script.cmake
+-- script.cmake --
+cmake_minimum_required(VERSION 4.5)
+option(default_off "A switch")
+option(default_on "A switch" ON)
+set(shadow custom)
+option(shadow "A switch" OFF)
+option(default_on "A switch" OFF)
+message(STATUS "defaults=${default_off}/${default_on} shadow=${shadow}")
+if(NOT DEFINED CACHE{shadow})
+  message(STATUS "normal variable suppresses cache entry")
+endif()
+=== CASE set-and-unset-env ===
+# args: -P script.cmake
+# env: RCMAKE_CASE_VALUE=initial
+-- script.cmake --
+message(STATUS "initial=$ENV{RCMAKE_CASE_VALUE}")
+set(ENV{RCMAKE_CASE_VALUE} "two words")
+message(STATUS "updated=$ENV{RCMAKE_CASE_VALUE}")
+unset(ENV{RCMAKE_CASE_VALUE})
+if(NOT DEFINED ENV{RCMAKE_CASE_VALUE})
+  message(STATUS "environment binding removed")
+endif()
+=== CASE separate-arguments-unix-quoting ===
+# args: -P script.cmake
+-- script.cmake --
+separate_arguments(parts UNIX_COMMAND [=[tool 'one two' "three four" five\ six "" 'a;b']=])
+foreach(part IN LISTS parts)
+  message(STATUS "arg=[${part}]")
+endforeach()
+=== CASE list-length-get-and-join ===
+# args: -P script.cmake
+-- script.cmake --
+cmake_minimum_required(VERSION 4.5)
+set(items "alpha;;gamma;delta")
+list(LENGTH items length)
+list(GET items -1 1 0 picked)
+list(JOIN picked "|" joined)
+list(LENGTH missing missing_length)
+message(STATUS "length=${length} joined=${joined} missing=${missing_length}")
+=== CASE list-sublist-and-find ===
+# args: -P script.cmake
+-- script.cmake --
+set(items red blue red green)
+list(SUBLIST items 1 2 pair)
+list(SUBLIST items 2 -1 tail)
+list(FIND items red first)
+list(FIND items orange absent)
+message(STATUS "pair=${pair} tail=${tail} first=${first} absent=${absent}")
+=== CASE list-append-prepend-and-insert ===
+# args: -P script.cmake
+-- script.cmake --
+list(APPEND items center end)
+list(PREPEND items start)
+list(INSERT items -1 before-end)
+list(INSERT items 4 after-end)
+message(STATUS "items=${items}")
+=== CASE list-pop-front-and-back ===
+# args: -P script.cmake
+-- script.cmake --
+set(items a b c d e)
+list(POP_BACK items last penultimate)
+list(POP_FRONT items first second)
+list(POP_FRONT items)
+message(STATUS "popped=${last}/${penultimate}/${first}/${second} rest=[${items}]")
+=== CASE list-remove-and-reverse ===
+# args: -P script.cmake
+-- script.cmake --
+set(items a b a c d b c e)
+list(REMOVE_ITEM items b missing)
+list(REMOVE_AT items -1 2)
+list(REMOVE_DUPLICATES items)
+list(REVERSE items)
+message(STATUS "items=${items}")
+=== CASE list-sort-default-and-natural ===
+# args: -P script.cmake
+-- script.cmake --
+set(items file20 FILE11 file2 File3)
+set(default "${items}")
+list(SORT default)
+list(SORT items COMPARE NATURAL CASE INSENSITIVE ORDER DESCENDING)
+message(STATUS "default=${default} natural=${items}")
+=== CASE list-filter-regex ===
+# args: -P script.cmake
+-- script.cmake --
+set(items blue bluest red BLUE)
+list(FILTER items INCLUDE REGEX "^blue")
+list(FILTER items EXCLUDE REGEX "st$")
+message(STATUS "items=${items}")
+=== CASE list-filter-predicate ===
+# args: -P script.cmake
+-- script.cmake --
+function(is_heavy input result)
+  if(input GREATER_EQUAL 10)
+    set(${result} TRUE PARENT_SCOPE)
+  else()
+    set(${result} FALSE PARENT_SCOPE)
+  endif()
+endfunction()
+set(heavy 4 12 7 19)
+set(light "${heavy}")
+list(FILTER heavy INCLUDE PREDICATE is_heavy)
+list(FILTER light EXCLUDE PREDICATE is_heavy)
+message(STATUS "heavy=${heavy} light=${light}")
+=== CASE list-transform-selectors ===
+# args: -P script.cmake
+-- script.cmake --
+cmake_minimum_required(VERSION 4.5)
+set(items "  a  ;bee;cat;dog")
+list(TRANSFORM items STRIP)
+list(TRANSFORM items TOUPPER AT 0 -1 OUTPUT_VARIABLE upper)
+list(TRANSFORM items APPEND "!" FOR 0 3 2)
+list(TRANSFORM items REPLACE "^b" "B" REGEX "^bee$")
+message(STATUS "items=${items} upper=${upper}")

@@ -1,0 +1,142 @@
+=== CASE presets-project-and-user ===
+# args: --list-presets
+-- CMakePresets.json --
+{
+  "version": 13,
+  "configurePresets": [
+    {"name": "project", "displayName": "Project default"},
+    {"name": "project-base", "hidden": true, "binaryDir": "out"}
+  ]
+}
+-- CMakeUserPresets.json --
+{
+  "version": 13,
+  "configurePresets": [
+    {"name": "local", "inherits": "project-base", "displayName": "Local build"}
+  ]
+}
+=== CASE presets-nested-includes ===
+# args: --list-presets=configure
+-- CMakePresets.json --
+{
+  "version": 13,
+  "include": ["config/platform.json"],
+  "configurePresets": [{"name": "default", "inherits": "common"}]
+}
+-- config/platform.json --
+{
+  "version": 13,
+  "include": ["base/common.json"],
+  "configurePresets": [{"name": "platform", "inherits": "common"}]
+}
+-- config/base/common.json --
+{
+  "version": 13,
+  "configurePresets": [{"name": "common", "hidden": true, "binaryDir": "out"}]
+}
+=== CASE presets-inheritance-precedence ===
+# args: --list-presets=configure
+-- CMakePresets.json --
+{
+  "version": 13,
+  "configurePresets": [
+    {"name": "first", "hidden": true, "environment": {"CHOICE": "first"}},
+    {"name": "second", "hidden": true, "environment": {"CHOICE": "second"}},
+    {
+      "name": "first-wins",
+      "inherits": ["first", "second"],
+      "condition": {"type": "equals", "lhs": "$env{CHOICE}", "rhs": "first"}
+    },
+    {
+      "name": "override-wins",
+      "inherits": ["first", "second"],
+      "environment": {"CHOICE": "override"},
+      "condition": {"type": "equals", "lhs": "$env{CHOICE}", "rhs": "override"}
+    }
+  ]
+}
+=== CASE presets-conditions-and-environment-macros ===
+# args: --list-presets=configure
+# env: RCMAKE_PRESET_MODE=debug
+-- CMakePresets.json --
+{
+  "version": 13,
+  "configurePresets": [
+    {
+      "name": "debug",
+      "condition": {
+        "type": "allOf",
+        "conditions": [
+          {"type": "equals", "lhs": "${presetName}", "rhs": "$penv{RCMAKE_PRESET_MODE}"},
+          {"type": "matches", "string": "${sourceDir}", "regex": "/[^/]+$"}
+        ]
+      }
+    },
+    {
+      "name": "release",
+      "condition": {"type": "inList", "string": "$penv{RCMAKE_PRESET_MODE}", "list": ["release", "fast"]}
+    },
+    {"name": "disabled", "condition": false}
+  ]
+}
+=== CASE presets-all-kinds-and-configure-name ===
+# args: --list-presets=all
+-- CMakePresets.json --
+{
+  "version": 13,
+  "configurePresets": [
+    {
+      "name": "configure-dev",
+      "binaryDir": "${sourceDir}/out/${configurePresetName}",
+      "condition": {"type": "equals", "lhs": "${configurePresetName}", "rhs": "${presetName}"}
+    }
+  ],
+  "buildPresets": [
+    {"name": "build-base", "hidden": true, "configurePreset": "configure-dev"},
+    {
+      "name": "build-fast",
+      "inherits": "build-base",
+      "condition": {"type": "equals", "lhs": "${configurePresetName}", "rhs": "configure-dev"}
+    },
+    {
+      "name": "build-disabled",
+      "inherits": "build-base",
+      "condition": {"type": "equals", "lhs": "${configurePresetName}", "rhs": "${presetName}"}
+    }
+  ],
+  "testPresets": [{"name": "test-dev", "configurePreset": "configure-dev"}],
+  "packagePresets": [{"name": "package-dev", "configurePreset": "configure-dev", "generators": ["ZIP"]}],
+  "workflowPresets": [
+    {"name": "check-dev", "steps": [
+      {"type": "configure", "name": "configure-dev"},
+      {"type": "build", "name": "build-fast"},
+      {"type": "test", "name": "test-dev"}
+    ]}
+  ]
+}
+=== CASE presets-build-kind-from-user-file ===
+# args: --list-presets=build
+-- CMakePresets.json --
+{
+  "version": 13,
+  "configurePresets": [{"name": "dev", "binaryDir": "out/dev"}],
+  "buildPresets": [{"name": "core", "configurePreset": "dev"}]
+}
+-- CMakeUserPresets.json --
+{
+  "version": 13,
+  "buildPresets": [
+    {
+      "name": "local",
+      "inherits": "core",
+      "displayName": "Local build",
+      "condition": {"type": "equals", "lhs": "${configurePresetName}", "rhs": "dev"}
+    },
+    {"name": "local-internal", "hidden": true, "inherits": "core"},
+    {
+      "name": "disabled",
+      "inherits": "core",
+      "condition": {"type": "equals", "lhs": "${configurePresetName}", "rhs": "${presetName}"}
+    }
+  ]
+}
