@@ -5,7 +5,7 @@ use rcmake_base::{BString, list};
 use rcmake_diag::{DiagOptions, PolicyId, PolicyStatus};
 use rcmake_eval::{CacheDefine, Interp, InterpConfig, LogLevel, RunMode};
 use rcmake_host::{Follow, Host, PureHost, ReadRange, Stream};
-use rcmake_model::CacheType;
+use rcmake_model::{CacheEntry, CacheType, GeneratorKind};
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -886,6 +886,167 @@ fn role_and_commands_properties_report_interpreter_state() -> TestResult {
         let names = interp.cx().registered_command_names();
         assert!(names.iter().any(|name| name == b"custom_command"));
         assert_eq!(interp.cx().var(b"commands"), Some(list::join(names)));
+    }
+    Ok(())
+}
+
+#[test]
+fn computed_global_properties_are_available_before_project() -> TestResult {
+    let script = r#"
+        set(CMAKE_GENERATOR "Ninja Multi-Config")
+        foreach(name IN ITEMS IN_TRY_COMPILE ENABLED_LANGUAGES GENERATOR_IS_MULTI_CONFIG
+            CMAKE_C_KNOWN_FEATURES CMAKE_CXX_KNOWN_FEATURES CMAKE_CUDA_KNOWN_FEATURES
+            CMAKE_HIP_KNOWN_FEATURES)
+            get_property(${name} GLOBAL PROPERTY ${name})
+            get_property(${name}_defined GLOBAL PROPERTY ${name} DEFINED)
+            get_property(${name}_set GLOBAL PROPERTY ${name} SET)
+            set_property(GLOBAL PROPERTY ${name} ignored)
+            get_cmake_property(${name}_after_write ${name})
+        endforeach()
+        list(LENGTH CMAKE_CXX_KNOWN_FEATURES cxx_count)
+        list(GET CMAKE_CXX_KNOWN_FEATURES 0 6 -1 cxx_features)
+    "#;
+    for (mode, generator, cached_generator, multi_config) in [
+        (RunMode::Script, None, "Ninja Multi-Config", "0"),
+        (RunMode::Configure, Some(GeneratorKind::Ninja), "Ninja", "0"),
+        (
+            RunMode::Configure,
+            Some(GeneratorKind::NinjaMultiConfig),
+            "Ninja Multi-Config",
+            "1",
+        ),
+        (
+            RunMode::Configure,
+            Some(GeneratorKind::UnixMakefiles),
+            "Unix Makefiles",
+            "0",
+        ),
+        (RunMode::Configure, None, "Ninja Multi-Config", "1"),
+        (RunMode::Configure, None, "Xcode", "1"),
+    ] {
+        let (host, mut interp) = context(mode);
+        interp.cx().project().generator = generator;
+        interp.cx().cache().insert(
+            "CMAKE_GENERATOR".into(),
+            CacheEntry {
+                value: cached_generator.into(),
+                ty: CacheType::Internal,
+                help: BString::default(),
+                advanced: false,
+                props: Default::default(),
+            },
+        );
+        match mode {
+            RunMode::Script => run(&host, &mut interp, script, 0)?,
+            RunMode::Configure => configure(&host, &mut interp, script, 0)?,
+        }
+        assert_var(&mut interp, "IN_TRY_COMPILE", Some("0"));
+        assert_var(&mut interp, "ENABLED_LANGUAGES", Some(""));
+        assert_var(&mut interp, "GENERATOR_IS_MULTI_CONFIG", Some(multi_config));
+        assert_var(
+            &mut interp,
+            "CMAKE_C_KNOWN_FEATURES",
+            Some(
+                "c_std_90;c_std_99;c_std_11;c_std_17;c_std_23;c_function_prototypes;\
+                 c_restrict;c_variadic_macros;c_static_assert",
+            ),
+        );
+        assert_var(&mut interp, "cxx_count", Some("64"));
+        assert_var(
+            &mut interp,
+            "cxx_features",
+            Some("cxx_std_98;cxx_std_26;cxx_variable_templates"),
+        );
+        assert_var(
+            &mut interp,
+            "CMAKE_CUDA_KNOWN_FEATURES",
+            Some(
+                "cuda_std_03;cuda_std_11;cuda_std_14;cuda_std_17;cuda_std_20;cuda_std_23;cuda_std_26",
+            ),
+        );
+        assert_var(
+            &mut interp,
+            "CMAKE_HIP_KNOWN_FEATURES",
+            Some("hip_std_98;hip_std_11;hip_std_14;hip_std_17;hip_std_20;hip_std_23;hip_std_26"),
+        );
+        for name in [
+            "IN_TRY_COMPILE",
+            "ENABLED_LANGUAGES",
+            "GENERATOR_IS_MULTI_CONFIG",
+            "CMAKE_C_KNOWN_FEATURES",
+            "CMAKE_CXX_KNOWN_FEATURES",
+            "CMAKE_CUDA_KNOWN_FEATURES",
+            "CMAKE_HIP_KNOWN_FEATURES",
+        ] {
+            assert_var(&mut interp, &format!("{name}_defined"), Some("0"));
+            assert_var(&mut interp, &format!("{name}_set"), Some("1"));
+            let mut cx = interp.cx();
+            assert_eq!(
+                cx.var(format!("{name}_after_write").as_bytes()),
+                cx.var(name.as_bytes()),
+                "{name}",
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn computed_global_properties_keep_internal_language_state() -> TestResult {
+    let (host, mut interp) = context(RunMode::Configure);
+    interp
+        .cx()
+        .global()
+        .props
+        .set("IN_TRY_COMPILE".into(), "1".into());
+    configure(
+        &host,
+        &mut interp,
+        r#"
+        project(Probe NONE)
+        set_property(GLOBAL PROPERTY IN_TRY_COMPILE 0)
+        set_property(GLOBAL PROPERTY ENABLED_LANGUAGES)
+        get_property(nested GLOBAL PROPERTY IN_TRY_COMPILE)
+        get_cmake_property(languages ENABLED_LANGUAGES)
+        "#,
+        0,
+    )?;
+    assert_var(&mut interp, "nested", Some("1"));
+    assert_var(&mut interp, "languages", Some("NONE"));
+    Ok(())
+}
+
+#[test]
+fn writable_global_properties_use_only_stored_values() -> TestResult {
+    let (host, mut interp) = context(RunMode::Script);
+    run(
+        &host,
+        &mut interp,
+        r#"
+        foreach(name IN ITEMS ALLOW_DUPLICATE_CUSTOM_TARGETS FIND_LIBRARY_USE_LIB64_PATHS
+            FIND_LIBRARY_USE_LIB32_PATHS FIND_LIBRARY_USE_LIBX32_PATHS)
+            get_property(${name}_before GLOBAL PROPERTY ${name} SET)
+            get_cmake_property(${name}_missing ${name})
+            set_property(GLOBAL PROPERTY ${name} TRUE)
+            get_property(${name}_after GLOBAL PROPERTY ${name} SET)
+            get_cmake_property(${name}_value ${name})
+            set_property(GLOBAL PROPERTY ${name})
+            get_property(${name}_removed GLOBAL PROPERTY ${name} SET)
+        endforeach()
+        "#,
+        0,
+    )?;
+    for name in [
+        "ALLOW_DUPLICATE_CUSTOM_TARGETS",
+        "FIND_LIBRARY_USE_LIB64_PATHS",
+        "FIND_LIBRARY_USE_LIB32_PATHS",
+        "FIND_LIBRARY_USE_LIBX32_PATHS",
+    ] {
+        assert_var(&mut interp, &format!("{name}_before"), Some("0"));
+        assert_var(&mut interp, &format!("{name}_missing"), Some("NOTFOUND"));
+        assert_var(&mut interp, &format!("{name}_after"), Some("1"));
+        assert_var(&mut interp, &format!("{name}_value"), Some("TRUE"));
+        assert_var(&mut interp, &format!("{name}_removed"), Some("0"));
     }
     Ok(())
 }

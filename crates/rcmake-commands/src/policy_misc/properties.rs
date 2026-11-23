@@ -4,8 +4,8 @@ use rcmake_eval::{CmdError, CmdResult, Cx, Flow, RunMode, UserCommandKind};
 use rcmake_expr::ExpandedArg;
 use rcmake_host::path;
 use rcmake_model::{
-    AppendMode, CacheType, DefinedProperty, DirId, ModelError, PropOrigin, PropScope,
-    TargetBinding, TargetId, UsageField,
+    AppendMode, CacheType, DefinedProperty, DirId, GeneratorKind, ModelError, PropOrigin,
+    PropScope, TargetBinding, TargetId, UsageField,
 };
 
 use crate::dirs::{find_directory, normalized_path, scoped_test_directory};
@@ -13,6 +13,52 @@ use crate::dirs::{find_directory, normalized_path, scoped_test_directory};
 use super::{quoted, status, values};
 
 const DIRECTORY_ERROR: &str = "DIRECTORY scope provided but requested directory was not found.  This could be because the directory argument was invalid or, it is valid but has not been processed yet.";
+
+// These CMake 4.5.1 lists are available before the language bootstrap runs.
+const KNOWN_FEATURES: [(&[u8], &str); 4] = [
+    (
+        b"CMAKE_C_KNOWN_FEATURES",
+        "c_std_90;c_std_99;c_std_11;c_std_17;c_std_23;c_function_prototypes;c_restrict;\
+         c_variadic_macros;c_static_assert",
+    ),
+    (
+        b"CMAKE_CXX_KNOWN_FEATURES",
+        "cxx_std_98;cxx_std_11;cxx_std_14;cxx_std_17;cxx_std_20;cxx_std_23;cxx_std_26;\
+         cxx_template_template_parameters;cxx_alias_templates;cxx_alignas;cxx_alignof;\
+         cxx_attributes;cxx_auto_type;cxx_constexpr;cxx_decltype;\
+         cxx_decltype_incomplete_return_types;cxx_default_function_template_args;\
+         cxx_defaulted_functions;cxx_defaulted_move_initializers;cxx_delegating_constructors;\
+         cxx_deleted_functions;cxx_enum_forward_declarations;cxx_explicit_conversions;\
+         cxx_extended_friend_declarations;cxx_extern_templates;cxx_final;\
+         cxx_func_identifier;cxx_generalized_initializers;cxx_inheriting_constructors;\
+         cxx_inline_namespaces;cxx_lambdas;cxx_local_type_template_args;\
+         cxx_long_long_type;cxx_noexcept;cxx_nonstatic_member_init;cxx_nullptr;\
+         cxx_override;cxx_range_for;cxx_raw_string_literals;\
+         cxx_reference_qualified_functions;cxx_right_angle_brackets;\
+         cxx_rvalue_references;cxx_sizeof_member;cxx_static_assert;cxx_strong_enums;\
+         cxx_thread_local;cxx_trailing_return_types;cxx_unicode_literals;\
+         cxx_uniform_initialization;cxx_unrestricted_unions;cxx_user_literals;\
+         cxx_variadic_macros;cxx_variadic_templates;cxx_aggregate_default_initializers;\
+         cxx_attribute_deprecated;cxx_binary_literals;cxx_contextual_conversions;\
+         cxx_decltype_auto;cxx_digit_separators;cxx_generic_lambdas;\
+         cxx_lambda_init_captures;cxx_relaxed_constexpr;cxx_return_type_deduction;\
+         cxx_variable_templates",
+    ),
+    (
+        b"CMAKE_CUDA_KNOWN_FEATURES",
+        "cuda_std_03;cuda_std_11;cuda_std_14;cuda_std_17;cuda_std_20;cuda_std_23;cuda_std_26",
+    ),
+    (
+        b"CMAKE_HIP_KNOWN_FEATURES",
+        "hip_std_98;hip_std_11;hip_std_14;hip_std_17;hip_std_20;hip_std_23;hip_std_26",
+    ),
+];
+
+fn known_features(name: &[u8]) -> Option<&'static str> {
+    KNOWN_FEATURES
+        .into_iter()
+        .find_map(|(property, features)| (name == property).then_some(features))
+}
 
 pub(super) fn define(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
     let args = values(args);
@@ -237,7 +283,13 @@ pub(super) fn set(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
     let value = (!tail.is_empty()).then(|| list::join(tail));
     match *scope {
         b"GLOBAL" if names.is_empty() => {
-            update_scoped(cx, &PropScope::Global, name, value, update)?;
+            if !matches!(
+                *name,
+                b"IN_TRY_COMPILE" | b"ENABLED_LANGUAGES" | b"GENERATOR_IS_MULTI_CONFIG"
+            ) && known_features(name).is_none()
+            {
+                update_scoped(cx, &PropScope::Global, name, value, update)?;
+            }
         }
         b"GLOBAL" => return Err(status("given names for GLOBAL scope.")),
         b"DIRECTORY" => {
@@ -801,15 +853,34 @@ fn global_value(cx: &mut Cx<'_>, name: &[u8]) -> Option<BString> {
             }
             .into(),
         ),
-        b"GENERATOR_IS_MULTI_CONFIG" => {
-            let generator = cx.var_or_empty(b"CMAKE_GENERATOR");
-            Some(boolean(
-                generator.starts_with(b"Visual Studio")
-                    || matches!(generator.as_slice(), b"Xcode" | b"Ninja Multi-Config"),
-            ))
-        }
-        _ => cx.global().props.get(name).cloned(),
+        b"GENERATOR_IS_MULTI_CONFIG" => Some(boolean(generator_is_multi_config(cx))),
+        b"IN_TRY_COMPILE" => Some(boolean(
+            cx.global()
+                .props
+                .get(name)
+                .is_some_and(|value| truth::is_on(value)),
+        )),
+        b"ENABLED_LANGUAGES" => Some(cx.global().props.get(name).cloned().unwrap_or_default()),
+        _ => known_features(name)
+            .map(BString::from)
+            .or_else(|| cx.global().props.get(name).cloned()),
     }
+}
+
+fn generator_is_multi_config(cx: &mut Cx<'_>) -> bool {
+    if cx.mode() == RunMode::Script {
+        return false;
+    }
+    if let Some(generator) = cx.project().generator {
+        return generator.multi_config();
+    }
+    // Preload scripts and generators without a model kind use the cache entry.
+    cx.cache().get(b"CMAKE_GENERATOR").is_some_and(|entry| {
+        entry.ty == CacheType::Internal
+            && (GeneratorKind::from_name(&entry.value).is_some_and(GeneratorKind::multi_config)
+                || entry.value == b"Xcode"
+                || entry.value.starts_with(b"Visual Studio "))
+    })
 }
 
 fn cache_names(cx: &mut Cx<'_>) -> BString {
