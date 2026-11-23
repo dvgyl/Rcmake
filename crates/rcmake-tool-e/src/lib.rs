@@ -191,14 +191,26 @@ fn checksum(algo: HashAlgo, args: &[BString], cx: &ToolCtx<'_>) -> i32 {
         return usage(cx, 1);
     }
     let mut failures: i32 = 0;
+    let mut stdin_used = false;
     for file in args {
-        let file_path = path(cx, file);
-        if is_dir(cx, &file_path) && !file.is_empty() {
-            error(cx, &[b"Error: ", file, b" is a directory\n"]);
-            failures = failures.saturating_add(1);
-            continue;
-        }
-        match cx.host.read(&file_path, read_all()) {
+        let result = if file == b"-" {
+            if stdin_used {
+                error(cx, &[b"-: No such file or directory\n"]);
+                failures = failures.saturating_add(1);
+                continue;
+            }
+            stdin_used = true;
+            cx.host.read_stdin(Limits::default().max_file_read)
+        } else {
+            let file_path = path(cx, file);
+            if is_dir(cx, &file_path) && !file.is_empty() {
+                error(cx, &[b"Error: ", file, b" is a directory\n"]);
+                failures = failures.saturating_add(1);
+                continue;
+            }
+            cx.host.read(&file_path, read_all())
+        };
+        match result {
             Ok(bytes) => write(
                 cx,
                 Stream::Stdout,

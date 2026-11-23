@@ -352,7 +352,49 @@ fn all_checksum_algorithms_emit_two_spaces_and_count_failures() -> HostResult<()
             f.err(),
             b"missing: No such file or directory\nError: dir is a directory\n"
         );
+
+        let f = Fixture::new();
+        f.host.seed_stdin(b"abc")?;
+        assert_eq!(f.run(&[command, "-"]), 0);
+        assert_eq!(f.out(), format!("{digest}  -\n"));
+        assert!(f.err().is_empty());
     }
+    Ok(())
+}
+
+#[test]
+fn checksum_requires_an_operand_and_reads_stdin_once() -> HostResult<()> {
+    let f = Fixture::new();
+    f.host.seed_stdin(b"abc")?;
+    f.seed("-", b"")?;
+    assert_eq!(f.run(&["sha256sum"]), 1);
+    assert!(f.out().is_empty());
+    assert_eq!(
+        f.err(),
+        concat!(
+            "CMake Error: cmake version 4.5.1\n",
+            "Usage: test-cmake -E <command> [arguments...]\nAvailable commands:\n",
+            include_str!("usage.txt"),
+            "\n",
+        )
+    );
+    assert_eq!(f.run(&["sha256sum", "-", "./-", "-"]), 1);
+    assert_eq!(
+        f.out(),
+        concat!(
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad  -\n",
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  ./-\n",
+        )
+    );
+    assert!(f.err().ends_with(b"\n\n-: No such file or directory\n"));
+
+    let f = Fixture::new();
+    assert_eq!(f.run(&["sha256sum", "-"]), 0);
+    assert_eq!(
+        f.out(),
+        b"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  -\n"
+    );
+    assert!(f.err().is_empty());
     Ok(())
 }
 
@@ -499,6 +541,26 @@ fn tar_option_and_missing_archive_errors() -> HostResult<()> {
             "CMake Error: Problem listing tar: missing\n",
         )
     );
+    Ok(())
+}
+
+#[test]
+fn tar_reports_missing_members_for_extract_and_both_list_modes() -> HostResult<()> {
+    for (flags, summary) in [
+        ("xf", "CMake Error: Problem extracting tar:\n  archive\n"),
+        ("tf", "CMake Error: Problem listing tar: archive\n"),
+        ("tvf", "CMake Error: Problem listing tar: archive\n"),
+    ] {
+        let f = Fixture::new();
+        f.seed("member with spaces", b"content")?;
+        assert_eq!(f.run(&["tar", "cf", "archive", "member with spaces"]), 0);
+        assert_eq!(f.run(&["tar", flags, "archive", "missing member"]), 1);
+        assert!(f.out().is_empty());
+        assert_eq!(
+            f.err(),
+            format!("CMake Error: tar: missing member: Not found in archive\n{summary}")
+        );
+    }
     Ok(())
 }
 

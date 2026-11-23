@@ -430,7 +430,12 @@ fn extract(
                     ],
                 );
             } else {
-                error(cx, &[b"CMake Error: ", err.message.as_bytes(), b"\n"]);
+                let prefix = if err.message.ends_with(": Not found in archive") {
+                    b"CMake Error: tar: ".as_slice()
+                } else {
+                    b"CMake Error: "
+                };
+                error(cx, &[prefix, err.message.as_bytes(), b"\n"]);
             }
             let message = if list {
                 b"CMake Error: Problem listing tar: ".as_slice()
