@@ -6,8 +6,8 @@ use std::sync::Arc;
 
 use rcmake_base::{BString, Limits, list};
 use rcmake_eval::{
-    CmdError, CmdFlags, CmdResult, Cx, Flow, IncludeOptions, Interp, InterpConfig, Registry,
-    RunMode,
+    CmdError, CmdFlags, CmdResult, Cx, Flow, IncludeOptions, Interp, InterpConfig, LogLevel,
+    Registry, RunMode,
 };
 use rcmake_expr::ExpandedArg;
 use rcmake_host::path::{from_native, to_native};
@@ -23,7 +23,7 @@ pub(crate) struct Test {
     pub(crate) name: BString,
     pub(crate) command: CommandSpec,
     pub(crate) directory: PathBuf,
-    properties: BTreeMap<BString, BString>,
+    pub(crate) properties: BTreeMap<BString, BString>,
 }
 
 impl Test {
@@ -75,12 +75,20 @@ pub(crate) fn load(
         Err(error) if error.kind == ErrorKind::NotFound => return Ok(Vec::new()),
         Err(source) => return Err(CtestError::Access { path, source }),
     }
+    let executable = host.current_exe().unwrap_or_else(|_| dir.join("cmake"));
+    let cmake_root = host
+        .env_get(b"RCMAKE_VENDORED_DATA_ROOT")
+        .map(|root| dir.join(to_native(&root)))
+        .or_else(|| Some(executable.parent()?.parent()?.join("share/cmake-4.5")))
+        .unwrap_or_default();
+    let cmake_command =
+        executable.with_file_name(if cfg!(windows) { "cmake.exe" } else { "cmake" });
     let mut interp = Interp::new(
         InterpConfig {
             host,
             mode: RunMode::Script,
-            cmake_root: PathBuf::new(),
-            cmake_command: PathBuf::new(),
+            cmake_root,
+            cmake_command,
             cwd: dir.to_path_buf(),
             limits: Limits {
                 max_recursion: MAX_RECURSION,
@@ -92,11 +100,11 @@ pub(crate) fn load(
         },
         register,
     );
-    if let Some(config) = config {
-        interp
-            .cx()
-            .set_var(b"CTEST_CONFIGURATION_TYPE", config.clone());
-    }
+    interp.set_log_level(Some(LogLevel::Notice));
+    interp.cx().set_var(
+        b"CTEST_CONFIGURATION_TYPE",
+        config.cloned().unwrap_or_default(),
+    );
     let _scope = DiscoveryScope::enter();
     if interp.run_script(&path).exit_code != 0 {
         return Err(CtestError::Load(path));
@@ -105,10 +113,12 @@ pub(crate) fn load(
 }
 
 fn register(registry: &mut Registry) {
+    rcmake_commands::register_all(registry);
     registry.add("add_test", add_test, SCRIPTABLE);
     registry.add("set_tests_properties", set_properties, SCRIPTABLE);
     registry.add("subdirs", subdirs, SCRIPTABLE);
-    registry.add("set", set, SCRIPTABLE);
+    registry.add("add_subdirectory", add_subdirectory, SCRIPTABLE);
+    registry.add("discover_tests", crate::discover::run, SCRIPTABLE);
 }
 
 fn add_test(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
@@ -124,6 +134,11 @@ fn add_test(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
         directory: cx.current_binary_dir(),
         properties: BTreeMap::new(),
     };
+    register_test(test);
+    Ok(Flow::Normal)
+}
+
+pub(crate) fn register_test(test: Test) {
     COLLECTOR.with_borrow_mut(|state| {
         state
             .names
@@ -132,7 +147,6 @@ fn add_test(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
             .push(state.tests.len());
         state.tests.push(test);
     });
-    Ok(Flow::Normal)
 }
 
 fn set_properties(_: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
@@ -149,8 +163,8 @@ fn set_properties(_: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
     COLLECTOR.with_borrow_mut(|state| {
         for name in names {
             if let Some(ids) = state.names.get(&name.value) {
-                for id in ids {
-                    if let Some(test) = state.tests.get_mut(*id) {
+                for &id in ids {
+                    if let Some(test) = state.tests.get_mut(id) {
                         for [key, value] in pairs {
                             test.properties
                                 .insert(key.value.clone(), value.value.clone());
@@ -161,6 +175,13 @@ fn set_properties(_: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
         }
     });
     Ok(Flow::Normal)
+}
+
+fn add_subdirectory(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
+    match args {
+        [directory, ..] => subdirs(cx, std::slice::from_ref(directory)),
+        [] => Err(CmdError::Status("requires a directory".into())),
+    }
 }
 
 fn subdirs(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
@@ -194,17 +215,6 @@ fn subdirs(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
         cx.project()
             .set_root_dirs(parent_bytes.clone(), parent_bytes.clone());
         result?;
-    }
-    Ok(Flow::Normal)
-}
-
-fn set(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
-    match args {
-        [] => return Err(CmdError::Status("requires a variable name".into())),
-        [name] => cx.unset_var(&name.value),
-        [name, values @ ..] => {
-            cx.set_var(&name.value, list::join(values.iter().map(|arg| &arg.value)))
-        }
     }
     Ok(Flow::Normal)
 }

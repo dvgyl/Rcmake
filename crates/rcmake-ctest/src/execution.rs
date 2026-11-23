@@ -6,6 +6,7 @@ use rcmake_host::path::{from_native, to_native};
 use rcmake_host::{CommandSpec, FileKind, Follow, Host, Input, Output, ProcessResult, RunRequest};
 
 use crate::CtestOptions;
+use crate::discovery::Test;
 use crate::selection::{OutputChecks, PlannedTest, any_match};
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10_000_000);
@@ -55,7 +56,7 @@ impl ResultLine {
     }
 }
 
-type Environment = BTreeMap<BString, BString>;
+pub(crate) type Environment = BTreeMap<BString, BString>;
 
 pub(crate) fn request(
     host: &dyn Host,
@@ -84,9 +85,9 @@ pub(crate) fn request(
     })
 }
 
-fn resolve_program(
+pub(crate) fn resolve_program(
     host: &dyn Host,
-    test: &PlannedTest,
+    test: &Test,
     command: &mut CommandSpec,
     options: &CtestOptions,
 ) {
@@ -117,7 +118,7 @@ fn resolve_program(
     }
 }
 
-fn parse_timeout(value: &[u8]) -> Option<Duration> {
+pub(crate) fn parse_timeout(value: &[u8]) -> Option<Duration> {
     let seconds: f64 = std::str::from_utf8(value).ok()?.trim().parse().ok()?;
     Duration::try_from_secs_f64(seconds).ok()
 }
@@ -127,7 +128,7 @@ fn split(value: &[u8], separator: u8) -> Option<(&[u8], &[u8])> {
     Some((value.get(..index)?, value.get(index + 1..)?))
 }
 
-fn environment(host: &dyn Host, test: &PlannedTest) -> Result<Environment, String> {
+pub(crate) fn environment(host: &dyn Host, test: &Test) -> Result<Environment, String> {
     let mut env: Environment = host.env_all().into_iter().collect();
     for assignment in test.list(b"ENVIRONMENT") {
         if let Some((key, value)) = split(&assignment, b'=') {

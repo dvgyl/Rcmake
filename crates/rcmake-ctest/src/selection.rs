@@ -406,7 +406,7 @@ pub(crate) fn plan_with(
             .collect();
         tests
             .iter()
-            .map(|(number, _)| failures.contains(number))
+            .map(|(number, _)| failures.is_empty() || failures.contains(number))
             .collect()
     } else {
         select_tests(host, dir, options, selection, &mut tests)?
