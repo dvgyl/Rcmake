@@ -191,7 +191,7 @@ fn run_cmake(argv: &[BString], rest: &[BString], host: Arc<dyn Host>) -> i32 {
         return install::run(argv, args, host);
     }
     if let Some(args) = rest.strip_prefix(&[BString::from("--workflow")]) {
-        return workflow::run(args, host.as_ref());
+        return workflow::run(args, host);
     }
 
     let mut opts = match options::parse(rest, host.as_ref()) {

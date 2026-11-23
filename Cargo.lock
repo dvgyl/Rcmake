@@ -468,6 +468,7 @@ dependencies = [
  "rcmake-gen-ninja",
  "rcmake-genex",
  "rcmake-host",
+ "rcmake-instrument",
  "rcmake-json",
  "rcmake-model",
  "rcmake-presets",

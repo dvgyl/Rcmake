@@ -23,6 +23,7 @@ rcmake-gen-make.workspace = true
 rcmake-gen-ninja.workspace = true
 rcmake-genex.workspace = true
 rcmake-host.workspace = true
+rcmake-instrument.workspace = true
 rcmake-json.workspace = true
 rcmake-model.workspace = true
 rcmake-presets.workspace = true
