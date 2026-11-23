@@ -421,10 +421,11 @@ pub fn resolve(
     } else {
         configs.to_vec()
     };
-    let mut paths = SourcePaths::new(model, host);
+    let mut paths = SourcePaths::new(host);
     let mut targets = Vec::new();
     let mut graphs = Vec::with_capacity(configs.len());
     for config in &configs {
+        paths.index_generated(model, config)?;
         paths.index_objects(model, config);
         let mut usage = UsageResolver::with_source_paths(model, &paths);
         let ctx = EvalContext {
@@ -452,11 +453,13 @@ pub fn resolve(
             inputs.objects.extend(link.objects);
         }
         let resolved = resolved.into_values().collect::<Vec<_>>();
-        graphs.push(lower::lower_with_inputs(model, &resolved, config, &inputs)?);
+        graphs.push(lower::lower_with_inputs(
+            model, &resolved, config, &inputs, &mut usage,
+        )?);
         targets.extend(resolved);
     }
 
-    let install = lower::lower_install_manifest(model, &targets);
+    let install = lower::lower_install_manifest_with_configs(model, &targets, &configs)?;
     let exports = resolve_exports(model, &mut UsageResolver::new(model), &targets, &install)?;
     Ok(GenerationResult {
         configs,
@@ -531,6 +534,12 @@ fn resolve_target(
                     language: Some(language.clone()),
                     ..ctx.clone()
                 };
+                let features = usage.collect(id, UsageField::CompileFeatures, &compile_ctx)?;
+                if let Some(standard) = lower::required_standard(&language, &features.entries) {
+                    inputs
+                        .standard_requirements
+                        .insert(language.clone(), standard);
+                }
                 let flags = usage
                     .collect(id, UsageField::CompileOptions, &compile_ctx)?
                     .entries;

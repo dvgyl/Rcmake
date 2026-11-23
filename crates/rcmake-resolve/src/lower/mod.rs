@@ -2,10 +2,12 @@
 
 mod artifacts;
 mod compile;
+mod custom;
 mod graph;
 mod install;
 mod link;
 mod shell;
+mod standard;
 
 #[cfg(test)]
 mod tests;
@@ -15,9 +17,12 @@ use rcmake_model::{DirId, ProjectModel, Target};
 
 pub(crate) use artifacts::build_relative;
 pub use artifacts::{compute_artifacts, linker_language, object_path, source_language};
+pub(crate) use custom::command_outputs;
 pub use graph::lower;
 pub(crate) use graph::lower_with_inputs;
+pub(crate) use install::lower_install_manifest_with_configs;
 pub use install::{collect_metadata, lower_install_manifest};
+pub(crate) use standard::required_standard;
 
 pub(crate) fn definition<'a>(
     model: &'a ProjectModel,

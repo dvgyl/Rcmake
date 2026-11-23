@@ -1,3 +1,6 @@
+use std::cell::RefCell;
+
+use indexmap::IndexSet;
 use rcmake_base::{BString, list};
 use rcmake_diag::{PolicyId, PolicyStatus};
 use rcmake_genex::{
@@ -13,7 +16,8 @@ use crate::ResolveError;
 pub struct ModelGenexHost<'model, 'resolver> {
     pub(super) resolver: &'resolver mut UsageResolver<'model>,
     pub(super) lookup_dir: DirId,
-    pub(super) current: Option<TargetHandle>,
+    pub(crate) current: Option<TargetHandle>,
+    pub(crate) artifact_dependencies: Option<&'resolver RefCell<IndexSet<TargetId>>>,
 }
 
 impl<'model, 'resolver> ModelGenexHost<'model, 'resolver> {
@@ -23,6 +27,7 @@ impl<'model, 'resolver> ModelGenexHost<'model, 'resolver> {
             resolver,
             lookup_dir,
             current: None,
+            artifact_dependencies: None,
         }
     }
 
@@ -102,7 +107,19 @@ impl GenexHost for ModelGenexHost<'_, '_> {
         part: ArtifactPart,
         config: &ConfigId,
     ) -> Option<BString> {
-        self.resolver.artifact(self.id(target)?, kind, part, config)
+        let id = self.id(target)?;
+        let path = self.resolver.artifact(id, kind, part, config)?;
+        if let Some(dependencies) = self.artifact_dependencies {
+            let full_file = part == ArtifactPart::Full
+                && !matches!(
+                    kind,
+                    ArtifactKind::BundleDir | ArtifactKind::BundleContentDir
+                );
+            if full_file || self.target_policy(target, b"CMP0112") == Some(false) {
+                dependencies.borrow_mut().insert(id);
+            }
+        }
+        Some(path)
     }
 
     fn target_objects(
@@ -111,8 +128,12 @@ impl GenexHost for ModelGenexHost<'_, '_> {
         config: &ConfigId,
         sources: Option<&[u8]>,
     ) -> Option<BString> {
-        self.resolver
-            .target_objects(self.id(target)?, config, sources)
+        let id = self.id(target)?;
+        let objects = self.resolver.target_objects(id, config, sources)?;
+        if let Some(dependencies) = self.artifact_dependencies {
+            dependencies.borrow_mut().insert(id);
+        }
+        Some(objects)
     }
 
     fn link_closure(

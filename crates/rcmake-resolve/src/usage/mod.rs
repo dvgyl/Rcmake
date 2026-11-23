@@ -536,7 +536,7 @@ fn context(target: TargetId, ctx: &EvalContext, traversal: UsageTraversal) -> Ev
     }
 }
 
-fn handle(id: TargetId) -> TargetHandle {
+pub(crate) fn handle(id: TargetId) -> TargetHandle {
     TargetHandle(id.index() as u32)
 }
 

@@ -797,36 +797,197 @@ fn custom_command_outputs_and_byproducts_are_sources_across_directories() -> Tes
         backtrace(7),
         Default::default(),
     );
-    command.outputs.push(entry("generated.cpp"));
-    command.byproducts.push(entry("generated.o"));
+    command.outputs.push(entry("generated-$<CONFIG>.cpp"));
+    command.byproducts.push(entry("generated-$<CONFIG>.o"));
+    command
+        .depends
+        .push(entry("$<IF:$<CONFIG:Debug>,input1;input2,input3>"));
+    command.working_directory = Some("stage-$<CONFIG>".into());
+    command.comment = Some("Generate $<CONFIG> sources".into());
+    command.depfile = Some("deps-$<CONFIG>.d".into());
+    command.command_lines.push(vec![
+        "echo".into(),
+        "$<CONFIG>".into(),
+        "$<0:empty>".into(),
+        "a;b".into(),
+    ]);
     model.add_command(command)?;
     model.add_target(target(
         "generated",
         TargetKind::ObjectLibrary,
-        &["gen/generated.cpp"],
+        &["gen/generated-$<CONFIG>.cpp"],
     ))?;
     model.add_target(target(
         "app",
         TargetKind::Executable,
-        &["$<TARGET_OBJECTS:generated>", "$<1:gen/generated.o>"],
+        &["$<TARGET_OBJECTS:generated>", "gen/generated-$<CONFIG>.o"],
     ))?;
 
-    let result = resolve(&model, &PureHost::default(), &[])?;
+    let result = resolve(&model, &PureHost::default(), &[ConfigId("Debug".into())])?;
     let [generated, app] = result.targets.as_slice() else {
         return Err("Expected two resolved targets.".into());
     };
     assert_eq!(
         generated.compile_units[0].source.value,
-        "/out/gen/generated.cpp"
+        "/out/gen/generated-Debug.cpp"
     );
     let graph = &result.graphs[0];
+    let Some(BuildStep::Custom(recipe)) = graph.steps.first() else {
+        return Err("Expected the source generator.".into());
+    };
+    assert_eq!(recipe.depends, ["gen/input1", "gen/input2"]);
+    assert_eq!(recipe.depfile, Some("gen/deps-Debug.d".into()));
+    assert_eq!(recipe.comment, Some("Generate Debug sources".into()));
+    assert_eq!(
+        recipe.invocations[0].working_dir,
+        Some("/out/gen/stage-Debug".into())
+    );
+    assert_eq!(recipe.invocations[0].argv, ["echo", "Debug", "", "a;b"]);
     for target in &graph.targets {
         assert!(target.steps.iter().any(|&index| matches!(
             &graph.steps[index],
-            BuildStep::Custom(step) if step.outputs == ["gen/generated.cpp"]
+            BuildStep::Custom(step) if step.outputs == ["gen/generated-Debug.cpp"]
         )));
     }
     assert!(app.compile_units.is_empty());
     assert_object_input(graph, "app", &generated.compile_units[0].object)?;
-    assert_object_input(graph, "app", &"gen/generated.o".into())
+    assert_object_input(graph, "app", &"gen/generated-Debug.o".into())
+}
+
+#[test]
+fn transitive_compile_features_raise_the_standard_when_needed() -> TestResult {
+    use rcmake_diag::{PolicyId, PolicyStatus};
+
+    let mut model = project();
+    for (key, value) in [
+        ("CMAKE_CXX_STANDARD_DEFAULT", "17"),
+        ("CMAKE_CXX_EXTENSIONS_DEFAULT", "ON"),
+        ("CMAKE_C_STANDARD_DEFAULT", "90"),
+        ("CMAKE_C_EXTENSIONS_DEFAULT", "ON"),
+    ] {
+        model
+            .dir_mut(DirId::ROOT)
+            .props
+            .set(key.into(), value.into());
+    }
+    let mut features = target("features", TargetKind::InterfaceLibrary, &[]);
+    features.usage.push(
+        UsageField::InterfaceCompileFeatures,
+        entry("cxx_std_98;cxx_std_14;c_static_assert"),
+    );
+    model.add_target(features)?;
+    let mut bridge = target("bridge", TargetKind::InterfaceLibrary, &[]);
+    bridge.usage.interface_link_libraries = Some(vec![link_item("features")]);
+    model.add_target(bridge)?;
+
+    for (name, sources, properties) in [
+        (
+            "explicit_cxx",
+            vec!["main.cpp"],
+            vec![("CXX_STANDARD", "11"), ("CXX_EXTENSIONS", "OFF")],
+        ),
+        ("default_cxx", vec!["main.cpp"], vec![]),
+        (
+            "strict_default_cxx",
+            vec!["main.cpp"],
+            vec![("CXX_EXTENSIONS", "OFF")],
+        ),
+        ("explicit_c", vec!["main.c"], vec![("C_STANDARD", "99")]),
+    ] {
+        let mut app = target(name, TargetKind::Executable, &sources);
+        app.policies
+            .policies
+            .set(PolicyId::new(128), PolicyStatus::New)?;
+        for (key, value) in properties {
+            app.props.set(key.into(), value.into());
+        }
+        app.usage.link_libraries = Some(vec![link_item("bridge")]);
+        model.add_target(app)?;
+    }
+    let host = PureHost::default();
+    host.seed_file(Path::new("/src/main.cpp"), b"")?;
+    host.seed_file(Path::new("/src/main.c"), b"")?;
+    let result = resolve(&model, &host, &[])?;
+    let graph = &result.graphs[0];
+    for (name, expected) in [
+        ("explicit_cxx", Some("-std=c++14")),
+        ("default_cxx", None),
+        ("strict_default_cxx", Some("-std=c++17")),
+        ("explicit_c", Some("-std=gnu11")),
+    ] {
+        let invocation = graph
+            .targets
+            .iter()
+            .find(|target| target.name == name)
+            .and_then(|target| {
+                target
+                    .steps
+                    .iter()
+                    .find_map(|&index| match &graph.steps[index] {
+                        BuildStep::Compile { invocation, .. } => Some(invocation),
+                        _ => None,
+                    })
+            })
+            .ok_or("Expected a compiler invocation.")?;
+        let flags: Vec<_> = invocation
+            .argv
+            .iter()
+            .filter(|arg| arg.starts_with(b"-std="))
+            .cloned()
+            .collect();
+        assert_eq!(
+            flags,
+            expected.into_iter().map(BString::from).collect::<Vec<_>>(),
+            "{name}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn install_file_paths_use_target_artifacts_and_the_install_configuration() -> TestResult {
+    let mut model = project();
+    let mut library = target("png_shared", TargetKind::SharedLibrary, &["png.c"]);
+    library
+        .props
+        .set("LIBRARY_OUTPUT_DIRECTORY_DEBUG".into(), "/out/debug".into());
+    library.props.set(
+        "LIBRARY_OUTPUT_DIRECTORY_RELEASE".into(),
+        "/out/release".into(),
+    );
+    model.add_target(library)?;
+    model.add_install(InstallRule {
+        dir: DirId::ROOT,
+        backtrace: backtrace(15),
+        kind: InstallKind::Files(vec![
+            entry("$<TARGET_LINKER_FILE_DIR:png_shared>/libpng.dylib"),
+            entry("$<$<CONFIG:Debug>:debug.txt>"),
+        ]),
+        options: InstallOptions {
+            destination: Some("lib".into()),
+            ..InstallOptions::default()
+        },
+    });
+    let host = PureHost::default();
+    host.seed_file(Path::new("/src/png.c"), b"")?;
+    let configs = [ConfigId("Debug".into()), ConfigId("Release".into())];
+    let result = resolve(&model, &host, &configs)?;
+    let [debug, release] = result.install.actions.as_slice() else {
+        return Err("Expected one install action per configuration.".into());
+    };
+    for (action, config, paths) in [
+        (
+            debug,
+            "Debug",
+            vec!["/out/debug/libpng.dylib", "/src/debug.txt"],
+        ),
+        (release, "Release", vec!["/out/release/libpng.dylib"]),
+    ] {
+        assert_eq!(action.configurations, [config]);
+        let InstallActionKind::Files { files, .. } = &action.kind else {
+            return Err("Expected a file install action.".into());
+        };
+        assert_eq!(files, &paths);
+    }
+    Ok(())
 }

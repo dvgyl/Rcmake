@@ -12,6 +12,7 @@ use crate::{ResolveError, absolute_path, usage::UsageResolver};
 pub(crate) struct TargetInputs {
     pub(crate) sources: IndexSet<BString>,
     pub(crate) objects: IndexSet<BString>,
+    pub(crate) standard_requirements: IndexMap<BString, &'static [u8]>,
 }
 
 pub(crate) struct SourcePaths<'a> {
@@ -21,23 +22,28 @@ pub(crate) struct SourcePaths<'a> {
 }
 
 impl<'a> SourcePaths<'a> {
-    pub(crate) fn new(model: &ProjectModel, host: &'a dyn Host) -> Self {
-        let generated = model
-            .commands()
-            .flat_map(|(_, command)| {
-                let binary = &model.dir(command.dir).binary_dir;
-                command
-                    .outputs
-                    .iter()
-                    .chain(&command.byproducts)
-                    .map(move |entry| absolute_path(binary, &entry.value))
-            })
-            .collect();
+    pub(crate) fn new(host: &'a dyn Host) -> Self {
         Self {
             host,
-            generated,
+            generated: IndexSet::new(),
             objects: IndexMap::new(),
         }
+    }
+
+    pub(crate) fn index_generated(
+        &mut self,
+        model: &ProjectModel,
+        config: &ConfigId,
+    ) -> Result<(), ResolveError> {
+        self.generated.clear();
+        let mut usage = UsageResolver::new(model);
+        for (_, command) in model.commands() {
+            let (outputs, byproducts) =
+                crate::lower::command_outputs(model, command, config, &mut usage)?;
+            self.generated.extend(outputs);
+            self.generated.extend(byproducts);
+        }
+        Ok(())
     }
 
     pub(crate) fn index_objects(&mut self, model: &ProjectModel, config: &ConfigId) {

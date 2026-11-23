@@ -1,11 +1,13 @@
 //! Compile flags and compiler rule expansion.
 
+use indexmap::IndexSet;
 use rcmake_base::{BString, list, path_lex::Lexical, truth};
 use rcmake_genex::ConfigId;
 use rcmake_model::{ProjectModel, Target, TargetKind};
 
 use super::artifacts::is_darwin;
 use super::shell::{command, join_words, quote, rule_invocations};
+use super::standard::standard_flag;
 use super::{definition, expand_rule, join, object_path, target_property};
 use crate::{ArtifactSet, BuildStep, CompileGroup, CompileUnit, ResolveError};
 
@@ -88,52 +90,16 @@ fn apple_flags_for_language(
     flags
 }
 
-fn standard_flag(model: &ProjectModel, target: &Target, language: &[u8]) -> Option<BString> {
-    let standard = target_property(model, target, &[language, b"_STANDARD"].concat())?;
-    if standard.is_empty() || !standard.iter().all(u8::is_ascii_digit) {
-        return None;
-    }
-    let extensions = target_property(model, target, &[language, b"_EXTENSIONS"].concat())
-        .or_else(|| {
-            definition(
-                model,
-                target.dir,
-                &[b"CMAKE_", language, b"_EXTENSIONS_DEFAULT"].concat(),
-            )
-        })
-        .is_none_or(|v| truth::is_on(v));
-    let option: &[u8] = if extensions {
-        b"_EXTENSION_COMPILE_OPTION"
-    } else {
-        b"_STANDARD_COMPILE_OPTION"
-    };
-    let key = [b"CMAKE_", language, b"_", standard, option].concat();
-    if let Some(flag) = definition(model, target.dir, &key) {
-        return Some(join_words(
-            list::split(flag, list::Empty::Drop)
-                .into_iter()
-                .map(|flag| quote(&flag)),
-        ));
-    }
-    let dialect: &[u8] = match (language, extensions) {
-        (b"CXX" | b"OBJCXX", true) => b"gnu++",
-        (b"CXX" | b"OBJCXX", false) => b"c++",
-        (b"C" | b"OBJC", true) => b"gnu",
-        (b"C" | b"OBJC", false) => b"c",
-        _ => return None,
-    };
-    Some([b"-std=", dialect, standard].concat().into())
-}
-
 fn compile_flags(
     model: &ProjectModel,
     target: &Target,
     config: &ConfigId,
     group: &CompileGroup,
+    required_standard: Option<&[u8]>,
 ) -> Vec<BString> {
     let language = group.language.as_slice();
     let mut flags = language_flags(model, target, config, language);
-    flags.extend(standard_flag(model, target, language));
+    flags.extend(standard_flag(model, target, language, required_standard));
     flags.extend(apple_flags_for_language(
         model,
         target,
@@ -185,15 +151,25 @@ fn compile_flags(
 
 fn includes(model: &ProjectModel, target: &Target, group: &CompileGroup) -> BString {
     let darwin = is_darwin(model, target.dir);
-    join_words(group.includes.iter().map(|include| {
-        let path = include.path.value.as_slice();
-        let root = Lexical::new(path);
-        let root_len = root.root_name().len() + root.root_directory().len();
-        let end = path
-            .iter()
-            .rposition(|&byte| byte != b'/')
-            .map_or(0, |i| i + 1);
-        let path = path.get(..end.max(root_len)).unwrap_or(path);
+    let key = [
+        b"CMAKE_",
+        group.language.as_slice(),
+        b"_IMPLICIT_INCLUDE_DIRECTORIES",
+    ]
+    .concat();
+    let implicit: IndexSet<_> = definition(model, target.dir, &key)
+        .into_iter()
+        .flat_map(|value| list::split(value, list::Empty::Drop))
+        .map(|path| Lexical::new(&path).normalize())
+        .map(|path| BString::from(without_trailing_slashes(&path)))
+        .collect();
+    join_words(group.includes.iter().filter_map(|include| {
+        let path = without_trailing_slashes(&include.path.value);
+        if !implicit.is_empty()
+            && implicit.contains(without_trailing_slashes(&Lexical::new(path).normalize()))
+        {
+            return None;
+        }
         if darwin
             && let Some(end) = path
                 .split(|&b| b == b'/')
@@ -202,17 +178,27 @@ fn includes(model: &ProjectModel, target: &Target, group: &CompileGroup) -> BStr
             let framework = path.windows(end.len()).position(|part| part == end);
             if let Some(index) = framework {
                 let dir = path.get(..index).unwrap_or_default();
-                return quote(
+                return Some(quote(
                     &[b"-F".as_slice(), if dir.is_empty() { b"." } else { dir }].concat(),
-                );
+                ));
             }
         }
-        if include.system {
+        Some(if include.system {
             join_words(["-isystem".into(), quote(path)])
         } else {
             quote(&[b"-I", path].concat())
-        }
+        })
     }))
+}
+
+fn without_trailing_slashes(path: &[u8]) -> &[u8] {
+    let root = Lexical::new(path);
+    let root_len = root.root_name().len() + root.root_directory().len();
+    let end = path
+        .iter()
+        .rposition(|&byte| byte != b'/')
+        .map_or(0, |i| i + 1);
+    path.get(..end.max(root_len)).unwrap_or(path)
 }
 
 pub(super) fn compile(
@@ -222,9 +208,10 @@ pub(super) fn compile(
     artifacts: &ArtifactSet,
     unit: &CompileUnit,
     group: &CompileGroup,
+    required_standard: Option<&[u8]>,
 ) -> Result<BuildStep, ResolveError> {
     let language = group.language.as_slice();
-    let mut flags = compile_flags(model, target, config, group);
+    let mut flags = compile_flags(model, target, config, group, required_standard);
     let mut defines: Vec<_> = group
         .defines
         .iter()

@@ -1,12 +1,16 @@
 //! Install actions and configure metadata.
 
+use std::convert::Infallible;
+
 use indexmap::{IndexMap, IndexSet};
 use rcmake_base::{BString, list, path_lex::Lexical};
-use rcmake_model::{DirId, InstallKind, InstallOptions, InstallRule, ProjectModel, TargetKind};
+use rcmake_genex::{ConfigId, EvalContext, EvalSite, evaluate, parse};
+use rcmake_model::{BT, DirId, InstallKind, InstallOptions, InstallRule, ProjectModel, TargetKind};
 
 use super::{compute_artifacts, definition, join};
 use crate::{
-    ConfigureMetadata, InstallAction, InstallActionKind, InstallManifest, ResolvedTarget, Toolchain,
+    ConfigureMetadata, InstallAction, InstallActionKind, InstallManifest, ResolveError,
+    ResolvedTarget, Toolchain, usage::UsageResolver,
 };
 
 /// Collect listfiles and compiler data from the model.
@@ -84,6 +88,87 @@ fn compiler_language(key: &[u8]) -> Option<BString> {
 /// same order.
 #[must_use]
 pub fn lower_install_manifest(model: &ProjectModel, targets: &[ResolvedTarget]) -> InstallManifest {
+    match lower_install_rules(model, targets, |rule, files| {
+        Ok::<_, Infallible>(vec![(
+            rule.options.clone(),
+            literal_files(model, rule, files),
+        )])
+    }) {
+        Ok(manifest) => manifest,
+        Err(never) => match never {},
+    }
+}
+
+pub(crate) fn lower_install_manifest_with_configs(
+    model: &ProjectModel,
+    targets: &[ResolvedTarget],
+    configs: &[ConfigId],
+) -> Result<InstallManifest, ResolveError> {
+    let mut usage = UsageResolver::new(model);
+    lower_install_rules(model, targets, |rule, files| {
+        if !files
+            .iter()
+            .any(|path| path.value.windows(2).any(|pair| pair == b"$<"))
+        {
+            return Ok(vec![(
+                rule.options.clone(),
+                literal_files(model, rule, files),
+            )]);
+        }
+        let source = &model.dir(rule.dir).source_dir;
+        let mut host = usage.host(rule.dir);
+        let mut groups = Vec::new();
+        for config in configs {
+            let mut options = rule.options.clone();
+            if !options.configurations.is_empty()
+                && !options
+                    .configurations
+                    .iter()
+                    .any(|name| config.matches(name))
+            {
+                continue;
+            }
+            if configs.len() > 1 {
+                options.configurations = vec![config.0.clone()];
+            }
+            let mut paths = Vec::new();
+            for file in files {
+                let context = EvalContext {
+                    config: config.clone(),
+                    site: EvalSite {
+                        backtrace: file.backtrace.clone(),
+                        property: None,
+                    },
+                    ..EvalContext::default()
+                };
+                let (value, _) = evaluate(&parse(&file.value)?, &context, &mut host)?;
+                paths.extend(
+                    list::split(&value, list::Empty::Drop)
+                        .into_iter()
+                        .map(|path| join(source, &path)),
+                );
+            }
+            if !paths.is_empty() {
+                groups.push((options, paths));
+            }
+        }
+        Ok(groups)
+    })
+}
+
+fn literal_files(model: &ProjectModel, rule: &InstallRule, files: &[BT<BString>]) -> Vec<BString> {
+    let source = &model.dir(rule.dir).source_dir;
+    files.iter().map(|file| join(source, &file.value)).collect()
+}
+
+fn lower_install_rules<E>(
+    model: &ProjectModel,
+    targets: &[ResolvedTarget],
+    mut files_for_configs: impl FnMut(
+        &InstallRule,
+        &[BT<BString>],
+    ) -> Result<Vec<(InstallOptions, Vec<BString>)>, E>,
+) -> Result<InstallManifest, E> {
     let mut manifest = InstallManifest::default();
     let mut export_plan = 0;
     for (index, rule) in model.installs.iter().enumerate() {
@@ -183,11 +268,13 @@ pub fn lower_install_manifest(model: &ProjectModel, targets: &[ResolvedTarget]) 
                 } else {
                     b"FILE"
                 };
-                file_action(
-                    file_type,
-                    files.iter().map(|f| join(source, &f.value)).collect(),
-                    options,
-                )
+                for (options, files) in files_for_configs(rule, files)? {
+                    let kind = file_action(file_type, files, &options);
+                    manifest
+                        .actions
+                        .push(action(model, rule, &options, b"", kind));
+                }
+                continue;
             }
             InstallKind::Directory(dirs) => InstallActionKind::Directory {
                 dirs: dirs.iter().map(|d| join(source, &d.value)).collect(),
@@ -205,7 +292,7 @@ pub fn lower_install_manifest(model: &ProjectModel, targets: &[ResolvedTarget]) 
             .actions
             .push(action(model, rule, options, b"", kind));
     }
-    manifest
+    Ok(manifest)
 }
 
 fn action(

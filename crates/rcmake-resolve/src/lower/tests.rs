@@ -683,10 +683,7 @@ fn custom_commands_attach_to_consumers_in_dependency_order() -> TestResult {
         BuildStep::Custom(input),
         BuildStep::Custom(generated),
         BuildStep::Compile { .. },
-        BuildStep::Custom(pre_build),
-        BuildStep::Custom(pre_link),
-        BuildStep::Link { .. },
-        BuildStep::Custom(post_build),
+        BuildStep::Link { invocations, .. },
     ] = steps.as_slice()
     else {
         return Err("Expected custom commands, compile, and link in dependency order.".into());
@@ -711,16 +708,13 @@ fn custom_commands_attach_to_consumers_in_dependency_order() -> TestResult {
         super::shell::simple_args(&invocation.shell),
         Some(invocation.argv.clone())
     );
-    for (step, label) in [
-        (pre_build, "pre-build"),
-        (pre_link, "pre-link"),
-        (post_build, "post-build"),
-    ] {
-        assert_eq!(
-            step.invocations.first().and_then(|call| call.argv.last()),
-            Some(&BString::from(label))
-        );
-    }
+    let [pre_build, pre_link, linker, post_build] = invocations.as_slice() else {
+        return Err("Expected build events around the linker invocation.".into());
+    };
+    assert_eq!(pre_build.argv, ["echo", "pre-build"]);
+    assert_eq!(pre_link.argv, ["echo", "pre-link"]);
+    assert!(linker.argv.iter().any(|arg| arg == "-o"));
+    assert_eq!(post_build.argv, ["echo", "post-build"]);
     Ok(())
 }
 
@@ -941,5 +935,180 @@ fn installs_public_headers_with_their_own_options() -> TestResult {
         matches!(&explicit.kind, InstallActionKind::Files { permissions, .. }
         if permissions == &["OWNER_READ"])
     );
+    Ok(())
+}
+
+#[test]
+fn target_events_evaluate_artifacts_and_run_after_linker_symlinks() -> TestResult {
+    let mut model = fixture("Darwin");
+    let config = ConfigId("Release".into());
+    let mut library = raw_target("png_shared", TargetKind::SharedLibrary);
+    library.props.set("OUTPUT_NAME".into(), "png16".into());
+    library.props.set("VERSION".into(), "16.50.0".into());
+    library.props.set("SOVERSION".into(), "16".into());
+    library.props.set("MARKER".into(), "library context".into());
+    let library = resolve_target(&mut model, library, &config, &["png.c"])?;
+    let mut pre = CustomCommand::new(
+        DirId::ROOT,
+        CustomCommandKind::TargetEvent {
+            target: library.id,
+            event: TargetEvent::PreLink,
+        },
+        Default::default(),
+        Default::default(),
+    );
+    pre.depends.push(bt("input-$<CONFIG>.txt"));
+    pre.command_lines
+        .push(vec!["echo".into(), "$<TARGET_PROPERTY:MARKER>".into()]);
+    model.add_command(pre)?;
+    let mut post = CustomCommand::new(
+        DirId::ROOT,
+        CustomCommandKind::TargetEvent {
+            target: library.id,
+            event: TargetEvent::PostBuild,
+        },
+        Default::default(),
+        Default::default(),
+    );
+    post.command_lines.push(
+        [
+            "rcmake",
+            "-E",
+            "create_symlink",
+            "$<TARGET_LINKER_FILE_NAME:png_shared>",
+            "$<TARGET_LINKER_FILE_DIR:png_shared>/libpng.dylib",
+        ]
+        .map(BString::from)
+        .to_vec(),
+    );
+    post.byproducts
+        .push(bt("$<$<CONFIG:Release>:libpng.dylib>"));
+    model.add_command(post)?;
+
+    let graph = lower(&model, &[library], &config)?;
+    let [BuildStep::Compile { .. }, BuildStep::Custom(recipe)] = graph.steps.as_slice() else {
+        return Err("Expected one compile step and one link recipe with byproducts.".into());
+    };
+    assert_eq!(recipe.outputs, ["libpng16.16.50.0.dylib"]);
+    assert!(recipe.byproducts.contains(&"libpng.dylib".into()));
+    assert!(recipe.byproducts.contains(&"libpng16.dylib".into()));
+    assert!(recipe.depends.contains(&"input-Release.txt".into()));
+    let [pre, linker, symlinks, post] = recipe.invocations.as_slice() else {
+        return Err(
+            "Expected the target events before linking and after the linker symlinks.".into(),
+        );
+    };
+    assert_eq!(pre.argv, ["echo", "library context"]);
+    assert!(linker.argv.iter().any(|arg| arg == "-o"));
+    assert_eq!(symlinks.argv.get(2), Some(&"cmake_symlink_library".into()));
+    assert_eq!(
+        post.argv,
+        [
+            "rcmake",
+            "-E",
+            "create_symlink",
+            "libpng16.dylib",
+            "/build/libpng.dylib"
+        ]
+    );
+    Ok(())
+}
+
+#[test]
+fn utility_events_share_one_recipe_in_event_order() -> TestResult {
+    let mut model = fixture("Linux");
+    let config = ConfigId("Release".into());
+    let utility = resolve_target(
+        &mut model,
+        raw_target("assets", TargetKind::Utility),
+        &config,
+        &[],
+    )?;
+    let command =
+        |kind| CustomCommand::new(DirId::ROOT, kind, Default::default(), Default::default());
+    let event = |event| CustomCommandKind::TargetEvent {
+        target: utility.id,
+        event,
+    };
+    let mut post = command(event(TargetEvent::PostBuild));
+    post.byproducts.push(bt("post-$<CONFIG>.txt"));
+    post.command_lines.push(vec!["echo".into(), "post".into()]);
+    model.add_command(post)?;
+    let mut main = command(CustomCommandKind::Utility(utility.id));
+    main.command_expand_lists = true;
+    main.command_lines.push(
+        ["$<0:program>", "echo", "a;;b;", "$<0:arg>", "", "last"]
+            .map(BString::from)
+            .to_vec(),
+    );
+    model.add_command(main)?;
+    let mut pre = command(event(TargetEvent::PreBuild));
+    pre.command_lines
+        .push(vec!["$<0:program>".into(), "skip".into()]);
+    pre.command_lines.push(vec!["echo".into(), "pre".into()]);
+    model.add_command(pre)?;
+    let mut pre_link = command(event(TargetEvent::PreLink));
+    pre_link
+        .command_lines
+        .push(vec!["echo".into(), "pre-link".into()]);
+    model.add_command(pre_link)?;
+    let graph = lower(&model, &[utility], &config)?;
+    let [BuildStep::Custom(recipe)] = graph.steps.as_slice() else {
+        return Err("Expected one recipe for the utility target.".into());
+    };
+    let [main, pre, post] = recipe.invocations.as_slice() else {
+        return Err("Expected three commands after generator expression evaluation.".into());
+    };
+    assert_eq!(pre.argv, ["echo", "pre"]);
+    assert_eq!(main.argv, ["echo", "a", "b", "last"]);
+    assert_eq!(post.argv, ["echo", "post"]);
+    assert_eq!(recipe.byproducts, ["post-Release.txt"]);
+    Ok(())
+}
+
+#[test]
+fn compile_excludes_normalized_implicit_include_paths() -> TestResult {
+    let mut model = fixture("Darwin");
+    let config = ConfigId::default();
+    model.dir_mut(DirId::ROOT).props.set(
+        "CMAKE_C_IMPLICIT_INCLUDE_DIRECTORIES".into(),
+        "/sdk/usr/include;/toolchain/./include/".into(),
+    );
+    var(
+        &mut model,
+        "CMAKE_CXX_IMPLICIT_INCLUDE_DIRECTORIES",
+        "/keep",
+    );
+    let mut app = resolve_target(
+        &mut model,
+        raw_target("app", TargetKind::Executable),
+        &config,
+        &["main.c"],
+    )?;
+    app.compile_groups[0].includes = [
+        ("/sdk/usr/lib/../include/", true),
+        ("/toolchain/include", false),
+        ("/sdk/usr/include/addon", true),
+        ("/keep/", false),
+    ]
+    .into_iter()
+    .map(|(path, system)| InterfaceInclude {
+        path: bt(path),
+        system,
+    })
+    .collect();
+    let graph = lower(&model, &[app], &config)?;
+    let Some(BuildStep::Compile { invocation, .. }) = graph.steps.first() else {
+        return Err("Expected a C compiler invocation.".into());
+    };
+    assert!(
+        invocation
+            .argv
+            .windows(2)
+            .any(|pair| pair == ["-isystem", "/sdk/usr/include/addon"])
+    );
+    assert!(invocation.argv.contains(&"-I/keep".into()));
+    assert!(!invocation.argv.contains(&"/sdk/usr/lib/../include".into()));
+    assert!(!invocation.argv.contains(&"-I/toolchain/include".into()));
     Ok(())
 }
