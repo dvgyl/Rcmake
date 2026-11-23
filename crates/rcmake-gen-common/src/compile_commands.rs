@@ -33,7 +33,7 @@ pub fn render(graph: &BuildGraph, build_dir: &[u8]) -> Result<BString, GenError>
         out.extend_from_slice(b"{\n  \"directory\": ");
         json_string(&mut out, directory);
         out.extend_from_slice(b",\n  \"command\": ");
-        json_string(&mut out, &invocation.shell);
+        json_string(&mut out, &without_depfile_flags(&invocation.shell));
         out.extend_from_slice(b",\n  \"file\": ");
         json_string(&mut out, source);
         out.extend_from_slice(b",\n  \"output\": ");
@@ -45,6 +45,58 @@ pub fn render(graph: &BuildGraph, build_dir: &[u8]) -> Result<BString, GenError>
     }
     out.push(b']');
     Ok(out)
+}
+
+fn without_depfile_flags(shell: &[u8]) -> BString {
+    let mut command = BString::default();
+    let mut rest = shell;
+    let mut skip_value = false;
+    let mut changed = false;
+    while !rest.is_empty() {
+        let (word, following) = rest
+            .split_at_checked(shell_word_len(rest))
+            .unwrap_or((rest, b""));
+        if matches!(word, b"-MD" | b"-MMD" | b"-MT" | b"-MF") || skip_value {
+            skip_value = !skip_value && matches!(word, b"-MT" | b"-MF");
+            changed = true;
+            let spaces = following
+                .iter()
+                .take_while(|byte| matches!(byte, b' ' | b'\t'))
+                .count();
+            rest = following.get(spaces..).unwrap_or_default();
+        } else {
+            command.extend_from_slice(word);
+            rest = following;
+        }
+    }
+    if changed {
+        command.as_slice().trim_ascii_end().into()
+    } else {
+        shell.into()
+    }
+}
+
+// Keep the original shell quoting, including quoted paths that contain spaces.
+fn shell_word_len(input: &[u8]) -> usize {
+    let separator = |byte: u8| byte.is_ascii_whitespace() || b";|&()<>".contains(&byte);
+    if input.first().copied().is_some_and(separator) {
+        return 1;
+    }
+    let mut quote = None;
+    let mut bytes = input.iter().copied().enumerate();
+    while let Some((index, byte)) = bytes.next() {
+        match (quote, byte) {
+            (Some(b'\''), b'\'') | (Some(b'"'), b'"') => quote = None,
+            (Some(b'\''), _) => {}
+            (_, b'\\') => {
+                bytes.next();
+            }
+            (None, b'\'' | b'"') => quote = Some(byte),
+            (None, byte) if separator(byte) => return index,
+            _ => {}
+        }
+    }
+    input.len()
 }
 
 /// Write the compile database to an existing build directory.
@@ -86,5 +138,36 @@ fn json_escaped_content(out: &mut BString, value: &[u8]) {
         .and_then(|s| s.strip_suffix(b"\""))
     {
         out.extend_from_slice(content);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rcmake_resolve::Invocation;
+
+    use super::*;
+
+    #[test]
+    fn omits_dependency_flags_from_the_database_command() {
+        for flag in ["-MD", "-MMD"] {
+            let graph = BuildGraph {
+                steps: vec![BuildStep::Compile {
+                    object: "obj file.o".into(),
+                    source: "source file.c".into(),
+                    depfile: Some("obj file.o.d".into()),
+                    invocation: Invocation {
+                        shell: format!(
+                            "cc '-DVARIABLE=-MD -MF' {flag} -MT 'obj file.o' -MF \"obj file.o.d\" -o 'obj file.o' -c 'source file.c'"
+                        ).into(),
+                        ..Invocation::default()
+                    },
+                }],
+                ..BuildGraph::default()
+            };
+            let output = render(&graph, b"/work").unwrap().to_string();
+            assert!(output.contains(
+                r#""command": "cc '-DVARIABLE=-MD -MF' -o 'obj file.o' -c 'source file.c'""#
+            ));
+        }
     }
 }

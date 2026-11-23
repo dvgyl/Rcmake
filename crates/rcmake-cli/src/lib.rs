@@ -246,6 +246,9 @@ fn new_interp(argv: &[BString], opts: &Options, mode: RunMode, host: Arc<dyn Hos
         script_args: argv.to_vec(),
     };
     let mut interp = Interp::new(cfg, rcmake_commands::register_all);
+    if opts.debug_trycompile {
+        interp.cx().set_var(b"CMAKE_DEBUG_TRY_COMPILE", "ON".into());
+    }
     interp.set_log_level(opts.log_level);
     interp.set_log_context(opts.log_context);
     interp.set_trace_config(opts.trace.clone());

@@ -265,7 +265,10 @@ pub(crate) fn apply(host: &dyn Host, src: &Path, opts: &mut Options) -> Result<A
             options::out(host, "Running with debug output on.\n");
         }
         if debug.try_compile == Some(true) {
-            options::out(host, "debug trycompile on\n");
+            if !opts.debug_trycompile {
+                options::out(host, "debug trycompile on\n");
+            }
+            opts.debug_trycompile = true;
         }
         if debug.find == Some(true) {
             opts.cache_edits.insert(

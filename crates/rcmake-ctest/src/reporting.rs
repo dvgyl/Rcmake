@@ -148,8 +148,10 @@ impl<'a> Report<'a> {
             skipped |= matches!(status, Status::Disabled | Status::Skipped);
         }
         if counted == 0 {
-            self.host
-                .write_out(Stream::Stderr, b"No tests were found!!!\n");
+            if !self.options.ignore_no_tests {
+                self.host
+                    .write_out(Stream::Stderr, b"No tests were found!!!\n");
+            }
             return;
         }
         if failed == 0 {

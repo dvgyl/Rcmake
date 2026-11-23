@@ -15,6 +15,98 @@ fn invoke(host: &Arc<PureHost>, args: &[&str]) -> i32 {
 }
 
 #[test]
+fn configure_stages_install_export_separately_from_build_export() {
+    let host = Arc::new(PureHost::default());
+    host.seed_file(
+        Path::new("/work/CMakeLists.txt"),
+        br#"cmake_minimum_required(VERSION 3.10)
+project(example NONE)
+add_library(headers INTERFACE)
+install(TARGETS headers EXPORT example)
+install(EXPORT example DESTINATION lib/cmake/example FILE targets.cmake)
+export(EXPORT example FILE targets.cmake)
+file(GENERATE OUTPUT "config-$<CONFIG>.txt" CONTENT "$<TARGET_PROPERTY:TYPE>" TARGET headers)
+"#,
+    )
+    .unwrap();
+    assert_eq!(
+        invoke(
+            &host,
+            &[
+                "cmake",
+                "-S",
+                ".",
+                "-B",
+                "out",
+                "-G",
+                "Ninja",
+                "-DCMAKE_INSTALL_PREFIX=/packages/example",
+                "-DCMAKE_BUILD_TYPE=Release",
+            ]
+        ),
+        0,
+        "{}",
+        host.stream_bytes(Stream::Stderr)
+    );
+    let read = |file| {
+        let file = Path::new("/work/out").join(file);
+        host.read(&file, ReadRange::All { limit: 16384 }).unwrap()
+    };
+    let script = BString::from(read("cmake_install.cmake")).to_string();
+    let staged_path = "CMakeFiles/Export/0/targets.cmake";
+    assert!(script.contains("\"/work/out/CMakeFiles/Export/0/targets.cmake\""));
+    assert!(script.contains("set(CMAKE_INSTALL_PREFIX \"/packages/example\")"));
+    assert!(script.contains("set(CMAKE_INSTALL_CONFIG_NAME \"Release\")"));
+    let installed = BString::from(read(staged_path)).to_string();
+    assert!(installed.contains("get_filename_component(_IMPORT_PREFIX"));
+    let build = BString::from(read("targets.cmake")).to_string();
+    assert!(!build.contains("get_filename_component(_IMPORT_PREFIX"));
+    assert_eq!(read("config-Release.txt"), b"INTERFACE_LIBRARY");
+}
+
+#[test]
+fn configure_enables_debug_trycompile_for_flag_and_preset() {
+    for args in [
+        vec![
+            "cmake",
+            "-S",
+            ".",
+            "-B",
+            "out",
+            "-G",
+            "Ninja",
+            "--debug-trycompile",
+        ],
+        vec!["cmake", "--preset=debug"],
+    ] {
+        let host = Arc::new(PureHost::default());
+        host.seed_file(
+            Path::new("/work/CMakeLists.txt"),
+            br#"cmake_minimum_required(VERSION 3.10)
+project(example NONE)
+if(NOT CMAKE_DEBUG_TRY_COMPILE)
+  message(FATAL_ERROR "Expected CMAKE_DEBUG_TRY_COMPILE=ON.")
+endif()
+"#,
+        )
+        .unwrap();
+        host.seed_file(
+            Path::new("/work/CMakePresets.json"),
+            br#"{"version": 6, "configurePresets": [
+              {"name": "debug", "generator": "Ninja", "binaryDir": "out", "debug": {"tryCompile": true}}
+            ]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            invoke(&host, &args),
+            0,
+            "{}",
+            host.stream_bytes(Stream::Stderr)
+        );
+    }
+}
+
+#[test]
 fn build_ninja_multi_config_streams_output_and_cleans_first() {
     let host = Arc::new(PureHost::default());
     host.seed_file(

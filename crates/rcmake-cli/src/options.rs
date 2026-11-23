@@ -30,6 +30,7 @@ pub(crate) struct Options {
     pub toolset: Option<BString>,
     pub log_level: Option<LogLevel>,
     pub log_context: bool,
+    pub debug_trycompile: bool,
     pub sarif: Option<PathBuf>,
     pub script: Option<PathBuf>,
     pub preset: Option<BString>,
@@ -232,7 +233,10 @@ fn parse_args(args: &[BString], host: &dyn Host) -> Result<Option<Options>, Stri
                     out(host, "Find problems with variable usage in system files.\n")
                 }
                 b"--debug-output" => out(host, "Running with debug output on.\n"),
-                b"--debug-trycompile" => out(host, "debug trycompile on\n"),
+                b"--debug-trycompile" => {
+                    out(host, "debug trycompile on\n");
+                    opts.debug_trycompile = true;
+                }
                 b"--debug-find" => {
                     out(
                         host,

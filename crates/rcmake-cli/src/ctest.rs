@@ -4,7 +4,9 @@ use std::sync::Arc;
 use rcmake_base::BString;
 use rcmake_ctest::{CtestError, CtestOptions, CtestOutcome};
 use rcmake_host::{Host, Stream};
-use rcmake_presets::{PresetKind, PresetSettings, ShowOnly, TestJobs, TestSettings, TestVerbosity};
+use rcmake_presets::{
+    NoTestsAction, PresetKind, PresetSettings, ShowOnly, TestJobs, TestSettings, TestVerbosity,
+};
 
 use crate::options::{split_flag, take_value};
 use crate::{presets, resolve_cli_path};
@@ -20,6 +22,7 @@ struct Options {
     verbosity: Option<TestVerbosity>,
     quiet: bool,
     show_only: Option<ShowOnly>,
+    no_tests: Option<NoTestsAction>,
     timeout: Option<f64>,
     preset: Option<BString>,
     presets_file: Option<PathBuf>,
@@ -62,6 +65,19 @@ fn parse(args: &[BString], host: &dyn Host) -> Result<Options, String> {
             }
             b"-Q" | b"--quiet" if inline.is_none() => opts.quiet = true,
             b"--output-on-failure" if inline.is_none() => opts.output_on_failure = true,
+            b"--no-tests" => {
+                let action = value()?;
+                opts.no_tests = Some(match action {
+                    b"error" => NoTestsAction::Error,
+                    b"ignore" => NoTestsAction::Ignore,
+                    _ => {
+                        return Err(format!(
+                            "'--no-tests=' given unknown value '{}'",
+                            String::from_utf8_lossy(action)
+                        ));
+                    }
+                });
+            }
             b"-N" | b"--show-only" => {
                 let mode = inline.unwrap_or(b"human");
                 opts.show_only = Some(match mode {
@@ -148,6 +164,7 @@ impl Options {
             });
             self.timeout = self.timeout.or(execution.timeout.map(f64::from));
             self.show_only = self.show_only.or(execution.show_only);
+            self.no_tests = self.no_tests.or(execution.no_tests_action);
         }
     }
 }
@@ -215,6 +232,8 @@ fn run_with(
         ),
         quiet: opts.quiet,
         show_only: opts.show_only.is_some(),
+        error_on_no_tests: opts.no_tests == Some(NoTestsAction::Error),
+        ignore_no_tests: opts.no_tests == Some(NoTestsAction::Ignore),
         timeout: opts.timeout.map(std::time::Duration::from_secs_f64),
         ..CtestOptions::default()
     };
@@ -257,6 +276,20 @@ mod tests {
         assert!(options.quiet);
         assert_eq!(options.show_only, Some(ShowOnly::JsonV1));
         assert_eq!(options.timeout, Some(1.5));
+    }
+
+    #[test]
+    fn applies_no_tests_action() {
+        for (action, expected) in [("error", 8), ("ignore", 0), ("action", 1)] {
+            let host = Arc::new(PureHost::default());
+            assert_eq!(
+                run(&[format!("--no-tests={action}").into()], host.clone()),
+                expected
+            );
+            if action == "ignore" {
+                assert!(host.stream_bytes(Stream::Stderr).is_empty());
+            }
+        }
     }
 
     #[test]

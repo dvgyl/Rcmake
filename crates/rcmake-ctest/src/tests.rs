@@ -456,6 +456,11 @@ fn lists_tests_without_executing_and_handles_an_empty_selection() -> TestResult 
             .to_string()
             .contains("No tests were found!!!")
     );
+    let options = CtestOptions {
+        error_on_no_tests: true,
+        ..options
+    };
+    assert_eq!(run(host.clone(), &options)?.exit_code, 8);
     assert!(
         requests
             .lock()

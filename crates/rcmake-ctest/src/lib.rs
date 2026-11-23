@@ -43,6 +43,10 @@ pub struct CtestOptions {
     pub quiet: bool,
     /// List selected tests without starting them (`-N`, `--show-only`).
     pub show_only: bool,
+    /// Return exit code 8 when there are no tests to run.
+    pub error_on_no_tests: bool,
+    /// Suppress the diagnostic when there are no tests to run.
+    pub ignore_no_tests: bool,
     /// Default timeout per test (`--timeout`).
     pub timeout: Option<Duration>,
     /// Stop starting regular tests after a failure (`--stop-on-failure`).
@@ -63,6 +67,8 @@ impl Default for CtestOptions {
             verbose: false,
             quiet: false,
             show_only: false,
+            error_on_no_tests: false,
+            ignore_no_tests: false,
             timeout: None,
             stop_on_failure: false,
         }
@@ -140,6 +146,10 @@ pub fn run(host: Arc<dyn Host>, options: &CtestOptions) -> Result<CtestOutcome, 
     let started = host.monotonic();
     let results = schedule::run(host.as_ref(), options, &plan, &report);
     report.summary(&plan, &results, host.monotonic().saturating_sub(started));
+    let no_tests = results
+        .iter()
+        .flatten()
+        .all(|status| *status == execution::Status::Disabled);
     let mut outcome = CtestOutcome::default();
     for (test, result) in plan.tests.iter().zip(results) {
         match result {
@@ -148,7 +158,7 @@ pub fn run(host: Arc<dyn Host>, options: &CtestOptions) -> Result<CtestOutcome, 
             _ => {}
         }
     }
-    if !outcome.failed.is_empty() {
+    if !outcome.failed.is_empty() || (options.error_on_no_tests && no_tests) {
         outcome.exit_code = 8;
     }
     Ok(outcome)
