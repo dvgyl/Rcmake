@@ -254,7 +254,11 @@ fn validate_version(package: &CpsPackage) -> Result<(), CpsError> {
                 .all(|part| !part.is_empty() && part.iter().all(u8::is_ascii_digit))
             {
                 return Err(CpsError::Invalid(
-                    format!("Version {version:?} does not conform to the simple schema.").into(),
+                    format!(
+                        r#"Package "{}" version "{version}" does not conform to the "simple" schema."#,
+                        package.name,
+                    )
+                    .into(),
                 ));
             }
         }

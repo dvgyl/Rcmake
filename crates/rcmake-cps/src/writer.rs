@@ -142,7 +142,9 @@ fn requirement(requirement: &CpsRequirement) -> Value {
     let mut out = Object::new();
     list(&mut out, "components", &requirement.components);
     list(&mut out, "hints", &requirement.hints);
-    string(&mut out, "version", requirement.version.as_ref());
+    if let Some(version) = &requirement.version {
+        out.insert("version".into(), Value::string(version.clone()));
+    }
     if !requirement.domains.is_empty() {
         out.insert(
             "extensions".into(),

@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
 };
 
@@ -7,7 +7,7 @@ use rcmake_base::{BString, hash::HashAlgo, list, path_lex::Lexical};
 use rcmake_cps::{naming, writer};
 use rcmake_genex::{EvalContext, PreprocessMode};
 use rcmake_host::{
-    Host,
+    Host, Stream,
     path::{from_native, to_native},
 };
 use rcmake_model::{
@@ -25,7 +25,11 @@ use super::{
 };
 use crate::{
     GenError, cpack_properties,
-    export::{cps, output_error, write_output},
+    export::{
+        cps, output_error,
+        provenance::{author_warning, generation_error},
+        write_output,
+    },
     genex, quote, sbom,
 };
 
@@ -55,13 +59,15 @@ pub fn write_supplementary_outputs(
         let directory = &model.dir(export.dir).binary_dir;
         match &export.kind {
             ExportKind::PackageInfo(spec) => {
-                let files = cps::render_for_tree(model, result, spec, None)?;
+                outputs.cps_schema_warning(model, spec, &export.backtrace);
+                let files = cps::render_for_tree(model, result, spec, None, &mut outputs.warnings)?;
                 let directory =
                     naming::build_directory(&spec.package, directory, spec.lower_case_file)
                         .map_err(cps::cps_error)?;
                 outputs.add(
                     to_native(&directory).join(to_native(&files.file_name)),
-                    writer::write_build_package(&files.package).map_err(cps::cps_error)?,
+                    writer::write_build_package(&files.package)
+                        .map_err(|error| generation_error([error.to_string().into()]))?,
                 )?;
             }
             ExportKind::Sbom(spec) => {
@@ -78,13 +84,16 @@ pub fn write_supplementary_outputs(
         let directory = to_native(&model.dir(rule.dir).binary_dir);
         match &rule.kind {
             InstallKind::PackageInfo(spec) => {
-                let files = cps::render_for_tree(model, result, spec, Some(rule))?;
+                outputs.cps_schema_warning(model, spec, &rule.backtrace);
+                let files =
+                    cps::render_for_tree(model, result, spec, Some(rule), &mut outputs.warnings)?;
                 let destination = cps::install_destination(model, rule, spec)?;
                 let directory = stage(&directory, "Export", &destination);
                 let path = directory.join(to_native(&files.file_name));
                 outputs.add(
                     path.clone(),
-                    writer::write_package(&files.package).map_err(cps::cps_error)?,
+                    writer::write_package(&files.package)
+                        .map_err(|error| generation_error([error.to_string().into()]))?,
                 )?;
                 let config = rule.options.configurations.clone();
                 outputs.install(
@@ -146,6 +155,9 @@ pub fn write_supplementary_outputs(
     outputs.bmis(result, bin);
     for (path, content) in outputs.files {
         write_output(host, &path, &content)?;
+    }
+    for warning in outputs.warnings {
+        host.write_out(Stream::Stderr, &warning);
     }
     Ok(outputs.manifest)
 }
@@ -227,9 +239,33 @@ fn automatic_sboms(model: &ProjectModel) -> Result<Vec<SbomSpec>, GenError> {
 struct Outputs {
     files: BTreeMap<PathBuf, BString>,
     manifest: InstallManifest,
+    warnings: BTreeSet<BString>,
 }
 
 impl Outputs {
+    fn cps_schema_warning(
+        &mut self,
+        model: &ProjectModel,
+        spec: &rcmake_model::PackageInfoSpec,
+        backtrace: &rcmake_diag::Backtrace,
+    ) {
+        if let Some(schema) = &spec.version_schema
+            && !matches!(
+                schema.as_slice(),
+                b"" | b"simple" | b"custom" | b"pep440" | b"rpm" | b"dpkg"
+            )
+        {
+            self.warnings.extend(author_warning(
+                model,
+                backtrace,
+                format!(
+                    r#"Package "{}" uses unrecognized version schema "{schema}"."#,
+                    spec.package,
+                ),
+            ));
+        }
+    }
+
     fn add(&mut self, path: PathBuf, content: BString) -> Result<(), GenError> {
         use std::collections::btree_map::Entry;
         match self.files.entry(path) {
@@ -272,10 +308,9 @@ impl Outputs {
             validate_fragment(&suffix)?;
             let name = [spec.name.as_slice(), b"-", &suffix, b".spdx.json"].concat();
             let path = directory.join(to_native(&name));
-            self.add(
-                path.clone(),
-                sbom::render_for_tree(model, result, spec, dir, &config.0, mode, now)?,
-            )?;
+            let document = sbom::render_for_tree(model, result, spec, dir, &config.0, mode, now)?;
+            self.warnings.extend(document.warnings);
+            self.add(path.clone(), document.contents)?;
             if let Some((destination, options)) = install {
                 self.install(
                     model,

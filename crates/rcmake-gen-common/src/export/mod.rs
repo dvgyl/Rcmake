@@ -15,6 +15,7 @@ use crate::{GenError, quote, quoted_content, write_error, write_if_changed};
 
 pub mod cps;
 mod generate;
+pub(crate) mod provenance;
 pub use generate::{
     FileGenerateContext, FileGenerateInput, FileGenerateNewline, FileGeneratePermissions,
     FileGenerateRequest, write_generated_files,

@@ -2,15 +2,24 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
-use rcmake_base::{BString, ByteSlice, list};
+use rcmake_base::{BString, list};
 use rcmake_genex::{
     ConfigId, EvalContext, GenexNode, PreprocessMode, TargetHandle, UsageTraversal,
 };
 use rcmake_json::{Value, write_styled};
-use rcmake_model::{DirId, ProjectMetadata, ProjectModel, SbomSpec, Target, TargetId, TargetKind};
+use rcmake_model::{
+    DirId, ExportKind, InstallKind, ProjectMetadata, ProjectModel, SbomSpec, Target, TargetId,
+    TargetKind,
+};
 use rcmake_resolve::{GenerationResult, usage::UsageResolver};
 
-use crate::GenError;
+use crate::{
+    GenError,
+    export::provenance::{
+        author_warnings_enabled, component, exports, generation_error, generator_diagnostic,
+        imported_package, imported_version, package_variable, unknown_import,
+    },
+};
 
 type Object = BTreeMap<BString, Value>;
 const CREATION_INFO: &str = "_:Build#CreationInfo";
@@ -35,6 +44,7 @@ pub fn render_sbom(
         PreprocessMode::Build,
         0,
     )
+    .map(|output| output.contents)
 }
 
 pub(crate) fn validate_format(format: &[u8]) -> Result<(), GenError> {
@@ -71,6 +81,11 @@ pub(crate) fn with_project_metadata(model: &ProjectModel, dir: DirId, spec: &Sbo
     spec
 }
 
+pub(crate) struct SbomOutput {
+    pub(crate) contents: BString,
+    pub(crate) warnings: BTreeSet<BString>,
+}
+
 pub(crate) fn render_for_tree(
     model: &ProjectModel,
     result: &GenerationResult,
@@ -79,18 +94,24 @@ pub(crate) fn render_for_tree(
     config: &[u8],
     mode: PreprocessMode,
     epoch_seconds: i64,
-) -> Result<BString, GenError> {
+) -> Result<SbomOutput, GenError> {
     if let Some(format) = &spec.format {
         validate_format(format)?;
     }
+    let explicit_default_license = spec.default_license.is_some();
     let spec = with_project_metadata(model, dir, spec);
     let mut roots = BTreeSet::new();
+    let mut queue = VecDeque::new();
     for set in &spec.exports {
         let members = model
             .exports
             .get(set)
             .ok_or_else(|| GenError::Invalid(format!("Unknown export set \"{set}\".").into()))?;
-        roots.extend(&members.targets);
+        for &id in &members.targets {
+            if roots.insert(id) {
+                queue.push_back(id);
+            }
+        }
     }
     let created = jiff::Timestamp::from_second(epoch_seconds)
         .map_err(|error| GenError::Invalid(error.to_string().into()))?
@@ -124,12 +145,13 @@ pub(crate) fn render_for_tree(
     }
     let mut usage = UsageResolver::new(model);
     let mut visited = BTreeSet::new();
-    let mut unknown = BTreeSet::new();
+    let mut dependencies_seen = BTreeSet::new();
+    let mut identities = BTreeMap::new();
+    let mut warnings = BTreeSet::new();
     let mut root_elements = Vec::new();
     let mut elements = Vec::new();
     let mut imported_relationships = Vec::new();
     let mut relationships = Vec::new();
-    let mut queue: VecDeque<_> = roots.iter().copied().collect();
     while let Some(id) = queue.pop_front() {
         if !visited.insert(id) {
             continue;
@@ -137,13 +159,16 @@ pub(crate) fn render_for_tree(
         let target = model
             .target(id)
             .ok_or_else(|| GenError::Invalid("Unknown SBOM target.".into()))?;
-        let name = package_name(target);
         let is_root = roots.contains(&id);
-        let package = package(target, &name, &spec, is_root, &created);
+        let identity = identities
+            .get(&id)
+            .cloned()
+            .unwrap_or_else(|| Identity::local(target));
+        let name = &identity.name;
         if is_root {
-            root_elements.push(package);
-        } else {
-            elements.push(package);
+            root_elements.push(package(model, target, &identity, &spec, true, &created));
+        } else if identity.bare {
+            continue;
         }
 
         let links = target_links(model, result, &mut usage, id, target, config, mode)?;
@@ -154,10 +179,41 @@ pub(crate) fn render_for_tree(
                 if dependency == id {
                     continue;
                 }
-                queue.push_back(dependency);
-                if let Some(target) = model.target(dependency) {
-                    let package = text(urn(&package_name(target), "Package"));
-                    let group = if target.kind == TargetKind::SharedLibrary {
+                if let Some(dependency_target) = model.target(dependency) {
+                    if !identities.contains_key(&dependency) && !roots.contains(&dependency) {
+                        let identity = dependency_identity(
+                            model,
+                            result,
+                            dependency,
+                            dependency_target,
+                            target,
+                            mode,
+                            &mut warnings,
+                        )?;
+                        identities.insert(dependency, identity);
+                    }
+                    let identity = identities
+                        .get(&dependency)
+                        .cloned()
+                        .unwrap_or_else(|| Identity::local(dependency_target));
+                    if !roots.contains(&dependency)
+                        && dependencies_seen.insert(identity.name.clone())
+                    {
+                        elements.push(package(
+                            model,
+                            dependency_target,
+                            &identity,
+                            &spec,
+                            false,
+                            &created,
+                        ));
+                    }
+                    queue.push_back(dependency);
+                    if dependency_target.kind == TargetKind::UnknownLibrary {
+                        continue;
+                    }
+                    let package = text(urn(&identity.name, "Package"));
+                    let group = if dependency_target.kind == TargetKind::SharedLibrary {
                         &mut shared
                     } else {
                         &mut dependencies
@@ -166,7 +222,7 @@ pub(crate) fn render_for_tree(
                         group.push(package);
                     }
                 }
-            } else if !link.starts_with(b"-") && unknown.insert(link.clone()) {
+            } else if !link.starts_with(b"-") && dependencies_seen.insert(link.clone()) {
                 let mut package = node(&link, "Package", "software_Package");
                 package.insert("name".into(), text(link));
                 elements.push(Value::Object(package));
@@ -179,7 +235,7 @@ pub(crate) fn render_for_tree(
         };
         if !dependencies.is_empty() {
             relationships.push(relationship(
-                &name,
+                name,
                 "StaticRelationship",
                 "dependsOn",
                 dependencies,
@@ -188,7 +244,7 @@ pub(crate) fn render_for_tree(
         }
         if !shared.is_empty() {
             relationships.push(relationship(
-                &name,
+                name,
                 "SharedRelationship",
                 "dependsOn",
                 shared,
@@ -198,14 +254,24 @@ pub(crate) fn render_for_tree(
         if let Some(license) = target
             .props
             .get(b"SPDX_LICENSE")
-            .or_else(|| is_root.then_some(spec.default_license.as_ref()).flatten())
+            .or_else(|| {
+                is_root
+                    .then(|| {
+                        if explicit_default_license {
+                            spec.default_license.as_ref()
+                        } else {
+                            target_license(model, target, &spec)
+                        }
+                    })
+                    .flatten()
+            })
             .filter(|value| !value.is_empty())
         {
             relationships.push(relationship(
-                &name,
+                name,
                 "DeclaredLicenseRelationship",
                 "hasDeclaredLicense",
-                vec![license_expression(&name, "LicenseExpression", license)],
+                vec![license_expression(name, "LicenseExpression", license)],
                 None,
             ));
         }
@@ -218,7 +284,7 @@ pub(crate) fn render_for_tree(
         .into_iter()
         .chain(imported_relationships)
         .chain(relationships);
-    Ok(write_styled(
+    let contents = write_styled(
         &object([
             (
                 "@context",
@@ -227,7 +293,8 @@ pub(crate) fn render_for_tree(
             ("@graph", array(graph)),
         ]),
         "  ",
-    ))
+    );
+    Ok(SbomOutput { contents, warnings })
 }
 
 fn target_links(
@@ -278,10 +345,15 @@ fn target_links(
             },
         );
         for (dir, value) in entries {
-            let mut ast = rcmake_genex::parse(value)
+            let ast = rcmake_genex::parse(value)
                 .map_err(|error| GenError::Invalid(error.to_string().into()))?;
-            include_compile_only(&mut ast.nodes);
-            let ast = rcmake_genex::strip(&ast, mode);
+            let mut ast = rcmake_genex::strip(&ast, mode);
+            if !prepare_link_nodes(&mut ast.nodes) {
+                return Err(generation_error([format!(
+                    r#"Property "{}" of target "{}" contains a generator expression that is not allowed for SBOM generation."#,
+                    BString::from(property), target.name,
+                ).into()]));
+            }
             let (value, _) = rcmake_genex::evaluate(&ast, &context, &mut usage.host(dir))
                 .map_err(|error| GenError::Invalid(error.to_string().into()))?;
             links.extend(
@@ -306,60 +378,193 @@ fn target_links(
     Ok(links)
 }
 
-// Both compile-only and link-only requirements belong in an SBOM.
-fn include_compile_only(nodes: &mut [GenexNode]) {
+fn prepare_link_nodes(nodes: &mut [GenexNode]) -> bool {
     for node in nodes {
         let GenexNode::Expr(expr) = node else {
             continue;
         };
-        if let [GenexNode::Text(name)] = expr.identifier.as_mut_slice()
-            && name == b"COMPILE_ONLY"
-        {
-            *name = "LINK_ONLY".into();
-        }
-        include_compile_only(&mut expr.identifier);
-        if let Some(params) = &mut expr.params {
-            for param in params {
-                include_compile_only(param);
+        if let [GenexNode::Text(name)] = expr.identifier.as_mut_slice() {
+            match name.as_slice() {
+                b"COMPILE_ONLY" => *name = "LINK_ONLY".into(),
+                b"TARGET_PROPERTY"
+                    if expr.params.as_ref().is_some_and(|params| params.len() == 1) =>
+                {
+                    return false;
+                }
+                _ => {}
             }
         }
-    }
-}
-
-fn package_name(target: &Target) -> BString {
-    if let Some((namespace, component)) = target.name.split_once_str(b"::") {
-        return [namespace, b":", component].concat().into();
-    }
-    target.name.clone()
-}
-
-fn package(target: &Target, name: &[u8], spec: &SbomSpec, root: bool, created: &str) -> Value {
-    let mut package = node(name, "Package", "software_Package");
-    package.insert("name".into(), text(name));
-    if target.is_imported() {
-        if let Some(origin) = target
-            .props
-            .get(b"EXPORT_FIND_PACKAGE_NAME")
-            .map(|value| value.as_slice())
-            .or_else(|| name.split_once_str(b":").map(|(origin, _)| origin))
+        if !prepare_link_nodes(&mut expr.identifier)
+            || expr
+                .params
+                .iter_mut()
+                .flatten()
+                .any(|param| !prepare_link_nodes(param))
         {
-            let mut organization = node(origin, "Organization", "Organization");
-            organization.insert("name".into(), text(origin));
-            package.insert("originatedBy".into(), array([Value::Object(organization)]));
-            package.insert("builtTime".into(), text(created));
-            package.insert(
-                "externalRef".into(),
-                array([object([
-                    ("externalRefType", text("buildSystem")),
-                    (
-                        "locator",
-                        text(format!("cmake:find_package({})", BString::from(origin))),
-                    ),
-                    ("type", text("ExternalRef")),
-                ])]),
-            );
+            return false;
         }
+    }
+    true
+}
+
+#[derive(Clone)]
+struct Identity {
+    name: BString,
+    origin: Option<BString>,
+    bare: bool,
+}
+
+impl Identity {
+    fn local(target: &Target) -> Self {
+        Self {
+            name: target.name.clone(),
+            origin: None,
+            bare: false,
+        }
+    }
+
+    fn external(origin: &[u8], component: &[u8]) -> Self {
+        Self {
+            name: [origin, b":", component].concat().into(),
+            origin: Some(origin.into()),
+            bare: false,
+        }
+    }
+}
+
+fn dependency_identity(
+    model: &ProjectModel,
+    result: &GenerationResult,
+    id: TargetId,
+    target: &Target,
+    consumer: &Target,
+    mode: PreprocessMode,
+    warnings: &mut BTreeSet<BString>,
+) -> Result<Identity, GenError> {
+    if target.is_imported() {
+        if let Some(package) = imported_package(model, target) {
+            let namespace = [package, b"::"].concat();
+            return Ok(Identity::external(package, &component(target, &namespace)));
+        }
+        if author_warnings_enabled(model) {
+            warnings.insert(generator_diagnostic(unknown_import(consumer, target), true));
+        }
+        return Ok(Identity {
+            bare: true,
+            ..Identity::local(target)
+        });
+    }
+    let candidates = exports(model, result, id, mode)?;
+    if let Some(first) = candidates.first() {
+        let multiple_sets = candidates.iter().any(|other| other.set != first.set);
+        if multiple_sets
+            || candidates
+                .iter()
+                .any(|other| other.namespace != first.namespace)
+        {
+            let files = candidates
+                .iter()
+                .map(|entry| entry.file.as_slice())
+                .collect::<Vec<_>>()
+                .join(b", ".as_slice());
+            let reason = if multiple_sets {
+                "that is in multiple export sets"
+            } else {
+                "that is in an export set which is exported multiple times with different namespaces"
+            };
+            return Err(generation_error([format!(
+                "Target \"{}\" references target \"{}\" {reason}: {}.\n\nAn SBOM cannot attribute a dependency exported in more than one export set or with more than one namespace.  Consider consolidating the exports of the \"{}\" target to a single export.",
+                consumer.name, target.name, BString::from(files), target.name,
+            ).into()]));
+        }
+        if let Some(origin) = first.namespace.strip_suffix(b"::") {
+            return Ok(Identity::external(
+                origin,
+                &component(target, &first.namespace),
+            ));
+        }
+        if author_warnings_enabled(model) {
+            warnings.insert(generator_diagnostic(format!(
+                r#"Target "{}" references target "{}", whose export does not use the standard namespace separator.  The dependency will be recorded by its bare target name without provenance."#,
+                consumer.name, target.name,
+            ), true));
+        }
+        return Ok(Identity {
+            bare: true,
+            ..Identity::local(target)
+        });
+    }
+    let sboms: Box<dyn Iterator<Item = &SbomSpec>> = if mode == PreprocessMode::Install {
+        Box::new(model.installs.iter().filter_map(|rule| match &rule.kind {
+            InstallKind::Sbom(spec) => Some(spec.as_ref()),
+            _ => None,
+        }))
     } else {
+        Box::new(
+            model
+                .build_exports
+                .iter()
+                .filter_map(|rule| match &rule.kind {
+                    ExportKind::Sbom(spec) => Some(spec),
+                    _ => None,
+                }),
+        )
+    };
+    for spec in sboms {
+        if spec.exports.iter().any(|set| {
+            model
+                .exports
+                .get(set)
+                .is_some_and(|set| set.targets.contains(&id))
+        }) {
+            return Ok(Identity::external(&spec.name, &component(target, b"")));
+        }
+    }
+    Ok(Identity::local(target))
+}
+
+fn target_license<'a>(
+    model: &'a ProjectModel,
+    target: &Target,
+    spec: &'a SbomSpec,
+) -> Option<&'a BString> {
+    if spec.project != ProjectMetadata::None
+        && let Some(project) = target
+            .props
+            .get(b"_RCMAKE_TARGET_PROJECT_NAME")
+            .filter(|name| !name.is_empty())
+        && let Some(license) = package_variable(model, target.dir, project, b"_SPDX_LICENSE")
+    {
+        return Some(license);
+    }
+    spec.default_license.as_ref()
+}
+
+fn package(
+    model: &ProjectModel,
+    target: &Target,
+    identity: &Identity,
+    spec: &SbomSpec,
+    root: bool,
+    created: &str,
+) -> Value {
+    let name = &identity.name;
+    let mut package = node(name, "Package", "software_Package");
+    package.insert("name".into(), text(name.clone()));
+    if let Some(origin) = &identity.origin {
+        let mut organization = node(origin, "Organization", "Organization");
+        organization.insert("name".into(), text(origin.clone()));
+        package.insert("originatedBy".into(), array([Value::Object(organization)]));
+        package.insert("builtTime".into(), text(created));
+        package.insert(
+            "externalRef".into(),
+            array([object([
+                ("externalRefType", text("buildSystem")),
+                ("locator", text(format!("cmake:find_package({origin})"))),
+                ("type", text("ExternalRef")),
+            ])]),
+        );
+    } else if !identity.bare {
         let purpose = if target.kind == TargetKind::Executable {
             "application"
         } else {
@@ -373,6 +578,12 @@ fn package(target: &Target, name: &[u8], spec: &SbomSpec, root: bool, created: &
         target
             .props
             .get(b"VERSION")
+            .or_else(|| {
+                identity
+                    .origin
+                    .as_ref()
+                    .and_then(|origin| imported_version(model, target, origin))
+            })
             .or_else(|| root.then_some(spec.version.as_ref()).flatten()),
     );
     if root {
