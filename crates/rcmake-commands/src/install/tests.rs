@@ -60,7 +60,7 @@ fn install_records_rules_and_export_membership() -> TestResult {
 set(CMAKE_INSTALL_INCLUDEDIR headers)
 install(TARGETS core EXPORT sdk DESTINATION lib COMPONENT Run
         ARCHIVE DESTINATION archives NAMELINK_SKIP FILE_SET HEADERS DESTINATION headers
-        INCLUDES DESTINATION include include2)
+        INCLUDES DESTINATION ./include include2 /opt/headers)
 install(TARGETS api EXPORT sdk)
 install(FILES f TYPE INCLUDE PERMISSIONS OWNER_READ GROUP_READ RENAME file OPTIONAL)
 install(PROGRAMS tool DESTINATION bin CONFIGURATIONS Debug)
@@ -109,6 +109,10 @@ export(PACKAGE Enabled)
     assert_eq!(sdk.install_rules, [0, 1]);
     assert_eq!(target_rule.options.destination, Some("lib".into()));
     assert_eq!(target_rule.options.component, Some("Run".into()));
+    assert_eq!(
+        target_rule.options.includes_destination,
+        ["./include", "include2", "/opt/headers"]
+    );
     assert_eq!(files.options.destination, Some("headers".into()));
     assert_eq!(files.options.rename, Some("file".into()));
     assert!(files.options.optional);

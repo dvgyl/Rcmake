@@ -17,7 +17,15 @@ pub use artifacts::{compute_artifacts, linker_language, object_path, source_lang
 pub use graph::lower;
 pub use install::{collect_metadata, lower_install_manifest};
 
-fn definition<'a>(model: &'a ProjectModel, mut dir: DirId, key: &[u8]) -> Option<&'a BString> {
+pub(crate) fn definition<'a>(
+    model: &'a ProjectModel,
+    mut dir: DirId,
+    key: &[u8],
+) -> Option<&'a BString> {
+    if let Some(value) = model.definition(dir, key) {
+        return Some(value);
+    }
+    // Models without variable snapshots can supply definitions as properties.
     loop {
         let directory = model.dir(dir);
         if let Some(value) = directory.props.get(key) {
@@ -31,11 +39,7 @@ fn definition<'a>(model: &'a ProjectModel, mut dir: DirId, key: &[u8]) -> Option
         };
         dir = parent;
     }
-    model
-        .global
-        .props
-        .get(key)
-        .or_else(|| model.cache.get(key).map(|entry| &entry.value))
+    model.global.props.get(key)
 }
 
 fn target_property<'a>(

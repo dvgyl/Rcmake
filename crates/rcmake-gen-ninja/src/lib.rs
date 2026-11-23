@@ -81,17 +81,24 @@ pub fn generate_single_config(
     let empty = BuildGraph::default();
     let input = result.graphs.first().unwrap_or(&empty);
     let graph = Graph::new(input, build_dir, None)?;
+    let programs = Programs::new(result, host, build_dir);
     let manifests = [BString::from("build.ninja"), RULES_PATH.into()];
     let mut ninja = Ninja::default();
     ninja.include(RULES_PATH.as_bytes());
     graph.emit(&mut ninja);
-    emit_regeneration(&mut ninja, &graph, &manifests, result, host, build_dir);
+    emit_regeneration(
+        &mut ninja,
+        &graph,
+        &manifests,
+        result,
+        &configure_command(result, build_dir, &programs.cmake, true),
+    );
     emit_utilities(
         &mut ninja,
         &graph,
         b"build.ninja",
-        host,
-        &configure_command(result, host, build_dir, false),
+        &programs,
+        &configure_command(result, build_dir, &programs.cmake, false),
     );
     ninja.0.extend_from_slice(b"default all\n");
 
@@ -169,18 +176,28 @@ pub fn generate_multi_config(
 
     prepare_directory(host, build_dir)?;
     write_rules(result, host, build_dir)?;
-    let rebuild = configure_command(result, host, build_dir, false);
+    let programs = Programs::new(result, host, build_dir);
+    let rebuild = configure_command(result, build_dir, &programs.cmake, false);
+    let regenerate = configure_command(result, build_dir, &programs.cmake, true);
     for (graph, files) in &configs {
         let mut ninja = Ninja::default();
         ninja.include(RULES_PATH.as_bytes());
         graph.emit(&mut ninja);
-        emit_regeneration(&mut ninja, graph, &manifests, result, host, build_dir);
+        emit_regeneration(&mut ninja, graph, &manifests, result, &regenerate);
         write_if_changed(
             host,
             &build_dir.join(path::to_native(&files.implementation)),
             &ninja.0,
         )?;
-        write_entry(host, build_dir, graph, files, &files.entry, &rebuild)?;
+        write_entry(
+            host,
+            build_dir,
+            graph,
+            files,
+            &files.entry,
+            &programs,
+            &rebuild,
+        )?;
     }
     write_entry(
         host,
@@ -188,6 +205,7 @@ pub fn generate_multi_config(
         default,
         default_files,
         b"build.ninja",
+        &programs,
         &rebuild,
     )
 }
@@ -214,6 +232,7 @@ fn write_entry(
     graph: &Graph<'_>,
     files: &ConfigFiles,
     entry: &[u8],
+    programs: &Programs,
     rebuild: &[u8],
 ) -> Result<(), GenError> {
     let mut ninja = Ninja::default();
@@ -221,7 +240,7 @@ fn write_entry(
     ninja.0.extend_from_slice(b"ninja_pipe = |\n");
     ninja.include(&files.implementation);
     graph.emit_entry_aliases(&mut ninja);
-    emit_utilities(&mut ninja, graph, entry, host, rebuild);
+    emit_utilities(&mut ninja, graph, entry, programs, rebuild);
     ninja.0.extend_from_slice(b"default all\n");
     write_if_changed(host, &build_dir.join(path::to_native(entry)), &ninja.0)
 }
@@ -288,8 +307,7 @@ fn emit_regeneration(
     graph: &Graph<'_>,
     outputs: &[BString],
     result: &GenerationResult,
-    host: &dyn Host,
-    build_dir: &Path,
+    regenerate: &[u8],
 ) {
     let mut seen = HashSet::new();
     let listfiles: Vec<_> = result
@@ -308,10 +326,7 @@ fn emit_regeneration(
             ..Edge::default()
         },
     );
-    ninja.binding(
-        b"COMMAND",
-        &configure_command(result, host, build_dir, true),
-    );
+    ninja.binding(b"COMMAND", regenerate);
 
     for listfile in &listfiles {
         // Missing listfiles must trigger regeneration so CMake can check them.
@@ -323,8 +338,8 @@ fn emit_regeneration(
 
 fn configure_command(
     result: &GenerationResult,
-    host: &dyn Host,
     build_dir: &Path,
+    cmake: &[u8],
     rerun: bool,
 ) -> Vec<u8> {
     let source_dir = result
@@ -346,7 +361,7 @@ fn configure_command(
         .map(|source| build_dir.join(source))
         .unwrap_or_else(|| build_dir.to_path_buf());
 
-    let mut command = program(host, b"CMAKE_COMMAND", b"cmake");
+    let mut command = cmake.to_vec();
     if rerun {
         command.extend_from_slice(b" --regenerate-during-build");
     }
@@ -361,11 +376,11 @@ fn emit_utilities(
     ninja: &mut Ninja,
     graph: &Graph<'_>,
     entry: &[u8],
-    host: &dyn Host,
+    programs: &Programs,
     rebuild: &[u8],
 ) {
-    let mut install = program(host, b"CMAKE_COMMAND", b"cmake");
-    let mut test = program(host, b"CMAKE_CTEST_COMMAND", b"ctest");
+    let mut install = programs.cmake.clone();
+    let mut test = programs.ctest.clone();
     test.extend_from_slice(b" --force-new-ctest-process");
     if let Some(config) = graph.config {
         install.extend_from_slice(b" -DCMAKE_INSTALL_CONFIG_NAME=");
@@ -461,17 +476,21 @@ fn emit_utility(ninja: &mut Ninja, graph: &Graph<'_>, utility: Utility<'_>) {
 }
 
 fn configuration_setting(host: &dyn Host, build_dir: &Path, name: &[u8]) -> Option<BString> {
-    if let Some(value) = host.env_get(name) {
-        return Some(value);
-    }
-    let cache = host
-        .read(
-            &build_dir.join("CMakeCache.txt"),
-            ReadRange::All {
-                limit: 16 * 1024 * 1024,
-            },
-        )
-        .ok()?;
+    host.env_get(name)
+        .or_else(|| cache_setting(&read_cache(host, build_dir)?, name))
+}
+
+fn read_cache(host: &dyn Host, build_dir: &Path) -> Option<Vec<u8>> {
+    host.read(
+        &build_dir.join("CMakeCache.txt"),
+        ReadRange::All {
+            limit: 16 * 1024 * 1024,
+        },
+    )
+    .ok()
+}
+
+fn cache_setting(cache: &[u8], name: &[u8]) -> Option<BString> {
     cache.split(|&byte| byte == b'\n').find_map(|line| {
         let entry = line.strip_prefix(name)?.strip_prefix(b":")?;
         let value = entry.splitn(2, |&byte| byte == b'=').nth(1)?;
@@ -479,16 +498,41 @@ fn configuration_setting(host: &dyn Host, build_dir: &Path, name: &[u8]) -> Opti
     })
 }
 
-fn program(host: &dyn Host, var: &[u8], fallback: &[u8]) -> Vec<u8> {
-    let mut command = Vec::new();
-    let name = host.env_get(var).filter(|value| !value.is_empty());
-    shell_word(
-        name.as_ref()
-            .map(|name| name.as_slice())
-            .unwrap_or(fallback),
-        &mut command,
-    );
-    command
+struct Programs {
+    cmake: Vec<u8>,
+    ctest: Vec<u8>,
+}
+
+impl Programs {
+    fn new(result: &GenerationResult, host: &dyn Host, build_dir: &Path) -> Self {
+        let cache = read_cache(host, build_dir);
+        let program = |configured: Option<&BString>, key: &[u8], fallback: &[u8]| {
+            let saved = || cache_setting(cache.as_deref()?, key).filter(|value| !value.is_empty());
+            let resolved = configured
+                .filter(|value| !value.is_empty())
+                .cloned()
+                .or_else(saved)
+                .or_else(|| host.env_get(key).filter(|value| !value.is_empty()));
+            let mut command = Vec::new();
+            shell_word(
+                resolved.as_ref().map_or(fallback, |value| value.as_slice()),
+                &mut command,
+            );
+            command
+        };
+        Self {
+            cmake: program(
+                result.metadata.cmake_command.as_ref(),
+                b"CMAKE_COMMAND",
+                b"cmake",
+            ),
+            ctest: program(
+                result.metadata.ctest_command.as_ref(),
+                b"CMAKE_CTEST_COMMAND",
+                b"ctest",
+            ),
+        }
+    }
 }
 
 fn generation_error(path: &Path, message: impl Into<BString>) -> GenError {

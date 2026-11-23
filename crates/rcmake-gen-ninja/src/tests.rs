@@ -170,6 +170,51 @@ fn continues_ninja_lines_and_keeps_escaped_values() {
 }
 
 #[test]
+fn generator_commands_use_metadata_and_the_requested_build_cache() {
+    let host = PureHost::default();
+    host.env_set(b"CMAKE_COMMAND", Some(b"/unrelated/cmake"));
+    host.env_set(b"CMAKE_CTEST_COMMAND", Some(b"/unrelated/ctest"));
+    let dir = Path::new("/work/build");
+    host.seed_file(
+        &dir.join("CMakeCache.txt"),
+        b"CMAKE_COMMAND_OTHER:INTERNAL=ignored\nCMAKE_COMMAND:INTERNAL=/cache tools/cmake\r\nCMAKE_CTEST_COMMAND:INTERNAL=/cache tools/ctest\n",
+    ).unwrap_or_else(|error| panic!("{error}"));
+    let mut result = GenerationResult::default();
+    generate_single_config(&result, &host, dir).unwrap_or_else(|error| panic!("{error}"));
+    let build = read(&host, "build.ninja");
+    for line in [
+        "  COMMAND = '/cache$ tools/cmake'$ --regenerate-during-build$",
+        "  COMMAND = '/cache$ tools/cmake'$ -P$ cmake_install.cmake",
+        "  COMMAND = '/cache$ tools/cmake'$ -S",
+        "  COMMAND = '/cache$ tools/ctest'$ --force-new-ctest-process",
+    ] {
+        assert!(build.contains(line), "Missing {line:?} in:\n{build}");
+    }
+
+    let mut graph = BuildGraph::default();
+    graph.config.0 = "Debug".into();
+    result.configs.push(graph.config.clone());
+    result.graphs.push(graph);
+    result.metadata.cmake_command = Some("/current tools/rcmake".into());
+    result.metadata.ctest_command = Some("/current tools/ctest".into());
+    generate_multi_config(&result, &host, dir).unwrap_or_else(|error| panic!("{error}"));
+    for file in ["build.ninja", "build-Debug.ninja"] {
+        let build = read(&host, file);
+        for line in [
+            "  COMMAND = '/current$ tools/rcmake'$ -DCMAKE_INSTALL_CONFIG_NAME=Debug",
+            "  COMMAND = '/current$ tools/rcmake'$ -S",
+            "  COMMAND = '/current$ tools/ctest'$ --force-new-ctest-process$ -C$ Debug",
+        ] {
+            assert!(build.contains(line), "Missing {line:?} in:\n{build}");
+        }
+    }
+    let implementation = read(&host, "CMakeFiles/impl-Debug.ninja");
+    assert!(
+        implementation.contains("  COMMAND = '/current$ tools/rcmake'$ --regenerate-during-build$")
+    );
+}
+
+#[test]
 fn multi_config_uses_config_order_or_host_default() {
     let host = PureHost::default();
     let mut debug = BuildGraph::default();

@@ -131,6 +131,18 @@ fn resolves_build_install_and_export_for_each_config() -> TestResult {
             },
             options: InstallOptions {
                 destination: Some(destination.into()),
+                includes_destination: if id == math_id {
+                    [
+                        "./sdk",
+                        "/opt/sdk",
+                        "$<INSTALL_PREFIX>/extra2",
+                        "$<1:more;paths>",
+                    ]
+                    .map(BString::from)
+                    .into()
+                } else {
+                    vec!["app/include".into()]
+                },
                 ..InstallOptions::default()
             },
         });
@@ -273,7 +285,15 @@ fn resolves_build_install_and_export_for_each_config() -> TestResult {
     assert_eq!(install.targets[0].name, "math");
     assert_eq!(
         install.targets[0].properties[includes],
-        "${_IMPORT_PREFIX}/include;${_IMPORT_PREFIX}/extra"
+        concat!(
+            "${_IMPORT_PREFIX}/include;${_IMPORT_PREFIX}/extra;",
+            "${_IMPORT_PREFIX}/./sdk;/opt/sdk;${_IMPORT_PREFIX}/extra2;",
+            "${_IMPORT_PREFIX}/more;${_IMPORT_PREFIX}/paths"
+        )
+    );
+    assert_eq!(
+        install.targets[1].properties[includes],
+        "${_IMPORT_PREFIX}/app/include"
     );
     assert_eq!(
         install.targets[0].config_properties[&debug.0][location],
@@ -316,6 +336,190 @@ fn resolves_build_install_and_export_for_each_config() -> TestResult {
     );
     assert_eq!(multi.exports[0].targets[0].config_properties.len(), 2);
     assert_eq!(multi.install.actions[1].configurations, [release.0]);
+    Ok(())
+}
+
+#[test]
+fn resolves_normal_definitions_before_cache_values() -> TestResult {
+    let mut model = project();
+    let root = model.dir_mut(DirId::ROOT);
+    root.vars.extend([
+        ("CMAKE_BUILD_TYPE".into(), "Debug".into()),
+        ("CMAKE_C_COMPILER".into(), "/root/cc".into()),
+        ("CMAKE_COMMAND".into(), "/tools/cmake".into()),
+        ("CMAKE_CTEST_COMMAND".into(), "/tools/ctest".into()),
+        ("CMAKE_ASM_COMPILER".into(), "/tools/as".into()),
+    ]);
+    let child = model.add_directory(
+        DirId::ROOT,
+        "/src/sub".into(),
+        "/out/sub".into(),
+        Default::default(),
+    )?;
+    model.dir_mut(child).vars.extend([
+        ("CMAKE_C_COMPILER".into(), "/sub/cc".into()),
+        ("CMAKE_C_COMPILER_ID".into(), "Clang".into()),
+        ("CMAKE_C_FLAGS".into(), "-O1".into()),
+        ("CMAKE_SYSTEM_NAME".into(), "Linux".into()),
+    ]);
+    for (name, value) in [
+        ("CMAKE_BUILD_TYPE", "Release"),
+        ("CMAKE_C_COMPILER", "/cache/cc"),
+        ("CMAKE_C_COMPILER_ID", "GNU"),
+        ("CMAKE_C_FLAGS", "-O2"),
+        ("CMAKE_C_FLAGS_DEBUG", "-g"),
+    ] {
+        model.cache.insert(
+            name.into(),
+            CacheEntry {
+                value: value.into(),
+                ty: CacheType::String,
+                help: BString::default(),
+                advanced: false,
+                props: Default::default(),
+            },
+        );
+    }
+    let mut raw = target("shared", TargetKind::SharedLibrary, &["a.c"]);
+    raw.dir = child;
+    raw.usage.push(
+        UsageField::CompileDefinitions,
+        entry("$<$<C_COMPILER_ID:Clang>:SUBDIR_CLANG>"),
+    );
+    model.add_target(raw)?;
+    let host = PureHost::default();
+    host.seed_file(Path::new("/src/sub/a.c"), b"")?;
+
+    let result = resolve(&model, &host, &[])?;
+    assert_eq!(result.configs, [ConfigId("Debug".into())]);
+    assert_eq!(
+        result.metadata.toolchains[b"C".as_slice()].compiler_path,
+        "/root/cc"
+    );
+    assert_eq!(
+        result.metadata.toolchains[b"ASM".as_slice()].compiler_path,
+        "/tools/as"
+    );
+    assert_eq!(
+        result
+            .metadata
+            .cmake_command
+            .as_ref()
+            .map(|value| value.as_slice()),
+        Some(&b"/tools/cmake"[..])
+    );
+    assert_eq!(
+        result
+            .metadata
+            .ctest_command
+            .as_ref()
+            .map(|value| value.as_slice()),
+        Some(&b"/tools/ctest"[..])
+    );
+    assert_eq!(
+        result.targets[0].artifacts.file,
+        Some("/out/sub/libshared.so".into())
+    );
+    let invocation = result.graphs[0]
+        .steps
+        .iter()
+        .find_map(|step| match step {
+            BuildStep::Compile { invocation, .. } => Some(invocation),
+            _ => None,
+        })
+        .ok_or("Expected a compile step.")?;
+    for arg in ["/sub/cc", "-O1", "-g", "-DSUBDIR_CLANG"] {
+        assert!(
+            invocation.argv.contains(&arg.into()),
+            "{:?}",
+            invocation.argv
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn adds_export_symbols_only_to_the_library_compile_steps() -> TestResult {
+    let mut model = project();
+    let cases = [
+        (
+            "1my-lib",
+            TargetKind::SharedLibrary,
+            None,
+            Some("_1my_lib_EXPORTS"),
+        ),
+        (
+            "explicit",
+            TargetKind::SharedLibrary,
+            Some("ZLIB_DLL"),
+            Some("ZLIB_DLL"),
+        ),
+        (
+            "module",
+            TargetKind::ModuleLibrary,
+            None,
+            Some("module_EXPORTS"),
+        ),
+        ("disabled", TargetKind::SharedLibrary, Some(""), None),
+        ("static", TargetKind::StaticLibrary, Some("NOT_USED"), None),
+        ("app", TargetKind::Executable, None, None),
+    ];
+    for (name, kind, symbol, _) in cases {
+        let mut raw = target(name, kind, &["a.c"]);
+        if let Some(symbol) = symbol {
+            raw.props.set("DEFINE_SYMBOL".into(), symbol.into());
+        }
+        if name == "app" {
+            raw.usage.link_libraries = Some(vec![link_item("explicit")]);
+        }
+        model.add_target(raw)?;
+    }
+    let host = PureHost::default();
+    host.seed_file(Path::new("/src/a.c"), b"")?;
+
+    let result = resolve(&model, &host, &[])?;
+    let graph = &result.graphs[0];
+    for (name, _, _, expected) in cases {
+        let target = result
+            .targets
+            .iter()
+            .find(|target| target.metadata.name == name)
+            .ok_or("Expected a resolved target.")?;
+        let defines: Vec<_> = target.compile_groups[0]
+            .defines
+            .iter()
+            .map(|define| &define.value)
+            .collect();
+        assert_eq!(
+            defines,
+            expected.map(BString::from).iter().collect::<Vec<_>>()
+        );
+        let graph_target = graph
+            .targets
+            .iter()
+            .find(|target| target.name == name)
+            .ok_or("Expected a graph target.")?;
+        let invocation = graph_target
+            .steps
+            .iter()
+            .find_map(|&step| match &graph.steps[step] {
+                BuildStep::Compile { invocation, .. } => Some(invocation),
+                _ => None,
+            })
+            .ok_or("Expected a compile step.")?;
+        let definitions: Vec<_> = invocation
+            .argv
+            .iter()
+            .filter(|arg| arg.starts_with(b"-D"))
+            .collect();
+        assert_eq!(
+            definitions,
+            expected
+                .map(|symbol| BString::from(format!("-D{symbol}")))
+                .iter()
+                .collect::<Vec<_>>()
+        );
+    }
     Ok(())
 }
 

@@ -138,21 +138,7 @@ impl GenexHost for ModelGenexHost<'_, '_> {
 }
 
 pub(super) fn definition(model: &ProjectModel, dir: DirId, name: &[u8]) -> Option<BString> {
-    let mut current = Some(dir);
-    for _ in 0..super::MAX_WALK_DEPTH {
-        let Some(id) = current else { break };
-        let dir = model.dir(id);
-        if let Some(value) = dir.props.get(name) {
-            return Some(value.clone());
-        }
-        current = dir.parent;
-    }
-    model
-        .global
-        .props
-        .get(name)
-        .cloned()
-        .or_else(|| model.cache.get(name).map(|entry| entry.value.clone()))
+    crate::lower::definition(model, dir, name).cloned()
 }
 
 fn missing_target() -> GenexError {

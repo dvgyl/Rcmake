@@ -790,3 +790,74 @@ fn lowers_install_rules_and_collects_metadata() -> TestResult {
     assert_eq!(toolchain.implicit_includes, ["/one", "/two"]);
     Ok(())
 }
+
+#[test]
+fn installs_public_headers_with_their_own_options() -> TestResult {
+    let mut model = fixture("Linux");
+    let child = model.add_directory(
+        DirId::ROOT,
+        "/project/sub".into(),
+        "/build/sub".into(),
+        Default::default(),
+    )?;
+    let mut raw = raw_target("api", TargetKind::StaticLibrary);
+    raw.dir = child;
+    raw.props
+        .set("PUBLIC_HEADER".into(), "api.h;;/generated/config.h".into());
+    let target = resolve_target(&mut model, raw, &ConfigId("Debug".into()), &["a.c"])?;
+    for _ in 0..2 {
+        model.add_install(InstallRule {
+            dir: DirId::ROOT,
+            backtrace: Default::default(),
+            kind: InstallKind::Targets {
+                targets: vec![target.id],
+                export: None,
+            },
+            options: InstallOptions::default(),
+        });
+    }
+    for (index, word) in [
+        "TARGETS",
+        "api",
+        "ARCHIVE",
+        "DESTINATION",
+        "lib64",
+        "CONFIGURATIONS",
+        "Release",
+        "PUBLIC_HEADER",
+        "DESTINATION",
+        "headers",
+        "COMPONENT",
+        "Development",
+        "OPTIONAL",
+        "CONFIGURATIONS",
+        "Debug",
+        "PERMISSIONS",
+        "OWNER_READ",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        var(&mut model, &format!("_RCMAKE_INSTALL_1_ARG{index}"), word);
+    }
+    let manifest = lower_install_manifest(&model, &[target]);
+    let [_, defaults, explicit] = manifest.actions.as_slice() else {
+        return Err("Expected one archive and two header actions.".into());
+    };
+    assert_eq!(defaults.destination, "include");
+    assert_eq!(explicit.destination, "headers");
+    assert_eq!(explicit.component, "Development");
+    assert_eq!(explicit.configurations, ["Debug"]);
+    assert!(explicit.optional);
+    for action in [defaults, explicit] {
+        assert!(
+            matches!(&action.kind, InstallActionKind::Files { file_type, files, .. }
+            if file_type == "FILE" && files == &["/project/api.h", "/generated/config.h"])
+        );
+    }
+    assert!(
+        matches!(&explicit.kind, InstallActionKind::Files { permissions, .. }
+        if permissions == &["OWNER_READ"])
+    );
+    Ok(())
+}

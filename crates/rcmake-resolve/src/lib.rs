@@ -19,7 +19,8 @@ use rcmake_diag::Backtrace;
 use rcmake_genex::{ConfigId, EvalContext, GenexHost, GenexNode, PreprocessMode, TargetHandle};
 use rcmake_host::{FileKind, Follow, Host, path::to_native};
 use rcmake_model::{
-    BT, DirId, Directory, InstallKind, ProjectModel, Target, TargetId, TargetKind, UsageField,
+    BT, DirId, Directory, ExportSet, InstallKind, InstallRule, ProjectModel, Target, TargetId,
+    TargetKind, UsageField,
 };
 
 use usage::{ResolvedLinkItem, ResolvedLinkKind, UsageResolver};
@@ -71,6 +72,10 @@ pub struct ConfigureMetadata {
     pub toolchains: IndexMap<BString, Toolchain>,
     /// Absolute path of `CMakeConfigureLog.yaml`, if written.
     pub configure_log: Option<BString>,
+    /// Executable path from `CMAKE_COMMAND`.
+    pub cmake_command: Option<BString>,
+    /// Executable path from `CMAKE_CTEST_COMMAND`.
+    pub ctest_command: Option<BString>,
 }
 
 /// Compiler facts of one language (`toolchains-v1`).
@@ -406,10 +411,9 @@ pub fn resolve(
 ) -> Result<GenerationResult, ResolveError> {
     let configs = if configs.is_empty() {
         vec![ConfigId(
-            model
-                .cache
-                .get(b"CMAKE_BUILD_TYPE")
-                .map_or_else(BString::default, |entry| entry.value.clone()),
+            lower::definition(model, DirId::ROOT, b"CMAKE_BUILD_TYPE")
+                .cloned()
+                .unwrap_or_default(),
         )]
     } else {
         configs.to_vec()
@@ -448,7 +452,7 @@ pub fn resolve(
     }
 
     let install = lower::lower_install_manifest(model, &targets);
-    let exports = resolve_exports(model, &targets, &install)?;
+    let exports = resolve_exports(model, &mut usage, &targets, &install)?;
     Ok(GenerationResult {
         configs,
         targets,
@@ -489,6 +493,7 @@ fn resolve_target(
         dependencies: Vec::new(),
     };
 
+    let export_symbol = export_symbol(target);
     let mut seen = IndexSet::new();
     let mut groups = IndexMap::new();
     for mut source in usage.collect_property(id, b"SOURCES", ctx)?.entries {
@@ -515,9 +520,14 @@ fn resolve_target(
                 let flags = usage
                     .collect(id, UsageField::CompileOptions, &compile_ctx)?
                     .entries;
-                let defines = usage
+                let mut defines = usage
                     .collect(id, UsageField::CompileDefinitions, &compile_ctx)?
                     .entries;
+                if let Some(symbol) = &export_symbol
+                    && !defines.iter().any(|define| define.value == *symbol)
+                {
+                    defines.insert(0, BT::new(symbol.clone(), target.backtrace.clone()));
+                }
                 let includes = usage.collect_includes(id, &compile_ctx)?;
                 let group = entry.index();
                 let facts = entry.insert(CompileGroup {
@@ -539,6 +549,31 @@ fn resolve_target(
     }
     resolved.compile_groups = groups.into_values().collect();
     Ok(resolved)
+}
+
+fn export_symbol(target: &Target) -> Option<BString> {
+    if !matches!(
+        target.kind,
+        TargetKind::SharedLibrary | TargetKind::ModuleLibrary
+    ) {
+        return None;
+    }
+    if let Some(symbol) = target.props.get(b"DEFINE_SYMBOL") {
+        return (!symbol.is_empty()).then(|| symbol.clone());
+    }
+    let mut symbol = BString::default();
+    if target.name.first().is_some_and(u8::is_ascii_digit) {
+        symbol.push(b'_');
+    }
+    symbol.extend(target.name.iter().map(|&byte| {
+        if byte.is_ascii_alphanumeric() {
+            byte
+        } else {
+            b'_'
+        }
+    }));
+    symbol.extend_from_slice(b"_EXPORTS");
+    Some(symbol)
 }
 
 fn excluded(model: &ProjectModel, target: &Target) -> bool {
@@ -823,6 +858,7 @@ fn shell_quote(value: &[u8]) -> BString {
 
 fn resolve_exports(
     model: &ProjectModel,
+    usage: &mut UsageResolver<'_>,
     targets: &[ResolvedTarget],
     install: &InstallManifest,
 ) -> Result<Vec<ExportPlan>, ResolveError> {
@@ -837,6 +873,19 @@ fn resolve_exports(
             continue;
         };
         let members = export_set(model, set)?;
+        let mut include_rules = IndexMap::<TargetId, Vec<_>>::new();
+        for &index in &members.install_rules {
+            let Some(rule) = model.installs.get(index) else {
+                continue;
+            };
+            if let InstallKind::Targets { targets, .. } = &rule.kind
+                && !rule.options.includes_destination.is_empty()
+            {
+                for &id in targets {
+                    include_rules.entry(id).or_default().push(rule);
+                }
+            }
+        }
         let mut plan = ExportPlan {
             set: set.clone(),
             namespace: namespace.clone(),
@@ -844,8 +893,8 @@ fn resolve_exports(
             install: true,
             ..ExportPlan::default()
         };
-        for &id in members {
-            plan.targets.push(export_target(
+        for &id in &members.targets {
+            let mut target = export_target(
                 model,
                 id,
                 targets.iter().filter(|target| {
@@ -858,7 +907,11 @@ fn resolve_exports(
                                 .any(|c| target.config.matches(c)))
                 }),
                 Some(install),
-            )?);
+            )?;
+            if let Some(rules) = include_rules.get(&id) {
+                add_include_destinations(usage, id, rules, &mut target)?;
+            }
+            plan.targets.push(target);
         }
         plans.push(plan);
     }
@@ -886,7 +939,7 @@ fn resolve_exports(
         let (set, ids, mut options) = match args.as_slice() {
             [b"EXPORT", set, options @ ..] => (
                 BString::from(*set),
-                export_set(model, set)?.to_vec(),
+                export_set(model, set)?.targets.clone(),
                 options,
             ),
             [b"TARGETS", rest @ ..] => {
@@ -959,6 +1012,59 @@ fn resolve_exports(
     Ok(plans)
 }
 
+fn add_include_destinations(
+    usage: &mut UsageResolver<'_>,
+    id: TargetId,
+    rules: &[&InstallRule],
+    target: &mut ExportedTarget,
+) -> Result<(), ResolveError> {
+    const KEY: &[u8] = b"INTERFACE_INCLUDE_DIRECTORIES";
+    const PREFIX: &[u8] = b"${_IMPORT_PREFIX}";
+    let handle = TargetHandle(id.index() as u32);
+    let ctx = EvalContext {
+        head: Some(handle),
+        current: Some(handle),
+        ..EvalContext::default()
+    };
+    let mut includes = BString::default();
+    for rule in rules {
+        let mut host = usage.host(rule.dir);
+        for destination in &rule.options.includes_destination {
+            let value = rcmake_genex::rewrite_install_prefix(destination, PREFIX);
+            let ast = rcmake_genex::strip(&rcmake_genex::parse(&value)?, PreprocessMode::Install);
+            let (paths, flags) = rcmake_genex::evaluate(&ast, &ctx, &mut host)?;
+            if flags.context_sensitive || flags.head_sensitive || flags.link_language_sensitive {
+                return Err(ResolveError::Message(
+                    "INCLUDES DESTINATION requires paths that do not depend on the evaluation context."
+                        .into(),
+                ));
+            }
+            for path in list::split(&paths, list::Empty::Drop) {
+                if !includes.is_empty() {
+                    includes.push(b';');
+                }
+                if !Lexical::new(&path).absolute() && !path.starts_with(PREFIX) {
+                    includes.extend_from_slice(PREFIX);
+                    includes.push(b'/');
+                }
+                includes.extend_from_slice(&path);
+            }
+        }
+    }
+    if !includes.is_empty() {
+        match target.properties.entry(KEY.into()) {
+            Entry::Occupied(mut entry) => {
+                entry.get_mut().push(b';');
+                entry.get_mut().extend_from_slice(&includes);
+            }
+            Entry::Vacant(entry) => {
+                entry.insert(includes);
+            }
+        }
+    }
+    Ok(())
+}
+
 fn property_index(value: &[u8]) -> Option<usize> {
     std::str::from_utf8(value).ok()?.parse().ok()
 }
@@ -967,11 +1073,10 @@ fn invalid_export_record() -> ResolveError {
     ResolveError::Message("Invalid build export record.".into())
 }
 
-fn export_set<'a>(model: &'a ProjectModel, set: &[u8]) -> Result<&'a [TargetId], ResolveError> {
+fn export_set<'a>(model: &'a ProjectModel, set: &[u8]) -> Result<&'a ExportSet, ResolveError> {
     model
         .exports
         .get(set)
-        .map(|members| members.targets.as_slice())
         .ok_or_else(|| ResolveError::Message([b"Unknown export set: ", set].concat().into()))
 }
 

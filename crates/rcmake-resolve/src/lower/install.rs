@@ -11,16 +11,16 @@ use crate::{
 
 /// Collect listfiles and compiler data from the model.
 ///
-/// Listfiles keep the order of their first appearance. Compiler values come from
-/// directory properties, global properties, or the cache.
+/// Listfiles keep the order of their first appearance. Read compiler values
+/// from directory variable snapshots and the cache.
 #[must_use]
 pub fn collect_metadata(model: &ProjectModel) -> ConfigureMetadata {
     let mut listfiles = IndexSet::new();
     let mut languages = IndexMap::new();
     for (dir, directory) in model.dirs() {
         listfiles.extend(directory.listfiles.iter().cloned());
-        for key in directory.props.names() {
-            if let Some(language) = compiler_language(&key) {
+        for key in directory.vars.keys().chain(directory.props.names().iter()) {
+            if let Some(language) = compiler_language(key) {
                 languages.entry(language).or_insert(dir);
             }
         }
@@ -68,6 +68,8 @@ pub fn collect_metadata(model: &ProjectModel) -> ConfigureMetadata {
         listfiles: listfiles.into_iter().collect(),
         toolchains,
         configure_log: definition(model, DirId::ROOT, b"CMAKE_CONFIGURE_LOG").cloned(),
+        cmake_command: definition(model, DirId::ROOT, b"CMAKE_COMMAND").cloned(),
+        ctest_command: definition(model, DirId::ROOT, b"CMAKE_CTEST_COMMAND").cloned(),
     }
 }
 
@@ -92,14 +94,14 @@ pub fn lower_install_manifest(model: &ProjectModel, targets: &[ResolvedTarget]) 
             InstallKind::Targets { targets: ids, .. } => {
                 let groups = target_options(&recorded);
                 for id in ids {
+                    let Some(raw) = model.target(*id).filter(|raw| !raw.is_imported()) else {
+                        continue;
+                    };
                     let matching: Vec<_> = targets.iter().filter(|t| t.id == *id).collect();
                     for target in &matching {
                         let Some((class, file_type, fallback)) =
                             target_install_kind(target.metadata.kind)
                         else {
-                            continue;
-                        };
-                        let Some(raw) = model.target(*id).filter(|raw| !raw.is_imported()) else {
                             continue;
                         };
                         let extra = groups.get(class);
@@ -150,6 +152,23 @@ pub fn lower_install_manifest(model: &ProjectModel, targets: &[ResolvedTarget]) 
                         if let Some((component, file)) = namelink {
                             options.component = Some(component.into());
                             let kind = file_action(file_type, vec![file], &options);
+                            manifest
+                                .actions
+                                .push(action(model, rule, &options, default, kind));
+                        }
+                    }
+                    if let Some(headers) = raw.props.get(b"PUBLIC_HEADER") {
+                        let files: Vec<_> = list::split(headers, list::Empty::Drop)
+                            .iter()
+                            .map(|path| join(source, path))
+                            .collect();
+                        if !files.is_empty() {
+                            let options = groups
+                                .get(b"PUBLIC_HEADER".as_slice())
+                                .map_or_else(|| options.clone(), |extra| extra.merge(options));
+                            let default = definition(model, rule.dir, b"CMAKE_INSTALL_INCLUDEDIR")
+                                .map_or(b"include".as_slice(), |value| value.as_slice());
+                            let kind = file_action(b"FILE", files, &options);
                             manifest
                                 .actions
                                 .push(action(model, rule, &options, default, kind));

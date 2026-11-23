@@ -267,7 +267,9 @@ fn targets(
                 if args.next() != Some(b"DESTINATION") {
                     return Err(fail("TARGETS INCLUDES requires DESTINATION."));
                 }
-                values(args);
+                options
+                    .includes_destination
+                    .extend(values(args).into_iter().map(BString::from));
             }
             b"NAMELINK_COMPONENT" | b"NAMELINK_ONLY" | b"NAMELINK_SKIP" => {
                 if !matches!(group, Some(b"LIBRARY" | b"ARCHIVE")) {
