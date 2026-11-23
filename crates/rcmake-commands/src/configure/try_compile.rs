@@ -2,7 +2,7 @@ use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::time::Duration;
 
 use rcmake_base::{BString, list, truth};
@@ -402,6 +402,7 @@ fn build_probe(
     let cmake_root = path::to_native(&cx.var_or_empty(b"CMAKE_ROOT"));
     let cmake_command = path::to_native(&cx.var_or_empty(b"CMAKE_COMMAND"));
     let limits = cx.limits().clone();
+    let trace = cx.trace_config().cloned();
     let generator = cx.project().generator;
     let imports = match signature {
         Signature::Sources { .. } => probe_imports(cx, options),
@@ -410,7 +411,7 @@ fn build_probe(
     let (build, mut output) = CapturingHost::capture(cx.host(), &dirs.binary, |host| {
         let mut child = Interp::new(
             InterpConfig {
-                host,
+                host: host.clone(),
                 mode: RunMode::Configure,
                 cmake_root,
                 cmake_command,
@@ -422,6 +423,11 @@ fn build_probe(
             },
             crate::register_all,
         );
+        if let Some(mut trace) = trace {
+            let redirect = trace.redirect.replace(PathBuf::new());
+            child.set_trace_config(Some(trace));
+            let _ = host.trace_output.set(redirect);
+        }
         let mut child_context = child.cx();
         let model = child_context.project();
         model.generator = generator;
@@ -569,7 +575,7 @@ fn set_result(cx: &mut Cx<'_>, name: &[u8], value: BString, no_cache: bool) {
 }
 
 fn write_project(
-    cx: &Cx<'_>,
+    cx: &mut Cx<'_>,
     options: &Options<'_>,
     sources: &[Source<'_>],
     directory: &Path,
@@ -639,7 +645,10 @@ fn write_project(
     code.extend_from_slice(
         b")\ninclude_directories(${INCLUDE_DIRECTORIES})\nlink_directories(${LINK_DIRECTORIES})\n",
     );
-    code.extend_from_slice(b"add_compile_options(${COMPILE_DEFINITIONS})\n");
+    code.extend_from_slice(
+        b"separate_arguments(_probe_compile_flags UNIX_COMMAND \"${COMPILE_DEFINITIONS}\")\n\
+          add_compile_options(${_probe_compile_flags})\n",
+    );
     let prefix = if archive {
         "add_library(cmTryCompile STATIC"
     } else {
@@ -650,14 +659,19 @@ fn write_project(
         prefix,
         files.iter().map(|value| value.as_slice()),
     );
+    let compile_flags: Vec<_> = options
+        .many(b"COMPILE_DEFINITIONS")
+        .iter()
+        .flat_map(|arg| compile_definition_words(cx, arg))
+        .collect();
     for (command, definitions) in [
         ("target_compile_definitions", true),
         ("target_compile_options", false),
     ] {
-        let values: Vec<_> = options
-            .many(b"COMPILE_DEFINITIONS")
+        let values: Vec<_> = compile_flags
             .iter()
-            .filter_map(|&arg| {
+            .filter_map(|arg| {
+                let arg = arg.as_slice();
                 let definition = arg.strip_prefix(b"-D").or_else(|| arg.strip_prefix(b"/D"));
                 if definitions {
                     definition
@@ -673,6 +687,12 @@ fn write_project(
                 values,
             );
         }
+    }
+    if !archive {
+        code.extend_from_slice(
+            b"separate_arguments(_probe_link_flags UNIX_COMMAND \"${EXE_LINKER_FLAGS}\")\n\
+              target_link_options(cmTryCompile PRIVATE ${_probe_link_flags})\n",
+        );
     }
     let link_options = options.many(b"LINK_OPTIONS");
     if !link_options.is_empty() {
@@ -1269,6 +1289,20 @@ fn compiler_args(cx: &mut Cx<'_>, language: &str, default: &str, config: &[u8]) 
     args
 }
 
+fn compile_definition_words(cx: &mut Cx<'_>, value: &[u8]) -> Vec<BString> {
+    let mut words = command_words(cx, value);
+    if let [word] = words.as_mut_slice()
+        && (value.starts_with(b"-D") || value.starts_with(b"/D"))
+        && let Some((_, definition)) = split_byte(value, b'=')
+        && definition.starts_with(b"\"")
+        && definition.ends_with(b"\"")
+    {
+        // Keep the quotes in a single macro definition for the preprocessor.
+        *word = value.into();
+    }
+    words
+}
+
 fn command_words(cx: &mut Cx<'_>, value: &[u8]) -> Vec<BString> {
     if value.is_empty() {
         return Vec::new();
@@ -1523,6 +1557,7 @@ type HostCall = Box<dyn FnOnce(&dyn Host) + Send>;
 struct CapturingHost {
     calls: mpsc::Sender<HostCall>,
     output: Mutex<BString>,
+    trace_output: OnceLock<Option<PathBuf>>,
     system: SystemInfo,
     cwd: PathBuf,
 }
@@ -1531,7 +1566,7 @@ impl CapturingHost {
     fn capture<T>(
         parent: &dyn Host,
         cwd: &Path,
-        configure: impl FnOnce(Arc<dyn Host>) -> T,
+        configure: impl FnOnce(Arc<Self>) -> T,
     ) -> HostResult<(T, BString)> {
         std::thread::scope(|scope| {
             let (calls, requests) = mpsc::channel::<HostCall>();
@@ -1546,6 +1581,7 @@ impl CapturingHost {
             let host = Arc::new(Self {
                 calls,
                 output: Mutex::default(),
+                trace_output: OnceLock::new(),
                 system: parent.system(),
                 cwd: cwd.to_path_buf(),
             });
@@ -1613,8 +1649,19 @@ impl Host for CapturingHost {
     }
 
     fn write(&self, p: &Path, data: &[u8], mode: WriteMode) -> HostResult<()> {
-        let p = p.to_owned();
         let data = data.to_vec();
+        // The empty path routes trace lines. The parent already initialized its trace output.
+        if p.as_os_str().is_empty() {
+            return match self.trace_output.get() {
+                Some(Some(path)) => {
+                    let path = path.clone();
+                    self.forward(move |host| host.write(&path, &data, mode))?
+                }
+                Some(None) => self.forward(move |host| host.write_out(Stream::Stderr, &data)),
+                None => Ok(()),
+            };
+        }
+        let p = p.to_owned();
         self.forward(move |host| host.write(&p, &data, mode))?
     }
 
@@ -1927,6 +1974,63 @@ endif()
         Ok(())
     }
 
+    #[test]
+    fn sends_child_trace_to_the_parent_destination() -> TestResult {
+        use rcmake_eval::{TraceConfig, TraceFormat};
+
+        for format in [TraceFormat::Human, TraceFormat::JsonV1] {
+            let host = Arc::new(PureHost::default());
+            host.seed_file(
+                Path::new("/work/CMakeLists.txt"),
+                br#"
+cmake_minimum_required(VERSION 4.5)
+project(Parent NONE)
+try_compile(CHILD PROJECT Child SOURCE_DIR /work/child OUTPUT_VARIABLE child_output NO_LOG)
+message(STATUS "after probe")
+"#,
+            )?;
+            host.seed_file(
+                Path::new("/work/child/CMakeLists.txt"),
+                br#"
+cmake_minimum_required(VERSION 4.5)
+project(Child NONE)
+message(STATUS "inside probe")
+"#,
+            )?;
+            let redirect = (format == TraceFormat::JsonV1).then(|| PathBuf::from("/work/trace"));
+            let mut interp = interpreter(host.clone(), Path::new("/work"));
+            interp.set_trace_config(Some(TraceConfig {
+                format,
+                redirect: redirect.clone(),
+                ..TraceConfig::default()
+            }));
+            let result = interp.run_configure(Path::new("/work"), Path::new("/work/build"), &[]);
+            assert_eq!(result.exit_code, 0, "{}", host.stream_bytes(Stream::Stderr));
+            assert_eq!(
+                interp.cx().var_or_empty(b"child_output"),
+                "-- inside probe\n"
+            );
+
+            let trace = if let Some(path) = redirect {
+                assert!(host.stream_bytes(Stream::Stderr).is_empty());
+                host.read(&path, ReadRange::All { limit: 16_384 })?
+            } else {
+                host.stream_bytes(Stream::Stderr).to_vec()
+            };
+            let trace = std::str::from_utf8(&trace)?;
+            let before = trace.find("try_compile").ok_or("Missing parent trace.")?;
+            let inside = trace
+                .find("/work/child/CMakeLists.txt")
+                .ok_or("Missing child trace.")?;
+            let after = trace.find("after probe").ok_or("Missing final trace.")?;
+            assert!(before < inside && inside < after, "{trace}");
+            if format == TraceFormat::JsonV1 {
+                assert_eq!(trace.matches(r#""version":"#).count(), 1, "{trace}");
+            }
+        }
+        Ok(())
+    }
+
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[test]
     fn builds_real_macho_archive_and_runs_a_probe() -> TestResult {
@@ -1971,8 +2075,20 @@ project(Probe NONE)
 set(CMAKE_C_COMPILER /usr/bin/cc)
 set(CMAKE_CXX_COMPILER /usr/bin/c++)
 set(CMAKE_OSX_ARCHITECTURES arm64)
-try_compile(RES SOURCE_FROM_CONTENT main.c "int main(void){return 0;}"
-  CMAKE_FLAGS -DCMAKE_C_FLAGS:STRING=-v COPY_FILE "${CMAKE_BINARY_DIR}/out.bin" OUTPUT_VARIABLE out)
+set(probe_source [=[
+#if FOO != 1 || BAR != 2
+#error Missing compiler definitions
+#endif
+_Static_assert(sizeof(TEXT) == 4, "Expected a string with a space");
+int main(void) { return 0; }
+]=])
+try_compile(RES SOURCE_FROM_VAR main.c probe_source
+  COMPILE_DEFINITIONS "-v -Wl,-v" "-DFOO=1 -DBAR=2" "-DTEXT=\"a b\""
+  CMAKE_FLAGS "-DEXE_LINKER_FLAGS=-v -Wl,-v"
+  COPY_FILE "${CMAKE_BINARY_DIR}/out.bin" OUTPUT_VARIABLE out)
+try_compile(CACHE_FLAGS SOURCE_FROM_VAR main.c probe_source
+  CMAKE_FLAGS [=[-DCOMPILE_DEFINITIONS:STRING=-DFOO=1 -DBAR=2 -DTEXT='"a b"']=]
+  OUTPUT_VARIABLE cache_out NO_LOG)
 file(READ_MACHO "${CMAKE_BINARY_DIR}/out.bin" ARCHITECTURES arch)
 try_compile(BAD SOURCE_FROM_CONTENT bad.c "int main(void){ return missing_symbol; }"
   OUTPUT_VARIABLE error NO_CACHE)
@@ -2031,6 +2147,17 @@ int main() { static_assert(Valid<int>); }
                 .to_string()
                 .contains("clang version")
         );
+        assert!(
+            cx.var_or_empty(b"out").to_string().contains("PROGRAM:ld"),
+            "{}",
+            cx.var_or_empty(b"out")
+        );
+        assert_eq!(
+            cx.var_or_empty(b"CACHE_FLAGS"),
+            "TRUE",
+            "{}",
+            cx.var_or_empty(b"cache_out")
+        );
         assert_eq!(cx.var_or_empty(b"arch"), "arm64");
         assert_eq!(cx.var_or_empty(b"BAD"), "FALSE");
         let error = cx.var_or_empty(b"error").to_string();
@@ -2073,6 +2200,14 @@ int main() { static_assert(Valid<int>); }
             "{}",
             cx.var_or_empty(b"cpp_out")
         );
+        let log = host.read(
+            &binary.join("CMakeFiles/CMakeConfigureLog.yaml"),
+            ReadRange::All { limit: 256 * 1024 },
+        )?;
+        let log = std::str::from_utf8(&log)?;
+        assert_eq!(log.matches("try_compile-v1").count(), 4);
+        assert_eq!(log.matches("try_run-v1").count(), 1);
+        assert!(log.contains("variable: \"RUN_RES\""));
         Ok(())
     }
 }
