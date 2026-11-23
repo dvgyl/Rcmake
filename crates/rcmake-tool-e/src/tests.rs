@@ -605,3 +605,195 @@ fn tar_round_trip_with_the_shared_archive_backend() -> HostResult<()> {
     }
     Ok(())
 }
+
+#[test]
+fn generator_symlinks_use_basenames_and_replace_files() -> HostResult<()> {
+    let f = Fixture::new();
+    f.seed("lib/libdemo.2.1", b"library")?;
+    f.seed("lib/libdemo.2", b"old")?;
+    f.host
+        .symlink(Path::new("wrong"), &f.cwd.join("lib/libdemo"))?;
+    let args = [
+        "cmake_symlink_library",
+        "lib/libdemo.2.1",
+        "lib/libdemo.2",
+        "lib/libdemo",
+    ];
+    assert_eq!(f.run(&args), 0);
+    assert_eq!(f.run(&args), 0);
+    assert_eq!(
+        f.host.read_link(&f.cwd.join("lib/libdemo"))?,
+        Path::new("libdemo.2")
+    );
+    assert_eq!(
+        f.host.read_link(&f.cwd.join("lib/libdemo.2"))?,
+        Path::new("libdemo.2.1")
+    );
+    assert_eq!(f.read("lib/libdemo")?, b"library");
+    assert_eq!(
+        f.run(&["cmake_symlink_executable", "lib/libdemo.2.1", "app"]),
+        0
+    );
+    assert_eq!(
+        f.host.read_link(&f.cwd.join("app"))?,
+        Path::new("libdemo.2.1")
+    );
+    assert_eq!(
+        f.run(&[
+            "cmake_symlink_executable",
+            "lib/libdemo.2.1",
+            "lib/libdemo.2.1"
+        ]),
+        0
+    );
+    assert_eq!(f.read("lib/libdemo.2.1")?, b"library");
+    assert_eq!(f.err(), b"");
+    Ok(())
+}
+
+#[test]
+fn library_symlink_attempts_both_links_after_first_failure() -> HostResult<()> {
+    let f = Fixture::new();
+    assert_eq!(
+        f.run(&["cmake_symlink_library", "source", "missing/soname", "name"]),
+        1
+    );
+    assert_eq!(f.host.read_link(&f.cwd.join("name"))?, Path::new("soname"));
+    assert_eq!(
+        f.err(),
+        b"CMake Error: failed to create symbolic link 'missing/soname': No such file or directory\nCMake Error: cmake_symlink_library: System Error: No such file or directory\n"
+    );
+    Ok(())
+}
+
+#[test]
+fn depfile_transform_rebases_and_escapes_inputs() -> HostResult<()> {
+    let f = Fixture::new();
+    f.seed("input.d", b"a.o b.o: a.c ./a.c ../b.h space\\ name.h hash\\#x.h dollar$$name.h colon\\:x.h \\\r\n other.h\r\nfoo.h:\n")?;
+    for (generator, format) in [("Ninja", "gccdepfile"), ("Unix Makefiles", "makedepfile")] {
+        assert_eq!(
+            f.run(&[
+                "cmake_transform_depfile",
+                generator,
+                format,
+                "src",
+                "src/sub",
+                "build",
+                "build/sub",
+                "input.d",
+                "output.d",
+            ]),
+            0
+        );
+        let mut expected = b"sub/a.o \\\n  sub/b.o: \\\n  b.h \\\n  sub/a.c \\\n  sub/a.c \\\n  sub/colon:x.h \\\n  sub/dollar$$name.h \\\n  sub/hash\\#x.h \\\n  sub/other.h \\\n  sub/space\\ name.h\nsub/foo.h:\n".to_vec();
+        if format == "makedepfile" {
+            expected.extend_from_slice(b"\n\nb.h:\n\nsub/a.c:\n\nsub/a.c:\n\nsub/colon:x.h:\n\nsub/dollar$$name.h:\n\nsub/hash\\#x.h:\n\nsub/other.h:\n\nsub/space\\ name.h:\n");
+        }
+        assert_eq!(f.read("output.d")?, expected);
+    }
+    assert_eq!(f.err(), b"");
+    Ok(())
+}
+
+#[test]
+fn depfile_transform_distinguishes_missing_and_invalid_input() -> HostResult<()> {
+    let f = Fixture::new();
+    let args = [
+        "cmake_transform_depfile",
+        "Ninja",
+        "gccdepfile",
+        "src",
+        "src",
+        "build",
+        "build",
+        "input.d",
+        "output.d",
+    ];
+    assert_eq!(f.run(&args), 0);
+    assert_eq!(f.read("output.d")?, b"");
+    assert_eq!(
+        f.err(),
+        b"CMake Warning:\n  Expected depfile does not exist.\n\n    input.d\n\n\n"
+    );
+    f.seed("input.d", b"invalid dependency rule\n")?;
+    assert_eq!(f.run(&args), 2);
+    assert_eq!(f.read("output.d")?, b"");
+    Ok(())
+}
+
+#[test]
+fn echo_color_updates_make_progress_and_formats_messages() -> HostResult<()> {
+    let f = Fixture::new();
+    f.seed("total", b"4\n")?;
+    assert_eq!(
+        f.run(&["cmake_progress_start", "build/CMakeFiles", "total"]),
+        0
+    );
+    assert_eq!(f.read("build/CMakeFiles/Progress/count.txt")?, b"4\n");
+    assert_eq!(
+        f.run(&["cmake_progress_report", "build/CMakeFiles", "4"]),
+        0
+    );
+    assert!(f.read("build/CMakeFiles/Progress/4").is_err());
+    assert_eq!(
+        f.run(&[
+            "cmake_echo_color",
+            "--switch=ON",
+            "--green",
+            "--bold",
+            "--progress-dir=build/CMakeFiles",
+            "--progress-num=1,2,2",
+            "--no-newline",
+            "Linking ",
+            "app",
+            "--normal",
+            "--newline",
+            ".",
+            "--progress-num=2,3",
+            "Done",
+        ]),
+        0
+    );
+    assert_eq!(f.out(), b"[ 50%] Linking app.\n[ 75%] Done\n");
+    assert_eq!(f.read("build/CMakeFiles/Progress/3")?, b"empty");
+    assert_eq!(f.run(&["cmake_progress_start", "build/CMakeFiles", "2"]), 0);
+    assert!(f.read("build/CMakeFiles/Progress/3").is_err());
+    assert_eq!(f.read("build/CMakeFiles/Progress/count.txt")?, b"2\n");
+    assert_eq!(f.run(&["cmake_progress_start", "build/CMakeFiles", "0"]), 0);
+    assert!(!is_dir(
+        &ToolCtx {
+            host: &f.host,
+            cwd: &f.cwd,
+            exe_display: b"cmake",
+            capabilities: &|| Value::Null,
+        },
+        &f.cwd.join("build/CMakeFiles/Progress")
+    ));
+    Ok(())
+}
+
+#[test]
+fn echo_color_uses_ansi_styles_when_color_is_forced() {
+    let f = Fixture::new();
+    f.host.env_set(b"CLICOLOR_FORCE", Some(b"1"));
+    assert_eq!(
+        f.run(&[
+            "cmake_echo_color",
+            "plain",
+            "--red",
+            "one",
+            "--bold",
+            "two",
+            "--switch=OFF",
+            "three",
+            "--switch=ON",
+            "--normal",
+            "four",
+        ]),
+        0
+    );
+    assert_eq!(
+        f.out(),
+        b"plain\n\x1b[31mone\x1b[0m\n\x1b[1m\x1b[31mtwo\x1b[0m\nthree\n\x1b[0mfour\x1b[0m\n"
+    );
+}

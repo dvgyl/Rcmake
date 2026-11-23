@@ -4,7 +4,9 @@
 
 mod archive;
 mod binary;
+mod depfile;
 mod files;
+mod generator;
 mod process;
 
 #[cfg(test)]
@@ -82,6 +84,13 @@ pub fn run(args: &[BString], cx: &ToolCtx<'_>) -> i32 {
         b"time" => process::time(args, cx),
         b"sleep" => process::sleep(args, cx),
         b"tar" => archive::tar(args, cx),
+        b"cmake_symlink_library" if args.len() == 3 => generator::symlink_library(args, cx),
+        b"cmake_symlink_executable" if args.len() == 2 => generator::symlink_executable(args, cx),
+        b"cmake_transform_depfile" if args.len() == 8 => depfile::transform(args, cx),
+        b"cmake_echo_color" => generator::echo_color(args, cx),
+        b"cmake_progress_start" if args.len() == 2 => generator::progress_start(args, cx),
+        // CMake 4.5.1 records progress in cmake_echo_color.
+        b"cmake_progress_report" if !args.is_empty() => 0,
         _ => unknown(command, cx),
     }
 }
