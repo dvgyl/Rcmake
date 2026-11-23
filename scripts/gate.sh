@@ -24,10 +24,10 @@ RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
 echo "==> [5/6] Workspace unit & integration tests"
 cargo test --workspace -- --test-threads="${RUST_TEST_THREADS:-3}"
 
-echo "==> [6/6] Stage & Layer 1 Oracle Differential Smoke"
+echo "==> [6/6] Stage & Layer 1 Oracle Differential Suites"
 if [[ -x "${RCMAKE_ORACLE_CMAKE:-}" ]]; then
   ./scripts/stage.sh
-  cargo run --quiet --bin rcmake-harness -- --suite smoke
+  cargo run --quiet --bin rcmake-harness -- --suite all
 else
   echo "WARNING: RCMAKE_ORACLE_CMAKE not found at '${RCMAKE_ORACLE_CMAKE:-}'; skipping oracle smoke." >&2
   exit 1

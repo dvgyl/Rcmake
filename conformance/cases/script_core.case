@@ -1,0 +1,62 @@
+=== CASE message-modes-and-defines ===
+# tool: cmake
+# args: -DFOO=bar -DBAZ:STRING=qux -P script.cmake -- extra1 extra2
+# check_files: false
+-- script.cmake --
+message(STATUS "foo=${FOO} baz=${BAZ} argc=${CMAKE_ARGC}")
+message("plain stderr ${FOO}")
+message(NOTICE "notice line")
+
+=== CASE if-precedence-and-truth ===
+# tool: cmake
+# args: -P script.cmake
+# check_files: false
+-- script.cmake --
+if(TRUE OR FALSE AND FALSE)
+  message(STATUS "bad-prec")
+else()
+  message(STATUS "good-prec")
+endif()
+if("1.2.3.4.5.999999999999999999999999" VERSION_GREATER "1.2.3.4.5.999999999999999999999998")
+  message(STATUS "big-ver-ok")
+endif()
+if("abc" MATCHES "(a)(b)(c)")
+  message(STATUS "match=${CMAKE_MATCH_0}:${CMAKE_MATCH_1}:${CMAKE_MATCH_2}:${CMAKE_MATCH_3}:n=${CMAKE_MATCH_COUNT}")
+endif()
+
+=== CASE foreach-range-and-items ===
+# tool: cmake
+# args: -P script.cmake
+# check_files: false
+-- script.cmake --
+foreach(i RANGE 1 5 2)
+  message(STATUS "r=${i}")
+endforeach()
+foreach(x IN ITEMS a "b;c" "")
+  message(STATUS "item=[${x}]")
+endforeach()
+
+=== CASE function-argnc-and-macro ===
+# tool: cmake
+# args: -P script.cmake
+# check_files: false
+-- script.cmake --
+function(greet first)
+  message(STATUS "first=${first} argc=${ARGC} argnc=${ARGNC} argn=${ARGN}")
+endfunction()
+greet(hello world 42)
+
+macro(echo_macro x)
+  message(STATUS "macro=${x} argc=${ARGC}")
+endmacro()
+echo_macro(abc)
+
+=== CASE block-and-return-propagate ===
+# tool: cmake
+# args: -P script.cmake
+# check_files: false
+-- script.cmake --
+block(SCOPE_FOR VARIABLES)
+  message(STATUS "inside-block")
+endblock()
+message(STATUS "after-block")

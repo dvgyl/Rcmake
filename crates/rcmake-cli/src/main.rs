@@ -9,6 +9,10 @@ use std::sync::Arc;
 
 use rcmake_host::{Host, NativeHost, Stream};
 
+/// Generous worker stack (64 MiB) so deep CMake script recursion (1,000+ frames even in
+/// debug builds) never overflows macOS's 8 MiB main thread stack.
+const WORKER_STACK_BYTES: usize = 64 * 1024 * 1024;
+
 fn main() -> ExitCode {
     let argv: Vec<_> = std::env::args_os()
         .map(|a| rcmake_host::path::from_native(Path::new(&a)))
@@ -23,10 +27,24 @@ fn main() -> ExitCode {
         }
     };
 
-    let host_for_panic = host.clone();
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-        rcmake_cli::run(&argv, host)
-    }));
+    let host_for_panic = Arc::clone(&host);
+    let spawned = std::thread::Builder::new()
+        .name("rcmake-main".to_owned())
+        .stack_size(WORKER_STACK_BYTES)
+        .spawn(move || rcmake_cli::run(&argv, host));
+
+    let result = match spawned {
+        Ok(handle) => handle.join(),
+        Err(_) => {
+            let fallback = Arc::clone(&host_for_panic);
+            let argv_fallback: Vec<_> = std::env::args_os()
+                .map(|a| rcmake_host::path::from_native(Path::new(&a)))
+                .collect();
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                rcmake_cli::run(&argv_fallback, fallback)
+            }))
+        }
+    };
 
     match result {
         Ok(code) => ExitCode::from(u8::try_from(code.clamp(0, 255)).unwrap_or(1)),

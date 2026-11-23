@@ -214,7 +214,11 @@ version = "0.1.0"
 dependencies = [
  "rcmake-base",
  "rcmake-diag",
+ "rcmake-eval",
  "rcmake-host",
+ "rcmake-json",
+ "rcmake-model",
+ "rcmake-presets",
  "rcmake-syntax",
 ]
 
@@ -301,6 +305,7 @@ dependencies = [
  "rcmake-diag",
  "rcmake-host",
  "rcmake-json",
+ "rcmake-regex",
  "thiserror",
 ]
 

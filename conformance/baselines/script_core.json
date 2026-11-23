@@ -1,0 +1,27 @@
+{
+  "block-and-return-propagate": {
+    "exit_code": 0,
+    "stdout": "-- inside-block\n-- after-block\n",
+    "stderr": ""
+  },
+  "foreach-range-and-items": {
+    "exit_code": 0,
+    "stdout": "-- r=1\n-- r=3\n-- r=5\n-- item=[a]\n-- item=[b;c]\n-- item=[]\n",
+    "stderr": ""
+  },
+  "function-argnc-and-macro": {
+    "exit_code": 0,
+    "stdout": "-- first=hello argc=3 argnc=2 argn=world;42\n-- macro=abc argc=1\n",
+    "stderr": ""
+  },
+  "if-precedence-and-truth": {
+    "exit_code": 0,
+    "stdout": "-- good-prec\n-- big-ver-ok\n-- match=abc:a:b:c:n=3\n",
+    "stderr": ""
+  },
+  "message-modes-and-defines": {
+    "exit_code": 0,
+    "stdout": "-- foo=bar baz=qux argc=8\n",
+    "stderr": "plain stderr bar\nnotice line\n"
+  }
+}

@@ -15,8 +15,15 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use rcmake_base::BString;
+use rcmake_base::{BString, Limits};
 use thiserror::Error;
+
+pub mod glob;
+mod parse;
+mod program;
+
+#[cfg(test)]
+mod tests;
 
 /// Maximum number of capture slots (`0` = full match, `1..=31` = capturing groups).
 pub const MAX_CAPTURE_SLOTS: usize = 32;
@@ -24,7 +31,7 @@ pub const MAX_CAPTURE_SLOTS: usize = 32;
 /// Number of `CMAKE_MATCH_<n>` variables exposed by CMake (`0..=9`).
 pub const MATCH_VAR_SLOTS: usize = 10;
 
-/// Compilation error produced by [`Regex::new`].
+/// Error from compiling a pattern or expanding a replacement.
 #[derive(Clone, Debug, PartialEq, Eq, Error)]
 #[error("{message}")]
 pub struct RegexError {
@@ -40,8 +47,8 @@ pub struct RegexLimit;
 /// Matching options controlling `^` anchoring and zero-length match acceptance.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MatchOptions {
-    /// When `true` (`CMP0186` OLD/unset), `^` matches at `start`; when `false` (`CMP0186` NEW),
-    /// `^` matches only at byte offset `0`.
+    /// Use `start` as the beginning of the input for `^` (`CMP0186` OLD/unset).
+    /// Set to `false` for `CMP0186` NEW, which uses byte offset `0`.
     pub bol_at_start: bool,
     /// When `false`, a zero-length match at `start` is rejected (used when retrying after
     /// an empty match during `MATCHALL`/`REPLACE`).
@@ -89,14 +96,16 @@ impl Captures {
 #[derive(Clone, Debug)]
 pub struct Regex {
     group_count: usize,
+    program: Arc<[program::Instruction]>,
 }
 
 impl Regex {
     /// Compile a CMake regular expression pattern.
-    pub fn new(_pattern: &[u8]) -> Result<Self, RegexError> {
-        Err(RegexError {
-            message: "RegularExpression::compile(): not yet implemented (scheduled for M1-W1)"
-                .to_owned(),
+    pub fn new(pattern: &[u8]) -> Result<Self, RegexError> {
+        let (expression, group_count) = parse::parse(pattern)?;
+        Ok(Self {
+            group_count,
+            program: program::compile(expression).into(),
         })
     }
 
@@ -106,15 +115,17 @@ impl Regex {
         self.group_count
     }
 
-    /// Search `hay` starting at byte offset `start`, consuming from `budget`.
+    /// Search `hay` from byte offset `start`. Subtract each match step from `budget`.
+    ///
+    /// Return [`RegexLimit`] if the search needs a step after the budget reaches zero.
     pub fn find_at(
         &self,
-        _hay: &[u8],
-        _start: usize,
-        _options: MatchOptions,
-        _budget: &mut u64,
+        hay: &[u8],
+        start: usize,
+        options: MatchOptions,
+        budget: &mut u64,
     ) -> Result<Option<Captures>, RegexLimit> {
-        Ok(None)
+        program::find(&self.program, hay, start, options, budget)
     }
 }
 
@@ -140,13 +151,66 @@ impl RegexCache {
     }
 }
 
-/// CMake glob-to-regex conversion (`file(GLOB)` / `string(MATCH)` glob helpers).
-pub mod glob {
-    use rcmake_base::BString;
+/// Expand a CMake replacement template for a successful match.
+///
+/// Use `\0` for the full match, `\1` through `\9` for capture groups, `\\` for a
+/// backslash, and `\n` for a newline. A group that did not participate gives an
+/// empty string. Return an error for an invalid escape, an undefined group, or a
+/// result larger than the default value size limit.
+pub fn expand_replacement(
+    template: &[u8],
+    hay: &[u8],
+    caps: &Captures,
+    group_count: usize,
+) -> Result<BString, RegexError> {
+    let mut out = Vec::new();
+    let mut remaining = template.iter().copied();
+    let limit = Limits::default().max_value_bytes;
+    while let Some(byte) = remaining.next() {
+        let bytes = match byte {
+            b'\\' => match remaining.next() {
+                Some(digit @ b'0'..=b'9') => {
+                    let group = usize::from(digit - b'0');
+                    if group > group_count {
+                        return Err(replacement_error(format_args!(
+                            "replace expression \"{}\" contains an out-of-range escape for group {group}.",
+                            String::from_utf8_lossy(template)
+                        )));
+                    }
+                    caps.groups
+                        .get(group)
+                        .and_then(|&span| span)
+                        .and_then(|(start, end)| hay.get(start..end))
+                        .unwrap_or_default()
+                }
+                Some(b'\\') => b"\\",
+                Some(b'n') => b"\n",
+                Some(escape) => {
+                    return Err(replacement_error(format_args!(
+                        "Unknown escape \"\\{}\" in replace-expression.",
+                        String::from_utf8_lossy(std::slice::from_ref(&escape))
+                    )));
+                }
+                None => {
+                    return Err(replacement_error(format_args!(
+                        "replace-expression ends in a backslash."
+                    )));
+                }
+            },
+            _ => std::slice::from_ref(&byte),
+        };
+        if bytes.len() > limit - out.len() {
+            return Err(replacement_error(format_args!(
+                "Replacement exceeds the value size limit."
+            )));
+        }
+        out.extend_from_slice(bytes);
+    }
+    Ok(BString::from(out))
+}
 
-    /// Convert a CMake glob pattern into an equivalent anchored CMake regex.
-    #[must_use]
-    pub fn to_regex(glob: &[u8]) -> BString {
-        BString::from(glob)
+fn replacement_error(detail: std::fmt::Arguments<'_>) -> RegexError {
+    RegexError {
+        message: format!("string sub-command REGEX, mode REPLACE: {detail}"),
     }
 }

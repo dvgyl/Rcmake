@@ -4,6 +4,10 @@
 
 #![forbid(unsafe_code)]
 
+mod condition;
+mod expand;
+mod number;
+
 use std::path::Path;
 use std::sync::Arc;
 
@@ -11,7 +15,7 @@ use rcmake_base::BString;
 use rcmake_diag::{Diagnostic, PolicyId, PolicyStatus};
 use rcmake_host::Host;
 use rcmake_regex::{Captures, Regex, RegexError};
-use rcmake_syntax::{ArgKind, Argument};
+use rcmake_syntax::ArgKind;
 use thiserror::Error;
 
 /// One expanded command argument retaining its original [`ArgKind`] delimiter so `if()`
@@ -58,28 +62,7 @@ pub struct ExpandError {
     pub message: BString,
 }
 
-/// Expand a slice of parsed [`Argument`]s into [`ExpandedArg`]s.
-///
-/// - [`ArgKind::Bracket`] passes through verbatim as 1 argument.
-/// - [`ArgKind::Quoted`] decodes escapes and expands `${...}`/`$ENV{...}`/`$CACHE{...}` into 1 argument.
-/// - [`ArgKind::Unquoted`] decodes escapes and expands variables, then splits on `;`
-///   with `Empty::Drop` (each resulting element retains `ArgKind::Unquoted`).
-pub fn expand_args(
-    _args: &[Argument],
-    _env: &mut dyn ExpandEnv,
-    _out: &mut Vec<ExpandedArg>,
-) -> Result<(), ExpandError> {
-    Err(ExpandError {
-        message: "expand_args not yet implemented (scheduled for M1-W1)".into(),
-    })
-}
-
-/// Expand variables and escape sequences inside a raw byte string without list splitting.
-pub fn expand_string(_src: &[u8], _env: &mut dyn ExpandEnv) -> Result<BString, ExpandError> {
-    Err(ExpandError {
-        message: "expand_string not yet implemented (scheduled for M1-W1)".into(),
-    })
-}
+pub use expand::{expand_args, expand_string};
 
 /// Full execution context required by CMake 4.5.1's `if()` / `while()` condition evaluator.
 pub trait CondEnv: ExpandEnv {
@@ -137,37 +120,10 @@ pub struct CondError {
     pub message: BString,
 }
 
-/// Evaluate an expanded `if()` / `while()` condition using CMake 4.5.1's multi-pass
-/// reduction rules.
-pub fn eval_condition(_args: &[ExpandedArg], _env: &mut dyn CondEnv) -> Result<bool, CondError> {
-    Err(CondError {
-        message: "eval_condition not yet implemented (scheduled for M1-W1)".into(),
-    })
-}
+pub use condition::eval_condition;
 
-/// `configure_file` template substitution (`@VAR@`, `${VAR}`, `#cmakedefine`, `#cmakedefine01`).
-pub mod configure {
-    use rcmake_base::BString;
+/// CMake template substitution for `configure_file`.
+pub mod configure;
 
-    use crate::{ExpandEnv, ExpandError};
-
-    /// Options controlling `configure_file` expansion.
-    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-    pub struct ConfigureOptions {
-        /// Expand only `@VAR@` references (`@ONLY`).
-        pub at_only: bool,
-        /// Escape double quotes with backslashes (`ESCAPE_QUOTES`).
-        pub escape_quotes: bool,
-    }
-
-    /// Perform `configure_file` template substitution over `input`.
-    pub fn configure(
-        _input: &[u8],
-        _env: &mut dyn ExpandEnv,
-        _options: ConfigureOptions,
-    ) -> Result<BString, ExpandError> {
-        Err(ExpandError {
-            message: "configure not yet implemented (scheduled for M1-W1)".into(),
-        })
-    }
-}
+#[cfg(test)]
+mod tests;
