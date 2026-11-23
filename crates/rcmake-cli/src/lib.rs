@@ -2,11 +2,18 @@
 
 #![forbid(unsafe_code)]
 
+mod cache;
+mod configure;
+mod options;
+mod presets;
+mod resource;
+
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use options::{Options, ParseResult};
 use rcmake_base::{
     BString, CMAKE_VERSION_MAJOR, CMAKE_VERSION_MINOR, CMAKE_VERSION_PATCH, CMAKE_VERSION_STR,
     Limits,
@@ -15,11 +22,10 @@ use rcmake_diag::{
     DiagAction, DiagCategory, DiagOptions, DiagState, Diagnostic, Effect, Location, MessageKind,
     RenderOptions, render,
 };
-use rcmake_eval::{CacheDefine, Interp, InterpConfig, LogLevel, RunMode};
+use rcmake_eval::{CacheDefine, Interp, InterpConfig, RunMode};
 use rcmake_host::{Host, Stream, WriteMode};
 use rcmake_json::Value;
 use rcmake_model::CacheType;
-use rcmake_presets::{EnvSnapshot, PresetKind, PresetSettings};
 
 /// Active tool persona selected from the `argv[0]` basename.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -74,7 +80,7 @@ pub fn run(argv: &[BString], host: Arc<dyn Host>) -> i32 {
     let rest = argv.get(1..).unwrap_or(&[]);
     if let Some(first) = rest.first() {
         let fb = first.as_slice();
-        if fb == b"--version" || fb == b"-version" || fb == b"/V" {
+        if fb == b"--version" || fb == b"-version" || fb == b"/V" || fb == b"/version" {
             let banner = format!(
                 "{} version {CMAKE_VERSION_STR}\n\nRcmake native Rust drop-in replacement for CMake {CMAKE_VERSION_STR}.\n",
                 tool.name()
@@ -86,6 +92,7 @@ pub fn run(argv: &[BString], host: Arc<dyn Host>) -> i32 {
             .strip_prefix(b"--version=")
             .or_else(|| fb.strip_prefix(b"-version="))
             .or_else(|| fb.strip_prefix(b"/V="))
+            .or_else(|| fb.strip_prefix(b"/version="))
         {
             return run_version_format(tool, fmt, host.as_ref());
         }
@@ -147,531 +154,118 @@ fn run_version_format(tool: Tool, fmt: &[u8], host: &dyn Host) -> i32 {
     0
 }
 
-enum ListPresetsMode {
-    One(PresetKind),
-    All,
-}
-
 fn run_cmake(argv: &[BString], rest: &[BString], host: Arc<dyn Host>) -> i32 {
-    let mut defines: Vec<CacheDefine> = Vec::new();
-    let mut preload_scripts: Vec<PathBuf> = Vec::new();
-    let mut diag_state = DiagState::default();
-    let mut sarif_output: Option<PathBuf> = None;
-    let mut log_level: Option<LogLevel> = None;
-    let mut log_context = false;
-    let mut view_only = false;
-    let mut source_dir: Option<PathBuf> = None;
-    let mut binary_dir: Option<PathBuf> = None;
-    let mut generator: Option<BString> = None;
-    let mut preset_name: Option<BString> = None;
-    let mut list_presets: Option<ListPresetsMode> = None;
-    let mut positional: Vec<BString> = Vec::new();
-    let mut i = 0usize;
-
-    while let Some(arg) = rest.get(i) {
-        let bytes = arg.as_slice();
-        if bytes == b"-E" {
-            let sub_args = rest.get(i + 1..).unwrap_or(&[]);
-            let cwd = host.initial_cwd();
-            let exe_display = host
-                .current_exe()
-                .map(|p| rcmake_host::path::from_native(&p))
-                .unwrap_or_else(|_| BString::from("cmake"));
-            let caps = build_capabilities_json;
-            let ctx = rcmake_tool_e::ToolCtx {
-                host: host.as_ref(),
-                cwd: &cwd,
-                exe_display: exe_display.as_slice(),
-                capabilities: &caps,
-            };
-            return rcmake_tool_e::run(sub_args, &ctx);
-        }
-        if bytes == b"-P" {
-            let Some(script_arg) = rest.get(i + 1) else {
-                emit_cli_error(host.as_ref(), "No script specified for argument -P");
-                return 1;
-            };
-            return run_script_mode(
-                argv,
-                script_arg.as_slice(),
-                defines,
-                diag_state,
-                sarif_output,
-                log_level,
-                log_context,
-                host,
-            );
-        }
-        if bytes == b"--build" || bytes == b"--install" {
-            emit_cli_error(
-                host.as_ref(),
-                format!(
-                    "{} mode is not yet implemented (scheduled for Milestone 2)",
-                    String::from_utf8_lossy(bytes)
-                ),
-            );
-            return 1;
-        }
-        if bytes == b"-N" {
-            view_only = true;
-            i += 1;
-            continue;
-        }
-        if let Some(c_arg) = take_opt_value(rest, &mut i, b"-C") {
-            let Some(val) = c_arg else {
-                emit_cli_error(host.as_ref(), "No file specified for -C");
-                return 1;
-            };
-            preload_scripts.push(rcmake_host::path::to_native(val));
-            continue;
-        }
-        if let Some(s_arg) = take_opt_value(rest, &mut i, b"-S") {
-            let Some(val) = s_arg else {
-                emit_cli_error(host.as_ref(), "No source directory specified for -S");
-                return 1;
-            };
-            source_dir = Some(resolve_cli_path(host.as_ref(), val));
-            continue;
-        }
-        if let Some(b_arg) = take_opt_value(rest, &mut i, b"-B") {
-            let Some(val) = b_arg else {
-                emit_cli_error(host.as_ref(), "No build directory specified for -B");
-                return 1;
-            };
-            binary_dir = Some(resolve_cli_path(host.as_ref(), val));
-            continue;
-        }
-        if let Some(g_arg) = take_opt_value(rest, &mut i, b"-G") {
-            let Some(val) = g_arg else {
-                emit_cli_error(host.as_ref(), "No generator specified for -G");
-                return 1;
-            };
-            generator = Some(BString::from(val));
-            continue;
-        }
-        if let Some(def) = bytes.strip_prefix(b"-D") {
-            let raw = if def.is_empty() {
-                i += 1;
-                match rest.get(i) {
-                    Some(next) => next.as_slice(),
-                    None => {
-                        emit_cli_error(host.as_ref(), "No argument for -D");
-                        return 1;
-                    }
-                }
-            } else {
-                def
-            };
-            let Some(parsed) = parse_define(raw) else {
-                let raw_s = String::from_utf8_lossy(raw);
-                host.write_out(
-                    Stream::Stderr,
-                    format!(
-                        "CMake Error: Parse error in command line argument: {raw_s}\n Should be: VAR:type=value\n\nCMake Error: Run 'cmake --help' for all supported options.\n"
-                    )
-                    .as_bytes(),
-                );
-                return 1;
-            };
-            defines.push(parsed);
-            i += 1;
-            continue;
-        }
-        if bytes.starts_with(b"-U") {
-            if bytes == b"-U" {
-                i += 1;
-            }
-            i += 1;
-            continue;
-        }
-        if bytes == b"--preset" {
-            i += 1;
-            let Some(next) = rest.get(i) else {
-                emit_cli_error(host.as_ref(), "No preset specified for --preset");
-                return 1;
-            };
-            preset_name = Some(next.clone());
-            i += 1;
-            continue;
-        }
-        if let Some(p) = bytes.strip_prefix(b"--preset=") {
-            preset_name = Some(BString::from(p));
-            i += 1;
-            continue;
-        }
-        if bytes == b"--log-context" {
-            log_context = true;
-            i += 1;
-            continue;
-        }
-        if let Some(level_bytes) = bytes.strip_prefix(b"--log-level=") {
-            if let Some(lvl) = LogLevel::parse(level_bytes) {
-                log_level = Some(lvl);
-            } else {
-                emit_cli_error(
-                    host.as_ref(),
-                    format!(
-                        "Value {} for --log-level is not a valid log level.",
-                        String::from_utf8_lossy(level_bytes)
-                    ),
-                );
-                return 1;
-            }
-            i += 1;
-            continue;
-        }
-        if bytes == b"--log-level" {
-            i += 1;
-            let Some(next) = rest.get(i) else {
-                emit_cli_error(host.as_ref(), "No argument for --log-level");
-                return 1;
-            };
-            if let Some(lvl) = LogLevel::parse(next.as_slice()) {
-                log_level = Some(lvl);
-            } else {
-                emit_cli_error(
-                    host.as_ref(),
-                    format!(
-                        "Value {} for --log-level is not a valid log level.",
-                        String::from_utf8_lossy(next.as_slice())
-                    ),
-                );
-                return 1;
-            }
-            i += 1;
-            continue;
-        }
-        if let Some(path_bytes) = bytes.strip_prefix(b"--sarif-output=") {
-            let p = resolve_cli_path(host.as_ref(), path_bytes);
-            sarif_output = Some(p);
-            i += 1;
-            continue;
-        }
-        if apply_warning_flag(bytes, &mut diag_state) {
-            i += 1;
-            continue;
-        }
-        if bytes == b"--list-presets" || bytes.starts_with(b"--list-presets=") {
-            let mode = match bytes.strip_prefix(b"--list-presets=") {
-                None | Some(b"configure") => ListPresetsMode::One(PresetKind::Configure),
-                Some(b"build") => ListPresetsMode::One(PresetKind::Build),
-                Some(b"test") => ListPresetsMode::One(PresetKind::Test),
-                Some(b"package") => ListPresetsMode::One(PresetKind::Package),
-                Some(b"workflow") => ListPresetsMode::One(PresetKind::Workflow),
-                Some(b"all") => ListPresetsMode::All,
-                Some(_) => {
-                    emit_cli_error(host.as_ref(), "Invalid value specified for --list-presets.");
+    if let Some(sub_args) = rest.strip_prefix(&[BString::from("-E")]) {
+        if let [command, args @ ..] = sub_args {
+            match command.as_slice() {
+                b"cmake_llvm_rc" => return resource::run(args, host.as_ref()),
+                b"server" => {
+                    emit_cli_error(
+                        host.as_ref(),
+                        "CMake server mode has been removed in favor of the file-api.",
+                    );
                     return 1;
                 }
-            };
-            list_presets = Some(mode);
-            i += 1;
-            continue;
-        }
-        if bytes == b"--no-warn-unused-cli"
-            || bytes == b"--debug-output"
-            || bytes == b"--trace"
-            || bytes == b"--trace-expand"
-            || bytes.starts_with(b"--trace-")
-        {
-            i += 1;
-            continue;
-        }
-        if bytes == b"-H" || bytes.starts_with(b"-H") {
-            let val = if bytes == b"-H" {
-                i += 1;
-                rest.get(i).map(|a| a.as_slice())
-            } else {
-                bytes.strip_prefix(b"-H")
-            };
-            if let Some(v) = val {
-                source_dir = Some(resolve_cli_path(host.as_ref(), v));
+                _ => {}
             }
-            i += 1;
-            continue;
         }
-        if !bytes.starts_with(b"-") {
-            positional.push(arg.clone());
-        }
-        i += 1;
-    }
-
-    if let Some(mode) = list_presets {
-        let dir = source_dir
-            .or_else(|| {
-                positional
-                    .first()
-                    .map(|p| resolve_cli_path(host.as_ref(), p.as_slice()))
-            })
-            .unwrap_or_else(|| host.initial_cwd());
-        return run_list_presets(host.as_ref(), &dir, mode);
-    }
-
-    if view_only && !preload_scripts.is_empty() {
-        return run_view_preload(
-            argv,
-            &preload_scripts,
-            defines,
-            diag_state,
-            sarif_output,
-            log_level,
-            log_context,
-            host,
-        );
-    }
-
-    if preset_name.is_some()
-        || source_dir.is_some()
-        || binary_dir.is_some()
-        || !positional.is_empty()
-    {
-        return run_configure_mode(
-            argv,
-            source_dir,
-            binary_dir,
-            positional,
-            preset_name,
-            generator,
-            &preload_scripts,
-            defines,
-            diag_state,
-            sarif_output,
-            log_level,
-            log_context,
-            host,
-        );
-    }
-
-    emit_cli_error(
-        host.as_ref(),
-        "Requested CLI mode is not yet implemented (scheduled for Milestone 1/2)",
-    );
-    1
-}
-
-fn take_opt_value<'a>(
-    rest: &'a [BString],
-    idx: &mut usize,
-    flag: &[u8],
-) -> Option<Option<&'a [u8]>> {
-    let bytes = rest.get(*idx)?.as_slice();
-    if bytes == flag {
-        *idx += 1;
-        let val = rest.get(*idx).map(|a| a.as_slice());
-        if val.is_some() {
-            *idx += 1;
-        }
-        Some(val)
-    } else if let Some(tail) = bytes.strip_prefix(flag) {
-        *idx += 1;
-        Some(Some(tail))
-    } else {
-        None
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn run_view_preload(
-    argv: &[BString],
-    preload_scripts: &[PathBuf],
-    defines: Vec<CacheDefine>,
-    diag_state: DiagState,
-    sarif_output: Option<PathBuf>,
-    log_level: Option<LogLevel>,
-    log_context: bool,
-    host: Arc<dyn Host>,
-) -> i32 {
-    let cwd = host.initial_cwd();
-    let (cmake_command, cmake_root) = discover_cmake_paths(host.as_ref());
-    let cfg = InterpConfig {
-        host: Arc::clone(&host),
-        mode: RunMode::Configure,
-        cmake_root,
-        cmake_command,
-        cwd,
-        limits: Limits::default(),
-        diag: DiagOptions {
-            initial_state: diag_state,
-            sarif: sarif_output.is_some(),
-        },
-        defines,
-        script_args: argv.to_vec(),
-    };
-    let mut interp = Interp::new(cfg, rcmake_commands::register_all);
-    interp.set_log_level(log_level);
-    if log_context {
-        interp.set_log_context(true);
-    }
-    for script in preload_scripts {
-        let _ = interp.run_preload_script(script);
-        if interp.fatal_occurred() {
-            break;
-        }
-    }
-    write_sarif_if_requested(host.as_ref(), sarif_output.as_deref(), &interp);
-    interp.exit_code()
-}
-
-#[allow(clippy::too_many_arguments)]
-fn run_configure_mode(
-    argv: &[BString],
-    mut source_dir: Option<PathBuf>,
-    mut binary_dir: Option<PathBuf>,
-    positional: Vec<BString>,
-    preset_name: Option<BString>,
-    mut generator: Option<BString>,
-    preload_scripts: &[PathBuf],
-    mut defines: Vec<CacheDefine>,
-    diag_state: DiagState,
-    sarif_output: Option<PathBuf>,
-    log_level: Option<LogLevel>,
-    log_context: bool,
-    host: Arc<dyn Host>,
-) -> i32 {
-    let cwd = host.initial_cwd();
-    if source_dir.is_none()
-        && let Some(first) = positional.first()
-    {
-        source_dir = Some(resolve_cli_path(host.as_ref(), first.as_slice()));
-    }
-    let src = source_dir.unwrap_or_else(|| cwd.clone());
-
-    if let Some(pname) = preset_name {
-        let presets = match rcmake_presets::load(&src, host.as_ref()) {
-            Ok(p) => p,
-            Err(err) => {
-                emit_cli_error(host.as_ref(), err.to_string());
-                return 1;
-            }
+        let cwd = host.initial_cwd();
+        let exe = host
+            .current_exe()
+            .map(|p| rcmake_host::path::from_native(&p))
+            .unwrap_or_else(|_| BString::from("cmake"));
+        let ctx = rcmake_tool_e::ToolCtx {
+            host: host.as_ref(),
+            cwd: &cwd,
+            exe_display: &exe,
+            capabilities: &build_capabilities_json,
         };
-        let env = EnvSnapshot::from_host(host.as_ref());
-        let resolved = match rcmake_presets::resolve(
-            &presets,
-            PresetKind::Configure,
-            pname.as_slice(),
-            &env,
-        ) {
-            Ok(r) => r,
-            Err(err) => {
-                emit_cli_error(host.as_ref(), err.to_string());
-                return 1;
-            }
-        };
-        if binary_dir.is_none()
-            && let Some(bd) = &resolved.binary_dir
-        {
-            binary_dir = Some(resolve_cli_path(host.as_ref(), bd.as_slice()));
-        }
-        if generator.is_none() {
-            generator = resolved.generator.clone();
-        }
-        for (k, v) in &resolved.environment {
-            host.env_set(k.as_slice(), v.as_ref().map(|b| b.as_slice()));
-        }
-        if let PresetSettings::Configure(cfg) = &resolved.settings
-            && let Some(vars) = &cfg.cache_variables
-        {
-            for (name, cv) in vars {
-                let ty = cv
-                    .kind
-                    .as_ref()
-                    .and_then(|t| CacheType::parse(t.as_slice()));
-                defines.push(CacheDefine {
-                    name: name.clone(),
-                    ty,
-                    value: cv.value.clone(),
-                });
+        return rcmake_tool_e::run(sub_args, &ctx);
+    }
+
+    let mut opts = match options::parse(rest, host.as_ref()) {
+        ParseResult::Run(opts) => *opts,
+        ParseResult::Exit(code) => return code,
+    };
+    if let Some(script) = opts.script.take() {
+        let mut interp = new_interp(argv, &opts, RunMode::Script, Arc::clone(&host));
+        for edit in opts.cache_edits {
+            if let options::CacheEdit::Define(def) = edit {
+                cache::apply(interp.cx().cache(), def);
             }
         }
+        let state = configure::initialize_diagnostics(
+            host.as_ref(),
+            interp.cx().cache(),
+            &[],
+            &opts.warning_flags,
+            false,
+        );
+        *interp.cx().diag_state_mut() = state;
+        let outcome = interp.run_script(&script);
+        if !write_sarif_if_requested(host.as_ref(), opts.sarif.as_deref(), &interp, Vec::new()) {
+            return 1;
+        }
+        return outcome.exit_code;
     }
-
-    if let Some(generator_name) = generator {
-        defines.push(CacheDefine {
-            name: BString::from("CMAKE_GENERATOR"),
-            ty: Some(CacheType::Internal),
-            value: generator_name,
-        });
-    }
-
-    let bin = binary_dir.unwrap_or_else(|| cwd.clone());
-    let (cmake_command, cmake_root) = discover_cmake_paths(host.as_ref());
-
-    let cfg = InterpConfig {
-        host: Arc::clone(&host),
-        mode: RunMode::Configure,
-        cmake_root,
-        cmake_command,
-        cwd,
-        limits: Limits::default(),
-        diag: DiagOptions {
-            initial_state: diag_state,
-            sarif: sarif_output.is_some(),
-        },
-        defines,
-        script_args: argv.to_vec(),
-    };
-
-    let mut interp = Interp::new(cfg, rcmake_commands::register_all);
-    interp.set_log_level(log_level);
-    if log_context {
-        interp.set_log_context(true);
-    }
-
-    let outcome = interp.run_configure(&src, &bin, preload_scripts);
-    if !write_sarif_if_requested(host.as_ref(), sarif_output.as_deref(), &interp) {
-        return 1;
-    }
-    outcome.exit_code
+    configure::run(argv, opts, host)
 }
 
-#[allow(clippy::too_many_arguments)]
-fn run_script_mode(
-    argv: &[BString],
-    script_arg: &[u8],
-    defines: Vec<CacheDefine>,
-    diag_state: DiagState,
-    sarif_output: Option<PathBuf>,
-    log_level: Option<LogLevel>,
-    log_context: bool,
-    host: Arc<dyn Host>,
-) -> i32 {
-    let cwd = host.initial_cwd();
-    let script_path = resolve_cli_path(host.as_ref(), script_arg);
-    let (cmake_command, cmake_root) = discover_cmake_paths(host.as_ref());
-
+fn new_interp(argv: &[BString], opts: &Options, mode: RunMode, host: Arc<dyn Host>) -> Interp {
+    let (cmake_command, cmake_root) = discover_cmake_paths(host.as_ref(), argv.first());
     let cfg = InterpConfig {
-        host: Arc::clone(&host),
-        mode: RunMode::Script,
+        cwd: host.initial_cwd(),
+        host,
+        mode,
         cmake_root,
         cmake_command,
-        cwd,
         limits: Limits::default(),
         diag: DiagOptions {
-            initial_state: diag_state,
-            sarif: sarif_output.is_some(),
+            initial_state: DiagState::default(),
+            sarif: opts.sarif.is_some(),
         },
-        defines,
+        defines: Vec::new(),
         script_args: argv.to_vec(),
     };
-
     let mut interp = Interp::new(cfg, rcmake_commands::register_all);
-    interp.set_log_level(log_level);
-    if log_context {
-        interp.set_log_context(true);
-    }
-
-    let outcome = interp.run_script(&script_path);
-    if !write_sarif_if_requested(host.as_ref(), sarif_output.as_deref(), &interp) {
-        return 1;
-    }
-    outcome.exit_code
+    interp.set_log_level(opts.log_level);
+    interp.set_log_context(opts.log_context);
+    interp
 }
 
-fn write_sarif_if_requested(host: &dyn Host, path: Option<&Path>, interp: &Interp) -> bool {
+fn sarif_results(sarif: &mut Value) -> Option<&mut Vec<Value>> {
+    let Value::Object(root) = sarif else {
+        return None;
+    };
+    let Value::Array(runs) = root.get_mut(b"runs".as_slice())? else {
+        return None;
+    };
+    let Value::Object(run) = runs.first_mut()? else {
+        return None;
+    };
+    let Value::Array(results) = run.get_mut(b"results".as_slice())? else {
+        return None;
+    };
+    Some(results)
+}
+
+fn write_sarif_if_requested(
+    host: &dyn Host,
+    path: Option<&Path>,
+    interp: &Interp,
+    mut preload_results: Vec<Value>,
+) -> bool {
     let Some(sarif_path) = path else {
         return true;
     };
-    let json = rcmake_json::write_styled(&interp.diag_engine().sarif_json(), "  ");
+    let mut sarif = interp.diag_engine().sarif_json();
+    if !preload_results.is_empty()
+        && let Some(results) = sarif_results(&mut sarif)
+    {
+        preload_results.append(results);
+        *results = preload_results;
+    }
+    let json = rcmake_json::write_styled(&sarif, "  ");
     if let Err(err) = host.write(sarif_path, json.as_slice(), WriteMode::Truncate) {
         emit_cli_error(
             host,
@@ -683,81 +277,6 @@ fn write_sarif_if_requested(host: &dyn Host, path: Option<&Path>, interp: &Inter
         return false;
     }
     true
-}
-
-fn run_list_presets(host: &dyn Host, source_dir: &Path, mode: ListPresetsMode) -> i32 {
-    let presets = match rcmake_presets::load(source_dir, host) {
-        Ok(p) => p,
-        Err(err) => {
-            emit_cli_error(host, err.to_string());
-            return 1;
-        }
-    };
-    let env = EnvSnapshot::from_host(host);
-    let kinds: &[PresetKind] = match mode {
-        ListPresetsMode::One(k) => match k {
-            PresetKind::Configure => &[PresetKind::Configure],
-            PresetKind::Build => &[PresetKind::Build],
-            PresetKind::Test => &[PresetKind::Test],
-            PresetKind::Package => &[PresetKind::Package],
-            PresetKind::Workflow => &[PresetKind::Workflow],
-        },
-        ListPresetsMode::All => &[
-            PresetKind::Configure,
-            PresetKind::Build,
-            PresetKind::Test,
-            PresetKind::Package,
-            PresetKind::Workflow,
-        ],
-    };
-
-    let mut out = String::new();
-    let mut printed_any = false;
-    for &kind in kinds {
-        let visible = presets.list_visible(kind, &env);
-        if matches!(mode, ListPresetsMode::All) && visible.is_empty() {
-            continue;
-        }
-        if printed_any {
-            out.push('\n');
-        }
-        printed_any = true;
-
-        let title = match kind {
-            PresetKind::Configure => "Available configure presets:",
-            PresetKind::Build => "Available build presets:",
-            PresetKind::Test => "Available test presets:",
-            PresetKind::Package => "Available package presets:",
-            PresetKind::Workflow => "Available workflow presets:",
-        };
-        out.push_str(title);
-        out.push_str("\n\n");
-
-        let max_len = visible
-            .iter()
-            .map(|item| item.name.len())
-            .max()
-            .unwrap_or(0);
-        for item in visible {
-            let name = String::from_utf8_lossy(item.name.as_slice());
-            if let Some(display) = item.display_name {
-                let pad = max_len.saturating_sub(item.name.len()) + 1;
-                out.push_str("  \"");
-                out.push_str(&name);
-                out.push('"');
-                for _ in 0..pad {
-                    out.push(' ');
-                }
-                out.push_str("- ");
-                out.push_str(&String::from_utf8_lossy(display.as_slice()));
-                out.push('\n');
-            } else {
-                out.push_str(&format!("  \"{name}\"\n"));
-            }
-        }
-    }
-    host.write_out(Stream::Stdout, out.as_bytes());
-    0
 }
 
 fn parse_define(raw: &[u8]) -> Option<CacheDefine> {
@@ -797,6 +316,9 @@ fn apply_warning_flag(flag: &[u8], state: &mut DiagState) -> bool {
         b"deprecated" => DiagCategory::Deprecated,
         b"policy" => DiagCategory::Policy,
         b"strict" => DiagCategory::Strict,
+        b"experimental" => DiagCategory::Experimental,
+        b"non-target-directive" => DiagCategory::NonTargetDirective,
+        b"install-absolute-destination" => DiagCategory::InstallAbsoluteDestination,
         b"uninitialized" => DiagCategory::Uninitialized,
         b"unused-cli" => DiagCategory::UnusedCli,
         _ => return false,
@@ -812,28 +334,40 @@ fn apply_warning_flag(flag: &[u8], state: &mut DiagState) -> bool {
 
 fn resolve_cli_path(host: &dyn Host, arg: &[u8]) -> PathBuf {
     let native = rcmake_host::path::to_native(arg);
-    if native.is_absolute() {
-        native
-    } else {
-        host.initial_cwd().join(native)
+    let absolute = host.initial_cwd().join(native);
+    let mut path = PathBuf::new();
+    for component in absolute.components() {
+        if component == std::path::Component::ParentDir {
+            if path.parent().is_some() {
+                path.pop();
+            }
+        } else {
+            path.push(component);
+        }
     }
+    path
 }
 
-fn discover_cmake_paths(host: &dyn Host) -> (PathBuf, PathBuf) {
+fn discover_cmake_paths(host: &dyn Host, argv0: Option<&BString>) -> (PathBuf, PathBuf) {
     let exe = host
         .current_exe()
         .unwrap_or_else(|_| PathBuf::from("/usr/local/bin/cmake"));
-    let real_exe = host.canonicalize(&exe).unwrap_or(exe);
-    let bin_dir = real_exe
-        .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| PathBuf::from("/usr/local/bin"));
-    let cmake_command = bin_dir.join("cmake");
-    let cmake_root = bin_dir
-        .parent()
-        .map(|p| p.join("share/cmake-4.5"))
-        .unwrap_or_else(|| PathBuf::from("/usr/local/share/cmake-4.5"));
-    (cmake_command, cmake_root)
+    let argv_path = argv0.map(|arg| resolve_cli_path(host, arg));
+    for executable in argv_path.iter().chain(std::iter::once(&exe)) {
+        if let Some(bin) = executable.parent()
+            && let Some(prefix) = bin.parent()
+        {
+            let root = prefix.join("share/cmake-4.5");
+            if configure::is_dir(host, &root.join("Modules")) {
+                return (executable.clone(), root);
+            }
+        }
+    }
+    let root = exe.parent().and_then(Path::parent).map_or_else(
+        || PathBuf::from("/usr/local/share/cmake-4.5"),
+        |prefix| prefix.join("share/cmake-4.5"),
+    );
+    (exe, root)
 }
 
 fn build_capabilities_json() -> Value {
@@ -940,5 +474,69 @@ mod tests {
             host.stream_bytes(Stream::Stderr)
                 .starts_with(b"CMake Error: Parse error in command line argument: FOO\n")
         );
+    }
+
+    #[test]
+    fn configure_reuses_and_refreshes_cache() {
+        let host = Arc::new(PureHost::default());
+        host.seed_file(
+            Path::new("/work/CMakeLists.txt"),
+            b"message(STATUS \"value=${VALUE}\")\n",
+        )
+        .unwrap();
+        let invoke = |args: &[&str]| {
+            let argv: Vec<_> = std::iter::once("cmake")
+                .chain(args.iter().copied())
+                .map(BString::from)
+                .collect();
+            run(&argv, host.clone())
+        };
+        assert_eq!(
+            invoke(&["-S", ".", "-B", "build", "-DVALUE:STRING=initial"]),
+            0
+        );
+        assert_eq!(invoke(&["build"]), 0);
+        assert_eq!(invoke(&["--fresh", "build"]), 0);
+        let output = host.stream_bytes(Stream::Stdout);
+        assert_eq!(
+            output
+                .split(|byte| *byte == b'\n')
+                .filter(|line| line.starts_with(b"-- value="))
+                .collect::<Vec<_>>(),
+            [
+                b"-- value=initial".as_slice(),
+                b"-- value=initial",
+                b"-- value="
+            ]
+        );
+    }
+
+    #[test]
+    fn view_mode_uses_explicit_directories_and_implicit_preload() {
+        let host = Arc::new(PureHost::default());
+        host.seed_file(
+            Path::new("/work/src/PreLoad.cmake"),
+            b"message(STATUS \"${CMAKE_SOURCE_DIR} -> ${CMAKE_BINARY_DIR} ${LOCAL}\")\nset(LOCAL set)\n",
+        )
+        .unwrap();
+        let args = [
+            "cmake",
+            "-N",
+            "-C",
+            "src/PreLoad.cmake",
+            "-S",
+            "src",
+            "-B",
+            "build",
+        ]
+        .map(BString::from);
+        assert_eq!(run(&args, host.clone()), 0);
+        assert_eq!(
+            host.stream_bytes(Stream::Stdout),
+            BString::from(
+                "loading initial cache file src/PreLoad.cmake\n-- /work/src -> /work/build \n-- /work/src -> /work/build \n"
+            )
+        );
+        assert!(!configure::is_dir(host.as_ref(), Path::new("/work/build")));
     }
 }
