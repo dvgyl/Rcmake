@@ -320,7 +320,13 @@ fn run_step(
             restore_environment(host.as_ref(), &env.vars);
             exit
         }
-        PresetKind::Build => crate::build::run(&args, host.as_ref()),
+        PresetKind::Build => {
+            let mut argv = Vec::with_capacity(args.len() + 2);
+            argv.push("cmake".into());
+            argv.push("--build".into());
+            argv.extend(args.iter().cloned());
+            crate::build::run(&argv, &args, host.as_ref())
+        }
         PresetKind::Test => {
             args.insert(0, "ctest".into());
             rcmake_ctest::main(&args, Arc::clone(host))
