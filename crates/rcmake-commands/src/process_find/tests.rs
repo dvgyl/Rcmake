@@ -364,6 +364,22 @@ find_library(CUSTOM NAMES tool PATHS custom NO_DEFAULT_PATH)
 }
 
 #[test]
+fn find_path_returns_the_search_directory_for_a_nested_file() -> HostResult<()> {
+    let (host, mut interp) = setup();
+    host.seed_file(Path::new("/work/inc/sub/h.h"), b"")?;
+    assert_eq!(
+        run(
+            &host,
+            &mut interp,
+            "find_path(HP sub/h.h PATHS inc NO_DEFAULT_PATH)",
+        )?,
+        0
+    );
+    assert_eq!(var(&mut interp, b"HP"), "/work/inc");
+    Ok(())
+}
+
+#[test]
 fn find_program_requires_a_regular_executable_file_and_supports_both_loop_orders() -> HostResult<()>
 {
     let (host, mut interp) = setup();

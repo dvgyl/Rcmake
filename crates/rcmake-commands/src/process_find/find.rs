@@ -416,8 +416,7 @@ fn search(cx: &Cx<'_>, kind: Kind, options: &Options, dirs: &[PathBuf]) -> Optio
         }
         if let Some(found) = candidate(cx, kind, dir.join(&path)) {
             if matches!(kind, Kind::Path) {
-                let parent = path.parent().unwrap_or_else(|| Path::new(""));
-                return Some(normalize(&dir.join(parent)));
+                return Some(dir.to_path_buf());
             }
             return Some(found);
         }

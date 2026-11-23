@@ -7,10 +7,44 @@ use rcmake_diag::{PolicyId, PolicyStatus};
 use rcmake_eval::{CmdError, CmdResult, Cx, Flow};
 use rcmake_expr::ExpandedArg;
 use rcmake_host::{CommandSpec, Input, Output, ProcessResult, ReadRange, RunRequest, SystemInfo};
+use rcmake_model::{CacheEntry, CacheType};
 
 use super::{quoted, status, values};
 
 const MIB: u64 = 1024 * 1024;
+
+pub(super) fn site_name(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
+    let [arg] = args else {
+        return Err(status("called with incorrect number of arguments"));
+    };
+    if !cx.var_defined(&arg.value) {
+        let hostname = cx.host().system().hostname;
+        cx.cache().insert(
+            arg.value.clone(),
+            CacheEntry {
+                value: hostname,
+                ty: CacheType::String,
+                help: "Name of the computer/site where compile is being run".into(),
+                advanced: false,
+                props: Default::default(),
+            },
+        );
+    }
+    Ok(Flow::Normal)
+}
+
+pub(super) fn variable_watch(_: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
+    let Some(var) = args.first() else {
+        return Err(status("must be called with at least one argument."));
+    };
+    if var.value == b"CMAKE_CURRENT_LIST_FILE" {
+        return Err(status(
+            "cannot be set on the variable: CMAKE_CURRENT_LIST_FILE",
+        ));
+    }
+    // Variable access callbacks need evaluator support.
+    Ok(Flow::Normal)
+}
 
 pub(super) fn query(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
     let args = values(args);

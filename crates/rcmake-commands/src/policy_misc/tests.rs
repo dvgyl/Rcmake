@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use rcmake_base::BString;
+use rcmake_base::{BString, list};
 use rcmake_diag::{DiagOptions, PolicyId, PolicyStatus};
 use rcmake_eval::{CacheDefine, Interp, InterpConfig, LogLevel, RunMode};
 use rcmake_host::{Follow, Host, PureHost, ReadRange, Stream};
@@ -39,6 +39,19 @@ fn run(host: &PureHost, interp: &mut Interp, script: &str, code: i32) -> TestRes
     host.seed_file(path, script.as_bytes())?;
     assert_eq!(
         interp.run_script(path).exit_code,
+        code,
+        "{}",
+        host.stream_bytes(Stream::Stderr)
+    );
+    Ok(())
+}
+
+fn configure(host: &PureHost, interp: &mut Interp, script: &str, code: i32) -> TestResult {
+    let source = Path::new("/work/src");
+    let binary = Path::new("/work/build");
+    host.seed_file(&source.join("CMakeLists.txt"), script.as_bytes())?;
+    assert_eq!(
+        interp.run_configure(source, binary, &[]).exit_code,
         code,
         "{}",
         host.stream_bytes(Stream::Stderr)
@@ -561,6 +574,303 @@ fn language_rejects_unknown_meta_operation_and_structural_commands() -> TestResu
             host.stream_bytes(Stream::Stderr)
                 .to_string()
                 .contains(error)
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn project_sets_metadata_without_a_compiler() -> TestResult {
+    let (host, mut interp) = context(RunMode::Configure);
+    configure(
+        &host,
+        &mut interp,
+        r#"
+        cmake_minimum_required(VERSION 4.5.1)
+        project(Test VERSION 1.2.3 COMPAT_VERSION 1.1 SPDX_LICENSE "MIT OR Apache-2.0"
+            DESCRIPTION "Test project" HOMEPAGE_URL "https://example.com" LANGUAGES NONE)
+        "#,
+        0,
+    )?;
+    assert_var(&mut interp, "PROJECT_NAME", Some("Test"));
+    assert_var(&mut interp, "CMAKE_PROJECT_NAME", Some("Test"));
+    assert_var(&mut interp, "CMAKE_SYSTEM_NAME", Some("PureOS"));
+    assert_var(&mut interp, "CMAKE_SYSTEM_PROCESSOR", Some("arm64"));
+    for prefix in ["PROJECT", "Test"] {
+        for (suffix, value) in [
+            ("SOURCE_DIR", "/work/src"),
+            ("BINARY_DIR", "/work/build"),
+            ("IS_TOP_LEVEL", "ON"),
+        ] {
+            assert_var(&mut interp, &format!("{prefix}_{suffix}"), Some(value));
+        }
+    }
+    for prefix in ["PROJECT", "Test", "CMAKE_PROJECT"] {
+        for (suffix, value) in [
+            ("VERSION", "1.2.3"),
+            ("VERSION_MAJOR", "1"),
+            ("VERSION_MINOR", "2"),
+            ("VERSION_PATCH", "3"),
+            ("VERSION_TWEAK", ""),
+            ("COMPAT_VERSION", "1.1"),
+            ("SPDX_LICENSE", "MIT OR Apache-2.0"),
+            ("DESCRIPTION", "Test project"),
+            ("HOMEPAGE_URL", "https://example.com"),
+        ] {
+            assert_var(&mut interp, &format!("{prefix}_{suffix}"), Some(value));
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn project_accepts_legacy_languages_and_clears_version_metadata() -> TestResult {
+    let (host, mut interp) = context(RunMode::Configure);
+    configure(
+        &host,
+        &mut interp,
+        "project(Test VERSION 001.02 LANGUAGES NONE)\nproject(Other C CXX)\nproject(Other NONE)",
+        0,
+    )?;
+    assert_var(&mut interp, "CMAKE_PROJECT_NAME", Some("Other"));
+    assert_var(&mut interp, "PROJECT_VERSION", Some(""));
+    assert_var(&mut interp, "CMAKE_PROJECT_VERSION", Some(""));
+    assert_var(&mut interp, "Other_VERSION", None);
+    assert_var(&mut interp, "Test_VERSION", Some("001.02"));
+    Ok(())
+}
+
+#[test]
+fn project_validates_version_and_language_arguments() -> TestResult {
+    for (script, fragment) in [
+        (
+            "project(Test NONE VERSION 1.2.3)",
+            "must use LANGUAGES before",
+        ),
+        (
+            "project(Test VERSION 1.2.3.4.5 LANGUAGES NONE)",
+            "VERSION \"1.2.3.4.5\" format invalid.",
+        ),
+        (
+            "project(Test VERSION 1 COMPAT_VERSION 1.1 LANGUAGES NONE)",
+            "COMPAT_VERSION must be less than or equal to VERSION",
+        ),
+    ] {
+        let (host, mut interp) = context(RunMode::Configure);
+        configure(&host, &mut interp, script, 1)?;
+        assert!(
+            host.stream_bytes(Stream::Stderr)
+                .to_string()
+                .contains(fragment)
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn language_exit_stops_execution() -> TestResult {
+    for (script, code) in [
+        ("cmake_language(EXIT 5)", 5),
+        ("cmake_language(EXIT 0)", 0),
+        ("cmake_language(EXIT -5)", -5),
+        ("cmake_language(EXIT 2147483648)", i32::MIN),
+        (r#"cmake_language(EVAL CODE "cmake_language(EXIT 8)")"#, 8),
+    ] {
+        let (host, mut interp) = context(RunMode::Script);
+        run(
+            &host,
+            &mut interp,
+            &format!("{script}\nget_cmake_property(after CMAKE_ROLE)"),
+            code,
+        )?;
+        assert_var(&mut interp, "after", None);
+        assert!(host.stream_bytes(Stream::Stderr).is_empty());
+    }
+    Ok(())
+}
+
+#[test]
+fn language_exit_reports_invalid_arguments() -> TestResult {
+    for (script, error) in [
+        ("cmake_language(EXIT)", "EXIT requires one argument"),
+        ("cmake_language(EXIT 5 6)", "EXIT requires one argument"),
+        (
+            "cmake_language(EXIT wrong)",
+            "EXIT requires one integral argument, got \"wrong\"",
+        ),
+        (
+            "cmake_language(EXIT 9223372036854775808)",
+            "EXIT requires one integral argument, got",
+        ),
+    ] {
+        let (host, mut interp) = context(RunMode::Script);
+        run(&host, &mut interp, script, 1)?;
+        assert!(
+            host.stream_bytes(Stream::Stderr)
+                .to_string()
+                .contains(error)
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn language_exit_requires_script_mode() -> TestResult {
+    let (host, mut interp) = context(RunMode::Configure);
+    configure(
+        &host,
+        &mut interp,
+        "project(Test NONE)\ncmake_language(EXIT 5)",
+        1,
+    )?;
+    assert!(
+        host.stream_bytes(Stream::Stderr)
+            .to_string()
+            .contains("cmake_language EXIT can be used only in SCRIPT mode")
+    );
+    Ok(())
+}
+
+#[test]
+fn role_and_commands_properties_report_interpreter_state() -> TestResult {
+    let script = r#"
+        function(custom_command)
+        endfunction()
+        get_property(role GLOBAL PROPERTY CMAKE_ROLE)
+        get_cmake_property(other_role CMAKE_ROLE)
+        get_cmake_property(commands COMMANDS)
+    "#;
+    for (mode, role) in [(RunMode::Script, "SCRIPT"), (RunMode::Configure, "PROJECT")] {
+        let (host, mut interp) = context(mode);
+        match mode {
+            RunMode::Script => run(&host, &mut interp, script, 0)?,
+            RunMode::Configure => configure(&host, &mut interp, script, 0)?,
+        }
+        assert_var(&mut interp, "role", Some(role));
+        assert_var(&mut interp, "other_role", Some(role));
+        let names = interp.cx().registered_command_names();
+        assert!(names.iter().any(|name| name == b"custom_command"));
+        assert_eq!(interp.cx().var(b"commands"), Some(list::join(names)));
+    }
+    Ok(())
+}
+
+#[test]
+fn script_source_properties_support_multiple_files_and_updates() -> TestResult {
+    let (host, mut interp) = context(RunMode::Script);
+    run(
+        &host,
+        &mut interp,
+        r#"
+        set_property(SOURCE a.c b.c PROPERTY LABEL initial)
+        set_property(SOURCE a.c APPEND PROPERTY LABEL next)
+        set_property(SOURCE a.c APPEND_STRING PROPERTY LABEL -tail)
+        get_property(a SOURCE a.c PROPERTY LABEL)
+        get_property(b SOURCE b.c PROPERTY LABEL)
+        set_property(SOURCE b.c PROPERTY LABEL)
+        get_property(removed SOURCE b.c PROPERTY LABEL SET)
+        get_property(missing SOURCE missing.c PROPERTY LABEL)
+        "#,
+        0,
+    )?;
+    assert_var(&mut interp, "a", Some("initial;next-tail"));
+    assert_var(&mut interp, "b", Some("initial"));
+    assert_var(&mut interp, "removed", Some("0"));
+    assert_var(&mut interp, "missing", None);
+    Ok(())
+}
+
+#[test]
+fn set_property_reports_a_missing_target() -> TestResult {
+    let (host, mut interp) = context(RunMode::Script);
+    run(
+        &host,
+        &mut interp,
+        "set_property(TARGET nope PROPERTY FOO foo)",
+        1,
+    )?;
+    let stderr = host.stream_bytes(Stream::Stderr).to_string();
+    assert!(
+        stderr.contains("set_property could not find TARGET nope.  Perhaps it has not yet been")
+    );
+    assert!(stderr.contains("  created."));
+    Ok(())
+}
+
+#[test]
+fn site_name_uses_the_host_and_preserves_existing_values() -> TestResult {
+    let (host, mut interp) = context(RunMode::Script);
+    interp.cx().set_var(b"existing", "previous".into());
+    run(
+        &host,
+        &mut interp,
+        r#"
+        site_name(site)
+        get_property(site_type CACHE site PROPERTY TYPE)
+        site_name(existing)
+        site_name(chosen)
+        "#,
+        0,
+    )?;
+    assert_var(&mut interp, "site", Some("purehost"));
+    assert_var(&mut interp, "site_type", Some("STRING"));
+    assert_var(&mut interp, "existing", Some("previous"));
+    assert_var(&mut interp, "chosen", Some("initial"));
+    assert!(!interp.cx().cache().contains(b"existing"));
+    Ok(())
+}
+
+#[test]
+fn variable_watch_accepts_an_optional_callback() -> TestResult {
+    let (host, mut interp) = context(RunMode::Script);
+    run(
+        &host,
+        &mut interp,
+        "variable_watch(a)\nvariable_watch(b callback)",
+        0,
+    )?;
+    let (host, mut interp) = context(RunMode::Script);
+    run(&host, &mut interp, "variable_watch()", 1)?;
+    assert!(
+        host.stream_bytes(Stream::Stderr)
+            .to_string()
+            .contains("variable_watch must be called with at least one argument.")
+    );
+    Ok(())
+}
+
+#[test]
+fn project_commands_are_unavailable_in_script_mode() -> TestResult {
+    for command in [
+        "project",
+        "add_executable",
+        "add_library",
+        "add_subdirectory",
+        "add_custom_target",
+        "add_custom_command",
+        "add_custom_rule",
+        "add_dependencies",
+        "target_sources",
+        "target_include_directories",
+        "target_link_libraries",
+        "target_compile_definitions",
+        "target_compile_options",
+        "target_compile_features",
+        "target_link_options",
+        "target_link_directories",
+        "install",
+        "export",
+        "enable_language",
+        "enable_testing",
+        "add_test",
+        "discover_tests",
+    ] {
+        let (host, mut interp) = context(RunMode::Script);
+        run(&host, &mut interp, &format!("{command}()"), 1)?;
+        assert!(
+            host.stream_bytes(Stream::Stderr)
+                .to_string()
+                .contains(&format!("{command} command is not scriptable"))
         );
     }
     Ok(())

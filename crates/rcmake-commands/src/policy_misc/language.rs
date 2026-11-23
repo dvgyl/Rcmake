@@ -1,8 +1,8 @@
 use rcmake_base::BString;
-use rcmake_eval::{CmdResult, Cx, Flow, LogLevel};
+use rcmake_eval::{CmdResult, Cx, Flow, LogLevel, RunMode};
 use rcmake_expr::ExpandedArg;
 
-use super::status;
+use super::{quoted, status};
 
 pub(super) fn language(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
     let Some((op, args)) = args.split_first() else {
@@ -57,6 +57,34 @@ pub(super) fn language(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
             cx.set_var(&var.value, level.into());
             Ok(Flow::Normal)
         }
+        b"EXIT" => exit(cx, args),
         _ => Err(status("called with unknown meta-operation")),
     }
+}
+
+fn exit(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
+    if !args.is_empty() && cx.mode() != RunMode::Script {
+        return Err(status("EXIT can be used only in SCRIPT mode"));
+    }
+    let [arg] = args else {
+        return Err(status("EXIT requires one argument"));
+    };
+    let code = core::str::from_utf8(&arg.value)
+        .ok()
+        .and_then(|value| {
+            value
+                .trim_start_matches(|ch: char| ch.is_ascii_whitespace() || ch == '\u{b}')
+                .parse::<i64>()
+                .ok()
+        })
+        .ok_or_else(|| {
+            status(quoted(
+                "EXIT requires one integral argument, got \"",
+                &arg.value,
+                "\"",
+            ))
+        })?;
+    // CMake passes the low 32 bits of the parsed integer to the exit function.
+    cx.request_exit(code as i32);
+    Ok(Flow::Normal)
 }

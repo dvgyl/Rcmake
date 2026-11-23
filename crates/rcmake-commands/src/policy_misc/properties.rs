@@ -1,5 +1,5 @@
 use rcmake_base::{BString, list, truth};
-use rcmake_eval::{CmdError, CmdResult, Cx, Flow};
+use rcmake_eval::{CmdError, CmdResult, Cx, Flow, RunMode};
 use rcmake_expr::ExpandedArg;
 use rcmake_host::path;
 use rcmake_model::{CacheEntry, CacheType, DefinedProperty, PropertyMap};
@@ -118,6 +118,18 @@ pub(super) fn set(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
             check_directory(cx, &names)?;
             update.property(cx.directory_props(), name, value);
         }
+        b"SOURCE" => {
+            for source in source_names(cx, &names, false)? {
+                let key = object_key(b"SOURCE", source, name);
+                update.property(cx.directory_props(), &key, value.clone());
+            }
+        }
+        b"TARGET" => {
+            for target in names {
+                let key = target_key(cx, target, name)?;
+                update.property(&mut cx.global().props, &key, value.clone());
+            }
+        }
         b"CACHE" => {
             for entry_name in names {
                 let entry = cx.cache().get_mut(entry_name).ok_or_else(|| {
@@ -214,9 +226,18 @@ pub(super) fn get(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
             other => return Err(status(quoted("given invalid argument \"", other, "\"."))),
         };
     }
+    let source = match (*scope, names) {
+        (b"SOURCE", _) => source_names(cx, names, true)?.first().copied(),
+        _ => None,
+    };
     match (*scope, names) {
         (b"GLOBAL" | b"VARIABLE", []) | (b"CACHE", [_]) => {}
         (b"DIRECTORY", _) => check_directory(cx, names)?,
+        (b"SOURCE", _) | (b"TARGET", [_]) => {}
+        (b"TARGET", []) => return Err(status("not given name for TARGET scope.")),
+        (b"TARGET", [_, extra, ..]) => {
+            return Err(status(quoted("given invalid argument \"", extra, "\".")));
+        }
         (b"GLOBAL" | b"VARIABLE", _) => {
             return Err(status(quoted("given name for ", scope, " scope.")));
         }
@@ -252,6 +273,18 @@ pub(super) fn get(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
                 b"GLOBAL" => global_value(cx, name),
                 b"DIRECTORY" => directory_value(cx, name)
                     .or_else(|| inherited.then(|| global_value(cx, name)).flatten()),
+                b"SOURCE" => source.and_then(|source| source_value(cx, source, name, inherited)),
+                b"TARGET" => {
+                    let [target] = names else {
+                        return Err(status("not given name for TARGET scope."));
+                    };
+                    let key = target_key(cx, target, name)?;
+                    cx.global().props.get(&key).cloned().or_else(|| {
+                        inherited
+                            .then(|| directory_value(cx, name).or_else(|| global_value(cx, name)))
+                            .flatten()
+                    })
+                }
                 b"CACHE" => names
                     .first()
                     .and_then(|entry| cx.cache().get(entry))
@@ -272,6 +305,87 @@ pub(super) fn get(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
         cx.unset_var(out);
     }
     Ok(Flow::Normal)
+}
+
+fn source_names<'a>(
+    cx: &mut Cx<'_>,
+    names: &[&'a [u8]],
+    query: bool,
+) -> Result<Vec<&'a [u8]>, CmdError> {
+    let mut sources = Vec::new();
+    let mut words = names.iter().copied();
+    while let Some(word) = words.next() {
+        match word {
+            b"DIRECTORY" | b"TARGET_DIRECTORY" => {
+                let value = words.next().ok_or_else(|| {
+                    status(quoted(
+                        "called with incorrect number of arguments no value provided to the ",
+                        word,
+                        " option",
+                    ))
+                })?;
+                if word == b"DIRECTORY" {
+                    if cx.mode() == RunMode::Script || check_directory(cx, &[value]).is_err() {
+                        return Err(status(quoted("given non-existent DIRECTORY ", value, "")));
+                    }
+                } else if !cx.project().target_names.contains_key(value) {
+                    return Err(status(quoted(
+                        "given non-existent target for TARGET_DIRECTORY ",
+                        value,
+                        "",
+                    )));
+                }
+            }
+            _ if query && !sources.is_empty() => {
+                return Err(status(quoted("given invalid argument \"", word, "\".")));
+            }
+            _ => sources.push(word),
+        }
+    }
+    if query && sources.is_empty() {
+        return Err(status("not given name for SOURCE scope."));
+    }
+    Ok(sources)
+}
+
+fn source_value(cx: &mut Cx<'_>, source: &[u8], name: &[u8], inherited: bool) -> Option<BString> {
+    let key = object_key(b"SOURCE", source, name);
+    cx.directory_props()
+        .get(&key)
+        .cloned()
+        .or_else(|| match name {
+            b"GENERATED" => Some("0".into()),
+            b"LOCATION" => Some(path::from_native(&normalize(&cx.resolve_path(source)))),
+            _ if inherited => directory_value(cx, name).or_else(|| global_value(cx, name)),
+            _ => None,
+        })
+}
+
+fn target_key(cx: &mut Cx<'_>, target: &[u8], name: &[u8]) -> Result<BString, CmdError> {
+    if cx.project().target_names.contains_key(target) {
+        Ok(object_key(b"TARGET", target, name))
+    } else {
+        Err(status(quoted(
+            "could not find TARGET ",
+            target,
+            ".  Perhaps it has not yet been created.",
+        )))
+    }
+}
+
+fn object_key(scope: &[u8], object: &[u8], name: &[u8]) -> BString {
+    // Store object properties in the current model until it has source and target property maps.
+    let length = object.len().to_string();
+    [
+        b"\0".as_slice(),
+        scope,
+        length.as_bytes(),
+        b":",
+        object,
+        name,
+    ]
+    .concat()
+    .into()
 }
 
 fn check_directory(cx: &Cx<'_>, names: &[&[u8]]) -> Result<(), CmdError> {
@@ -309,6 +423,13 @@ fn directory_value(cx: &mut Cx<'_>, name: &[u8]) -> Option<BString> {
 
 fn global_value(cx: &mut Cx<'_>, name: &[u8]) -> Option<BString> {
     match name {
+        b"CMAKE_ROLE" => Some(
+            match cx.mode() {
+                RunMode::Script => "SCRIPT",
+                RunMode::Configure => "PROJECT",
+            }
+            .into(),
+        ),
         b"GENERATOR_IS_MULTI_CONFIG" => {
             let generator = cx.var_or_empty(b"CMAKE_GENERATOR");
             Some(boolean(
@@ -349,6 +470,7 @@ pub(super) fn get_cmake(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
         return Err(status("called with incorrect number of arguments"));
     };
     let value = match name.value.as_slice() {
+        b"COMMANDS" => Some(list::join(cx.registered_command_names())),
         b"VARIABLES" | b"MACROS" | b"CACHE_VARIABLES" => directory_value(cx, &name.value),
         b"COMPONENTS" => Some(
             cx.global()

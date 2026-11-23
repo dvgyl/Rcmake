@@ -3,13 +3,14 @@
 #![forbid(unsafe_code)]
 
 use rcmake_base::BString;
-use rcmake_eval::{CmdError, CmdFlags, Registry};
+use rcmake_eval::{CmdError, CmdFlags, CmdResult, Cx, Registry};
 use rcmake_expr::ExpandedArg;
 
 mod arguments;
 mod files;
 mod language;
 mod policies;
+mod project;
 mod properties;
 mod system;
 
@@ -18,6 +19,7 @@ mod tests;
 
 pub(crate) fn register(registry: &mut Registry) {
     let script = CmdFlags { scriptable: true };
+    let project_only = CmdFlags { scriptable: false };
     registry.add("cmake_minimum_required", policies::minimum_required, script);
     registry.add("cmake_policy", policies::policy, script);
     registry.add("cmake_diagnostic", policies::diagnostic, script);
@@ -29,11 +31,39 @@ pub(crate) fn register(registry: &mut Registry) {
     registry.add("get_cmake_property", properties::get_cmake, script);
     registry.add("cmake_host_system_information", system::query, script);
     registry.add("cmake_language", language::language, script);
-    registry.add(
-        "define_property",
-        properties::define,
-        CmdFlags { scriptable: false },
-    );
+    registry.add("site_name", system::site_name, script);
+    registry.add("variable_watch", system::variable_watch, script);
+    registry.add("define_property", properties::define, project_only);
+    registry.add("project", project::project, project_only);
+    for command in [
+        "add_executable",
+        "add_library",
+        "add_subdirectory",
+        "add_custom_target",
+        "add_custom_command",
+        "add_custom_rule",
+        "add_dependencies",
+        "target_sources",
+        "target_include_directories",
+        "target_link_libraries",
+        "target_compile_definitions",
+        "target_compile_options",
+        "target_compile_features",
+        "target_link_options",
+        "target_link_directories",
+        "install",
+        "export",
+        "enable_language",
+        "enable_testing",
+        "add_test",
+        "discover_tests",
+    ] {
+        registry.add(command, pending_project_command, project_only);
+    }
+}
+
+fn pending_project_command(_: &mut Cx<'_>, _: &[ExpandedArg]) -> CmdResult {
+    Err(status("requires build-system support."))
 }
 
 fn values(args: &[ExpandedArg]) -> Vec<&[u8]> {
