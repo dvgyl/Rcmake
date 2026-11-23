@@ -15,7 +15,9 @@ pub(crate) struct Graph<'a> {
     input: &'a BuildGraph,
     build_dir: &'a Path,
     pub(crate) config: Option<&'a [u8]>,
-    names: HashMap<BString, BString>,
+    names: HashMap<BString, usize>,
+    aliases: Vec<BString>,
+    artifact_targets: HashSet<usize>,
     producers: HashMap<BString, usize>,
     steps: Vec<StepNodes>,
 }
@@ -39,22 +41,26 @@ impl<'a> Graph<'a> {
             build_dir,
             config,
             names: HashMap::new(),
+            aliases: Vec::new(),
+            artifact_targets: HashSet::new(),
             producers: HashMap::new(),
             steps: Vec::new(),
         };
-        for target in &input.targets {
+        for (index, target) in input.targets.iter().enumerate() {
             let name = graph.node(&target.name);
-            if name.is_empty()
-                || name == "all"
-                || graph
-                    .names
-                    .insert(name.clone(), qualified(&name, config))
-                    .is_some()
+            if name.is_empty() || name == "all" || graph.names.insert(name.clone(), index).is_some()
             {
                 return Err(generation_error(
                     build_dir,
                     "Invalid or duplicate Ninja target name.",
                 ));
+            }
+            graph.aliases.push(qualified(&name, config));
+            if artifacts
+                .get(target.name.as_slice())
+                .is_some_and(|artifacts| artifacts.file.is_some())
+            {
+                graph.artifact_targets.insert(index);
             }
         }
         for (index, step) in input.steps.iter().enumerate() {
@@ -91,8 +97,31 @@ impl<'a> Graph<'a> {
                 }
             }
         }
+        graph.disambiguate_aliases();
         graph.connect_targets()?;
         Ok(graph)
+    }
+
+    fn disambiguate_aliases(&mut self) {
+        let mut reserved: HashSet<_> = self.names.keys().chain(&self.aliases).cloned().collect();
+        for (index, (target, alias)) in self.input.targets.iter().zip(&mut self.aliases).enumerate()
+        {
+            if let Some(producer) = self.producers.get(alias)
+                && !target.steps.contains(producer)
+            {
+                for suffix in 0usize.. {
+                    let name =
+                        BString::from(format!("CMakeFiles/rcmake-target-{index}-{suffix}.util"));
+                    let candidate = qualified(&name, self.config);
+                    if !self.producers.contains_key(&candidate)
+                        && reserved.insert(candidate.clone())
+                    {
+                        *alias = candidate;
+                        break;
+                    }
+                }
+            }
+        }
     }
 
     fn add_link_byproducts(&mut self, artifacts: &HashMap<&[u8], &ArtifactSet>) {
@@ -138,22 +167,12 @@ impl<'a> Graph<'a> {
         self.names.contains_key(name) || self.producers.contains_key(name)
     }
 
-    fn target_name(&self, name: &[u8]) -> BString {
-        qualified(&self.node(name), self.config)
-    }
-
     fn connect_targets(&mut self) -> Result<(), GenError> {
-        for target in &self.input.targets {
-            let alias = self.target_name(&target.name);
+        for (target, alias) in self.input.targets.iter().zip(&self.aliases) {
             let dependencies: Vec<_> = target
                 .depends
                 .iter()
-                .map(|&index| {
-                    self.input
-                        .targets
-                        .get(index)
-                        .map(|target| self.target_name(&target.name))
-                })
+                .map(|&index| self.aliases.get(index).cloned())
                 .collect::<Option<_>>()
                 .ok_or_else(|| {
                     generation_error(self.build_dir, "Invalid Ninja target dependency index.")
@@ -171,7 +190,7 @@ impl<'a> Graph<'a> {
                     nodes.order_only.extend(dependencies.iter().cloned());
                 }
             }
-            if let Some(&producer) = self.producers.get(&alias) {
+            if let Some(&producer) = self.producers.get(alias) {
                 // A real output can also be the target name, such as a root executable.
                 let extra: Vec<_> = dependencies
                     .into_iter()
@@ -199,9 +218,8 @@ impl<'a> Graph<'a> {
         }
 
         let mut all = Vec::new();
-        for target in &self.input.targets {
-            let alias = self.target_name(&target.name);
-            if !self.producers.contains_key(&alias) {
+        for (target, alias) in self.input.targets.iter().zip(&self.aliases) {
+            if !self.producers.contains_key(alias) {
                 let inputs: Vec<_> = target
                     .steps
                     .iter()
@@ -212,27 +230,48 @@ impl<'a> Graph<'a> {
                         target
                             .depends
                             .iter()
-                            .filter_map(|&index| self.input.targets.get(index))
-                            .map(|dep| self.target_name(&dep.name)),
+                            .filter_map(|&index| self.aliases.get(index).cloned()),
                     )
                     .collect();
-                ninja.phony(&alias, &unique(inputs));
+                ninja.phony(alias, &unique(inputs));
             }
             if target.in_all {
-                all.push(alias);
+                all.push(alias.clone());
             }
         }
         ninja.phony(&qualified(&"all".into(), self.config), &all);
     }
 
     pub(crate) fn emit_entry_aliases(&self, ninja: &mut Ninja) {
-        for target in &self.input.targets {
+        let aliases: HashSet<_> = self.aliases.iter().collect();
+        for (target, alias) in self.input.targets.iter().zip(&self.aliases) {
             let name = self.node(&target.name);
-            if !self.producers.contains_key(&name) {
-                ninja.phony(&name, &[self.target_name(&target.name)]);
+            if !self.producers.contains_key(&name) && !aliases.contains(&name) {
+                ninja.phony(&name, std::slice::from_ref(alias));
             }
         }
         ninja.phony(&"all".into(), &[qualified(&"all".into(), self.config)]);
+    }
+
+    fn custom_input(&self, input: &[u8]) -> BString {
+        let node = self.node(input);
+        let Some(&index) = self.names.get(&node) else {
+            return node;
+        };
+        // The resolver converts target dependencies with artifacts to file paths.
+        // Bare target names can still refer to targets without artifacts.
+        if let Some(producer) = self.producers.get(&node)
+            && (input != node.as_slice()
+                || self.artifact_targets.contains(&index)
+                || self
+                    .input
+                    .targets
+                    .get(index)
+                    .is_some_and(|target| target.steps.contains(producer)))
+        {
+            return node;
+        }
+        self.aliases.get(index).cloned().unwrap_or(node)
     }
 
     fn emit_step(&self, ninja: &mut Ninja, step: &BuildStep, nodes: &StepNodes) {
@@ -282,16 +321,7 @@ impl<'a> Graph<'a> {
                 let inputs = custom
                     .depends
                     .iter()
-                    .map(|input| {
-                        let node = self.node(input);
-                        if !self.producers.contains_key(&node)
-                            && let Some(alias) = self.names.get(&node)
-                        {
-                            alias.clone()
-                        } else {
-                            node
-                        }
-                    })
+                    .map(|input| self.custom_input(input))
                     .collect();
                 (
                     rule,

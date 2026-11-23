@@ -8,7 +8,9 @@ use rcmake_resolve::{
     ArtifactSet, BuildGraph, BuildStep, CustomStep, GraphTarget, Invocation, LinkKind, LinkStep,
 };
 
-use super::{GenerationResult, Graph, Ninja, generate_multi_config, generate_single_config};
+use super::{
+    GenerationResult, Graph, Ninja, generate_multi_config, generate_single_config, qualified,
+};
 
 fn read(host: &PureHost, file: &str) -> String {
     let bytes = host
@@ -228,6 +230,114 @@ fn link_byproducts_use_unique_paths_on_the_link_edge() -> Result<(), Box<dyn std
                 "build all: phony all$:Debug\n"
             )
         );
+    }
+    Ok(())
+}
+
+#[test]
+fn target_dependencies_use_the_library_when_its_name_matches_an_executable_output()
+-> Result<(), Box<dyn std::error::Error>> {
+    for (config, executable, library_alias) in [
+        (None, "sqlite3", "CMakeFiles/rcmake-target-0-2.util"),
+        (Some("Debug"), "sqlite3", "sqlite3$:Debug"),
+        (
+            Some("Debug"),
+            "sqlite3:Debug",
+            "CMakeFiles/rcmake-target-0-2.util$:Debug",
+        ),
+    ] {
+        let link = |kind, output: &str, inputs| BuildStep::Link {
+            inputs,
+            step: LinkStep {
+                kind,
+                language: "C".into(),
+                fragments: Vec::new(),
+                output: output.into(),
+            },
+            invocations: Vec::new(),
+        };
+        let occupied_output = qualified(
+            &"CMakeFiles/rcmake-target-0-0.util".into(),
+            config.map(str::as_bytes),
+        );
+        let input = BuildGraph {
+            steps: vec![
+                link(LinkKind::StaticArchive, "libsqlite3.a", Vec::new()),
+                BuildStep::Compile {
+                    object: "shell.o".into(),
+                    source: "shell.c".into(),
+                    invocation: Invocation::default(),
+                    depfile: None,
+                },
+                link(
+                    LinkKind::Executable,
+                    executable,
+                    vec!["shell.o".into(), "libsqlite3.a".into()],
+                ),
+                BuildStep::Custom(CustomStep {
+                    outputs: vec!["check".into()],
+                    byproducts: vec![occupied_output],
+                    depends: vec!["sqlite3".into(), format!("./{executable}").into()],
+                    ..CustomStep::default()
+                }),
+            ],
+            targets: vec![
+                GraphTarget {
+                    name: "sqlite3".into(),
+                    steps: vec![0],
+                    in_all: true,
+                    ..GraphTarget::default()
+                },
+                GraphTarget {
+                    name: "sqlite_shell".into(),
+                    steps: vec![1, 2],
+                    depends: vec![0],
+                    in_all: true,
+                },
+                GraphTarget {
+                    name: "CMakeFiles/rcmake-target-0-1.util".into(),
+                    ..GraphTarget::default()
+                },
+            ],
+            ..BuildGraph::default()
+        };
+        let graph = Graph::new(
+            &input,
+            &Default::default(),
+            Path::new("/work/build"),
+            config.map(str::as_bytes),
+        )?;
+        let mut ninja = Ninja::default();
+        graph.emit(&mut ninja);
+        if config.is_some() {
+            graph.emit_entry_aliases(&mut ninja);
+        }
+        let manifest = String::from_utf8(ninja.0)?;
+        let executable_node = executable.replace(':', "$:");
+        let suffix = config.map_or("", |_| "$:Debug");
+        for line in [
+            format!("build {library_alias}: phony libsqlite3.a"),
+            format!("build shell.o: COMPILE shell.c || {library_alias}"),
+            format!("build {executable_node}: LINK_EXECUTABLE shell.o libsqlite3.a"),
+            format!("build all{suffix}: phony {library_alias} sqlite_shell{suffix}"),
+        ] {
+            assert!(
+                manifest.lines().any(|candidate| candidate == line),
+                "{manifest}"
+            );
+        }
+        assert!(
+            manifest.lines().any(|line| {
+                line.starts_with("build check | ")
+                    && line.ends_with(&format!(": phony {library_alias} {executable_node}"))
+            }),
+            "{manifest}"
+        );
+        if config.is_some() && executable != "sqlite3" {
+            assert!(manifest.contains(&format!("build sqlite3: phony {library_alias}\n")));
+        } else {
+            assert!(!manifest.contains("build sqlite3: phony"));
+        }
     }
     Ok(())
 }

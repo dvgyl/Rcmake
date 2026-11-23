@@ -13,7 +13,8 @@ use rcmake_host::{
     RunRequest, WriteMode, path,
 };
 use rcmake_model::{
-    BT, DirId, GeneratorKind, LinkItem, ProjectModel, Target, TargetKind, TargetOrigin,
+    BT, CustomCommand, CustomCommandKind, DirId, GeneratorKind, LinkItem, ProjectModel, Target,
+    TargetKind, TargetOrigin,
 };
 use rcmake_resolve::{
     BuildGraph, BuildStep, GenerationResult, GraphTarget, Invocation, LinkKind, LinkStep, resolve,
@@ -303,6 +304,85 @@ fn ninja_builds_the_requested_configuration_and_default() {
     );
 }
 
+fn c_target(name: &str, kind: TargetKind, source: &str) -> Target {
+    let mut target = Target::new(
+        name.into(),
+        kind,
+        TargetOrigin::Normal,
+        DirId::ROOT,
+        Default::default(),
+        Default::default(),
+    );
+    target
+        .sources
+        .push(BT::new(source.into(), Default::default()));
+    target
+}
+
+#[test]
+fn ninja_builds_an_executable_whose_output_name_matches_its_library()
+-> Result<(), Box<dyn std::error::Error>> {
+    let project = Project::new();
+    let build = project.dir.join("build");
+    let mut model = ProjectModel::default();
+    model.set_root_dirs(path::from_native(&project.dir), path::from_native(&build));
+    model.generator = Some(GeneratorKind::Ninja);
+    model
+        .dir_mut(DirId::ROOT)
+        .vars
+        .insert("CMAKE_C_COMPILER".into(), "cc".into());
+    model.add_target(c_target(
+        "sqlite3",
+        TargetKind::StaticLibrary,
+        "lib source$.c",
+    ))?;
+    let mut shell = c_target("sqlite_shell", TargetKind::Executable, "main.c");
+    shell.props.set("OUTPUT_NAME".into(), "sqlite3".into());
+    shell.usage.link_libraries = Some(vec![LinkItem {
+        text: BT::new("sqlite3".into(), Default::default()),
+        lookup_dir: DirId::ROOT,
+    }]);
+    model.add_target(shell)?;
+    let mut check = CustomCommand::new(
+        DirId::ROOT,
+        CustomCommandKind::Output,
+        Default::default(),
+        Default::default(),
+    );
+    check
+        .outputs
+        .push(BT::new("check".into(), Default::default()));
+    check
+        .depends
+        .push(BT::new("sqlite_shell".into(), Default::default()));
+    check
+        .command_lines
+        .push(vec!["sh".into(), "-c".into(), "./sqlite3 > check".into()]);
+    model.add_command(check)?;
+
+    let result = resolve(&model, &project.host, &[])?;
+    generate_single_config(&result, &project.host, &build)?;
+    project.run(&build, "ninja", &["-j", "2", "sqlite3"]);
+    project
+        .host
+        .metadata(&build.join("libsqlite3.a"), Follow::Yes)?;
+    assert_eq!(project.run(&build, "./sqlite3", &[]).stdout, b"answer=42\n");
+    assert_eq!(
+        project.run(&build, "ninja", &["-j", "2"]).stdout,
+        b"ninja: no work to do.\n"
+    );
+
+    project.host.remove_file(&build.join("sqlite3"))?;
+    project.run(&build, "ninja", &["-j", "2", "check"]);
+    assert_eq!(
+        project
+            .host
+            .read(&build.join("check"), ReadRange::All { limit: 64 })?,
+        b"answer=42\n"
+    );
+    Ok(())
+}
+
 fn versioned_library_model(
     project: &Project,
     build: &Path,
@@ -326,25 +406,11 @@ fn versioned_library_model(
     let vars = &mut model.dir_mut(DirId::ROOT).vars;
     vars.insert("CMAKE_C_COMPILER".into(), "cc".into());
     vars.insert("CMAKE_COMMAND".into(), path::from_native(&symlink));
-    let target = |name: &str, kind, source: &str| {
-        let mut target = Target::new(
-            name.into(),
-            kind,
-            TargetOrigin::Normal,
-            DirId::ROOT,
-            Default::default(),
-            Default::default(),
-        );
-        target
-            .sources
-            .push(BT::new(source.into(), Default::default()));
-        target
-    };
-    let mut library = target("demo", TargetKind::SharedLibrary, "lib source$.c");
+    let mut library = c_target("demo", TargetKind::SharedLibrary, "lib source$.c");
     library.props.set("VERSION".into(), "1.2.3".into());
     library.props.set("SOVERSION".into(), "1".into());
     model.add_target(library)?;
-    let mut app = target("app", TargetKind::Executable, "main.c");
+    let mut app = c_target("app", TargetKind::Executable, "main.c");
     app.usage.link_libraries = Some(vec![LinkItem {
         text: BT::new("demo".into(), Default::default()),
         lookup_dir: DirId::ROOT,
