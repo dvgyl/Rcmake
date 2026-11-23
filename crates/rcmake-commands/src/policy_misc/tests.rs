@@ -580,6 +580,141 @@ fn language_rejects_unknown_meta_operation_and_structural_commands() -> TestResu
 }
 
 #[test]
+fn language_rejects_call_arguments_from_the_command_name_expansion() -> TestResult {
+    let (host, mut interp) = context(RunMode::Script);
+    run(
+        &host,
+        &mut interp,
+        "set(command message;unexpected)\ncmake_language(CALL ${command})",
+        1,
+    )?;
+    assert!(
+        host.stream_bytes(Stream::Stderr)
+            .to_string()
+            .contains("CALL command's arguments must be literal")
+    );
+    Ok(())
+}
+
+#[test]
+fn language_defer_keeps_call_arguments_raw_and_accepts_both_id_options() -> TestResult {
+    let (host, mut interp) = context(RunMode::Configure);
+    configure(
+        &host,
+        &mut interp,
+        r#"
+        project(Test NONE)
+        set(operation DEFER)
+        set(value immediate)
+        cmake_language(${operation} DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/."
+          ID_VAR id ID report CALL set result "${value}")
+        cmake_language(DEFER GET_CALL ${id} pending)
+        set(value deferred)
+        "#,
+        0,
+    )?;
+    assert_var(&mut interp, "id", Some("report"));
+    assert_var(&mut interp, "pending", Some("set;result;${value}"));
+    assert_var(&mut interp, "result", Some("deferred"));
+    Ok(())
+}
+
+#[test]
+fn language_registers_replaces_and_clears_dependency_providers() -> TestResult {
+    let (host, mut interp) = context(RunMode::Configure);
+    // Simulate the provider registration context that project() sets.
+    interp
+        .cx()
+        .global()
+        .props
+        .set("_RCMAKE_IN_TOP_LEVEL_INCLUDES".into(), "ON".into());
+    configure(
+        &host,
+        &mut interp,
+        r#"
+        cmake_minimum_required(VERSION 4.5)
+        macro(Provide method package)
+          set(provider_method "${method}")
+          set(${package}_FOUND TRUE)
+        endmacro()
+        cmake_language(SET_DEPENDENCY_PROVIDER Provide
+          SUPPORTED_METHODS FIND_PACKAGE FETCHCONTENT_MAKEAVAILABLE_SERIAL)
+        get_property(fetch_command GLOBAL PROPERTY __FETCHCONTENT_MAKEAVAILABLE_SERIAL_PROVIDER)
+        find_package(FirstPackage REQUIRED)
+        cmake_language(SET_DEPENDENCY_PROVIDER Provide
+          SUPPORTED_METHODS FETCHCONTENT_MAKEAVAILABLE_SERIAL)
+        find_package(SecondPackage QUIET)
+        cmake_language(SET_DEPENDENCY_PROVIDER Provide
+          SUPPORTED_METHODS FIND_PACKAGE FETCHCONTENT_MAKEAVAILABLE_SERIAL)
+        cmake_language(SET_DEPENDENCY_PROVIDER "")
+        get_property(cleared_fetch GLOBAL PROPERTY __FETCHCONTENT_MAKEAVAILABLE_SERIAL_PROVIDER)
+        find_package(ThirdPackage QUIET)
+        "#,
+        0,
+    )?;
+    assert_var(&mut interp, "provider_method", Some("FIND_PACKAGE"));
+    assert_var(&mut interp, "fetch_command", Some("Provide"));
+    assert_var(&mut interp, "cleared_fetch", Some(""));
+    assert!(interp.cx().var_is_on(b"FirstPackage_FOUND"));
+    assert!(!interp.cx().var_is_on(b"SecondPackage_FOUND"));
+    assert!(!interp.cx().var_is_on(b"ThirdPackage_FOUND"));
+    Ok(())
+}
+
+#[test]
+fn language_validates_dependency_provider_context_and_arguments() -> TestResult {
+    let (host, mut interp) = context(RunMode::Configure);
+    configure(
+        &host,
+        &mut interp,
+        r#"project(Test NONE)
+        cmake_language(SET_DEPENDENCY_PROVIDER "")"#,
+        1,
+    )?;
+    let stderr = host.stream_bytes(Stream::Stderr).to_string();
+    assert!(
+        stderr.contains("Dependency providers can only be set")
+            && stderr.contains("CMAKE_PROJECT_TOP_LEVEL_INCLUDES"),
+        "{stderr}"
+    );
+
+    for (args, error) in [
+        ("Provide FIND_PACKAGE", "Unrecognized keyword"),
+        (
+            "missing SUPPORTED_METHODS FIND_PACKAGE",
+            "is not a defined command",
+        ),
+        (
+            "Provide SUPPORTED_METHODS",
+            "Must specify at least one provider method",
+        ),
+        (
+            r#""" SUPPORTED_METHODS FIND_PACKAGE"#,
+            "Must specify a non-empty command name",
+        ),
+        (
+            "Provide SUPPORTED_METHODS OTHER",
+            "Unknown dependency provider method",
+        ),
+    ] {
+        let (host, mut interp) = context(RunMode::Configure);
+        interp
+            .cx()
+            .global()
+            .props
+            .set("_RCMAKE_IN_TOP_LEVEL_INCLUDES".into(), "ON".into());
+        let script = format!(
+            "macro(Provide)\nendmacro()\n\
+             cmake_language(SET_DEPENDENCY_PROVIDER {args})"
+        );
+        configure(&host, &mut interp, &script, 1)?;
+        let stderr = host.stream_bytes(Stream::Stderr).to_string();
+        assert!(stderr.contains(error), "{stderr}");
+    }
+    Ok(())
+}
+
+#[test]
 fn project_sets_metadata_without_a_compiler() -> TestResult {
     let (host, mut interp) = context(RunMode::Configure);
     configure(
@@ -673,6 +808,7 @@ fn language_exit_stops_execution() -> TestResult {
         ("cmake_language(EXIT 5)", 5),
         ("cmake_language(EXIT 0)", 0),
         ("cmake_language(EXIT -5)", -5),
+        (r#"cmake_language(EXIT 5 "\X")"#, 5),
         ("cmake_language(EXIT 2147483648)", i32::MIN),
         (r#"cmake_language(EVAL CODE "cmake_language(EXIT 8)")"#, 8),
     ] {
@@ -693,7 +829,6 @@ fn language_exit_stops_execution() -> TestResult {
 fn language_exit_reports_invalid_arguments() -> TestResult {
     for (script, error) in [
         ("cmake_language(EXIT)", "EXIT requires one argument"),
-        ("cmake_language(EXIT 5 6)", "EXIT requires one argument"),
         (
             "cmake_language(EXIT wrong)",
             "EXIT requires one integral argument, got \"wrong\"",
