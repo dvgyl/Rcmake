@@ -210,22 +210,30 @@ fn render_into(nodes: &[GenexNode], out: &mut BString) {
     for node in nodes {
         match node {
             GenexNode::Text(text) => out.extend_from_slice(text),
-            GenexNode::Expr(expr) => {
-                out.extend_from_slice(b"$<");
-                render_into(&expr.identifier, out);
-                if let Some(params) = &expr.params {
-                    out.push(b':');
-                    for (i, param) in params.iter().enumerate() {
-                        if i > 0 {
-                            out.push(b',');
-                        }
-                        render_into(param, out);
-                    }
-                }
-                out.push(b'>');
-            }
+            GenexNode::Expr(expr) => render_expr_into(expr, out),
         }
     }
+}
+
+pub(crate) fn render_expr(expr: &GenexExpr) -> BString {
+    let mut out = BString::default();
+    render_expr_into(expr, &mut out);
+    out
+}
+
+fn render_expr_into(expr: &GenexExpr, out: &mut BString) {
+    out.extend_from_slice(b"$<");
+    render_into(&expr.identifier, out);
+    if let Some(params) = &expr.params {
+        out.push(b':');
+        for (i, param) in params.iter().enumerate() {
+            if i > 0 {
+                out.push(b',');
+            }
+            render_into(param, out);
+        }
+    }
+    out.push(b'>');
 }
 
 #[cfg(test)]

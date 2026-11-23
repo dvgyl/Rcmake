@@ -5,20 +5,16 @@
 //! This breaks the recursion between `$<TARGET_PROPERTY:...>` and transitive usage
 //! resolution without a crate cycle.
 //!
-//! # Status
-//!
-//! Wave 0 freezes the contract. [`parse`], [`find_genex`], [`genex_strip`], [`strip`],
-//! and [`rewrite_install_prefix`] work. [`evaluate`] returns plain text and reports
-//! [`GenexError::Unsupported`] for expressions until Wave 1 adds the operators.
-
 #![forbid(unsafe_code)]
 
 use rcmake_base::BString;
 use rcmake_diag::Backtrace;
 
+mod eval;
 mod parse;
 mod preprocess;
 
+pub use eval::evaluate;
 pub use parse::parse;
 pub use preprocess::{PreprocessMode, find_genex, genex_strip, rewrite_install_prefix, strip};
 
@@ -168,6 +164,11 @@ pub trait GenexHost {
     /// Target named `name` as seen from the evaluation's directory.
     fn find_target(&self, name: &[u8]) -> Option<TargetHandle>;
 
+    /// Find a target in the lookup scope of the evaluation context.
+    fn find_target_in_context(&self, name: &[u8], _ctx: &EvalContext) -> Option<TargetHandle> {
+        self.find_target(name)
+    }
+
     /// Name of `target`.
     fn target_name(&self, target: TargetHandle) -> BString;
 
@@ -202,6 +203,67 @@ pub trait GenexHost {
     /// Variable value of the evaluation directory (`CMAKE_<LANG>_COMPILER_ID`, and so
     /// on).
     fn definition(&self, name: &[u8]) -> Option<BString>;
+
+    /// Return the policy state at target creation.
+    fn target_policy(&self, target: TargetHandle, policy: &[u8]) -> Option<bool> {
+        self.raw_property(target, policy)
+            .map(|value| value == "NEW")
+    }
+
+    /// Return object paths for the target and the optional source filter.
+    fn target_objects(
+        &self,
+        target: TargetHandle,
+        config: &ConfigId,
+        sources: Option<&[u8]>,
+    ) -> Option<BString> {
+        let _ = (config, sources);
+        self.raw_property(target, b"TARGET_OBJECTS")
+    }
+
+    /// Return the artifact base name without the configuration postfix.
+    fn artifact_base_name_without_postfix(
+        &self,
+        target: TargetHandle,
+        kind: ArtifactKind,
+        config: &ConfigId,
+    ) -> Option<BString> {
+        let mut path = self.artifact(target, kind, ArtifactPart::BaseName, config)?;
+        let mut property = config.0.to_ascii_uppercase();
+        property.extend_from_slice(b"_POSTFIX");
+        if let Some(postfix) = self.raw_property(target, &property)
+            && path.ends_with(&postfix)
+        {
+            let length = path.len() - postfix.len();
+            path.truncate(length);
+        }
+        Some(path)
+    }
+
+    /// Return whether the current evaluation is for a device link step.
+    fn is_device_link(&self, _ctx: &EvalContext) -> bool {
+        false
+    }
+
+    /// Return the install prefix when this context permits its evaluation.
+    fn install_prefix(&self, _ctx: &EvalContext) -> Option<BString> {
+        None
+    }
+
+    /// Return the timestamp in the requested format and time zone.
+    fn timestamp(&self, _format: Option<&[u8]>, _utc: bool) -> Option<BString> {
+        None
+    }
+
+    /// Return a seed for an unseeded random string expression.
+    fn random_seed(&self) -> Option<u64> {
+        None
+    }
+
+    /// Return the execution limits for generator expressions.
+    fn limits(&self) -> rcmake_base::Limits {
+        rcmake_base::Limits::default()
+    }
 }
 
 /// A parsed generator expression string.
@@ -252,7 +314,7 @@ pub enum GenexError {
         message: BString,
     },
     /// `Self reference on target "<t>".` from the cycle checker.
-    #[error("Self reference on target")]
+    #[error("Self reference on target \"{target}\".")]
     SelfReference {
         /// Target name.
         target: BString,
@@ -266,24 +328,4 @@ pub enum GenexError {
         /// The full expression text.
         expression: BString,
     },
-}
-
-/// Evaluate `ast` in `ctx`. Returns the value and the flags of what it depends on.
-pub fn evaluate(
-    ast: &GenexAst,
-    _ctx: &EvalContext,
-    _host: &mut dyn GenexHost,
-) -> Result<(BString, EvalFlags), GenexError> {
-    let mut out = BString::default();
-    for node in &ast.nodes {
-        match node {
-            GenexNode::Text(text) => out.extend_from_slice(text),
-            GenexNode::Expr(expr) => {
-                return Err(GenexError::Unsupported {
-                    expression: parse::render(&[GenexNode::Expr(expr.clone())]),
-                });
-            }
-        }
-    }
-    Ok((out, EvalFlags::default()))
 }
