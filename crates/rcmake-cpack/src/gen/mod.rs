@@ -1,7 +1,8 @@
-//! Generator registry and the macOS generators.
+//! Generator registry and the External and macOS generators.
 
 pub mod bundle;
 pub mod dmg;
+pub(crate) mod external;
 
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
@@ -29,6 +30,7 @@ pub fn create(name: &[u8]) -> Option<Box<dyn PackageGenerator>> {
         return Some(Box::new(ArchiveGenerator { kind }));
     }
     match name {
+        b"External" => Some(Box::new(external::ExternalGenerator)),
         b"DragNDrop" => Some(Box::new(dmg::DragNDropGenerator)),
         b"Bundle" => Some(Box::new(bundle::BundleGenerator)),
         _ => None,

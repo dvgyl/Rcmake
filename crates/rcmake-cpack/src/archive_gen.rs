@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use rcmake_archive::{ArchiveFormat, CreateOptions, create_archive};
 use rcmake_base::BString;
-use rcmake_host::path::{from_native, to_native};
+use rcmake_host::path::to_native;
 use rcmake_host::{Follow, Host};
 
 use crate::config::CpackConfig;
@@ -148,7 +148,7 @@ impl PackageGenerator for ArchiveGenerator {
             compression_level,
             verbose: false,
         };
-        let component_groups = component_groups(&cfg)?;
+        let component_groups = component_groups(&cfg);
         let mut outputs = BTreeSet::new();
         if component_groups.is_empty() {
             let (base, inputs) = if cfg.get(b"CPACK_INCLUDE_TOPLEVEL_DIRECTORY").is_none()
@@ -158,7 +158,12 @@ impl PackageGenerator for ArchiveGenerator {
                     .staging_dir
                     .parent()
                     .ok_or_else(|| error("Missing parent directory for the staging directory"))?;
-                (parent.to_owned(), vec![safe_name(cx.file_name)?])
+                let prefix = safe_name(cx.file_name)?;
+                let inputs = children(cx.host, cx.staging_dir)?
+                    .into_iter()
+                    .map(|child| prefix.join(child))
+                    .collect();
+                (parent.to_owned(), inputs)
             } else {
                 (
                     cx.staging_dir.to_owned(),
@@ -202,26 +207,26 @@ impl PackageGenerator for ArchiveGenerator {
     }
 }
 
-fn component_groups(cfg: &CpackConfig) -> Result<BTreeMap<PathBuf, BTreeSet<PathBuf>>, CpackError> {
-    let mut groups: BTreeMap<PathBuf, BTreeSet<PathBuf>> = BTreeMap::new();
+fn component_groups(cfg: &CpackConfig) -> BTreeMap<BString, BTreeSet<PathBuf>> {
+    let mut groups: BTreeMap<BString, BTreeSet<PathBuf>> = BTreeMap::new();
     let projects = cfg.list(b"CPACK_INSTALL_CMAKE_PROJECTS");
     for [_, _, selection, _] in projects.as_chunks::<4>().0 {
         for component in crate::stage::package_components(cfg, selection) {
-            let group = crate::stage::package_group(cfg, &component)?;
+            let group = crate::stage::package_group(cfg, &component);
             groups
                 .entry(group)
                 .or_default()
-                .insert(safe_name(&component)?);
+                .insert(crate::stage::component_dir(&component));
         }
     }
-    Ok(groups)
+    groups
 }
 
-fn component_archive_name(cfg: &CpackConfig, base: &[u8], group: &Path) -> BString {
+fn component_archive_name(cfg: &CpackConfig, base: &[u8], group: &[u8]) -> BString {
     if crate::stage::grouping(cfg) == ComponentGrouping::AllComponentsInOne {
         return base.into();
     }
-    let group = from_native(group);
+    let group = BString::from(group);
     let variable = format!(
         "CPACK_ARCHIVE_{}_FILE_NAME",
         BString::from(group.to_ascii_uppercase())

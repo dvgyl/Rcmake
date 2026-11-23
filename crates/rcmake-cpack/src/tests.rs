@@ -20,6 +20,10 @@ fn registry_knows_milestone_three_generators() {
         generators::create(b"Bundle").map(|g| g.name()),
         Some("Bundle")
     );
+    assert_eq!(
+        generators::create(b"External").map(|g| g.extension()),
+        Some(".json")
+    );
     assert!(generators::create(b"DEB").is_none());
 }
 
@@ -37,7 +41,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use rcmake_archive::{ExtractOptions, extract_archive};
+use rcmake_archive::{ExtractOptions, extract_archive, list_command_archive};
 use rcmake_base::hash::HashAlgo;
 use rcmake_host::path::from_native;
 use rcmake_host::{
@@ -190,11 +194,9 @@ endforeach()
     ] {
         let package = Path::new("/work/output").join(file);
         let extracted = Path::new("/work/extracted").join(root);
-        let tree = extract(host.as_ref(), &package, &extracted);
-        assert_eq!(
-            tree.keys().cloned().collect::<Vec<_>>(),
-            [format!("{root}/hook.txt")]
-        );
+        let entries = list_command_archive(host.as_ref(), &package, Vec::new(), None).unwrap();
+        assert_eq!(entries, [BString::from(format!("{root}/hook.txt"))]);
+        extract(host.as_ref(), &package, &extracted);
         assert_eq!(
             read(host.as_ref(), &extracted.join(root).join("hook.txt")),
             b"installed and staged"

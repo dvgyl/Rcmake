@@ -97,7 +97,7 @@ pub(crate) fn copy_directories(
             &dest,
             0,
             &mut remaining,
-            false,
+            None,
             &mut |path, kind| Ok(path.starts_with(excluded) || ignored(path, kind)?),
         )?;
     }
@@ -110,9 +110,15 @@ pub(crate) fn merge_component(
     dest: &Path,
 ) -> Result<(), CpackError> {
     let mut remaining = 100_000;
-    copy_tree(host, source, dest, 0, &mut remaining, true, &mut |_, _| {
-        Ok(false)
-    })
+    copy_tree(
+        host,
+        source,
+        dest,
+        0,
+        &mut remaining,
+        Some(source),
+        &mut |_, _| Ok(false),
+    )
 }
 
 fn copy_tree(
@@ -121,7 +127,7 @@ fn copy_tree(
     dest: &Path,
     depth: usize,
     remaining: &mut usize,
-    merge: bool,
+    merge_root: Option<&Path>,
     ignored: &mut impl FnMut(&Path, FileKind) -> Result<bool, CpackError>,
 ) -> Result<(), CpackError> {
     if depth >= 256 {
@@ -137,7 +143,9 @@ fn copy_tree(
             continue;
         }
         let output = dest.join(name);
-        if merge && existing_component_entry(host, &input, &output, entry.kind)? {
+        if let Some(root) = merge_root
+            && existing_component_entry(host, root, &input, &output, entry.kind)?
+        {
             continue;
         }
         match entry.kind {
@@ -158,7 +166,15 @@ fn copy_tree(
             }
             FileKind::Dir => {
                 ensure_dir(host, dest, &output)?;
-                copy_tree(host, &input, &output, depth + 1, remaining, merge, ignored)?;
+                copy_tree(
+                    host,
+                    &input,
+                    &output,
+                    depth + 1,
+                    remaining,
+                    merge_root,
+                    ignored,
+                )?;
                 let metadata = host.metadata(&input, Follow::No)?;
                 host.set_permissions(&output, metadata.mode & 0o7777)?;
                 host.set_times(&output, Some(metadata.atime), Some(metadata.mtime))?;
@@ -171,6 +187,7 @@ fn copy_tree(
 
 fn existing_component_entry(
     host: &dyn Host,
+    root: &Path,
     input: &Path,
     output: &Path,
     kind: FileKind,
@@ -201,7 +218,7 @@ fn existing_component_entry(
         }
     }
     Err(error(format!(
-        "CPack components install different files to {}",
-        input.display()
+        "ERROR The data in files with the same filename is different: {}",
+        input.strip_prefix(root).unwrap_or(input).display()
     )))
 }

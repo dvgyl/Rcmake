@@ -6,7 +6,7 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use rcmake_base::{BString, truth};
+use rcmake_base::{BString, hash::HashAlgo, truth};
 use rcmake_eval::Interp;
 use rcmake_host::path::{from_native, to_native};
 use rcmake_host::{CommandSpec, FileKind, Follow, Host, Input, Output, ProcessResult, RunRequest};
@@ -42,25 +42,32 @@ pub(crate) fn install(
     staging: &Path,
 ) -> Result<(), CpackError> {
     let cfg = snapshot(interp);
-    interp
-        .cx()
-        .set_var(b"CMAKE_INSTALL_PREFIX", from_native(staging));
+    let stage_files = cfg.get(b"CPACK_GENERATOR") != Some(b"External")
+        || cfg.on(b"CPACK_EXTERNAL_ENABLE_STAGING");
     let clear_destdir = BTreeMap::from([("DESTDIR".into(), None)]);
-    let _env = Environment::apply(host.as_ref(), &clear_destdir);
-    let install_scripts = if cfg.get(b"CPACK_INSTALL_SCRIPTS").is_some() {
-        b"CPACK_INSTALL_SCRIPTS".as_slice()
+    let _env = stage_files.then(|| Environment::apply(host.as_ref(), &clear_destdir));
+    let cfg = if stage_files {
+        interp
+            .cx()
+            .set_var(b"CMAKE_INSTALL_PREFIX", from_native(staging));
+        let install_scripts = if cfg.get(b"CPACK_INSTALL_SCRIPTS").is_some() {
+            b"CPACK_INSTALL_SCRIPTS".as_slice()
+        } else {
+            b"CPACK_INSTALL_SCRIPT"
+        };
+        run_hooks(
+            host.as_ref(),
+            cwd,
+            interp,
+            install_scripts,
+            "Install script",
+        )?;
+        let cfg = snapshot(interp);
+        crate::source::copy_directories(host.as_ref(), &cfg, cwd, staging, interp)?;
+        cfg
     } else {
-        b"CPACK_INSTALL_SCRIPT"
+        cfg
     };
-    run_hooks(
-        host.as_ref(),
-        cwd,
-        interp,
-        install_scripts,
-        "Install script",
-    )?;
-    let cfg = snapshot(interp);
-    crate::source::copy_directories(host.as_ref(), &cfg, cwd, staging, interp)?;
     install_projects(host, cwd, options, &cfg, staging)?;
     run_hooks(
         host.as_ref(),
@@ -105,16 +112,32 @@ fn install_projects(
     if configs.is_empty() {
         configs.push(BString::default());
     }
+    let external = cfg.get(b"CPACK_GENERATOR") == Some(b"External");
+    let stage_project = !external || cfg.on(b"CPACK_EXTERNAL_ENABLE_STAGING");
+    if external && !tuples.is_empty() && cfg.get(b"CPACK_CMAKE_GENERATOR").is_none() {
+        return Err(error(
+            "CPACK_INSTALL_CMAKE_PROJECTS is specified, but CPACK_CMAKE_GENERATOR is not. CPACK_CMAKE_GENERATOR is required to install the project.",
+        ));
+    }
     for [build, project, component, subdir] in tuples {
         let build = absolute(cwd, build);
-        let destinations = install_destinations(cfg, staging, component, subdir)?;
         for config in &configs {
-            preinstall(host.as_ref(), cfg, &build, config)?;
+            if stage_project {
+                preinstall(host.as_ref(), cfg, &build, config)?;
+            }
             log(
                 host.as_ref(),
                 format!("- Install project: {project} [{config}]"),
             );
+            if !stage_project {
+                continue;
+            }
+            let separate = !package_components(cfg, component).is_empty();
+            let destinations = install_destinations(cfg, staging, component, subdir)?;
             for (component, destination) in &destinations {
+                if external && separate {
+                    log(host.as_ref(), format!("-   Install component: {component}"));
+                }
                 ensure_dir(host.as_ref(), staging, destination)?;
                 install_project(host, options, cfg, &build, config, component, destination)?;
             }
@@ -141,7 +164,7 @@ fn install_destinations(
     components
         .into_iter()
         .map(|name| {
-            let mut destination = staging.join(safe_name(&name)?);
+            let mut destination = staging.join(component_dir(&name));
             if cfg.on(b"CPACK_COMPONENT_INCLUDE_TOPLEVEL_DIRECTORY") {
                 let file_name = safe_name(cfg.get(b"CPACK_PACKAGE_FILE_NAME").unwrap_or_default())?;
                 destination.push(file_name);
@@ -275,36 +298,56 @@ pub(crate) fn grouping(cfg: &CpackConfig) -> ComponentGrouping {
             ComponentGrouping::AllComponentsInOne
         }
         Some(value) if value.eq_ignore_ascii_case(b"IGNORE") => ComponentGrouping::Ignore,
+        Some(value) if value.eq_ignore_ascii_case(b"ONE_PER_GROUP") => {
+            ComponentGrouping::OnePerGroup
+        }
+        _ if cfg.on(b"CPACK_COMPONENTS_ALL_IN_ONE_PACKAGE") => {
+            ComponentGrouping::AllComponentsInOne
+        }
+        _ if cfg.on(b"CPACK_COMPONENTS_IGNORE_GROUPS") => ComponentGrouping::Ignore,
         _ => ComponentGrouping::OnePerGroup,
     }
 }
 
-pub(crate) fn package_components(cfg: &CpackConfig, component: &[u8]) -> Vec<BString> {
-    if !cfg.on(b"CPACK_ARCHIVE_COMPONENT_INSTALL") || cfg.on(b"CPACK_MONOLITHIC_INSTALL") {
+pub(crate) fn package_components(cfg: &CpackConfig, selection: &[u8]) -> Vec<BString> {
+    if !cfg.on(b"CPACK_ARCHIVE_COMPONENT_INSTALL")
+        && cfg.get(b"CPACK_GENERATOR") != Some(b"External")
+    {
+        return Vec::new();
+    }
+    project_components(cfg, selection)
+}
+
+pub(crate) fn project_components(cfg: &CpackConfig, selection: &[u8]) -> Vec<BString> {
+    if cfg.on(b"CPACK_MONOLITHIC_INSTALL") {
         return Vec::new();
     }
     let name = format!(
         "CPACK_COMPONENTS_{}",
-        BString::from(component.to_ascii_uppercase())
+        BString::from(selection.to_ascii_uppercase())
     );
     cfg.list(name.as_bytes())
 }
 
-pub(crate) fn package_group(cfg: &CpackConfig, component: &[u8]) -> Result<PathBuf, CpackError> {
+pub(crate) fn component_dir(name: &[u8]) -> PathBuf {
+    // CPack uses the MD5 of a component name when the name contains a path separator.
+    safe_name(name).unwrap_or_else(|_| HashAlgo::Md5.hex_digest(name).into())
+}
+
+pub(crate) fn package_group(cfg: &CpackConfig, component: &[u8]) -> BString {
     match grouping(cfg) {
-        ComponentGrouping::AllComponentsInOne => Ok("ALL_COMPONENTS_IN_ONE".into()),
+        ComponentGrouping::AllComponentsInOne => "ALL_COMPONENTS_IN_ONE".into(),
         ComponentGrouping::OnePerGroup => {
             let key = format!(
                 "CPACK_COMPONENT_{}_GROUP",
                 BString::from(component.to_ascii_uppercase())
             );
-            safe_name(
-                cfg.get(key.as_bytes())
-                    .filter(|name| !name.is_empty())
-                    .unwrap_or(component),
-            )
+            cfg.get(key.as_bytes())
+                .filter(|name| !name.is_empty())
+                .unwrap_or(component)
+                .into()
         }
-        ComponentGrouping::Ignore => safe_name(component),
+        ComponentGrouping::Ignore => component.into(),
     }
 }
 

@@ -48,6 +48,11 @@ pub fn parse(args: &[BString]) -> Result<CPackOptions, CpackError> {
                 } else {
                     (bytes, None)
                 };
+                if flag == b"--list-presets" && attached != Some(b"defined") {
+                    return Err(CpackError::Argument(
+                        "Invalid value specified for --list-presets.\nThe only supported value is \"defined\".".into(),
+                    ));
+                }
                 if !VALUE_OPTIONS.iter().any(|option| option.as_bytes() == flag) {
                     if bytes.starts_with(b"-") {
                         return Err(unknown(arg));
@@ -140,7 +145,7 @@ pub(crate) fn print_information(host: &dyn Host, options: &CPackOptions) -> bool
         );
         host.write_out(Stream::Stdout, text.as_bytes());
     } else if options.help {
-        host.write_out(Stream::Stdout, b"Usage\n\n  cpack [options]\n\nOptions\n  -G <generators>     = Override CPACK_GENERATOR\n  -C <configs>        = Select build configurations\n  -D <var>=<value>    = Set a CPack variable\n  --config <file>     = Select the CPack config file\n  -P <name>           = Set the package name\n  -R <version>        = Set the package version\n  -B <dir>            = Set the package directory\n  --vendor <name>     = Set the package vendor\n  --preset <name>     = Use a package preset\n  --presets-file <file> = Select a presets file\n  --list-presets      = List available package presets\n  -V, --verbose       = Enable verbose output\n  --debug             = Enable debug output\n  --trace             = Trace CMake scripts\n  --trace-expand      = Trace CMake scripts with variables expanded\n  --version           = Print the version\n  --help              = Print this help\n\nGenerators\n  TGZ TXZ TZST TBZ2 TZ TAR ZIP ZIP_DEFLATE ZIP_STORE Bundle DragNDrop\n");
+        host.write_out(Stream::Stdout, b"Usage\n\n  cpack [options]\n\nOptions\n  -G <generators>     = Override CPACK_GENERATOR\n  -C <configs>        = Select build configurations\n  -D <var>=<value>    = Set a CPack variable\n  --config <file>     = Select the CPack config file\n  -P <name>           = Set the package name\n  -R <version>        = Set the package version\n  -B <dir>            = Set the package directory\n  --vendor <name>     = Set the package vendor\n  --preset <name>     = Use a package preset\n  --presets-file <file> = Select a presets file\n  --list-presets      = List available package presets\n  -V, --verbose       = Enable verbose output\n  --debug             = Enable debug output\n  --trace             = Trace CMake scripts\n  --trace-expand      = Trace CMake scripts with variables expanded\n  --version           = Print the version\n  --help              = Print this help\n\nGenerators\n  TGZ TXZ TZST TBZ2 TZ TAR ZIP ZIP_DEFLATE ZIP_STORE External Bundle DragNDrop\n");
     } else {
         return false;
     }

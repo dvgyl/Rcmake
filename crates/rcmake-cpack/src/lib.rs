@@ -11,7 +11,7 @@
 //! - [`stage`]: install of the projects into the staging directory.
 //! - [`archive_gen`]: `TGZ`, `TXZ`, `TZST`, `TBZ2`, `TZ`, `TAR`, and `ZIP`.
 //! - [`source`]: source packages (`CPackSourceConfig.cmake`).
-//! - [`generators`] (`src/gen/`): the generator registry and the macOS `DragNDrop` and `Bundle` generators.
+//! - [`generators`] (`src/gen/`): the generator registry and the `External`, `DragNDrop`, and `Bundle` generators.
 
 #![forbid(unsafe_code)]
 
@@ -169,6 +169,15 @@ fn run(host: &Arc<dyn Host>, cli: CPackOptions) -> Result<(), CpackError> {
     if options.cli.list_presets {
         return Ok(());
     }
+    if options.cli.debug {
+        log(
+            host.as_ref(),
+            format_args!("{}:{} Enable Debug", file!(), line!()),
+        );
+    }
+    if options.cli.verbose {
+        log(host.as_ref(), "Enable Verbose");
+    }
     let _environment = Environment::apply(host.as_ref(), &options.environment);
     let mut interp = config::load_base(host, &options.cwd, &options.cli)?;
     let base = snapshot(&mut interp);
@@ -202,13 +211,21 @@ fn run(host: &Arc<dyn Host>, cli: CPackOptions) -> Result<(), CpackError> {
             }
         }
         complete_version(&mut interp)?;
-        package(
+        if generator.name() == "External" {
+            generators::external::initialize(&mut interp)?;
+        }
+        if let Err(err) = package(
             host,
             &options.cwd,
             &options.cli,
             &mut interp,
             generator.as_ref(),
-        )?;
+        ) {
+            let package_name = interp.cx().var_or_empty(b"CPACK_PACKAGE_NAME");
+            return Err(error(format!(
+                "{err}\nCPack Error: Error when generating package: {package_name}",
+            )));
+        }
         let updated = snapshot(&mut interp);
         let mut cx = interp.cx();
         for name in updated
@@ -283,6 +300,12 @@ fn package(
     work.push(generator.name());
     host.create_dir_all(&output)?;
     stage::ensure_dir(host.as_ref(), &output, &work)?;
+    if generator.name() == "External"
+        && (cfg.get(b"CPACK_REMOVE_TOPLEVEL_DIRECTORY").is_none()
+            || cfg.on(b"CPACK_REMOVE_TOPLEVEL_DIRECTORY"))
+    {
+        host.remove_dir_all(&work)?;
+    }
     let staging = work.join(file);
     stage::remove_entry(host.as_ref(), &staging)?;
     host.create_dir_all(&staging)?;
@@ -324,7 +347,7 @@ fn package(
     stage::install(host, cwd, cli, interp, &staging)?;
     let vars = snapshot(interp);
     log(host.as_ref(), "Create package");
-    let packages = generator.package(&PackageContext {
+    let mut packages = generator.package(&PackageContext {
         host: host.as_ref(),
         vars: &vars.vars,
         staging_dir: &staging,
@@ -332,6 +355,9 @@ fn package(
         file_name: name,
         grouping: stage::grouping(&vars),
     })?;
+    if generator.name() == "External" {
+        generators::external::run_script(host.as_ref(), cwd, interp, &mut packages)?;
+    }
     interp.cx().set_var(
         b"CPACK_PACKAGE_FILES",
         list::join(packages.iter().map(|path| from_native(path))),
@@ -366,6 +392,18 @@ fn publish(
             .file_name()
             .ok_or_else(|| error("No package file name"))?;
         let path = output.join(name);
+        if package != &path {
+            stage::clear_output_file(host, &path)?;
+            host.copy_file(
+                package,
+                &path,
+                CopyOptions {
+                    preserve_permissions: true,
+                    preserve_mtime: true,
+                },
+            )?;
+        }
+        log(host, format!("- package: {} generated.", path.display()));
         if !algorithms.is_empty() {
             let bytes = host.read(
                 package,
@@ -382,20 +420,10 @@ fn publish(
                 host.write(&checksum, text.as_bytes(), WriteMode::CreateNew)?;
                 log(
                     host,
-                    format!("Package checksum file: {} generated.", checksum.display()),
+                    format!("- checksum file: {} generated.", checksum.display()),
                 );
             }
         }
-        stage::clear_output_file(host, &path)?;
-        host.copy_file(
-            package,
-            &path,
-            CopyOptions {
-                preserve_permissions: true,
-                preserve_mtime: true,
-            },
-        )?;
-        log(host, format!("Package {} generated.", path.display()));
     }
     Ok(())
 }

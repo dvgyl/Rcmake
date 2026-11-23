@@ -3,11 +3,13 @@
 use std::collections::BTreeMap;
 use std::io::ErrorKind;
 use std::path::{Component, Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use rcmake_base::list::{self, Empty};
-use rcmake_base::{BString, Limits, truth};
-use rcmake_eval::{IncludeOptions, Interp, InterpConfig, RunMode, TraceConfig};
+use rcmake_base::{BString, ByteSlice, Limits, truth};
+use rcmake_eval::{
+    BuiltinFn, Flow, IncludeOptions, Interp, InterpConfig, Registry, RunMode, TraceConfig,
+};
 use rcmake_host::path::{from_native, to_native};
 use rcmake_host::{FileKind, Follow, Host, Stream};
 use rcmake_presets::{EnvSnapshot, PresetKind, PresetSettings};
@@ -65,14 +67,32 @@ pub(crate) fn resolve_options(
             None => rcmake_presets::load(&cwd, host),
         }
         .map_err(|err| {
-            error(format!(
-                "Could not read presets from {}:\n{err}",
-                cwd.display()
-            ))
+            if err.message.starts_with("Could not read presets from ") {
+                error(err.message)
+            } else {
+                error(format!(
+                    "Could not read presets from {}:\n{err}",
+                    cwd.display()
+                ))
+            }
         })?;
         let env = EnvSnapshot::from_host(host);
         if cli.list_presets {
-            let visible = presets.list_visible(PresetKind::Package, &env);
+            let mut visible = presets.list_visible(PresetKind::Package, &env);
+            visible.retain(|preset| {
+                presets
+                    .resolve(PresetKind::Package, &preset.name, &env)
+                    .is_ok_and(|resolved| match resolved.settings {
+                        PresetSettings::Package(settings) => {
+                            settings.generators.is_none_or(|names| {
+                                names
+                                    .iter()
+                                    .all(|name| crate::generators::create(name).is_some())
+                            })
+                        }
+                        _ => false,
+                    })
+            });
             if !visible.is_empty() {
                 host.write_out(Stream::Stdout, b"Available package presets:\n\n");
                 let width = visible
@@ -92,6 +112,19 @@ pub(crate) fn resolve_options(
                 }
             }
         } else if let Some(name) = &cli.preset {
+            let source_dir = from_native(&cwd);
+            // The preset resolver returns the package fields as literal strings.
+            let mut remaining = Limits::default().max_value_bytes;
+            let mut expand = |value: BString| -> Result<BString, CpackError> {
+                let token = b"${sourceDir}";
+                let count = value.find_iter(token).count();
+                let length = (value.len() - count * token.len())
+                    .saturating_add(count.saturating_mul(source_dir.len()));
+                remaining = remaining.checked_sub(length).ok_or_else(|| {
+                    error("CPack package preset expansion exceeds the size limit")
+                })?;
+                Ok(BString::from(value.replace(token, source_dir.as_slice())))
+            };
             let preset = presets
                 .resolve(PresetKind::Package, name, &env)
                 .map_err(|err| error(err.to_string()))?;
@@ -100,19 +133,33 @@ pub(crate) fn resolve_options(
             }
             environment = preset.environment;
             if let PresetSettings::Package(settings) = preset.settings {
-                cli.config_file = cli.config_file.or(settings.config_file);
+                cli.config_file = cli
+                    .config_file
+                    .or(settings.config_file.map(&mut expand).transpose()?);
                 cli.generators = cli
                     .generators
                     .or_else(|| settings.generators.as_ref().map(list::join));
                 cli.build_config = cli
                     .build_config
                     .or_else(|| settings.configurations.as_ref().map(list::join));
-                cli.package_name = cli.package_name.or(settings.package_name);
-                cli.package_version = cli.package_version.or(settings.package_version);
-                cli.package_directory = cli.package_directory.or(settings.package_directory);
-                cli.vendor = cli.vendor.or(settings.vendor_name);
-                let mut defines: Vec<_> =
-                    settings.variables.unwrap_or_default().into_iter().collect();
+                cli.package_name = cli
+                    .package_name
+                    .or(settings.package_name.map(&mut expand).transpose()?);
+                cli.package_version = cli
+                    .package_version
+                    .or(settings.package_version.map(&mut expand).transpose()?);
+                cli.package_directory = cli
+                    .package_directory
+                    .or(settings.package_directory.map(&mut expand).transpose()?);
+                cli.vendor = cli
+                    .vendor
+                    .or(settings.vendor_name.map(&mut expand).transpose()?);
+                let mut defines: Vec<_> = settings
+                    .variables
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|(name, value)| Ok((name, expand(value)?)))
+                    .collect::<Result<_, CpackError>>()?;
                 defines.append(&mut cli.defines);
                 cli.defines = defines;
                 if let Some(output) = settings.output {
@@ -196,7 +243,7 @@ pub(crate) fn interpreter(host: &Arc<dyn Host>, cwd: &Path, options: &CPackOptio
             defines: Vec::new(),
             script_args: Vec::new(),
         },
-        rcmake_commands::register_all,
+        register_cpack_commands,
     );
     if options.trace || options.trace_expand {
         interp.set_trace_config(Some(TraceConfig {
@@ -205,6 +252,52 @@ pub(crate) fn interpreter(host: &Arc<dyn Host>, cwd: &Path, options: &CPackOptio
         }));
     }
     interp
+}
+
+fn register_cpack_commands(registry: &mut Registry) {
+    rcmake_commands::register_all(registry);
+
+    static GET_PROPERTY: OnceLock<BuiltinFn> = OnceLock::new();
+    if let Some((builtin, flags)) = registry.get(b"get_property") {
+        GET_PROPERTY.get_or_init(|| builtin);
+        registry.add(
+            "get_property",
+            |cx, args| {
+                if let [output, scope, property, name] = args
+                    && scope.value == b"GLOBAL"
+                    && property.value == b"PROPERTY"
+                    && name.value == b"CMAKE_ROLE"
+                {
+                    cx.set_var(&output.value, "CPACK".into());
+                    return Ok(Flow::Normal);
+                }
+                GET_PROPERTY
+                    .get()
+                    .map_or(Ok(Flow::Normal), |builtin| builtin(cx, args))
+            },
+            flags,
+        );
+    }
+
+    static GET_CMAKE_PROPERTY: OnceLock<BuiltinFn> = OnceLock::new();
+    if let Some((builtin, flags)) = registry.get(b"get_cmake_property") {
+        GET_CMAKE_PROPERTY.get_or_init(|| builtin);
+        registry.add(
+            "get_cmake_property",
+            |cx, args| {
+                if let [output, name] = args
+                    && name.value == b"CMAKE_ROLE"
+                {
+                    cx.set_var(&output.value, "CPACK".into());
+                    return Ok(Flow::Normal);
+                }
+                GET_CMAKE_PROPERTY
+                    .get()
+                    .map_or(Ok(Flow::Normal), |builtin| builtin(cx, args))
+            },
+            flags,
+        );
+    }
 }
 
 pub(crate) fn load_base(
