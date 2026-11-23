@@ -481,7 +481,7 @@ impl Interp {
             .bt
             .top()
             .map_or_else(|| Arc::from(&b""[..]), |f| Arc::clone(&f.file));
-        let Some(queue) = self.defer.as_mut() else {
+        let Some(queue) = self.dir_frame_mut().defer.as_mut() else {
             return false;
         };
         let args = args
@@ -502,7 +502,7 @@ impl Interp {
 
     /// `cmMakefile::DeferCancelCall`.
     pub(crate) fn cancel_deferred(&mut self, id: &[u8]) -> bool {
-        let Some(queue) = self.defer.as_mut() else {
+        let Some(queue) = self.dir_frame_mut().defer.as_mut() else {
             return false;
         };
         for call in queue.iter_mut().filter(|c| c.id.as_slice() == id) {
@@ -513,7 +513,7 @@ impl Interp {
 
     /// `cmMakefile::DeferGetCallIds`.
     pub(crate) fn deferred_ids(&self) -> Option<Vec<BString>> {
-        self.defer.as_ref().map(|queue| {
+        self.dir_frame().defer.as_ref().map(|queue| {
             queue
                 .iter()
                 .filter(|c| !c.id.is_empty())
@@ -525,7 +525,7 @@ impl Interp {
     /// `cmMakefile::DeferGetCall`: `[command, args...]`, or an empty list for an unknown
     /// identifier. `None` when no deferred-call queue is active.
     pub(crate) fn deferred_call(&self, id: &[u8]) -> Option<Vec<BString>> {
-        let queue = self.defer.as_ref()?;
+        let queue = self.dir_frame().defer.as_ref()?;
         let Some(call) = queue
             .iter()
             .find(|c| !id.is_empty() && c.id.as_slice() == id)
@@ -549,7 +549,12 @@ impl Interp {
         });
         let mut i = 0;
         while !self.fatal && self.exit_override.is_none() {
-            let Some(call) = self.defer.as_mut().and_then(|q| q.get_mut(i)) else {
+            let Some(call) = self
+                .dir_frame_mut()
+                .defer
+                .as_mut()
+                .and_then(|q| q.get_mut(i))
+            else {
                 break;
             };
             i += 1;

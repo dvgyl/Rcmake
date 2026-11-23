@@ -12,13 +12,16 @@ indexmap.workspace = true
 jiff.workspace = true
 rcmake-archive.workspace = true
 rcmake-base.workspace = true
+rcmake-build.workspace = true
 rcmake-diag.workspace = true
 rcmake-eval.workspace = true
 rcmake-expr.workspace = true
+rcmake-genex.workspace = true
 rcmake-host.workspace = true
 rcmake-json.workspace = true
 rcmake-model.workspace = true
 rcmake-regex.workspace = true
+rcmake-resolve.workspace = true
 rcmake-syntax.workspace = true
 
 [lints]

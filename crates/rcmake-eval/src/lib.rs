@@ -26,7 +26,7 @@ use rcmake_diag::{
 };
 use rcmake_expr::{CondEnv, CondError, ExpandEnv, ExpandError, ExpandedArg};
 use rcmake_host::Host;
-use rcmake_model::{Cache, CacheType, GlobalState, ProjectModel, PropertyMap};
+use rcmake_model::{Cache, CacheType, DirId, GlobalState, ProjectModel, PropertyMap};
 use rcmake_regex::{Captures, Regex, RegexCache, RegexError};
 use rcmake_syntax::{Argument, CommandInvocation};
 
@@ -197,6 +197,25 @@ pub struct IncludeOptions {
     pub no_diagnostic_scope: bool,
 }
 
+/// Options for [`Cx::run_subdirectory`] (`add_subdirectory()` keywords).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SubdirOptions {
+    /// `EXCLUDE_FROM_ALL`.
+    pub exclude_from_all: bool,
+    /// `SYSTEM`.
+    pub system: bool,
+}
+
+/// One active directory on [`Interp`]'s directory stack.
+#[derive(Debug)]
+pub(crate) struct DirFrame {
+    /// The directory in the [`ProjectModel`] arena.
+    pub(crate) id: DirId,
+    /// Deferred-call queue of the directory listfile being processed (`None` outside
+    /// a directory listfile).
+    pub(crate) defer: Option<Vec<hooks::DeferredCall>>,
+}
+
 /// Outcome of running a CMake script or configure session.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RunOutcome {
@@ -335,11 +354,12 @@ pub const HARD_RECURSION_CEILING: u32 = 20_000;
 /// Core CMake 4.5.1 interpreter.
 pub struct Interp {
     config: InterpConfig,
-    cache: Cache,
-    global: GlobalState,
+    /// Project model: cache, global state, and the directory/target arenas.
     project: ProjectModel,
-    /// Current directory properties (`include_guard(DIRECTORY)`, `MACROS`).
-    dir_props: PropertyMap,
+    /// The root directory frame (script mode, or the top-level `CMakeLists.txt`).
+    root_frame: DirFrame,
+    /// Active subdirectory frames (`add_subdirectory()`), innermost last.
+    dir_stack: Vec<DirFrame>,
     registry: Registry,
     /// User-defined commands and renamed (`_name`) previous definitions.
     scripted: BTreeMap<BString, Command>,
@@ -366,10 +386,6 @@ pub struct Interp {
     show_log_context: bool,
     /// Host monotonic time at session start (wall-clock budget).
     started: core::time::Duration,
-    /// True source directory for the active directory frame (not affected by user `set()`).
-    source_dir: PathBuf,
-    /// True binary directory for the active directory frame (not affected by user `set()`).
-    binary_dir: PathBuf,
     /// Optional explicit exit code requested by `cmake_language(EXIT <code>)`.
     exit_override: Option<i32>,
     frontend: Frontend,
@@ -378,8 +394,6 @@ pub struct Interp {
     next_watch_id: u64,
     /// Command tracing configuration (`--trace*`).
     trace: Option<TraceConfig>,
-    /// Deferred-call queue of the directory listfile being processed.
-    defer: Option<Vec<hooks::DeferredCall>>,
     next_defer_id: u64,
     /// Identifier of the deferred call whose frame is on top of the backtrace.
     top_defer_id: Option<BString>,
@@ -402,9 +416,9 @@ impl Interp {
         let mut registry = Registry::default();
         builtins::register_core(&mut registry);
         register(&mut registry);
-        let mut cache = Cache::default();
+        let mut project = ProjectModel::default();
         for def in &config.defines {
-            cache.insert(
+            project.cache.insert(
                 def.name.clone(),
                 rcmake_model::CacheEntry {
                     value: def.value.clone(),
@@ -422,13 +436,16 @@ impl Interp {
             ..RenderOptions::default()
         };
         let started = config.host.monotonic();
-        let initial_dir = config.cwd.clone();
+        let initial_dir = rcmake_host::path::from_native(&config.cwd);
+        project.set_root_dirs(initial_dir.clone(), initial_dir);
         let mut interp = Self {
             config,
-            cache,
-            global: GlobalState::default(),
-            project: ProjectModel::default(),
-            dir_props: PropertyMap::default(),
+            project,
+            root_frame: DirFrame {
+                id: DirId::ROOT,
+                defer: None,
+            },
+            dir_stack: Vec::new(),
             registry,
             scripted: BTreeMap::new(),
             vars: VarStack::default(),
@@ -453,14 +470,11 @@ impl Interp {
             log_level: None,
             show_log_context: false,
             started,
-            source_dir: initial_dir.clone(),
-            binary_dir: initial_dir,
             exit_override: None,
             frontend: Frontend::default(),
             watches: BTreeMap::new(),
             next_watch_id: 0,
             trace: None,
-            defer: None,
             next_defer_id: 0,
             top_defer_id: None,
             cur_cmd: None,
@@ -596,7 +610,7 @@ impl Cx<'_> {
     /// `if(DEFINED name)`: a normal binding or a cache entry exists.
     #[must_use]
     pub fn var_defined(&self, name: &[u8]) -> bool {
-        self.interp.vars.get(name).is_some() || self.interp.cache.contains(name)
+        self.interp.vars.get(name).is_some() || self.interp.project.cache.contains(name)
     }
 
     /// Value of `name` or an empty string (`GetSafeDefinition`).
@@ -617,7 +631,7 @@ impl Cx<'_> {
     #[must_use]
     pub fn variable_names(&self) -> Vec<BString> {
         let mut names = self.interp.vars.visible_names();
-        names.extend(self.interp.cache.iter().map(|(k, _)| k.clone()));
+        names.extend(self.interp.project.cache.iter().map(|(k, _)| k.clone()));
         names.sort();
         names.dedup();
         names
@@ -692,12 +706,12 @@ impl Cx<'_> {
 
     /// Mutable access to the [`Cache`].
     pub fn cache(&mut self) -> &mut Cache {
-        &mut self.interp.cache
+        &mut self.interp.project.cache
     }
 
     /// Mutable access to [`GlobalState`].
     pub fn global(&mut self) -> &mut GlobalState {
-        &mut self.interp.global
+        &mut self.interp.project.global
     }
 
     /// Mutable access to [`ProjectModel`].
@@ -705,9 +719,41 @@ impl Cx<'_> {
         &mut self.interp.project
     }
 
-    /// Mutable access to the current directory properties.
+    /// Mutable access to the plain properties of the current directory. Usage
+    /// requirements and computed properties go through [`ProjectModel::get_prop`] and
+    /// [`ProjectModel::set_prop`] with [`Self::current_dir_id`].
     pub fn directory_props(&mut self) -> &mut PropertyMap {
-        &mut self.interp.dir_props
+        let id = self.interp.current_dir_id();
+        &mut self.interp.project.dir_mut(id).props
+    }
+
+    /// The directory being processed ([`DirId::ROOT`] in script mode).
+    #[must_use]
+    pub fn current_dir_id(&self) -> DirId {
+        self.interp.current_dir_id()
+    }
+
+    /// Process a subdirectory (`add_subdirectory()`): create the directory in the
+    /// [`ProjectModel`] and run `<src>/CMakeLists.txt` with `<bin>` as its binary
+    /// directory. Relative paths resolve against the current source and binary
+    /// directories.
+    ///
+    /// The child starts with a copy of the current variables, so `set(... PARENT_SCOPE)`
+    /// and `return(PROPAGATE)` in the child update the caller. Policy, diagnostic, and
+    /// loop-block scopes are isolated. The child's deferred calls run before this call
+    /// returns, and [`rcmake_model::Directory::final_policies`] records the child's
+    /// policies at its end.
+    ///
+    /// Issues the error `The source directory ... does not contain a CMakeLists.txt
+    /// file.` and returns `Err(CmdError::Reported)` when the listfile is missing.
+    /// Processing continues after that error, as in CMake.
+    pub fn run_subdirectory(
+        &mut self,
+        src: &Path,
+        bin: &Path,
+        options: SubdirOptions,
+    ) -> Result<DirId, CmdError> {
+        self.interp.run_subdirectory(src, bin, options)
     }
 
     /// `CMAKE_CURRENT_LIST_FILE`.
@@ -732,7 +778,7 @@ impl Cx<'_> {
     /// user-mutated variables).
     #[must_use]
     pub fn current_binary_dir(&self) -> PathBuf {
-        self.interp.binary_dir.clone()
+        self.interp.current_binary_dir()
     }
 
     /// Line of the command being executed.
@@ -999,7 +1045,7 @@ impl Cx<'_> {
     /// can be queued for the end of the directory.
     #[must_use]
     pub fn defer_active(&self) -> bool {
-        self.interp.defer.is_some()
+        self.interp.dir_frame().defer.is_some()
     }
 
     /// A new unique deferred-call identifier (`__0`, `__1`, ...).

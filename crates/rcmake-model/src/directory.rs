@@ -1,0 +1,44 @@
+//! Directory scopes (`cmStateDirectory` and the per-directory parts of `cmMakefile`).
+
+use indexmap::IndexMap;
+use rcmake_base::BString;
+use rcmake_diag::{Backtrace, PolicyMap};
+
+use crate::{DirId, PropertyMap, TargetBinding, TargetId, TestId, UsageProps};
+
+/// One processed (or in-process) source directory.
+#[derive(Clone, Debug, Default)]
+pub struct Directory {
+    /// Parent directory (`None` for [`DirId::ROOT`]).
+    pub parent: Option<DirId>,
+    /// Subdirectories in `add_subdirectory()` order (`SUBDIRECTORIES`).
+    pub children: Vec<DirId>,
+    /// Absolute source directory, CMake style (`SOURCE_DIR`).
+    pub source_dir: BString,
+    /// Absolute binary directory, CMake style (`BINARY_DIR`).
+    pub binary_dir: BString,
+    /// Backtrace of the `add_subdirectory()` call (empty for the root).
+    pub backtrace: Backtrace,
+    /// Directory properties that are not usage requirements.
+    pub props: PropertyMap,
+    /// Directory usage requirements (`INCLUDE_DIRECTORIES`, `COMPILE_OPTIONS`, ...).
+    pub usage: UsageProps,
+    /// Source file properties by absolute source path.
+    pub source_props: IndexMap<BString, PropertyMap>,
+    /// `add_subdirectory(... EXCLUDE_FROM_ALL)`.
+    pub exclude_from_all: bool,
+    /// `add_subdirectory(... SYSTEM)`.
+    pub system: bool,
+    /// Listfiles read while processing the directory, in order (`cmakeFiles-v1`,
+    /// `RERUN_CMAKE`).
+    pub listfiles: Vec<BString>,
+    /// Policies at the end of the directory's `CMakeLists.txt` (`None` until then).
+    pub final_policies: Option<PolicyMap>,
+    /// Targets created in this directory, in order (`BUILDSYSTEM_TARGETS`).
+    pub targets: Vec<TargetId>,
+    /// Non-global imported targets and their aliases visible here (`IMPORTED_TARGETS`
+    /// lists the ones created here).
+    pub local_targets: IndexMap<BString, TargetBinding>,
+    /// Tests created in this directory (`TESTS`).
+    pub tests: IndexMap<BString, TestId>,
+}

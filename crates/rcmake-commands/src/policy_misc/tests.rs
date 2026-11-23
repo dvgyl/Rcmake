@@ -29,7 +29,7 @@ fn context(mode: RunMode) -> (Arc<PureHost>, Interp) {
             }],
             script_args: Vec::new(),
         },
-        super::register,
+        crate::register_all,
     );
     (host, interp)
 }

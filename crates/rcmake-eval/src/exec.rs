@@ -13,6 +13,7 @@ use rcmake_diag::{
 };
 use rcmake_expr::ExpandedArg;
 use rcmake_host::{FileKind, Follow, ReadRange, Stream};
+use rcmake_model::DirId;
 use rcmake_regex::Captures;
 use rcmake_syntax::{ArgKind, Argument, CommandInvocation, ParseError};
 
@@ -20,8 +21,9 @@ use crate::code::Code;
 use crate::hooks::{WatchAccess, display_line};
 use crate::util::{closest, collapse_full_path, filename_path};
 use crate::{
-    CmdError, CmdResult, Command, Cx, FLOW_CONTROL, Flow, HARD_RECURSION_CEILING, IncludeOptions,
-    Interp, LogLevel, RunMode, RunOutcome, Snapshot, UserCommand, UserCommandKind,
+    CmdError, CmdResult, Command, Cx, DirFrame, FLOW_CONTROL, Flow, HARD_RECURSION_CEILING,
+    IncludeOptions, Interp, LogLevel, RunMode, RunOutcome, Snapshot, SubdirOptions, UserCommand,
+    UserCommandKind,
 };
 
 /// `CMP0198`: `CMAKE_PARENT_LIST_FILE` is not defined in `CMakeLists.txt`.
@@ -249,9 +251,10 @@ impl Interp {
         if directory {
             self.begin_directory_list_file();
         }
+        self.record_list_file(abs);
         self.push_snapshot();
         let saved_defer = if directory {
-            self.defer.replace(Vec::new())
+            self.dir_frame_mut().defer.replace(Vec::new())
         } else {
             None
         };
@@ -272,7 +275,10 @@ impl Interp {
             None => false,
         };
         if directory {
-            self.defer = saved_defer;
+            self.dir_frame_mut().defer = saved_defer;
+            let policies = *self.policies.top();
+            let id = self.current_dir_id();
+            self.project.dir_mut(id).final_policies = Some(policies);
         }
         let report = !self.fatal;
         self.pop_list_file_vars(vars);
@@ -321,7 +327,7 @@ impl Interp {
     pub(crate) fn lookup_var(&self, name: &[u8]) -> Option<&BString> {
         self.vars
             .get(name)
-            .or_else(|| self.cache.get(name).map(|e| &e.value))
+            .or_else(|| self.project.cache.get(name).map(|e| &e.value))
     }
 
     pub(crate) fn run_configure_impl(
@@ -336,8 +342,7 @@ impl Interp {
         let src_native = rcmake_host::path::to_native(&src_abs);
         let bin_native = rcmake_host::path::to_native(&bin_abs);
 
-        self.source_dir = src_native.clone();
-        self.binary_dir = bin_native.clone();
+        self.project.set_root_dirs(src_abs.clone(), bin_abs.clone());
         self.render.relative_base = Some(src_abs.clone());
 
         for var in [b"CMAKE_SOURCE_DIR".as_slice(), b"CMAKE_CURRENT_SOURCE_DIR"] {
@@ -397,8 +402,116 @@ impl Interp {
         self.read_list_file(&abs)
     }
 
+    /// The directory being processed.
+    pub(crate) fn current_dir_id(&self) -> DirId {
+        self.dir_frame().id
+    }
+
+    /// Innermost directory frame.
+    pub(crate) fn dir_frame(&self) -> &DirFrame {
+        self.dir_stack.last().unwrap_or(&self.root_frame)
+    }
+
+    /// Mutable innermost directory frame.
+    pub(crate) fn dir_frame_mut(&mut self) -> &mut DirFrame {
+        match self.dir_stack.last_mut() {
+            Some(frame) => frame,
+            None => &mut self.root_frame,
+        }
+    }
+
     pub(crate) fn current_source_dir(&self) -> PathBuf {
-        self.source_dir.clone()
+        let dir = self.project.dir(self.current_dir_id());
+        rcmake_host::path::to_native(&dir.source_dir)
+    }
+
+    pub(crate) fn current_binary_dir(&self) -> PathBuf {
+        let dir = self.project.dir(self.current_dir_id());
+        rcmake_host::path::to_native(&dir.binary_dir)
+    }
+
+    /// Record a listfile read in the current directory (`cmMakefile::ListFiles`).
+    fn record_list_file(&mut self, abs: &[u8]) {
+        let id = self.current_dir_id();
+        let files = &mut self.project.dir_mut(id).listfiles;
+        if !files.iter().any(|f| f.as_slice() == abs) {
+            files.push(BString::from(abs));
+        }
+    }
+
+    /// `cmMakefile::AddSubDirectory` + `ConfigureSubDirectory` (see
+    /// [`crate::Cx::run_subdirectory`]).
+    pub(crate) fn run_subdirectory(
+        &mut self,
+        src: &Path,
+        bin: &Path,
+        options: SubdirOptions,
+    ) -> Result<DirId, CmdError> {
+        let src_abs = collapse_full_path(
+            &rcmake_host::path::from_native(src),
+            &self.current_source_dir_bytes(),
+        );
+        let bin_base = rcmake_host::path::from_native(&self.current_binary_dir());
+        let bin_abs = collapse_full_path(&rcmake_host::path::from_native(bin), &bin_base);
+        let lists = cat(&[&src_abs, b"/CMakeLists.txt"]);
+        if !self.is_regular_file(&lists) {
+            // CMake reports this from the new directory, so processing continues.
+            self.error_here(cat(&[
+                b"The source directory\n  ",
+                &src_abs,
+                b"\ndoes not contain a CMakeLists.txt file.",
+            ]));
+            return Err(CmdError::Reported);
+        }
+        let parent = self.current_dir_id();
+        let bt = self.bt.clone();
+        let Ok(id) = self
+            .project
+            .add_directory(parent, src_abs.clone(), bin_abs.clone(), bt)
+        else {
+            self.fatal_here(b"Too many directories.".into());
+            return Err(CmdError::Reported);
+        };
+        let dir = self.project.dir_mut(id);
+        dir.exclude_from_all |= options.exclude_from_all;
+        dir.system |= options.system;
+        if options.exclude_from_all {
+            dir.props.set("EXCLUDE_FROM_ALL".into(), "TRUE".into());
+        }
+        if options.system {
+            dir.props.set("SYSTEM".into(), "TRUE".into());
+        }
+        let _ = self
+            .config
+            .host
+            .create_dir_all(&rcmake_host::path::to_native(&bin_abs));
+
+        self.depth = self.depth.saturating_add(1);
+        let limit = self.recursion_limit();
+        if self.depth > limit {
+            self.depth = self.depth.saturating_sub(1);
+            self.fatal_here(format!("Maximum recursion depth of {limit} exceeded").into());
+            return Err(CmdError::Reported);
+        }
+        self.vars.push();
+        self.loop_blocks.push(0);
+        self.policies.push_copy();
+        self.diags.push_copy();
+        let policy_base = self.policies.len() - 1;
+        let diag_base = self.diags.len() - 1;
+        self.dir_stack.push(DirFrame { id, defer: None });
+        self.define(b"CMAKE_CURRENT_SOURCE_DIR", src_abs);
+        self.define(b"CMAKE_CURRENT_BINARY_DIR", bin_abs);
+
+        let _ = self.read_list_file_impl(&lists, true);
+
+        self.dir_stack.pop();
+        self.diags.pop_above(diag_base);
+        self.policies.pop_above(policy_base);
+        self.loop_blocks.pop();
+        self.vars.pop();
+        self.depth = self.depth.saturating_sub(1);
+        Ok(id)
     }
 
     fn current_source_dir_bytes(&self) -> BString {
@@ -1240,6 +1353,7 @@ impl Interp {
     /// `cmMakefile::ReadDependentFile` (`IncludeScope`). Returns `false` when the file
     /// can not be read or parsed.
     pub(crate) fn read_dependent_file(&mut self, abs: &[u8], options: IncludeOptions) -> bool {
+        self.record_list_file(abs);
         let saved_bt = self.push_file_frame(abs);
         self.push_snapshot();
         if !options.no_policy_scope {

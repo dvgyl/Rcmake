@@ -31,7 +31,7 @@ impl ExpandEnv for Interp {
     }
 
     fn cache_var(&mut self, name: &[u8]) -> Option<BString> {
-        self.cache.get(name).map(|e| e.value.clone())
+        self.project.cache.get(name).map(|e| e.value.clone())
     }
 
     fn env_var(&mut self, name: &[u8]) -> Option<BString> {
@@ -45,7 +45,7 @@ impl ExpandEnv for Interp {
 
 impl CondEnv for Interp {
     fn is_defined(&mut self, name: &[u8]) -> bool {
-        let defined = self.vars.get(name).is_some() || self.cache.contains(name);
+        let defined = self.vars.get(name).is_some() || self.project.cache.contains(name);
         if !defined {
             self.fire_watches(name, WatchAccess::UnknownDefined, None);
         }
@@ -53,7 +53,7 @@ impl CondEnv for Interp {
     }
 
     fn cache_defined(&mut self, name: &[u8]) -> bool {
-        self.cache.contains(name)
+        self.project.cache.contains(name)
     }
 
     fn env_defined(&mut self, name: &[u8]) -> bool {
@@ -73,15 +73,20 @@ impl CondEnv for Interp {
     }
 
     fn target_exists(&self, name: &[u8]) -> bool {
-        self.project.target_names.contains_key(name)
+        self.project
+            .find_target(self.current_dir_id(), name)
+            .is_some()
     }
 
     fn test_exists(&self, name: &[u8]) -> bool {
-        self.project.test_names.contains_key(name)
+        self.project
+            .find_test(self.current_dir_id(), name)
+            .is_some()
     }
 
-    fn rule_exists(&self, name: &[u8]) -> bool {
-        self.project.rule_names.contains_key(name)
+    fn rule_exists(&self, _name: &[u8]) -> bool {
+        // No command creates custom rules yet.
+        false
     }
 
     fn policy(&self, id: PolicyId) -> PolicyStatus {

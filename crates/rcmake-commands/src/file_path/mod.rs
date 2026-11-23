@@ -10,7 +10,6 @@ mod archive;
 mod copy;
 mod file;
 mod glob;
-mod lexical;
 mod mutation;
 mod path_cmd;
 mod path_hash;

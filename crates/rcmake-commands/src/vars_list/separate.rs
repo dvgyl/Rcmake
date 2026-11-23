@@ -229,6 +229,4 @@ impl Iterator for Arguments<'_> {
     }
 }
 
-pub(super) fn space(byte: u8) -> bool {
-    byte.is_ascii_whitespace() || byte == b'\x0b'
-}
+use rcmake_base::list_ops::is_space as space;

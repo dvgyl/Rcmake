@@ -1,8 +1,12 @@
 use rcmake_base::{BString, list, truth};
+use rcmake_diag::{Effect, MessageKind};
 use rcmake_eval::{CmdError, CmdResult, Cx, Flow, RunMode};
 use rcmake_expr::ExpandedArg;
 use rcmake_host::path;
-use rcmake_model::{CacheEntry, CacheType, DefinedProperty, PropertyMap};
+use rcmake_model::{
+    AppendMode, CacheEntry, CacheType, DefinedProperty, ModelError, PropOrigin, PropScope,
+    PropertyMap, TargetId,
+};
 
 use super::{files::normalize, quoted, status, values};
 
@@ -31,6 +35,7 @@ pub(super) fn define(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
         inherited: false,
         brief_docs: BString::default(),
         full_docs: BString::default(),
+        initialize_from_variable: None,
     };
     let mut docs = None;
     let mut tail = tail.iter().copied();
@@ -47,6 +52,7 @@ pub(super) fn define(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
                     status("missing variable name after INITIALIZE_FROM_VARIABLE")
                 })?;
                 validate_initializer(scope, name, variable)?;
+                entry.initialize_from_variable = Some(variable.into());
                 docs = None;
             }
             other => {
@@ -130,8 +136,9 @@ pub(super) fn set_directory(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult 
     let [b"PROPERTIES", pairs @ ..] = args.as_slice() else {
         return Err(status("Wrong number of arguments"));
     };
+    let dir = PropScope::Directory(cx.current_dir_id());
     for [name, value] in property_pairs(pairs)? {
-        cx.directory_props().set((*name).into(), (*value).into());
+        update_scoped(cx, &dir, name, Some((*value).into()), Update::Set)?;
     }
     Ok(Flow::Normal)
 }
@@ -144,10 +151,9 @@ pub(super) fn set_sources(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
     let (sources, tail) = args.split_at(split);
     let pairs = property_pairs(tail.get(1..).unwrap_or_default())?;
     for source in source_names(cx, sources, false)? {
-        let source = path::from_native(&cx.resolve_path(source));
+        let scope = source_scope(cx, source);
         for [name, value] in pairs {
-            let key = object_key(b"SOURCE", &source, name);
-            cx.directory_props().set(key, (*value).into());
+            update_scoped(cx, &scope, name, Some((*value).into()), Update::Set)?;
         }
     }
     Ok(Flow::Normal)
@@ -240,19 +246,19 @@ pub(super) fn set(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
         b"GLOBAL" => return Err(status("given names for GLOBAL scope.")),
         b"DIRECTORY" => {
             check_directory(cx, &names)?;
-            update.property(cx.directory_props(), name, value);
+            let dir = PropScope::Directory(cx.current_dir_id());
+            update_scoped(cx, &dir, name, value, update)?;
         }
         b"SOURCE" => {
             for source in source_names(cx, &names, false)? {
-                let source = path::from_native(&cx.resolve_path(source));
-                let key = object_key(b"SOURCE", &source, name);
-                update.property(cx.directory_props(), &key, value.clone());
+                let scope = source_scope(cx, source);
+                update_scoped(cx, &scope, name, value.clone(), update)?;
             }
         }
         b"TARGET" => {
             for target in names {
-                let key = target_key(cx, target, name)?;
-                update.property(&mut cx.global().props, &key, value.clone());
+                let scope = PropScope::Target(find_target(cx, target)?);
+                update_scoped(cx, &scope, name, value.clone(), update)?;
             }
         }
         b"CACHE" => {
@@ -275,6 +281,52 @@ pub(super) fn set(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
         _ => return Err(status(quoted("given invalid scope ", scope, "."))),
     }
     Ok(Flow::Normal)
+}
+
+/// Apply `update` to a model-owned property scope.
+fn update_scoped(
+    cx: &mut Cx<'_>,
+    scope: &PropScope,
+    name: &[u8],
+    value: Option<BString>,
+    update: Update,
+) -> Result<(), CmdError> {
+    let backtrace = cx.backtrace();
+    let origin = PropOrigin {
+        dir: cx.current_dir_id(),
+        backtrace: &backtrace,
+    };
+    let project = cx.project();
+    let result = match (update, value) {
+        (Update::Set, value) => project.set_prop(scope, name, value, origin),
+        (Update::Append, Some(value)) => {
+            project.append_prop(scope, name, &value, AppendMode::List, origin)
+        }
+        (Update::AppendString, Some(value)) => {
+            project.append_prop(scope, name, &value, AppendMode::String, origin)
+        }
+        (_, None) => Ok(()),
+    };
+    match result {
+        Ok(()) => Ok(()),
+        Err(ModelError::ReadOnly) => {
+            cx.issue(
+                MessageKind::Error,
+                Effect::Fatal,
+                None,
+                quoted("", name, " property is read-only\n"),
+            );
+            Err(CmdError::Reported)
+        }
+        Err(other) => Err(status(other.to_string())),
+    }
+}
+
+fn source_scope(cx: &mut Cx<'_>, source: &[u8]) -> PropScope {
+    PropScope::Source {
+        dir: cx.current_dir_id(),
+        path: path::from_native(&cx.resolve_path(source)),
+    }
 }
 
 fn set_cache(
@@ -403,12 +455,14 @@ pub(super) fn get(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
                     let [target] = names else {
                         return Err(status("not given name for TARGET scope."));
                     };
-                    let key = target_key(cx, target, name)?;
-                    cx.global().props.get(&key).cloned().or_else(|| {
-                        inherited
-                            .then(|| directory_value(cx, name).or_else(|| global_value(cx, name)))
-                            .flatten()
-                    })
+                    let scope = PropScope::Target(find_target(cx, target)?);
+                    let project = cx.project();
+                    let value = if inherited {
+                        project.get_prop_inherited(&scope, name)
+                    } else {
+                        project.get_prop(&scope, name)
+                    };
+                    value.or_else(|| inherited.then(|| global_value(cx, name)).flatten())
                 }
                 b"CACHE" => names
                     .first()
@@ -453,7 +507,7 @@ fn source_names<'a>(
                     if cx.mode() == RunMode::Script || check_directory(cx, &[value]).is_err() {
                         return Err(status(quoted("given non-existent DIRECTORY ", value, "")));
                     }
-                } else if !cx.project().target_names.contains_key(value) {
+                } else if find_target(cx, value).is_err() {
                     return Err(status(quoted(
                         "given non-existent target for TARGET_DIRECTORY ",
                         value,
@@ -474,44 +528,28 @@ fn source_names<'a>(
 }
 
 fn source_value(cx: &mut Cx<'_>, source: &[u8], name: &[u8], inherited: bool) -> Option<BString> {
-    let source = path::from_native(&cx.resolve_path(source));
-    let key = object_key(b"SOURCE", &source, name);
-    cx.directory_props()
-        .get(&key)
-        .cloned()
-        .or_else(|| match name {
-            b"GENERATED" => Some("0".into()),
-            b"LOCATION" => Some(path::from_native(&normalize(&path::to_native(&source)))),
-            _ if inherited => directory_value(cx, name).or_else(|| global_value(cx, name)),
-            _ => None,
-        })
+    let scope = source_scope(cx, source);
+    let PropScope::Source { path: source, .. } = &scope else {
+        return None;
+    };
+    let source = source.clone();
+    cx.project().get_prop(&scope, name).or_else(|| match name {
+        b"GENERATED" => Some("0".into()),
+        b"LOCATION" => Some(path::from_native(&normalize(&path::to_native(&source)))),
+        _ if inherited => directory_value(cx, name).or_else(|| global_value(cx, name)),
+        _ => None,
+    })
 }
 
-fn target_key(cx: &mut Cx<'_>, target: &[u8], name: &[u8]) -> Result<BString, CmdError> {
-    if cx.project().target_names.contains_key(target) {
-        Ok(object_key(b"TARGET", target, name))
-    } else {
-        Err(status(quoted(
+fn find_target(cx: &mut Cx<'_>, target: &[u8]) -> Result<TargetId, CmdError> {
+    let dir = cx.current_dir_id();
+    cx.project().find_target(dir, target).ok_or_else(|| {
+        status(quoted(
             "could not find TARGET ",
             target,
             ".  Perhaps it has not yet been created.",
-        )))
-    }
-}
-
-fn object_key(scope: &[u8], object: &[u8], name: &[u8]) -> BString {
-    // Store object properties in the current model until it has source and target property maps.
-    let length = object.len().to_string();
-    [
-        b"\0".as_slice(),
-        scope,
-        length.as_bytes(),
-        b":",
-        object,
-        name,
-    ]
-    .concat()
-    .into()
+        ))
+    })
 }
 
 fn check_directory(cx: &Cx<'_>, names: &[&[u8]]) -> Result<(), CmdError> {
@@ -536,14 +574,10 @@ fn directory_value(cx: &mut Cx<'_>, name: &[u8]) -> Option<BString> {
         b"VARIABLES" => Some(list::join(cx.variable_names())),
         b"CACHE_VARIABLES" => Some(cache_names(cx)),
         b"MACROS" => Some(cx.directory_props().get(name).cloned().unwrap_or_default()),
-        b"SOURCE_DIR" => Some(path::from_native(&cx.current_source_dir())),
-        b"BINARY_DIR" => Some(path::from_native(&cx.current_binary_dir())),
-        b"PARENT_DIRECTORY"
-        | b"SUBDIRECTORIES"
-        | b"BUILDSYSTEM_TARGETS"
-        | b"IMPORTED_TARGETS"
-        | b"TESTS" => Some(BString::default()),
-        _ => cx.directory_props().get(name).cloned(),
+        _ => {
+            let dir = PropScope::Directory(cx.current_dir_id());
+            cx.project().get_prop(&dir, name)
+        }
     }
 }
 

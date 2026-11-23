@@ -1,14 +1,21 @@
-use rcmake_base::BString;
+//! Pure lexical `cmake_path` operations shared by `cmake_path()` and `$<PATH:...>`.
+//!
+//! All operations work on byte strings. They do not access the filesystem.
+
+use bstr::BString;
 
 #[derive(Clone, Copy)]
-pub(super) struct Lexical<'a> {
+/// Borrowed lexical view of a `cmake_path` path value: root name, root directory, and
+/// relative part. No filesystem access is made.
+pub struct Lexical<'a> {
     raw: &'a [u8],
     root_name_len: usize,
     relative_start: usize,
 }
 
 impl<'a> Lexical<'a> {
-    pub(super) fn new(raw: &'a [u8]) -> Self {
+    /// Split `raw` into root name, root directory, and relative part.
+    pub fn new(raw: &'a [u8]) -> Self {
         let root_name_len = root_name_len(raw);
         let relative_start = root_name_len
             + raw
@@ -24,11 +31,13 @@ impl<'a> Lexical<'a> {
         }
     }
 
-    pub(super) fn root_name(self) -> &'a [u8] {
+    /// Root name (`C:` or `//server` on Windows; always empty on POSIX).
+    pub fn root_name(self) -> &'a [u8] {
         self.raw.get(..self.root_name_len).unwrap_or_default()
     }
 
-    pub(super) fn root_directory(self) -> &'static [u8] {
+    /// Root directory (`/` when the path has one after the root name).
+    pub fn root_directory(self) -> &'static [u8] {
         if self.relative_start > self.root_name_len {
             b"/"
         } else {
@@ -36,32 +45,38 @@ impl<'a> Lexical<'a> {
         }
     }
 
-    pub(super) fn root_path(self) -> BString {
+    /// Root name followed by root directory.
+    pub fn root_path(self) -> BString {
         [self.root_name(), self.root_directory()].concat().into()
     }
 
-    pub(super) fn absolute(self) -> bool {
+    /// `true` for an absolute path (`cmake_path(IS_ABSOLUTE)`).
+    pub fn absolute(self) -> bool {
         !self.root_directory().is_empty() && (!cfg!(windows) || !self.root_name().is_empty())
     }
 
-    pub(super) fn relative_part(self) -> &'a [u8] {
+    /// Path text after the root path.
+    pub fn relative_part(self) -> &'a [u8] {
         self.raw.get(self.relative_start..).unwrap_or_default()
     }
 
-    pub(super) fn filename(self) -> &'a [u8] {
+    /// Last component of the relative part (empty after a trailing `/`).
+    pub fn filename(self) -> &'a [u8] {
         self.relative_part()
             .rsplit(|&b| b == b'/')
             .next()
             .unwrap_or_default()
     }
 
-    pub(super) fn without_filename(self) -> &'a [u8] {
+    /// Path text with the filename removed (`REMOVE_FILENAME`).
+    pub fn without_filename(self) -> &'a [u8] {
         self.raw
             .get(..self.raw.len() - self.filename().len())
             .unwrap_or_default()
     }
 
-    pub(super) fn parent(self) -> &'a [u8] {
+    /// Parent path (`GET PARENT_PATH`).
+    pub fn parent(self) -> &'a [u8] {
         if self.relative_part().is_empty() {
             return self.raw;
         }
@@ -72,7 +87,9 @@ impl<'a> Lexical<'a> {
             .unwrap_or_default()
     }
 
-    pub(super) fn stem_extension(self, last_only: bool) -> (&'a [u8], &'a [u8]) {
+    /// Split the filename into stem and extension. With `last_only`, the extension starts
+    /// at the last dot; otherwise at the first dot after the first byte.
+    pub fn stem_extension(self, last_only: bool) -> (&'a [u8], &'a [u8]) {
         let name = self.filename();
         if matches!(name, b"." | b"..") {
             return (name, b"");
@@ -86,7 +103,8 @@ impl<'a> Lexical<'a> {
         name.split_at(dot.map_or(name.len(), |(i, _)| i))
     }
 
-    pub(super) fn components(self) -> impl Iterator<Item = &'a [u8]> {
+    /// Non-empty components of the relative part.
+    pub fn components(self) -> impl Iterator<Item = &'a [u8]> {
         self.relative_part()
             .split(|&b| b == b'/')
             .filter(|part| !part.is_empty())
@@ -100,13 +118,15 @@ impl<'a> Lexical<'a> {
         self.root_name() == other.root_name() && self.root_directory() == other.root_directory()
     }
 
-    pub(super) fn equal(self, other: Self) -> bool {
+    /// Lexical path equality (`cmake_path(COMPARE ... EQUAL ...)`).
+    pub fn equal(self, other: Self) -> bool {
         self.same_root(other)
             && self.components().eq(other.components())
             && self.trailing() == other.trailing()
     }
 
-    pub(super) fn prefix(self, other: Self) -> bool {
+    /// `true` if `self` is a lexical prefix of `other` (`cmake_path(IS_PREFIX)`).
+    pub fn prefix(self, other: Self) -> bool {
         if !self.same_root(other) {
             return false;
         }
@@ -115,7 +135,9 @@ impl<'a> Lexical<'a> {
             && (!self.trailing() || target.next().is_some() || other.trailing())
     }
 
-    pub(super) fn normalize(self) -> BString {
+    /// Lexically normal form (`NORMAL_PATH`): removes `.`, resolves `..`, collapses
+    /// separators.
+    pub fn normalize(self) -> BString {
         if self.raw.is_empty() {
             return BString::default();
         }
@@ -148,7 +170,8 @@ impl<'a> Lexical<'a> {
         output
     }
 
-    pub(super) fn append(self, input: &[u8]) -> BString {
+    /// Append `input` with `cmake_path(APPEND)` semantics.
+    pub fn append(self, input: &[u8]) -> BString {
         let rhs = Lexical::new(input);
         if rhs.absolute() || (!rhs.root_name().is_empty() && self.root_name() != rhs.root_name()) {
             return input.into();
@@ -169,7 +192,8 @@ impl<'a> Lexical<'a> {
         [self.raw, separator, rhs.relative_part()].concat().into()
     }
 
-    pub(super) fn relative(self, base: Self) -> Option<BString> {
+    /// Relative path from `base` to `self` (`RELATIVE_PATH`). `None` when the roots differ.
+    pub fn relative(self, base: Self) -> Option<BString> {
         if !self.same_root(base) {
             return None;
         }
@@ -217,9 +241,11 @@ fn root_name_len(raw: &[u8]) -> usize {
     0
 }
 
-pub(super) const NATIVE_LIST_SEPARATOR: u8 = if cfg!(windows) { b';' } else { b':' };
+/// Separator of native path lists (`:` on POSIX, `;` on Windows).
+pub const NATIVE_LIST_SEPARATOR: u8 = if cfg!(windows) { b';' } else { b':' };
 
-pub(super) fn native_list(input: &[u8]) -> impl Iterator<Item = &[u8]> {
+/// Split a native path list at [`NATIVE_LIST_SEPARATOR`].
+pub fn native_list(input: &[u8]) -> impl Iterator<Item = &[u8]> {
     let mut remaining = Some((input, 0));
     std::iter::from_fn(move || {
         let (rest, skip) = remaining.take()?;
@@ -238,7 +264,8 @@ pub(super) fn native_list(input: &[u8]) -> impl Iterator<Item = &[u8]> {
     })
 }
 
-pub(super) fn cmake_style(input: &[u8]) -> BString {
+/// Convert a native path to CMake style (forward slashes; strips `\\?\` on Windows).
+pub fn cmake_style(input: &[u8]) -> BString {
     if cfg!(windows) {
         let input = input.strip_prefix(br"\\?\").unwrap_or(input);
         input
@@ -251,7 +278,8 @@ pub(super) fn cmake_style(input: &[u8]) -> BString {
     }
 }
 
-pub(super) fn native_style(input: &[u8]) -> BString {
+/// Convert a CMake-style path to native separators.
+pub fn native_style(input: &[u8]) -> BString {
     if cfg!(windows) {
         input
             .iter()

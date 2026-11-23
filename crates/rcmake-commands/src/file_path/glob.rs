@@ -12,8 +12,8 @@ use rcmake_host::{
 };
 use rcmake_regex::{MatchOptions, Regex};
 
-use super::lexical::Lexical;
 use super::{Result, error, set, warning};
+use rcmake_base::path_lex::Lexical;
 
 pub(super) fn run(cx: &mut Cx<'_>, recursive: bool, args: &[&[u8]]) -> Result {
     let command: &[u8] = if recursive { b"GLOB_RECURSE" } else { b"GLOB" };

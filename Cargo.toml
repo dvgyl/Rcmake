@@ -9,10 +9,17 @@ members = [
     "crates/rcmake-regex",
     "crates/rcmake-expr",
     "crates/rcmake-model",
+    "crates/rcmake-genex",
     "crates/rcmake-eval",
+    "crates/rcmake-resolve",
+    "crates/rcmake-build",
     "crates/rcmake-presets",
     "crates/rcmake-archive",
     "crates/rcmake-commands",
+    "crates/rcmake-gen-common",
+    "crates/rcmake-gen-ninja",
+    "crates/rcmake-gen-make",
+    "crates/rcmake-ctest",
     "crates/rcmake-tool-e",
     "crates/rcmake-cli",
     "crates/rcmake-harness",
@@ -59,6 +66,13 @@ rcmake-presets = { path = "crates/rcmake-presets" }
 rcmake-archive = { path = "crates/rcmake-archive" }
 rcmake-commands = { path = "crates/rcmake-commands" }
 rcmake-tool-e = { path = "crates/rcmake-tool-e" }
+rcmake-genex = { path = "crates/rcmake-genex" }
+rcmake-resolve = { path = "crates/rcmake-resolve" }
+rcmake-build = { path = "crates/rcmake-build" }
+rcmake-gen-common = { path = "crates/rcmake-gen-common" }
+rcmake-gen-ninja = { path = "crates/rcmake-gen-ninja" }
+rcmake-gen-make = { path = "crates/rcmake-gen-make" }
+rcmake-ctest = { path = "crates/rcmake-ctest" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

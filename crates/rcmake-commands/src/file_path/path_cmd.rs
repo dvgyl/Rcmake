@@ -7,8 +7,10 @@ use rcmake_eval::{CmdError, CmdResult, Cx};
 use rcmake_expr::ExpandedArg;
 use rcmake_host::path::from_native;
 
-use super::lexical::{Lexical, NATIVE_LIST_SEPARATOR, cmake_style, native_list, native_style};
 use super::{Result, error, set, unknown};
+use rcmake_base::path_lex::{
+    Lexical, NATIVE_LIST_SEPARATOR, cmake_style, native_list, native_style,
+};
 
 pub(super) fn run(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
     let args: Vec<_> = args.iter().map(|arg| arg.value.as_slice()).collect();

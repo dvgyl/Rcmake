@@ -1,13 +1,13 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use rcmake_base::{BString, list};
+use rcmake_base::{BString, list, list_ops};
 use rcmake_eval::{CmdError, CmdResult, Cx, Flow};
 use rcmake_expr::ExpandedArg;
 use rcmake_host::Stream;
 use rcmake_regex::{MatchOptions, Regex};
 
-use super::{bytes, callbacks::Callback, cat, separate::space, sort::Sort, status, transform};
+use super::{bytes, callbacks::Callback, cat, sort::Sort, status, transform};
 
 pub(super) fn list(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
     let [command, name, rest @ ..] = args else {
@@ -164,23 +164,10 @@ fn join_with(items: &[BString], glue: &[u8], limit: usize) -> Result<BString, Cm
     Ok(value.into())
 }
 
-pub(super) fn number(arg: &[u8]) -> Option<i64> {
-    let first = arg.iter().position(|&byte| !space(byte))?;
-    std::str::from_utf8(arg.get(first..)?).ok()?.parse().ok()
-}
-
 fn list_number(arg: &[u8]) -> Result<i64, CmdError> {
-    number(arg)
+    list_ops::parse_index(arg)
         .map(|value| i64::from(value as i32))
         .ok_or_else(|| status(cat(&[b"index: ", arg, b" is not a valid index"])))
-}
-
-pub(super) fn normalized(index: i64, len: usize) -> i64 {
-    if index < 0 {
-        index + signed_len(len)
-    } else {
-        index
-    }
 }
 
 fn signed_len(len: usize) -> i64 {
@@ -190,7 +177,7 @@ fn signed_len(len: usize) -> i64 {
 fn index(arg: &[u8], len: usize, insert: bool) -> Result<usize, CmdError> {
     let parsed = list_number(arg)?;
     let last = signed_len(len) - i64::from(!insert);
-    let relative = normalized(parsed, len);
+    let relative = list_ops::normalize_index(parsed, len);
     if !(0..=last).contains(&relative) {
         return Err(status(format!(
             "index: {parsed} out of range ({}, {last})",

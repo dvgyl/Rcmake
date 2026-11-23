@@ -721,7 +721,11 @@ impl Interp {
         if kind == UserCommandKind::Macro
             && self.policy_status(PolicyId::new(217)) != PolicyStatus::New
         {
-            self.dir_props.append(BString::from("MACROS"), &name);
+            let dir = self.current_dir_id();
+            self.project
+                .dir_mut(dir)
+                .props
+                .append(BString::from("MACROS"), &name);
         }
         let user = UserCommand {
             kind,

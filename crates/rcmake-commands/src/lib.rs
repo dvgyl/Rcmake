@@ -5,10 +5,15 @@
 
 use rcmake_eval::Registry;
 
+mod configure;
+mod custom;
+mod dirs;
 mod file_path;
+mod install;
 mod policy_misc;
 mod process_find;
 mod string_math;
+mod targets;
 mod vars_list;
 
 /// Register all implemented built-in CMake 4.5.1 script commands into `registry`.
@@ -18,6 +23,21 @@ pub fn register_all(registry: &mut Registry) {
     file_path::register(registry);
     process_find::register(registry);
     policy_misc::register(registry);
+    targets::register(registry);
+    dirs::register(registry);
+    custom::register(registry);
+    install::register(registry);
+    configure::register(registry);
+}
+
+/// Placeholder for a project command that a later wave implements.
+fn pending_project_command(
+    _: &mut rcmake_eval::Cx<'_>,
+    _: &[rcmake_expr::ExpandedArg],
+) -> rcmake_eval::CmdResult {
+    Err(rcmake_eval::CmdError::Status(
+        "requires build-system support.".into(),
+    ))
 }
 
 fn command_error(

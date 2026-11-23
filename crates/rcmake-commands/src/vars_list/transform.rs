@@ -1,13 +1,13 @@
 use std::sync::Arc;
 
-use rcmake_base::{BString, list};
+use rcmake_base::{BString, list, list_ops};
 use rcmake_diag::{PolicyId, PolicyStatus};
 use rcmake_eval::{CmdError, Cx};
 use rcmake_expr::ExpandedArg;
 use rcmake_regex::{Captures, MatchOptions, Regex, expand_replacement};
 
-use super::lists::{compile, matches, normalized, number};
-use super::{bytes, callbacks::Callback, cat, separate::space, status};
+use super::lists::{compile, matches};
+use super::{bytes, callbacks::Callback, cat, status};
 
 const CONTEXT: &[u8] = b"sub-command TRANSFORM, ";
 const REPLACE: &[u8] = b"sub-command TRANSFORM, action REPLACE: ";
@@ -72,8 +72,12 @@ impl<'a> Action<'a> {
             Self::Prepend(prefix) => selector.map(cx, items, |_, item| Ok(cat(&[prefix, item]))),
             Self::Lower => selector.map(cx, items, |_, item| Ok(item.to_ascii_lowercase().into())),
             Self::Upper => selector.map(cx, items, |_, item| Ok(item.to_ascii_uppercase().into())),
-            Self::Strip => selector.map(cx, items, |_, item| Ok(strip(item).into())),
-            Self::GenexStrip => selector.map(cx, items, |_, item| Ok(strip_genex(item))),
+            Self::Strip => {
+                selector.map(cx, items, |_, item| Ok(list_ops::strip_spaces(item).into()))
+            }
+            Self::GenexStrip => {
+                selector.map(cx, items, |_, item| Ok(rcmake_genex::genex_strip(item)))
+            }
             Self::Replace(pattern, template) => {
                 let replace = Replacement::new(cx, pattern, template)?;
                 let mut budget = cx.limits().regex_steps;
@@ -118,7 +122,11 @@ impl<'a> Selector<'a> {
     ) -> Result<(Self, &'a [ExpandedArg]), CmdError> {
         match (keyword, args) {
             (b"AT", _) => {
-                let indices: Vec<_> = args.iter().map(bytes).map_while(number).collect();
+                let indices: Vec<_> = args
+                    .iter()
+                    .map(bytes)
+                    .map_while(list_ops::parse_index)
+                    .collect();
                 if indices.is_empty() {
                     return Err(status(
                         "sub-command TRANSFORM, selector AT expects at least one numeric value.",
@@ -128,13 +136,16 @@ impl<'a> Selector<'a> {
                 Ok((Self::At(indices), rest))
             }
             (b"FOR", [start, stop, rest @ ..]) => {
-                let (Some(start), Some(stop)) = (number(bytes(start)), number(bytes(stop))) else {
+                let (Some(start), Some(stop)) = (
+                    list_ops::parse_index(bytes(start)),
+                    list_ops::parse_index(bytes(stop)),
+                ) else {
                     return Err(status(
                         "sub-command TRANSFORM, selector FOR expects, at least, two numeric values.",
                     ));
                 };
                 let (step, rest) = if let Some((head, tail)) = rest.split_first()
-                    && let Some(step) = number(bytes(head))
+                    && let Some(step) = list_ops::parse_index(bytes(head))
                 {
                     let step = usize::try_from(step).ok().filter(|&step| step > 0).ok_or_else(|| {
                         status("sub-command TRANSFORM, selector FOR expects positive numeric value for <step>.")
@@ -251,7 +262,7 @@ impl<'a> Selector<'a> {
 }
 
 fn selector_index(selector: &str, raw: i64, len: usize) -> Result<usize, CmdError> {
-    let index = normalized(raw, len);
+    let index = list_ops::normalize_index(raw, len);
     usize::try_from(index).ok().filter(|&index| index < len).ok_or_else(|| {
         let last = len.wrapping_sub(1);
         status(format!("sub-command TRANSFORM, selector {selector}, index: {index} out of range (-{len}, {last})."))
@@ -304,44 +315,6 @@ pub(super) fn apply(
     }
     cx.set_var(out, list::join(items));
     Ok(())
-}
-
-fn strip(item: &[u8]) -> &[u8] {
-    let Some(start) = item.iter().position(|&byte| !space(byte)) else {
-        return b"";
-    };
-    let end = item
-        .iter()
-        .rposition(|&byte| !space(byte))
-        .map_or(0, |index| index + 1);
-    item.get(start..end).unwrap_or_default()
-}
-
-fn strip_genex(input: &[u8]) -> BString {
-    let mut output = Vec::new();
-    let mut start = 0;
-    let mut depth = 0_usize;
-    let mut input_iter = input.iter().copied().enumerate().peekable();
-    while let Some((index, byte)) = input_iter.next() {
-        match byte {
-            b'$' if input_iter.next_if(|&(_, byte)| byte == b'<').is_some() => {
-                if depth == 0 {
-                    output.extend_from_slice(input.get(start..index).unwrap_or_default());
-                    start = index;
-                }
-                depth += 1;
-            }
-            b'>' if depth > 0 => {
-                depth -= 1;
-                if depth == 0 {
-                    start = index + 1;
-                }
-            }
-            _ => {}
-        }
-    }
-    output.extend_from_slice(input.get(start..).unwrap_or_default());
-    output.into()
 }
 
 struct Replacement<'a> {

@@ -14,6 +14,8 @@ use rcmake_expr::{CondEnv, CondError, ExpandEnv, ExpandError, ExpandedArg};
 use rcmake_host::{PureHost, Stream};
 use rcmake_syntax::{ArgKind, Argument};
 
+use rcmake_model::DirId;
+
 use crate::{
     CmdError, CmdFlags, CmdResult, Cx, Flow, Frontend, IncludeOptions, Interp, InterpConfig,
     Registry, RunMode,
@@ -372,8 +374,30 @@ fn t_defer_query(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
     Ok(Flow::Normal)
 }
 
+/// `test_subdir(<src> <bin> [EXCLUDE_FROM_ALL] [SYSTEM])`: run a subdirectory.
+fn t_subdir(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
+    let v = vals(args);
+    let Some(src) = v.first() else {
+        return Err(CmdError::Status("bad args".into()));
+    };
+    let bin = v
+        .get(1)
+        .filter(|b| !matches!(b.as_slice(), b"EXCLUDE_FROM_ALL" | b"SYSTEM"))
+        .unwrap_or(src);
+    let flag = |name: &[u8]| v.iter().skip(2).any(|a| a.as_slice() == name);
+    let options = crate::SubdirOptions {
+        exclude_from_all: flag(b"EXCLUDE_FROM_ALL"),
+        system: flag(b"SYSTEM"),
+    };
+    let src = rcmake_host::path::to_native(src);
+    let bin = rcmake_host::path::to_native(bin);
+    cx.run_subdirectory(&src, &bin, options)?;
+    Ok(Flow::Normal)
+}
+
 fn register_test(reg: &mut Registry) {
     let s = CmdFlags { scriptable: true };
+    reg.add("test_subdir", t_subdir, CmdFlags { scriptable: false });
     reg.add("variable_watch", t_variable_watch, s);
     reg.add_raw("test_defer", t_defer, s);
     reg.add("test_defer_query", t_defer_query, s);
@@ -447,6 +471,11 @@ fn run(main: &str) -> Out {
 
 /// Configure `/work/src` (its `CMakeLists.txt` is `lists`) into `/work/build`.
 fn run_configure(lists: &str, files: &[(&str, &str)]) -> Out {
+    run_configure_interp(lists, files).0
+}
+
+/// [`run_configure`] that also returns the interpreter for model checks.
+fn run_configure_interp(lists: &str, files: &[(&str, &str)]) -> (Out, Interp) {
     let mut all = vec![("/work/src/CMakeLists.txt", lists)];
     all.extend_from_slice(files);
     let (mut interp, host) = new_interp(&all, RunMode::Configure);
@@ -455,11 +484,12 @@ fn run_configure(lists: &str, files: &[(&str, &str)]) -> Out {
         &PathBuf::from("/work/build"),
         &[],
     );
-    Out {
+    let out = Out {
         exit: outcome.exit_code,
         stdout: String::from_utf8_lossy(&host.stream_bytes(Stream::Stdout)).into_owned(),
         stderr: String::from_utf8_lossy(&host.stream_bytes(Stream::Stderr)).into_owned(),
-    }
+    };
+    (out, interp)
 }
 
 /// Run on a thread with a large stack (deep recursion tests).
@@ -2013,6 +2043,155 @@ fn deferred_call_error_shows_deferred_frame() {
             .starts_with("CMake Error at CMakeLists.txt:1 (nope):\n"),
         "{}",
         o.stderr
+    );
+}
+
+// ---------------------------------------------------------------------------------------
+// Subdirectories.
+// ---------------------------------------------------------------------------------------
+
+#[test]
+fn subdirectory_copies_variables_and_parent_scope_updates_caller_only() {
+    let o = run_configure(
+        concat!(
+            "set(a parent)
+",
+            "test_subdir(sub)
+",
+            "message(\"after a=${a} b=${b} c=${c}\")
+",
+            "message(\"dirs ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_BINARY_DIR}\")
+",
+        ),
+        &[(
+            "/work/src/sub/CMakeLists.txt",
+            concat!(
+                "message(\"child a=${a}\")
+",
+                "set(a child)
+",
+                "set(b up PARENT_SCOPE)
+",
+                "message(\"child b=[${b}]\")
+",
+                "message(\"dirs ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_BINARY_DIR}\")
+",
+                "message(\"list ${CMAKE_CURRENT_LIST_FILE} ${CMAKE_CURRENT_LIST_DIR}\")
+",
+            ),
+        )],
+    );
+    assert_eq!(o.exit, 0, "{}", o.stderr);
+    assert_eq!(
+        o.stderr,
+        concat!(
+            "child a=parent\n",
+            "child b=[]\n",
+            "dirs /work/src/sub /work/build/sub\n",
+            "list /work/src/sub/CMakeLists.txt /work/src/sub\n",
+            "after a=parent b=up c=\n",
+            "dirs /work/src /work/build\n",
+        )
+    );
+}
+
+#[test]
+fn subdirectory_return_propagate_reaches_caller() {
+    let o = run_configure(
+        "test_subdir(sub)\nmessage(\"r=[${r}]\")\n",
+        &[(
+            "/work/src/sub/CMakeLists.txt",
+            "cmake_policy(SET CMP0140 NEW)\nset(r 7)\nreturn(PROPAGATE r)\nmessage(no)\n",
+        )],
+    );
+    assert_eq!(o.exit, 0, "{}", o.stderr);
+    assert_eq!(o.stderr, "r=[7]\n");
+}
+
+#[test]
+fn subdirectory_isolates_policies_and_records_final_policies() {
+    let (o, interp) = run_configure_interp(
+        concat!(
+            "cmake_policy(SET CMP0140 OLD)\n",
+            "test_subdir(sub out EXCLUDE_FROM_ALL)\n",
+            "cmake_policy(GET CMP0140 p)\n",
+            "message(\"parent ${p}\")\n",
+        ),
+        &[
+            (
+                "/work/src/sub/CMakeLists.txt",
+                "cmake_policy(SET CMP0140 NEW)\ninclude(${CMAKE_CURRENT_LIST_DIR}/x.cmake)\n",
+            ),
+            ("/work/src/sub/x.cmake", ""),
+        ],
+    );
+    assert_eq!(o.exit, 0, "{}", o.stderr);
+    assert_eq!(o.stderr, "parent OLD\n");
+    let project = &interp.project;
+    let root = project.dir(DirId::ROOT);
+    let [child] = root.children.as_slice() else {
+        panic!("one child expected");
+    };
+    let child = project.dir(*child);
+    assert_eq!(child.source_dir, "/work/src/sub");
+    assert_eq!(child.binary_dir, "/work/build/out");
+    assert!(child.exclude_from_all);
+    assert_eq!(child.parent, Some(DirId::ROOT));
+    let cmp0140 = PolicyId::new(140);
+    assert_eq!(
+        child.final_policies.map(|p| p.get(cmp0140)),
+        Some(PolicyStatus::New)
+    );
+    assert_eq!(
+        root.final_policies.map(|p| p.get(cmp0140)),
+        Some(PolicyStatus::Old)
+    );
+    assert_eq!(
+        child.listfiles,
+        vec![
+            BString::from("/work/src/sub/CMakeLists.txt"),
+            BString::from("/work/src/sub/x.cmake"),
+        ]
+    );
+    assert_eq!(
+        root.listfiles,
+        vec![BString::from("/work/src/CMakeLists.txt")]
+    );
+}
+
+#[test]
+fn subdirectory_runs_its_deferred_calls_before_returning() {
+    let o = run_configure(
+        concat!(
+            "test_defer(p message parent-deferred)\n",
+            "test_subdir(sub)\n",
+            "message(after-subdir)\n",
+        ),
+        &[(
+            "/work/src/sub/CMakeLists.txt",
+            "test_defer(c message child-deferred)\ntest_defer_query(ids)\nmessage(\"child ids ${ids}\")\n",
+        )],
+    );
+    assert_eq!(o.exit, 0, "{}", o.stderr);
+    assert_eq!(
+        o.stderr,
+        "child ids c\nchild-deferred\nafter-subdir\nparent-deferred\n"
+    );
+}
+
+#[test]
+fn subdirectory_without_listfile_is_an_error() {
+    let o = run_configure("test_subdir(missing)\nmessage(next)\n", &[]);
+    assert_eq!(o.exit, 1);
+    assert_eq!(
+        o.stderr,
+        concat!(
+            "CMake Error at CMakeLists.txt:1 (test_subdir):\n",
+            "  The source directory\n\n",
+            "    /work/src/missing\n\n",
+            "  does not contain a CMakeLists.txt file.\n\n\n",
+            "next\n",
+        )
     );
 }
 

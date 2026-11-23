@@ -1,4 +1,4 @@
-use super::lexical::Lexical;
+use rcmake_base::path_lex::Lexical;
 
 pub(super) fn hash(normalized: &[u8]) -> String {
     let path = Lexical::new(normalized);

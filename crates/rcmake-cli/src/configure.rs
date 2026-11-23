@@ -732,8 +732,8 @@ fn write_graphviz(host: &dyn Host, path: &Path, interp: &mut Interp) -> bool {
     let mut cx = interp.cx();
     let name = cx.var_or_empty(b"CMAKE_PROJECT_NAME");
     let mut graph = format!("digraph \"{}\" {{\n", dot_escape(&name));
-    for target in cx.project().target_names.keys() {
-        graph.push_str(&format!("  \"{}\";\n", dot_escape(target)));
+    for (_, target) in cx.project().targets() {
+        graph.push_str(&format!("  \"{}\";\n", dot_escape(&target.name)));
     }
     graph.push_str("}\n");
     if let Err(err) = host.write(path, graph.as_bytes(), WriteMode::Truncate) {

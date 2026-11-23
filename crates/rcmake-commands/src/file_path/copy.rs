@@ -11,9 +11,9 @@ use rcmake_host::{
 use rcmake_regex::{MatchOptions, Regex};
 
 use super::file::binary_destination;
-use super::lexical::Lexical;
 use super::mutation::{Modes, permission};
 use super::{Result, arg, error};
+use rcmake_base::path_lex::Lexical;
 
 #[derive(Default)]
 struct Options {

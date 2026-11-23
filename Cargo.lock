@@ -370,6 +370,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "rcmake-build"
+version = "0.1.0"
+dependencies = [
+ "rcmake-base",
+ "rcmake-diag",
+ "rcmake-host",
+ "rcmake-resolve",
+ "thiserror",
+]
+
+[[package]]
 name = "rcmake-cli"
 version = "0.1.0"
 dependencies = [
@@ -393,14 +404,28 @@ dependencies = [
  "jiff",
  "rcmake-archive",
  "rcmake-base",
+ "rcmake-build",
  "rcmake-diag",
  "rcmake-eval",
  "rcmake-expr",
+ "rcmake-genex",
  "rcmake-host",
  "rcmake-json",
  "rcmake-model",
  "rcmake-regex",
+ "rcmake-resolve",
  "rcmake-syntax",
+]
+
+[[package]]
+name = "rcmake-ctest"
+version = "0.1.0"
+dependencies = [
+ "rcmake-base",
+ "rcmake-diag",
+ "rcmake-eval",
+ "rcmake-host",
+ "thiserror",
 ]
 
 [[package]]
@@ -436,6 +461,51 @@ dependencies = [
  "rcmake-host",
  "rcmake-regex",
  "rcmake-syntax",
+ "thiserror",
+]
+
+[[package]]
+name = "rcmake-gen-common"
+version = "0.1.0"
+dependencies = [
+ "rcmake-base",
+ "rcmake-diag",
+ "rcmake-host",
+ "rcmake-json",
+ "rcmake-model",
+ "rcmake-resolve",
+ "thiserror",
+]
+
+[[package]]
+name = "rcmake-gen-make"
+version = "0.1.0"
+dependencies = [
+ "rcmake-base",
+ "rcmake-diag",
+ "rcmake-gen-common",
+ "rcmake-host",
+ "rcmake-resolve",
+]
+
+[[package]]
+name = "rcmake-gen-ninja"
+version = "0.1.0"
+dependencies = [
+ "rcmake-base",
+ "rcmake-diag",
+ "rcmake-gen-common",
+ "rcmake-host",
+ "rcmake-resolve",
+]
+
+[[package]]
+name = "rcmake-genex"
+version = "0.1.0"
+dependencies = [
+ "rcmake-base",
+ "rcmake-diag",
+ "rcmake-regex",
  "thiserror",
 ]
 
@@ -495,6 +565,19 @@ name = "rcmake-regex"
 version = "0.1.0"
 dependencies = [
  "rcmake-base",
+ "thiserror",
+]
+
+[[package]]
+name = "rcmake-resolve"
+version = "0.1.0"
+dependencies = [
+ "indexmap",
+ "rcmake-base",
+ "rcmake-diag",
+ "rcmake-genex",
+ "rcmake-host",
+ "rcmake-model",
  "thiserror",
 ]
 

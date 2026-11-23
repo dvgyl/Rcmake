@@ -1,26 +1,16 @@
-use std::cmp::Ordering;
 use std::collections::BTreeSet;
 
 use rcmake_base::BString;
+use rcmake_base::list_ops::{SortCompare, SortOptions, sort_items};
 use rcmake_eval::{CmdError, Cx};
 use rcmake_expr::ExpandedArg;
 
 use super::{bytes, callbacks::Callback, cat, status};
 
 #[derive(Default)]
-enum Compare<'a> {
-    Callback(&'a [u8]),
-    #[default]
-    String,
-    FileBasename,
-    Natural,
-}
-
-#[derive(Default)]
 pub(super) struct Sort<'a> {
-    compare: Compare<'a>,
-    insensitive: bool,
-    descending: bool,
+    comparator: Option<&'a [u8]>,
+    options: SortOptions,
 }
 
 impl<'a> Sort<'a> {
@@ -69,14 +59,16 @@ impl<'a> Sort<'a> {
                 ]))
             })?;
             match (option, value) {
-                (b"COMPARATOR", name) => sort.compare = Compare::Callback(name),
-                (b"COMPARE", b"STRING") => sort.compare = Compare::String,
-                (b"COMPARE", b"FILE_BASENAME") => sort.compare = Compare::FileBasename,
-                (b"COMPARE", b"NATURAL") => sort.compare = Compare::Natural,
-                (b"CASE", b"SENSITIVE") => sort.insensitive = false,
-                (b"CASE", b"INSENSITIVE") => sort.insensitive = true,
-                (b"ORDER", b"ASCENDING") => sort.descending = false,
-                (b"ORDER", b"DESCENDING") => sort.descending = true,
+                (b"COMPARATOR", name) => sort.comparator = Some(name),
+                (b"COMPARE", b"STRING") => sort.options.compare = SortCompare::String,
+                (b"COMPARE", b"FILE_BASENAME") => {
+                    sort.options.compare = SortCompare::FileBasename;
+                }
+                (b"COMPARE", b"NATURAL") => sort.options.compare = SortCompare::Natural,
+                (b"CASE", b"SENSITIVE") => sort.options.insensitive = false,
+                (b"CASE", b"INSENSITIVE") => sort.options.insensitive = true,
+                (b"ORDER", b"ASCENDING") => sort.options.descending = false,
+                (b"ORDER", b"DESCENDING") => sort.options.descending = true,
                 _ => {
                     return Err(status(cat(&[
                         b"sub-command SORT value \"",
@@ -92,30 +84,13 @@ impl<'a> Sort<'a> {
     }
 
     pub(super) fn apply(&self, cx: &mut Cx<'_>, items: &mut Vec<BString>) -> Result<(), CmdError> {
-        if let Compare::Callback(name) = self.compare {
+        if let Some(name) = self.comparator {
             let callback =
                 Callback::new(cx, name, b"sub-command SORT, COMPARATOR: ", "comparator")?;
             *items = self.sort_with_callback(cx, &callback, std::mem::take(items))?;
             return Ok(());
         }
-        items.sort_by(|a, b| {
-            let a = self.basename(a);
-            let b = self.basename(b);
-            let order = if matches!(self.compare, Compare::Natural) {
-                natural_cmp(a, b, self.insensitive)
-            } else if self.insensitive {
-                a.iter()
-                    .map(u8::to_ascii_lowercase)
-                    .cmp(b.iter().map(u8::to_ascii_lowercase))
-            } else {
-                a.cmp(b)
-            };
-            if self.descending {
-                order.reverse()
-            } else {
-                order
-            }
-        });
+        sort_items(items, self.options);
         Ok(())
     }
 
@@ -139,7 +114,7 @@ impl<'a> Sort<'a> {
             .peekable();
         let mut merged = Vec::with_capacity(left.len() + right.len());
         while let (Some(a), Some(b)) = (left.peek(), right.peek()) {
-            let before = if self.descending {
+            let before = if self.options.descending {
                 self.less(cx, callback, a, b)?
             } else {
                 self.less(cx, callback, b, a)?
@@ -159,7 +134,7 @@ impl<'a> Sort<'a> {
         b: &[u8],
     ) -> Result<bool, CmdError> {
         let (lower_a, lower_b);
-        let (a, b) = if self.insensitive {
+        let (a, b) = if self.options.insensitive {
             lower_a = a.to_ascii_lowercase();
             lower_b = b.to_ascii_lowercase();
             (lower_a.as_slice(), lower_b.as_slice())
@@ -174,77 +149,4 @@ impl<'a> Sort<'a> {
         }
         Ok(less)
     }
-
-    fn basename<'item>(&self, item: &'item [u8]) -> &'item [u8] {
-        if matches!(self.compare, Compare::FileBasename) {
-            item.rsplit(|&byte| byte == b'/' || cfg!(windows) && byte == b'\\')
-                .next()
-                .unwrap_or_default()
-        } else {
-            item
-        }
-    }
-}
-
-fn natural_cmp(mut left: &[u8], mut right: &[u8], insensitive: bool) -> Ordering {
-    let byte = |b: u8| {
-        let b = if insensitive {
-            b.to_ascii_lowercase()
-        } else {
-            b
-        };
-        b as i8
-    };
-    while let (Some((&a, rest_a)), Some((&b, rest_b))) = (left.split_first(), right.split_first()) {
-        let order = if a.is_ascii_digit() && b.is_ascii_digit() {
-            let (digits_a, rest_a) = digit_run(left);
-            let (digits_b, rest_b) = digit_run(right);
-            left = rest_a;
-            right = rest_b;
-            if a != b && (a == b'0' || b == b'0') {
-                a.cmp(&b)
-            } else if a != b'0' {
-                digits_a
-                    .len()
-                    .cmp(&digits_b.len())
-                    .then_with(|| digits_a.cmp(digits_b))
-            } else {
-                let common = digits_a
-                    .iter()
-                    .zip(digits_b)
-                    .take_while(|(a, b)| a == b)
-                    .count();
-                match (digits_a.get(common), digits_b.get(common)) {
-                    (Some(a), Some(b)) => a.cmp(b),
-                    // A digit sorts before the end of a prefix that has only zeros.
-                    (Some(_), None) if digits_b.iter().all(|&b| b == b'0') => Ordering::Less,
-                    (None, Some(_)) if digits_a.iter().all(|&a| a == b'0') => Ordering::Greater,
-                    (Some(&a), None) => {
-                        byte(a).cmp(&byte(right.first().copied().unwrap_or_default()))
-                    }
-                    (None, Some(&b)) => {
-                        byte(left.first().copied().unwrap_or_default()).cmp(&byte(b))
-                    }
-                    (None, None) => Ordering::Equal,
-                }
-            }
-        } else {
-            left = rest_a;
-            right = rest_b;
-            byte(a).cmp(&byte(b))
-        };
-        if !order.is_eq() {
-            return order;
-        }
-    }
-    byte(left.first().copied().unwrap_or_default())
-        .cmp(&byte(right.first().copied().unwrap_or_default()))
-}
-
-fn digit_run(input: &[u8]) -> (&[u8], &[u8]) {
-    let end = input
-        .iter()
-        .position(|byte| !byte.is_ascii_digit())
-        .unwrap_or(input.len());
-    input.split_at(end)
 }

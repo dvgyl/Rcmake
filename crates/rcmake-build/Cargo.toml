@@ -1,0 +1,18 @@
+[package]
+name = "rcmake-build"
+description = "In-process build graph executor for try_compile and cmake --build fallbacks in Rcmake (ADR-008)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+rcmake-base.workspace = true
+rcmake-diag.workspace = true
+rcmake-host.workspace = true
+rcmake-resolve.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

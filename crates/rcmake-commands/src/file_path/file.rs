@@ -4,8 +4,8 @@ use rcmake_eval::{CmdResult, Cx};
 use rcmake_expr::ExpandedArg;
 use rcmake_host::path::{from_native, to_native};
 
-use super::lexical::{Lexical, native_list, native_style};
 use super::{Result, archive, error, glob, mutation, reading, set, unknown, warning};
+use rcmake_base::path_lex::{Lexical, native_list, native_style};
 
 pub(super) fn run(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
     let args: Vec<_> = args.iter().map(|arg| arg.value.as_slice()).collect();

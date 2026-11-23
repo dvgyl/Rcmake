@@ -10,6 +10,8 @@
 pub mod hash;
 pub mod limits;
 pub mod list;
+pub mod list_ops;
+pub mod path_lex;
 pub mod truth;
 pub mod version;
 

@@ -1,10 +1,36 @@
-//! CMake cache store (`CMakeCache.txt`), property maps, global state, and Milestone 2
-//! project model scaffolding.
+//! CMake cache store (`CMakeCache.txt`), property maps, global state, and the arena-based
+//! [`ProjectModel`] (ADR-007).
+//!
+//! The project model holds the raw configure-time state: directories, targets, custom
+//! commands, tests, file sets, install rules, and export sets. Each arena hands out a
+//! typed id ([`DirId`], [`TargetId`], [`CommandId`], [`TestId`], [`FileSetId`]). Ids are
+//! only created by the arenas, and arenas never shrink.
 
 #![forbid(unsafe_code)]
 
 use indexmap::IndexMap;
 use rcmake_base::{BString, list};
+
+mod command;
+mod directory;
+mod generator;
+mod ids;
+mod install;
+mod project;
+mod props;
+mod target;
+
+pub use command::{CustomCommand, CustomCommandKind, TargetEvent};
+pub use directory::Directory;
+pub use generator::GeneratorKind;
+pub use ids::{BT, CommandId, DirId, FileSetId, TargetId, TestId};
+pub use install::{ExportSet, InstallKind, InstallOptions, InstallRule, TestEntry};
+pub use project::{ModelError, ProjectModel};
+pub use props::{AppendMode, PropOrigin, PropScope};
+pub use target::{
+    FileSet, FileSetKind, ImportedVisibility, LinkItem, Target, TargetBinding, TargetKind,
+    TargetOrigin, TargetPolicySnapshot, UsageField, UsageProps, UsageScope,
+};
 
 /// Cache entry type matching `CMakeCache.txt` (`<NAME>:<TYPE>=<VALUE>`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -188,6 +214,9 @@ pub struct DefinedProperty {
     pub brief_docs: BString,
     /// Full documentation string.
     pub full_docs: BString,
+    /// Variable that initializes the property on target creation
+    /// (`INITIALIZE_FROM_VARIABLE`, `TARGET` scope only).
+    pub initialize_from_variable: Option<BString>,
 }
 
 /// Global properties and defined-property metadata shared across the build/script session.
@@ -199,13 +228,12 @@ pub struct GlobalState {
     pub defined_props: Vec<DefinedProperty>,
 }
 
-/// Placeholder for Milestone 2 build-system target/directory/install graph.
-#[derive(Clone, Debug, Default)]
-pub struct ProjectModel {
-    /// Registered target names (populated in Milestone 2; queried by `if(TARGET ...)`).
-    pub target_names: IndexMap<BString, ()>,
-    /// Registered test names (populated in Milestone 2/3; queried by `if(TEST ...)`).
-    pub test_names: IndexMap<BString, ()>,
-    /// Registered custom rule names (`add_custom_rule` in CMake 4.5; queried by `if(RULE ...)`).
-    pub rule_names: IndexMap<BString, ()>,
+impl GlobalState {
+    /// The `define_property()` entry for `name` in `scope`, if any.
+    #[must_use]
+    pub fn defined_property(&self, scope: &[u8], name: &[u8]) -> Option<&DefinedProperty> {
+        self.defined_props
+            .iter()
+            .find(|entry| entry.scope == scope && entry.name == name)
+    }
 }
