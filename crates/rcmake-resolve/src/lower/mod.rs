@@ -1,0 +1,87 @@
+//! Lowering of resolved targets into a build graph and install manifest.
+
+mod artifacts;
+mod compile;
+mod graph;
+mod install;
+mod link;
+mod shell;
+
+#[cfg(test)]
+mod tests;
+
+use rcmake_base::{BString, path_lex::Lexical};
+use rcmake_model::{DirId, ProjectModel, Target};
+
+pub use artifacts::{compute_artifacts, linker_language, object_path, source_language};
+pub use graph::lower;
+pub use install::{collect_metadata, lower_install_manifest};
+
+fn definition<'a>(model: &'a ProjectModel, mut dir: DirId, key: &[u8]) -> Option<&'a BString> {
+    loop {
+        let directory = model.dir(dir);
+        if let Some(value) = directory.props.get(key) {
+            return Some(value);
+        }
+        let Some(parent) = directory
+            .parent
+            .filter(|parent| parent.index() < dir.index())
+        else {
+            break;
+        };
+        dir = parent;
+    }
+    model
+        .global
+        .props
+        .get(key)
+        .or_else(|| model.cache.get(key).map(|entry| &entry.value))
+}
+
+fn target_property<'a>(
+    model: &'a ProjectModel,
+    target: &'a Target,
+    key: &[u8],
+) -> Option<&'a BString> {
+    target
+        .props
+        .get(key)
+        .or_else(|| definition(model, target.dir, &[b"CMAKE_", key].concat()))
+}
+
+fn join(base: &[u8], path: &[u8]) -> BString {
+    if path.is_empty() {
+        base.into()
+    } else {
+        Lexical::new(base).append(path)
+    }
+}
+
+/// Expand the `<NAME>` placeholders of a rule template with `lookup`. Unknown
+/// placeholders stay as written.
+#[must_use]
+pub fn expand_rule(template: &[u8], lookup: impl Fn(&[u8]) -> Option<BString>) -> BString {
+    let mut out = Vec::with_capacity(template.len());
+    let mut rest = template;
+    while let Some(open) = rest.iter().position(|&b| b == b'<') {
+        out.extend_from_slice(rest.get(..open).unwrap_or_default());
+        let tail = rest.get(open + 1..).unwrap_or_default();
+        let name_len = tail
+            .iter()
+            .position(|&b| !(b.is_ascii_alphanumeric() || b == b'_'))
+            .unwrap_or(tail.len());
+        let name = tail.get(..name_len).unwrap_or_default();
+        match (tail.get(name_len), lookup(name)) {
+            (Some(b'>'), Some(value)) if !name.is_empty() => {
+                out.extend_from_slice(&value);
+                rest = tail.get(name_len + 1..).unwrap_or_default();
+            }
+            _ => {
+                out.push(b'<');
+                rest = tail;
+            }
+        }
+    }
+    out.extend_from_slice(rest);
+    out.into()
+}
