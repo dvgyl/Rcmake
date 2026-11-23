@@ -102,21 +102,20 @@ fn write_common(
         ),
     )?;
     let cmake_files = bin.join("CMakeFiles");
-    match common::configure_log::render(&result.metadata) {
-        Ok(content) => {
-            host.create_dir_all(&cmake_files)
-                .map_err(|err| GenError::Write {
-                    path: path::from_native(&cmake_files),
-                    message: err.to_string().into(),
-                })?;
-            write(
-                host,
-                &cmake_files.join("CMakeConfigureLog.yaml"),
-                Ok(content),
-            )?;
+    let log_path = cmake_files.join("CMakeConfigureLog.yaml");
+    if host.metadata(&log_path, rcmake_host::Follow::Yes).is_err() {
+        match common::configure_log::render(&result.metadata) {
+            Ok(content) => {
+                host.create_dir_all(&cmake_files)
+                    .map_err(|err| GenError::Write {
+                        path: path::from_native(&cmake_files),
+                        message: err.to_string().into(),
+                    })?;
+                write(host, &log_path, Ok(content))?;
+            }
+            Err(GenError::Unimplemented(_)) => {}
+            Err(err) => return Err(err),
         }
-        Err(GenError::Unimplemented(_)) => {}
-        Err(err) => return Err(err),
     }
 
     let export_commands = interp.cx().var_is_on(b"CMAKE_EXPORT_COMPILE_COMMANDS");
