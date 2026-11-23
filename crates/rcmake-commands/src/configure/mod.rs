@@ -5,9 +5,12 @@
 #![forbid(unsafe_code)]
 
 use rcmake_eval::{CmdFlags, Registry};
+mod try_compile;
 
 pub(crate) fn register(registry: &mut Registry) {
     let project_only = CmdFlags { scriptable: false };
+    registry.add("try_compile", try_compile::try_compile, project_only);
+    registry.add("try_run", try_compile::try_run, project_only);
     registry.add(
         "enable_language",
         crate::pending_project_command,
