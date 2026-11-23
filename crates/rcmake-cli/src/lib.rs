@@ -2,11 +2,18 @@
 
 #![forbid(unsafe_code)]
 
+mod build;
 mod cache;
 mod configure;
+mod ctest;
+mod generate;
+mod install;
 mod options;
 mod presets;
 mod resource;
+
+#[cfg(test)]
+mod driver_tests;
 
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
@@ -102,6 +109,10 @@ pub fn run(argv: &[BString], host: Arc<dyn Host>) -> i32 {
         return run_cmake(argv, rest, host);
     }
 
+    if tool == Tool::Ctest {
+        return ctest::run(rest, host);
+    }
+
     emit_cli_error(
         host.as_ref(),
         format!(
@@ -181,6 +192,13 @@ fn run_cmake(argv: &[BString], rest: &[BString], host: Arc<dyn Host>) -> i32 {
             capabilities: &build_capabilities_json,
         };
         return rcmake_tool_e::run(sub_args, &ctx);
+    }
+
+    if let Some(args) = rest.strip_prefix(&[BString::from("--build")]) {
+        return build::run(args, host.as_ref());
+    }
+    if let Some(args) = rest.strip_prefix(&[BString::from("--install")]) {
+        return install::run(argv, args, host);
     }
 
     let mut opts = match options::parse(rest, host.as_ref()) {
@@ -391,12 +409,51 @@ fn build_capabilities_json() -> Value {
 
     let mut root = BTreeMap::new();
     root.insert(BString::from("debugger"), Value::Bool(false));
-    root.insert(BString::from("fileApi"), Value::object());
-    root.insert(BString::from("generators"), Value::Array(Vec::new()));
+    let requests = [
+        ("codemodel", 2, 12),
+        ("configureLog", 1, 0),
+        ("cache", 2, 0),
+        ("cmakeFiles", 1, 1),
+        ("toolchains", 1, 1),
+    ]
+    .map(|(kind, major, minor)| {
+        object([
+            ("kind", Value::string(kind)),
+            (
+                "version",
+                Value::Array(vec![object([
+                    ("major", Value::UInt(major)),
+                    ("minor", Value::UInt(minor)),
+                ])]),
+            ),
+        ])
+    });
+    root.insert(
+        "fileApi".into(),
+        object([("requests", Value::Array(requests.into()))]),
+    );
+    let generators = rcmake_model::GeneratorKind::ALL.map(|generator| {
+        object([
+            ("name", Value::string(generator.name())),
+            ("extraGenerators", Value::Array(Vec::new())),
+            ("platformSupport", Value::Bool(false)),
+            ("toolsetSupport", Value::Bool(false)),
+        ])
+    });
+    root.insert("generators".into(), Value::Array(generators.into()));
     root.insert(BString::from("serverMode"), Value::Bool(false));
     root.insert(BString::from("tls"), Value::Bool(false));
     root.insert(BString::from("version"), Value::Object(version));
     Value::Object(root)
+}
+
+fn object<const N: usize>(entries: [(&str, Value); N]) -> Value {
+    Value::Object(
+        entries
+            .into_iter()
+            .map(|(key, value)| (key.into(), value))
+            .collect(),
+    )
 }
 
 fn emit_cli_error(host: &dyn Host, body: impl Into<BString>) {

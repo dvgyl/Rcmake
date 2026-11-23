@@ -6,7 +6,7 @@ use rcmake_diag::{DiagAction, DiagCategory, DiagState};
 use rcmake_eval::{IncludeOptions, Interp, RunMode};
 use rcmake_host::{FileKind, Follow, Host, Stream, WriteMode, path};
 use rcmake_json::Value;
-use rcmake_model::{Cache, CacheType};
+use rcmake_model::{Cache, CacheType, GeneratorKind};
 
 use crate::options::{self, CacheEdit, DirectoryArg, Options};
 use crate::{apply_warning_flag, cache, emit_cli_error, new_interp, presets, resolve_cli_path};
@@ -119,9 +119,11 @@ pub(crate) fn run(argv: &[BString], mut opts: Options, host: Arc<dyn Host>) -> i
         }
     }
 
+    let generator_kind = GeneratorKind::from_name(&generator);
     let has_cache = saved.contains(HOME_DIR);
     let mut interp = new_interp(argv, &opts, RunMode::Configure, Arc::clone(&host));
     *interp.cx().cache() = saved;
+    interp.cx().project().generator = generator_kind;
     cache::insert(
         interp.cx().cache(),
         GENERATOR,
@@ -248,11 +250,10 @@ pub(crate) fn run(argv: &[BString], mut opts: Options, host: Arc<dyn Host>) -> i
             .include_file(&toolchain, IncludeOptions::default());
     }
     let result = interp.run_configure(&src, &bin, &[]);
-    if result.exit_code == 0
-        && opts
-            .log_level
-            .is_none_or(|level| level >= rcmake_eval::LogLevel::Status)
-    {
+    let show_status = opts
+        .log_level
+        .is_none_or(|level| level >= rcmake_eval::LogLevel::Status);
+    if result.exit_code == 0 && show_status {
         let elapsed = host.monotonic().saturating_sub(start);
         options::out(
             host.as_ref(),
@@ -296,10 +297,26 @@ pub(crate) fn run(argv: &[BString], mut opts: Options, host: Arc<dyn Host>) -> i
     {
         return 1;
     }
+    let start = host.monotonic();
+    let generated = match crate::generate::run(&mut interp, host.as_ref(), &bin) {
+        Ok(generated) => generated,
+        Err(err) => return error(host.as_ref(), format!("{err}\nCMake Generate step failed.")),
+    };
+    let elapsed = host.monotonic().saturating_sub(start);
     if let Err(err) = cache::save(host.as_ref(), &bin, interp.cx().cache()) {
         return error(
             host.as_ref(),
             format!("Could not write CMakeCache.txt: {err}"),
+        );
+    }
+    if generated && show_status {
+        options::out(
+            host.as_ref(),
+            &format!(
+                "-- Generating done ({:.1}s)\n-- Build files have been written to: {}\n",
+                elapsed.as_secs_f64(),
+                bin.display(),
+            ),
         );
     }
     0

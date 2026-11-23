@@ -14,12 +14,18 @@ path = "src/main.rs"
 [dependencies]
 rcmake-base.workspace = true
 rcmake-commands.workspace = true
+rcmake-ctest.workspace = true
 rcmake-diag.workspace = true
 rcmake-eval.workspace = true
+rcmake-gen-common.workspace = true
+rcmake-gen-make.workspace = true
+rcmake-gen-ninja.workspace = true
+rcmake-genex.workspace = true
 rcmake-host.workspace = true
 rcmake-json.workspace = true
 rcmake-model.workspace = true
 rcmake-presets.workspace = true
+rcmake-resolve.workspace = true
 rcmake-syntax.workspace = true
 rcmake-tool-e.workspace = true
 

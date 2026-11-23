@@ -64,6 +64,7 @@ const LONG_OPTIONS: &[&[u8]] = &[
     b"--help",
     b"--help-variable",
     b"--fresh",
+    b"--regenerate-during-build",
     b"--preset",
     b"--presets-file",
     b"--list-presets",
@@ -147,12 +148,7 @@ fn parse_args(args: &[BString], host: &dyn Host) -> Result<Option<Options>, Stri
                     };
                     return show_help(host, topic, flag == b"--help-variable").map(|()| None);
                 }
-                b"--build" | b"--install" => {
-                    return Err(format!(
-                        "{} mode is not yet implemented (scheduled for Milestone 2)",
-                        String::from_utf8_lossy(flag)
-                    ));
-                }
+                b"--regenerate-during-build" if inline.is_none() => {}
                 b"--preset" => {
                     opts.preset = Some(value!("No preset specified for --preset").into());
                 }
@@ -196,7 +192,7 @@ fn parse_args(args: &[BString], host: &dyn Host) -> Result<Option<Options>, Stri
                     } else {
                         (
                             "CMAKE_INSTALL_PREFIX",
-                            "No path specified for --install-prefix",
+                            "No install directory specified for --install-prefix",
                         )
                     };
                     opts.cache_edits.push(CacheEdit::Define(CacheDefine {
@@ -537,7 +533,7 @@ fn cli_usage_error_only(host: &dyn Host) -> String {
     String::new()
 }
 
-fn split_flag(arg: &[u8], separator: u8) -> (&[u8], Option<&[u8]>) {
+pub(crate) fn split_flag(arg: &[u8], separator: u8) -> (&[u8], Option<&[u8]>) {
     if let Some(i) = arg.iter().position(|&b| b == separator) {
         (arg.get(..i).unwrap_or(arg), arg.get(i + 1..))
     } else {
@@ -545,15 +541,19 @@ fn split_flag(arg: &[u8], separator: u8) -> (&[u8], Option<&[u8]>) {
     }
 }
 
-fn take_value<'a>(
+pub(crate) fn take_value<'a>(
     iter: &mut std::iter::Peekable<impl Iterator<Item = &'a [u8]>>,
 ) -> Option<&'a [u8]> {
     iter.next_if(|arg| !arg.starts_with(b"-"))
 }
 
 fn unknown_option(arg: &[u8]) -> String {
+    unknown_mode_option(arg, LONG_OPTIONS)
+}
+
+pub(crate) fn unknown_mode_option(arg: &[u8], flags: &[&[u8]]) -> String {
     let mut message = format!("Unknown argument {}", String::from_utf8_lossy(arg));
-    if let Some((flag, distance)) = LONG_OPTIONS
+    if let Some((flag, distance)) = flags
         .iter()
         .map(|flag| (*flag, edit_distance(arg, flag)))
         .min_by_key(|&(_, distance)| distance)

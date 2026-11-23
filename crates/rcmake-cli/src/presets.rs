@@ -6,7 +6,7 @@ use rcmake_eval::{CacheDefine, LogLevel, TraceConfig, TraceFormat as EvalTraceFo
 use rcmake_host::{Host, WriteMode};
 use rcmake_model::CacheType;
 use rcmake_presets::{
-    ConfigureSettings, EnvSnapshot, PresetKind, PresetSettings, Presets, Strategy,
+    ConfigureSettings, EnvSnapshot, PresetKind, PresetSettings, Presets, ResolvedPreset, Strategy,
     TraceFormat as PresetTraceFormat, TraceMode,
 };
 
@@ -36,6 +36,22 @@ fn load(host: &dyn Host, src: &Path, custom: Option<&Path>) -> Result<Presets, i
         emit_cli_error(host, msg);
         1
     })
+}
+
+pub(crate) fn resolve_for_mode(
+    host: &dyn Host,
+    kind: PresetKind,
+    name: &[u8],
+    custom: Option<&Path>,
+) -> Result<ResolvedPreset, i32> {
+    let cwd = host.initial_cwd();
+    let presets = load(host, &cwd, custom)?;
+    presets
+        .resolve(kind, name, &EnvSnapshot::from_host(host))
+        .map_err(|err| {
+            emit_cli_error(host, err.message);
+            1
+        })
 }
 
 pub(crate) fn list(host: &dyn Host, src: &Path, custom: Option<&Path>, mode: &[u8]) -> i32 {
