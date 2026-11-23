@@ -2,11 +2,11 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use rcmake_base::BString;
+use rcmake_base::{BString, ByteSlice as _};
 use rcmake_eval::{Interp, InterpConfig, RunMode};
 use rcmake_host::{
-    CommandSpec, Host, HostError, HostResult, Input, Output, ProcessResult, PureHost, RunOutput,
-    Stream,
+    CommandSpec, Host, HostError, HostResult, Input, NativeHost, Output, ProcessResult, PureHost,
+    ReadRange, RunOutput, Stream,
 };
 use rcmake_model::CacheType;
 
@@ -496,6 +496,392 @@ fn find_required_records_the_miss_and_stops_the_script() -> HostResult<()> {
         String::from_utf8_lossy(&error)
             .contains("Could not find X using the following files: one.h, two.h"),
         "{error}"
+    );
+    Ok(())
+}
+
+#[test]
+fn find_package_loads_module_and_restores_request_variables() -> HostResult<()> {
+    let (host, mut interp) = setup_package();
+    host.seed_file(
+        Path::new("/work/modules/FindWidget.cmake"),
+        br#"
+set(request "${Widget_FIND_VERSION}|${Widget_FIND_VERSION_RANGE}|${Widget_FIND_VERSION_RANGE_MAX}|${Widget_FIND_VERSION_MAX_MINOR}|${Widget_FIND_COMPONENTS}|${Widget_FIND_REQUIRED_core}|${Widget_FIND_REQUIRED_extra}|${Widget_FIND_QUIETLY}|${Widget_FIND_REQUIRED}")
+set(WIDGET_FOUND TRUE)
+"#,
+    )?;
+    let script = r#"
+set(CMAKE_MODULE_PATH /work/modules)
+set(Widget_FIND_VERSION saved)
+find_package(Widget 1.2...<2.3 QUIET REQUIRED MODULE COMPONENTS core OPTIONAL_COMPONENTS extra)
+"#;
+    let exit = run(&host, &mut interp, script)?;
+    assert_eq!(exit, 0, "{}", host.stream_bytes(Stream::Stderr));
+    assert_eq!(
+        var(&mut interp, b"request"),
+        "1.2|1.2...<2.3|EXCLUDE|3|core;extra|1|0|1|1"
+    );
+    assert_eq!(var(&mut interp, b"Widget_FIND_VERSION"), "saved");
+    assert!(!interp.cx().var_defined(b"Widget_FIND_REQUIRED_extra"));
+    assert!(interp.cx().var_is_on(b"Widget_FOUND"));
+    Ok(())
+}
+
+fn setup_package() -> (Arc<PureHost>, Interp) {
+    let host = Arc::new(PureHost::default());
+    let interp = package_interp(host.clone(), RunMode::Script);
+    (host, interp)
+}
+
+fn package_interp(host: Arc<PureHost>, mode: RunMode) -> Interp {
+    Interp::new(
+        InterpConfig {
+            host,
+            mode,
+            cmake_root: "/share/cmake".into(),
+            cmake_command: "/bin/cmake".into(),
+            cwd: "/work".into(),
+            limits: Default::default(),
+            diag: Default::default(),
+            defines: Vec::new(),
+            script_args: Vec::new(),
+        },
+        crate::register_all,
+    )
+}
+
+#[test]
+fn find_package_checks_config_versions_in_separate_scopes() -> HostResult<()> {
+    let (host, mut interp) = setup_package();
+    for (folder, version, flags) in [
+        ("bad", "9.1", "set(PACKAGE_VERSION_UNSUITABLE TRUE)"),
+        ("compatible", "1.7.5-rc1", ""),
+        ("exact", "1.2", "set(PACKAGE_VERSION_EXACT TRUE)"),
+    ] {
+        let dir = format!("/work/{folder}/lib/cmake/Widget");
+        host.seed_file(
+            &Path::new(&dir).join("WidgetConfig.cmake"),
+            format!("set(loaded {folder})").as_bytes(),
+        )?;
+        let script = format!(
+            r#"
+if(DEFINED PACKAGE_VERSION OR DEFINED version_local)
+  message(FATAL_ERROR "Version state leaked")
+endif()
+if(NOT PACKAGE_FIND_NAME STREQUAL Widget OR NOT PACKAGE_FIND_VERSION_MAJOR EQUAL 1)
+  message(FATAL_ERROR "Incorrect version request")
+endif()
+set(version_local TRUE)
+set(PACKAGE_VERSION {version})
+set(PACKAGE_VERSION_COMPATIBLE TRUE)
+{flags}
+"#
+        );
+        host.seed_file(
+            &Path::new(&dir).join("WidgetConfigVersion.cmake"),
+            script.as_bytes(),
+        )?;
+    }
+    let script = r#"
+set(PACKAGE_VERSION saved)
+find_package(Widget 1.2 EXACT CONFIG REQUIRED NO_DEFAULT_PATH PATHS bad compatible exact)
+"#;
+    let exit = run(&host, &mut interp, script)?;
+    assert_eq!(exit, 0, "{}", host.stream_bytes(Stream::Stderr));
+    assert_eq!(var(&mut interp, b"loaded"), "exact");
+    assert_eq!(var(&mut interp, b"Widget_VERSION"), "1.2");
+    assert_eq!(var(&mut interp, b"Widget_VERSION_COUNT"), "2");
+    assert_eq!(var(&mut interp, b"Widget_VERSION_PATCH"), "0");
+    assert_eq!(
+        var(&mut interp, b"Widget_CONSIDERED_VERSIONS"),
+        "9.1;1.7.5-rc1;1.2"
+    );
+    assert_eq!(var(&mut interp, b"PACKAGE_VERSION"), "saved");
+    let mut cx = interp.cx();
+    assert!(!cx.var_defined(b"version_local"));
+    assert!(!cx.var_defined(b"PACKAGE_FIND_NAME"));
+    assert_eq!(
+        cx.cache()
+            .get(b"Widget_DIR")
+            .map(|entry| (&entry.value, entry.ty)),
+        Some((&"/work/exact/lib/cmake/Widget".into(), CacheType::Path))
+    );
+    Ok(())
+}
+
+#[test]
+fn find_package_passes_range_to_config_version_file() -> HostResult<()> {
+    let (host, mut interp) = setup_package();
+    for (dir, version) in [
+        ("Widget-2.0", "2.0"),
+        ("Widget-1.10", "1.10"),
+        ("Widget-1.2", "1.2"),
+    ] {
+        let dir = Path::new("/work/prefix").join(dir);
+        host.seed_file(&dir.join("widget-config.cmake"), b"")?;
+        let script = format!(
+            r#"
+if(NOT PACKAGE_FIND_VERSION STREQUAL "1.2"
+   OR NOT PACKAGE_FIND_VERSION_MIN STREQUAL "1.2"
+   OR NOT PACKAGE_FIND_VERSION_MAX STREQUAL "2.0"
+   OR NOT PACKAGE_FIND_VERSION_RANGE STREQUAL "1.2...<2.0"
+   OR NOT PACKAGE_FIND_VERSION_RANGE_MIN STREQUAL "INCLUDE"
+   OR NOT PACKAGE_FIND_VERSION_RANGE_MAX STREQUAL "EXCLUDE")
+  message(FATAL_ERROR "Incorrect version range")
+endif()
+set(PACKAGE_VERSION {version})
+if(PACKAGE_VERSION VERSION_GREATER_EQUAL PACKAGE_FIND_VERSION_MIN
+   AND PACKAGE_VERSION VERSION_LESS PACKAGE_FIND_VERSION_MAX)
+  set(PACKAGE_VERSION_COMPATIBLE TRUE)
+endif()
+"#
+        );
+        host.seed_file(&dir.join("widget-config-version.cmake"), script.as_bytes())?;
+    }
+    let exit = run(
+        &host,
+        &mut interp,
+        "find_package(Widget 1.2...<2.0 CONFIG REQUIRED NO_DEFAULT_PATH PATHS prefix)",
+    )?;
+    assert_eq!(exit, 0, "{}", host.stream_bytes(Stream::Stderr));
+    assert_eq!(var(&mut interp, b"Widget_VERSION"), "1.10");
+    assert_eq!(var(&mut interp, b"Widget_CONSIDERED_VERSIONS"), "2.0;1.10");
+    assert_eq!(
+        var(&mut interp, b"Widget_CONFIG"),
+        "/work/prefix/Widget-1.10/widget-config.cmake"
+    );
+    Ok(())
+}
+
+#[test]
+fn find_package_uses_config_preference_redirects_and_provider() -> HostResult<()> {
+    let (host, mut interp) = setup_package();
+    host.seed_file(
+        Path::new("/share/cmake/Modules/FindWidget.cmake"),
+        b"set(loaded module)\nset(Widget_FOUND TRUE)",
+    )?;
+    for (dir, source) in [("config", "config"), ("redirect", "redirect")] {
+        host.seed_file(
+            &Path::new("/work").join(dir).join("WidgetConfig.cmake"),
+            format!("set(loaded {source})").as_bytes(),
+        )?;
+    }
+    let script = r#"
+set(Widget_DIR /work/config)
+find_package(Widget REQUIRED)
+set(first "${loaded}")
+set(CMAKE_FIND_PACKAGE_PREFER_CONFIG TRUE)
+find_package(Widget REQUIRED)
+set(second "${loaded}")
+set(CMAKE_FIND_PACKAGE_REDIRECTS_DIR /work/redirect)
+find_package(Widget MODULE REQUIRED)
+set(third "${loaded}")
+
+macro(provide method package_name)
+  set(provided "${method}|${package_name}|${ARGN}")
+  if("${package_name}" STREQUAL "Remote")
+    set(Remote_FOUND TRUE)
+  endif()
+endmacro()
+set_property(GLOBAL PROPERTY _RCMAKE_FIND_PACKAGE_PROVIDER provide)
+set(CMAKE_REQUIRE_FIND_PACKAGE_Remote ON)
+find_package(Remote 1 OPTIONAL COMPONENTS runtime)
+find_package(Skipped CONFIG QUIET BYPASS_PROVIDER)
+get_property(packages GLOBAL PROPERTY PACKAGES_FOUND)
+get_property(missing GLOBAL PROPERTY PACKAGES_NOT_FOUND)
+"#;
+    let exit = run(&host, &mut interp, script)?;
+    assert_eq!(exit, 0, "{}", host.stream_bytes(Stream::Stderr));
+    for (name, expected) in [
+        (b"first".as_slice(), "module"),
+        (b"second", "config"),
+        (b"third", "redirect"),
+        (
+            b"provided",
+            "FIND_PACKAGE|Remote|1;OPTIONAL;COMPONENTS;runtime",
+        ),
+        (b"packages", "Widget;Remote"),
+        (b"missing", "Skipped"),
+    ] {
+        assert_eq!(var(&mut interp, name), expected);
+    }
+    Ok(())
+}
+
+#[test]
+fn find_package_handles_disabled_optional_and_required_packages() -> HostResult<()> {
+    for (script, code, message) in [
+        ("find_package(Missing CONFIG QUIET)", 0, ""),
+        ("find_package(Missing CONFIG OPTIONAL)", 0, ""),
+        (
+            "find_package(Missing CONFIG REQUIRED)",
+            1,
+            "Could not find a package configuration file provided by \"Missing\"",
+        ),
+        (
+            "set(CMAKE_REQUIRE_FIND_PACKAGE_Missing ON)\nfind_package(Missing CONFIG OPTIONAL)",
+            1,
+            "Could not find a package configuration file provided by \"Missing\"",
+        ),
+        (
+            "set(CMAKE_DISABLE_FIND_PACKAGE_Missing ON)\nfind_package(Missing)",
+            0,
+            "",
+        ),
+        (
+            "set(CMAKE_DISABLE_FIND_PACKAGE_Missing ON)\nfind_package(Missing REQUIRED)",
+            1,
+            "A REQUIRED package cannot",
+        ),
+    ] {
+        let (host, mut interp) = setup_package();
+        assert_eq!(run(&host, &mut interp, script)?, code, "{script}");
+        assert_eq!(var(&mut interp, b"Missing_FOUND"), "0", "{script}");
+        let stderr = host.stream_bytes(Stream::Stderr);
+        if message.is_empty() {
+            assert!(stderr.is_empty(), "{stderr}");
+        } else {
+            assert!(stderr.to_str_lossy().contains(message), "{stderr}");
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn find_package_searches_nested_roots_and_uses_renamed_configs() -> HostResult<()> {
+    let (host, mut interp) = setup_package();
+    host.seed_file(
+        Path::new("/work/modules/FindOuter.cmake"),
+        b"find_package(Inner CONFIG NAMES Alternate CONFIGS special.cmake PATH_SUFFIXES extra REQUIRED)\nset(Outer_FOUND TRUE)",
+    )?;
+    host.seed_file(
+        Path::new("/sysroot/opt/share/alternate-2/extra/special.cmake"),
+        b"set(nested \"${CMAKE_FIND_PACKAGE_NAME}\")",
+    )?;
+    let script = r#"
+cmake_minimum_required(VERSION 4.5)
+set(CMAKE_MODULE_PATH /work/modules)
+set(Outer_ROOT /opt)
+set(CMAKE_FIND_ROOT_PATH /sysroot)
+set(CMAKE_FIND_ROOT_PATH_MODE_PACKAGE ONLY)
+find_package(Outer REQUIRED)
+"#;
+    let exit = run(&host, &mut interp, script)?;
+    assert_eq!(exit, 0, "{}", host.stream_bytes(Stream::Stderr));
+    assert_eq!(var(&mut interp, b"nested"), "Inner");
+    assert_eq!(
+        var(&mut interp, b"Inner_CONFIG"),
+        "/sysroot/opt/share/alternate-2/extra/special.cmake"
+    );
+    assert!(!interp.cx().var_defined(b"CMAKE_FIND_PACKAGE_NAME"));
+    Ok(())
+}
+
+#[test]
+fn find_package_runs_vendored_threads_and_zlib_modules() -> HostResult<()> {
+    let host = Arc::new(PureHost::default());
+    let native = NativeHost::new()?;
+    let modules = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../modules/cmake-4.5/Modules");
+    for module in [
+        "CheckCSourceCompiles.cmake",
+        "CheckIncludeFile.cmake",
+        "CheckLibraryExists.cmake",
+        "FindPackageHandleStandardArgs.cmake",
+        "FindPackageMessage.cmake",
+        "FindThreads.cmake",
+        "FindZLIB.cmake",
+        "SelectLibraryConfigurations.cmake",
+        "Internal/CheckCommon.cmake",
+        "Internal/CheckSourceCompiles.cmake",
+    ] {
+        let data = native.read(&modules.join(module), ReadRange::All { limit: 128 * 1024 })?;
+        host.seed_file(&Path::new("/share/cmake/Modules").join(module), &data)?;
+    }
+    host.seed_file(
+        Path::new("/work/zlib/include/zlib.h"),
+        b"#define ZLIB_VERSION \"1.3.1\"\n",
+    )?;
+    host.seed_file(Path::new("/work/zlib/lib/libz.a"), b"")?;
+    host.seed_file(
+        Path::new("/work/CMakeLists.txt"),
+        br#"
+cmake_minimum_required(VERSION 4.5)
+project(Packages NONE)
+set(CMAKE_C_COMPILER_LOADED TRUE)
+set(CMAKE_HAVE_LIBC_PTHREAD TRUE)
+find_package(Threads REQUIRED)
+set(ZLIB_ROOT /work/zlib)
+set(ZLIB_USE_STATIC_LIBS TRUE)
+find_package(ZLIB 1.3 REQUIRED)
+if(NOT TARGET Threads::Threads OR NOT TARGET ZLIB::ZLIB)
+  message(FATAL_ERROR "An imported target is missing")
+endif()
+"#,
+    )?;
+    let mut interp = package_interp(host.clone(), RunMode::Configure);
+    let outcome = interp.run_configure(Path::new("/work"), Path::new("/work/build"), &[]);
+    assert_eq!(
+        outcome.exit_code,
+        0,
+        "{}",
+        host.stream_bytes(Stream::Stderr)
+    );
+    assert!(interp.cx().var_is_on(b"Threads_FOUND"));
+    assert!(interp.cx().var_is_on(b"ZLIB_FOUND"));
+    assert_eq!(var(&mut interp, b"ZLIB_VERSION"), "1.3.1");
+    Ok(())
+}
+
+#[test]
+fn find_package_scopes_policies_unless_requested_otherwise() -> HostResult<()> {
+    let (host, mut interp) = setup_package();
+    host.seed_file(
+        Path::new("/share/cmake/Modules/FindWidget.cmake"),
+        b"cmake_policy(SET CMP0074 OLD)\nset(Widget_FOUND TRUE)",
+    )?;
+    let script = r#"
+cmake_minimum_required(VERSION 4.5)
+find_package(Widget MODULE REQUIRED)
+cmake_policy(GET CMP0074 scoped)
+find_package(Widget MODULE REQUIRED NO_POLICY_SCOPE)
+cmake_policy(GET CMP0074 unscoped)
+"#;
+    let exit = run(&host, &mut interp, script)?;
+    assert_eq!(exit, 0, "{}", host.stream_bytes(Stream::Stderr));
+    assert_eq!(var(&mut interp, b"scoped"), "NEW");
+    assert_eq!(var(&mut interp, b"unscoped"), "OLD");
+    Ok(())
+}
+
+#[test]
+fn find_package_global_promotes_targets_from_a_subdirectory() -> HostResult<()> {
+    let host = Arc::new(PureHost::default());
+    host.seed_file(
+        Path::new("/work/CMakeLists.txt"),
+        b"cmake_minimum_required(VERSION 4.5)\nproject(Packages NONE)\nadd_subdirectory(child)",
+    )?;
+    host.seed_file(
+        Path::new("/work/child/CMakeLists.txt"),
+        b"find_package(Widget CONFIG GLOBAL REQUIRED NO_DEFAULT_PATH PATHS /work/prefix)",
+    )?;
+    host.seed_file(
+        Path::new("/work/prefix/WidgetConfig.cmake"),
+        b"add_library(Widget::Widget INTERFACE IMPORTED)",
+    )?;
+    let mut interp = package_interp(host.clone(), RunMode::Configure);
+    let outcome = interp.run_configure(Path::new("/work"), Path::new("/work/build"), &[]);
+    assert_eq!(
+        outcome.exit_code,
+        0,
+        "{}",
+        host.stream_bytes(Stream::Stderr)
+    );
+    assert!(
+        interp
+            .cx()
+            .project()
+            .find_target(rcmake_model::DirId::ROOT, b"Widget::Widget")
+            .is_some()
     );
     Ok(())
 }
