@@ -1,0 +1,19 @@
+[package]
+name = "rcmake-expr"
+description = "CMake 4.5.1 variable expansion, escape decoding, if()/while() condition evaluator, and configure_file expander."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+rcmake-base.workspace = true
+rcmake-diag.workspace = true
+rcmake-host.workspace = true
+rcmake-regex.workspace = true
+rcmake-syntax.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

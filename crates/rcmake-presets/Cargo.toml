@@ -1,0 +1,19 @@
+[package]
+name = "rcmake-presets"
+description = "CMake Presets schema v13 loader, inheritance resolver, condition evaluator, and macro expander."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+indexmap.workspace = true
+rcmake-base.workspace = true
+rcmake-diag.workspace = true
+rcmake-host.workspace = true
+rcmake-json.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

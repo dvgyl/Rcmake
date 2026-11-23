@@ -1,0 +1,22 @@
+[package]
+name = "rcmake-eval"
+description = "Core CMake 4.5.1 interpreter runtime, scope stacks, control flow, functions/macros/blocks, and builtin Cx API."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+indexmap.workspace = true
+rcmake-base.workspace = true
+rcmake-diag.workspace = true
+rcmake-expr.workspace = true
+rcmake-host.workspace = true
+rcmake-model.workspace = true
+rcmake-regex.workspace = true
+rcmake-syntax.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

@@ -25,6 +25,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4e7648175b45a9a48536d676f68d918270699102aa8dab5496df06904c914600"
 
 [[package]]
+name = "equivalent"
+version = "1.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "00d174d5400e5e8fd687ad1049e2f578285fa914201b1af7e8b112a4546bd826"
+
+[[package]]
 name = "errno"
 version = "0.3.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -49,6 +55,22 @@ dependencies = [
  "cfg-if",
  "libc",
  "r-efi",
+]
+
+[[package]]
+name = "hashbrown"
+version = "0.17.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "735eaa21a6a5ffb2e84362faaeb90c05ba8e19797ca30428478cb6ea3a4921bc"
+
+[[package]]
+name = "indexmap"
+version = "2.14.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cc4e190f5d26ca7051642629da2c52fc03bde85a03197c99408dcd291734c855"
+dependencies = [
+ "equivalent",
+ "hashbrown",
 ]
 
 [[package]]
@@ -206,6 +228,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "rcmake-eval"
+version = "0.1.0"
+dependencies = [
+ "indexmap",
+ "rcmake-base",
+ "rcmake-diag",
+ "rcmake-expr",
+ "rcmake-host",
+ "rcmake-model",
+ "rcmake-regex",
+ "rcmake-syntax",
+ "thiserror",
+]
+
+[[package]]
+name = "rcmake-expr"
+version = "0.1.0"
+dependencies = [
+ "rcmake-base",
+ "rcmake-diag",
+ "rcmake-host",
+ "rcmake-regex",
+ "rcmake-syntax",
+ "thiserror",
+]
+
+[[package]]
 name = "rcmake-harness"
 version = "0.1.0"
 dependencies = [
@@ -227,6 +276,36 @@ dependencies = [
 
 [[package]]
 name = "rcmake-json"
+version = "0.1.0"
+dependencies = [
+ "rcmake-base",
+ "thiserror",
+]
+
+[[package]]
+name = "rcmake-model"
+version = "0.1.0"
+dependencies = [
+ "indexmap",
+ "rcmake-base",
+ "rcmake-diag",
+ "thiserror",
+]
+
+[[package]]
+name = "rcmake-presets"
+version = "0.1.0"
+dependencies = [
+ "indexmap",
+ "rcmake-base",
+ "rcmake-diag",
+ "rcmake-host",
+ "rcmake-json",
+ "thiserror",
+]
+
+[[package]]
+name = "rcmake-regex"
 version = "0.1.0"
 dependencies = [
  "rcmake-base",

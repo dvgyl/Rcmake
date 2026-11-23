@@ -6,6 +6,11 @@ members = [
     "crates/rcmake-diag",
     "crates/rcmake-syntax",
     "crates/rcmake-host",
+    "crates/rcmake-regex",
+    "crates/rcmake-expr",
+    "crates/rcmake-model",
+    "crates/rcmake-eval",
+    "crates/rcmake-presets",
     "crates/rcmake-cli",
     "crates/rcmake-harness",
 ]
@@ -36,6 +41,11 @@ rcmake-json = { path = "crates/rcmake-json" }
 rcmake-diag = { path = "crates/rcmake-diag" }
 rcmake-syntax = { path = "crates/rcmake-syntax" }
 rcmake-host = { path = "crates/rcmake-host" }
+rcmake-regex = { path = "crates/rcmake-regex" }
+rcmake-expr = { path = "crates/rcmake-expr" }
+rcmake-model = { path = "crates/rcmake-model" }
+rcmake-eval = { path = "crates/rcmake-eval" }
+rcmake-presets = { path = "crates/rcmake-presets" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
