@@ -4,9 +4,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use rcmake_base::BString;
 use rcmake_diag::{Effect, MessageKind, PolicyId, PolicyStatus};
+use rcmake_eval::args::{KeywordParser, Slot};
 use rcmake_eval::{CmdError, Cx, Flow};
 use rcmake_host::{
-    CopyOptions, FileKind, Follow, HostError, ReadRange, WriteMode, path::to_native,
+    CopyOptions, FileKind, Follow, HostError, ReadRange, WriteMode,
+    path::{from_native, to_native},
 };
 
 use super::{Result, arg, error, set, warning};
@@ -17,7 +19,8 @@ pub(super) fn run(cx: &mut Cx<'_>, command: &[u8], args: &[&[u8]]) -> Result {
         b"TOUCH" | b"TOUCH_NOCREATE" => touch(cx, command == b"TOUCH", args),
         b"MAKE_DIRECTORY" => make_directory(cx, args),
         b"REMOVE" | b"REMOVE_RECURSE" => remove(cx, command, args),
-        b"RENAME" | b"COPY_FILE" | b"CREATE_LINK" => pair(cx, command, args),
+        b"RENAME" | b"COPY_FILE" => pair(cx, command, args),
+        b"CREATE_LINK" => create_link(cx, args),
         b"COPY" => super::copy::run(cx, args),
         b"CHMOD" | b"CHMOD_RECURSE" => chmod(cx, command == b"CHMOD_RECURSE", args),
         _ => Err(super::unknown(command)),
@@ -145,59 +148,104 @@ fn remove(cx: &mut Cx<'_>, command: &[u8], args: &[&[u8]]) -> Result {
 fn pair(cx: &mut Cx<'_>, command: &[u8], args: &[&[u8]]) -> Result {
     let [input, output, rest @ ..] = args else {
         return Err(error(
-            [command, b" must be called with at least two arguments."].concat(),
+            [
+                command,
+                b" must be called with at least two additional arguments",
+            ]
+            .concat(),
+        ));
+    };
+    let rename_file = command == b"RENAME";
+    let parser = KeywordParser::new().keyword("RESULT", Slot::SingleMaybe);
+    let args = if rename_file {
+        parser.keyword("NO_REPLACE", Slot::Flag)
+    } else {
+        parser
+            .keyword("ONLY_IF_DIFFERENT", Slot::Flag)
+            .keyword("INPUT_MAY_BE_RECENT", Slot::Flag)
+    }
+    .parse(rest);
+    if let Some(option) = args.unparsed().first() {
+        return Err(error([command, b" unknown argument:\n  ", option].concat()));
+    }
+
+    let source = cx.resolve_path(input);
+    let target = cx.resolve_path(output);
+    let result = if rename_file {
+        rename(cx, &source, &target, args.flag("NO_REPLACE"))
+    } else {
+        copy_file(
+            cx,
+            &source,
+            &target,
+            args.flag("ONLY_IF_DIFFERENT"),
+            args.flag("INPUT_MAY_BE_RECENT"),
+        )
+    };
+    let variable = args.single("RESULT").filter(|name| !name.is_empty());
+    if let Some(name) = variable {
+        return status(cx, Some(name), result);
+    }
+    match result {
+        Ok(()) => Ok(Flow::Normal),
+        Err(msg) => {
+            let source = from_native(&source);
+            let target = from_native(&target);
+            let detail = match (command, msg.as_slice()) {
+                (b"COPY_FILE", b"cannot copy a directory") => {
+                    [msg.as_slice(), b"\n  ", source.as_slice()].concat()
+                }
+                (b"COPY_FILE", b"cannot copy to a directory") => {
+                    [msg.as_slice(), b"\n  ", target.as_slice()].concat()
+                }
+                _ => {
+                    let operation = if rename_file {
+                        b"rename".as_slice()
+                    } else {
+                        b"copy"
+                    };
+                    let reason = if rename_file && msg.as_slice() == b"NO_REPLACE" {
+                        b"path not replaced"
+                    } else {
+                        msg.as_slice()
+                    };
+                    [
+                        b"failed to ",
+                        operation,
+                        b"\n  ",
+                        source.as_slice(),
+                        b"\nto\n  ",
+                        target.as_slice(),
+                        b"\nbecause: ",
+                        reason,
+                    ]
+                    .concat()
+                }
+            };
+            Err(error([command, b" ", &detail].concat()))
+        }
+    }
+}
+
+fn create_link(cx: &mut Cx<'_>, args: &[&[u8]]) -> Result {
+    let [input, output, rest @ ..] = args else {
+        return Err(error(
+            "CREATE_LINK must be called with at least two arguments.",
         ));
     };
     let mut rest = rest.iter().copied();
     let mut variable = None;
-    let mut no_replace = false;
-    let mut different = false;
-    let mut recent = false;
     let mut symbolic = false;
     let mut fallback = false;
     while let Some(option) = rest.next() {
         match option {
             b"RESULT" => variable = Some(arg(&mut rest, option)?),
-            b"NO_REPLACE" if command == b"RENAME" => no_replace = true,
-            b"ONLY_IF_DIFFERENT" if command == b"COPY_FILE" => different = true,
-            b"INPUT_MAY_BE_RECENT" if command == b"COPY_FILE" => recent = true,
-            b"SYMBOLIC" if command == b"CREATE_LINK" => symbolic = true,
-            b"COPY_ON_ERROR" if command == b"CREATE_LINK" => fallback = true,
+            b"SYMBOLIC" => symbolic = true,
+            b"COPY_ON_ERROR" => fallback = true,
             _ => return Err(error([b"unknown argument: \"", option, b"\""].concat())),
         }
     }
-    let source = cx.resolve_path(input);
-    let target = cx.resolve_path(output);
-    let result = match command {
-        b"RENAME" => rename(cx, &source, &target, no_replace),
-        b"COPY_FILE" => copy_file(cx, &source, &target, different, recent),
-        _ => link(cx, input, output, symbolic, fallback),
-    };
-    if variable.is_none() && command != b"CREATE_LINK" {
-        return status(
-            cx,
-            variable,
-            result.map_err(|msg| {
-                [
-                    command,
-                    b" failed to ",
-                    if command == b"RENAME" {
-                        b"rename"
-                    } else {
-                        b"copy"
-                    },
-                    b"\n  ",
-                    input,
-                    b"\nto\n  ",
-                    output,
-                    b"\nbecause: ",
-                    &msg,
-                ]
-                .concat()
-                .into()
-            }),
-        );
-    }
+    let result = link(cx, input, output, symbolic, fallback);
     status(cx, variable, result)
 }
 
@@ -242,21 +290,20 @@ fn copy_file_once(
     different: bool,
 ) -> core::result::Result<(), (ErrorKind, BString)> {
     let host = cx.host();
-    let from = host
-        .metadata(source, Follow::Yes)
-        .map_err(|e| copy_error(&e, true))?;
-    if from.kind == FileKind::Dir {
+    let from = host.metadata(source, Follow::Yes);
+    if from.as_ref().is_ok_and(|meta| meta.kind == FileKind::Dir) {
         return Err((ErrorKind::IsADirectory, "cannot copy a directory".into()));
     }
-    if let Ok(to) = host.metadata(target, Follow::Yes) {
-        if to.kind == FileKind::Dir {
-            return Err((ErrorKind::IsADirectory, "cannot copy to a directory".into()));
-        }
-        if (from.dev, from.ino) == (to.dev, to.ino)
-            || (different && from.len == to.len && files_equal(cx, source, target, from.len))
-        {
-            return Ok(());
-        }
+    let to = host.metadata(target, Follow::Yes);
+    if to.as_ref().is_ok_and(|meta| meta.kind == FileKind::Dir) {
+        return Err((ErrorKind::IsADirectory, "cannot copy to a directory".into()));
+    }
+    let from = from.map_err(|e| copy_error(&e, true))?;
+    if let Ok(to) = to
+        && ((from.dev, from.ino) == (to.dev, to.ino)
+            || (different && from.len == to.len && files_equal(cx, source, target, from.len)))
+    {
+        return Ok(());
     }
     copy_replace(
         cx,
