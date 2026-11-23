@@ -8,14 +8,16 @@ mod prep;
 mod syntax;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use rcmake_base::BString;
 use rcmake_gen_common::{GenError, write_if_changed};
 use rcmake_host::{Host, ReadRange, path};
+use rcmake_model::ProjectModel;
 use rcmake_resolve::{ArtifactSet, BuildGraph, BuildStep, GenerationResult};
 
 use graph::{Graph, qualified};
+use prep::PrepTargets;
 use syntax::{Edge, Ninja, shell_word};
 
 const RULES_PATH: &str = "CMakeFiles/rules.ninja";
@@ -80,14 +82,54 @@ pub fn generate_single_config(
     host: &dyn Host,
     build_dir: &Path,
 ) -> Result<(), GenError> {
+    generate_single(result, host, build_dir, None)
+}
+
+/// Write a single-configuration Ninja manifest with test preparation targets
+/// from the configure-time project model.
+///
+/// # Errors
+///
+/// Returns an error if input resolution fails or the host cannot write a file.
+pub fn generate_single_config_with_model(
+    result: &GenerationResult,
+    host: &dyn Host,
+    build_dir: &Path,
+    model: &ProjectModel,
+) -> Result<(), GenError> {
+    generate_single(result, host, build_dir, Some(model))
+}
+
+fn generate_single(
+    result: &GenerationResult,
+    host: &dyn Host,
+    build_dir: &Path,
+    model: Option<&ProjectModel>,
+) -> Result<(), GenError> {
     let empty = BuildGraph::default();
     let input = result.graphs.first().unwrap_or(&empty);
     let graph = Graph::new(input, &config_artifacts(result, input), build_dir, None)?;
+    let prep = PrepTargets::new(&graph, result, model)?;
     let programs = Programs::new(result, host, build_dir);
-    let manifests = [BString::from("build.ninja"), RULES_PATH.into()];
+    let uses_modules = modules::uses_modules(input);
+    let module_flag = if uses_modules {
+        modules::modmap_flag(result, build_dir)?
+    } else {
+        BString::default()
+    };
+    prepare_directory(host, build_dir)?;
+    let mut manifests = vec![BString::from("build.ninja"), RULES_PATH.into()];
+    if uses_modules {
+        manifests.extend(
+            modules::write_metadata(result, model, &[input], host, build_dir, false)?
+                .iter()
+                .map(|file| graph.node(file)),
+        );
+    }
     let mut ninja = Ninja::default();
     ninja.include(RULES_PATH.as_bytes());
-    graph.emit(&mut ninja);
+    graph.emit(&mut ninja, &programs.cmake, &module_flag);
+    prep.emit(&mut ninja, &graph);
     emit_regeneration(
         &mut ninja,
         &graph,
@@ -104,8 +146,7 @@ pub fn generate_single_config(
     );
     ninja.0.extend_from_slice(b"default all\n");
 
-    prepare_directory(host, build_dir)?;
-    write_rules(result, host, build_dir)?;
+    write_rules(result, host, build_dir, uses_modules)?;
     write_if_changed(host, &build_dir.join("build.ninja"), &ninja.0)
 }
 
@@ -123,6 +164,30 @@ pub fn generate_multi_config(
     result: &GenerationResult,
     host: &dyn Host,
     build_dir: &Path,
+) -> Result<(), GenError> {
+    generate_multi(result, host, build_dir, None)
+}
+
+/// Write Ninja Multi-Config manifests with test preparation targets from the
+/// configure-time project model.
+///
+/// # Errors
+///
+/// Returns an error if input resolution fails or the host cannot write a file.
+pub fn generate_multi_config_with_model(
+    result: &GenerationResult,
+    host: &dyn Host,
+    build_dir: &Path,
+    model: &ProjectModel,
+) -> Result<(), GenError> {
+    generate_multi(result, host, build_dir, Some(model))
+}
+
+fn generate_multi(
+    result: &GenerationResult,
+    host: &dyn Host,
+    build_dir: &Path,
+    model: Option<&ProjectModel>,
 ) -> Result<(), GenError> {
     let mut configs = Vec::new();
     let mut names = HashSet::new();
@@ -146,15 +211,14 @@ pub fn generate_multi_config(
             .ok_or_else(|| {
                 generation_error(build_dir, "A Ninja configuration has no build graph.")
             })?;
-        configs.push((
-            Graph::new(
-                input,
-                &config_artifacts(result, input),
-                build_dir,
-                Some(name),
-            )?,
-            ConfigFiles::new(name),
-        ));
+        let graph = Graph::new(
+            input,
+            &config_artifacts(result, input),
+            build_dir,
+            Some(name),
+        )?;
+        let prep = PrepTargets::new(&graph, result, model)?;
+        configs.push((graph, ConfigFiles::new(name, prep)));
     }
 
     let first = configs.first().ok_or_else(|| {
@@ -181,15 +245,30 @@ pub fn generate_multi_config(
         manifests.extend([files.entry.clone(), files.implementation.clone()]);
     }
 
+    let graphs: Vec<_> = configs.iter().map(|(graph, _)| graph.input).collect();
+    let uses_modules = graphs.iter().any(|graph| modules::uses_modules(graph));
+    let module_flag = if uses_modules {
+        modules::modmap_flag(result, build_dir)?
+    } else {
+        BString::default()
+    };
     prepare_directory(host, build_dir)?;
-    write_rules(result, host, build_dir)?;
+    if uses_modules {
+        manifests.extend(
+            modules::write_metadata(result, model, &graphs, host, build_dir, true)?
+                .iter()
+                .map(|file| default.node(file)),
+        );
+    }
+    write_rules(result, host, build_dir, uses_modules)?;
     let programs = Programs::new(result, host, build_dir);
     let rebuild = configure_command(result, build_dir, &programs.cmake, false);
     let regenerate = configure_command(result, build_dir, &programs.cmake, true);
     for (graph, files) in &configs {
         let mut ninja = Ninja::default();
         ninja.include(RULES_PATH.as_bytes());
-        graph.emit(&mut ninja);
+        graph.emit(&mut ninja, &programs.cmake, &module_flag);
+        files.prep.emit(&mut ninja, graph);
         emit_regeneration(&mut ninja, graph, &manifests, result, &regenerate);
         write_if_changed(
             host,
@@ -232,15 +311,17 @@ fn config_artifacts<'a>(
 struct ConfigFiles {
     entry: BString,
     implementation: BString,
+    prep: PrepTargets,
 }
 
 impl ConfigFiles {
-    fn new(config: &[u8]) -> Self {
+    fn new(config: &[u8], prep: PrepTargets) -> Self {
         let entry = [b"build-", config, b".ninja"].concat().into();
         let implementation = [b"CMakeFiles/impl-", config, b".ninja"].concat().into();
         Self {
             entry,
             implementation,
+            prep,
         }
     }
 }
@@ -259,6 +340,7 @@ fn write_entry(
     ninja.0.extend_from_slice(b"ninja_pipe = |\n");
     ninja.include(&files.implementation);
     graph.emit_entry_aliases(&mut ninja);
+    files.prep.emit_aliases(&mut ninja, graph);
     emit_utilities(&mut ninja, graph, entry, programs, rebuild);
     ninja.0.extend_from_slice(b"default all\n");
     write_if_changed(host, &build_dir.join(path::to_native(entry)), &ninja.0)
@@ -274,8 +356,19 @@ fn write_rules(
     result: &GenerationResult,
     host: &dyn Host,
     build_dir: &Path,
+    uses_modules: bool,
 ) -> Result<(), GenError> {
-    let mut ninja = Ninja(RULES.as_bytes().to_vec());
+    let mut ninja = if uses_modules {
+        let mut rules = RULES.replacen(
+            "ninja_required_version = 1.7",
+            "ninja_required_version = 1.10",
+            1,
+        );
+        rules.push_str(modules::RULES);
+        Ninja(rules.into_bytes())
+    } else {
+        Ninja(RULES.as_bytes().to_vec())
+    };
     let mut pools = BTreeMap::new();
     if let Some(specs) = configuration_setting(host, build_dir, b"CMAKE_JOB_POOLS") {
         for spec in specs.split(|&byte| byte == b';') {
@@ -355,13 +448,8 @@ fn emit_regeneration(
     }
 }
 
-fn configure_command(
-    result: &GenerationResult,
-    build_dir: &Path,
-    cmake: &[u8],
-    rerun: bool,
-) -> Vec<u8> {
-    let source_dir = result
+fn source_directory(result: &GenerationResult, build_dir: &Path) -> PathBuf {
+    result
         .metadata
         .listfiles
         .iter()
@@ -378,8 +466,16 @@ fn configure_command(
                 .map(|target| path::to_native(&target.metadata.source_dir))
         })
         .map(|source| build_dir.join(source))
-        .unwrap_or_else(|| build_dir.to_path_buf());
+        .unwrap_or_else(|| build_dir.to_path_buf())
+}
 
+fn configure_command(
+    result: &GenerationResult,
+    build_dir: &Path,
+    cmake: &[u8],
+    rerun: bool,
+) -> Vec<u8> {
+    let source_dir = source_directory(result, build_dir);
     let mut command = cmake.to_vec();
     if rerun {
         command.extend_from_slice(b" --regenerate-during-build");

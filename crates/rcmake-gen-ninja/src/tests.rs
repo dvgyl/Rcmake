@@ -218,7 +218,7 @@ fn link_byproducts_use_unique_paths_on_the_link_edge() -> Result<(), Box<dyn std
             Some(b"Debug"),
         )?;
         let mut ninja = Ninja::default();
-        graph.emit(&mut ninja);
+        graph.emit(&mut ninja, b"cmake", b"");
         graph.emit_entry_aliases(&mut ninja);
         let manifest = String::from_utf8(ninja.0)?;
         assert_eq!(
@@ -312,7 +312,7 @@ fn target_dependencies_use_the_library_when_its_name_matches_an_executable_outpu
             config.map(str::as_bytes),
         )?;
         let mut ninja = Ninja::default();
-        graph.emit(&mut ninja);
+        graph.emit(&mut ninja, b"cmake", b"");
         if config.is_some() {
             graph.emit_entry_aliases(&mut ninja);
         }
@@ -430,4 +430,301 @@ fn multi_config_uses_config_order_or_host_default() {
         assert!(implementation.contains(&format!("build app$:{config}: phony\n")));
         assert!(implementation.contains(&format!("build all$:{config}: phony app$:{config}")));
     }
+}
+
+#[test]
+fn module_pipeline_writes_edges_and_target_metadata() -> Result<(), Box<dyn std::error::Error>> {
+    use rcmake_cxxmodules::{ModuleVisibility, tdi::read_tdi};
+    use rcmake_genex::ConfigId;
+    use rcmake_model::{DirId, ProjectModel, Target, TargetKind, TargetOrigin};
+    use rcmake_resolve::{
+        BmiInstall, CompileUnit, CxxModuleInfo, ModuleUnit, ResolvedTarget, TargetMetadata,
+        Toolchain,
+    };
+
+    let host = PureHost::default();
+    let dir = Path::new("/work/build");
+    let mut model = ProjectModel::default();
+    model.set_root_dirs("/work/source".into(), "/work/build".into());
+    let id = model.add_target(Target::new(
+        "producer".into(),
+        TargetKind::ObjectLibrary,
+        TargetOrigin::Normal,
+        DirId::ROOT,
+        Default::default(),
+        Default::default(),
+    ))?;
+    let configs = [ConfigId("Debug".into()), ConfigId("Release".into())];
+    let mut result = GenerationResult {
+        configs: configs.to_vec(),
+        ..GenerationResult::default()
+    };
+    result.metadata.toolchains.insert(
+        "CXX".into(),
+        Toolchain {
+            compiler_id: "Clang".into(),
+            module_map_format: Some("clang".into()),
+            ..Toolchain::default()
+        },
+    );
+    for config in configs {
+        let producer = format!("producer/{}", config.0);
+        let consumer = format!("consumer/{}", config.0);
+        let stages = |name: &str, base: &str, implicit_inputs| {
+            let object: BString = format!("{base}/unit.o").into();
+            let ddi: BString = format!("{base}/unit.o.ddi").into();
+            let dd: BString = format!("{base}/CXX.dd").into();
+            let map: BString = format!("{base}/unit.o.modmap").into();
+            let source: BString = format!("/work/source/{name}.cxx").into();
+            [
+                BuildStep::Scan {
+                    source: source.clone(),
+                    object: object.clone(),
+                    ddi: ddi.clone(),
+                    invocation: Invocation::default(),
+                    depfile: Some(format!("{base}/unit.o.ddi.d").into()),
+                },
+                BuildStep::Collate {
+                    target: name.into(),
+                    ddis: vec![ddi],
+                    dd: dd.clone(),
+                    modmaps: vec![map.clone()],
+                    tdi: format!("{base}/CXXDependInfo.json").into(),
+                    implicit_inputs,
+                },
+                BuildStep::Compile {
+                    object,
+                    source,
+                    invocation: Invocation::default(),
+                    depfile: None,
+                    modmap: Some(map),
+                    dyndep: Some(dd),
+                },
+            ]
+        };
+        let steps = stages("producer", &producer, vec![])
+            .into_iter()
+            .chain(stages(
+                "consumer",
+                &consumer,
+                vec![format!("{producer}/CXXModules.json").into()],
+            ))
+            .collect();
+        result.graphs.push(BuildGraph {
+            config: config.clone(),
+            steps,
+            targets: vec![
+                GraphTarget {
+                    name: "producer".into(),
+                    steps: vec![0, 1, 2],
+                    in_all: true,
+                    ..GraphTarget::default()
+                },
+                GraphTarget {
+                    name: "consumer".into(),
+                    steps: vec![3, 4, 5],
+                    in_all: true,
+                    ..GraphTarget::default()
+                },
+            ],
+        });
+        result.targets.push(ResolvedTarget {
+            id,
+            config,
+            metadata: TargetMetadata {
+                name: "producer".into(),
+                kind: TargetKind::ObjectLibrary,
+                source_dir: "/work/source/lib".into(),
+                binary_dir: "/work/build/lib".into(),
+                backtrace: Default::default(),
+                folder: None,
+                exclude_from_all: false,
+                generator_provided: false,
+            },
+            artifacts: ArtifactSet::default(),
+            compile_units: vec![CompileUnit {
+                source: rcmake_model::BT::new(
+                    "/work/source/producer.cxx".into(),
+                    Default::default(),
+                ),
+                object: format!("{producer}/unit.o").into(),
+                scan: true,
+                ..CompileUnit::default()
+            }],
+            compile_groups: vec![],
+            link: None,
+            dependencies: vec![],
+            cxx_modules: Some(CxxModuleInfo {
+                units: vec![ModuleUnit {
+                    unit: 0,
+                    file_set: "modules".into(),
+                    public: true,
+                    bmi_only: false,
+                }],
+                module_dir: producer.into(),
+                bmi_install: Some(BmiInstall {
+                    destination: "lib/modules".into(),
+                    component: "Development".into(),
+                    ..BmiInstall::default()
+                }),
+                ..CxxModuleInfo::default()
+            }),
+        });
+    }
+    super::generate_multi_config_with_model(&result, &host, dir, &model)?;
+    let rules = read(&host, "CMakeFiles/rules.ninja");
+    assert!(rules.contains("rule CXX_SCAN\n"));
+    assert!(rules.contains("rule CXX_DYNDEP\n"));
+    assert!(
+        rules.contains("  rspfile = $out.rsp\n  rspfile_content = $in_newline\n  restat = 1\n")
+    );
+    for config in ["Debug", "Release"] {
+        let manifest = read(&host, &format!("CMakeFiles/impl-{config}.ninja"));
+        assert!(manifest.contains(&format!("build consumer/{config}/CXX.dd | consumer/{config}/CXXModules.json consumer/{config}/unit.o.modmap: CXX_DYNDEP consumer/{config}/unit.o.ddi | consumer/{config}/CXXDependInfo.json producer/{config}/CXXModules.json")));
+        assert!(manifest.contains(&format!("build producer/{config}/unit.o: CXX_COMPILE_SCANNED /work/source/producer.cxx | producer/{config}/unit.o.modmap || producer/{config}/CXX.dd")));
+        assert!(manifest.contains(&format!("  dyndep = producer/{config}/CXX.dd")));
+        let producer =
+            read_tdi(read(&host, &format!("producer/{config}/CXXDependInfo.json")).as_bytes())?;
+        let consumer =
+            read_tdi(read(&host, &format!("consumer/{config}/CXXDependInfo.json")).as_bytes())?;
+        assert_eq!(producer.config, config);
+        assert_eq!(producer.dir_top_src, "/work/source");
+        assert_eq!(producer.dir_cur_src, "/work/source/lib");
+        assert_eq!(producer.dir_top_bld, "/work/build");
+        assert_eq!(producer.dir_cur_bld, "/work/build/lib");
+        assert_eq!(
+            producer.module_dir,
+            format!("/work/build/producer/{config}")
+        );
+        let module = producer
+            .cxx_modules
+            .get(format!("producer/{config}/unit.o").as_bytes());
+        assert_eq!(
+            module.map(|module| module.visibility),
+            Some(ModuleVisibility::Public)
+        );
+        assert_eq!(
+            producer.bmi_installation.map(|install| install.component),
+            Some("Development".into())
+        );
+        assert_eq!(
+            consumer.linked_target_dirs,
+            [BString::from(format!("/work/build/producer/{config}"))]
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn prep_targets_preserve_user_outputs_and_select_dependencies()
+-> Result<(), Box<dyn std::error::Error>> {
+    use rcmake_model::{
+        DirId, InstallKind, InstallOptions, InstallRule, ProjectModel, TestEntry, TestKind,
+    };
+    use rcmake_resolve::{InstallAction, InstallActionKind};
+
+    let host = PureHost::default();
+    let dir = Path::new("/work/build");
+    let mut model = ProjectModel::default();
+    model.set_root_dirs("/work/src".into(), "/work/build".into());
+    let test = model.add_test(TestEntry {
+        name: "sample".into(),
+        dir: DirId::ROOT,
+        backtrace: Default::default(),
+        command: vec!["echo".into()],
+        configurations: vec!["Debug".into()],
+        working_directory: None,
+        command_expand_lists: false,
+        old_style: false,
+        props: Default::default(),
+        build_depends: vec![],
+        kind: TestKind::Single,
+    })?;
+    let test = model.test_mut(test).ok_or("Missing test.")?;
+    test.build_depends.push(rcmake_model::BT::new(
+        "generated".into(),
+        Default::default(),
+    ));
+    let mut discovery = test.clone();
+    discovery.name = "discovery".into();
+    discovery.kind = TestKind::Discover(Box::default());
+    model.add_test(discovery)?;
+    model.add_install(InstallRule {
+        dir: DirId::ROOT,
+        backtrace: Default::default(),
+        kind: InstallKind::Files(vec![rcmake_model::BT::new(
+            "/work/build/hidden".into(),
+            Default::default(),
+        )]),
+        options: InstallOptions {
+            component: Some("Hidden".into()),
+            exclude_from_all: true,
+            ..InstallOptions::default()
+        },
+    });
+    let mut result = GenerationResult {
+        graphs: vec![BuildGraph {
+            steps: vec![BuildStep::Custom(CustomStep {
+                outputs: vec![
+                    "generated".into(),
+                    "hidden".into(),
+                    "install_prep/Runtime".into(),
+                ],
+                ..CustomStep::default()
+            })],
+            ..BuildGraph::default()
+        }],
+        ..GenerationResult::default()
+    };
+    for (component, file) in [("Runtime", "generated"), ("Hidden", "hidden")] {
+        let file = BString::from(format!("/work/build/{file}"));
+        if component == "Runtime" {
+            model.add_install(InstallRule {
+                dir: DirId::ROOT,
+                backtrace: Default::default(),
+                kind: InstallKind::Files(vec![rcmake_model::BT::new(
+                    file.clone(),
+                    Default::default(),
+                )]),
+                options: InstallOptions {
+                    component: Some(component.into()),
+                    ..InstallOptions::default()
+                },
+            });
+        }
+        result.install.actions.push(InstallAction {
+            component: component.into(),
+            destination: "share".into(),
+            configurations: vec![],
+            kind: InstallActionKind::Files {
+                file_type: "FILE".into(),
+                files: vec![file],
+                rename: None,
+                permissions: vec![],
+            },
+            optional: false,
+        });
+    }
+    super::generate_single_config_with_model(&result, &host, dir, &model)?;
+    let build = read(&host, "build.ninja");
+    assert!(!build.contains("build install_prep/Runtime:"));
+    assert!(build.contains("build install_prep/Hidden: phony hidden\n"));
+    assert!(build.contains("build install_prep/all: phony generated\n"));
+    assert!(build.contains("build test_prep/sample: phony generated\n"));
+    assert!(build.contains("build test_prep/directory_"));
+    assert!(build.contains("build test_prep/all: phony test_prep/directory_"));
+    assert!(!build.contains("build test_prep/discovery:"));
+    assert!(!read(&host, "CMakeFiles/rules.ninja").contains("CXX_SCAN"));
+
+    let release = rcmake_genex::ConfigId("Release".into());
+    result.configs = vec![release.clone()];
+    if let Some(graph) = result.graphs.first_mut() {
+        graph.config = release;
+    }
+    super::generate_multi_config_with_model(&result, &host, dir, &model)?;
+    let release = read(&host, "CMakeFiles/impl-Release.ninja");
+    assert!(release.contains("build test_prep/sample$:Release: phony generated\n"));
+    let entry = read(&host, "build-Release.ninja");
+    assert!(entry.contains("build test_prep/sample: phony test_prep/sample$:Release\n"));
+    Ok(())
 }

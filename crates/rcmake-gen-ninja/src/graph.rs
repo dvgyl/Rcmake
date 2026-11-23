@@ -8,12 +8,12 @@ use rcmake_gen_common::GenError;
 use rcmake_host::path;
 use rcmake_resolve::{ArtifactSet, BuildGraph, BuildStep, Invocation, LinkKind};
 
-use crate::generation_error;
 use crate::syntax::{Edge, Ninja, shell_word};
+use crate::{generation_error, modules};
 
 pub(crate) struct Graph<'a> {
-    input: &'a BuildGraph,
-    build_dir: &'a Path,
+    pub(crate) input: &'a BuildGraph,
+    pub(crate) build_dir: &'a Path,
     pub(crate) config: Option<&'a [u8]>,
     names: HashMap<BString, usize>,
     aliases: Vec<BString>,
@@ -68,8 +68,15 @@ impl<'a> Graph<'a> {
             match step {
                 BuildStep::Compile { object, .. } => nodes.outputs.push(graph.node(object)),
                 BuildStep::Link { step, .. } => nodes.outputs.push(graph.node(&step.output)),
-                BuildStep::Scan { .. } | BuildStep::Collate { .. } => {
-                    return Err(crate::modules::unsupported());
+                BuildStep::Scan { ddi, .. } => nodes.outputs.push(graph.node(ddi)),
+                BuildStep::Collate { dd, modmaps, .. } => {
+                    nodes.outputs.push(graph.node(dd));
+                    nodes
+                        .byproducts
+                        .push(graph.node(&modules::modules_json(dd)));
+                    nodes
+                        .byproducts
+                        .extend(modmaps.iter().map(|map| graph.node(map)));
                 }
                 BuildStep::Custom(custom) => {
                     nodes
@@ -170,6 +177,20 @@ impl<'a> Graph<'a> {
         self.names.contains_key(name) || self.producers.contains_key(name)
     }
 
+    pub(crate) fn prep_output_is_reserved(&self, name: &BString) -> bool {
+        self.has_target(name) || self.aliases.contains(name)
+    }
+
+    pub(crate) fn file_dependency(&self, path: &[u8]) -> Option<BString> {
+        let node = self.node(path);
+        self.producers.contains_key(&node).then_some(node)
+    }
+
+    pub(crate) fn target_dependency(&self, name: &[u8]) -> Option<BString> {
+        let index = self.names.get(&self.node(name))?;
+        self.aliases.get(*index).cloned()
+    }
+
     fn connect_targets(&mut self) -> Result<(), GenError> {
         for (target, alias) in self.input.targets.iter().zip(&self.aliases) {
             let dependencies: Vec<_> = target
@@ -187,7 +208,7 @@ impl<'a> Graph<'a> {
                         "Invalid Ninja build step index.",
                     ));
                 };
-                if matches!(step, BuildStep::Compile { .. })
+                if matches!(step, BuildStep::Compile { .. } | BuildStep::Scan { .. })
                     && let Some(nodes) = self.steps.get_mut(index)
                 {
                     nodes.order_only.extend(dependencies.iter().cloned());
@@ -215,9 +236,9 @@ impl<'a> Graph<'a> {
         Ok(())
     }
 
-    pub(crate) fn emit(&self, ninja: &mut Ninja) {
+    pub(crate) fn emit(&self, ninja: &mut Ninja, cmake: &[u8], modmap_flag: &[u8]) {
         for (step, nodes) in self.input.steps.iter().zip(&self.steps) {
-            self.emit_step(ninja, step, nodes);
+            self.emit_step(ninja, step, nodes, cmake, modmap_flag);
         }
 
         let mut all = Vec::new();
@@ -277,24 +298,68 @@ impl<'a> Graph<'a> {
         self.aliases.get(index).cloned().unwrap_or(node)
     }
 
-    fn emit_step(&self, ninja: &mut Ninja, step: &BuildStep, nodes: &StepNodes) {
+    fn emit_step(
+        &self,
+        ninja: &mut Ninja,
+        step: &BuildStep,
+        nodes: &StepNodes,
+        cmake: &[u8],
+        modmap_flag: &[u8],
+    ) {
+        let mut implicit = Vec::new();
+        let mut dyndep_node = None;
         let (rule, inputs, invocations, depfile) = match step {
             BuildStep::Compile {
                 source,
                 invocation,
                 depfile,
+                modmap,
+                dyndep,
                 ..
             } => {
-                let rule: &[u8] = if depfile.is_some() {
-                    b"COMPILE_DEPFILE"
-                } else {
-                    b"COMPILE"
+                implicit.extend(modmap.iter().map(|map| self.node(map)));
+                dyndep_node = dyndep.as_ref().map(|dd| self.node(dd));
+                let rule: &[u8] = match (dyndep.is_some() || modmap.is_some(), depfile.is_some()) {
+                    (false, false) => b"COMPILE",
+                    (false, true) => b"COMPILE_DEPFILE",
+                    (true, false) => b"CXX_COMPILE_SCANNED",
+                    (true, true) => b"CXX_COMPILE_SCANNED_DEPFILE",
                 };
                 (
                     rule,
                     vec![self.node(source)],
                     std::slice::from_ref(invocation),
                     depfile.as_ref(),
+                )
+            }
+            BuildStep::Scan {
+                source,
+                invocation,
+                depfile,
+                ..
+            } => (
+                if depfile.is_some() {
+                    b"CXX_SCAN".as_slice()
+                } else {
+                    b"CXX_SCAN_NO_DEPFILE".as_slice()
+                },
+                vec![self.node(source)],
+                std::slice::from_ref(invocation),
+                depfile.as_ref(),
+            ),
+            BuildStep::Collate {
+                ddis,
+                tdi,
+                implicit_inputs,
+                ..
+            } => {
+                implicit.push(self.node(tdi));
+                implicit.extend(implicit_inputs.iter().map(|input| self.node(input)));
+                (
+                    b"CXX_DYNDEP".as_slice(),
+                    ddis.iter().map(|ddi| self.node(ddi)).collect(),
+                    &[][..],
+                    None,
                 )
             }
             BuildStep::Link {
@@ -333,16 +398,16 @@ impl<'a> Graph<'a> {
                     custom.depfile.as_ref(),
                 )
             }
-            // `Graph::new` rejects module steps.
-            BuildStep::Scan { .. } | BuildStep::Collate { .. } => return,
         };
         let inputs = unique(inputs);
+        let implicit = unique(implicit);
         let order_only = unique(
-            nodes
-                .order_only
+            dyndep_node
                 .iter()
+                .chain(nodes.order_only.iter())
                 .filter(|node| {
                     !inputs.contains(node)
+                        && !implicit.contains(node)
                         && !nodes.outputs.contains(node)
                         && !nodes.byproducts.contains(node)
                 })
@@ -354,21 +419,38 @@ impl<'a> Graph<'a> {
                 outputs: &nodes.outputs,
                 implicit_outputs: &nodes.byproducts,
                 inputs: &inputs,
+                implicit_inputs: &implicit,
                 order_only: &order_only,
-                ..Edge::default()
             },
         );
         if rule == b"phony" {
             return;
         }
+        if let BuildStep::Collate { tdi, .. } = step {
+            let mut tdi_arg = Vec::new();
+            shell_word(&self.node(tdi), &mut tdi_arg);
+            ninja.binding(b"CMAKE_COMMAND", cmake);
+            ninja.binding(b"in_tdi", &tdi_arg);
+            ninja.binding(b"MODMAP_FLAG", modmap_flag);
+            return;
+        }
         ninja.binding(b"COMMAND", &command_line(invocations));
         if let Some(depfile) = depfile {
-            let key: &[u8] = if matches!(step, BuildStep::Compile { .. }) {
+            let key: &[u8] = if matches!(step, BuildStep::Compile { .. } | BuildStep::Scan { .. }) {
                 b"DEP_FILE"
             } else {
                 b"depfile"
             };
             ninja.binding(key, &self.node(depfile));
+        }
+        if let BuildStep::Compile {
+            modmap: Some(map), ..
+        } = step
+        {
+            ninja.binding(b"DYNDEP_MODULE_MAP_FILE", &self.node(map));
+        }
+        if let Some(dd) = dyndep_node {
+            ninja.binding(b"dyndep", &dd);
         }
         if let BuildStep::Custom(custom) = step {
             ninja.binding(

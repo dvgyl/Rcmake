@@ -505,3 +505,110 @@ fn ninja_links_and_rebuilds_a_versioned_shared_library() -> Result<(), Box<dyn s
     }
     Ok(())
 }
+
+#[test]
+fn ninja_reads_cxx_dyndep_and_builds_a_scanned_unit() -> Result<(), Box<dyn std::error::Error>> {
+    use rcmake_resolve::Toolchain;
+
+    let project = Project::new();
+    let build = &project.dir;
+    let object = BString::from("module state/unit.o");
+    let ddi = BString::from("module state/unit.o.ddi");
+    let dd = BString::from("module state/CXX.dd");
+    let map = BString::from("module state/unit.o.modmap");
+    let depfile = BString::from("module state/unit.o.ddi.d");
+    let cmake = project.host.env_get(b"RCMAKE_NINJA_TEST_CMAKE");
+    project.write(
+        "scan.sh",
+        br#"set -eu
+printf '%s\n' '{"version":1,"revision":0,"rules":[{"primary-output":"module state/unit.o"}]}' > "$1"
+printf '%s\n' 'module\ state/unit.o.ddi: main.c' > "$2"
+"#,
+    );
+    let mut result = GenerationResult {
+        graphs: vec![BuildGraph {
+            steps: vec![
+                BuildStep::Scan {
+                    source: "main.c".into(),
+                    object: object.clone(),
+                    ddi: ddi.clone(),
+                    invocation: Invocation {
+                        argv: vec!["sh".into(), "scan.sh".into(), ddi.clone(), depfile.clone()],
+                        ..Invocation::default()
+                    },
+                    depfile: Some(depfile),
+                },
+                BuildStep::Collate {
+                    target: "demo".into(),
+                    ddis: vec![ddi],
+                    dd: dd.clone(),
+                    modmaps: vec![map.clone()],
+                    tdi: "module state/CXXDependInfo.json".into(),
+                    implicit_inputs: vec![],
+                },
+                BuildStep::Compile {
+                    object: object.clone(),
+                    source: "main.c".into(),
+                    invocation: Invocation {
+                        argv: vec![
+                            "sh".into(),
+                            "-c".into(),
+                            "test -f \"$1\" && printf built > \"$2\"".into(),
+                            "compile".into(),
+                            map,
+                            object,
+                        ],
+                        ..Invocation::default()
+                    },
+                    depfile: None,
+                    modmap: Some("module state/unit.o.modmap".into()),
+                    dyndep: Some(dd),
+                },
+            ],
+            targets: vec![GraphTarget {
+                name: "demo".into(),
+                steps: vec![0, 1, 2],
+                in_all: true,
+                ..GraphTarget::default()
+            }],
+            ..BuildGraph::default()
+        }],
+        ..GenerationResult::default()
+    };
+    result.metadata.cmake_command.clone_from(&cmake);
+    result.metadata.toolchains.insert(
+        "CXX".into(),
+        Toolchain {
+            module_map_format: Some("clang".into()),
+            ..Toolchain::default()
+        },
+    );
+    generate_single_config(&result, &project.host, build)?;
+    if cmake.is_some() {
+        project.run(build, "ninja", &["demo"]);
+        assert_eq!(
+            project.host.read(
+                &build.join("module state/unit.o"),
+                ReadRange::All { limit: 1024 }
+            )?,
+            b"built"
+        );
+        assert!(
+            project
+                .host
+                .metadata(&build.join("module state/CXXModules.json"), Follow::Yes)
+                .is_ok()
+        );
+        project
+            .host
+            .remove_file(&build.join("module state/unit.o.modmap"))?;
+        project.run(build, "ninja", &["demo"]);
+    } else {
+        project.write(
+            "module state/CXX.dd",
+            b"ninja_dyndep_version = 1.0\nbuild module$ state/unit.o: dyndep\n",
+        );
+        project.run(build, "ninja", &["-n", "demo"]);
+    }
+    Ok(())
+}
