@@ -111,3 +111,77 @@ All major architectural and contract decisions for Rcmake are recorded here by t
 5. **Black-Box Oracle Harness (`rcmake-harness`):**
    - Links zero core engine crates; runs staged `rcmake` and pinned `$RCMAKE_ORACLE_CMAKE` side-by-side in fresh `/tmp` sandboxes with controlled env, normalizing `<TMP>`, `<CMAKE_EXE>`, `<CMAKE_ROOT>`, and the version attribution line.
    - Uses compact txtar-style `.case` files plus recorded JSON baselines in `conformance/baselines/`.
+
+---
+
+## ADR-006: Generator Expression Engine (`rcmake-genex`)
+
+- **Status:** Accepted
+- **Date:** 2026-11-23
+
+### Decision
+
+1. **Decoupled Crate & `GenexHost` Trait:** `rcmake-genex` depends only on `rcmake-base`, `rcmake-diag`, and `rcmake-regex`. To break the mutual recursion between generator-expression evaluation (`$<TARGET_PROPERTY:...>`) and transitive usage resolution without cyclic crate dependencies, `rcmake-genex` defines a `GenexHost` trait (`find_target`, `raw_property`, `transitive_property`, `artifact`, `link_closure`) implemented by `rcmake-resolve`.
+2. **Shared Pure Algorithms in `rcmake-base`:** Move the `cmake_path` lexical engine and `list` sort/transform/filter algorithms into `rcmake-base` during M2 Wave 0 so `$<PATH:...>`, `$<LIST:...>`, `cmake_path()`, and `list()` share one verified implementation.
+3. **Parser & Evaluation Invariants (Verified Against CMake 4.5.1):**
+   - `$<` opens an expression, `>` closes the innermost open expression, the first `:` at that nesting level splits operator from arguments, and commas split arguments at that nesting level according to each operator's arity rules (`$<UPPER_CASE:a,b:c>` -> `A,B:C`; `$<BOOL:a,b>` -> error).
+   - Unmatched delimiters recover as literal text; complete `$<>` is a generation error.
+   - `IF`, `AND`, `OR`, and conditional payloads evaluate lazily. `$<BOOL:00>` and `$<BOOL:0.0>` evaluate to `1`. `$<JOIN:a;;b,|>` drops empty items (`a|b`), while `$<LIST:JOIN,a;;b,|>` preserves them (`a||b`).
+   - `$<GENEX_EVAL:...>` re-parses and evaluates in the same context; `$<TARGET_GENEX_EVAL:t,...>` evaluates pass 1 in consumer `head`, then pass 2 with target context switched to `t`.
+4. **Separate Cycle Detection vs. Memoization:**
+   - Cycle detection uses an active parent-linked chain (`DAGChecker`) keyed on `(target, property)` with CMake's exact exemptions and `"Self reference on target"` diagnostic.
+   - Memoization lives in `rcmake-resolve`, keyed on `(target, property, config, language, head?, traversal)`, where `EvalFlags { head_sensitive, context_sensitive, link_language_sensitive }` controls whether `head` enters the key so diamond graphs remain polynomial.
+5. **Preprocess & Configure-Time Helpers:** Provide `find_genex(bytes)`, syntax-only `genex_strip(bytes)`, and AST-preserving `strip(ast, Mode::{Build, Install})` + `rewrite_install_prefix` for `string(GENEX_STRIP)`, `install(EXPORT)`, and `export()`. Reserve `command_config` and `output_config` on `EvalContext` for `Ninja Multi-Config`.
+
+---
+
+## ADR-007: Arena-Based `ProjectModel`, Directory Scopes & Transitive Usage Resolution
+
+- **Status:** Accepted
+- **Date:** 2026-11-23
+
+### Decision
+
+1. **Arena Architecture:** Extend `rcmake-model::ProjectModel` with arenas (`DirId`/`Directory`, `TargetId`/`Target`, `CommandId`/`CustomCommand`, `InstallRule`, `ExportSet`, `TestEntry`) and delete M1 placeholder maps (`target_names`, `test_names`, `rule_names`).
+2. **Backtrace-Tagged Usage Properties (`BT<BString>`):** Store `Target` usage requirements (`INCLUDE_DIRECTORIES`, `COMPILE_DEFINITIONS`, `COMPILE_OPTIONS`, `COMPILE_FEATURES`, `LINK_OPTIONS`, `LINK_DIRECTORIES`, `LINK_LIBRARIES`, and `INTERFACE_*` counterparts) and `sources` as `Vec<BT<BString>>` (carrying cheap `Backtrace` snapshots) rather than joined strings, so File-API v2.12 and diagnostics never lose origin provenance. Store `LinkItem { text: BT<BString>, lookup_dir: DirId }` for `CMP0079` cross-directory link calls.
+3. **Target Lookup & Policy Snapshots:**
+   - Normal targets and `IMPORTED GLOBAL` targets reside in a global map; non-global `IMPORTED` targets and their aliases are scoped to their creation `Directory` and descendants via `ProjectModel::find_target(dir, name)`.
+   - Snapshot target-creation policy values (`TargetPolicySnapshot`) on target creation and `Directory::final_policies` when a directory's `CMakeLists.txt` finishes.
+   - Generate the `CMAKE_<PROP>` target-property initializer table via `tools/gen/gen_target_init.py` from BSD-3-Clause CMake 4.5.1 Help `.rst` docs.
+4. **Scoped Properties & `INHERITED` Chain:** Use typed `PropScope::{Global, Directory(DirId), Target(TargetId), Source { dir, path }, Test { dir, name }, Cache(BString)}`. An `INHERITED` lookup walks `Object -> Directory -> ParentDirectories -> Global`; any set value (including the empty string) stops the walk.
+5. **Directory Execution in `rcmake-eval`:** Replace `Interp`'s single `dir_props`/`source_dir`/`binary_dir`/`defer` fields with the `ProjectModel` directory arena + `dir_stack: Vec<DirId>` and implement `Interp::run_subdirectory(...)` directly in `rcmake-eval` (copying parent variables on entry so `PARENT_SCOPE` updates the caller frame without leaking back into child reads, pushing policy/diagnostic/loop barriers, running the directory's deferred queue on exit, and recording `final_policies`).
+6. **Transitive Link & Usage Semantics:** `PRIVATE d` on `STATIC`/`OBJECT` adds `$<LINK_ONLY:d>` to `INTERFACE_LINK_LIBRARIES` (not on `SHARED`/`MODULE`). Compile traversal skips `$<LINK_ONLY:...>`; link traversal includes it. Keep compile-usage deduplication (encounter order + `SYSTEM` classification) distinct from link-line ordering (`REORDER_MINIMALLY`, `CMP0156`, `CMP0179`, static archive multiplicity).
+
+---
+
+## ADR-008: Compiler Bootstrap, Vendored `Modules/` & In-Process `try_compile`
+
+- **Status:** Accepted
+- **Date:** 2026-11-23
+
+### Decision
+
+1. **Execute Vendored CMake 4.5.1 `Modules/` Directly:** Rather than hardcoding compiler flags or platform tables in Rust, `project()` / `enable_language()` execute the vendored `modules/cmake-4.5/Modules/` sequence (`CMakeDetermineSystem`, `CMakeUnixFindMake`/`CMakeNinjaFindMake`, `CMakeSystemSpecificInitialize`, `CMakeDetermine<LANG>Compiler`, `CMakeSystemSpecificInformation`, `CMake<LANG>Information`, `CMakeTest<LANG>Compiler`, `CMakeDetermineCompilerABI`, `Check*`, `GNUInstallDirs`) directly through `rcmake-eval`, preserving exact variable and cache types and warm-reconfigure caching via `CMakeFiles/4.5.1/CMake<LANG>Compiler.cmake`.
+2. **Native Rust Primitives & `GeneratorKind`:** Provide `GeneratorKind` at configure time (name, `multi_config`, find-make module, `GENERATOR_IS_MULTI_CONFIG`), native global properties (`ENABLED_LANGUAGES`, `IN_TRY_COMPILE`, `CMAKE_C_KNOWN_FEATURES`, `CMAKE_CXX_KNOWN_FEATURES`, `PACKAGES_FOUND`, `PACKAGES_NOT_FOUND`), `file(READ_MACHO ...)` (required by Darwin ABI detection), and `CMakeConfigureLog.yaml`.
+3. **CMake 4.0+ macOS Defaults:** Preserve `CMAKE_C_COMPILER=/usr/bin/cc`, `APPLE=1`, `UNIX=1`, `DARWIN` unset, `CMAKE_SYSTEM_NAME=Darwin`, and empty `CMAKE_OSX_SYSROOT` by default while compiler state records the resolved SDK path.
+4. **Isolated `try_compile` with In-Process `rcmake-build` Executor:**
+   - `try_compile` / `try_run` instantiate a fresh child `Interp` with a `TryCompileSeed` (reusing detected compiler state to avoid recursion, capped at depth 2) and a capturing `Host` decorator so child output routes cleanly into `OUTPUT_VARIABLE` and `CMakeConfigureLog.yaml`.
+   - Deliberate M2 design choice: execute `try_compile`'s resolved `BuildGraph` via an in-process Rust executor crate (`rcmake-build`) rather than shelling out to Ninja/Make. This keeps `try_compile` fast, deterministic, independent of generator bugs, and lets compiler bootstrap (`project(x C CXX)`) pass end-to-end in Wave 2 before generators are written.
+
+---
+
+## ADR-009: Three-Layer Resolution IR, Generators, File-API v2.12 & Minimal `ctest`
+
+- **Status:** Accepted
+- **Date:** 2026-11-23
+
+### Decision
+
+1. **Three-Layer Pipeline (Zero Cyclic Crates):**
+   - `ProjectModel` (raw configure-time state) -> `ResolvedTarget` (per-config typed, genex-evaluated target facts with backtraces; single source of truth for File-API codemodel and `install(EXPORT)`) -> `BuildGraph` (lowered POSIX-`sh`-escaped command invocations, placeholder-expanded rule templates `<FLAGS> <DEFINES> <INCLUDES> <OBJECT> <SOURCE> <DEP_FILE> <LINK_FLAGS> <LINK_LIBRARIES> <OBJECTS> <TARGET> <SONAME_FLAG> <TARGET_INSTALLNAME_DIR>`, link fragments with semantic roles, and `InstallManifest`).
+   - Non-target metadata (cache, ordered listfile inputs for `RERUN_CMAKE` & `cmakeFiles-v1`, toolchains, configureLog) lives in `ConfigureMetadata`.
+   - Acyclic crate graph: `base <- regex <- genex`, `base <- diag <- model`, `eval <- model`, `resolve <- (model, genex, diag, host)`, `build <- (resolve, host)`, `commands <- (eval, model, genex, resolve, build)`, `gen-common <- resolve`, `gen-ninja`/`gen-make <- (resolve, gen-common)`, `ctest <- (eval, host)`, `cli <- all`.
+2. **Generator Rollout Order:**
+   - Wave 3: `rcmake-gen-ninja` (single-config `Ninja`), `rcmake-gen-common` (`compile_commands.json`, `cmake_install.cmake`, `CTestTestfile.cmake`, `install(EXPORT)`/`export()`, `file(GENERATE)`), `cmake --build`, `cmake --install` (with native `file(INSTALL)` and macOS `install_name_tool` / Linux ELF `file(RPATH_*)`), and minimal `rcmake-ctest` (`CTestTestfile.cmake` execution with `-C`, `-R`, `-E`, `-j`, `--output-on-failure`) so Tier-1 corpus projects (`zlib`, `fmt`, `nlohmann/json`, `cJSON`, `doctest`) build, install, and pass tests end-to-end.
+   - Wave 4: `rcmake-gen-make` (`Unix Makefiles` with output sync), `Ninja Multi-Config` (with `COMMAND_CONFIG`/`OUTPUT_CONFIG`), and File-API v2.12 (`codemodel` 2.12, `cache` 2.0, `toolchains` 1.1, `cmakeFiles` 1.1, `configureLog` 1.0), followed by Tier-2 corpus (`Catch2`, `libpng`, `sqlite`, `spdlog`).
+3. **Behavioral Equivalence Over Byte-Identical Build Files:** Validate generated build systems against CMake 4.5.1 via normalized `compile_commands.json`, File-API JSON replies, installed file trees + `install_manifest.txt`, passing consumer projects linking against installed exports, and `ctest` results.

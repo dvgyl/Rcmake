@@ -28,10 +28,12 @@ fn load(host: &dyn Host, src: &Path, custom: Option<&Path>) -> Result<Presets, i
         rcmake_presets::load(src, host).map_err(|err| err.message)
     };
     result.map_err(|err| {
-        emit_cli_error(
-            host,
-            format!("Could not read presets from {}:\n{err}", src.display()),
-        );
+        let msg = if err.starts_with("Could not read presets from ") {
+            err
+        } else {
+            format!("Could not read presets from {}:\n{err}", src.display())
+        };
+        emit_cli_error(host, msg);
         1
     })
 }
@@ -125,14 +127,16 @@ pub(crate) fn apply(host: &dyn Host, src: &Path, opts: &mut Options) -> Result<A
                     ),
                 );
             } else {
-                emit_cli_error(
-                    host,
+                let msg = if err.message.starts_with("Could not read presets from ") {
+                    err.message
+                } else {
                     format!(
                         "Could not read presets from {}:\n{}",
                         src.display(),
                         err.message
-                    ),
-                );
+                    )
+                };
+                emit_cli_error(host, msg);
             }
             1
         })?;
