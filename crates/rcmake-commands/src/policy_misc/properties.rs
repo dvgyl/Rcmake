@@ -1,14 +1,16 @@
 use rcmake_base::{BString, list, truth};
-use rcmake_diag::{Effect, MessageKind};
-use rcmake_eval::{CmdError, CmdResult, Cx, Flow, RunMode};
+use rcmake_diag::{Effect, FrameKind, MessageKind};
+use rcmake_eval::{CmdError, CmdResult, Cx, Flow, RunMode, UserCommandKind};
 use rcmake_expr::ExpandedArg;
 use rcmake_host::path;
 use rcmake_model::{
-    AppendMode, CacheEntry, CacheType, DefinedProperty, ModelError, PropOrigin, PropScope,
-    PropertyMap, TargetId,
+    AppendMode, CacheType, DefinedProperty, DirId, ModelError, PropOrigin, PropScope,
+    TargetBinding, TargetId, UsageField,
 };
 
-use super::{files::normalize, quoted, status, values};
+use crate::dirs::{find_directory, normalized_path, scoped_test_directory};
+
+use super::{quoted, status, values};
 
 const DIRECTORY_ERROR: &str = "DIRECTORY scope provided but requested directory was not found.  This could be because the directory argument was invalid or, it is valid but has not been processed yet.";
 
@@ -117,13 +119,14 @@ pub(super) fn get_directory(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult 
         [b"DIRECTORY", dir, rest @ ..] => (Some(*dir), rest),
         _ => (None, args),
     };
-    check_directory(cx, &directory.into_iter().collect::<Vec<_>>())?;
+    let dir = check_directory(cx, directory.as_slice())?;
     let result = match query {
-        [b"DEFINITION", name] => cx.var(name),
-        [name] => {
+        [b"DEFINITION", name] if dir == cx.current_dir_id() => cx.var(name),
+        [b"DEFINITION", _] => None,
+        [b""] => return Err(status("given empty string for the property name to get")),
+        [name] if *name != b"DIRECTORY" => {
             let inherited = is_inherited(cx, b"DIRECTORY", name);
-            directory_value(cx, name)
-                .or_else(|| inherited.then(|| global_value(cx, name)).flatten())
+            directory_value(cx, dir, name, inherited)
         }
         _ => return Err(status("called with incorrect number of arguments")),
     };
@@ -150,8 +153,7 @@ pub(super) fn set_sources(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
     };
     let (sources, tail) = args.split_at(split);
     let pairs = property_pairs(tail.get(1..).unwrap_or_default())?;
-    for source in source_names(cx, sources, false)? {
-        let scope = source_scope(cx, source);
+    for scope in source_scopes(cx, sources, false)? {
         for [name, value] in pairs {
             update_scoped(cx, &scope, name, Some((*value).into()), Update::Set)?;
         }
@@ -161,15 +163,19 @@ pub(super) fn set_sources(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
 
 pub(super) fn get_source(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
     let args = values(args);
-    let [out, source, options @ .., name] = args.as_slice() else {
+    let [out, source, options @ ..] = args.as_slice() else {
         return Err(status("called with incorrect number of arguments"));
     };
-    let mut names = vec![*source];
-    names.extend_from_slice(options);
-    let selected = source_names(cx, &names, true)?;
-    let source = selected.first().copied().unwrap_or_default();
+    let (dir, name) = match options {
+        [option @ (b"DIRECTORY" | b"TARGET_DIRECTORY"), value, name] => {
+            (source_directory(cx, option, value)?, *name)
+        }
+        [name] => (cx.current_dir_id(), *name),
+        _ => return Err(status("called with incorrect number of arguments")),
+    };
+    let scope = source_scope(cx, dir, source);
     let inherited = is_inherited(cx, b"SOURCE", name);
-    let value = source_value(cx, source, name, inherited).unwrap_or_else(|| "NOTFOUND".into());
+    let value = source_value(cx, &scope, name, inherited).unwrap_or_else(|| "NOTFOUND".into());
     cx.set_var(out, value);
     Ok(Flow::Normal)
 }
@@ -197,18 +203,6 @@ enum Update {
 }
 
 impl Update {
-    fn property(self, props: &mut PropertyMap, name: &[u8], value: Option<BString>) {
-        match (self, value) {
-            (Self::Set, Some(value)) => props.set(name.into(), value),
-            (Self::Set, None) => props.unset(name),
-            (Self::Append, Some(value)) if !value.is_empty() => props.append(name.into(), &value),
-            (Self::AppendString, Some(value)) if !value.is_empty() => {
-                props.append_string(name.into(), &value)
-            }
-            _ => {}
-        }
-    }
-
     fn value(self, old: &[u8], new: &[u8]) -> BString {
         match self {
             Self::Set => new.into(),
@@ -242,40 +236,64 @@ pub(super) fn set(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
     });
     let value = (!tail.is_empty()).then(|| list::join(tail));
     match *scope {
-        b"GLOBAL" if names.is_empty() => update.property(&mut cx.global().props, name, value),
+        b"GLOBAL" if names.is_empty() => {
+            update_scoped(cx, &PropScope::Global, name, value, update)?;
+        }
         b"GLOBAL" => return Err(status("given names for GLOBAL scope.")),
         b"DIRECTORY" => {
-            check_directory(cx, &names)?;
-            let dir = PropScope::Directory(cx.current_dir_id());
+            let dir = PropScope::Directory(check_directory(cx, &names)?);
             update_scoped(cx, &dir, name, value, update)?;
         }
         b"SOURCE" => {
-            for source in source_names(cx, &names, false)? {
-                let scope = source_scope(cx, source);
+            for scope in source_scopes(cx, &names, false)? {
                 update_scoped(cx, &scope, name, value.clone(), update)?;
             }
         }
         b"TARGET" => {
-            for target in names {
-                let scope = PropScope::Target(find_target(cx, target)?);
+            let targets = names
+                .iter()
+                .map(|target| writable_target(cx, target))
+                .collect::<Result<Vec<_>, _>>()?;
+            for target in targets {
+                let scope = PropScope::Target(target);
                 update_scoped(cx, &scope, name, value.clone(), update)?;
+            }
+        }
+        b"TEST" => {
+            let (tests, dir) = test_names(cx, &names)?;
+            let missing = tests
+                .iter()
+                .filter(|test| cx.project().find_test(dir, test).is_none())
+                .flat_map(|test| [b"\n  ".as_slice(), *test])
+                .flatten()
+                .copied()
+                .collect::<Vec<_>>();
+            if !missing.is_empty() {
+                return Err(status(
+                    [
+                        b"given TEST names that do not exist:\n".as_slice(),
+                        &missing,
+                    ]
+                    .concat(),
+                ));
+            }
+            for test in tests {
+                let scope = PropScope::Test {
+                    dir,
+                    name: (*test).into(),
+                };
+                update_scoped(cx, &scope, name, value.clone(), update)?;
+            }
+        }
+        b"INSTALL" => {
+            for file in names {
+                let key = install_prop_name(file, name);
+                update_scoped(cx, &PropScope::Global, &key, value.clone(), update)?;
             }
         }
         b"CACHE" => {
             for entry_name in names {
-                let entry = cx.cache().get_mut(entry_name).ok_or_else(|| {
-                    status(quoted(
-                        "could not find CACHE variable ",
-                        entry_name,
-                        ".  Perhaps it has not yet been created.",
-                    ))
-                })?;
-                set_cache(
-                    entry,
-                    name,
-                    value.as_ref().map(|value| value.as_slice()),
-                    update,
-                )?;
+                set_cache(cx, entry_name, name, value.clone(), update)?;
             }
         }
         _ => return Err(status(quoted("given invalid scope ", scope, "."))),
@@ -291,6 +309,21 @@ fn update_scoped(
     value: Option<BString>,
     update: Update,
 ) -> Result<(), CmdError> {
+    if matches!(scope, PropScope::Directory(_))
+        && matches!(
+            name,
+            b"SUBDIRECTORIES"
+                | b"BUILDSYSTEM_TARGETS"
+                | b"IMPORTED_TARGETS"
+                | b"PARENT_DIRECTORY"
+                | b"SOURCE_DIR"
+                | b"BINARY_DIR"
+                | b"LISTFILE_STACK"
+                | b"TESTS"
+        )
+    {
+        return Ok(());
+    }
     let backtrace = cx.backtrace();
     let origin = PropOrigin {
         dir: cx.current_dir_id(),
@@ -308,7 +341,17 @@ fn update_scoped(
         (_, None) => Ok(()),
     };
     match result {
-        Ok(()) => Ok(()),
+        Ok(()) => {
+            if let (PropScope::Test { dir, name: test }, b"WORKING_DIRECTORY") = (scope, name) {
+                let value = project.get_prop(scope, name);
+                if let Some(id) = project.find_test(*dir, test)
+                    && let Some(entry) = project.test_mut(id)
+                {
+                    entry.working_directory = value;
+                }
+            }
+            Ok(())
+        }
         Err(ModelError::ReadOnly) => {
             cx.issue(
                 MessageKind::Error,
@@ -322,31 +365,55 @@ fn update_scoped(
     }
 }
 
-fn source_scope(cx: &mut Cx<'_>, source: &[u8]) -> PropScope {
+fn source_scope(cx: &Cx<'_>, dir: DirId, source: &[u8]) -> PropScope {
     PropScope::Source {
-        dir: cx.current_dir_id(),
-        path: path::from_native(&cx.resolve_path(source)),
+        dir,
+        path: path::from_native(&normalized_path(&cx.resolve_path(source))),
     }
 }
 
+fn install_prop_name(file: &[u8], name: &[u8]) -> BString {
+    // CMake indexes install properties globally by the exact file name.
+    // The frozen model has no install property map.
+    [
+        b"\0INSTALL".as_slice(),
+        &file.len().to_be_bytes(),
+        file,
+        name,
+    ]
+    .concat()
+    .into()
+}
+
 fn set_cache(
-    entry: &mut CacheEntry,
+    cx: &mut Cx<'_>,
+    entry: &[u8],
     name: &[u8],
-    value: Option<&[u8]>,
+    value: Option<BString>,
     update: Update,
 ) -> Result<(), CmdError> {
-    let new = value.unwrap_or_default();
+    let ty = cx.cache().get(entry).map(|entry| entry.ty).ok_or_else(|| {
+        status(quoted(
+            "could not find CACHE variable ",
+            entry,
+            ".  Perhaps it has not yet been created.",
+        ))
+    })?;
     match name {
-        b"VALUE" => entry.value = update.value(&entry.value, new),
-        b"HELPSTRING" => entry.help = update.value(&entry.help, new),
+        b"VALUE" | b"HELPSTRING" | b"STRINGS" => {}
         b"TYPE" => {
-            let value = update.value(entry.ty.as_str().as_bytes(), new);
-            entry.ty = CacheType::parse(&value)
-                .filter(|ty| ty.as_str().as_bytes() == value.as_slice())
-                .ok_or_else(|| status(quoted("given invalid CACHE entry TYPE \"", &value, "\"")))?;
+            let new = value.as_ref().map_or(b"".as_slice(), AsRef::as_ref);
+            let new = update.value(ty.as_str().as_bytes(), new);
+            if !CacheType::parse(&new).is_some_and(|ty| ty.as_str().as_bytes() == new.as_slice()) {
+                return Err(status(quoted(
+                    "given invalid CACHE entry TYPE \"",
+                    &new,
+                    "\"",
+                )));
+            }
         }
         b"ADVANCED" => {
-            if let Some(new) = value
+            if let Some(new) = &value
                 && !truth::is_on(new)
                 && !truth::is_off(new)
             {
@@ -356,13 +423,7 @@ fn set_cache(
                     "\" for CACHE property \"ADVANCED\".",
                 )));
             }
-            update.property(&mut entry.props, name, value.map(BString::from));
-            entry.advanced = entry
-                .props
-                .get(name)
-                .is_some_and(|value| truth::is_on(value));
         }
-        b"STRINGS" => update.property(&mut entry.props, name, value.map(BString::from)),
         _ => {
             return Err(status(quoted(
                 "given invalid CACHE property ",
@@ -371,7 +432,7 @@ fn set_cache(
             )));
         }
     }
-    Ok(())
+    update_scoped(cx, &PropScope::Cache(entry.into()), name, value, update)
 }
 
 #[derive(Clone, Copy)]
@@ -388,6 +449,25 @@ pub(super) fn get(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
     let [out, scope, rest @ ..] = args.as_slice() else {
         return Err(status("called with incorrect number of arguments"));
     };
+    if !matches!(
+        *scope,
+        b"GLOBAL"
+            | b"DIRECTORY"
+            | b"RULE"
+            | b"TARGET"
+            | b"FILE_SET"
+            | b"SOURCE"
+            | b"TEST"
+            | b"VARIABLE"
+            | b"CACHE"
+            | b"INSTALL"
+    ) {
+        return Err(status(quoted(
+            "given invalid scope ",
+            scope,
+            ".  Valid scopes are GLOBAL, DIRECTORY, RULE, TARGET, FILE_SET, SOURCE, TEST, VARIABLE, CACHE, INSTALL.",
+        )));
+    }
     let mut words = rest.splitn(2, |arg| *arg == b"PROPERTY");
     let names = words.next().unwrap_or_default();
     let Some([name, tail @ ..]) = words.next() else {
@@ -403,24 +483,29 @@ pub(super) fn get(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
             other => return Err(status(quoted("given invalid argument \"", other, "\"."))),
         };
     }
-    let source = match (*scope, names) {
-        (b"SOURCE", _) => source_names(cx, names, true)?.first().copied(),
-        _ => None,
-    };
+    let mut object = None;
     match (*scope, names) {
-        (b"GLOBAL" | b"VARIABLE", []) | (b"CACHE", [_]) => {}
-        (b"DIRECTORY", _) => check_directory(cx, names)?,
-        (b"SOURCE", _) | (b"TARGET", [_]) => {}
-        (b"TARGET", []) => return Err(status("not given name for TARGET scope.")),
-        (b"TARGET", [_, extra, ..]) => {
-            return Err(status(quoted("given invalid argument \"", extra, "\".")));
+        (b"GLOBAL" | b"VARIABLE", []) | (b"CACHE" | b"INSTALL" | b"TARGET", [_]) => {}
+        (b"DIRECTORY", _) => {
+            object = Some(PropScope::Directory(check_directory(cx, names)?));
+        }
+        (b"SOURCE", _) => object = source_scopes(cx, names, true)?.pop(),
+        (b"TEST", _) => {
+            let (tests, dir) = test_names(cx, names)?;
+            let test = single_name(scope, tests)?;
+            object = Some(PropScope::Test {
+                dir,
+                name: test.into(),
+            });
         }
         (b"GLOBAL" | b"VARIABLE", _) => {
             return Err(status(quoted("given name for ", scope, " scope.")));
         }
-        (b"CACHE", _) => return Err(status("not given name for CACHE scope.")),
+        (b"TARGET" | b"CACHE" | b"INSTALL", _) => {
+            single_name(scope, names)?;
+        }
         _ => return Err(status(quoted("given invalid scope ", scope, "."))),
-    };
+    }
     let definition_scope: &[u8] = if *scope == b"CACHE" {
         b"CACHED_VARIABLE"
     } else {
@@ -446,30 +531,37 @@ pub(super) fn get(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
         }
         Query::Value | Query::Set => {
             let inherited = definition.is_some_and(|entry| entry.inherited);
-            let value = match *scope {
-                b"GLOBAL" => global_value(cx, name),
-                b"DIRECTORY" => directory_value(cx, name)
-                    .or_else(|| inherited.then(|| global_value(cx, name)).flatten()),
-                b"SOURCE" => source.and_then(|source| source_value(cx, source, name, inherited)),
-                b"TARGET" => {
-                    let [target] = names else {
-                        return Err(status("not given name for TARGET scope."));
-                    };
-                    let scope = PropScope::Target(find_target(cx, target)?);
-                    let project = cx.project();
-                    let value = if inherited {
-                        project.get_prop_inherited(&scope, name)
-                    } else {
-                        project.get_prop(&scope, name)
-                    };
-                    value.or_else(|| inherited.then(|| global_value(cx, name)).flatten())
+            let value = match object {
+                Some(PropScope::Directory(dir)) => directory_value(cx, dir, name, inherited),
+                Some(scope @ PropScope::Source { .. }) => source_value(cx, &scope, name, inherited),
+                Some(scope @ PropScope::Test { .. }) => {
+                    if let PropScope::Test { dir, name: test } = &scope
+                        && cx.project().find_test(*dir, test).is_none()
+                    {
+                        return Err(status(quoted(
+                            "given TEST name that does not exist: ",
+                            test,
+                            "",
+                        )));
+                    }
+                    model_value(cx, &scope, name, inherited)
                 }
-                b"CACHE" => names
-                    .first()
-                    .and_then(|entry| cx.cache().get(entry))
-                    .and_then(|entry| cache_value(entry, name)),
-                b"VARIABLE" => cx.var(name),
-                _ => None,
+                _ => match (*scope, names) {
+                    (b"GLOBAL", _) => global_value(cx, name),
+                    (b"TARGET", [target]) => {
+                        let scope = PropScope::Target(find_target(cx, target)?);
+                        alias_value(cx, target, name)
+                            .or_else(|| model_value(cx, &scope, name, inherited))
+                    }
+                    (b"CACHE", [entry]) => cx
+                        .project()
+                        .get_prop(&PropScope::Cache((*entry).into()), name),
+                    (b"INSTALL", [file]) => cx
+                        .project()
+                        .get_prop(&PropScope::Global, &install_prop_name(file, name)),
+                    (b"VARIABLE", _) => cx.var(name),
+                    _ => None,
+                },
             };
             if matches!(query, Query::Set) {
                 Some(boolean(value.is_some()))
@@ -486,57 +578,108 @@ pub(super) fn get(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
     Ok(Flow::Normal)
 }
 
-fn source_names<'a>(
-    cx: &mut Cx<'_>,
-    names: &[&'a [u8]],
-    query: bool,
-) -> Result<Vec<&'a [u8]>, CmdError> {
-    let mut sources = Vec::new();
-    let mut words = names.iter().copied();
-    while let Some(word) = words.next() {
-        match word {
-            b"DIRECTORY" | b"TARGET_DIRECTORY" => {
-                let value = words.next().ok_or_else(|| {
-                    status(quoted(
-                        "called with incorrect number of arguments no value provided to the ",
-                        word,
-                        " option",
-                    ))
-                })?;
-                if word == b"DIRECTORY" {
-                    if cx.mode() == RunMode::Script || check_directory(cx, &[value]).is_err() {
-                        return Err(status(quoted("given non-existent DIRECTORY ", value, "")));
-                    }
-                } else if find_target(cx, value).is_err() {
-                    return Err(status(quoted(
-                        "given non-existent target for TARGET_DIRECTORY ",
-                        value,
-                        "",
-                    )));
-                }
-            }
-            _ if query && !sources.is_empty() => {
-                return Err(status(quoted("given invalid argument \"", word, "\".")));
-            }
-            _ => sources.push(word),
-        }
+fn single_name<'a>(scope: &[u8], names: &[&'a [u8]]) -> Result<&'a [u8], CmdError> {
+    match names {
+        [name] => Ok(name),
+        [] => Err(status(quoted("not given name for ", scope, " scope."))),
+        [_, extra, ..] => Err(status(quoted("given invalid argument \"", extra, "\"."))),
     }
-    if query && sources.is_empty() {
-        return Err(status("not given name for SOURCE scope."));
-    }
-    Ok(sources)
 }
 
-fn source_value(cx: &mut Cx<'_>, source: &[u8], name: &[u8], inherited: bool) -> Option<BString> {
-    let scope = source_scope(cx, source);
-    let PropScope::Source { path: source, .. } = &scope else {
+fn test_names<'a, 'b>(
+    cx: &mut Cx<'_>,
+    names: &'a [&'b [u8]],
+) -> Result<(&'a [&'b [u8]], DirId), CmdError> {
+    match names {
+        [tests @ .., b"DIRECTORY", directory] => Ok((tests, scoped_test_directory(cx, directory)?)),
+        [.., b"DIRECTORY"] => Err(status(
+            "called with incorrect number of arguments no value provided to the DIRECTORY option",
+        )),
+        _ => Ok((names, cx.current_dir_id())),
+    }
+}
+
+fn source_scopes(
+    cx: &mut Cx<'_>,
+    mut names: &[&[u8]],
+    query: bool,
+) -> Result<Vec<PropScope>, CmdError> {
+    let is_option = |word: &[u8]| matches!(word, b"DIRECTORY" | b"TARGET_DIRECTORY");
+    let section_end = |words: &[&[u8]]| {
+        words
+            .iter()
+            .position(|word| is_option(word))
+            .unwrap_or(words.len())
+    };
+    let (sources, rest) = names.split_at(section_end(names));
+    names = rest;
+    if query {
+        single_name(b"SOURCE", sources)?;
+    }
+    let mut dirs = Vec::new();
+    while let Some((option, rest)) = names.split_first() {
+        let (selected, tail) = rest.split_at(section_end(rest));
+        if selected.is_empty() {
+            return Err(status(quoted(
+                "called with incorrect number of arguments no value provided to the ",
+                option,
+                " option",
+            )));
+        }
+        if query {
+            single_name(option, selected)?;
+        }
+        for name in selected {
+            let dir = source_directory(cx, option, name)?;
+            if !dirs.contains(&dir) {
+                dirs.push(dir);
+            }
+        }
+        names = tail;
+    }
+    if dirs.is_empty() {
+        dirs.push(cx.current_dir_id());
+    }
+    let mut scopes = Vec::new();
+    for dir in dirs {
+        scopes.extend(sources.iter().map(|source| source_scope(cx, dir, source)));
+    }
+    Ok(scopes)
+}
+
+fn source_directory(cx: &mut Cx<'_>, option: &[u8], value: &[u8]) -> Result<DirId, CmdError> {
+    if option == b"DIRECTORY" {
+        if cx.mode() != RunMode::Script
+            && let Some(dir) = find_directory(cx, value)
+        {
+            return Ok(dir);
+        }
+        return Err(status(quoted("given non-existent DIRECTORY ", value, "")));
+    }
+    let target = find_target(cx, value)
+        .ok()
+        .and_then(|id| cx.project().target(id));
+    target.map(|target| target.dir).ok_or_else(|| {
+        status(quoted(
+            "given non-existent target for TARGET_DIRECTORY ",
+            value,
+            "",
+        ))
+    })
+}
+
+fn source_value(
+    cx: &mut Cx<'_>,
+    scope: &PropScope,
+    name: &[u8],
+    inherited: bool,
+) -> Option<BString> {
+    let PropScope::Source { path: source, .. } = scope else {
         return None;
     };
-    let source = source.clone();
-    cx.project().get_prop(&scope, name).or_else(|| match name {
+    model_value(cx, scope, name, inherited).or_else(|| match name {
         b"GENERATED" => Some("0".into()),
-        b"LOCATION" => Some(path::from_native(&normalize(&path::to_native(&source)))),
-        _ if inherited => directory_value(cx, name).or_else(|| global_value(cx, name)),
+        b"LOCATION" => Some(source.clone()),
         _ => None,
     })
 }
@@ -552,33 +695,101 @@ fn find_target(cx: &mut Cx<'_>, target: &[u8]) -> Result<TargetId, CmdError> {
     })
 }
 
-fn check_directory(cx: &Cx<'_>, names: &[&[u8]]) -> Result<(), CmdError> {
+fn writable_target(cx: &mut Cx<'_>, name: &[u8]) -> Result<TargetId, CmdError> {
+    let dir = cx.current_dir_id();
+    if matches!(
+        cx.project().lookup_target(dir, name),
+        Some(TargetBinding::Alias(_))
+    ) {
+        return Err(status("can not be used on an ALIAS target."));
+    }
+    find_target(cx, name)
+}
+
+fn alias_value(cx: &mut Cx<'_>, target: &[u8], name: &[u8]) -> Option<BString> {
+    let dir = cx.current_dir_id();
+    let model = cx.project();
+    let TargetBinding::Alias(id) = model.lookup_target(dir, target)? else {
+        return None;
+    };
+    let target = model.target(id)?;
+    match name {
+        b"ALIASED_TARGET" => Some(target.name.clone()),
+        b"ALIAS_GLOBAL" => Some(if target.is_global() { "TRUE" } else { "FALSE" }.into()),
+        _ => None,
+    }
+}
+
+fn check_directory(cx: &mut Cx<'_>, names: &[&[u8]]) -> Result<DirId, CmdError> {
     match names {
-        [] | [b""] => Ok(()),
-        [name] => {
-            let requested = normalize(&cx.resolve_path(name));
-            let source = normalize(&cx.current_source_dir());
-            let binary = normalize(&cx.current_binary_dir());
-            if requested == source || requested == binary {
-                Ok(())
-            } else {
-                Err(status(DIRECTORY_ERROR))
-            }
-        }
+        [] => Ok(cx.current_dir_id()),
+        [name] => find_directory(cx, name).ok_or_else(|| status(DIRECTORY_ERROR)),
         _ => Err(status("given more than one name for DIRECTORY scope.")),
     }
 }
 
-fn directory_value(cx: &mut Cx<'_>, name: &[u8]) -> Option<BString> {
-    match name {
-        b"VARIABLES" => Some(list::join(cx.variable_names())),
-        b"CACHE_VARIABLES" => Some(cache_names(cx)),
-        b"MACROS" => Some(cx.directory_props().get(name).cloned().unwrap_or_default()),
-        _ => {
-            let dir = PropScope::Directory(cx.current_dir_id());
-            cx.project().get_prop(&dir, name)
-        }
+fn model_value(
+    cx: &mut Cx<'_>,
+    scope: &PropScope,
+    name: &[u8],
+    inherited: bool,
+) -> Option<BString> {
+    if inherited {
+        cx.project().get_prop_inherited(scope, name)
+    } else {
+        cx.project().get_prop(scope, name)
     }
+}
+
+fn directory_value(cx: &mut Cx<'_>, dir: DirId, name: &[u8], inherited: bool) -> Option<BString> {
+    match name {
+        b"VARIABLES" if dir == cx.current_dir_id() => Some(list::join(cx.variable_names())),
+        b"CACHE_VARIABLES" => Some(cache_names(cx)),
+        b"MACROS" => Some(
+            cx.project()
+                .dir(dir)
+                .props
+                .get(name)
+                .cloned()
+                .unwrap_or_default(),
+        ),
+        b"LISTFILE_STACK" => Some(listfile_stack(cx, dir)),
+        _ => model_value(cx, &PropScope::Directory(dir), name, inherited).or_else(|| {
+            UsageField::from_name(name)
+                .filter(|field| field.on_directory())
+                .map(|_| BString::default())
+        }),
+    }
+}
+
+fn listfile_stack(cx: &mut Cx<'_>, dir: DirId) -> BString {
+    let entry = cx.project().dir(dir).listfiles.first().cloned();
+    let backtrace = cx.backtrace();
+    let mut frames: Vec<_> = backtrace.frames().collect();
+    frames.reverse();
+    let mut files = Vec::new();
+    let mut function = false;
+    for frame in frames {
+        if frame.kind == FrameKind::ModuleInclude {
+            if entry
+                .as_ref()
+                .is_some_and(|entry| entry.as_slice() == &*frame.file)
+            {
+                files.clear();
+            }
+            files.push(&*frame.file);
+        } else if function {
+            files.push(&*frame.file);
+        }
+        function = frame
+            .name
+            .as_deref()
+            .is_some_and(|name| cx.user_command_kind(name) == Some(UserCommandKind::Function));
+    }
+    if dir != cx.current_dir_id() {
+        return entry.unwrap_or_default();
+    }
+    list::join(files)
 }
 
 fn global_value(cx: &mut Cx<'_>, name: &[u8]) -> Option<BString> {
@@ -601,20 +812,6 @@ fn global_value(cx: &mut Cx<'_>, name: &[u8]) -> Option<BString> {
     }
 }
 
-fn cache_value(entry: &CacheEntry, name: &[u8]) -> Option<BString> {
-    match name {
-        b"VALUE" => Some(entry.value.clone()),
-        b"TYPE" => Some(entry.ty.as_str().into()),
-        b"HELPSTRING" => Some(entry.help.clone()),
-        b"ADVANCED" => entry
-            .props
-            .get(name)
-            .cloned()
-            .or_else(|| entry.advanced.then(|| "1".into())),
-        _ => entry.props.get(name).cloned(),
-    }
-}
-
 fn cache_names(cx: &mut Cx<'_>) -> BString {
     let mut names: Vec<_> = cx.cache().iter().map(|(name, _)| name).collect();
     names.sort();
@@ -629,9 +826,12 @@ pub(super) fn get_cmake(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
     let [out, name, ..] = args else {
         return Err(status("called with incorrect number of arguments"));
     };
+    let dir = cx.current_dir_id();
     let value = match name.value.as_slice() {
         b"COMMANDS" => Some(list::join(cx.registered_command_names())),
-        b"VARIABLES" | b"MACROS" | b"CACHE_VARIABLES" => directory_value(cx, &name.value),
+        b"VARIABLES" | b"MACROS" | b"CACHE_VARIABLES" => {
+            directory_value(cx, dir, &name.value, false)
+        }
         b"COMPONENTS" => Some(
             cx.global()
                 .props
