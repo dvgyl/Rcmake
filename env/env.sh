@@ -6,8 +6,13 @@
 _RCMAKE_ENV_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 export RCMAKE_ROOT="$(cd "$_RCMAKE_ENV_DIR/.." && pwd)"
 
-# Ensure Rust and Homebrew toolchains are on PATH
-export PATH="$HOME/.cargo/bin:/opt/homebrew/bin:$PATH"
+# Ensure Rust, Homebrew, and pinned local tools (ninja) are on PATH
+_RCMAKE_LOCAL_BIN="$RCMAKE_ROOT/env/oracle/bin"
+if [[ ! -d "$_RCMAKE_LOCAL_BIN" && -d "$RCMAKE_ROOT/env/oracle/bin" ]]; then
+  _RCMAKE_LOCAL_BIN="$RCMAKE_ROOT/env/oracle/bin"
+fi
+export PATH="$_RCMAKE_LOCAL_BIN:$HOME/.cargo/bin:/opt/homebrew/bin:$PATH"
+unset _RCMAKE_LOCAL_BIN
 
 # 16 GB RAM macOS arm64 concurrency caps (AGENTS.md)
 export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-2}"
