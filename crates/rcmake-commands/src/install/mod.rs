@@ -11,7 +11,10 @@ use rcmake_expr::ExpandedArg;
 use rcmake_host::path::{from_native, to_native};
 use rcmake_model::{
     BT, ExportSet, InstallKind, InstallOptions, InstallRule, TargetBinding, TargetId, TargetKind,
+    UsageScope,
 };
+
+mod metadata;
 
 type Result<T> = std::result::Result<T, CmdError>;
 type Args<'a> = Peekable<std::iter::Copied<std::slice::Iter<'a, &'a [u8]>>>;
@@ -191,6 +194,7 @@ fn install(cx: &mut Cx<'_>, input: &[ExpandedArg]) -> CmdResult {
         b"FILES" | b"PROGRAMS" | b"DIRECTORY" => paths(cx, signature, &mut args, &mut options)?,
         b"CODE" | b"SCRIPT" => script(cx, signature, &mut args, &mut options)?,
         b"EXPORT" => install_export(cx, &mut args, &mut options)?,
+        b"PACKAGE_INFO" | b"SBOM" => metadata::install(cx, signature, rest, &mut options)?,
         _ => {
             return Err(fail(
                 [b"does not recognize sub-command ", *signature].concat(),
@@ -201,6 +205,13 @@ fn install(cx: &mut Cx<'_>, input: &[ExpandedArg]) -> CmdResult {
         || matches!(&kind, InstallKind::Files(files) | InstallKind::Programs(files) if files.is_empty())
     {
         return Ok(Flow::Normal);
+    }
+    if options
+        .component
+        .as_ref()
+        .is_none_or(|name| name.is_empty())
+    {
+        options.component = Some(default_component(cx));
     }
     for path in options.destination.iter().chain(extra_destinations.iter()) {
         if Lexical::new(path).absolute() {
@@ -249,6 +260,12 @@ fn install(cx: &mut Cx<'_>, input: &[ExpandedArg]) -> CmdResult {
     Ok(Flow::Normal)
 }
 
+fn default_component(cx: &mut Cx<'_>) -> BString {
+    cx.var(b"CMAKE_INSTALL_DEFAULT_COMPONENT_NAME")
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "Unspecified".into())
+}
+
 fn targets(
     cx: &mut Cx<'_>,
     args: &mut Args<'_>,
@@ -260,6 +277,7 @@ fn targets(
     let mut artifact_options = InstallOptions::default();
     let mut group: Option<&[u8]> = None;
     let mut namelink = None;
+    let mut file_sets = Vec::new();
     while let Some(key) = args.next() {
         match key {
             b"EXPORT" if group.is_none() => export = Some(value(args, key)?.into()),
@@ -297,7 +315,12 @@ fn targets(
                 group = Some(key);
                 namelink = None;
                 if key == b"FILE_SET" {
-                    value(args, key)?;
+                    let name = args
+                        .next_if(|token| !token.is_empty() && !keyword(token))
+                        .ok_or_else(|| {
+                            fail("TARGETS given FILE_SET option without file set name.")
+                        })?;
+                    file_sets.push(name);
                 }
             }
             _ => {
@@ -313,7 +336,38 @@ fn targets(
         }
     }
     destinations.extend(artifact_options.destination);
+    if export.is_some() {
+        require_exported_file_sets(cx, &targets, &file_sets)?;
+    }
     Ok(InstallKind::Targets { targets, export })
+}
+
+fn require_exported_file_sets(
+    cx: &mut Cx<'_>,
+    targets: &[TargetId],
+    file_sets: &[&[u8]],
+) -> Result<()> {
+    let project = cx.project();
+    for target in targets.iter().filter_map(|id| project.target(*id)) {
+        if target
+            .file_sets
+            .iter()
+            .filter_map(|id| project.file_set(*id))
+            .any(|set| {
+                set.scope != UsageScope::Private && !file_sets.contains(&set.name.as_slice())
+            })
+        {
+            return Err(fail(
+                [
+                    b"TARGETS target ",
+                    target.name.as_slice(),
+                    b" is exported but not all of its interface file sets are installed",
+                ]
+                .concat(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn paths(
@@ -523,6 +577,10 @@ fn export(cx: &mut Cx<'_>, input: &[ExpandedArg]) -> CmdResult {
     let [signature, rest @ ..] = input.as_slice() else {
         return Err(fail("called with no arguments."));
     };
+    if matches!(*signature, b"PACKAGE_INFO" | b"SBOM") {
+        metadata::export(cx, signature, rest)?;
+        return Ok(Flow::Normal);
+    }
     if *signature == b"PACKAGE" {
         let [name] = rest else {
             return Err(fail("PACKAGE requires one package name."));
