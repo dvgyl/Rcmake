@@ -15,7 +15,7 @@ use super::shell::direct;
 use super::{compute_artifacts, join, linker_language};
 use crate::{
     ArtifactSet, BuildGraph, BuildStep, CustomStep, GraphTarget, LinkKind, LinkStep, ResolveError,
-    ResolvedTarget,
+    ResolvedTarget, sources::TargetInputs,
 };
 
 /// Lower resolved targets for one configuration.
@@ -25,6 +25,15 @@ pub fn lower(
     model: &ProjectModel,
     targets: &[ResolvedTarget],
     config: &ConfigId,
+) -> Result<BuildGraph, ResolveError> {
+    lower_with_inputs(model, targets, config, &IndexMap::new())
+}
+
+pub(crate) fn lower_with_inputs(
+    model: &ProjectModel,
+    targets: &[ResolvedTarget],
+    config: &ConfigId,
+    inputs: &IndexMap<TargetId, TargetInputs>,
 ) -> Result<BuildGraph, ResolveError> {
     let resolved: IndexMap<_, _> = targets
         .iter()
@@ -58,16 +67,23 @@ pub fn lower(
         );
         let mut steps = IndexSet::new();
         let dir = model.dir(target.dir);
-        let paths = resolved
-            .compile_units
-            .iter()
-            .map(|unit| unit.source.value.clone())
-            .chain(
-                target
-                    .sources
+        let target_inputs = inputs.get(&resolved.id);
+        let paths = if let Some(inputs) = target_inputs {
+            Box::new(inputs.sources.iter().cloned()) as Box<dyn Iterator<Item = BString>>
+        } else {
+            Box::new(
+                resolved
+                    .compile_units
                     .iter()
-                    .flat_map(|source| list::split(&source.value, list::Empty::Drop)),
-            );
+                    .map(|unit| unit.source.value.clone())
+                    .chain(
+                        target
+                            .sources
+                            .iter()
+                            .flat_map(|source| list::split(&source.value, list::Empty::Drop)),
+                    ),
+            )
+        };
         for path in paths {
             for base in [&dir.source_dir, &dir.binary_dir] {
                 if let Some(&step) = commands.outputs.get(&command_path(model, base, &path)) {
@@ -77,7 +93,10 @@ pub fn lower(
         }
 
         let artifacts = artifacts(model, target, resolved);
-        let mut objects = Vec::new();
+        let mut objects = target_inputs
+            .into_iter()
+            .flat_map(|inputs| inputs.objects.iter().cloned())
+            .collect::<Vec<_>>();
         for unit in &resolved.compile_units {
             let Some(group) = resolved.compile_groups.get(unit.group) else {
                 return Err(ResolveError::Message(

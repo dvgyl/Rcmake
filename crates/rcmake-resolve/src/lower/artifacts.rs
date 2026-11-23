@@ -201,7 +201,7 @@ fn object_dir(model: &ProjectModel, target: &Target, config: &ConfigId) -> BStri
     }
 }
 
-pub(super) fn build_relative(model: &ProjectModel, path: &[u8]) -> BString {
+pub(crate) fn build_relative(model: &ProjectModel, path: &[u8]) -> BString {
     let root = &model.dir(DirId::ROOT).binary_dir;
     let path = Lexical::new(path).normalize();
     let root = Lexical::new(root).normalize();
@@ -246,15 +246,41 @@ pub fn source_language(model: &ProjectModel, target: &Target, source: &[u8]) -> 
         return Some(language.clone());
     }
     let (_, extension) = Lexical::new(source).stem_extension(true);
-    let language = match extension {
-        b".c" => "C",
-        b".cc" | b".cpp" | b".cxx" | b".c++" | b".C" | b".CPP" => "CXX",
-        b".m" => "OBJC",
-        b".mm" => "OBJCXX",
-        b".s" | b".S" | b".asm" => "ASM",
-        _ => return None,
-    };
-    Some(language.into())
+    ["C", "CXX", "OBJC", "OBJCXX", "ASM", "Fortran", "CUDA"]
+        .into_iter()
+        .find(|language| source_extension(model, target, language, extension))
+        .map(BString::from)
+}
+
+fn source_extension(
+    model: &ProjectModel,
+    target: &Target,
+    language: &str,
+    extension: &[u8],
+) -> bool {
+    let extension = extension.strip_prefix(b".").unwrap_or(extension);
+    if let Some(values) = definition(
+        model,
+        target.dir,
+        format!("CMAKE_{language}_SOURCE_FILE_EXTENSIONS").as_bytes(),
+    ) {
+        return list::split(values, list::Empty::Drop)
+            .iter()
+            .any(|value| value == extension);
+    }
+    match language {
+        "C" => extension == b"c",
+        "CXX" => matches!(
+            extension,
+            b"C" | b"cc" | b"cpp" | b"CPP" | b"cxx" | b"c++" | b"ixx" | b"cppm"
+        ),
+        "OBJC" => extension == b"m",
+        "OBJCXX" => extension == b"mm",
+        "ASM" => matches!(extension, b"s" | b"S" | b"asm"),
+        "Fortran" => matches!(extension, b"f" | b"F" | b"f90" | b"F90"),
+        "CUDA" => extension == b"cu",
+        _ => false,
+    }
 }
 
 /// Return the build path of a source's object file.

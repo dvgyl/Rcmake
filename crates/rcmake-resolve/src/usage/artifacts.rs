@@ -1,8 +1,10 @@
-use rcmake_base::{BString, list, path_lex::Lexical, truth};
+use indexmap::IndexSet;
+use rcmake_base::{BString, list, path_lex::Lexical};
 use rcmake_genex::{ArtifactKind, ArtifactPart, ConfigId, EvalContext};
-use rcmake_model::{BT, Target, TargetId, TargetKind};
+use rcmake_model::{BT, DirId, Target, TargetId, TargetKind};
 
 use super::{UsageResolver, handle, host::definition, on};
+use crate::{absolute_path, lower, sources::external_object};
 
 struct Artifact {
     path: BString,
@@ -358,97 +360,49 @@ impl UsageResolver<'_> {
             return Some(value.clone());
         }
         let dir = self.model.dir(target.dir);
-        let objects = self.object_directory(id, config)?;
         let ctx = EvalContext {
             config: config.clone(),
             head: Some(handle(id)),
             ..Default::default()
         };
-        let value = Self::new(self.model)
-            .collect_property(id, b"SOURCES", &ctx)
-            .ok()?;
-        let source_filter = sources.map(|values| list::split(values, list::Empty::Drop));
-        let mut files = Vec::new();
-        for entry in value.entries {
-            let source = Lexical::new(&dir.source_dir).append(&entry.value);
-            if let Some(filter) = &source_filter
-                && !filter
-                    .iter()
-                    .any(|entry| Lexical::new(&dir.source_dir).append(entry) == source)
-            {
-                continue;
-            }
-            let scope = rcmake_model::PropScope::Source {
-                dir: target.dir,
-                path: source.clone(),
-            };
-            if [b"HEADER_FILE_ONLY".as_slice(), b"EXTERNAL_OBJECT"]
-                .iter()
-                .any(|name| {
-                    self.model
-                        .get_prop(&scope, name)
-                        .is_some_and(|value| truth::is_on(&value))
-                })
-            {
-                continue;
-            }
-            let (_, extension) = Lexical::new(&source).stem_extension(true);
-            let language = self.model.get_prop(&scope, b"LANGUAGE").or_else(|| {
-                ["C", "CXX", "OBJC", "OBJCXX", "ASM", "Fortran", "CUDA"]
-                    .into_iter()
-                    .find(|language| source_extension(self.model, target, language, extension))
-                    .map(BString::from)
-            });
-            let Some(language) = language else { continue };
-            let relative = [dir.source_dir.as_slice(), dir.binary_dir.as_slice()]
-                .iter()
-                .find_map(|base| {
-                    source
-                        .strip_prefix(*base)
-                        .and_then(|tail| tail.strip_prefix(b"/"))
-                })
-                .unwrap_or_else(|| source.strip_prefix(b"/").unwrap_or(&source));
-            let extension = definition(
-                self.model,
-                target.dir,
-                format!("CMAKE_{language}_OUTPUT_EXTENSION").as_bytes(),
-            )
-            .unwrap_or_else(|| ".o".into());
-            let relative: BString = [relative, extension.as_slice()].concat().into();
-            files.push(Lexical::new(&objects).append(&relative));
-        }
+        // Keep the active property chain when TARGET_OBJECTS queries another target.
+        let mut resolver = Self {
+            source_paths: self.source_paths,
+            active: self.active.clone(),
+            ..Self::new(self.model)
+        };
+        let value = resolver.collect_property(id, b"SOURCES", &ctx).ok()?;
+        let path = |entry: &[u8]| {
+            self.source_paths
+                .and_then(|paths| paths.find(dir, entry))
+                .unwrap_or_else(|| absolute_path(&dir.source_dir, entry))
+        };
+        let source_filter = sources.map(|values| {
+            list::split(values, list::Empty::Drop)
+                .into_iter()
+                .map(|source| path(&source))
+                .collect::<IndexSet<_>>()
+        });
+        let binary_root = &self.model.dir(DirId::ROOT).binary_dir;
+        let files = value
+            .entries
+            .into_iter()
+            .map(|entry| path(&entry.value))
+            .filter(|source| {
+                source_filter
+                    .as_ref()
+                    .is_none_or(|filter| filter.contains(source))
+            })
+            .filter(|source| {
+                !external_object(dir, source)
+                    && lower::source_language(self.model, target, source).is_some()
+            })
+            .map(|source| {
+                let object = lower::object_path(self.model, target, config, &source);
+                absolute_path(binary_root, &object)
+            })
+            .collect::<IndexSet<_>>();
         Some(list::join(files))
-    }
-}
-
-fn source_extension(
-    model: &rcmake_model::ProjectModel,
-    target: &Target,
-    language: &str,
-    extension: &[u8],
-) -> bool {
-    let extension = extension.strip_prefix(b".").unwrap_or(extension);
-    if let Some(values) = definition(
-        model,
-        target.dir,
-        format!("CMAKE_{language}_SOURCE_FILE_EXTENSIONS").as_bytes(),
-    ) {
-        return list::split(&values, list::Empty::Drop)
-            .iter()
-            .any(|value| value == extension);
-    }
-    match language {
-        "C" => extension == b"c",
-        "CXX" => matches!(
-            extension,
-            b"C" | b"cc" | b"cpp" | b"cxx" | b"c++" | b"ixx" | b"cppm"
-        ),
-        "OBJC" => extension == b"m",
-        "OBJCXX" => extension == b"mm",
-        "ASM" => matches!(extension, b"s" | b"S" | b"asm"),
-        "Fortran" => matches!(extension, b"f" | b"F" | b"f90" | b"F90"),
-        "CUDA" => extension == b"cu",
-        _ => false,
     }
 }
 

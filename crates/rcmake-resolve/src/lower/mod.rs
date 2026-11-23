@@ -13,8 +13,10 @@ mod tests;
 use rcmake_base::{BString, path_lex::Lexical};
 use rcmake_model::{DirId, ProjectModel, Target};
 
+pub(crate) use artifacts::build_relative;
 pub use artifacts::{compute_artifacts, linker_language, object_path, source_language};
 pub use graph::lower;
+pub(crate) use graph::lower_with_inputs;
 pub use install::{collect_metadata, lower_install_manifest};
 
 pub(crate) fn definition<'a>(

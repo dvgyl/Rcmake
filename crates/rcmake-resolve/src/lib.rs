@@ -16,14 +16,17 @@
 use indexmap::{IndexMap, IndexSet, map::Entry};
 use rcmake_base::{BString, list, path_lex::Lexical, truth};
 use rcmake_diag::Backtrace;
-use rcmake_genex::{ConfigId, EvalContext, GenexHost, GenexNode, PreprocessMode, TargetHandle};
-use rcmake_host::{FileKind, Follow, Host, path::to_native};
+use rcmake_genex::{ConfigId, EvalContext, GenexNode, PreprocessMode, TargetHandle};
+use rcmake_host::{Host, path::to_native};
 use rcmake_model::{
-    BT, DirId, Directory, ExportSet, InstallKind, InstallRule, ProjectModel, Target, TargetId,
-    TargetKind, UsageField,
+    BT, DirId, ExportSet, InstallKind, InstallRule, ProjectModel, Target, TargetId, TargetKind,
+    UsageField,
 };
 
+use sources::{SourcePaths, TargetInputs, external_object};
 use usage::{ResolvedLinkItem, ResolvedLinkKind, UsageResolver};
+
+mod sources;
 
 pub mod lower;
 pub mod usage;
@@ -418,41 +421,43 @@ pub fn resolve(
     } else {
         configs.to_vec()
     };
-    let mut usage = UsageResolver::new(model);
-    let ids: Vec<_> = model.targets().map(|(id, _)| id).collect();
+    let mut paths = SourcePaths::new(model, host);
     let mut targets = Vec::new();
     let mut graphs = Vec::with_capacity(configs.len());
     for config in &configs {
+        paths.index_objects(model, config);
+        let mut usage = UsageResolver::with_source_paths(model, &paths);
         let ctx = EvalContext {
             config: config.clone(),
             ..EvalContext::default()
         };
-        let mut resolved: IndexMap<_, _> = model
-            .targets()
-            .filter(|(_, target)| !target.is_imported())
-            .map(|(id, target)| {
-                Ok((
-                    id,
-                    resolve_target(model, host, &mut usage, id, target, &ctx)?,
-                ))
-            })
-            .collect::<Result<_, ResolveError>>()?;
+        let mut resolved = IndexMap::new();
+        let mut inputs = IndexMap::new();
+        for (id, target) in model.targets().filter(|(_, target)| !target.is_imported()) {
+            let (facts, target_inputs) =
+                resolve_target(model, &paths, &mut usage, id, target, &ctx)?;
+            resolved.insert(id, facts);
+            inputs.insert(id, target_inputs);
+        }
         let links = model
             .targets()
             .filter(|(_, target)| !target.is_imported())
-            .map(|(id, target)| resolve_link(model, &mut usage, &ids, &resolved, id, target, &ctx))
+            .map(|(id, target)| {
+                resolve_link(model, &mut usage, &paths, &resolved, id, target, &ctx)
+            })
             .collect::<Result<Vec<_>, _>>()?;
-        for (target, (link, dependencies)) in resolved.values_mut().zip(links) {
-            target.link = link;
-            target.dependencies = dependencies;
+        for ((target, inputs), link) in resolved.values_mut().zip(inputs.values_mut()).zip(links) {
+            target.link = link.step;
+            target.dependencies = link.dependencies;
+            inputs.objects.extend(link.objects);
         }
         let resolved = resolved.into_values().collect::<Vec<_>>();
-        graphs.push(lower::lower(model, &resolved, config)?);
+        graphs.push(lower::lower_with_inputs(model, &resolved, config, &inputs)?);
         targets.extend(resolved);
     }
 
     let install = lower::lower_install_manifest(model, &targets);
-    let exports = resolve_exports(model, &mut usage, &targets, &install)?;
+    let exports = resolve_exports(model, &mut UsageResolver::new(model), &targets, &install)?;
     Ok(GenerationResult {
         configs,
         targets,
@@ -465,12 +470,12 @@ pub fn resolve(
 
 fn resolve_target(
     model: &ProjectModel,
-    host: &dyn Host,
+    paths: &SourcePaths<'_>,
     usage: &mut UsageResolver<'_>,
     id: TargetId,
     target: &Target,
     ctx: &EvalContext,
-) -> Result<ResolvedTarget, ResolveError> {
+) -> Result<(ResolvedTarget, TargetInputs), ResolveError> {
     let dir = model.dir(target.dir);
     let metadata = TargetMetadata {
         name: target.name.clone(),
@@ -494,17 +499,26 @@ fn resolve_target(
     };
 
     let export_symbol = export_symbol(target);
-    let mut seen = IndexSet::new();
+    let mut dependencies = IndexSet::new();
+    let mut inputs = TargetInputs::default();
     let mut groups = IndexMap::new();
     for mut source in usage.collect_property(id, b"SOURCES", ctx)?.entries {
-        source.value = source_path(host, dir, &source.value)?;
-        if !seen.insert(source.value.clone())
-            || matches!(
-                target.kind,
-                TargetKind::Utility | TargetKind::GlobalTarget | TargetKind::InterfaceLibrary
-            )
-            || source_flag(dir, &source.value, b"EXTERNAL_OBJECT")
-        {
+        source.value = paths.resolve(dir, &source.value)?;
+        if !inputs.sources.insert(source.value.clone()) {
+            continue;
+        }
+        let owner = paths.object_owner(&source.value);
+        dependencies.extend(owner);
+        if matches!(
+            target.kind,
+            TargetKind::Utility | TargetKind::GlobalTarget | TargetKind::InterfaceLibrary
+        ) {
+            continue;
+        }
+        if owner.is_some() || external_object(dir, &source.value) {
+            inputs
+                .objects
+                .insert(lower::build_relative(model, &source.value));
             continue;
         }
         let Some(language) = lower::source_language(model, target, &source.value) else {
@@ -548,7 +562,8 @@ fn resolve_target(
         });
     }
     resolved.compile_groups = groups.into_values().collect();
-    Ok(resolved)
+    resolved.dependencies = dependencies.into_iter().collect();
+    Ok((resolved, inputs))
 }
 
 fn export_symbol(target: &Target) -> Option<BString> {
@@ -591,37 +606,6 @@ fn excluded(model: &ProjectModel, target: &Target) -> bool {
     false
 }
 
-fn source_flag(dir: &Directory, source: &BString, property: &[u8]) -> bool {
-    dir.source_props
-        .get(source)
-        .and_then(|props| props.get(property))
-        .is_some_and(|value| truth::is_on(value))
-}
-
-fn source_path(host: &dyn Host, dir: &Directory, source: &[u8]) -> Result<BString, ResolveError> {
-    let source_path = absolute_path(&dir.source_dir, source);
-    let binary_path = absolute_path(&dir.binary_dir, source);
-    for path in [&source_path, &binary_path] {
-        if source_flag(dir, path, b"GENERATED") {
-            return Ok(path.clone());
-        }
-    }
-    for path in [&source_path, &binary_path] {
-        if host
-            .metadata(&to_native(path), Follow::Yes)
-            .is_ok_and(|metadata| metadata.kind == FileKind::File)
-        {
-            return Ok(path.clone());
-        }
-        if source_path == binary_path {
-            break;
-        }
-    }
-    Err(ResolveError::Message(
-        [b"Cannot find source file:\n\n  ", source].concat().into(),
-    ))
-}
-
 fn absolute_path(base: &[u8], path: &[u8]) -> BString {
     Lexical::new(&Lexical::new(base).append(path)).normalize()
 }
@@ -634,52 +618,94 @@ fn build_path(model: &ProjectModel, path: &[u8]) -> BString {
         .map_or_else(|_| path.into(), rcmake_host::path::from_native)
 }
 
+#[derive(Default)]
+struct ResolvedLink {
+    step: Option<LinkStep>,
+    dependencies: Vec<TargetId>,
+    objects: IndexSet<BString>,
+}
+
 fn resolve_link(
     model: &ProjectModel,
     usage: &mut UsageResolver<'_>,
-    ids: &[TargetId],
+    paths: &SourcePaths<'_>,
     resolved: &IndexMap<TargetId, ResolvedTarget>,
     id: TargetId,
     target: &Target,
     ctx: &EvalContext,
-) -> Result<(Option<LinkStep>, Vec<TargetId>), ResolveError> {
-    let facts = &resolved[&id];
-    let language = lower::linker_language(
-        model,
-        target,
-        facts
-            .compile_groups
-            .iter()
-            .map(|group| group.language.as_slice()),
-    );
-    let ctx = EvalContext {
-        link_language: language.clone(),
+) -> Result<ResolvedLink, ResolveError> {
+    let facts = resolved
+        .get(&id)
+        .ok_or_else(|| ResolveError::Message("Missing resolved target.".into()))?;
+    let languages = std::iter::once(facts)
+        .chain(facts.dependencies.iter().filter_map(|id| resolved.get(id)))
+        .flat_map(|facts| {
+            facts
+                .compile_groups
+                .iter()
+                .map(|group| group.language.as_slice())
+        });
+    let mut ctx = EvalContext {
+        link_language: lower::linker_language(model, target, languages.clone()),
         ..ctx.clone()
     };
-    let closure = usage
-        .host(target.dir)
-        .link_closure(TargetHandle(id.index() as u32), &ctx)?;
-    let dependencies = target
-        .utility_deps
-        .iter()
-        .filter_map(|dep| model.find_target(target.dir, &dep.value))
-        .chain(
-            closure
-                .iter()
-                .filter_map(|handle| ids.get(handle.0 as usize).copied()),
-        )
-        .filter(|dep| *dep != id && resolved.contains_key(dep))
-        .collect::<IndexSet<_>>()
-        .into_iter()
-        .collect();
     let kind = match target.kind {
-        TargetKind::Executable => LinkKind::Executable,
-        TargetKind::StaticLibrary => LinkKind::StaticArchive,
-        TargetKind::SharedLibrary => LinkKind::SharedLibrary,
-        TargetKind::ModuleLibrary => LinkKind::ModuleLibrary,
-        _ => return Ok((None, dependencies)),
+        TargetKind::Executable => Some(LinkKind::Executable),
+        TargetKind::StaticLibrary => Some(LinkKind::StaticArchive),
+        TargetKind::SharedLibrary => Some(LinkKind::SharedLibrary),
+        TargetKind::ModuleLibrary => Some(LinkKind::ModuleLibrary),
+        _ => None,
     };
-    let language = language.ok_or_else(|| {
+    let mut items = Vec::new();
+    if kind.is_some() {
+        items = usage.collect_link_items(id, &ctx)?;
+        let language_for = |items: &[ResolvedLinkItem]| {
+            let linked_languages = link_items(items)
+                .filter_map(|item| match item.kind {
+                    ResolvedLinkKind::Objects(id) => resolved.get(&id),
+                    _ => None,
+                })
+                .flat_map(|facts| {
+                    facts
+                        .compile_groups
+                        .iter()
+                        .map(|group| group.language.as_slice())
+                });
+            lower::linker_language(model, target, languages.clone().chain(linked_languages))
+        };
+        let language = language_for(&items);
+        if language != ctx.link_language {
+            ctx.link_language = language;
+            items = usage.collect_link_items(id, &ctx)?;
+            if language_for(&items) != ctx.link_language {
+                return Err(ResolveError::Message(
+                    format!(
+                        "The link language changed during link resolution for target {}.",
+                        target.name
+                    )
+                    .into(),
+                ));
+            }
+        }
+    }
+    let mut link = ResolvedLink {
+        dependencies: target
+            .utility_deps
+            .iter()
+            .filter_map(|dep| model.find_target(target.dir, &dep.value))
+            .chain(usage.link_targets(id, &ctx)?)
+            .chain(facts.dependencies.iter().copied())
+            .chain(link_items(&items).filter_map(|item| paths.object_owner(&item.text.value)))
+            .filter(|dep| *dep != id && resolved.contains_key(dep))
+            .collect::<IndexSet<_>>()
+            .into_iter()
+            .collect(),
+        ..ResolvedLink::default()
+    };
+    let Some(kind) = kind else {
+        return Ok(link);
+    };
+    let language = ctx.link_language.clone().ok_or_else(|| {
         ResolveError::Message(
             [
                 b"Cannot determine link language for target ",
@@ -708,23 +734,39 @@ fn resolve_link(
             LinkFragmentRole::LibraryPath,
         ));
     }
-    for item in &usage.collect_link_items(id, &ctx)? {
+    for item in &items {
         append_link_item(model, resolved, &ctx.config, item, &mut fragments);
+    }
+    for item in link_items(&items) {
+        if let ResolvedLinkKind::Objects(id) = item.kind {
+            if let Some(facts) = resolved.get(&id) {
+                link.objects
+                    .extend(facts.compile_units.iter().map(|unit| unit.object.clone()));
+            } else if let Some(objects) = usage.target_objects(id, &ctx.config, None) {
+                link.objects
+                    .extend(list::split(&objects, list::Empty::Drop));
+            }
+        }
     }
     let output = facts
         .artifacts
         .file
         .as_ref()
         .map_or_else(BString::default, |path| build_path(model, path));
-    Ok((
-        Some(LinkStep {
-            kind,
-            language,
-            fragments,
-            output,
-        }),
-        dependencies,
-    ))
+    link.step = Some(LinkStep {
+        kind,
+        language,
+        fragments,
+        output,
+    });
+    Ok(link)
+}
+
+fn link_items(items: &[ResolvedLinkItem]) -> impl Iterator<Item = &ResolvedLinkItem> {
+    items.iter().flat_map(|item| match &item.kind {
+        ResolvedLinkKind::Group { members, .. } => members.as_slice(),
+        _ => std::slice::from_ref(item),
+    })
 }
 
 fn append_link_item(
@@ -736,58 +778,34 @@ fn append_link_item(
 ) {
     use LinkFragmentRole::Libraries;
     let value = item.text.value.as_slice();
-    let (text, role) =
-        match &item.kind {
-            ResolvedLinkKind::Library(id) => {
-                let Some(raw) = model.target(*id) else { return };
-                let artifacts = resolved.get(id).map_or_else(
-                    || lower::compute_artifacts(model, raw, config),
-                    |target| target.artifacts.clone(),
-                );
-                let path = artifacts.linker_file.or(artifacts.file);
-                if let Some(path) = path {
-                    append_library_path(&path, &item.text, fragments);
-                    return;
-                }
-                (raw_library(value), Libraries)
-            }
-            ResolvedLinkKind::Objects(id) => {
-                if let Some(target) = resolved.get(id) {
-                    fragments.extend(target.compile_units.iter().map(|unit| {
-                        link_fragment(shell_quote(&unit.object), &item.text, Libraries)
-                    }));
-                } else if let Some(target) = model.target(*id) {
-                    let key = [
-                        b"IMPORTED_OBJECTS_",
-                        config.0.to_ascii_uppercase().as_slice(),
-                    ]
-                    .concat();
-                    if let Some(objects) = target
-                        .props
-                        .get(&key)
-                        .or_else(|| target.props.get(b"IMPORTED_OBJECTS"))
-                    {
-                        fragments.extend(list::split(objects, list::Empty::Drop).into_iter().map(
-                            |object| link_fragment(shell_quote(&object), &item.text, Libraries),
-                        ));
-                    }
-                }
+    let (text, role) = match &item.kind {
+        ResolvedLinkKind::Library(id) => {
+            let Some(raw) = model.target(*id) else { return };
+            let artifacts = resolved.get(id).map_or_else(
+                || lower::compute_artifacts(model, raw, config),
+                |target| target.artifacts.clone(),
+            );
+            let path = artifacts.linker_file.or(artifacts.file);
+            if let Some(path) = path {
+                append_library_path(&path, &item.text, fragments);
                 return;
             }
-            ResolvedLinkKind::Interface(_) => return,
-            ResolvedLinkKind::Group { members, .. } => {
-                for member in members {
-                    append_link_item(model, resolved, config, member, fragments);
-                }
-                return;
+            (raw_library(value), Libraries)
+        }
+        ResolvedLinkKind::Objects(_) | ResolvedLinkKind::Interface(_) => return,
+        ResolvedLinkKind::Group { members, .. } => {
+            for member in members {
+                append_link_item(model, resolved, config, member, fragments);
             }
-            ResolvedLinkKind::ObjectFile => (shell_quote(value), Libraries),
-            ResolvedLinkKind::Raw if value.contains(&b'/') && !value.starts_with(b"-") => {
-                append_library_path(value, &item.text, fragments);
-                return;
-            }
-            ResolvedLinkKind::Raw => (raw_library(value), Libraries),
-        };
+            return;
+        }
+        ResolvedLinkKind::ObjectFile => (shell_quote(value), Libraries),
+        ResolvedLinkKind::Raw if value.contains(&b'/') && !value.starts_with(b"-") => {
+            append_library_path(value, &item.text, fragments);
+            return;
+        }
+        ResolvedLinkKind::Raw => (raw_library(value), Libraries),
+    };
     fragments.push(link_fragment(text, &item.text, role));
 }
 

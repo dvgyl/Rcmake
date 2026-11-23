@@ -139,7 +139,7 @@ impl UsageResolver<'_> {
         Ok(objects.into_iter().chain(libraries).collect())
     }
 
-    pub(super) fn link_targets(
+    pub(crate) fn link_targets(
         &mut self,
         target: TargetId,
         ctx: &EvalContext,

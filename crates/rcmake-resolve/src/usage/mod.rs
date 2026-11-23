@@ -13,7 +13,7 @@ use rcmake_genex::{
 };
 use rcmake_model::{BT, DirId, ProjectModel, Target, TargetId, UsageField};
 
-use crate::InterfaceInclude;
+use crate::{InterfaceInclude, sources::SourcePaths};
 
 mod artifacts;
 mod host;
@@ -73,6 +73,7 @@ const MAX_WALK_DEPTH: usize = 128;
 /// Evaluate usage requirements against one immutable project model.
 pub struct UsageResolver<'a> {
     model: &'a ProjectModel,
+    source_paths: Option<&'a SourcePaths<'a>>,
     ids: Vec<TargetId>,
     memo: HashMap<MemoKey, WalkValue>,
     active: Vec<(TargetId, BString)>,
@@ -86,6 +87,7 @@ impl<'a> UsageResolver<'a> {
     pub fn new(model: &'a ProjectModel) -> Self {
         Self {
             model,
+            source_paths: None,
             ids: model.targets().map(|(id, _)| id).collect(),
             memo: HashMap::new(),
             active: Vec::new(),
@@ -94,6 +96,13 @@ impl<'a> UsageResolver<'a> {
                 target.props.get(link::DIRECT).is_some()
                     || target.props.get(link::EXCLUDE).is_some()
             }),
+        }
+    }
+
+    pub(crate) fn with_source_paths(model: &'a ProjectModel, paths: &'a SourcePaths<'a>) -> Self {
+        Self {
+            source_paths: Some(paths),
+            ..Self::new(model)
         }
     }
 

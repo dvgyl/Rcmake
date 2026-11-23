@@ -591,3 +591,242 @@ fn keeps_local_dependency_order_and_links_imported_artifacts() -> TestResult {
     assert_eq!(link.fragments[0].text.value, "/pkg/libexternal.a");
     Ok(())
 }
+
+fn link_build_step<'a>(graph: &'a BuildGraph, name: &str) -> Result<&'a BuildStep, &'static str> {
+    graph
+        .targets
+        .iter()
+        .find(|target| target.name == name)
+        .into_iter()
+        .flat_map(|target| &target.steps)
+        .filter_map(|&index| graph.steps.get(index))
+        .find(|step| matches!(step, BuildStep::Link { .. }))
+        .ok_or("Expected a link step.")
+}
+
+fn assert_object_input(graph: &BuildGraph, name: &str, path: &BString) -> TestResult {
+    let BuildStep::Link {
+        inputs,
+        invocations,
+        ..
+    } = link_build_step(graph, name)?
+    else {
+        return Err("Expected a link step.".into());
+    };
+    assert_eq!(inputs.iter().filter(|input| *input == path).count(), 1);
+    assert_eq!(
+        invocations
+            .iter()
+            .flat_map(|command| &command.argv)
+            .filter(|arg| *arg == path)
+            .count(),
+        1
+    );
+    Ok(())
+}
+
+#[test]
+fn target_objects_source_links_the_producer_object() -> TestResult {
+    let mut model = project();
+    model.add_target(target(
+        "app",
+        TargetKind::Executable,
+        &["$<TARGET_OBJECTS:obj>", "main.c"],
+    ))?;
+    let objects_dir = model.add_directory(
+        DirId::ROOT,
+        "/src/lib".into(),
+        "/out/lib".into(),
+        backtrace(3),
+    )?;
+    let mut obj = target("obj", TargetKind::ObjectLibrary, &["../a.cpp"]);
+    obj.dir = objects_dir;
+    let obj_id = model.add_target(obj)?;
+    let host = PureHost::default();
+    host.seed_file(Path::new("/src/a.cpp"), b"")?;
+    host.seed_file(Path::new("/src/main.c"), b"")?;
+
+    let result = resolve(&model, &host, &[])?;
+    let [app, obj] = result.targets.as_slice() else {
+        return Err("Expected two resolved targets.".into());
+    };
+    assert_eq!(app.compile_units.len(), 1);
+    assert_eq!(app.dependencies, [obj_id]);
+    let graph = &result.graphs[0];
+    assert_eq!(graph.targets[0].depends, [1]);
+    assert_object_input(graph, "app", &obj.compile_units[0].object)
+}
+
+#[test]
+fn direct_link_to_object_library_includes_objects_and_usage() -> TestResult {
+    let mut model = project();
+    let mut obj = target("obj", TargetKind::ObjectLibrary, &["a.cpp"]);
+    obj.usage
+        .push(UsageField::InterfaceCompileDefinitions, entry("FROM_OBJ"));
+    let obj_id = model.add_target(obj)?;
+    let mut app = target("app", TargetKind::Executable, &["main.c"]);
+    app.usage.link_libraries = Some(vec![link_item("obj")]);
+    model.add_target(app)?;
+    let mut archive = target("archive", TargetKind::StaticLibrary, &[]);
+    archive.usage.link_libraries = Some(vec![link_item("obj")]);
+    model.add_target(archive)?;
+    let host = PureHost::default();
+    host.seed_file(Path::new("/src/a.cpp"), b"")?;
+    host.seed_file(Path::new("/src/main.c"), b"")?;
+
+    let result = resolve(&model, &host, &[])?;
+    let [obj, app, archive] = result.targets.as_slice() else {
+        return Err("Expected three resolved targets.".into());
+    };
+    assert_eq!(app.compile_groups[0].defines, [entry("FROM_OBJ")]);
+    let graph = &result.graphs[0];
+    for consumer in [app, archive] {
+        assert_eq!(consumer.dependencies, [obj_id]);
+        let link = consumer.link.as_ref().ok_or("Expected a link step.")?;
+        assert_eq!(link.language, "CXX");
+        assert!(link.fragments.is_empty());
+        assert_object_input(
+            graph,
+            &consumer.metadata.name.to_string(),
+            &obj.compile_units[0].object,
+        )?;
+    }
+    Ok(())
+}
+
+#[test]
+fn interface_object_library_link_requires_explicit_objects() -> TestResult {
+    let mut model = project();
+    let mut obj = target("obj", TargetKind::ObjectLibrary, &["a.cpp"]);
+    obj.usage
+        .push(UsageField::InterfaceCompileDefinitions, entry("FROM_OBJ"));
+    let obj_id = model.add_target(obj)?;
+    let mut iface = target("iface", TargetKind::InterfaceLibrary, &[]);
+    iface.usage.interface_link_libraries = Some(vec![link_item("obj")]);
+    model.add_target(iface)?;
+    let mut forward = target("forward", TargetKind::InterfaceLibrary, &[]);
+    forward.usage.interface_link_libraries = Some(vec![link_item("$<TARGET_OBJECTS:obj>")]);
+    model.add_target(forward)?;
+    for (name, interface) in [("app", "iface"), ("explicit", "forward")] {
+        let mut app = target(name, TargetKind::Executable, &["main.c"]);
+        app.usage.link_libraries = Some(vec![link_item(interface)]);
+        model.add_target(app)?;
+    }
+    let host = PureHost::default();
+    host.seed_file(Path::new("/src/a.cpp"), b"")?;
+    host.seed_file(Path::new("/src/main.c"), b"")?;
+
+    let result = resolve(&model, &host, &[])?;
+    let [obj, _, _, app, explicit] = result.targets.as_slice() else {
+        return Err("Expected five resolved targets.".into());
+    };
+    let BuildStep::Link { inputs, step, .. } = link_build_step(&result.graphs[0], "app")? else {
+        return Err("Expected a link step.".into());
+    };
+    assert_eq!(inputs, &[app.compile_units[0].object.clone()]);
+    assert_eq!(step.language, "C");
+    assert_eq!(app.compile_groups[0].defines, [entry("FROM_OBJ")]);
+    assert!(explicit.dependencies.contains(&obj_id));
+    let object = absolute_path(b"/out", &obj.compile_units[0].object);
+    assert_object_input(&result.graphs[0], "explicit", &object)
+}
+
+#[test]
+fn target_objects_source_supplies_the_link_language() -> TestResult {
+    let mut model = project();
+    let obj_id = model.add_target(target("cxx_obj", TargetKind::ObjectLibrary, &["main.cpp"]))?;
+    model.add_target(target(
+        "app",
+        TargetKind::Executable,
+        &["$<TARGET_OBJECTS:cxx_obj>"],
+    ))?;
+    let host = PureHost::default();
+    host.seed_file(Path::new("/src/main.cpp"), b"")?;
+
+    let result = resolve(&model, &host, &[])?;
+    let [obj, app] = result.targets.as_slice() else {
+        return Err("Expected two resolved targets.".into());
+    };
+    assert!(app.compile_units.is_empty());
+    assert_eq!(app.dependencies, [obj_id]);
+    assert_eq!(
+        app.link.as_ref().map(|link| link.language.as_slice()),
+        Some(b"CXX".as_slice())
+    );
+    assert_object_input(&result.graphs[0], "app", &obj.compile_units[0].object)
+}
+
+#[test]
+fn external_object_source_is_linked_without_compilation() -> TestResult {
+    let mut model = project();
+    model.add_target(target(
+        "app",
+        TargetKind::Executable,
+        &["main.c", "prebuilt.data"],
+    ))?;
+    let props = model
+        .dir_mut(DirId::ROOT)
+        .source_props
+        .entry("/src/prebuilt.data".into())
+        .or_default();
+    props.set("EXTERNAL_OBJECT".into(), "ON".into());
+    props.set("LANGUAGE".into(), "CXX".into());
+    let host = PureHost::default();
+    host.seed_file(Path::new("/src/main.c"), b"")?;
+    host.seed_file(Path::new("/src/prebuilt.data"), b"")?;
+
+    let result = resolve(&model, &host, &[])?;
+    assert_eq!(result.targets[0].compile_units.len(), 1);
+    assert_object_input(&result.graphs[0], "app", &"/src/prebuilt.data".into())
+}
+
+#[test]
+fn custom_command_outputs_and_byproducts_are_sources_across_directories() -> TestResult {
+    use rcmake_model::{CustomCommand, CustomCommandKind};
+
+    let mut model = project();
+    let producer = model.add_directory(
+        DirId::ROOT,
+        "/src/gen".into(),
+        "/out/gen".into(),
+        backtrace(3),
+    )?;
+    let mut command = CustomCommand::new(
+        producer,
+        CustomCommandKind::Output,
+        backtrace(7),
+        Default::default(),
+    );
+    command.outputs.push(entry("generated.cpp"));
+    command.byproducts.push(entry("generated.o"));
+    model.add_command(command)?;
+    model.add_target(target(
+        "generated",
+        TargetKind::ObjectLibrary,
+        &["gen/generated.cpp"],
+    ))?;
+    model.add_target(target(
+        "app",
+        TargetKind::Executable,
+        &["$<TARGET_OBJECTS:generated>", "$<1:gen/generated.o>"],
+    ))?;
+
+    let result = resolve(&model, &PureHost::default(), &[])?;
+    let [generated, app] = result.targets.as_slice() else {
+        return Err("Expected two resolved targets.".into());
+    };
+    assert_eq!(
+        generated.compile_units[0].source.value,
+        "/out/gen/generated.cpp"
+    );
+    let graph = &result.graphs[0];
+    for target in &graph.targets {
+        assert!(target.steps.iter().any(|&index| matches!(
+            &graph.steps[index],
+            BuildStep::Custom(step) if step.outputs == ["gen/generated.cpp"]
+        )));
+    }
+    assert!(app.compile_units.is_empty());
+    assert_object_input(graph, "app", &generated.compile_units[0].object)?;
+    assert_object_input(graph, "app", &"gen/generated.o".into())
+}
