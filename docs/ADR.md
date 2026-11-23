@@ -185,3 +185,76 @@ All major architectural and contract decisions for Rcmake are recorded here by t
    - Wave 3: `rcmake-gen-ninja` (single-config `Ninja`), `rcmake-gen-common` (`compile_commands.json`, `cmake_install.cmake`, `CTestTestfile.cmake`, `install(EXPORT)`/`export()`, `file(GENERATE)`), `cmake --build`, `cmake --install` (with native `file(INSTALL)` and macOS `install_name_tool` / Linux ELF `file(RPATH_*)`), and minimal `rcmake-ctest` (`CTestTestfile.cmake` execution with `-C`, `-R`, `-E`, `-j`, `--output-on-failure`) so Tier-1 corpus projects (`zlib`, `fmt`, `nlohmann/json`, `cJSON`, `doctest`) build, install, and pass tests end-to-end.
    - Wave 4: `rcmake-gen-make` (`Unix Makefiles` with output sync), `Ninja Multi-Config` (with `COMMAND_CONFIG`/`OUTPUT_CONFIG`), and File-API v2.12 (`codemodel` 2.12, `cache` 2.0, `toolchains` 1.1, `cmakeFiles` 1.1, `configureLog` 1.0), followed by Tier-2 corpus (`Catch2`, `libpng`, `sqlite`, `spdlog`).
 3. **Behavioral Equivalence Over Byte-Identical Build Files:** Validate generated build systems against CMake 4.5.1 via normalized `compile_commands.json`, File-API JSON replies, installed file trees + `install_manifest.txt`, passing consumer projects linking against installed exports, and `ctest` results.
+
+---
+
+## ADR-010: Native `cpack` Engine & Archive / macOS Packaging (`rcmake-cpack`)
+
+- **Status:** Accepted
+- **Date:** 2026-11-23
+
+### Decision
+
+1. **Acyclic Crate Boundary:** Add `crates/rcmake-cpack` depending on `base`, `diag`, `host`, `json`, `eval`, `commands`, `archive`, and `presets` (no dependency on `rcmake-cli`; `preinstall` runs via `${CMAKE_COMMAND} --build <dir> --target preinstall` through `Host::run_process`). `rcmake-cli` dispatches the `cpack` persona directly to `rcmake_cpack::main`.
+2. **Configuration & CLI Precedence (Empirically Verified Against CMake 4.5.1):**
+   - Load `CPackConfig.cmake` (or `--config <file>`, or package preset via `--preset`) in a script-mode `Interp` with the full `rcmake_commands::register_all` registry.
+   - Apply `-C` (`CPACK_BUILD_CONFIG`) **before** executing the config script; apply `-G`, `-P`, `-R`, `-B`, `--vendor` **after** the config script; apply `-D` overrides last.
+   - For each generator in `CPACK_GENERATOR`, set the active generator, evaluate `CPACK_PROJECT_CONFIG_FILE` if set, stage `CPACK_INSTALLED_DIRECTORIES` and `CPACK_INSTALL_CMAKE_PROJECTS` quadruples (`build;project;component;subdir`, running `preinstall` unless `CPACK_SKIP_PREINSTALL` and invoking `cmake_install.cmake` in-process with `CMAKE_INSTALL_PREFIX` pointing at the staging root), plus `CPACK_INSTALL_SCRIPTS`, `CPACK_PRE_BUILD_SCRIPTS`, `CPACK_POST_BUILD_SCRIPTS`, and `CPACK_PACKAGE_CHECKSUM`.
+   - Fix the `COMPONENTS` global property to derive dynamically from `ProjectModel::install_components()` (defaulting to `Unspecified`), matching CMake 4.5.1's `CPackConfig.cmake` output.
+3. **Milestone 3 Generator Set & Codecs:**
+   - Implement `PackageGenerator` trait with archive generators (`TGZ`, `TXZ`, `TZST`, `TBZ2`, `TZ`, `TAR`, `ZIP` including `ZIP_DEFLATE`/`ZIP_STORE`), source packaging (`CPACK_SOURCE_IGNORE_FILES`), component modes (`ONE_PER_GROUP`, `ALL_COMPONENTS_IN_ONE`, `IGNORE`), and macOS `DragNDrop` (`.dmg`) & `Bundle` via `Host::run_process` (`hdiutil`/`SetFile`/`Rez`, tested with scripted `PureHost` and live macOS runs).
+   - Extend `rcmake-archive` with ADR-001 codecs `zstd` (`MIT`), `liblzma` (`MIT OR Apache-2.0`), `bzip2` (pure-Rust `libbz2-rs-sys`, `bzip2-1.0.6`), and native pure-Rust LZW for `TZ` (also enabling `-E tar J`/`j`/`--zstd`). Non-archive / non-macOS CPack generators (`DEB`, `RPM`, `NSIS`, `WIX`, `IFW`, `NuGet`, `STGZ`, `productbuild`, etc.) defer to Milestone 4.
+
+---
+
+## ADR-011: Full `rcmake-ctest`, `discover_tests` & `cmake --workflow`
+
+- **Status:** Accepted
+- **Date:** 2026-11-23
+
+### Decision
+
+1. **Full-Registry CTest Interpreter & `TEST_INCLUDE_FILES`:**
+   - Move `ctest` CLI parsing from `rcmake-cli` into `crates/rcmake-ctest/src/cli.rs` and expand `rcmake-ctest` to depend on `commands`, `presets`, `json`, and `instrument`.
+   - Run `CTestTestfile.cmake` and `TEST_INCLUDE_FILES` scripts with the full `rcmake_commands::register_all` registry plus ctest overrides (`add_test`, `set_tests_properties`, `subdirs`, `discover_tests`, and `-S` script commands `ctest_start`, `ctest_configure`, `ctest_build`, `ctest_test`), enabling `gtest_discover_tests` and `catch_discover_tests` in both `POST_BUILD` and `PRE_TEST` modes.
+2. **Complete CLI, Discovery, Reporting & State Files:**
+   - Support `-I`, `-U`, `-L`/`-LE`, `-FA`/`-FS`/`-FC`, `--rerun-failed`, `--tests-from-file`, `--exclude-from-file`, `--repeat` (`until-fail`, `until-pass`, `after-timeout`, plus CMP0224 fixture repeat mode), `--schedule-random[-seed]`, `--test-load`, `--stop-time`, `-O`, `--output-junit`, `-T Test` (`Testing/TAG` + `Testing/<tag>/Test.xml`), `--show-only=human|json-v1|json-v1-raw`, `-N`, `--out-of-date`, `--print-labels`, `--preset`, and `--instrument` (instrumentation launcher).
+   - Support CMake 4.4–4.5 `discover_tests(BUILD_DEPENDS ...)` in `ProjectModel` (`TestKind::Discover`) and `CTestTestfile.cmake` (`_CMAKE_TEST_BUILD_DEPENDS`, `install_prep/*`, `test_prep/*`).
+   - Implement `cmake --workflow --preset <name> [--fresh] [--list-presets[=defined]]` in `rcmake-cli/src/workflow.rs`, executing configure, build, test, and package presets in order and propagating the first failing exit code.
+   - Defer CDash network `ctest_submit` and `--build-and-test` to Milestone 4.
+
+---
+
+## ADR-012: C++20 Named Modules (`FILE_SET TYPE CXX_MODULES`) & Ninja `dyndep`
+
+- **Status:** Accepted
+- **Date:** 2026-11-23
+
+### Decision
+
+1. **Leaf Module Collation Crate (`rcmake-cxxmodules`):**
+   - Add `crates/rcmake-cxxmodules` depending only on `base` and `json`. Owns P1689r5 `.ddi` JSON parsing, `CXXDependInfo.json` (TDI) reading/writing, `CXXModules.json` reading/writing, module import collation & cycle diagnostics, Ninja `ninja_dyndep_version = 1.0` `.dd` emission, and compiler module-map writers (LLVM Clang `@modmap`, GCC `-fmodule-mapper=`, MSVC).
+   - Expose `cmake -E cmake_ninja_dyndep --tdi=... --lang=CXX --dd=... [--modmapfmt=...] [<file.ddi> ...]` in `rcmake-tool-e` backed by `rcmake-cxxmodules`, verified byte-for-byte against official CMake 4.5.1 `cmake -E cmake_ninja_dyndep` on `.ddi` fixtures.
+2. **Model, Resolver & Ninja Pipeline:**
+   - Extend `FileSetKind` to `{ Headers, Sources, CxxModules }` (no `CxxModuleHeaders` in CMake 4.5.1; `SYCL`/`SYCL_HEADERS` mapped under experimental gate), add `FileSet.props` + `PropScope::FileSet(FileSetId)` + `CMP0211`, and enforce CMake 4.5.1 `CXX_MODULES` visibility/scope rules.
+   - Extend `BuildStep` with `BuildStep::Scan` and `BuildStep::Collate`, plus `modmap`/`dyndep` fields on `BuildStep::Compile`. Honor `CXX_SCAN_FOR_MODULES` precedence (`file set > source > target > CMP0155`), `CMAKE_CXX_STDLIB_MODULES_JSON`, and the synthesized generator-provided `@cmake_cxx_std` target for `import std`.
+   - Ninja-only pipeline (`CXX_SCAN__<t>_`, `CXX_DYNDEP__<t>_`, `CXX_COMPILER__<t>_scanned_`); `rcmake-build` executes scan -> collate -> compile in-process for `try_compile`. C++20 targets without `CXX_MODULES` file sets continue to build cleanly on AppleClang without requiring `clang-scan-deps`.
+
+---
+
+## ADR-013: Common Package Specification (CPS), SPDX 3.0.1 SBOM & Instrumentation API v1
+
+- **Status:** Accepted
+- **Date:** 2026-11-23
+
+### Decision
+
+1. **Common Package Specification (`rcmake-cps`):**
+   - Add leaf crate `crates/rcmake-cps` (`base`, `json`, `diag`) implementing CPS **0.15.0** emission and validating reader (`>= 0.13 && < 0.16`), `@prefix@` path resolution, root `<Pkg>.cps`, appendix `<Pkg>-<appendix>.cps`, and install configuration supplements `<Pkg>[-<appendix>]@<lowercase-config>.cps` (`@noconfig` when empty).
+   - Wire `install(PACKAGE_INFO ...)` and `export(PACKAGE_INFO ...)` in `rcmake-commands` / `rcmake-gen-common`, and CPS discovery + imported `<Pkg>::<comp>` / default `<Pkg>` target creation inside `find_package()` Config mode.
+2. **Software Bill of Materials (SPDX 3.0.1 JSON-LD):**
+   - Implement `install(SBOM <name> EXPORTS <set>... [DESTINATION <dir>] ...)` and `export(SBOM ...)` plus automatic per-export SBOM generation via `CMAKE_INSTALL_SBOM_FORMATS` (`spdx`, `spdx-3.0+json`, `spdx-3.0.1+json` — SPDX 3.0.1 JSON-LD only, matching CMake 4.5.1).
+   - Emit `<name>-<config-or-noconfig>.spdx.json` with `@context: "https://spdx.org/rdf/3.0.1/spdx-context.jsonld"`, `CreationInfo`, `SpdxDocument`, `software_Package`, and `hasDeclaredLicense` relationships honoring target `SPDX_LICENSE` over `DEFAULT_LICENSE`.
+3. **Instrumentation API v1 (`rcmake-instrument`):**
+   - Add leaf crate `crates/rcmake-instrument` (`base`, `json`, `host`) implementing API v1 / data v1.2 query parsing (`<build>/.cmake/instrumentation/v1/query[/generated]/`), snippet/index/content JSON writers, hook triggers (`postGenerate`, `preBuild`, `postBuild`, `preCMakeBuild`, `postCMakeBuild`, `postCMakeInstall`, `postCMakeWorkflow`, `postCTest`), callback dispatch via `Host`, Google trace output, and the `ctest --instrument` command launcher.
+   - Register `cmake_instrumentation(...)` in `rcmake-commands`, wire compile/link launcher wrapping in `rcmake-resolve`, invoke lifecycle hooks from `rcmake-cli`, and expose `"instrumentation":{"apiVersion":1,"dataVersion":{"major":1,"minor":2}}` in `cmake -E capabilities`.
