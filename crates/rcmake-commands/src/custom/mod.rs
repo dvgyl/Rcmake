@@ -20,7 +20,7 @@ pub(crate) fn register(registry: &mut Registry) {
     let project_only = CmdFlags { scriptable: false };
     registry.add("add_custom_command", add_command, project_only);
     registry.add("add_custom_target", add_target, project_only);
-    registry.add("add_custom_rule", rule::add, project_only);
+    crate::compat::project_command!(registry, "add_custom_rule", rule::add);
 }
 
 #[derive(Clone, Copy, Default)]
@@ -186,7 +186,7 @@ impl Options {
     }
 }
 
-fn new_command(cx: &mut Cx<'_>) -> CustomCommand {
+pub(crate) fn new_command(cx: &mut Cx<'_>) -> CustomCommand {
     CustomCommand::new(
         cx.current_dir_id(),
         CustomCommandKind::Output,
@@ -540,7 +540,10 @@ fn binary_path(base: &[u8], value: &[u8]) -> BString {
     }
 }
 
-fn record(cx: &mut Cx<'_>, body: CustomCommand) -> Result<rcmake_model::CommandId, CmdError> {
+pub(crate) fn record(
+    cx: &mut Cx<'_>,
+    body: CustomCommand,
+) -> Result<rcmake_model::CommandId, CmdError> {
     let dir = body.dir;
     let backtrace = body.backtrace.clone();
     let generated: Vec<_> = body

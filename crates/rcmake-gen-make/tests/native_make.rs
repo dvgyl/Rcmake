@@ -205,7 +205,7 @@ fn native_make_builds_c_archive_and_executable_incrementally() {
     let first = make(&["-j2", "CMAKE_COMMAND=/bin/sh record.sh"]);
     assert!(first.contains("Generate C source and header"));
     assert!(first.contains("Building obj $/main.o"));
-    assert!(first.contains("Linking bin/app"));
+    assert!(first.contains("Linking C executable bin/app"));
     assert!(!first.contains("cc -MMD"));
     assert!(
         host.metadata(&root.join("manual-ran"), Follow::Yes)

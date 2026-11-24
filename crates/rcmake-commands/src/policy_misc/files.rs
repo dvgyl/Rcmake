@@ -164,7 +164,7 @@ fn permission(name: &[u8]) -> Option<u32> {
     })
 }
 
-pub(super) fn configure_file(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
+pub(crate) fn configure_file(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
     let args = values(args);
     let [input, output, flags @ ..] = args.as_slice() else {
         return Err(status(

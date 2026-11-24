@@ -1097,6 +1097,7 @@ fn global_value(cx: &mut Cx<'_>, name: &[u8]) -> Option<BString> {
                 .is_some_and(|value| truth::is_on(value)),
         )),
         b"ENABLED_LANGUAGES" => Some(cx.global().props.get(name).cloned().unwrap_or_default()),
+        b"COMMANDS" => Some(list::join(crate::compat::command_names(cx))),
         _ => known_features(name)
             .map(BString::from)
             .or_else(|| cx.global().props.get(name).cloned()),
@@ -1135,7 +1136,6 @@ pub(super) fn get_cmake(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
     };
     let dir = cx.current_dir_id();
     let value = match name.value.as_slice() {
-        b"COMMANDS" => Some(list::join(cx.registered_command_names())),
         b"VARIABLES" | b"MACROS" | b"CACHE_VARIABLES" => {
             directory_value(cx, dir, &name.value, false)
         }

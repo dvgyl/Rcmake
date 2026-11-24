@@ -21,18 +21,18 @@ mod tests;
 pub(crate) fn register(registry: &mut Registry) {
     let flags = CmdFlags { scriptable: false };
     registry.add("add_subdirectory", add_subdirectory, flags);
-    registry.add("subdirs", subdirs, flags);
+    crate::compat::project_command!(registry, "subdirs", subdirs);
     registry.add("include_directories", include_directories, flags);
     registry.add("add_definitions", add_definitions, flags);
     registry.add("remove_definitions", remove_definitions, flags);
-    registry.add("add_compile_definitions", add_compile_definitions, flags);
+    crate::compat::project_command!(registry, "add_compile_definitions", add_compile_definitions);
     registry.add("add_compile_options", add_compile_options, flags);
-    registry.add("add_link_options", add_link_options, flags);
+    crate::compat::project_command!(registry, "add_link_options", add_link_options);
     registry.add("link_directories", link_directories, flags);
     registry.add("link_libraries", link_libraries, flags);
     registry.add("source_group", source_groups::command, flags);
     tests_commands::register(registry, flags);
-    registry.add("discover_tests", discover::discover_tests, flags);
+    crate::compat::project_command!(registry, "discover_tests", discover::discover_tests);
 }
 
 fn status(text: impl Into<BString>) -> CmdError {
@@ -310,6 +310,16 @@ fn include_directories(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
         includes.reverse();
         system_includes.reverse();
     }
+    record_include_directories(cx, &includes, &system_includes, before);
+    Ok(Flow::Normal)
+}
+
+pub(crate) fn record_include_directories(
+    cx: &mut Cx<'_>,
+    includes: &[BT<BString>],
+    system_includes: &[BT<BString>],
+    before: bool,
+) {
     let dir = cx.current_dir_id();
     let model = cx.project();
     let directory = model.dir_mut(dir);
@@ -317,13 +327,13 @@ fn include_directories(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
     insert_paths(
         &mut directory.usage,
         UsageField::IncludeDirectories,
-        &includes,
+        includes,
         before,
     );
     insert_paths(
         &mut directory.usage,
         UsageField::InterfaceSystemIncludeDirectories,
-        &system_includes,
+        system_includes,
         before,
     );
     for id in targets {
@@ -331,12 +341,11 @@ fn include_directories(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
             insert_paths(
                 &mut target.usage,
                 UsageField::IncludeDirectories,
-                &includes,
+                includes,
                 before,
             );
         }
     }
-    Ok(Flow::Normal)
 }
 
 fn link_directories(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {

@@ -5,6 +5,8 @@
 
 use rcmake_eval::Registry;
 
+mod active;
+mod compat;
 mod configure;
 mod custom;
 mod dirs;
@@ -16,6 +18,9 @@ mod process_find;
 mod string_math;
 mod targets;
 mod vars_list;
+
+#[cfg(test)]
+mod registry_tests;
 
 /// Register all implemented built-in CMake 4.5.1 script commands into `registry`.
 pub fn register_all(registry: &mut Registry) {
@@ -30,6 +35,8 @@ pub fn register_all(registry: &mut Registry) {
     install::register(registry);
     configure::register(registry);
     instrumentation::register(registry);
+    active::register(registry);
+    compat::register(registry);
 }
 
 fn command_error(

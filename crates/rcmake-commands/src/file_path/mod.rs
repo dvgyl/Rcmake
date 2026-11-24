@@ -15,6 +15,7 @@ mod glob;
 mod install_cmd;
 mod lock;
 mod macho;
+mod macho_rpath;
 mod mutation;
 mod path_cmd;
 mod path_hash;

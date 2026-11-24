@@ -3,10 +3,12 @@
 use indexmap::IndexSet;
 use rcmake_base::{BString, list, path_lex::Lexical, truth};
 use rcmake_genex::ConfigId;
-use rcmake_model::{ProjectModel, Target, TargetKind};
+use rcmake_model::{ProjectModel, Target};
 
 use super::artifacts::is_darwin;
 use super::launcher;
+use super::pch::PchFlags;
+use super::policy_flags::Flags;
 use super::shell::{command, join_words, quote, rule_invocations};
 use super::standard::standard_flag;
 use super::{
@@ -32,15 +34,7 @@ pub(super) fn apple_flags(
     model: &ProjectModel,
     target: &Target,
     config: &ConfigId,
-) -> Vec<BString> {
-    apple_flags_for_language(model, target, config, None)
-}
-
-fn apple_flags_for_language(
-    model: &ProjectModel,
-    target: &Target,
-    config: &ConfigId,
-    language: Option<&[u8]>,
+    language: &[u8],
 ) -> Vec<BString> {
     if !is_darwin(model, target.dir) {
         return Vec::new();
@@ -52,7 +46,6 @@ fn apple_flags_for_language(
         .or_else(|| target_property(model, target, b"OSX_ARCHITECTURES"))
         .map_or_else(Vec::new, |value| list::split(value, list::Empty::Drop));
     if architectures.is_empty()
-        && let Some(language) = language
         && matches!(
             language,
             b"C" | b"CXX" | b"OBJC" | b"OBJCXX" | b"ASM" | b"SYCL"
@@ -103,30 +96,9 @@ fn compile_flags(
     let language = group.language.as_slice();
     let mut flags = language_flags(model, target, config, language);
     flags.extend(standard_flag(model, target, language, required_standard));
-    flags.extend(apple_flags_for_language(
-        model,
-        target,
-        config,
-        Some(language),
-    ));
-    let pic = target_property(model, target, b"POSITION_INDEPENDENT_CODE").map_or(
-        matches!(
-            target.kind,
-            TargetKind::SharedLibrary | TargetKind::ModuleLibrary
-        ),
-        |v| truth::is_on(v),
-    );
-    if pic {
-        let key = [b"CMAKE_", language, b"_COMPILE_OPTIONS_PIC"].concat();
-        match definition(model, target.dir, &key) {
-            Some(options) => flags.extend(
-                list::split(options, list::Empty::Drop)
-                    .into_iter()
-                    .map(|v| quote(&v)),
-            ),
-            None => flags.push("-fPIC".into()),
-        }
-    }
+    flags.extend(apple_flags(model, target, config, language));
+    let policy = Flags::new(model, target, language);
+    flags.extend(policy.compile(policy.ipo(config)));
 
     let preset_key = [language, b"_VISIBILITY_PRESET"].concat();
     if let Some(preset) = target_property(model, target, &preset_key).filter(|p| !p.is_empty()) {
@@ -239,6 +211,12 @@ pub(super) fn compile_arguments(
     (flags, defines, includes)
 }
 
+#[derive(Default)]
+pub(super) struct Settings<'a> {
+    pub(super) standard: Option<&'a [u8]>,
+    pub(super) pch: Option<PchFlags<'a>>,
+}
+
 pub(super) fn compile(
     model: &ProjectModel,
     target: &Target,
@@ -246,12 +224,15 @@ pub(super) fn compile(
     artifacts: &ArtifactSet,
     unit: &CompileUnit,
     group: &CompileGroup,
-    required_standard: Option<&[u8]>,
+    settings: Settings<'_>,
 ) -> Result<BuildStep, ResolveError> {
     let language = group.language.as_slice();
     let source = join(&model.dir(target.dir).source_dir, &unit.source.value);
     let (mut flags, defines, includes) =
-        compile_arguments(model, target, config, group, required_standard, &source);
+        compile_arguments(model, target, config, group, settings.standard, &source);
+    if let Some(pch) = settings.pch {
+        flags.extend(pch.options(model, target, language));
+    }
     let object = if unit.object.is_empty() {
         object_path(model, target, config, &source)
     } else {
@@ -334,6 +315,21 @@ pub(super) fn compile(
         b"INCLUDES" => Some(includes.clone()),
         _ => lookup_paths(key),
     });
+    let launch = launcher::Command {
+        role: "compile",
+        config,
+        output: &object,
+        source: Some(&source),
+        language: &group.language,
+    };
+    for invocation in &mut invocations {
+        *invocation = launch.launch_tool(
+            model,
+            target,
+            b"_COMPILER_LAUNCHER",
+            std::mem::take(invocation),
+        )?;
+    }
     let invocation = match invocations.len() {
         0 => {
             return Err(ResolveError::Message(
@@ -352,14 +348,7 @@ pub(super) fn compile(
             command(line)
         }
     };
-    let invocation = launcher::Command {
-        role: "compile",
-        config,
-        output: &object,
-        source: Some(&source),
-        language: &group.language,
-    }
-    .wrap(model, target, invocation);
+    let invocation = launch.wrap(model, target, invocation);
     let writes_depfile = dep_flags.is_some_and(|f| has_placeholder(f, b"<DEP_FILE>"))
         || has_placeholder(template_text, b"<DEP_FILE>");
     Ok(BuildStep::Compile {

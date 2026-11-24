@@ -233,11 +233,12 @@ fn remove(data: &mut [u8], paths: &Paths) -> bool {
     true
 }
 
-pub(super) fn run(cx: &Cx<'_>, command: &[u8], args: &[&[u8]]) -> Result {
+pub(super) fn run(cx: &mut Cx<'_>, command: &[u8], args: &[&[u8]]) -> Result {
     let operation = String::from_utf8_lossy(command);
     let mut file = None;
     let mut old = None;
     let mut new = None;
+    let mut tool = None;
     let mut strip = false;
     let check = command == b"RPATH_CHECK";
     let removing = command == b"RPATH_REMOVE";
@@ -246,8 +247,9 @@ pub(super) fn run(cx: &Cx<'_>, command: &[u8], args: &[&[u8]]) -> Result {
         let slot = match key {
             b"FILE" => &mut file,
             b"RPATH" if check => &mut new,
-            b"OLD_RPATH" if !check && !removing => &mut old,
+            b"OLD_RPATH" if !check => &mut old,
             b"NEW_RPATH" if !check && !removing => &mut new,
+            b"INSTALL_NAME_TOOL" if !check => &mut tool,
             b"INSTALL_REMOVE_ENVIRONMENT_RPATH" if !check && !removing => {
                 strip = true;
                 continue;
@@ -259,11 +261,9 @@ pub(super) fn run(cx: &Cx<'_>, command: &[u8], args: &[&[u8]]) -> Result {
     let file = file
         .filter(|file| !file.is_empty())
         .ok_or_else(|| error(format!("{operation} not given FILE option.")))?;
-    let old = if check || removing {
-        &[][..]
-    } else {
-        old.ok_or_else(|| error(format!("{operation} not given OLD_RPATH option.")))?
-    };
+    if !check && !removing && old.is_none() {
+        return Err(error(format!("{operation} not given OLD_RPATH option.")));
+    }
     let new = if removing {
         &[][..]
     } else {
@@ -297,6 +297,16 @@ pub(super) fn run(cx: &Cx<'_>, command: &[u8], args: &[&[u8]]) -> Result {
             },
         )
         .map_err(|err| error(err.to_string()))?;
+    if let Some(paths) = super::macho_rpath::paths(&data) {
+        return super::macho_rpath::edit(cx, &path, paths, command, old, new, tool);
+    }
+    if let Some(key) = tool
+        .map(|_| b"INSTALL_NAME_TOOL".as_slice())
+        .or((removing && old.is_some()).then_some(b"OLD_RPATH"))
+    {
+        return Err(error([command, b" given unknown argument ", key].concat()));
+    }
+    let old = old.unwrap_or_default();
     let paths = parse(&data);
     if check {
         let matches = paths

@@ -883,9 +883,12 @@ fn role_and_commands_properties_report_interpreter_state() -> TestResult {
         }
         assert_var(&mut interp, "role", Some(role));
         assert_var(&mut interp, "other_role", Some(role));
-        let names = interp.cx().registered_command_names();
+        let names = list::split(&interp.cx().var_or_empty(b"commands"), list::Empty::Drop);
         assert!(names.iter().any(|name| name == b"custom_command"));
-        assert_eq!(interp.cx().var(b"commands"), Some(list::join(names)));
+        assert_eq!(
+            names.iter().any(|name| name == b"target_link_options"),
+            mode == RunMode::Configure,
+        );
     }
     Ok(())
 }
@@ -1144,7 +1147,6 @@ fn project_commands_are_unavailable_in_script_mode() -> TestResult {
         "add_subdirectory",
         "add_custom_target",
         "add_custom_command",
-        "add_custom_rule",
         "add_dependencies",
         "target_sources",
         "target_include_directories",
@@ -1152,14 +1154,11 @@ fn project_commands_are_unavailable_in_script_mode() -> TestResult {
         "target_compile_definitions",
         "target_compile_options",
         "target_compile_features",
-        "target_link_options",
-        "target_link_directories",
         "install",
         "export",
         "enable_language",
         "enable_testing",
         "add_test",
-        "discover_tests",
     ] {
         let (host, mut interp) = context(RunMode::Script);
         run(&host, &mut interp, &format!("{command}()"), 1)?;

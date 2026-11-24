@@ -49,11 +49,11 @@ rule CXX_DYNDEP
 
 rule CXX_COMPILE_SCANNED
   command = $COMMAND
-  description = Building $out
+  description = $DESC
 
 rule CXX_COMPILE_SCANNED_DEPFILE
   command = $COMMAND
-  description = Building $out
+  description = $DESC
   depfile = $DEP_FILE
   deps = gcc
 ";

@@ -31,29 +31,29 @@ ninja_pipe = |
 
 rule COMPILE
   command = $COMMAND
-  description = Building $out
+  description = $DESC
 
 rule COMPILE_DEPFILE
   command = $COMMAND
-  description = Building $out
+  description = $DESC
   depfile = $DEP_FILE
   deps = gcc
 
 rule LINK_EXECUTABLE
   command = $COMMAND
-  description = Linking executable $out
+  description = $DESC
 
 rule LINK_SHARED_LIBRARY
   command = $COMMAND
-  description = Linking shared library $out
+  description = $DESC
 
 rule LINK_MODULE_LIBRARY
   command = $COMMAND
-  description = Linking module library $out
+  description = $DESC
 
 rule STATIC_ARCHIVE
   command = $COMMAND
-  description = Linking static library $out
+  description = $DESC
 
 rule CUSTOM_COMMAND
   command = $COMMAND
@@ -114,7 +114,7 @@ fn generate_single(
     let input = result.graphs.first().unwrap_or(&empty);
     let mut graph = Graph::new(input, &config_artifacts(result, input), build_dir, None)?;
     graph.resolve_custom_inputs(model, host);
-    graph.set_scan_responses(result);
+    graph.set_compile_metadata(result);
     let prep = PrepTargets::new(&graph, result, model)?;
     let programs = Programs::new(result, host, build_dir, model);
     let uses_modules = modules::uses_modules(input);
@@ -229,7 +229,7 @@ fn generate_multi(
             Some(name),
         )?;
         graph.resolve_custom_inputs(model, host);
-        graph.set_scan_responses(result);
+        graph.set_compile_metadata(result);
         let prep = PrepTargets::new(&graph, result, model)?;
         configs.push((graph, ConfigFiles::new(name, prep)));
     }

@@ -11,6 +11,7 @@ use rcmake_model::{ModelError, TargetId, UsageScope};
 mod create;
 mod init;
 mod link;
+mod precompile;
 mod properties;
 mod sources;
 mod usage;
@@ -40,9 +41,10 @@ pub(crate) fn register(registry: &mut Registry) {
     );
     registry.add("target_compile_options", usage::compile_options, flags);
     registry.add("target_compile_features", usage::compile_features, flags);
-    registry.add("target_link_options", usage::link_options, flags);
-    registry.add("target_link_directories", usage::link_directories, flags);
+    crate::compat::project_command!(registry, "target_link_options", usage::link_options);
+    crate::compat::project_command!(registry, "target_link_directories", usage::link_directories);
     registry.add("target_link_libraries", link::add, flags);
+    crate::compat::project_command!(registry, "target_precompile_headers", precompile::add);
 }
 
 fn bytes(arg: &ExpandedArg) -> &[u8] {

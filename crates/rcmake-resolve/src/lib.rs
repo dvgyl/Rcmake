@@ -30,12 +30,16 @@ use sources::{SourcePaths, TargetInputs, external_object};
 use usage::{ResolvedLinkItem, ResolvedLinkKind, UsageResolver};
 
 mod export_links;
+mod install_manifest;
 mod sources;
 mod unity;
 
 pub mod ide;
 pub mod lower;
+pub mod progress;
 pub mod usage;
+
+pub use install_manifest::{InstallAction, InstallActionKind, InstallManifest};
 
 #[cfg(test)]
 mod resolve_tests;
@@ -63,6 +67,8 @@ pub struct GenerationResult {
     pub targets: Vec<ResolvedTarget>,
     /// One lowered build graph per configuration.
     pub graphs: Vec<BuildGraph>,
+    /// Additional file dependencies of each compile output.
+    pub compile_inputs: std::collections::BTreeMap<BString, Vec<BString>>,
     /// Install actions for `cmake_install.cmake`.
     pub install: InstallManifest,
     /// `install(EXPORT)` and `export()` plans.
@@ -453,60 +459,6 @@ pub struct BuildGraph {
     pub targets: Vec<GraphTarget>,
 }
 
-/// One install action of `cmake_install.cmake`.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct InstallAction {
-    /// Install component.
-    pub component: BString,
-    /// Destination (relative to `CMAKE_INSTALL_PREFIX` unless absolute).
-    pub destination: BString,
-    /// Configurations the action applies to (empty means all).
-    pub configurations: Vec<BString>,
-    /// What to install.
-    pub kind: InstallActionKind,
-    /// Skip missing files (`OPTIONAL`).
-    pub optional: bool,
-}
-
-/// Payload of an [`InstallAction`].
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum InstallActionKind {
-    /// Copy files (`file(INSTALL TYPE FILE|PROGRAM|SHARED_LIBRARY|...)`).
-    Files {
-        /// `file(INSTALL TYPE ...)` value.
-        file_type: BString,
-        /// Source files.
-        files: Vec<BString>,
-        /// Destination name (`RENAME`).
-        rename: Option<BString>,
-        /// Permission keywords.
-        permissions: Vec<BString>,
-    },
-    /// Copy directories.
-    Directory {
-        /// Source directories.
-        dirs: Vec<BString>,
-        /// Raw `install(DIRECTORY)` options (`PATTERN`, `FILES_MATCHING`, ...).
-        options: Vec<BString>,
-    },
-    /// Include a script.
-    Script(BString),
-    /// Run code.
-    Code(BString),
-    /// Install an export file.
-    Export {
-        /// Index into [`GenerationResult::exports`].
-        plan: usize,
-    },
-}
-
-/// All install actions in rule order.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct InstallManifest {
-    /// Actions.
-    pub actions: Vec<InstallAction>,
-}
-
 /// One exported target of an [`ExportPlan`].
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ExportedTarget {
@@ -559,6 +511,7 @@ pub fn resolve_with_options(
     configs: &[ConfigId],
     options: &ResolveOptions,
 ) -> Result<GenerationResult, ResolveError> {
+    lower::warn_about_wrappers(model, host);
     let configs = if configs.is_empty() {
         vec![ConfigId(
             lower::definition(model, DirId::ROOT, b"CMAKE_BUILD_TYPE")
@@ -573,6 +526,7 @@ pub fn resolve_with_options(
     paths.unity = Some(unity::prepare(model, host, &mut paths, &configs)?);
     let mut targets = Vec::new();
     let mut graphs = Vec::with_capacity(configs.len());
+    let mut compile_inputs = std::collections::BTreeMap::new();
     let mut xcode_link_error = None;
     let mut xcode_sources = IndexMap::new();
     for config in &configs {
@@ -691,6 +645,7 @@ pub fn resolve_with_options(
             &inputs,
             &mut usage,
             &mut ide_custom,
+            &mut compile_inputs,
         )?);
         for target in &mut resolved {
             if let Some(facts) = &mut target.ide {
@@ -749,6 +704,7 @@ pub fn resolve_with_options(
         configs,
         targets,
         graphs,
+        compile_inputs,
         install,
         exports,
         metadata,

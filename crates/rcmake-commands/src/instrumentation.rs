@@ -2,7 +2,7 @@
 //! [`rcmake_model::GlobalState::instrumentation`].
 
 use rcmake_base::{BString, ByteSlice as _};
-use rcmake_eval::{CmdError, CmdFlags, CmdResult, Cx, Flow, Registry};
+use rcmake_eval::{CmdError, CmdResult, Cx, Flow, Registry};
 use rcmake_expr::ExpandedArg;
 use rcmake_host::path;
 use rcmake_instrument::{
@@ -11,11 +11,7 @@ use rcmake_instrument::{
 use rcmake_model::{DirId, InstrumentationContent, InstrumentationRequest};
 
 pub(crate) fn register(registry: &mut Registry) {
-    registry.add(
-        "cmake_instrumentation",
-        cmake_instrumentation,
-        CmdFlags { scriptable: false },
-    );
+    crate::compat::project_command!(registry, "cmake_instrumentation", cmake_instrumentation);
 }
 
 fn cmake_instrumentation(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {

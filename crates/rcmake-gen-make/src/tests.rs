@@ -115,6 +115,15 @@ fn writes_hierarchy_and_escapes_make_and_shell_words() {
         .metadata(&root.join("Makefile"), Follow::Yes)
         .expect("metadata");
     assert_eq!(after.mtime, metadata.mtime);
+
+    result.metadata.cmake_command = Some("/tools/rcmake".into());
+    generate_with_model(&result, &host, root, &ProjectModel::default())
+        .expect("generate with progress");
+    let top = read(&host, &root.join("Makefile"));
+    assert!(top.contains("cmake_progress_start CMakeFiles 2"));
+    let dispatch = read(&host, &root.join("CMakeFiles/Makefile2"));
+    assert!(dispatch.contains("--progress-num=1 'Built target tool $$'"));
+    assert!(dispatch.contains("--progress-num=2 'Built target generator'"));
 }
 
 #[test]

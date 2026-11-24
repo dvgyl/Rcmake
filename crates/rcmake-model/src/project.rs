@@ -78,10 +78,6 @@ fn push_arena<T, I>(
 }
 
 impl ProjectModel {
-    // ----------------------------------------------------------------------------------
-    // Directories.
-    // ----------------------------------------------------------------------------------
-
     /// Look up a variable definition as seen at the end of configuring `dir`:
     /// normal variable snapshot first, else `CMakeCache.txt` value.
     #[must_use]
@@ -120,15 +116,16 @@ impl ProjectModel {
 
     /// Set the source and binary directory of the root directory.
     pub fn set_root_dirs(&mut self, source_dir: BString, binary_dir: BString) {
-        self.root.source_dir = source_dir;
-        self.root.binary_dir = binary_dir;
+        let root = &mut self.root;
+        let property = b"INCLUDE_REGULAR_EXPRESSION";
+        if root.source_dir.is_empty() && root.props.get(property).is_none() {
+            root.props.set(property.as_slice().into(), "^.*$".into());
+        }
+        root.source_dir = source_dir;
+        root.binary_dir = binary_dir;
     }
 
-    /// Add a subdirectory of `parent` (`add_subdirectory()`). As in
-    /// `cmMakefile::InitializeFromParent`, the new directory copies the parent's usage
-    /// requirements, its `LABELS`, `LINK_LIBRARIES`, and
-    /// `IMPLICIT_DEPENDS_INCLUDE_TRANSFORM` properties, and its visible local imported
-    /// targets and aliases. The caller sets `exclude_from_all` and `system`.
+    /// Add a subdirectory with the inherited properties and local targets of `parent`.
     pub fn add_directory(
         &mut self,
         parent: DirId,
@@ -136,10 +133,12 @@ impl ProjectModel {
         binary_dir: BString,
         backtrace: Backtrace,
     ) -> Result<DirId, ModelError> {
-        const INHERITED: [&[u8]; 3] = [
+        const INHERITED: &[&[u8]] = &[
             b"IMPLICIT_DEPENDS_INCLUDE_TRANSFORM",
+            b"INCLUDE_REGULAR_EXPRESSION",
             b"LABELS",
             b"LINK_LIBRARIES",
+            b"_RCMAKE_INCLUDE_REGEX_COMPLAIN",
         ];
         let parent_dir = self.dir(parent);
         let mut dir = Directory {
@@ -151,7 +150,7 @@ impl ProjectModel {
             local_targets: parent_dir.local_targets.clone(),
             ..Directory::default()
         };
-        for name in INHERITED {
+        for &name in INHERITED {
             if let Some(value) = parent_dir.props.get(name) {
                 dir.props.set(name.into(), value.clone());
             }

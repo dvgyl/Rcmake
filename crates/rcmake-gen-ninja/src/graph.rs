@@ -10,6 +10,7 @@ use rcmake_host::{Follow, Host, path};
 use rcmake_model::ProjectModel;
 use rcmake_resolve::{
     ArtifactSet, BuildGraph, BuildStep, GenerationResult, Invocation, LinkKind, ScanResponse,
+    progress,
 };
 
 use crate::syntax::{Edge, Ninja, shell_word};
@@ -21,6 +22,8 @@ pub(crate) struct Graph<'a> {
     pub(crate) config: Option<&'a [u8]>,
     names: HashMap<BString, usize>,
     scan_responses: HashMap<&'a [u8], &'a ScanResponse>,
+    compile_languages: HashMap<&'a [u8], &'a [u8]>,
+    compile_inputs: Option<&'a std::collections::BTreeMap<BString, Vec<BString>>>,
     aliases: Vec<BString>,
     artifact_targets: HashSet<usize>,
     producers: HashMap<BString, usize>,
@@ -54,6 +57,8 @@ impl<'a> Graph<'a> {
             config,
             names: HashMap::with_capacity(input.targets.len()),
             scan_responses: HashMap::new(),
+            compile_languages: HashMap::new(),
+            compile_inputs: None,
             aliases: Vec::with_capacity(input.targets.len()),
             artifact_targets: HashSet::new(),
             producers: HashMap::with_capacity(input.steps.len()),
@@ -296,7 +301,9 @@ impl<'a> Graph<'a> {
         Ninja(Vec::with_capacity(capacity))
     }
 
-    pub(crate) fn set_scan_responses(&mut self, result: &'a GenerationResult) {
+    pub(crate) fn set_compile_metadata(&mut self, result: &'a GenerationResult) {
+        self.compile_languages = progress::compile_languages(result, self.input);
+        self.compile_inputs = Some(&result.compile_inputs);
         self.scan_responses.extend(
             result
                 .targets
@@ -396,14 +403,21 @@ impl<'a> Graph<'a> {
         let mut scan_response = None;
         let (rule, inputs, invocations, depfile) = match step {
             BuildStep::Compile {
+                object,
                 source,
                 invocation,
                 depfile,
                 modmap,
                 dyndep,
-                ..
             } => {
                 implicit.extend(modmap.iter().map(|map| self.node(map)));
+                implicit.extend(
+                    self.compile_inputs
+                        .and_then(|inputs| inputs.get(object))
+                        .into_iter()
+                        .flatten()
+                        .map(|input| self.node(input)),
+                );
                 dyndep_node = dyndep.as_ref().map(|dd| self.node(dd));
                 let rule: &[u8] = match (dyndep.is_some() || modmap.is_some(), depfile.is_some()) {
                     (false, false) => b"COMPILE",
@@ -570,6 +584,19 @@ impl<'a> Graph<'a> {
             b"COMMAND",
             &command_line(invocations, matches!(step, BuildStep::Custom(_))),
         );
+        if let Some(output) = nodes.outputs.first() {
+            let description = match step {
+                BuildStep::Compile { object, .. } => Some(progress::compile_description(
+                    self.compile_languages.get(object.as_slice()).copied(),
+                    output,
+                )),
+                BuildStep::Link { step, .. } => Some(progress::link_description(step, output)),
+                _ => None,
+            };
+            if let Some(description) = description {
+                ninja.binding(b"DESC", &description);
+            }
+        }
         if let Some((ddi, response)) = scan_response {
             let rsp = [self.node(ddi).as_slice(), b".rsp"].concat();
             ninja.binding(b"RSP_FILE", &rsp);

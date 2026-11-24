@@ -1,21 +1,26 @@
 //! Build graph edges and custom commands.
 
+use std::collections::BTreeMap;
+
 use indexmap::{IndexMap, IndexSet};
 use rcmake_base::{BString, list, truth};
 use rcmake_genex::ConfigId;
-use rcmake_model::{DirId, GeneratorKind, ProjectModel, Target, TargetEvent, TargetId, TargetKind};
+use rcmake_model::{
+    BT, DirId, GeneratorKind, ProjectModel, Target, TargetEvent, TargetId, TargetKind,
+};
 
 use super::artifacts::build_relative;
-use super::compile::compile;
+use super::compile::{Settings, compile};
 use super::custom::{
     Commands, attach_link_events, command_path, ide_custom_step, remove_own_outputs,
 };
 use super::link::link;
+use super::pch::{self, PchFlags};
 use super::{compute_artifacts, linker_language};
 use crate::ide::{IdeCustomPhase, IdeCustomStep};
 use crate::{
-    ArtifactSet, BuildGraph, BuildStep, CustomStep, GraphTarget, LinkFragmentRole, LinkKind,
-    LinkStep, ResolveError, ResolvedTarget, sources::TargetInputs, usage::UsageResolver,
+    ArtifactSet, BuildGraph, BuildStep, CompileUnit, CustomStep, GraphTarget, LinkFragmentRole,
+    LinkKind, LinkStep, ResolveError, ResolvedTarget, sources::TargetInputs, usage::UsageResolver,
 };
 
 /// Lower resolved targets for one configuration.
@@ -33,6 +38,7 @@ pub fn lower(
         &IndexMap::new(),
         &mut UsageResolver::new(model),
         &mut IndexMap::new(),
+        &mut BTreeMap::new(),
     )
 }
 
@@ -43,6 +49,7 @@ pub(crate) fn lower_with_inputs(
     inputs: &IndexMap<TargetId, TargetInputs>,
     usage: &mut UsageResolver<'_>,
     ide_custom: &mut IndexMap<TargetId, Vec<IdeCustomStep>>,
+    compile_inputs: &mut BTreeMap<BString, Vec<BString>>,
 ) -> Result<BuildGraph, ResolveError> {
     let resolved: IndexMap<_, _> = targets
         .iter()
@@ -66,6 +73,7 @@ pub(crate) fn lower_with_inputs(
         ..BuildGraph::default()
     };
     let commands = Commands::new(model, &resolved, config, usage, &mut graph.steps)?;
+    let precompiled = pch::Plans::new(model, &resolved, config, usage)?;
     let rule_count = graph.steps.len();
     let mut unity_prerequisites = Vec::new();
     for (target, resolved) in local {
@@ -163,6 +171,7 @@ pub(crate) fn lower_with_inputs(
         for step in super::modules::lower_modules_with_standard(model, resolved, cxx_standard)? {
             steps.insert(push(&mut graph.steps, step));
         }
+        let mut pch_languages = IndexSet::new();
         for unit in &resolved.compile_units {
             let Some(group) = resolved.compile_groups.get(unit.group) else {
                 return Err(ResolveError::Message(
@@ -176,6 +185,44 @@ pub(crate) fn lower_with_inputs(
             };
             let required_standard = target_inputs
                 .and_then(|inputs| inputs.standard_requirements.get(&group.language).copied());
+            let pch = precompiled
+                .find(resolved.id, &group.language)
+                .filter(|_| !pch::skip_unit(model, target, unit));
+            if let Some((owner, plan)) = pch {
+                if owner != resolved.id {
+                    dependencies.insert(owner);
+                } else if pch_languages.insert(&group.language) {
+                    let unit = CompileUnit {
+                        source: BT::new(plan.source.clone(), target.backtrace.clone()),
+                        object: plan.artifact.clone(),
+                        ..CompileUnit::default()
+                    };
+                    let step = compile(
+                        model,
+                        target,
+                        config,
+                        &artifacts,
+                        &unit,
+                        group,
+                        Settings {
+                            standard: required_standard,
+                            pch: Some(PchFlags::Create(plan)),
+                        },
+                    )?;
+                    let mut requires = vec![plan.header.clone()];
+                    for header in &plan.project_headers {
+                        let path = command_path(model, &dir.binary_dir, header);
+                        if commands
+                            .producer(&path)
+                            .is_some_and(|producer| steps.contains(&producer))
+                        {
+                            requires.push(path);
+                        }
+                    }
+                    compile_inputs.insert(plan.artifact.clone(), requires);
+                    steps.insert(push(&mut graph.steps, step));
+                }
+            }
             let mut step = compile(
                 model,
                 target,
@@ -183,9 +230,18 @@ pub(crate) fn lower_with_inputs(
                 &artifacts,
                 unit,
                 group,
-                required_standard,
+                Settings {
+                    standard: required_standard,
+                    pch: pch.map(|(_, plan)| PchFlags::Use(plan)),
+                },
             )?;
             if let BuildStep::Compile { object, dyndep, .. } = &mut step {
+                if let Some((_, plan)) = pch {
+                    compile_inputs.insert(
+                        object.clone(),
+                        vec![plan.header.clone(), plan.artifact.clone()],
+                    );
+                }
                 if !super::modules::is_std_bmi(model, target) {
                     objects.push(object.clone());
                 }
@@ -275,7 +331,7 @@ pub(crate) fn lower_with_inputs(
                 &mut dependencies,
                 ide_steps.as_mut(),
             )?;
-            let link = link(model, target, config, &artifacts, step, objects);
+            let link = link(model, target, config, &artifacts, step, objects)?;
             let link = attach_link_events(model, &artifacts, link, before, after);
             steps.insert(push(&mut graph.steps, link));
         } else {

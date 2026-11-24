@@ -105,7 +105,7 @@ fn single_config_writes_rules_edges_and_utilities() {
     let dir = Path::new("/work/build");
     generate_single_config(&result, &host, dir).unwrap_or_else(|error| panic!("{error}"));
     let rules = read(&host, "CMakeFiles/rules.ninja");
-    assert!(rules.contains("rule COMPILE_DEPFILE\n  command = $COMMAND\n  description = Building $out\n  depfile = $DEP_FILE\n  deps = gcc"));
+    assert!(rules.contains("rule COMPILE_DEPFILE\n  command = $COMMAND\n  description = $DESC\n  depfile = $DEP_FILE\n  deps = gcc"));
     assert!(rules.contains(
         "rule CUSTOM_COMMAND\n  command = $COMMAND\n  description = $DESC\n  restat = 1"
     ));
@@ -124,6 +124,7 @@ fn single_config_writes_rules_edges_and_utilities() {
         "build obj/a$ $$$:file.o: COMPILE_DEPFILE /work/src/a$ $$$:file.c || generate",
         "  DEP_FILE = obj/a$ $$$:file.d",
         "build libshared.so: LINK_SHARED_LIBRARY obj/a$ $$$:file.o",
+        "  DESC = Linking$ C$ shared$ library$ libshared.so",
         "build shared: phony obj/a$ $$$:file.o libshared.so generate",
         "build generate: phony generated$ $$$:file include${ninja_pipe}generated.h",
         "build optional: phony CMakeFiles/rcmake-custom-3.util",
@@ -226,6 +227,7 @@ fn link_byproducts_use_unique_paths_on_the_link_edge() -> Result<(), Box<dyn std
             concat!(
                 "build libdemo.so.1 | libdemo.so libdemo.lib libdemo.pdb: LINK_SHARED_LIBRARY\n",
                 "  COMMAND = $:\n",
+                "  DESC = Linking$ C$ shared$ library$ libdemo.so.1\n",
                 "build check: phony libdemo.so\n",
                 "build libdemo.so$:Debug: phony libdemo.so.1 libdemo.so libdemo.lib libdemo.pdb\n",
                 "build all$:Debug: phony libdemo.so$:Debug\n",

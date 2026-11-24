@@ -1,7 +1,7 @@
 //! Add the CTest instrumentation launcher to build commands.
 
-use rcmake_base::BString;
-use rcmake_genex::ConfigId;
+use rcmake_base::{BString, list};
+use rcmake_genex::{ConfigId, EvalContext, evaluate, parse};
 use rcmake_model::{DirId, ProjectModel, Target};
 
 use super::{definition, shell::direct};
@@ -43,6 +43,43 @@ pub(super) struct Command<'a> {
 }
 
 impl Command<'_> {
+    pub(super) fn launch_tool(
+        &self,
+        model: &ProjectModel,
+        target: &Target,
+        suffix: &[u8],
+        invocation: Invocation,
+    ) -> Result<Invocation, ResolveError> {
+        let property = [self.language.as_slice(), suffix].concat();
+        let Some(value) = target.props.get(&property) else {
+            return Ok(invocation);
+        };
+        let expansion;
+        let value = if value.windows(2).any(|part| part == b"$<") {
+            let id = model.find_target(target.dir, &target.name);
+            let handle = id.map(crate::usage::handle);
+            let ctx = EvalContext {
+                config: self.config.clone(),
+                current: handle,
+                head: handle,
+                language: self.source.map(|_| self.language.clone()),
+                link_language: self.source.is_none().then(|| self.language.clone()),
+                ..EvalContext::default()
+            };
+            let mut usage = crate::usage::UsageResolver::new(model);
+            (expansion, _) = evaluate(&parse(value)?, &ctx, &mut usage.host(target.dir))?;
+            &expansion
+        } else {
+            value
+        };
+        let mut args = list::split(value, list::Empty::Keep);
+        if args.first().is_none_or(|program| program.is_empty()) {
+            return Ok(invocation);
+        }
+        args.extend(invocation.argv);
+        Ok(direct(args, invocation.working_dir))
+    }
+
     pub(super) fn wrap(
         self,
         model: &ProjectModel,

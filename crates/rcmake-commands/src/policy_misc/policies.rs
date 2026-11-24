@@ -8,6 +8,8 @@ use rcmake_expr::ExpandedArg;
 
 use super::{quoted, status, values};
 
+mod warning_text;
+
 const VERSION_ADVICE: &str = "Update the VERSION argument <min> value.  Or, use the <min>...<max> syntax to tell CMake that the project requires at least <min> but has been updated to work with policies introduced by <max> or earlier.";
 
 pub(super) fn minimum_required(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
@@ -95,6 +97,10 @@ pub(super) fn policy(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
             };
             cx.set_var(var, state.into());
         }
+        [b"GET_WARNING", name, var] => {
+            let id = policy_id(name, "GET_WARNING")?;
+            cx.set_var(var, warning_text::body(id));
+        }
         [b"ISSUE_WARNING", name, options @ ..] => {
             let id = policy_id(name, "ISSUE_WARNING")?;
             let (mut preface, mut postface) = (Vec::new(), Vec::new());
@@ -118,7 +124,7 @@ pub(super) fn policy(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
                 "must be given at least one additional argument.",
             ));
         }
-        [b"SET" | b"GET", ..] => {
+        [b"SET" | b"GET" | b"GET_WARNING", ..] => {
             return Err(subcommand_error(
                 args,
                 "must be given exactly 2 additional arguments.",
@@ -147,19 +153,12 @@ fn policy_id(name: &[u8], op: &str) -> Result<PolicyId, CmdError> {
     })
 }
 
-fn issue_warning(cx: &mut Cx<'_>, id: PolicyId, preface: &[u8], postface: &[u8]) {
-    let summary = match id.number() {
-        133 => "The CPack module disables SLA by default in the CPack DragNDrop Generator.",
-        161 => "CPACK_PRODUCTBUILD_DOMAINS defaults to true.",
-        172 => {
-            "The CPack module enables per-machine installation by default in the CPack WIX Generator."
-        }
-        _ => return cx.issue_policy_warning(id, preface, postface),
-    };
-    let message = format!(
-        "Policy {id} is not set: {summary}  Run \"cmake --help-policy {id}\" for policy details.  Use the cmake_policy command to set the policy and suppress this warning."
-    );
-    let body = [preface, message.as_bytes(), postface]
+pub(crate) fn issue_warning(cx: &mut Cx<'_>, id: PolicyId, preface: &[u8], postface: &[u8]) {
+    if !matches!(id.number(), 133 | 153 | 161 | 172) {
+        return cx.issue_policy_warning(id, preface, postface);
+    }
+    let message = warning_text::body(id);
+    let body = [preface, message.as_slice(), postface]
         .into_iter()
         .filter(|part| !part.is_empty())
         .collect::<Vec<_>>()

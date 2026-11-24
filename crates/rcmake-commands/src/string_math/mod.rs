@@ -203,19 +203,10 @@ fn transform(cx: &mut Cx<'_>, mode: &[u8], args: &[&[u8]]) -> CmdResult {
         b"STRIP" => set(cx, out, trim_start(input).trim_end_with(is_space)),
         b"GENEX_STRIP" => set(cx, out, drop_empty_elements(strip_genex(input))),
         b"MAKE_C_IDENTIFIER" => {
-            let mut result = Vec::with_capacity(input.len());
             if input.first().is_some_and(u8::is_ascii_digit) {
                 check_size(cx, input.len().saturating_add(1))?;
-                result.push(b'_');
             }
-            result.extend(input.iter().map(|&byte| {
-                if byte.is_ascii_alphanumeric() {
-                    byte
-                } else {
-                    b'_'
-                }
-            }));
-            set(cx, out, result)
+            set(cx, out, make_c_identifier(input))
         }
         b"HEX" => {
             check_size(cx, input.len().saturating_mul(2))?;
@@ -223,6 +214,21 @@ fn transform(cx: &mut Cx<'_>, mode: &[u8], args: &[&[u8]]) -> CmdResult {
         }
         _ => Err(status("invalid string transformation.")),
     }
+}
+
+pub(crate) fn make_c_identifier(input: &[u8]) -> Vec<u8> {
+    let mut result = Vec::with_capacity(input.len());
+    if input.first().is_some_and(u8::is_ascii_digit) {
+        result.push(b'_');
+    }
+    result.extend(input.iter().map(|&byte| {
+        if byte.is_ascii_alphanumeric() {
+            byte
+        } else {
+            b'_'
+        }
+    }));
+    result
 }
 
 fn strip_genex(input: &[u8]) -> Vec<u8> {

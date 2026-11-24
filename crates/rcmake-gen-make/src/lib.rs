@@ -4,6 +4,7 @@
 
 mod build;
 mod prep;
+mod progress;
 
 pub use build::build_commands;
 
@@ -63,17 +64,33 @@ fn generate_impl(
     let build_dir = host.initial_cwd().join(build_dir);
     let empty = BuildGraph::default();
     let graph = result.graphs.first().unwrap_or(&empty);
-    let targets = plan_targets(result, graph, &build_dir)?;
-    let cmake = host.current_exe().map_err(|error| GenError::Write {
-        path: "Makefile".into(),
-        message: error.to_string().into(),
-    })?;
+    let mut targets = plan_targets(result, graph, &build_dir)?;
+    let cmake_command = result
+        .metadata
+        .cmake_command
+        .as_ref()
+        .filter(|path| !path.is_empty());
+    let report_progress = cmake_command.is_some();
+    if report_progress {
+        progress::assign(&mut targets);
+    }
+    let cmake = match cmake_command {
+        Some(command) => command.clone(),
+        None => host
+            .current_exe()
+            .map(|exe| path::from_native(&exe))
+            .map_err(|error| GenError::Write {
+                path: "Makefile".into(),
+                message: error.to_string().into(),
+            })?,
+    };
     let prep = prep::targets(result, graph, &targets, &build_dir, model)?;
-    let top = top_level(result, &targets, &path::from_native(&cmake), &prep)?;
-    let dispatch = dispatch(graph, &targets, &prep);
+    let top = top_level(result, graph, &targets, &cmake, &prep, report_progress)?;
+    let dispatch = dispatch(graph, &targets, &prep, report_progress)?;
+    let languages = rcmake_resolve::progress::compile_languages(result, graph);
     let build_files = targets
         .iter()
-        .map(build_file)
+        .map(|target| build_file(target, &languages))
         .collect::<Result<Vec<_>, _>>()?;
 
     for (target, contents) in targets.iter().zip(build_files) {
@@ -109,6 +126,7 @@ struct Step<'a> {
     inputs: Vec<BString>,
     depfile: Option<BString>,
     always: bool,
+    progress: Option<usize>,
 }
 
 fn invalid_graph(message: impl Into<BString>) -> GenError {
@@ -193,9 +211,13 @@ fn plan_targets<'a>(
                     action,
                     goal: make_path(object),
                     outputs: vec![make_path(object)],
-                    inputs: vec![make_path(source)],
+                    inputs: std::iter::once(source)
+                        .chain(result.compile_inputs.get(object).into_iter().flatten())
+                        .map(make_path)
+                        .collect(),
                     depfile: depfile.as_ref().map(make_path),
                     always: false,
+                    progress: None,
                 },
                 BuildStep::Link { step, inputs, .. } => Step {
                     action,
@@ -204,6 +226,7 @@ fn plan_targets<'a>(
                     inputs: inputs.iter().map(make_path).collect(),
                     depfile: None,
                     always: false,
+                    progress: None,
                 },
                 BuildStep::Custom(custom) => Step {
                     action,
@@ -220,6 +243,7 @@ fn plan_targets<'a>(
                     inputs: custom.depends.clone(),
                     depfile: custom.depfile.as_ref().map(make_path),
                     always: custom.outputs.is_empty(),
+                    progress: None,
                 },
                 BuildStep::Scan { .. } | BuildStep::Collate { .. } => {
                     return Err(GenError::Unimplemented(
@@ -361,9 +385,11 @@ MAKE_SILENT = $(MAKE_SILENT_$(VERBOSE))\nMAKE_SILENT_ = -s\n\n"
 
 fn top_level(
     result: &GenerationResult,
+    graph: &BuildGraph,
     targets: &[Target<'_>],
     cmake: &[u8],
     prep: &prep::Targets,
+    report_progress: bool,
 ) -> Result<Vec<u8>, GenError> {
     let mut out = makefile();
     // Separate entry points can build the same target. Submakes still run in parallel.
@@ -377,8 +403,20 @@ fn top_level(
         out.push(byte);
     }
     out.push_str(b"\nCTEST_COMMAND ?= ctest\n\n");
+    if report_progress {
+        out.push_str(b"export CMAKE_COMMAND\n");
+    }
     phony(&mut out, b"all", [b"cmake_check_build_system".as_slice()]);
-    recursive_make(&mut out, MAKEFILE2, b"all");
+    let all = graph
+        .targets
+        .iter()
+        .enumerate()
+        .filter_map(|(index, target)| target.in_all.then_some(index));
+    progress::build(
+        &mut out,
+        b"all",
+        report_progress.then(|| progress::count(targets, all)),
+    );
     phony(&mut out, b"clean", []);
     recursive_make(&mut out, MAKEFILE2, b"clean");
     phony(&mut out, b"preinstall", [b"all".as_slice()]);
@@ -437,13 +475,17 @@ fn top_level(
         make_recipe_text(&mut out, &shell_quote(&[b"... ", name].concat()))?;
         out.push(b'\n');
     }
-    for target in targets {
+    for (index, target) in targets.iter().enumerate() {
         phony(
             &mut out,
             target.name,
             [b"cmake_check_build_system".as_slice()],
         );
-        recursive_make(&mut out, MAKEFILE2, &target.goal);
+        progress::build(
+            &mut out,
+            &target.goal,
+            report_progress.then(|| progress::count(targets, [index])),
+        );
     }
     for name in prep.keys() {
         phony(&mut out, name, [b"cmake_check_build_system".as_slice()]);
@@ -452,7 +494,12 @@ fn top_level(
     Ok(out)
 }
 
-fn dispatch(graph: &BuildGraph, targets: &[Target<'_>], prep: &prep::Targets) -> Vec<u8> {
+fn dispatch(
+    graph: &BuildGraph,
+    targets: &[Target<'_>],
+    prep: &prep::Targets,
+    report_progress: bool,
+) -> Result<Vec<u8>, GenError> {
     let mut out = makefile();
     phony(
         &mut out,
@@ -481,6 +528,9 @@ fn dispatch(graph: &BuildGraph, targets: &[Target<'_>], prep: &prep::Targets) ->
                 .map(|target| target.goal.as_slice()),
         );
         recursive_make(&mut out, &target.file, &target.goal);
+        if report_progress {
+            progress::complete(&mut out, target)?;
+        }
         phony(&mut out, &target.clean_goal, []);
         recursive_make(&mut out, &target.file, &target.clean_goal);
     }
@@ -491,10 +541,13 @@ fn dispatch(graph: &BuildGraph, targets: &[Target<'_>], prep: &prep::Targets) ->
             dependencies.iter().map(|goal| goal.as_slice()),
         );
     }
-    out
+    Ok(out)
 }
 
-fn build_file(target: &Target<'_>) -> Result<Vec<u8>, GenError> {
+fn build_file(
+    target: &Target<'_>,
+    languages: &std::collections::HashMap<&[u8], &[u8]>,
+) -> Result<Vec<u8>, GenError> {
     let mut out = makefile();
     out.push_str(b".DELETE_ON_ERROR:\n");
     phony(
@@ -510,12 +563,17 @@ fn build_file(target: &Target<'_>) -> Result<Vec<u8>, GenError> {
     }
     phony(&mut out, FORCE, []);
     for step in &target.rules {
-        write_step(&mut out, step, &target.file)?;
+        write_step(&mut out, step, &target.file, languages)?;
     }
     Ok(out)
 }
 
-fn write_step(out: &mut Vec<u8>, step: &Step<'_>, file: &[u8]) -> Result<(), GenError> {
+fn write_step(
+    out: &mut Vec<u8>,
+    step: &Step<'_>,
+    file: &[u8],
+    languages: &std::collections::HashMap<&[u8], &[u8]>,
+) -> Result<(), GenError> {
     for path in std::iter::once(&step.goal)
         .chain(&step.inputs)
         .chain(&step.outputs)
@@ -558,12 +616,21 @@ fn write_step(out: &mut Vec<u8>, step: &Step<'_>, file: &[u8]) -> Result<(), Gen
         );
     }
     let (message, invocations) = match step.action {
-        BuildStep::Compile { invocation, .. } => (
-            [b"Building ".as_slice(), &step.goal].concat(),
+        BuildStep::Compile {
+            object, invocation, ..
+        } => (
+            rcmake_resolve::progress::compile_description(
+                languages.get(object.as_slice()).copied(),
+                &step.goal,
+            ),
             std::slice::from_ref(invocation),
         ),
-        BuildStep::Link { invocations, .. } => (
-            [b"Linking ".as_slice(), &step.goal].concat(),
+        BuildStep::Link {
+            step: link,
+            invocations,
+            ..
+        } => (
+            rcmake_resolve::progress::link_description(link, &step.goal),
             invocations.as_slice(),
         ),
         BuildStep::Custom(custom) => (
@@ -577,12 +644,7 @@ fn write_step(out: &mut Vec<u8>, step: &Step<'_>, file: &[u8]) -> Result<(), Gen
         BuildStep::Scan { .. } | BuildStep::Collate { .. } => (Vec::new(), [].as_slice()),
     };
     if !message.is_empty() {
-        let mut report = b"printf '%s\\n'".to_vec();
-        for line in message.split(|byte| *byte == b'\n') {
-            report.push(b' ');
-            report.push_str(shell_quote(line));
-        }
-        commands.push(report);
+        progress::report(out, &message, step.progress)?;
     }
     commands.extend(invocations.iter().filter_map(shell_invocation));
     if !commands.is_empty() {

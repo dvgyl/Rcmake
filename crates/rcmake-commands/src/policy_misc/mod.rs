@@ -8,13 +8,15 @@ use rcmake_expr::ExpandedArg;
 
 mod arguments;
 mod experimental;
-mod files;
+pub(crate) mod files;
 mod introspection;
 mod language;
 mod policies;
 mod project;
 mod properties;
 mod system;
+
+pub(crate) use policies::issue_warning;
 
 #[cfg(test)]
 mod tests;

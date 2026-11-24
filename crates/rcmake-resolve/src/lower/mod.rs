@@ -5,12 +5,17 @@ mod compile;
 mod custom;
 mod graph;
 mod install;
+mod install_rpath;
 mod launcher;
 mod link;
 mod modules;
+mod pch;
+mod policy_flags;
 mod shell;
 mod standard;
 
+#[cfg(test)]
+mod property_tests;
 #[cfg(test)]
 mod tests;
 
@@ -30,6 +35,7 @@ pub use launcher::instrumentation_launcher;
 pub(crate) use link::{ide_rpaths, install_name_dir};
 pub(crate) use modules::scan_responses;
 pub use modules::{bmi_script_path, lower_modules};
+pub(crate) use policy_flags::warn_about_wrappers;
 pub(crate) use standard::required_standard;
 
 pub(crate) fn definition<'a>(

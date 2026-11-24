@@ -108,7 +108,7 @@ pub(crate) struct TargetInputs {
 }
 
 pub(crate) struct SourcePaths<'a> {
-    host: &'a dyn Host,
+    pub(crate) host: &'a dyn Host,
     pub(crate) ide: Option<crate::ide::IdeFlavor>,
     generated: IndexSet<BString>,
     objects: IndexMap<BString, TargetId>,

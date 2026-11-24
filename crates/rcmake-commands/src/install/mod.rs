@@ -270,7 +270,7 @@ fn install(cx: &mut Cx<'_>, input: &[ExpandedArg]) -> CmdResult {
     Ok(Flow::Normal)
 }
 
-fn default_component(cx: &mut Cx<'_>) -> BString {
+pub(crate) fn default_component(cx: &mut Cx<'_>) -> BString {
     cx.var(b"CMAKE_INSTALL_DEFAULT_COMPONENT_NAME")
         .filter(|name| !name.is_empty())
         .unwrap_or_else(|| "Unspecified".into())
@@ -695,7 +695,7 @@ fn export(cx: &mut Cx<'_>, input: &[ExpandedArg]) -> CmdResult {
 }
 
 // Store arguments separately to preserve empty values, semicolons, and binary content.
-fn record_args(cx: &mut Cx<'_>, section: &str, args: &[&[u8]]) {
+pub(crate) fn record_args(cx: &mut Cx<'_>, section: &str, args: &[&[u8]]) {
     let directory = cx.current_dir_id().index();
     let props = &mut cx.global().props;
     props.set(

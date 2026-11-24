@@ -3,14 +3,14 @@
 use std::convert::Infallible;
 
 use indexmap::{IndexMap, IndexSet};
-use rcmake_base::{BString, list};
+use rcmake_base::{BString, list, path_lex::Lexical};
 use rcmake_diag::Backtrace;
 use rcmake_genex::{ConfigId, EvalContext, EvalSite, evaluate, parse};
 use rcmake_model::{
     DirId, GeneratorKind, InstallKind, InstallOptions, InstallRule, ProjectModel, TargetKind,
 };
 
-use super::{compute_artifacts, definition, join};
+use super::{compute_artifacts, definition, join, link::install_rpath};
 use crate::{
     ConfigureMetadata, InstallAction, InstallActionKind, InstallManifest, ResolveError,
     ResolvedTarget, Toolchain, usage::UsageResolver,
@@ -156,12 +156,6 @@ fn lower_install_rules<E>(
         let options = &rule.options;
         let recorded = recorded_args(model, index);
         let source = &model.dir(rule.dir).source_dir;
-        let mut eval_destination = |options: &mut InstallOptions, dir, config| {
-            if let Some(destination) = &mut options.destination {
-                *destination = eval(dir, config, &rule.backtrace, destination)?;
-            }
-            Ok::<_, E>(())
-        };
         let kind = match &rule.kind {
             InstallKind::Targets { targets: ids, .. } => {
                 let groups = target_options(&recorded);
@@ -200,7 +194,13 @@ fn lower_install_rules<E>(
                             definition(model, rule.dir, key).map_or(default, |v| v.as_slice());
                         if !configs.is_empty() {
                             options.destination.get_or_insert_with(|| default.into());
-                            eval_destination(&mut options, raw.dir, &target.config)?;
+                            eval_destination(
+                                &mut options,
+                                raw.dir,
+                                &target.config,
+                                rule,
+                                &mut eval,
+                            )?;
                         }
                         let namelink = extra.and_then(|group| group.namelink_component).and_then(
                             |component| {
@@ -214,14 +214,36 @@ fn lower_install_rules<E>(
                             },
                         );
                         if !files.is_empty() {
+                            let macho_rpath = if let Some(file) = artifacts.file.as_ref()
+                                && files.contains(file)
+                            {
+                                let name = options.rename.as_ref().map_or_else(
+                                    || Lexical::new(file).filename(),
+                                    |name| name.as_slice(),
+                                );
+                                install_rpath(model, raw, target, name, |value| {
+                                    eval(raw.dir, &target.config, &rule.backtrace, value)
+                                })?
+                            } else {
+                                None
+                            };
                             let files = files.into_iter().map(|path| join(bin, path)).collect();
-                            manifest.actions.push(action(
+                            let action = action(
                                 model,
                                 rule,
                                 &options,
                                 default,
                                 file_action(file_type, files, &options),
-                            ));
+                            );
+                            let edit_action = macho_rpath.map(|edit| InstallAction {
+                                kind: InstallActionKind::Code(edit.render(
+                                    &action.destination,
+                                    !action.configurations.is_empty(),
+                                )),
+                                ..action.clone()
+                            });
+                            manifest.actions.push(action);
+                            manifest.actions.extend(edit_action);
                         }
                         if let Some((component, file)) = namelink {
                             options.component = Some(component.into());
@@ -250,7 +272,13 @@ fn lower_install_rules<E>(
                                     .any(|group| group.language == b"CXX")
                                 {
                                     let mut bmi = bmi.clone();
-                                    eval_destination(&mut bmi, raw.dir, &target.config)?;
+                                    eval_destination(
+                                        &mut bmi,
+                                        raw.dir,
+                                        &target.config,
+                                        rule,
+                                        &mut eval,
+                                    )?;
                                     add_bmi_include(
                                         &mut manifest,
                                         model,
@@ -281,7 +309,13 @@ fn lower_install_rules<E>(
                             for config in action_configs(configs, &options, false, multi) {
                                 let mut options = options.clone();
                                 if let Some(config) = config {
-                                    eval_destination(&mut options, rule.dir, config)?;
+                                    eval_destination(
+                                        &mut options,
+                                        rule.dir,
+                                        config,
+                                        rule,
+                                        &mut eval,
+                                    )?;
                                     if multi {
                                         options.configurations = vec![config.0.clone()];
                                     }
@@ -417,6 +451,19 @@ fn action(
     }
 }
 
+fn eval_destination<E>(
+    options: &mut InstallOptions,
+    dir: DirId,
+    config: &ConfigId,
+    rule: &InstallRule,
+    eval: &mut impl FnMut(DirId, &ConfigId, &Backtrace, &[u8]) -> Result<BString, E>,
+) -> Result<(), E> {
+    if let Some(destination) = &mut options.destination {
+        *destination = eval(dir, config, &rule.backtrace, destination)?;
+    }
+    Ok(())
+}
+
 fn add_bmi_include(
     manifest: &mut InstallManifest,
     model: &ProjectModel,
@@ -467,15 +514,19 @@ fn add_bmi_include(
     manifest.actions.push(action);
 }
 
-fn cmake_quote(out: &mut BString, text: &[u8]) {
+pub(super) fn cmake_quote(out: &mut BString, text: &[u8]) {
     out.push(b'"');
+    cmake_quoted_content(out, text);
+    out.push(b'"');
+}
+
+pub(super) fn cmake_quoted_content(out: &mut BString, text: &[u8]) {
     for &byte in text {
         if matches!(byte, b'\\' | b'"' | b'$') {
             out.push(b'\\');
         }
         out.push(byte);
     }
-    out.push(b'"');
 }
 
 fn file_action(
