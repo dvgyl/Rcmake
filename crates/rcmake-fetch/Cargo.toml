@@ -1,0 +1,20 @@
+[package]
+name = "rcmake-fetch"
+description = "Content-addressed FetchContent storage and lockfiles."
+version.workspace = true
+publish.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+rcmake-base.workspace = true
+rcmake-host.workspace = true
+rcmake-store.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

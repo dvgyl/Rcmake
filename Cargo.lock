@@ -678,6 +678,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "rcmake-fetch"
+version = "0.1.0"
+dependencies = [
+ "rcmake-base",
+ "rcmake-host",
+ "rcmake-store",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "rcmake-fortran"
 version = "0.1.0"
 dependencies = [
@@ -821,6 +833,17 @@ version = "0.1.0"
 dependencies = [
  "rcmake-base",
  "thiserror",
+]
+
+[[package]]
+name = "rcmake-lsp"
+version = "0.1.0"
+dependencies = [
+ "rcmake-base",
+ "rcmake-diag",
+ "rcmake-host",
+ "rcmake-json",
+ "rcmake-syntax",
 ]
 
 [[package]]

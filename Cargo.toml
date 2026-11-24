@@ -24,6 +24,8 @@ members = [
     "crates/rcmake-cxxmodules",
     "crates/rcmake-fortran",
     "crates/rcmake-store",
+    "crates/rcmake-fetch",
+    "crates/rcmake-lsp",
     "crates/rcmake-instrument",
     "crates/rcmake-cpack",
     "crates/rcmake-tool-e",
@@ -93,6 +95,8 @@ rcmake-cps = { path = "crates/rcmake-cps" }
 rcmake-cxxmodules = { path = "crates/rcmake-cxxmodules" }
 rcmake-fortran = { path = "crates/rcmake-fortran" }
 rcmake-store = { path = "crates/rcmake-store" }
+rcmake-fetch = { path = "crates/rcmake-fetch" }
+rcmake-lsp = { path = "crates/rcmake-lsp" }
 rcmake-instrument = { path = "crates/rcmake-instrument" }
 rcmake-cpack = { path = "crates/rcmake-cpack" }
 

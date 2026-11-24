@@ -1,0 +1,19 @@
+[package]
+name = "rcmake-lsp"
+description = "Language server for CMake listfiles."
+version.workspace = true
+publish.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+rcmake-base.workspace = true
+rcmake-diag.workspace = true
+rcmake-host.workspace = true
+rcmake-json.workspace = true
+rcmake-syntax.workspace = true
+
+[lints]
+workspace = true
