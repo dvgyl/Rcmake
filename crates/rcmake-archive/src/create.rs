@@ -1,18 +1,17 @@
-use std::collections::HashMap;
-use std::io::{Cursor, Read, Write};
+use std::collections::{HashMap, HashSet};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use rcmake_base::BString;
 use rcmake_host::{
-    DirEntry, FileKind, FileTime, Follow, Host, Metadata, ReadRange, WriteMode, path::from_native,
+    FileKind, FileTime, Follow, Host, Metadata, ReadRange, WriteMode, path::from_native,
 };
 use tar::{Builder, EntryType, Header};
-use zip::{CompressionMethod, ZipWriter, write::FullFileOptions};
 
 use crate::pattern::Patterns;
 use crate::{
-    ArchiveError, ArchiveFormat, CreateOptions, MAX_ENTRIES, absolute, archive_error, archive_name,
-    checked_name, emit_names, read_bytes, relative_path, size_limit,
+    ArchiveError, ArchiveFormat, CreateOptions, CreateRequest, MAX_ENTRIES, absolute,
+    archive_error, archive_name, checked_name, emit_names, read_bytes, relative_path, size_limit,
 };
 use crate::{TarCompression, ZipCompression, codec::Encoder, seven_zip, timestamp, zip_codec};
 
@@ -21,6 +20,7 @@ pub(super) struct Selection<'a> {
     pub(super) excludes: &'a [BString],
     pub(super) threads: u32,
     pub(super) allow_outside: bool,
+    pub(super) command: bool,
 }
 
 pub(super) fn run(
@@ -28,11 +28,12 @@ pub(super) fn run(
     output: &Path,
     base_dir: &Path,
     inputs: &[PathBuf],
-    options: &CreateOptions,
+    request: CreateRequest<'_>,
     selection: Selection<'_>,
 ) -> Result<Vec<BString>, ArchiveError> {
     absolute(output)?;
     absolute(base_dir)?;
+    let options = request.options;
     let mtime = options
         .mtime
         .map(i64::try_from)
@@ -42,11 +43,15 @@ pub(super) fn run(
     let mut archive = Creation {
         host,
         writer: Writer::new(options, selection.threads)?,
+        zone: host.time_zone(),
         mtime,
         names: Vec::new(),
         links: HashMap::new(),
         bytes_left: size_limit(),
-        command: selection.allow_outside,
+        allow_outside: selection.allow_outside,
+        command: selection.command,
+        deterministic_order: request.deterministic_order,
+        skip_apple_double: request.skip_apple_double,
         excludes: Patterns::new(selection.excludes)?,
     };
     for input in inputs {
@@ -71,7 +76,7 @@ pub(super) fn run(
         } else {
             name
         };
-        archive.add(&base_dir.join(input), name, &[])?;
+        archive.add(&base_dir.join(input), name, None)?;
     }
 
     let bytes = archive.writer.finish()?;
@@ -109,11 +114,15 @@ fn command_name(base_dir: &Path, input: &Path) -> BString {
 struct Creation<'a> {
     host: &'a dyn Host,
     writer: Writer,
+    zone: jiff::tz::TimeZone,
     mtime: Option<FileTime>,
     names: Vec<BString>,
     links: HashMap<(u64, u64), (BString, PathBuf)>,
     bytes_left: u64,
+    allow_outside: bool,
     command: bool,
+    deterministic_order: bool,
+    skip_apple_double: bool,
     excludes: Patterns<'a>,
 }
 
@@ -122,9 +131,9 @@ impl Creation<'_> {
         &mut self,
         path: &Path,
         mut name: BString,
-        siblings: &[DirEntry],
+        siblings: Option<&HashSet<&[u8]>>,
     ) -> Result<(), ArchiveError> {
-        if self.command {
+        if self.allow_outside {
             checked_name(&name)?;
         } else {
             relative_path(&name)?;
@@ -137,7 +146,8 @@ impl Creation<'_> {
         {
             return Ok(());
         }
-        if metadata.kind == FileKind::File
+        if let Some(siblings) = siblings
+            && metadata.kind == FileKind::File
             && let Some(child) = name.rsplit(|&byte| byte == b'/').next()
             && is_apple_double(self.host, path, child, siblings, metadata.len)?
         {
@@ -153,7 +163,8 @@ impl Creation<'_> {
             .ok_or_else(|| ArchiveError::new("Archive exceeds the entry or size limit"))?;
 
         let identity = (metadata.dev, metadata.ino);
-        let link_name = if matches!(self.writer, Writer::Tar(..))
+        let link_name = if !self.command
+            && matches!(self.writer, Writer::Tar(..))
             && metadata.kind == FileKind::File
             && metadata.nlink > 1
             && let Ok(relative) = relative_path(&name)
@@ -182,17 +193,21 @@ impl Creation<'_> {
             .bytes_left
             .checked_sub(link_name.unwrap_or(&contents).len() as u64)
             .ok_or_else(|| ArchiveError::new("Archive exceeds the size limit"))?;
-        self.writer.add(
-            &name,
-            &metadata,
-            self.mtime.unwrap_or(metadata.mtime),
-            &contents,
-            link_name,
-        )?;
+        let mut mtime = self.mtime.unwrap_or(metadata.mtime);
+        if self.command && !matches!(self.writer, Writer::SevenZip(_)) {
+            mtime.nanos = 0;
+        }
+        self.writer
+            .add(&name, &metadata, mtime, &contents, link_name, &self.zone)?;
 
         if metadata.kind == FileKind::Dir {
             let mut children = self.host.read_dir(path)?;
-            children.sort_unstable_by(|left, right| left.name.cmp(&right.name));
+            if self.deterministic_order {
+                children.sort_unstable_by(|left, right| left.name.cmp(&right.name));
+            }
+            let siblings = self
+                .skip_apple_double
+                .then(|| children.iter().map(|entry| entry.name.as_slice()).collect());
             self.names.push(name.clone());
             for child in &children {
                 let child_path = relative_path(&child.name)?;
@@ -203,7 +218,7 @@ impl Creation<'_> {
                 }
                 let mut child_name = name.clone();
                 child_name.extend_from_slice(&child.name);
-                self.add(&path.join(child_path), child_name, &children)?;
+                self.add(&path.join(child_path), child_name, siblings.as_ref())?;
             }
         } else {
             self.names.push(name);
@@ -216,16 +231,13 @@ fn is_apple_double(
     host: &dyn Host,
     path: &Path,
     name: &[u8],
-    siblings: &[DirEntry],
+    siblings: &HashSet<&[u8]>,
     size: u64,
 ) -> Result<bool, ArchiveError> {
     let Some(original) = name.strip_prefix(b"._") else {
         return Ok(false);
     };
-    if siblings
-        .binary_search_by(|entry| entry.name.as_slice().cmp(original))
-        .is_err()
-    {
+    if !siblings.contains(original) {
         return Ok(false);
     }
 
@@ -239,10 +251,10 @@ fn is_apple_double(
             len: Some((HEADER_SIZE + 2 * DESCRIPTOR_SIZE) as u64),
         },
     )?;
-    let Some(header) = bytes.get(..HEADER_SIZE) else {
+    let Some(header @ [.., high, low]) = bytes.get(..HEADER_SIZE) else {
         return Ok(false);
     };
-    let count = usize::from(u16::from_be_bytes([header[24], header[25]]));
+    let count = usize::from(u16::from_be_bytes([*high, *low]));
     if !header.starts_with(b"\0\x05\x16\x07\0\x02\0\0") || !(1..=2).contains(&count) {
         return Ok(false);
     }
@@ -272,13 +284,7 @@ fn is_apple_double(
 enum Writer {
     Tar(Box<Builder<Encoder>>, bool),
     SevenZip(Box<seven_zip::Writer>),
-    Zip {
-        writer: Box<ZipWriter<Cursor<Vec<u8>>>>,
-        method: CompressionMethod,
-        level: Option<i64>,
-        codec: Option<(ZipCompression, Option<u32>)>,
-        compressed: HashMap<String, zip_codec::Entry>,
-    },
+    Zip(zip_codec::writer::Writer),
 }
 
 impl Writer {
@@ -327,21 +333,13 @@ impl Writer {
             )?)));
         }
         if matches!(options.format, Zip | ZipStored | ZipCompressed(_)) {
-            let deflate = options.format == Zip;
-            return Ok(Self::Zip {
-                writer: Box::new(ZipWriter::new(Cursor::new(Vec::new()))),
-                method: if deflate {
-                    CompressionMethod::Deflated
-                } else {
-                    CompressionMethod::Stored
-                },
-                level: deflate.then(|| i64::from(level.filter(|&value| value != 0).unwrap_or(6))),
-                codec: match options.format {
-                    ZipCompressed(codec) => Some((codec, level)),
-                    _ => None,
-                },
-                compressed: HashMap::new(),
-            });
+            if options.format == ZipCompressed(ZipCompression::Ppmd) {
+                return Err(zip_codec::ppmd_error());
+            }
+            return Ok(Self::Zip(zip_codec::writer::Writer::new(
+                options.format,
+                level,
+            )));
         }
         let encoder = Encoder::new(filter, level, threads)?;
         Ok(Self::Tar(Box::new(Builder::new(encoder)), gnu))
@@ -354,6 +352,7 @@ impl Writer {
         mtime: FileTime,
         contents: &[u8],
         link_name: Option<&[u8]>,
+        zone: &jiff::tz::TimeZone,
     ) -> Result<(), ArchiveError> {
         match self {
             Self::Tar(writer, gnu) => {
@@ -374,47 +373,7 @@ impl Writer {
                 )
             }
             Self::SevenZip(writer) => seven_zip::add(writer, name, metadata, mtime, contents),
-            Self::Zip {
-                writer,
-                method,
-                level,
-                codec,
-                compressed,
-            } => {
-                if name.contains(&b'\\') {
-                    return Err(ArchiveError::new(
-                        "ZIP input paths must use slash separators",
-                    ));
-                }
-                let name = std::str::from_utf8(name).map_err(archive_error)?;
-                let mut options = FullFileOptions::default()
-                    .compression_method(*method)
-                    .compression_level(*level)
-                    .unix_permissions(metadata.mode)
-                    .last_modified_time(timestamp::zip_dos_time(mtime));
-                timestamp::add_zip_time(&mut options, mtime)?;
-                match metadata.kind {
-                    FileKind::Dir => writer.add_directory(name, options).map_err(archive_error),
-                    FileKind::Symlink => {
-                        let target = std::str::from_utf8(contents).map_err(archive_error)?;
-                        writer
-                            .add_symlink(name, target, options)
-                            .map_err(archive_error)
-                    }
-                    _ => {
-                        if let Some((method, level)) = *codec {
-                            let (entry, payload) = zip_codec::encode(method, level, contents)?;
-                            writer.start_file(name, options).map_err(archive_error)?;
-                            writer.write_all(&payload).map_err(archive_error)?;
-                            compressed.insert(name.to_owned(), entry);
-                            Ok(())
-                        } else {
-                            writer.start_file(name, options).map_err(archive_error)?;
-                            writer.write_all(contents).map_err(archive_error)
-                        }
-                    }
-                }
-            }
+            Self::Zip(writer) => writer.add(name, metadata, mtime, contents, zone),
         }
     }
 
@@ -425,16 +384,7 @@ impl Writer {
                 .and_then(Encoder::finish)
                 .map_err(archive_error),
             Self::SevenZip(writer) => writer.finish(),
-            Self::Zip {
-                writer, compressed, ..
-            } => {
-                let mut bytes = writer
-                    .finish()
-                    .map(Cursor::into_inner)
-                    .map_err(archive_error)?;
-                zip_codec::update_headers(&mut bytes, &compressed)?;
-                Ok(bytes)
-            }
+            Self::Zip(writer) => writer.finish(),
         }
     }
 }

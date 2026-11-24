@@ -1,7 +1,4 @@
 use std::io::{self, Read, Write};
-use std::path::Path;
-
-use rcmake_host::{Host, ReadRange};
 
 use bzip2::{Compression as BzLevel, read::MultiBzDecoder, write::BzEncoder};
 use flate2::{Compression as GzLevel, read::MultiGzDecoder, write::GzEncoder};
@@ -168,63 +165,4 @@ pub(super) fn decoder(
         }
         TarCompression::Compress => Box::new(compress::Decoder::new(bytes).map_err(archive_error)?),
     })
-}
-
-/// Read regular archive files in bounded chunks through the host.
-pub(super) struct FileReader<'a> {
-    host: &'a dyn Host,
-    path: &'a Path,
-    offset: u64,
-    chunk: &'a [u8],
-    buffer: Vec<u8>,
-    cursor: usize,
-    eof: bool,
-}
-
-impl<'a> FileReader<'a> {
-    pub(super) fn new(host: &'a dyn Host, path: &'a Path, prefix: &'a [u8]) -> Self {
-        Self {
-            host,
-            path,
-            offset: prefix.len() as u64,
-            chunk: prefix,
-            buffer: Vec::new(),
-            cursor: 0,
-            eof: false,
-        }
-    }
-}
-
-impl Read for FileReader<'_> {
-    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
-        const CHUNK: u64 = 256 * 1024;
-        if !self.chunk.is_empty() {
-            return self.chunk.read(out);
-        }
-        if out.is_empty() {
-            return Ok(0);
-        }
-        if self.cursor == self.buffer.len() && !self.eof {
-            self.buffer = self
-                .host
-                .read(
-                    self.path,
-                    ReadRange::Slice {
-                        offset: self.offset,
-                        len: Some(CHUNK),
-                    },
-                )
-                .map_err(|error| io::Error::new(error.kind, ArchiveError::from(error)))?;
-            self.offset += self.buffer.len() as u64;
-            self.eof = (self.buffer.len() as u64) < CHUNK;
-            self.cursor = 0;
-        }
-        let read = self
-            .buffer
-            .get(self.cursor..)
-            .unwrap_or_default()
-            .read(out)?;
-        self.cursor += read;
-        Ok(read)
-    }
 }

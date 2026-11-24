@@ -1,19 +1,17 @@
 use std::collections::BTreeMap;
 use std::io::{self, ErrorKind, Read};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use rcmake_base::BString;
-use rcmake_host::{
-    FileKind, FileTime, Follow, Host, Metadata, ReadRange, WriteMode, path::to_native,
-};
+use rcmake_host::{FileKind, FileTime, Follow, Host, Metadata, WriteMode, path::to_native};
 use tar::{Archive, EntryType};
 
 use crate::pattern::Patterns;
 use crate::{
-    ArchiveError, ExtractOptions, MAX_ENTRIES, absolute, archive_error, checked_name, emit_names,
+    ArchiveError, ExtractRequest, MAX_ENTRIES, absolute, archive_error, checked_name, emit_names,
     read_bounded, read_bytes, relative_path, size_limit,
 };
-use crate::{codec, external_filter, seven_zip, timestamp, zip_codec};
+use crate::{codec, external_filter, seven_zip, tar_budget, timestamp, zip_codec};
 
 #[derive(Clone, Copy)]
 pub(super) enum Listing<'a> {
@@ -35,9 +33,10 @@ impl<'a> Listing<'a> {
 pub(super) fn run(
     host: &dyn Host,
     archive_path: &Path,
-    options: &ExtractOptions,
+    request: ExtractRequest<'_>,
     listing: Listing<'_>,
 ) -> Result<Vec<BString>, ArchiveError> {
+    let options = request.options;
     absolute(archive_path)?;
     if !options.list_only {
         absolute(&options.destination)?;
@@ -55,13 +54,8 @@ pub(super) fn run(
             archive_path.display()
         )));
     }
-    let prefix = host.read(
-        archive_path,
-        ReadRange::Slice {
-            offset: 0,
-            len: Some(16),
-        },
-    )?;
+    // Validate and extract from the same bytes, even if a member replaces the archive.
+    let bytes = read_bytes(host, archive_path, size_limit())?;
     if options.excludes.iter().any(|pattern| pattern.is_empty()) {
         return Err(ArchiveError::new("Failed to add to exclusion list: "));
     }
@@ -71,57 +65,61 @@ pub(super) fn run(
         list_only: options.list_only,
         listing,
         touch: options.touch,
+        confined_links: request.confined_links,
         names: Vec::new(),
         count: 0,
         bytes_left: size_limit(),
     };
-    if prefix.starts_with(b"PK\x03\x04")
-        || prefix.starts_with(b"PK\x05\x06")
-        || prefix.starts_with(seven_zip::MAGIC)
+    if bytes.starts_with(b"PK\x03\x04")
+        || bytes.starts_with(b"PK\x05\x06")
+        || bytes.starts_with(b"PK\x06\x06")
+        || bytes.starts_with(seven_zip::MAGIC)
     {
-        let bytes = read_bytes(host, archive_path, size_limit())?;
-        let entries = if prefix.starts_with(seven_zip::MAGIC) {
+        let entries = if bytes.starts_with(seven_zip::MAGIC) {
             scan.seven_zip(&bytes)?
         } else {
-            scan.zip(&bytes)?
+            scan.zip(&bytes, &host.time_zone())?
         };
         scan.patterns.finish()?;
         if !entries.is_empty() {
-            let mut unpack = Unpack::new(host, &options.destination, scan.bytes_left)?;
+            let mut unpack = Unpack::new(
+                host,
+                &options.destination,
+                scan.bytes_left,
+                request.confined_links,
+            )?;
             for (entry, payload) in entries {
                 unpack.entry(entry, &payload)?;
             }
             unpack.finish()?;
         }
-    } else if let Some(program) = external_filter::detect(&prefix) {
-        let bytes = external_filter::decompress(host, archive_path, program)?;
-        let entries = scan.tar_headers(bytes.as_slice())?;
-        scan.patterns.finish()?;
-        if !entries.is_empty() {
-            Unpack::new(host, &options.destination, scan.bytes_left)?
-                .tar(bytes.as_slice(), entries)?;
-        }
-    } else if let Some(filter) = codec::detect(&prefix) {
-        let bytes = read_bytes(host, archive_path, size_limit())?;
-        let entries = scan.tar_headers(codec::decoder(filter, &bytes)?)?;
-        scan.patterns.finish()?;
-        if !entries.is_empty() {
-            let unpack = Unpack::new(host, &options.destination, scan.bytes_left)?;
-            unpack.tar(codec::decoder(filter, &bytes)?, entries)?;
-        }
     } else {
-        let source = host.canonicalize(archive_path)?;
-        let reader = || codec::FileReader::new(host, &source, &prefix);
-        let entries = scan.tar_headers(reader())?;
+        let (bytes, filter) = if let Some(program) = external_filter::detect(&bytes) {
+            drop(bytes);
+            (
+                external_filter::decompress(host, archive_path, program)?,
+                None,
+            )
+        } else {
+            let filter = codec::detect(&bytes);
+            (bytes, filter)
+        };
+        let reader = || -> Result<Box<dyn Read + '_>, ArchiveError> {
+            match filter {
+                Some(filter) => codec::decoder(filter, &bytes),
+                None => Ok(Box::new(bytes.as_slice())),
+            }
+        };
+        let entries = scan.tar_headers(reader()?)?;
         scan.patterns.finish()?;
         if !entries.is_empty() {
-            let unpack = Unpack::new(host, &options.destination, scan.bytes_left)?;
-            if unpack.replaces_source(&source, &metadata, &entries) {
-                let bytes = read_bytes(host, &source, size_limit())?;
-                unpack.tar(bytes.as_slice(), entries)?;
-            } else {
-                unpack.tar(reader(), entries)?;
-            }
+            Unpack::new(
+                host,
+                &options.destination,
+                scan.bytes_left,
+                request.confined_links,
+            )?
+            .tar(reader()?, entries)?;
         }
     }
     emit_names(host, &scan.names, options.verbose);
@@ -134,6 +132,7 @@ struct Scan<'a> {
     list_only: bool,
     listing: Listing<'a>,
     touch: bool,
+    confined_links: bool,
     names: Vec<BString>,
     count: usize,
     bytes_left: u64,
@@ -172,7 +171,7 @@ impl Scan<'_> {
     }
 
     fn tar_headers(&mut self, reader: impl Read) -> Result<Vec<(usize, Entry)>, ArchiveError> {
-        let mut archive = Archive::new(reader.take(size_limit() + 1));
+        let mut archive = Archive::new(tar_budget::Reader::new(reader.take(size_limit() + 1)));
         let mut entries = Vec::new();
         for (index, item) in archive.entries().map_err(archive_error)?.enumerate() {
             let mut item = item.map_err(archive_error)?;
@@ -205,7 +204,7 @@ impl Scan<'_> {
                     let target = item
                         .link_name_bytes()
                         .ok_or_else(|| ArchiveError::new("The tar symbolic link has no target"))?;
-                    Data::Symlink(symlink_target(&path, &target)?)
+                    Data::Symlink(symlink_target(&path, &target, self.confined_links)?)
                 }
                 EntryType::Link => {
                     let target = item
@@ -251,7 +250,7 @@ impl Scan<'_> {
             ));
         }
         // Read past the tar end marker to check the compression trailer and size limit.
-        let mut remaining = archive.into_inner();
+        let mut remaining = archive.into_inner().into_inner();
         io::copy(&mut remaining, &mut io::sink()).map_err(archive_error)?;
         if remaining.limit() == 0 {
             return Err(ArchiveError::new("Archive exceeds the size limit"));
@@ -337,7 +336,8 @@ impl Scan<'_> {
                     name.extend_from_slice(&payload);
                 }
                 if !self.list_only {
-                    entry.data = Data::Symlink(symlink_target(&entry.path, &payload)?);
+                    entry.data =
+                        Data::Symlink(symlink_target(&entry.path, &payload, self.confined_links)?);
                 }
                 payload.clear();
             }
@@ -353,88 +353,83 @@ impl Scan<'_> {
         Ok(entries.into_iter().map(|(_, entry)| entry).collect())
     }
 
-    fn zip(&mut self, bytes: &[u8]) -> Result<Vec<(Entry, Vec<u8>)>, ArchiveError> {
-        let mut archive = zip_codec::open(bytes)?;
+    fn zip(
+        &mut self,
+        bytes: &[u8],
+        zone: &jiff::tz::TimeZone,
+    ) -> Result<Vec<(Entry, Vec<u8>)>, ArchiveError> {
+        let archive = zip_codec::open(bytes)?;
+        self.bytes_left = archive.preflight()?;
         let mut entries = Vec::new();
-        for index in 0..archive.len() {
-            let item = archive.by_index_raw(index).map_err(archive_error)?;
+        for item in archive.entries() {
+            let item = item?;
             let name: Vec<_> = item
-                .name_raw()
+                .name
                 .iter()
                 .map(|&byte| if byte == b'\\' { b'/' } else { byte })
                 .collect();
             let path = self.path(&name)?;
-            self.count_entry(name.len())?;
-            self.reserve_payload(item.size())?;
             if !self.select(&name, &path)? {
                 continue;
             }
-            let entry_name = if let Some(format_time) = self.listing.time_formatter() {
-                let is_link = item.is_symlink();
-                let mode =
-                    item.unix_mode()
-                        .unwrap_or(if item.is_dir() { 0o40755 } else { 0o100644 });
-                let mtime = timestamp::zip_time(&item).unwrap_or_default();
-                let size = if is_link { 0 } else { item.size() };
-                drop(item);
+
+            let kind = item.mode.unwrap_or(0) & 0o170000;
+            let is_link = kind == 0o120000;
+            let is_dir = name.ends_with(b"/") || kind == 0o040000;
+            let formatter = self.listing.time_formatter();
+            let mtime = if formatter.is_some() || (!self.list_only && !self.touch) {
+                item.time(zone)?
+            } else {
+                None
+            };
+            let needs_link = is_link && (!self.list_only || formatter.is_some());
+            let link = if needs_link {
+                if item.size > crate::MAX_NAME_BYTES as u64 {
+                    return Err(ArchiveError::new(
+                        "The ZIP symbolic link target is too long",
+                    ));
+                }
+                item.payload()?
+            } else {
+                Vec::new()
+            };
+            let display = if let Some(format_time) = formatter {
+                let mode = item.mode.unwrap_or(if is_dir { 0o40755 } else { 0o100644 });
+                let size = if is_link { 0 } else { item.size };
                 let mut line = listing_line(
                     mode,
                     b"0 ",
                     b"0",
                     &size.to_string(),
-                    &format_time(mtime),
+                    &format_time(mtime.unwrap_or_default()),
                     &name,
                 );
                 if is_link {
-                    let link = archive.by_index_raw(index).map_err(archive_error)?;
-                    let size = link.size();
-                    drop(link);
-                    if size > crate::MAX_NAME_BYTES as u64 {
-                        return Err(ArchiveError::new(
-                            "The ZIP symbolic link target is too long",
-                        ));
-                    }
+                    self.reserve_payload(link.len() as u64)?;
                     line.extend_from_slice(b" -> ");
-                    line.extend_from_slice(&zip_codec::payload(&mut archive, index)?);
+                    line.extend_from_slice(&link);
                 }
                 line
             } else {
-                drop(item);
                 BString::from(name)
             };
-            self.names.push(entry_name);
+            self.names.push(display);
             if self.list_only {
                 continue;
             }
-            let item = archive.by_index_raw(index).map_err(archive_error)?;
-            let mode = item.unix_mode();
-            let is_link = item.is_symlink();
-            let is_dir = item.is_dir();
-            let size = item.size();
-            let mtime = if self.touch {
-                None
-            } else {
-                timestamp::zip_time(&item)
-            };
-            drop(item);
             let (data, payload) = if is_link {
-                if size > crate::MAX_NAME_BYTES as u64 {
-                    return Err(ArchiveError::new(
-                        "The ZIP symbolic link target is too long",
-                    ));
-                }
-                let target = symlink_target(&path, &zip_codec::payload(&mut archive, index)?)?;
+                let target = symlink_target(&path, &link, self.confined_links)?;
                 (Data::Symlink(target), Vec::new())
-            } else if is_dir || mode.is_some_and(|mode| mode & 0o170000 == 0o40000) {
+            } else if is_dir {
                 (Data::Directory, Vec::new())
             } else {
-                (Data::File(size), zip_codec::payload(&mut archive, index)?)
+                (Data::File(item.size), item.payload()?)
             };
             entries.push((
                 Entry {
                     path,
                     data,
-                    mode,
+                    mode: item.mode,
                     mtime,
                 },
                 payload,
@@ -567,14 +562,43 @@ enum Data {
     HardLink(PathBuf),
 }
 
-fn symlink_target(link: &Path, target: &[u8]) -> Result<PathBuf, ArchiveError> {
-    if target.is_empty() || target.contains(&0) || target.len() > crate::MAX_NAME_BYTES {
-        return Err(ArchiveError::new(format!(
+fn symlink_target(link: &Path, target: &[u8], confined: bool) -> Result<PathBuf, ArchiveError> {
+    let error = || {
+        ArchiveError::new(format!(
             "Invalid symbolic link target for {}",
             link.display()
-        )));
+        ))
+    };
+    if target.is_empty() || target.contains(&0) || target.len() > crate::MAX_NAME_BYTES {
+        return Err(error());
     }
-    Ok(to_native(target))
+    let path = to_native(target);
+    if confined {
+        if crate::rooted(target) || path.components().count() > crate::MAX_DEPTH {
+            return Err(error());
+        }
+        resolve_link(link, &path).ok_or_else(error)?;
+    }
+    Ok(path)
+}
+
+fn resolve_link(link: &Path, target: &Path) -> Option<PathBuf> {
+    let mut path = link.parent()?.to_owned();
+    let mut has_name = false;
+    for part in target.components() {
+        match part {
+            Component::CurDir => {}
+            Component::ParentDir if !has_name && path.pop() => {}
+            Component::Normal(name)
+                if !cfg!(windows) || !crate::unsafe_windows_name(name.as_encoded_bytes()) =>
+            {
+                has_name = true;
+                path.push(name);
+            }
+            _ => return None,
+        }
+    }
+    Some(path)
 }
 
 pub(super) fn read_payload(reader: impl Read, size: u64) -> Result<Vec<u8>, ArchiveError> {
@@ -596,53 +620,24 @@ struct Unpack<'a> {
     host: &'a dyn Host,
     root: PathBuf,
     directories: BTreeMap<PathBuf, (Option<u32>, Option<FileTime>)>,
+    regular_members: Option<BTreeMap<PathBuf, (u64, u64)>>,
     bytes_left: u64,
 }
 
 impl<'a> Unpack<'a> {
-    fn new(host: &'a dyn Host, destination: &Path, bytes_left: u64) -> Result<Self, ArchiveError> {
+    fn new(
+        host: &'a dyn Host,
+        destination: &Path,
+        bytes_left: u64,
+        confined_links: bool,
+    ) -> Result<Self, ArchiveError> {
         host.create_dir_all(destination)?;
         Ok(Self {
             host,
             root: host.canonicalize(destination)?,
             directories: BTreeMap::new(),
+            regular_members: confined_links.then(BTreeMap::new),
             bytes_left,
-        })
-    }
-
-    fn replaces_source(
-        &self,
-        source: &Path,
-        metadata: &Metadata,
-        entries: &[(usize, Entry)],
-    ) -> bool {
-        // The reader opens the input again for each chunk. Keep a snapshot if
-        // an entry can replace the input before the reader reaches the end.
-        let root_metadata = self.host.metadata(&self.root, Follow::Yes).ok();
-        let Some(depth) = source
-            .ancestors()
-            .skip(1)
-            .position(|parent| {
-                parent == self.root
-                    || root_metadata.as_ref().is_some_and(|root| {
-                        self.host
-                            .metadata(parent, Follow::Yes)
-                            .is_ok_and(|candidate| {
-                                (root.dev, root.ino) == (candidate.dev, candidate.ino)
-                            })
-                    })
-            })
-            .map(|depth| depth + 1)
-        else {
-            return false;
-        };
-        entries.iter().any(|(_, entry)| {
-            !matches!(entry.data, Data::Directory)
-                && entry.path.components().count() == depth
-                && self
-                    .host
-                    .metadata(&self.root.join(&entry.path), Follow::No)
-                    .is_ok_and(|target| (target.dev, target.ino) == (metadata.dev, metadata.ino))
         })
     }
 
@@ -701,23 +696,50 @@ impl<'a> Unpack<'a> {
                 remove_existing_file(host, &path)?;
                 host.write(&path, payload, WriteMode::CreateNew)?;
                 restore(host, &path, entry.mode, entry.mtime)?;
+                if let Some(members) = &mut self.regular_members {
+                    let metadata = host.metadata(&path, Follow::No)?;
+                    members.insert(entry.path, (metadata.dev, metadata.ino));
+                }
             }
             Data::Symlink(target) => {
+                if let Some(members) = &mut self.regular_members {
+                    let resolved =
+                        resolve_link(&entry.path, &target).ok_or_else(|| conflict(&path))?;
+                    let mut parent = self.root.clone();
+                    for part in &resolved {
+                        parent.push(part);
+                        if existing(host, &parent)?
+                            .is_some_and(|meta| meta.kind == FileKind::Symlink)
+                        {
+                            return Err(conflict(&parent));
+                        }
+                    }
+                    members.remove(&entry.path);
+                }
                 remove_existing_file(host, &path)?;
                 host.symlink(&target, &path)?;
             }
             Data::HardLink(target) => {
-                let target = self.checked_path(&target, false)?;
-                let metadata = host.metadata(&target, Follow::No)?;
+                let source = self.checked_path(&target, false)?;
+                let metadata = host.metadata(&source, Follow::No)?;
+                if let Some(members) = &mut self.regular_members {
+                    if members.get(&target) != Some(&(metadata.dev, metadata.ino)) {
+                        return Err(ArchiveError::new(format!(
+                            "The hard link target must be a regular member from this extraction: {}",
+                            target.display()
+                        )));
+                    }
+                    members.remove(&entry.path);
+                }
                 if metadata.kind != FileKind::File {
                     return Err(ArchiveError::new(format!(
                         "The hard link target must be a regular file: {}",
-                        target.display()
+                        source.display()
                     )));
                 }
                 remove_existing_file(host, &path)?;
-                if host.hard_link(&target, &path).is_err() {
-                    let contents = read_bytes(host, &target, self.bytes_left)?;
+                if host.hard_link(&source, &path).is_err() {
+                    let contents = read_bytes(host, &source, self.bytes_left)?;
                     self.bytes_left = self
                         .bytes_left
                         .checked_sub(contents.len() as u64)

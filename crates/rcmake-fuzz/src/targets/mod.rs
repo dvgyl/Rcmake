@@ -42,13 +42,12 @@ pub(super) fn run(surface: Surface, seed: u64) -> Check {
     }
 }
 
-#[expect(
-    clippy::indexing_slicing,
-    reason = "The array is nonempty and the index is below its length."
-)]
 fn pick<'a, T, const N: usize>(rng: &mut Rng, choices: &'a [T; N]) -> &'a T {
     const { assert!(N > 0) };
-    &choices[rng.below(N as u64) as usize]
+    let [first, ..] = choices.as_slice() else {
+        unreachable!("Fuzz choices must contain at least one item");
+    };
+    choices.get(rng.below(N as u64) as usize).unwrap_or(first)
 }
 
 fn random_bytes(rng: &mut Rng) -> Vec<u8> {

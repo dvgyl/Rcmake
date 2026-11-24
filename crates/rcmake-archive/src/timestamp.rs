@@ -8,14 +8,13 @@ use jiff::{
 };
 use rcmake_host::FileTime;
 use tar::Entry;
-use zip::{DateTime, extra_fields::ExtraField, read::ZipFile, write::FullFileOptions};
+use zip::DateTime;
 
 use crate::{ArchiveError, archive_error};
 
 const NANOS_PER_SECOND: i128 = 1_000_000_000;
 const TICKS_PER_SECOND: i128 = 10_000_000;
 const NTFS_EPOCH_OFFSET: i64 = 11_644_473_600;
-const SECONDS_PER_DAY: i64 = 86_400;
 
 pub(super) fn seconds(secs: i64) -> FileTime {
     FileTime { secs, nanos: 0 }
@@ -71,123 +70,70 @@ fn parse_pax_time(value: &str) -> Result<FileTime, ArchiveError> {
     })
 }
 
-pub(super) fn add_zip_time(
-    options: &mut FullFileOptions<'_>,
-    time: FileTime,
-) -> Result<(), ArchiveError> {
+pub(super) fn zip_time_fields(time: FileTime) -> Result<Vec<u8>, ArchiveError> {
+    let mut fields = Vec::new();
     if let Ok(secs) = i32::try_from(time.secs) {
-        let mut field = vec![1];
-        field.extend_from_slice(&secs.to_le_bytes());
-        options
-            .add_extra_data(0x5455, field.into_boxed_slice(), false)
-            .map_err(archive_error)?;
+        fields.extend_from_slice(&[0x55, 0x54, 5, 0, 1]);
+        fields.extend_from_slice(&secs.to_le_bytes());
         if time.nanos == 0 {
-            return Ok(());
+            return Ok(fields);
         }
     }
-
     let ticks = (i128::from(time.secs) + i128::from(NTFS_EPOCH_OFFSET)) * TICKS_PER_SECOND
         + i128::from(time.nanos / 100);
     let ticks = u64::try_from(ticks).map_err(|_| {
         ArchiveError::new("The modification time is outside the ZIP timestamp range")
     })?;
-    // The NTFS field has four reserved bytes, a tag, a length, and three file times.
-    let mut field = vec![0, 0, 0, 0, 1, 0, 24, 0];
-    field.extend_from_slice(&ticks.to_le_bytes());
-    field.extend_from_slice(&[0; 16]);
-    options
-        .add_extra_data(0x000a, field.into_boxed_slice(), false)
-        .map_err(archive_error)
+    // The NTFS field contains four reserved bytes, a tag, a length, and three file times.
+    fields.extend_from_slice(&[0x0a, 0, 32, 0, 0, 0, 0, 0, 1, 0, 24, 0]);
+    fields.extend_from_slice(&ticks.to_le_bytes());
+    fields.extend_from_slice(&[0; 16]);
+    Ok(fields)
 }
 
-pub(super) fn zip_time<R: Read>(file: &ZipFile<'_, R>) -> Option<FileTime> {
-    let mut unix_time = None;
-    for field in file.extra_data_fields() {
-        match field {
-            ExtraField::Ntfs(field) => {
-                let ticks = i128::from(field.mtime());
-                return Some(FileTime {
-                    secs: (ticks / TICKS_PER_SECOND) as i64 - NTFS_EPOCH_OFFSET,
-                    nanos: ((ticks % TICKS_PER_SECOND) * 100) as u32,
-                });
-            }
-            ExtraField::ExtendedTimestamp(field) => {
-                if let Some(time) = field.mod_time() {
-                    unix_time = Some(seconds(i64::from(i32::from_le_bytes(time.to_le_bytes()))));
-                }
-            }
-        }
+pub(super) fn ntfs_time(ticks: u64) -> FileTime {
+    let ticks = i128::from(ticks);
+    FileTime {
+        secs: (ticks / TICKS_PER_SECOND) as i64 - NTFS_EPOCH_OFFSET,
+        nanos: ((ticks % TICKS_PER_SECOND) * 100) as u32,
     }
-    unix_time.or_else(|| file.last_modified().map(dos_to_unix))
 }
 
-pub(super) fn zip_dos_time(time: FileTime) -> DateTime {
-    let mut days = time.secs.div_euclid(SECONDS_PER_DAY);
-    let start = days_to_year(1980);
-    if days < start {
+pub(super) fn zip_dos_time(time: FileTime, zone: &TimeZone) -> DateTime {
+    let Ok(timestamp) = Timestamp::from_second(time.secs) else {
         return DateTime::default();
-    }
-    let end = days_to_year(2108) - 1;
-    let secs = if days > end {
-        days = end;
-        SECONDS_PER_DAY - 1
-    } else {
-        time.secs.rem_euclid(SECONDS_PER_DAY)
     };
-    let mut year = 1980;
-    while days >= days_to_year(year + 1) {
-        year += 1;
-    }
-    days -= days_to_year(year);
-    let mut month = 1;
-    while days >= month_days(year, month) {
-        days -= month_days(year, month);
-        month += 1;
+    let date_time = timestamp.to_zoned(zone.clone()).datetime();
+    if date_time.year() > 2107 {
+        return DateTime::from_date_and_time(2107, 12, 31, 23, 59, 58).unwrap_or_default();
     }
     DateTime::from_date_and_time(
-        year,
-        month,
-        (days + 1) as u8,
-        (secs / 3600) as u8,
-        (secs / 60 % 60) as u8,
-        (secs % 60) as u8,
+        date_time.year() as u16,
+        date_time.month() as u8,
+        date_time.day() as u8,
+        date_time.hour() as u8,
+        date_time.minute() as u8,
+        date_time.second() as u8,
     )
     .unwrap_or_default()
 }
 
-fn dos_to_unix(time: DateTime) -> FileTime {
-    let days_before_month: i64 = (1..time.month())
-        .map(|month| month_days(time.year(), month))
-        .sum();
-    let days = days_to_year(time.year()) + days_before_month + i64::from(time.day()) - 1;
-    seconds(
-        days * SECONDS_PER_DAY
-            + i64::from(time.hour()) * 3600
-            + i64::from(time.minute()) * 60
-            + i64::from(time.second()),
+pub(super) fn dos_to_unix(time: DateTime, zone: &TimeZone) -> Option<FileTime> {
+    let date = Date::new(
+        time.year().try_into().ok()?,
+        time.month() as i8,
+        time.day() as i8,
     )
-}
-
-fn days_to_year(year: u16) -> i64 {
-    const LAST_PRE_EPOCH_YEAR: i64 = 1969;
-    let previous = i64::from(year) - 1;
-    (previous - LAST_PRE_EPOCH_YEAR) * 365 + leap_days(previous) - leap_days(LAST_PRE_EPOCH_YEAR)
-}
-
-fn leap_days(year: i64) -> i64 {
-    year / 4 - year / 100 + year / 400
-}
-
-fn month_days(year: u16, month: u8) -> i64 {
-    match month {
-        2 => {
-            28 + i64::from(
-                year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400)),
-            )
-        }
-        4 | 6 | 9 | 11 => 30,
-        _ => 31,
-    }
+    .ok()?;
+    let clock = Time::new(
+        time.hour() as i8,
+        time.minute() as i8,
+        time.second() as i8,
+        0,
+    )
+    .ok()?;
+    let zoned = date.to_datetime(clock).to_zoned(zone.clone()).ok()?;
+    Some(seconds(zoned.timestamp().as_second()))
 }
 
 /// Parse a CMake archive modification time, including epoch seconds prefixed with `@`.

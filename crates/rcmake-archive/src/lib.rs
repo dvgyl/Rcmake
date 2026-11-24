@@ -20,6 +20,7 @@ mod external_filter;
 mod extract;
 mod pattern;
 mod seven_zip;
+mod tar_budget;
 mod timestamp;
 mod zip_codec;
 
@@ -98,6 +99,8 @@ pub enum ZipCompression {
     Lzma,
     /// XZ.
     Xz,
+    /// PPMd, which ZIP creation rejects.
+    Ppmd,
     /// Zstandard.
     Zstd,
 }
@@ -133,6 +136,41 @@ pub struct CreateOptions {
     pub verbose: bool,
 }
 
+/// Creation options with an explicit directory walk policy.
+pub struct CreateRequest<'a> {
+    options: &'a CreateOptions,
+    deterministic_order: bool,
+    skip_apple_double: bool,
+}
+
+impl CreateOptions {
+    /// Sort children by their raw name bytes. Keep the order of explicit operands.
+    pub fn with_deterministic_order(&self) -> CreateRequest<'_> {
+        CreateRequest {
+            deterministic_order: true,
+            ..self.into()
+        }
+    }
+}
+
+impl CreateRequest<'_> {
+    /// Skip paired AppleDouble files during recursive walks.
+    pub fn skipping_apple_double(mut self) -> Self {
+        self.skip_apple_double = true;
+        self
+    }
+}
+
+impl<'a> From<&'a CreateOptions> for CreateRequest<'a> {
+    fn from(options: &'a CreateOptions) -> Self {
+        Self {
+            options,
+            deterministic_order: false,
+            skip_apple_double: false,
+        }
+    }
+}
+
 /// Options for [`extract_archive`].
 #[derive(Clone, Debug, Default)]
 pub struct ExtractOptions {
@@ -152,6 +190,35 @@ pub struct ExtractOptions {
     pub verbose: bool,
 }
 
+/// Extraction options with an explicit link policy.
+pub struct ExtractRequest<'a> {
+    options: &'a ExtractOptions,
+    confined_links: bool,
+}
+
+impl ExtractOptions {
+    /// Restrict symbolic links to relative targets inside the destination.
+    ///
+    /// Parent components are permitted before the first name in a target.
+    /// A target cannot refer to a symbolic link already at the destination.
+    /// Hard links must refer to a regular member written by this extraction.
+    pub fn with_confined_links(&self) -> ExtractRequest<'_> {
+        ExtractRequest {
+            options: self,
+            confined_links: true,
+        }
+    }
+}
+
+impl<'a> From<&'a ExtractOptions> for ExtractRequest<'a> {
+    fn from(options: &'a ExtractOptions) -> Self {
+        Self {
+            options,
+            confined_links: false,
+        }
+    }
+}
+
 /// Error returned by archive operations.
 #[derive(Clone, Debug, PartialEq, Eq, Error)]
 #[error("{message}")]
@@ -165,48 +232,52 @@ pub struct ArchiveError {
 ///
 /// The returned names use slash separators. Directory names end with a slash.
 /// ZIP creation requires UTF-8 names and preserves the nine access permission bits.
-/// ZIP timestamps have a resolution of 100 nanoseconds.
+/// Shared ZIP creation preserves timestamps to a resolution of 100 nanoseconds.
 ///
 /// # Errors
 ///
 /// Returns an error for invalid options, unsupported entries, size limits, or host errors.
-pub fn create_archive(
+pub fn create_archive<'a>(
     host: &dyn Host,
     output: &Path,
     base_dir: &Path,
     inputs: &[PathBuf],
-    options: &CreateOptions,
+    options: impl Into<CreateRequest<'a>>,
 ) -> Result<Vec<BString>, ArchiveError> {
     create::run(
         host,
         output,
         base_dir,
         inputs,
-        options,
+        options.into(),
         create::Selection::default(),
     )
 }
 
 /// Create an archive for `cmake -E tar`. The input paths can be outside `base_dir`.
 ///
+/// TAR and ZIP store whole-second modification times. TAR stores each source
+/// file as a separate member, including files that share a hard link.
+///
 /// # Errors
 ///
 /// Returns the same errors as [`create_archive`] except for paths outside the base directory.
-pub fn create_command_archive(
+pub fn create_command_archive<'a>(
     host: &dyn Host,
     output: &Path,
     base_dir: &Path,
     inputs: &[PathBuf],
-    options: &CreateOptions,
+    options: impl Into<CreateRequest<'a>>,
 ) -> Result<Vec<BString>, ArchiveError> {
     create::run(
         host,
         output,
         base_dir,
         inputs,
-        options,
+        options.into(),
         create::Selection {
             allow_outside: true,
+            command: true,
             ..Default::default()
         },
     )
@@ -216,12 +287,12 @@ pub fn create_command_archive(
 ///
 /// # Errors
 /// Returns an error for an invalid option, an empty pattern, or a host error.
-pub fn create_filtered_archive(
+pub fn create_filtered_archive<'a>(
     host: &dyn Host,
     output: &Path,
     base_dir: &Path,
     inputs: &[PathBuf],
-    options: &CreateOptions,
+    options: impl Into<CreateRequest<'a>>,
     excludes: &[BString],
     threads: u32,
 ) -> Result<Vec<BString>, ArchiveError> {
@@ -233,30 +304,31 @@ pub fn create_filtered_archive(
         output,
         base_dir,
         inputs,
-        options,
+        options.into(),
         create::Selection {
             excludes,
             threads,
             allow_outside: true,
+            command: false,
         },
     )
 }
 
 /// Extract or list an archive at absolute path `archive_path`.
 ///
-/// Symbolic links preserve their targets. Extraction rejects paths that pass
+/// By default, symbolic links preserve their targets. Extraction rejects paths that pass
 /// through symbolic links inside the destination and skips tar device and FIFO entries.
 ///
 /// # Errors
 ///
 /// Returns an error for an invalid archive, unsafe paths, unmatched patterns,
 /// unsupported formats or entries, size limits, or host errors.
-pub fn extract_archive(
+pub fn extract_archive<'a>(
     host: &dyn Host,
     archive_path: &Path,
-    options: &ExtractOptions,
+    options: impl Into<ExtractRequest<'a>>,
 ) -> Result<Vec<BString>, ArchiveError> {
-    extract::run(host, archive_path, options, extract::Listing::Shared)
+    extract::run(host, archive_path, options.into(), extract::Listing::Shared)
 }
 
 /// List selected entries with their mode, size, and modification time.
@@ -276,7 +348,7 @@ pub fn list_archive_details(
     extract::run(
         host,
         archive_path,
-        &options,
+        (&options).into(),
         extract::Listing::SharedDetails(format_time),
     )
 }
@@ -295,11 +367,12 @@ pub fn list_command_archive(
     extract::run(
         host,
         archive_path,
-        &ExtractOptions {
+        (&ExtractOptions {
             patterns,
             list_only: true,
             ..Default::default()
-        },
+        })
+            .into(),
         format_time.map_or(extract::Listing::Names, extract::Listing::Details),
     )
 }

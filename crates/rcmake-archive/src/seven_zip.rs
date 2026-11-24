@@ -21,6 +21,7 @@ const MAX_HEADER_MEMORY_KIB: usize = 16 * 1024;
 const MAX_DECODE_MEMORY_KIB: usize = 256 * 1024;
 
 mod ppmd;
+mod preflight;
 
 pub(super) struct Writer {
     output: Output,
@@ -157,12 +158,7 @@ pub(super) fn add(
 }
 
 pub(super) fn open(bytes: &[u8]) -> Result<Archive, ArchiveError> {
-    let archive = Archive::read_with_memory_limit(
-        &mut Cursor::new(bytes),
-        &Password::empty(),
-        MAX_HEADER_MEMORY_KIB,
-    )
-    .map_err(archive_error)?;
+    let archive = preflight::open(bytes)?;
     let limit_error = || ArchiveError::new("Archive exceeds the entry or size limit");
     if archive.files.len() > MAX_ENTRIES || archive.blocks.len() > MAX_ENTRIES {
         return Err(limit_error());
@@ -246,7 +242,7 @@ pub(super) fn read_entries(
     }
     for (index, entry) in archive.files.iter().enumerate() {
         if archive.stream_map.file_block_index.get(index) == Some(&None) {
-            read(index, entry, &mut &[][..])?;
+            read(index, entry, &mut b"".as_slice())?;
         }
     }
     Ok(())

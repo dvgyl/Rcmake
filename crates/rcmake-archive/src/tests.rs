@@ -8,6 +8,11 @@ use zip::{ZipArchive, ZipWriter, extra_fields::ExtraField, write::SimpleFileOpti
 
 use super::*;
 
+mod limits;
+#[cfg(unix)]
+mod oracle;
+mod paths;
+
 type TestResult = Result<(), Box<dyn Error>>;
 
 const ALL_FORMATS: [ArchiveFormat; 9] = [
@@ -77,11 +82,23 @@ fn round_trips_all_formats_in_byte_order() -> TestResult {
             "tree/z.txt",
         ]);
         assert_eq!(
-            create_archive(&host, archive, base, &input, &create)?,
+            create_archive(
+                &host,
+                archive,
+                base,
+                &input,
+                create.with_deterministic_order()
+            )?,
             expected
         );
         let duplicate = Path::new("/duplicate");
-        create_archive(&host, duplicate, base, &input, &create)?;
+        create_archive(
+            &host,
+            duplicate,
+            base,
+            &input,
+            create.with_deterministic_order(),
+        )?;
         assert_eq!(
             read_bytes(&host, archive, size_limit())?,
             read_bytes(&host, duplicate, size_limit())?
@@ -112,12 +129,13 @@ fn skips_only_paired_apple_double_files_during_directory_walks() -> TestResult {
     let host = test_host();
     let source = Path::new("/source");
     let archive = Path::new("/archive");
-    let mut sidecar = vec![0; 70];
-    sidecar[..8].copy_from_slice(b"\0\x05\x16\x07\0\x02\0\0");
-    sidecar[24..26].copy_from_slice(&1_u16.to_be_bytes());
-    sidecar[26..30].copy_from_slice(&9_u32.to_be_bytes());
-    sidecar[30..34].copy_from_slice(&38_u32.to_be_bytes());
-    sidecar[34..38].copy_from_slice(&32_u32.to_be_bytes());
+    let mut sidecar = b"\0\x05\x16\x07\0\x02\0\0".to_vec();
+    sidecar.extend_from_slice(&[0; 16]);
+    sidecar.extend_from_slice(&1_u16.to_be_bytes());
+    for value in [9_u32, 38, 32] {
+        sidecar.extend_from_slice(&value.to_be_bytes());
+    }
+    sidecar.resize(70, 0);
     for name in ["tree/._data", "tree/._unpaired"] {
         host.seed_file(&source.join(name), &sidecar)?;
     }
@@ -127,7 +145,13 @@ fn skips_only_paired_apple_double_files_during_directory_walks() -> TestResult {
     host.create_dir_all(&source.join("tree/._user-dir"))?;
     let options = create_options(ArchiveFormat::Tar);
     assert_eq!(
-        create_archive(&host, archive, source, &[PathBuf::from("tree")], &options)?,
+        create_archive(
+            &host,
+            archive,
+            source,
+            &[PathBuf::from("tree")],
+            options.with_deterministic_order().skipping_apple_double(),
+        )?,
         names(&[
             "tree/",
             "tree/._notes",
@@ -148,6 +172,9 @@ fn skips_only_paired_apple_double_files_during_directory_walks() -> TestResult {
         )?,
         names(&["tree/._data"])
     );
+    let listed =
+        create_command_archive(&host, archive, source, &[PathBuf::from("tree")], &options)?;
+    assert!(listed.contains(&BString::from("tree/._data")));
     Ok(())
 }
 
@@ -233,6 +260,7 @@ fn reports_cmake_compression_level_limits() {
     let archive = Path::new("/archive");
     for (format, max) in [
         (ArchiveFormat::ZipCompressed(ZipCompression::Zstd), 9),
+        (ArchiveFormat::ZipCompressed(ZipCompression::Ppmd), 9),
         (ArchiveFormat::GnuTarCompressed(TarCompression::Zstd), 19),
         (
             ArchiveFormat::SevenZip {
@@ -456,35 +484,6 @@ fn creates_missing_parents_for_a_selected_file() -> TestResult {
     Ok(())
 }
 
-#[test]
-fn rejects_unsafe_tar_entry_paths_before_writing() -> TestResult {
-    let host = test_host();
-    let archive = Path::new("/archive");
-    for name in [b"tree/../marker".as_slice(), b"/marker", b"bad\0name"] {
-        let mut builder = Builder::new(Vec::new());
-        add_test_tar_file(&mut builder, "valid")?;
-        builder.append_pax_extensions([("path", name)])?;
-        add_test_tar_file(&mut builder, "placeholder")?;
-        host.write(archive, &builder.into_inner()?, WriteMode::Truncate)?;
-        assert!(extract_archive(&host, archive, &extract_options()).is_err());
-        assert!(absent(&host, "/extract"));
-        assert!(absent(&host, "/marker"));
-        assert!(
-            extract_archive(
-                &host,
-                archive,
-                &ExtractOptions {
-                    list_only: true,
-                    patterns: names(&["valid"]),
-                    ..Default::default()
-                }
-            )
-            .is_err()
-        );
-    }
-    Ok(())
-}
-
 fn add_test_tar_file(builder: &mut Builder<Vec<u8>>, name: &str) -> std::io::Result<()> {
     let mut header = Header::new_gnu();
     header.set_size(1);
@@ -505,291 +504,7 @@ fn add_test_tar_link(
     header.set_mode(0o755);
     header.set_mtime(123);
     header.set_link_name_literal(target)?;
-    builder.append_data(&mut header, name, &[][..])
-}
-
-#[test]
-fn rejects_unsafe_zip_entry_paths() -> TestResult {
-    let host = test_host();
-    let archive = Path::new("/archive");
-    for name in [
-        "a/../marker",
-        "/marker",
-        "bad\0name",
-        "a\\..\\marker",
-        "C:/marker",
-    ] {
-        let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
-        writer.start_file(name, SimpleFileOptions::default())?;
-        writer.write_all(b"test")?;
-        host.write(archive, &writer.finish()?.into_inner(), WriteMode::Truncate)?;
-        assert!(extract_archive(&host, archive, &extract_options()).is_err());
-        assert!(absent(&host, "/extract"));
-        assert!(absent(&host, "/marker"));
-    }
-    Ok(())
-}
-
-#[test]
-fn rejects_unsafe_windows_entry_components() {
-    for name in [
-        b"NUL.txt".as_slice(),
-        b"cOn .txt",
-        b"lPt3",
-        b"COM\xc2\xb2.dat",
-        b"target:stream",
-        b".. ",
-        b"directory.",
-    ] {
-        assert!(unsafe_windows_name(name), "{name:?}");
-    }
-    for name in [b"nul-file".as_slice(), b"lpt10", b"normal file", b".hidden"] {
-        assert!(!unsafe_windows_name(name), "{name:?}");
-    }
-}
-
-#[test]
-fn caps_sparse_tar_size_even_when_the_entry_is_excluded() -> TestResult {
-    let host = test_host();
-    let archive = Path::new("/archive");
-    let mut builder = Builder::new(Vec::new());
-    add_test_tar_file(&mut builder, "selected")?;
-    let mut header = Header::new_gnu();
-    header.set_entry_type(EntryType::GNUSparse);
-    header.set_size(0);
-    let size = size_limit() + 1;
-    let gnu = header.as_gnu_mut().ok_or("Expected a GNU tar header")?;
-    gnu.set_real_size(size);
-    let block = gnu.sparse.first_mut().ok_or("Expected a sparse block")?;
-    block.set_offset(size);
-    block.set_length(0);
-    builder.append_data(&mut header, "sparse", &[][..])?;
-    host.seed_file(archive, &builder.into_inner()?)?;
-    let options = ExtractOptions {
-        patterns: names(&["selected"]),
-        ..extract_options()
-    };
-    assert!(
-        extract_archive(&host, archive, &options)
-            .is_err_and(|error| error.message == "Archive exceeds the size limit")
-    );
-    assert!(absent(&host, "/extract"));
-    Ok(())
-}
-
-#[test]
-fn caps_zip_size_even_when_the_entry_is_excluded() -> TestResult {
-    let host = test_host();
-    let archive = Path::new("/archive");
-    let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
-    writer.start_file("selected", SimpleFileOptions::default())?;
-    writer.write_all(b"x")?;
-    writer.start_file("oversized", SimpleFileOptions::default())?;
-    writer.write_all(b"x")?;
-    let mut bytes = writer.finish()?.into_inner();
-    let mut zip = ZipArchive::new(Cursor::new(&bytes))?;
-    let offset = usize::try_from(zip.by_index_raw(1)?.central_header_start())? + 24;
-    drop(zip);
-    let oversized = u32::try_from(size_limit() + 1)?;
-    bytes[offset..offset + 4].copy_from_slice(&oversized.to_le_bytes());
-    host.seed_file(archive, &bytes)?;
-    let options = ExtractOptions {
-        patterns: names(&["selected"]),
-        ..extract_options()
-    };
-    assert!(
-        extract_archive(&host, archive, &options)
-            .is_err_and(|error| error.message == "Archive exceeds the size limit")
-    );
-    assert!(absent(&host, "/extract"));
-    Ok(())
-}
-
-#[test]
-fn replaces_leaf_links_without_changing_their_targets() -> TestResult {
-    let host = test_host();
-    host.seed_file(Path::new("/source/tree/file"), b"archive")?;
-    host.seed_file(Path::new("/outside/file"), b"outside")?;
-    let archive = Path::new("/archive");
-    let create = create_options(ArchiveFormat::Tar);
-    create_archive(
-        &host,
-        archive,
-        Path::new("/source"),
-        &[PathBuf::from("tree/file")],
-        &create,
-    )?;
-
-    host.create_dir_all(Path::new("/extract"))?;
-    host.symlink(Path::new("/outside"), Path::new("/extract/tree"))?;
-    assert!(extract_archive(&host, archive, &extract_options()).is_err());
-    host.remove_file(Path::new("/extract/tree"))?;
-    host.create_dir_all(Path::new("/extract/tree"))?;
-    let file = Path::new("/extract/tree/file");
-    let outside = Path::new("/outside/file");
-    host.symlink(outside, file)?;
-    extract_archive(&host, archive, &extract_options())?;
-    assert_eq!(host.metadata(file, Follow::No)?.kind, FileKind::File);
-    assert_eq!(read_bytes(&host, file, 16)?, b"archive");
-
-    host.remove_file(file)?;
-    host.hard_link(outside, file)?;
-    extract_archive(&host, archive, &extract_options())?;
-    assert_eq!(read_bytes(&host, file, 16)?, b"archive");
-    assert_eq!(read_bytes(&host, outside, 16)?, b"outside");
-    assert_eq!(host.metadata(outside, Follow::No)?.nlink, 1);
-    Ok(())
-}
-
-#[test]
-fn round_trips_absolute_and_parent_symlink_targets_twice() -> TestResult {
-    for format in ALL_FORMATS {
-        let host = test_host();
-        let archive = Path::new("/archive");
-        let links = [
-            ("absolute", Path::new("/etc/hosts")),
-            ("relative", Path::new("../outside")),
-        ];
-        for (name, target) in links {
-            host.symlink(target, &Path::new("/source").join(name))?;
-        }
-        create_archive(
-            &host,
-            archive,
-            Path::new("/source"),
-            &[PathBuf::from("absolute"), PathBuf::from("relative")],
-            &create_options(format),
-        )?;
-        for _ in 0..2 {
-            extract_archive(&host, archive, &extract_options())?;
-            for (name, target) in links {
-                assert_eq!(host.read_link(&Path::new("/extract").join(name))?, target);
-            }
-        }
-    }
-    Ok(())
-}
-
-#[test]
-fn rejects_writes_through_an_extracted_symlink() -> TestResult {
-    let host = test_host();
-    host.seed_file(Path::new("/outside/file"), b"outside")?;
-    let archive = Path::new("/archive");
-    let mut builder = Builder::new(Vec::new());
-    add_test_tar_link(&mut builder, "link", EntryType::Symlink, b"/outside")?;
-    add_test_tar_file(&mut builder, "link/file")?;
-    host.seed_file(archive, &builder.into_inner()?)?;
-    assert!(extract_archive(&host, archive, &extract_options()).is_err());
-    assert_eq!(
-        host.read_link(Path::new("/extract/link"))?,
-        Path::new("/outside")
-    );
-    assert_eq!(
-        read_bytes(&host, Path::new("/outside/file"), 16)?,
-        b"outside"
-    );
-    Ok(())
-}
-
-#[test]
-fn tar_directories_cannot_be_replaced_by_symlinks() -> TestResult {
-    let host = test_host();
-    let archive = Path::new("/archive");
-    let mut builder = Builder::new(Vec::new());
-    add_test_tar_file(&mut builder, "tree/first")?;
-    add_test_tar_link(&mut builder, "tree", EntryType::Symlink, b"/outside")?;
-    add_test_tar_file(&mut builder, "tree/second")?;
-    host.seed_file(archive, &builder.into_inner()?)?;
-    let result = extract_archive(&host, archive, &extract_options());
-    assert!(result.is_err_and(|error| error.message
-        == format!(
-            "Cannot extract over this filesystem entry: {}",
-            Path::new("/extract").join("tree").display()
-        )));
-    assert!(absent(&host, "/outside/second"));
-    assert_eq!(
-        read_bytes(&host, Path::new("/extract/tree/first"), 1)?,
-        b"x"
-    );
-    Ok(())
-}
-
-#[test]
-fn chunked_tar_extraction_can_replace_the_archive_it_reads() -> TestResult {
-    let host = test_host();
-    let archive = Path::new("/extract/archive.tar");
-    let mut builder = Builder::new(Vec::new());
-    add_test_tar_file(&mut builder, "archive.tar")?;
-    let contents = vec![b'z'; 300 * 1024];
-    let mut header = Header::new_gnu();
-    header.set_size(contents.len() as u64);
-    header.set_mode(0o644);
-    header.set_mtime(0);
-    builder.append_data(&mut header, "large", contents.as_slice())?;
-    host.seed_file(archive, &builder.into_inner()?)?;
-    extract_archive(&host, archive, &extract_options())?;
-    assert_eq!(read_bytes(&host, archive, 1)?, b"x");
-    assert_eq!(
-        read_bytes(&host, Path::new("/extract/large"), size_limit())?,
-        contents
-    );
-    Ok(())
-}
-
-#[test]
-fn extracts_tar_hard_links_twice() -> TestResult {
-    let host = test_host();
-    let archive = Path::new("/archive");
-    let mut builder = Builder::new(Vec::new());
-    add_test_tar_file(&mut builder, "nested/file")?;
-    add_test_tar_link(&mut builder, "link", EntryType::Link, b"./nested/file")?;
-    host.seed_file(archive, &builder.into_inner()?)?;
-    for _ in 0..2 {
-        assert_eq!(
-            extract_archive(&host, archive, &extract_options())?,
-            names(&["nested/file", "link"])
-        );
-        let file = host.metadata(Path::new("/extract/nested/file"), Follow::No)?;
-        let link = Path::new("/extract/link");
-        assert_eq!(host.metadata(link, Follow::No)?, file);
-        assert_eq!(file.nlink, 2);
-        assert_eq!(file.mode, 0o644);
-        assert_eq!(file.mtime, timestamp::seconds(0));
-        assert_eq!(read_bytes(&host, link, 16)?, b"x");
-    }
-    Ok(())
-}
-
-#[test]
-fn rejects_unsafe_tar_hard_link_targets_before_writing() -> TestResult {
-    let host = test_host();
-    let archive = Path::new("/archive");
-    for target in [b"../outside".as_slice(), b"/outside", b"./link", b"."] {
-        let mut builder = Builder::new(Vec::new());
-        add_test_tar_file(&mut builder, "valid")?;
-        add_test_tar_link(&mut builder, "link", EntryType::Link, target)?;
-        host.write(archive, &builder.into_inner()?, WriteMode::Truncate)?;
-        assert!(extract_archive(&host, archive, &extract_options()).is_err());
-        assert!(absent(&host, "/extract"));
-    }
-    Ok(())
-}
-
-#[test]
-fn rejects_hard_link_targets_through_symlinks() -> TestResult {
-    for target in [b"parent/file".as_slice(), b"leaf"] {
-        let host = test_host();
-        host.seed_file(Path::new("/outside/file"), b"outside")?;
-        let archive = Path::new("/archive");
-        let mut builder = Builder::new(Vec::new());
-        add_test_tar_link(&mut builder, "parent", EntryType::Symlink, b"/outside")?;
-        add_test_tar_link(&mut builder, "leaf", EntryType::Symlink, b"/outside/file")?;
-        add_test_tar_link(&mut builder, "link", EntryType::Link, target)?;
-        host.seed_file(archive, &builder.into_inner()?)?;
-        assert!(extract_archive(&host, archive, &extract_options()).is_err());
-        assert!(absent(&host, "/extract/link"));
-    }
-    Ok(())
+    builder.append_data(&mut header, name, b"".as_slice())
 }
 
 #[test]
@@ -805,7 +520,7 @@ fn skips_tar_fifos_and_devices() -> TestResult {
         let mut header = Header::new_gnu();
         header.set_entry_type(kind);
         header.set_size(0);
-        builder.append_data(&mut header, name, &[][..])?;
+        builder.append_data(&mut header, name, b"".as_slice())?;
     }
     add_test_tar_file(&mut builder, "file")?;
     host.seed_file(archive, &builder.into_inner()?)?;
@@ -928,316 +643,101 @@ fn handles_empty_archives() -> TestResult {
     Ok(())
 }
 
-#[cfg(unix)]
 #[test]
-fn preserves_tar_names_that_are_not_utf8() -> TestResult {
-    let host = test_host();
-    let relative = to_native(b"tree/a\xff");
-    host.seed_file(&Path::new("/source").join(&relative), b"data")?;
-    let archive = Path::new("/archive");
-    let expected = vec![
-        BString::from("tree/"),
-        BString::from(b"tree/a\xff".as_slice()),
-    ];
-    assert_eq!(
-        create_archive(
+fn creates_repeated_zip_members_with_their_own_payloads() -> TestResult {
+    for format in [
+        ArchiveFormat::Zip,
+        ArchiveFormat::ZipStored,
+        ArchiveFormat::ZipCompressed(ZipCompression::Bzip2),
+    ] {
+        let host = test_host();
+        let archive = Path::new("/archive");
+        let input = PathBuf::from("file");
+        host.seed_file(Path::new("/source/file"), b"contents")?;
+        let expected = names(&["file", "file"]);
+        assert_eq!(
+            create_command_archive(
+                &host,
+                archive,
+                Path::new("/source"),
+                &[input.clone(), input],
+                &create_options(format),
+            )?,
+            expected
+        );
+        assert_eq!(
+            list_command_archive(&host, archive, Vec::new(), None)?,
+            expected
+        );
+        assert_eq!(
+            extract_archive(&host, archive, &extract_options())?,
+            expected
+        );
+        assert_eq!(
+            read_bytes(&host, Path::new("/extract/file"), 16)?,
+            b"contents"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn command_creation_stores_separate_tar_members_and_whole_seconds() -> TestResult {
+    for format in [
+        ArchiveFormat::Tar,
+        ArchiveFormat::GnuTar,
+        ArchiveFormat::Zip,
+    ] {
+        let host = test_host();
+        let archive = Path::new("/archive");
+        let source = Path::new("/source/a");
+        host.seed_file(source, b"data")?;
+        let secs = 1_707_871_601;
+        host.set_times(
+            source,
+            None,
+            Some(FileTime {
+                secs,
+                nanos: 123_456_700,
+            }),
+        )?;
+        host.hard_link(source, Path::new("/source/b"))?;
+        create_command_archive(
             &host,
             archive,
             Path::new("/source"),
-            &[PathBuf::from("tree")],
-            &create_options(ArchiveFormat::Tar)
-        )?,
-        expected
-    );
+            &[PathBuf::from("a"), PathBuf::from("b")],
+            &create_options(format),
+        )?;
+        extract_archive(&host, archive, &extract_options())?;
+        let a = host.metadata(Path::new("/extract/a"), Follow::No)?;
+        let b = host.metadata(Path::new("/extract/b"), Follow::No)?;
+        assert_eq!(a.mtime, timestamp::seconds(secs));
+        assert_eq!(b.mtime, a.mtime);
+        assert_ne!((a.dev, a.ino), (b.dev, b.ino));
+    }
+    Ok(())
+}
+
+#[test]
+fn zip_dos_time_uses_local_time() -> TestResult {
+    let zone = jiff::tz::Offset::from_seconds(3600)?.to_time_zone();
+    let dos = zip::DateTime::from_date_and_time(2000, 1, 1, 1, 0, 0)?;
     assert_eq!(
-        extract_archive(&host, archive, &extract_options())?,
-        expected
-    );
-    assert_eq!(
-        read_bytes(&host, &Path::new("/extract").join(relative), 16)?,
-        b"data"
+        timestamp::dos_to_unix(dos, &zone),
+        Some(timestamp::seconds(946_684_800))
     );
     Ok(())
 }
 
-#[cfg(unix)]
-mod oracle {
-    use std::time::Duration;
-
-    use rcmake_host::{CommandSpec, Input, NativeHost, Output, ProcessResult, RunRequest};
-
-    use super::*;
-
-    struct TempDir<'a> {
-        host: &'a NativeHost,
-        path: PathBuf,
-    }
-
-    impl Drop for TempDir<'_> {
-        fn drop(&mut self) {
-            let _ = self.host.remove_dir_all(&self.path);
-        }
-    }
-
-    fn run(
-        host: &NativeHost,
-        cwd: &Path,
-        program: BString,
-        arguments: &[&str],
-    ) -> Result<Vec<u8>, Box<dyn Error>> {
-        let request = RunRequest {
-            pipeline: vec![CommandSpec {
-                program,
-                args: names(arguments),
-            }],
-            cwd: cwd.to_owned(),
-            env: host.env_all(),
-            stdin: Input::Null,
-            stdout: Output::Capture,
-            stderr: Output::Capture,
-            timeout: Some(Duration::from_secs(15)),
-            tee: false,
-        };
-        let result = host.run(&request, &mut |_, _| {})?;
-        assert_eq!(
-            result.results,
-            [ProcessResult::Exited(0)],
-            "{:?}: {}",
-            request.pipeline,
-            String::from_utf8_lossy(&result.stderr)
-        );
-        Ok(result.stdout)
-    }
-
-    #[test]
-    #[ignore = "Set RCMAKE_ARCHIVE_INTEROP_CMAKE to the CMake executable"]
-    fn interops_with_cmake_7zip_archives() -> TestResult {
-        let host = NativeHost::new()?;
-        let cmake = host
-            .env_get(b"RCMAKE_ARCHIVE_INTEROP_CMAKE")
-            .ok_or("Set RCMAKE_ARCHIVE_INTEROP_CMAKE to the CMake executable")?;
-        let directory = run(&host, &host.initial_cwd(), BString::from("mktemp"), &["-d"])?;
-        let temporary = TempDir {
-            host: &host,
-            path: to_native(directory.strip_suffix(b"\n").unwrap_or(&directory)),
-        };
-        let source = temporary.path.join("source");
-        let destination = temporary.path.join("destination");
-        let archive = temporary.path.join("archive.7z");
-        host.create_dir_all(&source.join("data/empty"))?;
-        host.create_dir_all(&destination)?;
-        let payload = b"sample\n".repeat(4096);
-        let input = source.join("data/file");
-        host.write(&input, &payload, WriteMode::CreateNew)?;
-        host.set_permissions(&input, 0o751)?;
-        host.symlink(Path::new("file"), &source.join("data/link"))?;
-        let archive_arg = archive.to_str().ok_or("Invalid archive path")?;
-        for (compression, method) in [
-            (SevenZipCompression::Store, "store"),
-            (SevenZipCompression::Lzma, "lzma"),
-            (SevenZipCompression::Lzma2, "lzma2"),
-            (SevenZipCompression::Deflate, "deflate"),
-            (SevenZipCompression::Bzip2, "bzip2"),
-            (SevenZipCompression::Ppmd, "ppmd"),
-            (SevenZipCompression::Zstd, "zstd"),
-        ] {
-            let mut options = create_options(ArchiveFormat::SevenZip {
-                compression,
-                threads: 2,
-            });
-            options.mtime = Some(1_700_000_000);
-            create_archive(&host, &archive, &source, &[PathBuf::from("data")], &options)?;
-            run(
-                &host,
-                &destination,
-                cmake.clone(),
-                &["-E", "tar", "xf", archive_arg],
-            )?;
-            let output = destination.join("data/file");
-            assert_eq!(
-                read_bytes(&host, &output, size_limit())?,
-                payload,
-                "{method}"
-            );
-            assert_eq!(
-                host.read_link(&destination.join("data/link"))?,
-                Path::new("file")
-            );
-            let metadata = host.metadata(&output, Follow::No)?;
-            assert_eq!(metadata.mode & 0o777, 0o751);
-            assert_eq!(metadata.mtime, timestamp::seconds(1_700_000_000));
-            host.remove_dir_all(&destination.join("data"))?;
-
-            let option = format!("--cmake-tar-compression-method={method}");
-            run(
-                &host,
-                &source,
-                cmake.clone(),
-                &[
-                    "-E",
-                    "tar",
-                    "cf",
-                    archive_arg,
-                    "--format=7zip",
-                    &option,
-                    "data",
-                ],
-            )?;
-            let entries = extract_archive(
-                &host,
-                &archive,
-                &ExtractOptions {
-                    destination: destination.clone(),
-                    ..ExtractOptions::default()
-                },
-            )?;
-            assert!(entries.iter().any(|entry| entry == "data/empty/"));
-            assert_eq!(
-                read_bytes(&host, &output, size_limit())?,
-                payload,
-                "{method}"
-            );
-            assert_eq!(
-                host.read_link(&destination.join("data/link"))?,
-                Path::new("file")
-            );
-            host.remove_dir_all(&destination.join("data"))?;
-        }
-        Ok(())
-    }
-
-    #[test]
-    #[ignore = "Set RCMAKE_ARCHIVE_INTEROP_CMAKE to the CMake executable"]
-    fn interops_with_cmake_archives() -> TestResult {
-        let host = NativeHost::new()?;
-        let cmake = host
-            .env_get(b"RCMAKE_ARCHIVE_INTEROP_CMAKE")
-            .ok_or("Set RCMAKE_ARCHIVE_INTEROP_CMAKE to the CMake executable")?;
-        let directory = run(&host, &host.initial_cwd(), BString::from("mktemp"), &["-d"])?;
-        let path = to_native(directory.strip_suffix(b"\n").unwrap_or(&directory));
-        let temporary = TempDir { host: &host, path };
-        let root = &temporary.path;
-        let source = root.join("source");
-        let output = root.join("output");
-        host.create_dir_all(&source)?;
-        host.create_dir_all(&output)?;
-
-        // Incompressible data fills the LZW dictionary. Repeated data also tests
-        // phrases that refer to the next dictionary entry.
-        let mut state = 0x2a9d_1701_u32;
-        let mut payload: Vec<_> = (0..196_608)
-            .map(|_| {
-                state ^= state << 13;
-                state ^= state >> 17;
-                state ^= state << 5;
-                state as u8
-            })
-            .collect();
-        payload.resize(2 * payload.len(), b'a');
-        host.write(&source.join("input"), &payload, WriteMode::CreateNew)?;
-        let rcmake_archive = root.join("rcmake-archive.Z");
-        let oracle_archive = root.join("oracle-archive");
-        let rcmake_path = rcmake_archive.to_str().ok_or("Invalid archive path")?;
-        let oracle_path = oracle_archive.to_str().ok_or("Invalid archive path")?;
-        for (format, flags, options) in [
-            (ArchiveFormat::Tar, "cf", &[][..]),
-            (ArchiveFormat::Tar, "cf", &["--format=pax"][..]),
-            (ArchiveFormat::Tar, "cf", &["--format=paxr"][..]),
-            (ArchiveFormat::GnuTar, "cf", &["--format=gnutar"][..]),
-            (ArchiveFormat::TarGz, "czf", &[][..]),
-            (ArchiveFormat::TarBz2, "cjf", &[][..]),
-            (ArchiveFormat::TarXz, "cJf", &[][..]),
-            (ArchiveFormat::TarLzma, "cf", &["--lzma"][..]),
-            (ArchiveFormat::TarZstd, "cf", &["--zstd"][..]),
-            (ArchiveFormat::TarZ, "cf", &[][..]),
-            (ArchiveFormat::Zip, "cf", &["--format=zip"][..]),
-            (
-                ArchiveFormat::ZipStored,
-                "cf",
-                &["--format=zip", "--cmake-tar-compression-method=store"][..],
-            ),
-        ] {
-            create_archive(
-                &host,
-                &rcmake_archive,
-                &source,
-                &[PathBuf::from("input")],
-                &create_options(format),
-            )?;
-            let list = run(
-                &host,
-                &output,
-                cmake.clone(),
-                &["-E", "tar", "tf", rcmake_path],
-            )?;
-            assert_eq!(list, b"input\n", "{format:?}");
-            run(
-                &host,
-                &output,
-                cmake.clone(),
-                &["-E", "tar", "xf", rcmake_path],
-            )?;
-            assert_eq!(
-                read_bytes(&host, &output.join("input"), size_limit())?,
-                payload
-            );
-            host.remove_file(&output.join("input"))?;
-
-            let mut args = vec!["-E", "tar", flags, oracle_path];
-            args.extend_from_slice(options);
-            args.push("input");
-            run(&host, &source, cmake.clone(), &args)?;
-            if format == ArchiveFormat::TarZ {
-                #[cfg(target_os = "macos")]
-                {
-                    let system_tar = run(
-                        &host,
-                        root,
-                        BString::from("/usr/bin/uncompress"),
-                        &["-c", rcmake_path],
-                    )?;
-                    assert_eq!(
-                        system_tar,
-                        read_bounded(
-                            compress::Decoder::new(&read_bytes(
-                                &host,
-                                &rcmake_archive,
-                                size_limit()
-                            )?)?,
-                            size_limit(),
-                        )?
-                    );
-                    let encoded = run(
-                        &host,
-                        root,
-                        BString::from("/usr/bin/compress"),
-                        &["-c", oracle_path],
-                    )?;
-                    host.write(&oracle_archive, &encoded, WriteMode::Truncate)?;
-                }
-                #[cfg(not(target_os = "macos"))]
-                continue;
-            }
-            assert_eq!(
-                list_command_archive(&host, &oracle_archive, names(&["input"]), None)?,
-                names(&["input"]),
-                "{format:?}"
-            );
-            extract_archive(
-                &host,
-                &oracle_archive,
-                &ExtractOptions {
-                    destination: output.clone(),
-                    patterns: names(&["input"]),
-                    ..Default::default()
-                },
-            )?;
-            assert_eq!(
-                read_bytes(&host, &output.join("input"), size_limit())?,
-                payload
-            );
-            host.remove_file(&output.join("input"))?;
-        }
-        Ok(())
-    }
+#[test]
+fn zip_ppmd_reports_the_cmake_diagnostic() {
+    let result = create_command_archive(
+        &test_host(),
+        Path::new("/archive"),
+        Path::new("/source"),
+        &[],
+        &create_options(ArchiveFormat::ZipCompressed(ZipCompression::Ppmd)),
+    );
+    assert!(result.is_err_and(|error| error.message == "PPMd is not supported for zip"));
 }
