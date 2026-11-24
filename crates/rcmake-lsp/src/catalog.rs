@@ -317,41 +317,81 @@ pub(crate) const VARIABLES: &[(&str, &str)] = &[
     ("PROJECT_VERSION", "Version of the current project."),
 ];
 
-pub(crate) const KEYWORDS: &[&str] = &[
-    "ALIAS",
-    "AND",
-    "CACHE",
-    "COMMAND",
-    "COMPONENT",
-    "CONFIG",
-    "DEFINED",
-    "DESTINATION",
-    "EXCLUDE_FROM_ALL",
-    "EXISTS",
-    "FALSE",
-    "FORCE",
-    "GENERATED",
-    "GLOBAL",
-    "IMPORTED",
-    "INTERFACE",
-    "LISTS",
-    "MODULE",
-    "NAMES",
-    "NOT",
-    "OFF",
-    "ON",
-    "OPTIONAL",
-    "OR",
-    "PARENT_SCOPE",
-    "PRIVATE",
-    "PUBLIC",
-    "QUIET",
-    "RANGE",
-    "REQUIRED",
-    "SHARED",
-    "STATIC",
-    "STREQUAL",
-    "TARGET",
-    "TRUE",
-    "VERSION",
+pub(crate) const MODULE_COMMANDS: &[(&str, &str, &str, &str)] = &[
+    (
+        "FetchContent_Declare",
+        "FetchContent",
+        "FetchContent_Declare(<name> <content-options>...)",
+        "Record how to obtain a dependency at configure time.",
+    ),
+    (
+        "FetchContent_MakeAvailable",
+        "FetchContent",
+        "FetchContent_MakeAvailable(<name>...)",
+        "Obtain the declared dependencies and make them available to the project.",
+    ),
+    (
+        "FetchContent_GetProperties",
+        "FetchContent",
+        "FetchContent_GetProperties(<name> [SOURCE_DIR <var>] [BINARY_DIR <var>] [POPULATED <var>])",
+        "Read the source directory, binary directory, or population status of a dependency.",
+    ),
+    (
+        "FetchContent_Populate",
+        "FetchContent",
+        "FetchContent_Populate(<name> <content-options>...)",
+        "Obtain the source files for a dependency.",
+    ),
+    (
+        "ExternalProject_Add",
+        "ExternalProject",
+        "ExternalProject_Add(<name> <option>...)",
+        "Add a target that drives the build of an external project.",
+    ),
 ];
+
+pub(crate) fn signature(name: &str) -> Option<&'static str> {
+    match name {
+        "target_link_libraries" => Some(
+            "target_link_libraries(<target> <PRIVATE|PUBLIC|INTERFACE> <item>... [...])\n\
+             target_link_libraries(<target> <item>...)",
+        ),
+        "target_compile_options" => Some(
+            "target_compile_options(<target> [BEFORE] <INTERFACE|PUBLIC|PRIVATE> <option>... [...])",
+        ),
+        "target_include_directories" => Some(
+            "target_include_directories(<target> [SYSTEM] [AFTER|BEFORE] <INTERFACE|PUBLIC|PRIVATE> <dir>... [...])",
+        ),
+        "target_compile_definitions" => Some(
+            "target_compile_definitions(<target> <INTERFACE|PUBLIC|PRIVATE> <definition>... [...])",
+        ),
+        "target_compile_features" => {
+            Some("target_compile_features(<target> <INTERFACE|PUBLIC|PRIVATE> <feature>... [...])")
+        }
+        "target_link_options" => Some(
+            "target_link_options(<target> [BEFORE] <INTERFACE|PUBLIC|PRIVATE> <option>... [...])",
+        ),
+        "target_link_directories" => Some(
+            "target_link_directories(<target> [BEFORE|AFTER] <INTERFACE|PUBLIC|PRIVATE> <dir>... [...])",
+        ),
+        "target_precompile_headers" => Some(
+            "target_precompile_headers(<target> <INTERFACE|PUBLIC|PRIVATE> <header>... [...])\n\
+             target_precompile_headers(<target> REUSE_FROM <other-target>)",
+        ),
+        "target_sources" => {
+            Some("target_sources(<target> <INTERFACE|PUBLIC|PRIVATE> <source>... [...])")
+        }
+        "add_library" => Some("add_library(<name> [<type>] [EXCLUDE_FROM_ALL] [<source>...])"),
+        "add_executable" => Some("add_executable(<name> [<option>...] [<source>...])"),
+        "add_subdirectory" => {
+            Some("add_subdirectory(<source-dir> [<binary-dir>] [EXCLUDE_FROM_ALL] [SYSTEM])")
+        }
+        "include" => Some(
+            "include(<file|module> [OPTIONAL] [RESULT_VARIABLE <var>] [NO_POLICY_SCOPE] [NO_DIAGNOSTIC_SCOPE])",
+        ),
+        "add_dependencies" => Some("add_dependencies(<target> [<target-dependency>...])"),
+        "set" => Some("set(<variable> <value>... [PARENT_SCOPE])"),
+        "option" => Some("option(<variable> \"<help>\" [<value>])"),
+        _ => None,
+    }
+}

@@ -3,7 +3,7 @@ use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
 use rcmake_base::Limits;
-use rcmake_host::{FileKind, FileTime, Follow, Host, HostError, HostResult, Metadata, ReadRange};
+use rcmake_host::{FileKind, Follow, Host, HostError, HostResult, Metadata, ReadRange};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
@@ -55,13 +55,13 @@ impl From<&Metadata> for FastStat {
 /// One input observed during a computation.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum InputStamp {
-    /// A file identified by metadata.
+    /// A file identified by its permission bits and content digest.
     FileStat {
         /// Absolute file path.
         path: PathBuf,
         /// Observed metadata.
         stat: FastStat,
-        /// Content digest for verification after a metadata change.
+        /// Observed content digest. Old records without a digest cannot be reused.
         #[serde(default)]
         digest: Option<Digest>,
     },
@@ -112,25 +112,12 @@ impl InputStamp {
         path: PathBuf,
         timestamp_resolution: Duration,
     ) -> HostResult<Self> {
-        let stat = FastStat::read(host, &path)?;
-        let digest = file_digest(host, &path)?;
-        if FastStat::read(host, &path)? != stat {
-            return Err(crate::io_at(
-                std::io::Error::new(
-                    ErrorKind::InvalidData,
-                    "Trace file changed during recording.",
-                ),
-                &path,
-            ));
-        }
-        let mtime = FileTime {
-            secs: stat.mtime_secs,
-            nanos: stat.mtime_nanos,
-        };
-        if crate::gc::older_than(host.now(), mtime, timestamp_resolution) {
+        let metadata = host.metadata(&path, Follow::Yes)?;
+        let digest = hash_file(host, &path, &metadata)?;
+        if crate::gc::older_than(host.now(), metadata.mtime, timestamp_resolution) {
             Ok(Self::FileStat {
                 path,
-                stat,
+                stat: FastStat::from(&metadata),
                 digest: Some(digest),
             })
         } else {
@@ -164,6 +151,10 @@ pub struct MissReason {
 /// during the read.
 pub fn file_digest(host: &dyn Host, path: &Path) -> HostResult<Digest> {
     let before = host.metadata(path, Follow::Yes)?;
+    hash_file(host, path, &before)
+}
+
+fn hash_file(host: &dyn Host, path: &Path, before: &Metadata) -> HostResult<Digest> {
     if before.kind != FileKind::File {
         return Err(HostError::unsupported("Expected a regular file."));
     }
@@ -198,7 +189,7 @@ pub fn file_digest(host: &dyn Host, path: &Path) -> HostResult<Digest> {
     let after = host.metadata(path, Follow::Yes)?;
     if offset != before.len
         || after.kind != FileKind::File
-        || FastStat::from(&before) != FastStat::from(&after)
+        || FastStat::from(before) != FastStat::from(&after)
     {
         return Err(crate::io_at(
             std::io::Error::new(
@@ -242,21 +233,13 @@ pub fn verify_trace(host: &dyn Host, trace: &[InputStamp]) -> VerifyOutcome {
 fn matches_input(host: &dyn Host, input: &InputStamp) -> bool {
     match input {
         InputStamp::FileStat { path, stat, digest } => {
-            let Ok(current) = FastStat::read(host, path) else {
+            let Some(digest) = digest else {
                 return false;
             };
-            if current != *stat {
-                return current.mode == stat.mode
-                    && digest.is_some_and(|digest| file_digest(host, path) == Ok(digest));
-            }
-            host.read(
-                path,
-                ReadRange::Slice {
-                    offset: 0,
-                    len: Some(0),
-                },
-            )
-            .is_ok()
+            let Ok(current) = host.metadata(path, Follow::Yes) else {
+                return false;
+            };
+            current.mode == stat.mode && hash_file(host, path, &current).as_ref() == Ok(digest)
         }
         InputStamp::FileHash { path, digest } => file_digest(host, path).as_ref() == Ok(digest),
         InputStamp::DirEntries { path, digest } => {

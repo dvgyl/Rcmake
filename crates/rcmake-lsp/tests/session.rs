@@ -266,33 +266,122 @@ fn change(version: i64, changes: &str) -> RpcMessage {
     ))
 }
 
-#[test]
-fn incremental_edits_clamp_character_offsets_and_ignore_range_length() {
-    struct EchoText;
-    impl SemanticProvider for EchoText {
-        fn hover(&self, context: &SemanticContext<'_>) -> Option<String> {
-            Some(context.text.into())
-        }
+fn rejected(mut messages: Vec<RpcMessage>, recovery: &str) -> Value {
+    let Some(RpcMessage::Call {
+        id: None,
+        method,
+        params,
+    }) = messages.pop()
+    else {
+        panic!("Expected a warning.")
+    };
+    assert_eq!(method, "window/showMessage");
+    assert_eq!(get(&params, "type"), &Value::Int(2));
+    assert_eq!(
+        get(&params, "message"),
+        &Value::string(format!(
+            "Rcmake lost synchronization with {URI}. {recovery}"
+        )),
+    );
+    published(messages)
+}
+
+struct EchoText;
+
+impl SemanticProvider for EchoText {
+    fn hover(&self, context: &SemanticContext<'_>) -> Option<String> {
+        Some(context.text.into())
     }
+}
+
+fn assert_text(server: &mut Server<'_>, expected: &str) {
+    assert_eq!(
+        get(&at(server, "textDocument/hover", 0, 999), "contents"),
+        &object(&[
+            ("kind", Value::string("plaintext")),
+            ("value", Value::string(expected)),
+        ]),
+    );
+}
+
+#[test]
+fn incremental_edits_use_exact_unicode_boundaries_and_clamp_at_line_end() {
     for (utf8, end) in [(false, 11), (true, 13)] {
         let host = host();
         let mut server = initialized(&host, utf8).with_semantic_provider(&EchoText);
         open(&mut server, "message(\"😃X\")\r\n");
         let changes = format!(
-            r#"[{{"range":{{"start":{{"line":0,"character":10}},"end":{{"line":0,"character":{end}}}}},"rangeLength":123,"text":"Y"}}]"#
+            r#"[{{"range":{{"start":{{"line":0,"character":9}},"end":{{"line":0,"character":{end}}}}},"rangeLength":123,"text":"Y"}},
+                {{"range":{{"start":{{"line":0,"character":999}},"end":{{"line":0,"character":1000}}}},"text":" "}},
+                {{"range":{{"start":{{"line":1,"character":0}},"end":{{"line":1,"character":0}}}},"text":"message(EOF)"}}]"#
         );
         let diagnostics = published(server.handle(change(2, &changes)));
         assert_eq!(get(&diagnostics, "version"), &Value::Int(2));
         assert!(array(get(&diagnostics, "diagnostics")).is_empty());
-        assert_eq!(
-            get(&at(&mut server, "textDocument/hover", 0, 999), "contents"),
-            &object(&[
-                ("kind", Value::string("plaintext")),
-                ("value", Value::string("message(\"YX\")\r\n")),
-            ]),
-        );
+        assert_text(&mut server, "message(\"YX\") \r\nmessage(EOF)");
         assert!(server.handle(change(2, &changes)).is_empty());
     }
+}
+
+#[test]
+fn incremental_edits_reject_split_unicode_scalars() {
+    for (utf8, end) in [(false, 11), (true, 13)] {
+        let host = host();
+        let mut server = initialized(&host, utf8).with_semantic_provider(&EchoText);
+        open(&mut server, "message(\"😀\")\n");
+        let changes = format!(
+            r#"[{{"range":{{"start":{{"line":0,"character":10}},"end":{{"line":0,"character":{end}}}}},"text":"Y"}}]"#
+        );
+        let diagnostics = rejected(
+            server.handle(change(2, &changes)),
+            "Save the file with full text or reopen it to restore language features.",
+        );
+        assert!(array(get(&diagnostics, "diagnostics")).is_empty());
+        assert_eq!(at(&mut server, "textDocument/hover", 0, 0), Value::Null);
+    }
+}
+
+#[test]
+fn incremental_edits_track_changes_to_carriage_return_lines() {
+    let host = host();
+    let mut server = initialized(&host, false).with_semantic_provider(&EchoText);
+    let text = "# lead\rmessage(OLD)\rset(A 1)\r";
+    assert!(array(get(&open(&mut server, text), "diagnostics")).is_empty());
+    let changes = r#"[
+        {"range":{"start":{"line":1,"character":0},"end":{"line":1,"character":0}},"text":"\n"},
+        {"range":{"start":{"line":1,"character":8},"end":{"line":1,"character":11}},"text":"NEXT"},
+        {"range":{"start":{"line":2,"character":0},"end":{"line":3,"character":99}},"text":"set(A 2)\r\nset(B 3)\r"},
+        {"range":{"start":{"line":3,"character":6},"end":{"line":3,"character":7}},"text":"4"}]"#;
+    let diagnostics = published(server.handle(change(2, changes)));
+    assert!(array(get(&diagnostics, "diagnostics")).is_empty());
+    assert_text(
+        &mut server,
+        "# lead\r\nmessage(NEXT)\rset(A 2)\r\nset(B 4)\r",
+    );
+}
+
+#[test]
+fn many_cursor_changes_keep_a_large_buffer_synchronized() {
+    let host = host();
+    let mut server = initialized(&host, false).with_semantic_provider(&EchoText);
+    let line = format!("set(VALUE old) # {}\n", "a".repeat(1007));
+    let text = line.repeat(1024);
+    assert!(text.len() >= 1024 * 1024);
+    open(&mut server, &text);
+    let mut edits = Vec::new();
+    let mut expected = text;
+    for row in (0..1024).step_by(8) {
+        edits.push(format!(
+            r#"{{"range":{{"start":{{"line":{row},"character":10}},"end":{{"line":{row},"character":13}}}},"text":"next"}}"#
+        ));
+    }
+    for row in (0..1024).step_by(8).rev() {
+        let start = row * line.len() + 10;
+        expected.replace_range(start..start + 3, "next");
+    }
+    let diagnostics = published(server.handle(change(2, &format!("[{}]", edits.join(",")))));
+    assert!(array(get(&diagnostics, "diagnostics")).is_empty());
+    assert_text(&mut server, &expected);
 }
 
 #[test]
@@ -319,13 +408,21 @@ fn rejected_incremental_edits_disable_features_until_full_text_arrives() {
         }
         assert_indent_edits(&format(&mut server), &[1], "  ");
         let invalid = r#"[{"range":{"start":{"line":9,"character":0},"end":{"line":9,"character":0}},"text":"x"}]"#;
-        let diagnostics = published(server.handle(change(offset, invalid)));
+        let diagnostics = rejected(
+            server.handle(change(offset, invalid)),
+            "Save the file with full text or reopen it to restore language features.",
+        );
         assert_eq!(get(&diagnostics, "version"), &Value::Int(offset));
         assert!(array(get(&diagnostics, "diagnostics")).is_empty());
         assert_eq!(format(&mut server), Value::Null);
         assert_eq!(at(&mut server, "textDocument/hover", 0, 0), Value::Null);
         let valid = r#"[{"range":{"start":{"line":1,"character":0},"end":{"line":1,"character":0}},"text":"x"}]"#;
         published(server.handle(change(offset + 1, valid)));
+        assert_eq!(format(&mut server), Value::Null);
+        published(server.handle(RpcMessage::notification(
+            "textDocument/didSave",
+            object(&[("textDocument", object(&[("uri", Value::string(URI))]))]),
+        )));
         assert_eq!(format(&mut server), Value::Null);
         let doc = object(&[
             ("uri", Value::string(URI)),
@@ -354,12 +451,16 @@ fn assert_indent_edits(result: &Value, lines: &[u64], indent: &str) {
     let edits = array(result);
     assert_eq!(edits.len(), lines.len());
     for (edit, line) in edits.iter().zip(lines) {
-        assert_eq!(get(edit, "newText"), &Value::string(indent));
-        for endpoint in ["start", "end"] {
-            let point = get(get(edit, "range"), endpoint);
-            assert_eq!(get(point, "line"), &Value::UInt(*line));
-            assert_eq!(get(point, "character"), &Value::UInt(0));
-        }
+        assert_indent_edit(edit, *line, indent);
+    }
+}
+
+fn assert_indent_edit(edit: &Value, line: u64, indent: &str) {
+    assert_eq!(get(edit, "newText"), &Value::string(indent));
+    for endpoint in ["start", "end"] {
+        let point = get(get(edit, "range"), endpoint);
+        assert_eq!(get(point, "line"), &Value::UInt(line));
+        assert_eq!(get(point, "character"), &Value::UInt(0));
     }
 }
 
@@ -367,7 +468,7 @@ fn assert_indent_edits(result: &Value, lines: &[u64], indent: &str) {
 fn formatter_preserves_multiline_literals_comments_and_line_endings() {
     let host = host();
     let mut server = initialized(&host, true);
-    let text = "if(ON)\r\nset(V [==[\r\nkeep  this\r\n]==])\r\n#[=[\r\n# keep this too\r\n]=]\r\nendif()\r\n";
+    let text = "if(ON)\r\nset(V [==[\r\nkeep  this\r\n]==])\r\n#[=[\r\n# keep this too\r\n]=]\r\nset(V \"keep\r\n  this too\")\r\n  \r\nendif()\r\n";
     open(&mut server, text);
     let options = object(&[
         ("tabSize", Value::Int(2)),
@@ -378,7 +479,70 @@ fn formatter_preserves_multiline_literals_comments_and_line_endings() {
         "textDocument/formatting",
         &[("options", options)],
     );
-    assert_indent_edits(&response, &[1, 4], "\t");
+    assert_indent_edits(&response, &[1, 4, 7], "\t");
+}
+
+#[test]
+fn formatter_aligns_a_close_with_the_opener_when_no_argument_precedes_it() {
+    let host = host();
+    let mut server = initialized(&host, false);
+    let text = concat!(
+        "if(ON)\rmessage(\rone\rtwo)\r",
+        "message(\rone\r) # close\r",
+        "message(\r(\rone\r) two)\rendif()\r",
+    );
+    assert!(array(get(&open(&mut server, text), "diagnostics")).is_empty());
+    let response = request(
+        &mut server,
+        "textDocument/formatting",
+        &[(
+            "options",
+            object(&[
+                ("tabSize", Value::Int(2)),
+                ("insertSpaces", Value::Bool(true)),
+            ]),
+        )],
+    );
+    let edits = array(&response);
+    let expected = [
+        "  ", "    ", "    ", "  ", "    ", "  ", "  ", "    ", "    ", "    ",
+    ];
+    assert_eq!(edits.len(), expected.len());
+    for (line, (edit, indent)) in edits.iter().zip(expected).enumerate() {
+        assert_indent_edit(edit, line as u64 + 1, indent);
+    }
+}
+
+#[test]
+fn formatter_reports_the_response_limit() {
+    let host = host();
+    let mut server = initialized(&host, false);
+    let text = format!(
+        "{}{}{}",
+        "if(ON)\n".repeat(1000),
+        "message(TEXT)\n".repeat(600),
+        "endif()\n".repeat(1000),
+    );
+    assert!(array(get(&open(&mut server, &text), "diagnostics")).is_empty());
+    let response = server.handle(RpcMessage::request(
+        RequestId::Int(2),
+        "textDocument/formatting",
+        object(&[
+            ("textDocument", object(&[("uri", Value::string(URI))])),
+            (
+                "options",
+                object(&[
+                    ("tabSize", Value::Int(32)),
+                    ("insertSpaces", Value::Bool(true)),
+                ]),
+            ),
+        ]),
+    ));
+    assert!(matches!(
+        response.as_slice(),
+        [RpcMessage::Error { code: -32803, message, .. }]
+            if message.contains("16 MiB response limit")
+    ));
 }
 
 #[test]

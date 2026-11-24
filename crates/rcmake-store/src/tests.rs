@@ -1,4 +1,7 @@
-use std::thread;
+use std::{
+    sync::{Mutex, mpsc},
+    thread,
+};
 
 use rcmake_host::{FileTime, PureHost};
 
@@ -86,7 +89,8 @@ fn concurrent_publish_preserves_winner_and_cleans_staging() -> HostResult<()> {
         let first = scope.spawn(|| {
             barrier.wait();
             store.put_blob(b"identical blob")?;
-            store.put_entry(domain, key, &entry("first"))
+            store.put_entry(domain, key, &entry("first"))?;
+            Ok::<_, HostError>(())
         });
         barrier.wait();
         store.put_blob(b"identical blob")?;
@@ -180,7 +184,7 @@ fn stat_negative_lookup_and_environment_invalidate_the_entry() -> HostResult<()>
         InputStamp::FileStat {
             path: header.clone(),
             stat: FastStat::read(&host, &header)?,
-            digest: None,
+            digest: Some(file_digest(&host, &header)?),
         },
         InputStamp::NegativeLookup {
             root: root.clone(),
@@ -321,7 +325,10 @@ fn off_read_only_and_verify_modes() -> HostResult<()> {
     store.config.mode = StoreMode::ReadOnly;
     assert_eq!(store.get_entry(domain, key)?, Some(result.clone()));
     assert_eq!(host.metadata(&path, Follow::No)?.mtime, before);
-    store.put_entry(domain, domain.key(b"new"), &result)?;
+    assert_eq!(
+        store.put_entry(domain, domain.key(b"new"), &result)?,
+        PublishOutcome::Disabled,
+    );
     assert_eq!(store.get_entry::<String>(domain, domain.key(b"new"))?, None);
     assert_eq!(store.get_blob(store.put_blob(b"new")?)?, None);
     assert_eq!(store.gc()?, GcReport::default());
@@ -347,7 +354,7 @@ fn cache_location_uses_host_environment() {
     assert_eq!(config.root, host.initial_cwd().join("custom-cache"));
     assert_eq!(config.mode, StoreMode::ReadWrite);
     assert_eq!(config.max_bytes, 1000);
-    assert_eq!(config.blob_grace, Duration::from_secs(600));
+    assert_eq!(config.blob_grace, Duration::from_secs(3600));
 }
 
 #[test]
@@ -361,9 +368,16 @@ fn stale_or_corrupt_entry_can_be_refreshed() -> HostResult<()> {
         name: b"TEST_INPUT".to_vec(),
         digest: None,
     });
-    store.put_entry(domain, key, &original)?;
+    assert_eq!(
+        store.put_entry(domain, key, &original)?,
+        PublishOutcome::Published
+    );
     host.env_set(b"TEST_INPUT", Some(b"new value"));
     assert_eq!(store.get_entry::<String>(domain, key)?, None);
+    assert_eq!(
+        store.put_entry(domain, key, &original)?,
+        PublishOutcome::Stale
+    );
     let fresh = entry("fresh");
     store.put_entry(domain, key, &fresh)?;
     assert_eq!(store.get_entry(domain, key)?, Some(fresh));
@@ -489,15 +503,20 @@ fn unsupported_rename_uses_fallback_and_preserves_existing_file() -> HostResult<
     let temp = store.config.root.join("tmp/staged");
     let output = store.config.root.join("final");
     host.seed_file(&temp, b"first")?;
-    store.rename_staged(&temp, &output, || {
+    let locked = store.lock_cache(Duration::ZERO)?;
+    locked.rename_staged(&temp, &output, || {
         Err(HostError::unsupported("Unsupported by test host."))
     })?;
     assert!(store.file_metadata(&temp)?.is_none());
-    assert!(!store.publish(&output, b"second", false)?);
+    assert!(
+        locked
+            .publish(&output, b"second", false)
+            .is_err_and(|error| error.kind == ErrorKind::AlreadyExists)
+    );
     assert_eq!(host.read(&output, ReadRange::All { limit: 32 })?, b"first");
     host.create_dir_all(&store.config.root.join("blocked/child"))?;
     assert!(
-        store
+        locked
             .publish(&store.config.root.join("blocked"), b"unused", true)
             .is_err()
     );
@@ -514,10 +533,327 @@ fn entries_with_blobs_skip_publication_while_collection_holds_lock() -> HostResu
     let domain = Domain::FetchV1;
     let key = domain.key(b"dependency");
     let lock = host.lock_file(&store.gc_lock_path()?, Some(Duration::ZERO))?;
-    store.put_entry(domain, key, &result)?;
+    assert_eq!(
+        store.put_entry(domain, key, &result)?,
+        PublishOutcome::SkippedBusy
+    );
     assert_eq!(store.get_entry::<String>(domain, key)?, None);
     drop(lock);
-    store.put_entry(domain, key, &result)?;
+    assert_eq!(
+        store.put_entry(domain, key, &result)?,
+        PublishOutcome::Published
+    );
     assert_eq!(store.get_entry(domain, key)?, Some(result));
     Ok(())
+}
+
+#[test]
+fn stat_stamps_check_same_inode_rewrites_and_reject_old_records() -> HostResult<()> {
+    let host = host();
+    let path = host.initial_cwd().join("source");
+    host.seed_file(&path, b"set(VALUE old)")?;
+    let stamp = InputStamp::record_file(&host, path.clone(), Duration::ZERO)?;
+    assert!(matches!(stamp, InputStamp::FileStat { .. }));
+    let stat = host.metadata(&path, Follow::Yes)?;
+    assert_eq!(
+        verify_trace(&host, std::slice::from_ref(&stamp)),
+        VerifyOutcome::Hit
+    );
+    let old_record = serde_json::json!({
+        "FileStat": { "path": path, "stat": FastStat::from(&stat) },
+    });
+    let legacy = serde_json::from_value(old_record).map_err(|error| io_at(error.into(), &path))?;
+    assert_eq!(
+        verify_trace(&host, &[legacy]),
+        VerifyOutcome::Miss(MissReason { stamp: 0 })
+    );
+    host.sleep(Duration::from_secs(1));
+    host.write(&path, b"set(VALUE new)", WriteMode::Truncate)?;
+    host.set_times(&path, None, Some(stat.mtime))?;
+    assert_eq!(FastStat::read(&host, &path)?, FastStat::from(&stat));
+    assert_eq!(
+        verify_trace(&host, &[stamp]),
+        VerifyOutcome::Miss(MissReason { stamp: 0 })
+    );
+    Ok(())
+}
+
+#[test]
+fn blob_and_aliases_report_busy_disabled_and_present() -> HostResult<()> {
+    let host = host();
+    let mut store = store(&host)?;
+    let domain = Domain::FetchV1;
+    let aliases = [domain.key(b"digest alias"), domain.key(b"URL alias")];
+    let data = b"archive";
+    let digest = Digest::hash(data);
+    let lock = store.lock_cache(Duration::ZERO)?;
+    assert_eq!(
+        store.put_blob_with_aliases(data, domain, &aliases)?,
+        (digest, PublishOutcome::SkippedBusy)
+    );
+    assert_eq!(store.get_blob(digest)?, None);
+    for key in aliases {
+        assert_eq!(store.get_entry::<Digest>(domain, key)?, None);
+    }
+    drop(lock);
+    store.config.mode = StoreMode::ReadOnly;
+    assert_eq!(
+        store.put_blob_with_aliases(data, domain, &aliases)?,
+        (digest, PublishOutcome::Disabled)
+    );
+    assert_eq!(store.get_blob(digest)?, None);
+    store.config.mode = StoreMode::ReadWrite;
+    assert_eq!(
+        store.put_blob_with_aliases(data, domain, &aliases)?,
+        (digest, PublishOutcome::Published)
+    );
+    assert_eq!(
+        store.put_blob_with_aliases(data, domain, &aliases)?,
+        (digest, PublishOutcome::AlreadyPresent)
+    );
+    assert_eq!(store.get_blob(digest)?.as_deref(), Some(data.as_slice()));
+    for key in aliases {
+        assert_eq!(
+            store.get_entry(domain, key)?,
+            Some(Entry {
+                trace: Vec::new(),
+                blobs: vec![digest],
+                payload: digest
+            }),
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn bounded_blob_lookup_leaves_an_oversized_blob_in_the_store() -> HostResult<()> {
+    let host = host();
+    let mut store = store(&host)?;
+    let data = vec![b'a'; 32 * 1024];
+    let domain = Domain::FetchV1;
+    let alias = domain.key(b"bounded lookup");
+    let (digest, outcome) = store.put_blob_with_aliases(&data, domain, &[alias])?;
+    assert_eq!(outcome, PublishOutcome::Published);
+    let limit = 1024;
+    let stat = host.metadata(&store.blob_path(digest), Follow::No)?;
+    assert!(stat.len < frame::disk_limit(limit));
+    store.config.mode = StoreMode::Verify;
+    assert_eq!(
+        store.get_entry_with_blob_limit::<Digest>(domain, alias, limit)?,
+        None
+    );
+    assert!(store.get_entry::<Digest>(domain, alias)?.is_some());
+    assert_eq!(store.get_blob_with_limit(digest, limit)?, None);
+    assert_eq!(store.get_blob_with_diagnostics(digest, limit)?, None);
+    assert_eq!(
+        store.get_entry_with_diagnostics::<Digest>(domain, alias, limit)?,
+        None
+    );
+    assert_eq!(store.get_blob_with_limit(digest, data.len())?, Some(data));
+    Ok(())
+}
+
+#[test]
+fn diagnostic_lookup_reports_the_blocked_cache_directory() -> HostResult<()> {
+    let host = host();
+    let store = store(&host)?;
+    let digest = Digest::hash(b"archive");
+    let domain = Domain::FetchV1;
+    let key = domain.key(b"archive");
+    assert_eq!(store.get_blob_with_diagnostics(digest, 1024)?, None);
+    assert_eq!(
+        store.get_entry_with_diagnostics::<Digest>(domain, key, 1024)?,
+        None
+    );
+    let blocked = store.root().join("blobs");
+    host.seed_file(&blocked, b"file instead of directory")?;
+    assert_eq!(store.get_blob(digest)?, None);
+    assert!(
+        store
+            .get_blob_with_diagnostics(digest, 1024)
+            .is_err_and(|error| {
+                error.kind == ErrorKind::NotADirectory
+                    && error.path.as_deref() == Some(blocked.as_path())
+            })
+    );
+    let blocked = store.root().join("entries").join(domain.as_str());
+    host.seed_file(&blocked, b"file instead of directory")?;
+    assert_eq!(store.get_entry::<Digest>(domain, key)?, None);
+    assert!(
+        store
+            .get_entry_with_diagnostics::<Digest>(domain, key, 1024)
+            .is_err_and(|error| {
+                error.kind == ErrorKind::NotADirectory
+                    && error.path.as_deref() == Some(blocked.as_path())
+            })
+    );
+    Ok(())
+}
+
+#[test]
+fn diagnostic_lookup_reports_invalid_frames_and_respects_store_mode() -> HostResult<()> {
+    let host = host();
+    let mut store = store(&host)?;
+    let digest = Digest::hash(b"archive");
+    let blob = store.blob_path(digest);
+    let domain = Domain::FetchV1;
+    let key = domain.key(b"archive");
+    let entry = store.entry_path(domain, key);
+    host.seed_file(&blob, b"corrupt blob")?;
+    host.seed_file(&entry, b"corrupt entry")?;
+    for mode in [StoreMode::ReadOnly, StoreMode::ReadWrite] {
+        store.config.mode = mode;
+        assert!(
+            store
+                .get_blob_with_diagnostics(digest, 1024)
+                .is_err_and(|error| {
+                    error.kind == ErrorKind::InvalidData
+                        && error.path.as_deref() == Some(blob.as_path())
+                })
+        );
+        assert!(
+            store
+                .get_entry_with_diagnostics::<Digest>(domain, key, 1024)
+                .is_err_and(|error| {
+                    error.kind == ErrorKind::InvalidData
+                        && error.path.as_deref() == Some(entry.as_path())
+                })
+        );
+        assert_eq!(
+            store.file_metadata(&blob)?.is_some(),
+            mode == StoreMode::ReadOnly
+        );
+        assert_eq!(
+            store.file_metadata(&entry)?.is_some(),
+            mode == StoreMode::ReadOnly
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn fallback_rename_keeps_first_concurrent_entry() -> HostResult<()> {
+    let host = host();
+    let contender = store(&host)?;
+    contender.rename_fallback.store(true, Ordering::Relaxed);
+    let domain = Domain::ProbeV1;
+    let key = domain.key(b"concurrent fallback");
+    let outcome = run_paused(
+        &host,
+        &contender.entry_path(domain, key),
+        TestEvent::FallbackRename,
+        |first| {
+            first.rename_fallback.store(true, Ordering::Relaxed);
+            first.put_entry(domain, key, &entry("first"))
+        },
+        || {
+            assert_eq!(
+                contender.put_entry(domain, key, &entry("second"))?,
+                PublishOutcome::SkippedBusy
+            );
+            Ok(())
+        },
+    )?;
+    assert_eq!(outcome, PublishOutcome::Published);
+    assert_eq!(
+        contender.put_entry(domain, key, &entry("second"))?,
+        PublishOutcome::AlreadyPresent
+    );
+    assert_eq!(contender.get_entry(domain, key)?, Some(entry("first")));
+    Ok(())
+}
+
+#[test]
+fn corruption_cleanup_blocks_repair_between_check_and_remove() -> HostResult<()> {
+    let host = host();
+    let repairer = store(&host)?;
+    let bytes = b"verified";
+    let digest = Digest::hash(bytes);
+    let path = repairer.blob_path(digest);
+    host.seed_file(&path, b"corrupt")?;
+    let result = run_paused(
+        &host,
+        &path,
+        TestEvent::BeforeRemove,
+        |reader| reader.get_blob(digest),
+        || {
+            let error = repairer
+                .put_blob(bytes)
+                .err()
+                .ok_or_else(|| HostError::unsupported("A repair passed a held cleanup lock."))?;
+            assert_eq!(error.kind, ErrorKind::TimedOut);
+            assert!(repairer.file_metadata(&path)?.is_some());
+            assert_eq!(repairer.gc()?, GcReport::default());
+            Ok(())
+        },
+    )?;
+    assert_eq!(result, None);
+    assert!(repairer.file_metadata(&path)?.is_none());
+    repairer.put_blob(bytes)?;
+    assert_eq!(
+        repairer.get_blob(digest)?.as_deref(),
+        Some(bytes.as_slice())
+    );
+    Ok(())
+}
+
+#[test]
+fn corruption_cleanup_rechecks_an_object_repaired_before_the_lock() -> HostResult<()> {
+    let host = host();
+    let repairer = store(&host)?;
+    let bytes = b"verified";
+    let digest = Digest::hash(bytes);
+    let path = repairer.blob_path(digest);
+    host.seed_file(&path, b"corrupt")?;
+    let result = run_paused(
+        &host,
+        &path,
+        TestEvent::InvalidRead,
+        |reader| reader.get_blob(digest),
+        || {
+            repairer.put_blob(bytes)?;
+            Ok(())
+        },
+    )?;
+    assert_eq!(result.as_deref(), Some(bytes.as_slice()));
+    assert_eq!(
+        repairer.get_blob(digest)?.as_deref(),
+        Some(bytes.as_slice())
+    );
+    Ok(())
+}
+
+fn run_paused<T: Send>(
+    host: &PureHost,
+    path: &Path,
+    event: TestEvent,
+    operation: impl FnOnce(&Store<'_>) -> HostResult<T> + Send,
+    interleave: impl FnOnce() -> HostResult<()>,
+) -> HostResult<T> {
+    const TEST_WAIT: Duration = Duration::from_secs(5);
+    let (pause, paused) = mpsc::sync_channel(1);
+    let (resume, resumed) = mpsc::sync_channel(1);
+    let resumed = Mutex::new(resumed);
+    let hook = |actual_event, actual_path: &Path| {
+        if actual_event == event && actual_path == path {
+            let _ = pause.try_send(());
+            if let Ok(resumed) = resumed.lock() {
+                let _ = resumed.recv_timeout(TEST_WAIT);
+            }
+        }
+    };
+    let mut hooked = store(host)?;
+    hooked.test_hook = Some(&hook);
+    thread::scope(|scope| {
+        let worker = scope.spawn(|| operation(&hooked));
+        let result = paused
+            .recv_timeout(TEST_WAIT)
+            .map_err(|_| HostError::unsupported("The test did not reach the pause point."))
+            .and_then(|()| interleave());
+        let _ = resume.try_send(());
+        result?;
+        worker
+            .join()
+            .map_err(|_| HostError::unsupported("Store test thread failed."))?
+    })
 }

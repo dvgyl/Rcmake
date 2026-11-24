@@ -16,8 +16,8 @@ use rcmake_fetch::{
     ArchiveCache, ContentHash, FetchError, FetchPool, GitEntry, GitMirror, LockEntry, LockFile,
     LockMode, LockSession, PrefetchSource, UrlEntry,
 };
-use rcmake_host::{Host, ProcessResult, PureHost, RunOutput};
-use rcmake_store::{Store, StoreConfig};
+use rcmake_host::{Host, ProcessResult, PureHost, ReadRange, RunOutput};
+use rcmake_store::{PublishOutcome, Store, StoreConfig};
 
 const URL: &str = "https://example.invalid/archive";
 const REPO: &str = "https://example.invalid/repo.git";
@@ -141,7 +141,7 @@ fn lock_modes_apply_and_concurrent_updates_merge() {
     let empty = ArchiveCache::new(&host, &empty);
     assert!(matches!(
         frozen.fetch_archive_with(&empty, "dep", URL, None, || Ok(b"changed".to_vec())),
-        Err(FetchError::HashMismatch { .. })
+        Err(FetchError::Archive { cause, .. }) if matches!(*cause, FetchError::HashMismatch { .. })
     ));
     let mut auto = LockSession::open(&host, source, LockMode::Auto).unwrap();
     assert_eq!(auto.git_pin("git", REPO, Some("v1")).unwrap(), None);
@@ -150,7 +150,9 @@ fn lock_modes_apply_and_concurrent_updates_merge() {
         .unwrap();
     assert_eq!(archive.bytes, b"changed");
     assert!(!archive.cache_hit);
-    assert!(matches!(warning, Some(FetchError::HashMismatch { .. })));
+    assert!(
+        matches!(warning, Some(FetchError::Archive { cause, .. }) if matches!(*cause, FetchError::HashMismatch { .. }))
+    );
     let expected = hash("SHA256", HashAlgo::Sha256, b"changed");
     assert!(
         auto.fetch_archive_with(&empty, "dep", URL, Some(&expected), || Ok(
@@ -174,7 +176,7 @@ fn archive_cache_checks_non_sha256_aliases_and_offline_misses() {
     assert!(cache.lookup(URL, &expected).unwrap().is_none());
     assert!(matches!(
         cache.fetch_with(URL, Some(&expected), || Ok(b"wrong".to_vec())),
-        Err(FetchError::HashMismatch { .. })
+        Err(FetchError::Archive { cause, .. }) if matches!(*cause, FetchError::HashMismatch { .. })
     ));
     assert!(cache.lookup(URL, &expected).unwrap().is_none());
     let miss = cache
@@ -189,17 +191,18 @@ fn archive_cache_checks_non_sha256_aliases_and_offline_misses() {
         .unwrap();
     assert!(hit.cache_hit);
     assert_eq!(hit.bytes, b"archive");
-    assert_eq!(
-        cache.fetch_with(URL, None, || panic!("offline miss must not download")),
-        Err(FetchError::Offline)
-    );
+    let error = cache
+        .fetch_with(URL, None, || panic!("offline miss must not download"))
+        .unwrap_err();
+    assert!(error.to_string().contains("RCMAKE_FETCH_OFFLINE=1"));
+    assert!(error.to_string().contains("URL_HASH"));
     let other = hash("SHA256", HashAlgo::Sha256, b"other");
-    assert_eq!(
-        cache.fetch_with(URL, Some(&other), || panic!(
-            "offline miss must not download"
-        )),
-        Err(FetchError::Offline)
-    );
+    let error = cache
+        .fetch_with(URL, Some(&other), || {
+            panic!("offline miss must not download")
+        })
+        .unwrap_err();
+    assert!(error.to_string().contains("SHA256="));
 }
 
 #[test]
@@ -209,7 +212,9 @@ fn git_offline_miss_does_not_run_a_process() {
     host.set_command_handler(|_, _, _| panic!("offline miss must not run Git"))
         .unwrap();
     let mirror = GitMirror::new(&host, Path::new("/cache")).unwrap();
-    assert_eq!(mirror.prefetch(REPO, PIN), Err(FetchError::Offline));
+    assert!(matches!(mirror.prefetch(REPO, PIN), Err(FetchError::Git {
+        repository, commit, path, ..
+    }) if repository == REPO && commit.as_deref() == Some(PIN) && path.starts_with("/cache/git")));
     assert!(mirror.prefetch(REPO, "main").is_err());
 }
 
@@ -223,10 +228,14 @@ fn pinned_git_mirror_reuses_local_commit() {
         let stdout = if git.first().is_some_and(|arg| arg == "clone") {
             observed.fetch_add(1, Ordering::SeqCst);
             let destination = PathBuf::from(std::str::from_utf8(git.last().unwrap()).unwrap());
-            host.create_dir_all(&destination)?;
+            seed_bare(host, &destination)?;
             Vec::new()
+        } else if git.iter().any(|arg| arg == "--is-bare-repository") {
+            b"true\n".to_vec()
+        } else if git.iter().any(|arg| arg == "--verify") {
+            PIN.as_bytes().to_vec()
         } else if git.iter().any(|arg| arg == "cat-file") {
-            b"commit\n".to_vec()
+            b"tree\n".to_vec()
         } else {
             Vec::new()
         };
@@ -267,7 +276,7 @@ fn pool_deduplicates_pins_and_populates_store() {
         hash: hash.clone(),
     };
     let first = pool.submit(source.clone()).unwrap();
-    let second = pool.submit(source).unwrap();
+    let second = pool.submit(source.clone()).unwrap();
     first.wait().unwrap();
     second.wait().unwrap();
     assert_eq!(calls.load(Ordering::SeqCst), 1);
@@ -278,6 +287,15 @@ fn pool_deduplicates_pins_and_populates_store() {
             .unwrap(),
         Some(b"archive".to_vec())
     );
+    let digest = rcmake_store::Digest::hash(b"archive").to_hex();
+    let path = config()
+        .root
+        .join("blobs")
+        .join(&digest[..2])
+        .join(format!("{digest}.blob"));
+    host.remove_file(&path).unwrap();
+    pool.submit(source).unwrap().wait().unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
     assert!(
         pool.submit(PrefetchSource::Git {
             repository: REPO.into(),
@@ -298,10 +316,12 @@ fn store_write_errors_leave_verified_downloads_usable_in_each_lock_mode() {
     let download = || Ok(b"valid".to_vec());
     let result = cache.fetch_with(URL, Some(&expected), download).unwrap();
     assert_eq!(result.bytes, b"valid");
-    assert!(matches!(result.cache_warning, Some(FetchError::Host(_))));
+    assert!(
+        matches!(result.cache_warning, Some(FetchError::Archive { cause, .. }) if matches!(*cause, FetchError::Host(_) | FetchError::CacheRead { .. }))
+    );
     assert!(matches!(
         cache.fetch_with(URL, Some(&expected), || Ok(b"invalid".to_vec())),
-        Err(FetchError::HashMismatch { .. })
+        Err(FetchError::Archive { cause, .. }) if matches!(*cause, FetchError::HashMismatch { .. })
     ));
 
     let mut update = LockSession::open(&host, Path::new("/work"), LockMode::Update).unwrap();
@@ -309,7 +329,9 @@ fn store_write_errors_leave_verified_downloads_usable_in_each_lock_mode() {
         .fetch_archive_with(&cache, "dep", URL, None, download)
         .unwrap();
     assert!(warning.is_none());
-    assert!(matches!(result.cache_warning, Some(FetchError::Host(_))));
+    assert!(
+        matches!(result.cache_warning, Some(FetchError::Archive { cause, .. }) if matches!(*cause, FetchError::Host(_) | FetchError::CacheRead { .. }))
+    );
     update.commit().unwrap();
 
     let mut frozen = LockSession::open(&host, Path::new("/work"), LockMode::Frozen).unwrap();
@@ -318,7 +340,9 @@ fn store_write_errors_leave_verified_downloads_usable_in_each_lock_mode() {
         .unwrap();
     assert_eq!(result.bytes, b"valid");
     assert!(warning.is_none());
-    assert!(matches!(result.cache_warning, Some(FetchError::Host(_))));
+    assert!(
+        matches!(result.cache_warning, Some(FetchError::Archive { cause, .. }) if matches!(*cause, FetchError::Host(_) | FetchError::CacheRead { .. }))
+    );
 }
 
 #[test]
@@ -352,7 +376,7 @@ fn curl_and_git_default_to_no_timeout_and_accept_a_caller_timeout() {
                 .map(|(_, value)| value.as_slice())
         };
         let call = observed.fetch_add(1, Ordering::SeqCst);
-        let expected_timeout = if call == 0 || (2..6).contains(&call) {
+        let expected_timeout = if call == 0 || (2..7).contains(&call) {
             None
         } else {
             Some(timeout)
@@ -383,12 +407,22 @@ fn curl_and_git_default_to_no_timeout_and_accept_a_caller_timeout() {
             );
             let destination =
                 PathBuf::from(std::str::from_utf8(invocation.args.last().unwrap()).unwrap());
-            host.create_dir_all(&destination)?;
+            seed_bare(host, &destination)?;
             Vec::new()
         } else {
             assert!(env("GIT_SSH_COMMAND").is_none());
             assert!(env("GIT_CONFIG_COUNT").is_none());
-            b"commit\n".to_vec()
+            if invocation
+                .args
+                .iter()
+                .any(|arg| arg == "--is-bare-repository")
+            {
+                b"true\n".to_vec()
+            } else if invocation.args.iter().any(|arg| arg == "--verify") {
+                PIN.as_bytes().to_vec()
+            } else {
+                b"tree\n".to_vec()
+            }
         };
         for key in ["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE"] {
             if invocation.program == "git" {
@@ -418,7 +452,7 @@ fn curl_and_git_default_to_no_timeout_and_accept_a_caller_timeout() {
         .with_timeout(timeout)
         .prefetch(REPO, PIN)
         .unwrap();
-    assert_eq!(calls.load(Ordering::SeqCst), 10);
+    assert_eq!(calls.load(Ordering::SeqCst), 12);
 }
 
 #[test]
@@ -449,6 +483,332 @@ fn prefetch_propagates_the_timeout_and_reports_cache_warnings() {
         .unwrap();
     assert!(matches!(
         ticket.wait_with_warning().unwrap(),
-        Some(FetchError::Host(_))
+        Some(FetchError::Archive { cause, .. }) if matches!(*cause, FetchError::Host(_) | FetchError::CacheRead { .. })
     ));
+}
+
+fn seed_bare(host: &PureHost, path: &Path) -> rcmake_host::HostResult<()> {
+    host.create_dir_all(&path.join("objects"))?;
+    host.seed_file(&path.join("HEAD"), b"ref: refs/heads/main\n")
+}
+
+#[test]
+fn archive_lock_preserves_mirrors_when_the_primary_fails() {
+    let host = host();
+    let store = Store::new(&host, config()).unwrap();
+    let empty = Store::new(&host, StoreConfig::new("/empty".into())).unwrap();
+    let cache = ArchiveCache::new(&host, &store);
+    let cold = ArchiveCache::new(&host, &empty);
+    let source_dir = Path::new("/work");
+    let mirrors = [URL, "https://mirror.invalid/archive"];
+    let archive = b"archive from mirror";
+    let mut update = LockSession::open(&host, source_dir, LockMode::Update).unwrap();
+    let mut attempts = Vec::new();
+    let (download, warning) = update
+        .fetch_archive_urls_with(&cache, "dep", &mirrors, None, |url| {
+            attempts.push(url.to_owned());
+            if url == URL {
+                Err(FetchError::Offline)
+            } else {
+                Ok(archive.to_vec())
+            }
+        })
+        .unwrap();
+    assert!(download.offline_seeded && warning.is_none());
+    assert_eq!(attempts, mirrors.map(str::to_owned));
+    update.commit().unwrap();
+
+    let file = host
+        .read(
+            &source_dir.join("rcmake-fetch.lock"),
+            ReadRange::All { limit: 4096 },
+        )
+        .unwrap();
+    let lock = LockFile::parse(&file).unwrap();
+    assert!(matches!(lock.get("dep"), Some(LockEntry::Url(entry)) if entry.urls == mirrors));
+    let mut frozen = LockSession::open(&host, source_dir, LockMode::Frozen).unwrap();
+    let (warm, _) = frozen
+        .fetch_archive_urls_with(&cache.cache_only(), "dep", &mirrors, None, |_| {
+            panic!("Frozen warm fetch must use the content pin.")
+        })
+        .unwrap();
+    assert!(warm.cache_hit);
+    let (fetched, _) = frozen
+        .fetch_archive_urls_with(&cold, "dep", &mirrors, None, |url| {
+            if url == URL {
+                Ok(b"stale mirror".to_vec())
+            } else {
+                Ok(archive.to_vec())
+            }
+        })
+        .unwrap();
+    assert!(!fetched.cache_hit && fetched.offline_seeded);
+    assert_eq!(fetched.bytes, archive);
+    assert!(matches!(
+        frozen.fetch_archive_urls_with(&cold, "dep", &[mirrors[1], URL], None, |_| panic!(
+            "Check the declaration before using a cache or transport."
+        )),
+        Err(FetchError::Lock { .. })
+    ));
+}
+
+#[test]
+fn concurrent_lock_updates_agree_or_preserve_the_first_file() {
+    let host = host();
+    let source = Path::new("/work");
+    let path = source.join("rcmake-fetch.lock");
+    let make_entry = |bytes: &[u8]| LockEntry::Url(UrlEntry::from_bytes(vec![URL.into()], bytes));
+    let session = || LockSession::open(&host, source, LockMode::Update).unwrap();
+    let mut first = session();
+    let mut identical = session();
+    let mut conflict = session();
+    first.record("dependency", make_entry(b"first")).unwrap();
+    identical
+        .record("Dependency", make_entry(b"first"))
+        .unwrap();
+    conflict
+        .record("dependency", make_entry(b"second"))
+        .unwrap();
+    conflict.record("disjoint", make_entry(b"third")).unwrap();
+    first.commit().unwrap();
+    let before = host.read(&path, ReadRange::All { limit: 4096 }).unwrap();
+    identical.commit().unwrap();
+    assert!(
+        matches!(conflict.commit(), Err(FetchError::LockConflict { dependency, .. })
+        if dependency == "dependency")
+    );
+    assert_eq!(
+        host.read(&path, ReadRange::All { limit: 4096 }).unwrap(),
+        before
+    );
+}
+
+#[test]
+fn fetch_errors_and_lockfiles_remove_credentials() {
+    let host = host();
+    let store = Store::new(&host, config()).unwrap();
+    let cache = ArchiveCache::new(&host, &store);
+    let url = "https://user:secret@example.invalid/archive";
+    let source = Path::new("/work");
+    let mut update = LockSession::open(&host, source, LockMode::Update).unwrap();
+    update
+        .fetch_archive_with(&cache, "dep", url, None, || Ok(b"archive".to_vec()))
+        .unwrap();
+    update.commit().unwrap();
+    let lock = host
+        .read(
+            &source.join("rcmake-fetch.lock"),
+            ReadRange::All { limit: 4096 },
+        )
+        .unwrap();
+    let lock = String::from_utf8(lock).unwrap();
+    assert!(lock.contains(URL));
+    assert!(!lock.contains("user") && !lock.contains("secret"));
+    let mut frozen = LockSession::open(&host, source, LockMode::Frozen).unwrap();
+    let expected = hash("SHA512", HashAlgo::Sha512, b"another archive");
+    let message = frozen
+        .fetch_archive_with(&cache, "dep", url, Some(&expected), || {
+            panic!("Check both hashes on a warm hit.")
+        })
+        .unwrap_err()
+        .to_string();
+    for label in ["SHA512", "dep", URL, "rcmake-fetch.lock", "URL_HASH"] {
+        assert!(message.contains(label));
+    }
+    assert!(!message.contains("secret"));
+
+    let url = "https://user:secret@example.invalid/archive?token=credential";
+    let message = cache
+        .cache_only()
+        .fetch_with(url, None, || {
+            panic!("Cache-only operations must skip network access.")
+        })
+        .unwrap_err()
+        .to_string();
+    assert!(message.contains("cache-only mode"));
+    assert!(!message.contains("RCMAKE_FETCH_OFFLINE"));
+    for secret in ["user", "secret", "token", "credential"] {
+        assert!(!message.contains(secret));
+    }
+}
+
+#[test]
+fn busy_alias_publication_does_not_confirm_the_prefetch() {
+    use std::time::Duration;
+    let host = Arc::new(host());
+    let config = config();
+    host.create_dir_all(&config.root).unwrap();
+    let guard = host
+        .lock_file(&config.root.join("gc.lock"), Some(Duration::ZERO))
+        .unwrap();
+    host.set_command_handler(|_, _, _| {
+        Ok(RunOutput {
+            stdout: b"archive".to_vec(),
+            results: vec![ProcessResult::Exited(0)],
+            ..RunOutput::default()
+        })
+    })
+    .unwrap();
+    let pool = FetchPool::new(host.clone(), config).unwrap();
+    let source = PrefetchSource::Url {
+        url: URL.into(),
+        hash: hash("SHA512", HashAlgo::Sha512, b"archive"),
+    };
+    assert!(matches!(
+        pool.submit(source.clone()).unwrap().wait(),
+        Err(FetchError::Archive { cause, .. }) if matches!(*cause, FetchError::Publication {
+            outcome: PublishOutcome::SkippedBusy,
+        })
+    ));
+    drop(guard);
+    pool.submit(source).unwrap().wait().unwrap();
+}
+
+#[test]
+fn prefetch_shutdown_releases_tickets_even_if_the_host_ignores_timeouts() {
+    use std::{sync::mpsc, time::Duration};
+    let host = Arc::new(host());
+    host.env_set(b"RCMAKE_FETCH_JOBS", Some(b"1"));
+    let (entered, started) = mpsc::channel();
+    let (release, allowed) = mpsc::channel();
+    let allowed = std::sync::Mutex::new(allowed);
+    host.set_command_handler(move |_, req, _| {
+        assert_eq!(req.timeout, Some(Duration::from_secs(15)));
+        entered.send(()).unwrap();
+        allowed
+            .lock()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+        Ok(RunOutput {
+            results: vec![ProcessResult::TimedOut],
+            ..RunOutput::default()
+        })
+    })
+    .unwrap();
+    let pool = FetchPool::new(host, config()).unwrap();
+    let first = pool
+        .submit(PrefetchSource::Url {
+            url: URL.into(),
+            hash: hash("SHA256", HashAlgo::Sha256, b"one"),
+        })
+        .unwrap();
+    started.recv_timeout(Duration::from_secs(5)).unwrap();
+    let queued = pool
+        .submit(PrefetchSource::Url {
+            url: URL.into(),
+            hash: hash("SHA256", HashAlgo::Sha256, b"two"),
+        })
+        .unwrap();
+    let (done, stopped) = mpsc::channel();
+    let shutdown = std::thread::spawn(move || {
+        drop(pool);
+        done.send(()).unwrap();
+    });
+    let shutdown_result = stopped.recv_timeout(Duration::from_secs(3));
+    release.send(()).unwrap();
+    shutdown.join().unwrap();
+    assert!(shutdown_result.is_ok());
+    assert!(
+        first
+            .wait()
+            .unwrap_err()
+            .to_string()
+            .contains("shutdown time limit")
+    );
+    assert!(queued.wait().unwrap_err().to_string().contains("cancelled"));
+}
+
+#[test]
+fn prefetch_publishes_a_large_archive_within_the_byte_budget() {
+    let host = Arc::new(host());
+    let bytes = vec![42u8; 16 * 1024 * 1024];
+    let expected = hash("SHA512", HashAlgo::Sha512, &bytes);
+    host.set_command_handler(move |_, req, _| {
+        let args = &req.pipeline.first().unwrap().args;
+        assert!(
+            args.windows(2)
+                .any(|pair| pair.first().is_some_and(|v| v == "--max-filesize")
+                    && pair.last().is_some_and(|v| v == "33554432"))
+        );
+        Ok(RunOutput {
+            stdout: bytes.clone(),
+            results: vec![ProcessResult::Exited(0)],
+            ..RunOutput::default()
+        })
+    })
+    .unwrap();
+    let pool = FetchPool::new(host.clone(), config()).unwrap();
+    pool.submit(PrefetchSource::Url {
+        url: URL.into(),
+        hash: expected.clone(),
+    })
+    .unwrap()
+    .wait()
+    .unwrap();
+    let store = Store::new(host.as_ref(), config()).unwrap();
+    let archive = ArchiveCache::new(host.as_ref(), &store)
+        .cache_only()
+        .fetch(URL, Some(&expected))
+        .unwrap();
+    assert!(archive.offline_seeded && archive.cache_hit);
+    assert_eq!(archive.bytes.len(), 16 * 1024 * 1024);
+}
+
+#[test]
+fn archive_offline_error_names_the_corrupt_cache_object() {
+    use rcmake_host::WriteMode;
+    use rcmake_store::Digest;
+
+    let host = host();
+    let config = config();
+    let store = Store::new(&host, config.clone()).unwrap();
+    let cache = ArchiveCache::new(&host, &store).cache_only();
+    let bytes = b"the expected archive";
+    let digest = Digest::hash(bytes);
+    let hash = ContentHash::sha256(digest);
+    let hex = digest.to_hex();
+    cache.insert(URL, &hash, bytes).unwrap();
+    let object = config
+        .root
+        .join("blobs")
+        .join(&hex[..2])
+        .join(format!("{hex}.blob"));
+    host.write(&object, b"invalid frame", WriteMode::Truncate)
+        .unwrap();
+    let error = cache
+        .fetch_with(URL, Some(&hash), || {
+            panic!("Offline mode must not download.")
+        })
+        .unwrap_err();
+    assert!(error.to_string().contains(object.to_str().unwrap()));
+    assert!(matches!(error, FetchError::Archive { cause, .. }
+        if matches!(cause.as_ref(), FetchError::CacheAndDownload { cache, .. }
+            if matches!(cache.as_ref(), FetchError::CacheRead { path, .. } if path == &object))));
+}
+
+#[test]
+fn legacy_lockfiles_load_and_remove_secrets_on_update() {
+    let host = host();
+    let dir = Path::new("/work");
+    let path = dir.join("rcmake-fetch.lock");
+    let mut legacy = LockFile::default();
+    let entry = LockEntry::Url(UrlEntry::from_bytes(vec![URL.into()], b"archive"));
+    legacy.insert("dependency", entry.clone()).unwrap();
+    let raw = String::from_utf8(legacy.to_json().unwrap())
+        .unwrap()
+        .replace(
+            URL,
+            "https://legacy:secret@example.invalid/archive?token=hidden",
+        );
+    host.seed_file(&path, raw.as_bytes()).unwrap();
+    LockSession::open(&host, dir, LockMode::Auto).unwrap();
+    let mut update = LockSession::open(&host, dir, LockMode::Update).unwrap();
+    update.record("another-dependency", entry).unwrap();
+    update.commit().unwrap();
+    let bytes = host.read(&path, ReadRange::All { limit: 4096 }).unwrap();
+    let updated = String::from_utf8(bytes).unwrap();
+    for secret in ["legacy", "secret", "token", "hidden"] {
+        assert!(!updated.contains(secret));
+    }
 }

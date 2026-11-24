@@ -1,6 +1,6 @@
 use std::{
     collections::{HashMap, VecDeque},
-    sync::{Arc, Condvar, Mutex, Weak},
+    sync::{Arc, Condvar, Mutex},
     thread::{self, JoinHandle},
     time::Duration,
 };
@@ -12,6 +12,11 @@ use crate::{ArchiveCache, ContentHash, FetchError, GitMirror, git::is_commit, in
 
 const MAX_WORKERS: usize = 32;
 const MAX_FLIGHTS: usize = 4096;
+const ARCHIVE_BYTES: usize = 32 * 1024 * 1024;
+const IN_FLIGHT_ARCHIVE_BYTES: usize = 2 * ARCHIVE_BYTES;
+const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+const MAX_REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// An immutable source eligible for background prefetch.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -42,10 +47,13 @@ struct Flight {
 
 impl Flight {
     fn finish(&self, result: PrefetchResult) {
-        *self
+        let mut slot = self
             .result
             .lock()
-            .unwrap_or_else(|error| error.into_inner()) = Some(result);
+            .unwrap_or_else(|error| error.into_inner());
+        if slot.is_none() {
+            *slot = Some(result);
+        }
         self.ready.notify_all();
     }
 }
@@ -55,12 +63,14 @@ impl Flight {
 pub struct Ticket(Arc<Flight>);
 
 impl Ticket {
-    /// Wait for the fetch to finish.
+    /// Wait for confirmation that the cache contains the pin.
     pub fn wait(&self) -> Result<(), FetchError> {
-        self.wait_with_warning().map(|_| ())
+        self.wait_with_warning()?.map_or(Ok(()), Err)
     }
 
-    /// Wait for the fetch to finish and return any cache warning.
+    /// Wait for the fetch to finish.
+    ///
+    /// A cache warning means that the fetch could not confirm offline availability.
     pub fn wait_with_warning(&self) -> Result<Option<FetchError>, FetchError> {
         let result = self
             .0
@@ -80,7 +90,25 @@ impl Ticket {
 struct Queue {
     closed: bool,
     jobs: VecDeque<(PrefetchSource, Arc<Flight>)>,
-    flights: HashMap<PrefetchSource, Weak<Flight>>,
+    flights: HashMap<PrefetchSource, Arc<Flight>>,
+    active: Vec<Arc<Flight>>,
+    archive_bytes: usize,
+}
+
+impl Queue {
+    fn can_start(&self, source: &PrefetchSource) -> bool {
+        self.archive_bytes + source.reserved_bytes() <= IN_FLIGHT_ARCHIVE_BYTES
+    }
+}
+
+impl PrefetchSource {
+    fn reserved_bytes(&self) -> usize {
+        if matches!(self, Self::Url { .. }) {
+            ARCHIVE_BYTES
+        } else {
+            0
+        }
+    }
 }
 
 #[derive(Default)]
@@ -91,8 +119,10 @@ struct Shared {
 
 /// A bounded background fetch pool for one configure.
 ///
-/// Duplicate submissions share a wait handle while that handle remains live.
-/// Drop cancels queued work and waits for running operations.
+/// Duplicate submissions share a wait handle while the job is queued or running.
+/// Each archive can use up to 32 MiB of payload bytes. Active archive jobs
+/// share a 64 MiB payload budget. Drop cancels queued jobs and waits up to
+/// one second for active jobs. An active job keeps its own request timeout.
 pub struct FetchPool {
     shared: Arc<Shared>,
     workers: Vec<JoinHandle<()>>,
@@ -104,12 +134,17 @@ impl FetchPool {
         Self::new_with_timeout(host, config, None)
     }
 
-    /// Start workers with an optional timeout for each fetch command and Git lock.
+    /// Start workers with a timeout for each job.
+    ///
+    /// The default is 15 seconds. Explicit timeouts are capped at 10 minutes.
     pub fn new_with_timeout(
         host: Arc<dyn Host>,
         config: StoreConfig,
         timeout: Option<Duration>,
     ) -> Result<Self, FetchError> {
+        let timeout = timeout
+            .unwrap_or(DEFAULT_REQUEST_TIMEOUT)
+            .min(MAX_REQUEST_TIMEOUT);
         let count = host
             .env_get(b"RCMAKE_FETCH_JOBS")
             .and_then(|value| std::str::from_utf8(&value).ok()?.parse::<usize>().ok())
@@ -134,6 +169,13 @@ impl FetchPool {
 
     /// Queue a pinned source or return its existing ticket.
     pub fn submit(&self, mut source: PrefetchSource) -> Result<Ticket, FetchError> {
+        let url = match &source {
+            PrefetchSource::Url { url, .. } => url,
+            PrefetchSource::Git { repository, .. } => repository,
+        };
+        if url.is_empty() || url.len() > 8192 || url.chars().any(char::is_control) {
+            return Err(invalid("Invalid prefetch source URL."));
+        }
         if let PrefetchSource::Git { commit, .. } = &mut source {
             if !is_commit(commit) {
                 return Err(invalid("Prefetch requires a full Git commit ID."));
@@ -145,19 +187,14 @@ impl FetchPool {
             .queue
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        if let Some(flight) = queue.flights.get(&source).and_then(Weak::upgrade) {
-            return Ok(Ticket(flight));
+        if let Some(flight) = queue.flights.get(&source) {
+            return Ok(Ticket(Arc::clone(flight)));
         }
         if queue.flights.len() >= MAX_FLIGHTS {
-            queue.flights.retain(|_, flight| flight.strong_count() != 0);
-            if queue.flights.len() >= MAX_FLIGHTS {
-                return Err(invalid("Prefetch queue is full."));
-            }
+            return Err(invalid("Prefetch queue is full."));
         }
         let flight = Arc::new(Flight::default());
-        queue
-            .flights
-            .insert(source.clone(), Arc::downgrade(&flight));
+        queue.flights.insert(source.clone(), Arc::clone(&flight));
         queue.jobs.push_back((source, Arc::clone(&flight)));
         self.shared.ready.notify_one();
         Ok(Ticket(flight))
@@ -166,50 +203,77 @@ impl FetchPool {
 
 impl Drop for FetchPool {
     fn drop(&mut self) {
-        {
-            let mut queue = self
-                .shared
-                .queue
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
-            queue.closed = true;
-            for (_, flight) in queue.jobs.drain(..) {
-                flight.finish(Err(invalid("Prefetch was cancelled.")));
-            }
-            self.shared.ready.notify_all();
+        let mut queue = self
+            .shared
+            .queue
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        queue.closed = true;
+        queue.flights.clear();
+        for (_, flight) in queue.jobs.drain(..) {
+            flight.finish(Err(invalid("Prefetch was cancelled.")));
         }
+        self.shared.ready.notify_all();
+        let (queue, _) = self
+            .shared
+            .ready
+            .wait_timeout_while(queue, SHUTDOWN_TIMEOUT, |queue| !queue.active.is_empty())
+            .unwrap_or_else(|error| error.into_inner());
+        for flight in &queue.active {
+            flight.finish(Err(invalid("Prefetch exceeded the shutdown time limit.")));
+        }
+        drop(queue);
         for worker in self.workers.drain(..) {
-            let _ = worker.join();
+            if worker.is_finished() {
+                let _ = worker.join();
+            }
         }
     }
 }
 
-fn work(shared: &Shared, host: &dyn Host, config: &StoreConfig, timeout: Option<Duration>) {
+fn work(shared: &Shared, host: &dyn Host, config: &StoreConfig, timeout: Duration) {
     loop {
-        let job = {
+        let (source, flight) = {
             let queue = shared
                 .queue
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
             let mut queue = shared
                 .ready
-                .wait_while(queue, |queue| !queue.closed && queue.jobs.is_empty())
+                .wait_while(queue, |queue| {
+                    !queue.closed && !queue.jobs.iter().any(|(source, _)| queue.can_start(source))
+                })
                 .unwrap_or_else(|error| error.into_inner());
-            queue.jobs.pop_front()
+            if queue.closed {
+                return;
+            }
+            let Some(index) = queue
+                .jobs
+                .iter()
+                .position(|(source, _)| queue.can_start(source))
+            else {
+                return;
+            };
+            let Some((source, flight)) = queue.jobs.remove(index) else {
+                return;
+            };
+            queue.archive_bytes += source.reserved_bytes();
+            queue.active.push(Arc::clone(&flight));
+            (source, flight)
         };
-        let Some((source, flight)) = job else { return };
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             fetch(host, config, &source, timeout)
         }))
         .unwrap_or_else(|_| Err(invalid("Prefetch worker failed.")));
-        if !matches!(result, Ok(None)) {
-            let mut queue = shared
-                .queue
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
-            queue.flights.remove(&source);
-        }
+        let mut queue = shared
+            .queue
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        queue.flights.remove(&source);
         flight.finish(result);
+        queue.archive_bytes -= source.reserved_bytes();
+        queue.active.retain(|active| !Arc::ptr_eq(active, &flight));
+        shared.ready.notify_all();
     }
 }
 
@@ -217,23 +281,28 @@ fn fetch(
     host: &dyn Host,
     config: &StoreConfig,
     source: &PrefetchSource,
-    timeout: Option<Duration>,
+    timeout: Duration,
 ) -> PrefetchResult {
     match source {
         PrefetchSource::Url { url, hash } => {
             let store = Store::new(host, config.clone())?;
-            let mut cache = ArchiveCache::new(host, &store);
-            if let Some(timeout) = timeout {
-                cache = cache.with_timeout(timeout);
+            let cache = ArchiveCache::new(host, &store)
+                .with_byte_limit(ARCHIVE_BYTES)
+                .with_timeout(timeout);
+            let result = cache.fetch(url, Some(hash))?;
+            if result.offline_seeded {
+                Ok(None)
+            } else {
+                Ok(Some(result.cache_warning.unwrap_or_else(|| invalid(
+                    "The archive is unavailable for offline use. Check the cache path and seed the pin again."
+                ))))
             }
-            Ok(cache.fetch(url, Some(hash))?.cache_warning)
         }
         PrefetchSource::Git { repository, commit } => {
-            let mut mirror = GitMirror::new(host, &config.root)?;
-            if let Some(timeout) = timeout {
-                mirror = mirror.with_timeout(timeout);
-            }
-            mirror.prefetch(repository, commit)?;
+            let deadline = host.monotonic().saturating_add(timeout);
+            GitMirror::new(host, &config.root)?
+                .with_deadline(deadline)
+                .prefetch(repository, commit)?;
             Ok(None)
         }
     }

@@ -1,4 +1,4 @@
-use std::ops::Range;
+use std::{borrow::Cow, ops::Range};
 
 use rcmake_json::Value;
 
@@ -56,15 +56,12 @@ impl PositionEncoding {
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct Lines(Vec<usize>);
 
 impl Lines {
     pub(crate) fn new(text: &str) -> Self {
-        Self(
-            std::iter::once(0)
-                .chain(text.match_indices('\n').map(|(offset, _)| offset + 1))
-                .collect(),
-        )
+        Self(std::iter::once(0).chain(line_starts(text)).collect())
     }
 
     pub(crate) fn len(&self) -> usize {
@@ -89,17 +86,19 @@ impl Lines {
     ) -> Option<usize> {
         let start = self.start(position.line)?;
         let line = self.text(text, position.line)?;
-        if encoding == PositionEncoding::Utf8 || line.is_ascii() {
-            return Some(start + line.floor_char_boundary(position.character.min(line.len())));
-        }
-        let mut units = 0;
-        for (offset, character) in line.char_indices() {
-            units += character.len_utf16();
-            if units > position.character {
-                return Some(start + offset);
-            }
-        }
-        Some(start + line.len())
+        Some(start + line_offset(line, position.character, encoding).0)
+    }
+
+    pub(crate) fn edit_offset(
+        &self,
+        text: &str,
+        position: Position,
+        encoding: PositionEncoding,
+    ) -> Option<usize> {
+        let start = self.start(position.line)?;
+        let line = self.text(text, position.line)?;
+        let (offset, exact) = line_offset(line, position.character, encoding);
+        exact.then_some(start + offset)
     }
 
     pub(crate) fn text<'a>(&self, text: &'a str, line: usize) -> Option<&'a str> {
@@ -107,9 +106,53 @@ impl Lines {
         let end = self.start(line + 1).unwrap_or(text.len());
         let line = text.get(start..end)?;
         Some(
-            line.strip_suffix('\n')
-                .map_or(line, |line| line.strip_suffix('\r').unwrap_or(line)),
+            line.strip_suffix("\r\n")
+                .or_else(|| line.strip_suffix(['\r', '\n']))
+                .unwrap_or(line),
         )
+    }
+
+    pub(crate) fn replace(
+        &mut self,
+        text: &mut String,
+        span: Range<usize>,
+        replacement: &str,
+        work_left: &mut usize,
+    ) -> bool {
+        // Include the adjacent bytes in case an edit joins or splits CRLF.
+        let from = text.floor_char_boundary(span.start.saturating_sub(1));
+        let mut to = text.ceil_char_boundary(span.end.saturating_add(1).min(text.len()));
+        if text.as_bytes().get(to.saturating_sub(1)..=to) == Some(b"\r\n") {
+            to += 1;
+        }
+        let first = self.0.partition_point(|&start| start <= from);
+        let last = self.0.partition_point(|&start| start <= to);
+        let removed = span.len();
+        let new_end = to - removed + replacement.len();
+        let mut work = new_end - from;
+        if removed != replacement.len() {
+            work += text.len() - span.end;
+        }
+        if removed != replacement.len() || first != last || replacement.contains(['\r', '\n']) {
+            work += (self.len() - last) * size_of::<usize>();
+        }
+        let Some(remaining) = work_left.checked_sub(work) else {
+            return false;
+        };
+        *work_left = remaining;
+
+        text.replace_range(span, replacement);
+        if removed != replacement.len()
+            && let Some(tail) = self.0.get_mut(last..)
+        {
+            for start in tail {
+                *start = *start - removed + replacement.len();
+            }
+        }
+        let starts =
+            line_starts(text.get(from..new_end).unwrap_or_default()).map(|start| from + start);
+        self.0.splice(first..last, starts);
+        true
     }
 
     pub(crate) fn position(
@@ -121,9 +164,10 @@ impl Lines {
         let offset = offset.min(text.len());
         let line = self.line_at(offset);
         let start = self.start(line).unwrap_or(0);
-        let character = text
-            .get(start..offset)
-            .map_or(0, |prefix| encoding.width(prefix));
+        let character = self.text(text, line).map_or(0, |text| {
+            let offset = text.floor_char_boundary((offset - start).min(text.len()));
+            encoding.width(text.get(..offset).unwrap_or_default())
+        });
         Position { line, character }
     }
 
@@ -138,6 +182,55 @@ impl Lines {
             self.position(text, span.end, encoding),
         )
     }
+}
+
+fn line_starts(text: &str) -> impl Iterator<Item = usize> {
+    text.match_indices(['\r', '\n'])
+        .filter_map(|(offset, ending)| {
+            (ending == "\n" || text.as_bytes().get(offset + 1) != Some(&b'\n'))
+                .then_some(offset + 1)
+        })
+}
+
+fn line_offset(line: &str, character: usize, encoding: PositionEncoding) -> (usize, bool) {
+    let byte = character.min(line.len());
+    if encoding == PositionEncoding::Utf8 {
+        let boundary = line.floor_char_boundary(byte);
+        return (boundary, boundary == byte);
+    }
+    if line.as_bytes().get(..byte).is_some_and(<[u8]>::is_ascii) {
+        return (byte, true);
+    }
+    let mut units = 0;
+    for (offset, scalar) in line.char_indices() {
+        if units == character {
+            return (offset, true);
+        }
+        units += scalar.len_utf16();
+        if units > character {
+            return (offset, false);
+        }
+    }
+    (line.len(), true)
+}
+
+pub(crate) fn syntax_text(text: &str) -> Cow<'_, str> {
+    let mut bare_cr = text.match_indices('\r').filter_map(|(offset, _)| {
+        (text.as_bytes().get(offset + 1) != Some(&b'\n')).then_some(offset)
+    });
+    let Some(first) = bare_cr.next() else {
+        return Cow::Borrowed(text);
+    };
+    // Each replacement has the same length. Lexer offsets identify the original bytes.
+    let mut normalized = String::with_capacity(text.len());
+    let mut start = 0;
+    for offset in std::iter::once(first).chain(bare_cr) {
+        normalized.push_str(text.get(start..offset).unwrap_or_default());
+        normalized.push('\n');
+        start = offset + 1;
+    }
+    normalized.push_str(text.get(start..).unwrap_or_default());
+    Cow::Owned(normalized)
 }
 
 pub(crate) fn range(start: Position, end: Position) -> Value {

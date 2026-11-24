@@ -10,6 +10,7 @@ use rcmake_syntax::{ArgKind, CommandInvocation, parse_list_file_with_warnings};
 
 use crate::{
     json::{object, uint},
+    lexical,
     position::{Lines, Position, PositionEncoding, range},
 };
 
@@ -18,6 +19,7 @@ pub(crate) struct Document {
     pub(crate) version: i64,
     pub(crate) lines: Lines,
     pub(crate) commands: Arc<[CommandInvocation]>,
+    pub(crate) unfinished: Vec<usize>,
     warnings: Vec<Diagnostic>,
     error: Option<rcmake_syntax::ParseError>,
 }
@@ -33,27 +35,19 @@ impl Document {
                 version,
                 lines,
                 commands: Arc::default(),
+                unfinished: Vec::new(),
                 warnings: Vec::new(),
                 error: None,
             };
         };
         let limits = Limits::default();
-        let (commands, warnings, error) =
-            match parse_list_file_with_warnings(text.as_bytes(), source, kind, &limits) {
-                Ok(file) => (file.commands, file.warnings, None),
+        let syntax = crate::position::syntax_text(&text);
+        let (commands, unfinished, warnings, error) =
+            match parse_list_file_with_warnings(syntax.as_bytes(), source, kind, &limits) {
+                Ok(file) => (file.commands, Vec::new(), file.warnings, None),
                 Err((error, warnings)) => {
-                    let prefix = lines
-                        .start(error.line.saturating_sub(1) as usize)
-                        .and_then(|end| text.get(..end))
-                        .and_then(|prefix| {
-                            rcmake_syntax::parse_list_file(prefix.as_bytes(), source, kind, &limits)
-                                .ok()
-                        });
-                    (
-                        prefix.map_or_else(Arc::default, |file| file.commands),
-                        warnings,
-                        Some(error),
-                    )
+                    let (commands, unfinished) = lexical::recover(&syntax, &lines);
+                    (commands.into(), unfinished, warnings, Some(error))
                 }
             };
         Self {
@@ -61,6 +55,7 @@ impl Document {
             version,
             lines,
             commands,
+            unfinished,
             warnings,
             error,
         }
@@ -148,10 +143,16 @@ impl Document {
     pub(crate) fn command_at(&self, offset: usize) -> Option<&CommandInvocation> {
         let index = self
             .commands
-            .partition_point(|command| command.span.end < offset);
-        self.commands
-            .get(index)
-            .filter(|command| command.span.start <= offset)
+            .partition_point(|command| command.span.start <= offset)
+            .checked_sub(1)?;
+        self.commands.get(index).filter(|command| {
+            command.span.contains(&offset)
+                || (offset == command.span.end && self.is_unfinished(command))
+        })
+    }
+
+    pub(crate) fn is_unfinished(&self, command: &CommandInvocation) -> bool {
+        self.unfinished.binary_search(&command.span.start).is_ok()
     }
 
     pub(crate) fn comments(&self) -> Vec<Range<usize>> {
@@ -165,9 +166,9 @@ impl Document {
         found
     }
 
-    pub(crate) fn formatting(&self, encoding: PositionEncoding, indent: &str) -> Value {
+    pub(crate) fn formatting(&self, encoding: PositionEncoding, indent: &str) -> Option<Value> {
         if self.error.is_some() {
-            return Value::Array(Vec::new());
+            return Some(Value::Array(Vec::new()));
         }
         let mut verbatim = self.comments();
         verbatim.extend(
@@ -186,11 +187,13 @@ impl Document {
             }
         }
         let mut edits = Vec::new();
-        let mut response_bytes = 0usize;
+        let mut response_bytes = 1024;
         let mut depth = 0usize;
         let mut commands = self.commands.iter().peekable();
         let mut continuation = None;
-        for (line, raw) in self.text.split_inclusive('\n').enumerate() {
+        let indentation_byte = indent.as_bytes().first().copied().unwrap_or(b' ');
+        for line in 0..self.lines.len() {
+            let raw = self.lines.text(&self.text, line).unwrap_or_default();
             let (bom, rest) = if line == 0 && raw.starts_with('\u{feff}') {
                 ("\u{feff}", raw.strip_prefix('\u{feff}').unwrap_or(raw))
             } else {
@@ -200,7 +203,7 @@ impl Document {
             let is_blank = trimmed.trim_ascii().is_empty();
             let mut line_depth = match continuation {
                 Some((end, opening_depth)) if line <= end => {
-                    opening_depth + usize::from(line < end)
+                    opening_depth + usize::from(line < end || !closing_only(trimmed))
                 }
                 _ => depth,
             };
@@ -224,21 +227,46 @@ impl Document {
                 continue;
             }
             let original_len = rest.len() - trimmed.len();
-            let new_indent = indent.repeat(line_depth.min(1000));
-            if rest.get(..original_len) == Some(new_indent.as_str()) {
+            let line_depth = line_depth.min(1000);
+            let new_len = indent.len() * line_depth;
+            if original_len == new_len
+                && rest
+                    .as_bytes()
+                    .get(..original_len)
+                    .is_some_and(|prefix| prefix.iter().all(|&byte| byte == indentation_byte))
+            {
                 continue;
             }
-            response_bytes += 128 + new_indent.len() * 2;
+            let escaped_len = if indent == "\t" { new_len * 2 } else { new_len };
+            response_bytes += 128 + escaped_len;
             if response_bytes > crate::rpc::MAX_MESSAGE_BYTES {
-                return Value::Array(Vec::new());
+                return None;
             }
             let start = self.lines.start(line).unwrap_or_default() + bom.len();
             edits.push(object([
                 ("range", self.span(start..start + original_len, encoding)),
-                ("newText", Value::string(new_indent)),
+                ("newText", Value::string(indent.repeat(line_depth))),
             ]));
         }
-        Value::Array(edits)
+        Some(Value::Array(edits))
+    }
+}
+
+fn closing_only(line: &str) -> bool {
+    if !line.starts_with(')') {
+        return false;
+    }
+    let mut bytes = line.as_bytes();
+    loop {
+        match bytes {
+            [] => return true,
+            [b')' | b' ' | b'\t', tail @ ..] => bytes = tail,
+            [b'#', ..] => {
+                let end = lexical::comment_end(bytes, 0);
+                bytes = bytes.get(end..).unwrap_or_default();
+            }
+            _ => return false,
+        }
     }
 }
 
@@ -269,44 +297,16 @@ fn collect_comments(text: &str, span: Range<usize>, output: &mut Vec<Range<usize
         match tail {
             [] => break,
             [b'\\', _, ..] => cursor += 2,
-            [b'"', rest @ ..] => {
-                cursor += 1;
-                let mut escaped = false;
-                for &byte in rest {
-                    cursor += 1;
-                    if !escaped && byte == b'"' {
-                        break;
-                    }
-                    escaped = !escaped && byte == b'\\';
-                }
+            [b'"', ..] => cursor = lexical::quoted_end(chunk, cursor).0,
+            [b'#', ..] => {
+                let end = lexical::comment_end(chunk, cursor);
+                output.push(span.start + cursor..span.start + end);
+                cursor = end;
             }
-            [b'#', rest @ ..] => {
-                let end = bracket_end(rest).unwrap_or_else(|| {
-                    rest.iter()
-                        .position(|&byte| byte == b'\n')
-                        .unwrap_or(rest.len())
-                });
-                output.push(span.start + cursor..span.start + cursor + 1 + end);
-                cursor += 1 + end;
+            [b'[', ..] => {
+                cursor = lexical::bracket(chunk, cursor).map_or(cursor + 1, |(end, _)| end);
             }
-            [b'[', ..] => cursor += bracket_end(tail).unwrap_or(1),
             _ => cursor += 1,
         }
     }
-}
-
-fn bracket_end(input: &[u8]) -> Option<usize> {
-    let payload = input.strip_prefix(b"[")?;
-    let equals = payload.iter().take_while(|&&byte| byte == b'=').count();
-    let tail = payload.get(equals..)?.strip_prefix(b"[")?;
-    for (index, &byte) in tail.iter().enumerate() {
-        if byte == b']' {
-            let mark = tail.get(index + 1..)?;
-            let count = mark.iter().take_while(|&&byte| byte == b'=').count();
-            if count == equals && mark.get(count) == Some(&b']') {
-                return Some(equals + index + count + 4);
-            }
-        }
-    }
-    Some(input.len())
 }

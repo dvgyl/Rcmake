@@ -6,7 +6,7 @@ use std::time::Duration;
 use rcmake_host::{FileKind, FileTime, HostResult, Metadata, path};
 use serde::Deserialize;
 
-use crate::{Digest, Domain, Store};
+use crate::{CacheRead, Digest, Domain, LockedStore, Store};
 
 /// Files removed by one garbage collection pass.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -40,11 +40,8 @@ impl Store<'_> {
         if !self.writable() || !self.directory_exists(&self.config.root)? {
             return Ok(report);
         }
-        let _guard = match self
-            .host
-            .lock_file(&self.gc_lock_path()?, Some(Duration::ZERO))
-        {
-            Ok(guard) => guard,
+        let locked = match self.lock_cache(Duration::ZERO) {
+            Ok(locked) => locked,
             Err(error) if error.kind == ErrorKind::TimedOut => return Ok(report),
             Err(error) => return Err(error),
         };
@@ -66,7 +63,7 @@ impl Store<'_> {
             }
             if let Some(stat) = self.file_metadata(&path)? {
                 if older_than(now, stat.mtime, Duration::from_secs(3600))
-                    && self.remove_if_unchanged(&path, &stat)?
+                    && locked.remove_if_unchanged(&path, &stat)?
                 {
                     report.staging_removed += 1;
                     report.bytes_removed = report.bytes_removed.saturating_add(stat.len);
@@ -79,14 +76,24 @@ impl Store<'_> {
         for domain in Domain::ALL {
             let directory = self.config.root.join("entries").join(domain.as_str());
             for file in self.cache_files(&directory, "entry")? {
-                let references =
-                    self.read_entry::<BlobReferences>(domain, file.digest, &file.path)?;
-                if references.is_none() && self.file_metadata(&file.path)?.is_none() {
-                    report.entries_removed += 1;
-                    report.bytes_removed = report.bytes_removed.saturating_add(file.stat.len);
-                    continue;
-                }
-                let references = references.map_or_else(Vec::new, |entry| entry.blobs);
+                let references = match self.read_entry::<BlobReferences>(
+                    domain,
+                    file.digest,
+                    &file.path,
+                    false,
+                )? {
+                    CacheRead::Found(entry) => entry.blobs,
+                    CacheRead::Missing => continue,
+                    CacheRead::Invalid => {
+                        if locked.remove_if_unchanged(&file.path, &file.stat)? {
+                            report.entries_removed += 1;
+                            report.bytes_removed =
+                                report.bytes_removed.saturating_add(file.stat.len);
+                            continue;
+                        }
+                        Vec::new()
+                    }
+                };
                 for digest in &references {
                     if let Some((_, count)) = blobs.get_mut(digest) {
                         *count += 1;
@@ -99,7 +106,7 @@ impl Store<'_> {
 
         for (blob, count) in blobs.values() {
             if *count == 0 {
-                total = total.saturating_sub(self.sweep_blob(blob, now, &mut report)?);
+                total = total.saturating_sub(locked.sweep_blob(blob, now, &mut report)?);
             }
         }
         if total <= self.config.max_bytes {
@@ -114,7 +121,7 @@ impl Store<'_> {
             if total <= goal {
                 break;
             }
-            if self.remove_if_unchanged(&entry.path, &entry.stat)? {
+            if locked.remove_if_unchanged(&entry.path, &entry.stat)? {
                 report.entries_removed += 1;
                 report.bytes_removed = report.bytes_removed.saturating_add(entry.stat.len);
                 total = total.saturating_sub(entry.stat.len);
@@ -123,30 +130,13 @@ impl Store<'_> {
                         *count -= 1;
                         if *count == 0 {
                             total =
-                                total.saturating_sub(self.sweep_blob(blob, now, &mut report)?);
+                                total.saturating_sub(locked.sweep_blob(blob, now, &mut report)?);
                         }
                     }
                 }
             }
         }
         Ok(report)
-    }
-
-    fn sweep_blob(
-        &self,
-        blob: &CachedFile,
-        now: FileTime,
-        report: &mut GcReport,
-    ) -> HostResult<u64> {
-        if older_than(now, blob.stat.mtime, self.config.blob_grace)
-            && self.remove_if_unchanged(&blob.path, &blob.stat)?
-        {
-            report.blobs_removed += 1;
-            report.bytes_removed = report.bytes_removed.saturating_add(blob.stat.len);
-            Ok(blob.stat.len)
-        } else {
-            Ok(0)
-        }
     }
 
     fn cache_files(&self, directory: &Path, extension: &str) -> HostResult<Vec<CachedFile>> {
@@ -192,19 +182,34 @@ impl Store<'_> {
             result => result,
         }
     }
+}
 
-    pub(crate) fn remove_if_unchanged(&self, path: &Path, stat: &Metadata) -> HostResult<bool> {
-        let Some(current) = self.file_metadata(path)? else {
+impl LockedStore<'_, '_> {
+    fn sweep_blob(
+        &self,
+        blob: &CachedFile,
+        now: FileTime,
+        report: &mut GcReport,
+    ) -> HostResult<u64> {
+        if older_than(now, blob.stat.mtime, self.store.config.blob_grace)
+            && self.remove_if_unchanged(&blob.path, &blob.stat)?
+        {
+            report.blobs_removed += 1;
+            report.bytes_removed = report.bytes_removed.saturating_add(blob.stat.len);
+            Ok(blob.stat.len)
+        } else {
+            Ok(0)
+        }
+    }
+
+    fn remove_if_unchanged(&self, path: &Path, stat: &Metadata) -> HostResult<bool> {
+        let Some(current) = self.store.file_metadata(path)? else {
             return Ok(false);
         };
         if crate::FastStat::from(&current) != crate::FastStat::from(stat) {
             return Ok(false);
         }
-        match self.host.remove_file(path) {
-            Ok(()) => Ok(true),
-            Err(error) if error.kind == ErrorKind::NotFound => Ok(false),
-            Err(error) => Err(error),
-        }
+        self.remove(path)
     }
 }
 

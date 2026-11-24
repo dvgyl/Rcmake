@@ -14,8 +14,12 @@ use serde::{
 };
 
 use crate::{
-    ArchiveCache, ArchiveResult, ContentHash, FetchError, GitMirror, LockMode, atomic_write,
-    git::is_commit, invalid,
+    ArchiveCache, ArchiveResult, ContentHash, FetchError, GitMirror, LockMode,
+    archive::confirmed,
+    atomic_write,
+    error::{has_url_suffix, sanitized_url},
+    git::is_commit,
+    invalid,
 };
 
 const FILE_NAME: &str = "rcmake-fetch.lock";
@@ -82,16 +86,33 @@ pub enum LockEntry {
 }
 
 impl LockEntry {
+    fn redact_legacy_identity(&mut self) {
+        // Older version 1 lockfiles may contain transport credentials.
+        match self {
+            Self::Url(entry) => {
+                for url in &mut entry.urls {
+                    if valid_text(url) {
+                        *url = sanitized_url(url);
+                    }
+                }
+            }
+            Self::Git(entry) if valid_text(&entry.repository) => {
+                entry.repository = sanitized_url(&entry.repository);
+            }
+            Self::Git(_) => {}
+        }
+    }
+
     fn validate(&self) -> bool {
         match self {
             Self::Url(entry) => {
                 entry.algo == "SHA256"
                     && !entry.urls.is_empty()
                     && entry.urls.len() <= MAX_URLS
-                    && entry.urls.iter().all(|url| valid_text(url))
+                    && entry.urls.iter().all(|url| valid_identity(url))
             }
             Self::Git(entry) => {
-                valid_text(&entry.repository)
+                valid_identity(&entry.repository)
                     && entry.tag.as_deref().is_none_or(valid_text)
                     && is_commit(&entry.commit)
             }
@@ -101,6 +122,25 @@ impl LockEntry {
 
 fn valid_text(value: &str) -> bool {
     !value.is_empty() && value.len() <= 8192 && !value.chars().any(char::is_control)
+}
+
+fn valid_identity(url: &str) -> bool {
+    valid_text(url) && !has_url_suffix(url) && sanitized_url(url) == url
+}
+
+fn portable_urls(urls: &[&str]) -> Result<Vec<String>, &'static str> {
+    if urls.is_empty() || urls.len() > MAX_URLS || urls.iter().any(|url| !valid_text(url)) {
+        return Err("Supply a valid ordered URL declaration.");
+    }
+    let urls = urls
+        .iter()
+        .map(|url| sanitized_url(url))
+        .collect::<Vec<_>>();
+    if urls.iter().all(|url| valid_identity(url)) {
+        Ok(urls)
+    } else {
+        Err("Supply a portable URL identity and pass credentials through the transport.")
+    }
 }
 
 fn valid_name(name: &str) -> bool {
@@ -131,8 +171,14 @@ impl LockFile {
         if bytes.len() > MAX_BYTES {
             return Err(invalid("Fetch lockfile exceeds the size limit."));
         }
-        let file: Self = serde_json::from_slice(bytes)
-            .map_err(|error| invalid(format!("Invalid fetch lockfile ({error}).")))?;
+        let file: Self = serde_json::from_slice(bytes).map_err(|error| {
+            invalid(format!(
+                "Invalid fetch lockfile at line {}, column {} ({:?}).",
+                error.line(),
+                error.column(),
+                error.classify(),
+            ))
+        })?;
         if file.version != 1 {
             return Err(invalid("Unsupported fetch lockfile version."));
         }
@@ -188,8 +234,9 @@ fn read_entries<'de, D: Deserializer<'de>>(
                 if file.get(&name).is_some() {
                     return Err(M::Error::custom("Duplicate fetch dependency name."));
                 }
-                file.insert(&name, map.next_value()?)
-                    .map_err(M::Error::custom)?;
+                let mut entry: LockEntry = map.next_value()?;
+                entry.redact_legacy_identity();
+                file.insert(&name, entry).map_err(M::Error::custom)?;
             }
             Ok(file.entries)
         }
@@ -217,8 +264,11 @@ impl<'a> LockSession<'a> {
         );
         let original = match mode {
             LockMode::Off => LockFile::default(),
-            LockMode::Frozen => read(host, &path)?
-                .ok_or_else(|| invalid("Frozen mode requires a fetch lockfile."))?,
+            LockMode::Frozen => read(host, &path)?.ok_or_else(|| FetchError::Lock {
+                path: path.clone(),
+                dependency: None,
+                detail: "Frozen mode requires this file.".into(),
+            })?,
             _ => read(host, &path)?.unwrap_or_default(),
         };
         Ok(Self {
@@ -240,13 +290,22 @@ impl<'a> LockSession<'a> {
         if self.mode != LockMode::Frozen {
             return Ok(None);
         }
+        let identity = sanitized_url(repository);
         match self.original.get(name) {
             Some(LockEntry::Git(entry))
-                if entry.repository == repository && entry.tag.as_deref() == tag =>
+                if !has_url_suffix(repository)
+                    && entry.repository == identity
+                    && entry.tag.as_deref() == tag =>
             {
                 Ok(Some(&entry.commit))
             }
-            _ => Err(invalid(format!("No matching Git lock entry for {name}."))),
+            Some(LockEntry::Git(entry)) => Err(self.lock_error(name, format!(
+                "The declared Git repository {identity:?} or tag {tag:?} differs from the locked repository {:?} or tag {:?}.",
+                entry.repository, entry.tag,
+            ))),
+            _ => Err(self.lock_error(name, format!(
+                "No Git entry matches repository {identity:?} and tag {tag:?}."
+            ))),
         }
     }
 
@@ -260,10 +319,15 @@ impl<'a> LockSession<'a> {
         source_dir: &Path,
     ) -> Result<(), FetchError> {
         if self.mode == LockMode::Update {
+            if has_url_suffix(repository) {
+                return Err(self.lock_error(name,
+                    "Use a repository URL without a query or fragment. Pass credentials through Git."
+                ));
+            }
             self.updates.insert(
                 name,
                 LockEntry::Git(GitEntry {
-                    repository: repository.into(),
+                    repository: sanitized_url(repository),
                     tag: tag.map(str::to_owned),
                     commit: mirror.head(source_dir)?,
                 }),
@@ -286,7 +350,7 @@ impl<'a> LockSession<'a> {
         self.fetch_archive_with(cache, name, url, expected, || cache.download(url))
     }
 
-    /// Apply the lock mode with a caller-provided download operation.
+    /// Apply the lock mode with a caller-provided download operation for one URL.
     pub fn fetch_archive_with(
         &mut self,
         cache: &ArchiveCache<'_>,
@@ -295,49 +359,123 @@ impl<'a> LockSession<'a> {
         expected: Option<&ContentHash>,
         download: impl FnOnce() -> Result<Vec<u8>, FetchError>,
     ) -> Result<(ArchiveResult, Option<FetchError>), FetchError> {
+        let mut download = Some(download);
+        self.fetch_archive_urls_with(cache, name, &[url], expected, |_| {
+            let run = download
+                .take()
+                .ok_or_else(|| invalid("The transport has already run."))?;
+            run()
+        })
+    }
+
+    /// Fetch the ordered URL declaration with the built-in curl transport.
+    pub fn fetch_archive_urls(
+        &mut self,
+        cache: &ArchiveCache<'_>,
+        name: &str,
+        urls: &[&str],
+        expected: Option<&ContentHash>,
+    ) -> Result<(ArchiveResult, Option<FetchError>), FetchError> {
+        self.fetch_archive_urls_with(cache, name, urls, expected, |url| cache.download(url))
+    }
+
+    /// Apply the lock mode to the complete ordered URL declaration.
+    ///
+    /// Frozen mode checks the declaration before cache lookup or transport.
+    /// On a cache miss, the transport receives each original URL in order
+    /// until an endpoint returns verified bytes. Supply the project's transfer
+    /// settings in the transport closure.
+    pub fn fetch_archive_urls_with(
+        &mut self,
+        cache: &ArchiveCache<'_>,
+        name: &str,
+        urls: &[&str],
+        expected: Option<&ContentHash>,
+        download: impl FnMut(&str) -> Result<Vec<u8>, FetchError>,
+    ) -> Result<(ArchiveResult, Option<FetchError>), FetchError> {
+        let identities = portable_urls(urls).map_err(|reason| self.lock_error(name, reason))?;
+        if matches!(self.mode, LockMode::Update | LockMode::Frozen)
+            && urls.iter().any(|url| has_url_suffix(url))
+        {
+            return Err(self.lock_error(name,
+                "Use URLs without queries or fragments in a fetch lock entry. Pass credentials through the transport."
+            ));
+        }
         let lock = match self.original.get(name) {
-            Some(LockEntry::Url(entry)) if entry.urls.iter().any(|candidate| candidate == url) => {
-                Some(entry)
+            Some(LockEntry::Url(entry)) if entry.urls == identities => Some(entry),
+            Some(LockEntry::Url(entry)) if self.mode == LockMode::Frozen => {
+                return Err(self.lock_error(
+                    name,
+                    format!(
+                        "The declared URLs {identities:?} differ from the locked URLs {:?}.",
+                        entry.urls,
+                    ),
+                ));
+            }
+            _ if self.mode == LockMode::Frozen => {
+                return Err(self.lock_error(
+                    name,
+                    format!("No archive entry matches the declared URLs {identities:?}."),
+                ));
             }
             _ => None,
         };
-        let mut warning = None;
-        let mut result = match (self.mode, lock, expected) {
-            (LockMode::Frozen, None, _) => {
-                return Err(invalid(format!(
-                    "No matching archive lock entry for {name}."
-                )));
+
+        let pin = lock.map(|entry| ContentHash::sha256(entry.sha256));
+        let mut hashes = Vec::new();
+        let mut size = None;
+        if self.mode == LockMode::Frozen
+            || (self.mode == LockMode::Auto && expected.is_none() && cache.is_cache_only())
+        {
+            hashes.extend(pin.as_ref());
+            size = lock.map(|entry| entry.size);
+        }
+        hashes.extend(expected);
+        let mut context = cache.context(urls, &hashes);
+        context.dependency = Some(name.into());
+        if let Some(pin) = &pin {
+            context.lockfile = Some(self.path.clone());
+            if !context.expected.contains(&pin.identity()) && expected.is_none() {
+                context.expected.push(pin.identity());
             }
-            (LockMode::Frozen, Some(entry), _) => {
-                let pin = ContentHash::sha256(entry.sha256);
-                let result = cache.fetch_with(url, Some(&pin), download)?;
-                if let Some(expected) = expected {
-                    expected.verify(&result.bytes)?;
-                }
-                verify_size(entry, &result.bytes)?;
-                result
+            if expected.is_none() {
+                context.recovery = "Check the cache and mirrors. Restore the locked content or run --fetch-lock=update if the change is intentional.";
             }
-            (LockMode::Auto, Some(entry), None) => {
-                let result = cache.fetch_with(url, None, download)?;
-                let pin = ContentHash::sha256(entry.sha256);
-                warning = pin
-                    .verify(&result.bytes)
-                    .and_then(|()| verify_size(entry, &result.bytes))
-                    .err();
-                result
-            }
-            _ => cache.fetch_with(url, expected, download)?,
+        }
+        let mut result = cache
+            .fetch_candidates(urls, &hashes, size, download)
+            .map_err(|cause| context.clone().error(cause))?;
+        let warning = if self.mode == LockMode::Auto && expected.is_none() {
+            pin.as_ref()
+                .and_then(|pin| pin.verify(&result.bytes).err())
+                .or_else(|| lock.and_then(|entry| verify_size(entry, &result.bytes).err()))
+                .map(|cause| context.clone().error(cause))
+        } else {
+            None
         };
         if self.mode == LockMode::Update {
-            let entry = UrlEntry::from_bytes(vec![url.into()], &result.bytes);
+            let entry = UrlEntry::from_bytes(identities, &result.bytes);
             if expected.is_none() {
-                result.cache_warning = cache
-                    .insert(url, &ContentHash::sha256(entry.sha256), &result.bytes)
-                    .err();
+                match cache
+                    .insert_verified(urls, &[&ContentHash::sha256(entry.sha256)], &result.bytes)
+                    .and_then(confirmed)
+                {
+                    Ok(()) => result.offline_seeded = true,
+                    Err(error) => result.cache_warning = Some(error),
+                }
             }
             self.updates.insert(name, LockEntry::Url(entry))?;
         }
+        result.cache_warning = result.cache_warning.map(|cause| context.error(cause));
         Ok((result, warning))
+    }
+
+    fn lock_error(&self, name: &str, detail: impl Into<String>) -> FetchError {
+        FetchError::Lock {
+            path: self.path.clone(),
+            dependency: Some(name.into()),
+            detail: detail.into(),
+        }
     }
 
     /// Stage a validated update that was populated outside this crate.
@@ -356,10 +494,25 @@ impl<'a> LockSession<'a> {
         let lock = self.path.with_added_extension("guard");
         let _guard = self.host.lock_file(&lock, Some(Duration::from_secs(10)))?;
         let mut current = read(self.host, &self.path)?.unwrap_or_default();
+        let mut changed = false;
         for (name, entry) in self.updates.entries {
+            let committed = current.get(&name);
+            if committed == Some(&entry) {
+                continue;
+            }
+            if committed != self.original.get(&name) {
+                return Err(FetchError::LockConflict {
+                    path: self.path,
+                    dependency: name,
+                });
+            }
             current.insert(&name, entry)?;
+            changed = true;
         }
-        atomic_write(self.host, &self.path, &current.to_json()?)
+        if changed {
+            atomic_write(self.host, &self.path, &current.to_json()?)?;
+        }
+        Ok(())
     }
 }
 
@@ -377,8 +530,17 @@ fn read(host: &dyn Host, path: &Path) -> Result<Option<LockFile>, FetchError> {
             limit: MAX_BYTES as u64,
         },
     ) {
-        Ok(bytes) => LockFile::parse(&bytes).map(Some),
+        Ok(bytes) => LockFile::parse(&bytes)
+            .map(Some)
+            .map_err(|error| FetchError::Lock {
+                path: path.to_owned(),
+                dependency: None,
+                detail: error.to_string(),
+            }),
         Err(error) if error.kind == ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error.into()),
+        Err(cause) => Err(FetchError::LockRead {
+            path: path.to_owned(),
+            cause,
+        }),
     }
 }

@@ -3,7 +3,7 @@ use std::io;
 use crate::Digest;
 
 const VERSION: u8 = 1;
-const HEADER_LEN: usize = 8 + 1 + 8;
+pub(crate) const HEADER_LEN: usize = 8 + 1 + 8;
 const FOOTER_LEN: usize = 32;
 
 pub(crate) const ENTRY_MAGIC: &[u8; 8] = b"RCMENTRY";
@@ -34,9 +34,8 @@ pub(crate) fn encode(magic: &[u8; 8], payload: &[u8], limit: usize) -> io::Resul
 
 pub(crate) fn decode(magic: &[u8; 8], bytes: &[u8], limit: usize) -> Option<Vec<u8>> {
     let (body, checksum) = bytes.split_at_checked(bytes.len().checked_sub(FOOTER_LEN)?)?;
-    let header = body.strip_prefix(magic)?.strip_prefix(&[VERSION])?;
-    let (len, compressed) = header.split_at_checked(8)?;
-    let len = usize::try_from(u64::from_le_bytes(len.try_into().ok()?)).ok()?;
+    let len = payload_len(magic, body)?;
+    let compressed = body.get(HEADER_LEN..)?;
     if len > limit
         || Digest::hash(body).as_bytes() != checksum
         || zstd::zstd_safe::find_frame_compressed_size(compressed).ok()? != compressed.len()
@@ -45,4 +44,12 @@ pub(crate) fn decode(magic: &[u8; 8], bytes: &[u8], limit: usize) -> Option<Vec<
     }
     let payload = zstd::bulk::decompress(compressed, len).ok()?;
     (payload.len() == len).then_some(payload)
+}
+
+pub(crate) fn payload_len(magic: &[u8; 8], bytes: &[u8]) -> Option<usize> {
+    let header = bytes
+        .get(..HEADER_LEN)?
+        .strip_prefix(magic)?
+        .strip_prefix(&[VERSION])?;
+    usize::try_from(u64::from_le_bytes(header.try_into().ok()?)).ok()
 }
