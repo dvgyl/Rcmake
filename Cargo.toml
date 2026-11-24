@@ -95,8 +95,8 @@ rcmake-cps = { path = "crates/rcmake-cps" }
 rcmake-cxxmodules = { path = "crates/rcmake-cxxmodules" }
 rcmake-fortran = { path = "crates/rcmake-fortran" }
 rcmake-store = { path = "crates/rcmake-store" }
-rcmake-fetch = { path = "crates/rcmake-fetch" }
-rcmake-lsp = { path = "crates/rcmake-lsp" }
+rcmake-fetch = { path = "crates/rcmake-fetch", default-features = false }
+rcmake-lsp = { path = "crates/rcmake-lsp", default-features = false }
 rcmake-instrument = { path = "crates/rcmake-instrument" }
 rcmake-cpack = { path = "crates/rcmake-cpack" }
 

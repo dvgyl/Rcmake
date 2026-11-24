@@ -1,8 +1,9 @@
 use std::io::ErrorKind;
 use std::path::{Component, Path, PathBuf};
+use std::time::Duration;
 
 use rcmake_base::Limits;
-use rcmake_host::{FileKind, Follow, Host, HostError, HostResult, Metadata, ReadRange};
+use rcmake_host::{FileKind, FileTime, Follow, Host, HostError, HostResult, Metadata, ReadRange};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
@@ -19,6 +20,12 @@ pub struct FastStat {
     pub mtime_nanos: u32,
     /// File permission bits.
     pub mode: u32,
+    /// Device identifier.
+    #[serde(default)]
+    pub dev: u64,
+    /// File identifier on the device.
+    #[serde(default)]
+    pub ino: u64,
 }
 
 impl FastStat {
@@ -39,6 +46,8 @@ impl From<&Metadata> for FastStat {
             mtime_secs: metadata.mtime.secs,
             mtime_nanos: metadata.mtime.nanos,
             mode: metadata.mode,
+            dev: metadata.dev,
+            ino: metadata.ino,
         }
     }
 }
@@ -52,6 +61,9 @@ pub enum InputStamp {
         path: PathBuf,
         /// Observed metadata.
         stat: FastStat,
+        /// Content digest for verification after a metadata change.
+        #[serde(default)]
+        digest: Option<Digest>,
     },
     /// A file identified by SHA-256 of its contents.
     FileHash {
@@ -90,6 +102,41 @@ pub enum InputStamp {
         /// Observed digest of that directory's immediate entries.
         listing: Digest,
     },
+}
+
+impl InputStamp {
+    /// Record a file input. Use only its digest when its timestamp is within
+    /// the host filesystem's timestamp resolution of the current time.
+    pub fn record_file(
+        host: &dyn Host,
+        path: PathBuf,
+        timestamp_resolution: Duration,
+    ) -> HostResult<Self> {
+        let stat = FastStat::read(host, &path)?;
+        let digest = file_digest(host, &path)?;
+        if FastStat::read(host, &path)? != stat {
+            return Err(crate::io_at(
+                std::io::Error::new(
+                    ErrorKind::InvalidData,
+                    "Trace file changed during recording.",
+                ),
+                &path,
+            ));
+        }
+        let mtime = FileTime {
+            secs: stat.mtime_secs,
+            nanos: stat.mtime_nanos,
+        };
+        if crate::gc::older_than(host.now(), mtime, timestamp_resolution) {
+            Ok(Self::FileStat {
+                path,
+                stat,
+                digest: Some(digest),
+            })
+        } else {
+            Ok(Self::FileHash { path, digest })
+        }
+    }
 }
 
 /// The input stamps required to reuse an entry.
@@ -151,7 +198,6 @@ pub fn file_digest(host: &dyn Host, path: &Path) -> HostResult<Digest> {
     let after = host.metadata(path, Follow::Yes)?;
     if offset != before.len
         || after.kind != FileKind::File
-        || (before.dev, before.ino) != (after.dev, after.ino)
         || FastStat::from(&before) != FastStat::from(&after)
     {
         return Err(crate::io_at(
@@ -195,17 +241,22 @@ pub fn verify_trace(host: &dyn Host, trace: &[InputStamp]) -> VerifyOutcome {
 
 fn matches_input(host: &dyn Host, input: &InputStamp) -> bool {
     match input {
-        InputStamp::FileStat { path, stat } => {
-            FastStat::read(host, path).is_ok_and(|current| current == *stat)
-                && host
-                    .read(
-                        path,
-                        ReadRange::Slice {
-                            offset: 0,
-                            len: Some(0),
-                        },
-                    )
-                    .is_ok()
+        InputStamp::FileStat { path, stat, digest } => {
+            let Ok(current) = FastStat::read(host, path) else {
+                return false;
+            };
+            if current != *stat {
+                return current.mode == stat.mode
+                    && digest.is_some_and(|digest| file_digest(host, path) == Ok(digest));
+            }
+            host.read(
+                path,
+                ReadRange::Slice {
+                    offset: 0,
+                    len: Some(0),
+                },
+            )
+            .is_ok()
         }
         InputStamp::FileHash { path, digest } => file_digest(host, path).as_ref() == Ok(digest),
         InputStamp::DirEntries { path, digest } => {

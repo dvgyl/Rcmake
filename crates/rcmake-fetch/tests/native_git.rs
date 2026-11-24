@@ -1,5 +1,6 @@
 //! Verify Git commands against a real local repository.
 
+#![cfg(all(feature = "native", any(unix, windows)))]
 #![cfg(unix)]
 #![allow(clippy::unwrap_used)]
 

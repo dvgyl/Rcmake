@@ -3,7 +3,7 @@ use std::fmt;
 
 use rcmake_base::{BString, path_lex::Lexical};
 
-use crate::{FortranCompiler, FortranSourceInfo};
+use crate::{FortranCompiler, FortranSourceInfo, ModuleCase};
 
 /// Map from lowercase logical module names to build paths.
 pub type ModuleMap = BTreeMap<BString, BString>;
@@ -53,6 +53,51 @@ impl<'a> DependInfo<'a> {
     }
 }
 
+/// Owned target settings for the build graph.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FortranTdi {
+    /// Current build directory.
+    pub dir_cur_bld: BString,
+    /// Top-level build directory.
+    pub dir_top_bld: BString,
+    /// Compiler include search directories, in order.
+    pub include_dirs: Vec<BString>,
+    /// Directory for module files.
+    pub module_dir: Option<BString>,
+    /// Directories with linked targets' dependency summaries.
+    pub linked_target_dirs: Vec<BString>,
+    /// CMake compiler ID.
+    pub compiler_id: BString,
+    /// Separator between the ancestor and submodule names.
+    pub submodule_sep: BString,
+    /// Submodule file extension, including the leading dot.
+    pub submodule_ext: BString,
+    /// Module case recorded in the toolchain.
+    pub module_case: ModuleCase,
+    /// Source paths for the target.
+    pub sources: Vec<DependSource>,
+}
+
+impl FortranTdi {
+    /// Create collation settings that borrow the compiler data.
+    pub fn as_depend_info(&self) -> DependInfo<'_> {
+        DependInfo {
+            dir_cur_bld: self.dir_cur_bld.clone(),
+            dir_top_bld: self.dir_top_bld.clone(),
+            include_dirs: self.include_dirs.clone(),
+            module_dir: self.module_dir.clone(),
+            linked_target_dirs: self.linked_target_dirs.clone(),
+            compiler: FortranCompiler {
+                id: &self.compiler_id,
+                submodule_sep: &self.submodule_sep,
+                submodule_ext: &self.submodule_ext,
+                module_case: self.module_case,
+            },
+            sources: self.sources.clone(),
+        }
+    }
+}
+
 /// Scan results assigned to one object path.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ObjectScan {
@@ -80,7 +125,7 @@ pub enum CollateError {
     InvalidModule(BString),
     /// Two scans use the same object path.
     DuplicateObject(BString),
-    /// Two objects provide the same logical module.
+    /// Two objects provide the same logical module in resolved branches.
     DuplicateProvider {
         /// Logical module name.
         module: BString,
@@ -121,33 +166,44 @@ impl std::error::Error for CollateError {}
 #[derive(Default)]
 struct Edge {
     provides: BTreeSet<BString>,
-    requires: BTreeSet<BString>,
+    requires: BTreeMap<BString, BString>,
     includes: BTreeSet<BString>,
+    alternate_inputs: BTreeSet<BString>,
 }
 
 #[derive(Default)]
 struct Graph {
     edges: BTreeMap<BString, Edge>,
     modules: ModuleMap,
+    stamp_inputs: BTreeMap<BString, Vec<BString>>,
+}
+
+struct Provider<'a> {
+    primary: &'a BString,
+    alternatives: Vec<&'a BString>,
+    conditional: bool,
 }
 
 /// Write a Ninja dyndep file and the target's exported module paths.
 ///
 /// Local providers take precedence over linked modules. Linked maps are read
-/// in link order. This operation adds module file dependencies only.
+/// in link order. If several conditional providers remain possible, consumers
+/// wait for all their objects.
 pub fn collate_ninja_dyndep(
     objects: &[ObjectScan],
     info: &DependInfo<'_>,
     linked: &[ModuleMap],
 ) -> Result<Collation, CollateError> {
-    let graph = collate(objects, info, linked)?;
+    let graph = collate_with(objects, info, linked, None)?;
     let mut text = BString::from("ninja_dyndep_version = 1.0\n");
     for (object, edge) in graph.edges {
         text.extend_from_slice(b"build ");
         ninja_path(&mut text, &object)?;
         ninja_paths(&mut text, &edge.provides)?;
         text.extend_from_slice(b": dyndep");
-        ninja_paths(&mut text, &edge.requires)?;
+        let mut prerequisites = edge.alternate_inputs;
+        prerequisites.extend(edge.requires.into_values());
+        ninja_paths(&mut text, &prerequisites)?;
         text.push(b'\n');
         if !edge.provides.is_empty() {
             text.extend_from_slice(b"  restat = 1\n");
@@ -160,35 +216,78 @@ pub fn collate_ninja_dyndep(
     })
 }
 
-/// Write GNU Make dependency rules and the target's exported module paths.
+/// Checks whether a candidate module file exists at a compiler include path.
+pub type ModuleFileProbe<'a> = dyn Fn(&[u8]) -> bool + 'a;
+
+/// Write GNU Make dependency and module stamp rules.
 ///
-/// Include files and module files are prerequisites of the object that needs
-/// them. Each local module file also depends on the object that produces it.
+/// The stamp directory is also the target directory that contains its build rule.
+/// Pass linked targets' exported stamp paths in link order. The optional
+/// file probe checks include directories for modules with no known provider.
 pub fn collate_make_depend(
     objects: &[ObjectScan],
     info: &DependInfo<'_>,
     linked: &[ModuleMap],
+    stamp_dir: &[u8],
+    file_exists: Option<&ModuleFileProbe<'_>>,
 ) -> Result<Collation, CollateError> {
-    let graph = collate(objects, info, linked)?;
+    let settings = MakeSettings {
+        stamp_dir,
+        file_exists,
+    };
+    let graph = collate_with(objects, info, linked, Some(&settings))?;
     let mut text = BString::default();
     for (object, edge) in graph.edges {
-        let mut prerequisites = edge.requires;
-        prerequisites.extend(edge.includes);
-        if !prerequisites.is_empty() {
+        if !edge.includes.is_empty() {
             make_path(&mut text, &object, true)?;
             text.push(b':');
-            for path in prerequisites {
-                text.push(b' ');
-                make_path(&mut text, &path, false)?;
+            for include in edge.includes {
+                text.extend_from_slice(b" \\\n ");
+                make_path(&mut text, &include, false)?;
             }
             text.push(b'\n');
         }
+        for path in edge.requires.into_values() {
+            make_rule(&mut text, &object, &path)?;
+        }
+        if edge.provides.is_empty() {
+            continue;
+        }
+
+        let provides = [object.as_slice(), b".provides.build"].concat();
         for module in edge.provides {
-            make_path(&mut text, &module, true)?;
+            let stamp = settings.stamp(info, &module);
+            make_rule(&mut text, &provides, &stamp)?;
+            make_path(&mut text, &stamp, true)?;
             text.extend_from_slice(b": ");
             make_path(&mut text, &object, false)?;
+            if let Some(alternatives) = graph.stamp_inputs.get(&stamp) {
+                for alternative in alternatives {
+                    text.push(b' ');
+                    make_path(&mut text, alternative, false)?;
+                }
+            }
+            text.push(b'\n');
+            text.extend_from_slice(b"\t$(CMAKE_COMMAND) -E cmake_copy_f90_mod ");
+            make_shell_arg(&mut text, &module)?;
+            text.push(b' ');
+            make_shell_arg(&mut text, &stamp)?;
+            if !info.compiler.id.is_empty() {
+                text.push(b' ');
+                make_shell_arg(&mut text, info.compiler.id)?;
+            }
             text.push(b'\n');
         }
+        make_path(&mut text, &provides, true)?;
+        text.extend_from_slice(b":\n\t$(CMAKE_COMMAND) -E touch ");
+        make_shell_arg(&mut text, &provides)?;
+        text.push(b'\n');
+        let driver = Lexical::new(stamp_dir).append(b"build");
+        make_rule(
+            &mut text,
+            &relative_to_top(&driver, &info.dir_top_bld),
+            &provides,
+        )?;
     }
     Ok(Collation {
         text,
@@ -196,10 +295,73 @@ pub fn collate_make_depend(
     })
 }
 
-fn collate(
+struct MakeSettings<'a> {
+    stamp_dir: &'a [u8],
+    file_exists: Option<&'a ModuleFileProbe<'a>>,
+}
+
+impl MakeSettings<'_> {
+    fn stamp(&self, info: &DependInfo<'_>, module_path: &[u8]) -> BString {
+        let stamp = [Lexical::new(module_path).filename(), b".stamp"].concat();
+        relative_to_top(
+            &Lexical::new(self.stamp_dir).append(&stamp),
+            &info.dir_top_bld,
+        )
+    }
+
+    fn find_module(&self, info: &DependInfo<'_>, name: &[u8]) -> Option<BString> {
+        let exists = self.file_exists?;
+        let lower = info.compiler.module_filename(name)?;
+        let (stem, extension) = Lexical::new(&lower).stem_extension(true);
+        let upper = [stem.to_ascii_uppercase().as_slice(), extension].concat();
+        for directory in &info.include_dirs {
+            for filename in [lower.as_slice(), upper.as_slice()] {
+                let path = Lexical::new(directory).append(filename);
+                if exists(&path) {
+                    return Some(relative_to_top(&path, &info.dir_top_bld));
+                }
+            }
+        }
+        None
+    }
+}
+
+fn make_rule(out: &mut BString, target: &[u8], prerequisite: &[u8]) -> Result<(), CollateError> {
+    make_path(out, target, true)?;
+    out.extend_from_slice(b": ");
+    make_path(out, prerequisite, false)?;
+    out.push(b'\n');
+    Ok(())
+}
+
+fn make_shell_arg(out: &mut BString, value: &[u8]) -> Result<(), CollateError> {
+    if value.is_empty() || value.iter().any(|byte| matches!(byte, 0 | b'\r' | b'\n')) {
+        return Err(CollateError::InvalidPath(value.into()));
+    }
+    let quote = value
+        .iter()
+        .any(|byte| !byte.is_ascii_alphanumeric() && !b"/._-@+:".contains(byte));
+    if quote {
+        out.push(b'"');
+    }
+    for &byte in value {
+        match byte {
+            b'$' => out.extend_from_slice(b"\\$$"),
+            b'"' | b'`' | b'\\' => out.extend_from_slice(&[b'\\', byte]),
+            _ => out.push(byte),
+        }
+    }
+    if quote {
+        out.push(b'"');
+    }
+    Ok(())
+}
+
+fn collate_with(
     objects: &[ObjectScan],
     info: &DependInfo<'_>,
     linked: &[ModuleMap],
+    make: Option<&MakeSettings<'_>>,
 ) -> Result<Graph, CollateError> {
     let mut scans = BTreeMap::new();
     for scan in objects {
@@ -210,42 +372,74 @@ fn collate(
     }
     let mut outputs: BTreeSet<_> = scans.keys().cloned().collect();
     let mut graph = Graph::default();
-    let mut providers = BTreeMap::<BString, BString>::new();
+    let mut providers = BTreeMap::<BString, Provider<'_>>::new();
     let module_dir = info.module_dir.as_deref().map_or_else(
         || info.dir_cur_bld.clone(),
         |dir| Lexical::new(&info.dir_cur_bld).append(dir),
     );
     for (object, scan) in &scans {
-        let mut edge = Edge::default();
         for name in &scan.provides {
             let module = BString::from(name.to_ascii_lowercase());
-            let file = info
-                .compiler
-                .module_filename(&module)
-                .ok_or_else(|| CollateError::InvalidModule(module.clone()))?;
-            if let Some(first) = providers.get(&module) {
-                if first == object {
+            let conditional = scan.conditional_provides.contains(&module);
+            if let Some(previous) = providers.get_mut(&module) {
+                if previous.primary == object {
                     continue;
                 }
-                return Err(CollateError::DuplicateProvider {
-                    module,
-                    objects: [first.clone(), object.clone()],
-                });
+                if conditional {
+                    if previous.conditional {
+                        previous.alternatives.push(object);
+                    }
+                    continue;
+                }
+                if !previous.conditional {
+                    return Err(CollateError::DuplicateProvider {
+                        module,
+                        objects: [previous.primary.clone(), object.clone()],
+                    });
+                }
             }
-            let path = relative_to_top(&Lexical::new(&module_dir).append(&file), &info.dir_top_bld);
-            if !outputs.insert(path.clone()) {
-                return Err(CollateError::DuplicateOutput(path));
-            }
-            providers.insert(module.clone(), object.clone());
-            graph.modules.insert(module, path.clone());
-            edge.provides.insert(path);
+            providers.insert(
+                module,
+                Provider {
+                    primary: object,
+                    alternatives: Vec::new(),
+                    conditional,
+                },
+            );
         }
-        edge.includes = scan
+        let includes = scan
             .resolved_includes
             .iter()
             .map(|path| relative_to_top(path, &info.dir_top_bld))
             .collect();
-        graph.edges.insert(object.clone(), edge);
+        graph.edges.insert(
+            object.clone(),
+            Edge {
+                includes,
+                ..Edge::default()
+            },
+        );
+    }
+    for (module, provider) in &providers {
+        let file = info
+            .compiler
+            .module_filename(module)
+            .ok_or_else(|| CollateError::InvalidModule(module.clone()))?;
+        let path = relative_to_top(&Lexical::new(&module_dir).append(&file), &info.dir_top_bld);
+        if !outputs.insert(path.clone()) {
+            return Err(CollateError::DuplicateOutput(path));
+        }
+        if let Some(edge) = graph.edges.get_mut(provider.primary) {
+            edge.provides.insert(path.clone());
+        }
+        let exported = make.map_or_else(|| path.clone(), |settings| settings.stamp(info, &path));
+        if make.is_some() && !provider.alternatives.is_empty() {
+            graph.stamp_inputs.insert(
+                exported.clone(),
+                provider.alternatives.iter().copied().cloned().collect(),
+            );
+        }
+        graph.modules.insert(module.clone(), exported);
     }
 
     let mut external = ModuleMap::new();
@@ -262,14 +456,29 @@ fn collate(
         if let Some(scan) = scans.get(object) {
             for name in &scan.requires {
                 let name = BString::from(name.to_ascii_lowercase());
+                if scan.provides.contains(&name) {
+                    continue;
+                }
                 if let Some(provider) = providers.get(&name) {
-                    if provider == object {
+                    if provider.primary == object {
                         continue;
                     }
-                    local.insert(provider.clone());
+                    local.insert(provider.primary.clone());
+                    for &alternative in &provider.alternatives {
+                        if alternative != object {
+                            local.insert(alternative.clone());
+                            if make.is_none() {
+                                edge.alternate_inputs.insert(alternative.clone());
+                            }
+                        }
+                    }
                 }
                 if let Some(path) = graph.modules.get(&name).or_else(|| external.get(&name)) {
-                    edge.requires.insert(path.clone());
+                    edge.requires.insert(name, path.clone());
+                } else if let Some(path) =
+                    make.and_then(|settings| settings.find_module(info, &name))
+                {
+                    edge.requires.insert(name, path);
                 }
             }
         }

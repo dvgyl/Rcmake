@@ -3,21 +3,25 @@
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
-use std::{
-    io::{self, Write},
-    process::ExitCode,
-};
+use std::process::ExitCode;
 
+#[cfg(any(unix, windows))]
+use std::io::{self, Write};
+
+#[cfg(any(unix, windows))]
 use rcmake_host::native::NativeHost;
+#[cfg(any(unix, windows))]
 use rcmake_lsp::{
     RequestId, RpcMessage, Server,
     rpc::{MAX_MESSAGE_BYTES, read_frame, write_frame},
 };
 
+#[cfg(any(unix, windows))]
 fn main() -> ExitCode {
     serve().unwrap_or(ExitCode::FAILURE)
 }
 
+#[cfg(any(unix, windows))]
 fn serve() -> io::Result<ExitCode> {
     let host = NativeHost::new().map_err(io::Error::other)?;
     let mut server = Server::new(&host);
@@ -58,6 +62,7 @@ fn serve() -> io::Result<ExitCode> {
     }
 }
 
+#[cfg(any(unix, windows))]
 fn send(output: &mut impl Write, message: RpcMessage) -> io::Result<()> {
     let body = message.encode();
     if body.len() <= MAX_MESSAGE_BYTES {
@@ -67,4 +72,9 @@ fn send(output: &mut impl Write, message: RpcMessage) -> io::Result<()> {
         write_frame(output, &error.encode())?;
     }
     output.flush()
+}
+
+#[cfg(not(any(unix, windows)))]
+fn main() -> ExitCode {
+    ExitCode::FAILURE
 }

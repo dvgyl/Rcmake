@@ -4,8 +4,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use rcmake_base::{BString, Limits};
 use rcmake_fortran::{
-    CollateError, DependInfo, FortranCompiler, FortranSourceInfo, IncludeResolver, ObjectScan,
-    ScanError, ScanInput, SourceForm, collate_make_depend, collate_ninja_dyndep, scan,
+    CollateError, DependInfo, FortranCompiler, FortranSourceInfo, FortranTdi, IncludeResolver,
+    ModuleCase, ObjectScan, ScanError, ScanInput, SourceForm, collate_make_depend,
+    collate_ninja_dyndep, scan,
 };
 
 fn names(words: &[&str]) -> BTreeSet<BString> {
@@ -86,18 +87,18 @@ USE :: Actual
     );
     assert_eq!(
         info.requires,
-        names(&["parent", "parent@child", "ieee_arithmetic", "actual"])
+        names(&[
+            "parent",
+            "parent@child",
+            "ieee_arithmetic",
+            "actual",
+            "iso_c_binding",
+            "omp_lib"
+        ])
     );
-    assert_eq!(
-        info.intrinsic,
-        names(&["iso_c_binding", "omp_lib", "vendor"])
-    );
+    assert_eq!(info.intrinsic, names(&["vendor"]));
 
     let mut input = ScanInput::new(b"sub.f90", text, SourceForm::Free);
-    input.implicit_intrinsics = false;
-    let oracle = scan(&input, None, &Limits::default())?;
-    assert_eq!(oracle.intrinsic, names(&["vendor"]));
-    assert!(oracle.requires.contains(&BString::from("iso_c_binding")));
     input.building_intrinsic_modules = true;
     assert!(
         scan(&input, None, &Limits::default())?
@@ -139,15 +140,7 @@ include 'file;name.inc'
     )?;
     assert_eq!(
         info.requires,
-        names(&[
-            "zero",
-            "middle",
-            "default",
-            "one",
-            "two",
-            "part_one_end",
-            "part_two_end"
-        ])
+        names(&["default", "two", "part_one_end", "part_two_end"])
     );
     assert_eq!(
         info.includes,
@@ -241,7 +234,7 @@ fn selects_source_forms_and_compiler_file_names() {
     for compiler in [b"Cray".as_slice(), b"PGI", b"Absoft"] {
         assert_eq!(
             FortranCompiler::from_id(compiler).module_filename(b"MiXeD"),
-            Some("MIXED.mod".into())
+            Some("mixed.mod".into())
         );
     }
     assert_eq!(
@@ -250,17 +243,39 @@ fn selects_source_forms_and_compiler_file_names() {
     );
     assert_eq!(
         FortranCompiler::from_id(b"Intel").module_filename(b"Parent@Child"),
-        Some("parent-child.smod".into())
+        Some("parent@child.smod".into())
     );
-    let llvm = FortranCompiler {
-        submodule_ext: b".mod",
-        ..FortranCompiler::from_id(b"LLVMFlang")
+    for (id, filename) in [
+        ("IntelLLVM", "parent@child.smod"),
+        ("Flang", "parent-child.mod"),
+        ("LLVMFlang", "parent-child.mod"),
+        ("NVHPC", "parent-child.mod"),
+        ("Cray", "child.mod"),
+    ] {
+        assert_eq!(
+            FortranCompiler::from_id(id.as_bytes()).module_filename(b"Parent@Child"),
+            Some(filename.into())
+        );
+    }
+    let owned = FortranTdi {
+        dir_cur_bld: "/build".into(),
+        dir_top_bld: "/build".into(),
+        include_dirs: vec!["/includes".into()],
+        module_dir: Some("mod".into()),
+        linked_target_dirs: vec![],
+        compiler_id: "Custom".into(),
+        submodule_sep: "__".into(),
+        submodule_ext: "".into(),
+        module_case: ModuleCase::Upper,
+        sources: vec![],
     };
+    let info = owned.as_depend_info();
+    assert_eq!(info.include_dirs, owned.include_dirs);
     assert_eq!(
-        llvm.module_filename(b"Parent@Child"),
-        Some("parent-child.mod".into())
+        info.compiler.module_filename(b"Parent@Child"),
+        Some("parent__child.mod".into())
     );
-    assert_eq!(llvm.module_filename(b"invalid@@module"), None);
+    assert_eq!(info.compiler.module_filename(b"invalid@@module"), None);
 }
 
 fn object(path: &str, provides: &[&str], requires: &[&str]) -> ObjectScan {
@@ -319,23 +334,41 @@ fn ninja_dyndep_is_sorted_and_uses_linked_target_module_paths() -> Result<(), Co
 fn make_depend_emits_module_producers_and_sorted_prerequisites() -> Result<(), CollateError> {
     let mut info = DependInfo::new(FortranCompiler::from_id(b"GNU"));
     info.module_dir = Some("mod dir".into());
-    let mut consumer = object("dependent $.o", &[], &["local", "remote"]);
+    info.include_dirs = vec!["first".into(), "second".into()];
+    let mut consumer = object("dependent $.o", &[], &["local", "remote", "vendor"]);
     consumer.info.resolved_includes = names(&["includes/foo#bar.inc"]);
     let mut objects = [object("producer.o", &["Local"], &[]), consumer];
     let linked = [BTreeMap::from([(
         "remote".into(),
-        "remote/remote.mod".into(),
+        "remote/remote.mod.stamp".into(),
     )])];
-    let depend = collate_make_depend(&objects, &info, &linked)?;
+    let exists = |path: &[u8]| matches!(path, b"first/VENDOR.mod" | b"second/vendor.mod");
+    let stamp_dir = b"CMakeFiles/app.dir";
+    let depend = collate_make_depend(&objects, &info, &linked, stamp_dir, Some(&exists))?;
     assert_eq!(
         depend.text,
         concat!(
-            "dependent\\ $$.o: includes/foo\\#bar.inc mod\\ dir/local.mod remote/remote.mod\n",
-            "mod\\ dir/local.mod: producer.o\n",
+            "dependent\\ $$.o: \\\n includes/foo\\#bar.inc\n",
+            "dependent\\ $$.o: CMakeFiles/app.dir/local.mod.stamp\n",
+            "dependent\\ $$.o: remote/remote.mod.stamp\n",
+            "dependent\\ $$.o: first/VENDOR.mod\n",
+            "producer.o.provides.build: CMakeFiles/app.dir/local.mod.stamp\n",
+            "CMakeFiles/app.dir/local.mod.stamp: producer.o\n",
+            "\t$(CMAKE_COMMAND) -E cmake_copy_f90_mod \"mod dir/local.mod\" CMakeFiles/app.dir/local.mod.stamp GNU\n",
+            "producer.o.provides.build:\n",
+            "\t$(CMAKE_COMMAND) -E touch producer.o.provides.build\n",
+            "CMakeFiles/app.dir/build: producer.o.provides.build\n",
         )
     );
+    assert_eq!(
+        depend.modules.get(b"local".as_slice()),
+        Some(&"CMakeFiles/app.dir/local.mod.stamp".into())
+    );
     objects.reverse();
-    assert_eq!(depend, collate_make_depend(&objects, &info, &linked)?);
+    assert_eq!(
+        depend,
+        collate_make_depend(&objects, &info, &linked, stamp_dir, Some(&exists))?
+    );
     Ok(())
 }
 
@@ -351,7 +384,7 @@ fn collators_report_cycles_duplicates_and_invalid_paths() {
         Err(CollateError::Cycle)
     );
     assert_eq!(
-        collate_make_depend(&cycle, &info, &[]),
+        collate_make_depend(&cycle, &info, &[], b"target.dir", None),
         Err(CollateError::Cycle)
     );
     let duplicate = [object("b.o", &["m"], &[]), object("a.o", &["M"], &[])];
@@ -367,4 +400,102 @@ fn collators_report_cycles_duplicates_and_invalid_paths() {
         collate_ninja_dyndep(&invalid, &info, &[]),
         Err(CollateError::InvalidPath(_))
     ));
+}
+
+#[test]
+fn fixed_form_tabs_start_statements_and_continue_tokens() -> Result<(), ScanError> {
+    let info = scan_text(
+        b"\tuse foo\n123\tuse bar\n\tuse long_\n\t1name\n",
+        SourceForm::Fixed,
+    )?;
+    assert_eq!(info.requires, names(&["foo", "bar", "long_name"]));
+    Ok(())
+}
+
+#[test]
+fn complementary_and_unknown_conditional_providers_collate()
+-> Result<(), Box<dyn std::error::Error>> {
+    let defines = ["USE_MPI=1".into()];
+    let mut mpi = ScanInput::new(
+        b"mpi.F90",
+        b"#ifdef USE_MPI\nmodule comm\n#endif",
+        SourceForm::Free,
+    );
+    mpi.defines = &defines;
+    let mut serial = ScanInput::new(
+        b"serial.F90",
+        b"#ifndef USE_MPI\nmodule comm\n#endif",
+        SourceForm::Free,
+    );
+    serial.defines = &defines;
+    let info = DependInfo::new(FortranCompiler::from_id(b"GNU"));
+    let objects = [
+        ObjectScan {
+            object: "mpi.o".into(),
+            info: scan(&mpi, None, &Limits::default())?,
+        },
+        ObjectScan {
+            object: "serial.o".into(),
+            info: scan(&serial, None, &Limits::default())?,
+        },
+        object("user.o", &[], &["comm"]),
+    ];
+    assert_eq!(objects[0].info.provides, names(&["comm"]));
+    assert!(objects[1].info.provides.is_empty());
+    assert!(
+        collate_ninja_dyndep(&objects, &info, &[])?
+            .text
+            .windows(b"build mpi.o | comm.mod".len())
+            .any(|bytes| bytes == b"build mpi.o | comm.mod")
+    );
+
+    let possible = scan_text(b"#if UNKNOWN > 1\nmodule comm\n#endif", SourceForm::Free)?;
+    assert_eq!(possible.conditional_provides, names(&["comm"]));
+    let objects = [
+        ObjectScan {
+            object: "a.o".into(),
+            info: possible.clone(),
+        },
+        ObjectScan {
+            object: "b.o".into(),
+            info: possible,
+        },
+        object("user.o", &[], &["comm"]),
+    ];
+    let result = collate_ninja_dyndep(&objects, &info, &[])?;
+    let text = std::str::from_utf8(&result.text)?;
+    assert!(text.contains("build a.o | comm.mod"));
+    assert!(text.contains("build b.o: dyndep"));
+    assert!(text.contains("build user.o: dyndep | b.o comm.mod"));
+    let result = collate_make_depend(&objects, &info, &[], b"target.dir", None)?;
+    assert!(std::str::from_utf8(&result.text)?.contains("target.dir/comm.mod.stamp: a.o b.o"));
+    Ok(())
+}
+
+#[test]
+fn define_undef_and_malformed_conditionals() -> Result<(), ScanError> {
+    let info = scan_text(b"#define FLAG 9\n#if defined(FLAG)\nuse yes\n#endif\n#undef FLAG\n#ifdef FLAG\nuse no\n#else\nuse fallback\n#endif", SourceForm::Free)?;
+    assert_eq!(info.requires, names(&["yes", "fallback"]));
+    let info = scan_text(b"#if 0\nuse a\n#else\nuse b\n", SourceForm::Free)?;
+    assert_eq!(info.requires, names(&["a", "b"]));
+    Ok(())
+}
+
+#[test]
+fn preprocessor_definitions_follow_include_order() -> Result<(), ScanError> {
+    let mut resolver = MemoryIncludes {
+        files: BTreeMap::from([(
+            "flags.inc".into(),
+            "#ifdef BEFORE\n#define AFTER\nuse from_include\n#endif\n".into(),
+        )]),
+        lookups: Vec::new(),
+    };
+    let input = ScanInput::new(
+        b"main.F90",
+        b"#define BEFORE\n#include \"flags.inc\"\n#ifdef AFTER\nuse after_include\n#endif",
+        SourceForm::Free,
+    );
+    let info = scan(&input, Some(&mut resolver), &Limits::default())?;
+    assert_eq!(info.requires, names(&["from_include", "after_include"]));
+    Ok(())
 }

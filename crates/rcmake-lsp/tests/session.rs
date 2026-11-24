@@ -219,10 +219,7 @@ fn scripted_editing_session() {
         "textDocument/formatting",
         &[("options", options)],
     );
-    assert_eq!(
-        get(array(&formatted).first().unwrap(), "newText"),
-        &Value::string(text.replace("# A comment\nmessage", "  # A comment\n  message"))
-    );
+    assert_indent_edits(&formatted, &[3, 4], "  ");
 
     let change = decode(
         r#"{"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":"file:///work/CMakeLists.txt","version":2},"contentChanges":[{"text":"project(Example)\nmessage(\"unfinished"}]}}"#,
@@ -263,22 +260,106 @@ fn scripted_editing_session() {
     assert_eq!(server.exit_code(), Some(0));
 }
 
+fn change(version: i64, changes: &str) -> RpcMessage {
+    decode(&format!(
+        r#"{{"jsonrpc":"2.0","method":"textDocument/didChange","params":{{"textDocument":{{"uri":"{URI}","version":{version}}},"contentChanges":{changes}}}}}"#
+    ))
+}
+
 #[test]
-fn incremental_edits_use_negotiated_encoding_and_keep_the_last_valid_version() {
-    for (utf8, column) in [(false, 11), (true, 13)] {
+fn incremental_edits_clamp_character_offsets_and_ignore_range_length() {
+    struct EchoText;
+    impl SemanticProvider for EchoText {
+        fn hover(&self, context: &SemanticContext<'_>) -> Option<String> {
+            Some(context.text.into())
+        }
+    }
+    for (utf8, end) in [(false, 11), (true, 13)] {
         let host = host();
-        let mut server = initialized(&host, utf8);
+        let mut server = initialized(&host, utf8).with_semantic_provider(&EchoText);
         open(&mut server, "message(\"😃X\")\r\n");
-        let change = |version, start, end, text| {
-            decode(&format!(
-                r#"{{"jsonrpc":"2.0","method":"textDocument/didChange","params":{{"textDocument":{{"uri":"{URI}","version":{version}}},"contentChanges":[{{"range":{{"start":{{"line":0,"character":{start}}},"end":{{"line":0,"character":{end}}}}},"text":"{text}"}}]}}}}"#
-            ))
-        };
-        assert!(server.handle(change(2, 10, column, "BAD")).is_empty());
-        let diagnostics = published(server.handle(change(3, column, column + 1, "Y")));
-        assert_eq!(get(&diagnostics, "version"), &Value::Int(3));
+        let changes = format!(
+            r#"[{{"range":{{"start":{{"line":0,"character":10}},"end":{{"line":0,"character":{end}}}}},"rangeLength":123,"text":"Y"}}]"#
+        );
+        let diagnostics = published(server.handle(change(2, &changes)));
+        assert_eq!(get(&diagnostics, "version"), &Value::Int(2));
         assert!(array(get(&diagnostics, "diagnostics")).is_empty());
-        assert!(server.handle(change(2, column, column + 1, "Z")).is_empty());
+        assert_eq!(
+            get(&at(&mut server, "textDocument/hover", 0, 999), "contents"),
+            &object(&[
+                ("kind", Value::string("plaintext")),
+                ("value", Value::string("message(\"YX\")\r\n")),
+            ]),
+        );
+        assert!(server.handle(change(2, &changes)).is_empty());
+    }
+}
+
+#[test]
+fn rejected_incremental_edits_disable_features_until_full_text_arrives() {
+    let host = host();
+    let mut server = initialized(&host, false);
+    let text = "if(ON)\nmessage(STATUS hello)\nendif()\n";
+    let format = |server: &mut Server<'_>| {
+        request(
+            server,
+            "textDocument/formatting",
+            &[(
+                "options",
+                object(&[
+                    ("tabSize", Value::Int(2)),
+                    ("insertSpaces", Value::Bool(true)),
+                ]),
+            )],
+        )
+    };
+    for (offset, recovery) in [(2, "didChange"), (5, "didSave"), (7, "didOpen")] {
+        if offset == 2 {
+            open(&mut server, text);
+        }
+        assert_indent_edits(&format(&mut server), &[1], "  ");
+        let invalid = r#"[{"range":{"start":{"line":9,"character":0},"end":{"line":9,"character":0}},"text":"x"}]"#;
+        let diagnostics = published(server.handle(change(offset, invalid)));
+        assert_eq!(get(&diagnostics, "version"), &Value::Int(offset));
+        assert!(array(get(&diagnostics, "diagnostics")).is_empty());
+        assert_eq!(format(&mut server), Value::Null);
+        assert_eq!(at(&mut server, "textDocument/hover", 0, 0), Value::Null);
+        let valid = r#"[{"range":{"start":{"line":1,"character":0},"end":{"line":1,"character":0}},"text":"x"}]"#;
+        published(server.handle(change(offset + 1, valid)));
+        assert_eq!(format(&mut server), Value::Null);
+        let doc = object(&[
+            ("uri", Value::string(URI)),
+            ("version", Value::Int(offset + 1)),
+            ("text", Value::string(text)),
+        ]);
+        let update = match recovery {
+            "didOpen" => {
+                RpcMessage::notification("textDocument/didOpen", object(&[("textDocument", doc)]))
+            }
+            "didSave" => RpcMessage::notification(
+                "textDocument/didSave",
+                object(&[("textDocument", doc), ("text", Value::string(text))]),
+            ),
+            _ => change(
+                offset + 2,
+                r#"[{"text":"if(ON)\nmessage(STATUS hello)\nendif()\n"}]"#,
+            ),
+        };
+        published(server.handle(update));
+        assert_indent_edits(&format(&mut server), &[1], "  ");
+    }
+}
+
+fn assert_indent_edits(result: &Value, lines: &[u64], indent: &str) {
+    let edits = array(result);
+    assert_eq!(edits.len(), lines.len());
+    for (edit, line) in edits.iter().zip(lines) {
+        assert_eq!(get(edit, "newText"), &Value::string(indent));
+        for endpoint in ["start", "end"] {
+            let point = get(get(edit, "range"), endpoint);
+            assert_eq!(get(point, "line"), &Value::UInt(*line));
+            assert_eq!(get(point, "character"), &Value::UInt(0));
+        }
     }
 }
 
@@ -297,11 +378,7 @@ fn formatter_preserves_multiline_literals_comments_and_line_endings() {
         "textDocument/formatting",
         &[("options", options)],
     );
-    let edit = array(&response).first().unwrap();
-    assert_eq!(
-        get(edit, "newText"),
-        &Value::string(text.replace("set(V", "\tset(V").replace("#[=[", "\t#[=["))
-    );
+    assert_indent_edits(&response, &[1, 4], "\t");
 }
 
 #[test]

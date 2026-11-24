@@ -140,6 +140,7 @@ fn invalid_frames_are_misses() -> HostResult<()> {
     if let Some((body, checksum)) = oversized.split_at_mut_checked(footer) {
         checksum.copy_from_slice(Digest::hash(body).as_bytes());
     }
+    host.remove_file(&path)?;
     for bytes in [
         b"".as_slice(),
         valid
@@ -150,8 +151,9 @@ fn invalid_frames_are_misses() -> HostResult<()> {
         &wrong_version,
         &oversized,
     ] {
-        host.write(&path, bytes, WriteMode::Truncate)?;
+        host.write(&path, bytes, WriteMode::CreateNew)?;
         assert_eq!(store.get_entry::<String>(domain, key)?, None);
+        assert!(store.file_metadata(&path)?.is_none());
     }
     let wrong_key = domain.key(b"moved");
     let moved = store.entry_path(domain, wrong_key);
@@ -178,6 +180,7 @@ fn stat_negative_lookup_and_environment_invalidate_the_entry() -> HostResult<()>
         InputStamp::FileStat {
             path: header.clone(),
             stat: FastStat::read(&host, &header)?,
+            digest: None,
         },
         InputStamp::NegativeLookup {
             root: root.clone(),
@@ -367,5 +370,154 @@ fn stale_or_corrupt_entry_can_be_refreshed() -> HostResult<()> {
     host.write(&store.entry_path(domain, key), b"torn", WriteMode::Truncate)?;
     store.put_entry(domain, key, &entry("recovered"))?;
     assert_eq!(store.get_entry(domain, key)?, Some(entry("recovered")));
+    Ok(())
+}
+
+#[test]
+fn collection_accounts_for_shared_blobs_and_staging() -> HostResult<()> {
+    let host = host();
+    let mut store = store(&host)?;
+    let domain = Domain::FetchV1;
+    let mut items = Vec::new();
+    let mut size = 0;
+    let stale = store.config.root.join("tmp/stale");
+    host.seed_file(&stale, &[0; 4096])?;
+    for number in 0..5u8 {
+        let digest = store.put_blob(&[number; 4096])?;
+        let mut result = entry("archive");
+        result.blobs = vec![digest, digest];
+        let key = domain.key(&[number]);
+        store.put_entry(domain, key, &result)?;
+        size += host.metadata(&store.blob_path(digest), Follow::No)?.len;
+        size += host
+            .metadata(&store.entry_path(domain, key), Follow::No)?
+            .len;
+        items.push((key, digest));
+        host.sleep(Duration::from_secs(1));
+    }
+
+    host.sleep(Duration::from_secs(3600));
+    let active = store.config.root.join("tmp/active");
+    host.seed_file(&active, &[0; 32])?;
+    store.config.max_bytes = size + 31;
+    let report = store.gc()?;
+    assert_eq!(report.staging_removed, 1);
+    assert_eq!(report.entries_removed, 2);
+    assert_eq!(report.blobs_removed, 2);
+    assert!(store.file_metadata(&stale)?.is_none());
+    assert!(store.file_metadata(&active)?.is_some());
+    for (index, (key, digest)) in items.into_iter().enumerate() {
+        assert_eq!(
+            store.get_entry::<String>(domain, key)?.is_some(),
+            index >= 2
+        );
+        assert_eq!(store.get_blob(digest)?.is_some(), index >= 2);
+    }
+    Ok(())
+}
+
+#[test]
+fn corrupt_blobs_are_removed_and_republished() -> HostResult<()> {
+    let host = host();
+    let mut store = store(&host)?;
+    let digest = store.put_blob(b"artifact")?;
+    let path = store.blob_path(digest);
+    let wrong = frame::encode(BLOB_MAGIC, b"wrong digest", blob_limit())
+        .map_err(|error| io_at(error, &path))?;
+    host.write(&path, &wrong, WriteMode::Truncate)?;
+    store.config.mode = StoreMode::Verify;
+    assert_eq!(store.get_blob(digest)?, None);
+    assert!(store.file_metadata(&path)?.is_some());
+    store.config.mode = StoreMode::ReadWrite;
+    assert_eq!(store.get_blob(digest)?, None);
+    assert!(store.file_metadata(&path)?.is_none());
+
+    host.write(&path, b"", WriteMode::CreateNew)?;
+    assert_eq!(store.put_blob(b"artifact")?, digest);
+    assert_eq!(
+        store.get_blob(digest)?.as_deref(),
+        Some(b"artifact".as_slice())
+    );
+    host.sleep(store.config.blob_grace);
+    store.put_blob(b"artifact")?;
+    assert_eq!(store.gc()?.blobs_removed, 0);
+    Ok(())
+}
+
+#[test]
+fn file_stamps_detect_same_time_replacements_and_allow_touch() -> HostResult<()> {
+    let host = host();
+    let path = host.initial_cwd().join("source");
+    let replacement = host.initial_cwd().join("replacement");
+    let resolution = Duration::from_secs(2);
+    host.seed_file(&path, b"old")?;
+    assert!(matches!(
+        InputStamp::record_file(&host, path.clone(), resolution)?,
+        InputStamp::FileHash { .. }
+    ));
+    host.sleep(Duration::from_secs(10));
+    let stamp = InputStamp::record_file(&host, path.clone(), resolution)?;
+    assert!(matches!(stamp, InputStamp::FileStat { .. }));
+    let time = host.now();
+    host.set_times(&path, None, Some(time))?;
+    assert_eq!(
+        verify_trace(&host, std::slice::from_ref(&stamp)),
+        VerifyOutcome::Hit
+    );
+    host.seed_file(&replacement, b"new")?;
+    host.set_times(&replacement, None, Some(time))?;
+    let stamp = InputStamp::record_file(&host, path.clone(), Duration::ZERO)?;
+    let before = FastStat::read(&host, &path)?;
+    host.rename(&replacement, &path)?;
+    let after = FastStat::read(&host, &path)?;
+    assert_eq!(
+        (before.len, before.mtime_secs, before.mtime_nanos),
+        (after.len, after.mtime_secs, after.mtime_nanos)
+    );
+    assert_ne!(before.ino, after.ino);
+    assert_eq!(
+        verify_trace(&host, &[stamp]),
+        VerifyOutcome::Miss(MissReason { stamp: 0 })
+    );
+    Ok(())
+}
+
+#[test]
+fn unsupported_rename_uses_fallback_and_preserves_existing_file() -> HostResult<()> {
+    let host = host();
+    let store = store(&host)?;
+    let temp = store.config.root.join("tmp/staged");
+    let output = store.config.root.join("final");
+    host.seed_file(&temp, b"first")?;
+    store.rename_staged(&temp, &output, || {
+        Err(HostError::unsupported("Unsupported by test host."))
+    })?;
+    assert!(store.file_metadata(&temp)?.is_none());
+    assert!(!store.publish(&output, b"second", false)?);
+    assert_eq!(host.read(&output, ReadRange::All { limit: 32 })?, b"first");
+    host.create_dir_all(&store.config.root.join("blocked/child"))?;
+    assert!(
+        store
+            .publish(&store.config.root.join("blocked"), b"unused", true)
+            .is_err()
+    );
+    assert!(host.read_dir(&store.config.root.join("tmp"))?.is_empty());
+    Ok(())
+}
+
+#[test]
+fn entries_with_blobs_skip_publication_while_collection_holds_lock() -> HostResult<()> {
+    let host = host();
+    let store = store(&host)?;
+    let mut result = entry("archive");
+    result.blobs.push(store.put_blob(b"blob")?);
+    let domain = Domain::FetchV1;
+    let key = domain.key(b"dependency");
+    let lock = host.lock_file(&store.gc_lock_path()?, Some(Duration::ZERO))?;
+    store.put_entry(domain, key, &result)?;
+    assert_eq!(store.get_entry::<String>(domain, key)?, None);
+    drop(lock);
+    store.put_entry(domain, key, &result)?;
+    assert_eq!(store.get_entry(domain, key)?, Some(result));
     Ok(())
 }

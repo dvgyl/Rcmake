@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -15,6 +15,8 @@ pub struct GcReport {
     pub entries_removed: usize,
     /// Number of removed blobs.
     pub blobs_removed: usize,
+    /// Number of removed staging files.
+    pub staging_removed: usize,
     /// Combined file size freed in bytes.
     pub bytes_removed: u64,
 }
@@ -48,52 +50,103 @@ impl Store<'_> {
         };
 
         let now = self.host.now();
-        let blobs = self.cache_files(&self.config.root.join("blobs"), "blob")?;
+        let mut blobs: BTreeMap<_, _> = self
+            .cache_files(&self.config.root.join("blobs"), "blob")?
+            .into_iter()
+            .map(|blob| (blob.digest, (blob, 0usize)))
+            .collect();
+        let mut total = blobs
+            .values()
+            .fold(0u64, |size, (file, _)| size.saturating_add(file.stat.len));
+        let staging = self.config.root.join("tmp");
+        for file in self.list_dir(&staging)? {
+            let path = staging.join(path::to_native(&file.name));
+            if file.kind != FileKind::File {
+                continue;
+            }
+            if let Some(stat) = self.file_metadata(&path)? {
+                if older_than(now, stat.mtime, Duration::from_secs(3600))
+                    && self.remove_if_unchanged(&path, &stat)?
+                {
+                    report.staging_removed += 1;
+                    report.bytes_removed = report.bytes_removed.saturating_add(stat.len);
+                } else {
+                    total = total.saturating_add(stat.len);
+                }
+            }
+        }
         let mut entries = Vec::new();
         for domain in Domain::ALL {
             let directory = self.config.root.join("entries").join(domain.as_str());
-            entries.extend(
-                self.cache_files(&directory, "entry")?
-                    .into_iter()
-                    .map(|file| (domain, file)),
-            );
+            for file in self.cache_files(&directory, "entry")? {
+                let references =
+                    self.read_entry::<BlobReferences>(domain, file.digest, &file.path)?;
+                if references.is_none() && self.file_metadata(&file.path)?.is_none() {
+                    report.entries_removed += 1;
+                    report.bytes_removed = report.bytes_removed.saturating_add(file.stat.len);
+                    continue;
+                }
+                let references = references.map_or_else(Vec::new, |entry| entry.blobs);
+                for digest in &references {
+                    if let Some((_, count)) = blobs.get_mut(digest) {
+                        *count += 1;
+                    }
+                }
+                total = total.saturating_add(file.stat.len);
+                entries.push((file, references));
+            }
         }
 
-        let mut total = blobs
-            .iter()
-            .chain(entries.iter().map(|(_, file)| file))
-            .fold(0u64, |size, file| size.saturating_add(file.stat.len));
-        let goal = if total > self.config.max_bytes {
-            self.config.max_bytes - self.config.max_bytes / 5
-        } else {
-            self.config.max_bytes
-        };
-        entries.sort_unstable_by(|(_, left), (_, right)| {
+        for (blob, count) in blobs.values() {
+            if *count == 0 {
+                total = total.saturating_sub(self.sweep_blob(blob, now, &mut report)?);
+            }
+        }
+        if total <= self.config.max_bytes {
+            return Ok(report);
+        }
+        let goal = self.config.max_bytes - self.config.max_bytes / 5;
+        entries.sort_unstable_by(|(left, _), (right, _)| {
             (left.stat.mtime, &left.path).cmp(&(right.stat.mtime, &right.path))
         });
 
-        let mut live = BTreeSet::new();
-        for (domain, entry) in entries {
-            if total > goal && self.remove_if_unchanged(&entry)? {
-                report.entries_removed += 1;
-                report.bytes_removed += entry.stat.len;
-                total -= entry.stat.len;
-            } else if let Some(references) =
-                self.read_entry::<BlobReferences>(domain, entry.digest, &entry.path)?
-            {
-                live.extend(references.blobs);
+        for (entry, references) in entries {
+            if total <= goal {
+                break;
             }
-        }
-        for blob in blobs {
-            if !live.contains(&blob.digest)
-                && older_than(now, blob.stat.mtime, self.config.blob_grace)
-                && self.remove_if_unchanged(&blob)?
-            {
-                report.blobs_removed += 1;
-                report.bytes_removed = report.bytes_removed.saturating_add(blob.stat.len);
+            if self.remove_if_unchanged(&entry.path, &entry.stat)? {
+                report.entries_removed += 1;
+                report.bytes_removed = report.bytes_removed.saturating_add(entry.stat.len);
+                total = total.saturating_sub(entry.stat.len);
+                for digest in references {
+                    if let Some((blob, count)) = blobs.get_mut(&digest) {
+                        *count -= 1;
+                        if *count == 0 {
+                            total =
+                                total.saturating_sub(self.sweep_blob(blob, now, &mut report)?);
+                        }
+                    }
+                }
             }
         }
         Ok(report)
+    }
+
+    fn sweep_blob(
+        &self,
+        blob: &CachedFile,
+        now: FileTime,
+        report: &mut GcReport,
+    ) -> HostResult<u64> {
+        if older_than(now, blob.stat.mtime, self.config.blob_grace)
+            && self.remove_if_unchanged(&blob.path, &blob.stat)?
+        {
+            report.blobs_removed += 1;
+            report.bytes_removed = report.bytes_removed.saturating_add(blob.stat.len);
+            Ok(blob.stat.len)
+        } else {
+            Ok(0)
+        }
     }
 
     fn cache_files(&self, directory: &Path, extension: &str) -> HostResult<Vec<CachedFile>> {
@@ -140,16 +193,14 @@ impl Store<'_> {
         }
     }
 
-    fn remove_if_unchanged(&self, file: &CachedFile) -> HostResult<bool> {
-        let Some(current) = self.file_metadata(&file.path)? else {
+    pub(crate) fn remove_if_unchanged(&self, path: &Path, stat: &Metadata) -> HostResult<bool> {
+        let Some(current) = self.file_metadata(path)? else {
             return Ok(false);
         };
-        if (current.dev, current.ino, current.len, current.mtime)
-            != (file.stat.dev, file.stat.ino, file.stat.len, file.stat.mtime)
-        {
+        if crate::FastStat::from(&current) != crate::FastStat::from(stat) {
             return Ok(false);
         }
-        match self.host.remove_file(&file.path) {
+        match self.host.remove_file(path) {
             Ok(()) => Ok(true),
             Err(error) if error.kind == ErrorKind::NotFound => Ok(false),
             Err(error) => Err(error),
@@ -169,7 +220,7 @@ fn lower_hex(bytes: &[u8], len: usize) -> bool {
             .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
 }
 
-fn older_than(now: FileTime, mtime: FileTime, grace: Duration) -> bool {
+pub(crate) fn older_than(now: FileTime, mtime: FileTime, grace: Duration) -> bool {
     let nanos = |time: FileTime| i128::from(time.secs) * 1_000_000_000 + i128::from(time.nanos);
     nanos(now) - nanos(mtime) >= grace.as_nanos() as i128
 }

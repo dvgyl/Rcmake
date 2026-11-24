@@ -8,8 +8,8 @@ mod scan;
 mod source;
 
 pub use collate::{
-    CollateError, Collation, DependInfo, DependSource, ModuleMap, ObjectScan, collate_make_depend,
-    collate_ninja_dyndep,
+    CollateError, Collation, DependInfo, DependSource, FortranTdi, ModuleFileProbe, ModuleMap,
+    ObjectScan, collate_make_depend, collate_ninja_dyndep,
 };
 pub use scan::{FortranSourceInfo, IncludeResolver, ScanError, ScanInput, scan};
 pub use source::{FortranCompiler, ModuleCase, SourceForm};

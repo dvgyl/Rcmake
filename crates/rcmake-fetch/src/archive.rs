@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use std::path::Path;
 
 use rcmake_base::{Limits, hash::HashAlgo};
@@ -75,6 +77,8 @@ pub struct ArchiveResult {
     pub bytes: Vec<u8>,
     /// Whether the bytes came from the store.
     pub cache_hit: bool,
+    /// Store error if the cache could not read or publish the archive.
+    pub cache_warning: Option<FetchError>,
 }
 
 /// Archive cache that uses the store's SHA-256 blobs and versioned hash aliases.
@@ -82,6 +86,7 @@ pub struct ArchiveCache<'a> {
     host: &'a dyn Host,
     store: &'a Store<'a>,
     offline: bool,
+    timeout: Option<Duration>,
 }
 
 impl<'a> ArchiveCache<'a> {
@@ -91,7 +96,14 @@ impl<'a> ArchiveCache<'a> {
             host,
             store,
             offline: offline(host),
+            timeout: None,
         }
+    }
+
+    /// Set a total timeout for curl downloads.
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = Some(timeout);
+        self
     }
 
     /// Require cache-only operation for this instance.
@@ -123,6 +135,15 @@ impl<'a> ArchiveCache<'a> {
     /// Verify bytes before adding them and their hash aliases to the store.
     pub fn insert(&self, url: &str, hash: &ContentHash, bytes: &[u8]) -> Result<(), FetchError> {
         hash.verify(bytes)?;
+        self.insert_verified(url, hash, bytes)
+    }
+
+    fn insert_verified(
+        &self,
+        url: &str,
+        hash: &ContentHash,
+        bytes: &[u8],
+    ) -> Result<(), FetchError> {
         let digest = self.store.put_blob(bytes)?;
         let entry = Entry {
             trace: Default::default(),
@@ -145,24 +166,33 @@ impl<'a> ArchiveCache<'a> {
         hash: Option<&ContentHash>,
         download: impl FnOnce() -> Result<Vec<u8>, FetchError>,
     ) -> Result<ArchiveResult, FetchError> {
-        if let Some(hash) = hash
-            && let Some(bytes) = self.lookup(url, hash)?
-        {
-            return Ok(ArchiveResult {
-                bytes,
-                cache_hit: true,
-            });
+        let mut cache_warning = None;
+        if let Some(hash) = hash {
+            match self.lookup(url, hash) {
+                Ok(Some(bytes)) => {
+                    return Ok(ArchiveResult {
+                        bytes,
+                        cache_hit: true,
+                        cache_warning,
+                    });
+                }
+                Ok(None) => {}
+                Err(error) => cache_warning = Some(error),
+            }
         }
         if self.offline || offline(self.host) {
             return Err(FetchError::Offline);
         }
         let bytes = download()?;
         if let Some(hash) = hash {
-            self.insert(url, hash, &bytes)?;
+            hash.verify(&bytes)?;
+            let write_warning = self.insert_verified(url, hash, &bytes).err();
+            cache_warning = cache_warning.or(write_warning);
         }
         Ok(ArchiveResult {
             bytes,
             cache_hit: false,
+            cache_warning,
         })
     }
 
@@ -208,6 +238,7 @@ impl<'a> ArchiveCache<'a> {
             &self.host.initial_cwd(),
             self.host.env_all(),
             usize::try_from(limit).unwrap_or(usize::MAX),
+            self.timeout,
         )?;
         Ok(result.stdout)
     }

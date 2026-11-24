@@ -90,13 +90,38 @@ enum State {
     Exited(i32),
 }
 
+enum OpenDocument {
+    Synced(Document),
+    Desynced(i64),
+}
+
+impl OpenDocument {
+    fn current(&self) -> Option<&Document> {
+        match self {
+            Self::Synced(doc) => Some(doc),
+            Self::Desynced(_) => None,
+        }
+    }
+
+    fn version(&self) -> i64 {
+        match self {
+            Self::Synced(doc) => doc.version,
+            Self::Desynced(version) => *version,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.current().map_or(0, |doc| doc.text.len())
+    }
+}
+
 /// Language Server Protocol state for one client. Use [Self::handle] to dispatch messages.
 pub struct Server<'a> {
     host: &'a dyn Host,
     semantic: Option<&'a dyn SemanticProvider>,
     state: State,
     encoding: PositionEncoding,
-    documents: BTreeMap<String, Document>,
+    documents: BTreeMap<String, OpenDocument>,
     open_bytes: usize,
 }
 
@@ -183,7 +208,7 @@ impl<'a> Server<'a> {
             | "textDocument/formatting"
             | "textDocument/semanticTokens/full" => {
                 let uri = document_uri(params).ok_or(INVALID_PARAMS)?;
-                let Some(doc) = self.documents.get(uri) else {
+                let Some(doc) = self.documents.get(uri).and_then(OpenDocument::current) else {
                     return Ok(Value::Null);
                 };
                 Ok(match method {
@@ -211,7 +236,7 @@ impl<'a> Server<'a> {
                 let position = get(params, "position")
                     .and_then(Position::parse)
                     .ok_or(INVALID_PARAMS)?;
-                let Some(doc) = self.documents.get(uri) else {
+                let Some(doc) = self.documents.get(uri).and_then(OpenDocument::current) else {
                     return Ok(Value::Null);
                 };
                 let offset = doc
@@ -254,27 +279,40 @@ impl<'a> Server<'a> {
                 let uri = get(doc, "uri").and_then(string)?;
                 let version = get(doc, "version").and_then(int)?;
                 let text = get(doc, "text").and_then(string)?;
-                if self.documents.contains_key(uri) || self.documents.len() >= MAX_DOCUMENTS {
-                    return None;
+                match self.documents.get(uri) {
+                    Some(OpenDocument::Synced(_)) => return None,
+                    None if self.documents.len() >= MAX_DOCUMENTS => return None,
+                    _ => {}
                 }
                 self.replace(uri, text, version)
             }
             "textDocument/didChange" => {
                 let uri = document_uri(params)?;
-                let version = get(get(params, "textDocument")?, "version").and_then(int)?;
                 let doc = self.documents.get(uri)?;
-                let changes = get(params, "contentChanges").and_then(array)?;
-                if version <= doc.version || changes.is_empty() || changes.len() > 1024 {
+                let Some(version) = get(get(params, "textDocument")?, "version").and_then(int)
+                else {
+                    return self.desync(uri, doc.version());
+                };
+                if version <= doc.version() {
                     return None;
                 }
-                let text = self.apply_changes(doc, changes)?;
-                self.replace(uri, &text, version)
+                let text = get(params, "contentChanges")
+                    .and_then(array)
+                    .and_then(|changes| self.apply_changes(doc, changes));
+                if let Some(text) = text
+                    && let Some(notification) = self.replace(uri, &text, version)
+                {
+                    return Some(notification);
+                }
+                self.desync(uri, version)
             }
             "textDocument/didSave" => {
                 let uri = document_uri(params)?;
                 let doc = self.documents.get(uri)?;
                 if let Some(text) = get(params, "text") {
-                    self.replace(uri, string(text)?, doc.version)
+                    let version = doc.version();
+                    self.replace(uri, string(text)?, version)
+                        .or_else(|| self.desync(uri, version))
                 } else {
                     Some(self.publish(uri))
                 }
@@ -282,8 +320,10 @@ impl<'a> Server<'a> {
             "textDocument/didClose" => {
                 let uri = document_uri(params)?;
                 let doc = self.documents.remove(uri)?;
-                self.open_bytes -= doc.text.len();
-                if let Some(provider) = self.semantic {
+                self.open_bytes -= doc.len();
+                if doc.current().is_some()
+                    && let Some(provider) = self.semantic
+                {
                     provider.update(SemanticUpdate::Closed { uri });
                 }
                 Some(self.publish(uri))
@@ -296,9 +336,33 @@ impl<'a> Server<'a> {
         }
     }
 
-    fn apply_changes(&self, doc: &Document, changes: &[Value]) -> Option<String> {
-        let limit = MAX_BUFFER_BYTES.min(MAX_OPEN_BYTES - (self.open_bytes - doc.text.len()));
-        let mut text = doc.text.clone();
+    fn desync(&mut self, uri: &str, version: i64) -> Option<RpcMessage> {
+        let previous = self
+            .documents
+            .insert(uri.to_owned(), OpenDocument::Desynced(version))?;
+        self.open_bytes -= previous.len();
+        if previous.current().is_some()
+            && let Some(provider) = self.semantic
+        {
+            provider.update(SemanticUpdate::Closed { uri });
+        }
+        Some(self.publish(uri))
+    }
+
+    fn apply_changes(&self, doc: &OpenDocument, mut changes: &[Value]) -> Option<String> {
+        if changes.is_empty() || changes.len() > 1024 {
+            return None;
+        }
+        let limit = MAX_BUFFER_BYTES.min(MAX_OPEN_BYTES - (self.open_bytes - doc.len()));
+        let mut text = if let Some(full) = changes
+            .iter()
+            .rposition(|change| get(change, "range").is_none())
+        {
+            changes = changes.get(full..)?;
+            String::new()
+        } else {
+            doc.current()?.text.clone()
+        };
         let mut work = 0usize;
         for change in changes {
             let replacement = get(change, "text").and_then(string)?;
@@ -309,23 +373,14 @@ impl<'a> Server<'a> {
                     return None;
                 }
                 let lines = Lines::new(&text);
-                let start = lines.offset(
-                    &text,
-                    get(span, "start").and_then(Position::parse)?,
-                    self.encoding,
-                )?;
-                let end = lines.offset(
-                    &text,
-                    get(span, "end").and_then(Position::parse)?,
-                    self.encoding,
-                )?;
-                let old = text.get(start..end)?;
-                if let Some(length) = get(change, "rangeLength") {
-                    let length = usize::try_from(int(length)?).ok()?;
-                    if self.encoding.width(old) != length {
-                        return None;
-                    }
+                let start = get(span, "start").and_then(Position::parse)?;
+                let end = get(span, "end").and_then(Position::parse)?;
+                if (end.line, end.character) < (start.line, start.character) {
+                    return None;
                 }
+                let start = lines.offset(&text, start, self.encoding)?;
+                let end = lines.offset(&text, end, self.encoding)?;
+                let old = text.get(start..end)?;
                 if text.len() - old.len() + replacement.len() > limit {
                     return None;
                 }
@@ -345,13 +400,15 @@ impl<'a> Server<'a> {
         if uri.is_empty() || uri.len() > 8192 || text.len() > MAX_BUFFER_BYTES {
             return None;
         }
-        let old_len = self.documents.get(uri).map_or(0, |doc| doc.text.len());
+        let old_len = self.documents.get(uri).map_or(0, OpenDocument::len);
         let total = self.open_bytes - old_len + text.len();
         if total > MAX_OPEN_BYTES {
             return None;
         }
-        self.documents
-            .insert(uri.to_owned(), Document::new(text.to_owned(), version));
+        self.documents.insert(
+            uri.to_owned(),
+            OpenDocument::Synced(Document::new(text.to_owned(), version)),
+        );
         self.open_bytes = total;
         if let Some(provider) = self.semantic {
             provider.update(SemanticUpdate::Changed { uri, text, version });
@@ -362,8 +419,11 @@ impl<'a> Server<'a> {
     fn publish(&self, uri: &str) -> RpcMessage {
         let mut params = vec![("uri", Value::string(uri))];
         if let Some(doc) = self.documents.get(uri) {
-            params.push(("version", Value::Int(doc.version)));
-            params.push(("diagnostics", Value::Array(doc.diagnostics(self.encoding))));
+            params.push(("version", Value::Int(doc.version())));
+            let diagnostics = doc
+                .current()
+                .map_or_else(Vec::new, |doc| doc.diagnostics(self.encoding));
+            params.push(("diagnostics", Value::Array(diagnostics)));
         } else {
             params.push(("diagnostics", Value::Array(Vec::new())));
         }

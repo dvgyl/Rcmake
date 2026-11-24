@@ -10,7 +10,7 @@ mod stamp;
 
 use std::io::{self, ErrorKind};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use rcmake_base::Limits;
@@ -130,6 +130,7 @@ pub(crate) struct Record<T> {
 pub struct Store<'a> {
     host: &'a dyn Host,
     config: StoreConfig,
+    rename_fallback: AtomicBool,
 }
 
 impl<'a> Store<'a> {
@@ -138,7 +139,11 @@ impl<'a> Store<'a> {
         if config.mode != StoreMode::Off && !config.root.is_absolute() {
             return Err(HostError::not_absolute(config.root));
         }
-        Ok(Self { host, config })
+        Ok(Self {
+            host,
+            config,
+            rename_fallback: AtomicBool::new(false),
+        })
     }
 
     /// Write an immutable blob and return its digest.
@@ -150,7 +155,13 @@ impl<'a> Store<'a> {
             let path = self.blob_path(digest);
             let frame = frame::encode(BLOB_MAGIC, bytes, blob_limit())
                 .map_err(|error| io_at(error, &path))?;
-            self.publish(&path, &frame, false)?;
+            if !self.publish(&path, &frame, false)? {
+                if self.get_blob(digest)?.is_some() {
+                    let _ = self.host.set_times(&path, None, Some(self.host.now()));
+                } else {
+                    self.publish(&path, &frame, true)?;
+                }
+            }
         }
         Ok(digest)
     }
@@ -160,9 +171,9 @@ impl<'a> Store<'a> {
         if self.config.mode == StoreMode::Off {
             return Ok(None);
         }
-        Ok(self
-            .read_frame(&self.blob_path(digest), BLOB_MAGIC, blob_limit())?
-            .filter(|bytes| Digest::hash(bytes) == digest))
+        self.read_checked(&self.blob_path(digest), BLOB_MAGIC, blob_limit(), |bytes| {
+            (Digest::hash(&bytes) == digest).then_some(bytes)
+        })
     }
 
     /// Write a verified blob to a destination and report whether the blob was present.
@@ -184,7 +195,8 @@ impl<'a> Store<'a> {
     /// Publish an entry. Keep the first valid entry for a key.
     ///
     /// All referenced blobs must already be present. Modes that disable writes
-    /// return success without publishing.
+    /// return success without publishing. If collection holds the lock, skip
+    /// writes that require it.
     pub fn put_entry<T: Serialize>(
         &self,
         domain: Domain,
@@ -205,9 +217,11 @@ impl<'a> Store<'a> {
         // Keep collection out of reference checks and stale entry replacement.
         self.ensure_dir(&self.config.root)?;
         let lock_path = self.gc_lock_path()?;
-        let _guard = self
-            .host
-            .lock_file(&lock_path, Some(Duration::from_secs(1)))?;
+        let _guard = match self.host.lock_file(&lock_path, Some(Duration::ZERO)) {
+            Ok(guard) => guard,
+            Err(error) if error.kind == ErrorKind::TimedOut => return Ok(()),
+            Err(error) => return Err(error),
+        };
         for &digest in &entry.blobs {
             let path = self.blob_path(digest);
             if self.file_metadata(&path)?.is_none() {
@@ -234,6 +248,7 @@ impl<'a> Store<'a> {
     /// Read and verify an entry, its input trace, and its blob references.
     ///
     /// An absent, stale, oversized, or invalid entry is a cache miss.
+    /// A blob can be collected after a hit. Treat an absent blob as a miss.
     pub fn get_entry<T: DeserializeOwned>(
         &self,
         domain: Domain,
@@ -306,13 +321,10 @@ impl<'a> Store<'a> {
         key: Digest,
         path: &Path,
     ) -> HostResult<Option<T>> {
-        let Some(payload) = self.read_frame(path, ENTRY_MAGIC, ENTRY_LIMIT)? else {
-            return Ok(None);
-        };
-        let record = serde_json::from_slice::<Record<T>>(&payload).ok();
-        Ok(record
-            .filter(|record| record.domain == domain && record.key == key)
-            .map(|record| record.entry))
+        self.read_checked(path, ENTRY_MAGIC, ENTRY_LIMIT, |payload| {
+            let record = serde_json::from_slice::<Record<T>>(&payload).ok()?;
+            (record.domain == domain && record.key == key).then_some(record.entry)
+        })
     }
 
     fn file_metadata(&self, path: &Path) -> HostResult<Option<Metadata>> {
@@ -374,26 +386,31 @@ impl<'a> Store<'a> {
         self.host.create_dir_all(path)
     }
 
-    fn read_frame(
+    fn read_checked<T>(
         &self,
         path: &Path,
         magic: &[u8; 8],
         limit: usize,
-    ) -> HostResult<Option<Vec<u8>>> {
-        let max = frame::disk_limit(limit);
-        if !self
-            .file_metadata(path)?
-            .is_some_and(|meta| meta.len <= max)
-        {
+        validate: impl FnOnce(Vec<u8>) -> Option<T>,
+    ) -> HostResult<Option<T>> {
+        let Some(stat) = self.file_metadata(path)? else {
             return Ok(None);
-        }
-        match self.host.read(path, ReadRange::All { limit: max }) {
-            Ok(bytes) => Ok(frame::decode(magic, &bytes, limit)),
-            Err(error) if matches!(error.kind, ErrorKind::NotFound | ErrorKind::FileTooLarge) => {
-                Ok(None)
+        };
+        let max = frame::disk_limit(limit);
+        let value = if stat.len <= max {
+            match self.host.read(path, ReadRange::All { limit: max }) {
+                Ok(bytes) => frame::decode(magic, &bytes, limit).and_then(validate),
+                Err(error) if error.kind == ErrorKind::NotFound => return Ok(None),
+                Err(error) if error.kind == ErrorKind::FileTooLarge => None,
+                Err(error) => return Err(error),
             }
-            Err(error) => Err(error),
+        } else {
+            None
+        };
+        if value.is_none() && self.writable() {
+            let _ = self.remove_if_unchanged(path, &stat);
         }
+        Ok(value)
     }
 
     fn publish(&self, path: &Path, bytes: &[u8], replace: bool) -> HostResult<bool> {
@@ -403,29 +420,35 @@ impl<'a> Store<'a> {
         let staging = self.config.root.join("tmp");
         self.ensure_dir(&staging)?;
         let pid = self.host.system().pid;
+        let now = self.host.now();
         for _ in 0..64 {
             let serial = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
-            let temp = staging.join(format!("{pid}-{serial}"));
+            let temp = staging.join(format!("{pid}-{}-{}-{serial}", now.secs, now.nanos));
+            let mut cleanup = StagingFile {
+                host: self.host,
+                path: &temp,
+                armed: true,
+            };
             match self.host.write(&temp, bytes, WriteMode::CreateNew) {
                 Ok(()) => {}
-                Err(error) if error.kind == ErrorKind::AlreadyExists => continue,
+                Err(error) if error.kind == ErrorKind::AlreadyExists => {
+                    cleanup.armed = false;
+                    continue;
+                }
                 Err(error) => return Err(error),
             }
             let renamed = if replace {
                 self.host.rename(&temp, path)
             } else {
-                self.host.rename_noreplace(&temp, path)
+                self.rename_staged(&temp, path, || self.host.rename_noreplace(&temp, path))
             };
             return match renamed {
-                Ok(()) => Ok(true),
-                Err(error) => {
-                    let _ = self.host.remove_file(&temp);
-                    if !replace && error.kind == ErrorKind::AlreadyExists {
-                        Ok(false)
-                    } else {
-                        Err(error)
-                    }
+                Ok(()) => {
+                    cleanup.armed = false;
+                    Ok(true)
                 }
+                Err(error) if !replace && error.kind == ErrorKind::AlreadyExists => Ok(false),
+                Err(error) => Err(error),
             };
         }
         Err(io_at(
@@ -435,6 +458,39 @@ impl<'a> Store<'a> {
             ),
             &staging,
         ))
+    }
+    fn rename_staged(
+        &self,
+        temp: &Path,
+        path: &Path,
+        no_replace: impl FnOnce() -> HostResult<()>,
+    ) -> HostResult<()> {
+        if !self.rename_fallback.load(Ordering::Relaxed) {
+            match no_replace() {
+                Err(error) if error.kind == ErrorKind::Unsupported => {
+                    self.rename_fallback.store(true, Ordering::Relaxed);
+                }
+                result => return result,
+            }
+        }
+        if self.file_metadata(path)?.is_some() {
+            return Err(io_at(ErrorKind::AlreadyExists.into(), path));
+        }
+        self.host.rename(temp, path)
+    }
+}
+
+struct StagingFile<'a> {
+    host: &'a dyn Host,
+    path: &'a Path,
+    armed: bool,
+}
+
+impl Drop for StagingFile<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = self.host.remove_file(self.path);
+        }
     }
 }
 

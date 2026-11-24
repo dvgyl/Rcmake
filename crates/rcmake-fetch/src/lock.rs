@@ -14,44 +14,14 @@ use serde::{
 };
 
 use crate::{
-    ArchiveCache, ArchiveResult, ContentHash, FetchError, GitMirror, atomic_write, git::is_commit,
-    invalid,
+    ArchiveCache, ArchiveResult, ContentHash, FetchError, GitMirror, LockMode, atomic_write,
+    git::is_commit, invalid,
 };
 
 const FILE_NAME: &str = "rcmake-fetch.lock";
 const MAX_BYTES: usize = 4 * 1024 * 1024;
 const MAX_ENTRIES: usize = 10_000;
 const MAX_URLS: usize = 32;
-
-/// Controls when a project reads, writes, or enforces lock entries.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum LockMode {
-    /// Do not read or write the lockfile.
-    Off,
-    /// Read an optional lockfile and report changes in unpinned archive content.
-    #[default]
-    Auto,
-    /// Record the content used by the current configure and write it on commit.
-    Update,
-    /// Require matching entries and enforce the locked content.
-    Frozen,
-}
-
-impl LockMode {
-    /// Read the lock mode from `RCMAKE_FETCH_LOCK_MODE`. The default is auto.
-    pub fn from_host(host: &dyn Host) -> Result<Self, FetchError> {
-        let value = host
-            .env_get(b"RCMAKE_FETCH_LOCK_MODE")
-            .unwrap_or_else(|| "auto".into());
-        match value.as_slice() {
-            b"off" => Ok(Self::Off),
-            b"auto" => Ok(Self::Auto),
-            b"update" => Ok(Self::Update),
-            b"frozen" => Ok(Self::Frozen),
-            _ => Err(invalid("Invalid RCMAKE_FETCH_LOCK_MODE.")),
-        }
-    }
-}
 
 fn sha256_name() -> String {
     "SHA256".into()
@@ -331,48 +301,39 @@ impl<'a> LockSession<'a> {
             }
             _ => None,
         };
-        let (result, warning) = match (self.mode, lock, expected) {
+        let mut warning = None;
+        let mut result = match (self.mode, lock, expected) {
             (LockMode::Frozen, None, _) => {
                 return Err(invalid(format!(
                     "No matching archive lock entry for {name}."
                 )));
             }
-            (LockMode::Frozen, Some(entry), _) | (LockMode::Auto, Some(entry), None) => {
+            (LockMode::Frozen, Some(entry), _) => {
                 let pin = ContentHash::sha256(entry.sha256);
-                let result = match cache.lookup(url, &pin)? {
-                    Some(bytes) => ArchiveResult {
-                        bytes,
-                        cache_hit: true,
-                    },
-                    None => cache.fetch_with(url, None, download)?,
-                };
+                let result = cache.fetch_with(url, Some(&pin), download)?;
                 if let Some(expected) = expected {
                     expected.verify(&result.bytes)?;
                 }
-                let verification = pin.verify(&result.bytes).and_then(|()| {
-                    if result.bytes.len() as u64 == entry.size {
-                        Ok(())
-                    } else {
-                        Err(invalid("Archive size differs from the fetch lock entry."))
-                    }
-                });
-                match verification {
-                    Ok(()) => {
-                        if !result.cache_hit {
-                            cache.insert(url, &pin, &result.bytes)?;
-                        }
-                        (result, None)
-                    }
-                    Err(error) if self.mode == LockMode::Auto => (result, Some(error)),
-                    Err(error) => return Err(error),
-                }
+                verify_size(entry, &result.bytes)?;
+                result
             }
-            _ => (cache.fetch_with(url, expected, download)?, None),
+            (LockMode::Auto, Some(entry), None) => {
+                let result = cache.fetch_with(url, None, download)?;
+                let pin = ContentHash::sha256(entry.sha256);
+                warning = pin
+                    .verify(&result.bytes)
+                    .and_then(|()| verify_size(entry, &result.bytes))
+                    .err();
+                result
+            }
+            _ => cache.fetch_with(url, expected, download)?,
         };
         if self.mode == LockMode::Update {
             let entry = UrlEntry::from_bytes(vec![url.into()], &result.bytes);
             if expected.is_none() {
-                cache.insert(url, &ContentHash::sha256(entry.sha256), &result.bytes)?;
+                result.cache_warning = cache
+                    .insert(url, &ContentHash::sha256(entry.sha256), &result.bytes)
+                    .err();
             }
             self.updates.insert(name, LockEntry::Url(entry))?;
         }
@@ -400,6 +361,13 @@ impl<'a> LockSession<'a> {
         }
         atomic_write(self.host, &self.path, &current.to_json()?)
     }
+}
+
+fn verify_size(entry: &UrlEntry, bytes: &[u8]) -> Result<(), FetchError> {
+    if bytes.len() as u64 != entry.size {
+        return Err(invalid("Archive size differs from the fetch lock entry."));
+    }
+    Ok(())
 }
 
 fn read(host: &dyn Host, path: &Path) -> Result<Option<LockFile>, FetchError> {

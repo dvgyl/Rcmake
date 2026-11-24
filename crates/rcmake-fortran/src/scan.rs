@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use rcmake_base::{BString, Limits};
@@ -29,22 +29,25 @@ pub struct ScanInput<'a> {
     pub text: &'a [u8],
     /// Source form for this file and its includes.
     pub form: SourceForm,
+    /// Initial preprocessor definitions, with optional values after an equals sign.
+    pub defines: &'a [BString],
     /// Treat unqualified uses of standard intrinsic modules as intrinsic.
     ///
-    /// Set this to false to match CMake's qualifier-only scan.
+    /// The default matches CMake's qualifier-only scan.
     pub implicit_intrinsics: bool,
     /// Track explicitly intrinsic uses as dependencies when building intrinsic modules.
     pub building_intrinsic_modules: bool,
 }
 
 impl<'a> ScanInput<'a> {
-    /// Construct scan settings with the conventional intrinsic module filter enabled.
+    /// Construct scan settings with qualifier-only intrinsic detection.
     pub const fn new(path: &'a [u8], text: &'a [u8], form: SourceForm) -> Self {
         Self {
             path,
             text,
             form,
-            implicit_intrinsics: true,
+            defines: &[],
+            implicit_intrinsics: false,
             building_intrinsic_modules: false,
         }
     }
@@ -55,6 +58,8 @@ impl<'a> ScanInput<'a> {
 pub struct FortranSourceInfo {
     /// Lowercase module names and ancestor@child submodule names defined here.
     pub provides: BTreeSet<BString>,
+    /// Providers found only in branches whose conditions could not be resolved.
+    pub conditional_provides: BTreeSet<BString>,
     /// Lowercase module and submodule names needed to compile this source.
     pub requires: BTreeSet<BString>,
     /// Lowercase module names used as intrinsics.
@@ -105,165 +110,318 @@ struct Include {
 #[derive(Default)]
 struct FileScan {
     info: FortranSourceInfo,
-    includes: BTreeSet<Include>,
+    includes: Vec<(Include, bool)>,
+    definite_provides: BTreeSet<BString>,
 }
 
-/// Scan one source and, optionally, its includes. Visit all preprocessor branches.
+impl FileScan {
+    fn provide(&mut self, name: BString, conditional: bool) {
+        self.info.provides.insert(name.clone());
+        if conditional {
+            self.info.conditional_provides.insert(name);
+        } else {
+            self.definite_provides.insert(name);
+        }
+    }
+}
+
+/// Scan one source and, optionally, its includes. Scan all possible branches
+/// when a preprocessor expression cannot be evaluated.
 ///
 /// A resolver can supply include files from memory. Unresolved include names
 /// remain in the result. A resolved file is scanned once, including in a cycle.
 pub fn scan(
     input: &ScanInput<'_>,
-    mut resolver: Option<&mut dyn IncludeResolver>,
+    resolver: Option<&mut dyn IncludeResolver>,
     limits: &Limits,
 ) -> Result<FortranSourceInfo, ScanError> {
-    let mut budget = limits.max_file_read;
-    let root = scan_file(input.text, input, &mut budget, limits)?;
-    let mut result = root.info;
-    let mut seen = BTreeSet::from([BString::from(input.path)]);
-    let mut stack = vec![(BString::from(input.path), root.includes.into_iter())];
-    while let Some((path, includes)) = stack.last_mut() {
-        let Some(include) = includes.next() else {
-            stack.pop();
-            continue;
-        };
-        result.includes.insert(include.name.clone());
-        let Some((resolved, text)) = resolver
-            .as_deref_mut()
-            .and_then(|resolver| resolver.read(path, &include.name, include.quoted))
-        else {
-            continue;
-        };
-        if resolved.as_slice() != input.path {
-            result.resolved_includes.insert(resolved.clone());
-        }
-        if seen.insert(resolved.clone()) {
-            if stack.len() >= MAX_DEPTH.min(limits.max_recursion as usize) {
-                return Err(ScanError::IncludeDepth);
-            }
-            let mut child = scan_file(&text, input, &mut budget, limits)?;
-            result.provides.append(&mut child.info.provides);
-            result.requires.append(&mut child.info.requires);
-            result.intrinsic.append(&mut child.info.intrinsic);
-            stack.push((resolved, child.includes.into_iter()));
-        }
-    }
-    Ok(result)
+    let mut scanner = Scanner {
+        input,
+        resolver,
+        limits,
+        budget: limits.max_file_read,
+        seen: BTreeSet::from([BString::from(input.path)]),
+        defines: input
+            .defines
+            .iter()
+            .filter_map(|definition| {
+                let name =
+                    split_once(definition, b'=').map_or(definition.as_slice(), |(name, _)| name);
+                macro_name(name).then_some((BString::from(name), Some(true)))
+            })
+            .collect(),
+        output: FileScan::default(),
+    };
+    scanner.scan_file(input.path, input.text, 1, false)?;
+    let FileScan {
+        mut info,
+        definite_provides,
+        ..
+    } = scanner.output;
+    info.conditional_provides
+        .retain(|name| !definite_provides.contains(name));
+    Ok(info)
+}
+
+struct Scanner<'a, 'input, 'resolver> {
+    input: &'a ScanInput<'input>,
+    resolver: Option<&'resolver mut dyn IncludeResolver>,
+    limits: &'a Limits,
+    budget: u64,
+    seen: BTreeSet<BString>,
+    defines: BTreeMap<BString, Option<bool>>,
+    output: FileScan,
 }
 
 #[derive(Clone, Default, Eq, Ord, PartialEq, PartialOrd)]
 struct LogicalLine {
     text: Vec<u8>,
     quote: Option<u8>,
+    conditional: bool,
 }
 
 #[derive(Default)]
 struct Conditional {
     start: Vec<LogicalLine>,
     finished: Vec<LogicalLine>,
-    has_else: bool,
+    remaining: bool,
+    uncertain: bool,
 }
 
-fn scan_file(
-    text: &[u8],
-    input: &ScanInput<'_>,
-    budget: &mut u64,
-    limits: &Limits,
-) -> Result<FileScan, ScanError> {
-    *budget = budget
-        .checked_sub(text.len() as u64)
-        .ok_or(ScanError::SourceBytes)?;
-    let mut output = FileScan::default();
-    let mut states = vec![LogicalLine::default()];
-    let mut conditions: Vec<Conditional> = Vec::new();
-    let mut saved_bytes = 0usize;
-    let mut lines = text
-        .strip_prefix(b"\xef\xbb\xbf")
-        .unwrap_or(text)
-        .split(|&byte| byte == b'\n');
-    while let Some(line) = lines.next() {
-        let line = line.strip_suffix(b"\r").unwrap_or(line);
-        if let Some(directive) = line.trim_ascii_start().strip_prefix(b"#") {
-            let directive = splice_directive(directive, &mut lines);
-            let (word, rest) = word(&directive);
-            match word {
-                b"include" => {
-                    if let Some(include) = include_name(rest, true) {
-                        output.includes.insert(include);
+impl Conditional {
+    fn take(&mut self, condition: Option<bool>) -> Vec<LogicalLine> {
+        if !self.remaining || condition == Some(false) {
+            return Vec::new();
+        }
+        self.uncertain |= condition.is_none();
+        self.remaining = condition.is_none();
+        self.start.clone()
+    }
+}
+
+impl Scanner<'_, '_, '_> {
+    fn include(
+        &mut self,
+        from: &[u8],
+        include: Include,
+        depth: usize,
+        conditional: bool,
+    ) -> Result<(), ScanError> {
+        let resolved = self
+            .resolver
+            .as_deref_mut()
+            .and_then(|resolver| resolver.read(from, &include.name, include.quoted));
+        self.output.info.includes.insert(include.name);
+        let Some((path, text)) = resolved else {
+            return Ok(());
+        };
+        if path.as_slice() != self.input.path {
+            self.output.info.resolved_includes.insert(path.clone());
+        }
+        if self.seen.insert(path.clone()) {
+            if depth >= MAX_DEPTH.min(self.limits.max_recursion as usize) {
+                return Err(ScanError::IncludeDepth);
+            }
+            self.scan_file(&path, &text, depth + 1, conditional)?;
+        }
+        Ok(())
+    }
+
+    fn scan_file(
+        &mut self,
+        path: &[u8],
+        text: &[u8],
+        depth: usize,
+        inherited_conditional: bool,
+    ) -> Result<(), ScanError> {
+        self.budget = self
+            .budget
+            .checked_sub(text.len() as u64)
+            .ok_or(ScanError::SourceBytes)?;
+        let text = text.strip_prefix(b"\xef\xbb\xbf").unwrap_or(text);
+        let evaluate = balanced_conditions(text);
+        let limits = self.limits;
+        let mut states = vec![LogicalLine::default()];
+        let mut conditions: Vec<Conditional> = Vec::new();
+        let mut saved_bytes = 0usize;
+        let mut lines = text.split(|&byte| byte == b'\n');
+        while let Some(line) = lines.next() {
+            let line = line.strip_suffix(b"\r").unwrap_or(line);
+            let conditional =
+                inherited_conditional || conditions.iter().any(|branch| branch.uncertain);
+            if let Some(directive) = line.trim_ascii_start().strip_prefix(b"#") {
+                let directive = splice_directive(directive, &mut lines);
+                let (word, rest) = word(&directive);
+                match word {
+                    b"define" | b"undef" if !states.is_empty() => {
+                        let (name, _) = self::word(rest);
+                        if macro_name(name) {
+                            let value = word == b"define";
+                            if !conditional || defined(&self.defines, name) != Some(value) {
+                                self.defines
+                                    .insert(name.into(), (!conditional).then_some(value));
+                            }
+                        }
                     }
-                }
-                b"if" | b"ifdef" | b"ifndef" => {
-                    if conditions.len() >= MAX_DEPTH.min(limits.max_recursion as usize)
-                        || saved_bytes.saturating_add(state_bytes(&states).saturating_mul(2))
-                            > limits.max_value_bytes
-                    {
-                        return Err(ScanError::ConditionalLimit);
+                    b"include" if !states.is_empty() => {
+                        if let Some(include) = include_name(rest, true) {
+                            self.include(path, include, depth, conditional)?;
+                        }
                     }
-                    conditions.push(Conditional {
-                        start: states.clone(),
-                        ..Conditional::default()
-                    });
-                }
-                b"elif" | b"else" => {
-                    if let Some(branch) = conditions.last_mut() {
-                        if saved_bytes
-                            .saturating_add(state_bytes(&states))
-                            .saturating_add(state_bytes(&branch.start))
-                            > limits.max_value_bytes
+                    b"if" | b"ifdef" | b"ifndef" => {
+                        if conditions.len() >= MAX_DEPTH.min(limits.max_recursion as usize)
+                            || saved_bytes.saturating_add(state_bytes(&states).saturating_mul(2))
+                                > limits.max_value_bytes
                         {
                             return Err(ScanError::ConditionalLimit);
                         }
-                        branch.finished.append(&mut states);
-                        normalize_states(&mut branch.finished)?;
-                        states.clone_from(&branch.start);
-                        branch.has_else |= word == b"else";
+                        let mut branch = Conditional {
+                            start: std::mem::take(&mut states),
+                            remaining: true,
+                            ..Conditional::default()
+                        };
+                        let condition = if evaluate {
+                            match word {
+                                b"ifdef" | b"ifndef" => {
+                                    let (name, _) = self::word(rest);
+                                    defined(&self.defines, name)
+                                        .map(|set| set == (word == b"ifdef"))
+                                }
+                                _ => expression(rest, &self.defines),
+                            }
+                        } else {
+                            None
+                        };
+                        states = branch.take(condition);
+                        conditions.push(branch);
                     }
-                }
-                b"endif" => {
-                    if let Some(mut branch) = conditions.pop() {
-                        states.append(&mut branch.finished);
-                        if !branch.has_else {
-                            states.append(&mut branch.start);
+                    b"elif" | b"else" => {
+                        if let Some(branch) = conditions.last_mut() {
+                            if saved_bytes
+                                .saturating_add(state_bytes(&states))
+                                .saturating_add(state_bytes(&branch.start))
+                                > limits.max_value_bytes
+                            {
+                                return Err(ScanError::ConditionalLimit);
+                            }
+                            branch.finished.append(&mut states);
+                            normalize_states(&mut branch.finished)?;
+                            let condition = if word == b"else" {
+                                Some(true)
+                            } else if evaluate {
+                                expression(rest, &self.defines)
+                            } else {
+                                None
+                            };
+                            states = branch.take(condition);
                         }
-                        normalize_states(&mut states)?;
                     }
+                    b"endif" => {
+                        if let Some(mut branch) = conditions.pop() {
+                            states.append(&mut branch.finished);
+                            if branch.remaining {
+                                states.append(&mut branch.start);
+                            }
+                            normalize_states(&mut states)?;
+                        }
+                    }
+                    _ => {}
                 }
-                _ => {}
+                saved_bytes = conditions
+                    .iter()
+                    .map(|branch| state_bytes(&branch.start) + state_bytes(&branch.finished))
+                    .sum();
+                if saved_bytes.saturating_add(state_bytes(&states)) > limits.max_value_bytes {
+                    return Err(ScanError::ConditionalLimit);
+                }
+                continue;
             }
-            saved_bytes = conditions
-                .iter()
-                .map(|branch| state_bytes(&branch.start) + state_bytes(&branch.finished))
-                .sum();
-            if saved_bytes.saturating_add(state_bytes(&states)) > limits.max_value_bytes {
+            if saved_bytes
+                .saturating_add(state_bytes(&states))
+                .saturating_add(states.len().saturating_mul(line.len() + 1))
+                > limits.max_value_bytes
+            {
                 return Err(ScanError::ConditionalLimit);
             }
-            continue;
+            for state in &mut states {
+                state.push(line, self.input, conditional, &mut self.output);
+            }
+            for (include, conditional) in std::mem::take(&mut self.output.includes) {
+                self.include(path, include, depth, conditional)?;
+            }
+            if states.len() > 1 {
+                normalize_states(&mut states)?;
+            }
         }
-        if saved_bytes
-            .saturating_add(state_bytes(&states))
-            .saturating_add(states.len().saturating_mul(line.len() + 1))
-            > limits.max_value_bytes
-        {
-            return Err(ScanError::ConditionalLimit);
-        }
-        for state in &mut states {
-            state.push(line, input, &mut output);
-        }
-        if states.len() > 1 {
+        // Well-formed branches reunite at endif. Preserve pending statements in
+        // malformed input too, so a missing endif cannot hide a dependency.
+        for branch in conditions {
+            states.extend(branch.finished);
+            states.extend(branch.start);
             normalize_states(&mut states)?;
         }
+        for mut state in states {
+            state.flush(self.input, &mut self.output);
+        }
+        for (include, conditional) in std::mem::take(&mut self.output.includes) {
+            self.include(path, include, depth, conditional)?;
+        }
+        Ok(())
     }
-    // Well-formed branches reunite at endif. Preserve pending statements in
-    // malformed input too, so a missing endif cannot hide a dependency.
-    for branch in conditions {
-        states.extend(branch.finished);
-        states.extend(branch.start);
-        normalize_states(&mut states)?;
+}
+
+fn balanced_conditions(text: &[u8]) -> bool {
+    let mut lines = text.split(|&byte| byte == b'\n');
+    let mut depth = 0usize;
+    while let Some(line) = lines.next() {
+        let Some(directive) = line.trim_ascii_start().strip_prefix(b"#") else {
+            continue;
+        };
+        let (keyword, _) = word(directive);
+        match keyword {
+            b"if" | b"ifdef" | b"ifndef" => depth += 1,
+            b"elif" | b"else" | b"endif" if depth == 0 => return false,
+            b"endif" => depth -= 1,
+            _ => {}
+        }
+        let mut line = directive;
+        while line.strip_suffix(b"\r").unwrap_or(line).ends_with(b"\\") {
+            let Some(next) = lines.next() else { break };
+            line = next;
+        }
     }
-    for mut state in states {
-        state.flush(input, &mut output);
+    depth == 0
+}
+
+fn macro_name(name: &[u8]) -> bool {
+    identifier(name) || name.starts_with(b"_") && word(name).0 == name
+}
+
+fn defined(defines: &BTreeMap<BString, Option<bool>>, name: &[u8]) -> Option<bool> {
+    if !macro_name(name) {
+        return None;
     }
-    Ok(output)
+    defines.get(name).copied().unwrap_or(Some(false))
+}
+
+fn expression(text: &[u8], defines: &BTreeMap<BString, Option<bool>>) -> Option<bool> {
+    let text = text.trim_ascii();
+    let (negated, text) = text
+        .strip_prefix(b"!")
+        .map_or((false, text), |rest| (true, rest.trim_ascii_start()));
+    if let Ok(number) = std::str::from_utf8(text).ok()?.parse::<i64>() {
+        return Some((number != 0) != negated);
+    }
+    let (operator, argument) = word(text);
+    if operator != b"defined" {
+        return None;
+    }
+    let name = if let Some(argument) = argument.strip_prefix(b"(") {
+        argument.strip_suffix(b")")?.trim_ascii()
+    } else {
+        argument
+    };
+    defined(defines, name).map(|set| set != negated)
 }
 
 fn state_bytes(states: &[LogicalLine]) -> usize {
@@ -290,7 +448,13 @@ fn splice_directive<'a>(line: &[u8], lines: &mut impl Iterator<Item = &'a [u8]>)
 }
 
 impl LogicalLine {
-    fn push(&mut self, line: &[u8], input: &ScanInput<'_>, output: &mut FileScan) {
+    fn push(
+        &mut self,
+        line: &[u8],
+        input: &ScanInput<'_>,
+        conditional: bool,
+        output: &mut FileScan,
+    ) {
         let trimmed = line.trim_ascii_start();
         if trimmed.is_empty() {
             return;
@@ -310,6 +474,7 @@ impl LogicalLine {
                         }
                         line
                     };
+                self.conditional |= conditional;
                 let (fragment, quote) = strip_comment(fragment, self.quote);
                 let fragment = fragment.trim_ascii_end();
                 if let Some(rest) = fragment.strip_suffix(b"&") {
@@ -330,13 +495,28 @@ impl LogicalLine {
                 {
                     return;
                 }
-                let continued = line
-                    .get(5)
-                    .is_some_and(|byte| !matches!(byte, b' ' | b'0' | b'\t'));
-                let fragment = line.get(6..line.len().min(72)).unwrap_or_default();
+                let tab_statement = line
+                    .iter()
+                    .take(6)
+                    .position(|&byte| byte == b'\t')
+                    .and_then(|tab| line.get(tab + 1..));
+                let (continued, fragment) = if let Some(after) = tab_statement {
+                    let continued = after
+                        .first()
+                        .is_some_and(|byte| matches!(byte, b'1'..=b'9'));
+                    let fragment = after.get(usize::from(continued)..).unwrap_or_default();
+                    (continued, fragment.get(..66).unwrap_or(fragment))
+                } else {
+                    let continued = line.get(5).is_some_and(|byte| !matches!(byte, b' ' | b'0'));
+                    (
+                        continued,
+                        line.get(6..line.len().min(72)).unwrap_or_default(),
+                    )
+                };
                 if !continued {
                     self.flush(input, output);
                 }
+                self.conditional |= conditional;
                 let (fragment, quote) = strip_comment(fragment, self.quote);
                 self.quote = quote;
                 self.text.extend_from_slice(fragment);
@@ -350,16 +530,17 @@ impl LogicalLine {
         for (index, &byte) in self.text.iter().enumerate() {
             if byte == b';' && quote.is_none() {
                 if let Some(statement) = self.text.get(start..index) {
-                    scan_statement(statement, input, output);
+                    scan_statement(statement, input, self.conditional, output);
                 }
                 start = index + 1;
             }
             update_quote(&mut quote, byte);
         }
         if let Some(statement) = self.text.get(start..) {
-            scan_statement(statement, input, output);
+            scan_statement(statement, input, self.conditional, output);
         }
         self.quote = None;
+        self.conditional = false;
         if self.text.capacity() > 4096 {
             self.text = Vec::new();
         } else {
@@ -386,7 +567,12 @@ fn update_quote(quote: &mut Option<u8>, byte: u8) {
     }
 }
 
-fn scan_statement(mut text: &[u8], input: &ScanInput<'_>, output: &mut FileScan) {
+fn scan_statement(
+    mut text: &[u8],
+    input: &ScanInput<'_>,
+    conditional: bool,
+    output: &mut FileScan,
+) {
     text = text.trim_ascii_start();
     let label = text.iter().take_while(|byte| byte.is_ascii_digit()).count();
     if let Some(rest) = text.get(label..) {
@@ -401,14 +587,14 @@ fn scan_statement(mut text: &[u8], input: &ScanInput<'_>, output: &mut FileScan)
                 && tail.trim_ascii().is_empty()
                 && !matches!(name.as_slice(), b"procedure" | b"subroutine" | b"function")
             {
-                output.info.provides.insert(name.into());
+                output.provide(name.into(), conditional);
             }
         }
-        b"submodule" => submodule(rest, &mut output.info),
+        b"submodule" => submodule(rest, conditional, output),
         b"use" => use_module(rest, input, &mut output.info),
         b"include" => {
             if let Some(include) = include_name(rest, false) {
-                output.includes.insert(include);
+                output.includes.push((include, conditional));
             }
         }
         _ => {}
@@ -430,7 +616,7 @@ fn split_once(text: &[u8], separator: u8) -> Option<(&[u8], &[u8])> {
     Some((text.get(..index)?, text.get(index + 1..)?))
 }
 
-fn submodule(text: &[u8], output: &mut FortranSourceInfo) {
+fn submodule(text: &[u8], conditional: bool, output: &mut FileScan) {
     let Some((parents, rest)) = text
         .strip_prefix(b"(")
         .and_then(|rest| split_once(rest, b')'))
@@ -450,8 +636,9 @@ fn submodule(text: &[u8], output: &mut FortranSourceInfo) {
         return;
     }
     let qualified = |name: &[u8]| BString::from([root, b"@", name].concat().to_ascii_lowercase());
-    output.provides.insert(qualified(child));
+    output.provide(qualified(child), conditional);
     output
+        .info
         .requires
         .insert(parent.map_or_else(|| root.to_ascii_lowercase().into(), qualified));
 }

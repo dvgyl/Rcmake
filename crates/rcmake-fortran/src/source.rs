@@ -39,7 +39,7 @@ pub struct FortranCompiler<'a> {
     pub submodule_sep: &'a [u8],
     /// Submodule file extension, including the leading dot.
     pub submodule_ext: &'a [u8],
-    /// Letter case of the basename.
+    /// Case recorded in toolchain metadata. Collation uses lowercase names.
     pub module_case: ModuleCase,
 }
 
@@ -49,24 +49,32 @@ impl<'a> FortranCompiler<'a> {
     /// Callers with toolchain metadata can set the separator, extension, and
     /// case from that metadata.
     pub fn from_id(id: &'a [u8]) -> Self {
-        let (submodule_sep, submodule_ext): (&[u8], &[u8]) = match id {
-            b"Flang" | b"LLVMFlang" | b"Intel" | b"IntelLLVM" => (b"-", b".smod"),
-            b"NVHPC" | b"PGI" => (b"-", b".mod"),
-            b"Cray" => (b"", b".mod"),
-            b"XL" => (b"_", b".smod"),
-            b"Fujitsu" => (b".", b".smod"),
-            b"NAG" => (b".", b".sub"),
-            _ => (b"@", b".smod"),
-        };
-        let module_case = match id {
-            b"Cray" | b"PGI" | b"Absoft" => ModuleCase::Upper,
-            _ => ModuleCase::Lower,
-        };
+        const NAMING: &[(&[u8], &[u8], &[u8])] = &[
+            (b"GNU", b"@", b".smod"),
+            (b"LCC", b"@", b".smod"),
+            (b"CCur", b"@", b".smod"),
+            (b"Intel", b"@", b".smod"),
+            (b"IntelLLVM", b"@", b".smod"),
+            (b"Flang", b"-", b".mod"),
+            (b"LLVMFlang", b"-", b".mod"),
+            (b"IBMFlang", b"-", b".mod"),
+            (b"PGI", b"-", b".mod"),
+            (b"NVHPC", b"-", b".mod"),
+            (b"Cray", b"", b".mod"),
+            (b"XL", b"_", b".smod"),
+            (b"VisualAge", b"_", b".smod"),
+            (b"Fujitsu", b".", b".smod"),
+            (b"NAG", b".", b".sub"),
+        ];
+        let (submodule_sep, submodule_ext) = NAMING
+            .iter()
+            .find_map(|&(name, sep, ext)| (name == id).then_some((sep, ext)))
+            .unwrap_or((b"", b".mod"));
         Self {
             id,
             submodule_sep,
             submodule_ext,
-            module_case,
+            module_case: ModuleCase::Lower,
         }
     }
 
@@ -83,16 +91,21 @@ impl<'a> FortranCompiler<'a> {
             if !identifier(child) {
                 return None;
             }
-            basename.extend_from_slice(self.submodule_sep);
-            basename.extend_from_slice(child);
-            self.submodule_ext
+            if self.submodule_sep.is_empty() {
+                basename = child.into();
+            } else {
+                basename.extend_from_slice(self.submodule_sep);
+                basename.extend_from_slice(child);
+            }
+            if self.submodule_ext.is_empty() {
+                b".mod"
+            } else {
+                self.submodule_ext
+            }
         } else {
             b".mod"
         };
-        match self.module_case {
-            ModuleCase::Lower => basename.make_ascii_lowercase(),
-            ModuleCase::Upper => basename.make_ascii_uppercase(),
-        }
+        basename.make_ascii_lowercase();
         basename.extend_from_slice(extension);
         Some(basename)
     }

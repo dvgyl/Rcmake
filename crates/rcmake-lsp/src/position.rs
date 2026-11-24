@@ -90,17 +90,13 @@ impl Lines {
         let start = self.start(position.line)?;
         let line = self.text(text, position.line)?;
         if encoding == PositionEncoding::Utf8 || line.is_ascii() {
-            let offset = position.character.min(line.len());
-            return line.is_char_boundary(offset).then_some(start + offset);
+            return Some(start + line.floor_char_boundary(position.character.min(line.len())));
         }
         let mut units = 0;
         for (offset, character) in line.char_indices() {
-            if units == position.character {
-                return Some(start + offset);
-            }
             units += character.len_utf16();
             if units > position.character {
-                return None;
+                return Some(start + offset);
             }
         }
         Some(start + line.len())

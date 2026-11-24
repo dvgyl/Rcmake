@@ -8,13 +8,19 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+default = []
+native = ["dep:rcmake-store"]
+
 [dependencies]
 rcmake-base.workspace = true
 rcmake-host.workspace = true
-rcmake-store.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+
+[target.'cfg(any(unix, windows))'.dependencies]
+rcmake-store = { workspace = true, optional = true }
 
 [lints]
 workspace = true

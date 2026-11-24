@@ -8,6 +8,14 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+default = []
+stdio = []
+
+[[bin]]
+name = "rcmake-lsp"
+required-features = ["stdio"]
+
 [dependencies]
 rcmake-base.workspace = true
 rcmake-diag.workspace = true

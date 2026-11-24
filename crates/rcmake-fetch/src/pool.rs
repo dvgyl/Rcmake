@@ -2,6 +2,7 @@ use std::{
     collections::{HashMap, VecDeque},
     sync::{Arc, Condvar, Mutex, Weak},
     thread::{self, JoinHandle},
+    time::Duration,
 };
 
 use rcmake_host::Host;
@@ -31,14 +32,16 @@ pub enum PrefetchSource {
     },
 }
 
+type PrefetchResult = Result<Option<FetchError>, FetchError>;
+
 #[derive(Default)]
 struct Flight {
-    result: Mutex<Option<Result<(), FetchError>>>,
+    result: Mutex<Option<PrefetchResult>>,
     ready: Condvar,
 }
 
 impl Flight {
-    fn finish(&self, result: Result<(), FetchError>) {
+    fn finish(&self, result: PrefetchResult) {
         *self
             .result
             .lock()
@@ -52,8 +55,13 @@ impl Flight {
 pub struct Ticket(Arc<Flight>);
 
 impl Ticket {
-    /// Wait for the source to be available in the cache.
+    /// Wait for the fetch to finish.
     pub fn wait(&self) -> Result<(), FetchError> {
+        self.wait_with_warning().map(|_| ())
+    }
+
+    /// Wait for the fetch to finish and return any cache warning.
+    pub fn wait_with_warning(&self) -> Result<Option<FetchError>, FetchError> {
         let result = self
             .0
             .result
@@ -93,6 +101,15 @@ pub struct FetchPool {
 impl FetchPool {
     /// Start workers using `RCMAKE_FETCH_JOBS` (default 4, bounded to 1 through 32).
     pub fn new(host: Arc<dyn Host>, config: StoreConfig) -> Result<Self, FetchError> {
+        Self::new_with_timeout(host, config, None)
+    }
+
+    /// Start workers with an optional timeout for each fetch command and Git lock.
+    pub fn new_with_timeout(
+        host: Arc<dyn Host>,
+        config: StoreConfig,
+        timeout: Option<Duration>,
+    ) -> Result<Self, FetchError> {
         let count = host
             .env_get(b"RCMAKE_FETCH_JOBS")
             .and_then(|value| std::str::from_utf8(&value).ok()?.parse::<usize>().ok())
@@ -108,7 +125,7 @@ impl FetchPool {
                 (Arc::clone(&pool.shared), Arc::clone(&host), config.clone());
             let worker = thread::Builder::new()
                 .name(format!("rcmake-fetch-{index}"))
-                .spawn(move || work(&shared, host.as_ref(), &config))
+                .spawn(move || work(&shared, host.as_ref(), &config, timeout))
                 .map_err(|error| invalid(format!("Cannot start a fetch worker ({error}).")))?;
             pool.workers.push(worker);
         }
@@ -167,7 +184,7 @@ impl Drop for FetchPool {
     }
 }
 
-fn work(shared: &Shared, host: &dyn Host, config: &StoreConfig) {
+fn work(shared: &Shared, host: &dyn Host, config: &StoreConfig, timeout: Option<Duration>) {
     loop {
         let job = {
             let queue = shared
@@ -182,10 +199,10 @@ fn work(shared: &Shared, host: &dyn Host, config: &StoreConfig) {
         };
         let Some((source, flight)) = job else { return };
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            fetch(host, config, &source)
+            fetch(host, config, &source, timeout)
         }))
         .unwrap_or_else(|_| Err(invalid("Prefetch worker failed.")));
-        if result.is_err() {
+        if !matches!(result, Ok(None)) {
             let mut queue = shared
                 .queue
                 .lock()
@@ -196,15 +213,28 @@ fn work(shared: &Shared, host: &dyn Host, config: &StoreConfig) {
     }
 }
 
-fn fetch(host: &dyn Host, config: &StoreConfig, source: &PrefetchSource) -> Result<(), FetchError> {
+fn fetch(
+    host: &dyn Host,
+    config: &StoreConfig,
+    source: &PrefetchSource,
+    timeout: Option<Duration>,
+) -> PrefetchResult {
     match source {
         PrefetchSource::Url { url, hash } => {
             let store = Store::new(host, config.clone())?;
-            ArchiveCache::new(host, &store).fetch(url, Some(hash))?;
+            let mut cache = ArchiveCache::new(host, &store);
+            if let Some(timeout) = timeout {
+                cache = cache.with_timeout(timeout);
+            }
+            Ok(cache.fetch(url, Some(hash))?.cache_warning)
         }
         PrefetchSource::Git { repository, commit } => {
-            GitMirror::new(host, &config.root)?.prefetch(repository, commit)?;
+            let mut mirror = GitMirror::new(host, &config.root)?;
+            if let Some(timeout) = timeout {
+                mirror = mirror.with_timeout(timeout);
+            }
+            mirror.prefetch(repository, commit)?;
+            Ok(None)
         }
     }
-    Ok(())
 }

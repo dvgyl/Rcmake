@@ -185,7 +185,8 @@ impl Document {
                 lines.fill(true);
             }
         }
-        let mut output = String::with_capacity(self.text.len());
+        let mut edits = Vec::new();
+        let mut response_bytes = 0usize;
         let mut depth = 0usize;
         let mut commands = self.commands.iter().peekable();
         let mut continuation = None;
@@ -219,26 +220,25 @@ impl Document {
                 }
                 first = false;
             }
-            output.push_str(bom);
             if is_blank || protected.get(line).copied().unwrap_or(false) {
-                output.push_str(rest);
-            } else {
-                for _ in 0..line_depth.min(1000) {
-                    output.push_str(indent);
-                }
-                output.push_str(trimmed);
+                continue;
             }
-            if output.len() > crate::rpc::MAX_MESSAGE_BYTES / 2 {
+            let original_len = rest.len() - trimmed.len();
+            let new_indent = indent.repeat(line_depth.min(1000));
+            if rest.get(..original_len) == Some(new_indent.as_str()) {
+                continue;
+            }
+            response_bytes += 128 + new_indent.len() * 2;
+            if response_bytes > crate::rpc::MAX_MESSAGE_BYTES {
                 return Value::Array(Vec::new());
             }
+            let start = self.lines.start(line).unwrap_or_default() + bom.len();
+            edits.push(object([
+                ("range", self.span(start..start + original_len, encoding)),
+                ("newText", Value::string(new_indent)),
+            ]));
         }
-        if output == self.text {
-            return Value::Array(Vec::new());
-        }
-        Value::Array(vec![object([
-            ("range", self.span(0..self.text.len(), encoding)),
-            ("newText", Value::string(output)),
-        ])])
+        Value::Array(edits)
     }
 }
 

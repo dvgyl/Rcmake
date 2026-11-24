@@ -1,5 +1,6 @@
 //! Fetch tests with an in-memory host and simulated tools.
 
+#![cfg(all(feature = "native", any(unix, windows)))]
 #![allow(clippy::panic, clippy::unwrap_used)]
 
 use std::{
@@ -10,10 +11,10 @@ use std::{
     },
 };
 
-use rcmake_base::{BString, hash::HashAlgo};
+use rcmake_base::hash::HashAlgo;
 use rcmake_fetch::{
     ArchiveCache, ContentHash, FetchError, FetchPool, GitEntry, GitMirror, LockEntry, LockFile,
-    LockMode, LockSession, PrefetchSource, UrlEntry, classify_git_checkout, classify_git_clone,
+    LockMode, LockSession, PrefetchSource, UrlEntry,
 };
 use rcmake_host::{Host, ProcessResult, PureHost, RunOutput};
 use rcmake_store::{Store, StoreConfig};
@@ -32,10 +33,6 @@ fn config() -> StoreConfig {
 
 fn hash(algorithm: &str, algo: HashAlgo, bytes: &[u8]) -> ContentHash {
     ContentHash::parse(&format!("{algorithm}={}", algo.hex_digest(bytes))).unwrap()
-}
-
-fn args(values: &[&str]) -> Vec<BString> {
-    values.iter().map(|value| BString::from(*value)).collect()
 }
 
 #[test]
@@ -149,9 +146,10 @@ fn lock_modes_apply_and_concurrent_updates_merge() {
     let mut auto = LockSession::open(&host, source, LockMode::Auto).unwrap();
     assert_eq!(auto.git_pin("git", REPO, Some("v1")).unwrap(), None);
     let (archive, warning) = auto
-        .fetch_archive_with(&empty, "dep", URL, None, || Ok(b"changed".to_vec()))
+        .fetch_archive_with(&cache, "dep", URL, None, || Ok(b"changed".to_vec()))
         .unwrap();
     assert_eq!(archive.bytes, b"changed");
+    assert!(!archive.cache_hit);
     assert!(matches!(warning, Some(FetchError::HashMismatch { .. })));
     let expected = hash("SHA256", HashAlgo::Sha256, b"changed");
     assert!(
@@ -202,59 +200,6 @@ fn archive_cache_checks_non_sha256_aliases_and_offline_misses() {
         )),
         Err(FetchError::Offline)
     );
-}
-
-#[test]
-fn git_classifier_tracks_vendored_template_and_rejects_other_shapes() {
-    let template =
-        include_str!("../../../modules/cmake-4.5/Modules/ExternalProject/gitclone.cmake.in");
-    let render = |line: &str| {
-        line.replace("@git_clone_options@", "--no-checkout --depth 1 --no-single-branch --progress --origin origin2 -c http.sslVerify=true")
-            .replace("\"@git_repository@\"", REPO).replace("\"@src_name@\"", "source")
-            .replace("\"@git_tag@\"", "v1").replace("@git_checkout_explicit--@", "--")
-            .split_whitespace().map(BString::from).collect::<Vec<_>>()
-    };
-    let clone = render(
-        template
-            .lines()
-            .find(|line| line.contains("clone @git_clone_options@"))
-            .unwrap(),
-    );
-    let clone = classify_git_clone(&clone).unwrap();
-    assert_eq!(
-        (clone.repository, clone.directory, clone.origin),
-        (REPO, "source", "origin2")
-    );
-    let checkout = render(
-        template
-            .lines()
-            .find(|line| line.contains("checkout \"@git_tag@\""))
-            .unwrap(),
-    );
-    assert_eq!(classify_git_checkout(&checkout), Some("v1"));
-    assert_eq!(
-        classify_git_checkout(&args(&["checkout", "v1"])),
-        Some("v1")
-    );
-    assert!(
-        classify_git_clone(&args(&[
-            "-c",
-            "http.sslVersion=tlsv1.2",
-            "clone",
-            REPO,
-            "dir"
-        ]))
-        .is_some()
-    );
-    for invocation in [
-        ["clone", "--mirror", REPO, "dir"],
-        ["clone", "--shared", REPO, "dir"],
-        ["fetch", "origin", REPO, "dir"],
-    ] {
-        assert!(classify_git_clone(&args(&invocation)).is_none());
-    }
-    assert!(classify_git_checkout(&args(&["checkout", "--", "some-file"])).is_none());
-    assert!(classify_git_checkout(&args(&["checkout", "v1", "--", "some-file"])).is_none());
 }
 
 #[test]
@@ -340,4 +285,170 @@ fn pool_deduplicates_pins_and_populates_store() {
         })
         .is_err()
     );
+}
+
+#[test]
+fn store_write_errors_leave_verified_downloads_usable_in_each_lock_mode() {
+    let host = host();
+    let bad_root = Path::new("/work/cache-file");
+    host.seed_file(bad_root, b"not a directory").unwrap();
+    let store = Store::new(&host, StoreConfig::new(bad_root.into())).unwrap();
+    let cache = ArchiveCache::new(&host, &store);
+    let expected = hash("SHA256", HashAlgo::Sha256, b"valid");
+    let download = || Ok(b"valid".to_vec());
+    let result = cache.fetch_with(URL, Some(&expected), download).unwrap();
+    assert_eq!(result.bytes, b"valid");
+    assert!(matches!(result.cache_warning, Some(FetchError::Host(_))));
+    assert!(matches!(
+        cache.fetch_with(URL, Some(&expected), || Ok(b"invalid".to_vec())),
+        Err(FetchError::HashMismatch { .. })
+    ));
+
+    let mut update = LockSession::open(&host, Path::new("/work"), LockMode::Update).unwrap();
+    let (result, warning) = update
+        .fetch_archive_with(&cache, "dep", URL, None, download)
+        .unwrap();
+    assert!(warning.is_none());
+    assert!(matches!(result.cache_warning, Some(FetchError::Host(_))));
+    update.commit().unwrap();
+
+    let mut frozen = LockSession::open(&host, Path::new("/work"), LockMode::Frozen).unwrap();
+    let (result, warning) = frozen
+        .fetch_archive_with(&cache, "dep", URL, None, download)
+        .unwrap();
+    assert_eq!(result.bytes, b"valid");
+    assert!(warning.is_none());
+    assert!(matches!(result.cache_warning, Some(FetchError::Host(_))));
+}
+
+#[test]
+fn curl_and_git_default_to_no_timeout_and_accept_a_caller_timeout() {
+    use std::time::Duration;
+
+    let host = host();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let observed = Arc::clone(&calls);
+    let timeout = Duration::from_secs(600);
+    for (key, value) in [
+        ("GIT_SSH_COMMAND", "ssh -F /keys/config"),
+        ("GIT_SSL_CAINFO", "/certs/company.pem"),
+        ("GIT_SSL_CAPATH", "/certs"),
+        ("GIT_ASKPASS", "/bin/askpass"),
+        ("GIT_CONFIG_COUNT", "1"),
+        ("GIT_CONFIG_KEY_0", "http.proxy"),
+        ("GIT_CONFIG_VALUE_0", "http://proxy.test"),
+        ("GIT_DIR", "/other/git"),
+        ("GIT_WORK_TREE", "/other"),
+        ("GIT_INDEX_FILE", "/other/index"),
+    ] {
+        host.env_set(key.as_bytes(), Some(value.as_bytes()));
+    }
+    host.set_command_handler(move |host, req, _| {
+        let invocation = req.pipeline.first().unwrap();
+        let env = |key: &str| {
+            req.env
+                .iter()
+                .find(|(name, _)| name == key)
+                .map(|(_, value)| value.as_slice())
+        };
+        let call = observed.fetch_add(1, Ordering::SeqCst);
+        let expected_timeout = if call == 0 || (2..6).contains(&call) {
+            None
+        } else {
+            Some(timeout)
+        };
+        assert_eq!(req.timeout, expected_timeout);
+        let stdout = if invocation.program == "curl" {
+            b"download".to_vec()
+        } else if invocation.args.iter().any(|arg| arg == "--mirror") {
+            assert_eq!(
+                env("GIT_SSH_COMMAND"),
+                Some(b"ssh -F /keys/config".as_slice())
+            );
+            assert_eq!(
+                env("GIT_SSL_CAINFO"),
+                Some(b"/certs/company.pem".as_slice())
+            );
+            assert_eq!(env("GIT_SSL_CAPATH"), Some(b"/certs".as_slice()));
+            assert_eq!(env("GIT_ASKPASS"), Some(b"/bin/askpass".as_slice()));
+            assert_eq!(env("GIT_CONFIG_KEY_0"), Some(b"http.proxy".as_slice()));
+            assert_eq!(
+                env("GIT_CONFIG_VALUE_0"),
+                Some(b"http://proxy.test".as_slice())
+            );
+            assert_eq!(env("GIT_CONFIG_COUNT"), Some(b"1".as_slice()));
+            assert_eq!(
+                env("GIT_ALLOW_PROTOCOL"),
+                Some(b"file:git:http:https:ssh".as_slice())
+            );
+            let destination =
+                PathBuf::from(std::str::from_utf8(invocation.args.last().unwrap()).unwrap());
+            host.create_dir_all(&destination)?;
+            Vec::new()
+        } else {
+            assert!(env("GIT_SSH_COMMAND").is_none());
+            assert!(env("GIT_CONFIG_COUNT").is_none());
+            b"commit\n".to_vec()
+        };
+        for key in ["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE"] {
+            if invocation.program == "git" {
+                assert!(env(key).is_none());
+            }
+        }
+        Ok(RunOutput {
+            results: vec![ProcessResult::Exited(0)],
+            stdout,
+            ..RunOutput::default()
+        })
+    })
+    .unwrap();
+
+    let store = Store::new(&host, config()).unwrap();
+    ArchiveCache::new(&host, &store).fetch(URL, None).unwrap();
+    ArchiveCache::new(&host, &store)
+        .with_timeout(timeout)
+        .fetch(URL, None)
+        .unwrap();
+    GitMirror::new(&host, Path::new("/cache/default"))
+        .unwrap()
+        .prefetch(REPO, PIN)
+        .unwrap();
+    GitMirror::new(&host, Path::new("/cache/custom"))
+        .unwrap()
+        .with_timeout(timeout)
+        .prefetch(REPO, PIN)
+        .unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 10);
+}
+
+#[test]
+fn prefetch_propagates_the_timeout_and_reports_cache_warnings() {
+    use std::time::Duration;
+
+    let host = Arc::new(host());
+    let path = Path::new("/work/cache-file");
+    host.seed_file(path, b"not a directory").unwrap();
+    host.env_set(b"RCMAKE_FETCH_JOBS", Some(b"1"));
+    let timeout = Duration::from_secs(420);
+    host.set_command_handler(move |_, req, _| {
+        assert_eq!(req.timeout, Some(timeout));
+        Ok(RunOutput {
+            stdout: b"download".to_vec(),
+            results: vec![ProcessResult::Exited(0)],
+            ..RunOutput::default()
+        })
+    })
+    .unwrap();
+    let pool =
+        FetchPool::new_with_timeout(host, StoreConfig::new(path.into()), Some(timeout)).unwrap();
+    let ticket = pool
+        .submit(PrefetchSource::Url {
+            url: URL.into(),
+            hash: hash("SHA256", HashAlgo::Sha256, b"download"),
+        })
+        .unwrap();
+    assert!(matches!(
+        ticket.wait_with_warning().unwrap(),
+        Some(FetchError::Host(_))
+    ));
 }
