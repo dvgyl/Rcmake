@@ -1,11 +1,11 @@
 use std::error::Error;
+#[cfg(unix)]
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use rcmake_host::{
-    CommandSpec, Input, NativeHost, Output, ProcessResult, PureHost, ReadRange, RunOutput,
-    WriteMode,
-};
+#[cfg(unix)]
+use rcmake_host::{CommandSpec, Input, NativeHost, Output, ReadRange, WriteMode};
+use rcmake_host::{ProcessResult, PureHost, RunOutput};
 
 use super::*;
 
@@ -74,17 +74,20 @@ fn lists_tests_and_filtered_labels_and_summarizes_processor_time() -> TestResult
     Ok(())
 }
 
+#[cfg(unix)]
 struct Fixture<'a> {
     host: &'a dyn Host,
     dir: PathBuf,
 }
 
+#[cfg(unix)]
 impl Drop for Fixture<'_> {
     fn drop(&mut self) {
         let _ = self.host.remove_dir_all(&self.dir);
     }
 }
 
+#[cfg(unix)]
 fn oracle(
     host: &dyn Host,
     dir: &Path,
@@ -109,6 +112,7 @@ fn oracle(
     )
 }
 
+#[cfg(unix)]
 fn stable_junit(bytes: &[u8]) -> Vec<String> {
     String::from_utf8_lossy(bytes)
         .lines()
@@ -124,6 +128,7 @@ fn stable_junit(bytes: &[u8]) -> Vec<String> {
         .collect()
 }
 
+#[cfg(unix)]
 fn stable_cdash(bytes: &[u8]) -> Vec<String> {
     let text = String::from_utf8_lossy(bytes);
     let mut lines = text.lines().skip_while(|line| !line.contains("<Testing>"));
