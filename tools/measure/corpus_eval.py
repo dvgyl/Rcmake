@@ -30,13 +30,30 @@ import zipfile
 
 ROOT = Path(__file__).resolve().parents[2]
 MANIFEST = ROOT / "conformance/corpus/manifest.toml"
-CACHE = ROOT / "env/corpus/cache"
 STAGES = ("configure", "build", "install", "test")
+MULTI_CONFIG_GENERATORS = ("Ninja Multi-Config", "Xcode")
 PACKAGE_EXTENSIONS = {"TGZ": ".tar.gz", "ZIP": ".zip"}
 JOBS = "2"
 ORACLE_VERSION = "4.5.1"
 DOWNLOAD_TIMEOUT = 1800
 MAX_ARCHIVE_BYTES = 512 * 1024 * 1024
+
+
+def corpus_cache() -> Path:
+    """Return the cache path in the main Git checkout."""
+    try:
+        common = subprocess.run(
+            ["git", "rev-parse", "--path-format=absolute", "--git-common-dir"],
+            cwd=ROOT, capture_output=True, text=True, timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return ROOT / "env/corpus/cache"
+    if common.returncode == 0 and common.stdout.strip():
+        return Path(common.stdout.strip()).parent / "env/corpus/cache"
+    return ROOT / "env/corpus/cache"
+
+
+CACHE = corpus_cache()
 
 
 def cached_archive(pin: dict) -> Path:
@@ -279,6 +296,12 @@ def evaluate(
     """Run one engine in a new source, build and install tree."""
     work.mkdir()
     source = extract(cached_archive(project), work / "source")
+    source_dir = source
+    if subdir := project.get("source_subdir"):
+        relative = Path(subdir)
+        source_dir = (source / relative).resolve()
+        if relative.is_absolute() or not source_dir.is_relative_to(source) or not source_dir.is_dir():
+            raise ValueError(f"Invalid source_subdir {subdir!r} for {project['name']}.")
     build = work / "build"
     prefix = dependency_prefix if prerequisite and dependency_prefix is not None else work / "install"
     build.mkdir()
@@ -306,7 +329,7 @@ def evaluate(
             configure_args.append(f"-D{variable}={dependency}")
         roots[dependency] = f"<fetch-{content}>"
     if "cmakelists" in project:
-        with (source / "CMakeLists.txt").open("x", encoding="utf-8") as wrapper:
+        with (source_dir / "CMakeLists.txt").open("x", encoding="utf-8") as wrapper:
             wrapper.write(project["cmakelists"])
 
     env = os.environ.copy()
@@ -322,17 +345,17 @@ def evaluate(
     xcode = args.generator == "Xcode"
     compile_commands_args = [] if xcode else ["-DCMAKE_EXPORT_COMPILE_COMMANDS=ON"]
     commands = {
-        "configure": [str(cmake), "-S", str(source), "-B", str(build), "-G", args.generator,
+        "configure": [str(cmake), "-S", str(source_dir), "-B", str(build), "-G", args.generator,
          *compile_commands_args, f"-DCMAKE_INSTALL_PREFIX={prefix}",
          *configure_args],
         "build": [str(cmake), "--build", str(build), "--parallel", JOBS],
         "install": [str(cmake), "--install", str(build)],
         "test": [str(ctest), "--output-on-failure", "--no-tests=error", "--parallel", JOBS],
     }
-    if xcode:
-        commands["build"].extend(["--config", "Release"])
-        commands["install"].extend(["--config", "Release"])
-        commands["test"].extend(["-C", "Release"])
+    if args.config is not None:
+        commands["build"].extend(["--config", args.config])
+        commands["install"].extend(["--config", args.config])
+        commands["test"].extend(["-C", args.config])
     generators = [] if prerequisite else args.cpack_generators or project.get("cpack_generators", [])
     if generators and cpack is None:
         cpack = work / "cpack"
@@ -344,6 +367,8 @@ def evaluate(
             str(cpack), "--config", str(build / "CPackConfig.cmake"),
             "-G", generator, "-B", str(package_dir),
         ]
+        if args.config is not None:
+            commands[f"cpack_{generator}"].extend(["-C", args.config])
     stages = {}
     previous_failure = False
     for stage, command in commands.items():
@@ -501,20 +526,24 @@ def package_generators(values: list[str]) -> list[str]:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--tier", choices=("1", "2", "3", "all"), default="all")
+    parser.add_argument("--tier", choices=("1", "2", "3", "4", "all"), default="all")
     parser.add_argument("--project", help="Project name, for example zlib or nlohmann/json.")
-    parser.add_argument("--generator", choices=("Ninja", "Unix Makefiles", "Xcode"), default="Ninja")
+    parser.add_argument("--generator", choices=("Ninja", "Unix Makefiles", *MULTI_CONFIG_GENERATORS),
+                        default="Ninja")
+    parser.add_argument("--config", help="Build configuration. The multi-config default is Release.")
     parser.add_argument("--oracle-only", action="store_true", help="Run only the pinned CMake oracle.")
     parser.add_argument(
         "--cpack-generators", metavar="TGZ,ZIP",
         help="Compare these package formats. Each selected project must provide CPackConfig.cmake.",
     )
-    parser.add_argument("--rcmake-bin", type=Path, default=ROOT / "target/stage/bin/rcmake")
+    parser.add_argument("--rcmake-bin", "--rcmake", type=Path, default=ROOT / "target/stage/bin/rcmake")
     parser.add_argument("--json", type=Path, metavar="PATH", help="Write the complete results as JSON.")
     parser.add_argument("--timeout", type=int, default=600, help="Timeout in seconds for each command.")
     args = parser.parse_args()
     if args.timeout < 1:
         parser.error("--timeout must be positive.")
+    if args.config is None and args.generator in MULTI_CONFIG_GENERATORS:
+        args.config = "Release"
 
     try:
         with MANIFEST.open("rb") as manifest:
@@ -528,7 +557,10 @@ def main() -> int:
         for project in projects:
             if "cpack_generators" in project:
                 project["cpack_generators"] = package_generators(project["cpack_generators"])
-        generator_tool = {"Ninja": "ninja", "Unix Makefiles": "make", "Xcode": "xcodebuild"}[args.generator]
+        generator_tool = {
+            "Ninja": "ninja", "Ninja Multi-Config": "ninja",
+            "Unix Makefiles": "make", "Xcode": "xcodebuild",
+        }[args.generator]
         if shutil.which(generator_tool) is None:
             raise ValueError(f"{generator_tool} is required for {args.generator}.")
         if "RCMAKE_ORACLE_CMAKE" not in os.environ:
@@ -549,6 +581,8 @@ def main() -> int:
                 if version["returncode"] != 0 or expected not in version.get("output", "").splitlines():
                     raise ValueError(f"Expected {expected} from {tool}.")
             report = {"generator": args.generator, "oracle_version": ORACLE_VERSION, "projects": {}}
+            if args.config is not None:
+                report["config"] = args.config
             for index, project in enumerate(projects):
                 result = {"version": project["version"], "passed": False}
                 report["projects"][project["name"]] = result

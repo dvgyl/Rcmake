@@ -226,3 +226,140 @@ licence = "Zlib"
 configure_args = []
 test_enabled = false
 notes = "Build the default Cocoa backend on macOS. GLFW has no headless CTest suite."
+
+[[project]]
+name = "pugixml"
+tier = 4
+version = "1.15"
+url = "https://codeload.github.com/zeux/pugixml/tar.gz/refs/tags/v1.15"
+sha256 = "b39647064d9e28297a34278bfb897092bf33b7c487906ddfc094c9e8868bddcb"
+licence = "MIT"
+configure_args = [
+    "-DBUILD_SHARED_LIBS=ON",
+    "-DPUGIXML_BUILD_SHARED_AND_STATIC_LIBS=ON",
+    "-DPUGIXML_BUILD_TESTS=ON",
+    "-DPUGIXML_INSTALL=ON",
+]
+test_enabled = true
+notes = "Build and install the shared and static libraries with their CMake exports."
+
+[[project]]
+name = "glm"
+tier = 4
+version = "1.0.1"
+url = "https://codeload.github.com/g-truc/glm/tar.gz/refs/tags/1.0.1"
+sha256 = "9f3174561fd26904b23f0db5e560971cbf9b3cbda0b280f04d5c379d03bf234c"
+licence = "MIT"
+configure_args = [
+    "-DGLM_BUILD_LIBRARY=OFF",
+    "-DGLM_BUILD_TESTS=ON",
+    "-DGLM_BUILD_INSTALL=ON",
+    "-DCMAKE_CXX_FLAGS=-w",
+]
+test_enabled = true
+notes = "Install the header-only library and its CMake interface target. Suppress compiler warnings because this release treats all warnings as errors."
+
+[[project]]
+name = "c-ares"
+tier = 4
+version = "1.34.5"
+url = "https://codeload.github.com/c-ares/c-ares/tar.gz/refs/tags/v1.34.5"
+sha256 = "dcd919635f01b7c8c9c2f5fb38063cd86500f7c6d4d32ecf4deff5e3497fb157"
+licence = "MIT"
+depends_on = ["googletest"]
+configure_args = [
+    "-DCARES_BUILD_TESTS=ON",
+    "-DCARES_BUILD_CONTAINER_TESTS=OFF",
+    "-DCARES_STATIC=ON",
+    "-DCARES_SHARED=ON",
+    "-DCARES_THREADS=ON",
+    "-DCARES_INSTALL=ON",
+]
+test_enabled = true
+notes = "Use the pinned GoogleTest and GoogleMock libraries. The upstream suite includes runs over fixed fuzz input files."
+
+[[project]]
+name = "zstd"
+tier = 4
+version = "1.5.7"
+url = "https://codeload.github.com/facebook/zstd/tar.gz/refs/tags/v1.5.7"
+sha256 = "37d7284556b20954e56e1ca85b80226768902e2edabd3b649e9e72c0c9012ee3"
+licence = "BSD-2-Clause"
+source_subdir = "build/cmake"
+configure_args = [
+    "-DZSTD_BUILD_SHARED=ON",
+    "-DZSTD_BUILD_STATIC=ON",
+    "-DZSTD_BUILD_PROGRAMS=ON",
+    "-DZSTD_BUILD_TESTS=ON",
+    "-DZSTD_FUZZER_FLAGS=-T30s",
+    "-DZSTD_ZSTREAM_FLAGS=-T30s",
+    "-DZSTD_FULLBENCH_FLAGS=-i0",
+]
+test_enabled = true
+notes = "Use the short test settings from upstream continuous integration."
+
+[[project]]
+name = "expat"
+tier = 4
+version = "2.7.3"
+url = "https://codeload.github.com/libexpat/libexpat/tar.gz/refs/tags/R_2_7_3"
+sha256 = "7c853a76f7c2a562c3edfd84ca47e487d9eff3966786191dfb60cc441daf82d6"
+licence = "MIT"
+source_subdir = "expat"
+configure_args = [
+    "-DEXPAT_BUILD_DOCS=OFF",
+    "-DEXPAT_BUILD_FUZZERS=OFF",
+    "-DEXPAT_BUILD_TESTS=ON",
+    "-DEXPAT_ENABLE_INSTALL=ON",
+]
+test_enabled = true
+cpack_generators = ["TGZ"]
+notes = "Build the parser and xmlwf tool. Run the upstream tests and create a CPack archive."
+
+[[project]]
+name = "pcre2"
+tier = 4
+version = "10.46"
+url = "https://codeload.github.com/PCRE2Project/pcre2/tar.gz/refs/tags/pcre2-10.46"
+sha256 = "ffde0c6ead457c4f8edcd8f9ce490bbabd30adabdfd179ecaddd320946cf3872"
+licence = "BSD-3-Clause WITH PCRE2-exception"
+configure_args = [
+    "-DPCRE2_BUILD_PCRE2_8=ON",
+    "-DPCRE2_BUILD_PCRE2_16=ON",
+    "-DPCRE2_BUILD_TESTS=ON",
+    "-DPCRE2_SUPPORT_LIBBZ2=OFF",
+    "-DPCRE2_SUPPORT_LIBZ=OFF",
+    "-DPCRE2_SUPPORT_LIBREADLINE=OFF",
+]
+test_enabled = true
+notes = "Test the 8-bit and 16-bit libraries without optional compression and line editing libraries."
+
+[[project]]
+name = "libuv"
+tier = 4
+version = "1.51.0"
+url = "https://codeload.github.com/libuv/libuv/tar.gz/refs/tags/v1.51.0"
+sha256 = "27e55cf7083913bfb6826ca78cde9de7647cded648d35f24163f2d31bb9f51cd"
+licence = "MIT"
+configure_args = [
+    "-DBUILD_TESTING=OFF",
+    "-DLIBUV_BUILD_SHARED=ON",
+]
+test_enabled = false
+notes = "Install the shared and static libraries, CMake exports, and pkg-config files. The upstream emfile test fails on this macOS host."
+
+[[project]]
+name = "lz4"
+tier = 4
+version = "1.10.0"
+url = "https://codeload.github.com/lz4/lz4/tar.gz/refs/tags/v1.10.0"
+sha256 = "537512904744b35e232912055ccf8ec66d768639ff3abe5788d90d792ec5f48b"
+licence = "BSD-2-Clause"
+source_subdir = "build/cmake"
+configure_args = [
+    "-DBUILD_SHARED_LIBS=ON",
+    "-DBUILD_STATIC_LIBS=ON",
+    "-DLZ4_BUILD_CLI=ON",
+]
+test_enabled = false
+notes = "The library uses BSD-2-Clause. The command-line tool uses GPL-2.0-or-later. This CMake release registers no CTest tests."
