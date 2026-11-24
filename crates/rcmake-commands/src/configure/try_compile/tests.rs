@@ -1,12 +1,8 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
 
 use rcmake_eval::{Interp, InterpConfig, RunMode};
-use rcmake_host::{
-    CommandSpec, Follow, Host, Input, Output, ProcessResult, PureHost, ReadRange, RunOutput,
-    RunRequest, Stream, WriteMode,
-};
+use rcmake_host::{Follow, Host, ProcessResult, PureHost, ReadRange, RunOutput, Stream};
 use rcmake_model::CacheType;
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -233,7 +229,9 @@ message(STATUS "inside probe")
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[test]
 fn builds_real_macho_archive_and_runs_a_probe() -> TestResult {
-    use rcmake_host::NativeHost;
+    use std::time::Duration;
+
+    use rcmake_host::{CommandSpec, Input, NativeHost, Output, RunRequest, WriteMode};
 
     let host = Arc::new(NativeHost::new()?);
     let temp = host.run(

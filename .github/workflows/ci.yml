@@ -85,6 +85,13 @@ jobs:
             choco install ninja -y --no-progress
           }
           Get-Command cl.exe, MSBuild.exe, ninja
+          $linker = Join-Path $env:VCToolsInstallDir 'bin\Hostx64\x64\link.exe'
+          if (-not (Test-Path -LiteralPath $linker -PathType Leaf)) {
+            throw "The Visual Studio linker is missing at $linker."
+          }
+          "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER=$linker" |
+            Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          Write-Host "Using Visual Studio linker at $linker"
 
       - name: Check Rust formatting
         if: runner.os == 'Linux'

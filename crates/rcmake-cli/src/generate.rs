@@ -80,7 +80,7 @@ pub(crate) fn run(
     if !queries.is_empty() && !kind.is_ide() {
         instrument::wrap_custom_commands(&mut result, interp.cx().project(), host, bin);
     }
-    let ide_result = match kind {
+    let ide_result: Option<Result<(), GenError>> = match kind {
         #[cfg(any(target_os = "macos", feature = "xcode-cross"))]
         GeneratorKind::Xcode => {
             let generated = rcmake_gen_xcode::generate(&result, interp.cx().project(), host, bin);
