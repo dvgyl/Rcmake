@@ -37,7 +37,7 @@ pub(crate) struct ExecLogEntry<'a> {
 ///
 /// Reject symbolic links at the log and lock paths.
 /// On Unix, restrict access to the file owner.
-/// On Windows, select a trusted directory and restrict access to both files.
+/// On Windows, use a trusted directory with private access controls.
 /// A logging error leaves the tool's output and exit code intact.
 pub(crate) fn append_exec_log(host: &dyn Host, entry: &ExecLogEntry<'_>) {
     let Some(path) = host
@@ -61,21 +61,8 @@ use private_log::append_at_path;
 
 #[cfg(any(unix, windows))]
 mod private_log {
-    #[cfg(unix)]
-    use std::fs::Permissions;
-    use std::fs::{File, OpenOptions, TryLockError};
-    use std::io::{self, ErrorKind, Read as _, Seek as _, SeekFrom, Write as _};
-    #[cfg(unix)]
-    use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
-    #[cfg(windows)]
-    use std::os::windows::{
-        ffi::OsStrExt as _,
-        fs::{MetadataExt as _, OpenOptionsExt as _},
-    };
-
-    #[cfg(windows)]
-    use rcmake_host::Follow;
     use rcmake_json::{ReadOptions, parse};
+    use std::io::{self, ErrorKind, Read, Seek, SeekFrom};
 
     use super::*;
 
@@ -93,7 +80,105 @@ mod private_log {
         let path = parent.join(name);
         let mut lock_name = name.to_os_string();
         lock_name.push(".lock");
-        let lock = open_log_file(host, &parent.join(lock_name), false)?;
+        write_locked_log(host, &parent.join(lock_name), &path, line)
+    }
+
+    /// Open the lock and log with native file options and write under the lock.
+    ///
+    /// `Host::write` cannot set `O_NOFOLLOW` and mode `0600` in one open.
+    /// The Windows open also needs reparse-point flags. Keep the lock and
+    /// repair operations on the verified file handles.
+    #[allow(clippy::disallowed_methods)]
+    fn write_locked_log(
+        host: &dyn Host,
+        lock_path: &Path,
+        path: &Path,
+        line: &[u8],
+    ) -> io::Result<()> {
+        use std::fs::{File, OpenOptions, TryLockError};
+        use std::io::Write as _;
+
+        let open_private_file = |path: &Path, _append: bool| -> io::Result<File> {
+            let mut options = OpenOptions::new();
+            options.read(true).create(true).truncate(false);
+            #[cfg(unix)]
+            {
+                use std::fs::Permissions;
+                use std::os::unix::fs::{
+                    MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _,
+                };
+
+                options
+                    .write(!_append)
+                    .append(_append)
+                    .mode(0o600)
+                    .custom_flags(open_flags()?);
+                let file = options.open(path)?;
+                let metadata = file.metadata()?;
+                if !metadata.is_file() || metadata.nlink() != 1 {
+                    return Err(ErrorKind::InvalidInput.into());
+                }
+                if metadata.mode() & 0o7777 != 0o600 {
+                    file.set_permissions(Permissions::from_mode(0o600))?;
+                    if file.metadata()?.mode() & 0o7777 != 0o600 {
+                        return Err(ErrorKind::PermissionDenied.into());
+                    }
+                }
+                Ok(file)
+            }
+            #[cfg(windows)]
+            {
+                use std::os::windows::{
+                    ffi::OsStrExt as _,
+                    fs::{MetadataExt as _, OpenOptionsExt as _},
+                };
+
+                use rcmake_host::Follow;
+
+                const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+                const FILE_SHARE_READ: u32 = 0x1;
+                const FILE_SHARE_WRITE: u32 = 0x2;
+                const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+
+                let check_file = |metadata: &std::fs::Metadata| {
+                    if metadata.file_type().is_symlink()
+                        || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+                        || !metadata.is_file()
+                    {
+                        return Err(ErrorKind::InvalidInput);
+                    }
+                    Ok(())
+                };
+                // Reject alternate data streams.
+                let name = path.file_name().ok_or(ErrorKind::InvalidInput)?;
+                if name.encode_wide().any(|unit| unit == u16::from(b':')) {
+                    return Err(ErrorKind::InvalidInput.into());
+                }
+                match std::fs::symlink_metadata(path) {
+                    Ok(metadata) => check_file(&metadata)?,
+                    Err(error) if error.kind() == ErrorKind::NotFound => {}
+                    Err(error) => return Err(error),
+                }
+
+                // The flag blocks reparse points added after the path check.
+                // New files inherit the access controls of their directory.
+                // Omit FILE_SHARE_DELETE so Host can check the hard link count.
+                let file = options
+                    .write(true)
+                    .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+                    .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+                    .open(path)?;
+                check_file(&file.metadata()?)?;
+                let metadata = host
+                    .metadata(path, Follow::No)
+                    .map_err(|error| io::Error::from(error.kind))?;
+                if metadata.nlink != 1 {
+                    return Err(ErrorKind::InvalidInput.into());
+                }
+                Ok(file)
+            }
+        };
+        let lock = open_private_file(lock_path, false)?;
         let start = host.monotonic();
         loop {
             match lock.try_lock() {
@@ -103,42 +188,24 @@ mod private_log {
                     if left.is_zero() {
                         return Err(ErrorKind::TimedOut.into());
                     }
-                    std::thread::sleep(left.min(LOCK_POLL));
+                    host.sleep(left.min(LOCK_POLL));
                 }
                 Err(TryLockError::Error(error)) => return Err(error),
             }
         }
-        let mut file = open_log_file(host, &path, true)?;
+        let mut file = open_private_file(path, true)?;
         let end = file.metadata()?.len();
         if end != 0 && read_exact(&mut file, end - 1, 1)? != b"\n" {
-            repair_tail(&mut file, end)?;
+            let start = record_start(&mut file, end)?;
+            if complete_record(&mut file, start, end)? {
+                file.write_all(b"\n")?;
+            } else {
+                file.set_len(start)?;
+            }
         }
         #[cfg(windows)]
         file.seek(SeekFrom::End(0))?;
         file.write_all(line)
-    }
-
-    #[cfg(unix)]
-    fn open_log_file(_host: &dyn Host, path: &Path, append: bool) -> io::Result<File> {
-        let file = OpenOptions::new()
-            .read(true)
-            .write(!append)
-            .append(append)
-            .create(true)
-            .mode(0o600)
-            .custom_flags(open_flags()?)
-            .open(path)?;
-        let metadata = file.metadata()?;
-        if !metadata.is_file() || metadata.nlink() != 1 {
-            return Err(ErrorKind::InvalidInput.into());
-        }
-        if metadata.mode() & 0o7777 != 0o600 {
-            file.set_permissions(Permissions::from_mode(0o600))?;
-            if file.metadata()?.mode() & 0o7777 != 0o600 {
-                return Err(ErrorKind::PermissionDenied.into());
-            }
-        }
-        Ok(file)
     }
 
     #[cfg(unix)]
@@ -153,72 +220,30 @@ mod private_log {
         )) {
             Ok(0x100 | 0x4)
         } else if cfg!(any(target_os = "linux", target_os = "android")) {
-            match std::env::consts::ARCH {
-                "arm" | "aarch64" | "powerpc" | "powerpc64" => Ok(0x8000 | 0x800),
-                "x86" | "x86_64" | "riscv32" | "riscv64" | "s390x" => Ok(0x20000 | 0x800),
-                _ => Err(ErrorKind::Unsupported.into()),
+            if cfg!(any(
+                target_arch = "arm",
+                target_arch = "aarch64",
+                target_arch = "powerpc",
+                target_arch = "powerpc64"
+            )) {
+                return Ok(0x8000 | 0x800);
             }
+            if cfg!(any(
+                target_arch = "x86",
+                target_arch = "x86_64",
+                target_arch = "riscv32",
+                target_arch = "riscv64",
+                target_arch = "s390x"
+            )) {
+                return Ok(0x20000 | 0x800);
+            }
+            Err(ErrorKind::Unsupported.into())
         } else {
             Err(ErrorKind::Unsupported.into())
         }
     }
 
-    #[cfg(windows)]
-    fn open_log_file(host: &dyn Host, path: &Path, _append: bool) -> io::Result<File> {
-        use std::fs::symlink_metadata;
-
-        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-        const FILE_SHARE_READ: u32 = 0x1;
-        const FILE_SHARE_WRITE: u32 = 0x2;
-
-        // Reject alternate data streams.
-        let name = path.file_name().ok_or(ErrorKind::InvalidInput)?;
-        if name.encode_wide().any(|unit| unit == u16::from(b':')) {
-            return Err(ErrorKind::InvalidInput.into());
-        }
-        match symlink_metadata(path) {
-            Ok(metadata) => check_windows_file(&metadata)?,
-            Err(error) if error.kind() == ErrorKind::NotFound => {}
-            Err(error) => return Err(error),
-        }
-
-        // The flag prevents the open from following a reparse point added after the path check.
-        // New files inherit directory access controls. The standard library cannot set or
-        // verify those controls, or open the file relative to a directory handle.
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
-            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
-            .open(path)?;
-        check_windows_file(&file.metadata()?)?;
-        // Omit FILE_SHARE_DELETE so Host can check the hard link count while the file is open.
-        let metadata = host
-            .metadata(path, Follow::No)
-            .map_err(|error| io::Error::from(error.kind))?;
-        if metadata.nlink != 1 {
-            return Err(ErrorKind::InvalidInput.into());
-        }
-        Ok(file)
-    }
-
-    #[cfg(windows)]
-    fn check_windows_file(metadata: &std::fs::Metadata) -> io::Result<()> {
-        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
-
-        if metadata.file_type().is_symlink()
-            || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
-            || !metadata.is_file()
-        {
-            return Err(ErrorKind::InvalidInput.into());
-        }
-        Ok(())
-    }
-
-    fn repair_tail(file: &mut File, end: u64) -> io::Result<()> {
-        let start = record_start(file, end)?;
+    fn complete_record(file: &mut (impl Read + Seek), start: u64, end: u64) -> io::Result<bool> {
         let len = end - start;
         let complete = if len <= MAX_RECORD_BYTES {
             let tail = read_exact(file, start, len)?;
@@ -237,14 +262,10 @@ mod private_log {
                 .and_then(|field| field.strip_prefix(b"\"pid\":"))
                 .is_some_and(|pid| !pid.is_empty() && pid.iter().all(u8::is_ascii_digit))
         };
-        if complete {
-            file.write_all(b"\n")
-        } else {
-            file.set_len(start)
-        }
+        Ok(complete)
     }
 
-    fn record_start(file: &mut File, mut end: u64) -> io::Result<u64> {
+    fn record_start(file: &mut (impl Read + Seek), mut end: u64) -> io::Result<u64> {
         while end > 0 {
             let offset = end.saturating_sub(REPAIR_CHUNK_BYTES);
             let chunk = read_exact(file, offset, end - offset)?;
@@ -256,7 +277,7 @@ mod private_log {
         Ok(0)
     }
 
-    fn read_exact(file: &mut File, offset: u64, len: u64) -> io::Result<Vec<u8>> {
+    fn read_exact(file: &mut (impl Read + Seek), offset: u64, len: u64) -> io::Result<Vec<u8>> {
         let len = usize::try_from(len).map_err(|_| ErrorKind::InvalidInput)?;
         let mut bytes = vec![0; len];
         file.seek(SeekFrom::Start(offset))?;
@@ -367,7 +388,15 @@ mod tests {
         let host = NativeHost::new()?;
         let pid = host.system().pid;
         let now = host.now();
-        let root = std::env::temp_dir().join(format!(
+        let temp = [b"TMPDIR".as_slice(), b"TEMP", b"TMP"]
+            .into_iter()
+            .find_map(|key| {
+                host.env_get(key)
+                    .map(|value| to_native(&value))
+                    .filter(|path| path.is_absolute())
+            })
+            .unwrap_or_else(|| host.initial_cwd());
+        let root = temp.join(format!(
             "rcmake-exec-log-test-{pid}-{}-{}",
             now.secs, now.nanos
         ));

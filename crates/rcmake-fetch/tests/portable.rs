@@ -1,6 +1,6 @@
 //! Fetch command and option checks with default features.
 
-#![allow(clippy::unwrap_used)]
+#![forbid(unsafe_code)]
 
 use rcmake_base::BString;
 use rcmake_fetch::{LockMode, classify_git_checkout, classify_git_clone};
@@ -13,7 +13,8 @@ fn args(values: &[&str]) -> Vec<BString> {
 }
 
 #[test]
-fn git_classifier_tracks_vendored_template_and_rejects_other_shapes() {
+fn git_classifier_tracks_vendored_template_and_rejects_other_shapes()
+-> Result<(), Box<dyn std::error::Error>> {
     let template =
         include_str!("../../../modules/cmake-4.5/Modules/ExternalProject/gitclone.cmake.in");
     let render = |line: &str| {
@@ -26,9 +27,9 @@ fn git_classifier_tracks_vendored_template_and_rejects_other_shapes() {
         template
             .lines()
             .find(|line| line.contains("clone @git_clone_options@"))
-            .unwrap(),
+            .ok_or("Missing Git command in the CMake template.")?,
     );
-    let clone = classify_git_clone(&clone).unwrap();
+    let clone = classify_git_clone(&clone).ok_or("Invalid Git clone arguments.")?;
     assert_eq!(
         (clone.repository, clone.directory, clone.origin),
         (REPO, "source", "origin2")
@@ -37,7 +38,7 @@ fn git_classifier_tracks_vendored_template_and_rejects_other_shapes() {
         template
             .lines()
             .find(|line| line.contains("checkout \"@git_tag@\""))
-            .unwrap(),
+            .ok_or("Missing Git command in the CMake template.")?,
     );
     assert_eq!(classify_git_checkout(&checkout), Some("v1"));
     assert_eq!(
@@ -63,10 +64,11 @@ fn git_classifier_tracks_vendored_template_and_rejects_other_shapes() {
     }
     assert!(classify_git_checkout(&args(&["checkout", "--", "some-file"])).is_none());
     assert!(classify_git_checkout(&args(&["checkout", "v1", "--", "some-file"])).is_none());
+    Ok(())
 }
 
 #[test]
-fn classifies_the_argv_emitted_by_fetchcontent_4_5_1() {
+fn classifies_the_argv_emitted_by_fetchcontent_4_5_1() -> Result<(), Box<dyn std::error::Error>> {
     // Captured with GIT_TRACE during FetchContent_MakeAvailable(fixture).
     let argv = args(&[
         "clone",
@@ -84,11 +86,12 @@ fn classifies_the_argv_emitted_by_fetchcontent_4_5_1() {
         REPO,
         "fixture-src",
     ]);
-    let clone = classify_git_clone(&argv).unwrap();
+    let clone = classify_git_clone(&argv).ok_or("Invalid Git clone arguments.")?;
     assert_eq!(
         (clone.repository, clone.directory, clone.origin),
         (REPO, "fixture-src", "origin2")
     );
+    Ok(())
 }
 
 #[test]
