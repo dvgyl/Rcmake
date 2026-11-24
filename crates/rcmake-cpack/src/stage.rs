@@ -61,7 +61,7 @@ pub(crate) fn install(
             cwd,
             interp,
             install_scripts,
-            "Install script",
+            "- Install script",
         )?;
         let cfg = snapshot(interp);
         crate::source::copy_directories(host.as_ref(), &cfg, cwd, staging, interp)?;
@@ -87,7 +87,7 @@ pub(crate) fn run_hooks(
     label: &str,
 ) -> Result<(), CpackError> {
     for file in snapshot(interp).list(variable) {
-        log(host, format!("- {label}: {file}"));
+        log(host, format!("{label}: {file}"));
         script(interp, &absolute(cwd, &file))?;
     }
     Ok(())
@@ -101,6 +101,11 @@ fn install_projects(
     staging: &Path,
 ) -> Result<(), CpackError> {
     let projects = cfg.list(b"CPACK_INSTALL_CMAKE_PROJECTS");
+    if !projects.is_empty() && cfg.get(b"CPACK_CMAKE_GENERATOR").is_none() {
+        return Err(error(
+            "CPACK_INSTALL_CMAKE_PROJECTS is specified, but CPACK_CMAKE_GENERATOR is not. CPACK_CMAKE_GENERATOR is required to install the project.",
+        ));
+    }
     let (tuples, remainder) = projects.as_chunks::<4>();
     if !remainder.is_empty() {
         return Err(error(
@@ -115,9 +120,9 @@ fn install_projects(
     }
     let external = cfg.get(b"CPACK_GENERATOR") == Some(b"External");
     let stage_project = !external || cfg.on(b"CPACK_EXTERNAL_ENABLE_STAGING");
-    if external && !tuples.is_empty() && cfg.get(b"CPACK_CMAKE_GENERATOR").is_none() {
+    if !tuples.is_empty() && cfg.get(b"CPACK_CMAKE_GENERATOR") == Some(b"") {
         return Err(error(
-            "CPACK_INSTALL_CMAKE_PROJECTS is specified, but CPACK_CMAKE_GENERATOR is not. CPACK_CMAKE_GENERATOR is required to install the project.",
+            "Specified package generator not found. CPACK_CMAKE_GENERATOR value is invalid.",
         ));
     }
     for [build, project, component, subdir] in tuples {
@@ -136,7 +141,7 @@ fn install_projects(
             let separate = !package_components(cfg, component).is_empty();
             let destinations = install_destinations(cfg, staging, component, subdir)?;
             for (component, destination) in &destinations {
-                if external && separate {
+                if separate {
                     log(host.as_ref(), format!("-   Install component: {component}"));
                 }
                 ensure_dir(host.as_ref(), staging, destination)?;
@@ -331,25 +336,20 @@ pub(crate) fn project_components(cfg: &CpackConfig, selection: &[u8]) -> Vec<BSt
 }
 
 pub(crate) fn component_dir(name: &[u8]) -> PathBuf {
-    // CPack uses the MD5 of a component name when the name contains a path separator.
+    if name.iter().any(|byte| b"<>\"/\\|?*`".contains(byte))
+        || (cfg!(windows) && name.contains(&b':'))
+    {
+        return HashAlgo::Md5.hex_digest(name).into();
+    }
     safe_name(name).unwrap_or_else(|_| HashAlgo::Md5.hex_digest(name).into())
 }
 
-pub(crate) fn package_group(cfg: &CpackConfig, component: &[u8]) -> BString {
-    match grouping(cfg) {
-        ComponentGrouping::AllComponentsInOne => "ALL_COMPONENTS_IN_ONE".into(),
-        ComponentGrouping::OnePerGroup => {
-            let key = format!(
-                "CPACK_COMPONENT_{}_GROUP",
-                BString::from(component.to_ascii_uppercase())
-            );
-            cfg.get(key.as_bytes())
-                .filter(|name| !name.is_empty())
-                .unwrap_or(component)
-                .into()
-        }
-        ComponentGrouping::Ignore => component.into(),
-    }
+pub(crate) fn component_group<'a>(cfg: &'a CpackConfig, component: &[u8]) -> Option<&'a [u8]> {
+    let key = format!(
+        "CPACK_COMPONENT_{}_GROUP",
+        BString::from(component.to_ascii_uppercase())
+    );
+    cfg.get(key.as_bytes()).filter(|name| !name.is_empty())
 }
 
 pub(crate) fn relative_install_path(value: &[u8]) -> Result<PathBuf, CpackError> {

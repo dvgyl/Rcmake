@@ -87,6 +87,18 @@ impl<'a> Lexer<'a> {
         })
     }
 
+    pub(super) fn resume(rest: &'a [u8], position: Position) -> Self {
+        Self {
+            rest,
+            normalize_crlf: true,
+            position,
+        }
+    }
+
+    pub(super) fn position(&self) -> Position {
+        self.position
+    }
+
     pub(super) fn next(&mut self) -> Option<Token> {
         loop {
             let start = self.position;
@@ -265,11 +277,11 @@ fn check_nul(kind: Kind, text: &[u8]) -> Kind {
     }
 }
 
-fn identifier_start(byte: u8) -> bool {
+pub(super) fn identifier_start(byte: u8) -> bool {
     byte == b'_' || byte.is_ascii_alphabetic()
 }
 
-fn identifier_byte(byte: u8) -> bool {
+pub(super) fn identifier_byte(byte: u8) -> bool {
     byte == b'_' || byte.is_ascii_alphanumeric()
 }
 

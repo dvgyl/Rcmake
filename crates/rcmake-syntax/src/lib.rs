@@ -21,6 +21,9 @@ use thiserror::Error;
 
 mod lexer;
 mod parser;
+mod tolerant;
+
+pub use tolerant::{PartialCommandInvocation, TolerantParse, parse_tolerant};
 
 #[cfg(test)]
 mod tests;

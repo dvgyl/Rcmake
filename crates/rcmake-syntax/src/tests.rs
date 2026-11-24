@@ -533,3 +533,153 @@ fn malformed_byte_sequences_and_deep_nesting_do_not_panic() {
     src.extend_from_slice(&b"endblock()\n".repeat(12_000));
     assert_eq!(file(&src).commands.len(), 24_000);
 }
+
+fn editor_parse(src: &[u8]) -> TolerantParse {
+    let mut sources = SourceMap::default();
+    let source = sources
+        .add("CMakeLists.txt".into(), SourceKind::File, Arc::from(src))
+        .expect("available source ID");
+    parse_tolerant(source, src)
+}
+
+fn command_names(parsed: &TolerantParse) -> Vec<&[u8]> {
+    parsed
+        .commands
+        .iter()
+        .map(|command| command.lower.as_slice())
+        .collect()
+}
+
+#[test]
+fn tolerant_parse_keeps_commands_inside_open_blocks() {
+    let src = b"if(BUILD_APP)\n  add_executable(app main.cpp)\n  target_link_libraries(app PRI";
+    let parsed = editor_parse(src);
+    assert_eq!(parsed.source.get(), 1);
+    assert_eq!(
+        command_names(&parsed),
+        [b"if".as_slice(), b"add_executable"]
+    );
+    assert_eq!(parsed.unclosed_blocks, [0]);
+    assert_eq!(parsed.partial_commands.len(), 1);
+    let partial = &parsed.partial_commands[0];
+    assert_eq!(partial.line, 3);
+    assert_eq!(partial.name.as_slice(), b"target_link_libraries");
+    assert_eq!(&src[partial.span.clone()], b"target_link_libraries(app PRI");
+    let opening = partial.parenthesis_span.clone().expect("opening paren");
+    assert_eq!(&src[opening], b"(app PRI");
+    assert_eq!(partial.args[0].text.as_slice(), b"app");
+    assert_eq!(partial.args[1].text.as_slice(), b"PRI");
+    assert_eq!(parsed.errors.len(), 1);
+    assert_eq!(file_error(src).line, 3);
+}
+
+#[test]
+fn tolerant_parse_tracks_each_kind_of_unclosed_block() {
+    let parsed = editor_parse(
+        b"IF(TRUE)\nforeach(X IN ITEMS a)\nwhile(FALSE)\nfunction(f)\nmacro(m)\nblock()\nset(x 1)\n",
+    );
+    assert_eq!(parsed.commands.len(), 7);
+    assert_eq!(parsed.unclosed_blocks, [0, 1, 2, 3, 4, 5]);
+    assert!(parsed.partial_commands.is_empty());
+
+    let parsed = editor_parse(b"if(TRUE)\nblock()\nendif()\nmessage(hi)\n");
+    assert_eq!(
+        command_names(&parsed),
+        [b"if".as_slice(), b"block", b"endif", b"message"]
+    );
+    assert_eq!(parsed.unclosed_blocks, [1]);
+}
+
+#[test]
+fn tolerant_parse_recovers_after_a_missing_parenthesis_and_a_bad_line() {
+    let src = b"if(TRUE)\n  set(first yes)\n  target_link_libraries(app PRI\n  set(second yes)\n!invalid\nendif()\nset(third yes)";
+    let parsed = editor_parse(src);
+    assert_eq!(
+        command_names(&parsed),
+        [b"if".as_slice(), b"set", b"set", b"endif", b"set"]
+    );
+    assert!(parsed.unclosed_blocks.is_empty());
+    assert_eq!(parsed.partial_commands.len(), 1);
+    let partial = &parsed.partial_commands[0];
+    assert_eq!(partial.args[1].text.as_slice(), b"PRI");
+    assert_eq!(
+        &src[partial.span.clone()],
+        b"target_link_libraries(app PRI\n"
+    );
+    assert_eq!(parsed.errors.len(), 2);
+}
+
+#[test]
+fn tolerant_parse_recovers_from_an_open_quote_before_later_quoted_arguments() {
+    let src = b"set(before yes)\nmessage(\"unfinished\n  set(after \"yes\")\nmessage(done)";
+    let parsed = editor_parse(src);
+    assert_eq!(
+        command_names(&parsed),
+        [b"set".as_slice(), b"set", b"message"]
+    );
+    assert_eq!(parsed.partial_commands.len(), 1);
+    let argument = &parsed.partial_commands[0].args[0];
+    assert_eq!(argument.kind, ArgKind::Quoted);
+    assert_eq!(argument.text.as_slice(), b"unfinished\n");
+    assert_eq!(&src[argument.span.clone()], b"\"unfinished\n");
+    assert_eq!(parsed.commands[1].args[1].text.as_slice(), b"yes");
+}
+
+#[test]
+fn tolerant_parse_retains_an_open_quote_at_end_of_input() {
+    let parsed = editor_parse(b"add_library(lib main.cpp)\nmessage(STATUS \"text");
+    assert_eq!(command_names(&parsed), [b"add_library".as_slice()]);
+    let argument = &parsed.partial_commands[0].args[1];
+    assert_eq!(argument.kind, ArgKind::Quoted);
+    assert_eq!(argument.text.as_slice(), b"text");
+    assert_eq!(parsed.errors.len(), 1);
+}
+
+#[test]
+fn tolerant_parse_preserves_multiline_arguments_and_crlf_utf8_spans() {
+    let src = "\u{feff}SeT(x \"café\r\nliteral(call)\r\n🍃\")\r\nmessage(STATUS \"café\r\n";
+    let parsed = editor_parse(src.as_bytes());
+    assert_eq!(command_names(&parsed), [b"set".as_slice()]);
+    let complete = &parsed.commands[0];
+    assert_eq!(complete.line, 1);
+    assert_eq!(complete.close_line, 3);
+    assert_eq!(complete.span.start, 3);
+    assert_eq!(
+        complete.args[1].text.as_slice(),
+        "café\nliteral(call)\n🍃".as_bytes()
+    );
+    assert_eq!(
+        &src[complete.args[1].span.clone()],
+        "\"café\r\nliteral(call)\r\n🍃\""
+    );
+    let partial = &parsed.partial_commands[0];
+    assert_eq!(partial.line, 4);
+    assert_eq!(&src[partial.span.clone()], "message(STATUS \"café\r\n");
+    assert_eq!(partial.args[1].text.as_slice(), "café\n".as_bytes());
+}
+
+#[test]
+fn tolerant_parse_prefers_balanced_syntax_to_statement_recovery() {
+    let src = b"if(\n  name(value)\n)\nmessage([=[\nquoted(fake)\n]=])\nendif()";
+    let strict = file(src);
+    let tolerant = editor_parse(src);
+    assert_eq!(tolerant.commands.as_slice(), strict.commands.as_ref());
+    assert!(tolerant.errors.is_empty());
+    assert!(tolerant.partial_commands.is_empty());
+
+    let parsed = editor_parse(b"message(\"line\nfake()\nmore\"\nset(real yes)");
+    assert_eq!(command_names(&parsed), [b"set".as_slice()]);
+    assert_eq!(
+        parsed.partial_commands[0].args[0].text.as_slice(),
+        b"line\nfake()\nmore"
+    );
+}
+
+#[test]
+fn tolerant_parse_keeps_later_commands_after_multiple_open_strings() {
+    let src = b"message(\"one\nmessage(\"two\nmessage(\"three\nmessage(\"four\nmessage(\"five\nset(value \"line\nsecond\")\nset(last yes)";
+    let parsed = editor_parse(src);
+    assert_eq!(command_names(&parsed), [b"set".as_slice(), b"set"]);
+    assert_eq!(parsed.partial_commands.len(), 5);
+    assert_eq!(parsed.commands[0].args[1].text.as_slice(), b"line\nsecond");
+}

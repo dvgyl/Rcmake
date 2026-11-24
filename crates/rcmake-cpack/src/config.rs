@@ -314,6 +314,7 @@ pub(crate) fn load_base(
     argv0: Option<&BString>,
 ) -> Result<Interp, CpackError> {
     let mut interp = interpreter(host, cwd, options, argv0)?;
+    // The generated config can use this value when it includes CPackProperties.cmake.
     if let Some(value) = &options.build_config {
         interp.cx().set_var(b"CPACK_BUILD_CONFIG", value.clone());
     }

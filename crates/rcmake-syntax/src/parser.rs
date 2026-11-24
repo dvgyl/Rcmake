@@ -146,13 +146,13 @@ fn parse_command(
 }
 
 #[derive(PartialEq, Eq)]
-enum Separation {
+pub(super) enum Separation {
     Space,
     None,
     Bracket,
 }
 
-fn check_separation(
+pub(super) fn check_separation(
     preceding: Separation,
     kind: ArgKind,
     position: Position,
@@ -188,7 +188,7 @@ fn check_separation(
     })
 }
 
-fn unexpected(prefix: &[u8], token: &Token) -> ParseError {
+pub(super) fn unexpected(prefix: &[u8], token: &Token) -> ParseError {
     let mut message = prefix.to_vec();
     message.extend_from_slice(token.kind.description());
     message.extend_from_slice(b" with text \"");
@@ -203,7 +203,7 @@ fn unexpected(prefix: &[u8], token: &Token) -> ParseError {
     error(position, message)
 }
 
-fn error(position: Position, message: impl Into<BString>) -> ParseError {
+pub(super) fn error(position: Position, message: impl Into<BString>) -> ParseError {
     ParseError {
         line: position.line,
         column: position.column,

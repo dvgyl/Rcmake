@@ -354,6 +354,7 @@ set(CPACK_GENERATOR TAR)
 set(CPACK_PACKAGE_NAME demo)
 set(CPACK_PACKAGE_VERSION 1)
 set(CPACK_PACKAGE_FILE_NAME demo)
+set(CPACK_CMAKE_GENERATOR Ninja)
 set(CPACK_INSTALL_CMAKE_PROJECTS "/work/build;demo;ALL;/")
 set(CPACK_ARCHIVE_COMPONENT_INSTALL ON)
 set(CPACK_COMPONENTS_ALL "api;bin;docs")
@@ -764,4 +765,148 @@ include(CPack)
             assert_eq!(expected, native_tree[&name], "{} {name}", kind.name());
         }
     }
+}
+
+#[test]
+fn generated_config_loads_install_properties_before_packaging() {
+    let host = memory_host();
+    write(
+        host.as_ref(),
+        "/work/CPackConfig.cmake",
+        br#"
+cmake_minimum_required(VERSION 4.5)
+set(CPACK_GENERATOR TAR)
+set(CPACK_PACKAGE_NAME demo)
+set(CPACK_PACKAGE_VERSION 1)
+set(CPACK_PACKAGE_FILE_NAME demo)
+set(CPACK_PACKAGE_DESCRIPTION demo)
+set(CPACK_INSTALL_SCRIPT "/work/install.cmake")
+set(CPACK_PRE_BUILD_SCRIPTS "/work/check.cmake")
+if(NOT CPACK_PROPERTIES_FILE)
+  set(CPACK_PROPERTIES_FILE "/work/CPackProperties.cmake")
+endif()
+if(EXISTS "${CPACK_PROPERTIES_FILE}")
+  include("${CPACK_PROPERTIES_FILE}")
+endif()
+"#,
+    );
+    write(
+        host.as_ref(),
+        "/work/CPackProperties.cmake",
+        br#"
+if(CPACK_BUILD_CONFIG STREQUAL "Release")
+  set_property(INSTALL artifact PROPERTY LABEL release)
+else()
+  set_property(INSTALL artifact PROPERTY LABEL debug)
+endif()
+"#,
+    );
+    write(
+        host.as_ref(),
+        "/work/install.cmake",
+        br#"file(WRITE "${CMAKE_INSTALL_PREFIX}/artifact" "contents")"#,
+    );
+    write(
+        host.as_ref(),
+        "/work/check.cmake",
+        br#"
+get_property(role GLOBAL PROPERTY CMAKE_ROLE)
+get_property(label INSTALL artifact PROPERTY LABEL)
+if(NOT role STREQUAL "CPACK" OR NOT label STREQUAL "release")
+  message(FATAL_ERROR "Expected the Release install property in the CPack session.")
+endif()
+"#,
+    );
+    assert_eq!(invoke(host.clone(), &["-C", "Release"]), 0);
+    assert!(
+        host.metadata(Path::new("/work/demo.tar"), Follow::No)
+            .is_ok()
+    );
+}
+
+#[test]
+fn archive_component_names_and_order_follow_the_package_configuration()
+-> Result<(), Box<dyn std::error::Error>> {
+    let host = memory_host();
+    write(
+        host.as_ref(),
+        "/work/CPackConfig.cmake",
+        br#"
+cmake_minimum_required(VERSION 4.5)
+set(CPACK_GENERATOR TAR)
+set(CPACK_PACKAGE_NAME demo)
+set(CPACK_PACKAGE_VERSION 1)
+set(CPACK_PACKAGE_FILE_NAME demo)
+set(CPACK_PACKAGE_DESCRIPTION demo)
+set(CPACK_CMAKE_GENERATOR Ninja)
+set(CPACK_INSTALL_CMAKE_PROJECTS "/work/build;demo;ALL;/")
+set(CPACK_ARCHIVE_COMPONENT_INSTALL ON)
+set(CPACK_COMPONENTS_ALL "zeta;a-orphan;beta")
+set(CPACK_COMPONENT_ZETA_GROUP "Zulu")
+set(CPACK_COMPONENT_BETA_GROUP "Zulu")
+set(CPACK_COMPONENT_GROUP_ZULU_DISPLAY_NAME "Tools Kit")
+set(CPACK_COMPONENT_A-ORPHAN_DISPLAY_NAME "Some docs")
+set(CPACK_TAR_USE_DISPLAY_NAME_IN_FILENAME ON)
+set(CPACK_ARCHIVE_ZULU_FILE_NAME "")
+set(CPACK_ARCHIVE_FILE_NAME "")
+set(CPACK_ARCHIVE_FILE_EXTENSION "")
+set(CPACK_COMPONENT_INCLUDE_TOPLEVEL_DIRECTORY ON)
+set(CPACK_PACKAGING_INSTALL_PREFIX "/usr/share")
+set(CPACK_POST_BUILD_SCRIPTS "/work/check.cmake")
+"#,
+    );
+    write(
+        host.as_ref(),
+        "/work/build/cmake_install.cmake",
+        br#"file(WRITE "${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_COMPONENT}.txt" "contents")"#,
+    );
+    write(
+        host.as_ref(),
+        "/work/check.cmake",
+        br#"
+list(LENGTH CPACK_PACKAGE_FILES count)
+list(GET CPACK_PACKAGE_FILES 0 first)
+list(GET CPACK_PACKAGE_FILES 1 second)
+get_filename_component(first "${first}" NAME)
+get_filename_component(second "${second}" NAME)
+if(NOT count EQUAL 2 OR NOT first STREQUAL "demo-Tools Kit.tar" OR NOT second STREQUAL "demo-Some docs.tar")
+  message(FATAL_ERROR "Unexpected package files: ${CPACK_PACKAGE_FILES}")
+endif()
+"#,
+    );
+    assert_eq!(invoke(host.clone(), &[]), 0);
+    let entries = |path| list_command_archive(host.as_ref(), Path::new(path), Vec::new(), None);
+    assert_eq!(
+        entries("/work/demo-Tools Kit.tar")?,
+        [
+            BString::from("demo/usr/share/zeta.txt"),
+            BString::from("demo/usr/share/beta.txt"),
+        ]
+    );
+    assert_eq!(
+        entries("/work/demo-Some docs.tar")?,
+        [BString::from("demo/usr/share/a-orphan.txt")]
+    );
+    Ok(())
+}
+
+#[test]
+fn project_install_requires_a_cmake_generator_for_archive_packages() {
+    let host = memory_host();
+    write(
+        host.as_ref(),
+        "/work/CPackConfig.cmake",
+        br#"
+set(CPACK_GENERATOR TAR)
+set(CPACK_PACKAGE_NAME demo)
+set(CPACK_PACKAGE_VERSION 1)
+set(CPACK_PACKAGE_FILE_NAME demo)
+set(CPACK_INSTALL_CMAKE_PROJECTS "/work/build;demo;ALL;/")
+"#,
+    );
+    assert_eq!(invoke(host.clone(), &[]), 1);
+    assert_eq!(
+        host.stream_bytes(Stream::Stderr),
+        b"CPack Error: CPACK_INSTALL_CMAKE_PROJECTS is specified, but CPACK_CMAKE_GENERATOR is not. CPACK_CMAKE_GENERATOR is required to install the project.\nCPack Error: Error when generating package: demo\n"
+    );
 }

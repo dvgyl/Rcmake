@@ -115,17 +115,23 @@ impl PackageGenerator for ArchiveGenerator {
         let cfg = CpackConfig {
             vars: cx.vars.clone(),
         };
-        let archive_name = cfg.get(b"CPACK_ARCHIVE_FILE_NAME").unwrap_or(cx.file_name);
-        let extension = cfg.get(b"CPACK_ARCHIVE_FILE_EXTENSION").map_or_else(
-            || self.extension().into(),
-            |ext| {
-                if ext.starts_with(b".") {
-                    BString::from(ext)
-                } else {
-                    format!(".{}", BString::from(ext)).into()
-                }
-            },
-        );
+        let archive_name = cfg
+            .get(b"CPACK_ARCHIVE_FILE_NAME")
+            .filter(|name| !name.is_empty())
+            .unwrap_or(cx.file_name);
+        let extension = cfg
+            .get(b"CPACK_ARCHIVE_FILE_EXTENSION")
+            .filter(|ext| !ext.is_empty())
+            .map_or_else(
+                || self.extension().into(),
+                |ext| {
+                    if ext.starts_with(b".") {
+                        BString::from(ext)
+                    } else {
+                        format!(".{}", BString::from(ext)).into()
+                    }
+                },
+            );
         let compression_level = cfg
             .get(b"CPACK_ARCHIVE_COMPRESSION_LEVEL")
             .or_else(|| cfg.get(b"CPACK_COMPRESSION_LEVEL"))
@@ -150,9 +156,8 @@ impl PackageGenerator for ArchiveGenerator {
             compression_level,
             verbose: false,
         };
-        let component_groups = component_groups(&cfg);
-        let mut outputs = BTreeSet::new();
-        if component_groups.is_empty() {
+        let archives = component_archives(&cfg, archive_name, self.name());
+        if archives.is_empty() {
             let (base, inputs) = if cfg.get(b"CPACK_INCLUDE_TOPLEVEL_DIRECTORY").is_none()
                 || cfg.on(b"CPACK_INCLUDE_TOPLEVEL_DIRECTORY")
             {
@@ -174,73 +179,94 @@ impl PackageGenerator for ArchiveGenerator {
             };
             let path = archive_path(cx, archive_name, &extension)?;
             write_archive(cx, &path, &base, &inputs, &options)?;
-            outputs.insert(path);
-        } else {
-            for (group, components) in component_groups {
-                let name = component_archive_name(&cfg, archive_name, &group);
-                let path = archive_path(cx, &name, &extension)?;
-                if !outputs.insert(path.clone()) {
+            return Ok(vec![path]);
+        }
+
+        let mut used_paths = BTreeSet::new();
+        let paths = archives
+            .iter()
+            .map(|archive| {
+                let path = archive_path(cx, &archive.name, &extension)?;
+                if !used_paths.insert(path.clone()) {
                     return Err(error(format!(
                         "Duplicate CPack archive name: {}",
                         path.display()
                     )));
                 }
-                let mut roots = components.iter().map(|name| cx.staging_dir.join(name));
-                let first = roots
-                    .next()
-                    .ok_or_else(|| error("CPack component group is empty"))?;
-                if components.len() == 1 {
-                    write_component_archive(cx, &cfg, &path, &first, &options)?;
-                } else {
-                    let merged = component_workspace(cx)?;
-                    let result = (|| {
-                        for root in std::iter::once(first).chain(roots) {
-                            crate::source::merge_component(cx.host, &root, &merged)?;
-                        }
-                        write_component_archive(cx, &cfg, &path, &merged, &options)
-                    })();
-                    let cleanup = cx.host.remove_dir_all(&merged);
-                    result?;
-                    cleanup?;
-                }
-            }
+                Ok(path)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let prefix = component_prefix(cx, &cfg)?;
+        for (archive, path) in archives.iter().zip(&paths) {
+            write_component_archive(cx, path, &prefix, &archive.components, &options)?;
         }
-        Ok(outputs.into_iter().collect())
+        Ok(paths)
     }
 }
 
-fn component_groups(cfg: &CpackConfig) -> BTreeMap<BString, BTreeSet<PathBuf>> {
-    let mut groups: BTreeMap<BString, BTreeSet<PathBuf>> = BTreeMap::new();
+struct ComponentArchive {
+    name: BString,
+    components: Vec<BString>,
+}
+
+fn component_archives(cfg: &CpackConfig, base: &[u8], generator: &str) -> Vec<ComponentArchive> {
+    let grouping = crate::stage::grouping(cfg);
+    let mut seen = BTreeSet::new();
+    let mut groups: BTreeMap<BString, Vec<BString>> = BTreeMap::new();
+    let mut singles = BTreeSet::new();
     let projects = cfg.list(b"CPACK_INSTALL_CMAKE_PROJECTS");
     for [_, _, selection, _] in projects.as_chunks::<4>().0 {
         for component in crate::stage::package_components(cfg, selection) {
-            let group = crate::stage::package_group(cfg, &component);
-            groups
-                .entry(group)
-                .or_default()
-                .insert(crate::stage::component_dir(&component));
+            if grouping == ComponentGrouping::OnePerGroup
+                && let Some(group) = crate::stage::component_group(cfg, &component)
+            {
+                if seen.insert(component.clone()) {
+                    groups.entry(group.into()).or_default().push(component);
+                }
+            } else {
+                singles.insert(component);
+            }
         }
     }
+    if grouping == ComponentGrouping::AllComponentsInOne && !singles.is_empty() {
+        return vec![ComponentArchive {
+            name: base.into(),
+            components: singles.into_iter().collect(),
+        }];
+    }
     groups
+        .into_iter()
+        .map(|(group, components)| ComponentArchive {
+            name: component_archive_name(cfg, base, &group, generator, "COMPONENT_GROUP"),
+            components,
+        })
+        .chain(singles.into_iter().map(|component| ComponentArchive {
+            name: component_archive_name(cfg, base, &component, generator, "COMPONENT"),
+            components: vec![component],
+        }))
+        .collect()
 }
 
-fn component_archive_name(cfg: &CpackConfig, base: &[u8], group: &[u8]) -> BString {
-    if crate::stage::grouping(cfg) == ComponentGrouping::AllComponentsInOne {
-        return base.into();
+fn component_archive_name(
+    cfg: &CpackConfig,
+    base: &[u8],
+    name: &[u8],
+    generator: &str,
+    scope: &str,
+) -> BString {
+    let upper = BString::from(name.to_ascii_uppercase());
+    let variable = format!("CPACK_ARCHIVE_{upper}_FILE_NAME");
+    if let Some(name) = cfg.get(variable.as_bytes()).filter(|name| !name.is_empty()) {
+        return name.into();
     }
-    let group = BString::from(group);
-    let variable = format!(
-        "CPACK_ARCHIVE_{}_FILE_NAME",
-        BString::from(group.to_ascii_uppercase())
-    );
-    cfg.get(variable.as_bytes()).map_or_else(
-        || {
-            format!("{}-{group}", BString::from(base))
-                .replace(' ', "-")
-                .into()
-        },
-        BString::from,
-    )
+    let display = format!("CPACK_{generator}_USE_DISPLAY_NAME_IN_FILENAME");
+    let suffix = if cfg.on(display.as_bytes()) {
+        let variable = format!("CPACK_{scope}_{upper}_DISPLAY_NAME");
+        cfg.get(variable.as_bytes()).unwrap_or(name)
+    } else {
+        name
+    };
+    [base, b"-", suffix].concat().into()
 }
 
 fn component_workspace(cx: &PackageContext<'_>) -> Result<PathBuf, CpackError> {
@@ -258,23 +284,53 @@ fn component_workspace(cx: &PackageContext<'_>) -> Result<PathBuf, CpackError> {
     Err(error("Cannot create a CPack component workspace"))
 }
 
+fn component_prefix(cx: &PackageContext<'_>, cfg: &CpackConfig) -> Result<PathBuf, CpackError> {
+    let mut prefix = if cfg.on(b"CPACK_COMPONENT_INCLUDE_TOPLEVEL_DIRECTORY") {
+        safe_name(cx.file_name)?
+    } else {
+        PathBuf::new()
+    };
+    if let Some(install_prefix) = cfg.get(b"CPACK_PACKAGING_INSTALL_PREFIX") {
+        prefix.push(crate::stage::relative_install_path(install_prefix)?);
+    }
+    Ok(prefix)
+}
+
 fn write_component_archive(
     cx: &PackageContext<'_>,
-    cfg: &CpackConfig,
     path: &Path,
-    root: &Path,
+    prefix: &Path,
+    components: &[BString],
     options: &CreateOptions,
 ) -> Result<(), CpackError> {
-    let inputs = if cfg.on(b"CPACK_COMPONENT_INCLUDE_TOPLEVEL_DIRECTORY") {
-        let prefix = safe_name(cx.file_name)?;
-        children(cx.host, &root.join(&prefix))?
-            .into_iter()
-            .map(|name| prefix.join(name))
-            .collect()
-    } else {
-        children(cx.host, root)?
+    let mut roots = components
+        .iter()
+        .map(|name| cx.staging_dir.join(crate::stage::component_dir(name)));
+    let first = roots
+        .next()
+        .ok_or_else(|| error("CPack component group is empty"))?;
+    let component_inputs = |root: &Path| {
+        children(cx.host, &root.join(prefix))
+            .map(|files| files.into_iter().map(|file| prefix.join(file)))
     };
-    write_archive(cx, path, root, &inputs, options)
+    if roots.len() == 0 {
+        let inputs = component_inputs(&first)?.collect::<Vec<_>>();
+        return write_archive(cx, path, &first, &inputs, options);
+    }
+    let merged = component_workspace(cx)?;
+    let result: Result<(), CpackError> = (|| {
+        let mut seen = BTreeSet::new();
+        let mut inputs = Vec::new();
+        for root in std::iter::once(first).chain(roots) {
+            crate::source::merge_component(cx.host, &root, &merged)?;
+            inputs.extend(component_inputs(&root)?.filter(|file| seen.insert(file.clone())));
+        }
+        write_archive(cx, path, &merged, &inputs, options)
+    })();
+    let cleanup = cx.host.remove_dir_all(&merged);
+    result?;
+    cleanup?;
+    Ok(())
 }
 
 fn level_number<T: std::str::FromStr>(value: &[u8], variable: &str) -> Result<T, CpackError> {
@@ -290,14 +346,13 @@ fn level_number<T: std::str::FromStr>(value: &[u8], variable: &str) -> Result<T,
 }
 
 fn children(host: &dyn Host, path: &Path) -> Result<Vec<PathBuf>, CpackError> {
-    let mut paths: Vec<_> = host
-        .read_dir(path)?
+    let mut entries = host.read_dir(path)?;
+    entries.sort_unstable_by(|left, right| left.name.cmp(&right.name));
+    Ok(entries
         .into_iter()
         .filter(|entry| !entry.name.starts_with(b"._"))
         .map(|entry| to_native(&entry.name))
-        .collect();
-    paths.sort();
-    Ok(paths)
+        .collect())
 }
 
 fn archive_path(
