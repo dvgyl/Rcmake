@@ -678,6 +678,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "rcmake-fortran"
+version = "0.1.0"
+dependencies = [
+ "rcmake-base",
+]
+
+[[package]]
 name = "rcmake-fuzz"
 version = "0.1.0"
 dependencies = [
@@ -860,6 +867,18 @@ dependencies = [
  "rcmake-json",
  "rcmake-model",
  "thiserror",
+]
+
+[[package]]
+name = "rcmake-store"
+version = "0.1.0"
+dependencies = [
+ "rcmake-base",
+ "rcmake-host",
+ "serde",
+ "serde_json",
+ "sha2",
+ "zstd",
 ]
 
 [[package]]
