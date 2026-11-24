@@ -802,7 +802,11 @@ fn toolchain_variable(name: &[u8]) -> bool {
                 .any(|part| part == b"_LINKER_FLAGS")
         || matches!(
             name,
-            b"CMAKE_SYSTEM" | b"CMAKE_AR" | b"CMAKE_RANLIB" | b"CMAKE_MAKE_PROGRAM"
+            b"CMAKE_SYSTEM"
+                | b"CMAKE_AR"
+                | b"CMAKE_RANLIB"
+                | b"CMAKE_MAKE_PROGRAM"
+                | b"_CMAKE_OSX_SYSROOT_PATH"
         )
 }
 
@@ -831,6 +835,17 @@ impl TryCompileSeed {
             "CMAKE_GENERATOR",
         ] {
             seed_var(cx, &mut defines, name.as_bytes());
+        }
+        if cx.var_or_empty(b"CMAKE_SYSTEM_NAME") == b"Darwin" {
+            let sysroot = cx.var_or_empty(b"CMAKE_OSX_SYSROOT");
+            let resolved = cx.var_or_empty(b"_CMAKE_OSX_SYSROOT_PATH");
+            if !sysroot.contains(&b'/') && !resolved.is_empty() {
+                defines.push(CacheDefine {
+                    name: "CMAKE_OSX_SYSROOT".into(),
+                    ty: Some(CacheType::Path),
+                    value: resolved,
+                });
+            }
         }
         for language in ["C", "CXX"] {
             let compiler = format!("CMAKE_{language}_COMPILER");
@@ -1031,18 +1046,25 @@ impl DirectBuild {
             ) {
                 platform_flags.extend(["-arch".into(), arch]);
             }
-            for (name, prefix) in [
-                (b"CMAKE_OSX_SYSROOT".as_slice(), b"-isysroot".as_slice()),
-                (b"CMAKE_OSX_DEPLOYMENT_TARGET", b"-mmacosx-version-min="),
-            ] {
-                let value = cx.var_or_empty(name);
-                if !value.is_empty() {
-                    if prefix == b"-isysroot" {
-                        platform_flags.extend([prefix.into(), value]);
-                    } else {
-                        platform_flags.push([prefix, value.as_slice()].concat().into());
-                    }
+            let sysroot = {
+                let raw = cx.var_or_empty(b"CMAKE_OSX_SYSROOT");
+                if raw.contains(&b'/') {
+                    raw
+                } else {
+                    let resolved = cx.var_or_empty(b"_CMAKE_OSX_SYSROOT_PATH");
+                    if !resolved.is_empty() { resolved } else { raw }
                 }
+            };
+            if !sysroot.is_empty() {
+                platform_flags.extend(["-isysroot".into(), sysroot]);
+            }
+            let deploy = cx.var_or_empty(b"CMAKE_OSX_DEPLOYMENT_TARGET");
+            if !deploy.is_empty() {
+                platform_flags.push(
+                    [b"-mmacosx-version-min=".as_slice(), deploy.as_slice()]
+                        .concat()
+                        .into(),
+                );
             }
         } else {
             let sysroot = cx.var_or_empty(b"CMAKE_SYSROOT");

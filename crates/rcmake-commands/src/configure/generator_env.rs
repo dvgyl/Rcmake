@@ -85,6 +85,19 @@ pub(super) fn initialize(cx: &mut Cx<'_>, generator: GeneratorKind) -> Result<()
             if let Some(toolset) = toolset {
                 cx.set_var(b"CMAKE_XCODE_PLATFORM_TOOLSET", toolset.clone());
             }
+            if !cx
+                .var(b"CMAKE_MAKE_PROGRAM")
+                .is_some_and(|v| !v.is_empty() && !rcmake_base::truth::is_off(&v))
+                && let Some(xcodebuild) = find_xcodebuild(cx)
+            {
+                add_cache(
+                    cx,
+                    b"CMAKE_MAKE_PROGRAM",
+                    xcodebuild,
+                    CacheType::Filepath,
+                    "Path to a program.",
+                );
+            }
         }
         (GeneratorKind::VisualStudio(version), ParsedToolset::Vs(toolset)) => {
             let (default_platform, default_host) = match cx.host().system().machine.as_slice() {
@@ -95,12 +108,17 @@ pub(super) fn initialize(cx: &mut Cx<'_>, generator: GeneratorKind) -> Result<()
             let platform = spec
                 .parsed_platform
                 .as_ref()
-                .and_then(|platform| platform.name.clone());
+                .and_then(|platform| platform.name.clone())
+                .unwrap_or_else(|| default_platform.into());
             cx.set_var(b"MSVC_IDE", "1".into());
             cx.set_var(b"CMAKE_VS_PLATFORM_NAME_DEFAULT", default_platform.into());
-            cx.set_var(
+            cx.set_var(b"CMAKE_VS_PLATFORM_NAME", platform.clone());
+            add_cache(
+                cx,
                 b"CMAKE_VS_PLATFORM_NAME",
-                platform.unwrap_or_else(|| default_platform.into()),
+                platform,
+                CacheType::Internal,
+                "Name of generator platform.",
             );
             cx.set_var(
                 b"CMAKE_VS_PLATFORM_TOOLSET",
@@ -118,6 +136,33 @@ pub(super) fn initialize(cx: &mut Cx<'_>, generator: GeneratorKind) -> Result<()
     }
     cx.project().generator_spec = spec;
     Ok(())
+}
+
+fn find_xcodebuild(cx: &Cx<'_>) -> Option<BString> {
+    let host = cx.host();
+    if let Some(path_env) = host.env_get(b"PATH") {
+        let sep = if cfg!(windows) { b';' } else { b':' };
+        for dir in path_env.split(|&b| b == sep) {
+            if dir.is_empty() {
+                continue;
+            }
+            let candidate = rcmake_host::path::to_native(dir).join("xcodebuild");
+            if host
+                .metadata(&candidate, rcmake_host::Follow::Yes)
+                .is_ok_and(|meta| meta.kind == rcmake_host::FileKind::File)
+            {
+                return Some(rcmake_host::path::from_native(&candidate));
+            }
+        }
+    }
+    let fallback = std::path::Path::new("/usr/bin/xcodebuild");
+    if host
+        .metadata(fallback, rcmake_host::Follow::Yes)
+        .is_ok_and(|meta| meta.kind == rcmake_host::FileKind::File)
+    {
+        return Some(rcmake_host::path::from_native(fallback));
+    }
+    None
 }
 
 fn xcode_version(cx: &mut Cx<'_>) -> Option<XcodeVersion> {
