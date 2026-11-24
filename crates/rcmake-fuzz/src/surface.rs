@@ -21,11 +21,13 @@ pub enum Surface {
     Archive,
     /// `rcmake-base`: lexical `cmake_path` and list operations.
     Path,
+    /// `rcmake-syntax`: recover syntax from an editor buffer.
+    Tolerant,
 }
 
 impl Surface {
-    /// All surfaces, in ADR-016 order.
-    pub const ALL: [Self; 9] = [
+    /// All surfaces, with the original ADR-016 surfaces first.
+    pub const ALL: [Self; 10] = [
         Self::Syntax,
         Self::Expr,
         Self::Regex,
@@ -35,6 +37,7 @@ impl Surface {
         Self::Cps,
         Self::Archive,
         Self::Path,
+        Self::Tolerant,
     ];
 
     /// Command-line name of the surface.
@@ -50,6 +53,7 @@ impl Surface {
             Self::Cps => "cps",
             Self::Archive => "archive",
             Self::Path => "path",
+            Self::Tolerant => "tolerant",
         }
     }
 

@@ -6,6 +6,15 @@ mod expr;
 mod genex;
 mod lexical;
 mod syntax;
+mod tolerant;
+
+// For W0, add both lines under [dependencies] in crates/rcmake-fuzz/Cargo.toml.
+// rcmake-fortran.workspace = true
+// rcmake-store.workspace = true
+// Then register fortran and store_frame here and add their Surface entries.
+// Register binfmt when rcmake-base exports the binfmt module.
+// Register diagnostics when rcmake-diag exports annotate, rich, and suggest
+// and adds the annotations field to Diagnostic.
 
 use std::path::{Path, PathBuf};
 
@@ -29,6 +38,7 @@ pub(super) fn run(surface: Surface, seed: u64) -> Check {
         Surface::Cps => documents::cps(&mut rng, &limits),
         Surface::Archive => archive::check(&mut rng, &limits),
         Surface::Path => lexical::path_list(&mut rng, &limits),
+        Surface::Tolerant => tolerant::check(&mut rng),
     }
 }
 
@@ -102,7 +112,7 @@ mod tests {
     use crate::{FuzzOptions, options::DEFAULT_BUDGET, run as run_surface};
 
     #[test]
-    fn runs_all_nine_surfaces_with_fixed_seeds() -> Result<(), String> {
+    fn runs_all_surfaces_with_fixed_seeds() -> Result<(), String> {
         for surface in Surface::ALL {
             let report = run_surface(&FuzzOptions {
                 surface,
