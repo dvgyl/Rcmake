@@ -148,10 +148,7 @@ fn parse_option<'a>(arg: &'a [u8], opts: &mut TarOptions<'a>, cx: &ToolCtx<'_>) 
                 ));
             }
         })
-    } else if let Some(level) = arg
-        .strip_prefix(b"--cmake-tar-compression-level=")
-        .or_else(|| arg.strip_prefix(b"--cmake-compression-level="))
-    {
+    } else if let Some(level) = arg.strip_prefix(b"--cmake-tar-compression-level=") {
         opts.level = Some(parse_integer(b"compression-level", level, cx)?);
         None
     } else if let Some(threads) = arg.strip_prefix(b"--cmake-tar-threads=") {
@@ -392,7 +389,8 @@ fn archive_format(opts: &TarOptions<'_>) -> Result<ArchiveFormat, String> {
             Compression::Lzma => Ok(ArchiveFormat::ZipCompressed(ZipCompression::Lzma)),
             Compression::Xz => Ok(ArchiveFormat::ZipCompressed(ZipCompression::Xz)),
             Compression::Zstd => Ok(ArchiveFormat::ZipCompressed(ZipCompression::Zstd)),
-            _ => Err(String::from(
+            Compression::Ppmd => Err(String::from("CMake Error: PPMd is not supported for zip\n")),
+            Compression::Compress => Err(String::from(
                 "CMake Error: The archive backend does not support the requested ZIP compression method\n",
             )),
         };
@@ -551,7 +549,7 @@ fn extract(
 mod tests {
     use std::path::Path;
 
-    use rcmake_host::{Host, PureHost};
+    use rcmake_host::{Host, HostResult, PureHost};
 
     use super::*;
 
@@ -570,17 +568,17 @@ mod tests {
         for (flags, options, magic) in [
             (
                 "cjf",
-                &["--cmake-tar-compression-level=1"][..],
+                ["--cmake-tar-compression-level=1"].as_slice(),
                 b"BZh1".as_slice(),
             ),
-            ("cJf", &["--format=gnutar"][..], b"\xfd7zXZ\0"),
-            ("cf", &["--lzma"][..], b"\x5d\0\0\x80\0"),
+            ("cJf", ["--format=gnutar"].as_slice(), b"\xfd7zXZ\0"),
+            ("cf", ["--lzma"].as_slice(), b"\x5d\0\0\x80\0"),
             (
                 "cf",
-                &["--zstd", "--cmake-compression-level=19"][..],
+                ["--zstd", "--cmake-tar-compression-level=19"].as_slice(),
                 b"\x28\xb5\x2f\xfd",
             ),
-            ("cZf", &[][..], b"\x1f\x9d\x90"),
+            ("cZf", [].as_slice(), b"\x1f\x9d\x90"),
         ] {
             host.seed_file(&input, b"contents")?;
             let args = ["tar", flags, "archive"]
@@ -598,6 +596,71 @@ mod tests {
             }
             assert_eq!(host.read(&input, read_all())?, b"contents");
         }
+        Ok(())
+    }
+
+    #[test]
+    fn tar_rejects_short_compression_level_option() -> HostResult<()> {
+        for level in ["9", "", "invalid"] {
+            let option = format!("--cmake-compression-level={level}");
+            assert_tar_create_error(
+                &[&option],
+                &format!("CMake Error: Unknown option to -E tar: {option}\n"),
+            )?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn tar_checks_zip_ppmd_level_before_rejecting_method() -> HostResult<()> {
+        let unsupported = "CMake Error: PPMd is not supported for zip\nCMake Error: Problem creating tar:\n  archive\n";
+        for (level, diagnostic) in [
+            (
+                -1,
+                "CMake Error: Compression level must be between 0 and 9. Got -1\n",
+            ),
+            (0, unsupported),
+            (9, unsupported),
+            (
+                10,
+                "CMake Error: Compression level must be between 0 and 9. Got 10\n",
+            ),
+        ] {
+            assert_tar_create_error(
+                &[
+                    "--format=zip",
+                    "--cmake-tar-compression-method=ppmd",
+                    &format!("--cmake-tar-compression-level={level}"),
+                ],
+                diagnostic,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn assert_tar_create_error(options: &[&str], diagnostic: &str) -> HostResult<()> {
+        let cwd = to_native(if cfg!(windows) { b"C:/work" } else { b"/work" });
+        let host = PureHost::new(cwd.clone(), cwd.join("cmake"));
+        host.seed_file(&cwd.join("input"), b"contents")?;
+        let cx = ToolCtx {
+            host: &host,
+            cwd: &cwd,
+            exe_display: b"cmake",
+            capabilities: &|| rcmake_json::Value::Null,
+        };
+        let args = ["tar", "cf", "archive"]
+            .into_iter()
+            .chain(options.iter().copied())
+            .chain(["input"])
+            .map(BString::from)
+            .collect::<Vec<_>>();
+        assert_eq!(crate::run(&args, &cx), 1, "{options:?}");
+        assert_eq!(
+            host.stream_bytes(Stream::Stderr).as_slice(),
+            diagnostic.as_bytes(),
+            "{options:?}"
+        );
+        assert!(host.stream_bytes(Stream::Stdout).is_empty(), "{options:?}");
         Ok(())
     }
 }
