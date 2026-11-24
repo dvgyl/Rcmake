@@ -208,10 +208,8 @@ fn damaged_mirror_repairs_online_and_can_be_used_as_an_immutable_snapshot() {
     assert_eq!(mirror.prefetch(repo, &pin).unwrap(), mirror_path);
 
     let tree = git(&host, &upstream, &["rev-parse", "HEAD^{tree}"]);
-    let tree_object = mirror_path
-        .join("objects")
-        .join(&tree[..2])
-        .join(&tree[2..]);
+    let (shard, object) = tree.split_at_checked(2).unwrap();
+    let tree_object = mirror_path.join("objects").join(shard).join(object);
     host.remove_file(&tree_object).unwrap();
     host.env_set(b"RCMAKE_FETCH_OFFLINE", Some(b"1"));
     assert!(

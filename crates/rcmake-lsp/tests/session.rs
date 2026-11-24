@@ -596,6 +596,11 @@ fn lifecycle_rejects_early_requests_and_reports_exit_without_shutdown() {
 
 #[test]
 fn l0_open_latency_on_two_thousand_lines() {
+    #[cfg(debug_assertions)]
+    const BUDGET_MS: u64 = 50;
+    #[cfg(not(debug_assertions))]
+    const BUDGET_MS: u64 = 5;
+
     let host = host();
     let clock = NativeHost::new().unwrap();
     let text: String = (0..2000)
@@ -611,7 +616,7 @@ fn l0_open_latency_on_two_thousand_lines() {
     samples.sort_unstable();
     let median = samples.get(4).unwrap();
     assert!(
-        *median < Duration::from_millis(5),
-        "Median L0 open time exceeded 5 ms. Samples {samples:?}"
+        *median < Duration::from_millis(BUDGET_MS),
+        "Median L0 open time reached or exceeded {BUDGET_MS} ms. Samples {samples:?}"
     );
 }

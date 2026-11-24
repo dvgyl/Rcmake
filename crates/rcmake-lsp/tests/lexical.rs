@@ -162,7 +162,9 @@ fn tokens(server: &mut Server<'_>, text: &str) -> Vec<(usize, String, usize)> {
     let mut character = 0;
     let source: Vec<_> = text.lines().collect();
     array(get(&response, "data"))
-        .chunks_exact(5)
+        .as_chunks::<5>()
+        .0
+        .iter()
         .map(|values| {
             let delta_line = number(&values[0]);
             if delta_line > 0 {

@@ -308,16 +308,17 @@ fn attach_blobs(
         } else if store.writable()
             && let Some(bytes) = load_blob(digest, *remaining)?
         {
-            decode_blob(&bytes, digest, remaining)?;
-            store
-                .publish(&path, &bytes, false)
+            let size = decode_blob(&bytes, digest, remaining)?;
+            let locked = store.lock_cache(Duration::ZERO).map_err(|_| LOCAL_STORE)?;
+            locked
+                .put_blob(digest, &path, &bytes, size)
                 .map_err(|_| LOCAL_STORE)?;
         } else {
             return Ok(false);
         }
     }
     if store.writable() {
-        publish_pinned(store, pin, encoded).map_err(|_| LOCAL_STORE)?;
+        return publish_pinned(store, pin, encoded).map_err(|_| LOCAL_STORE);
     }
     Ok(true)
 }
@@ -325,17 +326,18 @@ fn publish_pinned(
     store: &Store<'_>,
     pin: &ManifestEntry,
     encoded: &[u8],
-) -> rcmake_host::HostResult<()> {
-    store.ensure_dir(&store.config.root)?;
-    let lock = store.gc_lock_path()?;
-    let _guard = store.host.lock_file(&lock, Some(Duration::ZERO))?;
+) -> rcmake_host::HostResult<bool> {
+    let locked = store.lock_cache(Duration::ZERO)?;
     for &digest in &pin.blobs {
         if store.file_metadata(&store.blob_path(digest))?.is_none() {
-            return Ok(());
+            return Ok(false);
         }
     }
     let path = store.entry_path(pin.kind.domain(), pin.key);
-    store.publish(&path, encoded, false).map(|_| ())
+    if store.file_metadata(&path)?.is_none() {
+        locked.publish(&path, encoded, false)?;
+    }
+    Ok(true)
 }
 
 fn read_frame(store: &Store<'_>, path: &Path, limit: usize) -> FrameResult {
@@ -354,7 +356,7 @@ fn read_frame(store: &Store<'_>, path: &Path, limit: usize) -> FrameResult {
         Err(_) => Err(LOCAL_STORE),
     }
 }
-fn decode_blob(encoded: &[u8], digest: Digest, budget: &mut usize) -> Result<(), RemoteError> {
+fn decode_blob(encoded: &[u8], digest: Digest, budget: &mut usize) -> Result<usize, RemoteError> {
     if encoded.len() as u64 > frame::disk_limit(*budget) {
         return Err(RESPONSE_LIMIT);
     }
@@ -364,7 +366,7 @@ fn decode_blob(encoded: &[u8], digest: Digest, budget: &mut usize) -> Result<(),
     if Digest::hash(&bytes) != digest {
         return Err(RemoteError::Failure("Blob SHA-256 verification failed."));
     }
-    Ok(())
+    Ok(bytes.len())
 }
 
 /// Remote write policy. Both modes permit reads.

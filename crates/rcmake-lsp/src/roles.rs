@@ -348,7 +348,7 @@ impl<'a> Arguments<'a> {
             {
                 INSTALL_TARGET_OPTIONS
             }
-            (b"build_command", 1..) if index % 2 != 0 => from_ref(&TARGET),
+            (b"build_command", 1..) if !index.is_multiple_of(2) => from_ref(&TARGET),
             (b"include", 1..) if arg(command, index - 1) != b"RESULT_VARIABLE" => INCLUDE_FLAGS,
             (b"add_subdirectory", 1..) => &[
                 (

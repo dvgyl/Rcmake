@@ -638,7 +638,7 @@ pub(crate) fn completion<'a>(
         comment.contains(&offset)
             || (comment.end == offset
                 && lexical::bracket(
-                    &doc.text.as_bytes().get(..offset).unwrap_or_default(),
+                    doc.text.as_bytes().get(..offset).unwrap_or_default(),
                     comment.start + 1,
                 )
                 .is_none_or(|(end, content)| end == content.end))

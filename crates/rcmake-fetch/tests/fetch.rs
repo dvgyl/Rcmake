@@ -291,7 +291,7 @@ fn pool_deduplicates_pins_and_populates_store() {
     let path = config()
         .root
         .join("blobs")
-        .join(&digest[..2])
+        .join(digest.get(..2).unwrap())
         .join(format!("{digest}.blob"));
     host.remove_file(&path).unwrap();
     pool.submit(source).unwrap().wait().unwrap();
@@ -319,10 +319,16 @@ fn store_write_errors_leave_verified_downloads_usable_in_each_lock_mode() {
     assert!(
         matches!(result.cache_warning, Some(FetchError::Archive { cause, .. }) if matches!(*cause, FetchError::Host(_) | FetchError::CacheRead { .. }))
     );
-    assert!(matches!(
-        cache.fetch_with(URL, Some(&expected), || Ok(b"invalid".to_vec())),
-        Err(FetchError::Archive { cause, .. }) if matches!(*cause, FetchError::HashMismatch { .. })
-    ));
+    let error = cache
+        .fetch_with(URL, Some(&expected), || Ok(b"invalid".to_vec()))
+        .unwrap_err();
+    assert!(
+        matches!(&error, FetchError::Archive { cause, .. }
+            if matches!(cause.as_ref(), FetchError::CacheAndDownload { cache, download }
+                if matches!(cache.as_ref(), FetchError::CacheRead { path, .. } if path == bad_root)
+                    && matches!(download.as_ref(), FetchError::HashMismatch { .. }))),
+        "{error}"
+    );
 
     let mut update = LockSession::open(&host, Path::new("/work"), LockMode::Update).unwrap();
     let (result, warning) = update
@@ -772,7 +778,7 @@ fn archive_offline_error_names_the_corrupt_cache_object() {
     let object = config
         .root
         .join("blobs")
-        .join(&hex[..2])
+        .join(hex.get(..2).unwrap())
         .join(format!("{hex}.blob"));
     host.write(&object, b"invalid frame", WriteMode::Truncate)
         .unwrap();

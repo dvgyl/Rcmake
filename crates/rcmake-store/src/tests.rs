@@ -26,6 +26,52 @@ fn entry(payload: &str) -> Entry<String> {
 }
 
 #[test]
+fn remote_seed_imports_a_blob_and_reuses_it_on_retry() -> Result<(), Box<dyn std::error::Error>> {
+    use crate::remote::{CacheEntryKind, RemoteError, export_blob, export_entry};
+
+    let host = host();
+    let source = store(&host)?;
+    let destination = Store::new(
+        &host,
+        StoreConfig::new(host.initial_cwd().join("destination")),
+    )?;
+    let payload = b"probe output";
+    let digest = source.put_blob(payload)?;
+    let key = Domain::ProbeV1.key(b"probe inputs");
+    let mut entry = entry("probe result");
+    entry.blobs.push(digest);
+    assert_eq!(
+        source.put_entry(Domain::ProbeV1, key, &entry)?,
+        PublishOutcome::Published
+    );
+    let (pin, frame) = export_entry(&source, CacheEntryKind::Probe, key)?
+        .ok_or("The source must contain the probe entry.")?;
+    let imported: Option<Entry<String>> = pin.seed(
+        &destination,
+        &frame,
+        &entry.trace,
+        |candidate| candidate == &entry,
+        |digest, _| export_blob(&source, digest),
+    )?;
+    assert_eq!(imported.as_ref(), Some(&entry));
+    assert_eq!(
+        destination.get_blob(digest)?.as_deref(),
+        Some(payload.as_slice())
+    );
+    assert_eq!(destination.get_entry(Domain::ProbeV1, key)?, imported);
+
+    let retried: Option<Entry<String>> = pin.seed(
+        &destination,
+        &frame,
+        &entry.trace,
+        |candidate| candidate == &entry,
+        |_, _| Err(RemoteError::Failure("Expected a local blob.")),
+    )?;
+    assert_eq!(retried, imported);
+    Ok(())
+}
+
+#[test]
 fn digest_hex_and_domains() -> Result<(), Box<dyn std::error::Error>> {
     let digest = Digest::hash(b"abc");
     let hex = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";

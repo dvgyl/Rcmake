@@ -6,6 +6,7 @@
 mod digest;
 mod frame;
 mod gc;
+pub mod remote;
 mod stamp;
 
 use std::io::{self, ErrorKind};
