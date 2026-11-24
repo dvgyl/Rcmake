@@ -149,7 +149,7 @@ impl<'a> Options<'a> {
             Some(b"GROUP") => Mode::Group,
             Some(mode) => {
                 let body: BString = format!(
-                    "Invalid UNITY_BUILD_MODE value of {} assigned to target {}.\n  Acceptable values are BATCH and GROUP.",
+                    "Invalid UNITY_BUILD_MODE value of {} assigned to target {}. Acceptable values are BATCH and GROUP.",
                     BString::from(mode), target.name
                 ).into();
                 paths.emit(
@@ -158,7 +158,7 @@ impl<'a> Options<'a> {
                     generation_location(model, target),
                     body.clone(),
                 );
-                return Err(ResolveError::Message(body));
+                return Err(ResolveError::Reported(body));
             }
         };
         let code = |key: &[u8]| target.props.get(key).filter(|value| !value.is_empty());
@@ -237,6 +237,7 @@ pub(crate) fn prepare(
     paths: &mut SourcePaths<'_>,
     configs: &[ConfigId],
 ) -> Result<UnityPlan, ResolveError> {
+    crate::file_sets::validate_membership(model, paths, configs)?;
     let mut candidates = model
         .targets()
         .filter(|(_, target)| enabled(target))

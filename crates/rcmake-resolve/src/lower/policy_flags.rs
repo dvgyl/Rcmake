@@ -5,6 +5,7 @@ use rcmake_host::{Host, Stream};
 use rcmake_model::{ProjectModel, Target, TargetKind};
 
 use super::{definition, target_property};
+use crate::ResolveError;
 
 pub(super) struct Flags<'a> {
     model: &'a ProjectModel,
@@ -46,6 +47,22 @@ impl<'a> Flags<'a> {
         let mut flags = Vec::new();
         if ipo {
             self.extend(&mut flags, b"COMPILE_OPTIONS_IPO");
+        }
+        if let Some(color) = definition(self.model, self.target.dir, b"CMAKE_COLOR_DIAGNOSTICS")
+            .filter(|value| {
+                !value.is_empty()
+                    && !value.ends_with(b"-NOTFOUND")
+                    && value.as_slice() != b"NOTFOUND"
+            })
+        {
+            self.extend(
+                &mut flags,
+                if truth::is_on(color) {
+                    b"COMPILE_OPTIONS_COLOR_DIAGNOSTICS"
+                } else {
+                    b"COMPILE_OPTIONS_COLOR_DIAGNOSTICS_OFF"
+                },
+            );
         }
         let pic = position_independent
             .or_else(|| self.position_independent())
@@ -90,6 +107,27 @@ impl<'a> Flags<'a> {
             self.extend(&mut flags, b"LINK_OPTIONS_IPO");
         }
         flags
+    }
+
+    pub(super) fn validate_visibility(&self) -> Result<(), ResolveError> {
+        if self.option(b"COMPILE_OPTIONS_VISIBILITY").is_none() {
+            return Ok(());
+        }
+        let key = [self.language, b"_VISIBILITY_PRESET"].concat();
+        let Some(value) = self.target.props.get(&key) else {
+            return Ok(());
+        };
+        if matches!(
+            value.as_slice(),
+            b"default" | b"hidden" | b"protected" | b"internal"
+        ) {
+            return Ok(());
+        }
+        Err(ResolveError::Message(format!(
+            "CMake Error: Target {} uses unsupported value \"{value}\" for {}. The supported values are: default, hidden, protected, and internal.",
+            self.target.name,
+            BString::from(key)
+        ).into()))
     }
 
     pub(super) fn pie_link(&self, position_independent: Option<bool>) -> Vec<BString> {

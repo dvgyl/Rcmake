@@ -2,14 +2,18 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use indexmap::IndexMap;
+
 use crate::{
-    BuildGraph, BuildStep, ResolveError,
+    BuildGraph, BuildStep, ResolveError, ResolvedTarget,
+    sources::{SourcePaths, properties},
     usage::{UsageResolver, handle},
 };
 use rcmake_base::{BString, list, path_lex::Lexical};
-use rcmake_genex::{ConfigId, EvalContext, PreprocessMode, evaluate, parse, strip};
+use rcmake_diag::{Backtrace, Location, MessageKind};
+use rcmake_genex::{ConfigId, EvalContext};
 use rcmake_host::{FileKind, Follow, Host, path::to_native};
-use rcmake_model::{FileSet, InstallOptions, ProjectModel, Target};
+use rcmake_model::{BT, DirId, FileSet, InstallOptions, ProjectModel, Target};
 
 /// Get the install options for a named file set in one install rule.
 pub fn options_for_set(model: &ProjectModel, index: usize, name: &[u8]) -> Option<InstallOptions> {
@@ -79,6 +83,88 @@ pub fn set_files(
     set: &FileSet,
     config: &ConfigId,
 ) -> Result<BTreeMap<BString, Vec<(BString, BString)>>, ResolveError> {
+    map_set_files(model, usage, target, set, config, |_, body| {
+        ResolveError::Message(body)
+    })
+}
+
+pub(crate) fn validate_membership(
+    model: &ProjectModel,
+    paths: &SourcePaths<'_>,
+    configs: &[ConfigId],
+) -> Result<(), ResolveError> {
+    let mut usage = UsageResolver::new(model).with_ide(paths.ide);
+    for (_, target) in model.targets().filter(|(_, target)| !target.is_imported()) {
+        for set in target.file_sets.iter().filter_map(|&id| model.file_set(id)) {
+            for config in configs {
+                map_set_files(model, &mut usage, target, set, config, |backtrace, body| {
+                    paths.emit(
+                        model,
+                        MessageKind::Error,
+                        Location::Backtrace(backtrace.clone()),
+                        body.clone(),
+                    );
+                    ResolveError::Reported(body)
+                })?;
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_source_includes(
+    model: &ProjectModel,
+    usage: &mut UsageResolver<'_>,
+    target: &Target,
+    resolved: &ResolvedTarget,
+) -> Result<(), ResolveError> {
+    let dir = model.dir(target.dir);
+    for unit in &resolved.compile_units {
+        let Some(group) = resolved.compile_groups.get(unit.group) else {
+            continue;
+        };
+        let Some(raw) = properties(dir, &unit.source.value).get(b"INCLUDE_DIRECTORIES") else {
+            continue;
+        };
+        let context = EvalContext {
+            config: resolved.config.clone(),
+            language: Some(group.language.clone()),
+            head: Some(handle(resolved.id)),
+            ..EvalContext::default()
+        };
+        let includes = usage.file_set_paths(
+            resolved.id,
+            b"INCLUDE_DIRECTORIES",
+            &[BT::new(raw.clone(), unit.source.backtrace.clone())],
+            &context,
+        )?;
+        if let Some(relative) = includes
+            .iter()
+            .find(|path| !Lexical::new(&path.value).absolute())
+        {
+            let root = Lexical::new(&model.dir(DirId::ROOT).source_dir);
+            let source = Lexical::new(&dir.source_dir);
+            let file = Lexical::new(&source.append(b"CMakeLists.txt"))
+                .relative(root)
+                .unwrap_or_else(|| source.append(b"CMakeLists.txt"));
+            let filename = Lexical::new(&unit.source.value).filename();
+            return Err(ResolveError::Message(format!(
+                "CMake Error in {file}:\n  Found relative path while evaluating include directories of \"{}\":\n\n    \"{}\"\n",
+                BString::from(filename), relative.value
+            ).into()));
+        }
+    }
+    Ok(())
+}
+
+fn map_set_files(
+    model: &ProjectModel,
+    usage: &mut UsageResolver<'_>,
+    target: &Target,
+    set: &FileSet,
+    config: &ConfigId,
+    error: impl Fn(&Backtrace, BString) -> ResolveError,
+) -> Result<BTreeMap<BString, Vec<(BString, BString)>>, ResolveError> {
     let handle = handle(set.target);
     let context = EvalContext {
         config: config.clone(),
@@ -87,51 +173,59 @@ pub fn set_files(
         ..EvalContext::default()
     };
     let source = Lexical::new(&model.dir(target.dir).source_dir);
-    let mut expand = |items: &[rcmake_model::BT<BString>]| {
-        let mut paths = Vec::new();
-        for item in items {
-            let ast = strip(&parse(&item.value)?, PreprocessMode::Build);
-            let (value, _) = evaluate(&ast, &context, &mut usage.host(target.dir))?;
-            paths.extend(
-                list::split(&value, list::Empty::Drop)
-                    .into_iter()
-                    .map(|path| Lexical::new(&source.append(&path)).normalize()),
-            );
-        }
-        Ok::<_, ResolveError>(paths)
-    };
-    let mut bases = expand(&set.base_dirs)?;
+    let mut bases = IndexMap::<BString, BString>::new();
     if set.base_dirs.is_empty() {
-        bases.push(model.dir(target.dir).source_dir.clone());
+        let dir = &model.dir(target.dir).source_dir;
+        bases.insert(Lexical::new(dir).normalize(), dir.clone());
+    }
+    for base in usage.file_set_paths(set.target, b"BASE_DIRS", &set.base_dirs, &context)? {
+        let path = source.append(&base.value);
+        let normalized = Lexical::new(&path).normalize();
+        for (prior, spelling) in &bases {
+            if relative_member(prior, &normalized).is_some()
+                || relative_member(&normalized, prior).is_some()
+            {
+                return Err(error(
+                    &base.backtrace,
+                    format!("Base directories in file set cannot be subdirectories of each other:\n\n  {spelling}\n  {path}").into(),
+                ));
+            }
+        }
+        bases.entry(normalized).or_insert(path);
     }
     let mut roots: BTreeMap<_, Vec<_>> = bases
-        .iter()
+        .keys()
         .cloned()
         .map(|base| (base, Vec::new()))
         .collect();
-    for file in expand(&set.files)? {
+    for file in usage.file_set_paths(set.target, b"SOURCES", &set.files, &context)? {
+        let path = source.append(&file.value);
+        let normalized = Lexical::new(&path).normalize();
         let (base, relative) = bases
-            .iter()
-            .find_map(|base| {
-                let relative = Lexical::new(&file).relative(Lexical::new(base))?;
-                (!matches!(relative.as_slice(), b"." | b"..") && !relative.starts_with(b"../"))
-                    .then_some((base, relative))
-            })
+            .keys()
+            .find_map(|base| relative_member(base, &normalized).map(|relative| (base, relative)))
             .ok_or_else(|| {
-                ResolveError::Message(
-                    format!(
-                        "File \"{file}\" is outside the base directories of file set \"{}\".",
-                        set.name
-                    )
-                    .into(),
-                )
+                let mut body = BString::from(format!(
+                    "File:\n\n  {path}\n\nmust be in one of the file set's base directories:\n"
+                ));
+                for base in bases.values() {
+                    body.extend_from_slice(b"\n  ");
+                    body.extend_from_slice(base);
+                }
+                error(&file.backtrace, body)
             })?;
         let files = roots.entry(base.clone()).or_default();
-        if !files.iter().any(|(known, _)| known == &file) {
-            files.push((file, relative));
+        if !files.iter().any(|(known, _)| known == &normalized) {
+            files.push((normalized, relative));
         }
     }
     Ok(roots)
+}
+
+fn relative_member(base: &[u8], path: &[u8]) -> Option<BString> {
+    let relative = Lexical::new(path).relative(Lexical::new(base))?;
+    (!matches!(relative.as_slice(), b"." | b"..") && !relative.starts_with(b"../"))
+        .then_some(relative)
 }
 
 fn clang_tidy_fixes_directory(

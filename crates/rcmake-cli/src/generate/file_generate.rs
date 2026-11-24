@@ -2,8 +2,8 @@ use std::collections::HashMap;
 
 use jiff::{Timestamp, fmt::strtime, tz::TimeZone};
 
-use rcmake_base::BString;
-use rcmake_diag::{Backtrace, Frame, FrameKind, PolicyId, PolicyStatus};
+use rcmake_base::{BString, list, truth};
+use rcmake_diag::{Backtrace, Frame, FrameKind, PolicyId, PolicyStatus, format_paragraphs};
 use rcmake_gen_common::{
     GenError,
     export::{
@@ -12,7 +12,7 @@ use rcmake_gen_common::{
     },
 };
 use rcmake_genex::{ConfigId, EvalContext, EvalSite, GenexHost, evaluate, parse};
-use rcmake_host::{Host, path::to_native};
+use rcmake_host::{Host, Stream, path::to_native};
 use rcmake_model::{DirId, ProjectModel, PropertyMap};
 use rcmake_resolve::{
     GenerationResult,
@@ -65,10 +65,13 @@ pub(super) fn write(
         let [b"OUTPUT", output, input_kind, input, options @ ..] = args.as_slice() else {
             return Err(invalid_record());
         };
-        let use_directory = directory
+        let policy = directory
             .final_policies
             .as_ref()
-            .is_some_and(|policies| policies.get(PolicyId::new(70)) == PolicyStatus::New);
+            .map_or(PolicyStatus::Warn, |policies| {
+                policies.get(PolicyId::new(70))
+            });
+        let use_directory = policy == PolicyStatus::New;
         let mut request = FileGenerateRequest {
             input_base: if use_directory { source } else { &cwd },
             output_base: if use_directory { binary } else { &cwd },
@@ -84,7 +87,15 @@ pub(super) fn write(
             newline: FileGenerateNewline::Native,
         };
         apply_options(&mut request, options)?;
-        request_dirs.push((*id, origin(props, &section)));
+        if policy == PolicyStatus::Warn {
+            if !output.windows(2).any(|part| part == b"$<") {
+                warn_relative_path(model, host, *id, "OUTPUT", output);
+            }
+            if let FileGenerateInput::File(input) = request.input {
+                warn_relative_path(model, host, *id, "INPUT", input);
+            }
+        }
+        request_dirs.push((*id, origin(props, &section), policy));
         requests.push(request);
     }
 
@@ -93,36 +104,37 @@ pub(super) fn write(
         .map(std::ptr::from_ref)
         .zip(request_dirs)
         .collect();
-    let mut languages: Vec<_> = result
-        .metadata
-        .toolchains
-        .keys()
-        .map(|lang| Some(lang.as_slice()))
-        .collect();
-    if languages.is_empty() {
-        languages.push(None);
-    }
-    let contexts = result
-        .configs
+    let mut languages = props
+        .get(b"ENABLED_LANGUAGES")
+        .map_or_else(Vec::new, |value| list::split(value, list::Empty::Drop));
+    languages.retain(|language| language != "NONE");
+    let no_language = languages.is_empty().then_some(None);
+    let contexts = languages
         .iter()
-        .flat_map(|config| {
-            languages.iter().map(|&language| FileGenerateContext {
-                configuration: &config.0,
-                language,
-            })
+        .map(|language| Some(language.as_slice()))
+        .chain(no_language)
+        .flat_map(|language| {
+            result
+                .configs
+                .iter()
+                .map(move |config| FileGenerateContext {
+                    configuration: &config.0,
+                    language,
+                })
         })
         .collect::<Vec<_>>();
     let mut usage = UsageResolver::new(model);
     let objects = ObjectPaths::new(&result.targets);
     let root = &model.dir(DirId::ROOT).source_dir;
     let timestamp = |format: Option<&[u8]>, utc| format_timestamp(host, format, utc);
+    let mut condition_result: Option<BString> = None;
     let evaluate = |value: &[u8],
                     request: &FileGenerateRequest<'_>,
                     context: FileGenerateContext<'_>| {
-        let (dir, backtrace) = request_dirs
+        let (dir, backtrace, policy) = request_dirs
             .get(&std::ptr::from_ref(request))
             .ok_or_else(invalid_record)?;
-        let mut host = usage
+        let mut genex_host = usage
             .host(*dir)
             .with_object_paths(&objects)
             .with_clock(host, &timestamp);
@@ -133,7 +145,7 @@ pub(super) fn write(
         let target = request
             .target
             .map(|name| {
-                host.find_target(name).ok_or_else(|| {
+                genex_host.find_target(name).ok_or_else(|| {
                     error(format!("Unknown target \"{}\".", String::from_utf8_lossy(name)).into())
                 })
             })
@@ -149,13 +161,104 @@ pub(super) fn write(
             },
             ..EvalContext::default()
         };
-        parse(value)
-            .and_then(|ast| evaluate(&ast, &ctx, &mut host))
-            .map(|(value, _)| value)
-            .map_err(|err| GenError::Invalid(err.at(backtrace, root).to_string().into()))
+        let evaluate_value = |value: &[u8], host: &mut dyn GenexHost| {
+            parse(value)
+                .and_then(|ast| evaluate(&ast, &ctx, host))
+                .map(|(value, _)| value)
+                .map_err(|err| GenError::Invalid(err.at(backtrace, root).to_string().into()))
+        };
+        // The shared writer asks for the output name before the condition.
+        // Check the condition first and pass its result back to the writer.
+        if let Some(result) = condition_result.take() {
+            return Ok(result);
+        }
+        if std::ptr::eq(value, request.output) {
+            if let Some(condition) = request.condition {
+                let condition_value = evaluate_value(condition, &mut genex_host)?;
+                match condition_value.as_slice() {
+                    b"0" => {
+                        condition_result = Some(condition_value);
+                        return Ok(BString::default());
+                    }
+                    b"1" => condition_result = Some(condition_value),
+                    _ => {
+                        let message = format!(
+                            "Evaluation file condition \"{}\" did not evaluate to valid content. Got \"{condition_value}\".",
+                            BString::from(condition),
+                        );
+                        let file = listfile(model, *dir);
+                        let body = format_paragraphs(message.as_bytes(), 2, 77);
+                        return Err(GenError::Invalid(
+                            format!("\nCMake Error in {file}:\n{body}\n\n").into(),
+                        ));
+                    }
+                }
+            }
+            let output = evaluate_value(value, &mut genex_host)?;
+            if *policy == PolicyStatus::Warn {
+                warn_relative_path(model, host, *dir, "OUTPUT", &output);
+            }
+            return Ok(output);
+        }
+        evaluate_value(value, &mut genex_host)
     };
-    write_generated_files(&requests, &contexts, evaluate, host)?;
+    write_generated_files(&requests, &contexts, evaluate, host).map_err(collision_error)?;
     Ok(())
+}
+
+fn listfile(model: &ProjectModel, dir: DirId) -> BString {
+    use rcmake_base::path_lex::Lexical;
+
+    let source = Lexical::new(&model.dir(dir).source_dir);
+    let root = Lexical::new(&model.dir(DirId::ROOT).source_dir);
+    let path = source
+        .relative(root)
+        .unwrap_or_else(|| model.dir(dir).source_dir.clone());
+    if path == "." {
+        return "CMakeLists.txt".into();
+    }
+    Lexical::new(&path).append(b"CMakeLists.txt")
+}
+
+fn warn_relative_path(model: &ProjectModel, host: &dyn Host, dir: DirId, role: &str, path: &[u8]) {
+    if path.is_empty()
+        || to_native(path).is_absolute()
+        || model
+            .definition(dir, b"CMAKE_SUPPRESS_DEVELOPER_WARNINGS")
+            .is_some_and(|value| truth::is_on(value))
+    {
+        return;
+    }
+    let file = listfile(model, dir);
+    let body = format!(
+        "Policy CMP0070 is not set: Define file(GENERATE) behavior for relative paths.  Run \"cmake --help-policy CMP0070\" for policy details.  Use the cmake_policy command to set the policy and suppress this warning.\n\nfile(GENERATE) given relative {role} path:\n\n  {}\n\nThis is not defined behavior unless CMP0070 is set to NEW.  For compatibility with older versions of CMake, the previous undefined behavior will be used.",
+        BString::from(path)
+    );
+    let body = format_paragraphs(body.as_bytes(), 2, 77);
+    host.write_out(
+        Stream::Stderr,
+        format!("CMake Warning (policy) in {file}:\n{body}\nThis warning is for project developers.  Use -Wno-author or -Wno-policy to\nsuppress it.\n\n").as_bytes(),
+    );
+}
+
+fn collision_error(error: GenError) -> GenError {
+    match error {
+        GenError::Write { path, message }
+            if message == "more than one file(GENERATE) request uses the same output path" =>
+        {
+            GenError::Invalid(format!(
+                "\nCMake Error: Files to be generated by multiple different commands: \"{path}\"\n\n"
+            ).into())
+        }
+        GenError::Write { path, message }
+            if message == "file(GENERATE) produced different content for the same output path" =>
+        {
+            GenError::Invalid(format!(
+                "\nCMake Error: Evaluation file to be written multiple times with different content. This is generally caused by the content evaluating the configuration type, language, or location of object files:\n {path}\n\n"
+            ).into())
+        }
+        error => error,
+    }
 }
 
 fn format_timestamp(host: &dyn Host, format: Option<&[u8]>, utc: bool) -> Option<BString> {

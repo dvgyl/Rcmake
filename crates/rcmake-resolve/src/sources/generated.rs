@@ -1,7 +1,6 @@
-use rcmake_base::BString;
+use rcmake_base::list;
 use rcmake_diag::{PolicyId, PolicyStatus};
 use rcmake_genex::{ConfigId, EvalContext, GenexHost, evaluate, parse};
-use rcmake_host::path::from_native;
 use rcmake_model::ProjectModel;
 
 use super::{SourcePaths, absolute_path};
@@ -21,7 +20,10 @@ impl SourcePaths<'_> {
         else {
             return Ok(());
         };
-        let cwd = from_native(&self.host.initial_cwd());
+        let mut languages = props
+            .get(b"ENABLED_LANGUAGES")
+            .map_or_else(Vec::new, |value| list::split(value, list::Empty::Drop));
+        languages.retain(|language| language != "NONE");
         let directories: Vec<_> = model.dirs().collect();
         for index in 0..count {
             let key = format!("_RCMAKE_FILE_GENERATE_{index}");
@@ -35,26 +37,43 @@ impl SourcePaths<'_> {
             let use_directory = dir
                 .final_policies
                 .is_some_and(|policies| policies.get(PolicyId::new(70)) == PolicyStatus::New);
-            let base = if use_directory { &dir.binary_dir } else { &cwd };
+            let base = if use_directory {
+                &dir.binary_dir
+            } else {
+                &dir.source_dir
+            };
             let ast = parse(output)?;
             let mut host = usage.host(id);
             let mut options = (4..).map_while(|arg| get(&format!("ARG{arg}")));
-            let target = options
-                .find(|option| option.as_slice() == b"TARGET")
-                .and_then(|_| options.next())
-                .and_then(|target| host.find_target(target));
-            let context = EvalContext {
-                config: config.clone(),
-                current: target,
-                head: target,
-                ..EvalContext::default()
-            };
-            let output: BString = evaluate(&ast, &context, &mut host)?.0;
-            if !output.is_empty() {
-                self.generated
-                    .entry(absolute_path(base, &output))
-                    .or_default()
-                    .insert(dir.binary_dir.clone());
+            let mut target = None;
+            while let Some(option) = options.next() {
+                match option.as_slice() {
+                    b"TARGET" => {
+                        target = options.next().and_then(|name| host.find_target(name));
+                        break;
+                    }
+                    b"CONDITION" | b"NEWLINE_STYLE" => {
+                        options.next();
+                    }
+                    _ => {}
+                }
+            }
+            let no_language = languages.is_empty().then_some(None);
+            for language in languages.iter().cloned().map(Some).chain(no_language) {
+                let context = EvalContext {
+                    config: config.clone(),
+                    language,
+                    current: target,
+                    head: target,
+                    ..EvalContext::default()
+                };
+                let output = evaluate(&ast, &context, &mut host)?.0;
+                if !output.is_empty() {
+                    self.generated
+                        .entry(absolute_path(base, &output))
+                        .or_default()
+                        .insert(dir.binary_dir.clone());
+                }
             }
         }
         Ok(())

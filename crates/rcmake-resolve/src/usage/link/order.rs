@@ -1,14 +1,19 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::fmt::Write;
 use std::sync::Arc;
 
 use indexmap::{IndexMap, IndexSet};
-use rcmake_base::{BString, list};
-use rcmake_diag::{PolicyId, PolicyStatus};
+use rcmake_base::{BString, ByteSlice, list, truth};
+use rcmake_diag::{
+    DiagCategory, Diagnostic, Effect, Location, MessageKind, PolicyId, PolicyStatus, RenderOptions,
+    render,
+};
 use rcmake_genex::EvalContext;
-use rcmake_model::{ProjectModel, TargetId, TargetKind};
+use rcmake_host::Stream;
+use rcmake_model::{DirId, ProjectModel, Target, TargetId, TargetKind};
 
 use super::{Limits, LinkKey, ResolvedLinkItem, ResolvedLinkKind, UsageResolver, link_context};
-use crate::{ResolveError, lower::definition};
+use crate::{ResolveError, lower::definition, sources::SourcePaths};
 
 impl UsageResolver<'_> {
     pub(crate) fn ordered_links(
@@ -17,10 +22,16 @@ impl UsageResolver<'_> {
         ctx: &EvalContext,
     ) -> Result<Vec<Arc<ResolvedLinkItem>>, ResolveError> {
         let ctx = link_context(target, ctx);
-        let strategy = self
-            .model
-            .target(target)
-            .and_then(|target| target.props.get(b"LINK_LIBRARIES_STRATEGY"));
+        let owner = self.target(target)?;
+        let model = self.model;
+        let strategy = owner.props.get(b"LINK_LIBRARIES_STRATEGY");
+        let paths = self.source_paths();
+        let error = |body: BString| {
+            paths.map_or_else(
+                || ResolveError::Message(body.clone()),
+                |paths| paths.target_error(model, owner, body.clone()),
+            )
+        };
         let strategy = match strategy.map(|value| value.as_slice()) {
             None | Some(b"REORDER_MINIMALLY") => LinkOrder::Minimal,
             Some(b"REORDER_FREELY") => LinkOrder::Free,
@@ -29,12 +40,7 @@ impl UsageResolver<'_> {
                     "LINK_LIBRARIES_STRATEGY value '{}' is not recognized.",
                     BString::from(value)
                 ));
-                if let Some(paths) = self.source_paths()
-                    && let Some(target) = self.model.target(target)
-                {
-                    return Err(paths.target_error(self.model, target, body));
-                }
-                return Err(ResolveError::Message(body));
+                return Err(error(body));
             }
         };
         let (direct, _) = self.usage_links(target, false, &ctx)?;
@@ -57,9 +63,37 @@ impl UsageResolver<'_> {
             index += 1;
         }
 
+        let overrides = self.link_feature_overrides(target, owner, &ctx)?;
+        let features =
+            graph.apply_features(self.model, owner, &ctx, &overrides, paths, &mut original)?;
         graph.apply_groups(&mut original);
-        let mut ordered = graph.order(self.model, &ctx, original, strategy)?;
-        deduplicate(self.model, target, &ctx, &mut ordered);
+        let mut ordered = graph
+            .order(self.model, owner, &ctx, original, strategy)
+            .map_err(|error_value| match error_value {
+                ResolveError::Message(body) => error(body),
+                other => other,
+            })?;
+        if let Some(paths) = paths {
+            warn_policy(model, paths, owner, 156);
+            if owner.policies.policies.get(PolicyId::new(156)) == PolicyStatus::New {
+                warn_policy(model, paths, owner, 179);
+            }
+        }
+        let debug = paths.filter(|_| {
+            owner
+                .props
+                .get(b"LINK_DEPENDS_DEBUG_MODE")
+                .is_some_and(|value| truth::is_on(value))
+                || definition(model, owner.dir, b"CMAKE_LINK_DEPENDS_DEBUG_MODE")
+                    .is_some_and(|value| truth::is_on(value))
+        });
+        if let Some(paths) = debug {
+            print_link_order(paths, model, owner, "link dependency ordering", &ordered);
+        }
+        deduplicate(self.model, owner, &ctx, &features, &mut ordered).map_err(error)?;
+        if let Some(paths) = debug {
+            print_link_order(paths, model, owner, "link line", &ordered);
+        }
         // Explicit object inputs are placed before the libraries.
         ordered.retain(|item| !matches!(item.kind, ResolvedLinkKind::Interface(_)));
         ordered.sort_by_key(|item| {
@@ -69,6 +103,38 @@ impl UsageResolver<'_> {
             )
         });
         Ok(ordered)
+    }
+
+    fn link_feature_overrides(
+        &mut self,
+        id: TargetId,
+        target: &Target,
+        ctx: &EvalContext,
+    ) -> Result<HashMap<BString, BString>, ResolveError> {
+        let mut overrides = HashMap::new();
+        let mut ctx = ctx.clone();
+        ctx.language.clone_from(&ctx.link_language);
+        for key in target.props.names() {
+            if let Some(item) = key
+                .strip_prefix(b"LINK_LIBRARY_OVERRIDE_")
+                .filter(|item| !item.is_empty())
+                && let Some(value) = target.props.get(&key).filter(|value| !value.is_empty())
+            {
+                overrides.insert(item.into(), self.eval_ide_property(id, &key, value, &ctx)?);
+            }
+        }
+        if let Some(value) = target.props.get(b"LINK_LIBRARY_OVERRIDE") {
+            let value = self.eval_ide_property(id, b"LINK_LIBRARY_OVERRIDE", value, &ctx)?;
+            let mut parts = value.split(|&byte| byte == b',');
+            if let Some(feature) = parts.next() {
+                for item in parts {
+                    overrides
+                        .entry(item.into())
+                        .or_insert_with(|| feature.into());
+                }
+            }
+        }
+        Ok(overrides)
     }
 }
 
@@ -82,6 +148,7 @@ enum LinkOrder {
 #[derive(Default)]
 struct LinkGraph {
     nodes: IndexMap<LinkKey, LinkNode>,
+    feature_variants: Vec<Arc<ResolvedLinkItem>>,
 }
 
 #[expect(
@@ -92,8 +159,153 @@ impl LinkGraph {
     fn insert(&mut self, item: &Arc<ResolvedLinkItem>) -> usize {
         let entry = self.nodes.entry(item.key());
         let index = entry.index();
-        entry.or_insert_with(|| (Arc::clone(item), IndexSet::new()));
+        let (first, _) = entry.or_insert_with(|| (Arc::clone(item), IndexSet::new()));
+        if first.feature != item.feature
+            || matches!(item.kind, ResolvedLinkKind::Group { .. }) && first.kind != item.kind
+        {
+            self.feature_variants.push(Arc::clone(item));
+        }
         index
+    }
+
+    fn apply_features(
+        &mut self,
+        model: &ProjectModel,
+        target: &Target,
+        ctx: &EvalContext,
+        overrides: &HashMap<BString, BString>,
+        paths: Option<&SourcePaths<'_>>,
+        direct: &mut [(usize, Arc<ResolvedLinkItem>)],
+    ) -> Result<HashMap<BString, FeatureAttributes>, ResolveError> {
+        if target.kind == TargetKind::StaticLibrary
+            || (overrides.is_empty()
+                && self.feature_variants.is_empty()
+                && !self.nodes.values().any(|(item, _)| {
+                    item.feature.is_some() || matches!(item.kind, ResolvedLinkKind::Group { .. })
+                }))
+        {
+            return Ok(HashMap::new());
+        }
+        let mut attributes = HashMap::new();
+        let mut features = HashMap::<LinkKey, BString>::new();
+        let mut groups = HashMap::<LinkKey, BString>::new();
+        let mut warned = HashSet::new();
+        let error = |body: BString| {
+            if let Some(paths) = paths {
+                paths.target_error(model, target, body)
+            } else {
+                ResolveError::Message(body)
+            }
+        };
+        let language = ctx.link_language.as_ref().or(ctx.language.as_ref());
+        for entry in self
+            .nodes
+            .values()
+            .map(|(item, _)| item)
+            .chain(&self.feature_variants)
+        {
+            let (group, items) = match &entry.kind {
+                ResolvedLinkKind::Group { feature, members } => (Some(feature), members.as_slice()),
+                _ => (None, std::slice::from_ref(entry.as_ref())),
+            };
+            for item in items {
+                let key = item.key();
+                if let Some(group) = group {
+                    let prior = groups.entry(key.clone()).or_insert_with(|| group.clone());
+                    if group.as_slice() != prior.as_slice() {
+                        return Err(error(format!(
+                            "Impossible to link target '{}' because the link item '{}', specified with the group feature '{group}', has already occurred with the feature '{prior}', which is not allowed.",
+                            target.name, item.text.value
+                        ).into()));
+                    }
+                }
+                let requested = overrides.get(&item.text.value).or(item.feature.as_ref());
+                let feature = requested.map_or(b"DEFAULT".as_slice(), |value| value.as_slice());
+                if !attributes.contains_key(feature) {
+                    attributes.insert(
+                        feature.into(),
+                        FeatureAttributes::read(model, target, language, feature).map_err(error)?,
+                    );
+                }
+                let kind = match item.kind {
+                    ResolvedLinkKind::Library(id)
+                    | ResolvedLinkKind::Interface(id)
+                    | ResolvedLinkKind::Objects(id) => model.target(id).map(|target| target.kind),
+                    _ => None,
+                };
+                let applicable = feature == b"DEFAULT"
+                    || attributes
+                        .get(feature)
+                        .is_none_or(|attribute| attribute.applies(kind));
+                if !applicable {
+                    if let (Some(paths), Some(kind)) = (paths, kind)
+                        && warned.insert((key.clone(), BString::from(feature)))
+                        && !definition(model, target.dir, b"CMAKE_SUPPRESS_DEVELOPER_WARNINGS")
+                            .is_some_and(|value| truth::is_on(value))
+                    {
+                        paths.emit(
+                            model,
+                            rcmake_diag::MessageKind::AuthorWarning,
+                            rcmake_diag::Location::Backtrace(target.backtrace.clone()),
+                            format!(
+                                "The feature '{}', specified as part of a generator-expression '$<LINK_LIBRARY:{}>', will not be applied to the {} '{}'.",
+                                BString::from(feature), BString::from(feature), kind.as_str(), item.text.value
+                            ).into(),
+                        );
+                    }
+                    continue;
+                }
+                let prior = features.entry(key).or_insert_with(|| feature.into());
+                if prior.as_slice() == feature {
+                    continue;
+                }
+                let replaces = |feature: &[u8], old: &[u8]| {
+                    attributes
+                        .get(feature)
+                        .is_some_and(|attribute| attribute.overrides.contains(old))
+                };
+                match (replaces(feature, prior), replaces(prior, feature)) {
+                    (true, false) => *prior = feature.into(),
+                    (false, true) => {}
+                    (true, true) => return Err(error(format!(
+                        "Impossible to link target '{}' because the link item '{}' is specified with the features '{}' and '{prior}', and both have an 'OVERRIDE' attribute that overrides the other. Such cycles are not allowed.",
+                        target.name, item.text.value, BString::from(feature)
+                    ).into())),
+                    (false, false) => return Err(error(format!(
+                        "Impossible to link target '{}' because the link item '{}', specified {}, has already occurred {}, which is not allowed.",
+                        target.name, item.text.value, describe_feature(feature), describe_feature(prior)
+                    ).into())),
+                }
+            }
+        }
+        features.retain(|_, feature| feature.as_slice() != b"DEFAULT");
+        fn apply(item: &mut ResolvedLinkItem, features: &HashMap<LinkKey, BString>) {
+            let selected = features.get(&item.key());
+            if let ResolvedLinkKind::Group { members, .. } = &mut item.kind {
+                for member in members {
+                    member.feature = features.get(&member.key()).cloned();
+                }
+            } else {
+                item.feature = selected.cloned();
+            }
+        }
+        for (item, _) in self.nodes.values_mut() {
+            if item.feature.is_some()
+                || features.contains_key(&item.key())
+                || matches!(item.kind, ResolvedLinkKind::Group { .. })
+            {
+                apply(Arc::make_mut(item), &features);
+            }
+        }
+        for (_, item) in direct {
+            if item.feature.is_some()
+                || features.contains_key(&item.key())
+                || matches!(item.kind, ResolvedLinkKind::Group { .. })
+            {
+                apply(Arc::make_mut(item), &features);
+            }
+        }
+        Ok(attributes)
     }
 
     fn apply_groups(&mut self, direct: &mut [(usize, Arc<ResolvedLinkItem>)]) {
@@ -110,6 +322,7 @@ impl LinkGraph {
         if replacements.is_empty() {
             for (index, (_, edges)) in self.nodes.values_mut().enumerate() {
                 edges.shift_remove(&index);
+                edges.sort_unstable();
             }
             return;
         }
@@ -128,18 +341,19 @@ impl LinkGraph {
                     edges.insert(next);
                 }
             }
+            edges.sort_unstable();
         }
     }
 
     fn order(
         &self,
         model: &ProjectModel,
+        owner: &Target,
         ctx: &EvalContext,
         direct: Vec<(usize, Arc<ResolvedLinkItem>)>,
         strategy: LinkOrder,
     ) -> Result<Vec<Arc<ResolvedLinkItem>>, ResolveError> {
-        let (component_ids, mut components) =
-            self.components(direct.iter().rev().map(|(index, _)| *index));
+        let (component_ids, mut components) = self.components();
         for (index, (_, (_, edges))) in self.nodes.iter().enumerate() {
             let id = component_ids[index];
             for &next in edges {
@@ -149,6 +363,7 @@ impl LinkGraph {
                 }
             }
         }
+        set_component_order(&mut components);
         for component in &mut components {
             if component.members.len() > 1 {
                 component.passes = 2;
@@ -156,9 +371,7 @@ impl LinkGraph {
                     let (item, _) = &self.nodes[index];
                     match item.kind {
                         ResolvedLinkKind::Group { .. } => {
-                            return Err(ResolveError::Message(
-                                "A link group has a circular dependency.".into(),
-                            ));
+                            return Err(self.group_cycle(owner, component));
                         }
                         ResolvedLinkKind::Library(id) => {
                             if let Some(target) = model.target(id) {
@@ -186,7 +399,7 @@ impl LinkGraph {
         }
 
         // Edges point from a library to the libraries that must follow it.
-        // The component identifiers are in topological order.
+        // Use the component order to choose the next pending library.
         let mut order = Vec::with_capacity(self.nodes.len().max(direct.len()));
         let mut pending = BTreeSet::new();
         match strategy {
@@ -199,13 +412,13 @@ impl LinkGraph {
             LinkOrder::Free => {
                 for (index, _) in direct {
                     let id = component_ids[index];
-                    if pending.insert(id) {
+                    if pending.insert((components[id].order, id)) {
                         components[id].reset();
                     }
                 }
             }
         }
-        while let Some(id) = pending.first().copied() {
+        while let Some((_, id)) = pending.first().copied() {
             let Some(index) = components[id].remaining.first().copied() else {
                 return Err(ResolveError::Message(
                     "A pending link component has no members.".into(),
@@ -222,7 +435,36 @@ impl LinkGraph {
         Ok(order)
     }
 
-    fn components(&self, roots: impl Iterator<Item = usize>) -> (Vec<usize>, Vec<Component>) {
+    fn group_cycle(&self, owner: &Target, component: &Component) -> ResolveError {
+        let item_name = |index: usize| -> String {
+            let (item, _) = &self.nodes[index];
+            if let ResolvedLinkKind::Group { feature, members } = &item.kind {
+                let names: Vec<_> = members
+                    .iter()
+                    .map(|member| member.text.value.to_string())
+                    .collect();
+                format!("group \"{feature}:{{{}}}\"", names.join(","))
+            } else {
+                format!("\"{}\"", item.text.value)
+            }
+        };
+        let mut body = format!(
+            "The inter-target dependency graph, for the target \"{}\", contains the following strongly connected component (cycle):\n\n",
+            owner.name
+        );
+        for &index in &component.members {
+            let _ = writeln!(body, "  {}", item_name(index));
+            let (_, edges) = &self.nodes[index];
+            for &edge in edges {
+                if component.members.binary_search(&edge).is_ok() {
+                    let _ = writeln!(body, "    depends on {}", item_name(edge));
+                }
+            }
+        }
+        ResolveError::Message(body.into())
+    }
+
+    fn components(&self) -> (Vec<usize>, Vec<Component>) {
         let count = self.nodes.len();
         let mut reverse = vec![Vec::new(); count];
         for (id, (_, (_, edges))) in self.nodes.iter().enumerate() {
@@ -236,14 +478,14 @@ impl LinkGraph {
         let mut visited = vec![false; count];
         let mut finished = Vec::with_capacity(count);
         let mut stack = Vec::new();
-        for index in roots.chain((0..count).rev()) {
+        for index in 0..count {
             stack.push((index, false));
             while let Some((node, done)) = stack.pop() {
                 if done {
                     finished.push(node);
                 } else if !std::mem::replace(&mut visited[node], true) {
                     stack.push((node, true));
-                    stack.extend(self.nodes[node].1.iter().map(|&edge| (edge, false)));
+                    stack.extend(self.nodes[node].1.iter().rev().map(|&edge| (edge, false)));
                 }
             }
         }
@@ -267,6 +509,7 @@ impl LinkGraph {
             members.sort_unstable();
             components.push(Component {
                 members,
+                order: 0,
                 edges: IndexSet::new(),
                 passes: 1,
                 left: 0,
@@ -279,10 +522,33 @@ impl LinkGraph {
 
 struct Component {
     members: Vec<usize>,
+    order: usize,
     edges: IndexSet<usize>,
     passes: usize,
     left: usize,
     remaining: IndexSet<usize>,
+}
+
+#[expect(
+    clippy::indexing_slicing,
+    reason = "Edges contain indices into the component table."
+)]
+fn set_component_order(components: &mut [Component]) {
+    let mut visited = vec![false; components.len()];
+    let mut next = components.len();
+    let mut stack = Vec::new();
+    for id in 0..components.len() {
+        stack.push((id, false));
+        while let Some((id, done)) = stack.pop() {
+            if done {
+                next -= 1;
+                components[id].order = next;
+            } else if !std::mem::replace(&mut visited[id], true) {
+                stack.push((id, true));
+                stack.extend(components[id].edges.iter().map(|&edge| (edge, false)));
+            }
+        }
+    }
 }
 
 impl Component {
@@ -297,10 +563,16 @@ impl Component {
     clippy::indexing_slicing,
     reason = "The pending set and edges contain component indices from the component table."
 )]
-fn visit(item: usize, ids: &[usize], components: &mut [Component], pending: &mut BTreeSet<usize>) {
+fn visit(
+    item: usize,
+    ids: &[usize],
+    components: &mut [Component],
+    pending: &mut BTreeSet<(usize, usize)>,
+) {
     let id = ids[item];
     let component = &mut components[id];
-    if pending.insert(id) {
+    let key = (component.order, id);
+    if pending.insert(key) {
         component.reset();
     }
     component.remaining.shift_remove(&item);
@@ -314,23 +586,198 @@ fn visit(item: usize, ids: &[usize], components: &mut [Component], pending: &mut
             .extend(component.members.iter().copied());
         return;
     }
-    pending.remove(&id);
+    pending.remove(&key);
     let edges = component.edges.clone();
     for next in edges {
-        pending.insert(next);
+        pending.insert((components[next].order, next));
         components[next].reset();
     }
 }
 
+fn describe_feature(feature: &[u8]) -> String {
+    if feature == b"DEFAULT" {
+        "without any feature or 'DEFAULT' feature".to_owned()
+    } else {
+        format!("with the feature '{}'", BString::from(feature))
+    }
+}
+
+fn warn_policy(model: &ProjectModel, paths: &SourcePaths<'_>, target: &Target, number: u16) {
+    let policy = PolicyId::new(number);
+    let defined_on =
+        |key: &[u8]| definition(model, target.dir, key).is_some_and(|value| truth::is_on(value));
+    if target.policies.policies.get(policy) != PolicyStatus::Warn
+        || !defined_on(format!("CMAKE_POLICY_WARNING_{policy}").as_bytes())
+        || defined_on(b"CMAKE_SUPPRESS_DEVELOPER_WARNINGS")
+        || model
+            .global
+            .props
+            .get(b"IN_TRY_COMPILE")
+            .is_some_and(|value| truth::is_on(value))
+    {
+        return;
+    }
+    let summary = policy.info().map_or("", |info| info.summary);
+    let behavior = if number == 156 {
+        "legacy libraries de-duplication strategy will be applied."
+    } else {
+        "static libraries de-duplication will keep the last occurrence of the static libraries."
+    };
+    let diagnostic = Diagnostic {
+        kind: MessageKind::AuthorWarning,
+        effect: Effect::None,
+        category: Some(DiagCategory::Policy),
+        policy: Some(policy),
+        location: Location::Backtrace(target.backtrace.clone()),
+        body: format!("Policy {policy} is not set: {summary}  Run \"cmake --help-policy {policy}\" for policy details.  Use the cmake_policy command to set the policy and suppress this warning.\n\nSince the policy is not set, {behavior}").into(),
+    };
+    paths.host.write_out(
+        Stream::Stderr,
+        &render(
+            &diagnostic,
+            &RenderOptions {
+                relative_base: Some(model.dir(DirId::ROOT).source_dir.clone()),
+                ..RenderOptions::default()
+            },
+        ),
+    );
+}
+
+fn print_link_order(
+    paths: &SourcePaths<'_>,
+    model: &ProjectModel,
+    target: &Target,
+    heading: &str,
+    items: &[Arc<ResolvedLinkItem>],
+) {
+    let mut output = format!("target [{}] {heading}:\n", target.name);
+    for item in items {
+        if let ResolvedLinkKind::Group { feature, .. } = &item.kind {
+            let _ = writeln!(output, "  group, feature [{feature}]");
+            continue;
+        }
+        if let Some(target) = item.edge_targets().next().and_then(|id| model.target(id)) {
+            let _ = write!(output, "  target [{}]", target.name);
+        } else {
+            let _ = write!(output, "  item [{}]", item.text.value);
+        }
+        if let Some(feature) = &item.feature {
+            let _ = write!(output, ", feature [{feature}]");
+        }
+        output.push('\n');
+    }
+    output.push('\n');
+    paths.host.write_out(Stream::Stderr, output.as_bytes());
+}
+
+#[derive(Default)]
+struct FeatureAttributes {
+    types: Option<Vec<BString>>,
+    deduplicate: Option<bool>,
+    overrides: HashSet<BString>,
+}
+
+impl FeatureAttributes {
+    fn read(
+        model: &ProjectModel,
+        target: &Target,
+        language: Option<&BString>,
+        feature: &[u8],
+    ) -> Result<Self, BString> {
+        let mut attributes = Self::default();
+        if feature == b"DEFAULT" {
+            return Ok(attributes);
+        }
+        let feature = BString::from(feature);
+        let mut variable = format!("CMAKE_LINK_LIBRARY_{feature}_ATTRIBUTES");
+        if let Some(language) = language {
+            let specific = format!("CMAKE_{language}_LINK_LIBRARY_{feature}_ATTRIBUTES");
+            if definition(model, target.dir, specific.as_bytes())
+                .is_some_and(|value| !value.is_empty())
+            {
+                variable = specific;
+            }
+        }
+        let mut invalid = Vec::new();
+        if let Some(value) = definition(model, target.dir, variable.as_bytes()) {
+            for entry in list::split(value, list::Empty::Drop) {
+                match entry.split_once_str(b"=") {
+                    Some((b"LIBRARY_TYPE", value)) => {
+                        let types: Vec<_> = value
+                            .split(|&byte| byte == b',')
+                            .map(BString::from)
+                            .collect();
+                        if types.iter().all(|kind| {
+                            matches!(
+                                kind.as_slice(),
+                                b"STATIC" | b"SHARED" | b"MODULE" | b"EXECUTABLE"
+                            )
+                        }) {
+                            attributes.types = Some(types);
+                        } else {
+                            invalid.push(entry);
+                        }
+                    }
+                    Some((b"DEDUPLICATION", b"YES")) => attributes.deduplicate = Some(true),
+                    Some((b"DEDUPLICATION", b"NO")) => attributes.deduplicate = Some(false),
+                    Some((b"DEDUPLICATION", b"DEFAULT")) => attributes.deduplicate = None,
+                    Some((b"OVERRIDE", value))
+                        if !value.is_empty()
+                            && value.split(|&byte| byte == b',').all(|name| {
+                                !name.is_empty()
+                                    && name
+                                        .iter()
+                                        .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+                            }) =>
+                    {
+                        attributes.overrides = value
+                            .split(|&byte| byte == b',')
+                            .map(BString::from)
+                            .collect();
+                    }
+                    _ => invalid.push(entry),
+                }
+            }
+        }
+        if invalid.is_empty() {
+            Ok(attributes)
+        } else {
+            Err(invalid_options(&variable, &invalid))
+        }
+    }
+
+    fn applies(&self, kind: Option<TargetKind>) -> bool {
+        let name: &[u8] = match kind {
+            None | Some(TargetKind::UnknownLibrary) => return true,
+            Some(TargetKind::StaticLibrary) => b"STATIC",
+            Some(TargetKind::SharedLibrary) => b"SHARED",
+            Some(TargetKind::ModuleLibrary) => b"MODULE",
+            Some(TargetKind::Executable) => b"EXECUTABLE",
+            _ => return false,
+        };
+        self.types
+            .as_ref()
+            .is_none_or(|types| types.iter().any(|kind| kind == name))
+    }
+}
+
+fn invalid_options(variable: &str, invalid: &[BString]) -> BString {
+    let mut body = BString::from(format!("Erroneous option(s) for '{variable}':\n\n"));
+    for entry in invalid {
+        body.extend_from_slice(b"  ");
+        body.extend_from_slice(entry);
+        body.push(b'\n');
+    }
+    body
+}
+
 fn deduplicate(
     model: &ProjectModel,
-    id: TargetId,
+    target: &Target,
     ctx: &EvalContext,
+    attributes: &HashMap<BString, FeatureAttributes>,
     items: &mut Vec<Arc<ResolvedLinkItem>>,
-) {
-    let Some(target) = model.target(id) else {
-        return;
-    };
+) -> Result<(), BString> {
     let policy = |number| target.policies.policies.get(PolicyId::new(number)) == PolicyStatus::New;
     let platform = definition(model, target.dir, b"CMAKE_SYSTEM_NAME")
         .map_or(b"".as_slice(), |value| value.as_slice());
@@ -339,45 +786,90 @@ fn deduplicate(
         platform,
         b"Darwin" | b"iOS" | b"tvOS" | b"watchOS" | b"visionOS"
     ) || (platform.is_empty() && cfg!(target_os = "macos"));
-    let processing = ctx
-        .link_language
-        .as_ref()
-        .or(ctx.language.as_ref())
-        .and_then(|language| {
-            definition(
-                model,
-                target.dir,
-                format!("CMAKE_{language}_LINK_LIBRARIES_PROCESSING").as_bytes(),
-            )
-        });
-    let settings = processing.map(|value| list::split(value, list::Empty::Drop));
-    let setting = |name: &[u8]| {
-        settings
-            .as_ref()
-            .and_then(|items| items.iter().find_map(|item| item.strip_prefix(name)))
-    };
-    let all =
-        policy(156) && setting(b"DEDUPLICATION=").map_or(apple || windows, |value| value == b"ALL");
-    let forward = policy(156) && setting(b"ORDER=").map_or(windows, |value| value == b"FORWARD");
-    let keep_first = |item: &ResolvedLinkItem| match item.kind {
-        ResolvedLinkKind::Objects(_)
-        | ResolvedLinkKind::ObjectFile
-        | ResolvedLinkKind::Group { .. } => Some(true),
-        ResolvedLinkKind::Library(id) => match model.target(id)?.kind {
-            TargetKind::StaticLibrary if all => Some(policy(179)),
-            TargetKind::SharedLibrary
-                if !policy(156) || setting(b"DEDUPLICATION=") != Some(b"NONE") =>
+    let language = ctx.link_language.as_ref().or(ctx.language.as_ref());
+    let mut all = policy(156) && (apple || windows);
+    let mut shared = true;
+    let mut forward = policy(156) && windows;
+    if policy(156)
+        && let Some(language) = language
+    {
+        let variable = format!("CMAKE_{language}_LINK_LIBRARIES_PROCESSING");
+        if let Some(value) = definition(model, target.dir, variable.as_bytes()) {
+            let mut invalid = Vec::new();
+            for item in list::split(value, list::Empty::Drop) {
+                match item.split_once_str(b"=") {
+                    Some((b"ORDER", b"FORWARD")) => forward = true,
+                    Some((b"ORDER", b"REVERSE")) => forward = false,
+                    Some((b"DEDUPLICATION" | b"UNICITY", b"ALL")) => {
+                        all = true;
+                        shared = true;
+                    }
+                    Some((b"DEDUPLICATION" | b"UNICITY", b"SHARED")) => {
+                        all = false;
+                        shared = true;
+                    }
+                    Some((b"DEDUPLICATION" | b"UNICITY", b"NONE")) => {
+                        all = false;
+                        shared = false;
+                    }
+                    _ => invalid.push(item),
+                }
+            }
+            if !invalid.is_empty() {
+                return Err(invalid_options(&variable, &invalid));
+            }
+            if all
+                && !policy(179)
+                && definition(model, target.dir, b"CMAKE_EXECUTABLE_FORMAT")
+                    .is_some_and(|value| value == "ELF")
+                && definition(
+                    model,
+                    target.dir,
+                    format!("CMAKE_{language}_PLATFORM_LINKER_ID").as_bytes(),
+                )
+                .is_some_and(|value| value == "LLD")
             {
-                Some(forward)
+                all = false;
+            }
+        }
+    }
+    let keep_static_first = forward || all && policy(179);
+    let feature_dedup = |item: &ResolvedLinkItem| {
+        item.feature
+            .as_ref()
+            .and_then(|feature| attributes.get(feature))
+            .and_then(|attribute| attribute.deduplicate)
+    };
+    let keep_first = |item: &ResolvedLinkItem| {
+        if let Some(deduplicate) = feature_dedup(item) {
+            return deduplicate.then_some(match item.kind {
+                ResolvedLinkKind::Library(id)
+                    if model
+                        .target(id)
+                        .is_some_and(|target| target.kind == TargetKind::StaticLibrary) =>
+                {
+                    keep_static_first
+                }
+                _ => forward,
+            });
+        }
+        match item.kind {
+            ResolvedLinkKind::Objects(_) | ResolvedLinkKind::ObjectFile => Some(true),
+            ResolvedLinkKind::Library(id) => match model.target(id)?.kind {
+                TargetKind::StaticLibrary if all => Some(keep_static_first),
+                TargetKind::SharedLibrary if shared => Some(forward),
+                _ if all => Some(forward),
+                _ => None,
+            },
+            ResolvedLinkKind::Raw if all => {
+                let text = &item.text.value;
+                (!text.starts_with(b"-")
+                    || text.starts_with(b"-l")
+                    || text.starts_with(b"-framework "))
+                .then_some(forward)
             }
             _ => None,
-        },
-        ResolvedLinkKind::Raw if all => {
-            let text = &item.text.value;
-            (!text.starts_with(b"-") || text.starts_with(b"-l") || text.starts_with(b"-framework "))
-                .then_some(forward)
         }
-        _ => None,
     };
 
     let mut first = HashSet::new();
@@ -395,4 +887,5 @@ fn deduplicate(
     }
     let mut keep = keep.into_iter();
     items.retain(|_| keep.next().unwrap_or_default());
+    Ok(())
 }

@@ -1,11 +1,15 @@
 use indexmap::{IndexMap, IndexSet};
 use rcmake_base::{BString, list, shell::quote, truth};
+use rcmake_diag::MessageKind;
 use rcmake_genex::{ConfigId, EvalContext};
 use rcmake_host::{Host, ReadRange, WriteMode, path::to_native};
 use rcmake_model::{DirId, ProjectModel, Target, TargetId, UsageField};
 
 use super::{definition, expand_rule, join, object_dir, policy_flags::Flags};
-use crate::{CompileUnit, ResolveError, ResolvedTarget, sources, usage::UsageResolver};
+use crate::{
+    CompileUnit, ResolveError, ResolvedTarget, cxx_modules::generation_location, sources,
+    usage::UsageResolver,
+};
 
 const REUSE: &[u8] = b"PRECOMPILE_HEADERS_REUSE_FROM";
 
@@ -79,9 +83,10 @@ impl Plans {
         config: &ConfigId,
         usage: &mut UsageResolver<'_>,
     ) -> Result<Self, ResolveError> {
-        let Some(host) = usage.source_paths().map(|paths| paths.host) else {
+        let Some(paths) = usage.source_paths() else {
             return Ok(Self::default());
         };
+        let host = paths.host;
         if !model.targets().any(|(_, target)| {
             target.props.get(REUSE).is_some()
                 || [
@@ -102,7 +107,28 @@ impl Plans {
                 continue;
             }
             if target.props.get(REUSE).is_some_and(|name| !name.is_empty()) {
-                plans.owners.insert(id, reuse_owner(model, id, target)?);
+                let owner = reuse_owner(model, id, target).map_err(|body| {
+                    paths.emit(
+                        model,
+                        MessageKind::Error,
+                        generation_location(model, target),
+                        body.clone(),
+                    );
+                    ResolveError::Reported(body)
+                })?;
+                if let Some(owner_target) = model.target(owner).filter(|owner| disabled(owner)) {
+                    paths.emit(
+                        model,
+                        MessageKind::Warning,
+                        generation_location(model, target),
+                        format!(
+                            "Target \"{}\" for the \"{}\" target's \"PRECOMPILE_HEADERS_REUSE_FROM\" property has set \"DISABLE_PRECOMPILE_HEADERS\"; ignoring.",
+                            owner_target.name, target.name
+                        ).into(),
+                    );
+                } else {
+                    plans.owners.insert(id, owner);
+                }
                 continue;
             }
             let languages = resolved
@@ -148,26 +174,21 @@ pub(super) fn skip_unit(
         || inputs.is_some_and(|inputs| inputs.sources_without_pch.contains(&unit.source.value))
 }
 
-fn reuse_owner(
-    model: &ProjectModel,
-    id: TargetId,
-    origin: &Target,
-) -> Result<TargetId, ResolveError> {
+fn reuse_owner(model: &ProjectModel, id: TargetId, origin: &Target) -> Result<TargetId, BString> {
     let mut visited = IndexSet::from([id]);
     let (mut current, mut target) = (id, origin);
     while let Some(name) = target.props.get(REUSE).filter(|name| !name.is_empty()) {
         let missing = || {
-            ResolveError::Message(format!(
-            "Unable to resolve precompiled header reuse target \"{name}\" for target \"{}\".",
-            origin.name
-        ).into())
+            format!(
+                "Unable to resolve precompiled header reuse target \"{name}\" for target \"{}\".",
+                origin.name
+            )
+            .into()
         };
         current = model.find_target(target.dir, name).ok_or_else(missing)?;
         target = model.target(current).ok_or_else(missing)?;
         if !visited.insert(current) {
-            return Err(ResolveError::Message(
-                format!("Circular PCH reuse target involving '{}'", target.name).into(),
-            ));
+            return Err(format!("Circular PCH reuse target involving '{}'", target.name).into());
         }
     }
     Ok(current)

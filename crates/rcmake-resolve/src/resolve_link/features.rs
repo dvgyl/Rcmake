@@ -4,7 +4,7 @@ use rcmake_base::{BString, list, shell::quote, truth};
 use rcmake_model::{ProjectModel, Target};
 
 use super::{LinkFragment, LinkFragmentRole, ResolvedLinkItem, ResolvedLinkKind, link_fragment};
-use crate::{ResolveError, lower, sources::SourcePaths};
+use crate::{ResolveError, lower, sources::SourcePaths, usage::link_options::Wrapper};
 
 #[derive(Clone)]
 struct Definition {
@@ -18,6 +18,7 @@ pub(super) struct Features<'a, 'host> {
     target: &'a Target,
     paths: &'a SourcePaths<'host>,
     language: &'a BString,
+    wrapper: Wrapper<'a>,
     definitions: HashMap<(bool, BString), Definition>,
 }
 
@@ -33,6 +34,7 @@ impl<'a, 'host> Features<'a, 'host> {
             target,
             paths,
             language,
+            wrapper: Wrapper::new(model, target, language, b"LINKER"),
             definitions: HashMap::new(),
         }
     }
@@ -54,20 +56,20 @@ impl<'a, 'host> Features<'a, 'host> {
                 .is_some_and(|(first, _)| first.feature.as_ref() != feature)
                 && let Some((first, definition)) = library.take()
             {
-                push(fragments, &definition.suffix, first);
+                self.push(fragments, &definition.suffix, first)?;
             }
             if let ResolvedLinkKind::Group { feature, members } = &item.kind {
                 let definition = self.definition(true, feature)?;
-                push(fragments, &definition.prefix, item);
+                self.push(fragments, &definition.prefix, item)?;
                 self.append(members.iter(), fragments, plain)?;
-                push(fragments, &definition.suffix, item);
+                self.push(fragments, &definition.suffix, item)?;
                 continue;
             }
             if let Some(feature) = feature
                 && library.is_none()
             {
                 let definition = self.definition(false, feature)?;
-                push(fragments, &definition.prefix, item);
+                self.push(fragments, &definition.prefix, item)?;
                 library = Some((item, definition));
             }
             let start = fragments.len();
@@ -82,8 +84,10 @@ impl<'a, 'host> Features<'a, 'host> {
                     .filter(|fragment| fragment.role == LinkFragmentRole::Libraries)
                 {
                     let value = &fragment.text.value;
-                    let use_path =
-                        value.contains(&b'/') || matches!(item.kind, ResolvedLinkKind::Library(_));
+                    let framework = value.strip_prefix(b"-framework ");
+                    let use_path = framework.is_none()
+                        && (value.contains(&b'/')
+                            || matches!(item.kind, ResolvedLinkKind::Library(_)));
                     let raw = item.text.value.as_slice();
                     if !use_path
                         && (raw.starts_with(b"-")
@@ -93,7 +97,19 @@ impl<'a, 'host> Features<'a, 'host> {
                     {
                         continue;
                     }
-                    let template = alternative(template, use_path);
+                    let mut template = alternative(template, use_path);
+                    if let Some(arguments) = template.strip_prefix(b"LINKER:")
+                        && !arguments.starts_with(b"SHELL:")
+                    {
+                        // Split the template before substituting paths. File names can contain commas.
+                        let mut rewritten = b"LINKER:SHELL:".to_vec();
+                        rewritten.extend(
+                            arguments
+                                .iter()
+                                .map(|&byte| if byte == b',' { b' ' } else { byte }),
+                        );
+                        template = rewritten;
+                    }
                     let definition = |key: &[u8]| {
                         lower::definition(self.model, self.target.dir, key)
                             .map_or(b"".as_slice(), |v| v.as_slice())
@@ -103,18 +119,53 @@ impl<'a, 'host> Features<'a, 'host> {
                     let flag =
                         lower::definition(self.model, self.target.dir, b"CMAKE_LINK_LIBRARY_FLAG")
                             .map_or(b"-l".as_slice(), |v| v.as_slice());
-                    fragment.text.value = lower::expand_rule(&template, |key| match key {
+                    let text = lower::expand_rule(&template, |key| match key {
                         b"LINK_ITEM" | b"LIBRARY" | b"LIB_ITEM" if use_path => Some(value.clone()),
+                        b"LIBRARY" | b"LIB_ITEM" if framework.is_some() => {
+                            framework.map(BString::from)
+                        }
+                        b"LINK_ITEM" if framework.is_some() => Some(value.clone()),
                         b"LINK_ITEM" => Some(quote(&[flag, &name].concat())),
                         b"LIBRARY" => Some(quote(&name)),
                         b"LIB_ITEM" => Some(quote(raw)),
                         _ => None,
                     });
+                    fragment.text.value = self.render(&text)?;
                 }
             }
         }
         if let Some((item, definition)) = library {
-            push(fragments, &definition.suffix, item);
+            self.push(fragments, &definition.suffix, item)?;
+        }
+        Ok(())
+    }
+
+    fn render(&self, text: &BString) -> Result<BString, ResolveError> {
+        if !text.starts_with(b"LINKER:") {
+            return Ok(text.clone());
+        }
+        let args = self.wrapper.expand(text)?;
+        let parts: Vec<_> = args.iter().map(|arg| quote(arg)).collect();
+        Ok(parts
+            .iter()
+            .map(|arg| arg.as_slice())
+            .collect::<Vec<_>>()
+            .join(b" ".as_slice())
+            .into())
+    }
+
+    fn push(
+        &self,
+        fragments: &mut Vec<LinkFragment>,
+        text: &BString,
+        item: &ResolvedLinkItem,
+    ) -> Result<(), ResolveError> {
+        if !text.is_empty() {
+            fragments.push(link_fragment(
+                self.render(text)?,
+                &item.text,
+                LinkFragmentRole::Libraries,
+            ));
         }
         Ok(())
     }
@@ -136,7 +187,7 @@ impl<'a, 'host> Features<'a, 'host> {
                 "Feature '{feature}', specified through generator-expression '$<{operator}>' to link target '{target}', is not {reason} for the '{language}' link language."
             ))
         };
-        let variable = if supports(&specific).is_some() {
+        let variable = if supports(&specific).is_some_and(|value| !group || truth::is_on(value)) {
             specific
         } else {
             generic
@@ -180,16 +231,6 @@ impl<'a, 'host> Features<'a, 'host> {
     fn error(&self, body: String) -> ResolveError {
         self.paths
             .target_error(self.model, self.target, body.into())
-    }
-}
-
-fn push(fragments: &mut Vec<LinkFragment>, text: &BString, item: &ResolvedLinkItem) {
-    if !text.is_empty() {
-        fragments.push(link_fragment(
-            text.clone(),
-            &item.text,
-            LinkFragmentRole::Libraries,
-        ));
     }
 }
 
