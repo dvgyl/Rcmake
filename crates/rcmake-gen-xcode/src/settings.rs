@@ -1,6 +1,9 @@
 //! Project and target build settings for each configuration.
 
-use std::{collections::BTreeSet, path::Path};
+use std::{
+    collections::BTreeSet,
+    path::{Path, PathBuf},
+};
 
 use rcmake_base::{list as cmake_list, truth};
 use rcmake_model::{DirId, ParsedToolset, ProjectModel, Target, TargetKind};
@@ -99,7 +102,7 @@ impl Product {
             dir = dir.join(text(value));
         }
         if kind == TargetKind::ObjectLibrary {
-            dir = bin.join(format!("build/{}.build/{CONFIG_DIR}", text(&raw.name)));
+            dir = target_temp_dir(bin, &model.dir(raw.dir).binary_dir, &raw.name);
         } else if let Some(resolved_dir) = target
             .and_then(|target| target.artifacts.file.as_ref())
             .filter(|path| !path.windows(2).any(|pair| pair == b"$<"))
@@ -216,6 +219,11 @@ pub(crate) fn on(target: &Target, key: &[u8]) -> bool {
     target.props.get(key).is_some_and(|v| truth::is_on(v))
 }
 
+fn target_temp_dir(bin: &Path, binary_dir: &[u8], name: &[u8]) -> PathBuf {
+    bin.join(text(binary_dir))
+        .join(format!("build/{}.build/{CONFIG_DIR}", text(name)))
+}
+
 pub(crate) fn project(
     model: &ProjectModel,
     root: DirId,
@@ -318,7 +326,6 @@ impl TargetSettings<'_> {
             raw,
             target,
         } = *self;
-        let name = text(&raw.name);
         let mut settings = project(model, raw.dir, bin, arch, config);
         settings.extend(attrs([
             ("ALWAYS_SEARCH_USER_PATHS", "NO".into()),
@@ -355,7 +362,10 @@ impl TargetSettings<'_> {
             ),
             (
                 "TARGET_TEMP_DIR",
-                format!("{}/build/{name}.build/{CONFIG_DIR}", bin.display()).into(),
+                target_temp_dir(bin, &model.dir(raw.dir).binary_dir, &raw.name)
+                    .to_string_lossy()
+                    .into_owned()
+                    .into(),
             ),
             ("USE_HEADERMAP", "NO".into()),
             ("WARNING_CFLAGS", list([INHERITED])),
@@ -419,16 +429,18 @@ impl TargetSettings<'_> {
             ("C", "OTHER_CFLAGS", &mut cflags),
             ("CXX", "OTHER_CPLUSPLUSFLAGS", &mut cxxflags),
         ] {
-            let flag_key = format!("CMAKE_{language}_FLAGS");
-            for var in [
-                flag_key.clone(),
-                format!("{flag_key}_{}", config.to_ascii_uppercase()),
-            ] {
-                if let Some(value) = model
-                    .definition(raw.dir, var.as_bytes())
-                    .filter(|v| !v.is_empty())
-                {
-                    flags.push(text(value));
+            if ide.is_none() {
+                let flag_key = format!("CMAKE_{language}_FLAGS");
+                for var in [
+                    flag_key.clone(),
+                    format!("{flag_key}_{}", config.to_ascii_uppercase()),
+                ] {
+                    if let Some(value) = model
+                        .definition(raw.dir, var.as_bytes())
+                        .filter(|v| !v.is_empty())
+                    {
+                        flags.push(text(value));
+                    }
                 }
             }
             let mut include = |flags: &mut Vec<String>, path: &[u8], system, framework| {
@@ -786,9 +798,8 @@ impl TargetSettings<'_> {
                     .to_str()?
                     .to_owned();
                 let name = text(&dep.metadata.name);
-                let path = self.bin.join(format!(
-                    "build/{name}.build/{CONFIG_DIR}/Objects-normal/$(CURRENT_ARCH)/{stem}.o"
-                ));
+                let path = target_temp_dir(self.bin, &dep.metadata.binary_dir, &dep.metadata.name)
+                    .join(format!("Objects-normal/$(CURRENT_ARCH)/{stem}.o"));
                 return Some((
                     format!("{name}/{stem}"),
                     path.to_string_lossy().into_owned(),

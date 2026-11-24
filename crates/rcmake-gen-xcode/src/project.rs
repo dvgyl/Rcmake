@@ -276,7 +276,7 @@ impl Project<'_> {
             &mut self.objects,
             "project/listfile",
             &listfile.to_string_lossy(),
-            "sourcecode.text",
+            ("explicitFileType", "sourcecode.text"),
             "<absolute>",
         )?;
         tree.files.push(group(
@@ -639,7 +639,26 @@ impl Project<'_> {
                 |p| format!("generated/{}", p.display()),
             );
             let file_key = format!("{key}/file/{file_key}");
-            let file_type = file_type(&file);
+            let props = self
+                .model
+                .dir(raw.dir)
+                .source_props
+                .get(file.path.as_bytes());
+            let explicit = props
+                .and_then(|props| props.get(b"XCODE_EXPLICIT_FILE_TYPE"))
+                .filter(|value| !value.is_empty())
+                .map(|value| text(value));
+            let last_known = props
+                .and_then(|props| props.get(b"XCODE_LAST_KNOWN_FILE_TYPE"))
+                .filter(|value| !value.is_empty())
+                .map(|value| text(value));
+            let file_type = if let Some(value) = explicit.as_deref() {
+                ("explicitFileType", value)
+            } else if let Some(value) = last_known.as_deref() {
+                ("lastKnownFileType", value)
+            } else {
+                ("explicitFileType", file_type(&file))
+            };
             let file_ref = file_ref(
                 &mut self.objects,
                 &file_key,
@@ -740,7 +759,7 @@ impl Project<'_> {
                 &mut self.objects,
                 &format!("product/{name}"),
                 &product.file(),
-                product.types().1,
+                ("explicitFileType", product.types().1),
                 "BUILT_PRODUCTS_DIR",
             )?);
             build_phases.extend(self.embeds(&key, raw)?);
@@ -833,7 +852,7 @@ impl Project<'_> {
                     &mut self.objects,
                     &file_key,
                     &item,
-                    "wrapper.framework",
+                    ("explicitFileType", "wrapper.framework"),
                     source_tree,
                 )?;
                 files.push(phases::build_file(
@@ -1006,7 +1025,7 @@ fn file_ref(
     objects: &mut Objects,
     key: &str,
     path: &str,
-    file_type: &str,
+    file_type: (&str, &str),
     tree: &str,
 ) -> Result<Reference, GenError> {
     let name = Path::new(path)
@@ -1017,7 +1036,7 @@ fn file_ref(
         key,
         &name,
         attrs([
-            ("explicitFileType", file_type.into()),
+            (file_type.0, file_type.1.into()),
             ("name", name.to_string().into()),
             ("path", path.into()),
             ("sourceTree", tree.into()),
@@ -1213,7 +1232,7 @@ fn file_type(file: &Source) -> &'static str {
             Some("xcassets") => "folder.assetcatalog",
             Some("storyboard") => "file.storyboard",
             Some("xib") => "file.xib",
-            _ => "file",
+            _ => "default",
         },
     }
 }

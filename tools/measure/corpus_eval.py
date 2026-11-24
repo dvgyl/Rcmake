@@ -319,14 +319,20 @@ def evaluate(
         ctest = work / "ctest"
         ctest.symlink_to(cmake)
 
+    xcode = args.generator == "Xcode"
+    compile_commands_args = [] if xcode else ["-DCMAKE_EXPORT_COMPILE_COMMANDS=ON"]
     commands = {
         "configure": [str(cmake), "-S", str(source), "-B", str(build), "-G", args.generator,
-         "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON", f"-DCMAKE_INSTALL_PREFIX={prefix}",
+         *compile_commands_args, f"-DCMAKE_INSTALL_PREFIX={prefix}",
          *configure_args],
         "build": [str(cmake), "--build", str(build), "--parallel", JOBS],
         "install": [str(cmake), "--install", str(build)],
         "test": [str(ctest), "--output-on-failure", "--no-tests=error", "--parallel", JOBS],
     }
+    if xcode:
+        commands["build"].extend(["--config", "Release"])
+        commands["install"].extend(["--config", "Release"])
+        commands["test"].extend(["-C", "Release"])
     generators = [] if prerequisite else args.cpack_generators or project.get("cpack_generators", [])
     if generators and cpack is None:
         cpack = work / "cpack"
@@ -364,7 +370,7 @@ def evaluate(
 
     result = {"stages": stages}
     try:
-        if stages["configure"]["returncode"] == 0:
+        if not xcode and stages["configure"]["returncode"] == 0:
             result["compile_commands"] = compile_database(build, roots)
         if stages["install"]["returncode"] == 0:
             result["install_tree"] = install_tree(prefix)
@@ -497,7 +503,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--tier", choices=("1", "2", "3", "all"), default="all")
     parser.add_argument("--project", help="Project name, for example zlib or nlohmann/json.")
-    parser.add_argument("--generator", choices=("Ninja", "Unix Makefiles"), default="Ninja")
+    parser.add_argument("--generator", choices=("Ninja", "Unix Makefiles", "Xcode"), default="Ninja")
     parser.add_argument("--oracle-only", action="store_true", help="Run only the pinned CMake oracle.")
     parser.add_argument(
         "--cpack-generators", metavar="TGZ,ZIP",
@@ -522,7 +528,7 @@ def main() -> int:
         for project in projects:
             if "cpack_generators" in project:
                 project["cpack_generators"] = package_generators(project["cpack_generators"])
-        generator_tool = {"Ninja": "ninja", "Unix Makefiles": "make"}[args.generator]
+        generator_tool = {"Ninja": "ninja", "Unix Makefiles": "make", "Xcode": "xcodebuild"}[args.generator]
         if shutil.which(generator_tool) is None:
             raise ValueError(f"{generator_tool} is required for {args.generator}.")
         if "RCMAKE_ORACLE_CMAKE" not in os.environ:

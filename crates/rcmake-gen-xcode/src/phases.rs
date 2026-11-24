@@ -70,6 +70,7 @@ pub(crate) struct Script {
     lines: BTreeMap<String, Vec<String>>,
     inputs: BTreeSet<String>,
     outputs: BTreeSet<String>,
+    comment: Option<String>,
     always: bool,
 }
 
@@ -110,12 +111,13 @@ impl Script {
         self,
         objects: &mut Objects,
         key: &str,
-        name: &str,
+        default_name: &str,
         configs: &[String],
     ) -> Result<Option<Reference>, GenError> {
         if self.lines.is_empty() {
             return Ok(None);
         }
+        let name = self.comment.as_deref().unwrap_or(default_name);
         let mut script = String::from("set -e\n");
         for config in configs {
             if let Some(lines) = self.lines.get(config) {
@@ -183,6 +185,9 @@ impl Custom {
                 } else {
                     text(&step.working_dir)
                 };
+                if phase.lines.is_empty() {
+                    phase.comment = step.comment.as_ref().map(|comment| text(comment));
+                }
                 phase.push(
                     &config,
                     &cwd,

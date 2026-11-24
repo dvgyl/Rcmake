@@ -409,6 +409,8 @@ fn native_xcodebuild_compiles_and_runs_program() {
     host.create_dir_all(&source.join("include dir"))
         .expect("source dir");
     host.create_dir_all(&out).expect("build dir");
+    host.create_dir_all(&source.join("objects"))
+        .expect("object source dir");
     for (file, data) in [
         (
             "main.c",
@@ -420,11 +422,15 @@ fn native_xcodebuild_compiles_and_runs_program() {
         ("resource.txt", "sample resource\n"),
         ("core.c", "int core(void) { return 30; }\n"),
         ("shared.c", "int shared(void) { return 2; }\n"),
-        ("object.c", "int obj(void) { return 3; }\n"),
+        ("objects/object.c", "int obj(void) { return 3; }\n"),
+        (
+            "objects/CMakeLists.txt",
+            "add_library(object OBJECT object.c)\n",
+        ),
         ("generate.in", "int generated(void) { return 7; }\n"),
         (
             "CMakeLists.txt",
-            "cmake_minimum_required(VERSION 4.5)\nproject(Demo C)\nadd_library(core STATIC core.c)\nadd_library(shared SHARED shared.c)\nset_target_properties(shared PROPERTIES VERSION 5.2.0 SOVERSION 5)\nadd_library(object OBJECT object.c)\nadd_custom_command(OUTPUT generated.c COMMAND /bin/cp \"${CMAKE_CURRENT_SOURCE_DIR}/generate.in\" generated.c DEPENDS generate.in VERBATIM)\nadd_executable(app main.c generated.c)\ntarget_link_libraries(app PRIVATE core shared object)\ntarget_include_directories(app PRIVATE \"include dir\")\nset_source_files_properties(main.c PROPERTIES COMPILE_OPTIONS -DMAIN_ONLY)\nadd_library(bridge SHARED shared.c bridge.h)\nset_target_properties(bridge PROPERTIES FRAMEWORK TRUE PUBLIC_HEADER bridge.h)\nadd_executable(bundle MACOSX_BUNDLE bundle.c resource.txt)\nset_source_files_properties(resource.txt PROPERTIES MACOSX_PACKAGE_LOCATION Resources)\n",
+            "cmake_minimum_required(VERSION 4.5)\nproject(Demo C)\nadd_library(core STATIC core.c)\nadd_library(shared SHARED shared.c)\nset_target_properties(shared PROPERTIES VERSION 5.2.0 SOVERSION 5)\nadd_subdirectory(objects)\nadd_custom_command(OUTPUT generated.c COMMAND /bin/cp \"${CMAKE_CURRENT_SOURCE_DIR}/generate.in\" generated.c DEPENDS generate.in VERBATIM)\nadd_executable(app main.c generated.c)\ntarget_link_libraries(app PRIVATE core shared object)\ntarget_include_directories(app PRIVATE \"include dir\")\nset_source_files_properties(main.c PROPERTIES COMPILE_OPTIONS -DMAIN_ONLY)\nadd_library(bridge SHARED shared.c bridge.h)\nset_target_properties(bridge PROPERTIES FRAMEWORK TRUE PUBLIC_HEADER bridge.h)\nadd_executable(bundle MACOSX_BUNDLE bundle.c resource.txt)\nset_source_files_properties(resource.txt PROPERTIES MACOSX_PACKAGE_LOCATION Resources)\n",
         ),
     ] {
         host.write(&source.join(file), data.as_bytes(), WriteMode::Truncate)
@@ -451,12 +457,26 @@ fn native_xcodebuild_compiles_and_runs_program() {
     );
     prop(&mut model, shared, "VERSION", "5.2.0");
     prop(&mut model, shared, "SOVERSION", "5");
-    add(
-        &mut model,
-        "object",
+    let objects = model
+        .add_directory(
+            DirId::ROOT,
+            from_native(&source.join("objects")),
+            from_native(&out.join("objects")),
+            Default::default(),
+        )
+        .expect("object directory");
+    let mut object = Target::new(
+        "object".into(),
         TargetKind::ObjectLibrary,
-        Some("object.c"),
+        TargetOrigin::Normal,
+        objects,
+        Default::default(),
+        Default::default(),
     );
+    object
+        .sources
+        .push(BT::new("object.c".into(), Default::default()));
+    model.add_target(object).expect("object library");
     let app = add(
         &mut model,
         "app",
