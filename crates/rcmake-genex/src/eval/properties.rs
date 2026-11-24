@@ -2,11 +2,72 @@ use rcmake_base::{BString, list};
 
 use super::{
     Call, Evaluator, Value, boolean,
-    targets::{DAGChecker, DAGEntry, FrameKind},
+    context::is_link_libraries_property,
+    targets::{DAGChecker, DAGEntry, FrameKind, valid_target},
 };
 use crate::{EvalContext, GenexError, TargetHandle, parse};
 
 impl Evaluator<'_> {
+    /// Check target property arguments before the evaluator reads the property.
+    pub(super) fn validate_target_property_arguments(
+        &mut self,
+        call: Call<'_>,
+        arguments: &[BString],
+    ) -> Result<(), GenexError> {
+        let message = match arguments {
+            [] => "$<TARGET_PROPERTY> expression requires at least one parameter.",
+            [_] if call.ctx.head.is_none() => {
+                "$<TARGET_PROPERTY:prop> may only be used with binary targets.  It may not be used with add_custom_command or add_custom_target.  Specify the target to read a property from using the $<TARGET_PROPERTY:tgt,prop> signature instead."
+            }
+            [target, property] if target.is_empty() => {
+                if property.is_empty() {
+                    "$<TARGET_PROPERTY:tgt,prop> expression requires a non-empty target name and property name."
+                } else {
+                    "$<TARGET_PROPERTY:tgt,prop> expression requires a non-empty target name."
+                }
+            }
+            [target, property]
+                if !valid_target(target) && (property.is_empty() || !valid_property(property)) =>
+            {
+                "Target name and property name not supported."
+            }
+            [property] | [_, property] => {
+                return self.check_target_property_link_recursion(call, arguments, property);
+            }
+            _ => "$<TARGET_PROPERTY:...> expression requires one or two parameters",
+        };
+        Err(call.error(message))
+    }
+
+    fn check_target_property_link_recursion(
+        &mut self,
+        call: Call<'_>,
+        arguments: &[BString],
+        property: &[u8],
+    ) -> Result<(), GenexError> {
+        // The site names the link entry when a usage walk evaluates its links.
+        if self.in_target_expression
+            || !call
+                .ctx
+                .site
+                .property
+                .as_ref()
+                .is_some_and(|property| is_link_libraries_property(property))
+            || !requires_link_closure(property)
+        {
+            return Ok(());
+        }
+        if let [name, _] = arguments {
+            if !valid_target(name) {
+                return Ok(());
+            }
+            self.require_target(call, name)?;
+        }
+        Err(call.error(
+            "$<TARGET_PROPERTY:...> expression in link libraries evaluation depends on target property which is transitive over the link libraries, creating a recursion.",
+        ))
+    }
+
     pub(super) fn scoped_property(&mut self, call: Call<'_>) -> Value {
         self.flags.context_sensitive = true;
         match call.name {
@@ -183,11 +244,35 @@ pub(super) fn source_scope<'a>(
     Err(call.error("Invalid option.  DIRECTORY: or TARGET_DIRECTORY: expected."))
 }
 
-pub(super) fn validate_property(call: Call<'_>, name: &[u8]) -> Result<(), GenexError> {
-    if name
-        .iter()
+fn requires_link_closure(property: &[u8]) -> bool {
+    // Link evaluation checks built-in usage properties. It allows link lists.
+    let base = property.strip_prefix(b"INTERFACE_").unwrap_or(property);
+    matches!(
+        base,
+        b"AUTOMOC_MACRO_NAMES"
+            | b"AUTOUIC_OPTIONS"
+            | b"COMPILE_DEFINITIONS"
+            | b"COMPILE_FEATURES"
+            | b"COMPILE_OPTIONS"
+            | b"COMPILE_WRAPPERS"
+            | b"INCLUDE_DIRECTORIES"
+            | b"LINK_DEPENDS"
+            | b"LINK_DIRECTORIES"
+            | b"LINK_OPTIONS"
+            | b"LINK_WRAPPERS"
+            | b"PRECOMPILE_HEADERS"
+            | b"SOURCES"
+            | b"SYSTEM_INCLUDE_DIRECTORIES"
+    )
+}
+
+fn valid_property(name: &[u8]) -> bool {
+    name.iter()
         .all(|byte| byte.is_ascii_alphanumeric() || b"_:".contains(byte))
-    {
+}
+
+pub(super) fn validate_property(call: Call<'_>, name: &[u8]) -> Result<(), GenexError> {
+    if valid_property(name) {
         Ok(())
     } else {
         Err(call.error("Property name not supported."))

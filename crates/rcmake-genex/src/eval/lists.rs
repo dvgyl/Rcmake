@@ -5,7 +5,10 @@ use rcmake_base::{
     list_ops::{self, SortCompare, SortOptions},
 };
 
-use super::{Call, Evaluator, Value, boolean, strict_bool, strings::convert};
+use super::{
+    Call, Evaluator, Value, boolean,
+    strings::{RegexSearch, convert},
+};
 use crate::{GenexError, GenexNode};
 
 type Result<T> = std::result::Result<T, GenexError>;
@@ -14,6 +17,14 @@ type Result<T> = std::result::Result<T, GenexError>;
 struct ListArguments<'a> {
     values: Vec<BString>,
     bodies: Vec<(usize, &'a [GenexNode])>,
+}
+
+enum TransformSelector {
+    All,
+    At(Vec<i64>),
+    For { start: i64, stop: i64, step: usize },
+    Regex(rcmake_regex::Regex),
+    PredicateMatches(Vec<usize>),
 }
 
 impl<'a> ListArguments<'a> {
@@ -27,12 +38,11 @@ impl<'a> ListArguments<'a> {
         match self.values.as_slice() {
             [op, _, _, mode] if op == "FILTER" => mode == "PREDICATE",
             [op, _, options @ ..] if op == "SORT" => {
-                self.bodies.is_empty() && options.last().is_some_and(|opt| opt == "COMPARATOR")
+                options.last().is_some_and(|opt| opt == "COMPARATOR")
             }
             [op, _, action, options @ ..] if op == "TRANSFORM" => {
-                let fixed = transform_arity(action).unwrap_or_default();
                 (action == "APPLY" && options.is_empty())
-                    || (options.len() == fixed + 1
+                    || (transform_arity(action).is_some_and(|arity| options.len() == arity + 1)
                         && options.last().is_some_and(|opt| opt == "PREDICATE"))
             }
             _ => false,
@@ -159,12 +169,19 @@ impl Evaluator<'_> {
             (b"FILTER", [mode, kind, pattern])
                 if matches!(kind.as_slice(), b"REGEX" | b"PREDICATE") =>
             {
-                self.filter(call, &mut items, mode, pattern, args.body(4))?;
+                let body = if kind == "PREDICATE" {
+                    Some(args.body(4).ok_or_else(|| {
+                        call.error(
+                            "sub-command FILTER, PREDICATE expects a single <body> argument.",
+                        )
+                    })?)
+                } else {
+                    None
+                };
+                self.filter(call, &mut items, mode, pattern, body)?;
             }
             (b"TRANSFORM", [action, params @ ..]) => {
-                if !items.is_empty() {
-                    self.transform(call, &mut items, action, params, &args)?;
-                }
+                self.transform(call, &mut items, action, params, &args)?;
             }
             (b"REVERSE", []) => items.reverse(),
             (b"SORT", options) => self.sort(call, &mut items, options, &args)?,
@@ -196,7 +213,7 @@ impl Evaluator<'_> {
             b"INCLUDE" => true,
             b"EXCLUDE" => false,
             _ if call.name == b"LIST" => return Err(call.error(format!(
-                "sub-command FILTER does not recognize operator \"{}\".  It must be either INCLUDE or EXCLUDE.",
+                "sub-command FILTER does not recognize operator \"{}\". It must be either INCLUDE or EXCLUDE.",
                 BString::from(mode),
             ))),
             _ => return Err(call.error("The filter mode must be INCLUDE or EXCLUDE.")),
@@ -213,8 +230,7 @@ impl Evaluator<'_> {
         let mut kept = Vec::new();
         for item in items.drain(..) {
             let matched = if let Some(body) = body {
-                let value = self.bound(body, call.ctx, vec![item.clone()])?;
-                strict_bool(call, &value)?
+                self.bound_boolean(call, body, vec![item.clone()], "FILTER, PREDICATE")?
             } else if let Some(regex) = &regex {
                 self.regex_matches(call, regex, &item)?
             } else {
@@ -228,6 +244,24 @@ impl Evaluator<'_> {
         Ok(())
     }
 
+    fn bound_boolean(
+        &mut self,
+        call: Call<'_>,
+        body: &[GenexNode],
+        values: Vec<BString>,
+        operation: &str,
+    ) -> Result<bool> {
+        let value = self.bound(body, call.ctx, values)?;
+        self.charge(value.len().max(1))?;
+        match value.as_slice() {
+            b"0" => Ok(false),
+            b"1" => Ok(true),
+            _ => Err(call.error(format!(
+                "sub-command {operation} body must evaluate to \"0\" or \"1\", but evaluated to \"{value}\"."
+            ))),
+        }
+    }
+
     fn transform(
         &mut self,
         call: Call<'_>,
@@ -236,17 +270,59 @@ impl Evaluator<'_> {
         params: &[BString],
         args: &ListArguments<'_>,
     ) -> Result<()> {
-        let arity = transform_arity(action).ok_or_else(|| {
-            call.error(format!("sub-command TRANSFORM, {action} invalid action."))
-        })?;
-        if params.len() < arity {
+        let Some(arity) = transform_arity(action) else {
+            if items.is_empty() {
+                return Ok(());
+            }
+            return Err(call.error(format!(" sub-command TRANSFORM, {action} invalid action.")));
+        };
+        let apply_body = if action == "APPLY" {
+            Some(args.body(3).ok_or_else(|| {
+                call.error("sub-command TRANSFORM, action APPLY expects a <body> argument.")
+            })?)
+        } else {
+            None
+        };
+        let Some((operands, selector)) = params.split_at_checked(arity) else {
+            if items.is_empty() {
+                return Ok(());
+            }
             return Err(call.error(format!(
                 "sub-command TRANSFORM, action {action} expects {arity} argument(s)."
             )));
+        };
+        let predicate = selector.first().is_some_and(|kind| kind == "PREDICATE");
+        if predicate && selector.len() > 2 {
+            return Err(call.error(
+                "sub-command TRANSFORM, selector PREDICATE expects a single <body> argument and cannot be combined with another selector.",
+            ));
         }
-        let (operands, selector) = params.split_at(arity);
-        if let (b"REPLACE", [pattern, replacement]) = (action.as_slice(), operands) {
-            let _ = list_regex(
+        let predicate_body = if predicate {
+            Some(args.body(arity + 4).ok_or_else(|| {
+                call.error("sub-command TRANSFORM, selector PREDICATE expects a <body> argument.")
+            })?)
+        } else {
+            None
+        };
+        if items.is_empty() {
+            return Ok(());
+        }
+        let selector = if let Some(body) = predicate_body {
+            let mut selected = Vec::new();
+            for (index, item) in items.iter().enumerate() {
+                if self.bound_boolean(call, body, vec![item.clone()], "TRANSFORM, PREDICATE")? {
+                    selected.push(index);
+                }
+            }
+            if selected.is_empty() {
+                return Ok(());
+            }
+            TransformSelector::PredicateMatches(selected)
+        } else {
+            parse_selector(call, selector)?
+        };
+        let replace = if let (b"REPLACE", [pattern, replacement]) = (action.as_slice(), operands) {
+            let regex = list_regex(
                 call,
                 pattern,
                 "sub-command TRANSFORM, action REPLACE: Failed",
@@ -264,34 +340,47 @@ impl Evaluator<'_> {
                     .concat(),
                 )
             })?;
+            self.flags.context_sensitive = true;
+            let bol_at_start = self.host.directory_policy(b"CMP0186", call.ctx) != Some(true);
+            Some((regex, pattern, replacement, bol_at_start))
+        } else {
+            None
+        };
+        let unique_indexes = apply_body.is_some() && matches!(selector, TransformSelector::At(_));
+        let mut selected = self.selected(call, items, selector)?;
+        if unique_indexes {
+            selected.sort_unstable();
+            selected.dedup();
         }
-        let selected = self.selected(call, items, selector, args.body(arity + 4))?;
         for index in selected {
             let Some(item) = items.get_mut(index) else {
                 continue;
             };
-            let transformed = match (action.as_slice(), operands) {
-                (b"APPEND", [value]) => {
+            let transformed = match (action.as_slice(), operands, &replace, apply_body) {
+                (b"APPEND", [value], _, _) => {
                     self.charge(item.len().saturating_add(value.len()))?;
                     self.append(item, value)?;
                     continue;
                 }
-                (b"PREPEND", [value]) => {
+                (b"PREPEND", [value], _, _) => {
                     let mut out = value.clone();
                     self.append(&mut out, item)?;
                     out
                 }
-                (b"TOLOWER" | b"TOUPPER", _) => convert(action, item),
-                (b"STRIP", _) => list_ops::strip_spaces(item).into(),
-                (b"REPLACE", [pattern, replacement]) => {
-                    self.regex_output(call, item, pattern, Some(replacement), true)?
-                }
-                (b"APPLY", [_]) => {
-                    let body = args
-                        .body(3)
-                        .ok_or_else(|| call.error("APPLY requires a body."))?;
-                    self.bound(body, call.ctx, vec![item.clone()])?
-                }
+                (b"TOLOWER" | b"TOUPPER", _, _, _) => convert(action, item),
+                (b"STRIP", _, _, _) => list_ops::strip_spaces(item).into(),
+                (_, _, Some((regex, pattern, replacement, bol_at_start)), _) => self
+                    .regex_output_compiled(
+                        call,
+                        regex,
+                        item,
+                        Some(replacement),
+                        RegexSearch::ListReplace {
+                            bol_at_start: *bol_at_start,
+                            pattern,
+                        },
+                    )?,
+                (_, _, _, Some(body)) => self.bound(body, call.ctx, vec![item.clone()])?,
                 _ => return Err(call.error("Invalid transformation operands.")),
             };
             self.charge(transformed.len().max(1))?;
@@ -304,59 +393,23 @@ impl Evaluator<'_> {
         &mut self,
         call: Call<'_>,
         items: &[BString],
-        selector: &[BString],
-        body: Option<&[GenexNode]>,
+        selector: TransformSelector,
     ) -> Result<Vec<usize>> {
         match selector {
-            [] => Ok((0..items.len()).collect()),
-            [kind, indexes @ ..] if kind == "AT" => {
-                let indexes = flatten(indexes).collect::<Vec<_>>();
-                if indexes.is_empty() {
-                    return Err(call.error(
-                        "sub-command TRANSFORM, selector AT expects at least one numeric value.",
-                    ));
-                }
-                indexes.iter().map(|index| {
-                    if list_ops::parse_index(index).is_none() {
-                        return Err(call.error(format!("sub-command TRANSFORM, selector AT: '{index}': unexpected argument.")));
-                    }
-                    selector_index(call, kind, index, items.len())
-                }).collect()
-            }
-            [kind, operands @ ..] if kind == "FOR" => {
-                let [start, stop, tail @ ..] = operands else {
-                    return Err(call.error(
-                        "sub-command TRANSFORM, selector FOR expects, at least, two arguments.",
-                    ));
-                };
-                if list_ops::parse_index(start).is_none() || list_ops::parse_index(stop).is_none() {
-                    return Err(call.error("sub-command TRANSFORM, selector FOR expects, at least, two numeric values."));
-                }
-                let step = match tail.first() {
-                    Some(step) => list_ops::parse_index(step)
-                        .and_then(|n| usize::try_from(n).ok())
-                        .filter(|&n| n > 0)
-                        .ok_or_else(|| call.error("sub-command TRANSFORM, selector FOR expects positive numeric value for <step>."))?,
-                    None => 1,
-                };
-                reject_selector_tail(call, kind, tail.get(1..).unwrap_or_default())?;
-                let start = selector_index(call, kind, start, items.len())?;
-                let stop = selector_index(call, kind, stop, items.len())?;
+            TransformSelector::All => Ok((0..items.len()).collect()),
+            TransformSelector::At(indexes) => indexes
+                .into_iter()
+                .map(|index| selector_index(call, b"AT", index, items.len()))
+                .collect(),
+            TransformSelector::For { start, stop, step } => {
+                let start = selector_index(call, b"FOR", start, items.len())?;
+                let stop = selector_index(call, b"FOR", stop, items.len())?;
                 if start > stop {
                     return Err(call.error(format!("sub-command TRANSFORM, selector FOR expects <start> to be no greater than <stop> ({start} > {stop})")));
                 }
                 Ok((start..=stop).step_by(step).collect())
             }
-            [kind, options @ ..] if kind == "REGEX" => {
-                let [pattern, tail @ ..] = options else {
-                    return Err(call.error("sub-command TRANSFORM, selector REGEX expects 'regular expression' argument."));
-                };
-                reject_selector_tail(call, kind, tail)?;
-                let regex = list_regex(
-                    call,
-                    pattern,
-                    "sub-command TRANSFORM, selector REGEX failed",
-                )?;
+            TransformSelector::Regex(regex) => {
                 let mut selected = Vec::new();
                 for (index, item) in items.iter().enumerate() {
                     if self.regex_matches(call, &regex, item)? {
@@ -365,18 +418,7 @@ impl Evaluator<'_> {
                 }
                 Ok(selected)
             }
-            [kind, _] if kind == "PREDICATE" => {
-                let body = body.ok_or_else(|| call.error("PREDICATE requires a body."))?;
-                let mut selected = Vec::new();
-                for (index, item) in items.iter().enumerate() {
-                    let value = self.bound(body, call.ctx, vec![item.clone()])?;
-                    if strict_bool(call, &value)? {
-                        selected.push(index);
-                    }
-                }
-                Ok(selected)
-            }
-            _ => reject_selector_tail(call, b"", selector).map(|()| Vec::new()),
+            TransformSelector::PredicateMatches(selected) => Ok(selected),
         }
     }
 
@@ -389,12 +431,33 @@ impl Evaluator<'_> {
     ) -> Result<()> {
         let mut parsed = SortOptions::default();
         let mut seen = HashSet::new();
-        let mut body = None;
-        let mut options = options.iter().enumerate();
-        while let Some((i, option)) = options.next() {
+        let comparator = options.iter().position(|option| option == "COMPARATOR");
+        let body = comparator
+            .map(|index| {
+                args.body(index + 3).ok_or_else(|| {
+                    call.error("sub-command SORT, COMPARATOR expects a <body> argument.")
+                })
+            })
+            .transpose()?;
+        for (index, option) in options.iter().enumerate() {
+            if comparator.is_some_and(|start| index == start || index == start + 1) {
+                continue;
+            }
             let mut parts = option.splitn(2, |&byte| byte == b':');
             let key = parts.next().unwrap_or_default();
-            let value = parts.next().unwrap_or_default();
+            let Some(value) = parts
+                .next()
+                .filter(|_| matches!(key, b"COMPARE" | b"CASE" | b"ORDER"))
+            else {
+                return Err(
+                    call.error(format!("sub-command SORT, option \"{option}\" is invalid."))
+                );
+            };
+            if comparator.is_some() && key == b"COMPARE" {
+                return Err(call.error(
+                    "sub-command SORT, option \"COMPARE\" is incompatible with \"COMPARATOR\".",
+                ));
+            }
             if !seen.insert(key) {
                 return Err(call.error(format!(
                     "sub-command SORT, {} option has been specified multiple times.",
@@ -409,31 +472,16 @@ impl Evaluator<'_> {
                 (b"CASE", b"INSENSITIVE") => parsed.insensitive = true,
                 (b"ORDER", b"ASCENDING") => parsed.descending = false,
                 (b"ORDER", b"DESCENDING") => parsed.descending = true,
-                (b"COMPARATOR", b"") => {
-                    options.next();
-                    body = Some(
-                        args.body(i + 3)
-                            .ok_or_else(|| call.error("COMPARATOR requires a body."))?,
-                    );
-                }
-                (b"COMPARE" | b"CASE" | b"ORDER", _) => {
+                _ => {
                     return Err(call.error(format!(
                         "sub-command SORT, an invalid {} option has been specified: \"{}\".",
                         BString::from(key),
                         BString::from(value),
                     )));
                 }
-                _ => {
-                    return Err(
-                        call.error(format!("sub-command SORT, option \"{option}\" is invalid."))
-                    );
-                }
             }
         }
         if let Some(body) = body {
-            if seen.contains(b"COMPARE".as_slice()) {
-                return Err(call.error("COMPARATOR cannot be combined with COMPARE."));
-            }
             return self.sort_bound(call, items, parsed, body);
         }
         list_ops::sort_items(items, parsed);
@@ -447,7 +495,23 @@ impl Evaluator<'_> {
         options: SortOptions,
         body: &[GenexNode],
     ) -> Result<()> {
+        if items.len() < 2 {
+            return Ok(());
+        }
         // Merge runs without assuming that the user callback defines a valid order.
+        let mut compare = |first: &BString, second: &BString| {
+            let operands = [first, second]
+                .into_iter()
+                .map(|item| {
+                    if options.insensitive {
+                        item.to_ascii_lowercase().into()
+                    } else {
+                        item.clone()
+                    }
+                })
+                .collect();
+            self.bound_boolean(call, body, operands, "SORT, COMPARATOR")
+        };
         let mut order: Vec<_> = items.iter().collect();
         let mut merged = Vec::with_capacity(order.len());
         let mut width = 1;
@@ -464,22 +528,11 @@ impl Evaluator<'_> {
                     } else {
                         (right_item, left_item)
                     };
-                    let operands = [first, second]
-                        .into_iter()
-                        .map(|item| {
-                            if options.insensitive {
-                                item.to_ascii_lowercase().into()
-                            } else {
-                                item.clone()
-                            }
-                        })
-                        .collect();
-                    let value = self.bound(body, call.ctx, operands)?;
-                    let next = if strict_bool(call, &value)? {
-                        right.next()
-                    } else {
-                        left.next()
-                    };
+                    let precedes = compare(first, second)?;
+                    if precedes && compare(second, first)? {
+                        return Err(call.error("sub-command SORT, COMPARATOR: function does not induce a strict weak ordering. The comparator returned TRUE for both (a, b) and (b, a)."));
+                    }
+                    let next = if precedes { right.next() } else { left.next() };
                     merged.extend(next);
                 }
                 merged.extend(left);
@@ -541,12 +594,75 @@ fn transform_arity(action: &[u8]) -> Option<usize> {
     })
 }
 
+fn parse_selector(call: Call<'_>, selector: &[BString]) -> Result<TransformSelector> {
+    match selector {
+        [] => Ok(TransformSelector::All),
+        [kind, indexes @ ..] if kind == "AT" => {
+            let indexes = indexes
+                .iter()
+                .flat_map(|index| list::iter(index, list::Empty::Drop))
+                .map(|index| {
+                    list_ops::parse_index(&index).ok_or_else(|| {
+                        call.error(format!(
+                            "sub-command TRANSFORM, selector AT: '{}': unexpected argument.",
+                            BString::from(index.into_owned()),
+                        ))
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            if indexes.is_empty() {
+                return Err(call.error(
+                    "sub-command TRANSFORM, selector AT expects at least one numeric value.",
+                ));
+            }
+            Ok(TransformSelector::At(indexes))
+        }
+        [kind, operands @ ..] if kind == "FOR" => {
+            let [start, stop, tail @ ..] = operands else {
+                return Err(call.error(
+                    "sub-command TRANSFORM, selector FOR expects, at least, two arguments.",
+                ));
+            };
+            let (Some(start), Some(stop)) =
+                (list_ops::parse_index(start), list_ops::parse_index(stop))
+            else {
+                return Err(call.error(
+                    "sub-command TRANSFORM, selector FOR expects, at least, two numeric values.",
+                ));
+            };
+            let step = match tail.first() {
+                Some(step) => list_ops::parse_index(step)
+                    .and_then(|n| usize::try_from(n).ok())
+                    .filter(|&n| n > 0)
+                    .ok_or_else(|| call.error("sub-command TRANSFORM, selector FOR expects positive numeric value for <step>."))?,
+                None => 1,
+            };
+            reject_selector_tail(call, kind, tail.get(1..).unwrap_or_default())?;
+            Ok(TransformSelector::For { start, stop, step })
+        }
+        [kind, operands @ ..] if kind == "REGEX" => {
+            let [pattern, tail @ ..] = operands else {
+                return Err(call.error(
+                    "sub-command TRANSFORM, selector REGEX expects 'regular expression' argument.",
+                ));
+            };
+            let regex = list_regex(
+                call,
+                pattern,
+                "sub-command TRANSFORM, selector REGEX failed",
+            )?;
+            reject_selector_tail(call, kind, tail)?;
+            Ok(TransformSelector::Regex(regex))
+        }
+        _ => reject_selector_tail(call, b"", selector).map(|()| TransformSelector::All),
+    }
+}
+
 fn reject_selector_tail(call: Call<'_>, selector: &[u8], tail: &[BString]) -> Result<()> {
     let Some(first) = tail.first() else {
         return Ok(());
     };
-    if !selector.is_empty() && matches!(first.as_slice(), b"REGEX" | b"AT" | b"FOR" | b"PREDICATE")
-    {
+    if !selector.is_empty() && matches!(first.as_slice(), b"REGEX" | b"AT" | b"FOR") {
         return Err(call.error(format!(
             "sub-command TRANSFORM, selector already specified ({}).",
             BString::from(selector)
@@ -562,8 +678,8 @@ fn reject_selector_tail(call: Call<'_>, selector: &[u8], tail: &[BString]) -> Re
     )))
 }
 
-fn selector_index(call: Call<'_>, selector: &[u8], index: &BString, len: usize) -> Result<usize> {
-    item_index(call, index, len, false).map_err(|error| match error {
+fn selector_index(call: Call<'_>, selector: &[u8], index: i64, len: usize) -> Result<usize> {
+    checked_item_index(call, index, len, false).map_err(|error| match error {
         GenexError::Message { message, .. } => call.error(format!(
             "sub-command TRANSFORM, selector {}, {message}.",
             BString::from(selector),

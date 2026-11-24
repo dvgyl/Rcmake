@@ -3,6 +3,15 @@ use rcmake_regex::{MatchOptions, Regex, expand_replacement};
 
 use super::{Call, Evaluator, Value, operations::operation_arity};
 
+pub(super) enum RegexSearch<'a> {
+    First,
+    All,
+    ListReplace {
+        bol_at_start: bool,
+        pattern: &'a [u8],
+    },
+}
+
 pub(super) fn convert(op: &[u8], value: &[u8]) -> BString {
     match op {
         b"LOWER_CASE" | b"TOLOWER" => value.to_ascii_lowercase().into(),
@@ -140,7 +149,12 @@ impl Evaluator<'_> {
                 BString::from(pattern)
             ))
         })?;
-        self.regex_output_compiled(call, &regex, value, replacement, all)
+        let search = if all {
+            RegexSearch::All
+        } else {
+            RegexSearch::First
+        };
+        self.regex_output_compiled(call, &regex, value, replacement, search)
     }
 
     fn concatenate(&self, op: &[u8], value: &[u8], items: &[BString]) -> Value {
@@ -197,28 +211,22 @@ impl Evaluator<'_> {
             .map_err(|err| call.error(err.to_string()))
     }
 
-    pub(super) fn regex_output(
-        &mut self,
-        call: Call<'_>,
-        value: &[u8],
-        pattern: &[u8],
-        replacement: Option<&[u8]>,
-        all: bool,
-    ) -> Value {
-        let regex = self.regex(call, pattern)?;
-        self.regex_output_compiled(call, &regex, value, replacement, all)
-    }
-
-    fn regex_output_compiled(
+    pub(super) fn regex_output_compiled(
         &mut self,
         call: Call<'_>,
         regex: &Regex,
         value: &[u8],
         replacement: Option<&[u8]>,
-        all: bool,
+        search: RegexSearch<'_>,
     ) -> Value {
-        let options = MatchOptions {
-            bol_at_start: false,
+        let mut options = MatchOptions {
+            bol_at_start: matches!(
+                search,
+                RegexSearch::ListReplace {
+                    bol_at_start: true,
+                    ..
+                }
+            ),
             allow_empty_at_start: true,
         };
         let mut out = BString::default();
@@ -238,7 +246,18 @@ impl Evaluator<'_> {
             if let Some(replacement) = replacement {
                 self.append(&mut out, value.get(copied..begin).unwrap_or_default())?;
                 let text = expand_replacement(replacement, value, &caps, regex.group_count())
-                    .map_err(|error| call.error(error.message))?;
+                    .map_err(|error| match search {
+                        RegexSearch::ListReplace { pattern, .. }
+                            if error.message.contains("contains an out-of-range escape for group") =>
+                        {
+                            call.error(format!(
+                                "sub-command TRANSFORM, action REPLACE: replace expression \"{}\" contains an out-of-range escape for regex \"{}\".",
+                                BString::from(replacement),
+                                BString::from(pattern),
+                            ))
+                        }
+                        _ => call.error(error.message),
+                    })?;
                 self.append(&mut out, &text)?;
                 copied = end;
             } else {
@@ -248,10 +267,15 @@ impl Evaluator<'_> {
                 self.append(&mut out, value.get(begin..end).unwrap_or_default())?;
             }
             matched = true;
-            if !all {
+            if matches!(search, RegexSearch::First) || begin == value.len() {
                 break;
             }
-            start = if end == begin { end + 1 } else { end };
+            if matches!(search, RegexSearch::ListReplace { .. }) {
+                start = end;
+                options.allow_empty_at_start = begin != end;
+            } else {
+                start = if end == begin { end + 1 } else { end };
+            }
         }
         if replacement.is_some() {
             self.append(&mut out, value.get(copied..).unwrap_or_default())?;

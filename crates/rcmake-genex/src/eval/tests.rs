@@ -15,9 +15,9 @@ const RIGHT: TargetHandle = TargetHandle(4);
 #[derive(Default)]
 struct Host {
     properties: HashMap<(TargetHandle, BString), BString>,
+    definitions: HashMap<BString, BString>,
     visits: Vec<TargetHandle>,
     limits: Limits,
-    device: bool,
 }
 
 impl Host {
@@ -107,6 +107,9 @@ impl GenexHost for Host {
     }
 
     fn definition(&self, name: &[u8]) -> Option<BString> {
+        if let Some(value) = self.definitions.get(name) {
+            return Some(value.clone());
+        }
         let value = match name {
             b"CMAKE_SYSTEM_NAME" => "Darwin",
             b"CMAKE_C_COMPILER_ID" => "Clang",
@@ -137,10 +140,6 @@ impl GenexHost for Host {
             }
             .into()
         })
-    }
-
-    fn is_device_link(&self, _ctx: &EvalContext) -> bool {
-        self.device
     }
 
     fn timestamp(&self, format: Option<&[u8]>, utc: bool) -> Option<BString> {
@@ -204,6 +203,38 @@ fn lazy_branches_and_recovered_delimiters() {
             run(input, &context(), &mut Host::default()),
             Err(GenexError::Message { .. })
         ));
+    }
+}
+
+#[test]
+fn boolean_arguments_preserve_short_circuit_and_error_order() {
+    let ctx = context();
+    let mut host = Host::default();
+    check(
+        &[("$<IF:$<ARGS:1;selected>,unused,unused>", "selected")],
+        &ctx,
+        &mut host,
+    );
+    for (expression, expected) in [
+        (
+            "$<IF:asdf,a,b>",
+            "First parameter to $<IF> must resolve to exactly one '0' or '1' value.",
+        ),
+        (
+            "$<IF:asdf,a>",
+            "$<IF> expression requires 3 comma separated parameters, but got 2 instead.",
+        ),
+        (
+            "$<AND:1,x>",
+            "Parameters to $<AND> must resolve to either '0' or '1'.",
+        ),
+        (
+            "$<OR:0,x>",
+            "Parameters to $<OR> must resolve to either '0' or '1'.",
+        ),
+    ] {
+        let error = run(expression.as_bytes(), &ctx, &mut host).unwrap_err();
+        assert_eq!(error.to_string(), expected);
     }
 }
 
@@ -387,6 +418,7 @@ fn list_callbacks_and_argument_expansion() {
                 "$<LIST:TRANSFORM,a;b,APPLY,$<UPPER_CASE:$<_0>>,PREDICATE,$<STREQUAL:$<_0>,b>>",
                 "a;B",
             ),
+            ("$<LIST:TRANSFORM,a;b,APPLY,x$<_0>,AT,1,1,0>", "xa;xb"),
             (
                 "$<LIST:SORT,B;a;C,COMPARATOR,$<STRLESS:$<_0>,$<_1>>,CASE:INSENSITIVE,ORDER:DESCENDING>",
                 "C;B;a",
@@ -395,7 +427,35 @@ fn list_callbacks_and_argument_expansion() {
         &context(),
         &mut Host::default(),
     );
-    assert!(run(b"$<_0>", &context(), &mut Host::default()).is_err());
+    for (expr, expected) in [
+        (
+            "$<_0>",
+            "$<_0> may only be used inside the body of a binding operation.",
+        ),
+        (
+            "$<LIST:TRANSFORM,a,APPLY,$<_1>>",
+            "$<_1> is out of range for the current binding operation",
+        ),
+        (
+            "$<LIST:TRANSFORM,,APPLY>",
+            "sub-command TRANSFORM, action APPLY expects a <body> argument.",
+        ),
+        (
+            "$<LIST:FILTER,a,INCLUDE,PREDICATE,x>",
+            "PREDICATE body must evaluate to \"0\" or \"1\"",
+        ),
+        (
+            "$<LIST:SORT,b;a,COMPARATOR,1>",
+            "does not induce a strict weak ordering",
+        ),
+        (
+            r"$<LIST:TRANSFORM,abc,REPLACE,(a),\2>",
+            r#"replace expression "\2" contains an out-of-range escape for regex "(a)""#,
+        ),
+    ] {
+        let error = run(expr.as_bytes(), &context(), &mut Host::default()).unwrap_err();
+        assert!(error.to_string().contains(expected), "{error}");
+    }
 }
 
 #[test]
@@ -460,6 +520,7 @@ fn contexts_and_interface_operators() {
     let mut ctx = context();
     ctx.output_config = Some(ConfigId("Release".into()));
     ctx.command_config = Some(ConfigId("MinSizeRel".into()));
+    ctx.site.property = Some("COMPILE_OPTIONS".into());
     check(
         &[
             (
@@ -470,17 +531,14 @@ fn contexts_and_interface_operators() {
                 "$<OUTPUT_CONFIG:$<CONFIG>>/$<COMMAND_CONFIG:$<CONFIG>>",
                 "Release/MinSizeRel",
             ),
-            (
-                "$<COMPILE_LANGUAGE>/$<COMPILE_LANGUAGE:C,CXX>/$<LINK_LANGUAGE>/$<LINK_LANGUAGE:CXX>",
-                "CXX/1/C/0",
-            ),
+            ("$<COMPILE_LANGUAGE>/$<COMPILE_LANGUAGE:C,CXX>", "CXX/1"),
             (
                 "$<C_COMPILER_ID>/$<CXX_COMPILER_ID:Clang,AppleClang>/$<C_COMPILER_VERSION:18.1.2.0>/$<CXX_COMPILER_VERSION>",
                 "Clang/1/1/21.0.0",
             ),
             (
-                "$<COMPILE_LANG_AND_ID:CXX,AppleClang>/$<LINK_LANG_AND_ID:C,Clang>/$<COMPILE_FEATURES:cxx_std_17,cxx_std_20>",
-                "1/1/1",
+                "$<COMPILE_LANG_AND_ID:CXX,AppleClang>/$<COMPILE_FEATURES:cxx_std_17,cxx_std_20>",
+                "1/1",
             ),
             (
                 "$<C_COMPILER_FRONTEND_VARIANT:GNU>/$<CXX_COMPILER_FRONTEND_VARIANT>",
@@ -490,18 +548,61 @@ fn contexts_and_interface_operators() {
                 "$<BUILD_INTERFACE:a,b>/$<BUILD_LOCAL_INTERFACE:c>/$<INSTALL_INTERFACE:$<BAD>>",
                 "a,b/c/",
             ),
-            ("$<LINK_ONLY:link>/$<COMPILE_ONLY:compile>", "/compile"),
         ],
+        &ctx,
+        &mut host,
+    );
+    ctx.site.property = Some("LINK_LIBRARIES".into());
+    host.set(HEAD, "CMP0131", "NEW");
+    check(
+        &[("$<LINK_ONLY:link>/$<COMPILE_ONLY:compile>", "/compile")],
         &ctx,
         &mut host,
     );
     ctx.traversal = UsageTraversal::Link;
     check(
+        &[("$<LINK_ONLY:link>/$<COMPILE_ONLY:compile>", "link/")],
+        &ctx,
+        &mut host,
+    );
+    ctx.site.property = Some("LINK_OPTIONS".into());
+    check(
         &[
-            ("$<LINK_ONLY:link>/$<COMPILE_ONLY:compile>", "link/"),
             ("$<HOST_LINK:-a,-b>/$<DEVICE_LINK:-c>", "-a;-b/"),
             (
-                "$<LINK_LIBRARY:DEFAULT,a;b>",
+                "$<COMPILE_LANGUAGE>/$<LINK_LANGUAGE>/$<LINK_LANGUAGE:CXX>/$<LINK_LANG_AND_ID:C,Clang>",
+                "C/C/0/1",
+            ),
+        ],
+        &ctx,
+        &mut host,
+    );
+    assert!(run(b"$<DEVICE_LINK:$<BAD>>", &ctx, &mut host).is_err());
+    ctx.device_link = true;
+    check(
+        &[(
+            "$<DEVICE_LINK:-a>/$<HOST_LINK:-b>",
+            "<DEVICE_LINK>;-a;</DEVICE_LINK>/",
+        )],
+        &ctx,
+        &mut host,
+    );
+    assert!(run(b"$<INSTALL_PREFIX>", &ctx, &mut host).is_err());
+}
+
+#[test]
+fn link_features_require_link_libraries_and_validate_members() {
+    let mut host = Host::default();
+    let mut ctx = context();
+    ctx.traversal = UsageTraversal::Link;
+    ctx.site.property = Some("LINK_OPTIONS".into());
+    assert!(run(b"$<LINK_GROUP:RESCAN>", &ctx, &mut host).is_err());
+    ctx.site.property = Some("LINK_LIBRARIES".into());
+    check(
+        &[
+            ("$<LINK_LIBRARY:DEFAULT>", ""),
+            (
+                "$<LINK_LIBRARY:DEFAULT,a;$<LINK_LIBRARY:DEFAULT,b>>",
                 "<LINK_LIBRARY:DEFAULT>;a;b;</LINK_LIBRARY:DEFAULT>",
             ),
             (
@@ -512,17 +613,118 @@ fn contexts_and_interface_operators() {
         &ctx,
         &mut host,
     );
-    assert!(run(b"$<DEVICE_LINK:$<BAD>>", &ctx, &mut host).is_err());
-    host.device = true;
+    for (expression, expected) in [
+        (
+            "$<LINK_GROUP:,>",
+            "$<LINK_GROUP:...> expects a feature name as first argument.",
+        ),
+        (
+            "$<LINK_GROUP:bad:name,a>",
+            "The feature name 'bad:name' contains invalid characters.",
+        ),
+        (
+            "$<LINK_GROUP:RESCAN,$<LINK_GROUP:RESCAN,a>>",
+            "$<LINK_GROUP:...> cannot be nested.",
+        ),
+        (
+            "$<LINK_LIBRARY:DEFAULT,$<LINK_LIBRARY:OTHER,a>>",
+            "$<LINK_LIBRARY:...> with different features cannot be nested.",
+        ),
+        (
+            "$<LINK_LIBRARY:DEFAULT,$<LINK_GROUP:RESCAN,a>>",
+            "$<LINK_GROUP:...> cannot be nested inside a $<LINK_LIBRARY:...> expression.",
+        ),
+    ] {
+        let error = run(expression.as_bytes(), &ctx, &mut host).unwrap_err();
+        assert_eq!(error.to_string(), expected);
+    }
+    host.set(HEAD, "LINK_LIBRARIES_ONLY_TARGETS", "ON");
     check(
-        &[(
-            "$<DEVICE_LINK:-a>/$<HOST_LINK:-b>",
-            "<DEVICE_LINK>;-a;</DEVICE_LINK>/",
-        )],
+        &[
+            (
+                "$<LINK_GROUP:RESCAN,other,-lexternal,/sdk/lib.a>",
+                "<LINK_GROUP:RESCAN:other|-lexternal|/sdk/lib.a>;other;-lexternal;/sdk/lib.a;</LINK_GROUP:RESCAN>",
+            ),
+            (
+                "$<IF:$<BOOL:$<LINK_GROUP:RESCAN,external>>,other,other>",
+                "other",
+            ),
+        ],
         &ctx,
         &mut host,
     );
-    assert!(run(b"$<INSTALL_PREFIX>", &ctx, &mut host).is_err());
+    let error = run(b"$<LINK_GROUP:RESCAN,external>", &ctx, &mut host).unwrap_err();
+    assert!(error.to_string().contains("LINK_LIBRARIES_ONLY_TARGETS"));
+}
+
+#[test]
+fn link_library_uses_attributes_for_the_selected_language() {
+    let mut host = Host::default();
+    let mut ctx = context();
+    ctx.traversal = UsageTraversal::Link;
+    ctx.site.property = Some("LINK_LIBRARIES".into());
+    host.definitions.insert(
+        "CMAKE_LINK_LIBRARY_feat_ATTRIBUTES".into(),
+        "DEDUPLICATION=YES,NO".into(),
+    );
+    host.definitions.insert(
+        "CMAKE_C_LINK_LIBRARY_feat_ATTRIBUTES".into(),
+        "LIBRARY_TYPE=STATIC,SHARED;OVERRIDE=DEFAULT".into(),
+    );
+    let expr = b"$<LINK_LIBRARY:feat,other>";
+    assert!(run(expr, &ctx, &mut host).is_ok());
+    ctx.link_language = Some("CXX".into());
+    let error = run(expr, &ctx, &mut host).unwrap_err().to_string();
+    assert!(error.contains("Erroneous option(s) for 'CMAKE_LINK_LIBRARY_feat_ATTRIBUTES'"));
+    assert!(error.contains("DEDUPLICATION=YES,NO"));
+    host.definitions.insert(
+        "CMAKE_LINK_LIBRARY_DEFAULT_ATTRIBUTES".into(),
+        "BAD=VALUE".into(),
+    );
+    assert!(run(b"$<LINK_LIBRARY:DEFAULT,other>", &ctx, &mut host).is_ok());
+}
+
+#[test]
+fn target_property_link_recursion_uses_the_current_property_role() {
+    let mut host = Host::default();
+    let mut ctx = context();
+    ctx.site.property = Some("INTERFACE_LINK_LIBRARIES".into());
+    let error = run(
+        b"$<TARGET_PROPERTY:other,INCLUDE_DIRECTORIES>",
+        &ctx,
+        &mut host,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("transitive over the link libraries, creating a recursion"));
+    assert!(host.visits.is_empty());
+
+    let error = run(
+        b"$<TARGET_PROPERTY:missing,INCLUDE_DIRECTORIES>",
+        &ctx,
+        &mut host,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("Target \"missing\" not found."));
+
+    host.set(HEAD, "CODE", "$<TARGET_PROPERTY:other,INCLUDE_DIRECTORIES>");
+    host.set(OTHER, "INCLUDE_DIRECTORIES", "/inc");
+    check(
+        &[("$<GENEX_EVAL:$<TARGET_PROPERTY:CODE>>", "/inc")],
+        &ctx,
+        &mut host,
+    );
+
+    ctx.site.property = Some("SOURCES".into());
+    assert!(
+        run(
+            b"$<TARGET_PROPERTY:other,INCLUDE_DIRECTORIES>",
+            &ctx,
+            &mut host,
+        )
+        .is_ok()
+    );
 }
 
 #[test]
@@ -575,7 +777,8 @@ fn targets_and_second_pass_context() {
 fn dependency_flags_follow_only_evaluated_expressions() {
     let mut host = Host::default();
     host.set(OTHER, "FOO", "other");
-    let ctx = context();
+    let mut ctx = context();
+    ctx.site.property = Some("LINK_LIBRARIES".into());
     for (input, expected) in [
         (
             "$<IF:0,$<TARGET_PROPERTY:FOO>,$<1:ok>>",
@@ -596,9 +799,10 @@ fn dependency_flags_follow_only_evaluated_expressions() {
             },
         ),
         (
-            "$<LINK_LANGUAGE>",
+            "$<LINK_LANGUAGE:C>",
             EvalFlags {
                 context_sensitive: true,
+                head_sensitive: true,
                 link_language_sensitive: true,
                 ..EvalFlags::default()
             },

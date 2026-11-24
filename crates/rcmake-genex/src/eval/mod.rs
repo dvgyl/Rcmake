@@ -5,6 +5,7 @@ use rcmake_base::{BString, Limits, list, path_lex::Lexical, truth, version};
 use crate::{EvalContext, EvalFlags, GenexAst, GenexError, GenexExpr, GenexHost, GenexNode};
 
 mod context;
+mod links;
 mod lists;
 mod operations;
 mod paths;
@@ -26,6 +27,7 @@ pub fn evaluate(
     let _root = targets::DAGChecker::root(ctx);
     let mut evaluator = Evaluator::new(host);
     let value = evaluator.nodes(&ast.nodes, ctx)?;
+    evaluator.validate_link_feature_output(ctx, &value)?;
     Ok((value, evaluator.flags))
 }
 
@@ -64,6 +66,9 @@ pub fn evaluate_diagnostics(
         }
     }
     if errors.is_empty() {
+        evaluator
+            .validate_link_feature_output(ctx, &output)
+            .map_err(|error| vec![error])?;
         Ok((output, evaluator.flags))
     } else {
         Err(errors)
@@ -78,6 +83,8 @@ struct Evaluator<'a> {
     regex_steps: u64,
     limits: Limits,
     bindings: Vec<Vec<BString>>,
+    in_target_expression: bool,
+    emitted_link_feature: bool,
 }
 
 thread_local! {
@@ -149,6 +156,8 @@ impl<'a> Evaluator<'a> {
             regex_steps: limits.regex_steps,
             limits,
             bindings: Vec::new(),
+            in_target_expression: false,
+            emitted_link_feature: false,
         }
     }
 
@@ -231,13 +240,20 @@ impl<'a> Evaluator<'a> {
                     Ok(BString::default())
                 }
             }
-            b"IF" | b"AND" | b"OR" => self.lazy_boolean(call),
+            b"IF" => self.conditional(call),
+            b"AND" | b"OR" => self.boolean_operation(call),
             b"BOOL" | b"NOT" => {
                 let [value] = self.fixed(call)?;
                 if name == "BOOL" {
                     Ok(boolean(!truth::is_off(&value)))
                 } else {
-                    Ok(boolean(!strict_bool(call, &value)?))
+                    match value.as_slice() {
+                        b"0" => Ok(boolean(true)),
+                        b"1" => Ok(boolean(false)),
+                        _ => Err(call.error(
+                            "$<NOT> parameter must resolve to exactly one '0' or '1' value.",
+                        )),
+                    }
                 }
             }
             b"EQUAL"
@@ -273,15 +289,19 @@ impl<'a> Evaluator<'a> {
             b"_0" | b"_1" => {
                 let [] = self.fixed(call)?;
                 let index = usize::from(name == "_1");
-                self.bindings
-                    .last()
-                    .and_then(|args| args.get(index))
-                    .cloned()
-                    .ok_or_else(|| {
-                        call.error(format!(
-                            "$<{name}> is only valid in a binding operation with operand {index}."
-                        ))
-                    })
+                let Some(binding) = self.bindings.last().filter(|binding| !binding.is_empty())
+                else {
+                    return Err(call.error(format!(
+                        "$<{name}> may only be used inside the body of a binding operation."
+                    )));
+                };
+                binding.get(index).cloned().ok_or_else(|| {
+                    let count = binding.len();
+                    call.error(format!(
+                        "$<{name}> is out of range for the current binding operation, which binds only {count} operand(s) (maximum $<_{}>).",
+                        count - 1
+                    ))
+                })
             }
             b"GENEX_EVAL" | b"TARGET_GENEX_EVAL" => self.reevaluate(call),
             b"CONFIG"
@@ -300,10 +320,9 @@ impl<'a> Evaluator<'a> {
             | b"INSTALL_PREFIX"
             | b"LINK_ONLY"
             | b"COMPILE_ONLY"
-            | b"LINK_LIBRARY"
-            | b"LINK_GROUP"
             | b"HOST_LINK"
             | b"DEVICE_LINK" => self.interface(call),
+            b"LINK_LIBRARY" | b"LINK_GROUP" => self.link_feature(call),
             _ if context::compiler_operator(&name) => self.compiler(call),
             b"SOURCE_PROPERTY" => self.source_property(call),
             b"SOURCE_EXISTS"
@@ -359,6 +378,10 @@ impl<'a> Evaluator<'a> {
         let mut values = Vec::new();
         for nodes in call.expr.params.iter().flatten() {
             values.extend(self.expanded_parameter(nodes, call.ctx)?);
+        }
+        // Check the property read before it can enter the usage resolver.
+        if call.name == b"TARGET_PROPERTY" {
+            self.validate_target_property_arguments(call, &values)?;
         }
         Ok(values)
     }
@@ -422,48 +445,74 @@ impl<'a> Evaluator<'a> {
         Ok(out)
     }
 
-    fn lazy_boolean(&mut self, call: Call<'_>) -> Value {
-        if call.name == b"IF" {
-            if call.params() != 3 {
-                return Err(call.error(format!(
-                    "$<IF> expression requires 3 comma separated parameters, but got {} instead.",
-                    call.params()
-                )));
-            }
-            let mut wanted = 0;
-            let mut index = 0;
-            for nodes in call.expr.params.iter().flatten() {
-                if index != 0 && index < wanted {
-                    index += 1;
-                    continue;
-                }
-                for value in self.expanded_parameter(nodes, call.ctx)? {
-                    if index == 0 {
-                        wanted = if strict_bool(call, &value)? { 1 } else { 2 };
-                    } else if index == wanted {
-                        return Ok(value);
-                    }
-                    index += 1;
-                }
-            }
+    fn conditional(&mut self, call: Call<'_>) -> Value {
+        // Select branches before expanding argument lists.
+        let mut raw = Vec::<BString>::new();
+        for (index, nodes) in call.expr.params.iter().flatten().enumerate() {
+            let skip = index.checked_sub(1).is_some_and(|branch| {
+                raw.first()
+                    .is_some_and(|condition| condition.as_slice() == branch.to_string().as_bytes())
+            });
+            let value = if skip {
+                BString::default()
+            } else {
+                self.nodes(nodes, call.ctx)?
+            };
+            self.charge(value.len().max(1))?;
+            raw.push(value);
+        }
+        if raw.len() != 3 {
             return Err(call.arity(3));
         }
+        let mut values = Vec::new();
+        for value in raw {
+            values.extend(self.expand_argument(value)?);
+        }
+        let mut values = values.into_iter();
+        let branch = match values.next().as_ref().map(|value| value.as_slice()) {
+            Some(b"1") => 0,
+            Some(b"0") => 1,
+            _ => {
+                return Err(call.error(
+                    "First parameter to $<IF> must resolve to exactly one '0' or '1' value.",
+                ));
+            }
+        };
+        values.nth(branch).ok_or_else(|| call.arity(3))
+    }
 
-        let short = call.name == b"OR";
+    fn boolean_operation(&mut self, call: Call<'_>) -> Value {
+        let decisive = boolean(call.name == b"OR");
         if call.params() == 0 {
             return Err(call.error(format!(
                 "$<{}> expression requires at least one parameter.",
                 BString::from(call.name)
             )));
         }
+        let mut raw = Vec::new();
         for nodes in call.expr.params.iter().flatten() {
-            for value in self.expanded_parameter(nodes, call.ctx)? {
-                if strict_bool(call, &value)? == short {
-                    return Ok(boolean(short));
+            let value = self.nodes(nodes, call.ctx)?;
+            self.charge(value.len().max(1))?;
+            let done = value == decisive;
+            raw.push(value);
+            if done {
+                break;
+            }
+        }
+        for parameter in raw {
+            for value in self.expand_argument(parameter)? {
+                if value == decisive {
+                    return Ok(decisive);
+                }
+                if !matches!(value.as_slice(), b"0" | b"1") {
+                    return Err(call.error(format!(
+                        "Parameters to $<{}> must resolve to either '0' or '1'.",
+                        BString::from(call.name)
+                    )));
                 }
             }
         }
-        Ok(boolean(!short))
+        Ok(boolean(call.name == b"AND"))
     }
 
     fn compare(&mut self, call: Call<'_>) -> Value {
@@ -502,17 +551,6 @@ impl<'a> Evaluator<'a> {
 
 fn boolean(value: bool) -> BString {
     if value { "1" } else { "0" }.into()
-}
-
-fn strict_bool(call: Call<'_>, value: &[u8]) -> Result<bool, GenexError> {
-    match value {
-        b"0" => Ok(false),
-        b"1" => Ok(true),
-        _ => Err(call.error(format!(
-            "$<{}> parameter must resolve to exactly one '0' or '1' value.",
-            BString::from(call.name)
-        ))),
-    }
 }
 
 fn integer(value: &[u8]) -> Option<i64> {

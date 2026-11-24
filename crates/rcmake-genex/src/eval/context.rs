@@ -115,39 +115,47 @@ impl Evaluator<'_> {
 
     pub(super) fn compiler(&mut self, call: Call<'_>) -> Value {
         self.flags.context_sensitive = true;
-        if call.ctx.head.is_none() {
+        let arguments = self.arguments(call)?;
+        let is_version = call.name.ends_with(b"_VERSION");
+        if is_version && call.params() > 1 {
             return Err(call.error(format!(
-                "$<{}> may only be used with binary targets.  It may not be used with add_custom_command or add_custom_target.",
+                "$<{}> expression requires one or zero parameters.",
+                BString::from(call.name)
+            )));
+        }
+        if call.ctx.head.is_none() {
+            let spacing = if call.name.ends_with(b"_COMPILER_LINKER_ID")
+                || call.name.ends_with(b"_COMPILER_LINKER_FRONTEND_VARIANT")
+            {
+                " "
+            } else {
+                "  "
+            };
+            return Err(call.error(format!(
+                "$<{}> may only be used with binary targets.{spacing}It may not be used with add_custom_command or add_custom_target.",
                 BString::from(call.name)
             )));
         }
         let mut key = b"CMAKE_".to_vec();
         key.extend_from_slice(call.name);
         let value = self.host.definition(&key).unwrap_or_default();
-        if call.name.ends_with(b"_VERSION") {
-            return match call.params() {
-                0 => Ok(value),
-                1 => {
-                    let [wanted] = self.fixed(call)?;
-                    if !wanted
-                        .iter()
-                        .all(|byte| byte.is_ascii_digit() || *byte == b'.')
-                    {
-                        return Err(call.error("Expression syntax not recognized."));
-                    }
-                    Ok(boolean(if value.is_empty() || wanted.is_empty() {
-                        value == wanted
-                    } else {
-                        version::compare(&value, &wanted).is_eq()
-                    }))
-                }
-                _ => Err(call.error(format!(
-                    "$<{}> expression requires one or zero parameters.",
-                    BString::from(call.name)
-                ))),
-            };
+        if !is_version {
+            return compiler_id(call, value, &arguments);
         }
-        self.id_value(call, value)
+        let Some(wanted) = arguments.first() else {
+            return Ok(value);
+        };
+        if !wanted
+            .iter()
+            .all(|byte| byte.is_ascii_digit() || *byte == b'.')
+        {
+            return Err(call.error("Expression syntax not recognized."));
+        }
+        Ok(boolean(if value.is_empty() {
+            wanted.is_empty()
+        } else {
+            version::compare(&value, wanted).is_eq()
+        }))
     }
 
     fn id_value(&mut self, call: Call<'_>, value: BString) -> Value {
@@ -167,9 +175,14 @@ impl Evaluator<'_> {
                 BString::from(call.name)
             )));
         }
-        let role = EvaluationRole::of(call.ctx);
+        let role = EvaluationRole::active();
+        let language = if role.supports_link_language() {
+            call.ctx.link_language.as_ref()
+        } else {
+            call.ctx.language.as_ref()
+        };
         let linking = call.name.starts_with(b"LINK_");
-        let language = if linking {
+        if linking {
             if call.ctx.head.is_none() || !role.supports_link_language() {
                 let expression = if and_id {
                     "LINK_LANG_AND_ID:lang,id"
@@ -178,32 +191,23 @@ impl Evaluator<'_> {
                 };
                 return Err(call.error(format!("$<{expression}> may only be used with binary targets to specify link libraries, link directories, link options, link depends, and link wrappers.")));
             }
-            if role == EvaluationRole::LinkLibraries {
+            if role.is_link_libraries() {
                 if arguments.is_empty() {
                     return Err(call
                         .error("$<LINK_LANGUAGE> is not supported in link libraries expression."));
                 }
                 self.flags.head_sensitive = true;
+                self.flags.link_language_sensitive = true;
             }
-            self.flags.link_language_sensitive = true;
-            call.ctx.link_language.as_ref()
-        } else {
-            if (call
-                .ctx
-                .language
-                .as_ref()
-                .is_none_or(|value| value.is_empty())
-                && role != EvaluationRole::Compile)
-                || (and_id && call.ctx.head.is_none())
-            {
-                return Err(call.error(if and_id {
-                    "$<COMPILE_LANG_AND_ID:lang,id> may only be used with binary targets to specify include directories, compile definitions, compile options, and compile wrappers.  It may not be used with the add_custom_command, add_custom_target, or file(GENERATE) commands."
-                } else {
-                    "$<COMPILE_LANGUAGE:...> may only be used to specify include directories, compile definitions, compile options, compile wrappers, and to evaluate components of the file(GENERATE) command."
-                }));
-            }
-            call.ctx.language.as_ref()
-        };
+        } else if (language.is_none_or(|value| value.is_empty()) && role != EvaluationRole::Compile)
+            || (and_id && call.ctx.head.is_none())
+        {
+            return Err(call.error(if and_id {
+                "$<COMPILE_LANG_AND_ID:lang,id> may only be used with binary targets to specify include directories, compile definitions, compile options, and compile wrappers.  It may not be used with the add_custom_command, add_custom_target, or file(GENERATE) commands."
+            } else {
+                "$<COMPILE_LANGUAGE:...> may only be used to specify include directories, compile definitions, compile options, compile wrappers, and to evaluate components of the file(GENERATE) command."
+            }));
+        }
         let lang = language.map_or(b"".as_slice(), |value| value.as_slice());
         if !and_id {
             if arguments.is_empty() {
@@ -221,21 +225,7 @@ impl Evaluator<'_> {
         let mut key = b"CMAKE_".to_vec();
         key.extend_from_slice(lang);
         key.extend_from_slice(b"_COMPILER_ID");
-        let id = self.host.definition(&key).unwrap_or_default();
-        if id.is_empty() {
-            return Ok(boolean(
-                ids.first().is_some_and(|argument| argument.is_empty()),
-            ));
-        }
-        for argument in ids {
-            if !valid_id(argument) {
-                return Err(call.error("Expression syntax not recognized."));
-            }
-            if argument == &id {
-                return Ok(boolean(true));
-            }
-        }
-        Ok(boolean(false))
+        compiler_id(call, self.host.definition(&key).unwrap_or_default(), ids)
     }
 
     fn compile_features(&mut self, call: Call<'_>) -> Value {
@@ -313,7 +303,7 @@ impl Evaluator<'_> {
         if value.is_empty() {
             return Ok(BString::default());
         }
-        let _active = if let Some(target) = ctx.head {
+        let active = if let Some(target) = ctx.head {
             let mut key = BString::from(call.name);
             self.append(&mut key, b":")?;
             self.append(&mut key, value)?;
@@ -341,7 +331,12 @@ impl Evaluator<'_> {
         } else {
             None
         };
-        self.nodes(&parse(value)?.nodes, ctx)
+        let ast = parse(value)?;
+        let previous = self.in_target_expression;
+        self.in_target_expression |= active.is_some();
+        let result = self.nodes(&ast.nodes, ctx);
+        self.in_target_expression = previous;
+        result
     }
 
     pub(super) fn interface(&mut self, call: Call<'_>) -> Value {
@@ -360,33 +355,47 @@ impl Evaluator<'_> {
                     call.error("INSTALL_PREFIX is a marker for install(EXPORT) only.  It should never be evaluated.")
                 })
             }
-            b"LINK_ONLY" | b"COMPILE_ONLY" => {
-                self.flags.context_sensitive = true;
-                if call.params() != 1 {
-                    return Err(call.arity(1));
-                }
-                let [value] = self.fixed(call)?;
-                let link = call.ctx.traversal == UsageTraversal::Link;
-                if link == (call.name == b"LINK_ONLY") {
-                    Ok(value)
-                } else {
-                    Ok(BString::default())
-                }
-            }
+            b"LINK_ONLY" | b"COMPILE_ONLY" => self.usage_only(call),
             b"DEVICE_LINK" | b"HOST_LINK" => self.link_step(call),
-            _ => self.link_feature(call),
+            _ => Err(unknown(call)),
         }
+    }
+
+    fn usage_only(&mut self, call: Call<'_>) -> Value {
+        self.flags.context_sensitive = true;
+        let [value] = self.fixed(call)?;
+        let property = DAGChecker::root_property();
+        if property.is_none() && !self.in_target_expression {
+            return Err(call.error(format!(
+                "$<{}:...> may only be used for linking",
+                BString::from(call.name)
+            )));
+        }
+        let property = property
+            .as_ref()
+            .map_or(b"".as_slice(), |property| property.as_slice());
+        let compile_usage =
+            call.ctx.traversal == UsageTraversal::Compile && is_link_libraries_property(property);
+        let include = if call.name == b"COMPILE_ONLY" {
+            compile_usage
+        } else if property == b"LINK_LIBRARIES" {
+            !compile_usage
+                || call
+                    .ctx
+                    .current
+                    .or(call.ctx.head)
+                    .and_then(|target| self.host.target_policy(target, b"CMP0131"))
+                    != Some(true)
+        } else {
+            !compile_usage
+        };
+        Ok(if include { value } else { BString::default() })
     }
 
     fn link_step(&mut self, call: Call<'_>) -> Value {
         self.flags.context_sensitive = true;
         let args = self.arguments(call)?;
-        let role = EvaluationRole::of(call.ctx);
-        if call.ctx.head.is_none()
-            || !(role == EvaluationRole::LinkOptions
-                || (role == EvaluationRole::ExplicitLanguages
-                    && call.ctx.traversal == UsageTraversal::Link))
-        {
+        if call.ctx.head.is_none() || EvaluationRole::active() != EvaluationRole::LinkOptions {
             return Err(call.error(format!(
                 "$<{}:...> may only be used with binary targets to specify link options.",
                 BString::from(call.name)
@@ -411,43 +420,14 @@ impl Evaluator<'_> {
             _ => Ok(BString::default()),
         }
     }
+}
 
-    fn link_feature(&mut self, call: Call<'_>) -> Value {
-        self.flags.context_sensitive = true;
-        if call.ctx.traversal != UsageTraversal::Link {
-            return Err(call.error(format!("$<{}:...> may only be used with binary targets to specify link libraries through 'LINK_LIBRARIES', 'INTERFACE_LINK_LIBRARIES', and 'INTERFACE_LINK_LIBRARIES_DIRECT' properties.", BString::from(call.name))));
-        }
-        let arguments = self.arguments(call)?;
-        let [feature, items @ ..] = arguments.as_slice() else {
-            return Err(call.arity(2));
-        };
-        if items.is_empty() {
-            return Err(call.arity(2));
-        }
-        if feature.is_empty() || !valid_id(feature) {
-            return Err(call.error(format!("The feature name '{feature}' is invalid.")));
-        }
-        let name = BString::from(call.name);
-        let members: Vec<_> = items
-            .iter()
-            .flat_map(|item| list::split(item, list::Empty::Drop))
-            .collect();
-        if members.is_empty() {
-            return Ok(BString::default());
-        }
-        let mut output = if name == "LINK_GROUP" {
-            let encoded = self.join(members.iter().cloned(), b"|")?;
-            BString::from(format!("<{name}:{feature}:{encoded}>"))
-        } else {
-            BString::from(format!("<{name}:{feature}>"))
-        };
-        for item in members {
-            self.append(&mut output, b";")?;
-            self.append(&mut output, &item)?;
-        }
-        self.append(&mut output, format!(";</{name}:{feature}>").as_bytes())?;
-        Ok(output)
-    }
+pub(super) fn link_features_allowed(ctx: &EvalContext) -> bool {
+    ctx.head.is_some() && EvaluationRole::active() == EvaluationRole::LinkLibraries
+}
+
+pub(super) fn is_link_libraries_property(property: &[u8]) -> bool {
+    EvaluationRole::for_property(property).is_link_libraries()
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -456,39 +436,45 @@ enum EvaluationRole {
     Link,
     LinkOptions,
     LinkLibraries,
-    ExplicitLanguages,
+    LinkLibrariesExclude,
     Other,
 }
 
 impl EvaluationRole {
-    fn of(ctx: &EvalContext) -> Self {
-        let root = DAGChecker::root_property();
-        let property = root.as_ref().or(ctx.site.property.as_ref());
-        let Some(property) = property else {
-            return if ctx.language.is_some() && ctx.link_language.is_some() {
-                Self::ExplicitLanguages
-            } else {
-                Self::Other
-            };
-        };
-        let property = property.strip_prefix(b"INTERFACE_").unwrap_or(property);
+    fn active() -> Self {
+        DAGChecker::root_property()
+            .as_ref()
+            .map_or(Self::Other, |property| Self::for_property(property))
+    }
+
+    fn for_property(property: &[u8]) -> Self {
+        // The resolver uses interface property names for inherited usage.
         match property {
             b"INCLUDE_DIRECTORIES"
-            | b"SYSTEM_INCLUDE_DIRECTORIES"
+            | b"INTERFACE_INCLUDE_DIRECTORIES"
             | b"COMPILE_DEFINITIONS"
+            | b"INTERFACE_COMPILE_DEFINITIONS"
             | b"COMPILE_OPTIONS"
+            | b"INTERFACE_COMPILE_OPTIONS"
             | b"COMPILE_WRAPPERS" => Self::Compile,
-            b"LINK_OPTIONS" | b"LINKER_TYPE" => Self::LinkOptions,
-            b"LINK_DIRECTORIES" | b"LINK_DEPENDS" | b"LINK_LIBRARY_OVERRIDE" | b"LINK_WRAPPERS" => {
-                Self::Link
-            }
+            b"LINK_OPTIONS" | b"INTERFACE_LINK_OPTIONS" | b"LINKER_TYPE" => Self::LinkOptions,
+            b"LINK_DIRECTORIES"
+            | b"INTERFACE_LINK_DIRECTORIES"
+            | b"LINK_DEPENDS"
+            | b"INTERFACE_LINK_DEPENDS"
+            | b"LINK_LIBRARY_OVERRIDE"
+            | b"LINK_WRAPPERS" => Self::Link,
             b"LINK_LIBRARIES"
-            | b"LINK_LIBRARIES_DIRECT"
-            | b"LINK_LIBRARIES_DIRECT_EXCLUDE"
+            | b"INTERFACE_LINK_LIBRARIES"
+            | b"INTERFACE_LINK_LIBRARIES_DIRECT"
             | b"LINK_INTERFACE_LIBRARIES"
             | b"IMPORTED_LINK_INTERFACE_LIBRARIES" => Self::LinkLibraries,
-            name if name.ends_with(b"_LINKER_LAUNCHER") => Self::Link,
-            name if name.ends_with(b"_COMPILER_LAUNCHER") => Self::Compile,
+            b"INTERFACE_LINK_LIBRARIES_DIRECT_EXCLUDE" => Self::LinkLibrariesExclude,
+            name if name.len() > b"_LINKER_LAUNCHER".len()
+                && name.ends_with(b"_LINKER_LAUNCHER") =>
+            {
+                Self::Link
+            }
             name if name.starts_with(b"LINK_INTERFACE_LIBRARIES_")
                 || name.starts_with(b"IMPORTED_LINK_INTERFACE_LIBRARIES_") =>
             {
@@ -501,9 +487,31 @@ impl EvaluationRole {
     fn supports_link_language(self) -> bool {
         matches!(
             self,
-            Self::Link | Self::LinkOptions | Self::LinkLibraries | Self::ExplicitLanguages
+            Self::Link | Self::LinkOptions | Self::LinkLibraries | Self::LinkLibrariesExclude
         )
     }
+
+    fn is_link_libraries(self) -> bool {
+        matches!(self, Self::LinkLibraries | Self::LinkLibrariesExclude)
+    }
+}
+
+fn compiler_id(call: Call<'_>, value: BString, arguments: &[BString]) -> Value {
+    let Some(first) = arguments.first() else {
+        return Ok(value);
+    };
+    if value.is_empty() {
+        return Ok(boolean(first.is_empty()));
+    }
+    for argument in arguments {
+        if !valid_id(argument) {
+            return Err(call.error("Expression syntax not recognized."));
+        }
+        if argument == &value {
+            return Ok(boolean(true));
+        }
+    }
+    Ok(boolean(false))
 }
 
 fn valid_id(value: &[u8]) -> bool {

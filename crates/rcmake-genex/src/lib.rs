@@ -94,6 +94,8 @@ pub struct EvalContext {
     pub language: Option<BString>,
     /// Link language (`$<LINK_LANGUAGE>`), if known.
     pub link_language: Option<BString>,
+    /// The current evaluation supplies inputs to the device linker.
+    pub device_link: bool,
     /// `Ninja Multi-Config` command configuration (`$<COMMAND_CONFIG:...>`).
     pub command_config: Option<ConfigId>,
     /// `Ninja Multi-Config` output configuration (`$<OUTPUT_CONFIG:...>`).
@@ -358,8 +360,8 @@ pub trait GenexHost {
     }
 
     /// Return whether the current evaluation is for a device link step.
-    fn is_device_link(&self, _ctx: &EvalContext) -> bool {
-        false
+    fn is_device_link(&self, ctx: &EvalContext) -> bool {
+        ctx.device_link
     }
 
     /// Return the install prefix when this context permits its evaluation.
