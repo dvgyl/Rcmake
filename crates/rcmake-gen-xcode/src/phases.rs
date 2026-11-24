@@ -357,7 +357,7 @@ pub(crate) fn utility(
             quote(&bin.join(rerun::SCRIPT).to_string_lossy())
         ),
         UtilityKind::Install => format!(
-            "{} \"-DBUILD_TYPE=$CONFIGURATION$EFFECTIVE_PLATFORM_NAME\" -P cmake_install.cmake",
+            "{} \"-DBUILD_TYPE=$CONFIGURATION\" \"-DEFFECTIVE_PLATFORM_NAME=$EFFECTIVE_PLATFORM_NAME\" -P cmake_install.cmake",
             quote(cmake)
         ),
         UtilityKind::RunTests => format!(
