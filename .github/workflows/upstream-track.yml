@@ -1,0 +1,82 @@
+name: Track upstream CMake
+
+"on":
+  schedule:
+    - cron: '0 6 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: upstream-cmake-tracker
+  cancel-in-progress: false
+
+jobs:
+  track:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Check upstream CMake
+        id: track
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: |
+          python3 tools/measure/upstream_track.py --out-json upstream.json --out-md upstream.md
+          printf 'issue_required=%s\n' "$(jq -r .issue_required upstream.json)" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: upstream-cmake-report
+          path: |
+            upstream.json
+            upstream.md
+          if-no-files-found: error
+
+      - name: Update the upstream tracking issue
+        if: steps.track.outputs.issue_required == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          marker='<!-- rcmake-upstream-cmake-tracker -->'
+          endpoint="repos/$GITHUB_REPOSITORY/issues"
+          issue=$(gh api --paginate --slurp \
+            "$endpoint?state=all&creator=github-actions%5Bbot%5D&per_page=100" |
+            jq -c --arg marker "$marker" '
+              [ .[][] | select(.pull_request == null and ((.body // "") | contains($marker))) ]
+              | min_by(.number)
+            ')
+
+          fingerprint=$(jq -c '{baseline: .baseline.version, releases: .delta.releases,
+                                policies: .delta.policies}' upstream.json | sha256sum | cut -d ' ' -f 1)
+          signature="<!-- upstream-delta:$fingerprint -->"
+          if jq -e --arg signature "$signature" '(.body // "") | contains($signature)' \
+            <<< "$issue" > /dev/null; then
+            exit 0
+          fi
+
+          run_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          body=$(jq -r --arg marker "$marker" --arg signature "$signature" --arg url "$run_url" '
+            $marker, $signature, "",
+            "New upstream releases or policy IDs since the CMake \(.baseline.version) baseline.",
+            "",
+            "- Stable releases: \(.delta.releases | if length > 0 then join(", ") else "None" end)",
+            "- Policies: \(.delta.policies | if length > 0 then join(", ") else "None" end)",
+            "",
+            "Download the Markdown and JSON reports from the [workflow run](\($url))."
+          ' upstream.json)
+          number=$(jq -r '.number // empty' <<< "$issue")
+          if [[ -z "$number" ]]; then
+            gh api --method POST "$endpoint" -f title="Track upstream CMake changes" -f body="$body" --silent
+          else
+            gh api --method PATCH "$endpoint/$number" -f state=open -f body="$body" --silent
+          fi
