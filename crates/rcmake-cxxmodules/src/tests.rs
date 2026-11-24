@@ -224,8 +224,9 @@ fn cycles_and_duplicate_providers_are_errors() -> Result<(), ModulesError> {
 
 #[test]
 fn bmi_install_script_contains_only_public_modules_of_the_target() -> Result<(), ModulesError> {
+    let drive = if cfg!(windows) { "C:" } else { "" };
     let tdi = tdi::read_tdi(
-        br#"{
+        r#"{
           "module-dir": "/build/modules",
           "cxx-modules": {
             "public.o": {"visibility": "PUBLIC"},
@@ -237,7 +238,9 @@ fn bmi_install_script_contains_only_public_modules_of_the_target() -> Result<(),
             "permissions": "OWNER_READ GROUP_READ",
             "message-level": "MESSAGE_LAZY"
           }
-        }"#,
+        }"#
+        .replace("/build", &format!("{drive}/build"))
+        .as_bytes(),
     )?;
     let ddis = [("public.o", "Public"), ("private.o", "Private")]
     .into_iter()
@@ -264,9 +267,11 @@ fn bmi_install_script_contains_only_public_modules_of_the_target() -> Result<(),
     let actual = output
         .modmaps
         .iter()
-        .find(|(path, _)| path == b"/build/install-bmi.cmake")
+        .find(|(path, _)| path == &format!("{drive}/build/install-bmi.cmake"))
         .map(|(_, script)| script.as_slice());
-    let expected = b"file(INSTALL DESTINATION \"${CMAKE_INSTALL_PREFIX}/lib/bmi\" TYPE FILE MESSAGE_LAZY PERMISSIONS OWNER_READ GROUP_READ FILES \"/build/modules/Public.pcm\")\n";
-    assert_eq!(actual, Some(expected.as_slice()));
+    let expected = format!(
+        "file(INSTALL DESTINATION \"${{CMAKE_INSTALL_PREFIX}}/lib/bmi\" TYPE FILE MESSAGE_LAZY PERMISSIONS OWNER_READ GROUP_READ FILES \"{drive}/build/modules/Public.pcm\")\n"
+    );
+    assert_eq!(actual, Some(expected.as_bytes()));
     Ok(())
 }

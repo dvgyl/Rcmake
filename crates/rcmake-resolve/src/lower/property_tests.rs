@@ -147,6 +147,11 @@ fn creates_and_reuses_a_language_specific_pch() -> TestResult {
             ("CMAKE_CXX_COMPILE_OPTIONS_USE_PCH", "-include;<PCH_HEADER>"),
         ],
     );
+    let precompiled = if cfg!(windows) {
+        "C:/headers/local.hxx"
+    } else {
+        "/headers/local.hxx"
+    };
     let mut provider = target("provider", TargetKind::StaticLibrary, "provider.cpp");
     provider.usage.push(
         UsageField::PrecompileHeaders,
@@ -154,6 +159,10 @@ fn creates_and_reuses_a_language_specific_pch() -> TestResult {
             "$<$<COMPILE_LANGUAGE:CXX>:<vector$<ANGLE-R>>>".into(),
             Default::default(),
         ),
+    );
+    provider.usage.push(
+        UsageField::PrecompileHeaders,
+        BT::new(precompiled.into(), Default::default()),
     );
     let provider = model.add_target(provider)?;
     let mut consumer = target("consumer", TargetKind::Executable, "consumer.cpp");
@@ -174,6 +183,7 @@ fn creates_and_reuses_a_language_specific_pch() -> TestResult {
             .windows(b"#include <vector>".len())
             .any(|word| word == b"#include <vector>")
     );
+    assert!(String::from_utf8(contents)?.contains(&format!("#include \"{precompiled}\"")));
     let graph = &result.graphs[0];
     assert_eq!(graph.targets[1].depends, vec![provider.index()]);
     assert_eq!(

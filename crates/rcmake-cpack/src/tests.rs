@@ -29,7 +29,7 @@ fn registry_lists_package_generators() {
 
 #[test]
 fn main_requires_a_generator_or_configuration() {
-    let host = Arc::new(PureHost::new("/work".into(), "/bin/cpack".into()));
+    let host = memory_host();
     let shared: Arc<dyn Host> = host.clone();
     let code = crate::main(&[BString::from("cpack")], shared);
     assert_eq!(code, 1);
@@ -50,7 +50,12 @@ use rcmake_host::{
 };
 
 fn memory_host() -> Arc<PureHost> {
-    Arc::new(PureHost::new("/work".into(), "/bin/cpack".into()))
+    let exe = if cfg!(windows) {
+        "C:/bin/cpack.exe"
+    } else {
+        "/bin/cpack"
+    };
+    Arc::new(PureHost::new("/work".into(), exe.into()))
 }
 
 fn invoke(host: Arc<dyn Host>, args: &[&str]) -> i32 {
@@ -469,7 +474,15 @@ file(WRITE "${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_CONFIG_NAME}" "staged")
     );
     host.set_command_handler(|host, request, _| {
         let command = request.pipeline.first().unwrap();
-        assert_eq!(command.program, "/bin/cmake");
+        let exe = if cfg!(windows) {
+            "C:/bin/cmake.exe"
+        } else {
+            "/bin/cmake"
+        };
+        assert_eq!(
+            rcmake_host::path::to_native(&command.program),
+            Path::new(exe)
+        );
         assert_eq!(request.timeout, None);
         assert_eq!(
             &command.args[..5],

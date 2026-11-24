@@ -31,7 +31,7 @@ use rcmake_base::{BString, Limits};
 use rcmake_diag::source::{SourceKind, SourceMap};
 use rcmake_diag::{DiagOptions, DiagState};
 use rcmake_eval::{Interp, InterpConfig, RunMode};
-use rcmake_host::{Follow, Host, NativeHost, PureHost, Stream, WriteMode};
+use rcmake_host::{Follow, Host, NativeHost, PureHost, ReadRange, Stream, WriteMode};
 use rcmake_json::{ReadOptions, Value};
 use rcmake_presets::{EnvSnapshot, PresetKind};
 
@@ -895,7 +895,7 @@ fn genex_parse_random_and_nested() {
     });
 }
 
-fn configure_with(content_genex: &str) -> CliRun {
+fn configure_with(content_genex: &str) -> (CliRun, Arc<PureHost>) {
     let lists = format!(
         "cmake_minimum_required(VERSION 3.20)\nproject(fuzz NONE)\n\
          add_library(a INTERFACE)\nadd_library(b INTERFACE)\n\
@@ -911,13 +911,18 @@ fn configure_with(content_genex: &str) -> CliRun {
         &[("/work/CMakeLists.txt", lists.as_bytes())],
         argv(&["cmake", "-S", ".", "-B", "out", "-G", "Ninja"]),
     )
-    .0
 }
 
 #[test]
 fn genex_configure_cycles_and_random() {
     let n = 120 * scale();
     guarded("genex/configure", Duration::from_secs(600), move |c| {
+        let (baseline, host) = configure_with("$<1:baseline>");
+        assert_cli_sane(&baseline, &[0]);
+        let generated = host
+            .read(Path::new("/work/out/out.txt"), ReadRange::All { limit: 64 })
+            .expect("Read generated baseline.");
+        assert_eq!(generated, b"baseline");
         let mut corpus = vec![
             "$<TARGET_PROPERTY:a,INTERFACE_COMPILE_DEFINITIONS>".to_owned(),
             "$<TARGET_PROPERTY:a,INTERFACE_LINK_LIBRARIES>".to_owned(),
@@ -939,7 +944,7 @@ fn genex_configure_cycles_and_random() {
         }
         for genex in &corpus {
             c.case(genex.as_bytes(), || {
-                let run = configure_with(genex);
+                let (run, _) = configure_with(genex);
                 assert_cli_sane(&run, &[0, 1]);
             });
         }
@@ -957,7 +962,7 @@ const PRESET_SEED: &str = r#"{
     {"name": "base", "hidden": true, "generator": "Ninja", "binaryDir": "${sourceDir}/out/${presetName}",
      "cacheVariables": {"A": "$env{A}", "B": {"type": "BOOL", "value": "ON"}, "C": "$penv{HOME}"},
      "environment": {"A": "x$env{B}", "B": "$penv{PATH}", "C": null},
-     "condition": {"type": "equals", "lhs": "${hostSystemName}", "rhs": "Darwin"}},
+     "condition": {"type": "equals", "lhs": "${hostSystemName}", "rhs": "PureOS"}},
     {"name": "p0", "inherits": ["base"], "displayName": "P0", "vendor": {"x": [1, 2, {"y": null}]}}
   ],
   "buildPresets": [{"name": "b0", "configurePreset": "p0", "jobs": 2, "targets": ["all"]}],
@@ -1037,6 +1042,22 @@ const JSON_DICT: &[&[u8]] = &[
 fn presets_mutated_documents() {
     let n = 500 * scale();
     guarded("presets/mutated", Duration::from_secs(600), move |c| {
+        let control = PureHost::default();
+        control
+            .seed_file(Path::new("/work/CMakePresets.json"), PRESET_SEED.as_bytes())
+            .expect("Seed baseline presets.");
+        let presets =
+            rcmake_presets::load(Path::new("/work"), &control).expect("Load baseline presets.");
+        let preset = rcmake_presets::resolve(
+            &presets,
+            PresetKind::Configure,
+            b"p0",
+            &EnvSnapshot {
+                vars: BTreeMap::new(),
+            },
+        )
+        .expect("Resolve baseline preset.");
+        assert_eq!(preset.binary_dir, Some("/work/out/p0".into()));
         let mut rng = Rng::new(6);
         for _ in 0..n {
             let doc = mutate(&mut rng, PRESET_SEED.as_bytes(), JSON_DICT);
@@ -1451,6 +1472,15 @@ fn script_wall_budget_stops_infinite_loops() {
         let host = Arc::new(NativeHost::new().expect("native host"));
         let dir = std::env::temp_dir().join(format!("rcmake-fuzz-budget-{}", std::process::id()));
         host.create_dir_all(&dir).expect("budget dir");
+        assert_eq!(
+            interp_script(
+                host.clone(),
+                &dir,
+                b"message(STATUS baseline)",
+                limits.clone()
+            ),
+            0
+        );
         for script in [
             "set(i 0)\nwhile(TRUE)\n  math(EXPR i \"${i}+1\")\nendwhile()\n",
             "function(f)\n  while(1)\n    set(x y)\n  endwhile()\nendfunction()\nf()\n",
@@ -1475,6 +1505,15 @@ fn script_wall_budget_empty_loop_body() {
         let host = Arc::new(NativeHost::new().expect("native host"));
         let dir = std::env::temp_dir().join(format!("rcmake-fuzz-empty-{}", std::process::id()));
         host.create_dir_all(&dir).expect("budget dir");
+        assert_eq!(
+            interp_script(
+                host.clone(),
+                &dir,
+                b"message(STATUS baseline)",
+                limits.clone()
+            ),
+            0
+        );
         for script in [
             "while(TRUE)\nendwhile()\n",
             "foreach(i RANGE 2000000000)\nendforeach()\n",

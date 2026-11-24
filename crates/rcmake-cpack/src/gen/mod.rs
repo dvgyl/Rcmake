@@ -147,6 +147,15 @@ mod tests {
     use rcmake_host::path::{from_native, to_native};
     use rcmake_host::{CommandSpec, Host, ProcessResult, ReadRange, RunOutput, WriteMode};
 
+    pub(super) fn package_host() -> Arc<rcmake_host::PureHost> {
+        let exe = if cfg!(windows) {
+            "C:/bin/cpack.exe"
+        } else {
+            "/bin/cpack"
+        };
+        Arc::new(rcmake_host::PureHost::new("/work".into(), exe.into()))
+    }
+
     pub(super) fn invoke(host: Arc<dyn Host>, generator: &str, options: &str) -> i32 {
         let root = host.initial_cwd();
         let source = root.join("payload");
@@ -154,7 +163,7 @@ mod tests {
         host.write(&source.join("readme.txt"), b"payload", WriteMode::Truncate)
             .unwrap();
         let config = root.join("CPackConfig.cmake");
-        let source = from_native(&source);
+        let source = rcmake_host::path::from_native_cmake(&source);
         host.write(
             &config,
             format!(

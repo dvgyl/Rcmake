@@ -8,7 +8,7 @@ use rcmake_diag::{PolicyId, PolicyStatus};
 use rcmake_eval::{Cx, RunMode};
 use rcmake_host::{
     FileKind, Follow,
-    path::{from_native, to_native},
+    path::{from_native_cmake, to_native},
 };
 use rcmake_model::{GlobCall, GlobCheck, GlobKey};
 use rcmake_regex::{MatchOptions, Regex};
@@ -130,7 +130,7 @@ fn record(
     files: &BTreeSet<BString>,
 ) -> Result<()> {
     let key = GlobKey {
-        expression: from_native(&cx.resolve_path(pattern)),
+        expression: from_native_cmake(&cx.resolve_path(pattern)),
         recursive: options.recursive,
         directories: options.directories,
         follow: options.follow,
@@ -141,7 +141,7 @@ fn record(
         variable: variable.into(),
         backtrace: cx.backtrace(),
     };
-    let root = rcmake_host::path::from_native(&cx.current_source_dir());
+    let root = rcmake_host::path::from_native_cmake(&cx.current_source_dir());
     let Some(previous) = cx.project().glob_checks.get_mut(&key) else {
         cx.project().glob_checks.insert(
             key,
@@ -215,7 +215,7 @@ impl Glob<'_, '_> {
         if self.expression.is_empty() {
             return Ok(());
         }
-        let absolute = from_native(&self.cx.resolve_path(self.expression));
+        let absolute = from_native_cmake(&self.cx.resolve_path(self.expression));
         let path = Lexical::new(&absolute);
         let components: Vec<_> = path.components().collect();
         let prefix = components
@@ -346,11 +346,11 @@ impl Glob<'_, '_> {
             );
             for link in self.links.iter().skip(cycle_start) {
                 message.extend_from_slice(b"\n");
-                message.extend_from_slice(&from_native(&link.parent));
+                message.extend_from_slice(&from_native_cmake(&link.parent));
             }
             if let Some(name) = path.file_name() {
                 message.extend_from_slice(b"\n");
-                message.extend_from_slice(&from_native(&parent.join(name)));
+                message.extend_from_slice(&from_native_cmake(&parent.join(name)));
             }
             warning(self.cx, message);
             return Ok(());
@@ -362,7 +362,7 @@ impl Glob<'_, '_> {
     }
 
     fn insert(&mut self, path: &Path) -> Result<()> {
-        let full = from_native(path);
+        let full = from_native_cmake(path);
         let name = if let Some(base) = &self.options.relative {
             if Lexical::new(base).absolute() {
                 super::file::relative_absolute(base, &full)

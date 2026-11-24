@@ -5,7 +5,7 @@ use rcmake_base::path_lex::Lexical;
 use rcmake_eval::{Cx, Flow};
 use rcmake_host::{
     Follow,
-    path::{from_native, to_native},
+    path::{from_native_cmake, to_native},
 };
 
 use super::copy::{self, Options, permissions};
@@ -41,7 +41,7 @@ pub(super) fn run(cx: &mut Cx<'_>, args: &[&[u8]]) -> Result {
         .filter(|value| !value.is_empty());
     let destination = match &destdir {
         Some(prefix) => {
-            let normalized = from_native(&unstaged);
+            let normalized = from_native_cmake(&unstaged);
             let unstaged = normalized
                 .strip_prefix(b"/")
                 .ok_or_else(|| error("INSTALL cannot use DESTDIR with this destination."))?;
@@ -99,7 +99,7 @@ pub(super) fn run(cx: &mut Cx<'_>, args: &[&[u8]]) -> Result {
                 display(cx, path, current, install.message);
                 if !directory {
                     let relative = path.strip_prefix(&destination).unwrap_or(path);
-                    let entry = from_native(&unstaged.join(relative));
+                    let entry = from_native_cmake(&unstaged.join(relative));
                     if !manifest.is_empty() {
                         manifest.push(b';');
                     }
@@ -122,7 +122,7 @@ fn display(cx: &Cx<'_>, target: &Path, current: bool, message: Message) {
     } else {
         b"Installing: ".as_slice()
     };
-    status(cx, &[label, &from_native(target)].concat());
+    status(cx, &[label, &from_native_cmake(target)].concat());
 }
 
 fn parse<'a>(cx: &mut Cx<'_>, args: &[&'a [u8]]) -> Result<Install<'a>> {

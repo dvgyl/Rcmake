@@ -1,5 +1,6 @@
 //! End-to-end checks with the pinned Ninja binary on PATH.
 
+#![cfg(unix)]
 #![allow(clippy::panic)]
 
 use std::path::{Path, PathBuf};
@@ -32,9 +33,7 @@ impl Project {
     fn new() -> Self {
         static NEXT: AtomicU32 = AtomicU32::new(0);
         let host = NativeHost::new().unwrap_or_else(|error| panic!("{error}"));
-        let parent = host
-            .env_get(b"TMPDIR")
-            .map_or_else(|| PathBuf::from("/tmp"), |path| path::to_native(&path));
+        let parent = std::env::temp_dir();
         let now = host.now();
         let index = NEXT.fetch_add(1, Ordering::Relaxed);
         let dir = parent.join(format!("rcmake-ninja-{}-{}-{index}", now.secs, now.nanos));

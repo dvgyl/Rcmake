@@ -105,7 +105,7 @@ impl Presets {
             PresetsError::new(format!(
                 "No such {} preset in {}: \"{}\"",
                 kind.label(),
-                self.source_dir.display(),
+                path::from_native_cmake(&self.source_dir),
                 String::from_utf8_lossy(name)
             ))
         })?;
@@ -113,7 +113,7 @@ impl Presets {
             return Err(PresetsError::new(format!(
                 "Cannot use hidden {} preset in {}: \"{}\"",
                 kind.label(),
-                self.source_dir.display(),
+                path::from_native_cmake(&self.source_dir),
                 record.summary.name
             )));
         }
@@ -132,7 +132,7 @@ impl Presets {
             return Err(PresetsError::new(format!(
                 "Cannot use disabled {} preset in {}: \"{}\"",
                 kind.label(),
-                self.source_dir.display(),
+                path::from_native_cmake(&self.source_dir),
                 record.summary.name
             )));
         }
@@ -360,7 +360,7 @@ impl Presets {
         if let Some(text) = value
             && !text.is_empty()
         {
-            *text = path::from_native(&graph::normalize(
+            *text = path::from_native_cmake(&graph::normalize(
                 &self.source_dir.join(path::to_native(text.as_slice())),
             ));
         }

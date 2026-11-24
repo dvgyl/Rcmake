@@ -60,7 +60,11 @@ fn reports_first_start_group_without_a_value() -> Result<(), Box<dyn Error>> {
 fn configures_from_a_ctest_link_outside_the_install_directory() -> Result<(), Box<dyn Error>> {
     let host = Arc::new(PureHost::new("/work".into(), "/work/ctest".into()));
     let binary = Path::new("/install/bin/rcmake");
-    let cmake = Path::new("/install/bin/cmake");
+    let cmake = Path::new(if cfg!(windows) {
+        "/install/bin/cmake.exe"
+    } else {
+        "/install/bin/cmake"
+    });
     host.seed_file(binary, b"")?;
     host.symlink(binary, Path::new("/work/ctest"))?;
     host.symlink(binary, cmake)?;
@@ -79,7 +83,7 @@ fn configures_from_a_ctest_link_outside_the_install_directory() -> Result<(), Bo
     "#,
     )?;
     host.set_command_handler(move |_, request, _| {
-        assert_eq!(request.pipeline[0].program, path::from_native(cmake));
+        assert_eq!(path::to_native(&request.pipeline[0].program), cmake);
         Ok(RunOutput {
             results: vec![ProcessResult::Exited(0)],
             ..RunOutput::default()
@@ -117,7 +121,7 @@ fn runs_dashboard_handlers_and_sets_script_variables() -> Result<(), Box<dyn Err
         if(NOT configure EQUAL 0 OR NOT captured EQUAL 0)
           message(FATAL_ERROR "Configure failed")
         endif()
-        ctest_build(TARGET sample CONFIGURATION Debug FLAGS "-v 'two words'" NUMBER_WARNINGS warnings NUMBER_ERRORS errors RETURN_VALUE build)
+        ctest_build(TARGET sample CONFIGURATION Debug FLAGS [=[-v "two words"]=] NUMBER_WARNINGS warnings NUMBER_ERRORS errors RETURN_VALUE build)
         if(NOT build EQUAL 0 OR NOT warnings EQUAL 1 OR NOT errors EQUAL 0)
           message(FATAL_ERROR "Wrong build result")
         endif()

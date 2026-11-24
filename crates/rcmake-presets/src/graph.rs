@@ -202,7 +202,7 @@ pub(crate) fn load(
         } else {
             PresetsError::new(format!(
                 "Could not read presets from {}:\n{error}",
-                source_dir.display()
+                path::from_native_cmake(&source_dir)
             ))
         }
     })
@@ -281,14 +281,14 @@ impl FileGraph<'_> {
             Err(error) => {
                 return Err(PresetsError::new(format!(
                     "Could not read {}: {error}",
-                    path.display()
+                    path::from_native_cmake(path)
                 )));
             }
         };
         if metadata.kind != FileKind::File {
             return Err(PresetsError::new(format!(
                 "Could not read {}: Expected a regular file",
-                path.display()
+                path::from_native_cmake(path)
             )));
         }
         let bytes = self
@@ -300,7 +300,10 @@ impl FileGraph<'_> {
                 },
             )
             .map_err(|error| {
-                PresetsError::new(format!("Could not read {}: {error}", path.display()))
+                PresetsError::new(format!(
+                    "Could not read {}: {error}",
+                    path::from_native_cmake(path)
+                ))
             })?;
         let bytes = bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(&bytes);
         if bytes.is_empty() {
@@ -352,7 +355,7 @@ impl FileGraph<'_> {
             }
             return Err(PresetsError::new(format!(
                 "Cyclic include among presets files: {}",
-                path.display()
+                path::from_native_cmake(path)
             )));
         }
         if self.file_paths.len() >= MAX_FILES {
@@ -668,7 +671,7 @@ fn minimum_version(field: &Field) -> Result<CmakeVersion, PresetsError> {
 }
 
 fn file_not_found(path: &Path) -> PresetsError {
-    PresetsError::new(format!("File not found: {}", path.display()))
+    PresetsError::new(format!("File not found: {}", path::from_native_cmake(path)))
 }
 
 pub(crate) fn normalize(path: &Path) -> PathBuf {

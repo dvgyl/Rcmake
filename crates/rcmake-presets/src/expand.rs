@@ -121,13 +121,13 @@ impl<'a> Macros<'a> {
     fn builtin(&self, name: &[u8], field: &Field, version: u32) -> Result<BString, PresetsError> {
         let source = self.presets.source_dir.as_path();
         match name {
-            b"sourceDir" => Ok(path::from_native(source)),
+            b"sourceDir" => Ok(path::from_native_cmake(source)),
             b"sourceParentDir" => Ok(source
                 .parent()
-                .map_or_else(BString::default, path::from_native)),
-            b"sourceDirName" => Ok(source
-                .file_name()
-                .map_or_else(BString::default, |name| path::from_native(name.as_ref()))),
+                .map_or_else(BString::default, path::from_native_cmake)),
+            b"sourceDirName" => Ok(source.file_name().map_or_else(BString::default, |name| {
+                path::from_native_cmake(name.as_ref())
+            })),
             b"presetName" => self
                 .preset
                 .map(|preset| preset.summary.name.clone())
@@ -147,7 +147,7 @@ impl<'a> Macros<'a> {
                 Ok(origin
                     .path
                     .parent()
-                    .map_or_else(BString::default, path::from_native))
+                    .map_or_else(BString::default, path::from_native_cmake))
             }
             b"dollar" => Ok(BString::from("$")),
             b"pathListSep" if version >= 5 => {

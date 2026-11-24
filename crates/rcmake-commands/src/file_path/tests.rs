@@ -7,6 +7,8 @@ use rcmake_base::{BString, hash::HashAlgo};
 use rcmake_eval::{Interp, InterpConfig, Registry, RunMode};
 use rcmake_host::{FileKind, Follow, Host, PureHost, ReadRange, Stream};
 
+const DRIVE: &str = if cfg!(windows) { "C:" } else { "" };
+
 type TestResult = std::result::Result<(), Box<dyn std::error::Error>>;
 
 fn interpreter() -> (Arc<PureHost>, Interp) {
@@ -19,14 +21,18 @@ fn register(registry: &mut Registry) {
 }
 
 fn interpreter_with_mode(mode: RunMode) -> (Arc<PureHost>, Interp) {
-    let host = Arc::new(PureHost::default());
+    interpreter_in(mode, "/work")
+}
+
+fn interpreter_in(mode: RunMode, cwd: &str) -> (Arc<PureHost>, Interp) {
+    let host = Arc::new(PureHost::new(cwd.into(), "/cmake/bin/cmake".into()));
     let interp = Interp::new(
         InterpConfig {
             host: host.clone(),
             mode,
             cmake_root: "/cmake".into(),
             cmake_command: "/cmake/bin/cmake".into(),
-            cwd: "/work".into(),
+            cwd: cwd.into(),
             limits: Default::default(),
             diag: Default::default(),
             defines: Vec::new(),
@@ -38,12 +44,12 @@ fn interpreter_with_mode(mode: RunMode) -> (Arc<PureHost>, Interp) {
 }
 
 fn script(host: &PureHost, interp: &mut Interp, code: &str) -> TestResult {
-    let input = Path::new("/work/test.cmake");
+    let input = host.initial_cwd().join("test.cmake");
     let version =
         rcmake_base::version::Version::parse_strict(b"4.5").ok_or("invalid test version")?;
     interp.cx().set_cmake_minimum_required(b"4.5", &version)?;
-    host.seed_file(input, code.as_bytes())?;
-    let outcome = interp.run_script(input);
+    host.seed_file(&input, code.as_bytes())?;
+    let outcome = interp.run_script(&input);
     assert_eq!(
         outcome.exit_code,
         0,
@@ -92,10 +98,7 @@ ${VALUE}]=] OUTPUT line/ending ESCAPE_QUOTES NEWLINE_STYLE DOS)
 #[test]
 fn path_decomposes_queries_and_compares() -> TestResult {
     let (host, mut interp) = interpreter();
-    script(
-        &host,
-        &mut interp,
-        r#"
+    let code = r#"
 cmake_path(SET p "//tmp//.hidden.tar.gz")
 cmake_path(GET p ROOT_NAME root_name)
 cmake_path(GET p ROOT_DIRECTORY root_dir)
@@ -124,8 +127,16 @@ cmake_path(COMPARE a//b EQUAL a/b equal)
 cmake_path(COMPARE a/ NOT_EQUAL a unequal)
 cmake_path(SET empty "")
 cmake_path(IS_PREFIX empty /a prefix_empty_new)
-"#,
-    )?;
+"#
+    .replace(
+        "//tmp//.hidden",
+        if cfg!(windows) {
+            "C:/tmp//.hidden"
+        } else {
+            "//tmp//.hidden"
+        },
+    );
+    script(&host, &mut interp, &code)?;
     interp.cx().set_policy(
         rcmake_diag::PolicyId::new(223),
         rcmake_diag::PolicyStatus::Old,
@@ -136,17 +147,17 @@ cmake_path(IS_PREFIX empty /a prefix_empty_new)
     vars(
         &mut interp,
         &[
-            ("root_name", ""),
+            ("root_name", if cfg!(windows) { "C:" } else { "" }),
             ("root_dir", "/"),
-            ("root", "/"),
+            ("root", if cfg!(windows) { "C:/" } else { "/" }),
             ("filename", ".hidden.tar.gz"),
             ("ext", ".tar.gz"),
             ("ext_last", ".gz"),
             ("stem", ".hidden"),
             ("stem_last", ".hidden.tar"),
             ("part", "tmp//.hidden.tar.gz"),
-            ("parent", "//tmp"),
-            ("has_root_name", "OFF"),
+            ("parent", if cfg!(windows) { "C:/tmp" } else { "//tmp" }),
+            ("has_root_name", if cfg!(windows) { "ON" } else { "OFF" }),
             ("has_root_dir", "ON"),
             ("has_root", "ON"),
             ("has_file", "ON"),
@@ -170,10 +181,7 @@ cmake_path(IS_PREFIX empty /a prefix_empty_new)
 #[test]
 fn path_modifies_normalizes_and_converts() -> TestResult {
     let (host, mut interp) = interpreter();
-    script(
-        &host,
-        &mut interp,
-        r#"
+    let code = r#"
 cmake_path(SET p a//b.tar.gz)
 cmake_path(APPEND p sub x OUTPUT_VARIABLE joined)
 cmake_path(APPEND p /absolute x OUTPUT_VARIABLE reset)
@@ -194,8 +202,13 @@ cmake_path(CONVERT "a::b:/c/../d" TO_CMAKE_PATH_LIST cmake_list NORMALIZE)
 cmake_path(CONVERT "a;;b/../c;" TO_NATIVE_PATH_LIST native_list NORMALIZE)
 cmake_path(HASH p hash1)
 cmake_path(HASH normal hash2)
-"#,
-    )?;
+"#;
+    let code = if cfg!(windows) {
+        code.replace("a::b:/c/../d", "a;;b;C:/c/../d")
+    } else {
+        code.to_owned()
+    };
+    script(&host, &mut interp, &code)?;
     vars(
         &mut interp,
         &[
@@ -213,10 +226,27 @@ cmake_path(HASH normal hash2)
             ("rel", "../a/"),
             ("abs", "/other/a/b.tar.gz"),
             ("default_base", "/work/a//b.tar.gz"),
-            ("NATIVE", "a//b.tar.gz"),
-            ("native_normal", "a/b.tar.gz"),
-            ("cmake_list", "a;:b;/d"),
-            ("native_list", "a:c"),
+            (
+                "NATIVE",
+                if cfg!(windows) {
+                    r"a\\b.tar.gz"
+                } else {
+                    "a//b.tar.gz"
+                },
+            ),
+            (
+                "native_normal",
+                if cfg!(windows) {
+                    r"a\b.tar.gz"
+                } else {
+                    "a/b.tar.gz"
+                },
+            ),
+            (
+                "cmake_list",
+                if cfg!(windows) { "a;b;C:/d" } else { "a;:b;/d" },
+            ),
+            ("native_list", if cfg!(windows) { "a;c" } else { "a:c" }),
         ],
     );
     assert_eq!(interp.cx().var(b"hash1"), interp.cx().var(b"hash2"));
@@ -447,11 +477,11 @@ file(COPY src/ DESTINATION contents USE_SOURCE_PERMISSIONS)
 
 #[test]
 fn file_globs_in_byte_order() -> TestResult {
-    let (host, mut interp) = interpreter();
+    let (host, mut interp) = interpreter_in(RunMode::Script, &format!("{DRIVE}/work"));
     script(
         &host,
         &mut interp,
-        r#"
+        &r#"
 file(WRITE tree/Z.txt z)
 file(WRITE tree/a.txt a)
 file(WRITE tree/sub/b.txt b)
@@ -461,7 +491,8 @@ file(GLOB_RECURSE recursive RELATIVE /work/tree "tree/*.txt")
 file(GLOB_RECURSE linked FOLLOW_SYMLINKS RELATIVE /work/tree "tree/*.txt")
 file(GLOB_RECURSE dirs LIST_DIRECTORIES true RELATIVE /work/tree "tree/missing*")
 file(GLOB wildcard RELATIVE /work/tree "tree/s?b/[a-c].txt")
-"#,
+"#
+        .replace("/work/", &format!("{DRIVE}/work/")),
     )?;
     vars(
         &mut interp,
@@ -478,12 +509,17 @@ file(GLOB wildcard RELATIVE /work/tree "tree/s?b/[a-c].txt")
 
 #[test]
 fn file_resolves_real_relative_and_legacy_paths() -> TestResult {
-    let (host, mut interp) = interpreter();
-    host.env_set(b"HOME", Some(b"/work/home"));
-    script(
-        &host,
-        &mut interp,
-        r#"
+    let (host, mut interp) = interpreter_in(RunMode::Script, &format!("{DRIVE}/work"));
+    let home = format!("{DRIVE}/work/home");
+    host.env_set(
+        if cfg!(windows) {
+            b"USERPROFILE"
+        } else {
+            b"HOME"
+        },
+        Some(home.as_bytes()),
+    );
+    let code = r#"
 file(WRITE home/a/file x)
 file(CREATE_LINK /work/home/a /work/alias SYMBOLIC)
 file(REAL_PATH "~/a/file" expanded EXPAND_TILDE)
@@ -494,19 +530,33 @@ file(REAL_PATH /work/bad/../home/a/file missing)
 file(RELATIVE_PATH rel /work/other /work/home/a/file)
 file(TO_CMAKE_PATH [[~/a/:/b//c/:a\b]] cmake)
 file(TO_NATIVE_PATH "path with space:/root/a//b/" native)
-"#,
-    )?;
+"#
+    .replace("/work/", &format!("{DRIVE}/work/"));
+    let code = if cfg!(windows) {
+        code.replace("~/a/:/b//c/:", "~/a/;/b//c/;")
+            .replace("path with space:/root", "path with space;/root")
+    } else {
+        code
+    };
+    script(&host, &mut interp, &code)?;
     vars(
         &mut interp,
         &[
-            ("expanded", "/work/home/a/file"),
-            ("based", "/work/home/a/file"),
-            ("rel_based", "/work/home/a/file"),
-            ("real", "/work/home/a/file"),
-            ("missing", "/work/bad/../home/a/file"),
+            ("expanded", &format!("{DRIVE}/work/home/a/file")),
+            ("based", &format!("{DRIVE}/work/home/a/file")),
+            ("rel_based", &format!("{DRIVE}/work/home/a/file")),
+            ("real", &format!("{DRIVE}/work/home/a/file")),
+            ("missing", &format!("{DRIVE}/work/bad/../home/a/file")),
             ("rel", "../home/a/file"),
-            ("cmake", "/work/home/a;/b/c;a/b"),
-            ("native", "path\\ with\\ space;/root/a/b/"),
+            ("cmake", &format!("{DRIVE}/work/home/a;/b/c;a/b")),
+            (
+                "native",
+                if cfg!(windows) {
+                    r#""path with space";\root\a\b\"#
+                } else {
+                    "path\\ with\\ space;/root/a/b/"
+                },
+            ),
         ],
     );
     Ok(())
@@ -975,11 +1025,11 @@ fn file_glob_reports_configure_depends_diagnostics() -> TestResult {
 
 #[test]
 fn file_glob_recurse_stops_only_when_a_symlink_target_repeats() -> TestResult {
-    let (host, mut interp) = interpreter();
+    let (host, mut interp) = interpreter_in(RunMode::Script, &format!("{DRIVE}/work"));
     script(
         &host,
         &mut interp,
-        r#"
+        &r#"
 file(WRITE tree/abc data)
 file(MAKE_DIRECTORY tree/sub/deep)
 file(CREATE_LINK ../.. tree/sub/deep/loop SYMBOLIC)
@@ -992,7 +1042,8 @@ file(CREATE_LINK . outer/inner/loop SYMBOLIC)
 file(MAKE_DIRECTORY entry)
 file(CREATE_LINK ../outer entry/alias SYMBOLIC)
 file(GLOB_RECURSE chained FOLLOW_SYMLINKS RELATIVE /work/entry "entry/*")
-"#,
+"#
+        .replace("/work/", &format!("{DRIVE}/work/")),
     )?;
     vars(
         &mut interp,
@@ -1581,5 +1632,133 @@ file(LOCK lock RELEASE)
 "#,
     )?;
     vars(&mut interp, &[("still_locked", "File already locked")]);
+    Ok(())
+}
+
+#[test]
+fn download_has_no_default_total_timeout_and_uses_the_last_range() -> TestResult {
+    use rcmake_host::{ProcessResult, RunOutput};
+    let (host, mut interp) = interpreter();
+    host.set_command_handler(|_, request, _| {
+        assert_eq!(request.timeout, None);
+        let args = &request.pipeline[0].args;
+        assert_eq!(args.iter().filter(|arg| *arg == "--range").count(), 1);
+        assert!(args.windows(2).any(|pair| pair == ["--range", "20-29"]));
+        Ok(RunOutput {
+            results: vec![ProcessResult::Exited(0)],
+            ..RunOutput::default()
+        })
+    })?;
+    script(
+        &host,
+        &mut interp,
+        "
+file(DOWNLOAD https://example.invalid/ RANGE_START 0 RANGE_END 9 RANGE_START 20 RANGE_END 29)
+file(DOWNLOAD file:///input RANGE_START 0 RANGE_END 9 RANGE_START 20 RANGE_END 29)
+",
+    )
+}
+
+#[test]
+fn download_passes_netrc_file_only_when_netrc_is_enabled() -> TestResult {
+    use rcmake_host::{ProcessResult, RunOutput};
+    let (host, mut interp) = interpreter();
+    host.set_command_handler(|_, request, _| {
+        let args = &request.pipeline[0].args;
+        let flag = if args
+            .iter()
+            .any(|arg| arg == "https://example.invalid/optional")
+        {
+            Some("--netrc-optional")
+        } else if args
+            .iter()
+            .any(|arg| arg == "https://example.invalid/required")
+        {
+            Some("--netrc")
+        } else {
+            None
+        };
+        assert_eq!(args.iter().any(|arg| arg == "--netrc-file"), flag.is_some());
+        if let Some(flag) = flag {
+            assert!(args.iter().any(|arg| arg == flag));
+            assert!(
+                args.windows(2)
+                    .any(|pair| pair == ["--netrc-file", "/work/.netrc"])
+            );
+        }
+        Ok(RunOutput {
+            results: vec![ProcessResult::Exited(0)],
+            ..RunOutput::default()
+        })
+    })?;
+    script(
+        &host,
+        &mut interp,
+        "
+set(CMAKE_NETRC_FILE /work/.netrc)
+file(DOWNLOAD https://example.invalid/default)
+file(DOWNLOAD https://example.invalid/ignored NETRC IGNORED)
+file(DOWNLOAD https://example.invalid/optional NETRC OPTIONAL)
+file(DOWNLOAD https://example.invalid/required NETRC REQUIRED)
+",
+    )
+}
+
+#[test]
+fn download_rejects_headers_that_start_with_an_at_sign() -> TestResult {
+    let (host, mut interp) = interpreter();
+    host.set_command_handler(|_, _, _| panic!("Rejected header reached the subprocess."))?;
+    let input = Path::new("/work/test.cmake");
+    host.seed_file(
+        input,
+        b"file(DOWNLOAD https://example.invalid/ HTTPHEADER @secret)",
+    )?;
+    assert_eq!(interp.run_script(input).exit_code, 1);
+    assert!(
+        host.stream_bytes(Stream::Stderr)
+            .to_string()
+            .contains("HTTPHEADER cannot start with '@'")
+    );
+    Ok(())
+}
+
+#[test]
+fn download_hashes_existing_files_above_the_single_read_limit() -> TestResult {
+    let host = Arc::new(PureHost::default());
+    let mut interp = Interp::new(
+        InterpConfig {
+            host: host.clone(),
+            mode: RunMode::Script,
+            cmake_root: "/cmake".into(),
+            cmake_command: "/cmake/bin/cmake".into(),
+            cwd: "/work".into(),
+            limits: rcmake_base::Limits {
+                max_file_read: 4096,
+                ..Default::default()
+            },
+            diag: Default::default(),
+            defines: Vec::new(),
+            script_args: Vec::new(),
+        },
+        register,
+    );
+    let payload = vec![0xab; 300 * 1024];
+    host.seed_file(Path::new("/work/large"), &payload)?;
+    host.set_command_handler(|_, _, _| panic!("The expected hash matched the existing file."))?;
+    let hash = HashAlgo::Sha256.hex_digest(&payload);
+    script(
+        &host,
+        &mut interp,
+        &format!(
+            "file(DOWNLOAD https://example.invalid/ large EXPECTED_HASH SHA256={hash} STATUS result)"
+        ),
+    )?;
+    vars(
+        &mut interp,
+        &[(
+            "result",
+            "0;\"skipping download as file already exists with expected SHA256 hash\"",
+        )],
+    );
     Ok(())
 }

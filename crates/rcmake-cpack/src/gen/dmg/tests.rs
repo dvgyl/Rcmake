@@ -1,34 +1,53 @@
 use std::sync::Arc;
 
-use rcmake_host::{CommandSpec, PureHost, RunOutput, Stream};
+use rcmake_host::{RunOutput, Stream};
 
 use super::*;
-use crate::generators::tests::{check_checksums, fake_image, invoke, read, success};
+use crate::generators::tests::{check_checksums, fake_image, invoke, package_host, read, success};
+
+fn check_create_args(args: &[BString], staging: &Path, output: &Path, volume: &str, format: &str) {
+    let [
+        create,
+        volname,
+        label,
+        srcfolder,
+        source,
+        overwrite,
+        flag,
+        kind,
+        image,
+    ] = args
+    else {
+        panic!("Expected nine hdiutil arguments.");
+    };
+    assert_eq!(
+        [create, volname, label, srcfolder, overwrite, flag, kind].map(|arg| arg.as_slice()),
+        [
+            "create",
+            "-volname",
+            volume,
+            "-srcfolder",
+            "-ov",
+            "-format",
+            format
+        ]
+        .map(str::as_bytes)
+    );
+    assert_eq!(to_native(source), staging);
+    assert_eq!(to_native(image), output);
+}
 
 #[test]
 fn creates_and_publishes_default_disk_image() {
-    let host = Arc::new(PureHost::default());
+    let host = package_host();
     host.set_command_handler(|host, request, _| {
         let staging = Path::new("/work/_CPack_Packages/DragNDrop/Sample Package");
         let output = staging.with_extension("dmg");
-        assert_eq!(
-            request.pipeline,
-            [CommandSpec {
-                program: "hdiutil".into(),
-                args: [
-                    "create".into(),
-                    "-volname".into(),
-                    "Sample Package".into(),
-                    "-srcfolder".into(),
-                    from_native(staging),
-                    "-ov".into(),
-                    "-format".into(),
-                    "UDZO".into(),
-                    from_native(&output),
-                ]
-                .into(),
-            }]
-        );
+        let [command] = request.pipeline.as_slice() else {
+            panic!("Expected one tool command.");
+        };
+        assert_eq!(command.program, "hdiutil");
+        check_create_args(&command.args, staging, &output, "Sample Package", "UDZO");
         assert_eq!(
             host.read_link(&staging.join("Applications"))?,
             Path::new("/Applications")
@@ -51,7 +70,7 @@ fn creates_and_publishes_default_disk_image() {
 #[test]
 fn stages_finder_files_and_passes_each_requested_format() {
     for format in ["UDRW", "UDRO", "UDCO", "UDZO", "UDBZ", "ULFO", "ULMO"] {
-        let host = Arc::new(PureHost::default());
+        let host = package_host();
         host.seed_file(Path::new("/work/assets/cover.png"), b"cover")
             .unwrap();
         host.seed_file(Path::new("/work/assets/layout"), b"layout")
@@ -60,14 +79,12 @@ fn stages_finder_files_and_passes_each_requested_format() {
             let command = request.pipeline.first().unwrap();
             let staging = Path::new("/work/_CPack_Packages/DragNDrop/Sample Package");
             assert_eq!(command.program, "hdiutil");
-            assert_eq!(
-                command.args,
-                create_args(
-                    staging,
-                    &staging.with_extension("dmg"),
-                    b"Demo Volume",
-                    format.as_bytes()
-                )
+            check_create_args(
+                &command.args,
+                staging,
+                &staging.with_extension("dmg"),
+                "Demo Volume",
+                format,
             );
             assert_eq!(
                 read(host, &staging.join(".background/background.png")),
@@ -102,7 +119,7 @@ set(CPACK_DMG_DS_STORE assets/layout)"#
 
 #[test]
 fn embeds_text_and_rtf_license_resources() {
-    let host = Arc::new(PureHost::default());
+    let host = package_host();
     for (file, content) in [
         ("English.menu.txt", "English\r\nAgree\r\n"),
         ("English.license.txt", "License\r\n"),
@@ -159,7 +176,7 @@ fn embeds_text_and_rtf_license_resources() {
 #[test]
 fn detaches_writable_image_before_conversion_or_failure() {
     for fail in [false, true] {
-        let host = Arc::new(PureHost::default());
+        let host = package_host();
         let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
         let observed = calls.clone();
         host.set_command_handler(move |host, request, _| {
@@ -204,7 +221,11 @@ fn detaches_writable_image_before_conversion_or_failure() {
         assert_eq!(flags, "-noautoopen");
         assert_eq!(input, image);
         assert_eq!(setup.program, "osascript");
-        assert_eq!(setup.args, ["/work/setup.applescript", "Sample Package"]);
+        let [script, label] = setup.args.as_slice() else {
+            panic!("Expected two setup arguments.");
+        };
+        assert_eq!(to_native(script), Path::new("/work/setup.applescript"));
+        assert_eq!(label, "Sample Package");
         assert_eq!(detach.args, [BString::from("detach"), mount.clone()]);
         if fail {
             assert!(rest.is_empty());
@@ -213,16 +234,17 @@ fn detaches_writable_image_before_conversion_or_failure() {
             let [convert] = rest else {
                 panic!("Unexpected commands {rest:?}");
             };
+            let [verb, input, format, kind, out, file] = convert.args.as_slice() else {
+                panic!("Expected six convert arguments.");
+            };
             assert_eq!(
-                convert.args,
-                [
-                    "convert".into(),
-                    image.clone(),
-                    "-format".into(),
-                    "UDZO".into(),
-                    "-o".into(),
-                    "/work/_CPack_Packages/DragNDrop/Sample Package.dmg".into(),
-                ]
+                [verb, format, kind, out].map(|arg| arg.as_slice()),
+                ["convert", "-format", "UDZO", "-o"].map(str::as_bytes)
+            );
+            assert_eq!(input, image);
+            assert_eq!(
+                to_native(file),
+                Path::new("/work/_CPack_Packages/DragNDrop/Sample Package.dmg")
             );
             check_checksums(host.as_ref());
         }

@@ -3,8 +3,7 @@ use std::time::Duration;
 
 use rcmake_base::{BString, hash::HashAlgo, list, truth};
 use rcmake_host::{
-    CommandSpec, FileKind, Follow, Host, Input, Output, ProcessResult, ReadRange, RunRequest,
-    Stream, path,
+    CommandSpec, FileKind, Follow, Host, Input, Output, ProcessResult, RunRequest, Stream, path,
 };
 
 use crate::cli::Invocation;
@@ -64,7 +63,15 @@ pub(super) fn run(host: &dyn Host, invocation: &Invocation) -> Result<i32, Strin
     }
     .map_err(|error| error.to_string())?;
     let log = invocation.options.verbose && !invocation.options.quiet;
-    let mut transport = Transport::new(false, false);
+    let mut transport = Transport::new(
+        false,
+        false,
+        definition(invocation, b"CTEST_SUBMIT_INACTIVITY_TIMEOUT").or(config
+            .submit_inactivity_timeout
+            .as_ref()
+            .map(|value| value.as_slice())),
+        None,
+    );
     tls(
         host,
         &config,
@@ -113,10 +120,20 @@ pub(crate) struct Transport {
     pub delay: Duration,
     pub log: bool,
     pub verbose: bool,
+    timeout: Option<Duration>,
 }
 
 impl Transport {
-    pub(crate) fn new(log: bool, verbose: bool) -> Self {
+    pub(crate) fn new(
+        log: bool,
+        verbose: bool,
+        inactivity: Option<&[u8]>,
+        timeout: Option<Duration>,
+    ) -> Self {
+        let seconds = inactivity
+            .and_then(|value| std::str::from_utf8(value).ok())
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .unwrap_or(120);
         Self {
             flags: [
                 "--disable",
@@ -126,17 +143,26 @@ impl Transport {
                 "--proto",
                 "=http,https",
                 "--globoff",
+                "--speed-limit",
+                "1",
+                "--speed-time",
             ]
             .map(BString::from)
-            .to_vec(),
+            .into_iter()
+            .chain([seconds.to_string().into()])
+            .collect(),
             retries: 0,
             delay: Duration::ZERO,
             log,
             verbose,
+            timeout,
         }
     }
 
-    pub(crate) fn header(&mut self, host: &dyn Host, header: BString) {
+    pub(crate) fn header(&mut self, host: &dyn Host, header: BString) -> Result<(), String> {
+        if header.starts_with(b"@") {
+            return Err("ctest_submit HTTPHEADER cannot start with '@'.".into());
+        }
         if self.verbose {
             host.write_out(
                 Stream::Stdout,
@@ -144,6 +170,7 @@ impl Transport {
             );
         }
         self.flags.extend(["--header".into(), header]);
+        Ok(())
     }
 
     fn request(
@@ -161,7 +188,7 @@ impl Transport {
                 url
             }
             Transfer::Post(fields, url) => {
-                args.extend(["--data".into(), fields.into()]);
+                args.extend(["--data-raw".into(), fields.into()]);
                 url
             }
         };
@@ -177,7 +204,7 @@ impl Transport {
                 stdin: Input::Null,
                 stdout: Output::Capture,
                 stderr: Output::Capture,
-                timeout: Some(Duration::from_secs(30)),
+                timeout: self.timeout,
                 tee: false,
             },
             1024 * 1024,
@@ -285,14 +312,7 @@ pub(crate) fn submit(
             ['\\', ':', '*', '?', '"', '<', '>', '|', '\n', '\r', '\t'],
             "",
         );
-        let payload = host
-            .read(
-                &file,
-                ReadRange::All {
-                    limit: rcmake_base::Limits::default().max_file_read,
-                },
-            )
-            .map_err(|error| error.to_string())?;
+        let md5 = path::hash_file(host, &file, HashAlgo::Md5).map_err(|error| error.to_string())?;
         let separator = if url.contains('?') { '&' } else { '?' };
         let mut destination = format!("{url}{separator}FileName={}", encode(remote.as_bytes()));
         if report {
@@ -306,14 +326,16 @@ pub(crate) fn submit(
                 destination.push_str(&format!("&subproject={}", encode(project)));
             }
         }
-        destination.push_str(&format!("&MD5={}", HashAlgo::Md5.hex_digest(&payload)));
+        destination.push_str(&format!("&MD5={md5}"));
         if transport.verbose {
             host.write_out(
                 Stream::Stdout,
                 format!(
                     "Upload file: {} to {destination} Size: {}\n",
                     file.display(),
-                    payload.len()
+                    host.metadata(&file, Follow::Yes)
+                        .map_err(|error| error.to_string())?
+                        .len
                 )
                 .as_bytes(),
             );
@@ -407,15 +429,8 @@ pub(crate) fn cdash_upload(
     if !http_url(&job.url) {
         return Err("Only http and https are supported for CDASH_UPLOAD".into());
     }
-    let payload = host
-        .read(
-            upload.file,
-            ReadRange::All {
-                limit: rcmake_base::Limits::default().max_file_read,
-            },
-        )
-        .map_err(|error| error.to_string())?;
-    let md5 = HashAlgo::Md5.hex_digest(&payload);
+    let md5 =
+        path::hash_file(host, upload.file, HashAlgo::Md5).map_err(|error| error.to_string())?;
     let (url, query) = job.url.split_once('?').unwrap_or((&job.url, ""));
     let stamp = encode(format!("{}-{}", tag.stamp(), tag.track).as_bytes());
     let group = encode(tag.track.as_bytes());
@@ -509,4 +524,62 @@ fn encode(value: &[u8]) -> String {
         }
     }
     escaped
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rcmake_host::{PureHost, RunOutput};
+
+    #[test]
+    fn rejects_header_file_arguments() {
+        let host = PureHost::default();
+        let mut transport = Transport::new(false, false, None, None);
+        assert!(transport.header(&host, "@secret".into()).is_err());
+        assert!(!transport.flags.iter().any(|flag| flag == "--header"));
+        transport.header(&host, "X-Example: value".into()).unwrap();
+        assert!(
+            transport
+                .flags
+                .windows(2)
+                .any(|pair| pair == ["--header", "X-Example: value"])
+        );
+    }
+
+    #[test]
+    fn sends_literal_post_data_and_applies_the_inactivity_timeout() {
+        let dir = if cfg!(windows) { "C:/work" } else { "/work" };
+        for (configured, speed_time, timeout) in [
+            (None, "120", None),
+            (Some(b"45".as_slice()), "45", Some(Duration::from_secs(9))),
+        ] {
+            let host = PureHost::new(dir.into(), dir.into());
+            let curl = Path::new(dir).join(format!("curl{}", std::env::consts::EXE_SUFFIX));
+            host.seed_file(&curl, b"").unwrap();
+            host.set_permissions(&curl, 0o755).unwrap();
+            host.env_set(b"PATH", Some(dir.as_bytes()));
+            host.set_command_handler(move |_, request, _| {
+                let args = &request.pipeline[0].args;
+                assert_eq!(request.timeout, timeout);
+                assert!(args.windows(2).any(|pair| pair == ["--speed-limit", "1"]));
+                assert!(
+                    args.windows(2)
+                        .any(|pair| pair == ["--speed-time", speed_time])
+                );
+                assert!(
+                    args.windows(2)
+                        .any(|pair| pair == ["--data-raw", "@literal&key=value"])
+                );
+                Ok(RunOutput::default())
+            })
+            .unwrap();
+            Transport::new(false, false, configured, timeout)
+                .request(
+                    &host,
+                    Path::new(dir),
+                    Transfer::Post("@literal&key=value", "https://example.invalid/"),
+                )
+                .unwrap();
+        }
+    }
 }

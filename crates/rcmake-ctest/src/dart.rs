@@ -24,6 +24,7 @@ pub(crate) struct Configuration {
     pub(crate) coverage_tool: BString,
     pub(crate) change_id: BString,
     pub(crate) submit_url: BString,
+    pub(crate) submit_inactivity_timeout: Option<BString>,
     pub(crate) drop_method: BString,
     pub(crate) drop_site: BString,
     pub(crate) drop_location: BString,
@@ -71,8 +72,8 @@ impl Configuration {
             Err(error) if error.kind == ErrorKind::NotFound => Vec::new(),
             Err(error) => return Err(error),
         };
-        let source = path::from_native(source);
-        let build = path::from_native(build);
+        let source = path::from_native_cmake(source);
+        let build = path::from_native_cmake(build);
         let fields = [
             (b"Site".as_slice(), self.site.as_slice()),
             (b"BuildName", self.build_name.as_slice()),
@@ -114,6 +115,7 @@ impl Configuration {
             b"BuildDirectory" => self.build_directory = value.into(),
             b"CTestTestCoverageTool" => self.coverage_tool = value.into(),
             b"SubmitURL" => self.submit_url = value.into(),
+            b"SubmitInactivityTimeout" => self.submit_inactivity_timeout = Some(value.into()),
             b"DropMethod" => self.drop_method = value.into(),
             b"DropSite" => self.drop_site = value.into(),
             b"DropLocation" => self.drop_location = value.into(),

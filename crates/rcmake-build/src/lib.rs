@@ -429,6 +429,9 @@ fn create_output_parent(host: &dyn Host, build_dir: &Path, file: &[u8]) -> Resul
     Ok(())
 }
 
+const SHELL_PROGRAM: &str = if cfg!(windows) { "cmd.exe" } else { "/bin/sh" };
+const SHELL_COMMAND_FLAG: &str = if cfg!(windows) { "/C" } else { "-c" };
+
 fn run(
     host: &dyn Host,
     build_dir: &Path,
@@ -439,8 +442,8 @@ fn run(
     let (program, args) = match invocation.argv.split_first() {
         Some((program, args)) => (program.clone(), args.to_vec()),
         None => (
-            "/bin/sh".into(),
-            vec!["-c".into(), invocation.shell.clone()],
+            SHELL_PROGRAM.into(),
+            vec![SHELL_COMMAND_FLAG.into(), invocation.shell.clone()],
         ),
     };
     if verbose {

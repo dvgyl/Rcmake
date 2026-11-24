@@ -246,7 +246,7 @@ impl Host for NativeHost {
     }
 
     fn remove_dir(&self, p: &Path) -> HostResult<()> {
-        let path = crate::path::directory_removal_path(p)?;
+        let path = crate::path::directory_removal_path(p, require_absolute, cfg!(windows))?;
         if !io_at(fs::symlink_metadata(&path), p)?.is_dir() {
             return Err(SyntheticError::NotADirectory.at(Some(p)));
         }
@@ -254,7 +254,7 @@ impl Host for NativeHost {
     }
 
     fn remove_dir_all(&self, p: &Path) -> HostResult<()> {
-        let path = crate::path::directory_removal_path(p)?;
+        let path = crate::path::directory_removal_path(p, require_absolute, cfg!(windows))?;
         io_at(platform::remove_dir_all(&path), p)
     }
 

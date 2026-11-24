@@ -11,7 +11,7 @@ use rcmake_base::{
     BString, CMAKE_VERSION_MAJOR, CMAKE_VERSION_MINOR, CMAKE_VERSION_PATCH, CMAKE_VERSION_STR,
     hash::HashAlgo,
 };
-use rcmake_host::{DirEntry, FileKind, Host, WriteMode, path::from_native, path::to_native};
+use rcmake_host::{DirEntry, FileKind, Host, WriteMode, path::from_native_cmake, path::to_native};
 use rcmake_json::Value::{self, Array, Bool, Object, UInt};
 use rcmake_model::{DirId, GeneratorKind, ProjectModel};
 use rcmake_resolve::{ConfigureMetadata, GenerationResult};
@@ -38,7 +38,7 @@ pub fn write_replies(
     let reply_dir = api_dir.join("reply");
     let old_entries = read_dir(host, &reply_dir)?;
     let root = model.dir(DirId::ROOT);
-    let build = from_native(build_dir);
+    let build = from_native_cmake(build_dir);
     let source = if root.source_dir.is_empty() {
         cache_value(model, b"CMAKE_HOME_DIRECTORY").unwrap_or(&build)
     } else {
@@ -131,7 +131,7 @@ impl ReplyWriter<'_> {
             }
         }
         Err(GenError::Write {
-            path: from_native(&path),
+            path: from_native_cmake(&path),
             message: "cannot create temporary reply file".into(),
         })
     }
@@ -287,9 +287,19 @@ impl FileApi<'_, '_> {
             (
                 "paths",
                 object([
-                    ("cmake", Value::string(from_native(&exe))),
-                    ("ctest", Value::string(from_native(&tool_dir.join("ctest")))),
-                    ("cpack", Value::string(from_native(&tool_dir.join("cpack")))),
+                    ("cmake", Value::string(from_native_cmake(&exe))),
+                    (
+                        "ctest",
+                        Value::string(from_native_cmake(
+                            &tool_dir.join(format!("ctest{}", std::env::consts::EXE_SUFFIX)),
+                        )),
+                    ),
+                    (
+                        "cpack",
+                        Value::string(from_native_cmake(
+                            &tool_dir.join(format!("cpack{}", std::env::consts::EXE_SUFFIX)),
+                        )),
+                    ),
                     ("root", Value::string(self.cmake_root())),
                 ]),
             ),
@@ -405,7 +415,7 @@ fn toolchains(metadata: &ConfigureMetadata) -> Members {
 
 fn configure_log(metadata: &ConfigureMetadata, build: &[u8]) -> Members {
     let path = metadata.configure_log.clone().unwrap_or_else(|| {
-        from_native(&to_native(build).join("CMakeFiles/CMakeConfigureLog.yaml"))
+        from_native_cmake(&to_native(build).join("CMakeFiles/CMakeConfigureLog.yaml"))
     });
     members([
         ("path", Value::string(path)),
@@ -447,7 +457,7 @@ fn relative(path: &[u8], root: &[u8]) -> BString {
         return if suffix.as_os_str().is_empty() {
             ".".into()
         } else {
-            from_native(suffix)
+            from_native_cmake(suffix)
         };
     }
     path.into()

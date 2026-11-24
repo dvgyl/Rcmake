@@ -55,12 +55,18 @@ fn configure(
 
 #[test]
 fn install_records_rules_and_export_membership() -> TestResult {
+    let headers = if cfg!(windows) {
+        "C:/opt/headers"
+    } else {
+        "/opt/headers"
+    };
     let (_, mut interp) = configure(
-        r#"
+        &format!(
+            r#"
 set(CMAKE_INSTALL_INCLUDEDIR headers)
 install(TARGETS core EXPORT sdk DESTINATION lib COMPONENT Run
         ARCHIVE DESTINATION archives NAMELINK_SKIP FILE_SET HEADERS DESTINATION headers
-        INCLUDES DESTINATION ./include include2 /opt/headers)
+        INCLUDES DESTINATION ./include include2 {headers})
 install(TARGETS api EXPORT sdk)
 install(FILES f TYPE INCLUDE PERMISSIONS OWNER_READ GROUP_READ RENAME file OPTIONAL)
 install(PROGRAMS tool DESTINATION bin CONFIGURATIONS Debug)
@@ -77,7 +83,8 @@ export(TARGETS api APPEND FILE core.cmake EXPORT_LINK_INTERFACE_LIBRARIES)
 export(PACKAGE Ignored)
 set(CMAKE_EXPORT_PACKAGE_REGISTRY ON)
 export(PACKAGE Enabled)
-"#,
+"#
+        ),
         0,
     )?;
     let mut cx = interp.cx();
@@ -111,7 +118,7 @@ export(PACKAGE Enabled)
     assert_eq!(target_rule.options.component, Some("Run".into()));
     assert_eq!(
         target_rule.options.includes_destination,
-        ["./include", "include2", "/opt/headers"]
+        ["./include", "include2", headers]
     );
     assert_eq!(files.options.destination, Some("headers".into()));
     assert_eq!(files.options.rename, Some("file".into()));
@@ -215,16 +222,23 @@ fn install_and_export_reject_invalid_argument_sets() -> TestResult {
 
 #[test]
 fn absolute_install_destinations_use_the_configured_diagnostic() -> TestResult {
+    let destination = if cfg!(windows) {
+        "C:/absolute/archives"
+    } else {
+        "/absolute/archives"
+    };
     let (host, _) = configure(
-        r#"
+        &format!(
+            r#"
 cmake_diagnostic(SET CMD_INSTALL_ABSOLUTE_DESTINATION WARN)
-install(TARGETS core ARCHIVE DESTINATION /absolute/archives)
+install(TARGETS core ARCHIVE DESTINATION {destination})
 install(FILES one DESTINATION relative)
-"#,
+"#
+        ),
         0,
     )?;
     let stderr = host.stream_bytes(Stream::Stderr).to_string();
-    assert!(stderr.contains("/absolute/archives"), "{stderr}");
+    assert!(stderr.contains(destination), "{stderr}");
     assert!(!stderr.contains("relative"), "{stderr}");
     Ok(())
 }

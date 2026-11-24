@@ -291,7 +291,12 @@ fn stages_noconfig_cps_and_explicit_sbom_and_preserves_header_paths() {
         .vars
         .insert("CMAKE_INSTALL_SBOM_FORMATS".into(), "spdx".into());
     let manifest = write_supplementary_outputs(&model, &result, &host, build).unwrap();
-    let stage = export_stage(build, "Export", b"lib/cps/Sdk");
+    let destination = if cfg!(windows) {
+        b"cps/Sdk".as_slice()
+    } else {
+        b"lib/cps/Sdk".as_slice()
+    };
+    let stage = export_stage(build, "Export", destination);
     assert!(
         read(&host, &stage.join("Sdk@noconfig.cps"))
             .to_string()
@@ -361,7 +366,12 @@ fn stages_appendix_files_with_lower_case_package_names() {
     add_install(&mut model, InstallKind::PackageInfo(Box::new(spec.clone())));
     add_export(&mut model, ExportKind::PackageInfo(spec));
     write_supplementary_outputs(&model, &result, &host, build).unwrap();
-    let stage = export_stage(build, "Export", b"lib/cps/sdk");
+    let destination = if cfg!(windows) {
+        b"cps/sdk".as_slice()
+    } else {
+        b"lib/cps/sdk".as_slice()
+    };
+    let stage = export_stage(build, "Export", destination);
     assert!(
         read(&host, &stage.join("sdk-Tools@debug.cps"))
             .to_string()

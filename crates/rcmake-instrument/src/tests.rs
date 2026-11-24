@@ -188,11 +188,14 @@ fn query_errors_show_the_source_value_and_file() {
     let error = query::read_queries(&host, build).expect_err("reject invalid query");
     assert_eq!(
         error.to_string(),
-        concat!(
-            "Could not load instrumentation queries from /build/.cmake/instrumentation/v1/query:\n",
-            "invalid.json:3: Not a valid option: \"bad option\"\n",
-            "  \"options\": [\"trace\", \"bad option\"]\n",
-            "                       ^",
+        format!(
+            concat!(
+                "Could not load instrumentation queries from {}:\n",
+                "invalid.json:3: Not a valid option: \"bad option\"\n",
+                "  \"options\": [\"trace\", \"bad option\"]\n",
+                "                       ^"
+            ),
+            query.display()
         ),
     );
 }

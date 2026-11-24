@@ -108,7 +108,7 @@ impl Rejection {
         for diagnostic in &mut diagnostics {
             diagnostic
                 .files
-                .extend(files.iter().map(|file| path::from_native(file)));
+                .extend(files.iter().map(|file| path::from_native_cmake(file)));
         }
         Self {
             reason: dependency_error(package, &dependency),
@@ -144,7 +144,7 @@ fn message(error: CpsError) -> BString {
 
 pub(super) fn read_root(cx: &mut Cx<'_>, file: &Path) -> Result<CpsPackage, BString> {
     let bytes = read(cx, file)?;
-    let file = path::from_native(file);
+    let file = path::from_native_cmake(file);
     match reader::read_package(&bytes, &file) {
         Ok(package) => Ok(package),
         Err(error) => recover_optional_attributes(cx, &bytes, &file).ok_or_else(|| message(error)),
@@ -291,7 +291,8 @@ pub(super) fn prepare(
     let files = active
         .iter()
         .flat_map(|value| value.split(|byte| *byte == 0));
-    let identity = path::from_native(&cx.host().canonicalize(file).unwrap_or_else(|_| file.into()));
+    let identity =
+        path::from_native_cmake(&cx.host().canonicalize(file).unwrap_or_else(|_| file.into()));
     if files.clone().any(|file| file == identity)
         || files.count() >= cx.limits().max_recursion.min(64) as usize
     {
@@ -330,7 +331,7 @@ fn load_companions(
     let (Some(dir), Some(stem)) = (
         file.parent(),
         file.file_stem()
-            .map(|stem| path::from_native(Path::new(stem))),
+            .map(|stem| path::from_native_cmake(Path::new(stem))),
     ) else {
         return Ok(Err(BString::from(
             "The CPS file has no package name or directory.",
@@ -369,8 +370,12 @@ fn load_companions(
                 prefix: package.prefix.clone(),
                 ..Default::default()
             };
-            if reader::merge_appendix(&mut appendix, &contents, &path::from_native(&companion))
-                .is_ok()
+            if reader::merge_appendix(
+                &mut appendix,
+                &contents,
+                &path::from_native_cmake(&companion),
+            )
+            .is_ok()
             {
                 appendices.push((
                     suffix,
@@ -439,7 +444,7 @@ fn load_companions(
         if let Err(error) = reader::merge_appendix(
             package,
             &appendix.contents,
-            &path::from_native(&appendix.file),
+            &path::from_native_cmake(&appendix.file),
         ) {
             return Ok(Err(message(error).into()));
         }
@@ -491,7 +496,7 @@ fn load_supplements(
 ) -> Result<(), BString> {
     for file in files {
         let contents = read(cx, file)?;
-        let path = path::from_native(file);
+        let path = path::from_native_cmake(file);
         let supplement = reader::read_supplement(&contents, &path).map_err(message)?;
         reader::merge_supplement(package, supplement, &path).map_err(message)?;
     }

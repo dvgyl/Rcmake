@@ -479,9 +479,11 @@ fn cached_tar_directories_cannot_be_replaced_by_symlinks() -> TestResult {
     add_test_tar_file(&mut builder, "tree/second")?;
     host.seed_file(archive, &builder.into_inner()?)?;
     let result = extract_archive(&host, archive, &extract_options());
-    assert!(result.is_err_and(
-        |error| error.message == "Cannot extract over this filesystem entry: /extract/tree"
-    ));
+    assert!(result.is_err_and(|error| error.message
+        == format!(
+            "Cannot extract over this filesystem entry: {}",
+            Path::new("/extract").join("tree").display()
+        )));
     assert!(absent(&host, "/outside/second"));
     assert_eq!(
         read_bytes(&host, Path::new("/extract/tree/first"), 1)?,

@@ -6,7 +6,7 @@ use rcmake_base::BString;
 use rcmake_eval::{Cx, Flow};
 use rcmake_host::{
     CopyOptions, FileKind, Follow,
-    path::{from_native, to_native},
+    path::{from_native, from_native_cmake, to_native},
 };
 use rcmake_regex::{MatchOptions, Regex};
 
@@ -200,7 +200,7 @@ pub(super) fn copy_entry(
         .metadata(source, Follow::No)
         .map_err(|e| copy_error(command, "read", source, &e))?;
     let directory = meta.kind == FileKind::Dir;
-    let name = from_native(source);
+    let name = from_native_cmake(source);
     let filename = source.file_name().map(|name| from_native(Path::new(name)));
     let mut matched = false;
     let mut mode = None;
@@ -365,7 +365,7 @@ fn is_descendant(cx: &Cx<'_>, source: &Path, target: &Path) -> bool {
     let Ok(source) = host.canonicalize(source) else {
         return false;
     };
-    let normalized = Lexical::new(&from_native(target)).normalize();
+    let normalized = Lexical::new(&from_native_cmake(target)).normalize();
     to_native(&normalized)
         .ancestors()
         .find_map(|path| match host.canonicalize(path) {

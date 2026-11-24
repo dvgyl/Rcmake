@@ -306,3 +306,101 @@ fn pure_lock_waits_for_release() {
         .expect("work directory");
     assert_eq!(check_lock_wait(&host, Path::new("/work/wait.lock")), Ok(()));
 }
+
+#[test]
+fn pure_host_keeps_virtual_roots_and_resolves_cross_root_links() -> rcmake_host::HostResult<()> {
+    let host = PureHost::default();
+    host.seed_file(Path::new(r"C:\new\file"), b"N")?;
+    host.seed_file(Path::new(r"\virtual\new\file"), b"V")?;
+    assert!(host.metadata(Path::new("C:/new/file"), Follow::No).is_ok());
+    assert!(
+        host.metadata(Path::new("/virtual/new/file"), Follow::No)
+            .is_ok()
+    );
+    let cases = [
+        (
+            "/work/tree/item",
+            r"\work/tree/item",
+            "/work/tree/item",
+            b'P',
+        ),
+        (
+            "C:/work/tree/item",
+            r"c:\work\tree\item",
+            "C:/work/tree/item",
+            b'C',
+        ),
+        (
+            "D:/work/tree/item",
+            r"D:\work\tree\item",
+            "D:/work/tree/item",
+            b'D',
+        ),
+        (
+            "//server/share/work/tree/item",
+            r"\\server\share\work\tree\item",
+            "//server/share/work/tree/item",
+            b'U',
+        ),
+    ];
+    let range = rcmake_host::ReadRange::All { limit: 1 };
+    for (file, alias, canonical, value) in cases {
+        host.seed_file(Path::new(file), &[value])?;
+        assert_eq!(host.read(Path::new(alias), range)?, [value]);
+        assert_eq!(
+            rcmake_host::path::from_native(&host.canonicalize(Path::new(alias))?),
+            canonical
+        );
+    }
+    host.seed_file(Path::new("/server/share/work/tree/item"), b"S")?;
+    assert_eq!(
+        host.read(Path::new("//server/share/work/tree/item"), range)?,
+        b"U"
+    );
+    for (file, value) in [
+        ("/../../work/tree/item", b'P'),
+        ("C:/../../work/tree/item", b'C'),
+        ("//server/share/../../work/tree/item", b'U'),
+    ] {
+        assert_eq!(host.read(Path::new(file), range)?, [value]);
+    }
+
+    host.symlink(Path::new(r"C:\work\tree"), Path::new("/work/drive"))?;
+    host.symlink(Path::new("/work/tree"), Path::new("D:/work/synthetic"))?;
+    host.symlink(Path::new(r"..\tree"), Path::new("D:/work/tree/relative"))?;
+    host.symlink(
+        Path::new(r"\\server\share\work\tree"),
+        Path::new("C:/work/share"),
+    )?;
+    for (file, value) in [
+        ("/work/drive/item", b'C'),
+        ("D:/work/synthetic/item", b'P'),
+        ("D:/work/tree/relative/item", b'D'),
+        ("C:/work/share/item", b'U'),
+    ] {
+        assert_eq!(host.read(Path::new(file), range)?, [value]);
+    }
+
+    assert!(host.read(Path::new("C:work/tree/item"), range).is_err());
+    assert!(host.create_dir_all(Path::new("C:work")).is_err());
+    for root in ["/", r"\", r"C:\", "//server/share", r"\\server\share\"] {
+        assert!(host.remove_dir_all(Path::new(root)).is_err());
+    }
+    assert!(host.remove_dir_all(Path::new("C:/work/tree/.")).is_err());
+    assert!(host.remove_dir_all(Path::new("C:/work/tree/..")).is_err());
+    host.remove_dir_all(Path::new(r"c:\work\tree\"))?;
+    host.remove_dir_all(Path::new(r"\work/tree/"))?;
+    assert!(
+        host.metadata(Path::new("C:/work/tree"), Follow::No)
+            .is_err()
+    );
+    assert!(host.metadata(Path::new("/work/tree"), Follow::No).is_err());
+    assert_eq!(host.read(Path::new("D:/work/tree/item"), range)?, b"D");
+    assert_eq!(
+        host.read(Path::new("//server/share/work/tree/item"), range)?,
+        b"U"
+    );
+    host.create_dir_all(Path::new("C:/work/empty"))?;
+    host.remove_dir(Path::new(r"C:\work\empty\"))?;
+    Ok(())
+}

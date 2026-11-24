@@ -64,7 +64,7 @@ impl Interp {
                 (file.starts_with(&source) || file.starts_with(&binary))
                     && (self.config.cmake_root.as_os_str().is_empty()
                         || !file.starts_with(&self.config.cmake_root))
-                    && !file.starts_with(binary.join("CMakeFiles"))
+                    && !file.starts_with(Path::new("/CMakeFiles"))
             });
         if self.check_system_vars || project_file {
             self.issue_here(

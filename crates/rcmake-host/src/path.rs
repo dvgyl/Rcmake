@@ -33,13 +33,23 @@ pub fn from_native(p: &Path) -> BString {
     }
 }
 
-pub(crate) fn directory_removal_path(p: &Path) -> crate::HostResult<PathBuf> {
+/// Convert a native path to the forward-slash spelling used by CMake.
+#[must_use]
+pub fn from_native_cmake(p: &Path) -> BString {
+    rcmake_base::path_lex::cmake_style(&from_native(p))
+}
+
+pub(crate) fn directory_removal_path(
+    p: &Path,
+    require_absolute: fn(&Path) -> crate::HostResult<()>,
+    windows_separators: bool,
+) -> crate::HostResult<PathBuf> {
     use crate::error::SyntheticError;
 
-    crate::require_absolute(p)?;
+    require_absolute(p)?;
     let bytes = from_native(p);
     let bytes = bytes.as_slice();
-    let separator = |byte: &u8| *byte == b'/' || (cfg!(windows) && *byte == b'\\');
+    let separator = |byte: &u8| *byte == b'/' || (windows_separators && *byte == b'\\');
     if p.parent().is_none() {
         return Err(SyntheticError::ResourceBusy.at(Some(p)));
     }
@@ -75,4 +85,21 @@ pub fn executable_on_absolute_path(host: &dyn crate::Host, name: &str) -> Option
                 meta.kind == crate::FileKind::File && (cfg!(windows) || meta.mode & 0o111 != 0)
             })
         })
+}
+
+/// Hash a regular file with bounded reads.
+pub fn hash_file(
+    host: &dyn crate::Host,
+    file: &Path,
+    algorithm: rcmake_base::hash::HashAlgo,
+) -> crate::HostResult<String> {
+    let metadata = host.metadata(file, crate::Follow::Yes)?;
+    if metadata.kind != crate::FileKind::File {
+        return Err(crate::HostError::unsupported(
+            "The path is not a regular file.",
+        ));
+    }
+    let mut hash = algorithm.hasher();
+    host.read_chunks(file, &mut |chunk| hash.update(chunk))?;
+    Ok(hash.finish_hex())
 }

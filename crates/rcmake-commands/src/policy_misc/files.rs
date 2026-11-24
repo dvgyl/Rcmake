@@ -199,7 +199,7 @@ pub(crate) fn configure_file(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult
     if metadata.kind == FileKind::Dir {
         return Err(CmdError::status(quoted(
             "input location\n\n  ",
-            &path::from_native(&source),
+            &path::from_native_cmake(&source),
             "\n\nis a directory but a file was expected.",
         )));
     }
@@ -228,7 +228,7 @@ pub(crate) fn configure_file(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult
             cx,
             quoted(
                 "File starts with a Byte-Order-Mark that is not UTF-8:\n  ",
-                &path::from_native(&source),
+                &path::from_native_cmake(&source),
                 "",
             ),
         ));
@@ -389,7 +389,7 @@ pub(super) fn filename_component(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdRe
             let base = base_dir.unwrap_or_else(|| cx.current_source_dir());
             let input = if let Some(drive) = drive_root(&path_input).filter(|_| !cfg!(windows)) {
                 let absolute = path::to_native(path_input.get(2..).unwrap_or_default());
-                let clean = path::from_native(&normalize(&absolute));
+                let clean = path::from_native_cmake(&normalize(&absolute));
                 path::to_native(&[drive, clean.as_slice()].concat())
             } else if let Some(tail) = path_input.strip_prefix(b"~/")
                 && let Some(home) = cx.host().env_get(b"HOME")
@@ -404,7 +404,7 @@ pub(super) fn filename_component(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdRe
             } else {
                 normalized
             };
-            path::from_native(&resolved)
+            path::from_native_cmake(&resolved)
         }
         b"PROGRAM" => {
             let (program, tail) = find_program(cx, input);
@@ -544,9 +544,9 @@ fn program_path(cx: &Cx<'_>, name: &[u8], whole_path_search: bool) -> Option<BSt
         })
     {
         return Some(if path::to_native(&name).is_absolute() {
-            path::from_native(&normalize(&local))
+            path::from_native_cmake(&normalize(&local))
         } else if whole_path_search {
-            path::from_native(&cx.host().canonicalize(&local).unwrap_or(local))
+            path::from_native_cmake(&cx.host().canonicalize(&local).unwrap_or(local))
         } else {
             name.into()
         });
@@ -561,6 +561,6 @@ fn program_path(cx: &Cx<'_>, name: &[u8], whole_path_search: bool) -> Option<BSt
         cx.host()
             .metadata(&candidate, Follow::Yes)
             .is_ok_and(|m| m.kind == FileKind::File && (cfg!(windows) || m.mode & 0o111 != 0))
-            .then(|| path::from_native(&candidate))
+            .then(|| path::from_native_cmake(&candidate))
     })
 }

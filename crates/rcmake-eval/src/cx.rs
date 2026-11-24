@@ -9,7 +9,7 @@ use rcmake_diag::{
 use rcmake_expr::{CondError, ExpandError, ExpandedArg};
 use rcmake_host::{
     Host,
-    path::{from_native, to_native},
+    path::{from_native_cmake, to_native},
 };
 use rcmake_model::{Cache, CacheEntry, CacheType, DirId, GlobalState, ProjectModel, PropertyMap};
 use rcmake_regex::{Captures, Regex, RegexError};
@@ -85,7 +85,7 @@ impl Cx<'_> {
                             _ => clean.push(component),
                         }
                     }
-                    from_native(&clean)
+                    from_native_cmake(&clean)
                 }),
         )
     }
@@ -531,7 +531,7 @@ impl Cx<'_> {
         body: BString,
     ) {
         let source = self.interp.current_source_dir();
-        let root_file = rcmake_host::path::from_native(&source.join("CMakeLists.txt"));
+        let root_file = rcmake_host::path::from_native_cmake(&source.join("CMakeLists.txt"));
         let frames: Vec<_> = self
             .interp
             .bt
@@ -561,7 +561,7 @@ impl Cx<'_> {
     /// Report an error associated with a directory's main listfile.
     pub fn issue_directory_error(&mut self, dir: DirId, body: BString) {
         let source = &self.interp.project.dir(dir).source_dir;
-        let file = rcmake_host::path::from_native(
+        let file = rcmake_host::path::from_native_cmake(
             &rcmake_host::path::to_native(source).join("CMakeLists.txt"),
         );
         self.interp.issue_at(

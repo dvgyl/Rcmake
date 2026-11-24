@@ -483,7 +483,14 @@ fn expansion_uses_parent_environment_and_detects_cycles() {
     assert_eq!(settings.toolchain_file, Some("//tool.cmake".into()));
     assert_eq!(settings.graphviz, Some("project.dot".into()));
     for (key, expected) in [
-        ("PATH", "bin:system"),
+        (
+            "PATH",
+            if cfg!(windows) {
+                "bin;system"
+            } else {
+                "bin:system"
+            },
+        ),
         ("PASS", "Ninja"),
         ("DOLLAR", "${stay}"),
         ("LITERAL", "$unknown{key}"),

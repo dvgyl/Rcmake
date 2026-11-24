@@ -16,38 +16,67 @@ pub(crate) fn cat(parts: &[&[u8]]) -> BString {
 /// Relative paths are joined to `base`. `.` components are removed and `..` removes the
 /// previous component (never above the root).
 pub(crate) fn collapse_full_path(path: &[u8], base: &[u8]) -> BString {
-    let mut joined = Vec::new();
-    if path.first() != Some(&b'/') {
-        joined.extend_from_slice(base);
-        joined.push(b'/');
-    }
-    joined.extend_from_slice(path);
+    let path = rcmake_base::path_lex::cmake_style(path);
+    let joined = if path.starts_with(b"/") || drive_root(&path) {
+        path
+    } else {
+        let mut joined = rcmake_base::path_lex::cmake_style(base);
+        if !joined.ends_with(b"/") {
+            joined.push(b'/');
+        }
+        joined.extend_from_slice(&path);
+        joined
+    };
 
-    let mut parts: Vec<&[u8]> = Vec::new();
-    for comp in joined.split(|&b| b == b'/') {
-        match comp {
+    let root_len = root_len(&joined);
+    let (root, relative) = joined.as_slice().split_at(root_len);
+    let mut parts = Vec::new();
+    for component in relative.split(|&byte| byte == b'/') {
+        match component {
             b"" | b"." => {}
             b".." => {
                 parts.pop();
             }
-            other => parts.push(other),
+            part => parts.push(part),
         }
     }
-    let mut out = Vec::with_capacity(joined.len());
-    for part in &parts {
-        out.push(b'/');
-        out.extend_from_slice(part);
-    }
-    if out.is_empty() {
+    let mut out = BString::from(root);
+    if out.is_empty() || (!parts.is_empty() && !out.ends_with(b"/")) {
         out.push(b'/');
     }
-    BString::from(out)
+    out.extend_from_slice(&parts.join(&b'/'));
+    out
+}
+
+fn drive_root(path: &[u8]) -> bool {
+    cfg!(windows) && matches!(path, [letter, b':', b'/', ..] if letter.is_ascii_alphabetic())
+}
+
+fn root_len(path: &[u8]) -> usize {
+    if drive_root(path) {
+        return 3;
+    }
+    if cfg!(windows)
+        && let Some(remote) = path.strip_prefix(b"//")
+    {
+        let mut parts = remote.splitn(3, |&byte| byte == b'/');
+        if let (Some(server), Some(share)) = (parts.next(), parts.next())
+            && !server.is_empty()
+            && !share.is_empty()
+        {
+            return 3 + server.len() + share.len();
+        }
+    }
+    usize::from(path.starts_with(b"/"))
 }
 
 /// Directory part of a path (`cmSystemTools::GetFilenamePath`).
 pub(crate) fn filename_path(path: &[u8]) -> BString {
     match path.iter().rposition(|&b| b == b'/') {
         Some(0) => BString::from("/"),
+        Some(pos) if pos < root_len(path) => {
+            BString::from(path.get(..root_len(path)).unwrap_or_default())
+        }
         Some(pos) => BString::from(path.get(..pos).unwrap_or_default()),
         None => BString::default(),
     }
@@ -162,6 +191,25 @@ mod tests {
         assert_eq!(filename_path(b"/w/a.cmake"), "/w");
         assert_eq!(filename_path(b"/a.cmake"), "/");
         assert_eq!(filename_path(b"a.cmake"), "");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn collapse_keeps_drive_and_unc_roots() {
+        assert_eq!(
+            collapse_full_path(br"C:\one\two\..\..\..\file", b"D:/work"),
+            "C:/file"
+        );
+        assert_eq!(collapse_full_path(b"../file", br"C:\work"), "C:/file");
+        assert_eq!(
+            collapse_full_path(br"\\server\share\one\..\..\file", b"D:/work"),
+            "//server/share/file"
+        );
+        assert_eq!(
+            collapse_full_path(br"\\?\UNC\server\share\one", b"D:/work"),
+            "//server/share/one"
+        );
+        assert_eq!(filename_path(b"C:/file"), "C:/");
     }
 
     #[test]

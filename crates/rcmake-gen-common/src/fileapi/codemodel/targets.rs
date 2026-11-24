@@ -5,7 +5,7 @@ use std::path::Path;
 
 use rcmake_base::{list, truth::is_on};
 use rcmake_diag::{Backtrace, Frame, FrameKind};
-use rcmake_host::path::{from_native, to_native};
+use rcmake_host::path::{from_native, from_native_cmake, to_native};
 use rcmake_model::{BT, DirId, Directory, InstallRule, ProjectModel, Target, TargetId, TargetKind};
 use rcmake_resolve::{
     ArtifactSet, CompileGroup, LinkFragmentRole, LinkKind, ResolvedTarget, TargetMetadata,
@@ -233,7 +233,7 @@ impl FileApi<'_, '_> {
                     ]);
                     let listfile = to_native(&dir.source_dir).join("CMakeLists.txt");
                     let trace = Backtrace::default().push(Frame {
-                        file: from_native(&listfile).as_slice().into(),
+                        file: from_native_cmake(&listfile).as_slice().into(),
                         line: 0,
                         name: None,
                         kind: FrameKind::Command,
@@ -481,7 +481,7 @@ impl FileApi<'_, '_> {
             .map(|unit| (unit.source.clone(), Some(unit.group)));
         for (source, group) in units.chain(raw_sources) {
             let file = to_native(&target.metadata.source_dir).join(to_native(&source.value));
-            let file = from_native(&file);
+            let file = from_native_cmake(&file);
             if !seen.insert(file.clone()) {
                 continue;
             }

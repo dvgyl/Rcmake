@@ -5,6 +5,8 @@ use rcmake_eval::{Interp, InterpConfig, RunMode};
 use rcmake_host::{Follow, Host, ProcessResult, PureHost, ReadRange, RunOutput, Stream};
 use rcmake_model::CacheType;
 
+const DRIVE: &str = if cfg!(windows) { "C:" } else { "" };
+
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
 fn interpreter(host: Arc<dyn Host>, cwd: &Path) -> Interp {
@@ -39,19 +41,23 @@ fn interpreter(host: Arc<dyn Host>, cwd: &Path) -> Interp {
 #[test]
 fn builds_all_four_signatures_and_captures_child_output() -> TestResult {
     let host = Arc::new(PureHost::default());
-    host.seed_file(Path::new("/work/probe-cc"), b"")?;
-    host.seed_file(Path::new("/work/main.c"), b"int main(void) { return 0; }")?;
+    host.seed_file(Path::new(&format!("{DRIVE}/work/probe-cc")), b"")?;
     host.seed_file(
-        Path::new("/work/sub/main.c"),
+        Path::new(&format!("{DRIVE}/work/main.c")),
         b"int main(void) { return 0; }",
     )?;
     host.seed_file(
-        Path::new("/work/sub/missing.c"),
+        Path::new(&format!("{DRIVE}/work/sub/main.c")),
         b"int main(void) { return 0; }",
     )?;
     host.seed_file(
-        Path::new("/work/sub/CMakeLists.txt"),
-        br#"
+        Path::new(&format!("{DRIVE}/work/sub/missing.c")),
+        b"int main(void) { return 0; }",
+    )?;
+    host.seed_file(
+        Path::new(&format!("{DRIVE}/work/sub/CMakeLists.txt")),
+        &std::str::from_utf8(
+            br#"
 cmake_minimum_required(VERSION 4.5)
 project(Child C)
 get_property(nested GLOBAL PROPERTY IN_TRY_COMPILE)
@@ -59,10 +65,13 @@ message(STATUS "child nested=${nested} flag=${PASSED}")
 add_executable(app main.c)
 add_executable(excluded missing.c)
 "#,
+        )?
+        .replace("/work", &format!("{DRIVE}/work"))
+        .into_bytes(),
     )?;
     host.seed_file(
-            Path::new("/work/CMakeLists.txt"),
-            br#"
+            Path::new(&format!("{DRIVE}/work/CMakeLists.txt")),
+            &std::str::from_utf8(br#"
 cmake_minimum_required(VERSION 4.5)
 project(Parent NONE)
 set(CMAKE_C_COMPILER /work/probe-cc)
@@ -73,11 +82,14 @@ try_compile(LEGACY /work/legacy /work/main.c NO_LOG)
 try_compile(PROJECT_NEW PROJECT Child SOURCE_DIR /work/sub BINARY_DIR /work/build/project-new TARGET app
     CMAKE_FLAGS -DPASSED:STRING=override OUTPUT_VARIABLE CHILD_OUT LOG_DESCRIPTION "Child build")
 try_compile(PROJECT_OLD /work/project-old /work/sub Child app OUTPUT_VARIABLE CHILD_OLD NO_LOG)
-"#,
+"#)?.replace("/work", &format!("{DRIVE}/work")).into_bytes(),
         )?;
     host.set_command_handler(|_, request, _| {
         let command = &request.pipeline[0];
-        assert_eq!(command.program, "/work/probe-cc");
+        assert_eq!(
+            rcmake_host::path::to_native(&command.program),
+            Path::new(&format!("{DRIVE}/work/probe-cc"))
+        );
         assert!(!command.args.iter().any(|arg| arg.ends_with(b"missing.c")));
         Ok(RunOutput {
             stdout: b"compiler output\n".to_vec(),
@@ -85,8 +97,12 @@ try_compile(PROJECT_OLD /work/project-old /work/sub Child app OUTPUT_VARIABLE CH
             ..RunOutput::default()
         })
     })?;
-    let mut interp = interpreter(host.clone(), Path::new("/work"));
-    let result = interp.run_configure(Path::new("/work"), Path::new("/work/build"), &[]);
+    let mut interp = interpreter(host.clone(), Path::new(&format!("{DRIVE}/work")));
+    let result = interp.run_configure(
+        Path::new(&format!("{DRIVE}/work")),
+        Path::new(&format!("{DRIVE}/work/build")),
+        &[],
+    );
     assert_eq!(result.exit_code, 0, "{}", host.stream_bytes(Stream::Stderr));
     let mut cx = interp.cx();
     assert_eq!(cx.var_normal_only(b"NEW"), Some("TRUE".into()));
@@ -112,60 +128,35 @@ try_compile(PROJECT_OLD /work/project-old /work/sub Child app OUTPUT_VARIABLE CH
     );
     assert!(host.stream_bytes(Stream::Stdout).is_empty());
     assert!(
-        host.read_dir(Path::new("/work/build/CMakeFiles/CMakeScratch"))?
-            .is_empty()
+        host.read_dir(Path::new(&format!(
+            "{DRIVE}/work/build/CMakeFiles/CMakeScratch"
+        )))?
+        .is_empty()
     );
     assert!(
-        host.metadata(Path::new("/work/legacy/CMakeFiles/CMakeTmp"), Follow::No)
-            .is_err()
+        host.metadata(
+            Path::new(&format!("{DRIVE}/work/legacy/CMakeFiles/CMakeTmp")),
+            Follow::No
+        )
+        .is_err()
     );
     assert_eq!(
-        host.metadata(Path::new("/work/build/project-new"), Follow::No)?
-            .kind,
+        host.metadata(
+            Path::new(&format!("{DRIVE}/work/build/project-new")),
+            Follow::No
+        )?
+        .kind,
         rcmake_host::FileKind::Dir
     );
     let log = host.read(
-        Path::new("/work/build/CMakeFiles/CMakeConfigureLog.yaml"),
+        Path::new(&format!(
+            "{DRIVE}/work/build/CMakeFiles/CMakeConfigureLog.yaml"
+        )),
         ReadRange::All { limit: 16_384 },
     )?;
     let log = std::str::from_utf8(&log)?;
     assert_eq!(log.matches("try_compile-v1").count(), 1);
     assert!(log.contains("description: \"Child build\""));
-    Ok(())
-}
-
-#[test]
-fn stops_nested_probes_at_two_and_captures_the_error() -> TestResult {
-    let host = Arc::new(PureHost::default());
-    host.seed_file(
-        Path::new("/work/CMakeLists.txt"),
-        br#"
-cmake_minimum_required(VERSION 4.5)
-project(Parent NONE)
-try_compile(TOP PROJECT Child SOURCE_DIR "${CMAKE_SOURCE_DIR}/child" OUTPUT_VARIABLE TOP_LOG NO_LOG)
-"#,
-    )?;
-    host.seed_file(
-        Path::new("/work/child/CMakeLists.txt"),
-        br#"
-cmake_minimum_required(VERSION 4.5)
-project(Child NONE)
-try_compile(CHILD PROJECT Child SOURCE_DIR ${CMAKE_SOURCE_DIR} OUTPUT_VARIABLE CHILD_LOG NO_LOG)
-if(NOT CHILD)
-    message(FATAL_ERROR "${CHILD_LOG}")
-endif()
-"#,
-    )?;
-    let mut interp = interpreter(host.clone(), Path::new("/work"));
-    let result = interp.run_configure(Path::new("/work"), Path::new("/work/build"), &[]);
-    assert_eq!(result.exit_code, 0, "{}", host.stream_bytes(Stream::Stderr));
-    assert_eq!(interp.cx().var_or_empty(b"TOP"), "FALSE");
-    let output = interp.cx().var_or_empty(b"TOP_LOG");
-    assert!(
-        output.to_string().contains("nesting limit is two"),
-        "{output}"
-    );
-    assert!(host.stream_bytes(Stream::Stderr).is_empty());
     Ok(())
 }
 
@@ -405,5 +396,28 @@ int main() { static_assert(Valid<int>); }
     assert_eq!(log.matches("try_compile-v1").count(), 4);
     assert_eq!(log.matches("try_run-v1").count(), 1);
     assert!(log.contains("variable: \"RUN_RES\""));
+    Ok(())
+}
+
+#[test]
+fn try_compile_can_nest_three_projects_with_the_default_recursion_limit() -> TestResult {
+    let host = Arc::new(PureHost::default());
+    for level in 0..=3 {
+        let mut code = format!("cmake_minimum_required(VERSION 4.5)\nproject(Probe{level} NONE)\n");
+        if level < 3 {
+            let next = level + 1;
+            code.push_str(&format!(
+                "try_compile(success PROJECT Probe{next} SOURCE_DIR /work/probe{next} OUTPUT_VARIABLE output NO_LOG)\n\
+                 if(NOT success)\n  message(FATAL_ERROR \"${{output}}\")\nendif()\n"
+            ));
+        }
+        host.seed_file(
+            Path::new(&format!("/work/probe{level}/CMakeLists.txt")),
+            code.as_bytes(),
+        )?;
+    }
+    let mut interp = interpreter(host.clone(), Path::new("/work"));
+    let result = interp.run_configure(Path::new("/work/probe0"), Path::new("/work/build"), &[]);
+    assert_eq!(result.exit_code, 0, "{}", host.stream_bytes(Stream::Stderr));
     Ok(())
 }

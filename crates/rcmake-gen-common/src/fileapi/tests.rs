@@ -126,7 +126,9 @@ fn follow(host: &dyn Host, reply: &Path, reference: &Value) -> Value {
 
 fn trace(root: &Path, line: u32, command: &str) -> Backtrace {
     Backtrace::default().push(Frame {
-        file: from_native(&root.join("CMakeLists.txt")).to_vec().into(),
+        file: from_native_cmake(&root.join("CMakeLists.txt"))
+            .to_vec()
+            .into(),
         line,
         name: Some(command.as_bytes().into()),
         kind: FrameKind::Command,
@@ -153,8 +155,8 @@ fn cache_entry(model: &mut ProjectModel, name: &str, value: &[u8], ty: CacheType
 fn fixture(source: &Path, build: &Path) -> (ProjectModel, GenerationResult) {
     let mut model = ProjectModel::default();
     model.generator = Some(GeneratorKind::Ninja);
-    let source_dir = from_native(source);
-    let binary_dir = from_native(build);
+    let source_dir = from_native_cmake(source);
+    let binary_dir = from_native_cmake(build);
     model.set_root_dirs(source_dir.clone(), binary_dir.clone());
     cache_entry(
         &mut model,
@@ -215,7 +217,7 @@ fn fixture(source: &Path, build: &Path) -> (ProjectModel, GenerationResult) {
                     source,
                     7,
                     "target_include_directories",
-                    &from_native(&source.join("inc")),
+                    &from_native_cmake(&source.join("inc")),
                 ),
                 system: false,
             }];
@@ -252,7 +254,7 @@ fn fixture(source: &Path, build: &Path) -> (ProjectModel, GenerationResult) {
             },
             compile_groups: vec![group],
             compile_units: vec![CompileUnit {
-                source: BT::new(from_native(&source.join("main.c")), backtrace),
+                source: BT::new(from_native_cmake(&source.join("main.c")), backtrace),
                 object: format!("CMakeFiles/{name}.dir/main.c.o").into(),
                 group: 0,
                 scan: false,
@@ -274,8 +276,8 @@ fn fixture(source: &Path, build: &Path) -> (ProjectModel, GenerationResult) {
         library = Some(id);
     }
     result.metadata.listfiles = vec![
-        from_native(&source.join("CMakeLists.txt")),
-        from_native(&build.join("generated.cmake")),
+        from_native_cmake(&source.join("CMakeLists.txt")),
+        from_native_cmake(&build.join("generated.cmake")),
         "/elsewhere/module.cmake".into(),
         "/cmake/Modules/Check.cmake".into(),
     ];
@@ -752,9 +754,9 @@ mark_as_advanced(PROBE)
                     program: oracle,
                     args: vec![
                         "-S".into(),
-                        from_native(&source),
+                        from_native_cmake(&source),
                         "-B".into(),
-                        from_native(&oracle_build),
+                        from_native_cmake(&oracle_build),
                         "-G".into(),
                         "Ninja".into(),
                         "-DCMAKE_INSTALL_PREFIX=/probe".into(),

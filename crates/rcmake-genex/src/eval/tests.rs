@@ -405,7 +405,11 @@ fn path_operations() {
             ("$<PATH_EQUAL:/a//b,/a/b>/$<PATH_EQUAL:/a/../b,/b>", "1/0"),
             (
                 "$<PATH:HAS_ROOT_DIRECTORY,/a>/$<PATH:HAS_FILENAME,/a/>/$<PATH:HAS_PARENT_PATH,/>/$<PATH:IS_ABSOLUTE,/a>/$<PATH:IS_RELATIVE,a>",
-                "1/0/1/1/1",
+                if cfg!(windows) {
+                    "1/0/1/0/1"
+                } else {
+                    "1/0/1/1/1"
+                },
             ),
             (
                 "$<PATH:IS_PREFIX,NORMALIZE,/a/../b,/b/c>/$<PATH:IS_PREFIX,,/a>",
@@ -700,4 +704,38 @@ fn recursion_and_expansion_are_bounded() {
     host.limits.max_value_bytes = 1000;
     host.limits.regex_steps = 0;
     assert!(run(b"$<FILTER:a;b,INCLUDE,a>", &ctx, &mut host).is_err());
+}
+
+#[test]
+fn transform_skips_action_and_selector_validation_for_empty_lists() {
+    check(
+        &[
+            ("$<LIST:TRANSFORM,,BOGUS>", ""),
+            ("$<LIST:TRANSFORM,,TOUPPER,AT,5>", ""),
+            ("$<LIST:TRANSFORM,,TOUPPER,REGEX,[>", ""),
+            ("$<LIST:TRANSFORM,,APPEND>", ""),
+        ],
+        &context(),
+        &mut Host::default(),
+    );
+}
+
+#[test]
+fn remove_at_parses_all_indices_before_checking_bounds() {
+    for (expression, expected) in [
+        ("$<LIST:REMOVE_AT,,1>", "index: 1 out of range (0, 0)"),
+        ("$<LIST:REMOVE_AT,,00>", "index: 0 out of range (0, 0)"),
+        ("$<LIST:REMOVE_AT,,-1>", "index: -1 out of range (0, 0)"),
+        (
+            "$<LIST:REMOVE_AT,,1;bad>",
+            "index: \"bad\" is not a valid index",
+        ),
+        (
+            "$<LIST:REMOVE_AT,a,99;bad>",
+            "index: \"bad\" is not a valid index",
+        ),
+    ] {
+        let error = run(expression.as_bytes(), &context(), &mut Host::default()).unwrap_err();
+        assert!(error.to_string().contains(expected), "{error:?}");
+    }
 }

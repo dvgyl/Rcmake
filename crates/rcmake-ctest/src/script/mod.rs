@@ -130,7 +130,7 @@ fn execute_script(
     let cwd = host.initial_cwd();
     let file = absolute(&cwd, file);
     if new_process {
-        let mut argument = path::from_native(&file);
+        let mut argument = path::from_native_cmake(&file);
         if !arg.is_empty() {
             argument.push(b',');
             argument.extend_from_slice(arg);
@@ -200,7 +200,7 @@ fn execute_script(
     cx.set_var(b"CMAKE_CTEST_COMMAND", settings.ctest.clone());
     cx.set_var(
         b"CTEST_SCRIPT_DIRECTORY",
-        path::from_native(file.parent().unwrap_or(&file)),
+        path::from_native_cmake(file.parent().unwrap_or(&file)),
     );
     cx.set_var(
         b"CTEST_SCRIPT_NAME",
@@ -273,7 +273,7 @@ fn register(registry: &mut Registry) {
 }
 
 fn absolute(cwd: &Path, raw: &[u8]) -> PathBuf {
-    let file = path::from_native(&cwd.join(path::to_native(raw)));
+    let file = path::from_native_cmake(&cwd.join(path::to_native(raw)));
     path::to_native(&Lexical::new(&file).normalize())
 }
 

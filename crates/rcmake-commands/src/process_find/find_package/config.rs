@@ -203,7 +203,7 @@ impl<'a> ConfigSearch<'a> {
             } else {
                 file
             };
-            let file = path::from_native(&file);
+            let file = path::from_native_cmake(&file);
             let version = if checked.version.is_empty() {
                 "unknown".into()
             } else {
@@ -270,7 +270,7 @@ impl<'a> ConfigSearch<'a> {
                     Err(BString::from("The package description file could not be read.").into())
                 }
             };
-            let file = path::from_native(&file);
+            let file = path::from_native_cmake(&file);
             let considered_version = if found_version.is_empty() {
                 "unknown".into()
             } else {
@@ -312,7 +312,11 @@ impl<'a> ConfigSearch<'a> {
         let message = text(&[self.name, b"_NOT_FOUND_MESSAGE"]);
         let value = matched
             .as_ref()
-            .and_then(|found| path::to_native(&found.file).parent().map(path::from_native))
+            .and_then(|found| {
+                path::to_native(&found.file)
+                    .parent()
+                    .map(path::from_native_cmake)
+            })
             .unwrap_or_else(|| text(&[&dir, b"-NOTFOUND"]));
         let current = cx.cache().get(&dir).cloned();
         cx.cache().insert(
@@ -418,7 +422,7 @@ fn check_version(
     config: &Path,
     request: &Request,
 ) -> Result<VersionCheck, CmdError> {
-    let config_path = path::from_native(config);
+    let config_path = path::from_native_cmake(config);
     let stem = config_path.strip_suffix(b".cmake").unwrap_or(&config_path);
     let version_file = [b"-version.cmake".as_slice(), b"Version.cmake"]
         .into_iter()
@@ -448,7 +452,7 @@ fn check_version(
         code.extend_from_slice(b")\n");
     }
     code.extend_from_slice(b"include(");
-    write_argument(&mut code, &path::from_native(&version_file));
+    write_argument(&mut code, &path::from_native_cmake(&version_file));
     code.extend_from_slice(b")\nendblock()\n");
 
     let mut outputs = Bindings::default();

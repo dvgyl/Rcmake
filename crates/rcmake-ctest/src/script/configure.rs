@@ -47,10 +47,10 @@ pub(super) fn ctest_configure(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResul
                 }
                 let mut command = vec![
                     cx.var_or_empty(b"CMAKE_COMMAND"),
-                    [b"-S", path::from_native(&source).as_slice()]
+                    [b"-S", path::from_native_cmake(&source).as_slice()]
                         .concat()
                         .into(),
-                    [b"-B", path::from_native(&build).as_slice()]
+                    [b"-B", path::from_native_cmake(&build).as_slice()]
                         .concat()
                         .into(),
                     [b"-G", generator.as_slice()].concat().into(),

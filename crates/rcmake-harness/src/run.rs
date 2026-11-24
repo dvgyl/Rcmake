@@ -293,27 +293,28 @@ impl Normalizer {
 fn add_paths(paths: &mut Vec<(String, &'static str)>, path: &Path, token: &'static str) {
     let canonical = path.canonicalize().ok();
     for path in [Some(path), canonical.as_deref()].into_iter().flatten() {
-        let text = path.to_string_lossy();
-        paths.push((text.into_owned(), token));
+        add_spelling(paths, path, token);
         if (path.starts_with("/private/tmp") || path.starts_with("/private/var"))
             && let Ok(short) = path.strip_prefix("/private")
         {
-            paths.push((
-                Path::new("/").join(short).to_string_lossy().into_owned(),
-                token,
-            ));
+            add_spelling(paths, &Path::new("/").join(short), token);
         } else if (path.starts_with("/tmp") || path.starts_with("/var"))
             && let Ok(short) = path.strip_prefix("/")
         {
-            paths.push((
-                Path::new("/private")
-                    .join(short)
-                    .to_string_lossy()
-                    .into_owned(),
-                token,
-            ));
+            add_spelling(paths, &Path::new("/private").join(short), token);
         }
     }
+}
+
+fn add_spelling(paths: &mut Vec<(String, &'static str)>, path: &Path, token: &'static str) {
+    let native = path.to_string_lossy();
+    if cfg!(windows) {
+        let cmake = native.replace('\\', "/");
+        if cmake != native {
+            paths.push((cmake, token));
+        }
+    }
+    paths.push((native.into_owned(), token));
 }
 
 impl Outcome {

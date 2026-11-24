@@ -120,7 +120,7 @@ jobs:
       - name: Run workspace tests
         run: |
           source env/env.sh
-          cargo test --workspace
+          cargo test --workspace --no-fail-fast
 
       - name: Stage Rcmake
         run: |

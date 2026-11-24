@@ -11,7 +11,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use jiff::tz::TimeZone;
 use rcmake_base::BString;
 
-use self::fs::FileSystem;
+use self::fs::{FileSystem, VirtualPath, root};
 use crate::error::{HostError, HostResult, SyntheticError};
 use crate::{
     CopyOptions, DirEntry, FileLockGuard, FileTime, Follow, Host, Metadata, ReadRange, RunOutput,
@@ -44,7 +44,7 @@ struct PureState {
 /// Table of the files that [`PureHost::lock_file`] holds locks on.
 #[derive(Debug, Default)]
 struct LockTable {
-    held: Mutex<BTreeSet<PathBuf>>,
+    held: Mutex<BTreeSet<VirtualPath>>,
     released: Condvar,
 }
 
@@ -52,6 +52,7 @@ struct LockTable {
 #[derive(Debug)]
 struct PureFileLock {
     table: Arc<LockTable>,
+    key: VirtualPath,
     path: PathBuf,
 }
 
@@ -64,7 +65,7 @@ impl FileLockGuard for PureFileLock {
 impl Drop for PureFileLock {
     fn drop(&mut self) {
         if let Ok(mut held) = self.table.held.lock() {
-            held.remove(&self.path);
+            held.remove(&self.key);
         }
         self.table.released.notify_all();
     }
@@ -138,12 +139,7 @@ impl PureHost {
 
     /// Create any missing parent directories, then write the file.
     pub fn seed_file(&self, path: &Path, bytes: &[u8]) -> HostResult<()> {
-        require_absolute(path)?;
-        let mut state = self.lock()?;
-        if let Some(parent) = path.parent() {
-            state.fs.create_dir_all(parent)?;
-        }
-        state.fs.write(path, bytes, WriteMode::Truncate)
+        self.lock()?.fs.seed_file(path, bytes)
     }
 
     /// Return a snapshot of all recorded stdio events in order.
@@ -227,7 +223,7 @@ impl Host for PureHost {
             let mut state = self.lock()?;
             // Create the file if it is missing. An empty append keeps the content.
             state.fs.write(path, b"", WriteMode::Append)?;
-            state.fs.canonicalize(path)?
+            state.fs.canonical_key(path)?
         };
         let poisoned = || HostError::unsupported("PureHost lock table poisoned");
         let mut held = self.locks.held.lock().map_err(|_| poisoned())?;
@@ -255,7 +251,8 @@ impl Host for PureHost {
         held.insert(key.clone());
         Ok(Box::new(PureFileLock {
             table: Arc::clone(&self.locks),
-            path: key,
+            path: key.to_path_buf(),
+            key,
         }))
     }
 
@@ -400,12 +397,8 @@ impl Host for PureHost {
     }
 }
 
-fn virtual_absolute(path: &Path) -> bool {
-    crate::path::from_native(path).as_slice().starts_with(b"/")
-}
-
 fn require_absolute(path: &Path) -> HostResult<()> {
-    if virtual_absolute(path) {
+    if root(&crate::path::from_native(path)).is_some() {
         Ok(())
     } else {
         Err(HostError::not_absolute(path.to_path_buf()))

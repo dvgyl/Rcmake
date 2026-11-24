@@ -267,12 +267,19 @@ pub fn native_list(input: &[u8]) -> impl Iterator<Item = &[u8]> {
 /// Convert a native path to CMake style (forward slashes; strips `\\?\` on Windows).
 pub fn cmake_style(input: &[u8]) -> BString {
     if cfg!(windows) {
-        let input = input.strip_prefix(br"\\?\").unwrap_or(input);
-        input
-            .iter()
-            .map(|&b| if b == b'\\' { b'/' } else { b })
-            .collect::<Vec<_>>()
-            .into()
+        let mut output = Vec::new();
+        let input = if let Some(verbatim) = input.strip_prefix(br"\\?\") {
+            if let Some(unc) = verbatim.strip_prefix(br"UNC\") {
+                output.extend_from_slice(b"//");
+                unc
+            } else {
+                verbatim
+            }
+        } else {
+            input
+        };
+        output.extend(input.iter().map(|&b| if b == b'\\' { b'/' } else { b }));
+        output.into()
     } else {
         input.into()
     }

@@ -18,8 +18,8 @@ impl Interp {
     /// Execute a standalone `-P` script at `path`.
     pub fn run_script(&mut self, path: &Path) -> RunOutcome {
         self.init_policy_minimum();
-        let cwd = rcmake_host::path::from_native(&self.config.cwd);
-        let abs = collapse_full_path(&rcmake_host::path::from_native(path), &cwd);
+        let cwd = rcmake_host::path::from_native_cmake(&self.config.cwd);
+        let abs = collapse_full_path(&rcmake_host::path::from_native_cmake(path), &cwd);
 
         self.vars.set(b"CMAKE_SCRIPT_MODE_FILE", abs.clone());
         // The script-mode root snapshot has no listfile.
@@ -132,9 +132,9 @@ impl Interp {
         binary_dir: &Path,
         preload_scripts: &[PathBuf],
     ) -> RunOutcome {
-        let cwd = rcmake_host::path::from_native(&self.config.cwd);
-        let src_abs = collapse_full_path(&rcmake_host::path::from_native(source_dir), &cwd);
-        let bin_abs = collapse_full_path(&rcmake_host::path::from_native(binary_dir), &cwd);
+        let cwd = rcmake_host::path::from_native_cmake(&self.config.cwd);
+        let src_abs = collapse_full_path(&rcmake_host::path::from_native_cmake(source_dir), &cwd);
+        let bin_abs = collapse_full_path(&rcmake_host::path::from_native_cmake(binary_dir), &cwd);
         let src_native = rcmake_host::path::to_native(&src_abs);
         let bin_native = rcmake_host::path::to_native(&bin_abs);
 
@@ -166,7 +166,7 @@ impl Interp {
         }
 
         let lists_path = src_native.join("CMakeLists.txt");
-        let lists_bytes = rcmake_host::path::from_native(&lists_path);
+        let lists_bytes = rcmake_host::path::from_native_cmake(&lists_path);
         if !self.is_regular_file(&lists_bytes) {
             self.error_no_location(cat(&[
                 b"The source directory \"",
@@ -182,7 +182,7 @@ impl Interp {
             self.error_no_location(
                 format!(
                     "Unable to (re)create the private pkgRedirects directory:\n  {}\n  {error}",
-                    bin_native.join("CMakeFiles/pkgRedirects").display()
+                    path::from_native_cmake(&bin_native.join("CMakeFiles/pkgRedirects"))
                 )
                 .into(),
             );
@@ -227,7 +227,7 @@ impl Interp {
         self.project.cache.insert(
             "CMAKE_FIND_PACKAGE_REDIRECTS_DIR".into(),
             CacheEntry {
-                value: path::from_native(&redirects),
+                value: path::from_native_cmake(&redirects),
                 ty: CacheType::Static,
                 help: "Value Computed by CMake.".into(),
                 advanced: false,
@@ -240,8 +240,8 @@ impl Interp {
     /// Execute one `-C` initial cache script in the current session.
     pub fn run_preload_script(&mut self, path: &Path) -> bool {
         self.init_policy_minimum();
-        let cwd = rcmake_host::path::from_native(&self.config.cwd);
-        let abs = collapse_full_path(&rcmake_host::path::from_native(path), &cwd);
+        let cwd = rcmake_host::path::from_native_cmake(&self.config.cwd);
+        let abs = collapse_full_path(&rcmake_host::path::from_native_cmake(path), &cwd);
         let display = path.to_string_lossy();
         self.config.host.write_out(
             Stream::Stdout,
@@ -330,11 +330,11 @@ impl Interp {
             return Err(CmdError::Reported);
         }
         let src_abs = collapse_full_path(
-            &rcmake_host::path::from_native(src),
+            &rcmake_host::path::from_native_cmake(src),
             &self.current_source_dir_bytes(),
         );
-        let bin_base = rcmake_host::path::from_native(&self.current_binary_dir());
-        let bin_abs = collapse_full_path(&rcmake_host::path::from_native(bin), &bin_base);
+        let bin_base = rcmake_host::path::from_native_cmake(&self.current_binary_dir());
+        let bin_abs = collapse_full_path(&rcmake_host::path::from_native_cmake(bin), &bin_base);
         let lists = cat(&[&src_abs, b"/CMakeLists.txt"]);
         if !self.is_regular_file(&lists) {
             // CMake reports this from the new directory, so processing continues.
@@ -455,6 +455,6 @@ impl Interp {
     }
 
     pub(super) fn current_source_dir_bytes(&self) -> BString {
-        rcmake_host::path::from_native(&self.current_source_dir())
+        rcmake_host::path::from_native_cmake(&self.current_source_dir())
     }
 }

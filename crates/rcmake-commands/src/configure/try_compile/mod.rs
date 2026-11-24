@@ -1,4 +1,3 @@
-use std::cell::Cell;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -26,10 +25,6 @@ mod run;
 mod seed;
 #[cfg(test)]
 mod tests;
-
-thread_local! {
-    static PROBE_DEPTH: Cell<u8> = const { Cell::new(0) };
-}
 
 const TIMEOUT: Duration = Duration::from_secs(120);
 
@@ -148,7 +143,7 @@ fn explicit_binary_dir(cx: &mut Cx<'_>, value: &[u8]) -> Result<PathBuf, CmdErro
 }
 
 fn absolute(base: &Path, value: &[u8]) -> PathBuf {
-    let joined = path::from_native(&base.join(path::to_native(value)));
+    let joined = path::from_native_cmake(&base.join(path::to_native(value)));
     path::to_native(&rcmake_base::path_lex::Lexical::new(&joined).normalize())
 }
 
@@ -192,16 +187,6 @@ fn probe(cx: &mut Cx<'_>, args: &[ExpandedArg], run: bool) -> CmdResult {
             message,
         );
     }
-    let depth = PROBE_DEPTH.get();
-    const MAX_LIMITED_PROBES: u8 = 32;
-    let probe_limit = if cx.recursion_limit() <= u32::from(MAX_LIMITED_PROBES) {
-        MAX_LIMITED_PROBES
-    } else {
-        2
-    };
-    if depth >= probe_limit {
-        return Err(CmdError::status("The try_compile nesting limit is two."));
-    }
     let dirs = ProbeDirs::create(cx, &signature)?;
     if cx.var_is_on(b"CMAKE_DEBUG_TRY_COMPILE") {
         let command = if run { "try_run" } else { "try_compile" };
@@ -217,9 +202,7 @@ fn probe(cx: &mut Cx<'_>, args: &[ExpandedArg], run: bool) -> CmdResult {
             .into(),
         );
     }
-    PROBE_DEPTH.set(depth + 1);
     let result = build_probe(cx, &signature, &options, &dirs, build_var, run_var);
-    PROBE_DEPTH.set(depth);
     if let Some(scratch) = &dirs.scratch
         && !cx.var_is_on(b"CMAKE_DEBUG_TRY_COMPILE")
     {

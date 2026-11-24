@@ -136,6 +136,11 @@ fn files(
 
 #[test]
 fn install_script_covers_each_action_and_manifest_scope() {
+    let absolute = if cfg!(windows) {
+        "C:/absolute"
+    } else {
+        "/absolute"
+    };
     let host = PureHost::default();
     let build = Path::new("/work");
     let mut file = action(
@@ -151,7 +156,7 @@ fn install_script_covers_each_action_and_manifest_scope() {
         actions: vec![
             file,
             action(
-                "/absolute".into(),
+                absolute.into(),
                 InstallActionKind::Directory {
                     dirs: vec!["/src/assets/".into()],
                     options: vec![
@@ -206,7 +211,9 @@ two]])"#
         r#"if(CMAKE_INSTALL_COMPONENT STREQUAL "Data" OR NOT CMAKE_INSTALL_COMPONENT)"#,
         r#"if(CMAKE_INSTALL_CONFIG_NAME MATCHES "^([Dd][Ee][Bb][Uu][Gg]|[Rr][Ee][Ll]\\.[Ww][Ii][Tt][Hh]\\+[Ii][Nn][Ff][Oo])$")"#,
         r#"file(INSTALL DESTINATION "${CMAKE_INSTALL_PREFIX}/share/data" TYPE "FILE" OPTIONAL RENAME "renamed.txt" PERMISSIONS "OWNER_READ" FILES "/src/a \${literal}.txt")"#,
-        r#"file(INSTALL DESTINATION "/absolute" TYPE "DIRECTORY" FILES "/src/assets/" "FILES_MATCHING" REGEX "/[^/]*\\.txt\$" "EXCLUDE")"#,
+        &format!(
+            r#"file(INSTALL DESTINATION "{absolute}" TYPE "DIRECTORY" FILES "/src/assets/" "FILES_MATCHING" REGEX "/[^/]*\\.txt\$" "EXCLUDE")"#
+        ),
         r#"include("/src/setup.cmake")"#,
         "message(STATUS [[one\ntwo]])",
         r#"file(INSTALL DESTINATION "${CMAKE_INSTALL_PREFIX}/lib/cmake" TYPE "FILE" FILES "/work/ExampleTargets.cmake")"#,

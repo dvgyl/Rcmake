@@ -72,9 +72,11 @@ mod tests {
     use std::sync::{Arc, OnceLock};
 
     use rcmake_host::path::to_native;
-    use rcmake_host::{Follow, Host, PureHost, Stream};
+    use rcmake_host::{Follow, Host, Stream};
 
-    use crate::generators::tests::{check_checksums, fake_image, invoke, read, success};
+    use crate::generators::tests::{
+        check_checksums, fake_image, invoke, package_host, read, success,
+    };
 
     const REQUIRED: &str = r#"set(CPACK_BUNDLE_NAME "Sample App")
 set(CPACK_BUNDLE_PLIST assets/Info.plist)
@@ -82,7 +84,7 @@ set(CPACK_BUNDLE_ICON assets/icon.icns)"#;
 
     #[test]
     fn assembles_signs_and_packages_app() {
-        let host = Arc::new(PureHost::default());
+        let host = package_host();
         for (path, data) in [
             ("Info.plist", "<plist/>"),
             ("icon.icns", "icon"),
@@ -103,17 +105,24 @@ set(CPACK_BUNDLE_ICON assets/icon.icns)"#;
             if command.program == "codesign" {
                 let bundle = to_native(command.args.last().unwrap());
                 assert_eq!(bundle.file_name().unwrap(), "Sample App.app");
+                let [deep, force, sign, identity, entitlements, file, _] = command.args.as_slice()
+                else {
+                    panic!("Expected seven codesign arguments.");
+                };
                 assert_eq!(
-                    command.args,
+                    [deep, force, sign, identity, entitlements].map(|arg| arg.as_slice()),
                     [
-                        "--deep".into(),
-                        "-f".into(),
-                        "-s".into(),
-                        "Developer ID Application: Example".into(),
-                        "--entitlements".into(),
-                        "/work/assets/entitlements.plist".into(),
-                        super::from_native(&bundle),
+                        "--deep",
+                        "-f",
+                        "-s",
+                        "Developer ID Application: Example",
+                        "--entitlements"
                     ]
+                    .map(str::as_bytes)
+                );
+                assert_eq!(
+                    to_native(file),
+                    Path::new("/work/assets/entitlements.plist")
                 );
                 signed.set(bundle).unwrap();
                 return Ok(success());
@@ -121,19 +130,38 @@ set(CPACK_BUNDLE_ICON assets/icon.icns)"#;
             assert_eq!(command.program, "hdiutil");
             let bundle = signed.get().unwrap();
             let staging = bundle.parent().unwrap();
+            let [
+                create,
+                volname,
+                volume,
+                srcfolder,
+                source,
+                overwrite,
+                format,
+                kind,
+                output,
+            ] = command.args.as_slice()
+            else {
+                panic!("Expected nine hdiutil arguments.");
+            };
             assert_eq!(
-                command.args,
+                [create, volname, volume, srcfolder, overwrite, format, kind]
+                    .map(|arg| arg.as_slice()),
                 [
-                    "create".into(),
-                    "-volname".into(),
-                    "App Volume".into(),
-                    "-srcfolder".into(),
-                    super::from_native(staging),
-                    "-ov".into(),
-                    "-format".into(),
-                    "UDRO".into(),
-                    "/work/_CPack_Packages/Bundle/Sample Package.dmg".into(),
+                    "create",
+                    "-volname",
+                    "App Volume",
+                    "-srcfolder",
+                    "-ov",
+                    "-format",
+                    "UDRO"
                 ]
+                .map(str::as_bytes)
+            );
+            assert_eq!(to_native(source), staging);
+            assert_eq!(
+                to_native(output),
+                Path::new("/work/_CPack_Packages/Bundle/Sample Package.dmg")
             );
             let contents = bundle.join("Contents");
             let resources = contents.join("Resources");
@@ -186,7 +214,7 @@ set(CPACK_DMG_FORMAT UDRO)"#
             "CPACK_BUNDLE_PLIST",
             "CPACK_BUNDLE_ICON",
         ] {
-            let host = Arc::new(PureHost::default());
+            let host = package_host();
             host.set_command_handler(|_, request, _| panic!("Unexpected command {request:?}"))
                 .unwrap();
 

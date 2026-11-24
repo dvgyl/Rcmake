@@ -135,7 +135,7 @@ fn find(cx: &mut Cx<'_>, args: &[ExpandedArg], kind: Kind) -> CmdResult {
     search.log_event(cx, var, found.as_deref(), existing.is_some());
     let mut value = found
         .as_deref()
-        .map_or_else(|| text(&[var, b"-NOTFOUND"]), path::from_native);
+        .map_or_else(|| text(&[var, b"-NOTFOUND"]), path::from_native_cmake);
     if found.is_some() && options.no_cache && matches!(kind, Kind::Path) && !value.ends_with(b"/") {
         value.push(b'/');
     }
@@ -187,7 +187,7 @@ fn normalize_existing(cx: &Cx<'_>, value: &BString) -> BString {
     }
     let absolute = normalize(&cx.host().initial_cwd().join(path::to_native(value)));
     if cx.host().metadata(&absolute, Follow::Yes).is_ok() {
-        path::from_native(&absolute)
+        path::from_native_cmake(&absolute)
     } else {
         value.clone()
     }

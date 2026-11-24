@@ -2,7 +2,7 @@ use rcmake_base::{BString, hash::HashAlgo, list};
 use rcmake_diag::{PolicyId, PolicyStatus};
 use rcmake_eval::{CmdResult, Cx};
 use rcmake_expr::ExpandedArg;
-use rcmake_host::path::{from_native, to_native};
+use rcmake_host::path::{from_native_cmake, to_native};
 
 use super::{
     Result, archive, configure, download, elf_rpath, error, generate, glob, install_cmd, lock,
@@ -54,7 +54,7 @@ fn real_path(cx: &mut Cx<'_>, args: &[&[u8]]) -> Result {
         ));
     };
     let mut options = options.iter().copied();
-    let mut base = from_native(&cx.current_source_dir());
+    let mut base = from_native_cmake(&cx.current_source_dir());
     let mut expand = false;
     while let Some(option) = options.next() {
         match option {
@@ -109,7 +109,7 @@ fn real_path(cx: &mut Cx<'_>, args: &[&[u8]]) -> Result {
         cx.issue_policy_warning(PolicyId::new(152), b"", b"");
     }
     let result = match resolved {
-        Some(resolved) => from_native(&resolved),
+        Some(resolved) => from_native_cmake(&resolved),
         None => {
             warning(
                 cx,
@@ -241,5 +241,5 @@ pub(super) fn legacy_separators(path: &[u8], trim_trailing: bool) -> BString {
 
 pub(super) fn binary_destination(cx: &Cx<'_>, input: &[u8]) -> std::path::PathBuf {
     let input = to_native(input);
-    cx.resolve_path(&from_native(&cx.current_binary_dir().join(input)))
+    cx.resolve_path(&from_native_cmake(&cx.current_binary_dir().join(input)))
 }

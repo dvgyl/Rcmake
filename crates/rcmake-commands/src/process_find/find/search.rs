@@ -328,7 +328,7 @@ impl<'a> Search<'a> {
             let attempt = if matches!(self.kind, Kind::Library) {
                 directory_path(dir)
             } else {
-                path::from_native(&direct)
+                path::from_native_cmake(&direct)
             };
             event.bytes = event.bytes.saturating_add(attempt.len() + 8);
             if event.bytes <= 1024 * 1024 {
@@ -337,7 +337,7 @@ impl<'a> Search<'a> {
         }
         if self.considered.is_some() && !self.ignored.ignores_prefix(&direct) {
             let path = self.decoration.as_ref().map_or_else(
-                || direct.display().to_string(),
+                || path::from_native_cmake(&direct).to_string(),
                 |library| library.pattern(dir, name),
             );
             self.record(&path);
@@ -382,7 +382,7 @@ impl<'a> Search<'a> {
         trailing_slash: bool,
     ) -> Result<bool, CmdError> {
         if let Some(callback) = &self.options.validator {
-            let mut value = path::from_native(found);
+            let mut value = path::from_native_cmake(found);
             if trailing_slash && !value.ends_with(b"/") {
                 value.push(b'/');
             }
@@ -459,7 +459,7 @@ impl<'a> Search<'a> {
         });
         let framework = order(b"CMAKE_FIND_FRAMEWORK");
         let app_bundle = order(b"CMAKE_FIND_APPBUNDLE");
-        let found = found.map(path::from_native);
+        let found = found.map(path::from_native_cmake);
         cx.log_configure_find(FindEvent {
             mode,
             variable: var,
@@ -775,7 +775,7 @@ fn candidate(cx: &mut Cx<'_>, kind: Kind, path: &Path) -> bool {
 }
 
 fn directory_path(dir: &Path) -> BString {
-    let mut path = path::from_native(dir);
+    let mut path = path::from_native_cmake(dir);
     if !path.ends_with(b"/") {
         path.push(b'/');
     }

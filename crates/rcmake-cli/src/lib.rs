@@ -548,7 +548,7 @@ fn missing_cmake_root(host: &dyn Host, exe: &Path, configure: bool) -> i32 {
         Stream::Stderr,
         format!(
             "CMake Error: Could not find CMAKE_ROOT !!!\nCMake has most likely not been installed correctly.\nModules directory not found in\n{}\n",
-            root.display()
+            rcmake_host::path::from_native_cmake(&root)
         ).as_bytes(),
     );
     if configure {

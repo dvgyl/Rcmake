@@ -132,14 +132,17 @@ impl Evaluator<'_> {
                 items.retain(|item| !excluded.contains(item));
             }
             (b"REMOVE_AT", [_, ..]) => {
-                let indexes = flatten(rest);
+                let indexes = flatten(rest)
+                    .map(|index| parse_item_index(call, &index))
+                    .collect::<Result<Vec<_>>>()?;
+                if items.is_empty()
+                    && let Some(index) = indexes.first()
+                {
+                    return Err(call.error(format!("index: {index} out of range (0, 0)")));
+                }
                 let positions = indexes
-                    .map(|index| {
-                        if items.is_empty() && index == "0" {
-                            return Err(call.error("index: 0 out of range (0, 0)"));
-                        }
-                        item_index(call, &index, items.len(), false)
-                    })
+                    .into_iter()
+                    .map(|index| checked_item_index(call, index, items.len(), false))
                     .collect::<Result<HashSet<_>>>()?;
                 items = items
                     .into_iter()
@@ -159,7 +162,9 @@ impl Evaluator<'_> {
                 self.filter(call, &mut items, mode, pattern, args.body(4))?;
             }
             (b"TRANSFORM", [action, params @ ..]) => {
-                self.transform(call, &mut items, action, params, &args)?;
+                if !items.is_empty() {
+                    self.transform(call, &mut items, action, params, &args)?;
+                }
             }
             (b"REVERSE", []) => items.reverse(),
             (b"SORT", options) => self.sort(call, &mut items, options, &args)?,
@@ -595,8 +600,15 @@ fn deduplicate(items: &mut Vec<BString>) {
 }
 
 fn item_index(call: Call<'_>, value: &BString, len: usize, append: bool) -> Result<usize> {
-    let index = list_ops::parse_index(value)
-        .ok_or_else(|| call.error(format!("index: \"{value}\" is not a valid index")))?;
+    checked_item_index(call, parse_item_index(call, value)?, len, append)
+}
+
+fn parse_item_index(call: Call<'_>, value: &BString) -> Result<i64> {
+    list_ops::parse_index(value)
+        .ok_or_else(|| call.error(format!("index: \"{value}\" is not a valid index")))
+}
+
+fn checked_item_index(call: Call<'_>, index: i64, len: usize, append: bool) -> Result<usize> {
     if len == 0 && !append {
         return Err(call.error("given empty list"));
     }

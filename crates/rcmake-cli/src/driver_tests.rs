@@ -597,21 +597,28 @@ fn generator_host_gate_and_help_list_follow_generator_kind() {
             "/work/vs",
         ],
     );
+    let vs_stderr = host.stream_bytes(Stream::Stderr).to_string();
+    if cfg!(any(windows, feature = "vs-cross")) {
+        assert!(!vs_stderr.contains("Could not create named generator"));
+    } else {
+        assert_eq!(code, 1);
+        assert!(
+            vs_stderr
+                .contains("CMake Error: Could not create named generator Visual Studio 17 2022")
+        );
+    }
+    let host = project_host();
+    assert_eq!(invoke(&host, &["cmake", "-G", "invalid-generator"]), 1);
     let stderr = host.stream_bytes(Stream::Stderr);
     let contains = |needle: &str| {
         stderr
             .windows(needle.len())
             .any(|window| window == needle.as_bytes())
     };
-    if cfg!(any(windows, feature = "vs-cross")) {
-        assert!(!contains("Could not create named generator"));
-    } else {
-        assert_eq!(code, 1);
-        assert!(contains(
-            "CMake Error: Could not create named generator Visual Studio 17 2022"
-        ));
-        assert!(!contains("Visual Studio 18 2026"));
-    }
+    assert_eq!(
+        contains("Visual Studio 18 2026"),
+        cfg!(any(windows, feature = "vs-cross"))
+    );
     // The generator list after the error has the oracle order.
     let order = ["Unix Makefiles", "Ninja", "Ninja Multi-Config"];
     let positions: Vec<usize> = order
@@ -626,4 +633,40 @@ fn generator_host_gate_and_help_list_follow_generator_kind() {
     assert_eq!(positions.len(), order.len());
     assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));
     assert_eq!(contains(" Xcode "), cfg!(target_os = "macos"));
+}
+
+#[test]
+fn warns_about_uninitialized_variables_in_the_build_cmakefiles_directory() {
+    let host = project_host();
+    host.seed_file(
+        Path::new("/work/CMakeLists.txt"),
+        br#"
+cmake_minimum_required(VERSION 4.5)
+project(sample NONE)
+file(WRITE "${CMAKE_BINARY_DIR}/CMakeFiles/check.cmake" [=[message(STATUS "${UNDEFINED_IN_BUILD_CMAKEFILES}")]=])
+include("${CMAKE_BINARY_DIR}/CMakeFiles/check.cmake")
+"#,
+    )
+    .unwrap();
+    assert_eq!(
+        invoke(
+            &host,
+            &[
+                "cmake",
+                "-S",
+                ".",
+                "-B",
+                "out",
+                "-G",
+                "Ninja",
+                "--warn-uninitialized"
+            ]
+        ),
+        0
+    );
+    let stderr = host.stream_bytes(Stream::Stderr).to_string();
+    assert!(
+        stderr.contains("uninitialized variable 'UNDEFINED_IN_BUILD_CMAKEFILES'"),
+        "{stderr}"
+    );
 }

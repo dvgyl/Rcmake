@@ -211,7 +211,7 @@ fn copy_compile_trace(
                 dest.display()
             ))
         })?;
-    Ok(Some(path::from_native(&relative)))
+    Ok(Some(path::from_native_cmake(&relative)))
 }
 
 fn comma_list(value: &[u8]) -> Vec<BString> {
@@ -293,7 +293,7 @@ fn run(
     let snippet = Snippet {
         role,
         command,
-        working_dir: path::from_native(cwd),
+        working_dir: path::from_native_cmake(cwd),
         result,
         time_start,
         duration,

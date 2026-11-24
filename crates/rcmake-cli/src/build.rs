@@ -314,7 +314,10 @@ fn dispatch(
         .metadata(dir, Follow::Yes)
         .is_ok_and(|meta| meta.kind == FileKind::Dir)
     {
-        return error(host, &format!("{} is not a directory", dir.display()));
+        return error(
+            host,
+            &format!("{} is not a directory", path::from_native_cmake(dir)),
+        );
     }
     if !host
         .metadata(&dir.join("CMakeCache.txt"), Follow::Yes)
@@ -343,7 +346,7 @@ fn dispatch(
     let make_program = cached(b"CMAKE_MAKE_PROGRAM");
     let project_name = cached(b"CMAKE_PROJECT_NAME");
     let platform = cached(b"CMAKE_VS_PLATFORM_NAME");
-    let build_dir = path::from_native(dir);
+    let build_dir = path::from_native_cmake(dir);
     let request = BuildRequest {
         generator: kind,
         build_dir: &build_dir,

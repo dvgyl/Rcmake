@@ -128,9 +128,9 @@ fn run_subdirectory(
                 CmdError::status(
                     [
                         b"not given a binary directory but the given source directory \"".as_slice(),
-                        &path::from_native(&src),
+                        &path::from_native_cmake(&src),
                         b"\" is not a subdirectory of \"",
-                        &path::from_native(&current),
+                        &path::from_native_cmake(&current),
                         b"\".  When specifying an out-of-tree source a binary directory must be explicitly specified.",
                     ]
                     .concat(),
@@ -139,8 +139,8 @@ fn run_subdirectory(
             base.join(relative)
         }
     };
-    let bin_bytes = path::from_native(&bin);
-    let source_bytes = path::from_native(&src);
+    let bin_bytes = path::from_native_cmake(&bin);
+    let source_bytes = path::from_native_cmake(&src);
     if cx
         .project()
         .dirs()
@@ -163,7 +163,7 @@ fn run_subdirectory(
 }
 
 pub(crate) fn normalized_path(input: &Path) -> std::path::PathBuf {
-    let raw = path::from_native(input);
+    let raw = path::from_native_cmake(input);
     let normalized = Lexical::new(&raw).normalize();
     path::to_native(
         normalized
@@ -387,7 +387,7 @@ fn usage_path(cx: &Cx<'_>, value: &[u8]) -> BString {
     if value.starts_with(b"$<") || path::to_native(value).is_absolute() {
         value.into()
     } else {
-        path::from_native(&cx.resolve_path(value))
+        path::from_native_cmake(&cx.resolve_path(value))
     }
 }
 

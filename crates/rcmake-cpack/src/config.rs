@@ -10,7 +10,7 @@ use rcmake_base::{BString, ByteSlice, Limits, truth};
 use rcmake_eval::{
     BuiltinFn, Flow, IncludeOptions, Interp, InterpConfig, Registry, RunMode, TraceConfig,
 };
-use rcmake_host::path::{from_native, to_native};
+use rcmake_host::path::{from_native_cmake, to_native};
 use rcmake_host::{FileKind, Follow, Host, Stream};
 use rcmake_presets::{EnvSnapshot, PresetKind, PresetSettings};
 
@@ -112,7 +112,7 @@ pub(crate) fn resolve_options(
                 }
             }
         } else if let Some(name) = &cli.preset {
-            let source_dir = from_native(&cwd);
+            let source_dir = from_native_cmake(&cwd);
             // The preset resolver returns the package fields as literal strings.
             let mut remaining = Limits::default().max_value_bytes;
             let mut expand = |value: BString| -> Result<BString, CpackError> {
@@ -329,7 +329,7 @@ pub(crate) fn load_base(
             if interp.run_script(&config).exit_code != 0 {
                 return Err(error(format!(
                     "Problem reading CPack config file: \"{}\"",
-                    config.display()
+                    from_native_cmake(&config)
                 )));
             }
         }
@@ -337,7 +337,7 @@ pub(crate) fn load_base(
         _ => {
             return Err(error(format!(
                 "Cannot find CPack config file: \"{}\"",
-                config.display()
+                from_native_cmake(&config)
             )));
         }
     }
@@ -358,7 +358,7 @@ pub(crate) fn load_base(
     let output_dir = output_dir.map_or_else(|| cwd.to_owned(), |dir| absolute(cwd, &dir));
     interp
         .cx()
-        .set_var(b"CPACK_PACKAGE_DIRECTORY", from_native(&output_dir));
+        .set_var(b"CPACK_PACKAGE_DIRECTORY", from_native_cmake(&output_dir));
     for (name, value) in &options.defines {
         interp.cx().set_var(name, value.clone());
     }

@@ -37,8 +37,9 @@ pub(crate) fn run_tests_with_dashboard(
     let options = &invocation.options;
     let deadline = schedule::stop_deadline(host.as_ref(), invocation.stop_time);
     let dir = host.initial_cwd().join(&options.test_dir);
-    let normalized = rcmake_base::path_lex::Lexical::new(&path::from_native(&dir)).normalize();
-    let dir: PathBuf = path::to_native(&normalized).components().collect();
+    let normalized =
+        rcmake_base::path_lex::Lexical::new(&path::from_native_cmake(&dir)).normalize();
+    let dir = path::to_native(&normalized);
     let show_project = dashboard
         .as_ref()
         .is_none_or(|dashboard| dashboard.show_project);

@@ -238,7 +238,10 @@ fn sets_the_working_directory_and_isolates_environment_changes() -> TestResult {
     };
     assert_eq!(first.cwd, Path::new("/work/run"));
     let command = first.pipeline.first().ok_or("Expected a command.")?;
-    assert_eq!(command.program, "/work/./local-run");
+    assert_eq!(
+        rcmake_host::path::to_native(&command.program),
+        Path::new("/work/local-run")
+    );
     assert_eq!(command.args, ["", "a;b"]);
     assert_eq!(
         first.env,

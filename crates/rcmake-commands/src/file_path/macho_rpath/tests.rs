@@ -1,7 +1,7 @@
 use std::{path::Path, sync::Arc};
 
 use rcmake_eval::{Interp, InterpConfig, RunMode};
-use rcmake_host::{CommandSpec, Follow, Host, ProcessResult, PureHost, RunOutput, Stream};
+use rcmake_host::{Follow, Host, ProcessResult, PureHost, RunOutput, Stream, path};
 
 const FILE: &str = "/work/libsample.dylib";
 const SCRIPT: &str = "/work/install.cmake";
@@ -29,21 +29,20 @@ fn file_rpath_edits_macho_through_the_host() -> std::result::Result<(), Box<dyn 
         &macho(&["/build lib", "@loader_path/shared"]),
     )?;
     host.set_command_handler(|host, request, _| {
+        let [command] = request.pipeline.as_slice() else {
+            panic!("Expected one tool command.");
+        };
+        let (file, flags) = command.args.split_last().expect("Missing file argument.");
+        assert_eq!(path::to_native(file), Path::new(FILE));
+        assert_eq!(command.program, "/tools/install_name_tool");
         assert_eq!(
-            request.pipeline,
-            [CommandSpec {
-                program: "/tools/install_name_tool".into(),
-                args: [
-                    "-delete_rpath",
-                    "/build lib",
-                    "-add_rpath",
-                    "@loader_path/install",
-                    FILE
-                ]
-                .into_iter()
-                .map(Into::into)
-                .collect(),
-            }]
+            flags,
+            [
+                "-delete_rpath",
+                "/build lib",
+                "-add_rpath",
+                "@loader_path/install"
+            ]
         );
         host.seed_file(
             Path::new(FILE),
@@ -72,16 +71,13 @@ file(RPATH_CHECK FILE libsample.dylib RPATH "@loader_path/install;@loader_path/s
     );
     assert!(host.metadata(Path::new(FILE), Follow::Yes).is_ok());
     host.set_command_handler(|host, request, _| {
-        assert_eq!(
-            request.pipeline,
-            [CommandSpec {
-                program: "install_name_tool".into(),
-                args: ["-delete_rpath", "@loader_path/install", FILE]
-                    .into_iter()
-                    .map(Into::into)
-                    .collect(),
-            }]
-        );
+        let [command] = request.pipeline.as_slice() else {
+            panic!("Expected one tool command.");
+        };
+        let (file, flags) = command.args.split_last().expect("Missing file argument.");
+        assert_eq!(path::to_native(file), Path::new(FILE));
+        assert_eq!(command.program, "install_name_tool");
+        assert_eq!(flags, ["-delete_rpath", "@loader_path/install"]);
         host.seed_file(Path::new(FILE), &macho(&["@loader_path/shared"]))?;
         Ok(RunOutput {
             results: vec![ProcessResult::Exited(0)],

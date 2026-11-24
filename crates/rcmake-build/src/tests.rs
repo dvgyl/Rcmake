@@ -143,14 +143,19 @@ fn rejects_bad_indices_and_cycles_before_running_steps() {
 
 #[test]
 fn uses_argv_and_shell_fallback_and_stops_at_first_failed_invocation() {
+    let (shell_program, shell_flag) = if cfg!(windows) {
+        ("cmd.exe", "/C")
+    } else {
+        ("/bin/sh", "-c")
+    };
     let host = PureHost::default();
     let calls = Arc::new(Mutex::new(Vec::new()));
     let observed = calls.clone();
     host.set_command_handler(move |host, request, _| {
         let command = request.pipeline[0].clone();
-        let shell = command.program == "/bin/sh";
+        let shell = command.program == shell_program;
         if shell {
-            assert_eq!(command.args, ["-c", "first link"]);
+            assert_eq!(command.args, [shell_flag, "first link"]);
             assert_eq!(request.cwd, Path::new("/work/build/obj"));
             assert_eq!(
                 host.metadata(Path::new("/work/build/bin"), Follow::No)?
@@ -212,13 +217,14 @@ fn uses_argv_and_shell_fallback_and_stops_at_first_failed_invocation() {
         },
     )
     .unwrap();
-    assert_eq!(*calls.lock().unwrap(), ["compiler", "/bin/sh"]);
+    assert_eq!(*calls.lock().unwrap(), ["compiler", shell_program]);
     assert!(!result.success);
     assert_eq!(result.exit_code, 7);
     assert_eq!(result.steps_run, 2);
     assert_eq!(result.output, "compile output\nlink failed\n");
 }
 
+#[cfg(unix)]
 #[test]
 fn builds_and_links_c_with_native_host() -> Result<(), Box<dyn std::error::Error>> {
     use rcmake_host::{NativeHost, WriteMode};

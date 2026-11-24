@@ -8,7 +8,7 @@ use rcmake_eval::args::{KeywordParser, Slot};
 use rcmake_eval::{CmdError, Cx, Flow};
 use rcmake_host::{
     CopyOptions, FileKind, Follow, HostError, ReadRange, WriteMode,
-    path::{from_native, to_native},
+    path::{from_native, from_native_cmake, to_native},
 };
 
 use super::{Result, arg, error, set, warning};
@@ -205,8 +205,8 @@ fn pair(cx: &mut Cx<'_>, command: &[u8], args: &[&[u8]]) -> Result {
     match result {
         Ok(()) => Ok(Flow::Normal),
         Err(msg) => {
-            let source = from_native(&source);
-            let target = from_native(&target);
+            let source = from_native_cmake(&source);
+            let target = from_native_cmake(&target);
             let detail = match (command, msg.as_slice()) {
                 (b"COPY_FILE", b"cannot copy a directory") => {
                     [msg.as_slice(), b"\n  ", source.as_slice()].concat()

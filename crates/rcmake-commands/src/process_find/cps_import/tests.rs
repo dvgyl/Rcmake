@@ -300,7 +300,7 @@ endif()
     let target = project.target(api).ok_or("missing imported target")?;
     assert_eq!(
         target.usage.joined(UsageField::InterfaceIncludeDirectories),
-        Some(path::from_native(&prefix.join("include")))
+        Some(path::from_native_cmake(&prefix.join("include")))
     );
     Ok(())
 }

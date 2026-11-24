@@ -1,7 +1,9 @@
-use super::{require_absolute, virtual_absolute};
+use super::require_absolute;
 use std::collections::{BTreeMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+
+use rcmake_base::BString;
 
 use crate::error::{HostResult, SyntheticError};
 use crate::{
@@ -46,23 +48,134 @@ enum Missing {
     Directories,
 }
 
-fn components(path: &Path, create_dirs: bool) -> VecDeque<(PathBuf, bool)> {
-    let bytes = path::from_native(path);
-    let bytes = bytes.as_slice();
-    let separator = |byte: &u8| *byte == b'/' || (cfg!(windows) && *byte == b'\\');
+fn windows_separator(byte: u8) -> bool {
+    matches!(byte, b'/' | b'\\')
+}
+
+fn separator(byte: u8, windows: bool) -> bool {
+    byte == b'/' || (windows && byte == b'\\')
+}
+
+fn drive_prefix(bytes: &[u8]) -> bool {
+    matches!(bytes, [letter, b':', ..] if letter.is_ascii_alphabetic())
+}
+
+pub(super) fn root(bytes: &[u8]) -> Option<(BString, &[u8], bool)> {
+    if let [letter, b':', sep, rest @ ..] = bytes
+        && letter.is_ascii_alphabetic()
+        && windows_separator(*sep)
+    {
+        return Some((
+            vec![letter.to_ascii_uppercase(), b':', b'/'].into(),
+            rest,
+            true,
+        ));
+    }
+    let [first, rest @ ..] = bytes else {
+        return None;
+    };
+    if !windows_separator(*first) {
+        return None;
+    }
+    if let [second, remote @ ..] = rest
+        && windows_separator(*second)
+    {
+        let mut parts = remote.splitn(3, |&byte| windows_separator(byte));
+        if let (Some(server), Some(share)) = (parts.next(), parts.next())
+            && !server.is_empty()
+            && !share.is_empty()
+            && !matches!(server, b"." | b".." | b"?")
+            && !matches!(share, b"." | b"..")
+        {
+            return Some((
+                [b"//", server, b"/", share, b"/"].concat().into(),
+                parts.next().unwrap_or_default(),
+                true,
+            ));
+        }
+    }
+    Some(("/".into(), rest, cfg!(windows) || *first == b'\\'))
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(super) struct VirtualPath {
+    root: BString,
+    // A zero byte ends each component. All descendants share this byte prefix.
+    relative: BString,
+}
+
+impl VirtualPath {
+    fn at_root(root: BString) -> Self {
+        Self {
+            root,
+            relative: BString::default(),
+        }
+    }
+
+    fn is_root(&self) -> bool {
+        self.relative.is_empty()
+    }
+
+    fn push(&mut self, part: &[u8]) {
+        self.relative.extend_from_slice(part);
+        self.relative.push(0);
+    }
+
+    fn pop(&mut self) {
+        let parent_len = self.parent_and_name().0.len();
+        self.relative.truncate(parent_len);
+    }
+
+    fn parent_and_name(&self) -> (&[u8], &[u8]) {
+        let relative = self.relative.strip_suffix(b"\0").unwrap_or_default();
+        let end = relative
+            .iter()
+            .rposition(|&byte| byte == 0)
+            .map_or(0, |i| i + 1);
+        relative.split_at(end)
+    }
+
+    fn is_under(&self, path: &Self) -> bool {
+        self.root == path.root && self.relative.starts_with(&path.relative)
+    }
+
+    pub(super) fn to_path_buf(&self) -> PathBuf {
+        let mut bytes = self.root.clone();
+        let relative = self.relative.strip_suffix(b"\0").unwrap_or_default();
+        bytes.extend(
+            relative
+                .iter()
+                .map(|&byte| if byte == 0 { b'/' } else { byte }),
+        );
+        path::to_native(&bytes)
+    }
+}
+
+fn removal_path(input: &Path) -> HostResult<PathBuf> {
+    let bytes = path::from_native(input);
+    let (_, rest, windows) =
+        root(&bytes).ok_or_else(|| crate::HostError::not_absolute(input.to_path_buf()))?;
+    if rest.iter().all(|&byte| separator(byte, windows)) {
+        return Err(SyntheticError::ResourceBusy.at(Some(input)));
+    }
+    path::directory_removal_path(input, require_absolute, windows)
+}
+
+fn components(bytes: &[u8], windows: bool, create_dirs: bool) -> VecDeque<(BString, bool)> {
+    let separator = |byte| separator(byte, windows);
     let mut parts: VecDeque<_> = bytes
-        .split(separator)
+        .split(|&byte| separator(byte))
         .filter(|part| !part.is_empty())
-        .map(|part| (path::to_native(part), create_dirs))
+        .map(|part| (part.into(), create_dirs))
         .collect();
-    if !parts.is_empty() && bytes.last().is_some_and(separator) {
-        parts.push_back((PathBuf::from("."), create_dirs));
+    if !parts.is_empty() && bytes.last().copied().is_some_and(separator) {
+        parts.push_back((".".into(), create_dirs));
     }
     parts
 }
 
 pub(super) struct FileSystem {
-    paths: BTreeMap<PathBuf, u64>,
+    paths: BTreeMap<VirtualPath, u64>,
     inodes: BTreeMap<u64, Inode>,
     next_ino: u64,
     pub(super) now: FileTime,
@@ -81,7 +194,7 @@ impl FileSystem {
             },
             monotonic: Duration::ZERO,
         };
-        fs.insert(PathBuf::from("/"), Data::Dir);
+        fs.insert(VirtualPath::at_root("/".into()), Data::Dir);
         let _ = fs.create_dir_all(cwd);
         fs
     }
@@ -104,7 +217,7 @@ impl FileSystem {
         };
     }
 
-    fn insert(&mut self, path: PathBuf, data: Data) -> u64 {
+    fn insert(&mut self, path: VirtualPath, data: Data) -> u64 {
         self.advance(Duration::from_nanos(1));
         let ino = self.next_ino;
         self.next_ino += 1;
@@ -122,11 +235,11 @@ impl FileSystem {
         ino
     }
 
-    fn lookup(&self, path: &Path) -> Option<&Inode> {
+    fn lookup(&self, path: &VirtualPath) -> Option<&Inode> {
         self.inodes.get(self.paths.get(path)?)
     }
 
-    fn unlink(&mut self, path: &Path) {
+    fn unlink(&mut self, path: &VirtualPath) {
         if let Some(ino) = self.paths.remove(path)
             && let Some(inode) = self.inodes.get_mut(&ino)
         {
@@ -137,31 +250,44 @@ impl FileSystem {
         }
     }
 
-    fn descendants<'a>(&'a self, path: &'a Path) -> impl Iterator<Item = &'a PathBuf> {
+    fn descendants<'a>(&'a self, path: &'a VirtualPath) -> impl Iterator<Item = &'a VirtualPath> {
         use std::ops::Bound::{Excluded, Unbounded};
         self.paths
-            .range::<Path, _>((Excluded(path), Unbounded))
+            .range((Excluded(path), Unbounded))
             .map(|(entry, _)| entry)
-            .take_while(move |entry| entry.starts_with(path))
+            .take_while(move |entry| entry.is_under(path))
     }
 
-    fn resolve(&mut self, path: &Path, follow: Follow, missing: Missing) -> HostResult<PathBuf> {
-        require_absolute(path)?;
-        if path::from_native(path).as_slice().contains(&0) {
+    fn resolve(
+        &mut self,
+        path: &Path,
+        follow: Follow,
+        missing: Missing,
+    ) -> HostResult<VirtualPath> {
+        let bytes = path::from_native(path);
+        let (root_name, rest, mut windows) =
+            root(&bytes).ok_or_else(|| crate::HostError::not_absolute(path.to_path_buf()))?;
+        if bytes.as_slice().contains(&0) {
             return Err(SyntheticError::InvalidInput.at(Some(path)));
         }
-        let mut resolved = PathBuf::from("/");
-        let mut pending = components(path, missing == Missing::Directories);
+        let mut resolved = VirtualPath::at_root(root_name);
+        if !self.paths.contains_key(&resolved) {
+            if missing != Missing::Directories {
+                return Err(SyntheticError::NotFound.at(Some(path)));
+            }
+            self.insert(resolved.clone(), Data::Dir);
+        }
+        let mut pending = components(rest, windows, missing == Missing::Directories);
         let mut hops = 0;
         while let Some((part, create_dir)) = pending.pop_front() {
-            if part == Path::new(".") {
+            if part == "." {
                 continue;
             }
-            if part == Path::new("..") {
+            if part == ".." {
                 resolved.pop();
                 continue;
             }
-            resolved.push(part);
+            resolved.push(&part);
             let Some(inode) = self.lookup(&resolved) else {
                 if create_dir {
                     self.insert(resolved.clone(), Data::Dir);
@@ -179,12 +305,22 @@ impl FileSystem {
                     if hops > 40 {
                         return Err(SyntheticError::LinkLoop.at(Some(path)));
                     }
-                    if virtual_absolute(target) {
-                        resolved = PathBuf::from("/");
+                    let target = path::from_native(target);
+                    let rest = if let Some((root_name, rest, target_windows)) = root(&target) {
+                        resolved = VirtualPath::at_root(root_name);
+                        windows = target_windows;
+                        if !self.paths.contains_key(&resolved) {
+                            return Err(SyntheticError::NotFound.at(Some(path)));
+                        }
+                        rest
                     } else {
+                        if drive_prefix(&target) {
+                            return Err(SyntheticError::InvalidInput.at(Some(path)));
+                        }
                         resolved.pop();
-                    }
-                    let mut parts = components(target, false);
+                        target.as_slice()
+                    };
+                    let mut parts = components(rest, windows, false);
                     parts.append(&mut pending);
                     pending = parts;
                 }
@@ -198,7 +334,7 @@ impl FileSystem {
         Ok(resolved)
     }
 
-    fn existing(&mut self, path: &Path, follow: Follow) -> HostResult<(PathBuf, u64)> {
+    fn existing(&mut self, path: &Path, follow: Follow) -> HostResult<(VirtualPath, u64)> {
         let resolved = self.resolve(path, follow, Missing::Reject)?;
         let ino = self
             .paths
@@ -229,7 +365,7 @@ impl FileSystem {
             Data::Dir => {
                 let dirs = self
                     .descendants(&resolved)
-                    .filter(|child| child.parent() == Some(resolved.as_path()))
+                    .filter(|child| child.parent_and_name().0 == resolved.relative.as_slice())
                     .filter(|child| {
                         self.lookup(child)
                             .is_some_and(|node| matches!(node.data, Data::Dir))
@@ -278,6 +414,23 @@ impl FileSystem {
         Ok(bytes)
     }
 
+    pub(super) fn seed_file(&mut self, input: &Path, bytes: &[u8]) -> HostResult<()> {
+        let name = path::from_native(input);
+        let (root_name, rest, windows) =
+            root(&name).ok_or_else(|| crate::HostError::not_absolute(input.to_path_buf()))?;
+        if let Some(end) = rest.iter().rposition(|&byte| separator(byte, windows)) {
+            let mut parent = root_name;
+            if parent == "/" && name.starts_with(b"\\") {
+                parent = "\\".into();
+            }
+            parent.extend_from_slice(rest.get(..end).unwrap_or_default());
+            self.create_dir_all(&path::to_native(&parent))?;
+        } else {
+            self.create_dir_all(&path::to_native(&root_name))?;
+        }
+        self.write(input, bytes, WriteMode::Truncate)
+    }
+
     pub(super) fn write(&mut self, path: &Path, bytes: &[u8], mode: WriteMode) -> HostResult<()> {
         let follow = if mode == WriteMode::CreateNew {
             Follow::No
@@ -314,10 +467,10 @@ impl FileSystem {
         }
         Ok(self
             .descendants(&resolved)
-            .filter(|child| child.parent() == Some(resolved.as_path()))
+            .filter(|child| child.parent_and_name().0 == resolved.relative.as_slice())
             .filter_map(|child| {
                 Some(DirEntry {
-                    name: path::from_native(Path::new(child.file_name()?)),
+                    name: child.parent_and_name().1.into(),
                     kind: self.lookup(child)?.data.kind(),
                 })
             })
@@ -329,13 +482,11 @@ impl FileSystem {
         if result
             .as_ref()
             .is_err_and(|err| err.kind == std::io::ErrorKind::NotFound)
+            && let Ok(unresolved) = removal_path(path)
+            && let Ok((_, ino)) = self.existing(&unresolved, Follow::No)
+            && matches!(self.inode(ino, path)?.data, Data::Symlink(_))
         {
-            let unresolved = path.components().collect::<PathBuf>();
-            if let Ok((_, ino)) = self.existing(&unresolved, Follow::No)
-                && matches!(self.inode(ino, path)?.data, Data::Symlink(_))
-            {
-                return Err(SyntheticError::AlreadyExists.at(Some(path)));
-            }
+            return Err(SyntheticError::AlreadyExists.at(Some(path)));
         }
         result.map(|_| ())
     }
@@ -350,12 +501,12 @@ impl FileSystem {
     }
 
     pub(super) fn remove_dir(&mut self, path: &Path) -> HostResult<()> {
-        let trimmed = path::directory_removal_path(path)?;
+        let trimmed = removal_path(path)?;
         let (resolved, ino) = self.existing(&trimmed, Follow::No)?;
         if !matches!(self.inode(ino, path)?.data, Data::Dir) {
             return Err(SyntheticError::NotADirectory.at(Some(path)));
         }
-        if resolved.parent().is_none() {
+        if resolved.is_root() {
             return Err(SyntheticError::ResourceBusy.at(Some(path)));
         }
         if self.descendants(&resolved).next().is_some() {
@@ -366,9 +517,9 @@ impl FileSystem {
     }
 
     pub(super) fn remove_dir_all(&mut self, path: &Path) -> HostResult<()> {
-        let trimmed = path::directory_removal_path(path)?;
+        let trimmed = removal_path(path)?;
         let (resolved, ino) = self.existing(&trimmed, Follow::No)?;
-        if resolved.parent().is_none() {
+        if resolved.is_root() {
             return Err(SyntheticError::ResourceBusy.at(Some(path)));
         }
         match self.inode(ino, path)?.data {
@@ -393,11 +544,11 @@ impl FileSystem {
         if self.paths.get(&dst) == Some(&ino) {
             return Ok(());
         }
-        if src.parent().is_none() || dst.parent().is_none() {
+        if src.is_root() || dst.is_root() {
             return Err(SyntheticError::ResourceBusy.at(Some(from)));
         }
         let src_dir = matches!(self.inode(ino, from)?.data, Data::Dir);
-        if src_dir && dst.starts_with(&src) {
+        if src_dir && dst.is_under(&src) {
             return Err(SyntheticError::InvalidInput.at(Some(to)));
         }
         if let Some(node) = self.lookup(&dst) {
@@ -415,10 +566,12 @@ impl FileSystem {
         self.unlink(&dst);
         let children: Vec<_> = self.descendants(&src).cloned().collect();
         for child in children {
-            if let Ok(relative) = child.strip_prefix(&src)
+            if let Some(relative) = child.relative.strip_prefix(src.relative.as_slice())
                 && let Some(ino) = self.paths.remove(&child)
             {
-                self.paths.insert(dst.join(relative), ino);
+                let mut entry = dst.clone();
+                entry.relative.extend_from_slice(relative);
+                self.paths.insert(entry, ino);
             }
         }
         self.paths.remove(&src);
@@ -498,6 +651,10 @@ impl FileSystem {
     }
 
     pub(super) fn canonicalize(&mut self, path: &Path) -> HostResult<PathBuf> {
+        self.canonical_key(path).map(|key| key.to_path_buf())
+    }
+
+    pub(super) fn canonical_key(&mut self, path: &Path) -> HostResult<VirtualPath> {
         self.resolve(path, Follow::Yes, Missing::Reject)
     }
 

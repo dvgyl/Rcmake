@@ -94,8 +94,16 @@ pub(super) fn ctest_submit(cx: &mut Cx<'_>, input: &[ExpandedArg]) -> CmdResult 
                 subproject,
             };
             let quiet = args.flag(b"QUIET");
-            let mut transport =
-                Transport::new(verbose() && !quiet, (extra_verbose() || debug()) && !quiet);
+            let inactivity = cx.var(b"CTEST_SUBMIT_INACTIVITY_TIMEOUT");
+            let mut transport = Transport::new(
+                verbose() && !quiet,
+                (extra_verbose() || debug()) && !quiet,
+                inactivity
+                    .as_ref()
+                    .or(config.submit_inactivity_timeout.as_ref())
+                    .map(|value| value.as_slice()),
+                cx.limits().wall_budget,
+            );
             transport.retries =
                 retry_option(cx, args.value(b"RETRY_COUNT"), b"CTEST_SUBMIT_RETRY_COUNT").min(10);
             transport.delay = Duration::from_secs(u64::from(
@@ -118,7 +126,7 @@ pub(super) fn ctest_submit(cx: &mut Cx<'_>, input: &[ExpandedArg]) -> CmdResult 
             )
             .map_err(error)?;
             for header in args.labels(b"HTTPHEADER") {
-                transport.header(host, header);
+                transport.header(host, header).map_err(error)?;
             }
             let result = if let Some(file) = args.value(b"CDASH_UPLOAD") {
                 let path = absolute(&cwd, file);

@@ -1,12 +1,8 @@
-use std::path::Path;
 use std::time::Duration;
 
 use rcmake_base::{BString, hash::HashAlgo, truth};
 use rcmake_eval::{Cx, Flow};
-use rcmake_host::{
-    CommandSpec, FileKind, Follow, Host, HostError, Input, Output, ProcessResult, ReadRange,
-    RunRequest, Stream, WriteMode, path,
-};
+use rcmake_host::{CommandSpec, Input, Output, ProcessResult, RunRequest, Stream, WriteMode, path};
 
 use super::{Result, error, warning};
 
@@ -45,13 +41,8 @@ pub(super) fn run(cx: &mut Cx<'_>, args: &[&[u8]]) -> Result {
         let file = destination
             .as_deref()
             .ok_or_else(|| error("DOWNLOAD cannot calculate hash if file is not saved."))?;
-        if digest(
-            cx.host(),
-            file,
-            expected.algorithm,
-            cx.limits().max_file_read,
-        )
-        .is_ok_and(|actual| actual == expected.value)
+        if path::hash_file(cx.host(), file, expected.algorithm)
+            .is_ok_and(|actual| actual == expected.value)
         {
             set_status(
                 cx,
@@ -84,26 +75,20 @@ pub(super) fn run(cx: &mut Cx<'_>, args: &[&[u8]]) -> Result {
             .flags
             .extend(["--output".into(), path::from_native(file)]);
     }
-    if !download.ranges.is_empty() {
-        let mut range = BString::default();
-        for (start, end) in &download.ranges {
-            if url.starts_with(b"file://") {
-                range.clear();
-            } else if !range.is_empty() {
-                range.push(b',');
-            }
-            range.extend_from_slice(start);
-            range.push(b'-');
-            range.extend_from_slice(end.unwrap_or_default());
-        }
+    if let Some((start, end)) = download.ranges.last() {
+        let mut range = BString::from(*start);
+        range.push(b'-');
+        range.extend_from_slice(end.unwrap_or_default());
         download.flags.extend(["--range".into(), range]);
     }
     if download.log.is_some() {
         download.flags.push("--verbose".into());
     }
     download.flags.extend(["--url".into(), BString::from(*url)]);
-    let limit = cx.limits().wall_budget.unwrap_or(Duration::from_secs(600));
-    let timeout = download.timeout.map_or(limit, |timeout| timeout.min(limit));
+    let timeout = match (download.timeout, cx.limits().wall_budget) {
+        (Some(timeout), Some(budget)) => Some(timeout.min(budget)),
+        (timeout, budget) => timeout.or(budget),
+    };
     let result = cx
         .host()
         .run_bounded(
@@ -121,7 +106,7 @@ pub(super) fn run(cx: &mut Cx<'_>, args: &[&[u8]]) -> Result {
                 },
                 stdout: Output::Null,
                 stderr: Output::Capture,
-                timeout: Some(timeout),
+                timeout,
                 tee: false,
             },
             cx.limits().max_value_bytes,
@@ -152,13 +137,7 @@ pub(super) fn run(cx: &mut Cx<'_>, args: &[&[u8]]) -> Result {
                 BString::from(*url),
             )));
         }
-        let actual = digest(
-            cx.host(),
-            &file,
-            expected.algorithm,
-            cx.limits().max_file_read,
-        )
-        .map_err(|_| {
+        let actual = path::hash_file(cx.host(), &file, expected.algorithm).map_err(|_| {
             error(format!(
                 "DOWNLOAD cannot compute hash on download\n  for file: \"{}\"",
                 file.display(),
@@ -244,6 +223,9 @@ impl<'a> Download<'a> {
                 b"TLS_CAINFO" => cainfo = value.into(),
                 b"NETRC" => netrc = value.into(),
                 b"NETRC_FILE" => netrc_file = value.into(),
+                b"HTTPHEADER" if value.starts_with(b"@") => {
+                    return Err(error("DOWNLOAD HTTPHEADER cannot start with '@'."));
+                }
                 b"HTTPHEADER" => download.flags.extend(["--header".into(), value.into()]),
                 b"USERPWD" => download.input = credentials(value),
                 b"EXPECTED_MD5" => {
@@ -314,16 +296,22 @@ impl<'a> Download<'a> {
         }
         match netrc.to_ascii_uppercase().as_slice() {
             b"" | b"IGNORED" => {}
-            b"OPTIONAL" => download.flags.push("--netrc-optional".into()),
-            b"REQUIRED" => download.flags.push("--netrc".into()),
+            level @ (b"OPTIONAL" | b"REQUIRED") => {
+                let flag = if level == b"OPTIONAL" {
+                    "--netrc-optional"
+                } else {
+                    "--netrc"
+                };
+                download.flags.push(flag.into());
+                if !netrc_file.is_empty() {
+                    download.flags.extend(["--netrc-file".into(), netrc_file]);
+                }
+            }
             _ => {
                 return Err(error(format!(
                     "NETRC accepts OPTIONAL, IGNORED or REQUIRED but got: {netrc}"
                 )));
             }
-        }
-        if !netrc_file.is_empty() && !netrc.eq_ignore_ascii_case(b"IGNORED") {
-            download.flags.extend(["--netrc-file".into(), netrc_file]);
         }
         Ok(download)
     }
@@ -369,37 +357,6 @@ fn credentials(value: &[u8]) -> BString {
 
 fn setting(cx: &mut Cx<'_>, name: &[u8]) -> Option<BString> {
     cx.var(name).or_else(|| cx.host().env_get(name))
-}
-
-fn digest(
-    host: &dyn Host,
-    file: &Path,
-    algorithm: HashAlgo,
-    limit: u64,
-) -> rcmake_host::HostResult<String> {
-    let metadata = host.metadata(file, Follow::Yes)?;
-    if metadata.kind != FileKind::File || metadata.len > limit {
-        return Err(HostError::unsupported(
-            "The destination is not a regular file within the read limit.",
-        ));
-    }
-    let mut hash = algorithm.hasher();
-    let mut offset = 0;
-    while offset < metadata.len {
-        let bytes = host.read(
-            file,
-            ReadRange::Slice {
-                offset,
-                len: Some((metadata.len - offset).min(64 * 1024)),
-            },
-        )?;
-        if bytes.is_empty() {
-            break;
-        }
-        hash.update(&bytes);
-        offset += bytes.len() as u64;
-    }
-    Ok(hash.finish_hex())
 }
 
 fn set_status(cx: &mut Cx<'_>, name: Option<&[u8]>, code: i32, message: &str) {

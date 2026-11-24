@@ -490,7 +490,11 @@ fn find_path_returns_the_search_directory_for_a_nested_file() -> HostResult<()> 
 fn find_program_requires_a_regular_executable_file_and_supports_both_loop_orders() -> HostResult<()>
 {
     let (host, mut interp) = setup();
-    host.seed_file(Path::new("/work/one/first"), b"")?;
+    if cfg!(windows) {
+        host.create_dir_all(Path::new("/work/one/first"))?;
+    } else {
+        host.seed_file(Path::new("/work/one/first"), b"")?;
+    }
     host.create_dir_all(Path::new("/work/one/only_dir"))?;
     for file in ["/work/one/second", "/work/two/first"] {
         host.seed_file(Path::new(file), b"")?;
@@ -502,15 +506,24 @@ fn find_program_requires_a_regular_executable_file_and_supports_both_loop_orders
             .set_policy(PolicyId::new(109), PolicyStatus::New)
             .is_ok()
     );
-    let script = r#"
+    let absolute = if cfg!(windows) {
+        "C:/work/two/first"
+    } else {
+        "/work/two/first"
+    };
+    host.seed_file(Path::new(absolute), b"")?;
+    host.set_permissions(Path::new(absolute), 0o755)?;
+    let script = format!(
+        r#"
 find_program(NAMES_FIRST NAMES only_dir first second PATHS one two NO_DEFAULT_PATH)
 find_program(DIRS_FIRST NAMES only_dir first second PATHS one two NAMES_PER_DIR NO_DEFAULT_PATH)
-find_program(ABSOLUTE /work/two/first NO_DEFAULT_PATH)
-"#;
-    assert_eq!(run(&host, &mut interp, script)?, 0);
+find_program(ABSOLUTE {absolute} NO_DEFAULT_PATH)
+"#
+    );
+    assert_eq!(run(&host, &mut interp, &script)?, 0);
     assert_eq!(var(&mut interp, b"NAMES_FIRST"), "/work/two/first");
     assert_eq!(var(&mut interp, b"DIRS_FIRST"), "/work/one/second");
-    assert_eq!(var(&mut interp, b"ABSOLUTE"), "/work/two/first");
+    assert_eq!(var(&mut interp, b"ABSOLUTE"), absolute);
     Ok(())
 }
 
@@ -534,7 +547,14 @@ fn find_search_order_and_disable_options() -> HostResult<()> {
     cx.set_var(b"CMAKE_PREFIX_PATH", "/prefix".into());
     cx.set_var(b"CMAKE_PROGRAM_PATH", "/programs".into());
     host.env_set(b"CMAKE_PREFIX_PATH", Some(b"/env-prefix"));
-    host.env_set(b"PATH", Some(b"/missing:/env"));
+    host.env_set(
+        b"PATH",
+        Some(if cfg!(windows) {
+            b"/missing;/env"
+        } else {
+            b"/missing:/env"
+        }),
+    );
     let script = r#"
 find_program(HINT tool HINTS /hints PATHS /paths)
 find_program(PREFIX tool PATHS /paths)
@@ -1019,26 +1039,42 @@ fn find_package_runs_vendored_threads_and_zlib_modules() -> HostResult<()> {
         let data = native.read(&modules.join(module), ReadRange::All { limit: 128 * 1024 })?;
         host.seed_file(&Path::new("/share/cmake/Modules").join(module), &data)?;
     }
+    let (root, library, platform) = if cfg!(windows) {
+        (
+            "C:/work/zlib",
+            "zlibstatic.lib",
+            "set(WIN32 TRUE)\nset(CMAKE_FIND_LIBRARY_PREFIXES [[]])",
+        )
+    } else {
+        ("/work/zlib", "libz.a", "")
+    };
+    let root = Path::new(root);
+    let library = root.join("lib").join(library);
     host.seed_file(
-        Path::new("/work/zlib/include/zlib.h"),
+        &root.join("include/zlib.h"),
         b"#define ZLIB_VERSION \"1.3.1\"\n",
     )?;
-    host.seed_file(Path::new("/work/zlib/lib/libz.a"), b"")?;
+    host.seed_file(&library, b"")?;
     host.seed_file(
         Path::new("/work/CMakeLists.txt"),
-        br#"
+        format!(
+            r#"
 cmake_minimum_required(VERSION 4.5)
 project(Packages NONE)
 set(CMAKE_C_COMPILER_LOADED TRUE)
 set(CMAKE_HAVE_LIBC_PTHREAD TRUE)
 find_package(Threads REQUIRED)
-set(ZLIB_ROOT /work/zlib)
+{platform}
+set(ZLIB_ROOT "{root}")
 set(ZLIB_USE_STATIC_LIBS TRUE)
 find_package(ZLIB 1.3 REQUIRED)
 if(NOT TARGET Threads::Threads OR NOT TARGET ZLIB::ZLIB)
   message(FATAL_ERROR "An imported target is missing")
 endif()
 "#,
+            root = root.display()
+        )
+        .as_bytes(),
     )?;
     let mut interp = package_interp(host.clone(), RunMode::Configure);
     let outcome = interp.run_configure(Path::new("/work"), Path::new("/work/build"), &[]);
@@ -1051,6 +1087,20 @@ endif()
     assert!(interp.cx().var_is_on(b"Threads_FOUND"));
     assert!(interp.cx().var_is_on(b"ZLIB_FOUND"));
     assert_eq!(var(&mut interp, b"ZLIB_VERSION"), "1.3.1");
+    let mut cx = interp.cx();
+    let model = cx.project();
+    let zlib = model
+        .find_target(rcmake_model::DirId::ROOT, b"ZLIB::ZLIB")
+        .and_then(|id| model.target(id))
+        .ok_or_else(|| rcmake_host::HostError::unsupported("Missing imported ZLIB target."))?;
+    let location = zlib
+        .props
+        .get(b"IMPORTED_LOCATION_RELEASE")
+        .or_else(|| zlib.props.get(b"IMPORTED_LOCATION"));
+    assert_eq!(
+        location.map(|value| rcmake_host::path::to_native(value)),
+        Some(library)
+    );
     Ok(())
 }
 

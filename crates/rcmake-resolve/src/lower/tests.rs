@@ -868,6 +868,11 @@ fn lowers_install_rules_and_collects_metadata() -> TestResult {
 #[test]
 fn installs_public_headers_with_their_own_options() -> TestResult {
     let mut model = fixture("Linux");
+    let generated = if cfg!(windows) {
+        "C:/generated/config.h"
+    } else {
+        "/generated/config.h"
+    };
     let child = model.add_directory(
         DirId::ROOT,
         "/project/sub".into(),
@@ -877,7 +882,7 @@ fn installs_public_headers_with_their_own_options() -> TestResult {
     let mut raw = raw_target("api", TargetKind::StaticLibrary);
     raw.dir = child;
     raw.props
-        .set("PUBLIC_HEADER".into(), "api.h;;/generated/config.h".into());
+        .set("PUBLIC_HEADER".into(), format!("api.h;;{generated}").into());
     let target = resolve_target(&mut model, raw, &ConfigId("Debug".into()), &["a.c"])?;
     for _ in 0..2 {
         model.add_install(InstallRule {
@@ -926,7 +931,7 @@ fn installs_public_headers_with_their_own_options() -> TestResult {
     for action in [defaults, explicit] {
         assert!(
             matches!(&action.kind, InstallActionKind::Files { file_type, files, .. }
-            if file_type == "FILE" && files == &["/project/api.h", "/generated/config.h"])
+            if file_type == "FILE" && files == &["/project/api.h", generated])
         );
     }
     assert!(

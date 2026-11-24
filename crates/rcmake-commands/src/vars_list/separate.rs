@@ -141,13 +141,13 @@ fn find_program(cx: &Cx<'_>, token: &[u8]) -> Option<BString> {
     for dir in dirs {
         let candidate = cwd.join(path::to_native(dir)).join(&file);
         if available(&candidate) {
-            return Some(path::from_native(&candidate));
+            return Some(path::from_native_cmake(&candidate));
         }
         #[cfg(windows)]
         for extension in ["com", "exe"] {
             let candidate = candidate.with_extension(extension);
             if available(&candidate) {
-                return Some(path::from_native(&candidate));
+                return Some(path::from_native_cmake(&candidate));
             }
         }
     }
