@@ -1851,6 +1851,19 @@ fn shell_quote(value: &[u8]) -> BString {
     quoted
 }
 
+fn dir_excluded_from_all(model: &ProjectModel, mut dir: DirId) -> bool {
+    loop {
+        let info = model.dir(dir);
+        if info.exclude_from_all {
+            return true;
+        }
+        let Some(parent) = info.parent else {
+            return false;
+        };
+        dir = parent;
+    }
+}
+
 fn resolve_exports(
     model: &ProjectModel,
     usage: &mut UsageResolver<'_>,
@@ -1859,6 +1872,9 @@ fn resolve_exports(
 ) -> Result<Vec<ExportPlan>, ResolveError> {
     let mut plans = Vec::new();
     for rule in &model.installs {
+        if dir_excluded_from_all(model, rule.dir) {
+            continue;
+        }
         let InstallKind::Export {
             set,
             namespace,

@@ -496,7 +496,7 @@ cmake_instrumentation(API_VERSION 1 DATA_VERSION 1.2
             assert!(stdout.contains(hook));
         }
 
-        assert!(stdout.contains("-- Build files have been written to: /work/out\npostGenerate"));
+        assert!(stdout.contains("postGenerate-- Build files have been written to: /work/out\n"));
 
         let interrupted = ["cmake", "--build", "out", "--target", "interrupted"].map(BString::from);
         assert_eq!(crate::run(&interrupted, host.clone()), 130);

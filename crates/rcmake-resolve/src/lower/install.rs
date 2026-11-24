@@ -177,6 +177,9 @@ fn lower_install_rules<E>(
     let mut manifest = InstallManifest::default();
     let mut export_plan = 0;
     for (index, rule) in model.installs.iter().enumerate() {
+        if dir_excluded_from_all(model, rule.dir) {
+            continue;
+        }
         let options = &rule.options;
         let recorded = recorded_args(model, index);
         let source = &model.dir(rule.dir).source_dir;
@@ -300,6 +303,19 @@ fn lower_install_rules<E>(
             .push(action(model, rule, options, b"", kind));
     }
     Ok(manifest)
+}
+
+fn dir_excluded_from_all(model: &ProjectModel, mut dir: DirId) -> bool {
+    loop {
+        let info = model.dir(dir);
+        if info.exclude_from_all {
+            return true;
+        }
+        let Some(parent) = info.parent else {
+            return false;
+        };
+        dir = parent;
+    }
 }
 
 fn action(
