@@ -120,9 +120,9 @@ fn common(
     args: &mut Args<'_>,
 ) -> Result<bool> {
     match key {
-        b"DESTINATION" => options.destination = Some(destination(cx, value(args, key)?)),
-        b"TYPE" if matches!(signature, b"FILES" | b"PROGRAMS" | b"DIRECTORY") => {
-            options.destination = Some(type_destination(cx, value(args, key)?)?);
+        b"DESTINATION" => {
+            let path = destination(cx, value(args, key)?);
+            options.destination = (signature != b"TARGETS" || !path.is_empty()).then_some(path);
         }
         b"COMPONENT" => options.component = Some(value(args, key)?.into()),
         b"PERMISSIONS" if signature != b"DIRECTORY" => options.permissions = permissions(args)?,
@@ -222,6 +222,7 @@ fn install(cx: &mut Cx<'_>, input: &[ExpandedArg]) -> CmdResult {
     };
     if matches!(&kind, InstallKind::Targets { targets, .. } if targets.is_empty())
         || matches!(&kind, InstallKind::Files(files) | InstallKind::Programs(files) if files.is_empty())
+        || matches!(&kind, InstallKind::Directory(dirs) if dirs.is_empty() && options.destination.is_none())
     {
         return Ok(Flow::Normal);
     }
@@ -435,8 +436,7 @@ fn targets(
                 }
             }
             _ => {
-                if key == b"DESTINATION" && args.peek().is_some_and(|next| *next == b"DESTINATION")
-                {
+                if key == b"DESTINATION" && args.peek().is_none_or(|next| keyword(next)) {
                     continue;
                 }
                 if group.is_some() && key == b"DESTINATION" {
@@ -499,16 +499,10 @@ fn paths(
     options: &mut InstallOptions,
 ) -> Result<InstallKind> {
     let inputs = values(args);
-    let mut destination_key = None;
+    let directory = signature == b"DIRECTORY";
+    let mut install_type = None;
     let mut rule = false;
     while let Some(key) = args.next() {
-        if matches!(key, b"TYPE" | b"DESTINATION")
-            && destination_key
-                .replace(key)
-                .is_some_and(|previous| previous != key)
-        {
-            return Err(fail("TYPE and DESTINATION are mutually exclusive."));
-        }
         match key {
             b"PATTERN" | b"REGEX" if signature == b"DIRECTORY" => {
                 let expression = value(args, key)?;
@@ -527,6 +521,14 @@ fn paths(
                 ));
             }
             _ if rule => return Err(unknown(key)),
+            b"TYPE" => {
+                let value = value(args, key)?;
+                install_type = if value.is_empty() && !directory {
+                    None
+                } else {
+                    Some(type_destination(cx, value)?)
+                };
+            }
             b"DIRECTORY_PERMISSIONS" if signature == b"DIRECTORY" => {
                 permissions(args)?;
             }
@@ -536,12 +538,24 @@ fn paths(
             _ => return Err(unknown(key)),
         }
     }
-    if options
+    if inputs.is_empty() && (!directory || options.destination.is_none()) {
+        return Ok(match signature {
+            b"FILES" => InstallKind::Files(Vec::new()),
+            b"PROGRAMS" => InstallKind::Programs(Vec::new()),
+            _ => InstallKind::Directory(Vec::new()),
+        });
+    }
+    let has_destination = options
         .destination
         .as_ref()
-        .is_none_or(|path| path.is_empty())
-        && (!inputs.is_empty() || signature == b"DIRECTORY")
-    {
+        .is_some_and(|path| directory || !path.is_empty());
+    if has_destination && install_type.is_some() {
+        return Err(fail("TYPE and DESTINATION are mutually exclusive."));
+    }
+    if !has_destination {
+        options.destination = install_type;
+    }
+    if options.destination.is_none() {
         return Err(fail([signature, b" given no DESTINATION!"].concat()));
     }
     if options.rename.is_some() && inputs.len() > 1 {
@@ -576,23 +590,25 @@ fn scripts(cx: &mut Cx<'_>, signature: &[u8], rest: &[&[u8]]) -> CmdResult {
     let mut blocks = Vec::new();
     let mut shared = Vec::new();
     let mut key = signature;
+    let payload = |token: &[u8]| {
+        !matches!(
+            token,
+            b"SCRIPT"
+                | b"CODE"
+                | b"COMPONENT"
+                | b"EXCLUDE_FROM_ALL"
+                | b"BUILD_DEPENDS"
+                | b"ALL_COMPONENTS"
+        )
+    };
     loop {
         match key {
             b"SCRIPT" | b"CODE" => {
                 let input = args
-                    .next_if(|token| !matches!(*token, b"SCRIPT" | b"CODE") && !keyword(token))
+                    .next_if(|token| payload(token))
                     .ok_or_else(|| fail([key, b" requires an argument."].concat()))?;
                 let kind = if key == b"SCRIPT" {
-                    let path = source_path(cx, input);
-                    if !path.starts_with(b"$<")
-                        && cx
-                            .host()
-                            .metadata(&to_native(&path), rcmake_host::Follow::Yes)
-                            .is_ok_and(|metadata| metadata.kind == rcmake_host::FileKind::Dir)
-                    {
-                        return Err(fail(format!("given a directory as a script: {path}")));
-                    }
-                    InstallKind::Script(path)
+                    InstallKind::Script(script_path(cx, input)?)
                 } else {
                     InstallKind::Code(input.into())
                 };
@@ -604,7 +620,7 @@ fn scripts(cx: &mut Cx<'_>, signature: &[u8], rest: &[&[u8]]) -> CmdResult {
             }
             b"COMPONENT" => {
                 let name = args
-                    .next_if(|token| !matches!(*token, b"SCRIPT" | b"CODE") && !keyword(token))
+                    .next_if(|token| payload(token))
                     .ok_or_else(|| fail("option COMPONENT requires a value."))?;
                 options.component = Some(name.into());
                 shared.extend([key, name]);
@@ -615,9 +631,7 @@ fn scripts(cx: &mut Cx<'_>, signature: &[u8], rest: &[&[u8]]) -> CmdResult {
             }
             b"BUILD_DEPENDS" => {
                 shared.push(key);
-                while let Some(path) =
-                    args.next_if(|token| !matches!(*token, b"SCRIPT" | b"CODE") && !keyword(token))
-                {
+                while let Some(path) = args.next_if(|token| payload(token)) {
                     shared.push(path);
                     options.build_depends.push(path.into());
                 }
@@ -630,13 +644,9 @@ fn scripts(cx: &mut Cx<'_>, signature: &[u8], rest: &[&[u8]]) -> CmdResult {
     if options.all_components && options.component.is_some() {
         return Err(fail("ALL_COMPONENTS and COMPONENT are mutually exclusive."));
     }
-    if options
+    options
         .component
-        .as_ref()
-        .is_none_or(|name| name.is_empty())
-    {
-        options.component = Some(default_component(cx));
-    }
+        .get_or_insert_with(|| default_component(cx));
     let dir = cx.current_dir_id();
     let backtrace = cx.backtrace();
     for (signature, input, kind) in blocks {
@@ -651,6 +661,21 @@ fn scripts(cx: &mut Cx<'_>, signature: &[u8], rest: &[&[u8]]) -> CmdResult {
         record_args(cx, &format!("_RCMAKE_INSTALL_{index}"), &recorded);
     }
     Ok(Flow::Normal)
+}
+
+fn script_path(cx: &Cx<'_>, input: &[u8]) -> Result<BString> {
+    if input.starts_with(b"$<INSTALL_PREFIX>") {
+        return Ok(input.into());
+    }
+    let file = cx.current_source_dir().join(to_native(input));
+    if cx
+        .host()
+        .metadata(&file, rcmake_host::Follow::Yes)
+        .is_ok_and(|metadata| metadata.kind == rcmake_host::FileKind::Dir)
+    {
+        return Err(fail("given a directory as value of SCRIPT argument."));
+    }
+    Ok(from_native_cmake(&file))
 }
 
 fn install_export(

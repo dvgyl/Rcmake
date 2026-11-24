@@ -17,6 +17,63 @@ pub(super) fn join_words(words: impl IntoIterator<Item = BString>) -> BString {
     result
 }
 
+pub(super) fn windows_host(model: &ProjectModel, dir: DirId) -> bool {
+    definition(model, dir, b"CMAKE_HOST_SYSTEM_NAME").map_or_else(
+        || {
+            definition(model, dir, b"CMAKE_HOST_WIN32")
+                .map_or(cfg!(windows), |value| truth::is_on(value))
+        },
+        |value| value.eq_ignore_ascii_case(b"Windows"),
+    )
+}
+
+pub(super) fn windows_arguments(line: &[u8]) -> Vec<BString> {
+    let mut args = Vec::new();
+    let mut input = line.iter().copied().peekable();
+    while let Some(byte) = input.peek() {
+        if byte.is_ascii_whitespace() {
+            input.next();
+            continue;
+        }
+        let mut word = BString::default();
+        let mut quoted = false;
+        while let Some(byte) = input.peek().copied() {
+            if !quoted && byte.is_ascii_whitespace() {
+                break;
+            }
+            let mut slashes = 0;
+            while input.next_if_eq(&b'\\').is_some() {
+                slashes += 1;
+            }
+            if input.next_if_eq(&b'"').is_some() {
+                word.extend(std::iter::repeat_n(b'\\', slashes / 2));
+                if slashes % 2 == 1 || (quoted && input.next_if_eq(&b'"').is_some()) {
+                    word.push(b'"');
+                } else {
+                    quoted = !quoted;
+                }
+            } else {
+                word.extend(std::iter::repeat_n(b'\\', slashes));
+                if slashes == 0
+                    && let Some(byte) = input.next()
+                {
+                    word.push(byte);
+                }
+            }
+        }
+        args.push(word);
+    }
+    args
+}
+
+pub(super) fn raw_flags(model: &ProjectModel, dir: DirId, value: &[u8]) -> BString {
+    if windows_host(model, dir) {
+        join_words(windows_arguments(value).iter().map(|arg| quote(arg)))
+    } else {
+        value.into()
+    }
+}
+
 pub(super) fn direct(argv: Vec<BString>, working_dir: Option<BString>) -> Invocation {
     let shell = join_words(argv.iter().map(|arg| quote(arg)));
     Invocation {
@@ -54,7 +111,7 @@ fn is_shell_prefix(program: &[u8]) -> bool {
 }
 
 /// Read a simple shell command. Require the shell when an expansion or operator is present.
-pub(super) fn simple_args(shell: &[u8]) -> Option<Vec<BString>> {
+pub fn simple_args(shell: &[u8]) -> Option<Vec<BString>> {
     let mut args = Vec::new();
     let mut word = BString::default();
     let mut active = false;
@@ -103,6 +160,40 @@ pub(super) fn simple_args(shell: &[u8]) -> Option<Vec<BString>> {
         args.push(word);
     }
     Some(args)
+}
+
+/// Read simple commands separated by an unquoted `&&`.
+pub fn rule_command_chain(shell: &[u8]) -> Option<Vec<Vec<BString>>> {
+    let mut input = shell.iter().copied().enumerate().peekable();
+    let mut quote = None;
+    let mut start = 0;
+    let mut commands = Vec::new();
+    while let Some((index, byte)) = input.next() {
+        match (quote, byte) {
+            (Some(b'\''), b'\'') | (Some(b'"'), b'"') => quote = None,
+            (Some(b'\''), _) => {}
+            (None, b'\'' | b'"') => quote = Some(byte),
+            (_, b'\\') => {
+                input.next()?;
+            }
+            (None, b'&') if input.peek().is_some_and(|(_, byte)| *byte == b'&') => {
+                let (next, _) = input.next()?;
+                let args = simple_args(shell.get(start..index)?)?;
+                if args.first().is_none_or(|program| is_shell_prefix(program)) {
+                    return None;
+                }
+                commands.push(args);
+                start = next + 1;
+            }
+            _ => {}
+        }
+    }
+    let args = simple_args(shell.get(start..)?)?;
+    if args.first().is_none_or(|program| is_shell_prefix(program)) {
+        return None;
+    }
+    commands.push(args);
+    Some(commands)
 }
 
 pub(super) fn rule_invocations(
@@ -190,14 +281,36 @@ impl RuleExpander<'_> {
     fn value(&self, key: &[u8]) -> Option<BString> {
         let value = self.definition(key);
         match key {
-            b"CMAKE_AR" => Some(quote(value.unwrap_or(b"ar"))),
+            b"CMAKE_AR" => {
+                let msvc = [b"C".as_slice(), b"CXX"]
+                    .into_iter()
+                    .any(|language| super::artifacts::is_msvc(self.model, self.dir, language));
+                Some(quote(
+                    value
+                        .filter(|value| !truth::is_off(value))
+                        .unwrap_or(if msvc { b"lib.exe" } else { b"ar" }),
+                ))
+            }
             b"CMAKE_RANLIB" => Some(quote(value.unwrap_or(b"ranlib"))),
             b"CMAKE_COMMAND" => Some(quote(value.unwrap_or(b"cmake"))),
-            b"CMAKE_LINKER" | b"CMAKE_MT" | b"CMAKE_RC_COMPILER" => Some(
-                value
-                    .filter(|v| !v.is_empty())
-                    .map_or_else(BString::default, quote),
-            ),
+            b"CMAKE_RC_COMPILER"
+                if self.sysroot == b"CMAKE_SYSROOT_COMPILE"
+                    && value.is_some_and(|value| !truth::is_off(value)) =>
+            {
+                Some(self.compiler(key, b"CMAKE_RC"))
+            }
+            b"CMAKE_LINKER" | b"CMAKE_MT" | b"CMAKE_RC_COMPILER" => {
+                let fallback = match key {
+                    b"CMAKE_LINKER" => b"link.exe".as_slice(),
+                    b"CMAKE_MT" => b"mt.exe",
+                    _ => b"rc.exe",
+                };
+                Some(quote(
+                    value
+                        .filter(|value| !truth::is_off(value))
+                        .unwrap_or(fallback),
+                ))
+            }
             b"MANIFESTS" => Some(BString::default()),
             _ => {
                 if let Some(prefix) = key
@@ -221,7 +334,7 @@ impl RuleExpander<'_> {
             }
         }))];
         if let Some(arg1) = lookup(b"_COMPILER_ARG1") {
-            words.push(arg1.into());
+            words.push(raw_flags(self.model, self.dir, arg1));
         }
         let sysroot = self
             .definition(self.sysroot)

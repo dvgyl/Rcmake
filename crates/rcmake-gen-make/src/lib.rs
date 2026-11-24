@@ -704,13 +704,9 @@ fn write_step(
         .filter(|dir| !dir.as_os_str().is_empty())
         .collect::<BTreeSet<_>>();
     for directory in directories {
-        commands.push(
-            [
-                b"mkdir -p -- ".as_slice(),
-                &quote_always(&path::from_native(&directory)),
-            ]
-            .concat(),
-        );
+        let mut command = b"mkdir -p -- ".to_vec();
+        make_recipe_text(&mut command, &quote_always(&path::from_native(&directory)))?;
+        commands.push(command);
     }
     let (message, invocations) = match step.action {
         BuildStep::Compile {
@@ -743,10 +739,11 @@ fn write_step(
     if !message.is_empty() {
         progress::report(out, &message, step.progress)?;
     }
+    let custom = matches!(step.action, BuildStep::Custom(_));
     if step.jobserver_aware {
         for command in commands {
             out.push_str(b"\t$(SILENT)");
-            make_recipe_text(out, &command)?;
+            out.push_str(&command);
             out.push(b'\n');
         }
         for invocation in invocations {
@@ -767,26 +764,27 @@ fn write_step(
                     make_recipe_text(out, &rcmake_base::shell::quote(arg))?;
                 }
                 out.push(b'\n');
-            } else if let Some(command) = shell_invocation(invocation) {
+            } else if let Some(command) = recipe_invocation(invocation, custom)? {
                 out.push_str(b"\t+$(SILENT)");
-                make_recipe_text(out, &command)?;
+                out.push_str(&command);
                 out.push(b'\n');
             }
         }
-    } else if let commands = commands
-        .into_iter()
-        .chain(invocations.iter().filter_map(shell_invocation))
-        .collect::<Vec<_>>()
-        && !commands.is_empty()
-    {
-        out.push_str(b"\t$(SILENT)");
+    } else {
+        for invocation in invocations {
+            commands.extend(recipe_invocation(invocation, custom)?);
+        }
         for (index, command) in commands.iter().enumerate() {
-            if index != 0 {
+            if index == 0 {
+                out.push_str(b"\t$(SILENT)");
+            } else {
                 out.push_str(b" && \\\n\t  ");
             }
-            make_recipe_text(out, command)?;
+            out.push_str(command);
         }
-        out.push(b'\n');
+        if !commands.is_empty() {
+            out.push(b'\n');
+        }
     }
 
     for output in step.outputs.iter().filter(|output| **output != step.goal) {
@@ -819,16 +817,7 @@ fn shell_invocation(invocation: &Invocation) -> Option<Vec<u8>> {
     if invocation.shell.is_empty() && invocation.argv.is_empty() {
         return None;
     }
-    let mut command = b"(".to_vec();
-    if let Some(directory) = &invocation.working_dir {
-        command.push_str(b"CDPATH= cd ");
-        if directory.starts_with(b"-") {
-            command.push_str(quote_always(&[b"./", directory.as_slice()].concat()));
-        } else {
-            command.push_str(quote_always(directory));
-        }
-        command.push_str(b" && ");
-    }
+    let mut command = shell_command_prefix(invocation);
     if invocation.shell.is_empty() {
         for (index, arg) in invocation.argv.iter().enumerate() {
             if index != 0 {
@@ -841,6 +830,40 @@ fn shell_invocation(invocation: &Invocation) -> Option<Vec<u8>> {
     }
     command.push(b')');
     Some(command)
+}
+
+fn recipe_invocation(invocation: &Invocation, custom: bool) -> Result<Option<Vec<u8>>, GenError> {
+    let mut recipe = Vec::new();
+    if custom
+        && let Some((program, arguments)) = invocation.argv.split_first()
+        && program == b"$(MAKE)"
+    {
+        make_recipe_text(&mut recipe, &shell_command_prefix(invocation))?;
+        recipe.push_str(b"$(MAKE)");
+        for argument in arguments {
+            recipe.push(b' ');
+            make_recipe_text(&mut recipe, &rcmake_base::shell::quote(argument))?;
+        }
+        recipe.push(b')');
+    } else if let Some(command) = shell_invocation(invocation) {
+        make_recipe_text(&mut recipe, &command)?;
+    }
+    Ok((!recipe.is_empty()).then_some(recipe))
+}
+
+fn shell_command_prefix(invocation: &Invocation) -> Vec<u8> {
+    let mut command = b"(".to_vec();
+    if let Some(directory) = &invocation.working_dir {
+        command.push_str(b"CDPATH= cd ");
+        let directory = if directory.starts_with(b"-") {
+            quote_always(&[b"./", directory.as_slice()].concat())
+        } else {
+            quote_always(directory)
+        };
+        command.push_str(directory);
+        command.push_str(b" && ");
+    }
+    command
 }
 
 fn make_recipe_text(out: &mut Vec<u8>, text: &[u8]) -> Result<(), GenError> {

@@ -59,14 +59,19 @@ pub(crate) fn resolve_target<'a>(
         metadata.folder = facts.attributes.get(b"FOLDER".as_slice()).cloned();
         (artifacts, Some(facts))
     } else {
-        let mut artifacts = lower::compute_artifacts(model, target, &ctx.config);
-        if has_configured_artifact_path(model, target) {
+        let artifacts = if lower::artifacts::is_dll_platform(model, target.dir) {
+            usage.ide_artifacts(id, &ctx.config)?.0
+        } else if has_configured_artifact_path(model, target) {
+            let mut artifacts = lower::compute_artifacts(model, target, &ctx.config);
             let (configured, _) = usage.ide_artifacts(id, &ctx.config)?;
             artifacts.file = configured.file;
             artifacts.linker_file = configured.linker_file;
             artifacts.soname_file = configured.soname_file;
             artifacts.import_file = configured.import_file;
-        }
+            artifacts
+        } else {
+            lower::compute_artifacts(model, target, &ctx.config)
+        };
         (artifacts, None)
     };
     let mut resolved = ResolvedTarget {

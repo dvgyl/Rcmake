@@ -5,9 +5,9 @@ use rcmake_diag::{RenderOptions, format_paragraphs};
 use rcmake_gen_common::GenError;
 use rcmake_genex::ConfigId;
 
-use crate::generation_error;
 use crate::graph::{Graph, qualified};
-use crate::syntax::{Edge, Ninja, shell_word};
+use crate::syntax::{Edge, Ninja};
+use crate::{Programs, clean::clean_command, generation_error};
 
 pub(crate) struct Selection {
     pub(crate) default: usize,
@@ -104,21 +104,29 @@ pub(crate) fn emit_clean<'a>(
     ninja: &mut Ninja,
     graph: &Graph<'_>,
     implementation: &[u8],
-    included: impl Iterator<Item = &'a [u8]>,
-    cross: impl Iterator<Item = &'a [u8]>,
+    programs: &Programs,
+    included: impl Iterator<Item = &'a Graph<'a>>,
+    cross: &[&Graph<'_>],
 ) {
-    let mut base = b"ninja -f ".to_vec();
-    shell_word(&graph.node(implementation), &mut base);
+    let mut base = programs.ninja.clone();
+    base.extend_from_slice(b" -f ");
+    graph.commands.word(&graph.node(implementation), &mut base);
     base.extend_from_slice(b" -t clean");
-    let mut emit = |name, configs: &mut dyn Iterator<Item = &'a [u8]>| {
+    let mut emit = |name, configs: &[&Graph<'_>]| {
         let mut command = base.clone();
         for config in configs {
             command.push(b' ');
-            shell_word(
-                &qualified(&graph.node(b"CMakeFiles/rcmake-clean"), Some(config)),
+            graph.commands.word(
+                &qualified(&graph.node(b"CMakeFiles/rcmake-clean"), config.config),
                 &mut command,
             );
         }
+        let command = clean_command(
+            graph,
+            &programs.cmake,
+            command,
+            configs.iter().flat_map(|graph| &graph.clean_files),
+        );
         ninja.edge(
             b"CLEAN",
             Edge {
@@ -130,12 +138,13 @@ pub(crate) fn emit_clean<'a>(
         // Default aliases can run multiple clean edges that share outputs.
         ninja.binding(b"pool", b"console");
     };
-    for config in included {
-        emit(config, &mut std::iter::once(config));
+    for graph in included {
+        if let Some(config) = graph.config {
+            emit(config, &[graph]);
+        }
     }
-    let mut cross = cross.peekable();
-    if cross.peek().is_some() {
-        emit(b"all", &mut cross);
+    if !cross.is_empty() {
+        emit(b"all", cross);
     }
 }
 

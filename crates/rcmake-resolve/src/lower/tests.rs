@@ -111,6 +111,349 @@ fn expands_known_placeholders_only() {
 }
 
 #[test]
+fn windows_ninja_links_resources_and_import_libraries() -> TestResult {
+    use rcmake_host::{Host, PureHost, ReadRange, path::to_native};
+    use rcmake_model::{GeneratorKind, LinkItem, UsageField};
+
+    let mut model = fixture("Windows");
+    model.generator = Some(GeneratorKind::Ninja);
+    model.set_root_dirs("C:/Source Tree".into(), "C:/Build Tree".into());
+    for (key, value) in [
+        ("CMAKE_HOST_SYSTEM_NAME", "Windows"),
+        ("CMAKE_C_COMPILER_ID", "MSVC"),
+        ("CMAKE_C_COMPILER", "C:/Program Files/Tools/cl.exe"),
+        ("CMAKE_C_OUTPUT_EXTENSION", ".obj"),
+        (
+            "CMAKE_C_COMPILE_OBJECT",
+            "<CMAKE_C_COMPILER> <FLAGS> /Fo<OBJECT> /Fd<TARGET_COMPILE_PDB> /FS -c <SOURCE>",
+        ),
+        ("CMAKE_DEPFILE_FLAGS_C", "/showIncludes"),
+        ("CMAKE_RC_COMPILER", "C:/Program Files/SDK/rc.exe"),
+        ("CMAKE_RC_COMPILER_ARG1", "/nologo"),
+        (
+            "CMAKE_RC_COMPILE_OBJECT",
+            "<CMAKE_RC_COMPILER> <DEFINES> <INCLUDES> <FLAGS> /fo <OBJECT> <SOURCE>",
+        ),
+        ("CMAKE_RC_OUTPUT_EXTENSION", ".res"),
+        ("CMAKE_MT", "C:/Program Files/SDK/mt.exe"),
+        ("CMAKE_LINKER", "C:/Program Files/Tools/link.exe"),
+        ("CMAKE_AR", "C:/Program Files/Tools/lib.exe"),
+        (
+            "CMAKE_C_CREATE_STATIC_LIBRARY",
+            "<CMAKE_AR> /out:<TARGET> <OBJECTS>",
+        ),
+        ("CMAKE_STATIC_LIBRARY_PREFIX", ""),
+        ("CMAKE_STATIC_LIBRARY_SUFFIX", ".lib"),
+        ("CMAKE_SHARED_LIBRARY_CREATE_C_FLAGS", ""),
+        (
+            "CMAKE_C_CREATE_SHARED_LIBRARY",
+            "<CMAKE_COMMAND> -E vs_link_dll --intdir=<OBJECT_DIR> --rc=<CMAKE_RC_COMPILER> --mt=<CMAKE_MT> --manifests <MANIFESTS> -- <CMAKE_LINKER> /dll /out:<TARGET> /implib:<TARGET_IMPLIB> /pdb:<TARGET_PDB> /version:<TARGET_VERSION_MAJOR>.<TARGET_VERSION_MINOR> /stub:<TARGET_BASE> <OBJECTS> <LINK_FLAGS> <LINK_LIBRARIES>",
+        ),
+        (
+            "CMAKE_C_LINK_EXECUTABLE",
+            "<CMAKE_LINKER> /out:<TARGET> /implib:<TARGET_IMPLIB> /pdb:<TARGET_PDB> <OBJECTS> <LINK_FLAGS> <LINK_LIBRARIES>",
+        ),
+        ("CMAKE_C_LINK_DEF_FILE_FLAG", "/DEF:"),
+        ("CMAKE_C_STANDARD_LIBRARIES", "kernel32.lib user32.lib"),
+    ] {
+        var(&mut model, key, value);
+    }
+    let host = PureHost::default();
+    for file in [
+        "a.c",
+        "app.c",
+        "b.c",
+        "archive.c",
+        "icon.RC",
+        "exports file.def",
+        "extra.def",
+        "main.manifest",
+    ] {
+        let path = format!("C:/Source Tree/{file}");
+        host.seed_file(&to_native(path.as_bytes()), b"")?;
+    }
+    let mut library = raw_target("shared", TargetKind::SharedLibrary);
+    for (key, value) in [
+        ("RUNTIME_OUTPUT_DIRECTORY", "run files"),
+        ("ARCHIVE_OUTPUT_DIRECTORY", "link files"),
+        ("PDB_OUTPUT_DIRECTORY", "link symbols"),
+        ("PDB_NAME", "linked"),
+        ("COMPILE_PDB_NAME", "compiled"),
+        ("COMPILE_PDB_OUTPUT_DIRECTORY_DEBUG", "compile symbols"),
+        ("VERSION", "2.7.1"),
+        ("SOVERSION", "2"),
+    ] {
+        library.props.set(key.into(), value.into());
+    }
+    library.sources = ["a.c", "icon.RC", "exports file.def", "main.manifest"]
+        .into_iter()
+        .map(bt)
+        .collect();
+    let library = model.add_target(library)?;
+    let mut exported = raw_target("exported", TargetKind::SharedLibrary);
+    exported
+        .props
+        .set("WINDOWS_EXPORT_ALL_SYMBOLS".into(), "ON".into());
+    exported.sources = ["b.c", "exports file.def", "extra.def"]
+        .into_iter()
+        .map(bt)
+        .collect();
+    model.add_target(exported)?;
+    let mut archive = raw_target("archive", TargetKind::StaticLibrary);
+    archive.sources.push(bt("archive.c"));
+    model.add_target(archive)?;
+    let mut imported = raw_target("sdk", TargetKind::SharedLibrary);
+    imported.origin = TargetOrigin::Imported(ImportedVisibility::Global);
+    imported.props.set(
+        "IMPORTED_LOCATION_DEBUG".into(),
+        "C:/SDK/bin/sdk.dll".into(),
+    );
+    imported.props.set(
+        "IMPORTED_IMPLIB_DEBUG".into(),
+        "C:/SDK/link files/sdk.lib".into(),
+    );
+    model.add_target(imported)?;
+    let mut app = raw_target("app", TargetKind::Executable);
+    app.sources.push(bt("app.c"));
+    app.usage.link_libraries = Some(
+        ["shared", "sdk", "bare", "ready.LIB"]
+            .into_iter()
+            .map(|name| LinkItem {
+                text: bt(name),
+                lookup_dir: DirId::ROOT,
+            })
+            .collect(),
+    );
+    app.usage
+        .push(UsageField::LinkDirectories, bt("C:/Dependency Path"));
+    model.add_target(app)?;
+    model.add_install(InstallRule {
+        dir: DirId::ROOT,
+        backtrace: Default::default(),
+        kind: InstallKind::Targets {
+            targets: vec![library],
+            export: None,
+        },
+        options: InstallOptions::default(),
+    });
+    for (index, value) in [
+        "TARGETS",
+        "shared",
+        "RUNTIME",
+        "DESTINATION",
+        "bin",
+        "COMPONENT",
+        "Runtime",
+        "ARCHIVE",
+        "DESTINATION",
+        "lib",
+        "COMPONENT",
+        "Development",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        var(&mut model, &format!("_RCMAKE_INSTALL_0_ARG{index}"), value);
+    }
+    let result = crate::resolve(&model, &host, &[ConfigId("Debug".into())])?;
+    let shared = result
+        .targets
+        .iter()
+        .find(|target| target.id == library)
+        .ok_or("Missing DLL facts.")?;
+    assert_eq!(
+        shared.artifacts.file.as_ref().map(|value| value.as_slice()),
+        Some(b"C:/Build Tree/run files/shared.dll".as_slice())
+    );
+    assert_eq!(
+        shared
+            .artifacts
+            .import_file
+            .as_ref()
+            .map(|value| value.as_slice()),
+        Some(b"C:/Build Tree/link files/shared.lib".as_slice())
+    );
+    assert!(shared.artifacts.soname_file.is_none());
+    let graph = result.graphs.first().ok_or("Missing build graph.")?;
+    let compile = |name: &[u8]| {
+        graph.steps.iter().find_map(|step| match step {
+            BuildStep::Compile {
+                source,
+                object,
+                invocation,
+                ..
+            } if source.ends_with(name) => Some((object, invocation)),
+            _ => None,
+        })
+    };
+    let (_, invocation) = compile(b"/a.c").ok_or("Missing DLL compiler command.")?;
+    assert_eq!(
+        invocation.argv.first().map(|value| value.as_slice()),
+        Some(b"C:/Program Files/Tools/cl.exe".as_slice())
+    );
+    assert!(
+        invocation
+            .argv
+            .iter()
+            .any(|arg| arg == b"/Fdcompile symbols/compiled.pdb")
+    );
+    assert!(
+        invocation
+            .argv
+            .iter()
+            .any(|arg| arg == b"C:/Source Tree/a.c")
+    );
+    let (_, invocation) = compile(b"/app.c").ok_or("Missing executable compiler command.")?;
+    assert!(
+        invocation
+            .argv
+            .iter()
+            .any(|arg| arg == b"/FdCMakeFiles/app.dir/")
+    );
+    let (_, invocation) =
+        compile(b"/archive.c").ok_or("Missing static library compiler command.")?;
+    assert!(
+        invocation
+            .argv
+            .iter()
+            .any(|arg| arg == b"/FdCMakeFiles/archive.dir/archive.pdb")
+    );
+    let (resource, invocation) =
+        compile(b"/icon.RC").ok_or("Missing resource compiler command.")?;
+    assert!(resource.ends_with(b".res"));
+    assert!(
+        invocation
+            .argv
+            .starts_with(&["C:/Program Files/SDK/rc.exe".into(), "/nologo".into()])
+    );
+    assert!(
+        invocation
+            .argv
+            .windows(2)
+            .any(|pair| matches!(pair, [flag, output] if flag == b"/fo" && output == resource))
+    );
+    let link = |kind| {
+        graph.steps.iter().find_map(|step| match step {
+            BuildStep::Link {
+                inputs,
+                step,
+                invocations,
+            } if step.kind == kind => Some((inputs, invocations)),
+            _ => None,
+        })
+    };
+    let (inputs, dll) = link(LinkKind::SharedLibrary).ok_or("Missing DLL link command.")?;
+    assert!(inputs.contains(resource));
+    assert!(
+        inputs
+            .iter()
+            .any(|arg| arg == b"C:/Source Tree/exports file.def")
+    );
+    let [dll] = dll.as_slice() else {
+        return Err("Expected one DLL link command.".into());
+    };
+    for argument in [
+        "--intdir=CMakeFiles/shared.dir",
+        "--rc=C:/Program Files/SDK/rc.exe",
+        "--mt=C:/Program Files/SDK/mt.exe",
+        "C:/Source Tree/main.manifest",
+        "C:/Program Files/Tools/link.exe",
+        "/DEF:C:/Source Tree/exports file.def",
+        "/implib:C:/Build Tree/link files/shared.lib",
+        "/pdb:C:/Build Tree/link symbols/linked.pdb",
+        "/version:2.7",
+        "/stub:run files/shared",
+    ] {
+        assert!(
+            dll.argv.iter().any(|arg| arg == argument),
+            "{argument}: {:?}",
+            dll.argv
+        );
+    }
+    let (inputs, app) = link(LinkKind::Executable).ok_or("Missing executable link command.")?;
+    assert!(inputs.iter().any(|arg| arg == b"link files/shared.lib"));
+    assert!(inputs.iter().any(|arg| arg == b"C:/SDK/link files/sdk.lib"));
+    assert!(!inputs.iter().any(|arg| arg == b"C:/SDK/bin/sdk.dll"));
+    let app = app.first().ok_or("Missing linker invocation.")?;
+    assert!(
+        app.argv
+            .iter()
+            .any(|arg| arg == b"-LIBPATH:C:/Dependency Path")
+    );
+    assert!(app.argv.ends_with(&[
+        "bare.lib".into(),
+        "ready.LIB".into(),
+        "kernel32.lib".into(),
+        "user32.lib".into()
+    ]));
+    assert!(
+        !app.argv
+            .iter()
+            .any(|arg| arg.starts_with(b"-l") || arg.starts_with(b"-L/") || arg == b"/implib:")
+    );
+    let (_, archive) = link(LinkKind::StaticArchive).ok_or("Missing librarian command.")?;
+    let [archive] = archive.as_slice() else {
+        return Err("Expected one librarian command.".into());
+    };
+    assert_eq!(
+        archive.argv.first().map(|value| value.as_slice()),
+        Some(b"C:/Program Files/Tools/lib.exe".as_slice())
+    );
+    assert!(result.install.actions.iter().any(|action| action.component == "Runtime" && action.destination == "bin"
+        && matches!(&action.kind, InstallActionKind::Files {files, ..} if files.as_slice() == ["C:/Build Tree/run files/shared.dll"])));
+    assert!(result.install.actions.iter().any(|action| action.component == "Development" && action.destination == "lib"
+        && matches!(&action.kind, InstallActionKind::Files {files, ..} if files.as_slice() == ["C:/Build Tree/link files/shared.lib"])));
+    let list = host.read(
+        &to_native(b"C:/Build Tree/CMakeFiles/exported.dir/exports.def.objs"),
+        ReadRange::All { limit: 4096 },
+    )?;
+    assert_eq!(list, b"CMakeFiles/exported.dir/b.c.obj\nC:/Source Tree/exports file.def\nC:/Source Tree/extra.def");
+    assert!(graph.steps.iter().any(|step| match step {
+        BuildStep::Link {
+            step, invocations, ..
+        } if step.output == "exported.dll" => {
+            matches!(invocations.as_slice(), [generate, link]
+                if generate.argv.iter().any(|arg| arg == b"__create_def")
+                  && link.argv.iter().any(|arg| arg == b"/DEF:CMakeFiles/exported.dir/exports.def"))
+        }
+        _ => false,
+    }));
+    Ok(())
+}
+
+#[test]
+fn fortran_and_swift_compile_artifacts_omit_compiler_depfiles() -> TestResult {
+    for language in ["Fortran", "Swift"] {
+        let mut model = fixture("Linux");
+        let config = ConfigId::default();
+        var(
+            &mut model,
+            &format!("CMAKE_DEPFILE_FLAGS_{language}"),
+            "-MMD -MF <DEP_FILE>",
+        );
+        let raw = raw_target("source", TargetKind::ObjectLibrary);
+        let mut target = resolve_target(&mut model, raw, &config, &["source.f90"])?;
+        let group = target
+            .compile_groups
+            .first_mut()
+            .ok_or("Missing compile group.")?;
+        group.language = language.into();
+        let graph = lower(&model, &[target], &config)?;
+        let Some(BuildStep::Compile {
+            depfile,
+            invocation,
+            ..
+        }) = graph.steps.first()
+        else {
+            return Err("Missing compile step.".into());
+        };
+        assert!(depfile.is_none());
+        assert!(!invocation.argv.iter().any(|arg| arg == b"-MMD"));
+    }
+    Ok(())
+}
+
+#[test]
 fn executable_rules_preserve_paths_and_library_inputs() -> TestResult {
     let mut model = fixture("Linux");
     let config = ConfigId("Debug".into());
@@ -1038,6 +1381,7 @@ fn utility_events_share_one_recipe_in_event_order() -> TestResult {
     post.command_lines.push(vec!["echo".into(), "post".into()]);
     model.add_command(post)?;
     let mut main = command(CustomCommandKind::Utility(utility.id));
+    main.depends.extend([bt("assets"), bt("/project/assets")]);
     main.command_expand_lists = true;
     main.command_lines.push(
         ["$<0:program>", "echo", "a;;b;", "$<0:arg>", "", "last"]
@@ -1059,6 +1403,7 @@ fn utility_events_share_one_recipe_in_event_order() -> TestResult {
     let [BuildStep::Custom(recipe)] = graph.steps.as_slice() else {
         return Err("Expected one recipe for the utility target.".into());
     };
+    assert_eq!(recipe.depends, ["/project/assets"]);
     let [main, pre, post] = recipe.invocations.as_slice() else {
         return Err("Expected three commands after generator expression evaluation.".into());
     };

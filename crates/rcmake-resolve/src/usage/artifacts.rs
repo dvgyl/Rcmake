@@ -55,6 +55,14 @@ impl Artifact {
 }
 
 impl UsageResolver<'_> {
+    pub(crate) fn compile_framework_targets(
+        &mut self,
+        id: TargetId,
+        context: &EvalContext,
+    ) -> Result<Vec<TargetId>, ResolveError> {
+        self.compatibility_targets(id, context)
+    }
+
     /// Compute an artifact path or name part for a target and configuration.
     #[must_use]
     pub fn artifact(
@@ -170,6 +178,9 @@ impl UsageResolver<'_> {
         if apple && import && !apple_import {
             return Ok(None);
         }
+        if windows && import && target.kind == Executable && !on(target, b"ENABLE_EXPORTS") {
+            return Ok(None);
+        }
         let Some(kind_defaults) = artifact_defaults(target, import, apple, windows, visual_studio)
         else {
             return Ok(None);
@@ -270,15 +281,44 @@ impl UsageResolver<'_> {
         let framework = matches!(layout, BundleKind::Framework { .. });
         let module_bundle = matches!(layout, BundleKind::Bundle { .. });
         if (bundle && !(app || framework || module_bundle))
-            || (kind == PdbFile && !windows)
+            || (kind == PdbFile
+                && (!windows || !matches!(target.kind, Executable | SharedLibrary | ModuleLibrary)))
             || (kind == SonameFile && (windows || on(target, b"NO_SONAME")))
         {
             return Ok(None);
         }
+        if kind == PdbFile {
+            let Some(runtime) = self.output_artifact(id, File, ArtifactPart::Full, config)? else {
+                return Ok(None);
+            };
+            let base = self
+                .artifact_property(
+                    id,
+                    config,
+                    "PDB_NAME",
+                    &[format!("PDB_NAME_{config_upper}"), "PDB_NAME".into()],
+                )?
+                .filter(|value| !value.is_empty())
+                .unwrap_or(runtime.base);
+            let dir = if target.props.get(b"PDB_OUTPUT_DIRECTORY").is_some()
+                || target
+                    .props
+                    .get(format!("PDB_OUTPUT_DIRECTORY_{config_upper}").as_bytes())
+                    .is_some()
+            {
+                self.artifact_output_directory(id, config, target, "PDB", &config_upper)?
+            } else {
+                runtime.output_dir
+            };
+            let file = [runtime.prefix.as_slice(), &base, b".pdb"].concat();
+            return Ok(Some(Artifact::from_path(
+                lower::join(&dir, &file),
+                &runtime.prefix,
+                b".pdb",
+            )));
+        }
         let nested = app || framework || module_bundle;
-        let category = if kind == PdbFile {
-            "PDB"
-        } else if framework && target.kind == TargetKind::SharedLibrary {
+        let category = if framework && target.kind == TargetKind::SharedLibrary {
             "LIBRARY"
         } else {
             category
@@ -319,16 +359,10 @@ impl UsageResolver<'_> {
         } else {
             name
         };
-        let (prefix, suffix) = if framework || module_bundle || kind == PdbFile {
+        let (prefix, suffix) = if framework || module_bundle {
             (
                 BString::default(),
-                BString::from(if kind == PdbFile {
-                    ".pdb"
-                } else if framework && import {
-                    ".tbd"
-                } else {
-                    ""
-                }),
+                BString::from(if framework && import { ".tbd" } else { "" }),
             )
         } else {
             (prefix, suffix)
@@ -401,13 +435,21 @@ impl UsageResolver<'_> {
         category: &str,
         config_upper: &BString,
     ) -> Result<BString, ResolveError> {
-        let binary = Lexical::new(&self.model.dir(target.dir).binary_dir);
+        let binary = lower::artifacts::model_path(&self.model.dir(target.dir).binary_dir);
         let config_dir = format!("{category}_OUTPUT_DIRECTORY_{config_upper}");
         let general_dir = format!("{category}_OUTPUT_DIRECTORY");
         let configured = !config.0.is_empty() && target.props.get(config_dir.as_bytes()).is_some();
         let general = target.props.get(general_dir.as_bytes());
         let mut dir = self
             .artifact_property(id, config, "OUTPUT_DIRECTORY", &[config_dir, general_dir])?
+            .or_else(|| {
+                matches!(category, "LIBRARY" | "ARCHIVE" | "RUNTIME")
+                    .then(|| {
+                        lower::artifacts::legacy_library_output_directory(self.model, target)
+                            .cloned()
+                    })
+                    .flatten()
+            })
             .map_or_else(
                 || self.model.dir(target.dir).binary_dir.clone(),
                 |path| binary.append(&path),
@@ -423,7 +465,7 @@ impl UsageResolver<'_> {
         {
             dir = Lexical::new(&dir).append(&config.0);
         }
-        Ok(Lexical::new(&dir).normalize())
+        Ok(lower::artifacts::model_path(&dir).normalize())
     }
 
     pub(crate) fn ide_artifacts(
@@ -699,7 +741,7 @@ fn artifact_defaults(
         (SharedLibrary, false) if windows => ("RUNTIME", "SHARED_LIBRARY", "", ".dll"),
         (SharedLibrary, false) if apple => ("LIBRARY", "SHARED_LIBRARY", "lib", ".dylib"),
         (SharedLibrary, false) => ("LIBRARY", "SHARED_LIBRARY", "lib", ".so"),
-        (ModuleLibrary, false) if visual_studio => ("RUNTIME", "SHARED_MODULE", "", ".dll"),
+        (ModuleLibrary, false) if windows => ("LIBRARY", "SHARED_MODULE", "", ".dll"),
         (ModuleLibrary, false) => (
             "LIBRARY",
             "SHARED_MODULE",

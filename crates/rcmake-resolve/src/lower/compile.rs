@@ -7,12 +7,12 @@ use rcmake_base::{BString, list, path_lex::Lexical, shell::quote, truth};
 use rcmake_genex::{ConfigId, EvalContext, evaluate, parse};
 use rcmake_model::{DirId, GeneratorKind, ProjectModel, Target};
 
-use super::artifacts::is_darwin;
+use super::artifacts::{compile_pdb, is_darwin};
 use super::launcher;
 use super::pch::PchFlags;
 use super::policy_flags::Flags;
-use super::shell::{command, join_words, rule_invocations};
-use super::standard::standard_flag;
+use super::shell::{command, join_words, raw_flags, rule_invocations};
+use super::standard::{checked_standard_flag, standard_flag};
 use super::{
     definition, expand_rule, join, object_path, target_property, without_trailing_slashes,
 };
@@ -30,7 +30,9 @@ pub(crate) fn language_flags(
     let configured = [base.as_slice(), b"_", &config.0.to_ascii_uppercase()].concat();
     [base.as_slice(), configured.as_slice()]
         .into_iter()
-        .filter_map(|key| definition(model, target.dir, key).cloned())
+        .filter_map(|key| {
+            definition(model, target.dir, key).map(|value| raw_flags(model, target.dir, value))
+        })
         .collect()
 }
 
@@ -147,7 +149,12 @@ fn compile_flags(
 ) -> Result<Vec<BString>, ResolveError> {
     let language = group.language.as_slice();
     let mut flags = language_flags(model, target, config, language);
-    flags.extend(standard_flag(model, target, language, required_standard));
+    let standard = if language == b"CUDA" {
+        checked_standard_flag(model, target, language, required_standard)?
+    } else {
+        standard_flag(model, target, language, required_standard)
+    };
+    flags.extend(standard);
     flags.extend(apple_flags(model, target, config, language));
     let policy = Flags::new(model, target, language);
     flags.extend(policy.compile(policy.ipo(config), position_independent));
@@ -199,6 +206,7 @@ fn compile_flags(
     {
         flags.push("-fvisibility-inlines-hidden".into());
     }
+    policy.append_color(&mut flags);
     flags.extend(
         group
             .flags
@@ -488,16 +496,26 @@ pub(super) fn compile(
         flags.push(super::modules::module_map_flag(model, target, path));
     }
     let template_text = template.map_or(fallback.as_slice(), |v| v.as_slice());
-    let dep_flags = definition(
-        model,
-        target.dir,
-        &[b"CMAKE_DEPFILE_FLAGS_", language].concat(),
-    )
-    .map(|v| v.as_slice())
-    .or_else(|| {
-        (template.is_none() && matches!(language, b"C" | b"CXX" | b"OBJC" | b"OBJCXX"))
-            .then_some(b"-MD -MT <DEP_TARGET> -MF <DEP_FILE>")
-    });
+    let compile_pdb = if has_placeholder(template_text, b"<TARGET_COMPILE_PDB>") {
+        compile_pdb(model, target, config, usage)?
+    } else {
+        BString::default()
+    };
+    let compiler_depfile = !matches!(language, b"Fortran" | b"Swift");
+    let dep_flags = if compiler_depfile {
+        definition(
+            model,
+            target.dir,
+            &[b"CMAKE_DEPFILE_FLAGS_", language].concat(),
+        )
+        .map(|v| v.as_slice())
+        .or_else(|| {
+            (template.is_none() && matches!(language, b"C" | b"CXX" | b"OBJC" | b"OBJCXX"))
+                .then_some(b"-MD -MT <DEP_TARGET> -MF <DEP_FILE>")
+        })
+    } else {
+        None
+    };
     let lookup_paths = |key: &[u8]| match key {
         b"SOURCE" => Some(quote(&source)),
         b"TARGET_NAME" => Some(quote(&target.name)),
@@ -524,7 +542,8 @@ pub(super) fn compile(
         } else {
             Lexical::new(&object).parent()
         })),
-        b"TARGET_PDB" | b"TARGET_COMPILE_PDB" => Some(
+        b"TARGET_COMPILE_PDB" => Some(quote(&compile_pdb)),
+        b"TARGET_PDB" => Some(
             artifacts
                 .pdb_file
                 .as_ref()
@@ -587,8 +606,9 @@ pub(super) fn compile(
         }
     };
     let invocation = launch.wrap(model, target, invocation);
-    let writes_depfile = dep_flags.is_some_and(|f| has_placeholder(f, b"<DEP_FILE>"))
-        || has_placeholder(template_text, b"<DEP_FILE>");
+    let writes_depfile = compiler_depfile
+        && (dep_flags.is_some_and(|f| has_placeholder(f, b"<DEP_FILE>"))
+            || has_placeholder(template_text, b"<DEP_FILE>"));
     Ok(BuildStep::Compile {
         object,
         source,

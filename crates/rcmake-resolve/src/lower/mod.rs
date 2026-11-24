@@ -1,7 +1,7 @@
 //! Lowering of resolved targets into a build graph and install manifest.
 
 pub(crate) mod apple;
-mod artifacts;
+pub(crate) mod artifacts;
 mod compile;
 mod custom;
 pub(crate) mod framework;
@@ -42,6 +42,7 @@ pub(crate) use link::{ide_rpaths, install_name_dir, install_name_prefix};
 pub(crate) use modules::scan_responses;
 pub use modules::{bmi_script_path, lower_modules};
 pub(crate) use policy_flags::warn_about_wrappers;
+pub use shell::{rule_command_chain, simple_args as rule_arguments};
 pub(crate) use standard::required_standard;
 
 pub(crate) fn definition<'a>(
@@ -73,6 +74,8 @@ fn target_property<'a>(
 pub(crate) fn join(base: &[u8], path: &[u8]) -> BString {
     if path.is_empty() {
         base.into()
+    } else if Lexical::windows(base).absolute() || Lexical::windows(path).absolute() {
+        Lexical::windows(base).append(path)
     } else {
         Lexical::new(base).append(path)
     }

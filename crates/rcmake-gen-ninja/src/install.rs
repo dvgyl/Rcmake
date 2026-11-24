@@ -1,6 +1,4 @@
-use rcmake_base::path_lex::Lexical;
-
-use super::{BString, Edge, Graph, Ninja, Programs, qualified, shell_word};
+use super::{BString, Edge, Graph, Ninja, Programs, clean::clean_command, qualified};
 
 pub(super) fn emit_utilities(
     ninja: &mut Ninja,
@@ -10,13 +8,14 @@ pub(super) fn emit_utilities(
     rebuild: &[u8],
 ) {
     emit_directory_utilities(ninja, graph, programs, rebuild);
-    let mut clean = b"ninja".to_vec();
+    let mut clean = programs.ninja.clone();
     if entry != b"build.ninja" {
         clean.extend_from_slice(b" -f ");
-        shell_word(&graph.node(entry), &mut clean);
+        graph.commands.word(&graph.node(entry), &mut clean);
     }
     let mut help = clean.clone();
     clean.extend_from_slice(b" -t clean");
+    let clean = clean_command(graph, &programs.cmake, clean, &graph.clean_files);
     help.extend_from_slice(b" -t targets");
     for (name, command, inputs, pool, rule) in [
         ("clean", clean, vec![], b"".as_slice(), b"CLEAN".as_slice()),
@@ -31,6 +30,7 @@ pub(super) fn emit_utilities(
             Utility {
                 name,
                 command: &command,
+                cwd: None,
                 inputs: &inputs,
                 pool,
                 rule,
@@ -55,16 +55,17 @@ pub(super) fn emit_utilities(
             let mut command = programs.cpack.clone();
             if let Some(config) = graph.config {
                 command.extend_from_slice(b" -C ");
-                shell_word(config, &mut command);
+                graph.commands.word(config, &mut command);
             }
             command.extend_from_slice(b" --config ");
-            shell_word(config_file, &mut command);
+            graph.commands.word(config_file, &mut command);
             emit_utility(
                 ninja,
                 graph,
                 Utility {
                     name,
                     command: &command,
+                    cwd: None,
                     inputs,
                     pool: b"console",
                     rule: b"CUSTOM_COMMAND",
@@ -81,13 +82,14 @@ fn emit_directory_utilities(
     rebuild: &[u8],
 ) {
     let root_path = rcmake_host::path::from_native(graph.build_dir);
-    let root = Lexical::new(&root_path);
-    let dirs = std::iter::once(BString::default()).chain(
-        programs
-            .directories
-            .iter()
-            .filter_map(|dir| Lexical::new(dir).relative(root)),
-    );
+    let root = graph.commands.path(&root_path);
+    let dirs =
+        std::iter::once(BString::default()).chain(programs.directories.iter().filter_map(|dir| {
+            graph
+                .commands
+                .beneath(&graph.commands.path(dir), &root)
+                .map(BString::from)
+        }));
     let mut parallel = Vec::new();
     for directory in dirs {
         let prefix = if directory.is_empty() {
@@ -105,25 +107,26 @@ fn emit_directory_utilities(
                 format!("{prefix}/{name}")
             }
         };
-        let command = |program: &[u8]| {
-            let mut result = Vec::new();
-            if !directory.is_empty() {
-                result.extend_from_slice(b"cd ");
-                shell_word(&directory, &mut result);
-                result.extend_from_slice(b" && ");
+        let cwd = (!directory.is_empty()).then(|| {
+            if graph.prefix.is_empty() {
+                directory.clone()
+            } else {
+                graph
+                    .commands
+                    .path(&[root.as_slice(), b"/", &directory].concat())
             }
-            result.extend_from_slice(program);
-            result
-        };
-        let mut test = command(&programs.ctest);
+        });
+        let mut test = programs.ctest.clone();
         test.extend_from_slice(b" --force-new-ctest-process");
         if let Some(config) = graph.config {
             test.extend_from_slice(b" -C ");
-            shell_word(config, &mut test);
+            graph.commands.word(config, &mut test);
         }
-        let mut edit_cache = command(&programs.cmake);
+        let mut edit_cache = programs.cmake.clone();
         edit_cache.extend_from_slice(b" -E echo ");
-        shell_word(b"No interactive CMake dialog available.", &mut edit_cache);
+        graph
+            .commands
+            .word(b"No interactive CMake dialog available.", &mut edit_cache);
 
         for (utility, cmd, enabled) in [
             ("test", test.as_slice(), programs.testing),
@@ -137,6 +140,10 @@ fn emit_directory_utilities(
                     Utility {
                         name: &name(utility),
                         command: cmd,
+                        cwd: cwd
+                            .as_ref()
+                            .map(|value| value.as_slice())
+                            .filter(|_| utility != "rebuild_cache"),
                         inputs: &[],
                         pool: b"console",
                         rule: b"CUSTOM_COMMAND",
@@ -146,17 +153,25 @@ fn emit_directory_utilities(
         }
         if !programs.install
             || (!directory.is_empty()
-                && !programs
-                    .install_directories
-                    .iter()
-                    .any(|dir| Lexical::new(dir).relative(root).as_ref() == Some(&directory)))
+                && !programs.install_directories.iter().any(|dir| {
+                    graph.commands.beneath(&graph.commands.path(dir), &root)
+                        == Some(directory.as_slice())
+                }))
         {
             continue;
         }
-        let mut install = command(&programs.cmake);
+        let mut install = programs.cmake.clone();
         if let Some(config) = graph.config {
-            install.extend_from_slice(b" -DCMAKE_INSTALL_CONFIG_NAME=");
-            shell_word(config, &mut install);
+            install.push(b' ');
+            if graph.commands.windows() {
+                graph.commands.word(
+                    &[b"-DCMAKE_INSTALL_CONFIG_NAME=", config].concat(),
+                    &mut install,
+                );
+            } else {
+                install.extend_from_slice(b"-DCMAKE_INSTALL_CONFIG_NAME=");
+                graph.commands.word(config, &mut install);
+            }
         }
         let all = BString::from(name("all"));
         for (utility, flags, enabled) in [
@@ -180,6 +195,7 @@ fn emit_directory_utilities(
                 Utility {
                     name: &name(utility),
                     command: &cmd,
+                    cwd: cwd.as_ref().map(|value| value.as_slice()),
                     inputs: std::slice::from_ref(&all),
                     pool: if utility == "install/local" && programs.parallel_install {
                         b""
@@ -204,6 +220,7 @@ fn emit_directory_utilities(
 struct Utility<'a> {
     name: &'a str,
     command: &'a [u8],
+    cwd: Option<&'a [u8]>,
     inputs: &'a [BString],
     pool: &'a [u8],
     rule: &'a [u8],
@@ -231,6 +248,11 @@ fn emit_utility(ninja: &mut Ninja, graph: &Graph<'_>, utility: Utility<'_>) {
     if !utility.command.is_empty() {
         if matches!(utility.name, "clean" | "help") {
             ninja.binding(b"COMMAND", utility.command);
+        } else if let Some(directory) = utility.cwd {
+            ninja.binding(
+                b"COMMAND",
+                &graph.commands.in_directory(utility.command, directory),
+            );
         } else {
             ninja.binding(b"COMMAND", &graph.in_build_dir(utility.command));
         }

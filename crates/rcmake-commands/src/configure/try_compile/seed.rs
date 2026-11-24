@@ -68,6 +68,7 @@ pub(super) fn toolchain_variable(name: &[u8]) -> bool {
         b"CMAKE_SYCL_",
         b"CMAKE_RC_",
         b"CMAKE_DEPFILE_FLAGS_",
+        b"CMAKE_MSVC_",
         b"CMAKE_CXX_",
         b"CMAKE_OBJC_",
         b"CMAKE_OBJCXX_",
@@ -85,11 +86,15 @@ pub(super) fn toolchain_variable(name: &[u8]) -> bool {
             name,
             b"CMAKE_SYSTEM"
                 | b"CMAKE_AR"
+                | b"CMAKE_LIBRARY_PATH_FLAG"
                 | b"CMAKE_LINKER"
+                | b"CMAKE_LINK_LIBRARY_FLAG"
+                | b"CMAKE_LINK_LIBRARY_SUFFIX"
                 | b"CMAKE_MT"
                 | b"CMAKE_LINKER_TYPE"
                 | b"CMAKE_RANLIB"
                 | b"CMAKE_MAKE_PROGRAM"
+                | b"CMAKE_VS_USE_DEBUG_LIBRARIES"
                 | b"_CMAKE_OSX_SYSROOT_PATH"
                 | b"_CMAKE_APPLE_ARCHS_DEFAULT"
         )

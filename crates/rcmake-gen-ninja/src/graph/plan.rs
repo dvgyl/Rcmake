@@ -1,8 +1,9 @@
 use rcmake_base::BString;
 use rcmake_gen_common::export::ModuleExportJob;
-use rcmake_resolve::{BuildStep, Invocation, progress};
+use rcmake_resolve::{BuildStep, progress};
 
-use super::{Graph, StepNodes, is_library_symlink, shell_word};
+use super::{Graph, StepNodes, is_library_symlink};
+use crate::response::{COMPILE_MSVC, Response};
 
 pub(super) struct EdgePlan {
     pub(super) rule: &'static [u8],
@@ -22,6 +23,17 @@ impl EdgePlan {
             implicit_outputs: nodes.byproducts.clone(),
             dyndep: None,
             bindings: Vec::new(),
+        }
+    }
+
+    fn bind_command(&mut self, command: Vec<u8>, response: Option<Response>) {
+        if let Some(response) = response {
+            self.rule = response.rule;
+            self.bind(b"COMMAND", response.command);
+            self.bind(b"RSP_FILE", response.file);
+            self.bind(b"RSP_ARGS", response.contents);
+        } else {
+            self.bind(b"COMMAND", command);
         }
     }
 
@@ -48,11 +60,19 @@ impl<'a> Graph<'a> {
                 modmap,
                 dyndep,
             } => {
-                let (rule, command) = crate::instrumented::compile(
-                    invocation,
-                    dyndep.is_some() || modmap.is_some(),
-                    depfile.is_some(),
-                );
+                let scan = self.resource_dependency_scan(object, source, invocation);
+                let msvc = scan.is_some() || self.msvc_deps(object, invocation);
+                let scanned = dyndep.is_some() || modmap.is_some();
+                let (rule, command) = if msvc {
+                    (COMPILE_MSVC, None)
+                } else if self.commands.windows() {
+                    (
+                        crate::instrumented::ordinary_rule(scanned, depfile.is_some()),
+                        None,
+                    )
+                } else {
+                    crate::instrumented::compile(invocation, scanned, depfile.is_some())
+                };
                 let mut plan = EdgePlan::new(rule, vec![self.node(source)], nodes);
                 plan.implicit_inputs
                     .extend(modmap.iter().map(|map| self.node(map)));
@@ -63,11 +83,18 @@ impl<'a> Graph<'a> {
                         .flatten()
                         .map(|input| self.node(input)),
                 );
-                plan.bind(
-                    b"COMMAND",
-                    command
-                        .unwrap_or_else(|| command_line(std::slice::from_ref(invocation), false)),
+                let command = command.map_or_else(
+                    || {
+                        if let Some(scan) = scan {
+                            self.command_line(&[scan, invocation.clone()], false)
+                        } else {
+                            self.command_line(std::slice::from_ref(invocation), false)
+                        }
+                    },
+                    |command| self.in_build_dir(&command).into(),
                 );
+                let response = self.compile_response(rule, object, invocation, &command);
+                plan.bind_command(command, response);
                 if let Some(output) = nodes.outputs.first() {
                     plan.bind(
                         b"DESC",
@@ -80,7 +107,7 @@ impl<'a> Graph<'a> {
                 if let Some(pool) = self.pools.get(object) {
                     plan.bind(b"pool", pool.clone());
                 }
-                if let Some(depfile) = depfile {
+                if let Some(depfile) = depfile.as_ref().filter(|_| !msvc) {
                     plan.bind(b"DEP_FILE", self.node(depfile));
                 }
                 if let Some(map) = modmap {
@@ -100,7 +127,17 @@ impl<'a> Graph<'a> {
                 depfile,
                 ..
             } => {
-                let response = self.scan_responses.get(ddi.as_slice()).copied();
+                let response = self
+                    .scan_responses
+                    .get(ddi.as_slice())
+                    .and_then(|response| {
+                        if self.commands.windows() {
+                            let argv = rcmake_resolve::lower::rule_arguments(&response.arguments)?;
+                            Some((response, self.commands.argv(&argv).into()))
+                        } else {
+                            Some((response, response.arguments.clone()))
+                        }
+                    });
                 let rule: &[u8] = match (depfile.is_some(), response.is_some()) {
                     (true, true) => b"CXX_SCAN_RSP",
                     (true, false) => b"CXX_SCAN",
@@ -108,15 +145,17 @@ impl<'a> Graph<'a> {
                     (false, false) => b"CXX_SCAN_NO_DEPFILE",
                 };
                 let mut plan = EdgePlan::new(rule, vec![self.node(source)], nodes);
-                let invocation = response.map_or(invocation, |response| &response.invocation);
+                let invocation = response
+                    .as_ref()
+                    .map_or(invocation, |(response, _)| &response.invocation);
                 plan.bind(
                     b"COMMAND",
-                    command_line(std::slice::from_ref(invocation), false),
+                    self.command_line(std::slice::from_ref(invocation), false),
                 );
-                if let Some(response) = response {
+                if let Some((_, arguments)) = response {
                     let rsp = [self.node(ddi).as_slice(), b".rsp"].concat();
                     plan.bind(b"RSP_FILE", rsp);
-                    plan.bind(b"RSP_ARGS", response.arguments.clone());
+                    plan.bind(b"RSP_ARGS", arguments);
                 }
                 if let Some(depfile) = depfile {
                     plan.bind(b"DEP_FILE", self.node(depfile));
@@ -132,7 +171,12 @@ impl<'a> Graph<'a> {
                 ..
             } => {
                 let inputs = ddis.iter().map(|ddi| self.node(ddi)).collect();
-                let mut plan = EdgePlan::new(b"CXX_DYNDEP", inputs, nodes);
+                let rule: &[u8] = if self.commands.windows() {
+                    b"CXX_DYNDEP_WINDOWS"
+                } else {
+                    b"CXX_DYNDEP"
+                };
+                let mut plan = EdgePlan::new(rule, inputs, nodes);
                 plan.implicit_outputs.extend(
                     depend_info
                         .bmi_installation
@@ -140,26 +184,58 @@ impl<'a> Graph<'a> {
                         .filter(|install| !install.script_location.is_empty())
                         .map(|install| self.node(&install.script_location)),
                 );
-                let tdi = self.node(tdi);
-                let mut tdi_arg = Vec::new();
-                shell_word(&tdi, &mut tdi_arg);
-                plan.implicit_inputs.push(tdi);
+                let tdi_node = self.node(tdi);
+                plan.implicit_inputs.push(tdi_node.clone());
                 plan.implicit_inputs
                     .extend(implicit_inputs.iter().map(|input| self.node(input)));
-                plan.bind(b"CMAKE_COMMAND", cmake);
-                plan.bind(b"in_tdi", tdi_arg);
-                plan.bind(b"MODMAP_FLAG", modmap_flag);
+                let mut command = cmake.to_vec();
+                if self.commands.windows() {
+                    command.extend_from_slice(b" -E cmake_ninja_dyndep ");
+                    self.commands
+                        .word(&[b"--tdi=", tdi.as_slice()].concat(), &mut command);
+                    command.extend_from_slice(b" --lang=CXX ");
+                    command.extend_from_slice(modmap_flag);
+                    command.push(b' ');
+                    self.commands
+                        .word(&[b"--dd=", dd.as_slice()].concat(), &mut command);
+                    command.push(b' ');
+                    self.commands
+                        .word(&[b"@", dd.as_slice(), b".rsp"].concat(), &mut command);
+                } else {
+                    let mut tdi_arg = Vec::new();
+                    self.commands.word(&tdi_node, &mut tdi_arg);
+                    plan.bind(b"CMAKE_COMMAND", cmake);
+                    plan.bind(b"in_tdi", tdi_arg);
+                    plan.bind(b"MODMAP_FLAG", modmap_flag);
+                }
                 let mut export_commands = Vec::new();
                 for export in exports.iter().filter(|export| export.dyndep == *dd) {
-                    let script = self.node(&export.script);
+                    let script_node = self.node(&export.script);
                     plan.implicit_outputs.push(self.node(&export.output));
                     export_commands.extend_from_slice(b" && ");
                     export_commands.extend_from_slice(cmake);
                     export_commands.extend_from_slice(b" -P ");
-                    shell_word(&script, &mut export_commands);
-                    plan.implicit_inputs.push(script);
+                    self.commands.word(
+                        if self.commands.windows() {
+                            &export.script
+                        } else {
+                            &script_node
+                        },
+                        &mut export_commands,
+                    );
+                    plan.implicit_inputs.push(script_node);
                 }
-                if !export_commands.is_empty() {
+                if self.commands.windows() {
+                    command.extend_from_slice(&export_commands);
+                    let command = if !self.prefix.is_empty() {
+                        self.in_build_dir(&command).into()
+                    } else if export_commands.is_empty() {
+                        command
+                    } else {
+                        self.commands.cmd(&command)
+                    };
+                    plan.bind(b"COMMAND", command);
+                } else if !export_commands.is_empty() {
                     plan.bind(b"MODULE_EXPORT_COMMANDS", export_commands);
                 }
                 plan
@@ -169,9 +245,11 @@ impl<'a> Graph<'a> {
                 step,
                 invocations,
             } => {
-                let inputs = inputs.iter().map(|input| self.node(input)).collect();
-                let mut plan = EdgePlan::new(step.kind.ninja_rule(), inputs, nodes);
-                plan.bind(b"COMMAND", command_line(invocations, false));
+                let path_inputs = inputs.iter().map(|input| self.node(input)).collect();
+                let mut plan = EdgePlan::new(step.kind.ninja_rule(), path_inputs, nodes);
+                let command = self.command_line(invocations, false);
+                let response = self.link_response(step, inputs, invocations, &command);
+                plan.bind_command(command, response);
                 if let Some(pool) = self.pools.get(&step.output) {
                     plan.bind(b"pool", pool.clone());
                 }
@@ -195,7 +273,23 @@ impl<'a> Graph<'a> {
                     b"CUSTOM_COMMAND"
                 };
                 let mut plan = EdgePlan::new(rule, inputs, nodes);
-                plan.bind(b"COMMAND", command_line(&custom.invocations, true));
+                let script = nodes
+                    .outputs
+                    .first()
+                    .and_then(|output| self.custom_scripts.get(output));
+                let command = script.map_or_else(
+                    || self.command_line(&custom.invocations, true),
+                    |script| {
+                        let mut argument = b"\"".to_vec();
+                        argument.extend_from_slice(script);
+                        argument.push(b'"');
+                        self.commands.cmd(&argument)
+                    },
+                );
+                plan.bind(b"COMMAND", command);
+                if let Some(script) = script {
+                    plan.implicit_inputs.push(script.clone());
+                }
                 if let Some(depfile) = &custom.depfile {
                     plan.bind(b"depfile", self.node(depfile));
                 }
@@ -223,57 +317,4 @@ impl<'a> Graph<'a> {
             }
         }
     }
-}
-
-fn command_line(invocations: &[Invocation], custom: bool) -> Vec<u8> {
-    let mut result = Vec::new();
-    for invocation in invocations {
-        if !result.is_empty() {
-            result.extend_from_slice(b" && ");
-        }
-        let group = invocations.len() > 1 || invocation.working_dir.is_some();
-        if group {
-            result.push(b'(');
-        }
-        if let Some(directory) = &invocation.working_dir {
-            result.extend_from_slice(b"cd -- ");
-            shell_word(directory, &mut result);
-            result.extend_from_slice(b" && ");
-        }
-        if !invocation.shell.is_empty() && (!custom || invocation.argv.is_empty()) {
-            result.extend_from_slice(&invocation.shell);
-        } else if let Some((first, rest)) = invocation.argv.split_first() {
-            shell_word(first, &mut result);
-            for arg in rest {
-                result.push(b' ');
-                if custom
-                    && matches!(
-                        arg.as_slice(),
-                        b"<" | b">"
-                            | b"<<"
-                            | b">>"
-                            | b"2>"
-                            | b"2>>"
-                            | b"2>&1"
-                            | b"|"
-                            | b"||"
-                            | b"&&"
-                    )
-                {
-                    result.extend_from_slice(arg);
-                } else {
-                    shell_word(arg, &mut result);
-                }
-            }
-        } else {
-            result.push(b':');
-        }
-        if group {
-            result.push(b')');
-        }
-    }
-    if result.is_empty() {
-        result.push(b':');
-    }
-    result
 }

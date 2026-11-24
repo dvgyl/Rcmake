@@ -40,15 +40,24 @@ impl Ninja {
 
     pub(crate) fn include(&mut self, path: &[u8]) {
         self.0.extend_from_slice(b"include ");
-        self.escape(path, true);
+        self.path(path);
         self.0.push(b'\n');
     }
 
     pub(crate) fn binding(&mut self, key: &[u8], value: &[u8]) {
         self.0.extend_from_slice(b"  ");
+        self.global_binding(key, value);
+    }
+
+    pub(crate) fn global_binding(&mut self, key: &[u8], value: &[u8]) {
         self.0.extend_from_slice(key);
         self.0.extend_from_slice(b" = ");
-        self.escape(value, false);
+        for (index, &byte) in value.iter().enumerate() {
+            if matches!(byte, b'$' | b'\n') || byte == b' ' && index == 0 {
+                self.0.push(b'$');
+            }
+            self.0.push(byte);
+        }
         self.0.push(b'\n');
     }
 
@@ -58,15 +67,15 @@ impl Ninja {
         self.0.extend_from_slice(separator);
         for path in std::iter::once(first).chain(paths) {
             self.0.push(b' ');
-            self.escape(path, true);
+            self.path(path);
         }
     }
 
-    fn escape(&mut self, value: &[u8], path: bool) {
+    fn path(&mut self, value: &[u8]) {
         for &byte in value {
             match byte {
                 b'$' | b' ' | b':' | b'\n' => self.0.extend_from_slice(&[b'$', byte]),
-                b'|' if path => self.0.extend_from_slice(b"${ninja_pipe}"),
+                b'|' => self.0.extend_from_slice(b"${ninja_pipe}"),
                 _ => self.0.push(byte),
             }
         }

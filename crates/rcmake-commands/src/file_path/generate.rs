@@ -1,4 +1,5 @@
 use rcmake_base::BString;
+use rcmake_diag::{PolicyId, PolicyStatus};
 use rcmake_eval::args::{KeywordParser, Slot};
 use rcmake_eval::{Cx, Flow};
 
@@ -102,8 +103,17 @@ pub(super) fn run(cx: &mut Cx<'_>, args: &[&[u8]]) -> Result {
     }
     record.extend(permissions.iter().map(|value| value.as_slice()));
     let request = crate::install::record_request(cx, "_RCMAKE_FILE_GENERATE", &record);
+    let policy = match cx.policy(PolicyId::new(70)) {
+        PolicyStatus::New => "New",
+        PolicyStatus::Old => "Old",
+        PolicyStatus::Warn => "Warn",
+    };
     let backtrace = cx.backtrace();
     let props = &mut cx.global().props;
+    props.set(
+        format!("_RCMAKE_FILE_GENERATE_{request}_CMP0070").into(),
+        policy.into(),
+    );
     for (index, frame) in backtrace.frames().enumerate() {
         let key = format!("_RCMAKE_FILE_GENERATE_{request}_FRAME_{index}");
         props.set(

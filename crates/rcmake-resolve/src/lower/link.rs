@@ -11,7 +11,7 @@ use rcmake_genex::{
 };
 use rcmake_model::{DirId, ProjectModel, Target, TargetId};
 
-use super::artifacts::{build_relative, is_darwin};
+use super::artifacts::{build_relative, is_darwin, is_msvc};
 use super::compile::{apple_flags, language_flags};
 use super::install_rpath::MachORpathEdit;
 use super::launcher;
@@ -19,12 +19,15 @@ use super::policy_flags::Flags;
 use super::shell::{command as shell_command, direct, join_words, rule_invocations, simple_args};
 use super::{definition, join, target_property};
 use crate::{
-    ArtifactSet, BuildStep, Invocation, LinkFragmentRole, LinkKind, LinkStep, ResolveError,
-    ResolvedTarget, usage::UsageResolver,
+    ArtifactSet, BuildStep, LinkFragmentRole, LinkKind, LinkStep, ResolveError, ResolvedTarget,
+    usage::UsageResolver,
 };
 
 mod driver;
-use driver::LinkerDriver;
+use driver::{
+    LinkerDriver, archive_commands, deduplicate_darwin_flags, definition_file, library_file,
+    shared_library, without_empty_output_flags,
+};
 
 #[expect(
     clippy::too_many_arguments,
@@ -37,6 +40,7 @@ pub(super) fn link(
     artifacts: &ArtifactSet,
     mut step: LinkStep,
     objects: Vec<BString>,
+    sources: Option<&IndexSet<BString>>,
     position_independent: Option<bool>,
     usage: &mut UsageResolver<'_>,
 ) -> Result<BuildStep, ResolveError> {
@@ -53,10 +57,11 @@ pub(super) fn link(
         if policy_new(181) {
             wrapper.flag_string(&flags)
         } else {
-            Ok(flags)
+            Ok(wrapper.driver_flags(&flags))
         }
     };
     let darwin = is_darwin(model, target.dir);
+    let msvc = is_msvc(model, target.dir, language);
     let kind = step.kind;
     let policy = Flags::new(model, target, language);
     let ipo = policy.ipo(config);
@@ -137,12 +142,17 @@ pub(super) fn link(
         }
     }
     let raw_flags = kind.target_flags_property();
-    flags.extend(target.props.get(raw_flags).cloned());
+    flags.extend(
+        target
+            .props
+            .get(raw_flags)
+            .map(|flags| wrapper.driver_flags(flags)),
+    );
     flags.extend(
         target
             .props
             .get(&[raw_flags, b"_", &config.0.to_ascii_uppercase()].concat())
-            .cloned(),
+            .map(|flags| wrapper.driver_flags(flags)),
     );
     for fragment in step
         .fragments
@@ -190,9 +200,38 @@ pub(super) fn link(
     if darwin {
         deduplicate_darwin_flags(&mut flags);
     }
-    let flags = join_words(flags);
-
     let mut inputs = objects.clone();
+    let mut before_link = Vec::new();
+    if kind != LinkKind::StaticArchive && super::artifacts::is_dll_platform(model, target.dir) {
+        let definitions =
+            definition_file(model, target, config, usage, sources, &objects, language)?;
+        inputs.extend(definitions.inputs);
+        flags.extend(definitions.flag);
+        before_link.extend(definitions.invocation);
+    }
+    let flags = join_words(flags);
+    let source_paths = || {
+        sources.map_or_else(
+            || {
+                target
+                    .sources
+                    .iter()
+                    .map(|source| join(&model.dir(target.dir).source_dir, &source.value))
+                    .collect()
+            },
+            |sources| sources.iter().cloned().collect::<Vec<_>>(),
+        )
+    };
+    let manifests = source_paths()
+        .into_iter()
+        .filter(|path| {
+            path.last_chunk::<9>()
+                .is_some_and(|suffix| suffix.eq_ignore_ascii_case(b".manifest"))
+        })
+        .map(|path| build_relative(model, &path))
+        .collect::<Vec<_>>();
+    inputs.extend(manifests.iter().cloned());
+    let manifests = join_words(manifests.iter().map(|path| quote(path)));
     let libraries = link_libraries(model, target, config, &step, darwin, &mut inputs, &wrapper)?;
     if kind != LinkKind::StaticArchive
         && let Some(id) = model.find_target(target.dir, &target.name)
@@ -243,8 +282,14 @@ pub(super) fn link(
     };
     let shared_flags_key = [b"CMAKE_SHARED_LIBRARY_", language, b"_FLAGS"].concat();
     let output = quote(&step.output);
+    let output_ext = Lexical::new(&step.output).stem_extension(true).1;
+    let output_base = quote(step.output.strip_suffix(output_ext).unwrap_or(&step.output));
+    let object_dir = super::object_dir(model, target, config);
     let lookup = |key: &[u8]| match key {
         b"TARGET" => Some(output.clone()),
+        b"TARGET_BASE" => Some(output_base.clone()),
+        b"OBJECT_DIR" | b"TARGET_SUPPORT_DIR" => Some(quote(&object_dir)),
+        b"MANIFESTS" => Some(manifests.clone()),
         b"TARGET_SONAME" => Some(soname.map_or_else(BString::default, quote)),
         b"SONAME_FLAG" => Some(soname_flag.clone()),
         b"TARGET_INSTALLNAME_DIR" => Some(if install_name_dir.is_empty() {
@@ -284,7 +329,8 @@ pub(super) fn link(
     };
     let expand = |template: &[u8], objects: &[BString]| {
         let objects = join_words(objects.iter().map(|v| quote(v)));
-        rule_invocations(model, target.dir, template, |key| {
+        let template = without_empty_output_flags(template, artifacts);
+        rule_invocations(model, target.dir, &template, |key| {
             if key == b"OBJECTS" {
                 Some(objects.clone())
             } else {
@@ -318,7 +364,7 @@ pub(super) fn link(
             &objects,
             cmake(),
             &policy,
-            ipo,
+            (ipo, msvc),
             template,
             expand,
         )
@@ -401,7 +447,7 @@ pub(super) fn link(
     }
     for invocation in invocations
         .iter_mut()
-        .skip(usize::from(kind == LinkKind::StaticArchive))
+        .skip(usize::from(kind == LinkKind::StaticArchive && !msvc))
     {
         let command = launcher::Command {
             role: "link",
@@ -454,10 +500,11 @@ pub(super) fn link(
             None,
         ));
     }
+    before_link.append(&mut invocations);
     Ok(BuildStep::Link {
         inputs,
         step,
-        invocations,
+        invocations: before_link,
     })
 }
 
@@ -481,118 +528,26 @@ fn link_libraries(
     let runtime = runtime_libraries(model, target, config, step, &libraries);
     let rpaths = rpaths(model, target, config, step, darwin, &runtime)?;
     inputs.extend(libraries);
-    let mut arguments = rpaths;
+    let (mut arguments, mut rpaths) = if darwin {
+        (Vec::new(), Some(rpaths))
+    } else {
+        (rpaths, None)
+    };
     for fragment in link_fragments {
+        if darwin && fragment.role == LinkFragmentRole::Libraries {
+            arguments.extend(rpaths.take().into_iter().flatten());
+        }
         arguments.push(wrapper.argument(&fragment.text.value)?);
     }
+    arguments.extend(rpaths.into_iter().flatten());
+    if let Some(standard) = definition(
+        model,
+        target.dir,
+        &[b"CMAKE_", step.language.as_slice(), b"_STANDARD_LIBRARIES"].concat(),
+    ) {
+        arguments.push(wrapper.driver_flags(standard));
+    }
     Ok(join_words(arguments))
-}
-
-fn archive_commands(
-    output: &BString,
-    objects: &[BString],
-    cmake: BString,
-    policy: &Flags<'_>,
-    ipo: bool,
-    template: Option<&BString>,
-    expand: impl Fn(&[u8], &[BString]) -> Vec<Invocation>,
-) -> Vec<Invocation> {
-    let mut commands = vec![direct(
-        vec![cmake, "-E".into(), "rm".into(), "-f".into(), output.clone()],
-        None,
-    )];
-    let archive = |key: &[u8]| {
-        ipo.then(|| policy.option(&[key, b"_IPO"].concat()))
-            .flatten()
-            .or_else(|| policy.option(key))
-    };
-    if let Some(template) =
-        template.filter(|_| !(ipo && policy.option(b"ARCHIVE_CREATE_IPO").is_some()))
-    {
-        commands.extend(expand(template, objects));
-    } else {
-        let create = archive(b"ARCHIVE_CREATE").map_or(
-            b"<CMAKE_AR> qc <TARGET> <LINK_FLAGS> <OBJECTS>".as_slice(),
-            |v| v.as_slice(),
-        );
-        let append = archive(b"ARCHIVE_APPEND").map_or(
-            b"<CMAKE_AR> q <TARGET> <LINK_FLAGS> <OBJECTS>".as_slice(),
-            |v| v.as_slice(),
-        );
-        let finish = archive(b"ARCHIVE_FINISH")
-            .map_or(b"<CMAKE_RANLIB> <TARGET>".as_slice(), |v| v.as_slice());
-        commands.extend(archive_invocations(expand, create, append, finish, objects));
-    }
-    commands
-}
-
-fn deduplicate_darwin_flags(flags: &mut [BString]) {
-    let mut seen = IndexSet::new();
-    for flag in flags {
-        let Some(args) = simple_args(flag) else {
-            continue;
-        };
-        let filtered: Vec<_> = args
-            .iter()
-            .filter(|arg| {
-                !matches!(
-                    arg.as_slice(),
-                    b"-Wl,-search_paths_first" | b"-Wl,-headerpad_max_install_names"
-                ) || seen.insert((*arg).clone())
-            })
-            .collect();
-        if filtered.len() != args.len() {
-            *flag = join_words(filtered.into_iter().map(|arg| quote(arg)));
-        }
-    }
-}
-
-fn archive_invocations(
-    expand: impl Fn(&[u8], &[BString]) -> Vec<Invocation>,
-    create: &[u8],
-    append: &[u8],
-    finish: &[u8],
-    objects: &[BString],
-) -> Vec<Invocation> {
-    // Leave space for the rest of the command and the environment.
-    const OBJECT_BYTES: usize = 32 * 1024;
-    let mut start = 0;
-    let mut bytes = 0;
-    let mut commands = Vec::new();
-    if !append.is_empty() {
-        for (index, object) in objects.iter().enumerate() {
-            let size = quote(object).len() + 1;
-            if index > start && bytes + size > OBJECT_BYTES {
-                if let Some(chunk) = objects.get(start..index) {
-                    commands.extend(expand(if start == 0 { create } else { append }, chunk));
-                }
-                start = index;
-                bytes = 0;
-            }
-            bytes += size;
-        }
-    }
-    commands.extend(expand(
-        if start == 0 { create } else { append },
-        objects.get(start..).unwrap_or_default(),
-    ));
-    commands.extend(expand(finish, &[]));
-    commands
-}
-
-fn library_file(arg: &[u8]) -> bool {
-    !arg.starts_with(b"-")
-        && (arg.contains(&b'/')
-            || arg.ends_with(b".a")
-            || arg.ends_with(b".o")
-            || arg.ends_with(b".tbd")
-            || shared_library(arg))
-}
-
-fn shared_library(name: &[u8]) -> bool {
-    name.ends_with(b".dylib")
-        || name.ends_with(b".so")
-        || name.windows(4).any(|part| part == b".so.")
 }
 
 fn darwin_versions(model: &ProjectModel, target: &Target, language: &[u8]) -> Vec<BString> {
@@ -920,6 +875,22 @@ fn rpath_entries(
 ) -> IndexSet<BString> {
     let mut paths: IndexSet<BString> = list::split(value, list::Empty::Drop).into_iter().collect();
     if !installs {
+        if darwin
+            && definition(model, target.dir, b"CMAKE_PLATFORM_HAS_INSTALLNAME")
+                .is_some_and(|value| truth::is_on(value))
+        {
+            paths.extend(
+                step.fragments
+                    .iter()
+                    .filter(|fragment| fragment.role == LinkFragmentRole::LibraryPath)
+                    .flat_map(|fragment| simple_args(&fragment.text.value).into_iter().flatten())
+                    .filter_map(|arg| {
+                        arg.strip_prefix(b"-L")
+                            .filter(|path| !path.is_empty())
+                            .map(BString::from)
+                    }),
+            );
+        }
         let build = &model.dir(DirId::ROOT).binary_dir;
         let build_path = Lexical::new(build);
         let output = join(build, &step.output);

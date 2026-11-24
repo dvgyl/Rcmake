@@ -165,13 +165,20 @@ fn find_msbuild(cx: &mut Cx<'_>, version: VsVersion) -> Option<BString> {
             .is_ok_and(|meta| meta.kind == FileKind::File)
     };
     let from_install = |dir: &[u8]| {
-        let directory = path::to_native(dir).join("MSBuild/Current/Bin");
-        let suffix = match host.system().machine.as_slice() {
-            b"ARM64" | b"arm64" | b"aarch64" => "arm64/MSBuild.exe",
-            _ => "MSBuild.exe",
+        let directory = path::to_native(dir).join("MSBuild");
+        let native: &[&str] = match host.system().machine.as_slice() {
+            b"ARM64" | b"arm64" | b"aarch64" => &[
+                "Current/Bin/arm64/MSBuild.exe",
+                "Current/Bin/amd64/MSBuild.exe",
+            ],
+            b"x86_64" | b"AMD64" | b"amd64" | b"x64" => &["Current/Bin/amd64/MSBuild.exe"],
+            _ => &[],
         };
-        [directory.join(suffix), directory.join("MSBuild.exe")]
-            .into_iter()
+        native
+            .iter()
+            .copied()
+            .chain(["Current/Bin/MSBuild.exe", "15.0/Bin/MSBuild.exe"])
+            .map(|suffix| directory.join(suffix))
             .find(|candidate| is_file(candidate))
             .map(|file| path::from_native_cmake(&file))
     };
@@ -182,10 +189,24 @@ fn find_msbuild(cx: &mut Cx<'_>, version: VsVersion) -> Option<BString> {
     {
         return from_install(dir);
     }
-    if let Some(dir) = host.env_get(b"VSINSTALLDIR").filter(|dir| !dir.is_empty())
+    let build = instance
+        .split(|&byte| byte == b',')
+        .find_map(|field| field.strip_prefix(b"version="))
+        .filter(|build| !build.is_empty());
+    if build.is_none()
+        && host
+            .env_get(b"VisualStudioVersion")
+            .is_none_or(|current| current == version.tools_version())
+        && let Some(dir) = host.env_get(b"VSINSTALLDIR").filter(|dir| !dir.is_empty())
         && let Some(found) = from_install(&dir)
     {
         return Some(found);
+    }
+    if let Some(found) = find_installed_msbuild(host, version, build, from_install) {
+        return Some(found);
+    }
+    if build.is_some() {
+        return None;
     }
     let windows = cfg!(windows) || host.system().sysname.starts_with(b"Windows");
     if let Some(paths) = host.env_get(b"PATH") {
@@ -203,35 +224,48 @@ fn find_msbuild(cx: &mut Cx<'_>, version: VsVersion) -> Option<BString> {
             }
         }
     }
+    None
+}
+
+fn find_installed_msbuild(
+    host: &dyn rcmake_host::Host,
+    version: VsVersion,
+    build: Option<&[u8]>,
+    from_install: impl Fn(&[u8]) -> Option<BString>,
+) -> Option<BString> {
     let installer = host
         .env_get(b"ProgramFiles(x86)")
         .filter(|dir| !dir.is_empty())?;
     let locator = path::to_native(&installer).join("Microsoft Visual Studio/Installer/vswhere.exe");
-    if !is_file(&locator) {
+    if !host
+        .metadata(&locator, Follow::Yes)
+        .is_ok_and(|meta| meta.kind == FileKind::File)
+    {
         return None;
     }
     let range = match version {
         VsVersion::Vs17 => "[17.0,18.0)",
         VsVersion::Vs18 => "[18.0,19.0)",
     };
+    let range = build.map_or_else(
+        || range.into(),
+        |build| [b"[".as_slice(), build, b",", build, b"]"].concat().into(),
+    );
     let request = RunRequest {
         pipeline: vec![CommandSpec {
             program: path::from_native(&locator),
-            args: [
-                "-latest",
-                "-products",
-                "*",
-                "-version",
+            args: vec![
+                "-latest".into(),
+                "-products".into(),
+                "*".into(),
+                "-version".into(),
                 range,
-                "-requires",
-                "Microsoft.Component.MSBuild",
-                "-property",
-                "installationPath",
-                "-utf8",
-            ]
-            .into_iter()
-            .map(BString::from)
-            .collect(),
+                "-requires".into(),
+                "Microsoft.Component.MSBuild".into(),
+                "-property".into(),
+                "installationPath".into(),
+                "-utf8".into(),
+            ],
         }],
         cwd: host.initial_cwd(),
         env: host.env_all(),

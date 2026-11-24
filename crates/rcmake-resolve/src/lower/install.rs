@@ -24,7 +24,7 @@ mod targets;
 
 pub(crate) use objects::exported_path as exported_object_path;
 
-pub use super::graph::collect_metadata;
+pub use super::artifacts::collect_metadata;
 
 /// Lower install rules in model order.
 ///
@@ -347,8 +347,7 @@ fn lower_install_rules<E>(
                 InstallKind::Files(paths)
                 | InstallKind::Programs(paths)
                 | InstallKind::Directory(paths) => {
-                    let expand_paths = !matches!(rule.kind, InstallKind::Directory(_))
-                        && paths.iter().any(|path| has_genex(&path.value));
+                    let expand_paths = paths.iter().any(|path| has_genex(&path.value));
                     for config in action_configs(configs, options, expand_paths, multi) {
                         let mut options = options.clone();
                         let mut files = Vec::new();
@@ -374,11 +373,11 @@ fn lower_install_rules<E>(
                             }
                         }
                         let kind = match &rule.kind {
+                            _ if files.is_empty() && expand_paths => continue,
                             InstallKind::Directory(_) => InstallActionKind::Directory {
                                 dirs: files,
                                 options: directory_options(&recorded, &options.permissions),
                             },
-                            _ if files.is_empty() && expand_paths => continue,
                             InstallKind::Programs(_) => file_action(b"PROGRAM", files, &options),
                             _ => file_action(b"FILE", files, &options),
                         };
@@ -687,7 +686,7 @@ fn target_options<'a>(recorded: &[&'a [u8]]) -> IndexMap<&'a [u8], Group<'a>> {
             }
         };
         match key {
-            b"DESTINATION" => entry.options.destination = read(),
+            b"DESTINATION" => entry.options.destination = read().filter(|path| !path.is_empty()),
             b"COMPONENT" => entry.options.component = read(),
             b"OPTIONAL" => entry.options.optional = true,
             b"EXCLUDE_FROM_ALL" => entry.options.exclude_from_all = true,

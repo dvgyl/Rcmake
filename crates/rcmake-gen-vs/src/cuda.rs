@@ -129,7 +129,7 @@ pub(crate) fn compile_options(xml: &mut Writer, options: &CompileOptions<'_>) {
         &[],
         options.optimization.unwrap_or_default(),
     );
-    if let Some(runtime) = match options.runtime {
+    if let Some(runtime) = match options.runtime.map(str::to_ascii_uppercase).as_deref() {
         Some("STATIC") => Some("Static"),
         Some("SHARED") => Some("Shared"),
         Some("NONE") => Some("None"),
@@ -435,7 +435,7 @@ mod tests {
                 defines: &["SIZE=2".into(), "A&B".into(), "SIZE=2".into()],
                 architecture_flags: &["--generate-code=arch=compute_75,code=sm_75".into()],
                 additional_options: OptionText::Literal("-lineinfo"),
-                runtime: Some("SHARED"),
+                runtime: Some("Shared"),
                 ..CompileOptions::default()
             },
         );

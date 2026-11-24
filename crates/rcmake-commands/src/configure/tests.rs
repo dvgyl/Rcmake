@@ -562,6 +562,153 @@ fn visual_studio_finds_msbuild_and_preserves_a_user_program() -> TestResult {
 }
 
 #[test]
+fn visual_studio_uses_msbuild_for_the_requested_instance_version() -> TestResult {
+    use rcmake_host::{ProcessResult, RunOutput};
+    use rcmake_model::{GeneratorKind, VsVersion};
+
+    let host = new_host();
+    let locator = "/programs/Microsoft Visual Studio/Installer/vswhere.exe";
+    let selected = "/selected VS/MSBuild/Current/Bin/arm64/MSBuild.exe";
+    host.env_set(b"ProgramFiles(x86)", Some(b"/programs"));
+    host.env_set(b"VSINSTALLDIR", Some(b"/default VS"));
+    host.seed_file(Path::new(locator), b"")?;
+    host.seed_file(Path::new(selected), b"")?;
+    host.seed_file(
+        Path::new("/selected VS/MSBuild/Current/Bin/MSBuild.exe"),
+        b"",
+    )?;
+    host.seed_file(
+        Path::new("/default VS/MSBuild/Current/Bin/MSBuild.exe"),
+        b"",
+    )?;
+    host.set_command_handler(move |_, request, _| {
+        let Some(command) = request.pipeline.first() else {
+            return Err(rcmake_host::HostError::unsupported("Expected vswhere.exe."));
+        };
+        assert_eq!(
+            rcmake_host::path::to_native(&command.program),
+            Path::new(locator)
+        );
+        assert!(command.args.iter().any(|arg| arg == "[17.8.0.0,17.8.0.0]"));
+        Ok(RunOutput {
+            stdout: b"\xef\xbb\xbf/selected VS\r\n".to_vec(),
+            results: vec![ProcessResult::Exited(0)],
+            ..RunOutput::default()
+        })
+    })?;
+    seed_modules(&host, &[])?;
+    let mut interp = interp(
+        &host,
+        vec![define("CMAKE_GENERATOR_INSTANCE", "version=17.8.0.0")],
+    );
+    interp.cx().project().generator = Some(GeneratorKind::VisualStudio(VsVersion::Vs17));
+    configure(&host, &mut interp, "project(P NONE)", 0)?;
+    assert_eq!(
+        var(&mut interp, "CMAKE_MAKE_PROGRAM"),
+        Some(selected.into())
+    );
+    assert_eq!(
+        var(&mut interp, "CMAKE_VS_MSBUILD_COMMAND"),
+        Some(selected.into())
+    );
+    Ok(())
+}
+
+#[test]
+fn file_generate_records_the_policy_at_each_call() -> TestResult {
+    let host = new_host();
+    let mut interp = interp(&host, vec![]);
+    configure(
+        &host,
+        &mut interp,
+        r#"
+cmake_minimum_required(VERSION 3.5)
+project(P NONE)
+file(GENERATE OUTPUT warn.txt CONTENT warn)
+cmake_policy(PUSH)
+cmake_policy(SET CMP0070 OLD)
+file(GENERATE OUTPUT old.txt CONTENT old)
+cmake_policy(SET CMP0070 NEW)
+file(GENERATE OUTPUT new.txt CONTENT new)
+cmake_policy(POP)
+"#,
+        0,
+    )?;
+    for (index, policy) in ["Warn", "Old", "New"].into_iter().enumerate() {
+        let property = format!("_RCMAKE_FILE_GENERATE_{index}_CMP0070");
+        assert_eq!(global(&mut interp, &property), Some(policy.into()));
+    }
+    Ok(())
+}
+
+#[test]
+fn install_records_scripts_in_order_and_preserves_empty_destinations() -> TestResult {
+    use rcmake_model::InstallKind;
+
+    let host = new_host();
+    let mut interp = interp(&host, vec![]);
+    configure(
+        &host,
+        &mut interp,
+        r#"
+cmake_minimum_required(VERSION 4.5)
+project(P NONE)
+install(SCRIPT first.cmake COMPONENT "" CODE DESTINATION SCRIPT "$<1:last.cmake>" EXCLUDE_FROM_ALL)
+install(DIRECTORY DESTINATION "")
+install(DIRECTORY TYPE DATA)
+install(FILES notes.txt DESTINATION "" TYPE DATA)
+"#,
+        0,
+    )?;
+    let mut cx = interp.cx();
+    let [first, code, last, empty, files] = cx.project().installs.as_slice() else {
+        return Err("Incorrect install rule count.".into());
+    };
+    assert_eq!(
+        first.kind,
+        InstallKind::Script("/work/src/first.cmake".into())
+    );
+    assert_eq!(code.kind, InstallKind::Code("DESTINATION".into()));
+    assert_eq!(
+        last.kind,
+        InstallKind::Script("/work/src/$<1:last.cmake>".into())
+    );
+    for rule in [first, code, last] {
+        assert_eq!(rule.options.component, Some("".into()));
+        assert!(rule.options.exclude_from_all);
+    }
+    assert!(matches!(&empty.kind, InstallKind::Directory(dirs) if dirs.is_empty()));
+    assert_eq!(empty.options.destination, Some("".into()));
+    assert_eq!(files.options.destination, Some("share".into()));
+    Ok(())
+}
+
+#[test]
+fn install_targets_uses_default_for_missing_artifact_destination() -> TestResult {
+    let host = new_host();
+    let mut interp = interp(&host, vec![]);
+    configure(
+        &host,
+        &mut interp,
+        r#"
+cmake_minimum_required(VERSION 4.5)
+project(P NONE)
+add_library(sample STATIC sample.c)
+install(TARGETS sample ARCHIVE DESTINATION ${unset_dir} LIBRARY DESTINATION ${unset_dir})
+install(TARGETS sample DESTINATION "")
+"#,
+        0,
+    )?;
+    let mut cx = interp.cx();
+    let [implicit, explicit] = cx.project().installs.as_slice() else {
+        return Err("Incorrect target install rule count.".into());
+    };
+    assert!(implicit.options.destination.is_none());
+    assert!(explicit.options.destination.is_none());
+    Ok(())
+}
+
+#[test]
 fn project_reports_xcode_generator_spec_errors() -> TestResult {
     use rcmake_host::{ProcessResult, RunOutput};
     use rcmake_model::GeneratorKind;

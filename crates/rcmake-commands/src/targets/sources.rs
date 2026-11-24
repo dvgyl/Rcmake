@@ -210,7 +210,9 @@ fn add_file_set<'a>(
     set.base_dirs.extend(bases);
     let first_new_file = set.files.len();
     set.files.extend(args.files);
-    validate_file_set_paths(cx.project(), &set)?;
+    if kind != FileSetKind::Headers || scope != UsageScope::Interface {
+        validate_file_set_paths(cx.project(), &set)?;
+    }
     validate_file_set_membership(cx, &set, first_new_file)?;
     let model = cx.project();
     let target = model

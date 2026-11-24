@@ -12,7 +12,7 @@ use super::{
     GenerationResult, Graph, Ninja, generate_multi_config, generate_single_config, qualified,
 };
 
-fn read(host: &PureHost, file: &str) -> String {
+pub(super) fn read(host: &PureHost, file: &str) -> String {
     let bytes = host
         .read(
             &Path::new("/work/build").join(file),
@@ -117,30 +117,30 @@ fn single_config_writes_rules_edges_and_utilities() {
     for line in [
         "include CMakeFiles/rules.ninja",
         "build generated$ $$$:file | include${ninja_pipe}generated.h: CUSTOM_COMMAND /work/config.in",
-        "  COMMAND = (cd$ --$ '/work/a$ dir'$ &&$ printf$ '%s'$ '$$value')",
-        "  DESC = Generate$ $$$:$ file",
-        "  depfile = a$ $$$:file.d",
+        "  COMMAND = (cd -- '/work/a dir' && printf '%s' '$$value')",
+        "  DESC = Generate $$: file",
+        "  depfile = a $$:file.d",
         "  pool = console",
         "  pool = slow",
         "build obj/a$ $$$:file.o: COMPILE_DEPFILE /work/src/a$ $$$:file.c || generated$ $$$:file",
-        "  DEP_FILE = obj/a$ $$$:file.d",
+        "  DEP_FILE = obj/a $$:file.d",
         "build libshared.so: LINK_SHARED_LIBRARY obj/a$ $$$:file.o",
-        "  DESC = Linking$ C$ shared$ library$ libshared.so",
+        "  DESC = Linking C shared library libshared.so",
         "build shared: phony obj/a$ $$$:file.o libshared.so generate",
         "build generate: phony generated$ $$$:file include${ninja_pipe}generated.h",
         "build optional: phony CMakeFiles/rcmake-custom-3.util",
         "build all: phony shared",
         "build build.ninja CMakeFiles/rules.ninja: RERUN_CMAKE | /work/source$ dir/CMakeLists.txt /work/source$ dir/options$$$:file.cmake",
-        "  COMMAND = cmake$ --regenerate-during-build$ -S'/work/source$ dir'$ -B/work/build",
+        "  COMMAND = cmake --regenerate-during-build -S'/work/source dir' -B/work/build",
         "build CMakeFiles/install.util: CUSTOM_COMMAND all",
-        "  COMMAND = cmake$ -P$ cmake_install.cmake",
+        "  COMMAND = cmake -P cmake_install.cmake",
         "build install: phony CMakeFiles/install.util",
-        "  COMMAND = ctest$ --force-new-ctest-process",
+        "  COMMAND = ctest --force-new-ctest-process",
         "build test: phony CMakeFiles/test.util",
-        "  COMMAND = ninja$ -t$ clean",
-        "  COMMAND = ninja$ -t$ targets",
+        "  COMMAND = ninja -t clean",
+        "  COMMAND = ninja -t targets",
         "build clean: phony CMakeFiles/clean.util",
-        "  COMMAND = cmake$ -S'/work/source$ dir'$ -B/work/build",
+        "  COMMAND = cmake -S'/work/source dir' -B/work/build",
         "build rebuild_cache: phony CMakeFiles/rebuild_cache.util",
         "default all",
     ] {
@@ -171,7 +171,7 @@ fn continues_ninja_lines_and_keeps_escaped_values() {
     ninja.binding(b"VAR", b"a b:c$\nrest|here");
     assert_eq!(
         ninja.0,
-        b"ninja_pipe = |\nbuild a$ b$:c$$$\nrest${ninja_pipe}here: phony\n  VAR = a$ b$:c$$$\nrest|here\n"
+        b"ninja_pipe = |\nbuild a$ b$:c$$$\nrest${ninja_pipe}here: phony\n  VAR = a b:c$$$\nrest|here\n"
     );
 }
 
@@ -226,11 +226,11 @@ fn link_byproducts_use_unique_paths_on_the_link_edge() -> Result<(), Box<dyn std
         assert_eq!(
             manifest,
             concat!(
-                "build libdemo.so.1 | libdemo.so libdemo.lib libdemo.pdb: LINK_SHARED_LIBRARY\n",
-                "  COMMAND = $:\n",
-                "  DESC = Linking$ C$ shared$ library$ libdemo.so.1\n",
+                "build libdemo.so.1 | libdemo.so libdemo.lib: LINK_SHARED_LIBRARY\n",
+                "  COMMAND = :\n",
+                "  DESC = Linking C shared library libdemo.so.1\n",
                 "build check: phony libdemo.so\n",
-                "build libdemo.so$:Debug: phony libdemo.so.1 libdemo.so libdemo.lib libdemo.pdb\n",
+                "build libdemo.so$:Debug: phony libdemo.so.1 libdemo.so libdemo.lib\n",
                 "build all$:Debug: phony libdemo.so$:Debug\n",
                 "build all: phony all$:Debug\n"
             )
@@ -363,10 +363,10 @@ fn generator_commands_use_metadata_and_the_requested_build_cache() {
     generate_single_config(&result, &host, dir).unwrap_or_else(|error| panic!("{error}"));
     let build = read(&host, "build.ninja");
     for line in [
-        "  COMMAND = '/cache$ tools/cmake'$ --regenerate-during-build$",
-        "  COMMAND = '/cache$ tools/cmake'$ -P$ cmake_install.cmake",
-        "  COMMAND = '/cache$ tools/cmake'$ -S",
-        "  COMMAND = '/cache$ tools/ctest'$ --force-new-ctest-process",
+        "  COMMAND = '/cache tools/cmake' --regenerate-during-build ",
+        "  COMMAND = '/cache tools/cmake' -P cmake_install.cmake",
+        "  COMMAND = '/cache tools/cmake' -S",
+        "  COMMAND = '/cache tools/ctest' --force-new-ctest-process",
     ] {
         assert!(build.contains(line), "Missing {line:?} in:\n{build}");
     }
@@ -381,16 +381,16 @@ fn generator_commands_use_metadata_and_the_requested_build_cache() {
     for file in ["build.ninja", "build-Debug.ninja"] {
         let build = read(&host, file);
         for line in [
-            "  COMMAND = '/current$ tools/rcmake'$ -DCMAKE_INSTALL_CONFIG_NAME=Debug",
-            "  COMMAND = '/current$ tools/rcmake'$ -S",
-            "  COMMAND = '/current$ tools/ctest'$ --force-new-ctest-process$ -C$ Debug",
+            "  COMMAND = '/current tools/rcmake' -DCMAKE_INSTALL_CONFIG_NAME=Debug",
+            "  COMMAND = '/current tools/rcmake' -S",
+            "  COMMAND = '/current tools/ctest' --force-new-ctest-process -C Debug",
         ] {
             assert!(build.contains(line), "Missing {line:?} in:\n{build}");
         }
     }
     let implementation = read(&host, "CMakeFiles/impl-Debug.ninja");
     assert!(
-        implementation.contains("  COMMAND = '/current$ tools/rcmake'$ --regenerate-during-build$")
+        implementation.contains("  COMMAND = '/current tools/rcmake' --regenerate-during-build ")
     );
 }
 
@@ -405,7 +405,7 @@ fn package_targets_use_only_their_own_config_files() -> Result<(), Box<dyn std::
     let build = read(&host, "build.ninja");
     assert!(!build.contains("build package:"));
     assert!(build.contains("build CMakeFiles/package_source.util: CUSTOM_COMMAND\n"));
-    assert!(build.contains("'/tool$ bin/cpack'$ --config$ ./CPackSourceConfig.cmake"));
+    assert!(build.contains("'/tool bin/cpack' --config ./CPackSourceConfig.cmake"));
 
     host.seed_file(
         &dir.join("CMakeCache.txt"),
@@ -416,7 +416,7 @@ fn package_targets_use_only_their_own_config_files() -> Result<(), Box<dyn std::
     let build = read(&host, "build.ninja");
     assert!(build.contains("build package: phony CMakeFiles/package.util"));
     assert!(build.contains("build CMakeFiles/package.util: CUSTOM_COMMAND\n"));
-    assert!(build.contains("/tools/packer$ --config$ ./CPackConfig.cmake"));
+    assert!(build.contains("/tools/packer --config ./CPackConfig.cmake"));
     Ok(())
 }
 

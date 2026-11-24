@@ -17,12 +17,12 @@ use super::custom::{
 };
 use super::link::link;
 use super::pch::{self, PchFlags};
-use super::{compute_artifacts, definition, linker_language};
+use super::{compute_artifacts, linker_language};
 use crate::ide::{IdeCustomPhase, IdeCustomStep};
 use crate::{
-    ArtifactSet, BuildGraph, BuildStep, CompileUnit, ConfigureMetadata, CrossConfiguration,
-    CustomStep, GraphTarget, LinkFragmentRole, LinkKind, LinkStep, ResolveError, ResolvedTarget,
-    Toolchain, sources::TargetInputs, unity::TargetUnity, usage::UsageResolver,
+    ArtifactSet, BuildGraph, BuildStep, CompileUnit, CrossConfiguration, CustomStep, GraphTarget,
+    LinkFragmentRole, LinkKind, LinkStep, ResolveError, ResolvedTarget, sources::TargetInputs,
+    unity::TargetUnity, usage::UsageResolver,
 };
 
 mod order;
@@ -109,25 +109,25 @@ pub(crate) fn lower_with_inputs(
         )?;
         let artifacts = artifacts(model, target, resolved);
         let lint = lint_settings(model, resolved.id, usage, config)?;
-        let framework_dirs =
-            if !resolved.compile_units.is_empty() && super::is_darwin(model, target.dir) {
-                let context = EvalContext {
-                    config: config.clone(),
-                    link_language: resolved.link.as_ref().map(|link| link.language.clone()),
-                    ..Default::default()
-                };
-                let mut framework_dependencies = resolved.dependencies.clone();
-                framework_dependencies.extend(usage.link_targets(resolved.id, &context)?);
-                crate::resolve_link::framework_dirs(
-                    model,
-                    target,
-                    &framework_dependencies,
-                    &|id| resolved_targets.get(&id)?.artifacts.file.as_ref(),
-                    config,
-                )
-            } else {
-                Vec::new()
+        let framework_dirs = if !resolved.compile_units.is_empty()
+            && super::is_darwin(model, target.dir)
+        {
+            let context = EvalContext {
+                config: config.clone(),
+                link_language: resolved.link.as_ref().map(|link| link.language.clone()),
+                ..Default::default()
             };
+            let framework_dependencies = usage.compile_framework_targets(resolved.id, &context)?;
+            crate::resolve_link::framework_dirs(
+                model,
+                target,
+                &framework_dependencies,
+                &|id| resolved_targets.get(&id)?.artifacts.file.as_ref(),
+                config,
+            )
+        } else {
+            Vec::new()
+        };
         let objects = plan.add_compile_steps(
             &artifacts,
             &commands,
@@ -658,6 +658,7 @@ impl<'a> TargetPlan<'a> {
                 &linker_artifacts,
                 step,
                 objects,
+                self.inputs.map(|inputs| &inputs.sources),
                 position_independent,
                 usage,
             )
@@ -714,6 +715,10 @@ impl<'a> TargetPlan<'a> {
             )?;
             if utility != CustomStep::default() {
                 remove_own_outputs(&mut utility);
+                utility
+                    .depends
+                    .retain(|dep| dep != &target.name || commands.producer(dep).is_some());
+                self.dependencies.shift_remove(&resolved.id);
                 self.steps
                     .insert(push(graph_steps, BuildStep::Custom(utility)));
             }
@@ -879,85 +884,4 @@ pub(super) fn push(steps: &mut Vec<BuildStep>, step: BuildStep) -> usize {
     let index = steps.len();
     steps.push(step);
     index
-}
-
-/// Collect listfiles and compiler data from the model.
-///
-/// Listfiles keep the order of their first appearance. Read compiler values
-/// from directory variable snapshots and the cache.
-#[must_use]
-pub fn collect_metadata(model: &ProjectModel) -> ConfigureMetadata {
-    let mut listfiles = IndexSet::new();
-    let mut languages = IndexMap::new();
-    for (dir, directory) in model.dirs() {
-        listfiles.extend(directory.listfiles.iter().cloned());
-        for key in directory.vars.keys().chain(directory.props.names().iter()) {
-            if let Some(language) = compiler_language(key) {
-                languages.entry(language).or_insert(dir);
-            }
-        }
-    }
-    for key in model
-        .global
-        .props
-        .names()
-        .iter()
-        .chain(model.cache.iter().map(|(key, _)| key))
-    {
-        if let Some(language) = compiler_language(key) {
-            languages.entry(language).or_insert(DirId::ROOT);
-        }
-    }
-    let toolchains = languages
-        .into_iter()
-        .filter_map(|(language, dir)| {
-            let read = |suffix: &[u8]| {
-                definition(
-                    model,
-                    dir,
-                    &[b"CMAKE_", language.as_slice(), b"_", suffix].concat(),
-                )
-            };
-            let compiler = read(b"COMPILER")?;
-            if rcmake_base::truth::is_off(compiler) {
-                return None;
-            }
-            let value = |suffix| read(suffix).cloned().unwrap_or_default();
-            let optional = |suffix| read(suffix).filter(|v| !v.is_empty()).cloned();
-            let paths =
-                |suffix| read(suffix).map_or_else(Vec::new, |v| list::split(v, list::Empty::Drop));
-            let toolchain = Toolchain {
-                compiler_path: compiler.clone(),
-                compiler_id: value(b"COMPILER_ID"),
-                compiler_version: value(b"COMPILER_VERSION"),
-                implicit_includes: paths(b"IMPLICIT_INCLUDE_DIRECTORIES"),
-                implicit_link_dirs: paths(b"IMPLICIT_LINK_DIRECTORIES"),
-                source_extensions: paths(b"SOURCE_FILE_EXTENSIONS"),
-                scandep_rule: optional(b"SCANDEP_SOURCE"),
-                module_map_format: optional(b"MODULE_MAP_FORMAT"),
-                module_map_flag: optional(b"MODULE_MAP_FLAG"),
-                compile_bmi_rule: optional(b"MODULE_BMI_ONLY_FLAG"),
-            };
-            Some((language, toolchain))
-        })
-        .collect();
-    ConfigureMetadata {
-        listfiles: listfiles.into_iter().collect(),
-        toolchains,
-        configure_log: definition(model, DirId::ROOT, b"CMAKE_CONFIGURE_LOG").cloned(),
-        cmake_command: definition(model, DirId::ROOT, b"CMAKE_COMMAND").cloned(),
-        ctest_command: definition(model, DirId::ROOT, b"CMAKE_CTEST_COMMAND").cloned(),
-        jobserver_steps: model
-            .commands()
-            .map(|(_, command)| command)
-            .filter(|command| command.kind == rcmake_model::CustomCommandKind::Output)
-            .enumerate()
-            .filter_map(|(step, command)| command.job_server_aware.then_some(step))
-            .collect(),
-    }
-}
-
-fn compiler_language(key: &[u8]) -> Option<BString> {
-    let lang = key.strip_prefix(b"CMAKE_")?.strip_suffix(b"_COMPILER")?;
-    (!lang.is_empty()).then(|| lang.into())
 }

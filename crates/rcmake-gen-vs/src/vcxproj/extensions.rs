@@ -193,11 +193,14 @@ impl Context<'_> {
                 ),
                 |value| truth::is_on(&value),
             );
-        let runtime = property(
-            b"CUDA_RUNTIME_LIBRARY",
-            self.definition(b"CMAKE_CUDA_RUNTIME_LIBRARY_DEFAULT"),
-        )?
-        .map(|value| string(&value));
+        let runtime = if let Some(default) = self
+            .definition(b"CMAKE_CUDA_RUNTIME_LIBRARY_DEFAULT")
+            .filter(|value| !value.is_empty())
+        {
+            property(b"CUDA_RUNTIME_LIBRARY", Some(default))?.map(|value| string(&value))
+        } else {
+            None
+        };
         let architectures = property(
             b"CUDA_ARCHITECTURES",
             self.definition(b"CMAKE_CUDA_ARCHITECTURES"),

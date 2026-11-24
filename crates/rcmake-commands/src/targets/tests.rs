@@ -54,7 +54,7 @@ fn configure(
     assert_eq!(
         outcome.exit_code,
         exit,
-        "{}",
+        "{script}\n{}",
         host.stream_bytes(Stream::Stderr)
     );
     Ok((host, interp))
@@ -456,12 +456,30 @@ fn records_sources_and_file_sets() -> TestResult {
 }
 
 #[test]
-fn rejects_overlap_across_file_set_calls() -> TestResult {
-    let (host, _) = configure(
+fn defers_path_checks_for_interface_header_sets() -> TestResult {
+    let (_, mut interp) = configure(
         r#"
         add_library(lib INTERFACE)
-        target_sources(lib INTERFACE FILE_SET headers TYPE HEADERS BASE_DIRS a a-sibling FILES a/a.h)
-        target_sources(lib INTERFACE FILE_SET headers BASE_DIRS "unrelated;b/../a/sub")
+        target_sources(lib INTERFACE FILE_SET headers TYPE HEADERS BASE_DIRS a FILES outside.h)
+        target_sources(lib INTERFACE FILE_SET headers BASE_DIRS a/sub)
+        get_target_property(bases lib HEADER_DIRS_headers)
+        get_target_property(files lib HEADER_SET_headers)
+    "#,
+        &[],
+        0,
+    )?;
+    var(&mut interp, "bases", "/work/src/a;/work/src/a/sub");
+    var(&mut interp, "files", "/work/src/outside.h");
+    Ok(())
+}
+
+#[test]
+fn rejects_overlap_across_build_file_set_calls() -> TestResult {
+    let (host, _) = configure(
+        r#"
+        add_library(lib STATIC)
+        target_sources(lib PRIVATE FILE_SET headers TYPE HEADERS BASE_DIRS a a-sibling FILES a/a.h)
+        target_sources(lib PRIVATE FILE_SET headers BASE_DIRS "unrelated;b/../a/sub")
     "#,
         &[],
         1,
@@ -551,7 +569,12 @@ fn records_link_lookup_directory_and_backtrace() -> TestResult {
 }
 
 #[test]
-fn reports_invalid_targets_and_signatures() -> TestResult {
+fn checks_targets_and_link_signatures() -> TestResult {
+    configure(
+        "add_library(t INTERFACE)\nadd_library(a ALIAS t)\ntarget_link_libraries(a INTERFACE d)",
+        &[],
+        0,
+    )?;
     for (script, expected) in [
         (
             "add_library(t INTERFACE)\nadd_executable(t)",
@@ -564,10 +587,6 @@ fn reports_invalid_targets_and_signatures() -> TestResult {
         (
             "add_library(t INTERFACE)\nadd_executable(a ALIAS t)",
             "is not an executable",
-        ),
-        (
-            "add_library(t INTERFACE)\nadd_library(a ALIAS t)\ntarget_link_libraries(a INTERFACE d)",
-            "can not be used on an ALIAS target.",
         ),
         (
             "add_library(t STATIC)\ntarget_link_libraries(t d)\ntarget_link_libraries(t PRIVATE e)",

@@ -117,24 +117,32 @@ pub(crate) fn attach_profilers(
     }
     let legacy = legacy.cloned();
     let native = native.cloned();
-    interp.set_command_profiler(Some(Arc::new(move |name, file, line, start, elapsed| {
+    interp.set_command_profiler(Some(Arc::new(move |sample| {
         if let Some(legacy) = &legacy {
-            legacy.event(name, file, line, start, elapsed);
+            legacy.event(
+                sample.name,
+                sample.file,
+                sample.line,
+                sample.start,
+                sample.elapsed,
+            );
         }
         if let Some(native) = &native {
-            // The current evaluator callback supplies only timing and location.
-            native.record_sample(
-                ProfileSample {
-                    name,
-                    file,
-                    line,
-                    depth: 0,
-                    start,
-                    elapsed,
-                    kind: ProfileKind::Builtin,
+            native.record(ProfileSample {
+                name: sample.name,
+                file: sample.file,
+                line: sample.line,
+                depth: sample.depth,
+                start: sample.start,
+                elapsed: sample.elapsed,
+                // The evaluator keeps SampleKind in a private module.
+                kind: match format!("{:?}", sample.kind).as_str() {
+                    "Function" => ProfileKind::Function,
+                    "Macro" => ProfileKind::Macro,
+                    "ListFile" => ProfileKind::ListFile,
+                    _ => ProfileKind::Builtin,
                 },
-                true,
-            );
+            });
         }
     })));
 }

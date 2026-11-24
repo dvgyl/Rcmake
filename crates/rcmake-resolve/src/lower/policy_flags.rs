@@ -81,7 +81,6 @@ impl<'a> Flags<'a> {
         {
             self.extend(&mut flags, b"COMPILE_OPTIONS_WARNING_AS_ERROR");
         }
-        self.append_color(&mut flags);
         flags
     }
 
@@ -93,14 +92,22 @@ impl<'a> Flags<'a> {
                     && value.as_slice() != b"NOTFOUND"
             })
         {
-            self.extend(
-                flags,
-                if truth::is_on(color) {
-                    b"COMPILE_OPTIONS_COLOR_DIAGNOSTICS"
-                } else {
-                    b"COMPILE_OPTIONS_COLOR_DIAGNOSTICS_OFF"
-                },
-            );
+            let enabled = truth::is_on(color);
+            let key = if enabled {
+                b"COMPILE_OPTIONS_COLOR_DIAGNOSTICS".as_slice()
+            } else {
+                b"COMPILE_OPTIONS_COLOR_DIAGNOSTICS_OFF"
+            };
+            if self.option(key).is_some() {
+                self.extend(flags, key);
+            } else if !enabled
+                && matches!(
+                    self.option(b"COMPILER_ID").map(|id| id.as_slice()),
+                    Some(b"Clang" | b"AppleClang")
+                )
+            {
+                flags.push("-fno-color-diagnostics".into());
+            }
         }
     }
 

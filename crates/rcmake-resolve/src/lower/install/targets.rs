@@ -168,6 +168,68 @@ pub(super) fn lower<E>(
             continue;
         }
         for target in &matching {
+            let per_config = multi || matching.len() > 1;
+            if raw.kind == TargetKind::SharedLibrary
+                && super::super::artifacts::is_dll_platform(model, raw.dir)
+            {
+                if groups
+                    .get(b"LIBRARY".as_slice())
+                    .is_some_and(|group| group.namelink_only)
+                {
+                    continue;
+                }
+                let artifacts = &target.artifacts;
+                let runtime = groups
+                    .get(b"RUNTIME".as_slice())
+                    .map_or_else(|| options.clone(), |group| group.merge(options));
+                let archive = groups
+                    .get(b"ARCHIVE".as_slice())
+                    .map_or_else(|| options.clone(), |group| group.merge(options));
+                let has_destination = |options: &InstallOptions| {
+                    options
+                        .destination
+                        .as_ref()
+                        .is_some_and(|path| !path.is_empty())
+                };
+                let explicit = has_destination(&runtime) || has_destination(&archive);
+                for (file, mut options, file_type, variable, fallback) in [
+                    (
+                        &artifacts.import_file,
+                        archive,
+                        b"STATIC_LIBRARY".as_slice(),
+                        b"CMAKE_INSTALL_LIBDIR".as_slice(),
+                        b"lib".as_slice(),
+                    ),
+                    (
+                        &artifacts.file,
+                        runtime,
+                        b"SHARED_LIBRARY".as_slice(),
+                        b"CMAKE_INSTALL_BINDIR".as_slice(),
+                        b"bin".as_slice(),
+                    ),
+                ] {
+                    let Some(file) = file else { continue };
+                    if (explicit && !has_destination(&options))
+                        || ((configs.is_empty() || per_config)
+                            && !matches_config(&options, &target.config))
+                    {
+                        continue;
+                    }
+                    if per_config {
+                        options.configurations = vec![target.config.0.clone()];
+                    }
+                    let default = definition(model, rule.dir, variable)
+                        .map_or(fallback, |value| value.as_slice());
+                    if !has_destination(&options) {
+                        options.destination = Some(default.into());
+                    }
+                    eval_destination(&mut options, raw.dir, &target.config, rule, eval)?;
+                    let files = vec![join(&model.dir(DirId::ROOT).binary_dir, file)];
+                    let kind = file_action(file_type, files, &options);
+                    manifest.actions.push(make_action(&options, default, kind));
+                }
+                continue;
+            }
             let layout = if super::super::is_darwin(model, raw.dir) {
                 crate::ide::bundle_kind(raw)
             } else {
@@ -187,7 +249,6 @@ pub(super) fn lower<E>(
             }
             let extra = groups.get(class);
             let mut options = extra.map_or_else(|| options.clone(), |extra| extra.merge(options));
-            let per_config = multi || matching.len() > 1;
             if (configs.is_empty() || per_config) && !matches_config(&options, &target.config) {
                 continue;
             }

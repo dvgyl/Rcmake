@@ -1,15 +1,120 @@
 //! Artifact names and source classification.
 
+use indexmap::{IndexMap, IndexSet};
 use rcmake_base::{BString, ByteSlice, hash::HashAlgo, list, path_lex::Lexical, truth};
 use rcmake_genex::ConfigId;
 use rcmake_model::{DirId, GeneratorKind, ProjectModel, Target, TargetKind};
 
 use super::{definition, join, target_property};
 use crate::{
-    ArtifactSet,
+    ArtifactSet, ConfigureMetadata, ResolveError, Toolchain,
     ide::{self, IdeFlavor},
     unity::UnityFile,
+    usage::UsageResolver,
 };
+
+pub(crate) fn is_dll_platform(model: &ProjectModel, dir: DirId) -> bool {
+    definition(model, dir, b"CMAKE_SYSTEM_NAME").map_or_else(
+        || definition(model, dir, b"WIN32").is_some_and(|value| truth::is_on(value)),
+        |system| system.starts_with(b"Windows") || system == b"CYGWIN",
+    )
+}
+
+pub(crate) fn is_msvc(model: &ProjectModel, dir: DirId, language: &[u8]) -> bool {
+    [b"_COMPILER_ID".as_slice(), b"_COMPILER_FRONTEND_VARIANT"]
+        .into_iter()
+        .any(|suffix| {
+            definition(model, dir, &[b"CMAKE_", language, suffix].concat())
+                .is_some_and(|value| value == b"MSVC")
+        })
+        || definition(model, dir, b"MSVC").is_some_and(|value| truth::is_on(value))
+}
+
+pub(super) fn compile_pdb(
+    model: &ProjectModel,
+    target: &Target,
+    config: &ConfigId,
+    usage: &mut UsageResolver<'_>,
+) -> Result<BString, ResolveError> {
+    let reuse = target
+        .props
+        .get(b"PRECOMPILE_HEADERS_REUSE_FROM")
+        .and_then(|name| model.find_target(target.dir, name))
+        .and_then(|id| model.target(id).map(|target| (id, target)));
+    let (id, owner) = reuse.map_or_else(
+        || (model.find_target(target.dir, &target.name), target),
+        |(id, owner)| (Some(id), owner),
+    );
+    let ctx = rcmake_genex::EvalContext {
+        config: config.clone(),
+        ..Default::default()
+    };
+    let mut property = |name: &[u8]| {
+        let specific = [name, b"_", &config.0.to_ascii_uppercase()].concat();
+        let configured = !config.0.is_empty() && owner.props.get(&specific).is_some();
+        let key = if configured { &specific } else { name };
+        let value = owner.props.get(key).filter(|value| !value.is_empty());
+        value
+            .map(|value| {
+                let append_config = !configured
+                    && multi_config(model)
+                    && !value.windows(2).any(|part| part == b"$<");
+                let value = if let Some(id) = id {
+                    usage.eval_ide_property(id, key, value, &ctx)?
+                } else {
+                    value.clone()
+                };
+                Ok::<_, ResolveError>((value, append_config))
+            })
+            .transpose()
+    };
+    let name = property(b"COMPILE_PDB_NAME")?.map(|(name, _)| name);
+    let reused = reuse.is_some()
+        || (!owner
+            .usage
+            .entries(rcmake_model::UsageField::PrecompileHeaders)
+            .is_empty()
+            && model.targets().any(|(_, candidate)| {
+                candidate
+                    .props
+                    .get(b"PRECOMPILE_HEADERS_REUSE_FROM")
+                    .is_some_and(|name| model.find_target(candidate.dir, name) == id)
+            }));
+    let named = name.is_some() || reused;
+    let file = name.or_else(|| {
+        (reused || owner.kind == TargetKind::StaticLibrary).then(|| owner.name.clone())
+    });
+    let mut dir = if let Some((path, append_config)) = property(b"COMPILE_PDB_OUTPUT_DIRECTORY")? {
+        let mut dir = join(&model.dir(owner.dir).binary_dir, &path);
+        if append_config {
+            dir = join(&dir, &config.0);
+        }
+        build_relative(model, &dir)
+    } else if named
+        && let Some(id) = id
+        && let Some(path) = usage.artifact(
+            id,
+            rcmake_genex::ArtifactKind::PdbFile,
+            rcmake_genex::ArtifactPart::Dir,
+            config,
+        )
+    {
+        build_relative(model, &path)
+    } else {
+        object_dir(model, owner, config)
+    };
+    if let Some(file) = file {
+        dir = join(&dir, &[file.as_slice(), b".pdb"].concat());
+    } else {
+        if dir.is_empty() {
+            dir.push(b'.');
+        }
+        if !dir.ends_with(b"/") {
+            dir.push(b'/');
+        }
+    }
+    Ok(dir)
+}
 
 pub(crate) fn is_darwin(model: &ProjectModel, dir: DirId) -> bool {
     if let Some(system) = definition(model, dir, b"CMAKE_SYSTEM_NAME") {
@@ -83,6 +188,12 @@ pub fn compute_artifacts(model: &ProjectModel, target: &Target, config: &ConfigI
             ..ArtifactSet::default()
         };
     }
+    if is_dll_platform(model, target.dir)
+        && let Some(id) = model.find_target(target.dir, &target.name)
+        && let Ok((artifacts, _)) = UsageResolver::new(model).ide_artifacts(id, config)
+    {
+        return artifacts;
+    }
 
     let mut artifacts = ArtifactSet::default();
     let darwin = is_darwin(model, target.dir);
@@ -109,8 +220,9 @@ pub fn compute_artifacts(model: &ProjectModel, target: &Target, config: &ConfigI
     let config_dir = (!config.0.is_empty())
         .then(|| target_property(model, target, &key))
         .flatten();
-    let configured_dir =
-        config_dir.or_else(|| target_property(model, target, output_dir.as_bytes()));
+    let configured_dir = config_dir
+        .or_else(|| target_property(model, target, output_dir.as_bytes()))
+        .or_else(|| legacy_library_output_directory(model, target));
     let mut dir = configured_dir.map_or_else(|| dir.clone(), |output| join(dir, output));
     if config_dir.is_none()
         && multi_config(model)
@@ -190,6 +302,19 @@ pub fn compute_artifacts(model: &ProjectModel, target: &Target, config: &ConfigI
     artifacts
 }
 
+pub(crate) fn legacy_library_output_directory<'a>(
+    model: &'a ProjectModel,
+    target: &Target,
+) -> Option<&'a BString> {
+    matches!(
+        target.kind,
+        TargetKind::StaticLibrary | TargetKind::SharedLibrary | TargetKind::ModuleLibrary
+    )
+    .then(|| definition(model, target.dir, b"LIBRARY_OUTPUT_PATH"))
+    .flatten()
+    .filter(|path| !path.is_empty())
+}
+
 fn multi_config(model: &ProjectModel) -> bool {
     model
         .generator
@@ -242,14 +367,23 @@ fn sha3_prefix(input: &[u8], length: usize) -> String {
 
 pub(crate) fn build_relative(model: &ProjectModel, path: &[u8]) -> BString {
     let root = &model.dir(DirId::ROOT).binary_dir;
-    let path = Lexical::new(path).normalize();
-    let root = Lexical::new(root).normalize();
-    let path = Lexical::new(&path);
-    let root = Lexical::new(&root);
+    let path = model_path(path).normalize();
+    let root = model_path(root).normalize();
+    let path = model_path(&path);
+    let root = model_path(&root);
     if root.prefix(path) {
         list_path(path.components().skip(root.components().count()))
     } else {
         path.normalize()
+    }
+}
+
+pub(crate) fn model_path(path: &[u8]) -> Lexical<'_> {
+    let windows = Lexical::windows(path);
+    if windows.absolute() {
+        windows
+    } else {
+        Lexical::new(path)
     }
 }
 
@@ -282,7 +416,7 @@ pub fn source_language(model: &ProjectModel, target: &Target, source: &[u8]) -> 
         return Some(language.clone());
     }
     let (_, extension) = Lexical::new(source).stem_extension(true);
-    ["C", "CXX", "OBJC", "OBJCXX", "ASM", "Fortran", "CUDA"]
+    ["C", "CXX", "OBJC", "OBJCXX", "ASM", "Fortran", "CUDA", "RC"]
         .into_iter()
         .find(|language| source_extension(model, target, language, extension))
         .map(BString::from)
@@ -295,6 +429,11 @@ fn source_extension(
     extension: &[u8],
 ) -> bool {
     let extension = extension.strip_prefix(b".").unwrap_or(extension);
+    if language == "RC" {
+        return extension.eq_ignore_ascii_case(b"rc")
+            && definition(model, target.dir, b"CMAKE_RC_COMPILER")
+                .is_some_and(|compiler| !truth::is_off(compiler));
+    }
     if let Some(values) = definition(
         model,
         target.dir,
@@ -363,18 +502,18 @@ fn object_name(
 ) -> BString {
     let dir = model.dir(target.dir);
     let root = model.dir(DirId::ROOT);
-    let absolute = Lexical::new(&join(&dir.source_dir, source)).normalize();
-    let absolute = Lexical::new(&absolute);
+    let absolute = model_path(&join(&dir.source_dir, source)).normalize();
+    let absolute = model_path(&absolute);
     let parent_count = absolute
         .components()
         .take_while(|part| *part == b"..")
         .count();
 
     let relative_to_tree = |current: &[u8], top: &[u8]| {
-        let current = Lexical::new(current).normalize();
-        let top = Lexical::new(top).normalize();
-        let current = Lexical::new(&current);
-        let top = Lexical::new(&top);
+        let current = model_path(current).normalize();
+        let top = model_path(top).normalize();
+        let current = model_path(&current);
+        let top = model_path(&top);
         (parent_count == 0
             && (current.prefix(absolute) || (top.prefix(current) && top.prefix(absolute))))
         .then(|| absolute.relative(current))
@@ -483,6 +622,7 @@ pub fn linker_language<'a>(
     }
     languages
         .into_iter()
+        .filter(|language| *language != b"RC")
         .max_by_key(|language| {
             definition(
                 model,
@@ -498,4 +638,85 @@ pub fn linker_language<'a>(
             })
         })
         .map(BString::from)
+}
+
+/// Collect listfiles and compiler data from the model.
+///
+/// Listfiles keep the order of their first appearance. Read compiler values
+/// from directory variable snapshots and the cache.
+#[must_use]
+pub fn collect_metadata(model: &ProjectModel) -> ConfigureMetadata {
+    let mut listfiles = IndexSet::new();
+    let mut languages = IndexMap::new();
+    for (dir, directory) in model.dirs() {
+        listfiles.extend(directory.listfiles.iter().cloned());
+        for key in directory.vars.keys().chain(directory.props.names().iter()) {
+            if let Some(language) = compiler_language(key) {
+                languages.entry(language).or_insert(dir);
+            }
+        }
+    }
+    for key in model
+        .global
+        .props
+        .names()
+        .iter()
+        .chain(model.cache.iter().map(|(key, _)| key))
+    {
+        if let Some(language) = compiler_language(key) {
+            languages.entry(language).or_insert(DirId::ROOT);
+        }
+    }
+    let toolchains = languages
+        .into_iter()
+        .filter_map(|(language, dir)| {
+            let read = |suffix: &[u8]| {
+                definition(
+                    model,
+                    dir,
+                    &[b"CMAKE_", language.as_slice(), b"_", suffix].concat(),
+                )
+            };
+            let compiler = read(b"COMPILER")?;
+            if rcmake_base::truth::is_off(compiler) {
+                return None;
+            }
+            let value = |suffix| read(suffix).cloned().unwrap_or_default();
+            let optional = |suffix| read(suffix).filter(|v| !v.is_empty()).cloned();
+            let paths =
+                |suffix| read(suffix).map_or_else(Vec::new, |v| list::split(v, list::Empty::Drop));
+            let toolchain = Toolchain {
+                compiler_path: compiler.clone(),
+                compiler_id: value(b"COMPILER_ID"),
+                compiler_version: value(b"COMPILER_VERSION"),
+                implicit_includes: paths(b"IMPLICIT_INCLUDE_DIRECTORIES"),
+                implicit_link_dirs: paths(b"IMPLICIT_LINK_DIRECTORIES"),
+                source_extensions: paths(b"SOURCE_FILE_EXTENSIONS"),
+                scandep_rule: optional(b"SCANDEP_SOURCE"),
+                module_map_format: optional(b"MODULE_MAP_FORMAT"),
+                module_map_flag: optional(b"MODULE_MAP_FLAG"),
+                compile_bmi_rule: optional(b"MODULE_BMI_ONLY_FLAG"),
+            };
+            Some((language, toolchain))
+        })
+        .collect();
+    ConfigureMetadata {
+        listfiles: listfiles.into_iter().collect(),
+        toolchains,
+        configure_log: definition(model, DirId::ROOT, b"CMAKE_CONFIGURE_LOG").cloned(),
+        cmake_command: definition(model, DirId::ROOT, b"CMAKE_COMMAND").cloned(),
+        ctest_command: definition(model, DirId::ROOT, b"CMAKE_CTEST_COMMAND").cloned(),
+        jobserver_steps: model
+            .commands()
+            .map(|(_, command)| command)
+            .filter(|command| command.kind == rcmake_model::CustomCommandKind::Output)
+            .enumerate()
+            .filter_map(|(step, command)| command.job_server_aware.then_some(step))
+            .collect(),
+    }
+}
+
+fn compiler_language(key: &[u8]) -> Option<BString> {
+    let lang = key.strip_prefix(b"CMAKE_")?.strip_suffix(b"_COMPILER")?;
+    (!lang.is_empty()).then(|| lang.into())
 }

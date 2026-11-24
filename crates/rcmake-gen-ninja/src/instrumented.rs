@@ -30,6 +30,15 @@ fn arguments(invocation: &Invocation) -> Option<(&BString, &[BString])> {
     .then_some((program, args))
 }
 
+pub(crate) fn ordinary_rule(scanned: bool, depfile: bool) -> &'static [u8] {
+    match (scanned, depfile) {
+        (false, false) => b"COMPILE",
+        (false, true) => b"COMPILE_DEPFILE",
+        (true, false) => b"CXX_COMPILE_SCANNED",
+        (true, true) => b"CXX_COMPILE_SCANNED_DEPFILE",
+    }
+}
+
 pub(crate) fn compile(
     invocation: &Invocation,
     scanned: bool,

@@ -3,6 +3,8 @@
 #![forbid(unsafe_code)]
 
 mod build;
+mod clean;
+mod commands;
 mod graph;
 mod install;
 
@@ -11,6 +13,7 @@ mod instrumented;
 mod modules;
 mod multi;
 mod prep;
+mod response;
 mod syntax;
 
 pub use build::build_commands;
@@ -25,9 +28,10 @@ use rcmake_host::{FileKind, Follow, Host, ReadRange, path};
 use rcmake_model::{DirId, ProjectModel};
 use rcmake_resolve::{ArtifactSet, BuildGraph, BuildStep, GenerationResult};
 
+use commands::Commands;
 use graph::{Graph, qualified};
 use prep::PrepTargets;
-use syntax::{Edge, Ninja, shell_word};
+use syntax::{Edge, Ninja};
 
 const RULES_PATH: &str = "CMakeFiles/rules.ninja";
 const RULES: &str = "\
@@ -101,7 +105,7 @@ pub fn generate_single_config(
     host: &dyn Host,
     build_dir: &Path,
 ) -> Result<(), GenError> {
-    generate_single(result, host, build_dir, None)
+    generate_single(result, host, build_dir, None, Commands::new(host))
 }
 
 /// Write a single-configuration Ninja manifest with test preparation targets
@@ -116,16 +120,13 @@ pub fn generate_single_config_with_model(
     build_dir: &Path,
     model: &ProjectModel,
 ) -> Result<(), GenError> {
-    generate_single(result, host, build_dir, Some(model))
+    generate_single(result, host, build_dir, Some(model), Commands::new(host))
 }
 
-fn output_prefix(model: Option<&ProjectModel>) -> BString {
+fn output_prefix(model: Option<&ProjectModel>, commands: &Commands) -> BString {
     model
         .and_then(|model| model.definition(DirId::ROOT, b"CMAKE_NINJA_OUTPUT_PATH_PREFIX"))
-        .map(|prefix| rcmake_base::path_lex::cmake_style(prefix))
-        .map_or_else(BString::default, |prefix| {
-            rcmake_base::path_lex::Lexical::new(&prefix).normalize()
-        })
+        .map_or_else(BString::default, |prefix| commands.path(prefix))
 }
 
 fn generate_single(
@@ -133,18 +134,28 @@ fn generate_single(
     host: &dyn Host,
     build_dir: &Path,
     model: Option<&ProjectModel>,
+    commands: Commands,
 ) -> Result<(), GenError> {
-    let prefix = output_prefix(model);
+    let prefix = output_prefix(model, &commands);
     let empty = BuildGraph::default();
     let input = result.graphs.first().unwrap_or(&empty);
     let artifacts = config_artifacts(result, input);
-    let mut graph = Graph::with_prefix(input, &artifacts, build_dir, None, &prefix)?;
+    let mut graph = Graph::with_prefix(
+        input,
+        &artifacts,
+        build_dir,
+        None,
+        &prefix,
+        commands.clone(),
+    )?;
     graph.add_aliases(&artifacts, model);
     graph.resolve_custom_inputs(model, host);
     graph.connect_custom_dependencies(model);
     graph.set_compile_metadata(result);
+    graph.set_command_settings(model, host);
+    graph.set_clean_files(model)?;
     let prep = PrepTargets::new(&graph, result, model, host)?;
-    let programs = Programs::new(result, host, build_dir, model);
+    let programs = Programs::new(result, host, build_dir, model, &commands);
     let uses_modules = modules::uses_modules(input);
     let module_flag = if uses_modules {
         modules::modmap_flag(result, build_dir)?
@@ -152,6 +163,7 @@ fn generate_single(
         BString::default()
     };
     prepare_directory(host, build_dir)?;
+    graph.prepare_custom_scripts(host)?;
     let verify_globs = rcmake_gen_common::glob::write_verification(model, build_dir, host)?;
     let exports = model
         .map(|model| write_module_exports(result, model, host, build_dir, false))
@@ -180,7 +192,7 @@ fn generate_single(
         &graph,
         &manifests,
         result,
-        &configure_command(result, build_dir, &programs.cmake, true),
+        &configure_command(result, build_dir, &programs.cmake, &commands, true),
         verify_globs.then_some(programs.cmake.as_slice()),
     );
     emit_utilities(
@@ -188,13 +200,13 @@ fn generate_single(
         &graph,
         b"build.ninja",
         &programs,
-        &configure_command(result, build_dir, &programs.cmake, false),
+        &configure_command(result, build_dir, &programs.cmake, &commands, false),
     );
     if graph.prefix.is_empty() {
         ninja.0.extend_from_slice(b"default all\n");
     }
 
-    write_rules(result, host, build_dir, uses_modules, model)?;
+    write_rules(result, host, build_dir, uses_modules, model, &commands)?;
     write_if_changed(host, &build_dir.join("build.ninja"), &ninja.0)
 }
 
@@ -213,7 +225,7 @@ pub fn generate_multi_config(
     host: &dyn Host,
     build_dir: &Path,
 ) -> Result<(), GenError> {
-    generate_multi(result, host, build_dir, None)
+    generate_multi(result, host, build_dir, None, Commands::new(host))
 }
 
 /// Write Ninja Multi-Config manifests with test preparation targets from the
@@ -228,7 +240,7 @@ pub fn generate_multi_config_with_model(
     build_dir: &Path,
     model: &ProjectModel,
 ) -> Result<(), GenError> {
-    generate_multi(result, host, build_dir, Some(model))
+    generate_multi(result, host, build_dir, Some(model), Commands::new(host))
 }
 
 fn generate_multi(
@@ -236,8 +248,9 @@ fn generate_multi(
     host: &dyn Host,
     build_dir: &Path,
     model: Option<&ProjectModel>,
+    commands: Commands,
 ) -> Result<(), GenError> {
-    let prefix = output_prefix(model);
+    let prefix = output_prefix(model, &commands);
     let mut configs = Vec::new();
     let mut names = HashSet::new();
     for config in &result.configs {
@@ -261,14 +274,27 @@ fn generate_multi(
                 generation_error(build_dir, "A Ninja configuration has no build graph.")
             })?;
         let artifacts = config_artifacts(result, input);
-        let mut graph = Graph::with_prefix(input, &artifacts, build_dir, Some(name), &prefix)?;
+        let mut graph = Graph::with_prefix(
+            input,
+            &artifacts,
+            build_dir,
+            Some(name),
+            &prefix,
+            commands.clone(),
+        )?;
         graph.add_aliases(&artifacts, model);
         graph.resolve_custom_inputs(model, host);
         graph.set_compile_metadata(result);
+        graph.set_command_settings(model, host);
+        graph.set_clean_files(model)?;
         let prep = PrepTargets::new(&graph, result, model, host)?;
         configs.push((graph, ConfigFiles::new(name, prep)));
     }
 
+    prepare_directory(host, build_dir)?;
+    for (graph, _) in &mut configs {
+        graph.prepare_custom_scripts(host)?;
+    }
     let selection = multi::Selection::new(&result.configs, build_dir, |name| {
         model
             .and_then(|model| model.definition(DirId::ROOT, name))
@@ -320,10 +346,10 @@ fn generate_multi(
                 .map(|file| default.node(file)),
         );
     }
-    write_rules(result, host, build_dir, uses_modules, model)?;
-    let programs = Programs::new(result, host, build_dir, model);
-    let rebuild = configure_command(result, build_dir, &programs.cmake, false);
-    let regenerate = configure_command(result, build_dir, &programs.cmake, true);
+    write_rules(result, host, build_dir, uses_modules, model, &commands)?;
+    let programs = Programs::new(result, host, build_dir, model, &commands);
+    let rebuild = configure_command(result, build_dir, &programs.cmake, &commands, false);
+    let regenerate = configure_command(result, build_dir, &programs.cmake, &commands, true);
     for (index, (graph, files)) in configs.iter().enumerate() {
         let mut ninja = graph.manifest();
         ninja.include(&graph.node(RULES_PATH.as_bytes()));
@@ -348,11 +374,19 @@ fn generate_multi(
                 .flatten()
                 .map(|input| {
                     let artifacts = config_artifacts(result, input);
-                    let mut variant =
-                        Graph::with_prefix(input, &artifacts, build_dir, output.config, &prefix)?;
+                    let mut variant = Graph::with_prefix(
+                        input,
+                        &artifacts,
+                        build_dir,
+                        output.config,
+                        &prefix,
+                        commands.clone(),
+                    )?;
                     variant.add_aliases(&artifacts, model);
                     variant.resolve_custom_inputs(model, host);
                     variant.set_compile_metadata(result);
+                    variant.set_command_settings(model, host);
+                    variant.prepare_custom_scripts(host)?;
                     Ok::<_, GenError>(variant)
                 })
                 .transpose()?;
@@ -371,9 +405,9 @@ fn generate_multi(
             &mut ninja,
             graph,
             &files.implementation,
-            included
-                .filter_map(|selected| configs.get(selected).and_then(|(graph, _)| graph.config)),
-            cross.iter().filter_map(|graph| graph.config),
+            &programs,
+            included.filter_map(|selected| configs.get(selected).map(|(graph, _)| graph)),
+            &cross,
         );
         if !cross.is_empty() {
             graph.emit_aliases(&mut ninja, Some(b"all"), &cross, &emitted);
@@ -490,6 +524,7 @@ fn write_rules(
     build_dir: &Path,
     uses_modules: bool,
     model: Option<&ProjectModel>,
+    commands: &Commands,
 ) -> Result<(), GenError> {
     let mut ninja = if uses_modules {
         let mut rules = RULES.replacen(
@@ -502,7 +537,18 @@ fn write_rules(
     } else {
         Ninja(RULES.as_bytes().to_vec())
     };
-    instrumented::emit_rules(&mut ninja, result);
+    response::emit_rules(&mut ninja);
+    if !commands.windows() {
+        instrumented::emit_rules(&mut ninja, result);
+    }
+    if let Some(prefix) = model
+        .and_then(|model| model.definition(DirId::ROOT, b"CMAKE_CL_SHOWINCLUDES_PREFIX"))
+        .cloned()
+        .or_else(|| configuration_setting(host, build_dir, b"CMAKE_CL_SHOWINCLUDES_PREFIX"))
+        .filter(|prefix| !prefix.is_empty())
+    {
+        ninja.global_binding(b"msvc_deps_prefix", &prefix);
+    }
     let mut pools = BTreeMap::new();
     let specs = if let Some(model) = model {
         model
@@ -595,7 +641,7 @@ fn emit_regeneration(
         );
         let mut command = cmake.to_vec();
         command.extend_from_slice(b" -P ");
-        shell_word(&script, &mut command);
+        graph.commands.word(&script, &mut command);
         ninja.binding(b"COMMAND", &command);
         listfiles.push(stamp);
     }
@@ -645,6 +691,7 @@ fn configure_command(
     result: &GenerationResult,
     build_dir: &Path,
     cmake: &[u8],
+    commands: &Commands,
     rerun: bool,
 ) -> Vec<u8> {
     let source_dir = source_directory(result, build_dir);
@@ -652,10 +699,18 @@ fn configure_command(
     if rerun {
         command.extend_from_slice(b" --regenerate-during-build");
     }
-    command.extend_from_slice(b" -S");
-    shell_word(&path::from_native(&source_dir), &mut command);
-    command.extend_from_slice(b" -B");
-    shell_word(&path::from_native(build_dir), &mut command);
+    let option = |prefix: &[u8], directory: &Path, command: &mut Vec<u8>| {
+        command.push(b' ');
+        let directory = path::from_native(directory);
+        if commands.windows() {
+            commands.word(&[prefix, &directory].concat(), command);
+        } else {
+            command.extend_from_slice(prefix);
+            commands.word(&directory, command);
+        }
+    };
+    option(b"-S", &source_dir, &mut command);
+    option(b"-B", build_dir, &mut command);
     command
 }
 
@@ -686,6 +741,7 @@ struct Programs {
     cmake: Vec<u8>,
     ctest: Vec<u8>,
     cpack: Vec<u8>,
+    ninja: Vec<u8>,
     package: bool,
     package_source: bool,
     package_inputs: Vec<BString>,
@@ -703,6 +759,7 @@ impl Programs {
         host: &dyn Host,
         build_dir: &Path,
         model: Option<&ProjectModel>,
+        commands: &Commands,
     ) -> Self {
         let cache = read_cache(host, build_dir);
         let definition = |key: &[u8]| model.and_then(|model| model.definition(DirId::ROOT, key));
@@ -716,7 +773,7 @@ impl Programs {
         };
         let program = |resolved: Option<BString>, fallback: &[u8]| {
             let mut command = Vec::new();
-            shell_word(
+            commands.word(
                 resolved.as_ref().map_or(fallback, |value| value.as_slice()),
                 &mut command,
             );
@@ -761,6 +818,10 @@ impl Programs {
                 b"ctest",
             ),
             cpack: program(cpack, b"cpack"),
+            ninja: program(
+                setting(definition(b"CMAKE_MAKE_PROGRAM"), b"CMAKE_MAKE_PROGRAM"),
+                b"ninja",
+            ),
             package: has_config("CPackConfig.cmake"),
             package_source: has_config("CPackSourceConfig.cmake"),
             testing: model.is_none()
@@ -809,3 +870,6 @@ fn generation_error(path: &Path, message: impl Into<BString>) -> GenError {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod windows_tests;

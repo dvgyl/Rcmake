@@ -13,7 +13,8 @@ use rcmake_resolve::{
     ArtifactSet, BuildGraph, BuildStep, GenerationResult, ScanResponse, progress,
 };
 
-use crate::syntax::{Edge, Ninja, shell_word};
+use crate::commands::Commands;
+use crate::syntax::{Edge, Ninja};
 use crate::{generation_error, modules};
 
 mod aliases;
@@ -25,9 +26,14 @@ pub(crate) struct Graph<'a> {
     pub(crate) build_dir: &'a Path,
     pub(crate) config: Option<&'a [u8]>,
     pub(crate) prefix: &'a [u8],
+    pub(crate) commands: Commands,
+    build_root: BString,
+    pub(crate) clean_files: BTreeSet<BString>,
+    pub(crate) command_settings: crate::response::Settings<'a>,
+    custom_scripts: HashMap<BString, BString>,
     names: HashMap<BString, usize>,
     scan_responses: HashMap<&'a [u8], &'a ScanResponse>,
-    compile_languages: HashMap<&'a [u8], &'a [u8]>,
+    pub(crate) compile_languages: HashMap<&'a [u8], &'a [u8]>,
     compile_inputs: Option<&'a std::collections::BTreeMap<BString, Vec<BString>>>,
     aliases: Vec<BString>,
     extra_aliases: BTreeMap<BString, Vec<BString>>,
@@ -63,7 +69,14 @@ impl<'a> Graph<'a> {
         build_dir: &'a Path,
         config: Option<&'a [u8]>,
     ) -> Result<Self, GenError> {
-        Self::with_prefix(input, artifacts, build_dir, config, b"")
+        Self::with_prefix(
+            input,
+            artifacts,
+            build_dir,
+            config,
+            b"",
+            Commands::default(),
+        )
     }
 
     pub(crate) fn with_prefix(
@@ -72,12 +85,18 @@ impl<'a> Graph<'a> {
         build_dir: &'a Path,
         config: Option<&'a [u8]>,
         prefix: &'a [u8],
+        commands: Commands,
     ) -> Result<Self, GenError> {
         let mut graph = Self {
             input,
             build_dir,
             config,
             prefix,
+            build_root: commands.path(&path::from_native(build_dir)),
+            commands,
+            clean_files: BTreeSet::new(),
+            command_settings: crate::response::Settings::default(),
+            custom_scripts: HashMap::new(),
             names: HashMap::with_capacity(input.targets.len()),
             scan_responses: HashMap::new(),
             compile_languages: HashMap::new(),
@@ -196,7 +215,6 @@ impl<'a> Graph<'a> {
                 &artifacts.soname_file,
                 &artifacts.linker_file,
                 &artifacts.import_file,
-                &artifacts.pdb_file,
             ]
             .into_iter()
             .filter_map(Option::as_ref)
@@ -224,15 +242,14 @@ impl<'a> Graph<'a> {
     }
 
     pub(crate) fn node(&self, value: &[u8]) -> BString {
-        let value = Lexical::new(&rcmake_base::path_lex::cmake_style(value)).normalize();
-        let native = path::to_native(&value);
-        let relative = match native.strip_prefix(self.build_dir) {
-            Ok(relative) if relative.as_os_str().is_empty() => ".".into(),
-            Ok(relative) => rcmake_base::path_lex::cmake_style(&path::from_native(relative)),
-            Err(_) => value,
-        };
+        let value = self.commands.path(value);
+        let relative = self
+            .commands
+            .beneath(&value, &self.build_root)
+            .map(BString::from);
+        let relative = relative.unwrap_or(value);
         if self.prefix.is_empty()
-            || Lexical::new(&relative).absolute()
+            || self.commands.absolute(&relative)
             || relative == self.prefix
             || relative
                 .strip_prefix(self.prefix)
@@ -240,7 +257,7 @@ impl<'a> Graph<'a> {
         {
             relative
         } else {
-            Lexical::new(self.prefix).append(&relative)
+            self.commands.path(&[self.prefix, b"/", &relative].concat())
         }
     }
 
@@ -248,11 +265,46 @@ impl<'a> Graph<'a> {
         if self.prefix.is_empty() {
             return command.into();
         }
-        let mut out = b"cd -- ".to_vec();
-        shell_word(&path::from_native(self.build_dir), &mut out);
-        out.extend_from_slice(b" && ");
-        out.extend_from_slice(command);
-        out.into()
+        self.commands
+            .in_directory(command, &path::from_native(self.build_dir))
+            .into()
+    }
+
+    pub(crate) fn command_line(
+        &self,
+        invocations: &[rcmake_resolve::Invocation],
+        custom: bool,
+    ) -> Vec<u8> {
+        self.commands.line(
+            invocations,
+            custom,
+            &path::from_native(self.build_dir),
+            !self.prefix.is_empty(),
+        )
+    }
+
+    pub(crate) fn prepare_custom_scripts(&mut self, host: &dyn Host) -> Result<(), GenError> {
+        let build = path::from_native(self.build_dir);
+        for (step, nodes) in self.input.steps.iter().zip(&self.steps) {
+            let BuildStep::Custom(custom) = step else {
+                continue;
+            };
+            let Some(output) = nodes.outputs.first() else {
+                continue;
+            };
+            let Some(script) =
+                self.commands
+                    .custom_script(&custom.invocations, &build, !self.prefix.is_empty())
+            else {
+                continue;
+            };
+            let digest = rcmake_base::hash::HashAlgo::Sha256.hex_digest(&script);
+            let name = format!("CMakeFiles/rcmake-custom-{digest}.cmd");
+            crate::write_if_changed(host, &self.build_dir.join(&name), &script)?;
+            self.custom_scripts
+                .insert(output.clone(), self.node(name.as_bytes()));
+        }
+        Ok(())
     }
 
     pub(crate) fn has_target(&self, name: &BString) -> bool {
@@ -513,6 +565,7 @@ impl<'a> Graph<'a> {
 
     pub(crate) fn set_compile_metadata(&mut self, result: &'a GenerationResult) {
         self.compile_languages = progress::compile_languages(result, self.input);
+        self.command_settings.result = Some(result);
         self.compile_inputs = Some(&result.compile_inputs);
         self.scan_responses.extend(
             result
@@ -705,11 +758,7 @@ impl<'a> Graph<'a> {
         );
 
         for (key, value) in plan.bindings {
-            if key == b"COMMAND" {
-                ninja.binding(key, &self.in_build_dir(&value));
-            } else {
-                ninja.binding(key, &value);
-            }
+            ninja.binding(key, &value);
         }
     }
 }

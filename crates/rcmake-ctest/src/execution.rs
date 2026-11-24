@@ -122,6 +122,20 @@ pub(crate) fn resolve_program_at(
     }
     let program = to_native(command);
     let local = directory.join(&program);
+    let windows = host.system().sysname.starts_with(b"Windows");
+    if let Some(path) = find_local_program(host, &local, config, windows) {
+        *command = from_native(&path);
+    } else if program.components().count() > 1 {
+        *command = from_native(&local);
+    }
+}
+
+fn find_local_program(
+    host: &dyn Host,
+    local: &std::path::Path,
+    config: Option<&BString>,
+    windows: bool,
+) -> Option<std::path::PathBuf> {
     let config_path = config.and_then(|config| {
         Some(
             local
@@ -130,18 +144,23 @@ pub(crate) fn resolve_program_at(
                 .join(local.file_name()?),
         )
     });
-    for path in std::iter::once(&local).chain(config_path.as_ref()) {
-        if host
-            .metadata(path, Follow::Yes)
+    let is_file = |path: &std::path::Path| {
+        host.metadata(path, Follow::Yes)
             .is_ok_and(|metadata| metadata.kind == FileKind::File)
-        {
-            *command = from_native(path);
-            return;
+    };
+    for path in std::iter::once(local).chain(config_path.as_deref()) {
+        if is_file(path) {
+            return Some(path.to_path_buf());
+        }
+        if windows {
+            let mut executable = path.to_path_buf();
+            executable.as_mut_os_string().push(".exe");
+            if is_file(&executable) {
+                return Some(executable);
+            }
         }
     }
-    if program.components().count() > 1 {
-        *command = from_native(&local);
-    }
+    None
 }
 
 pub(crate) fn parse_timeout(value: &[u8]) -> Option<Duration> {
@@ -349,4 +368,42 @@ fn exited(test: &PlannedTest, code: i32, output: &[u8]) -> ResultLine {
         detail: Some(error.to_string()),
         ..ResultLine::new(Status::Failed)
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::find_local_program;
+    use rcmake_host::{HostResult, PureHost};
+    use std::path::Path;
+
+    #[test]
+    fn windows_test_program_suffix_and_config_order() -> HostResult<()> {
+        let host = PureHost::default();
+        let program = Path::new("/work/sub/parse.number");
+        let local = Path::new("/work/sub/parse.number.exe");
+        let configured = Path::new("/work/sub/Release/parse.number.exe");
+        let release = "Release".into();
+        host.seed_file(configured, b"")?;
+        assert_eq!(
+            find_local_program(&host, program, Some(&release), false),
+            None
+        );
+        assert_eq!(
+            find_local_program(&host, program, Some(&release), true).as_deref(),
+            Some(configured)
+        );
+
+        host.seed_file(local, b"")?;
+        assert_eq!(
+            find_local_program(&host, program, Some(&release), true).as_deref(),
+            Some(local)
+        );
+
+        host.seed_file(program, b"")?;
+        assert_eq!(
+            find_local_program(&host, program, Some(&release), true).as_deref(),
+            Some(program)
+        );
+        Ok(())
+    }
 }

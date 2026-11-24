@@ -12,10 +12,13 @@ use rcmake_json::Value;
 use rcmake_model::{Cache, CacheType, GeneratorKind};
 
 use crate::options::{self, CacheEdit, DirectoryArg, Options};
-use crate::{cache, emit_cli_error, new_interp, new_interp_with_paths, presets, resolve_cli_path};
+use crate::{cache, emit_cli_error, new_interp, new_interp_with_paths, presets};
 
+mod cache_setup;
 mod diagnostics;
 mod graphviz;
+#[cfg(test)]
+mod tests;
 
 use graphviz::write_graphviz;
 mod unused_cli;
@@ -171,7 +174,7 @@ impl<'a> ConfigureSession<'a> {
                 listing,
             )));
         }
-        let mut saved = load_cache(host.as_ref(), bin.as_deref().unwrap_or(&cwd))?;
+        let mut saved = cache_setup::load(host.as_ref(), bin.as_deref().unwrap_or(&cwd))?;
         if src.is_none() {
             src = saved
                 .get(HOME_DIR)
@@ -196,7 +199,7 @@ impl<'a> ConfigureSession<'a> {
                 && let Some(dir) = preset.binary.take()
             {
                 if dir != cwd {
-                    saved = load_cache(host.as_ref(), &dir)?;
+                    saved = cache_setup::load(host.as_ref(), &dir)?;
                 }
                 bin = Some(dir);
             }
@@ -209,7 +212,7 @@ impl<'a> ConfigureSession<'a> {
         }
         let bin = bin.unwrap_or(cwd);
         if opts.fresh && !opts.view {
-            clear_cache(host.as_ref(), &bin).map_err(|err| {
+            cache_setup::clear(host.as_ref(), &bin).map_err(|err| {
                 Exit::Message(format!(
                     "Could not remove the cache in {}: {err}",
                     bin.display()
@@ -481,15 +484,8 @@ impl<'a> ConfigureSession<'a> {
         preloads: Preloads,
     ) -> Result<Configured, Exit> {
         let host = self.host.as_ref();
-        let toolchain =
-            apply_environment_defaults(host, interp.cx().cache(), &self.src, &self.bin, has_cache);
-        if let Some(toolchain) = toolchain
-            && is_file(host, &toolchain)
-        {
-            let _ = interp
-                .cx()
-                .include_file(&toolchain, IncludeOptions::default());
-        }
+        // The system module loads the toolchain when project() starts platform setup.
+        cache_setup::apply_environment_defaults(host, interp.cx().cache(), has_cache);
         rcmake_instrument::query::clear_generated_queries(host, &self.bin)
             .map_err(Exit::message)?;
         if host
@@ -722,15 +718,6 @@ struct Preloads {
     missing: bool,
 }
 
-fn load_cache(host: &dyn Host, bin: &Path) -> Result<Cache, Exit> {
-    cache::load(host, bin).map_err(|err| {
-        Exit::Message(format!(
-            "Could not load cache from {}: {err}",
-            bin.display()
-        ))
-    })
-}
-
 fn resolve_directories(
     host: &dyn Host,
     args: &[DirectoryArg],
@@ -798,90 +785,6 @@ fn set_directory_vars(interp: &mut Interp, src: &Path, bin: &Path) {
     cx.set_var(b"CMAKE_CURRENT_SOURCE_DIR", source);
     cx.set_var(b"CMAKE_BINARY_DIR", binary.clone());
     cx.set_var(b"CMAKE_CURRENT_BINARY_DIR", binary);
-}
-
-fn clear_cache(host: &dyn Host, bin: &Path) -> rcmake_host::HostResult<()> {
-    let ignore_missing = |result: rcmake_host::HostResult<()>| {
-        result.or_else(|err| {
-            if err.kind == std::io::ErrorKind::NotFound {
-                Ok(())
-            } else {
-                Err(err)
-            }
-        })
-    };
-    ignore_missing(host.remove_file(&bin.join("CMakeCache.txt")))?;
-    let files = bin.join("CMakeFiles");
-    if host
-        .metadata(&files, Follow::No)
-        .is_ok_and(|m| m.kind == FileKind::Symlink)
-    {
-        ignore_missing(host.remove_file(&files))
-    } else {
-        ignore_missing(host.remove_dir_all(&files))
-    }
-}
-
-fn apply_environment_defaults(
-    host: &dyn Host,
-    cache: &mut Cache,
-    src: &Path,
-    bin: &Path,
-    has_cache: bool,
-) -> Option<PathBuf> {
-    for (name, ty) in [
-        (b"CMAKE_TOOLCHAIN_FILE".as_slice(), CacheType::Filepath),
-        (b"CMAKE_INSTALL_PREFIX", CacheType::Path),
-        (b"CMAKE_BUILD_TYPE", CacheType::String),
-        (b"CMAKE_EXPORT_COMPILE_COMMANDS", CacheType::Bool),
-        (b"CMAKE_COLOR_DIAGNOSTICS", CacheType::Bool),
-        (b"CMAKE_CROSSCOMPILING_EMULATOR", CacheType::String),
-    ] {
-        if !has_cache
-            && !cache.contains(name)
-            && let Some(value) = host.env_get(name).filter(|v| !v.is_empty())
-        {
-            let value = if name == b"CMAKE_COLOR_DIAGNOSTICS" {
-                BString::from(if is_on(&value) { "ON" } else { "OFF" })
-            } else {
-                value
-            };
-            cache::insert(cache, name, value, Some(ty));
-        }
-        if let Some(entry) = cache.get_mut(name)
-            && entry.ty == CacheType::Uninitialized
-        {
-            entry.ty = ty;
-        }
-    }
-    if cache
-        .get(GENERATOR)
-        .is_some_and(|g| g.value.windows(4).any(|window| window == b"Make"))
-        && !cache.contains(b"CMAKE_COLOR_MAKEFILE")
-    {
-        cache::insert(
-            cache,
-            b"CMAKE_COLOR_MAKEFILE",
-            "ON".into(),
-            Some(CacheType::Bool),
-        );
-    }
-    let entry = cache
-        .get_mut(b"CMAKE_TOOLCHAIN_FILE")
-        .filter(|entry| !entry.value.is_empty())?;
-    let path = path::to_native(&entry.value);
-    let absolute = if path.is_absolute() {
-        resolve_cli_path(host, &entry.value)
-    } else {
-        let build_path = bin.join(&path);
-        if is_file(host, &build_path) {
-            build_path
-        } else {
-            src.join(&path)
-        }
-    };
-    entry.value = path::from_native(&absolute);
-    Some(absolute)
 }
 
 fn remove_entries(interp: &mut Interp, pattern: &[u8], tracked: &mut BTreeSet<BString>) {

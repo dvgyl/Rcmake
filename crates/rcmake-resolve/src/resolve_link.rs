@@ -107,6 +107,7 @@ pub(crate) fn resolve_link(
     let directories = usage
         .collect(id, UsageField::LinkDirectories, &ctx)?
         .entries;
+    let naming = LinkLibraryFlags::new(model, target, &language);
     let mut fragments = Vec::with_capacity(options.len() + directories.len() + items.len());
     for option in &options {
         let value = option.value.as_slice();
@@ -120,7 +121,7 @@ pub(crate) fn resolve_link(
         fragments.push(link_fragment(text, option, LinkFragmentRole::Flags));
     }
     for directory in &directories {
-        let text = quote(&[b"-L", directory.value.as_slice()].concat());
+        let text = quote(&[naming.path, directory.value.as_slice()].concat());
         fragments.push(link_fragment(
             text,
             directory,
@@ -174,7 +175,7 @@ pub(crate) fn resolve_link(
                     model,
                     usage,
                     resolved,
-                    target.dir,
+                    (target.dir, &naming),
                     &ctx.config,
                     item,
                     fragments,
@@ -403,7 +404,7 @@ fn append_link_item(
     model: &ProjectModel,
     usage: &UsageResolver<'_>,
     resolved: &IndexMap<TargetId, ResolvedTarget>,
-    dir: DirId,
+    (dir, naming): (DirId, &LinkLibraryFlags<'_>),
     config: &ConfigId,
     item: &ResolvedLinkItem,
     fragments: &mut Vec<LinkFragment>,
@@ -477,12 +478,20 @@ fn append_link_item(
                 append_library_path(model, dir, &path, &item.text, fragments);
                 return;
             }
-            (raw_library(value), Libraries)
+            (naming.library(value), Libraries)
         }
         ResolvedLinkKind::Objects(_) | ResolvedLinkKind::Interface(_) => return,
         ResolvedLinkKind::Group { members, .. } => {
             for member in members {
-                append_link_item(model, usage, resolved, dir, config, member, fragments);
+                append_link_item(
+                    model,
+                    usage,
+                    resolved,
+                    (dir, naming),
+                    config,
+                    member,
+                    fragments,
+                );
             }
             return;
         }
@@ -497,7 +506,7 @@ fn append_link_item(
         ResolvedLinkKind::Raw if is_framework_option(value) && lower::is_darwin(model, dir) => {
             (value.into(), Libraries)
         }
-        ResolvedLinkKind::Raw => (raw_library(value), Libraries),
+        ResolvedLinkKind::Raw => (naming.library(value), Libraries),
     };
     fragments.push(link_fragment(text, &item.text, role));
 }
@@ -534,8 +543,25 @@ fn append_library_path(
             LinkFragmentRole::Libraries,
         ));
     } else {
+        let windows = lower::artifacts::is_dll_platform(model, dir);
+        let darwin_ninja = lower::is_darwin(model, dir)
+            && matches!(
+                model.generator,
+                Some(
+                    rcmake_model::GeneratorKind::Ninja
+                        | rcmake_model::GeneratorKind::NinjaMultiConfig
+                )
+            );
+        let mut path = if windows || darwin_ninja {
+            lower::build_relative(model, path)
+        } else {
+            path.into()
+        };
+        if windows && !path.contains(&b'/') && !path.contains(&b'\\') {
+            path = [b"./".as_slice(), &path].concat().into();
+        }
         fragments.push(link_fragment(
-            quote(path),
+            quote(&path),
             origin,
             LinkFragmentRole::Libraries,
         ));
@@ -571,11 +597,48 @@ fn append_framework_dir(
     }
 }
 
-fn raw_library(value: &[u8]) -> BString {
-    if value.starts_with(b"-") || value.contains(&b'/') || value.ends_with(b".lib") {
-        quote(value)
-    } else {
-        quote(&[b"-l", value].concat())
+struct LinkLibraryFlags<'a> {
+    path: &'a [u8],
+    prefix: &'a [u8],
+    suffix: &'a [u8],
+    msvc: bool,
+}
+
+impl<'a> LinkLibraryFlags<'a> {
+    fn new(model: &'a ProjectModel, target: &Target, language: &[u8]) -> Self {
+        let msvc = lower::artifacts::is_msvc(model, target.dir, language);
+        let flag = |key: &[u8], fallback: &'static [u8]| {
+            lower::definition(
+                model,
+                target.dir,
+                &[b"CMAKE_", language, b"_", key].concat(),
+            )
+            .or_else(|| lower::definition(model, target.dir, &[b"CMAKE_", key].concat()))
+            .map_or(fallback, |value| value.as_slice())
+        };
+        Self {
+            path: flag(
+                b"LIBRARY_PATH_FLAG",
+                if msvc { b"-LIBPATH:" } else { b"-L" },
+            ),
+            prefix: flag(b"LINK_LIBRARY_FLAG", if msvc { b"" } else { b"-l" }),
+            suffix: flag(b"LINK_LIBRARY_SUFFIX", if msvc { b".lib" } else { b"" }),
+            msvc,
+        }
+    }
+
+    fn library(&self, value: &[u8]) -> BString {
+        let (_, extension) = Lexical::new(value).stem_extension(true);
+        if value.starts_with(b"-")
+            || value.contains(&b'/')
+            || value.contains(&b'\\')
+            || (self.msvc && !extension.is_empty())
+            || extension.eq_ignore_ascii_case(b".lib")
+        {
+            quote(value)
+        } else {
+            quote(&[self.prefix, value, self.suffix].concat())
+        }
     }
 }
 

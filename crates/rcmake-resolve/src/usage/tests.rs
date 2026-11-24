@@ -872,7 +872,11 @@ fn injections_exclusions_qualifiers_and_link_features() {
     };
     assert_eq!(feature, "RESCAN");
     assert_eq!(link_line(members), "member;-lm");
-    assert_eq!(members[1].feature, Some("DEFAULT".into()));
+    assert!(
+        members
+            .get(1)
+            .is_some_and(|member| member.feature.is_none())
+    );
     assert_eq!(items[3].kind, ResolvedLinkKind::Library(base));
 
     link(&mut model, app, false, &["obj"]);
@@ -890,34 +894,41 @@ fn injections_exclusions_qualifiers_and_link_features() {
 }
 
 #[test]
-fn deduplication_respects_linker_processing_and_static_policy() {
+fn deduplication_respects_linker_processing_and_static_policy()
+-> Result<(), Box<dyn std::error::Error>> {
     let mut model = model("Darwin");
+    model.global.props.set(
+        "CMAKE_C_LINK_LIBRARIES_PROCESSING".into(),
+        "ORDER=REVERSE;DEDUPLICATION=ALL".into(),
+    );
     let app = add(&mut model, "app", TargetKind::Executable);
     let _a = add(&mut model, "a", TargetKind::StaticLibrary);
     let b = add(&mut model, "b", TargetKind::StaticLibrary);
     let _c = add(&mut model, "c", TargetKind::StaticLibrary);
     link(&mut model, b, true, &["a"]);
     link(&mut model, app, false, &["a", "b", "c"]);
-    let line = |model: &ProjectModel| {
-        link_line(&collect_link_items(model, app, &EvalContext::default()).unwrap())
+    let ctx = EvalContext {
+        link_language: Some("C".into()),
+        ..EvalContext::default()
     };
-    assert_eq!(line(&model), "a;b;c;a");
+    let line =
+        |model: &ProjectModel| collect_link_items(model, app, &ctx).map(|items| link_line(&items));
+    assert_eq!(line(&model)?, "a;b;c;a");
     model
         .target_mut(app)
-        .unwrap()
+        .ok_or("Missing target.")?
         .policies
         .policies
-        .set(PolicyId::new(156), PolicyStatus::New)
-        .unwrap();
-    assert_eq!(line(&model), "b;c;a");
+        .set(PolicyId::new(156), PolicyStatus::New)?;
+    assert_eq!(line(&model)?, "b;c;a");
     model
         .target_mut(app)
-        .unwrap()
+        .ok_or("Missing target.")?
         .policies
         .policies
-        .set(PolicyId::new(179), PolicyStatus::New)
-        .unwrap();
-    assert_eq!(line(&model), "a;b;c");
+        .set(PolicyId::new(179), PolicyStatus::New)?;
+    assert_eq!(line(&model)?, "a;b;c");
+    Ok(())
 }
 
 #[test]
@@ -1099,14 +1110,20 @@ fn link_property_preserves_feature_markers_and_original_direct_entries() {
 }
 
 #[test]
-fn archive_deduplication_keeps_raw_link_flags_in_place() {
+fn archive_deduplication_keeps_raw_link_flags_in_place() -> Result<(), Box<dyn std::error::Error>> {
     let mut model = model("Darwin");
+    model.global.props.set(
+        "CMAKE_C_LINK_LIBRARIES_PROCESSING".into(),
+        "ORDER=REVERSE;DEDUPLICATION=ALL".into(),
+    );
     let app = add(&mut model, "app", TargetKind::Executable);
-    let policies = &mut model.target_mut(app).unwrap().policies.policies;
+    let policies = &mut model
+        .target_mut(app)
+        .ok_or("Missing target.")?
+        .policies
+        .policies;
     for policy in [156, 179] {
-        policies
-            .set(PolicyId::new(policy), PolicyStatus::New)
-            .unwrap();
+        policies.set(PolicyId::new(policy), PolicyStatus::New)?;
     }
     link(
         &mut model,
@@ -1121,9 +1138,14 @@ fn archive_deduplication_keeps_raw_link_flags_in_place() {
             "-framework Foundation",
         ],
     );
-    let result = collect_link_items(&model, app, &EvalContext::default()).unwrap();
+    let ctx = EvalContext {
+        link_language: Some("C".into()),
+        ..EvalContext::default()
+    };
+    let result = collect_link_items(&model, app, &ctx)?;
     assert_eq!(
         link_line(&result),
         "-pthread;/tmp/liba.a;-pthread;-framework Foundation"
     );
+    Ok(())
 }

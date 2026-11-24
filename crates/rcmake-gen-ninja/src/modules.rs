@@ -47,6 +47,13 @@ rule CXX_DYNDEP
   rspfile_content = $in_newline
   restat = 1
 
+rule CXX_DYNDEP_WINDOWS
+  command = $COMMAND
+  description = Generating C++ dyndep file $out
+  rspfile = $out.rsp
+  rspfile_content = $in_newline
+  restat = 1
+
 rule CXX_COMPILE_SCANNED
   command = $COMMAND
   description = $DESC

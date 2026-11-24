@@ -11,12 +11,22 @@ pub struct Lexical<'a> {
     raw: &'a [u8],
     root_name_len: usize,
     relative_start: usize,
+    windows: bool,
 }
 
 impl<'a> Lexical<'a> {
     /// Split `raw` into root name, root directory, and relative part.
     pub fn new(raw: &'a [u8]) -> Self {
-        let root_name_len = root_name_len(raw);
+        Self::with_dialect(raw, cfg!(windows))
+    }
+
+    /// Split a forward-slash path using Windows drive and UNC rules.
+    pub fn windows(raw: &'a [u8]) -> Self {
+        Self::with_dialect(raw, true)
+    }
+
+    fn with_dialect(raw: &'a [u8], windows: bool) -> Self {
+        let root_name_len = root_name_len(raw, windows);
         let relative_start = root_name_len
             + raw
                 .get(root_name_len..)
@@ -28,6 +38,7 @@ impl<'a> Lexical<'a> {
             raw,
             root_name_len,
             relative_start,
+            windows,
         }
     }
 
@@ -52,7 +63,7 @@ impl<'a> Lexical<'a> {
 
     /// `true` for an absolute path (`cmake_path(IS_ABSOLUTE)`).
     pub fn absolute(self) -> bool {
-        !self.root_directory().is_empty() && (!cfg!(windows) || !self.root_name().is_empty())
+        !self.root_directory().is_empty() && (!self.windows || !self.root_name().is_empty())
     }
 
     /// Path text after the root path.
@@ -172,7 +183,7 @@ impl<'a> Lexical<'a> {
 
     /// Append `input` with `cmake_path(APPEND)` semantics.
     pub fn append(self, input: &[u8]) -> BString {
-        let rhs = Lexical::new(input);
+        let rhs = Lexical::with_dialect(input, self.windows);
         if rhs.absolute() || (!rhs.root_name().is_empty() && self.root_name() != rhs.root_name()) {
             return input.into();
         }
@@ -225,8 +236,8 @@ impl<'a> Lexical<'a> {
     }
 }
 
-fn root_name_len(raw: &[u8]) -> usize {
-    if cfg!(windows) {
+fn root_name_len(raw: &[u8], windows: bool) -> usize {
+    if windows {
         if let [drive, b':', ..] = raw
             && drive.is_ascii_alphabetic()
         {
