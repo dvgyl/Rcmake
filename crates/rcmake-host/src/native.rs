@@ -6,24 +6,28 @@ use core::time::Duration;
 use std::collections::BTreeMap;
 use std::fs::{self, File, FileType, OpenOptions};
 use std::io::{self, ErrorKind, IsTerminal, Read, Seek, SeekFrom, Write};
-use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::sync::RwLock;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use jiff::tz::TimeZone;
 use rcmake_base::BString;
-use rustix::fs::{AtFlags, CWD, Timespec, Timestamps, UTIME_OMIT};
-use rustix::io::Errno;
 
-use crate::error::{HostError, HostResult, from_errno};
+use crate::error::{HostError, HostResult, SyntheticError};
 use crate::{
     CopyOptions, DirEntry, FILE_CHUNK_SIZE, FileKind, FileLockGuard, FileTime, Follow,
     GracefulTimeout, Host, Metadata, ReadRange, RunOutput, RunRequest, Stream, SystemInfo,
     WriteMode, require_absolute, validate_run,
 };
 
+#[cfg(unix)]
 mod cwd;
+#[cfg(unix)]
+#[path = "native/unix.rs"]
+mod platform;
+#[cfg(windows)]
+#[path = "native/windows.rs"]
+mod platform;
 mod process;
 
 /// Production [`Host`] backed by the operating system with an edition-2024-safe
@@ -41,7 +45,7 @@ impl NativeHost {
         let mut map = BTreeMap::new();
         for (k, v) in std::env::vars_os() {
             map.insert(
-                crate::path::from_native(Path::new(&k)),
+                env_key(&crate::path::from_native(Path::new(&k))),
                 crate::path::from_native(Path::new(&v)),
             );
         }
@@ -49,13 +53,21 @@ impl NativeHost {
         let pwd = map
             .get(b"PWD".as_slice())
             .map(|path| crate::path::to_native(path));
-        let initial_cwd = cwd::logical_cwd(&physical_cwd, pwd.as_deref());
+        let initial_cwd = platform::logical_cwd(&physical_cwd, pwd.as_deref());
         Ok(Self {
             env: RwLock::new(map),
             initial_cwd,
             start: Instant::now(),
         })
     }
+}
+
+fn env_key(key: &[u8]) -> BString {
+    let mut name = BString::from(key);
+    if cfg!(windows) {
+        name.make_ascii_uppercase();
+    }
+    name
 }
 
 fn io_at<T>(result: io::Result<T>, path: &Path) -> HostResult<T> {
@@ -71,19 +83,6 @@ fn file_kind(kind: FileType) -> FileKind {
         FileKind::Symlink
     } else {
         FileKind::Other
-    }
-}
-
-fn timestamp(time: Option<FileTime>) -> Timespec {
-    match time {
-        Some(time) => Timespec {
-            tv_sec: time.secs,
-            tv_nsec: time.nanos.into(),
-        },
-        None => Timespec {
-            tv_sec: 0,
-            tv_nsec: UTIME_OMIT,
-        },
     }
 }
 
@@ -122,28 +121,6 @@ impl Drop for NativeFileLock {
     }
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-fn rename_noreplace_native(from: &Path, to: &Path) -> HostResult<()> {
-    use rustix::fs::{RenameFlags, renameat_with};
-    match renameat_with(CWD, from, CWD, to, RenameFlags::NOREPLACE) {
-        Ok(()) => Ok(()),
-        Err(errno)
-            if errno == Errno::NOSYS || errno == Errno::NOTSUP || errno == Errno::OPNOTSUPP =>
-        {
-            Err(HostError::unsupported(
-                "atomic no-replace rename is not supported on this filesystem",
-            ))
-        }
-        Err(errno) if errno == Errno::EXIST => Err(from_errno(errno, Some(to))),
-        Err(errno) => Err(from_errno(errno, Some(from))),
-    }
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn rename_noreplace_native(from: &Path, to: &Path) -> HostResult<()> {
-    rename_noreplace_with_link(from, to)
-}
-
 #[cfg(any(test, not(any(target_os = "macos", target_os = "linux"))))]
 fn rename_noreplace_with_link(from: &Path, to: &Path) -> HostResult<()> {
     const ERROR_INVALID_FUNCTION: i32 = 1;
@@ -172,49 +149,27 @@ fn rename_noreplace_with_link(from: &Path, to: &Path) -> HostResult<()> {
 impl Host for NativeHost {
     fn metadata(&self, p: &Path, follow: Follow) -> HostResult<Metadata> {
         require_absolute(p)?;
-        let m = io_at(
-            match follow {
-                Follow::Yes => fs::metadata(p),
-                Follow::No => fs::symlink_metadata(p),
-            },
-            p,
-        )?;
-        Ok(Metadata {
-            kind: file_kind(m.file_type()),
-            len: m.len(),
-            mode: m.mode() & 0o7777,
-            mtime: FileTime {
-                secs: m.mtime(),
-                nanos: u32::try_from(m.mtime_nsec()).unwrap_or_default(),
-            },
-            atime: FileTime {
-                secs: m.atime(),
-                nanos: u32::try_from(m.atime_nsec()).unwrap_or_default(),
-            },
-            dev: m.dev(),
-            ino: m.ino(),
-            nlink: m.nlink(),
-        })
+        platform::metadata(p, follow)
     }
 
     fn read(&self, p: &Path, range: ReadRange) -> HostResult<Vec<u8>> {
         require_absolute(p)?;
-        let mut file = io_at(File::open(p), p)?;
+        let mut file = io_at(platform::open_input(p), p)?;
         let metadata = io_at(file.metadata(), p)?;
         if metadata.is_dir() {
-            return Err(from_errno(Errno::ISDIR, Some(p)));
+            return Err(SyntheticError::IsADirectory.at(Some(p)));
         }
         let mut bytes = Vec::new();
         match range {
             ReadRange::All { limit } => {
                 if metadata.is_file() && metadata.len() > limit {
-                    return Err(from_errno(Errno::FBIG, Some(p)));
+                    return Err(SyntheticError::FileTooLarge.at(Some(p)));
                 }
                 let mut reader = (&mut file).take(limit);
                 io_at(reader.read_to_end(&mut bytes), p)?;
                 if reader.limit() == 0 {
                     match file.read_exact(&mut [0]) {
-                        Ok(()) => return Err(from_errno(Errno::FBIG, Some(p))),
+                        Ok(()) => return Err(SyntheticError::FileTooLarge.at(Some(p))),
                         Err(err) if err.kind() == ErrorKind::UnexpectedEof => {}
                         Err(err) => return io_at(Err(err), p),
                     }
@@ -238,16 +193,20 @@ impl Host for NativeHost {
 
     fn read_chunks(&self, p: &Path, consume: &mut dyn FnMut(&[u8])) -> HostResult<()> {
         require_absolute(p)?;
-        let mut file = io_at(File::open(p), p)?;
+        let mut file = io_at(platform::open_input(p), p)?;
         let mut buffer = vec![0; FILE_CHUNK_SIZE];
         loop {
             match file.read(&mut buffer) {
                 Ok(0) => return Ok(()),
-                Ok(len) => consume(
-                    buffer
-                        .get(..len)
-                        .ok_or_else(|| from_errno(Errno::IO, Some(p)))?,
-                ),
+                Ok(len) => {
+                    let bytes = buffer.get(..len).ok_or_else(|| {
+                        HostError::from_io(
+                            io::Error::other("Invalid file read length"),
+                            Some(p.to_path_buf()),
+                        )
+                    })?;
+                    consume(bytes);
+                }
                 Err(err) if err.kind() == ErrorKind::Interrupted => continue,
                 Err(err) => return io_at(Err(err), p),
             }
@@ -281,22 +240,22 @@ impl Host for NativeHost {
         require_absolute(p)?;
         // macOS reports EPERM when unlinking a directory.
         if io_at(fs::symlink_metadata(p), p)?.is_dir() {
-            return Err(from_errno(Errno::ISDIR, Some(p)));
+            return Err(SyntheticError::IsADirectory.at(Some(p)));
         }
-        io_at(fs::remove_file(p), p)
+        io_at(platform::remove_file(p), p)
     }
 
     fn remove_dir(&self, p: &Path) -> HostResult<()> {
         let path = crate::path::directory_removal_path(p)?;
         if !io_at(fs::symlink_metadata(&path), p)?.is_dir() {
-            return Err(from_errno(Errno::NOTDIR, Some(p)));
+            return Err(SyntheticError::NotADirectory.at(Some(p)));
         }
         io_at(fs::remove_dir(path), p)
     }
 
     fn remove_dir_all(&self, p: &Path) -> HostResult<()> {
         let path = crate::path::directory_removal_path(p)?;
-        io_at(fs::remove_dir_all(path), p)
+        io_at(platform::remove_dir_all(&path), p)
     }
 
     fn rename(&self, from: &Path, to: &Path) -> HostResult<()> {
@@ -308,7 +267,7 @@ impl Host for NativeHost {
     fn rename_noreplace(&self, from: &Path, to: &Path) -> HostResult<()> {
         require_absolute(from)?;
         require_absolute(to)?;
-        rename_noreplace_native(from, to)
+        platform::rename_noreplace(from, to)
     }
 
     fn lock_file(
@@ -360,10 +319,10 @@ impl Host for NativeHost {
     fn copy_file(&self, from: &Path, to: &Path, opts: CopyOptions) -> HostResult<()> {
         require_absolute(from)?;
         require_absolute(to)?;
-        let mut src = io_at(File::open(from), from)?;
+        let mut src = io_at(platform::open_input(from), from)?;
         let metadata = io_at(src.metadata(), from)?;
         if !metadata.is_file() {
-            return Err(from_errno(Errno::INVAL, Some(from)));
+            return Err(SyntheticError::InvalidInput.at(Some(from)));
         }
         let mut dst = io_at(
             OpenOptions::new()
@@ -373,9 +332,8 @@ impl Host for NativeHost {
                 .open(to),
             to,
         )?;
-        let dst_metadata = io_at(dst.metadata(), to)?;
-        if (metadata.dev(), metadata.ino()) == (dst_metadata.dev(), dst_metadata.ino()) {
-            return Err(from_errno(Errno::INVAL, Some(to)));
+        if io_at(platform::same_file(&src, &dst), to)? {
+            return Err(SyntheticError::InvalidInput.at(Some(to)));
         }
         io_at(dst.set_len(0), to)?;
         io_at(io::copy(&mut src, &mut dst), to)?;
@@ -383,31 +341,20 @@ impl Host for NativeHost {
             io_at(dst.set_permissions(metadata.permissions()), to)?;
         }
         if opts.preserve_mtime {
-            rustix::fs::futimens(
-                &dst,
-                &Timestamps {
-                    last_access: timestamp(None),
-                    last_modification: Timespec {
-                        tv_sec: metadata.mtime(),
-                        tv_nsec: metadata.mtime_nsec(),
-                    },
-                },
-            )
-            .map_err(|err| from_errno(err, Some(to)))?;
+            io_at(platform::preserve_mtime(&dst, &metadata), to)?;
         }
         Ok(())
     }
 
     fn symlink(&self, target: &Path, link: &Path) -> HostResult<()> {
         require_absolute(link)?;
-        io_at(symlink(target, link), link)
+        io_at(platform::symlink(target, link), link)
     }
 
     fn hard_link(&self, src: &Path, dst: &Path) -> HostResult<()> {
         require_absolute(src)?;
         require_absolute(dst)?;
-        rustix::fs::linkat(CWD, src, CWD, dst, AtFlags::empty())
-            .map_err(|err| from_errno(err, Some(dst)))
+        io_at(platform::hard_link(src, dst), dst)
     }
 
     fn read_link(&self, p: &Path) -> HostResult<PathBuf> {
@@ -424,10 +371,7 @@ impl Host for NativeHost {
 
     fn set_permissions(&self, p: &Path, mode: u32) -> HostResult<()> {
         require_absolute(p)?;
-        io_at(
-            fs::set_permissions(p, fs::Permissions::from_mode(mode & 0o7777)),
-            p,
-        )
+        io_at(platform::set_permissions(p, mode), p)
     }
 
     fn set_times(
@@ -442,36 +386,27 @@ impl Host for NativeHost {
             .chain(mtime)
             .any(|time| time.nanos >= 1_000_000_000)
         {
-            return Err(from_errno(Errno::INVAL, Some(p)));
+            return Err(SyntheticError::InvalidInput.at(Some(p)));
         }
         if atime.is_none() && mtime.is_none() {
             return self.metadata(p, Follow::Yes).map(|_| ());
         }
-        rustix::fs::utimensat(
-            CWD,
-            p,
-            &Timestamps {
-                last_access: timestamp(atime),
-                last_modification: timestamp(mtime),
-            },
-            AtFlags::empty(),
-        )
-        .map_err(|err| from_errno(err, Some(p)))
+        io_at(platform::set_times(p, atime, mtime), p)
     }
 
     fn env_get(&self, key: &[u8]) -> Option<BString> {
         let guard = self.env.read().ok()?;
-        guard.get(key).cloned()
+        guard.get(&env_key(key)).cloned()
     }
 
     fn env_set(&self, key: &[u8], value: Option<&[u8]>) {
         if let Ok(mut guard) = self.env.write() {
             match value {
                 Some(v) => {
-                    guard.insert(BString::from(key), BString::from(v));
+                    guard.insert(env_key(key), BString::from(v));
                 }
                 None => {
-                    guard.remove(key);
+                    guard.remove(&env_key(key));
                 }
             }
         }
@@ -489,7 +424,7 @@ impl Host for NativeHost {
         req: &RunRequest,
         on_output: &mut dyn FnMut(Stream, &[u8]),
     ) -> HostResult<RunOutput> {
-        validate_run(req)?;
+        validate_run(req, require_absolute)?;
         process::run_pipeline(req, None, usize::MAX, on_output)
     }
 
@@ -499,12 +434,12 @@ impl Host for NativeHost {
         timeout: GracefulTimeout,
         on_output: &mut dyn FnMut(Stream, &[u8]),
     ) -> HostResult<RunOutput> {
-        validate_run(req)?;
+        validate_run(req, require_absolute)?;
         process::run_pipeline(req, Some(timeout), usize::MAX, on_output)
     }
 
     fn run_bounded(&self, req: &RunRequest, limit: usize) -> HostResult<RunOutput> {
-        validate_run(req)?;
+        validate_run(req, require_absolute)?;
         process::run_pipeline(req, None, limit, &mut |_, _| {})
     }
 
@@ -570,19 +505,12 @@ impl Host for NativeHost {
     }
 
     fn system(&self) -> SystemInfo {
-        let u = rustix::system::uname();
-        let cpus = std::thread::available_parallelism()
+        let mut system = platform::system();
+        system.cpu_count = std::thread::available_parallelism()
             .map(|n| u32::try_from(n.get()).unwrap_or(1))
             .unwrap_or(1);
-        SystemInfo {
-            sysname: BString::from(u.sysname().to_bytes()),
-            release: BString::from(u.release().to_bytes()),
-            version: BString::from(u.version().to_bytes()),
-            machine: BString::from(u.machine().to_bytes()),
-            hostname: BString::from(u.nodename().to_bytes()),
-            cpu_count: cpus,
-            pid: std::process::id(),
-        }
+        system.pid = std::process::id();
+        system
     }
 }
 

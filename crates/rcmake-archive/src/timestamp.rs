@@ -1,5 +1,10 @@
 use std::io::Read;
 
+use jiff::{
+    Timestamp,
+    civil::{Date, DateTime as CivilDateTime, Time},
+    tz::{Offset, TimeZone},
+};
 use rcmake_host::FileTime;
 use tar::Entry;
 use zip::{DateTime, extra_fields::ExtraField, read::ZipFile, write::FullFileOptions};
@@ -182,4 +187,80 @@ fn month_days(year: u16, month: u8) -> i64 {
         4 | 6 | 9 | 11 => 30,
         _ => 31,
     }
+}
+
+/// Parse a CMake archive modification time, including epoch seconds prefixed with `@`.
+pub fn parse_archive_mtime(host: &dyn rcmake_host::Host, value: &[u8]) -> Option<u64> {
+    let text = std::str::from_utf8(value).ok()?;
+    if let Some(epoch) = text.strip_prefix('@') {
+        return u64::try_from(epoch.parse::<i64>().ok()?).ok();
+    }
+    let text = text.trim_ascii();
+    let upper = text.to_ascii_uppercase();
+    let utc = ["UTC", "GMT", "Z"]
+        .into_iter()
+        .find_map(|suffix| upper.strip_suffix(suffix));
+    let (text, zone) = if let Some(text) = utc {
+        (text.trim_ascii_end(), TimeZone::UTC)
+    } else if let Some((local, offset)) = mtime_offset(text) {
+        (local, TimeZone::fixed(offset))
+    } else {
+        (text, host.time_zone())
+    };
+    let date_time = if text.contains(' ')
+        && let Ok(date_time) = text.parse::<CivilDateTime>()
+    {
+        date_time
+    } else if !text.contains([' ', 'T', 't'])
+        && let Ok(date) = text.parse::<Date>()
+    {
+        date.at(0, 0, 0, 0)
+    } else {
+        if !text.contains(' ') && text.contains(['T', 't']) {
+            return None;
+        }
+        let time = if text.len() <= 4
+            && !text.is_empty()
+            && text.bytes().all(|byte| byte.is_ascii_digit())
+        {
+            let number = text.parse::<u32>().ok()?;
+            let (hour, minute) = if number < 100 {
+                (number, 0)
+            } else {
+                (number / 100, number % 100)
+            };
+            if hour > 23 || minute > 59 {
+                Time::MIN
+            } else {
+                Time::new(hour as i8, minute as i8, 0, 0).ok()?
+            }
+        } else {
+            text.parse::<Time>().ok()?
+        };
+        let now = Timestamp::from_second(host.now().secs)
+            .ok()?
+            .to_zoned(zone.clone());
+        now.date().to_datetime(time)
+    };
+    u64::try_from(date_time.to_zoned(zone).ok()?.timestamp().as_second()).ok()
+}
+
+fn mtime_offset(text: &str) -> Option<(&str, Offset)> {
+    let (local, offset) = text.split_at_checked(text.len().checked_sub(5)?)?;
+    let (sign, digits) = offset.split_at_checked(1)?;
+    if !local.contains(':')
+        || !matches!(sign, "+" | "-")
+        || !digits.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+    let (hours, minutes) = digits.split_at_checked(2)?;
+    let hours = hours.parse::<i32>().ok()?;
+    let minutes = minutes.parse::<i32>().ok()?;
+    if minutes > 59 {
+        return None;
+    }
+    let seconds = hours * 3_600 + minutes * 60;
+    let seconds = if sign == "-" { -seconds } else { seconds };
+    Some((local.trim_ascii_end(), Offset::from_seconds(seconds).ok()?))
 }

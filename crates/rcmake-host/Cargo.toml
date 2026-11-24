@@ -16,3 +16,15 @@ thiserror.workspace = true
 
 [lints]
 workspace = true
+
+[target.'cfg(windows)'.dependencies]
+process-wrap = { version = "10.0.0", default-features = false, features = ["std", "job-object"] }
+winapi-util = "0.1.11"
+winreg = { version = "0.56.0", default-features = false }
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[[test]]
+name = "native_process"
+harness = false

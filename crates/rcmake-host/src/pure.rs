@@ -12,7 +12,7 @@ use jiff::tz::TimeZone;
 use rcmake_base::BString;
 
 use self::fs::FileSystem;
-use crate::error::{HostError, HostResult, from_errno};
+use crate::error::{HostError, HostResult, SyntheticError};
 use crate::{
     CopyOptions, DirEntry, FileLockGuard, FileTime, Follow, Host, Metadata, ReadRange, RunOutput,
     RunRequest, Stream, SystemInfo, WriteMode, validate_run,
@@ -138,7 +138,7 @@ impl PureHost {
 
     /// Create any missing parent directories, then write the file.
     pub fn seed_file(&self, path: &Path, bytes: &[u8]) -> HostResult<()> {
-        crate::require_absolute(path)?;
+        require_absolute(path)?;
         let mut state = self.lock()?;
         if let Some(parent) = path.parent() {
             state.fs.create_dir_all(parent)?;
@@ -208,11 +208,11 @@ impl Host for PureHost {
     }
 
     fn rename_noreplace(&self, from: &Path, to: &Path) -> HostResult<()> {
-        crate::require_absolute(from)?;
-        crate::require_absolute(to)?;
+        require_absolute(from)?;
+        require_absolute(to)?;
         let mut state = self.lock()?;
         if state.fs.metadata(to, Follow::No).is_ok() {
-            return Err(from_errno(rustix::io::Errno::EXIST, Some(to)));
+            return Err(SyntheticError::AlreadyExists.at(Some(to)));
         }
         state.fs.rename(from, to)
     }
@@ -222,7 +222,7 @@ impl Host for PureHost {
         path: &Path,
         timeout: Option<Duration>,
     ) -> HostResult<Box<dyn FileLockGuard>> {
-        crate::require_absolute(path)?;
+        require_absolute(path)?;
         let key = {
             let mut state = self.lock()?;
             // Create the file if it is missing. An empty append keeps the content.
@@ -321,7 +321,7 @@ impl Host for PureHost {
         req: &RunRequest,
         on_output: &mut dyn FnMut(Stream, &[u8]),
     ) -> HostResult<RunOutput> {
-        validate_run(req)?;
+        validate_run(req, require_absolute)?;
         let handler = self
             .lock()?
             .handler
@@ -397,5 +397,17 @@ impl Host for PureHost {
             cpu_count: 4,
             pid: 1000,
         }
+    }
+}
+
+fn virtual_absolute(path: &Path) -> bool {
+    crate::path::from_native(path).as_slice().starts_with(b"/")
+}
+
+fn require_absolute(path: &Path) -> HostResult<()> {
+    if virtual_absolute(path) {
+        Ok(())
+    } else {
+        Err(HostError::not_absolute(path.to_path_buf()))
     }
 }

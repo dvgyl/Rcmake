@@ -1,13 +1,10 @@
 use std::io::ErrorKind;
 
-use jiff::{
-    Timestamp,
-    civil::{Date, DateTime, Time},
-    tz::{Offset, TimeZone},
-};
+use jiff::Timestamp;
 use rcmake_archive::{
-    ArchiveFormat, CreateOptions, ExtractOptions, TarCompression, ZipCompression,
-    create_command_archive, extract_archive, list_command_archive,
+    ArchiveFormat, CreateOptions, ExtractOptions, SevenZipCompression, TarCompression,
+    ZipCompression, create_command_archive, extract_archive, list_command_archive,
+    parse_archive_mtime,
 };
 use rcmake_base::BString;
 use rcmake_host::{Follow, Stream, path::to_native};
@@ -33,6 +30,7 @@ struct TarOptions<'a> {
     format: Option<&'a [u8]>,
     mtime: Option<&'a [u8]>,
     level: Option<i32>,
+    threads: u32,
     encoding: Option<&'a [u8]>,
     touch: bool,
 }
@@ -157,8 +155,7 @@ fn parse_option<'a>(arg: &'a [u8], opts: &mut TarOptions<'a>, cx: &ToolCtx<'_>) 
         opts.level = Some(parse_integer(b"compression-level", level, cx)?);
         None
     } else if let Some(threads) = arg.strip_prefix(b"--cmake-tar-threads=") {
-        // The available compression methods use one thread.
-        parse_integer(b"threads", threads, cx)?;
+        opts.threads = u32::try_from(parse_integer(b"threads", threads, cx)?).unwrap_or_default();
         None
     } else if let Some(encoding) = arg.strip_prefix(b"--cmake-tar-encoding=") {
         if encoding.is_empty() {
@@ -278,7 +275,7 @@ fn create(archive: &[u8], opts: TarOptions<'_>, verbose: bool, cx: &ToolCtx<'_>)
         Err(message) => return creation_error(cx, archive, &[message.as_bytes()]),
     };
     let mtime = if let Some(mtime) = opts.mtime {
-        let Some(seconds) = parse_mtime(mtime, cx) else {
+        let Some(seconds) = parse_archive_mtime(cx.host, mtime) else {
             return creation_error(
                 cx,
                 archive,
@@ -293,7 +290,8 @@ fn create(archive: &[u8], opts: TarOptions<'_>, verbose: bool, cx: &ToolCtx<'_>)
         error(cx, &[b"tar: No files or directories specified\n"]);
     }
     if let Some(encoding) = opts.encoding
-        && !(encoding.eq_ignore_ascii_case(b"UTF-8") || (encoding == b"OEM" && !cfg!(windows)))
+        && !(encoding.eq_ignore_ascii_case(b"UTF-8")
+            || (encoding == b"OEM" && (!cfg!(windows) || opts.format == Some(b"7zip"))))
     {
         return creation_error(
             cx,
@@ -398,9 +396,24 @@ fn archive_format(opts: &TarOptions<'_>) -> Result<ArchiveFormat, String> {
         };
     }
     if format == b"7zip" {
-        return Err(String::from(
-            "CMake Error: The archive backend does not support 7zip\n",
-        ));
+        let compression = match opts.compression {
+            None | Some(Compression::Lzma) => SevenZipCompression::Lzma,
+            Some(Compression::None) => SevenZipCompression::Store,
+            Some(Compression::Gzip) => SevenZipCompression::Deflate,
+            Some(Compression::Bzip2) => SevenZipCompression::Bzip2,
+            Some(Compression::Xz) => SevenZipCompression::Lzma2,
+            Some(Compression::Zstd) => SevenZipCompression::Zstd,
+            Some(Compression::Ppmd) => SevenZipCompression::Ppmd,
+            Some(Compression::Compress) => {
+                return Err(String::from(
+                    "CMake Error: Unix compress is not supported for 7zip\n",
+                ));
+            }
+        };
+        return Ok(ArchiveFormat::SevenZip {
+            compression,
+            threads: opts.threads,
+        });
     }
 
     let (filter, tar) = match compression {
@@ -429,78 +442,6 @@ fn archive_format(opts: &TarOptions<'_>) -> Result<ArchiveFormat, String> {
     } else {
         tar
     })
-}
-
-fn parse_mtime(value: &[u8], cx: &ToolCtx<'_>) -> Option<u64> {
-    let text = std::str::from_utf8(value).ok()?;
-    if let Some(epoch) = text.strip_prefix('@') {
-        return u64::try_from(epoch.parse::<i64>().ok()?).ok();
-    }
-    let text = text.trim_ascii();
-    let upper = text.to_ascii_uppercase();
-    let utc = ["UTC", "GMT", "Z"]
-        .into_iter()
-        .find_map(|suffix| upper.strip_suffix(suffix));
-    let (text, zone) = if let Some(text) = utc {
-        (text.trim_ascii_end(), TimeZone::UTC)
-    } else if let Some((local, offset)) = mtime_offset(text) {
-        (local, TimeZone::fixed(offset))
-    } else {
-        (text, cx.host.time_zone())
-    };
-    let date_time = if text.contains(' ')
-        && let Ok(date_time) = text.parse::<DateTime>()
-    {
-        date_time
-    } else if !text.contains([' ', 'T', 't'])
-        && let Ok(date) = text.parse::<Date>()
-    {
-        date.at(0, 0, 0, 0)
-    } else {
-        let time = if text.len() <= 4
-            && !text.is_empty()
-            && text.bytes().all(|byte| byte.is_ascii_digit())
-        {
-            let number = text.parse::<u32>().ok()?;
-            let (hour, minute) = if number < 100 {
-                (number, 0)
-            } else {
-                (number / 100, number % 100)
-            };
-            if hour > 23 || minute > 59 {
-                Time::MIN
-            } else {
-                Time::new(hour as i8, minute as i8, 0, 0).ok()?
-            }
-        } else {
-            text.parse::<Time>().ok()?
-        };
-        let now = Timestamp::from_second(cx.host.now().secs)
-            .ok()?
-            .to_zoned(zone.clone());
-        now.date().to_datetime(time)
-    };
-    u64::try_from(date_time.to_zoned(zone).ok()?.timestamp().as_second()).ok()
-}
-
-fn mtime_offset(text: &str) -> Option<(&str, Offset)> {
-    let (local, offset) = text.split_at_checked(text.len().checked_sub(5)?)?;
-    let (sign, digits) = offset.split_at_checked(1)?;
-    if !local.contains(':')
-        || !matches!(sign, "+" | "-")
-        || !digits.bytes().all(|byte| byte.is_ascii_digit())
-    {
-        return None;
-    }
-    let (hours, minutes) = digits.split_at_checked(2)?;
-    let hours = hours.parse::<i32>().ok()?;
-    let minutes = minutes.parse::<i32>().ok()?;
-    if minutes > 59 {
-        return None;
-    }
-    let seconds = hours * 3_600 + minutes * 60;
-    let seconds = if sign == "-" { -seconds } else { seconds };
-    Some((local.trim_ascii_end(), Offset::from_seconds(seconds).ok()?))
 }
 
 fn creation_error(cx: &ToolCtx<'_>, archive: &[u8], message: &[&[u8]]) -> i32 {

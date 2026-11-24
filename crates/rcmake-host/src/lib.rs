@@ -302,7 +302,7 @@ pub trait Host: Send + Sync {
             }
             offset = offset
                 .checked_add(FILE_CHUNK_SIZE as u64)
-                .ok_or_else(|| error::from_errno(rustix::io::Errno::FBIG, Some(p)))?;
+                .ok_or_else(|| error::SyntheticError::FileTooLarge.at(Some(p)))?;
         }
     }
 
@@ -466,7 +466,7 @@ fn require_absolute(path: &Path) -> HostResult<()> {
     }
 }
 
-fn validate_run(req: &RunRequest) -> HostResult<()> {
+fn validate_run(req: &RunRequest, require_absolute: fn(&Path) -> HostResult<()>) -> HostResult<()> {
     require_absolute(&req.cwd)?;
     if let Input::File(path) = &req.stdin {
         require_absolute(path)?;
@@ -477,7 +477,7 @@ fn validate_run(req: &RunRequest) -> HostResult<()> {
         }
     }
     if req.pipeline.is_empty() || req.stdout == Output::SharedWithStdout {
-        return Err(error::from_errno(rustix::io::Errno::INVAL, None));
+        return Err(error::SyntheticError::InvalidInput.at(None));
     }
     Ok(())
 }

@@ -51,7 +51,7 @@ pub(super) fn encode(
     level: Option<u32>,
     bytes: &[u8],
 ) -> Result<(Entry, Vec<u8>), ArchiveError> {
-    let mut encoder = Encoder::new(Some(codec.stream()), level)?;
+    let mut encoder = Encoder::new(Some(codec.stream()), level, 0)?;
     encoder.write_all(bytes).map_err(archive_error)?;
     let mut data = encoder.finish().map_err(archive_error)?;
     if codec == ZipCompression::Lzma {

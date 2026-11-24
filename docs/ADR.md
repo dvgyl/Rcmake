@@ -351,3 +351,14 @@ The CMake 4.5.1 oracle cannot create a Visual Studio generator on macOS. This ma
 
 - Fuzzing finds panics, stack overflows, and hangs on the stable toolchain without coverage guidance. Coverage-guided fuzzing needs a new ADR.
 - Milestone 4 adds no external crate. `Cargo.lock` changes only by the three new workspace packages.
+
+---
+
+## ADR-017 Windows host services and 7-Zip archives
+
+- **Status:** Accepted
+- **Date:** 2026-11-24
+
+Use Windows job objects for process pipelines. Assign each child to a job while the child is suspended. Retain the job handle until output capture ends. Use a bounded channel to deliver pipe output to the thread that checks deadlines. Use safe handle APIs to compare file identities before a copy truncates its destination. Read the Windows version with a safe registry API.
+
+Use `sevenz-rust2` for 7-Zip headers and the standard compression methods. Use `ppmd-turbo` for PPMd because the optional PPMd dependency in `sevenz-rust2` has no licence on the project's allowlist. Use the existing archive path checks for all formats. Keep the Windows dependencies in the Windows target configuration. Keep unsafe code forbidden in the host and archive crates.

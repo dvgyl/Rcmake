@@ -19,8 +19,11 @@ mod create;
 mod external_filter;
 mod extract;
 mod pattern;
+mod seven_zip;
 mod timestamp;
 mod zip_codec;
+
+pub use timestamp::parse_archive_mtime;
 
 #[cfg(test)]
 mod tests;
@@ -52,12 +55,38 @@ pub enum ArchiveFormat {
     GnuTarGz,
     /// GNU tar with the specified compression filter.
     GnuTarCompressed(TarCompression),
+    /// 7-Zip archive with the selected compression method and thread count.
+    SevenZip {
+        /// Compression method for file entries.
+        compression: SevenZipCompression,
+        /// Requested number of codec threads. Zero selects the default.
+        threads: u32,
+    },
     /// ZIP archive with deflate compression (`.zip`).
     Zip,
     /// ZIP archive with stored entries.
     ZipStored,
     /// ZIP archive with a codec supplied by the archive engine.
     ZipCompressed(ZipCompression),
+}
+
+/// Compression method for 7-Zip file entries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SevenZipCompression {
+    /// Store file data without compression.
+    Store,
+    /// LZMA.
+    Lzma,
+    /// LZMA2.
+    Lzma2,
+    /// Deflate.
+    Deflate,
+    /// Bzip2.
+    Bzip2,
+    /// PPMd.
+    Ppmd,
+    /// Zstandard.
+    Zstd,
 }
 
 /// Compression method for ZIP file entries.
@@ -113,6 +142,8 @@ pub struct ExtractOptions {
     ///
     /// A directory match also selects its descendants unless the pattern ends with `$`.
     pub patterns: Vec<BString>,
+    /// Entry name patterns to exclude. Exclusions take priority over selections.
+    pub excludes: Vec<BString>,
     /// Only list entries without writing files (`LIST_ONLY` / `-t`).
     pub list_only: bool,
     /// Do not restore archive mtimes (`TOUCH`).
@@ -146,7 +177,14 @@ pub fn create_archive(
     inputs: &[PathBuf],
     options: &CreateOptions,
 ) -> Result<Vec<BString>, ArchiveError> {
-    create::run(host, output, base_dir, inputs, options, false)
+    create::run(
+        host,
+        output,
+        base_dir,
+        inputs,
+        options,
+        create::Selection::default(),
+    )
 }
 
 /// Create an archive for `cmake -E tar`. The input paths can be outside `base_dir`.
@@ -161,7 +199,47 @@ pub fn create_command_archive(
     inputs: &[PathBuf],
     options: &CreateOptions,
 ) -> Result<Vec<BString>, ArchiveError> {
-    create::run(host, output, base_dir, inputs, options, true)
+    create::run(
+        host,
+        output,
+        base_dir,
+        inputs,
+        options,
+        create::Selection {
+            allow_outside: true,
+            ..Default::default()
+        },
+    )
+}
+
+/// Create an archive and omit entries that match an exclusion pattern.
+///
+/// # Errors
+/// Returns an error for an invalid option, an empty pattern, or a host error.
+pub fn create_filtered_archive(
+    host: &dyn Host,
+    output: &Path,
+    base_dir: &Path,
+    inputs: &[PathBuf],
+    options: &CreateOptions,
+    excludes: &[BString],
+    threads: u32,
+) -> Result<Vec<BString>, ArchiveError> {
+    if excludes.iter().any(|pattern| pattern.is_empty()) {
+        return Err(ArchiveError::new("exclusion pattern must not be empty"));
+    }
+    create::run(
+        host,
+        output,
+        base_dir,
+        inputs,
+        options,
+        create::Selection {
+            excludes,
+            threads,
+            allow_outside: true,
+        },
+    )
 }
 
 /// Extract or list an archive at absolute path `archive_path`.
@@ -179,6 +257,28 @@ pub fn extract_archive(
     options: &ExtractOptions,
 ) -> Result<Vec<BString>, ArchiveError> {
     extract::run(host, archive_path, options, extract::Listing::Shared)
+}
+
+/// List selected entries with their mode, size, and modification time.
+///
+/// # Errors
+/// Returns the same errors as archive extraction.
+pub fn list_archive_details(
+    host: &dyn Host,
+    archive_path: &Path,
+    options: &ExtractOptions,
+    format_time: &dyn Fn(FileTime) -> String,
+) -> Result<Vec<BString>, ArchiveError> {
+    let options = ExtractOptions {
+        list_only: true,
+        ..options.clone()
+    };
+    extract::run(
+        host,
+        archive_path,
+        &options,
+        extract::Listing::SharedDetails(format_time),
+    )
 }
 
 /// List entries for `cmake -E tar`. `format_time` enables detailed output when supplied.
@@ -234,7 +334,7 @@ fn archive_error(error: impl Display) -> ArchiveError {
 }
 
 fn absolute(path: &Path) -> Result<(), ArchiveError> {
-    if path.is_absolute() {
+    if path.has_root() {
         Ok(())
     } else {
         Err(HostError::not_absolute(path.to_owned()).into())

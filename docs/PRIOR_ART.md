@@ -81,3 +81,16 @@ The direct path dependencies in the root manifest are Rcmake crates. Each uses `
 | `rcmake-resolve` | Resolve target dependencies and construct build graphs. |
 | `rcmake-syntax` | Parse CMake listfiles and preserve their input bytes. |
 | `rcmake-tool-e` | Run `cmake -E` utilities. |
+
+## Windows host and 7-Zip support
+
+| Dependency | Licence | Use |
+| --- | --- | --- |
+| `winapi-util` | Unlicense or MIT | Read a file identity and the computer name through safe Windows APIs. |
+| `winreg` | MIT | Read the Windows release and build number from the registry. |
+| `process-wrap` | Apache-2.0 or MIT | Assign a suspended child to a Windows job object before it starts. Terminate the job when the process pipeline reaches its deadline. |
+| `sevenz-rust2` | Apache-2.0 | Read 7-Zip headers and encode or decode the standard compression methods. |
+| `ppmd-turbo` | Apache-2.0 | Encode and decode PPMd blocks within 7-Zip archives. |
+| `crc32fast` | MIT or Apache-2.0 | Calculate the CRC-32 checksums in 7-Zip PPMd archives. This crate was already in the dependency graph. |
+
+See the [7-Zip format specification](https://github.com/ip7z/7zip/blob/main/DOC/7zFormat.txt) for the PPMd container headers.

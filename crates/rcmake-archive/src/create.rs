@@ -7,11 +7,19 @@ use rcmake_host::{FileKind, FileTime, Follow, Host, Metadata, WriteMode, path::f
 use tar::{Builder, EntryType, Header};
 use zip::{CompressionMethod, ZipWriter, write::FullFileOptions};
 
+use crate::pattern::Patterns;
 use crate::{
     ArchiveError, ArchiveFormat, CreateOptions, MAX_ENTRIES, absolute, archive_error, archive_name,
     checked_name, emit_names, read_bytes, relative_path, size_limit,
 };
-use crate::{TarCompression, ZipCompression, codec::Encoder, timestamp, zip_codec};
+use crate::{TarCompression, ZipCompression, codec::Encoder, seven_zip, timestamp, zip_codec};
+
+#[derive(Default)]
+pub(super) struct Selection<'a> {
+    pub(super) excludes: &'a [BString],
+    pub(super) threads: u32,
+    pub(super) allow_outside: bool,
+}
 
 pub(super) fn run(
     host: &dyn Host,
@@ -19,7 +27,7 @@ pub(super) fn run(
     base_dir: &Path,
     inputs: &[PathBuf],
     options: &CreateOptions,
-    command: bool,
+    selection: Selection<'_>,
 ) -> Result<Vec<BString>, ArchiveError> {
     absolute(output)?;
     absolute(base_dir)?;
@@ -31,18 +39,21 @@ pub(super) fn run(
         .map(timestamp::seconds);
     let mut archive = Creation {
         host,
-        writer: Writer::new(options)?,
+        writer: Writer::new(options, selection.threads)?,
         mtime,
         names: Vec::new(),
         links: HashMap::new(),
         bytes_left: size_limit(),
-        command,
+        command: selection.allow_outside,
+        excludes: Patterns::new(selection.excludes)?,
     };
     for input in inputs {
-        let name = if input.is_absolute() {
+        let name = if input.has_root() {
             if let Ok(relative) = input.strip_prefix(base_dir) {
                 archive_name(relative)
-            } else if command {
+            } else if let Some(relative) = relative_from_canonical_parent(host, base_dir, input) {
+                archive_name(&relative)
+            } else if selection.allow_outside {
                 command_name(base_dir, input)
             } else {
                 return Err(ArchiveError::new(format!(
@@ -65,6 +76,13 @@ pub(super) fn run(
     host.write(output, &bytes, WriteMode::Truncate)?;
     emit_names(host, &archive.names, options.verbose);
     Ok(archive.names)
+}
+
+fn relative_from_canonical_parent(host: &dyn Host, base: &Path, input: &Path) -> Option<PathBuf> {
+    let base = host.canonicalize(base).ok()?;
+    let parent = host.canonicalize(input.parent()?).ok()?;
+    let relative = parent.strip_prefix(base).ok()?;
+    Some(relative.join(input.file_name()?))
 }
 
 fn command_name(base_dir: &Path, input: &Path) -> BString {
@@ -94,6 +112,7 @@ struct Creation<'a> {
     links: HashMap<(u64, u64), (BString, PathBuf)>,
     bytes_left: u64,
     command: bool,
+    excludes: Patterns<'a>,
 }
 
 impl Creation<'_> {
@@ -104,7 +123,14 @@ impl Creation<'_> {
             relative_path(&name)?;
         }
         let metadata = self.host.metadata(path, Follow::No)?;
-        if metadata.kind == FileKind::Dir {
+        let directory = metadata.kind == FileKind::Dir;
+        if self
+            .excludes
+            .excludes(&crate::to_native(&name), directory)?
+        {
+            return Ok(());
+        }
+        if directory {
             name.push(b'/');
         }
         self.bytes_left = self
@@ -175,6 +201,7 @@ impl Creation<'_> {
 
 enum Writer {
     Tar(Box<Builder<Encoder>>, bool),
+    SevenZip(Box<seven_zip::Writer>),
     Zip {
         writer: Box<ZipWriter<Cursor<Vec<u8>>>>,
         method: CompressionMethod,
@@ -185,7 +212,7 @@ enum Writer {
 }
 
 impl Writer {
-    fn new(options: &CreateOptions) -> Result<Self, ArchiveError> {
+    fn new(options: &CreateOptions, threads: u32) -> Result<Self, ArchiveError> {
         use ArchiveFormat::*;
         let level = options.compression_level;
         let (gnu, filter) = match options.format {
@@ -199,9 +226,16 @@ impl Writer {
             GnuTar => (true, None),
             GnuTarGz => (true, Some(TarCompression::Gzip)),
             GnuTarCompressed(filter) => (true, Some(filter)),
-            Zip | ZipStored | ZipCompressed(_) => (false, None),
+            SevenZip { .. } | Zip | ZipStored | ZipCompressed(_) => (false, None),
         };
-        let max_level = if filter == Some(TarCompression::Zstd) {
+        let max_level = if filter == Some(TarCompression::Zstd)
+            || matches!(
+                options.format,
+                SevenZip {
+                    compression: crate::SevenZipCompression::Zstd,
+                    ..
+                }
+            ) {
             19
         } else {
             9
@@ -210,6 +244,17 @@ impl Writer {
             return Err(ArchiveError::new(format!(
                 "The compression level must be between 0 and {max_level}"
             )));
+        }
+        if let SevenZip {
+            compression,
+            threads,
+        } = options.format
+        {
+            return Ok(Self::SevenZip(Box::new(seven_zip::writer(
+                compression,
+                level,
+                threads,
+            )?)));
         }
         if matches!(options.format, Zip | ZipStored | ZipCompressed(_)) {
             let deflate = options.format == Zip;
@@ -228,7 +273,7 @@ impl Writer {
                 compressed: HashMap::new(),
             });
         }
-        let encoder = Encoder::new(filter, level)?;
+        let encoder = Encoder::new(filter, level, threads)?;
         Ok(Self::Tar(Box::new(Builder::new(encoder)), gnu))
     }
 
@@ -258,6 +303,7 @@ impl Writer {
                     link_name.unwrap_or(contents),
                 )
             }
+            Self::SevenZip(writer) => seven_zip::add(writer, name, metadata, mtime, contents),
             Self::Zip {
                 writer,
                 method,
@@ -308,6 +354,7 @@ impl Writer {
                 .into_inner()
                 .and_then(Encoder::finish)
                 .map_err(archive_error),
+            Self::SevenZip(writer) => writer.finish(),
             Self::Zip {
                 writer, compressed, ..
             } => {

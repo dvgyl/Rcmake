@@ -86,6 +86,35 @@ impl<'a> Patterns<'a> {
         Ok(matched)
     }
 
+    pub(super) fn excludes(&mut self, path: &Path, directory: bool) -> Result<bool, ArchiveError> {
+        if self.items.is_empty() {
+            return Ok(false);
+        }
+        let mut name = archive_name(path);
+        if directory {
+            name.push(b'/');
+        }
+        for pattern in &mut self.items {
+            let mut candidate = name.as_slice();
+            loop {
+                if pattern.matches(candidate, &mut self.steps_left)? {
+                    return Ok(true);
+                }
+                let Some(separator) = candidate.iter().position(|&byte| byte == b'/') else {
+                    break;
+                };
+                let Some(suffix) = candidate
+                    .get(separator + 1..)
+                    .filter(|suffix| !suffix.is_empty())
+                else {
+                    break;
+                };
+                candidate = suffix;
+            }
+        }
+        Ok(false)
+    }
+
     pub(super) fn finish(&self) -> Result<(), ArchiveError> {
         if let Some(pattern) = self.items.iter().find(|item| !item.matched) {
             return Err(ArchiveError::new(format!(

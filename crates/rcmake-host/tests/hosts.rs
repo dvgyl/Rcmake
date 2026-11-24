@@ -1,48 +1,41 @@
 //! Run the shared host checks and exercise process input and output.
 
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::path::Path;
 use std::time::Duration;
 
 use rcmake_base::BString;
+#[cfg(unix)]
+use rcmake_host::ReadRange;
 use rcmake_host::{
-    CommandSpec, Follow, Host, Input, NativeHost, Output, ProcessResult, PureHost, ReadRange,
-    RunOutput, RunRequest, Stream, WriteMode, conformance,
+    CommandSpec, Follow, Host, Input, NativeHost, Output, ProcessResult, PureHost, RunOutput,
+    RunRequest, Stream, WriteMode, conformance,
 };
-use rustix::fs::Mode;
+#[cfg(unix)]
 use rustix::io::Errno;
-
-struct TempDir<'a> {
-    host: &'a NativeHost,
-    path: PathBuf,
-}
-
-impl<'a> TempDir<'a> {
-    fn new(host: &'a NativeHost) -> Result<Self, Errno> {
-        static NEXT: AtomicU64 = AtomicU64::new(0);
-        loop {
-            let id = NEXT.fetch_add(1, Ordering::Relaxed);
-            let path = PathBuf::from(format!("/tmp/rcmake-host-test-{}-{id}", host.system().pid));
-            match rustix::fs::mkdir(&path, Mode::RWXU) {
-                Ok(()) => return Ok(Self { host, path }),
-                Err(Errno::EXIST) => continue,
-                Err(err) => return Err(err),
-            }
-        }
-    }
-}
-
-impl Drop for TempDir<'_> {
-    fn drop(&mut self) {
-        let _ = self.host.remove_dir_all(&self.path);
-    }
-}
 
 #[test]
 fn native_conformance() {
     let host = NativeHost::new().expect("native host");
-    let temp = TempDir::new(&host).expect("temporary directory");
-    conformance::run_all(&host, &temp.path);
+    let temp = tempfile::tempdir().expect("temporary directory");
+    conformance::run_all(&host, temp.path());
+}
+
+#[cfg(windows)]
+#[test]
+fn native_windows_system_values_and_path_validation() {
+    let host = NativeHost::new().expect("native host");
+    let info = host.system();
+    assert_eq!(info.sysname, "Windows");
+    assert!(!info.hostname.is_empty());
+    assert!(!info.release.is_empty());
+    assert!(!info.version.is_empty());
+    assert!(host.initial_cwd().is_absolute());
+    assert!(
+        host.metadata(Path::new("/work"), Follow::No)
+            .is_err_and(|error| error.kind == std::io::ErrorKind::InvalidInput)
+    );
+    host.env_set(b"example", Some(b"value"));
+    assert_eq!(host.env_get(b"EXAMPLE"), Some(BString::from("value")));
 }
 
 #[test]
@@ -50,6 +43,7 @@ fn pure_conformance() {
     conformance::run_all(&PureHost::default(), Path::new("/work/conformance"));
 }
 
+#[cfg(unix)]
 fn shell(command: &str) -> CommandSpec {
     CommandSpec {
         program: BString::from("/bin/sh"),
@@ -70,11 +64,12 @@ fn request(cwd: &Path, pipeline: Vec<CommandSpec>) -> RunRequest {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn native_pipeline_with_bytes_and_explicit_environment() {
     let host = NativeHost::new().expect("native host");
-    let temp = TempDir::new(&host).expect("temporary directory");
-    let cwd = host.canonicalize(&temp.path).expect("cwd");
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let cwd = host.canonicalize(temp.path()).expect("cwd");
     host.env_set(b"RCMAKE_HIDDEN", Some(b"hidden"));
     let mut req = request(
         &cwd,
@@ -101,6 +96,7 @@ fn native_pipeline_with_bytes_and_explicit_environment() {
     assert_eq!(result.stderr, b"first");
 }
 
+#[cfg(unix)]
 #[test]
 fn native_shares_stdout_and_stderr_with_tee() {
     let host = NativeHost::new().expect("native host");
@@ -123,17 +119,18 @@ fn native_shares_stdout_and_stderr_with_tee() {
     assert_eq!(chunks, result.stdout);
 }
 
+#[cfg(unix)]
 #[test]
 fn native_process_file_redirection_and_spawn_failure() {
     let host = NativeHost::new().expect("native host");
-    let temp = TempDir::new(&host).expect("temporary directory");
-    let input = temp.path.join("input");
-    let output = temp.path.join("output");
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let input = temp.path().join("input");
+    let output = temp.path().join("output");
     host.write(&input, b"bytes", WriteMode::CreateNew)
         .expect("input");
     host.write(&output, b"old", WriteMode::CreateNew)
         .expect("output");
-    let mut req = request(&temp.path, vec![shell("/bin/cat; printf error >&2")]);
+    let mut req = request(temp.path(), vec![shell("/bin/cat; printf error >&2")]);
     req.stdin = Input::File(input);
     req.stdout = Output::File {
         path: output.clone(),
@@ -159,19 +156,20 @@ fn native_process_file_redirection_and_spawn_failure() {
         program: BString::from("/nonexistent/rcmake-host-test"),
         args: Vec::new(),
     };
-    let req = request(&temp.path, vec![missing, shell("/bin/cat")]);
+    let req = request(temp.path(), vec![missing, shell("/bin/cat")]);
     let result = host.run(&req, &mut |_, _| {}).expect("run");
     assert!(
         matches!(result.results.as_slice(), [ProcessResult::SpawnFailed(err), ProcessResult::Exited(0)] if err.errno == Some(Errno::NOENT.raw_os_error()))
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn native_timeout_kills_pipeline_and_descendants() {
     let host = NativeHost::new().expect("native host");
-    let temp = TempDir::new(&host).expect("temporary directory");
+    let temp = tempfile::tempdir().expect("temporary directory");
     let mut req = request(
-        &temp.path,
+        temp.path(),
         vec![
             shell("(/bin/sleep 5; : > survived) & wait"),
             shell("/bin/cat"),
@@ -200,8 +198,13 @@ fn pure_process_hook_and_virtual_io() {
 
     host.seed_stdin(b"abc").expect("seed stdin");
     assert_eq!(host.read_stdin(1).expect("stdin"), b"a");
-    host.set_command_handler(|host, req, emit| {
-        assert_eq!(req.pipeline, [shell("scripted")]);
+    let command = CommandSpec {
+        program: BString::from("scripted"),
+        args: Vec::new(),
+    };
+    let mut req = request(&host.initial_cwd(), vec![command.clone()]);
+    host.set_command_handler(move |host, req, emit| {
+        assert_eq!(req.pipeline.as_slice(), std::slice::from_ref(&command));
         let stdout = host.read_stdin(5)?;
         host.write_out(Stream::Stderr, b"logged");
         emit(Stream::Stdout, &stdout);
@@ -212,7 +215,6 @@ fn pure_process_hook_and_virtual_io() {
         })
     })
     .expect("handler");
-    let mut req = request(&host.initial_cwd(), vec![shell("scripted")]);
     req.tee = true;
     let mut chunks = Vec::new();
     let result = host
@@ -228,6 +230,7 @@ fn pure_process_hook_and_virtual_io() {
     assert!(host.read_stdin(5).expect("stdin").is_empty());
 }
 
+#[cfg(unix)]
 #[test]
 fn native_timeout_after_pipeline_leader_exits() {
     let host = NativeHost::new().expect("native host");
@@ -260,8 +263,8 @@ fn pure_symlink_hop_limit() {
     assert_eq!(
         host.canonicalize(&base.join("41"))
             .expect_err("link limit")
-            .errno,
-        Some(Errno::LOOP.raw_os_error())
+            .os_message,
+        "Too many levels of symbolic links"
     );
 }
 
@@ -289,8 +292,11 @@ fn check_lock_wait(host: &(dyn Host + Sync), path: &Path) -> Result<(), String> 
 #[test]
 fn native_lock_waits_for_release() {
     let host = NativeHost::new().expect("native host");
-    let temp = TempDir::new(&host).expect("temporary directory");
-    assert_eq!(check_lock_wait(&host, &temp.path.join("wait.lock")), Ok(()));
+    let temp = tempfile::tempdir().expect("temporary directory");
+    assert_eq!(
+        check_lock_wait(&host, &temp.path().join("wait.lock")),
+        Ok(())
+    );
 }
 
 #[test]

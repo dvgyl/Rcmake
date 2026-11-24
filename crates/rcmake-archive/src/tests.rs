@@ -787,6 +787,103 @@ mod oracle {
 
     #[test]
     #[ignore = "Set RCMAKE_ARCHIVE_INTEROP_CMAKE to the CMake executable"]
+    fn interops_with_cmake_7zip_archives() -> TestResult {
+        let host = NativeHost::new()?;
+        let cmake = host
+            .env_get(b"RCMAKE_ARCHIVE_INTEROP_CMAKE")
+            .ok_or("Set RCMAKE_ARCHIVE_INTEROP_CMAKE to the CMake executable")?;
+        let directory = run(&host, &host.initial_cwd(), BString::from("mktemp"), &["-d"])?;
+        let temporary = TempDir {
+            host: &host,
+            path: to_native(directory.strip_suffix(b"\n").unwrap_or(&directory)),
+        };
+        let source = temporary.path.join("source");
+        let destination = temporary.path.join("destination");
+        let archive = temporary.path.join("archive.7z");
+        host.create_dir_all(&source.join("data/empty"))?;
+        host.create_dir_all(&destination)?;
+        let payload = b"sample\n".repeat(4096);
+        let input = source.join("data/file");
+        host.write(&input, &payload, WriteMode::CreateNew)?;
+        host.set_permissions(&input, 0o751)?;
+        host.symlink(Path::new("file"), &source.join("data/link"))?;
+        let archive_arg = archive.to_str().ok_or("Invalid archive path")?;
+        for (compression, method) in [
+            (SevenZipCompression::Store, "store"),
+            (SevenZipCompression::Lzma, "lzma"),
+            (SevenZipCompression::Lzma2, "lzma2"),
+            (SevenZipCompression::Deflate, "deflate"),
+            (SevenZipCompression::Bzip2, "bzip2"),
+            (SevenZipCompression::Ppmd, "ppmd"),
+            (SevenZipCompression::Zstd, "zstd"),
+        ] {
+            let mut options = create_options(ArchiveFormat::SevenZip {
+                compression,
+                threads: 2,
+            });
+            options.mtime = Some(1_700_000_000);
+            create_archive(&host, &archive, &source, &[PathBuf::from("data")], &options)?;
+            run(
+                &host,
+                &destination,
+                cmake.clone(),
+                &["-E", "tar", "xf", archive_arg],
+            )?;
+            let output = destination.join("data/file");
+            assert_eq!(
+                read_bytes(&host, &output, size_limit())?,
+                payload,
+                "{method}"
+            );
+            assert_eq!(
+                host.read_link(&destination.join("data/link"))?,
+                Path::new("file")
+            );
+            let metadata = host.metadata(&output, Follow::No)?;
+            assert_eq!(metadata.mode & 0o777, 0o751);
+            assert_eq!(metadata.mtime, timestamp::seconds(1_700_000_000));
+            host.remove_dir_all(&destination.join("data"))?;
+
+            let option = format!("--cmake-tar-compression-method={method}");
+            run(
+                &host,
+                &source,
+                cmake.clone(),
+                &[
+                    "-E",
+                    "tar",
+                    "cf",
+                    archive_arg,
+                    "--format=7zip",
+                    &option,
+                    "data",
+                ],
+            )?;
+            let entries = extract_archive(
+                &host,
+                &archive,
+                &ExtractOptions {
+                    destination: destination.clone(),
+                    ..ExtractOptions::default()
+                },
+            )?;
+            assert!(entries.iter().any(|entry| entry == "data/empty/"));
+            assert_eq!(
+                read_bytes(&host, &output, size_limit())?,
+                payload,
+                "{method}"
+            );
+            assert_eq!(
+                host.read_link(&destination.join("data/link"))?,
+                Path::new("file")
+            );
+            host.remove_dir_all(&destination.join("data"))?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "Set RCMAKE_ARCHIVE_INTEROP_CMAKE to the CMake executable"]
     fn interops_with_cmake_archives() -> TestResult {
         let host = NativeHost::new()?;
         let cmake = host

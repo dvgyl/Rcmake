@@ -7,7 +7,7 @@ use bzip2::{Compression as BzLevel, read::MultiBzDecoder, write::BzEncoder};
 use flate2::{Compression as GzLevel, read::MultiGzDecoder, write::GzEncoder};
 use liblzma::{
     read::XzDecoder,
-    stream::{CONCATENATED, Check, LzmaOptions, Stream},
+    stream::{CONCATENATED, Check, LzmaOptions, MtStreamBuilder, Stream},
     write::XzEncoder,
 };
 
@@ -28,6 +28,7 @@ impl Encoder {
     pub(super) fn new(
         filter: Option<TarCompression>,
         level: Option<u32>,
+        threads: u32,
     ) -> Result<Self, ArchiveError> {
         let level = level.unwrap_or(match filter {
             Some(TarCompression::Bzip2) => 9,
@@ -49,7 +50,15 @@ impl Encoder {
             )),
             Some(TarCompression::Xz | TarCompression::Lzma) => {
                 let stream = if filter == Some(TarCompression::Xz) {
-                    Stream::new_easy_encoder(level, Check::Crc64)
+                    if threads > 1 {
+                        MtStreamBuilder::new()
+                            .threads(threads.min(2))
+                            .preset(level)
+                            .check(Check::Crc64)
+                            .encoder()
+                    } else {
+                        Stream::new_easy_encoder(level, Check::Crc64)
+                    }
                 } else {
                     Stream::new_lzma_encoder(
                         &LzmaOptions::new_preset(level).map_err(archive_error)?,
@@ -61,6 +70,9 @@ impl Encoder {
             Some(TarCompression::Zstd) => {
                 let mut encoder =
                     zstd::Encoder::new(Vec::new(), level as i32).map_err(archive_error)?;
+                if threads > 1 {
+                    encoder.multithread(threads.min(2)).map_err(archive_error)?;
+                }
                 encoder.include_checksum(true).map_err(archive_error)?;
                 Self::Zstd(encoder)
             }

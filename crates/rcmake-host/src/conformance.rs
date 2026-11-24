@@ -5,7 +5,6 @@ use std::path::Path;
 use std::time::Duration;
 
 use rcmake_base::BString;
-use rustix::io::Errno;
 
 use crate::{
     CopyOptions, DirEntry, FileKind, FileTime, Follow, Host, HostError, HostResult, ReadRange,
@@ -69,7 +68,7 @@ fn check_file_locks(host: &dyn Host, root: &Path) -> HostResult<()> {
     let path = root.join("lock-file");
     let guard = host.lock_file(&path, Some(Duration::ZERO))?;
     assert_eq!(guard.path().file_name(), path.file_name());
-    assert_eq!(host.read(&path, ALL)?, b"");
+    assert_eq!(host.metadata(&path, Follow::Yes)?.len, 0);
     assert_kind(
         host.lock_file(&path, Some(Duration::ZERO)),
         ErrorKind::TimedOut,
@@ -89,6 +88,7 @@ fn check_file_locks(host: &dyn Host, root: &Path) -> HostResult<()> {
 }
 
 fn check_files(host: &dyn Host, root: &Path) -> HostResult<()> {
+    let windows_native = cfg!(windows) && root.is_absolute();
     let file = root.join("file");
     host.write(&file, b"old", WriteMode::Truncate)?;
     host.write(&file, b"abc", WriteMode::Truncate)?;
@@ -99,11 +99,9 @@ fn check_files(host: &dyn Host, root: &Path) -> HostResult<()> {
         ErrorKind::AlreadyExists,
     );
     assert_eq!(host.read(&file, ReadRange::All { limit: 6 })?, b"abcdef");
-    assert_eq!(
-        host.read(&file, ReadRange::All { limit: 5 })
-            .err()
-            .and_then(|err| err.errno),
-        Some(Errno::FBIG.raw_os_error())
+    assert_kind(
+        host.read(&file, ReadRange::All { limit: 5 }),
+        ErrorKind::FileTooLarge,
     );
     for (offset, len, expected) in [
         (2, Some(2), b"cd".as_slice()),
@@ -124,16 +122,24 @@ fn check_files(host: &dyn Host, root: &Path) -> HostResult<()> {
     host.set_permissions(&file, 0o710)?;
     let atime = FileTime {
         secs: 1_600_000_000,
-        nanos: 123_456_789,
+        nanos: 123_456_700,
     };
     let mtime = FileTime {
         secs: 1_600_000_001,
-        nanos: 987_654_321,
+        nanos: 987_654_300,
     };
     host.set_times(&file, Some(atime), None)?;
     host.set_times(&file, None, Some(mtime))?;
     let stat = host.metadata(&file, Follow::Yes)?;
-    assert_eq!((stat.kind, stat.len, stat.mode), (FileKind::File, 6, 0o710));
+    assert_eq!((stat.kind, stat.len), (FileKind::File, 6));
+    if windows_native {
+        assert_ne!(stat.mode & 0o222, 0);
+        host.set_permissions(&file, 0o444)?;
+        assert_eq!(host.metadata(&file, Follow::Yes)?.mode & 0o222, 0);
+        host.set_permissions(&file, 0o710)?;
+    } else {
+        assert_eq!(stat.mode, 0o710);
+    }
     assert_eq!((stat.atime, stat.mtime), (atime, mtime));
     assert_kind(
         host.set_times(
@@ -167,7 +173,7 @@ fn check_files(host: &dyn Host, root: &Path) -> HostResult<()> {
                 if preserve_permissions {
                     stat.mode
                 } else {
-                    0o600
+                    if windows_native { 0o666 } else { 0o600 }
                 }
             );
             assert_eq!(copied.mtime == stat.mtime, preserve_mtime);
@@ -201,8 +207,13 @@ fn check_links(host: &dyn Host, root: &Path) -> HostResult<()> {
 
     let stat = host.metadata(&file, Follow::Yes)?;
     assert_eq!(stat.nlink, 2);
+    assert_kind(
+        host.copy_file(&file, &hard, CopyOptions::default()),
+        ErrorKind::InvalidInput,
+    );
     assert_eq!(host.metadata(&hard, Follow::No)?, stat);
     assert_eq!(host.metadata(&sym, Follow::Yes)?, stat);
+    assert_eq!(host.read(&file, ALL)?, b"abc");
     let lstat = host.metadata(&sym, Follow::No)?;
     assert_eq!(lstat.kind, FileKind::Symlink);
     assert_ne!(lstat.ino, stat.ino);
@@ -264,14 +275,16 @@ fn check_directories(host: &dyn Host, root: &Path) -> HostResult<()> {
         host.read_dir(&root.join("dir-link"))?,
         host.read_dir(&outside)?
     );
-    assert_eq!(
-        host.canonicalize(&tree.join("link/../tree/./child"))?,
-        child
-    );
-    assert_message(
-        host.canonicalize(&tree.join("file/../child")),
-        "Not a directory",
-    );
+    if !cfg!(windows) || !root.is_absolute() {
+        assert_eq!(
+            host.canonicalize(&tree.join("link/../tree/./child"))?,
+            child
+        );
+        assert_message(
+            host.canonicalize(&tree.join("file/../child")),
+            "Not a directory",
+        );
+    }
     assert_message(host.read(&tree, ALL), "Is a directory");
     assert_message(host.remove_dir(&tree), "Directory not empty");
     assert_message(host.remove_dir(&tree.join("link")), "Not a directory");
@@ -351,8 +364,9 @@ fn check_environment_and_clock(host: &dyn Host) {
     let interval = Duration::from_millis(2);
     host.sleep(interval);
     assert!(host.monotonic().saturating_sub(start) >= interval);
-    assert!(host.initial_cwd().is_absolute());
-    assert!(host.current_exe().is_ok_and(|path| path.is_absolute()));
+    let absolute = |path: &Path| path.is_absolute() || (cfg!(windows) && path.has_root());
+    assert!(absolute(&host.initial_cwd()));
+    assert!(host.current_exe().is_ok_and(|path| absolute(&path)));
     assert!(host.system().cpu_count > 0);
     host.write_out(Stream::Stdout, b"");
 }
@@ -362,8 +376,20 @@ fn assert_kind<T>(result: HostResult<T>, kind: ErrorKind) {
 }
 
 fn assert_message<T>(result: HostResult<T>, message: &str) {
-    assert_eq!(
-        result.err().as_ref().map(|err| err.os_message.as_str()),
-        Some(message)
-    );
+    let Err(err) = result else {
+        unreachable!("expected host error");
+    };
+    if cfg!(windows) && err.errno.is_some() {
+        let expected = match message {
+            "No such file or directory" => Some(ErrorKind::NotFound),
+            "File exists" => Some(ErrorKind::AlreadyExists),
+            "Directory not empty" => Some(ErrorKind::DirectoryNotEmpty),
+            _ => None,
+        };
+        if let Some(expected) = expected {
+            assert_eq!(err.kind, expected);
+        }
+    } else {
+        assert_eq!(err.os_message, message);
+    }
 }

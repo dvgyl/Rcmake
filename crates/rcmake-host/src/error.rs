@@ -73,6 +73,7 @@ impl HostError {
     }
 }
 
+#[cfg(unix)]
 pub(crate) fn from_errno(errno: rustix::io::Errno, path: Option<&Path>) -> HostError {
     HostError::from_io(errno.into(), path.map(Path::to_path_buf))
 }
@@ -84,6 +85,60 @@ fn strip_os_error_suffix(msg: &str) -> &str {
         return msg.get(..idx).unwrap_or(msg);
     }
     msg
+}
+
+pub(crate) enum SyntheticError {
+    NotFound,
+    InvalidInput,
+    IsADirectory,
+    NotADirectory,
+    FileTooLarge,
+    AlreadyExists,
+    ResourceBusy,
+    DirectoryNotEmpty,
+    PermissionDenied,
+    LinkLoop,
+}
+
+impl SyntheticError {
+    pub(crate) fn at(self, path: Option<&Path>) -> HostError {
+        #[cfg(unix)]
+        {
+            use rustix::io::Errno;
+            let errno = match self {
+                Self::NotFound => Errno::NOENT,
+                Self::InvalidInput => Errno::INVAL,
+                Self::IsADirectory => Errno::ISDIR,
+                Self::NotADirectory => Errno::NOTDIR,
+                Self::FileTooLarge => Errno::FBIG,
+                Self::AlreadyExists => Errno::EXIST,
+                Self::ResourceBusy => Errno::BUSY,
+                Self::DirectoryNotEmpty => Errno::NOTEMPTY,
+                Self::PermissionDenied => Errno::PERM,
+                Self::LinkLoop => Errno::LOOP,
+            };
+            from_errno(errno, path)
+        }
+        #[cfg(windows)]
+        {
+            let (kind, message) = match self {
+                Self::NotFound => (ErrorKind::NotFound, "No such file or directory"),
+                Self::InvalidInput => (ErrorKind::InvalidInput, "Invalid argument"),
+                Self::IsADirectory => (ErrorKind::IsADirectory, "Is a directory"),
+                Self::NotADirectory => (ErrorKind::NotADirectory, "Not a directory"),
+                Self::FileTooLarge => (ErrorKind::FileTooLarge, "File too large"),
+                Self::AlreadyExists => (ErrorKind::AlreadyExists, "File exists"),
+                Self::ResourceBusy => (ErrorKind::ResourceBusy, "Device or resource busy"),
+                Self::DirectoryNotEmpty => (ErrorKind::DirectoryNotEmpty, "Directory not empty"),
+                Self::PermissionDenied => (ErrorKind::PermissionDenied, "Operation not permitted"),
+                Self::LinkLoop => (ErrorKind::Other, "Too many levels of symbolic links"),
+            };
+            HostError::from_io(
+                std::io::Error::new(kind, message),
+                path.map(Path::to_path_buf),
+            )
+        }
+    }
 }
 
 #[cfg(test)]

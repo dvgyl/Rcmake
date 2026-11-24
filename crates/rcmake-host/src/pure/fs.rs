@@ -1,13 +1,11 @@
+use super::{require_absolute, virtual_absolute};
 use std::collections::{BTreeMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use rustix::io::Errno;
-
-use crate::error::{HostResult, from_errno};
+use crate::error::{HostResult, SyntheticError};
 use crate::{
     CopyOptions, DirEntry, FileKind, FileTime, Follow, Metadata, ReadRange, WriteMode, path,
-    require_absolute,
 };
 
 enum Data {
@@ -51,12 +49,13 @@ enum Missing {
 fn components(path: &Path, create_dirs: bool) -> VecDeque<(PathBuf, bool)> {
     let bytes = path::from_native(path);
     let bytes = bytes.as_slice();
+    let separator = |byte: &u8| *byte == b'/' || (cfg!(windows) && *byte == b'\\');
     let mut parts: VecDeque<_> = bytes
-        .split(|byte| *byte == b'/')
+        .split(separator)
         .filter(|part| !part.is_empty())
         .map(|part| (path::to_native(part), create_dirs))
         .collect();
-    if !parts.is_empty() && bytes.ends_with(b"/") {
+    if !parts.is_empty() && bytes.last().is_some_and(separator) {
         parts.push_back((PathBuf::from("."), create_dirs));
     }
     parts
@@ -149,7 +148,7 @@ impl FileSystem {
     fn resolve(&mut self, path: &Path, follow: Follow, missing: Missing) -> HostResult<PathBuf> {
         require_absolute(path)?;
         if path::from_native(path).as_slice().contains(&0) {
-            return Err(from_errno(Errno::INVAL, Some(path)));
+            return Err(SyntheticError::InvalidInput.at(Some(path)));
         }
         let mut resolved = PathBuf::from("/");
         let mut pending = components(path, missing == Missing::Directories);
@@ -171,16 +170,16 @@ impl FileSystem {
                 if pending.is_empty() && missing == Missing::Leaf {
                     return Ok(resolved);
                 }
-                return Err(from_errno(Errno::NOENT, Some(path)));
+                return Err(SyntheticError::NotFound.at(Some(path)));
             };
             let last = pending.is_empty();
             match &inode.data {
                 Data::Symlink(target) if !last || follow == Follow::Yes => {
                     hops += 1;
                     if hops > 40 {
-                        return Err(from_errno(Errno::LOOP, Some(path)));
+                        return Err(SyntheticError::LinkLoop.at(Some(path)));
                     }
-                    if target.is_absolute() {
+                    if virtual_absolute(target) {
                         resolved = PathBuf::from("/");
                     } else {
                         resolved.pop();
@@ -191,7 +190,7 @@ impl FileSystem {
                 }
                 Data::Dir => {}
                 _ if !last || missing == Missing::Directories => {
-                    return Err(from_errno(Errno::NOTDIR, Some(path)));
+                    return Err(SyntheticError::NotADirectory.at(Some(path)));
                 }
                 _ => {}
             }
@@ -205,20 +204,20 @@ impl FileSystem {
             .paths
             .get(&resolved)
             .copied()
-            .ok_or_else(|| from_errno(Errno::NOENT, Some(path)))?;
+            .ok_or_else(|| SyntheticError::NotFound.at(Some(path)))?;
         Ok((resolved, ino))
     }
 
     fn inode(&self, ino: u64, path: &Path) -> HostResult<&Inode> {
         self.inodes
             .get(&ino)
-            .ok_or_else(|| from_errno(Errno::NOENT, Some(path)))
+            .ok_or_else(|| SyntheticError::NotFound.at(Some(path)))
     }
 
     fn inode_mut(&mut self, ino: u64, path: &Path) -> HostResult<&mut Inode> {
         self.inodes
             .get_mut(&ino)
-            .ok_or_else(|| from_errno(Errno::NOENT, Some(path)))
+            .ok_or_else(|| SyntheticError::NotFound.at(Some(path)))
     }
 
     pub(super) fn metadata(&mut self, path: &Path, follow: Follow) -> HostResult<Metadata> {
@@ -254,12 +253,12 @@ impl FileSystem {
     pub(super) fn read(&mut self, path: &Path, range: ReadRange) -> HostResult<Vec<u8>> {
         let (_, ino) = self.existing(path, Follow::Yes)?;
         let Data::File(bytes) = &self.inode(ino, path)?.data else {
-            return Err(from_errno(Errno::ISDIR, Some(path)));
+            return Err(SyntheticError::IsADirectory.at(Some(path)));
         };
         let bytes = match range {
             ReadRange::All { limit } => {
                 if bytes.len() as u64 > limit {
-                    return Err(from_errno(Errno::FBIG, Some(path)));
+                    return Err(SyntheticError::FileTooLarge.at(Some(path)));
                 }
                 bytes.clone()
             }
@@ -288,13 +287,13 @@ impl FileSystem {
         let resolved = self.resolve(path, follow, Missing::Leaf)?;
         if let Some(ino) = self.paths.get(&resolved).copied() {
             if mode == WriteMode::CreateNew {
-                return Err(from_errno(Errno::EXIST, Some(path)));
+                return Err(SyntheticError::AlreadyExists.at(Some(path)));
             }
             self.advance(Duration::from_nanos(1));
             let now = self.now;
             let inode = self.inode_mut(ino, path)?;
             let Data::File(data) = &mut inode.data else {
-                return Err(from_errno(Errno::ISDIR, Some(path)));
+                return Err(SyntheticError::IsADirectory.at(Some(path)));
             };
             if mode == WriteMode::Truncate {
                 data.clear();
@@ -311,7 +310,7 @@ impl FileSystem {
     pub(super) fn read_dir(&mut self, path: &Path) -> HostResult<Vec<DirEntry>> {
         let (resolved, ino) = self.existing(path, Follow::Yes)?;
         if !matches!(self.inode(ino, path)?.data, Data::Dir) {
-            return Err(from_errno(Errno::NOTDIR, Some(path)));
+            return Err(SyntheticError::NotADirectory.at(Some(path)));
         }
         Ok(self
             .descendants(&resolved)
@@ -329,13 +328,13 @@ impl FileSystem {
         let result = self.resolve(path, Follow::Yes, Missing::Directories);
         if result
             .as_ref()
-            .is_err_and(|err| err.errno == Some(Errno::NOENT.raw_os_error()))
+            .is_err_and(|err| err.kind == std::io::ErrorKind::NotFound)
         {
             let unresolved = path.components().collect::<PathBuf>();
             if let Ok((_, ino)) = self.existing(&unresolved, Follow::No)
                 && matches!(self.inode(ino, path)?.data, Data::Symlink(_))
             {
-                return Err(from_errno(Errno::EXIST, Some(path)));
+                return Err(SyntheticError::AlreadyExists.at(Some(path)));
             }
         }
         result.map(|_| ())
@@ -344,7 +343,7 @@ impl FileSystem {
     pub(super) fn remove_file(&mut self, path: &Path) -> HostResult<()> {
         let (resolved, ino) = self.existing(path, Follow::No)?;
         if matches!(self.inode(ino, path)?.data, Data::Dir) {
-            return Err(from_errno(Errno::ISDIR, Some(path)));
+            return Err(SyntheticError::IsADirectory.at(Some(path)));
         }
         self.unlink(&resolved);
         Ok(())
@@ -354,13 +353,13 @@ impl FileSystem {
         let trimmed = path::directory_removal_path(path)?;
         let (resolved, ino) = self.existing(&trimmed, Follow::No)?;
         if !matches!(self.inode(ino, path)?.data, Data::Dir) {
-            return Err(from_errno(Errno::NOTDIR, Some(path)));
+            return Err(SyntheticError::NotADirectory.at(Some(path)));
         }
         if resolved.parent().is_none() {
-            return Err(from_errno(Errno::BUSY, Some(path)));
+            return Err(SyntheticError::ResourceBusy.at(Some(path)));
         }
         if self.descendants(&resolved).next().is_some() {
-            return Err(from_errno(Errno::NOTEMPTY, Some(path)));
+            return Err(SyntheticError::DirectoryNotEmpty.at(Some(path)));
         }
         self.unlink(&resolved);
         Ok(())
@@ -370,7 +369,7 @@ impl FileSystem {
         let trimmed = path::directory_removal_path(path)?;
         let (resolved, ino) = self.existing(&trimmed, Follow::No)?;
         if resolved.parent().is_none() {
-            return Err(from_errno(Errno::BUSY, Some(path)));
+            return Err(SyntheticError::ResourceBusy.at(Some(path)));
         }
         match self.inode(ino, path)?.data {
             Data::Dir => {
@@ -380,7 +379,7 @@ impl FileSystem {
                 }
             }
             Data::Symlink(_) => {}
-            Data::File(_) => return Err(from_errno(Errno::NOTDIR, Some(path))),
+            Data::File(_) => return Err(SyntheticError::NotADirectory.at(Some(path))),
         }
         self.unlink(&resolved);
         Ok(())
@@ -395,20 +394,20 @@ impl FileSystem {
             return Ok(());
         }
         if src.parent().is_none() || dst.parent().is_none() {
-            return Err(from_errno(Errno::BUSY, Some(from)));
+            return Err(SyntheticError::ResourceBusy.at(Some(from)));
         }
         let src_dir = matches!(self.inode(ino, from)?.data, Data::Dir);
         if src_dir && dst.starts_with(&src) {
-            return Err(from_errno(Errno::INVAL, Some(to)));
+            return Err(SyntheticError::InvalidInput.at(Some(to)));
         }
         if let Some(node) = self.lookup(&dst) {
             match (src_dir, &node.data) {
                 (true, Data::File(_) | Data::Symlink(_)) => {
-                    return Err(from_errno(Errno::NOTDIR, Some(to)));
+                    return Err(SyntheticError::NotADirectory.at(Some(to)));
                 }
-                (false, Data::Dir) => return Err(from_errno(Errno::ISDIR, Some(to))),
+                (false, Data::Dir) => return Err(SyntheticError::IsADirectory.at(Some(to))),
                 (true, Data::Dir) if self.descendants(&dst).next().is_some() => {
-                    return Err(from_errno(Errno::NOTEMPTY, Some(to)));
+                    return Err(SyntheticError::DirectoryNotEmpty.at(Some(to)));
                 }
                 _ => {}
             }
@@ -438,11 +437,11 @@ impl FileSystem {
         let (_, src) = self.existing(from, Follow::Yes)?;
         let dst = self.resolve(to, Follow::Yes, Missing::Leaf)?;
         if self.paths.get(&dst) == Some(&src) {
-            return Err(from_errno(Errno::INVAL, Some(to)));
+            return Err(SyntheticError::InvalidInput.at(Some(to)));
         }
         let inode = self.inode(src, from)?;
         let Data::File(bytes) = &inode.data else {
-            return Err(from_errno(Errno::INVAL, Some(from)));
+            return Err(SyntheticError::InvalidInput.at(Some(from)));
         };
         let (bytes, mode, mtime) = (bytes.clone(), inode.mode, inode.mtime);
         self.write(to, &bytes, WriteMode::Truncate)?;
@@ -461,13 +460,13 @@ impl FileSystem {
     pub(super) fn symlink(&mut self, target: &Path, link: &Path) -> HostResult<()> {
         let resolved = self.resolve(link, Follow::No, Missing::Leaf)?;
         if self.paths.contains_key(&resolved) {
-            return Err(from_errno(Errno::EXIST, Some(link)));
+            return Err(SyntheticError::AlreadyExists.at(Some(link)));
         }
         if target.as_os_str().is_empty() {
-            return Err(from_errno(Errno::NOENT, Some(link)));
+            return Err(SyntheticError::NotFound.at(Some(link)));
         }
         if path::from_native(target).as_slice().contains(&0) {
-            return Err(from_errno(Errno::INVAL, Some(link)));
+            return Err(SyntheticError::InvalidInput.at(Some(link)));
         }
         self.insert(resolved, Data::Symlink(target.to_path_buf()));
         Ok(())
@@ -479,11 +478,11 @@ impl FileSystem {
         let (_, ino) = self.existing(src, Follow::No)?;
         let resolved = self.resolve(dst, Follow::No, Missing::Leaf)?;
         if self.paths.contains_key(&resolved) {
-            return Err(from_errno(Errno::EXIST, Some(dst)));
+            return Err(SyntheticError::AlreadyExists.at(Some(dst)));
         }
         let inode = self.inode_mut(ino, src)?;
         if matches!(inode.data, Data::Dir) {
-            return Err(from_errno(Errno::PERM, Some(src)));
+            return Err(SyntheticError::PermissionDenied.at(Some(src)));
         }
         inode.links += 1;
         self.paths.insert(resolved, ino);
@@ -494,7 +493,7 @@ impl FileSystem {
         let (_, ino) = self.existing(path, Follow::No)?;
         match &self.inode(ino, path)?.data {
             Data::Symlink(target) => Ok(target.clone()),
-            _ => Err(from_errno(Errno::INVAL, Some(path))),
+            _ => Err(SyntheticError::InvalidInput.at(Some(path))),
         }
     }
 
@@ -520,7 +519,7 @@ impl FileSystem {
             .chain(mtime)
             .any(|time| time.nanos >= 1_000_000_000)
         {
-            return Err(from_errno(Errno::INVAL, Some(path)));
+            return Err(SyntheticError::InvalidInput.at(Some(path)));
         }
         let (_, ino) = self.existing(path, Follow::Yes)?;
         let inode = self.inode_mut(ino, path)?;

@@ -34,22 +34,23 @@ pub fn from_native(p: &Path) -> BString {
 }
 
 pub(crate) fn directory_removal_path(p: &Path) -> crate::HostResult<PathBuf> {
-    use rustix::io::Errno;
+    use crate::error::SyntheticError;
 
     crate::require_absolute(p)?;
     let bytes = from_native(p);
     let bytes = bytes.as_slice();
+    let separator = |byte: &u8| *byte == b'/' || (cfg!(windows) && *byte == b'\\');
+    if p.parent().is_none() {
+        return Err(SyntheticError::ResourceBusy.at(Some(p)));
+    }
     let end = bytes
         .iter()
-        .rposition(|byte| *byte != b'/')
+        .rposition(|byte| !separator(byte))
         .map(|index| index + 1)
-        .ok_or_else(|| crate::error::from_errno(Errno::BUSY, Some(p)))?;
+        .ok_or_else(|| SyntheticError::ResourceBusy.at(Some(p)))?;
     let trimmed = bytes.get(..end).unwrap_or_default();
-    if matches!(
-        trimmed.rsplit(|byte| *byte == b'/').next(),
-        Some(b"." | b"..")
-    ) {
-        return Err(crate::error::from_errno(Errno::INVAL, Some(p)));
+    if matches!(trimmed.rsplit(separator).next(), Some(b"." | b"..")) {
+        return Err(SyntheticError::InvalidInput.at(Some(p)));
     }
     Ok(to_native(trimmed))
 }

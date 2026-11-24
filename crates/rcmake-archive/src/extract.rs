@@ -14,13 +14,23 @@ use crate::{
     ArchiveError, ExtractOptions, MAX_ENTRIES, absolute, archive_error, checked_name, emit_names,
     read_bounded, read_bytes, relative_path, size_limit,
 };
-use crate::{codec, external_filter, timestamp, zip_codec};
+use crate::{codec, external_filter, seven_zip, timestamp, zip_codec};
 
 #[derive(Clone, Copy)]
 pub(super) enum Listing<'a> {
     Shared,
     Names,
     Details(&'a dyn Fn(FileTime) -> String),
+    SharedDetails(&'a dyn Fn(FileTime) -> String),
+}
+
+impl<'a> Listing<'a> {
+    fn time_formatter(self) -> Option<&'a dyn Fn(FileTime) -> String> {
+        match self {
+            Self::Details(format) | Self::SharedDetails(format) => Some(format),
+            Self::Shared | Self::Names => None,
+        }
+    }
 }
 
 pub(super) fn run(
@@ -47,7 +57,11 @@ pub(super) fn run(
             len: Some(16),
         },
     )?;
+    if options.excludes.iter().any(|pattern| pattern.is_empty()) {
+        return Err(ArchiveError::new("Failed to add to exclusion list: "));
+    }
     let mut scan = Scan {
+        excludes: Patterns::new(&options.excludes)?,
         patterns: Patterns::new(&options.patterns)?,
         list_only: options.list_only,
         listing,
@@ -56,9 +70,16 @@ pub(super) fn run(
         count: 0,
         bytes_left: size_limit(),
     };
-    if prefix.starts_with(b"PK\x03\x04") || prefix.starts_with(b"PK\x05\x06") {
+    if prefix.starts_with(b"PK\x03\x04")
+        || prefix.starts_with(b"PK\x05\x06")
+        || prefix.starts_with(seven_zip::MAGIC)
+    {
         let bytes = read_bytes(host, archive_path, size_limit())?;
-        let entries = scan.zip(&bytes)?;
+        let entries = if prefix.starts_with(seven_zip::MAGIC) {
+            scan.seven_zip(&bytes)?
+        } else {
+            scan.zip(&bytes)?
+        };
         scan.patterns.finish()?;
         if !entries.is_empty() {
             let mut unpack = Unpack::new(host, &options.destination)?;
@@ -109,6 +130,7 @@ pub(super) fn run(
 
 struct Scan<'a> {
     patterns: Patterns<'a>,
+    excludes: Patterns<'a>,
     list_only: bool,
     listing: Listing<'a>,
     touch: bool,
@@ -125,12 +147,14 @@ impl Scan<'_> {
             .checked_sub(name.len() as u64 + 512)
             .filter(|_| self.count <= MAX_ENTRIES)
             .ok_or_else(|| ArchiveError::new("Archive exceeds the entry or size limit"))?;
-        self.patterns.matches(path, name.ends_with(b"/"))
+        let directory = name.ends_with(b"/");
+        let included = self.patterns.matches(path, directory)?;
+        Ok(included && !self.excludes.excludes(path, directory)?)
     }
 
     fn path(&self, name: &[u8]) -> Result<PathBuf, ArchiveError> {
         match self.listing {
-            Listing::Shared => relative_path(name),
+            Listing::Shared | Listing::SharedDetails(_) => relative_path(name),
             _ => checked_name(name),
         }
     }
@@ -157,7 +181,7 @@ impl Scan<'_> {
             if !self.select(&name, &path)? {
                 continue;
             }
-            let entry_name = if let Listing::Details(format_time) = self.listing {
+            let entry_name = if let Some(format_time) = self.listing.time_formatter() {
                 let name = name.into_owned();
                 let line = tar_listing(&mut item, &name, format_time)?;
                 self.reserve_payload(line.len().saturating_sub(name.len() + 512) as u64)?;
@@ -235,6 +259,96 @@ impl Scan<'_> {
         Ok(entries)
     }
 
+    fn seven_zip(&mut self, bytes: &[u8]) -> Result<Vec<(Entry, Vec<u8>)>, ArchiveError> {
+        let archive = seven_zip::open(bytes)?;
+        let mut entries = Vec::new();
+        let mut selected_entries = Vec::new();
+        for item in &archive.files {
+            self.reserve_payload(item.size)?;
+            let mut name = item.name.replace('\\', "/").into_bytes();
+            if item.is_directory && !name.ends_with(b"/") {
+                name.push(b'/');
+            }
+            let path = self.path(&name)?;
+            let selected = self.select(&name, &path)? && !item.is_anti_item;
+            let needs_payload = if selected {
+                let mode = seven_zip::mode(item);
+                let mtime = seven_zip::time(item);
+                let is_link = mode & 0o170000 == 0o120000;
+                let needs_payload =
+                    !self.list_only || (is_link && self.listing.time_formatter().is_some());
+                let data = if item.is_directory {
+                    Data::Directory
+                } else {
+                    Data::File
+                };
+                let display = match self.listing.time_formatter() {
+                    Some(format_time) => listing_line(
+                        mode,
+                        b"0 ",
+                        b"0",
+                        &(if is_link { 0 } else { item.size }).to_string(),
+                        &format_time(mtime.unwrap_or_default()),
+                        &name,
+                    ),
+                    None => BString::from(name),
+                };
+                let index = self.names.len();
+                self.names.push(display);
+                if is_link && item.size > crate::MAX_NAME_BYTES as u64 {
+                    return Err(ArchiveError::new(
+                        "The 7-Zip symbolic link target is too long",
+                    ));
+                }
+                needs_payload.then_some((
+                    index,
+                    Entry {
+                        path,
+                        data,
+                        mode: Some(mode),
+                        mtime: if self.touch { None } else { mtime },
+                    },
+                    is_link,
+                ))
+            } else {
+                None
+            };
+            selected_entries.push(needs_payload);
+        }
+        if !selected_entries.iter().any(Option::is_some) {
+            return Ok(Vec::new());
+        }
+        seven_zip::read_entries(bytes, &archive, |item_index, item, reader| {
+            let Some((index, mut entry, is_link)) =
+                selected_entries.get_mut(item_index).and_then(Option::take)
+            else {
+                return Ok(());
+            };
+            let mut payload = read_payload(reader, item.size)?;
+            if is_link {
+                if self.listing.time_formatter().is_some()
+                    && let Some(name) = self.names.get_mut(index)
+                {
+                    name.extend_from_slice(b" -> ");
+                    name.extend_from_slice(&payload);
+                }
+                if !self.list_only {
+                    entry.data = Data::Symlink(symlink_target(&entry.path, &payload)?);
+                }
+                payload.clear();
+            }
+            if !self.list_only {
+                entries.push((index, (entry, payload)));
+            }
+            Ok(())
+        })?;
+        if selected_entries.iter().any(Option::is_some) {
+            return Err(ArchiveError::new("7-Zip archive is missing entry data"));
+        }
+        entries.sort_unstable_by_key(|(index, _)| *index);
+        Ok(entries.into_iter().map(|(_, entry)| entry).collect())
+    }
+
     fn zip(&mut self, bytes: &[u8]) -> Result<Vec<(Entry, Vec<u8>)>, ArchiveError> {
         let mut archive = ZipArchive::new(Cursor::new(bytes)).map_err(archive_error)?;
         let mut entries = Vec::new();
@@ -249,7 +363,7 @@ impl Scan<'_> {
             if !self.select(&name, &path)? {
                 continue;
             }
-            let entry_name = if let Listing::Details(format_time) = self.listing {
+            let entry_name = if let Some(format_time) = self.listing.time_formatter() {
                 let is_link = item.is_symlink();
                 let mode =
                     item.unix_mode()
