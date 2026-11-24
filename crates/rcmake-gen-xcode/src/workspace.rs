@@ -1,3 +1,41 @@
-//! `project.xcworkspace/xcshareddata/WorkspaceSettings.xcsettings`.
-//!
-//! Owner after Milestone 4 Wave 0: Wave 1 worker A.
+//! Xcode workspace descriptors and shared settings.
+
+use std::path::Path;
+
+use rcmake_gen_common::GenError;
+use rcmake_host::Host;
+
+use crate::write_file;
+
+pub(crate) const XML: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n";
+pub(crate) const PLIST: &str = "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\">\n";
+
+pub(crate) fn escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+        .replace('\n', "&#10;")
+        .replace('\r', "&#13;")
+        .replace('\t', "&#9;")
+}
+
+pub(crate) fn write(host: &dyn Host, project: &Path) -> Result<(), GenError> {
+    let workspace = project.join("project.xcworkspace");
+    write_file(
+        host,
+        &workspace.join("contents.xcworkspacedata"),
+        &format!(
+            "{XML}<Workspace version=\"1.0\">\n   <FileRef location=\"self:\"></FileRef>\n</Workspace>\n"
+        ),
+    )?;
+    write_file(
+        host,
+        &workspace.join("xcshareddata/WorkspaceSettings.xcsettings"),
+        &format!(
+            "{XML}{PLIST}<dict>\n\t<key>BuildSystemType</key>\n\t<string>Latest</string>\n\t<key>IDEWorkspaceSharedSettings_AutocreateContextsIfNeeded</key>\n\t<false/>\n</dict>\n</plist>\n"
+        ),
+    )
+}
