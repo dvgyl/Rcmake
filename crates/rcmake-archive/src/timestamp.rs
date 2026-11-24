@@ -3,6 +3,7 @@ use std::io::Read;
 use jiff::{
     Timestamp,
     civil::{Date, DateTime as CivilDateTime, Time},
+    fmt::rfc2822,
     tz::{Offset, TimeZone},
 };
 use rcmake_host::FileTime;
@@ -196,6 +197,12 @@ pub fn parse_archive_mtime(host: &dyn rcmake_host::Host, value: &[u8]) -> Option
         return u64::try_from(epoch.parse::<i64>().ok()?).ok();
     }
     let text = text.trim_ascii();
+    if text.contains('.') {
+        return None;
+    }
+    if let Ok(date_time) = rfc2822::parse(text) {
+        return u64::try_from(date_time.timestamp().as_second()).ok();
+    }
     let upper = text.to_ascii_uppercase();
     let utc = ["UTC", "GMT", "Z"]
         .into_iter()
@@ -219,21 +226,16 @@ pub fn parse_archive_mtime(host: &dyn rcmake_host::Host, value: &[u8]) -> Option
         if !text.contains(' ') && text.contains(['T', 't']) {
             return None;
         }
-        let time = if text.len() <= 4
-            && !text.is_empty()
-            && text.bytes().all(|byte| byte.is_ascii_digit())
-        {
+        let time = if text == "24" {
+            Time::MIN
+        } else if text.len() <= 4 && text.bytes().all(|byte| byte.is_ascii_digit()) {
             let number = text.parse::<u32>().ok()?;
             let (hour, minute) = if number < 100 {
                 (number, 0)
             } else {
                 (number / 100, number % 100)
             };
-            if hour > 23 || minute > 59 {
-                Time::MIN
-            } else {
-                Time::new(hour as i8, minute as i8, 0, 0).ok()?
-            }
+            Time::new(i8::try_from(hour).ok()?, i8::try_from(minute).ok()?, 0, 0).ok()?
         } else {
             text.parse::<Time>().ok()?
         };

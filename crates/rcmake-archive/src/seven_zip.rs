@@ -1,3 +1,4 @@
+use std::cmp::Reverse;
 use std::io::{Cursor, Read};
 
 use rcmake_host::{FileKind, FileTime, Metadata};
@@ -9,30 +10,63 @@ use sevenz_rust2::{
     NtTime, Password,
 };
 
-use crate::{ArchiveError, SevenZipCompression, archive_error};
+use crate::{ArchiveError, MAX_ENTRIES, SevenZipCompression, archive_error, size_limit};
 
 pub(super) const MAGIC: &[u8] = b"\x37\x7a\xbc\xaf\x27\x1c";
 
 const TICKS_PER_SECOND: u64 = 10_000_000;
 const NTFS_EPOCH: i64 = 11_644_473_600;
 const UNIX_ATTRIBUTES: u32 = 0x8000;
+const MAX_HEADER_MEMORY_KIB: usize = 16 * 1024;
 const MAX_DECODE_MEMORY_KIB: usize = 256 * 1024;
 
 mod ppmd;
 
-pub(super) enum Writer {
+pub(super) struct Writer {
+    output: Output,
+    empty: Vec<ArchiveEntry>,
+}
+
+enum Output {
     Generic(ArchiveWriter<Cursor<Vec<u8>>>),
     Ppmd(ppmd::Writer),
 }
 
 impl Writer {
-    pub(super) fn finish(self) -> Result<Vec<u8>, ArchiveError> {
-        match self {
-            Self::Generic(writer) => writer
+    pub(super) fn finish(mut self) -> Result<Vec<u8>, ArchiveError> {
+        // CMake writes entries with data first, then empty files in input order.
+        // Directories follow, in descending order by UTF-16LE name length and bytes.
+        self.empty.sort_by_cached_key(|entry| {
+            entry.is_directory.then(|| {
+                let name: Vec<_> = entry
+                    .name
+                    .encode_utf16()
+                    .flat_map(u16::to_le_bytes)
+                    .collect();
+                Reverse((name.len(), name))
+            })
+        });
+        for entry in self.empty {
+            self.output.add(entry, &[])?;
+        }
+        match self.output {
+            Output::Generic(writer) => writer
                 .finish()
                 .map(Cursor::into_inner)
                 .map_err(archive_error),
-            Self::Ppmd(writer) => Ok(writer.finish()),
+            Output::Ppmd(writer) => Ok(writer.finish()),
+        }
+    }
+}
+
+impl Output {
+    fn add(&mut self, entry: ArchiveEntry, bytes: &[u8]) -> Result<(), ArchiveError> {
+        match self {
+            Self::Generic(writer) => writer
+                .push_archive_entry(entry, (!bytes.is_empty()).then_some(bytes))
+                .map(|_| ())
+                .map_err(archive_error),
+            Self::Ppmd(writer) => writer.add(entry, bytes),
         }
     }
 }
@@ -66,7 +100,12 @@ pub(super) fn writer(
             EncoderMethod::BZIP2,
             Some(Bzip2Options::from_level(level.filter(|&value| value > 0).unwrap_or(6)).into()),
         ),
-        SevenZipCompression::Ppmd => return Ok(Writer::Ppmd(ppmd::Writer::new(level)?)),
+        SevenZipCompression::Ppmd => {
+            return Ok(Writer {
+                output: Output::Ppmd(ppmd::Writer::new(level)?),
+                empty: Vec::new(),
+            });
+        }
         SevenZipCompression::Zstd => (
             EncoderMethod::ZSTD,
             Some(
@@ -80,7 +119,10 @@ pub(super) fn writer(
     }
     let mut writer = ArchiveWriter::new(Cursor::new(Vec::new())).map_err(archive_error)?;
     writer.set_content_methods(vec![method]);
-    Ok(Writer::Generic(writer))
+    Ok(Writer {
+        output: Output::Generic(writer),
+        empty: Vec::new(),
+    })
 }
 
 pub(super) fn add(
@@ -106,24 +148,40 @@ pub(super) fn add(
     let ticks = (i128::from(mtime.secs) + i128::from(NTFS_EPOCH)) * i128::from(TICKS_PER_SECOND)
         + i128::from(mtime.nanos / 100);
     entry.last_modified_date = NtTime::from(u64::try_from(ticks).map_err(archive_error)?);
-    match writer {
-        Writer::Generic(writer) => {
-            writer
-                .push_archive_entry(entry, (!bytes.is_empty()).then_some(bytes))
-                .map_err(archive_error)?;
-            Ok(())
-        }
-        Writer::Ppmd(writer) => writer.add(entry, bytes),
+    if bytes.is_empty() {
+        writer.empty.push(entry);
+        Ok(())
+    } else {
+        writer.output.add(entry, bytes)
     }
 }
 
 pub(super) fn open(bytes: &[u8]) -> Result<Archive, ArchiveError> {
-    Archive::read_with_memory_limit(
+    let archive = Archive::read_with_memory_limit(
         &mut Cursor::new(bytes),
         &Password::empty(),
-        MAX_DECODE_MEMORY_KIB,
+        MAX_HEADER_MEMORY_KIB,
     )
-    .map_err(archive_error)
+    .map_err(archive_error)?;
+    let limit_error = || ArchiveError::new("Archive exceeds the entry or size limit");
+    if archive.files.len() > MAX_ENTRIES || archive.blocks.len() > MAX_ENTRIES {
+        return Err(limit_error());
+    }
+    let mut bytes_left = size_limit();
+    for block in &archive.blocks {
+        bytes_left = bytes_left
+            .checked_sub(block.get_unpack_size())
+            .ok_or_else(limit_error)?;
+        if block
+            .coders
+            .iter()
+            .enumerate()
+            .any(|(index, _)| block.get_unpack_size_at_index(index) > size_limit())
+        {
+            return Err(limit_error());
+        }
+    }
+    Ok(archive)
 }
 
 pub(super) fn read_entries(

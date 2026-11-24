@@ -1,5 +1,5 @@
-use std::collections::{BTreeMap, HashSet};
-use std::io::{self, Cursor, ErrorKind, Read};
+use std::collections::BTreeMap;
+use std::io::{self, ErrorKind, Read};
 use std::path::{Path, PathBuf};
 
 use rcmake_base::BString;
@@ -7,7 +7,6 @@ use rcmake_host::{
     FileKind, FileTime, Follow, Host, Metadata, ReadRange, WriteMode, path::to_native,
 };
 use tar::{Archive, EntryType};
-use zip::ZipArchive;
 
 use crate::pattern::Patterns;
 use crate::{
@@ -50,6 +49,12 @@ pub(super) fn run(
             archive_path.display()
         )));
     }
+    if metadata.len > size_limit() {
+        return Err(ArchiveError::new(format!(
+            "{}: File too large",
+            archive_path.display()
+        )));
+    }
     let prefix = host.read(
         archive_path,
         ReadRange::Slice {
@@ -82,7 +87,7 @@ pub(super) fn run(
         };
         scan.patterns.finish()?;
         if !entries.is_empty() {
-            let mut unpack = Unpack::new(host, &options.destination)?;
+            let mut unpack = Unpack::new(host, &options.destination, scan.bytes_left)?;
             for (entry, payload) in entries {
                 unpack.entry(entry, &payload)?;
             }
@@ -93,29 +98,24 @@ pub(super) fn run(
         let entries = scan.tar_headers(bytes.as_slice())?;
         scan.patterns.finish()?;
         if !entries.is_empty() {
-            Unpack::new(host, &options.destination)?.tar(bytes.as_slice(), entries)?;
+            Unpack::new(host, &options.destination, scan.bytes_left)?
+                .tar(bytes.as_slice(), entries)?;
         }
     } else if let Some(filter) = codec::detect(&prefix) {
         let bytes = read_bytes(host, archive_path, size_limit())?;
         let entries = scan.tar_headers(codec::decoder(filter, &bytes)?)?;
         scan.patterns.finish()?;
         if !entries.is_empty() {
-            let unpack = Unpack::new(host, &options.destination)?;
+            let unpack = Unpack::new(host, &options.destination, scan.bytes_left)?;
             unpack.tar(codec::decoder(filter, &bytes)?, entries)?;
         }
     } else {
-        if metadata.len > size_limit() {
-            return Err(ArchiveError::new(format!(
-                "{}: File too large",
-                archive_path.display()
-            )));
-        }
         let source = host.canonicalize(archive_path)?;
         let reader = || codec::FileReader::new(host, &source, &prefix);
         let entries = scan.tar_headers(reader())?;
         scan.patterns.finish()?;
         if !entries.is_empty() {
-            let unpack = Unpack::new(host, &options.destination)?;
+            let unpack = Unpack::new(host, &options.destination, scan.bytes_left)?;
             if unpack.replaces_source(&source, &metadata, &entries) {
                 let bytes = read_bytes(host, &source, size_limit())?;
                 unpack.tar(bytes.as_slice(), entries)?;
@@ -140,13 +140,17 @@ struct Scan<'a> {
 }
 
 impl Scan<'_> {
-    fn select(&mut self, name: &[u8], path: &Path) -> Result<bool, ArchiveError> {
+    fn count_entry(&mut self, name_size: usize) -> Result<(), ArchiveError> {
         self.count += 1;
         self.bytes_left = self
             .bytes_left
-            .checked_sub(name.len() as u64 + 512)
+            .checked_sub(name_size as u64 + 512)
             .filter(|_| self.count <= MAX_ENTRIES)
             .ok_or_else(|| ArchiveError::new("Archive exceeds the entry or size limit"))?;
+        Ok(())
+    }
+
+    fn select(&mut self, name: &[u8], path: &Path) -> Result<bool, ArchiveError> {
         let directory = name.ends_with(b"/");
         let included = self.patterns.matches(path, directory)?;
         Ok(included && !self.excludes.excludes(path, directory)?)
@@ -173,10 +177,12 @@ impl Scan<'_> {
         for (index, item) in archive.entries().map_err(archive_error)?.enumerate() {
             let mut item = item.map_err(archive_error)?;
             let kind = item.header().entry_type();
+            self.reserve_payload(item.size())?;
+            let name = item.path_bytes();
+            self.count_entry(name.len())?;
             if kind.is_pax_global_extensions() {
                 continue;
             }
-            let name = item.path_bytes();
             let path = self.path(&name)?;
             if !self.select(&name, &path)? {
                 continue;
@@ -214,10 +220,7 @@ impl Scan<'_> {
                     }
                     Data::HardLink(target)
                 }
-                EntryType::Regular | EntryType::GNUSparse => {
-                    self.reserve_payload(item.size())?;
-                    Data::File
-                }
+                EntryType::Regular | EntryType::GNUSparse => Data::File(item.size()),
                 EntryType::Fifo | EntryType::Char | EntryType::Block => continue,
                 _ => {
                     return Err(ArchiveError::new(format!(
@@ -270,6 +273,7 @@ impl Scan<'_> {
                 name.push(b'/');
             }
             let path = self.path(&name)?;
+            self.count_entry(name.len())?;
             let selected = self.select(&name, &path)? && !item.is_anti_item;
             let needs_payload = if selected {
                 let mode = seven_zip::mode(item);
@@ -280,7 +284,7 @@ impl Scan<'_> {
                 let data = if item.is_directory {
                     Data::Directory
                 } else {
-                    Data::File
+                    Data::File(item.size)
                 };
                 let display = match self.listing.time_formatter() {
                     Some(format_time) => listing_line(
@@ -350,7 +354,7 @@ impl Scan<'_> {
     }
 
     fn zip(&mut self, bytes: &[u8]) -> Result<Vec<(Entry, Vec<u8>)>, ArchiveError> {
-        let mut archive = ZipArchive::new(Cursor::new(bytes)).map_err(archive_error)?;
+        let mut archive = zip_codec::open(bytes)?;
         let mut entries = Vec::new();
         for index in 0..archive.len() {
             let item = archive.by_index_raw(index).map_err(archive_error)?;
@@ -360,6 +364,8 @@ impl Scan<'_> {
                 .map(|&byte| if byte == b'\\' { b'/' } else { byte })
                 .collect();
             let path = self.path(&name)?;
+            self.count_entry(name.len())?;
+            self.reserve_payload(item.size())?;
             if !self.select(&name, &path)? {
                 continue;
             }
@@ -388,7 +394,6 @@ impl Scan<'_> {
                             "The ZIP symbolic link target is too long",
                         ));
                     }
-                    self.reserve_payload(size)?;
                     line.extend_from_slice(b" -> ");
                     line.extend_from_slice(&zip_codec::payload(&mut archive, index)?);
                 }
@@ -418,14 +423,12 @@ impl Scan<'_> {
                         "The ZIP symbolic link target is too long",
                     ));
                 }
-                self.reserve_payload(size)?;
                 let target = symlink_target(&path, &zip_codec::payload(&mut archive, index)?)?;
                 (Data::Symlink(target), Vec::new())
             } else if is_dir || mode.is_some_and(|mode| mode & 0o170000 == 0o40000) {
                 (Data::Directory, Vec::new())
             } else {
-                self.reserve_payload(size)?;
-                (Data::File, zip_codec::payload(&mut archive, index)?)
+                (Data::File(size), zip_codec::payload(&mut archive, index)?)
             };
             entries.push((
                 Entry {
@@ -559,7 +562,7 @@ struct Entry {
 
 enum Data {
     Directory,
-    File,
+    File(u64),
     Symlink(PathBuf),
     HardLink(PathBuf),
 }
@@ -593,17 +596,17 @@ struct Unpack<'a> {
     host: &'a dyn Host,
     root: PathBuf,
     directories: BTreeMap<PathBuf, (Option<u32>, Option<FileTime>)>,
-    verified: HashSet<PathBuf>,
+    bytes_left: u64,
 }
 
 impl<'a> Unpack<'a> {
-    fn new(host: &'a dyn Host, destination: &Path) -> Result<Self, ArchiveError> {
+    fn new(host: &'a dyn Host, destination: &Path, bytes_left: u64) -> Result<Self, ArchiveError> {
         host.create_dir_all(destination)?;
         Ok(Self {
             host,
             root: host.canonicalize(destination)?,
             directories: BTreeMap::new(),
-            verified: HashSet::new(),
+            bytes_left,
         })
     }
 
@@ -653,8 +656,10 @@ impl<'a> Unpack<'a> {
                 continue;
             };
             payload.clear();
-            if matches!(entry.data, Data::File) {
-                let size = item.size();
+            if let Data::File(size) = entry.data {
+                if item.size() != size {
+                    return Err(ArchiveError::new("The archive changed during extraction"));
+                }
                 (&mut item)
                     .take(size.saturating_add(1))
                     .read_to_end(&mut payload)
@@ -666,37 +671,21 @@ impl<'a> Unpack<'a> {
                 break;
             }
         }
+        if entries.peek().is_some() {
+            return Err(ArchiveError::new("The archive changed during extraction"));
+        }
         self.finish()
     }
 
-    fn checked_path(
-        &mut self,
-        relative: &Path,
-        create_parents: bool,
-    ) -> Result<PathBuf, ArchiveError> {
+    fn checked_path(&self, relative: &Path, create_parents: bool) -> Result<PathBuf, ArchiveError> {
         let relative_parent = relative.parent().unwrap_or(Path::new(""));
         let mut parent = self.root.clone();
-        parent.push(relative_parent);
-        if self.verified.contains(&parent) {
-            return Ok(self.root.join(relative));
-        }
-        parent.clone_from(&self.root);
+        ensure_directory(self.host, &parent, false)?;
         for part in relative_parent {
             parent.push(part);
-            self.verify_directory(&parent, create_parents)?;
+            ensure_directory(self.host, &parent, create_parents)?;
         }
         Ok(self.root.join(relative))
-    }
-
-    fn verify_directory(&mut self, path: &Path, create: bool) -> Result<(), ArchiveError> {
-        if !self.verified.contains(path) {
-            ensure_directory(self.host, path, create)?;
-            if self.verified.len() >= 4096 {
-                self.verified.clear();
-            }
-            self.verified.insert(path.to_owned());
-        }
-        Ok(())
     }
 
     fn entry(&mut self, entry: Entry, payload: &[u8]) -> Result<(), ArchiveError> {
@@ -704,10 +693,11 @@ impl<'a> Unpack<'a> {
         let path = self.checked_path(&entry.path, true)?;
         match entry.data {
             Data::Directory => {
-                self.verify_directory(&path, true)?;
-                self.directories.insert(path, (entry.mode, entry.mtime));
+                ensure_directory(host, &path, true)?;
+                self.directories
+                    .insert(entry.path, (entry.mode, entry.mtime));
             }
-            Data::File => {
+            Data::File(_) => {
                 remove_existing_file(host, &path)?;
                 host.write(&path, payload, WriteMode::CreateNew)?;
                 restore(host, &path, entry.mode, entry.mtime)?;
@@ -715,7 +705,6 @@ impl<'a> Unpack<'a> {
             Data::Symlink(target) => {
                 remove_existing_file(host, &path)?;
                 host.symlink(&target, &path)?;
-                self.verified.clear();
             }
             Data::HardLink(target) => {
                 let target = self.checked_path(&target, false)?;
@@ -728,7 +717,11 @@ impl<'a> Unpack<'a> {
                 }
                 remove_existing_file(host, &path)?;
                 if host.hard_link(&target, &path).is_err() {
-                    let contents = read_bytes(host, &target, size_limit())?;
+                    let contents = read_bytes(host, &target, self.bytes_left)?;
+                    self.bytes_left = self
+                        .bytes_left
+                        .checked_sub(contents.len() as u64)
+                        .ok_or_else(|| ArchiveError::new("Archive exceeds the size limit"))?;
                     host.write(&path, &contents, WriteMode::CreateNew)?;
                     restore(host, &path, Some(metadata.mode), Some(metadata.mtime))?;
                 }
@@ -739,7 +732,9 @@ impl<'a> Unpack<'a> {
 
     fn finish(self) -> Result<(), ArchiveError> {
         // Restore children first so a directory mode cannot prevent child writes.
-        for (path, (mode, mtime)) in self.directories.into_iter().rev() {
+        for (relative, &(mode, mtime)) in self.directories.iter().rev() {
+            let path = self.checked_path(relative, false)?;
+            ensure_directory(self.host, &path, false)?;
             restore(self.host, &path, mode, mtime)?;
         }
         Ok(())
@@ -784,7 +779,7 @@ fn restore(
     mtime: Option<FileTime>,
 ) -> Result<(), ArchiveError> {
     if let Some(mode) = mode {
-        host.set_permissions(path, mode & 0o7777)?;
+        host.set_permissions(path, mode & 0o777)?;
     }
     if let Some(mtime) = mtime {
         host.set_times(path, None, Some(mtime))?;

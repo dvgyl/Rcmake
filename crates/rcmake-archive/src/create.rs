@@ -3,7 +3,9 @@ use std::io::{Cursor, Read, Write};
 use std::path::{Path, PathBuf};
 
 use rcmake_base::BString;
-use rcmake_host::{FileKind, FileTime, Follow, Host, Metadata, WriteMode, path::from_native};
+use rcmake_host::{
+    DirEntry, FileKind, FileTime, Follow, Host, Metadata, ReadRange, WriteMode, path::from_native,
+};
 use tar::{Builder, EntryType, Header};
 use zip::{CompressionMethod, ZipWriter, write::FullFileOptions};
 
@@ -69,7 +71,7 @@ pub(super) fn run(
         } else {
             name
         };
-        archive.add(&base_dir.join(input), name)?;
+        archive.add(&base_dir.join(input), name, &[])?;
     }
 
     let bytes = archive.writer.finish()?;
@@ -116,7 +118,12 @@ struct Creation<'a> {
 }
 
 impl Creation<'_> {
-    fn add(&mut self, path: &Path, mut name: BString) -> Result<(), ArchiveError> {
+    fn add(
+        &mut self,
+        path: &Path,
+        mut name: BString,
+        siblings: &[DirEntry],
+    ) -> Result<(), ArchiveError> {
         if self.command {
             checked_name(&name)?;
         } else {
@@ -127,6 +134,12 @@ impl Creation<'_> {
         if self
             .excludes
             .excludes(&crate::to_native(&name), directory)?
+        {
+            return Ok(());
+        }
+        if metadata.kind == FileKind::File
+            && let Some(child) = name.rsplit(|&byte| byte == b'/').next()
+            && is_apple_double(self.host, path, child, siblings, metadata.len)?
         {
             return Ok(());
         }
@@ -181,7 +194,7 @@ impl Creation<'_> {
             let mut children = self.host.read_dir(path)?;
             children.sort_unstable_by(|left, right| left.name.cmp(&right.name));
             self.names.push(name.clone());
-            for child in children {
+            for child in &children {
                 let child_path = relative_path(&child.name)?;
                 if child_path.components().count() != 1 || child.name.contains(&b'/') {
                     return Err(ArchiveError::new(
@@ -190,13 +203,70 @@ impl Creation<'_> {
                 }
                 let mut child_name = name.clone();
                 child_name.extend_from_slice(&child.name);
-                self.add(&path.join(child_path), child_name)?;
+                self.add(&path.join(child_path), child_name, &children)?;
             }
         } else {
             self.names.push(name);
         }
         Ok(())
     }
+}
+
+fn is_apple_double(
+    host: &dyn Host,
+    path: &Path,
+    name: &[u8],
+    siblings: &[DirEntry],
+    size: u64,
+) -> Result<bool, ArchiveError> {
+    let Some(original) = name.strip_prefix(b"._") else {
+        return Ok(false);
+    };
+    if siblings
+        .binary_search_by(|entry| entry.name.as_slice().cmp(original))
+        .is_err()
+    {
+        return Ok(false);
+    }
+
+    // macOS sidecars have a Finder info entry, a resource fork entry, or both.
+    const HEADER_SIZE: usize = 26;
+    const DESCRIPTOR_SIZE: usize = 12;
+    let bytes = host.read(
+        path,
+        ReadRange::Slice {
+            offset: 0,
+            len: Some((HEADER_SIZE + 2 * DESCRIPTOR_SIZE) as u64),
+        },
+    )?;
+    let Some(header) = bytes.get(..HEADER_SIZE) else {
+        return Ok(false);
+    };
+    let count = usize::from(u16::from_be_bytes([header[24], header[25]]));
+    if !header.starts_with(b"\0\x05\x16\x07\0\x02\0\0") || !(1..=2).contains(&count) {
+        return Ok(false);
+    }
+    let end = HEADER_SIZE + count * DESCRIPTOR_SIZE;
+    let Some(descriptors) = bytes.get(HEADER_SIZE..end) else {
+        return Ok(false);
+    };
+    let mut ids = 0_u16;
+    let fields = descriptors.as_chunks::<4>().0;
+    for [id, offset, length] in fields.as_chunks::<3>().0 {
+        let id = u32::from_be_bytes(*id);
+        let offset = u64::from(u32::from_be_bytes(*offset));
+        let length = u64::from(u32::from_be_bytes(*length));
+        if !matches!(id, 2 | 9)
+            || ids & (1 << id) != 0
+            || offset < end as u64
+            || offset + length > size
+            || (id == 9 && length < 32)
+        {
+            return Ok(false);
+        }
+        ids |= 1 << id;
+    }
+    Ok(true)
 }
 
 enum Writer {
@@ -240,9 +310,9 @@ impl Writer {
         } else {
             9
         };
-        if level.is_some_and(|level| level > max_level) {
+        if let Some(level) = level.filter(|&level| level > max_level) {
             return Err(ArchiveError::new(format!(
-                "The compression level must be between 0 and {max_level}"
+                "Compression level must be between 0 and {max_level}. Got {level}"
             )));
         }
         if let SevenZip {
@@ -265,7 +335,7 @@ impl Writer {
                 } else {
                     CompressionMethod::Stored
                 },
-                level: deflate.then(|| i64::from(level.unwrap_or(6).clamp(0, 9))),
+                level: deflate.then(|| i64::from(level.filter(|&value| value != 0).unwrap_or(6))),
                 codec: match options.format {
                     ZipCompressed(codec) => Some((codec, level)),
                     _ => None,

@@ -5,7 +5,7 @@
 #![forbid(unsafe_code)]
 
 use std::fmt::Display;
-use std::io::Read;
+use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
 
 use rcmake_base::{BString, Limits};
@@ -126,8 +126,8 @@ pub struct CreateOptions {
     pub format: ArchiveFormat,
     /// Optional explicit modification time in Unix seconds (`MTIME`).
     pub mtime: Option<u64>,
-    /// Optional compression level (`0..=9`, or `0..=19` for Zstandard).
-    /// Bzip2 and Zstandard use their default levels for zero.
+    /// Optional compression level (`0..=9`, or `0..=19` for Zstandard in tar and 7-Zip).
+    /// ZIP deflate, Bzip2, and Zstandard use their default levels for zero.
     pub compression_level: Option<u32>,
     /// Write archive entry names to the host standard output stream.
     pub verbose: bool,
@@ -364,17 +364,41 @@ fn relative_path(name: &[u8]) -> Result<PathBuf, ArchiveError> {
         error.unsafe_path = Some((reason, BString::from(name)));
         return Err(error);
     }
-    if cfg!(windows)
-        && path.components().any(|component| {
-            matches!(component, Component::Normal(part) if part.as_encoded_bytes().contains(&b':'))
-        })
-    {
-        return Err(invalid_name(name));
+    let mut relative = PathBuf::new();
+    for part in path.components() {
+        if let Component::Normal(part) = part {
+            if cfg!(windows) && unsafe_windows_name(part.as_encoded_bytes()) {
+                return Err(invalid_name(name));
+            }
+            relative.push(part);
+        }
     }
-    Ok(path
-        .components()
-        .filter(|part| matches!(part, Component::Normal(_)))
-        .collect())
+    Ok(relative)
+}
+
+fn unsafe_windows_name(name: &[u8]) -> bool {
+    if name.ends_with(b".")
+        || name.ends_with(b" ")
+        || name
+            .iter()
+            .any(|&byte| byte < b' ' || b"<>:\"|?*".contains(&byte))
+    {
+        return true;
+    }
+    let stem = name
+        .split(|&byte| byte == b'.')
+        .next()
+        .unwrap_or_default()
+        .trim_ascii_end()
+        .to_ascii_uppercase();
+    matches!(
+        stem.as_slice(),
+        b"CON" | b"PRN" | b"AUX" | b"NUL" | b"CONIN$" | b"CONOUT$"
+    ) || matches!(
+        stem.as_slice(),
+        [b'C', b'O', b'M', number @ ..] | [b'L', b'P', b'T', number @ ..]
+            if matches!(number, [b'1'..=b'9'] | b"\xc2\xb9" | b"\xc2\xb2" | b"\xc2\xb3")
+    )
 }
 
 fn checked_name(name: &[u8]) -> Result<PathBuf, ArchiveError> {
@@ -399,11 +423,11 @@ fn read_bytes(host: &dyn Host, path: &Path, limit: u64) -> Result<Vec<u8>, Archi
 
 fn read_bounded(reader: impl Read, limit: u64) -> Result<Vec<u8>, ArchiveError> {
     let mut data = Vec::new();
-    reader
-        .take(limit.saturating_add(1))
-        .read_to_end(&mut data)
-        .map_err(archive_error)?;
-    if data.len() as u64 > limit {
+    let mut bounded = reader.take(limit);
+    bounded.read_to_end(&mut data).map_err(archive_error)?;
+    if bounded.limit() == 0
+        && io::copy(&mut bounded.into_inner().take(1), &mut io::sink()).map_err(archive_error)? != 0
+    {
         return Err(ArchiveError::new("Archive exceeds the size limit"));
     }
     Ok(data)

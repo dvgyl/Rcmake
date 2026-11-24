@@ -108,6 +108,153 @@ fn round_trips_all_formats_in_byte_order() -> TestResult {
 }
 
 #[test]
+fn skips_only_paired_apple_double_files_during_directory_walks() -> TestResult {
+    let host = test_host();
+    let source = Path::new("/source");
+    let archive = Path::new("/archive");
+    let mut sidecar = vec![0; 70];
+    sidecar[..8].copy_from_slice(b"\0\x05\x16\x07\0\x02\0\0");
+    sidecar[24..26].copy_from_slice(&1_u16.to_be_bytes());
+    sidecar[26..30].copy_from_slice(&9_u32.to_be_bytes());
+    sidecar[30..34].copy_from_slice(&38_u32.to_be_bytes());
+    sidecar[34..38].copy_from_slice(&32_u32.to_be_bytes());
+    for name in ["tree/._data", "tree/._unpaired"] {
+        host.seed_file(&source.join(name), &sidecar)?;
+    }
+    for name in ["tree/data", "tree/notes", "tree/._notes", "tree/user-dir"] {
+        host.seed_file(&source.join(name), b"file data")?;
+    }
+    host.create_dir_all(&source.join("tree/._user-dir"))?;
+    let options = create_options(ArchiveFormat::Tar);
+    assert_eq!(
+        create_archive(&host, archive, source, &[PathBuf::from("tree")], &options)?,
+        names(&[
+            "tree/",
+            "tree/._notes",
+            "tree/._unpaired",
+            "tree/._user-dir/",
+            "tree/data",
+            "tree/notes",
+            "tree/user-dir",
+        ])
+    );
+    assert_eq!(
+        create_archive(
+            &host,
+            archive,
+            source,
+            &[PathBuf::from("tree/._data")],
+            &options,
+        )?,
+        names(&["tree/._data"])
+    );
+    Ok(())
+}
+
+#[test]
+fn seven_zip_lists_empty_entries_in_cmake_order() -> TestResult {
+    let host = test_host();
+    let source = Path::new("/source");
+    let archive = Path::new("/archive");
+    for dir in ["aaaa", "tree/empty", "z"] {
+        host.create_dir_all(&source.join(dir))?;
+    }
+    for file in ["first-empty", "tree/last-empty"] {
+        host.seed_file(&source.join(file), b"")?;
+    }
+    host.seed_file(&source.join("tree/data"), b"data")?;
+    host.symlink(Path::new("data"), &source.join("tree/link"))?;
+    let inputs = ["first-empty", "z", "aaaa", "tree"].map(PathBuf::from);
+    let expected = names(&[
+        "tree/data",
+        "tree/link",
+        "first-empty",
+        "tree/last-empty",
+        "tree/empty/",
+        "tree/",
+        "aaaa/",
+        "z/",
+    ]);
+    for compression in [SevenZipCompression::Store, SevenZipCompression::Ppmd] {
+        let options = CreateOptions {
+            compression_level: Some(1),
+            ..create_options(ArchiveFormat::SevenZip {
+                compression,
+                threads: 0,
+            })
+        };
+        create_archive(&host, archive, source, &inputs, &options)?;
+        assert_eq!(
+            list_command_archive(&host, archive, vec![], None)?,
+            expected
+        );
+        assert_eq!(
+            extract_archive(&host, archive, &extract_options())?,
+            expected
+        );
+        assert_eq!(
+            read_bytes(&host, Path::new("/extract/tree/data"), 4)?,
+            b"data"
+        );
+        assert_eq!(
+            host.read_link(Path::new("/extract/tree/link"))?,
+            Path::new("data")
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn parses_cmake_archive_mtime_values() {
+    let host = test_host();
+    for (value, expected) in [
+        ("@0", Some(0)),
+        ("@+1", Some(1)),
+        ("1970-01-01UTC", Some(0)),
+        ("2000-01-01 02:03:04 +0130", Some(946_686_784)),
+        ("Tue, 14 Nov 2023 22:13:20 GMT", Some(1_700_000_000)),
+        ("@-2", None),
+        ("99", None),
+        ("2400", None),
+        ("1970-01-01T00:00:00Z", None),
+        ("2000-01-01 02:03:04.5 UTC", None),
+    ] {
+        assert_eq!(
+            parse_archive_mtime(&host, value.as_bytes()),
+            expected,
+            "{value}"
+        );
+    }
+}
+
+#[test]
+fn reports_cmake_compression_level_limits() {
+    let host = test_host();
+    let archive = Path::new("/archive");
+    for (format, max) in [
+        (ArchiveFormat::ZipCompressed(ZipCompression::Zstd), 9),
+        (ArchiveFormat::GnuTarCompressed(TarCompression::Zstd), 19),
+        (
+            ArchiveFormat::SevenZip {
+                compression: SevenZipCompression::Zstd,
+                threads: 0,
+            },
+            19,
+        ),
+    ] {
+        let level = max + 1;
+        let options = CreateOptions {
+            compression_level: Some(level),
+            ..create_options(format)
+        };
+        let result = create_archive(&host, archive, Path::new("/source"), &[], &options);
+        assert!(result.is_err_and(|error| error.message
+            == format!("Compression level must be between 0 and {max}. Got {level}")));
+        assert!(absent(&host, "/archive"));
+    }
+}
+
+#[test]
 fn restores_modification_times_and_permissions() -> TestResult {
     let time = FileTime {
         secs: 1_707_871_601,
@@ -118,7 +265,7 @@ fn restores_modification_times_and_permissions() -> TestResult {
         let source = Path::new("/source/bin/run");
         let directory = Path::new("/source/bin");
         host.seed_file(source, b"program")?;
-        for (path, mode) in [(source, 0o751), (directory, 0o750)] {
+        for (path, mode) in [(source, 0o6751), (directory, 0o1750)] {
             host.set_permissions(path, mode)?;
             host.set_times(path, None, Some(time))?;
         }
@@ -384,6 +531,81 @@ fn rejects_unsafe_zip_entry_paths() -> TestResult {
 }
 
 #[test]
+fn rejects_unsafe_windows_entry_components() {
+    for name in [
+        b"NUL.txt".as_slice(),
+        b"cOn .txt",
+        b"lPt3",
+        b"COM\xc2\xb2.dat",
+        b"target:stream",
+        b".. ",
+        b"directory.",
+    ] {
+        assert!(unsafe_windows_name(name), "{name:?}");
+    }
+    for name in [b"nul-file".as_slice(), b"lpt10", b"normal file", b".hidden"] {
+        assert!(!unsafe_windows_name(name), "{name:?}");
+    }
+}
+
+#[test]
+fn caps_sparse_tar_size_even_when_the_entry_is_excluded() -> TestResult {
+    let host = test_host();
+    let archive = Path::new("/archive");
+    let mut builder = Builder::new(Vec::new());
+    add_test_tar_file(&mut builder, "selected")?;
+    let mut header = Header::new_gnu();
+    header.set_entry_type(EntryType::GNUSparse);
+    header.set_size(0);
+    let size = size_limit() + 1;
+    let gnu = header.as_gnu_mut().ok_or("Expected a GNU tar header")?;
+    gnu.set_real_size(size);
+    let block = gnu.sparse.first_mut().ok_or("Expected a sparse block")?;
+    block.set_offset(size);
+    block.set_length(0);
+    builder.append_data(&mut header, "sparse", &[][..])?;
+    host.seed_file(archive, &builder.into_inner()?)?;
+    let options = ExtractOptions {
+        patterns: names(&["selected"]),
+        ..extract_options()
+    };
+    assert!(
+        extract_archive(&host, archive, &options)
+            .is_err_and(|error| error.message == "Archive exceeds the size limit")
+    );
+    assert!(absent(&host, "/extract"));
+    Ok(())
+}
+
+#[test]
+fn caps_zip_size_even_when_the_entry_is_excluded() -> TestResult {
+    let host = test_host();
+    let archive = Path::new("/archive");
+    let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
+    writer.start_file("selected", SimpleFileOptions::default())?;
+    writer.write_all(b"x")?;
+    writer.start_file("oversized", SimpleFileOptions::default())?;
+    writer.write_all(b"x")?;
+    let mut bytes = writer.finish()?.into_inner();
+    let mut zip = ZipArchive::new(Cursor::new(&bytes))?;
+    let offset = usize::try_from(zip.by_index_raw(1)?.central_header_start())? + 24;
+    drop(zip);
+    let oversized = u32::try_from(size_limit() + 1)?;
+    bytes[offset..offset + 4].copy_from_slice(&oversized.to_le_bytes());
+    host.seed_file(archive, &bytes)?;
+    let options = ExtractOptions {
+        patterns: names(&["selected"]),
+        ..extract_options()
+    };
+    assert!(
+        extract_archive(&host, archive, &options)
+            .is_err_and(|error| error.message == "Archive exceeds the size limit")
+    );
+    assert!(absent(&host, "/extract"));
+    Ok(())
+}
+
+#[test]
 fn replaces_leaf_links_without_changing_their_targets() -> TestResult {
     let host = test_host();
     host.seed_file(Path::new("/source/tree/file"), b"archive")?;
@@ -470,7 +692,7 @@ fn rejects_writes_through_an_extracted_symlink() -> TestResult {
 }
 
 #[test]
-fn cached_tar_directories_cannot_be_replaced_by_symlinks() -> TestResult {
+fn tar_directories_cannot_be_replaced_by_symlinks() -> TestResult {
     let host = test_host();
     let archive = Path::new("/archive");
     let mut builder = Builder::new(Vec::new());
@@ -919,6 +1141,9 @@ mod oracle {
         let oracle_path = oracle_archive.to_str().ok_or("Invalid archive path")?;
         for (format, flags, options) in [
             (ArchiveFormat::Tar, "cf", &[][..]),
+            (ArchiveFormat::Tar, "cf", &["--format=pax"][..]),
+            (ArchiveFormat::Tar, "cf", &["--format=paxr"][..]),
+            (ArchiveFormat::GnuTar, "cf", &["--format=gnutar"][..]),
             (ArchiveFormat::TarGz, "czf", &[][..]),
             (ArchiveFormat::TarBz2, "cjf", &[][..]),
             (ArchiveFormat::TarXz, "cJf", &[][..]),

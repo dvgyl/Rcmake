@@ -7,8 +7,44 @@ use zip::{CompressionMethod, ZipArchive};
 use crate::codec::{self, Encoder};
 use crate::extract::read_payload;
 use crate::{
-    ArchiveError, TarCompression, ZipCompression, archive_error, read_bounded, size_limit,
+    ArchiveError, MAX_ENTRIES, TarCompression, ZipCompression, archive_error, read_bounded,
+    size_limit,
 };
+
+pub(super) fn open(bytes: &[u8]) -> Result<ZipArchive<Cursor<&[u8]>>, ArchiveError> {
+    // The ZIP reader allocates from the central directory count before reading entries.
+    // ZIP32 counts fit under MAX_ENTRIES. Check ZIP64 records before opening the archive.
+    for (offset, signature) in bytes.windows(4).enumerate() {
+        if signature != b"PK\x06\x06" {
+            continue;
+        }
+        let Some(record) = bytes.get(offset..).filter(|record| record.len() >= 56) else {
+            continue;
+        };
+        let record_size = read_u64(&record[4..12]);
+        let Some(locator) = record_size
+            .checked_add(12)
+            .and_then(|size| usize::try_from(size).ok())
+            .and_then(|end| record.get(end..))
+            .filter(|locator| locator.starts_with(b"PK\x06\x07"))
+        else {
+            continue;
+        };
+        if record_size >= 44
+            && locator.get(20..24) == Some(b"PK\x05\x06")
+            && read_u64(&record[32..40]) > MAX_ENTRIES as u64
+        {
+            return Err(ArchiveError::new("Archive exceeds the entry or size limit"));
+        }
+    }
+    ZipArchive::new(Cursor::new(bytes)).map_err(archive_error)
+}
+
+fn read_u64(bytes: &[u8]) -> u64 {
+    let mut value = [0; 8];
+    value.copy_from_slice(bytes);
+    u64::from_le_bytes(value)
+}
 
 pub(super) struct Entry {
     codec: ZipCompression,
