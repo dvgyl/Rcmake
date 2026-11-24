@@ -177,7 +177,10 @@ def install(root: Path, version: tuple[str, str, str]) -> None:
     shutil.copyfile(Path(__file__).resolve(), nvcc)
     nvcc.chmod(0o755)
     for tool in ("nvlink", "fatbinary"):
-        (nvcc.parent / tool).symlink_to("nvcc")
+        link = nvcc.parent / tool
+        if link.exists() or link.is_symlink():
+            link.unlink()
+        link.symlink_to("nvcc")
     (root / "bin/crt/link.stub").touch()
     (root / "include/cuda_runtime.h").write_text(RUNTIME_HEADER, encoding="utf-8")
     (root / "include/cuda.h").write_text(
@@ -207,8 +210,11 @@ def install(root: Path, version: tuple[str, str, str]) -> None:
             input=b"", check=True, timeout=TIMEOUT,
         )
     for target in (root / "targets").iterdir():
-        (target / "include").symlink_to("../../include")
-        (target / "lib").symlink_to("../../lib64")
+        for name, dest in (("include", "../../include"), ("lib", "../../lib64")):
+            link = target / name
+            if link.exists() or link.is_symlink():
+                link.unlink()
+            link.symlink_to(dest)
 
 
 def print_verbose(root: Path, compiler: str, options: Invocation) -> None:

@@ -488,6 +488,7 @@ file(WRITE home/a/file x)
 file(CREATE_LINK /work/home/a /work/alias SYMBOLIC)
 file(REAL_PATH "~/a/file" expanded EXPAND_TILDE)
 file(REAL_PATH file based BASE_DIRECTORY /work/alias)
+file(REAL_PATH file rel_based BASE_DIRECTORY home/a)
 file(REAL_PATH /work/alias/../a/file real)
 file(REAL_PATH /work/bad/../home/a/file missing)
 file(RELATIVE_PATH rel /work/other /work/home/a/file)
@@ -500,6 +501,7 @@ file(TO_NATIVE_PATH "path with space:/root/a//b/" native)
         &[
             ("expanded", "/work/home/a/file"),
             ("based", "/work/home/a/file"),
+            ("rel_based", "/work/home/a/file"),
             ("real", "/work/home/a/file"),
             ("missing", "/work/bad/../home/a/file"),
             ("rel", "../home/a/file"),

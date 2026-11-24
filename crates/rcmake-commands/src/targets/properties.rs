@@ -43,17 +43,36 @@ pub(super) fn set(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
     let targets = names
         .iter()
         .map(|name| {
-            model.find_target(dir, bytes(name)).ok_or_else(|| {
+            let binding = model.lookup_target(dir, bytes(name)).ok_or_else(|| {
                 CmdError::status(format!(
                     "Can not find target to add properties to: {}",
                     name.value
                 ))
-            })
+            })?;
+            let id = binding.id();
+            if model.target(id).is_some_and(|target| {
+                target
+                    .props
+                    .get(b"SYMBOLIC")
+                    .is_some_and(|value| truth::is_on(value))
+            }) {
+                return Err(CmdError::status("can not be used on a SYMBOLIC target."));
+            }
+            Ok((name, binding))
         })
         .collect::<Result<Vec<_>, _>>()?;
-    for id in targets {
+    for (name, binding) in targets {
+        let id = binding.id();
+        let is_alias = matches!(binding, TargetBinding::Alias(_));
         for [property, value] in props {
             let property = bytes(property);
+            if is_alias && matches!(property, b"ALIASED_TARGET" | b"ALIAS_GLOBAL") {
+                return Err(CmdError::status(format!(
+                    "can not set property {} on an ALIAS target: {}",
+                    BString::from(property),
+                    name.value
+                )));
+            }
             if property == b"IMPORTED_GLOBAL" {
                 promote(model, id, dir, bytes(value))?;
                 continue;

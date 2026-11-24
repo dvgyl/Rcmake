@@ -93,14 +93,18 @@ fn real_path(cx: &mut Cx<'_>, args: &[&[u8]]) -> Result {
     } else {
         path.clone()
     };
-    let resolved = if Lexical::new(&candidate).absolute() {
-        cx.host().canonicalize(&cx.resolve_path(&candidate)).ok()
-    } else {
-        None
+    let canonicalize = |candidate: &[u8]| {
+        let native = if Lexical::new(candidate).absolute() {
+            cx.resolve_path(candidate)
+        } else {
+            cx.host().initial_cwd().join(to_native(candidate))
+        };
+        cx.host().canonicalize(&native).ok()
     };
+    let resolved = canonicalize(&candidate);
     if before_links
         && cx.policy(PolicyId::new(152)) == PolicyStatus::Warn
-        && cx.host().canonicalize(&cx.resolve_path(&path)).ok() != resolved
+        && canonicalize(&path) != resolved
     {
         cx.issue_policy_warning(PolicyId::new(152), b"", b"");
     }
