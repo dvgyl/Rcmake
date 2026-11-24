@@ -495,8 +495,16 @@ impl TargetSettings<'_> {
                 }
             }
         }
+        settings.insert(
+            "GCC_PREPROCESSOR_DEFINITIONS".into(),
+            inherited_paths(
+                defines
+                    .into_iter()
+                    .map(|value| xcode_flag(&value))
+                    .collect(),
+            ),
+        );
         for (key, values) in [
-            ("GCC_PREPROCESSOR_DEFINITIONS", defines),
             ("HEADER_SEARCH_PATHS", headers),
             ("FRAMEWORK_SEARCH_PATHS", frameworks),
         ] {
