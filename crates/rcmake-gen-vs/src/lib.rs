@@ -152,11 +152,7 @@ pub fn generate(
         let mut build = Vec::new();
         let mut deploy = Vec::new();
         for config in &settings.configs {
-            let fact = facts.and_then(|facts| facts.get(config)).copied();
-            let excluded = fact.map_or_else(
-                || excluded_from_all(model, target, config),
-                |fact| fact.metadata.exclude_from_all,
-            );
+            let excluded = excluded_from_all(model, target, config);
             let default = format!("EXCLUDE_FROM_DEFAULT_BUILD_{config}");
             let excluded_default = target
                 .props
@@ -473,7 +469,15 @@ pub fn generate(
             .dir(ide.dir)
             .props
             .get(b"VS_STARTUP_PROJECT")
-            .map(|value| string(value));
+            .map(|value| string(value))
+            .filter(|name| {
+                members.iter().any(|&index| {
+                    projects
+                        .get(index)
+                        .is_some_and(|project| project.name == *name)
+                })
+            })
+            .or_else(|| all_build.get(&ide.dir).map(|_| "ALL_BUILD".into()));
         solutions.push(Solution {
             name,
             dir,
@@ -497,7 +501,7 @@ pub fn generate(
             model,
             inputs: &inputs,
         };
-        let plan = context.plan();
+        let plan = context.plan()?;
         for item in plan.items.values().filter(|item| item.synthetic) {
             write(host, &item.path, b"# MSBuild custom command\r\n")?;
         }

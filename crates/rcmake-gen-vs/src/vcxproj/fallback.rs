@@ -117,7 +117,9 @@ impl Context<'_> {
                 }
                 let path = self.source_path(&string(&source));
                 let props = dir.source_props.get(path.as_bytes());
-                let kind = if props
+                let kind = if target.kind == TargetKind::InterfaceLibrary {
+                    Kind::Other
+                } else if props
                     .and_then(|props| props.get(b"HEADER_FILE_ONLY"))
                     .is_some_and(|value| truth::is_on(value))
                 {
@@ -151,7 +153,12 @@ impl Context<'_> {
                 for source in &set.files {
                     for path in list::split(&source.value, list::Empty::Drop) {
                         if !path.windows(2).any(|part| part == b"$<") {
-                            plan.source(self.source_path(&string(&path)), Kind::Header, "", name);
+                            let kind = if target.kind == TargetKind::InterfaceLibrary {
+                                Kind::Other
+                            } else {
+                                Kind::Header
+                            };
+                            plan.source(self.source_path(&string(&path)), kind, "", name);
                         }
                     }
                 }

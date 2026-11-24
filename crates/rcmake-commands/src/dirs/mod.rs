@@ -12,6 +12,7 @@ use rcmake_host::{FileKind, Follow, path};
 use rcmake_model::{BT, DirId, UsageField, UsageProps};
 
 mod discover;
+pub(crate) mod source_groups;
 mod tests_commands;
 
 #[cfg(test)]
@@ -29,7 +30,7 @@ pub(crate) fn register(registry: &mut Registry) {
     registry.add("add_link_options", add_link_options, flags);
     registry.add("link_directories", link_directories, flags);
     registry.add("link_libraries", link_libraries, flags);
-    registry.add("source_group", source_group, flags);
+    registry.add("source_group", source_groups::command, flags);
     tests_commands::register(registry, flags);
     registry.add("discover_tests", discover::discover_tests, flags);
 }
@@ -412,13 +413,6 @@ fn link_libraries(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
                 text: BT::new(lib.into(), bt.clone()),
                 lookup_dir: dir,
             }));
-    }
-    Ok(Flow::Normal)
-}
-
-fn source_group(_: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
-    if args.is_empty() {
-        return Err(status("called with incorrect number of arguments"));
     }
     Ok(Flow::Normal)
 }

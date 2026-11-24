@@ -1,6 +1,6 @@
 //! Visual Studio 18 XML solutions.
 
-use crate::{CPP_TYPE, Project, Solution, guid, relative, xml::Writer};
+use crate::{CPP_TYPE, Project, Solution, guid, relative, windows, xml::Writer};
 
 pub(crate) fn render(solution: &Solution<'_>) -> String {
     let mut xml = Writer::new(false, "UTF-8");
@@ -11,28 +11,24 @@ pub(crate) fn render(solution: &Solution<'_>) -> String {
     }
     xml.empty("Platform", &[("Name", &solution.settings.platform)]);
     xml.end();
-    for (folder, id) in &solution.folders {
+    let mut projects: Vec<_> = solution.members().collect();
+    projects.sort_by(|a, b| a.name.cmp(&b.name));
+    for project in projects.iter().filter(|project| project.folder.is_empty()) {
+        write_project(&mut xml, solution, project);
+    }
+    for folder in solution.folders.keys() {
         let name = format!("/{folder}/");
-        xml.start("Folder", &[("Name", &name), ("Id", &guid::bare(id))]);
-        for project in solution
-            .members()
-            .filter(|project| project.folder == *folder)
-        {
+        xml.start("Folder", &[("Name", &name)]);
+        for project in projects.iter().filter(|project| project.folder == *folder) {
             write_project(&mut xml, solution, project);
         }
         xml.end();
-    }
-    for project in solution
-        .members()
-        .filter(|project| project.folder.is_empty())
-    {
-        write_project(&mut xml, solution, project);
     }
     xml.finish()
 }
 
 fn write_project(xml: &mut Writer, solution: &Solution<'_>, project: &Project) {
-    let path = relative(solution.dir, &project.path());
+    let path = windows(&relative(solution.dir, &project.path()));
     let kind = guid::bare(CPP_TYPE);
     let id = guid::bare(&project.guid);
     let mut attrs = vec![("Path", path.as_str()), ("Type", &kind), ("Id", &id)];
@@ -51,7 +47,7 @@ fn write_project(xml: &mut Writer, solution: &Solution<'_>, project: &Project) {
     for dep in dependencies {
         xml.empty(
             "BuildDependency",
-            &[("Project", &relative(solution.dir, &dep.path()))],
+            &[("Project", &windows(&relative(solution.dir, &dep.path())))],
         );
     }
     for (index, config) in solution.settings.configs.iter().enumerate() {

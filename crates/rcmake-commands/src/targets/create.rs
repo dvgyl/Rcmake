@@ -156,9 +156,11 @@ fn add(cx: &mut Cx<'_>, args: &[ExpandedArg], executable: bool) -> CmdResult {
                 .push(BT::new(sources, target.backtrace.clone()));
         }
     }
-    cx.project()
+    let id = cx
+        .project()
         .add_target(target)
         .map_err(|err| duplicate(cx, name, options.imported, err))?;
+    crate::dirs::source_groups::apply_to_target(cx, id)?;
     Ok(Flow::Normal)
 }
 

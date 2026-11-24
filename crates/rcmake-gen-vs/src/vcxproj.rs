@@ -11,7 +11,7 @@ use rcmake_resolve::{
 };
 
 use crate::{
-    Project, Settings, absolute, flags_table, guid, join, msbuild,
+    GenError, Project, Settings, absolute, flags_table, guid, join, msbuild,
     rules::{self, Command, Rule},
     string, windows,
 };
@@ -99,7 +99,8 @@ struct Config {
     gui: bool,
     link_incremental: Option<String>,
     generate_manifest: Option<String>,
-    properties: Vec<(String, String)>,
+    debugger: Vec<(&'static str, String)>,
+    dpi_aware: Option<&'static str>,
 }
 
 impl Plan {
@@ -129,8 +130,21 @@ impl Plan {
     }
 }
 
+const DEBUGGER_PROPERTIES: [(&[u8], &str); 4] = [
+    (b"VS_DEBUGGER_COMMAND", "LocalDebuggerCommand"),
+    (
+        b"VS_DEBUGGER_COMMAND_ARGUMENTS",
+        "LocalDebuggerCommandArguments",
+    ),
+    (b"VS_DEBUGGER_ENVIRONMENT", "LocalDebuggerEnvironment"),
+    (
+        b"VS_DEBUGGER_WORKING_DIRECTORY",
+        "LocalDebuggerWorkingDirectory",
+    ),
+];
+
 impl Context<'_> {
-    pub(crate) fn plan(&self) -> Plan {
+    pub(crate) fn plan(&self) -> Result<Plan, GenError> {
         let mut plan = Plan::default();
         let target = self.project.target.and_then(|id| self.model.target(id));
         for name in &self.settings.configs {
@@ -222,6 +236,11 @@ impl Context<'_> {
                             (Kind::Other, String::new())
                         }
                     };
+                    let kind = if self.project.kind == TargetKind::InterfaceLibrary {
+                        Kind::Other
+                    } else {
+                        kind
+                    };
                     let item = plan.source(path.clone(), kind, &string(&source.group), name);
                     item.excluded = source
                         .excluded_configs
@@ -245,17 +264,32 @@ impl Context<'_> {
                         IdeCustomPhase::PostBuild => config.events[2].push(rule),
                     }
                 }
-                for (key, value) in &ide.attributes {
-                    let key = string(key);
-                    if let Some(property) =
-                        key.strip_prefix("VS_GLOBAL_").filter(|key| xml_name(key))
-                    {
-                        config.properties.push((property.into(), string(value)));
-                    }
-                }
             } else {
                 self.fallback(&mut plan, &mut config, fact, &steps, link, name);
             }
+            let property = |key: &[u8]| {
+                fact.and_then(|fact| fact.ide.as_ref())
+                    .and_then(|ide| ide.attributes.get(key))
+                    .or_else(|| target.and_then(|target| target.props.get(key)))
+            };
+            config.debugger = DEBUGGER_PROPERTIES
+                .iter()
+                .filter_map(|&(key, element)| {
+                    let value = property(key).filter(|value| !value.is_empty())?;
+                    Some((element, string(value)))
+                })
+                .collect();
+            config.dpi_aware = match property(b"VS_DPI_AWARE").map(|value| value.as_slice()) {
+                None | Some(b"") => None,
+                Some(b"PerMonitor") => Some("PerMonitorHighDPIAware"),
+                Some(value) if truth::is_on(value) => Some("true"),
+                Some(value) if truth::is_off(value) => Some("false"),
+                Some(value) => {
+                    return Err(GenError::Invalid(
+                        format!("Bad parameter for VS_DPI_AWARE: {}", string(value)).into(),
+                    ));
+                }
+            };
 
             if let Some(utility) = self.project.utility {
                 self.utility(&mut plan, &mut config, name, utility);
@@ -264,7 +298,32 @@ impl Context<'_> {
             config.generate_manifest = config.link.take("GenerateManifest");
             plan.configs.insert(name.clone(), config);
         }
-        plan
+        self.apply_source_groups(&mut plan, target);
+        Ok(plan)
+    }
+
+    fn apply_source_groups(&self, plan: &mut Plan, target: Option<&Target>) {
+        let Some(target) = target else { return };
+        let dir = self.model.dir(target.dir);
+        for item in plan.items.values_mut() {
+            let path = Lexical::new(item.path.as_bytes());
+            let binary = Lexical::new(&dir.binary_dir);
+            let group = dir
+                .source_props
+                .get(item.path.as_bytes())
+                .and_then(|props| props.get(b"SOURCE_GROUP"))
+                .or_else(|| {
+                    if !binary.prefix(path) {
+                        return None;
+                    }
+                    let relative = path.relative(binary)?;
+                    let source = Lexical::new(&dir.source_dir).append(&relative);
+                    dir.source_props.get(&source)?.get(b"SOURCE_GROUP")
+                });
+            if let Some(group) = group {
+                item.group = windows(&string(group));
+            }
+        }
     }
 
     fn output(

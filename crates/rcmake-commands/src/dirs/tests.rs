@@ -121,3 +121,129 @@ fn subdirectory_commands_share_the_model_with_property_commands() -> TestResult 
     assert!(test.command_expand_lists);
     Ok(())
 }
+
+fn source_group_model(
+    source: &[u8],
+) -> Result<(Interp, Arc<PureHost>, i32), Box<dyn std::error::Error>> {
+    let src = PathBuf::from("/work/src");
+    let bin = PathBuf::from("/work/build");
+    let command = PathBuf::from("/bin/cmake");
+    let host = Arc::new(PureHost::new(src.clone(), command.clone()));
+    host.seed_file(&src.join("CMakeLists.txt"), source)?;
+    let mut interp = Interp::new(
+        InterpConfig {
+            host: host.clone(),
+            mode: RunMode::Configure,
+            cmake_root: "/share/cmake-4.5".into(),
+            cmake_command: command,
+            cwd: src.clone(),
+            limits: Default::default(),
+            diag: Default::default(),
+            defines: Vec::new(),
+            script_args: Vec::new(),
+        },
+        crate::register_all,
+    );
+    let outcome = interp.run_configure(&src, &bin, &[]);
+    Ok((interp, host, outcome.exit_code))
+}
+
+#[test]
+fn source_group_records_files_tree_and_empty_group() -> TestResult {
+    let (mut interp, host, exit) = source_group_model(
+        br#"
+        cmake_minimum_required(VERSION 4.5)
+        project(groups NONE)
+        source_group("a/b" FILES src/left.c src/reset.c)
+        source_group("a\\b" FILES src/right.c)
+        source_group(TREE src/ PREFIX "Files/Code" FILES src/direct.c src/sub/nested.c)
+        source_group("" FILES src/reset.c)
+    "#,
+    )?;
+    assert_eq!(exit, 0, "{}", host.stream_bytes(Stream::Stderr));
+    let mut cx = interp.cx();
+    let props = &cx.project().dir(DirId::ROOT).source_props;
+    for (path, expected) in [
+        ("/work/src/src/left.c", r"a\b"),
+        ("/work/src/src/right.c", r"a\b"),
+        ("/work/src/src/direct.c", r"Files\Code"),
+        ("/work/src/src/sub/nested.c", r"Files\Code\sub"),
+        ("/work/src/src/reset.c", ""),
+    ] {
+        let value = props
+            .get(path.as_bytes())
+            .and_then(|props| props.get(b"SOURCE_GROUP"));
+        assert_eq!(
+            value.map(|item| item.as_slice()),
+            Some(expected.as_bytes()),
+            "{path}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn source_group_regex_applies_to_sources_added_later() -> TestResult {
+    let (mut interp, host, exit) = source_group_model(
+        br#"
+        cmake_minimum_required(VERSION 4.5)
+        project(groups NONE)
+        add_custom_target(early SOURCES early.c manual.c)
+        set_source_files_properties(manual.c PROPERTIES SOURCE_GROUP "Manual")
+        source_group("Code" REGULAR_EXPRESSION "[.]c$")
+        source_group("Override" REGULAR_EXPRESSION "late[.]c$")
+        source_group("" FILES reset.c)
+        add_library(later STATIC late.c reset.c)
+        target_sources(later PRIVATE added.c)
+        target_sources(later PRIVATE FILE_SET HEADERS FILES include.h)
+        source_group("Header" REGULAR_EXPRESSION "[.]h$")
+    "#,
+    )?;
+    assert_eq!(exit, 0, "{}", host.stream_bytes(Stream::Stderr));
+    let mut cx = interp.cx();
+    let props = &cx.project().dir(DirId::ROOT).source_props;
+    for (path, expected) in [
+        ("/work/src/early.c", "Code"),
+        ("/work/src/manual.c", "Manual"),
+        ("/work/src/late.c", "Override"),
+        ("/work/src/added.c", "Code"),
+        ("/work/src/include.h", "Header"),
+        ("/work/src/reset.c", ""),
+    ] {
+        let value = props
+            .get(path.as_bytes())
+            .and_then(|props| props.get(b"SOURCE_GROUP"));
+        assert_eq!(
+            value.map(|item| item.as_slice()),
+            Some(expected.as_bytes()),
+            "{path}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn source_group_tree_rejects_paths_outside_the_root() -> TestResult {
+    let (mut interp, host, exit) = source_group_model(
+        br#"
+        cmake_minimum_required(VERSION 4.5)
+        project(groups NONE)
+        source_group(TREE src FILES src/valid.c src-other/outside.c)
+    "#,
+    )?;
+    assert_ne!(exit, 0);
+    assert!(
+        host.stream_bytes(Stream::Stderr)
+            .to_string()
+            .contains("is not a prefix")
+    );
+    assert!(
+        interp
+            .cx()
+            .project()
+            .dir(DirId::ROOT)
+            .source_props
+            .is_empty()
+    );
+    Ok(())
+}

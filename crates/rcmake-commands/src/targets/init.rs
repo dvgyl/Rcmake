@@ -1,6 +1,6 @@
 //! Target property defaults captured at creation.
 
-use rcmake_base::{BString, list};
+use rcmake_base::{BString, ByteSlice, list};
 use rcmake_eval::Cx;
 use rcmake_model::{BT, GeneratorKind, LinkItem, Target, TargetKind, UsageField};
 
@@ -68,6 +68,16 @@ fn initialize_from_variables(cx: &mut Cx<'_>, target: &mut Target, builds: bool)
         .project()
         .generator
         .or_else(|| GeneratorKind::from_name(&cx.var_or_empty(b"CMAKE_GENERATOR")));
+    if builds && matches!(generator, Some(GeneratorKind::VisualStudio(_))) {
+        for entry in list::split(&cx.var_or_empty(b"CMAKE_VS_GLOBALS"), list::Empty::Drop) {
+            if let Some((name, value)) = entry.split_once_str(b"=")
+                && !name.is_empty()
+            {
+                let key = [b"VS_GLOBAL_", name].concat();
+                target.props.set(key.into(), value.into());
+            }
+        }
+    }
     let xcode = generator == Some(GeneratorKind::Xcode);
     let multi_config = generator.is_some_and(GeneratorKind::multi_config);
     let mut configs = active_configurations(cx, multi_config);

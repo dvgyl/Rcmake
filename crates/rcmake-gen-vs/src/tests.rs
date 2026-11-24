@@ -613,7 +613,7 @@ fn nested_solutions_build_only_local_targets_and_their_dependencies() {
     )
     .expect("generate solutions");
     let solution = contents(&host, bin, "sub/Child.slnx");
-    assert!(solution.contains("Path=\"../dependency.vcxproj\""));
+    assert!(solution.contains("Path=\"..\\dependency.vcxproj\""));
     assert!(solution.contains("Path=\"child.vcxproj\""));
     assert!(solution.contains("Path=\"ALL_BUILD.vcxproj\""));
     assert!(!solution.contains("unrelated"));

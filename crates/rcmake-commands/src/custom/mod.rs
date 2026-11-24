@@ -502,6 +502,7 @@ fn add_target(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
     let id = cx.project().add_target(target).map_err(model_error)?;
     body.kind = CustomCommandKind::Utility(id);
     record(cx, body)?;
+    crate::dirs::source_groups::apply_to_target(cx, id)?;
     Ok(Flow::Normal)
 }
 

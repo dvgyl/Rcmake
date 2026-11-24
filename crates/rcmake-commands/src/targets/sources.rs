@@ -67,6 +67,7 @@ pub(super) fn add(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
             _ => return Err(status("called with invalid arguments")),
         }
     }
+    crate::dirs::source_groups::apply_to_target(cx, id)?;
     Ok(Flow::Normal)
 }
 

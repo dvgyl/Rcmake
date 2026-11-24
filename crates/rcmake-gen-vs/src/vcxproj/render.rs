@@ -78,11 +78,6 @@ pub(crate) fn render(ctx: &Context<'_>, plan: &Plan) -> String {
         xml.text("ConfigurationType", &[], configuration_type);
         xml.text("CharacterSet", &[], "MultiByte");
         xml.text("PlatformToolset", &[], &settings.toolset);
-        if let Some(config) = plan.configs.get(name) {
-            for (property, value) in &config.properties {
-                xml.text(property, &[], value);
-            }
-        }
         xml.end();
     }
     xml.empty(
@@ -134,6 +129,12 @@ pub(crate) fn render(ctx: &Context<'_>, plan: &Plan) -> String {
             if let Some(value) = &config.generate_manifest {
                 xml.text("GenerateManifest", &attrs, value);
             }
+            if !config.debugger.is_empty() {
+                xml.text("DebuggerFlavor", &attrs, "WindowsLocalDebugger");
+                for (property, value) in &config.debugger {
+                    xml.text(property, &attrs, value);
+                }
+            }
         }
     }
     xml.end();
@@ -163,6 +164,11 @@ pub(crate) fn render(ctx: &Context<'_>, plan: &Plan) -> String {
                 xml.text("SubSystem", &[], "Windows");
             }
             config.link.write(&mut xml);
+            xml.end();
+        }
+        if let Some(value) = config.dpi_aware {
+            xml.start("Manifest", &[]);
+            xml.text("EnableDpiAwareness", &[], value);
             xml.end();
         }
         for (event, rules) in EVENTS.iter().zip(&config.events) {
