@@ -252,6 +252,9 @@ fn argv(args: &[&str]) -> Vec<BString> {
     args.iter().copied().map(BString::from).collect()
 }
 
+#[path = "support/project_modules.rs"]
+mod project_modules;
+
 /// Result of one in-memory CLI run.
 struct CliRun {
     code: i32,
@@ -261,6 +264,7 @@ struct CliRun {
 /// Run the CLI against a fresh in-memory [`PureHost`] seeded with `files`.
 fn cli(files: &[(&str, &[u8])], args: Vec<BString>) -> (CliRun, Arc<PureHost>) {
     let host = Arc::new(PureHost::default());
+    project_modules::seed(&host).expect("seed project modules");
     for (path, bytes) in files {
         host.seed_file(Path::new(path), bytes).expect("seed file");
     }

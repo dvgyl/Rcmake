@@ -6,6 +6,67 @@ use rcmake_host::{Host, ProcessResult, PureHost, ReadRange, RunOutput, Stream};
 
 use crate::run;
 
+#[path = "../tests/support/project_modules.rs"]
+mod project_modules;
+
+pub(crate) fn project_host() -> Arc<PureHost> {
+    let host = Arc::new(PureHost::default());
+    project_modules::seed(&host).unwrap();
+    host
+}
+
+#[test]
+fn configure_reports_a_missing_cmake_root() {
+    let host = Arc::new(PureHost::default());
+    host.seed_file(
+        Path::new("/work/CMakeLists.txt"),
+        b"project(example NONE)\n",
+    )
+    .unwrap();
+    assert_eq!(invoke(&host, &["cmake", "-S", ".", "-B", "out"]), 1);
+    assert_eq!(
+        host.stream_bytes(Stream::Stderr),
+        b"CMake Error: Could not find CMAKE_ROOT !!!\nCMake has most likely not been installed correctly.\nModules directory not found in\n/usr/local/share/cmake-4.5\nCMake Error: Error executing cmake::LoadCache(). Aborting.\n\n",
+    );
+}
+
+#[test]
+fn skip_install_rules_suppresses_the_install_script() {
+    let host = project_host();
+    host.seed_file(
+        Path::new("/work/CMakeLists.txt"),
+        b"cmake_minimum_required(VERSION 3.10)\nproject(example NONE)\ninstall(FILES CMakeLists.txt DESTINATION doc)\n",
+    ).unwrap();
+    assert_eq!(
+        invoke(
+            &host,
+            &[
+                "cmake",
+                "-S",
+                ".",
+                "-B",
+                "out",
+                "-G",
+                "Ninja",
+                "-DCMAKE_SKIP_INSTALL_RULES=ON"
+            ]
+        ),
+        0,
+        "{}",
+        host.stream_bytes(Stream::Stderr),
+    );
+    assert!(
+        host.metadata(
+            Path::new("/work/out/cmake_install.cmake"),
+            rcmake_host::Follow::Yes
+        )
+        .is_err()
+    );
+    assert!(host.stream_bytes(Stream::Stderr).starts_with(
+        b"CMake Warning in CMakeLists.txt:\n  CMAKE_SKIP_INSTALL_RULES was enabled even though installation rules have\n  been specified\n"
+    ));
+}
+
 fn argv(args: &[&str]) -> Vec<BString> {
     args.iter().copied().map(BString::from).collect()
 }
@@ -16,7 +77,7 @@ fn invoke(host: &Arc<PureHost>, args: &[&str]) -> i32 {
 
 #[test]
 fn configure_stages_install_export_separately_from_build_export() {
-    let host = Arc::new(PureHost::default());
+    let host = project_host();
     host.seed_file(
         Path::new("/work/CMakeLists.txt"),
         br#"cmake_minimum_required(VERSION 3.10)
@@ -79,7 +140,7 @@ fn configure_enables_debug_trycompile_for_flag_and_preset() {
         ],
         vec!["cmake", "--preset=debug"],
     ] {
-        let host = Arc::new(PureHost::default());
+        let host = project_host();
         host.seed_file(
             Path::new("/work/CMakeLists.txt"),
             br#"cmake_minimum_required(VERSION 3.10)
@@ -108,7 +169,7 @@ endif()
 
 #[test]
 fn build_ninja_multi_config_streams_output_and_cleans_first() {
-    let host = Arc::new(PureHost::default());
+    let host = project_host();
     host.seed_file(
         Path::new("/work/out/CMakeCache.txt"),
         b"CMAKE_GENERATOR:INTERNAL=Ninja Multi-Config\nCMAKE_MAKE_PROGRAM:FILEPATH=/tools/ninja\n",
@@ -186,7 +247,7 @@ fn build_ninja_multi_config_streams_output_and_cleans_first() {
 
 #[test]
 fn build_make_preset_uses_cli_overrides_and_inherits_environment() {
-    let host = Arc::new(PureHost::default());
+    let host = project_host();
     host.env_set(b"REMOVE", Some(b"parent"));
     host.seed_file(
         Path::new("/work/CMakePresets.json"),
@@ -259,7 +320,7 @@ fn build_make_preset_uses_cli_overrides_and_inherits_environment() {
 
 #[test]
 fn build_stops_after_a_failed_clean() {
-    let host = Arc::new(PureHost::default());
+    let host = project_host();
     host.seed_file(
         Path::new("/work/CMakeCache.txt"),
         b"CMAKE_GENERATOR:INTERNAL=Ninja\n",
@@ -335,7 +396,7 @@ fn build_reports_cache_and_argument_errors() {
             "Error: Building 'clean' and other targets together is not supported.",
         ),
     ] {
-        let host = Arc::new(PureHost::default());
+        let host = project_host();
         if let Some(cache) = cache {
             host.seed_file(Path::new("/work/CMakeCache.txt"), cache.as_bytes())
                 .unwrap();
@@ -352,7 +413,7 @@ fn build_reports_cache_and_argument_errors() {
 
 #[test]
 fn install_executes_script_for_each_component_with_destdir_and_options() {
-    let host = Arc::new(PureHost::default());
+    let host = project_host();
     host.env_set(b"DESTDIR", Some(b"/stage"));
     host.seed_file(
         Path::new("/work/out/cmake_install.cmake"),
@@ -422,7 +483,7 @@ fn install_validates_directory_and_flags() {
             "--default-directory-permissions is in incorrect format",
         ),
     ] {
-        let host = Arc::new(PureHost::default());
+        let host = project_host();
         assert_eq!(invoke(&host, &[&["cmake"][..], args].concat()), 1);
         assert!(
             host.stream_bytes(Stream::Stderr)
@@ -435,7 +496,7 @@ fn install_validates_directory_and_flags() {
 
 #[test]
 fn ctest_persona_calls_runner_with_supported_options() {
-    let host = Arc::new(PureHost::default());
+    let host = project_host();
     host.seed_file(Path::new("/work/out/CTestTestfile.cmake"), b"")
         .unwrap();
     let code = invoke(
@@ -454,22 +515,12 @@ fn ctest_persona_calls_runner_with_supported_options() {
             "--output-on-failure",
         ],
     );
-    // The frozen runner reports Unimplemented until its wave lands.
-    let stderr = host.stream_bytes(Stream::Stderr);
-    if stderr
-        .windows(b"not implemented yet".len())
-        .any(|text| text == b"not implemented yet")
-    {
-        assert_eq!(code, 1);
-        assert!(stderr.starts_with(b"CMake Error: the ctest runner"));
-    } else {
-        assert_eq!(code, 0, "{stderr}");
-    }
+    assert_eq!(code, 0, "{}", host.stream_bytes(Stream::Stderr));
 }
 
 #[test]
 fn regeneration_flag_uses_configure_and_view_skips_generation() {
-    let host = Arc::new(PureHost::default());
+    let host = project_host();
     host.seed_file(
         Path::new("/work/CMakeLists.txt"),
         b"message(STATUS \"evaluated\")\n",
@@ -506,7 +557,7 @@ fn regeneration_flag_uses_configure_and_view_skips_generation() {
 
 #[test]
 fn capabilities_advertises_supported_generators_and_file_api() {
-    let host = Arc::new(PureHost::default());
+    let host = project_host();
     assert_eq!(invoke(&host, &["cmake", "-E", "capabilities"]), 0);
     let json = host.stream_bytes(Stream::Stdout);
     for field in [
@@ -530,7 +581,7 @@ fn capabilities_advertises_supported_generators_and_file_api() {
 
 #[test]
 fn generator_host_gate_and_help_list_follow_generator_kind() {
-    let host = Arc::new(PureHost::default());
+    let host = project_host();
     host.seed_file(Path::new("/work/src/CMakeLists.txt"), b"")
         .expect("seed");
     let code = invoke(

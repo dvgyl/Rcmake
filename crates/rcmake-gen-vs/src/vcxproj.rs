@@ -2,12 +2,12 @@
 
 use std::collections::BTreeMap;
 
-use rcmake_base::{list, path_lex::Lexical, truth};
+use rcmake_base::{path_lex::Lexical, truth};
 use rcmake_gen_common::ide::UtilityKind;
-use rcmake_model::{ProjectModel, Target, TargetKind, UsageField};
+use rcmake_model::{ProjectModel, Target, TargetKind};
 use rcmake_resolve::{
-    BuildStep, CustomStep, GenerationResult, LinkFragmentRole, LinkStep, ResolvedTarget,
-    ide::{IdeCompileSettings, IdeCustomPhase, IdeLinkItem, IdeSourceKind},
+    BuildStep, GenerationResult, LinkStep, ResolvedTarget,
+    ide::{IdeCompileSettings, IdeCustomPhase, IdeSourceKind},
 };
 
 use crate::{
@@ -17,6 +17,7 @@ use crate::{
 };
 
 mod fallback;
+mod link;
 mod render;
 
 use fallback::source_language;
@@ -383,231 +384,6 @@ impl Context<'_> {
         )
     }
 
-    fn compile_settings(
-        &self,
-        target: Option<&Target>,
-        config: &str,
-        language: &str,
-        resolved: Option<flags_table::Settings>,
-    ) -> flags_table::Settings {
-        if let Some(resolved) = resolved {
-            return resolved;
-        }
-        let Some(target) = target else {
-            return flags_table::Settings::default();
-        };
-        let flag_key = format!("CMAKE_{language}_FLAGS");
-        let config_key = format!("{flag_key}_{}", config.to_ascii_uppercase());
-        let dir = self.model.dir(target.dir);
-        let flags = [flag_key, config_key]
-            .into_iter()
-            .filter_map(|key| self.model.definition(target.dir, key.as_bytes()))
-            .flat_map(|value| flags_table::split(&string(value)))
-            .chain(
-                [&dir.usage, &target.usage]
-                    .into_iter()
-                    .flat_map(|usage| usage.entries(UsageField::CompileOptions))
-                    .flat_map(|entry| ide_flags(&string(&entry.value))),
-            );
-        let mut out = flags_table::compile(flags);
-        for usage in [&dir.usage, &target.usage] {
-            for entry in usage.entries(UsageField::CompileDefinitions) {
-                out.list(
-                    "PreprocessorDefinitions",
-                    msbuild_value(&string(&entry.value)),
-                );
-            }
-            for entry in usage.entries(UsageField::IncludeDirectories) {
-                out.list(
-                    "AdditionalIncludeDirectories",
-                    msbuild_value(&windows(&self.source_path(&string(&entry.value)))),
-                );
-            }
-        }
-        if let Some(standard) = target
-            .props
-            .get(b"CXX_STANDARD")
-            .filter(|_| language == "CXX")
-        {
-            let value = match standard.as_slice() {
-                b"14" => "stdcpp14",
-                b"17" => "stdcpp17",
-                b"20" => "stdcpp20",
-                b"23" => "stdcpp23",
-                _ => "stdcpplatest",
-            };
-            out.set("LanguageStandard", value);
-        }
-        out
-    }
-
-    fn ide_link(&self, ide: &rcmake_resolve::ide::IdeFacts, config: &str) -> flags_table::Settings {
-        let archive = self.project.kind == TargetKind::StaticLibrary;
-        let mut flags: Vec<_> = ide
-            .link_options
-            .iter()
-            .flat_map(|flag| ide_flags(&string(&flag.value)))
-            .collect();
-        let mut libraries = Vec::new();
-        for item in &ide.link_items {
-            match item {
-                IdeLinkItem::Target(id) => {
-                    if !archive && let Some(file) = self.target_library(*id, config) {
-                        libraries.push(file);
-                    }
-                    libraries.extend(self.target_objects(*id, config));
-                }
-                IdeLinkItem::File(file)
-                    if !archive || source_kind(&string(file), Kind::Other) == Kind::Object =>
-                {
-                    libraries.push(windows(&string(file)));
-                }
-                IdeLinkItem::Library(name) if !archive => libraries.push(library(&string(name))),
-                IdeLinkItem::Flag(flag) => flags.push(string(flag)),
-                _ => {}
-            }
-        }
-        let mut out = flags_table::link(flags, archive);
-        for library in libraries {
-            out.list("AdditionalDependencies", msbuild(&library));
-        }
-        for dir in &ide.link_directories {
-            out.list(
-                "AdditionalLibraryDirectories",
-                msbuild_value(&windows(&string(dir))),
-            );
-        }
-        out
-    }
-
-    fn target_library(&self, id: rcmake_model::TargetId, config: &str) -> Option<String> {
-        let target = self.model.target(id)?;
-        if !matches!(
-            target.kind,
-            TargetKind::StaticLibrary | TargetKind::SharedLibrary | TargetKind::UnknownLibrary
-        ) {
-            return None;
-        }
-        let resolved = self
-            .result
-            .targets
-            .iter()
-            .find(|fact| fact.id == id && fact.config.0.as_slice() == config.as_bytes());
-        if let Some(file) = resolved.and_then(|fact| {
-            fact.artifacts
-                .linker_file
-                .as_ref()
-                .or(fact.artifacts.import_file.as_ref())
-                .or(fact.artifacts.file.as_ref())
-        }) {
-            return Some(windows(&absolute(&self.settings.bin, &string(file))));
-        }
-        if target.is_imported() {
-            let config = config.to_ascii_uppercase();
-            return [
-                format!("IMPORTED_IMPLIB_{config}"),
-                "IMPORTED_IMPLIB".into(),
-                format!("IMPORTED_LOCATION_{config}"),
-                "IMPORTED_LOCATION".into(),
-            ]
-            .into_iter()
-            .find_map(|key| target.props.get(key.as_bytes()))
-            .map(|file| windows(&string(file)));
-        }
-        let project = self
-            .projects
-            .iter()
-            .find(|project| project.target == Some(id))?;
-        Some(windows(&join(
-            &join(&project.dir, config),
-            &format!("{}.lib", project.name),
-        )))
-    }
-
-    fn target_objects(&self, id: rcmake_model::TargetId, config: &str) -> Vec<String> {
-        let Some(project) = self.projects.iter().find(|project| {
-            project.target == Some(id) && project.kind == TargetKind::ObjectLibrary
-        }) else {
-            return Vec::new();
-        };
-        let fact = self
-            .result
-            .targets
-            .iter()
-            .find(|fact| fact.id == id && fact.config.0.as_slice() == config.as_bytes());
-        let sources: Vec<_> = if let Some(ide) = fact.and_then(|fact| fact.ide.as_deref()) {
-            ide.sources
-                .iter()
-                .filter(|source| {
-                    matches!(source.kind, IdeSourceKind::Compile { .. })
-                        && !source
-                            .excluded_configs
-                            .iter()
-                            .any(|value| value.as_slice() == config.as_bytes())
-                })
-                .map(|source| string(&source.path))
-                .collect()
-        } else if let Some(fact) = fact.filter(|fact| !fact.compile_units.is_empty()) {
-            fact.compile_units
-                .iter()
-                .map(|unit| string(&unit.source.value))
-                .collect()
-        } else if let Some(graph) = self
-            .result
-            .graphs
-            .iter()
-            .find(|graph| graph.config.0.as_slice() == config.as_bytes())
-            && let Some(entry) = graph
-                .targets
-                .iter()
-                .find(|entry| entry.name.as_slice() == project.name.as_bytes())
-        {
-            return entry
-                .steps
-                .iter()
-                .filter_map(|&index| match graph.steps.get(index) {
-                    Some(BuildStep::Compile { object, source, .. }) => {
-                        let source = absolute(&project.source, &string(source));
-                        if source_kind(&source, Kind::Compile) != Kind::Compile {
-                            return None;
-                        }
-                        let object = string(object);
-                        let path = if object.to_ascii_lowercase().ends_with(".obj") {
-                            absolute(&self.settings.bin, &object)
-                        } else {
-                            object_path(project, self.settings, self.model, &source, config, fact)
-                        };
-                        Some(windows(&path))
-                    }
-                    _ => None,
-                })
-                .collect();
-        } else {
-            self.model
-                .target(id)
-                .into_iter()
-                .flat_map(|target| &target.sources)
-                .flat_map(|entry| list::split(&entry.value, list::Empty::Drop))
-                .map(|path| string(&path))
-                .filter(|path| source_kind(path, Kind::Other) == Kind::Compile)
-                .collect()
-        };
-        sources
-            .into_iter()
-            .map(|source| {
-                let source = absolute(&project.source, &source);
-                windows(&object_path(
-                    project,
-                    self.settings,
-                    self.model,
-                    &source,
-                    config,
-                    fact,
-                ))
-            })
-            .collect()
-    }
-
     fn custom(
         &self,
         plan: &mut Plan,
@@ -726,14 +502,6 @@ fn source_kind(path: &str, otherwise: Kind) -> Kind {
     }
 }
 
-fn xml_name(value: &str) -> bool {
-    let mut chars = value.chars();
-    chars
-        .next()
-        .is_some_and(|ch| ch.is_ascii_alphabetic() || ch == '_')
-        && chars.all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '.' | '-'))
-}
-
 fn visual_studio_compile(settings: &IdeCompileSettings) -> flags_table::Settings {
     let mut out = flags_table::compile(
         settings
@@ -763,42 +531,5 @@ fn ide_flags(text: &str) -> Vec<String> {
         Vec::new()
     } else {
         vec![text.into()]
-    }
-}
-
-fn library(value: &str) -> String {
-    let value = value.strip_prefix("-l").unwrap_or(value);
-    if value.contains(['/', '\\', '.']) {
-        windows(value)
-    } else {
-        format!("{value}.lib")
-    }
-}
-
-fn invocation_rule(step: &CustomStep) -> Rule {
-    Rule {
-        commands: step
-            .invocations
-            .iter()
-            .map(|cmd| Command {
-                argv: cmd.argv.iter().map(|arg| string(arg)).collect(),
-                dir: cmd
-                    .working_dir
-                    .as_ref()
-                    .map_or_else(String::new, |path| string(path)),
-            })
-            .collect(),
-        inputs: step.depends.iter().map(|path| string(path)).collect(),
-        outputs: step
-            .outputs
-            .iter()
-            .chain(&step.byproducts)
-            .map(|path| string(path))
-            .collect(),
-        message: step
-            .comment
-            .as_ref()
-            .map_or_else(String::new, |value| string(value)),
-        always: step.outputs.is_empty(),
     }
 }

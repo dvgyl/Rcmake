@@ -17,7 +17,12 @@ mod tests;
 
 use std::path::{Path, PathBuf};
 
-use rcmake_base::{BString, hash::HashAlgo, limits::Limits};
+use rcmake_base::{
+    BString,
+    hash::HashAlgo,
+    limits::Limits,
+    suggest::{Threshold, closest},
+};
 use rcmake_host::Host;
 use rcmake_host::{FileKind, Follow, HostResult, ReadRange, Stream, path::to_native};
 use rcmake_json::Value;
@@ -154,51 +159,21 @@ fn unknown(command: &[u8], cx: &ToolCtx<'_>) -> i32 {
     .concat();
     if let Some(name) = closest_command(command) {
         message.extend_from_slice(b" Did you mean \"");
-        message.extend_from_slice(name);
+        message.extend_from_slice(&name);
         message.extend_from_slice(b"\"?");
     }
     error(cx, &[&message, b"\n"]);
     usage(cx, 1)
 }
 
-fn closest_command(command: &[u8]) -> Option<&'static [u8]> {
-    let mut best = None;
-    let mut threshold = (command.len() / 5 + 1).min(4) + 1;
-    for line in include_bytes!("usage.txt").split(|byte| *byte == b'\n') {
-        let Some(name) = line
-            .strip_prefix(b"  ")
-            .and_then(|rest| rest.split(|b| *b == b' ').next())
-        else {
-            continue;
-        };
-        if name.is_empty() || command.len().abs_diff(name.len()) >= threshold {
-            continue;
-        }
-        let distance = edit_distance(command, name);
-        if distance < threshold {
-            best = Some(name);
-            threshold = distance;
-        }
-    }
-    best
-}
-
-fn edit_distance(left: &[u8], right: &[u8]) -> usize {
-    let mut row: Vec<usize> = (0..=right.len()).collect();
-    for (index, a) in left.iter().enumerate() {
-        let mut diagonal = index;
-        let mut previous = index + 1;
-        for (b, entry) in right.iter().zip(row.iter_mut().skip(1)) {
-            let distance = (diagonal + usize::from(a != b)).min(previous.min(*entry) + 1);
-            diagonal = *entry;
-            *entry = distance;
-            previous = distance;
-        }
-        if let Some(first) = row.first_mut() {
-            *first = index + 1;
-        }
-    }
-    row.last().copied().unwrap_or_default()
+fn closest_command(command: &[u8]) -> Option<BString> {
+    let candidates: Vec<_> = include_bytes!("usage.txt")
+        .split(|byte| *byte == b'\n')
+        .filter_map(|line| line.strip_prefix(b"  ")?.split(|b| *b == b' ').next())
+        .filter(|name| !name.is_empty())
+        .map(BString::from)
+        .collect();
+    closest(command, &candidates, Threshold::CmakeCommand).cloned()
 }
 
 fn checksum(algo: HashAlgo, args: &[BString], cx: &ToolCtx<'_>) -> i32 {
@@ -252,21 +227,7 @@ fn checksum(algo: HashAlgo, args: &[BString], cx: &ToolCtx<'_>) -> i32 {
 }
 
 fn file_digest(host: &dyn Host, file: &Path, algo: HashAlgo) -> HostResult<String> {
-    const CHUNK_SIZE: u64 = 1024 * 1024;
     let mut hasher = algo.hasher();
-    let mut offset = 0;
-    loop {
-        let bytes = host.read(
-            file,
-            ReadRange::Slice {
-                offset,
-                len: Some(CHUNK_SIZE),
-            },
-        )?;
-        hasher.update(&bytes);
-        if (bytes.len() as u64) < CHUNK_SIZE {
-            return Ok(hasher.finish_hex());
-        }
-        offset += CHUNK_SIZE;
-    }
+    host.read_chunks(file, &mut |bytes| hasher.update(bytes))?;
+    Ok(hasher.finish_hex())
 }

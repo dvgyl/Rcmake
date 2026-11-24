@@ -8,8 +8,9 @@ use crate::{FileKind, Follow, Host, path::to_native};
 ///
 /// Check the environment override first. Then check beside the canonical and
 /// direct executable paths, in that order. If necessary, check the direct and
-/// canonical paths from `argv0`. Resolve relative paths against the initial
-/// working directory. A valid data directory contains
+/// canonical paths from `argv0`. If there is no installed data directory,
+/// check the repository beside the Cargo target directory. Resolve relative
+/// paths against the initial working directory. A valid data directory contains
 /// `Modules/CMakeDetermineSystem.cmake`.
 ///
 /// Return the executable path with no data directory if all candidates fail.
@@ -35,26 +36,32 @@ pub fn discover_cmake_root(host: &dyn Host, argv0: Option<&BString>) -> (PathBuf
         return (fallback(), Some(root));
     }
 
-    let installed_root = |path: &Path| {
-        let root = path.parent()?.parent()?.join("share/cmake-4.5");
-        valid_root(host, &root).then(|| (path.to_path_buf(), Some(root)))
-    };
-    if let Some(paths) = canonical_exe
-        .iter()
-        .chain(exe.iter())
-        .chain(argv_path.iter())
-        .find_map(|path| installed_root(path))
-    {
-        return paths;
-    }
-    if let Some(paths) = argv_path
+    let canonical_argv = argv_path
         .as_deref()
-        .and_then(|path| host.canonicalize(path).ok())
-        .and_then(|path| installed_root(&path))
-    {
-        return paths;
-    }
-    (fallback(), None)
+        .and_then(|path| host.canonicalize(path).ok());
+    let mut executables = canonical_exe
+        .iter()
+        .chain(&exe)
+        .chain(&argv_path)
+        .chain(&canonical_argv);
+    let installed = executables.clone().find_map(|path| {
+        let root = path.parent()?.parent()?.join("share/cmake-4.5");
+        valid_root(host, &root).then_some((path.clone(), Some(root)))
+    });
+    let checkout = || {
+        executables.find_map(|path| {
+            path.parent()?
+                .ancestors()
+                .skip(2)
+                .take(2)
+                .map(|base| base.join("modules/cmake-4.5"))
+                .find(|root| valid_root(host, root))
+                .map(|root| (path.clone(), Some(root)))
+        })
+    };
+    installed
+        .or_else(checkout)
+        .unwrap_or_else(|| (fallback(), None))
 }
 
 fn valid_root(host: &dyn Host, root: &Path) -> bool {
@@ -69,6 +76,23 @@ fn valid_root(host: &dyn Host, root: &Path) -> bool {
 mod tests {
     use super::*;
     use crate::{HostResult, PureHost};
+
+    #[test]
+    fn finds_data_beside_a_cargo_target_directory() -> HostResult<()> {
+        let root = PathBuf::from("/source/modules/cmake-4.5");
+        for relative in [
+            "debug/rcmake",
+            "release/rcmake",
+            "aarch64-apple-darwin/release/rcmake",
+        ] {
+            let exe = Path::new("/source/target").join(relative);
+            let host = PureHost::new(PathBuf::from("/work"), exe.clone());
+            host.seed_file(&exe, b"")?;
+            host.seed_file(&root.join("Modules/CMakeDetermineSystem.cmake"), b"")?;
+            assert_eq!(discover_cmake_root(&host, None), (exe, Some(root.clone())));
+        }
+        Ok(())
+    }
 
     #[test]
     fn canonical_executable_wins_over_shim_and_invalid_override() -> HostResult<()> {

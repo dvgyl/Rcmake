@@ -7,7 +7,7 @@ use crate::archive_gen::ArchiveKind;
 use crate::generators;
 
 #[test]
-fn registry_knows_milestone_three_generators() {
+fn registry_lists_package_generators() {
     for kind in ArchiveKind::ALL {
         let generator = generators::create(kind.name().as_bytes());
         assert_eq!(generator.map(|g| g.extension()), Some(kind.extension()));
@@ -61,6 +61,20 @@ fn invoke(host: Arc<dyn Host>, args: &[&str]) -> i32 {
     crate::main(&argv, host)
 }
 
+#[test]
+fn reports_the_text_version_after_options() {
+    let host = memory_host();
+    assert_eq!(invoke(host.clone(), &["--verbose", "--version"]), 0);
+    assert_eq!(
+        host.stream_bytes(Stream::Stdout),
+        concat!(
+            "cpack version 4.5.1\nRcmake ",
+            env!("CARGO_PKG_VERSION"),
+            "\n"
+        )
+    );
+}
+
 fn write(host: &dyn Host, path: impl AsRef<Path>, bytes: &[u8]) {
     let path = path.as_ref();
     host.create_dir_all(path.parent().unwrap()).unwrap();
@@ -83,6 +97,11 @@ fn cli_reports_oracle_diagnostics() {
         (
             &["--verbos"][..],
             "CPack Error: Unknown argument: --verbos. Did you mean: --verbose?\n",
+        ),
+        (&["-g"][..], "CPack Error: Unknown argument: -g\n"),
+        (
+            &["--nosuch"][..],
+            "CPack Error: Unknown argument: --nosuch\n",
         ),
         (&["-G"][..], "CMake Error: Invalid value used with -G\n"),
         (

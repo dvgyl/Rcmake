@@ -1,15 +1,13 @@
-#![allow(clippy::expect_used)]
-
 use std::path::Path;
 
 use rcmake_gen_common::ide::{BuildRequest, Jobs};
 use rcmake_host::{NativeHost, PureHost, ReadRange, path::to_native};
 use rcmake_model::{
-    BT, CacheEntry, CacheType, CustomCommand, CustomCommandKind, GeneratorSpec, InstallKind,
-    InstallRule, Target, TargetEvent, TargetOrigin, UsageField,
+    BT, CacheEntry, CacheType, CustomCommand, CustomCommandKind, GeneratorKind, GeneratorSpec,
+    InstallKind, InstallRule, Target, TargetEvent, TargetKind, TargetOrigin, UsageField,
 };
 use rcmake_resolve::{
-    BuildGraph, BuildStep, CustomStep, GraphTarget, Invocation, TargetMetadata,
+    BuildGraph, BuildStep, CustomStep, GraphTarget, Invocation, ResolvedTarget, TargetMetadata,
     ide::{
         IdeCompileSettings, IdeCustomPhase, IdeCustomStep, IdeFacts, IdeInclude, IdeLinkItem,
         IdeSource, IdeSourceKind, OutputNaming,
@@ -101,6 +99,7 @@ fn compile_flags_use_last_values_and_inherit_options() {
 
 #[test]
 fn build_plans_support_clean_parallel_targets_and_devenv() {
+    let host = PureHost::default();
     let targets = ["app".into(), "lib.vcxproj".into()];
     let req = BuildRequest {
         generator: GeneratorKind::VisualStudio(VsVersion::Vs18),
@@ -115,7 +114,7 @@ fn build_plans_support_clean_parallel_targets_and_devenv() {
         native_args: &["/nr:false".into()],
         platform: b"ARM64",
     };
-    let commands = build_commands(&req).expect("MSBuild plan");
+    let commands = build_commands(&req, &host).expect("MSBuild plan");
     assert_eq!(
         commands
             .iter()
@@ -158,7 +157,7 @@ fn build_plans_support_clean_parallel_targets_and_devenv() {
         native_args: &[],
         ..req
     };
-    let commands = build_commands(&req).expect("devenv plan");
+    let commands = build_commands(&req, &host).expect("devenv plan");
     assert_eq!(
         commands
             .first()
@@ -202,7 +201,7 @@ fn msbuild_builds_named_subdirectory_projects_in_both_solution_formats() {
     for version in [VsVersion::Vs17, VsVersion::Vs18] {
         generate(version, &GenerationResult::default(), &model, &host, &bin)
             .expect("generate solution");
-        let commands = build::plan(
+        let commands = build_commands(
             &BuildRequest {
                 generator: GeneratorKind::VisualStudio(version),
                 build_dir: &build_dir,
@@ -216,7 +215,7 @@ fn msbuild_builds_named_subdirectory_projects_in_both_solution_formats() {
                 native_args: &[],
                 platform: b"x64",
             },
-            Some(&host),
+            &host,
         )
         .expect("plan build");
         assert_eq!(
@@ -451,40 +450,7 @@ fn fixture(
                 steps: vec![0, 1],
                 ..Default::default()
             }],
-            steps: vec![
-                BuildStep::Compile {
-                    object: format!("{name}/fallback.obj").into(),
-                    source: "/source tree/fallback.c".into(),
-                    invocation: Invocation {
-                        argv: vec![
-                            "cl.exe".into(),
-                            "/W3".into(),
-                            "/MDd".into(),
-                            "/c".into(),
-                            "/source tree/fallback.c".into(),
-                            format!("/Fo{name}/fallback.obj").into(),
-                        ],
-                        ..Default::default()
-                    },
-                    depfile: None,
-                    modmap: None,
-                    dyndep: None,
-                },
-                BuildStep::Custom(CustomStep {
-                    outputs: vec!["graph.out".into()],
-                    invocations: vec![Invocation {
-                        argv: vec![
-                            "cmake".into(),
-                            "-E".into(),
-                            "touch".into(),
-                            "graph.out".into(),
-                        ],
-                        working_dir: Some(from_native(bin)),
-                        ..Default::default()
-                    }],
-                    ..Default::default()
-                }),
-            ],
+            steps: fallback_steps(bin, name),
         });
     }
     result.metadata.listfiles = vec![
@@ -493,6 +459,43 @@ fn fixture(
         "/source tree/script.cmake".into(),
     ];
     (model, result)
+}
+
+fn fallback_steps(bin: &Path, name: &str) -> Vec<BuildStep> {
+    vec![
+        BuildStep::Compile {
+            object: format!("{name}/fallback.obj").into(),
+            source: "/source tree/fallback.c".into(),
+            invocation: Invocation {
+                argv: vec![
+                    "cl.exe".into(),
+                    "/W3".into(),
+                    "/MDd".into(),
+                    "/c".into(),
+                    "/source tree/fallback.c".into(),
+                    format!("/Fo{name}/fallback.obj").into(),
+                ],
+                ..Default::default()
+            },
+            depfile: None,
+            modmap: None,
+            dyndep: None,
+        },
+        BuildStep::Custom(CustomStep {
+            outputs: vec!["graph.out".into()],
+            invocations: vec![Invocation {
+                argv: vec![
+                    "cmake".into(),
+                    "-E".into(),
+                    "touch".into(),
+                    "graph.out".into(),
+                ],
+                working_dir: Some(from_native(bin)),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }),
+    ]
 }
 
 fn contents(host: &dyn Host, bin: &Path, filename: &str) -> String {

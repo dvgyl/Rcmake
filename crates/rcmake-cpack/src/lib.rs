@@ -42,9 +42,6 @@ mod tests;
 /// Error of a `cpack` operation.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum CpackError {
-    /// The operation is not implemented yet.
-    #[error("{0} is not supported yet")]
-    Unsupported(&'static str),
     /// A CPack error with the CPack message text.
     #[error("{0}")]
     Message(BString),

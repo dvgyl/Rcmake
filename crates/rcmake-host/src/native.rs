@@ -22,10 +22,12 @@ use rustix::process::{Pid, Signal, WaitId, WaitIdOptions, kill_process_group, wa
 
 use crate::error::{HostError, HostResult, from_errno};
 use crate::{
-    CopyOptions, DirEntry, FileKind, FileLockGuard, FileTime, Follow, Host, Input, Metadata,
-    Output, ProcessResult, ReadRange, RunOutput, RunRequest, Stream, SystemInfo, WriteMode,
-    require_absolute, validate_run,
+    CopyOptions, DirEntry, FILE_CHUNK_SIZE, FileKind, FileLockGuard, FileTime, Follow, Host, Input,
+    Metadata, Output, ProcessResult, ReadRange, RunOutput, RunRequest, Stream, SystemInfo,
+    WriteMode, require_absolute, validate_run,
 };
+
+mod cwd;
 
 /// Production [`Host`] backed by the operating system with an edition-2024-safe
 /// interior-mutable environment overlay.
@@ -47,30 +49,16 @@ impl NativeHost {
             );
         }
         let physical_cwd = std::env::current_dir().map_err(|e| HostError::from_io(e, None))?;
-        let initial_cwd = logical_cwd(&physical_cwd);
+        let pwd = map
+            .get(b"PWD".as_slice())
+            .map(|path| crate::path::to_native(path));
+        let initial_cwd = cwd::logical_cwd(&physical_cwd, pwd.as_deref());
         Ok(Self {
             env: RwLock::new(map),
             initial_cwd,
             start: Instant::now(),
         })
     }
-}
-
-fn logical_cwd(physical: &Path) -> PathBuf {
-    let Some(pwd_os) = std::env::var_os("PWD") else {
-        return physical.to_path_buf();
-    };
-    let pwd = PathBuf::from(pwd_os);
-    if !pwd.is_absolute() {
-        return physical.to_path_buf();
-    }
-    if let (Ok(m_phys), Ok(m_pwd)) = (fs::metadata(physical), fs::metadata(&pwd))
-        && m_phys.dev() == m_pwd.dev()
-        && m_phys.ino() == m_pwd.ino()
-    {
-        return pwd;
-    }
-    physical.to_path_buf()
 }
 
 fn io_at<T>(result: io::Result<T>, path: &Path) -> HostResult<T> {
@@ -249,6 +237,24 @@ impl Host for NativeHost {
             }
         }
         Ok(bytes)
+    }
+
+    fn read_chunks(&self, p: &Path, consume: &mut dyn FnMut(&[u8])) -> HostResult<()> {
+        require_absolute(p)?;
+        let mut file = io_at(File::open(p), p)?;
+        let mut buffer = vec![0; FILE_CHUNK_SIZE];
+        loop {
+            match file.read(&mut buffer) {
+                Ok(0) => return Ok(()),
+                Ok(len) => consume(
+                    buffer
+                        .get(..len)
+                        .ok_or_else(|| from_errno(Errno::IO, Some(p)))?,
+                ),
+                Err(err) if err.kind() == ErrorKind::Interrupted => continue,
+                Err(err) => return io_at(Err(err), p),
+            }
+        }
     }
 
     fn write(&self, p: &Path, data: &[u8], mode: WriteMode) -> HostResult<()> {

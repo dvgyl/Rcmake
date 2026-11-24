@@ -1,6 +1,6 @@
 //! Parse the CPack command line.
 
-use rcmake_base::{BString, CMAKE_VERSION_STR};
+use rcmake_base::{BString, CMAKE_VERSION_STR, suggest::levenshtein};
 use rcmake_host::{Host, Stream};
 
 use crate::{CPackOptions, CpackError, error};
@@ -116,36 +116,23 @@ fn unknown(arg: &BString) -> CpackError {
         "--help",
         "--version",
     ]);
-    if let Some(option) = candidates
-        .filter(|option| option.len() > 3)
-        .find(|option| one_edit(arg, option.as_bytes()))
-    {
+    if let Some(option) = candidates.filter(|option| option.len() > 3).find(|option| {
+        arg.len().abs_diff(option.len()) <= 1 && levenshtein(arg, option.as_bytes()) <= 1
+    }) {
         message.push_str(&format!(". Did you mean: {option}?"));
     }
     error(message)
 }
 
-fn one_edit(left: &[u8], right: &[u8]) -> bool {
-    let common = left.iter().zip(right).take_while(|(a, b)| a == b).count();
-    let (left, right) = (
-        left.get(common..).unwrap_or_default(),
-        right.get(common..).unwrap_or_default(),
-    );
-    match left.len().cmp(&right.len()) {
-        std::cmp::Ordering::Less => right.get(1..) == Some(left),
-        std::cmp::Ordering::Equal => left.get(1..) == right.get(1..),
-        std::cmp::Ordering::Greater => left.get(1..) == Some(right),
-    }
-}
-
 pub(crate) fn print_information(host: &dyn Host, options: &CPackOptions) -> bool {
     if options.version {
         let text = format!(
-            "cpack version {CMAKE_VERSION_STR}\n\nCMake suite maintained and supported by Kitware (kitware.com/cmake).\n"
+            "cpack version {CMAKE_VERSION_STR}\nRcmake {}\n",
+            env!("CARGO_PKG_VERSION")
         );
         host.write_out(Stream::Stdout, text.as_bytes());
     } else if options.help {
-        host.write_out(Stream::Stdout, b"Usage\n\n  cpack [options]\n\nOptions\n  -G <generators>     = Override CPACK_GENERATOR\n  -C <configs>        = Select build configurations\n  -D <var>=<value>    = Set a CPack variable\n  --config <file>     = Select the CPack config file\n  -P <name>           = Set the package name\n  -R <version>        = Set the package version\n  -B <dir>            = Set the package directory\n  --vendor <name>     = Set the package vendor\n  --preset <name>     = Use a package preset\n  --presets-file <file> = Select a presets file\n  --list-presets      = List available package presets\n  -V, --verbose       = Enable verbose output\n  --debug             = Enable debug output\n  --trace             = Trace CMake scripts\n  --trace-expand      = Trace CMake scripts with variables expanded\n  --version           = Print the version\n  --help              = Print this help\n\nGenerators\n  TGZ TXZ TZST TBZ2 TZ TAR ZIP ZIP_DEFLATE ZIP_STORE External Bundle DragNDrop\n");
+        host.write_out(Stream::Stdout, include_bytes!("help.txt"));
     } else {
         return false;
     }

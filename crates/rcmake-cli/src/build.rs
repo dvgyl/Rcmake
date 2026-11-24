@@ -371,7 +371,7 @@ fn dispatch(
         #[cfg(any(target_os = "macos", feature = "xcode-cross"))]
         GeneratorKind::Xcode => rcmake_gen_xcode::build_commands(&request),
         #[cfg(any(windows, feature = "vs-cross"))]
-        GeneratorKind::VisualStudio(_) => rcmake_gen_vs::build_commands(&request),
+        GeneratorKind::VisualStudio(_) => rcmake_gen_vs::build_commands(&request, host),
         #[cfg(not(any(target_os = "macos", feature = "xcode-cross")))]
         GeneratorKind::Xcode => {
             return error(

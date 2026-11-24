@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use rcmake_base::{BString, truth};
+use rcmake_base::{BString, suggest::levenshtein, truth};
 use rcmake_host::{Host, Stream, path::to_native};
 use rcmake_presets::{
     EnvSnapshot, NoTestsAction, OutputTruncation, PresetKind, PresetSettings, RepeatMode, ShowOnly,
@@ -13,6 +13,8 @@ use rcmake_presets::{
 
 use crate::CtestOptions;
 use crate::selection::{IndexSource, SelectionOptions};
+
+mod flags;
 
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) enum Mode {
@@ -165,27 +167,6 @@ pub(crate) fn parse(args: &[BString], host: &dyn Host) -> Result<Invocation, Str
             }
             b"--source-dir" => cli.source_dir = Some(to_native(value()?)),
             b"-C" | b"--build-config" => cli.options.config = Some(value()?.into()),
-            b"-R" | b"--tests-regex" => cli.options.include = Some(value()?.into()),
-            b"-E" | b"--exclude-regex" => cli.options.exclude = Some(value()?.into()),
-            b"-L" | b"--label-regex" => cli.options.include_labels.push(value()?.into()),
-            b"-LE" | b"--label-exclude" => cli.options.exclude_labels.push(value()?.into()),
-            b"-FA" | b"--fixture-exclude-any" => {
-                cli.selection.exclude_fixture = Some(value()?.into())
-            }
-            b"-FS" | b"--fixture-exclude-setup" => {
-                cli.selection.exclude_fixture_setup = Some(value()?.into())
-            }
-            b"-FC" | b"--fixture-exclude-cleanup" => {
-                cli.selection.exclude_fixture_cleanup = Some(value()?.into())
-            }
-            b"-I" | b"--tests-information" => {
-                cli.selection.indices = Some(IndexSource::Argument(value()?.into()))
-            }
-            b"-U" | b"--union" => cli.selection.union = true,
-            b"--tests-from-file" => cli.selection.tests_from_file = Some(to_native(value()?)),
-            b"--exclude-from-file" => cli.selection.exclude_from_file = Some(to_native(value()?)),
-            b"--rerun-failed" => cli.selection.rerun_failed = true,
-            b"--out-of-date" => cli.selection.out_of_date = true,
             b"--timeout" => timeout = Some(number_prefix(value()?).unwrap_or_default()),
             b"--stop-on-failure" => cli.execution.stop_on_failure = Some(true),
             b"--repeat" | b"--repeat-until-fail" => {
@@ -219,59 +200,6 @@ pub(crate) fn parse(args: &[BString], host: &dyn Host) -> Result<Invocation, Str
                 };
                 cli.execution.show_only = Some(parse_show_only(format)?);
             }
-            b"--output-on-failure" => cli.output.output_on_failure = Some(true),
-            b"--output-junit" => cli.output.output_junit_file = Some(value()?.into()),
-            b"-O" | b"--output-log" => cli.output.output_log_file = Some(value()?.into()),
-            b"-V" | b"--verbose" => {
-                if cli.output.verbosity != Some(TestVerbosity::Extra) {
-                    cli.output.verbosity = Some(TestVerbosity::Verbose);
-                }
-            }
-            b"-VV" | b"--extra-verbose" => cli.output.verbosity = Some(TestVerbosity::Extra),
-            b"-Q" | b"--quiet" => cli.output.quiet = Some(true),
-            b"--progress" => cli.output.short_progress = Some(true),
-            b"--print-labels" => cli.print_labels = true,
-            b"--no-compress-output" => {}
-            b"--no-label-summary" => cli.output.label_summary = Some(false),
-            b"--no-subproject-summary" => cli.output.subproject_summary = Some(false),
-            b"--debug" => cli.output.debug = Some(true),
-            b"-W" | b"--max-width" => {
-                cli.output.max_test_name_width = Some(output_integer(flag, value()?)?)
-            }
-            b"--test-output-size-passed" => {
-                cli.output.max_passed_test_output_size = Some(output_integer(flag, value()?)?)
-            }
-            b"--test-output-size-failed" => {
-                cli.output.max_failed_test_output_size = Some(output_integer(flag, value()?)?)
-            }
-            b"--test-output-truncation" => {
-                let raw = value()?;
-                cli.output.test_output_truncation =
-                    Some(truncation_mode(raw).ok_or_else(|| {
-                        format!(
-                            "Invalid value for '--test-output-truncation': {}",
-                            display(raw)
-                        )
-                    })?);
-            }
-            b"-F" => cli.execution.enable_failover = Some(true),
-            b"--resource-spec-file" => cli.execution.resource_spec_file = Some(value()?.into()),
-            b"--interactive-debug-mode" => {
-                cli.execution.interactive_debugging = Some(truth::is_on(value()?));
-            }
-            b"-M" | b"--test-model" => {
-                let raw = value()?;
-                cli.dashboard_model = Some(
-                    crate::dart::Model::parse(raw)
-                        .ok_or_else(|| format!("Unknown dashboard model: {}", display(raw)))?,
-                );
-            }
-            b"-T" | b"--test-action" => cli.actions.push(parse_action(value()?)?),
-            b"-D" | b"--dashboard" => cli.definitions.push(parse_definition(value()?)?),
-            b"-S" | b"--script" | b"-SP" | b"--script-new-process" => cli.scripts.push(Script {
-                argument: value()?.into(),
-                new_process: matches!(flag, b"-SP" | b"--script-new-process"),
-            }),
             b"--preset" => cli.preset = Some(value()?.into()),
             b"--presets-file" => cli.presets_file = Some(to_native(value()?)),
             b"--collect-instrumentation" => {
@@ -297,6 +225,10 @@ pub(crate) fn parse(args: &[BString], host: &dyn Host) -> Result<Invocation, Str
                 cli.execution.jobs = Some(parse_jobs(flag, raw)?);
             }
             b"--overwrite" => cli.overwrite_configuration_file.push(value()?.into()),
+            _ if flags::selection(&mut cli, flag, &mut value)?
+                || flags::output(&mut cli, flag, &mut value)?
+                || flags::execution(&mut cli, flag, &mut value)?
+                || flags::dashboard(&mut cli, flag, &mut value)? => {}
             _ if arg.starts_with(b"-j") => {
                 cli.execution.jobs = Some(parse_jobs(b"-j", arg.get(2..))?)
             }
@@ -437,25 +369,7 @@ fn unknown(arg: &[u8]) -> String {
     let suggestion = OPTIONS
         .iter()
         .find(|option| {
-            let (long, short) = if option.len() > arg.len() {
-                (option.as_bytes(), arg)
-            } else {
-                (arg, option.as_bytes())
-            };
-            let common = long
-                .iter()
-                .zip(short)
-                .take_while(|(left, right)| left == right)
-                .count();
-            match (long.get(common..), short.get(common..)) {
-                (Some(left), Some(right)) if left.len() == right.len() + 1 => {
-                    left.get(1..) == Some(right)
-                }
-                (Some(left), Some(right)) if left.len() == right.len() => {
-                    left.get(1..) == right.get(1..)
-                }
-                _ => false,
-            }
+            arg.len().abs_diff(option.len()) <= 1 && levenshtein(arg, option.as_bytes()) <= 1
         })
         .map_or_else(String::new, |option| format!(". Did you mean: {option}?"));
     format!(
@@ -881,377 +795,4 @@ impl Invocation {
 }
 
 #[cfg(test)]
-mod tests {
-    use std::path::Path;
-
-    use rcmake_host::PureHost;
-    use rcmake_presets::{TestIndex, TestIndexRange};
-
-    use super::*;
-
-    fn parse_args(host: &dyn Host, args: &[&str]) -> Result<Invocation, String> {
-        parse(
-            &args.iter().copied().map(BString::from).collect::<Vec<_>>(),
-            host,
-        )
-    }
-
-    #[test]
-    fn reads_selection_and_execution_flags() -> Result<(), String> {
-        let host = PureHost::default();
-        let invocation = parse_args(
-            &host,
-            &[
-                "-R",
-                "^app",
-                "-E=slow",
-                "-L",
-                "unit",
-                "--label-regex",
-                "fast",
-                "-LE",
-                "linux",
-                "-LE",
-                "net",
-                "-FA",
-                "both",
-                "-FS",
-                "setup",
-                "-FC",
-                "cleanup",
-                "-I",
-                "1,5,2,4",
-                "-U",
-                "--tests-from-file",
-                "include.txt",
-                "--exclude-from-file",
-                "exclude.txt",
-                "--rerun-failed",
-                "--out-of-date",
-                "-C",
-                "Release",
-                "-j4",
-                "--timeout",
-                "1.5",
-                "--stop-on-failure",
-                "--repeat=after-timeout:2",
-                "--schedule-random",
-                "--schedule-random-seed",
-                "42",
-                "--test-load",
-                "5",
-                "--stop-time",
-                "13:02:03",
-                "--test-dir",
-                "out",
-                "--no-tests=error",
-            ],
-        )?;
-        assert_eq!(
-            invocation.selection,
-            SelectionOptions {
-                indices: Some(IndexSource::Argument("1,5,2,4".into())),
-                union: true,
-                exclude_fixture: Some("both".into()),
-                exclude_fixture_setup: Some("setup".into()),
-                exclude_fixture_cleanup: Some("cleanup".into()),
-                tests_from_file: Some("include.txt".into()),
-                exclude_from_file: Some("exclude.txt".into()),
-                rerun_failed: true,
-                out_of_date: true,
-                schedule_random: true,
-                random_seed: Some(42),
-            }
-        );
-        assert_eq!(
-            invocation.options,
-            CtestOptions {
-                test_dir: "/work/out".into(),
-                config: Some("Release".into()),
-                include: Some("^app".into()),
-                exclude: Some("slow".into()),
-                include_labels: vec!["unit".into(), "fast".into()],
-                exclude_labels: vec!["linux".into(), "net".into()],
-                jobs: 4,
-                timeout: Some(Duration::from_millis(1500)),
-                stop_on_failure: true,
-                error_on_no_tests: true,
-                ..CtestOptions::default()
-            }
-        );
-        assert_eq!(
-            invocation.execution.repeat,
-            Some(TestRepeat {
-                mode: RepeatMode::AfterTimeout,
-                count: 2
-            })
-        );
-        assert_eq!(invocation.test_load, Some(5));
-        assert_eq!(invocation.stop_time, Some(46_923));
-        Ok(())
-    }
-
-    #[test]
-    fn reads_output_scripts_and_arguments_for_test_processes() -> Result<(), String> {
-        let host = PureHost::default();
-        let invocation = parse_args(
-            &host,
-            &[
-                "-N",
-                "--show-only=json-v1-raw",
-                "--output-on-failure",
-                "--output-junit",
-                "junit.xml",
-                "-O",
-                "ctest.log",
-                "-V",
-                "-VV",
-                "-Q",
-                "--progress",
-                "--print-labels",
-                "--no-label-summary",
-                "-T",
-                "Test",
-                "-D",
-                "COUNT:STRING=1",
-                "-DVAR=2",
-                "-S",
-                "run.cmake,arg",
-                "-SP",
-                "other.cmake",
-                "--",
-                "--help",
-                "data",
-            ],
-        )?;
-        assert_eq!(invocation.execution.show_only, Some(ShowOnly::JsonV1Raw));
-        assert_eq!(
-            invocation.execution.test_passthrough_arguments,
-            Some(vec!["--help".into(), "data".into()])
-        );
-        assert_eq!(
-            invocation.output,
-            TestOutput {
-                output_on_failure: Some(true),
-                output_junit_file: Some("junit.xml".into()),
-                output_log_file: Some("ctest.log".into()),
-                verbosity: Some(TestVerbosity::Extra),
-                quiet: Some(true),
-                short_progress: Some(true),
-                label_summary: Some(false),
-                ..TestOutput::default()
-            }
-        );
-        assert!(invocation.print_labels);
-        assert_eq!(invocation.actions, ["test"]);
-        assert_eq!(invocation.definitions, ["COUNT:STRING=1", "VAR=2"]);
-        assert_eq!(
-            invocation.scripts,
-            [
-                Script {
-                    argument: "run.cmake,arg".into(),
-                    new_process: false
-                },
-                Script {
-                    argument: "other.cmake".into(),
-                    new_process: true
-                },
-            ]
-        );
-        assert_eq!(
-            parse_args(&host, &["--help"])?.mode,
-            Mode::Help(vec!["--help".into()])
-        );
-        assert_eq!(
-            parse_args(&host, &["--version"])?.mode,
-            Mode::Version {
-                json: false,
-                file: None
-            }
-        );
-        assert_eq!(
-            parse_args(&host, &["--list-presets=defined"])?.mode,
-            Mode::ListPresets { defined: true }
-        );
-        assert_eq!(
-            parse_args(&host, &["--list-presets"])?.mode,
-            Mode::ListPresets { defined: false }
-        );
-        assert_eq!(
-            parse_args(
-                &host,
-                &["--instrument", "--role", "test", "--", "program", "--arg"]
-            )?
-            .mode,
-            Mode::Instrument {
-                args: vec!["--role".into(), "test".into()],
-                command: vec!["program".into(), "--arg".into()]
-            }
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn accepts_repeat_modes_and_reports_invalid_values() -> Result<(), String> {
-        let host = PureHost::default();
-        for (args, mode) in [
-            (["--repeat", "until-fail:3"], RepeatMode::UntilFail),
-            (["--repeat", "until-pass:3"], RepeatMode::UntilPass),
-            (["--repeat", "after-timeout:3"], RepeatMode::AfterTimeout),
-            (["--repeat-until-fail", "3"], RepeatMode::UntilFail),
-        ] {
-            assert_eq!(
-                parse_args(&host, &args)?.execution.repeat,
-                Some(TestRepeat { mode, count: 3 })
-            );
-        }
-        for (args, error) in [
-            (
-                vec!["--repeat", "bad:1"],
-                "'--repeat' given invalid value 'bad:1'",
-            ),
-            (
-                vec!["--repeat-until-fail", "bad"],
-                "'--repeat-until-fail' given non-integer value 'bad'",
-            ),
-            (
-                vec!["--repeat=until-fail:2", "--repeat=until-pass:1"],
-                "At most one '--repeat' option may be used.",
-            ),
-            (
-                vec!["--no-tests=action"],
-                "'--no-tests=' given unknown value 'action'",
-            ),
-            (
-                vec!["--show-only=unknown"],
-                "'--show-only=' given unknown value 'unknown'",
-            ),
-            (vec!["-I"], "Invalid value used with -I"),
-            (
-                vec!["--parallel", "-1"],
-                "'--parallel' given invalid value '-1'",
-            ),
-        ] {
-            assert_eq!(parse_args(&host, &args).err().as_deref(), Some(error));
-        }
-        assert_eq!(
-            parse_args(&host, &["--parallel", "0"])?.options.jobs,
-            usize::MAX
-        );
-        assert!(parse_args(&host, &["-j"])?.options.jobs >= 2);
-        assert_eq!(
-            parse_args(&host, &["--test-load=bad", "--schedule-random-seed=bad"])?.test_load,
-            None
-        );
-        assert_eq!(
-            host.stream_bytes(Stream::Stderr),
-            "Invalid value for 'Test Load' : bad\nInvalid value for '--schedule-random-seed': bad\n"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn resolves_v13_presets_and_applies_cli_overrides() -> Result<(), String> {
-        let host = PureHost::default();
-        host.env_set(b"UNSET", Some(b"parent"));
-        host.seed_file(Path::new("/work/CMakePresets.json"), br#"{
-          "version": 13,
-          "configurePresets": [{
-            "name": "cfg", "generator": "Ninja", "binaryDir": "${sourceDir}/build",
-            "environment": { "FROM_CONFIGURE": "1" }
-          }],
-          "testPresets": [{
-            "name": "test", "configurePreset": "cfg", "configuration": "Debug",
-            "environment": { "CTEST_OUTPUT_ON_FAILURE": "ON", "UNSET": null },
-            "filter": {
-              "include": { "name": "^test", "label": "smoke", "index": { "start": 2, "stride": 3 }, "useUnion": true },
-              "exclude": { "name": "slow", "label": "network", "fixtures": { "setup": "setup" } }
-            },
-            "execution": {
-              "jobs": 2, "stopOnFailure": true, "scheduleRandom": true, "testLoad": 4,
-              "noTestsAction": "error", "timeout": 15, "showOnly": "json-v1",
-              "repeat": { "mode": "until-pass", "count": 3 }, "testPassthroughArguments": ["preset"]
-            },
-            "output": { "outputJUnitFile": "preset.xml", "outputLogFile": "preset.log", "verbosity": "extra", "labelSummary": true }
-          }]
-        }"#).map_err(|error| error.to_string())?;
-        let invocation = parse_args(
-            &host,
-            &[
-                "--preset=test",
-                "-C",
-                "Release",
-                "-E",
-                "manual",
-                "-L",
-                "quick",
-                "--parallel",
-                "7",
-                "--no-tests=ignore",
-                "--output-junit",
-                "cli.xml",
-                "--no-label-summary",
-                "--schedule-random-seed",
-                "3",
-            ],
-        )?;
-        assert_eq!(invocation.options.test_dir, Path::new("/work/build"));
-        assert_eq!(invocation.options.config, Some("Release".into()));
-        assert_eq!(invocation.options.include, Some("^test".into()));
-        assert_eq!(invocation.options.exclude, Some("manual".into()));
-        assert_eq!(invocation.options.include_labels, ["smoke", "quick"]);
-        assert_eq!(invocation.options.exclude_labels, ["network"]);
-        assert_eq!(invocation.options.jobs, 7);
-        assert!(invocation.options.stop_on_failure);
-        assert!(invocation.options.ignore_no_tests);
-        assert!(invocation.options.output_on_failure);
-        assert_eq!(invocation.options.timeout, Some(Duration::from_secs(15)));
-        assert_eq!(
-            invocation.selection.indices,
-            Some(IndexSource::Preset(TestIndex::Range(TestIndexRange {
-                start: Some(2),
-                stride: Some(3),
-                ..TestIndexRange::default()
-            })))
-        );
-        assert_eq!(
-            invocation.selection.exclude_fixture_setup,
-            Some("setup".into())
-        );
-        assert!(invocation.selection.union);
-        assert!(invocation.selection.schedule_random);
-        assert_eq!(invocation.selection.random_seed, Some(3));
-        assert_eq!(invocation.test_load, Some(4));
-        assert_eq!(invocation.output.output_junit_file, Some("cli.xml".into()));
-        assert_eq!(invocation.output.output_log_file, Some("preset.log".into()));
-        assert_eq!(invocation.output.label_summary, Some(false));
-        assert_eq!(invocation.output.verbosity, Some(TestVerbosity::Extra));
-        assert_eq!(invocation.execution.show_only, Some(ShowOnly::JsonV1));
-        assert_eq!(
-            invocation.execution.repeat,
-            Some(TestRepeat {
-                mode: RepeatMode::UntilPass,
-                count: 3
-            })
-        );
-        assert_eq!(
-            invocation.execution.test_passthrough_arguments,
-            Some(vec!["preset".into()])
-        );
-        assert_eq!(
-            invocation.environment.get(b"FROM_CONFIGURE".as_slice()),
-            Some(&Some("1".into()))
-        );
-        assert_eq!(invocation.environment.get(b"UNSET".as_slice()), Some(&None));
-        let overridden = parse_args(
-            &host,
-            &["--preset", "test", "--test-dir", "local", "--", "cli"],
-        )?;
-        assert_eq!(overridden.options.test_dir, Path::new("/work/local"));
-        assert_eq!(
-            overridden.execution.test_passthrough_arguments,
-            Some(vec!["preset".into(), "cli".into()])
-        );
-        Ok(())
-    }
-}
+mod tests;

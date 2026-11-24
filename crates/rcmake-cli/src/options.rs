@@ -1,13 +1,19 @@
 use std::path::PathBuf;
 
-use rcmake_base::BString;
-use rcmake_diag::DiagState;
-use rcmake_eval::{CacheDefine, LogLevel, TraceConfig, TraceFormat};
-use rcmake_host::{Host, Stream, WriteMode};
-use rcmake_model::{CacheType, GeneratorKind};
+use rcmake_base::{BString, suggest::levenshtein};
+use rcmake_eval::{CacheDefine, LogLevel, TraceConfig};
+use rcmake_host::{Host, Stream};
+use rcmake_model::GeneratorKind;
 
 use crate::presets::Listing;
-use crate::{apply_warning_flag, parse_define, resolve_cli_path};
+use crate::resolve_cli_path;
+
+mod cache;
+mod debug;
+mod diagnostics;
+mod generator;
+mod presets;
+mod trace;
 
 pub(crate) enum CacheEdit {
     Define(CacheDefine),
@@ -111,434 +117,192 @@ pub(crate) fn parse(args: &[BString], host: &dyn Host) -> ParseResult {
     }
 }
 
+type Arguments<'a> = std::iter::Peekable<std::slice::Iter<'a, BString>>;
+
+struct Argument<'a, 'rest> {
+    original: &'a [u8],
+    flag: &'a [u8],
+    inline: Option<&'a [u8]>,
+    rest: &'rest mut Arguments<'a>,
+}
+
+impl<'a, 'rest> Argument<'a, 'rest> {
+    fn new(original: &'a [u8], rest: &'rest mut Arguments<'a>) -> Self {
+        let (flag, inline) = if original.starts_with(b"--") {
+            split_flag(original, b'=')
+        } else {
+            let (flag, tail) = original.split_at(original.len().min(2));
+            (flag, (!tail.is_empty()).then_some(tail))
+        };
+        Self {
+            original,
+            flag,
+            inline,
+            rest,
+        }
+    }
+
+    fn value(&mut self) -> Option<&'a [u8]> {
+        self.inline.or_else(|| take_value(self.rest))
+    }
+
+    fn required(&mut self, missing: impl Into<String>) -> Result<&'a [u8], String> {
+        self.value()
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| missing.into())
+    }
+}
+
 fn parse_args(args: &[BString], host: &dyn Host) -> Result<Option<Options>, String> {
     let mut opts = Options::default();
-    let mut iter = args.iter().map(|arg| arg.as_slice()).peekable();
+    let mut iter = args.iter().peekable();
     let mut profile_format = None;
-    while let Some(arg) = iter.next() {
-        if arg == b"--" {
+    while let Some(raw) = iter.next() {
+        if raw.as_slice() == b"--" {
             break;
         }
-        let (flag, inline) = split_flag(arg, b'=');
-        if opts.script.is_some()
-            && !matches!(
-                flag,
-                b"--fresh"
-                    | b"--preset"
-                    | b"--presets-file"
-                    | b"--list-presets"
-                    | b"--log-level"
-                    | b"--loglevel"
-                    | b"--log-context"
-            )
+        let mut arg = Argument::new(raw, &mut iter);
+        if opts.script.is_some() && !script_mode_flag(arg.flag) {
+            continue;
+        }
+        if arg.flag == b"--print-config-dir" {
+            print_config_dir(host);
+            return Ok(None);
+        }
+        if parse_project(&mut arg, &mut opts, host)?
+            || presets::parse(&mut arg, &mut opts, host)?
+            || generator::parse(&mut arg, &mut opts, host)?
+            || cache::parse(&mut arg, &mut opts, host)?
+            || diagnostics::parse(&mut arg, &mut opts, host)?
+            || trace::parse(&mut arg, &mut opts, host)?
+            || debug::parse(&mut arg, &mut opts, host, &mut profile_format)?
         {
             continue;
         }
-        if arg.starts_with(b"--") {
-            macro_rules! value {
-                ($error:expr) => {
-                    inline
-                        .or_else(|| take_value(&mut iter))
-                        .filter(|v| !v.is_empty())
-                        .ok_or_else(|| $error.to_owned())?
-                };
-            }
-            match flag {
-                b"--help" | b"--help-variable" => {
-                    let Some(topic) = inline.or_else(|| take_value(&mut iter)) else {
-                        out(host, USAGE);
-                        print_generators(host, Stream::Stdout);
-                        return Ok(None);
-                    };
-                    return show_help(host, topic, flag == b"--help-variable").map(|()| None);
-                }
-                b"--regenerate-during-build" if inline.is_none() => {}
-                b"--preset" => {
-                    opts.preset = Some(value!("No preset specified for --preset").into());
-                }
-                b"--presets-file" => {
-                    opts.presets_file = Some(resolve_cli_path(
-                        host,
-                        value!("No file specified for --presets-file"),
-                    ));
-                }
-                b"--list-presets" => {
-                    let mode = inline.or_else(|| take_value(&mut iter));
-                    if let Some(value) = mode.filter(|value| value.starts_with(b"-")) {
-                        return Err(unknown_option(value));
-                    }
-                    if mode == Some(b"") {
-                        crate::emit_cli_error(host, "Invalid value used with --list-presets");
-                        return Err(String::new());
-                    }
-                    opts.list_presets = Some(Listing::parse(mode)?);
-                }
-                b"--fresh" => opts.fresh = true,
-                b"--log-context" => opts.log_context = true,
-                b"--log-level" | b"--loglevel" => {
-                    let invalid = format!(
-                        "Invalid level specified for {}",
-                        String::from_utf8_lossy(flag)
-                    );
-                    opts.log_level = Some(LogLevel::parse(value!(invalid)).ok_or(invalid)?);
-                }
-                b"--sarif-output" => {
-                    opts.sarif = Some(resolve_cli_path(
-                        host,
-                        value!("No file specified for --sarif-output"),
-                    ));
-                }
-                b"--toolchain" | b"--install-prefix" => {
-                    let (name, message) = if flag == b"--toolchain" {
-                        ("CMAKE_TOOLCHAIN_FILE", "No file specified for --toolchain")
-                    } else {
-                        (
-                            "CMAKE_INSTALL_PREFIX",
-                            "No install directory specified for --install-prefix",
-                        )
-                    };
-                    opts.cache_edits.push(CacheEdit::Define(CacheDefine {
-                        name: name.into(),
-                        ty: Some(if flag == b"--toolchain" {
-                            CacheType::Filepath
-                        } else {
-                            CacheType::Path
-                        }),
-                        value: value!(message).into(),
-                    }));
-                }
-                b"--debugger" | b"--debugger-pipe" | b"--debugger-dap-log" => {
-                    let name = String::from_utf8_lossy(flag);
-                    if flag != b"--debugger" {
-                        let label = if flag == b"--debugger-pipe" {
-                            "path"
-                        } else {
-                            "file"
-                        };
-                        let _ = value!(format!("No {label} specified for {name}"));
-                    }
-                    return Err(format!("CMake was not built with support for {name}"));
-                }
-                b"--warn-uninitialized" => {
-                    out(host, "Warn about uninitialized values.\n");
-                    opts.warning_flags.push("-Wuninitialized".into());
-                }
-                b"--no-warn-unused-cli" => {
-                    out(
-                        host,
-                        "Not searching for unused variables given on the command line.\n",
-                    );
-                    opts.warning_flags.push("-Wno-unused-cli".into());
-                }
-                b"--check-system-vars" => {
-                    out(host, "Find problems with variable usage in system files.\n")
-                }
-                b"--debug-output" => {
-                    out(host, "Running with debug output on.\n");
-                    opts.debug_output = true;
-                }
-                b"--debug-trycompile" => {
-                    out(host, "debug trycompile on\n");
-                    opts.debug_trycompile = true;
-                }
-                b"--debug-find" => {
-                    out(
-                        host,
-                        "Running with debug output on for the `find` commands.\n",
-                    );
-                    opts.debug_find = true;
-                }
-                b"--debug-find-pkg" | b"--debug-find-var" => {
-                    let list = value!("No names specified for debug find");
-                    let category = if flag == b"--debug-find-pkg" {
-                        "package(s)"
-                    } else {
-                        "variable(s)"
-                    };
-                    let names = String::from_utf8_lossy(list).replace(',', " ");
-                    out(
-                        host,
-                        &format!(
-                            "Running with debug output on for the 'find' commands for {category} {names}.\n"
-                        ),
-                    );
-                }
-                b"--graphviz" => {
-                    opts.graphviz = Some(resolve_cli_path(
-                        host,
-                        value!("No file specified for --graphviz"),
-                    ));
-                }
-                b"--trace" => {
-                    out(host, "Put cmake in trace mode.\n");
-                    opts.trace.get_or_insert_with(TraceConfig::default);
-                }
-                b"--trace-expand" => {
-                    out(
-                        host,
-                        "Put cmake in trace mode, but with variables expanded.\n",
-                    );
-                    let trace = opts.trace.get_or_insert_with(TraceConfig::default);
-                    trace.expand = true;
-                }
-                b"--trace-format" => {
-                    out(
-                        host,
-                        "Put cmake in trace mode and sets the trace output format.\n",
-                    );
-                    let fmt = value!("No format specified for --trace-format");
-                    let format = match fmt {
-                        b"human" => TraceFormat::Human,
-                        b"json-v1" => TraceFormat::JsonV1,
-                        _ => {
-                            return Err("Invalid format specified for --trace-format. Valid formats are human, json-v1.".into());
-                        }
-                    };
-                    let trace = opts.trace.get_or_insert_with(TraceConfig::default);
-                    trace.format = format;
-                }
-                b"--trace-source" => {
-                    let src = value!("No file specified for --trace-source");
-                    let trace = opts.trace.get_or_insert_with(TraceConfig::default);
-                    trace.sources.push(src.into());
-                }
-                b"--trace-redirect" => {
-                    let path = value!("No file specified for --trace-redirect");
-                    let absolute = resolve_cli_path(host, path);
-                    if let Err(err) = host.write(&absolute, b"", WriteMode::Truncate) {
-                        crate::emit_cli_error(
-                            host,
-                            format!(
-                                "Error opening trace file {}: {err}",
-                                String::from_utf8_lossy(path)
-                            ),
-                        );
-                        return Err(String::new());
-                    }
-                    out(
-                        host,
-                        &format!(
-                            "Put cmake in trace mode and redirect trace output to a file instead of stderr.\nTrace will be written to {}\n",
-                            absolute.display()
-                        ),
-                    );
-                    let trace = opts.trace.get_or_insert_with(TraceConfig::default);
-                    trace.redirect = Some(absolute);
-                }
-                b"--profiling-format" => {
-                    profile_format =
-                        Some(value!("Invalid format specified for --profiling-format"));
-                }
-                b"--profiling-output" => {
-                    opts.profile_output = Some(resolve_cli_path(
-                        host,
-                        value!("No file specified for --profiling-output"),
-                    ));
-                }
-                b"--print-config-dir" => {
-                    print_config_dir(host);
-                    return Ok(None);
-                }
-                _ => return Err(unknown_option(arg)),
-            }
-            continue;
-        }
-        if arg.is_empty() {
-            warn(
-                host,
-                "Ignoring empty string (\"\") provided on the command line.",
-            );
-            continue;
-        }
-        if !arg.starts_with(b"-") {
-            opts.directories.push(DirectoryArg::Positional(
-                resolve_cli_path(host, arg),
-                arg.ends_with(b"/"),
-            ));
-            continue;
-        }
-        match arg {
-            b"-h" | b"-help" => {
-                out(host, USAGE);
-                print_generators(host, Stream::Stdout);
-                return Ok(None);
-            }
-            b"-i" => {
-                host.write_out(
-                    Stream::Stderr,
-                    b"The \"cmake -i\" wizard mode is no longer supported.\n",
-                );
-                return Err(String::new());
-            }
-            b"-N" => opts.view = true,
-            b"-L" | b"-LA" | b"-LH" | b"-LAH" | b"-LR" | b"-LRA" | b"-LRH" | b"-LRAH" => {
-                let pattern = if arg.contains(&b'R') {
-                    Some(
-                        take_value(&mut iter)
-                            .ok_or("No regex specified for -LR")?
-                            .into(),
-                    )
-                } else {
-                    None
-                };
-                opts.list_cache = Some(ListCache {
-                    advanced: arg.contains(&b'A'),
-                    help: arg.contains(&b'H'),
-                    pattern,
-                });
-            }
-            _ => {
-                let (flag, tail) = arg.split_at(arg.len().min(2));
-                let value = |iter: &mut std::iter::Peekable<_>| {
-                    if tail.is_empty() {
-                        take_value(iter)
-                    } else {
-                        Some(tail)
-                    }
-                };
-                match flag {
-                    b"-S" | b"-H" | b"-B" => {
-                        let (is_build, label) = if flag == b"-B" {
-                            (true, "build")
-                        } else {
-                            (false, "source")
-                        };
-                        let path = resolve_cli_path(
-                            host,
-                            value(&mut iter).filter(|v| !v.is_empty()).ok_or_else(|| {
-                                format!(
-                                    "No {label} directory specified for {}",
-                                    String::from_utf8_lossy(flag)
-                                )
-                            })?,
-                        );
-                        if flag == b"-H" {
-                            host.write_out(
-                                Stream::Stderr,
-                                b"The -H option is deprecated.  Use -S instead.\n",
-                            );
-                        }
-                        opts.directories.push(if is_build {
-                            DirectoryArg::Binary(path)
-                        } else {
-                            DirectoryArg::Source(path)
-                        });
-                    }
-                    b"-C" => {
-                        let path = if tail.is_empty() {
-                            take_value(&mut iter).ok_or("-C must be followed by a file name.")?
-                        } else {
-                            tail.strip_prefix(b"=").unwrap_or(tail).trim_ascii_start()
-                        };
-                        if path.is_empty() {
-                            return Err("No file name specified for -C".into());
-                        }
-                        opts.cache_edits
-                            .push(CacheEdit::Preload(rcmake_host::path::to_native(path)));
-                    }
-                    b"-D" => {
-                        let raw = value(&mut iter).ok_or("-D must be followed with VAR=VALUE.")?;
-                        let Some(mut def) = parse_define(raw) else {
-                            host.write_out(Stream::Stderr, format!("CMake Error: Parse error in command line argument: {}\n Should be: VAR:type=value\n\n", String::from_utf8_lossy(raw)).as_bytes());
-                            return Err(cli_usage_error_only(host));
-                        };
-                        if let Some(home) = host.env_get(b"HOME") {
-                            if def.value.as_slice() == b"~" {
-                                def.value = home;
-                            } else if let Some(relative) = def.value.strip_prefix(b"~/") {
-                                def.value = [home.as_slice(), b"/", relative].concat().into();
-                            }
-                        }
-                        opts.cache_edits.push(CacheEdit::Define(def));
-                    }
-                    b"-U" => {
-                        opts.cache_edits.push(CacheEdit::Remove(
-                            value(&mut iter)
-                                .ok_or("-U must be followed with VAR.")?
-                                .into(),
-                        ));
-                    }
-                    b"-W" => {
-                        let raw =
-                            value(&mut iter).ok_or("-W must be followed with [no-]<name>.")?;
-                        let warning = [b"-W", raw].concat();
-                        if !apply_warning_flag(&warning, &mut DiagState::default()) {
-                            let name = raw.strip_prefix(b"no-").unwrap_or(raw);
-                            let name = name.strip_prefix(b"error=").unwrap_or(name);
-                            return Err(if name.is_empty() {
-                                "No warning name provided.".into()
-                            } else {
-                                format!(
-                                    "The warning category \"{}\" is not known.",
-                                    String::from_utf8_lossy(name)
-                                )
-                            });
-                        }
-                        opts.warning_flags.push(warning.into());
-                    }
-                    b"-G" => {
-                        let maybe = value(&mut iter).filter(|v| !v.is_empty());
-                        if maybe.is_none_or(|g| !is_generator(g)) {
-                            generator_error(host, maybe);
-                            return Err(String::new());
-                        }
-                        opts.generator = maybe.map(BString::from);
-                    }
-                    b"-A" | b"-T" => {
-                        let (slot, missing) = if flag == b"-A" {
-                            (&mut opts.architecture, "No platform specified for -A")
-                        } else {
-                            (&mut opts.toolset, "No toolset specified for -T")
-                        };
-                        *slot = Some(value(&mut iter).ok_or(missing)?.into());
-                    }
-                    b"-P" => {
-                        let Some(script) = value(&mut iter) else {
-                            crate::emit_cli_error(host, "No script specified for argument -P");
-                            return Err(String::new());
-                        };
-                        opts.script = Some(resolve_cli_path(host, script));
-                    }
-                    _ => return Err(unknown_option(arg)),
-                }
-            }
-        }
+        return Err(unknown_option(raw));
     }
-    if opts.script.is_some() {
-        if opts.fresh {
-            crate::emit_cli_error(host, "--fresh allowed only when configuring a project");
-            return Err(String::new());
+    validate_script_mode(&opts, host)?;
+    debug::validate_profile(host, &opts, profile_format)?;
+    Ok(Some(opts))
+}
+
+fn script_mode_flag(flag: &[u8]) -> bool {
+    matches!(
+        flag,
+        b"--fresh"
+            | b"--preset"
+            | b"--presets-file"
+            | b"--list-presets"
+            | b"--log-level"
+            | b"--loglevel"
+            | b"--log-context"
+    )
+}
+
+fn parse_project(
+    arg: &mut Argument<'_, '_>,
+    opts: &mut Options,
+    host: &dyn Host,
+) -> Result<bool, String> {
+    match arg.original {
+        b"" => warn(
+            host,
+            "Ignoring empty string (\"\") provided on the command line.",
+        ),
+        raw if !raw.starts_with(b"-") => {
+            opts.directories.push(DirectoryArg::Positional(
+                resolve_cli_path(host, raw),
+                raw.ends_with(b"/"),
+            ));
         }
-        if opts.preset.is_some() || opts.list_presets.is_some() || opts.presets_file.is_some() {
+        b"-i" => {
             host.write_out(
                 Stream::Stderr,
-                b"CMake Error:\n  Presets are not supported in CMake script mode.\n",
+                b"The \"cmake -i\" wizard mode is no longer supported.\n",
             );
             return Err(String::new());
         }
-    }
-    if profile_format.is_some() || opts.profile_output.is_some() {
-        let error = match (profile_format, &opts.profile_output) {
-            (Some(b"google-trace"), Some(path)) => host
-                .write(path, b"[\n]\n", WriteMode::Truncate)
-                .err()
-                .map(|_| {
-                    format!(
-                        "Could not start profiling: Unable to open: {}",
-                        path.display()
-                    )
-                }),
-            (Some(b"google-trace"), None) => {
-                Some("--profiling-format specified but no --profiling-output!".into())
-            }
-            _ => Some("Invalid format specified for --profiling-format".into()),
-        };
-        if let Some(error) = error {
-            crate::emit_cli_error(host, error);
-            return Err(String::new());
+        b"-N" => opts.view = true,
+        raw @ (b"-L" | b"-LA" | b"-LH" | b"-LAH" | b"-LR" | b"-LRA" | b"-LRH" | b"-LRAH") => {
+            let pattern = if raw.contains(&b'R') {
+                Some(
+                    take_value(arg.rest)
+                        .ok_or("No regex specified for -LR")?
+                        .into(),
+                )
+            } else {
+                None
+            };
+            opts.list_cache = Some(ListCache {
+                advanced: raw.contains(&b'A'),
+                help: raw.contains(&b'H'),
+                pattern,
+            });
         }
+        _ => match arg.flag {
+            b"--regenerate-during-build" if arg.inline.is_none() => {}
+            b"--graphviz" => {
+                opts.graphviz = Some(resolve_cli_path(
+                    host,
+                    arg.required("No file specified for --graphviz")?,
+                ));
+            }
+            b"-S" | b"-H" | b"-B" => parse_directory(arg, opts, host)?,
+            b"-P" => {
+                let Some(script) = arg.value() else {
+                    crate::emit_cli_error(host, "No script specified for argument -P");
+                    return Err(String::new());
+                };
+                opts.script = Some(resolve_cli_path(host, script));
+            }
+            _ => return Ok(false),
+        },
     }
-    Ok(Some(opts))
+    Ok(true)
+}
+
+fn parse_directory(
+    arg: &mut Argument<'_, '_>,
+    opts: &mut Options,
+    host: &dyn Host,
+) -> Result<(), String> {
+    let is_build = arg.flag == b"-B";
+    let label = if is_build { "build" } else { "source" };
+    let flag = String::from_utf8_lossy(arg.flag);
+    let path = resolve_cli_path(
+        host,
+        arg.required(format!("No {label} directory specified for {flag}"))?,
+    );
+    if arg.flag == b"-H" {
+        host.write_out(
+            Stream::Stderr,
+            b"The -H option is deprecated.  Use -S instead.\n",
+        );
+    }
+    opts.directories.push(if is_build {
+        DirectoryArg::Binary(path)
+    } else {
+        DirectoryArg::Source(path)
+    });
+    Ok(())
+}
+
+fn validate_script_mode(opts: &Options, host: &dyn Host) -> Result<(), String> {
+    if opts.script.is_none() {
+        return Ok(());
+    }
+    if opts.fresh {
+        crate::emit_cli_error(host, "--fresh allowed only when configuring a project");
+        return Err(String::new());
+    }
+    if opts.preset.is_some() || opts.list_presets.is_some() || opts.presets_file.is_some() {
+        host.write_out(
+            Stream::Stderr,
+            b"CMake Error:\n  Presets are not supported in CMake script mode.\n",
+        );
+        return Err(String::new());
+    }
+    Ok(())
 }
 
 fn cli_usage_error_only(host: &dyn Host) -> String {
@@ -557,10 +321,11 @@ pub(crate) fn split_flag(arg: &[u8], separator: u8) -> (&[u8], Option<&[u8]>) {
     }
 }
 
-pub(crate) fn take_value<'a>(
-    iter: &mut std::iter::Peekable<impl Iterator<Item = &'a [u8]>>,
+pub(crate) fn take_value<'a, T: AsRef<[u8]> + ?Sized + 'a>(
+    iter: &mut std::iter::Peekable<impl Iterator<Item = &'a T>>,
 ) -> Option<&'a [u8]> {
-    iter.next_if(|arg| !arg.starts_with(b"-"))
+    iter.next_if(|arg| !arg.as_ref().starts_with(b"-"))
+        .map(AsRef::as_ref)
 }
 
 fn unknown_option(arg: &[u8]) -> String {
@@ -568,12 +333,14 @@ fn unknown_option(arg: &[u8]) -> String {
 }
 
 pub(crate) fn unknown_mode_option(arg: &[u8], flags: &[&[u8]]) -> String {
+    const MAX_DISTANCE: usize = 2;
     let mut message = format!("Unknown argument {}", String::from_utf8_lossy(arg));
-    if let Some((flag, distance)) = flags
+    if let Some((flag, _)) = flags
         .iter()
-        .map(|flag| (*flag, edit_distance(arg, flag)))
+        .filter(|flag| arg.len().abs_diff(flag.len()) <= MAX_DISTANCE)
+        .map(|flag| (*flag, levenshtein(arg, flag)))
+        .filter(|&(_, distance)| distance <= MAX_DISTANCE)
         .min_by_key(|&(_, distance)| distance)
-        && distance <= 2
     {
         message.push_str(&format!(
             ". Did you mean: {}?",
@@ -581,30 +348,6 @@ pub(crate) fn unknown_mode_option(arg: &[u8], flags: &[&[u8]]) -> String {
         ));
     }
     message
-}
-
-fn edit_distance(a: &[u8], b: &[u8]) -> usize {
-    if a.len().abs_diff(b.len()) > 2 {
-        return 3;
-    }
-    let mut row: Vec<_> = (0..=b.len()).collect();
-    for (i, x) in a.iter().enumerate() {
-        let Some((first, rest)) = row.split_first_mut() else {
-            return 3;
-        };
-        let mut diagonal = *first;
-        *first = i + 1;
-        let mut left = *first;
-        for (cell, y) in rest.iter_mut().zip(b) {
-            let above = *cell;
-            *cell = (above + 1)
-                .min(left + 1)
-                .min(diagonal + usize::from(x != y));
-            diagonal = above;
-            left = *cell;
-        }
-    }
-    row.last().copied().unwrap_or(3)
 }
 
 pub(crate) fn cli_usage_error(host: &dyn Host, body: &str) -> i32 {
@@ -641,7 +384,20 @@ pub(crate) fn default_generator(host: &dyn Host) -> BString {
         .unwrap_or_else(|| "Unix Makefiles".into())
 }
 
-fn print_generators(host: &dyn Host, stream: Stream) {
+/// Print the generators for this host and mark the default generator.
+pub(crate) fn print_generators(host: &dyn Host, stream: Stream) {
+    write_generators(host, stream, "Generators\n");
+}
+
+pub(crate) fn print_help_generators(host: &dyn Host) {
+    write_generators(
+        host,
+        Stream::Stdout,
+        "\nGenerators\n\nThe following generators are available on this platform (* marks default):\n",
+    );
+}
+
+fn write_generators(host: &dyn Host, stream: Stream, heading: &str) {
     let default = default_generator(host);
     if stream == Stream::Stdout
         && host
@@ -650,7 +406,7 @@ fn print_generators(host: &dyn Host, stream: Stream) {
     {
         invalid_generator_env(host);
     }
-    let mut text = String::from("Generators\n");
+    let mut text = String::from(heading);
     for kind in GeneratorKind::available() {
         let (name, desc) = (kind.name(), kind.description());
         let marker = if name.as_bytes() == default.as_slice() {
@@ -726,14 +482,23 @@ fn print_config_dir(host: &dyn Host) {
     out(host, &format!("{dir}\n"));
 }
 
-fn show_help(_host: &dyn Host, topic: &[u8], variable: bool) -> Result<(), String> {
-    let flag = if variable {
-        "--help-variable"
-    } else {
-        "--help"
-    };
-    Err(format!(
-        "Argument \"{}\" to {flag} is not a defined variable.",
-        String::from_utf8_lossy(topic)
-    ))
+#[cfg(test)]
+mod tests {
+    use super::unknown_mode_option;
+
+    #[test]
+    fn unknown_option_suggests_the_first_closest_flag_within_two_edits() {
+        assert_eq!(
+            unknown_mode_option(b"--xax", &[b"--cat", b"--bar", b"--ax"]),
+            "Unknown argument --xax. Did you mean: --ax?"
+        );
+        assert_eq!(
+            unknown_mode_option(b"--xax", &[b"--cat", b"--bar"]),
+            "Unknown argument --xax. Did you mean: --cat?"
+        );
+        assert_eq!(
+            unknown_mode_option(b"--xyz", &[b"--cat", b"--bar"]),
+            "Unknown argument --xyz"
+        );
+    }
 }

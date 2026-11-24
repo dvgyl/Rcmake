@@ -1,8 +1,10 @@
 //! Project settings when the resolver has no IDE data.
 
-use rcmake_model::{CustomCommand, CustomCommandKind, TargetEvent};
-use rcmake_resolve::Invocation;
+use rcmake_base::list;
+use rcmake_model::{CustomCommand, CustomCommandKind, TargetEvent, UsageField};
+use rcmake_resolve::{CustomStep, Invocation, LinkFragmentRole};
 
+use super::link::library;
 use super::*;
 
 impl Context<'_> {
@@ -94,9 +96,7 @@ impl Context<'_> {
                     };
                     item.language = source_language(&path).into();
                     item.compile = invocation_settings(invocation, source, object.as_bytes())
-                        .or_else(|| {
-                            Some(self.compile_settings(Some(target), name, &item.language, None))
-                        });
+                        .or_else(|| Some(self.compile_settings(target, name, &item.language)));
                     per_source_settings = true;
                     language.clone_from(&item.language);
                 }
@@ -105,7 +105,7 @@ impl Context<'_> {
                 language = string(&link.language);
             }
             if !per_source_settings {
-                config.compile = self.compile_settings(Some(target), name, &language, None);
+                config.compile = self.compile_settings(target, name, &language);
             }
         }
         let has_compile_facts = fact.is_some_and(|fact| !fact.compile_units.is_empty())
@@ -136,12 +136,8 @@ impl Context<'_> {
                         item.object = self.object_path(&path, name, fact);
                         item.language = source_language(&path).into();
                         if item.language != language {
-                            item.compile = Some(self.compile_settings(
-                                Some(target),
-                                name,
-                                &item.language,
-                                None,
-                            ));
+                            item.compile =
+                                Some(self.compile_settings(target, name, &item.language));
                         }
                     }
                 }
@@ -237,6 +233,57 @@ impl Context<'_> {
                 _ => {}
             }
         }
+    }
+
+    fn compile_settings(
+        &self,
+        target: &Target,
+        config: &str,
+        language: &str,
+    ) -> flags_table::Settings {
+        let flag_key = format!("CMAKE_{language}_FLAGS");
+        let config_key = format!("{flag_key}_{}", config.to_ascii_uppercase());
+        let dir = self.model.dir(target.dir);
+        let flags = [flag_key, config_key]
+            .into_iter()
+            .filter_map(|key| self.model.definition(target.dir, key.as_bytes()))
+            .flat_map(|value| flags_table::split(&string(value)))
+            .chain(
+                [&dir.usage, &target.usage]
+                    .into_iter()
+                    .flat_map(|usage| usage.entries(UsageField::CompileOptions))
+                    .flat_map(|entry| ide_flags(&string(&entry.value))),
+            );
+        let mut out = flags_table::compile(flags);
+        for usage in [&dir.usage, &target.usage] {
+            for entry in usage.entries(UsageField::CompileDefinitions) {
+                out.list(
+                    "PreprocessorDefinitions",
+                    msbuild_value(&string(&entry.value)),
+                );
+            }
+            for entry in usage.entries(UsageField::IncludeDirectories) {
+                out.list(
+                    "AdditionalIncludeDirectories",
+                    msbuild_value(&windows(&self.source_path(&string(&entry.value)))),
+                );
+            }
+        }
+        if let Some(standard) = target
+            .props
+            .get(b"CXX_STANDARD")
+            .filter(|_| language == "CXX")
+        {
+            let value = match standard.as_slice() {
+                b"14" => "stdcpp14",
+                b"17" => "stdcpp17",
+                b"20" => "stdcpp20",
+                b"23" => "stdcpp23",
+                _ => "stdcpplatest",
+            };
+            out.set("LanguageStandard", value);
+        }
+        out
     }
 
     fn fallback_link(
@@ -448,4 +495,32 @@ fn invocation_settings(
         }
     }
     Some(flags_table::compile(flags))
+}
+
+fn invocation_rule(step: &CustomStep) -> Rule {
+    Rule {
+        commands: step
+            .invocations
+            .iter()
+            .map(|cmd| Command {
+                argv: cmd.argv.iter().map(|arg| string(arg)).collect(),
+                dir: cmd
+                    .working_dir
+                    .as_ref()
+                    .map_or_else(String::new, |path| string(path)),
+            })
+            .collect(),
+        inputs: step.depends.iter().map(|path| string(path)).collect(),
+        outputs: step
+            .outputs
+            .iter()
+            .chain(&step.byproducts)
+            .map(|path| string(path))
+            .collect(),
+        message: step
+            .comment
+            .as_ref()
+            .map_or_else(String::new, |value| string(value)),
+        always: step.outputs.is_empty(),
+    }
 }

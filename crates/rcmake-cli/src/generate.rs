@@ -1,14 +1,16 @@
 use std::path::Path;
+use std::sync::Arc;
 
 use rcmake_base::{
     BString,
     list::{Empty, split},
     path_lex::Lexical,
 };
+use rcmake_diag::{Diagnostic, Effect, Location, MessageKind, RenderOptions, render};
 use rcmake_eval::Interp;
 use rcmake_gen_common::{self as common, GenError};
 use rcmake_genex::ConfigId;
-use rcmake_host::{Host, path};
+use rcmake_host::{Host, Stream, path};
 use rcmake_instrument::snippet::{self, ContentTarget};
 use rcmake_instrument::{
     CustomContent, CustomContentType, InstrumentError, InstrumentOption, Query,
@@ -81,8 +83,6 @@ pub(crate) fn run(
     if !queries.is_empty() && !kind.is_ide() {
         instrument::wrap_custom_commands(&mut result, interp.cx().project(), host, bin);
     }
-    // An IDE generator writes its project files first, so that a generator that is not
-    // implemented yet leaves no partial output.
     let ide_result = match kind {
         #[cfg(any(target_os = "macos", feature = "xcode-cross"))]
         GeneratorKind::Xcode => {
@@ -112,10 +112,8 @@ pub(crate) fn run(
             None
         }
     };
-    match ide_result {
-        Some(Err(GenError::Unimplemented(_))) => return Ok(false),
-        Some(Err(err)) => return Err(err.to_string()),
-        Some(Ok(())) | None => {}
+    if let Some(Err(err)) = ide_result {
+        return Err(err.to_string());
     }
     write_common(interp, host, bin, &result, kind).map_err(|err| err.to_string())?;
     let result = match kind {
@@ -234,35 +232,47 @@ fn write_common(
     let supplementary =
         common::write_supplementary_outputs(interp.cx().project(), result, host, bin)?;
     manifest.actions.extend(supplementary.actions);
-    write(
-        host,
-        &bin.join("cmake_install.cmake"),
-        common::install_script::render_with_options(
-            &manifest,
-            &binary_dir,
-            &common::install_script::InstallScriptOptions {
-                prefix,
-                configuration,
-                export_files: &export_files,
-                ..Default::default()
-            },
-        ),
-    )?;
+    if interp.cx().var_is_on(b"CMAKE_SKIP_INSTALL_RULES") {
+        if !manifest.actions.is_empty() {
+            let warning = Diagnostic {
+                kind: MessageKind::Warning,
+                effect: Effect::None,
+                category: None,
+                policy: None,
+                location: Location::FileLine {
+                    file: Arc::from(b"CMakeLists.txt".as_slice()),
+                    line: 0,
+                },
+                body: "CMAKE_SKIP_INSTALL_RULES was enabled even though installation rules have been specified".into(),
+            };
+            host.write_out(Stream::Stderr, &render(&warning, &RenderOptions::default()));
+        }
+    } else {
+        write(
+            host,
+            &bin.join("cmake_install.cmake"),
+            common::install_script::render_with_options(
+                &manifest,
+                &binary_dir,
+                &common::install_script::InstallScriptOptions {
+                    prefix,
+                    configuration,
+                    export_files: &export_files,
+                    ..Default::default()
+                },
+            ),
+        )?;
+    }
     let cmake_files = bin.join("CMakeFiles");
     let log_path = cmake_files.join("CMakeConfigureLog.yaml");
     if host.metadata(&log_path, rcmake_host::Follow::Yes).is_err() {
-        match common::configure_log::render(&result.metadata) {
-            Ok(content) => {
-                host.create_dir_all(&cmake_files)
-                    .map_err(|err| GenError::Write {
-                        path: path::from_native(&cmake_files),
-                        message: err.to_string().into(),
-                    })?;
-                write(host, &log_path, Ok(content))?;
-            }
-            Err(GenError::Unimplemented(_)) => {}
-            Err(err) => return Err(err),
-        }
+        let content = common::configure_log::render(&result.metadata)?;
+        host.create_dir_all(&cmake_files)
+            .map_err(|err| GenError::Write {
+                path: path::from_native(&cmake_files),
+                message: err.to_string().into(),
+            })?;
+        common::write_if_changed(host, &log_path, &content)?;
     }
 
     let export_commands = interp.cx().var_is_on(b"CMAKE_EXPORT_COMPILE_COMMANDS");
@@ -298,14 +308,7 @@ fn write_common(
         }
     }
     file_generate::write(interp.cx().project(), result, host)?;
-    let api_result = {
-        let mut cx = interp.cx();
-        common::fileapi::write_replies(cx.project(), result, host, bin)
-    };
-    match api_result {
-        Err(GenError::Unimplemented(_)) => Ok(()),
-        result => result,
-    }
+    common::fileapi::write_replies(interp.cx().project(), result, host, bin)
 }
 
 fn write_exports(
@@ -391,24 +394,18 @@ fn write_exports(
 }
 
 fn write(host: &dyn Host, path: &Path, content: Result<BString, GenError>) -> Result<(), GenError> {
-    match content {
-        Ok(content) => common::write_if_changed(host, path, &content),
-        Err(GenError::Unimplemented(_)) => Ok(()),
-        Err(err) => Err(err),
-    }
+    common::write_if_changed(host, path, &content?)
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
-    use rcmake_host::{Follow, ProcessResult, PureHost, ReadRange, RunOutput, Stream};
+    use rcmake_host::{Follow, ProcessResult, ReadRange, RunOutput, Stream};
 
     use super::*;
 
     #[test]
     fn configure_and_build_collect_instrumentation() {
-        let host = Arc::new(PureHost::default());
+        let host = crate::driver_tests::project_host();
         let source = Path::new("/work/CMakeLists.txt");
         let bin = Path::new("/work/out");
         let api = bin.join(".cmake/instrumentation/v1");

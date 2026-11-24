@@ -7,6 +7,7 @@ This log records the licences and purpose of the vendored assets and direct work
 | Asset | Upstream version | Licence | Location | Purpose |
 | --- | --- | --- | --- | --- |
 | CMake standard modules and templates | CMake 4.5.1 | `BSD-3-Clause` | `modules/cmake-4.5/` | Supply the standard CMake module library and templates. The original copyright notices stay with the files. |
+| Rendered command-line help and reference manuals | CMake 4.5.1 | `BSD-3-Clause` | `crates/rcmake-cli/help/` | Supply CMake help when only the Rcmake binary is present. |
 
 ## Direct Third-Party Dependencies
 
@@ -18,7 +19,7 @@ The licence expression lists the upstream terms. Rcmake uses an option on the sc
 | `bzip2` | `0.6.1` | `MIT OR Apache-2.0` | Read and write bzip2 streams with the Rust `libbz2-rs-sys` backend. |
 | `flate2` | `1.1.11` | `MIT OR Apache-2.0` | Read and write gzip streams with the Rust `miniz_oxide` backend. |
 | `indexmap` | `2.14.2` | `Apache-2.0 OR MIT` | Keep map entries in insertion order. |
-| `jiff` | `0.2.46` | `Unlicense OR MIT` | Read the local time zone and format timestamps. |
+| `jiff` | `0.2.46` | `Unlicense OR MIT` | Read the local time zone and format timestamps. Use the system zone database where available. |
 | `liblzma` | `0.4.9` | `MIT OR Apache-2.0` | Read and write xz streams with the bundled `liblzma` library. |
 | `md-5` | `0.10.6` | `MIT OR Apache-2.0` | Calculate MD5 hashes and generate stable Visual Studio identifiers. |
 | `memchr` | `2.8.3` | `Unlicense OR MIT` | Find bytes for list parsing and other byte operations. |
@@ -29,11 +30,13 @@ The licence expression lists the upstream terms. Rcmake uses an option on the sc
 | `sha2` | `0.10.9` | `MIT OR Apache-2.0` | Calculate SHA-2 hashes and generate stable Xcode identifiers. |
 | `sha3` | `0.10.9` | `MIT OR Apache-2.0` | Calculate SHA-3 hashes for CMake commands. |
 | `similar` | `2.7.0` | `Apache-2.0` | Show text differences when test harness output differs from CMake output. |
-| `tar` | `0.4.46` | `MIT OR Apache-2.0` | Read and write tar archives. |
+| `tar` | `0.4.46` | `MIT OR Apache-2.0` | Read and write tar archives. The default extended-attribute feature is disabled. |
 | `tempfile` | `3.27.0` | `MIT OR Apache-2.0` | Create isolated temporary directories for the test harness. |
 | `thiserror` | `2.0.21` | `MIT OR Apache-2.0` | Derive Rust error implementations for structured error types. |
-| `zip` | `2.6.1` | `MIT` | Read and write ZIP archives with Deflate support. |
+| `zip` | `2.6.1` | `MIT` | Read and write ZIP archives with the `flate2` Deflate backend. |
 | `zstd` | `0.14.4` | `BSD-3-Clause` | Read and write Zstandard streams with the bundled Zstandard library. |
+
+The archive feature selection removes `zopfli`, `bumpalo`, and `xattr` from the lockfile. The lockfile still lists `log` for optional Jiff features. The macOS ARM64 build does not use it. On AArch64 targets that use an ABI other than MSVC, `sha2` enables `sha2-asm` (version 0.6.4, `MIT OR Apache-2.0`). This backend uses the ARMv8 SHA-2 instructions when the processor supports them.
 
 ## Archive Codec Dependencies
 

@@ -8,10 +8,14 @@ mod configure;
 #[cfg(test)]
 mod ctest;
 mod generate;
+mod help;
 mod install;
+mod instrumentation;
 mod options;
 mod presets;
 mod resource;
+mod sarif;
+mod system_information;
 mod workflow;
 
 #[cfg(test)]
@@ -21,8 +25,10 @@ use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
 
+use instrumentation::{
+    CommandExit, InstrumentationStep, instrument_lifecycle, sample_instrumentation,
+};
 use options::{Options, ParseResult};
 use rcmake_base::{
     BString, CMAKE_VERSION_MAJOR, CMAKE_VERSION_MINOR, CMAKE_VERSION_PATCH, CMAKE_VERSION_STR,
@@ -33,11 +39,7 @@ use rcmake_diag::{
     RenderOptions, render,
 };
 use rcmake_eval::{CacheDefine, Interp, InterpConfig, RunMode};
-use rcmake_host::{FileKind, Host, HostError, Stream, WriteMode, path};
-use rcmake_instrument::{
-    Hook, InstrumentError, InstrumentOption, Query, Snippet, SnippetRole, hooks, query,
-    snippet::{self, SnippetDetails, SystemSample},
-};
+use rcmake_host::{Host, Stream, WriteMode};
 use rcmake_json::Value;
 use rcmake_model::CacheType;
 
@@ -97,8 +99,9 @@ pub fn run(argv: &[BString], host: Arc<dyn Host>) -> i32 {
         let output = rest.get(1).filter(|arg| !arg.starts_with(b"-"));
         if fb == b"--version" || fb == b"-version" || fb == b"/V" || fb == b"/version" {
             let banner = format!(
-                "{} version {CMAKE_VERSION_STR}\n\nRcmake native Rust drop-in replacement for CMake {CMAKE_VERSION_STR}.\n",
-                tool.name()
+                "{} version {CMAKE_VERSION_STR}\nRcmake {}\n",
+                tool.name(),
+                env!("CARGO_PKG_VERSION")
             );
             return write_version(host.as_ref(), output, banner.as_bytes());
         }
@@ -248,6 +251,14 @@ fn run_cmake(argv: &[BString], rest: &[BString], host: Arc<dyn Host>) -> i32 {
         return workflow::run(args, host);
     }
 
+    if let Some(code) = help::run(rest, host.as_ref()) {
+        return code;
+    }
+
+    if let Some(args) = rest.strip_prefix(&[BString::from("--system-information")]) {
+        return system_information::run(argv, args, host.as_ref());
+    }
+
     let mut opts = match options::parse(rest, host.as_ref()) {
         ParseResult::Run(opts) => *opts,
         ParseResult::Exit(code) => return code,
@@ -267,209 +278,55 @@ fn run_cmake(argv: &[BString], rest: &[BString], host: Arc<dyn Host>) -> i32 {
             false,
         );
         *interp.cx().diag_state_mut() = state;
+        let start = host.now();
         let outcome = interp.run_script(&script);
-        if !write_sarif_if_requested(host.as_ref(), opts.sarif.as_deref(), &interp, Vec::new()) {
-            return 1;
+        if let Some(output) = opts.sarif.as_deref() {
+            let command = interp.cx().var_or_empty(b"CMAKE_COMMAND");
+            let invocation = sarif::Invocation {
+                command: &command,
+                start,
+                exit_code: outcome.exit_code,
+                directories: None,
+            };
+            if !sarif::write(host.as_ref(), output, &interp, Vec::new(), invocation) {
+                return 1;
+            }
         }
         return outcome.exit_code;
     }
     configure::run(argv, opts, host)
 }
 
-enum CommandExit {
-    Code(i32),
-    Signal(i32),
-}
-
-impl CommandExit {
-    fn code(&self) -> i32 {
-        match *self {
-            Self::Code(code) => code,
-            Self::Signal(signal) => 128_i32.saturating_add(signal),
-        }
-    }
-}
-
-struct InstrumentationStep {
-    start: Duration,
-    time_start: u64,
-    before: Option<SystemSample>,
-}
-
-impl InstrumentationStep {
-    fn start(host: &dyn Host, sample: bool) -> Self {
-        let before = sample.then(|| SystemSample::collect(host));
-        let time = host.now();
-        Self {
-            start: host.monotonic(),
-            time_start: u64::try_from(time.secs)
-                .unwrap_or_default()
-                .saturating_mul(1000)
-                .saturating_add(u64::from(time.nanos / 1_000_000)),
-            before,
-        }
-    }
-
-    fn record(
-        self,
-        host: &dyn Host,
-        build_dir: &Path,
-        argv: &[BString],
-        role: SnippetRole,
-        exit: &CommandExit,
-    ) -> Result<(), InstrumentError> {
-        let duration = host.monotonic().saturating_sub(self.start);
-        let (result, interrupt_signal) = match *exit {
-            CommandExit::Code(code) => (Some(i64::from(code)), None),
-            CommandExit::Signal(signal) => (None, Some(signal)),
-        };
-        let snippet = Snippet {
-            role,
-            command: instrumentation_command(argv),
-            working_dir: path::from_native(&host.initial_cwd()),
-            result,
-            time_start: self.time_start,
-            duration: u64::try_from(duration.as_millis()).unwrap_or(u64::MAX),
-            target: None,
-            outputs: Vec::new(),
-            source: None,
-            language: None,
-            test_name: None,
-            config: None,
-            stdout: None,
-            stderr: None,
-        };
-        let data = build_dir.join(".cmake/instrumentation/v1/data");
-        if self.before.is_none() && interrupt_signal.is_none() {
-            snippet::write_snippet(host, &data, &snippet)?;
-        } else {
-            let cmake_content = if role == SnippetRole::Configure {
-                None
-            } else {
-                instrumentation_content(host, &data)?
-            };
-            let details = SnippetDetails {
-                interrupt_signal,
-                dynamic: self
-                    .before
-                    .map(|before| (before, SystemSample::collect(host))),
-                cmake_content,
-                ..SnippetDetails::default()
-            };
-            snippet::write_snippet_with_details(host, &data, &snippet, &details)?;
-        }
-        Ok(())
-    }
-}
-
-fn instrumentation_command(argv: &[BString]) -> BString {
-    let mut command = BString::default();
-    for (index, arg) in argv.iter().enumerate() {
-        if index > 0 {
-            command.push(b' ');
-        }
-        let quote = arg.is_empty()
-            || arg
-                .iter()
-                .any(|byte| byte.is_ascii_whitespace() || matches!(byte, b'"' | b'\\'));
-        if quote {
-            command.push(b'"');
-        }
-        for &byte in arg.iter() {
-            if quote && matches!(byte, b'"' | b'\\') {
-                command.push(b'\\');
-            }
-            command.push(byte);
-        }
-        if quote {
-            command.push(b'"');
-        }
-    }
-    command
-}
-
-fn instrumentation_content(host: &dyn Host, data: &Path) -> Result<Option<BString>, HostError> {
-    let entries = match host.read_dir(&data.join("content")) {
-        Ok(entries) => entries,
-        Err(err) if err.kind == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(err) => return Err(err),
-    };
-    Ok(entries
-        .into_iter()
-        .filter(|entry| matches!(entry.kind, FileKind::File | FileKind::Symlink))
-        .filter_map(|entry| {
-            (entry.name.starts_with(b"cmake-") && entry.name.ends_with(b".json"))
-                .then_some(entry.name)
-        })
-        .max_by(|left, right| {
-            left.strip_suffix(b".json")
-                .cmp(&right.strip_suffix(b".json"))
-        })
-        .map(|name| path::from_native(&Path::new("content").join(path::to_native(&name)))))
-}
-
-fn sample_instrumentation(queries: &[Query]) -> bool {
-    queries.iter().any(|query| {
-        query
-            .options
-            .contains(&InstrumentOption::DynamicSystemInformation)
-    })
-}
-
-fn instrument_lifecycle(
-    host: &dyn Host,
-    build_dir: &Path,
-    argv: &[BString],
-    role: SnippetRole,
-    post_hook: Hook,
-    run: impl FnOnce() -> CommandExit,
-) -> i32 {
-    let queries = match query::read_queries(host, build_dir) {
-        Ok(queries) => queries,
-        Err(err) => {
-            emit_cli_error(host, err.to_string());
-            return 1;
-        }
-    };
-    if queries.is_empty() {
-        return run().code();
-    }
-    if role == SnippetRole::CMakeBuild
-        && let Err(err) = hooks::run_hook(host, build_dir, Hook::PreCMakeBuild)
-    {
-        emit_cli_error(host, err.to_string());
-        return 1;
-    }
-    let step = InstrumentationStep::start(host, sample_instrumentation(&queries));
-    let exit = run();
-    let code = exit.code();
-    if let Err(err) = step
-        .record(host, build_dir, argv, role, &exit)
-        .and_then(|()| {
-            if matches!(exit, CommandExit::Signal(_)) {
-                return Ok(());
-            }
-            hooks::run_hook(host, build_dir, post_hook)
-        })
-    {
-        emit_cli_error(host, err.to_string());
-        return if code == 0 { 1 } else { code };
-    }
-    code
-}
-
 fn new_interp(argv: &[BString], opts: &Options, mode: RunMode, host: Arc<dyn Host>) -> Interp {
     let (cmake_command, cmake_root) = rcmake_host::discover_cmake_root(host.as_ref(), argv.first());
+    new_interp_with_paths(
+        opts,
+        mode,
+        host,
+        cmake_command,
+        cmake_root.unwrap_or_default(),
+        argv,
+    )
+}
+
+fn new_interp_with_paths(
+    opts: &Options,
+    mode: RunMode,
+    host: Arc<dyn Host>,
+    cmake_command: PathBuf,
+    cmake_root: PathBuf,
+    argv: &[BString],
+) -> Interp {
     let cfg = InterpConfig {
         cwd: host.initial_cwd(),
         host,
         mode,
-        cmake_root: cmake_root.unwrap_or_default(),
+        cmake_root,
         cmake_command,
         limits: Limits::default(),
         diag: DiagOptions {
             initial_state: DiagState::default(),
-            sarif: opts.sarif.is_some(),
+            sarif: mode == RunMode::Configure || opts.sarif.is_some(),
         },
         defines: Vec::new(),
         script_args: argv.to_vec(),
@@ -485,52 +342,6 @@ fn new_interp(argv: &[BString], opts: &Options, mode: RunMode, host: Arc<dyn Hos
     interp.set_log_context(opts.log_context);
     interp.set_trace_config(opts.trace.clone());
     interp
-}
-
-fn sarif_results(sarif: &mut Value) -> Option<&mut Vec<Value>> {
-    let Value::Object(root) = sarif else {
-        return None;
-    };
-    let Value::Array(runs) = root.get_mut(b"runs".as_slice())? else {
-        return None;
-    };
-    let Value::Object(run) = runs.first_mut()? else {
-        return None;
-    };
-    let Value::Array(results) = run.get_mut(b"results".as_slice())? else {
-        return None;
-    };
-    Some(results)
-}
-
-fn write_sarif_if_requested(
-    host: &dyn Host,
-    path: Option<&Path>,
-    interp: &Interp,
-    mut preload_results: Vec<Value>,
-) -> bool {
-    let Some(sarif_path) = path else {
-        return true;
-    };
-    let mut sarif = interp.diag_engine().sarif_json();
-    if !preload_results.is_empty()
-        && let Some(results) = sarif_results(&mut sarif)
-    {
-        preload_results.append(results);
-        *results = preload_results;
-    }
-    let json = rcmake_json::write_styled(&sarif, "  ");
-    if let Err(err) = host.write(sarif_path, json.as_slice(), WriteMode::Truncate) {
-        emit_cli_error(
-            host,
-            format!(
-                "Failed to write SARIF output to \"{}\": {err}",
-                sarif_path.display()
-            ),
-        );
-        return false;
-    }
-    true
 }
 
 fn parse_define(raw: &[u8]) -> Option<CacheDefine> {
@@ -703,10 +514,31 @@ fn emit_cli_error(host: &dyn Host, body: impl Into<BString>) {
     host.write_out(Stream::Stderr, rendered.as_slice());
 }
 
+fn missing_cmake_root(host: &dyn Host, exe: &Path, configure: bool) -> i32 {
+    let root = exe
+        .parent()
+        .and_then(Path::parent)
+        .unwrap_or(Path::new("/"))
+        .join("share/cmake-4.5");
+    host.write_out(
+        Stream::Stderr,
+        format!(
+            "CMake Error: Could not find CMAKE_ROOT !!!\nCMake has most likely not been installed correctly.\nModules directory not found in\n{}\n",
+            root.display()
+        ).as_bytes(),
+    );
+    if configure {
+        host.write_out(
+            Stream::Stderr,
+            b"CMake Error: Error executing cmake::LoadCache(). Aborting.\n\n",
+        );
+    }
+    1
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rcmake_host::PureHost;
 
     #[test]
     fn argv0_dispatch_and_version_banner() {
@@ -715,19 +547,19 @@ mod tests {
         assert_eq!(tool_from_argv0(OsStr::new("/opt/cpack")), Tool::Cpack);
         assert_eq!(tool_from_argv0(OsStr::new("rcmake")), Tool::Cmake);
 
-        let host = Arc::new(PureHost::default());
+        let host = crate::driver_tests::project_host();
         let code = run(
             &[BString::from("cmake"), BString::from("--version")],
             host.clone(),
         );
         assert_eq!(code, 0);
         let out = host.stream_bytes(Stream::Stdout);
-        assert!(out.starts_with(b"cmake version 4.5.1\n\n"));
+        assert_eq!(out, b"cmake version 4.5.1\nRcmake 0.1.0\n");
     }
 
     #[test]
     fn capabilities_include_instrumentation_versions() {
-        let host = Arc::new(PureHost::default());
+        let host = crate::driver_tests::project_host();
         let args = ["cmake", "-E", "capabilities"].map(BString::from);
         assert_eq!(run(&args, host.clone()), 0);
         let field = br#""instrumentation":{"apiVersion":1,"dataVersion":{"major":1,"minor":2}}"#;
@@ -737,7 +569,7 @@ mod tests {
 
     #[test]
     fn script_mode_executes_with_defines() {
-        let host = Arc::new(PureHost::default());
+        let host = crate::driver_tests::project_host();
         host.seed_file(
             Path::new("/work/hello.cmake"),
             b"message(STATUS \"hi ${WHO}\")\n",
@@ -761,7 +593,7 @@ mod tests {
 
     #[test]
     fn malformed_define_is_rejected() {
-        let host = Arc::new(PureHost::default());
+        let host = crate::driver_tests::project_host();
         let code = run(
             &[
                 BString::from("cmake"),
@@ -780,7 +612,7 @@ mod tests {
 
     #[test]
     fn configure_reuses_and_refreshes_cache() {
-        let host = Arc::new(PureHost::default());
+        let host = crate::driver_tests::project_host();
         host.seed_file(
             Path::new("/work/CMakeLists.txt"),
             b"message(STATUS \"value=${VALUE}\")\n",
@@ -815,7 +647,7 @@ mod tests {
 
     #[test]
     fn view_mode_uses_explicit_directories_and_implicit_preload() {
-        let host = Arc::new(PureHost::default());
+        let host = crate::driver_tests::project_host();
         host.seed_file(
             Path::new("/work/src/PreLoad.cmake"),
             b"message(STATUS \"${CMAKE_SOURCE_DIR} -> ${CMAKE_BINARY_DIR} ${LOCAL}\")\nset(LOCAL set)\n",

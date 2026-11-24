@@ -293,3 +293,11 @@ fn write_items(xml: &mut Writer, plan: &Plan, settings: &Settings, custom: bool)
     }
     xml.end();
 }
+
+fn xml_name(value: &str) -> bool {
+    let mut chars = value.chars();
+    chars
+        .next()
+        .is_some_and(|ch| ch.is_ascii_alphabetic() || ch == '_')
+        && chars.all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '.' | '-'))
+}

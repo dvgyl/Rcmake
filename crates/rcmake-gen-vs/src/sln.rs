@@ -2,17 +2,17 @@
 
 use std::{collections::BTreeMap, fmt::Write};
 
-use crate::{CPP_TYPE, Solution, relative, windows};
+use crate::{CPP_TYPE, Project, Settings, plan::Solution, relative, windows};
 
 const FOLDER_TYPE: &str = "{2150E333-8FDC-42A3-9474-1A3956D46DE8}";
 
-pub(crate) fn render(solution: &Solution<'_>) -> String {
+pub(crate) fn render(solution: &Solution, settings: &Settings, projects: &[Project]) -> String {
     let mut out = String::from(
         "\u{feff}\nMicrosoft Visual Studio Solution File, Format Version 12.00\n# Visual Studio Version 17\n",
     );
 
-    let mut projects: Vec<_> = solution.members().collect();
-    projects.sort_by_key(|project| {
+    let mut members: Vec<_> = solution.members(projects).collect();
+    members.sort_by_key(|project| {
         (
             solution.startup.as_ref() != Some(&project.name),
             &project.name,
@@ -26,31 +26,31 @@ pub(crate) fn render(solution: &Solution<'_>) -> String {
             "Project(\"{FOLDER_TYPE}\") = \"{name}\", \"{path}\", \"{guid}\"\nEndProject"
         );
     }
-    for project in &projects {
+    for project in &members {
         let name = field(&project.name);
-        let path = field(&windows(&relative(solution.dir, &project.path())));
+        let path = field(&windows(&relative(&solution.dir, &project.path())));
         let _ = writeln!(
             out,
             "Project(\"{CPP_TYPE}\") = \"{name}\", \"{path}\", \"{}\"",
             project.guid
         );
         out.push_str("\tProjectSection(ProjectDependencies) = postProject\n");
-        for dep in solution.dependencies(project) {
+        for dep in solution.dependencies(projects, project) {
             let _ = writeln!(out, "\t\t{} = {}", dep.guid, dep.guid);
         }
         out.push_str("\tEndProjectSection\n");
         out.push_str("EndProject\n");
     }
     out.push_str("Global\n\tGlobalSection(SolutionConfigurationPlatforms) = preSolution\n");
-    let platform = &solution.settings.platform;
-    for config in &solution.settings.configs {
+    let platform = &settings.platform;
+    for config in &settings.configs {
         let _ = writeln!(out, "\t\t{config}|{platform} = {config}|{platform}");
     }
     out.push_str(
         "\tEndGlobalSection\n\tGlobalSection(ProjectConfigurationPlatforms) = postSolution\n",
     );
-    for project in projects {
-        for (index, config) in solution.settings.configs.iter().enumerate() {
+    for project in members {
+        for (index, config) in settings.configs.iter().enumerate() {
             let cfg = format!("{config}|{platform}");
             let _ = writeln!(out, "\t\t{}.{cfg}.ActiveCfg = {cfg}", project.guid);
             if project.build.get(index) == Some(&true) {
@@ -71,7 +71,7 @@ pub(crate) fn render(solution: &Solution<'_>) -> String {
             }
         }
         for project in solution
-            .members()
+            .members(projects)
             .filter(|project| !project.folder.is_empty())
         {
             children

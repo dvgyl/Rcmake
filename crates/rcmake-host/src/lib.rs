@@ -246,6 +246,8 @@ pub trait FileLockGuard: Send + core::fmt::Debug {
     fn path(&self) -> &Path;
 }
 
+const FILE_CHUNK_SIZE: usize = 256 * 1024;
+
 /// Core OS abstraction trait for Rcmake (ADR-004).
 ///
 /// Every filesystem path argument MUST be absolute; relative paths return
@@ -256,6 +258,29 @@ pub trait Host: Send + Sync {
 
     /// Read bytes from an absolute file path.
     fn read(&self, p: &Path, range: ReadRange) -> HostResult<Vec<u8>>;
+
+    /// Read a file in order and pass each chunk to `consume`.
+    fn read_chunks(&self, p: &Path, consume: &mut dyn FnMut(&[u8])) -> HostResult<()> {
+        let mut offset = 0;
+        loop {
+            let bytes = self.read(
+                p,
+                ReadRange::Slice {
+                    offset,
+                    len: Some(FILE_CHUNK_SIZE as u64),
+                },
+            )?;
+            if !bytes.is_empty() {
+                consume(&bytes);
+            }
+            if bytes.len() < FILE_CHUNK_SIZE {
+                return Ok(());
+            }
+            offset = offset
+                .checked_add(FILE_CHUNK_SIZE as u64)
+                .ok_or_else(|| error::from_errno(rustix::io::Errno::FBIG, Some(p)))?;
+        }
+    }
 
     /// Write bytes to an absolute file path.
     fn write(&self, p: &Path, data: &[u8], mode: WriteMode) -> HostResult<()>;

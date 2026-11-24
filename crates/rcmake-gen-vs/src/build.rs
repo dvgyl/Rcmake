@@ -2,7 +2,7 @@
 
 use rcmake_gen_common::GenError;
 use rcmake_gen_common::ide::{BuildCommand, BuildRequest, Jobs};
-use rcmake_host::{Host, NativeHost, ReadRange, path::to_native};
+use rcmake_host::{Host, ReadRange, path::to_native};
 use rcmake_model::{GeneratorKind, VsVersion};
 
 use crate::{CPP_TYPE, default_platform, solution_ext, string, windows, xml};
@@ -12,14 +12,9 @@ use crate::{CPP_TYPE, default_platform, solution_ext, string, windows, xml};
 /// # Errors
 ///
 /// Returns an error if the requested generator is not Visual Studio.
-pub fn build_commands(req: &BuildRequest<'_>) -> Result<Vec<BuildCommand>, GenError> {
-    let host = NativeHost::new().ok();
-    plan(req, host.as_ref().map(|host| host as &dyn Host))
-}
-
-pub(crate) fn plan(
+pub fn build_commands(
     req: &BuildRequest<'_>,
-    host: Option<&dyn Host>,
+    host: &dyn Host,
 ) -> Result<Vec<BuildCommand>, GenError> {
     let GeneratorKind::VisualStudio(version) = req.generator else {
         return Err(GenError::Invalid(
@@ -37,7 +32,7 @@ pub(crate) fn plan(
         .filter(|value| !value.is_empty())
         .map_or_else(|| "Debug".into(), string);
     let platform = if req.platform.is_empty() {
-        default_platform(host.map(Host::system).as_ref()).into()
+        default_platform(&host.system()).into()
     } else {
         string(req.platform)
     };
@@ -47,27 +42,26 @@ pub(crate) fn plan(
         string(req.project_name)
     };
     let solution = format!("{project}.{}", solution_ext(version));
-    let solution_data = host
-        .filter(|_| {
-            !devenv
-                && req.targets.iter().any(|target| {
-                    !target.is_empty()
-                        && target.as_slice() != b"clean"
-                        && !target.contains(&b'/')
-                        && !target.contains(&b'\\')
-                })
-        })
-        .and_then(|host| {
-            let path = to_native(req.build_dir).join(&solution);
-            host.read(
-                &path,
-                ReadRange::All {
-                    limit: 64 * 1024 * 1024,
-                },
-            )
-            .ok()
-        })
-        .and_then(|bytes| String::from_utf8(bytes).ok());
+    let needs_project_lookup = !devenv
+        && req.targets.iter().any(|target| {
+            !target.is_empty()
+                && target.as_slice() != b"clean"
+                && !target.contains(&b'/')
+                && !target.contains(&b'\\')
+        });
+    let solution_data = if needs_project_lookup {
+        let path = to_native(req.build_dir).join(&solution);
+        host.read(
+            &path,
+            ReadRange::All {
+                limit: 64 * 1024 * 1024,
+            },
+        )
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+    } else {
+        None
+    };
     let command = |target: &str, clean_first: bool| {
         let target = if target.is_empty() {
             "ALL_BUILD"

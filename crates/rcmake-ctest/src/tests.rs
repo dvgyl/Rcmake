@@ -495,3 +495,5 @@ fn rejects_a_dependency_cycle_before_starting_any_test() -> TestResult {
     );
     Ok(())
 }
+
+mod runner;

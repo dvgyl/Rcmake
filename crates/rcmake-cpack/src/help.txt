@@ -1,0 +1,25 @@
+Usage
+
+  cpack [options]
+
+Options
+  -G <generators>     = Override CPACK_GENERATOR
+  -C <configs>        = Select build configurations
+  -D <var>=<value>    = Set a CPack variable
+  --config <file>     = Select the CPack config file
+  -P <name>           = Set the package name
+  -R <version>        = Set the package version
+  -B <dir>            = Set the package directory
+  --vendor <name>     = Set the package vendor
+  --preset <name>     = Use a package preset
+  --presets-file <file> = Select a presets file
+  --list-presets      = List available package presets
+  -V, --verbose       = Enable verbose output
+  --debug             = Enable debug output
+  --trace             = Trace CMake scripts
+  --trace-expand      = Trace CMake scripts with variables expanded
+  --version           = Print the version
+  --help              = Print this help
+
+Generators
+  TGZ TXZ TZST TBZ2 TZ TAR ZIP ZIP_DEFLATE ZIP_STORE External Bundle DragNDrop
