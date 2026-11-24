@@ -344,8 +344,8 @@ fn run_tool(
     verbose: bool,
 ) -> Result<RunOutput> {
     let program = from_native(executable);
+    let windows = cx.host.system().sysname.eq_ignore_ascii_case(b"Windows");
     let command = || {
-        let windows = cx.host.system().sysname.eq_ignore_ascii_case(b"Windows");
         let mut command = BString::from(if windows { "&" } else { "" });
         for arg in std::iter::once(&program).chain(&args) {
             if !command.is_empty() {
@@ -367,12 +367,22 @@ fn run_tool(
         command
     };
     if verbose {
-        let message = format!("Running {}\n", command());
+        let prefix = if windows {
+            "Running PowerShell command: "
+        } else {
+            "Running "
+        };
+        let message = format!("{prefix}{}\n", command());
         cx.host.write_out(Stream::Stdout, message.as_bytes());
     }
     let failure = |status: &dyn std::fmt::Display| {
+        let label = if windows {
+            "PowerShell command"
+        } else {
+            "Command"
+        };
         format!(
-            "The tool failed.\nCommand: {}\nWorking directory: {}\nStatus: {status}\n",
+            "The tool failed.\n{label}: {}\nWorking directory: {}\nStatus: {status}\n",
             command(),
             cwd.display(),
         )

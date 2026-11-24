@@ -583,7 +583,8 @@ fn requeries_an_updated_autorcc_manifest_and_refreshes_on_info_timestamp() {
     seed(&host, "/src/form.qrc", b"<RCC><file>new.txt</file></RCC>");
     assert_eq!(action(&host, run_rcc, &[RCC_INFO]), 0);
     assert_eq!(action(&host, run_rcc, &[RCC_INFO]), 1);
+    assert_eq!(calls.lock().unwrap().len(), 2);
     seed(&host, "/src/new.txt", b"new");
     assert_eq!(action(&host, run_rcc, &[RCC_INFO]), 0);
-    assert_eq!(calls.lock().unwrap().len(), 2);
+    assert_eq!(calls.lock().unwrap().len(), 3);
 }

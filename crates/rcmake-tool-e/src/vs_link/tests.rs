@@ -33,9 +33,11 @@ fn expands_nmake_response_files_and_retains_cmake_response_files() {
         host.env_set(b"Path", Some(b"C:/Existing Path"));
         host.seed_file(
             Path::new("/work/link args.rsp"),
-            br#"/OUT:"target dir/main.exe" /INCREMENTAL:NO "/DKEY=\"with space\"" "C:\object dir\leaf\\" "my'file.obj""#,
+            br#"/OUT:"target dir/main.exe" /INCREMENTAL:NO "/DKEY=\"with space\"" "C:\object dir\leaf\\" "my'file.obj" @child.rsp"#,
         )
         .unwrap();
+        host.seed_file(Path::new("/work/child.rsp"), b"unused.obj")
+            .unwrap();
         host.set_command_handler(move |_, request, _| {
             assert_eq!(request.pipeline[0].program, "C:/VC Tools/link.exe");
             assert_eq!(
@@ -46,6 +48,7 @@ fn expands_nmake_response_files_and_retains_cmake_response_files() {
                     "/DKEY=\"with space\"",
                     "C:\\object dir\\leaf\\",
                     "my'file.obj",
+                    "@child.rsp",
                     "@CMakeFiles/objects.rsp",
                     "@.o/first.rsp",
                     "@.o\\second.rsp",
@@ -69,6 +72,7 @@ fn expands_nmake_response_files_and_retains_cmake_response_files() {
                     "extra file.manifest",
                     "--",
                     "C:/VC Tools/link.exe",
+                    "@missing.rsp",
                     "@link args.rsp",
                     "@CMakeFiles/objects.rsp",
                     "@.o/first.rsp",
@@ -110,9 +114,10 @@ fn retains_manifest_no_and_adds_an_embed_option_for_explicit_input() {
 
         assert_eq!(command(&host, b"vs_link_exe", &args), -1);
         assert!(
-            host.stream_bytes(Stream::Stderr)
-                .contains_str(b"LINK: command link /Fe 'target path/main.exe' /MANIFEST:NO")
+            host.stream_bytes(Stream::Stdout)
+                .contains_str(b"LINK: command \"link /Fe target path/main.exe /MANIFEST:NO")
         );
+        assert!(host.stream_bytes(Stream::Stderr).is_empty());
     }
 }
 
@@ -222,26 +227,65 @@ fn propagates_each_incremental_tool_failure() {
                     "/out:demo.exe",
                 ]
             ),
-            if program == "mt" { exit_code } else { -1 }
+            -1
         );
-        assert!(
-            host.stream_bytes(Stream::Stderr)
-                .contains_str(b"tool diagnostic\n")
-        );
+        let stdout = host.stream_bytes(Stream::Stdout);
+        let code = if program == "mt" {
+            format!("{exit_code:#x}")
+        } else {
+            exit_code.to_string()
+        };
+        assert!(stdout.contains_str(format!("failed (exit code {code})")));
+        assert!(stdout.ends_with(b"tool diagnostic\n"));
+        assert!(host.stream_bytes(Stream::Stderr).is_empty());
     }
 }
 
 #[test]
-fn uses_mt_with_older_linkers_and_reports_response_errors() {
-    let host = PureHost::default();
-    host.seed_file(Path::new("/work/nested.rsp"), b"@another.rsp")
-        .unwrap();
-    for name in ["@nested.rsp", "@missing.rsp"] {
-        assert_ne!(
-            command(&host, b"vs_link_exe", &["--intdir=obj", "--", "link", name]),
+fn prints_successful_tool_output_only_in_verbose_mode() -> rcmake_host::HostResult<()> {
+    for verbose in [false, true] {
+        let host = PureHost::default();
+        if verbose {
+            host.env_set(b"VERBOSE", Some(b""));
+        }
+        host.set_command_handler(|_, _, _| {
+            Ok(RunOutput {
+                stdout: b"from stdout\n".to_vec(),
+                stderr: b"from stderr\n".to_vec(),
+                ..exit(0)
+            })
+        })?;
+        assert_eq!(
+            command(
+                &host,
+                b"vs_link_exe",
+                &[
+                    "--intdir=obj",
+                    "--",
+                    "link",
+                    "/out:demo.exe",
+                    "/MANIFEST:NO"
+                ],
+            ),
             0
         );
+        let output = host.stream_bytes(Stream::Stdout);
+        if verbose {
+            assert_eq!(
+                output,
+                b"Visual Studio Non-Incremental Link\nLINK:\nlink /out:demo.exe /MANIFEST:NO\nfrom stdout\nfrom stderr\n",
+            );
+        } else {
+            assert!(output.is_empty());
+        }
+        assert!(host.stream_bytes(Stream::Stderr).is_empty());
     }
+    Ok(())
+}
+
+#[test]
+fn uses_mt_with_older_linkers() {
+    let host = PureHost::default();
     host.seed_file(Path::new("/work/wrapper.rsp"), br#"--msvc-ver=1600 "--intdir=obj dir" --manifests "extra file.manifest" -- link "/out:main file.exe""#).unwrap();
     host.set_command_handler(|host, request, _| {
         let tool = &request.pipeline[0];

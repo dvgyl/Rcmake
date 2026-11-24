@@ -41,8 +41,9 @@ pub struct Edit {
 }
 
 impl Edit {
-    /// Get the range and replacement if they are valid for this UTF-8 source.
-    pub(crate) fn validate(&self, text: &str) -> Option<(Range<usize>, &str)> {
+    /// Get the byte range and replacement if both are valid for `text`.
+    #[must_use]
+    pub fn validate(&self, text: &str) -> Option<(Range<usize>, &str)> {
         let start = usize::try_from(self.span.start).ok()?;
         let end = usize::try_from(self.span.end).ok()?;
         let range = start..end;

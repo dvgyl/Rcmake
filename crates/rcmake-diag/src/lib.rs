@@ -3,6 +3,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod annotate;
 pub mod backtrace;
 pub mod category;
 #[allow(missing_docs)]
@@ -10,6 +11,7 @@ pub mod generated_policies;
 pub mod policy;
 pub mod render;
 pub mod source;
+pub mod suggest;
 
 use std::collections::BTreeMap;
 

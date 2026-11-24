@@ -62,15 +62,28 @@ pub(super) fn prepare_outputs(
 pub(super) fn shell_command(
     host: &dyn Host,
     cwd: &Path,
-    command: &[u8],
+    command: BatchRule<'_>,
 ) -> Result<(CommandSpec, PathBuf), HostError> {
     // cmd.exe uses its own parser for /C. Put the script in a file so that the
     // native process adapter only needs to pass simple arguments.
     static SEQUENCE: AtomicU64 = AtomicU64::new(0);
     let pid = host.system().pid;
     let mut contents = Vec::from(b"@echo off\r\n".as_slice());
-    let rule = batch::render(command, |args| prepare_outputs(host, cwd, args))?;
-    contents.extend_from_slice(&rule);
+    match command {
+        BatchRule::Native(rule) => {
+            if rule.contains(&0) {
+                return Err(HostError::unsupported(
+                    "The Windows build rule contains a null byte.",
+                ));
+            }
+            contents.extend_from_slice(rule);
+        }
+        BatchRule::Lowered(rule) => {
+            contents.extend(batch::render(rule, |args| {
+                prepare_outputs(host, cwd, args)
+            })?);
+        }
+    }
     contents.extend_from_slice(b"\r\n");
     let program = host
         .env_all()
@@ -102,9 +115,14 @@ pub(super) fn shell_command(
     ))
 }
 
-pub(super) fn batch_rule(invocation: &Invocation) -> Option<(&[BString], &[u8])> {
+pub(super) enum BatchRule<'a> {
+    Native(&'a [u8]),
+    Lowered(&'a [u8]),
+}
+
+pub(super) fn batch_rule(invocation: &Invocation) -> Option<(&[BString], BatchRule<'_>)> {
     match invocation.argv.as_slice() {
-        [] => Some((&[], &invocation.shell)),
+        [] => Some((&[], BatchRule::Native(&invocation.shell))),
         [launcher @ .., program, option, command]
             if program == b"sh"
                 && option == b"-c"
@@ -113,7 +131,7 @@ pub(super) fn batch_rule(invocation: &Invocation) -> Option<(&[BString], &[u8])>
                         && (invocation.shell.ends_with(command)
                             || invocation.shell.ends_with(&quote(command))))) =>
         {
-            Some((launcher, command))
+            Some((launcher, BatchRule::Lowered(command)))
         }
         _ => None,
     }

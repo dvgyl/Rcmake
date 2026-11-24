@@ -298,7 +298,7 @@ fn write_items(xml: &mut Writer, ctx: &Context<'_>, plan: &Plan, custom: bool) {
     xml.start("ItemGroup", &[]);
     for item in items {
         if matches!(item.kind, Kind::Cuda | Kind::Masm | Kind::Nasm) {
-            ctx.write_tool_item(xml, item);
+            ctx.write_tool_item(xml, item, plan);
             continue;
         }
         let path = msbuild(&windows(&item.path));

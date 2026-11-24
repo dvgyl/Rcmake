@@ -12,8 +12,15 @@ pub(super) fn render(
     let mut word = BString::default();
     let mut active = false;
     let mut quote = None;
+    let mut word_start = 0;
+    let mut native_escape = false;
     let mut bytes = rule.iter().copied().peekable();
     while let Some(byte) = bytes.next() {
+        let offset = rule.len() - bytes.len() - 1;
+        if !active {
+            word_start = offset;
+        }
+        let spelling = rule.get(word_start..offset).filter(|_| native_escape);
         match (quote, byte) {
             (_, 0) | (Some(_), b'\r' | b'\n') => return Err(invalid_rule()),
             (Some(delimiter), byte) if delimiter == byte => quote = None,
@@ -46,7 +53,17 @@ pub(super) fn render(
                 }
                 active = true;
             }
-            (None, b' ' | b'\t') => flush(&mut result, &mut words, &mut word, &mut active),
+            (None, b'^') if bytes.peek().is_some_and(|byte| b"\"&|<>()^".contains(byte)) => {
+                if let Some(escaped) = bytes.next() {
+                    word.push(escaped);
+                    active = true;
+                    native_escape = true;
+                }
+            }
+            (None, b' ' | b'\t') => {
+                flush(&mut result, &mut words, &mut word, &mut active, spelling);
+                native_escape = false;
+            }
             (None, b'&' | b'|' | b'<' | b'>' | b'(' | b')' | b'\r' | b'\n') => {
                 let mut operator = Vec::new();
                 if matches!(byte, b'<' | b'>')
@@ -70,7 +87,8 @@ pub(super) fn render(
                     b'\r' if bytes.next_if_eq(&b'\n').is_some() => operator.push(b'\n'),
                     _ => {}
                 }
-                flush(&mut result, &mut words, &mut word, &mut active);
+                flush(&mut result, &mut words, &mut word, &mut active, spelling);
+                native_escape = false;
                 if !matches!(byte, b'<' | b'>') {
                     prepare(words.get(1..).unwrap_or_default())?;
                     words.clear();
@@ -87,7 +105,8 @@ pub(super) fn render(
     if quote.is_some() {
         return Err(invalid_rule());
     }
-    flush(&mut result, &mut words, &mut word, &mut active);
+    let spelling = rule.get(word_start..).filter(|_| native_escape);
+    flush(&mut result, &mut words, &mut word, &mut active, spelling);
     prepare(words.get(1..).unwrap_or_default())?;
     Ok(result)
 }
@@ -96,10 +115,20 @@ fn invalid_rule() -> HostError {
     HostError::unsupported("The Windows build rule contains an invalid argument.")
 }
 
-fn flush(result: &mut Vec<u8>, words: &mut Vec<BString>, word: &mut BString, active: &mut bool) {
+fn flush(
+    result: &mut Vec<u8>,
+    words: &mut Vec<BString>,
+    word: &mut BString,
+    active: &mut bool,
+    spelling: Option<&[u8]>,
+) {
     if *active {
         separator(result);
-        quote_argument(result, word);
+        if let Some(spelling) = spelling {
+            result.extend_from_slice(spelling);
+        } else {
+            quote_argument(result, word);
+        }
         words.push(std::mem::take(word));
         *active = false;
     }

@@ -46,9 +46,7 @@ fn build_jobs_use_the_unsigned_integer_range() {
     let build = named(&presets, PresetKind::Build, "build");
     assert!(matches!(build.settings, PresetSettings::Build(settings)
         if settings.jobs == Some(u32::MAX)));
-    let error = root(&document("-10"))
-        .err()
-        .expect("invalid build job count");
+    let error = root(&document("-10")).expect_err("invalid build job count");
     assert!(
         error
             .message

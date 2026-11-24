@@ -407,7 +407,7 @@ fn is_missing(kind: ErrorKind) -> bool {
     matches!(kind, ErrorKind::NotFound | ErrorKind::NotADirectory)
 }
 
-fn same_bytes(first: &Path, second: &Path, cx: &ToolCtx<'_>) -> HostResult<bool> {
+pub(super) fn same_bytes(first: &Path, second: &Path, cx: &ToolCtx<'_>) -> HostResult<bool> {
     const CHUNK: u64 = 64 * 1024;
     let mut offset = 0;
     loop {

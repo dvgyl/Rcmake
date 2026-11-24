@@ -1,5 +1,7 @@
 //! Expand NMake response files and retain CMake-owned response file arguments.
 
+use std::io::ErrorKind;
+
 use rcmake_base::BString;
 use rcmake_host::{CommandSpec, ReadRange};
 
@@ -53,17 +55,21 @@ fn retained(arg: &[u8]) -> bool {
 }
 
 fn read(cx: &ToolCtx<'_>, file: &[u8], budget: &mut u64) -> Result<Vec<BString>, String> {
-    let contents = cx
+    let contents = match cx
         .host
         .read(&path(cx, file), ReadRange::All { limit: *budget })
-        .map_err(|err| {
-            format!(
+    {
+        Ok(contents) => contents,
+        Err(err) if err.kind == ErrorKind::FileTooLarge => {
+            return Err(format!(
                 "Cannot read linker response file '{}'. {err}",
                 BString::from(file)
-            )
-        })?;
+            ));
+        }
+        Err(_) => return Ok(Vec::new()),
+    };
     *budget = budget.saturating_sub(contents.len() as u64);
-    let words = if let Some(utf16) = contents.strip_prefix(b"\xff\xfe") {
+    if let Some(utf16) = contents.strip_prefix(b"\xff\xfe") {
         let (units, remainder) = utf16.as_chunks::<2>();
         if !remainder.is_empty() {
             return Err("The linker response file contains incomplete UTF-16.".into());
@@ -75,14 +81,7 @@ fn read(cx: &ToolCtx<'_>, file: &[u8], budget: &mut u64) -> Result<Vec<BString>,
         words(text.as_bytes())
     } else {
         words(contents.strip_prefix(b"\xef\xbb\xbf").unwrap_or(&contents))
-    }?;
-    if words
-        .iter()
-        .any(|word| word.starts_with(b"@") && !retained(word))
-    {
-        return Err("The linker response file contains a nested response file.".into());
     }
-    Ok(words)
 }
 
 fn words(input: &[u8]) -> Result<Vec<BString>, String> {

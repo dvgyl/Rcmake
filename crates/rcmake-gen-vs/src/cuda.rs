@@ -53,6 +53,15 @@ impl OptionText<'_> {
     }
 }
 
+/// A CUDA output mode and its file extension.
+#[derive(Clone, Copy)]
+pub(crate) struct CompileMode {
+    /// Value of the MSBuild CUDA compilation property.
+    pub(crate) nvcc: &'static str,
+    /// File extension without the period.
+    pub(crate) extension: &'static str,
+}
+
 /// CUDA compiler properties for one project configuration.
 #[derive(Default)]
 pub(crate) struct CompileOptions<'a> {
@@ -66,6 +75,8 @@ pub(crate) struct CompileOptions<'a> {
     pub(crate) platform: &'a str,
     /// Whether the compiler must generate relocatable device code.
     pub(crate) separable: bool,
+    /// Alternate output mode, if the target requests one.
+    pub(crate) mode: Option<CompileMode>,
     /// Ordered include directories.
     pub(crate) includes: &'a [String],
     /// Preprocessor definitions.
@@ -104,6 +115,15 @@ pub(crate) fn compile_options(xml: &mut Writer, options: &CompileOptions<'_>) {
         if options.separable { "true" } else { "false" },
     );
     xml.text("UseHostInclude", &[], "false");
+    if let Some(mode) = options.mode {
+        xml.text("NvccCompilation", &[], mode.nvcc);
+    }
+    let extension = options.mode.map_or("obj", |mode| mode.extension);
+    xml.text(
+        "CompileOut",
+        &[],
+        &format!("$(IntDir)%(Filename).{extension}"),
+    );
     xml.text(
         "Optimization",
         &[],
@@ -455,7 +475,7 @@ mod tests {
             },
         );
         let text = xml.finish();
-        assert!(text.contains("<CudaLink Condition=\"'$(Configuration)'=='Debug'\">\r\n    <PerformDeviceLink>false</PerformDeviceLink>"));
+        assert!(text.contains("<CudaLink Condition=\"'$(Configuration)'=='Debug'\">\r\n  <PerformDeviceLink>false</PerformDeviceLink>"));
         assert!(text.contains("<PerformDeviceLink>true</PerformDeviceLink>"));
         assert!(text.contains(r"<AdditionalDependencies>obj\kernel.obj</AdditionalDependencies>"));
         assert!(text.contains("<AdditionalOptions>-Xnvlink=-v</AdditionalOptions>"));
@@ -537,7 +557,7 @@ mod tests {
         additional_options(
             &mut xml,
             [
-                OptionText::Literal(r#"-DNAME="a&b;$(Literal)"#),
+                OptionText::Literal(r#"-DNAME="a&b;$(Literal)""#),
                 OptionText::WithProperties(r#"-I"$(IntDir)one;two""#),
             ],
             false,

@@ -4,7 +4,7 @@ use rcmake_base::list;
 use rcmake_host::{Host, ReadRange, path::to_native};
 use rcmake_resolve::{ide::IdeLinkItem, usage::UsageResolver};
 
-use crate::cuda::{self, Assembler, ImportKind, OptionText, SourceOptions};
+use crate::cuda::{self, Assembler, CompileMode, ImportKind, OptionText, SourceOptions};
 
 use super::*;
 
@@ -16,6 +16,7 @@ pub(super) struct CudaConfig {
     architectures: Vec<String>,
     runtime: Option<String>,
     separable: bool,
+    mode: Option<CompileMode>,
     device_link: bool,
     dependencies: Vec<String>,
 }
@@ -61,12 +62,12 @@ impl Context<'_> {
         if plan.configs.values().any(|config| config.cuda.is_some())
             && let Some(version) = &self.settings.cuda_version
         {
-            let integration = self
-                .settings
-                .cuda_toolkit
-                .as_ref()
-                .map(|root| join(root, "extras/visual_studio_integration/MSBuildExtensions"));
-            cuda::cuda_import(xml, kind, version, integration.as_deref());
+            cuda::cuda_import(
+                xml,
+                kind,
+                version,
+                self.settings.cuda_integration.as_deref(),
+            );
         }
         if plan.items.values().any(|item| item.kind == Kind::Masm) {
             cuda::masm_import(xml, kind);
@@ -208,6 +209,18 @@ impl Context<'_> {
                 .find(|compile| compile.language == b"CUDA")
         });
         let (includes, defines, options) = compile_values(compile);
+        let mut mode = None;
+        for (key, nvcc, extension) in [
+            (b"CUDA_PTX_COMPILATION".as_slice(), "ptx", "ptx"),
+            (b"CUDA_CUBIN_COMPILATION", "cubin", "cubin"),
+            (b"CUDA_FATBIN_COMPILATION", "fatbin", "fatbin"),
+            (b"CUDA_OPTIX_COMPILATION", "optix-ir", "optixir"),
+        ] {
+            if property(key, None)?.is_some_and(|value| truth::is_on(&value)) {
+                mode = Some(CompileMode { nvcc, extension });
+                break;
+            }
+        }
         config.cuda = Some(CudaConfig {
             includes,
             defines,
@@ -215,6 +228,7 @@ impl Context<'_> {
             architectures,
             runtime,
             separable,
+            mode,
             device_link,
             dependencies,
         });
@@ -266,6 +280,7 @@ impl Context<'_> {
                 platform: &self.settings.platform,
                 runtime: config.runtime.as_deref(),
                 separable: config.separable,
+                mode: config.mode,
                 includes: &config.includes,
                 defines: &config.defines,
                 architecture_flags: &config.architectures,
@@ -286,7 +301,7 @@ impl Context<'_> {
         );
     }
 
-    pub(super) fn write_tool_item(&self, xml: &mut crate::xml::Writer, item: &Item) {
+    pub(super) fn write_tool_item(&self, xml: &mut crate::xml::Writer, item: &Item, plan: &Plan) {
         for (name, config) in &item.configs {
             if config.excluded {
                 continue;
@@ -339,7 +354,17 @@ impl Context<'_> {
             } else {
                 None
             };
-            let output = windows(&config.object);
+            let output = if item.kind == Kind::Cuda
+                && let Some(mode) = plan
+                    .configs
+                    .get(name)
+                    .and_then(|config| config.cuda.as_ref()?.mode)
+                && let Some((stem, _)) = config.object.rsplit_once('.')
+            {
+                windows(&format!("{stem}.{}", mode.extension))
+            } else {
+                windows(&config.object)
+            };
             let flags = options.join(" ");
             let condition = self.settings.condition(name);
             let source = SourceOptions {

@@ -8,7 +8,7 @@ mod tests;
 use std::io::ErrorKind;
 use std::time::Duration;
 
-use rcmake_base::{BString, ByteSlice, shell::quote};
+use rcmake_base::{BString, ByteSlice};
 use rcmake_host::{
     CommandSpec, FileKind, Follow, Input, Output, ProcessResult, RunRequest, Stream, WriteMode,
     path::{from_native, to_native},
@@ -114,6 +114,14 @@ impl Link {
 
     fn run(mut self, cx: &ToolCtx<'_>) -> Result<i32, String> {
         let embed = self.linker_generates || !self.manifests.is_empty();
+        if cx.host.env_get(b"VERBOSE").is_some() {
+            let banner: &[u8] = match (self.incremental, embed) {
+                (true, true) => b"Visual Studio Incremental Link with embedded manifests\n",
+                (true, false) => b"Visual Studio Incremental Link without manifests\n",
+                (false, _) => b"Visual Studio Non-Incremental Link\n",
+            };
+            cx.host.write_out(Stream::Stdout, banner);
+        }
         if !embed {
             let fallback = self.linker_embeds.then(|| rc_directory(&self.rc)).flatten();
             return Ok(run_tool(cx, "LINK", &self.tool, fallback, false));
@@ -246,7 +254,7 @@ impl Link {
             program: self.mt.clone(),
             args,
         };
-        Ok(run_tool(cx, "MT", &mt, None, notify))
+        Ok(run_tool(cx, "MT", &mt, None, true))
     }
 
     fn intermediate(&self, file: &str) -> BString {
@@ -311,7 +319,7 @@ fn run_tool(
     stage: &str,
     tool: &CommandSpec,
     fallback: Option<&[u8]>,
-    accept_update: bool,
+    manifest_tool: bool,
 ) -> i32 {
     let mut env = cx.host.env_all();
     if let Some(dir) = fallback {
@@ -341,14 +349,15 @@ fn run_tool(
     let command = || {
         std::iter::once(&tool.program)
             .chain(&tool.args)
-            .map(|arg| quote(arg))
+            .map(|arg| arg.as_slice())
             .collect::<Vec<_>>()
             .join(b" ".as_slice())
     };
-    if cx.host.env_get(b"VERBOSE").is_some() {
+    let verbose = cx.host.env_get(b"VERBOSE").is_some();
+    if verbose {
         cx.host.write_out(
             Stream::Stdout,
-            &[stage.as_bytes(), b": ", &command(), b"\n"].concat(),
+            &[stage.as_bytes(), b":\n", &command(), b"\n"].concat(),
         );
     }
 
@@ -371,31 +380,38 @@ fn run_tool(
                 Some(ProcessResult::SpawnFailed(_)) => 127,
                 None => 1,
             };
-            if status == 0 || (accept_update && mt_updated(status)) {
-                cx.host.write_out(Stream::Stdout, &result.stdout);
-                cx.host.write_out(Stream::Stderr, &result.stderr);
+            let mut output = result.stdout;
+            output.extend(result.stderr);
+            if status == 0 || (manifest_tool && mt_updated(status)) {
+                if verbose && !output.contains_str(b"Resource Compiler Version") {
+                    cx.host.write_out(Stream::Stdout, &output);
+                }
                 return status;
             }
+            let code = if manifest_tool {
+                format!("{status:#x}")
+            } else {
+                status.to_string()
+            };
             cx.host.write_out(
-                Stream::Stderr,
+                Stream::Stdout,
                 &[
-                    format!("{stage}: command ").as_bytes(),
+                    format!("{stage}: command \"").as_bytes(),
                     &command(),
-                    format!(" failed (exit code {status}) with the following output:\n").as_bytes(),
-                    &result.stdout,
-                    &result.stderr,
+                    format!("\" failed (exit code {code}) with the following output:\n").as_bytes(),
+                    &output,
                 ]
                 .concat(),
             );
             if let Some(ProcessResult::SpawnFailed(error)) = result.results.first() {
                 cx.host
-                    .write_out(Stream::Stderr, format!("{error}\n").as_bytes());
+                    .write_out(Stream::Stdout, format!("{error}\n").as_bytes());
             }
-            if stage == "MT" { status } else { -1 }
+            -1
         }
         Err(err) => {
             cx.host.write_out(
-                Stream::Stderr,
+                Stream::Stdout,
                 &[
                     format!("{stage}: Cannot run ").as_bytes(),
                     &command(),

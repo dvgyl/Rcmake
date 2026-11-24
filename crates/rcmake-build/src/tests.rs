@@ -475,29 +475,34 @@ fn windows_build_processes_use_argv_and_prepare_side_output_paths() {
 }
 
 #[test]
-fn windows_shell_fragment_runs_from_a_temporary_command_file() {
+fn windows_shell_fragment_runs_from_a_temporary_command_file() -> Result<(), HostError> {
     let host = PureHost::default();
     host.env_set(b"ComSpec", Some(b"C:/Windows/System32/cmd.exe"));
     let script = Arc::new(Mutex::new(PathBuf::new()));
     let observed = Arc::clone(&script);
-    let cmd = r#"echo "a file's contents" > "spaced file" && link.exe /out:demo.exe"#;
+    let cmd = concat!(
+        r#"echo one^&two 100%% | find "a file's contents" > "spaced file""#,
+        r#" && link.exe /out:demo.exe "C:\trailing space\" 2>&1"#,
+    );
     host.set_command_handler(move |host, request, _| {
-        let tool = &request.pipeline[0];
+        let [tool] = request.pipeline.as_slice() else {
+            return Err(HostError::unsupported("Expected one command."));
+        };
         assert_eq!(tool.program, "C:/Windows/System32/cmd.exe");
-        assert_eq!(tool.args[..3], ["/D", "/V:OFF", "/C"]);
-        let name = tool.args[3].strip_prefix(b".\\").unwrap();
+        let name = batch_test_name(&tool.args)?;
         let path = request.cwd.join(path::to_native(name));
         assert_eq!(
             host.read(&path, ReadRange::All { limit: 1024 })?,
             format!("@echo off\r\n{cmd}\r\n").as_bytes()
         );
-        *observed.lock().unwrap() = path;
+        *observed
+            .lock()
+            .map_err(|error| HostError::unsupported(error.to_string()))? = path;
         Ok(RunOutput {
             results: vec![ProcessResult::Exited(9)],
             ..RunOutput::default()
         })
-    })
-    .unwrap();
+    })?;
     let invocation = Invocation {
         shell: cmd.into(),
         ..Invocation::default()
@@ -510,34 +515,36 @@ fn windows_shell_fragment_runs_from_a_temporary_command_file() {
             true,
             false,
             &mut Vec::new()
-        )
-        .unwrap(),
+        )?,
         9
     );
+    let script = script
+        .lock()
+        .map_err(|error| HostError::unsupported(error.to_string()))?;
     assert_eq!(
-        host.metadata(&script.lock().unwrap(), Follow::No)
-            .unwrap_err()
-            .kind,
+        host.metadata(&script, Follow::No).unwrap_err().kind,
         std::io::ErrorKind::NotFound
     );
+    Ok(())
 }
 
 #[test]
-fn windows_compound_rule_uses_comspec_and_preserves_literal_arguments() {
+fn windows_compound_rule_uses_comspec_and_preserves_literal_arguments() -> Result<(), HostError> {
     use rcmake_base::shell::quote;
 
     let host = PureHost::default();
     host.env_set(b"COMSPEC", Some(b"C:/Windows/System32/cmd.exe"));
     host.set_command_handler(|host, request, _| {
-        let tool = &request.pipeline[0];
+        let [tool] = request.pipeline.as_slice() else {
+            return Err(HostError::unsupported("Expected one command."));
+        };
         assert_eq!(tool.program, "C:/Windows/System32/cmd.exe");
-        assert_eq!(tool.args[..3], ["/D", "/V:OFF", "/C"]);
-        let path = request.cwd.join(path::to_native(&tool.args[3][2..]));
+        let path = request.cwd.join(path::to_native(batch_test_name(&tool.args)?));
         assert_eq!(
             host.read(&path, ReadRange::All { limit: 1024 })?,
             concat!(
                 "@echo off\r\n",
-                r#""C:\MSVC Tools\cl.exe" "C:\100%% complete\\" && link.exe "/PDB:symbol dir\build%%PATH%%.pdb""#,
+                r#""C:\MSVC Tools\cl.exe" "C:\100%% complete\\" && link.exe "/PDB:symbol dir\build%%PATH%%.pdb" && echo one^&two"#,
                 "\r\n"
             ).as_bytes(),
         );
@@ -546,9 +553,9 @@ fn windows_compound_rule_uses_comspec_and_preserves_literal_arguments() {
             results: vec![ProcessResult::Exited(0)],
             ..RunOutput::default()
         })
-    }).unwrap();
+    })?;
     let shell = BString::from(format!(
-        "{} {} && link.exe {}",
+        "{} {} && link.exe {} && echo one^&two",
         quote(br"C:\MSVC Tools\cl.exe"),
         quote(br"C:\100% complete\"),
         quote(br"/PDB:symbol dir\build%PATH%.pdb"),
@@ -566,8 +573,23 @@ fn windows_compound_rule_uses_comspec_and_preserves_literal_arguments() {
             true,
             false,
             &mut Vec::new()
-        )
-        .unwrap(),
+        )?,
         0
     );
+    Ok(())
+}
+
+fn batch_test_name(args: &[BString]) -> Result<&[u8], HostError> {
+    let [defaults, expansion, execute, script] = args else {
+        return Err(HostError::unsupported(
+            "Expected the batch command arguments.",
+        ));
+    };
+    assert_eq!(
+        [defaults.as_slice(), expansion, execute],
+        [b"/D".as_slice(), b"/V:OFF", b"/C"]
+    );
+    script
+        .strip_prefix(b".\\")
+        .ok_or_else(|| HostError::unsupported("Expected a relative batch file path."))
 }

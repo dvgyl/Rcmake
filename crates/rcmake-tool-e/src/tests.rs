@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use rcmake_base::ByteSlice;
 use rcmake_host::{
     FileKind, FileTime, Follow, HostResult, Input, Output, ProcessResult, PureHost, RunOutput,
 };
@@ -528,33 +529,45 @@ fn bin2c_formats_bytes_and_expands_templates() -> HostResult<()> {
     f.seed("binary", b"\x00\xff")?;
     f.seed(
         "template",
-        b"int x[] = {@arr@};\r\nsize_t n = @len@; @other@\r\n",
+        b"int x[] = {@arr@};\r\nsize_t n = @len@; @other@\rX\r\n",
     )?;
-    assert_eq!(f.run(&["bin2c", "binary", "out/embedded.inc"]), 1);
-    assert!(f.host.metadata(&f.cwd.join("out"), Follow::Yes).is_err());
     f.seed("invalid", b"file")?;
     assert_eq!(f.run(&["bin2c", "binary", "invalid/embedded.inc"]), 1);
-    f.host.create_dir_all(&f.cwd.join("out"))?;
-    assert_eq!(
-        f.run(&[
-            "bin2c",
-            "--decimal",
-            "--trailing-comma",
-            "--template-file",
-            "template",
-            "--template-array-placeholder",
-            "arr",
-            "--template-length-placeholder",
-            "len",
-            "--",
-            "binary",
-            "out/embedded.inc",
-        ]),
-        0
+    assert!(
+        f.err()
+            .starts_with(b"CMake Error: Cannot open file for write: ")
     );
+    assert!(f.err().contains_str("embedded.inc.tmp"));
+    assert!(f.err().contains_str("System Error: "));
+    let args = [
+        "bin2c",
+        "--decimal",
+        "--trailing-comma",
+        "--template-file",
+        "template",
+        "--template-array-placeholder",
+        "arr",
+        "--template-length-placeholder",
+        "len",
+        "--",
+        "binary",
+        "out/nested/embedded.inc",
+    ];
+    assert_eq!(f.run(&args), 0);
     assert_eq!(
-        f.read("out/embedded.inc")?,
-        b"int x[] = {\n    0, 255,\n};\nsize_t n = 2; @other@\n"
+        f.read("out/nested/embedded.inc")?,
+        b"int x[] = {\n    0, 255,\n};\nsize_t n = 2; @other@\rX\n"
+    );
+    let output = f.cwd.join("out/nested/embedded.inc");
+    let timestamp = FileTime { secs: 7, nanos: 0 };
+    f.host.set_times(&output, None, Some(timestamp))?;
+    assert_eq!(f.run(&args), 0);
+    assert_eq!(f.host.metadata(&output, Follow::Yes)?.mtime, timestamp);
+    assert_eq!(f.host.read_dir(&f.cwd.join("out/nested"))?.len(), 1);
+    assert_eq!(f.run(&["bin2c", "--template-file=", "binary"]), 1);
+    assert!(
+        f.err()
+            .contains_str("Invalid value used with --template-file")
     );
     f.seed("template", b"prefix @length@ @array@")?;
     assert_eq!(

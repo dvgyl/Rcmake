@@ -804,7 +804,6 @@ fn dependency_flags_follow_only_evaluated_expressions() {
                 context_sensitive: true,
                 head_sensitive: true,
                 link_language_sensitive: true,
-                ..EvalFlags::default()
             },
         ),
         (

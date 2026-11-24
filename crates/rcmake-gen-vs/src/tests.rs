@@ -162,6 +162,69 @@ fn writes_link_output_directories_and_cuda_and_nasm_tool_imports() {
 }
 
 #[test]
+fn writes_cuda_output_modes_and_split_toolkit_imports() -> Result<(), Box<dyn std::error::Error>> {
+    let host = PureHost::default();
+    let bin = Path::new("/out");
+    let mut model = ProjectModel::default();
+    let toolkit = "/toolkit/CUDAVisualStudioIntegration";
+    host.create_dir_all(Path::new(toolkit))?;
+    model.generator_spec = GeneratorSpec::parse(
+        GeneratorKind::VisualStudio(VsVersion::Vs17),
+        b"cuda=/toolkit",
+        b"",
+        b"",
+        None,
+    )?;
+    let root = model.dir_mut(DirId::ROOT);
+    root.vars
+        .insert("CMAKE_CUDA_COMPILER_VERSION".into(), "12.6.91".into());
+    let modes = [
+        ("PTX", "ptx", "ptx"),
+        ("CUBIN", "cubin", "cubin"),
+        ("FATBIN", "fatbin", "fatbin"),
+        ("OPTIX", "optix-ir", "optixir"),
+    ];
+    for (property, _, _) in modes {
+        let mut app = target(property, TargetKind::ObjectLibrary, "kernel.cu");
+        app.props
+            .set(format!("CUDA_{property}_COMPILATION").into(), "ON".into());
+        model.add_target(app).expect("Add CUDA object library");
+    }
+    generate(
+        VsVersion::Vs17,
+        &GenerationResult::default(),
+        &model,
+        &host,
+        bin,
+    )?;
+    for (name, mode, extension) in modes {
+        let file = contents(&host, bin, &format!("{name}.vcxproj"));
+        for kind in ["props", "targets"] {
+            assert!(file.contains(&format!(
+                r"\toolkit\CUDAVisualStudioIntegration\extras\visual_studio_integration\MSBuildExtensions\CUDA 12.6.{kind}"
+            )));
+        }
+        assert!(file.contains(&format!("<NvccCompilation>{mode}</NvccCompilation>")));
+        assert!(file.contains(&format!(
+            "<CompileOut>$(IntDir)%(Filename).{extension}</CompileOut>"
+        )));
+        let suffix = format!(".{extension}</CompileOut>");
+        assert!(
+            file.lines()
+                .filter(|line| line.contains("<CompileOut>"))
+                .count()
+                > 1
+        );
+        assert!(
+            file.lines()
+                .filter(|line| line.contains("<CompileOut>"))
+                .all(|line| line.ends_with(&suffix))
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn build_plans_support_clean_parallel_targets_and_devenv() {
     let host = PureHost::default();
     let targets = ["app".into(), "lib.vcxproj".into()];

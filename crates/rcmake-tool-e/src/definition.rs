@@ -57,6 +57,7 @@ fn write_definition(
         .map_err(|err| err.to_string())?;
     let mut objects = Vec::new();
     let mut machines = BTreeMap::new();
+    let windows = cx.host.system().sysname.eq_ignore_ascii_case(b"Windows");
     for line in list
         .lines()
         .map(<[u8]>::trim_ascii)
@@ -86,6 +87,12 @@ fn write_definition(
             if !coff::exports(&file, &mut data, &mut exports)
                 .map_err(|message| format!("{}: {message}", object.display()))?
             {
+                if !can_use_nm(&file, windows) {
+                    return Err(format!(
+                        "{} is not a supported COFF object or LLVM bitcode.",
+                        object.display()
+                    ));
+                }
                 if nm.is_none() {
                     return Err(format!(
                         "{} is not a supported COFF object. Use --nm for LLVM bitcode.",
@@ -173,6 +180,10 @@ fn write_definition(
             .map_err(|err| err.to_string())?;
     }
     Ok(())
+}
+
+fn can_use_nm(file: &[u8], windows: bool) -> bool {
+    !windows || file.starts_with(b"BC\xc0\xde") || file.starts_with(b"\xde\xc0\x17\x0b")
 }
 
 fn definition_entries(contents: &[u8]) -> impl Iterator<Item = &[u8]> {

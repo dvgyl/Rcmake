@@ -65,7 +65,7 @@ fn merges_coff_and_explicit_exports_without_nm() {
 }
 
 #[test]
-fn sends_only_non_coff_objects_to_nm() {
+fn sends_only_non_coff_objects_to_nm() -> rcmake_host::HostResult<()> {
     let host = PureHost::default();
     let cwd = Path::new("/work");
     let ctx = ToolCtx {
@@ -74,14 +74,16 @@ fn sends_only_non_coff_objects_to_nm() {
         exe_display: b"cmake",
         capabilities: &|| rcmake_json::Value::Null,
     };
-    host.seed_file(&cwd.join("objects.rsp"), b"native.obj\nbitcode.obj\n")
-        .unwrap();
-    host.seed_file(&cwd.join("native.obj"), &object()).unwrap();
-    host.seed_file(&cwd.join("bitcode.obj"), b"BC\xc0\xde")
-        .unwrap();
+    host.seed_file(&cwd.join("objects.rsp"), b"native.obj\nbitcode.obj\n")?;
+    host.seed_file(&cwd.join("native.obj"), &object())?;
+    host.seed_file(&cwd.join("bitcode.obj"), b"BC\xc0\xde")?;
     host.set_command_handler(|host, request, _| {
-        let tool = &request.pipeline[0];
-        let response = tool.args.last().unwrap().strip_prefix(b"@").unwrap();
+        let response = request
+            .pipeline
+            .first()
+            .and_then(|tool| tool.args.last())
+            .and_then(|arg| arg.strip_prefix(b"@"))
+            .ok_or_else(|| rcmake_host::HostError::unsupported("Expected a response file."))?;
         assert_eq!(
             host.read(&native::to_native(response), read_all())?,
             b"\"bitcode.obj\"\n"
@@ -91,8 +93,7 @@ fn sends_only_non_coff_objects_to_nm() {
             stdout: b"bitcode.obj: _external@8 T 0 1\nbitcode.obj: ??_Gexcluded T 0 1\n".to_vec(),
             ..Default::default()
         })
-    })
-    .unwrap();
+    })?;
     assert_eq!(
         run(
             &["export.def".into(), "objects.rsp".into(), "--nm=nm".into()],
@@ -101,7 +102,17 @@ fn sends_only_non_coff_objects_to_nm() {
         0
     );
     assert_eq!(
-        host.read(&cwd.join("export.def"), read_all()).unwrap(),
+        host.read(&cwd.join("export.def"), read_all())?,
         b"EXPORTS \n\tvariable \t DATA\n\t_external\n\tfunction\n\tmore_than_eight\n"
     );
+    Ok(())
+}
+
+#[test]
+fn windows_nm_fallback_requires_an_llvm_bitcode_signature() {
+    assert!(can_use_nm(b"BC\xc0\xde", true));
+    assert!(can_use_nm(b"\xde\xc0\x17\x0b", true));
+    assert!(!can_use_nm(b"MZ\0\0", true));
+    assert!(!can_use_nm(b"BC", true));
+    assert!(can_use_nm(b"\x7fELF", false));
 }

@@ -10,7 +10,7 @@ use std::path::Path;
 
 use rcmake_base::{BString, list, path_lex::Lexical};
 use rcmake_gen_common::{GenError, write_if_changed};
-use rcmake_host::{Host, SystemInfo, path::from_native};
+use rcmake_host::{FileKind, Follow, Host, SystemInfo, path::from_native};
 use rcmake_model::{DirId, ParsedToolset, ProjectModel, VsVersion};
 use rcmake_resolve::GenerationResult;
 
@@ -45,6 +45,7 @@ pub(crate) struct Settings {
     tool_version: Option<String>,
     cuda_version: Option<String>,
     cuda_toolkit: Option<String>,
+    cuda_integration: Option<String>,
     nasm_templates: Option<String>,
     cmake: String,
     ctest: String,
@@ -184,6 +185,21 @@ impl Settings {
                 cuda_toolset.filter(|value| value.iter().any(|byte| matches!(byte, b'/' | b'\\')))
             })
             .map(|value| absolute(&bin, &string(value)));
+        let cuda_integration = cuda_toolkit.as_ref().map(|root| {
+            let split_root = join(root, "CUDAVisualStudioIntegration");
+            let root = if host
+                .metadata(
+                    &rcmake_host::path::to_native(split_root.as_bytes()),
+                    Follow::Yes,
+                )
+                .is_ok_and(|metadata| metadata.kind == FileKind::Dir)
+            {
+                &split_root
+            } else {
+                root
+            };
+            join(root, "extras/visual_studio_integration/MSBuildExtensions")
+        });
         let cuda_version = var(b"CMAKE_VS_PLATFORM_TOOLSET_CUDA")
             .or_else(|| cuda_toolset.filter(|_| cuda_toolkit.is_none()))
             .or_else(|| var(b"CMAKE_CUDA_COMPILER_VERSION"))
@@ -236,6 +252,7 @@ impl Settings {
                 .map(|value| string(value)),
             cuda_version,
             cuda_toolkit,
+            cuda_integration,
             nasm_templates,
             cmake: executable(
                 result.metadata.cmake_command.as_ref(),
