@@ -3,7 +3,7 @@ use rcmake_base::{
     path_lex::{self, Lexical},
 };
 
-use super::{Call, Evaluator, Value, boolean};
+use super::{Call, Evaluator, Value, boolean, operations::operation_arity};
 
 impl Evaluator<'_> {
     pub(super) fn path(&mut self, call: Call<'_>) -> Value {
@@ -24,100 +24,88 @@ impl Evaluator<'_> {
         }
 
         let args = self.arguments(call)?;
+        if call.params() < 2 {
+            return Err(call.error("$<PATH> expression requires at least two parameters."));
+        }
         let [op, rest @ ..] = args.as_slice() else {
-            return Err(call.error("$<PATH> expression requires at least one parameter."));
+            return Err(call.error("$<PATH> expression requires at least two parameters."));
         };
-        let arity = |n: usize| {
-            let suffix = if n == 1 {
-                "one parameter".into()
-            } else {
-                format!("{n} parameters")
-            };
-            call.error(format!(
-                "$<PATH:{op}> expression requires exactly {suffix}."
-            ))
-        };
-        let (option, rest) = match rest {
-            [option, rest @ ..]
-                if (option == "NORMALIZE"
-                    && matches!(
-                        op.as_slice(),
-                        b"IS_PREFIX" | b"CMAKE_PATH" | b"NATIVE_PATH" | b"ABSOLUTE_PATH"
-                    ))
-                    || (option == "LAST_ONLY"
-                        && matches!(
-                            op.as_slice(),
-                            b"GET_EXTENSION"
-                                | b"GET_STEM"
-                                | b"REMOVE_EXTENSION"
-                                | b"REPLACE_EXTENSION"
-                        )) =>
-            {
-                (true, rest)
+        let component = path_component(op);
+        let (count, allowed_modifier) = match op.as_slice() {
+            b"IS_PREFIX" | b"ABSOLUTE_PATH" => (2, Some("NORMALIZE")),
+            b"CMAKE_PATH" | b"NATIVE_PATH" => (1, Some("NORMALIZE")),
+            b"GET_EXTENSION" | b"GET_STEM" | b"REMOVE_EXTENSION" => (1, Some("LAST_ONLY")),
+            b"REPLACE_EXTENSION" => (2, Some("LAST_ONLY")),
+            b"REPLACE_FILENAME" | b"RELATIVE_PATH" => (2, None),
+            b"IS_ABSOLUTE" | b"IS_RELATIVE" | b"APPEND" | b"NORMAL_PATH" | b"REMOVE_FILENAME" => {
+                (1, None)
             }
-            _ => (false, rest),
+            _ if component.is_some() => (1, None),
+            _ => return Err(call.error(format!("{op}: invalid option."))),
         };
-
+        let (modifier, rest) = match (allowed_modifier, rest) {
+            (Some(modifier), [item, rest @ ..]) if item == modifier => (Some(modifier), rest),
+            _ => (None, rest),
+        };
+        let variadic = op == "APPEND";
+        let arity = || {
+            operation_arity(
+                call,
+                op,
+                modifier,
+                if variadic { "at least" } else { "exactly" },
+                count,
+            )
+        };
+        if rest.len() < count || (!variadic && rest.len() > count) {
+            return Err(arity());
+        }
         let [path, tail @ ..] = rest else {
-            return Err(arity(1));
+            return Err(arity());
         };
+        let option = modifier.is_some();
         let lexical = Lexical::new(path);
-        if let Some(component) = op.strip_prefix(b"HAS_") {
-            if !tail.is_empty() {
-                return Err(arity(1));
-            }
+        if let Some(component) = component.filter(|_| op.starts_with(b"HAS_")) {
             let has = component_value(lexical, component, false)
-                .ok_or_else(|| call.error("Invalid path component."))?;
+                .ok_or_else(|| call.error(format!("{op}: invalid option.")))?;
             return Ok(boolean(!has.is_empty()));
         }
         match op.as_slice() {
             b"IS_ABSOLUTE" | b"IS_RELATIVE" => {
-                if !tail.is_empty() {
-                    return Err(arity(1));
-                }
                 return Ok(boolean(lexical.absolute() == (op == "IS_ABSOLUTE")));
             }
             b"IS_PREFIX" => {
                 let [input] = tail else {
-                    return Err(arity(2));
+                    return Err(arity());
                 };
-                return Ok(boolean(
-                    !path.is_empty()
-                        && if option {
-                            Lexical::new(&lexical.normalize())
-                                .prefix(Lexical::new(&Lexical::new(input).normalize()))
-                        } else {
-                            lexical.prefix(Lexical::new(input))
-                        },
-                ));
+                if path.is_empty() {
+                    self.flags.context_sensitive = true;
+                    return Ok(boolean(
+                        self.host.directory_policy(b"CMP0223", call.ctx) == Some(false),
+                    ));
+                }
+                return Ok(boolean(if option {
+                    Lexical::new(&lexical.normalize())
+                        .prefix(Lexical::new(&Lexical::new(input).normalize()))
+                } else {
+                    lexical.prefix(Lexical::new(input))
+                }));
             }
             _ => {}
         }
 
-        let replacement = match op.as_slice() {
-            b"REPLACE_FILENAME" | b"REPLACE_EXTENSION" | b"ABSOLUTE_PATH" | b"RELATIVE_PATH" => {
-                let [value] = tail else {
-                    return Err(arity(2));
-                };
-                value.as_slice()
-            }
-            b"APPEND" => b"",
-            _ => {
-                if !tail.is_empty() {
-                    return Err(arity(1));
-                }
-                b""
-            }
-        };
+        let replacement = tail
+            .first()
+            .map_or(b"".as_slice(), |value| value.as_slice());
         let paths = split_paths(path);
         let mut out = BString::default();
         for (index, item) in paths.iter().enumerate() {
             let path = Lexical::new(item);
             let transformed = match op.as_slice() {
                 name if name.starts_with(b"GET_") => {
-                    let component = name.get(4..).unwrap_or_default();
+                    let component = component.unwrap_or_default();
                     component_value(path, component, option)
-                        .ok_or_else(|| call.error("Invalid path component."))?
+                        .ok_or_else(|| call.error(format!("{op}: invalid option.")))?
                 }
                 b"CMAKE_PATH" => {
                     let cmake = path_lex::cmake_style(item);
@@ -178,7 +166,7 @@ impl Evaluator<'_> {
                         value
                     }
                 }
-                _ => return Err(call.error("Invalid path operation.")),
+                _ => return Err(call.error(format!("{op}: invalid option."))),
             };
             if index != 0 {
                 self.append(&mut out, b";")?;
@@ -187,6 +175,24 @@ impl Evaluator<'_> {
         }
         Ok(out)
     }
+}
+
+fn path_component(operation: &[u8]) -> Option<&[u8]> {
+    let component = operation
+        .strip_prefix(b"GET_")
+        .or_else(|| operation.strip_prefix(b"HAS_"))?;
+    matches!(
+        component,
+        b"ROOT_NAME"
+            | b"ROOT_DIRECTORY"
+            | b"ROOT_PATH"
+            | b"FILENAME"
+            | b"EXTENSION"
+            | b"STEM"
+            | b"RELATIVE_PART"
+            | b"PARENT_PATH"
+    )
+    .then_some(component)
 }
 
 fn component_value(path: Lexical<'_>, component: &[u8], last: bool) -> Option<BString> {

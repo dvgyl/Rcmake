@@ -14,7 +14,7 @@ mod eval;
 mod parse;
 mod preprocess;
 
-pub use eval::evaluate;
+pub use eval::{evaluate, evaluate_diagnostics};
 pub use parse::{parse, render};
 pub use preprocess::{PreprocessMode, find_genex, genex_strip, rewrite_install_prefix, strip};
 
@@ -191,6 +191,51 @@ pub trait GenexHost {
         _ctx: &EvalContext,
     ) -> Result<BString, BString> {
         Ok(BString::default())
+    }
+
+    /// Check whether a source is registered in the selected directory.
+    fn source_exists(
+        &self,
+        _source: &[u8],
+        _scope: Option<(&[u8], &[u8])>,
+        _ctx: &EvalContext,
+    ) -> Result<bool, BString> {
+        Ok(false)
+    }
+
+    /// Check whether the target has a file set with this name.
+    fn file_set_exists(&self, _target: TargetHandle, _name: &[u8]) -> bool {
+        false
+    }
+
+    /// Read a raw property from an existing file set.
+    fn file_set_property(
+        &self,
+        _target: TargetHandle,
+        _name: &[u8],
+        _property: &[u8],
+    ) -> Option<BString> {
+        None
+    }
+
+    /// Read a global property.
+    fn global_property(&self, _name: &[u8]) -> Option<BString> {
+        None
+    }
+
+    /// Read a property from a directory. An error means that the directory is unknown.
+    fn directory_property(
+        &self,
+        _directory: &[u8],
+        _property: &[u8],
+        _ctx: &EvalContext,
+    ) -> Result<Option<BString>, BString> {
+        Ok(None)
+    }
+
+    /// Return the policy state in the evaluation directory, if known.
+    fn directory_policy(&self, _policy: &[u8], _ctx: &EvalContext) -> Option<bool> {
+        None
     }
 
     /// Raw (unevaluated) value of a non-transitive property.
@@ -391,6 +436,14 @@ pub enum GenexError {
         /// Target name.
         target: BString,
     },
+    /// An indirect generator expression cycle.
+    #[error("Dependency loop found.")]
+    DependencyLoop {
+        /// Expression where the loop was detected.
+        expression: BString,
+        /// Active expressions from the most recent to the least recent.
+        steps: Vec<BString>,
+    },
     /// An output property needs its own value to compute the artifact path.
     #[error("Target '{target}' {property} depends on itself.")]
     ArtifactCycle {
@@ -412,6 +465,7 @@ pub enum GenexError {
 pub struct GenexDiagnostic {
     frames: Vec<Frame>,
     body: BString,
+    steps: Vec<BString>,
     source_root: BString,
 }
 
@@ -424,21 +478,39 @@ impl std::fmt::Display for GenexDiagnostic {
             .fold(Backtrace::default(), |backtrace, frame| {
                 backtrace.push(frame.clone())
             });
-        let text = rcmake_diag::render(
-            &Diagnostic {
-                kind: MessageKind::Error,
-                effect: Effect::SetError,
-                category: None,
-                policy: None,
-                location: Location::Backtrace(backtrace),
-                body: self.body.clone(),
-            },
-            &RenderOptions {
-                relative_base: Some(self.source_root.clone()),
-                ..RenderOptions::default()
-            },
-        );
-        f.write_str(&String::from_utf8_lossy(&text))
+        let render = |body: BString| {
+            if backtrace.is_empty() {
+                let mut output = BString::from("CMake Error:\n");
+                output.extend_from_slice(&rcmake_diag::format_paragraphs(
+                    &body,
+                    2,
+                    RenderOptions::default().wrap_width,
+                ));
+                output.extend_from_slice(b"\n\n");
+                return output;
+            }
+            rcmake_diag::render(
+                &Diagnostic {
+                    kind: MessageKind::Error,
+                    effect: Effect::SetError,
+                    category: None,
+                    policy: None,
+                    location: Location::Backtrace(backtrace.clone()),
+                    body,
+                },
+                &RenderOptions {
+                    relative_base: Some(self.source_root.clone()),
+                    ..RenderOptions::default()
+                },
+            )
+        };
+        f.write_str(&String::from_utf8_lossy(&render(self.body.clone())))?;
+        for (index, step) in self.steps.iter().enumerate() {
+            f.write_str(&String::from_utf8_lossy(&render(
+                format!("Loop step {}\n  {step}\n", index + 1).into(),
+            )))?;
+        }
+        Ok(())
     }
 }
 
@@ -449,6 +521,19 @@ impl GenexError {
         if backtrace.is_empty() || matches!(self, Self::Located(_)) {
             return self;
         }
+        self.with_site(backtrace, source_root)
+    }
+
+    /// Format a diagnostic that has no source location.
+    #[must_use]
+    pub fn without_location(self) -> Self {
+        if matches!(self, Self::Located(_)) {
+            return self;
+        }
+        self.with_site(&Backtrace::default(), b"")
+    }
+
+    fn with_site(self, backtrace: &Backtrace, source_root: &[u8]) -> Self {
         let body = match &self {
             Self::Message {
                 expression,
@@ -457,7 +542,15 @@ impl GenexError {
                 format!("Error evaluating generator expression:\n\n  {expression}\n\n{message}")
                     .into()
             }
+            Self::DependencyLoop { expression, .. } => format!(
+                "Error evaluating generator expression:\n\n  {expression}\n\nDependency loop found."
+            )
+            .into(),
             _ => self.to_string().into(),
+        };
+        let steps = match self {
+            Self::DependencyLoop { steps, .. } => steps,
+            _ => Vec::new(),
         };
         Self::Located(Box::new(GenexDiagnostic {
             frames: backtrace
@@ -466,6 +559,7 @@ impl GenexError {
                 .cloned()
                 .collect(),
             body,
+            steps,
             source_root: source_root.into(),
         }))
     }

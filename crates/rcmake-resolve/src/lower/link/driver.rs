@@ -4,7 +4,7 @@ use rcmake_model::{ProjectModel, Target};
 use crate::{
     ResolveError,
     lower::shell::{join_words, simple_args},
-    usage::link_options::Wrapper,
+    usage::link_options::{Wrapper, shell_arguments},
 };
 
 pub(super) struct LinkerDriver<'a>(Wrapper<'a>);
@@ -31,6 +31,13 @@ impl<'a> LinkerDriver<'a> {
     }
 
     pub(super) fn argument(&self, argument: &[u8]) -> Result<BString, ResolveError> {
+        if let Some(payload) = argument.strip_prefix(b"SHELL:") {
+            let mut args = Vec::new();
+            for word in shell_arguments(payload) {
+                args.extend(self.0.expand(&word)?);
+            }
+            return Ok(join_words(args.iter().map(|arg| quote(arg))));
+        }
         if !argument.starts_with(b"LINKER:") {
             return Ok(argument.into());
         }

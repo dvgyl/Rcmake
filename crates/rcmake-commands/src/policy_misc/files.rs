@@ -54,6 +54,7 @@ impl FileOptions {
             args = tail;
             match *arg {
                 b"COPYONLY" => options.copy = true,
+                b"IMMEDIATE" => {}
                 b"ESCAPE_QUOTES" => options.expand.escape_quotes = true,
                 b"@ONLY" => options.expand.at_only = true,
                 b"USE_SOURCE_PERMISSIONS" => options.set_permissions(Permissions::Source)?,
@@ -66,6 +67,7 @@ impl FileOptions {
                         if matches!(
                             *name,
                             b"COPYONLY"
+                                | b"IMMEDIATE"
                                 | b"ESCAPE_QUOTES"
                                 | b"@ONLY"
                                 | b"USE_SOURCE_PERMISSIONS"

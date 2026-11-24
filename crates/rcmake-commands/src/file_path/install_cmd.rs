@@ -5,8 +5,10 @@ use rcmake_base::path_lex::Lexical;
 use rcmake_eval::{Cx, Flow};
 use rcmake_host::{
     Follow,
-    path::{from_native_cmake, to_native},
+    path::{from_native, from_native_cmake, to_native},
 };
+
+use rcmake_regex::MatchOptions;
 
 use super::copy::{self, Options, permissions};
 use super::file::binary_destination;
@@ -30,6 +32,57 @@ struct Install<'a> {
     directory: bool,
     executable: bool,
     copy: Options,
+    rules: Vec<MatchRule<'a>>,
+}
+
+struct MatchRule<'a> {
+    option: &'a [u8],
+    pattern: &'a [u8],
+    exclude: bool,
+}
+
+impl Install<'_> {
+    fn excludes_missing_path(
+        &self,
+        cx: &mut Cx<'_>,
+        path: &Path,
+        budget: &mut u64,
+    ) -> Result<bool> {
+        let full = from_native_cmake(path);
+        let filename = path.file_name().map(|name| from_native(Path::new(name)));
+        let mut matched = false;
+        for rule in &self.rules {
+            let basename = rule.option == b"PATTERN" && !rule.pattern.contains(&b'/');
+            let pattern = match (rule.option, basename) {
+                (b"PATTERN", true) => rcmake_regex::glob::to_regex(rule.pattern),
+                (b"PATTERN", false) => {
+                    let glob = rcmake_regex::glob::to_regex(rule.pattern);
+                    [b"/", glob.strip_prefix(b"^").unwrap_or(&glob)]
+                        .concat()
+                        .into()
+                }
+                _ => rule.pattern.into(),
+            };
+            let input = if basename {
+                filename.as_ref().unwrap_or(&full)
+            } else {
+                &full
+            };
+            if cx
+                .regex(&pattern)
+                .map_err(|err| error(err.to_string()))?
+                .find_at(input, 0, MatchOptions::default(), budget)
+                .map_err(|err| error(err.to_string()))?
+                .is_some()
+            {
+                if rule.exclude {
+                    return Ok(true);
+                }
+                matched = true;
+            }
+        }
+        Ok(self.copy.files_matching && !matched)
+    }
 }
 
 pub(super) fn run(cx: &mut Cx<'_>, args: &[&[u8]]) -> Result {
@@ -70,7 +123,9 @@ pub(super) fn run(cx: &mut Cx<'_>, args: &[&[u8]]) -> Result {
             None => cx.resolve_path(input),
         };
         if let Err(err) = host.metadata(&source, Follow::No) {
-            if install.optional && err.kind == ErrorKind::NotFound {
+            if err.kind == ErrorKind::NotFound
+                && (install.optional || install.excludes_missing_path(cx, &source, &mut budget)?)
+            {
                 return Ok(());
             }
             return Err(error(format!(
@@ -135,6 +190,7 @@ fn parse<'a>(cx: &mut Cx<'_>, args: &[&'a [u8]]) -> Result<Install<'a>> {
         optional: false,
         directory: false,
         executable: false,
+        rules: Vec::new(),
         copy: Options::for_install(
             cx.host()
                 .env_get(b"CMAKE_INSTALL_ALWAYS")
@@ -148,13 +204,22 @@ fn parse<'a>(cx: &mut Cx<'_>, args: &[&'a [u8]]) -> Result<Install<'a>> {
     while let Some(option) = args.next() {
         match option {
             b"PATTERN" | b"REGEX" => {
-                install
-                    .copy
-                    .match_rule(cx, option, arg(&mut args, option)?)?;
+                let pattern = arg(&mut args, option)?;
+                install.copy.match_rule(cx, option, pattern)?;
+                install.rules.push(MatchRule {
+                    option,
+                    pattern,
+                    exclude: false,
+                });
                 matching = true;
             }
             b"EXCLUDE" | b"PERMISSIONS" if matching => {
-                install.copy.match_option(option, &mut args)?
+                install.copy.match_option(option, &mut args)?;
+                if option == b"EXCLUDE"
+                    && let Some(rule) = install.rules.last_mut()
+                {
+                    rule.exclude = true;
+                }
             }
             _ if matching => {
                 return Err(error(

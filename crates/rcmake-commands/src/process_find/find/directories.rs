@@ -46,7 +46,7 @@ struct SearchVariables {
 pub(super) fn directories(cx: &Cx<'_>, kind: Kind, options: &Options) -> Vec<PathBuf> {
     let variables = kind.paths();
     let mut paths = Vec::new();
-    let library = matches!(kind, Kind::Library);
+    let framework = !matches!(kind, Kind::Program);
 
     if use_default(
         cx,
@@ -71,7 +71,7 @@ pub(super) fn directories(cx: &Cx<'_>, kind: Kind, options: &Options) -> Vec<Pat
                 .iter()
                 .map(|dir| cx.resolve_path(dir)),
         );
-        if library {
+        if framework {
             add_framework_dirs(cx, &mut paths, cmake_paths(cx, b"CMAKE_FRAMEWORK_PATH"));
         } else if matches!(kind, Kind::Program) {
             add_framework_dirs(cx, &mut paths, cmake_paths(cx, b"CMAKE_APPBUNDLE_PATH"));
@@ -93,7 +93,7 @@ pub(super) fn directories(cx: &Cx<'_>, kind: Kind, options: &Options) -> Vec<Pat
                 .iter()
                 .map(|dir| cx.resolve_path(dir)),
         );
-        if library {
+        if framework {
             add_framework_dirs(
                 cx,
                 &mut paths,
@@ -132,7 +132,7 @@ pub(super) fn directories(cx: &Cx<'_>, kind: Kind, options: &Options) -> Vec<Pat
                 .iter()
                 .map(|dir| cx.resolve_path(dir)),
         );
-        if library {
+        if framework {
             add_framework_dirs(
                 cx,
                 &mut paths,

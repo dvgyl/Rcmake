@@ -21,6 +21,10 @@ use crate::{
 mod driver;
 use driver::LinkerDriver;
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Link lowering uses configured artifacts, objects, and usage requirements."
+)]
 pub(super) fn link(
     model: &ProjectModel,
     target: &Target,
@@ -29,6 +33,7 @@ pub(super) fn link(
     mut step: LinkStep,
     objects: Vec<BString>,
     position_independent: Option<bool>,
+    usage: &mut UsageResolver<'_>,
 ) -> Result<BuildStep, ResolveError> {
     if step.output.is_empty()
         && let Some(file) = &artifacts.file
@@ -108,7 +113,7 @@ pub(super) fn link(
         .concat();
         for key in [&language_flags, &configured] {
             if let Some(value) = definition(model, target.dir, key) {
-                flags.push(parse_flags(value.clone())?);
+                flags.push(wrapper.flag_string(value)?);
             }
         }
     }
@@ -139,9 +144,38 @@ pub(super) fn link(
         .iter()
         .filter(|f| f.role == LinkFragmentRole::Flags)
     {
-        flags.push(wrapper.argument(&fragment.text.value)?);
+        let value = &fragment.text.value;
+        flags.push(if value.starts_with(b"LINKER:") {
+            wrapper.argument(value)?
+        } else {
+            value.clone()
+        });
     }
     if kind != LinkKind::StaticArchive {
+        let modes = crate::usage::link_options::warning_as_error_options(model, target)
+            .map_err(ResolveError::Message)?;
+        for mode in modes {
+            let prefix = if mode == "DRIVER" {
+                let key = [b"CMAKE_", language, b"_LINK_MODE"].concat();
+                if definition(model, target.dir, &key).is_none_or(|mode| mode != "DRIVER") {
+                    continue;
+                }
+                b"_COMPILE".as_slice()
+            } else {
+                b"_LINK"
+            };
+            let key = [b"CMAKE_", language, prefix, b"_OPTIONS_WARNING_AS_ERROR"].concat();
+            for option in definition(model, target.dir, &key)
+                .into_iter()
+                .flat_map(|value| list::split(value, list::Empty::Drop))
+            {
+                flags.push(if mode == "DRIVER" {
+                    quote(&option)
+                } else {
+                    wrapper.argument(&option)?
+                });
+            }
+        }
         flags.extend(policy.pie_link(position_independent));
         flags.extend(policy.link(ipo));
     }
@@ -155,6 +189,26 @@ pub(super) fn link(
 
     let mut inputs = objects.clone();
     let libraries = link_libraries(model, target, config, &step, darwin, &mut inputs, &wrapper)?;
+    if kind != LinkKind::StaticArchive
+        && let Some(id) = model.find_target(target.dir, &target.name)
+    {
+        let context = EvalContext {
+            config: config.clone(),
+            link_language: Some(step.language.clone()),
+            traversal: UsageTraversal::Link,
+            ..EvalContext::default()
+        };
+        for entry in usage
+            .collect_property(id, b"LINK_DEPENDS", &context)?
+            .entries
+        {
+            let path = join(&model.dir(target.dir).source_dir, &entry.value);
+            let path = build_relative(model, &path);
+            if !inputs.contains(&path) {
+                inputs.push(path);
+            }
+        }
+    }
     let soname = if kind == LinkKind::SharedLibrary {
         artifacts.soname_file.as_ref()
     } else {
@@ -178,7 +232,20 @@ pub(super) fn link(
         })
     });
     let install_name_dir = if darwin && soname.is_some() {
-        install_name_dir(model, target, artifacts)
+        let mut dir = install_name_dir(model, target, artifacts);
+        if let layout @ crate::ide::BundleKind::Framework { .. } = crate::ide::bundle_kind(target)
+            && let Some(file) = &artifacts.file
+            && let Some(root) = layout.root(file)
+            && let Some(relative) = Lexical::new(Lexical::new(file).parent())
+                .relative(Lexical::new(Lexical::new(root).parent()))
+            && !dir
+                .strip_suffix(b"/")
+                .is_some_and(|dir| Lexical::new(dir).normalize() == Lexical::new(file).parent())
+        {
+            dir.extend_from_slice(&relative);
+            dir.push(b'/');
+        }
+        dir
     } else {
         BString::default()
     };
@@ -299,7 +366,18 @@ pub(super) fn link(
                 .map_err(ResolveError::from)
         })
         .transpose()?
-        .filter(|value| !value.is_empty());
+        .filter(|value| !value.is_empty())
+        .map(|prefix| {
+            super::expand_rule(&prefix, |key| match key {
+                b"LANGUAGE" => Some(step.language.clone()),
+                b"TARGET_NAME" => Some(quote(&target.name)),
+                b"TARGET_TYPE" => Some(target.kind.as_str().into()),
+                b"CMAKE_CURRENT_BINARY_DIR" => Some(quote(&model.dir(target.dir).binary_dir)),
+                b"CMAKE_BINARY_DIR" => Some(quote(&model.dir(DirId::ROOT).binary_dir)),
+                b"TARGET_SUPPORT_DIR" => Some(quote(&super::object_dir(model, target, config))),
+                _ => lookup(key),
+            })
+        });
     if let Some(program) = rule_launcher
         .as_ref()
         .and_then(|prefix| simple_args(prefix)?.into_iter().next())
@@ -328,7 +406,7 @@ pub(super) fn link(
         };
         let mut link = std::mem::take(invocation);
         if kind != LinkKind::StaticArchive {
-            link = command.launch_tool(model, target, b"_LINKER_LAUNCHER", link)?;
+            link = command.launch_tool(model, target, b"_LINKER_LAUNCHER", link, usage)?;
         }
         if let Some(prefix) = &rule_launcher {
             link = shell_command(join_words([prefix.clone(), link.shell]));
@@ -781,9 +859,14 @@ fn rpath_entries(
             && target_property(model, target, b"BUILD_RPATH_USE_ORIGIN")
                 .is_some_and(|value| truth::is_on(value));
         for library in libraries {
-            let file = Lexical::new(&join(build, library)).normalize();
-            let file = Lexical::new(&file);
-            if build_path.prefix(file) && shared_library(file.filename()) {
+            let path = Lexical::new(&join(build, library)).normalize();
+            let file = Lexical::new(&path);
+            if darwin
+                && build_path.prefix(file)
+                && let Some(parent) = framework_search_path(&path)
+            {
+                paths.insert(parent.into());
+            } else if build_path.prefix(file) && shared_library(file.filename()) {
                 let parent = Lexical::new(file.parent());
                 let path = if origin {
                     parent.relative(output_dir).map_or_else(
@@ -804,4 +887,11 @@ fn rpath_entries(
         }
     }
     paths
+}
+
+fn framework_search_path(path: &[u8]) -> Option<&[u8]> {
+    let suffix = b".framework/";
+    let index = path.windows(suffix.len()).position(|part| part == suffix)?;
+    let framework = path.get(..index + suffix.len() - 1)?;
+    Some(Lexical::new(framework).parent())
 }

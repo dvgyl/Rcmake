@@ -52,7 +52,7 @@ pub(in crate::policy_misc) fn set(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdR
         let project = cx.project();
         let Some(owner) = project.custom_rule_owner(dir, rule) else {
             return Err(CmdError::status(format!(
-                "could not find RULE \"{}\".",
+                "could not find RULE {}.  Perhaps it has not yet been created.",
                 BString::from(rule)
             )));
         };
@@ -69,12 +69,14 @@ pub(in crate::policy_misc) fn set(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdR
             value = [old.as_slice(), separator, &value].concat().into();
         }
         let mut new_owner = owner;
+        let mut cross_directory_promotion = false;
         let error = match *name {
             b"GLOBAL" if !truth::is_on(&value) => Some(format!(
                 "GLOBAL property can't be set to FALSE on rules (\"{}\")",
                 BString::from(rule)
             )),
             b"GLOBAL" => {
+                cross_directory_promotion = owner.is_some_and(|owner| owner != dir);
                 new_owner = None;
                 value = "1".into();
                 None
@@ -89,10 +91,17 @@ pub(in crate::policy_misc) fn set(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdR
   \"name;type\"".into()),
                 }
             }
-            b"NAME" | b"PARENT_RULE" | b"COMMAND_COUNT" => Some(format!(
-                "The \"{}\" rule property is read-only.",
-                BString::from(*name)
-            )),
+            b"NAME"
+            | b"PARENT_RULE"
+            | b"COMMAND"
+            | b"COMMAND_COUNT"
+            | b"OUTPUT"
+            | b"DEPENDS"
+            | b"BYPRODUCTS"
+            | b"DEPFILE"
+            | b"FILE_SET_CONFIGURATORS"
+            | b"SOURCE_CONFIGURATORS" => Some(read_only(name, rule)),
+            _ if command_index(name).is_some() => Some(read_only(name, rule)),
             _ => None,
         };
         if let Some(error) = error {
@@ -108,6 +117,31 @@ pub(in crate::policy_misc) fn set(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdR
             project.remove_custom_rule(owner, rule);
         }
         project.store_custom_rule(new_owner, rule.into(), properties);
+        if cross_directory_promotion {
+            cx.issue(
+                MessageKind::Error,
+                Effect::SetError,
+                None,
+                format!(
+                    "Attempt to promote rule \"{}\" to global scope (by setting GLOBAL) which is not created in this directory.",
+                    BString::from(rule)
+                )
+                .into(),
+            );
+        }
     }
     Ok(Flow::Normal)
+}
+
+fn read_only(name: &[u8], rule: &[u8]) -> String {
+    format!(
+        "\"{}\" property is read-only for rules (\"{}\")",
+        BString::from(name),
+        BString::from(rule)
+    )
+}
+
+pub(super) fn command_index(property: &[u8]) -> Option<&[u8]> {
+    let index = property.strip_prefix(b"COMMAND_")?;
+    (!index.is_empty() && index.iter().all(u8::is_ascii_digit)).then_some(index)
 }

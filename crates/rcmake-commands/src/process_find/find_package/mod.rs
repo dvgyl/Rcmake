@@ -178,7 +178,7 @@ fn find_requested_package(
     match found {
         Ok(found) => finish(cx, name, &request, first_target, found),
         Err(err) => {
-            record_result(cx, name, cx.var_is_on(&found_var));
+            record_result(cx, name, request.quiet, cx.var_is_on(&found_var));
             Err(err)
         }
     }
@@ -195,7 +195,7 @@ fn finish(
     first_target: usize,
     found: bool,
 ) -> CmdResult {
-    record_result(cx, name, found);
+    record_result(cx, name, request.quiet, found);
     let version = cx.var(&text(&[name, b"_VERSION"]));
     let global = request.global || cx.var_is_on(b"CMAKE_FIND_PACKAGE_TARGETS_GLOBAL");
     let dir = cx.current_dir_id();
@@ -235,7 +235,11 @@ fn finish(
     Ok(Flow::Normal)
 }
 
-fn record_result(cx: &mut Cx<'_>, name: &[u8], found: bool) {
+fn record_result(cx: &mut Cx<'_>, name: &[u8], quiet: bool, found: bool) {
+    cx.global().props.set(
+        text(&[b"_CMAKE_", name, b"_QUIET"]),
+        if quiet { "TRUE" } else { "FALSE" }.into(),
+    );
     for (property, include) in [
         (b"PACKAGES_FOUND".as_slice(), found),
         (b"PACKAGES_NOT_FOUND", !found),

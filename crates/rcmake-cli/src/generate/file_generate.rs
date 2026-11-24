@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 
+use jiff::{Timestamp, fmt::strtime, tz::TimeZone};
+
 use rcmake_base::BString;
 use rcmake_diag::{Backtrace, Frame, FrameKind, PolicyId, PolicyStatus};
 use rcmake_gen_common::{
@@ -113,13 +115,17 @@ pub(super) fn write(
     let mut usage = UsageResolver::new(model);
     let objects = ObjectPaths::new(&result.targets);
     let root = &model.dir(DirId::ROOT).source_dir;
+    let timestamp = |format: Option<&[u8]>, utc| format_timestamp(host, format, utc);
     let evaluate = |value: &[u8],
                     request: &FileGenerateRequest<'_>,
                     context: FileGenerateContext<'_>| {
         let (dir, backtrace) = request_dirs
             .get(&std::ptr::from_ref(request))
             .ok_or_else(invalid_record)?;
-        let mut host = usage.host(*dir).with_object_paths(&objects);
+        let mut host = usage
+            .host(*dir)
+            .with_object_paths(&objects)
+            .with_clock(host, &timestamp);
         let error = |message| GenError::Write {
             path: request.output.into(),
             message,
@@ -150,6 +156,59 @@ pub(super) fn write(
     };
     write_generated_files(&requests, &contexts, evaluate, host)?;
     Ok(())
+}
+
+fn format_timestamp(host: &dyn Host, format: Option<&[u8]>, utc: bool) -> Option<BString> {
+    let format = format
+        .filter(|format| !format.is_empty())
+        .unwrap_or(if utc {
+            b"%Y-%m-%dT%H:%M:%SZ"
+        } else {
+            b"%Y-%m-%dT%H:%M:%S"
+        });
+    let (secs, nanos) = if let Some(epoch) = host
+        .env_get(b"SOURCE_DATE_EPOCH")
+        .filter(|epoch| !epoch.is_empty())
+    {
+        let secs = rcmake_base::parse_source_date_epoch(&epoch)?;
+        if secs == -1 {
+            return Some(BString::default());
+        }
+        (secs, 0)
+    } else {
+        let now = host.now();
+        (now.secs, i32::try_from(now.nanos).ok()?)
+    };
+    let instant = Timestamp::new(secs, nanos).ok()?;
+    let zone = if utc { TimeZone::UTC } else { host.time_zone() };
+    let zoned = instant.to_zoned(zone);
+    let mut result = BString::default();
+    let mut bytes = format.iter().copied();
+    while let Some(byte) = bytes.next() {
+        if byte != b'%' {
+            result.push(byte);
+            continue;
+        }
+        match bytes.next() {
+            Some(b'%') | None => result.push(b'%'),
+            Some(b'f') => result.extend_from_slice(format!("{:06}", nanos / 1000).as_bytes()),
+            Some(b's') => result.extend_from_slice(secs.to_string().as_bytes()),
+            Some(b'Z') if utc => result.extend_from_slice(b"GMT"),
+            Some(b'Z') => result.extend_from_slice(
+                zoned
+                    .time_zone()
+                    .to_offset_info(instant)
+                    .abbreviation()
+                    .as_bytes(),
+            ),
+            Some(
+                spec @ (b'd' | b'H' | b'I' | b'j' | b'm' | b'b' | b'B' | b'M' | b'S' | b'U' | b'V'
+                | b'w' | b'a' | b'A' | b'y' | b'Y' | b'z'),
+            ) => result.extend_from_slice(strtime::format([b'%', spec], &zoned).ok()?.as_bytes()),
+            Some(spec) => result.extend_from_slice(&[b'%', spec]),
+        }
+    }
+    Some(result)
 }
 
 fn origin(props: &PropertyMap, section: &str) -> Backtrace {

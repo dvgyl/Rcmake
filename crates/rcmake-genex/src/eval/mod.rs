@@ -6,7 +6,9 @@ use crate::{EvalContext, EvalFlags, GenexAst, GenexError, GenexExpr, GenexHost, 
 
 mod context;
 mod lists;
+mod operations;
 mod paths;
+mod properties;
 mod strings;
 mod targets;
 
@@ -22,18 +24,50 @@ pub fn evaluate(
     host: &mut dyn GenexHost,
 ) -> Result<(BString, EvalFlags), GenexError> {
     let _root = targets::DAGChecker::root(ctx);
-    let limits = host.limits();
-    let mut evaluator = Evaluator {
-        host,
-        flags: EvalFlags::default(),
-        depth: 0,
-        work: limits.max_value_bytes,
-        regex_steps: limits.regex_steps,
-        limits,
-        bindings: Vec::new(),
-    };
+    let mut evaluator = Evaluator::new(host);
     let value = evaluator.nodes(&ast.nodes, ctx)?;
     Ok((value, evaluator.flags))
+}
+
+/// Evaluate independent top-level expressions and collect their diagnostics.
+///
+/// An error in one expression does not evaluate any skipped branches of that
+/// expression. All expressions share the same evaluation limits.
+///
+/// # Errors
+///
+/// Returns the diagnostics in source order when evaluation fails.
+pub fn evaluate_diagnostics(
+    ast: &GenexAst,
+    ctx: &EvalContext,
+    host: &mut dyn GenexHost,
+) -> Result<(BString, EvalFlags), Vec<GenexError>> {
+    let _root = targets::DAGChecker::root(ctx);
+    let mut evaluator = Evaluator::new(host);
+    let mut output = BString::default();
+    let mut errors = Vec::new();
+    for node in &ast.nodes {
+        if let Err(error) = evaluator.append_node(&mut output, node, ctx) {
+            let can_continue = match &error {
+                GenexError::TooDeep => false,
+                GenexError::Message { expression, .. } => !expression.is_empty(),
+                _ => true,
+            };
+            errors.push(error);
+            if !can_continue {
+                return Err(errors);
+            }
+            if let Err(error) = evaluator.charge(1) {
+                errors.push(error);
+                return Err(errors);
+            }
+        }
+    }
+    if errors.is_empty() {
+        Ok((output, evaluator.flags))
+    } else {
+        Err(errors)
+    }
 }
 
 struct Evaluator<'a> {
@@ -89,14 +123,14 @@ impl Call<'_> {
 
     fn arity(self, count: usize) -> GenexError {
         let name = BString::from(self.name);
-        let parameter = if count == 1 {
-            "parameter"
-        } else {
-            "parameters"
-        };
-        self.error(format!(
-            "$<{name}> expression requires exactly {count} {parameter}."
-        ))
+        self.error(match count {
+            0 => format!("$<{name}> expression requires no parameters."),
+            1 => format!("$<{name}> expression requires exactly one parameter."),
+            _ => format!(
+                "$<{name}> expression requires {count} comma separated parameters, but got {} instead.",
+                self.params()
+            ),
+        })
     }
 
     fn params(self) -> usize {
@@ -104,7 +138,20 @@ impl Call<'_> {
     }
 }
 
-impl Evaluator<'_> {
+impl<'a> Evaluator<'a> {
+    fn new(host: &'a mut dyn GenexHost) -> Self {
+        let limits = host.limits();
+        Self {
+            host,
+            flags: EvalFlags::default(),
+            depth: 0,
+            work: limits.max_value_bytes,
+            regex_steps: limits.regex_steps,
+            limits,
+            bindings: Vec::new(),
+        }
+    }
+
     fn limit_error(message: &'static str) -> GenexError {
         GenexError::Message {
             expression: BString::default(),
@@ -132,15 +179,24 @@ impl Evaluator<'_> {
     fn nodes(&mut self, nodes: &[GenexNode], ctx: &EvalContext) -> Value {
         let mut result = BString::default();
         for node in nodes {
-            match node {
-                GenexNode::Text(text) => self.append(&mut result, text)?,
-                GenexNode::Expr(expr) => {
-                    let value = self.expression(expr, ctx)?;
-                    self.append(&mut result, &value)?;
-                }
-            }
+            self.append_node(&mut result, node, ctx)?;
         }
         Ok(result)
+    }
+
+    fn append_node(
+        &mut self,
+        output: &mut BString,
+        node: &GenexNode,
+        ctx: &EvalContext,
+    ) -> Result<(), GenexError> {
+        match node {
+            GenexNode::Text(text) => self.append(output, text),
+            GenexNode::Expr(expr) => {
+                let value = self.expression(expr, ctx)?;
+                self.append(output, &value)
+            }
+        }
     }
 
     fn expression(&mut self, expr: &GenexExpr, ctx: &EvalContext) -> Value {
@@ -213,17 +269,7 @@ impl Evaluator<'_> {
             b"STRING" => self.string(call),
             b"LIST" | b"IN_LIST" | b"JOIN" | b"REMOVE_DUPLICATES" | b"FILTER" => self.list(call),
             b"PATH" | b"SHELL_PATH" => self.path(call),
-            b"ARGS" => {
-                let value = self.content(call)?;
-                if value.is_empty() {
-                    return Ok(value);
-                }
-                let parts = list::split(&value, list::Empty::Keep);
-                let mut out = BString::from("<ARGS>");
-                self.append(&mut out, &parts.join(&b','))?;
-                self.append(&mut out, b"</ARGS>")?;
-                Ok(out)
-            }
+            b"ARGS" => self.argument_list(call),
             b"_0" | b"_1" => {
                 let [] = self.fixed(call)?;
                 let index = usize::from(name == "_1");
@@ -260,6 +306,11 @@ impl Evaluator<'_> {
             | b"DEVICE_LINK" => self.interface(call),
             _ if context::compiler_operator(&name) => self.compiler(call),
             b"SOURCE_PROPERTY" => self.source_property(call),
+            b"SOURCE_EXISTS"
+            | b"FILE_SET_EXISTS"
+            | b"FILE_SET_PROPERTY"
+            | b"DIRECTORY_PROPERTY"
+            | b"GLOBAL_PROPERTY" => self.scoped_property(call),
             _ if name.starts_with(b"TARGET_") => self.target(call),
             _ => Err(unknown(call)),
         }
@@ -284,14 +335,22 @@ impl Evaluator<'_> {
     ) -> Result<Vec<BString>, GenexError> {
         let value = self.nodes(nodes, ctx)?;
         self.charge(value.len().max(1))?;
+        self.expand_argument(value)
+    }
+
+    fn expand_argument(&mut self, value: BString) -> Result<Vec<BString>, GenexError> {
         if let Some(args) = value
             .strip_prefix(b"<ARGS>")
             .and_then(|v| v.strip_suffix(b"</ARGS>"))
         {
-            return Ok(args
-                .split(|&byte| byte == b',')
-                .map(BString::from)
-                .collect());
+            let parts = args.split(|&byte| byte == b',');
+            self.charge(
+                parts
+                    .clone()
+                    .count()
+                    .saturating_mul(std::mem::size_of::<BString>()),
+            )?;
+            return Ok(parts.map(BString::from).collect());
         }
         Ok(vec![value])
     }
@@ -305,43 +364,61 @@ impl Evaluator<'_> {
     }
 
     fn fixed<const N: usize>(&mut self, call: Call<'_>) -> Result<[BString; N], GenexError> {
-        if call.params() != N {
-            return Err(match call.name {
-                b"STREQUAL" | b"IF" => call.error(format!(
-                    "$<{}> expression requires {N} comma separated parameters, but got {} instead.",
-                    BString::from(call.name),
-                    call.params()
-                )),
-                _ => call.arity(N),
-            });
-        }
         let mut values = self.arguments(call)?;
+        if call.params() != N {
+            return Err(call.arity(N));
+        }
         values.truncate(N);
         values.try_into().map_err(|_| call.arity(N))
     }
 
     fn content(&mut self, call: Call<'_>) -> Value {
-        if call.params() == 0 {
-            return Err(call.arity(1));
+        self.arbitrary_content(call, 0)?
+            .into_iter()
+            .next()
+            .ok_or_else(|| call.arity(1))
+    }
+
+    fn arbitrary_content(
+        &mut self,
+        call: Call<'_>,
+        start: usize,
+    ) -> Result<Vec<BString>, GenexError> {
+        if call.params() <= start {
+            return Err(call.arity(start + 1));
         }
         let mut out = BString::default();
-        for index in 0..call.params() {
-            if index != 0 {
+        for index in start..call.params() {
+            if index != start {
                 self.append(&mut out, b",")?;
             }
             let value = self.parameter(call, index)?;
             self.append(&mut out, &value)?;
         }
-        if let Some(args) = out
-            .strip_prefix(b"<ARGS>")
-            .and_then(|v| v.strip_suffix(b"</ARGS>"))
-        {
-            return Ok(args
-                .split(|&byte| byte == b',')
-                .next()
-                .unwrap_or_default()
-                .into());
+        self.expand_argument(out)
+    }
+
+    fn argument_list(&mut self, call: Call<'_>) -> Value {
+        let values = self.arguments(call)?;
+        if values.is_empty() || matches!(values.as_slice(), [value] if value.is_empty()) {
+            return Ok(BString::default());
         }
+        let mut out = BString::from("<ARGS>");
+        let mut first = true;
+        for value in &values {
+            let parts = list::iter(value, list::Empty::Keep);
+            let empty = value
+                .is_empty()
+                .then_some(std::borrow::Cow::Borrowed(b"".as_slice()));
+            for part in parts.chain(empty) {
+                if !first {
+                    self.append(&mut out, b",")?;
+                }
+                first = false;
+                self.append(&mut out, &part)?;
+            }
+        }
+        self.append(&mut out, b"</ARGS>")?;
         Ok(out)
     }
 

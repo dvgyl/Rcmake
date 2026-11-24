@@ -634,30 +634,25 @@ impl TargetSettings<'_> {
             }
             ldflags.extend(ide.build_rpaths.iter().map(|path| rpath(&text(path))));
         }
-        let objects = self
-            .link_objects()
-            .map(|(_, path)| xcode_flag(&path))
-            .collect::<Vec<_>>();
+        let objects = self.link_objects().map(|(_, path)| path);
         if matches!(
             raw.kind,
             TargetKind::StaticLibrary | TargetKind::ObjectLibrary
         ) {
-            let mut flags = objects;
-            if raw.kind == TargetKind::StaticLibrary
-                && let Some(ide) = ide
-            {
-                flags.extend(
-                    ide.link_options
-                        .iter()
-                        .map(|option| flag_text(&option.value)),
-                );
+            let mut flags = ide
+                .filter(|_| raw.kind == TargetKind::StaticLibrary)
+                .into_iter()
+                .flat_map(|ide| &ide.link_options)
+                .map(|option| flag_text(&option.value))
+                .chain(objects)
+                .map(Value::from)
+                .collect::<Vec<_>>();
+            if flags.is_empty() {
+                flags.push("".into());
             }
-            if !flags.is_empty() {
-                flags.push(INHERITED.into());
-                settings.insert("OTHER_LIBTOOLFLAGS".into(), flags.join(" ").into());
-            }
+            settings.insert("OTHER_LIBTOOLFLAGS".into(), Value::List(flags));
         } else {
-            ldflags.splice(0..0, objects);
+            ldflags.splice(0..0, objects.map(|path| xcode_flag(&path)));
         }
         settings.insert("OTHER_LDFLAGS".into(), flags_with_inherited(&ldflags));
         if !libraries.is_empty() {

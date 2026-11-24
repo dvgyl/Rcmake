@@ -32,6 +32,7 @@ mod link;
 pub(crate) mod link_options;
 #[cfg(test)]
 mod tests;
+mod wrappers;
 
 pub use host::{ModelGenexHost, ObjectPaths};
 pub use link::{ResolvedLinkItem, ResolvedLinkKind, collect_link_items};
@@ -599,7 +600,13 @@ impl<'a> UsageResolver<'a> {
         let root = &self.model.dir(DirId::ROOT).source_dir;
         let mut host = self.host(dir);
         host.current = ctx.current;
-        evaluate(&ast, &ctx, &mut host).map_err(|error| error.at(&entry.backtrace, root).into())
+        evaluate(&ast, &ctx, &mut host).map_err(|error| {
+            if matches!(property, b"LINK_DEPENDS" | b"INTERFACE_LINK_DEPENDS") {
+                error.without_location().into()
+            } else {
+                error.at(&entry.backtrace, root).into()
+            }
+        })
     }
 
     /// Collect includes in search order and mark system paths.

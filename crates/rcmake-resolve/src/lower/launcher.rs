@@ -1,11 +1,16 @@
 //! Add the CTest instrumentation launcher to build commands.
 
 use rcmake_base::{BString, list};
-use rcmake_genex::{ConfigId, EvalContext, evaluate, parse};
+use rcmake_genex::{ConfigId, EvalContext};
 use rcmake_model::{DirId, ProjectModel, Target};
 
-use super::{definition, shell::direct};
+use super::{
+    definition,
+    shell::{command, direct, join_words},
+};
+use crate::usage::UsageResolver;
 use crate::{Invocation, ResolveError};
+use rcmake_base::shell::quote;
 
 /// Return the launcher prefix when the project has an instrumentation query.
 ///
@@ -49,35 +54,59 @@ impl Command<'_> {
         target: &Target,
         suffix: &[u8],
         invocation: Invocation,
+        usage: &mut UsageResolver<'_>,
     ) -> Result<Invocation, ResolveError> {
-        let property = [self.language.as_slice(), suffix].concat();
-        let Some(value) = target.props.get(&property) else {
-            return Ok(invocation);
-        };
-        let expansion;
-        let value = if value.windows(2).any(|part| part == b"$<") {
-            let id = model.find_target(target.dir, &target.name);
-            let handle = id.map(crate::usage::handle);
-            let ctx = EvalContext {
-                config: self.config.clone(),
-                current: handle,
-                head: handle,
-                language: self.source.map(|_| self.language.clone()),
-                link_language: self.source.is_none().then(|| self.language.clone()),
-                ..EvalContext::default()
-            };
-            let mut usage = crate::usage::UsageResolver::new(model);
-            (expansion, _) = evaluate(&parse(value)?, &ctx, &mut usage.host(target.dir))?;
-            &expansion
-        } else {
-            value
-        };
-        let mut args = list::split(value, list::Empty::Keep);
-        if args.first().is_none_or(|program| program.is_empty()) {
+        let mut args = self.tool_prefix(model, target, suffix, usage)?;
+        if args.is_empty() {
             return Ok(invocation);
         }
+        let prefix = join_words(args.iter().map(|arg| quote(arg)));
+        let shell = join_words([prefix, invocation.shell]);
+        if invocation.argv.is_empty() {
+            return Ok(command(shell));
+        }
         args.extend(invocation.argv);
-        Ok(direct(args, invocation.working_dir))
+        Ok(Invocation {
+            argv: args,
+            shell,
+            working_dir: invocation.working_dir,
+        })
+    }
+
+    pub(super) fn tool_prefix(
+        &self,
+        model: &ProjectModel,
+        target: &Target,
+        suffix: &[u8],
+        usage: &mut UsageResolver<'_>,
+    ) -> Result<Vec<BString>, ResolveError> {
+        let Some(id) = model.find_target(target.dir, &target.name) else {
+            return Ok(Vec::new());
+        };
+        let handle = crate::usage::handle(id);
+        let ctx = EvalContext {
+            config: self.config.clone(),
+            current: Some(handle),
+            head: Some(handle),
+            language: self.source.map(|_| self.language.clone()),
+            link_language: self.source.is_none().then(|| self.language.clone()),
+            ..EvalContext::default()
+        };
+        let kind = if self.source.is_some() {
+            b"COMPILE".as_slice()
+        } else {
+            b"LINK"
+        };
+        let mut args = usage.tool_wrappers(id, kind, &ctx)?;
+        let property = [self.language.as_slice(), suffix].concat();
+        if let Some(value) = target.props.get(&property) {
+            let value = usage.eval_ide_property(id, &property, value, &ctx)?;
+            let launcher = list::split(&value, list::Empty::Keep);
+            if launcher.first().is_some_and(|program| !program.is_empty()) {
+                args.extend(launcher);
+            }
+        }
+        Ok(args)
     }
 
     pub(super) fn wrap(

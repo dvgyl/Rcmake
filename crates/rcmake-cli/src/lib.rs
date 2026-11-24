@@ -131,6 +131,11 @@ pub fn run(argv: &[BString], host: Arc<dyn Host>) -> i32 {
 }
 
 fn run_ctest(argv: &[BString], args: &[BString], host: Arc<dyn Host>) -> i32 {
+    if let Some((flag, args)) = args.split_first()
+        && flag == "--launch"
+    {
+        return run_ctest_launch(host.as_ref(), args);
+    }
     // CTest ignores positional arguments before its options.
     let first_option = args
         .iter()
@@ -149,6 +154,53 @@ fn run_ctest(argv: &[BString], args: &[BString], host: Arc<dyn Host>) -> i32 {
         .cloned()
         .collect::<Vec<_>>();
     rcmake_ctest::main(&argv, host)
+}
+
+fn run_ctest_launch(host: &dyn Host, args: &[BString]) -> i32 {
+    use rcmake_host::{CommandSpec, Input, Output, ProcessResult, RunRequest};
+
+    let mut commands = args.splitn(2, |arg| arg == "--");
+    let _ = commands.next();
+    let Some(command) = commands.next() else {
+        host.write_out(
+            Stream::Stderr,
+            b"No launch/command separator ('--') found!\n",
+        );
+        return 1;
+    };
+    let Some((program, args)) = command.split_first() else {
+        return 0;
+    };
+    if program == ":" {
+        return 0;
+    }
+    let request = RunRequest {
+        pipeline: vec![CommandSpec {
+            program: program.clone(),
+            args: args.to_vec(),
+        }],
+        cwd: host.initial_cwd(),
+        env: host.env_all(),
+        stdin: Input::Inherit,
+        stdout: Output::Inherit,
+        stderr: Output::Inherit,
+        timeout: Some(std::time::Duration::from_secs(30 * 60)),
+        tee: false,
+    };
+    match host.run(&request, &mut |_, _| {}) {
+        Ok(output) => match output.results.first() {
+            Some(ProcessResult::Exited(code)) => *code,
+            Some(ProcessResult::SpawnFailed(error)) => {
+                host.write_out(Stream::Stderr, format!("{error}\n").as_bytes());
+                1
+            }
+            _ => 1,
+        },
+        Err(error) => {
+            host.write_out(Stream::Stderr, format!("{error}\n").as_bytes());
+            1
+        }
+    }
 }
 
 fn write_version(host: &dyn Host, output: Option<&BString>, contents: &[u8]) -> i32 {
@@ -312,6 +364,18 @@ fn run_cmake(argv: &[BString], rest: &[BString], host: Arc<dyn Host>) -> i32 {
             }
         }
         return outcome.exit_code;
+    }
+    let ignore_key = "_RCMAKE_IGNORE_LINK_WARNING_AS_ERROR";
+    if opts.ignore_link_warning_as_error {
+        opts.cache_edits
+            .push(options::CacheEdit::Define(rcmake_eval::CacheDefine {
+                name: ignore_key.into(),
+                ty: Some(CacheType::Internal),
+                value: "ON".into(),
+            }));
+    } else if !opts.regenerate_during_build {
+        opts.cache_edits
+            .push(options::CacheEdit::Remove(ignore_key.into()));
     }
     configure::run(argv, opts, host)
 }

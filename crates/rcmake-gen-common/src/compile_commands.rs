@@ -62,6 +62,7 @@ fn render_with_directories<'a>(
         else {
             continue;
         };
+        let shell = compiler_shell(&invocation.shell);
         out.extend_from_slice(separator);
         separator = b",\n";
         let (directory, command) = if let Some(&directory) = directories.get(object.as_slice()) {
@@ -74,7 +75,7 @@ fn render_with_directories<'a>(
             (
                 directory,
                 compile_command(
-                    &invocation.shell,
+                    shell,
                     paths
                         .as_ref()
                         .map(|(from, to)| (from.as_slice(), to.as_slice())),
@@ -86,7 +87,7 @@ fn render_with_directories<'a>(
                     .working_dir
                     .as_deref()
                     .map_or(build_dir, |v| v.as_ref()),
-                compile_command(&invocation.shell, None),
+                compile_command(shell, None),
             )
         };
         // Preserve the compile database's field order and use the JSON writer for values.
@@ -105,6 +106,24 @@ fn render_with_directories<'a>(
     }
     out.push(b']');
     Ok(out)
+}
+
+fn compiler_shell(shell: &[u8]) -> &[u8] {
+    let mut rest = shell;
+    let mut previous = b"".as_slice();
+    let mut helper = false;
+    while !rest.is_empty() {
+        rest = rest.trim_ascii_start();
+        let (word, tail) = rest.split_at(shell_word_len(rest));
+        if word == b"__run_co_compile" && previous == b"-E" {
+            helper = true;
+        } else if helper && word == b"--" {
+            return tail.trim_ascii_start();
+        }
+        previous = word;
+        rest = tail;
+    }
+    shell
 }
 
 fn compile_command(shell: &[u8], object_paths: Option<(&[u8], &[u8])>) -> BString {

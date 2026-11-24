@@ -1,0 +1,184 @@
+use std::collections::HashSet;
+
+use indexmap::{IndexMap, IndexSet};
+use rcmake_base::{BString, list, truth};
+use rcmake_genex::{EvalContext, EvalFlags};
+use rcmake_model::{Target, TargetId, TargetKind};
+
+use super::{ResolvedLinkKind, UsageResolver, link_context};
+use crate::{ResolveError, ResolvedTarget, lower};
+
+#[derive(Clone, Copy, Eq, Hash, PartialEq)]
+enum Contribution {
+    Link,
+    DirectObject,
+    ArchiveObject,
+}
+
+impl UsageResolver<'_> {
+    pub(crate) fn select_link_language(
+        &mut self,
+        id: TargetId,
+        target: &Target,
+        resolved: &IndexMap<TargetId, ResolvedTarget>,
+        ctx: &EvalContext,
+    ) -> Result<Option<BString>, ResolveError> {
+        if let Some(language) = target
+            .props
+            .get(b"LINKER_LANGUAGE")
+            .filter(|lang| !lang.is_empty())
+        {
+            return Ok(Some(language.clone()));
+        }
+        if target
+            .props
+            .get(b"HAS_CXX")
+            .is_some_and(|flag| truth::is_on(flag))
+        {
+            return Ok(Some("CXX".into()));
+        }
+        let mut phase = link_context(id, ctx);
+        phase.link_language = None;
+        let (first, flags) = self.link_language_pass(id, target, resolved, &phase)?;
+        let first = first.or_else(|| ctx.link_language.clone());
+        if flags.link_language_sensitive && first.is_some() {
+            phase.link_language.clone_from(&first);
+            let (second, _) = self.link_language_pass(id, target, resolved, &phase)?;
+            let second = second.or_else(|| ctx.link_language.clone());
+            if second != first {
+                let first = first.unwrap_or_default();
+                let second = second.unwrap_or_default();
+                return Err(ResolveError::Message(
+                    format!("Evaluation of $<LINK_LANGUAGE:...> or $<LINK_LAND_AND_ID:...> changes\nthe linker language for target \"{}\" (from '{first}' to '{second}') which is invalid.", target.name).into(),
+                ));
+            }
+        }
+        Ok(first)
+    }
+
+    fn link_language_pass(
+        &mut self,
+        id: TargetId,
+        target: &Target,
+        resolved: &IndexMap<TargetId, ResolvedTarget>,
+        ctx: &EvalContext,
+    ) -> Result<(Option<BString>, EvalFlags), ResolveError> {
+        let mut languages = IndexSet::new();
+        let mut dependencies = Vec::new();
+        if let Some(facts) = resolved.get(&id) {
+            languages.extend(
+                facts
+                    .compile_groups
+                    .iter()
+                    .map(|group| group.language.clone()),
+            );
+            dependencies.extend(
+                facts
+                    .dependencies
+                    .iter()
+                    .copied()
+                    .map(|id| (id, Contribution::DirectObject)),
+            );
+        }
+        let (direct, mut flags) = self.direct_links(id, ctx)?;
+        self.language_dependencies(&direct, &mut dependencies);
+
+        let mut visited = HashSet::new();
+        let mut index = 0;
+        while let Some(&(dependency, contribution)) = dependencies.get(index) {
+            index += 1;
+            if dependency == id || !visited.insert((dependency, contribution)) {
+                continue;
+            }
+            let library = self.target(dependency)?;
+            if library.kind == TargetKind::StaticLibrary
+                || (library.kind == TargetKind::ObjectLibrary && contribution != Contribution::Link)
+            {
+                let inherited = if library.is_imported() {
+                    imported_languages(library, ctx)
+                } else {
+                    resolved
+                        .get(&dependency)
+                        .into_iter()
+                        .flat_map(|facts| {
+                            facts
+                                .compile_groups
+                                .iter()
+                                .map(|group| group.language.clone())
+                        })
+                        .collect()
+                };
+                languages.extend(inherited.into_iter().filter(|language| {
+                    contribution == Contribution::DirectObject
+                        || lower::definition(
+                            self.model,
+                            target.dir,
+                            &[
+                                b"CMAKE_",
+                                language.as_slice(),
+                                b"_LINKER_PREFERENCE_PROPAGATES",
+                            ]
+                            .concat(),
+                        )
+                        .map_or(language == "CXX", |value| truth::is_on(value))
+                }));
+            }
+            if let Some(facts) = resolved.get(&dependency) {
+                let objects = if contribution == Contribution::DirectObject {
+                    Contribution::DirectObject
+                } else {
+                    Contribution::ArchiveObject
+                };
+                dependencies.extend(facts.dependencies.iter().copied().map(|id| (id, objects)));
+            }
+            let (links, deps) = self.usage_links(dependency, true, ctx)?;
+            flags = flags.union(deps);
+            self.language_dependencies(&links, &mut dependencies);
+        }
+
+        Ok((
+            lower::linker_language(
+                self.model,
+                target,
+                languages.iter().map(|language| language.as_slice()),
+            ),
+            flags,
+        ))
+    }
+
+    fn language_dependencies(
+        &self,
+        items: &[std::sync::Arc<super::ResolvedLinkItem>],
+        dependencies: &mut Vec<(TargetId, Contribution)>,
+    ) {
+        for item in items {
+            let entries = match &item.kind {
+                ResolvedLinkKind::Group { members, .. } => members.as_slice(),
+                _ => std::slice::from_ref(item.as_ref()),
+            };
+            dependencies.extend(entries.iter().filter_map(|entry| match entry.kind {
+                ResolvedLinkKind::Objects(id) => Some((id, Contribution::DirectObject)),
+                ResolvedLinkKind::Library(id) | ResolvedLinkKind::Interface(id) => {
+                    Some((id, Contribution::Link))
+                }
+                ResolvedLinkKind::ObjectFile => Some((
+                    self.source_paths()?.object_owner(&entry.text.value)?,
+                    Contribution::DirectObject,
+                )),
+                _ => None,
+            }));
+        }
+    }
+}
+
+fn imported_languages(target: &Target, ctx: &EvalContext) -> Vec<BString> {
+    let property = b"IMPORTED_LINK_INTERFACE_LANGUAGES";
+    let configured = super::super::artifacts::selected_imported_config(target, &ctx.config)
+        .filter(|config| !config.is_empty())
+        .map(|config| [property.as_slice(), b"_", &config].concat());
+    configured
+        .as_ref()
+        .and_then(|key| target.props.get(key))
+        .or_else(|| target.props.get(property))
+        .map_or_else(Vec::new, |value| list::split(value, list::Empty::Drop))
+}

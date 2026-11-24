@@ -1,9 +1,9 @@
 //! Target names in exported link interfaces.
 
 use indexmap::IndexSet;
-use rcmake_base::{BString, list};
+use rcmake_base::{BString, list, truth};
 use rcmake_genex::{GenexNode, PreprocessMode, parse, render, rewrite_install_prefix};
-use rcmake_model::{DirId, ExportKind, InstallKind, ProjectModel, Target, TargetId};
+use rcmake_model::{DirId, ExportKind, InstallKind, ProjectModel, Target, TargetId, TargetKind};
 use std::collections::BTreeMap;
 
 use crate::{
@@ -35,6 +35,14 @@ pub(crate) fn qualify(
     let Some(target) = model.target(id) else {
         return Ok(packages);
     };
+    if target.kind == TargetKind::Executable
+        && !target
+            .props
+            .get(b"ENABLE_EXPORTS")
+            .is_some_and(|flag| truth::is_on(flag))
+    {
+        return Ok(packages);
+    }
     let contains = |set: &[u8]| {
         model
             .exports

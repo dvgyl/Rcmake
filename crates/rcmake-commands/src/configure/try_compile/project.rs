@@ -105,7 +105,8 @@ pub(super) fn write_project(
     let compile_flags: Vec<_> = options
         .many(b"COMPILE_DEFINITIONS")
         .iter()
-        .flat_map(|arg| compile_definition_words(cx, arg))
+        .flat_map(|arg| list::iter(arg, list::Empty::Drop))
+        .flat_map(|arg| compile_definition_words(cx, &arg))
         .collect();
     let code = render_project(
         ProjectInputs {
@@ -195,9 +196,14 @@ fn render_project(inputs: ProjectInputs<'_>, options: &Options<'_>, target: &str
                     definition.is_none().then_some(arg)
                 }
             })
+            .map(escape_definition_list_item)
             .collect();
         if !values.is_empty() {
-            cmake_command(&mut code, &format!("{command}({target} PRIVATE"), values);
+            cmake_command(
+                &mut code,
+                &format!("{command}({target} PRIVATE"),
+                values.iter().map(|value| value.as_slice()),
+            );
         }
     }
     if !archive {
@@ -320,6 +326,17 @@ fn source_language<'a>(cx: &mut Cx<'_>, file: &Path, enabled: &'a [BString]) -> 
                 _ => false,
             }
         })
+}
+
+fn escape_definition_list_item(value: &[u8]) -> BString {
+    let mut escaped = BString::default();
+    for &byte in value {
+        if byte == b';' {
+            escaped.push(b'\\');
+        }
+        escaped.push(byte);
+    }
+    escaped
 }
 
 fn compile_definition_words(cx: &mut Cx<'_>, value: &[u8]) -> Vec<BString> {

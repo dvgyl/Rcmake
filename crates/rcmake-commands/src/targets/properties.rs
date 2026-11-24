@@ -1,12 +1,15 @@
 use std::collections::BTreeSet;
 
 use rcmake_base::{BString, list, truth};
+use rcmake_diag::{Effect, MessageKind, PolicyId, PolicyStatus};
 use rcmake_eval::{CmdError, CmdResult, Cx, Flow};
 use rcmake_expr::ExpandedArg;
 use rcmake_model::{
     BT, DirId, FileSetId, FileSetKind, ModelError, ProjectModel, PropOrigin, PropScope, Target,
-    TargetBinding, TargetId, UsageScope,
+    TargetBinding, TargetId, TargetKind, UsageScope,
 };
+
+use rcmake_resolve::usage::UsageResolver;
 
 use super::{bytes, model_error};
 
@@ -130,7 +133,6 @@ pub(super) fn get(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
         ));
     };
     let dir = cx.current_dir_id();
-    let config = rcmake_genex::ConfigId(cx.var_or_empty(b"CMAKE_BUILD_TYPE"));
     let model = cx.project();
     let Some(binding) = model.lookup_target(dir, bytes(name)) else {
         return Err(super::reported(
@@ -143,42 +145,85 @@ pub(super) fn get(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
     };
     let owner = PropScope::Target(binding.id());
     let property = bytes(property);
-    let value = match (binding, property) {
-        (TargetBinding::Alias(id), b"ALIASED_TARGET") => {
-            model.target(id).map(|target| target.name.clone())
+    let location = target_location(cx, binding.id(), property);
+    let model = cx.project();
+    let value = if let Some(value) = location {
+        value
+    } else {
+        match (binding, property) {
+            (TargetBinding::Alias(id), b"ALIASED_TARGET") => {
+                model.target(id).map(|target| target.name.clone())
+            }
+            (TargetBinding::Alias(_), b"ALIAS_GLOBAL") => {
+                let local = model.dir(dir).local_targets.contains_key(bytes(name));
+                Some(if local { "FALSE" } else { "TRUE" }.into())
+            }
+            (_, b"MANUALLY_ADDED_DEPENDENCIES") => model.target(binding.id()).and_then(|target| {
+                let mut deps: Vec<_> = target
+                    .utility_deps
+                    .iter()
+                    .map(|dep| dep.value.as_slice())
+                    .collect();
+                deps.sort_unstable();
+                deps.dedup();
+                (!deps.is_empty()).then(|| list::join(deps))
+            }),
+            _ if model
+                .global
+                .defined_property(b"TARGET", property)
+                .is_some_and(|prop| prop.inherited) =>
+            {
+                model.get_prop_inherited(&owner, property)
+            }
+            _ => file_set_property(model, binding.id(), property)
+                .or_else(|| model.get_prop(&owner, property)),
         }
-        (TargetBinding::Alias(_), b"ALIAS_GLOBAL") => {
-            let local = model.dir(dir).local_targets.contains_key(bytes(name));
-            Some(if local { "FALSE" } else { "TRUE" }.into())
-        }
-        (_, b"LOCATION") if model.target(binding.id()).is_some_and(Target::is_imported) => {
-            model.target(binding.id()).and_then(|target| {
-                rcmake_resolve::lower::compute_artifacts(model, target, &config).file
-            })
-        }
-        (_, b"MANUALLY_ADDED_DEPENDENCIES") => model.target(binding.id()).and_then(|target| {
-            let mut deps: Vec<_> = target
-                .utility_deps
-                .iter()
-                .map(|dep| dep.value.as_slice())
-                .collect();
-            deps.sort_unstable();
-            deps.dedup();
-            (!deps.is_empty()).then(|| list::join(deps))
-        }),
-        _ if model
-            .global
-            .defined_property(b"TARGET", property)
-            .is_some_and(|prop| prop.inherited) =>
-        {
-            model.get_prop_inherited(&owner, property)
-        }
-        _ => file_set_property(model, binding.id(), property)
-            .or_else(|| model.get_prop(&owner, property)),
     };
     let value = value.unwrap_or_else(|| [bytes(var), b"-NOTFOUND"].concat().into());
     cx.set_var(bytes(var), value);
     Ok(Flow::Normal)
+}
+
+fn target_location(
+    cx: &mut Cx<'_>,
+    id: rcmake_model::TargetId,
+    property: &[u8],
+) -> Option<Option<BString>> {
+    let model = cx.project();
+    let target = model.target(id)?;
+    let config = UsageResolver::location_property_config(target.kind, property)?;
+    let name = target.name.clone();
+    if !target.is_imported() {
+        cx.issue(
+            MessageKind::Error,
+            Effect::SetError,
+            None,
+            format!("The LOCATION property may not be read from target \"{name}\".  Use the target name directly with add_custom_command, or use the generator expression $<TARGET_FILE>, as appropriate.\n").into(),
+        );
+        return Some(None);
+    }
+    if let Some(location) = UsageResolver::new(model).imported_runtime_location(target, &config) {
+        return Some(Some(location));
+    }
+    let policy = PolicyId::new(111);
+    let status = target.policies.policies.get(policy);
+    let property = if target.kind == TargetKind::SharedLibrary {
+        "IMPORTED_LOCATION or IMPORTED_IMPLIB"
+    } else {
+        "IMPORTED_LOCATION"
+    };
+    let config = if config.0.is_empty() {
+        String::new()
+    } else {
+        format!(" configuration \"{}\"", config.0)
+    };
+    let message = format!("{property} not set for imported target \"{name}\"{config}.");
+    match status {
+        PolicyStatus::New => cx.issue(MessageKind::Error, Effect::SetError, None, message.into()),
+        PolicyStatus::Warn => cx.issue_policy_warning(policy, b"", message.as_bytes()),
+        PolicyStatus::Old => {}
+    }
+    Some(Some(format!("{name}-NOTFOUND").into()))
 }
 
 const FILE_SET_KINDS: [(FileSetKind, &[u8]); 3] = [

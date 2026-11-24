@@ -1,4 +1,5 @@
 use rcmake_base::{BString, list};
+use rcmake_diag::{PolicyId, PolicyStatus};
 use rcmake_eval::{CmdError, CmdResult, Cx, Flow};
 use rcmake_expr::ExpandedArg;
 use rcmake_model::{
@@ -227,6 +228,7 @@ fn alias(
     }
     let referent = &referent.value;
     let dir = cx.current_dir_id();
+    let reject_collision = cx.policy(PolicyId::new(107)) == PolicyStatus::New;
     let model = cx.project();
     let id = match model.lookup_target(dir, referent) {
         None => {
@@ -255,6 +257,37 @@ fn alias(
         return Err(CmdError::status(format!(
             "cannot create ALIAS target \"{name}\" because target \"{referent}\" is not {kind}."
         )));
+    }
+    if !reject_collision && let Some(existing) = model.lookup_target(dir, name) {
+        let global = target.is_global();
+        let directories: Vec<_> = if global {
+            model.dirs().map(|(dir, _)| dir).collect()
+        } else {
+            model
+                .dirs()
+                .filter_map(|(child, _)| {
+                    model.ancestors(child).any(|id| id == dir).then_some(child)
+                })
+                .collect()
+        };
+        for dir in directories {
+            // A built target in this directory takes precedence over the alias.
+            let aliased = match existing {
+                TargetBinding::Target(current)
+                    if model
+                        .target(current)
+                        .is_some_and(|target| target.dir == dir && !target.is_imported()) =>
+                {
+                    current
+                }
+                _ => id,
+            };
+            model
+                .dir_mut(dir)
+                .local_targets
+                .insert(name.clone(), TargetBinding::Alias(aliased));
+        }
+        return Ok(Flow::Normal);
     }
     model.add_alias(dir, name.clone(), id).map_err(|err| {
         if matches!(err, ModelError::DuplicateTarget(_)) {

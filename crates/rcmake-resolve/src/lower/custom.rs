@@ -5,7 +5,7 @@ use std::cell::RefCell;
 use indexmap::{IndexMap, IndexSet};
 use rcmake_base::{BString, hash::HashAlgo, list, path_lex::Lexical, truth};
 use rcmake_diag::{PolicyId, PolicyStatus};
-use rcmake_genex::{ConfigId, EvalContext, EvalSite, evaluate, parse};
+use rcmake_genex::{ConfigId, EvalContext, EvalSite, evaluate_diagnostics, parse};
 use rcmake_model::{
     BT, CommandId, CustomCommand, CustomCommandKind, DirId, GeneratorKind, ProjectModel, Target,
     TargetEvent, TargetId, TargetKind,
@@ -29,6 +29,24 @@ pub(super) struct Commands<'a> {
     inputs: Vec<Vec<BString>>,
     pub(super) codegen: IndexSet<usize>,
     dependencies: Vec<IndexSet<TargetId>>,
+}
+
+fn command_result<T>(result: T, errors: Vec<ResolveError>) -> Result<T, ResolveError> {
+    let mut errors = errors.into_iter();
+    let Some(first) = errors.next() else {
+        return Ok(result);
+    };
+    if errors.len() == 0 {
+        return Err(first);
+    }
+    let mut diagnostics = first.to_string();
+    for error in errors {
+        if !diagnostics.ends_with('\n') {
+            diagnostics.push('\n');
+        }
+        diagnostics.push_str(&error.to_string());
+    }
+    Err(ResolveError::Message(diagnostics.into()))
 }
 
 impl<'a> Commands<'a> {
@@ -133,6 +151,7 @@ impl<'a> Commands<'a> {
             }
         }
         let mut invocations = Vec::new();
+        let mut errors = Vec::new();
         for line in &command.command_lines {
             let mut argv = Vec::new();
             for (index, arg) in line.iter().enumerate() {
@@ -142,12 +161,21 @@ impl<'a> Commands<'a> {
                     argument_config
                 }
                 .clone();
-                let value = eval.value(arg)?;
+                let value = match eval.value(arg) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        errors.push(error);
+                        continue;
+                    }
+                };
                 if command.command_expand_lists {
                     argv.extend(list::split(&value, list::Empty::Drop));
                 } else {
                     argv.push(value);
                 }
+            }
+            if !errors.is_empty() {
+                continue;
             }
             let Some(program) = argv.first_mut().filter(|program| !program.is_empty()) else {
                 continue;
@@ -166,6 +194,7 @@ impl<'a> Commands<'a> {
             }
             invocations.push(direct(argv, working_dir.clone()));
         }
+        command_result((), errors)?;
         for (id, config) in artifact_dependencies.into_inner() {
             if Some(id) != command_target(command)
                 && let Some(target) = self.model.target(id).filter(|target| !target.is_imported())
@@ -468,13 +497,20 @@ impl<'model, 'resolver> CommandEvaluation<'model, 'resolver> {
         if !value.windows(2).any(|pair| pair == b"$<") {
             return Ok(value.into());
         }
-        parse(value)
-            .and_then(|ast| evaluate(&ast, &self.context, &mut self.host))
+        let ast = parse(value)
+            .map_err(|error| error.at(&self.context.site.backtrace, self.host.source_root()))?;
+        evaluate_diagnostics(&ast, &self.context, &mut self.host)
             .map(|(value, _)| value)
-            .map_err(|error| {
-                error
-                    .at(&self.context.site.backtrace, self.host.source_root())
-                    .into()
+            .or_else(|errors| {
+                let diagnostics = errors
+                    .into_iter()
+                    .map(|error| {
+                        error
+                            .at(&self.context.site.backtrace, self.host.source_root())
+                            .into()
+                    })
+                    .collect();
+                command_result(BString::default(), diagnostics)
             })
     }
 

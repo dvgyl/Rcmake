@@ -34,7 +34,10 @@ pub(super) fn add(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
         .all(|ch| ch.is_ascii_alphanumeric() || b"_.+-".contains(ch))
     {
         Some(format!("invalid name for RULE: {name}."))
-    } else if name.iter().any(u8::is_ascii_uppercase) && !name.iter().any(u8::is_ascii_lowercase) {
+    } else if !name
+        .iter()
+        .any(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+    {
         Some("names in all uppercase are reserved for CMake.".to_owned())
     } else {
         None
@@ -54,23 +57,27 @@ pub(super) fn add(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
         .iter()
         .map(|arg| arg.value.as_slice())
         .collect::<Vec<_>>();
-    let derived = values.contains(&b"FROM_RULE".as_slice());
-    let mut parsed = Declaration::default();
-    if let Err(error) = parsed.parse(cx, name, &values, derived) {
-        return Err(CmdError::status(error));
-    }
-    let project = cx.project();
-    if project.custom_rule(dir, name).is_some() {
+    if cx.project().custom_rule(dir, name).is_some() {
         return Err(CmdError::status(format!(
             "cannot create RULE \"{name}\" because another RULE with the same name already exists."
         )));
     }
+    let derived = values.contains(&b"FROM_RULE".as_slice());
+    let mut parsed = Declaration::default();
+    parsed
+        .parse(cx, name, &values, derived)
+        .map_err(|error| error.issue(cx))?;
     let mut props = if let Some(base) = parsed.base {
-        project.custom_rule(dir, base).cloned().ok_or_else(|| CmdError::status(format!(
-            "cannot create RULE \"{name}\" because the RULE \"{}\" does not exist or is not accessible.", BString::from(base)
-        )))?
+        let parent = cx.project().custom_rule(dir, base).cloned();
+        parent.ok_or_else(|| {
+            RuleError::fatal(format!(
+                "cannot create RULE \"{name}\" because the RULE \"{}\" does not exist or is not accessible.",
+                BString::from(base)
+            ))
+            .issue(cx)
+        })?
     } else {
-        parsed.properties(name)?
+        parsed.properties(name).map_err(|error| error.issue(cx))?
     };
     props.set("NAME".into(), name.clone());
     props.set("PARENT_RULE".into(), parsed.base.unwrap_or_default().into());
@@ -83,14 +90,15 @@ pub(super) fn add(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
         (b"SOURCE_CONFIGURATORS".as_slice(), parsed.source),
     ] {
         let previous = props.get(key).filter(|text| !text.is_empty());
-        let value = match (previous, configurator) {
-            (Some(previous), Some((next, true))) => list::join([previous.as_slice(), next]),
-            (_, Some((next, _))) => next.into(),
-            (Some(previous), None) => previous.clone(),
-            (None, None) => BString::default(),
-        };
-        props.set(key.into(), value);
+        if let Some((next, chain)) = configurator {
+            let value = match previous.filter(|_| chain) {
+                Some(previous) => list::join([previous.as_slice(), next]),
+                None => next.into(),
+            };
+            props.set(key.into(), value);
+        }
     }
+    let project = cx.project();
     project.store_custom_rule((!parsed.global).then_some(dir), name.clone(), props);
     let declaration = Value::Array(
         values
@@ -106,6 +114,36 @@ pub(super) fn add(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
     };
     scope.set(key, write_compact(&declaration));
     Ok(Flow::Normal)
+}
+
+enum RuleError {
+    Status(&'static str),
+    Fatal(BString),
+}
+
+impl RuleError {
+    fn fatal(message: impl Into<BString>) -> Self {
+        Self::Fatal(message.into())
+    }
+
+    fn issue(self, cx: &mut Cx<'_>) -> CmdError {
+        match self {
+            Self::Status(message) => CmdError::status(message),
+            Self::Fatal(message) => {
+                cx.issue(
+                    MessageKind::Error,
+                    Effect::Fatal,
+                    None,
+                    [b"add_custom_rule ", message.as_slice()].concat().into(),
+                );
+                CmdError::Reported
+            }
+        }
+    }
+}
+
+fn is_configurator_option(key: &[u8]) -> bool {
+    matches!(key, b"FOR_FILE_SET" | b"FOR_SOURCE")
 }
 
 #[derive(Default)]
@@ -128,7 +166,7 @@ impl<'a> Declaration<'a> {
         name: &[u8],
         mut args: &[&'a [u8]],
         derived: bool,
-    ) -> Result<(), BString> {
+    ) -> Result<(), RuleError> {
         let singleton_options = if derived {
             (
                 b"FROM_RULE".as_slice(),
@@ -147,7 +185,7 @@ impl<'a> Declaration<'a> {
             .iter()
             .any(|key| args.iter().filter(|word| *word == key).count() > 1)
         {
-            return Err(message.into());
+            return Err(RuleError::Status(message));
         }
         let mut seen = BTreeSet::new();
         let mut missing = BTreeSet::new();
@@ -155,15 +193,31 @@ impl<'a> Declaration<'a> {
         while let Some((&key, rest)) = args.split_first() {
             let end = rest
                 .iter()
-                .position(|arg| OPTIONS.contains(arg))
+                .position(|arg| {
+                    OPTIONS.contains(arg)
+                        && (!is_configurator_option(arg)
+                            || key == b"CONFIGURATOR"
+                            || (configuring && is_configurator_option(key)))
+                })
                 .unwrap_or(rest.len());
             let (values, tail) = rest.split_at(end);
             args = tail;
-            if !seen.insert(key) && matches!(key, b"FOR_FILE_SET" | b"FOR_SOURCE") {
-                return Err("only one occurrence of \"FOR_FILE_SET\" or \"FOR_SOURCE\" sub-options of \"CONFIGURATOR\" option is allowed.".into());
+            if !is_configurator_option(key) {
+                configuring = key == b"CONFIGURATOR";
+            }
+            if !seen.insert(key) && configuring && is_configurator_option(key) {
+                return Err(RuleError::Status(
+                    "only one occurrence of \"FOR_FILE_SET\" or \"FOR_SOURCE\" sub-options of \"CONFIGURATOR\" option is allowed.",
+                ));
             }
             match key {
-                b"CONFIGURATOR" => configuring = true,
+                b"CONFIGURATOR" => {
+                    if args.first().is_none_or(|arg| !is_configurator_option(arg))
+                        && values.is_empty()
+                    {
+                        missing.insert(key);
+                    }
+                }
                 b"GLOBAL" => self.global = true,
                 b"FOR_FILE_SET" | b"FOR_SOURCE" if configuring => {
                     if let Some((&function, mode)) = values.split_first() {
@@ -176,17 +230,20 @@ impl<'a> Declaration<'a> {
                             None
                         };
                         if let Some(issue) = issue {
-                            return Err(format!(
+                            return Err(RuleError::fatal(format!(
                                 "command specified for \"{}\" {issue}: {}.",
                                 BString::from(key),
                                 BString::from(function)
-                            )
-                            .into());
+                            )));
                         }
                         let chain = mode.contains(&b"CHAIN".as_slice());
                         let override_ = mode.contains(&b"OVERRIDE".as_slice());
                         if chain && override_ {
-                            return Err(format!("cannot create RULE \"{}\" because the \"CHAIN\" and \"OVERRIDE\" options of CONFIGURATOR \"{}\" are mutually exclusive.", BString::from(name), BString::from(function)).into());
+                            return Err(RuleError::fatal(format!(
+                                "cannot create RULE \"{}\" because the \"CHAIN\" and \"OVERRIDE\" options of CONFIGURATOR \"{}\" are mutually exclusive.",
+                                BString::from(name),
+                                BString::from(function)
+                            )));
                         }
                         if let Some(extra) = mode
                             .iter()
@@ -221,7 +278,7 @@ impl<'a> Declaration<'a> {
                     continue;
                 }
                 b"OUTPUT" | b"COMMAND" | b"BYPRODUCTS" | b"DEPENDS" if !derived => {
-                    if values.is_empty() {
+                    if values.is_empty() && matches!(key, b"OUTPUT" | b"COMMAND") {
                         missing.insert(key);
                     }
                     match key {
@@ -248,14 +305,17 @@ impl<'a> Declaration<'a> {
             } else {
                 "arguments"
             };
-            return Err(format!("given invalid {count}:\n\n{}", entries.join("\n")).into());
+            return Err(RuleError::fatal(format!(
+                "given invalid {count}:\n\n{}",
+                entries.join("\n")
+            )));
         }
         Ok(())
     }
 
-    fn properties(&self, name: &[u8]) -> Result<PropertyMap, CmdError> {
+    fn properties(&self, name: &[u8]) -> Result<PropertyMap, RuleError> {
         if self.commands.is_empty() || self.outputs.is_empty() {
-            return Err(CmdError::status(format!(
+            return Err(RuleError::fatal(format!(
                 "cannot create RULE \"{}\" because the mandatory options \"COMMAND\" or \"OUTPUT\" are missing.",
                 BString::from(name)
             )));
@@ -285,6 +345,9 @@ impl<'a> Declaration<'a> {
     }
 }
 
-fn unknown(key: &[u8]) -> BString {
-    format!("given unknown argument: \"{}\".", BString::from(key)).into()
+fn unknown(key: &[u8]) -> RuleError {
+    RuleError::fatal(format!(
+        "given unknown argument: \"{}\".",
+        BString::from(key)
+    ))
 }

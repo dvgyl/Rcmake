@@ -1,7 +1,7 @@
 use rcmake_base::{BString, hash::HashAlgo, list_ops};
 use rcmake_regex::{MatchOptions, Regex, expand_replacement};
 
-use super::{Call, Evaluator, Value};
+use super::{Call, Evaluator, Value, operations::operation_arity};
 
 pub(super) fn convert(op: &[u8], value: &[u8]) -> BString {
     match op {
@@ -28,22 +28,44 @@ impl Evaluator<'_> {
     pub(super) fn string(&mut self, call: Call<'_>) -> Value {
         let args = self.arguments(call)?;
         let [op, rest @ ..] = args.as_slice() else {
-            return Err(call.arity(1));
+            return Err(call.error("$<STRING> expression requires at least one parameter."));
         };
+        let (minimum, maximum) = match op.as_slice() {
+            b"" => return Err(call.error("$<STRING> expression requires at least one parameter.")),
+            b"LENGTH" | b"TOLOWER" | b"TOUPPER" | b"HEX" | b"MAKE_C_IDENTIFIER" => (1, Some(1)),
+            b"SUBSTRING" => (3, Some(3)),
+            b"STRIP" | b"QUOTE" | b"HASH" => (2, Some(2)),
+            b"FIND" | b"MATCH" => (2, Some(3)),
+            b"REPLACE" => (3, Some(4)),
+            b"UUID" => (2, Some(4)),
+            b"RANDOM" => (0, Some(3)),
+            b"TIMESTAMP" => (0, Some(2)),
+            b"JOIN" | b"APPEND" | b"PREPEND" => (2, None),
+            b"ASCII" => (1, None),
+            _ => return Err(call.error(format!("{op}: invalid option."))),
+        };
+        if maximum == Some(minimum) && rest.len() != minimum {
+            return Err(operation_arity(call, op, None, "exactly", minimum));
+        }
+        if rest.len() < minimum {
+            return Err(operation_arity(call, op, None, "at least", minimum));
+        }
+        if let Some(maximum) = maximum.filter(|&maximum| rest.len() > maximum) {
+            return Err(operation_arity(call, op, None, "at most", maximum));
+        }
         match (op.as_slice(), rest) {
             (b"LENGTH", [value]) => Ok(value.len().to_string().into()),
             (b"SUBSTRING", [value, start, count]) => substring(call, value, start, count),
             (b"FIND", [value, needle]) => Ok(find(value, needle, false)),
-            (b"FIND", [value, from, needle])
-                if matches!(from.as_slice(), b"FROM:BEGIN" | b"FROM:END") =>
-            {
-                Ok(find(value, needle, from == "FROM:END"))
+            (b"FIND", [value, first, second]) => {
+                let (needle, reverse) =
+                    option_argument(call, first, second, "FROM", "BEGIN", "END")?;
+                Ok(find(value, needle, reverse))
             }
-            (b"MATCH", [value, pattern]) => self.regex_output(call, value, pattern, None, false),
-            (b"MATCH", [value, seek, pattern])
-                if matches!(seek.as_slice(), b"SEEK:ONCE" | b"SEEK:ALL") =>
-            {
-                self.regex_output(call, value, pattern, None, seek == "SEEK:ALL")
+            (b"MATCH", [value, pattern]) => self.string_regex(call, value, pattern, None, false),
+            (b"MATCH", [value, first, second]) => {
+                let (pattern, all) = option_argument(call, first, second, "SEEK", "ONCE", "ALL")?;
+                self.string_regex(call, value, pattern, None, all)
             }
             (b"REPLACE", [value, needle, replacement]) => {
                 self.replace_literal(value, needle, replacement)
@@ -52,8 +74,11 @@ impl Evaluator<'_> {
                 self.replace_literal(value, needle, replacement)
             }
             (b"REPLACE", [mode, value, pattern, replacement]) if mode == "REGEX" => {
-                self.regex_output(call, value, pattern, Some(replacement), true)
+                self.string_regex(call, value, pattern, Some(replacement), true)
             }
+            (b"REPLACE", [mode, ..]) => Err(call.error(format!(
+                "'{mode}' is unexpected.  'STRING' or 'REGEX' expected."
+            ))),
             (b"APPEND" | b"PREPEND" | b"JOIN", [value, items @ ..]) if !items.is_empty() => {
                 self.concatenate(op, value, items)
             }
@@ -61,13 +86,26 @@ impl Evaluator<'_> {
             (b"STRIP", [mode, value]) if mode == "SPACES" => {
                 Ok(list_ops::strip_spaces(value).into())
             }
+            (b"STRIP", [mode, _]) => {
+                Err(call.error(format!("'{mode}' is unexpected.  'SPACES' expected.")))
+            }
             (b"QUOTE", [mode, value]) if mode == "REGEX" => self.quote_regex(value),
+            (b"QUOTE", [mode, _]) => {
+                Err(call.error(format!("'{mode}' is unexpected.  'REGEX' expected.")))
+            }
             (b"HEX", [value]) => self.hex(value),
             (b"HASH", [value, algorithm]) => {
-                let algo = algorithm
-                    .strip_prefix(b"ALGORITHM:")
-                    .and_then(HashAlgo::parse)
-                    .ok_or_else(|| call.error("Invalid hash algorithm."))?;
+                let name = algorithm.strip_prefix(b"ALGORITHM:").ok_or_else(|| {
+                    call.error(format!(
+                        "{algorithm}: invalid parameter. Option 'ALGORITHM:' expected."
+                    ))
+                })?;
+                if name.is_empty() {
+                    return Err(call.error("Missing value for 'ALGORITHM:' option."));
+                }
+                let algo = HashAlgo::parse(name).ok_or_else(|| {
+                    call.error(format!("{}: invalid hash algorithm.", BString::from(name)))
+                })?;
                 Ok(algo.hex_digest(value).into())
             }
             (b"ASCII", [_, ..]) => rest
@@ -86,6 +124,23 @@ impl Evaluator<'_> {
             (b"TIMESTAMP", args) => self.timestamp(call, args),
             _ => Err(call.error(format!("Invalid arguments for $<STRING:{op}>."))),
         }
+    }
+
+    fn string_regex(
+        &mut self,
+        call: Call<'_>,
+        value: &[u8],
+        pattern: &[u8],
+        replacement: Option<&[u8]>,
+        all: bool,
+    ) -> Value {
+        let regex = Regex::new(pattern).map_err(|_| {
+            call.error(format!(
+                "Failed to compile regex \"{}\"",
+                BString::from(pattern)
+            ))
+        })?;
+        self.regex_output_compiled(call, &regex, value, replacement, all)
     }
 
     fn concatenate(&self, op: &[u8], value: &[u8], items: &[BString]) -> Value {
@@ -151,6 +206,17 @@ impl Evaluator<'_> {
         all: bool,
     ) -> Value {
         let regex = self.regex(call, pattern)?;
+        self.regex_output_compiled(call, &regex, value, replacement, all)
+    }
+
+    fn regex_output_compiled(
+        &mut self,
+        call: Call<'_>,
+        regex: &Regex,
+        value: &[u8],
+        replacement: Option<&[u8]>,
+        all: bool,
+    ) -> Value {
         let options = MatchOptions {
             bol_at_start: false,
             allow_empty_at_start: true,
@@ -219,26 +285,41 @@ impl Evaluator<'_> {
         let mut upper = false;
         for arg in args {
             if let Some(value) = arg.strip_prefix(b"NAMESPACE:") {
-                namespace = uuid_namespace(value);
+                if value.is_empty() {
+                    return Err(call.error("Invalid value for 'NAMESPACE:' option."));
+                }
+                namespace = Some(value);
             } else if let Some(value) = arg.strip_prefix(b"TYPE:") {
-                kind = HashAlgo::parse(value);
+                kind = Some(match value {
+                    b"MD5" => HashAlgo::Md5,
+                    b"SHA1" => HashAlgo::Sha1,
+                    _ => {
+                        return Err(call.error(
+                            "Invalid value for 'TYPE:' option.  'MD5' or 'SHA1' expected.",
+                        ));
+                    }
+                });
             } else if let Some(value) = arg.strip_prefix(b"NAME:") {
                 name = value;
             } else if arg == "CASE:UPPER" {
                 upper = true;
             } else if arg == "CASE:LOWER" {
                 upper = false;
+            } else if arg.starts_with(b"CASE:") {
+                return Err(
+                    call.error("Invalid value for 'CASE:' option.  'UPPER' or 'LOWER' expected.")
+                );
             } else {
-                return Err(call.error("Invalid UUID option."));
+                return Err(call.error(format!("{arg}: invalid parameter.")));
             }
         }
-        let mut input = namespace.ok_or_else(|| call.error("Invalid UUID namespace."))?;
+        let namespace =
+            namespace.ok_or_else(|| call.error("Required option 'NAMESPACE:' is missing."))?;
+        let hash = kind.ok_or_else(|| call.error("Required option 'TYPE:' is missing."))?;
+        let version = if hash == HashAlgo::Md5 { b'3' } else { b'5' };
+        let mut input =
+            uuid_namespace(namespace).ok_or_else(|| call.error("Invalid UUID namespace."))?;
         self.append(&mut input, name)?;
-        let (hash, version) = match kind {
-            Some(HashAlgo::Md5) => (HashAlgo::Md5, b'3'),
-            Some(HashAlgo::Sha1) => (HashAlgo::Sha1, b'5'),
-            _ => return Err(call.error("The UUID type must be MD5 or SHA1.")),
-        };
         let digest = hash.hex_digest(&input);
         let mut output = BString::default();
         for (index, mut byte) in digest.bytes().take(32).enumerate() {
@@ -270,29 +351,38 @@ impl Evaluator<'_> {
 
     fn random(&mut self, call: Call<'_>, args: &[BString]) -> Value {
         let mut count = 5;
-        let mut alphabet =
+        let default_alphabet =
             b"qwertyuiopasdfghjklzxcvbnmQWERTYUIOPASDFGHJKLZXCVBNM0123456789".as_slice();
+        let mut alphabet = default_alphabet;
         let mut seed = None;
         for arg in args {
             if let Some(value) = arg.strip_prefix(b"LENGTH:") {
                 count = list_ops::parse_index(value)
                     .and_then(|n| usize::try_from(n).ok())
                     .filter(|&n| n > 0 && n <= self.limits.max_value_bytes)
-                    .ok_or_else(|| call.error("Invalid random string length."))?;
+                    .ok_or_else(|| {
+                        call.error(format!(
+                            "{arg}: invalid numeric value for 'LENGTH:' option."
+                        ))
+                    })?;
             } else if let Some(value) = arg.strip_prefix(b"ALPHABET:") {
                 alphabet = value;
             } else if let Some(value) = arg.strip_prefix(b"RANDOM_SEED:") {
                 seed = Some(
                     list_ops::parse_index(value)
-                        .ok_or_else(|| call.error("Invalid random seed."))?
+                        .ok_or_else(|| {
+                            call.error(format!(
+                                "{arg}: invalid numeric value for 'RANDOM_SEED:' option."
+                            ))
+                        })?
                         .cast_unsigned(),
                 );
             } else {
-                return Err(call.error("Invalid random string option."));
+                return Err(call.error(format!("{arg}: invalid parameter.")));
             }
         }
-        if alphabet.is_empty() || !alphabet.is_ascii() {
-            return Err(call.error("The random string alphabet must contain ASCII characters."));
+        if alphabet.is_empty() {
+            alphabet = default_alphabet;
         }
         self.flags.context_sensitive |= seed.is_none();
         let mut state = seed
@@ -329,7 +419,7 @@ impl Evaluator<'_> {
             } else if format.is_none() {
                 format = Some(arg.as_slice());
             } else {
-                return Err(call.error("Invalid timestamp option."));
+                return Err(call.error("'UTC' option is expected."));
             }
         }
         self.host
@@ -338,9 +428,47 @@ impl Evaluator<'_> {
     }
 }
 
+fn option_argument<'a>(
+    call: Call<'_>,
+    first: &'a BString,
+    second: &'a BString,
+    key: &str,
+    default: &str,
+    alternate: &str,
+) -> Result<(&'a BString, bool), crate::GenexError> {
+    let prefix = format!("{key}:");
+    let mut flag = None;
+    let mut argument = first;
+    for item in [first, second] {
+        if let Some(option) = item.strip_prefix(prefix.as_bytes()) {
+            flag = Some(if option == default.as_bytes() {
+                false
+            } else if option == alternate.as_bytes() {
+                true
+            } else {
+                return Err(call.error(format!(
+                    "Invalid value for '{prefix}' option.  '{default}' or '{alternate}' expected."
+                )));
+            });
+        } else {
+            argument = item;
+        }
+    }
+    flag.map(|flag| (argument, flag))
+        .ok_or_else(|| call.error(format!("Expected option '{prefix}' is missing.")))
+}
+
 fn substring(call: Call<'_>, value: &[u8], start: &[u8], length: &[u8]) -> Value {
-    let start_index = list_ops::parse_index(start)
-        .and_then(|n| usize::try_from(n).ok())
+    let numeric = |value: &[u8]| {
+        list_ops::parse_index(value).ok_or_else(|| {
+            call.error(format!(
+                "index: \"{}\" is not a valid index",
+                BString::from(value)
+            ))
+        })
+    };
+    let start_index = usize::try_from(numeric(start)?)
+        .ok()
         .filter(|&n| n <= value.len())
         .ok_or_else(|| {
             call.error(format!(
@@ -350,9 +478,9 @@ fn substring(call: Call<'_>, value: &[u8], start: &[u8], length: &[u8]) -> Value
             ))
         })?;
     let remaining = value.get(start_index..).unwrap_or_default();
-    let count = match list_ops::parse_index(length) {
-        Some(-1) => remaining.len(),
-        Some(n) if n >= 0 => usize::try_from(n)
+    let count = match numeric(length)? {
+        -1 => remaining.len(),
+        n if n >= 0 => usize::try_from(n)
             .unwrap_or(usize::MAX)
             .min(remaining.len()),
         _ => {

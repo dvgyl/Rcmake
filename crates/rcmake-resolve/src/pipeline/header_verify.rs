@@ -396,12 +396,15 @@ fn verification_target(
         .map_err(|error| ResolveError::Message(error.to_string().into()))?;
     let original_name = BT::new(original.name.clone(), original.backtrace.clone());
     match side {
-        Side::Interface => {
+        Side::Interface
+            if original.kind != TargetKind::Executable || is_on(original, b"ENABLE_EXPORTS") =>
+        {
             target.usage.link_libraries = Some(vec![LinkItem {
                 text: original_name,
                 lookup_dir: original.dir,
             }]);
         }
+        Side::Interface => {}
         Side::Private => {
             for field in [
                 UsageField::CompileDefinitions,

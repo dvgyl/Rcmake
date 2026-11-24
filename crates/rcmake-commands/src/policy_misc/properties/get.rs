@@ -1,7 +1,10 @@
-use rcmake_base::{BString, list};
+use rcmake_base::{BString, list, truth};
+use rcmake_diag::{Effect, MessageKind, PolicyId, PolicyStatus};
 use rcmake_eval::{CmdError, CmdResult, Cx, Flow};
 use rcmake_expr::ExpandedArg;
-use rcmake_model::PropScope;
+use rcmake_host::{Follow, path};
+use rcmake_model::{DirId, PropScope, TargetKind};
+use rcmake_resolve::usage::UsageResolver;
 
 use super::computed::{boolean, directory_value, global_value, source_value};
 use super::file_set::{file_set_id, file_set_selection, file_set_target, file_set_value};
@@ -10,6 +13,48 @@ use super::scope::{
     source_scope, source_scopes, test_names,
 };
 use super::{is_inherited, model_value, quoted, values};
+
+fn target_location(
+    cx: &mut Cx<'_>,
+    id: rcmake_model::TargetId,
+    property: &[u8],
+) -> Option<Option<BString>> {
+    let model = cx.project();
+    let target = model.target(id)?;
+    let config = UsageResolver::location_property_config(target.kind, property)?;
+    let name = target.name.clone();
+    if !target.is_imported() {
+        cx.issue(
+            MessageKind::Error,
+            Effect::SetError,
+            None,
+            format!("The LOCATION property may not be read from target \"{name}\".  Use the target name directly with add_custom_command, or use the generator expression $<TARGET_FILE>, as appropriate.\n").into(),
+        );
+        return Some(None);
+    }
+    if let Some(location) = UsageResolver::new(model).imported_runtime_location(target, &config) {
+        return Some(Some(location));
+    }
+    let policy = PolicyId::new(111);
+    let status = target.policies.policies.get(policy);
+    let property = if target.kind == TargetKind::SharedLibrary {
+        "IMPORTED_LOCATION or IMPORTED_IMPLIB"
+    } else {
+        "IMPORTED_LOCATION"
+    };
+    let config = if config.0.is_empty() {
+        String::new()
+    } else {
+        format!(" configuration \"{}\"", config.0)
+    };
+    let message = format!("{property} not set for imported target \"{name}\"{config}.");
+    match status {
+        PolicyStatus::New => cx.issue(MessageKind::Error, Effect::SetError, None, message.into()),
+        PolicyStatus::Warn => cx.issue_policy_warning(policy, b"", message.as_bytes()),
+        PolicyStatus::Old => {}
+    }
+    Some(Some(format!("{name}-NOTFOUND").into()))
+}
 
 pub(in crate::policy_misc) fn get_directory(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
     let args = values(args);
@@ -119,9 +164,10 @@ fn query_source(
         }
     }
     let scope = source_scope(cx, dir, source);
-    if (create || name == b"LOCATION")
-        && let PropScope::Source { path, .. } = &scope
-    {
+    if name == b"LOCATION" {
+        return source_location(cx, dir, source, &scope);
+    }
+    if create && let PropScope::Source { path, .. } = &scope {
         cx.project()
             .dir_mut(dir)
             .source_props
@@ -137,6 +183,71 @@ fn query_source(
         ));
     }
     source_value(cx, &scope, name, inherited)
+}
+
+fn source_location(
+    cx: &mut Cx<'_>,
+    dir: DirId,
+    source: &[u8],
+    scope: &PropScope,
+) -> Option<BString> {
+    const EXTENSIONS: &str = "c C c++ cc cpp cxx cu mpp m M mm ixx cppm ccm cxxm c++m h hh h++ hm hpp hxx in txx f F for f77 f90 f95 f03 hip ispc";
+    let PropScope::Source { path: known, .. } = scope else {
+        return None;
+    };
+    let relative = path::to_native(source);
+    let source_path = crate::dirs::normalized_path(&cx.resolve_path(source));
+    let binary_path = crate::dirs::normalized_path(&cx.current_binary_dir().join(&relative));
+    let paths = [source_path, binary_path].map(|value| path::from_native_cmake(&value));
+    let is_generated = |cx: &mut Cx<'_>, path: &BString| {
+        let model = cx.project();
+        model.is_globally_generated(path) || model.dir(dir).generated_sources.contains(path)
+    };
+    let source_props = cx.project().dir(dir).source_props.get(known);
+    if source_props
+        .and_then(|props| props.get(b"GENERATED"))
+        .is_some_and(|value| truth::is_on(value))
+    {
+        return paths.get(1).cloned();
+    }
+    let policy = PolicyId::new(115);
+    let status = super::generated::policy(cx, dir, policy);
+    let accept = |cx: &mut Cx<'_>, path: &BString| {
+        is_generated(cx, path)
+            || cx
+                .host()
+                .metadata(&path::to_native(path), Follow::Yes)
+                .is_ok()
+    };
+    for path in paths {
+        if accept(cx, &path) {
+            return Some(path);
+        }
+        if status != PolicyStatus::New {
+            for extension in EXTENSIONS.split_ascii_whitespace() {
+                let candidate: BString = [path.as_slice(), b".", extension.as_bytes()]
+                    .concat()
+                    .into();
+                if accept(cx, &candidate) {
+                    if status == PolicyStatus::Warn {
+                        let detail = [b"File:\n\n  ", candidate.as_slice()].concat();
+                        cx.issue_policy_warning(policy, b"", &detail);
+                    }
+                    return Some(candidate);
+                }
+            }
+        }
+    }
+    let mut body: BString = [b"Cannot find source file:\n\n  ", source].concat().into();
+    if status != PolicyStatus::New {
+        body.extend_from_slice(b"\n\nTried extensions");
+        for extension in EXTENSIONS.split_ascii_whitespace() {
+            body.extend_from_slice(b" .");
+            body.extend_from_slice(extension.as_bytes());
+        }
+    }
+    cx.issue(MessageKind::Error, Effect::SetError, None, body);
+    None
 }
 
 #[derive(Clone, Copy)]
@@ -232,12 +343,9 @@ impl<'a> PropertyQuery<'a> {
             }
             QueryMode::Value | QueryMode::Set => {
                 let inherited = definition.is_some_and(|entry| entry.inherited);
-                let rule = matches!(self.owner, PropertyOwner::Rule(_));
                 let value = self.owner.value(cx, self.name, inherited)?;
                 if matches!(self.mode, QueryMode::Set) {
                     Some(boolean(value.is_some()))
-                } else if rule {
-                    Some(value.unwrap_or_else(|| "NOTFOUND".into()))
                 } else {
                     value
                 }
@@ -308,19 +416,32 @@ impl<'a> PropertyOwner<'a> {
             Self::Variable => cx.var(name),
             Self::Rule(rule) => {
                 let dir = cx.current_dir_id();
-                cx.project()
-                    .custom_rule(dir, rule)
-                    .ok_or_else(|| {
-                        CmdError::status(format!(
-                            "could not find RULE \"{}\".",
-                            BString::from(rule)
-                        ))
-                    })?
-                    .get(name)
-                    .cloned()
+                let properties = cx.project().custom_rule(dir, rule).ok_or_else(|| {
+                    CmdError::status(format!(
+                        "could not find RULE {}.  Perhaps it has not yet been created.",
+                        BString::from(rule)
+                    ))
+                })?;
+                if let Some(index) = super::rule::command_index(name) {
+                    let index = std::str::from_utf8(index)
+                        .ok()
+                        .and_then(|index| index.parse::<usize>().ok());
+                    Some(
+                        index
+                            .and_then(|index| properties.get(format!("COMMAND_{index}").as_bytes()))
+                            .cloned()
+                            .unwrap_or_else(|| "NOTFOUND".into()),
+                    )
+                } else {
+                    properties.get(name).cloned()
+                }
             }
             Self::Target(target) => {
-                let scope = PropScope::Target(find_target(cx, target)?);
+                let id = find_target(cx, target)?;
+                if let Some(value) = target_location(cx, id, name) {
+                    return Ok(value);
+                }
+                let scope = PropScope::Target(id);
                 alias_value(cx, target, name).or_else(|| model_value(cx, &scope, name, inherited))
             }
             Self::FileSet { set, target } => {

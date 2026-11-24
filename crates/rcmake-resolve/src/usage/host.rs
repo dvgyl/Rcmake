@@ -8,7 +8,8 @@ use rcmake_genex::{
     ArtifactKind, ArtifactPart, ConfigId, EvalContext, GenexError, GenexHost, InterfaceView,
     TargetHandle,
 };
-use rcmake_model::{DirId, PropScope, TargetBinding, TargetId};
+use rcmake_host::Host;
+use rcmake_model::{DirId, FileSetId, PropScope, TargetBinding, TargetId, UsageScope};
 
 use super::{UsageResolver, handle};
 use crate::{ResolveError, ResolvedTarget, lower::definition, sources::absolute_path};
@@ -29,6 +30,8 @@ impl<'a> ObjectPaths<'a> {
     }
 }
 
+type TimestampFormatter<'a> = dyn Fn(Option<&[u8]>, bool) -> Option<BString> + 'a;
+
 /// Generator expression adapter for a project model and a default lookup directory.
 pub struct ModelGenexHost<'model, 'resolver> {
     pub(super) resolver: &'resolver mut UsageResolver<'model>,
@@ -36,6 +39,8 @@ pub struct ModelGenexHost<'model, 'resolver> {
     pub(crate) current: Option<TargetHandle>,
     pub(crate) artifact_dependencies: Option<&'resolver RefCell<IndexSet<(TargetId, ConfigId)>>>,
     objects: Option<&'resolver ObjectPaths<'resolver>>,
+    clock: Option<&'resolver dyn Host>,
+    timestamp: Option<&'resolver TimestampFormatter<'resolver>>,
 }
 
 impl<'model, 'resolver> ModelGenexHost<'model, 'resolver> {
@@ -47,6 +52,8 @@ impl<'model, 'resolver> ModelGenexHost<'model, 'resolver> {
             current: None,
             artifact_dependencies: None,
             objects: None,
+            clock: None,
+            timestamp: None,
         }
     }
 
@@ -54,6 +61,18 @@ impl<'model, 'resolver> ModelGenexHost<'model, 'resolver> {
     #[must_use]
     pub fn with_object_paths(mut self, paths: &'resolver ObjectPaths<'resolver>) -> Self {
         self.objects = Some(paths);
+        self
+    }
+
+    /// Use the supplied clock and time zone to format timestamps.
+    #[must_use]
+    pub fn with_clock(
+        mut self,
+        host: &'resolver dyn Host,
+        format: &'resolver TimestampFormatter<'resolver>,
+    ) -> Self {
+        self.clock = Some(host);
+        self.timestamp = Some(format);
         self
     }
 
@@ -74,6 +93,68 @@ impl<'model, 'resolver> ModelGenexHost<'model, 'resolver> {
             .and_then(|target| self.id(target))
             .and_then(|id| self.resolver.model.target(id))
             .map_or(self.lookup_dir, |target| target.dir)
+    }
+
+    fn source_scope(&self, dir: DirId, scope: Option<(&[u8], &[u8])>) -> Result<DirId, BString> {
+        let model = self.resolver.model;
+        match scope {
+            Some((b"DIRECTORY", name)) => {
+                let path = absolute_path(&model.dir(dir).source_dir, name);
+                self.directory_id(&path)
+                    .ok_or_else(|| format!("Directory \"{path}\" is not known from CMake.").into())
+            }
+            Some((_, name)) => model
+                .find_target(dir, name)
+                .and_then(|id| model.target(id))
+                .map(|target| target.dir)
+                .ok_or_else(|| format!("Non-existent target: {}", BString::from(name)).into()),
+            None => Ok(dir),
+        }
+    }
+
+    fn directory_id(&self, path: &[u8]) -> Option<DirId> {
+        self.resolver
+            .model
+            .dirs()
+            .find_map(|(id, dir)| (dir.source_dir == path || dir.binary_dir == path).then_some(id))
+    }
+
+    fn registered_source(&self, dir: DirId, path: &[u8]) -> bool {
+        let model = self.resolver.model;
+        let directory = model.dir(dir);
+        if directory.source_props.contains_key(path) || directory.generated_sources.contains(path) {
+            return true;
+        }
+        let source = &directory.source_dir;
+        let matches_path = |value: &[u8]| {
+            !value.windows(2).any(|bytes| bytes == b"$<")
+                && list::split(value, list::Empty::Drop)
+                    .iter()
+                    .any(|entry| absolute_path(source, entry) == path)
+        };
+        directory.targets.iter().any(|id| {
+            model.target(*id).is_some_and(|target| {
+                target
+                    .sources
+                    .iter()
+                    .any(|entry| matches_path(&entry.value))
+                    || target.file_sets.iter().any(|id| {
+                        model.file_set(*id).is_some_and(|set| {
+                            set.files.iter().any(|entry| matches_path(&entry.value))
+                        })
+                    })
+            })
+        })
+    }
+
+    fn named_file_set(&self, target: TargetHandle, name: &[u8]) -> Option<FileSetId> {
+        let model = self.resolver.model;
+        let target = model.target(self.id(target)?)?;
+        target
+            .file_sets
+            .iter()
+            .copied()
+            .find(|id| model.file_set(*id).is_some_and(|set| set.name == name))
     }
 }
 
@@ -100,32 +181,9 @@ impl GenexHost for ModelGenexHost<'_, '_> {
         ctx: &EvalContext,
     ) -> Result<BString, BString> {
         let model = self.resolver.model;
-        let dir = self.directory(ctx);
-        let dir = match scope {
-            Some((b"DIRECTORY", name)) => {
-                let path = absolute_path(&model.dir(dir).source_dir, name);
-                model
-                    .dirs()
-                    .find(|(_, dir)| dir.source_dir == path || dir.binary_dir == path)
-                    .map(|(id, _)| id)
-                    .ok_or_else(|| {
-                        BString::from(format!("Directory \"{path}\" is not known from CMake."))
-                    })?
-            }
-            Some((_, name)) => model
-                .find_target(dir, name)
-                .and_then(|id| model.target(id))
-                .map(|target| target.dir)
-                .ok_or_else(|| {
-                    BString::from(format!("Non-existent target: {}", BString::from(name)))
-                })?,
-            None => dir,
-        };
-        let lookup = model.dir(if scope.is_some() {
-            self.directory(ctx)
-        } else {
-            dir
-        });
+        let origin = self.lookup_dir;
+        let dir = self.source_scope(origin, scope)?;
+        let lookup = model.dir(origin);
         let directory = model.dir(dir);
         let explicit = scope.is_some();
         let paths = [
@@ -135,7 +193,7 @@ impl GenexHost for ModelGenexHost<'_, '_> {
         let path = paths
             .iter()
             .flatten()
-            .find(|path| directory.source_props.contains_key(*path))
+            .find(|path| self.registered_source(dir, path))
             .or_else(|| {
                 paths
                     .iter()
@@ -168,6 +226,122 @@ impl GenexHost for ModelGenexHost<'_, '_> {
                 property,
             )
             .unwrap_or_default())
+    }
+
+    fn source_exists(
+        &self,
+        source: &[u8],
+        scope: Option<(&[u8], &[u8])>,
+        _ctx: &EvalContext,
+    ) -> Result<bool, BString> {
+        let model = self.resolver.model;
+        let origin = self.lookup_dir;
+        let dir = self.source_scope(origin, scope)?;
+        let absolute = absolute_path(&model.dir(origin).source_dir, source);
+        Ok(self.registered_source(dir, &absolute)
+            || (scope.is_none()
+                && self.registered_source(dir, &absolute_path(&model.dir(dir).binary_dir, source))))
+    }
+
+    fn file_set_exists(&self, target: TargetHandle, name: &[u8]) -> bool {
+        self.named_file_set(target, name).is_some()
+    }
+
+    fn file_set_property(
+        &self,
+        target: TargetHandle,
+        name: &[u8],
+        property: &[u8],
+    ) -> Option<BString> {
+        let model = self.resolver.model;
+        let id = self.named_file_set(target, name)?;
+        let set = model.file_set(id)?;
+        let entries = match property {
+            b"TYPE" => return Some(set.kind.as_str().into()),
+            b"SCOPE" => {
+                return Some(
+                    match set.scope {
+                        UsageScope::Private => "PRIVATE",
+                        UsageScope::Public => "PUBLIC",
+                        UsageScope::Interface => "INTERFACE",
+                    }
+                    .into(),
+                );
+            }
+            b"BASE_DIRS" => &set.base_dirs,
+            b"SOURCES" if set.scope != UsageScope::Interface => &set.files,
+            b"INTERFACE_SOURCES" if set.scope != UsageScope::Private => &set.files,
+            b"SOURCES" | b"INTERFACE_SOURCES" => return None,
+            _ => return model.get_prop(&PropScope::FileSet(id), property),
+        };
+        Some(list::join(entries.iter().map(|entry| &entry.value)))
+    }
+
+    fn global_property(&self, name: &[u8]) -> Option<BString> {
+        let model = self.resolver.model;
+        match name {
+            b"CMAKE_ROLE" => Some("PROJECT".into()),
+            b"GENERATOR_IS_MULTI_CONFIG" => Some(
+                if model
+                    .generator
+                    .is_some_and(rcmake_model::GeneratorKind::multi_config)
+                {
+                    "1"
+                } else {
+                    "0"
+                }
+                .into(),
+            ),
+            _ => model.get_prop(&PropScope::Global, name),
+        }
+    }
+
+    fn directory_property(
+        &self,
+        directory: &[u8],
+        property: &[u8],
+        _ctx: &EvalContext,
+    ) -> Result<Option<BString>, BString> {
+        let model = self.resolver.model;
+        let path = absolute_path(&model.dir(self.lookup_dir).source_dir, directory);
+        let dir = self.directory_id(&path).ok_or_else(|| {
+            BString::from(format!(
+                "Directory \"{}\" was not found.",
+                BString::from(directory)
+            ))
+        })?;
+        let scope = PropScope::Directory(dir);
+        if model
+            .global
+            .defined_property(b"DIRECTORY", property)
+            .is_some_and(|prop| prop.inherited)
+        {
+            Ok(model.get_prop_inherited(&scope, property))
+        } else {
+            Ok(model.get_prop(&scope, property))
+        }
+    }
+
+    fn directory_policy(&self, policy: &[u8], _ctx: &EvalContext) -> Option<bool> {
+        let policies = self
+            .resolver
+            .model
+            .dir(self.lookup_dir)
+            .final_policies
+            .as_ref()?;
+        Some(policies.get(PolicyId::parse(policy)?) == PolicyStatus::New)
+    }
+
+    fn timestamp(&self, format: Option<&[u8]>, utc: bool) -> Option<BString> {
+        self.timestamp?(format, utc)
+    }
+
+    fn random_seed(&self) -> Option<u64> {
+        let host = self
+            .clock
+            .or_else(|| self.resolver.source_paths().map(|paths| paths.host))?;
+        let now = host.now();
+        Some((now.secs as u64).rotate_left(11) ^ u64::from(now.nanos))
     }
 
     fn target_name(&self, target: TargetHandle) -> BString {

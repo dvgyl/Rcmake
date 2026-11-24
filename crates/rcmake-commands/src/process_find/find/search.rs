@@ -3,7 +3,7 @@ use std::fmt::Write as _;
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
-use rcmake_base::{BString, list};
+use rcmake_base::{BString, ByteSlice, list};
 use rcmake_diag::{FrameKind, PolicyId, PolicyStatus};
 use rcmake_eval::{CmdError, Cx, FindEvent, RunMode};
 use rcmake_expr::ExpandedArg;
@@ -141,43 +141,8 @@ impl<'a> Search<'a> {
             .iter()
             .map(|name| path::to_native(name))
             .collect();
-        if matches!(self.kind, Kind::File | Kind::Path)
-            && cx.host().system().sysname == b"Darwin"
-            && !matches!(
-                cx.var_or_empty(b"CMAKE_FIND_FRAMEWORK").as_slice(),
-                b"NEVER" | b"LAST"
-            )
-        {
-            for root in cmake_paths(cx, b"CMAKE_FRAMEWORK_PATH") {
-                let mut children = cx
-                    .host()
-                    .read_dir(&cx.resolve_path(&root))
-                    .unwrap_or_default();
-                children.sort_by(|a, b| a.name.cmp(&b.name));
-                for entry in children
-                    .iter()
-                    .filter(|entry| entry.name.ends_with(b".framework"))
-                {
-                    let framework = cx.resolve_path(&root).join(path::to_native(&entry.name));
-                    for headers in ["Headers", "PrivateHeaders"] {
-                        let dir = normalize(&framework.join(headers));
-                        if self.ignored.ignores_directory(&dir) {
-                            continue;
-                        }
-                        for name in &names {
-                            if let Some(found) = self.in_directory(cx, &dir, name)? {
-                                return Ok(Some(found));
-                            }
-                        }
-                    }
-                }
-            }
-            if cx.var_or_empty(b"CMAKE_FIND_FRAMEWORK") == b"ONLY" {
-                return Ok(None);
-            }
-        }
         let passes = match self.kind {
-            Kind::Library => FrameworkOrder::new(cx).passes(),
+            Kind::Library | Kind::File | Kind::Path => FrameworkOrder::new(cx).passes(),
             Kind::Program if cx.host().system().sysname == b"Darwin" => {
                 use SearchPass::{AppBundle, Regular};
                 match cx.var_or_empty(b"CMAKE_FIND_APPBUNDLE").as_slice() {
@@ -206,10 +171,16 @@ impl<'a> Search<'a> {
     ) -> Result<Option<PathBuf>, CmdError> {
         let search = match pass {
             SearchPass::Regular => Self::in_directory,
+            SearchPass::Framework if matches!(self.kind, Kind::File | Kind::Path) => {
+                Self::framework_header
+            }
             SearchPass::Framework => Self::framework,
             SearchPass::AppBundle => Self::app_bundle,
         };
-        if self.options.names_per_dir && !matches!(pass, SearchPass::AppBundle) {
+        if self.options.names_per_dir
+            && matches!(self.kind, Kind::Library | Kind::Program)
+            && !matches!(pass, SearchPass::AppBundle)
+        {
             for name in names.iter().filter(|name| name.is_absolute()) {
                 if let Some(found) = search(self, cx, Path::new(""), name)? {
                     return Ok(Some(found));
@@ -234,6 +205,62 @@ impl<'a> Search<'a> {
                         return Ok(Some(found));
                     }
                 }
+            }
+        }
+        Ok(None)
+    }
+
+    fn framework_header(
+        &mut self,
+        cx: &mut Cx<'_>,
+        root: &Path,
+        name: &Path,
+    ) -> Result<Option<PathBuf>, CmdError> {
+        if name.is_absolute() {
+            return Ok(None);
+        }
+        let name_text = path::from_native_cmake(name);
+        if let Some((framework, header)) = name_text.split_once_str(b"/") {
+            let framework_name: BString = [framework, b".framework"].concat().into();
+            let framework = root.join(path::to_native(&framework_name));
+            let path = framework.join("Headers").join(path::to_native(header));
+            let found = if matches!(self.kind, Kind::Path) {
+                &framework
+            } else {
+                &path
+            };
+            if !self.ignored.ignores_prefix(&path)
+                && candidate(cx, Kind::File, &path)
+                && self.validate(cx, found, false)?
+            {
+                self.match_path = Some(path.clone());
+                return Ok(Some(found.clone()));
+            }
+            let attempt = path::from_native_cmake(&path);
+            self.record(&attempt.to_string());
+            if let Some(event) = &mut self.event {
+                event.bytes = event.bytes.saturating_add(attempt.len() + 8);
+                if event.bytes <= 1024 * 1024 {
+                    event.attempted.push(attempt);
+                }
+            }
+        }
+
+        let mut entries = cx.host().read_dir(root).unwrap_or_default();
+        entries.sort_by(|a, b| a.name.cmp(&b.name));
+        for entry in entries
+            .iter()
+            .filter(|entry| entry.name.ends_with(b".framework"))
+        {
+            let headers = root.join(path::to_native(&entry.name)).join("Headers");
+            let path = headers.join(name);
+            if !self.ignored.ignores_prefix(&path) && candidate(cx, Kind::File, &path) {
+                self.match_path = Some(path.clone());
+                return Ok(Some(if matches!(self.kind, Kind::Path) {
+                    headers
+                } else {
+                    path
+                }));
             }
         }
         Ok(None)

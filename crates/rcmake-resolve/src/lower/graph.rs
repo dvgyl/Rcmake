@@ -3,9 +3,9 @@
 use std::collections::BTreeMap;
 
 use indexmap::{IndexMap, IndexSet};
-use rcmake_base::{BString, list};
+use rcmake_base::{BString, list, path_lex::Lexical, truth};
 use rcmake_diag::{PolicyId, PolicyStatus};
-use rcmake_genex::ConfigId;
+use rcmake_genex::{ConfigId, EvalContext};
 use rcmake_model::{
     BT, DirId, GeneratorKind, ProjectModel, Target, TargetEvent, TargetId, TargetKind,
 };
@@ -24,6 +24,8 @@ use crate::{
     CustomStep, GraphTarget, LinkFragmentRole, LinkKind, LinkStep, ResolveError, ResolvedTarget,
     Toolchain, sources::TargetInputs, unity::TargetUnity, usage::UsageResolver,
 };
+
+mod order;
 
 /// Lower resolved targets for one configuration.
 ///
@@ -59,7 +61,7 @@ pub(crate) fn lower_with_inputs(
     compile_inputs: &mut BTreeMap<BString, Vec<BString>>,
     cross: Option<CrossConfiguration<'_>>,
 ) -> Result<BuildGraph, ResolveError> {
-    let resolved: IndexMap<_, _> = targets
+    let resolved_targets: IndexMap<_, _> = targets
         .iter()
         .filter(|target| config.matches(&target.config.0))
         .map(|target| (target.id, target))
@@ -67,7 +69,7 @@ pub(crate) fn lower_with_inputs(
     let local: Vec<_> = model
         .targets()
         .filter_map(|(id, target)| {
-            let resolved = *resolved.get(&id)?;
+            let resolved = *resolved_targets.get(&id)?;
             (!target.is_imported()).then_some((target, resolved))
         })
         .collect();
@@ -80,10 +82,18 @@ pub(crate) fn lower_with_inputs(
         config: config.clone(),
         ..BuildGraph::default()
     };
-    let commands = Commands::new(model, &resolved, config, cross, usage, &mut graph.steps)?;
-    let precompiled = pch::Plans::new(model, &resolved, inputs, config, usage)?;
+    let commands = Commands::new(
+        model,
+        &resolved_targets,
+        config,
+        cross,
+        usage,
+        &mut graph.steps,
+    )?;
+    let precompiled = pch::Plans::new(model, &resolved_targets, inputs, config, usage)?;
     let rule_count = graph.steps.len();
     let mut unity_prerequisites = Vec::new();
+    let mut strong_edges = Vec::new();
     for &(target, resolved) in &local {
         let mut plan = TargetPlan::new(model, config, target, resolved, inputs.get(&resolved.id));
         let unity = usage
@@ -98,10 +108,17 @@ pub(crate) fn lower_with_inputs(
             &mut graph.steps,
         )?;
         let artifacts = artifacts(model, target, resolved);
+        let lint = lint_settings(model, resolved.id, usage, config)?;
+        let framework_dirs =
+            crate::resolve_link::framework_dirs(model, target, &resolved.dependencies, &|id| {
+                resolved_targets.get(&id)?.artifacts.file.as_ref()
+            });
         let objects = plan.add_compile_steps(
             &artifacts,
             &commands,
             &precompiled,
+            (&lint, &framework_dirs),
+            usage,
             &mut graph.steps,
             compile_inputs,
         )?;
@@ -121,15 +138,24 @@ pub(crate) fn lower_with_inputs(
             ide_custom.insert(resolved.id, rules.chain(events).collect());
         }
 
+        strong_edges.push(
+            plan.dependencies
+                .iter()
+                .filter_map(|id| target_indices.get(id).copied())
+                .collect(),
+        );
         graph.targets.push(GraphTarget {
             name: resolved.metadata.name.clone(),
             steps: plan.steps.into_iter().collect(),
             depends: plan
                 .dependencies
                 .iter()
+                .chain(&resolved.dependencies)
                 .filter(|id| **id != resolved.id)
                 .filter_map(|id| target_indices.get(id).copied())
                 .chain(unity_prerequisite)
+                .collect::<IndexSet<_>>()
+                .into_iter()
                 .collect(),
             in_all: !resolved.metadata.exclude_from_all
                 && !model.excluded_from_all(target)
@@ -138,6 +164,7 @@ pub(crate) fn lower_with_inputs(
         });
     }
     graph.targets.extend(unity_prerequisites);
+    order::dependencies(model, &local, &strong_edges, &mut graph.targets)?;
     if matches!(
         model.generator,
         Some(GeneratorKind::Ninja | GeneratorKind::NinjaMultiConfig | GeneratorKind::UnixMakefiles)
@@ -292,13 +319,11 @@ impl<'a> TargetPlan<'a> {
         resolved: &'a ResolvedTarget,
         inputs: Option<&'a TargetInputs>,
     ) -> Self {
-        let mut dependencies: IndexSet<_> = resolved.dependencies.iter().copied().collect();
-        dependencies.extend(
-            target
-                .utility_deps
-                .iter()
-                .filter_map(|dep| model.find_target(target.dir, &dep.value)),
-        );
+        let dependencies = target
+            .utility_deps
+            .iter()
+            .filter_map(|dep| model.find_target(target.dir, &dep.value))
+            .collect();
         Self {
             model,
             config,
@@ -372,6 +397,7 @@ impl<'a> TargetPlan<'a> {
                     depends: self
                         .dependencies
                         .iter()
+                        .chain(&resolved.dependencies)
                         .filter(|id| **id != resolved.id)
                         .filter_map(|id| target_indices.get(id).copied())
                         .collect(),
@@ -395,11 +421,17 @@ impl<'a> TargetPlan<'a> {
         Ok(unity_prerequisite)
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Compile lowering writes graph steps and prerequisite inputs."
+    )]
     fn add_compile_steps(
         &mut self,
         artifacts: &ArtifactSet,
         commands: &Commands<'_>,
         precompiled: &pch::Plans,
+        (lint, framework_dirs): (&IndexMap<BString, bool>, &[BString]),
+        usage: &mut UsageResolver<'_>,
         graph_steps: &mut Vec<BuildStep>,
         compile_inputs: &mut BTreeMap<BString, Vec<BString>>,
     ) -> Result<Vec<BString>, ResolveError> {
@@ -461,7 +493,10 @@ impl<'a> TargetPlan<'a> {
                             standard: required_standard,
                             pch: Some(PchFlags::Create(plan)),
                             position_independent,
+                            skip_file_set_linting: None,
+                            extra_framework_dirs: framework_dirs,
                         },
+                        usage,
                     )?;
                     let mut requires = vec![plan.header.clone()];
                     for header in &plan.project_headers {
@@ -488,7 +523,12 @@ impl<'a> TargetPlan<'a> {
                     standard: required_standard,
                     pch: pch.map(|(_, plan)| PchFlags::Use(plan)),
                     position_independent,
+                    skip_file_set_linting: lint
+                        .get(&Lexical::new(&unit.source.value).normalize())
+                        .copied(),
+                    extra_framework_dirs: framework_dirs,
                 },
+                usage,
             )?;
             if let BuildStep::Compile { object, dyndep, .. } = &mut step {
                 if let Some((_, plan)) = pch {
@@ -549,7 +589,8 @@ impl<'a> TargetPlan<'a> {
                 && usage.ide().is_none()
                 && let Some(paths) = usage.source_paths()
             {
-                let framework = super::framework::prepare(model, target, artifacts, paths.host)?;
+                let framework =
+                    prepare_framework(model, target, config, resolved, artifacts, paths.host)?;
                 after.invocations.splice(..0, framework.invocations);
                 after.depends.extend(framework.depends);
                 after.byproducts.extend(framework.byproducts);
@@ -565,6 +606,7 @@ impl<'a> TargetPlan<'a> {
                 step,
                 objects,
                 position_independent,
+                usage,
             )
             .map_err(|error| {
                 if let ResolveError::Message(body) = &error
@@ -609,6 +651,49 @@ impl<'a> TargetPlan<'a> {
 
         Ok(())
     }
+}
+
+fn lint_settings(
+    model: &ProjectModel,
+    target: TargetId,
+    usage: &mut UsageResolver<'_>,
+    config: &ConfigId,
+) -> Result<IndexMap<BString, bool>, ResolveError> {
+    let context = EvalContext {
+        config: config.clone(),
+        ..EvalContext::default()
+    };
+    let mut settings = IndexMap::new();
+    for (_, set) in usage.source_file_sets(target, &context)? {
+        let Some(value) = set.props.get(b"SKIP_LINTING").filter(|value| {
+            !value.is_empty() && value.as_slice() != b"NOTFOUND" && !value.ends_with(b"-NOTFOUND")
+        }) else {
+            continue;
+        };
+        let Some(owner) = model.target(set.target) else {
+            continue;
+        };
+        let files = usage.file_set_paths(set.target, b"SOURCES", &set.files, &context)?;
+        let directory = Lexical::new(&model.dir(owner.dir).source_dir);
+        for entry in files {
+            settings
+                .entry(Lexical::new(&directory.append(&entry.value)).normalize())
+                .or_insert_with(|| truth::is_on(value));
+        }
+    }
+    Ok(settings)
+}
+
+fn prepare_framework(
+    model: &ProjectModel,
+    target: &Target,
+    config: &ConfigId,
+    resolved: &ResolvedTarget,
+    artifacts: &ArtifactSet,
+    host: &dyn rcmake_host::Host,
+) -> Result<CustomStep, ResolveError> {
+    debug_assert!(config.matches(&resolved.config.0));
+    super::framework::prepare(model, target, artifacts, host)
 }
 
 fn link_step(

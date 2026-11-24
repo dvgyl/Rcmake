@@ -12,6 +12,13 @@ pub(super) fn parse(
     host: &dyn Host,
 ) -> Result<bool, String> {
     match arg.flag {
+        b"--link-no-warning-as-error" if arg.inline.is_none() => {
+            out(
+                host,
+                "Ignoring LINK_WARNING_AS_ERROR target property and CMAKE_LINK_WARNING_AS_ERROR variable.\n",
+            );
+            opts.ignore_link_warning_as_error = true;
+        }
         b"--log-context" => opts.log_context = true,
         b"--log-level" | b"--loglevel" => {
             let invalid = format!(

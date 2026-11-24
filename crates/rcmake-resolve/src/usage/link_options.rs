@@ -1,4 +1,4 @@
-use rcmake_base::{BString, list, shell::quote_always};
+use rcmake_base::{BString, list, shell::quote_always, truth};
 use rcmake_diag::{Location, MessageKind, PolicyId, PolicyStatus};
 use rcmake_genex::{EvalContext, UsageTraversal};
 use rcmake_model::{BT, ProjectModel, Target, TargetId, TargetKind};
@@ -102,7 +102,16 @@ impl<'a> Wrapper<'a> {
         prefix: &'a [u8],
     ) -> Self {
         let key = |suffix: &[u8]| [b"CMAKE_", language, b"_", prefix, suffix].concat();
-        let flags = definition(model, target.dir, &key(b"_WRAPPER_FLAG"))
+        let direct = prefix == b"LINKER"
+            && definition(
+                model,
+                target.dir,
+                &[b"CMAKE_", language, b"_LINK_MODE"].concat(),
+            )
+            .is_some_and(|mode| mode == b"LINKER");
+        let flags = (!direct)
+            .then(|| definition(model, target.dir, &key(b"_WRAPPER_FLAG")))
+            .flatten()
             .map_or_else(Vec::new, |value| list::split(value, list::Empty::Drop));
         let separator = definition(model, target.dir, &key(b"_WRAPPER_FLAG_SEP"))
             .filter(|value| !value.is_empty());
@@ -163,7 +172,7 @@ impl<'a> Wrapper<'a> {
     }
 }
 
-fn shell_arguments(input: &[u8]) -> Vec<BString> {
+pub(crate) fn shell_arguments(input: &[u8]) -> Vec<BString> {
     let mut args = Vec::new();
     let mut word = BString::default();
     let mut quote = None;
@@ -195,4 +204,42 @@ fn shell_arguments(input: &[u8]) -> Vec<BString> {
         args.push(word);
     }
     args
+}
+
+pub(crate) fn warning_as_error_options(
+    model: &ProjectModel,
+    target: &Target,
+) -> Result<Vec<BString>, BString> {
+    if !matches!(
+        target.kind,
+        TargetKind::Executable | TargetKind::SharedLibrary | TargetKind::ModuleLibrary
+    ) || definition(model, target.dir, b"_RCMAKE_IGNORE_LINK_WARNING_AS_ERROR")
+        .is_some_and(|flag| truth::is_on(flag))
+    {
+        return Ok(Vec::new());
+    }
+    let Some(value) = target
+        .props
+        .get(b"LINK_WARNING_AS_ERROR")
+        .filter(|value| !truth::is_off(value))
+    else {
+        return Ok(Vec::new());
+    };
+    if truth::is_on(value) {
+        return Ok(vec!["DRIVER".into(), "LINKER".into()]);
+    }
+    let mut modes = list::split(value, list::Empty::Drop);
+    modes.sort();
+    modes.dedup();
+    let invalid: Vec<_> = modes
+        .iter()
+        .filter(|mode| !matches!(mode.as_slice(), b"DRIVER" | b"LINKER"))
+        .map(|mode| mode.as_slice())
+        .collect();
+    if invalid.is_empty() {
+        Ok(modes)
+    } else {
+        let invalid = BString::from(invalid.join(b"\n  ".as_slice()));
+        Err(format!("Erroneous value(s) for 'LINK_WARNING_AS_ERROR' property of target '{}':\n\n  {invalid}", target.name).into())
+    }
 }

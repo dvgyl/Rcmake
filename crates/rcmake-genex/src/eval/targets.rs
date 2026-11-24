@@ -15,6 +15,7 @@ struct PropertyFrame {
     target: Option<TargetHandle>,
     kind: FrameKind,
     key: BString,
+    expression: Option<BString>,
     parent: Option<Rc<Self>>,
     depth: usize,
 }
@@ -34,7 +35,7 @@ pub(super) enum DAGEntry {
 
 impl DAGChecker {
     pub(super) fn root(ctx: &EvalContext) -> Option<Self> {
-        let target = ctx.current.or(ctx.head)?;
+        let target = ctx.current.or(ctx.head);
         let property = ctx.site.property.as_ref()?;
         ACTIVE.with(|active| {
             let parent = active.borrow().clone();
@@ -42,9 +43,10 @@ impl DAGChecker {
                 return None;
             }
             active.replace(Some(Rc::new(PropertyFrame {
-                target: Some(target),
+                target,
                 kind: FrameKind::Property,
                 key: property.clone(),
+                expression: None,
                 depth: 1,
                 parent: None,
             })));
@@ -56,6 +58,31 @@ impl DAGChecker {
         target: Option<TargetHandle>,
         kind: FrameKind,
         key: &[u8],
+        limit: u32,
+    ) -> Result<DAGEntry, GenexError> {
+        Self::enter_frame(target, kind, key, None, limit)
+    }
+
+    pub(super) fn enter_expression(
+        target: TargetHandle,
+        key: &[u8],
+        expression: BString,
+        limit: u32,
+    ) -> Result<DAGEntry, GenexError> {
+        Self::enter_frame(
+            Some(target),
+            FrameKind::Expression,
+            key,
+            Some(expression),
+            limit,
+        )
+    }
+
+    fn enter_frame(
+        target: Option<TargetHandle>,
+        kind: FrameKind,
+        key: &[u8],
+        expression: Option<BString>,
         limit: u32,
     ) -> Result<DAGEntry, GenexError> {
         ACTIVE.with(|active| {
@@ -81,10 +108,35 @@ impl DAGChecker {
                 target,
                 kind,
                 key: key.into(),
+                expression,
                 depth,
                 parent: parent.clone(),
             })));
             Ok(DAGEntry::Entered(Self(parent)))
+        })
+    }
+
+    pub(super) fn root_property() -> Option<BString> {
+        ACTIVE.with(|active| {
+            let active = active.borrow();
+            let mut frame = active.as_deref()?;
+            while let Some(parent) = frame.parent.as_deref() {
+                frame = parent;
+            }
+            (frame.kind == FrameKind::Property).then(|| frame.key.clone())
+        })
+    }
+
+    pub(super) fn loop_steps(expression: &BString) -> Vec<BString> {
+        ACTIVE.with(|active| {
+            let active = active.borrow();
+            let mut frame = active.as_deref();
+            let mut steps = Vec::new();
+            while let Some(entry) = frame {
+                steps.push(entry.expression.as_ref().unwrap_or(expression).clone());
+                frame = entry.parent.as_deref();
+            }
+            steps
         })
     }
 }
@@ -191,26 +243,11 @@ impl Evaluator<'_> {
         let arguments = self.arguments(call)?;
         let (source, scope, property) = match arguments.as_slice() {
             [source, property] => (source, None, property),
-            [source, option, property] => {
-                let scope = option
-                    .strip_prefix(b"DIRECTORY:")
-                    .map(|value| (b"DIRECTORY".as_slice(), value))
-                    .or_else(|| {
-                        option
-                            .strip_prefix(b"TARGET_DIRECTORY:")
-                            .map(|value| (b"TARGET_DIRECTORY".as_slice(), value))
-                    })
-                    .ok_or_else(|| {
-                        call.error("Invalid option.  DIRECTORY: or TARGET_DIRECTORY: expected.")
-                    })?;
-                if scope.1.is_empty() {
-                    return Err(call.error(format!(
-                        "No value provided for the {}: option.",
-                        BString::from(scope.0)
-                    )));
-                }
-                (source, Some(scope), property)
-            }
+            [source, option, property] => (
+                source,
+                Some(super::properties::source_scope(call, option)?),
+                property,
+            ),
             [] | [_] => {
                 return Err(
                     call.error("$<SOURCE_PROPERTY> expression requires at least two parameters.")
@@ -232,12 +269,7 @@ impl Evaluator<'_> {
                 "$<SOURCE_PROPERTY:src,prop> expression requires a non-empty property name.",
             ));
         }
-        if !property
-            .iter()
-            .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
-        {
-            return Err(call.error("Property name not supported."));
-        }
+        super::properties::validate_property(call, property)?;
         self.flags.context_sensitive = true;
         let value = self
             .host
@@ -432,7 +464,7 @@ impl Evaluator<'_> {
     }
 }
 
-fn valid_target(name: &[u8]) -> bool {
+pub(super) fn valid_target(name: &[u8]) -> bool {
     !name.is_empty()
         && name
             .iter()

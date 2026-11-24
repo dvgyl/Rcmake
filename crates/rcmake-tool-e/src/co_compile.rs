@@ -1,9 +1,11 @@
-//! Run supported analyzers before the compiler.
+//! Run analyzers before the compiler.
+
+mod pvs;
 
 use std::time::Duration;
 
 use rcmake_base::{BString, list};
-use rcmake_host::{CommandSpec, Follow, Input, Output, ProcessResult, RunRequest, Stream};
+use rcmake_host::{CommandSpec, Input, Output, ProcessResult, RunOutput, RunRequest, Stream};
 
 use super::{ToolCtx, error, path, split_once, write};
 
@@ -19,102 +21,218 @@ const TOOLS: &[&[u8]] = &[
 const MISSING_TOOL: &[u8] = b"__run_co_compile missing command to run. Looking for one or more of the following:\n--cppcheck=\n--cpplint=\n--icstat=\n--iwyu=\n--lwyu=\n--pvs-studio=\n--tidy=\n";
 
 pub(super) fn run(args: &[BString], cx: &ToolCtx<'_>) -> i32 {
-    let mut args = args.iter();
     let mut analyzers = Vec::new();
+    let mut launcher = Vec::new();
     let mut source = b"".as_slice();
-    loop {
-        match args.next() {
-            Some(arg) if arg == b"--" => break,
-            Some(arg) => {
-                match arg
-                    .strip_prefix(b"--")
-                    .and_then(|option| split_once(option, b'='))
-                {
-                    Some((b"source", value)) => source = value,
-                    Some((name, value)) if TOOLS.contains(&name) => analyzers.push((name, value)),
-                    _ => {
-                        return error(
-                            cx,
-                            &[b"__run_co_compile given unknown argument: ", arg, b"\n"],
-                        );
-                    }
-                }
-            }
-            None => {
+    let mut object = b"".as_slice();
+    let mut args = args.iter();
+    for arg in args.by_ref() {
+        if arg == b"--" {
+            break;
+        }
+        match arg
+            .strip_prefix(b"--")
+            .and_then(|option| split_once(option, b'='))
+        {
+            Some((b"source", value)) => source = value,
+            Some((b"object", value)) => object = value,
+            Some((b"launcher", value)) => list::split_into(value, list::Empty::Keep, &mut launcher),
+            Some((name, value)) if TOOLS.contains(&name) => analyzers.push((name, value)),
+            _ => {
                 return error(
                     cx,
-                    &[b"__run_co_compile missing -- before compile command\n"],
+                    &[b"__run_co_compile given unknown argument: ", arg, b"\n"],
                 );
             }
         }
     }
+    if analyzers.is_empty() {
+        return error(cx, &[MISSING_TOOL]);
+    }
+
     let compile = args.as_slice();
-    if compile.is_empty() {
+    let run_compiler = analyzers.iter().all(|(name, _)| *name != b"lwyu");
+    if run_compiler && compile.is_empty() {
         return error(
             cx,
             &[b"__run_co_compile missing compile command after --\n"],
         );
     }
-    if analyzers.is_empty() {
-        return error(cx, &[MISSING_TOOL]);
-    }
     for (name, command) in analyzers {
-        let code = analyze(cx, name, command, compile, source);
+        let command = list::split(command, list::Empty::Keep);
+        let code = if name == b"pvs-studio" {
+            pvs::analyze(cx, command, compile, source, object)
+        } else {
+            analyze(cx, name, command, compile, source)
+        };
         if code != 0 {
             return code;
         }
     }
-    execute(cx, compile, false)
+    if !run_compiler {
+        return 0;
+    }
+    launcher.extend_from_slice(compile);
+    execute(cx, &launcher, Output::Inherit, Output::Inherit)
+        .map_or_else(|code| code, |(code, _)| code)
 }
 
 fn analyze(
     cx: &ToolCtx<'_>,
     name: &[u8],
-    command: &[u8],
+    mut command: Vec<BString>,
     compile: &[BString],
     source: &[u8],
 ) -> i32 {
-    let mut command = list::split(command, list::Empty::Drop);
+    if command.first().is_none_or(|program| program.is_empty()) {
+        return error(cx, &[MISSING_TOOL]);
+    }
+    let mut stdout = Output::Capture;
+    let mut stderr = Output::Capture;
     match name {
         b"iwyu" => {
             command.extend(compile.iter().skip(1).cloned());
+            stdout = Output::Null;
         }
         b"tidy" => {
+            for file in command
+                .iter()
+                .filter_map(|arg| arg.strip_prefix(b"--export-fixes="))
+            {
+                let file = path(cx, file);
+                let _ = cx.host.remove_file(&file);
+                if let Some(parent) = file.parent() {
+                    let _ = cx.host.create_dir_all(parent);
+                }
+            }
+            let use_database = command.iter().any(|arg| arg == b"-p");
             command.push(source.into());
-            command.push("--".into());
-            command.extend_from_slice(compile);
+            if !use_database {
+                command.push("--".into());
+                command.extend_from_slice(compile);
+            }
         }
-        b"cppcheck" | b"cpplint" => command.push(source.into()),
+        b"cpplint" => {
+            command.push(source.into());
+            stderr = Output::SharedWithStdout;
+        }
+        b"cppcheck" => {
+            command.extend(compile.iter().filter_map(cppcheck_option));
+            command.push(source.into());
+        }
+        b"lwyu" => command.push(source.into()),
         _ => return error(cx, &[b"__run_co_compile does not support --", name, b"\n"]),
     }
-    let fixes = (name == b"tidy")
-        .then(|| {
-            command
+    let (code, out) = match execute(cx, &command, stdout, stderr) {
+        Ok(result) => result,
+        Err(code) => return code,
+    };
+    match name {
+        b"iwyu" => {
+            if [
+                b"should add these lines:".as_slice(),
+                b"should remove these lines:",
+            ]
+            .iter()
+            .any(|marker| contains(&out.stderr, marker))
+            {
+                write(
+                    cx,
+                    Stream::Stderr,
+                    &[
+                        b"Warning: include-what-you-use reported diagnostics:\n",
+                        &out.stderr,
+                        b"\n",
+                    ],
+                );
+            }
+            let errors_enabled = command
                 .iter()
-                .find_map(|arg| arg.strip_prefix(b"--export-fixes="))
-                .map(|file| path(cx, file))
-        })
-        .flatten();
-    let code = execute(cx, &command, name == b"iwyu");
-    if let Some(file) = fixes
-        && cx
-            .host
-            .metadata(&file, Follow::Yes)
-            .is_ok_and(|metadata| metadata.len == 0)
-    {
-        let _ = cx.host.remove_file(&file);
+                .position(|arg| arg.starts_with(b"--error"))
+                .and_then(|index| index.checked_sub(1))
+                .and_then(|index| command.get(index))
+                .is_some_and(|arg| arg == b"-Xiwyu");
+            if errors_enabled { code } else { 0 }
+        }
+        b"tidy" => {
+            write(cx, Stream::Stderr, &[&out.stdout]);
+            if code != 0 {
+                write(cx, Stream::Stderr, &[&out.stderr]);
+            }
+            code
+        }
+        b"cpplint" => {
+            if !out.stdout.is_empty() {
+                write(
+                    cx,
+                    Stream::Stderr,
+                    &[b"Warning: cpplint diagnostics:\n", &out.stdout],
+                );
+            }
+            0
+        }
+        b"cppcheck" => {
+            write(cx, Stream::Stderr, &[&out.stdout]);
+            if [
+                b"(error)".as_slice(),
+                b"(warning)",
+                b"(style)",
+                b"(performance)",
+                b"(portability)",
+                b"(information)",
+            ]
+            .iter()
+            .any(|marker| contains(&out.stderr, marker))
+            {
+                write(
+                    cx,
+                    Stream::Stderr,
+                    &[if code == 0 {
+                        b"Warning: cppcheck reported diagnostics:\n"
+                    } else {
+                        b"Error: cppcheck reported failure:\n"
+                    }],
+                );
+            }
+            write(cx, Stream::Stderr, &[&out.stderr]);
+            code
+        }
+        b"lwyu" => {
+            if contains(&out.stdout, b"Unused direct dependencies:") {
+                write(cx, Stream::Stderr, &[b"Warning: ", &out.stdout]);
+            }
+            0
+        }
+        _ => code,
     }
-    if name == b"cpplint" { 0 } else { code }
 }
 
-fn execute(cx: &ToolCtx<'_>, command: &[BString], iwyu: bool) -> i32 {
-    let Some((program, args)) = command.split_first() else {
-        return error(cx, &[MISSING_TOOL]);
-    };
-    let output = if iwyu {
-        Output::Capture
+fn cppcheck_option(arg: &BString) -> Option<BString> {
+    let (prefix, tail) = arg.split_first()?;
+    if !matches!(tail, [b'D' | b'I' | b'U', _, ..]) {
+        return None;
+    }
+    if *prefix == b'-' {
+        Some(arg.clone())
+    } else if cfg!(windows) && *prefix == b'/' {
+        Some([b"-", tail].concat().into())
     } else {
-        Output::Inherit
+        None
+    }
+}
+
+fn contains(text: &[u8], marker: &[u8]) -> bool {
+    text.windows(marker.len()).any(|part| part == marker)
+}
+
+fn execute(
+    cx: &ToolCtx<'_>,
+    command: &[BString],
+    stdout: Output,
+    stderr: Output,
+) -> Result<(i32, RunOutput), i32> {
+    let Some((program, args)) = command.split_first() else {
+        return Err(error(cx, &[MISSING_TOOL]));
     };
     let request = RunRequest {
         pipeline: vec![CommandSpec {
@@ -124,40 +242,22 @@ fn execute(cx: &ToolCtx<'_>, command: &[BString], iwyu: bool) -> i32 {
         cwd: cx.cwd.to_path_buf(),
         env: cx.host.env_all(),
         stdin: Input::Inherit,
-        stdout: output.clone(),
-        stderr: output,
+        stdout,
+        stderr,
         timeout: Some(Duration::from_secs(30 * 60)),
         tee: false,
     };
-    let result = cx.host.run(&request, &mut |_, _| {});
-    let failure = match result.as_ref() {
+    let failure = match cx.host.run_bounded(&request, 64 * 1024 * 1024) {
         Ok(output) => match output.results.first() {
-            Some(ProcessResult::Exited(_)) if iwyu => {
-                if output
-                    .stderr
-                    .windows(b"should add these lines:".len())
-                    .any(|part| part == b"should add these lines:")
-                {
-                    write(
-                        cx,
-                        Stream::Stderr,
-                        &[
-                            b"Warning: include-what-you-use diagnostics:\n",
-                            &output.stderr,
-                        ],
-                    );
-                }
-                return 0;
-            }
-            Some(ProcessResult::Exited(code)) => return *code,
-            Some(ProcessResult::SpawnFailed(err)) => err.os_message.as_str(),
-            Some(ProcessResult::TimedOut) => "Process terminated due to timeout",
-            Some(ProcessResult::Signaled(_)) => "Subprocess terminated",
-            None => "No subprocess result",
+            Some(ProcessResult::Exited(code)) => return Ok((*code, output)),
+            Some(ProcessResult::SpawnFailed(err)) => err.os_message.clone(),
+            Some(ProcessResult::TimedOut) => "Process terminated due to timeout".into(),
+            Some(ProcessResult::Signaled(_)) => "Subprocess terminated".into(),
+            None => "No subprocess result".into(),
         },
-        Err(err) => err.os_message.as_str(),
+        Err(err) => err.os_message,
     };
-    error(
+    Err(error(
         cx,
         &[
             b"Error running '",
@@ -166,5 +266,5 @@ fn execute(cx: &ToolCtx<'_>, command: &[BString], iwyu: bool) -> i32 {
             failure.as_bytes(),
             b"\n",
         ],
-    )
+    ))
 }

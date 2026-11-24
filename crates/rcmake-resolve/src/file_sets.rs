@@ -1,13 +1,14 @@
-//! Shared file set paths and install options.
+//! Shared paths for file sets and generated files.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{
-    ResolveError,
+    BuildGraph, BuildStep, ResolveError,
     usage::{UsageResolver, handle},
 };
 use rcmake_base::{BString, list, path_lex::Lexical};
 use rcmake_genex::{ConfigId, EvalContext, PreprocessMode, evaluate, parse, strip};
+use rcmake_host::{FileKind, Follow, Host, path::to_native};
 use rcmake_model::{FileSet, InstallOptions, ProjectModel, Target};
 
 /// Get the install options for a named file set in one install rule.
@@ -131,4 +132,88 @@ pub fn set_files(
         }
     }
     Ok(roots)
+}
+
+fn clang_tidy_fixes_directory(
+    model: &ProjectModel,
+    target: &Target,
+    language: &[u8],
+) -> Option<BString> {
+    let key = [language, b"_CLANG_TIDY_EXPORT_FIXES_DIR"].concat();
+    let directory = target.props.get(&key).filter(|value| !value.is_empty())?;
+    let path = Lexical::new(&model.dir(target.dir).binary_dir).append(directory);
+    Some(Lexical::new(&path).normalize())
+}
+
+pub(crate) fn clang_tidy_fixes_file(
+    model: &ProjectModel,
+    target: &Target,
+    language: &[u8],
+    object: &[u8],
+) -> Option<BString> {
+    let dir = clang_tidy_fixes_directory(model, target, language)?;
+    let object = crate::lower::build_relative(model, object);
+    let object = Lexical::new(&object)
+        .components()
+        .filter(|part| !matches!(*part, b"." | b".."))
+        .collect::<Vec<_>>()
+        .join(&b'/');
+    let filename = [object.as_slice(), b".yaml"].concat();
+    Some(Lexical::new(&dir).append(&filename))
+}
+
+pub(crate) fn clean_lint_fixes(model: &ProjectModel, host: &dyn Host, graphs: &[BuildGraph]) {
+    let files: BTreeSet<_> = graphs
+        .iter()
+        .flat_map(|graph| &graph.steps)
+        .filter_map(|step| match step {
+            BuildStep::Compile { invocation, .. } => Some(&invocation.argv),
+            _ => None,
+        })
+        .flat_map(|args| {
+            args.iter()
+                .skip_while(|arg| *arg != b"__run_co_compile")
+                .take_while(|arg| *arg != b"--")
+                .filter_map(|arg| arg.strip_prefix(b"--tidy="))
+        })
+        .flat_map(|command| list::iter(command, list::Empty::Drop))
+        .filter_map(|arg| arg.strip_prefix(b"--export-fixes=").map(to_native))
+        .collect();
+    let dirs: BTreeSet<_> = model
+        .targets()
+        .filter(|(_, target)| !target.is_imported())
+        .flat_map(|(_, target)| {
+            [b"C".as_slice(), b"CXX", b"OBJC", b"OBJCXX"]
+                .into_iter()
+                .filter_map(|language| clang_tidy_fixes_directory(model, target, language))
+        })
+        .map(|dir| to_native(&dir))
+        .filter(|dir| files.iter().any(|file| file.starts_with(dir)))
+        .collect();
+    for dir in dirs {
+        let mut pending = vec![(dir, 0)];
+        while let Some((dir, depth)) = pending.pop() {
+            if depth >= 64
+                || !host
+                    .metadata(&dir, Follow::No)
+                    .is_ok_and(|entry| entry.kind == FileKind::Dir)
+            {
+                continue;
+            }
+            let Ok(entries) = host.read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries {
+                let path = dir.join(to_native(&entry.name));
+                if entry.kind == FileKind::Dir {
+                    pending.push((path, depth + 1));
+                } else if entry.kind == FileKind::File
+                    && entry.name.ends_with(b".yaml")
+                    && !files.contains(&path)
+                {
+                    let _ = host.remove_file(&path);
+                }
+            }
+        }
+    }
 }

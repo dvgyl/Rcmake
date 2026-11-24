@@ -26,6 +26,7 @@ use crate::{
 };
 
 mod header_verify;
+mod rule_output_sets;
 
 /// Resolve and lower the project in configuration order.
 /// Use `CMAKE_BUILD_TYPE` if `configs` is empty.
@@ -60,6 +61,8 @@ fn resolve_project(
     options: &ResolveOptions,
     collect_source_errors: bool,
 ) -> Result<GenerationResult, ResolveError> {
+    let output_sets = rule_output_sets::prepare(model)?;
+    let model = output_sets.as_ref().unwrap_or(model);
     let rules = crate::target::instantiate_rules(model, host)?;
     let model = rules.as_ref().unwrap_or(model);
     crate::exports::source_sets::validate(model)?;
@@ -160,7 +163,11 @@ fn resolve_project(
     }
     warn_link_flags(model, host, &targets);
     let mut install =
-        lower::lower_install_manifest_with_configs(model, &targets, &configs, options.ide, host)?;
+        lower::lower_install_manifest_with_configs(model, &targets, &configs, options.ide, host)
+            .map_err(|error| match error {
+                ResolveError::Genex(error) => ResolveError::Genex(error.without_location()),
+                other => other,
+            })?;
     let exports = resolve_exports(
         model,
         &mut UsageResolver::new(model).with_ide(options.ide),
@@ -217,6 +224,7 @@ fn resolve_project(
     {
         toolchain.module_map_format = Some(format.as_str().into());
     }
+    crate::file_sets::clean_lint_fixes(model, host, &graphs);
     Ok(GenerationResult {
         configs,
         targets,

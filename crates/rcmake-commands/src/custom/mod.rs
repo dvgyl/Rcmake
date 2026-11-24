@@ -28,7 +28,9 @@ enum Section {
     #[default]
     None,
     Command,
-    Output,
+    Output {
+        supplied: bool,
+    },
     Target,
     Depends,
     Byproducts,
@@ -46,6 +48,7 @@ enum Section {
 impl Section {
     fn pending_value(self, body: &CustomCommand) -> Option<&'static str> {
         match self {
+            Self::Output { supplied: false } => Some("OUTPUT"),
             Self::Target => Some("TARGET"),
             Self::MainDependency => Some("MAIN_DEPENDENCY"),
             Self::WorkingDirectory => Some("WORKING_DIRECTORY"),
@@ -110,7 +113,7 @@ impl Options {
                 (Section::Command, "COMMAND")
             }
             b"ARGS" if !utility => return Some("ARGS"),
-            b"OUTPUT" if !utility => (Section::Output, "OUTPUT"),
+            b"OUTPUT" if !utility => (Section::Output { supplied: false }, "OUTPUT"),
             b"TARGET" if !utility => (Section::Target, "TARGET"),
             b"DEPENDS" => (Section::Depends, "DEPENDS"),
             b"BYPRODUCTS" => (Section::Byproducts, "BYPRODUCTS"),
@@ -165,7 +168,10 @@ impl Options {
                     line.push(value);
                 }
             }
-            Section::Output => body.outputs.push(tagged(value)),
+            Section::Output { .. } => {
+                body.outputs.push(tagged(value));
+                self.section = Section::Output { supplied: true };
+            }
             Section::Depends => body.depends.push(tagged(value)),
             Section::Byproducts => body.byproducts.push(tagged(value)),
             Section::Sources => self.sources.push(tagged(value)),
@@ -216,29 +222,6 @@ fn add_command(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
             "add_custom_command Wrong syntax.  Unknown type of argument.",
         ));
     }
-    if body.codegen {
-        let error = if body.outputs.is_empty() {
-            Some("CODEGEN requires at least 1 OUTPUT.")
-        } else if options.append {
-            Some("CODEGEN may not be used with APPEND.")
-        } else if options.keywords.contains("IMPLICIT_DEPENDS") {
-            Some("CODEGEN is not compatible with IMPLICIT_DEPENDS.")
-        } else if cx.policy(PolicyId::new(171)) != PolicyStatus::New {
-            Some("CODEGEN option requires policy CMP0171 be set to NEW!")
-        } else {
-            None
-        };
-        if let Some(error) = error {
-            return Err(CmdError::status(error));
-        }
-    }
-    if options.append && body.outputs.is_empty() {
-        return Err(crate::command_error(
-            cx,
-            "add_custom_command given APPEND option with no OUTPUT.",
-        ));
-    }
-
     for keyword in &options.missing_values {
         if !check_policy(
             cx,
@@ -259,8 +242,7 @@ fn add_command(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
     }
 
     match (&options.target, body.outputs.is_empty()) {
-        (Some(target), true) => return add_event(cx, body, &options, target),
-        (None, false) => {}
+        (None, false) | (Some(_), true) => {}
         (Some(_), false) => {
             return Err(crate::command_error(
                 cx,
@@ -272,6 +254,33 @@ fn add_command(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
                 "Wrong syntax. A TARGET or OUTPUT must be specified.",
             ));
         }
+    }
+
+    if options.append && body.outputs.is_empty() {
+        return Err(crate::command_error(
+            cx,
+            "add_custom_command given APPEND option with no OUTPUT.",
+        ));
+    }
+
+    if body.codegen {
+        let error = if body.outputs.is_empty() {
+            Some("CODEGEN requires at least 1 OUTPUT.")
+        } else if options.append {
+            Some("CODEGEN may not be used with APPEND.")
+        } else if options.keywords.contains("IMPLICIT_DEPENDS") {
+            Some("CODEGEN is not compatible with IMPLICIT_DEPENDS.")
+        } else if cx.policy(PolicyId::new(171)) != PolicyStatus::New {
+            Some("CODEGEN option requires policy CMP0171 be set to NEW!")
+        } else {
+            None
+        };
+        if let Some(error) = error {
+            return Err(CmdError::status(error));
+        }
+    }
+    if let Some(target) = &options.target {
+        return add_event(cx, body, &options, target);
     }
 
     let valid = if options.append {

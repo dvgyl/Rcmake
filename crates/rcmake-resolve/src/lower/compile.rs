@@ -1,9 +1,11 @@
 //! Compile flags and compiler rule expansion.
 
+mod lint;
+
 use indexmap::IndexSet;
 use rcmake_base::{BString, list, path_lex::Lexical, shell::quote, truth};
 use rcmake_genex::{ConfigId, EvalContext, evaluate, parse};
-use rcmake_model::{GeneratorKind, ProjectModel, Target};
+use rcmake_model::{DirId, GeneratorKind, ProjectModel, Target};
 
 use super::artifacts::is_darwin;
 use super::launcher;
@@ -14,7 +16,9 @@ use super::standard::standard_flag;
 use super::{
     definition, expand_rule, join, object_path, target_property, without_trailing_slashes,
 };
-use crate::{ArtifactSet, BuildStep, CompileGroup, CompileUnit, ResolveError};
+use crate::{
+    ArtifactSet, BuildStep, CompileGroup, CompileUnit, ResolveError, usage::UsageResolver,
+};
 
 pub(crate) fn language_flags(
     model: &ProjectModel,
@@ -93,9 +97,27 @@ pub(super) fn apple_flags(
             &[b"--target=", arch, b"-apple-", platform, version, suffix].concat(),
         ));
     }
-    if let Some(sdk) = definition(model, target.dir, b"CMAKE_OSX_SYSROOT").filter(|v| !v.is_empty())
+    let sysroot = definition(model, target.dir, b"CMAKE_OSX_SYSROOT")
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            definition(
+                model,
+                target.dir,
+                &[b"CMAKE_", language, b"_COMPILER_APPLE_SYSROOT_REQUIRED"].concat(),
+            )
+            .filter(|value| truth::is_on(value))
+            .and_then(|_| definition(model, target.dir, b"_CMAKE_OSX_SYSROOT_PATH"))
+        });
+    let sysroot_flag = definition(
+        model,
+        target.dir,
+        &[b"CMAKE_", language, b"_SYSROOT_FLAG"].concat(),
+    )
+    .map_or(b"-isysroot".as_slice(), |value| value.as_slice());
+    if let Some(sdk) = sysroot.filter(|value| !value.is_empty() && value.as_slice() != b"/")
+        && !sysroot_flag.is_empty()
     {
-        flags.push("-isysroot".into());
+        flags.push(sysroot_flag.into());
         flags.push(quote(sdk));
     }
     if !version.is_empty() && triple.is_none() {
@@ -205,27 +227,111 @@ fn includes(model: &ProjectModel, target: &Target, group: &CompileGroup) -> BStr
         .map(|path| Lexical::new(&path).normalize())
         .map(|path| BString::from(without_trailing_slashes(&path)))
         .collect();
+    let mut paths = IndexSet::new();
+    let mut frameworks = implicit_frameworks(model, target);
     join_words(group.includes.iter().filter_map(|include| {
-        let path = without_trailing_slashes(&include.path.value);
-        if !implicit.is_empty()
-            && implicit.contains(without_trailing_slashes(&Lexical::new(path).normalize()))
-        {
+        let path = clean_include_path(&include.path.value);
+        let identity = Lexical::new(&path).normalize();
+        let identity = without_trailing_slashes(&identity);
+        if implicit.contains(identity) || !paths.insert(path.clone()) {
             return None;
         }
-        let wrapper = Lexical::new(without_trailing_slashes(path));
-        if darwin && wrapper.filename().ends_with(b".framework") {
-            let parent = wrapper.parent();
-            let directory = if parent.is_empty() {
-                b".".as_slice()
-            } else {
-                parent
-            };
-            return Some(quote(&[b"-F", directory].concat()));
+        if darwin && let Some(directory) = framework_directory(&path) {
+            let identity = Lexical::new(directory).normalize();
+            return frameworks.insert(identity).then(|| {
+                framework_flag(model, target, &group.language, directory, include.system)
+            });
         }
         Some(if include.system {
-            join_words(["-isystem".into(), quote(path)])
+            join_words(["-isystem".into(), quote(&path)])
         } else {
-            quote(&[b"-I", path].concat())
+            quote(&[b"-I".as_slice(), &path].concat())
+        })
+    }))
+}
+
+fn clean_include_path(path: &[u8]) -> BString {
+    let path = without_trailing_slashes(path);
+    let lex = Lexical::new(path);
+    let root_end = path.len() - lex.relative_part().len();
+    let mut result = BString::from(path.get(..root_end).unwrap_or_default());
+    let mut parts = lex.components();
+    if let Some(first) = parts.next() {
+        result.extend_from_slice(first);
+    }
+    for part in parts {
+        result.push(b'/');
+        result.extend_from_slice(part);
+    }
+    result
+}
+
+fn framework_directory(path: &[u8]) -> Option<&[u8]> {
+    let path = Lexical::new(path);
+    path.filename().ends_with(b".framework").then(|| {
+        let parent = path.parent();
+        if parent.is_empty() {
+            b".".as_slice()
+        } else {
+            parent
+        }
+    })
+}
+
+fn framework_flag(
+    model: &ProjectModel,
+    target: &Target,
+    language: &[u8],
+    directory: &[u8],
+    system: bool,
+) -> BString {
+    let flag = |suffix| definition(model, target.dir, &[b"CMAKE_", language, suffix].concat());
+    let prefix = system
+        .then(|| flag(b"_SYSTEM_FRAMEWORK_SEARCH_FLAG"))
+        .flatten()
+        .filter(|value| !value.is_empty())
+        .or_else(|| flag(b"_FRAMEWORK_SEARCH_FLAG"))
+        .map_or(b"-F".as_slice(), |value| value.as_slice());
+    if prefix.ends_with(b" ") {
+        [prefix, &quote(directory)].concat().into()
+    } else {
+        quote(&[prefix, directory].concat())
+    }
+}
+
+fn implicit_frameworks(model: &ProjectModel, target: &Target) -> IndexSet<BString> {
+    definition(
+        model,
+        target.dir,
+        b"CMAKE_PLATFORM_IMPLICIT_LINK_FRAMEWORK_DIRECTORIES",
+    )
+    .into_iter()
+    .flat_map(|value| list::split(value, list::Empty::Drop))
+    .map(|value| Lexical::new(&value).normalize())
+    .collect()
+}
+
+fn linked_framework_includes(
+    model: &ProjectModel,
+    target: &Target,
+    group: &CompileGroup,
+    directories: &[BString],
+) -> BString {
+    if directories.is_empty() {
+        return BString::default();
+    }
+    let mut emitted = implicit_frameworks(model, target);
+    emitted.extend(group.includes.iter().filter_map(|include| {
+        let path = clean_include_path(&include.path.value);
+        framework_directory(&path).map(|path| Lexical::new(path).normalize())
+    }));
+    join_words(directories.iter().filter_map(|directory| {
+        let path = clean_include_path(directory);
+        emitted.insert(Lexical::new(&path).normalize()).then(|| {
+            let system = group.includes.iter().any(|include| {
+                include.system && Lexical::new(&path).equal(Lexical::new(&include.path.value))
+            });
+            framework_flag(model, target, &group.language, &path, system)
         })
     }))
 }
@@ -296,8 +402,14 @@ pub(super) struct Settings<'a> {
     pub(super) standard: Option<&'a [u8]>,
     pub(super) pch: Option<PchFlags<'a>>,
     pub(super) position_independent: Option<bool>,
+    pub(super) skip_file_set_linting: Option<bool>,
+    pub(super) extra_framework_dirs: &'a [BString],
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Compile lowering reuses the caller's usage resolution session."
+)]
 pub(super) fn compile(
     model: &ProjectModel,
     target: &Target,
@@ -306,6 +418,7 @@ pub(super) fn compile(
     unit: &CompileUnit,
     group: &CompileGroup,
     settings: Settings<'_>,
+    usage: &mut UsageResolver<'_>,
 ) -> Result<BuildStep, ResolveError> {
     let language = group.language.as_slice();
     let source = join(&model.dir(target.dir).source_dir, &unit.source.value);
@@ -318,6 +431,10 @@ pub(super) fn compile(
         &source,
         settings.position_independent,
     )?;
+    let includes = join_words([
+        includes,
+        linked_framework_includes(model, target, group, settings.extra_framework_dirs),
+    ]);
     if let Some(pch) = settings.pch {
         flags.extend(pch.options(model, target, language));
     }
@@ -375,6 +492,20 @@ pub(super) fn compile(
     });
     let lookup_paths = |key: &[u8]| match key {
         b"SOURCE" => Some(quote(&source)),
+        b"TARGET_NAME" => Some(quote(&target.name)),
+        b"LANGUAGE" => Some(quote(language)),
+        b"CMAKE_CURRENT_BINARY_DIR" => Some(quote(&model.dir(target.dir).binary_dir)),
+        b"CMAKE_BINARY_DIR" => Some(quote(&model.dir(DirId::ROOT).binary_dir)),
+        b"CMAKE_CL_SHOWINCLUDES_PREFIX" => Some(quote(
+            definition(model, target.dir, b"CMAKE_CL_SHOWINCLUDES_PREFIX")
+                .map_or(b"".as_slice(), |value| value.as_slice()),
+        )),
+        b"TARGET_SUPPORT_DIR" => Some(quote(
+            artifacts
+                .object_dir
+                .as_ref()
+                .map_or(b"".as_slice(), |value| value.as_slice()),
+        )),
         b"OBJECT" | b"DEP_TARGET" => Some(quote(&object)),
         b"DEP_FILE" => Some(quote(&depfile)),
         b"OBJECT_DIR" | b"OBJECT_FILE_DIR" => Some(quote(if key == b"OBJECT_DIR" {
@@ -410,13 +541,24 @@ pub(super) fn compile(
         source: Some(&source),
         language: &group.language,
     };
-    for invocation in &mut invocations {
-        *invocation = launch.launch_tool(
+    if let Some(invocation) = invocations.first_mut() {
+        *invocation = lint::launch(
             model,
             target,
-            b"_COMPILER_LAUNCHER",
+            &launch,
             std::mem::take(invocation),
+            settings.skip_file_set_linting,
+            usage,
         )?;
+    }
+    if let Some(prefix) = lint::rule_launcher(model, target, &launch, usage)? {
+        let prefix = expand_rule(&prefix, lookup_paths);
+        for invocation in &mut invocations {
+            let working_dir = invocation.working_dir.take();
+            let shell = join_words([prefix.clone(), std::mem::take(&mut invocation.shell)]);
+            *invocation = command(shell);
+            invocation.working_dir = working_dir;
+        }
     }
     let invocation = match invocations.len() {
         0 => {

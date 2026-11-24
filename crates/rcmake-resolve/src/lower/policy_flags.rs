@@ -132,28 +132,20 @@ impl<'a> Flags<'a> {
 }
 
 pub(crate) fn warn_about_wrappers(model: &ProjectModel, host: &dyn Host) {
-    const SUFFIXES: &[&[u8]] = &[
-        b"CLANG_TIDY",
-        b"INCLUDE_WHAT_YOU_USE",
-        b"CPPLINT",
-        b"CPPCHECK",
-    ];
     for (_, target) in model.targets().filter(|(_, target)| !target.is_imported()) {
-        for name in target.props.names() {
-            if (name == b"LINK_WHAT_YOU_USE".as_slice()
-                || name
-                    .splitn(2, |&byte| byte == b'_')
-                    .nth(1)
-                    .is_some_and(|suffix| SUFFIXES.contains(&suffix)))
-                && target
-                    .props
-                    .get(&name)
-                    .is_some_and(|value| !value.is_empty())
-            {
-                host.write_out(Stream::Stderr, format!(
-                    "Rcmake Warning: target property {name} on target '{}' is not implemented yet\n", target.name
-                ).as_bytes());
-            }
+        if target
+            .props
+            .get(b"LINK_WHAT_YOU_USE")
+            .is_some_and(|value| !value.is_empty())
+        {
+            host.write_out(
+                Stream::Stderr,
+                format!(
+                    "Rcmake Warning: target property LINK_WHAT_YOU_USE on target '{}' is not implemented yet\n",
+                    target.name,
+                )
+                .as_bytes(),
+            );
         }
     }
 }

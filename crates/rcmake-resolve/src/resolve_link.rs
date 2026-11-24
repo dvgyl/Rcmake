@@ -49,54 +49,22 @@ pub(crate) fn resolve_link(
     let facts = resolved
         .get(&id)
         .ok_or_else(|| ResolveError::Message("Missing resolved target.".into()))?;
-    let languages = std::iter::once(facts)
-        .chain(facts.dependencies.iter().filter_map(|id| resolved.get(id)))
-        .flat_map(|facts| {
-            facts
-                .compile_groups
-                .iter()
-                .map(|group| group.language.as_slice())
-        });
-    let fallback_language = ctx.link_language.clone();
-    let mut ctx = EvalContext {
-        link_language: lower::linker_language(model, target, languages.clone())
-            .or_else(|| fallback_language.clone()),
-        ..ctx.clone()
-    };
+    crate::usage::link_options::warning_as_error_options(model, target).map_err(|body| {
+        let body_text = rcmake_diag::format_paragraphs(&body, 2, 77);
+        paths.host.write_out(
+            rcmake_host::Stream::Stderr,
+            &([b"CMake Error:\n".as_slice(), &body_text, b"\n\n"].concat()),
+        );
+        ResolveError::Reported(body)
+    })?;
+    let mut ctx = ctx.clone();
+    ctx.link_language = usage.select_link_language(id, target, resolved, &ctx)?;
     let kind = LinkKind::for_target(target.kind);
-    let mut items = Vec::new();
-    if kind.is_some() {
-        items = usage.ordered_links(id, &ctx)?;
-        let language_for = |items: &[Arc<ResolvedLinkItem>]| {
-            let linked_languages = link_items(items)
-                .filter_map(|item| match item.kind {
-                    ResolvedLinkKind::Objects(id) => resolved.get(&id),
-                    _ => None,
-                })
-                .flat_map(|facts| {
-                    facts
-                        .compile_groups
-                        .iter()
-                        .map(|group| group.language.as_slice())
-                });
-            lower::linker_language(model, target, languages.clone().chain(linked_languages))
-                .or_else(|| fallback_language.clone())
-        };
-        let language = language_for(&items);
-        if language != ctx.link_language {
-            ctx.link_language = language;
-            items = usage.ordered_links(id, &ctx)?;
-            if language_for(&items) != ctx.link_language {
-                return Err(ResolveError::Message(
-                    format!(
-                        "The link language changed during link resolution for target {}.",
-                        target.name
-                    )
-                    .into(),
-                ));
-            }
-        }
-    }
+    let items = if kind.is_some() {
+        usage.ordered_links(id, &ctx)?
+    } else {
+        Vec::new()
+    };
     let linked_targets = usage.link_targets(id, &ctx)?;
     let position_independent = usage.validate_compatible(id, &ctx, paths)?;
     let mut link = ResolvedLink {
@@ -385,6 +353,32 @@ fn xcframework_root(
         .then(|| Lexical::new(&path).normalize())
 }
 
+pub(crate) fn framework_dirs<'a>(
+    model: &ProjectModel,
+    target: &Target,
+    dependencies: &[TargetId],
+    artifact: &impl Fn(TargetId) -> Option<&'a BString>,
+) -> Vec<BString> {
+    if !lower::is_darwin(model, target.dir) {
+        return Vec::new();
+    }
+    dependencies
+        .iter()
+        .filter_map(|&id| {
+            let dependency = model.target(id)?;
+            let layout = ide::bundle_kind(dependency);
+            if !matches!(layout, ide::BundleKind::Framework { .. }) {
+                return None;
+            }
+            let path = artifact(id)?;
+            let root = layout.root(path)?;
+            Some(Lexical::new(root).parent().into())
+        })
+        .collect::<IndexSet<_>>()
+        .into_iter()
+        .collect()
+}
+
 fn append_link_item(
     model: &ProjectModel,
     usage: &UsageResolver<'_>,
@@ -398,6 +392,28 @@ fn append_link_item(
     let value = item.text.value.as_slice();
     let (text, role) = match &item.kind {
         ResolvedLinkKind::Library(id) => {
+            if lower::is_darwin(model, dir)
+                && let Some(dependency) = model.target(*id).filter(|target| !target.is_imported())
+                && let layout @ ide::BundleKind::Framework { .. } = ide::bundle_kind(dependency)
+                && let Some(path) = resolved
+                    .get(id)
+                    .and_then(|target| target.artifacts.file.as_ref())
+                && let Some(root) = layout.root(path)
+            {
+                append_framework_dir(
+                    model,
+                    dir,
+                    Lexical::new(root).parent(),
+                    &item.text,
+                    fragments,
+                );
+                fragments.push(link_fragment(
+                    quote(&build_path(model, path)),
+                    &item.text,
+                    Libraries,
+                ));
+                return;
+            }
             let path = if let Some(target) = resolved.get(id) {
                 target
                     .artifacts
@@ -424,7 +440,9 @@ fn append_link_item(
             return;
         }
         ResolvedLinkKind::ObjectFile => (quote(value), Libraries),
-        ResolvedLinkKind::Raw if value.starts_with(b"LINKER:") => (value.into(), Libraries),
+        ResolvedLinkKind::Raw if value.starts_with(b"LINKER:") || value.starts_with(b"SHELL:") => {
+            (value.into(), Libraries)
+        }
         ResolvedLinkKind::Raw if value.contains(&b'/') && !value.starts_with(b"-") => {
             append_library_path(model, dir, value, &item.text, fragments);
             return;
@@ -461,26 +479,7 @@ fn append_library_path(
     if let Some(name) = path_view.filename().strip_suffix(b".framework")
         && !name.is_empty()
     {
-        let parent = Lexical::new(path_view.parent()).normalize();
-        let implicit = lower::definition(
-            model,
-            dir,
-            b"CMAKE_PLATFORM_IMPLICIT_LINK_FRAMEWORK_DIRECTORIES",
-        )
-        .is_some_and(|dirs| {
-            list::split(dirs, list::Empty::Drop)
-                .iter()
-                .any(|path| Lexical::new(path).normalize() == parent)
-        });
-        let directory = quote(&[b"-F", path_view.parent()].concat());
-        let role = LinkFragmentRole::FrameworkPath;
-        if !implicit
-            && !fragments
-                .iter()
-                .any(|fragment| fragment.role == role && fragment.text.value == directory)
-        {
-            fragments.push(link_fragment(directory, origin, role));
-        }
+        append_framework_dir(model, dir, path_view.parent(), origin, fragments);
         let framework = [b"-framework ", quote(name).as_slice()].concat().into();
         fragments.push(link_fragment(
             framework,
@@ -493,6 +492,35 @@ fn append_library_path(
             origin,
             LinkFragmentRole::Libraries,
         ));
+    }
+}
+
+fn append_framework_dir(
+    model: &ProjectModel,
+    dir: DirId,
+    directory: &[u8],
+    origin: &BT<BString>,
+    fragments: &mut Vec<LinkFragment>,
+) {
+    let parent = Lexical::new(directory).normalize();
+    let implicit = lower::definition(
+        model,
+        dir,
+        b"CMAKE_PLATFORM_IMPLICIT_LINK_FRAMEWORK_DIRECTORIES",
+    )
+    .is_some_and(|dirs| {
+        list::split(dirs, list::Empty::Drop)
+            .iter()
+            .any(|path| Lexical::new(path).normalize() == parent)
+    });
+    let directory = quote(&[b"-F", directory].concat());
+    let role = LinkFragmentRole::FrameworkPath;
+    if !implicit
+        && !fragments
+            .iter()
+            .any(|fragment| fragment.role == role && fragment.text.value == directory)
+    {
+        fragments.push(link_fragment(directory, origin, role));
     }
 }
 

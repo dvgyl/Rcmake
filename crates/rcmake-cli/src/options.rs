@@ -33,6 +33,8 @@ pub(crate) struct Options {
     pub cache_edits: Vec<CacheEdit>,
     pub check_system_vars: bool,
     pub warning_flags: Vec<BString>,
+    pub ignore_link_warning_as_error: bool,
+    pub regenerate_during_build: bool,
     pub generator: Option<BString>,
     pub architecture: Option<BString>,
     pub toolset: Option<BString>,
@@ -78,6 +80,7 @@ const LONG_OPTIONS: &[&[u8]] = &[
     b"--help-variable",
     b"--fresh",
     b"--regenerate-during-build",
+    b"--link-no-warning-as-error",
     b"--preset",
     b"--presets-file",
     b"--list-presets",
@@ -243,7 +246,9 @@ fn parse_project(
             });
         }
         _ => match arg.flag {
-            b"--regenerate-during-build" if arg.inline.is_none() => {}
+            b"--regenerate-during-build" if arg.inline.is_none() => {
+                opts.regenerate_during_build = true
+            }
             b"--graphviz" => {
                 opts.graphviz = Some(resolve_cli_path(
                     host,
