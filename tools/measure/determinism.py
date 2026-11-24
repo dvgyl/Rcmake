@@ -10,13 +10,14 @@ directories to check other inputs. Use --rcmake-bin for the generator suite.
 from __future__ import annotations
 
 import argparse
-from collections import Counter, defaultdict
+from collections import ChainMap, Counter, defaultdict
 from decimal import Decimal
 import hashlib
 import json
 import os
 from pathlib import Path
 import re
+import shlex
 import shutil
 import signal
 import subprocess
@@ -24,23 +25,28 @@ import sys
 import tempfile
 
 from mutation_eval import API, QUERIES, diff_bytes
-from ninja_canon import Normalizer
+from ninja_canon import ASSIGNMENT, MAX_INCLUDE_DEPTH, Normalizer, expand, statements, tokens
 from oracle_prop_test import executable
 
 
 ROOT = Path(__file__).resolve().parents[2]
 GENERATORS = ("Ninja", "Ninja Multi-Config", "Unix Makefiles", "Xcode")
-ARTIFACTS = ("build.ninja", "CMakeCache.txt", "compile_commands.json")
+ARTIFACTS = ("CMakeCache.txt", "compile_commands.json")
 NATIVE_FLAGS = ("--diagnostics=rich", "--profile")
+SCRATCH_PATH = re.compile(
+    r"(?P<prefix>(?:<build>/|(?<![\w./-]))CMakeFiles/CMakeScratch/TryCompile-)"
+    r"(?:[0-9a-f]+-(?P<index>[0-9a-f]+)|[a-zA-Z0-9]{6})(?=$|[/\\\s'\":;,|)\]])"
+)
+PHASE_TIME = re.compile(rb"(?m)^(-- (?:Configuring|Generating) done) \(\d+(?:\.\d+)?s\)(?=\r?$)")
+SPECULATIVE = re.compile(r"Spec-[0-9a-f]{16}-[0-9a-f]+")
 FIXTURE = {
     "CMakeLists.txt": """\
 cmake_minimum_required(VERSION 4.5)
 project(M6Determinism LANGUAGES C CXX)
-include(CheckCSourceCompiles)
-include(CheckCXXSourceCompiles)
-check_c_source_compiles("int main(void) { return 0; }" M6_C_PROBE)
-check_cxx_source_compiles("int main() { return 0; }" M6_CXX_PROBE)
-if(NOT M6_C_PROBE OR NOT M6_CXX_PROBE)
+try_compile(M6_C_PROBE SOURCE_FROM_CONTENT probe.c "int main(void) { return 0; }")
+try_compile(M6_CXX_PROBE SOURCE_FROM_CONTENT probe.cpp "int main() { return 0; }")
+try_compile(M6_OTHER_PROBE SOURCE_FROM_CONTENT other.c "int main(void) { return 1; }")
+if(NOT M6_C_PROBE OR NOT M6_CXX_PROBE OR NOT M6_OTHER_PROBE)
   message(FATAL_ERROR "A Milestone 6 compiler probe failed.")
 endif()
 add_library(c_part STATIC part.c)
@@ -104,9 +110,60 @@ def run(command: list, cwd: Path, env: dict[str, str], timeout: int) -> tuple[by
     return stdout, stderr
 
 
+def ninja_paths(paths: Normalizer) -> Normalizer:
+    """Match known paths in Ninja syntax, including escaped path characters."""
+    def escape(path: str) -> str:
+        return path.replace("$", "$$").replace(" ", "$ ").replace(":", "$:")
+
+    for path, label in list(paths.labels.items()):
+        paths.labels[escape(path)] = label
+        paths.labels[json.dumps(path, ensure_ascii=False)[1:-1]] = label
+    alternatives = "|".join(map(re.escape, sorted(paths.labels, key=len, reverse=True)))
+    paths.pattern = re.compile(
+        rf"(?:(?<![\w./-])|(?<=-[BSILF]))(?:{alternatives})"
+        r"(?=$|[/\s'\"\x60:;,|)&\]]|\$[ :]|\$\r?\n)"
+    )
+    return paths
+
+
 def normalized(data: bytes, paths: Normalizer) -> bytes:
-    """Replace known paths and preserve all other bytes."""
-    return paths.text(data.decode(errors="surrogateescape")).encode(errors="surrogateescape")
+    """Replace known paths and volatile IDs in generated scratch paths."""
+    value = paths.text(data.decode(errors="surrogateescape"))
+    value = SCRATCH_PATH.sub(lambda match: match["prefix"] + "<scratch>"
+                             + (match["index"] or ""), value)
+    return value.encode(errors="surrogateescape")
+
+
+def ninja_files(build: Path, paths: Normalizer) -> dict[str, bytes]:
+    """Read the manifest and all resolved include and subninja files."""
+    files = {}
+
+    def read(path: Path, scope: ChainMap, active: tuple[Path, ...]) -> None:
+        path = path.resolve()
+        if path in active or len(active) >= MAX_INCLUDE_DEPTH:
+            raise ValueError(f"Invalid Ninja include chain at {path}.")
+        name = str(path.relative_to(build)) if path.is_relative_to(build) else paths.text(str(path))
+        files[name] = normalized(path.read_bytes(), paths)
+
+        def lookup(key):
+            return scope.get(key, "")
+
+        for statement, _ in statements(path):
+            keyword, _, argument = statement.partition(" ")
+            if keyword in {"include", "subninja"}:
+                arguments = tokens(argument.lstrip(" "))
+                if len(arguments) != 1:
+                    raise ValueError(f"Expected one Ninja include path in {path}.")
+                included = expand(arguments[0], lookup)
+                if not included:
+                    raise ValueError(f"Empty Ninja include path in {path}.")
+                read(build / included, scope if keyword == "include" else scope.new_child(),
+                     (*active, path))
+            elif match := ASSIGNMENT.fullmatch(statement):
+                scope[match[1]] = expand(match[2], lookup)
+
+    read(build / "build.ninja", ChainMap(), ())
+    return files
 
 
 def file_api(build: Path, paths: Normalizer) -> dict[str, bytes]:
@@ -150,14 +207,17 @@ def file_api(build: Path, paths: Normalizer) -> dict[str, bytes]:
 
 
 def snapshot(build: Path, tool_paths: dict[Path, str]) -> dict[str, bytes]:
-    """Read the generated files with only build and executable paths replaced."""
-    paths = Normalizer(build, replacements=tool_paths)
+    """Read generated build files, including the full Ninja manifest."""
+    paths = ninja_paths(Normalizer(build, replacements=tool_paths))
     files = {name: normalized((build / name).read_bytes(), paths) for name in ARTIFACTS}
+    manifests = ninja_files(build.resolve(), paths)
+    if not manifests["build.ninja"].strip():
+        raise ValueError(f"Empty Ninja manifest in {build}.")
     if any(not data.strip() for data in files.values()):
         raise ValueError(f"Empty generated artifact in {build}.")
     if not json.loads(files["compile_commands.json"]):
         raise ValueError(f"No compile commands in {build}.")
-    return {**files, **file_api(build, paths)}
+    return {**manifests, **files, **file_api(build, paths)}
 
 
 def compare(expected: dict[str, bytes], actual: dict[str, bytes], label: str) -> None:
@@ -247,50 +307,171 @@ def configure(args, binary: Path, source: Path, build: Path, env: dict[str, str]
     return run(command, build.parent, env, args.timeout)
 
 
-def check_compat(streams: tuple[bytes, bytes], build: Path) -> bytes:
-    """Check both streams for ANSI escapes and return normalized stderr."""
-    if any(code in stream for stream in streams for code in (b"\x1b", b"\xc2\x9b")):
+def configure_streams(streams: tuple[bytes, bytes], build: Path, tools: dict[Path, str],
+                      *, compat: bool = True) -> dict[str, bytes]:
+    """Normalize paths and configure phase durations in the captured streams."""
+    if compat and any(code in stream for stream in streams for code in (b"\x1b", b"\xc2\x9b")):
         raise ValueError(f"ANSI escape in Compat output from {build}.")
-    return normalized(streams[1], Normalizer(build))
+    paths = Normalizer(build, replacements=tools)
+    stdout, stderr = (normalized(stream, paths) for stream in streams)
+    return {"stdout": PHASE_TIME.sub(rb"\g<1> (<elapsed>)", stdout), "stderr": stderr}
+
+
+COMPILER_OBSERVER = """\
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+import time
+
+compiler = sys.argv[1:]
+cwd = Path.cwd()
+log = os.environ.get("RCMAKE_M6_PROBE_LOG")
+scratch = next((part for part in cwd.parts
+                if re.fullmatch(r"TryCompile-.+|CMakeTmp|Spec-[0-9a-f]{16}-[0-9a-f]+", part)), None)
+if not log or not scratch or "-c" not in compiler:
+    os.execv(compiler[0], compiler)
+inputs = []
+for arg in compiler[compiler.index("-c") + 1:]:
+    path = Path(arg)
+    if path.suffix in (".c", ".cc", ".cpp", ".cxx", ".C") and path.is_file():
+        inputs.append(path.name)
+start = time.monotonic_ns()
+result = subprocess.run(compiler, check=False)
+record = json.dumps([str(cwd), scratch, inputs, start, time.monotonic_ns(), result.returncode])
+fd = os.open(log, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+os.write(fd, (record + "\\n").encode())
+os.close(fd)
+sys.exit(result.returncode)
+"""
+
+
+PROBE_INPUT_OBSERVER = """\
+case "$PWD" in
+    */TryCompile-*|*/CMakeTmp|*/CMakeTmp/*|*/Spec-*)
+        compile=no
+        for arg do
+            if [ "$arg" = -c ]; then compile=yes; break; fi
+        done
+        if [ "$compile" = yes ]; then
+            for arg do
+                case "$arg" in
+                    *.c|*.cc|*.cpp|*.cxx|*.C)
+                        if [ -f "$arg" ]; then
+                            printf '%s\\0' "${arg##*/}" >> "$RCMAKE_M6_PROBE_LOG"
+                        fi
+                        ;;
+                esac
+            done
+        fi
+        ;;
+esac
+"""
+
+
+def observe_compilers(root: Path, env: dict[str, str], *, intervals: bool = True) -> dict[str, str]:
+    """Record probe compiler intervals or inputs in a trial log."""
+    prefix = "#!/bin/sh\n"
+    observer = []
+    if intervals:
+        script = root / "observe-probe.py"
+        script.write_text(COMPILER_OBSERVER, encoding="utf-8")
+        observer = [sys.executable, str(script)]
+    else:
+        prefix += PROBE_INPUT_OBSERVER
+    log = root / ("probe-compiles.jsonl" if intervals else "probe-inputs.bin")
+    observed = {**env, "RCMAKE_M6_PROBE_LOG": str(log)}
+    for key, default in (("CC", "cc"), ("CXX", "c++")):
+        command = shlex.split(env.get(key) or default)
+        if not command or not (compiler := shutil.which(command[0], path=env.get("PATH"))):
+            continue
+        wrapper = root / f"observe-{key}"
+        wrapper.write_text(
+            f"{prefix}exec {shlex.join([*observer, compiler, *command[1:]])} \"$@\"\n",
+            encoding="utf-8",
+        )
+        wrapper.chmod(0o755)
+        observed[key] = shlex.quote(str(wrapper))
+    return observed
+
+
+def probe_compiles(env: dict[str, str]) -> list:
+    """Read the compiler calls from the current configure."""
+    path = Path(env["RCMAKE_M6_PROBE_LOG"])
+    return [json.loads(line) for line in path.read_text().splitlines()] if path.is_file() else []
+
+
+def overlap_on_workers(records: list) -> bool:
+    """Require two successful compiler calls in distinct, overlapping worker trees."""
+    active = {}
+    for _, scratch, inputs, start, end, status in sorted(records, key=lambda row: row[3]):
+        if status or not inputs or end <= start or not SPECULATIVE.fullmatch(scratch):
+            continue
+        active = {path: finish for path, finish in active.items() if finish > start}
+        if active.keys() - {scratch}:
+            return True
+        active[scratch] = max(end, active.get(scratch, 0))
+    return False
 
 
 def check_project(args, source: Path, work: Path, compat: Path, native: Path,
-                  reference: Path | None, enabled_flags: list[str], env: dict[str, str]) -> None:
-    """Check worker count, Compat stderr, and each available native flag."""
+                  reference: Path | None, enabled_flags: list[str], env: dict[str, str]) -> bool:
+    """Compare stable output and report whether parallel workers ran."""
     work.mkdir()
+    env = observe_compilers(work, env)
+    log = Path(env["RCMAKE_M6_PROBE_LOG"])
     paths = {compat: "<cmake-command>", native: "<cmake-command>"}
     build = work / "compat-jobs-1"
     streams = configure(args, compat, source, build, {**env, "RCMAKE_PROBE_JOBS": "1"})
     baseline = snapshot(build, paths)
-    baseline_err = check_compat(streams, build)
+    baseline_streams = configure_streams(streams, build, paths)
+    if overlap_on_workers(probe_compiles(env)):
+        raise ValueError("Parallel probe workers ran with RCMAKE_PROBE_JOBS=1.")
     if reference:
         build = work / "stderr-reference"
-        stderr = check_compat(configure(args, reference, source, build, env), build)
-        compare({"stderr": stderr}, {"stderr": baseline_err}, "Compat jobs 1")
+        streams = configure(args, reference, source, build, env)
+        reference_stderr = configure_streams(streams, build, {reference: "<cmake-command>"})["stderr"]
+        compare({"stderr": reference_stderr}, {"stderr": baseline_streams["stderr"]}, "Compat jobs 1")
 
     env = {**env, "RCMAKE_PROBE_JOBS": "4"}
+    parallel = False
     for label, binary, overrides in (
         ("compat-jobs-4", compat, {}),
         ("oracle-mode", native, {"RCMAKE_ORACLE_MODE": "1", "RCMAKE_DIAGNOSTICS": "rich"}),
     ):
+        log.unlink(missing_ok=True)
         build = work / label
-        stderr = check_compat(configure(args, binary, source, build, {**env, **overrides}), build)
-        compare({**baseline, "stderr": baseline_err},
-                {**snapshot(build, paths), "stderr": stderr}, label)
+        streams = configure(args, binary, source, build, {**env, **overrides})
+        compare({**baseline, **baseline_streams},
+                {**snapshot(build, paths), **configure_streams(streams, build, paths)}, label)
+        if label == "compat-jobs-4":
+            parallel = overlap_on_workers(probe_compiles(env))
 
     for flag in enabled_flags:
         label = flag[2:].split("=")[0]
         build = work / label
-        _, stderr = configure(args, native, source, build, env, flag)
-        compare(baseline, snapshot(build, paths), label)
+        streams = configure_streams(configure(args, native, source, build, env, flag),
+                                    build, paths, compat=False)
+        compare({**baseline, "stdout": baseline_streams["stdout"]},
+                {**snapshot(build, paths), "stdout": streams["stdout"]}, label)
         if flag == "--profile":
             check_profile(build)
-        elif not args.projects and stderr == baseline_err:
-            raise ValueError("The rich diagnostics flag did not change the fixture warning.")
+        elif not args.projects:
+            rich = streams["stderr"]
+            warning = b"Milestone 6 diagnostic sample."
+            if warning not in rich or warning not in baseline_streams["stderr"] or rich == baseline_streams["stderr"]:
+                raise ValueError("The rich diagnostics flag did not change the fixture warning.")
 
-    print(f"PASS {source.name}. {len(baseline)} files match. Compat stderr matches and has no ANSI escapes.")
+    print(f"PASS {source.name} output. {len(baseline)} files and both Compat streams match.")
+    if parallel:
+        print(f"PASS {source.name} parallel probes. Compiler calls overlapped in distinct worker trees.")
+    else:
+        print(f"UNAVAILABLE {source.name} parallel probes. No overlapping compiler calls in probe workers.")
     for flag in enabled_flags:
         print(f"PASS {source.name} {flag}.")
+    return parallel
 
 
 def persona_path(binary: Path, name: str, aliases: Path) -> Path:
@@ -363,12 +544,13 @@ def check_generators(args, binary: Path, root: Path, env: dict[str, str]) -> int
             snapshots = []
             for suffix in ("a", "b"):
                 build = root / f"generator-{index}" / f"bld-{suffix}"
-                run([binary, "-S", source, "-B", build, "-G", name], root, env, args.timeout)
-                snapshots.append(generator_snapshot(build))
-            if not snapshots[0]:
-                raise ValueError("No generated files.")
+                streams = run([binary, "-S", source, "-B", build, "-G", name], root, env, args.timeout)
+                generated = generator_snapshot(build)
+                if not generated:
+                    raise ValueError("No generated files.")
+                snapshots.append({**generated, **configure_streams(streams, build, {}, compat=False)})
             compare(*snapshots, name)
-            print(f"PASS {name}. {len(snapshots[0])} files match.")
+            print(f"PASS {name}. {len(snapshots[0]) - 2} files and both streams match.")
         except (OSError, ValueError, subprocess.SubprocessError) as error:
             failures += 1
             print(f"FAIL {name}. {error}", file=sys.stderr)
@@ -402,18 +584,20 @@ def main() -> int:
             print(f"Executable {binary}. Compare two clean builds per available generator.")
             return 0
         with tempfile.TemporaryDirectory(prefix="rcmake-determinism-", dir="/tmp") as directory:
-            return check_generators(args, executable(binary), Path(directory).resolve(), dict(os.environ))
+            return check_generators(args, executable(binary), Path(directory).resolve(),
+                                    dict(os.environ, SOURCE_DATE_EPOCH="946684800", TZ="UTC"))
     if args.dry_run:
         print(f"Executable {args.rcmake}. Projects {', '.join(map(str, args.projects)) or 'built-in C/C++ fixture'}.")
         print("Compare Compat jobs 1 and 4, oracle mode, and the available native flags.")
-        print("Check Ninja, the CMake cache, compile commands, File API replies, stderr, and profile files.")
+        print("Check Ninja, the CMake cache, compile commands, File API replies, both streams, and profiles.")
         if args.baseline:
             print(f"Compare Compat stderr with {args.baseline}.")
         return 0
 
     env = {key: value for key, value in os.environ.items()
            if not key.startswith(("RCMAKE_", "CMAKE_")) or key == "RCMAKE_VENDORED_DATA_ROOT"}
-    env.update(LC_ALL="C", CLICOLOR_FORCE="1", CMAKE_COLOR_DIAGNOSTICS="OFF", COPYFILE_DISABLE="1")
+    env.update(LC_ALL="C", CLICOLOR_FORCE="1", CMAKE_COLOR_DIAGNOSTICS="OFF", COPYFILE_DISABLE="1",
+               SOURCE_DATE_EPOCH="946684800", TZ="UTC")
     binary = executable(args.rcmake)
     reference = executable(args.baseline) if args.baseline else None
     with tempfile.TemporaryDirectory(prefix="rcmake-determinism-", dir="/tmp") as directory:
@@ -439,11 +623,13 @@ def main() -> int:
             for name, contents in FIXTURE.items():
                 (source / name).write_text(contents, encoding="utf-8")
             sources.append(source)
+        complete = True
         for index, source in enumerate(sources):
             if not (source / "CMakeLists.txt").is_file():
                 raise ValueError(f"No CMakeLists.txt in {source}.")
-            check_project(args, source, root / f"project-{index}", compat, native, reference, enabled, env)
-    return 0
+            complete &= check_project(args, source, root / f"project-{index}", compat, native,
+                                      reference, enabled, env)
+    return 0 if complete else 2
 
 
 if __name__ == "__main__":

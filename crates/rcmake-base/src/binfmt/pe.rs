@@ -13,6 +13,7 @@ const MAX_SECTIONS: u16 = 96;
 const DIRECTORY_SIZE: u64 = 8;
 const IMPORT_DIRECTORY: u64 = 1;
 const DELAY_IMPORT_DIRECTORY: u64 = 13;
+const MACHINE_ITANIUM: u16 = 0x0200;
 
 struct Section<'a> {
     addresses: Range<u64>,
@@ -29,6 +30,8 @@ impl<'a> Image<'a> {
         bytes: &'a [u8],
         base: u64,
         headers_size: u64,
+        image_size: u64,
+        low_alignment: bool,
         table: &[u8],
     ) -> Result<Self, BinfmtError> {
         let headers = span(bytes, 0, headers_size, "PE image headers")?;
@@ -51,13 +54,13 @@ impl<'a> Image<'a> {
                 continue;
             }
             let end = start + virtual_size;
-            if end > 1_u64 << 32 {
+            if end > image_size {
                 return Err(BinfmtError::Invalid("PE section address range"));
             }
             let data = if raw_size == 0 {
                 &[]
             } else {
-                if raw_offset < headers_size {
+                if raw_offset < headers_size || (low_alignment && raw_offset != start) {
                     return Err(BinfmtError::Invalid("PE section file offset"));
                 }
                 let raw = span(bytes, raw_offset, raw_size, field)?;
@@ -190,6 +193,7 @@ pub(super) fn inspect(bytes: &[u8]) -> Result<Option<PeDeps>, BinfmtError> {
 
     let coff = signature + 4;
     let header = span(bytes, coff, COFF_HEADER_SIZE, "PE COFF header")?;
+    let machine = LE.u16(header, 0, "PE machine")?;
     let sections = LE.u16(header, 2, "PE section count")?;
     if sections > MAX_SECTIONS {
         return Err(BinfmtError::LimitExceeded("PE section count"));
@@ -214,11 +218,26 @@ pub(super) fn inspect(bytes: &[u8]) -> Result<Option<PeDeps>, BinfmtError> {
     let table_start = optional_start + optional_size;
     let table_size = u64::from(sections) * SECTION_HEADER_SIZE;
     let table = span(bytes, table_start, table_size, "PE section table")?;
+    let image_size = u64::from(LE.u32(optional, 56, field)?);
     let headers_size = u64::from(LE.u32(optional, 60, field)?);
-    if headers_size < table_start + table_size {
+    if headers_size < table_start + table_size || headers_size > image_size {
         return Err(BinfmtError::Invalid("PE image headers size"));
     }
-    let image = Image::read(bytes, base, headers_size, table)?;
+    let section_alignment = LE.u32(optional, 32, field)?;
+    let file_alignment = LE.u32(optional, 36, field)?;
+    let page_size = if machine == MACHINE_ITANIUM {
+        8192
+    } else {
+        4096
+    };
+    let low_alignment = section_alignment < page_size;
+    if file_alignment == 0
+        || section_alignment < file_alignment
+        || (low_alignment && file_alignment != section_alignment)
+    {
+        return Err(BinfmtError::Invalid("PE image alignment"));
+    }
+    let image = Image::read(bytes, base, headers_size, image_size, low_alignment, table)?;
     let mut budget = OutputBudget::default();
     Ok(Some(PeDeps {
         format,
@@ -276,6 +295,8 @@ mod tests {
         } else {
             dword(&mut bytes, OPTIONAL_AT + 28, BASE);
         }
+        dword(&mut bytes, OPTIONAL_AT + 32, 0x1000);
+        dword(&mut bytes, OPTIONAL_AT + 36, RAW_AT as u32);
         dword(&mut bytes, OPTIONAL_AT + 56, 0x2000);
         dword(&mut bytes, OPTIONAL_AT + 60, RAW_AT as u32);
         dword(&mut bytes, directories_at(plus) - 4, 16);
@@ -433,6 +454,64 @@ mod tests {
     }
 
     #[test]
+    fn rejects_mapped_headers_and_sections_beyond_size_of_image() {
+        let mut bytes = fixture(false);
+        dword(&mut bytes, OPTIONAL_AT + 56, RAW_AT as u32 - 1);
+        assert_eq!(
+            inspect_binary_deps(&bytes),
+            Err(BinfmtError::Invalid("PE image headers size"))
+        );
+
+        for virtual_size in [0, RAW_LEN as u32] {
+            let section = directories_at(false) + 16 * DIRECTORY_SIZE as usize;
+            dword(&mut bytes, section + 8, virtual_size);
+            dword(&mut bytes, OPTIONAL_AT + 56, RVA + RAW_LEN as u32 - 1);
+            assert_eq!(
+                inspect_binary_deps(&bytes),
+                Err(BinfmtError::Invalid("PE section address range"))
+            );
+        }
+    }
+
+    #[test]
+    fn low_alignment_requires_equal_alignments_and_matching_section_file_offsets() {
+        let mut bytes = fixture(false);
+        let raw_rva = RAW_AT as u32;
+        dword(&mut bytes, OPTIONAL_AT + 32, raw_rva * 2);
+        assert_eq!(
+            inspect_binary_deps(&bytes),
+            Err(BinfmtError::Invalid("PE image alignment"))
+        );
+
+        dword(&mut bytes, OPTIONAL_AT + 32, raw_rva);
+        assert_eq!(
+            inspect_binary_deps(&bytes),
+            Err(BinfmtError::Invalid("PE section file offset"))
+        );
+
+        let section = directories_at(false) + 16 * DIRECTORY_SIZE as usize;
+        dword(&mut bytes, section + 12, raw_rva);
+        set_directory(&mut bytes, false, IMPORT_DIRECTORY, raw_rva, 60);
+        dword(&mut bytes, RAW_AT + 12, raw_rva + 0x80);
+        dword(&mut bytes, RAW_AT + 32, raw_rva + 0x90);
+        assert_eq!(
+            inspect_binary_deps(&bytes),
+            Ok(Some(expected(BinFormat::Pe32, vec![])))
+        );
+    }
+
+    #[test]
+    fn uses_the_itanium_image_page_size() {
+        let mut bytes = fixture(true);
+        half(&mut bytes, PE_AT + 4, MACHINE_ITANIUM);
+        dword(&mut bytes, OPTIONAL_AT + 36, 0x1000);
+        assert_eq!(
+            inspect_binary_deps(&bytes),
+            Err(BinfmtError::Invalid("PE section file offset"))
+        );
+    }
+
+    #[test]
     fn rejects_invalid_directory_count_and_delay_import_attributes() {
         let mut bytes = fixture(true);
         dword(&mut bytes, directories_at(true) - 4, 17);
@@ -461,6 +540,7 @@ mod tests {
         let section = directories_at(false) + 16 * DIRECTORY_SIZE as usize;
         dword(&mut bytes, section + 8, section_len as u32);
         dword(&mut bytes, section + 16, section_len as u32);
+        dword(&mut bytes, OPTIONAL_AT + 56, 0x20000);
         set_directory(&mut bytes, false, IMPORT_DIRECTORY, RVA, table_len as u32);
         for index in 0..=MAX_ENTRIES {
             dword(&mut bytes, RAW_AT + index * 20 + 12, RVA + table_len as u32);

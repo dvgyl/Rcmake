@@ -82,16 +82,18 @@ impl Elf {
             };
             let offset = self.word(entry, file_at, field)?;
             let size = self.word(entry, size_at, field)?;
+            let address = self.word(entry, address_at, field)?;
+            let memory_size = self.word(entry, size_at + self.word_size(), field)?;
             if kind == PT_DYNAMIC {
                 let field = "ELF dynamic segment";
-                let data = span(bytes, offset, size, field)?;
-                set_once(&mut headers.dynamic, data, field)?;
+                if size != memory_size {
+                    return Err(BinfmtError::Invalid(field));
+                }
+                set_once(&mut headers.dynamic, (address, offset, size), field)?;
                 continue;
             }
 
             let field = "ELF load segment";
-            let address = self.word(entry, address_at, field)?;
-            let memory_size = self.word(entry, size_at + self.word_size(), field)?;
             let end = self.address_end(address, memory_size, field)?;
             if size > memory_size {
                 return Err(BinfmtError::Invalid(field));
@@ -104,6 +106,7 @@ impl Elf {
                 };
                 headers.loads.push(Load {
                     addresses: address..end,
+                    offset,
                     data,
                 });
             }
@@ -184,11 +187,41 @@ impl Elf {
 #[derive(Default)]
 struct ProgramHeaders<'a> {
     loads: Vec<Load<'a>>,
-    dynamic: Option<&'a [u8]>,
+    dynamic: Option<(u64, u64, u64)>,
+}
+
+impl<'a> ProgramHeaders<'a> {
+    fn map(
+        &self,
+        elf: Elf,
+        address: u64,
+        size: u64,
+        field: &'static str,
+    ) -> Result<(u64, &'a [u8]), BinfmtError> {
+        let invalid = BinfmtError::Invalid(field);
+        let end = elf.address_end(address, size, field)?;
+        let mut mapped = None;
+        for load in &self.loads {
+            let range = &load.addresses;
+            let overlaps = range.contains(&address) || (address < range.start && range.start < end);
+            if !overlaps {
+                continue;
+            }
+            if address < range.start || end > range.end || mapped.is_some() {
+                return Err(invalid);
+            }
+            let displacement = address - range.start;
+            let data = span(load.data, displacement, size, field)?;
+            let offset = load.offset.checked_add(displacement).ok_or(invalid)?;
+            mapped = Some((offset, data));
+        }
+        mapped.ok_or(invalid)
+    }
 }
 
 struct Load<'a> {
     addresses: Range<u64>,
+    offset: u64,
     data: &'a [u8],
 }
 
@@ -237,31 +270,12 @@ impl Dynamic {
         Err(BinfmtError::Invalid("ELF dynamic table terminator"))
     }
 
-    fn strings_from_loads<'a>(
-        &self,
-        elf: Elf,
-        loads: &[Load<'a>],
-    ) -> Result<&'a [u8], BinfmtError> {
+    fn string_table(&self) -> Result<(u64, u64), BinfmtError> {
         let field = "ELF dynamic string table";
-        let (address, size) = match (self.strtab, self.strsz) {
-            (None, None) => return Ok(&[]),
-            (Some(address), Some(size)) => (address, size),
-            _ => return Err(BinfmtError::Invalid(field)),
-        };
-        let end = elf.address_end(address, size, field)?;
-        let mut strings = None;
-        for load in loads {
-            let range = &load.addresses;
-            let overlaps = range.contains(&address) || (address < range.start && range.start < end);
-            if !overlaps {
-                continue;
-            }
-            if address < range.start || end > range.end || strings.is_some() {
-                return Err(BinfmtError::Invalid("ELF dynamic string table mapping"));
-            }
-            strings = Some(span(load.data, address - range.start, size, field)?);
+        match (self.strtab, self.strsz) {
+            (Some(address), Some(size)) => Ok((address, size)),
+            _ => Err(BinfmtError::Invalid(field)),
         }
-        strings.ok_or(BinfmtError::Invalid("ELF dynamic string table mapping"))
     }
 
     fn strings_from_section<'a>(
@@ -269,19 +283,17 @@ impl Dynamic {
         section: DynamicSection<'a>,
     ) -> Result<&'a [u8], BinfmtError> {
         let field = "ELF linked string table";
-        if self
-            .strtab
-            .is_some_and(|address| address != section.string_address)
-        {
+        let (address, size) = self.string_table()?;
+        if address != section.string_address {
             return Err(BinfmtError::Invalid(field));
         }
-        match self.strsz {
-            Some(size) => span(section.strings, 0, size, field),
-            None => Ok(section.strings),
-        }
+        span(section.strings, 0, size, field)
     }
 
     fn collect(self, strings: &[u8], deps: &mut ElfDeps) -> Result<(), BinfmtError> {
+        if !strings.is_empty() && (strings.first() != Some(&0) || strings.last() != Some(&0)) {
+            return Err(BinfmtError::Invalid("ELF dynamic string table boundaries"));
+        }
         let mut budget = OutputBudget::default();
         for offset in self.needed {
             deps.needed.push(budget.copy(string_at(strings, offset)?)?);
@@ -371,9 +383,15 @@ pub(super) fn inspect(bytes: &[u8]) -> Result<ElfDeps, BinfmtError> {
         runpaths: Vec::new(),
         soname: None,
     };
-    if let Some(entries) = program.dynamic {
+    if let Some((address, offset, size)) = program.dynamic {
+        let field = "ELF dynamic segment mapping";
+        let (mapped_offset, entries) = program.map(elf, address, size, field)?;
+        if offset != mapped_offset {
+            return Err(BinfmtError::Invalid(field));
+        }
         let dynamic = Dynamic::read(elf, entries)?;
-        let strings = dynamic.strings_from_loads(elf, &program.loads)?;
+        let (address, size) = dynamic.string_table()?;
+        let (_, strings) = program.map(elf, address, size, "ELF dynamic string table mapping")?;
         dynamic.collect(strings, &mut deps)?;
     } else if let Some(section) = elf.section_dynamic(bytes)? {
         let dynamic = Dynamic::read(elf, section.entries)?;
@@ -591,7 +609,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_truncated_images_and_unterminated_strings() {
+    fn rejects_truncated_images_and_non_nul_string_table_boundaries() {
         let elf = ELF64_LE;
         let mut bytes = fixture(elf);
         for end in 4..bytes.len() {
@@ -604,7 +622,62 @@ mod tests {
         word(elf, &mut bytes, DYNAMIC_AT + 24, 8);
         assert_eq!(
             inspect_binary_deps(&bytes),
-            Err(BinfmtError::Truncated("ELF dynamic string"))
+            Err(BinfmtError::Invalid("ELF dynamic string table boundaries"))
+        );
+        let mut bytes = fixture(elf);
+        word(elf, &mut bytes, DYNAMIC_AT + 24, STRINGS.len() as u64 + 1);
+        write(&mut bytes, STRINGS_AT + STRINGS.len(), b"x");
+        assert_eq!(
+            inspect_binary_deps(&bytes),
+            Err(BinfmtError::Invalid("ELF dynamic string table boundaries"))
+        );
+        let mut bytes = fixture(elf);
+        write(&mut bytes, STRINGS_AT, b"x");
+        assert_eq!(
+            inspect_binary_deps(&bytes),
+            Err(BinfmtError::Invalid("ELF dynamic string table boundaries"))
+        );
+    }
+
+    #[test]
+    fn requires_both_dynamic_string_table_tags_without_string_references() {
+        let elf = ELF64_LE;
+        for (first, second) in [(0, 0), (DT_STRTAB, 0), (4, DT_STRSZ)] {
+            let mut bytes = fixture(elf);
+            word(elf, &mut bytes, DYNAMIC_AT, first);
+            word(elf, &mut bytes, DYNAMIC_AT + 16, second);
+            word(elf, &mut bytes, DYNAMIC_AT + 32, DT_NULL);
+            assert_eq!(
+                inspect_binary_deps(&bytes),
+                Err(BinfmtError::Invalid("ELF dynamic string table"))
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_dynamic_segments_that_disagree_with_the_load_mapping() {
+        let elf = ELF64_LE;
+        let dynamic = 64 + 56;
+        let size = (DYNAMIC.len() * 16) as u64;
+        for (field, value, error) in [
+            (8, DYNAMIC_AT as u64 + 16, "ELF dynamic segment mapping"),
+            (16, BASE + IMAGE_LEN as u64, "ELF dynamic segment mapping"),
+            (40, size - 16, "ELF dynamic segment"),
+            (40, size + 16, "ELF dynamic segment"),
+        ] {
+            let mut bytes = fixture(elf);
+            word(elf, &mut bytes, dynamic + field, value);
+            assert_eq!(
+                inspect_binary_deps(&bytes),
+                Err(BinfmtError::Invalid(error))
+            );
+        }
+
+        let mut bytes = fixture(elf);
+        word(elf, &mut bytes, 64 + 32, DYNAMIC_AT as u64 + size - 1);
+        assert_eq!(
+            inspect_binary_deps(&bytes),
+            Err(BinfmtError::Truncated("ELF dynamic segment mapping"))
         );
     }
 
@@ -638,8 +711,12 @@ mod tests {
         );
 
         let length = (MAX_ENTRIES + 1) * 16;
-        bytes.resize(DYNAMIC_AT + length, 0);
-        word(elf, &mut bytes, 64 + 56 + 32, length as u64);
+        let image_size = DYNAMIC_AT + length;
+        bytes.resize(image_size, 0);
+        for offset in [32, 40] {
+            word(elf, &mut bytes, 64 + offset, image_size as u64);
+            word(elf, &mut bytes, 64 + 56 + offset, length as u64);
+        }
         assert_eq!(
             inspect_binary_deps(&bytes),
             Err(BinfmtError::LimitExceeded("ELF dynamic table"))

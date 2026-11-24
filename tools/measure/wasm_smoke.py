@@ -2,10 +2,9 @@
 # SPDX-License-Identifier: MIT OR Apache-2.0
 """Run the Milestone 6 WebAssembly acceptance checks.
 
-Source env/env.sh before use. Supply a WASI module that checks three
+Source env/env.sh before use. The rcmake-api wasm_smoke example checks three
 generated targets, cancellation, and a partial result on a denied process.
-A standalone module must exit with an error if any assertion fails.
-Use --wasi-test for an exact test name in a prebuilt Rust test module.
+Use --wasi-bin to run a prebuilt copy of that example.
 """
 
 from __future__ import annotations
@@ -16,6 +15,7 @@ import os
 from pathlib import Path
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 
@@ -43,12 +43,18 @@ def check_tree(output: str) -> str:
     return "No forbidden packages or features."
 
 
-def check_targets(output: str) -> str:
-    """Require both Rust WebAssembly targets."""
-    missing = set(TARGETS) - set(output.splitlines())
-    if missing:
-        raise ValueError(f"Rust target missing. {', '.join(sorted(missing))}.")
-    return "Both Rust WebAssembly targets are installed."
+def check_smoke(output: str) -> str:
+    """Require the success report that the pinned example emits after verification."""
+    result = json.loads(output)
+    if not isinstance(result, dict) or result.get("schema") != "rcmake-wasm-smoke-v1":
+        raise ValueError("Expected the wasm_smoke JSON report.")
+    if (result.get("ok") is not True or result.get("targets") != ["core", "util", "app"]
+            or result.get("provenance") != "-DCORE_API=1"
+            or type(result.get("denied_processes")) is not int or result["denied_processes"] != 1
+            or result.get("cancelled") is not True):
+        raise ValueError("The wasm_smoke report lacks evidence of all required checks.")
+    # The example reports a denial only after it verifies the partial result and index.
+    return "Verified three generated targets, provenance, cancellation, and the partial result."
 
 
 def run_gate(report: dict, args, env: dict[str, str], name: str, command: list[str],
@@ -77,47 +83,74 @@ def run_gate(report: dict, args, env: dict[str, str], name: str, command: list[s
 
 
 def find_module() -> Path | None:
-    """Find the standalone smoke module in a standard Cargo target directory."""
+    """Find the pinned prebuilt example in a standard Cargo target directory."""
     target_dir = ROOT / os.environ.get("CARGO_TARGET_DIR", "target")
     for profile in ("release", "debug"):
-        module = target_dir / WASI / profile / "purehost_smoke.wasm"
+        module = target_dir / WASI / profile / "examples" / "wasm_smoke.wasm"
         if module.is_file():
             return module
     return None
 
 
-def check_wasi(args, report: dict, env: dict[str, str]) -> None:
-    """Run the supplied module or record why the WASI smoke is incomplete."""
-    module = args.wasi_bin.expanduser().absolute() if args.wasi_bin else find_module()
-    command = [args.wasmtime, "run", str(module or "<purehost_smoke.wasm>")]
-    if args.wasi_test:
-        command.extend((args.wasi_test, "--exact"))
+def selection(target: str) -> list[str]:
+    return ["-p", "rcmake-api", "--no-default-features", "--target", target, "--locked"]
 
+
+def check_wasi(args, report: dict, env: dict[str, str], prerequisite: str | None) -> None:
+    """Build and run the pinned example, or use a prebuilt copy."""
+    module = args.wasi_bin.expanduser().absolute() if args.wasi_bin else None
+    if module is None and prerequisite and not args.dry_run:
+        module = find_module()
+    if module is None:
+        def built_example(output: str) -> str:
+            nonlocal module
+            for line in output.splitlines():
+                message = json.loads(line)
+                if not isinstance(message, dict) or message.get("reason") != "compiler-artifact":
+                    continue
+                target = message.get("target")
+                if (not isinstance(target, dict) or target.get("name") != "wasm_smoke"
+                        or target.get("kind") != ["example"]):
+                    continue
+                filenames = message.get("filenames")
+                if not isinstance(filenames, list):
+                    continue
+                for filename in filenames:
+                    if not isinstance(filename, str):
+                        continue
+                    path = ROOT / filename
+                    if (path.name == "wasm_smoke.wasm" and path.parent.name == "examples"
+                            and len(path.parents) > 2 and path.parents[2].name == WASI
+                            and path.is_file()):
+                        module = path
+                        return "Built the wasm_smoke example."
+            raise ValueError("Cargo did not report the wasm_smoke.wasm example artifact.")
+
+        run_gate(report, args, env, "Build WASI example",
+                 ["cargo", "build", *selection(WASI), "--example", "wasm_smoke",
+                  "--message-format=json-render-diagnostics"], built_example, prerequisite)
+
+    name = "WASI PureHost smoke"
+    command = [args.wasmtime, "run", str(module or f"target/{WASI}/debug/examples/wasm_smoke.wasm")]
+    detail = None
     if not args.dry_run:
         if module is None:
-            report["checks"].append({
-                "check": "WASI PureHost smoke", "command": command,
-                "status": "fail" if args.require_wasi else "skipped",
-                "detail": "No PureHost smoke module found. Use --wasi-bin to select a prebuilt module.",
-            })
-            return
-        try:
-            with module.open("rb") as stream:
-                if stream.read(8) != b"\0asm\x01\0\0\0":
-                    raise ValueError("Expected a WebAssembly module.")
-        except (OSError, ValueError) as error:
-            report["checks"].append({
-                "check": "WASI PureHost smoke", "command": command,
-                "status": "fail", "detail": str(error),
-            })
-            return
-
-    def check_output(output: str) -> str:
-        if args.wasi_test and not re.search(r"(?m)^test result: ok\. 1 passed; 0 failed;", output):
-            raise ValueError("The selected PureHost test did not run and pass.")
-        return "The PureHost smoke completed successfully under Wasmtime."
-
-    run_gate(report, args, env, "WASI PureHost smoke", command, check_output)
+            detail = "The wasm_smoke WASI example is unavailable."
+        else:
+            try:
+                with module.open("rb") as stream:
+                    if stream.read(8) != b"\0asm\x01\0\0\0":
+                        raise ValueError("Expected a WebAssembly module.")
+            except (OSError, ValueError) as error:
+                report["checks"].append({
+                    "check": name, "command": command, "status": "fail", "detail": str(error),
+                })
+                return
+            if not shutil.which(args.wasmtime):
+                detail = f"Cannot execute {args.wasmtime}. Install Wasmtime or set --wasmtime."
+    run_gate(report, args, env, name, command, check_smoke, detail)
+    if detail and args.require_wasi:
+        report["checks"][-1]["status"] = "fail"
 
 
 def markdown(report: dict) -> str:
@@ -139,34 +172,45 @@ def markdown(report: dict) -> str:
 def main() -> int:
     """Print JSON on standard output and Markdown on standard error."""
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--wasi-bin", type=Path, help="Prebuilt wasm32-wasip1 PureHost smoke module.")
-    parser.add_argument("--wasi-test", help="Exact libtest name within --wasi-bin.")
+    parser.add_argument("--wasi-bin", type=Path, help="Prebuilt wasm32-wasip1 wasm_smoke example.")
     parser.add_argument("--wasmtime", default="wasmtime", help="Path or command name for Wasmtime.")
-    parser.add_argument("--require-wasi", action="store_true", help="Fail if no WASI module is available.")
+    parser.add_argument("--require-wasi", action="store_true", help="Treat a missing WASI run as a failure.")
+    parser.add_argument("--allow-incomplete", action="store_true", help="Permit skipped checks for diagnostics.")
     parser.add_argument("--timeout", type=int, default=300, help="Seconds per command.")
     parser.add_argument("--json", type=Path, metavar="OUT", help="Also save the JSON report.")
     parser.add_argument("--markdown", type=Path, metavar="OUT", help="Also save the Markdown report.")
     parser.add_argument("--dry-run", action="store_true", help="Print the plan without executing tools.")
     args = parser.parse_args()
-    if args.timeout < 1 or (args.wasi_test and not args.wasi_bin):
-        parser.error("Use a positive timeout. Set --wasi-bin when using --wasi-test.")
+    if args.timeout < 1:
+        parser.error("Use a positive timeout.")
     if args.json and args.markdown and args.json.resolve() == args.markdown.resolve():
         parser.error("Use different report paths.")
 
     env = dict(os.environ, LC_ALL="C", CARGO_TERM_COLOR="never")
     env.setdefault("CARGO_BUILD_JOBS", "2")
     report = {"status": "planned", "checks": []}
-    installed = run_gate(report, args, env, "Installed targets",
-                         ["rustup", "target", "list", "--installed"], check_targets)
-    prerequisite = None if installed else "The Rust target check failed."
+    installed = set()
+
+    def record_installed(output: str) -> str:
+        installed.update(output.split())
+        return "Installed WebAssembly targets. " + (", ".join(sorted(installed & set(TARGETS))) or "None.")
+
+    checked = run_gate(report, args, env, "Installed targets",
+                       ["rustup", "target", "list", "--installed"], record_installed,
+                       None if shutil.which("rustup") else "Cannot execute rustup.")
+    prerequisites = {
+        target: (None if target in installed else f"Rust target {target} is missing.")
+        if checked else f"Could not verify Rust target {target}."
+        for target in TARGETS
+    }
     for target in TARGETS:
-        selection = ["-p", "rcmake-api", "--no-default-features", "--target", target, "--locked"]
         run_gate(report, args, env, f"Dependency tree for {target}",
-                 ["cargo", "tree", *selection, "-e", "normal,features"], check_tree, prerequisite)
+                 ["cargo", "tree", *selection(target), "-e", "normal,features"],
+                 check_tree, prerequisites[target])
     run_gate(report, args, env, f"Compile check for {BARE}",
-             ["cargo", "check", "-p", "rcmake-api", "--no-default-features", "--target", BARE, "--locked"],
-             lambda _: "Compilation succeeded.", prerequisite)
-    check_wasi(args, report, env)
+             ["cargo", "check", *selection(BARE), "--example", "wasm_smoke"],
+             lambda _: "The wasm_smoke example compiled.", prerequisites[BARE])
+    check_wasi(args, report, env, prerequisites[WASI])
 
     statuses = {row["status"] for row in report["checks"]}
     if not args.dry_run:
@@ -179,7 +223,8 @@ def main() -> int:
         args.markdown.write_text(formatted, encoding="utf-8")
     print(json.dumps(report, indent=2))
     print(formatted, end="", file=sys.stderr)
-    return int(report["status"] == "fail")
+    return int(report["status"] == "fail"
+               or (report["status"] == "incomplete" and not args.allow_incomplete))
 
 
 if __name__ == "__main__":
