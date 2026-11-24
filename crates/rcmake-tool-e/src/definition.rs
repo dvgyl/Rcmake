@@ -1,6 +1,11 @@
 //! Create a module definition file from object symbols and existing exports.
 
-use std::collections::BTreeSet;
+mod coff;
+
+#[cfg(test)]
+mod tests;
+
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -13,14 +18,23 @@ use rcmake_host::{
 use super::{ToolCtx, error, path, read_all};
 
 pub(super) fn run(args: &[BString], cx: &ToolCtx<'_>) -> i32 {
-    let [destination, response, option] = args else {
-        return error(
-            cx,
-            &[b"Usage: cmake -E __create_def <output> <object-list> --nm=<tool>\n"],
-        );
+    let (destination, response, option) = match args {
+        [destination, response] => (destination, response, None),
+        [destination, response, option] => (destination, response, Some(option)),
+        _ => {
+            return error(
+                cx,
+                &[b"Usage: cmake -E __create_def <output> <object-list> [--nm=<tool>]\n"],
+            );
+        }
     };
-    let Some(nm) = option.strip_prefix(b"--nm=").filter(|nm| !nm.is_empty()) else {
-        return error(cx, &[b"__create_def requires --nm=<tool>\n"]);
+    let nm = if let Some(option) = option {
+        let Some(nm) = option.strip_prefix(b"--nm=").filter(|nm| !nm.is_empty()) else {
+            return error(cx, &[b"Use --nm=<tool> to specify a symbol tool.\n"]);
+        };
+        Some(nm)
+    } else {
+        None
     };
     match write_definition(cx, &path(cx, destination), response, nm) {
         Ok(()) => 0,
@@ -32,10 +46,11 @@ fn write_definition(
     cx: &ToolCtx<'_>,
     destination: &Path,
     response: &[u8],
-    nm: &[u8],
+    nm: Option<&[u8]>,
 ) -> Result<(), String> {
     let mut data = BTreeSet::new();
     let mut exports = BTreeSet::new();
+    let mut explicit = BTreeMap::new();
     let list = cx
         .host
         .read(&path(cx, response), read_all())
@@ -46,24 +61,26 @@ fn write_definition(
         .map(<[u8]>::trim_ascii)
         .filter(|line| !line.is_empty())
     {
-        if line.to_ascii_lowercase().ends_with(b".def") {
+        if line
+            .last_chunk::<4>()
+            .is_some_and(|suffix| suffix.eq_ignore_ascii_case(b".def"))
+        {
             let file = cx
                 .host
                 .read(&path(cx, line), read_all())
                 .map_err(|err| err.to_string())?;
-            exports.extend(
-                file.lines()
-                    .map(<[u8]>::trim_ascii)
-                    .skip_while(|line| *line != b"EXPORTS")
-                    .skip(1)
-                    .filter(|line| !line.is_empty())
-                    .map(BString::from),
-            );
+            for entry in definition_entries(&file) {
+                let name = entry
+                    .split(|byte| byte.is_ascii_whitespace() || *byte == b'=')
+                    .next()
+                    .unwrap_or_default();
+                explicit.insert(BString::from(name), BString::from(entry));
+            }
         } else {
             objects.push(line);
         }
     }
-    if !objects.is_empty() {
+    if let Some(nm) = nm.filter(|_| !objects.is_empty()) {
         let symbols = read_symbols(cx, destination, nm, &objects)?;
         for line in symbols.lines() {
             let Some((object, entry)) = line.rsplit_once_str(b": ") else {
@@ -108,7 +125,19 @@ fn write_definition(
                 ),
             }
         }
+    } else {
+        for object in objects {
+            let file = cx
+                .host
+                .read(&path(cx, object), read_all())
+                .map_err(|err| err.to_string())?;
+            coff::exports(&file, &mut data, &mut exports)
+                .map_err(|message| format!("{}: {message}", BString::from(object)))?;
+        }
     }
+    data.retain(|name| !explicit.contains_key(name));
+    exports.retain(|name| !data.contains(name) && !explicit.contains_key(name));
+    exports.extend(explicit.into_values());
     let mut output = BString::from("EXPORTS \n");
     for (symbols, suffix) in [(&data, b" \t DATA\n".as_slice()), (&exports, b"\n")] {
         for symbol in symbols {
@@ -117,9 +146,42 @@ fn write_definition(
             output.extend_from_slice(suffix);
         }
     }
-    cx.host
-        .write(destination, &output, WriteMode::Truncate)
-        .map_err(|err| err.to_string())
+    if !cx
+        .host
+        .read(destination, read_all())
+        .is_ok_and(|current| current == output.as_slice())
+    {
+        cx.host
+            .write(destination, &output, WriteMode::Truncate)
+            .map_err(|err| err.to_string())?;
+    }
+    Ok(())
+}
+
+fn definition_entries(contents: &[u8]) -> impl Iterator<Item = &[u8]> {
+    let contents = contents.strip_prefix(b"\xef\xbb\xbf").unwrap_or(contents);
+    contents.lines().filter_map(|line| {
+        let line = line.split(|byte| *byte == b';').next()?.trim_ascii();
+        let first = line.split(|byte| byte.is_ascii_whitespace()).next()?;
+        if line.is_empty()
+            || [
+                b"EXPORTS".as_slice(),
+                b"LIBRARY",
+                b"NAME",
+                b"DESCRIPTION",
+                b"STACKSIZE",
+                b"HEAPSIZE",
+                b"VERSION",
+                b"SECTIONS",
+                b"IMPORTS",
+            ]
+            .iter()
+            .any(|header| first.eq_ignore_ascii_case(header))
+        {
+            return None;
+        }
+        Some(line)
+    })
 }
 
 fn read_symbols(

@@ -5,7 +5,9 @@ mod pvs;
 use std::time::Duration;
 
 use rcmake_base::{BString, list};
-use rcmake_host::{CommandSpec, Input, Output, ProcessResult, RunOutput, RunRequest, Stream};
+use rcmake_host::{
+    CommandSpec, Follow, Input, Output, ProcessResult, RunOutput, RunRequest, Stream,
+};
 
 use super::{ToolCtx, error, path, split_once, write};
 
@@ -120,6 +122,7 @@ fn analyze(
             command.extend(compile.iter().filter_map(cppcheck_option));
             command.push(source.into());
         }
+        b"icstat" => return icstat(cx, command, compile, source),
         b"lwyu" => command.push(source.into()),
         _ => return error(cx, &[b"__run_co_compile does not support --", name, b"\n"]),
     }
@@ -205,6 +208,75 @@ fn analyze(
         }
         _ => code,
     }
+}
+
+fn icstat(cx: &ToolCtx<'_>, mut command: Vec<BString>, compile: &[BString], source: &[u8]) -> i32 {
+    if cx
+        .host
+        .metadata(&cx.cwd.join("cstat_sel_checks.txt"), Follow::Yes)
+        .is_err()
+    {
+        let compiler = compile.first().map_or(b"".as_slice(), |arg| arg.as_slice());
+        let directory = rcmake_base::path_lex::Lexical::new(compiler).parent();
+        let program = if directory.is_empty() {
+            "ichecks".into()
+        } else {
+            [directory, b"/ichecks"].concat().into()
+        };
+        if let Err(code) = execute(
+            cx,
+            &[program, "--default=stdchecks".into()],
+            Output::Capture,
+            Output::Capture,
+        ) {
+            return code;
+        }
+    }
+    command.push("--".into());
+    command.extend_from_slice(compile);
+    let (code, output) = match execute(cx, &command, Output::Capture, Output::Capture) {
+        Ok(result) => result,
+        Err(code) => return code,
+    };
+    if code == 0 {
+        write(cx, Stream::Stderr, &[b"C-STAT: "]);
+        if !contains(&output.stdout, b"Analyzing") {
+            let name = source
+                .rsplit(|&byte| matches!(byte, b'/' | b'\\'))
+                .next()
+                .unwrap_or(source);
+            write(cx, Stream::Stderr, &[b"Analyzing ", name, b" (cached)\n"]);
+        }
+        let mut cleaned = Vec::with_capacity(output.stdout.len());
+        for (index, line) in output
+            .stdout
+            .split_inclusive(|&byte| byte == b'\n')
+            .enumerate()
+        {
+            if index != 0
+                && let Some(mut tail) = line.strip_prefix(b"\"")
+            {
+                cleaned.push(b'"');
+                while let Some(rest) = tail
+                    .strip_prefix(b"../")
+                    .or_else(|| tail.strip_prefix(b"..\\"))
+                {
+                    tail = rest;
+                }
+                cleaned.extend_from_slice(tail);
+            } else {
+                cleaned.extend_from_slice(line);
+            }
+        }
+        write(cx, Stream::Stderr, &[&cleaned, &output.stderr]);
+    } else {
+        write(
+            cx,
+            Stream::Stderr,
+            &[b"C-STAT ", &output.stdout, &output.stderr],
+        );
+    }
+    code
 }
 
 fn cppcheck_option(arg: &BString) -> Option<BString> {

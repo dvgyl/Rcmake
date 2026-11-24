@@ -518,6 +518,50 @@ fn project_sets_visual_studio_generator_variables() -> TestResult {
 }
 
 #[test]
+fn visual_studio_finds_msbuild_and_preserves_a_user_program() -> TestResult {
+    use rcmake_model::{GeneratorKind, VsVersion};
+
+    for (instance, override_program, expected) in [
+        ("", None, "/prepared tools/MSBuild.exe"),
+        (
+            "/custom VS,version=17.8.0.0",
+            None,
+            "/custom VS/MSBuild/Current/Bin/MSBuild.exe",
+        ),
+        ("", Some("/explicit/msbuild"), "/explicit/msbuild"),
+    ] {
+        let host = new_host();
+        let separator = if cfg!(windows) { ";" } else { ":" };
+        host.env_set(
+            b"PATH",
+            Some(format!("/missing{separator}/prepared tools").as_bytes()),
+        );
+        host.seed_file(Path::new("/prepared tools/MSBuild.exe"), b"")?;
+        host.seed_file(Path::new("/custom VS/MSBuild/Current/Bin/MSBuild.exe"), b"")?;
+        seed_modules(&host, &[])?;
+        let definitions = override_program
+            .map(|value| define("CMAKE_MAKE_PROGRAM", value))
+            .into_iter()
+            .collect();
+        let mut interp = interp(&host, definitions);
+        let mut cx = interp.cx();
+        let project = cx.project();
+        project.generator = Some(GeneratorKind::VisualStudio(VsVersion::Vs17));
+        project.generator_spec.instance = instance.into();
+        configure(&host, &mut interp, "project(P NONE)", 0)?;
+        assert_eq!(
+            var(&mut interp, "CMAKE_MAKE_PROGRAM"),
+            Some(expected.into())
+        );
+        assert_eq!(
+            var(&mut interp, "CMAKE_VS_MSBUILD_COMMAND"),
+            Some(expected.into())
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn project_reports_xcode_generator_spec_errors() -> TestResult {
     use rcmake_host::{ProcessResult, RunOutput};
     use rcmake_model::GeneratorKind;

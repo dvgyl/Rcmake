@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use rcmake_base::BString;
 use rcmake_eval::{CmdError, Cx};
-use rcmake_host::{CommandSpec, Input, Output, ProcessResult, RunRequest};
+use rcmake_host::{CommandSpec, FileKind, Follow, Input, Output, ProcessResult, RunRequest, path};
 use rcmake_model::{
     CacheType, GeneratorKind, GeneratorSpec, GeneratorSpecError, ParsedToolset, SpecField,
     VsVersion, XcodeBuildSystem, XcodeVersion,
@@ -136,6 +136,122 @@ pub(super) fn initialize(cx: &mut Cx<'_>, generator: GeneratorKind) -> Result<()
     }
     cx.project().generator_spec = spec;
     Ok(())
+}
+
+pub(super) fn configure_msbuild(cx: &mut Cx<'_>, version: VsVersion) {
+    let program = b"CMAKE_MAKE_PROGRAM";
+    let mut selected = cx.var_or_empty(program);
+    if rcmake_base::truth::is_off(&selected) {
+        let Some(discovered) = find_msbuild(cx, version) else {
+            return;
+        };
+        selected = discovered;
+        add_cache(
+            cx,
+            program,
+            selected.clone(),
+            CacheType::Filepath,
+            "Path to a program.",
+        );
+    }
+    cx.set_var(b"CMAKE_VS_MSBUILD_COMMAND", selected);
+}
+
+fn find_msbuild(cx: &mut Cx<'_>, version: VsVersion) -> Option<BString> {
+    let instance = cx.project().generator_spec.instance.clone();
+    let host = cx.host();
+    let is_file = |candidate: &std::path::Path| {
+        host.metadata(candidate, Follow::Yes)
+            .is_ok_and(|meta| meta.kind == FileKind::File)
+    };
+    let from_install = |dir: &[u8]| {
+        let directory = path::to_native(dir).join("MSBuild/Current/Bin");
+        let suffix = match host.system().machine.as_slice() {
+            b"ARM64" | b"arm64" | b"aarch64" => "arm64/MSBuild.exe",
+            _ => "MSBuild.exe",
+        };
+        [directory.join(suffix), directory.join("MSBuild.exe")]
+            .into_iter()
+            .find(|candidate| is_file(candidate))
+            .map(|file| path::from_native_cmake(&file))
+    };
+    if let Some(dir) = instance
+        .split(|&byte| byte == b',')
+        .next()
+        .filter(|dir| !dir.is_empty() && !dir.contains(&b'='))
+    {
+        return from_install(dir);
+    }
+    if let Some(dir) = host.env_get(b"VSINSTALLDIR").filter(|dir| !dir.is_empty())
+        && let Some(found) = from_install(&dir)
+    {
+        return Some(found);
+    }
+    let windows = cfg!(windows) || host.system().sysname.starts_with(b"Windows");
+    if let Some(paths) = host.env_get(b"PATH") {
+        let delimiter = if windows { b';' } else { b':' };
+        for dir in paths
+            .split(|&byte| byte == delimiter)
+            .filter(|dir| !dir.is_empty())
+        {
+            let candidate = host
+                .initial_cwd()
+                .join(path::to_native(dir))
+                .join("MSBuild.exe");
+            if is_file(&candidate) {
+                return Some(path::from_native_cmake(&candidate));
+            }
+        }
+    }
+    let installer = host
+        .env_get(b"ProgramFiles(x86)")
+        .filter(|dir| !dir.is_empty())?;
+    let locator = path::to_native(&installer).join("Microsoft Visual Studio/Installer/vswhere.exe");
+    if !is_file(&locator) {
+        return None;
+    }
+    let range = match version {
+        VsVersion::Vs17 => "[17.0,18.0)",
+        VsVersion::Vs18 => "[18.0,19.0)",
+    };
+    let request = RunRequest {
+        pipeline: vec![CommandSpec {
+            program: path::from_native(&locator),
+            args: [
+                "-latest",
+                "-products",
+                "*",
+                "-version",
+                range,
+                "-requires",
+                "Microsoft.Component.MSBuild",
+                "-property",
+                "installationPath",
+                "-utf8",
+            ]
+            .into_iter()
+            .map(BString::from)
+            .collect(),
+        }],
+        cwd: host.initial_cwd(),
+        env: host.env_all(),
+        stdin: Input::Null,
+        stdout: Output::Capture,
+        stderr: Output::Null,
+        timeout: Some(Duration::from_secs(5)),
+        tee: false,
+    };
+    let output = host.run_bounded(&request, 64 * 1024).ok()?;
+    if output.results != [ProcessResult::Exited(0)] {
+        return None;
+    }
+    output.stdout.split(|&byte| byte == b'\n').find_map(|line| {
+        let dir = line
+            .trim_ascii()
+            .strip_prefix(b"\xef\xbb\xbf")
+            .unwrap_or(line.trim_ascii());
+        (!dir.is_empty()).then(|| from_install(dir)).flatten()
+    })
 }
 
 fn find_xcodebuild(cx: &Cx<'_>) -> Option<BString> {

@@ -18,8 +18,14 @@ pub(super) struct TryCompileSeed {
 }
 
 pub(super) fn toolchain_variable(name: &[u8]) -> bool {
+    if name.ends_with(b"_LOADED") || name.starts_with(b"CMAKE_COMPILER_IS_") {
+        return false;
+    }
     [
         b"CMAKE_C_".as_slice(),
+        b"CMAKE_CUDA_",
+        b"CMAKE_RC_",
+        b"CMAKE_DEPFILE_FLAGS_",
         b"CMAKE_CXX_",
         b"CMAKE_OBJC_",
         b"CMAKE_OBJCXX_",
@@ -37,6 +43,8 @@ pub(super) fn toolchain_variable(name: &[u8]) -> bool {
             name,
             b"CMAKE_SYSTEM"
                 | b"CMAKE_AR"
+                | b"CMAKE_LINKER"
+                | b"CMAKE_MT"
                 | b"CMAKE_LINKER_TYPE"
                 | b"CMAKE_RANLIB"
                 | b"CMAKE_MAKE_PROGRAM"

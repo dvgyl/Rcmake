@@ -56,7 +56,7 @@ pub(super) fn write_project(
                 target
             }
         };
-        let file_path = path::from_native(&file);
+        let file_path = path::from_native_cmake(&file);
         let Some(language) = source_language(cx, &file, &enabled) else {
             let source_name = if let Source::File(name) = source {
                 name
@@ -160,17 +160,21 @@ fn render_project(inputs: ProjectInputs<'_>, options: &Options<'_>, target: &str
     let mut code = BString::from(
         b"cmake_minimum_required(VERSION 4.5)\nproject(CMAKE_TRY_COMPILE LANGUAGES".as_slice(),
     );
-    for lang in languages {
+    for &lang in &languages {
         code.push(b' ');
         code.extend_from_slice(lang);
     }
     code.extend_from_slice(
         b")\ninclude_directories(${INCLUDE_DIRECTORIES})\nlink_directories(${LINK_DIRECTORIES})\n",
     );
-    code.extend_from_slice(
-        b"separate_arguments(_probe_compile_flags UNIX_COMMAND \"${COMPILE_DEFINITIONS}\")\n\
-          add_compile_options(${_probe_compile_flags})\n",
-    );
+    code.extend_from_slice(b"if(NOT \"${COMPILE_DEFINITIONS}\" STREQUAL \"\")\n");
+    for lang in languages {
+        let flags = BString::from([b"CMAKE_", lang, b"_FLAGS"].concat());
+        code.extend_from_slice(
+            format!("set({flags} \"${{{flags}}} ${{COMPILE_DEFINITIONS}}\")\n").as_bytes(),
+        );
+    }
+    code.extend_from_slice(b"endif()\n");
     let prefix = if archive {
         format!("add_library({target} STATIC")
     } else {

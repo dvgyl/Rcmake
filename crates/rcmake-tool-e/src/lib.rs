@@ -3,15 +3,19 @@
 #![forbid(unsafe_code)]
 
 mod archive;
+mod autogen;
 mod binary;
 mod co_compile;
+mod copy_f90_mod;
 mod definition;
 mod depfile;
 mod dyndep;
 mod files;
 mod generator;
 pub mod make_depends;
+mod ninja_depends;
 mod process;
+mod vs_link;
 
 #[cfg(test)]
 mod tests;
@@ -99,6 +103,11 @@ pub fn run(args: &[BString], cx: &ToolCtx<'_>) -> i32 {
         b"cmake_symlink_executable" if args.len() == 2 => generator::symlink_executable(args, cx),
         b"cmake_transform_depfile" if args.len() == 8 => depfile::transform(args, cx),
         b"cmake_ninja_dyndep" => dyndep::run(args, cx),
+        b"cmake_ninja_depends" => ninja_depends::run(args, cx),
+        b"cmake_copy_f90_mod" if args.len() >= 2 => copy_f90_mod::run(args, cx),
+        b"cmake_autogen" => autogen::run(args, cx),
+        b"cmake_autorcc" => autogen::run_rcc(args, cx),
+        b"vs_link_exe" | b"vs_link_dll" => vs_link::run(command, args, cx),
         b"cmake_echo_color" => generator::echo_color(args, cx),
         b"cmake_progress_start" if args.len() == 2 => generator::progress_start(args, cx),
         // CMake 4.5.1 records progress in cmake_echo_color.

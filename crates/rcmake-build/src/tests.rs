@@ -402,3 +402,122 @@ fn scans_and_collates_before_compiling_module_providers() -> Result<(), Box<dyn 
     );
     Ok(())
 }
+
+#[test]
+fn windows_build_processes_use_argv_and_prepare_side_output_paths() {
+    let cwd = Path::new("C:/Probe Build/CMakeFiles/CMakeScratch");
+    let host = PureHost::new(cwd.into(), "C:/Program Files/Rcmake/cmake.exe".into());
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let recorded = Arc::clone(&calls);
+    host.set_command_handler(move |host, request, _| {
+        let command = &request.pipeline[0];
+        recorded.lock().unwrap().push(command.program.clone());
+        for dir in match command.program.as_slice() {
+            b"C:/Program Files (x86)/VC Tools/cl.exe" => {
+                assert_eq!(
+                    command.args,
+                    [
+                        "/Foobj dir/main.obj",
+                        "/Fdobj dir/pdb/",
+                        "C:/Source Tree/a'b.cpp"
+                    ]
+                );
+                &["C:/Probe Build/CMakeFiles/CMakeScratch/obj dir/pdb"][..]
+            }
+            b"C:/Program Files (x86)/VC Tools/link.exe" => {
+                assert_eq!(
+                    command.args,
+                    [
+                        "/PDB:C:/Debug Files/bin/main.pdb",
+                        "/implib:import lib/main.lib",
+                        "obj dir/main.obj"
+                    ]
+                );
+                &[
+                    "C:/Debug Files/bin",
+                    "C:/Probe Build/CMakeFiles/CMakeScratch/import lib",
+                ][..]
+            }
+            _ => panic!("Unexpected build command."),
+        } {
+            assert_eq!(
+                host.metadata(Path::new(dir), Follow::Yes)?.kind,
+                FileKind::Dir
+            );
+        }
+        Ok(RunOutput {
+            results: vec![ProcessResult::Exited(0)],
+            ..RunOutput::default()
+        })
+    })
+    .unwrap();
+    let mut output = Vec::new();
+    for args in [
+        &[
+            "C:/Program Files (x86)/VC Tools/cl.exe",
+            "/Foobj dir/main.obj",
+            "/Fdobj dir/pdb/",
+            "C:/Source Tree/a'b.cpp",
+        ][..],
+        &[
+            "C:/Program Files (x86)/VC Tools/link.exe",
+            "/PDB:C:/Debug Files/bin/main.pdb",
+            "/implib:import lib/main.lib",
+            "obj dir/main.obj",
+        ][..],
+    ] {
+        assert_eq!(
+            run(&host, cwd, &invocation(args), true, false, &mut output).unwrap(),
+            0
+        );
+    }
+    assert_eq!(calls.lock().unwrap().len(), 2);
+}
+
+#[test]
+fn windows_shell_fragment_runs_from_a_temporary_command_file() {
+    let host = PureHost::default();
+    host.env_set(b"ComSpec", Some(b"C:/Windows/System32/cmd.exe"));
+    let script = Arc::new(Mutex::new(PathBuf::new()));
+    let observed = Arc::clone(&script);
+    let cmd = r#"echo "a file's contents" > "spaced file" && link.exe /out:demo.exe"#;
+    host.set_command_handler(move |host, request, _| {
+        let tool = &request.pipeline[0];
+        assert_eq!(tool.program, "C:/Windows/System32/cmd.exe");
+        assert_eq!(tool.args[..3], ["/D", "/V:OFF", "/C"]);
+        let name = tool.args[3].strip_prefix(b".\\").unwrap();
+        let path = request.cwd.join(path::to_native(name));
+        assert_eq!(
+            host.read(&path, ReadRange::All { limit: 1024 })?,
+            format!("@echo off\r\n{cmd}\r\n").as_bytes()
+        );
+        *observed.lock().unwrap() = path;
+        Ok(RunOutput {
+            results: vec![ProcessResult::Exited(9)],
+            ..RunOutput::default()
+        })
+    })
+    .unwrap();
+    let invocation = Invocation {
+        shell: cmd.into(),
+        ..Invocation::default()
+    };
+    assert_eq!(
+        run(
+            &host,
+            Path::new("/work"),
+            &invocation,
+            true,
+            false,
+            &mut Vec::new()
+        )
+        .unwrap(),
+        9
+    );
+    assert_eq!(
+        host.metadata(&script.lock().unwrap(), Follow::No)
+            .unwrap_err()
+            .kind,
+        std::io::ErrorKind::NotFound
+    );
+}

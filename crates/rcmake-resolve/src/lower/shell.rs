@@ -111,31 +111,149 @@ pub(super) fn rule_invocations(
     template: &[u8],
     lookup: impl Fn(&[u8]) -> Option<BString>,
 ) -> Vec<Invocation> {
+    let expander = RuleExpander {
+        model,
+        dir,
+        // Compile and scan callers bind SOURCE. Link and archive callers bind TARGET.
+        sysroot: if lookup(b"SOURCE").is_some() {
+            b"CMAKE_SYSROOT_COMPILE"
+        } else {
+            b"CMAKE_SYSROOT_LINK"
+        },
+    };
     list::split(template, list::Empty::Drop)
         .into_iter()
-        .map(|rule| {
-            expand_rule(&rule, |key| {
-                lookup(key).or_else(|| {
-                    let value = definition(model, dir, key).map(|v| v.as_slice());
-                    match key {
-                        b"CMAKE_AR" => Some(quote(value.unwrap_or(b"ar"))),
-                        b"CMAKE_RANLIB" => Some(quote(value.unwrap_or(b"ranlib"))),
-                        b"CMAKE_COMMAND" => Some(quote(value.unwrap_or(b"cmake"))),
-                        key if key.starts_with(b"CMAKE_") && key.ends_with(b"_COMPILER") => {
-                            Some(quote(value.unwrap_or({
-                                if matches!(key, b"CMAKE_CXX_COMPILER" | b"CMAKE_OBJCXX_COMPILER") {
-                                    b"c++"
-                                } else {
-                                    b"cc"
-                                }
-                            })))
-                        }
-                        _ => value.map(BString::from),
-                    }
-                })
-            })
-        })
+        .map(|rule| expand_rule(&rule, |key| lookup(key).or_else(|| expander.value(key))))
         .filter(|shell| shell.iter().any(|b| !b.is_ascii_whitespace()))
         .map(command)
         .collect()
+}
+
+struct RuleExpander<'a> {
+    model: &'a ProjectModel,
+    dir: DirId,
+    sysroot: &'static [u8],
+}
+
+impl RuleExpander<'_> {
+    fn definition(&self, key: &[u8]) -> Option<&[u8]> {
+        definition(self.model, self.dir, key).map(|value| value.as_slice())
+    }
+
+    fn value(&self, key: &[u8]) -> Option<BString> {
+        let value = self.definition(key);
+        match key {
+            b"CMAKE_AR" => Some(quote(value.unwrap_or(b"ar"))),
+            b"CMAKE_RANLIB" => Some(quote(value.unwrap_or(b"ranlib"))),
+            b"CMAKE_COMMAND" => Some(quote(value.unwrap_or(b"cmake"))),
+            b"CMAKE_LINKER" | b"CMAKE_MT" | b"CMAKE_RC_COMPILER" => Some(
+                value
+                    .filter(|v| !v.is_empty())
+                    .map_or_else(BString::default, quote),
+            ),
+            b"MANIFESTS" => Some(BString::default()),
+            _ => {
+                if let Some(prefix) = key
+                    .strip_suffix(b"_COMPILER")
+                    .filter(|key| key.starts_with(b"CMAKE_"))
+                {
+                    return Some(self.compiler(key, prefix));
+                }
+                value.map(BString::from)
+            }
+        }
+    }
+
+    fn compiler(&self, key: &[u8], prefix: &[u8]) -> BString {
+        let lookup = |suffix: &[u8]| self.definition(&[prefix, suffix].concat());
+        let mut words = vec![quote(self.definition(key).unwrap_or({
+            if matches!(key, b"CMAKE_CXX_COMPILER" | b"CMAKE_OBJCXX_COMPILER") {
+                b"c++"
+            } else {
+                b"cc"
+            }
+        }))];
+        if let Some(arg1) = lookup(b"_COMPILER_ARG1") {
+            words.push(arg1.into());
+        }
+        let sysroot = self
+            .definition(self.sysroot)
+            .or_else(|| self.definition(b"CMAKE_SYSROOT"));
+        for (option, value) in [
+            (
+                b"_COMPILE_OPTIONS_TARGET".as_slice(),
+                lookup(b"_COMPILER_TARGET"),
+            ),
+            (
+                b"_COMPILE_OPTIONS_EXTERNAL_TOOLCHAIN",
+                lookup(b"_COMPILER_EXTERNAL_TOOLCHAIN"),
+            ),
+            (b"_COMPILE_OPTIONS_SYSROOT", sysroot),
+        ] {
+            if let (Some(option), Some(value)) = (
+                lookup(option).filter(|v| !v.is_empty()),
+                value.filter(|v| !v.is_empty()),
+            ) {
+                let value = quote(value);
+                words.push([option, value.as_slice()].concat().into());
+            }
+        }
+        join_words(words)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compile_and_link_select_their_sysroots_and_preserve_tool_arguments() {
+        let mut model = ProjectModel::default();
+        for (key, value) in [
+            ("CMAKE_C_COMPILER", "/cc tools/cc"),
+            ("CMAKE_C_COMPILER_ARG1", "-mthumb -DARG='two words'"),
+            ("CMAKE_C_COMPILER_TARGET", "arm-none-eabi"),
+            ("CMAKE_C_COMPILE_OPTIONS_TARGET", "--target="),
+            ("CMAKE_C_COMPILER_EXTERNAL_TOOLCHAIN", "/gcc tools"),
+            (
+                "CMAKE_C_COMPILE_OPTIONS_EXTERNAL_TOOLCHAIN",
+                "--gcc-toolchain=",
+            ),
+            ("CMAKE_SYSROOT", "/sysroot"),
+            ("CMAKE_SYSROOT_COMPILE", "/compile root"),
+            ("CMAKE_SYSROOT_LINK", "/link root"),
+            ("CMAKE_C_COMPILE_OPTIONS_SYSROOT", "--sysroot="),
+            ("CMAKE_LINKER", "/link tools/link"),
+            ("CMAKE_MT", "/link tools/mt"),
+        ] {
+            model
+                .dir_mut(DirId::ROOT)
+                .props
+                .set(key.into(), value.into());
+        }
+        for (source, expected) in [
+            (true, "--sysroot=/compile root"),
+            (false, "--sysroot=/link root"),
+        ] {
+            let rules = rule_invocations(
+                &model,
+                DirId::ROOT,
+                b"<CMAKE_C_COMPILER> <CMAKE_LINKER> <CMAKE_MT>",
+                |key| (source && key == b"SOURCE").then(BString::default),
+            );
+            assert_eq!(
+                rules[0].argv,
+                [
+                    "/cc tools/cc",
+                    "-mthumb",
+                    "-DARG=two words",
+                    "--target=arm-none-eabi",
+                    "--gcc-toolchain=/gcc tools",
+                    expected,
+                    "/link tools/link",
+                    "/link tools/mt",
+                ]
+            );
+        }
+    }
 }

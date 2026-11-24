@@ -267,6 +267,7 @@ fn build_probe(
     let limits = cx.limits().clone();
     let trace = cx.trace_config().cloned();
     let generator = cx.project().generator;
+    let generator_spec = cx.project().generator_spec.clone();
     let mut recursion_exceeded = false;
     let (build, mut output) = CapturingHost::capture(cx.host(), &dirs.binary, |host| {
         let mut child = Interp::new(
@@ -292,6 +293,7 @@ fn build_probe(
         let mut child_context = child.cx();
         let model = child_context.project();
         model.generator = generator;
+        model.generator_spec = generator_spec;
         model.global.props.set("IN_TRY_COMPILE".into(), "1".into());
         if !seed.enabled_languages.is_empty() {
             model

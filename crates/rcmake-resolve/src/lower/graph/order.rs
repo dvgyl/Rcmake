@@ -1,3 +1,5 @@
+use std::fmt::Write;
+
 use indexmap::IndexSet;
 use rcmake_base::{BString, truth};
 use rcmake_model::{ProjectModel, Target, TargetKind};
@@ -50,24 +52,26 @@ pub(super) fn dependencies(
         if component.len() < 2 {
             continue;
         }
-        if model
+        let no_cycles = model
             .global
             .props
             .get(b"GLOBAL_DEPENDS_NO_CYCLES")
-            .is_some_and(|v| truth::is_on(v))
-            || !component.iter().all(|&id| {
-                local
-                    .get(id)
-                    .is_some_and(|(raw, _)| raw.kind == TargetKind::StaticLibrary)
-            })
-        {
-            return Err(cycle_error(
-                local,
-                &component,
-                "Only static libraries may have cyclic link dependencies.",
-            ));
+            .is_some_and(|v| truth::is_on(v));
+        let all_static = component.iter().all(|&id| {
+            local
+                .get(id)
+                .is_some_and(|(raw, _)| raw.kind == TargetKind::StaticLibrary)
+        });
+        if no_cycles || !all_static {
+            let reason = if no_cycles {
+                "The GLOBAL_DEPENDS_NO_CYCLES global property is enabled, so cyclic dependencies are not allowed even among static libraries."
+            } else {
+                "At least one of these targets is not a STATIC_LIBRARY.  Cyclic dependencies are allowed only among static libraries."
+            };
+            return Err(cycle_error(local, graph, strong_edges, &component, reason));
         }
         let mut remaining = component.clone();
+        let mut order = Vec::with_capacity(remaining.len());
         while !remaining.is_empty() {
             let next = remaining
                 .iter()
@@ -83,11 +87,16 @@ pub(super) fn dependencies(
             let Some(next) = next else {
                 return Err(cycle_error(
                     local,
+                    graph,
+                    strong_edges,
                     &component,
-                    "The component has a cycle of strong dependencies.",
+                    "The component contains at least one cycle consisting of strong dependencies (created by add_dependencies) that cannot be broken.",
                 ));
             };
             remaining.shift_remove(&next);
+            order.push(next);
+        }
+        for next in order {
             if let Some(target) = graph.get_mut(next) {
                 target.depends.retain(|dep| {
                     !component.contains(dep)
@@ -109,16 +118,46 @@ pub(super) fn dependencies(
 
 fn cycle_error(
     local: &[(&Target, &crate::ResolvedTarget)],
+    graph: &[GraphTarget],
+    strong_edges: &[IndexSet<usize>],
     members: &IndexSet<usize>,
     reason: &str,
 ) -> ResolveError {
-    let names = members
-        .iter()
-        .filter_map(|&id| local.get(id))
-        .map(|(target, _)| target.name.as_slice())
-        .collect::<Vec<_>>();
-    let names = BString::from(names.join(b", ".as_slice()));
-    ResolveError::Message(
-        format!("The inter-target dependency graph contains a cycle ({names}). {reason}").into(),
-    )
+    let mut message = String::from(
+        "The inter-target dependency graph contains the following strongly connected component (cycle):\n",
+    );
+    let mut ids: Vec<_> = members.iter().copied().collect();
+    ids.sort_unstable();
+    for id in ids {
+        let (Some(&(target, _)), Some(node)) = (local.get(id), graph.get(id)) else {
+            continue;
+        };
+        let _ = writeln!(
+            message,
+            "  \"{}\" of type {}",
+            target.name,
+            target.kind.as_str()
+        );
+        for &dep in &node.depends {
+            if members.contains(&dep)
+                && let Some(&(dependency, _)) = local.get(dep)
+            {
+                let strength = if strong_edges
+                    .get(id)
+                    .is_some_and(|edges| edges.contains(&dep))
+                {
+                    "strong"
+                } else {
+                    "weak"
+                };
+                let _ = writeln!(
+                    message,
+                    "    depends on \"{}\" ({strength})",
+                    dependency.name
+                );
+            }
+        }
+    }
+    message.push_str(reason);
+    ResolveError::Message(BString::from(message))
 }

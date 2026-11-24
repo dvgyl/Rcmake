@@ -29,6 +29,13 @@ impl Settings {
         self.lists.entry(key).or_default().push(value.into());
     }
 
+    pub(crate) fn list_unique(&mut self, key: &'static str, value: String) {
+        let values = self.lists.entry(key).or_default();
+        if !values.contains(&value) {
+            values.push(value);
+        }
+    }
+
     pub(crate) fn option(&mut self, flag: &str) {
         self.options.push(msbuild_value(&quote(flag)));
     }
@@ -222,11 +229,31 @@ pub(crate) fn link(flags: impl IntoIterator<Item = String>, archive: bool) -> Se
             "SUBSYSTEM:EFI_APPLICATION" if !archive => settings.set("SubSystem", "EFI Application"),
             "WX" => settings.set(warnings, "true"),
             "WX:NO" => settings.set(warnings, "false"),
-            "INCREMENTAL" if !archive => settings.set("LinkIncremental", "true"),
+            "INCREMENTAL" | "INCREMENTAL:YES" if !archive => {
+                settings.set("LinkIncremental", "true")
+            }
             "INCREMENTAL:NO" if !archive => settings.set("LinkIncremental", "false"),
             "MANIFEST" if !archive => settings.set("GenerateManifest", "true"),
             "MANIFEST:NO" if !archive => settings.set("GenerateManifest", "false"),
             "LTCG" if archive => settings.set("LinkTimeCodeGeneration", "true"),
+            _ if !archive && key.contains(':') => {
+                let (name, value) = key.split_once(':').unwrap_or_default();
+                if let Some(property) = match name.to_ascii_uppercase().as_str() {
+                    "DEF" => Some("ModuleDefinitionFile"),
+                    "IMPLIB" => Some("ImportLibrary"),
+                    "PDB" => Some("ProgramDatabaseFile"),
+                    _ => None,
+                } {
+                    settings.set(property, msbuild_value(&windows(value)));
+                } else if name.eq_ignore_ascii_case("LIBPATH") {
+                    settings.list(
+                        "AdditionalLibraryDirectories",
+                        msbuild_value(&windows(value)),
+                    );
+                } else {
+                    settings.option(&flag);
+                }
+            }
             _ if key.to_ascii_uppercase().starts_with("LIBPATH:") => {
                 if let Some((_, path)) = key.split_once(':') {
                     settings.list(

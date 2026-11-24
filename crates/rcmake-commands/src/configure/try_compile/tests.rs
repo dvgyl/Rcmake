@@ -2,14 +2,36 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use rcmake_eval::{Interp, InterpConfig, RunMode};
-use rcmake_host::{Follow, Host, ProcessResult, PureHost, ReadRange, RunOutput, Stream};
+use rcmake_host::{Follow, Host, ProcessResult, PureHost, ReadRange, RunOutput, Stream, WriteMode};
 use rcmake_model::CacheType;
 
 const DRIVE: &str = if cfg!(windows) { "C:" } else { "" };
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
-fn interpreter(host: Arc<dyn Host>, cwd: &Path) -> Interp {
+fn interpreter(host: Arc<dyn Host>, cwd: &Path) -> Result<Interp, Box<dyn std::error::Error>> {
+    let modules = cwd.join("cmake/Modules");
+    host.create_dir_all(&modules)?;
+    for (name, body) in [
+        (
+            "CMakeSystemSpecificInitialize.cmake",
+            "set(CMAKE_SYSTEM_SPECIFIC_INITIALIZE_LOADED 1)",
+        ),
+        (
+            "CMakeSystemSpecificInformation.cmake",
+            "set(CMAKE_SYSTEM_SPECIFIC_INFORMATION_LOADED 1)\nfunction(probe_initialized)\nendfunction()",
+        ),
+        (
+            "CMakeCInformation.cmake",
+            "probe_initialized()\nset(CMAKE_C_INFORMATION_LOADED 1)",
+        ),
+        (
+            "CMakeCXXInformation.cmake",
+            "probe_initialized()\nset(CMAKE_CXX_INFORMATION_LOADED 1)",
+        ),
+    ] {
+        host.write(&modules.join(name), body.as_bytes(), WriteMode::CreateNew)?;
+    }
     let mut interp = Interp::new(
         InterpConfig {
             host,
@@ -26,6 +48,7 @@ fn interpreter(host: Arc<dyn Host>, cwd: &Path) -> Interp {
     );
     let mut cx = interp.cx();
     cx.set_var(b"CMAKE_SYSTEM", cx.host().system().sysname);
+    cx.set_var(b"CMAKE_MAKE_PROGRAM", "make".into());
     for name in [
         "CMAKE_SYSTEM_LOADED",
         "CMAKE_SYSTEM_SPECIFIC_INITIALIZE_LOADED",
@@ -35,7 +58,7 @@ fn interpreter(host: Arc<dyn Host>, cwd: &Path) -> Interp {
     ] {
         cx.set_var(name.as_bytes(), "1".into());
     }
-    interp
+    Ok(interp)
 }
 
 #[test]
@@ -77,27 +100,32 @@ project(Parent NONE)
 set(CMAKE_C_COMPILER /work/probe-cc)
 set(CMAKE_TRY_COMPILE_PLATFORM_VARIABLES PASSED)
 set(PASSED parent)
-try_compile(NEW SOURCES /work/main.c NO_CACHE NO_LOG)
+try_compile(NEW SOURCES /work/main.c CMAKE_FLAGS "-DCOMPILE_DEFINITIONS=--probe-driver-flag" NO_CACHE NO_LOG)
 try_compile(LEGACY /work/legacy /work/main.c NO_LOG)
 try_compile(PROJECT_NEW PROJECT Child SOURCE_DIR /work/sub BINARY_DIR /work/build/project-new TARGET app
     CMAKE_FLAGS -DPASSED:STRING=override OUTPUT_VARIABLE CHILD_OUT LOG_DESCRIPTION "Child build")
 try_compile(PROJECT_OLD /work/project-old /work/sub Child app OUTPUT_VARIABLE CHILD_OLD NO_LOG)
 "#)?.replace("/work", &format!("{DRIVE}/work")).into_bytes(),
         )?;
-    host.set_command_handler(|_, request, _| {
+    let flagged = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let observed = Arc::clone(&flagged);
+    host.set_command_handler(move |_, request, _| {
         let command = &request.pipeline[0];
         assert_eq!(
             rcmake_host::path::to_native(&command.program),
             Path::new(&format!("{DRIVE}/work/probe-cc"))
         );
         assert!(!command.args.iter().any(|arg| arg.ends_with(b"missing.c")));
+        if command.args.iter().any(|arg| arg == "--probe-driver-flag") {
+            observed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         Ok(RunOutput {
             stdout: b"compiler output\n".to_vec(),
             results: vec![ProcessResult::Exited(0)],
             ..RunOutput::default()
         })
     })?;
-    let mut interp = interpreter(host.clone(), Path::new(&format!("{DRIVE}/work")));
+    let mut interp = interpreter(host.clone(), Path::new(&format!("{DRIVE}/work")))?;
     let result = interp.run_configure(
         Path::new(&format!("{DRIVE}/work")),
         Path::new(&format!("{DRIVE}/work/build")),
@@ -106,6 +134,7 @@ try_compile(PROJECT_OLD /work/project-old /work/sub Child app OUTPUT_VARIABLE CH
     assert_eq!(result.exit_code, 0, "{}", host.stream_bytes(Stream::Stderr));
     let mut cx = interp.cx();
     assert_eq!(cx.var_normal_only(b"NEW"), Some("TRUE".into()));
+    assert_eq!(flagged.load(std::sync::atomic::Ordering::Relaxed), 2);
     assert!(cx.cache().get(b"NEW").is_none());
     for name in [b"LEGACY".as_slice(), b"PROJECT_NEW", b"PROJECT_OLD"] {
         let entry = cx.cache().get(name).ok_or("Missing cache result.")?;
@@ -184,7 +213,7 @@ message(STATUS "inside probe")
 "#,
         )?;
         let redirect = (format == TraceFormat::JsonV1).then(|| PathBuf::from("/work/trace"));
-        let mut interp = interpreter(host.clone(), Path::new("/work"));
+        let mut interp = interpreter(host.clone(), Path::new("/work"))?;
         interp.set_trace_config(Some(TraceConfig {
             format,
             redirect: redirect.clone(),
@@ -222,7 +251,7 @@ message(STATUS "inside probe")
 fn builds_real_macho_archive_and_runs_a_probe() -> TestResult {
     use std::time::Duration;
 
-    use rcmake_host::{CommandSpec, Input, NativeHost, Output, RunRequest, WriteMode};
+    use rcmake_host::{CommandSpec, Input, NativeHost, Output, RunRequest};
 
     let host = Arc::new(NativeHost::new()?);
     let temp = host.run(
@@ -319,7 +348,7 @@ int main() { static_assert(Valid<int>); }
 "#,
             WriteMode::CreateNew,
         )?;
-    let mut interp = interpreter(host.clone(), &root);
+    let mut interp = interpreter(host.clone(), &root)?;
     let binary = root.join("build");
     let result = interp.run_configure(&root, &binary, &[]);
     let cx = interp.cx();
@@ -416,7 +445,7 @@ fn try_compile_can_nest_three_projects_with_the_default_recursion_limit() -> Tes
             code.as_bytes(),
         )?;
     }
-    let mut interp = interpreter(host.clone(), Path::new("/work"));
+    let mut interp = interpreter(host.clone(), Path::new("/work"))?;
     let result = interp.run_configure(Path::new("/work/probe0"), Path::new("/work/build"), &[]);
     assert_eq!(result.exit_code, 0, "{}", host.stream_bytes(Stream::Stderr));
     Ok(())

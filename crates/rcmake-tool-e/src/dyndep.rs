@@ -1,4 +1,4 @@
-//! `cmake -E cmake_ninja_dyndep` collates one target's C++ module scan results.
+//! `cmake -E cmake_ninja_dyndep` collates one target's module scan results.
 
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -8,10 +8,12 @@ use rcmake_cxxmodules::collate::{CollationInput, collate, read_modules_json, wri
 use rcmake_cxxmodules::dyndep::{DyndepRequest, HEADER};
 use rcmake_cxxmodules::p1689::parse_ddi;
 use rcmake_cxxmodules::tdi::read_tdi;
-use rcmake_cxxmodules::{CxxModulesJson, ModmapFormat, ModulesError};
+use rcmake_cxxmodules::{CxxModulesJson, ModmapFormat, ModulesError, TargetDependInfo};
 use rcmake_host::{Stream, WriteMode, path::from_native};
 
 use crate::{ToolCtx, error, path, read_all};
+
+mod fortran;
 
 const COMMAND: &str = "-E cmake_ninja_dyndep";
 
@@ -26,10 +28,11 @@ pub(crate) fn run(args: &[BString], cx: &ToolCtx<'_>) -> i32 {
 fn execute(args: &[BString], cx: &ToolCtx<'_>) -> Result<(), BString> {
     let args = expand_response(args, cx)?;
     let request = parse(&args).map_err(|err| format!("{COMMAND} {err}"))?;
-    if request.lang != b"CXX" {
+    if !matches!(request.lang.as_slice(), b"CXX" | b"Fortran") {
         return Err(format!("{COMMAND} does not support language {}", request.lang).into());
     }
-    let tdi = read_tdi(&read_input(cx, &request.tdi, &request.tdi)?)
+    let tdi_bytes = read_input(cx, &request.tdi, &request.tdi)?;
+    let tdi = read_tdi(&tdi_bytes)
         .map_err(|err| format!("{COMMAND} failed to parse {}{err}", request.tdi))?;
     for (key, directory) in [
         ("dir-cur-bld", &tdi.dir_cur_bld),
@@ -41,6 +44,17 @@ fn execute(args: &[BString], cx: &ToolCtx<'_>) -> Result<(), BString> {
             return Err(format!("{COMMAND} --tdi= file has no absolute {key}").into());
         }
     }
+    if request.lang == b"Fortran" {
+        return fortran::execute(&request, cx, &tdi, &tdi_bytes);
+    }
+    execute_cxx(&request, cx, tdi)
+}
+
+fn execute_cxx(
+    request: &DyndepRequest,
+    cx: &ToolCtx<'_>,
+    tdi: TargetDependInfo,
+) -> Result<(), BString> {
     let linked = read_tables(cx, &tdi.linked_target_dirs)?;
     let forwarded = read_tables(cx, &tdi.forward_modules_from_target_dirs)?;
     let native = tdi
@@ -127,7 +141,15 @@ fn read_tables(cx: &ToolCtx<'_>, directories: &[BString]) -> Result<Vec<CxxModul
 }
 
 fn read_table(cx: &ToolCtx<'_>, directory: &[u8]) -> Result<CxxModulesJson, BString> {
-    let file = Lexical::new(directory).append(b"CXXModules.json");
+    read_table_file(cx, directory, b"CXXModules.json")
+}
+
+fn read_table_file(
+    cx: &ToolCtx<'_>,
+    directory: &[u8],
+    name: &[u8],
+) -> Result<CxxModulesJson, BString> {
+    let file = Lexical::new(directory).append(name);
     let contents = read_input(cx, directory, &file)?;
     read_modules_json(&contents).map_err(|err| {
         format!(
@@ -138,7 +160,7 @@ fn read_table(cx: &ToolCtx<'_>, directory: &[u8]) -> Result<CxxModulesJson, BStr
     })
 }
 
-fn write_output(
+pub(crate) fn write_output(
     cx: &ToolCtx<'_>,
     file: &Path,
     data: &[u8],

@@ -898,3 +898,59 @@ fn ninja_dyndep_validates_arguments_like_the_oracle() {
         b"CMake Error: -E cmake_ninja_dyndep failed to parse x.jsonFile not found: x.json\n"
     );
 }
+
+#[test]
+fn icstat_initializes_checks_and_runs_before_the_compiler() -> HostResult<()> {
+    use std::sync::{Arc, Mutex};
+
+    let f = Fixture::new();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let observed = Arc::clone(&calls);
+    f.host.set_command_handler(move |_, request, _| {
+        let command = &request.pipeline[0];
+        if let Ok(mut calls) = observed.lock() {
+            calls.push(command.program.clone());
+        }
+        let stdout = match command.program.as_slice() {
+            b"iar/ichecks" => {
+                assert_eq!(command.args, ["--default=stdchecks"]);
+                Vec::new()
+            }
+            b"icstat" => {
+                assert_eq!(
+                    command.args,
+                    ["analyze", "--", "iar/icc", "-c", "src/main.c"]
+                );
+                b"Results:\n\"../../src/main.c\", line 3\n".to_vec()
+            }
+            b"iar/icc" => Vec::new(),
+            other => panic!("Unexpected command: {}", BString::from(other)),
+        };
+        Ok(RunOutput {
+            stdout,
+            results: vec![ProcessResult::Exited(0)],
+            ..RunOutput::default()
+        })
+    })?;
+    assert_eq!(
+        f.run(&[
+            "__run_co_compile",
+            "--icstat=icstat;analyze",
+            "--source=src/main.c",
+            "--",
+            "iar/icc",
+            "-c",
+            "src/main.c",
+        ]),
+        0
+    );
+    assert_eq!(
+        f.err(),
+        b"C-STAT: Analyzing main.c (cached)\nResults:\n\"src/main.c\", line 3\n"
+    );
+    let calls = calls
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    assert_eq!(*calls, ["iar/ichecks", "icstat", "iar/icc"]);
+    Ok(())
+}

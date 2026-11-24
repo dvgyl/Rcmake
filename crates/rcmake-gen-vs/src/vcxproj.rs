@@ -92,7 +92,9 @@ pub(crate) struct Plan {
 #[derive(Default)]
 struct Config {
     compile: flags_table::Settings,
+    resource: flags_table::Settings,
     link: flags_table::Settings,
+    link_output_dirs: Vec<String>,
     events: [Vec<Rule>; 3],
     dir: String,
     name: String,
@@ -195,10 +197,15 @@ impl Context<'_> {
                     }
                     compiled
                 };
-                if let [settings] = ide.compile.as_slice() {
+                let languages = ide
+                    .compile
+                    .iter()
+                    .filter(|settings| settings.language != b"RC");
+                let use_common = languages.clone().count() == 1;
+                if use_common && let Some(settings) = languages.clone().next() {
                     config.compile = target_compile(settings);
                 }
-                if !ide.compile.is_empty() {
+                if languages.clone().next().is_some() {
                     config.compile.compiler_defaults(&self.settings.toolset);
                     config.compile.list(
                         "PreprocessorDefinitions",
@@ -232,7 +239,7 @@ impl Context<'_> {
                         .any(|value| value.as_slice() == name.as_bytes());
                     if kind == Kind::Compile {
                         item.object = self.object_path(&path, name, fact);
-                        let base = (ide.compile.len() > 1)
+                        let base = (!use_common)
                             .then(|| {
                                 ide.compile.iter().find(|settings| {
                                     settings.language.as_slice() == language.as_bytes()
@@ -250,7 +257,26 @@ impl Context<'_> {
                             (None, overrides) => overrides.as_ref().map(visual_studio_compile),
                         };
                         item.language = language;
+                    } else if kind == Kind::Resource {
+                        item.compile = source.compile.as_ref().map(visual_studio_compile);
                     }
+                }
+                if let Some(resource) = ide
+                    .compile
+                    .iter()
+                    .find(|settings| settings.language == b"RC")
+                {
+                    config.resource = visual_studio_compile(resource);
+                    for settings in languages {
+                        for define in &settings.defines {
+                            let value = msbuild_value(&string(&define.value));
+                            config
+                                .resource
+                                .list_unique("PreprocessorDefinitions", value);
+                        }
+                    }
+                } else if let Some(settings) = languages.clone().next() {
+                    config.resource = include_definitions(settings);
                 }
                 config.link = self.ide_link(ide, name);
                 for (index, step) in ide.custom.iter().enumerate() {
@@ -265,6 +291,7 @@ impl Context<'_> {
             } else {
                 self.fallback(&mut plan, &mut config, fact, &steps, link, name);
             }
+            self.windows_link(&plan, &mut config, fact, name);
             let property = |key: &[u8]| {
                 fact.and_then(|fact| fact.ide.as_ref())
                     .and_then(|ide| ide.attributes.get(key))
@@ -509,6 +536,12 @@ fn visual_studio_compile(settings: &IdeCompileSettings) -> flags_table::Settings
             .iter()
             .flat_map(|flag| ide_flags(&string(&flag.value))),
     );
+    out.append(include_definitions(settings));
+    out
+}
+
+fn include_definitions(settings: &IdeCompileSettings) -> flags_table::Settings {
+    let mut out = flags_table::Settings::default();
     for define in &settings.defines {
         out.list(
             "PreprocessorDefinitions",

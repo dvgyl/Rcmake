@@ -88,7 +88,7 @@ impl Command<'_> {
             config: self.config.clone(),
             current: Some(handle),
             head: Some(handle),
-            language: self.source.map(|_| self.language.clone()),
+            language: Some(self.language.clone()),
             link_language: self.source.is_none().then(|| self.language.clone()),
             ..EvalContext::default()
         };

@@ -117,9 +117,9 @@ fn normalized(path: &[u8]) -> BString {
 }
 
 #[derive(Default)]
-struct Rule {
+pub(super) struct Rule {
     targets: Vec<Vec<u8>>,
-    dependencies: Vec<Vec<u8>>,
+    pub(super) dependencies: Vec<Vec<u8>>,
     colon: bool,
 }
 
@@ -148,7 +148,7 @@ impl Rule {
     }
 }
 
-fn parse(contents: &[u8]) -> Option<Vec<Rule>> {
+pub(super) fn parse(contents: &[u8]) -> Option<Vec<Rule>> {
     let mut rules = Vec::new();
     let mut rule = Rule::default();
     let mut word = Vec::new();

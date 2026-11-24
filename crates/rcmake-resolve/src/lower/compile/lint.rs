@@ -158,6 +158,7 @@ fn analyzers(
             (b"pvs-studio", b"_PVS_STUDIO"),
             (b"cpplint", b"_CPPLINT"),
             (b"cppcheck", b"_CPPCHECK"),
+            (b"icstat", b"_ICSTAT"),
         ],
         b"OBJC" | b"OBJCXX" => &[(b"tidy", b"_CLANG_TIDY")],
         _ => &[],
@@ -193,6 +194,20 @@ fn analyzers(
                     command.push(b';');
                     command.extend_from_slice(&escaped(&option(b"export-fixes", &path)));
                 }
+            }
+            b"icstat" => {
+                for (prefix, default) in [
+                    (
+                        b"--checks=".as_slice(),
+                        b";--checks=cstat_sel_checks.txt".as_slice(),
+                    ),
+                    (b"--db=", b";--db=cstat.db"),
+                ] {
+                    if !command.windows(prefix.len()).any(|part| part == prefix) {
+                        command.extend_from_slice(default);
+                    }
+                }
+                command.extend_from_slice(b";analyze");
             }
             b"pvs-studio" => {
                 let compiler =

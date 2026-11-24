@@ -1,16 +1,70 @@
-use rcmake_base::list;
+use rcmake_base::{list, path_lex::Lexical};
 use rcmake_model::{TargetId, TargetKind};
 use rcmake_resolve::{
-    BuildStep,
+    BuildStep, ResolvedTarget,
     ide::{IdeFacts, IdeLinkItem, IdeSourceKind},
 };
 
 use super::{
-    Context, Kind, absolute, flags_table, ide_flags, join, msbuild, msbuild_value, object_path,
-    source_kind, string, windows,
+    Config, Context, Kind, Plan, absolute, flags_table, ide_flags, join, msbuild, msbuild_value,
+    object_path, source_kind, string, windows,
 };
 
 impl Context<'_> {
+    pub(super) fn windows_link(
+        &self,
+        plan: &Plan,
+        config: &mut Config,
+        fact: Option<&ResolvedTarget>,
+        name: &str,
+    ) {
+        if !matches!(
+            self.project.kind,
+            TargetKind::Executable | TargetKind::SharedLibrary | TargetKind::ModuleLibrary
+        ) {
+            return;
+        }
+        for (property, file) in [
+            (
+                "ImportLibrary",
+                fact.and_then(|fact| fact.artifacts.import_file.as_ref()),
+            ),
+            (
+                "ProgramDatabaseFile",
+                fact.and_then(|fact| fact.artifacts.pdb_file.as_ref()),
+            ),
+        ] {
+            let explicit = config.link.has(property);
+            if let Some(file) = file.filter(|_| !explicit) {
+                let file = absolute(&self.settings.bin, &string(file));
+                let dir = string(Lexical::new(file.as_bytes()).parent());
+                if !dir.is_empty() && dir != config.dir && !config.link_output_dirs.contains(&dir) {
+                    config.link_output_dirs.push(dir);
+                }
+                config.link.set(property, msbuild(&windows(&file)));
+            }
+        }
+        if config.link.has("ModuleDefinitionFile") {
+            return;
+        }
+        let mut definitions = plan.items.values().filter(|item| {
+            item.kind == Kind::Other
+                && item
+                    .path
+                    .rsplit_once('.')
+                    .is_some_and(|(_, ext)| ext.eq_ignore_ascii_case("def"))
+                && item
+                    .configs
+                    .get(name)
+                    .is_some_and(|source| !source.excluded)
+        });
+        if let Some(file) = definitions.next().filter(|_| definitions.next().is_none()) {
+            config
+                .link
+                .set("ModuleDefinitionFile", msbuild(&windows(&file.path)));
+        }
+    }
+
     pub(super) fn ide_link(&self, ide: &IdeFacts, config: &str) -> flags_table::Settings {
         let archive = self.project.kind == TargetKind::StaticLibrary;
         let mut flags: Vec<_> = ide
@@ -64,25 +118,39 @@ impl Context<'_> {
             .iter()
             .find(|fact| fact.id == id && fact.config.0.as_slice() == config.as_bytes());
         if let Some(file) = resolved.and_then(|fact| {
-            fact.artifacts
-                .linker_file
-                .as_ref()
-                .or(fact.artifacts.import_file.as_ref())
-                .or(fact.artifacts.file.as_ref())
+            fact.artifacts.import_file.as_ref().or_else(|| {
+                if target.kind == TargetKind::SharedLibrary {
+                    fact.artifacts
+                        .linker_file
+                        .as_ref()
+                        .filter(|file| Some(*file) != fact.artifacts.file.as_ref())
+                } else {
+                    fact.artifacts
+                        .linker_file
+                        .as_ref()
+                        .or(fact.artifacts.file.as_ref())
+                }
+            })
         }) {
             return Some(windows(&absolute(&self.settings.bin, &string(file))));
         }
         if target.is_imported() {
             let config = config.to_ascii_uppercase();
-            return [
+            let keys = [
                 format!("IMPORTED_IMPLIB_{config}"),
                 "IMPORTED_IMPLIB".into(),
                 format!("IMPORTED_LOCATION_{config}"),
                 "IMPORTED_LOCATION".into(),
-            ]
-            .into_iter()
-            .find_map(|key| target.props.get(key.as_bytes()))
-            .map(|file| windows(&string(file)));
+            ];
+            let keys = if target.kind == TargetKind::SharedLibrary {
+                &keys[..2]
+            } else {
+                keys.as_slice()
+            };
+            return keys
+                .iter()
+                .find_map(|key| target.props.get(key.as_bytes()))
+                .map(|file| windows(&string(file)));
         }
         let project = self
             .projects

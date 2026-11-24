@@ -17,6 +17,8 @@ use rcmake_host::{
 };
 use rcmake_resolve::{BuildGraph, BuildStep, Invocation};
 
+mod windows;
+
 /// Options for one build.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BuildOptions {
@@ -95,6 +97,7 @@ pub fn execute(
     if !order.is_empty() {
         let build_dir = host.initial_cwd().join(&options.build_dir);
         host.create_dir_all(&build_dir)?;
+        let windows = host.system().sysname.eq_ignore_ascii_case(b"Windows");
         let scan_objects: BTreeMap<_, _> = order
             .iter()
             .filter_map(|step| match step {
@@ -189,7 +192,14 @@ pub fn execute(
             }
             steps_run += 1;
             for invocation in invocations {
-                exit_code = run(host, &build_dir, invocation, options.verbose, &mut output)?;
+                exit_code = run(
+                    host,
+                    &build_dir,
+                    invocation,
+                    windows,
+                    options.verbose,
+                    &mut output,
+                )?;
                 if exit_code != 0 {
                     break;
                 }
@@ -429,21 +439,40 @@ fn create_output_parent(host: &dyn Host, build_dir: &Path, file: &[u8]) -> Resul
     Ok(())
 }
 
-const SHELL_PROGRAM: &str = if cfg!(windows) { "cmd.exe" } else { "/bin/sh" };
-const SHELL_COMMAND_FLAG: &str = if cfg!(windows) { "/C" } else { "-c" };
-
 fn run(
     host: &dyn Host,
     build_dir: &Path,
     invocation: &Invocation,
+    windows: bool,
     verbose: bool,
     output: &mut Vec<u8>,
 ) -> Result<i32, HostError> {
+    let cwd = invocation.working_dir.as_ref().map_or_else(
+        || build_dir.to_path_buf(),
+        |dir| {
+            if windows {
+                windows::absolute(build_dir, dir)
+            } else {
+                build_dir.join(path::to_native(dir))
+            }
+        },
+    );
+    let mut script = None;
     let (program, args) = match invocation.argv.split_first() {
-        Some((program, args)) => (program.clone(), args.to_vec()),
+        Some((program, args)) => {
+            if windows {
+                windows::prepare_outputs(host, &cwd, args)?;
+            }
+            (program.clone(), args.to_vec())
+        }
+        None if windows => {
+            let (command, file) = windows::shell_command(host, &cwd, &invocation.shell)?;
+            script = Some(file);
+            (command.program, command.args)
+        }
         None => (
-            SHELL_PROGRAM.into(),
-            vec![SHELL_COMMAND_FLAG.into(), invocation.shell.clone()],
+            "/bin/sh".into(),
+            vec!["-c".into(), invocation.shell.clone()],
         ),
     };
     if verbose {
@@ -458,17 +487,17 @@ fn run(
         }
         output.push(b'\n');
     }
-    let cwd = invocation.working_dir.as_ref().map_or_else(
-        || build_dir.to_path_buf(),
-        |dir| build_dir.join(path::to_native(dir)),
-    );
     if let [e, rm, flag, files @ ..] = args.as_slice()
         && e.as_slice() == b"-E"
         && rm.as_slice() == b"rm"
         && flag.as_slice() == b"-f"
     {
         for file in files {
-            let target = cwd.join(path::to_native(file));
+            let target = if windows {
+                windows::absolute(&cwd, file)
+            } else {
+                cwd.join(path::to_native(file))
+            };
             if let Err(err) = host.remove_file(&target)
                 && err.kind != std::io::ErrorKind::NotFound
             {
@@ -489,7 +518,10 @@ fn run(
             tee: false,
         },
         &mut |_, _| {},
-    )?;
+    );
+    let cleanup = script.map(|file| host.remove_file(&file)).transpose();
+    let result = result?;
+    cleanup?;
     output.extend_from_slice(&result.stdout);
     output.extend_from_slice(&result.stderr);
     match result.results.first() {

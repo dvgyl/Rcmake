@@ -149,7 +149,9 @@ pub(crate) fn render(ctx: &Context<'_>, plan: &Plan) -> String {
         xml.start("ClCompile", &[]);
         config.compile.write(&mut xml);
         xml.end();
-        xml.empty("ResourceCompile", &[]);
+        xml.start("ResourceCompile", &[]);
+        config.resource.write(&mut xml);
+        xml.end();
         xml.empty("Midl", &[]);
         if project.kind == TargetKind::StaticLibrary {
             xml.start("Lib", &[]);
@@ -226,6 +228,37 @@ pub(crate) fn render(ctx: &Context<'_>, plan: &Plan) -> String {
         "Import",
         &[("Project", r"$(VCTargetsPath)\Microsoft.Cpp.targets")],
     );
+    if plan
+        .configs
+        .values()
+        .any(|config| !config.link_output_dirs.is_empty())
+    {
+        xml.start(
+            "Target",
+            &[
+                ("Name", "RcmakePrepareLinkDirectories"),
+                ("BeforeTargets", "Link"),
+            ],
+        );
+        for (name, config) in &plan.configs {
+            if !config.link_output_dirs.is_empty() {
+                let dirs = config
+                    .link_output_dirs
+                    .iter()
+                    .map(|dir| msbuild(&windows(dir)))
+                    .collect::<Vec<_>>()
+                    .join(";");
+                xml.empty(
+                    "MakeDir",
+                    &[
+                        ("Condition", &settings.condition(name)),
+                        ("Directories", &dirs),
+                    ],
+                );
+            }
+        }
+        xml.end();
+    }
     if project.kind == TargetKind::ObjectLibrary {
         xml.empty(
             "Target",
