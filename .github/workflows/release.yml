@@ -1,0 +1,199 @@
+name: Release
+
+"on":
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  RUSTUP_TOOLCHAIN: stable
+
+jobs:
+  package:
+    name: Package ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+            target: aarch64-apple-darwin
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - os: windows-2025
+            target: x86_64-pc-windows-msvc
+    env:
+      RELEASE_TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      - name: Build the tarball
+        if: runner.os != 'Windows'
+        shell: bash
+        run: scripts/dist.sh --target "$RELEASE_TARGET"
+
+      - uses: ilammy/msvc-dev-cmd@v1
+        if: runner.os == 'Windows'
+        with:
+          arch: x64
+      - name: Build the ZIP archive
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $root = (Get-Location).Path
+          $version = python -c "import tomllib; print(tomllib.load(open('Cargo.toml', 'rb'))['workspace']['package']['version'])"
+          if ($version -cnotmatch '^[0-9]+\.[0-9]+\.[0-9]+([-+][A-Za-z0-9.+-]+)?$') {
+            throw 'Invalid version in Cargo.toml.'
+          }
+          $cargoHome = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { Join-Path $HOME '.cargo' }
+          $homePaths = @($HOME, $env:USERPROFILE, $env:HOME) | Where-Object { $_ } | Select-Object -Unique
+          $remap = @(
+            foreach ($path in $homePaths) { @{ Source = $path; Destination = '/rust-home' } }
+            @{ Source = $root; Destination = '/rcmake' }
+            @{ Source = (Join-Path $cargoHome 'registry\src'); Destination = '/cargo/registry/src' }
+            @{ Source = (Join-Path $HOME '.cargo\registry\src'); Destination = '/cargo/registry/src' }
+          )
+          $flags = @(
+            foreach ($mapping in $remap) {
+              foreach ($path in @($mapping.Source, $mapping.Source.Replace('\', '/')) | Select-Object -Unique) {
+                "--remap-path-prefix=$path=$($mapping.Destination)"
+              }
+            }
+          )
+          $env:RUSTFLAGS = $flags -join ' '
+          $env:CARGO_ENCODED_RUSTFLAGS = $flags -join [char]31
+          cargo build --locked --release --bin rcmake --target $env:RELEASE_TARGET --target-dir target
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          $binary = "target/$env:RELEASE_TARGET/release/rcmake.exe"
+          $env:RCMAKE_RELEASE_BINARY = $binary
+          $env:RCMAKE_RELEASE_HOMES = $homePaths -join [char]31
+          @'
+          import os
+          from pathlib import Path
+          import sys
+
+          contents = Path(os.environ["RCMAKE_RELEASE_BINARY"]).read_bytes().lower()
+          for home in os.environ["RCMAKE_RELEASE_HOMES"].split("\x1f"):
+              for path in {home, home.replace("\\", "/"), home.replace("/", "\\")}:
+                  for encoding in ("utf-8", "utf-16le"):
+                      if path.encode(encoding).lower() in contents:
+                          sys.exit("The release binary contains a home directory path.")
+          '@ | python -
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          $name = "rcmake-$version-$env:RELEASE_TARGET"
+          $work = Join-Path $env:RUNNER_TEMP ([Guid]::NewGuid().ToString())
+          $package = Join-Path $work $name
+          try {
+            New-Item -ItemType Directory -Path "$package/bin", "$package/share", "$package/third_party", 'dist' -Force | Out-Null
+            foreach ($tool in 'rcmake', 'cmake', 'ctest', 'cpack') {
+              Copy-Item $binary "$package/bin/$tool.exe"
+            }
+            Copy-Item modules/cmake-4.5 "$package/share/" -Recurse
+            Copy-Item third_party/licences "$package/third_party/" -Recurse
+            Copy-Item LICENSE-MIT, LICENSE-APACHE, THIRD_PARTY_NOTICES.md $package
+
+            [string[]]$files = @(Get-ChildItem -LiteralPath $package -File -Recurse -Force | ForEach-Object {
+              [IO.Path]::GetRelativePath($work, $_.FullName)
+            })
+            [Array]::Sort($files, [StringComparer]::Ordinal)
+            $archive = Join-Path $work "$name.zip"
+            $zip = [IO.Compression.ZipFile]::Open($archive, [IO.Compression.ZipArchiveMode]::Create)
+            try {
+              foreach ($file in $files) {
+                $entry = $zip.CreateEntry($file.Replace('\', '/'), [IO.Compression.CompressionLevel]::Optimal)
+                $entry.LastWriteTime = [DateTimeOffset]::new(1980, 1, 1, 0, 0, 0, [TimeSpan]::Zero)
+                $entry.ExternalAttributes = 0
+                $source = [IO.File]::OpenRead((Join-Path $work $file))
+                try {
+                  $destination = $entry.Open()
+                  try { $source.CopyTo($destination) } finally { $destination.Dispose() }
+                } finally {
+                  $source.Dispose()
+                }
+              }
+            } finally {
+              $zip.Dispose()
+            }
+            $digest = (Get-FileHash -Algorithm SHA256 -LiteralPath $archive).Hash.ToLowerInvariant()
+            "$digest  $name.zip`n" | Set-Content -LiteralPath "dist/$name.zip.sha256" -Encoding ascii -NoNewline
+            Move-Item -LiteralPath $archive -Destination "dist/$name.zip" -Force
+          } finally {
+            Remove-Item -LiteralPath $work -Recurse -Force
+          }
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: rcmake-${{ matrix.target }}
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/*.sha256
+          if-no-files-found: error
+
+  release:
+    name: Verify packages and publish
+    needs: package
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          pattern: rcmake-*
+          path: dist
+          merge-multiple: true
+      - name: Verify package checksums
+        working-directory: dist
+        shell: bash
+        run: |
+          shopt -s nullglob
+          archives=(*.tar.gz *.zip)
+          if [[ ${#archives[@]} -ne 4 ]]; then
+            printf 'Expected four release archives.\n' >&2
+            exit 1
+          fi
+          for archive in "${archives[@]}"; do
+            sha256sum "$archive"
+          done | LC_ALL=C sort -k2 > SHA256SUMS.txt
+          LC_ALL=C sort -k2 -- *.sha256 | diff -u SHA256SUMS.txt -
+      - uses: actions/upload-artifact@v6
+        with:
+          name: release
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/SHA256SUMS.txt
+          if-no-files-found: error
+      - name: Attach archives to the GitHub Release
+        if: github.ref_type == 'tag' && startsWith(github.ref_name, 'v')
+        working-directory: dist
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          shopt -s nullglob
+          assets=(*.tar.gz *.zip SHA256SUMS.txt)
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" "${assets[@]}" --clobber
+          else
+            gh release create "$RELEASE_TAG" "${assets[@]}" --verify-tag --generate-notes
+          fi
