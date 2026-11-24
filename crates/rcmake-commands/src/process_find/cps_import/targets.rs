@@ -4,7 +4,7 @@ use rcmake_base::{BString, ByteSlice as _, list};
 use rcmake_cps::{CpsComponentType, CpsPackage, CpsUsage};
 use rcmake_eval::{CmdError, Cx};
 use rcmake_model::{
-    BT, ImportedVisibility, LinkItem, Target, TargetKind, TargetOrigin, UsageField,
+    BT, GeneratorKind, ImportedVisibility, LinkItem, Target, TargetKind, TargetOrigin, UsageField,
 };
 
 use super::text;
@@ -30,6 +30,7 @@ pub(in crate::process_find) fn import(
     let dir = cx.current_dir_id();
     let backtrace = cx.backtrace();
     let policies = *cx.policies_mut();
+    let configuration_maps = configuration_maps(cx);
     let mut targets = Vec::new();
     let new_target = |name, kind| {
         let mut target = Target::new(
@@ -42,6 +43,9 @@ pub(in crate::process_find) fn import(
         );
         target.props.set("SYSTEM".into(), "ON".into());
         target.props.set(SOURCE.into(), source.clone());
+        for (property, value) in &configuration_maps {
+            target.props.set(property.clone(), value.clone());
+        }
         target
     };
     for (component_name, component) in &package.components {
@@ -124,6 +128,30 @@ pub(in crate::process_find) fn import(
             .map_err(|error| CmdError::Status(error.to_string().into()))?;
     }
     Ok(())
+}
+
+fn configuration_maps(cx: &mut Cx<'_>) -> Vec<(BString, BString)> {
+    let generator = cx
+        .project()
+        .generator
+        .or_else(|| GeneratorKind::from_name(&cx.var_or_empty(b"CMAKE_GENERATOR")));
+    let configs = if generator.is_some_and(GeneratorKind::multi_config) {
+        list::split(
+            &cx.var_or_empty(b"CMAKE_CONFIGURATION_TYPES"),
+            list::Empty::Drop,
+        )
+    } else {
+        vec![cx.var_or_empty(b"CMAKE_BUILD_TYPE")]
+    };
+    configs
+        .into_iter()
+        .filter(|config| !config.is_empty())
+        .filter_map(|config| {
+            let property = text(&[b"MAP_IMPORTED_CONFIG_", &config.to_ascii_uppercase()]);
+            let value = cx.var(&text(&[b"CMAKE_", &property]))?;
+            Some((property, value))
+        })
+        .collect()
 }
 
 fn apply_usage(target: &mut Target, package: &[u8], usage: &CpsUsage, config: &[u8]) {

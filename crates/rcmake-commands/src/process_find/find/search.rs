@@ -103,16 +103,19 @@ impl FrameworkOrder {
 
 impl<'a> Search<'a> {
     pub(super) fn new(cx: &Cx<'_>, kind: Kind, options: &'a Options, var: &[u8]) -> Self {
+        let debug = cx.find_variable_debug(var)
+            || cx
+                .var_normal_only(b"CMAKE_FIND_PACKAGE_NAME")
+                .is_some_and(|package| cx.find_package_debug(&package));
         Self {
             kind,
             options,
             decoration: matches!(kind, Kind::Library).then(|| LibraryNames::new(cx)),
             ignored: IgnoredPaths::new(cx),
-            considered: cx.find_variable_debug(var).then(String::new),
+            considered: debug.then(String::new),
             match_path: None,
             event: (cx.mode() == RunMode::Configure
-                && (cx.find_variable_debug(var)
-                    || !cx.var_is_on(b"CMAKE_FIND_DEBUG_MODE_NO_IMPLICIT_CONFIGURE_LOG")))
+                && (debug || !cx.var_is_on(b"CMAKE_FIND_DEBUG_MODE_NO_IMPLICIT_CONFIGURE_LOG")))
             .then(SearchEvent::default),
         }
     }
@@ -562,28 +565,35 @@ impl<'a> Search<'a> {
                 u8::from(first)
             );
         }
-        for (name, disabled) in [
-            ("CMAKE_FIND_USE_CMAKE_PATH", options.no_cmake),
-            (
-                "CMAKE_FIND_USE_CMAKE_ENVIRONMENT_PATH",
-                options.no_cmake_env,
-            ),
-            (
-                "CMAKE_FIND_USE_SYSTEM_ENVIRONMENT_PATH",
-                options.no_system_env,
-            ),
-            ("CMAKE_FIND_USE_CMAKE_SYSTEM_PATH", options.no_system),
-            ("CMAKE_FIND_USE_INSTALL_PREFIX", options.no_install),
-        ] {
-            let enabled = use_default(cx, options.no_defaults || disabled, name.as_bytes());
-            let _ = writeln!(log, "    {name}: {}", u8::from(enabled));
+        if options.no_defaults {
+            log.push_str("    NO_DEFAULT_PATH Enabled\n");
+        } else {
+            for (name, disabled) in [
+                ("CMAKE_FIND_USE_CMAKE_PATH", options.no_cmake),
+                (
+                    "CMAKE_FIND_USE_CMAKE_ENVIRONMENT_PATH",
+                    options.no_cmake_env,
+                ),
+                (
+                    "CMAKE_FIND_USE_SYSTEM_ENVIRONMENT_PATH",
+                    options.no_system_env,
+                ),
+                ("CMAKE_FIND_USE_CMAKE_SYSTEM_PATH", options.no_system),
+                ("CMAKE_FIND_USE_INSTALL_PREFIX", options.no_install),
+            ] {
+                let enabled = use_default(cx, disabled, name.as_bytes());
+                let _ = writeln!(log, "    {name}: {}", u8::from(enabled));
+            }
         }
         let _ = writeln!(log, "\n  {command} considered the following locations:\n");
         log.push_str(trace);
         if let Some(found) = &self.match_path {
             let _ = writeln!(log, "\n  The item was found at\n\n    {}", found.display());
         } else {
-            log.push_str("\n  The item was not found.\n");
+            if !trace.is_empty() {
+                log.push('\n');
+            }
+            log.push_str("  The item was not found.\n");
         }
         log.push('\n');
         let backtrace = cx.backtrace();

@@ -95,16 +95,33 @@ fn find_requested_package(
             Some(_) => {}
         }
     }
-    request.required |= cx.var_is_on(&text(&[b"CMAKE_REQUIRE_FIND_PACKAGE_", name]))
-        || !request.optional && cx.var_is_on(b"CMAKE_FIND_REQUIRED");
+    request.apply_requiredness(cx, name);
 
     let found_var = text(&[name, b"_FOUND"]);
     let disable = text(&[b"CMAKE_DISABLE_FIND_PACKAGE_", name]);
     if cx.var_is_on(&disable) {
         cx.set_var(&found_var, "0".into());
-        if request.required {
-            return Err(diagnostic(
-                cx,
+        let require = text(&[b"CMAKE_REQUIRE_FIND_PACKAGE_", name]);
+        if cx.var_is_on(&require) {
+            cx.issue(
+                MessageKind::Error,
+                Effect::SetError,
+                None,
+                text(&[
+                    b"find_package for module ",
+                    name,
+                    b" was made REQUIRED with ",
+                    &require,
+                    b" but ",
+                    &disable,
+                    b" is enabled.  A REQUIRED package cannot be disabled.",
+                ]),
+            );
+        } else if request.required {
+            cx.issue(
+                MessageKind::Error,
+                Effect::SetError,
+                None,
                 text(&[
                     b"find_package for module ",
                     name,
@@ -112,7 +129,7 @@ fn find_requested_package(
                     &disable,
                     b" is enabled.  A REQUIRED package cannot be disabled.\n",
                 ]),
-            ));
+            );
         }
         return Ok(Flow::Normal);
     }
@@ -136,6 +153,7 @@ fn find_requested_package(
 
     let mut vars = Bindings::default();
     vars.add("CMAKE_FIND_PACKAGE_NAME".into(), name.clone());
+    vars.add("CMAKE_FIND_REQUIRED".into(), "");
     let package_roots = package_roots(cx, name);
     vars.add(PACKAGE_ROOTS.into(), list::join(package_roots.iter()));
     vars.add(
@@ -309,11 +327,13 @@ fn search(
     let redirected = redirects_directory(cx).is_some_and(|dir| config.redirect(cx, &dir));
     let prefer_config = !request.module && cx.var_is_on(b"CMAKE_FIND_PACKAGE_PREFER_CONFIG");
     let try_module = request.config_options.is_empty() && !redirected;
-    if try_module
-        && !prefer_config
-        && let Some(found) = load_module(cx, name, found_var, request, trace)?
-    {
-        return Ok(found);
+    if try_module && !prefer_config {
+        if let Some(found) = load_module(cx, name, found_var, request, trace)? {
+            return Ok(found);
+        }
+        if !request.module && cx.var_is_on(b"CMAKE_FIND_PACKAGE_WARN_NO_MODULE") {
+            messages::warn_config_fallback(cx, name);
+        }
     }
 
     if !request.module || redirected {
@@ -479,16 +499,19 @@ fn load_module(
     };
     let mut vars = Bindings::default();
     vars.add(text(&[name, b"_FIND_MODULE"]), "1");
-    vars.scoped(cx, |cx| {
-        cx.include_package_file(&module, request.include_options())
-    })?;
+    vars.scoped(cx, |cx| request.include_file(cx, &module))?;
     if cx.fatal_occurred() {
         return Err(CmdError::Reported);
     }
-    if !cx.var_defined(found_var) {
+    let defined = cx.var_defined(found_var);
+    if !defined {
         let uppercase = text(&[&name.to_ascii_uppercase(), b"_FOUND"]);
         let found = cx.var_is_on(&uppercase);
         cx.set_var(found_var, flag(found).into());
     }
-    Ok(Some(cx.var_is_on(found_var)))
+    let found = cx.var_is_on(found_var);
+    if defined && !found {
+        trace.module_not_found(found_var);
+    }
+    Ok(Some(found))
 }

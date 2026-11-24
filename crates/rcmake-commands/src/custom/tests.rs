@@ -253,6 +253,14 @@ fn invalid_custom_commands_leave_the_model_unchanged() -> TestResult {
             "Exactly one of PRE_BUILD",
         ),
         (
+            r#"add_custom_target(t COMMAND "\"tool\"")"#,
+            "COMMAND may not contain literal quotes",
+        ),
+        (
+            "add_custom_command(TARGET missing SOURCE input OUTPUT out COMMAND tool)",
+            "The SOURCE signatures of add_custom_command are no longer supported.",
+        ),
+        (
             "add_custom_target(t COMMAND tool JOB_POOL pool USES_TERMINAL)",
             "JOB_POOL is shadowed",
         ),
@@ -273,6 +281,27 @@ fn invalid_custom_commands_leave_the_model_unchanged() -> TestResult {
 }
 
 #[test]
+fn custom_command_flags_preserve_arguments() -> TestResult {
+    let mut f = Fixture::new();
+    f.configure(
+        r#"add_custom_command(OUTPUT out COMMAND tool VERBATIM "$<IF:$<CONFIG:Debug>,a;b,c>" "\"argument\"")"#,
+        0,
+    )?;
+    let mut cx = f.interp.cx();
+    let project = cx.project();
+    let (_, command) = project.commands().next().ok_or("Missing command")?;
+    assert_eq!(
+        command.command_lines,
+        vec![vec![
+            BString::from("tool"),
+            BString::from("$<IF:$<CONFIG:Debug>,a;b,c>"),
+            BString::from("\"argument\""),
+        ]]
+    );
+    Ok(())
+}
+
+#[test]
 fn custom_rule_templates_keep_scope_and_arguments() -> TestResult {
     let mut f = Fixture::new();
     f.configure(
@@ -288,6 +317,13 @@ fn custom_rule_templates_keep_scope_and_arguments() -> TestResult {
     )?;
     let mut cx = f.interp.cx();
     let model = cx.project();
+    let rule = model
+        .custom_rule(DirId::ROOT, b"derived")
+        .ok_or("Missing rule")?;
+    assert_eq!(
+        rule.get(b"OUTPUT_FILE_SET_BASE_DIRS"),
+        Some(&BString::from("<CURRENT_BINARY_DIR>"))
+    );
     assert_eq!(
         model.global.props.get(b"_RCMAKE_CUSTOM_RULE_example").map(|value| value.as_slice()),
         Some(br#"["OUTPUT","<BASE_NAME>.gen","COMMAND","tool","<SOURCE>","arg;list","BYPRODUCTS","<BASE_NAME>.extra","GLOBAL"]"#.as_slice()),

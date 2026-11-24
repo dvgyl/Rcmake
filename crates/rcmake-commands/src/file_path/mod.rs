@@ -6,6 +6,7 @@ use rcmake_base::BString;
 use rcmake_diag::{DiagCategory, Effect, MessageKind};
 use rcmake_eval::{CmdError, CmdFlags, Cx, Flow, Registry};
 
+#[cfg(feature = "archive")]
 mod archive;
 mod configure;
 mod copy;
@@ -22,6 +23,7 @@ mod mutation;
 mod path_cmd;
 mod path_hash;
 mod reading;
+mod runtime_dependencies;
 mod strings;
 mod upload;
 

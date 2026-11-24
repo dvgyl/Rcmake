@@ -37,7 +37,7 @@ impl<'a> Request<'a> {
                             [
                                 b"Error after keyword \"".as_slice(),
                                 arg,
-                                b"\":\n\n    missing required value",
+                                b"\":\n  missing required value\n",
                             ]
                             .concat(),
                         ));

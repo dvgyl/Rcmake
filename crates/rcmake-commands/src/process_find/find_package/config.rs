@@ -8,8 +8,9 @@ use rcmake_host::{FileKind, Follow, path};
 use rcmake_model::{CacheEntry, CacheType};
 
 use super::super::cps_import;
-use super::super::search_paths::{is_file, relative_suffix};
+use super::super::search_paths::{is_file, relative_suffix, resolved_lexical_path};
 use super::paths::{paths_from_vars, redirects_directory};
+use super::request::include_package_file;
 use super::trace::SearchTrace;
 use super::{Bindings, Request, flag, text, version_bindings};
 
@@ -149,9 +150,8 @@ impl<'a> ConfigSearch<'a> {
         );
         let redirects = redirects_directory(cx);
         for prefix in self.prefixes(cx, package_roots, trace) {
-            if ignored_prefixes
-                .iter()
-                .any(|ignore| prefix.starts_with(ignore))
+            if ignored.contains(&prefix)
+                || ignored_prefixes.contains(&prefix)
                 || Some(&prefix) != redirects.as_ref()
                     && !cx
                         .host()
@@ -167,6 +167,7 @@ impl<'a> ConfigSearch<'a> {
                     .iter()
                     .map(|suffix| dir.join(relative_suffix(suffix)));
                 for dir in std::iter::once(dir.clone()).chain(suffixes) {
+                    let dir = resolved_lexical_path(cx, &path::from_native_cmake(&dir));
                     if !ignored.contains(&dir)
                         && let Some(found) = self.in_directory(cx, &dir, cps, trace)?
                     {
@@ -209,8 +210,10 @@ impl<'a> ConfigSearch<'a> {
             } else {
                 checked.version.clone()
             };
-            self.considered.push((file.clone(), version, None));
-            if checked.accepted {
+            let accepted = checked.rejection.is_none();
+            self.considered
+                .push((file.clone(), version, checked.rejection));
+            if accepted {
                 return Ok(Some(ConfigMatch {
                     file,
                     version: checked.version,
@@ -370,10 +373,8 @@ impl<'a> ConfigSearch<'a> {
                     }
                 }
             } else {
-                cx.include_package_file(
-                    &path::to_native(&found.file),
-                    self.request.include_options(),
-                )?;
+                self.request
+                    .include_file(cx, &path::to_native(&found.file))?;
             }
             if cx.fatal_occurred() {
                 return Err(CmdError::Reported);
@@ -392,7 +393,7 @@ impl<'a> ConfigSearch<'a> {
             if self
                 .considered
                 .iter()
-                .any(|(_, _, reason)| reason.is_some())
+                .any(|(path, _, reason)| path.ends_with(b".cps") && reason.is_some())
             {
                 for (component, _) in &self.request.components {
                     cx.set_var(&text(&[self.name, b"_", component, b"_FOUND"]), "0".into());
@@ -412,8 +413,8 @@ impl<'a> ConfigSearch<'a> {
 }
 
 struct VersionCheck {
-    accepted: bool,
     version: BString,
+    rejection: Option<BString>,
 }
 
 fn check_version(
@@ -430,12 +431,11 @@ fn check_version(
         .find(|file| is_file(cx, file));
     let Some(version_file) = version_file else {
         return Ok(VersionCheck {
-            accepted: request.version.is_none(),
             version: BString::default(),
+            rejection: request.version.as_ref().map(|_| BString::default()),
         });
     };
 
-    let mut code = b"block(SCOPE_FOR VARIABLES PROPAGATE PACKAGE_VERSION PACKAGE_VERSION_COMPATIBLE PACKAGE_VERSION_EXACT PACKAGE_VERSION_UNSUITABLE)\nunset(PACKAGE_VERSION)\nunset(PACKAGE_VERSION_COMPATIBLE)\nunset(PACKAGE_VERSION_EXACT)\nunset(PACKAGE_VERSION_UNSUITABLE)\n".to_vec();
     let mut inputs = Bindings::default();
     inputs.add("PACKAGE_FIND_NAME".into(), BString::from(name));
     if let Some(version) = &request.version {
@@ -444,28 +444,17 @@ fn check_version(
         version_bindings(b"PACKAGE_FIND_VERSION", b"", &mut inputs);
         inputs.add("PACKAGE_FIND_VERSION_COMPLETE".into(), "");
     }
-    for (key, value) in inputs.0 {
-        code.extend_from_slice(b"set(");
-        code.extend_from_slice(&key);
-        code.push(b' ');
-        write_argument(&mut code, &value);
-        code.extend_from_slice(b")\n");
-    }
-    code.extend_from_slice(b"include(");
-    write_argument(&mut code, &path::from_native_cmake(&version_file));
-    code.extend_from_slice(b")\nendblock()\n");
-
-    let mut outputs = Bindings::default();
-    for key in [
-        "PACKAGE_VERSION",
-        "PACKAGE_VERSION_COMPATIBLE",
-        "PACKAGE_VERSION_EXACT",
-        "PACKAGE_VERSION_UNSUITABLE",
-    ] {
-        outputs.add(key.into(), "");
-    }
-    outputs.scoped(cx, |cx| {
-        cx.eval_code(&code)?;
+    cx.with_variable_scope(|cx| {
+        inputs.apply(cx);
+        for key in [
+            b"PACKAGE_VERSION".as_slice(),
+            b"PACKAGE_VERSION_COMPATIBLE",
+            b"PACKAGE_VERSION_EXACT",
+            b"PACKAGE_VERSION_UNSUITABLE",
+        ] {
+            cx.unset_var(key);
+        }
+        include_package_file(cx, &version_file, true)?;
         if cx.fatal_occurred() {
             return Err(CmdError::Reported);
         }
@@ -474,19 +463,9 @@ fn check_version(
         let accepted = !cx.var_is_on(b"PACKAGE_VERSION_UNSUITABLE")
             && (request.version.is_none() || exact || !request.exact && compatible);
         Ok(VersionCheck {
-            accepted,
             version: cx.var_or_empty(b"PACKAGE_VERSION"),
+            rejection: (!accepted)
+                .then(|| "The version found is not compatible with the version requested.".into()),
         })
     })
-}
-
-fn write_argument(code: &mut Vec<u8>, value: &[u8]) {
-    code.push(b'"');
-    for &byte in value {
-        if matches!(byte, b'"' | b'$' | b'\\') {
-            code.push(b'\\');
-        }
-        code.push(byte);
-    }
-    code.push(b'"');
 }

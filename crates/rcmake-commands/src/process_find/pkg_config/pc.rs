@@ -80,6 +80,18 @@ impl Package {
                 return Err(InvalidFile::Resolution);
             }
         }
+        if mode == Strictness::Strict
+            && [
+                (b"Cflags".as_slice(), b"CFlags".as_slice()),
+                (b"Cflags.private", b"CFlags.private"),
+            ]
+            .into_iter()
+            .any(|(primary, alternate)| {
+                package.0.contains_key(primary) && package.0.contains_key(alternate)
+            })
+        {
+            return Err(InvalidFile::Resolution);
+        }
         Ok(package)
     }
 
@@ -90,11 +102,6 @@ impl Package {
         mode: Strictness,
         limit: usize,
     ) -> Result<(), InvalidFile> {
-        let key: &[u8] = match key {
-            b"CFlags" => b"Cflags",
-            b"CFlags.private" => b"Cflags.private",
-            key => key,
-        };
         if let Some(previous) = self.0.get_mut(key) {
             if mode == Strictness::Strict || previous.len() + value.len() + 1 > limit {
                 return Err(InvalidFile::Resolution);

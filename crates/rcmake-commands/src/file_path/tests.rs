@@ -567,6 +567,7 @@ file(TO_NATIVE_PATH "path with space:/root/a//b/" native)
 }
 
 #[test]
+#[cfg(feature = "archive")]
 fn file_archive_commands_validate_missing_options() -> TestResult {
     for (code, problem) in [
         (
@@ -576,10 +577,6 @@ fn file_archive_commands_validate_missing_options() -> TestResult {
         (
             "file(ARCHIVE_CREATE OUTPUT result.tar)",
             "file ARCHIVE_CREATE requires a non-empty list of PATHS",
-        ),
-        (
-            "file(GLOB output CONFIGURE_DEPENDS *)",
-            "CONFIGURE_DEPENDS is invalid",
         ),
     ] {
         let (host, mut interp) = interpreter();
@@ -598,6 +595,37 @@ fn file_archive_commands_validate_missing_options() -> TestResult {
     let script = Path::new("/work/test.cmake");
     host.seed_file(script, b"file(ARCHIVE_EXTRACT LIST_ONLY)")?;
     assert_eq!(interp.run_script(script).exit_code, 0);
+    Ok(())
+}
+
+#[test]
+#[cfg(not(feature = "archive"))]
+fn file_archive_commands_require_the_feature() -> TestResult {
+    for command in ["ARCHIVE_CREATE", "ARCHIVE_EXTRACT"] {
+        let (host, mut interp) = interpreter();
+        let script = Path::new("/work/test.cmake");
+        host.seed_file(script, format!("file({command})").as_bytes())?;
+        assert_eq!(interp.run_script(script).exit_code, 1);
+        let stderr = host.stream_bytes(Stream::Stderr);
+        assert!(
+            stderr.to_string().contains("requires the archive feature."),
+            "{stderr}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn file_glob_rejects_configure_depends_in_script_mode() -> TestResult {
+    let (host, mut interp) = interpreter();
+    let script = Path::new("/work/test.cmake");
+    host.seed_file(script, b"file(GLOB output CONFIGURE_DEPENDS *)")?;
+    assert_eq!(interp.run_script(script).exit_code, 1);
+    let stderr = host.stream_bytes(Stream::Stderr);
+    assert!(
+        stderr.to_string().contains("CONFIGURE_DEPENDS is invalid"),
+        "{stderr}"
+    );
     Ok(())
 }
 
@@ -669,6 +697,7 @@ file(STRINGS intel literal NO_HEX_CONVERSION)
 }
 
 #[test]
+#[cfg(feature = "archive")]
 fn file_archive_round_trip_with_linked_backend() -> TestResult {
     let (host, mut interp) = interpreter();
     let probe = Path::new("/work/probe.cmake");
@@ -1440,6 +1469,13 @@ file(RPATH_CHECK FILE binary RPATH /lib)
         script(
             &host,
             &mut interp,
+            "file(RPATH_SET FILE binary NEW_RPATH /replacement/longer/path)",
+        )?;
+        let data = host.read(path, ReadRange::All { limit: 512 })?;
+        assert!(data[321..].starts_with(b"/replacement/longer/path\0"));
+        script(
+            &host,
+            &mut interp,
             r#"
 file(RPATH_REMOVE FILE binary)
 file(RPATH_CHECK FILE binary RPATH "")
@@ -1460,13 +1496,78 @@ file(RPATH_CHECK FILE binary RPATH "")
         &mut interp,
         r#"
 file(RPATH_REMOVE FILE binary)
-file(RPATH_CHANGE FILE binary OLD_RPATH "" NEW_RPATH "")
+file(RPATH_CHANGE FILE binary OLD_RPATH "/old" NEW_RPATH "")
+file(RPATH_SET FILE binary NEW_RPATH "")
 file(RPATH_CHECK FILE binary RPATH "")
 "#,
     )?;
     assert_eq!(
         host.read(path, ReadRange::All { limit: 32 })?,
         b"plain data"
+    );
+    Ok(())
+}
+
+#[test]
+#[cfg(not(windows))]
+fn file_runtime_dependencies_inherit_macho_runpaths_and_apply_file_filters() -> TestResult {
+    use rcmake_host::{ProcessResult, RunOutput};
+
+    let (host, mut interp) = interpreter();
+    for file in [
+        "/work/bin/main",
+        "/work/lib1/liba.dylib",
+        "/work/lib2/libb.dylib",
+    ] {
+        host.seed_file(Path::new(file), b"")?;
+    }
+    host.hard_link(
+        Path::new("/work/lib2/libb.dylib"),
+        Path::new("/work/lib2/alias.dylib"),
+    )?;
+    host.set_command_handler(|_, request, _| {
+        let [command] = request.pipeline.as_slice() else {
+            panic!("Expected one command.");
+        };
+        assert_eq!(command.program, "/tools/custom-otool");
+        let [option, flags, file] = command.args.as_slice() else {
+            panic!("Expected the tool option and input path.");
+        };
+        assert_eq!(option, "custom-arg");
+        assert_eq!(flags, "-l");
+        let stdout = match file.as_slice() {
+            b"/work/bin/main" => b"cmd LC_RPATH\ncmdsize 24\npath /work/lib2 (offset 12)\ncmd LC_LOAD_DYLIB\ncmdsize 80\nname /work/lib1/liba.dylib (offset 24)\n".as_slice(),
+            b"/work/lib1/liba.dylib" => b"cmd LC_RPATH\ncmdsize 24\npath /unused (offset 12)\ncmd LC_LOAD_DYLIB\ncmdsize 80\nname @rpath/libb.dylib (offset 24)\ncmd LC_LOAD_DYLIB\ncmdsize 80\nname @rpath/missing.dylib (offset 24)\n",
+            b"/work/lib2/libb.dylib" => b"cmd LC_LOAD_DYLIB\ncmdsize 80\nname /work/lib1/liba.dylib (offset 24)\n",
+            _ => panic!("Unexpected input path: {file}"),
+        };
+        Ok(RunOutput { results: vec![ProcessResult::Exited(0)], stdout: stdout.to_vec(), ..RunOutput::default() })
+    })?;
+    script(
+        &host,
+        &mut interp,
+        r#"
+set(CMAKE_HOST_SYSTEM_NAME Darwin)
+set(CMAKE_GET_RUNTIME_DEPENDENCIES_COMMAND "/tools/custom-otool;custom-arg")
+file(GET_RUNTIME_DEPENDENCIES
+  EXECUTABLES /work/bin/main
+  RESOLVED_DEPENDENCIES_VAR deps
+  UNRESOLVED_DEPENDENCIES_VAR unresolved
+  CONFLICTING_DEPENDENCIES_PREFIX conflict
+  RPATH_PREFIX rpaths
+  POST_INCLUDE_REGEXES "liba[.]dylib$"
+  POST_EXCLUDE_REGEXES ".*"
+  POST_INCLUDE_FILES /work/lib2/alias.dylib)
+"#,
+    )?;
+    vars(
+        &mut interp,
+        &[
+            ("deps", "/work/lib1/liba.dylib;/work/lib2/libb.dylib"),
+            ("unresolved", "@rpath/missing.dylib"),
+            ("conflict_FILENAMES", ""),
+            ("rpaths_/work/lib1/liba.dylib", "/unused"),
+        ],
     );
     Ok(())
 }

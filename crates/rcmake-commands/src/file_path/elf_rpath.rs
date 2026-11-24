@@ -40,6 +40,7 @@ struct PathEntry {
     offset: usize,
     tag: u64,
     range: Range<usize>,
+    storage: Range<usize>,
 }
 
 fn parse(data: &[u8]) -> Option<Paths> {
@@ -113,8 +114,9 @@ fn parse(data: &[u8]) -> Option<Paths> {
             _ => {}
         }
     }
+    let dynamic = dynamic.start..end?;
     if offsets.is_empty() {
-        return Some(empty());
+        return Some(Paths { dynamic, ..empty() });
     }
     let strtab = strtab?;
     let strsz = strsz?;
@@ -138,15 +140,21 @@ fn parse(data: &[u8]) -> Option<Paths> {
             let path = strings.get(offset..)?;
             let len = path.iter().position(|&byte| byte == 0)?;
             let start = str_start + offset;
+            let padding = path
+                .get(len..)?
+                .iter()
+                .take_while(|&&byte| byte == 0)
+                .count();
             Some(PathEntry {
                 offset: entry,
                 tag,
                 range: start..start + len,
+                storage: start..start + len + padding,
             })
         })
         .collect::<Option<Vec<_>>>()?;
     Some(Paths {
-        dynamic: dynamic.start..end?,
+        dynamic,
         stride,
         entries,
     })
@@ -167,49 +175,70 @@ fn find(path: &[u8], part: &[u8]) -> Option<usize> {
         })
 }
 
-fn change(
+fn replace_component(
+    path: &[u8],
+    old: &[u8],
+    new: &[u8],
+    strip: bool,
+) -> std::result::Result<Option<Vec<u8>>, &'static str> {
+    const INVALID: &str = "Invalid ELF runtime path range.";
+    let Some(start) = find(path, old) else {
+        if find(path, new).is_some() {
+            return Ok(None);
+        }
+        return Err("The current runtime path does not contain OLD_RPATH.");
+    };
+    let mut prefix = if strip {
+        &[][..]
+    } else {
+        path.get(..start).ok_or(INVALID)?
+    };
+    let mut suffix = path.get(start + old.len()..).ok_or(INVALID)?;
+    if new.is_empty() {
+        if prefix.is_empty() {
+            suffix = suffix.strip_prefix(b":").unwrap_or(suffix);
+        } else {
+            prefix = prefix
+                .strip_suffix(b":")
+                .filter(|_| suffix.is_empty())
+                .unwrap_or(prefix);
+            if !suffix.is_empty() {
+                suffix = suffix.strip_prefix(b":").unwrap_or(suffix);
+            }
+        }
+    }
+    Ok(Some([prefix, new, suffix].concat()))
+}
+
+fn update(
     data: &mut [u8],
     paths: &Paths,
-    old: &[u8],
+    old: Option<&[u8]>,
     new: &[u8],
     strip: bool,
 ) -> std::result::Result<bool, &'static str> {
     const INVALID: &str = "Invalid ELF runtime path range.";
     let mut edits = Vec::new();
-    for PathEntry { range, .. } in &paths.entries {
-        let path = data.get(range.clone()).ok_or(INVALID)?;
-        let Some(start) = find(path, old) else {
-            if find(path, new).is_some() {
-                continue;
-            }
-            return Err("The current runtime path does not contain OLD_RPATH.");
+    for entry in &paths.entries {
+        let path = data.get(entry.range.clone()).ok_or(INVALID)?;
+        let replacement = match old {
+            Some(old) => replace_component(path, old, new, strip)?,
+            None => Some(new.to_vec()),
         };
-        let mut prefix = if strip {
-            &[][..]
-        } else {
-            path.get(..start).ok_or(INVALID)?
+        let Some(replacement) = replacement.filter(|replacement| replacement != path) else {
+            continue;
         };
-        let mut suffix = path.get(start + old.len()..).ok_or(INVALID)?;
-        if new.is_empty() {
-            if prefix.is_empty() {
-                suffix = suffix.strip_prefix(b":").unwrap_or(suffix);
+        if replacement.len() >= entry.storage.len() {
+            return Err(if entry.tag == RPATH {
+                "The replacement path is too long for the RPATH entry."
             } else {
-                prefix = prefix
-                    .strip_suffix(b":")
-                    .filter(|_| suffix.is_empty())
-                    .unwrap_or(prefix);
-                if !suffix.is_empty() {
-                    suffix = suffix.strip_prefix(b":").unwrap_or(suffix);
-                }
-            }
+                "The replacement path is too long for the RUNPATH entry."
+            });
         }
-        let replacement = [prefix, new, suffix].concat();
-        if replacement.len() > path.len() {
-            return Err("The replacement path is too long for the runtime path field.");
-        }
-        if replacement != path {
-            edits.push((range.clone(), replacement));
-        }
+        edits.push((entry.storage.clone(), replacement));
+    }
+    if edits.len() == paths.entries.len() && edits.iter().all(|(_, value)| value.is_empty()) {
+        return Ok(remove(data, paths));
     }
     for (range, replacement) in &edits {
         let path = data.get_mut(range.clone()).ok_or(INVALID)?;
@@ -236,8 +265,8 @@ fn remove(data: &mut [u8], paths: &Paths) -> bool {
     if let Some(tail) = data.get_mut(write..paths.dynamic.end) {
         tail.fill(0);
     }
-    for PathEntry { range, .. } in &paths.entries {
-        if let Some(path) = data.get_mut(range.clone()) {
+    for PathEntry { storage, .. } in &paths.entries {
+        if let Some(path) = data.get_mut(storage.clone()) {
             path.fill(0);
         }
     }
@@ -330,17 +359,23 @@ pub(super) fn run(cx: &mut Cx<'_>, command: &[u8], args: &[&[u8]]) -> Result {
     let mut strip = false;
     let check = command == b"RPATH_CHECK";
     let removing = command == b"RPATH_REMOVE";
+    let setting = command == b"RPATH_SET";
     let mut args = args.iter().copied();
     while let Some(key) = args.next() {
         let slot = match key {
             b"FILE" => &mut file,
             b"RPATH" if check => &mut new,
-            b"OLD_RPATH" if !check => &mut old,
+            b"OLD_RPATH" if !check && !setting => &mut old,
             b"NEW_RPATH" if !check && !removing => &mut new,
-            b"INSTALL_NAME_TOOL" if !check => &mut tool,
-            b"INSTALL_REMOVE_ENVIRONMENT_RPATH" if !check && !removing => {
+            b"INSTALL_NAME_TOOL" if !check && !setting => &mut tool,
+            b"INSTALL_REMOVE_ENVIRONMENT_RPATH" if !check && !removing && !setting => {
                 strip = true;
                 continue;
+            }
+            _ if setting => {
+                return Err(error(
+                    [command, b" given unrecognized argument \"", key, b"\"."].concat(),
+                ));
             }
             _ => return Err(error([command, b" given unknown argument ", key].concat())),
         };
@@ -349,7 +384,7 @@ pub(super) fn run(cx: &mut Cx<'_>, command: &[u8], args: &[&[u8]]) -> Result {
     let file = file
         .filter(|file| !file.is_empty())
         .ok_or_else(|| error(format!("{operation} not given FILE option.")))?;
-    if !check && !removing && old.is_none() {
+    if !check && !removing && !setting && old.is_none() {
         return Err(error(format!("{operation} not given OLD_RPATH option.")));
     }
     let new = if removing {
@@ -385,7 +420,7 @@ pub(super) fn run(cx: &mut Cx<'_>, command: &[u8], args: &[&[u8]]) -> Result {
             },
         )
         .map_err(|err| error(err.to_string()))?;
-    if let Some(paths) = super::macho_rpath::paths(&data) {
+    if !setting && let Some(paths) = super::macho_rpath::paths(&data) {
         return super::macho_rpath::edit(cx, &path, paths, command, old, new, tool);
     }
     if let Some(key) = tool
@@ -394,7 +429,6 @@ pub(super) fn run(cx: &mut Cx<'_>, command: &[u8], args: &[&[u8]]) -> Result {
     {
         return Err(error([command, b" given unknown argument ", key].concat()));
     }
-    let old = old.unwrap_or_default();
     let paths = parse(&data);
     if check {
         let matches = paths
@@ -417,7 +451,12 @@ pub(super) fn run(cx: &mut Cx<'_>, command: &[u8], args: &[&[u8]]) -> Result {
     let change_error = |reason: &str| {
         error(
             [
-                b"RPATH_CHANGE could not write new RPATH:\n  ",
+                if setting {
+                    b"RPATH_SET".as_slice()
+                } else {
+                    b"RPATH_CHANGE".as_slice()
+                },
+                b" could not write new RPATH:\n  ",
                 new,
                 b"\nto the file:\n  ",
                 file,
@@ -430,18 +469,10 @@ pub(super) fn run(cx: &mut Cx<'_>, command: &[u8], args: &[&[u8]]) -> Result {
     let changed = match paths {
         Some(paths) if removing => remove(&mut data, &paths),
         Some(paths) if !paths.entries.is_empty() => {
-            if new.is_empty()
-                && paths
-                    .entries
-                    .iter()
-                    .all(|PathEntry { range, .. }| data.get(range.clone()) == Some(old))
-            {
-                remove(&mut data, &paths)
-            } else {
-                change(&mut data, &paths, old, new, strip).map_err(change_error)?
-            }
+            update(&mut data, &paths, old, new, strip).map_err(change_error)?
         }
-        _ if removing || old.is_empty() && new.is_empty() => false,
+        Some(paths) if paths.dynamic.is_empty() => false,
+        _ if removing || new.is_empty() => false,
         Some(_) => {
             return Err(change_error(
                 "No valid ELF RPATH or RUNPATH entry exists in the file.",
@@ -452,6 +483,10 @@ pub(super) fn run(cx: &mut Cx<'_>, command: &[u8], args: &[&[u8]]) -> Result {
     if changed {
         host.write(&path, &data, WriteMode::Truncate)
             .map_err(|err| error(err.to_string()))?;
+        if meta.mode & 0o6000 != 0 {
+            host.set_permissions(&path, meta.mode)
+                .map_err(|err| error(err.to_string()))?;
+        }
         host.set_times(&path, Some(meta.atime), Some(meta.mtime))
             .map_err(|err| error(err.to_string()))?;
         let message = if removing {

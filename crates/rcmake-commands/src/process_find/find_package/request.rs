@@ -1,7 +1,9 @@
 use std::collections::BTreeSet;
+use std::path::Path;
 
 use rcmake_base::{BString, ByteSlice as _, version};
-use rcmake_eval::{CmdError, Cx, IncludeOptions};
+use rcmake_diag::{Effect, MessageKind};
+use rcmake_eval::{CmdError, CmdResult, Cx, IncludeOptions};
 use rcmake_expr::ExpandedArg;
 use rcmake_host::path;
 
@@ -14,6 +16,7 @@ pub(in crate::process_find) struct Request {
     pub(in crate::process_find) exact: bool,
     pub(super) quiet: bool,
     pub(super) required: bool,
+    pub(super) required_by: Option<BString>,
     pub(super) optional: bool,
     pub(super) module: bool,
     pub(in crate::process_find) global: bool,
@@ -127,7 +130,7 @@ impl Request {
         if request.module && !request.config_options.is_empty() {
             let options = list_lines(request.config_options.iter());
             return Err(CmdError::status(text(&[
-                b"given options exclusive to Module mode:\n\n    MODULE\n\nand options exclusive to Config mode:\n",
+                b"given options exclusive to Module mode:\n\n  MODULE\n\nand options exclusive to Config mode:\n",
                 &options,
                 b"\nThe options are incompatible.",
             ])));
@@ -148,6 +151,33 @@ impl Request {
             ])));
         }
         Ok(request)
+    }
+
+    pub(super) fn apply_requiredness(&mut self, cx: &mut Cx<'_>, name: &[u8]) {
+        if !self.required && !self.optional && cx.var_is_on(b"CMAKE_FIND_REQUIRED") {
+            self.required = true;
+            self.required_by = Some("CMAKE_FIND_REQUIRED".into());
+        }
+        let package_setting = text(&[b"CMAKE_REQUIRE_FIND_PACKAGE_", name]);
+        if cx.var_is_on(&package_setting) {
+            if self.required {
+                cx.issue(
+                    MessageKind::Warning,
+                    Effect::None,
+                    None,
+                    text(&[
+                        b"for module ",
+                        name,
+                        b" already called with REQUIRED, thus ",
+                        &package_setting,
+                        b" has no effect.",
+                    ]),
+                );
+            } else {
+                self.required = true;
+                self.required_by = Some(package_setting);
+            }
+        }
     }
 
     fn add_value<'a>(
@@ -200,12 +230,27 @@ impl Request {
             && setting_enabled(cx, &text(&[b"CMAKE_FIND_USE_", source]))
     }
 
-    pub(super) fn include_options(&self) -> IncludeOptions {
-        IncludeOptions {
-            no_policy_scope: self.no_policy_scope,
-            ..Default::default()
-        }
+    pub(super) fn include_file(&self, cx: &mut Cx<'_>, path: &Path) -> CmdResult {
+        include_package_file(cx, path, !self.no_policy_scope)
     }
+}
+
+pub(super) fn include_package_file(cx: &mut Cx<'_>, path: &Path, policy_scope: bool) -> CmdResult {
+    // Start the policy scope before the include records its stack depth.
+    if policy_scope {
+        cx.push_policy_scope();
+    }
+    let result = cx.include_package_file(
+        path,
+        IncludeOptions {
+            no_policy_scope: true,
+            ..Default::default()
+        },
+    );
+    if policy_scope {
+        cx.pop_policy_scope()?;
+    }
+    result
 }
 
 fn search_source(key: &[u8]) -> Option<&'static [u8]> {
@@ -316,7 +361,7 @@ pub(in crate::process_find) fn version_bindings(prefix: &[u8], value: &[u8], var
 }
 
 #[derive(Default)]
-pub(in crate::process_find) struct Bindings(pub(super) Vec<(BString, BString)>);
+pub(in crate::process_find) struct Bindings(Vec<(BString, BString)>);
 
 impl Bindings {
     pub(in crate::process_find) fn add(&mut self, name: BString, value: impl Into<BString>) {

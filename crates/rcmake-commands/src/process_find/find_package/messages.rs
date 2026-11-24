@@ -9,15 +9,45 @@ use super::{Request, diagnostic, text};
 pub(super) fn report_missing(
     cx: &mut Cx<'_>,
     request: &Request,
-    message: BString,
+    mut message: BString,
 ) -> Result<(), CmdError> {
     if request.required {
+        if let Some(setting) = &request.required_by {
+            message = text(&[
+                message.trim_ascii_end(),
+                b"\n\nThis package is considered required because the ",
+                setting,
+                b" variable has been enabled.\n",
+            ]);
+        }
         return Err(diagnostic(cx, message));
     }
     if !request.quiet && !request.optional {
         cx.issue(MessageKind::Warning, Effect::None, None, message);
     }
     Ok(())
+}
+
+pub(super) fn warn_config_fallback(cx: &mut Cx<'_>, name: &[u8]) {
+    let lower = name.to_ascii_lowercase();
+    cx.issue(
+        MessageKind::AuthorWarning,
+        Effect::None,
+        Some(DiagCategory::Author),
+        text(&[
+            b"find_package called without either MODULE or CONFIG option and no Find",
+            name,
+            b".cmake module is in CMAKE_MODULE_PATH.  Add MODULE to exclusively request Module mode and fail if Find",
+            name,
+            b".cmake is missing.  Add CONFIG to exclusively request Config mode and search for a package configuration file provided by ",
+            name,
+            b" (",
+            name,
+            b"Config.cmake or ",
+            &lower,
+            b"-config.cmake).\n\n(Variable CMAKE_FIND_PACKAGE_WARN_NO_MODULE enabled this warning.)",
+        ]),
+    );
 }
 
 pub(super) fn warn_module_path(cx: &mut Cx<'_>, name: &[u8]) {
@@ -38,11 +68,7 @@ pub(super) fn warn_module_path(cx: &mut Cx<'_>, name: &[u8]) {
 impl ConfigSearch<'_> {
     pub(super) fn missing_message(&self, tried_module: bool) -> BString {
         let name = self.name;
-        let cps_rejected = self
-            .considered
-            .iter()
-            .any(|(path, _, _)| path.ends_with(b".cps"));
-        let preface = if tried_module && !cps_rejected {
+        let preface = if tried_module && self.considered.is_empty() {
             text(&[
                 b"By not providing \"Find", name,
                 b".cmake\" in CMAKE_MODULE_PATH this project has asked CMake to find a package configuration file provided by \"",

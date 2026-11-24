@@ -6,9 +6,14 @@ use rcmake_diag::{PolicyId, PolicyStatus};
 use rcmake_eval::{Cx, RunMode};
 use rcmake_host::{FileKind, Follow, path};
 
-use super::super::search_paths::{cmake_paths, host_env_paths, is_file, resolved_lexical_path};
+use super::super::search_paths::{
+    cmake_paths, host_env_paths, is_file, resolved_lexical_path, search_path, system_prefixes,
+};
 use super::config::ConfigSearch;
 use super::{PACKAGE_ROOTS, text, trace::SearchTrace};
+
+const FRAMEWORK_VARS_HEADING: &[u8] =
+    b"CMAKE_FRAMEWORK_PATH and CMAKE_APPBUNDLE_PATH variables [CMAKE_FIND_USE_CMAKE_PATH].";
 
 impl ConfigSearch<'_> {
     pub(super) fn prefixes(
@@ -39,8 +44,11 @@ impl ConfigSearch<'_> {
                 cmake_paths(cx, b"CMAKE_PREFIX_PATH"),
             ));
             groups.push((
-                "CMAKE_FRAMEWORK_PATH and CMAKE_APPBUNDLE_PATH variables [CMAKE_FIND_USE_CMAKE_PATH].".into(),
-                apple_paths.iter().flat_map(|key| cmake_paths(cx, key)).collect(),
+                FRAMEWORK_VARS_HEADING.into(),
+                apple_paths
+                    .iter()
+                    .flat_map(|key| cmake_paths(cx, key))
+                    .collect(),
             ));
         }
         if request.use_source(cx, b"CMAKE_ENVIRONMENT_PATH") {
@@ -123,7 +131,11 @@ impl ConfigSearch<'_> {
                     .map(|value| resolved_lexical_path(cx, &value))
                     .filter(|path| seen.insert(path.clone()))
                     .collect();
-                trace.section(&heading, &paths);
+                if paths.is_empty() && heading == FRAMEWORK_VARS_HEADING {
+                    trace.heading(&heading);
+                } else {
+                    trace.section(&heading, &paths);
+                }
                 paths
             })
             .collect();
@@ -150,24 +162,7 @@ impl ConfigSearch<'_> {
 
     fn system_prefixes(&self, cx: &Cx<'_>) -> Vec<BString> {
         let use_install = self.request.use_source(cx, b"INSTALL_PREFIX");
-        let mut prefixes = if cx.var_defined(b"CMAKE_SYSTEM_PREFIX_PATH") {
-            let install = cx.var_or_empty(b"CMAKE_INSTALL_PREFIX");
-            let staging = cx.var_or_empty(b"CMAKE_STAGING_PREFIX");
-            cmake_paths(cx, b"CMAKE_SYSTEM_PREFIX_PATH")
-                .into_iter()
-                .filter(|value| use_install || (*value != install && *value != staging))
-                .collect()
-        } else {
-            let mut paths = vec!["/usr/local".into(), "/usr".into(), "/".into()];
-            if cx.host().system().sysname == b"Darwin" {
-                paths.push("/opt/homebrew".into());
-            }
-            if use_install {
-                paths.extend(cmake_paths(cx, b"CMAKE_INSTALL_PREFIX"));
-                paths.extend(cmake_paths(cx, b"CMAKE_STAGING_PREFIX"));
-            }
-            paths
-        };
+        let mut prefixes = system_prefixes(cx, use_install);
         prefixes.extend(cmake_paths(cx, b"CMAKE_SYSTEM_FRAMEWORK_PATH"));
         prefixes.extend(cmake_paths(cx, b"CMAKE_SYSTEM_APPBUNDLE_PATH"));
         prefixes
@@ -391,6 +386,11 @@ pub(super) fn package_roots(cx: &mut Cx<'_>, name: &[u8]) -> Vec<BString> {
         ),
         PolicyStatus::Old => {}
     }
+    let cwd = cx.host().initial_cwd();
+    let mut roots: Vec<_> = roots
+        .into_iter()
+        .map(|root| path::from_native_cmake(&search_path(cx, &cwd, &root)))
+        .collect();
     roots.extend(cmake_paths(cx, PACKAGE_ROOTS));
     roots
 }
@@ -423,9 +423,10 @@ fn warn_ignored_root(cx: &mut Cx<'_>, policy: PolicyId, key: &[u8], explanation:
         }
     }
     if !body.is_empty() {
+        body.push(b'\n');
         body.extend_from_slice(explanation);
         cx.global().props.set(warned, "1".into());
-        cx.issue_policy_warning(policy, b"", &body);
+        crate::policy_misc::issue_warning(cx, policy, b"", &body);
     }
 }
 

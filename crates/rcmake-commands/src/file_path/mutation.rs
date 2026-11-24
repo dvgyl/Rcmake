@@ -3,9 +3,9 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use rcmake_base::BString;
-use rcmake_diag::{Effect, MessageKind, PolicyId, PolicyStatus};
+use rcmake_diag::{PolicyId, PolicyStatus};
 use rcmake_eval::args::{KeywordParser, Slot};
-use rcmake_eval::{CmdError, Cx, Flow};
+use rcmake_eval::{Cx, Flow};
 use rcmake_host::{
     CopyOptions, FileKind, Follow, HostError, ReadRange, WriteMode,
     path::{from_native, from_native_cmake, to_native},
@@ -111,28 +111,70 @@ fn touch(cx: &mut Cx<'_>, create: bool, args: &[&[u8]]) -> Result {
 }
 
 fn make_directory(cx: &mut Cx<'_>, args: &[&[u8]]) -> Result {
-    let mut args = args.iter().copied();
-    let mut paths = Vec::new();
+    let mut paths = args;
+    let parsed;
     let mut variable = None;
-    while let Some(input) = args.next() {
-        if input == b"RESULT" {
-            variable = Some(arg(&mut args, input)?);
-        } else {
-            paths.push(input);
+    if let Some(index) = args.iter().position(|arg| *arg == b"RESULT") {
+        let (directories, options) = args.split_at(index);
+        parsed = KeywordParser::new()
+            .keyword("RESULT", Slot::Single)
+            .parse(options);
+        if !parsed.unparsed().is_empty() {
+            let mut message = b"MAKE_DIRECTORY called with unexpected\narguments:".to_vec();
+            for argument in parsed.unparsed() {
+                message.extend_from_slice(b"\n  ");
+                message.extend_from_slice(argument);
+            }
+            return Err(error(message));
+        }
+        paths = directories;
+        variable = parsed
+            .single("RESULT")
+            .filter(|name| !name.is_empty())
+            .map(|name| name.as_slice());
+    }
+    for input in paths {
+        let path = cx.resolve_path(input);
+        let name = from_native_cmake(&path);
+        if !crate::compat::can_write_project_file(cx, &path) {
+            if variable.is_none() {
+                cx.set_fatal();
+            }
+            return status(
+                cx,
+                variable,
+                Err([
+                    b"attempted to create a directory: ".as_slice(),
+                    &name,
+                    b" into a source directory.",
+                ]
+                .concat()
+                .into()),
+            );
+        }
+        if let Err(err) = cx.host().create_dir_all(&path) {
+            let reason = err.os_message.as_bytes();
+            let message = if variable.is_some() {
+                [
+                    b"Failed to create directory: ".as_slice(),
+                    &name,
+                    b" Error: ",
+                    reason,
+                ]
+                .concat()
+            } else {
+                [
+                    b"failed to create directory:\n  ".as_slice(),
+                    &name,
+                    b"\nbecause: ",
+                    reason,
+                ]
+                .concat()
+            };
+            return status(cx, variable, Err(message.into()));
         }
     }
-    let result = paths.into_iter().try_for_each(|input| {
-        let path = cx.resolve_path(input);
-        cx.host().create_dir_all(&path).map_err(|e| {
-            format!(
-                "Failed to create directory: {} Error: {}",
-                path.display(),
-                e.os_message
-            )
-            .into()
-        })
-    });
-    status(cx, variable, result)
+    status(cx, variable, Ok(()))
 }
 
 fn remove(cx: &mut Cx<'_>, command: &[u8], args: &[&[u8]]) -> Result {
@@ -246,7 +288,7 @@ fn pair(cx: &mut Cx<'_>, command: &[u8], args: &[&[u8]]) -> Result {
 fn create_link(cx: &mut Cx<'_>, args: &[&[u8]]) -> Result {
     let [input, output, rest @ ..] = args else {
         return Err(error(
-            "CREATE_LINK must be called with at least two arguments.",
+            "CREATE_LINK must be called with at least two additional arguments",
         ));
     };
     let mut rest = rest.iter().copied();
@@ -382,7 +424,7 @@ fn copy_error(err: &HostError, input: bool) -> (ErrorKind, BString) {
     (err.kind, format!("{} ({end})", err.os_message).into())
 }
 
-fn link(cx: &Cx<'_>, input: &[u8], output: &[u8], symbolic: bool, fallback: bool) -> Operation {
+fn link(cx: &mut Cx<'_>, input: &[u8], output: &[u8], symbolic: bool, fallback: bool) -> Operation {
     let source = cx.resolve_path(input);
     let target = cx.resolve_path(output);
     let host = cx.host();
@@ -406,11 +448,34 @@ fn link(cx: &Cx<'_>, input: &[u8], output: &[u8], symbolic: bool, fallback: bool
         }
         host.remove_file(&target).map_err(os_message)?;
     }
-    let linked = if symbolic {
-        host.symlink(&to_native(input), &target)
-    } else {
-        host.hard_link(&source, &target)
+    let directory = host
+        .metadata(&source, Follow::Yes)
+        .is_ok_and(|meta| meta.kind == FileKind::Dir);
+    let policy = PolicyId::new(205);
+    let policy_status = cx.policy(policy);
+    let warn_directory = directory && fallback && policy_status == PolicyStatus::Warn;
+    let warn = |cx: &mut Cx<'_>, detail: &[u8]| {
+        cx.issue_policy_warning(
+            policy,
+            &[b"Path\n  ".as_slice(), input, b"\nis a directory. ", detail].concat(),
+            b"",
+        );
     };
+    if warn_directory && !symbolic {
+        warn(cx, b"Hard link creation is not supported for directories.");
+    }
+    let linked = if symbolic {
+        cx.host().symlink(&to_native(input), &target)
+    } else {
+        cx.host().hard_link(&source, &target)
+    };
+    if warn_directory {
+        warn(
+            cx,
+            b"It will be copied recursively when CMP0205 is set to NEW.",
+        );
+    }
+    let host = cx.host();
     match linked {
         Ok(()) => Ok(()),
         Err(_) if fallback => {
@@ -423,8 +488,7 @@ fn link(cx: &Cx<'_>, input: &[u8], output: &[u8], symbolic: bool, fallback: bool
             };
             let meta = host.metadata(&source, Follow::Yes).map_err(os_message)?;
             if meta.kind == FileKind::Dir {
-                let policy = cx.policy(PolicyId::new(205));
-                if policy == PolicyStatus::New {
+                if policy_status == PolicyStatus::New {
                     super::copy::copy_directory(cx, &source, &target).map_err(|e| match e {
                         rcmake_eval::CmdError::Status(message) => message,
                         rcmake_eval::CmdError::Reported => "failed to copy directory".into(),
@@ -487,60 +551,44 @@ pub(crate) fn permission(value: &[u8]) -> Option<u32> {
 }
 
 fn chmod(cx: &mut Cx<'_>, recurse: bool, args: &[&[u8]]) -> Result {
-    let mut modes = Modes::default();
-    let mut active: Option<(&[u8], bool)> = None;
-    let mut missing = None;
-    let mut paths = Vec::new();
-    for &option in args {
-        match option {
-            b"PERMISSIONS" | b"FILE_PERMISSIONS" | b"DIRECTORY_PERMISSIONS" => {
-                missing = missing.or(active
-                    .filter(|(_, supplied)| !supplied)
-                    .map(|(name, _)| name));
-                active = Some((option, false));
-            }
-            option => {
-                let destination = match active {
-                    None => {
-                        paths.push(option);
-                        continue;
-                    }
-                    Some((b"PERMISSIONS", _)) => &mut modes.default,
-                    Some((b"FILE_PERMISSIONS", _)) => &mut modes.files,
-                    _ => &mut modes.directories,
-                };
-                let flag = permission(option).ok_or_else(|| {
-                    error([option, b" is an invalid permission specifier"].concat())
-                })?;
-                if let Some((_, supplied)) = &mut active {
-                    *supplied = true;
-                }
-                *destination.get_or_insert(0) |= flag;
-            }
-        }
-    }
-    if let Some(option) = missing.or(active
-        .filter(|(_, supplied)| !supplied)
-        .map(|(name, _)| name))
-    {
-        cx.issue(
-            MessageKind::Error,
-            Effect::Fatal,
-            None,
-            [
-                b"Error after keyword \"",
-                option,
-                b"\":\n\n  missing required value\n",
-            ]
-            .concat()
-            .into(),
-        );
-        return Err(CmdError::Reported);
-    }
-    if active.is_none() {
+    let parsed = KeywordParser::new()
+        .keyword("PERMISSIONS", Slot::MultiNonEmpty)
+        .keyword("FILE_PERMISSIONS", Slot::MultiNonEmpty)
+        .keyword("DIRECTORY_PERMISSIONS", Slot::MultiNonEmpty)
+        .parse(args);
+    let seen =
+        ["PERMISSIONS", "FILE_PERMISSIONS", "DIRECTORY_PERMISSIONS"].map(|key| parsed.seen(key));
+    if seen == [false; 3] {
+        cx.set_fatal();
         return Err(error("No permissions given"));
     }
-    for input in paths {
+    if seen == [true; 3] {
+        cx.set_fatal();
+        return Err(error(
+            "Remove either PERMISSIONS or FILE_PERMISSIONS or DIRECTORY_PERMISSIONS from the invocation",
+        ));
+    }
+    if let Some(message) = parsed.report_error_text() {
+        return Err(crate::command_error(cx, message));
+    }
+    let mode = |key| {
+        parsed
+            .seen(key)
+            .then(|| {
+                parsed.multi(key).iter().try_fold(0, |mode, option| {
+                    permission(option).map(|flag| mode | flag).ok_or_else(|| {
+                        error([option.as_slice(), b" is an invalid permission specifier"].concat())
+                    })
+                })
+            })
+            .transpose()
+    };
+    let modes = Modes {
+        default: mode("PERMISSIONS")?,
+        files: mode("FILE_PERMISSIONS")?,
+        directories: mode("DIRECTORY_PERMISSIONS")?,
+    };
+    for input in parsed.unparsed() {
         let start = cx.resolve_path(input);
         let mut pending = vec![(start, 0_u32, None)];
         while let Some((path, depth, post_order_mode)) = pending.pop() {

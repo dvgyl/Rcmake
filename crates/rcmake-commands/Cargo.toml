@@ -8,10 +8,14 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+default = ["archive"]
+archive = ["dep:rcmake-archive"]
+
 [dependencies]
 indexmap.workspace = true
 jiff.workspace = true
-rcmake-archive.workspace = true
+rcmake-archive = { workspace = true, optional = true }
 rcmake-base.workspace = true
 rcmake-build.workspace = true
 rcmake-cps.workspace = true

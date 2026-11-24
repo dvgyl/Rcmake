@@ -259,16 +259,8 @@ fn extract(cx: &mut Cx<'_>, package: &Package, settings: &Settings) {
         );
     }
     for (suffix, field_suffix) in [(b"".as_slice(), b"".as_slice()), (b"_PRIVATE", b".private")] {
-        let cflags = Flags::parse(
-            package.field(&text(&[b"Cflags", field_suffix])),
-            settings,
-            FlagKind::Compile,
-        );
-        let libs = Flags::parse(
-            package.field(&text(&[b"Libs", field_suffix])),
-            settings,
-            FlagKind::Link,
-        );
+        let cflags = Flags::parse(package, settings, FlagKind::Compile, field_suffix);
+        let libs = Flags::parse(package, settings, FlagKind::Link, field_suffix);
         for (key, value) in [
             (b"CFLAGS".as_slice(), join_words(&cflags.all)),
             (b"INCLUDES", list::join(cflags.directories)),
@@ -309,27 +301,22 @@ struct Flags {
 }
 
 impl Flags {
-    fn parse(value: &[u8], settings: &Settings, kind: FlagKind) -> Self {
+    fn parse(package: &Package, settings: &Settings, kind: FlagKind, suffix: &[u8]) -> Self {
         let mut flags = Self::default();
-        let (prefix, filtered) = match kind {
-            FlagKind::Compile => (b"-I", &settings.filter_includes),
-            FlagKind::Link => (b"-L", &settings.filter_libs),
+        let (fields, prefix, filtered): (&[&[u8]], _, _) = match kind {
+            FlagKind::Compile => (&[b"Cflags", b"CFlags"], b"-I", &settings.filter_includes),
+            FlagKind::Link => (&[b"Libs"], b"-L", &settings.filter_libs),
         };
-        for mut flag in Arguments::new(value, false) {
+        let words = fields
+            .iter()
+            .flat_map(|field| Arguments::new(package.field(&text(&[field, suffix])), false));
+        for mut flag in words {
             if let Some(dir) = flag.strip_prefix(prefix) {
-                if filtered.iter().any(|value| value == dir) {
+                let rooted = text(&[&settings.sysroot, dir]);
+                if filtered.contains(&rooted) {
                     continue;
                 }
-                if !settings.sysroot.is_empty() {
-                    flag = text(&[
-                        prefix,
-                        settings
-                            .sysroot
-                            .strip_suffix(b"/")
-                            .unwrap_or(&settings.sysroot),
-                        dir,
-                    ]);
-                }
+                flag = text(&[prefix, &rooted]);
                 flags.directories.push(flag.clone());
             } else if matches!(kind, FlagKind::Link) && flag.starts_with(b"-l") {
                 flags.libraries.push(flag.clone());
@@ -449,8 +436,8 @@ fn new_target(cx: &mut Cx<'_>, name: BString, visibility: ImportedVisibility) ->
 }
 
 fn add_flags(target: &mut Target, package: &Package, settings: &Settings) {
-    let compile = Flags::parse(package.field(b"Cflags"), settings, FlagKind::Compile);
-    let link = Flags::parse(package.field(b"Libs"), settings, FlagKind::Link);
+    let compile = Flags::parse(package, settings, FlagKind::Compile, b"");
+    let link = Flags::parse(package, settings, FlagKind::Link, b"");
     for (field, flags, strip) in [
         (
             UsageField::InterfaceIncludeDirectories,
@@ -490,5 +477,42 @@ fn add_links(target: &mut Target, links: impl IntoIterator<Item = BString>) {
                 text: BT::new(value, target.backtrace.clone()),
                 lookup_dir: target.dir,
             });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{FlagKind, Flags, Package, Settings, pc::Strictness};
+
+    #[test]
+    fn orders_compile_flags_and_reroots_before_filtering() -> Result<(), &'static str> {
+        let package = Package::parse(
+            b"Name: Demo\nDescription: Usage requirements\nVersion: 1\n\
+              CFlags: -DALT -I/usr/include\nCflags: -DPRIMARY\nLibs: -L/usr/lib -ldemo\n",
+            Default::default(),
+            Strictness::Permissive,
+            4096,
+        )
+        .map_err(|_| "Package parsing failed.")?;
+        let mut settings = Settings {
+            strictness: Strictness::Permissive,
+            search: Vec::new(),
+            sysroot: "/sdk/".into(),
+            top_build: None,
+            disable_uninstalled: false,
+            filter_includes: vec!["/usr/include".into()],
+            filter_libs: vec!["/sdk//usr/lib".into()],
+        };
+
+        let compile = Flags::parse(&package, &settings, FlagKind::Compile, b"");
+        assert_eq!(compile.options, ["-DPRIMARY", "-DALT"]);
+        assert_eq!(compile.directories, ["-I/sdk//usr/include"]);
+        let link = Flags::parse(&package, &settings, FlagKind::Link, b"");
+        assert!(link.directories.is_empty());
+        assert_eq!(link.libraries, ["-ldemo"]);
+        settings.filter_libs.clear();
+        let link = Flags::parse(&package, &settings, FlagKind::Link, b"");
+        assert_eq!(link.directories, ["-L/sdk//usr/lib"]);
+        Ok(())
     }
 }

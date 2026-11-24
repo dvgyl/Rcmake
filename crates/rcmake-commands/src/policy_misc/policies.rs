@@ -160,10 +160,15 @@ fn policy_id(name: &[u8], op: &str) -> Result<PolicyId, CmdError> {
 }
 
 pub(crate) fn issue_warning(cx: &mut Cx<'_>, id: PolicyId, preface: &[u8], postface: &[u8]) {
-    if !matches!(id.number(), 133 | 153 | 161 | 172) {
+    if !matches!(id.number(), 74 | 121 | 133 | 144 | 153 | 161 | 172) {
         return cx.issue_policy_warning(id, preface, postface);
     }
-    let message = warning_text::body(id);
+    let mut message = warning_text::body(id);
+    if id.number() == 74 {
+        message = message
+            .replace(b"find_package() uses", b"find_package uses")
+            .into();
+    }
     let body = [preface, message.as_slice(), postface]
         .into_iter()
         .filter(|part| !part.is_empty())
@@ -236,6 +241,9 @@ fn apply_version(cx: &mut Cx<'_>, raw: &[u8], required: bool) -> CmdResult {
         }
         None => (raw, None),
     };
+    if required {
+        cx.set_var(b"CMAKE_MINIMUM_REQUIRED_VERSION", minimum.into());
+    }
     let minimum_version = parse_version(minimum).ok_or_else(|| {
         if required {
             CmdError::status(quoted("could not parse VERSION \"", minimum, "\"."))
@@ -294,12 +302,8 @@ fn apply_version(cx: &mut Cx<'_>, raw: &[u8], required: bool) -> CmdResult {
     if legacy_export {
         effective = Version::from_tuple(3, 5, 0);
     }
-    let result = if required {
-        cx.set_cmake_minimum_required(minimum, &effective)
-    } else {
-        cx.apply_policy_version(&effective)
-    };
-    result.map_err(|error| policy_error(cx, error))?;
+    cx.apply_policy_version(&effective)
+        .map_err(|error| policy_error(cx, error))?;
     for policy in POLICIES {
         if cx.policy(policy.id) != PolicyStatus::Warn {
             continue;

@@ -61,6 +61,16 @@ impl SearchTrace {
         self.result(found.as_ref().map(|value| value.as_slice()));
     }
 
+    pub(super) fn module_not_found(&mut self, found_var: &[u8]) {
+        if let Some(body) = &mut self.body {
+            body.extend_from_slice(&super::text(&[
+                b"\nThe module is considered not found due to ",
+                found_var,
+                b" being FALSE.",
+            ]));
+        }
+    }
+
     pub(super) fn config(&mut self, name: &[u8], found: Option<&[u8]>, direct: bool) {
         if let Some(body) = &mut self.body {
             if !direct {

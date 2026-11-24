@@ -368,6 +368,26 @@ list(GET xs 2 single)
 }
 
 #[test]
+fn list_index_policy_applies_before_bounds_checks() {
+    let mut state = Script::new(Vec::new());
+    state.success("set(xs a;b;c)\nlist(GET xs 1word result)");
+    state.var("result", b"b");
+    assert!(state.stderr().contains("Invalid list index \"1word\"."));
+
+    let mut state = Script::new(Vec::new());
+    state.policy(121, rcmake_diag::PolicyStatus::Old);
+    state.success("set(xs a;b;c)\nlist(REMOVE_AT xs word)");
+    state.var("xs", b"b;c");
+    assert!(state.stderr().is_empty());
+
+    let mut state = Script::new(Vec::new());
+    state.policy(121, rcmake_diag::PolicyStatus::New);
+    let exit = state.run("set(xs a;b;c)\nlist(GET xs 9 word result)");
+    assert_eq!(exit, 1);
+    assert!(state.stderr().contains("index: word is not a valid index"));
+}
+
+#[test]
 fn filter_regex_and_predicate() {
     let mut state = Script::new(Vec::new());
     state.success(

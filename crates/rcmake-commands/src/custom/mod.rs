@@ -6,7 +6,7 @@ use rcmake_base::{BString, path_lex::Lexical, truth};
 use rcmake_diag::{DiagCategory, Effect, MessageKind, PolicyId, PolicyStatus};
 use rcmake_eval::{CmdError, CmdFlags, CmdResult, Cx, Flow, Registry};
 use rcmake_expr::ExpandedArg;
-use rcmake_host::path::from_native;
+use rcmake_host::path::{from_native, to_native};
 use rcmake_model::{
     BT, CustomCommand, CustomCommandKind, ModelError, Target, TargetBinding, TargetEvent,
     TargetKind, TargetOrigin,
@@ -28,10 +28,9 @@ enum Section {
     #[default]
     None,
     Command,
-    Output {
-        supplied: bool,
-    },
+    Output,
     Target,
+    Source,
     Depends,
     Byproducts,
     Sources,
@@ -46,13 +45,14 @@ enum Section {
 }
 
 impl Section {
-    fn pending_value(self, body: &CustomCommand) -> Option<&'static str> {
+    fn pending_value(self) -> Option<&'static str> {
         match self {
-            Self::Output { supplied: false } => Some("OUTPUT"),
+            Self::Output => Some("OUTPUT"),
             Self::Target => Some("TARGET"),
+            Self::Source => Some("SOURCE"),
             Self::MainDependency => Some("MAIN_DEPENDENCY"),
             Self::WorkingDirectory => Some("WORKING_DIRECTORY"),
-            Self::Comment if body.comment.is_none() => Some("COMMENT"),
+            Self::Comment => Some("COMMENT"),
             Self::Depfile => Some("DEPFILE"),
             Self::JobPool => Some("JOB_POOL"),
             Self::JobServerAware => Some("JOB_SERVER_AWARE"),
@@ -65,38 +65,38 @@ impl Section {
 struct Options {
     section: Section,
     target: Option<BString>,
+    source: Option<BString>,
     sources: Vec<BT<BString>>,
-    events: Vec<TargetEvent>,
+    event: Option<TargetEvent>,
     keywords: BTreeSet<&'static str>,
     append: bool,
     explicit_only: bool,
     implicit_language: Option<BString>,
-    missing_values: BTreeSet<&'static str>,
+    missing_values: Vec<&'static str>,
     extra_comment: bool,
     unknown_signature: bool,
 }
 
 impl Options {
     fn parse(&mut self, body: &mut CustomCommand, args: &[ExpandedArg], utility: bool) {
+        let mut pending = None;
         for arg in args {
-            let previous = self.section;
+            let section = self.section;
             if let Some(keyword) = self.keyword(body, &arg.value, utility) {
-                if keyword != "ARGS" {
-                    if let Some(previous) = previous.pending_value(body) {
-                        self.missing_values.insert(previous);
-                    }
-                    self.implicit_language = None;
+                if let Some(previous) = pending.take() {
+                    self.missing_values.push(previous);
                 }
-                if !self.keywords.insert(keyword) && keyword == "COMMENT" {
-                    self.extra_comment = true;
+                if !utility && matches!(self.section, Section::None) {
+                    self.section = section;
+                } else if keyword != "ARGS" {
+                    pending = self.section.pending_value();
                 }
+                self.keywords.insert(keyword);
             } else {
-                self.unknown_signature |= self.keywords.is_empty() && !utility;
+                self.unknown_signature |= matches!(self.section, Section::None);
+                pending = None;
                 self.value(body, arg.value.clone());
             }
-        }
-        if let Some(keyword) = self.section.pending_value(body) {
-            self.missing_values.insert(keyword);
         }
         body.command_lines.retain(|line| !line.is_empty());
     }
@@ -113,20 +113,23 @@ impl Options {
                 (Section::Command, "COMMAND")
             }
             b"ARGS" if !utility => return Some("ARGS"),
-            b"OUTPUT" if !utility => (Section::Output { supplied: false }, "OUTPUT"),
+            b"OUTPUT" if !utility => (Section::Output, "OUTPUT"),
             b"TARGET" if !utility => (Section::Target, "TARGET"),
             b"DEPENDS" => (Section::Depends, "DEPENDS"),
             b"BYPRODUCTS" => (Section::Byproducts, "BYPRODUCTS"),
             b"SOURCES" if utility => (Section::Sources, "SOURCES"),
             b"MAIN_DEPENDENCY" if !utility => (Section::MainDependency, "MAIN_DEPENDENCY"),
-            b"IMPLICIT_DEPENDS" if !utility => (Section::ImplicitDepends, "IMPLICIT_DEPENDS"),
+            b"IMPLICIT_DEPENDS" if !utility => {
+                self.implicit_language = None;
+                (Section::ImplicitDepends, "IMPLICIT_DEPENDS")
+            }
             b"WORKING_DIRECTORY" => (Section::WorkingDirectory, "WORKING_DIRECTORY"),
             b"COMMENT" => (Section::Comment, "COMMENT"),
             b"DEPFILE" if !utility => (Section::Depfile, "DEPFILE"),
             b"JOB_POOL" => (Section::JobPool, "JOB_POOL"),
             b"JOB_SERVER_AWARE" => (Section::JobServerAware, "JOB_SERVER_AWARE"),
             b"OUTPUTS" if !utility => (Section::Legacy, "OUTPUTS"),
-            b"SOURCE" if !utility => (Section::Legacy, "SOURCE"),
+            b"SOURCE" if !utility => (Section::Source, "SOURCE"),
             _ => {
                 let keyword = match arg {
                     b"VERBATIM" => (&mut body.verbatim, "VERBATIM"),
@@ -145,7 +148,7 @@ impl Options {
                             b"PRE_LINK" => (TargetEvent::PreLink, "PRE_LINK"),
                             _ => (TargetEvent::PostBuild, "POST_BUILD"),
                         };
-                        self.events.push(event);
+                        self.event = Some(event);
                         self.section = Section::None;
                         return Some(keyword);
                     }
@@ -168,14 +171,16 @@ impl Options {
                     line.push(value);
                 }
             }
-            Section::Output { .. } => {
-                body.outputs.push(tagged(value));
-                self.section = Section::Output { supplied: true };
-            }
+            Section::Output => body.outputs.push(tagged(value)),
             Section::Depends => body.depends.push(tagged(value)),
             Section::Byproducts => body.byproducts.push(tagged(value)),
             Section::Sources => self.sources.push(tagged(value)),
-            Section::Comment => self.extra_comment |= body.comment.replace(value).is_some(),
+            Section::Comment => {
+                self.extra_comment |= body
+                    .comment
+                    .replace(value)
+                    .is_some_and(|old| !old.is_empty());
+            }
             Section::ImplicitDepends => {
                 if let Some(language) = self.implicit_language.take() {
                     body.depends.push(tagged(value.clone()));
@@ -184,18 +189,16 @@ impl Options {
                     self.implicit_language = Some(value);
                 }
             }
-            section => {
-                match section {
-                    Section::Target => self.target = Some(value),
-                    Section::MainDependency => body.main_dependency = Some(value),
-                    Section::WorkingDirectory => body.working_directory = Some(value),
-                    Section::Depfile => body.depfile = Some(value),
-                    Section::JobPool => body.job_pool = Some(value),
-                    Section::JobServerAware => body.job_server_aware = truth::is_on(&value),
-                    _ => {}
-                }
-                self.section = Section::None;
-            }
+            section => match section {
+                Section::Target => self.target = Some(value),
+                Section::Source => self.source = Some(value),
+                Section::MainDependency => body.main_dependency = Some(value),
+                Section::WorkingDirectory => body.working_directory = Some(value),
+                Section::Depfile => body.depfile = Some(value),
+                Section::JobPool => body.job_pool = Some(value),
+                Section::JobServerAware => body.job_server_aware = truth::is_on(&value),
+                _ => {}
+            },
         }
     }
 }
@@ -241,9 +244,14 @@ fn add_command(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
         return Ok(Flow::Normal);
     }
 
-    match (&options.target, body.outputs.is_empty()) {
+    let target = options.target.as_ref().filter(|target| !target.is_empty());
+    let legacy_source = options
+        .source
+        .as_ref()
+        .is_some_and(|source| !source.is_empty());
+    match (target, body.outputs.is_empty()) {
         (None, false) | (Some(_), true) => {}
-        (Some(_), false) => {
+        (Some(_), false) if !legacy_source => {
             return Err(crate::command_error(
                 cx,
                 "add_custom_command Wrong syntax.  A TARGET and OUTPUT can not both be specified.",
@@ -254,6 +262,7 @@ fn add_command(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
                 "Wrong syntax. A TARGET or OUTPUT must be specified.",
             ));
         }
+        (Some(_), false) => {}
     }
 
     if options.append && body.outputs.is_empty() {
@@ -262,13 +271,24 @@ fn add_command(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
             "add_custom_command given APPEND option with no OUTPUT.",
         ));
     }
+    if body
+        .depfile
+        .as_ref()
+        .is_some_and(|depfile| !depfile.is_empty())
+        && !body.implicit_depends.is_empty()
+        && cx.var_or_empty(b"CMAKE_GENERATOR") != b"Ninja"
+    {
+        return Err(CmdError::status(
+            "IMPLICIT_DEPENDS and DEPFILE can not both be specified.",
+        ));
+    }
 
     if body.codegen {
         let error = if body.outputs.is_empty() {
             Some("CODEGEN requires at least 1 OUTPUT.")
         } else if options.append {
             Some("CODEGEN may not be used with APPEND.")
-        } else if options.keywords.contains("IMPLICIT_DEPENDS") {
+        } else if !body.implicit_depends.is_empty() {
             Some("CODEGEN is not compatible with IMPLICIT_DEPENDS.")
         } else if cx.policy(PolicyId::new(171)) != PolicyStatus::New {
             Some("CODEGEN option requires policy CMP0171 be set to NEW!")
@@ -279,7 +299,13 @@ fn add_command(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
             return Err(CmdError::status(error));
         }
     }
-    if let Some(target) = &options.target {
+    if let Some(target) = target.filter(|_| !options.append) {
+        if legacy_source {
+            return Err(crate::command_error(
+                cx,
+                "The SOURCE signatures of add_custom_command are no longer supported.",
+            ));
+        }
         return add_event(cx, body, &options, target);
     }
 
@@ -329,12 +355,7 @@ fn add_command(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
     if !valid {
         return Ok(Flow::Normal);
     }
-    if body.depfile.is_some() && !body.implicit_depends.is_empty() {
-        return Err(CmdError::status(
-            "IMPLICIT_DEPENDS and DEPFILE can not both be specified.",
-        ));
-    }
-    resolve_paths(cx, &mut body)?;
+    resolve_paths(cx, &mut body, !options.append)?;
     if options.append {
         return append(cx, body);
     }
@@ -427,6 +448,11 @@ fn add_event(
     options: &Options,
     name: &[u8],
 ) -> CmdResult {
+    if body.command_lines.is_empty()
+        && !check_policy(cx, "At least one COMMAND must be given.", b"")
+    {
+        return Ok(Flow::Normal);
+    }
     if !check_keywords(
         cx,
         options,
@@ -449,25 +475,27 @@ fn add_event(
     ) {
         return Ok(Flow::Normal);
     }
-    if options.events.len() != 1
-        && !check_policy(
+    let event = options.event.unwrap_or(TargetEvent::PostBuild);
+    if options
+        .keywords
+        .iter()
+        .filter(|key| matches!(**key, "PRE_BUILD" | "PRE_LINK" | "POST_BUILD"))
+        .count()
+        != 1
+    {
+        let name = match event {
+            TargetEvent::PreBuild => "PRE_BUILD",
+            TargetEvent::PreLink => "PRE_LINK",
+            TargetEvent::PostBuild => "POST_BUILD",
+        };
+        if !check_policy(
             cx,
             "Exactly one of PRE_BUILD, PRE_LINK, or POST_BUILD must be given.",
-            b"  Assuming POST_BUILD to preserve backward compatibility.",
-        )
-    {
-        return Ok(Flow::Normal);
+            format!("  Assuming {name} to preserve backward compatibility.").as_bytes(),
+        ) {
+            return Ok(Flow::Normal);
+        }
     }
-    if body.command_lines.is_empty()
-        && !check_policy(cx, "At least one COMMAND must be given.", b"")
-    {
-        return Ok(Flow::Normal);
-    }
-    let event = options
-        .events
-        .last()
-        .copied()
-        .unwrap_or(TargetEvent::PostBuild);
     let project = cx.project();
     let name_text = BString::from(name);
     let target = match project.lookup_target(body.dir, name) {
@@ -507,7 +535,7 @@ fn add_event(
         return Ok(Flow::Normal);
     }
     body.kind = CustomCommandKind::TargetEvent { target, event };
-    resolve_paths(cx, &mut body)?;
+    resolve_paths(cx, &mut body, true)?;
     let id = record(cx, body)?;
     if let Some(target) = cx.project().target_mut(target) {
         target.event_commands.push(id);
@@ -522,24 +550,26 @@ fn add_target(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
         ));
     };
     let name = &name.value;
+    if name.iter().any(|byte| matches!(byte, b'/' | b'\\')) {
+        return Err(CmdError::status(format!(
+            "called with invalid target name \"{name}\".  Target names may not contain a slash.  Use ADD_CUSTOM_COMMAND to generate files."
+        )));
+    }
     if name.is_empty()
         || !name
             .iter()
             .all(|byte| byte.is_ascii_alphanumeric() || b"_.+-".contains(byte))
+        || matches!(
+            name.as_slice(),
+            b"all" | b"clean" | b"help" | b"install" | b"edit_cache" | b"rebuild_cache"
+        )
     {
-        return Err(CmdError::status(format!("Invalid target name \"{name}\".")));
-    }
-
-    if matches!(
-        name.as_slice(),
-        b"all" | b"clean" | b"help" | b"install" | b"edit_cache" | b"rebuild_cache"
-    ) {
-        return Err(crate::command_error(
-            cx,
+        cx.issue(MessageKind::Error, Effect::SetError, None,
             format!(
                 "The target name \"{name}\" is reserved or not valid for certain CMake features, such as generator expressions, and may result in undefined behavior."
-            ),
-        ));
+            ).into(),
+        );
+        return Ok(Flow::Normal);
     }
     if name == b"test" && cx.var_is_on(b"CMAKE_TESTING_ENABLED") {
         return Err(crate::command_error(
@@ -561,11 +591,16 @@ fn add_target(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
         ..Options::default()
     };
     options.parse(&mut body, args, true);
+    if options.unknown_signature {
+        return Err(CmdError::status("Wrong syntax.  Unknown type of argument."));
+    }
     if body.command_lines.is_empty() {
-        let required = if body.uses_terminal {
+        let required = if !body.byproducts.is_empty() {
+            Some("BYPRODUCTS")
+        } else if body.uses_terminal {
             Some("USES_TERMINAL")
         } else {
-            (!body.byproducts.is_empty()).then_some("BYPRODUCTS")
+            body.command_expand_lists.then_some("COMMAND_EXPAND_LISTS")
         };
         if let Some(keyword) = required {
             return Err(crate::command_error(
@@ -574,7 +609,7 @@ fn add_target(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
             ));
         }
     }
-    resolve_paths(cx, &mut body)?;
+    resolve_paths(cx, &mut body, true)?;
 
     let mut target = Target::new(
         name.clone(),
@@ -602,13 +637,42 @@ fn add_target(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
     Ok(Flow::Normal)
 }
 
-fn resolve_paths(cx: &mut Cx<'_>, body: &mut CustomCommand) -> Result<(), CmdError> {
-    if body.uses_terminal && body.job_pool.is_some() {
+fn resolve_paths(
+    cx: &mut Cx<'_>,
+    body: &mut CustomCommand,
+    validate_outputs: bool,
+) -> Result<(), CmdError> {
+    if validate_outputs
+        && body.uses_terminal
+        && body.job_pool.as_ref().is_some_and(|pool| !pool.is_empty())
+    {
         return Err(CmdError::status("JOB_POOL is shadowed by USES_TERMINAL."));
     }
+    if let Some(quoted) = body
+        .command_lines
+        .iter()
+        .filter_map(|line| line.first())
+        .find(|arg| arg.starts_with(b"\""))
+    {
+        cx.issue(
+            MessageKind::Error,
+            Effect::SetError,
+            None,
+            format!("COMMAND may not contain literal quotes:\n  {quoted}\n").into(),
+        );
+        return Err(CmdError::Reported);
+    }
     let base = from_native(&cx.current_binary_dir());
-    for entry in body.outputs.iter_mut().chain(&mut body.byproducts) {
-        entry.value = binary_path(&base, &entry.value);
+    for (keyword, paths) in [
+        ("OUTPUT", &mut body.outputs),
+        ("BYPRODUCTS", &mut body.byproducts),
+    ] {
+        for entry in paths {
+            entry.value = binary_path(&base, &entry.value);
+            if validate_outputs && rcmake_genex::find_genex(&entry.value).is_none() {
+                validate_output(cx, keyword, &entry.value)?;
+            }
+        }
     }
     if let Some(dir) = &mut body.working_directory
         && !dir.is_empty()
@@ -616,6 +680,21 @@ fn resolve_paths(cx: &mut Cx<'_>, body: &mut CustomCommand) -> Result<(), CmdErr
         *dir = binary_path(&base, dir);
     }
     Ok(())
+}
+
+fn validate_output(cx: &mut Cx<'_>, keyword: &str, path: &BString) -> Result<(), CmdError> {
+    let problem = if !crate::compat::can_write_project_file(cx, &to_native(path)) {
+        format!("{keyword} path\n  {path}\nin a source directory as an output of custom command.")
+    } else if let Some(&invalid) = path.iter().find(|byte| matches!(byte, b'<' | b'>')) {
+        format!(
+            "{keyword} containing a \"{}\" is not allowed.",
+            char::from(invalid)
+        )
+    } else {
+        return Ok(());
+    };
+    cx.issue(MessageKind::Error, Effect::SetError, None, problem.into());
+    Err(CmdError::Reported)
 }
 
 fn binary_path(base: &[u8], value: &[u8]) -> BString {

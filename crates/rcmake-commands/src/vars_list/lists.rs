@@ -1,7 +1,9 @@
 use std::collections::BTreeSet;
+use std::ffi::c_long;
 use std::sync::Arc;
 
 use rcmake_base::{BString, list, list_ops};
+use rcmake_diag::{PolicyId, PolicyStatus};
 use rcmake_eval::{CmdError, CmdResult, Cx, Flow};
 use rcmake_expr::ExpandedArg;
 use rcmake_host::Stream;
@@ -51,7 +53,7 @@ pub(super) fn list(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
             let value = if raw.is_none() {
                 BString::from("NOTFOUND")
             } else {
-                get_elements(raw_bytes, indices)?
+                get_elements(cx, raw_bytes, indices)?
             };
             cx.set_var(bytes(out), value);
         }
@@ -71,7 +73,8 @@ pub(super) fn list(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
             )));
         }
         (b"SUBLIST", [begin, length, out]) => {
-            cx.set_var(bytes(out), sublist(raw_bytes, bytes(begin), bytes(length))?)
+            let value = sublist(cx, raw_bytes, bytes(begin), bytes(length))?;
+            cx.set_var(bytes(out), value);
         }
         (b"SUBLIST", _) => {
             return Err(CmdError::status(format!(
@@ -108,7 +111,7 @@ fn change_list(
     let mut items = raw.map_or_else(Vec::new, |raw| list::split(raw, list::Empty::Keep));
     match (command, rest) {
         (b"INSERT", [at, values @ ..]) if !values.is_empty() => {
-            let at = index(bytes(at), items.len(), true)?;
+            let at = checked_index(list_number(cx, bytes(at))?, items.len(), true)?;
             items.splice(at..at, values.iter().map(|arg| arg.value.clone()));
             save(cx, name, &items);
         }
@@ -185,13 +188,13 @@ fn join_with(items: list::Elements<'_>, glue: &[u8], limit: usize) -> Result<BSt
     Ok(value.into())
 }
 
-fn get_elements(raw: &[u8], args: &[ExpandedArg]) -> Result<BString, CmdError> {
+fn get_elements(cx: &mut Cx<'_>, raw: &[u8], args: &[ExpandedArg]) -> Result<BString, CmdError> {
     let elements = || list::iter(raw, list::Empty::Keep);
     if raw.is_empty() {
         return Err(CmdError::status("GET given empty list"));
     }
     if let [arg] = args {
-        let parsed = list_number(bytes(arg))?;
+        let parsed = list_number(cx, bytes(arg))?;
         let selected = match usize::try_from(parsed) {
             Ok(at) => elements().nth(at),
             Err(_) => {
@@ -205,23 +208,22 @@ fn get_elements(raw: &[u8], args: &[ExpandedArg]) -> Result<BString, CmdError> {
         };
     }
 
-    let indices = args.iter().map(|arg| list_number(bytes(arg)));
+    let indices = args
+        .iter()
+        .map(|arg| list_number(cx, bytes(arg)))
+        .collect::<Result<Vec<_>, _>>()?;
     let mut order = indices
-        .clone()
+        .iter()
+        .copied()
         .enumerate()
-        .map(|(slot, at)| at.map(|at| (at, slot)))
-        .collect::<Result<Vec<_>, _>>();
-    if !order
-        .as_ref()
-        .is_ok_and(|order| order.iter().all(|(at, _)| *at >= 0))
-    {
+        .map(|(slot, at)| (at, slot))
+        .collect::<Vec<_>>();
+    if indices.iter().any(|at| *at < 0) {
         let len = elements().count();
-        order = indices
-            .enumerate()
-            .map(|(slot, at)| Ok((checked_index(at?, len, false)? as i64, slot)))
-            .collect();
+        for (at, _) in &mut order {
+            *at = checked_index(*at, len, false)? as i64;
+        }
     }
-    let mut order = order?;
     order.sort_unstable();
     let mut selected = vec![None; args.len()];
     let mut scan = elements();
@@ -233,8 +235,8 @@ fn get_elements(raw: &[u8], args: &[ExpandedArg]) -> Result<BString, CmdError> {
             let Some(value) = scan.nth(at - next) else {
                 let len = elements().count();
                 // Report the first invalid index in argument order.
-                for arg in args {
-                    index(bytes(arg), len, false)?;
+                for index in indices {
+                    checked_index(index, len, false)?;
                 }
                 return Err(index_range(at as i64, len, false));
             };
@@ -254,18 +256,54 @@ fn get_elements(raw: &[u8], args: &[ExpandedArg]) -> Result<BString, CmdError> {
     Ok(list::join(selected.into_iter().flatten()))
 }
 
-fn list_number(arg: &[u8]) -> Result<i64, CmdError> {
-    list_ops::parse_index(arg)
-        .map(|value| i64::from(value as i32))
-        .ok_or_else(|| CmdError::status(cat(&[b"index: ", arg, b" is not a valid index"])))
+fn list_number(cx: &mut Cx<'_>, arg: &[u8]) -> Result<i64, CmdError> {
+    let text = arg.split(|byte| *byte == 0).next().unwrap_or_default();
+    let start = text.iter().position(|byte| !list_ops::is_space(*byte));
+    let number = start
+        .and_then(|start| text.get(start..))
+        .unwrap_or_default();
+    let sign = usize::from(matches!(number.first(), Some(b'+' | b'-')));
+    let digits = number
+        .iter()
+        .skip(sign)
+        .take_while(|byte| byte.is_ascii_digit())
+        .count();
+    let end = sign + digits;
+    let parsed = number
+        .get(..end)
+        .and_then(|prefix| std::str::from_utf8(prefix).ok())
+        .and_then(|prefix| prefix.parse::<c_long>().ok());
+    if parsed.is_none() || end != number.len() {
+        let policy = PolicyId::new(121);
+        match cx.policy(policy) {
+            PolicyStatus::New => {
+                return Err(CmdError::status(cat(&[
+                    b"index: ",
+                    arg,
+                    b" is not a valid index",
+                ])));
+            }
+            PolicyStatus::Warn => {
+                let warning = cat(&[b"\nInvalid list index \"", arg, b"\"."]);
+                crate::policy_misc::issue_warning(cx, policy, b"", &warning);
+            }
+            PolicyStatus::Old => {}
+        }
+    }
+    let value = parsed.unwrap_or_else(|| {
+        if digits == 0 {
+            0
+        } else if number.starts_with(b"-") {
+            c_long::MIN
+        } else {
+            c_long::MAX
+        }
+    });
+    Ok(i64::from(value as i32))
 }
 
 fn signed_len(len: usize) -> i64 {
     i64::try_from(len).unwrap_or(i64::MAX)
-}
-
-fn index(arg: &[u8], len: usize, insert: bool) -> Result<usize, CmdError> {
-    checked_index(list_number(arg)?, len, insert)
 }
 
 fn checked_index(parsed: i64, len: usize, insert: bool) -> Result<usize, CmdError> {
@@ -285,12 +323,12 @@ fn index_range(parsed: i64, len: usize, insert: bool) -> CmdError {
     ))
 }
 
-fn sublist(raw: &[u8], begin: &[u8], length: &[u8]) -> Result<BString, CmdError> {
+fn sublist(cx: &mut Cx<'_>, raw: &[u8], begin: &[u8], length: &[u8]) -> Result<BString, CmdError> {
     if raw.is_empty() {
         return Ok(BString::default());
     }
-    let begin = list_number(begin)?;
-    let length = list_number(length)?;
+    let begin = list_number(cx, begin)?;
+    let length = list_number(cx, length)?;
     let mut items = list::iter(raw, list::Empty::Keep);
     let Some(first) = usize::try_from(begin)
         .ok()
@@ -360,9 +398,13 @@ fn remove_at(
             b" out of range (0, 0)",
         ])));
     }
-    let removed = args
+    let indices = args
         .iter()
-        .map(|arg| index(bytes(arg), items.len(), false))
+        .map(|arg| list_number(cx, bytes(arg)))
+        .collect::<Result<Vec<_>, _>>()?;
+    let removed = indices
+        .into_iter()
+        .map(|index| checked_index(index, items.len(), false))
         .collect::<Result<BTreeSet<_>, _>>()?;
     let mut i = 0;
     items.retain(|_| {

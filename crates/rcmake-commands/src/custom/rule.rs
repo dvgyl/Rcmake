@@ -341,6 +341,10 @@ impl<'a> Declaration<'a> {
             "OUTPUT_FILE_SET".into(),
             "__cmake_rule_<RULE>_<TARGET>_<FILE_SET>_outputs;SOURCES".into(),
         );
+        props.set(
+            "OUTPUT_FILE_SET_BASE_DIRS".into(),
+            "<CURRENT_BINARY_DIR>".into(),
+        );
         Ok(props)
     }
 }

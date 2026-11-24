@@ -7,7 +7,7 @@ use rcmake_host::path;
 
 use super::super::{
     find_package::PACKAGE_ROOTS,
-    search_paths::{BUILD_ENV_SEPARATOR, cmake_paths, env_paths, relative_suffix},
+    search_paths::{BUILD_ENV_SEPARATOR, cmake_paths, env_paths, relative_suffix, system_prefixes},
 };
 use super::{Kind, Options, use_default};
 
@@ -126,7 +126,15 @@ pub(super) fn directories(cx: &Cx<'_>, kind: Kind, options: &Options) -> Vec<Pat
         options.no_defaults || options.no_system,
         b"CMAKE_FIND_USE_CMAKE_SYSTEM_PATH",
     ) {
-        add_prefixes(cx, &mut paths, system_prefixes(cx, options), &variables);
+        add_prefixes(
+            cx,
+            &mut paths,
+            system_prefixes(
+                cx,
+                use_default(cx, options.no_install, b"CMAKE_FIND_USE_INSTALL_PREFIX"),
+            ),
+            &variables,
+        );
         paths.extend(
             cmake_paths(cx, variables.system)
                 .iter()
@@ -159,77 +167,6 @@ fn add_framework_dirs(cx: &Cx<'_>, paths: &mut Vec<PathBuf>, values: Vec<BString
         }
         cx.resolve_path(value)
     }));
-}
-
-fn system_prefixes(cx: &Cx<'_>, options: &Options) -> Vec<BString> {
-    const USE_INSTALL_PREFIX: &[u8] = b"CMAKE_FIND_USE_INSTALL_PREFIX";
-    let platform_skips_install = cx.var_is_on(b"CMAKE_FIND_NO_INSTALL_PREFIX");
-    let use_install = use_default(cx, options.no_install, USE_INSTALL_PREFIX);
-    let install_prefixes = || {
-        [b"CMAKE_INSTALL_PREFIX".as_slice(), b"CMAKE_STAGING_PREFIX"]
-            .into_iter()
-            .flat_map(|key| cmake_paths(cx, key))
-    };
-
-    let has_system_prefixes = cx.var_defined(b"CMAKE_SYSTEM_PREFIX_PATH");
-    let mut prefixes = if has_system_prefixes {
-        cmake_paths(cx, b"CMAKE_SYSTEM_PREFIX_PATH")
-    } else {
-        let mut defaults = vec!["/usr/local".into(), "/usr".into(), "/".into()];
-        if cx.host().system().sysname.as_slice() == b"Darwin" {
-            defaults.push("/opt/homebrew".into());
-        }
-        if use_install && !platform_skips_install {
-            defaults.extend(install_prefixes());
-        }
-        defaults
-    };
-
-    if platform_skips_install {
-        if use_install && cx.var_defined(USE_INSTALL_PREFIX) {
-            prefixes.splice(..0, install_prefixes());
-        }
-    } else if !use_install && has_system_prefixes {
-        remove_install_prefixes(cx, &mut prefixes);
-    }
-    prefixes
-}
-
-fn remove_install_prefixes(cx: &Cx<'_>, prefixes: &mut Vec<BString>) {
-    // The platform records the occurrence of each prefix it added.
-    let recorded_index = |kind| {
-        let count_key = format!("_CMAKE_SYSTEM_PREFIX_PATH_{kind}_PREFIX_COUNT");
-        let value_key = format!("_CMAKE_SYSTEM_PREFIX_PATH_{kind}_PREFIX_VALUE");
-        let count = cx.var_or_empty(count_key.as_bytes());
-        let offset = std::str::from_utf8(&count)
-            .ok()?
-            .parse::<usize>()
-            .ok()?
-            .checked_sub(1)?;
-        let value = cx.var_or_empty(value_key.as_bytes());
-        prefixes
-            .iter()
-            .enumerate()
-            .filter(|(_, prefix)| **prefix == value)
-            .nth(offset)
-            .map(|(index, _)| index)
-    };
-    let install = recorded_index("INSTALL");
-    let mut staging = recorded_index("STAGING");
-    if let Some(index) = staging.filter(|_| staging == install) {
-        // If both prefixes have the same value, the platform records the same count.
-        staging = prefixes
-            .split_at_checked(index)
-            .and_then(|(earlier, rest)| {
-                let value = rest.first()?;
-                earlier.iter().rposition(|prefix| prefix == value)
-            });
-    }
-    let mut indices = [install, staging];
-    indices.sort_unstable();
-    for index in indices.into_iter().rev().flatten() {
-        prefixes.remove(index);
-    }
 }
 
 fn add_prefixes(

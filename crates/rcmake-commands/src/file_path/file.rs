@@ -4,9 +4,11 @@ use rcmake_eval::{CmdResult, Cx};
 use rcmake_expr::ExpandedArg;
 use rcmake_host::path::{from_native_cmake, to_native};
 
+#[cfg(feature = "archive")]
+use super::archive;
 use super::{
-    Result, archive, configure, download, elf_rpath, error, generate, glob, install_cmd, lock,
-    macho, mutation, reading, set, unknown, upload, warning,
+    Result, configure, download, elf_rpath, error, generate, glob, install_cmd, lock, macho,
+    mutation, reading, runtime_dependencies, set, unknown, upload, warning,
 };
 use rcmake_base::path_lex::{Lexical, native_list, native_style};
 
@@ -25,10 +27,11 @@ pub(super) fn run(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
         b"GLOB" | b"GLOB_RECURSE" => glob::run(cx, *command == b"GLOB_RECURSE", rest),
         b"READ_ELF" => elf_rpath::read(cx, rest),
         b"READ_MACHO" => macho::run(cx, rest),
+        b"GET_RUNTIME_DEPENDENCIES" => runtime_dependencies::run(cx, rest),
         b"INSTALL" => install_cmd::run(cx, rest),
         b"DOWNLOAD" => download::run(cx, rest),
         b"UPLOAD" => upload::run(cx, rest),
-        b"RPATH_CHECK" | b"RPATH_CHANGE" | b"RPATH_REMOVE" | b"CHRPATH" => {
+        b"RPATH_CHECK" | b"RPATH_CHANGE" | b"RPATH_SET" | b"RPATH_REMOVE" | b"CHRPATH" => {
             elf_rpath::run(cx, command, rest)
         }
         b"LOCK" => lock::run(cx, rest),
@@ -38,8 +41,14 @@ pub(super) fn run(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
         b"REAL_PATH" => real_path(cx, rest),
         b"RELATIVE_PATH" => relative_path(cx, rest),
         b"TO_CMAKE_PATH" | b"TO_NATIVE_PATH" => convert(cx, *command == b"TO_NATIVE_PATH", rest),
+        #[cfg(feature = "archive")]
         b"ARCHIVE_CREATE" => archive::create(cx, rest),
+        #[cfg(feature = "archive")]
         b"ARCHIVE_EXTRACT" => archive::extract(cx, rest),
+        #[cfg(not(feature = "archive"))]
+        b"ARCHIVE_CREATE" | b"ARCHIVE_EXTRACT" => Err(error(
+            [*command, b" requires the archive feature."].concat(),
+        )),
         command => match HashAlgo::parse(command) {
             Some(algo) => reading::hash(cx, command, algo, rest),
             None => Err(unknown(command)),
@@ -102,11 +111,29 @@ fn real_path(cx: &mut Cx<'_>, args: &[&[u8]]) -> Result {
         cx.host().canonicalize(&native).ok()
     };
     let resolved = canonicalize(&candidate);
-    if before_links
-        && cx.policy(PolicyId::new(152)) == PolicyStatus::Warn
-        && canonicalize(&path) != resolved
-    {
-        cx.issue_policy_warning(PolicyId::new(152), b"", b"");
+    if cx.policy(PolicyId::new(152)) == PolicyStatus::Warn {
+        let old = resolved
+            .as_deref()
+            .map_or_else(|| candidate.clone(), from_native_cmake);
+        let new = canonicalize(&path)
+            .as_deref()
+            .map_or_else(|| path.clone(), from_native_cmake);
+        if old != new {
+            cx.issue_policy_warning(
+                PolicyId::new(152),
+                b"",
+                &[
+                    b"From input path:\n  ".as_slice(),
+                    &input,
+                    b"\nthe policy OLD behavior produces path:\n  ",
+                    &old,
+                    b"\nbut the policy NEW behavior produces path:\n  ",
+                    &new,
+                    b"\nSince the policy is not set, CMake is using the OLD behavior for compatibility.",
+                ]
+                .concat(),
+            );
+        }
     }
     let result = match resolved {
         Some(resolved) => from_native_cmake(&resolved),

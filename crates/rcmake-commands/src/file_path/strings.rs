@@ -60,6 +60,19 @@ fn options(cx: &mut Cx<'_>, args: &[&[u8]]) -> Result<Options> {
                         .concat(),
                     )
                 })?);
+                let policy = PolicyId::new(159);
+                if cx.policy(policy) == PolicyStatus::Warn
+                    && cx.var(b"CMAKE_POLICY_WARNING_CMP0159").map_or_else(
+                        || cx.trace_config().is_some(),
+                        |value| rcmake_base::truth::is_on(&value),
+                    )
+                {
+                    cx.issue_policy_warning(
+                        policy,
+                        b"",
+                        b"For compatibility, CMake is leaving CMAKE_MATCH_<n> unchanged.",
+                    );
+                }
                 continue;
             }
             b"ENCODING" => {
