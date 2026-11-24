@@ -320,6 +320,7 @@ impl Interp {
 
     /// Define a normal variable and notify its watches (`cmMakefile::AddDefinition`).
     pub(crate) fn define(&mut self, name: &[u8], value: BString) {
+        self.record_variable_access(name);
         if self.watches.contains_key(name) {
             self.vars.set(name, value.clone());
             self.fire_watches(name, WatchAccess::Modified, Some(&value));
@@ -330,6 +331,7 @@ impl Interp {
 
     /// Undefine a normal variable and notify its watches (`RemoveDefinition`).
     pub(crate) fn undefine(&mut self, name: &[u8]) {
+        self.record_variable_access(name);
         self.vars.unset(name);
         self.fire_watches(name, WatchAccess::Removed, None);
     }

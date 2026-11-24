@@ -20,6 +20,7 @@ pub(super) struct ListFileVars {
 impl Interp {
     /// Normal binding value, else cache value (`GetDefinition`).
     pub(crate) fn lookup_var(&self, name: &[u8]) -> Option<&BString> {
+        self.record_variable_access(name);
         self.vars
             .get(name)
             .or_else(|| self.project.cache.get(name).map(|e| &e.value))
@@ -41,6 +42,7 @@ impl Interp {
             );
             return;
         }
+        self.record_variable_access(name);
         if let Some(value) = watched {
             self.fire_watches(
                 name,

@@ -32,6 +32,7 @@ use rcmake_syntax::{Argument, CommandInvocation};
 /// Shared keyword argument parser helpers (`cmArgumentParser`-style) for command families.
 pub mod args;
 
+mod access;
 mod builtins;
 mod code;
 mod configure_log;
@@ -420,6 +421,7 @@ pub struct Interp {
     frontend: Frontend,
     /// Variable watches by variable name (`cmVariableWatch`).
     watches: BTreeMap<BString, Vec<hooks::Watch>>,
+    variable_access: BTreeMap<BString, std::sync::atomic::AtomicBool>,
     next_watch_id: u64,
     /// Command tracing configuration (`--trace*`).
     trace: Option<TraceConfig>,
@@ -509,6 +511,7 @@ impl Interp {
             exit_override: None,
             frontend: Frontend::default(),
             watches: BTreeMap::new(),
+            variable_access: BTreeMap::new(),
             next_watch_id: 0,
             trace: None,
             configure_log: Vec::new(),
