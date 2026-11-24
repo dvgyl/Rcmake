@@ -539,8 +539,16 @@ cmake_instrumentation(API_VERSION 1 DATA_VERSION 1.2
         })
         .unwrap();
         configure();
+        let rules = read("CMakeFiles/rules.ninja")
+            .to_string()
+            .replace("$ ", " ");
         let wrapped = read("build.ninja").to_string().replace("$ ", " ");
-        assert!(wrapped.contains("--instrument --command-type compile"));
+        assert!(rules.contains("--instrument $COMMAND"));
+        assert!(
+            wrapped.contains("COMPILE_INSTRUMENTED")
+                || wrapped.contains("COMPILE_DEPFILE_INSTRUMENTED")
+        );
+        assert!(wrapped.contains("--command-type compile"));
         assert!(wrapped.contains("--instrument --command-type link"));
         assert!(
             host.read_dir(&api.join("query/generated"))

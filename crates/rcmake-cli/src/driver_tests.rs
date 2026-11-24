@@ -114,11 +114,12 @@ file(GENERATE OUTPUT "config-$<CONFIG>.txt" CONTENT "$<TARGET_PROPERTY:TYPE>" TA
         host.read(&file, ReadRange::All { limit: 16384 }).unwrap()
     };
     let script = BString::from(read("cmake_install.cmake")).to_string();
-    let staged_path = "CMakeFiles/Export/0/targets.cmake";
-    assert!(script.contains("\"/work/out/CMakeFiles/Export/0/targets.cmake\""));
+    let digest = rcmake_base::hash::HashAlgo::Md5.hex_digest(b"lib/cmake/example");
+    let staged_path = format!("CMakeFiles/Export/{digest}/targets.cmake");
+    assert!(script.contains(&format!("\"/work/out/{staged_path}\"")));
     assert!(script.contains("set(CMAKE_INSTALL_PREFIX \"/packages/example\")"));
     assert!(script.contains("set(CMAKE_INSTALL_CONFIG_NAME \"Release\")"));
-    let installed = BString::from(read(staged_path)).to_string();
+    let installed = BString::from(read(&staged_path)).to_string();
     assert!(installed.contains("get_filename_component(_IMPORT_PREFIX"));
     let build = BString::from(read("targets.cmake")).to_string();
     assert!(!build.contains("get_filename_component(_IMPORT_PREFIX"));
