@@ -41,7 +41,8 @@ impl<'a> Image<'a> {
             data: headers,
         }];
         let field = "PE section";
-        for row in table.chunks_exact(SECTION_HEADER_SIZE as usize) {
+        let (rows, _) = table.as_chunks::<{ SECTION_HEADER_SIZE as usize }>();
+        for row in rows {
             let virtual_size = u64::from(LE.u32(row, 8, field)?);
             let start = u64::from(LE.u32(row, 12, field)?);
             if !start.is_multiple_of(section_alignment) {

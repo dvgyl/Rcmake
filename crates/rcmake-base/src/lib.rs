@@ -7,6 +7,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod binfmt;
 pub mod hash;
 pub mod limits;
 pub mod list;

@@ -347,16 +347,15 @@ fn atomic_write_with(
 }
 
 #[cfg(all(test, feature = "native", any(unix, windows)))]
-#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
     use rcmake_host::{HostError, PureHost, ReadRange};
 
     #[test]
-    fn partial_staging_write_keeps_the_previous_destination() {
+    fn partial_staging_write_keeps_the_previous_destination() -> Result<(), HostError> {
         let host = PureHost::new("/work".into(), "/tools/rcmake".into());
         let path = Path::new("/work/archive.tar");
-        host.seed_file(path, b"previous archive").unwrap();
+        host.seed_file(path, b"previous archive")?;
         let result = atomic_write_with(&host, path, |stage| {
             assert_eq!(stage.parent(), path.parent());
             host.write(stage, b"partial", WriteMode::CreateNew)?;
@@ -369,9 +368,10 @@ mod tests {
             matches!(result, Err(FetchError::Host(error)) if error.kind == ErrorKind::StorageFull)
         );
         assert_eq!(
-            host.read(path, ReadRange::All { limit: 100 }).unwrap(),
+            host.read(path, ReadRange::All { limit: 100 })?,
             b"previous archive"
         );
-        assert_eq!(host.read_dir(Path::new("/work")).unwrap().len(), 1);
+        assert_eq!(host.read_dir(Path::new("/work"))?.len(), 1);
+        Ok(())
     }
 }

@@ -195,6 +195,56 @@ fn round_trips_absolute_and_parent_symlink_targets_twice() -> TestResult {
 }
 
 #[test]
+fn restores_symlink_mtime_unless_touched() -> TestResult {
+    let formats = [
+        ArchiveFormat::Tar,
+        ArchiveFormat::Zip,
+        ArchiveFormat::SevenZip {
+            compression: SevenZipCompression::Store,
+            threads: 1,
+        },
+    ];
+    for format in formats {
+        let host = test_host();
+        let archive = Path::new("/archive");
+        let target = Path::new("/target");
+        let link = Path::new("/extract/link");
+        host.seed_file(target, b"target")?;
+        let target_mtime = host.metadata(target, Follow::No)?.mtime;
+        host.symlink(target, Path::new("/source/link"))?;
+        let mut create = create_options(format);
+        create.mtime = Some(1_600_000_000);
+        let archive_mtime = timestamp::seconds(1_600_000_000);
+        create_archive(
+            &host,
+            archive,
+            Path::new("/source"),
+            &[PathBuf::from("link")],
+            &create,
+        )?;
+
+        let mut extract = extract_options();
+        extract_archive(&host, archive, &extract)?;
+        assert_eq!(
+            host.metadata(link, Follow::No)?.mtime,
+            archive_mtime,
+            "{format:?}"
+        );
+        assert_eq!(host.metadata(target, Follow::No)?.mtime, target_mtime);
+
+        extract.touch = true;
+        extract_archive(&host, archive, &extract)?;
+        assert_ne!(
+            host.metadata(link, Follow::No)?.mtime,
+            archive_mtime,
+            "{format:?}"
+        );
+        assert_eq!(host.metadata(target, Follow::No)?.mtime, target_mtime);
+    }
+    Ok(())
+}
+
+#[test]
 fn rejects_writes_through_an_extracted_symlink() -> TestResult {
     let host = test_host();
     host.seed_file(Path::new("/outside/file"), b"outside")?;

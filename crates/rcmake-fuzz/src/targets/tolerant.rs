@@ -10,6 +10,7 @@ use crate::Rng;
 
 const OPEN_BRACKET: &[u8] = b"set(x [=[open\n";
 const RECOVERED: &[u8] = b"message(recovered)\n";
+const OVER_LIMIT_REPEATS: usize = 8_192;
 
 pub(super) fn check(rng: &mut Rng) -> Check {
     let mode = rng.below(8);
@@ -17,10 +18,10 @@ pub(super) fn check(rng: &mut Rng) -> Check {
         0 => random_bytes(rng),
         1 => b"\xef\xbb\xbfIF(ON)\r\nset(x [==[\r\nvalue]==] \"a;b\")\r\nendif()\r\n".to_vec(),
         2 => b"IF(ON)\nset(x [=[open\nmessage(recovered)\n".to_vec(),
-        // Open brackets can hide each subsequent command. The per-input budget
-        // checks that recovery finishes as the number of restart points grows.
+        // Each open bracket can hide the commands that follow it.
+        // The largest case exceeds the parenthesis nesting limit.
         3 => {
-            let count = *pick(rng, &[128, 512, 2_048, 8_192]);
+            let count = *pick(rng, &[128, 512, 2_048, OVER_LIMIT_REPEATS]);
             let mut input = OPEN_BRACKET.repeat(count);
             input.extend_from_slice(RECOVERED);
             input
@@ -107,6 +108,17 @@ pub(super) fn check(rng: &mut Rng) -> Check {
         } else {
             (input.len() - RECOVERED.len()) / OPEN_BRACKET.len()
         };
+        if expected_partials == OVER_LIMIT_REPEATS {
+            require(
+                parsed.commands.is_empty()
+                    && parsed.partial_commands.is_empty()
+                    && matches!(parsed.errors.as_slice(), [error]
+                        if error.message.as_slice()
+                            == b"Listfile exceeds the editor parenthesis nesting limit."),
+                || "Recovery did not reject input above the parenthesis nesting limit.".into(),
+            )?;
+            return Ok(false);
+        }
         require(
             parsed
                 .commands

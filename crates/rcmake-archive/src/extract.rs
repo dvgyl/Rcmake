@@ -228,16 +228,15 @@ impl Scan<'_> {
                     )));
                 }
             };
-            let (mode, mtime) = if matches!(data, Data::Symlink(_) | Data::HardLink(_)) {
-                (None, None)
+            let mode = if matches!(data, Data::Symlink(_) | Data::HardLink(_)) {
+                None
             } else {
-                let mode = item.header().mode().map_err(archive_error)?;
-                let mtime = if self.touch {
-                    None
-                } else {
-                    Some(timestamp::tar_time(&mut item)?)
-                };
-                (Some(mode), mtime)
+                Some(item.header().mode().map_err(archive_error)?)
+            };
+            let mtime = if self.touch || matches!(data, Data::HardLink(_)) {
+                None
+            } else {
+                Some(timestamp::tar_time(&mut item)?)
             };
             entries.push((
                 index,
@@ -718,6 +717,12 @@ impl<'a> Unpack<'a> {
                 }
                 remove_existing_file(host, &path)?;
                 host.symlink(&target, &path)?;
+                if let Some(mtime) = entry.mtime
+                    && let Err(error) = host.set_symlink_times(&path, None, Some(mtime))
+                    && error.kind != ErrorKind::Unsupported
+                {
+                    return Err(error.into());
+                }
             }
             Data::HardLink(target) => {
                 let source = self.checked_path(&target, false)?;
