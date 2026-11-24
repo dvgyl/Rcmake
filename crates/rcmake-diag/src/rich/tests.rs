@@ -367,8 +367,8 @@ fn attached_annotations_use_editor_columns_and_terminal_cells() -> Result<(), &'
         "  |\n",
         "1 |     界x\n",
         "  |       ^ wide\n",
-        "2 | á👩🏽‍💻界   x\n",
-        "  |         - combined\n",
+        "2 | á👩🏽<U+200D>💻界 x\n",
+        "  |                 - combined\n",
         "3 | �x\n",
         "  |  - malformed\n",
         "  |   - end of file\n",
@@ -400,7 +400,7 @@ fn crop_keeps_the_primary_token_and_wraps_the_label_at_eighty_cells() -> Result<
         .find(|line| line.starts_with("1 | "))
         .ok_or("Missing excerpt")?;
     assert!(excerpt.starts_with("1 | ..."));
-    assert!(excerpt.contains("👩‍💻"));
+    assert!(excerpt.contains("👩<U+200D>💻"));
     assert!(excerpt.ends_with("..."));
     assert!(Cells::new(excerpt.as_bytes()).width() <= 80);
     let marker = lines.next().ok_or("Missing marker")?;
@@ -557,7 +557,7 @@ fn fix_preview_crops_cells_and_marks_omitted_lines() -> Result<(), &'static str>
     );
     let text = result.to_str_lossy();
     assert!(text.contains("  old end\n"));
-    assert!(text.contains("  👩‍💻new\n"));
+    assert!(text.contains("  👩<U+200D>💻new\n"));
     assert!(text.contains("    + ...\n    + five end\n"));
     assert!(
         text.lines()

@@ -3,7 +3,6 @@
 """Generate LSP documentation tables from CMake 4.5.1 RST files."""
 
 import argparse
-import json
 import os
 from pathlib import Path
 import re
@@ -185,6 +184,21 @@ def entries(help_dir, category):
     return rows, aliases
 
 
+def rust_string(value):
+    escapes = {"\\": r"\\", '"': r'\"', "\n": r"\n", "\r": r"\r", "\t": r"\t", "\0": r"\0"}
+    parts = ['"']
+    for char in value:
+        code = ord(char)
+        if char in escapes:
+            parts.append(escapes[char])
+        elif code < 0x20 or 0x7f <= code <= 0x9f:
+            parts.append(f"\\u{{{code:x}}}")
+        else:
+            parts.append(char)
+    parts.append('"')
+    return "".join(parts)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--help-source", type=Path, help="CMake 4.5.1 Help directory")
@@ -205,7 +219,7 @@ def main():
             parser.error(f"Cannot find RST files in {help_dir / category}. Use --help-source.")
         output.extend(("#[rustfmt::skip]", f"pub(super) static {table}: &[Entry] = &["))
         for name, (*fields, flags) in sorted(rows.items()):
-            strings = ", ".join(json.dumps(s, ensure_ascii=False) for s in (name, *fields))
+            strings = ", ".join(rust_string(field) for field in (name, *fields))
             output.append(f"    Entry({strings}, {flags}),")
         output.extend(("];", ""))
         print(f"{category}: {len(source)} topics, {len(rows) - len(source)} aliases")

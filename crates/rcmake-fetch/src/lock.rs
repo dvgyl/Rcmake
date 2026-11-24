@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     collections::BTreeMap,
     fmt,
     io::ErrorKind,
@@ -75,6 +76,24 @@ pub struct GitEntry {
     pub commit: String,
 }
 
+impl GitEntry {
+    /// Compare repository spellings with the same Git transport identity.
+    pub fn same_repository(left: &str, right: &str) -> bool {
+        fn identity(repository: &str) -> String {
+            let (scheme, host, path) = source_parts(repository);
+            let host = host.to_ascii_lowercase();
+            match scheme {
+                "" => repository.into(),
+                "ssh" if !repository.contains("://") && !path.starts_with('/') => {
+                    format!("{host}:{path}")
+                }
+                _ => format!("{scheme}://{host}{path}"),
+            }
+        }
+        identity(left) == identity(right)
+    }
+}
+
 /// A dependency in a version 1 lockfile.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
@@ -86,18 +105,69 @@ pub enum LockEntry {
 }
 
 impl LockEntry {
+    /// Check whether the source can be stored as a public lockfile identity.
+    pub fn is_portable_source(source: &str) -> bool {
+        if !valid_text(source) || source.starts_with('-') || Self::source_has_credentials(source) {
+            return false;
+        }
+        let (scheme, host, path) = source_parts(source);
+        let valid = match scheme {
+            "" => !path.contains(':') || Path::new(path).is_absolute(),
+            "file" => matches!(host, "" | "localhost"),
+            "ssh" => valid_host(&percent_decode(ssh_host(host))),
+            "http" | "https" | "ftp" | "ftps" | "git" => valid_host(&percent_decode(host)),
+            _ => false,
+        };
+        valid && (scheme.is_empty() || !path.contains('\\'))
+    }
+
+    /// Check for user info, URL suffixes, and recognized credential forms.
+    pub fn source_has_credentials(source: &str) -> bool {
+        let (scheme, authority, path) = source_parts(source);
+        let host = if scheme == "ssh" {
+            ssh_host(authority)
+        } else {
+            authority
+        };
+        let decoded = percent_decode(host);
+        decoded.contains(['@', '/', '\\'])
+            || decoded.matches(':').count() > host.matches(':').count()
+            || decoded.split(':').any(token_segment)
+            || (!scheme.is_empty() && path.contains(['?', '#']))
+            || percent_decode(path).split(['/', '\\', ';']).any(|segment| {
+                segment
+                    .split_once('=')
+                    .is_some_and(|(name, _)| credential_key(name))
+                    || segment.split('=').any(token_segment)
+            })
+    }
+
+    /// Return the scheme and host for diagnostics, or a placeholder if the host is invalid.
+    pub fn source_endpoint(source: &str) -> String {
+        let (scheme, authority, _) = source_parts(source);
+        let host = authority.rsplit('@').next().unwrap_or_default();
+        if matches!(scheme, "https" | "http" | "ftp" | "ftps" | "ssh" | "git")
+            && valid_host(host)
+            && !host.split(':').any(token_segment)
+        {
+            format!("{scheme}://{host}")
+        } else {
+            "<source>".into()
+        }
+    }
+
     fn redact_legacy_identity(&mut self) {
         // Older version 1 lockfiles may contain transport credentials.
         match self {
             Self::Url(entry) => {
                 for url in &mut entry.urls {
                     if valid_text(url) {
-                        *url = sanitized_url(url);
+                        *url = transport_identity(url);
                     }
                 }
             }
             Self::Git(entry) if valid_text(&entry.repository) => {
-                entry.repository = sanitized_url(&entry.repository);
+                entry.repository = transport_identity(&entry.repository);
             }
             Self::Git(_) => {}
         }
@@ -109,10 +179,10 @@ impl LockEntry {
                 entry.algo == "SHA256"
                     && !entry.urls.is_empty()
                     && entry.urls.len() <= MAX_URLS
-                    && entry.urls.iter().all(|url| valid_identity(url))
+                    && entry.urls.iter().all(|url| Self::is_portable_source(url))
             }
             Self::Git(entry) => {
-                valid_identity(&entry.repository)
+                Self::is_portable_source(&entry.repository)
                     && entry.tag.as_deref().is_none_or(valid_text)
                     && is_commit(&entry.commit)
             }
@@ -124,8 +194,111 @@ fn valid_text(value: &str) -> bool {
     !value.is_empty() && value.len() <= 8192 && !value.chars().any(char::is_control)
 }
 
-fn valid_identity(url: &str) -> bool {
-    valid_text(url) && !has_url_suffix(url) && sanitized_url(url) == url
+fn source_parts(source: &str) -> (&str, &str, &str) {
+    if let Some((scheme, rest)) = source.split_once("://") {
+        let (host, path) = rest.split_at(rest.find(['/', '?', '#', '\\']).unwrap_or(rest.len()));
+        return (scheme, host, path);
+    }
+    if let Some((host, path)) = source.split_once(':')
+        && !host.contains(['/', '\\'])
+        && host.len() > 1
+        && !path.starts_with(':')
+        && !path.is_empty()
+    {
+        return ("ssh", host, path);
+    }
+    ("", "", source)
+}
+
+fn ssh_host(host: &str) -> &str {
+    host.strip_prefix("git@").unwrap_or(host)
+}
+
+fn valid_host(host: &str) -> bool {
+    !host.is_empty()
+        && host.len() <= 255
+        && host
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b".-:[]".contains(&b))
+}
+
+fn percent_decode(value: &str) -> Cow<'_, str> {
+    let Some((head, tail)) = value.split_once('%') else {
+        return Cow::Borrowed(value);
+    };
+    let mut decoded = String::from(head);
+    for part in tail.split('%') {
+        if let Some((hex, rest)) = part.split_at_checked(2)
+            && hex.bytes().all(|byte| byte.is_ascii_hexdigit())
+            && let Ok(byte) = u8::from_str_radix(hex, 16)
+        {
+            decoded.push(char::from(byte));
+            decoded.push_str(rest);
+        } else {
+            decoded.push('%');
+            decoded.push_str(part);
+        }
+    }
+    Cow::Owned(decoded)
+}
+
+fn credential_key(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "token"
+            | "access_token"
+            | "auth_token"
+            | "private_token"
+            | "password"
+            | "passwd"
+            | "secret"
+            | "credential"
+            | "authorization"
+            | "api-key"
+            | "api_key"
+            | "apikey"
+            | "signature"
+            | "cookie"
+    )
+}
+
+fn token_segment(segment: &str) -> bool {
+    let bare = segment.split_once('.').map_or(segment, |(head, _)| head);
+    for (prefix, len, extra) in [
+        ("ghp_", 36, ""),
+        ("gho_", 36, ""),
+        ("ghu_", 36, ""),
+        ("ghs_", 36, ""),
+        ("ghr_", 36, ""),
+        ("github_pat_", 82, "_"),
+        ("glpat-", 20, "-_"),
+    ] {
+        if let Some(token) = bare.strip_prefix(prefix) {
+            return token.len() == len
+                && token
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || extra.as_bytes().contains(&b));
+        }
+    }
+    let base64url = |part: &str| {
+        !part.is_empty()
+            && part
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"-_".contains(&b))
+    };
+    let mut parts = segment.split('.');
+    matches!((parts.next(), parts.next(), parts.next(), parts.next()),
+        (Some(header), Some(payload), Some(signature), None)
+            if header.starts_with("eyJ") && base64url(header) && base64url(payload) && base64url(signature))
+}
+
+fn transport_identity(source: &str) -> String {
+    // Older callers can supply user info for transport. Validate the public identity again.
+    if LockEntry::is_portable_source(source) {
+        source.to_owned()
+    } else {
+        sanitized_url(source)
+    }
 }
 
 fn portable_urls(urls: &[&str]) -> Result<Vec<String>, &'static str> {
@@ -134,9 +307,9 @@ fn portable_urls(urls: &[&str]) -> Result<Vec<String>, &'static str> {
     }
     let urls = urls
         .iter()
-        .map(|url| sanitized_url(url))
+        .map(|url| transport_identity(url))
         .collect::<Vec<_>>();
-    if urls.iter().all(|url| valid_identity(url)) {
+    if urls.iter().all(|url| LockEntry::is_portable_source(url)) {
         Ok(urls)
     } else {
         Err("Supply a portable URL identity and pass credentials through the transport.")
@@ -290,22 +463,29 @@ impl<'a> LockSession<'a> {
         if self.mode != LockMode::Frozen {
             return Ok(None);
         }
-        let identity = sanitized_url(repository);
+        let identity = transport_identity(repository);
+        let endpoint = LockEntry::source_endpoint(repository);
         match self.original.get(name) {
             Some(LockEntry::Git(entry))
-                if !has_url_suffix(repository)
-                    && entry.repository == identity
+                if valid_text(repository)
+                    && !has_url_suffix(repository)
+                    && LockEntry::is_portable_source(&identity)
+                    && (entry.repository == identity
+                        || entry.repository == sanitized_url(&identity))
                     && entry.tag.as_deref() == tag =>
             {
                 Ok(Some(&entry.commit))
             }
-            Some(LockEntry::Git(entry)) => Err(self.lock_error(name, format!(
-                "The declared Git repository {identity:?} or tag {tag:?} differs from the locked repository {:?} or tag {:?}.",
-                entry.repository, entry.tag,
-            ))),
-            _ => Err(self.lock_error(name, format!(
-                "No Git entry matches repository {identity:?} and tag {tag:?}."
-            ))),
+            Some(LockEntry::Git(entry)) => {
+                let locked = LockEntry::source_endpoint(&entry.repository);
+                Err(self.lock_error(name, format!(
+                    "The Git repository or tag at {endpoint} differs from the lock entry at {locked}."
+                )))
+            }
+            _ => Err(self.lock_error(
+                name,
+                format!("No Git entry matches the source at {endpoint}."),
+            )),
         }
     }
 
@@ -319,15 +499,20 @@ impl<'a> LockSession<'a> {
         source_dir: &Path,
     ) -> Result<(), FetchError> {
         if self.mode == LockMode::Update {
-            if has_url_suffix(repository) {
-                return Err(self.lock_error(name,
-                    "Use a repository URL without a query or fragment. Pass credentials through Git."
+            let identity = transport_identity(repository);
+            if !valid_text(repository)
+                || has_url_suffix(repository)
+                || !LockEntry::is_portable_source(&identity)
+            {
+                return Err(self.lock_error(
+                    name,
+                    "Supply a portable repository URL. Pass credentials through Git.",
                 ));
             }
             self.updates.insert(
                 name,
                 LockEntry::Git(GitEntry {
-                    repository: sanitized_url(repository),
+                    repository: identity,
                     tag: tag.map(str::to_owned),
                     commit: mirror.head(source_dir)?,
                 }),
@@ -407,15 +592,27 @@ impl<'a> LockSession<'a> {
                 return Err(self.lock_error(
                     name,
                     format!(
-                        "The declared URLs {identities:?} differ from the locked URLs {:?}.",
-                        entry.urls,
+                        "The declared URLs at {:?} differ from the locked URLs at {:?}.",
+                        urls.iter()
+                            .map(|url| LockEntry::source_endpoint(url))
+                            .collect::<Vec<_>>(),
+                        entry
+                            .urls
+                            .iter()
+                            .map(|url| LockEntry::source_endpoint(url))
+                            .collect::<Vec<_>>(),
                     ),
                 ));
             }
             _ if self.mode == LockMode::Frozen => {
                 return Err(self.lock_error(
                     name,
-                    format!("No archive entry matches the declared URLs {identities:?}."),
+                    format!(
+                        "No archive entry matches the declared URLs at {:?}.",
+                        urls.iter()
+                            .map(|url| LockEntry::source_endpoint(url))
+                            .collect::<Vec<_>>(),
+                    ),
                 ));
             }
             _ => None,
@@ -542,5 +739,74 @@ fn read(host: &dyn Host, path: &Path) -> Result<Option<LockFile>, FetchError> {
             path: path.to_owned(),
             cause,
         }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rcmake_host::PureHost;
+    use rcmake_store::{Store, StoreConfig};
+
+    const COMMIT: &str = "40626af88bd7df9a5fb80be7b25ac85b122d6c21";
+
+    #[test]
+    fn lock_keeps_public_sources_and_rejects_credential_paths() -> Result<(), FetchError> {
+        let mut lock = LockFile::default();
+        let public = vec![
+            "https://github.com/huggingface/tokenizers".into(),
+            "https://gitlab.gnome.org/GNOME/libsecret.git".into(),
+            format!("https://codeload.github.com/fmtlib/fmt/tar.gz/{COMMIT}"),
+            "https://example.invalid/release/jdk-17.0.16%2B8".into(),
+        ];
+        let entry = LockEntry::Url(UrlEntry::from_bytes(public, b"archive"));
+        lock.insert("public", entry)?;
+        assert_eq!(LockFile::parse(&lock.to_json()?)?, lock);
+
+        let token = format!(
+            "https://example.invalid/download/ghp_{}.tar.gz",
+            "A".repeat(36)
+        );
+        for source in [
+            "https://example.invalid/download/access_token%3Dprivate/archive.tar.gz",
+            "https://example.invalid/100%/download/%67lpat-0123456789abcdefghij",
+            token.as_str(),
+        ] {
+            assert!(LockEntry::source_has_credentials(source));
+            assert!(!LockEntry::is_portable_source(source));
+            assert_eq!(
+                LockEntry::source_endpoint(source),
+                "https://example.invalid"
+            );
+            let archive = LockEntry::Url(UrlEntry::from_bytes(vec![source.into()], b"archive"));
+            let git = LockEntry::Git(GitEntry {
+                repository: source.into(),
+                tag: None,
+                commit: COMMIT.into(),
+            });
+            assert!(lock.insert("private", archive).is_err());
+            assert!(lock.insert("private", git).is_err());
+        }
+        assert!(lock.get("private").is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn lock_update_rejects_credential_paths_before_download() -> Result<(), FetchError> {
+        let host = PureHost::new("/work".into(), "/tools/rcmake".into());
+        let store = Store::new(&host, StoreConfig::new("/cache".into()))?;
+        let cache = ArchiveCache::new(&host, &store);
+        let mut lock = LockSession::open(&host, Path::new("/work"), LockMode::Update)?;
+        let mut called = false;
+        let source = "https://example.invalid/download/access_token%3Dprivate/archive.tar.gz";
+        let result = lock.fetch_archive_with(&cache, "dep", source, None, || {
+            called = true;
+            Ok(b"archive".to_vec())
+        });
+        assert!(!called);
+        assert!(
+            matches!(result, Err(FetchError::Lock { detail, .. }) if !detail.contains("private"))
+        );
+        Ok(())
     }
 }

@@ -2,9 +2,10 @@
 
 //! Observe FetchContent declarations and match transfers from bundled population code.
 
+#![cfg(all(feature = "native", any(unix, windows)))]
 #![forbid(unsafe_code)]
 
-use std::{borrow::Cow, collections::BTreeMap, fmt};
+use std::{collections::BTreeMap, fmt};
 
 use rcmake_base::{
     BString,
@@ -15,10 +16,9 @@ use rcmake_eval::{FetchLockMode, Services};
 use rcmake_expr::ExpandedArg;
 use rcmake_host::Host;
 
-#[cfg(all(feature = "native", any(unix, windows)))]
 use rcmake_fetch::{
-    ArchiveCache, ArchiveResult, ContentHash, FetchError, FetchPool, GitClone, LockEntry, LockFile,
-    LockMode, LockSession, PrefetchSource, Ticket, UrlEntry, classify_git_checkout,
+    ArchiveCache, ArchiveResult, ContentHash, FetchError, FetchPool, GitClone, GitEntry, LockEntry,
+    LockFile, LockMode, LockSession, PrefetchSource, Ticket, UrlEntry, classify_git_checkout,
     classify_git_clone,
 };
 
@@ -57,10 +57,8 @@ pub struct DeclaredFetch {
     pub custom_download: bool,
     /// Nonempty SOURCE_DIR specified in the declaration.
     pub source_dir: Option<BString>,
-    #[cfg(all(feature = "native", any(unix, windows)))]
     transfer_settings: bool,
     custom_update: bool,
-    #[cfg(all(feature = "native", any(unix, windows)))]
     package_lookup: bool,
 }
 impl DeclaredFetch {
@@ -139,7 +137,6 @@ pub fn parse_fetchcontent_declare(args: &[ExpandedArg]) -> Option<DeclaredFetch>
         },
         _ => DeclaredSource::Other,
     };
-    #[cfg(all(feature = "native", any(unix, windows)))]
     let transfer_settings = concat!(
         "TIMEOUT INACTIVITY_TIMEOUT HTTP_USERNAME HTTP_PASSWORD HTTP_HEADER TLS_VERSION ",
         "TLS_VERIFY TLS_CAINFO NETRC NETRC_FILE GIT_CONFIG GIT_SHALLOW GIT_REMOTE_NAME",
@@ -151,10 +148,8 @@ pub fn parse_fetchcontent_declare(args: &[ExpandedArg]) -> Option<DeclaredFetch>
         source,
         custom_download,
         source_dir: one(b"SOURCE_DIR").filter(|path| !path.is_empty()).cloned(),
-        #[cfg(all(feature = "native", any(unix, windows)))]
         transfer_settings,
         custom_update,
-        #[cfg(all(feature = "native", any(unix, windows)))]
         package_lookup: package_args || override_package,
     })
 }
@@ -209,7 +204,6 @@ pub struct FetchSession {
     declarations: BTreeMap<String, DeclaredFetch>,
     mode: FetchLockMode,
     offline: bool,
-    #[cfg(all(feature = "native", any(unix, windows)))]
     prefetch: bool,
 }
 /// Population identity after the hook verifies the bundled call and command source.
@@ -231,7 +225,6 @@ impl FetchSession {
             offline: host
                 .env_get(b"RCMAKE_FETCH_OFFLINE")
                 .is_some_and(|value| value == "1"),
-            #[cfg(all(feature = "native", any(unix, windows)))]
             prefetch: services.speed.fetch_prefetch,
         }
     }
@@ -270,7 +263,7 @@ impl FetchSession {
         }
     }
     fn skipped_source<T>(&self, dependency: &str, source: &str) -> Result<Option<T>, BlockedFetch> {
-        if credentialed_source(source) {
+        if LockEntry::source_has_credentials(source) {
             self.unportable(dependency)
         } else {
             Ok(None)
@@ -462,30 +455,14 @@ fn safe_name(value: &str) -> String {
 }
 /// Return a diagnostic URL identity without user info, path, query, or fragment.
 pub fn sanitize_url(url: &str) -> String {
-    let (scheme, authority, _) = source_parts(url);
-    let host = authority.rsplit('@').next().unwrap_or_default();
-    if matches!(scheme, "https" | "http" | "ftp" | "ftps" | "ssh" | "git")
-        && valid_host(host)
-        && !host.split(':').any(token_segment)
-    {
-        format!("{scheme}://{host}")
-    } else {
-        "<source>".into()
-    }
-}
-fn valid_host(host: &str) -> bool {
-    !host.is_empty()
-        && host.len() <= 255
-        && host
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b".-:[]".contains(&b))
+    LockEntry::source_endpoint(url)
 }
 fn credentialed_option(key: &[u8], value: &[u8]) -> bool {
     match key {
         b"URL" => list::iter(value, Empty::Drop)
-            .any(|url| std::str::from_utf8(&url).is_ok_and(credentialed_source)),
+            .any(|url| std::str::from_utf8(&url).is_ok_and(LockEntry::source_has_credentials)),
         b"GIT_REPOSITORY" | b"SVN_REPOSITORY" | b"HG_REPOSITORY" | b"CVS_REPOSITORY" => {
-            std::str::from_utf8(value).is_ok_and(credentialed_source)
+            std::str::from_utf8(value).is_ok_and(LockEntry::source_has_credentials)
         }
         b"HTTP_HEADER" => list::iter(value, Empty::Drop).any(|header| credential_header(&header)),
         b"HTTP_USERNAME" | b"HTTP_PASSWORD" | b"SVN_USERNAME" | b"SVN_PASSWORD" => {
@@ -523,119 +500,10 @@ fn credential_options(args: &[&[u8]]) -> bool {
 fn relative_repo(repository: &str) -> bool {
     repository.starts_with("../") && portable_source(repository)
 }
-fn credentialed_source(source: &str) -> bool {
-    let (scheme, authority, path) = source_parts(source);
-    let host = if scheme == "ssh" {
-        ssh_host(authority)
-    } else {
-        authority
-    };
-    let decoded = percent_decode(host);
-    decoded.contains('@')
-        || decoded.matches(':').count() > host.matches(':').count()
-        || decoded.contains('/')
-        || decoded.split(':').any(token_segment)
-        || (!scheme.is_empty() && path.contains(['?', '#']))
-        || percent_decode(path)
-            .split(['/', '\\', ';', '='])
-            .any(token_segment)
-}
-fn percent_decode(value: &str) -> Cow<'_, str> {
-    fn decode(value: &str) -> Option<String> {
-        let (head, tail) = value.split_once('%')?;
-        let mut decoded = String::from(head);
-        for part in tail.split('%') {
-            let (hex, rest) = part.split_at_checked(2)?;
-            if !hex.as_bytes().iter().all(u8::is_ascii_hexdigit) {
-                return None;
-            }
-            decoded.push(char::from(u8::from_str_radix(hex, 16).ok()?));
-            decoded.push_str(rest);
-        }
-        Some(decoded)
-    }
-    decode(value).map_or(Cow::Borrowed(value), Cow::Owned)
-}
-fn token_segment(segment: &str) -> bool {
-    // Git object IDs contain only hex digits. Token formats have a prefix or dots.
-    if let Some((prefix, len, extra)) = [
-        ("ghp_", 36, ""),
-        ("gho_", 36, ""),
-        ("github_pat_", 82, "_"),
-        ("glpat-", 20, "-_"),
-    ]
-    .into_iter()
-    .find(|(prefix, _, _)| segment.starts_with(*prefix))
-    {
-        return segment.strip_prefix(prefix).is_some_and(|token| {
-            token.len() == len
-                && token
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || extra.as_bytes().contains(&b))
-        });
-    }
-    let base64url = |part: &str| {
-        !part.is_empty()
-            && part
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b"-_".contains(&b))
-    };
-    if !segment.starts_with("eyJ") {
-        return false;
-    }
-    let parts: Vec<_> = segment.splitn(4, '.').collect();
-    matches!(parts.as_slice(), [header, payload, signature]
-        if base64url(header) && base64url(payload) && base64url(signature))
-}
 /// Check a public archive or Git identity before transport or lockfile use.
 pub fn portable_source(source: &str) -> bool {
-    if source.is_empty()
-        || source.starts_with('-')
-        || source.len() > 8192
-        || source.chars().any(char::is_control)
-        || credentialed_source(source)
-    {
-        return false;
-    }
-    let (scheme, host, path) = source_parts(source);
-    let valid = match scheme {
-        "" => !path.contains(':') || std::path::Path::new(path).is_absolute(),
-        "file" => matches!(host, "" | "localhost"),
-        "ssh" => valid_host(&percent_decode(ssh_host(host))),
-        "http" | "https" | "ftp" | "ftps" | "git" => valid_host(&percent_decode(host)),
-        _ => false,
-    };
-    valid && (scheme.is_empty() || !path.contains('\\'))
+    LockEntry::is_portable_source(source)
 }
-fn source_parts(source: &str) -> (&str, &str, &str) {
-    if let Some((scheme, rest)) = source.split_once("://") {
-        let (host, path) = rest.split_at(rest.find(['/', '?', '#', '\\']).unwrap_or(rest.len()));
-        (scheme, host, path)
-    } else if let Some((host, path)) = scp_repo(source) {
-        ("ssh", host, path)
-    } else {
-        ("", "", source)
-    }
-}
-fn ssh_host(host: &str) -> &str {
-    host.strip_prefix("git@").unwrap_or(host)
-}
-fn scp_repo(source: &str) -> Option<(&str, &str)> {
-    let (host, path) = source.split_once(':')?;
-    (!host.contains(['/', '\\']) && host.len() > 1 && !path.starts_with(':') && !path.is_empty())
-        .then_some((host, path))
-}
-#[cfg(all(feature = "native", any(unix, windows)))]
-fn git_identity(repo: &str) -> String {
-    let (scheme, host, path) = source_parts(repo);
-    let host = host.to_ascii_lowercase();
-    match scheme {
-        "" => repo.into(),
-        "ssh" if !repo.contains("://") && !path.starts_with('/') => format!("{host}:{path}"),
-        _ => format!("{scheme}://{host}{path}"),
-    }
-}
-#[cfg(all(feature = "native", any(unix, windows)))]
 /// Convert the evaluator mode explicitly so the two defaults do not affect each other.
 pub const fn lock_mode(mode: FetchLockMode) -> LockMode {
     match mode {
@@ -645,7 +513,6 @@ pub const fn lock_mode(mode: FetchLockMode) -> LockMode {
         FetchLockMode::Frozen => LockMode::Frozen,
     }
 }
-#[cfg(all(feature = "native", any(unix, windows)))]
 /// Recognized Git commands from the bundled clone template.
 pub enum GitTransfer<'a> {
     /// A clone of the observed repository with the original template options.
@@ -653,7 +520,6 @@ pub enum GitTransfer<'a> {
     /// Checkout of the declared tag or commit.
     Checkout,
 }
-#[cfg(all(feature = "native", any(unix, windows)))]
 impl FetchSession {
     /// Prefetch a pinned source with default options. Pass current population settings.
     pub fn prefetch(
@@ -743,7 +609,7 @@ impl FetchSession {
             return self.skipped_source(site.dependency, repository);
         }
         Ok(if let Some(clone) = classify_git_clone(args) {
-            (git_identity(repository) == git_identity(clone.repository))
+            GitEntry::same_repository(repository, clone.repository)
                 .then_some(GitTransfer::Clone(clone))
         } else {
             (classify_git_checkout(args) == Some(tag.as_deref().unwrap_or("master")))
@@ -830,7 +696,6 @@ impl FetchSession {
         Ok((result, warning))
     }
 }
-#[cfg(all(feature = "native", any(unix, windows)))]
 impl ArchiveTransfer<'_> {
     /// Record the full mirror list and content identity in an Update session.
     pub fn record(
@@ -873,7 +738,6 @@ impl ArchiveTransfer<'_> {
         ))
     }
 }
-#[cfg(all(feature = "native", any(unix, windows)))]
 fn verify_archive_size(entry: &UrlEntry, bytes: &[u8]) -> Result<(), FetchError> {
     if entry.size == bytes.len() as u64 {
         Ok(())

@@ -8,7 +8,7 @@ use rcmake_json::Value;
 
 use crate::{
     Position,
-    features::escape_markdown,
+    catalog::escape_markdown,
     json::{object, uint},
     position::range,
     uri,

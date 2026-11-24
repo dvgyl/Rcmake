@@ -172,25 +172,6 @@ pub(super) fn render(state: &State, spans: &[Span], wall: Duration, total: Durat
         for (&category, stats) in &summary.categories {
             row(&mut out, total, category.name(), Some(stats));
         }
-        let checks = summary.categories.get(&Category::Check);
-        if let Some(checks) = checks.filter(|timing| timing.measured) {
-            let elapsed = checks.inclusive.elapsed;
-            let time = if elapsed < Duration::from_millis(50) {
-                duration(elapsed)
-            } else {
-                format!("{:.1} s", elapsed.as_secs_f64())
-            };
-            let (calls, verb) = if checks.calls == 1 {
-                ("call", "is")
-            } else {
-                ("calls", "are")
-            };
-            let _ = writeln!(
-                out,
-                "{} check_* {calls} ({time}) {verb} cacheable by the probe cache.",
-                checks.calls
-            );
-        }
     }
     let root = source_root(spans);
     let root = root.as_ref().map(|path| path.as_slice());
@@ -348,7 +329,7 @@ mod tests {
     #[test]
     fn reports_subsecond_operations_and_unmeasured_phases() -> Result<(), &'static str> {
         let recorder = ProfileRecorder::new();
-        for name in [b"z\x1b".as_slice(), b"a\n", b"check_type_size"] {
+        for name in [b"z\x1b".as_slice(), b"a\n", b"check_project_setting"] {
             recorder.record(ProfileSample {
                 name,
                 file: b"test.cmake",
@@ -373,9 +354,13 @@ mod tests {
         );
         assert!(report.contains("4.2 ms of recorded wall time"));
         assert!(report.contains("100.0%"));
-        assert!(report.contains("check_*"));
+        assert!(
+            report
+                .lines()
+                .any(|line| { line.ends_with("  check_*") && line.contains("4.2 ms") })
+        );
         assert!(report.contains("Command categories can overlap"));
-        assert!(report.contains("1 check_* call (4.2 ms) is cacheable by the probe cache."));
+        assert!(!report.contains("cacheable"));
         assert!(report.contains("macro     a\u{fffd}  test.cmake:10"));
         assert!(report.contains("macro     z\u{fffd}  test.cmake:10"));
         assert!(report.find("a\u{fffd}") < report.find("z\u{fffd}"));
