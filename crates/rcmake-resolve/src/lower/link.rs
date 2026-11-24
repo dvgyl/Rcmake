@@ -24,6 +24,7 @@ pub(super) fn link(
     artifacts: &ArtifactSet,
     mut step: LinkStep,
     objects: Vec<BString>,
+    position_independent: Option<bool>,
 ) -> Result<BuildStep, ResolveError> {
     if step.output.is_empty()
         && let Some(file) = &artifacts.file
@@ -60,7 +61,7 @@ pub(super) fn link(
         definition(model, target.dir, &kind.create_flags_key(language))
             .map_or_else(|| kind.default_create_flag(darwin).into(), Clone::clone),
     );
-    flags.extend(policy.pie_link());
+    flags.extend(policy.pie_link(position_independent));
     if kind == LinkKind::SharedLibrary && darwin {
         flags.extend(darwin_versions(model, target, language));
     }

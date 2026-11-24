@@ -3,17 +3,20 @@
 use indexmap::{IndexMap, IndexSet};
 use rcmake_base::{BString, list, path_lex::Lexical, truth};
 use rcmake_diag::{
-    Backtrace, Diagnostic, Effect, FrameKind, Location, MessageKind, RenderOptions, render,
+    Backtrace, Diagnostic, Effect, FrameKind, Location, MessageKind, PolicyId, PolicyStatus,
+    RenderOptions, render,
 };
 use rcmake_genex::{ConfigId, EvalContext};
 use rcmake_host::{FileKind, Follow, Host, Stream, path::to_native};
-use rcmake_model::{BT, Directory, ProjectModel, PropertyMap, TargetId, TargetKind};
+use rcmake_model::{BT, Directory, ProjectModel, PropertyMap, TargetId};
 
 use crate::{
     CompileGroup, InterfaceInclude, ResolveError,
     target::FileSetMember,
     usage::{self, UsageResolver},
 };
+
+mod generated;
 
 #[derive(Clone, Copy)]
 enum SourceUsage {
@@ -135,6 +138,7 @@ pub(crate) fn append_compile_flags(
 pub(crate) struct TargetInputs {
     pub(crate) sources: IndexSet<BString>,
     pub(crate) objects: IndexSet<BString>,
+    pub(crate) position_independent: Option<bool>,
     pub(crate) standard_requirements: IndexMap<BString, &'static [u8]>,
     pub(crate) unity_groups: IndexMap<BString, Option<BString>>,
 }
@@ -142,7 +146,7 @@ pub(crate) struct TargetInputs {
 pub(crate) struct SourcePaths<'a> {
     pub(crate) host: &'a dyn Host,
     pub(crate) ide: Option<crate::ide::IdeFlavor>,
-    generated: IndexSet<BString>,
+    generated: IndexMap<BString, IndexSet<BString>>,
     objects: IndexMap<BString, TargetId>,
     pub(crate) unity: Option<crate::unity::UnityPlan>,
 }
@@ -152,7 +156,7 @@ impl<'a> SourcePaths<'a> {
         Self {
             host,
             ide: None,
-            generated: IndexSet::new(),
+            generated: IndexMap::new(),
             objects: IndexMap::new(),
             unity: None,
         }
@@ -168,9 +172,15 @@ impl<'a> SourcePaths<'a> {
         for (_, command) in model.commands() {
             let (outputs, byproducts) =
                 crate::lower::command_outputs(model, command, config, &mut usage)?;
-            self.generated.extend(outputs);
-            self.generated.extend(byproducts);
+            let dir = model.dir(command.dir);
+            for path in outputs.into_iter().chain(byproducts) {
+                self.generated
+                    .entry(path)
+                    .or_default()
+                    .insert(dir.binary_dir.clone());
+            }
         }
+        self.index_file_generations(model, config, &mut usage)?;
         Ok(())
     }
 
@@ -179,7 +189,7 @@ impl<'a> SourcePaths<'a> {
         let usage = UsageResolver::with_source_paths(model, self);
         self.objects = model
             .targets()
-            .filter(|(_, target)| target.kind == TargetKind::ObjectLibrary)
+            .filter(|(_, target)| target.kind.compiles_objects() && !target.is_imported())
             .filter_map(|(id, _)| Some((id, usage.target_objects(id, config, None)?)))
             .flat_map(|(id, objects)| {
                 list::split(&objects, list::Empty::Drop)
@@ -197,7 +207,19 @@ impl<'a> SourcePaths<'a> {
         [&dir.source_dir, &dir.binary_dir]
             .into_iter()
             .map(|base| absolute_path(base, source))
-            .any(|path| self.generated.contains(&path))
+            .any(|path| self.generated_in(dir, &path))
+    }
+
+    fn generated_in(&self, dir: &Directory, path: &[u8]) -> bool {
+        source_flag(dir, path, b"GENERATED")
+            || self.generated.get(path).is_some_and(|producers| {
+                producers.contains(&dir.binary_dir)
+                    || dir.final_policies.is_some_and(|policies| {
+                        [PolicyId::new(118), PolicyId::new(163)]
+                            .iter()
+                            .any(|&policy| policies.get(policy) == PolicyStatus::New)
+                    })
+            })
     }
 
     pub(crate) fn is_source_dependency(
@@ -207,7 +229,7 @@ impl<'a> SourcePaths<'a> {
         binary: &BString,
     ) -> bool {
         self.host.metadata(&to_native(source), Follow::Yes).is_ok()
-            || (!self.generated.contains(binary) && dir.source_props.contains_key(source))
+            || (!self.generated.contains_key(binary) && dir.source_props.contains_key(source))
     }
 
     pub(crate) fn find(&self, dir: &Directory, source: &[u8]) -> Option<BString> {
@@ -215,11 +237,10 @@ impl<'a> SourcePaths<'a> {
             absolute_path(&dir.source_dir, source),
             absolute_path(&dir.binary_dir, source),
         ];
-        if let Some(path) = paths.iter().find(|path| {
-            self.generated.contains(*path)
-                || self.objects.contains_key(*path)
-                || source_flag(dir, path, b"GENERATED")
-        }) {
+        if let Some(path) = paths
+            .iter()
+            .find(|path| self.generated_in(dir, path) || self.objects.contains_key(*path))
+        {
             return Some(path.clone());
         }
         paths.into_iter().find(|path| {
@@ -327,7 +348,7 @@ pub(crate) fn properties<'a>(dir: &'a Directory, source: &BString) -> SourceProp
     }
 }
 
-fn source_flag(dir: &Directory, source: &BString, property: &[u8]) -> bool {
+fn source_flag(dir: &Directory, source: &[u8], property: &[u8]) -> bool {
     dir.source_props
         .get(source)
         .and_then(|props| props.get(property))

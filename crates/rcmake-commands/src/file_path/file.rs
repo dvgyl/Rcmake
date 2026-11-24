@@ -5,8 +5,8 @@ use rcmake_expr::ExpandedArg;
 use rcmake_host::path::{from_native, to_native};
 
 use super::{
-    Result, archive, elf_rpath, error, generate, glob, install_cmd, lock, macho, mutation, reading,
-    set, unknown, warning,
+    Result, archive, configure, elf_rpath, error, generate, glob, install_cmd, lock, macho,
+    mutation, reading, set, unknown, warning,
 };
 use rcmake_base::path_lex::{Lexical, native_list, native_style};
 
@@ -30,6 +30,8 @@ pub(super) fn run(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
         }
         b"LOCK" => lock::run(cx, rest),
         b"GENERATE" => generate::run(cx, rest),
+        b"CONFIGURE" => configure::run(cx, rest),
+        b"DIFFERENT" => reading::different(cx, rest),
         b"REAL_PATH" => real_path(cx, rest),
         b"RELATIVE_PATH" => relative_path(cx, rest),
         b"TO_CMAKE_PATH" | b"TO_NATIVE_PATH" => convert(cx, *command == b"TO_NATIVE_PATH", rest),
@@ -53,7 +55,15 @@ fn real_path(cx: &mut Cx<'_>, args: &[&[u8]]) -> Result {
     let mut expand = false;
     while let Some(option) = options.next() {
         match option {
-            b"BASE_DIRECTORY" => base = super::arg(&mut options, option)?.into(),
+            b"BASE_DIRECTORY" => {
+                let value = options.next().ok_or_else(|| {
+                    crate::command_error(
+                        cx,
+                        "Error after keyword \"BASE_DIRECTORY\":\n\n  missing required value\n",
+                    )
+                })?;
+                base = value.into();
+            }
             b"EXPAND_TILDE" => expand = true,
             _ => {
                 return Err(error(

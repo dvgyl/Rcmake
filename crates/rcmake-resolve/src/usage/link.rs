@@ -59,7 +59,7 @@ impl ResolvedLinkItem {
         }
     }
 
-    pub(super) fn edge_targets(&self) -> impl Iterator<Item = TargetId> + '_ {
+    pub(super) fn edge_targets(&self) -> impl DoubleEndedIterator<Item = TargetId> + '_ {
         // Decoded groups have only one level of members.
         let items = match &self.kind {
             ResolvedLinkKind::Group { members, .. } => members.as_slice(),
@@ -197,6 +197,31 @@ impl<'a> UsageResolver<'a> {
                     .filter(|id| seen.insert(*id)),
             );
             index += 1;
+        }
+        Ok(targets)
+    }
+
+    pub(super) fn compatibility_targets(
+        &mut self,
+        target: TargetId,
+        ctx: &EvalContext,
+    ) -> Result<Vec<TargetId>, ResolveError> {
+        let mut ctx = context(target, ctx, UsageTraversal::Compile);
+        ctx.head = Some(handle(target));
+        let (direct, _) = self.usage_links(target, false, &ctx)?;
+        let mut seen = HashSet::from([target]);
+        let mut targets = Vec::new();
+        let mut pending: Vec<_> = direct
+            .iter()
+            .flat_map(|item| item.edge_targets())
+            .rev()
+            .collect();
+        while let Some(id) = pending.pop() {
+            if seen.insert(id) {
+                targets.push(id);
+                let (links, _) = self.usage_links(id, true, &ctx)?;
+                pending.extend(links.iter().flat_map(|item| item.edge_targets()).rev());
+            }
         }
         Ok(targets)
     }

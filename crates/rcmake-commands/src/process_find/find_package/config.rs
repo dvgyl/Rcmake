@@ -4,12 +4,13 @@ use std::path::{Path, PathBuf};
 use rcmake_base::{BString, list, truth};
 use rcmake_cps::{CpsPackage, naming};
 use rcmake_eval::{CmdError, Cx};
-use rcmake_host::path;
+use rcmake_host::{FileKind, Follow, path};
 use rcmake_model::{CacheEntry, CacheType};
 
 use super::super::cps_import;
 use super::super::search_paths::{is_file, relative_suffix};
-use super::paths::paths_from_vars;
+use super::paths::{paths_from_vars, redirects_directory};
+use super::trace::SearchTrace;
 use super::{Bindings, Request, flag, text, version_bindings};
 
 pub(super) struct ConfigSearch<'a> {
@@ -101,6 +102,7 @@ impl<'a> ConfigSearch<'a> {
         &mut self,
         cx: &mut Cx<'_>,
         package_roots: &[BString],
+        trace: &mut SearchTrace,
     ) -> Result<Option<ConfigMatch>, CmdError> {
         let dir = cx.var_or_empty(&text(&[self.name, b"_DIR"]));
         let preferred = self
@@ -108,16 +110,35 @@ impl<'a> ConfigSearch<'a> {
             .clone()
             .or_else(|| (!dir.is_empty() && !truth::is_off(&dir)).then(|| cx.resolve_path(&dir)));
         if let Some(dir) = preferred {
-            if self.redirect.is_none()
-                && let Some(found) = self.in_directory(cx, &dir, true)?
-            {
-                return Ok(Some(found));
-            }
-            if let Some(found) = self.in_directory(cx, &dir, false)? {
+            let found = if self.redirect.is_none() || !self.request.module {
+                self.in_directory(cx, &dir, true, trace)?
+            } else {
+                None
+            };
+            let found = match found {
+                Some(found) => Some(found),
+                None => self.in_directory(cx, &dir, false, trace)?,
+            };
+            trace.config(self.name, None, true);
+            if let Some(found) = found {
                 return Ok(Some(found));
             }
         }
+        let matched = self.find_in_prefixes(cx, package_roots, trace)?;
+        trace.config(
+            self.name,
+            matched.as_ref().map(|found| found.file.as_slice()),
+            false,
+        );
+        Ok(matched)
+    }
 
+    fn find_in_prefixes(
+        &mut self,
+        cx: &mut Cx<'_>,
+        package_roots: &[BString],
+        trace: &mut SearchTrace,
+    ) -> Result<Option<ConfigMatch>, CmdError> {
         let ignored = paths_from_vars(cx, &[b"CMAKE_IGNORE_PATH", b"CMAKE_SYSTEM_IGNORE_PATH"]);
         let ignored_prefixes = paths_from_vars(
             cx,
@@ -126,10 +147,16 @@ impl<'a> ConfigSearch<'a> {
                 b"CMAKE_SYSTEM_IGNORE_PREFIX_PATH",
             ],
         );
-        for prefix in self.prefixes(cx, package_roots) {
+        let redirects = redirects_directory(cx);
+        for prefix in self.prefixes(cx, package_roots, trace) {
             if ignored_prefixes
                 .iter()
                 .any(|ignore| prefix.starts_with(ignore))
+                || Some(&prefix) != redirects.as_ref()
+                    && !cx
+                        .host()
+                        .metadata(&prefix, Follow::Yes)
+                        .is_ok_and(|meta| meta.kind == FileKind::Dir)
             {
                 continue;
             }
@@ -141,7 +168,7 @@ impl<'a> ConfigSearch<'a> {
                     .map(|suffix| dir.join(relative_suffix(suffix)));
                 for dir in std::iter::once(dir.clone()).chain(suffixes) {
                     if !ignored.contains(&dir)
-                        && let Some(found) = self.in_directory(cx, &dir, cps)?
+                        && let Some(found) = self.in_directory(cx, &dir, cps, trace)?
                     {
                         return Ok(Some(found));
                     }
@@ -156,15 +183,17 @@ impl<'a> ConfigSearch<'a> {
         cx: &mut Cx<'_>,
         dir: &Path,
         cps: bool,
+        trace: &mut SearchTrace,
     ) -> Result<Option<ConfigMatch>, CmdError> {
         if !self.visited.insert((dir.to_path_buf(), cps)) {
             return Ok(None);
         }
         if cps {
-            return self.in_cps_directory(cx, dir);
+            return self.in_cps_directory(cx, dir, trace);
         }
         for config in &self.configs {
             let file = dir.join(path::to_native(config));
+            trace.candidate(&file);
             if !is_file(cx, &file) {
                 continue;
             }
@@ -196,10 +225,12 @@ impl<'a> ConfigSearch<'a> {
         &mut self,
         cx: &mut Cx<'_>,
         dir: &Path,
+        trace: &mut SearchTrace,
     ) -> Result<Option<ConfigMatch>, CmdError> {
         let mut visited = BTreeSet::new();
         for filename in &self.cps_names {
             let file = dir.join(path::to_native(filename));
+            trace.candidate(&file);
             if !is_file(cx, &file) {
                 continue;
             }

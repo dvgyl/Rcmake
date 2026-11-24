@@ -1,3 +1,4 @@
+use rcmake_base::BString;
 use rcmake_eval::{Cx, Flow};
 
 use super::{Result, arg, error, permission};
@@ -54,6 +55,22 @@ pub(super) fn run(cx: &mut Cx<'_>, args: &[&[u8]]) -> Result {
             _ => return Err(error("Unknown argument to GENERATE subcommand.")),
         }
     }
-    crate::install::record_request(cx, "_RCMAKE_FILE_GENERATE", args);
+    let request = crate::install::record_request(cx, "_RCMAKE_FILE_GENERATE", args);
+    let backtrace = cx.backtrace();
+    let props = &mut cx.global().props;
+    for (index, frame) in backtrace.frames().enumerate() {
+        let key = format!("_RCMAKE_FILE_GENERATE_{request}_FRAME_{index}");
+        props.set(
+            format!("{key}_FILE").into(),
+            BString::from(frame.file.as_ref()),
+        );
+        props.set(format!("{key}_LINE").into(), frame.line.to_string().into());
+        if let Some(name) = &frame.name {
+            props.set(format!("{key}_NAME").into(), BString::from(name.as_ref()));
+        }
+        if frame.kind == rcmake_diag::FrameKind::Deferred {
+            props.set(format!("{key}_DEFERRED").into(), "1".into());
+        }
+    }
     Ok(Flow::Normal)
 }

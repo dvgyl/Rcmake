@@ -195,6 +195,18 @@ fn resolve_config(
         result => result?,
     };
     attach_links(&mut resolved, &mut inputs, links, std_id);
+    for (&id, facts) in &mut resolved {
+        if facts.cxx_modules.is_some()
+            && let (Some(target), Some(inputs)) = (model.target(id), inputs.get(&id))
+        {
+            let standard = inputs.standard_requirements.get(b"CXX".as_slice()).copied();
+            let responses =
+                lower::scan_responses(model, target, facts, standard, inputs.position_independent)?;
+            if let Some(modules) = &mut facts.cxx_modules {
+                modules.scan_responses = responses;
+            }
+        }
+    }
     let mut resolved = resolved.into_values().collect::<Vec<_>>();
     let mut ide_custom = IndexMap::new();
     let graph = lower::lower_with_inputs(

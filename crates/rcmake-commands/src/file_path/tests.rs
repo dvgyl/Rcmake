@@ -64,6 +64,32 @@ fn vars(interp: &mut Interp, expected: &[(&str, &str)]) {
 }
 
 #[test]
+fn file_configure_expands_inline_content_and_uses_requested_newlines() -> TestResult {
+    let (host, mut interp) = interpreter();
+    script(
+        &host,
+        &mut interp,
+        r#"
+set(VALUE [=[a"b
+c]=])
+file(CONFIGURE OUTPUT plain CONTENT [=[@VALUE@ ${VALUE}]=] @ONLY)
+file(CONFIGURE CONTENT [=[@VALUE@
+${VALUE}]=] OUTPUT line/ending ESCAPE_QUOTES NEWLINE_STYLE DOS)
+"#,
+    )?;
+    let range = ReadRange::All { limit: 1024 };
+    assert_eq!(
+        host.read(Path::new("/work/plain"), range)?,
+        b"a\"b\nc ${VALUE}"
+    );
+    assert_eq!(
+        host.read(Path::new("/work/line/ending"), range)?,
+        b"a\\\"b\nc\r\na\\\"b\nc\r\n"
+    );
+    Ok(())
+}
+
+#[test]
 fn path_decomposes_queries_and_compares() -> TestResult {
     let (host, mut interp) = interpreter();
     script(

@@ -1093,6 +1093,9 @@ fn custom_command_outputs_and_byproducts_are_sources_across_directories() -> Tes
     use rcmake_model::{CustomCommand, CustomCommandKind};
 
     let mut model = project();
+    let mut policies = rcmake_diag::PolicyMap::default();
+    policies.set(PolicyId::new(118), PolicyStatus::New)?;
+    model.dir_mut(DirId::ROOT).final_policies = Some(policies);
     let producer = model.add_directory(
         DirId::ROOT,
         "/src/gen".into(),
@@ -2232,17 +2235,17 @@ fn default_resolve_keeps_ninja_and_make_layouts() -> TestResult {
         (
             GeneratorKind::Ninja,
             "CMakeFiles/obj.dir/core.c.o",
-            "/out/app",
+            "/out/app.app/Contents/MacOS/app",
         ),
         (
             GeneratorKind::NinjaMultiConfig,
             "CMakeFiles/obj.dir/Debug/core.c.o",
-            "/out/Debug/app",
+            "/out/Debug/app.app/Contents/MacOS/app",
         ),
         (
             GeneratorKind::UnixMakefiles,
             "CMakeFiles/obj.dir/core.c.o",
-            "/out/app",
+            "/out/app.app/Contents/MacOS/app",
         ),
     ] {
         model.generator = Some(generator);

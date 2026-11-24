@@ -26,12 +26,13 @@ use crate::{
 };
 
 mod artifacts;
+mod compatible;
 mod host;
 mod link;
 #[cfg(test)]
 mod tests;
 
-pub use host::ModelGenexHost;
+pub use host::{ModelGenexHost, ObjectPaths};
 pub use link::{ResolvedLinkItem, ResolvedLinkKind, collect_link_items};
 
 use crate::ResolveError;
@@ -105,15 +106,16 @@ const MAX_WALK_DEPTH: usize = 128;
 pub struct UsageResolver<'a> {
     model: &'a ProjectModel,
     ide: Option<crate::ide::IdeFlavor>,
-    artifact_depth: usize,
+    artifact_properties: Vec<(TargetId, rcmake_genex::ConfigId, BString)>,
     source_paths: Option<&'a SourcePaths<'a>>,
-    ids: Vec<TargetId>,
+    ids: Arc<[TargetId]>,
     memo: HashMap<MemoKey<'static>, Arc<WalkValue>>,
     link_memo: HashMap<link::LinkMemoKey, link::SharedLinks>,
     debug_configs: Vec<BString>,
     active: Vec<(TargetId, BString)>,
     cycle_count: usize,
     has_injections: bool,
+    compatible: compatible::Properties,
 }
 
 impl<'a> UsageResolver<'a> {
@@ -123,7 +125,7 @@ impl<'a> UsageResolver<'a> {
         Self {
             model,
             ide: crate::ide::IdeFlavor::from_model(model),
-            artifact_depth: 0,
+            artifact_properties: Vec::new(),
             source_paths: None,
             ids: model.targets().map(|(id, _)| id).collect(),
             memo: HashMap::new(),
@@ -135,6 +137,7 @@ impl<'a> UsageResolver<'a> {
                 .map_or_else(Vec::new, |value| list::split(value, list::Empty::Drop)),
             active: Vec::new(),
             cycle_count: 0,
+            compatible: compatible::Properties::default(),
             has_injections: model.targets().any(|(_, target)| {
                 target.props.get(link::DIRECT).is_some()
                     || target.props.get(link::EXCLUDE).is_some()
@@ -147,6 +150,23 @@ impl<'a> UsageResolver<'a> {
             ide: paths.ide,
             source_paths: Some(paths),
             ..Self::new(model)
+        }
+    }
+
+    fn fork_for_artifacts(&self) -> Self {
+        Self {
+            model: self.model,
+            ide: self.ide,
+            artifact_properties: self.artifact_properties.clone(),
+            source_paths: None,
+            ids: Arc::clone(&self.ids),
+            memo: HashMap::new(),
+            link_memo: HashMap::new(),
+            debug_configs: self.debug_configs.clone(),
+            active: Vec::new(),
+            cycle_count: 0,
+            compatible: compatible::Properties::default(),
+            has_injections: self.has_injections,
         }
     }
 
@@ -221,6 +241,18 @@ impl<'a> UsageResolver<'a> {
         name: &[u8],
         ctx: &EvalContext,
     ) -> Result<UsageValue, ResolveError> {
+        if self
+            .active
+            .last()
+            .is_some_and(|(id, prop)| *id != target || prop != name)
+            && self
+                .active
+                .iter()
+                .any(|(id, prop)| *id == target && prop == name)
+        {
+            self.cycle_count += 1;
+            return Ok(UsageValue::default());
+        }
         let ctx = self.property_context(target, name, ctx)?;
         if matches!(name, b"LINK_LIBRARIES" | b"INTERFACE_LINK_LIBRARIES") {
             return self.link_property(target, name, &ctx);
@@ -535,9 +567,10 @@ impl<'a> UsageResolver<'a> {
         if link_edges || ctx.traversal == UsageTraversal::Compile {
             prepare_nodes(&mut ast.nodes, ctx.traversal, link_edges);
         }
+        let root = &self.model.dir(DirId::ROOT).source_dir;
         let mut host = self.host(dir);
         host.current = ctx.current;
-        Ok(evaluate(&ast, &ctx, &mut host)?)
+        evaluate(&ast, &ctx, &mut host).map_err(|error| error.at(&entry.backtrace, root).into())
     }
 
     /// Collect includes in search order and mark system paths.

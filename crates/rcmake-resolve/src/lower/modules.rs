@@ -79,13 +79,14 @@ pub fn lower_modules(
     model: &ProjectModel,
     target: &ResolvedTarget,
 ) -> Result<Vec<BuildStep>, ResolveError> {
-    lower_modules_with_standard(model, target, None)
+    lower_modules_with_standard(model, target, None, None)
 }
 
 pub(super) fn lower_modules_with_standard(
     model: &ProjectModel,
     resolved: &ResolvedTarget,
     standard: Option<&[u8]>,
+    position_independent: Option<bool>,
 ) -> Result<Vec<BuildStep>, ResolveError> {
     if !resolved.compile_units.iter().any(|unit| unit.scan) {
         return Ok(Vec::new());
@@ -224,6 +225,7 @@ pub(super) fn lower_modules_with_standard(
             group,
             standard,
             &unit.source.value,
+            position_independent,
         );
         let step = scan(
             model,
@@ -268,6 +270,7 @@ pub(crate) fn scan_responses(
     target: &Target,
     resolved: &ResolvedTarget,
     standard: Option<&[u8]>,
+    position_independent: Option<bool>,
 ) -> Result<IndexMap<BString, ScanResponse>, ResolveError> {
     let mut responses = IndexMap::new();
     if !matches!(
@@ -293,6 +296,7 @@ pub(crate) fn scan_responses(
             group,
             standard,
             &unit.source.value,
+            position_independent,
         );
         let arguments = [defines, includes, join_words(flags)]
             .iter()

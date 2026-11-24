@@ -156,6 +156,17 @@ fn lower_install_rules<E>(
         let options = &rule.options;
         let recorded = recorded_args(model, index);
         let source = &model.dir(rule.dir).source_dir;
+        let message = model
+            .global
+            .props
+            .get(format!("_RCMAKE_INSTALL_{index}_MESSAGE").as_bytes());
+        let make_action = |options: &InstallOptions, destination: &[u8], kind| {
+            let mut action = action(model, rule, options, destination, kind);
+            if let Some(message) = message {
+                action.message.clone_from(message);
+            }
+            action
+        };
         let kind = match &rule.kind {
             InstallKind::Targets { targets: ids, .. } => {
                 let groups = target_options(&recorded);
@@ -228,9 +239,7 @@ fn lower_install_rules<E>(
                                 None
                             };
                             let files = files.into_iter().map(|path| join(bin, path)).collect();
-                            let action = action(
-                                model,
-                                rule,
+                            let action = make_action(
                                 &options,
                                 default,
                                 file_action(file_type, files, &options),
@@ -248,9 +257,7 @@ fn lower_install_rules<E>(
                         if let Some((component, file)) = namelink {
                             options.component = Some(component.into());
                             let kind = file_action(file_type, vec![file], &options);
-                            manifest
-                                .actions
-                                .push(action(model, rule, &options, default, kind));
+                            manifest.actions.push(make_action(&options, default, kind));
                         }
                     }
                     if matches!(
@@ -321,9 +328,7 @@ fn lower_install_rules<E>(
                                     }
                                 }
                                 let kind = file_action(b"FILE", files.clone(), &options);
-                                manifest
-                                    .actions
-                                    .push(action(model, rule, &options, default, kind));
+                                manifest.actions.push(make_action(&options, default, kind));
                             }
                         }
                     }
@@ -367,9 +372,7 @@ fn lower_install_rules<E>(
                         InstallKind::Programs(_) => file_action(b"PROGRAM", files, &options),
                         _ => file_action(b"FILE", files, &options),
                     };
-                    manifest
-                        .actions
-                        .push(action(model, rule, &options, b"", kind));
+                    manifest.actions.push(make_action(&options, b"", kind));
                 }
                 continue;
             }
@@ -383,9 +386,7 @@ fn lower_install_rules<E>(
             // CPS and SBOM files do not have install actions yet.
             InstallKind::PackageInfo(_) | InstallKind::Sbom(_) => continue,
         };
-        manifest
-            .actions
-            .push(action(model, rule, options, b"", kind));
+        manifest.actions.push(make_action(options, b"", kind));
     }
     Ok(manifest)
 }
@@ -435,6 +436,7 @@ fn action(
         configurations: options.configurations.clone(),
         kind,
         optional: options.optional,
+        message: BString::default(),
     }
 }
 

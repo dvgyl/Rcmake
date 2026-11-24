@@ -121,7 +121,7 @@ fn single_config_writes_rules_edges_and_utilities() {
         "  depfile = a$ $$$:file.d",
         "  pool = console",
         "  pool = slow",
-        "build obj/a$ $$$:file.o: COMPILE_DEPFILE /work/src/a$ $$$:file.c || generate",
+        "build obj/a$ $$$:file.o: COMPILE_DEPFILE /work/src/a$ $$$:file.c || generated$ $$$:file",
         "  DEP_FILE = obj/a$ $$$:file.d",
         "build libshared.so: LINK_SHARED_LIBRARY obj/a$ $$$:file.o",
         "  DESC = Linking$ C$ shared$ library$ libshared.so",
@@ -323,7 +323,7 @@ fn target_dependencies_use_the_library_when_its_name_matches_an_executable_outpu
         let suffix = config.map_or("", |_| "$:Debug");
         for line in [
             format!("build {library_alias}: phony libsqlite3.a"),
-            format!("build shell.o: COMPILE shell.c || {library_alias}"),
+            "build shell.o: COMPILE shell.c".to_owned(),
             format!("build {executable_node}: LINK_EXECUTABLE shell.o libsqlite3.a"),
             format!("build all{suffix}: phony {library_alias} sqlite_shell{suffix}"),
         ] {
@@ -451,11 +451,12 @@ fn multi_config_uses_config_order_or_host_default() {
         assert!(entry.contains(&format!("include CMakeFiles/impl-{config}.ninja")));
         assert!(entry.contains(&format!("build all: phony all$:{config}")));
         assert!(entry.contains(&format!("build app: phony app$:{config}")));
-        assert!(entry.contains(&format!("ninja$ -f$ build-{config}.ninja$ -t$ clean")));
+        assert!(entry.contains(&format!("build clean: phony clean$:{config}")));
         assert!(entry.ends_with("default all\n"));
         let implementation = read(&host, &format!("CMakeFiles/impl-{config}.ninja"));
         assert!(implementation.starts_with("include CMakeFiles/rules.ninja\n"));
         assert!(implementation.contains(&format!("build app$:{config}: phony\n")));
+        assert!(implementation.contains(&format!("build clean$:{config}: CLEAN\n")));
         assert!(implementation.contains(&format!("build all$:{config}: phony app$:{config}")));
     }
 }
@@ -735,6 +736,7 @@ fn prep_targets_preserve_user_outputs_and_select_dependencies()
                 permissions: vec![],
             },
             optional: false,
+            message: BString::default(),
         });
     }
     super::generate_single_config_with_model(&result, &host, dir, &model)?;

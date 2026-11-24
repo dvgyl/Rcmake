@@ -115,6 +115,7 @@ fn action(destination: BString, kind: InstallActionKind) -> InstallAction {
         configurations: vec!["Debug".into(), "Rel.With+Info".into()],
         kind,
         optional: false,
+        message: BString::default(),
     }
 }
 

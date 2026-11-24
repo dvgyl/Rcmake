@@ -60,6 +60,19 @@ impl TargetKind {
         )
     }
 
+    /// Whether this target kind can produce object files.
+    #[must_use]
+    pub const fn compiles_objects(self) -> bool {
+        matches!(
+            self,
+            Self::Executable
+                | Self::StaticLibrary
+                | Self::SharedLibrary
+                | Self::ModuleLibrary
+                | Self::ObjectLibrary
+        )
+    }
+
     /// `true` if `PRIVATE` link dependencies propagate as `$<LINK_ONLY:...>` (ADR-007).
     #[must_use]
     pub const fn propagates_private_links(self) -> bool {

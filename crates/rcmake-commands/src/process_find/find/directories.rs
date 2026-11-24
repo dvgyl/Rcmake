@@ -5,7 +5,10 @@ use rcmake_base::BString;
 use rcmake_eval::Cx;
 use rcmake_host::path;
 
-use super::super::search_paths::{BUILD_ENV_SEPARATOR, cmake_paths, env_paths, relative_suffix};
+use super::super::{
+    find_package::PACKAGE_ROOTS,
+    search_paths::{BUILD_ENV_SEPARATOR, cmake_paths, env_paths, relative_suffix},
+};
 use super::{Kind, Options, use_default};
 
 impl Kind {
@@ -45,6 +48,13 @@ pub(super) fn directories(cx: &Cx<'_>, kind: Kind, options: &Options) -> Vec<Pat
     let mut paths = Vec::new();
     let library = matches!(kind, Kind::Library);
 
+    if use_default(
+        cx,
+        options.no_defaults || options.no_package_root,
+        b"CMAKE_FIND_USE_PACKAGE_ROOT_PATH",
+    ) {
+        add_prefixes(cx, &mut paths, cmake_paths(cx, PACKAGE_ROOTS), &variables);
+    }
     if use_default(
         cx,
         options.no_defaults || options.no_cmake,

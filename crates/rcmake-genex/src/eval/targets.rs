@@ -131,6 +131,16 @@ impl Evaluator<'_> {
             b"TARGET_POLICY" => self.policy(call),
             b"TARGET_PROPERTY" => self.property(call),
             b"TARGET_OBJECTS" => self.objects(call),
+            b"TARGET_INTERMEDIATE_DIR" => {
+                let [name] = self.fixed(call)?;
+                if !valid_target(&name) {
+                    return Err(call.error("Target name not supported."));
+                }
+                let target = self.require_target(call, &name)?;
+                self.host.target_intermediate_directory(target, &call.ctx.config).ok_or_else(|| {
+                    call.error("The evaluation of the TARGET_INTERMEDIATE_DIR generator expression is only suitable for consumption by CMake (limited under Xcode with multiple architectures).  It is not suitable for writing out elsewhere.")
+                })
+            }
             _ => self.artifact(call),
         }
     }
@@ -143,7 +153,18 @@ impl Evaluator<'_> {
         self.flags.context_sensitive = true;
         self.host
             .find_target_in_context(name, call.ctx)
-            .ok_or_else(|| call.error(format!("No target \"{}\".", BString::from(name))))
+            .ok_or_else(|| {
+                let name = BString::from(name);
+                call.error(match call.name {
+                    b"TARGET_PROPERTY" | b"TARGET_INTERMEDIATE_DIR" => {
+                        format!("Target \"{name}\" not found.")
+                    }
+                    b"TARGET_OBJECTS" => format!(
+                        "Objects of target \"{name}\" referenced but no such target exists."
+                    ),
+                    _ => format!("No target \"{name}\""),
+                })
+            })
     }
 
     fn policy(&mut self, call: Call<'_>) -> Value {
@@ -185,6 +206,10 @@ impl Evaluator<'_> {
                 if !valid_target(name) {
                     return Err(call.error("Target name not supported."));
                 }
+                if let Some(value) = self.host.alias_property(name, property, call.ctx) {
+                    self.flags.context_sensitive = true;
+                    return Ok(value);
+                }
                 (self.require_target(call, name)?, property)
             }
             _ => {
@@ -205,14 +230,27 @@ impl Evaluator<'_> {
             return Err(call.error("Property name not supported."));
         }
         if !self.transitive(target, property) {
-            return Ok(self.host.raw_property(target, property).unwrap_or_default());
+            let view = self.host.scalar_property(target, property, call.ctx)?;
+            self.flags = self.flags.union(view.flags);
+            return Ok(view.value);
         }
 
         let limit = self.limits.max_recursion;
         let _active = match DAGChecker::enter(Some(target), FrameKind::Property, property, limit)? {
             DAGEntry::Entered(active) => active,
-            DAGEntry::SelfReference => return Err(self.self_reference(Some(target))),
-            DAGEntry::CyclicReference => return Ok(BString::default()),
+            DAGEntry::SelfReference
+                if call.ctx.site.property.is_none()
+                    || (call.ctx.current == Some(target)
+                        && call.ctx.site.property.as_ref() == Some(property)) =>
+            {
+                let error = self.self_reference(Some(target));
+                return Err(if call.ctx.site.backtrace.is_empty() {
+                    error
+                } else {
+                    call.error(error.to_string())
+                });
+            }
+            DAGEntry::SelfReference | DAGEntry::CyclicReference => return Ok(BString::default()),
         };
         let view = self.host.transitive_property(target, property, call.ctx)?;
         self.flags = self.flags.union(view.flags);
@@ -229,7 +267,8 @@ impl Evaluator<'_> {
         let base = property.strip_prefix(b"INTERFACE_").unwrap_or(property);
         matches!(
             base,
-            b"AUTOUIC_OPTIONS"
+            b"AUTOMOC_MACRO_NAMES"
+                | b"AUTOUIC_OPTIONS"
                 | b"COMPILE_DEFINITIONS"
                 | b"COMPILE_FEATURES"
                 | b"COMPILE_OPTIONS"
@@ -244,7 +283,6 @@ impl Evaluator<'_> {
                 | b"PRECOMPILE_HEADERS"
                 | b"SOURCES"
                 | b"SYSTEM_INCLUDE_DIRECTORIES"
-                | b"POSITION_INDEPENDENT_CODE"
         ) || [
             b"TRANSITIVE_COMPILE_PROPERTIES".as_slice(),
             b"TRANSITIVE_LINK_PROPERTIES",
@@ -278,7 +316,7 @@ impl Evaluator<'_> {
             self.host
                 .artifact_base_name_without_postfix(target, kind, config)
         } else {
-            self.host.artifact(target, kind, part, config)
+            self.host.checked_artifact(target, kind, part, config)?
         };
         value.ok_or_else(|| {
             call.error(format!(
@@ -305,7 +343,7 @@ impl Evaluator<'_> {
             .target_objects(target, &call.ctx.config, sources)
             .ok_or_else(|| {
                 call.error(format!(
-                    "Objects of target \"{name}\" referenced but no objects are available."
+                    "Objects of target \"{name}\" referenced but is not one of the allowed target types (EXECUTABLE, STATIC, SHARED, MODULE, OBJECT)."
                 ))
             })
     }

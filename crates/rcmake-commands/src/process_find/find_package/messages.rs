@@ -1,5 +1,5 @@
 use rcmake_base::BString;
-use rcmake_diag::{Effect, MessageKind};
+use rcmake_diag::{DiagCategory, Effect, MessageKind};
 use rcmake_eval::{CmdError, Cx};
 
 use super::config::ConfigSearch;
@@ -18,6 +18,21 @@ pub(super) fn report_missing(
         cx.issue(MessageKind::Warning, Effect::None, None, message);
     }
     Ok(())
+}
+
+pub(super) fn warn_module_path(cx: &mut Cx<'_>, name: &[u8]) {
+    cx.issue(
+        MessageKind::AuthorWarning,
+        Effect::None,
+        Some(DiagCategory::Author),
+        text(&[
+            b"Find",
+            name,
+            b".cmake must either be part of this project itself, in this case adjust CMAKE_MODULE_PATH so that it points to the correct location inside its source tree.\n\nOr it must be installed by a package which has already been found via find_package().  In this case make sure that package has indeed been found and adjust CMAKE_MODULE_PATH to contain the location where that package has installed Find",
+            name,
+            b".cmake.  This must be a location provided by that package.  This error in general means that the buildsystem of this project is relying on a Find-module without ensuring that it is actually available.\n",
+        ]),
+    );
 }
 
 impl ConfigSearch<'_> {
@@ -106,7 +121,7 @@ impl ConfigSearch<'_> {
             name,
             b"_DIR\" to a directory containing one of the above files.  If \"",
             name,
-            b"\" provides a separate development package or SDK, be sure it has been installed.\n",
+            b"\" provides a separate development package or SDK, be sure it has been installed.",
         ])
     }
 }

@@ -5,12 +5,13 @@ use std::time::Duration;
 
 use rcmake_base::BString;
 use rcmake_build::BuildOutcome;
+use rcmake_diag::{DiagCategory, Effect, MessageKind};
 use rcmake_eval::{CmdError, CmdResult, Cx, Flow, Interp, InterpConfig, RunMode};
 use rcmake_expr::ExpandedArg;
 use rcmake_host::{CopyOptions, Host, HostError, path};
 use rcmake_model::{CacheEntry, CacheType, DirId};
 
-use args::{Options, Signature, parse, required};
+use args::{Options, Signature, parse};
 use capture::CapturingHost;
 use log::log_probe;
 use project::write_project;
@@ -45,6 +46,11 @@ fn error_text(error: impl std::fmt::Display) -> CmdError {
     CmdError::status(error.to_string())
 }
 
+fn probe_error(cx: &mut Cx<'_>, message: impl Into<BString>) -> CmdError {
+    cx.issue(MessageKind::Error, Effect::SetError, None, message.into());
+    CmdError::Reported
+}
+
 struct ProbeDirs {
     source: PathBuf,
     binary: PathBuf,
@@ -52,14 +58,14 @@ struct ProbeDirs {
 }
 
 impl ProbeDirs {
-    fn create(cx: &Cx<'_>, signature: &Signature<'_>) -> Result<Self, CmdError> {
+    fn create(cx: &mut Cx<'_>, signature: &Signature<'_>) -> Result<Self, CmdError> {
         match signature {
             Signature::Project {
                 source,
                 binary: Some(binary),
                 ..
             } => {
-                let binary = explicit_binary_dir(binary)?;
+                let binary = explicit_binary_dir(cx, binary)?;
                 let source = absolute(&binary, source);
                 if binary == path::to_native(&cx.var_or_empty(b"CMAKE_BINARY_DIR")) {
                     return Err(CmdError::status(
@@ -75,7 +81,7 @@ impl ProbeDirs {
             Signature::Sources {
                 base: Some(base), ..
             } => {
-                let dir = explicit_binary_dir(base)?.join("CMakeFiles/CMakeTmp");
+                let dir = explicit_binary_dir(cx, base)?.join("CMakeFiles/CMakeTmp");
                 make_scratch(cx.host(), &dir)?;
                 Ok(Self {
                     source: dir.clone(),
@@ -128,13 +134,16 @@ fn make_scratch(host: &dyn Host, dir: &Path) -> Result<(), CmdError> {
     Ok(())
 }
 
-fn explicit_binary_dir(value: &[u8]) -> Result<PathBuf, CmdError> {
+fn explicit_binary_dir(cx: &mut Cx<'_>, value: &[u8]) -> Result<PathBuf, CmdError> {
+    if value.is_empty() {
+        return Err(probe_error(cx, "No <bindir> specified."));
+    }
     let dir = path::to_native(value);
     if !dir.is_absolute() {
-        return Err(CmdError::status(format!(
-            "The test build directory must be an absolute path: {}",
-            dir.display()
-        )));
+        return Err(probe_error(
+            cx,
+            [b"<bindir> is not an absolute path:\n\n '", value, b"'"].concat(),
+        ));
     }
     Ok(absolute(Path::new("/"), value))
 }
@@ -145,14 +154,45 @@ fn absolute(base: &Path, value: &[u8]) -> PathBuf {
 }
 
 fn probe(cx: &mut Cx<'_>, args: &[ExpandedArg], run: bool) -> CmdResult {
-    let mut args = args.iter().map(|arg| arg.value.as_slice());
-    let run_var = if run {
-        Some(required(&mut args, b"Run result")?)
-    } else {
-        None
+    let (run_var, build_var, first, rest) = match (run, args) {
+        (true, [run_var, build_var, first, next, rest @ ..]) => {
+            (Some(run_var), build_var, first, (next, rest))
+        }
+        (false, [build_var, first, next, rest @ ..]) => (None, build_var, first, (next, rest)),
+        (true, _) => {
+            return Err(probe_error(
+                cx,
+                "The try_run() command requires at least 4 arguments.",
+            ));
+        }
+        (false, _) => {
+            return Err(probe_error(
+                cx,
+                "The try_compile() command requires at least 3 arguments.",
+            ));
+        }
     };
-    let build_var = required(&mut args, b"Compile result")?;
-    let (signature, options) = parse(args, run)?;
+    let args = std::iter::once(rest.0)
+        .chain(rest.1)
+        .map(|arg| arg.value.as_slice());
+    let build_var = build_var.value.as_slice();
+    let run_var = run_var.map(|arg| arg.value.as_slice());
+    let (signature, options) =
+        parse(&first.value, args, run).map_err(|message| probe_error(cx, message))?;
+    if !options.unknown.is_empty() {
+        let mut message = BString::from("Unknown arguments:\n");
+        for arg in &options.unknown {
+            message.extend_from_slice(b"\n  \"");
+            message.extend_from_slice(arg);
+            message.push(b'"');
+        }
+        cx.issue(
+            MessageKind::AuthorWarning,
+            Effect::None,
+            Some(DiagCategory::Author),
+            message,
+        );
+    }
     let depth = PROBE_DEPTH.get();
     if depth >= 2 {
         return Err(CmdError::status("The try_compile nesting limit is two."));
@@ -181,6 +221,12 @@ fn build_probe(
     build_var: &[u8],
     run_var: Option<&[u8]>,
 ) -> Result<(), CmdError> {
+    let source_signature = matches!(signature, Signature::Sources { .. });
+    let imports = if source_signature {
+        probe_imports(cx, options)?
+    } else {
+        Vec::new()
+    };
     let target = match signature {
         Signature::Sources { sources, .. } => {
             write_project(cx, options, sources, &dirs.source, run_var.is_some())?;
@@ -188,16 +234,12 @@ fn build_probe(
         }
         Signature::Project { target, .. } => *target,
     };
-    let seed = TryCompileSeed::new(cx, options);
+    let seed = TryCompileSeed::new(cx, options, source_signature);
     let cmake_root = path::to_native(&cx.var_or_empty(b"CMAKE_ROOT"));
     let cmake_command = path::to_native(&cx.var_or_empty(b"CMAKE_COMMAND"));
     let limits = cx.limits().clone();
     let trace = cx.trace_config().cloned();
     let generator = cx.project().generator;
-    let imports = match signature {
-        Signature::Sources { .. } => probe_imports(cx, options),
-        Signature::Project { .. } => Vec::new(),
-    };
     let (build, mut output) = CapturingHost::capture(cx.host(), &dirs.binary, |host| {
         let mut child = Interp::new(
             InterpConfig {
@@ -248,7 +290,7 @@ fn build_probe(
                 None,
             ));
         }
-        build_child(&mut child.cx(), &dirs.binary, target)
+        build_child(&mut child.cx(), &dirs.binary, target, source_signature)
     })
     .map_err(error_text)?;
     let (outcome, artifact) = match build {
@@ -285,7 +327,6 @@ fn build_probe(
     {
         Some(run_executable(
             cx,
-            signature,
             options,
             artifact.as_deref(),
             var,

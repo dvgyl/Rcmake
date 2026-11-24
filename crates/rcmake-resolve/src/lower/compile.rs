@@ -92,13 +92,14 @@ fn compile_flags(
     config: &ConfigId,
     group: &CompileGroup,
     required_standard: Option<&[u8]>,
+    position_independent: Option<bool>,
 ) -> Vec<BString> {
     let language = group.language.as_slice();
     let mut flags = language_flags(model, target, config, language);
     flags.extend(standard_flag(model, target, language, required_standard));
     flags.extend(apple_flags(model, target, config, language));
     let policy = Flags::new(model, target, language);
-    flags.extend(policy.compile(policy.ipo(config)));
+    flags.extend(policy.compile(policy.ipo(config), position_independent));
 
     let preset_key = [language, b"_VISIBILITY_PRESET"].concat();
     if let Some(preset) = target_property(model, target, &preset_key).filter(|p| !p.is_empty()) {
@@ -173,9 +174,17 @@ pub(super) fn compile_arguments(
     group: &CompileGroup,
     required_standard: Option<&[u8]>,
     source: &[u8],
+    position_independent: Option<bool>,
 ) -> (Vec<BString>, BString, BString) {
     let language = group.language.as_slice();
-    let mut flags = compile_flags(model, target, config, group, required_standard);
+    let mut flags = compile_flags(
+        model,
+        target,
+        config,
+        group,
+        required_standard,
+        position_independent,
+    );
     let mut defines: Vec<_> = group
         .defines
         .iter()
@@ -215,6 +224,7 @@ pub(super) fn compile_arguments(
 pub(super) struct Settings<'a> {
     pub(super) standard: Option<&'a [u8]>,
     pub(super) pch: Option<PchFlags<'a>>,
+    pub(super) position_independent: Option<bool>,
 }
 
 pub(super) fn compile(
@@ -228,8 +238,15 @@ pub(super) fn compile(
 ) -> Result<BuildStep, ResolveError> {
     let language = group.language.as_slice();
     let source = join(&model.dir(target.dir).source_dir, &unit.source.value);
-    let (mut flags, defines, includes) =
-        compile_arguments(model, target, config, group, settings.standard, &source);
+    let (mut flags, defines, includes) = compile_arguments(
+        model,
+        target,
+        config,
+        group,
+        settings.standard,
+        &source,
+        settings.position_independent,
+    );
     if let Some(pch) = settings.pch {
         flags.extend(pch.options(model, target, language));
     }

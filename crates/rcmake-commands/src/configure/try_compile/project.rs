@@ -6,7 +6,8 @@ use rcmake_expr::ExpandedArg;
 use rcmake_host::{Host, WriteMode, path};
 
 use super::args::{Options, Source};
-use super::{absolute, error_text, split_byte};
+use super::seed::enabled_languages;
+use super::{absolute, error_text, probe_error, split_byte};
 
 pub(super) fn write_project(
     cx: &mut Cx<'_>,
@@ -20,13 +21,15 @@ pub(super) fn write_project(
         (true, _) | (_, b"" | b"EXECUTABLE") => false,
         (_, b"STATIC_LIBRARY") => true,
         _ => {
-            return Err(CmdError::status(
-                "CMAKE_TRY_COMPILE_TARGET_TYPE must be EXECUTABLE or STATIC_LIBRARY.",
+            return Err(probe_error(
+                cx,
+                [b"Invalid value '".as_slice(), &target_type, b"' for CMAKE_TRY_COMPILE_TARGET_TYPE.  Only 'EXECUTABLE' and 'STATIC_LIBRARY' are allowed."].concat(),
             ));
         }
     };
     let mut files = Vec::new();
     let mut languages = Vec::new();
+    let enabled = enabled_languages(cx);
     for &source in sources {
         let file = match source {
             Source::File(file) => absolute(directory, file),
@@ -45,30 +48,57 @@ pub(super) fn write_project(
                             limit: cx.limits().max_file_read,
                         },
                     )
-                    .map_err(error_text)?;
+                    .map_err(|error| source_copy_error(cx, file, &error))?;
                 cx.host()
                     .write(&target, &contents, WriteMode::CreateNew)
-                    .map_err(error_text)?;
+                    .map_err(|error| source_copy_error(cx, file, &error))?;
                 target
             }
         };
-        if let Some(language) = source_language(&file)
-            && !languages.contains(&language)
-        {
+        let file_path = path::from_native(&file);
+        let Some(language) = source_language(cx, &file, &enabled) else {
+            let source_name = if let Source::File(name) = source {
+                name
+            } else {
+                &file_path
+            };
+            let extension = file.extension().map_or_else(Vec::new, |value| {
+                [b".".as_slice(), value.as_encoded_bytes()].concat()
+            });
+            let message = [
+                b"Unknown extension \"".as_slice(),
+                &extension,
+                b"\" for file\n\n  ",
+                source_name,
+                b"\n\ntry_compile() works only for enabled languages.  Currently these are:\n\n  ",
+                &enabled
+                    .iter()
+                    .map(|language| language.as_slice())
+                    .collect::<Vec<_>>()
+                    .join(b" ".as_slice()),
+                b"\n\nSee project() command to enable other languages.",
+            ]
+            .concat();
+            return Err(probe_error(cx, message));
+        };
+        if !languages.contains(&language) {
             languages.push(language);
         }
-        files.push(path::from_native(&file));
+        if matches!(source, Source::File(_)) && !file.starts_with(directory) {
+            let dir = cx.current_dir_id();
+            let inputs = &mut cx.project().dir_mut(dir).listfiles;
+            if !inputs.contains(&file_path) {
+                inputs.push(file_path.clone());
+            }
+        }
+        files.push(file_path);
     }
     let language = options.one(b"LINKER_LANGUAGE");
-    if let Some(known @ (b"C" | b"CXX")) = language
-        && !languages.contains(&known)
+    if let Some(language) = language
+        && enabled.iter().any(|item| item == language)
+        && !languages.contains(&language)
     {
-        languages.push(known);
-    }
-    if languages.is_empty() {
-        return Err(CmdError::status(
-            "The probe requires a C or C++ source file.",
-        ));
+        languages.push(language);
     }
 
     let compile_flags: Vec<_> = options
@@ -93,6 +123,19 @@ pub(super) fn write_project(
             WriteMode::CreateNew,
         )
         .map_err(error_text)
+}
+
+fn source_copy_error(cx: &mut Cx<'_>, file: &[u8], error: &rcmake_host::HostError) -> CmdError {
+    probe_error(
+        cx,
+        [
+            b"SOURCE_FROM_FILE failed to copy \"".as_slice(),
+            file,
+            b"\": ",
+            error.os_message.as_bytes(),
+        ]
+        .concat(),
+    )
 }
 
 struct ProjectInputs<'a> {
@@ -238,12 +281,43 @@ fn write_bracket_arg(code: &mut BString, arg: &[u8]) {
     code.extend_from_slice(&delimiter);
 }
 
-fn source_language(file: &Path) -> Option<&'static [u8]> {
-    match file.extension()?.as_encoded_bytes() {
-        b"c" => Some(b"C"),
-        b"C" | b"cc" | b"cpp" | b"cxx" | b"c++" | b"CPP" | b"ixx" | b"cppm" => Some(b"CXX"),
-        _ => None,
-    }
+fn source_language<'a>(cx: &mut Cx<'_>, file: &Path, enabled: &'a [BString]) -> Option<&'a [u8]> {
+    let extension = file.extension()?.as_encoded_bytes();
+    enabled
+        .iter()
+        .rev()
+        .map(|language| language.as_slice())
+        .find(|language| {
+            let name = [b"CMAKE_".as_slice(), language, b"_SOURCE_FILE_EXTENSIONS"].concat();
+            if let Some(configured) = cx.var(&name) {
+                return list::split(&configured, list::Empty::Drop)
+                    .iter()
+                    .any(|item| item == extension);
+            }
+            match *language {
+                b"C" => extension == b"c",
+                b"CXX" => matches!(
+                    extension,
+                    b"C" | b"cc"
+                        | b"cpp"
+                        | b"cxx"
+                        | b"c++"
+                        | b"CPP"
+                        | b"ixx"
+                        | b"cppm"
+                        | b"ccm"
+                        | b"cxxm"
+                        | b"c++m"
+                        | b"M"
+                        | b"m"
+                        | b"mm"
+                        | b"mpp"
+                ),
+                b"OBJC" => extension == b"m",
+                b"OBJCXX" => matches!(extension, b"M" | b"m" | b"mm"),
+                _ => false,
+            }
+        })
 }
 
 fn compile_definition_words(cx: &mut Cx<'_>, value: &[u8]) -> Vec<BString> {

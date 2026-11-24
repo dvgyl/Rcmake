@@ -275,7 +275,13 @@ impl<'a> TargetPlan<'a> {
         let cxx_standard = self
             .inputs
             .and_then(|inputs| inputs.standard_requirements.get(b"CXX".as_slice()).copied());
-        for step in super::modules::lower_modules_with_standard(model, resolved, cxx_standard)? {
+        let position_independent = self.inputs.and_then(|inputs| inputs.position_independent);
+        for step in super::modules::lower_modules_with_standard(
+            model,
+            resolved,
+            cxx_standard,
+            position_independent,
+        )? {
             self.steps.insert(push(graph_steps, step));
         }
         let mut pch_languages = IndexSet::new();
@@ -315,6 +321,7 @@ impl<'a> TargetPlan<'a> {
                         Settings {
                             standard: required_standard,
                             pch: Some(PchFlags::Create(plan)),
+                            position_independent,
                         },
                     )?;
                     let mut requires = vec![plan.header.clone()];
@@ -341,6 +348,7 @@ impl<'a> TargetPlan<'a> {
                 Settings {
                     standard: required_standard,
                     pch: pch.map(|(_, plan)| PchFlags::Use(plan)),
+                    position_independent,
                 },
             )?;
             if let BuildStep::Compile { object, dyndep, .. } = &mut step {
@@ -392,7 +400,16 @@ impl<'a> TargetPlan<'a> {
                 &mut self.dependencies,
                 self.ide_steps.as_mut(),
             )?;
-            let link = link(model, target, config, artifacts, step, objects)?;
+            let position_independent = self.inputs.and_then(|inputs| inputs.position_independent);
+            let link = link(
+                model,
+                target,
+                config,
+                artifacts,
+                step,
+                objects,
+                position_independent,
+            )?;
             let link = attach_link_events(model, artifacts, link, before, after);
             self.steps.insert(push(graph_steps, link));
         } else {

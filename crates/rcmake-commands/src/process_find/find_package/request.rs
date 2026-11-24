@@ -70,7 +70,7 @@ impl Request {
                 b"REGISTRY_VIEW" => {
                     let Some(view) = args.next().map(|arg| &arg.value) else {
                         return Err(CmdError::status(
-                            "find_package given REGISTRY_VIEW without a value",
+                            "missing required argument for REGISTRY_VIEW",
                         ));
                     };
                     if !matches!(
@@ -78,7 +78,6 @@ impl Request {
                         b"64" | b"32" | b"64_32" | b"32_64" | b"HOST" | b"TARGET" | b"BOTH"
                     ) {
                         return Err(CmdError::status(text(&[
-                            b"find_package ",
                             b"given invalid value for REGISTRY_VIEW: ",
                             view,
                         ])));
@@ -121,16 +120,14 @@ impl Request {
         }
 
         if request.required && request.optional {
-            return Err(CmdError::status(
-                "find_package cannot be both REQUIRED and OPTIONAL.",
-            ));
+            return Err(CmdError::status("cannot be both REQUIRED and OPTIONAL"));
         }
         if request.module && !request.config_options.is_empty() {
             let options = list_lines(request.config_options.iter());
-            return Err(CmdError::status(text(&[b"find_package ",
+            return Err(CmdError::status(text(&[
                 b"given options exclusive to Module mode:\n\n    MODULE\n\nand options exclusive to Config mode:\n",
                 &options,
-                b"\nThe options are incompatible.\n",
+                b"\nThe options are incompatible.",
             ])));
         }
         let required: BTreeSet<_> = request
@@ -143,7 +140,6 @@ impl Request {
         }));
         if !overlap.is_empty() {
             return Err(CmdError::status(text(&[
-                b"find_package ",
                 b"called with components that are both required and optional:\n",
                 &overlap,
                 b"\n",
@@ -166,7 +162,7 @@ impl Request {
                 let filename = path::to_native(value);
                 if filename.file_name() != Some(filename.as_os_str()) || !value.ends_with(b".cmake")
                 {
-                    return Err(CmdError::status(text(&[b"find_package ",
+                    return Err(CmdError::status(text(&[
                         b"given CONFIGS option followed by invalid file name \"", value,
                         b"\".  The names given must be file names without a path and with a \".cmake\" extension.",
                     ])));
@@ -225,12 +221,7 @@ fn search_source(key: &[u8]) -> Option<&'static [u8]> {
 }
 
 fn invalid_argument(value: &[u8]) -> CmdError {
-    CmdError::status(text(&[
-        b"find_package ",
-        b"called with invalid argument \"",
-        value,
-        b"\"",
-    ]))
+    CmdError::status(text(&[b"called with invalid argument \"", value, b"\""]))
 }
 
 pub(super) fn list_lines<'a>(values: impl IntoIterator<Item = &'a BString>) -> BString {
@@ -266,9 +257,7 @@ impl VersionRequest {
             }
             let order = version::compare(min, max);
             if order.is_gt() || exclusive && order.is_eq() {
-                return Err(CmdError::status(
-                    "find_package specified version range is empty.\n",
-                ));
+                return Err(CmdError::status("specified version range is empty."));
             }
             Ok(Self {
                 full: full.clone(),

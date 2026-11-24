@@ -39,7 +39,6 @@ pub(super) fn run(cx: &mut Cx<'_>, command: &[u8], args: &[&[u8]]) -> Result {
                     [
                         b"SIZE requested of path that is not readable:\n\n  ".as_slice(),
                         input,
-                        b"\n",
                     ]
                     .concat(),
                 )),
@@ -70,6 +69,41 @@ pub(super) fn run(cx: &mut Cx<'_>, command: &[u8], args: &[&[u8]]) -> Result {
         }
         _ => Err(error("SIZE must be called with exactly two arguments.")),
     }
+}
+
+pub(super) fn different(cx: &mut Cx<'_>, args: &[&[u8]]) -> Result {
+    let [out, options @ ..] = args else {
+        return Err(error("DIFFERENT not given result variable name."));
+    };
+    let mut options = options.iter().copied();
+    let mut files = None;
+    while let Some(option) = options.next() {
+        if option != b"FILES" {
+            return Err(error(
+                [b"DIFFERENT given unknown argument ".as_slice(), option].concat(),
+            ));
+        }
+        files = options.next().zip(options.next());
+    }
+    let Some((first, second)) = files else {
+        return Err(error(
+            "DIFFERENT not given FILES option with two file names.",
+        ));
+    };
+    let first = cx.resolve_path(first);
+    let second = cx.resolve_path(second);
+    let host = cx.host();
+    let equal = host
+        .metadata(&first, Follow::Yes)
+        .ok()
+        .zip(host.metadata(&second, Follow::Yes).ok())
+        .is_some_and(|(left, right)| {
+            left.kind == FileKind::File
+                && right.kind == FileKind::File
+                && left.len == right.len
+                && super::mutation::files_equal(cx, &first, &second, left.len)
+        });
+    set(cx, out, if equal { "0" } else { "1" })
 }
 
 fn read(cx: &mut Cx<'_>, path: &std::path::Path, out: &[u8], args: &[&[u8]]) -> Result {

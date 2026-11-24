@@ -1,16 +1,17 @@
 use rcmake_base::{BString, list};
-use rcmake_diag::{DiagCategory, Effect, MessageKind};
-use rcmake_eval::{CmdError, CmdResult, Cx, Flow};
+use rcmake_diag::{DiagCategory, Effect, MessageKind, PolicyId, PolicyStatus};
+use rcmake_eval::{CmdError, CmdResult, Cx, Flow, LogLevel};
 use rcmake_expr::ExpandedArg;
-use rcmake_host::path;
+use rcmake_host::{Stream, path};
 use rcmake_syntax::ArgKind;
 
 use super::search_paths::{cmake_paths, is_file};
 use super::{cps_import, diagnostic, text};
 use config::ConfigSearch;
 use messages::report_missing;
-use paths::package_roots;
+use paths::{package_roots, redirects_directory};
 use request::VersionRequest;
+use trace::SearchTrace;
 
 pub(super) use request::{Bindings, Request, version_bindings};
 
@@ -18,9 +19,10 @@ mod config;
 mod messages;
 mod paths;
 mod request;
+mod trace;
 
 const PROVIDER: &[u8] = b"_RCMAKE_FIND_PACKAGE_PROVIDER";
-const PACKAGE_ROOTS: &[u8] = b"_RCMAKE_FIND_PACKAGE_ROOTS";
+pub(super) const PACKAGE_ROOTS: &[u8] = b"_RCMAKE_FIND_PACKAGE_ROOTS";
 
 pub(super) fn find_package(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
     find_package_with_diagnostics(cx, args, None)
@@ -33,7 +35,7 @@ pub(super) fn find_package_with_diagnostics(
 ) -> CmdResult {
     let Some((package, parameters)) = args.split_first() else {
         return Err(CmdError::status(
-            "find_package called with incorrect number of arguments",
+            "called with incorrect number of arguments",
         ));
     };
     let name = &package.value;
@@ -60,7 +62,7 @@ pub(super) fn find_package_with_diagnostics(
         match &request.version {
             Some(version) if version.max.is_some() => {
                 return Err(CmdError::status(
-                    "find_package EXACT cannot be specified with a version range.",
+                    "EXACT cannot be specified with a version range.",
                 ));
             }
             None => {
@@ -142,7 +144,18 @@ pub(super) fn find_package_with_diagnostics(
         vars.add(find(b"REGISTRY_VIEW"), registry_view.clone());
     }
     let found = vars.scoped(cx, |cx| {
-        search(cx, name, &found_var, &request, &package_roots, dependency)
+        let mut trace = SearchTrace::new(cx);
+        let result = search(
+            cx,
+            name,
+            &found_var,
+            &request,
+            &package_roots,
+            dependency,
+            &mut trace,
+        );
+        trace.emit(cx);
+        result
     });
     match found {
         Ok(found) => finish(cx, name, &request, first_target, found),
@@ -231,27 +244,27 @@ fn search(
     request: &Request,
     package_roots: &[BString],
     mut dependency: Option<&mut Vec<cps_import::PackageDiagnostic>>,
+    trace: &mut SearchTrace,
 ) -> Result<bool, CmdError> {
     let mut config = ConfigSearch::new(name, request);
-    let redirected = cx.var_or_empty(b"CMAKE_FIND_PACKAGE_REDIRECTS_DIR");
-    let redirected = !redirected.is_empty() && config.redirect(cx, &cx.resolve_path(&redirected));
+    let redirected = redirects_directory(cx).is_some_and(|dir| config.redirect(cx, &dir));
     let prefer_config = !request.module && cx.var_is_on(b"CMAKE_FIND_PACKAGE_PREFER_CONFIG");
     let try_module = request.config_options.is_empty() && !redirected;
     if try_module
         && !prefer_config
-        && let Some(found) = load_module(cx, name, found_var, request)?
+        && let Some(found) = load_module(cx, name, found_var, request, trace)?
     {
         return Ok(found);
     }
 
     if !request.module || redirected {
-        let matched = config.find(cx, package_roots)?;
+        let matched = config.find(cx, package_roots, trace)?;
         let config_file = matched.as_ref().map(|found| found.file.clone());
         let found = config.load(cx, found_var, matched)?;
         if !found
             && try_module
             && prefer_config
-            && let Some(found) = load_module(cx, name, found_var, request)?
+            && let Some(found) = load_module(cx, name, found_var, request, trace)?
         {
             return Ok(found);
         }
@@ -305,11 +318,7 @@ fn search(
     }
 
     let message = if request.module && !redirected {
-        text(&[
-            b"No \"Find",
-            name,
-            b".cmake\" found in CMAKE_MODULE_PATH.\n",
-        ])
+        text(&[b"No \"Find", name, b".cmake\" found in CMAKE_MODULE_PATH."])
     } else {
         config.missing_message(try_module)
     };
@@ -326,8 +335,25 @@ fn search(
             diagnostic.emit(cx);
         }
         report_missing(cx, request, rejection.reason)?;
+    } else if !try_module && !request.module && !request.required && config.considered.is_empty() {
+        if !request.quiet && cx.log_level() >= LogLevel::Status {
+            cx.host().write_out(
+                Stream::Stdout,
+                &text(&[
+                    b"-- Could NOT find ",
+                    name,
+                    b" (missing: ",
+                    name,
+                    b"_DIR)\n",
+                ]),
+            );
+        }
     } else {
-        report_missing(cx, request, message)?;
+        let result = report_missing(cx, request, message);
+        if request.module && (request.required || !request.quiet && !request.optional) {
+            messages::warn_module_path(cx, name);
+        }
+        result?;
     }
     Ok(false)
 }
@@ -337,14 +363,58 @@ fn load_module(
     name: &[u8],
     found_var: &[u8],
     request: &Request,
+    trace: &mut SearchTrace,
 ) -> Result<Option<bool>, CmdError> {
-    let filename = path::to_native(&text(&[b"Find", name, b".cmake"]));
-    let mut dirs = cmake_paths(cx, b"CMAKE_MODULE_PATH");
-    dirs.push(text(&[&cx.var_or_empty(b"CMAKE_ROOT"), b"/Modules"]));
-    let module = dirs
-        .into_iter()
-        .map(|dir| cx.resolve_path(&dir).join(&filename))
-        .find(|file| is_file(cx, file));
+    let filename = text(&[b"Find", name, b".cmake"]);
+    let native_name = path::to_native(&filename);
+    let mut considered = Vec::new();
+    let mut module = None;
+    for dir in cmake_paths(cx, b"CMAKE_MODULE_PATH") {
+        let candidate = path::to_native(&dir).join(&native_name);
+        let resolved = cx.resolve_path(&path::from_native(&candidate));
+        if is_file(cx, &resolved) {
+            module = Some(resolved);
+            break;
+        }
+        considered.push(candidate);
+    }
+    let policy = match name {
+        b"Qt" => Some(PolicyId::new(84)),
+        b"Dart" => Some(PolicyId::new(145)),
+        b"CUDA" => Some(PolicyId::new(146)),
+        b"PythonInterp" | b"PythonLibs" => Some(PolicyId::new(148)),
+        b"Boost" => Some(PolicyId::new(167)),
+        b"GCCXML" => Some(PolicyId::new(188)),
+        b"CABLE" => Some(PolicyId::new(191)),
+        _ => None,
+    };
+    let root = cx.var_or_empty(b"CMAKE_ROOT");
+    let bundled = cx
+        .resolve_path(&text(&[&root, b"/Modules"]))
+        .join(&native_name);
+    let bundled = if is_file(cx, &bundled) {
+        Some(bundled)
+    } else {
+        considered.push(bundled);
+        None
+    };
+    trace.module(
+        &filename,
+        &considered,
+        module.as_deref().or(bundled.as_deref()),
+    );
+    if module.is_none()
+        && let Some(bundled) = bundled
+    {
+        if let Some(policy) = policy {
+            match cx.policy(policy) {
+                PolicyStatus::New => return Ok(None),
+                PolicyStatus::Warn => cx.issue_policy_warning(policy, b"", b""),
+                PolicyStatus::Old => {}
+            }
+        }
+        module = Some(bundled);
+    }
     let Some(module) = module else {
         return Ok(None);
     };

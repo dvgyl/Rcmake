@@ -1,19 +1,22 @@
 //! Build edges and target aliases for one configuration.
 
-use std::collections::{HashMap, HashSet};
+use std::borrow::Cow;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
 
-use rcmake_base::{BString, path_lex::Lexical};
+use rcmake_base::{BString, path_lex::Lexical, truth};
 use rcmake_gen_common::GenError;
 use rcmake_gen_common::export::ModuleExportJob;
 use rcmake_host::{Follow, Host, path};
-use rcmake_model::ProjectModel;
+use rcmake_model::{DirId, ProjectModel};
 use rcmake_resolve::{
     ArtifactSet, BuildGraph, BuildStep, GenerationResult, Invocation, ScanResponse, progress,
 };
 
 use crate::syntax::{Edge, Ninja, shell_word};
 use crate::{generation_error, modules};
+
+mod implicit;
 
 pub(crate) struct Graph<'a> {
     pub(crate) input: &'a BuildGraph,
@@ -24,23 +27,28 @@ pub(crate) struct Graph<'a> {
     compile_languages: HashMap<&'a [u8], &'a [u8]>,
     compile_inputs: Option<&'a std::collections::BTreeMap<BString, Vec<BString>>>,
     aliases: Vec<BString>,
+    extra_aliases: BTreeMap<BString, Vec<BString>>,
     artifact_targets: HashSet<usize>,
     producers: HashMap<BString, usize>,
     generated_inputs: HashMap<BString, BString>,
     steps: Vec<StepNodes<'a>>,
     order_only_alias_bytes: usize,
+    compile_prerequisites: Vec<Vec<usize>>,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct StepNodes<'a> {
     outputs: Vec<BString>,
     byproducts: Vec<BString>,
     order_only: Vec<OrderOnly<'a>>,
+    link: bool,
 }
 
+#[derive(Clone)]
 enum OrderOnly<'a> {
-    Targets(&'a [usize]),
+    Targets(Cow<'a, [usize]>),
     StepOutputs(usize),
+    CompilePrerequisites(usize),
 }
 
 struct EdgePlan {
@@ -72,7 +80,7 @@ impl EdgePlan {
 impl<'a> Graph<'a> {
     pub(crate) fn new(
         input: &'a BuildGraph,
-        artifacts: &HashMap<&[u8], &ArtifactSet>,
+        artifacts: &BTreeMap<&[u8], &ArtifactSet>,
         build_dir: &'a Path,
         config: Option<&'a [u8]>,
     ) -> Result<Self, GenError> {
@@ -85,11 +93,13 @@ impl<'a> Graph<'a> {
             compile_languages: HashMap::new(),
             compile_inputs: None,
             aliases: Vec::with_capacity(input.targets.len()),
+            extra_aliases: BTreeMap::new(),
             artifact_targets: HashSet::new(),
             producers: HashMap::with_capacity(input.steps.len()),
             generated_inputs: HashMap::new(),
             steps: Vec::with_capacity(input.steps.len()),
             order_only_alias_bytes: 0,
+            compile_prerequisites: Vec::new(),
         };
         for (index, target) in input.targets.iter().enumerate() {
             let name = graph.node(&target.name);
@@ -179,7 +189,7 @@ impl<'a> Graph<'a> {
         }
     }
 
-    fn add_link_byproducts(&mut self, artifacts: &HashMap<&[u8], &ArtifactSet>) {
+    fn add_link_byproducts(&mut self, artifacts: &BTreeMap<&[u8], &ArtifactSet>) {
         for target in &self.input.targets {
             let Some(artifacts) = artifacts.get(target.name.as_slice()) else {
                 continue;
@@ -194,10 +204,17 @@ impl<'a> Graph<'a> {
             .filter_map(Option::as_ref)
             .map(|path| self.node(path))
             .collect();
+            let main = artifacts.file.as_ref().map(|file| self.node(file));
             for &index in &target.steps {
-                if matches!(self.input.steps.get(index), Some(BuildStep::Link { .. }))
-                    && let Some(nodes) = self.steps.get_mut(index)
-                {
+                if let Some(nodes) = self.steps.get_mut(index) {
+                    nodes.link |=
+                        matches!(self.input.steps.get(index), Some(BuildStep::Link { .. }))
+                            || main
+                                .as_ref()
+                                .is_some_and(|file| nodes.outputs.first() == Some(file));
+                    if !nodes.link {
+                        continue;
+                    }
                     for path in &paths {
                         if !nodes.outputs.contains(path) && !nodes.byproducts.contains(path) {
                             nodes.byproducts.push(path.clone());
@@ -220,6 +237,72 @@ impl<'a> Graph<'a> {
 
     pub(crate) fn has_target(&self, name: &BString) -> bool {
         self.names.contains_key(name) || self.producers.contains_key(name)
+    }
+
+    pub(crate) fn add_aliases(
+        &mut self,
+        artifacts: &BTreeMap<&[u8], &ArtifactSet>,
+        model: Option<&ProjectModel>,
+    ) {
+        let mut ambiguous = BTreeSet::new();
+        for (name, artifact) in artifacts {
+            let Some(file) = artifact.linker_file.as_ref().or(artifact.file.as_ref()) else {
+                continue;
+            };
+            let file = self.node(file);
+            let filename: BString = Lexical::new(&file).filename().into();
+            if name == &filename.as_slice() || self.names.contains_key(&filename) {
+                continue;
+            }
+            if self
+                .extra_aliases
+                .insert(filename.clone(), vec![file])
+                .is_some()
+            {
+                ambiguous.insert(filename);
+            }
+        }
+        for name in ambiguous {
+            self.extra_aliases.remove(&name);
+        }
+        let Some(model) = model else { return };
+        let directories: BTreeMap<_, _> = model
+            .dirs()
+            .filter(|(id, _)| *id != DirId::ROOT)
+            .map(|(id, dir)| {
+                let directory = self.node(&dir.binary_dir);
+                (id, Lexical::new(&directory).append(b"all"))
+            })
+            .collect();
+        for name in directories.values() {
+            self.extra_aliases.entry(name.clone()).or_default();
+        }
+        for (build_target, alias) in self.input.targets.iter().zip(&self.aliases) {
+            let Some(target) = model
+                .find_target(DirId::ROOT, &build_target.name)
+                .and_then(|id| model.target(id))
+            else {
+                continue;
+            };
+            if build_target.steps.is_empty()
+                || target
+                    .props
+                    .get(b"EXCLUDE_FROM_ALL")
+                    .is_some_and(|value| truth::is_on(value))
+            {
+                continue;
+            }
+            for ancestor in model.ancestors(target.dir) {
+                if let Some(name) = directories.get(&ancestor)
+                    && let Some(inputs) = self.extra_aliases.get_mut(name)
+                {
+                    inputs.push(alias.clone());
+                }
+                if model.dir(ancestor).exclude_from_all {
+                    break;
+                }
+            }
+        }
     }
 
     pub(crate) fn prep_output_is_reserved(&self, name: &BString) -> bool {
@@ -265,7 +348,9 @@ impl<'a> Graph<'a> {
     }
 
     fn connect_targets(&mut self) -> Result<(), GenError> {
-        for (target, alias) in self.input.targets.iter().zip(&self.aliases) {
+        for (target_index, (target, alias)) in
+            self.input.targets.iter().zip(&self.aliases).enumerate()
+        {
             let dependencies = target.depends.as_slice();
             let alias_bytes = dependencies
                 .iter()
@@ -277,6 +362,9 @@ impl<'a> Graph<'a> {
                 .ok_or_else(|| {
                     generation_error(self.build_dir, "Invalid Ninja target dependency index.")
                 })?;
+            let prerequisites = self.custom_prerequisites(target_index);
+            let has_prerequisites = !prerequisites.is_empty();
+            self.compile_prerequisites.push(prerequisites);
             for &index in &target.steps {
                 let Some(step) = self.input.steps.get(index) else {
                     return Err(generation_error(
@@ -286,11 +374,11 @@ impl<'a> Graph<'a> {
                 };
                 if matches!(step, BuildStep::Compile { .. } | BuildStep::Scan { .. })
                     && let Some(nodes) = self.steps.get_mut(index)
-                    && !dependencies.is_empty()
+                    && has_prerequisites
                 {
-                    nodes.order_only.push(OrderOnly::Targets(dependencies));
-                    self.order_only_alias_bytes =
-                        self.order_only_alias_bytes.saturating_add(alias_bytes);
+                    nodes
+                        .order_only
+                        .push(OrderOnly::CompilePrerequisites(target_index));
                 }
             }
             if let Some(&producer) = self.producers.get(alias)
@@ -298,7 +386,9 @@ impl<'a> Graph<'a> {
             {
                 // A real output can also be the target name, such as a root executable.
                 if !dependencies.is_empty() {
-                    nodes.order_only.push(OrderOnly::Targets(dependencies));
+                    nodes
+                        .order_only
+                        .push(OrderOnly::Targets(Cow::Borrowed(dependencies)));
                     self.order_only_alias_bytes =
                         self.order_only_alias_bytes.saturating_add(alias_bytes);
                 }
@@ -313,6 +403,28 @@ impl<'a> Graph<'a> {
             }
         }
         Ok(())
+    }
+
+    fn custom_prerequisites(&self, target: usize) -> Vec<usize> {
+        let mut pending = vec![target];
+        let mut visited = HashSet::new();
+        let mut seen_steps = HashSet::new();
+        let mut steps = Vec::new();
+        while let Some(index) = pending.pop() {
+            if !visited.insert(index) {
+                continue;
+            }
+            let Some(target) = self.input.targets.get(index) else {
+                continue;
+            };
+            steps.extend(target.steps.iter().copied().filter(|&step| {
+                matches!(self.input.steps.get(step), Some(BuildStep::Custom(_)))
+                    && self.steps.get(step).is_some_and(|nodes| !nodes.link)
+                    && seen_steps.insert(step)
+            }));
+            pending.extend(target.depends.iter().rev().copied());
+        }
+        steps
     }
 
     pub(crate) fn manifest(&self) -> Ninja {
@@ -347,13 +459,45 @@ impl<'a> Graph<'a> {
         modmap_flag: &[u8],
         exports: &[ModuleExportJob],
     ) {
+        self.emit_into(ninja, cmake, modmap_flag, exports, None);
+    }
+
+    pub(crate) fn emit_into(
+        &self,
+        ninja: &mut Ninja,
+        cmake: &[u8],
+        modmap_flag: &[u8],
+        exports: &[ModuleExportJob],
+        mut emitted: Option<&mut HashSet<BString>>,
+    ) {
         for (step, nodes) in self.input.steps.iter().zip(&self.steps) {
+            if let Some(emitted) = &mut emitted {
+                if nodes.outputs.iter().any(|node| emitted.contains(node)) {
+                    continue;
+                }
+                let duplicate = nodes.byproducts.iter().any(|node| emitted.contains(node));
+                if duplicate {
+                    if !nodes.link {
+                        continue;
+                    }
+                    let mut unique = nodes.clone();
+                    unique.byproducts.retain(|node| !emitted.contains(node));
+                    emitted.extend(unique.outputs.iter().chain(&unique.byproducts).cloned());
+                    self.emit_step(ninja, step, &unique, cmake, modmap_flag, exports);
+                    continue;
+                }
+                emitted.extend(nodes.outputs.iter().chain(&nodes.byproducts).cloned());
+            }
             self.emit_step(ninja, step, nodes, cmake, modmap_flag, exports);
         }
 
         let mut all = Vec::new();
         for (target, alias) in self.input.targets.iter().zip(&self.aliases) {
-            if !self.producers.contains_key(alias) {
+            if !self.producers.contains_key(alias)
+                && emitted
+                    .as_mut()
+                    .is_none_or(|nodes| nodes.insert(alias.clone()))
+            {
                 let inputs: Vec<_> = target
                     .steps
                     .iter()
@@ -373,18 +517,84 @@ impl<'a> Graph<'a> {
                 all.push(alias.clone());
             }
         }
-        ninja.phony(&qualified(&"all".into(), self.config), &all);
-    }
-
-    pub(crate) fn emit_entry_aliases(&self, ninja: &mut Ninja) {
-        let aliases: HashSet<_> = self.aliases.iter().collect();
-        for (target, alias) in self.input.targets.iter().zip(&self.aliases) {
-            let name = self.node(&target.name);
-            if !self.producers.contains_key(&name) && !aliases.contains(&name) {
-                ninja.phony(&name, std::slice::from_ref(alias));
+        let all_alias = qualified(&"all".into(), self.config);
+        if let Some(nodes) = &mut emitted {
+            nodes.insert(all_alias.clone());
+        }
+        ninja.phony(&all_alias, &all);
+        for (name, inputs) in &self.extra_aliases {
+            let alias = qualified(name, self.config);
+            if !self.producers.contains_key(&alias)
+                && emitted
+                    .as_mut()
+                    .is_none_or(|nodes| nodes.insert(alias.clone()))
+            {
+                ninja.phony(&alias, inputs);
             }
         }
-        ninja.phony(&"all".into(), &[qualified(&"all".into(), self.config)]);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn emit_entry_aliases(&self, ninja: &mut Ninja) {
+        self.emit_aliases(ninja, None, &[self], &HashSet::new());
+    }
+
+    pub(crate) fn emit_aliases(
+        &self,
+        ninja: &mut Ninja,
+        suffix: Option<&[u8]>,
+        configurations: &[&Self],
+        reserved: &HashSet<BString>,
+    ) {
+        let extra: BTreeSet<_> = configurations
+            .iter()
+            .flat_map(|graph| graph.extra_aliases.keys())
+            .collect();
+        let names = self
+            .input
+            .targets
+            .iter()
+            .map(|target| self.node(&target.name))
+            .chain([BString::from("all")])
+            .chain(extra.into_iter().cloned());
+        for name in names {
+            let output = qualified(&name, suffix);
+            if self.producers.contains_key(&output)
+                || reserved.contains(&output)
+                || self.aliases.contains(&output)
+            {
+                continue;
+            }
+            let inputs = configurations
+                .iter()
+                .filter_map(|graph| {
+                    if name == "all" || graph.extra_aliases.contains_key(&name) {
+                        Some(qualified(&name, graph.config))
+                    } else {
+                        graph
+                            .names
+                            .get(&name)
+                            .and_then(|&index| graph.aliases.get(index).cloned())
+                    }
+                })
+                .collect::<Vec<_>>();
+            if !inputs.is_empty() {
+                ninja.phony(&output, &inputs);
+            }
+        }
+    }
+
+    pub(crate) fn emit_clean_inputs(&self, ninja: &mut Ninja) {
+        let inputs = self
+            .steps
+            .iter()
+            .flat_map(|nodes| nodes.outputs.iter().chain(&nodes.byproducts))
+            .cloned()
+            .collect::<Vec<_>>();
+        ninja.phony(
+            &qualified(&"CMakeFiles/rcmake-clean".into(), self.config),
+            &inputs,
+        );
     }
 
     fn custom_input(&self, input: &[u8]) -> BString {
@@ -446,6 +656,15 @@ impl<'a> Graph<'a> {
                             .get(*index)
                             .into_iter()
                             .flat_map(|step| step.outputs.iter().chain(&step.byproducts))
+                            .filter(|node| seen.insert(node)),
+                    ),
+                    OrderOnly::CompilePrerequisites(index) => order_only.extend(
+                        self.compile_prerequisites
+                            .get(*index)
+                            .into_iter()
+                            .flatten()
+                            .filter_map(|&step| self.steps.get(step))
+                            .flat_map(|step| &step.outputs)
                             .filter(|node| seen.insert(node)),
                     ),
                 }

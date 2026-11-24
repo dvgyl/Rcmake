@@ -1,11 +1,11 @@
 use indexmap::IndexSet;
 use rcmake_base::{BString, list, path_lex::Lexical, truth};
-use rcmake_genex::{ArtifactKind, ArtifactPart, ConfigId, EvalContext};
+use rcmake_genex::{ArtifactKind, ArtifactPart, ConfigId, EvalContext, GenexError};
 use rcmake_model::{BT, DirId, FileSetKind, Target, TargetId, TargetKind};
 
 use super::{UsageResolver, handle, on};
 use crate::{
-    ArtifactSet,
+    ArtifactSet, ResolveError,
     ide::{BundleKind, IdeFlavor, OutputNaming},
     lower,
     lower::definition,
@@ -63,19 +63,33 @@ impl UsageResolver<'_> {
         part: ArtifactPart,
         config: &ConfigId,
     ) -> Option<BString> {
-        self.output_artifact(id, kind, config)
-            .map(|artifact| artifact.part(part))
+        self.checked_artifact(id, kind, part, config).ok().flatten()
+    }
+
+    pub(super) fn checked_artifact(
+        &self,
+        id: TargetId,
+        kind: ArtifactKind,
+        part: ArtifactPart,
+        config: &ConfigId,
+    ) -> Result<Option<BString>, ResolveError> {
+        Ok(self
+            .output_artifact(id, kind, part, config)?
+            .map(|artifact| artifact.part(part)))
     }
 
     fn output_artifact(
         &self,
         id: TargetId,
         kind: ArtifactKind,
+        part: ArtifactPart,
         config: &ConfigId,
-    ) -> Option<Artifact> {
+    ) -> Result<Option<Artifact>, ResolveError> {
         use ArtifactKind::*;
         use TargetKind::*;
-        let target = self.model.target(id)?;
+        let Some(target) = self.model.target(id) else {
+            return Ok(None);
+        };
         let variable = |name: &[u8]| definition(self.model, target.dir, name).cloned();
         let system = variable(b"CMAKE_SYSTEM_NAME").unwrap_or_default();
         let platform = ArtifactPlatform::new(&system, self.ide);
@@ -87,15 +101,18 @@ impl UsageResolver<'_> {
         } = platform;
         let import = matches!(kind, ImportFile | LinkerImportFile | SonameImportFile)
             || (kind == LinkerFile && windows && matches!(target.kind, SharedLibrary | Executable));
-        let kind_defaults = artifact_defaults(target, import, apple, windows, visual_studio)?;
+        let Some(kind_defaults) = artifact_defaults(target, import, apple, windows, visual_studio)
+        else {
+            return Ok(None);
+        };
         if matches!(kind, LinkerFile | LinkerLibraryFile | LinkerImportFile)
             && (target.kind == ModuleLibrary
                 || (target.kind == Executable && !on(target, b"ENABLE_EXPORTS")))
         {
-            return None;
+            return Ok(None);
         }
         if matches!(kind, SonameFile | SonameImportFile) && target.kind != SharedLibrary {
-            return None;
+            return Ok(None);
         }
         let (category, stem, prefix, suffix) = kind_defaults;
         let prefix_prop = if import {
@@ -120,13 +137,24 @@ impl UsageResolver<'_> {
             .cloned()
             .or_else(|| variable(format!("CMAKE_{stem}_SUFFIX").as_bytes()))
             .unwrap_or_else(|| suffix.into());
-        if target.is_imported() {
-            return imported_artifact(target, kind, config, import, prefix, suffix);
+        if target.is_imported() && part != ArtifactPart::BaseName {
+            if matches!(part, ArtifactPart::Prefix | ArtifactPart::Suffix) {
+                return Ok(Some(Artifact {
+                    prefix,
+                    suffix,
+                    base: target.name.clone(),
+                    path: BString::default(),
+                    output_dir: BString::default(),
+                }));
+            }
+            return Ok(imported_artifact(
+                target, kind, config, import, prefix, suffix,
+            ));
         }
 
         self.local_artifact(
             id,
-            kind,
+            (kind, part),
             config,
             target,
             platform,
@@ -141,16 +169,15 @@ impl UsageResolver<'_> {
     fn local_artifact(
         &self,
         id: TargetId,
-        kind: ArtifactKind,
+        (kind, part): (ArtifactKind, ArtifactPart),
         config: &ConfigId,
         target: &Target,
         platform: ArtifactPlatform,
         naming: ArtifactNaming,
-    ) -> Option<Artifact> {
+    ) -> Result<Option<Artifact>, ResolveError> {
         use ArtifactKind::*;
         use TargetKind::*;
         let ArtifactPlatform {
-            xcode,
             apple,
             windows,
             desktop_apple,
@@ -166,18 +193,29 @@ impl UsageResolver<'_> {
         let app = apple && target.kind == Executable && on(target, b"MACOSX_BUNDLE");
         let framework = apple && target.kind.is_library() && on(target, b"FRAMEWORK");
         let module_bundle =
-            xcode && matches!(crate::ide::bundle_kind(target), BundleKind::Bundle { .. });
+            apple && matches!(crate::ide::bundle_kind(target), BundleKind::Bundle { .. });
         if (bundle && !(app || framework || module_bundle))
             || (kind == PdbFile && !windows)
             || (kind == SonameFile && (windows || on(target, b"NO_SONAME")))
         {
-            return None;
+            return Ok(None);
         }
+        let nested = app || framework || module_bundle;
         let category = if kind == PdbFile { "PDB" } else { category };
-        let name = self
-            .artifact_property(
+        let dir = if matches!(part, ArtifactPart::Dir | ArtifactPart::Full) {
+            self.artifact_output_directory(id, config, target, category, &config_upper)?
+        } else {
+            BString::default()
+        };
+        let read_name = matches!(
+            part,
+            ArtifactPart::Full | ArtifactPart::Name | ArtifactPart::BaseName
+        ) || (part == ArtifactPart::Dir && nested);
+        let name = if read_name {
+            self.artifact_property(
                 id,
                 config,
+                "OUTPUT_NAME",
                 &[
                     format!("{category}_OUTPUT_NAME_{config_upper}"),
                     format!("{category}_OUTPUT_NAME"),
@@ -185,24 +223,21 @@ impl UsageResolver<'_> {
                     format!("{config_upper}_OUTPUT_NAME"),
                     "OUTPUT_NAME".into(),
                 ],
-            )
+            )?
             .filter(|name| !name.is_empty())
-            .unwrap_or_else(|| target.name.clone());
+            .unwrap_or_else(|| target.name.clone())
+        } else {
+            target.name.clone()
+        };
         let postfix = target
             .props
-            .get(format!("{config_upper}_POSTFIX").as_bytes());
-        let base: BString = if target.kind != Executable || app {
-            [
-                name.as_slice(),
-                postfix.map_or(b"".as_slice(), |value| value.as_slice()),
-            ]
-            .concat()
-            .into()
+            .get(format!("{config_upper}_POSTFIX").as_bytes())
+            .filter(|_| !app);
+        let base: BString = if let Some(postfix) = postfix {
+            [name.as_slice(), postfix.as_slice()].concat().into()
         } else {
             name
         };
-        let dir = self.artifact_output_directory(id, config, target, category, &config_upper);
-
         let (prefix, suffix) = if framework || module_bundle || kind == PdbFile {
             (
                 BString::default(),
@@ -230,13 +265,22 @@ impl UsageResolver<'_> {
         let p = prefix.as_slice();
         let n = base.as_slice();
         let s = suffix.as_slice();
+        let exe_version = (target.kind == Executable && kind == File && !app && !windows)
+            .then_some(version.or_else(|| target.props.get(b"VERSION")))
+            .flatten()
+            .filter(|version| !version.is_empty());
         let file = match version {
+            _ if let Some(version) = exe_version => [p, n, s, b"-", version.as_slice()].concat(),
             Some(version) if apple => [p, n, b".", version.as_slice(), s].concat(),
             Some(version) => [p, n, s, b".", version.as_slice()].concat(),
             None => [p, n, s].concat(),
         };
         let subdir = if app {
-            [n, b".app"].concat()
+            let extension = target
+                .props
+                .get(b"BUNDLE_EXTENSION")
+                .map_or(b"app".as_slice(), |value| value.as_slice());
+            [n, b".", extension].concat()
         } else if framework {
             [n, b".framework"].concat()
         } else if let BundleKind::Bundle { extension } = crate::ide::bundle_kind(target)
@@ -248,13 +292,13 @@ impl UsageResolver<'_> {
         };
         let mut path = Lexical::new(&dir).append(&subdir);
         if kind == BundleDir {
-            return Some(Artifact::from_path(path, b"", b""));
+            return Ok(Some(Artifact::from_path(path, b"", b"")));
         }
         if (app || module_bundle) && desktop_apple {
             path = Lexical::new(&path).append(b"Contents");
         }
         if kind == BundleContentDir {
-            return Some(Artifact::from_path(path, b"", b""));
+            return Ok(Some(Artifact::from_path(path, b"", b"")));
         }
         if (app || module_bundle) && desktop_apple {
             path = Lexical::new(&path).append(b"MacOS");
@@ -267,13 +311,13 @@ impl UsageResolver<'_> {
             path = Lexical::new(&Lexical::new(&path).append(b"Versions")).append(version);
         }
         path = Lexical::new(&path).append(&file);
-        Some(Artifact {
+        Ok(Some(Artifact {
             output_dir: dir,
             path,
             prefix,
             base,
             suffix,
-        })
+        }))
     }
 
     fn artifact_output_directory(
@@ -283,14 +327,14 @@ impl UsageResolver<'_> {
         target: &Target,
         category: &str,
         config_upper: &BString,
-    ) -> BString {
+    ) -> Result<BString, ResolveError> {
         let binary = Lexical::new(&self.model.dir(target.dir).binary_dir);
         let config_dir = format!("{category}_OUTPUT_DIRECTORY_{config_upper}");
         let general_dir = format!("{category}_OUTPUT_DIRECTORY");
         let configured = !config.0.is_empty() && target.props.get(config_dir.as_bytes()).is_some();
         let general = target.props.get(general_dir.as_bytes());
         let mut dir = self
-            .artifact_property(id, config, &[config_dir, general_dir])
+            .artifact_property(id, config, "OUTPUT_DIRECTORY", &[config_dir, general_dir])?
             .map_or_else(
                 || self.model.dir(target.dir).binary_dir.clone(),
                 |path| binary.append(&path),
@@ -306,17 +350,17 @@ impl UsageResolver<'_> {
         {
             dir = Lexical::new(&dir).append(&config.0);
         }
-        Lexical::new(&dir).normalize()
+        Ok(Lexical::new(&dir).normalize())
     }
 
     pub(crate) fn ide_artifacts(
         &self,
         id: TargetId,
         config: &ConfigId,
-    ) -> (ArtifactSet, OutputNaming) {
+    ) -> Result<(ArtifactSet, OutputNaming), ResolveError> {
         use ArtifactKind::*;
-        let artifact = |kind| self.output_artifact(id, kind, config);
-        let main = artifact(File);
+        let artifact = |kind| self.output_artifact(id, kind, ArtifactPart::Full, config);
+        let main = artifact(File)?;
         let target = self.model.target(id);
         let naming = main
             .as_ref()
@@ -332,33 +376,48 @@ impl UsageResolver<'_> {
                     .and_then(|target| target.props.get(b"SOVERSION"))
                     .cloned(),
             });
-        let path = |kind| artifact(kind).map(|file| file.path);
+        let path = |kind| Ok::<_, ResolveError>(artifact(kind)?.map(|file| file.path));
         let artifacts = ArtifactSet {
             file: main.map(|file| file.path),
-            linker_file: path(LinkerFile),
-            soname_file: path(SonameFile),
-            import_file: path(ImportFile),
-            pdb_file: path(PdbFile),
+            linker_file: path(LinkerFile)?,
+            soname_file: path(SonameFile)?,
+            import_file: path(ImportFile)?,
+            pdb_file: path(PdbFile)?,
             object_dir: target
                 .filter(|target| target.kind.is_library() || target.kind == TargetKind::Executable)
                 .and_then(|_| self.object_directory(id, config))
                 .map(|path| lower::build_relative(self.model, &path)),
         };
-        (artifacts, naming)
+        Ok((artifacts, naming))
     }
 
     fn artifact_property(
         &self,
         id: TargetId,
         config: &ConfigId,
+        class: &'static str,
         names: &[String],
-    ) -> Option<BString> {
-        let target = self.model.target(id)?;
-        let (name, value) = names
+    ) -> Result<Option<BString>, ResolveError> {
+        let target = self.target(id)?;
+        let Some((name, value)) = names
             .iter()
-            .find_map(|name| target.props.get(name.as_bytes()).map(|value| (name, value)))?;
+            .find_map(|name| target.props.get(name.as_bytes()).map(|value| (name, value)))
+        else {
+            return Ok(None);
+        };
         if !value.windows(2).any(|window| window == b"$<") {
-            return Some(value.clone());
+            return Ok(Some(value.clone()));
+        }
+        let key = (id, config.clone(), BString::from(name.as_str()));
+        if self.artifact_properties.contains(&key) {
+            return Err(GenexError::ArtifactCycle {
+                target: target.name.clone(),
+                property: class,
+            }
+            .into());
+        }
+        if self.artifact_properties.len() >= super::MAX_WALK_DEPTH {
+            return Err(GenexError::TooDeep.into());
         }
         let ctx = EvalContext {
             head: Some(handle(id)),
@@ -366,17 +425,11 @@ impl UsageResolver<'_> {
             ..Default::default()
         };
         let entry = BT::new(value.clone(), target.backtrace.clone());
-        if self.artifact_depth >= super::MAX_WALK_DEPTH {
-            return None;
-        }
-        Self {
-            ide: self.ide,
-            artifact_depth: self.artifact_depth + 1,
-            ..Self::new(self.model)
-        }
-        .eval_entry(id, target.dir, name.as_bytes(), &entry, &ctx, false)
-        .ok()
-        .map(|(value, _)| value)
+        let mut resolver = self.fork_for_artifacts();
+        resolver.artifact_properties.push(key);
+        let (value, _) =
+            resolver.eval_entry(id, target.dir, name.as_bytes(), &entry, &ctx, false)?;
+        Ok(Some(value))
     }
 
     /// Compute the object directory used by the selected generator.
@@ -388,21 +441,13 @@ impl UsageResolver<'_> {
                 self.model, target, config, flavor,
             ));
         }
-        let path = Lexical::new(&self.model.dir(target.dir).binary_dir)
-            .append(format!("CMakeFiles/{}.dir", target.name).as_bytes());
-        if self
-            .model
-            .generator
-            .is_some_and(|generator| generator.multi_config())
-            && !config.0.is_empty()
-        {
-            Some(Lexical::new(&path).append(&config.0))
-        } else {
-            Some(path)
-        }
+        Some(absolute_path(
+            &self.model.dir(DirId::ROOT).binary_dir,
+            &lower::object_dir(self.model, target, config),
+        ))
     }
 
-    /// Compute the object library file list, with an optional source filter.
+    /// Compute the compiled object file list, with an optional source filter.
     #[must_use]
     pub fn target_objects(
         &self,
@@ -411,7 +456,7 @@ impl UsageResolver<'_> {
         sources: Option<&[u8]>,
     ) -> Option<BString> {
         let target = self.model.target(id)?;
-        if target.kind != TargetKind::ObjectLibrary {
+        if !target.kind.compiles_objects() {
             return None;
         }
         if target.is_imported() {
@@ -431,13 +476,9 @@ impl UsageResolver<'_> {
             ..Default::default()
         };
         // Keep the active property chain when TARGET_OBJECTS queries another target.
-        let mut resolver = Self {
-            source_paths: self.source_paths,
-            ide: self.ide,
-            artifact_depth: self.artifact_depth,
-            active: self.active.clone(),
-            ..Self::new(self.model)
-        };
+        let mut resolver = self.fork_for_artifacts();
+        resolver.source_paths = self.source_paths;
+        resolver.active.clone_from(&self.active);
         let value = resolver.collect_property(id, b"SOURCES", &ctx).ok()?;
         let path = |entry: &[u8]| {
             self.source_paths
@@ -525,7 +566,6 @@ impl UsageResolver<'_> {
 
 #[derive(Clone, Copy)]
 struct ArtifactPlatform {
-    xcode: bool,
     visual_studio: bool,
     apple: bool,
     windows: bool,
@@ -547,7 +587,6 @@ impl ArtifactPlatform {
             || system.is_empty()
             || (xcode && !matches!(system, b"iOS" | b"tvOS" | b"watchOS" | b"visionOS"));
         Self {
-            xcode,
             visual_studio: vs,
             apple,
             windows,

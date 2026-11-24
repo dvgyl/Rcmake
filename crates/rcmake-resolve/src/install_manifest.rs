@@ -13,6 +13,8 @@ pub struct InstallAction {
     pub kind: InstallActionKind,
     /// Skip missing files (`OPTIONAL`).
     pub optional: bool,
+    /// Install message setting (`ALWAYS`, `LAZY`, `NEVER`, or empty for the default).
+    pub message: BString,
 }
 
 /// Payload of an [`InstallAction`].

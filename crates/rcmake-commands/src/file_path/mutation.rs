@@ -350,7 +350,7 @@ pub(super) fn copy_replace(
     result
 }
 
-fn files_equal(cx: &Cx<'_>, a: &Path, b: &Path, size: u64) -> bool {
+pub(super) fn files_equal(cx: &Cx<'_>, a: &Path, b: &Path, size: u64) -> bool {
     let chunk = 64 * 1024;
     let mut offset = 0;
     while offset < size {

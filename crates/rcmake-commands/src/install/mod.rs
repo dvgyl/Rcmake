@@ -15,6 +15,7 @@ use rcmake_model::{
 };
 
 mod metadata;
+mod runtime;
 
 type Result<T> = std::result::Result<T, CmdError>;
 type Args<'a> = Peekable<std::iter::Copied<std::slice::Iter<'a, &'a [u8]>>>;
@@ -86,7 +87,10 @@ fn keyword(token: &[u8]) -> bool {
                 | b"EXPORT_LINK_INTERFACE_LIBRARIES"
                 | b"CXX_MODULES_DIRECTORY"
                 | b"APPEND"
+                | b"RUNTIME_DEPENDENCY_SET"
+                | b"RUNTIME_DEPENDENCIES"
         )
+        || runtime::filter_keyword(token)
 }
 
 fn values<'a>(args: &mut Args<'a>) -> Vec<&'a [u8]> {
@@ -187,6 +191,9 @@ fn install(cx: &mut Cx<'_>, input: &[ExpandedArg]) -> CmdResult {
     let [signature, rest @ ..] = input.as_slice() else {
         return Ok(Flow::Normal);
     };
+    if *signature == b"RUNTIME_DEPENDENCY_SET" {
+        return runtime::set(cx, rest);
+    }
     let mut args = rest.iter().copied().peekable();
     let mut options = InstallOptions::default();
     let mut extra_destinations = Vec::new();
@@ -218,20 +225,9 @@ fn install(cx: &mut Cx<'_>, input: &[ExpandedArg]) -> CmdResult {
         .destination
         .iter()
         .chain(extra_destinations.iter().map(|(_, path)| path))
+        .filter(|path| Lexical::new(path).absolute())
     {
-        if Lexical::new(path).absolute() {
-            cx.issue(
-                MessageKind::Warning,
-                Effect::None,
-                Some(DiagCategory::InstallAbsoluteDestination),
-                [
-                    b"An absolute installation destination was given: ",
-                    path.as_slice(),
-                ]
-                .concat()
-                .into(),
-            );
-        }
+        warn_absolute_destination(cx, path);
     }
     let members = match &kind {
         InstallKind::Targets {
@@ -250,6 +246,12 @@ fn install(cx: &mut Cx<'_>, input: &[ExpandedArg]) -> CmdResult {
     });
     let section = format!("_RCMAKE_INSTALL_{index}");
     record_args(cx, &section, &input);
+    let message = cx.var_or_empty(b"CMAKE_INSTALL_MESSAGE");
+    if matches!(message.as_slice(), b"ALWAYS" | b"LAZY" | b"NEVER") {
+        cx.global()
+            .props
+            .set(format!("{section}_MESSAGE").into(), message);
+    }
     for (argument, path) in extra_destinations {
         cx.global()
             .props
@@ -270,6 +272,20 @@ fn install(cx: &mut Cx<'_>, input: &[ExpandedArg]) -> CmdResult {
     Ok(Flow::Normal)
 }
 
+fn warn_absolute_destination(cx: &mut Cx<'_>, path: &[u8]) {
+    cx.issue(
+        MessageKind::Warning,
+        Effect::None,
+        Some(DiagCategory::InstallAbsoluteDestination),
+        [
+            b"INSTALL command given absolute DESTINATION path:\n\n  ",
+            path,
+        ]
+        .concat()
+        .into(),
+    );
+}
+
 pub(crate) fn default_component(cx: &mut Cx<'_>) -> BString {
     cx.var(b"CMAKE_INSTALL_DEFAULT_COMPONENT_NAME")
         .filter(|name| !name.is_empty())
@@ -288,11 +304,32 @@ fn targets(
     let mut artifact_options = InstallOptions::default();
     let mut destination_argument = None;
     let mut group: Option<&[u8]> = None;
+    let mut dependencies = None;
     let mut namelink = None;
     let mut file_sets = Vec::new();
     while let Some(key) = args.next() {
         match key {
             b"EXPORT" if group.is_none() => export = Some(value(args, key)?.into()),
+            b"RUNTIME_DEPENDENCY_SET" | b"RUNTIME_DEPENDENCIES" if group.is_none() => {
+                if dependencies
+                    .replace(key)
+                    .is_some_and(|previous| previous != key)
+                {
+                    return Err(fail(
+                        "TARGETS cannot have both RUNTIME_DEPENDENCIES and RUNTIME_DEPENDENCY_SET.",
+                    ));
+                }
+                runtime::require_supported(cx, &[b"TARGETS ", key].concat())?;
+                if key == b"RUNTIME_DEPENDENCY_SET" {
+                    value(args, key)?;
+                }
+            }
+            key if dependencies == Some(b"RUNTIME_DEPENDENCIES")
+                && group.is_none()
+                && runtime::filter_keyword(key) =>
+            {
+                values(args);
+            }
             b"INCLUDES" => {
                 if args.next() != Some(b"DESTINATION") {
                     return Err(fail("TARGETS INCLUDES requires DESTINATION."));
@@ -417,6 +454,11 @@ fn paths(
             b"EXCLUDE" if rule => {}
             b"PERMISSIONS" if rule => {
                 permissions(args)?;
+            }
+            b"MESSAGE_NEVER" if rule => {
+                return Err(fail(
+                    "DIRECTORY does not allow \"MESSAGE_NEVER\" after PATTERN or REGEX.",
+                ));
             }
             _ if rule => return Err(unknown(key)),
             b"DIRECTORY_PERMISSIONS" if signature == b"DIRECTORY" => {
@@ -711,7 +753,7 @@ pub(crate) fn record_args(cx: &mut Cx<'_>, section: &str, args: &[&[u8]]) {
     }
 }
 
-pub(crate) fn record_request(cx: &mut Cx<'_>, prefix: &str, args: &[&[u8]]) {
+pub(crate) fn record_request(cx: &mut Cx<'_>, prefix: &str, args: &[&[u8]]) -> usize {
     let key = format!("{prefix}_COUNT");
     let index = cx
         .global()
@@ -724,6 +766,7 @@ pub(crate) fn record_request(cx: &mut Cx<'_>, prefix: &str, args: &[&[u8]]) {
     cx.global()
         .props
         .set(key.into(), index.saturating_add(1).to_string().into());
+    index
 }
 
 #[cfg(test)]

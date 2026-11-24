@@ -8,7 +8,7 @@ use rcmake_host::{CommandSpec, Input, Output, ProcessResult, RunRequest, path};
 use rcmake_model::DirId;
 use rcmake_resolve::BuildStep;
 
-use super::args::{Options, Signature};
+use super::args::Options;
 use super::seed::toolchain_variable;
 use super::{TIMEOUT, absolute, set_result};
 
@@ -16,6 +16,7 @@ pub(super) fn build_child(
     child: &mut Cx<'_>,
     directory: &Path,
     target: Option<&[u8]>,
+    verbose: bool,
 ) -> Result<(BuildOutcome, Option<PathBuf>), String> {
     let config = ConfigId(child.var_or_empty(b"CMAKE_BUILD_TYPE"));
     let mut model = child.project().clone();
@@ -54,6 +55,7 @@ pub(super) fn build_child(
     let options = BuildOptions {
         build_dir: directory.to_path_buf(),
         targets: target.into_iter().map(BString::from).collect(),
+        verbose,
         ..BuildOptions::default()
     };
     let outcome =
@@ -70,21 +72,15 @@ pub(super) struct RunResult<'a> {
 
 pub(super) fn run_executable<'a>(
     cx: &mut Cx<'_>,
-    signature: &Signature<'_>,
     options: &Options<'_>,
     artifact: Option<&Path>,
     variable: &'a [u8],
     build_output: &[u8],
 ) -> RunResult<'a> {
-    let default_cwd = match signature {
-        Signature::Sources {
-            base: Some(base), ..
-        } => path::to_native(base),
-        _ => cx.host().initial_cwd(),
-    };
-    let cwd = options
+    let default_cwd = cx.host().initial_cwd();
+    let working_dir = options
         .one(b"WORKING_DIRECTORY")
-        .map_or_else(|| default_cwd.clone(), |dir| absolute(&default_cwd, dir));
+        .map(|dir| absolute(&default_cwd, dir));
     let combined = options.has(b"RUN_OUTPUT_VARIABLE") || options.has(b"OUTPUT_VARIABLE");
     let mut command = Vec::new();
     let cross = cx.var_is_on(b"CMAKE_CROSSCOMPILING");
@@ -100,6 +96,9 @@ pub(super) fn run_executable<'a>(
         command.push(path::from_native(artifact));
         command.extend(options.many(b"ARGS").iter().copied().map(BString::from));
         command.split_first().and_then(|(program, args)| {
+            if let Some(dir) = &working_dir {
+                cx.host().create_dir_all(dir).ok()?;
+            }
             cx.host()
                 .run(
                     &RunRequest {
@@ -107,7 +106,7 @@ pub(super) fn run_executable<'a>(
                             program: program.clone(),
                             args: args.to_vec(),
                         }],
-                        cwd,
+                        cwd: working_dir.unwrap_or(default_cwd),
                         env: cx.host().env_all(),
                         stdin: Input::Null,
                         stdout: Output::Capture,

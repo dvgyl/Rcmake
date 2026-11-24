@@ -6,7 +6,6 @@ use indexmap::IndexMap;
 use rcmake_base::{BString, list};
 use rcmake_diag::Backtrace;
 
-use crate::target::join_entries;
 use crate::{
     AppendMode, BT, BuildExport, Cache, CacheEntry, CacheType, CommandId, CustomCommand, DirId,
     Directory, ExportSet, FileSet, FileSetId, GeneratorKind, GeneratorSpec, GlobalState,
@@ -421,54 +420,6 @@ impl ProjectModel {
     // Scoped properties.
     // ----------------------------------------------------------------------------------
 
-    /// Value of property `name` on `scope`, without inheritance. `None` when not set.
-    #[must_use]
-    pub fn get_prop(&self, scope: &PropScope, name: &[u8]) -> Option<BString> {
-        match scope {
-            PropScope::Global => self.global.props.get(name).cloned(),
-            PropScope::Directory(id) => self.directory_prop(*id, name),
-            PropScope::Target(id) => self.target_prop(self.target(*id)?, name),
-            PropScope::Source { dir, path } => {
-                self.dir(*dir).source_props.get(path)?.get(name).cloned()
-            }
-            PropScope::Test { dir, name: test } => {
-                let id = self.find_test(*dir, test)?;
-                self.test(id)?.props.get(name).cloned()
-            }
-            PropScope::Cache(entry) => cache_prop(self.cache.get(entry)?, name),
-            PropScope::FileSet(id) => self.file_set(*id)?.props.get(name).cloned(),
-            PropScope::Install { file } => self.install_props.get(file)?.get(name).cloned(),
-        }
-    }
-
-    /// Value of property `name` with `INHERITED` lookup: object, then its directory,
-    /// then parent directories, then global. A set value (also an empty one) stops the
-    /// walk. The caller checks that the property is defined `INHERITED`.
-    #[must_use]
-    pub fn get_prop_inherited(&self, scope: &PropScope, name: &[u8]) -> Option<BString> {
-        let mut scope = scope.clone();
-        loop {
-            if let Some(value) = self.get_prop(&scope, name) {
-                return Some(value);
-            }
-            scope = match scope {
-                PropScope::Target(id) => PropScope::Directory(self.target(id)?.dir),
-                PropScope::FileSet(id) => PropScope::Target(self.file_set(id)?.target),
-                PropScope::Source { dir, .. } | PropScope::Test { dir, .. } => {
-                    PropScope::Directory(dir)
-                }
-                PropScope::Directory(id) => {
-                    return self
-                        .ancestors(id)
-                        .skip(1)
-                        .find_map(|parent| self.directory_prop(parent, name))
-                        .or_else(|| self.global.props.get(name).cloned());
-                }
-                PropScope::Global | PropScope::Cache(_) | PropScope::Install { .. } => return None,
-            };
-        }
-    }
-
     /// Set (`Some`) or unset (`None`) property `name` on `scope`.
     pub fn set_prop(
         &mut self,
@@ -553,7 +504,15 @@ impl ProjectModel {
         if mode == AppendMode::List && self.append_entry(scope, name, value, origin)? {
             return Ok(());
         }
-        let old = self.get_prop(scope, name);
+        let old = match scope {
+            PropScope::Source { dir, path } if name == b"GENERATED" => self
+                .dir(*dir)
+                .source_props
+                .get(path)
+                .and_then(|props| props.get(name))
+                .cloned(),
+            _ => self.get_prop(scope, name),
+        };
         let new = match (old, mode) {
             (Some(old), AppendMode::List) if !old.is_empty() => list::join([old.as_slice(), value]),
             (Some(old), AppendMode::String) => [old.as_slice(), value].concat().into(),
@@ -602,79 +561,6 @@ impl ProjectModel {
         }
         Ok(true)
     }
-
-    fn directory_prop(&self, id: DirId, name: &[u8]) -> Option<BString> {
-        let dir = self.dir(id);
-        let names = |ids: &mut dyn Iterator<Item = TargetId>| {
-            list::join(
-                ids.filter_map(|t| self.target(t))
-                    .map(|t| t.name.as_slice()),
-            )
-        };
-        Some(match name {
-            b"SOURCE_DIR" => dir.source_dir.clone(),
-            b"BINARY_DIR" => dir.binary_dir.clone(),
-            b"PARENT_DIRECTORY" => dir
-                .parent
-                .map(|p| self.dir(p).source_dir.clone())
-                .unwrap_or_default(),
-            b"SUBDIRECTORIES" => list::join(
-                dir.children
-                    .iter()
-                    .map(|c| self.dir(*c).source_dir.as_slice()),
-            ),
-            b"BUILDSYSTEM_TARGETS" => names(
-                &mut dir
-                    .targets
-                    .iter()
-                    .copied()
-                    .filter(|t| self.target(*t).is_some_and(|t| !t.is_imported())),
-            ),
-            b"IMPORTED_TARGETS" => names(
-                &mut dir
-                    .targets
-                    .iter()
-                    .copied()
-                    .filter(|t| self.target(*t).is_some_and(Target::is_imported)),
-            ),
-            b"TESTS" => list::join(dir.tests.keys()),
-            _ => {
-                return match UsageField::from_name(name).filter(|f| f.on_directory()) {
-                    Some(field) => dir.usage.joined(field),
-                    None => dir.props.get(name).cloned(),
-                };
-            }
-        })
-    }
-
-    fn target_prop(&self, target: &Target, name: &[u8]) -> Option<BString> {
-        let flag = |on: bool| BString::from(if on { "TRUE" } else { "FALSE" });
-        match name {
-            b"NAME" => Some(target.name.clone()),
-            b"TYPE" => Some(target.kind.as_str().into()),
-            b"IMPORTED" => Some(flag(target.is_imported())),
-            b"IMPORTED_GLOBAL" => Some(flag(matches!(
-                target.origin,
-                TargetOrigin::Imported(ImportedVisibility::Global)
-            ))),
-            b"SOURCE_DIR" => Some(self.dir(target.dir).source_dir.clone()),
-            b"BINARY_DIR" => Some(self.dir(target.dir).binary_dir.clone()),
-            b"SOURCES" => (!target.sources.is_empty())
-                .then(|| join_entries(target.sources.iter().map(|s| s.value.as_slice()))),
-            b"LINK_LIBRARIES" => link_value(target.usage.link_libraries.as_deref()),
-            b"INTERFACE_LINK_LIBRARIES" => {
-                link_value(target.usage.interface_link_libraries.as_deref())
-            }
-            _ => match UsageField::from_name(name) {
-                Some(field) => target.usage.joined(field),
-                None => target.props.get(name).cloned(),
-            },
-        }
-    }
-}
-
-fn link_value(items: Option<&[LinkItem]>) -> Option<BString> {
-    items.map(|items| join_entries(items.iter().map(|i| i.text.value.as_slice())))
 }
 
 fn set_map(props: &mut crate::PropertyMap, name: &[u8], value: Option<BString>) {
@@ -737,20 +623,6 @@ fn set_target_prop(
         },
     }
     Ok(())
-}
-
-fn cache_prop(entry: &CacheEntry, name: &[u8]) -> Option<BString> {
-    match name {
-        b"VALUE" => Some(entry.value.clone()),
-        b"TYPE" => Some(entry.ty.as_str().into()),
-        b"HELPSTRING" => Some(entry.help.clone()),
-        b"ADVANCED" => entry
-            .props
-            .get(name)
-            .cloned()
-            .or_else(|| entry.advanced.then(|| "1".into())),
-        _ => entry.props.get(name).cloned(),
-    }
 }
 
 fn set_cache_prop(

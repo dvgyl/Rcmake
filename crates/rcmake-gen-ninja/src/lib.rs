@@ -5,12 +5,13 @@
 mod build;
 mod graph;
 mod modules;
+mod multi;
 mod prep;
 mod syntax;
 
 pub use build::build_commands;
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use rcmake_base::BString;
@@ -112,8 +113,11 @@ fn generate_single(
 ) -> Result<(), GenError> {
     let empty = BuildGraph::default();
     let input = result.graphs.first().unwrap_or(&empty);
-    let mut graph = Graph::new(input, &config_artifacts(result, input), build_dir, None)?;
+    let artifacts = config_artifacts(result, input);
+    let mut graph = Graph::new(input, &artifacts, build_dir, None)?;
+    graph.add_aliases(&artifacts, model);
     graph.resolve_custom_inputs(model, host);
+    graph.connect_custom_dependencies(model);
     graph.set_compile_metadata(result);
     let prep = PrepTargets::new(&graph, result, model)?;
     let programs = Programs::new(result, host, build_dir, model);
@@ -140,6 +144,7 @@ fn generate_single(
     let mut ninja = graph.manifest();
     ninja.include(RULES_PATH.as_bytes());
     graph.emit(&mut ninja, &programs.cmake, &module_flag, &exports);
+    graph.emit_assumed_sources(&mut ninja, model);
     prep.emit(&mut ninja, &graph);
     emit_regeneration(
         &mut ninja,
@@ -222,37 +227,34 @@ fn generate_multi(
             .ok_or_else(|| {
                 generation_error(build_dir, "A Ninja configuration has no build graph.")
             })?;
-        let mut graph = Graph::new(
-            input,
-            &config_artifacts(result, input),
-            build_dir,
-            Some(name),
-        )?;
+        let artifacts = config_artifacts(result, input);
+        let mut graph = Graph::new(input, &artifacts, build_dir, Some(name))?;
+        graph.add_aliases(&artifacts, model);
         graph.resolve_custom_inputs(model, host);
         graph.set_compile_metadata(result);
         let prep = PrepTargets::new(&graph, result, model)?;
         configs.push((graph, ConfigFiles::new(name, prep)));
     }
 
-    let first = configs.first().ok_or_else(|| {
-        generation_error(
-            build_dir,
-            "Ninja Multi-Config requires at least one configuration.",
-        )
+    let selection = multi::Selection::new(&result.configs, build_dir, |name| {
+        model
+            .and_then(|model| model.definition(DirId::ROOT, name))
+            .cloned()
+            .or_else(|| configuration_setting(host, build_dir, name))
     })?;
-    let requested = configuration_setting(host, build_dir, b"CMAKE_DEFAULT_BUILD_TYPE");
-    let (default, default_files) = match requested.as_ref().map(|name| name.as_slice()) {
-        Some(name) if !name.is_empty() => configs
-            .iter()
-            .find(|(graph, _)| graph.config == Some(name))
-            .ok_or_else(|| {
-                generation_error(
-                    build_dir,
-                    "CMAKE_DEFAULT_BUILD_TYPE has no matching Ninja configuration.",
-                )
-            })?,
-        _ => first,
-    };
+    let (default, default_files) = configs
+        .get(selection.default)
+        .ok_or_else(|| generation_error(build_dir, "Missing default Ninja configuration."))?;
+    let cross: Vec<_> = selection
+        .cross
+        .iter()
+        .filter_map(|&index| configs.get(index).map(|(graph, _)| graph))
+        .collect();
+    let defaults: Vec<_> = selection
+        .defaults
+        .iter()
+        .filter_map(|&index| configs.get(index).map(|(graph, _)| graph))
+        .collect();
     let mut manifests = vec!["build.ninja".into(), RULES_PATH.into()];
     for (_, files) in &configs {
         manifests.extend([files.entry.clone(), files.implementation.clone()]);
@@ -282,11 +284,41 @@ fn generate_multi(
     let programs = Programs::new(result, host, build_dir, model);
     let rebuild = configure_command(result, build_dir, &programs.cmake, false);
     let regenerate = configure_command(result, build_dir, &programs.cmake, true);
-    for (graph, files) in &configs {
+    for (index, (graph, files)) in configs.iter().enumerate() {
         let mut ninja = graph.manifest();
         ninja.include(RULES_PATH.as_bytes());
-        graph.emit(&mut ninja, &programs.cmake, &module_flag, &exports);
-        files.prep.emit(&mut ninja, graph);
+        let mut emitted = HashSet::new();
+        let included = std::iter::once(index).chain(
+            selection
+                .cross
+                .iter()
+                .copied()
+                .filter(|&other| other != index),
+        );
+        for (graph, files) in included
+            .clone()
+            .filter_map(|selected| configs.get(selected))
+        {
+            graph.emit_into(
+                &mut ninja,
+                &programs.cmake,
+                &module_flag,
+                &exports,
+                Some(&mut emitted),
+            );
+            graph.emit_clean_inputs(&mut ninja);
+            files.prep.emit(&mut ninja, graph);
+        }
+        multi::emit_clean(
+            &mut ninja,
+            &files.implementation,
+            included
+                .filter_map(|selected| configs.get(selected).and_then(|(graph, _)| graph.config)),
+            cross.iter().filter_map(|graph| graph.config),
+        );
+        if !cross.is_empty() {
+            graph.emit_aliases(&mut ninja, Some(b"all"), &cross, &emitted);
+        }
         emit_regeneration(&mut ninja, graph, &manifests, result, &regenerate);
         write_if_changed(
             host,
@@ -299,25 +331,30 @@ fn generate_multi(
             graph,
             files,
             &files.entry,
-            &programs,
-            &rebuild,
+            &[graph],
+            &emitted,
+            (&programs, &rebuild),
         )?;
+        if index == selection.default {
+            write_entry(
+                host,
+                build_dir,
+                default,
+                default_files,
+                b"build.ninja",
+                &defaults,
+                &emitted,
+                (&programs, &rebuild),
+            )?;
+        }
     }
-    write_entry(
-        host,
-        build_dir,
-        default,
-        default_files,
-        b"build.ninja",
-        &programs,
-        &rebuild,
-    )
+    Ok(())
 }
 
 fn config_artifacts<'a>(
     result: &'a GenerationResult,
     input: &BuildGraph,
-) -> HashMap<&'a [u8], &'a ArtifactSet> {
+) -> BTreeMap<&'a [u8], &'a ArtifactSet> {
     result
         .targets
         .iter()
@@ -344,20 +381,29 @@ impl ConfigFiles {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn write_entry(
     host: &dyn Host,
     build_dir: &Path,
     graph: &Graph<'_>,
     files: &ConfigFiles,
     entry: &[u8],
-    programs: &Programs,
-    rebuild: &[u8],
+    aliases: &[&Graph<'_>],
+    emitted: &HashSet<BString>,
+    (programs, rebuild): (&Programs, &[u8]),
 ) -> Result<(), GenError> {
     let mut ninja = Ninja::default();
     // The include path can contain a literal pipe.
     ninja.0.extend_from_slice(b"ninja_pipe = |\n");
     ninja.include(&files.implementation);
-    graph.emit_entry_aliases(&mut ninja);
+    graph.emit_aliases(&mut ninja, None, aliases, emitted);
+    if !graph.has_target(&"clean".into()) {
+        let targets = aliases
+            .iter()
+            .map(|graph| qualified(&"clean".into(), graph.config))
+            .collect::<Vec<_>>();
+        ninja.phony(&"clean".into(), &targets);
+    }
     files.prep.emit_aliases(&mut ninja, graph);
     emit_utilities(&mut ninja, graph, entry, programs, rebuild);
     ninja.0.extend_from_slice(b"default all\n");
@@ -548,6 +594,9 @@ fn emit_utilities(
         ("clean", clean, vec![], b"".as_slice(), b"CLEAN".as_slice()),
         ("help", help, vec![], b"".as_slice(), b"HELP".as_slice()),
     ] {
+        if name == "clean" && graph.config.is_some() {
+            continue;
+        }
         emit_utility(
             ninja,
             graph,
@@ -601,6 +650,20 @@ fn emit_utilities(
         Utility {
             name: "rebuild_cache",
             command: rebuild,
+            inputs: &[],
+            pool: b"console",
+            rule: b"CUSTOM_COMMAND",
+        },
+    );
+    let mut edit_cache = programs.cmake.clone();
+    edit_cache.extend_from_slice(b" -E echo ");
+    shell_word(b"No interactive CMake dialog available.", &mut edit_cache);
+    emit_utility(
+        ninja,
+        graph,
+        Utility {
+            name: "edit_cache",
+            command: &edit_cache,
             inputs: &[],
             pool: b"console",
             rule: b"CUSTOM_COMMAND",

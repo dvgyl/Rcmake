@@ -371,6 +371,7 @@ impl Outputs {
                 rename: options.rename.clone(),
             },
             optional: options.optional,
+            message: BString::default(),
         };
         self.push(action, options.exclude_from_all);
     }
@@ -488,6 +489,7 @@ impl Outputs {
                     configurations: vec![graph.config.0.clone()],
                     kind: InstallActionKind::Code(BString::default()),
                     optional: rule.optional,
+                    message: rule.message.clone(),
                 };
                 let mut script = BString::from("if(EXISTS ");
                 quote(&mut script, &from_native(&table));

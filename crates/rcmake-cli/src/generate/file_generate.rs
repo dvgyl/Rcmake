@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use rcmake_base::BString;
-use rcmake_diag::{PolicyId, PolicyStatus};
+use rcmake_diag::{Backtrace, Frame, FrameKind, PolicyId, PolicyStatus};
 use rcmake_gen_common::{
     GenError,
     export::{
@@ -9,10 +9,13 @@ use rcmake_gen_common::{
         FileGenerateRequest, write_generated_files,
     },
 };
-use rcmake_genex::{ConfigId, EvalContext, GenexHost, evaluate, parse};
+use rcmake_genex::{ConfigId, EvalContext, EvalSite, GenexHost, evaluate, parse};
 use rcmake_host::{Host, path::to_native};
-use rcmake_model::ProjectModel;
-use rcmake_resolve::{GenerationResult, usage::UsageResolver};
+use rcmake_model::{DirId, ProjectModel, PropertyMap};
+use rcmake_resolve::{
+    GenerationResult,
+    usage::{ObjectPaths, UsageResolver},
+};
 
 pub(super) fn write(
     model: &ProjectModel,
@@ -78,7 +81,7 @@ pub(super) fn write(
             newline: FileGenerateNewline::Native,
         };
         apply_options(&mut request, options)?;
-        request_dirs.push(*id);
+        request_dirs.push((*id, origin(props, &section)));
         requests.push(request);
     }
 
@@ -107,13 +110,15 @@ pub(super) fn write(
         })
         .collect::<Vec<_>>();
     let mut usage = UsageResolver::new(model);
+    let objects = ObjectPaths::new(&result.targets);
+    let root = &model.dir(DirId::ROOT).source_dir;
     let evaluate = |value: &[u8],
                     request: &FileGenerateRequest<'_>,
                     context: FileGenerateContext<'_>| {
-        let dir = request_dirs
+        let (dir, backtrace) = request_dirs
             .get(&std::ptr::from_ref(request))
             .ok_or_else(invalid_record)?;
-        let mut host = usage.host(*dir);
+        let mut host = usage.host(*dir).with_object_paths(&objects);
         let error = |message| GenError::Write {
             path: request.output.into(),
             message,
@@ -131,15 +136,42 @@ pub(super) fn write(
             language: context.language.map(BString::from),
             current: target,
             head: target,
+            site: EvalSite {
+                backtrace: backtrace.clone(),
+                property: None,
+            },
             ..EvalContext::default()
         };
         parse(value)
             .and_then(|ast| evaluate(&ast, &ctx, &mut host))
             .map(|(value, _)| value)
-            .map_err(|err| error(err.to_string().into()))
+            .map_err(|err| GenError::Invalid(err.at(backtrace, root).to_string().into()))
     };
     write_generated_files(&requests, &contexts, evaluate, host)?;
     Ok(())
+}
+
+fn origin(props: &PropertyMap, section: &str) -> Backtrace {
+    let frames: Vec<_> = (0..)
+        .map_while(|frame| {
+            let key = format!("{section}_FRAME_{frame}");
+            let get = |field: &str| props.get(format!("{key}_{field}").as_bytes());
+            Some(Frame {
+                file: get("FILE")?.as_slice().into(),
+                line: u32::try_from(index(get("LINE")?)?).ok()?,
+                name: get("NAME").map(|name| name.as_slice().into()),
+                kind: if get("DEFERRED").is_some() {
+                    FrameKind::Deferred
+                } else {
+                    FrameKind::Command
+                },
+            })
+        })
+        .collect();
+    frames
+        .into_iter()
+        .rev()
+        .fold(Backtrace::default(), |trace, frame| trace.push(frame))
 }
 
 fn index(value: &[u8]) -> Option<usize> {

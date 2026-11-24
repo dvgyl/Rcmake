@@ -6,8 +6,8 @@ use indexmap::{IndexMap, IndexSet};
 use rcmake_base::{BString, list, path_lex::Lexical};
 use rcmake_genex::{ConfigId, EvalContext, EvalSite, evaluate, parse};
 use rcmake_model::{
-    BT, CustomCommand, CustomCommandKind, DirId, ProjectModel, Target, TargetEvent, TargetId,
-    TargetKind,
+    BT, CustomCommand, CustomCommandKind, DirId, GeneratorKind, ProjectModel, Target, TargetEvent,
+    TargetId, TargetKind,
 };
 
 use super::graph::push;
@@ -15,12 +15,13 @@ use super::shell::direct;
 use super::{build_relative, compute_artifacts, join};
 use crate::ide::{IdeCustomPhase, IdeCustomStep};
 use crate::sources::{SourcePaths, absolute_path};
-use crate::usage::{ModelGenexHost, UsageResolver, handle};
+use crate::usage::{ModelGenexHost, ObjectPaths, UsageResolver, handle};
 use crate::{ArtifactSet, BuildStep, CustomStep, ResolveError, ResolvedTarget};
 
 pub(super) struct Commands<'a> {
     model: &'a ProjectModel,
     targets: &'a IndexMap<TargetId, &'a ResolvedTarget>,
+    objects: ObjectPaths<'a>,
     config: &'a ConfigId,
     outputs: IndexMap<BString, usize>,
     inputs: Vec<Vec<BString>>,
@@ -38,6 +39,7 @@ impl<'a> Commands<'a> {
         let mut commands = Self {
             model,
             targets,
+            objects: ObjectPaths::new(targets.values().copied()),
             config,
             outputs: IndexMap::new(),
             inputs: Vec::new(),
@@ -71,7 +73,8 @@ impl<'a> Commands<'a> {
         let binary = &self.model.dir(command.dir).binary_dir;
         let artifact_dependencies = RefCell::new(IndexSet::new());
         let paths = usage.source_paths();
-        let mut eval = CommandEvaluation::new(command, self.config, usage);
+        let mut eval = CommandEvaluation::new(self.model, command, self.config, usage);
+        eval.host = eval.host.with_object_paths(&self.objects);
         let outputs = eval.paths(binary, &command.outputs)?;
         let byproducts = eval.paths(binary, &command.byproducts)?;
         let working_dir = eval
@@ -277,6 +280,7 @@ struct CommandEvaluation<'model, 'resolver> {
 
 impl<'model, 'resolver> CommandEvaluation<'model, 'resolver> {
     fn new(
+        model: &ProjectModel,
         command: &CustomCommand,
         config: &ConfigId,
         usage: &'resolver mut UsageResolver<'model>,
@@ -284,6 +288,7 @@ impl<'model, 'resolver> CommandEvaluation<'model, 'resolver> {
         let target = command_target(command).map(handle);
         let mut host = usage.host(command.dir);
         host.current = target;
+        let multi_config = model.generator == Some(GeneratorKind::NinjaMultiConfig);
         Self {
             context: EvalContext {
                 config: config.clone(),
@@ -293,6 +298,8 @@ impl<'model, 'resolver> CommandEvaluation<'model, 'resolver> {
                     backtrace: command.backtrace.clone(),
                     property: None,
                 },
+                command_config: multi_config.then(|| config.clone()),
+                output_config: multi_config.then(|| config.clone()),
                 ..EvalContext::default()
             },
             host,
@@ -303,7 +310,14 @@ impl<'model, 'resolver> CommandEvaluation<'model, 'resolver> {
         if !value.windows(2).any(|pair| pair == b"$<") {
             return Ok(value.into());
         }
-        Ok(evaluate(&parse(value)?, &self.context, &mut self.host)?.0)
+        parse(value)
+            .and_then(|ast| evaluate(&ast, &self.context, &mut self.host))
+            .map(|(value, _)| value)
+            .map_err(|error| {
+                error
+                    .at(&self.context.site.backtrace, self.host.source_root())
+                    .into()
+            })
     }
 
     fn optional(&mut self, value: &Option<BString>) -> Result<Option<BString>, ResolveError> {
@@ -371,7 +385,7 @@ pub(crate) fn command_outputs(
     config: &ConfigId,
     usage: &mut UsageResolver<'_>,
 ) -> Result<(Vec<BString>, Vec<BString>), ResolveError> {
-    let mut eval = CommandEvaluation::new(command, config, usage);
+    let mut eval = CommandEvaluation::new(model, command, config, usage);
     let binary = &model.dir(command.dir).binary_dir;
     Ok((
         eval.paths(binary, &command.outputs)?,

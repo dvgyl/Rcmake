@@ -8,7 +8,7 @@
 #![forbid(unsafe_code)]
 
 use rcmake_base::BString;
-use rcmake_diag::Backtrace;
+use rcmake_diag::{Backtrace, Diagnostic, Effect, Frame, Location, MessageKind, RenderOptions};
 
 mod eval;
 mod parse;
@@ -172,8 +172,31 @@ pub trait GenexHost {
     /// Name of `target`.
     fn target_name(&self, target: TargetHandle) -> BString;
 
+    /// Read a property that belongs to an alias name.
+    fn alias_property(
+        &self,
+        _name: &[u8],
+        _property: &[u8],
+        _ctx: &EvalContext,
+    ) -> Option<BString> {
+        None
+    }
+
     /// Raw (unevaluated) value of a non-transitive property.
     fn raw_property(&self, target: TargetHandle, name: &[u8]) -> Option<BString>;
+
+    /// Value of a scalar property in an expression, with any compatible interface requirements.
+    fn scalar_property(
+        &mut self,
+        target: TargetHandle,
+        name: &[u8],
+        _ctx: &EvalContext,
+    ) -> Result<InterfaceView, GenexError> {
+        Ok(InterfaceView {
+            value: self.raw_property(target, name).unwrap_or_default(),
+            flags: EvalFlags::default(),
+        })
+    }
 
     /// Evaluated transitive property (`INTERFACE_*` closure) of `target` for the
     /// consumer in `ctx`.
@@ -192,6 +215,20 @@ pub trait GenexHost {
         part: ArtifactPart,
         config: &ConfigId,
     ) -> Option<BString>;
+
+    /// Get an artifact part, with errors from output property evaluation.
+    ///
+    /// # Errors
+    /// Returns an error if a property that names the artifact cannot be evaluated.
+    fn checked_artifact(
+        &self,
+        target: TargetHandle,
+        kind: ArtifactKind,
+        part: ArtifactPart,
+        config: &ConfigId,
+    ) -> Result<Option<BString>, GenexError> {
+        Ok(self.artifact(target, kind, part, config))
+    }
 
     /// Targets in the link closure of `target` for the consumer in `ctx`.
     fn link_closure(
@@ -219,6 +256,15 @@ pub trait GenexHost {
     ) -> Option<BString> {
         let _ = (config, sources);
         self.raw_property(target, b"TARGET_OBJECTS")
+    }
+
+    /// Directory that contains the target's intermediate build files.
+    fn target_intermediate_directory(
+        &self,
+        _target: TargetHandle,
+        _config: &ConfigId,
+    ) -> Option<BString> {
+        None
     }
 
     /// Return the artifact base name without the configuration postfix.
@@ -319,7 +365,82 @@ pub enum GenexError {
         /// Target name.
         target: BString,
     },
+    /// An output property needs its own value to compute the artifact path.
+    #[error("Target '{target}' {property} depends on itself.")]
+    ArtifactCycle {
+        /// Target name.
+        target: BString,
+        /// Output property class.
+        property: &'static str,
+    },
+    /// A generator expression failure with its originating call stack.
+    #[error("{0}")]
+    Located(Box<GenexDiagnostic>),
     /// Nesting is deeper than [`MAX_NESTING`].
     #[error("generator expression nesting is too deep")]
     TooDeep,
+}
+
+/// Source location and message of a generator expression failure.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GenexDiagnostic {
+    frames: Vec<Frame>,
+    body: BString,
+    source_root: BString,
+}
+
+impl std::fmt::Display for GenexDiagnostic {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let backtrace = self
+            .frames
+            .iter()
+            .rev()
+            .fold(Backtrace::default(), |backtrace, frame| {
+                backtrace.push(frame.clone())
+            });
+        let text = rcmake_diag::render(
+            &Diagnostic {
+                kind: MessageKind::Error,
+                effect: Effect::SetError,
+                category: None,
+                policy: None,
+                location: Location::Backtrace(backtrace),
+                body: self.body.clone(),
+            },
+            &RenderOptions {
+                relative_base: Some(self.source_root.clone()),
+                ..RenderOptions::default()
+            },
+        );
+        f.write_str(&String::from_utf8_lossy(&text))
+    }
+}
+
+impl GenexError {
+    /// Add source context to an error that does not already have it.
+    #[must_use]
+    pub fn at(self, backtrace: &Backtrace, source_root: &[u8]) -> Self {
+        if backtrace.is_empty() || matches!(self, Self::Located(_)) {
+            return self;
+        }
+        let body = match &self {
+            Self::Message {
+                expression,
+                message,
+            } if !expression.is_empty() => {
+                format!("Error evaluating generator expression:\n\n  {expression}\n\n{message}")
+                    .into()
+            }
+            _ => self.to_string().into(),
+        };
+        Self::Located(Box::new(GenexDiagnostic {
+            frames: backtrace
+                .frames()
+                .filter(|frame| frame.line != 0 || frame.name.is_some())
+                .cloned()
+                .collect(),
+            body,
+            source_root: source_root.into(),
+        }))
+    }
 }

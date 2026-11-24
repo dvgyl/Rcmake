@@ -168,7 +168,7 @@ fn parse<'a>(cx: &mut Cx<'_>, args: &[&'a [u8]]) -> Result<Install<'a>> {
             b"TYPE" => match arg(&mut args, option)? {
                 b"DIRECTORY" => install.directory = true,
                 b"PROGRAM" | b"EXECUTABLE" => install.executable = true,
-                b"MODULE" | b"SHARED_LIBRARY" => {
+                b"MODULE" | b"MODULE_LIBRARY" | b"SHARED_LIBRARY" => {
                     install.executable = !cx.var_is_on(b"CMAKE_INSTALL_SO_NO_EXE");
                 }
                 b"FILE" | b"STATIC_LIBRARY" => {}

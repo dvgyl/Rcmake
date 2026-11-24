@@ -44,7 +44,15 @@ pub(crate) fn resolve_target<'a>(
         metadata.folder = facts.attributes.get(b"FOLDER".as_slice()).cloned();
         (artifacts, Some(facts))
     } else {
-        (lower::compute_artifacts(model, target, &ctx.config), None)
+        let mut artifacts = lower::compute_artifacts(model, target, &ctx.config);
+        if has_configured_artifact_path(model, target) {
+            let (configured, _) = usage.ide_artifacts(id, &ctx.config)?;
+            artifacts.file = configured.file;
+            artifacts.linker_file = configured.linker_file;
+            artifacts.soname_file = configured.soname_file;
+            artifacts.import_file = configured.import_file;
+        }
+        (artifacts, None)
     };
     let mut resolved = ResolvedTarget {
         id,
@@ -237,14 +245,24 @@ pub(crate) fn resolve_target<'a>(
     );
     if file_sets || resolved.compile_units.iter().any(|unit| unit.scan) {
         validate_module_scanning(model, paths, target, &inputs, file_sets)?;
-        let standard = inputs.standard_requirements.get(b"CXX".as_slice()).copied();
-        let responses = lower::scan_responses(model, target, &resolved, standard)?;
-        if let Some(modules) = &mut resolved.cxx_modules {
-            modules.scan_responses = responses;
-        }
     }
     resolved.dependencies = dependencies.into_iter().collect();
     Ok((resolved, inputs))
+}
+
+fn has_configured_artifact_path(model: &ProjectModel, target: &Target) -> bool {
+    (lower::is_darwin(model, target.dir) && ide::bundle_kind(target) != ide::BundleKind::None)
+        || target.props.names().iter().any(|key| {
+            (key.windows(b"OUTPUT_NAME".len())
+                .any(|part| part == b"OUTPUT_NAME")
+                || key
+                    .windows(b"OUTPUT_DIRECTORY".len())
+                    .any(|part| part == b"OUTPUT_DIRECTORY"))
+                && target
+                    .props
+                    .get(key)
+                    .is_some_and(|value| value.windows(2).any(|part| part == b"$<"))
+        })
 }
 
 fn ide_artifacts(
@@ -256,7 +274,7 @@ fn ide_artifacts(
     flavor: ide::IdeFlavor,
 ) -> Result<(ArtifactSet, Box<ide::IdeFacts>), ResolveError> {
     let dir = model.dir(target.dir);
-    let (artifacts, naming) = usage.ide_artifacts(id, &ctx.config);
+    let (artifacts, naming) = usage.ide_artifacts(id, &ctx.config)?;
     let bundle = if flavor == ide::IdeFlavor::Xcode {
         ide::bundle_kind(target)
     } else {

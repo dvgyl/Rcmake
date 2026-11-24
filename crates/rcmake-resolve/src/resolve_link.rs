@@ -15,6 +15,7 @@ use crate::{
 #[derive(Default)]
 pub(crate) struct ResolvedLink {
     step: Option<LinkStep>,
+    position_independent: Option<bool>,
     dependencies: Vec<TargetId>,
     module_links: Vec<TargetId>,
     objects: IndexSet<BString>,
@@ -87,7 +88,9 @@ pub(crate) fn resolve_link(
         }
     }
     let linked_targets = usage.link_targets(id, &ctx)?;
+    let position_independent = usage.validate_compatible(id, &ctx, paths)?;
     let mut link = ResolvedLink {
+        position_independent,
         dependencies: target
             .utility_deps
             .iter()
@@ -242,6 +245,7 @@ pub(crate) fn attach_links(
         }
         target.link = link.step;
         target.dependencies = link.dependencies;
+        inputs.position_independent = link.position_independent;
         inputs.objects.extend(link.objects);
         if let Some(info) = &mut target.cxx_modules {
             let mut linked = link.module_links.into_iter().collect::<IndexSet<_>>();

@@ -222,6 +222,21 @@ fn install_command(out: &mut BString, action: &InstallAction, file_type: &[u8]) 
     if action.optional {
         out.extend_from_slice(b" OPTIONAL");
     }
+    let message = match &action.kind {
+        InstallActionKind::Directory { options, .. }
+            if options
+                .iter()
+                .take_while(|option| !matches!(option.as_slice(), b"PATTERN" | b"REGEX"))
+                .any(|option| option == b"MESSAGE_NEVER") =>
+        {
+            b"NEVER"
+        }
+        _ => action.message.as_slice(),
+    };
+    if matches!(message, b"ALWAYS" | b"LAZY" | b"NEVER") {
+        out.extend_from_slice(b" MESSAGE_");
+        out.extend_from_slice(message);
+    }
 }
 
 fn arguments(out: &mut BString, values: &[BString]) {
@@ -234,6 +249,9 @@ fn arguments(out: &mut BString, values: &[BString]) {
 fn directory_options(out: &mut BString, options: &[BString]) {
     let mut options = options.iter();
     while let Some(option) = options.next() {
+        if option == b"MESSAGE_NEVER" {
+            continue;
+        }
         out.push(b' ');
         if option == b"PATTERN" {
             out.extend_from_slice(b"REGEX");

@@ -42,18 +42,17 @@ impl<'a> Flags<'a> {
                 .is_some_and(|value| truth::is_on(value))
     }
 
-    pub(super) fn compile(&self, ipo: bool) -> Vec<BString> {
+    pub(super) fn compile(&self, ipo: bool, position_independent: Option<bool>) -> Vec<BString> {
         let mut flags = Vec::new();
         if ipo {
             self.extend(&mut flags, b"COMPILE_OPTIONS_IPO");
         }
-        let pic = target_property(self.model, self.target, PIC).map_or(
-            matches!(
+        let pic = position_independent
+            .or_else(|| self.position_independent())
+            .unwrap_or(matches!(
                 self.target.kind,
-                TargetKind::SharedLibrary | TargetKind::ModuleLibrary
-            ),
-            |value| truth::is_on(value),
-        );
+                TargetKind::SharedLibrary | TargetKind::ModuleLibrary,
+            ));
         if pic {
             if self.target.kind == TargetKind::Executable
                 && self
@@ -93,16 +92,16 @@ impl<'a> Flags<'a> {
         flags
     }
 
-    pub(super) fn pie_link(&self) -> Vec<BString> {
+    pub(super) fn pie_link(&self, position_independent: Option<bool>) -> Vec<BString> {
         if self.target.kind != TargetKind::Executable
             || self.target.policies.policies.get(PolicyId::new(83)) != PolicyStatus::New
         {
             return Vec::new();
         }
-        let Some(pic) = target_property(self.model, self.target, PIC) else {
+        let Some(pic) = position_independent.or_else(|| self.position_independent()) else {
             return Vec::new();
         };
-        let (supported, options): (&[u8], &[u8]) = if truth::is_on(pic) {
+        let (supported, options): (&[u8], &[u8]) = if pic {
             (b"LINK_PIE_SUPPORTED", b"LINK_OPTIONS_PIE")
         } else {
             (b"LINK_NO_PIE_SUPPORTED", b"LINK_OPTIONS_NO_PIE")
@@ -115,6 +114,10 @@ impl<'a> Flags<'a> {
             self.extend(&mut flags, options);
         }
         flags
+    }
+
+    fn position_independent(&self) -> Option<bool> {
+        target_property(self.model, self.target, PIC).map(|value| truth::is_on(value))
     }
 
     fn extend(&self, flags: &mut Vec<BString>, option: &[u8]) {

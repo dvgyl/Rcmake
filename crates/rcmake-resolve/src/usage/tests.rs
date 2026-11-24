@@ -438,10 +438,24 @@ fn active_property_cycle_is_distinct_from_a_static_link_cycle() {
         "$<TARGET_PROPERTY:app,COMPILE_DEFINITIONS>",
     );
     assert_eq!(
+        values(
+            &collect(&model, app, UsageField::CompileDefinitions, &ctx)
+                .unwrap()
+                .entries
+        ),
+        "ONE;TWO"
+    );
+    usage(
+        &mut model,
+        two,
+        UsageField::InterfaceCompileDefinitions,
+        "$<TARGET_PROPERTY:two,INTERFACE_COMPILE_DEFINITIONS>",
+    );
+    assert_eq!(
         collect(&model, app, UsageField::CompileDefinitions, &ctx)
             .unwrap_err()
             .to_string(),
-        "Self reference on target \"app\"."
+        "Self reference on target \"two\"."
     );
 }
 
