@@ -2,13 +2,14 @@
 
 use std::collections::BTreeMap;
 
-use crate::{msbuild, rules::quote, windows, xml::Writer};
+use crate::{msbuild_value, rules::quote, windows, xml::Writer};
 
 #[derive(Default)]
 pub(crate) struct Settings {
     values: BTreeMap<&'static str, String>,
     lists: BTreeMap<&'static str, Vec<String>>,
     options: Vec<String>,
+    condition_banner: bool,
 }
 
 impl Settings {
@@ -20,12 +21,45 @@ impl Settings {
         self.values.remove(key)
     }
 
+    pub(crate) fn has(&self, key: &str) -> bool {
+        self.values.contains_key(key)
+    }
+
     pub(crate) fn list(&mut self, key: &'static str, value: impl Into<String>) {
         self.lists.entry(key).or_default().push(value.into());
     }
 
     pub(crate) fn option(&mut self, flag: &str) {
-        self.options.push(msbuild(&quote(flag)));
+        self.options.push(msbuild_value(&quote(flag)));
+    }
+
+    pub(crate) fn append(&mut self, other: Self) {
+        self.values.extend(other.values);
+        for (key, values) in other.lists {
+            self.lists.entry(key).or_default().extend(values);
+        }
+        self.options.extend(other.options);
+    }
+
+    pub(crate) fn compiler_defaults(&mut self, toolset: &str) {
+        if toolset == "v142" && !self.values.contains_key("RemoveUnreferencedCodeData") {
+            self.condition_banner = true;
+        }
+        for (key, value) in [
+            ("BasicRuntimeChecks", "Default"),
+            ("BufferSecurityCheck", ""),
+            ("CallingConvention", ""),
+            ("FloatingPointModel", ""),
+            ("ForceConformanceInForLoopScope", ""),
+            ("MinimalRebuild", ""),
+            ("Optimization", ""),
+            ("RemoveUnreferencedCodeData", ""),
+            ("RuntimeLibrary", ""),
+            ("SupportJustMyCode", ""),
+            ("TreatWChar_tAsBuiltInType", ""),
+        ] {
+            self.values.entry(key).or_insert_with(|| value.into());
+        }
     }
 
     pub(crate) fn write(&self, xml: &mut Writer) {
@@ -34,16 +68,30 @@ impl Settings {
 
     pub(crate) fn write_condition(&self, xml: &mut Writer, attrs: &[(&str, &str)]) {
         for (key, value) in &self.values {
-            xml.text(key, attrs, value);
+            if *key == "SuppressStartupBanner" && self.condition_banner {
+                xml.text(
+                    key,
+                    &[("Condition", "'$(VCToolsVersion)' >= '14.29'")],
+                    value,
+                );
+            } else {
+                xml.text(key, attrs, value);
+            }
         }
         for (key, values) in &self.lists {
-            xml.text(key, attrs, &format!("{};%({key})", values.join(";")));
+            let values = values.join(";");
+            let value = if *key == "PreprocessorDefinitions" {
+                format!("%({key});{values}")
+            } else {
+                format!("{values};%({key})")
+            };
+            xml.text(key, attrs, &value);
         }
         if !self.options.is_empty() {
             xml.text(
                 "AdditionalOptions",
                 attrs,
-                &format!("{} %(AdditionalOptions)", self.options.join(" ")),
+                &format!("%(AdditionalOptions) {}", self.options.join(" ")),
             );
         }
     }
@@ -67,7 +115,7 @@ pub(crate) fn compile(flags: impl IntoIterator<Item = String>) -> Settings {
                     } else {
                         value
                     };
-                    settings.list(property, msbuild(&value));
+                    settings.list(property, msbuild_value(&value));
                 } else {
                     settings.option(&flag);
                 }
@@ -75,13 +123,13 @@ pub(crate) fn compile(flags: impl IntoIterator<Item = String>) -> Settings {
             Some(key) if key.starts_with('D') && !key.starts_with("DEBUG") => {
                 settings.list(
                     "PreprocessorDefinitions",
-                    msbuild(key.strip_prefix('D').unwrap_or_default()),
+                    msbuild_value(key.strip_prefix('D').unwrap_or_default()),
                 );
             }
             Some(key) if key.starts_with('I') => {
                 settings.list(
                     "AdditionalIncludeDirectories",
-                    msbuild(&windows(key.strip_prefix('I').unwrap_or_default())),
+                    msbuild_value(&windows(key.strip_prefix('I').unwrap_or_default())),
                 );
             }
             Some(key) => match compile_property(key) {
@@ -99,6 +147,25 @@ fn compile_property(flag: &str) -> Option<(&'static str, &'static str)> {
         "Od" | "O0" => ("Optimization", "Disabled"),
         "O1" => ("Optimization", "MinSpace"),
         "O2" => ("Optimization", "MaxSpeed"),
+        "TC" => ("CompileAs", "CompileAsC"),
+        "TP" => ("CompileAs", "CompileAsCpp"),
+        "RTCs" => ("BasicRuntimeChecks", "StackFrameRuntimeCheck"),
+        "RTCu" => ("BasicRuntimeChecks", "UninitializedLocalUsageCheck"),
+        "RTC1" | "RTCsu" | "RTCus" => ("BasicRuntimeChecks", "EnableFastChecks"),
+        "GS" => ("BufferSecurityCheck", "true"),
+        "GS-" => ("BufferSecurityCheck", "false"),
+        "Gd" => ("CallingConvention", "Cdecl"),
+        "Gr" => ("CallingConvention", "FastCall"),
+        "Gz" => ("CallingConvention", "StdCall"),
+        "Gv" => ("CallingConvention", "VectorCall"),
+        "fp:precise" => ("FloatingPointModel", "Precise"),
+        "fp:strict" => ("FloatingPointModel", "Strict"),
+        "fp:fast" => ("FloatingPointModel", "Fast"),
+        "Gm" => ("MinimalRebuild", "true"),
+        "Gm-" => ("MinimalRebuild", "false"),
+        "JMC" => ("SupportJustMyCode", "true"),
+        "JMC-" => ("SupportJustMyCode", "false"),
+        "nologo" => ("SuppressStartupBanner", "true"),
         "W0" => ("WarningLevel", "TurnOffAllWarnings"),
         "W1" => ("WarningLevel", "Level1"),
         "W2" => ("WarningLevel", "Level2"),
@@ -162,7 +229,10 @@ pub(crate) fn link(flags: impl IntoIterator<Item = String>, archive: bool) -> Se
             "LTCG" if archive => settings.set("LinkTimeCodeGeneration", "true"),
             _ if key.to_ascii_uppercase().starts_with("LIBPATH:") => {
                 if let Some((_, path)) = key.split_once(':') {
-                    settings.list("AdditionalLibraryDirectories", msbuild(&windows(path)));
+                    settings.list(
+                        "AdditionalLibraryDirectories",
+                        msbuild_value(&windows(path)),
+                    );
                 }
             }
             _ => settings.option(&flag),

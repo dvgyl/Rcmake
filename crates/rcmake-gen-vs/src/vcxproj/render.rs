@@ -273,6 +273,10 @@ fn write_items(xml: &mut Writer, plan: &Plan, settings: &Settings, custom: bool)
             }
             if matches!(config.language.as_str(), "C" | "CXX")
                 && config.language != source_language(&item.path)
+                && !config
+                    .compile
+                    .as_ref()
+                    .is_some_and(|settings| settings.has("CompileAs"))
             {
                 let mode = if config.language == "C" {
                     "CompileAsC"

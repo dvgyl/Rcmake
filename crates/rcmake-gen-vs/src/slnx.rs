@@ -56,7 +56,7 @@ fn write_project(xml: &mut Writer, solution: &Solution<'_>, project: &Project) {
             xml.empty("Build", &[("Solution", &selection), ("Project", "false")]);
         }
         if project.deploy.get(index) == Some(&true) {
-            xml.empty("Deploy", &[("Solution", &selection), ("Project", "true")]);
+            xml.empty("Deploy", &[("Solution", &selection)]);
         }
     }
     xml.end();

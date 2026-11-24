@@ -131,10 +131,20 @@ impl<'a> UsageResolver<'a> {
         value: &BString,
         ctx: &EvalContext,
     ) -> Result<BString, ResolveError> {
+        self.eval_ide_property_with_flags(id, property, value, ctx)
+            .map(|(value, _)| value)
+    }
+
+    pub(crate) fn eval_ide_property_with_flags(
+        &mut self,
+        id: TargetId,
+        property: &[u8],
+        value: &BString,
+        ctx: &EvalContext,
+    ) -> Result<(BString, EvalFlags), ResolveError> {
         let target = self.target(id)?;
         let entry = BT::new(value.clone(), target.backtrace.clone());
         self.eval_entry(id, target.dir, property, &entry, ctx, false)
-            .map(|(value, _)| value)
     }
 
     pub(crate) fn source_paths(&self) -> Option<&'a SourcePaths<'a>> {

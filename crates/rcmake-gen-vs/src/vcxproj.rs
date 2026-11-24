@@ -7,11 +7,11 @@ use rcmake_gen_common::ide::UtilityKind;
 use rcmake_model::{ProjectModel, Target, TargetKind, UsageField};
 use rcmake_resolve::{
     BuildStep, CustomStep, GenerationResult, LinkFragmentRole, LinkStep, ResolvedTarget,
-    ide::{IdeCustomPhase, IdeLinkItem, IdeSourceKind},
+    ide::{IdeCompileSettings, IdeCustomPhase, IdeLinkItem, IdeSourceKind},
 };
 
 use crate::{
-    GenError, Project, Settings, absolute, flags_table, guid, join, msbuild,
+    GenError, Project, Settings, absolute, flags_table, guid, join, msbuild, msbuild_value,
     rules::{self, Command, Rule},
     string, windows,
 };
@@ -187,39 +187,22 @@ impl Context<'_> {
             }
 
             if let Some(ide) = fact.and_then(|fact| fact.ide.as_deref()) {
-                let compile = |language: &str| {
-                    self.compile_settings(
-                        target,
-                        name,
-                        language,
-                        ide.compile
-                            .iter()
-                            .find(|settings| settings.language.as_slice() == language.as_bytes())
-                            .map(|settings| {
-                                let mut out = flags_table::compile(
-                                    settings
-                                        .flags
-                                        .iter()
-                                        .flat_map(|flag| ide_flags(&string(&flag.value))),
-                                );
-                                for define in &settings.defines {
-                                    out.list(
-                                        "PreprocessorDefinitions",
-                                        msbuild(&string(&define.value)),
-                                    );
-                                }
-                                for include in &settings.includes {
-                                    out.list(
-                                        "AdditionalIncludeDirectories",
-                                        msbuild(&windows(&string(&include.path))),
-                                    );
-                                }
-                                out
-                            }),
-                    )
+                let target_compile = |settings: &IdeCompileSettings| {
+                    let mut compiled = visual_studio_compile(settings);
+                    if matches!(settings.language.as_slice(), b"C" | b"CXX") {
+                        compiled.take("CompileAs");
+                    }
+                    compiled
                 };
-                if let Some(settings) = ide.compile.first().filter(|_| ide.compile.len() == 1) {
-                    config.compile = compile(&string(&settings.language));
+                if let [settings] = ide.compile.as_slice() {
+                    config.compile = target_compile(settings);
+                }
+                if !ide.compile.is_empty() {
+                    config.compile.compiler_defaults(&self.settings.toolset);
+                    config.compile.list(
+                        "PreprocessorDefinitions",
+                        r#"CMAKE_INTDIR="$(Configuration)""#,
+                    );
                 }
                 for source in &ide.sources {
                     let path = self.source_path(&string(&source.path));
@@ -248,9 +231,23 @@ impl Context<'_> {
                         .any(|value| value.as_slice() == name.as_bytes());
                     if kind == Kind::Compile {
                         item.object = self.object_path(&path, name, fact);
-                        if ide.compile.len() > 1 {
-                            item.compile = Some(compile(&language));
-                        }
+                        let base = (ide.compile.len() > 1)
+                            .then(|| {
+                                ide.compile.iter().find(|settings| {
+                                    settings.language.as_slice() == language.as_bytes()
+                                })
+                            })
+                            .flatten();
+                        item.compile = match (base, &source.compile) {
+                            (Some(settings), overrides) => {
+                                let mut compiled = target_compile(settings);
+                                if let Some(overrides) = overrides {
+                                    compiled.append(visual_studio_compile(overrides));
+                                }
+                                Some(compiled)
+                            }
+                            (None, overrides) => overrides.as_ref().map(visual_studio_compile),
+                        };
                         item.language = language;
                     }
                 }
@@ -415,12 +412,15 @@ impl Context<'_> {
         let mut out = flags_table::compile(flags);
         for usage in [&dir.usage, &target.usage] {
             for entry in usage.entries(UsageField::CompileDefinitions) {
-                out.list("PreprocessorDefinitions", msbuild(&string(&entry.value)));
+                out.list(
+                    "PreprocessorDefinitions",
+                    msbuild_value(&string(&entry.value)),
+                );
             }
             for entry in usage.entries(UsageField::IncludeDirectories) {
                 out.list(
                     "AdditionalIncludeDirectories",
-                    msbuild(&windows(&self.source_path(&string(&entry.value)))),
+                    msbuild_value(&windows(&self.source_path(&string(&entry.value)))),
                 );
             }
         }
@@ -474,7 +474,7 @@ impl Context<'_> {
         for dir in &ide.link_directories {
             out.list(
                 "AdditionalLibraryDirectories",
-                msbuild(&windows(&string(dir))),
+                msbuild_value(&windows(&string(dir))),
             );
         }
         out
@@ -732,6 +732,28 @@ fn xml_name(value: &str) -> bool {
         .next()
         .is_some_and(|ch| ch.is_ascii_alphabetic() || ch == '_')
         && chars.all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '.' | '-'))
+}
+
+fn visual_studio_compile(settings: &IdeCompileSettings) -> flags_table::Settings {
+    let mut out = flags_table::compile(
+        settings
+            .flags
+            .iter()
+            .flat_map(|flag| ide_flags(&string(&flag.value))),
+    );
+    for define in &settings.defines {
+        out.list(
+            "PreprocessorDefinitions",
+            msbuild_value(&string(&define.value)),
+        );
+    }
+    for include in &settings.includes {
+        out.list(
+            "AdditionalIncludeDirectories",
+            msbuild_value(&windows(&string(&include.path))),
+        );
+    }
+    out
 }
 
 fn ide_flags(text: &str) -> Vec<String> {

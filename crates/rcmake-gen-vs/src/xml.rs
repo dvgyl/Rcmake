@@ -95,3 +95,41 @@ fn escape(output: &mut String, value: &str, attribute: bool) {
         }
     }
 }
+
+pub(crate) fn unescape_attribute(mut value: &str) -> String {
+    let mut out = String::new();
+    while let Some((prefix, rest)) = value.split_once('&') {
+        out.push_str(prefix);
+        let Some((entity, next)) = rest.split_once(';') else {
+            out.push('&');
+            out.push_str(rest);
+            return out;
+        };
+        let decoded = match entity {
+            "amp" => Some('&'),
+            "lt" => Some('<'),
+            "gt" => Some('>'),
+            "quot" => Some('"'),
+            "apos" => Some('\''),
+            _ => entity
+                .strip_prefix("#x")
+                .and_then(|hex| u32::from_str_radix(hex, 16).ok())
+                .or_else(|| {
+                    entity
+                        .strip_prefix('#')
+                        .and_then(|decimal| decimal.parse().ok())
+                })
+                .and_then(char::from_u32),
+        };
+        if let Some(decoded) = decoded {
+            out.push(decoded);
+        } else {
+            out.push('&');
+            out.push_str(entity);
+            out.push(';');
+        }
+        value = next;
+    }
+    out.push_str(value);
+    out
+}

@@ -13,7 +13,9 @@
 use indexmap::{IndexMap, IndexSet};
 use rcmake_base::{BString, list, path_lex::Lexical, truth};
 use rcmake_genex::{ConfigId, EvalContext};
-use rcmake_model::{BT, FileSetKind, GeneratorKind, ProjectModel, Target, TargetId, TargetKind};
+use rcmake_model::{
+    BT, DirId, FileSetKind, GeneratorKind, ProjectModel, Target, TargetId, TargetKind,
+};
 
 use crate::{
     CompileGroup, FileSetMember, InterfaceInclude, ResolveError, ResolvedTarget, absolute_path,
@@ -281,40 +283,11 @@ pub(crate) fn object_directory(
     let binary = &model.dir(target.dir).binary_dir;
     match flavor {
         IdeFlavor::Xcode => {
-            let key = [
-                b"OSX_ARCHITECTURES_",
-                config.0.to_ascii_uppercase().as_slice(),
-            ]
-            .concat();
-            let architectures = target
-                .props
-                .get(&key)
-                .or_else(|| target.props.get(b"OSX_ARCHITECTURES"))
-                .or_else(|| lower::definition(model, target.dir, b"CMAKE_OSX_ARCHITECTURES"));
-            let architectures = architectures
-                .into_iter()
-                .chain(
-                    [
-                        b"CMAKE_XCODE_ARCHS".as_slice(),
-                        b"_CMAKE_APPLE_ARCHS_DEFAULT",
-                        b"CMAKE_SYSTEM_PROCESSOR",
-                    ]
-                    .into_iter()
-                    .filter_map(|key| lower::definition(model, target.dir, key)),
-                )
-                .find(|value| !value.is_empty())
-                .map(|value| list::split(value, list::Empty::Drop))
-                .unwrap_or_default();
-            let arch = match architectures.as_slice() {
-                [arch] => arch.as_slice(),
-                [] if cfg!(target_arch = "aarch64") => b"arm64",
-                [] if cfg!(target_arch = "x86_64") => b"x86_64",
-                _ => b"$(CURRENT_ARCH)",
-            };
             let build = absolute_path(
-                binary,
+                &model.dir(DirId::ROOT).binary_dir,
                 &[b"build/", target.name.as_slice(), b".build"].concat(),
             );
+            let arch = xcode_object_arch(model, target);
             let config = absolute_path(&build, &config.0);
             absolute_path(&config, &[b"Objects-normal/", arch].concat())
         }
@@ -323,6 +296,71 @@ pub(crate) fn object_directory(
             absolute_path(&dir, &config.0)
         }
     }
+}
+
+fn xcode_object_arch<'a>(model: &'a ProjectModel, target: &'a Target) -> &'a [u8] {
+    const CURRENT: &[u8] = b"$(CURRENT_ARCH)";
+    if let Some(architectures) = target.props.get(b"OSX_ARCHITECTURES") {
+        let mut archs = architectures
+            .split(|&byte| byte == b';')
+            .filter(|arch| !arch.is_empty());
+        if let Some(arch) = archs.next() {
+            return if archs.next().is_some() {
+                CURRENT
+            } else {
+                arch
+            };
+        }
+    }
+    let definition = |key| lower::definition(model, DirId::ROOT, key);
+    let embedded_sdk = || {
+        definition(b"CMAKE_OSX_SYSROOT").is_some_and(|sdk| {
+            let sdk = sdk.to_ascii_lowercase();
+            sdk.split(|&byte| byte == b'/').any(|part| {
+                [
+                    b"appletvos".as_slice(),
+                    b"appletvsimulator",
+                    b"iphoneos",
+                    b"iphonesimulator",
+                    b"watchos",
+                    b"watchsimulator",
+                    b"xros",
+                    b"xrsimulator",
+                ]
+                .iter()
+                .any(|prefix| part.starts_with(prefix))
+            })
+        })
+    };
+    if model
+        .global
+        .props
+        .get(b"XCODE_EMIT_EFFECTIVE_PLATFORM_NAME")
+        .map_or_else(embedded_sdk, |value| truth::is_on(value))
+    {
+        return CURRENT;
+    }
+    for key in [
+        b"CMAKE_OSX_ARCHITECTURES".as_slice(),
+        b"_CMAKE_APPLE_ARCHS_DEFAULT",
+    ] {
+        if let Some(value) = definition(key) {
+            let mut archs = value
+                .split(|&byte| byte == b';')
+                .filter(|arch| !arch.is_empty());
+            if let Some(arch) = archs.next() {
+                return if archs.next().is_some() {
+                    CURRENT
+                } else {
+                    arch
+                };
+            }
+        }
+    }
+    definition(b"CMAKE_XCODE_ARCHS")
+        .and_then(|value| value.split(|&byte| byte == b';').next())
+        .filter(|arch| !arch.is_empty())
+        .unwrap_or(CURRENT)
 }
 
 pub(crate) fn object_path(
@@ -377,8 +415,27 @@ impl IdeFacts {
         }
         for (key, property) in selected {
             if let Some(value) = target.props.get(&property) {
-                self.attributes
-                    .insert(key, usage.eval_ide_property(id, &property, value, &ctx)?);
+                let (evaluated, flags) =
+                    usage.eval_ide_property_with_flags(id, &property, value, &ctx)?;
+                if flavor == IdeFlavor::Xcode
+                    && flags.context_sensitive
+                    && matches!(
+                        property.as_slice(),
+                        b"XCODE_EMBED_FRAMEWORKS"
+                            | b"XCODE_EMBED_PLUGINS"
+                            | b"XCODE_EMBED_APP_EXTENSIONS"
+                            | b"XCODE_EMBED_EXTENSIONKIT_EXTENSIONS"
+                            | b"XCODE_EMBED_XPC_SERVICES"
+                            | b"XCODE_EMBED_RESOURCES"
+                    )
+                {
+                    let name = &target.name;
+                    let body = format!(
+                        "Xcode does not support per-config {property}:\n\n  {value}\n\nspecified for target:\n\n  {name}"
+                    );
+                    return Err(ResolveError::Message(body.into()));
+                }
+                self.attributes.insert(key, evaluated);
             }
         }
         Ok(())
@@ -605,109 +662,99 @@ pub(crate) fn collect_link_items<'a>(
         .collect()
 }
 
-fn xcode_source_key(source: &IdeSource) -> (BString, Option<BString>) {
-    if source.kind == IdeSourceKind::Object {
-        // The build directory contains the configuration and architecture.
-        // Compare the object library directory and the file name.
-        let path = Lexical::new(&source.path);
-        let arch = Lexical::new(path.parent());
-        let objects = Lexical::new(arch.parent());
-        let config = Lexical::new(objects.parent());
-        if objects.filename() == b"Objects-normal" {
-            return (config.parent().into(), Some(path.filename().into()));
-        }
-    }
-    (source.path.clone(), None)
-}
-
-pub(crate) fn finish_sources(
+pub(crate) fn check_xcode_sources(
     model: &ProjectModel,
     paths: &SourcePaths<'_>,
-    targets: &mut [ResolvedTarget],
-    flavor: IdeFlavor,
+    baseline: &mut IndexMap<TargetId, (ConfigId, Vec<BString>)>,
+    inputs: &IndexMap<TargetId, TargetInputs>,
+    config: &ConfigId,
 ) -> Result<(), ResolveError> {
+    for (&id, input) in inputs {
+        let sources = input
+            .sources
+            .iter()
+            .filter(|path| paths.object_owner(path).is_none())
+            .cloned()
+            .collect::<Vec<_>>();
+        let entry = baseline.entry(id);
+        match entry {
+            indexmap::map::Entry::Vacant(entry) => {
+                entry.insert((config.clone(), sources));
+            }
+            indexmap::map::Entry::Occupied(entry) => {
+                let (first_config, first_sources) = entry.get();
+                if first_sources != &sources
+                    && let Some(target) = model.target(id)
+                {
+                    let block = |config: &ConfigId, sources: &[BString]| {
+                        let mut text = format!("Config \"{}\":", config.0);
+                        if !sources.is_empty() {
+                            let files = sources.iter().map(ToString::to_string).collect::<Vec<_>>();
+                            text.push_str("\n\n  ");
+                            text.push_str(&files.join("\n  "));
+                        }
+                        text
+                    };
+                    let name = &target.name;
+                    let first = block(first_config, first_sources);
+                    let different = block(config, &sources);
+                    let body = format!(
+                        "Target \"{name}\" has source files which vary by configuration. This is not supported by the \"Xcode\" generator.\n\n{first}\n\n{different}"
+                    );
+                    return Err(module_error(model, paths, target, body.into()));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn finish_vs_sources(targets: &mut [ResolvedTarget]) {
     let mut by_id = IndexMap::<_, Vec<_>>::new();
     for target in targets {
         if target.ide.is_some() {
             by_id.entry(target.id).or_default().push(target);
         }
     }
-    for (id, configs) in by_id {
-        match flavor {
-            IdeFlavor::Xcode => {
-                let sources = |target: &ResolvedTarget| {
-                    target
-                        .ide
-                        .iter()
-                        .flat_map(|facts| &facts.sources)
-                        .map(xcode_source_key)
-                        .collect::<IndexSet<_>>()
-                };
-                if let (Some(raw), Some(first)) = (model.target(id), configs.first()) {
-                    let first = sources(first);
-                    if configs
-                        .iter()
-                        .skip(1)
-                        .all(|target| sources(target) == first)
-                    {
-                        continue;
-                    }
-                    let mut body = format!(
-                        "Target \"{}\" has source files which vary by configuration.  This is not supported by the \"Xcode\" generator.\n",
-                        raw.name
-                    );
-                    for target in configs {
-                        use std::fmt::Write;
-                        let _ = write!(body, "\nConfig \"{}\":\n\n", target.config.0);
-                        for source in target.ide.iter().flat_map(|facts| &facts.sources) {
-                            let _ = writeln!(body, "  {}", source.path);
-                        }
-                    }
-                    return Err(module_error(model, paths, raw, body.trim_end().into()));
-                }
-            }
-            IdeFlavor::VisualStudio => {
-                let mut sources = IndexMap::<_, (IdeSource, IndexSet<BString>)>::new();
-                for target in &configs {
-                    for source in target.ide.iter().flat_map(|facts| &facts.sources) {
-                        sources
-                            .entry(source.path.clone())
-                            .or_insert_with(|| (source.clone(), IndexSet::new()))
-                            .1
-                            .insert(target.config.0.clone());
-                    }
-                }
-                let all_configs: Vec<_> = configs
-                    .iter()
-                    .map(|target| target.config.0.clone())
-                    .collect();
-                for target in configs {
-                    let Some(facts) = &mut target.ide else {
-                        continue;
-                    };
-                    let mut local: IndexMap<_, _> = std::mem::take(&mut facts.sources)
-                        .into_iter()
-                        .map(|source| (source.path.clone(), source))
-                        .collect();
-                    facts.sources = sources
-                        .iter()
-                        .map(|(path, (source, included))| {
-                            let mut source = local.swap_remove(path).unwrap_or_else(|| {
-                                let mut source = source.clone();
-                                source.compile = None;
-                                source
-                            });
-                            source.excluded_configs = all_configs
-                                .iter()
-                                .filter(|config| !included.contains(*config))
-                                .cloned()
-                                .collect();
-                            source
-                        })
-                        .collect();
-                }
+    for configs in by_id.into_values() {
+        let mut sources = IndexMap::<_, (IdeSource, IndexSet<BString>)>::new();
+        for target in &configs {
+            for source in target.ide.iter().flat_map(|facts| &facts.sources) {
+                sources
+                    .entry(source.path.clone())
+                    .or_insert_with(|| (source.clone(), IndexSet::new()))
+                    .1
+                    .insert(target.config.0.clone());
             }
         }
+        let all_configs: Vec<_> = configs
+            .iter()
+            .map(|target| target.config.0.clone())
+            .collect();
+        for target in configs {
+            let Some(facts) = &mut target.ide else {
+                continue;
+            };
+            let mut local: IndexMap<_, _> = std::mem::take(&mut facts.sources)
+                .into_iter()
+                .map(|source| (source.path.clone(), source))
+                .collect();
+            facts.sources = sources
+                .iter()
+                .map(|(path, (source, included))| {
+                    let mut source = local.swap_remove(path).unwrap_or_else(|| {
+                        let mut source = source.clone();
+                        source.compile = None;
+                        source
+                    });
+                    source.excluded_configs = all_configs
+                        .iter()
+                        .filter(|config| !included.contains(*config))
+                        .cloned()
+                        .collect();
+                    source
+                })
+                .collect();
+        }
     }
-    Ok(())
 }

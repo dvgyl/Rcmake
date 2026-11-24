@@ -2,9 +2,10 @@
 
 use rcmake_gen_common::GenError;
 use rcmake_gen_common::ide::{BuildCommand, BuildRequest, Jobs};
-use rcmake_model::GeneratorKind;
+use rcmake_host::{Host, NativeHost, ReadRange, path::to_native};
+use rcmake_model::{GeneratorKind, VsVersion};
 
-use crate::{default_platform, solution_ext, string, windows};
+use crate::{CPP_TYPE, default_platform, solution_ext, string, windows, xml};
 
 /// Return the native processes for a Visual Studio build request, in run order.
 ///
@@ -12,6 +13,14 @@ use crate::{default_platform, solution_ext, string, windows};
 ///
 /// Returns an error if the requested generator is not Visual Studio.
 pub fn build_commands(req: &BuildRequest<'_>) -> Result<Vec<BuildCommand>, GenError> {
+    let host = NativeHost::new().ok();
+    plan(req, host.as_ref().map(|host| host as &dyn Host))
+}
+
+pub(crate) fn plan(
+    req: &BuildRequest<'_>,
+    host: Option<&dyn Host>,
+) -> Result<Vec<BuildCommand>, GenError> {
     let GeneratorKind::VisualStudio(version) = req.generator else {
         return Err(GenError::Invalid(
             "A Visual Studio generator is required.".into(),
@@ -22,18 +31,13 @@ pub fn build_commands(req: &BuildRequest<'_>) -> Result<Vec<BuildCommand>, GenEr
     } else {
         string(req.make_program)
     };
-    let devenv = program.rsplit(['/', '\\']).next().is_some_and(|file| {
-        matches!(
-            file.to_ascii_lowercase().as_str(),
-            "devenv" | "devenv.com" | "devenv.exe"
-        )
-    });
+    let devenv = program.to_ascii_lowercase().contains("devenv");
     let config = req
         .config
         .filter(|value| !value.is_empty())
         .map_or_else(|| "Debug".into(), string);
     let platform = if req.platform.is_empty() {
-        default_platform().into()
+        default_platform(host.map(Host::system).as_ref()).into()
     } else {
         string(req.platform)
     };
@@ -43,7 +47,33 @@ pub fn build_commands(req: &BuildRequest<'_>) -> Result<Vec<BuildCommand>, GenEr
         string(req.project_name)
     };
     let solution = format!("{project}.{}", solution_ext(version));
-    let command = |target: &str| {
+    let solution_data = host
+        .filter(|_| {
+            !devenv
+                && req.targets.iter().any(|target| {
+                    !target.is_empty()
+                        && target.as_slice() != b"clean"
+                        && !target.contains(&b'/')
+                        && !target.contains(&b'\\')
+                })
+        })
+        .and_then(|host| {
+            let path = to_native(req.build_dir).join(&solution);
+            host.read(
+                &path,
+                ReadRange::All {
+                    limit: 64 * 1024 * 1024,
+                },
+            )
+            .ok()
+        })
+        .and_then(|bytes| String::from_utf8(bytes).ok());
+    let command = |target: &str, clean_first: bool| {
+        let target = if target.is_empty() {
+            "ALL_BUILD"
+        } else {
+            target
+        };
         let clean = target == "clean";
         let mut argv = vec![program.as_str().into()];
         if devenv {
@@ -57,7 +87,15 @@ pub fn build_commands(req: &BuildRequest<'_>) -> Result<Vec<BuildCommand>, GenEr
             if clean {
                 argv.extend([solution.as_str().into(), "/t:Clean".into()]);
             } else {
-                let path = windows(target);
+                let path = if target.contains(['/', '\\']) {
+                    windows(target)
+                } else {
+                    let name = target.strip_suffix(".vcxproj").unwrap_or(target);
+                    solution_data
+                        .as_deref()
+                        .and_then(|data| project_path(data, version, name))
+                        .unwrap_or_else(|| target.into())
+                };
                 argv.push(if path.to_ascii_lowercase().ends_with(".vcxproj") {
                     path.into()
                 } else {
@@ -76,7 +114,9 @@ pub fn build_commands(req: &BuildRequest<'_>) -> Result<Vec<BuildCommand>, GenEr
             }
             argv.push(if req.verbose { "/v:n" } else { "/v:m" }.into());
         }
-        argv.extend_from_slice(req.native_args);
+        if !clean_first {
+            argv.extend_from_slice(req.native_args);
+        }
         BuildCommand {
             argv,
             working_dir: req.build_dir.into(),
@@ -89,12 +129,43 @@ pub fn build_commands(req: &BuildRequest<'_>) -> Result<Vec<BuildCommand>, GenEr
             .first()
             .is_some_and(|target| target.as_slice() == b"clean")
     {
-        commands.push(command("clean"));
+        commands.push(command("clean", true));
     }
     if req.targets.is_empty() {
-        commands.push(command("ALL_BUILD"));
+        commands.push(command("ALL_BUILD", false));
     } else {
-        commands.extend(req.targets.iter().map(|target| command(&string(target))));
+        commands.extend(
+            req.targets
+                .iter()
+                .map(|target| command(&string(target), false)),
+        );
     }
     Ok(commands)
+}
+
+fn project_path(solution: &str, version: VsVersion, target: &str) -> Option<String> {
+    if version.writes_slnx() {
+        return solution.lines().find_map(|line| {
+            // The solution writer puts the Path attribute first.
+            let (path, _) = line
+                .trim_start()
+                .strip_prefix("<Project Path=\"")?
+                .split_once('"')?;
+            let path = xml::unescape_attribute(path);
+            let (name, extension) = path.rsplit(['/', '\\']).next()?.rsplit_once('.')?;
+            (extension.eq_ignore_ascii_case("vcxproj") && name.eq_ignore_ascii_case(target))
+                .then(|| windows(&path))
+        });
+    }
+    solution.lines().find_map(|line| {
+        let (kind, fields) = line.strip_prefix("Project(\"")?.split_once("\") = \"")?;
+        if !kind.eq_ignore_ascii_case(CPP_TYPE) {
+            return None;
+        }
+        let (name, fields) = fields.split_once("\", \"")?;
+        let (path, _) = fields.rsplit_once("\", \"")?;
+        let (_, extension) = path.rsplit_once('.')?;
+        (extension.eq_ignore_ascii_case("vcxproj") && name.eq_ignore_ascii_case(target))
+            .then(|| windows(&path.replace("\"\"", "\"")))
+    })
 }

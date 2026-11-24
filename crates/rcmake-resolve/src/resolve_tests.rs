@@ -1969,11 +1969,13 @@ fn visual_studio_layout_and_per_configuration_source_union() -> TestResult {
 #[test]
 fn xcode_rejects_sources_that_vary_by_configuration() -> TestResult {
     let mut model = project();
-    model.add_target(target(
+    let mut pc = target(
         "pc",
         TargetKind::Executable,
-        &["main.c", "$<$<CONFIG:Debug>:core.c>"],
-    ))?;
+        &["main.c", "$<$<CONFIG:Debug,DebugExtra>:core.c>"],
+    );
+    pc.props.set("RESOURCE".into(), "image.png".into());
+    model.add_target(pc)?;
     let host = PureHost::default();
     for path in ["/src/main.c", "/src/core.c"] {
         host.seed_file(Path::new(path), b"")?;
@@ -1981,13 +1983,19 @@ fn xcode_rejects_sources_that_vary_by_configuration() -> TestResult {
     let result = resolve_with_options(
         &model,
         &host,
-        &[ConfigId("Debug".into()), ConfigId("Release".into())],
+        &[
+            ConfigId("Debug".into()),
+            ConfigId("DebugExtra".into()),
+            ConfigId("Release".into()),
+            ConfigId("MinSizeRel".into()),
+            ConfigId("RelWithDebInfo".into()),
+        ],
         &ResolveOptions {
             ide: Some(ide::IdeFlavor::Xcode),
         },
     );
     assert_eq!(result.err(), Some(ResolveError::Message(concat!(
-        "Target \"pc\" has source files which vary by configuration.  This is not supported by the \"Xcode\" generator.",
+        "Target \"pc\" has source files which vary by configuration. This is not supported by the \"Xcode\" generator.",
         "\n\nConfig \"Debug\":\n\n  /src/main.c\n  /src/core.c",
         "\n\nConfig \"Release\":\n\n  /src/main.c",
     ).into())));
@@ -2074,9 +2082,117 @@ fn xcode_reports_configuration_with_no_sources_before_link_language_error() -> T
         },
     );
     assert_eq!(result.err(), Some(ResolveError::Message(concat!(
-        "Target \"pc\" has source files which vary by configuration.  This is not supported by the \"Xcode\" generator.",
+        "Target \"pc\" has source files which vary by configuration. This is not supported by the \"Xcode\" generator.",
         "\n\nConfig \"Debug\":\n\n  /src/main.c",
         "\n\nConfig \"Release\":",
     ).into())));
+    Ok(())
+}
+
+#[test]
+fn xcode_uses_root_object_directory_for_subdirectory_targets() -> TestResult {
+    use ide::{IdeFlavor, IdeSourceKind};
+
+    let mut model = project();
+    let sub = model.add_directory(
+        DirId::ROOT,
+        "/src/sub".into(),
+        "/out/sub".into(),
+        Default::default(),
+    )?;
+    let mut obj = target("obj", TargetKind::ObjectLibrary, &["core.c"]);
+    obj.dir = sub;
+    obj.props
+        .set("OSX_ARCHITECTURES_DEBUG".into(), "ignored".into());
+    model.add_target(obj)?;
+    let app = model.add_target(target(
+        "app",
+        TargetKind::Executable,
+        &["main.c", "$<TARGET_OBJECTS:obj>"],
+    ))?;
+    let host = PureHost::default();
+    for path in ["/src/main.c", "/src/sub/core.c"] {
+        host.seed_file(Path::new(path), b"")?;
+    }
+    let debug = ConfigId("Debug".into());
+    for (key, value, arch) in [
+        ("CMAKE_XCODE_ARCHS", "x86_64;arm64", "x86_64"),
+        ("_CMAKE_APPLE_ARCHS_DEFAULT", "arm64", "arm64"),
+        ("CMAKE_OSX_ARCHITECTURES", "x86_64", "x86_64"),
+        ("CMAKE_OSX_SYSROOT", "/SDKs/iPhoneOS.sdk", "$(CURRENT_ARCH)"),
+    ] {
+        model
+            .dir_mut(DirId::ROOT)
+            .vars
+            .insert(key.into(), value.into());
+        let result = resolve_with_options(
+            &model,
+            &host,
+            std::slice::from_ref(&debug),
+            &ResolveOptions {
+                ide: Some(IdeFlavor::Xcode),
+            },
+        )?;
+        let object = format!("/out/build/obj.build/Debug/Objects-normal/{arch}/core.o");
+        let facts = result
+            .targets
+            .iter()
+            .find(|target| target.id == app)
+            .and_then(|target| target.ide.as_deref())
+            .ok_or("Missing IDE facts.")?;
+        assert!(
+            facts
+                .sources
+                .iter()
+                .any(|source| source.kind == IdeSourceKind::Object && source.path == object)
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn xcode_evaluates_embed_paths_and_rejects_per_config_embed_paths() -> TestResult {
+    use ide::IdeFlavor;
+
+    let mut model = project();
+    let mut app = target("app", TargetKind::Executable, &["main.c"]);
+    app.props.set(
+        "XCODE_EMBED_FRAMEWORKS".into(),
+        "$<1:Vendor.framework>".into(),
+    );
+    let app = model.add_target(app)?;
+    let host = PureHost::default();
+    host.seed_file(Path::new("/src/main.c"), b"")?;
+    let configs = [ConfigId("Debug".into())];
+    let options = ResolveOptions {
+        ide: Some(IdeFlavor::Xcode),
+    };
+    let result = resolve_with_options(&model, &host, &configs, &options)?;
+    let facts = result
+        .targets
+        .iter()
+        .find(|target| target.id == app)
+        .and_then(|target| target.ide.as_deref())
+        .ok_or("Missing IDE facts.")?;
+    assert_eq!(
+        facts.attributes[b"XCODE_EMBED_FRAMEWORKS".as_slice()],
+        "Vendor.framework"
+    );
+    model.target_mut(app).ok_or("Missing target.")?.props.set(
+        "XCODE_EMBED_FRAMEWORKS".into(),
+        "$<$<CONFIG:Debug>:Vendor.framework>".into(),
+    );
+    let error = resolve_with_options(&model, &host, &configs, &options).err();
+    assert_eq!(
+        error,
+        Some(ResolveError::Message(
+            concat!(
+                "Xcode does not support per-config XCODE_EMBED_FRAMEWORKS:",
+                "\n\n  $<$<CONFIG:Debug>:Vendor.framework>",
+                "\n\nspecified for target:\n\n  app",
+            )
+            .into()
+        ))
+    );
     Ok(())
 }

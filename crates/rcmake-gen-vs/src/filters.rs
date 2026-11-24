@@ -29,7 +29,7 @@ pub(crate) fn render(ctx: &Context<'_>, plan: &Plan) -> String {
         xml.start("ItemGroup", &[]);
         for group in groups {
             xml.start("Filter", &[("Include", &msbuild(group))]);
-            let name = format!("{}|{group}", ctx.project.name);
+            let name = format!("SG_Filter_{group}");
             xml.text(
                 "UniqueIdentifier",
                 &[],

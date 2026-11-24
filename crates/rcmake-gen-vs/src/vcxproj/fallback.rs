@@ -36,12 +36,15 @@ impl Context<'_> {
                     );
                 let mut settings = flags_table::compile(flags);
                 for define in &group.defines {
-                    settings.list("PreprocessorDefinitions", msbuild(&string(&define.value)));
+                    settings.list(
+                        "PreprocessorDefinitions",
+                        msbuild_value(&string(&define.value)),
+                    );
                 }
                 for include in &group.includes {
                     settings.list(
                         "AdditionalIncludeDirectories",
-                        msbuild(&windows(&string(&include.path.value))),
+                        msbuild_value(&windows(&string(&include.path.value))),
                     );
                 }
                 settings
@@ -332,7 +335,7 @@ impl Context<'_> {
             out.list("AdditionalDependencies", msbuild(&library));
         }
         for directory in directories {
-            out.list("AdditionalLibraryDirectories", msbuild(&directory));
+            out.list("AdditionalLibraryDirectories", msbuild_value(&directory));
         }
         out
     }

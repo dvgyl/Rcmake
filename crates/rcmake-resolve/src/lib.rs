@@ -558,6 +558,7 @@ pub fn resolve_with_options(
     let mut targets = Vec::new();
     let mut graphs = Vec::with_capacity(configs.len());
     let mut xcode_link_error = None;
+    let mut xcode_sources = IndexMap::new();
     for config in &configs {
         paths.index_generated(model, config)?;
         validate_file_sets(model, &paths, config)?;
@@ -597,6 +598,9 @@ pub fn resolve_with_options(
                 resolve_target(model, &paths, &mut usage, id, target, &ctx)?;
             resolved.insert(id, facts);
             inputs.insert(id, target_inputs);
+        }
+        if options.ide == Some(ide::IdeFlavor::Xcode) {
+            ide::check_xcode_sources(model, &paths, &mut xcode_sources, &inputs, config)?;
         }
         let links = model
             .targets()
@@ -680,8 +684,8 @@ pub fn resolve_with_options(
         targets.extend(resolved);
     }
 
-    if let Some(flavor) = options.ide {
-        ide::finish_sources(model, &paths, &mut targets, flavor)?;
+    if options.ide == Some(ide::IdeFlavor::VisualStudio) {
+        ide::finish_vs_sources(&mut targets);
     }
     if let Some(error) = xcode_link_error {
         return Err(error);
@@ -994,8 +998,12 @@ fn resolve_target<'a>(
                 }
                 if let (Some(flavor), Some(base)) = (flavor, base) {
                     let mut overrides = ide::compile_settings(&facts, flavor);
-                    overrides.flags.drain(..base.flags.len());
-                    overrides.defines.drain(..base.defines.len());
+                    if overrides.flags.starts_with(&base.flags) {
+                        overrides.flags.drain(..base.flags.len());
+                    }
+                    if overrides.defines.starts_with(&base.defines) {
+                        overrides.defines.drain(..base.defines.len());
+                    }
                     overrides
                         .includes
                         .retain(|include| !base.includes.contains(include));

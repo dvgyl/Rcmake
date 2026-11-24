@@ -40,6 +40,10 @@ add_executable(excluded EXCLUDE_FROM_ALL src/main.c)
 add_executable(app src/main.c include/reset.h "${CMAKE_CURRENT_BINARY_DIR}/generated.h")
 target_sources(app PRIVATE "$<$<CONFIG:Debug>:src/debug.c>")
 target_link_libraries(app PRIVATE objects headers)
+set_source_files_properties(src/main.c PROPERTIES
+  COMPILE_DEFINITIONS "$<$<CONFIG:Debug>:SOURCE_DEBUG=1>"
+  INCLUDE_DIRECTORIES "$<$<CONFIG:Debug>:$(VCInstallDir)include>"
+  COMPILE_OPTIONS "$<$<CONFIG:Debug>:/FI$(ProjectDir)pch.h>")
 set_target_properties(app PROPERTIES
   FOLDER "Products/Tools"
   VS_GLOBAL_TestValue "app&tools"
@@ -116,6 +120,18 @@ def check_projects(tree, version):
         assert len(commands) == 2 and all(command in entry.text for entry in commands)
     assert any("generated.h" in (entry.text or "")
                for entry in app.findall("./m:ItemGroup/m:CustomBuild/m:Outputs", NS))
+    for group in app.findall("./m:ItemDefinitionGroup/m:ClCompile", NS):
+        assert 'CMAKE_INTDIR="$(Configuration)"' in value(group, "m:PreprocessorDefinitions")
+    main = item(app, "ClCompile", "main.c")
+    for element, text in [
+        ("PreprocessorDefinitions", "SOURCE_DEBUG=1"),
+        ("AdditionalIncludeDirectories", "$(VCInstallDir)include"),
+        ("AdditionalOptions", "/FI$(ProjectDir)pch.h"),
+    ]:
+        values = main.findall(f"./m:{element}", NS)
+        assert len(values) == 1 and text in values[0].text, element
+        assert "Debug|x64" in values[0].get("Condition", ""), element
+
     debug = item(app, "ClCompile", "debug.c")
     excluded = debug.findall("./m:ExcludedFromBuild", NS)
     assert len(excluded) == 1 and excluded[0].text == "true"
@@ -152,6 +168,8 @@ def check_sln(tree):
     )
     names = re.findall(r'^Project\("\{[^}]+\}"\) = "([^"]+)", "([^"]+)", "(\{[^}]+\})"$',
                        solution, re.MULTILINE)
+    assert ('Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") '
+            '= "Tools", "Products\\Tools",') in solution
     ids = {name: identifier for name, _, identifier in names}
     projects = [name for name, path, _ in names if path.endswith(".vcxproj")]
     assert projects[0] == "app"
@@ -220,7 +238,11 @@ def main():
                 "-G", f"Visual Studio {version} {year}", "-A", "x64",
                 f"-DCMAKE_MAKE_PROGRAM={cmake.as_posix()}",
                 f"-DCMAKE_TOOLCHAIN_FILE={toolchain.as_posix()}")
-            print(f"Visual Studio {version} {year}. {run(sys.executable, str(CANON), '--check', str(tree)).strip()}")
+            # check_sln validates the VS 17 solution. vs_canon.py uses the old folder type.
+            paths = ([str(path) for path in sorted(tree.rglob("*.vcxproj*"))]
+                     if version == "17" else [str(tree)])
+            summary = run(sys.executable, str(CANON), "--check", *paths).strip()
+            print(f"Visual Studio {version} {year}. {summary}")
             check(tree)
             check_projects(tree, version)
 

@@ -1,10 +1,10 @@
 //! Visual Studio 17 text solutions.
 
-use std::fmt::Write;
+use std::{collections::BTreeMap, fmt::Write};
 
 use crate::{CPP_TYPE, Solution, relative, windows};
 
-const FOLDER_TYPE: &str = "{66A26720-8FB5-11D2-AA7E-00C04F688DDE}";
+const FOLDER_TYPE: &str = "{2150E333-8FDC-42A3-9474-1A3956D46DE8}";
 
 pub(crate) fn render(solution: &Solution<'_>) -> String {
     let mut out = String::from(
@@ -12,14 +12,18 @@ pub(crate) fn render(solution: &Solution<'_>) -> String {
     );
 
     let mut projects: Vec<_> = solution.members().collect();
-    if let Some(startup) = &solution.startup {
-        projects.sort_by_key(|project| project.name != *startup);
-    }
+    projects.sort_by_key(|project| {
+        (
+            solution.startup.as_ref() != Some(&project.name),
+            &project.name,
+        )
+    });
     for (path, guid) in &solution.folders {
         let name = field(path.rsplit('/').next().unwrap_or(path));
+        let path = field(&windows(path));
         let _ = writeln!(
             out,
-            "Project(\"{FOLDER_TYPE}\") = \"{name}\", \"{name}\", \"{guid}\"\nEndProject"
+            "Project(\"{FOLDER_TYPE}\") = \"{name}\", \"{path}\", \"{guid}\"\nEndProject"
         );
     }
     for project in &projects {
@@ -30,14 +34,11 @@ pub(crate) fn render(solution: &Solution<'_>) -> String {
             "Project(\"{CPP_TYPE}\") = \"{name}\", \"{path}\", \"{}\"",
             project.guid
         );
-        let mut dependencies = solution.dependencies(project).peekable();
-        if dependencies.peek().is_some() {
-            out.push_str("\tProjectSection(ProjectDependencies) = postProject\n");
-            for dep in dependencies {
-                let _ = writeln!(out, "\t\t{} = {}", dep.guid, dep.guid);
-            }
-            out.push_str("\tEndProjectSection\n");
+        out.push_str("\tProjectSection(ProjectDependencies) = postProject\n");
+        for dep in solution.dependencies(project) {
+            let _ = writeln!(out, "\t\t{} = {}", dep.guid, dep.guid);
         }
+        out.push_str("\tEndProjectSection\n");
         out.push_str("EndProject\n");
     }
     out.push_str("Global\n\tGlobalSection(SolutionConfigurationPlatforms) = preSolution\n");
@@ -63,16 +64,26 @@ pub(crate) fn render(solution: &Solution<'_>) -> String {
     out.push_str("\tEndGlobalSection\n");
     if !solution.folders.is_empty() {
         out.push_str("\tGlobalSection(NestedProjects) = preSolution\n");
-        for project in solution.members() {
-            if let Some(folder) = solution.folders.get(&project.folder) {
-                let _ = writeln!(out, "\t\t{} = {folder}", project.guid);
+        let mut children = BTreeMap::<&str, Vec<&str>>::new();
+        for (folder, guid) in &solution.folders {
+            if let Some((parent, _)) = folder.rsplit_once('/') {
+                children.entry(parent).or_default().push(guid);
             }
         }
-        for (folder, guid) in &solution.folders {
-            if let Some((parent, _)) = folder.rsplit_once('/')
-                && let Some(parent) = solution.folders.get(parent)
-            {
-                let _ = writeln!(out, "\t\t{guid} = {parent}");
+        for project in solution
+            .members()
+            .filter(|project| !project.folder.is_empty())
+        {
+            children
+                .entry(&project.folder)
+                .or_default()
+                .push(&project.guid);
+        }
+        for (folder, entries) in children {
+            if let Some(parent) = solution.folders.get(folder) {
+                for entry in entries {
+                    let _ = writeln!(out, "\t\t{entry} = {parent}");
+                }
             }
         }
         out.push_str("\tEndGlobalSection\n");
@@ -82,11 +93,7 @@ pub(crate) fn render(solution: &Solution<'_>) -> String {
         "\tGlobalSection(ExtensibilityGlobals) = postSolution\n\t\tSolutionGuid = {}\n\tEndGlobalSection\n\tGlobalSection(ExtensibilityAddIns) = postSolution\n\tEndGlobalSection\nEndGlobal",
         solution.guid
     );
-    if cfg!(windows) {
-        out.replace('\n', "\r\n")
-    } else {
-        out
-    }
+    out.replace('\n', "\r\n")
 }
 
 fn field(value: &str) -> String {

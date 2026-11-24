@@ -14,7 +14,7 @@ use rcmake_gen_common::{
     ide::{UtilityKind, project_roots, rerun_inputs, targets_for_root, utility_targets},
     write_if_changed,
 };
-use rcmake_host::{Host, path::from_native};
+use rcmake_host::{Host, SystemInfo, path::from_native};
 use rcmake_model::{
     DirId, GeneratorKind, ParsedToolset, ProjectModel, TargetId, TargetKind, VsVersion,
 };
@@ -110,7 +110,7 @@ pub fn generate(
     bin: &Path,
 ) -> Result<(), GenError> {
     let kind = GeneratorKind::VisualStudio(version);
-    let settings = Settings::new(version, result, model, bin);
+    let settings = Settings::new(version, result, model, host, bin);
     validate_name(&settings.platform)?;
     for config in &settings.configs {
         validate_name(config)?;
@@ -571,6 +571,7 @@ impl Settings {
         version: VsVersion,
         result: &GenerationResult,
         model: &ProjectModel,
+        host: &dyn Host,
         bin: &Path,
     ) -> Self {
         let root = model.dir(DirId::ROOT);
@@ -584,10 +585,14 @@ impl Settings {
             ParsedToolset::Vs(parsed) => Some(parsed),
             _ => None,
         };
+        let system = host.system();
         let platform_name = platform
             .and_then(|p| p.name.as_ref())
             .or_else(|| var(b"CMAKE_VS_PLATFORM_NAME"))
-            .map_or_else(|| default_platform().into(), |value| string(value));
+            .map_or_else(
+                || default_platform(Some(&system)).into(),
+                |value| string(value),
+            );
         let mut configs = Vec::new();
         let mut seen = BTreeSet::new();
         for value in result
@@ -644,7 +649,9 @@ impl Settings {
                 .and_then(|t| t.host.as_ref())
                 .or_else(|| var(b"CMAKE_VS_PLATFORM_TOOLSET_HOST_ARCHITECTURE"))
                 .map(|value| string(value))
-                .or_else(|| cfg!(target_arch = "x86_64").then(|| "x64".into())),
+                .or_else(|| {
+                    matches!(system.machine.as_slice(), b"x86_64" | b"AMD64").then(|| "x64".into())
+                }),
             tool_version: toolset
                 .and_then(|t| t.version.as_ref())
                 .or_else(|| var(b"CMAKE_VS_PLATFORM_TOOLSET_VERSION"))
@@ -738,6 +745,10 @@ fn folder(path: &str) -> String {
         .join("/")
 }
 
+fn msbuild_value(value: &str) -> String {
+    value.replace(';', "%3B")
+}
+
 fn msbuild(value: &str) -> String {
     use std::fmt::Write;
     let mut out = String::new();
@@ -751,13 +762,14 @@ fn msbuild(value: &str) -> String {
     out
 }
 
-fn default_platform() -> &'static str {
-    if cfg!(all(windows, target_arch = "aarch64")) {
-        "ARM64"
-    } else if cfg!(all(windows, target_arch = "x86")) {
-        "Win32"
-    } else {
-        "x64"
+fn default_platform(system: Option<&SystemInfo>) -> &'static str {
+    match system
+        .filter(|info| info.sysname.eq_ignore_ascii_case(b"Windows"))
+        .map(|info| info.machine.as_slice())
+    {
+        Some(b"arm64" | b"aarch64" | b"ARM64") => "ARM64",
+        Some(b"x86" | b"i386" | b"i686") => "Win32",
+        _ => "x64",
     }
 }
 

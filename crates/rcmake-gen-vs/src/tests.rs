@@ -11,8 +11,8 @@ use rcmake_model::{
 use rcmake_resolve::{
     BuildGraph, BuildStep, CustomStep, GraphTarget, Invocation, TargetMetadata,
     ide::{
-        IdeCompileSettings, IdeCustomPhase, IdeCustomStep, IdeFacts, IdeLinkItem, IdeSource,
-        IdeSourceKind, OutputNaming,
+        IdeCompileSettings, IdeCustomPhase, IdeCustomStep, IdeFacts, IdeInclude, IdeLinkItem,
+        IdeSource, IdeSourceKind, OutputNaming,
     },
 };
 
@@ -91,8 +91,8 @@ fn compile_flags_use_last_values_and_inherit_options() {
         "<RuntimeTypeInfo>false",
         "<LanguageStandard>stdcpp20",
         "<UseStandardPreprocessor>true",
-        "<AdditionalOptions>/Zc:__cplusplus %(AdditionalOptions)",
-        "<PreprocessorDefinitions>NAME=two words;%(PreprocessorDefinitions)",
+        "<AdditionalOptions>%(AdditionalOptions) /Zc:__cplusplus",
+        "<PreprocessorDefinitions>%(PreprocessorDefinitions);NAME=two words",
         "<AdditionalIncludeDirectories>C:\\Program Files\\SDK;%(AdditionalIncludeDirectories)",
     ] {
         assert!(xml.contains(element), "{element}: {xml}");
@@ -131,6 +131,7 @@ fn build_plans_support_clean_parallel_targets_and_devenv() {
         commands.first().and_then(|cmd| cmd.argv.get(2)),
         Some(&"/t:Clean".into())
     );
+    assert!(!commands[0].argv.contains(&"/nr:false".into()));
     let build = commands.get(1).expect("build command");
     assert_eq!(
         build.argv.iter().map(|arg| string(arg)).collect::<Vec<_>>(),
@@ -175,6 +176,61 @@ fn build_plans_support_clean_parallel_targets_and_devenv() {
             "ALL_BUILD"
         ]
     );
+}
+
+#[test]
+fn msbuild_builds_named_subdirectory_projects_in_both_solution_formats() {
+    let host = PureHost::default();
+    let bin = to_native(if cfg!(windows) { b"C:/out" } else { b"/out" });
+    let mut model = ProjectModel::default();
+    model.set_root_dirs("/source".into(), from_native(&bin));
+    let sub = model
+        .add_directory(
+            DirId::ROOT,
+            "/source/sub".into(),
+            from_native(&bin.join("sub & child")),
+            Default::default(),
+        )
+        .expect("add subdirectory");
+    let mut app = target("app", TargetKind::Utility, "");
+    app.dir = sub;
+    app.props.set("FOLDER".into(), "Products/Tools".into());
+    model.add_target(app).expect("add target");
+
+    let build_dir = from_native(&bin);
+    let targets = ["APP".into(), "custom/other".into(), "".into()];
+    for version in [VsVersion::Vs17, VsVersion::Vs18] {
+        generate(version, &GenerationResult::default(), &model, &host, &bin)
+            .expect("generate solution");
+        let commands = build::plan(
+            &BuildRequest {
+                generator: GeneratorKind::VisualStudio(version),
+                build_dir: &build_dir,
+                project_name: b"Project",
+                make_program: b"MSBuild.exe",
+                config: None,
+                targets: &targets,
+                jobs: Jobs::None,
+                clean_first: false,
+                verbose: false,
+                native_args: &[],
+                platform: b"x64",
+            },
+            Some(&host),
+        )
+        .expect("plan build");
+        assert_eq!(
+            commands
+                .iter()
+                .map(|command| string(&command.argv[1]))
+                .collect::<Vec<_>>(),
+            [
+                r"sub & child\app.vcxproj",
+                r"custom\other.vcxproj",
+                "ALL_BUILD.vcxproj"
+            ],
+        );
+    }
 }
 
 fn fixture(
@@ -316,7 +372,16 @@ fn fixture(
                         excluded_configs: Vec::new(),
                         file_set: None,
                         package_location: None,
-                        compile: None,
+                        compile: (name == "Debug").then(|| IdeCompileSettings {
+                            language: "CXX".into(),
+                            defines: vec![bt(r#"SOURCE="$(OutDir);file""#)],
+                            includes: vec![IdeInclude {
+                                path: "$(VCInstallDir)/include;extra".into(),
+                                system: false,
+                                framework: false,
+                            }],
+                            flags: vec![bt("/W3"), bt("/FI$(ProjectDir)pch.h")],
+                        }),
                     },
                     IdeSource {
                         path: from_native(&bin.join("generated.cpp")),
@@ -345,6 +410,8 @@ fn fixture(
                     language: "CXX".into(),
                     flags: vec![
                         bt("/W4"),
+                        bt("/TC"),
+                        bt("/GS-"),
                         bt("/Zc:__cplusplus"),
                         bt(if name == "Debug" { "/Od" } else { "/O2" }),
                     ],
@@ -449,6 +516,9 @@ fn check_fixture(version: VsVersion, platform: &str, host: &dyn Host, bin: &Path
     } else {
         assert!(solution.starts_with("\u{feff}"));
         assert!(solution.contains("# Visual Studio Version 17"));
+        assert!(solution.contains(
+            r#"Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "Tools", "Products\Tools", "#
+        ));
         assert!(solution.contains("GlobalSection(NestedProjects)"));
         assert!(solution.contains("ProjectSection(ProjectDependencies)"));
         assert!(solution.contains(&format!(".Release|{platform}.ActiveCfg")));
@@ -544,6 +614,74 @@ fn both_solution_formats_cover_three_platforms() {
             }
         }
     }
+}
+
+#[test]
+fn clcompile_emits_defaults_and_source_overrides_with_msbuild_properties() {
+    let host = PureHost::default();
+    let bin = Path::new(if cfg!(windows) { "C:/out" } else { "/out" });
+    host.create_dir_all(bin).expect("build directory");
+    let version = VsVersion::Vs17;
+    let (model, result) = fixture(version, "x64", bin, &host);
+    generate(version, &result, &model, &host, bin).expect("generate projects");
+    let project = contents(&host, bin, "app.vcxproj");
+    let (_, definition) = project
+        .split_once("<ClCompile>")
+        .expect("compile definitions");
+    let (definition, _) = definition
+        .split_once("</ClCompile>")
+        .expect("compile definitions");
+    for value in [
+        "<BasicRuntimeChecks>Default</BasicRuntimeChecks>",
+        "<BufferSecurityCheck>false</BufferSecurityCheck>",
+        "<CallingConvention></CallingConvention>",
+        "<FloatingPointModel></FloatingPointModel>",
+        "<ForceConformanceInForLoopScope></ForceConformanceInForLoopScope>",
+        "<MinimalRebuild></MinimalRebuild>",
+        "<Optimization>Disabled</Optimization>",
+        "<RemoveUnreferencedCodeData></RemoveUnreferencedCodeData>",
+        "<RuntimeLibrary></RuntimeLibrary>",
+        "<SupportJustMyCode></SupportJustMyCode>",
+        "<TreatWChar_tAsBuiltInType></TreatWChar_tAsBuiltInType>",
+        r#"CMAKE_INTDIR="$(Configuration)""#,
+    ] {
+        assert!(definition.contains(value), "{value}: {definition}");
+    }
+    assert!(!definition.contains("CompileAs"));
+    let (_, source) = project.split_once(r#"main.cpp">"#).expect("main.cpp item");
+    let (source, _) = source.split_once("</ClCompile>").expect("main.cpp item");
+    for (element, value) in [
+        ("WarningLevel", "Level3"),
+        (
+            "PreprocessorDefinitions",
+            r#"%(PreprocessorDefinitions);SOURCE="$(OutDir)%3Bfile""#,
+        ),
+        (
+            "AdditionalIncludeDirectories",
+            r"$(VCInstallDir)\include%3Bextra;%(AdditionalIncludeDirectories)",
+        ),
+        (
+            "AdditionalOptions",
+            r#"%(AdditionalOptions) "/FI$(ProjectDir)pch.h""#,
+        ),
+    ] {
+        let expected = format!(
+            "<{element} Condition=\"'$(Configuration)|$(Platform)'=='Debug|x64'\">{value}</{element}>"
+        );
+        assert!(source.contains(&expected), "{expected}: {source}");
+        assert_eq!(source.matches(&format!("<{element} ")).count(), 1);
+    }
+}
+
+#[test]
+fn v142_conditions_suppress_startup_banner_on_toolset_version() {
+    let mut settings = flags_table::compile(["/nologo".into()]);
+    settings.compiler_defaults("v142");
+    let mut xml = xml::Writer::new(false, "utf-8");
+    settings.write(&mut xml);
+    assert!(xml.finish().contains(
+        r#"<SuppressStartupBanner Condition="'$(VCToolsVersion)' &gt;= '14.29'">true</SuppressStartupBanner>"#
+    ));
 }
 
 #[test]
