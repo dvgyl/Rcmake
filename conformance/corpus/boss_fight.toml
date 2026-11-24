@@ -81,8 +81,8 @@ configure_args = [
     "-DVTK_GROUP_ENABLE_MPI=NO", "-DVTK_WRAP_PYTHON=OFF",
 ]
 l1 = true
-l2_targets = ["vtkCommonCore", "vtkFiltersCore"]
-l3_targets = ["vtkCommonCore", "vtkFiltersCore"]
+l2_targets = ["CommonCore", "FiltersCore"]
+l3_targets = ["CommonCore", "FiltersCore"]
 l4 = { install = true }
 runner = { memory_gib = 12, gpu = "none", tier = "large" }
 
