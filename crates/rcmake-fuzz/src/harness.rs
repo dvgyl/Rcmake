@@ -17,6 +17,8 @@ pub enum Outcome {
     Rejected,
     /// The surface panicked (failure). The text is the panic message.
     Panicked(String),
+    /// The surface failed a property check. The text identifies the property.
+    PropertyFailed(String),
     /// The input did not finish in the budget (failure).
     TimedOut,
     /// The harness could not start the input thread.
@@ -24,10 +26,13 @@ pub enum Outcome {
 }
 
 impl Outcome {
-    /// `true` for a panic or a timeout.
+    /// `true` for a panic, a timeout, or a failed property check.
     #[must_use]
     pub const fn is_failure(&self) -> bool {
-        matches!(self, Self::Panicked(_) | Self::TimedOut)
+        matches!(
+            self,
+            Self::Panicked(_) | Self::TimedOut | Self::PropertyFailed(_)
+        )
     }
 }
 
@@ -40,6 +45,13 @@ pub fn check_input<F>(budget: Duration, input: F) -> Outcome
 where
     F: FnOnce() -> bool + Send + UnwindSafe + 'static,
 {
+    check_property(budget, move || Ok(input()))
+}
+
+pub(crate) fn check_property<F>(budget: Duration, input: F) -> Outcome
+where
+    F: FnOnce() -> Result<bool, String> + Send + UnwindSafe + 'static,
+{
     let (send, receive) = mpsc::sync_channel(1);
     let spawned = std::thread::Builder::new()
         .name("rcmake-fuzz-input".into())
@@ -51,8 +63,9 @@ where
         return Outcome::HarnessError(err.to_string());
     }
     match receive.recv_timeout(budget) {
-        Ok(Ok(true)) => Outcome::Accepted,
-        Ok(Ok(false)) => Outcome::Rejected,
+        Ok(Ok(Ok(true))) => Outcome::Accepted,
+        Ok(Ok(Ok(false))) => Outcome::Rejected,
+        Ok(Ok(Err(message))) => Outcome::PropertyFailed(message),
         Ok(Err(payload)) => Outcome::Panicked(panic_message(payload.as_ref())),
         Err(mpsc::RecvTimeoutError::Timeout) => Outcome::TimedOut,
         Err(mpsc::RecvTimeoutError::Disconnected) => {
@@ -81,6 +94,16 @@ mod tests {
     fn classifies_accepted_and_rejected_inputs() {
         assert_eq!(check_input(BUDGET, || true), Outcome::Accepted);
         assert_eq!(check_input(BUDGET, || false), Outcome::Rejected);
+    }
+
+    #[test]
+    fn classifies_a_failed_property() {
+        let outcome = check_property(BUDGET, || Err("Round trip changed the value.".into()));
+        assert_eq!(
+            outcome,
+            Outcome::PropertyFailed("Round trip changed the value.".into())
+        );
+        assert!(outcome.is_failure());
     }
 
     #[test]

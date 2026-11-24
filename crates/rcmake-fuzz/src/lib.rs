@@ -5,12 +5,8 @@
 //! [`std::panic::catch_unwind`], with a wall-clock budget. A deterministic seeded
 //! generator ([`Rng`]) makes every failure replayable from its seed.
 //!
-//! The harness uses [`rcmake_base::Limits::fuzz`], never the production limits.
+//! The harness uses [`rcmake_base::Limits::fuzz`] for input and property checks.
 //! This crate is never linked into the `rcmake` binary.
-//!
-//! Milestone 4 Wave 0 freezes the harness contract. The surface targets come in Wave 1
-//! (`syntax`, `expr`, `regex`, `json`) and Wave 2 (`genex`, `presets`, `cps`,
-//! `archive`, `path`).
 
 #![forbid(unsafe_code)]
 
@@ -18,6 +14,7 @@ pub mod harness;
 pub mod options;
 pub mod rng;
 pub mod surface;
+mod targets;
 
 pub use harness::{Outcome, check_input};
 pub use options::{FuzzOptions, parse_args};
@@ -31,7 +28,7 @@ pub struct FuzzReport {
     pub iterations: u64,
     /// Inputs that the surface rejected with an error (not a failure).
     pub rejected: u64,
-    /// Failing inputs (panic or timeout), with their iteration seed.
+    /// Failing inputs, with their iteration seed.
     pub failures: Vec<Failure>,
 }
 
@@ -49,6 +46,15 @@ pub struct Failure {
 pub enum FuzzError {
     /// The surface has no target yet.
     Unimplemented(Surface),
+    /// The harness could not run an input.
+    Input {
+        /// Surface under test.
+        surface: Surface,
+        /// Seed of the input.
+        seed: u64,
+        /// Harness error.
+        message: String,
+    },
 }
 
 impl core::fmt::Display for FuzzError {
@@ -61,38 +67,61 @@ impl core::fmt::Display for FuzzError {
                     surface.name()
                 )
             }
+            Self::Input {
+                surface,
+                seed,
+                message,
+            } => {
+                write!(f, "{} seed {seed}: {message}", surface.name())
+            }
         }
     }
 }
 
 impl core::error::Error for FuzzError {}
 
-/// Run `options.iterations` inputs on `options.surface`.
+/// Run up to `options.iterations` inputs on `options.surface`.
+///
+/// Stop after a timeout because the input thread can still run in the background.
 ///
 /// # Errors
 ///
-/// Returns [`FuzzError::Unimplemented`] for a surface without a target. In Milestone 4
-/// Wave 0, no surface has a target.
+/// Returns an error if the harness cannot run an input.
 pub fn run(options: &FuzzOptions) -> Result<FuzzReport, FuzzError> {
-    Err(FuzzError::Unimplemented(options.surface))
+    let mut report = FuzzReport::default();
+    for offset in 0..options.iterations {
+        let seed = options.seed.wrapping_add(offset);
+        let surface = options.surface;
+        let outcome = harness::check_property(options.budget, move || targets::run(surface, seed));
+        report.iterations += 1;
+        match outcome {
+            Outcome::Accepted => {}
+            Outcome::Rejected => report.rejected += 1,
+            Outcome::HarnessError(message) => {
+                return Err(FuzzError::Input {
+                    surface,
+                    seed,
+                    message,
+                });
+            }
+            failure => {
+                let timed_out = failure == Outcome::TimedOut;
+                report.failures.push(Failure {
+                    seed,
+                    outcome: failure,
+                });
+                if timed_out {
+                    break;
+                }
+            }
+        }
+    }
+    Ok(report)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn wave_zero_surfaces_are_unimplemented() {
-        for surface in Surface::ALL {
-            let options = FuzzOptions {
-                surface,
-                seed: 1,
-                iterations: 1,
-                budget: options::DEFAULT_BUDGET,
-            };
-            assert_eq!(run(&options), Err(FuzzError::Unimplemented(surface)));
-        }
-    }
 
     #[test]
     fn fuzz_limits_are_the_harness_limits() {

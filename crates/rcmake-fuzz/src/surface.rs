@@ -56,6 +56,9 @@ impl Surface {
     /// Surface with the command-line name `name`.
     #[must_use]
     pub fn from_name(name: &str) -> Option<Self> {
+        if name == "path_list" {
+            return Some(Self::Path);
+        }
         Self::ALL.into_iter().find(|surface| surface.name() == name)
     }
 }
@@ -69,6 +72,7 @@ mod tests {
         for surface in Surface::ALL {
             assert_eq!(Surface::from_name(surface.name()), Some(surface));
         }
+        assert_eq!(Surface::from_name("path_list"), Some(Surface::Path));
         assert_eq!(Surface::from_name("SYNTAX"), None);
     }
 }
