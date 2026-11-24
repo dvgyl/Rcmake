@@ -13,6 +13,8 @@
 
 #![forbid(unsafe_code)]
 
+use std::sync::Arc;
+
 use indexmap::{IndexMap, IndexSet, map::Entry};
 use rcmake_base::{BString, list, path_lex::Lexical, truth};
 use rcmake_cxxmodules::{ModmapFormat, ModuleVisibility, TargetDependInfo};
@@ -312,7 +314,7 @@ pub struct LinkStep {
     pub kind: LinkKind,
     /// Link language (`LINKER_LANGUAGE`).
     pub language: BString,
-    /// Command fragments in order.
+    /// Command fragments in order. Lowered archives keep only flags.
     pub fragments: Vec<LinkFragment>,
     /// Output path relative to the build directory.
     pub output: BString,
@@ -1758,8 +1760,8 @@ fn resolve_link(
     };
     let mut items = Vec::new();
     if kind.is_some() {
-        items = usage.collect_link_items(id, &ctx)?;
-        let language_for = |items: &[ResolvedLinkItem]| {
+        items = usage.ordered_links(id, &ctx)?;
+        let language_for = |items: &[Arc<ResolvedLinkItem>]| {
             let linked_languages = link_items(items)
                 .filter_map(|item| match item.kind {
                     ResolvedLinkKind::Objects(id) => resolved.get(&id),
@@ -1776,7 +1778,7 @@ fn resolve_link(
         let language = language_for(&items);
         if language != ctx.link_language {
             ctx.link_language = language;
-            items = usage.collect_link_items(id, &ctx)?;
+            items = usage.ordered_links(id, &ctx)?;
             if language_for(&items) != ctx.link_language {
                 return Err(ResolveError::Message(
                     format!(
@@ -1801,10 +1803,14 @@ fn resolve_link(
             .collect::<IndexSet<_>>()
             .into_iter()
             .collect(),
-        module_links: linked_targets
-            .into_iter()
-            .chain(facts.dependencies.iter().copied())
-            .collect(),
+        module_links: if facts.cxx_modules.is_some() {
+            linked_targets
+                .into_iter()
+                .chain(facts.dependencies.iter().copied())
+                .collect()
+        } else {
+            Vec::new()
+        },
         ..ResolvedLink::default()
     };
     let Some(kind) = kind else {
@@ -1820,8 +1826,11 @@ fn resolve_link(
             .into(),
         )
     })?;
-    let mut fragments = Vec::new();
     let options = usage.collect(id, UsageField::LinkOptions, &ctx)?.entries;
+    let directories = usage
+        .collect(id, UsageField::LinkDirectories, &ctx)?
+        .entries;
+    let mut fragments = Vec::with_capacity(options.len() + directories.len() + items.len());
     for option in &options {
         let value = option.value.as_slice();
         let text = value
@@ -1829,9 +1838,6 @@ fn resolve_link(
             .map_or_else(|| shell_quote(value), BString::from);
         fragments.push(link_fragment(text, option, LinkFragmentRole::Flags));
     }
-    let directories = usage
-        .collect(id, UsageField::LinkDirectories, &ctx)?
-        .entries;
     for directory in &directories {
         let text = shell_quote(&[b"-L", directory.value.as_slice()].concat());
         fragments.push(link_fragment(
@@ -1905,10 +1911,10 @@ fn resolve_link(
     Ok(link)
 }
 
-fn link_items(items: &[ResolvedLinkItem]) -> impl Iterator<Item = &ResolvedLinkItem> {
+fn link_items(items: &[Arc<ResolvedLinkItem>]) -> impl Iterator<Item = &ResolvedLinkItem> {
     items.iter().flat_map(|item| match &item.kind {
         ResolvedLinkKind::Group { members, .. } => members.as_slice(),
-        _ => std::slice::from_ref(item),
+        _ => std::slice::from_ref(item.as_ref()),
     })
 }
 
@@ -1925,13 +1931,16 @@ fn append_link_item(
     let (text, role) = match &item.kind {
         ResolvedLinkKind::Library(id) => {
             let Some(raw) = model.target(*id) else { return };
-            let artifacts = resolved.get(id).map_or_else(
-                || lower::compute_artifacts(model, raw, config),
-                |target| target.artifacts.clone(),
-            );
-            let path = artifacts.linker_file.or(artifacts.file);
+            let imported;
+            let artifacts = if let Some(target) = resolved.get(id) {
+                &target.artifacts
+            } else {
+                imported = lower::compute_artifacts(model, raw, config);
+                &imported
+            };
+            let path = artifacts.linker_file.as_ref().or(artifacts.file.as_ref());
             if let Some(path) = path {
-                append_library_path(model, dir, &path, &item.text, fragments);
+                append_library_path(model, dir, path, &item.text, fragments);
                 return;
             }
             (raw_library(value), Libraries)

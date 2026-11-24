@@ -113,14 +113,14 @@ pub(super) fn link(
     );
     let flags = join_words(flags);
 
-    let link_fragments = step
-        .fragments
-        .iter()
-        .filter(|f| f.role != LinkFragmentRole::Flags);
     let mut inputs = objects.clone();
     let libraries = if static_archive {
         BString::default()
     } else {
+        let link_fragments = step
+            .fragments
+            .iter()
+            .filter(|f| f.role != LinkFragmentRole::Flags);
         let libraries = link_fragments
             .clone()
             .filter(|f| f.role == LinkFragmentRole::Libraries)

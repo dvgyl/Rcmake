@@ -288,7 +288,7 @@ fn diamond_matches_compile_property_and_link_line_order() {
         link_line(&resolver.collect_link_items(top, &ctx).unwrap()),
         "left;right;base"
     );
-    assert!(resolver.memo.keys().all(|key| key.usage.head.is_none()));
+    assert!(resolver.memo.keys().all(|key| key.head.is_none()));
 }
 
 #[test]
@@ -389,8 +389,8 @@ fn two_pass_evaluation_and_head_sensitive_memoization() {
     let heads: HashSet<_> = resolver
         .memo
         .keys()
-        .filter(|key| key.usage.target == interface)
-        .map(|key| key.usage.head)
+        .filter(|key| key.target == interface)
+        .map(|key| key.head)
         .collect();
     assert_eq!(heads, HashSet::from([Some(a), Some(b)]));
 }
@@ -443,6 +443,141 @@ fn active_property_cycle_is_distinct_from_a_static_link_cycle() {
             .to_string(),
         "Self reference on target \"app\"."
     );
+}
+
+#[test]
+fn deep_static_chain_preserves_usage_and_file_set_order() {
+    use UsageField::*;
+
+    let mut model = model("Linux");
+    let private = add(&mut model, "private", TargetKind::StaticLibrary);
+    usage(&mut model, private, InterfaceCompileDefinitions, "PRIVATE");
+    usage(&mut model, private, InterfaceIncludeDirectories, "/private");
+    let mut chain = Vec::new();
+    for index in 0..64 {
+        let name = format!("lib{index}");
+        let id = add(&mut model, &name, TargetKind::StaticLibrary);
+        if index == 0 {
+            link(&mut model, id, true, &["$<LINK_ONLY:private>"]);
+        } else {
+            let previous = format!("lib{}", index - 1);
+            link(&mut model, id, false, &[&previous, "private"]);
+            link(&mut model, id, true, &[&previous, "$<LINK_ONLY:private>"]);
+        }
+        usage(&mut model, id, CompileDefinitions, "LOCAL");
+        if index % 2 == 0 {
+            usage(&mut model, id, InterfaceCompileDefinitions, &name);
+            usage(
+                &mut model,
+                id,
+                InterfaceIncludeDirectories,
+                &format!("/{name}"),
+            );
+        }
+        chain.push(id);
+    }
+    let set_ids = [63, 1].map(|index| {
+        model
+            .add_file_set(FileSet {
+                target: chain[index],
+                name: "sources".into(),
+                kind: FileSetKind::Sources,
+                scope: UsageScope::Public,
+                base_dirs: vec![command_entry("/src", "target_sources", 1)],
+                files: vec![command_entry(
+                    &format!("/src/lib{index}.c"),
+                    "target_sources",
+                    2,
+                )],
+                props: Default::default(),
+            })
+            .unwrap()
+    });
+    let app = add(&mut model, "app", TargetKind::Executable);
+    link(&mut model, app, false, &["lib63", "lib31"]);
+    let other = add(&mut model, "other", TargetKind::Executable);
+    link(&mut model, other, false, &["lib63"]);
+    let ctx = EvalContext::default();
+    let expected: Vec<_> = (0..64)
+        .step_by(2)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    let expected_definitions: Vec<_> = expected
+        .iter()
+        .map(|index| BString::from(format!("lib{index}")))
+        .collect();
+    {
+        let mut resolver = UsageResolver::new(&model);
+        let defs = resolver.collect(app, CompileDefinitions, &ctx).unwrap();
+        assert_eq!(
+            defs.entries
+                .into_iter()
+                .map(|entry| entry.value)
+                .collect::<Vec<_>>(),
+            expected_definitions
+        );
+        let includes = resolver.collect_includes(app, &ctx).unwrap();
+        assert_eq!(
+            includes
+                .into_iter()
+                .map(|include| include.path.value)
+                .collect::<Vec<_>>(),
+            expected
+                .iter()
+                .map(|index| BString::from(format!("/lib{index}")))
+                .collect::<Vec<_>>()
+        );
+        let names = b"COMPILE_DEFINITIONS";
+        let walk = resolver.walk(app, names, &ctx).unwrap();
+        let repeat = resolver.walk(app, names, &ctx).unwrap();
+        let second = resolver.walk(other, names, &ctx).unwrap();
+        assert!(Arc::ptr_eq(&walk, &repeat));
+        assert_eq!(
+            walk.contributions
+                .iter()
+                .map(|(owner, _)| *owner)
+                .collect::<Vec<_>>(),
+            expected
+                .iter()
+                .map(|&index| chain[index])
+                .collect::<Vec<_>>()
+        );
+        for ((_, entries), (_, other_entries)) in
+            walk.contributions.iter().zip(&second.contributions)
+        {
+            assert!(Arc::ptr_eq(entries, other_entries));
+        }
+        assert_eq!(
+            resolver
+                .source_file_sets(app, &ctx)
+                .unwrap()
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect::<Vec<_>>(),
+            set_ids
+        );
+        let ids = resolver.link_targets(app, &ctx).unwrap();
+        assert!(ids.contains(&private));
+        assert_eq!(ids.len(), chain.len() + 1);
+    }
+
+    link(&mut model, chain[0], true, &["lib63"]);
+    let mut resolver = UsageResolver::new(&model);
+    let defs = resolver.collect(app, CompileDefinitions, &ctx).unwrap();
+    assert_eq!(
+        defs.entries
+            .into_iter()
+            .map(|entry| entry.value)
+            .collect::<Vec<_>>(),
+        expected_definitions
+    );
+    assert!(resolver.cycle_count > 0);
+    assert!(resolver.memo.is_empty());
+    let links = resolver.collect_link_items(other, &ctx).unwrap();
+    assert_eq!(links.len(), 129);
+    assert_eq!(links.last().unwrap().text.value, "private");
 }
 
 #[test]
@@ -895,7 +1030,7 @@ fn context_sensitive_diamonds_share_one_interface_value_per_target() {
         .unwrap();
     assert_eq!(values(&result.entries), "Debug");
     assert_eq!(resolver.memo.len(), 37);
-    assert!(resolver.memo.keys().all(|key| key.usage.head.is_none()));
+    assert!(resolver.memo.keys().all(|key| key.head.is_none()));
     let value = eval(
         &mut resolver,
         b"$<TARGET_PROPERTY:app,COMPILE_DEFINITIONS>",

@@ -11,7 +11,7 @@ pub(crate) struct Edge<'a> {
     pub(crate) implicit_outputs: &'a [BString],
     pub(crate) inputs: &'a [BString],
     pub(crate) implicit_inputs: &'a [BString],
-    pub(crate) order_only: &'a [BString],
+    pub(crate) order_only: &'a [&'a BString],
 }
 
 impl Ninja {
@@ -23,7 +23,7 @@ impl Ninja {
         self.0.extend_from_slice(rule);
         self.paths(b"", edge.inputs);
         self.paths(b" |", edge.implicit_inputs);
-        self.paths(b" ||", edge.order_only);
+        self.paths(b" ||", edge.order_only.iter().copied());
         self.0.push(b'\n');
     }
 
@@ -52,11 +52,11 @@ impl Ninja {
         self.0.push(b'\n');
     }
 
-    fn paths(&mut self, separator: &[u8], paths: &[BString]) {
-        if !paths.is_empty() {
-            self.0.extend_from_slice(separator);
-        }
-        for path in paths {
+    fn paths<'a>(&mut self, separator: &[u8], paths: impl IntoIterator<Item = &'a BString>) {
+        let mut paths = paths.into_iter();
+        let Some(first) = paths.next() else { return };
+        self.0.extend_from_slice(separator);
+        for path in std::iter::once(first).chain(paths) {
             self.0.push(b' ');
             self.escape(path, true);
         }

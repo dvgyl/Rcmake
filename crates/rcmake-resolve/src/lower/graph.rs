@@ -14,8 +14,8 @@ use super::link::link;
 use super::{compute_artifacts, linker_language};
 use crate::ide::{IdeCustomPhase, IdeCustomStep};
 use crate::{
-    ArtifactSet, BuildGraph, BuildStep, CustomStep, GraphTarget, LinkKind, LinkStep, ResolveError,
-    ResolvedTarget, sources::TargetInputs, usage::UsageResolver,
+    ArtifactSet, BuildGraph, BuildStep, CustomStep, GraphTarget, LinkFragmentRole, LinkKind,
+    LinkStep, ResolveError, ResolvedTarget, sources::TargetInputs, usage::UsageResolver,
 };
 
 /// Lower resolved targets for one configuration.
@@ -198,16 +198,38 @@ pub(crate) fn lower_with_inputs(
             }
             steps.insert(push(&mut graph.steps, step));
         }
-        if let Some(mut step) = resolved.link.clone().or_else(|| {
-            let kind = link_kind(target.kind)?;
-            let output = build_relative(model, artifacts.file.as_ref()?);
-            Some(LinkStep {
-                kind,
-                language: BString::default(),
-                fragments: Vec::new(),
-                output,
+        if let Some(mut step) = resolved
+            .link
+            .as_ref()
+            .map(|step| {
+                if step.kind != LinkKind::StaticArchive {
+                    return step.clone();
+                }
+                // The File API uses the full fragment list from the resolved target.
+                // The archive command uses only its flags.
+                LinkStep {
+                    kind: step.kind,
+                    language: step.language.clone(),
+                    fragments: step
+                        .fragments
+                        .iter()
+                        .filter(|fragment| fragment.role == LinkFragmentRole::Flags)
+                        .cloned()
+                        .collect(),
+                    output: step.output.clone(),
+                }
             })
-        }) {
+            .or_else(|| {
+                let kind = link_kind(target.kind)?;
+                let output = build_relative(model, artifacts.file.as_ref()?);
+                Some(LinkStep {
+                    kind,
+                    language: BString::default(),
+                    fragments: Vec::new(),
+                    output,
+                })
+            })
+        {
             if let Some(language) = target
                 .props
                 .get(b"LINKER_LANGUAGE")

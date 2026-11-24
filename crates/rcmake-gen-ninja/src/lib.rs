@@ -136,7 +136,7 @@ fn generate_single(
                 .map(|file| graph.node(file)),
         );
     }
-    let mut ninja = Ninja::default();
+    let mut ninja = graph.manifest();
     ninja.include(RULES_PATH.as_bytes());
     graph.emit(&mut ninja, &programs.cmake, &module_flag, &exports);
     prep.emit(&mut ninja, &graph);
@@ -281,7 +281,7 @@ fn generate_multi(
     let rebuild = configure_command(result, build_dir, &programs.cmake, false);
     let regenerate = configure_command(result, build_dir, &programs.cmake, true);
     for (graph, files) in &configs {
-        let mut ninja = Ninja::default();
+        let mut ninja = graph.manifest();
         ninja.include(RULES_PATH.as_bytes());
         graph.emit(&mut ninja, &programs.cmake, &module_flag, &exports);
         files.prep.emit(&mut ninja, graph);

@@ -22,14 +22,20 @@ pub(crate) struct Graph<'a> {
     artifact_targets: HashSet<usize>,
     producers: HashMap<BString, usize>,
     generated_inputs: HashMap<BString, BString>,
-    steps: Vec<StepNodes>,
+    steps: Vec<StepNodes<'a>>,
+    order_only_alias_bytes: usize,
 }
 
 #[derive(Default)]
-struct StepNodes {
+struct StepNodes<'a> {
     outputs: Vec<BString>,
     byproducts: Vec<BString>,
-    order_only: Vec<BString>,
+    order_only: Vec<OrderOnly<'a>>,
+}
+
+enum OrderOnly<'a> {
+    Targets(&'a [usize]),
+    StepOutputs(usize),
 }
 
 impl<'a> Graph<'a> {
@@ -43,12 +49,13 @@ impl<'a> Graph<'a> {
             input,
             build_dir,
             config,
-            names: HashMap::new(),
-            aliases: Vec::new(),
+            names: HashMap::with_capacity(input.targets.len()),
+            aliases: Vec::with_capacity(input.targets.len()),
             artifact_targets: HashSet::new(),
-            producers: HashMap::new(),
+            producers: HashMap::with_capacity(input.steps.len()),
             generated_inputs: HashMap::new(),
-            steps: Vec::new(),
+            steps: Vec::with_capacity(input.steps.len()),
+            order_only_alias_bytes: 0,
         };
         for (index, target) in input.targets.iter().enumerate() {
             let name = graph.node(&target.name);
@@ -225,11 +232,14 @@ impl<'a> Graph<'a> {
 
     fn connect_targets(&mut self) -> Result<(), GenError> {
         for (target, alias) in self.input.targets.iter().zip(&self.aliases) {
-            let dependencies: Vec<_> = target
-                .depends
+            let dependencies = target.depends.as_slice();
+            let alias_bytes = dependencies
                 .iter()
-                .map(|&index| self.aliases.get(index).cloned())
-                .collect::<Option<_>>()
+                .try_fold(0usize, |bytes, &index| {
+                    self.aliases
+                        .get(index)
+                        .map(|name| bytes.saturating_add(name.len()).saturating_add(1))
+                })
                 .ok_or_else(|| {
                     generation_error(self.build_dir, "Invalid Ninja target dependency index.")
                 })?;
@@ -242,30 +252,44 @@ impl<'a> Graph<'a> {
                 };
                 if matches!(step, BuildStep::Compile { .. } | BuildStep::Scan { .. })
                     && let Some(nodes) = self.steps.get_mut(index)
+                    && !dependencies.is_empty()
                 {
-                    nodes.order_only.extend(dependencies.iter().cloned());
+                    nodes.order_only.push(OrderOnly::Targets(dependencies));
+                    self.order_only_alias_bytes =
+                        self.order_only_alias_bytes.saturating_add(alias_bytes);
                 }
             }
-            if let Some(&producer) = self.producers.get(alias) {
+            if let Some(&producer) = self.producers.get(alias)
+                && let Some(nodes) = self.steps.get_mut(producer)
+            {
                 // A real output can also be the target name, such as a root executable.
-                let extra: Vec<_> = dependencies
-                    .into_iter()
-                    .chain(
-                        target
-                            .steps
-                            .iter()
-                            .filter(|&&index| index != producer)
-                            .filter_map(|&index| self.steps.get(index))
-                            .flat_map(|nodes| nodes.outputs.iter().chain(&nodes.byproducts))
-                            .cloned(),
-                    )
-                    .collect();
-                if let Some(nodes) = self.steps.get_mut(producer) {
-                    nodes.order_only.extend(extra);
+                if !dependencies.is_empty() {
+                    nodes.order_only.push(OrderOnly::Targets(dependencies));
+                    self.order_only_alias_bytes =
+                        self.order_only_alias_bytes.saturating_add(alias_bytes);
                 }
+                nodes.order_only.extend(
+                    target
+                        .steps
+                        .iter()
+                        .copied()
+                        .filter(|&index| index != producer)
+                        .map(OrderOnly::StepOutputs),
+                );
             }
         }
         Ok(())
+    }
+
+    pub(crate) fn manifest(&self) -> Ninja {
+        // Allow space for edge syntax and commands in addition to the alias paths.
+        let capacity = self
+            .input
+            .steps
+            .len()
+            .saturating_mul(256)
+            .saturating_add(self.order_only_alias_bytes);
+        Ninja(Vec::with_capacity(capacity))
     }
 
     pub(crate) fn emit(
@@ -344,7 +368,7 @@ impl<'a> Graph<'a> {
         &self,
         ninja: &mut Ninja,
         step: &BuildStep,
-        nodes: &StepNodes,
+        nodes: &StepNodes<'_>,
         cmake: &[u8],
         modmap_flag: &[u8],
         exports: &[ModuleExportJob],
@@ -455,18 +479,33 @@ impl<'a> Graph<'a> {
         };
         let inputs = unique(inputs);
         let implicit = unique(implicit);
-        let order_only = unique(
-            dyndep_node
+        let mut order_only = Vec::new();
+        if dyndep_node.is_some() || !nodes.order_only.is_empty() {
+            let mut seen: HashSet<_> = inputs
                 .iter()
-                .chain(nodes.order_only.iter())
-                .filter(|node| {
-                    !inputs.contains(node)
-                        && !implicit.contains(node)
-                        && !nodes.outputs.contains(node)
-                        && !nodes.byproducts.contains(node)
-                })
-                .cloned(),
-        );
+                .chain(&implicit)
+                .chain(&nodes.outputs)
+                .chain(&nodes.byproducts)
+                .collect();
+            order_only.extend(dyndep_node.iter().filter(|node| seen.insert(node)));
+            for entry in &nodes.order_only {
+                match entry {
+                    OrderOnly::Targets(indices) => order_only.extend(
+                        indices
+                            .iter()
+                            .filter_map(|&index| self.aliases.get(index))
+                            .filter(|node| seen.insert(node)),
+                    ),
+                    OrderOnly::StepOutputs(index) => order_only.extend(
+                        self.steps
+                            .get(*index)
+                            .into_iter()
+                            .flat_map(|step| step.outputs.iter().chain(&step.byproducts))
+                            .filter(|node| seen.insert(node)),
+                    ),
+                }
+            }
+        }
         ninja.edge(
             rule,
             Edge {

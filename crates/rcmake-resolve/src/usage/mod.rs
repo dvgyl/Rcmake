@@ -4,7 +4,9 @@
 //! Link usage includes them. Compile-usage deduplication (encounter order and `SYSTEM`
 //! classification) stays separate from link-line ordering.
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use rcmake_base::{BString, Limits, list, truth};
 use rcmake_diag::Frame;
@@ -57,19 +59,40 @@ pub struct UsageValue {
     pub flags: EvalFlags,
 }
 
-#[derive(Clone, Default)]
+#[derive(Default)]
 struct WalkValue {
-    contributions: Vec<(TargetId, Vec<BT<BString>>)>,
+    contributions: Vec<(TargetId, Arc<[BT<BString>]>)>,
     flags: EvalFlags,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-struct MemoKey {
-    usage: UsageKey,
-    property: Option<BString>,
-    link_language: Option<BString>,
-    command_config: Option<rcmake_genex::ConfigId>,
-    output_config: Option<rcmake_genex::ConfigId>,
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct MemoKey<'a> {
+    target: TargetId,
+    property: Cow<'a, [u8]>,
+    config: Cow<'a, [u8]>,
+    language: Option<Cow<'a, [u8]>>,
+    head: Option<TargetId>,
+    traversal: UsageTraversal,
+    link_language: Option<Cow<'a, [u8]>>,
+    command_config: Option<Cow<'a, [u8]>>,
+    output_config: Option<Cow<'a, [u8]>>,
+}
+
+impl MemoKey<'_> {
+    fn into_owned(self) -> MemoKey<'static> {
+        let owned = |value: Cow<'_, [u8]>| Cow::Owned(value.into_owned());
+        MemoKey {
+            target: self.target,
+            property: owned(self.property),
+            config: owned(self.config),
+            language: self.language.map(owned),
+            head: self.head,
+            traversal: self.traversal,
+            link_language: self.link_language.map(owned),
+            command_config: self.command_config.map(owned),
+            output_config: self.output_config.map(owned),
+        }
+    }
 }
 
 const MAX_WALK_DEPTH: usize = 128;
@@ -81,7 +104,9 @@ pub struct UsageResolver<'a> {
     artifact_depth: usize,
     source_paths: Option<&'a SourcePaths<'a>>,
     ids: Vec<TargetId>,
-    memo: HashMap<MemoKey, WalkValue>,
+    memo: HashMap<MemoKey<'static>, Arc<WalkValue>>,
+    link_memo: HashMap<link::LinkMemoKey, link::SharedLinks>,
+    debug_configs: Vec<BString>,
     active: Vec<(TargetId, BString)>,
     cycle_count: usize,
     has_injections: bool,
@@ -98,6 +123,12 @@ impl<'a> UsageResolver<'a> {
             source_paths: None,
             ids: model.targets().map(|(id, _)| id).collect(),
             memo: HashMap::new(),
+            link_memo: HashMap::new(),
+            debug_configs: model
+                .global
+                .props
+                .get(b"DEBUG_CONFIGURATIONS")
+                .map_or_else(Vec::new, |value| list::split(value, list::Empty::Drop)),
             active: Vec::new(),
             cycle_count: 0,
             has_injections: model.targets().any(|(_, target)| {
@@ -163,12 +194,20 @@ impl<'a> UsageResolver<'a> {
         field: UsageField,
         ctx: &EvalContext,
     ) -> Result<UsageValue, ResolveError> {
-        let mut value = self.collect_property(target, field.name().as_bytes(), ctx)?;
+        let name = field.name().as_bytes();
+        let ctx = self.property_context(target, name, ctx)?;
+        let result = self.walk(target, name, &ctx)?;
         let mut seen = HashSet::new();
-        value
-            .entries
-            .retain(|entry| seen.insert(entry.value.clone()));
-        Ok(value)
+        Ok(UsageValue {
+            entries: result
+                .contributions
+                .iter()
+                .flat_map(|(_, entries)| entries.iter())
+                .filter(|entry| seen.insert(entry.value.as_slice()))
+                .cloned()
+                .collect(),
+            flags: result.flags,
+        })
     }
 
     /// Collect a usage property by name, including sources and custom transitive properties.
@@ -178,11 +217,7 @@ impl<'a> UsageResolver<'a> {
         name: &[u8],
         ctx: &EvalContext,
     ) -> Result<UsageValue, ResolveError> {
-        let mut ctx = context(target, ctx, self.traversal(target, name));
-        if ctx.head.is_none() {
-            ctx.head = Some(handle(target));
-        }
-        self.check_reentry(target, name)?;
+        let ctx = self.property_context(target, name, ctx)?;
         if matches!(name, b"LINK_LIBRARIES" | b"INTERFACE_LINK_LIBRARIES") {
             return self.link_property(target, name, &ctx);
         }
@@ -190,11 +225,23 @@ impl<'a> UsageResolver<'a> {
         Ok(UsageValue {
             entries: result
                 .contributions
-                .into_iter()
-                .flat_map(|(_, entries)| entries)
+                .iter()
+                .flat_map(|(_, entries)| entries.iter().cloned())
                 .collect(),
             flags: result.flags,
         })
+    }
+
+    fn property_context(
+        &self,
+        target: TargetId,
+        name: &[u8],
+        ctx: &EvalContext,
+    ) -> Result<EvalContext, ResolveError> {
+        let mut ctx = context(target, ctx, self.traversal(target, name));
+        ctx.head.get_or_insert(handle(target));
+        self.check_reentry(target, name)?;
+        Ok(ctx)
     }
 
     fn traversal(&self, target: TargetId, name: &[u8]) -> UsageTraversal {
@@ -256,7 +303,7 @@ impl<'a> UsageResolver<'a> {
         target: TargetId,
         name: &[u8],
         ctx: &EvalContext,
-    ) -> Result<WalkValue, ResolveError> {
+    ) -> Result<Arc<WalkValue>, ResolveError> {
         // A link graph may contain a cycle. Stop this branch and avoid caching its
         // partial result. A generator expression that re-enters a property is an error.
         let in_cycle = self
@@ -265,43 +312,47 @@ impl<'a> UsageResolver<'a> {
             .any(|(id, prop)| *id == target && prop == name);
         if in_cycle {
             self.cycle_count += 1;
-            return Ok(WalkValue::default());
+            return Ok(Arc::default());
         }
-        let field = UsageField::from_name(name);
-        let key = MemoKey {
-            usage: UsageKey {
-                target,
-                field: field.unwrap_or(UsageField::InterfaceSources),
-                config: ctx.config.0.clone(),
-                language: ctx.language.clone(),
-                head: None,
-                traversal: ctx.traversal,
-            },
-            property: field.is_none().then(|| name.into()),
-            link_language: ctx.link_language.clone(),
-            command_config: ctx.command_config.clone(),
-            output_config: ctx.output_config.clone(),
+        let mut key = MemoKey {
+            target,
+            property: Cow::Borrowed(name),
+            config: Cow::Borrowed(&ctx.config.0),
+            language: ctx
+                .language
+                .as_ref()
+                .map(|value| Cow::Borrowed(value.as_slice())),
+            head: None,
+            traversal: ctx.traversal,
+            link_language: ctx
+                .link_language
+                .as_ref()
+                .map(|value| Cow::Borrowed(value.as_slice())),
+            command_config: ctx
+                .command_config
+                .as_ref()
+                .map(|value| Cow::Borrowed(value.0.as_slice())),
+            output_config: ctx
+                .output_config
+                .as_ref()
+                .map(|value| Cow::Borrowed(value.0.as_slice())),
         };
         if let Some(value) = self.memo.get(&key) {
-            return Ok(value.clone());
+            return Ok(Arc::clone(value));
         }
-        let mut head_key = key.clone();
-        head_key.usage.head = ctx.head.and_then(|id| self.ids.get(id.0 as usize).copied());
-        if let Some(value) = self.memo.get(&head_key) {
-            return Ok(value.clone());
+        key.head = ctx.head.and_then(|id| self.ids.get(id.0 as usize).copied());
+        if let Some(value) = self.memo.get(&key) {
+            return Ok(Arc::clone(value));
         }
         let cycle_count = self.cycle_count;
-        let value =
-            self.with_property(target, name, |this| this.walk_uncached(target, name, ctx))?;
+        let value = Arc::new(
+            self.with_property(target, name, |this| this.walk_uncached(target, name, ctx))?,
+        );
         if self.cycle_count == cycle_count {
-            self.memo.insert(
-                if value.flags.head_sensitive {
-                    head_key
-                } else {
-                    key
-                },
-                value.clone(),
-            );
+            if !value.flags.head_sensitive {
+                key.head = None;
+            }
+            self.memo.insert(key.into_owned(), Arc::clone(&value));
         }
         Ok(value)
     }
@@ -355,24 +406,30 @@ impl<'a> UsageResolver<'a> {
 
         let interface = name.starts_with(b"INTERFACE_");
         let dependency_name = if interface {
-            BString::from(name)
+            Cow::Borrowed(name)
         } else {
-            [b"INTERFACE_", name].concat().into()
+            Cow::Owned([b"INTERFACE_", name].concat())
         };
         let (links, flags) = self.usage_links(id, interface, ctx)?;
         let mut result = WalkValue {
             flags: own.flags.union(flags),
-            contributions: vec![(id, own.entries)],
+            ..WalkValue::default()
         };
+        if !own.entries.is_empty()
+            || (matches!(name, b"SOURCES" | b"INTERFACE_SOURCES") && !target.file_sets.is_empty())
+        {
+            result.contributions.push((id, own.entries.into()));
+        }
         let mut seen = HashSet::from([id]);
-        for dependency in links.iter().flat_map(ResolvedLinkItem::targets) {
+        for dependency in links.iter().flat_map(|item| item.edge_targets()) {
             let value = self.walk(dependency, &dependency_name, ctx)?;
             result.flags = result.flags.union(value.flags);
             result.contributions.extend(
                 value
                     .contributions
-                    .into_iter()
-                    .filter(|(owner, _)| seen.insert(*owner)),
+                    .iter()
+                    .filter(|(owner, _)| seen.insert(*owner))
+                    .cloned(),
             );
         }
         Ok(result)
@@ -385,11 +442,12 @@ impl<'a> UsageResolver<'a> {
     ) -> Result<Vec<(FileSetId, &'a FileSet)>, ResolveError> {
         let mut ctx = context(target, ctx, UsageTraversal::Compile);
         ctx.head.get_or_insert(handle(target));
-        let owners = self.walk(target, b"SOURCES", &ctx)?.contributions;
+        let owners = self.walk(target, b"SOURCES", &ctx)?;
         let model = self.model;
         Ok(owners
-            .into_iter()
-            .filter_map(|(owner, _)| model.target(owner))
+            .contributions
+            .iter()
+            .filter_map(|(owner, _)| model.target(*owner))
             .flat_map(|owner| owner.file_sets.iter())
             .filter_map(|id| Some((*id, model.file_set(*id)?)))
             .filter(|(_, set)| {
@@ -534,7 +592,7 @@ impl<'a> UsageResolver<'a> {
         }
 
         let (links, _) = self.usage_links(target, false, &ctx)?;
-        let mut todo: Vec<_> = links.iter().flat_map(ResolvedLinkItem::targets).collect();
+        let mut todo: Vec<_> = links.iter().flat_map(|item| item.edge_targets()).collect();
         let mut visited = HashSet::new();
         while let Some(id) = todo.pop() {
             if !visited.insert(id) {
@@ -562,7 +620,7 @@ impl<'a> UsageResolver<'a> {
                 )?;
             }
             let (links, _) = self.usage_links(id, true, &ctx)?;
-            todo.extend(links.iter().flat_map(ResolvedLinkItem::targets));
+            todo.extend(links.iter().flat_map(|item| item.edge_targets()));
         }
 
         let system: HashSet<_> = system

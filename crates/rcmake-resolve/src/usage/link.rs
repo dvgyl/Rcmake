@@ -1,4 +1,5 @@
-use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::sync::Arc;
 
 use indexmap::{IndexMap, IndexSet};
 use rcmake_base::{BString, list};
@@ -58,6 +59,20 @@ impl ResolvedLinkItem {
         }
     }
 
+    pub(super) fn edge_targets(&self) -> impl Iterator<Item = TargetId> + '_ {
+        // Decoded groups have only one level of members.
+        let items = match &self.kind {
+            ResolvedLinkKind::Group { members, .. } => members.as_slice(),
+            _ => std::slice::from_ref(self),
+        };
+        items.iter().filter_map(|item| match item.kind {
+            ResolvedLinkKind::Library(id)
+            | ResolvedLinkKind::Objects(id)
+            | ResolvedLinkKind::Interface(id) => Some(id),
+            _ => None,
+        })
+    }
+
     fn key(&self) -> LinkKey {
         match &self.kind {
             ResolvedLinkKind::Library(id)
@@ -95,27 +110,49 @@ struct EvaluatedLinks {
     value: UsageValue,
 }
 
-impl UsageResolver<'_> {
+pub(super) type SharedLinks = (Arc<[Arc<ResolvedLinkItem>]>, EvalFlags);
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub(super) struct LinkMemoKey {
+    owner: TargetId,
+    interface: bool,
+    debug: bool,
+    traversal: UsageTraversal,
+}
+
+impl<'a> UsageResolver<'a> {
     /// Collect direct and transitive link items in link order.
     pub fn collect_link_items(
         &mut self,
         target: TargetId,
         ctx: &EvalContext,
     ) -> Result<Vec<ResolvedLinkItem>, ResolveError> {
+        Ok(self
+            .ordered_links(target, ctx)?
+            .into_iter()
+            .map(Arc::unwrap_or_clone)
+            .collect())
+    }
+
+    pub(crate) fn ordered_links(
+        &mut self,
+        target: TargetId,
+        ctx: &EvalContext,
+    ) -> Result<Vec<Arc<ResolvedLinkItem>>, ResolveError> {
         let ctx = link_context(target, ctx);
         let (direct, _) = self.usage_links(target, false, &ctx)?;
         let mut graph = LinkGraph::default();
-        let original: Vec<_> = direct
-            .into_iter()
-            .map(|item| (graph.insert(item.clone()), item))
+        let mut original: Vec<_> = direct
+            .iter()
+            .map(|item| (graph.insert(item), Arc::clone(item)))
             .collect();
         let mut index = 0;
         while let Some((_, (item, _))) = graph.nodes.get_index(index) {
-            let parents: Vec<_> = item.targets().collect();
+            let item = Arc::clone(item);
             let mut edges = IndexSet::new();
-            for parent in parents {
+            for parent in item.edge_targets() {
                 let (items, _) = self.usage_links(parent, true, &ctx)?;
-                edges.extend(items.into_iter().map(|item| graph.insert(item)));
+                edges.extend(items.iter().map(|item| graph.insert(item)));
             }
             if let Some((_, (_, current_edges))) = graph.nodes.get_index_mut(index) {
                 *current_edges = edges;
@@ -123,20 +160,18 @@ impl UsageResolver<'_> {
             index += 1;
         }
 
-        let original = graph.apply_groups(original);
+        graph.apply_groups(&mut original);
         let mut ordered = graph.order(self.model, &ctx, original)?;
         deduplicate(self.model, target, &ctx, &mut ordered);
         // Explicit object inputs are placed before the libraries.
-        let (objects, libraries): (Vec<_>, Vec<_>) = ordered
-            .into_iter()
-            .filter(|item| !matches!(item.kind, ResolvedLinkKind::Interface(_)))
-            .partition(|item| {
-                matches!(
-                    item.kind,
-                    ResolvedLinkKind::Objects(_) | ResolvedLinkKind::ObjectFile
-                )
-            });
-        Ok(objects.into_iter().chain(libraries).collect())
+        ordered.retain(|item| !matches!(item.kind, ResolvedLinkKind::Interface(_)));
+        ordered.sort_by_key(|item| {
+            !matches!(
+                item.kind,
+                ResolvedLinkKind::Objects(_) | ResolvedLinkKind::ObjectFile
+            )
+        });
+        Ok(ordered)
     }
 
     pub(crate) fn link_targets(
@@ -146,15 +181,24 @@ impl UsageResolver<'_> {
     ) -> Result<Vec<TargetId>, ResolveError> {
         let ctx = link_context(target, ctx);
         let (direct, _) = self.usage_links(target, false, &ctx)?;
-        let mut todo: VecDeque<_> = direct.iter().flat_map(ResolvedLinkItem::targets).collect();
-        let mut seen = IndexSet::new();
-        while let Some(id) = todo.pop_front() {
-            if seen.insert(id) {
-                let (links, _) = self.usage_links(id, true, &ctx)?;
-                todo.extend(links.iter().flat_map(ResolvedLinkItem::targets));
-            }
+        let mut seen = HashSet::new();
+        let mut targets: Vec<_> = direct
+            .iter()
+            .flat_map(|item| item.edge_targets())
+            .filter(|id| seen.insert(*id))
+            .collect();
+        let mut index = 0;
+        while let Some(&id) = targets.get(index) {
+            let (links, _) = self.usage_links(id, true, &ctx)?;
+            targets.extend(
+                links
+                    .iter()
+                    .flat_map(|item| item.edge_targets())
+                    .filter(|id| seen.insert(*id)),
+            );
+            index += 1;
         }
-        Ok(seen.into_iter().collect())
+        Ok(targets)
     }
 
     pub(super) fn usage_links(
@@ -162,17 +206,39 @@ impl UsageResolver<'_> {
         owner: TargetId,
         interface: bool,
         ctx: &EvalContext,
-    ) -> Result<(Vec<ResolvedLinkItem>, EvalFlags), ResolveError> {
-        let explicit = self.explicit_links(owner, interface, ctx)?;
-        self.effective_links(owner, interface, ctx, explicit.items, explicit.value.flags)
+    ) -> Result<SharedLinks, ResolveError> {
+        let key = LinkMemoKey {
+            owner,
+            interface,
+            debug: self.debug_config(ctx),
+            traversal: ctx.traversal,
+        };
+        if let Some(links) = self.link_memo.get(&key)
+            && (self.active.is_empty() || !links.1.context_sensitive)
+        {
+            return Ok(links.clone());
+        }
+        let (name, entries) = self.link_entries(owner, interface)?;
+        let explicit = self.evaluate_links(owner, name, entries, ctx, !interface, false)?;
+        let (items, flags) =
+            self.effective_links(owner, interface, ctx, explicit.items, explicit.value.flags)?;
+        let links: SharedLinks = (items.into_iter().map(Arc::new).collect(), flags);
+        // Other expressions can read target properties and enter a usage walk.
+        // During a property walk, evaluate any remaining expression to check its depth.
+        if (interface || !self.has_injections)
+            && (self.active.is_empty() || !flags.context_sensitive)
+            && entries.iter().all(|entry| literal_link(&entry.text.value))
+        {
+            self.link_memo.insert(key, links.clone());
+        }
+        Ok(links)
     }
 
-    fn explicit_links(
-        &mut self,
+    fn link_entries(
+        &self,
         owner: TargetId,
         interface: bool,
-        ctx: &EvalContext,
-    ) -> Result<EvaluatedLinks, ResolveError> {
+    ) -> Result<(&'static [u8], &'a [LinkItem]), ResolveError> {
         let target = self.target(owner)?;
         let (name, entries) = if interface {
             (
@@ -182,13 +248,7 @@ impl UsageResolver<'_> {
         } else {
             (b"LINK_LIBRARIES".as_slice(), &target.usage.link_libraries)
         };
-        self.evaluate_links(
-            owner,
-            name,
-            entries.as_deref().unwrap_or(&[]),
-            ctx,
-            !interface,
-        )
+        Ok((name, entries.as_deref().unwrap_or(&[])))
     }
 
     fn effective_links(
@@ -215,12 +275,12 @@ impl UsageResolver<'_> {
         }
         if links
             .iter()
-            .flat_map(ResolvedLinkItem::targets)
+            .flat_map(ResolvedLinkItem::edge_targets)
             .any(|id| id == owner)
         {
             if interface {
                 // Interface-only self edges do not contribute another usage value.
-                links.retain(|item| !item.targets().any(|id| id == owner));
+                links.retain(|item| !item.edge_targets().any(|id| id == owner));
             } else {
                 return Err(GenexError::SelfReference {
                     target: self.target(owner)?.name.clone(),
@@ -238,20 +298,10 @@ impl UsageResolver<'_> {
         entries: &[LinkItem],
         ctx: &EvalContext,
         direct: bool,
+        collect_text: bool,
     ) -> Result<EvaluatedLinks, ResolveError> {
         let mut output = EvaluatedLinks::default();
-        let debug_configs = self
-            .model
-            .global
-            .props
-            .get(b"DEBUG_CONFIGURATIONS")
-            .map(|value| list::split(value, list::Empty::Drop))
-            .unwrap_or_default();
-        let debug = if debug_configs.is_empty() {
-            ctx.config.matches(b"Debug")
-        } else {
-            debug_configs.iter().any(|name| ctx.config.matches(name))
-        };
+        let debug = self.debug_config(ctx);
         let mut take_next = true;
         for entry in entries {
             match entry.text.value.as_slice() {
@@ -267,17 +317,29 @@ impl UsageResolver<'_> {
                         output
                             .items
                             .extend(self.decode_links(entry, &values, direct)?);
-                        output.value.entries.extend(
-                            values
-                                .into_iter()
-                                .map(|value| BT::new(value, entry.text.backtrace.clone())),
-                        );
+                        if collect_text {
+                            output.value.entries.extend(
+                                values
+                                    .into_iter()
+                                    .map(|value| BT::new(value, entry.text.backtrace.clone())),
+                            );
+                        }
                     }
                     take_next = true;
                 }
             }
         }
         Ok(output)
+    }
+
+    fn debug_config(&self, ctx: &EvalContext) -> bool {
+        if self.debug_configs.is_empty() {
+            ctx.config.matches(b"Debug")
+        } else {
+            self.debug_configs
+                .iter()
+                .any(|name| ctx.config.matches(name))
+        }
     }
 
     fn decode_links(
@@ -391,13 +453,9 @@ impl UsageResolver<'_> {
         if !visited.insert(owner) {
             return Ok(UsageValue::default());
         }
-        let name = if interface {
-            b"INTERFACE_LINK_LIBRARIES".as_slice()
-        } else {
-            b"LINK_LIBRARIES".as_slice()
-        };
+        let (name, entries) = self.link_entries(owner, interface)?;
         self.with_property(owner, name, |this| {
-            let explicit = this.explicit_links(owner, interface, ctx)?;
+            let explicit = this.evaluate_links(owner, name, entries, ctx, !interface, true)?;
             let mut result = explicit.value;
             let (items, flags) =
                 this.effective_links(owner, interface, ctx, explicit.items, result.flags)?;
@@ -410,7 +468,7 @@ impl UsageResolver<'_> {
                     "The link property exceeds the size limit.".into(),
                 ));
             }
-            for id in items.iter().flat_map(ResolvedLinkItem::targets) {
+            for id in items.iter().flat_map(ResolvedLinkItem::edge_targets) {
                 let value = this.flatten_links(id, true, ctx, visited, work)?;
                 result.flags = result.flags.union(value.flags);
                 result.entries.extend(value.entries);
@@ -428,6 +486,14 @@ fn link_context(owner: TargetId, ctx: &EvalContext) -> EvalContext {
 
 fn marker<'a>(value: &'a [u8], prefix: &[u8]) -> Option<&'a [u8]> {
     value.strip_prefix(prefix)?.strip_suffix(b">")
+}
+
+fn literal_link(value: &[u8]) -> bool {
+    !value.windows(2).any(|window| window == b"$<")
+        || [b"$<LINK_ONLY:".as_slice(), b"$<COMPILE_ONLY:"]
+            .into_iter()
+            .filter_map(|prefix| marker(value, prefix))
+            .any(|inner| !inner.windows(2).any(|window| window == b"$<") && !inner.contains(&b'>'))
 }
 
 pub(super) const DIRECT: &[u8] = b"INTERFACE_LINK_LIBRARIES_DIRECT";
@@ -453,7 +519,7 @@ impl Injection {
         if depth >= super::MAX_WALK_DEPTH {
             return Err(GenexError::TooDeep.into());
         }
-        for id in item.targets() {
+        for id in item.edge_targets() {
             if !self.visited.insert(id) {
                 continue;
             }
@@ -466,7 +532,7 @@ impl Injection {
                     text: BT::new(raw.clone(), target.backtrace.clone()),
                     lookup_dir: target.dir,
                 };
-                let links = resolver.evaluate_links(id, property, &[raw], ctx, true)?;
+                let links = resolver.evaluate_links(id, property, &[raw], ctx, true, false)?;
                 self.flags = self.flags.union(links.value.flags);
                 for link in links.items {
                     if property == EXCLUDE {
@@ -479,15 +545,15 @@ impl Injection {
             }
             let (links, flags) = resolver.usage_links(id, true, ctx)?;
             self.flags = self.flags.union(flags);
-            for link in links {
-                self.follow(resolver, &link, ctx, depth + 1)?;
+            for link in links.iter() {
+                self.follow(resolver, link, ctx, depth + 1)?;
             }
         }
         Ok(())
     }
 }
 
-type LinkNode = (ResolvedLinkItem, IndexSet<usize>);
+type LinkNode = (Arc<ResolvedLinkItem>, IndexSet<usize>);
 
 #[derive(Default)]
 struct LinkGraph {
@@ -499,17 +565,14 @@ struct LinkGraph {
     reason = "Node and component indices come from the graph and its component table."
 )]
 impl LinkGraph {
-    fn insert(&mut self, item: ResolvedLinkItem) -> usize {
+    fn insert(&mut self, item: &Arc<ResolvedLinkItem>) -> usize {
         let entry = self.nodes.entry(item.key());
         let index = entry.index();
-        entry.or_insert((item, IndexSet::new()));
+        entry.or_insert_with(|| (Arc::clone(item), IndexSet::new()));
         index
     }
 
-    fn apply_groups(
-        &mut self,
-        mut direct: Vec<(usize, ResolvedLinkItem)>,
-    ) -> Vec<(usize, ResolvedLinkItem)> {
+    fn apply_groups(&mut self, direct: &mut [(usize, Arc<ResolvedLinkItem>)]) {
         let mut replacements = HashMap::new();
         for (index, (_, (item, _))) in self.nodes.iter().enumerate() {
             if let ResolvedLinkKind::Group { members, .. } = &item.kind {
@@ -520,11 +583,17 @@ impl LinkGraph {
                 }
             }
         }
-        for (index, item) in &mut direct {
+        if replacements.is_empty() {
+            for (index, (_, edges)) in self.nodes.values_mut().enumerate() {
+                edges.shift_remove(&index);
+            }
+            return;
+        }
+        for (index, item) in direct {
             if let Some(group) = replacements.get(index) {
                 *index = *group;
-                *item = self.nodes[*group].0.clone();
-                item.direct = true;
+                *item = Arc::clone(&self.nodes[*group].0);
+                Arc::make_mut(item).direct = true;
             }
         }
         for (index, (_, edges)) in self.nodes.values_mut().enumerate() {
@@ -536,15 +605,14 @@ impl LinkGraph {
                 }
             }
         }
-        direct
     }
 
     fn order(
         &self,
         model: &ProjectModel,
         ctx: &EvalContext,
-        direct: Vec<(usize, ResolvedLinkItem)>,
-    ) -> Result<Vec<ResolvedLinkItem>, ResolveError> {
+        direct: Vec<(usize, Arc<ResolvedLinkItem>)>,
+    ) -> Result<Vec<Arc<ResolvedLinkItem>>, ResolveError> {
         let (component_ids, mut components) =
             self.components(direct.iter().rev().map(|(index, _)| *index));
         for (index, (_, (_, edges))) in self.nodes.iter().enumerate() {
@@ -594,7 +662,7 @@ impl LinkGraph {
 
         // Edges point from a library to the libraries that must follow it.
         // The component identifiers are in topological order.
-        let mut order = Vec::new();
+        let mut order = Vec::with_capacity(self.nodes.len().max(direct.len()));
         let mut pending = BTreeSet::new();
         for (index, item) in direct {
             visit(index, &component_ids, &mut components, &mut pending);
@@ -607,7 +675,7 @@ impl LinkGraph {
                 ));
             };
             visit(index, &component_ids, &mut components, &mut pending);
-            order.push(self.nodes[index].0.clone());
+            order.push(Arc::clone(&self.nodes[index].0));
             if order.len() > Limits::default().max_value_bytes / 64 {
                 return Err(ResolveError::Message(
                     "The link line exceeds the size limit.".into(),
@@ -628,14 +696,15 @@ impl LinkGraph {
 
         // Find strongly connected components with two graph passes. Use
         // explicit stacks so large acyclic link graphs do not use the call stack.
-        let mut visited = HashSet::new();
-        let mut finished = Vec::new();
+        let mut visited = vec![false; count];
+        let mut finished = Vec::with_capacity(count);
+        let mut stack = Vec::new();
         for index in roots.chain((0..count).rev()) {
-            let mut stack = vec![(index, false)];
+            stack.push((index, false));
             while let Some((node, done)) = stack.pop() {
                 if done {
                     finished.push(node);
-                } else if visited.insert(node) {
+                } else if !std::mem::replace(&mut visited[node], true) {
                     stack.push((node, true));
                     stack.extend(self.nodes[node].1.iter().map(|&edge| (edge, false)));
                 }
@@ -643,13 +712,14 @@ impl LinkGraph {
         }
         let mut ids = vec![usize::MAX; count];
         let mut components = Vec::new();
+        let mut stack = Vec::new();
         for index in finished.into_iter().rev() {
             if ids[index] != usize::MAX {
                 continue;
             }
             let id = components.len();
             let mut members = Vec::new();
-            let mut stack = vec![index];
+            stack.push(index);
             while let Some(node) = stack.pop() {
                 if ids[node] == usize::MAX {
                     ids[node] = id;
@@ -681,7 +751,8 @@ struct Component {
 impl Component {
     fn reset(&mut self) {
         self.left = self.passes;
-        self.remaining = self.members.iter().copied().collect();
+        self.remaining.clear();
+        self.remaining.extend(self.members.iter().copied());
     }
 }
 
@@ -718,7 +789,7 @@ fn deduplicate(
     model: &ProjectModel,
     id: TargetId,
     ctx: &EvalContext,
-    items: &mut Vec<ResolvedLinkItem>,
+    items: &mut Vec<Arc<ResolvedLinkItem>>,
 ) {
     let Some(target) = model.target(id) else {
         return;

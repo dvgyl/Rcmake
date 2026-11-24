@@ -893,6 +893,52 @@ fn direct_link_to_object_library_includes_objects_and_usage() -> TestResult {
 }
 
 #[test]
+fn archive_commands_keep_flags_and_objects_with_full_resolved_fragments() -> TestResult {
+    let mut model = project();
+    let library = model.add_target(target("lib", TargetKind::StaticLibrary, &["lib.c"]))?;
+    let objects = model.add_target(target("obj", TargetKind::ObjectLibrary, &["obj.c"]))?;
+    let mut archive = target("archive", TargetKind::StaticLibrary, &[]);
+    archive.usage.link_libraries = Some(vec![link_item("lib"), link_item("obj")]);
+    archive
+        .usage
+        .push(UsageField::LinkOptions, entry("-archive-flag"));
+    archive
+        .usage
+        .push(UsageField::LinkDirectories, entry("/lib/path"));
+    model.add_target(archive)?;
+    let host = PureHost::default();
+    for file in ["/src/lib.c", "/src/obj.c"] {
+        host.seed_file(Path::new(file), b"")?;
+    }
+    let result = resolve(&model, &host, &[])?;
+    let [_, obj, archive] = result.targets.as_slice() else {
+        return Err("Expected three resolved targets.".into());
+    };
+    assert_eq!(archive.dependencies, [library, objects]);
+    let link = archive.link.as_ref().ok_or("Expected an archive step.")?;
+    assert_eq!(
+        link.fragments
+            .iter()
+            .map(|fragment| fragment.role)
+            .collect::<Vec<_>>(),
+        [
+            LinkFragmentRole::Flags,
+            LinkFragmentRole::LibraryPath,
+            LinkFragmentRole::Libraries
+        ]
+    );
+
+    let graph = &result.graphs[0];
+    assert_eq!(graph.targets[2].depends, [0, 1]);
+    assert_object_input(graph, "archive", &obj.compile_units[0].object)?;
+    let BuildStep::Link { step, .. } = link_build_step(graph, "archive")? else {
+        return Err("Expected an archive step.".into());
+    };
+    assert_eq!(step.fragments, link.fragments[..1]);
+    Ok(())
+}
+
+#[test]
 fn interface_object_library_link_requires_explicit_objects() -> TestResult {
     let mut model = project();
     let mut obj = target("obj", TargetKind::ObjectLibrary, &["a.cpp"]);
