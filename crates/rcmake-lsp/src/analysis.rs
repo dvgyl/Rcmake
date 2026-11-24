@@ -19,7 +19,7 @@ use crate::{
     features::{command_name, payload},
     json::{object, uint},
     lexical,
-    position::{Lines, Position, PositionEncoding, range},
+    position::{Lines, Position, PositionEncoding},
     roles::{Arguments, Role, Variable},
 };
 
@@ -754,6 +754,7 @@ impl Tokens<'_> {
 #[cfg(test)]
 mod tests {
     use crate::json::{array, get};
+    use crate::position::range;
 
     use super::*;
 

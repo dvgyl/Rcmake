@@ -156,7 +156,7 @@ impl PackageGenerator for ArchiveGenerator {
             compression_level,
             verbose: false,
         };
-        let archives = component_archives(&cfg, archive_name, self.name());
+        let archives = component_archives(&cfg, archive_name, self.name())?;
         if archives.is_empty() {
             let (base, inputs) = if cfg.get(b"CPACK_INCLUDE_TOPLEVEL_DIRECTORY").is_none()
                 || cfg.on(b"CPACK_INCLUDE_TOPLEVEL_DIRECTORY")
@@ -198,7 +198,7 @@ impl PackageGenerator for ArchiveGenerator {
             .collect::<Result<Vec<_>, _>>()?;
         let prefix = component_prefix(cx, &cfg)?;
         for (archive, path) in archives.iter().zip(&paths) {
-            write_component_archive(cx, path, &prefix, &archive.components, &options)?;
+            write_component_archive(cx, path, &prefix, &archive.roots, &options)?;
         }
         Ok(paths)
     }
@@ -206,45 +206,60 @@ impl PackageGenerator for ArchiveGenerator {
 
 struct ComponentArchive {
     name: BString,
-    components: Vec<BString>,
+    roots: Vec<PathBuf>,
 }
 
-fn component_archives(cfg: &CpackConfig, base: &[u8], generator: &str) -> Vec<ComponentArchive> {
+fn component_archives(
+    cfg: &CpackConfig,
+    base: &[u8],
+    generator: &str,
+) -> Result<Vec<ComponentArchive>, CpackError> {
     let grouping = crate::stage::grouping(cfg);
     let mut seen = BTreeSet::new();
-    let mut groups: BTreeMap<BString, Vec<BString>> = BTreeMap::new();
-    let mut singles = BTreeSet::new();
+    let mut groups: BTreeMap<BString, Vec<PathBuf>> = BTreeMap::new();
+    let mut singles: BTreeMap<BString, Vec<PathBuf>> = BTreeMap::new();
     let projects = cfg.list(b"CPACK_INSTALL_CMAKE_PROJECTS");
-    for [_, _, selection, _] in projects.as_chunks::<4>().0 {
-        for component in crate::stage::package_components(cfg, selection) {
+    for [_, _, selection, subdir] in projects.as_chunks::<4>().0 {
+        let components = crate::stage::package_components(cfg, selection);
+        if components.is_empty() {
+            continue;
+        }
+        let subdir = crate::stage::relative_install_path(subdir)?;
+        for component in components {
+            let root = subdir.join(crate::stage::component_dir(&component));
+            if !seen.insert((component.clone(), root.clone())) {
+                continue;
+            }
             if grouping == ComponentGrouping::OnePerGroup
                 && let Some(group) = crate::stage::component_group(cfg, &component)
             {
-                if seen.insert(component.clone()) {
-                    groups.entry(group.into()).or_default().push(component);
-                }
+                groups.entry(group.into()).or_default().push(root);
             } else {
-                singles.insert(component);
+                singles.entry(component).or_default().push(root);
             }
         }
     }
     if grouping == ComponentGrouping::AllComponentsInOne && !singles.is_empty() {
-        return vec![ComponentArchive {
+        return Ok(vec![ComponentArchive {
             name: base.into(),
-            components: singles.into_iter().collect(),
-        }];
+            roots: singles.into_values().flatten().collect(),
+        }]);
     }
-    groups
+    Ok(groups
         .into_iter()
-        .map(|(group, components)| ComponentArchive {
+        .map(|(group, roots)| ComponentArchive {
             name: component_archive_name(cfg, base, &group, generator, "COMPONENT_GROUP"),
-            components,
+            roots,
         })
-        .chain(singles.into_iter().map(|component| ComponentArchive {
-            name: component_archive_name(cfg, base, &component, generator, "COMPONENT"),
-            components: vec![component],
-        }))
-        .collect()
+        .chain(
+            singles
+                .into_iter()
+                .map(|(component, roots)| ComponentArchive {
+                    name: component_archive_name(cfg, base, &component, generator, "COMPONENT"),
+                    roots,
+                }),
+        )
+        .collect())
 }
 
 fn component_archive_name(
@@ -297,9 +312,8 @@ fn component_prefix(cx: &PackageContext<'_>, cfg: &CpackConfig) -> Result<PathBu
     } else {
         PathBuf::new()
     };
-    if let Some(install_prefix) = cfg.get(b"CPACK_PACKAGING_INSTALL_PREFIX") {
-        prefix.push(crate::stage::relative_install_path(install_prefix)?);
-    }
+    let install_prefix = crate::stage::project_install_prefix(cfg);
+    prefix.extend(crate::stage::relative_install_path(install_prefix)?.iter());
     Ok(prefix)
 }
 
@@ -307,12 +321,10 @@ fn write_component_archive(
     cx: &PackageContext<'_>,
     path: &Path,
     prefix: &Path,
-    components: &[BString],
+    roots: &[PathBuf],
     options: &CreateOptions,
 ) -> Result<(), CpackError> {
-    let mut roots = components
-        .iter()
-        .map(|name| cx.staging_dir.join(crate::stage::component_dir(name)));
+    let mut roots = roots.iter().map(|root| cx.staging_dir.join(root));
     let first = roots
         .next()
         .ok_or_else(|| error("CPack component group is empty"))?;

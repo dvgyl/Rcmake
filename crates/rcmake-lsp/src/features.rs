@@ -508,9 +508,9 @@ fn display_path(uri: &str, markdown: bool) -> String {
     if markdown { code_span(&path) } else { path }
 }
 
-pub(crate) fn hover<'a>(
-    doc: &'a Document,
-    uri: &'a str,
+pub(crate) fn hover(
+    doc: &Document,
+    uri: &str,
     workspace: impl FnOnce() -> Workspace,
     offset: usize,
     encoding: PositionEncoding,
@@ -601,9 +601,9 @@ pub(crate) fn hover<'a>(
     })
 }
 
-pub(crate) fn definition<'a>(
-    doc: &'a Document,
-    uri: &'a str,
+pub(crate) fn definition(
+    doc: &Document,
+    uri: &str,
     workspace: impl FnOnce() -> Workspace,
     offset: usize,
     encoding: PositionEncoding,
@@ -654,8 +654,8 @@ pub(crate) fn location(uri: &str, range: Value) -> Value {
     object([("uri", Value::string(uri)), ("range", range)])
 }
 
-pub(crate) fn completion<'a>(
-    doc: &'a Document,
+pub(crate) fn completion(
+    doc: &Document,
     workspace: impl FnOnce() -> Workspace,
     offset: usize,
     encoding: PositionEncoding,

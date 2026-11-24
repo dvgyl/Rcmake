@@ -649,12 +649,15 @@ fn tolerant_parse_preserves_multiline_arguments_and_crlf_utf8_spans() {
         "café\nliteral(call)\n🍃".as_bytes()
     );
     assert_eq!(
-        &src[complete.args[1].span.clone()],
-        "\"café\r\nliteral(call)\r\n🍃\""
+        src.get(complete.args[1].span.clone()),
+        Some("\"café\r\nliteral(call)\r\n🍃\"")
     );
     let partial = &parsed.partial_commands[0];
     assert_eq!(partial.line, 4);
-    assert_eq!(&src[partial.span.clone()], "message(STATUS \"café\r\n");
+    assert_eq!(
+        src.get(partial.span.clone()),
+        Some("message(STATUS \"café\r\n")
+    );
     assert_eq!(partial.args[1].text.as_slice(), "café\n".as_bytes());
 }
 

@@ -56,30 +56,10 @@ pub(crate) fn path(uri: &str) -> Option<PathBuf> {
     if file.contains(['?', '#']) {
         return None;
     }
-    let mut decoded = if let Some(local) = local_path(file) {
-        decode(local)?
-    } else {
-        #[cfg(not(windows))]
-        return None;
-        #[cfg(windows)]
-        {
-            let (authority, share) = file.split_once('/')?;
-            let authority = decode(authority)?;
-            let share = decode(share)?;
-            if authority.is_empty()
-                || authority.iter().any(|byte| b"/\\:@".contains(byte))
-                || share.is_empty()
-                || matches!(share.first(), Some(b'/' | b'\\'))
-            {
-                return None;
-            }
-            let mut bytes = b"//".to_vec();
-            bytes.extend(authority);
-            bytes.push(b'/');
-            bytes.extend(share);
-            bytes
-        }
-    };
+    #[cfg(windows)]
+    let mut decoded = local_path(file).map_or_else(|| decode_unc(file), decode)?;
+    #[cfg(not(windows))]
+    let mut decoded = decode(local_path(file)?)?;
     if cfg!(windows) {
         if matches!(decoded.as_slice(), [b'/', drive, b':', b'/', ..] if drive.is_ascii_alphabetic())
         {
@@ -93,6 +73,25 @@ pub(crate) fn path(uri: &str) -> Option<PathBuf> {
     }
     let path = to_native(&decoded);
     path.is_absolute().then_some(path)
+}
+
+#[cfg(windows)]
+fn decode_unc(file: &str) -> Option<Vec<u8>> {
+    let (authority, share) = file.split_once('/')?;
+    let authority = decode(authority)?;
+    let share = decode(share)?;
+    if authority.is_empty()
+        || authority.iter().any(|byte| b"/\\:@".contains(byte))
+        || share.is_empty()
+        || matches!(share.first(), Some(b'/' | b'\\'))
+    {
+        return None;
+    }
+    let mut bytes = b"//".to_vec();
+    bytes.extend(authority);
+    bytes.push(b'/');
+    bytes.extend(share);
+    Some(bytes)
 }
 
 fn decode(text: &str) -> Option<Vec<u8>> {
@@ -150,10 +149,11 @@ fn encode_file(path: &Path, roots: &[Root]) -> String {
                     .filter_map(|root| root.drive.map(|drive| (root, drive)))
                     .filter(|(_, drive)| drive.letter.eq_ignore_ascii_case(letter))
                     .max_by_key(|(root, _)| {
-                        normalized
-                            .starts_with(&root.path)
-                            .then(|| root.path.components().count())
-                            .unwrap_or_default()
+                        if normalized.starts_with(&root.path) {
+                            root.path.components().count()
+                        } else {
+                            0
+                        }
                     })
                     .map_or(default, |(_, drive)| drive);
                 uri.push('/');

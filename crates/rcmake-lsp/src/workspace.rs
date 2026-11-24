@@ -461,7 +461,7 @@ impl WorkspaceGraph {
                         paths.len() > 1 || (name == b"include" && scope.modules.unknown);
                     if callable_depth == 0 {
                         scope.modules.update(&context, command, conditional);
-                        if name == b"project" && !conditional && command.args.first().is_some() {
+                        if name == b"project" && !conditional && !command.args.is_empty() {
                             scope.project = source.map(Path::to_owned);
                         }
                     }

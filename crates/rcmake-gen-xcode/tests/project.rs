@@ -326,7 +326,7 @@ fn generates_multiconfig_projects_from_ide_facts() {
         "PBXHeadersBuildPhase",
         "PBXCopyFilesBuildPhase",
         "CMake PostBuild Rules",
-        "word with spaces",
+        r"/bin/echo word\\ with\\ spaces",
         "ALL_BUILD",
         "ZERO_CHECK",
         "cmake_install.cmake",
@@ -443,7 +443,7 @@ fn rejects_per_configuration_source_properties() {
         assert_eq!(
             error.to_string(),
             format!(
-                "Xcode does not support per-config per-source {name}:\n\n  {value}\n\nspecified for source:\n\n  /src/main.c"
+                "CMake Error in CMakeLists.txt:\n  Xcode does not support per-config per-source {name}:\n\n    {value}\n\n  specified for source:\n\n    /src/main.c\n\n\n"
             )
         );
     }

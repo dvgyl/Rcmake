@@ -891,6 +891,64 @@ endif()
 }
 
 #[test]
+fn archive_reads_component_staging_from_each_project_subdirectory() {
+    let host = memory_host();
+    write(
+        host.as_ref(),
+        "/work/CPackConfig.cmake",
+        br#"
+set(CPACK_GENERATOR TAR)
+set(CPACK_PACKAGE_NAME demo)
+set(CPACK_PACKAGE_VERSION 1)
+set(CPACK_PACKAGE_FILE_NAME demo)
+set(CPACK_CMAKE_GENERATOR Ninja)
+set(CPACK_INSTALL_CMAKE_PROJECTS "/work/one;One;ALL;/first;/work/two;Two;ALL;/second")
+set(CPACK_ARCHIVE_COMPONENT_INSTALL ON)
+set(CPACK_COMPONENTS_ALL tools)
+set(CPACK_COMPONENT_INCLUDE_TOPLEVEL_DIRECTORY ON)
+set(CPACK_PACKAGING_INSTALL_PREFIX "/package")
+set(CPACK_INSTALL_PREFIX "/install")
+set(CPACK_SET_DESTDIR ON)
+"#,
+    );
+    for (project, file) in [("one", "first.txt"), ("two", "second.txt")] {
+        write(
+            host.as_ref(),
+            format!("/work/{project}/cmake_install.cmake"),
+            format!(
+                "file(INSTALL DESTINATION \"${{CMAKE_INSTALL_PREFIX}}/bin\" TYPE FILE FILES \"/work/{project}/{file}\")"
+            )
+            .as_bytes(),
+        );
+        write(
+            host.as_ref(),
+            format!("/work/{project}/{file}"),
+            project.as_bytes(),
+        );
+    }
+    assert_eq!(
+        invoke(host.clone(), &[]),
+        0,
+        "{}",
+        String::from_utf8_lossy(&host.stream_bytes(Stream::Stderr))
+    );
+    let unpacked = Path::new("/work/unpacked");
+    let files = extract(host.as_ref(), Path::new("/work/demo-tools.tar"), unpacked);
+    assert_eq!(
+        files.keys().map(String::as_str).collect::<Vec<_>>(),
+        ["demo/install/bin/first.txt", "demo/install/bin/second.txt"]
+    );
+    assert_eq!(
+        read(host.as_ref(), &unpacked.join("demo/install/bin/first.txt")),
+        b"one"
+    );
+    assert_eq!(
+        read(host.as_ref(), &unpacked.join("demo/install/bin/second.txt")),
+        b"two"
+    );
+}
+
+#[test]
 fn project_install_requires_a_cmake_generator_for_archive_packages() {
     let host = memory_host();
     write(

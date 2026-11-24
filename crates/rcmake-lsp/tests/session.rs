@@ -165,7 +165,10 @@ fn scripted_editing_session() {
     let hover = at(&mut server, "textDocument/hover", 0, 2);
     assert_eq!(
         get(get(&hover, "contents"), "value"),
-        &Value::string("project\n\nName the project and enable its languages.")
+        &Value::string(concat!(
+            "project\n\nSet the name of the project.\n\n",
+            "project(<PROJECT-NAME> [<language-name>...])"
+        ))
     );
     let hover = at(&mut server, "textDocument/hover", 11, 18);
     assert_ne!(hover, Value::Null);
