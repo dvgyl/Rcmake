@@ -1127,15 +1127,21 @@ fn ctest_empty_binary_directory(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdRes
     }
     let host = cx.host();
     let dir = absolute(&host.initial_cwd(), &dir.value);
-    let canonical = match host.canonicalize(&dir) {
-        Ok(path) => path,
+    let (Some(parent), Some(name)) = (dir.parent(), dir.file_name()) else {
+        return Err(error("requires a non-root directory"));
+    };
+    let dir = match host.canonicalize(parent) {
+        Ok(parent) => parent.join(name),
         Err(err) if err.kind == ErrorKind::NotFound => return Ok(Flow::Normal),
         Err(err) => return Err(error(err.to_string())),
     };
-    if canonical != dir || canonical.parent().is_none() {
-        return Err(error(
-            "requires a non-root directory without symbolic links",
-        ));
+    let kind = match host.metadata(&dir, Follow::No) {
+        Ok(metadata) => metadata.kind,
+        Err(err) if err.kind == ErrorKind::NotFound => return Ok(Flow::Normal),
+        Err(err) => return Err(error(err.to_string())),
+    };
+    if kind != FileKind::Dir {
+        return Err(error("requires a directory as the final path component"));
     }
     if !host
         .metadata(&dir.join("CMakeCache.txt"), Follow::Yes)
@@ -1143,7 +1149,7 @@ fn ctest_empty_binary_directory(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdRes
     {
         return Err(error("requires a directory that contains CMakeCache.txt"));
     }
-    host.remove_dir_all(&canonical)
+    host.remove_dir_all(&dir)
         .map_err(|err| error(err.to_string()))?;
     Ok(Flow::Normal)
 }
@@ -1391,6 +1397,43 @@ mod tests {
         assert!(
             host.metadata(Path::new("/work/source/CMakeLists.txt"), Follow::Yes)
                 .is_ok()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn empties_a_build_directory_under_a_symlinked_ancestor() -> Result<(), Box<dyn Error>> {
+        let host = Arc::new(PureHost::default());
+        host.seed_file(Path::new("/private/tmp/build/CMakeCache.txt"), b"")?;
+        host.seed_file(Path::new("/private/tmp/other/CMakeCache.txt"), b"")?;
+        host.symlink(Path::new("/private/tmp"), Path::new("/tmp"))?;
+        host.symlink(Path::new("other"), Path::new("/private/tmp/link"))?;
+
+        for (argument, expected) in [
+            ("/tmp/build/", 0),
+            ("/tmp/link", 255),
+            ("/tmp/link/", 255),
+            ("/tmp/link/.", 255),
+            ("/", 255),
+        ] {
+            host.seed_file(
+                Path::new("/work/empty.cmake"),
+                format!("ctest_empty_binary_directory({argument})").as_bytes(),
+            )?;
+            assert_eq!(invoke(host.clone(), &["-S", "empty.cmake"]), expected);
+        }
+        assert!(
+            host.metadata(Path::new("/private/tmp/build"), Follow::No)
+                .is_err()
+        );
+        assert_eq!(
+            host.metadata(Path::new("/tmp/link"), Follow::No)?.kind,
+            FileKind::Symlink
+        );
+        assert_eq!(
+            host.metadata(Path::new("/private/tmp/other/CMakeCache.txt"), Follow::No)?
+                .kind,
+            FileKind::File
         );
         Ok(())
     }

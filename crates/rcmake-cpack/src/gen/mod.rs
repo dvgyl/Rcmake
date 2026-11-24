@@ -7,7 +7,6 @@ pub(crate) mod external;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
 
 use rcmake_base::BString;
 use rcmake_host::{
@@ -83,7 +82,7 @@ fn run_tool(
             stdin: Input::Null,
             stdout: Output::Capture,
             stderr: Output::SharedWithStdout,
-            timeout: Some(Duration::from_secs(300)),
+            timeout: None,
             tee: false,
         },
         &mut |_, _| {},

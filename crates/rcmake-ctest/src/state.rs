@@ -1,10 +1,5 @@
 //! State files in the build directory.
 
-#![allow(
-    dead_code,
-    reason = "The execution and reporting modules will write run state"
-)]
-
 use std::collections::BTreeMap;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
@@ -137,6 +132,7 @@ pub(crate) fn write_failed(
     write(host, &dir.join(TEMPORARY), FAILURES, &data)
 }
 
+#[cfg(test)]
 pub(crate) fn last_log(host: &dyn Host, dir: &Path) -> Result<Option<Vec<u8>>, CtestError> {
     read_optional(host, &dir.join(TEMPORARY).join(LOG))
 }

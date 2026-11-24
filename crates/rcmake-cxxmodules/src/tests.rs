@@ -1,5 +1,5 @@
 use crate::collate::{CollationInput, collate, read_modules_json, write_modules_json};
-use crate::{LookupMethod, ModmapFormat, ModulesError, p1689, tdi};
+use crate::{LookupMethod, ModmapFormat, ModulesError, modmap, p1689, tdi};
 
 #[test]
 fn keywords_round_trip() {
@@ -52,6 +52,108 @@ fn ddi_round_trips_scan_fields() -> Result<(), ModulesError> {
         br#"{"version":1,"rules":[{"requires":[{"logical-name":"M","unique-on-source-path":true}]}]}"#,
     ] {
         assert!(p1689::parse_ddi(invalid, b"a.ddi").is_err());
+    }
+    Ok(())
+}
+
+#[test]
+fn ddi_checks_named_modules_and_allows_header_paths() -> Result<(), ModulesError> {
+    for name in [
+        "",
+        "../M",
+        r"M\\part",
+        r"M\npart",
+        r"M\rpart",
+        r#"M\"part"#,
+        r"M\u0000",
+        "Mä",
+    ] {
+        for kind in ["provides", "requires"] {
+            let json =
+                format!(r#"{{"version":1,"rules":[{{"{kind}":[{{"logical-name":"{name}"}}]}}]}}"#);
+            let result = p1689::parse_ddi(json.as_bytes(), b"scan.ddi");
+            assert!(
+                matches!(result, Err(ModulesError::Invalid(message)) if message.ends_with(b"Invalid C++ module logical-name")),
+                "{kind}: {name:?}"
+            );
+        }
+    }
+    let ddi = p1689::parse_ddi(
+        br#"{"version":1,"rules":[{
+            "provides":[{"logical-name":"M0.part_a:part_b"}],
+            "requires":[{"logical-name":"include/sub dir/header.hpp","lookup-method":"include-quote"}]
+        }]}"#,
+        b"scan.ddi",
+    )?;
+    assert_eq!(
+        p1689::parse_ddi(&p1689::write_ddi(&ddi)?, b"scan.ddi")?,
+        ddi
+    );
+    assert!(p1689::parse_ddi(
+        br#"{"version":1,"rules":[{"requires":[{"logical-name":"header\n.hpp","lookup-method":"include-angle"}]}]}"#,
+        b"scan.ddi",
+    ).is_err());
+    Ok(())
+}
+
+#[test]
+fn modmaps_reject_invalid_bmi_paths() -> Result<(), ModulesError> {
+    let mut modules = read_modules_json(
+        br#"{
+            "modules":{"M":{"bmi":"file name..v1.pcm"}},
+            "usages":{"M":["P"]},
+            "references":{"P":{"path":"p.pcm","lookup-method":"by-name"}}
+        }"#,
+    )?;
+    let ddi = p1689::parse_ddi(
+        br#"{"version":1,"rules":[
+            {"provides":[{"logical-name":"M"}],"requires":[{"logical-name":"M"}]}
+        ]}"#,
+        b"scan.ddi",
+    )?;
+    let rule = ddi
+        .rules
+        .first()
+        .ok_or_else(|| crate::json::invalid("Missing rule"))?;
+    let formats = [ModmapFormat::Clang, ModmapFormat::Gcc, ModmapFormat::Msvc];
+    for format in formats {
+        modmap::write_modmap(format, rule, &modules)?;
+    }
+    for path in [
+        "../M.pcm",
+        r"sub\..\M.pcm",
+        "M\0.pcm",
+        "M\n.pcm",
+        "M\r.pcm",
+        "M\".pcm",
+    ] {
+        let bmi = modules
+            .modules
+            .get_mut(b"M".as_slice())
+            .ok_or_else(|| crate::json::invalid("Missing module"))?;
+        let valid = std::mem::replace(&mut bmi.bmi, path.into());
+        for format in formats {
+            assert!(
+                modmap::write_modmap(format, rule, &modules).is_err(),
+                "{format:?}: {path:?}"
+            );
+        }
+        let bmi = modules
+            .modules
+            .get_mut(b"M".as_slice())
+            .ok_or_else(|| crate::json::invalid("Missing module"))?;
+        bmi.bmi = valid;
+        let reference = modules
+            .references
+            .get_mut(b"P".as_slice())
+            .ok_or_else(|| crate::json::invalid("Missing module reference"))?;
+        reference.path = path.into();
+        for format in [ModmapFormat::Clang, ModmapFormat::Msvc] {
+            assert!(
+                modmap::write_modmap(format, rule, &modules).is_err(),
+                "{format:?}: {path:?}"
+            );
+        }
     }
     Ok(())
 }

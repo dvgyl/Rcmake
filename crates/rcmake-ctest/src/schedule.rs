@@ -1,8 +1,3 @@
-#![allow(
-    clippy::indexing_slicing,
-    reason = "The plan creates all test indices for vectors with one entry per test"
-)]
-
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::path::Path;
@@ -68,6 +63,10 @@ struct Repetition {
 }
 
 impl Repetition {
+    #[allow(
+        clippy::indexing_slicing,
+        reason = "The plan supplies all test indices"
+    )]
     fn new(plan: &Plan, repeat: Option<TestRepeat>) -> Result<Self, CtestError> {
         let mut result = Self {
             repeat: repeat.filter(|repeat| repeat.count > 1),
@@ -176,18 +175,21 @@ impl Repetition {
         Ok(result)
     }
 
+    #[allow(clippy::indexing_slicing, reason = "The plan supplies the test index")]
     fn numbered_run(&self, id: usize, run: i32) -> Option<(i32, i32)> {
         self.repeat
             .filter(|_| self.modes[id] != FixtureMode::Once)
             .map(|repeat| (run, repeat.count))
     }
 
+    #[allow(clippy::indexing_slicing, reason = "The plan supplies the test index")]
     fn individual(&self, id: usize) -> Option<TestRepeat> {
         self.repeat
             .filter(|_| self.modes[id] == FixtureMode::Separate)
     }
 }
 
+#[allow(clippy::indexing_slicing, reason = "Each parent is a valid test index")]
 fn root(parents: &mut [usize], mut id: usize) -> usize {
     while parents[id] != id {
         parents[id] = parents[parents[id]];
@@ -215,6 +217,10 @@ struct Ready {
 }
 
 impl Ready {
+    #[allow(
+        clippy::indexing_slicing,
+        reason = "The plan supplies all test indices"
+    )]
     fn new(plan: &Plan) -> Self {
         let mut result = Self {
             remaining: plan.prerequisites.clone(),
@@ -228,19 +234,32 @@ impl Ready {
         result
     }
 
+    #[allow(clippy::indexing_slicing, reason = "The plan supplies the test index")]
     fn enqueue_if_ready(&mut self, id: usize) {
         if self.remaining[id] == 0 {
             self.ordered.insert((self.rank[id], id));
         }
     }
 
-    fn release(&mut self, plan: &Plan, id: usize, include: impl Fn(usize) -> bool) {
+    #[allow(
+        clippy::indexing_slicing,
+        reason = "The plan supplies all test indices"
+    )]
+    fn release(
+        &mut self,
+        plan: &Plan,
+        id: usize,
+        include: impl Fn(usize) -> bool,
+    ) -> Result<(), CtestError> {
         for &child in &plan.dependents[id] {
             if include(child) {
-                self.remaining[child] -= 1;
+                self.remaining[child] = self.remaining[child]
+                    .checked_sub(1)
+                    .ok_or_else(invariant_error)?;
                 self.enqueue_if_ready(child);
             }
         }
+        Ok(())
     }
 }
 
@@ -285,10 +304,14 @@ impl Running {
         self.locks.extend(test.locks.iter().cloned());
     }
 
-    fn finish(&mut self, test: &TestResources) {
-        self.slots -= test.slots;
+    fn finish(&mut self, test: &TestResources) -> Result<(), CtestError> {
+        self.slots = self
+            .slots
+            .checked_sub(test.slots)
+            .ok_or_else(invariant_error)?;
         self.serial &= !test.serial;
         self.locks.retain(|lock| !test.locks.contains(lock));
+        Ok(())
     }
 }
 
@@ -525,18 +548,21 @@ struct Scheduler<'a> {
 }
 
 impl Scheduler<'_> {
-    fn advance(&mut self, id: usize) {
+    #[allow(
+        clippy::indexing_slicing,
+        reason = "The plan supplies test indices, and Repetition assigns group indices"
+    )]
+    fn advance(&mut self, id: usize) -> Result<(), CtestError> {
         let Some(group_id) = self.repetition.group_of[id] else {
-            self.ready.release(self.plan, id, |_| true);
-            return;
+            return self.ready.release(self.plan, id, |_| true);
         };
         let group_of = &self.repetition.group_of;
         self.ready
-            .release(self.plan, id, |child| group_of[child] == Some(group_id));
+            .release(self.plan, id, |child| group_of[child] == Some(group_id))?;
         let group = &mut self.repetition.groups[group_id];
-        group.pending -= 1;
+        group.pending = group.pending.checked_sub(1).ok_or_else(invariant_error)?;
         if group.pending > 0 {
-            return;
+            return Ok(());
         }
         let statuses = || group.members.iter().map(|&id| self.statuses[id]);
         let again = group.runs_left > 0
@@ -549,22 +575,32 @@ impl Scheduler<'_> {
                 )
             });
         if again {
-            group.runs_left -= 1;
+            group.runs_left = group.runs_left.checked_sub(1).ok_or_else(invariant_error)?;
             group.pending = group.members.len();
             for &member in &group.members {
-                self.completed -= usize::from(self.statuses[member].take().is_some());
+                self.statuses[member].take().ok_or_else(invariant_error)?;
+                self.completed = self.completed.checked_sub(1).ok_or_else(invariant_error)?;
                 self.ready.remaining[member] = self.repetition.internal_dependencies[member];
                 self.ready.enqueue_if_ready(member);
             }
         } else {
             for &member in &group.members {
                 self.ready
-                    .release(self.plan, member, |child| group_of[child] != Some(group_id));
+                    .release(self.plan, member, |child| group_of[child] != Some(group_id))?;
             }
         }
+        Ok(())
     }
 }
 
+fn invariant_error() -> CtestError {
+    CtestError::Schedule("internal scheduler invariant violated".into())
+}
+
+#[allow(
+    clippy::indexing_slicing,
+    reason = "The plan supplies all test indices"
+)]
 pub(crate) fn run(
     host: &dyn Host,
     dir: &Path,
@@ -616,7 +652,10 @@ pub(crate) fn run(
                         usize::try_from(limit.saturating_sub(load)).unwrap_or(usize::MAX)
                     })
                 });
-                let spare = spare.min(jobs - running.slots);
+                let spare = spare.min(
+                    jobs.checked_sub(running.slots)
+                        .ok_or_else(invariant_error)?,
+                );
                 if let Some(&(rank, id)) = scheduler
                     .ready
                     .ordered
@@ -626,7 +665,7 @@ pub(crate) fn run(
                     scheduler.ready.ordered.remove(&(rank, id));
                     let test = &plan.tests[id];
                     if scheduler.stopped && !test.cleanup {
-                        scheduler.advance(id);
+                        scheduler.advance(id)?;
                         continue;
                     }
                     runs[id] += 1;
@@ -669,7 +708,12 @@ pub(crate) fn run(
                             match worker {
                                 Ok(_) => {
                                     running.start(&resources[id]);
-                                    budget = Some(budget.unwrap_or_default() - resources[id].slots);
+                                    budget = Some(
+                                        budget
+                                            .unwrap_or_default()
+                                            .checked_sub(resources[id].slots)
+                                            .ok_or_else(invariant_error)?,
+                                    );
                                     requests.insert(id, request);
                                     continue;
                                 }
@@ -745,14 +789,14 @@ pub(crate) fn run(
                 continue;
             }
             if requests.remove(&id).is_some() {
-                running.finish(&resources[id]);
+                running.finish(&resources[id])?;
             }
             scheduler.completed += 1;
             scheduler.statuses[id] = Some(result.status);
             scheduler.stopped |= options.stop_on_failure && result.status.failed();
             scheduler.stopped |=
                 remaining_time(host, deadline).is_some_and(|remaining| remaining.is_zero());
-            scheduler.advance(id);
+            scheduler.advance(id)?;
         }
         Ok(())
     })?;
@@ -760,6 +804,10 @@ pub(crate) fn run(
     Ok(scheduler.statuses)
 }
 
+#[allow(
+    clippy::indexing_slicing,
+    reason = "The plan supplies all test indices"
+)]
 fn prepare(
     host: &dyn Host,
     options: &CtestOptions,

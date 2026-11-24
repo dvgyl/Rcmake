@@ -55,10 +55,6 @@ pub(crate) struct Plan {
     pub(crate) dependents: Vec<Vec<usize>>,
     pub(crate) prerequisites: Vec<usize>,
     /// Plan indices in scheduling priority order.
-    #[allow(
-        dead_code,
-        reason = "The scheduler will use this order in the integration wave"
-    )]
     pub(crate) schedule_order: Vec<usize>,
 }
 
@@ -389,10 +385,6 @@ pub(crate) fn plan(tests: Vec<Test>, options: &CtestOptions) -> Result<Plan, Cte
 }
 
 /// Select tests with the full command line filters and set their scheduling order.
-#[allow(
-    dead_code,
-    reason = "The runner will use this entry point in the integration wave"
-)]
 pub(crate) fn plan_with(
     host: &dyn Host,
     dir: &Path,

@@ -4,12 +4,14 @@ use std::collections::BTreeSet;
 
 use rcmake_base::BString;
 
+use crate::json::invalid;
+use crate::p1689::validate_logical_name;
 use crate::{CxxModulesJson, LookupMethod, ModmapFormat, ModuleReference, ModulesError, P1689Rule};
 
 /// Write one compiler module map from the resolved module table.
 ///
 /// # Errors
-/// The writer currently accepts all values of `P1689Rule` and `CxxModulesJson`.
+/// Returns an error if a module name or binary module interface path is invalid.
 pub fn write_modmap(
     format: ModmapFormat,
     rule: &P1689Rule,
@@ -20,12 +22,15 @@ pub fn write_modmap(
         out.extend_from_slice(b"$root .\n");
         for module in &rule.provides {
             if let Some(bmi) = modules.modules.get(&module.logical_name) {
+                validate_logical_name(&module.logical_name, LookupMethod::ByName)?;
+                validate_bmi_path(&bmi.bmi)?;
                 line(&mut out, &[&module.logical_name, b" ", &bmi.bmi, b"\n"]);
             }
         }
     } else if let [module] = rule.provides.as_slice()
         && let Some(bmi) = modules.modules.get(&module.logical_name)
     {
+        validate_bmi_path(&bmi.bmi)?;
         if format == ModmapFormat::Clang {
             line(
                 &mut out,
@@ -45,7 +50,7 @@ pub fn write_modmap(
     for require in &rule.requires {
         let name = &require.logical_name;
         if let Some(bmi) = modules.modules.get(name) {
-            import(&mut out, format, name, &bmi.bmi, require.lookup_method);
+            import(&mut out, format, name, &bmi.bmi, require.lookup_method)?;
             if format != ModmapFormat::Gcc
                 && let Some(usages) = modules.usages.get(name)
             {
@@ -64,13 +69,34 @@ pub fn write_modmap(
             lookup_method,
         }) = modules.references.get(name)
         {
-            import(&mut out, format, name, path, *lookup_method);
+            import(&mut out, format, name, path, *lookup_method)?;
         }
     }
     Ok(out)
 }
 
-fn import(out: &mut BString, format: ModmapFormat, name: &[u8], path: &[u8], method: LookupMethod) {
+fn validate_bmi_path(path: &[u8]) -> Result<(), ModulesError> {
+    if path
+        .iter()
+        .any(|byte| matches!(byte, b'\0' | b'\r' | b'\n' | b'"'))
+        || path
+            .split(|byte| matches!(byte, b'/' | b'\\'))
+            .any(|part| part == b"..")
+    {
+        return Err(invalid("Invalid binary module interface path"));
+    }
+    Ok(())
+}
+
+fn import(
+    out: &mut BString,
+    format: ModmapFormat,
+    name: &[u8],
+    path: &[u8],
+    method: LookupMethod,
+) -> Result<(), ModulesError> {
+    validate_logical_name(name, method)?;
+    validate_bmi_path(path)?;
     match format {
         ModmapFormat::Gcc => line(out, &[name, b" ", path, b"\n"]),
         ModmapFormat::Clang => line(out, &[b"-fmodule-file=\"", name, b"=", path, b"\"\n"]),
@@ -83,6 +109,7 @@ fn import(out: &mut BString, format: ModmapFormat, name: &[u8], path: &[u8], met
             line(out, &[flag, b" \"", name, b"=", path, b"\"\n"]);
         }
     }
+    Ok(())
 }
 
 fn line(out: &mut BString, parts: &[&[u8]]) {

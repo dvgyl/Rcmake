@@ -42,6 +42,7 @@ fn parse(input: &[u8]) -> Result<P1689File, ModulesError> {
     let mut provides = Vec::new();
     for entry in array(rule.get(b"provides".as_slice()))? {
         let (module, fields) = read_module(entry)?;
+        validate_logical_name(&module.logical_name, LookupMethod::ByName)?;
         provides.push(ModuleProvide {
             logical_name: module.logical_name,
             source_path: module.source_path,
@@ -57,6 +58,7 @@ fn parse(input: &[u8]) -> Result<P1689File, ModulesError> {
             module.lookup_method = LookupMethod::from_name(&method)
                 .ok_or_else(|| invalid(format!("Invalid lookup-method: {method}")))?;
         }
+        validate_logical_name(&module.logical_name, module.lookup_method)?;
         requires.push(module);
     }
     Ok(P1689File {
@@ -70,6 +72,21 @@ fn parse(input: &[u8]) -> Result<P1689File, ModulesError> {
             requires,
         }],
     })
+}
+
+pub(crate) fn validate_logical_name(name: &[u8], method: LookupMethod) -> Result<(), ModulesError> {
+    let valid = match method {
+        LookupMethod::ByName => name
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b':')),
+        LookupMethod::IncludeAngle | LookupMethod::IncludeQuote => !name
+            .iter()
+            .any(|byte| matches!(byte, b'\0' | b'\r' | b'\n' | b'"')),
+    };
+    if name.is_empty() || !valid {
+        return Err(invalid("Invalid C++ module logical-name"));
+    }
+    Ok(())
 }
 
 fn read_module(entry: &Value) -> Result<(ModuleRequire, &crate::json::Object), ModulesError> {
@@ -118,6 +135,7 @@ pub fn write_ddi(ddi: &P1689File) -> Result<BString, ModulesError> {
     }
     let mut provides = Vec::new();
     for module in &rule.provides {
+        validate_logical_name(&module.logical_name, LookupMethod::ByName)?;
         let mut fields = module_fields(
             &module.logical_name,
             &module.source_path,
@@ -129,6 +147,7 @@ pub fn write_ddi(ddi: &P1689File) -> Result<BString, ModulesError> {
     }
     let mut requires = Vec::new();
     for module in &rule.requires {
+        validate_logical_name(&module.logical_name, module.lookup_method)?;
         let mut fields = module_fields(
             &module.logical_name,
             &module.source_path,

@@ -4,7 +4,6 @@ use std::io::ErrorKind;
 use std::path::Path;
 use std::sync::Arc;
 
-use rcmake_base::Limits;
 use rcmake_eval::Interp;
 use rcmake_host::path::{from_native, to_native};
 use rcmake_host::{CopyOptions, FileKind, Follow, Host, ReadRange};
@@ -24,7 +23,7 @@ pub fn stage_sources(
     staging_dir: &Path,
 ) -> Result<(), CpackError> {
     let cwd = host.initial_cwd();
-    let mut interp = interpreter(host, &cwd, &Default::default());
+    let mut interp = interpreter(host, &cwd, &Default::default())?;
     host.create_dir_all(staging_dir)?;
     copy_directories(host.as_ref(), config, &cwd, staging_dir, &mut interp)
 }
@@ -61,8 +60,9 @@ pub(crate) fn copy_directories(
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let mut budget = interp.cx().limits().regex_steps;
-    let ignored = &mut |path: &Path, kind: FileKind| -> Result<bool, CpackError> {
+    let steps_per_path = interp.cx().limits().regex_steps;
+    let ignored = |path: &Path, kind: FileKind| -> Result<bool, CpackError> {
+        let mut budget = steps_per_path;
         let mut name = from_native(path);
         if kind == FileKind::Dir {
             name.push(b'/');
@@ -86,11 +86,11 @@ pub(crate) fn copy_directories(
                 .is_some_and(|name| name == "_CPack_Packages")
         })
         .unwrap_or(&staging);
+    let mut remaining = 100_000;
     for [src, dest] in pairs {
         let src = host.canonicalize(&absolute(cwd, src))?;
         let dest = staging.join(relative_install_path(dest)?);
         ensure_dir(host, &staging, &dest)?;
-        let mut remaining = 100_000;
         copy_tree(
             host,
             &src,
@@ -205,12 +205,7 @@ fn existing_component_entry(
             }
             FileKind::File => {
                 let meta = host.metadata(input, Follow::No)?;
-                let range = ReadRange::All {
-                    limit: Limits::default().max_file_read,
-                };
-                if existing.len == meta.len
-                    && host.read(input, range)? == host.read(output, range)?
-                {
+                if existing.len == meta.len && same_file_contents(host, input, output, meta.len)? {
                     return Ok(true);
                 }
             }
@@ -221,4 +216,27 @@ fn existing_component_entry(
         "ERROR The data in files with the same filename is different: {}",
         input.strip_prefix(root).unwrap_or(input).display()
     )))
+}
+
+fn same_file_contents(
+    host: &dyn Host,
+    first: &Path,
+    second: &Path,
+    size: u64,
+) -> Result<bool, CpackError> {
+    const CHUNK_SIZE: u64 = 1024 * 1024;
+    let mut offset = 0;
+    while offset < size {
+        let len = (size - offset).min(CHUNK_SIZE);
+        let range = ReadRange::Slice {
+            offset,
+            len: Some(len),
+        };
+        let bytes = host.read(first, range)?;
+        if bytes.len() as u64 != len || bytes != host.read(second, range)? {
+            return Ok(false);
+        }
+        offset += len;
+    }
+    Ok(true)
 }

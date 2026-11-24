@@ -4,14 +4,15 @@ use std::collections::BTreeMap;
 use std::io::ErrorKind;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
 
 use rcmake_base::{BString, hash::HashAlgo, truth};
 use rcmake_eval::Interp;
 use rcmake_host::path::{from_native, to_native};
 use rcmake_host::{CommandSpec, FileKind, Follow, Host, Input, Output, ProcessResult, RunRequest};
 
-use crate::config::{CpackConfig, Environment, absolute, interpreter, script, snapshot};
+use crate::config::{
+    CpackConfig, Environment, absolute, cmake_executable, interpreter, script, snapshot,
+};
 use crate::{CPackOptions, ComponentGrouping, CpackError, error, log, safe_name};
 
 /// Install the configured files into the staging directory.
@@ -26,7 +27,7 @@ pub fn stage(
 ) -> Result<(), CpackError> {
     let cwd = host.initial_cwd();
     let options = CPackOptions::default();
-    let mut interp = interpreter(host, &cwd, &options);
+    let mut interp = interpreter(host, &cwd, &options)?;
     for (name, value) in &config.vars {
         interp.cx().set_var(name, value.clone());
     }
@@ -183,7 +184,7 @@ fn install_project(
     component: &[u8],
     destination: &Path,
 ) -> Result<(), CpackError> {
-    let mut interp = interpreter(host, build, options);
+    let mut interp = interpreter(host, build, options)?;
     let destdir = cfg.on(b"CPACK_SET_DESTDIR");
     let prefix = if destdir {
         cfg.get(b"CPACK_INSTALL_PREFIX").unwrap_or(b"/").into()
@@ -259,7 +260,7 @@ fn preinstall(
     if !config.is_empty() {
         args.extend(["--config".into(), config.into()]);
     }
-    let program = cfg.get(b"CMAKE_COMMAND").unwrap_or(b"cmake").into();
+    let program = from_native(&cmake_executable(host)?);
     let output = host.run(
         &RunRequest {
             pipeline: vec![CommandSpec { program, args }],
@@ -268,7 +269,7 @@ fn preinstall(
             stdin: Input::Null,
             stdout: Output::Capture,
             stderr: Output::SharedWithStdout,
-            timeout: Some(Duration::from_secs(300)),
+            timeout: None,
             tee: false,
         },
         &mut |_, _| {},

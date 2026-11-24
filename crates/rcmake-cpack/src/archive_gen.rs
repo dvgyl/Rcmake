@@ -140,8 +140,7 @@ impl PackageGenerator for ArchiveGenerator {
         let mtime = cx
             .host
             .env_get(b"SOURCE_DATE_EPOCH")
-            .map(|value| level_number(&value, "SOURCE_DATE_EPOCH"))
-            .transpose()?;
+            .and_then(|value| source_date_epoch(&value));
         let options = CreateOptions {
             format: self.kind.format(),
             mtime,
@@ -273,6 +272,15 @@ fn write_component_archive(
         children(cx.host, root)?
     };
     write_archive(cx, path, root, &inputs, options)
+}
+
+fn source_date_epoch(value: &[u8]) -> Option<u64> {
+    let epoch: i64 = std::str::from_utf8(value)
+        .ok()?
+        .trim_start_matches(|ch: char| ch.is_ascii_whitespace() || ch == '\u{b}')
+        .parse()
+        .ok()?;
+    u64::try_from(epoch).ok()
 }
 
 fn level_number<T: std::str::FromStr>(value: &[u8], variable: &str) -> Result<T, CpackError> {

@@ -915,6 +915,116 @@ mod wave_two_tests {
     }
 
     #[test]
+    fn finishes_seeded_fixture_dependency_graphs_with_repeats() -> TestResult {
+        use std::collections::BTreeSet;
+        use std::fmt::Write as _;
+
+        for seed in 1..=32_u32 {
+            let mut state = seed;
+            let mut choose = |limit| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                state % limit
+            };
+            let (repeat, first_result) = match seed % 3 {
+                0 => ("until-fail", ProcessResult::Exited(0)),
+                1 => ("until-pass", ProcessResult::Exited(1)),
+                _ => ("after-timeout", ProcessResult::TimedOut),
+            };
+            let repeat = format!("{repeat}:{}", 2 + choose(3));
+            let mut script = String::new();
+            let group_count = 2 + choose(3);
+            let mut test_count = 0;
+            for group in 0..group_count {
+                let mode = match choose(3) {
+                    0 => "AROUND_EACH_REPEAT",
+                    1 => "AROUND_ALL_REPEATS",
+                    _ => "EACH_TEST_SEPARATELY",
+                };
+                writeln!(script, "add_test(s{group} runner s{group})")?;
+                writeln!(script, "add_test(c{group} runner c{group})")?;
+                writeln!(
+                    script,
+                    "set_tests_properties(s{group} PROPERTIES FIXTURES_SETUP f{group} FIXTURE_REPEAT_MODE {mode})\n\
+                     set_tests_properties(c{group} PROPERTIES FIXTURES_CLEANUP f{group})"
+                )?;
+                if group > 0 && choose(2) == 0 {
+                    writeln!(
+                        script,
+                        "set_tests_properties(s{group} PROPERTIES DEPENDS c{})",
+                        choose(group)
+                    )?;
+                }
+                let members = 2 + choose(4);
+                let retry_member = choose(members);
+                for member in 0..members {
+                    let name = format!("g{group}t{member}");
+                    let marker = if member == retry_member { " retry" } else { "" };
+                    writeln!(script, "add_test({name} runner {name}{marker})")?;
+                    writeln!(
+                        script,
+                        "set_tests_properties({name} PROPERTIES FIXTURES_REQUIRED f{group})"
+                    )?;
+                    if member > 0 {
+                        writeln!(
+                            script,
+                            "set_tests_properties({name} PROPERTIES DEPENDS g{group}t{})",
+                            choose(member)
+                        )?;
+                    }
+                }
+                test_count += members + 2;
+            }
+            let host = tree(&script)?;
+            let retries = Mutex::new(BTreeSet::new());
+            host.set_command_handler(move |_, request, _| {
+                let [command] = request.pipeline.as_slice() else {
+                    return Err(HostError::unsupported("Expected one test command"));
+                };
+                let result = if let [name, _] = command.args.as_slice()
+                    && retries
+                        .lock()
+                        .map_err(|_| HostError::unsupported("Cannot record test attempts"))?
+                        .insert(name.clone())
+                {
+                    first_result.clone()
+                } else {
+                    ProcessResult::Exited(0)
+                };
+                Ok(output(result, b""))
+            })?;
+            assert_eq!(
+                invoke(
+                    &host,
+                    &[
+                        "--parallel",
+                        "4",
+                        "--schedule-random",
+                        "--schedule-random-seed",
+                        &seed.to_string(),
+                        "--repeat",
+                        &repeat,
+                        "--output-junit",
+                        "results.xml"
+                    ],
+                ),
+                0,
+                "seed {seed}, repeat {repeat}: {}",
+                host.stream_bytes(Stream::Stderr)
+            );
+            let report = state::read_optional(host.as_ref(), Path::new("/work/results.xml"))?
+                .ok_or("Missing test report")?;
+            assert_eq!(
+                String::from_utf8(report)?.matches("<testcase ").count(),
+                test_count as usize,
+                "seed {seed}, repeat {repeat}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn reruns_all_when_the_failure_log_is_empty_and_keeps_previous_failures() -> TestResult {
         let host = tree("add_test(first runner first)\nadd_test(second runner second)")?;
         let failing = Arc::new(AtomicBool::new(true));

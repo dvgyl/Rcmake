@@ -219,12 +219,24 @@ pub(crate) fn absolute(cwd: &Path, value: &[u8]) -> PathBuf {
     path
 }
 
-pub(crate) fn interpreter(host: &Arc<dyn Host>, cwd: &Path, options: &CPackOptions) -> Interp {
+pub(crate) fn cmake_executable(host: &dyn Host) -> Result<PathBuf, CpackError> {
     let exe = host
         .current_exe()
-        .unwrap_or_else(|_| PathBuf::from("/usr/local/bin/cpack"));
-    let bin = exe.parent().unwrap_or(Path::new("/usr/local/bin"));
-    let root = bin.join("../share/cmake-4.5");
+        .map_err(|err| error(format!("Cannot find the CPack executable: {err}")))?;
+    let bin = exe
+        .parent()
+        .filter(|path| path.is_absolute())
+        .ok_or_else(|| error("Cannot find the directory of the CPack executable"))?;
+    Ok(bin.join(if cfg!(windows) { "cmake.exe" } else { "cmake" }))
+}
+
+pub(crate) fn interpreter(
+    host: &Arc<dyn Host>,
+    cwd: &Path,
+    options: &CPackOptions,
+) -> Result<Interp, CpackError> {
+    let cmake_command = cmake_executable(host.as_ref())?;
+    let root = cmake_command.with_file_name("../share/cmake-4.5");
     let cmake_root = if host.metadata(&root.join("Modules"), Follow::Yes).is_ok() {
         root
     } else {
@@ -236,7 +248,7 @@ pub(crate) fn interpreter(host: &Arc<dyn Host>, cwd: &Path, options: &CPackOptio
             host: Arc::clone(host),
             mode: RunMode::Script,
             cmake_root,
-            cmake_command: bin.join(if cfg!(windows) { "cmake.exe" } else { "cmake" }),
+            cmake_command,
             cwd: cwd.to_owned(),
             limits: Limits::default(),
             diag: Default::default(),
@@ -251,7 +263,7 @@ pub(crate) fn interpreter(host: &Arc<dyn Host>, cwd: &Path, options: &CPackOptio
             ..Default::default()
         }));
     }
-    interp
+    Ok(interp)
 }
 
 fn register_cpack_commands(registry: &mut Registry) {
@@ -305,7 +317,7 @@ pub(crate) fn load_base(
     cwd: &Path,
     options: &CPackOptions,
 ) -> Result<Interp, CpackError> {
-    let mut interp = interpreter(host, cwd, options);
+    let mut interp = interpreter(host, cwd, options)?;
     if let Some(value) = &options.build_config {
         interp.cx().set_var(b"CPACK_BUILD_CONFIG", value.clone());
     }

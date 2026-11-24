@@ -1,10 +1,5 @@
 //! Command-line options and test preset resolution.
 
-#![allow(
-    dead_code,
-    reason = "rcmake-cli will switch to this parser in the integration wave"
-)]
-
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::Duration;

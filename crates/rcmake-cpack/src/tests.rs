@@ -206,6 +206,67 @@ endforeach()
 }
 
 #[test]
+fn archive_applies_only_valid_source_date_epochs() -> Result<(), Box<dyn std::error::Error>> {
+    use rcmake_host::FileTime;
+
+    let original_mtime = FileTime {
+        secs: 1000,
+        nanos: 0,
+    };
+    for (value, expected) in [
+        ("", original_mtime.secs),
+        ("invalid", original_mtime.secs),
+        ("123 ", original_mtime.secs),
+        ("9223372036854775808", original_mtime.secs),
+        (" \t+123", 123),
+        ("-0", 0),
+    ] {
+        let host = memory_host();
+        let input = Path::new("/work/source/file");
+        write(host.as_ref(), input, b"contents");
+        host.set_times(input, None, Some(original_mtime))?;
+        host.env_set(b"SOURCE_DATE_EPOCH", Some(value.as_bytes()));
+        write(
+            host.as_ref(),
+            "/work/CPackConfig.cmake",
+            br#"
+set(CPACK_GENERATOR TGZ)
+set(CPACK_PACKAGE_NAME demo)
+set(CPACK_PACKAGE_VERSION 1)
+set(CPACK_PACKAGE_FILE_NAME demo)
+set(CPACK_INSTALLED_DIRECTORIES "/work/source;/")
+"#,
+        );
+        assert_eq!(invoke(host.clone(), &[]), 0, "SOURCE_DATE_EPOCH={value:?}");
+        let package = Path::new("/work/demo.tar.gz");
+        let archive = read(host.as_ref(), package);
+        assert_eq!(archive.get(4..8), Some([0; 4].as_slice()));
+        let destination = Path::new("/work/extracted");
+        extract(host.as_ref(), package, destination);
+        let metadata = host.metadata(&destination.join("demo/file"), Follow::No)?;
+        assert_eq!(metadata.mtime.secs, expected, "SOURCE_DATE_EPOCH={value:?}");
+    }
+    Ok(())
+}
+
+#[test]
+fn component_merge_compares_bytes_beyond_the_first_chunk() -> Result<(), crate::CpackError> {
+    let host = memory_host();
+    let source = Path::new("/work/component");
+    let destination = Path::new("/work/merged");
+    let mut contents = vec![b'a'; 1024 * 1024 + 1];
+    write(host.as_ref(), source.join("file"), &contents);
+    write(host.as_ref(), destination.join("file"), &contents);
+    crate::source::merge_component(host.as_ref(), source, destination)?;
+
+    contents.pop();
+    contents.push(b'b');
+    write(host.as_ref(), source.join("file"), &contents);
+    assert!(crate::source::merge_component(host.as_ref(), source, destination).is_err());
+    Ok(())
+}
+
+#[test]
 fn source_package_filters_paths_and_preserves_links() {
     let host = memory_host();
     write(host.as_ref(), "/work/source/keep", b"data");
@@ -375,6 +436,7 @@ set(CPACK_PACKAGE_VERSION 1)
 set(CPACK_PACKAGE_FILE_NAME demo)
 set(CPACK_CMAKE_GENERATOR "Unix Makefiles")
 set(CPACK_INSTALL_CMAKE_PROJECTS "/work/build;demo;ALL;/")
+set(CMAKE_COMMAND "/other/bin/cmake")
 "#,
     );
     write(host.as_ref(), "/work/build/CMakeCache.txt", b"");
@@ -388,6 +450,7 @@ file(WRITE "${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_CONFIG_NAME}" "staged")
     host.set_command_handler(|host, request, _| {
         let command = request.pipeline.first().unwrap();
         assert_eq!(command.program, "/bin/cmake");
+        assert_eq!(request.timeout, None);
         assert_eq!(
             &command.args[..5],
             [
