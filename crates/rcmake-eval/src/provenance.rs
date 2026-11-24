@@ -9,7 +9,11 @@ use rcmake_diag::Backtrace;
 
 use crate::services::LedgerLevel;
 
-const MAX_EVENTS: usize = 2_000_000;
+const MAX_EVENTS: usize = 32_768;
+const MAX_HISTORY: usize = 64;
+const MAX_BYTES: usize = 8 * 1024 * 1024;
+const HISTORY_BYTES: usize = 192;
+const EVENT_BYTES: usize = 2 * std::mem::size_of::<(VarEvent, usize)>();
 const PREVIEW_BYTES: usize = 256;
 
 /// A change to a normal or cache variable.
@@ -60,21 +64,49 @@ pub struct VarEvent {
     pub op: VarOp,
     /// Depth of the scope in which the write occurred.
     pub scope_depth: u32,
-    /// New value, or `None` for an unset operation.
-    pub value_preview: Option<ValuePreview>,
+    /// Stable identity of the scope for this session.
+    pub scope_id: u64,
+    /// Value before the write, or absence.
+    pub old_value: Option<ValuePreview>,
+    /// Value after the write, or absence.
+    pub new_value: Option<ValuePreview>,
     /// Call stack at the write.
     pub backtrace: Backtrace,
+}
+
+/// Values and position captured by the evaluator at a variable write.
+pub struct VarWrite<'a> {
+    /// Execution sequence number.
+    pub seq: u64,
+    /// Operation that changed the variable.
+    pub op: VarOp,
+    /// Depth of the destination scope.
+    pub scope_depth: u32,
+    /// Identity of the destination scope, unique for the session.
+    pub scope_id: u64,
+    /// Value before the write, or absence.
+    pub old_value: Option<&'a [u8]>,
+    /// Value after the write, or absence.
+    pub new_value: Option<&'a [u8]>,
+    /// Call stack at the write.
+    pub backtrace: &'a Backtrace,
+}
+
+#[derive(Clone, Debug, Default)]
+struct History {
+    events: VecDeque<(VarEvent, usize)>,
+    dropped: u32,
 }
 
 /// Variable histories for a single evaluation session.
 #[derive(Clone, Debug, Default)]
 pub struct VarLedger {
     level: LedgerLevel,
-    events: BTreeMap<BString, VecDeque<VarEvent>>,
+    events: BTreeMap<BString, History>,
     retained: usize,
     max_events: usize,
     incomplete: bool,
-    total_limit_reached: bool,
+    bytes: usize,
 }
 
 impl VarLedger {
@@ -86,71 +118,128 @@ impl VarLedger {
 
     /// Start recording with a lower total limit on retained events.
     #[must_use]
-    pub fn with_event_limit(level: LedgerLevel, limit: usize) -> Self {
+    pub fn with_event_limit(mut level: LedgerLevel, limit: usize) -> Self {
+        let mut bytes = 0usize;
+        let mut incomplete = false;
+        if let LedgerLevel::Names(names) = &mut level {
+            names.retain(|name| {
+                let cost = HISTORY_BYTES.saturating_add(name.len());
+                if bytes.saturating_add(cost) > MAX_BYTES / 4 {
+                    incomplete = true;
+                    return false;
+                }
+                bytes += cost;
+                true
+            });
+        }
         Self {
             level,
             max_events: limit.min(MAX_EVENTS),
+            bytes,
+            incomplete,
             ..Self::default()
         }
     }
 
-    /// Record one write. Call this method in execution order.
-    pub fn record(
-        &mut self,
-        name: &[u8],
-        seq: u64,
-        op: VarOp,
-        scope_depth: u32,
-        value: Option<&[u8]>,
-        backtrace: &Backtrace,
-    ) {
-        if self.total_limit_reached {
-            return;
-        }
+    /// Record one write. Pass the values observed at the mutation point.
+    pub fn record(&mut self, name: &[u8], write: VarWrite<'_>) {
         let cap = match &self.level {
             LedgerLevel::Off => return,
-            LedgerLevel::Names(names) if names.contains(name) => self.max_events,
+            LedgerLevel::Names(names) if names.contains(name) => MAX_HISTORY,
             LedgerLevel::Names(_) => return,
-            LedgerLevel::Full { per_name_cap } => *per_name_cap as usize,
+            LedgerLevel::Full { per_name_cap } => (*per_name_cap as usize).min(MAX_HISTORY),
         };
-        if cap == 0 {
+        if cap == 0 || self.max_events == 0 {
             self.incomplete = true;
             return;
         }
+        let event_bytes = write
+            .backtrace
+            .frames()
+            .fold(EVENT_BYTES, |bytes, frame| {
+                bytes
+                    .saturating_add(96)
+                    .saturating_add(frame.file.len())
+                    .saturating_add(frame.name.as_ref().map_or(0, |name| name.len()))
+            })
+            .saturating_add(
+                write
+                    .old_value
+                    .map_or(0, |value| value.len().min(PREVIEW_BYTES)),
+            )
+            .saturating_add(
+                write
+                    .new_value
+                    .map_or(0, |value| value.len().min(PREVIEW_BYTES)),
+            );
 
-        let history = self.events.get_mut(name);
-        let replace = matches!(self.level, LedgerLevel::Full { .. })
-            && history.as_ref().is_some_and(|events| events.len() == cap);
-        if replace {
-            self.incomplete = true;
-        } else if self.retained == self.max_events {
-            self.incomplete = true;
-            self.total_limit_reached = true;
-            return;
-        } else {
-            self.retained += 1;
-        }
-
-        let event = VarEvent {
-            seq,
-            op,
-            scope_depth,
-            value_preview: value.map(ValuePreview::new),
-            backtrace: backtrace.clone(),
-        };
-        if let Some(history) = history {
-            if replace {
-                history.pop_front();
+        if !self.events.contains_key(name) {
+            let key_bytes = HISTORY_BYTES.saturating_add(name.len());
+            if self.events.len() >= MAX_EVENTS || self.bytes.saturating_add(key_bytes) > MAX_BYTES {
+                self.incomplete = true;
+                return;
             }
-            history.push_back(event);
-        } else {
-            self.events.insert(name.into(), VecDeque::from([event]));
+            self.bytes += key_bytes;
+            self.events.insert(
+                name.into(),
+                History {
+                    events: VecDeque::with_capacity(1),
+                    dropped: 0,
+                },
+            );
         }
+        let Some(history) = self.events.get_mut(name) else {
+            return;
+        };
+        if event_bytes > MAX_BYTES {
+            history.dropped = history.dropped.saturating_add(1);
+            self.incomplete = true;
+            return;
+        }
+        while history.events.len() >= cap
+            || self.retained >= self.max_events
+            || self.bytes.saturating_add(event_bytes) > MAX_BYTES
+        {
+            history.dropped = history.dropped.saturating_add(1);
+            self.incomplete = true;
+            let Some((_, bytes)) = history.events.pop_front() else {
+                history.events.shrink_to_fit();
+                return;
+            };
+            self.retained -= 1;
+            self.bytes -= bytes;
+        }
+        if history.events.capacity() > 2 * (history.events.len() + 1) {
+            history.events.shrink_to_fit();
+        }
+        self.retained += 1;
+        self.bytes += event_bytes;
+        history.events.push_back((
+            VarEvent {
+                seq: write.seq,
+                op: write.op,
+                scope_depth: write.scope_depth,
+                scope_id: write.scope_id,
+                old_value: write.old_value.map(ValuePreview::new),
+                new_value: write.new_value.map(ValuePreview::new),
+                backtrace: write.backtrace.clone(),
+            },
+            event_bytes,
+        ));
     }
 
     /// Iterate over one variable's retained events, oldest first.
     pub fn history(&self, name: &[u8]) -> impl DoubleEndedIterator<Item = &VarEvent> {
-        self.events.get(name).into_iter().flat_map(VecDeque::iter)
+        self.events
+            .get(name)
+            .into_iter()
+            .flat_map(|history| history.events.iter().map(|(event, _)| event))
+    }
+
+    /// Get the number of discarded writes for a recorded variable name.
+    #[must_use]
+    pub fn dropped(&self, name: &[u8]) -> u32 {
+        self.events.get(name).map_or(0, |history| history.dropped)
     }
 
     /// Iterate over the recorded names in byte order.
@@ -172,11 +261,15 @@ mod tests {
     fn set(ledger: &mut VarLedger, name: &[u8], seq: u64) {
         ledger.record(
             name,
-            seq,
-            VarOp::Set,
-            0,
-            Some(b"value"),
-            &Backtrace::default(),
+            VarWrite {
+                seq,
+                op: VarOp::Set,
+                scope_depth: 0,
+                scope_id: 0,
+                old_value: None,
+                new_value: Some(b"value"),
+                backtrace: &Backtrace::default(),
+            },
         );
     }
 
@@ -206,7 +299,7 @@ mod tests {
     }
 
     #[test]
-    fn filters_names_and_stops_at_the_total_limit() {
+    fn filters_names_and_keeps_recording_at_the_total_limit() {
         let names = [BString::from("Z")].into_iter().collect();
         let mut ledger = VarLedger::with_event_limit(LedgerLevel::Names(names), 2);
         set(&mut ledger, b"A", 1);
@@ -222,6 +315,7 @@ mod tests {
             [2, 3]
         );
         assert!(ledger.history(b"A").next().is_none());
+        assert_eq!(ledger.dropped(b"Z"), 1);
         assert!(ledger.is_incomplete());
     }
 
@@ -244,17 +338,31 @@ mod tests {
         let mut bytes = vec![0xff; PREVIEW_BYTES];
         bytes.push(1);
         let backtrace = Backtrace::default();
-        ledger.record(b"A", 1, VarOp::Set, 3, Some(&bytes), &backtrace);
+        let mut record = |seq, op, old_value: Option<&[u8]>, new_value: Option<&[u8]>| {
+            ledger.record(
+                b"A",
+                VarWrite {
+                    seq,
+                    op,
+                    scope_depth: 3,
+                    scope_id: 11,
+                    old_value,
+                    new_value,
+                    backtrace: &backtrace,
+                },
+            );
+        };
+        record(1, VarOp::Set, None, Some(&bytes));
         bytes.pop();
         bytes.push(2);
-        ledger.record(b"A", 2, VarOp::Set, 3, Some(&bytes), &backtrace);
-        ledger.record(b"A", 3, VarOp::CacheSet, 3, Some(b""), &backtrace);
-        ledger.record(b"A", 4, VarOp::ParentScope, 3, None, &backtrace);
+        record(2, VarOp::Set, Some(b"old"), Some(&bytes));
+        record(3, VarOp::CacheSet, None, Some(b""));
+        record(4, VarOp::ParentScope, Some(b""), None);
 
         let events: Vec<_> = ledger.history(b"A").collect();
         let previews: Vec<_> = events
             .iter()
-            .filter_map(|event| event.value_preview.as_ref())
+            .filter_map(|event| event.new_value.as_ref())
             .collect();
         let [first, second, empty] = previews.as_slice() else {
             assert_eq!(previews.len(), 3);
@@ -266,10 +374,14 @@ mod tests {
         assert_ne!(first.hash, second.hash);
         assert!(empty.prefix.is_empty());
         assert_eq!(events.last().map(|event| event.scope_depth), Some(3));
-        assert!(
+        assert_eq!(events.last().map(|event| event.scope_id), Some(11));
+        assert_eq!(
             events
-                .last()
-                .is_some_and(|event| event.value_preview.is_none())
+                .get(1)
+                .and_then(|event| event.old_value.as_ref())
+                .map(|value| value.prefix.as_slice()),
+            Some(b"old".as_slice())
         );
+        assert!(events.last().is_some_and(|event| event.new_value.is_none()));
     }
 }

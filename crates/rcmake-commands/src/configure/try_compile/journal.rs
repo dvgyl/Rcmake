@@ -2,7 +2,7 @@
 
 #![forbid(unsafe_code)]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::ErrorKind;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, PoisonError};
@@ -10,18 +10,31 @@ use std::time::Duration;
 
 use jiff::tz::TimeZone;
 use rcmake_base::{BString, Limits};
+use rcmake_eval::CancelToken;
 use rcmake_host::{
     CopyOptions, DirEntry, FileKind, FileLockGuard, FileTime, Follow, GracefulTimeout, Host,
     HostError, HostResult, Input, Metadata, Output, ProcessResult, ReadRange, RunOutput,
     RunRequest, Stream, SystemInfo, WriteMode, path,
 };
 use rcmake_store::{
-    Digest, Domain, FastStat, InputStamp, KeyHasher, Trace, VerifyOutcome, directory_digest,
-    file_digest, verify_trace,
+    Digest, Domain, InputStamp, KeyHasher, Trace, VerifyOutcome, directory_digest, file_digest,
+    verify_trace,
 };
 use serde::{Deserialize, Serialize};
 
-use super::plan::environment_fingerprint;
+use super::plan::{environment_fingerprint, request_digest};
+use depfile::missing_input_diagnostic;
+
+#[path = "depfile.rs"]
+mod depfile;
+#[path = "journal_host.rs"]
+mod host_impl;
+
+pub(crate) use depfile::{make_dependencies, msvc_dependencies, msvc_show_includes};
+
+/// Total time budget for one queued and running speculative job.
+pub(crate) const SPECULATIVE_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_PROCESS_OUTPUT: usize = 4 * 1024 * 1024;
 
 /// The first operation that prevented cache publication.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -53,13 +66,46 @@ pub(crate) enum JournalMode {
     Speculate,
 }
 
-/// Provide a trace for a deterministic process and all its descendants.
+/// Files and search results observed during one completed process tree.
 ///
-/// Certification covers the complete request, including executable selection,
-/// compiler and linker dependencies, negative searches, and the effects of
-/// the process. It requires private writes and stable inputs through use.
-/// A depfile or a tool name alone cannot establish this contract.
-pub(crate) type ProcessVerifier<'a> = dyn Fn(&RunRequest) -> Option<Trace> + Send + Sync + 'a;
+/// Include compiler and linker inputs, response files, plugins, and every
+/// failed candidate before a match. For a failed search, include all candidate
+/// directories. Return no closure if the executor cannot account for a read.
+pub(crate) struct DependencyClosure {
+    /// Absolute paths from compiler and linker evidence.
+    pub(crate) files: BTreeSet<PathBuf>,
+    /// Search candidates and the result observed by the process tree.
+    pub(crate) searches: Vec<SearchObservation>,
+}
+
+/// The result of one compiler or linker search candidate.
+pub(crate) struct SearchObservation {
+    /// Absolute directory examined by the tool.
+    pub(crate) root: PathBuf,
+    /// Name examined within the directory.
+    pub(crate) relative: PathBuf,
+    /// Whether the tool found this candidate.
+    pub(crate) found: bool,
+}
+
+/// Certification supplied by an executor that accounts for the full process tree.
+///
+/// Preflight certifies executable selection, launchers, descendants, config
+/// paths, private writes, and any negative tool or config searches. The second
+/// step verifies fresh dependency evidence from the completed request. A depfile
+/// alone cannot certify the complete process tree.
+pub(crate) trait ProcessVerifier: Send + Sync {
+    /// Check the request before launch and return the tool and config inputs.
+    fn preflight(&self, request: &RunRequest) -> Option<Trace>;
+
+    /// Read the dependency evidence for the exact request that ran.
+    fn dependencies(&self, request: &RunRequest, output: &RunOutput) -> Option<DependencyClosure>;
+
+    /// Maximum timestamp granularity in the verified file systems.
+    fn timestamp_granularity(&self) -> Duration {
+        Duration::from_secs(2)
+    }
+}
 
 const MAX_OBSERVATIONS: usize = 16_384;
 
@@ -100,12 +146,15 @@ enum Check {
     Slice(PathBuf, Slice),
     Chunks(PathBuf),
     DirectoryOrder(PathBuf),
+    OrderedDirectoryMissing(PathBuf),
+    FollowMissing(PathBuf),
     Link(PathBuf),
     Canonical(PathBuf),
     Environment,
     Executable,
     WorkingDirectory,
     System,
+    Request(u32),
 }
 
 impl Check {
@@ -138,6 +187,14 @@ impl Check {
                 .read_dir(path)
                 .ok()
                 .map(|entries| listing_digest(&entries, false)),
+            Self::OrderedDirectoryMissing(path) => host
+                .read_dir(path)
+                .is_err_and(|error| error.kind == ErrorKind::NotFound)
+                .then(|| Digest::hash(b"missing")),
+            Self::FollowMissing(path) => host
+                .metadata(path, Follow::Yes)
+                .is_err_and(|error| error.kind == ErrorKind::NotFound)
+                .then(|| Digest::hash(b"missing")),
             Self::Link(path) => host.read_link(path).ok().map(|target| path_digest(&target)),
             Self::Canonical(path) => host
                 .canonicalize(path)
@@ -147,6 +204,7 @@ impl Check {
             Self::Executable => host.current_exe().ok().map(|exe| path_digest(&exe)),
             Self::WorkingDirectory => Some(path_digest(&host.initial_cwd())),
             Self::System => Some(system_digest(&host.system())),
+            Self::Request(_) => None,
         }
     }
 }
@@ -185,11 +243,8 @@ fn metadata_digest(metadata: &Metadata) -> Digest {
     key.field(3, &metadata.mode.to_le_bytes());
     key.field(4, &metadata.mtime.secs.to_le_bytes());
     key.field(5, &metadata.mtime.nanos.to_le_bytes());
-    key.field(6, &metadata.atime.secs.to_le_bytes());
-    key.field(7, &metadata.atime.nanos.to_le_bytes());
     key.field(8, &metadata.dev.to_le_bytes());
     key.field(9, &metadata.ino.to_le_bytes());
-    key.field(10, &metadata.nlink.to_le_bytes());
     key.finish()
 }
 
@@ -202,7 +257,6 @@ fn system_digest(system: &SystemInfo) -> Digest {
     key.field(4, &system.machine);
     key.field(5, &system.hostname);
     key.field(6, &system.cpu_count.to_le_bytes());
-    key.field(7, &system.pid.to_le_bytes());
     key.finish()
 }
 
@@ -213,6 +267,8 @@ struct State {
     environment: BTreeMap<Vec<u8>, Option<BString>>,
     full_environment: Option<Vec<(BString, BString)>>,
     processes: Vec<RunRequest>,
+    output: Vec<(Stream, Vec<u8>)>,
+    output_bytes: usize,
     impure: Option<ImpureReason>,
 }
 
@@ -256,11 +312,32 @@ fn conflicts<K: Ord, V: PartialEq>(map: &mut BTreeMap<K, V>, key: K, value: V) -
 pub(crate) struct JournalChecks(Vec<(Check, Digest)>);
 
 impl JournalChecks {
+    /// Estimate the serialized byte count without allocating a frame.
+    pub(crate) fn encoded_size_bound(&self) -> usize {
+        self.0.iter().fold(16usize, |sum, (check, _)| {
+            let path = match check {
+                Check::Metadata(path, _)
+                | Check::Slice(path, _)
+                | Check::Chunks(path)
+                | Check::DirectoryOrder(path)
+                | Check::OrderedDirectoryMissing(path)
+                | Check::FollowMissing(path)
+                | Check::Link(path)
+                | Check::Canonical(path) => Some(path),
+                _ => None,
+            };
+            let path_bytes = path.map_or(0, |path| path.as_os_str().as_encoded_bytes().len());
+            sum.saturating_add(256)
+                .saturating_add(path_bytes.saturating_mul(6))
+        })
+    }
+
     /// Check all supplemental observations.
     pub(crate) fn verify(&self, host: &dyn Host) -> bool {
-        self.0
-            .iter()
-            .all(|(check, expected)| check.digest(host) == Some(*expected))
+        self.0.iter().all(|(check, expected)| match check {
+            Check::Request(_) => true,
+            _ => check.digest(host) == Some(*expected),
+        })
     }
 }
 
@@ -271,6 +348,7 @@ pub(crate) struct Journal {
     environment: BTreeMap<Vec<u8>, Option<BString>>,
     full_environment: Option<Vec<(BString, BString)>>,
     processes: Vec<RunRequest>,
+    output: Vec<(Stream, Vec<u8>)>,
     impure: Option<ImpureReason>,
 }
 
@@ -295,6 +373,11 @@ impl Journal {
         &self.processes
     }
 
+    /// Get output that was captured without writing to the parent host.
+    pub(crate) fn output(&self) -> &[(Stream, Vec<u8>)] {
+        &self.output
+    }
+
     /// Return the persistent validators only for a pure, unchanged run.
     pub(crate) fn verified_inputs(&self, host: &dyn Host) -> Option<(&Trace, &JournalChecks)> {
         (self.impure.is_none()
@@ -313,8 +396,17 @@ pub(crate) struct JournalHost<'a> {
     scratch: PathBuf,
     canonical_scratch: PathBuf,
     mode: JournalMode,
-    verify_process: Option<&'a ProcessVerifier<'a>>,
+    verify_process: Option<&'a dyn ProcessVerifier>,
+    speculation: Option<Speculation<'a>>,
+    sorted_listings: bool,
     state: Mutex<State>,
+}
+
+struct Speculation<'a> {
+    environment: &'a [(BString, BString)],
+    cancel: &'a CancelToken,
+    shutdown: &'a CancelToken,
+    deadline: std::time::Instant,
 }
 
 impl<'a> JournalHost<'a> {
@@ -323,7 +415,7 @@ impl<'a> JournalHost<'a> {
         inner: &'a dyn Host,
         scratch: &Path,
         mode: JournalMode,
-        verify_process: Option<&'a ProcessVerifier<'a>>,
+        verify_process: Option<&'a dyn ProcessVerifier>,
     ) -> HostResult<Self> {
         if !is_absolute(scratch) || scratch.parent().is_none() {
             return Err(HostError::unsupported(
@@ -345,8 +437,34 @@ impl<'a> JournalHost<'a> {
             canonical_scratch,
             mode,
             verify_process,
+            speculation: None,
+            sorted_listings: false,
             state: Mutex::default(),
         })
+    }
+
+    /// Use the owned job environment and the session's speculative deadline.
+    pub(crate) fn with_speculation(
+        mut self,
+        environment: &'a [(BString, BString)],
+        cancel: &'a CancelToken,
+        shutdown: &'a CancelToken,
+        deadline: std::time::Instant,
+    ) -> Self {
+        self.speculation = Some(Speculation {
+            environment,
+            cancel,
+            shutdown,
+            deadline,
+        });
+        self
+    }
+
+    /// Return directory entries in name and type order when the caller does not
+    /// depend on the host's enumeration order.
+    pub(crate) fn with_sorted_listings(mut self) -> Self {
+        self.sorted_listings = true;
+        self
     }
 
     /// Complete recording after the child has stopped.
@@ -361,6 +479,7 @@ impl<'a> JournalHost<'a> {
             environment: state.environment,
             full_environment: state.full_environment,
             processes: state.processes,
+            output: state.output,
             impure: state.impure,
         }
     }
@@ -370,12 +489,37 @@ impl<'a> JournalHost<'a> {
     /// Use this for paths from a depfile and for directly resolved headers,
     /// libraries, toolchain executables, and other regular files.
     pub(crate) fn record_dependency(&self, path: &Path) -> HostResult<()> {
+        self.record_dependency_since(path, None)
+    }
+
+    fn record_dependency_since(&self, path: &Path, cutoff: Option<i128>) -> HostResult<()> {
+        if !is_absolute(path) {
+            return Err(HostError::not_absolute(path.to_owned()));
+        }
         if self.private_path(path) {
             return Ok(());
         }
+        let metadata = self.inner.metadata(path, Follow::Yes)?;
+        let canonical = self.inner.canonicalize(path)?;
+        if cutoff.is_some_and(|cutoff| {
+            time_nanos(metadata.mtime) >= cutoff
+                || path.ancestors().any(|ancestor| {
+                    self.inner.metadata(ancestor, Follow::No).is_ok_and(|stat| {
+                        stat.kind == FileKind::Symlink && time_nanos(stat.mtime) >= cutoff
+                    })
+                })
+        }) {
+            self.mark_impure(ImpureReason::ChangedInput);
+        }
         let result = file_digest(self.inner, path);
         if let Ok(digest) = result {
-            self.state().stamp(InputStamp::FileHash {
+            let mut state = self.state();
+            state.check(Check::Canonical(path.to_owned()), path_digest(&canonical));
+            state.check(
+                Check::Metadata(path.to_owned(), true),
+                metadata_digest(&metadata),
+            );
+            state.stamp(InputStamp::FileHash {
                 path: path.to_owned(),
                 digest,
             });
@@ -391,6 +535,15 @@ impl<'a> JournalHost<'a> {
     /// A miss stamps the deepest existing directory. A missing search root
     /// gets its own stamp, so creating it also invalidates the result.
     pub(crate) fn record_search(&self, root: &Path, relative: &Path) -> HostResult<bool> {
+        self.record_search_since(root, relative, None)
+    }
+
+    fn record_search_since(
+        &self,
+        root: &Path,
+        relative: &Path,
+        cutoff: Option<i128>,
+    ) -> HostResult<bool> {
         if !is_absolute(root)
             || relative.as_os_str().is_empty()
             || !relative
@@ -405,14 +558,14 @@ impl<'a> JournalHost<'a> {
         let candidate = root.join(relative);
         match self.inner.metadata(&candidate, Follow::Yes) {
             Ok(metadata) if metadata.kind == FileKind::File => {
-                self.record_dependency(&candidate)?;
+                self.record_dependency_since(&candidate, cutoff)?;
                 Ok(true)
             }
             Err(error) if error.kind == ErrorKind::NotFound && self.private_path(&candidate) => {
                 Ok(false)
             }
             Err(error) if error.kind == ErrorKind::NotFound => {
-                let result = self.record_negative_search(root, relative);
+                let result = self.record_negative_search(root, relative, cutoff);
                 if result.is_err() {
                     self.mark_impure(ImpureReason::UnverifiableInput);
                 }
@@ -427,7 +580,12 @@ impl<'a> JournalHost<'a> {
         }
     }
 
-    fn record_negative_search(&self, root: &Path, relative: &Path) -> HostResult<()> {
+    fn record_negative_search(
+        &self,
+        root: &Path,
+        relative: &Path,
+        cutoff: Option<i128>,
+    ) -> HostResult<()> {
         let mut directory = match self.inner.metadata(root, Follow::Yes) {
             Ok(metadata) if metadata.kind == FileKind::Dir => root.to_owned(),
             Err(error) if error.kind == ErrorKind::NotFound && missing(self.inner, root) => {
@@ -435,6 +593,9 @@ impl<'a> JournalHost<'a> {
                     path: root.to_owned(),
                 });
                 return Ok(());
+            }
+            Err(error) if error.kind == ErrorKind::NotFound => {
+                return self.record_dangling_search(root, cutoff);
             }
             _ => {
                 return Err(HostError::unsupported(
@@ -445,6 +606,12 @@ impl<'a> JournalHost<'a> {
         for part in relative.components() {
             let next = directory.join(part.as_os_str());
             if missing(self.inner, &next) {
+                if let Some(cutoff) = cutoff {
+                    let metadata = self.inner.metadata(&directory, Follow::Yes)?;
+                    if time_nanos(metadata.mtime) >= cutoff {
+                        self.mark_impure(ImpureReason::ChangedInput);
+                    }
+                }
                 let listing = directory_digest(self.inner, &directory)?;
                 self.state().stamp(InputStamp::NegativeLookup {
                     root: root.to_owned(),
@@ -454,14 +621,38 @@ impl<'a> JournalHost<'a> {
                 });
                 return Ok(());
             }
-            if self.inner.metadata(&next, Follow::Yes)?.kind != FileKind::Dir {
-                break;
+            match self.inner.metadata(&next, Follow::Yes) {
+                Ok(metadata) if metadata.kind == FileKind::Dir => {}
+                Err(error) if error.kind == ErrorKind::NotFound => {
+                    return self.record_dangling_search(&next, cutoff);
+                }
+                _ => break,
             }
             directory = next;
         }
         Err(HostError::unsupported(
             "Cannot verify the missing search candidate.",
         ))
+    }
+
+    fn record_dangling_search(&self, link: &Path, cutoff: Option<i128>) -> HostResult<()> {
+        let metadata = self.inner.metadata(link, Follow::No)?;
+        if metadata.kind != FileKind::Symlink {
+            return Err(HostError::unsupported(
+                "Cannot verify the missing search path.",
+            ));
+        }
+        if cutoff.is_some_and(|cutoff| time_nanos(metadata.mtime) >= cutoff) {
+            self.mark_impure(ImpureReason::ChangedInput);
+        }
+        let target = self.inner.read_link(link)?;
+        let mut state = self.state();
+        state.check(Check::Link(link.to_owned()), path_digest(&target));
+        state.check(
+            Check::FollowMissing(link.to_owned()),
+            Digest::hash(b"missing"),
+        );
+        Ok(())
     }
 
     fn state(&self) -> MutexGuard<'_, State> {
@@ -527,14 +718,65 @@ impl<'a> JournalHost<'a> {
     fn record_request(&self, request: &RunRequest) {
         let mut state = self.state();
         if state.can_record() {
+            let index = state.processes.len() as u32;
+            state.check(Check::Request(index), request_digest(request));
             state.processes.push(request.clone());
         }
     }
 
+    fn limit_speculative_request(&self, request: &mut RunRequest) -> HostResult<()> {
+        let Some(spec) = &self.speculation else {
+            return Ok(());
+        };
+        let remaining = spec
+            .deadline
+            .saturating_duration_since(std::time::Instant::now());
+        if spec.cancel.is_cancelled() || spec.shutdown.is_cancelled() || remaining.is_zero() {
+            self.mark_impure(ImpureReason::ProcessFailure);
+            return Err(HostError::unsupported(
+                "Speculative probe was cancelled or expired.",
+            ));
+        }
+        request.timeout = Some(
+            request
+                .timeout
+                .map_or(remaining, |timeout| timeout.min(remaining)),
+        );
+        Ok(())
+    }
+
+    fn process_request<'request>(
+        &self,
+        request: &'request RunRequest,
+    ) -> HostResult<std::borrow::Cow<'request, RunRequest>> {
+        use std::borrow::Cow;
+
+        let mut request = Cow::Borrowed(request);
+        if let Some(spec) = &self.speculation {
+            let request = request.to_mut();
+            request.env = spec.environment.to_vec();
+            self.limit_speculative_request(request)?;
+        }
+        if let Err(error) = self.before_process(&request) {
+            self.record_request(&request);
+            return Err(error);
+        }
+        if let Cow::Owned(request) = &mut request {
+            self.limit_speculative_request(request)?;
+        }
+        self.record_request(&request);
+        if self.mode == JournalMode::Speculate && self.state().impure.is_some() {
+            return Err(HostError::unsupported(
+                "Cannot verify speculative probe inputs.",
+            ));
+        }
+        Ok(request)
+    }
+
     fn before_process(&self, request: &RunRequest) -> HostResult<()> {
-        self.record_request(request);
         if let Input::File(path) = &request.stdin {
-            let _ = self.record_dependency(path);
+            self.record_dependency(path)
+                .or_else(|_| self.guard_effect(ImpureReason::UnverifiableInput))?;
         }
         for output in [&request.stdout, &request.stderr] {
             if let Output::File { path, .. } = output {
@@ -543,51 +785,132 @@ impl<'a> JournalHost<'a> {
         }
 
         let bounded = request.timeout.is_some_and(|time| {
-            !time.is_zero()
-                && (self.mode == JournalMode::Observe || time <= Duration::from_secs(120))
+            !time.is_zero() && (self.mode == JournalMode::Observe || time <= SPECULATIVE_TIMEOUT)
         });
         let private = self.private_path(&request.cwd)
             && request.stdin != Input::Inherit
             && request.stdout != Output::Inherit
-            && request.stderr != Output::Inherit;
+            && request.stderr != Output::Inherit
+            && (self.mode == JournalMode::Observe || !request.tee);
         if !bounded || !private {
             return self.guard_effect(ImpureReason::UnverifiedProcess);
         }
-        let Some(trace) = self.verify_process.and_then(|verify| verify(request)) else {
+        let Some(trace) = self
+            .verify_process
+            .and_then(|verify| verify.preflight(request))
+        else {
             return self.guard_effect(ImpureReason::UnverifiedProcess);
         };
+        // A pipeline needs separate evidence for every stage.
+        if request.pipeline.len() != 1 {
+            return self.guard_effect(ImpureReason::UnverifiedProcess);
+        }
         for command in &request.pipeline {
             let program = path::to_native(&command.program);
             if !is_absolute(&program) || self.record_dependency(&program).is_err() {
                 return self.guard_effect(ImpureReason::UnverifiedProcess);
             }
         }
-        if verify_trace(self.inner, &trace) != VerifyOutcome::Hit {
+        if trace
+            .iter()
+            .any(|stamp| matches!(stamp, InputStamp::FileStat { .. }))
+            || verify_trace(self.inner, &trace) != VerifyOutcome::Hit
+        {
             return self.guard_effect(ImpureReason::ChangedInput);
+        }
+        for stamp in &trace {
+            if let InputStamp::FileHash { path, .. } = stamp
+                && self.record_dependency(path).is_err()
+            {
+                return self.guard_effect(ImpureReason::UnverifiedProcess);
+            }
         }
         let mut state = self.state();
         for stamp in trace {
             state.stamp(stamp);
         }
-        if self.mode == JournalMode::Speculate && state.impure.is_some() {
-            return Err(HostError::unsupported(
-                "Cannot verify speculative probe inputs.",
-            ));
-        }
         Ok(())
     }
 
-    fn after_process(&self, request: &RunRequest, result: &HostResult<RunOutput>) {
-        if !result.as_ref().is_ok_and(|output| {
-            output.results.len() == request.pipeline.len()
-                && output
-                    .results
-                    .iter()
-                    .all(|result| matches!(result, ProcessResult::Exited(_)))
-        }) {
+    fn after_process(&self, request: &RunRequest, spawn: FileTime, result: &HostResult<RunOutput>) {
+        let Ok(output) = result else {
             self.mark_impure(ImpureReason::ProcessFailure);
+            return;
+        };
+        if output.results.len() != request.pipeline.len()
+            || !output
+                .results
+                .iter()
+                .all(|result| matches!(result, ProcessResult::Exited(_)))
+        {
+            self.mark_impure(ImpureReason::ProcessFailure);
+            return;
+        }
+        let Some(verifier) = self.verify_process else {
+            self.mark_impure(ImpureReason::UnverifiedProcess);
+            return;
+        };
+        let Some(closure) = verifier.dependencies(request, output) else {
+            self.mark_impure(ImpureReason::UnverifiedProcess);
+            return;
+        };
+        let only_tools = closure.files.iter().all(|file| {
+            request
+                .pipeline
+                .iter()
+                .any(|command| path::to_native(&command.program) == *file)
+        });
+        if (only_tools && closure.searches.is_empty())
+            || closure.files.len().saturating_add(closure.searches.len()) > MAX_OBSERVATIONS
+        {
+            self.mark_impure(ImpureReason::UnverifiedProcess);
+            return;
+        }
+        let failed = output
+            .results
+            .iter()
+            .any(|result| matches!(result, ProcessResult::Exited(code) if *code != 0));
+        if failed
+            && missing_input_diagnostic(output)
+            && !closure.searches.iter().any(|search| !search.found)
+        {
+            self.mark_impure(ImpureReason::UnverifiedProcess);
+            return;
+        }
+        let cutoff = time_nanos(spawn) - verifier.timestamp_granularity().as_nanos() as i128;
+        for file in &closure.files {
+            if self.record_dependency_since(file, Some(cutoff)).is_err() {
+                self.mark_impure(ImpureReason::UnverifiableInput);
+            }
+        }
+        for search in &closure.searches {
+            if self.record_search_since(&search.root, &search.relative, Some(cutoff))
+                != Ok(search.found)
+            {
+                self.mark_impure(ImpureReason::ChangedInput);
+            }
+        }
+        // Include preflight dependencies and inputs recorded by earlier stages.
+        let state = self.state();
+        let racy = state.stamps.values().any(|stamp| {
+            let path = match stamp {
+                InputStamp::FileHash { path, .. } | InputStamp::DirEntries { path, .. } => path,
+                InputStamp::NegativeLookup { deepest, .. } => deepest,
+                _ => return false,
+            };
+            self.inner
+                .metadata(path, Follow::Yes)
+                .map_or(true, |meta| time_nanos(meta.mtime) >= cutoff)
+        });
+        drop(state);
+        if racy {
+            self.mark_impure(ImpureReason::ChangedInput);
         }
     }
+}
+
+fn time_nanos(time: FileTime) -> i128 {
+    i128::from(time.secs) * 1_000_000_000 + i128::from(time.nanos)
 }
 
 fn is_absolute(path: &Path) -> bool {
@@ -607,393 +930,6 @@ fn missing(host: &dyn Host, path: &Path) -> bool {
             .is_err_and(|error| error.kind == ErrorKind::NotFound)
 }
 
-impl Host for JournalHost<'_> {
-    fn metadata(&self, path: &Path, follow: Follow) -> HostResult<Metadata> {
-        let result = self.inner.metadata(path, follow);
-        if !self.private_path(path) {
-            match &result {
-                Ok(meta) if is_absolute(path) && meta.kind != FileKind::Other => {
-                    let mut state = self.state();
-                    state.check(
-                        Check::Metadata(path.to_owned(), follow == Follow::Yes),
-                        metadata_digest(meta),
-                    );
-                    if meta.kind == FileKind::File {
-                        state.stamp(InputStamp::FileStat {
-                            path: path.to_owned(),
-                            stat: FastStat::from(meta),
-                            digest: None,
-                        });
-                    }
-                }
-                Err(error) => self.record_error(path, error),
-                _ => self.mark_impure(ImpureReason::UnverifiableInput),
-            }
-        }
-        result
-    }
-
-    fn read(&self, path: &Path, range: ReadRange) -> HostResult<Vec<u8>> {
-        let result = self.inner.read(path, range);
-        if !self.private_path(path) {
-            match (&result, range) {
-                (Ok(bytes), ReadRange::All { .. }) if is_absolute(path) => {
-                    self.state().stamp(InputStamp::FileHash {
-                        path: path.to_owned(),
-                        digest: Digest::hash(bytes),
-                    });
-                }
-                (Ok(bytes), ReadRange::Slice { offset, len }) if is_absolute(path) => {
-                    // Bound the verification read by the observed byte count plus one.
-                    let limit = (bytes.len() as u64).saturating_add(1);
-                    let range = Slice {
-                        offset,
-                        len: Some(len.map_or(limit, |len| len.min(limit))),
-                    };
-                    self.state()
-                        .check(Check::Slice(path.to_owned(), range), Digest::hash(bytes));
-                }
-                (Err(error), _) => self.record_error(path, error),
-                _ => self.mark_impure(ImpureReason::UnverifiableInput),
-            }
-        }
-        result
-    }
-
-    fn read_chunks(&self, path: &Path, consume: &mut dyn FnMut(&[u8])) -> HostResult<()> {
-        if self.private_path(path) {
-            return self.inner.read_chunks(path, consume);
-        }
-        if !bounded_file(self.inner, path) {
-            self.guard_effect(ImpureReason::UnverifiableInput)?;
-            return self.inner.read_chunks(path, consume);
-        }
-        let mut key = KeyHasher::new(Domain::ProbeV1);
-        let result = self.inner.read_chunks(path, &mut |chunk| {
-            key.field(1, chunk);
-            consume(chunk);
-        });
-        if is_absolute(path) && result.is_ok() {
-            self.state()
-                .check(Check::Chunks(path.to_owned()), key.finish());
-        } else {
-            self.mark_impure(ImpureReason::UnverifiableInput);
-        }
-        result
-    }
-
-    fn write(&self, path: &Path, bytes: &[u8], mode: WriteMode) -> HostResult<()> {
-        self.guard_write(path)?;
-        self.inner.write(path, bytes, mode)
-    }
-
-    fn read_dir(&self, path: &Path) -> HostResult<Vec<DirEntry>> {
-        let result = self.inner.read_dir(path);
-        if !self.private_path(path) {
-            match &result {
-                Ok(entries) if is_absolute(path) => {
-                    let mut state = self.state();
-                    state.stamp(InputStamp::DirEntries {
-                        path: path.to_owned(),
-                        digest: listing_digest(entries, true),
-                    });
-                    state.check(
-                        Check::DirectoryOrder(path.to_owned()),
-                        listing_digest(entries, false),
-                    );
-                }
-                Err(error) => self.record_error(path, error),
-                _ => self.mark_impure(ImpureReason::UnverifiableInput),
-            }
-        }
-        result
-    }
-
-    fn create_dir_all(&self, path: &Path) -> HostResult<()> {
-        self.guard_write(path)?;
-        self.inner.create_dir_all(path)
-    }
-
-    fn remove_file(&self, path: &Path) -> HostResult<()> {
-        self.guard_write(path)?;
-        self.inner.remove_file(path)
-    }
-
-    fn remove_dir(&self, path: &Path) -> HostResult<()> {
-        self.guard_write(path)?;
-        self.inner.remove_dir(path)
-    }
-
-    fn remove_dir_all(&self, path: &Path) -> HostResult<()> {
-        self.guard_write(path)?;
-        self.inner.remove_dir_all(path)
-    }
-
-    fn rename(&self, from: &Path, to: &Path) -> HostResult<()> {
-        self.guard_write(from)?;
-        self.guard_write(to)?;
-        self.inner.rename(from, to)
-    }
-
-    fn rename_noreplace(&self, from: &Path, to: &Path) -> HostResult<()> {
-        self.guard_write(from)?;
-        self.guard_write(to)?;
-        self.inner.rename_noreplace(from, to)
-    }
-
-    fn lock_file(
-        &self,
-        path: &Path,
-        timeout: Option<Duration>,
-    ) -> HostResult<Box<dyn FileLockGuard>> {
-        self.guard_effect(ImpureReason::SharedState)?;
-        self.inner.lock_file(path, timeout)
-    }
-
-    fn copy_file(&self, from: &Path, to: &Path, options: CopyOptions) -> HostResult<()> {
-        self.guard_write(to)?;
-        let _ = self.record_dependency(from);
-        if options.preserve_permissions || options.preserve_mtime {
-            let _ = self.metadata(from, Follow::Yes);
-        }
-        let result = self.inner.copy_file(from, to, options);
-        if result.is_err() {
-            self.mark_impure(ImpureReason::UnverifiableInput);
-        }
-        result
-    }
-
-    fn symlink(&self, target: &Path, link: &Path) -> HostResult<()> {
-        self.guard_effect(ImpureReason::ExternalWrite)?;
-        self.inner.symlink(target, link)
-    }
-
-    fn hard_link(&self, source: &Path, destination: &Path) -> HostResult<()> {
-        self.guard_effect(ImpureReason::ExternalWrite)?;
-        self.inner.hard_link(source, destination)
-    }
-
-    fn read_link(&self, path: &Path) -> HostResult<PathBuf> {
-        let result = self.inner.read_link(path);
-        match &result {
-            Ok(target) if is_absolute(path) => {
-                self.state()
-                    .check(Check::Link(path.to_owned()), path_digest(target));
-            }
-            Err(error) => self.record_error(path, error),
-            _ => self.mark_impure(ImpureReason::UnverifiableInput),
-        }
-        result
-    }
-
-    fn canonicalize(&self, path: &Path) -> HostResult<PathBuf> {
-        let result = self.inner.canonicalize(path);
-        if !self.private_path(path) {
-            match &result {
-                Ok(target) if is_absolute(path) => {
-                    self.state()
-                        .check(Check::Canonical(path.to_owned()), path_digest(target));
-                }
-                Err(error) => self.record_error(path, error),
-                _ => self.mark_impure(ImpureReason::UnverifiableInput),
-            }
-        }
-        result
-    }
-
-    fn set_permissions(&self, path: &Path, mode: u32) -> HostResult<()> {
-        self.guard_write(path)?;
-        self.inner.set_permissions(path, mode)
-    }
-
-    fn set_times(
-        &self,
-        path: &Path,
-        atime: Option<FileTime>,
-        mtime: Option<FileTime>,
-    ) -> HostResult<()> {
-        self.guard_write(path)?;
-        self.inner.set_times(path, atime, mtime)
-    }
-
-    fn env_get(&self, name: &[u8]) -> Option<BString> {
-        let value = self.inner.env_get(name);
-        let mut state = self.state();
-        if state.can_record() {
-            if conflicts(&mut state.environment, name.to_vec(), value.clone()) {
-                state.impure.get_or_insert(ImpureReason::ChangedInput);
-            } else {
-                state.stamp(InputStamp::EnvVar {
-                    name: name.to_vec(),
-                    digest: value.as_ref().map(|value| Digest::hash(value)),
-                });
-            }
-        }
-        value
-    }
-
-    fn env_set(&self, name: &[u8], value: Option<&[u8]>) {
-        if self.guard_effect(ImpureReason::SharedState).is_ok() {
-            self.inner.env_set(name, value);
-        }
-    }
-
-    fn env_all(&self) -> Vec<(BString, BString)> {
-        let environment = self.inner.env_all();
-        let mut state = self.state();
-        if state.full_environment.is_none() {
-            state.full_environment = Some(environment.clone());
-        }
-        state.check(Check::Environment, environment_fingerprint(&environment));
-        environment
-    }
-
-    fn run(
-        &self,
-        request: &RunRequest,
-        on_output: &mut dyn FnMut(Stream, &[u8]),
-    ) -> HostResult<RunOutput> {
-        self.before_process(request)?;
-        let result = self.inner.run(request, on_output);
-        self.after_process(request, &result);
-        result
-    }
-
-    fn run_bounded(&self, request: &RunRequest, limit: usize) -> HostResult<RunOutput> {
-        self.before_process(request)?;
-        let result = self.inner.run_bounded(request, limit);
-        self.after_process(request, &result);
-        result
-    }
-
-    fn run_with_timeout_signal(
-        &self,
-        request: &RunRequest,
-        timeout: GracefulTimeout,
-        on_output: &mut dyn FnMut(Stream, &[u8]),
-    ) -> HostResult<RunOutput> {
-        self.guard_effect(ImpureReason::UnverifiedProcess)?;
-        self.before_process(request)?;
-        let result = self
-            .inner
-            .run_with_timeout_signal(request, timeout, on_output);
-        self.after_process(request, &result);
-        result
-    }
-
-    fn write_out(&self, stream: Stream, bytes: &[u8]) {
-        if self.guard_effect(ImpureReason::SharedState).is_ok() {
-            self.inner.write_out(stream, bytes);
-        }
-    }
-
-    fn read_stdin(&self, limit: u64) -> HostResult<Vec<u8>> {
-        self.guard_effect(ImpureReason::SharedState)?;
-        self.inner.read_stdin(limit)
-    }
-
-    fn is_terminal(&self, stream: Stream) -> bool {
-        self.mark_impure(ImpureReason::NondeterministicInput);
-        self.inner.is_terminal(stream)
-    }
-
-    fn now(&self) -> FileTime {
-        self.mark_impure(ImpureReason::NondeterministicInput);
-        self.inner.now()
-    }
-
-    fn monotonic(&self) -> Duration {
-        self.mark_impure(ImpureReason::NondeterministicInput);
-        self.inner.monotonic()
-    }
-
-    fn sleep(&self, duration: Duration) {
-        if self
-            .guard_effect(ImpureReason::NondeterministicInput)
-            .is_ok()
-        {
-            self.inner.sleep(duration);
-        }
-    }
-
-    fn time_zone(&self) -> TimeZone {
-        self.mark_impure(ImpureReason::NondeterministicInput);
-        self.inner.time_zone()
-    }
-
-    fn current_exe(&self) -> HostResult<PathBuf> {
-        let result = self.inner.current_exe();
-        match &result {
-            Ok(exe) => self.state().check(Check::Executable, path_digest(exe)),
-            Err(_) => self.mark_impure(ImpureReason::UnverifiableInput),
-        }
-        result
-    }
-
-    fn initial_cwd(&self) -> PathBuf {
-        let cwd = self.inner.initial_cwd();
-        if !self.private_path(&cwd) {
-            self.state()
-                .check(Check::WorkingDirectory, path_digest(&cwd));
-        }
-        cwd
-    }
-
-    fn system(&self) -> SystemInfo {
-        let system = self.inner.system();
-        self.state().check(Check::System, system_digest(&system));
-        system
-    }
-}
-
 #[cfg(all(test, unix))]
-mod tests {
-    use super::*;
-    use rcmake_host::PureHost;
-
-    #[test]
-    fn keeps_exact_environment_and_validates_a_read() -> HostResult<()> {
-        let host = PureHost::default();
-        let scratch = Path::new("/work/scratch");
-        let header = Path::new("/work/input.h");
-        host.create_dir_all(scratch)?;
-        host.seed_file(header, b"old")?;
-        host.env_set(b"LC_MESSAGES", Some(b"C"));
-        let journal = JournalHost::new(&host, scratch, JournalMode::Observe, None)?;
-        assert_eq!(journal.read(header, ReadRange::All { limit: 32 })?, b"old");
-        journal.env_get(b"LC_MESSAGES");
-        journal.env_all();
-        let journal = journal.finish();
-        assert_eq!(journal.full_environment(), Some(host.env_all().as_slice()));
-        assert_eq!(
-            journal.environment().get(b"LC_MESSAGES".as_slice()),
-            Some(&Some("C".into()))
-        );
-        assert!(journal.verified_inputs(&host).is_some());
-        host.env_set(b"LC_MESSAGES", Some(b"en_US"));
-        assert!(journal.verified_inputs(&host).is_none());
-        Ok(())
-    }
-
-    #[test]
-    fn observes_external_writes_and_blocks_them_in_speculation() -> HostResult<()> {
-        let host = PureHost::default();
-        let scratch = Path::new("/work/scratch");
-        let outside = Path::new("/work/outside");
-        host.create_dir_all(scratch)?;
-        let journal = JournalHost::new(&host, scratch, JournalMode::Observe, None)?;
-        journal.write(outside, b"first", WriteMode::Truncate)?;
-        assert_eq!(journal.finish().impure(), Some(ImpureReason::ExternalWrite));
-
-        host.symlink(outside, &scratch.join("alias"))?;
-        let journal = JournalHost::new(&host, scratch, JournalMode::Speculate, None)?;
-        assert!(
-            journal
-                .write(&scratch.join("alias"), b"second", WriteMode::Truncate)
-                .is_err()
-        );
-        assert_eq!(host.read(outside, ReadRange::All { limit: 32 })?, b"first");
-        assert_eq!(journal.finish().impure(), Some(ImpureReason::ExternalWrite));
-        Ok(())
-    }
-}
+#[path = "journal_tests.rs"]
+mod tests;

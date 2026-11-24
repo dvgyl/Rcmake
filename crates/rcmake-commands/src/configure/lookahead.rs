@@ -25,10 +25,23 @@ pub(crate) enum ProbeKind {
     TryCompile,
 }
 
+impl ProbeKind {
+    /// Stock module that defines this command. The direct probe is a built-in.
+    pub(crate) fn defining_module(self) -> Option<&'static str> {
+        match self {
+            Self::IncludeFile => Some("CheckIncludeFile.cmake"),
+            Self::CCompilerFlag => Some("CheckCCompilerFlag.cmake"),
+            Self::CxxCompilerFlag => Some("CheckCXXCompilerFlag.cmake"),
+            Self::SymbolExists => Some("CheckSymbolExists.cmake"),
+            Self::TryCompile => None,
+        }
+    }
+}
+
 /// One syntactic candidate in the original command order.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ProbeCandidate<'a> {
-    /// The position in the supplied command slice.
+    /// The position in the batch input, including the current command when supplied.
     pub(crate) index: usize,
     /// The command with its raw argument delimiters.
     pub(crate) command: &'a CommandInvocation,
@@ -38,22 +51,33 @@ pub(crate) struct ProbeCandidate<'a> {
     pub(crate) result: &'a [u8],
 }
 
-/// Find a consecutive batch with literal arguments and distinct result bindings.
+/// Find a consecutive batch with literal arguments and independent inputs.
 ///
-/// Stop at the first unknown command or dynamic argument. This function finds
-/// candidates only. Before starting work, the evaluator must verify dispatch,
-/// the module guard, effects, and all implicit dependencies of each candidate.
-/// Evaluate each wrapper at its original command position.
-pub(crate) fn lookahead(commands: &[CommandInvocation]) -> Vec<ProbeCandidate<'_>> {
+/// An observer can pass its current command before the remaining commands.
+/// The predicate must verify which definition will run, the defining module
+/// path and digest, the wrapper guard, and dependencies on preceding results.
+/// For a built-in, verify that the builtin still owns the command name.
+/// Evaluate each wrapper at its original command position and use its actual key.
+pub(crate) fn lookahead<'a>(
+    current: Option<&'a CommandInvocation>,
+    remaining: &'a [CommandInvocation],
+    mut verify: impl FnMut(ProbeKind, &CommandInvocation, &BTreeSet<&'a [u8]>) -> bool,
+) -> Vec<ProbeCandidate<'a>> {
     let mut results = BTreeSet::new();
     let mut batch = Vec::new();
-    for (index, command) in commands.iter().take(MAX_LOOKAHEAD).enumerate() {
+    for (index, command) in current
+        .into_iter()
+        .chain(remaining)
+        .take(MAX_LOOKAHEAD)
+        .enumerate()
+    {
         let Some((kind, result)) = candidate(command) else {
             break;
         };
-        if !results.insert(result) {
+        if results.contains(result) || !verify(kind, command, &results) {
             break;
         }
+        results.insert(result);
         batch.push(ProbeCandidate {
             index,
             command,
@@ -172,7 +196,7 @@ try_compile(HAVE_MAIN SOURCE_FROM_CONTENT probe.c [[int main(void) { return 0; }
 set(CMAKE_REQUIRED_FLAGS "-Werror")
 check_include_file(errno.h HAVE_ERRNO)"#,
         )?;
-        let batch = lookahead(&file.commands);
+        let batch = lookahead(None, &file.commands, |_, _, _| true);
         assert_eq!(
             batch
                 .iter()
@@ -205,8 +229,30 @@ check_include_file(errno.h HAVE_ERRNO)"#,
             "user_wrapper(HAVE_NEW)",
         ] {
             let file = parse(format!("check_include_file(stdio.h HAVE_OLD)\n{command}\ncheck_include_file(errno.h HAVE_ERRNO)").as_bytes())?;
-            assert!(lookahead(&file.commands).is_empty(), "{command}");
+            assert!(
+                lookahead(None, &file.commands, |_, _, _| true).is_empty(),
+                "{command}"
+            );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn includes_the_first_observed_call_and_stops_at_replaced_wrappers()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let file = parse(
+            b"check_include_file(stdio.h HAVE_STDIO)\ncheck_include_file(errno.h HAVE_ERRNO)",
+        )?;
+        let Some((current, remaining)) = file.commands.split_first() else {
+            return Err("Expected a current command.".into());
+        };
+        let batch = lookahead(Some(current), remaining, |kind, _, earlier| {
+            assert_eq!(kind.defining_module(), Some("CheckIncludeFile.cmake"));
+            assert!(earlier.len() <= 1);
+            true
+        });
+        assert_eq!(batch.len(), 2);
+        assert!(lookahead(Some(current), remaining, |_, _, earlier| earlier.is_empty()).is_empty());
         Ok(())
     }
 

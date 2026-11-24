@@ -3,10 +3,12 @@ use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
 use rcmake_base::Limits;
-use rcmake_base::hash::{HashAlgo, IncrementalHasher};
 use rcmake_diag::PolicyStatus;
-use rcmake_host::{FileKind, FileTime, Follow, Host, HostError, HostResult, Metadata, ReadRange};
+use rcmake_host::{FileKind, Follow, Host, HostError, HostResult, Metadata, ReadRange};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
+
+use super::path_bytes;
 
 /// SHA-256 digest used by the configure journal.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -28,48 +30,35 @@ impl JournalDigest {
     /// Hash bytes with SHA-256.
     #[must_use]
     pub fn hash(bytes: &[u8]) -> Self {
-        Self::from_sha256_hex(&HashAlgo::Sha256.hex_digest(bytes))
-    }
-
-    fn from_sha256_hex(hex: &str) -> Self {
-        // HashAlgo returns exactly 64 lowercase ASCII hexadecimal digits for SHA-256.
-        let nibble = |byte| match byte {
-            b'0'..=b'9' => byte - b'0',
-            _ => byte - b'a' + 10,
-        };
-        let mut bytes = [0; 32];
-        let (pairs, _) = hex.as_bytes().as_chunks::<2>();
-        for (byte, &[high, low]) in bytes.iter_mut().zip(pairs) {
-            *byte = (nibble(high) << 4) | nibble(low);
-        }
-        Self(bytes)
+        Self(Sha256::digest(bytes).into())
     }
 }
 
-pub(super) struct JournalHasher(IncrementalHasher);
+pub(super) struct JournalHasher(Sha256);
 
 impl JournalHasher {
     pub(super) fn new(domain: &[u8]) -> Self {
-        let mut hasher = Self(HashAlgo::Sha256.hasher());
+        let mut hasher = Self(Sha256::new());
         hasher.0.update(b"rcmake-configure.v1\0");
         hasher.field(0, domain);
         hasher
     }
 
     pub(super) fn field(&mut self, tag: u8, data: &[u8]) {
-        self.0.update(&[tag]);
-        self.0.update(&(data.len() as u64).to_le_bytes());
+        self.0.update([tag]);
+        self.0.update((data.len() as u64).to_le_bytes());
         self.0.update(data);
     }
 
     pub(super) fn finish(self) -> JournalDigest {
-        JournalDigest::from_sha256_hex(&self.0.finish_hex())
+        JournalDigest(self.0.finalize().into())
     }
 }
 
-/// File metadata used to check whether a content digest is still valid.
+/// File type, identity, size, permissions, and modification time.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JournalFileStat {
+    kind: u8,
     len: u64,
     mtime_secs: i64,
     mtime_nanos: u32,
@@ -92,6 +81,12 @@ impl JournalFileStat {
 impl From<&Metadata> for JournalFileStat {
     fn from(metadata: &Metadata) -> Self {
         Self {
+            kind: match metadata.kind {
+                FileKind::File => 1,
+                FileKind::Dir => 2,
+                FileKind::Symlink => 3,
+                FileKind::Other => 4,
+            },
             len: metadata.len,
             mtime_secs: metadata.mtime.secs,
             mtime_nanos: metadata.mtime.nanos,
@@ -105,18 +100,20 @@ impl From<&Metadata> for JournalFileStat {
 /// Recorded file-system or environment input to a region.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum JournalStamp {
-    /// A regular file identified by metadata.
+    /// A regular file with a content digest and optional metadata evidence.
     FileStat {
         /// Absolute file path.
+        #[serde(with = "path_bytes")]
         path: PathBuf,
         /// Observed metadata.
         stat: JournalFileStat,
-        /// Content digest to check when the metadata changes, if recorded.
+        /// Required content digest. Records without a digest cannot replay.
         digest: Option<JournalDigest>,
     },
     /// A regular file that must be checked by content.
     FileHash {
         /// Absolute file path.
+        #[serde(with = "path_bytes")]
         path: PathBuf,
         /// Observed content digest.
         digest: JournalDigest,
@@ -124,6 +121,7 @@ pub enum JournalStamp {
     /// Immediate names and types in a directory.
     DirEntries {
         /// Absolute directory path.
+        #[serde(with = "path_bytes")]
         path: PathBuf,
         /// Digest returned by [`directory_digest`].
         digest: JournalDigest,
@@ -131,7 +129,36 @@ pub enum JournalStamp {
     /// A path that did not exist.
     Missing {
         /// Absolute path.
+        #[serde(with = "path_bytes")]
         path: PathBuf,
+    },
+    /// Exact target returned by `file(READ_SYMLINK)`.
+    Link {
+        /// Absolute symbolic link path.
+        #[serde(with = "path_bytes")]
+        path: PathBuf,
+        /// Target as stored in the link.
+        #[serde(with = "path_bytes")]
+        target: PathBuf,
+    },
+    /// Exact path returned by `file(REAL_PATH)`.
+    Canonical {
+        /// Absolute path passed to canonicalization.
+        #[serde(with = "path_bytes")]
+        path: PathBuf,
+        /// Resolved native path.
+        #[serde(with = "path_bytes")]
+        target: PathBuf,
+    },
+    /// Exact stat for timestamp and `if(IS_SYMLINK)` observations.
+    Metadata {
+        /// Absolute path examined by the command.
+        #[serde(with = "path_bytes")]
+        path: PathBuf,
+        /// Whether the metadata call followed symbolic links.
+        follow: bool,
+        /// Observed metadata fields.
+        stat: JournalFileStat,
     },
     /// Environment variable value or absence.
     EnvVar {
@@ -143,10 +170,13 @@ pub enum JournalStamp {
     /// Failed search for a candidate under a search root.
     NegativeLookup {
         /// Absolute search root.
+        #[serde(with = "path_bytes")]
         root: PathBuf,
         /// Candidate path relative to the search root.
+        #[serde(with = "path_bytes")]
         relative: PathBuf,
         /// Absolute path of the last directory that existed in the search.
+        #[serde(with = "path_bytes")]
         deepest: PathBuf,
         /// Digest of the last directory's immediate names and types.
         listing: JournalDigest,
@@ -154,54 +184,55 @@ pub enum JournalStamp {
 }
 
 impl JournalStamp {
-    /// Record a file input. Use a metadata check only when the time since the
-    /// last modification reaches the supplied file-system timestamp resolution.
+    /// Record a content check for a listfile, toolchain, or other file input.
+    ///
+    /// The resolution argument is retained for callers that also record file
+    /// times. Metadata equality alone does not establish content identity.
     pub fn record_file(
         host: &dyn Host,
         path: PathBuf,
-        timestamp_resolution: Duration,
+        _timestamp_resolution: Duration,
     ) -> HostResult<Self> {
-        let (stat, digest) = hash_file(host, &path)?;
-        let now = host.now();
-        let mtime = FileTime {
-            secs: stat.mtime_secs,
-            nanos: stat.mtime_nanos,
-        };
-        let nanos = |time: FileTime| i128::from(time.secs) * 1_000_000_000 + i128::from(time.nanos);
-        let age = nanos(now) - nanos(mtime);
-        if age >= timestamp_resolution.as_nanos() as i128 {
-            Ok(Self::FileStat {
-                path,
-                stat,
-                digest: Some(digest),
-            })
-        } else {
-            Ok(Self::FileHash { path, digest })
+        let (_, digest) = hash_file(host, &path)?;
+        Ok(Self::FileHash { path, digest })
+    }
+
+    pub(super) fn path(&self) -> Option<&Path> {
+        match self {
+            Self::FileStat { path, .. }
+            | Self::FileHash { path, .. }
+            | Self::DirEntries { path, .. }
+            | Self::Missing { path }
+            | Self::Link { path, .. }
+            | Self::Canonical { path, .. }
+            | Self::Metadata { path, .. } => Some(path),
+            Self::EnvVar { .. } | Self::NegativeLookup { .. } => None,
         }
+    }
+
+    pub(super) fn matches_written_file(&self, digest: JournalDigest) -> bool {
+        matches!(self, Self::FileHash { digest: expected, .. } if *expected == digest)
     }
 
     fn matches(&self, host: &dyn Host) -> bool {
         match self {
             Self::FileStat { path, stat, digest } => {
-                if !path.is_absolute() {
-                    return false;
-                }
-                let Ok(current) = JournalFileStat::read(host, path) else {
-                    return false;
-                };
-                if current == *stat {
-                    return host
-                        .read(
-                            path,
-                            ReadRange::Slice {
-                                offset: 0,
-                                len: Some(0),
-                            },
-                        )
-                        .is_ok();
-                }
-                current.mode == stat.mode
+                path.is_absolute()
+                    && JournalFileStat::read(host, path)
+                        .is_ok_and(|current| current.mode == stat.mode)
                     && digest.is_some_and(|digest| file_digest(host, path) == Ok(digest))
+            }
+            Self::Link { path, target } => {
+                path.is_absolute() && host.read_link(path).as_ref() == Ok(target)
+            }
+            Self::Canonical { path, target } => {
+                path.is_absolute() && host.canonicalize(path).as_ref() == Ok(target)
+            }
+            Self::Metadata { path, follow, stat } => {
+                path.is_absolute()
+                    && host
+                        .metadata(path, if *follow { Follow::Yes } else { Follow::No })
+                        .is_ok_and(|actual| JournalFileStat::from(&actual) == *stat)
             }
             Self::FileHash { path, digest } => file_digest(host, path).as_ref() == Ok(digest),
             Self::DirEntries { path, digest } => {
@@ -308,7 +339,7 @@ fn hash_file(host: &dyn Host, path: &Path) -> HostResult<(JournalFileStat, Journ
             "Journal file exceeds the read limit.",
         ));
     }
-    let mut hasher = HashAlgo::Sha256.hasher();
+    let mut hasher = Sha256::new();
     let mut offset = 0;
     loop {
         // Check one byte beyond the recorded size to detect a file that grew.
@@ -333,7 +364,7 @@ fn hash_file(host: &dyn Host, path: &Path) -> HostResult<(JournalFileStat, Journ
             "Journal file changed during the read.",
         ));
     }
-    Ok((stat, JournalDigest::from_sha256_hex(&hasher.finish_hex())))
+    Ok((stat, JournalDigest(hasher.finalize().into())))
 }
 
 /// Variable scope relative to the region entry.
@@ -349,6 +380,7 @@ pub enum VariableScope {
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct TargetKey {
     /// Absolute binary directory of the target definition.
+    #[serde(with = "path_bytes")]
     pub binary_dir: PathBuf,
     /// Target name as bytes.
     pub name: Vec<u8>,
@@ -360,7 +392,7 @@ pub enum PropertyOwner {
     /// Global configure state.
     Global,
     /// A directory identified by its absolute binary path.
-    Directory(PathBuf),
+    Directory(#[serde(with = "path_bytes")] PathBuf),
     /// A target identified by its defining directory and name.
     Target(TargetKey),
 }
@@ -384,6 +416,8 @@ pub enum StateKey {
         /// Variable name as bytes.
         name: Vec<u8>,
     },
+    /// Effective normal binding at entry, including an inherited binding.
+    EffectiveVariable(Vec<u8>),
     /// Cache entry by name. Use the digest of the complete entry.
     Cache(Vec<u8>),
     /// Property on a global, directory, or target object.
@@ -447,7 +481,7 @@ pub fn policy_digest(status: PolicyStatus) -> JournalDigest {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rcmake_host::PureHost;
+    use rcmake_host::{FileTime, PureHost, WriteMode};
 
     fn fixture() -> (PureHost, PathBuf) {
         let root = PathBuf::from(if cfg!(windows) { "C:/work" } else { "/work" });
@@ -466,7 +500,7 @@ mod tests {
     }
 
     #[test]
-    fn records_recent_files_by_content_and_older_files_by_metadata() -> HostResult<()> {
+    fn detects_same_size_rewrite_with_preserved_mtime() -> HostResult<()> {
         let (host, root) = fixture();
         let path = root.join("input.cmake");
         host.seed_file(&path, b"initial")?;
@@ -483,10 +517,11 @@ mod tests {
         };
         host.set_times(&path, None, Some(old))?;
         let stable = JournalStamp::record_file(&host, path.clone(), resolution)?;
-        assert!(matches!(stable, JournalStamp::FileStat { .. }));
+        assert!(matches!(stable, JournalStamp::FileHash { .. }));
         assert!(stable.matches(&host));
 
-        host.seed_file(&path, b"changed")?;
+        host.write(&path, b"changed", WriteMode::Truncate)?;
+        host.set_times(&path, None, Some(old))?;
         assert!(!recent.matches(&host));
         assert!(!stable.matches(&host));
         Ok(())

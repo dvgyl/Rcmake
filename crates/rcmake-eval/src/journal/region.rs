@@ -1,10 +1,12 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use rcmake_diag::{Backtrace, Frame, FrameKind};
 use rcmake_model::{CacheEntry, CacheType, PropertyMap};
 use serde::{Deserialize, Serialize};
 
+use super::frame::{MAX_FRAME_BYTES, encoded_size};
+use super::path_bytes;
 use super::trace::{
     JournalDigest, JournalHasher, JournalInput, PropertyKey, PropertyOwner, StateKey, VariableScope,
 };
@@ -30,8 +32,10 @@ pub enum RegionKind {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RegionKey {
     /// Absolute binary directory of the region.
+    #[serde(with = "path_bytes")]
     pub binary_dir: PathBuf,
     /// Absolute source directory of the region.
+    #[serde(with = "path_bytes")]
     pub source_dir: PathBuf,
     /// Kind of evaluation performed in the region.
     pub kind: RegionKind,
@@ -40,6 +44,8 @@ pub struct RegionKey {
 /// Context that must match before the region's inputs are checked.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EntryContext {
+    /// Content identity of the Rcmake executable and its build options.
+    pub rcmake: JournalDigest,
     /// Digest of the effective policy stack at entry.
     pub policies: JournalDigest,
     /// Digest of the effective diagnostic state at entry.
@@ -66,6 +72,29 @@ pub enum OpaqueReason {
     FileGlobUncached,
     /// The input or effect count exceeded the journal limit.
     LimitExceeded,
+}
+
+/// First command that prevented replay.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OpaqueOperation {
+    /// Reason the operation cannot replay.
+    pub reason: OpaqueReason,
+    /// Command name, when known.
+    pub command: Option<Vec<u8>>,
+    /// Source file, when known.
+    #[serde(with = "path_bytes")]
+    pub file: PathBuf,
+    /// One-based source line. Zero means unknown.
+    pub line: u32,
+}
+
+/// Scope relationship between a child region and its enclosing region.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChildScope {
+    /// Both regions use the same variable scope, as in an include.
+    Shared,
+    /// The child starts with an empty variable scope directly inside the caller.
+    EmptyChild,
 }
 
 /// Whether the evaluator tracks the inputs and effects of an operation.
@@ -146,6 +175,7 @@ impl CacheValue {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PropertyOrigin {
     /// Absolute binary directory of the caller.
+    #[serde(with = "path_bytes")]
     pub binary_dir: PathBuf,
     frames: Vec<RecordedFrame>,
 }
@@ -266,6 +296,7 @@ pub enum JournalEffect {
     /// A written file whose final contents must still be present before replay.
     GeneratedFile {
         /// Absolute path of the written file.
+        #[serde(with = "path_bytes")]
         path: PathBuf,
         /// Digest of its contents after the write.
         digest: JournalDigest,
@@ -273,26 +304,48 @@ pub enum JournalEffect {
 }
 
 impl JournalEffect {
-    pub(super) fn written_state(&self) -> Option<StateKey> {
+    pub(super) fn implicit_read(&self) -> Option<StateKey> {
         match self {
-            Self::SetVar { scope, name, .. } => Some(StateKey::Variable {
-                scope: *scope,
-                name: name.clone(),
-            }),
-            Self::SetCache { name, .. } => Some(StateKey::Cache(name.clone())),
-            Self::Property { key, .. } => Some(StateKey::Property(key.clone())),
-            Self::Diagnostic { .. } | Self::ConfigureLog(_) | Self::GeneratedFile { .. } => None,
+            Self::SetVar {
+                scope: VariableScope::Parent,
+                name,
+                ..
+            } => Some(StateKey::EffectiveVariable(name.clone())),
+            Self::Property {
+                key,
+                edit: PropertyEdit::AppendList(_) | PropertyEdit::AppendString(_),
+                ..
+            } => Some(StateKey::Property(key.clone())),
+            _ => None,
         }
     }
 
-    pub(super) fn reads_written_state(&self) -> bool {
-        matches!(
-            self,
-            Self::Property {
-                edit: PropertyEdit::AppendList(_) | PropertyEdit::AppendString(_),
-                ..
+    pub(super) fn written_states(&self) -> impl Iterator<Item = StateKey> {
+        let (first, second) = match self {
+            Self::SetVar { scope, name, .. } => (
+                Some(StateKey::Variable {
+                    scope: *scope,
+                    name: name.clone(),
+                }),
+                Some(StateKey::EffectiveVariable(name.clone())),
+            ),
+            Self::SetCache { name, .. } => (Some(StateKey::Cache(name.clone())), None),
+            Self::Property { key, .. } => (Some(StateKey::Property(key.clone())), None),
+            Self::Diagnostic { .. } | Self::ConfigureLog(_) | Self::GeneratedFile { .. } => {
+                (None, None)
             }
-        )
+        };
+        first.into_iter().chain(second).chain(match self {
+            Self::SetVar {
+                scope: VariableScope::Parent,
+                name,
+                ..
+            } => Some(StateKey::Variable {
+                scope: VariableScope::Current,
+                name: name.clone(),
+            }),
+            _ => None,
+        })
     }
 
     pub(super) fn is_well_formed(&self) -> bool {
@@ -318,6 +371,8 @@ pub struct Journal {
     effects: Vec<JournalEffect>,
     read: BTreeMap<StateKey, Option<JournalDigest>>,
     written: BTreeSet<StateKey>,
+    generated: BTreeMap<PathBuf, JournalDigest>,
+    bytes: usize,
 }
 
 impl Journal {
@@ -334,9 +389,16 @@ impl Journal {
                 };
             }
         }
+        if let JournalInput::Host(stamp) = &input
+            && let Some(digest) = stamp.path().and_then(|path| self.generated.get(path))
+            && stamp.matches_written_file(*digest)
+        {
+            return Ok(());
+        }
         if self.inputs.len() == MAX_INPUTS {
             return Err(OpaqueReason::LimitExceeded);
         }
+        self.account(&input)?;
         if let JournalInput::State { key, value } = &input {
             self.read.insert(key.clone(), *value);
         }
@@ -351,16 +413,27 @@ impl Journal {
         if !effect.is_well_formed() {
             return Err(OpaqueReason::ExternalMutation);
         }
-        if let Some(key) = effect.written_state() {
-            if effect.reads_written_state()
-                && !self.written.contains(&key)
-                && !self.read.contains_key(&key)
-            {
-                return Err(OpaqueReason::ExternalMutation);
-            }
-            self.written.insert(key);
+        if let Some(key) = effect.implicit_read()
+            && !self.written.contains(&key)
+            && !self.read.contains_key(&key)
+        {
+            return Err(OpaqueReason::ExternalMutation);
+        }
+        self.account(&effect)?;
+        self.written.extend(effect.written_states());
+        if let JournalEffect::GeneratedFile { path, digest } = &effect {
+            self.generated.insert(path.clone(), *digest);
         }
         self.effects.push(effect);
+        Ok(())
+    }
+    fn account(&mut self, value: &impl Serialize) -> Result<(), OpaqueReason> {
+        // Reserve room for the manifest and for commas between records.
+        let remaining = MAX_FRAME_BYTES
+            .saturating_sub(self.bytes)
+            .saturating_sub(4096);
+        let size = encoded_size(value, remaining).ok_or(OpaqueReason::LimitExceeded)?;
+        self.bytes += size + 1;
         Ok(())
     }
 }
@@ -371,7 +444,7 @@ pub enum RegionState {
     /// Inputs and effects are still being recorded.
     Recording(Journal),
     /// An operation prevents replay.
-    Opaque(OpaqueReason),
+    Opaque(OpaqueOperation),
 }
 
 impl Default for RegionState {
@@ -381,19 +454,128 @@ impl Default for RegionState {
 }
 
 impl RegionState {
-    /// Record the evaluator's classification before performing an operation.
+    /// Record an operation that has no named classification.
     pub fn record_command(&mut self, class: CommandClass) {
         match class {
-            CommandClass::Tracked => {}
             CommandClass::Opaque(reason) => self.mark_opaque(reason),
-            CommandClass::Unknown => self.mark_opaque(OpaqueReason::UnclassifiedCommand),
+            CommandClass::Unknown | CommandClass::Tracked => {
+                self.mark_opaque(OpaqueReason::UnclassifiedCommand);
+            }
         }
     }
 
     /// Stop recording and retain the first reason replay is unsafe.
     pub fn mark_opaque(&mut self, reason: OpaqueReason) {
         if matches!(self, Self::Recording(_)) {
-            *self = Self::Opaque(reason);
+            *self = Self::Opaque(OpaqueOperation {
+                reason,
+                command: None,
+                file: PathBuf::new(),
+                line: 0,
+            });
+        }
+    }
+
+    /// Record a command at its source site. Require a tracked built-in contract.
+    ///
+    /// Pass `Unknown` for scripted or replaced commands. A caller can only
+    /// claim `Tracked` when its recorder covers the specific arguments.
+    pub fn record_named_command(
+        &mut self,
+        file: &Path,
+        line: u32,
+        command: &[u8],
+        args: &[&[u8]],
+        class: CommandClass,
+    ) {
+        let reason = match class {
+            CommandClass::Unknown => OpaqueReason::UnclassifiedCommand,
+            CommandClass::Opaque(reason) => reason,
+            CommandClass::Tracked => match command.to_ascii_lowercase().as_slice() {
+                b"set" | b"unset"
+                    if args.first().is_some_and(|name| !name.starts_with(b"ENV{")) =>
+                {
+                    return;
+                }
+                b"get_property" if args.get(1).is_some_and(|scope| tracked_owner(scope)) => return,
+                b"set_property" if args.first().is_some_and(|scope| tracked_owner(scope)) => return,
+                b"execute_process" => OpaqueReason::ExecuteProcess,
+                b"file" | b"if" => OpaqueReason::RandomOrTimestamp,
+                _ => OpaqueReason::UnclassifiedCommand,
+            },
+        };
+        if matches!(self, Self::Recording(_)) {
+            *self = Self::Opaque(OpaqueOperation {
+                reason,
+                command: Some(command.to_vec()),
+                file: file.to_owned(),
+                line,
+            });
+        }
+    }
+
+    /// Record the effective normal variable read that precedes a parent write.
+    ///
+    /// The evaluator supplies the value from its normal scope stack before the
+    /// write. Pass `None` for an undefined binding.
+    pub fn record_parent_write(
+        &mut self,
+        name: &[u8],
+        previous: Option<&[u8]>,
+        value: Option<Vec<u8>>,
+    ) {
+        self.record_input(JournalInput::State {
+            key: StateKey::EffectiveVariable(name.to_vec()),
+            value: previous.map(JournalDigest::hash),
+        });
+        self.record_effect(JournalEffect::SetVar {
+            scope: VariableScope::Parent,
+            name: name.to_vec(),
+            value,
+        });
+    }
+
+    /// Merge a child journal at its call site with scopes relative to this region.
+    ///
+    /// Provide the scope relationship from the evaluator. Child-local writes
+    /// disappear when its scope closes. Parent writes affect this region's
+    /// current scope and must not repeat the child's raise operation.
+    pub fn merge_child(&mut self, child: RegionRecord, scopes: ChildScope) {
+        let (inputs, effects) = match child.payload {
+            RegionPayload::Complete { inputs, effects } => (inputs, effects),
+            RegionPayload::Opaque(operation) => {
+                if matches!(self, Self::Recording(_)) {
+                    *self = Self::Opaque(operation);
+                }
+                return;
+            }
+        };
+        for mut input in inputs {
+            if scopes == ChildScope::EmptyChild
+                && let JournalInput::State { key, value } = &mut input
+                && let StateKey::Variable { scope, .. } = key
+            {
+                match scope {
+                    VariableScope::Current if value.is_none() => continue,
+                    VariableScope::Current => {
+                        self.mark_opaque(OpaqueReason::ExternalMutation);
+                        return;
+                    }
+                    VariableScope::Parent => *scope = VariableScope::Current,
+                }
+            }
+            self.record_input(input);
+        }
+        for mut effect in effects {
+            if scopes == ChildScope::EmptyChild
+                && let JournalEffect::SetVar { scope, .. } = &mut effect
+            {
+                match scope {
+                    VariableScope::Current => continue,
+                    VariableScope::Parent => *scope = VariableScope::Current,
+                }
+            }
+            self.record_effect(effect);
         }
     }
 
@@ -433,13 +615,17 @@ impl RegionState {
     }
 }
 
+fn tracked_owner(scope: &[u8]) -> bool {
+    matches!(scope, b"GLOBAL" | b"DIRECTORY" | b"TARGET")
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) enum RegionPayload {
     Complete {
         inputs: Vec<JournalInput>,
         effects: Vec<JournalEffect>,
     },
-    Opaque(OpaqueReason),
+    Opaque(OpaqueOperation),
 }
 
 /// Recorded region keyed by its binary directory, source directory, and kind.

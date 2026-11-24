@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 use std::path::Path;
 
 use rcmake_host::{Host, HostError, path};
@@ -7,12 +8,14 @@ use serde::{Deserialize, Serialize};
 
 use crate::Cx;
 
+use super::frame::{MAX_FRAME_BYTES, encoded_size, write_json};
 use super::region::{
-    EntryContext, JournalEffect, MAX_EFFECTS, MAX_INPUTS, OpaqueReason, PropertyEdit, RegionKey,
+    EntryContext, JournalEffect, MAX_EFFECTS, MAX_INPUTS, OpaqueOperation, PropertyEdit, RegionKey,
     RegionKind, RegionPayload, RegionRecord,
 };
 use super::trace::{
-    JournalInput, PropertyOwner, StateKey, StateLookup, VariableScope, file_digest,
+    JournalDigest, JournalInput, JournalStamp, PropertyOwner, StateKey, StateLookup, VariableScope,
+    file_digest,
 };
 
 /// Versioned manifest of a successful whole configure.
@@ -36,10 +39,13 @@ impl<M> ConfigureSnapshot<M> {
     /// Create a manifest from a completed whole configure and its portable model.
     pub fn new(region: RegionRecord, model: M) -> Result<Self, ReplayMiss> {
         if region.key.kind != RegionKind::Configure {
-            return Err(ReplayMiss::Identity);
+            return Err(ReplayMiss::new(&region.key, ReplayMissReason::Identity));
         }
-        if let RegionPayload::Opaque(reason) = region.payload {
-            return Err(ReplayMiss::Opaque(reason));
+        if let RegionPayload::Opaque(operation) = region.payload {
+            return Err(ReplayMiss::new(
+                &region.key,
+                ReplayMissReason::Opaque(operation),
+            ));
         }
         Ok(Self {
             schema: Self::SCHEMA.into(),
@@ -49,24 +55,188 @@ impl<M> ConfigureSnapshot<M> {
     }
 }
 
+impl<M: Serialize> ConfigureSnapshot<M> {
+    /// Encode this snapshot in a length-checked native-path frame.
+    pub fn encode(&self) -> Result<Vec<u8>, ReplayCodecError> {
+        let len = encoded_size(self, MAX_FRAME_BYTES).ok_or(ReplayCodecError::Payload)?;
+        let mut bytes = Vec::with_capacity(FRAME_HEADER + len + FRAME_CHECKSUM);
+        bytes.extend_from_slice(FRAME_MAGIC);
+        bytes.push(PATH_ENCODING);
+        bytes.extend_from_slice(&(len as u32).to_le_bytes());
+        write_json(self, &mut bytes, len).map_err(|_| ReplayCodecError::Payload)?;
+        if bytes.len() != FRAME_HEADER + len {
+            return Err(ReplayCodecError::Payload);
+        }
+        let checksum = JournalDigest::hash(&bytes);
+        bytes.extend_from_slice(checksum.as_bytes());
+        Ok(bytes)
+    }
+}
+
+impl<M: serde::de::DeserializeOwned> ConfigureSnapshot<M> {
+    /// Decode a snapshot after checking the frame version, platform, and size.
+    ///
+    /// Limit host reads to the size returned by `frame_limit` before calling this method.
+    pub fn decode(bytes: &[u8]) -> Result<Self, ReplayCodecError> {
+        if bytes.len() > Self::frame_limit() {
+            return Err(ReplayCodecError::Frame);
+        }
+        let (body, checksum) = bytes
+            .split_at_checked(bytes.len().saturating_sub(FRAME_CHECKSUM))
+            .ok_or(ReplayCodecError::Frame)?;
+        if JournalDigest::hash(body).as_bytes() != checksum {
+            return Err(ReplayCodecError::Frame);
+        }
+        let (_, len_and_payload) = body
+            .strip_prefix(FRAME_MAGIC)
+            .and_then(|bytes| bytes.split_first())
+            .filter(|(encoding, _)| **encoding == PATH_ENCODING)
+            .ok_or(ReplayCodecError::Frame)?;
+        let (len, payload) = len_and_payload
+            .split_first_chunk::<4>()
+            .ok_or(ReplayCodecError::Frame)?;
+        if payload.len() > MAX_FRAME_BYTES || u32::from_le_bytes(*len) as usize != payload.len() {
+            return Err(ReplayCodecError::Frame);
+        }
+        let snapshot: Self =
+            serde_json::from_slice(payload).map_err(|_| ReplayCodecError::Payload)?;
+        if snapshot.schema != Self::SCHEMA {
+            return Err(ReplayCodecError::Frame);
+        }
+        Ok(snapshot)
+    }
+}
+
+impl<M> ConfigureSnapshot<M> {
+    /// Maximum bytes to read for one snapshot, including the header.
+    #[must_use]
+    pub const fn frame_limit() -> usize {
+        FRAME_HEADER + MAX_FRAME_BYTES + FRAME_CHECKSUM
+    }
+}
+
+const FRAME_MAGIC: &[u8] = b"RCMAKE-CONFIGURE\0\x01";
+const FRAME_HEADER: usize = FRAME_MAGIC.len() + 5;
+const FRAME_CHECKSUM: usize = 32;
+const PATH_ENCODING: u8 = if cfg!(windows) {
+    1
+} else if cfg!(unix) {
+    2
+} else {
+    3
+};
+
+/// Failure to encode or decode a journal snapshot.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum ReplayCodecError {
+    /// Unsupported format or incorrect frame length.
+    #[error("Invalid configure journal frame.")]
+    Frame,
+    /// The payload is invalid or exceeds its byte limit.
+    #[error("Invalid or oversized configure journal payload.")]
+    Payload,
+}
+
+/// Region and first reason that required a fresh evaluation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReplayMiss {
+    /// Region that will run again.
+    pub region: Box<RegionKey>,
+    /// First reason the record could not replay.
+    pub reason: ReplayMissReason,
+}
+
 /// First reason a manifest or region could not be reused.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ReplayMiss {
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReplayMissReason {
     /// The manifest version is unsupported.
     Schema,
     /// The source directory, binary directory, or region kind differs.
     Identity,
-    /// The region entry context differs.
-    Context,
-    /// The region contains an operation that prevents replay.
-    Opaque(OpaqueReason),
+    /// The entry context fields that changed.
+    Context(Vec<&'static str>),
+    /// The first operation that prevents replay.
+    Opaque(OpaqueOperation),
     /// The record exceeds its limits or has inconsistent fields.
     InvalidRecord,
-    /// The input at this zero-based position changed or could not be read.
-    Input(usize),
-    /// The generated file at this zero-based effect position changed or went missing.
-    GeneratedFile(usize),
+    /// A checked input changed, became unavailable, or could not be read.
+    Input {
+        /// Zero-based input index.
+        index: usize,
+        /// Path, environment key, or evaluator state that failed validation.
+        description: String,
+    },
+    /// A generated file changed or went missing.
+    GeneratedFile {
+        /// Zero-based effect index.
+        index: usize,
+        /// Output file that failed validation.
+        path: std::path::PathBuf,
+    },
 }
+
+impl ReplayMiss {
+    fn new(region: &RegionKey, reason: ReplayMissReason) -> Self {
+        Self {
+            region: Box::new(region.clone()),
+            reason,
+        }
+    }
+
+    /// Action taken after a replay miss.
+    #[must_use]
+    pub const fn action(&self) -> &'static str {
+        "Evaluate the region again."
+    }
+}
+
+impl fmt::Display for ReplayMiss {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "Replay miss for {:?} in {} (source {}). ",
+            self.region.kind,
+            self.region.binary_dir.display(),
+            self.region.source_dir.display()
+        )?;
+        match &self.reason {
+            ReplayMissReason::Schema => write!(f, "The journal version differs.")?,
+            ReplayMissReason::Identity => write!(f, "The region identity differs.")?,
+            ReplayMissReason::Context(fields) => {
+                write!(f, "Entry context changed in {}.", fields.join(", "))?
+            }
+            ReplayMissReason::Opaque(operation) => {
+                write!(
+                    f,
+                    "An opaque operation prevents replay ({:?})",
+                    operation.reason
+                )?;
+                if let Some(command) = &operation.command {
+                    write!(
+                        f,
+                        " for {} at {}:{}",
+                        String::from_utf8_lossy(command),
+                        operation.file.display(),
+                        operation.line
+                    )?;
+                }
+                write!(f, ".")?;
+            }
+            ReplayMissReason::InvalidRecord => write!(f, "The journal record is invalid.")?,
+            ReplayMissReason::Input { description, .. } => {
+                write!(f, "Input validation failed for {description}.")?
+            }
+            ReplayMissReason::GeneratedFile { path, .. } => write!(
+                f,
+                "Generated file {} changed or went missing.",
+                path.display()
+            )?,
+        }
+        write!(f, " {}", self.action())
+    }
+}
+
+impl std::error::Error for ReplayMiss {}
 
 /// Failure while applying a verified effect to a staged evaluation context.
 #[derive(Debug, thiserror::Error)]
@@ -91,10 +261,31 @@ pub enum ReplayApplyError {
 /// A configure manifest whose region inputs and outputs matched.
 #[derive(Debug)]
 pub struct VerifiedConfigure<'a, M> {
-    /// Checked portable model. Restore it through the configure entry point.
+    /// Checked portable model, including final cache and property state.
     pub model: &'a M,
-    /// Checked trace and ordered effects.
-    pub region: VerifiedRegion<'a>,
+    region: VerifiedRegion<'a>,
+}
+
+impl<'a, M> VerifiedConfigure<'a, M> {
+    /// Get the checked entry inputs in observation order.
+    #[must_use]
+    pub fn inputs(&self) -> &'a [JournalInput] {
+        self.region.inputs()
+    }
+
+    /// Apply effects outside the model after restoring its final state.
+    ///
+    /// Stage variables, diagnostics, and log output until this operation succeeds.
+    /// The restored model supplies cache entries and properties.
+    pub fn replay<E>(
+        self,
+        mut apply: impl FnMut(&JournalEffect) -> Result<(), E>,
+    ) -> Result<(), E> {
+        self.region.replay(|effect| match effect {
+            JournalEffect::SetCache { .. } | JournalEffect::Property { .. } => Ok(()),
+            _ => apply(effect),
+        })
+    }
 }
 
 /// A region whose entry context, inputs, and output files matched.
@@ -236,57 +427,128 @@ pub fn verify_region<'a>(
     context: &EntryContext,
     mut lookup: impl FnMut(&StateKey) -> StateLookup,
 ) -> Result<VerifiedRegion<'a>, ReplayMiss> {
+    let miss = |reason| ReplayMiss::new(key, reason);
     if &record.key != key || !key.binary_dir.is_absolute() || !key.source_dir.is_absolute() {
-        return Err(ReplayMiss::Identity);
+        return Err(miss(ReplayMissReason::Identity));
     }
-    if &record.context != context {
-        return Err(ReplayMiss::Context);
+    let changed = [
+        ("rcmake", record.context.rcmake != context.rcmake),
+        ("policies", record.context.policies != context.policies),
+        ("diag", record.context.diag != context.diag),
+        ("log_level", record.context.log_level != context.log_level),
+        ("flags", record.context.flags != context.flags),
+    ]
+    .into_iter()
+    .filter_map(|(field, changed)| changed.then_some(field))
+    .collect::<Vec<_>>();
+    if !changed.is_empty() {
+        return Err(miss(ReplayMissReason::Context(changed)));
     }
     let (inputs, effects) = match &record.payload {
         RegionPayload::Complete { inputs, effects } => (inputs, effects),
-        RegionPayload::Opaque(reason) => return Err(ReplayMiss::Opaque(*reason)),
+        RegionPayload::Opaque(operation) => {
+            return Err(miss(ReplayMissReason::Opaque(operation.clone())));
+        }
     };
-    if inputs.len() > MAX_INPUTS || effects.len() > MAX_EFFECTS {
-        return Err(ReplayMiss::InvalidRecord);
+    if inputs.len() > MAX_INPUTS
+        || effects.len() > MAX_EFFECTS
+        || encoded_size(record, MAX_FRAME_BYTES).is_none()
+    {
+        return Err(miss(ReplayMissReason::InvalidRecord));
     }
+    let outputs: BTreeMap<_, _> = effects
+        .iter()
+        .enumerate()
+        .filter_map(|(index, effect)| {
+            if let JournalEffect::GeneratedFile { path, digest } = effect {
+                Some((path.as_path(), (index, *digest)))
+            } else {
+                None
+            }
+        })
+        .collect();
     let mut entry_keys = BTreeSet::new();
     for (index, input) in inputs.iter().enumerate() {
         if let JournalInput::State { key, .. } = input
             && !entry_keys.insert(key)
         {
-            return Err(ReplayMiss::InvalidRecord);
+            return Err(miss(ReplayMissReason::InvalidRecord));
+        }
+        // The final output check already covers content with the same digest.
+        // An earlier read of different contents is still an entry dependency.
+        if let JournalInput::Host(stamp) = input
+            && let Some((_, digest)) = stamp.path().and_then(|path| outputs.get(path))
+            && stamp.matches_written_file(*digest)
+        {
+            continue;
         }
         if !input.matches(host, &mut lookup) {
-            return Err(ReplayMiss::Input(index));
+            return Err(miss(ReplayMissReason::Input {
+                index,
+                description: input_description(input),
+            }));
         }
     }
 
-    let mut outputs = BTreeMap::<&Path, usize>::new();
     let mut written = BTreeSet::new();
-    for (index, effect) in effects.iter().enumerate() {
+    for effect in effects {
         if !effect.is_well_formed() {
-            return Err(ReplayMiss::InvalidRecord);
+            return Err(miss(ReplayMissReason::InvalidRecord));
         }
-        if let Some(key) = effect.written_state() {
-            if effect.reads_written_state() && !entry_keys.contains(&key) && !written.contains(&key)
-            {
-                return Err(ReplayMiss::InvalidRecord);
-            }
-            written.insert(key);
-        }
-        if let JournalEffect::GeneratedFile { path, .. } = effect {
-            outputs.insert(path, index);
-        }
-    }
-    for (index, effect) in effects.iter().enumerate() {
-        if let JournalEffect::GeneratedFile { path, digest } = effect
-            && outputs.get(path.as_path()) == Some(&index)
-            && file_digest(host, path).as_ref() != Ok(digest)
+        if let Some(key) = effect.implicit_read()
+            && !entry_keys.contains(&key)
+            && !written.contains(&key)
         {
-            return Err(ReplayMiss::GeneratedFile(index));
+            return Err(miss(ReplayMissReason::InvalidRecord));
+        }
+        written.extend(effect.written_states());
+    }
+    let mut final_outputs: Vec<_> = outputs.into_iter().collect();
+    final_outputs.sort_unstable_by_key(|(_, (index, _))| *index);
+    for (path, (index, digest)) in final_outputs {
+        if file_digest(host, path) != Ok(digest) {
+            return Err(miss(ReplayMissReason::GeneratedFile {
+                index,
+                path: path.to_owned(),
+            }));
         }
     }
     Ok(VerifiedRegion { inputs, effects })
+}
+
+fn input_description(input: &JournalInput) -> String {
+    let describe = |name: &[u8]| {
+        let prefix = name.get(..256).unwrap_or(name);
+        String::from_utf8_lossy(prefix).into_owned()
+    };
+    match input {
+        JournalInput::Host(JournalStamp::EnvVar { name, .. }) => {
+            format!("environment variable {}", describe(name))
+        }
+        JournalInput::Host(JournalStamp::NegativeLookup { root, relative, .. }) => {
+            root.join(relative).display().to_string()
+        }
+        JournalInput::Host(stamp) => stamp
+            .path()
+            .map_or_else(|| "host input".into(), |path| path.display().to_string()),
+        JournalInput::State { key, .. } => match key {
+            StateKey::Variable { name, .. } | StateKey::EffectiveVariable(name) => {
+                format!("variable {}", describe(name))
+            }
+            StateKey::Cache(name) => format!("cache entry {}", describe(name)),
+            StateKey::Property(key) => {
+                format!("property {} on {:?}", describe(&key.name), key.owner)
+            }
+            StateKey::Policy(id) => format!("policy CMP{id:04}"),
+            StateKey::Target(target) => format!(
+                "target {} in {}",
+                describe(&target.name),
+                target.binary_dir.display()
+            ),
+            StateKey::Command(name) => format!("command {}", describe(name)),
+            StateKey::Probe(key) => format!("probe {:02x?}", key.as_bytes()),
+        },
+    }
 }
 
 /// Verify a whole-configure manifest against the live host and entry state.
@@ -298,10 +560,10 @@ pub fn verify_configure<'a, M>(
     lookup: impl FnMut(&StateKey) -> StateLookup,
 ) -> Result<VerifiedConfigure<'a, M>, ReplayMiss> {
     if snapshot.schema != ConfigureSnapshot::<M>::SCHEMA {
-        return Err(ReplayMiss::Schema);
+        return Err(ReplayMiss::new(key, ReplayMissReason::Schema));
     }
     if key.kind != RegionKind::Configure {
-        return Err(ReplayMiss::Identity);
+        return Err(ReplayMiss::new(key, ReplayMissReason::Identity));
     }
     let region = verify_region(host, &snapshot.region, key, context, lookup)?;
     Ok(VerifiedConfigure {
@@ -311,356 +573,5 @@ pub fn verify_configure<'a, M>(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::journal::{
-        CacheValue, CommandClass, JournalDigest, JournalFileStat, JournalStamp, OutputStream,
-        PropertyKey, PropertyOrigin, RegionState, VariableScope, directory_digest, policy_digest,
-    };
-    use rcmake_diag::{Backtrace, Frame, FrameKind, PolicyStatus};
-    use rcmake_host::{FileTime, HostResult, PureHost};
-    use rcmake_model::{CacheEntry, CacheType, PropertyMap};
-    use std::path::PathBuf;
-
-    fn fixture(kind: RegionKind) -> (PureHost, RegionKey, EntryContext) {
-        let root = PathBuf::from(if cfg!(windows) { "C:/work" } else { "/work" });
-        let host = PureHost::new(root.clone(), root.join("rcmake"));
-        let key = RegionKey {
-            binary_dir: root.join("build"),
-            source_dir: root.join("src"),
-            kind,
-        };
-        let context = EntryContext {
-            policies: JournalDigest::hash(b"policies"),
-            diag: JournalDigest::hash(b"diagnostics"),
-            log_level: 0,
-            flags: JournalDigest::hash(b"flags"),
-        };
-        (host, key, context)
-    }
-
-    fn variable(scope: VariableScope, name: &[u8]) -> StateKey {
-        StateKey::Variable {
-            scope,
-            name: name.to_vec(),
-        }
-    }
-
-    fn read(state: &mut RegionState, key: StateKey, bytes: Option<&[u8]>) {
-        state.record_input(JournalInput::State {
-            key,
-            value: bytes.map(JournalDigest::hash),
-        });
-    }
-
-    fn unavailable(_: &StateKey) -> StateLookup {
-        StateLookup::Unavailable
-    }
-
-    #[test]
-    fn only_first_read_before_write_constrains_replay() -> Result<(), ReplayMiss> {
-        let (host, key, context) = fixture(RegionKind::Subdirectory);
-        let mut state = RegionState::default();
-        let parent = variable(VariableScope::Parent, b"X");
-        let current = variable(VariableScope::Current, b"X");
-        read(&mut state, parent.clone(), Some(b"old"));
-        read(&mut state, parent.clone(), Some(b"old"));
-        state.record_effect(JournalEffect::SetVar {
-            scope: VariableScope::Parent,
-            name: b"X".to_vec(),
-            value: Some(b"write".to_vec()),
-        });
-        read(&mut state, parent.clone(), Some(b"write"));
-        state.record_effect(JournalEffect::SetVar {
-            scope: VariableScope::Current,
-            name: b"X".to_vec(),
-            value: None,
-        });
-        read(&mut state, current, None);
-        let record = state.finish(key.clone(), context.clone());
-        let verified = verify_region(&host, &record, &key, &context, |seen| {
-            assert_eq!(seen, &parent);
-            StateLookup::Observed(Some(JournalDigest::hash(b"old")))
-        })?;
-        assert_eq!(verified.inputs().len(), 1);
-        let result = verify_region(&host, &record, &key, &context, |_| {
-            StateLookup::Observed(None)
-        });
-        assert!(matches!(result, Err(ReplayMiss::Input(0))));
-        Ok(())
-    }
-
-    #[test]
-    fn absent_cache_input_and_empty_cache_value_are_distinct() {
-        let (host, key, context) = fixture(RegionKind::Configure);
-        let mut state = RegionState::default();
-        read(&mut state, StateKey::Cache(b"X".to_vec()), None);
-        let record = state.finish(key.clone(), context.clone());
-        let empty = CacheValue::from(&CacheEntry {
-            value: "".into(),
-            ty: CacheType::String,
-            help: "help".into(),
-            advanced: false,
-            props: PropertyMap::default(),
-        });
-        assert!(
-            verify_region(&host, &record, &key, &context, |_| StateLookup::Observed(
-                None
-            ))
-            .is_ok()
-        );
-        assert!(matches!(
-            verify_region(&host, &record, &key, &context, unavailable),
-            Err(ReplayMiss::Input(0))
-        ));
-        assert!(matches!(
-            verify_region(&host, &record, &key, &context, |_| StateLookup::Observed(
-                Some(empty.digest())
-            )),
-            Err(ReplayMiss::Input(0))
-        ));
-    }
-
-    #[test]
-    fn cache_digest_and_restore_include_metadata() {
-        let mut props = PropertyMap::default();
-        props.set(b"STRINGS".as_slice().into(), b"\xff;two".as_slice().into());
-        let mut entry = CacheEntry {
-            value: "one".into(),
-            ty: CacheType::String,
-            help: "Help text".into(),
-            advanced: true,
-            props,
-        };
-        let saved = CacheValue::from(&entry);
-        assert_eq!(saved.to_entry().as_ref(), Some(&entry));
-        entry.advanced = false;
-        assert_ne!(saved.digest(), CacheValue::from(&entry).digest());
-        entry.advanced = true;
-        entry.props.unset(b"STRINGS");
-        assert_ne!(saved.digest(), CacheValue::from(&entry).digest());
-    }
-
-    #[test]
-    fn append_to_an_existing_property_requires_an_input() {
-        let (host, key, context) = fixture(RegionKind::Subdirectory);
-        let backtrace = Backtrace::default().push(Frame {
-            file: b"\xff/CMakeLists.txt".as_slice().into(),
-            line: 3,
-            name: Some(b"set_property".as_slice().into()),
-            kind: FrameKind::Command,
-        });
-        let origin = PropertyOrigin::new(key.binary_dir.clone(), &backtrace);
-        assert_eq!(origin.backtrace().top(), backtrace.top());
-        let property = PropertyKey {
-            owner: PropertyOwner::Global,
-            name: b"LIBS".to_vec(),
-        };
-        let append = JournalEffect::Property {
-            key: property.clone(),
-            edit: PropertyEdit::AppendList(b"next".to_vec()),
-            origin,
-        };
-
-        let mut missing = RegionState::default();
-        missing.record_effect(append.clone());
-        assert!(matches!(
-            missing,
-            RegionState::Opaque(OpaqueReason::ExternalMutation)
-        ));
-
-        let input = StateKey::Property(property);
-        let mut tracked = RegionState::default();
-        read(&mut tracked, input.clone(), Some(b"first"));
-        tracked.record_effect(append);
-        read(&mut tracked, input.clone(), Some(b"first;next"));
-        let record = tracked.finish(key.clone(), context.clone());
-        let verify = |value: &[u8]| {
-            verify_region(&host, &record, &key, &context, |seen| {
-                assert_eq!(seen, &input);
-                StateLookup::Observed(Some(JournalDigest::hash(value)))
-            })
-        };
-        assert!(verify(b"first").is_ok());
-        assert!(matches!(verify(b"other"), Err(ReplayMiss::Input(0))));
-    }
-
-    #[test]
-    fn policy_input_and_region_context_are_checked() {
-        let (host, key, context) = fixture(RegionKind::Subdirectory);
-        let mut state = RegionState::default();
-        state.record_input(JournalInput::State {
-            key: StateKey::Policy(77),
-            value: Some(policy_digest(PolicyStatus::New)),
-        });
-        let record = state.finish(key.clone(), context.clone());
-        let read_new = |key: &StateKey| {
-            assert_eq!(key, &StateKey::Policy(77));
-            StateLookup::Observed(Some(policy_digest(PolicyStatus::New)))
-        };
-        assert!(verify_region(&host, &record, &key, &context, read_new).is_ok());
-        assert!(matches!(
-            verify_region(&host, &record, &key, &context, |_| {
-                StateLookup::Observed(Some(policy_digest(PolicyStatus::Old)))
-            }),
-            Err(ReplayMiss::Input(0))
-        ));
-        let mut changed = context;
-        changed.log_level += 1;
-        assert!(matches!(
-            verify_region(&host, &record, &key, &changed, unavailable),
-            Err(ReplayMiss::Context)
-        ));
-    }
-
-    #[test]
-    fn unknown_command_makes_the_region_opaque() {
-        let (host, key, context) = fixture(RegionKind::Configure);
-        let mut state = RegionState::default();
-        state.record_command(CommandClass::Tracked);
-        state.record_command(CommandClass::default());
-        state.record_command(CommandClass::Opaque(OpaqueReason::ExecuteProcess));
-        let record = state.finish(key.clone(), context.clone());
-        assert!(matches!(
-            verify_region(&host, &record, &key, &context, unavailable),
-            Err(ReplayMiss::Opaque(OpaqueReason::UnclassifiedCommand))
-        ));
-        assert!(matches!(
-            ConfigureSnapshot::new(record, ()),
-            Err(ReplayMiss::Opaque(OpaqueReason::UnclassifiedCommand))
-        ));
-    }
-
-    #[test]
-    fn changed_shared_value_without_a_tracked_write_makes_region_opaque() {
-        let (_, key, context) = fixture(RegionKind::Subdirectory);
-        let mut state = RegionState::default();
-        let cache = StateKey::Cache(b"X".to_vec());
-        read(&mut state, cache.clone(), Some(b"old"));
-        read(&mut state, cache, Some(b"new"));
-        let record = state.finish(key, context);
-        assert!(matches!(
-            record.payload,
-            RegionPayload::Opaque(OpaqueReason::ExternalMutation)
-        ));
-    }
-
-    #[test]
-    fn trace_rechecks_file_directory_missing_path_and_environment() -> HostResult<()> {
-        let (host, key, context) = fixture(RegionKind::Configure);
-        let file = key.source_dir.join("CMakeLists.txt");
-        let missing = key.binary_dir.join("candidate");
-        host.seed_file(&file, b"original")?;
-        host.env_set(b"OPTION", Some(b"initial"));
-        let mut state = RegionState::default();
-        for stamp in [
-            JournalStamp::FileHash {
-                path: file.clone(),
-                digest: JournalDigest::hash(b"original"),
-            },
-            JournalStamp::DirEntries {
-                path: key.source_dir.clone(),
-                digest: directory_digest(&host, &key.source_dir)?,
-            },
-            JournalStamp::Missing {
-                path: missing.clone(),
-            },
-            JournalStamp::EnvVar {
-                name: b"OPTION".to_vec(),
-                digest: Some(JournalDigest::hash(b"initial")),
-            },
-        ] {
-            state.record_input(JournalInput::Host(stamp));
-        }
-        let record = state.finish(key.clone(), context.clone());
-        let verify = || verify_region(&host, &record, &key, &context, unavailable);
-        assert!(verify().is_ok());
-        host.env_set(b"OPTION", None);
-        assert!(matches!(verify(), Err(ReplayMiss::Input(3))));
-        host.seed_file(&missing, b"new")?;
-        assert!(matches!(verify(), Err(ReplayMiss::Input(2))));
-        host.seed_file(&key.source_dir.join("sibling.cmake"), b"new")?;
-        assert!(matches!(verify(), Err(ReplayMiss::Input(1))));
-        host.seed_file(&file, b"changed!")?;
-        assert!(matches!(verify(), Err(ReplayMiss::Input(0))));
-        Ok(())
-    }
-
-    #[test]
-    fn file_stat_trace_accepts_a_touch_and_detects_changed_contents() -> HostResult<()> {
-        let (host, key, context) = fixture(RegionKind::Configure);
-        let file = key.source_dir.join("input.cmake");
-        host.seed_file(&file, b"initial")?;
-        let mut state = RegionState::default();
-        state.record_input(JournalInput::Host(JournalStamp::FileStat {
-            path: file.clone(),
-            stat: JournalFileStat::read(&host, &file)?,
-            digest: Some(JournalDigest::hash(b"initial")),
-        }));
-        let record = state.finish(key.clone(), context.clone());
-        let verify = || verify_region(&host, &record, &key, &context, unavailable);
-        assert!(verify().is_ok());
-        let timestamp = FileTime {
-            secs: 123,
-            nanos: 0,
-        };
-        host.set_times(&file, None, Some(timestamp))?;
-        assert!(verify().is_ok());
-        host.seed_file(&file, b"new content")?;
-        assert!(matches!(verify(), Err(ReplayMiss::Input(0))));
-        Ok(())
-    }
-
-    #[test]
-    fn configure_checks_final_generated_contents() -> HostResult<()> {
-        fn requires_serde<T: Serialize + serde::de::DeserializeOwned>() {}
-        requires_serde::<ConfigureSnapshot<Vec<u8>>>();
-        let (host, key, context) = fixture(RegionKind::Configure);
-        let generated = key.binary_dir.join("generated.h");
-        host.seed_file(&generated, b"finish")?;
-        let mut state = RegionState::default();
-        state.record_effect(JournalEffect::GeneratedFile {
-            path: generated.clone(),
-            digest: JournalDigest::hash(b"start"),
-        });
-        state.record_effect(JournalEffect::Diagnostic {
-            stream: OutputStream::Stdout,
-            bytes: vec![0xff],
-        });
-        state.record_effect(JournalEffect::GeneratedFile {
-            path: generated.clone(),
-            digest: JournalDigest::hash(b"finish"),
-        });
-        let snapshot =
-            ConfigureSnapshot::new(state.finish(key.clone(), context.clone()), vec![0xff_u8]);
-        assert!(snapshot.is_ok());
-        let Ok(snapshot) = snapshot else {
-            return Ok(());
-        };
-        let checked = verify_configure(&host, &snapshot, &key, &context, unavailable);
-        assert!(checked.is_ok());
-        if let Ok(checked) = checked {
-            assert_eq!(checked.model, &[0xff]);
-            let mut seen = Vec::new();
-            checked.region.replay(|effect| {
-                seen.push(
-                    matches!(effect, JournalEffect::Diagnostic { bytes, .. } if bytes == &[0xff]),
-                );
-                Ok::<(), rcmake_host::HostError>(())
-            })?;
-            assert_eq!(seen, [false, true, false]);
-        }
-        let mut future_snapshot = snapshot.clone();
-        future_snapshot.schema = "configure.v2".into();
-        assert!(matches!(
-            verify_configure(&host, &future_snapshot, &key, &context, unavailable),
-            Err(ReplayMiss::Schema)
-        ));
-        host.remove_file(&generated)?;
-        assert!(matches!(
-            verify_configure(&host, &snapshot, &key, &context, unavailable),
-            Err(ReplayMiss::GeneratedFile(2))
-        ));
-        Ok(())
-    }
-}
+#[path = "replay_tests.rs"]
+mod tests;

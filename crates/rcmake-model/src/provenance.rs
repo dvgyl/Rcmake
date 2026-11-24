@@ -80,6 +80,59 @@ pub enum PropOp {
     Unset,
 }
 
+const PREVIEW_BYTES: usize = 256;
+const MAX_BYTES: usize = 8 * 1024 * 1024;
+const MAX_EVENTS: usize = 32_768;
+const HISTORY_BYTES: usize = 192;
+const EVENT_BYTES: usize = 2 * (std::mem::size_of::<PropEvent>() + std::mem::size_of::<usize>());
+
+/// Bounded preview of one property value.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PropValuePreview {
+    prefix: BString,
+    len: usize,
+    hash: u64,
+}
+
+impl PropValuePreview {
+    /// Capture up to 256 bytes and hash the full value.
+    #[must_use]
+    pub fn new(value: &[u8]) -> Self {
+        let hash = value.iter().fold(0xcbf2_9ce4_8422_2325u64, |hash, byte| {
+            (hash ^ u64::from(*byte)).wrapping_mul(0x0100_0000_01b3)
+        });
+        Self {
+            prefix: value.get(..PREVIEW_BYTES).unwrap_or(value).into(),
+            len: value.len(),
+            hash,
+        }
+    }
+
+    /// First bytes of the value.
+    #[must_use]
+    pub fn prefix(&self) -> &[u8] {
+        &self.prefix
+    }
+
+    /// Length of the full value in bytes.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Whether the full value is empty.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// FNV-1a hash of the full value.
+    #[must_use]
+    pub fn hash(&self) -> u64 {
+        self.hash
+    }
+}
+
 /// A recorded property write.
 #[derive(Clone, Debug)]
 pub struct PropEvent {
@@ -87,17 +140,48 @@ pub struct PropEvent {
     pub seq: u64,
     /// Operation that changed the property.
     pub op: PropOp,
+    /// Value before the write, or absence.
+    pub old_value: Option<PropValuePreview>,
+    /// Value after the write, or absence.
+    pub new_value: Option<PropValuePreview>,
     /// Call stack at the write.
     pub origin: Backtrace,
+}
+
+impl PropEvent {
+    /// Capture a successful write and its old and new values.
+    #[must_use]
+    pub fn new(
+        seq: u64,
+        op: PropOp,
+        old: Option<&[u8]>,
+        new: Option<&[u8]>,
+        origin: &Backtrace,
+    ) -> Self {
+        Self {
+            seq,
+            op,
+            old_value: old.map(PropValuePreview::new),
+            new_value: new.map(PropValuePreview::new),
+            origin: origin.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct History {
+    events: Vec<PropEvent>,
+    costs: Vec<usize>,
+    dropped: u32,
 }
 
 /// Recent property writes in one evaluation session.
 #[derive(Clone, Debug, Default)]
 pub struct PropLedger {
-    /// Histories in the order in which their first events arrived.
-    pub(crate) events: IndexMap<(PropScope, BString), Vec<PropEvent>>,
-    /// Whether the ledger discarded an event when it reached a limit.
-    pub(crate) incomplete: bool,
+    events: IndexMap<(PropScope, BString), History>,
+    incomplete: bool,
+    retained: usize,
+    bytes: usize,
 }
 
 impl PropLedger {
@@ -106,12 +190,83 @@ impl PropLedger {
 
     /// Record a successful property write. Call this method in execution order.
     pub fn record(&mut self, scope: &PropScope, name: &[u8], event: PropEvent) {
-        let history = self.events.entry((scope.clone(), name.into())).or_default();
-        if history.len() == Self::PER_PROPERTY_CAP {
-            history.remove(0);
-            self.incomplete = true;
+        let key = PropertyKey(scope, name);
+        if !self.events.contains_key(&key) {
+            let owner_bytes = match scope {
+                PropScope::Source { path, .. } => path.len(),
+                PropScope::Test { name, .. } | PropScope::Cache(name) => name.len(),
+                PropScope::Install { file } => file.len(),
+                _ => 0,
+            };
+            let key_bytes = HISTORY_BYTES
+                .saturating_add(name.len())
+                .saturating_add(owner_bytes);
+            if self.events.len() >= MAX_EVENTS || self.bytes.saturating_add(key_bytes) > MAX_BYTES {
+                self.incomplete = true;
+                return;
+            }
+            self.bytes += key_bytes;
+            self.events.insert(
+                (scope.clone(), name.into()),
+                History {
+                    events: Vec::with_capacity(1),
+                    costs: Vec::with_capacity(1),
+                    dropped: 0,
+                },
+            );
         }
-        history.push(event);
+        let Some(history) = self.events.get_mut(&key) else {
+            return;
+        };
+        let event_bytes = event
+            .origin
+            .frames()
+            .fold(EVENT_BYTES, |bytes, frame| {
+                bytes
+                    .saturating_add(96)
+                    .saturating_add(frame.file.len())
+                    .saturating_add(frame.name.as_ref().map_or(0, |name| name.len()))
+            })
+            .saturating_add(
+                event
+                    .old_value
+                    .as_ref()
+                    .map_or(0, |value| value.prefix.len()),
+            )
+            .saturating_add(
+                event
+                    .new_value
+                    .as_ref()
+                    .map_or(0, |value| value.prefix.len()),
+            );
+        if event_bytes > MAX_BYTES {
+            self.incomplete = true;
+            history.dropped = history.dropped.saturating_add(1);
+            return;
+        }
+        while history.events.len() >= Self::PER_PROPERTY_CAP
+            || self.retained >= MAX_EVENTS
+            || self.bytes.saturating_add(event_bytes) > MAX_BYTES
+        {
+            self.incomplete = true;
+            history.dropped = history.dropped.saturating_add(1);
+            if history.events.is_empty() {
+                history.events.shrink_to_fit();
+                history.costs.shrink_to_fit();
+                return;
+            }
+            history.events.remove(0);
+            self.bytes -= history.costs.remove(0);
+            self.retained -= 1;
+        }
+        if history.events.capacity() > 2 * (history.events.len() + 1) {
+            history.events.shrink_to_fit();
+            history.costs.shrink_to_fit();
+        }
+        self.retained += 1;
+        self.bytes += event_bytes;
+        history.events.push(event);
+        history.costs.push(event_bytes);
     }
 
     /// Get the retained writes to a property, oldest first.
@@ -119,14 +274,22 @@ impl PropLedger {
     pub fn history(&self, scope: &PropScope, name: &[u8]) -> &[PropEvent] {
         self.events
             .get(&PropertyKey(scope, name))
-            .map_or(&[], Vec::as_slice)
+            .map_or(&[], |history| history.events.as_slice())
+    }
+
+    /// Get the number of discarded writes for this recorded property.
+    #[must_use]
+    pub fn dropped(&self, scope: &PropScope, name: &[u8]) -> u32 {
+        self.events
+            .get(&PropertyKey(scope, name))
+            .map_or(0, |history| history.dropped)
     }
 
     /// Iterate over the histories in the order of their first writes.
     pub fn iter(&self) -> impl ExactSizeIterator<Item = (&PropScope, &BString, &[PropEvent])> {
         self.events
             .iter()
-            .map(|((scope, name), events)| (scope, name, events.as_slice()))
+            .map(|((scope, name), history)| (scope, name, history.events.as_slice()))
     }
 
     /// Return whether a history reached its limit and discarded an event.
@@ -191,11 +354,7 @@ mod tests {
     }
 
     fn event(seq: u64, op: PropOp) -> PropEvent {
-        PropEvent {
-            seq,
-            op,
-            origin: Backtrace::default(),
-        }
+        PropEvent::new(seq, op, Some(b"old"), Some(b"new"), &Backtrace::default())
     }
 
     #[test]
@@ -215,6 +374,7 @@ mod tests {
 
         let history = ledger.history(&global, name);
         assert_eq!(history.len(), PropLedger::PER_PROPERTY_CAP);
+        assert_eq!(ledger.dropped(&global, name), 1);
         assert_eq!(history.first().map(|event| event.seq), Some(2));
         assert_eq!(history.last().map(|event| event.op), Some(PropOp::Unset));
         assert_eq!(

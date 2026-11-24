@@ -76,13 +76,13 @@ pub struct CancelToken(Arc<AtomicBool>);
 impl CancelToken {
     /// Request cancellation on this token and all its clones.
     pub fn cancel(&self) {
-        self.0.store(true, Ordering::Relaxed);
+        self.0.store(true, Ordering::Release);
     }
 
     /// Return whether cancellation was requested.
     #[must_use]
     pub fn is_cancelled(&self) -> bool {
-        self.0.load(Ordering::Relaxed)
+        self.0.load(Ordering::Acquire)
     }
 }
 

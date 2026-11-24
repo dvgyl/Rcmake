@@ -2,21 +2,28 @@
 
 #![forbid(unsafe_code)]
 
+use std::fmt;
+use std::io::ErrorKind;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
-use rcmake_host::{CopyOptions, Host, HostError, HostResult, WriteMode, path};
-use rcmake_store::{Domain, Entry, Store, StoreMode};
+use rcmake_eval::ProbeCacheMode;
+use rcmake_host::{FileKind, Follow, Host, HostError, HostResult, ReadRange, WriteMode, path};
+use rcmake_store::{Digest, Domain, Entry, InputStamp, Store, StoreConfig, StoreMode};
 use serde::{Deserialize, Serialize};
 
-use super::journal::{Journal, JournalChecks};
+use super::journal::{ImpureReason, Journal, JournalChecks};
 use super::plan::{
     ArtifactRef, ProbeDiagnostic, ProbeEligibility, ProbeOutcome, ProbeRecipe, ReuseScope,
-    compute_probe_key,
+    compute_probe_key, environment_fingerprint,
 };
 use super::template::{Templated, round_trip_verify};
 
 const MAX_ARTIFACT_BYTES: usize = 4 * 1024 * 1024;
+const MAX_ENTRY_BYTES: usize = 16 * 1024 * 1024;
+const MAX_DIAGNOSTICS: usize = 16_384;
+static NEXT_ARTIFACT: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Deserialize, Serialize)]
 struct CachedProbe {
@@ -53,16 +60,35 @@ pub(crate) struct Artifact {
 impl Artifact {
     /// Restore the artifact to the same relative path in private scratch space.
     pub(crate) fn materialize(&self, host: &dyn Host, scratch: &Path) -> HostResult<PathBuf> {
-        if !scratch.is_absolute() || !is_relative_artifact(&self.relative_path) {
+        if !scratch.is_absolute()
+            || scratch
+                .components()
+                .any(|part| part == Component::ParentDir)
+            || !is_relative_artifact(&self.relative_path)
+        {
             return Err(HostError::unsupported("Invalid scratch artifact path."));
         }
         let file = scratch.join(&self.relative_path);
-        if let Some(parent) = file.parent() {
-            host.create_dir_all(parent)?;
+        let mut parent = scratch.to_owned();
+        if host.metadata(scratch, Follow::No)?.kind != FileKind::Dir {
+            return Err(HostError::unsupported(
+                "Expected a private scratch directory.",
+            ));
         }
-        host.write(&file, &self.bytes, WriteMode::CreateNew)?;
-        if let Err(error) = host.set_permissions(&file, self.mode) {
-            let _ = host.remove_file(&file);
+        if let Some(relative_parent) = self.relative_path.parent() {
+            for part in relative_parent.components() {
+                parent.push(part.as_os_str());
+                ensure_directory(host, &parent)?;
+            }
+        }
+        let id = NEXT_ARTIFACT.fetch_add(1, Ordering::Relaxed);
+        let staged = parent.join(format!(".rcmake-artifact-{}-{id:x}", host.system().pid));
+        host.write(&staged, &self.bytes, WriteMode::CreateNew)?;
+        if let Err(error) = host
+            .set_permissions(&staged, self.mode)
+            .and_then(|()| host.rename(&staged, &file))
+        {
+            let _ = host.remove_file(&staged);
             return Err(error);
         }
         Ok(file)
@@ -76,21 +102,12 @@ impl Artifact {
         destination: &Path,
     ) -> HostResult<()> {
         let file = self.materialize(host, scratch)?;
-        if let Some(parent) = destination.parent() {
-            host.create_dir_all(parent)?;
-        }
-        host.copy_file(
-            &file,
-            destination,
-            CopyOptions {
-                preserve_permissions: true,
-                preserve_mtime: false,
-            },
-        )
+        super::copy_artifact(host, Some(&file), destination)
     }
 }
 
-fn is_relative_artifact(path: &Path) -> bool {
+/// Return whether the path can name a file inside private scratch space.
+pub(crate) fn is_relative_artifact(path: &Path) -> bool {
     !path.as_os_str().is_empty()
         && path
             .components()
@@ -110,6 +127,85 @@ pub(crate) struct ProbeCacheStats {
     pub(crate) impure: u64,
     /// Cache hits that differed from a fresh run in verify mode.
     pub(crate) verify_mismatches: u64,
+    /// Number of publication errors from the store.
+    pub(crate) store_errors: u64,
+}
+
+/// Reason the cache skipped a publication attempt.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SkipReason {
+    /// The cache policy or the recipe disallowed publication.
+    Ineligible,
+    /// At least one input changed or an effect could not be verified.
+    Inputs(Option<ImpureReason>),
+    /// The result exceeded the storage limit or could not be relocated safely.
+    Outcome,
+    /// Another store operation prevented publication.
+    Busy,
+    /// The job was cancelled before publication.
+    Cancelled,
+}
+
+/// Result of an optional cache write.
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) enum ProbePublishOutcome {
+    /// The store has a valid result for this key.
+    Published,
+    /// The cache skipped the write.
+    Skipped(SkipReason),
+    /// An error occurred in the store. The probe result is still usable.
+    StoreError(String),
+}
+
+/// Site and caller-visible results for a comparison in verify mode.
+pub(crate) struct VerifyContext<'a> {
+    /// CMake variable that receives the result.
+    pub(crate) variable: &'a [u8],
+    /// Call site file.
+    pub(crate) file: &'a Path,
+    /// One-based call site line.
+    pub(crate) line: u32,
+    /// Full probe key.
+    pub(crate) key: Digest,
+    /// Copy status from materializing the cached artifact, without writing the destination.
+    pub(crate) cached_copy: Option<&'a [u8]>,
+    /// Copy status from the single copy at the original call site.
+    pub(crate) fresh_copy: Option<&'a [u8]>,
+}
+
+/// Fields that differ from a fresh result, with bounded diagnostic details.
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct VerifyMismatchReport {
+    /// CMake variable that receives the result.
+    pub(crate) variable: String,
+    /// Call site file.
+    pub(crate) file: PathBuf,
+    /// One-based call site line.
+    pub(crate) line: u32,
+    /// Full probe key.
+    pub(crate) key: Digest,
+    /// Details for each field that changed.
+    pub(crate) differences: Vec<String>,
+}
+
+impl fmt::Display for VerifyMismatchReport {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(
+            f,
+            "Probe {} at {}:{} differs from cache entry {}.",
+            self.variable,
+            self.file.display(),
+            self.line,
+            self.key.to_hex()
+        )?;
+        for difference in &self.differences {
+            writeln!(f, "  {difference}")?;
+        }
+        write!(
+            f,
+            "Rcmake used the fresh result. Use --no-probe-cache to bypass the cache. If you report this issue, include the probe key, Rcmake version, generator, and toolchain."
+        )
+    }
 }
 
 /// Compile probe cache policy and counters. The store owns atomic publication.
@@ -120,9 +216,20 @@ pub(crate) struct ProbeCache {
     bypassed: AtomicU64,
     impure: AtomicU64,
     verify_mismatches: AtomicU64,
+    store_errors: AtomicU64,
 }
 
 impl ProbeCache {
+    /// Apply the evaluator's probe policy to store access.
+    pub(crate) fn for_session(mode: ProbeCacheMode) -> Self {
+        Self::new(match mode {
+            ProbeCacheMode::Off => StoreMode::Off,
+            ProbeCacheMode::ReadWrite => StoreMode::ReadWrite,
+            ProbeCacheMode::ReadOnly => StoreMode::ReadOnly,
+            ProbeCacheMode::Verify => StoreMode::Verify,
+        })
+    }
+
     /// Use the same mode as the backing store.
     pub(crate) fn new(mode: StoreMode) -> Self {
         Self {
@@ -132,6 +239,7 @@ impl ProbeCache {
             bypassed: AtomicU64::default(),
             impure: AtomicU64::default(),
             verify_mismatches: AtomicU64::default(),
+            store_errors: AtomicU64::default(),
         }
     }
 
@@ -142,19 +250,20 @@ impl ProbeCache {
 
     /// Look up a reusable result. Store errors and invalid data give a miss.
     ///
-    /// The caller keeps the input snapshot stable through use. In verify mode,
+    /// Use the probe's filesystem view and a host that reads current inputs.
+    /// Keep the verified snapshot stable through use. In verify mode,
     /// the caller executes the probe and applies the fresh result.
     pub(crate) fn lookup(
         &self,
         host: &dyn Host,
-        store: &Store<'_>,
+        config: &StoreConfig,
         recipe: &ProbeRecipe,
     ) -> Option<ObservedOutcome> {
         if self.mode == StoreMode::Off || recipe.eligibility != ProbeEligibility::Eligible {
             self.bypassed.fetch_add(1, Ordering::Relaxed);
             return None;
         }
-        let outcome = read_outcome(host, store, recipe);
+        let outcome = self.lookup_with_mode(host, config, recipe, self.mode);
         let counter = if outcome.is_some() {
             &self.hits
         } else {
@@ -164,57 +273,291 @@ impl ProbeCache {
         outcome
     }
 
-    /// In read-write mode, publish a result with validated inputs and exact output.
+    /// Look up an outcome without changing the cache counters or its access time.
+    pub(crate) fn lookup_uncounted(
+        &self,
+        host: &dyn Host,
+        config: &StoreConfig,
+        recipe: &ProbeRecipe,
+    ) -> Option<ObservedOutcome> {
+        let mode = if self.mode == StoreMode::Verify {
+            StoreMode::Verify
+        } else {
+            StoreMode::ReadOnly
+        };
+        self.lookup_with_mode(host, config, recipe, mode)
+    }
+
+    fn lookup_with_mode(
+        &self,
+        host: &dyn Host,
+        config: &StoreConfig,
+        recipe: &ProbeRecipe,
+        mode: StoreMode,
+    ) -> Option<ObservedOutcome> {
+        if self.mode == StoreMode::Off
+            || config.mode == StoreMode::Off
+            || recipe.eligibility != ProbeEligibility::Eligible
+            || (recipe.try_run && recipe.scope != ReuseScope::ExactBindings)
+            || recipe.environment != environment_fingerprint(&host.env_all())
+        {
+            return None;
+        }
+        let mut config = config.clone();
+        config.mode = match (config.mode, mode) {
+            (StoreMode::ReadWrite, mode) | (_, mode @ StoreMode::Verify) => mode,
+            (mode, _) => mode,
+        };
+        let store = Store::new(host, config).ok()?;
+        read_outcome(host, &store, recipe)
+    }
+
+    /// Publish a verified foreground result. Treat cache failures as optional.
     pub(crate) fn publish(
         &self,
         host: &dyn Host,
-        store: &Store<'_>,
+        config: &StoreConfig,
         recipe: &ProbeRecipe,
         outcome: &ObservedOutcome,
         journal: &Journal,
-    ) -> HostResult<()> {
-        if !self.writable() || recipe.eligibility != ProbeEligibility::Eligible {
-            return Ok(());
+    ) -> ProbePublishOutcome {
+        let status = self.publish_uncounted(host, config, recipe, outcome, journal, || false);
+        match &status {
+            ProbePublishOutcome::Skipped(SkipReason::Inputs(_)) => {
+                self.impure.fetch_add(1, Ordering::Relaxed);
+            }
+            ProbePublishOutcome::Skipped(SkipReason::Outcome) => {
+                self.bypassed.fetch_add(1, Ordering::Relaxed);
+            }
+            ProbePublishOutcome::StoreError(_) => {
+                self.store_errors.fetch_add(1, Ordering::Relaxed);
+            }
+            _ => {}
         }
-        let Some((trace, checks)) = journal.verified_inputs(host) else {
-            self.impure.fetch_add(1, Ordering::Relaxed);
-            return Ok(());
-        };
-        let Some(outcome) = template_outcome(store, recipe, outcome)? else {
-            self.bypassed.fetch_add(1, Ordering::Relaxed);
-            return Ok(());
-        };
-        let blobs = outcome
-            .artifact
-            .iter()
-            .map(|artifact| artifact.blob)
-            .collect();
-        store.put_entry(
-            Domain::ProbeV1,
-            compute_probe_key(recipe),
-            &Entry {
-                trace: trace.clone(),
-                blobs,
-                payload: CachedProbe {
-                    outcome,
-                    checks: checks.clone(),
-                },
-            },
-        )
+        status
     }
 
-    /// Compare a hit with a fresh result when the store is in verify mode.
+    /// Publish for a worker without changing foreground counters.
+    pub(crate) fn publish_uncounted(
+        &self,
+        host: &dyn Host,
+        config: &StoreConfig,
+        recipe: &ProbeRecipe,
+        outcome: &ObservedOutcome,
+        journal: &Journal,
+        cancelled: impl Fn() -> bool,
+    ) -> ProbePublishOutcome {
+        let publish = || -> HostResult<ProbePublishOutcome> {
+            if !self.writable()
+                || config.mode != StoreMode::ReadWrite
+                || recipe.eligibility != ProbeEligibility::Eligible
+                || (recipe.try_run && recipe.scope != ReuseScope::ExactBindings)
+            {
+                return Ok(ProbePublishOutcome::Skipped(SkipReason::Ineligible));
+            }
+            let inputs_changed =
+                || ProbePublishOutcome::Skipped(SkipReason::Inputs(journal.impure()));
+            let Some((trace, checks)) = journal.verified_inputs(host) else {
+                return Ok(inputs_changed());
+            };
+            if cancelled() {
+                return Ok(ProbePublishOutcome::Skipped(SkipReason::Cancelled));
+            }
+            if recipe.environment != environment_fingerprint(&host.env_all()) {
+                return Ok(inputs_changed());
+            }
+            let bindings = recipe.bindings.clone().with_canonical(host);
+            let Some(payload) = template_outcome(recipe, &bindings, outcome) else {
+                return Ok(ProbePublishOutcome::Skipped(SkipReason::Outcome));
+            };
+            if !entry_fits(trace, checks, &payload) {
+                return Ok(ProbePublishOutcome::Skipped(SkipReason::Outcome));
+            }
+            let key = compute_probe_key(recipe);
+            let store = Store::new(host, config.clone())?;
+            let markers = config.root.join("probe-generations");
+            ensure_directory(host, &config.root)?;
+            ensure_directory(host, &markers)?;
+            let [shard, ..] = key.as_bytes();
+            let marker = markers.join(format!("{shard:02x}"));
+            // A bounded generation table lets Store replace a stale result
+            // without using Store's private file layout. A changed supplemental
+            // input invalidates this shard's entries until the next publication.
+            let lock = marker.with_extension("lock");
+            check_regular_or_missing(host, &lock)?;
+            let _guard = match host.lock_file(&lock, Some(Duration::ZERO)) {
+                Ok(guard) => guard,
+                Err(error) if error.kind == ErrorKind::TimedOut => {
+                    return Ok(ProbePublishOutcome::Skipped(SkipReason::Busy));
+                }
+                Err(error) => return Err(error),
+            };
+            let existing = store.get_entry::<CachedProbe>(Domain::ProbeV1, key)?;
+            if let Some(entry) = &existing
+                && entry.payload.checks.verify(host)
+                && entry
+                    .blobs
+                    .iter()
+                    .all(|digest| store.get_blob(*digest).is_ok_and(|blob| blob.is_some()))
+            {
+                return Ok(ProbePublishOutcome::Published);
+            }
+            check_regular_or_missing(host, &marker)?;
+            let mut generation = match host.read(&marker, ReadRange::All { limit: 32 }) {
+                Ok(bytes) => bytes,
+                Err(error) if error.kind == ErrorKind::NotFound => Vec::new(),
+                Err(error) => return Err(error),
+            };
+            let blobs = match &outcome.artifact {
+                Some(artifact) => vec![store.put_blob(&artifact.bytes)?],
+                None => Vec::new(),
+            };
+            if cancelled() {
+                return Ok(ProbePublishOutcome::Skipped(SkipReason::Cancelled));
+            }
+            if existing.is_some() || generation.len() != 32 {
+                generation = Digest::hash(&generation).as_bytes().to_vec();
+                let id = NEXT_ARTIFACT.fetch_add(1, Ordering::Relaxed);
+                let staged = markers.join(format!(".generation-{}-{id:x}", host.system().pid));
+                host.write(&staged, &generation, WriteMode::CreateNew)?;
+                if let Err(error) = host.rename(&staged, &marker) {
+                    let _ = host.remove_file(&staged);
+                    return Err(error);
+                }
+            }
+            let mut trace = trace.clone();
+            trace.push(InputStamp::FileHash {
+                path: marker,
+                digest: Digest::hash(&generation),
+            });
+            if !entry_fits(&trace, checks, &payload) {
+                return Ok(ProbePublishOutcome::Skipped(SkipReason::Outcome));
+            }
+            let entry = Entry {
+                trace,
+                blobs,
+                payload: CachedProbe {
+                    outcome: payload,
+                    checks: checks.clone(),
+                },
+            };
+            if recipe.environment != environment_fingerprint(&host.env_all())
+                || journal.verified_inputs(host).is_none()
+            {
+                return Ok(inputs_changed());
+            }
+            if cancelled() {
+                return Ok(ProbePublishOutcome::Skipped(SkipReason::Cancelled));
+            }
+            match store.put_entry(Domain::ProbeV1, key, &entry) {
+                Ok(_) => {
+                    let visible = store.get_entry::<CachedProbe>(Domain::ProbeV1, key)?;
+                    if visible.is_some_and(|entry| entry.payload.checks.verify(host)) {
+                        Ok(ProbePublishOutcome::Published)
+                    } else {
+                        Ok(ProbePublishOutcome::Skipped(SkipReason::Busy))
+                    }
+                }
+                Err(error) => Err(error),
+            }
+        };
+        publish().unwrap_or_else(|error| ProbePublishOutcome::StoreError(error.to_string()))
+    }
+
+    /// Compare a hit with a fresh result in verify mode.
     ///
     /// Apply the fresh result at the original call site even when they match.
-    pub(crate) fn verify_mode(&self, cached: &ObservedOutcome, fresh: &ObservedOutcome) -> bool {
+    pub(crate) fn verify_mode(
+        &self,
+        site: VerifyContext<'_>,
+        cached: &ObservedOutcome,
+        fresh: &ObservedOutcome,
+    ) -> Option<VerifyMismatchReport> {
         if self.mode != StoreMode::Verify {
-            return true;
+            return None;
         }
-        let matches = cached == fresh;
-        if !matches {
-            self.verify_mismatches.fetch_add(1, Ordering::Relaxed);
+        let mut differences = Vec::new();
+        if cached.compiled != fresh.compiled {
+            differences.push(format!(
+                "compiled changed from {} to {}.",
+                cached.compiled, fresh.compiled
+            ));
         }
-        matches
+        if cached.exit_code != fresh.exit_code {
+            differences.push(format!(
+                "exit_code changed from {} to {}.",
+                cached.exit_code, fresh.exit_code
+            ));
+        }
+        let before = normalized_output(&cached.output);
+        let after = normalized_output(&fresh.output);
+        if before != after {
+            let offset = before
+                .iter()
+                .zip(&after)
+                .take_while(|(left, right)| left == right)
+                .count();
+            differences.push(format!(
+                "output differs at byte {} after normalization ({} cached bytes, {} fresh bytes).",
+                offset,
+                before.len(),
+                after.len()
+            ));
+        }
+        if cached.artifact != fresh.artifact {
+            let describe = |artifact: Option<&Artifact>| {
+                artifact.map_or_else(
+                    || "absent".to_owned(),
+                    |artifact| {
+                        format!(
+                            "{} ({} bytes, mode {:o}, {})",
+                            Digest::hash(&artifact.bytes).to_hex(),
+                            artifact.bytes.len(),
+                            artifact.mode,
+                            artifact.relative_path.display()
+                        )
+                    },
+                )
+            };
+            differences.push(format!(
+                "artifact changed from {} to {}.",
+                describe(cached.artifact.as_ref()),
+                describe(fresh.artifact.as_ref())
+            ));
+        }
+        if site.cached_copy != site.fresh_copy {
+            differences.push(format!(
+                "COPY_FILE status changed from {:?} to {:?}.",
+                site.cached_copy.map(short_preview),
+                site.fresh_copy.map(short_preview)
+            ));
+        }
+        if !cached
+            .diagnostics
+            .iter()
+            .map(|diag| (diag.stream, normalized_output(&diag.message)))
+            .eq(fresh
+                .diagnostics
+                .iter()
+                .map(|diag| (diag.stream, normalized_output(&diag.message))))
+        {
+            differences.push(format!(
+                "diagnostics differ ({} cached messages, {} fresh messages).",
+                cached.diagnostics.len(),
+                fresh.diagnostics.len()
+            ));
+        }
+        if differences.is_empty() {
+            return None;
+        }
+        self.verify_mismatches.fetch_add(1, Ordering::Relaxed);
+        Some(VerifyMismatchReport {
+            variable: short_preview(site.variable),
+            file: site.file.to_owned(),
+            line: site.line,
+            key: site.key,
+            differences,
+        })
     }
 
     /// Read the current cache counters.
@@ -225,8 +568,125 @@ impl ProbeCache {
             bypassed: self.bypassed.load(Ordering::Relaxed),
             impure: self.impure.load(Ordering::Relaxed),
             verify_mismatches: self.verify_mismatches.load(Ordering::Relaxed),
+            store_errors: self.store_errors.load(Ordering::Relaxed),
         }
     }
+}
+
+fn ensure_directory(host: &dyn Host, path: &Path) -> HostResult<()> {
+    match host.metadata(path, Follow::No) {
+        Ok(meta) if meta.kind == FileKind::Dir => Ok(()),
+        Err(error) if error.kind == ErrorKind::NotFound => host.create_dir_all(path),
+        Ok(_) => Err(HostError::unsupported("Expected a cache directory.")),
+        Err(error) => Err(error),
+    }
+}
+
+fn check_regular_or_missing(host: &dyn Host, path: &Path) -> HostResult<()> {
+    match host.metadata(path, Follow::No) {
+        Ok(meta) if meta.kind == FileKind::File && meta.nlink <= 1 => Ok(()),
+        Err(error) if error.kind == ErrorKind::NotFound => Ok(()),
+        Ok(_) => Err(HostError::unsupported("Expected a regular cache file.")),
+        Err(error) => Err(error),
+    }
+}
+
+fn short_preview(bytes: &[u8]) -> String {
+    let prefix = bytes.get(..256).unwrap_or(bytes);
+    String::from_utf8_lossy(prefix).into_owned()
+}
+
+fn normalized_output(bytes: &[u8]) -> Vec<u8> {
+    let mut output = Vec::with_capacity(bytes.len());
+    for line in bytes.split_inclusive(|&byte| byte == b'\n') {
+        // Only normalize known build-tool elapsed time records.
+        if line.starts_with(b"Total time: ") || line.starts_with(b"Elapsed time: ") {
+            let time = line
+                .iter()
+                .position(|&byte| byte == b':')
+                .and_then(|index| line.get(index + 1..))
+                .map(<[u8]>::trim_ascii);
+            if time.is_some_and(|time| {
+                !time.is_empty()
+                    && time.iter().all(|byte| {
+                        byte.is_ascii_digit() || matches!(byte, b'.' | b' ' | b's' | b'm')
+                    })
+            }) {
+                continue;
+            }
+        }
+        for (index, word) in line.split_inclusive(u8::is_ascii_whitespace).enumerate() {
+            let file = word.trim_ascii_end();
+            let name = file
+                .rsplit(|byte| matches!(byte, b'/' | b'\\'))
+                .next()
+                .unwrap_or(file);
+            let temp_path = [
+                b"/tmp/".as_slice(),
+                b"/private/tmp/",
+                b"/var/folders/",
+                b"/private/var/folders/",
+            ]
+            .iter()
+            .any(|prefix| file.starts_with(prefix));
+            let temporary_object = name
+                .strip_suffix(b".o")
+                .and_then(|name| {
+                    name.strip_prefix(b"cc-")
+                        .or_else(|| name.strip_prefix(b"cc"))
+                })
+                .is_some_and(|id| {
+                    (6..=16).contains(&id.len()) && id.iter().all(u8::is_ascii_alphanumeric)
+                });
+            if temp_path && temporary_object {
+                output.extend_from_slice(b"<temporary object>");
+                output.extend_from_slice(word.get(file.len()..).unwrap_or_default());
+            } else if index == 0 && word == b"\r" {
+                continue;
+            } else {
+                output.extend_from_slice(word);
+            }
+        }
+    }
+    output
+}
+
+fn entry_fits(trace: &[InputStamp], checks: &JournalChecks, outcome: &ProbeOutcome) -> bool {
+    let path_size = |path: &Path| path.as_os_str().as_encoded_bytes().len().saturating_mul(6);
+    let bytes = trace
+        .iter()
+        .fold(checks.encoded_size_bound(), |bytes, stamp| {
+            let keys = match stamp {
+                InputStamp::FileStat { path, .. }
+                | InputStamp::FileHash { path, .. }
+                | InputStamp::DirEntries { path, .. }
+                | InputStamp::Missing { path } => path_size(path),
+                InputStamp::EnvVar { name, .. } => name.len().saturating_mul(4),
+                InputStamp::NegativeLookup {
+                    root,
+                    relative,
+                    deepest,
+                    ..
+                } => path_size(root)
+                    .saturating_add(path_size(relative))
+                    .saturating_add(path_size(deepest)),
+            };
+            bytes.saturating_add(512).saturating_add(keys)
+        });
+    let bytes = bytes
+        .saturating_add(8192)
+        .saturating_add(outcome.output.encoded_size_bound());
+    let bytes = outcome.diagnostics.iter().fold(bytes, |bytes, diagnostic| {
+        bytes
+            .saturating_add(64)
+            .saturating_add(diagnostic.message.encoded_size_bound())
+    });
+    let bytes = outcome.artifact.as_ref().map_or(bytes, |artifact| {
+        bytes
+            .saturating_add(512)
+            .saturating_add(artifact.relative_path.encoded_size_bound())
+    });
+    bytes <= MAX_ENTRY_BYTES
 }
 
 fn read_outcome(
@@ -240,7 +700,11 @@ fn read_outcome(
     if !entry.payload.checks.verify(host) {
         return None;
     }
+    let bindings = recipe.bindings.clone().with_canonical(host);
     let outcome = entry.payload.outcome;
+    if !entry_fits(&entry.trace, &entry.payload.checks, &outcome) {
+        return None;
+    }
     let artifact = match (&outcome.artifact, entry.blobs.as_slice()) {
         (None, []) => None,
         (Some(artifact), [blob]) if outcome.compiled && artifact.blob == *blob => {
@@ -248,7 +712,7 @@ fn read_outcome(
             if bytes.len() > MAX_ARTIFACT_BYTES {
                 return None;
             }
-            let relative_path = path::to_native(&artifact.relative_path.render(&recipe.bindings)?);
+            let relative_path = path::to_native(&artifact.relative_path.render(&bindings)?);
             if !is_relative_artifact(&relative_path) {
                 return None;
             }
@@ -260,40 +724,63 @@ fn read_outcome(
         }
         _ => return None,
     };
+    if outcome.diagnostics.len() > MAX_DIAGNOSTICS {
+        return None;
+    }
+    let output = outcome.output.render(&bindings)?;
+    let mut remaining = MAX_ARTIFACT_BYTES.checked_sub(output.len())?;
+    let mut diagnostics = Vec::with_capacity(outcome.diagnostics.len());
+    for diagnostic in outcome.diagnostics {
+        let message = diagnostic.message.render_bounded(&bindings, remaining)?;
+        remaining -= message.len();
+        diagnostics.push(ProbeDiagnostic {
+            stream: diagnostic.stream,
+            message,
+        });
+    }
     Some(ObservedOutcome {
         compiled: outcome.compiled,
         exit_code: outcome.exit_code,
-        output: outcome.output.render(&recipe.bindings)?,
+        output,
         artifact,
-        diagnostics: outcome
-            .diagnostics
-            .into_iter()
-            .map(|diagnostic| {
-                Some(ProbeDiagnostic {
-                    stream: diagnostic.stream,
-                    message: diagnostic.message.render(&recipe.bindings)?,
-                })
-            })
-            .collect::<Option<Vec<_>>>()?,
+        diagnostics,
     })
 }
 
 fn template_outcome(
-    store: &Store<'_>,
     recipe: &ProbeRecipe,
+    bindings: &super::template::PathBindings,
     outcome: &ObservedOutcome,
-) -> HostResult<Option<ProbeOutcome>> {
+) -> Option<ProbeOutcome> {
+    if outcome.diagnostics.len() > MAX_DIAGNOSTICS
+        || outcome
+            .diagnostics
+            .iter()
+            .fold(outcome.output.len(), |bytes, diagnostic| {
+                bytes.saturating_add(diagnostic.message.len())
+            })
+            > MAX_ARTIFACT_BYTES
+    {
+        return None;
+    }
+    if recipe.scope == ReuseScope::VerifiedRelocation && !bindings.can_scan_aliases() {
+        return None;
+    }
     let capture = |bytes: &[u8]| {
         let template = match recipe.scope {
             ReuseScope::ExactBindings => Templated::literal(bytes)?,
-            ReuseScope::VerifiedRelocation => Templated::capture(bytes, &recipe.bindings)?,
+            ReuseScope::VerifiedRelocation => {
+                let template = Templated::capture(bytes, bindings)?;
+                if template.has_leak(bindings) {
+                    return None;
+                }
+                template
+            }
         };
-        round_trip_verify(&template, &recipe.bindings, bytes).then_some(template)
+        round_trip_verify(&template, bindings, bytes).then_some(template)
     };
-    let Some(output) = capture(&outcome.output) else {
-        return Ok(None);
-    };
-    let Some(diagnostics) = outcome
+    let output = capture(&outcome.output)?;
+    let diagnostics = outcome
         .diagnostics
         .iter()
         .map(|diagnostic| {
@@ -302,310 +789,34 @@ fn template_outcome(
                 message: capture(&diagnostic.message)?,
             })
         })
-        .collect::<Option<Vec<_>>>()
-    else {
-        return Ok(None);
-    };
+        .collect::<Option<Vec<_>>>()?;
     let artifact = match &outcome.artifact {
         None => None,
         Some(artifact)
             if outcome.compiled
                 && artifact.bytes.len() <= MAX_ARTIFACT_BYTES
-                && is_relative_artifact(&artifact.relative_path) =>
+                && is_relative_artifact(&artifact.relative_path)
+                && (recipe.scope == ReuseScope::ExactBindings
+                    || !bindings.has_leak(&artifact.bytes)) =>
         {
-            let Some(relative_path) = capture(&path::from_native(&artifact.relative_path)) else {
-                return Ok(None);
-            };
             Some(ArtifactRef {
-                blob: store.put_blob(&artifact.bytes)?,
-                relative_path,
+                blob: Digest::hash(&artifact.bytes),
+                relative_path: capture(&path::from_native(&artifact.relative_path))?,
                 mode: artifact.mode,
             })
         }
-        Some(_) => return Ok(None),
+        Some(_) => return None,
     };
-    Ok(Some(ProbeOutcome {
+    Some(ProbeOutcome {
         compiled: outcome.compiled,
         exit_code: outcome.exit_code,
         output,
         artifact,
         diagnostics,
-    }))
+    })
 }
 
 #[cfg(all(test, unix))]
-pub(crate) mod tests {
-    use std::collections::BTreeMap;
-
-    use std::time::Duration;
-
-    use rcmake_host::{
-        CommandSpec, Follow, Input, Output, ProcessResult, PureHost, ReadRange, RunOutput,
-        RunRequest,
-    };
-    use rcmake_store::{Digest, InputStamp, StoreConfig, file_digest};
-
-    use super::super::journal::{ImpureReason, JournalHost, JournalMode};
-    use super::super::plan::{Admission, DiagnosticStream, RcmakeBuildId, environment_fingerprint};
-    use super::super::template::PathBindings;
-    use super::*;
-
-    /// Create an eligible recipe for a test probe.
-    pub(crate) fn recipe(host: &dyn Host, root: &Path) -> HostResult<ProbeRecipe> {
-        let eligibility = Admission {
-            store_mode: StoreMode::ReadWrite,
-            debug_try_compile: false,
-            trace: false,
-            profiling: false,
-            sources_signature: true,
-            private_scratch: true,
-            verified_execution: true,
-        }
-        .eligibility();
-        let digest = Digest::hash(b"test");
-        let bindings = PathBindings::new(
-            &root.join("scratch"),
-            &root.join("build"),
-            &root.join("source"),
-            Path::new("/work/cmake"),
-        )
-        .and_then(|bindings| bindings.with_target(b"cmTC_1"))
-        .ok_or_else(|| HostError::unsupported("Missing path bindings."))?;
-        Ok(ProbeRecipe {
-            eligibility,
-            rcmake: RcmakeBuildId(digest),
-            cmake_root: digest,
-            host: digest,
-            generator: digest,
-            files: BTreeMap::new(),
-            tools: BTreeMap::new(),
-            flags: Vec::new(),
-            definitions: Vec::new(),
-            link_libraries: Vec::new(),
-            target: "arm64".into(),
-            sysroot: "/sdk".into(),
-            seed: digest,
-            imports: digest,
-            environment: environment_fingerprint(&host.env_all()),
-            scope: ReuseScope::VerifiedRelocation,
-            bindings,
-        })
-    }
-
-    /// Return an example successful test probe.
-    pub(crate) fn success() -> ObservedOutcome {
-        ObservedOutcome {
-            compiled: true,
-            exit_code: 0,
-            output: b"/work/scratch/cmTC_1".to_vec(),
-            artifact: Some(Artifact {
-                bytes: b"test executable".to_vec(),
-                relative_path: "bin/cmTC_1".into(),
-                mode: 0o755,
-            }),
-            diagnostics: vec![ProbeDiagnostic {
-                stream: DiagnosticStream::Stderr,
-                message: b"/work/source/probe.c: warning".to_vec(),
-            }],
-        }
-    }
-
-    #[test]
-    fn verifies_inputs_and_materializes_the_copy_file_blob() -> HostResult<()> {
-        let host = PureHost::default();
-        let store = Store::new(&host, StoreConfig::new("/cache".into()))?;
-        let cache = ProbeCache::new(StoreMode::ReadWrite);
-        let scratch = Path::new("/work/scratch");
-        let header = Path::new("/work/header.h");
-        let compiler = Path::new("/work/compiler");
-        host.create_dir_all(scratch)?;
-        host.seed_file(header, b"old")?;
-        host.seed_file(compiler, b"cc1")?;
-        host.env_set(b"LANG", Some(b"C"));
-        let mut original = recipe(&host, Path::new("/work"))?;
-        original
-            .tools
-            .insert("cc".into(), file_digest(&host, compiler)?);
-        let journal = JournalHost::new(&host, scratch, JournalMode::Observe, None)?;
-        journal.record_dependency(header)?;
-        journal.record_dependency(compiler)?;
-        journal.env_get(b"LANG");
-        let journal = journal.finish();
-        assert!(cache.lookup(&host, &store, &original).is_none());
-        cache.publish(&host, &store, &original, &success(), &journal)?;
-
-        let mut relocated = recipe(&host, Path::new("/other"))?;
-        relocated.tools = original.tools.clone();
-        let hit = cache
-            .lookup(&host, &store, &relocated)
-            .ok_or_else(|| HostError::unsupported("Expected a probe cache hit."))?;
-        assert_eq!(hit.output, b"/other/scratch/cmTC_1");
-        assert_eq!(
-            hit.diagnostics.first().map(|diag| diag.message.as_slice()),
-            Some(b"/other/source/probe.c: warning".as_slice())
-        );
-        let artifact = hit
-            .artifact
-            .ok_or_else(|| HostError::unsupported("Missing probe artifact."))?;
-        assert_eq!(artifact.relative_path, Path::new("bin/cmTC_1"));
-        let destination = Path::new("/work/copied/test");
-        artifact.copy_to(&host, scratch, destination)?;
-        assert_eq!(
-            host.read(destination, ReadRange::All { limit: 32 })?,
-            artifact.bytes
-        );
-        assert_eq!(host.metadata(destination, Follow::Yes)?.mode & 0o777, 0o755);
-
-        host.env_set(b"LANG", Some(b"fr_FR"));
-        assert!(cache.lookup(&host, &store, &original).is_none());
-        host.env_set(b"LANG", Some(b"C"));
-        host.seed_file(header, b"new")?;
-        assert!(cache.lookup(&host, &store, &original).is_none());
-        host.seed_file(header, b"old")?;
-        host.seed_file(compiler, b"cc2")?;
-        assert!(cache.lookup(&host, &store, &original).is_none());
-        assert_eq!(
-            cache.stats(),
-            ProbeCacheStats {
-                hits: 1,
-                misses: 4,
-                ..ProbeCacheStats::default()
-            }
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn enforces_bypass_purity_and_verify_mode() -> HostResult<()> {
-        let host = PureHost::default();
-        let store = Store::new(&host, StoreConfig::new("/cache".into()))?;
-        let scratch = Path::new("/work/scratch");
-        host.create_dir_all(scratch)?;
-        let mut recipe = recipe(&host, Path::new("/work"))?;
-        recipe.scope = ReuseScope::ExactBindings;
-        let cache = ProbeCache::new(StoreMode::ReadWrite);
-        let journal = JournalHost::new(&host, scratch, JournalMode::Observe, None)?;
-        journal.env_set(b"LC_ALL", Some(b"C"));
-        cache.publish(&host, &store, &recipe, &success(), &journal.finish())?;
-        assert!(cache.lookup(&host, &store, &recipe).is_none());
-        assert_eq!(cache.stats().impure, 1);
-
-        let journal = JournalHost::new(&host, scratch, JournalMode::Observe, None)?.finish();
-        cache.publish(&host, &store, &recipe, &success(), &journal)?;
-        assert_eq!(cache.lookup(&host, &store, &recipe), Some(success()));
-        recipe.eligibility = ProbeEligibility::Bypass(super::super::plan::BypassReason::Trace);
-        assert!(cache.lookup(&host, &store, &recipe).is_none());
-        assert_eq!(cache.stats().bypassed, 1);
-
-        let verify = ProbeCache::new(StoreMode::Verify);
-        let mut fresh = success();
-        fresh.output.push(b'!');
-        assert!(!verify.verify_mode(&success(), &fresh));
-        assert_eq!(verify.stats().verify_mismatches, 1);
-        Ok(())
-    }
-
-    #[test]
-    fn keys_preserve_argument_and_environment_boundaries() -> HostResult<()> {
-        let host = PureHost::default();
-        let mut original = recipe(&host, Path::new("/work"))?;
-        let initial_key = compute_probe_key(&original);
-        host.env_set(b"LC_ALL", Some(b""));
-        let with_empty_locale = recipe(&host, Path::new("/work"))?;
-        assert_ne!(compute_probe_key(&with_empty_locale), initial_key);
-
-        original.flags = vec!["-Idir".into(), "-DSET".into()];
-        let ordered_key = compute_probe_key(&original);
-        original.flags.reverse();
-        assert_ne!(compute_probe_key(&original), ordered_key);
-        original.flags = vec!["-Idir-DSET".into()];
-        assert_ne!(compute_probe_key(&original), ordered_key);
-        Ok(())
-    }
-    #[test]
-    fn rejects_unverified_process_before_it_starts() -> HostResult<()> {
-        let host = PureHost::default();
-        let scratch = Path::new("/work/scratch");
-        host.create_dir_all(scratch)?;
-        let journal = JournalHost::new(&host, scratch, JournalMode::Speculate, None)?;
-        let request = RunRequest {
-            pipeline: vec![CommandSpec {
-                program: "/work/compiler".into(),
-                args: Vec::new(),
-            }],
-            cwd: scratch.to_owned(),
-            env: Vec::new(),
-            stdin: Input::Null,
-            stdout: Output::Capture,
-            stderr: Output::Capture,
-            timeout: Some(Duration::from_secs(1)),
-            tee: false,
-        };
-        assert!(journal.run(&request, &mut |_, _| {}).is_err());
-        let journal = journal.finish();
-        assert_eq!(journal.processes(), &[request]);
-        assert_eq!(journal.impure(), Some(ImpureReason::UnverifiedProcess));
-        Ok(())
-    }
-
-    #[test]
-    fn certifies_the_exact_process_and_rechecks_its_executable() -> HostResult<()> {
-        let host = PureHost::default();
-        let scratch = Path::new("/work/scratch");
-        let compiler = Path::new("/work/compiler");
-        host.create_dir_all(scratch)?;
-        host.seed_file(compiler, b"compiler-v1")?;
-        host.set_command_handler(|_, _, _| {
-            Ok(RunOutput {
-                results: vec![ProcessResult::Exited(1)],
-                stderr: b"invalid option".to_vec(),
-                ..RunOutput::default()
-            })
-        })?;
-        let request = RunRequest {
-            pipeline: vec![CommandSpec {
-                program: "/work/compiler".into(),
-                args: vec!["-invalid".into()],
-            }],
-            cwd: scratch.to_owned(),
-            env: vec![("LC_ALL".into(), "C".into())],
-            stdin: Input::Null,
-            stdout: Output::Capture,
-            stderr: Output::Capture,
-            timeout: Some(Duration::from_secs(1)),
-            tee: false,
-        };
-        let verifier = |observed: &RunRequest| (observed == &request).then(Vec::new);
-        let journal = JournalHost::new(&host, scratch, JournalMode::Speculate, Some(&verifier))?;
-        let result = journal.run(&request, &mut |_, _| {})?;
-        assert_eq!(result.results, [ProcessResult::Exited(1)]);
-        let journal = journal.finish();
-        assert_eq!(journal.processes(), &[request]);
-        assert!(journal.verified_inputs(&host).is_some());
-        host.seed_file(compiler, b"compiler-v2")?;
-        assert!(journal.verified_inputs(&host).is_none());
-        Ok(())
-    }
-
-    #[test]
-    fn missing_nested_header_invalidates_when_a_shadow_appears() -> HostResult<()> {
-        let host = PureHost::default();
-        let scratch = Path::new("/work/scratch");
-        let root = Path::new("/work/include");
-        let relative = Path::new("sub/header.h");
-        host.create_dir_all(scratch)?;
-        host.create_dir_all(&root.join("sub"))?;
-        let journal = JournalHost::new(&host, scratch, JournalMode::Observe, None)?;
-        assert!(!journal.record_search(root, relative)?);
-        let journal = journal.finish();
-        assert!(matches!(
-            journal
-                .verified_inputs(&host)
-                .map(|(trace, _)| trace.as_slice()),
-            Some([InputStamp::NegativeLookup { .. }])
-        ));
-        host.seed_file(&root.join(relative), b"shadow")?;
-        assert!(journal.verified_inputs(&host).is_none());
-        Ok(())
-    }
-}
+#[path = "cache_tests.rs"]
+/// Test fixtures shared by the cache and the worker pool.
+pub(in super::super) mod tests;

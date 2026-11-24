@@ -2,17 +2,20 @@
 
 #![forbid(unsafe_code)]
 
+mod frame;
+mod path_bytes;
 mod region;
 mod replay;
 mod trace;
 
 pub use region::{
-    CacheValue, CommandClass, EntryContext, Journal, JournalEffect, OpaqueReason, OutputStream,
-    PropertyEdit, PropertyOrigin, RegionKey, RegionKind, RegionRecord, RegionState,
+    CacheValue, ChildScope, CommandClass, EntryContext, Journal, JournalEffect, OpaqueOperation,
+    OpaqueReason, OutputStream, PropertyEdit, PropertyOrigin, RegionKey, RegionKind, RegionRecord,
+    RegionState,
 };
 pub use replay::{
-    ConfigureSnapshot, ReplayApplyError, ReplayMiss, VerifiedConfigure, VerifiedRegion,
-    verify_configure, verify_region,
+    ConfigureSnapshot, ReplayApplyError, ReplayCodecError, ReplayMiss, ReplayMissReason,
+    VerifiedConfigure, VerifiedRegion, verify_configure, verify_region,
 };
 pub use trace::{
     JournalDigest, JournalFileStat, JournalInput, JournalStamp, PropertyKey, PropertyOwner,

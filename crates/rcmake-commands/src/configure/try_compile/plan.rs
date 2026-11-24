@@ -3,12 +3,16 @@
 #![forbid(unsafe_code)]
 
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use rcmake_base::BString;
+use rcmake_host::{Input, Output, RunRequest, path};
 use rcmake_store::{Digest, Domain, KeyHasher, StoreMode};
 use serde::{Deserialize, Serialize};
 
-use super::template::{PathBindings, Templated};
+/// Bindings and byte templates used by a probe recipe.
+pub(crate) use super::template::{PathBindings, Templated};
 
 /// A reason to execute the original probe without consulting the cache.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -95,6 +99,19 @@ pub(crate) enum ReuseScope {
     VerifiedRelocation,
 }
 
+/// Owned process plan for one speculative compile or link.
+#[derive(Clone, Debug)]
+pub(crate) struct SpeculativeRun {
+    /// Absolute compiler or driver program path.
+    pub(crate) program: BString,
+    /// Ordered argument byte templates.
+    pub(crate) args: Vec<Templated>,
+    /// Relative artifact path template, if the call needs the artifact.
+    pub(crate) artifact: Option<Templated>,
+    /// Requested time limit before the shared pool deadline is applied.
+    pub(crate) timeout: Duration,
+}
+
 /// Complete inputs that the caller knows before running a probe.
 ///
 /// Represent ordered arguments in execution order. Include materialized source names
@@ -136,6 +153,97 @@ pub(crate) struct ProbeRecipe {
     pub(crate) scope: ReuseScope,
     /// Bindings for this invocation.
     pub(crate) bindings: PathBindings,
+    /// Whether the original call also runs the compiled program.
+    pub(crate) try_run: bool,
+    /// Owned execution plan used only when a verified worker can run this probe.
+    pub(crate) speculative_run: Option<SpeculativeRun>,
+}
+
+impl ProbeRecipe {
+    /// Set stable exact bindings before generating or executing the child project.
+    ///
+    /// The caller must claim this directory exclusively. Exact cache reuse
+    /// requires that the actual child use these same paths and target name.
+    pub(crate) fn bind_exact_scratch(&mut self, root: &Path) -> Option<PathBuf> {
+        let key = recipe_key(self, false).to_hex();
+        let scratch = root.join(format!("TryCompile-{key}"));
+        self.bindings = self
+            .bindings
+            .clone()
+            .with_scratch(&scratch)?
+            .with_target(format!("cmTC_{key}").as_bytes())?;
+        Some(scratch)
+    }
+
+    /// Bound the retained bytes of an owned recipe before it enters the queue.
+    pub(crate) fn queued_bytes(&self) -> usize {
+        let bytes = self.files.iter().fold(512usize, |size, (name, contents)| {
+            size.saturating_add(name.len())
+                .saturating_add(contents.encoded_size_bound())
+        });
+        let bytes = self
+            .flags
+            .iter()
+            .chain(&self.definitions)
+            .chain(&self.link_libraries)
+            .chain([&self.target, &self.sysroot])
+            .fold(bytes, |size, value| {
+                size.saturating_add(32).saturating_add(value.len())
+            });
+        let bytes = self
+            .tools
+            .keys()
+            .fold(bytes, |size, key| {
+                size.saturating_add(96).saturating_add(key.len())
+            })
+            .saturating_add(self.bindings.byte_size());
+        self.speculative_run.as_ref().map_or(bytes, |run| {
+            run.args
+                .iter()
+                .chain(&run.artifact)
+                .fold(bytes.saturating_add(run.program.len()), |size, arg| {
+                    size.saturating_add(arg.encoded_size_bound())
+                })
+        })
+    }
+}
+
+/// Hash all fields of the request passed to the host after applying its limits.
+pub(crate) fn request_digest(request: &RunRequest) -> Digest {
+    let mut key = KeyHasher::new(Domain::ProbeV1);
+    key.field(0, b"run-request");
+    for command in &request.pipeline {
+        key.field(1, &command.program);
+        for arg in &command.args {
+            key.field(2, arg);
+        }
+    }
+    key.field(3, &path::from_native(&request.cwd));
+    key.field(4, environment_fingerprint(&request.env).as_bytes());
+    match &request.stdin {
+        Input::Inherit => key.field(5, &[]),
+        Input::Null => key.field(6, &[]),
+        Input::File(file) => key.field(7, &path::from_native(file)),
+        Input::Bytes(bytes) => key.field(8, bytes),
+    }
+    for output in [&request.stdout, &request.stderr] {
+        key.field(9, &[]);
+        match output {
+            Output::Capture => key.field(10, &[]),
+            Output::Inherit => key.field(11, &[]),
+            Output::File { path: file, append } => {
+                key.field(12, &path::from_native(file));
+                key.field(13, &[u8::from(*append)]);
+            }
+            Output::Null => key.field(14, &[]),
+            Output::SharedWithStdout => key.field(15, &[]),
+        }
+    }
+    if let Some(timeout) = request.timeout {
+        key.field(16, &timeout.as_nanos().to_le_bytes());
+    }
+    key.field(17, &[u8::from(request.tee)]);
+    key.finish()
 }
 
 /// Hash the complete inherited environment, including locale and empty values.
@@ -165,8 +273,12 @@ pub(crate) fn project_recipe_digest(files: &BTreeMap<BString, Templated>) -> Dig
 
 /// Hash the recipe with explicit field boundaries and stable iteration order.
 pub(crate) fn compute_probe_key(recipe: &ProbeRecipe) -> Digest {
+    recipe_key(recipe, true)
+}
+
+fn recipe_key(recipe: &ProbeRecipe, bind_exact: bool) -> Digest {
     let mut key = KeyHasher::new(Domain::ProbeV1);
-    key.field(1, &1_u16.to_le_bytes());
+    key.field(1, &2_u16.to_le_bytes());
     key.field(2, recipe.rcmake.0.as_bytes());
     key.field(3, recipe.cmake_root.as_bytes());
     key.field(4, recipe.host.as_bytes());
@@ -191,8 +303,22 @@ pub(crate) fn compute_probe_key(recipe: &ProbeRecipe) -> Digest {
     key.field(16, recipe.imports.as_bytes());
     key.field(17, recipe.environment.as_bytes());
     match recipe.scope {
-        ReuseScope::ExactBindings => key.field(18, recipe.bindings.digest().as_bytes()),
+        ReuseScope::ExactBindings if bind_exact => {
+            key.field(18, recipe.bindings.digest().as_bytes())
+        }
+        ReuseScope::ExactBindings => key.field(18, &[]),
         ReuseScope::VerifiedRelocation => key.field(19, &[]),
+    }
+    key.field(20, &[u8::from(recipe.try_run)]);
+    if let Some(run) = &recipe.speculative_run {
+        key.field(21, &run.program);
+        for arg in &run.args {
+            key.field(22, arg.digest().as_bytes());
+        }
+        if let Some(artifact) = &run.artifact {
+            key.field(23, artifact.digest().as_bytes());
+        }
+        key.field(24, &run.timeout.as_nanos().to_le_bytes());
     }
     key.finish()
 }
