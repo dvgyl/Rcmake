@@ -1,9 +1,9 @@
 use core::fmt::Write as _;
 
-use rcmake_base::path_lex::Lexical;
-use rcmake_diag::Backtrace;
+use rcmake_base::{BString, path_lex::Lexical};
+use rcmake_diag::{Backtrace, Frame};
 use rcmake_eval::{ValuePreview, VarOp};
-use rcmake_host::{Host, Stream};
+use rcmake_host::{Host, Stream, discover_cmake_root, path::from_native};
 use rcmake_model::{AppendMode, PropOp, UsageField, UsageScope};
 use rcmake_resolve::{ChainKind, LinkFragmentRole};
 
@@ -16,7 +16,7 @@ const LINE_WIDTH: usize = 96;
 const VALUE_BYTES: usize = 64;
 
 /// Options for rendering an explanation in a terminal.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct ExplainRenderOptions<'a> {
     /// Show only this configuration, if specified.
     pub config: Option<&'a [u8]>,
@@ -24,25 +24,25 @@ pub struct ExplainRenderOptions<'a> {
     pub color: bool,
     /// Emit OSC 8 links for absolute source paths.
     pub hyperlinks: bool,
-    /// Show all stack frames and full effective and cache values.
+    /// Absolute directory for the bundled modules, if known.
+    pub bundled_modules: Option<BString>,
+    /// Show sources, all stack frames, and full effective and cache values.
     pub verbose: bool,
 }
 
 impl ExplainRenderOptions<'_> {
     /// Use the host's terminal and color settings for this output stream.
     ///
-    /// Nonempty `CLICOLOR_FORCE` other than `0` enables color. Then a nonempty
-    /// `NO_COLOR` disables color. Otherwise color follows terminal detection.
+    /// `CLICOLOR_FORCE=1` enables color. Otherwise, color requires a terminal
+    /// and an unset `NO_COLOR`.
     /// Links require a terminal with a known hyperlink capability.
     #[must_use]
     pub fn for_host(host: &dyn Host, stream: Stream) -> Self {
         let terminal = host.is_terminal(stream);
         let forced = host
             .env_get(b"CLICOLOR_FORCE")
-            .is_some_and(|value| !value.is_empty() && value.as_slice() != b"0");
-        let disabled = host
-            .env_get(b"NO_COLOR")
-            .is_some_and(|value| !value.is_empty());
+            .is_some_and(|value| value == "1");
+        let disabled = host.env_get(b"NO_COLOR").is_some();
         let hyperlinks = terminal
             && (host.env_get(b"VTE_VERSION").is_some_and(|value| {
                 core::str::from_utf8(&value)
@@ -61,6 +61,9 @@ impl ExplainRenderOptions<'_> {
         Self {
             color: forced || (!disabled && terminal),
             hyperlinks,
+            bundled_modules: discover_cmake_root(host, None)
+                .1
+                .map(|root| from_native(&root.join("Modules"))),
             ..Self::default()
         }
     }
@@ -127,6 +130,9 @@ struct Renderer<'a> {
 impl Renderer<'_> {
     fn target(&mut self, target: &ExplainTarget) {
         let name = text(&target.name);
+        if let Some(filter) = &target.filter {
+            self.filter_headline(target, filter);
+        }
         self.styled_row(0, &format!("{name} ({})", target.kind.as_str()), 1, None);
         if target.name != target.target {
             self.row(2, &format!("Alias of {}", text(&target.target)));
@@ -134,15 +140,6 @@ impl Renderer<'_> {
         }
         self.trace(2, &target.definition);
         self.provisional(target.provisional);
-        if let Some(filter) = &target.filter {
-            self.row(2, &format!("Entry filter {}", quoted(filter)));
-        } else if !target.sources.is_empty() {
-            self.row(2, "Declared sources");
-            for source in &target.sources {
-                self.row(4, &self.display_path(&source.value));
-                self.trace(6, &source.backtrace);
-            }
-        }
         if !target.configurations.is_empty() {
             let available = target
                 .configurations
@@ -170,17 +167,17 @@ impl Renderer<'_> {
         }
         for config in target.configurations_for(self.options.config) {
             self.row(2, &format!("Configuration {}", config_name(&config.name)));
-            if target.filter.is_none() {
-                for source in &config.sources {
-                    self.row(4, &format!("Source {}", self.display_path(&source.value)));
-                    self.trace(6, &source.backtrace);
-                }
-            }
             if target.filter.is_some() && config.entries.is_empty() {
                 self.row(4, "No entry matches the filter.");
             }
             for entry in &config.entries {
                 self.entry(&target.target, entry, config.compile_groups.len());
+            }
+            if self.options.verbose && target.filter.is_none() {
+                for source in &config.sources {
+                    self.row(4, &format!("Source {}", self.display_path(&source.value)));
+                    self.trace(6, &source.backtrace);
+                }
             }
             for (index, group) in config.compile_groups.iter().enumerate() {
                 if config.entries.iter().any(|entry| {
@@ -195,13 +192,22 @@ impl Renderer<'_> {
                         4,
                         &format!("Compile group {} ({})", index + 1, text(&group.language)),
                     );
-                    for source in &group.sources {
-                        self.row(6, &self.display_path(source));
+                    if self.options.verbose {
+                        for source in &group.sources {
+                            self.row(6, &self.display_path(source));
+                        }
                     }
                 }
             }
         }
 
+        if self.options.verbose && target.filter.is_none() && !target.sources.is_empty() {
+            self.row(2, "Declared sources");
+            for source in &target.sources {
+                self.row(4, &self.display_path(&source.value));
+                self.trace(6, &source.backtrace);
+            }
+        }
         let mut properties = target.properties_for(self.options.config).peekable();
         if properties.peek().is_some() {
             self.row(2, "Property history (writes at configure time)");
@@ -238,6 +244,38 @@ impl Renderer<'_> {
         }
     }
 
+    fn filter_headline(&mut self, target: &ExplainTarget, filter: &[u8]) {
+        let entry = target
+            .configurations_for(self.options.config)
+            .find_map(|config| config.entries.first());
+        let Some(entry) = entry else {
+            self.row(
+                0,
+                &format!("No match for {} in {}.", quoted(filter), text(&target.name)),
+            );
+            return;
+        };
+        let value = text(entry.spelling.as_ref().unwrap_or(&entry.value));
+        let origin = entry.origin.top().map_or_else(
+            || usage_label(entry.kind).to_owned(),
+            |frame| {
+                let command = frame
+                    .name
+                    .as_deref()
+                    .map_or_else(|| usage_label(entry.kind).to_owned(), text);
+                format!(
+                    "{command} at {}",
+                    self.display_site(&frame.file, frame.line)
+                )
+            },
+        );
+        let mut path = text(&target.name);
+        for hop in entry.chain.iter().flatten() {
+            let _ = write!(path, " -> {} {}", usage_scope(hop.via), hop_name(hop));
+        }
+        self.styled_row(0, &format!("{value} <- {origin} via {path}"), 1, None);
+    }
+
     fn entry(&mut self, target: &[u8], entry: &ExplainEntry, group_count: usize) {
         let label = match entry.link_role {
             Some(LinkFragmentRole::LibraryPath) => "Library search path",
@@ -267,15 +305,7 @@ impl Renderer<'_> {
         }
         if let Some(chain) = &entry.chain {
             if !chain.is_empty() {
-                let hops: Vec<_> = chain
-                    .iter()
-                    .map(|hop| {
-                        hop.target.as_ref().map_or_else(
-                            || format!("target #{}", hop.id.index()),
-                            |name| text(name),
-                        )
-                    })
-                    .collect();
+                let hops: Vec<_> = chain.iter().map(hop_name).collect();
                 let mut path = text(target);
                 for (hop, name) in chain.iter().zip(&hops) {
                     let _ = write!(path, " -> {} {name}", usage_scope(hop.via));
@@ -296,15 +326,6 @@ impl Renderer<'_> {
         let name = text(&variable.name);
         self.styled_row(0, &name, 1, None);
         self.provisional(variable.provisional);
-        if !variable.directory.is_empty() {
-            self.row(
-                2,
-                &format!(
-                    "Source directory {}",
-                    self.display_path(&variable.directory)
-                ),
-            );
-        }
         let label = match (variable.normal_binding, &variable.cache) {
             (true, Some(_)) => "Effective value (normal variable shadows cache)",
             (true, None) => "Effective value (normal variable)",
@@ -317,6 +338,15 @@ impl Renderer<'_> {
             self.location(4, variable.location.as_ref());
         } else {
             self.row(4, "(undefined)");
+        }
+        if !variable.directory.is_empty() {
+            self.row(
+                2,
+                &format!(
+                    "Source directory {}",
+                    self.display_path(&variable.directory)
+                ),
+            );
         }
         if let Some(cache) = &variable.cache {
             let force = match cache.force {
@@ -454,38 +484,55 @@ impl Renderer<'_> {
     fn trace(&mut self, indent: usize, trace: &Backtrace) {
         let mut frames = trace.frames();
         if let Some(frame) = frames.next() {
-            self.path_line(indent, "At", &frame.file, frame.line, frame.name.as_deref());
+            self.trace_frame(indent, "At", frame);
         }
         if self.options.verbose {
             for frame in frames {
-                self.path_line(
-                    indent,
-                    "Called from",
-                    &frame.file,
-                    frame.line,
-                    frame.name.as_deref(),
-                );
+                self.trace_frame(indent, "Called from", frame);
             }
+        } else if let Some(frame) = frames.find(|frame| self.is_project_frame(frame)) {
+            self.trace_frame(indent, "Called from", frame);
         }
+    }
+
+    fn trace_frame(&mut self, indent: usize, label: &str, frame: &Frame) {
+        self.path_line(
+            indent,
+            label,
+            &frame.file,
+            frame.line,
+            frame.name.as_deref(),
+        );
+    }
+
+    fn is_project_frame(&self, frame: &Frame) -> bool {
+        let path = Lexical::new(&frame.file).normalize();
+        relative_inside(&path, &self.roots.source).is_some()
+            && !self
+                .options
+                .bundled_modules
+                .as_ref()
+                .is_some_and(|modules| relative_inside(&path, modules).is_some())
     }
 
     fn display_path(&self, path: &[u8]) -> String {
         if path.starts_with(b"/") || Lexical::new(path).absolute() {
             let normalized = Lexical::new(path).normalize();
             for (root, prefix) in [(&self.roots.source, ""), (&self.roots.build, "<build>/")] {
-                if root.is_empty() {
-                    continue;
-                }
-                let root = Lexical::new(root).normalize();
-                if let Some(relative) = Lexical::new(&normalized).relative(Lexical::new(&root))
-                    && relative != ".."
-                    && !relative.starts_with(b"../")
-                {
+                if let Some(relative) = relative_inside(&normalized, root) {
                     return format!("{prefix}{}", text(&relative));
                 }
             }
         }
         text(path)
+    }
+
+    fn display_site(&self, path: &[u8], line: u32) -> String {
+        let mut display = self.display_path(path);
+        if line != 0 {
+            let _ = write!(display, ":{line}");
+        }
+        display
     }
 
     fn path_line(
@@ -496,10 +543,7 @@ impl Renderer<'_> {
         line: u32,
         command: Option<&[u8]>,
     ) {
-        let mut display = format!("{label} {}", self.display_path(path));
-        if line != 0 {
-            let _ = write!(display, ":{line}");
-        }
+        let mut display = format!("{label} {}", self.display_site(path, line));
         if let Some(command) = command {
             let _ = write!(display, " ({})", text(command));
         }
@@ -543,6 +587,22 @@ impl Renderer<'_> {
             pad = indent + 2;
         }
     }
+}
+
+fn relative_inside(path: &[u8], root: &[u8]) -> Option<BString> {
+    if root.is_empty() {
+        return None;
+    }
+    let root = Lexical::new(root).normalize();
+    Lexical::new(path)
+        .relative(Lexical::new(&root))
+        .filter(|relative| relative != ".." && !relative.starts_with(b"../"))
+}
+
+fn hop_name(hop: &crate::ExplainHop) -> String {
+    hop.target
+        .as_ref()
+        .map_or_else(|| format!("target #{}", hop.id.index()), |name| text(name))
 }
 
 fn line_end(value: &str, width: usize) -> usize {
@@ -605,7 +665,9 @@ fn escape(bytes: &[u8], quoted: bool) -> String {
     let mut escaped = String::new();
     for chunk in bytes.utf8_chunks() {
         for ch in chunk.valid().chars() {
-            if ch.is_control() || (quoted && matches!(ch, '"' | '\\')) {
+            if is_format(ch) {
+                let _ = write!(escaped, "<U+{:04X}>", u32::from(ch));
+            } else if ch.is_control() || (quoted && matches!(ch, '"' | '\\')) {
                 escaped.extend(ch.escape_default());
             } else {
                 escaped.push(ch);
@@ -661,4 +723,16 @@ pub(crate) fn chain_kind(kind: ChainKind) -> &'static str {
         ChainKind::LinkItem => "LINK_LIBRARIES",
         ChainKind::Usage(field) => field.name(),
     }
+}
+
+fn is_format(ch: char) -> bool {
+    // Unicode 17.0 General_Category=Cf.
+    matches!(ch,
+        '\u{00ad}' | '\u{0600}'..='\u{0605}' | '\u{061c}' | '\u{06dd}' | '\u{070f}' |
+        '\u{0890}'..='\u{0891}' | '\u{08e2}' | '\u{180e}' | '\u{200b}'..='\u{200f}' |
+        '\u{202a}'..='\u{202e}' | '\u{2060}'..='\u{2064}' | '\u{2066}'..='\u{206f}' |
+        '\u{feff}' | '\u{fff9}'..='\u{fffb}' | '\u{110bd}' | '\u{110cd}' |
+        '\u{13430}'..='\u{1343f}' | '\u{1bca0}'..='\u{1bca3}' | '\u{1d173}'..='\u{1d17a}' |
+        '\u{e0001}' | '\u{e0020}'..='\u{e007f}'
+    )
 }

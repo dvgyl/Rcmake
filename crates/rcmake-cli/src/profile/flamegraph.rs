@@ -407,7 +407,7 @@ dd { margin: 2px 0 0; font-variant-numeric: tabular-nums; }
 <p class="hint" id="hint">Select a bar to zoom. Use the arrow keys to select a frame, Enter to zoom, and Esc to reset zoom. Press / to search all frames.</p>
 <p class="hint" id="overlap" hidden>Some frames overlap in time. The graph scales bars to fit within the parent bar. The detail panel shows measured times and percentages.</p>
 <div id="graph-wrap">
-<svg id="graph" tabindex="0" role="listbox" aria-label="Profile flamegraph" aria-describedby="hint"></svg>
+<svg id="graph" tabindex="0" role="tree" aria-label="Profile flamegraph" aria-describedby="hint"></svg>
 </div>
 <p id="render-status" class="hint" hidden></p>
 <section id="details" aria-labelledby="details-title">
@@ -560,10 +560,11 @@ const SCRIPT: &str = r#"<script>
   function bar(id) {
     const node = nodes[id];
     const group = svgElement('g', {
-      id: `frame-${id}`, class: `frame ${node.kind}`, 'data-id': id, role: 'option',
+      id: `frame-${id}`, class: `frame ${node.kind}`, 'data-id': id, role: 'treeitem', 'aria-level': node.row + 1,
       'aria-selected': 'false', 'aria-label': `${node.label}, ${duration(node.inclusive)}`,
       transform: `translate(${node.x} ${node.row * ROW})`,
     });
+    if (node.children.length) group.setAttribute('aria-expanded', 'true');
     highlight(id, group);
     const width = Math.max(0, node.width - (node.width > 3 ? 1 : 0));
     group.append(svgElement('rect', {width, height: ROW - 2, rx: Math.min(2, width / 2)}));

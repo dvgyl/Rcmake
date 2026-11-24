@@ -7,7 +7,7 @@ use std::ops::Range;
 use crate::annotate::{Confidence, Edit, Fix};
 use crate::{SourceFile, SourceId};
 
-use super::{Cells, Line, Renderer, Site, SourceLookup, editor_column};
+use super::{Cells, Line, Renderer, Site, SourceLookup, Window, editor_column};
 
 struct CheckedEdit<'source, 'edit> {
     bytes: Range<usize>,
@@ -218,7 +218,7 @@ impl Renderer {
             if window.before {
                 self.out.push_str(ellipsis);
             }
-            self.paint(color, &window.text);
+            self.paint_changes(&cells, &window, changes, offset, color);
             if window.after {
                 self.out.push_str(ellipsis);
             }
@@ -235,8 +235,70 @@ impl Renderer {
         self.diff_omission(sign);
     }
 
+    fn paint_changes(
+        &mut self,
+        cells: &Cells<'_>,
+        window: &Window,
+        changes: &[Range<usize>],
+        offset: usize,
+        color: u8,
+    ) {
+        if !self.opts.color {
+            self.out.push_str(&window.text);
+            return;
+        }
+        let mut cursor = window.start;
+        let paint = |renderer: &mut Self, cursor: &mut usize, end: usize, color| {
+            let (text, actual_end) = cells.piece(*cursor, end - *cursor);
+            if color == 0 {
+                renderer.out.push_str(&text);
+            } else {
+                renderer.paint(color, &text);
+            }
+            *cursor = actual_end;
+        };
+        for change in changes.iter().filter(|range| !range.is_empty()) {
+            let first = cells.column(change.start.saturating_sub(offset), false);
+            let last = cells
+                .column(change.end.saturating_sub(offset), true)
+                .min(window.end);
+            if first >= window.end {
+                break;
+            }
+            if last <= cursor {
+                continue;
+            }
+            if first > cursor {
+                paint(self, &mut cursor, first, 0);
+            }
+            paint(self, &mut cursor, last, color);
+        }
+        if cursor < window.end {
+            paint(self, &mut cursor, window.end, 0);
+        }
+    }
+
     fn diff_omission(&mut self, sign: char) {
         let ellipsis = self.ellipsis();
         let _ = writeln!(self.out, "    {sign} {ellipsis}");
     }
+}
+
+#[test]
+fn colors_only_changed_spans_inside_fix_preview_lines() {
+    let mut renderer = Renderer {
+        out: String::new(),
+        opts: super::RichOptions {
+            color: true,
+            ..super::RichOptions::default()
+        },
+        width: 100,
+        primary_color: 31,
+    };
+    renderer.diff('-', "set(red shared old)", &[4..7, 15..18], false);
+    renderer.diff('+', "set(green shared new)", &[4..9, 17..20], false);
+    assert_eq!(
+        renderer.out,
+        "    - set(\x1b[31mred\x1b[0m shared \x1b[31mold\x1b[0m)\n    + set(\x1b[32mgreen\x1b[0m shared \x1b[32mnew\x1b[0m)\n",
+    );
 }

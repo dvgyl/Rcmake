@@ -7,6 +7,9 @@ use std::fmt::Write as _;
 use std::path::Path;
 use std::time::Duration;
 
+use rcmake_base::path_lex::Lexical;
+use rcmake_host::path::to_native;
+
 use super::{Coverage, ProfileKind, ProfilePhase, Site, Span, State};
 
 const TOP_COUNT: usize = 10;
@@ -165,15 +168,41 @@ pub(super) fn render(state: &State, spans: &[Span], wall: Duration, total: Durat
     }
 
     if !summary.categories.is_empty() {
-        heading(&mut out, "Category", "Command categories");
-        for (category, stats) in summary.categories {
-            row(&mut out, total, category.name(), Some(&stats));
+        heading(&mut out, "Category", "Command categories can overlap");
+        for (&category, stats) in &summary.categories {
+            row(&mut out, total, category.name(), Some(stats));
+        }
+        let checks = summary.categories.get(&Category::Check);
+        if let Some(checks) = checks.filter(|timing| timing.measured) {
+            let elapsed = checks.inclusive.elapsed;
+            let time = if elapsed < Duration::from_millis(50) {
+                duration(elapsed)
+            } else {
+                format!("{:.1} s", elapsed.as_secs_f64())
+            };
+            let (calls, verb) = if checks.calls == 1 {
+                ("call", "is")
+            } else {
+                ("calls", "are")
+            };
+            let _ = writeln!(
+                out,
+                "{} check_* {calls} ({time}) {verb} cacheable by the probe cache.",
+                checks.calls
+            );
         }
     }
+    let root = source_root(spans);
+    let root = root.as_ref().map(|path| path.as_slice());
     if !summary.files.is_empty() {
         heading(&mut out, "List file", "Top list files by self time");
         for (file, stats) in top(summary.files, |stats| stats.self_time) {
-            row(&mut out, total, &display(file), Some(&stats));
+            row(
+                &mut out,
+                total,
+                &display_source_path(file, root),
+                Some(&stats),
+            );
         }
     }
     if !summary.commands.is_empty() {
@@ -185,12 +214,48 @@ pub(super) fn render(state: &State, spans: &[Span], wall: Duration, total: Durat
         for (site, stats) in top(summary.commands, |stats| stats.inclusive.elapsed) {
             let mut label = format!("{:<8}  {}", site.kind.category(), display(&site.name));
             if !site.file.is_empty() {
-                let _ = write!(label, "  {}:{}", display(&site.file), site.line);
+                let _ = write!(
+                    label,
+                    "  {}:{}",
+                    display_source_path(&site.file, root),
+                    site.line
+                );
             }
             row(&mut out, total, &label, Some(&stats));
         }
     }
     out
+}
+
+fn source_root(spans: &[Span]) -> Option<rcmake_base::BString> {
+    // The outermost CMakeLists.txt identifies the source root in evaluator samples.
+    spans
+        .iter()
+        .filter_map(|span| {
+            let file = if span.site.file.is_empty() && span.site.kind == ProfileKind::ListFile {
+                &span.site.name
+            } else {
+                &span.site.file
+            };
+            let name = file.rsplit(|byte| matches!(*byte, b'/' | b'\\')).next();
+            if name != Some(b"CMakeLists.txt".as_slice()) {
+                return None;
+            }
+            let path = to_native(file);
+            path.is_absolute().then_some((span, path))
+        })
+        .min_by_key(|(span, _)| (span.depth, span.start))
+        .and_then(|(_, path)| path.parent().map(rcmake_host::path::from_native_cmake))
+        .map(|root| Lexical::new(&root).normalize())
+}
+
+fn display_source_path(file: &[u8], root: Option<&[u8]>) -> String {
+    let file = rcmake_base::path_lex::cmake_style(file);
+    let file = Lexical::new(&file).normalize();
+    let relative = root
+        .and_then(|root| Lexical::new(&file).relative(Lexical::new(root)))
+        .filter(|path| path != ".." && !path.starts_with(b"../"));
+    display(relative.as_ref().unwrap_or(&file))
 }
 
 fn heading(out: &mut String, name: &str, title: &str) {
@@ -252,10 +317,27 @@ pub(super) fn display_path(path: &Path) -> String {
 }
 
 fn display(bytes: &[u8]) -> String {
-    String::from_utf8_lossy(bytes)
-        .chars()
-        .map(|ch| if ch.is_control() { '\u{fffd}' } else { ch })
-        .collect()
+    let mut text = String::new();
+    for ch in String::from_utf8_lossy(bytes).chars() {
+        if is_format(ch) {
+            let _ = write!(text, "<U+{:04X}>", u32::from(ch));
+        } else {
+            text.push(if ch.is_control() { '\u{fffd}' } else { ch });
+        }
+    }
+    text
+}
+
+fn is_format(ch: char) -> bool {
+    // Unicode 17.0 General_Category=Cf.
+    matches!(ch,
+        '\u{00ad}' | '\u{0600}'..='\u{0605}' | '\u{061c}' | '\u{06dd}' | '\u{070f}' |
+        '\u{0890}'..='\u{0891}' | '\u{08e2}' | '\u{180e}' | '\u{200b}'..='\u{200f}' |
+        '\u{202a}'..='\u{202e}' | '\u{2060}'..='\u{2064}' | '\u{2066}'..='\u{206f}' |
+        '\u{feff}' | '\u{fff9}'..='\u{fffb}' | '\u{110bd}' | '\u{110cd}' |
+        '\u{13430}'..='\u{1343f}' | '\u{1bca0}'..='\u{1bca3}' | '\u{1d173}'..='\u{1d17a}' |
+        '\u{e0001}' | '\u{e0020}'..='\u{e007f}'
+    )
 }
 
 #[cfg(test)]
@@ -292,6 +374,8 @@ mod tests {
         assert!(report.contains("4.2 ms of recorded wall time"));
         assert!(report.contains("100.0%"));
         assert!(report.contains("check_*"));
+        assert!(report.contains("Command categories can overlap"));
+        assert!(report.contains("1 check_* call (4.2 ms) is cacheable by the probe cache."));
         assert!(report.contains("macro     a\u{fffd}  test.cmake:10"));
         assert!(report.contains("macro     z\u{fffd}  test.cmake:10"));
         assert!(report.find("a\u{fffd}") < report.find("z\u{fffd}"));

@@ -36,8 +36,7 @@ const MAX_STAMPS: usize = 256;
 const PROBE_BLOB_BYTES: usize = 16 * 1024 * 1024;
 const SESSION_BLOB_BYTES: usize = 64 * 1024 * 1024;
 const MAX_AUTH_BYTES: usize = 8 * 1024;
-const CONNECT_TIMEOUT: Duration = Duration::from_millis(300);
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(1);
+const EXPORT_TIMEOUT_SETTING: &str = "RCMAKE_CACHE_REMOTE_EXPORT_TIMEOUT";
 const FRAME_BYTES: usize = frame::ENTRY_LIMIT;
 type FrameResult = Result<Option<Vec<u8>>, RemoteError>;
 const RESPONSE_LIMIT: RemoteError =
@@ -47,8 +46,7 @@ const INVALID_MANIFEST: RemoteError =
 const LOCAL_STORE: RemoteError =
     RemoteError::Failure("Cannot access local cache data. Check RCMAKE_CACHE_DIR.");
 const TIMEOUT: RemoteError = RemoteError::Failure("The remote request timed out.");
-const BUDGET: RemoteError = RemoteError::Failure("The remote cache exceeded session_timeout.");
-
+const BUDGET: RemoteError = RemoteError::Failure("The remote cache time limit expired.");
 /// Kind of keyed entry in a portable cache export.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -58,7 +56,6 @@ pub enum CacheEntryKind {
     /// FetchContent archive cache entry.
     Fetch,
 }
-
 impl CacheEntryKind {
     fn domain(self) -> Domain {
         match self {
@@ -67,7 +64,6 @@ impl CacheEntryKind {
         }
     }
 }
-
 /// Content identities for one exported entry and its referenced blobs.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -82,7 +78,6 @@ pub struct ManifestEntry {
     #[serde(deserialize_with = "read_sequence::<_, _, MAX_BLOBS_PER_ENTRY>")]
     pub blobs: Vec<Digest>,
 }
-
 impl ManifestEntry {
     fn identity(&self) -> (CacheEntryKind, Digest) {
         (self.kind, self.key)
@@ -114,19 +109,14 @@ where
     struct Bounded<T, const LIMIT: usize>(std::marker::PhantomData<T>);
     impl<'de, T: Deserialize<'de>, const LIMIT: usize> Visitor<'de> for Bounded<T, LIMIT> {
         type Value = Vec<T>;
-
         fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
             write!(f, "a sequence of up to {LIMIT} items")
         }
         fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Vec<T>, A::Error> {
-            let mut items = Vec::new();
-            while items.len() < LIMIT {
-                match seq.next_element()? {
-                    Some(item) => items.push(item),
-                    None => return Ok(items),
-                }
-            }
-            if seq.next_element::<IgnoredAny>()?.is_some() {
+            let items = std::iter::from_fn(|| seq.next_element().transpose())
+                .take(LIMIT)
+                .collect::<Result<Vec<_>, _>>()?;
+            if items.len() == LIMIT && seq.next_element::<IgnoredAny>()?.is_some() {
                 return Err(de::Error::custom("Sequence limit exceeded."));
             }
             Ok(items)
@@ -134,13 +124,11 @@ where
     }
     de.deserialize_seq(Bounded::<T, LIMIT>(std::marker::PhantomData))
 }
-
 /// Versioned manifest for moving probe and fetch cache data between local stores.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct CacheManifest {
     entries: Vec<ManifestEntry>,
 }
-
 impl CacheManifest {
     /// Parse bounded JSON. Reject other versions and duplicate keys.
     pub fn from_json(json: &[u8]) -> Result<Self, RemoteError> {
@@ -208,13 +196,8 @@ impl CacheManifest {
     }
 }
 fn valid_record(entry: &ManifestEntry) -> bool {
-    entry.blobs.len() <= MAX_BLOBS_PER_ENTRY
-        && entry
-            .blobs
-            .windows(2)
-            .all(|pair| matches!(pair, [a, b] if a < b))
+    entry.blobs.len() <= MAX_BLOBS_PER_ENTRY && entry.blobs.is_sorted_by(|a, b| a < b)
 }
-
 /// Export an existing entry frame and its manifest record. Check its trace at import.
 pub fn export_entry(
     store: &Store<'_>,
@@ -237,7 +220,6 @@ pub fn export_entry(
     };
     Ok(Some((manifest, encoded)))
 }
-
 /// Export the verified frame for one existing content-addressed blob.
 pub fn export_blob(store: &Store<'_>, digest: Digest) -> Result<Option<Vec<u8>>, RemoteError> {
     if store.config.mode == StoreMode::Off {
@@ -249,13 +231,11 @@ pub fn export_blob(store: &Store<'_>, digest: Digest) -> Result<Option<Vec<u8>>,
     decode_blob(&bytes, digest, &mut blob_limit())?;
     Ok(Some(bytes))
 }
-
 fn sorted_blobs(mut blobs: Vec<Digest>) -> Vec<Digest> {
     blobs.sort_unstable();
     blobs.dedup();
     blobs
 }
-
 fn decode_entry<T: DeserializeOwned>(
     kind: CacheEntryKind,
     key: Digest,
@@ -290,7 +270,6 @@ fn decode_entry<T: DeserializeOwned>(
     }
     Ok(entry)
 }
-
 fn attach_blobs(
     store: &Store<'_>,
     pin: &ManifestEntry,
@@ -301,10 +280,11 @@ fn attach_blobs(
     if store.config.mode == StoreMode::Off {
         return Ok(false);
     }
+    let mut local_remaining = PROBE_BLOB_BYTES;
     for &digest in &pin.blobs {
         let path = store.blob_path(digest);
-        if let Some(bytes) = read_frame(store, &path, *remaining)? {
-            decode_blob(&bytes, digest, remaining)?;
+        if let Some(bytes) = read_frame(store, &path, local_remaining)? {
+            decode_blob(&bytes, digest, &mut local_remaining).map_err(|_| LOCAL_STORE)?;
         } else if store.writable()
             && let Some(bytes) = load_blob(digest, *remaining)?
         {
@@ -339,7 +319,6 @@ fn publish_pinned(
     }
     Ok(true)
 }
-
 fn read_frame(store: &Store<'_>, path: &Path, limit: usize) -> FrameResult {
     if store
         .file_metadata(path)
@@ -352,7 +331,6 @@ fn read_frame(store: &Store<'_>, path: &Path, limit: usize) -> FrameResult {
     match store.host.read(path, ReadRange::All { limit }) {
         Ok(bytes) => Ok(Some(bytes)),
         Err(error) if error.kind == ErrorKind::NotFound => Ok(None),
-        Err(error) if error.kind == ErrorKind::FileTooLarge => Err(RESPONSE_LIMIT),
         Err(_) => Err(LOCAL_STORE),
     }
 }
@@ -368,7 +346,6 @@ fn decode_blob(encoded: &[u8], digest: Digest, budget: &mut usize) -> Result<usi
     }
     Ok(bytes.len())
 }
-
 /// Remote write policy. Both modes permit reads.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum RemoteAccess {
@@ -378,7 +355,6 @@ pub enum RemoteAccess {
     /// Fetch and publish entries and blobs.
     ReadWrite,
 }
-
 /// Authentication settings. Values are read from the host for each request.
 pub enum RemoteAuth {
     /// Send no credentials.
@@ -390,7 +366,6 @@ pub enum RemoteAuth {
     /// Sign requests to an S3 HTTPS endpoint. The value is the AWS region.
     S3(String),
 }
-
 /// Address and limits for an optional remote probe cache.
 pub struct RemoteCacheConfig {
     endpoint: String,
@@ -407,8 +382,9 @@ pub struct RemoteCacheConfig {
     pub export_captured_output: bool,
     /// Maximum cumulative time spent on remote cache work in one configure.
     pub session_timeout: Duration,
+    /// Maximum cumulative time for one export job. The default is 300 seconds.
+    pub export_timeout: Duration,
 }
-
 impl RemoteCacheConfig {
     /// Use an HTTP or HTTPS origin or base path without URL user info, query, or fragment.
     pub fn new(endpoint: &str) -> Result<Self, RemoteError> {
@@ -435,13 +411,12 @@ impl RemoteCacheConfig {
             private_dir: None,
             export_captured_output: false,
             session_timeout: Duration::from_secs(3),
+            export_timeout: Duration::from_secs(300),
         })
     }
     /// Read settings from the host. An unset or empty RCMAKE_CACHE_REMOTE disables access.
     /// Uploads require RCMAKE_CACHE_REMOTE_WRITE=1 and RCMAKE_CACHE_REMOTE_EXPORT_CAPTURED_OUTPUT=1.
-    /// Set RCMAKE_CACHE_REMOTE_CURL to select a trusted absolute executable.
-    /// An endpoint path or authentication requires HTTPS and RCMAKE_CACHE_REMOTE_PRIVATE_DIR.
-    /// Set RCMAKE_CACHE_REMOTE_AUTH to bearer, header, or s3 to authenticate.
+    /// Set RCMAKE_CACHE_REMOTE_EXPORT_TIMEOUT to the export time limit in seconds.
     pub fn from_host(host: &dyn Host) -> Result<Option<Self>, RemoteError> {
         let env = |key: &[u8]| host.env_get(key);
         let enabled = |key: &[u8]| env(key).is_some_and(|s| s == "1");
@@ -459,6 +434,16 @@ impl RemoteCacheConfig {
         if enabled(b"RCMAKE_CACHE_REMOTE_WRITE") {
             config.access = RemoteAccess::ReadWrite;
         }
+        if env(EXPORT_TIMEOUT_SETTING.as_bytes()).is_some() {
+            const INVALID_TIMEOUT: RemoteError = RemoteError::Setting(EXPORT_TIMEOUT_SETTING);
+            let seconds = text(EXPORT_TIMEOUT_SETTING)?
+                .parse()
+                .map_err(|_| INVALID_TIMEOUT)?;
+            config.export_timeout = Duration::from_secs(seconds);
+            if seconds == 0 {
+                return Err(INVALID_TIMEOUT);
+            }
+        }
         config.export_captured_output = enabled(b"RCMAKE_CACHE_REMOTE_EXPORT_CAPTURED_OUTPUT");
         config.curl_path = env(b"RCMAKE_CACHE_REMOTE_CURL").map(|s| path::to_native(&s));
         config.private_dir = env(b"RCMAKE_CACHE_REMOTE_PRIVATE_DIR").map(|s| path::to_native(&s));
@@ -475,7 +460,6 @@ impl RemoteCacheConfig {
         Ok(Some(config))
     }
 }
-
 fn resolve(
     host: &dyn Host,
     path: Option<&Path>,
@@ -488,17 +472,15 @@ fn resolve(
     host.metadata(&path, Follow::No)
         .ok()
         .filter(check)
-        .ok_or(invalid)?;
-    Ok(path)
+        .map(|_| path)
+        .ok_or(invalid)
 }
-
 fn valid_header(name: &str) -> bool {
     !name.is_empty() && name.len() <= 128
         && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
         && !("host content-length transfer-encoding connection expect proxy-authorization proxy-connection trailer upgrade te"
             .split_ascii_whitespace().any(|reserved| name.eq_ignore_ascii_case(reserved)))
 }
-
 /// Safe reason for a cache miss.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RemoteError {
@@ -509,7 +491,6 @@ pub enum RemoteError {
     /// The endpoint returned an unexpected HTTP status.
     HttpStatus(u16),
 }
-
 impl fmt::Display for RemoteError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match *self {
@@ -520,20 +501,33 @@ impl fmt::Display for RemoteError {
     }
 }
 impl std::error::Error for RemoteError {}
-/// Optional remote cache scoped to one configure.
+/// Optional remote cache scoped to one configure or export job.
 pub struct RemoteStoreClient<'a> {
     host: &'a dyn Host,
     config: RemoteCacheConfig,
     curl: PathBuf,
-    time_left: Duration,
+    read_time_left: Duration,
+    export_time_left: Duration,
     blob_bytes: usize,
     failures: u32,
     diagnostic: Option<RemoteError>,
 }
-
 impl<'a> RemoteStoreClient<'a> {
-    /// Create a client with a trusted host that enforces bounded process capture.
+    /// Create a client with bounded process capture and verify its HTTPS and directory settings.
     pub fn new(host: &'a dyn Host, mut config: RemoteCacheConfig) -> Result<Self, RemoteError> {
+        let host_path = config
+            .endpoint
+            .split_once("://")
+            .is_some_and(|(_, rest)| rest.contains('/'));
+        let needs_private_dir = host_path || !matches!(config.auth, RemoteAuth::Anonymous);
+        if (needs_private_dir || config.access == RemoteAccess::ReadWrite)
+            && !config.endpoint.starts_with("https://")
+        {
+            return Err(RemoteError::Setting("RCMAKE_CACHE_REMOTE (HTTPS required)"));
+        }
+        if config.export_timeout.is_zero() {
+            return Err(RemoteError::Setting(EXPORT_TIMEOUT_SETTING));
+        }
         let windows = host.system().sysname == "Windows";
         let default = if windows {
             "C:/Windows/System32/curl.exe"
@@ -547,14 +541,7 @@ impl<'a> RemoteStoreClient<'a> {
         if config.session_timeout.is_zero() {
             return Err(RemoteError::Setting("session_timeout"));
         }
-        let host_path = config
-            .endpoint
-            .split_once("://")
-            .is_some_and(|(_, rest)| rest.contains('/'));
-        config.private_dir = if host_path || !matches!(config.auth, RemoteAuth::Anonymous) {
-            if !config.endpoint.starts_with("https://") {
-                return Err(RemoteError::Setting("RCMAKE_CACHE_REMOTE (HTTPS required)"));
-            }
+        config.private_dir = if needs_private_dir {
             Some(resolve(
                 host,
                 config.private_dir.as_deref(),
@@ -567,7 +554,8 @@ impl<'a> RemoteStoreClient<'a> {
         Ok(Self {
             host,
             curl,
-            time_left: config.session_timeout,
+            read_time_left: config.session_timeout,
+            export_time_left: config.export_timeout,
             config,
             blob_bytes: SESSION_BLOB_BYTES,
             failures: 0,
@@ -585,10 +573,8 @@ impl<'a> RemoteStoreClient<'a> {
         })
     }
     /// Read a probe pinned by a trusted manifest. An absent pin is a miss without I/O.
-    /// Supply the trace built from verified local inputs. The client compares the full
-    /// trace without opening any of its paths. Check the payload and artifact identities
-    /// against the local plan in `validate`.
-    /// A read-only or verify store can reuse entries whose blobs already exist locally.
+    /// Supply the verified local trace and check the payload and artifacts in `validate`.
+    /// A read-only or verify store can reuse entries with local blobs.
     pub fn get_probe<T: DeserializeOwned>(
         &mut self,
         store: &Store<'_>,
@@ -605,11 +591,11 @@ impl<'a> RemoteStoreClient<'a> {
         if store.config.mode == StoreMode::Off {
             return Ok(None);
         }
-        self.attempt(|client, deadline| {
+        self.attempt(false, |client, deadline| {
             let Some(encoded) = client.request(
                 &format!("probe/v1/{key}.entry"),
                 None,
-                frame::ENTRY_LIMIT,
+                frame::disk_limit(FRAME_BYTES) as usize,
                 deadline,
             )?
             else {
@@ -643,19 +629,18 @@ impl<'a> RemoteStoreClient<'a> {
         {
             return Ok(false);
         }
-        self.attempt(|client, deadline| {
-            let Some((pin, encoded)) = export_entry(store, CacheEntryKind::Probe, key)? else {
+        self.attempt(true, |client, deadline| {
+            let Some((pin, encoded)) =
+                export_entry(store, CacheEntryKind::Probe, key).map_err(|_| LOCAL_STORE)?
+            else {
                 return Ok(None);
             };
-            let mut remaining = client.blob_bytes.min(PROBE_BLOB_BYTES);
+            let mut remaining = PROBE_BLOB_BYTES;
             for digest in pin.blobs {
                 let Some(blob) = read_frame(store, &store.blob_path(digest), remaining)? else {
                     return Ok(None);
                 };
-                let before = remaining;
-                let checked = decode_blob(&blob, digest, &mut remaining);
-                client.blob_bytes -= before - remaining;
-                checked?;
+                decode_blob(&blob, digest, &mut remaining).map_err(|_| LOCAL_STORE)?;
                 client.upload(
                     store,
                     &format!("blobs/sha256/{digest}.blob"),
@@ -668,25 +653,36 @@ impl<'a> RemoteStoreClient<'a> {
         })
         .map(|result| result.is_some())
     }
-
     fn attempt<T>(
         &mut self,
+        export: bool,
         operation: impl FnOnce(&mut Self, Duration) -> Result<Option<T>, RemoteError>,
     ) -> Result<Option<T>, RemoteError> {
         if self.circuit_is_open() {
             return Ok(None);
         }
         let start = self.host.monotonic();
-        let mut result = operation(self, start.saturating_add(self.time_left));
-        self.time_left = self
-            .time_left
-            .saturating_sub(self.host.monotonic().saturating_sub(start));
-        if self.time_left.is_zero() {
+        let budget = if export {
+            self.export_time_left
+        } else {
+            self.read_time_left
+        };
+        let mut result = operation(self, start.saturating_add(budget));
+        if matches!(result, Err(LOCAL_STORE)) {
+            return result;
+        }
+        let remaining = budget.saturating_sub(self.host.monotonic().saturating_sub(start));
+        if export {
+            self.export_time_left = remaining;
+        } else {
+            self.read_time_left = remaining;
+        }
+        if remaining.is_zero() {
             result = Err(BUDGET);
         }
         match &result {
             Ok(Some(_)) => self.failures = 0,
-            Ok(None) | Err(LOCAL_STORE) => {}
+            Ok(None) => {}
             Err(RemoteError::Setting(_) | RemoteError::HttpStatus(401 | 403) | BUDGET) => {
                 self.failures = 2
             }
@@ -697,7 +693,6 @@ impl<'a> RemoteStoreClient<'a> {
         }
         result
     }
-
     fn upload(
         &self,
         store: &Store<'_>,
@@ -705,34 +700,31 @@ impl<'a> RemoteStoreClient<'a> {
         bytes: &[u8],
         deadline: Duration,
     ) -> Result<(), RemoteError> {
-        if bytes.len() > FRAME_BYTES {
-            return Err(RESPONSE_LIMIT);
-        }
         let scratch = store.config.root.join("tmp");
         store.ensure_dir(&scratch).map_err(|_| LOCAL_STORE)?;
         let path = temporary_path(self.host, &scratch);
         let _cleanup = stage(self.host, &path, bytes).map_err(|_| LOCAL_STORE)?;
-        self.request(suffix, Some(&path), FRAME_BYTES, deadline)
+        self.request(suffix, Some((&path, bytes.len())), FRAME_BYTES, deadline)
             .map(|_| ())
     }
-
     fn request(
         &self,
         suffix: &str,
-        upload: Option<&Path>,
+        upload: Option<(&Path, usize)>,
         limit: usize,
         deadline: Duration,
     ) -> FrameResult {
         let config = &self.config;
-        let time = deadline
-            .saturating_sub(self.host.monotonic())
-            .min(REQUEST_TIMEOUT);
+        // Allow one second of overhead plus time to upload at 128 KiB/s.
+        let timeout = upload.map_or(Duration::from_secs(1), |(_, size)| {
+            Duration::from_secs(1 + size.div_ceil(128 * 1024) as u64)
+        });
+        let time = deadline.saturating_sub(self.host.monotonic()).min(timeout);
         if time.is_zero() {
             return Err(BUDGET);
         }
-        let limit = limit.min(FRAME_BYTES);
-        let mut args = parse_curl_flags(time, limit);
-        if let Some(path) = upload {
+        let mut args = parse_curl_flags(time, limit, upload.is_some());
+        if let Some((path, _)) = upload {
             args.extend(["--upload-file".into(), path::from_native(path)]);
         }
         let url = format!("{}/{suffix}", config.endpoint);
@@ -751,7 +743,10 @@ impl<'a> RemoteStoreClient<'a> {
         let stdin = staged
             .as_ref()
             .map_or(Input::Null, |file| Input::File(file.path.into()));
-        let env = self.host.env_get(b"SystemRoot");
+        let env = "SystemRoot HTTPS_PROXY https_proxy HTTP_PROXY http_proxy NO_PROXY no_proxy SSL_CERT_FILE CURL_CA_BUNDLE"
+            .split_ascii_whitespace()
+            .filter_map(|key| self.host.env_get(key.as_bytes()).map(|value| (key.into(), value)))
+            .collect();
         let time = time.min(deadline.saturating_sub(self.host.monotonic()));
         if time.is_zero() {
             return Err(BUDGET);
@@ -764,10 +759,7 @@ impl<'a> RemoteStoreClient<'a> {
         let request = RunRequest {
             pipeline: vec![CommandSpec { program, args }],
             cwd: cwd.to_owned(),
-            env: env
-                .into_iter()
-                .map(|value| ("SystemRoot".into(), value))
-                .collect(),
+            env,
             stdin,
             stdout: Output::Capture,
             stderr: Output::Null,
@@ -793,8 +785,13 @@ impl<'a> RemoteStoreClient<'a> {
                 [ProcessResult::Exited(35 | 51 | 58..=60 | 77 | 83 | 90 | 91)] => {
                     "Curl TLS verification failed."
                 }
-                [ProcessResult::Exited(5 | 6)] => "Curl could not resolve the cache host.",
-                [ProcessResult::Exited(7)] => "Curl could not connect to the cache host.",
+                [ProcessResult::Exited(5)] => {
+                    "Curl could not resolve the proxy. Check HTTPS_PROXY and HTTP_PROXY."
+                }
+                [ProcessResult::Exited(6)] => "Curl could not resolve the cache host.",
+                [ProcessResult::Exited(7)] => {
+                    "Curl could not connect. Check the cache endpoint and HTTPS_PROXY, HTTP_PROXY, and NO_PROXY."
+                }
                 _ => "Curl could not complete the transfer.",
             })),
         }
@@ -803,10 +800,9 @@ impl<'a> RemoteStoreClient<'a> {
 fn response(mut bytes: Vec<u8>, limit: usize, upload: bool) -> FrameResult {
     let error = RemoteError::Failure("Curl returned no valid HTTP status.");
     let tail = bytes.len().checked_sub(3).ok_or(error)?;
-    let code = bytes
+    let status = bytes
         .get(tail..)
-        .filter(|b| b.iter().all(u8::is_ascii_digit));
-    let status = code
+        .filter(|b| b.iter().all(u8::is_ascii_digit))
         .and_then(|code| std::str::from_utf8(code).ok()?.parse::<u16>().ok())
         .ok_or(error)?;
     if tail > limit {
@@ -820,12 +816,19 @@ fn response(mut bytes: Vec<u8>, limit: usize, upload: bool) -> FrameResult {
         _ => Err(error),
     }
 }
-fn parse_curl_flags(time: Duration, limit: usize) -> Vec<BString> {
+fn parse_curl_flags(time: Duration, limit: usize, upload: bool) -> Vec<BString> {
     let duration = |time: Duration| format!("{:.6}", time.as_secs_f64().max(0.001));
-    let flags = "--disable --globoff --silent --proto =http,https --write-out %{http_code}";
+    let protocol = if upload { "=https" } else { "=http,https" };
+    let flags = "--disable --globoff --silent --write-out %{http_code} --proto";
     let mut args: Vec<_> = flags.split_ascii_whitespace().map(BString::from).collect();
+    args.push(protocol.into());
+    let connect_timeout = if upload {
+        Duration::from_secs(5)
+    } else {
+        Duration::from_millis(300)
+    };
     for (flag, value) in [
-        ("--connect-timeout", duration(time.min(CONNECT_TIMEOUT))),
+        ("--connect-timeout", duration(time.min(connect_timeout))),
         ("--max-time", duration(time)),
         ("--max-filesize", limit.to_string()),
     ] {
@@ -833,7 +836,6 @@ fn parse_curl_flags(time: Duration, limit: usize) -> Vec<BString> {
     }
     args
 }
-
 fn stage<'a>(
     host: &'a dyn Host,
     path: &'a Path,
@@ -851,14 +853,12 @@ fn stage<'a>(
         armed: true,
     })
 }
-
 fn temporary_path(host: &dyn Host, dir: &Path) -> PathBuf {
     let now = host.now();
     let pid = host.system().pid;
     let serial = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
     dir.join(format!("remote-{pid}-{}-{}-{serial}", now.secs, now.nanos))
 }
-
 fn credentials(
     host: &dyn Host,
     auth: &RemoteAuth,
@@ -920,7 +920,6 @@ fn credentials(
     }
     Ok(config)
 }
-
 fn append_config(config: &mut Vec<u8>, option: &[u8], parts: &[&[u8]]) {
     config.extend_from_slice(option);
     config.extend_from_slice(b" = \"");
@@ -932,7 +931,6 @@ fn append_config(config: &mut Vec<u8>, option: &[u8], parts: &[&[u8]]) {
     }
     config.extend_from_slice(b"\"\n");
 }
-
 #[test]
 fn round_trips_manifest_and_rejects_excess_blob_digests() -> Result<(), Box<dyn std::error::Error>>
 {

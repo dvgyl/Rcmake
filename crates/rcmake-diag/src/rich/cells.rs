@@ -1,5 +1,7 @@
 //! Terminal cell and editor column coordinates.
 
+use std::fmt::Write as _;
+
 use rcmake_base::ByteSlice as _;
 
 const TAB_WIDTH: usize = 4;
@@ -152,6 +154,8 @@ impl Glyph {
             .unwrap_or_default();
         if content.len() > MAX_GLYPH_BYTES {
             text.extend(std::iter::repeat_n('�', width));
+        } else if is_format(self.head) {
+            let _ = write!(text, "<U+{:04X}>", u32::from(self.head));
         } else if self.head == '\t' {
             text.extend(std::iter::repeat_n(' ', width));
         } else {
@@ -172,7 +176,10 @@ fn glyphs(bytes: &[u8], from: Boundary) -> impl Iterator<Item = Glyph> + '_ {
     let mut column = from.column;
     std::iter::from_fn(move || {
         let (start, mut end, head) = scalars.next()?;
-        let mut width = if head == '\t' {
+        let format = is_format(head);
+        let mut width = if format {
+            4 + if u32::from(head) > 0xffff { 5 } else { 4 }
+        } else if head == '\t' {
             TAB_WIDTH - column % TAB_WIDTH
         } else if !extends(head) && is_wide(head) {
             2
@@ -180,21 +187,18 @@ fn glyphs(bytes: &[u8], from: Boundary) -> impl Iterator<Item = Glyph> + '_ {
             1
         };
         let emoji = is_pictograph(head);
-        let mut joins_emoji = false;
         let mut joins_regional = is_regional(head);
         while let Some(&(_, next_end, next)) = scalars.peek() {
-            let emoji_pair = joins_emoji && is_pictograph(next);
             let regional_pair = joins_regional && is_regional(next);
-            if head == '\t' || (!extends(next) && !emoji_pair && !regional_pair) {
+            if format || head.is_control() || (!extends(next) && !regional_pair) {
                 break;
             }
-            if (emoji && next == '\u{fe0f}') || next == '\u{20e3}' || regional_pair || emoji_pair {
+            if (emoji && next == '\u{fe0f}') || next == '\u{20e3}' || regional_pair {
                 width = 2;
             }
             end = next_end;
             scalars.next();
             joins_regional = false;
-            joins_emoji = next == '\u{200d}' && emoji;
         }
         let glyph = Glyph {
             start: Boundary {
@@ -213,7 +217,7 @@ fn glyphs(bytes: &[u8], from: Boundary) -> impl Iterator<Item = Glyph> + '_ {
 }
 
 fn extends(ch: char) -> bool {
-    is_combining(ch) || is_variant(ch) || ch == '\u{200d}'
+    is_combining(ch) || is_variant(ch)
 }
 
 fn is_regional(ch: char) -> bool {
@@ -229,13 +233,17 @@ pub(super) fn editor_column(bytes: &[u8], byte: usize) -> usize {
         + 1
 }
 
-/// Replace terminal control characters with a visible character.
+/// Replace terminal control and format characters with a visible character.
 pub(super) fn visible_char(ch: char) -> char {
-    if ch.is_control() { '�' } else { ch }
+    if ch.is_control() || is_format(ch) {
+        '�'
+    } else {
+        ch
+    }
 }
 
 fn is_variant(ch: char) -> bool {
-    matches!(ch, '\u{fe00}'..='\u{fe0f}' | '\u{1f3fb}'..='\u{1f3ff}' | '\u{e0020}'..='\u{e007f}' | '\u{e0100}'..='\u{e01ef}')
+    matches!(ch, '\u{fe00}'..='\u{fe0f}' | '\u{1f3fb}'..='\u{1f3ff}' | '\u{e0100}'..='\u{e01ef}')
 }
 
 fn is_combining(ch: char) -> bool {
@@ -252,7 +260,7 @@ fn is_combining(ch: char) -> bool {
         '\u{0e31}' | '\u{0e34}'..='\u{0e3a}' | '\u{0e47}'..='\u{0e4e}' |
         '\u{0eb1}' | '\u{0eb4}'..='\u{0ebc}' | '\u{0ec8}'..='\u{0ecf}' |
         '\u{1160}'..='\u{11ff}' | '\u{1ab0}'..='\u{1aff}' | '\u{1dc0}'..='\u{1dff}' |
-        '\u{200c}' | '\u{20d0}'..='\u{20ff}' | '\u{302a}'..='\u{302f}' | '\u{3099}'..='\u{309a}' |
+        '\u{20d0}'..='\u{20ff}' | '\u{302a}'..='\u{302f}' | '\u{3099}'..='\u{309a}' |
         '\u{d7b0}'..='\u{d7ff}' | '\u{fe20}'..='\u{fe2f}'
     )
 }
@@ -283,4 +291,29 @@ fn is_wide(ch: char) -> bool {
         '\u{1f191}'..='\u{1f19a}' | '\u{1f1e6}'..='\u{1f1ff}' | '\u{1f200}'..='\u{1f251}' |
         '\u{1f300}'..='\u{1faff}' | '\u{20000}'..='\u{3fffd}'
     )
+}
+
+fn is_format(ch: char) -> bool {
+    // Unicode 17.0 General_Category=Cf.
+    matches!(ch,
+        '\u{00ad}' | '\u{0600}'..='\u{0605}' | '\u{061c}' | '\u{06dd}' | '\u{070f}' |
+        '\u{0890}'..='\u{0891}' | '\u{08e2}' | '\u{180e}' | '\u{200b}'..='\u{200f}' |
+        '\u{202a}'..='\u{202e}' | '\u{2060}'..='\u{2064}' | '\u{2066}'..='\u{206f}' |
+        '\u{feff}' | '\u{fff9}'..='\u{fffb}' | '\u{110bd}' | '\u{110cd}' |
+        '\u{13430}'..='\u{1343f}' | '\u{1bca0}'..='\u{1bca3}' | '\u{1d173}'..='\u{1d17a}' |
+        '\u{e0001}' | '\u{e0020}'..='\u{e007f}'
+    )
+}
+
+#[test]
+fn escapes_bidi_and_zero_width_characters_at_their_display_width() {
+    for (ch, escaped) in [('\u{202e}', "<U+202E>"), ('\u{200b}', "<U+200B>")] {
+        let line = format!("a{ch}b");
+        let cells = Cells::new(line.as_bytes());
+        let width = escaped.len() + 2;
+        assert_eq!(cells.column(1, false), 1);
+        assert_eq!(cells.column(1 + ch.len_utf8(), false), width - 1);
+        assert_eq!(cells.width(), width);
+        assert_eq!(cells.piece(0, width), (format!("a{escaped}b"), width));
+    }
 }

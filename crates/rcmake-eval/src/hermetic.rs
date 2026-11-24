@@ -12,7 +12,7 @@ use std::{
 };
 
 use rcmake_base::BString;
-use rcmake_host::{FileKind, Follow, Host, path::to_native};
+use rcmake_host::{FileKind, Follow, Host, Stream, path::to_native};
 
 use crate::services::HermeticMode;
 
@@ -38,6 +38,7 @@ pub struct HermeticPolicy {
     roots: BTreeSet<PathBuf>,
     programs: BTreeSet<PathBuf>,
     pinned_network: bool,
+    warnings: Vec<String>,
 }
 
 impl HermeticPolicy {
@@ -48,13 +49,15 @@ impl HermeticPolicy {
     /// Pass source, build, module, toolchain, sysroot, and staging roots in
     /// `roots`. Use [Self::allow_program] for known tools in those roots or elsewhere.
     pub fn from_host<'a>(host: &dyn Host, roots: impl IntoIterator<Item = &'a Path>) -> Self {
+        let system = host.system();
         let mut policy = Self {
             env: BTreeSet::new(),
-            case_insensitive_env: host.system().sysname == "Windows",
-            case_insensitive_roots: false,
+            case_insensitive_env: system.sysname == "Windows",
+            case_insensitive_roots: matches!(system.sysname.as_slice(), b"Darwin" | b"Windows"),
             roots: BTreeSet::new(),
             programs: BTreeSet::new(),
             pinned_network: true,
+            warnings: Vec::new(),
         };
         for name in BASE_ENV {
             policy.allow_env(name);
@@ -62,20 +65,43 @@ impl HermeticPolicy {
         for root in roots {
             policy.allow_root(host, root);
         }
-        if let Some(names) = host.env_get(b"RCMAKE_HERMETIC_ALLOW_ENV") {
-            for name in names.split(|byte| *byte == b';') {
-                policy.allow_env(name.trim_ascii());
-            }
-        }
-        if let Some(paths) = host.env_get(b"RCMAKE_HERMETIC_ALLOW_PATHS") {
-            for root in paths
-                .split(|byte| *byte == b';')
-                .filter(|root| !root.is_empty())
-            {
-                policy.allow_root(host, &to_native(root));
+        for (setting, is_env) in [
+            ("RCMAKE_HERMETIC_ALLOW_ENV", true),
+            ("RCMAKE_HERMETIC_ALLOW_PATHS", false),
+        ] {
+            let Some(value) = host
+                .env_get(setting.as_bytes())
+                .filter(|value| !value.is_empty())
+            else {
+                continue;
+            };
+            for (index, entry) in value.split(|byte| *byte == b';').enumerate() {
+                let valid = if is_env {
+                    policy.allow_env(entry.trim_ascii())
+                } else {
+                    policy.allow_root(host, &to_native(entry))
+                };
+                if !valid {
+                    let expected = if is_env {
+                        "a variable name"
+                    } else {
+                        "a resolvable absolute path"
+                    };
+                    let warning = format!(
+                        "Warning: Ignored entry {} in {setting}. Specify {expected}.\n",
+                        index + 1
+                    );
+                    host.write_out(Stream::Stderr, warning.as_bytes());
+                    policy.warnings.push(warning);
+                }
             }
         }
         policy
+    }
+
+    /// Return warnings for invalid allowlist entries.
+    pub fn warnings(&self) -> &[String] {
+        &self.warnings
     }
 
     /// Allow one environment variable. Return false for an invalid name.
@@ -259,7 +285,7 @@ impl SourceLocation {
 impl fmt::Display for SourceLocation {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         for ch in self.file.to_string_lossy().chars() {
-            formatter.write_char(if ch.is_control() { '?' } else { ch })?;
+            write_display_char(formatter, ch)?;
         }
         write!(formatter, ":{}", self.line)
     }
@@ -353,21 +379,32 @@ pub struct AuditOutcome<'a> {
 }
 
 /// Count of retained diagnostics and observations beyond the record limit.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct AuditSummary {
     /// Number of distinct records retained.
     pub recorded: usize,
     /// Number of observations omitted after the limit. This can include repeats.
     pub omitted: usize,
+    /// Combined rule for distinct, valid environment names in retained records.
+    pub allow_env: Option<String>,
 }
 
 impl fmt::Display for AuditSummary {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            formatter,
-            "Additional hermetic violations omitted: {}.",
-            self.omitted
-        )
+        if self.omitted != 0 {
+            write!(
+                formatter,
+                "Additional hermetic violations omitted: {}.",
+                self.omitted
+            )?;
+        }
+        if let Some(names) = &self.allow_env {
+            if self.omitted != 0 {
+                formatter.write_char('\n')?;
+            }
+            write!(formatter, "RCMAKE_HERMETIC_ALLOW_ENV={names}")?;
+        }
+        Ok(())
     }
 }
 
@@ -457,7 +494,10 @@ impl HermeticAuditor {
         }
         let directory = path.parent().filter(|parent| parent.is_absolute());
         let directory = directory.map_or_else(|| "<DIR>".into(), |dir| dir.to_string_lossy());
-        let directory = if directory.chars().any(|ch| ch.is_control() || ch == ';') {
+        let directory = if directory
+            .chars()
+            .any(|ch| ch.is_control() || is_format(ch) || ch == ';')
+        {
             "<DIR>"
         } else {
             &directory
@@ -567,21 +607,31 @@ impl HermeticAuditor {
         self.records.values()
     }
 
-    /// Return the number of retained and omitted diagnostics.
+    /// Return the counts and a combined rule for multiple environment names.
     pub fn summary(&self) -> AuditSummary {
+        let names: BTreeSet<_> = self
+            .records
+            .keys()
+            .filter_map(|(_, _, identity)| match identity {
+                InputIdentity::Env(name) if valid_env_name(name) => std::str::from_utf8(name).ok(),
+                _ => None,
+            })
+            .collect();
         AuditSummary {
             recorded: self.records.len(),
             omitted: self.omitted,
+            allow_env: (names.len() > 1).then(|| names.into_iter().collect::<Vec<_>>().join(";")),
         }
     }
 
-    /// Return the final omitted count once, if any observations were omitted.
+    /// Return the final summary once if it has omissions or an environment rule.
     pub fn take_omission_summary(&mut self) -> Option<AuditSummary> {
-        if self.omitted == 0 || self.reported_omissions {
+        let summary = self.summary();
+        if (summary.omitted == 0 && summary.allow_env.is_none()) || self.reported_omissions {
             return None;
         }
         self.reported_omissions = true;
-        Some(self.summary())
+        Some(summary)
     }
 
     fn record(
@@ -637,16 +687,35 @@ fn display_input_path(path: &Path) -> String {
 }
 
 fn display_text(value: &str) -> String {
+    let mut text = String::new();
     let mut chars = value.chars();
-    let mut text: String = chars
-        .by_ref()
-        .take(MAX_DISPLAY_CHARS)
-        .map(|ch| if ch.is_control() { '?' } else { ch })
-        .collect();
+    for ch in chars.by_ref().take(MAX_DISPLAY_CHARS) {
+        let _ = write_display_char(&mut text, ch);
+    }
     if chars.next().is_some() {
         text.push_str("...");
     }
     text
+}
+
+fn write_display_char(writer: &mut impl fmt::Write, ch: char) -> fmt::Result {
+    if is_format(ch) {
+        write!(writer, "<U+{:04X}>", u32::from(ch))
+    } else {
+        writer.write_char(if ch.is_control() { '?' } else { ch })
+    }
+}
+
+fn is_format(ch: char) -> bool {
+    // Unicode 17.0 General_Category=Cf.
+    matches!(ch,
+        '\u{00ad}' | '\u{0600}'..='\u{0605}' | '\u{061c}' | '\u{06dd}' | '\u{070f}' |
+        '\u{0890}'..='\u{0891}' | '\u{08e2}' | '\u{180e}' | '\u{200b}'..='\u{200f}' |
+        '\u{202a}'..='\u{202e}' | '\u{2060}'..='\u{2064}' | '\u{2066}'..='\u{206f}' |
+        '\u{feff}' | '\u{fff9}'..='\u{fffb}' | '\u{110bd}' | '\u{110cd}' |
+        '\u{13430}'..='\u{1343f}' | '\u{1bca0}'..='\u{1bca3}' | '\u{1d173}'..='\u{1d17a}' |
+        '\u{e0001}' | '\u{e0020}'..='\u{e007f}'
+    )
 }
 
 fn display_remote(value: &str) -> String {
@@ -801,6 +870,32 @@ mod tests {
     }
 
     #[test]
+    fn reports_invalid_entries_and_combines_env_names() -> Result<(), &'static str> {
+        let host = host();
+        host.env_set(b"RCMAKE_HERMETIC_ALLOW_ENV", Some(b"OK;BAD=private"));
+        host.env_set(b"RCMAKE_HERMETIC_ALLOW_PATHS", Some(b"relative;another"));
+        let policy = HermeticPolicy::from_host(&host, []);
+        assert_eq!(policy.warnings().len(), 3);
+        assert!(
+            policy
+                .warnings()
+                .iter()
+                .all(|warning| !warning.contains("private"))
+        );
+        let mut auditor = HermeticAuditor::new(HermeticMode::Warn, policy);
+        for name in [b"B", b"A", b"C", b"B"] {
+            auditor.check_env(&site(), name);
+        }
+        let summary = auditor
+            .take_omission_summary()
+            .ok_or("Missing environment rule.")?;
+        assert_eq!(summary.to_string(), "RCMAKE_HERMETIC_ALLOW_ENV=A;B;C");
+        assert!(auditor.take_omission_summary().is_none());
+        assert_eq!(display_text("test\u{202e}"), "test<U+202E>");
+        Ok(())
+    }
+
+    #[test]
     fn bounds_records_and_formats_clickable_diagnostics() -> Result<(), Box<dyn std::error::Error>>
     {
         let host = host();
@@ -834,7 +929,8 @@ mod tests {
             auditor.summary(),
             AuditSummary {
                 recorded: 2,
-                omitted: 1
+                omitted: 1,
+                allow_env: None,
             }
         );
         assert_eq!(auditor.records().len(), 2);
