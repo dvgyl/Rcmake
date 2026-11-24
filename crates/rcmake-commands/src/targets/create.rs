@@ -5,7 +5,7 @@ use rcmake_model::{
     BT, ImportedVisibility, ModelError, Target, TargetBinding, TargetKind, TargetOrigin,
 };
 
-use super::{bytes, init, model_error, status};
+use super::{bytes, init, model_error};
 
 pub(super) fn executable(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
     add(cx, args, true)
@@ -61,9 +61,9 @@ impl Options {
                 "The UNKNOWN library type may be used only for IMPORTED libraries.",
             )),
             Some(kind) => Ok(kind),
-            None if self.imported => {
-                Err(status("called with IMPORTED argument but no library type."))
-            }
+            None if self.imported => Err(CmdError::status(
+                "called with IMPORTED argument but no library type.",
+            )),
             None if cx.var_is_on(b"BUILD_SHARED_LIBS") => Ok(TargetKind::SharedLibrary),
             None => Ok(TargetKind::StaticLibrary),
         }
@@ -82,7 +82,9 @@ impl Options {
 
 fn add(cx: &mut Cx<'_>, args: &[ExpandedArg], executable: bool) -> CmdResult {
     let Some((name, mut rest)) = args.split_first() else {
-        return Err(status("called with incorrect number of arguments"));
+        return Err(CmdError::status(
+            "called with incorrect number of arguments",
+        ));
     };
     let name = &name.value;
     let mut options = Options::default();
@@ -99,7 +101,7 @@ fn add(cx: &mut Cx<'_>, args: &[ExpandedArg], executable: bool) -> CmdResult {
     validate_name(cx, name, options.imported)?;
     let kind = options.target_kind(cx, executable)?;
     if options.symbolic && kind != TargetKind::InterfaceLibrary {
-        return Err(status(
+        return Err(CmdError::status(
             "SYMBOLIC option may only be used with INTERFACE libraries",
         ));
     }
@@ -110,7 +112,7 @@ fn add(cx: &mut Cx<'_>, args: &[ExpandedArg], executable: bool) -> CmdResult {
             (options.exclude, "EXCLUDE_FROM_ALL"),
         ] {
             if set {
-                return Err(status(format!(
+                return Err(CmdError::status(format!(
                     "may not be given {flag} for an IMPORTED target."
                 )));
             }
@@ -133,7 +135,8 @@ fn add(cx: &mut Cx<'_>, args: &[ExpandedArg], executable: bool) -> CmdResult {
     }
     if !options.imported {
         let model = cx.project();
-        let project_name = std::iter::successors(Some(dir), |id| model.dir(*id).parent)
+        let project_name = model
+            .ancestors(dir)
             .find_map(|id| model.dir(id).props.get(b"_RCMAKE_PROJECT_NAME"));
         if let Some(name) = project_name {
             target
@@ -207,7 +210,9 @@ fn alias(
     options: &Options,
 ) -> CmdResult {
     let [referent] = args else {
-        return Err(status("ALIAS requires exactly one target argument."));
+        return Err(CmdError::status(
+            "ALIAS requires exactly one target argument.",
+        ));
     };
     if options.imported
         || options.exclude
@@ -216,19 +221,21 @@ fn alias(
         || options.bundle
         || options.kind.is_some()
     {
-        return Err(status("ALIAS target may not have other arguments."));
+        return Err(CmdError::status(
+            "ALIAS target may not have other arguments.",
+        ));
     }
     let referent = &referent.value;
     let dir = cx.current_dir_id();
     let model = cx.project();
     let id = match model.lookup_target(dir, referent) {
         None => {
-            return Err(status(format!(
+            return Err(CmdError::status(format!(
                 "cannot create ALIAS target \"{name}\" because target \"{referent}\" does not already exist."
             )));
         }
         Some(TargetBinding::Alias(_)) => {
-            return Err(status(format!(
+            return Err(CmdError::status(format!(
                 "cannot create ALIAS target \"{name}\" because target \"{referent}\" is itself an ALIAS."
             )));
         }
@@ -245,13 +252,13 @@ fn alias(
         } else {
             "a library"
         };
-        return Err(status(format!(
+        return Err(CmdError::status(format!(
             "cannot create ALIAS target \"{name}\" because target \"{referent}\" is not {kind}."
         )));
     }
     model.add_alias(dir, name.clone(), id).map_err(|err| {
         if matches!(err, ModelError::DuplicateTarget(_)) {
-            status(format!("cannot create ALIAS target \"{name}\" because another target with the same name already exists."))
+            CmdError::status(format!("cannot create ALIAS target \"{name}\" because another target with the same name already exists."))
         } else {
             model_error(err)
         }
@@ -264,7 +271,7 @@ fn duplicate(cx: &mut Cx<'_>, name: &BString, imported: bool, error: ModelError)
         return model_error(error);
     };
     if imported {
-        return status(format!(
+        return CmdError::status(format!(
             "cannot create imported target \"{name}\" because another target with the same name already exists."
         ));
     }
@@ -273,7 +280,7 @@ fn duplicate(cx: &mut Cx<'_>, name: &BString, imported: bool, error: ModelError)
         return model_error(error);
     };
     if target.is_imported() {
-        return status(format!(
+        return CmdError::status(format!(
             "cannot create target \"{name}\" because an imported target with the same name already exists."
         ));
     }
@@ -289,7 +296,7 @@ fn duplicate(cx: &mut Cx<'_>, name: &BString, imported: bool, error: ModelError)
         TargetKind::GlobalTarget => "a global target",
     };
     let dir = &model.dir(target.dir).source_dir;
-    status(format!(
+    CmdError::status(format!(
         "cannot create target \"{name}\" because another target with the same name already exists.  The existing target is {kind} created in source directory\n\"{dir}\".  See documentation for policy CMP0002 for more details."
     ))
 }

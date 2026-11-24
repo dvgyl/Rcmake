@@ -26,10 +26,10 @@ fn cmake_instrumentation(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
     let build = path::to_native(&cx.project().dir(DirId::ROOT).binary_dir);
     if cx.global().instrumentation.is_empty() {
         query::clear_generated_queries(cx.host(), &build)
-            .map_err(|error| status(error.to_string()))?;
+            .map_err(|error| CmdError::status(error.to_string()))?;
     }
     query::write_generated_query(cx.host(), &build, &query)
-        .map_err(|error| status(error.to_string()))?;
+        .map_err(|error| CmdError::status(error.to_string()))?;
     cx.global().instrumentation.push(request);
     Ok(Flow::Normal)
 }
@@ -41,16 +41,12 @@ fn keyword(arg: &ExpandedArg) -> bool {
     )
 }
 
-fn status(message: impl Into<BString>) -> CmdError {
-    CmdError::Status(message.into())
-}
-
 fn parse(
     cx: &mut Cx<'_>,
     args: &[ExpandedArg],
 ) -> Result<(InstrumentationRequest, Query), CmdError> {
     if args.is_empty() {
-        return Err(status("must be called with arguments."));
+        return Err(CmdError::status("must be called with arguments."));
     }
     if let Some(key) = args.iter().enumerate().find_map(|(index, arg)| {
         (keyword(arg) && args.get(index + 1).is_none_or(keyword)).then_some(&arg.value)
@@ -65,7 +61,10 @@ fn parse(
     let mut rest = args;
     while let Some((key, tail)) = rest.split_first() {
         if !keyword(key) {
-            return Err(status(format!("given unknown argument {:?}.", key.value)));
+            return Err(CmdError::status(format!(
+                "given unknown argument {:?}.",
+                key.value
+            )));
         }
         let count = tail.iter().take_while(|arg| !keyword(arg)).count();
         let (values, next) = tail.split_at(count);
@@ -79,13 +78,16 @@ fn parse(
                         request.data_version = value.value.clone();
                     }
                 } else if let Some(extra) = values.get(1) {
-                    return Err(status(format!("given unknown argument {:?}.", extra.value)));
+                    return Err(CmdError::status(format!(
+                        "given unknown argument {:?}.",
+                        extra.value
+                    )));
                 }
             }
             b"HOOKS" => {
                 for arg in values {
                     let hook = Hook::from_name(&arg.value).ok_or_else(|| {
-                        status(format!("given invalid argument to HOOKS {:?}", arg.value))
+                        CmdError::status(format!("given invalid argument to HOOKS {:?}", arg.value))
                     })?;
                     request.hooks.push(arg.value.clone());
                     query.hooks.push(hook);
@@ -94,7 +96,10 @@ fn parse(
             b"OPTIONS" => {
                 for arg in values {
                     let option = InstrumentOption::from_name(&arg.value).ok_or_else(|| {
-                        status(format!("given invalid argument to OPTIONS {:?}", arg.value))
+                        CmdError::status(format!(
+                            "given invalid argument to OPTIONS {:?}",
+                            arg.value
+                        ))
                     })?;
                     request.options.push(arg.value.clone());
                     query.options.push(option);
@@ -102,11 +107,16 @@ fn parse(
             }
             b"CALLBACK" => request.callbacks.push(callback(values)),
             b"CUSTOM_CONTENT" => request.custom_content.push(custom_content(values)?),
-            _ => return Err(status(format!("given unknown argument {:?}.", key.value))),
+            _ => {
+                return Err(CmdError::status(format!(
+                    "given unknown argument {:?}.",
+                    key.value
+                )));
+            }
         }
     }
     if number(&request.api_version) != Some(API_VERSION) {
-        return Err(status(format!(
+        return Err(CmdError::status(format!(
             "given an unsupported API_VERSION {:?} (the only currently supported version is {API_VERSION}).",
             request.api_version
         )));
@@ -118,7 +128,7 @@ fn parse(
 
 fn data_version(value: &BString) -> Result<DataVersion, CmdError> {
     let malformed = || {
-        status(format!(
+        CmdError::status(format!(
             "given a malformed DATA_VERSION {value:?}.  A numeric major or major.minor version is required."
         ))
     };
@@ -132,7 +142,7 @@ fn data_version(value: &BString) -> Result<DataVersion, CmdError> {
         number(minor).ok_or_else(malformed)?
     };
     if major != DATA_VERSION.major || minor > DATA_VERSION.minor {
-        return Err(status(format!(
+        return Err(CmdError::status(format!(
             "given an unsupported DATA_VERSION {value:?} (the maximum currently supported version is {}.{}).",
             DATA_VERSION.major, DATA_VERSION.minor
         )));
@@ -149,7 +159,7 @@ fn number(value: &[u8]) -> Option<u64> {
 
 fn custom_content(values: &[ExpandedArg]) -> Result<InstrumentationContent, CmdError> {
     let [name, ty, content] = values else {
-        return Err(status("CUSTOM_CONTENT expected 3 arguments"));
+        return Err(CmdError::status("CUSTOM_CONTENT expected 3 arguments"));
     };
     match CustomContentType::from_name(&ty.value) {
         Some(CustomContentType::Json) => {
@@ -161,7 +171,7 @@ fn custom_content(values: &[ExpandedArg]) -> Result<InstrumentationContent, CmdE
                         .nth(error.line.saturating_sub(1) as usize)
                         .unwrap_or_default();
                     let padding = (error.column.saturating_sub(1) as usize).min(line.len());
-                    status(format!(
+                    CmdError::status(format!(
                         "failed to parse custom content as JSON:\n\n {}\n\n{}\n\n{}^",
                         error.message,
                         BString::from(line),
@@ -171,7 +181,7 @@ fn custom_content(values: &[ExpandedArg]) -> Result<InstrumentationContent, CmdE
             )?;
         }
         None => {
-            return Err(status(format!(
+            return Err(CmdError::status(format!(
                 "got an invalid type for CUSTOM_CONTENT: {}",
                 ty.value
             )));

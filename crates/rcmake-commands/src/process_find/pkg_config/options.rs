@@ -4,7 +4,7 @@ use rcmake_base::{BString, list, truth};
 use rcmake_eval::{CmdError, Cx};
 use rcmake_expr::ExpandedArg;
 
-use super::{pc::Strictness, status, text};
+use super::{pc::Strictness, text};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum Mode {
@@ -23,14 +23,16 @@ pub(super) struct Request<'a> {
 impl<'a> Request<'a> {
     pub(super) fn parse(args: &'a [ExpandedArg]) -> Result<Self, CmdError> {
         let [mode, package, tail @ ..] = args else {
-            return Err(status("requires a subcommand and a package name."));
+            return Err(CmdError::status(
+                "requires a subcommand and a package name.",
+            ));
         };
         let mode = match mode.value.as_slice() {
             b"EXTRACT" => Mode::Extract,
             b"IMPORT" => Mode::Import,
             b"POPULATE" => Mode::Populate,
             other => {
-                return Err(status(format!(
+                return Err(CmdError::status(format!(
                     "given unknown subcommand {:?}.",
                     BString::from(other)
                 )));
@@ -41,7 +43,7 @@ impl<'a> Request<'a> {
         let mut options = BTreeMap::new();
         while let Some(key) = tail.next() {
             let Some(arity) = arity(key) else {
-                return Err(status(format!(
+                return Err(CmdError::status(format!(
                     "given unknown argument {:?}.",
                     BString::from(key)
                 )));
@@ -57,7 +59,7 @@ impl<'a> Request<'a> {
                 }
             }
             if matches!(arity, Arity::One) && values.is_empty() {
-                return Err(status(format!(
+                return Err(CmdError::status(format!(
                     "missing value for {:?}.",
                     BString::from(key)
                 )));
@@ -129,7 +131,7 @@ impl Settings {
             Some(b"PERMISSIVE") => Strictness::Permissive,
             Some(b"BEST_EFFORT") => Strictness::BestEffort,
             Some(value) => {
-                return Err(status(format!(
+                return Err(CmdError::status(format!(
                     "given invalid STRICTNESS {:?}.",
                     BString::from(value)
                 )));
@@ -139,7 +141,7 @@ impl Settings {
         };
         let env_mode = req.value(b"ENV_MODE").unwrap_or(b"PKGCONF");
         if !matches!(env_mode, b"IGNORE" | b"FDO" | b"PKGCONF") {
-            return Err(status(format!(
+            return Err(CmdError::status(format!(
                 "given invalid ENV_MODE {:?}.",
                 BString::from(env_mode)
             )));

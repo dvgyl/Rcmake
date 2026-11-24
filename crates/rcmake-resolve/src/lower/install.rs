@@ -150,7 +150,7 @@ fn lower_install_rules<E>(
     let mut export_plan = 0;
     let multi = configs.len() > 1 || model.generator.is_some_and(GeneratorKind::multi_config);
     for (index, rule) in model.installs.iter().enumerate() {
-        if dir_excluded_from_all(model, rule.dir) {
+        if model.dir_excluded_from_all(rule.dir) {
             continue;
         }
         let options = &rule.options;
@@ -410,19 +410,6 @@ fn action_configs<'a>(
             .filter(|config| !multi || matches_config(options, config))
             .map(Some)
             .collect()
-    }
-}
-
-fn dir_excluded_from_all(model: &ProjectModel, mut dir: DirId) -> bool {
-    loop {
-        let info = model.dir(dir);
-        if info.exclude_from_all {
-            return true;
-        }
-        let Some(parent) = info.parent else {
-            return false;
-        };
-        dir = parent;
     }
 }
 

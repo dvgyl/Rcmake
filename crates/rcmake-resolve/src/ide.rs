@@ -12,15 +12,20 @@
 
 use indexmap::{IndexMap, IndexSet};
 use rcmake_base::{BString, list, path_lex::Lexical, truth};
+use rcmake_diag::Backtrace;
 use rcmake_genex::{ConfigId, EvalContext};
 use rcmake_model::{
-    BT, DirId, FileSetKind, GeneratorKind, ProjectModel, Target, TargetId, TargetKind,
+    BT, DirId, Directory, FileSetKind, GeneratorKind, ProjectModel, Target, TargetId, TargetKind,
 };
 
 use crate::{
-    CompileGroup, FileSetMember, InterfaceInclude, ResolveError, ResolvedTarget, absolute_path,
-    lower, module_error,
-    sources::{SourcePaths, TargetInputs, external_object, properties},
+    CompileGroup, InterfaceInclude, ResolveError, ResolvedTarget,
+    cxx_modules::module_error,
+    lower,
+    sources::{
+        SourcePaths, TargetInputs, absolute_path, append_compile_flags, external_object, properties,
+    },
+    target::FileSetMember,
     usage::{ResolvedLinkItem, ResolvedLinkKind, UsageResolver, handle},
 };
 
@@ -533,7 +538,91 @@ fn xcode_attribute_name(name: &[u8], config: &[u8]) -> Option<(BString, bool)> {
     Some((key, specific))
 }
 
-pub(crate) fn compile_settings(group: &CompileGroup, flavor: IdeFlavor) -> IdeCompileSettings {
+/// Collects IDE compile settings by language and compile group.
+pub(crate) struct IdeCompile {
+    flavor: IdeFlavor,
+    base: IndexMap<BString, IdeCompileSettings>,
+    overrides: IndexMap<usize, IdeCompileSettings>,
+}
+
+impl IdeCompile {
+    pub(crate) fn new(flavor: IdeFlavor) -> Self {
+        Self {
+            flavor,
+            base: IndexMap::new(),
+            overrides: IndexMap::new(),
+        }
+    }
+
+    pub(crate) fn settings(&self, group: &CompileGroup) -> IdeCompileSettings {
+        compile_settings(group, self.flavor)
+    }
+
+    pub(crate) fn record_group(
+        &mut self,
+        group: usize,
+        base: IdeCompileSettings,
+        compiled: &CompileGroup,
+        language_flags: impl FnOnce() -> Vec<BString>,
+    ) {
+        let mut overrides = self.settings(compiled);
+        if overrides.flags.starts_with(&base.flags) {
+            overrides.flags.drain(..base.flags.len());
+        }
+        if overrides.defines.starts_with(&base.defines) {
+            overrides.defines.drain(..base.defines.len());
+        }
+        overrides
+            .includes
+            .retain(|include| !base.includes.contains(include));
+        if !overrides.flags.is_empty()
+            || !overrides.defines.is_empty()
+            || !overrides.includes.is_empty()
+        {
+            self.overrides.insert(group, overrides);
+        }
+        self.base.entry(base.language.clone()).or_insert_with(|| {
+            let mut base = base;
+            let mut flags = Vec::new();
+            for value in language_flags() {
+                append_compile_flags(&mut flags, &value, Backtrace::default());
+            }
+            flags.append(&mut base.flags);
+            base.flags = flags;
+            base
+        });
+    }
+
+    pub(crate) fn finish(
+        self,
+        resolved: &mut ResolvedTarget,
+        dir: &Directory,
+        paths: &SourcePaths<'_>,
+        inputs: &TargetInputs,
+        members: &IndexMap<BString, FileSetMember<'_>>,
+    ) {
+        if let Some(facts) = &mut resolved.ide {
+            facts.compile = self.base.into_values().collect();
+            let compiled = resolved
+                .compile_units
+                .iter()
+                .filter_map(|unit| {
+                    let group = resolved.compile_groups.get(unit.group)?;
+                    Some((
+                        unit.source.value.clone(),
+                        (
+                            group.language.clone(),
+                            self.overrides.get(&unit.group).cloned(),
+                        ),
+                    ))
+                })
+                .collect();
+            collect_sources(facts, dir, paths, inputs, members, compiled);
+        }
+    }
+}
+
+fn compile_settings(group: &CompileGroup, flavor: IdeFlavor) -> IdeCompileSettings {
     IdeCompileSettings {
         language: group.language.clone(),
         flags: group.flags.clone(),
@@ -568,7 +657,7 @@ fn include(entry: &InterfaceInclude, flavor: IdeFlavor) -> IdeInclude {
     }
 }
 
-pub(crate) fn collect_sources(
+fn collect_sources(
     facts: &mut IdeFacts,
     dir: &rcmake_model::Directory,
     paths: &SourcePaths<'_>,

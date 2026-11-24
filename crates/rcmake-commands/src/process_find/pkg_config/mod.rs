@@ -61,20 +61,16 @@ pub(super) fn run(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
         for target in graph.targets.into_values() {
             cx.project()
                 .add_target(target)
-                .map_err(|error| status(error.to_string()))?;
+                .map_err(|error| CmdError::status(error.to_string()))?;
         }
         cx.set_var(&found_var, "TRUE".into());
     }
     Ok(Flow::Normal)
 }
 
-fn status(message: impl Into<BString>) -> CmdError {
-    CmdError::Status(message.into())
-}
-
 fn report(cx: &mut Cx<'_>, req: &Request<'_>, message: &[u8]) -> Result<(), CmdError> {
     if req.flag(b"REQUIRED") {
-        return Err(status(message));
+        return Err(CmdError::status(message));
     }
     if !req.flag(b"QUIET") {
         cx.issue(MessageKind::Warning, Effect::None, None, message.into());
@@ -88,7 +84,7 @@ fn parse_bindings<'a>(req: &Request<'a>) -> Result<BTreeMap<&'a [u8], &'a [u8]>,
         .iter()
         .map(|binding| {
             binding.split_once_str(b"=").ok_or_else(|| {
-                status(format!(
+                CmdError::status(format!(
                     "given invalid binding {:?}.",
                     BString::from(*binding)
                 ))
@@ -430,7 +426,7 @@ impl Graph<'_, '_> {
             })
             .and_then(|target| target.props.get(PACKAGE_PROPERTY.as_bytes()))
             .cloned()
-            .ok_or_else(|| status("could not resolve the pkg-config target."))?;
+            .ok_or_else(|| CmdError::status("could not resolve the pkg-config target."))?;
         let mut target = new_target(cx, name.clone(), ImportedVisibility::Local);
         target.props.set(PACKAGE_PROPERTY.into(), package);
         add_links(&mut target, [root.into()]);

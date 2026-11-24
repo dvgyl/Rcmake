@@ -12,13 +12,15 @@ use rcmake_host::{
 };
 use rcmake_model::{CacheEntry, CacheType};
 
-use super::{quoted, status, values};
+use super::{quoted, values};
 
 const MIB: u64 = 1024 * 1024;
 
 pub(super) fn site_name(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
     let [arg] = args else {
-        return Err(status("called with incorrect number of arguments"));
+        return Err(CmdError::status(
+            "called with incorrect number of arguments",
+        ));
     };
     if !cx.var_defined(&arg.value) {
         let hostname = cx.host().system().hostname;
@@ -38,10 +40,12 @@ pub(super) fn site_name(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
 
 pub(super) fn variable_watch(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
     let Some(var) = args.first() else {
-        return Err(status("must be called with at least one argument."));
+        return Err(CmdError::status(
+            "must be called with at least one argument.",
+        ));
     };
     if var.value == b"CMAKE_CURRENT_LIST_FILE" {
-        return Err(status(
+        return Err(CmdError::status(
             "cannot be set on the variable: CMAKE_CURRENT_LIST_FILE",
         ));
     }
@@ -51,16 +55,16 @@ pub(super) fn variable_watch(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult
 
 pub(super) fn query(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
     let [result, out, args @ ..] = args else {
-        return Err(status("missing RESULT specification."));
+        return Err(CmdError::status("missing RESULT specification."));
     };
     if result.value != b"RESULT" {
-        return Err(status("missing RESULT specification."));
+        return Err(CmdError::status("missing RESULT specification."));
     }
     let [query, keys @ ..] = args else {
-        return Err(status("missing QUERY specification"));
+        return Err(CmdError::status("missing QUERY specification"));
     };
     if query.value != b"QUERY" {
-        return Err(status("missing QUERY specification"));
+        return Err(CmdError::status("missing QUERY specification"));
     }
     let out = out.value.as_slice();
     if let Some((query, args)) = keys.split_first()
@@ -71,7 +75,7 @@ pub(super) fn query(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
     let keys = values(keys);
     let (requested_root, keys) = query_options(&keys)?;
     if keys.is_empty() {
-        return Err(status("missing QUERY specification"));
+        return Err(CmdError::status("missing QUERY specification"));
     }
     let policy = PolicyId::new(221);
     let sysroot = requested_root.unwrap_or_else(|| cx.policy(policy) != PolicyStatus::New);
@@ -114,7 +118,7 @@ pub(super) fn query(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
         } else {
             facts
                 .get(cx, &host, key)
-                .ok_or_else(|| status(quoted("does not recognize <key> ", key, "")))?
+                .ok_or_else(|| CmdError::status(quoted("does not recognize <key> ", key, "")))?
         };
         if !result.is_empty() {
             result.push(b';');
@@ -127,7 +131,7 @@ pub(super) fn query(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
 
 fn registry(cx: &mut Cx<'_>, out: &[u8], args: &[ExpandedArg]) -> CmdResult {
     let [_, options @ ..] = args else {
-        return Err(status("missing <key> specification."));
+        return Err(CmdError::status("missing <key> specification."));
     };
     let parsed = KeywordParser::new()
         .keyword("VALUE", Slot::Single)
@@ -137,7 +141,7 @@ fn registry(cx: &mut Cx<'_>, out: &[u8], args: &[ExpandedArg]) -> CmdResult {
         .keyword("SUBKEYS", Slot::Flag)
         .parse(options);
     if !parsed.unparsed().is_empty() {
-        return Err(status(quoted(
+        return Err(CmdError::status(quoted(
             "given invalid argument(s) \"",
             &parsed.unparsed().join(b";".as_slice()),
             "\".",
@@ -152,7 +156,11 @@ fn registry(cx: &mut Cx<'_>, out: &[u8], args: &[ExpandedArg]) -> CmdResult {
             b"32" | b"64" | b"32_64" | b"64_32" | b"HOST" | b"TARGET" | b"BOTH"
         )
     {
-        return Err(status(quoted("given invalid value for VIEW: ", view, ".")));
+        return Err(CmdError::status(quoted(
+            "given invalid value for VIEW: ",
+            view,
+            ".",
+        )));
     }
     if let Some(error) = parsed.single("ERROR_VARIABLE") {
         cx.set_var(error, "No Registry on this platform.".into());
@@ -171,17 +179,17 @@ fn query_options<'a>(args: &[&'a [u8]]) -> Result<(Option<bool>, Vec<&'a [u8]>),
             continue;
         }
         if root.is_some() {
-            return Err(status("FROM_SYSROOT may be given at most once."));
+            return Err(CmdError::status("FROM_SYSROOT may be given at most once."));
         }
         let flag = args
             .next()
-            .ok_or_else(|| status("FROM_SYSROOT requires a boolean value."))?;
+            .ok_or_else(|| CmdError::status("FROM_SYSROOT requires a boolean value."))?;
         root = Some(if truth::is_on(flag) {
             true
         } else if truth::is_off(flag) {
             false
         } else {
-            return Err(status(quoted(
+            return Err(CmdError::status(quoted(
                 "FROM_SYSROOT requires a boolean value, got \"",
                 flag,
                 "\".",

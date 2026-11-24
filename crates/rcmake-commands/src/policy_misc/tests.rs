@@ -1199,3 +1199,46 @@ fn components_property_lists_install_components() -> TestResult {
     assert_var(&mut interp, "files", Some("/work/src/a.c"));
     Ok(())
 }
+
+#[test]
+fn install_properties_use_the_exact_file_name() -> TestResult {
+    let (host, mut interp) = context(RunMode::Configure);
+    configure(
+        &host,
+        &mut interp,
+        r#"
+        project(P NONE)
+        define_property(GLOBAL PROPERTY test_value INHERITED)
+        set_property(GLOBAL PROPERTY test_value global)
+        get_property(missing INSTALL unlisted PROPERTY test_value)
+
+        set_property(INSTALL path/file ./path/file PROPERTY test_value first)
+        set_property(INSTALL path/file APPEND PROPERTY test_value second)
+        set_property(INSTALL path/file APPEND_STRING PROPERTY test_value third)
+        set_property(INSTALL path/file APPEND PROPERTY test_value "")
+        set_property(INSTALL path/file APPEND_STRING PROPERTY test_value)
+        get_property(appended INSTALL path/file PROPERTY test_value)
+        get_property(separate INSTALL ./path/file PROPERTY test_value)
+        get_property(defined INSTALL path/file PROPERTY test_value DEFINED)
+
+        set_property(INSTALL path/file PROPERTY test_value "")
+        get_property(empty INSTALL path/file PROPERTY test_value)
+        get_property(empty_set INSTALL path/file PROPERTY test_value SET)
+        set_property(INSTALL path/file PROPERTY test_value)
+        get_property(removed INSTALL path/file PROPERTY test_value)
+        get_property(removed_set INSTALL path/file PROPERTY test_value SET)
+        get_property(global GLOBAL PROPERTY test_value)
+        "#,
+        0,
+    )?;
+    assert_var(&mut interp, "missing", None);
+    assert_var(&mut interp, "appended", Some("first;secondthird"));
+    assert_var(&mut interp, "separate", Some("first"));
+    assert_var(&mut interp, "defined", Some("0"));
+    assert_var(&mut interp, "empty", Some(""));
+    assert_var(&mut interp, "empty_set", Some("1"));
+    assert_var(&mut interp, "removed", None);
+    assert_var(&mut interp, "removed_set", Some("0"));
+    assert_var(&mut interp, "global", Some("global"));
+    Ok(())
+}

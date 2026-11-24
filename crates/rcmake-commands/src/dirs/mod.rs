@@ -35,21 +35,21 @@ pub(crate) fn register(registry: &mut Registry) {
     crate::compat::project_command!(registry, "discover_tests", discover::discover_tests);
 }
 
-fn status(text: impl Into<BString>) -> CmdError {
-    CmdError::Status(text.into())
-}
-
 fn values(args: &[ExpandedArg]) -> impl Iterator<Item = &[u8]> {
     args.iter().map(|arg| arg.value.as_slice())
 }
 
 fn add_subdirectory(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
     let [source, rest @ ..] = args else {
-        return Err(status("called with incorrect number of arguments"));
+        return Err(CmdError::status(
+            "called with incorrect number of arguments",
+        ));
     };
     let mut options = SubdirOptions::default();
     if rest.len() > 3 {
-        return Err(status("called with incorrect number of arguments"));
+        return Err(CmdError::status(
+            "called with incorrect number of arguments",
+        ));
     }
     let mut binary = None;
     for arg in values(rest) {
@@ -57,10 +57,16 @@ fn add_subdirectory(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
             b"EXCLUDE_FROM_ALL" if !options.exclude_from_all => options.exclude_from_all = true,
             b"SYSTEM" if !options.system => options.system = true,
             b"EXCLUDE_FROM_ALL" | b"SYSTEM" => {
-                return Err(status("called with incorrect number of arguments"));
+                return Err(CmdError::status(
+                    "called with incorrect number of arguments",
+                ));
             }
             _ if binary.is_none() => binary = Some(arg),
-            _ => return Err(status("called with incorrect number of arguments")),
+            _ => {
+                return Err(CmdError::status(
+                    "called with incorrect number of arguments",
+                ));
+            }
         }
     }
     run_subdirectory(cx, &source.value, binary, options)
@@ -68,7 +74,9 @@ fn add_subdirectory(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
 
 fn subdirs(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
     if args.is_empty() {
-        return Err(status("called with incorrect number of arguments"));
+        return Err(CmdError::status(
+            "called with incorrect number of arguments",
+        ));
     }
     cx.issue(
         MessageKind::DeprecationWarning,
@@ -102,7 +110,7 @@ fn run_subdirectory(
         .metadata(&src, Follow::Yes)
         .is_ok_and(|meta| meta.kind == FileKind::Dir)
     {
-        return Err(status(
+        return Err(CmdError::status(
             [
                 b"given source \"".as_slice(),
                 source,
@@ -117,7 +125,7 @@ fn run_subdirectory(
         None => {
             let current = normalized_path(&cx.current_source_dir());
             let relative = src.strip_prefix(&current).ok().filter(|p| !p.as_os_str().is_empty()).ok_or_else(|| {
-                status(
+                CmdError::status(
                     [
                         b"not given a binary directory but the given source directory \"".as_slice(),
                         &path::from_native(&src),
@@ -180,8 +188,9 @@ pub(crate) fn find_directory(cx: &mut Cx<'_>, name: &[u8]) -> Option<DirId> {
 }
 
 pub(crate) fn scoped_test_directory(cx: &mut Cx<'_>, name: &[u8]) -> Result<DirId, CmdError> {
-    find_directory(cx, name)
-        .ok_or_else(|| status([b"given non-existent DIRECTORY ".as_slice(), name].concat()))
+    find_directory(cx, name).ok_or_else(|| {
+        CmdError::status([b"given non-existent DIRECTORY ".as_slice(), name].concat())
+    })
 }
 
 fn non_target(cx: &mut Cx<'_>, alternative: &str) {
@@ -398,7 +407,7 @@ fn link_libraries(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
     let mut libs = values(args);
     while let Some(arg) = libs.next() {
         if matches!(arg, b"debug" | b"optimized" | b"general") && libs.next().is_none() {
-            return Err(status(
+            return Err(CmdError::status(
                 [
                     b"The \"".as_slice(),
                     arg,

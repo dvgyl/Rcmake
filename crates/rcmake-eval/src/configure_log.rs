@@ -5,7 +5,7 @@ use std::path::Path;
 use rcmake_diag::FrameKind;
 use rcmake_host::WriteMode;
 
-use crate::{Interp, RunMode, exec::cat, hooks::json_string};
+use crate::{Interp, RunMode, hooks::json_string, util::cat};
 
 impl Interp {
     pub(crate) fn log_configure_message(&mut self, message: &[u8]) {

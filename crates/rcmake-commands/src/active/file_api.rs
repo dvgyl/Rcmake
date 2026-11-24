@@ -8,7 +8,7 @@ use rcmake_expr::ExpandedArg;
 use rcmake_host::{WriteMode, path};
 use rcmake_model::DirId;
 
-use super::{status, values};
+use super::values;
 
 struct QueryKind {
     keyword: &'static str,
@@ -68,10 +68,10 @@ impl Keyword {
 pub(super) fn query(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
     let args = values(args);
     let Some((&operation, rest)) = args.split_first() else {
-        return Err(status("must be called with arguments."));
+        return Err(CmdError::status("must be called with arguments."));
     };
     if operation != b"QUERY" {
-        return Err(status(format!(
+        return Err(CmdError::status(format!(
             "does not recognize sub-command {}",
             BString::from(operation)
         )));
@@ -84,12 +84,12 @@ pub(super) fn query(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
     let directory = path::to_native(root).join(".cmake/api/v1/query/client-rcmake");
     let host = cx.host();
     host.create_dir_all(&directory)
-        .map_err(|error| status(error.to_string()))?;
+        .map_err(|error| CmdError::status(error.to_string()))?;
     for name in files {
         if let Err(error) = host.write(&directory.join(name), b"", WriteMode::CreateNew)
             && error.kind != ErrorKind::AlreadyExists
         {
-            return Err(status(error.to_string()));
+            return Err(CmdError::status(error.to_string()));
         }
     }
     Ok(Flow::Normal)
@@ -145,18 +145,18 @@ fn query_files(cx: &mut Cx<'_>, mut args: &[&[u8]]) -> Result<Vec<&'static str>,
         return Err(CmdError::Reported);
     }
     if let Some(argument) = unknown {
-        return Err(status(format!(
+        return Err(CmdError::status(format!(
             "QUERY given unknown argument \"{}\".",
             BString::from(argument)
         )));
     }
     if !version.iter().all(u8::is_ascii_digit) {
-        return Err(status("QUERY given non-integer API_VERSION."));
+        return Err(CmdError::status("QUERY given non-integer API_VERSION."));
     }
     // CMake narrows the parsed version to 32 bits.
     let api_version = parse_unsigned(version).map(|number| number as u32);
     if api_version != Some(1) {
-        return Err(status(format!(
+        return Err(CmdError::status(format!(
             "QUERY given unsupported API_VERSION \"{}\" (the only currently supported version is 1).",
             BString::from(version)
         )));
@@ -175,7 +175,7 @@ fn query_files(cx: &mut Cx<'_>, mut args: &[&[u8]]) -> Result<Vec<&'static str>,
     if errors.is_empty() {
         Ok(files)
     } else {
-        Err(status(format!(
+        Err(CmdError::status(format!(
             "QUERY given invalid arguments:\n  {}",
             errors.join("\n  ")
         )))

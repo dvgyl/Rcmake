@@ -7,11 +7,13 @@ use rcmake_expr::ExpandedArg;
 use rcmake_host::Stream;
 use rcmake_regex::{MatchOptions, Regex};
 
-use super::{bytes, callbacks::Callback, cat, sort::Sort, status, transform};
+use super::{bytes, callbacks::Callback, cat, sort::Sort, transform};
 
 pub(super) fn list(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
     let [command, name, rest @ ..] = args else {
-        return Err(status("must be called with at least two arguments."));
+        return Err(CmdError::status(
+            "must be called with at least two arguments.",
+        ));
     };
     let command = bytes(command);
     let name = bytes(name);
@@ -40,7 +42,11 @@ pub(super) fn list(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
     let elements = || list::iter(raw_bytes, list::Empty::Keep);
     match (command, rest) {
         (b"LENGTH", [out]) => cx.set_var(bytes(out), elements().count().to_string().into()),
-        (b"LENGTH", _) => return Err(status("sub-command LENGTH requires two arguments.")),
+        (b"LENGTH", _) => {
+            return Err(CmdError::status(
+                "sub-command LENGTH requires two arguments.",
+            ));
+        }
         (b"GET", [indices @ .., out]) if !indices.is_empty() => {
             let value = if raw.is_none() {
                 BString::from("NOTFOUND")
@@ -49,13 +55,17 @@ pub(super) fn list(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
             };
             cx.set_var(bytes(out), value);
         }
-        (b"GET", _) => return Err(status("sub-command GET requires at least three arguments.")),
+        (b"GET", _) => {
+            return Err(CmdError::status(
+                "sub-command GET requires at least three arguments.",
+            ));
+        }
         (b"JOIN", [glue, out]) => cx.set_var(
             bytes(out),
             join_with(elements(), bytes(glue), cx.limits().max_value_bytes)?,
         ),
         (b"JOIN", _) => {
-            return Err(status(format!(
+            return Err(CmdError::status(format!(
                 "sub-command JOIN requires three arguments ({} found).",
                 rest.len() + 1
             )));
@@ -64,7 +74,7 @@ pub(super) fn list(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
             cx.set_var(bytes(out), sublist(raw_bytes, bytes(begin), bytes(length))?)
         }
         (b"SUBLIST", _) => {
-            return Err(status(format!(
+            return Err(CmdError::status(format!(
                 "sub-command SUBLIST requires four arguments ({} found).",
                 rest.len() + 1
             )));
@@ -78,7 +88,11 @@ pub(super) fn list(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
                     .into(),
             );
         }
-        (b"FIND", _) => return Err(status("sub-command FIND requires three arguments.")),
+        (b"FIND", _) => {
+            return Err(CmdError::status(
+                "sub-command FIND requires three arguments.",
+            ));
+        }
         _ => return change_list(cx, command, name, rest, raw.as_ref()),
     }
     Ok(Flow::Normal)
@@ -99,7 +113,7 @@ fn change_list(
             save(cx, name, &items);
         }
         (b"INSERT", _) => {
-            return Err(status(
+            return Err(CmdError::status(
                 "sub-command INSERT requires at least three arguments.",
             ));
         }
@@ -112,7 +126,7 @@ fn change_list(
             }
         }
         (b"REMOVE_AT", []) => {
-            return Err(status(
+            return Err(CmdError::status(
                 "sub-command REMOVE_AT requires at least two arguments.",
             ));
         }
@@ -129,7 +143,7 @@ fn change_list(
             }
         }
         (b"REMOVE_DUPLICATES" | b"REVERSE", _) => {
-            return Err(status(cat(&[
+            return Err(CmdError::status(cat(&[
                 b"sub-command ",
                 command,
                 b" only takes one argument.",
@@ -144,7 +158,12 @@ fn change_list(
             }
         }
         (b"TRANSFORM", _) => transform::apply(cx, name, rest, raw.is_some(), items)?,
-        _ => return Err(status(cat(&[b"does not recognize sub-command ", command]))),
+        _ => {
+            return Err(CmdError::status(cat(&[
+                b"does not recognize sub-command ",
+                command,
+            ])));
+        }
     }
     Ok(Flow::Normal)
 }
@@ -158,7 +177,7 @@ fn join_with(items: list::Elements<'_>, glue: &[u8], limit: usize) -> Result<BSt
     for (i, item) in items.enumerate() {
         let separator = if i == 0 { b"".as_slice() } else { glue };
         if item.len().saturating_add(separator.len()) > limit - value.len() {
-            return Err(status("result exceeds the value size limit"));
+            return Err(CmdError::status("result exceeds the value size limit"));
         }
         value.extend_from_slice(separator);
         value.extend_from_slice(&item);
@@ -169,7 +188,7 @@ fn join_with(items: list::Elements<'_>, glue: &[u8], limit: usize) -> Result<BSt
 fn get_elements(raw: &[u8], args: &[ExpandedArg]) -> Result<BString, CmdError> {
     let elements = || list::iter(raw, list::Empty::Keep);
     if raw.is_empty() {
-        return Err(status("GET given empty list"));
+        return Err(CmdError::status("GET given empty list"));
     }
     if let [arg] = args {
         let parsed = list_number(bytes(arg))?;
@@ -209,7 +228,7 @@ fn get_elements(raw: &[u8], args: &[ExpandedArg]) -> Result<BString, CmdError> {
     let mut previous = None;
     let mut next = 0;
     for (at, slot) in order {
-        let at = usize::try_from(at).map_err(|err| status(err.to_string()))?;
+        let at = usize::try_from(at).map_err(|err| CmdError::status(err.to_string()))?;
         if at >= next {
             let Some(value) = scan.nth(at - next) else {
                 let len = elements().count();
@@ -238,7 +257,7 @@ fn get_elements(raw: &[u8], args: &[ExpandedArg]) -> Result<BString, CmdError> {
 fn list_number(arg: &[u8]) -> Result<i64, CmdError> {
     list_ops::parse_index(arg)
         .map(|value| i64::from(value as i32))
-        .ok_or_else(|| status(cat(&[b"index: ", arg, b" is not a valid index"])))
+        .ok_or_else(|| CmdError::status(cat(&[b"index: ", arg, b" is not a valid index"])))
 }
 
 fn signed_len(len: usize) -> i64 {
@@ -255,12 +274,12 @@ fn checked_index(parsed: i64, len: usize, insert: bool) -> Result<usize, CmdErro
     if !(0..=last).contains(&relative) {
         return Err(index_range(parsed, len, insert));
     }
-    usize::try_from(relative).map_err(|err| status(err.to_string()))
+    usize::try_from(relative).map_err(|err| CmdError::status(err.to_string()))
 }
 
 fn index_range(parsed: i64, len: usize, insert: bool) -> CmdError {
     let last = signed_len(len) - i64::from(!insert);
-    status(format!(
+    CmdError::status(format!(
         "index: {parsed} out of range ({}, {last})",
         -signed_len(len)
     ))
@@ -278,12 +297,14 @@ fn sublist(raw: &[u8], begin: &[u8], length: &[u8]) -> Result<BString, CmdError>
         .and_then(|start| items.nth(start))
     else {
         let last = signed_len(list::iter(raw, list::Empty::Keep).count()) - 1;
-        return Err(status(format!(
+        return Err(CmdError::status(format!(
             "begin index: {begin} is out of range 0 - {last}"
         )));
     };
     if length < -1 {
-        return Err(status(format!("length: {length} should be -1 or greater")));
+        return Err(CmdError::status(format!(
+            "length: {length} should be -1 or greater"
+        )));
     }
     let count = usize::try_from(length).unwrap_or(usize::MAX);
     Ok(list::join(std::iter::once(first).chain(items).take(count)))
@@ -333,7 +354,7 @@ fn remove_at(
         let indices: Vec<_> = std::iter::once(name)
             .chain(args.iter().map(bytes))
             .collect();
-        return Err(status(cat(&[
+        return Err(CmdError::status(cat(&[
             b"index: ",
             &indices.join(b", ".as_slice()),
             b" out of range (0, 0)",
@@ -366,14 +387,14 @@ pub(super) fn compile(
                 b"\nRegularExpression::compile(): Error in compile.\n",
             ]),
         );
-        status(cat(&[error, b" \"", pattern, b"\"."]))
+        CmdError::status(cat(&[error, b" \"", pattern, b"\"."]))
     })
 }
 
 pub(super) fn matches(re: &Regex, input: &[u8], budget: &mut u64) -> Result<bool, CmdError> {
     re.find_at(input, 0, MatchOptions::default(), budget)
         .map(|caps| caps.is_some())
-        .map_err(|err| status(err.to_string()))
+        .map_err(|err| CmdError::status(err.to_string()))
 }
 
 fn filter(
@@ -384,12 +405,12 @@ fn filter(
     items: Vec<BString>,
 ) -> Result<(), CmdError> {
     let Some((operator, tail)) = args.split_first() else {
-        return Err(status(
+        return Err(CmdError::status(
             "sub-command FILTER requires an operator to be specified.",
         ));
     };
     let Some((mode, operand)) = tail.split_first() else {
-        return Err(status(
+        return Err(CmdError::status(
             "sub-command FILTER requires a mode to be specified.",
         ));
     };
@@ -397,7 +418,7 @@ fn filter(
         b"INCLUDE" => true,
         b"EXCLUDE" => false,
         bad => {
-            return Err(status(cat(&[
+            return Err(CmdError::status(cat(&[
                 b"sub-command FILTER does not recognize operator ",
                 bad,
             ])));
@@ -411,14 +432,14 @@ fn filter(
         b"REGEX" => true,
         b"PREDICATE" => false,
         bad => {
-            return Err(status(cat(&[
+            return Err(CmdError::status(cat(&[
                 b"sub-command FILTER does not recognize mode ",
                 bad,
             ])));
         }
     };
     let [operand] = operand else {
-        return Err(status(cat(&[
+        return Err(CmdError::status(cat(&[
             b"sub-command FILTER, mode ",
             mode,
             b" requires five arguments.",

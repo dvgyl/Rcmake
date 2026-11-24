@@ -360,7 +360,7 @@ impl Bootstrap {
 
     /// `cmGlobalGenerator::FindMakeProgram`.
     fn find_make_program(&self, cx: &mut Cx<'_>) -> Result<(), CmdError> {
-        // Visual Studio has no module: the generator finds MSBuild itself (Wave 2).
+        // The Visual Studio generator finds MSBuild without a module.
         let module = self
             .generator
             .find_make_module()

@@ -2,20 +2,20 @@ use std::{fmt::Write as _, sync::Mutex};
 
 use jiff::{Timestamp, fmt::strtime, tz::TimeZone};
 use rcmake_base::{BString, ByteSlice, hash::HashAlgo};
-use rcmake_eval::{CmdResult, Cx};
+use rcmake_eval::{CmdError, CmdResult, Cx};
 use rcmake_expr::{
     ExpandEnv,
     configure::{ConfigureOptions, configure as expand_template},
 };
 
-use super::{append, check_size, decimal_prefix, set, status};
+use super::{append, check_size, decimal_prefix, set};
 
 pub(super) fn ascii(cx: &mut Cx<'_>, args: &[&[u8]]) -> CmdResult {
     let [codes @ .., out] = args else {
-        return Err(status("No output variable specified"));
+        return Err(CmdError::status("No output variable specified"));
     };
     if codes.is_empty() {
-        return Err(status("No output variable specified"));
+        return Err(CmdError::status("No output variable specified"));
     }
     check_size(cx, codes.len())?;
     let mut result = Vec::with_capacity(codes.len());
@@ -24,7 +24,7 @@ pub(super) fn ascii(cx: &mut Cx<'_>, args: &[&[u8]]) -> CmdResult {
             .ok()
             .filter(|&value| value != 0)
             .ok_or_else(|| {
-                status(format!(
+                CmdError::status(format!(
                     "Character with code {} does not exist.",
                     code.to_str_lossy()
                 ))
@@ -59,7 +59,7 @@ impl ExpandEnv for TemplateEnv<'_, '_> {
 
 pub(super) fn configure(cx: &mut Cx<'_>, args: &[&[u8]]) -> CmdResult {
     let [input, out, flags @ ..] = args else {
-        return Err(status(if args.is_empty() {
+        return Err(CmdError::status(if args.is_empty() {
             "No input string specified."
         } else {
             "No output variable specified."
@@ -71,7 +71,7 @@ pub(super) fn configure(cx: &mut Cx<'_>, args: &[&[u8]]) -> CmdResult {
             b"@ONLY" => options.at_only = true,
             b"ESCAPE_QUOTES" => options.escape_quotes = true,
             _ => {
-                return Err(status(format!(
+                return Err(CmdError::status(format!(
                     "Unrecognized argument \"{}\"",
                     flag.to_str_lossy()
                 )));
@@ -87,8 +87,8 @@ pub(super) fn configure(cx: &mut Cx<'_>, args: &[&[u8]]) -> CmdResult {
     for line in input.split_inclusive(|&byte| byte == b'\n') {
         let body = line.strip_suffix(b"\n").unwrap_or(line);
         let trimmed = body.strip_suffix(b"\r").unwrap_or(body);
-        let expanded =
-            expand_template(trimmed, &mut env, options).map_err(|error| status(error.message))?;
+        let expanded = expand_template(trimmed, &mut env, options)
+            .map_err(|error| CmdError::status(error.message))?;
         append(
             env.cx,
             &mut result,
@@ -110,7 +110,7 @@ static RANDOM_STATE: Mutex<Option<u32>> = Mutex::new(None);
 
 pub(super) fn random(cx: &mut Cx<'_>, args: &[&[u8]]) -> CmdResult {
     const ALPHABET: &[u8] = b"qwertyuiopasdfghjklzxcvbnmQWERTYUIOPASDFGHJKLZXCVBNM0123456789";
-    let missing = || status("sub-command RANDOM requires at least one argument.");
+    let missing = || CmdError::status("sub-command RANDOM requires at least one argument.");
     let [options @ .., out] = args else {
         return Err(missing());
     };
@@ -129,7 +129,9 @@ pub(super) fn random(cx: &mut Cx<'_>, args: &[&[u8]]) -> CmdResult {
         }
     }
     if length <= 0 {
-        return Err(status("sub-command RANDOM: Invoked with bad length.."));
+        return Err(CmdError::status(
+            "sub-command RANDOM: Invoked with bad length..",
+        ));
     }
     let length = length as usize;
     check_size(cx, length)?;
@@ -138,7 +140,7 @@ pub(super) fn random(cx: &mut Cx<'_>, args: &[&[u8]]) -> CmdResult {
     }
     let mut state = RANDOM_STATE
         .lock()
-        .map_err(|_| status("could not access random state."))?;
+        .map_err(|_| CmdError::status("could not access random state."))?;
     if let Some(seed) = seed {
         *state = Some(seed);
     }
@@ -161,7 +163,7 @@ pub(super) fn random(cx: &mut Cx<'_>, args: &[&[u8]]) -> CmdResult {
 pub(super) fn timestamp(cx: &mut Cx<'_>, args: &[&[u8]]) -> CmdResult {
     let (out, format, utc) = match args {
         [] => {
-            return Err(status(
+            return Err(CmdError::status(
                 "sub-command TIMESTAMP requires at least one argument.",
             ));
         }
@@ -170,13 +172,13 @@ pub(super) fn timestamp(cx: &mut Cx<'_>, args: &[&[u8]]) -> CmdResult {
         [out, format] => (*out, *format, false),
         [out, format, b"UTC"] => (*out, *format, true),
         [_, _, option] => {
-            return Err(status(format!(
+            return Err(CmdError::status(format!(
                 "TIMESTAMP sub-command does not recognize option {}.",
                 option.to_str_lossy()
             )));
         }
         _ => {
-            return Err(status(
+            return Err(CmdError::status(
                 "sub-command TIMESTAMP takes at most three arguments.",
             ));
         }
@@ -253,7 +255,9 @@ pub(super) fn timestamp(cx: &mut Cx<'_>, args: &[&[u8]]) -> CmdResult {
 
 pub(super) fn uuid(cx: &mut Cx<'_>, args: &[&[u8]]) -> CmdResult {
     let [out, options @ ..] = args else {
-        return Err(status("UUID sub-command requires an output variable."));
+        return Err(CmdError::status(
+            "UUID sub-command requires an output variable.",
+        ));
     };
     let mut namespace = b"".as_slice();
     let mut name = b"".as_slice();
@@ -262,7 +266,7 @@ pub(super) fn uuid(cx: &mut Cx<'_>, args: &[&[u8]]) -> CmdResult {
     let mut iter = options.iter().copied();
     while let Some(option) = iter.next() {
         let missing = || {
-            status(format!(
+            CmdError::status(format!(
                 "UUID sub-command, {} requires a value.",
                 option.to_str_lossy()
             ))
@@ -273,7 +277,7 @@ pub(super) fn uuid(cx: &mut Cx<'_>, args: &[&[u8]]) -> CmdResult {
             b"TYPE" => algorithm = iter.next().ok_or_else(missing)?,
             b"UPPER" => upper = true,
             _ => {
-                return Err(status(format!(
+                return Err(CmdError::status(format!(
                     "UUID sub-command does not recognize option {}.",
                     option.to_str_lossy()
                 )));
@@ -285,17 +289,17 @@ pub(super) fn uuid(cx: &mut Cx<'_>, args: &[&[u8]]) -> CmdResult {
         b"MD5" => (HashAlgo::Md5, 3),
         b"SHA1" => (HashAlgo::Sha1, 5),
         _ => {
-            return Err(status(format!(
+            return Err(CmdError::status(format!(
                 "UUID sub-command, unknown TYPE '{}'.",
                 algorithm.to_str_lossy()
             )));
         }
     };
     let mut data = decode_uuid(namespace)
-        .ok_or_else(|| status("UUID sub-command, malformed NAMESPACE UUID."))?;
+        .ok_or_else(|| CmdError::status("UUID sub-command, malformed NAMESPACE UUID."))?;
     data.extend_from_slice(name);
     let digest = algo.hex_digest(&data);
-    let invalid_digest = || status("UUID sub-command could not read the digest.");
+    let invalid_digest = || CmdError::status("UUID sub-command could not read the digest.");
     let mut uuid: Vec<u8> = digest
         .as_bytes()
         .as_chunks::<2>()

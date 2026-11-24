@@ -1,10 +1,10 @@
 use rcmake_base::ByteSlice;
 use rcmake_diag::{PolicyId, PolicyStatus};
-use rcmake_eval::{CmdResult, Cx};
+use rcmake_eval::{CmdError, CmdResult, Cx};
 use rcmake_host::Stream;
 use rcmake_regex::{Captures, MATCH_VAR_SLOTS, MatchOptions, Replacement, Scratch};
 
-use super::{append, concat, set, status};
+use super::{append, concat, set};
 
 const MATCH_VARS: [&[u8]; MATCH_VAR_SLOTS] = [
     b"CMAKE_MATCH_0",
@@ -21,11 +21,13 @@ const MATCH_VARS: [&[u8]; MATCH_VAR_SLOTS] = [
 
 pub(super) fn command(cx: &mut Cx<'_>, args: &[&[u8]]) -> CmdResult {
     let Some((&mode, args)) = args.split_first() else {
-        return Err(status("sub-command REGEX requires a mode to be specified."));
+        return Err(CmdError::status(
+            "sub-command REGEX requires a mode to be specified.",
+        ));
     };
     let mode_name = mode.to_str_lossy();
     let arity = |total| {
-        status(format!(
+        CmdError::status(format!(
             "sub-command REGEX, mode {mode_name} needs at least {total} arguments total to command."
         ))
     };
@@ -41,7 +43,7 @@ pub(super) fn command(cx: &mut Cx<'_>, args: &[&[u8]]) -> CmdResult {
         (b"MATCH" | b"MATCHALL", _) => return Err(arity(5)),
         (b"REPLACE", _) => return Err(arity(6)),
         _ => {
-            return Err(status(format!(
+            return Err(CmdError::status(format!(
                 "sub-command REGEX does not recognize mode {mode_name}"
             )));
         }
@@ -57,7 +59,7 @@ pub(super) fn command(cx: &mut Cx<'_>, args: &[&[u8]]) -> CmdResult {
             )
             .as_bytes(),
         );
-        status(format!(
+        CmdError::status(format!(
             "sub-command REGEX, mode {mode_name}: Failed to compile regex \"{pattern_name}\"."
         ))
     });
@@ -90,7 +92,7 @@ pub(super) fn command(cx: &mut Cx<'_>, args: &[&[u8]]) -> CmdResult {
     let result = (|| {
         while let Some(caps) = regex
             .find_at_with_scratch(&input, end, options, &mut budget, &mut scratch)
-            .map_err(|error| status(error.to_string()))?
+            .map_err(|error| CmdError::status(error.to_string()))?
         {
             let Some(&Some((start, next))) = caps.groups.first() else {
                 break;
@@ -107,7 +109,7 @@ pub(super) fn command(cx: &mut Cx<'_>, args: &[&[u8]]) -> CmdResult {
                 parsed.expand_into(&input, caps, regex.group_count(), &mut expanded)
                     .map_err(|error| {
                         if error.message.contains("contains an out-of-range escape") {
-                            status(format!(r#"sub-command REGEX, mode REPLACE: replace expression "{}" contains an out-of-range escape for regex "{pattern_name}"."#, template.to_str_lossy()))
+                            CmdError::status(format!(r#"sub-command REGEX, mode REPLACE: replace expression "{}" contains an out-of-range escape for regex "{pattern_name}"."#, template.to_str_lossy()))
                         } else {
                             replacement_error(error)
                         }
@@ -160,7 +162,7 @@ fn nonempty_slots(caps: &Captures) -> u16 {
 }
 
 fn replacement_error(error: rcmake_regex::RegexError) -> rcmake_eval::CmdError {
-    status(
+    CmdError::status(
         error
             .message
             .strip_prefix("string ")

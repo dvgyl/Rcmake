@@ -51,17 +51,13 @@ fn bytes(arg: &ExpandedArg) -> &[u8] {
     arg.value.as_slice()
 }
 
-fn status(message: impl Into<BString>) -> CmdError {
-    CmdError::Status(message.into())
-}
-
 fn reported(cx: &mut Cx<'_>, message: impl Into<BString>) -> CmdError {
     cx.issue(MessageKind::Error, Effect::SetError, None, message.into());
     CmdError::Reported
 }
 
 fn model_error(error: ModelError) -> CmdError {
-    status(error.to_string())
+    CmdError::status(error.to_string())
 }
 
 fn scope(value: &[u8]) -> Option<UsageScope> {

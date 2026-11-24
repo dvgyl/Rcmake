@@ -154,7 +154,7 @@ pub fn targets_for_root(
     let mut out = IndexSet::new();
     let mut pending = Vec::new();
     for (id, target) in model.targets() {
-        if !target.is_imported() && is_under(model, target.dir, root) {
+        if !target.is_imported() && model.ancestors(target.dir).any(|dir| dir == root) {
             out.insert(id);
             pending.push(id);
         }
@@ -176,18 +176,6 @@ pub fn targets_for_root(
         }
     }
     out.into_iter().collect()
-}
-
-fn is_under(model: &ProjectModel, mut dir: DirId, root: DirId) -> bool {
-    loop {
-        if dir == root {
-            return true;
-        }
-        match model.dir(dir).parent {
-            Some(parent) if parent.index() < dir.index() => dir = parent,
-            _ => return false,
-        }
-    }
 }
 
 /// The configure inputs that make the IDE project run CMake again: the

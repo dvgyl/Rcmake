@@ -3,7 +3,7 @@
 #![forbid(unsafe_code)]
 
 use rcmake_base::BString;
-use rcmake_eval::{CmdError, CmdFlags, Registry};
+use rcmake_eval::{CmdFlags, Registry};
 use rcmake_expr::ExpandedArg;
 
 mod arguments;
@@ -59,10 +59,6 @@ pub(crate) fn register(registry: &mut Registry) {
 
 fn values(args: &[ExpandedArg]) -> Vec<&[u8]> {
     args.iter().map(|arg| arg.value.as_slice()).collect()
-}
-
-fn status(text: impl Into<BString>) -> CmdError {
-    CmdError::Status(text.into())
 }
 
 fn quoted(before: &str, value: &[u8], after: &str) -> BString {

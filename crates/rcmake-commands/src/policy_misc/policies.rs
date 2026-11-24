@@ -6,7 +6,7 @@ use rcmake_diag::{
 use rcmake_eval::{CmdError, CmdResult, Cx, Flow};
 use rcmake_expr::ExpandedArg;
 
-use super::{quoted, status, values};
+use super::{quoted, values};
 
 mod warning_text;
 
@@ -22,7 +22,7 @@ pub(super) fn minimum_required(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResu
             b"VERSION" => {
                 version = Some(
                     iter.next()
-                        .ok_or_else(|| status("called with no value for VERSION."))?,
+                        .ok_or_else(|| CmdError::status("called with no value for VERSION."))?,
                 );
             }
             b"FATAL_ERROR" => {}
@@ -34,7 +34,7 @@ pub(super) fn minimum_required(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResu
     if let Some(arg) = unknown
         && !version.is_some_and(allows_future_options)
     {
-        return Err(status(quoted(
+        return Err(CmdError::status(quoted(
             "called with unknown argument \"",
             arg,
             "\".",
@@ -49,11 +49,11 @@ pub(super) fn minimum_required(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResu
 pub(super) fn policy(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
     let values = values(args);
     match values.as_slice() {
-        [] => return Err(status("requires at least one argument.")),
+        [] => return Err(CmdError::status("requires at least one argument.")),
         [b"VERSION", raw] => return apply_version(cx, raw, false),
-        [b"VERSION"] => return Err(status("VERSION not given an argument")),
+        [b"VERSION"] => return Err(CmdError::status("VERSION not given an argument")),
         [b"VERSION", ..] => {
-            return Err(status("VERSION given too many arguments"));
+            return Err(CmdError::status("VERSION given too many arguments"));
         }
         [b"SET", name, value] => {
             let id = policy_id(name, "SET")?;
@@ -61,7 +61,7 @@ pub(super) fn policy(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
                 b"NEW" => PolicyStatus::New,
                 b"OLD" => PolicyStatus::Old,
                 _ => {
-                    return Err(status(quoted(
+                    return Err(CmdError::status(quoted(
                         "SET given unrecognized policy status \"",
                         value,
                         "\"",
@@ -138,14 +138,20 @@ pub(super) fn policy(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
                 "may not be given additional arguments.",
             ));
         }
-        [op, ..] => return Err(status(quoted("given unknown first argument \"", op, "\""))),
+        [op, ..] => {
+            return Err(CmdError::status(quoted(
+                "given unknown first argument \"",
+                op,
+                "\"",
+            )));
+        }
     }
     Ok(Flow::Normal)
 }
 
 fn policy_id(name: &[u8], op: &str) -> Result<PolicyId, CmdError> {
     PolicyId::parse(name).ok_or_else(|| {
-        status(quoted(
+        CmdError::status(quoted(
             &format!("{op} given policy \""),
             name,
             "\" which is not known to this version of CMake.",
@@ -220,7 +226,7 @@ fn apply_version(cx: &mut Cx<'_>, raw: &[u8], required: bool) -> CmdResult {
             let min = raw.get(..at).unwrap_or_default();
             let max = raw.get(at + 3..).unwrap_or_default();
             if min.is_empty() || max.is_empty() {
-                return Err(status(quoted(
+                return Err(CmdError::status(quoted(
                     "VERSION \"",
                     raw,
                     "\" does not have a version on both sides of \"...\".",
@@ -232,7 +238,7 @@ fn apply_version(cx: &mut Cx<'_>, raw: &[u8], required: bool) -> CmdResult {
     };
     let minimum_version = parse_version(minimum).ok_or_else(|| {
         if required {
-            status(quoted("could not parse VERSION \"", minimum, "\"."))
+            CmdError::status(quoted("could not parse VERSION \"", minimum, "\"."))
         } else {
             invalid_version(cx, "policy version", minimum)
         }
@@ -370,7 +376,7 @@ fn fatal(cx: &mut Cx<'_>, message: BString) -> CmdError {
 pub(super) fn diagnostic(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
     let values = values(args);
     match values.as_slice() {
-        [] => return Err(status("requires at least one argument.")),
+        [] => return Err(CmdError::status("requires at least one argument.")),
         [b"PUSH"] => cx.push_diag_scope(),
         [b"POP"] => cx.pop_diag_scope()?,
         [b"PUSH" | b"POP", ..] => {
@@ -399,7 +405,7 @@ pub(super) fn diagnostic(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
             let cat = category(op, cat)?;
             let op_text = op.to_str_lossy();
             let action = DiagAction::parse(action).ok_or_else(|| {
-                status(quoted(
+                CmdError::status(quoted(
                     &format!("{op_text} given unrecognized diagnostic action \""),
                     action,
                     "\".",
@@ -410,7 +416,7 @@ pub(super) fn diagnostic(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
                 [b"RECURSE"] => true,
                 [b"NO_RECURSE"] => false,
                 [other, ..] => {
-                    return Err(status(quoted(
+                    return Err(CmdError::status(quoted(
                         &format!("{op_text} given unknown option \""),
                         other,
                         "\".",
@@ -429,7 +435,13 @@ pub(super) fn diagnostic(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
                 "must be given exactly 2 or 3 additional arguments.",
             ));
         }
-        [op, ..] => return Err(status(quoted("given unknown first argument \"", op, "\""))),
+        [op, ..] => {
+            return Err(CmdError::status(quoted(
+                "given unknown first argument \"",
+                op,
+                "\"",
+            )));
+        }
     }
     Ok(Flow::Normal)
 }
@@ -437,7 +449,7 @@ pub(super) fn diagnostic(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
 fn category(op: &[u8], cat: &[u8]) -> Result<DiagCategory, CmdError> {
     let op = op.to_str_lossy();
     DiagCategory::parse(cat).ok_or_else(|| {
-        status(quoted(
+        CmdError::status(quoted(
             &format!("{op} given unrecognized diagnostic category \""),
             cat,
             "\".",
@@ -447,5 +459,5 @@ fn category(op: &[u8], cat: &[u8]) -> Result<DiagCategory, CmdError> {
 
 fn subcommand_error(args: &[ExpandedArg], message: &str) -> CmdError {
     let op = args.first().map_or(b"".as_slice(), |a| a.value.as_slice());
-    status([op, b" ", message.as_bytes()].concat())
+    CmdError::status([op, b" ", message.as_bytes()].concat())
 }

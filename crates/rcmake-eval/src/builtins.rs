@@ -9,7 +9,7 @@ use rcmake_diag::{
 use rcmake_expr::ExpandedArg;
 use rcmake_host::Stream;
 
-use crate::exec::cat;
+use crate::util::cat;
 use crate::util::collapse_full_path;
 use crate::{CmdError, CmdFlags, CmdResult, Cx, Flow, IncludeOptions, Interp, LogLevel, Registry};
 
@@ -343,13 +343,13 @@ fn cmd_include_guard(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
             cx.set_var(&var, "ON".into());
         }
         Scope::Directory => {
-            let mut dir = Some(cx.current_dir_id());
-            while let Some(id) = dir {
-                let directory = cx.project().dir(id);
-                if directory.props.get(&var).is_some() {
-                    return done;
-                }
-                dir = directory.parent;
+            let dir = cx.current_dir_id();
+            let project = cx.project();
+            if project
+                .ancestors(dir)
+                .any(|id| project.dir(id).props.get(&var).is_some())
+            {
+                return done;
             }
             cx.directory_props().set(var, "TRUE".into());
         }

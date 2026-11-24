@@ -2,6 +2,15 @@
 
 use rcmake_base::BString;
 
+/// Concatenate byte slices.
+pub(crate) fn cat(parts: &[&[u8]]) -> BString {
+    let mut out = Vec::new();
+    for p in parts {
+        out.extend_from_slice(p);
+    }
+    BString::from(out)
+}
+
 /// Lexically collapse `path` against `base` (`cmSystemTools::CollapseFullPath`).
 ///
 /// Relative paths are joined to `base`. `.` components are removed and `..` removes the
@@ -138,63 +147,6 @@ pub(crate) fn stoi(s: &[u8]) -> Result<i32, IntError> {
     i32::try_from(signed).map_err(|_| IntError::OutOfRange)
 }
 
-/// Levenshtein edit distance over bytes (`cmLevenshteinDistance`).
-pub(crate) fn levenshtein(a: &[u8], b: &[u8]) -> usize {
-    if a == b {
-        return 0;
-    }
-    if a.is_empty() {
-        return b.len();
-    }
-    if b.is_empty() {
-        return a.len();
-    }
-    let mut previous: Vec<usize> = (0..=b.len()).collect();
-    let mut current = vec![0usize; b.len() + 1];
-    for (i, &ca) in a.iter().enumerate() {
-        if let Some(first) = current.first_mut() {
-            *first = i + 1;
-        }
-        for (j, &cb) in b.iter().enumerate() {
-            let cost = usize::from(ca != cb);
-            let del = previous
-                .get(j + 1)
-                .copied()
-                .unwrap_or(usize::MAX)
-                .saturating_add(1);
-            let ins = current
-                .get(j)
-                .copied()
-                .unwrap_or(usize::MAX)
-                .saturating_add(1);
-            let sub = previous
-                .get(j)
-                .copied()
-                .unwrap_or(usize::MAX)
-                .saturating_add(cost);
-            if let Some(slot) = current.get_mut(j + 1) {
-                *slot = del.min(ins).min(sub);
-            }
-        }
-        core::mem::swap(&mut previous, &mut current);
-    }
-    previous.last().copied().unwrap_or(0)
-}
-
-/// Closest candidate within CMake's typo threshold (`cmFindClosestString`).
-pub(crate) fn closest<'a>(input: &[u8], candidates: &'a [BString]) -> Option<&'a BString> {
-    let mut best: Option<(&BString, usize)> = None;
-    for cand in candidates {
-        let d = levenshtein(input, cand);
-        if best.is_none_or(|(_, bd)| d < bd) {
-            best = Some((cand, d));
-        }
-    }
-    let (cand, dist) = best?;
-    let max = (input.len() / 5 + 1).clamp(1, 4);
-    (dist <= max).then_some(cand)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -231,13 +183,5 @@ mod tests {
         assert_eq!(stoi(b"-2147483648"), Ok(i32::MIN));
         assert_eq!(stoi(b"2147483648"), Err(IntError::OutOfRange));
         assert_eq!(stoi(b"99999999999999999999999"), Err(IntError::OutOfRange));
-    }
-
-    #[test]
-    fn closest_command_threshold() {
-        let names = vec![BString::from("message"), BString::from("set")];
-        assert_eq!(closest(b"mesage", &names), Some(&names[0]));
-        assert_eq!(closest(b"foo_unknown", &names), None);
-        assert_eq!(levenshtein(b"kitten", b"sitting"), 3);
     }
 }

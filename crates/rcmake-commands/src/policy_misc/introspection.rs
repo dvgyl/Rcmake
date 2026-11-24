@@ -7,7 +7,7 @@ use rcmake_host::Stream;
 use rcmake_model::{CacheType, UsageField};
 use rcmake_regex::{MatchOptions, Regex, Scratch};
 
-use super::{properties, quoted, status};
+use super::{properties, quoted};
 
 pub(super) fn targets(cx: &mut Cx<'_>, args: &[&[u8]]) -> CmdResult {
     const KEYS: &[&[u8]] = &[b"REGEX", b"IGNORE_CASE", b"IMPORTED_ONLY", b"NO_IMPORTED"];
@@ -21,12 +21,12 @@ pub(super) fn targets(cx: &mut Cx<'_>, args: &[&[u8]]) -> CmdResult {
     let insensitive = options.has(b"IGNORE_CASE");
     let pattern = options.value(b"REGEX");
     if imported && local {
-        return Err(status(
+        return Err(CmdError::status(
             "IMPORTED_ONLY and NO_IMPORTED keywords are mutually exclusive in cmake_language(PRINT_TARGETS) call.",
         ));
     }
     if insensitive && pattern.is_none() {
-        return Err(status(
+        return Err(CmdError::status(
             "IGNORE_CASE keyword in cmake_language(PRINT_TARGETS) call is only valid with REGEX.",
         ));
     }
@@ -107,7 +107,7 @@ pub(super) fn variables(cx: &mut Cx<'_>, args: &[&[u8]]) -> CmdResult {
     check_mode(&options, "PRINT_VARIABLES", "__CMAKE_PRINT_VARIABLES")?;
     if named {
         if insensitive || name.is_some() || value.is_some() {
-            return Err(status(
+            return Err(CmdError::status(
                 "NAME_REGEX, VALUE_REGEX, and IGNORE_CASE in cmake_language(PRINT_VARIABLES) call are only valid with ALL, not NAMED.",
             ));
         }
@@ -210,7 +210,7 @@ pub(super) fn properties(cx: &mut Cx<'_>, args: &[&[u8]]) -> CmdResult {
     .concat();
     let options = Options::parse(cx, args, &keys, FILTERS, &lists)?;
     if !options.unknown.is_empty() {
-        return Err(status(quoted(
+        return Err(CmdError::status(quoted(
             "Unknown keywords: \"",
             &join_words(&options.unknown),
             "\"",
@@ -223,12 +223,12 @@ pub(super) fn properties(cx: &mut Cx<'_>, args: &[&[u8]]) -> CmdResult {
     let &(keyword, scope) = match modes.as_slice() {
         [mode] => *mode,
         [] => {
-            return Err(status(
+            return Err(CmdError::status(
                 "mode keyword missing in cmake_language(PRINT_PROPERTIES) call, there must be exactly one of TARGETS SOURCES TESTS DIRECTORIES CACHE_ENTRIES",
             ));
         }
         _ => {
-            return Err(status(
+            return Err(CmdError::status(
                 "multiple mode keywords used in cmake_language(PRINT_PROPERTIES) call, there must be exactly one of TARGETS SOURCES TESTS DIRECTORIES CACHE_ENTRIES.",
             ));
         }
@@ -240,13 +240,13 @@ pub(super) fn properties(cx: &mut Cx<'_>, args: &[&[u8]]) -> CmdResult {
     if scope != b"TARGET" {
         for flag in ["ALL", "DEFERRED", "FOLLOW_DEPENDENCIES"] {
             if options.has(flag.as_bytes()) {
-                return Err(status(format!(
+                return Err(CmdError::status(format!(
                     "{flag} keyword in cmake_language(PRINT_PROPERTIES) call is only valid with the TARGETS scope."
                 )));
             }
         }
         if all {
-            return Err(status(format!(
+            return Err(CmdError::status(format!(
                 "NAMED keyword missing in cmake_language(PRINT_PROPERTIES) call with {} scope.",
                 BString::from(keyword)
             )));
@@ -256,19 +256,19 @@ pub(super) fn properties(cx: &mut Cx<'_>, args: &[&[u8]]) -> CmdResult {
     let value = options.value(VALUE_REGEX);
     if name.is_some() || value.is_some() {
         if scope != b"TARGET" {
-            return Err(status(
+            return Err(CmdError::status(
                 "PROPERTY_NAME_REGEX and PROPERTY_VALUE_REGEX in cmake_language(PRINT_PROPERTIES) call are only valid with the TARGETS scope and ALL.",
             ));
         }
         if named {
-            return Err(status(
+            return Err(CmdError::status(
                 "PROPERTY_NAME_REGEX and PROPERTY_VALUE_REGEX in cmake_language(PRINT_PROPERTIES) call are only valid with ALL, not NAMED.",
             ));
         }
     }
     let filters = Filters::new(cx, "PROPERTY_", name, value, false)?;
     if options.has(b"DEFERRED") || options.has(b"FOLLOW_DEPENDENCIES") {
-        return Err(status(
+        return Err(CmdError::status(
             "generation-time property printing is not supported.",
         ));
     }
@@ -434,7 +434,7 @@ fn compile(
                 pattern
             };
             cx.regex(input).map_err(|_| {
-                status(format!(
+                CmdError::status(format!(
                     "{key} regular expression \"{}\" cannot compile.",
                     BString::from(pattern)
                 ))
@@ -519,7 +519,7 @@ impl Matcher {
                 &mut self.scratch,
             )
             .map(|result| result.is_some())
-            .map_err(|_| status("regular expression match exceeds the step limit."))
+            .map_err(|_| CmdError::status("regular expression match exceeds the step limit."))
     }
 }
 
@@ -607,7 +607,7 @@ impl<'a> Options<'a> {
             message.extend_from_slice(&quoted("\"", word, "\""));
         }
         message.extend_from_slice(suffix.as_bytes());
-        Err(status(message))
+        Err(CmdError::status(message))
     }
 }
 
@@ -617,12 +617,12 @@ fn join_words(words: &[&[u8]]) -> BString {
 
 fn check_mode(options: &Options<'_>, op: &str, legacy: &str) -> Result<(), CmdError> {
     if options.has(b"ALL") && options.has(b"NAMED") {
-        return Err(status(format!(
+        return Err(CmdError::status(format!(
             "ALL and NAMED keywords in cmake_language({op}) call are mutually exclusive."
         )));
     }
     if options.has(legacy.as_bytes()) && !options.has(b"NAMED") {
-        return Err(status(format!(
+        return Err(CmdError::status(format!(
             "{legacy} in cmake_language({op}) call is only valid with NAMED."
         )));
     }

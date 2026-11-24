@@ -9,17 +9,17 @@ use rcmake_syntax::ArgKind;
 use crate::policy_misc::files::configure_file;
 use crate::string_math::make_c_identifier;
 
-use super::{status, values};
+use super::values;
 
 pub(super) fn create(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
     let (output, driver, options) = match args {
         [output, driver, options @ ..] if !options.is_empty() => (output, driver, options),
-        _ => return Err(status("called with wrong number of arguments.")),
+        _ => return Err(CmdError::status("called with wrong number of arguments.")),
     };
     let line = driver.line;
     let driver = driver.value.as_slice();
     if extension_index(driver).is_none_or(|index| index + 1 == driver.len()) {
-        return Err(status(
+        return Err(CmdError::status(
             "You must specify a file extension for the test driver file.",
         ));
     }
@@ -65,7 +65,7 @@ impl<'a> TestDriver<'a> {
                 }
             };
             let Some((&value, tail)) = args.split_first() else {
-                return Err(status(format!(
+                return Err(CmdError::status(format!(
                     "incorrect arguments to {}",
                     BString::from(arg)
                 )));
@@ -96,7 +96,9 @@ impl<'a> TestDriver<'a> {
             table.extend_from_slice(&identifier);
             table.extend_from_slice(b"\n  },\n");
             if table.len().saturating_add(declarations.len()) > cx.limits().max_value_bytes {
-                return Err(status("test driver content exceeds the value size limit"));
+                return Err(CmdError::status(
+                    "test driver content exceeds the value size limit",
+                ));
             }
         }
         if let Some(header) = self.extra_include {

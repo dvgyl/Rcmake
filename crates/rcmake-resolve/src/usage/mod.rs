@@ -461,9 +461,9 @@ impl<'a> UsageResolver<'a> {
                     FileSetKind::Sources if !own => set.scope != UsageScope::Private,
                     _ => {
                         own && (set.scope != UsageScope::Interface
-                            || model
-                                .target(target)
-                                .is_some_and(|target| target.name == crate::STD_MODULE_TARGET))
+                            || model.target(target).is_some_and(|target| {
+                                target.name == crate::cxx_modules::STD_MODULE_TARGET
+                            }))
                     }
                 }
             })

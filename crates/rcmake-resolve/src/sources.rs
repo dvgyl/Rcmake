@@ -10,9 +10,65 @@ use rcmake_host::{FileKind, Follow, Host, Stream, path::to_native};
 use rcmake_model::{BT, Directory, ProjectModel, PropertyMap, TargetId, TargetKind};
 
 use crate::{
-    CompileGroup, FileSetMember, InterfaceInclude, ResolveError, absolute_path,
+    CompileGroup, InterfaceInclude, ResolveError,
+    target::FileSetMember,
     usage::{self, UsageResolver},
 };
+
+#[derive(Clone, Copy)]
+enum SourceUsage {
+    Options,
+    Definitions,
+    Includes,
+}
+
+impl SourceUsage {
+    const ALL: [Self; 3] = [Self::Options, Self::Definitions, Self::Includes];
+
+    fn property(self) -> &'static [u8] {
+        match self {
+            Self::Options => b"COMPILE_OPTIONS",
+            Self::Definitions => b"COMPILE_DEFINITIONS",
+            Self::Includes => b"INCLUDE_DIRECTORIES",
+        }
+    }
+
+    fn apply(
+        self,
+        group: &mut CompileGroup,
+        source_values: Vec<BT<BString>>,
+        set_values: Vec<BT<BString>>,
+    ) {
+        match self {
+            Self::Options => group
+                .flags
+                .extend(source_values.into_iter().chain(set_values)),
+            Self::Definitions => group
+                .defines
+                .extend(source_values.into_iter().chain(set_values)),
+            Self::Includes => {
+                let mut seen = IndexSet::new();
+                group.includes = set_values
+                    .into_iter()
+                    .chain(source_values)
+                    .map(|path| InterfaceInclude {
+                        path,
+                        system: false,
+                    })
+                    .chain(std::mem::take(&mut group.includes))
+                    .filter(|entry| seen.insert(entry.path.value.clone()))
+                    .collect();
+            }
+        }
+    }
+}
+
+pub(crate) fn has_source_compile_properties(props: SourceProperties<'_>) -> bool {
+    props.get(b"COMPILE_FLAGS").is_some()
+        || SourceUsage::ALL
+            .into_iter()
+            .any(|usage| props.get(usage.property()).is_some())
+}
 
 pub(crate) fn apply_compile_properties(
     usage: &mut UsageResolver<'_>,
@@ -30,11 +86,8 @@ pub(crate) fn apply_compile_properties(
         let flags = usage.eval_source_compile_flags(target, &entry, &ctx)?;
         append_compile_flags(&mut group.flags, &flags, entry.backtrace);
     }
-    for name in [
-        b"COMPILE_OPTIONS".as_slice(),
-        b"COMPILE_DEFINITIONS",
-        b"INCLUDE_DIRECTORIES",
-    ] {
+    for field in SourceUsage::ALL {
+        let name = field.property();
         let source_values = match source_props.get(name) {
             Some(value) => usage.file_set_paths(
                 target,
@@ -63,28 +116,7 @@ pub(crate) fn apply_compile_properties(
         } else {
             Vec::new()
         };
-        match name {
-            b"COMPILE_OPTIONS" => group
-                .flags
-                .extend(source_values.into_iter().chain(set_values)),
-            b"COMPILE_DEFINITIONS" => group
-                .defines
-                .extend(source_values.into_iter().chain(set_values)),
-            b"INCLUDE_DIRECTORIES" => {
-                let mut seen = IndexSet::new();
-                group.includes = set_values
-                    .into_iter()
-                    .chain(source_values)
-                    .map(|path| InterfaceInclude {
-                        path,
-                        system: false,
-                    })
-                    .chain(std::mem::take(&mut group.includes))
-                    .filter(|entry| seen.insert(entry.path.value.clone()))
-                    .collect();
-            }
-            _ => {}
-        }
+        field.apply(group, source_values, set_values);
     }
     Ok(())
 }
@@ -300,4 +332,8 @@ fn source_flag(dir: &Directory, source: &BString, property: &[u8]) -> bool {
         .get(source)
         .and_then(|props| props.get(property))
         .is_some_and(|value| truth::is_on(value))
+}
+
+pub(crate) fn absolute_path(base: &[u8], path: &[u8]) -> BString {
+    Lexical::new(&Lexical::new(base).append(path)).normalize()
 }

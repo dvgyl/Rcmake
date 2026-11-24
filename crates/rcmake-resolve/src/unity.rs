@@ -8,8 +8,12 @@ use rcmake_host::{Host, ReadRange, WriteMode, path::to_native};
 use rcmake_model::{BT, DirId, ProjectModel, Target, TargetId, TargetKind};
 
 use crate::{
-    CompileGroup, FileSetMember, InterfaceInclude, ResolveError, SourcePaths, absolute_path,
-    generation_location, lower, resolve_target, sources::SourceProperties, usage::UsageResolver,
+    CompileGroup, InterfaceInclude, ResolveError,
+    cxx_modules::generation_location,
+    lower,
+    sources::{SourcePaths, SourceProperties, absolute_path},
+    target::{FileSetMember, resolve_target},
+    usage::UsageResolver,
 };
 
 pub(crate) type UnityPlan = IndexMap<TargetId, TargetUnity>;

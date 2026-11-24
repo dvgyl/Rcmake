@@ -3,7 +3,7 @@ use rcmake_eval::{CmdError, CmdResult, Cx, Flow};
 use rcmake_expr::ExpandedArg;
 use rcmake_model::{BT, ModelError, Target, TargetKind, UsageField, UsageScope};
 
-use super::{absolute, bytes, model_error, scope, source_dir, status, usage_target};
+use super::{absolute, bytes, model_error, scope, source_dir, usage_target};
 
 use UsageField as Field;
 
@@ -58,10 +58,14 @@ pub(super) fn link_directories(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResu
 
 fn add(cx: &mut Cx<'_>, args: &[ExpandedArg], own: Field, interface: Field) -> CmdResult {
     let Some((name, mut rest)) = args.split_first() else {
-        return Err(status("called with incorrect number of arguments"));
+        return Err(CmdError::status(
+            "called with incorrect number of arguments",
+        ));
     };
     if rest.is_empty() {
-        return Err(status("called with incorrect number of arguments"));
+        return Err(CmdError::status(
+            "called with incorrect number of arguments",
+        ));
     }
     let paths = matches!(own, Field::IncludeDirectories | Field::LinkDirectories);
     let what = own.name().to_ascii_lowercase().replace('_', " ");
@@ -87,7 +91,8 @@ fn add(cx: &mut Cx<'_>, args: &[ExpandedArg], own: Field, interface: Field) -> C
         .target_mut(id)
         .ok_or_else(|| model_error(ModelError::UnknownObject))?;
     while let Some((keyword, tail)) = rest.split_first() {
-        let scope = scope(bytes(keyword)).ok_or_else(|| status("called with invalid arguments"))?;
+        let scope = scope(bytes(keyword))
+            .ok_or_else(|| CmdError::status("called with invalid arguments"))?;
         let end = tail
             .iter()
             .position(|arg| super::scope(bytes(arg)).is_some())
@@ -144,22 +149,24 @@ pub(super) fn validate_scope(
 ) -> Result<(), CmdError> {
     if scope != UsageScope::Interface {
         if target.kind == TargetKind::InterfaceLibrary && !sources {
-            return Err(status(
+            return Err(CmdError::status(
                 "may only set INTERFACE properties on INTERFACE targets",
             ));
         }
         if target.is_imported() {
-            return Err(status(
+            return Err(CmdError::status(
                 "may only set INTERFACE properties on IMPORTED targets",
             ));
         }
     }
     if target.kind == TargetKind::Utility {
         if !sources {
-            return Err(status("called with non-compilable target type"));
+            return Err(CmdError::status("called with non-compilable target type"));
         }
         if scope != UsageScope::Private {
-            return Err(status("may only set PRIVATE properties on custom targets"));
+            return Err(CmdError::status(
+                "may only set PRIVATE properties on custom targets",
+            ));
         }
     }
     Ok(())

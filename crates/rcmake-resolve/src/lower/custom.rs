@@ -14,9 +14,9 @@ use super::graph::push;
 use super::shell::direct;
 use super::{build_relative, compute_artifacts, join};
 use crate::ide::{IdeCustomPhase, IdeCustomStep};
-use crate::sources::SourcePaths;
+use crate::sources::{SourcePaths, absolute_path};
 use crate::usage::{ModelGenexHost, UsageResolver, handle};
-use crate::{ArtifactSet, BuildStep, CustomStep, ResolveError, ResolvedTarget, absolute_path};
+use crate::{ArtifactSet, BuildStep, CustomStep, ResolveError, ResolvedTarget};
 
 pub(super) struct Commands<'a> {
     model: &'a ProjectModel,

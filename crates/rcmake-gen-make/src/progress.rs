@@ -4,7 +4,9 @@ use rcmake_base::ByteVec;
 use rcmake_gen_common::GenError;
 use rcmake_resolve::BuildStep;
 
-use super::{MAKEFILE2, Target, make_recipe_text, recursive_make, shell_quote};
+use rcmake_base::shell::quote_always;
+
+use super::{MAKEFILE2, Target, make_recipe_text, recursive_make};
 
 pub(super) fn assign(targets: &mut [Target<'_>]) {
     let mut next = 1;
@@ -88,7 +90,7 @@ fn echo(out: &mut Vec<u8>, numbers: &[u8]) {
 fn arguments(out: &mut Vec<u8>, message: &[u8]) -> Result<(), GenError> {
     for line in message.split(|byte| *byte == b'\n') {
         out.push(b' ');
-        make_recipe_text(out, &shell_quote(line))?;
+        make_recipe_text(out, &quote_always(line))?;
     }
     out.push(b'\n');
     Ok(())

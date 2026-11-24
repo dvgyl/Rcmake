@@ -7,10 +7,10 @@ use rcmake_genex::{
     ArtifactKind, ArtifactPart, ConfigId, EvalContext, GenexError, GenexHost, InterfaceView,
     TargetHandle,
 };
-use rcmake_model::{DirId, ProjectModel, PropScope, TargetId};
+use rcmake_model::{DirId, PropScope, TargetId};
 
 use super::{UsageResolver, handle};
-use crate::ResolveError;
+use crate::{ResolveError, lower::definition};
 
 /// Generator expression adapter for a project model and a default lookup directory.
 pub struct ModelGenexHost<'model, 'resolver> {
@@ -149,17 +149,13 @@ impl GenexHost for ModelGenexHost<'_, '_> {
     }
 
     fn definition(&self, name: &[u8]) -> Option<BString> {
-        definition(self.resolver.model, self.lookup_dir, name)
+        definition(self.resolver.model, self.lookup_dir, name).cloned()
     }
 
     fn target_policy(&self, target: TargetHandle, policy: &[u8]) -> Option<bool> {
         let target = self.resolver.model.target(self.id(target)?)?;
         Some(target.policies.policies.get(PolicyId::parse(policy)?) == PolicyStatus::New)
     }
-}
-
-pub(super) fn definition(model: &ProjectModel, dir: DirId, name: &[u8]) -> Option<BString> {
-    crate::lower::definition(model, dir, name).cloned()
 }
 
 fn missing_target() -> GenexError {

@@ -1,10 +1,13 @@
 //! Target names in exported link interfaces.
 
 use rcmake_base::{BString, list};
-use rcmake_genex::{GenexNode, PreprocessMode, parse, rewrite_install_prefix};
+use rcmake_genex::{GenexNode, PreprocessMode, parse, render, rewrite_install_prefix};
 use rcmake_model::{DirId, ProjectModel, TargetId};
 
-use crate::{ExportedTarget, ResolveError, export_name, export_property_items, write_genex};
+use crate::{
+    ExportedTarget, ResolveError,
+    exports::{export_name, export_property_items},
+};
 
 const LINK_LIBRARIES: &[u8] = b"INTERFACE_LINK_LIBRARIES";
 
@@ -43,9 +46,7 @@ pub(crate) fn qualify(
                     name(&item).unwrap_or(item)
                 } else {
                     qualify_expressions(&mut ast.nodes, &name);
-                    let mut item = BString::default();
-                    write_genex(&ast.nodes, &mut item);
-                    item
+                    render(&ast.nodes)
                 };
                 if mode == PreprocessMode::Install {
                     item = rewrite_install_prefix(&item, b"${_IMPORT_PREFIX}");

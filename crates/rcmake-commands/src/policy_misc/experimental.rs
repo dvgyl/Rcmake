@@ -1,8 +1,8 @@
 use rcmake_base::BString;
 use rcmake_diag::{DiagCategory, Effect, MessageKind};
-use rcmake_eval::{CmdResult, Cx, Flow};
+use rcmake_eval::{CmdError, CmdResult, Cx, Flow};
 
-use super::{quoted, status};
+use super::quoted;
 
 struct Feature {
     name: &'static [u8],
@@ -46,7 +46,7 @@ const FEATURES: &[Feature] = &[
 
 pub(super) fn enabled(cx: &mut Cx<'_>, args: &[&[u8]]) -> CmdResult {
     let [name, out] = args else {
-        return Err(status(
+        return Err(CmdError::status(
             "sub-command GET_EXPERIMENTAL_FEATURE_ENABLED expects exactly two arguments",
         ));
     };
@@ -54,7 +54,7 @@ pub(super) fn enabled(cx: &mut Cx<'_>, args: &[&[u8]]) -> CmdResult {
         .iter()
         .find(|feature| feature.name == *name)
         .ok_or_else(|| {
-            status(quoted(
+            CmdError::status(quoted(
                 "Experimental feature name \"",
                 name,
                 "\" does not exist.",

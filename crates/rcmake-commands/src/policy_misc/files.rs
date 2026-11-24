@@ -11,7 +11,7 @@ use rcmake_expr::{
 use rcmake_host::{FileKind, Follow, ReadRange, WriteMode, path};
 use rcmake_model::{CacheEntry, CacheType};
 
-use super::{quoted, status, values};
+use super::{quoted, values};
 
 #[derive(Default)]
 struct FileOptions {
@@ -84,20 +84,22 @@ impl FileOptions {
                         args = rest;
                     }
                     if !invalid.is_empty() {
-                        return Err(status(quoted(
+                        return Err(CmdError::status(quoted(
                             "given invalid permission \"",
                             &invalid.join(b"\",\"".as_slice()),
                             "\".",
                         )));
                     }
                     if !found {
-                        return Err(status("given FILE_PERMISSIONS without any options. "));
+                        return Err(CmdError::status(
+                            "given FILE_PERMISSIONS without any options. ",
+                        ));
                     }
                     options.set_permissions(Permissions::Explicit(mode))?;
                 }
                 b"NEWLINE_STYLE" => {
                     let Some((style, rest)) = args.split_first() else {
-                        return Err(status(
+                        return Err(CmdError::status(
                             "NEWLINE_STYLE must set a style: LF, CRLF, UNIX, DOS, or WIN32",
                         ));
                     };
@@ -105,7 +107,7 @@ impl FileOptions {
                         b"UNIX" | b"LF" => false,
                         b"DOS" | b"WIN32" | b"CRLF" => true,
                         _ => {
-                            return Err(status(
+                            return Err(CmdError::status(
                                 "NEWLINE_STYLE sets an unknown style, only LF, CRLF, UNIX, DOS, and WIN32 are supported",
                             ));
                         }
@@ -119,7 +121,7 @@ impl FileOptions {
             }
         }
         if options.copy && options.newline.is_some() {
-            return Err(status(
+            return Err(CmdError::status(
                 "COPYONLY could not be used in combination with NEWLINE_STYLE ",
             ));
         }
@@ -136,7 +138,7 @@ impl FileOptions {
                 }
                 _ => (previous, permissions),
             };
-            return Err(status(format!(
+            return Err(CmdError::status(format!(
                 "given both {} and {}.  Only one option allowed. ",
                 first.name(),
                 second.name()
@@ -167,7 +169,7 @@ fn permission(name: &[u8]) -> Option<u32> {
 pub(crate) fn configure_file(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
     let args = values(args);
     let [input, output, flags @ ..] = args.as_slice() else {
-        return Err(status(
+        return Err(CmdError::status(
             "called with incorrect number of arguments, expected 2",
         ));
     };
@@ -195,14 +197,14 @@ pub(crate) fn configure_file(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult
         .metadata(&source, Follow::Yes)
         .map_err(file_error)?;
     if metadata.kind == FileKind::Dir {
-        return Err(status(quoted(
+        return Err(CmdError::status(quoted(
             "input location\n\n  ",
             &path::from_native(&source),
             "\n\nis a directory but a file was expected.",
         )));
     }
     if metadata.kind != FileKind::File {
-        return Err(status("input must be a regular file."));
+        return Err(CmdError::status("input must be a regular file."));
     }
     let mut dest = normalize(&cx.current_binary_dir().join(path::to_native(output)));
     if cx
@@ -235,7 +237,7 @@ pub(crate) fn configure_file(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult
         input
     } else {
         configure(&input, &mut TemplateEnv(cx), options.expand)
-            .map_err(|error| status(error.message))?
+            .map_err(|error| CmdError::status(error.message))?
             .into()
     };
     let content = if !options.copy && options.newline.unwrap_or(cfg!(windows)) {
@@ -244,7 +246,9 @@ pub(crate) fn configure_file(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult
         content
     };
     if !options.copy && content.len() > cx.limits().max_value_bytes {
-        return Err(status("configured content exceeds the value size limit."));
+        return Err(CmdError::status(
+            "configured content exceeds the value size limit.",
+        ));
     }
     let mode = options
         .permissions
@@ -273,7 +277,7 @@ fn write_configured(cx: &Cx<'_>, dest: &Path, content: &[u8], mode: u32) -> Resu
     let host = cx.host();
     let parent = dest
         .parent()
-        .ok_or_else(|| status("output has no parent directory."))?;
+        .ok_or_else(|| CmdError::status("output has no parent directory."))?;
     host.create_dir_all(parent).map_err(file_error)?;
     let pid = host.system().pid;
     for index in 0..100 {
@@ -296,11 +300,13 @@ fn write_configured(cx: &Cx<'_>, dest: &Path, content: &[u8], mode: u32) -> Resu
             Err(error) => return Err(file_error(error)),
         }
     }
-    Err(status("could not create a temporary output file."))
+    Err(CmdError::status(
+        "could not create a temporary output file.",
+    ))
 }
 
 fn file_error(error: rcmake_host::HostError) -> CmdError {
-    status(format!("Problem configuring file: {error}"))
+    CmdError::status(format!("Problem configuring file: {error}"))
 }
 
 struct TemplateEnv<'a, 'b>(&'a mut Cx<'b>);

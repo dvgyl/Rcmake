@@ -23,9 +23,9 @@ pub mod sbom;
 pub use install_script::write_supplementary_outputs;
 
 #[cfg(test)]
-mod tests;
+mod package_install_tests;
 #[cfg(test)]
-mod wave3_tests;
+mod tests;
 
 /// Error of a generator or writer.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]

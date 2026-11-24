@@ -1,17 +1,23 @@
 use rcmake_base::list;
-use rcmake_eval::{CmdResult, Cx, Flow};
+use rcmake_eval::{CmdError, CmdResult, Cx, Flow};
 use rcmake_expr::ExpandedArg;
 use rcmake_model::{BT, ModelError, TargetKind, UsageField, UsageScope};
 
-use super::{absolute, bytes, model_error, scope, source_dir, status, usage, usage_target};
+use super::{absolute, bytes, model_error, scope, source_dir, usage, usage_target};
 
 pub(super) fn add(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
     let [name, first, rest @ ..] = args else {
-        return Err(status("called with incorrect number of arguments"));
+        return Err(CmdError::status(
+            "called with incorrect number of arguments",
+        ));
     };
     let reuse = match (bytes(first), rest) {
         (b"REUSE_FROM", [provider]) => Some(provider),
-        (b"REUSE_FROM", _) => return Err(status("called with incorrect number of arguments")),
+        (b"REUSE_FROM", _) => {
+            return Err(CmdError::status(
+                "called with incorrect number of arguments",
+            ));
+        }
         _ => None,
     };
     let id = usage_target(cx, &name.value, "precompile headers")?;
@@ -22,7 +28,7 @@ pub(super) fn add(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
         .target_mut(id)
         .ok_or_else(|| model_error(ModelError::UnknownObject))?;
     if matches!(target.kind, TargetKind::Utility | TargetKind::GlobalTarget) {
-        return Err(status("called with non-compilable target type"));
+        return Err(CmdError::status("called with non-compilable target type"));
     }
     if let Some(provider) = reuse {
         target.props.set(
@@ -34,7 +40,8 @@ pub(super) fn add(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
     let mut keyword = first;
     let mut rest = rest;
     loop {
-        let scope = scope(bytes(keyword)).ok_or_else(|| status("called with invalid arguments"))?;
+        let scope = scope(bytes(keyword))
+            .ok_or_else(|| CmdError::status("called with invalid arguments"))?;
         usage::validate_scope(target, scope, false)?;
         let end = rest
             .iter()

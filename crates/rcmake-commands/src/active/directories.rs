@@ -1,9 +1,9 @@
 use rcmake_base::{BString, ByteSlice};
-use rcmake_eval::{CmdResult, Cx, Flow};
+use rcmake_eval::{CmdError, CmdResult, Cx, Flow};
 use rcmake_expr::ExpandedArg;
 use rcmake_model::{BT, CacheEntry, CacheType, GeneratorKind, Target, TargetKind, TargetOrigin};
 
-use super::{status, values};
+use super::values;
 
 pub(super) fn aux_source_directory(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
     const EXTENSIONS: &[&[u8]] = &[
@@ -12,7 +12,9 @@ pub(super) fn aux_source_directory(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> Cmd
     ];
     let values = values(args);
     let [path, output] = values.as_slice() else {
-        return Err(status("called with incorrect number of arguments"));
+        return Err(CmdError::status(
+            "called with incorrect number of arguments",
+        ));
     };
     let mut entries = cx
         .host()
@@ -40,7 +42,7 @@ pub(super) fn aux_source_directory(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> Cmd
         result.push(b'/');
         result.extend_from_slice(&entry.name);
         if result.len() > cx.limits().max_value_bytes {
-            return Err(status("source list exceeds the value size limit"));
+            return Err(CmdError::status("source list exceeds the value size limit"));
         }
     }
     cx.set_var(output, result);
@@ -52,7 +54,11 @@ pub(super) fn include_regular_expression(cx: &mut Cx<'_>, args: &[ExpandedArg]) 
     let (pattern, complain) = match values.as_slice() {
         [pattern] => (*pattern, b"^$".as_slice()),
         [pattern, complain] => (*pattern, *complain),
-        _ => return Err(status("called with incorrect number of arguments")),
+        _ => {
+            return Err(CmdError::status(
+                "called with incorrect number of arguments",
+            ));
+        }
     };
     let props = cx.directory_props();
     props.set("INCLUDE_REGULAR_EXPRESSION".into(), pattern.into());
@@ -78,7 +84,7 @@ impl ExternalOption {
 pub(super) fn include_external_msproject(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
     let values = values(args);
     let [name, location, options @ ..] = values.as_slice() else {
-        return Err(status(
+        return Err(CmdError::status(
             "INCLUDE_EXTERNAL_MSPROJECT called with incorrect number of arguments",
         ));
     };
@@ -136,7 +142,7 @@ pub(super) fn include_external_msproject(cx: &mut Cx<'_>, args: &[ExpandedArg]) 
     }
     cx.project()
         .add_target(target)
-        .map_err(|error| status(error.to_string()))?;
+        .map_err(|error| CmdError::status(error.to_string()))?;
     if !guid.is_empty() {
         let key: BString = [*name, b"_GUID_CMAKE"].concat().into();
         cx.cache().insert(

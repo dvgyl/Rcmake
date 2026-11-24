@@ -6,14 +6,16 @@ use rcmake_model::{
     BT, DirId, LinkItem, ModelError, Target, TargetBinding, TargetKind, UsageScope,
 };
 
-use super::{bytes, model_error, reported, scope, status, usage_target};
+use super::{bytes, model_error, reported, scope, usage_target};
 
 const PLAIN_CALLS: &[u8] = b"\0target_link_libraries/plain";
 const KEYWORD_CALLS: &[u8] = b"\0target_link_libraries/keyword";
 
 pub(super) fn add(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
     let [name, rest @ ..] = args else {
-        return Err(status("called with incorrect number of arguments"));
+        return Err(CmdError::status(
+            "called with incorrect number of arguments",
+        ));
     };
     let id = usage_target(cx, &name.value, "link libraries")?;
     let dir = cx.current_dir_id();
@@ -21,7 +23,7 @@ pub(super) fn add(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
         cx.project().lookup_target(dir, bytes(name)),
         Some(TargetBinding::Alias(_))
     ) {
-        return Err(status("can not be used on an ALIAS target."));
+        return Err(CmdError::status("can not be used on an ALIAS target."));
     }
     let Some(first) = rest.first() else {
         return Ok(Flow::Normal);
@@ -184,7 +186,7 @@ fn validate_scope(target: &Target, scope: UsageScope) -> Result<(), CmdError> {
             None
         };
         if let Some(kind) = kind {
-            return Err(status(format!(
+            return Err(CmdError::status(format!(
                 "{kind} library can only be used with the INTERFACE keyword of target_link_libraries"
             )));
         }

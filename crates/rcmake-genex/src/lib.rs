@@ -15,7 +15,7 @@ mod parse;
 mod preprocess;
 
 pub use eval::evaluate;
-pub use parse::parse;
+pub use parse::{parse, render};
 pub use preprocess::{PreprocessMode, find_genex, genex_strip, rewrite_install_prefix, strip};
 
 /// Maximum nesting depth of `$<...>` that [`parse`] accepts.
@@ -322,10 +322,4 @@ pub enum GenexError {
     /// Nesting is deeper than [`MAX_NESTING`].
     #[error("generator expression nesting is too deep")]
     TooDeep,
-    /// The operator is not implemented yet.
-    #[error("generator expression is not supported yet")]
-    Unsupported {
-        /// The full expression text.
-        expression: BString,
-    },
 }

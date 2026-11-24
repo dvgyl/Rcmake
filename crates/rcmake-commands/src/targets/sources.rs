@@ -9,16 +9,18 @@ use rcmake_model::{
     UsageField, UsageScope,
 };
 
-use super::{
-    absolute, bytes, model_error, properties, scope, source_dir, status, usage, usage_target,
-};
+use super::{absolute, bytes, model_error, properties, scope, source_dir, usage, usage_target};
 
 pub(super) fn add(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
     let Some((name, mut rest)) = args.split_first() else {
-        return Err(status("called with incorrect number of arguments"));
+        return Err(CmdError::status(
+            "called with incorrect number of arguments",
+        ));
     };
     if rest.is_empty() {
-        return Err(status("called with incorrect number of arguments"));
+        return Err(CmdError::status(
+            "called with incorrect number of arguments",
+        ));
     }
     let id = usage_target(cx, &name.value, "sources")?;
     let dir = source_dir(cx);
@@ -64,7 +66,7 @@ pub(super) fn add(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
                 }
                 rest = next;
             }
-            _ => return Err(status("called with invalid arguments")),
+            _ => return Err(CmdError::status("called with invalid arguments")),
         }
     }
     crate::dirs::source_groups::apply_to_target(cx, id)?;
@@ -92,7 +94,7 @@ fn add_file_set<'a>(
         .split_first()
         .filter(|(name, _)| !name.value.is_empty())
     else {
-        return Err(status("FILE_SET must not be empty."));
+        return Err(CmdError::status("FILE_SET must not be empty."));
     };
     let bt = cx.backtrace();
     let (args, rest) = parse_file_set(args, dir, &bt)?;
@@ -102,7 +104,7 @@ fn add_file_set<'a>(
         .ok_or_else(|| model_error(ModelError::UnknownObject))?;
     usage::validate_scope(target, scope, true)?;
     if target.kind == TargetKind::Utility {
-        return Err(status(
+        return Err(CmdError::status(
             "FILE_SETs of type \"HEADERS\", \"SOURCES\", \"SYCL\", \"SYCL_HEADERS\", \"CXX_MODULES\" may not be added to custom targets.",
         ));
     }
@@ -115,12 +117,12 @@ fn add_file_set<'a>(
             .get(b"FRAMEWORK")
             .is_some_and(|value| rcmake_base::truth::is_on(value))
     {
-        return Err(status(
+        return Err(CmdError::status(
             "FILE_SETs, of type \"HEADERS\", may not be added to FRAMEWORK targets.",
         ));
     }
     if kind == FileSetKind::CxxModules && scope == UsageScope::Interface && !target.is_imported() {
-        return Err(status(
+        return Err(CmdError::status(
             "File set TYPE \"CXX_MODULES\" may not have \"INTERFACE\" scope.",
         ));
     }
@@ -128,14 +130,14 @@ fn add_file_set<'a>(
         && scope != UsageScope::Interface
         && target.kind == TargetKind::InterfaceLibrary
     {
-        return Err(status(format!(
+        return Err(CmdError::status(format!(
             "File set TYPE \"{}\" may not have \"PUBLIC\" or \"PRIVATE\" scope on INTERFACE libraries.",
             kind.as_str()
         )));
     }
     let mut set = if let Some(previous) = previous {
         if previous.scope != scope {
-            return Err(status(format!(
+            return Err(CmdError::status(format!(
                 "Scope {} for file set \"{}\" does not match original scope {}.",
                 scope_name(scope),
                 previous.name,
@@ -244,7 +246,12 @@ fn parse_file_set<'a>(
             }
             b"FILE_SET" => break,
             keyword if scope(keyword).is_some() => break,
-            _ => return Err(status(format!("Unrecognized keyword: \"{}\".", key.value))),
+            _ => {
+                return Err(CmdError::status(format!(
+                    "Unrecognized keyword: \"{}\".",
+                    key.value
+                )));
+            }
         };
     }
     Ok((result, rest))
@@ -266,13 +273,13 @@ fn file_set_kind<'a>(
     let resolve = |name: &[u8]| FileSetKind::from_name(name).or_else(|| sycl_kind(name));
     let kind_value = match kind {
         Some(value) => resolve(value).ok_or_else(|| {
-            status("File set TYPE may only be one of the built-in types \"HEADERS\", \"SOURCES\", \"SYCL\", \"SYCL_HEADERS\", \"CXX_MODULES\" or a RULE visible from the current directory.")
+            CmdError::status("File set TYPE may only be one of the built-in types \"HEADERS\", \"SOURCES\", \"SYCL\", \"SYCL_HEADERS\", \"CXX_MODULES\" or a RULE visible from the current directory.")
         })?,
         None => existing.map(|set| set.kind).or_else(|| resolve(name))
-            .ok_or_else(|| status("Must specify a TYPE when creating file set."))?,
+            .ok_or_else(|| CmdError::status("Must specify a TYPE when creating file set."))?,
     };
     if let Some(set) = existing.filter(|set| set.kind != kind_value) {
-        return Err(status(format!(
+        return Err(CmdError::status(format!(
             "Type \"{}\" for file set \"{name}\" does not match original type \"{}\".",
             kind_value.as_str(),
             set.kind.as_str()
@@ -289,13 +296,13 @@ fn file_set_kind<'a>(
         && name.as_slice() != spelling
         && sycl_kind(name) != Some(kind_value)
     {
-        return Err(status(format!(
+        return Err(CmdError::status(format!(
             "FILE_SET name starting with a capital letter must match the TYPE name \"{}\".",
             BString::from(spelling)
         )));
     }
     if name.starts_with(b"_") || !name.iter().all(|c| c.is_ascii_alphanumeric() || *c == b'_') {
-        return Err(status(
+        return Err(CmdError::status(
             "Non-default file set name must contain only letters, numbers, and underscores, and must not start with a capital letter or underscore.",
         ));
     }
@@ -399,7 +406,7 @@ fn validate_file_set_paths(model: &ProjectModel, set: &FileSet) -> Result<(), Cm
         if let [(parent, first), (child, second)] = pair
             && child.starts_with(parent)
         {
-            return Err(status(format!(
+            return Err(CmdError::status(format!(
                 "Base directories in file set cannot be subdirectories of each other:\n  {first}\n  {second}"
             )));
         }
@@ -415,7 +422,7 @@ fn validate_file_set_paths(model: &ProjectModel, set: &FileSet) -> Result<(), Cm
                     .iter()
                     .map(|base| format!("\n  {base}"))
                     .collect::<String>();
-                return Err(status(format!(
+                return Err(CmdError::status(format!(
                     "File:\n  {file}\nmust be in one of the file set's base directories:{bases}"
                 )));
             }
@@ -462,7 +469,7 @@ fn validate_file_set_membership(
                 target.name
             );
             if policy == PolicyStatus::New {
-                return Err(status(message));
+                return Err(CmdError::status(message));
             }
             warnings.insert(message);
         }

@@ -3,7 +3,7 @@ use rcmake_eval::{CmdError, CmdFlags, CmdResult, Cx, Flow, Registry};
 use rcmake_expr::ExpandedArg;
 use rcmake_model::{BT, PropScope, TestEntry};
 
-use super::{scoped_test_directory, status, values};
+use super::{scoped_test_directory, values};
 
 pub(super) fn register(registry: &mut Registry, flags: CmdFlags) {
     registry.add("enable_testing", enable_testing, flags);
@@ -22,16 +22,22 @@ fn enable_testing(cx: &mut Cx<'_>, _: &[ExpandedArg]) -> CmdResult {
 fn add_test(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
     let args: Vec<_> = values(args).collect();
     let Some((first, rest)) = args.split_first() else {
-        return Err(status("called with incorrect number of arguments"));
+        return Err(CmdError::status(
+            "called with incorrect number of arguments",
+        ));
     };
     let (name, args, old_style) = match (*first, rest) {
         (b"NAME", [name, args @ ..]) => (*name, args, false),
-        (b"NAME", []) => return Err(status("must be given non-empty NAME.")),
+        (b"NAME", []) => return Err(CmdError::status("must be given non-empty NAME.")),
         (name, args) if !args.is_empty() => (name, args, true),
-        _ => return Err(status("called with incorrect number of arguments")),
+        _ => {
+            return Err(CmdError::status(
+                "called with incorrect number of arguments",
+            ));
+        }
     };
     if name.is_empty() && !old_style {
-        return Err(status("must be given non-empty NAME."));
+        return Err(CmdError::status("must be given non-empty NAME."));
     }
     let mut test = TestEntry {
         name: name.into(),
@@ -57,7 +63,7 @@ fn add_test(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
             existing.command = test.command;
             return Ok(Flow::Normal);
         }
-        return Err(status(
+        return Err(CmdError::status(
             [
                 b"given test NAME \"".as_slice(),
                 name,
@@ -68,7 +74,7 @@ fn add_test(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
     }
     model
         .add_test(test)
-        .map_err(|error| status(error.to_string()))?;
+        .map_err(|error| CmdError::status(error.to_string()))?;
     Ok(Flow::Normal)
 }
 
@@ -95,7 +101,7 @@ fn parse_test_options(test: &mut TestEntry, mut args: &[&[u8]]) -> Result<(), Cm
                 let (items, rest) = args.split_at(end);
                 if *option == b"COMMAND" {
                     if has_command {
-                        return Err(status("may be given at most one COMMAND."));
+                        return Err(CmdError::status("may be given at most one COMMAND."));
                     }
                     has_command = true;
                     test.command
@@ -108,7 +114,9 @@ fn parse_test_options(test: &mut TestEntry, mut args: &[&[u8]]) -> Result<(), Cm
                     );
                 } else {
                     if has_configurations {
-                        return Err(status("may be given at most one set of CONFIGURATIONS."));
+                        return Err(CmdError::status(
+                            "may be given at most one set of CONFIGURATIONS.",
+                        ));
                     }
                     has_configurations = true;
                     test.configurations
@@ -121,7 +129,9 @@ fn parse_test_options(test: &mut TestEntry, mut args: &[&[u8]]) -> Result<(), Cm
                     break;
                 };
                 if test.working_directory.is_some() {
-                    return Err(status("may be given at most one WORKING_DIRECTORY."));
+                    return Err(CmdError::status(
+                        "may be given at most one WORKING_DIRECTORY.",
+                    ));
                 }
                 let directory = BString::from(*directory);
                 test.props
@@ -131,14 +141,14 @@ fn parse_test_options(test: &mut TestEntry, mut args: &[&[u8]]) -> Result<(), Cm
             }
             b"COMMAND_EXPAND_LISTS" => test.command_expand_lists = true,
             _ => {
-                return Err(status(
+                return Err(CmdError::status(
                     [b"given unknown argument:\n  ".as_slice(), option].concat(),
                 ));
             }
         }
     }
     if test.command.is_empty() {
-        return Err(status("must be given non-empty COMMAND."));
+        return Err(CmdError::status("must be given non-empty COMMAND."));
     }
     Ok(())
 }
@@ -148,12 +158,12 @@ fn set_tests_properties(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
     const BAD_PROPERTIES: &str =
         "called with illegal arguments, maybe missing a PROPERTIES specifier?";
     let Some(split) = args.iter().position(|arg| *arg == b"PROPERTIES") else {
-        return Err(status(BAD_PROPERTIES));
+        return Err(CmdError::status(BAD_PROPERTIES));
     };
     let (tests, rest) = args.split_at(split);
     let (pairs, extra) = rest.get(1..).unwrap_or_default().as_chunks::<2>();
     if pairs.is_empty() || !extra.is_empty() {
-        return Err(status(BAD_PROPERTIES));
+        return Err(CmdError::status(BAD_PROPERTIES));
     }
     let (tests, dir) = match tests {
         [tests @ .., b"DIRECTORY", directory] => (tests, scoped_test_directory(cx, directory)?),
@@ -170,7 +180,9 @@ fn set_tests_properties(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
         .iter()
         .map(|name| {
             project.find_test(dir, name).ok_or_else(|| {
-                status([b"Can not find test to add properties to: ".as_slice(), name].concat())
+                CmdError::status(
+                    [b"Can not find test to add properties to: ".as_slice(), name].concat(),
+                )
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -197,7 +209,11 @@ fn get_test_property(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
             scoped_test_directory(cx, directory)?,
             *out,
         ),
-        _ => return Err(status("called with incorrect number of arguments.")),
+        _ => {
+            return Err(CmdError::status(
+                "called with incorrect number of arguments.",
+            ));
+        }
     };
     let scope = PropScope::Test {
         dir,

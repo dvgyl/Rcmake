@@ -200,7 +200,8 @@ pub fn parse(input: &[u8]) -> Result<GenexAst, GenexError> {
 }
 
 /// Render nodes back to source text.
-pub(crate) fn render(nodes: &[GenexNode]) -> BString {
+#[must_use]
+pub fn render(nodes: &[GenexNode]) -> BString {
     let mut out = BString::default();
     render_into(nodes, &mut out);
     out

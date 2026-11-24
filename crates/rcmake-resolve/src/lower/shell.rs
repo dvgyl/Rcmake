@@ -1,30 +1,10 @@
 //! Process arguments and POSIX shell command lines.
 
-use rcmake_base::{BString, list};
+use rcmake_base::{BString, list, shell::quote};
 use rcmake_model::{DirId, ProjectModel};
 
 use super::{definition, expand_rule};
 use crate::Invocation;
-
-pub(super) fn quote(arg: &[u8]) -> BString {
-    if !arg.is_empty()
-        && arg
-            .iter()
-            .all(|b| b.is_ascii_alphanumeric() || b"_@%+=:,./-".contains(b))
-    {
-        return arg.into();
-    }
-    let mut result = BString::from("'");
-    for &byte in arg {
-        if byte == b'\'' {
-            result.extend_from_slice(b"'\\''");
-        } else {
-            result.push(byte);
-        }
-    }
-    result.push(b'\'');
-    result
-}
 
 pub(super) fn join_words(words: impl IntoIterator<Item = BString>) -> BString {
     let mut result = BString::default();

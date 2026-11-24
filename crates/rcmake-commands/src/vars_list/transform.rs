@@ -7,7 +7,7 @@ use rcmake_expr::ExpandedArg;
 use rcmake_regex::{Captures, MatchOptions, Regex, expand_replacement};
 
 use super::lists::{compile, matches};
-use super::{bytes, callbacks::Callback, cat, status};
+use super::{bytes, callbacks::Callback, cat};
 
 const CONTEXT: &[u8] = b"sub-command TRANSFORM, ";
 const REPLACE: &[u8] = b"sub-command TRANSFORM, action REPLACE: ";
@@ -26,7 +26,7 @@ enum Action<'a> {
 impl<'a> Action<'a> {
     fn parse(args: &'a [ExpandedArg]) -> Result<(Self, &'a [ExpandedArg]), CmdError> {
         let Some((name, tail)) = args.split_first() else {
-            return Err(status(
+            return Err(CmdError::status(
                 "sub-command TRANSFORM requires an action to be specified.",
             ));
         };
@@ -43,7 +43,7 @@ impl<'a> Action<'a> {
                 } else {
                     b"1"
                 };
-                return Err(status(cat(&[
+                return Err(CmdError::status(cat(&[
                     CONTEXT,
                     b"action ",
                     bytes(name),
@@ -56,7 +56,7 @@ impl<'a> Action<'a> {
             (b"TOUPPER", _) => Self::Upper,
             (b"STRIP", _) => Self::Strip,
             (b"GENEX_STRIP", _) => Self::GenexStrip,
-            (bad, _) => return Err(status(cat(&[CONTEXT, bad, b" invalid action."]))),
+            (bad, _) => return Err(CmdError::status(cat(&[CONTEXT, bad, b" invalid action."]))),
         };
         Ok((action, tail))
     }
@@ -128,7 +128,7 @@ impl<'a> Selector<'a> {
                     .map_while(list_ops::parse_index)
                     .collect();
                 if indices.is_empty() {
-                    return Err(status(
+                    return Err(CmdError::status(
                         "sub-command TRANSFORM, selector AT expects at least one numeric value.",
                     ));
                 }
@@ -140,7 +140,7 @@ impl<'a> Selector<'a> {
                     list_ops::parse_index(bytes(start)),
                     list_ops::parse_index(bytes(stop)),
                 ) else {
-                    return Err(status(
+                    return Err(CmdError::status(
                         "sub-command TRANSFORM, selector FOR expects, at least, two numeric values.",
                     ));
                 };
@@ -148,7 +148,7 @@ impl<'a> Selector<'a> {
                     && let Some(step) = list_ops::parse_index(bytes(head))
                 {
                     let step = usize::try_from(step).ok().filter(|&step| step > 0).ok_or_else(|| {
-                        status("sub-command TRANSFORM, selector FOR expects positive numeric value for <step>.")
+                        CmdError::status("sub-command TRANSFORM, selector FOR expects positive numeric value for <step>.")
                     })?;
                     (step, tail)
                 } else {
@@ -156,7 +156,7 @@ impl<'a> Selector<'a> {
                 };
                 Ok((Self::For { start, stop, step }, rest))
             }
-            (b"FOR", _) => Err(status(
+            (b"FOR", _) => Err(CmdError::status(
                 "sub-command TRANSFORM, selector FOR expects, at least, two arguments.",
             )),
             (b"REGEX", [pattern, rest @ ..]) => {
@@ -176,10 +176,10 @@ impl<'a> Selector<'a> {
                 )?;
                 Ok((Self::Predicate(callback), rest))
             }
-            (b"PREDICATE", _) => Err(status(
+            (b"PREDICATE", _) => Err(CmdError::status(
                 "sub-command TRANSFORM, selector PREDICATE expects 'function name' argument.",
             )),
-            _ => Err(status(
+            _ => Err(CmdError::status(
                 "sub-command TRANSFORM, selector REGEX expects 'regular expression' argument.",
             )),
         }
@@ -201,7 +201,7 @@ impl<'a> Selector<'a> {
             let value = operation(cx, item)?;
             size = size.saturating_sub(item.len()).saturating_add(value.len());
             if size > limit {
-                return Err(status("result exceeds the value size limit"));
+                return Err(CmdError::status("result exceeds the value size limit"));
             }
             *item = value;
             Ok(())
@@ -228,7 +228,7 @@ impl<'a> Selector<'a> {
                 let start = selector_index("FOR", start, len)?;
                 let stop = selector_index("FOR", stop, len)?;
                 if start > stop {
-                    return Err(status(format!(
+                    return Err(CmdError::status(format!(
                         "sub-command TRANSFORM, selector FOR expects <start> to be no greater than <stop> ({start} > {stop})"
                     )));
                 }
@@ -265,7 +265,7 @@ fn selector_index(selector: &str, raw: i64, len: usize) -> Result<usize, CmdErro
     let index = list_ops::normalize_index(raw, len);
     usize::try_from(index).ok().filter(|&index| index < len).ok_or_else(|| {
         let last = len.wrapping_sub(1);
-        status(format!("sub-command TRANSFORM, selector {selector}, index: {index} out of range (-{len}, {last})."))
+        CmdError::status(format!("sub-command TRANSFORM, selector {selector}, index: {index} out of range (-{len}, {last})."))
     })
 }
 
@@ -286,13 +286,13 @@ pub(super) fn apply(
                 rest = next;
             }
             (b"OUTPUT_VARIABLE", _) => {
-                return Err(status(
+                return Err(CmdError::status(
                     "sub-command TRANSFORM, OUTPUT_VARIABLE expects variable name argument.",
                 ));
             }
             (selector_name @ (b"AT" | b"FOR" | b"REGEX" | b"PREDICATE"), _) => {
                 if !matches!(selector, Selector::All) {
-                    return Err(status(format!(
+                    return Err(CmdError::status(format!(
                         "sub-command TRANSFORM, selector already specified ({}).",
                         selector.name()
                     )));
@@ -301,7 +301,7 @@ pub(super) fn apply(
             }
             _ => {
                 let unexpected: Vec<_> = rest.iter().map(bytes).collect();
-                return Err(status(cat(&[
+                return Err(CmdError::status(cat(&[
                     CONTEXT,
                     b"'",
                     &unexpected.join(b" ".as_slice()),
@@ -397,7 +397,7 @@ impl<'a> Replacement<'a> {
             .strip_prefix("string sub-command REGEX, mode REPLACE: ")
             .unwrap_or(message);
         if message.contains("contains an out-of-range escape for group") {
-            return status(cat(&[
+            return CmdError::status(cat(&[
                 REPLACE,
                 b"replace expression \"",
                 self.template,
@@ -406,6 +406,6 @@ impl<'a> Replacement<'a> {
                 b"\".",
             ]));
         }
-        status(cat(&[REPLACE, message.as_bytes()]))
+        CmdError::status(cat(&[REPLACE, message.as_bytes()]))
     }
 }

@@ -8,24 +8,30 @@ use rcmake_model::{
     TargetBinding, TargetId, UsageScope,
 };
 
-use super::{bytes, model_error, status};
+use super::{bytes, model_error};
 
 pub(super) fn set(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
     if args.len() < 2 {
-        return Err(status("called with incorrect number of arguments."));
+        return Err(CmdError::status(
+            "called with incorrect number of arguments.",
+        ));
     }
     let Some(marker) = args.iter().position(|arg| bytes(arg) == b"PROPERTIES") else {
-        return Err(status(
+        return Err(CmdError::status(
             "called with illegal arguments, maybe missing a PROPERTIES specifier?",
         ));
     };
     let (names, tail) = args.split_at(marker);
     let [_, props @ ..] = tail else {
-        return Err(status("called with incorrect number of arguments."));
+        return Err(CmdError::status(
+            "called with incorrect number of arguments.",
+        ));
     };
     let (props, remainder) = props.as_chunks::<2>();
     if !remainder.is_empty() {
-        return Err(status("called with incorrect number of arguments."));
+        return Err(CmdError::status(
+            "called with incorrect number of arguments.",
+        ));
     }
     let dir = cx.current_dir_id();
     let bt = cx.backtrace();
@@ -38,7 +44,7 @@ pub(super) fn set(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
         .iter()
         .map(|name| {
             model.find_target(dir, bytes(name)).ok_or_else(|| {
-                status(format!(
+                CmdError::status(format!(
                     "Can not find target to add properties to: {}",
                     name.value
                 ))
@@ -61,7 +67,10 @@ pub(super) fn set(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
                 )
                 .map_err(|err| {
                     if err == ModelError::ReadOnly {
-                        status(format!("{} property is read-only", BString::from(property)))
+                        CmdError::status(format!(
+                            "{} property is read-only",
+                            BString::from(property)
+                        ))
                     } else {
                         model_error(err)
                     }
@@ -81,13 +90,13 @@ fn promote(
         .target(id)
         .ok_or_else(|| model_error(ModelError::UnknownObject))?;
     if !target.is_imported() || !truth::is_on(value) {
-        return Err(status(format!(
+        return Err(CmdError::status(format!(
             "IMPORTED_GLOBAL property can't be set to FALSE on targets (\"{}\")",
             target.name
         )));
     }
     if dir != target.dir {
-        return Err(status(format!(
+        return Err(CmdError::status(format!(
             "Attempt to promote imported target \"{}\" to global scope (by setting IMPORTED_GLOBAL) which is not built in this directory.",
             target.name
         )));
@@ -97,7 +106,9 @@ fn promote(
 
 pub(super) fn get(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
     let [var, name, property] = args else {
-        return Err(status("called with incorrect number of arguments"));
+        return Err(CmdError::status(
+            "called with incorrect number of arguments",
+        ));
     };
     let dir = cx.current_dir_id();
     let model = cx.project();
@@ -271,7 +282,9 @@ fn visible(scope: UsageScope, interface: bool) -> bool {
 
 pub(super) fn add_dependencies(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
     let [name, deps @ ..] = args else {
-        return Err(status("called with incorrect number of arguments"));
+        return Err(CmdError::status(
+            "called with incorrect number of arguments",
+        ));
     };
     let dir = cx.current_dir_id();
     let bt = cx.backtrace();

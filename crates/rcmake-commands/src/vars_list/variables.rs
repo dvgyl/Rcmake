@@ -6,7 +6,7 @@ use rcmake_expr::ExpandedArg;
 use rcmake_host::path::{from_native, to_native};
 use rcmake_model::{CacheEntry, CacheType};
 
-use super::{bytes, cat, status};
+use super::{bytes, cat};
 
 const ARG_COUNT: &str = "called with incorrect number of arguments";
 const CMP0077: PolicyId = PolicyId::new(77);
@@ -21,7 +21,7 @@ fn wrapped<'a>(name: &'a [u8], prefix: &[u8]) -> Option<&'a [u8]> {
 
 pub(super) fn set(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
     let [name, rest @ ..] = args else {
-        return Err(status(ARG_COUNT));
+        return Err(CmdError::status(ARG_COUNT));
     };
     let name = bytes(name);
     if name.starts_with(b"ENV{") {
@@ -62,12 +62,12 @@ pub(super) fn set(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
 fn set_normal_or_cache(cx: &mut Cx<'_>, name: &[u8], args: &[ExpandedArg]) -> Result<(), CmdError> {
     let (values, ty, help, force) = match args {
         [.., arg] if bytes(arg) == b"CACHE" => {
-            return Err(status(
+            return Err(CmdError::status(
                 "given invalid arguments for CACHE mode: missing type and docstring",
             ));
         }
         [.., arg, _] if bytes(arg) == b"CACHE" => {
-            return Err(status(
+            return Err(CmdError::status(
                 "given invalid arguments for CACHE mode: missing type or docstring",
             ));
         }
@@ -78,14 +78,14 @@ fn set_normal_or_cache(cx: &mut Cx<'_>, name: &[u8], args: &[ExpandedArg]) -> Re
         }
         [values @ .., keyword, ty, help] if bytes(keyword) == b"CACHE" => {
             if bytes(help) == b"FORCE" {
-                return Err(status(
+                return Err(CmdError::status(
                     "given invalid arguments: FORCE specified without CACHE",
                 ));
             }
             (values, bytes(ty), bytes(help), false)
         }
         [.., last] if bytes(last) == b"FORCE" && args.len() >= 4 => {
-            return Err(status(
+            return Err(CmdError::status(
                 "given invalid arguments: FORCE specified without CACHE",
             ));
         }
@@ -120,7 +120,7 @@ fn cache_type(value: &[u8]) -> Option<CacheType> {
 
 fn set_cache_keywords(cx: &mut Cx<'_>, name: &[u8], args: &[ExpandedArg]) -> Result<(), CmdError> {
     let Some(value_index) = args.iter().position(|arg| bytes(arg) == b"VALUE") else {
-        return Err(status("Required argument 'VALUE' is missing."));
+        return Err(CmdError::status("Required argument 'VALUE' is missing."));
     };
     let (options, value) = args.split_at(value_index + 1);
     let parsed = KeywordParser::new()
@@ -151,7 +151,7 @@ fn set_cache_keywords(cx: &mut Cx<'_>, name: &[u8], args: &[ExpandedArg]) -> Res
     }
     if !parsed.unparsed().is_empty() {
         let unsupported = parsed.unparsed().join(b";".as_slice());
-        return Err(status(cat(&[
+        return Err(CmdError::status(cat(&[
             b"Called with unsupported argument(s): ",
             &unsupported,
             b".",
@@ -278,10 +278,10 @@ fn write_cache(cx: &mut Cx<'_>, name: &[u8], value: BString, ty: CacheType, help
 
 pub(super) fn unset(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
     let [name, rest @ ..] = args else {
-        return Err(status(ARG_COUNT));
+        return Err(CmdError::status(ARG_COUNT));
     };
     if rest.len() > 1 {
-        return Err(status(ARG_COUNT));
+        return Err(CmdError::status(ARG_COUNT));
     }
     let name = bytes(name);
     if let Some(key) = wrapped(name, b"ENV{") {
@@ -295,7 +295,7 @@ pub(super) fn unset(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
                 cx.cache().remove(name);
             }
             Some(b"PARENT_SCOPE") => cx.set_parent_scope(name, None),
-            Some(_) => return Err(status("called with an invalid second argument")),
+            Some(_) => return Err(CmdError::status("called with an invalid second argument")),
         }
     }
     Ok(Flow::Normal)
@@ -346,7 +346,7 @@ pub(super) fn option(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
 
 fn option_count(args: &[ExpandedArg]) -> CmdError {
     let values: Vec<_> = args.iter().map(bytes).collect();
-    status(cat(&[
+    CmdError::status(cat(&[
         ARG_COUNT.as_bytes(),
         b": ",
         &values.join(b" ".as_slice()),
@@ -355,7 +355,7 @@ fn option_count(args: &[ExpandedArg]) -> CmdError {
 
 pub(super) fn mark_as_advanced(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
     let [first, rest @ ..] = args else {
-        return Err(status(ARG_COUNT));
+        return Err(CmdError::status(ARG_COUNT));
     };
     let (advanced, overwrite, names) = match bytes(first) {
         b"CLEAR" => (false, true, rest),

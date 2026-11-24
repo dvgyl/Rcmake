@@ -7,7 +7,7 @@ use rcmake_host::path::from_native;
 use rcmake_model::{DirId, ProjectModel, TargetId};
 use rcmake_regex::MatchOptions;
 
-use super::{status, values};
+use super::values;
 
 const GROUP: &[u8] = b"SOURCE_GROUP";
 const HAS_RULES: &[u8] = b"\0source_group_has_regex";
@@ -17,7 +17,9 @@ const FILE_GROUP: &[u8] = b"\0source_group_file";
 
 pub(super) fn command(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
     let Some((name, rest)) = args.split_first() else {
-        return Err(status("called with incorrect number of arguments"));
+        return Err(CmdError::status(
+            "called with incorrect number of arguments",
+        ));
     };
     let dir = cx.current_dir_id();
     let base = cx.project().dir(dir).source_dir.clone();
@@ -30,7 +32,7 @@ pub(super) fn command(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
 
     if let Some((group, pattern)) = regex {
         cx.regex(pattern).map_err(|_| {
-            status(format!(
+            CmdError::status(format!(
                 "regular expression \"{}\" is invalid",
                 BString::from(pattern)
             ))
@@ -106,7 +108,7 @@ fn named<'a>(
             legacy if files.is_empty() && regex.is_none() && args.peek().is_none() => {
                 regex = Some((group.clone(), legacy));
             }
-            _ => return Err(status("called with incorrect arguments")),
+            _ => return Err(CmdError::status("called with incorrect arguments")),
         }
     }
     Ok((files, regex))
@@ -114,7 +116,7 @@ fn named<'a>(
 
 fn tree(base: &[u8], cwd: &[u8], args: &[ExpandedArg]) -> Result<Vec<Assignment>, CmdError> {
     let Some((root, rest)) = args.split_first() else {
-        return Err(status(
+        return Err(CmdError::status(
             "given invalid argument:\n\n  TREE: missing required value",
         ));
     };
@@ -130,7 +132,9 @@ fn tree(base: &[u8], cwd: &[u8], args: &[ExpandedArg]) -> Result<Vec<Assignment>
                     args.next()
                         .filter(|&arg| !matches!(arg, b"FILES" | b"PREFIX"))
                         .ok_or_else(|| {
-                            status("given invalid argument:\n\n  PREFIX: missing required value")
+                            CmdError::status(
+                                "given invalid argument:\n\n  PREFIX: missing required value",
+                            )
                         })?,
                 );
             }
@@ -145,7 +149,7 @@ fn tree(base: &[u8], cwd: &[u8], args: &[ExpandedArg]) -> Result<Vec<Assignment>
                     }
                 }
             }
-            _ => return Err(status("called with incorrect arguments")),
+            _ => return Err(CmdError::status("called with incorrect arguments")),
         }
     }
     files
@@ -155,7 +159,9 @@ fn tree(base: &[u8], cwd: &[u8], args: &[ExpandedArg]) -> Result<Vec<Assignment>
             let relative = file
                 .relative(root_path)
                 .filter(|_| root_path.prefix(file))
-                .ok_or_else(|| status(format!("\"{root}\" is not a prefix of file \"{path}\"")))?;
+                .ok_or_else(|| {
+                    CmdError::status(format!("\"{root}\" is not a prefix of file \"{path}\""))
+                })?;
             let parent = group_path(Lexical::new(&relative).parent());
             let group = if prefix.is_empty() || parent.is_empty() {
                 [prefix.as_slice(), parent.as_slice()].concat().into()
@@ -231,7 +237,7 @@ fn apply_regex(cx: &mut Cx<'_>, dir: DirId, paths: BTreeSet<BString>) -> Result<
     for (group, pattern) in rules {
         let regex = cx
             .regex(&pattern)
-            .map_err(|error| status(error.to_string()))?;
+            .map_err(|error| CmdError::status(error.to_string()))?;
         regexes.push((group, regex));
     }
 
@@ -248,7 +254,7 @@ fn apply_regex(cx: &mut Cx<'_>, dir: DirId, paths: BTreeSet<BString>) -> Result<
         for (group, regex) in &regexes {
             if regex
                 .find_at(&path, 0, MatchOptions::default(), &mut budget)
-                .map_err(|error| status(error.to_string()))?
+                .map_err(|error| CmdError::status(error.to_string()))?
                 .is_some()
             {
                 matched = Some(group);

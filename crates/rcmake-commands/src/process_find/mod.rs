@@ -4,10 +4,10 @@
 
 use std::path::{Component, PathBuf};
 
-use rcmake_base::{BString, list, path_lex::Lexical};
+use rcmake_base::BString;
 use rcmake_diag::{Effect, MessageKind};
 use rcmake_eval::{CmdError, CmdFlags, Cx, Registry};
-use rcmake_host::path;
+use search_paths::{cmake_paths, resolved_lexical_path};
 
 mod cps_import;
 mod environment;
@@ -15,6 +15,7 @@ mod execute;
 mod find;
 mod find_package;
 mod pkg_config;
+mod search_paths;
 #[cfg(test)]
 mod tests;
 
@@ -73,12 +74,9 @@ impl RootMode {
             return paths;
         }
         let paths_from_var = |key| {
-            list::split(&cx.var_or_empty(key), list::Empty::Drop)
+            cmake_paths(cx, key)
                 .into_iter()
-                .map(|value| {
-                    let full = path::from_native(&cx.resolve_path(&value));
-                    path::to_native(&Lexical::new(&full).normalize())
-                })
+                .map(|value| resolved_lexical_path(cx, &value))
         };
         let roots: Vec<_> = [
             b"CMAKE_FIND_ROOT_PATH".as_slice(),

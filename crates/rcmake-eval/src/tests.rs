@@ -199,10 +199,6 @@ const TEST_FRONTEND: Frontend = Frontend {
     cond: t_cond,
 };
 
-// ---------------------------------------------------------------------------------------
-// Test-only commands (the real ones arrive in Wave 2).
-// ---------------------------------------------------------------------------------------
-
 fn vals(args: &[ExpandedArg]) -> Vec<BString> {
     args.iter().map(|a| a.value.clone()).collect()
 }
@@ -1445,10 +1441,6 @@ fn include_guard_skips_second_inclusion() {
             .contains("include_guard given an invalid scope: BAD")
     );
 }
-
-// ---------------------------------------------------------------------------------------
-// Cx API used by Wave 2 command families.
-// ---------------------------------------------------------------------------------------
 
 #[test]
 fn eval_code_and_call_command() {

@@ -1,10 +1,10 @@
-use rcmake_base::{BString, list, truth};
+use rcmake_base::{BString, list, shell::quote, truth};
 use rcmake_diag::{PolicyId, PolicyStatus};
 use rcmake_genex::ConfigId;
 use rcmake_host::{Host, Stream};
 use rcmake_model::{ProjectModel, Target, TargetKind};
 
-use super::{definition, shell::quote, target_property};
+use super::{definition, target_property};
 
 pub(super) struct Flags<'a> {
     model: &'a ProjectModel,

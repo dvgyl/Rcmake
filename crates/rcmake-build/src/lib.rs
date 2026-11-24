@@ -78,9 +78,6 @@ pub enum BuildError {
     /// Module scans or collation produced an error.
     #[error(transparent)]
     Modules(#[from] ModulesError),
-    /// The graph has a step kind that the executor can not run yet.
-    #[error("{0} is not supported yet")]
-    Unsupported(&'static str),
 }
 
 /// Run the selected build steps in dependency order through `host`.

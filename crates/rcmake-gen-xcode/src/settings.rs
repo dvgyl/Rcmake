@@ -8,7 +8,7 @@ use rcmake_base::{list as cmake_list, truth};
 use rcmake_model::{DirId, ParsedToolset, ProjectModel, Target, TargetKind};
 use rcmake_resolve::{
     BuildStep, GenerationResult, ResolvedTarget,
-    ide::{BundleKind, IdeCompileSettings, IdeLinkItem},
+    ide::{BundleKind, IdeCompileSettings, IdeFacts, IdeLinkItem},
 };
 
 use crate::{
@@ -326,16 +326,24 @@ pub(crate) struct TargetSettings<'a> {
 
 impl TargetSettings<'_> {
     pub(crate) fn build(&self, product: &Product, plist: Option<&Path>) -> Attrs {
+        let mut settings =
+            project_defaults(self.model, self.raw.dir, self.bin, self.arch, self.config);
+        let ide = self.target.and_then(|target| target.ide.as_deref());
+        self.add_product_settings(&mut settings, product, plist);
+        self.add_compile_settings(&mut settings, ide);
+        self.add_link_settings(&mut settings, product, ide);
+        if let Some(ide) = ide {
+            for (key, value) in &ide.attributes {
+                attribute(&mut settings, key, value, "XCODE_ATTRIBUTE_", self.config);
+            }
+        }
+        settings
+    }
+
+    fn add_product_settings(&self, settings: &mut Attrs, product: &Product, plist: Option<&Path>) {
         let Self {
-            model,
-            result,
-            bin,
-            config,
-            arch,
-            raw,
-            target,
+            bin, config, raw, ..
         } = *self;
-        let mut settings = project_defaults(model, raw.dir, bin, arch, config);
         settings.extend(attrs([
             ("ALWAYS_SEARCH_USER_PATHS", "NO".into()),
             ("COMBINE_HIDPI_IMAGES", "YES".into()),
@@ -427,7 +435,9 @@ impl TargetSettings<'_> {
         if product.kind == TargetKind::ModuleLibrary {
             settings.insert("MACH_O_TYPE".into(), "mh_bundle".into());
         }
-        let ide = target.and_then(|target| target.ide.as_deref());
+    }
+
+    fn add_compile_settings(&self, settings: &mut Attrs, ide: Option<&IdeFacts>) {
         let mut headers = Vec::new();
         let mut frameworks = Vec::new();
         let mut defines = vec![format!("CMAKE_INTDIR=\"{CONFIG_DIR}\"")];
@@ -480,6 +490,38 @@ impl TargetSettings<'_> {
             let values = values.drain(..).map(|value| xcode_flag(&value));
             settings.insert(key.into(), list(values.chain([INHERITED.into()])));
         }
+        let raw = self.raw;
+        if let Some(standard) = raw
+            .props
+            .get(b"CXX_STANDARD")
+            .filter(|value| !value.is_empty())
+        {
+            let dialect = if raw
+                .props
+                .get(b"CXX_EXTENSIONS")
+                .is_some_and(|v| !truth::is_on(v))
+            {
+                "c++"
+            } else {
+                "gnu++"
+            };
+            settings.insert(
+                "CLANG_CXX_LANGUAGE_STANDARD".into(),
+                format!("{dialect}{}", text(standard)).into(),
+            );
+        }
+    }
+
+    fn add_link_settings(&self, settings: &mut Attrs, product: &Product, ide: Option<&IdeFacts>) {
+        let Self {
+            model,
+            result,
+            bin,
+            config,
+            raw,
+            target,
+            ..
+        } = *self;
         let mut ldflags = Vec::new();
         let mut libraries = Vec::new();
         if let Some(ide) = ide {
@@ -586,25 +628,6 @@ impl TargetSettings<'_> {
                     .chain([INHERITED.into()]),
             ),
         );
-        if let Some(standard) = raw
-            .props
-            .get(b"CXX_STANDARD")
-            .filter(|value| !value.is_empty())
-        {
-            let dialect = if raw
-                .props
-                .get(b"CXX_EXTENSIONS")
-                .is_some_and(|v| !truth::is_on(v))
-            {
-                "c++"
-            } else {
-                "gnu++"
-            };
-            settings.insert(
-                "CLANG_CXX_LANGUAGE_STANDARD".into(),
-                format!("{dialect}{}", text(standard)).into(),
-            );
-        }
         if product.kind == TargetKind::SharedLibrary {
             if let Some(version) = product.version.as_ref().or(product.soversion.as_ref()) {
                 settings.insert("DYLIB_CURRENT_VERSION".into(), version.clone().into());
@@ -623,12 +646,6 @@ impl TargetSettings<'_> {
                 );
             }
         }
-        if let Some(ide) = ide {
-            for (key, value) in &ide.attributes {
-                attribute(&mut settings, key, value, "XCODE_ATTRIBUTE_", config);
-            }
-        }
-        settings
     }
 
     pub(crate) fn link_objects(&self) -> impl Iterator<Item = (String, String)> {

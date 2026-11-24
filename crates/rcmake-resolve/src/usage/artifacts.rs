@@ -3,11 +3,13 @@ use rcmake_base::{BString, list, path_lex::Lexical, truth};
 use rcmake_genex::{ArtifactKind, ArtifactPart, ConfigId, EvalContext};
 use rcmake_model::{BT, DirId, FileSetKind, Target, TargetId, TargetKind};
 
-use super::{UsageResolver, handle, host::definition, on};
+use super::{UsageResolver, handle, on};
 use crate::{
-    ArtifactSet, absolute_path,
+    ArtifactSet,
     ide::{BundleKind, IdeFlavor, OutputNaming},
     lower,
+    lower::definition,
+    sources::absolute_path,
     sources::{external_object, properties},
 };
 
@@ -74,61 +76,18 @@ impl UsageResolver<'_> {
         use ArtifactKind::*;
         use TargetKind::*;
         let target = self.model.target(id)?;
-        let variable = |name: &[u8]| definition(self.model, target.dir, name);
+        let variable = |name: &[u8]| definition(self.model, target.dir, name).cloned();
         let system = variable(b"CMAKE_SYSTEM_NAME").unwrap_or_default();
-        let xcode = self.ide == Some(IdeFlavor::Xcode);
-        let vs = self.ide == Some(IdeFlavor::VisualStudio);
-        let apple = xcode
-            || (!vs
-                && (matches!(
-                    system.as_slice(),
-                    b"Darwin" | b"iOS" | b"tvOS" | b"watchOS" | b"visionOS"
-                ) || (system.is_empty() && cfg!(target_os = "macos"))));
-        let windows = vs || (!xcode && (system.starts_with(b"Windows") || system == "CYGWIN"));
-        let desktop_apple = system == "Darwin"
-            || system.is_empty()
-            || (xcode
-                && !matches!(
-                    system.as_slice(),
-                    b"iOS" | b"tvOS" | b"watchOS" | b"visionOS"
-                ));
+        let platform = ArtifactPlatform::new(&system, self.ide);
+        let ArtifactPlatform {
+            apple,
+            windows,
+            visual_studio,
+            ..
+        } = platform;
         let import = matches!(kind, ImportFile | LinkerImportFile | SonameImportFile)
             || (kind == LinkerFile && windows && matches!(target.kind, SharedLibrary | Executable));
-        let (category, stem, prefix, suffix) = match (target.kind, import) {
-            (StaticLibrary, false) if vs => ("ARCHIVE", "STATIC_LIBRARY", "", ".lib"),
-            (StaticLibrary, false) => ("ARCHIVE", "STATIC_LIBRARY", "lib", ".a"),
-            (SharedLibrary, false) if windows => ("RUNTIME", "SHARED_LIBRARY", "", ".dll"),
-            (SharedLibrary, false) if apple => ("LIBRARY", "SHARED_LIBRARY", "lib", ".dylib"),
-            (SharedLibrary, false) => ("LIBRARY", "SHARED_LIBRARY", "lib", ".so"),
-            (ModuleLibrary, false) if vs => ("RUNTIME", "SHARED_MODULE", "", ".dll"),
-            (ModuleLibrary, false) => (
-                "LIBRARY",
-                "SHARED_MODULE",
-                "lib",
-                if windows { ".dll" } else { ".so" },
-            ),
-            (Executable, false) => (
-                "RUNTIME",
-                "EXECUTABLE",
-                "",
-                if windows { ".exe" } else { "" },
-            ),
-            (SharedLibrary | Executable, true) if windows || apple || target.is_imported() => {
-                if apple && !target.is_imported() && !on(target, b"ENABLE_EXPORTS") {
-                    return None;
-                }
-                (
-                    "ARCHIVE",
-                    "IMPORT_LIBRARY",
-                    if apple { "lib" } else { "" },
-                    if apple { ".tbd" } else { ".lib" },
-                )
-            }
-            (UnknownLibrary, false) if target.is_imported() => {
-                ("LIBRARY", "SHARED_LIBRARY", "", "")
-            }
-            _ => return None,
-        };
+        let kind_defaults = artifact_defaults(target, import, apple, windows, visual_studio)?;
         if matches!(kind, LinkerFile | LinkerLibraryFile | LinkerImportFile)
             && (target.kind == ModuleLibrary
                 || (target.kind == Executable && !on(target, b"ENABLE_EXPORTS")))
@@ -138,6 +97,7 @@ impl UsageResolver<'_> {
         if matches!(kind, SonameFile | SonameImportFile) && target.kind != SharedLibrary {
             return None;
         }
+        let (category, stem, prefix, suffix) = kind_defaults;
         let prefix_prop = if import {
             b"IMPORT_PREFIX".as_slice()
         } else {
@@ -161,32 +121,46 @@ impl UsageResolver<'_> {
             .or_else(|| variable(format!("CMAKE_{stem}_SUFFIX").as_bytes()))
             .unwrap_or_else(|| suffix.into());
         if target.is_imported() {
-            if matches!(kind, PdbFile | BundleDir | BundleContentDir) {
-                return None;
-            }
-            let property = if import {
-                b"IMPORTED_IMPLIB".as_slice()
-            } else {
-                b"IMPORTED_LOCATION"
-            };
-            let (path, selected) = imported_property(target, property, config)?;
-            let path = if matches!(kind, SonameFile | SonameImportFile) {
-                let name = imported_for_config(target, b"IMPORTED_SONAME", &selected)
-                    .or_else(|| on(target, b"IMPORTED_NO_SONAME").then(|| path.clone()))?;
-                Lexical::new(Lexical::new(&path).parent())
-                    .append(name.strip_prefix(b"@rpath/").unwrap_or(&name))
-            } else {
-                path
-            };
-            return Some(Artifact {
-                output_dir: Lexical::new(&path).parent().into(),
-                path,
-                prefix,
-                suffix,
-                base: target.name.clone(),
-            });
+            return imported_artifact(target, kind, config, import, prefix, suffix);
         }
 
+        self.local_artifact(
+            id,
+            kind,
+            config,
+            target,
+            platform,
+            ArtifactNaming {
+                category,
+                prefix,
+                suffix,
+            },
+        )
+    }
+
+    fn local_artifact(
+        &self,
+        id: TargetId,
+        kind: ArtifactKind,
+        config: &ConfigId,
+        target: &Target,
+        platform: ArtifactPlatform,
+        naming: ArtifactNaming,
+    ) -> Option<Artifact> {
+        use ArtifactKind::*;
+        use TargetKind::*;
+        let ArtifactPlatform {
+            xcode,
+            apple,
+            windows,
+            desktop_apple,
+            ..
+        } = platform;
+        let ArtifactNaming {
+            category,
+            prefix,
+            suffix,
+        } = naming;
         let config_upper = BString::from(config.0.to_ascii_uppercase());
         let bundle = kind == BundleDir || kind == BundleContentDir;
         let app = apple && target.kind == Executable && on(target, b"MACOSX_BUNDLE");
@@ -227,29 +201,7 @@ impl UsageResolver<'_> {
         } else {
             name
         };
-        let binary = Lexical::new(&self.model.dir(target.dir).binary_dir);
-        let config_dir = format!("{category}_OUTPUT_DIRECTORY_{config_upper}");
-        let general_dir = format!("{category}_OUTPUT_DIRECTORY");
-        let configured = !config.0.is_empty() && target.props.get(config_dir.as_bytes()).is_some();
-        let general = target.props.get(general_dir.as_bytes());
-        let mut dir = self
-            .artifact_property(id, config, &[config_dir, general_dir])
-            .map_or_else(
-                || self.model.dir(target.dir).binary_dir.clone(),
-                |path| binary.append(&path),
-            );
-        if (self.ide.is_some()
-            || self
-                .model
-                .generator
-                .is_some_and(|generator| generator.multi_config()))
-            && !config.0.is_empty()
-            && !configured
-            && !general.is_some_and(|value| value.windows(2).any(|part| part == b"$<"))
-        {
-            dir = Lexical::new(&dir).append(&config.0);
-        }
-        let dir = Lexical::new(&dir).normalize();
+        let dir = self.artifact_output_directory(id, config, target, category, &config_upper);
 
         let (prefix, suffix) = if framework || module_bundle || kind == PdbFile {
             (
@@ -322,6 +274,39 @@ impl UsageResolver<'_> {
             base,
             suffix,
         })
+    }
+
+    fn artifact_output_directory(
+        &self,
+        id: TargetId,
+        config: &ConfigId,
+        target: &Target,
+        category: &str,
+        config_upper: &BString,
+    ) -> BString {
+        let binary = Lexical::new(&self.model.dir(target.dir).binary_dir);
+        let config_dir = format!("{category}_OUTPUT_DIRECTORY_{config_upper}");
+        let general_dir = format!("{category}_OUTPUT_DIRECTORY");
+        let configured = !config.0.is_empty() && target.props.get(config_dir.as_bytes()).is_some();
+        let general = target.props.get(general_dir.as_bytes());
+        let mut dir = self
+            .artifact_property(id, config, &[config_dir, general_dir])
+            .map_or_else(
+                || self.model.dir(target.dir).binary_dir.clone(),
+                |path| binary.append(&path),
+            );
+        if (self.ide.is_some()
+            || self
+                .model
+                .generator
+                .is_some_and(|generator| generator.multi_config()))
+            && !config.0.is_empty()
+            && !configured
+            && !general.is_some_and(|value| value.windows(2).any(|part| part == b"$<"))
+        {
+            dir = Lexical::new(&dir).append(&config.0);
+        }
+        Lexical::new(&dir).normalize()
     }
 
     pub(crate) fn ide_artifacts(
@@ -536,6 +521,124 @@ impl UsageResolver<'_> {
             .collect::<IndexSet<_>>();
         Some(list::join(files))
     }
+}
+
+#[derive(Clone, Copy)]
+struct ArtifactPlatform {
+    xcode: bool,
+    visual_studio: bool,
+    apple: bool,
+    windows: bool,
+    desktop_apple: bool,
+}
+
+impl ArtifactPlatform {
+    fn new(system: &[u8], ide: Option<IdeFlavor>) -> Self {
+        let xcode = ide == Some(IdeFlavor::Xcode);
+        let vs = ide == Some(IdeFlavor::VisualStudio);
+        let apple = xcode
+            || (!vs
+                && (matches!(
+                    system,
+                    b"Darwin" | b"iOS" | b"tvOS" | b"watchOS" | b"visionOS"
+                ) || (system.is_empty() && cfg!(target_os = "macos"))));
+        let windows = vs || (!xcode && (system.starts_with(b"Windows") || system == b"CYGWIN"));
+        let desktop_apple = system == b"Darwin"
+            || system.is_empty()
+            || (xcode && !matches!(system, b"iOS" | b"tvOS" | b"watchOS" | b"visionOS"));
+        Self {
+            xcode,
+            visual_studio: vs,
+            apple,
+            windows,
+            desktop_apple,
+        }
+    }
+}
+
+struct ArtifactNaming {
+    category: &'static str,
+    prefix: BString,
+    suffix: BString,
+}
+
+fn artifact_defaults(
+    target: &Target,
+    import: bool,
+    apple: bool,
+    windows: bool,
+    visual_studio: bool,
+) -> Option<(&'static str, &'static str, &'static str, &'static str)> {
+    use TargetKind::*;
+    let (category, stem, prefix, suffix) = match (target.kind, import) {
+        (StaticLibrary, false) if visual_studio => ("ARCHIVE", "STATIC_LIBRARY", "", ".lib"),
+        (StaticLibrary, false) => ("ARCHIVE", "STATIC_LIBRARY", "lib", ".a"),
+        (SharedLibrary, false) if windows => ("RUNTIME", "SHARED_LIBRARY", "", ".dll"),
+        (SharedLibrary, false) if apple => ("LIBRARY", "SHARED_LIBRARY", "lib", ".dylib"),
+        (SharedLibrary, false) => ("LIBRARY", "SHARED_LIBRARY", "lib", ".so"),
+        (ModuleLibrary, false) if visual_studio => ("RUNTIME", "SHARED_MODULE", "", ".dll"),
+        (ModuleLibrary, false) => (
+            "LIBRARY",
+            "SHARED_MODULE",
+            "lib",
+            if windows { ".dll" } else { ".so" },
+        ),
+        (Executable, false) => (
+            "RUNTIME",
+            "EXECUTABLE",
+            "",
+            if windows { ".exe" } else { "" },
+        ),
+        (SharedLibrary | Executable, true) if windows || apple || target.is_imported() => {
+            if apple && !target.is_imported() && !on(target, b"ENABLE_EXPORTS") {
+                return None;
+            }
+            (
+                "ARCHIVE",
+                "IMPORT_LIBRARY",
+                if apple { "lib" } else { "" },
+                if apple { ".tbd" } else { ".lib" },
+            )
+        }
+        (UnknownLibrary, false) if target.is_imported() => ("LIBRARY", "SHARED_LIBRARY", "", ""),
+        _ => return None,
+    };
+    Some((category, stem, prefix, suffix))
+}
+
+fn imported_artifact(
+    target: &Target,
+    kind: ArtifactKind,
+    config: &ConfigId,
+    import: bool,
+    prefix: BString,
+    suffix: BString,
+) -> Option<Artifact> {
+    use ArtifactKind::*;
+    if matches!(kind, PdbFile | BundleDir | BundleContentDir) {
+        return None;
+    }
+    let property = if import {
+        b"IMPORTED_IMPLIB".as_slice()
+    } else {
+        b"IMPORTED_LOCATION"
+    };
+    let (path, selected) = imported_property(target, property, config)?;
+    let path = if matches!(kind, SonameFile | SonameImportFile) {
+        let name = imported_for_config(target, b"IMPORTED_SONAME", &selected)
+            .or_else(|| on(target, b"IMPORTED_NO_SONAME").then(|| path.clone()))?;
+        Lexical::new(Lexical::new(&path).parent())
+            .append(name.strip_prefix(b"@rpath/").unwrap_or(&name))
+    } else {
+        path
+    };
+    Some(Artifact {
+        output_dir: Lexical::new(&path).parent().into(),
+        path,
+        prefix,
+        suffix,
+        base: target.name.clone(),
+    })
 }
 
 fn imported_for_config(target: &Target, property: &[u8], config: &[u8]) -> Option<BString> {

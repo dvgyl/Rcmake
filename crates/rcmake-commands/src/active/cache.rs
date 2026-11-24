@@ -3,12 +3,12 @@ use std::io::ErrorKind;
 
 use rcmake_base::{BString, truth};
 use rcmake_diag::{Effect, MessageKind};
-use rcmake_eval::{CmdResult, Cx, Flow, RunMode};
+use rcmake_eval::{CmdError, CmdResult, Cx, Flow, RunMode};
 use rcmake_expr::ExpandedArg;
 use rcmake_host::{FileKind, Follow, ReadRange, path};
 use rcmake_model::{CacheEntry, CacheType};
 
-use super::{status, values};
+use super::values;
 
 enum Destination<'a> {
     Variables {
@@ -24,7 +24,7 @@ enum Destination<'a> {
 pub(super) fn load(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
     let args = values(args);
     let [directory, options @ ..] = args.as_slice() else {
-        return Err(status("called with wrong number of arguments."));
+        return Err(CmdError::status("called with wrong number of arguments."));
     };
     let destination = match options {
         [b"READ_WITH_PREFIX", prefix, keys @ ..] => Destination::Variables {
@@ -32,10 +32,12 @@ pub(super) fn load(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
             keys: keys.iter().copied().collect(),
         },
         [b"READ_WITH_PREFIX"] => {
-            return Err(status("READ_WITH_PREFIX form must specify a prefix."));
+            return Err(CmdError::status(
+                "READ_WITH_PREFIX form must specify a prefix.",
+            ));
         }
         _ if cx.mode() == RunMode::Script => {
-            return Err(status(
+            return Err(CmdError::status(
                 "Only load_cache(READ_WITH_PREFIX) may be used in script mode",
             ));
         }
@@ -44,7 +46,7 @@ pub(super) fn load(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
     let filename = path::to_native(directory).join("CMakeCache.txt");
     let path = cx.host().initial_cwd().join(&filename);
     let description = path::from_native(&filename);
-    let cannot_load = || status(format!("Cannot load cache file from {description}"));
+    let cannot_load = || CmdError::status(format!("Cannot load cache file from {description}"));
     match cx.host().metadata(&path, Follow::Yes) {
         Ok(meta) if meta.kind == FileKind::File => {}
         Ok(_) => return Err(cannot_load()),

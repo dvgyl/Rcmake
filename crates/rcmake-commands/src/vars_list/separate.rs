@@ -1,11 +1,11 @@
 use std::path::Path;
 
 use rcmake_base::{BString, list};
-use rcmake_eval::{CmdResult, Cx, Flow};
+use rcmake_eval::{CmdError, CmdResult, Cx, Flow};
 use rcmake_expr::ExpandedArg;
 use rcmake_host::{FileKind, Follow, path};
 
-use super::{bytes, status};
+use super::bytes;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Mode {
@@ -31,7 +31,7 @@ impl Mode {
 
 pub(super) fn separate_arguments(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
     let [name, tail @ ..] = args else {
-        return Err(status("must be given at least one argument."));
+        return Err(CmdError::status("must be given at least one argument."));
     };
     let name = bytes(name);
     if tail.is_empty() {
@@ -55,7 +55,7 @@ pub(super) fn separate_arguments(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdRe
             _ => {
                 if let Some(next) = Mode::parse(arg) {
                     if mode.is_some_and(|old| old != next) {
-                        return Err(status(
+                        return Err(CmdError::status(
                             "'UNIX_COMMAND', 'WINDOWS_COMMAND' and 'NATIVE_COMMAND' are mutually exclusive",
                         ));
                     }
@@ -67,13 +67,17 @@ pub(super) fn separate_arguments(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdRe
         }
     }
     let mode = mode.ok_or_else(|| {
-        status("missing required option: 'UNIX_COMMAND' or 'WINDOWS_COMMAND' or 'NATIVE_COMMAND'")
+        CmdError::status(
+            "missing required option: 'UNIX_COMMAND' or 'WINDOWS_COMMAND' or 'NATIVE_COMMAND'",
+        )
     })?;
     if separate && !program {
-        return Err(status("`SEPARATE_ARGS` option requires `PROGRAM' option"));
+        return Err(CmdError::status(
+            "`SEPARATE_ARGS` option requires `PROGRAM' option",
+        ));
     }
     if extra {
-        return Err(status("given unexpected argument(s)"));
+        return Err(CmdError::status("given unexpected argument(s)"));
     }
     let input = input.unwrap_or_default();
     let windows = if program && !separate {

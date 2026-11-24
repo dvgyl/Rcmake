@@ -16,15 +16,7 @@ use crate::{
 };
 
 pub(crate) fn quote(value: &str) -> String {
-    if !value.is_empty()
-        && value
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b"_@%+=:,./-".contains(&b))
-    {
-        value.into()
-    } else {
-        format!("'{}'", value.replace('\'', "'\\''"))
-    }
+    text(&rcmake_base::shell::quote(value.as_bytes()))
 }
 
 fn quote_command(value: &str) -> String {

@@ -35,9 +35,6 @@ mod tests;
 /// Error of a module operation.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum ModulesError {
-    /// The operation is not implemented yet.
-    #[error("{0} is not supported yet")]
-    Unsupported(&'static str),
     /// An input is not valid, or the imports can not be resolved. The text is the
     /// CMake-style message.
     #[error("{0}")]

@@ -9,8 +9,7 @@ use rcmake_gen_common::export::ModuleExportJob;
 use rcmake_host::{Follow, Host, path};
 use rcmake_model::ProjectModel;
 use rcmake_resolve::{
-    ArtifactSet, BuildGraph, BuildStep, GenerationResult, Invocation, LinkKind, ScanResponse,
-    progress,
+    ArtifactSet, BuildGraph, BuildStep, GenerationResult, Invocation, ScanResponse, progress,
 };
 
 use crate::syntax::{Edge, Ninja, shell_word};
@@ -42,6 +41,32 @@ struct StepNodes<'a> {
 enum OrderOnly<'a> {
     Targets(&'a [usize]),
     StepOutputs(usize),
+}
+
+struct EdgePlan {
+    rule: &'static [u8],
+    inputs: Vec<BString>,
+    implicit_inputs: Vec<BString>,
+    implicit_outputs: Vec<BString>,
+    dyndep: Option<BString>,
+    bindings: Vec<(&'static [u8], BString)>,
+}
+
+impl EdgePlan {
+    fn new(rule: &'static [u8], inputs: Vec<BString>, nodes: &StepNodes<'_>) -> Self {
+        Self {
+            rule,
+            inputs,
+            implicit_inputs: Vec::new(),
+            implicit_outputs: nodes.byproducts.clone(),
+            dyndep: None,
+            bindings: Vec::new(),
+        }
+    }
+
+    fn bind(&mut self, key: &'static [u8], value: impl Into<BString>) {
+        self.bindings.push((key, value.into()));
+    }
 }
 
 impl<'a> Graph<'a> {
@@ -396,148 +421,18 @@ impl<'a> Graph<'a> {
         modmap_flag: &[u8],
         exports: &[ModuleExportJob],
     ) {
-        let mut implicit = Vec::new();
-        let mut implicit_outputs = nodes.byproducts.clone();
-        let mut export_commands = Vec::new();
-        let mut dyndep_node = None;
-        let mut scan_response = None;
-        let (rule, inputs, invocations, depfile) = match step {
-            BuildStep::Compile {
-                object,
-                source,
-                invocation,
-                depfile,
-                modmap,
-                dyndep,
-            } => {
-                implicit.extend(modmap.iter().map(|map| self.node(map)));
-                implicit.extend(
-                    self.compile_inputs
-                        .and_then(|inputs| inputs.get(object))
-                        .into_iter()
-                        .flatten()
-                        .map(|input| self.node(input)),
-                );
-                dyndep_node = dyndep.as_ref().map(|dd| self.node(dd));
-                let rule: &[u8] = match (dyndep.is_some() || modmap.is_some(), depfile.is_some()) {
-                    (false, false) => b"COMPILE",
-                    (false, true) => b"COMPILE_DEPFILE",
-                    (true, false) => b"CXX_COMPILE_SCANNED",
-                    (true, true) => b"CXX_COMPILE_SCANNED_DEPFILE",
-                };
-                (
-                    rule,
-                    vec![self.node(source)],
-                    std::slice::from_ref(invocation),
-                    depfile.as_ref(),
-                )
-            }
-            BuildStep::Scan {
-                source,
-                ddi,
-                invocation,
-                depfile,
-                ..
-            } => {
-                scan_response = self
-                    .scan_responses
-                    .get(ddi.as_slice())
-                    .map(|&response| (ddi, response));
-                let rule: &[u8] = match (depfile.is_some(), scan_response.is_some()) {
-                    (true, true) => b"CXX_SCAN_RSP",
-                    (true, false) => b"CXX_SCAN",
-                    (false, true) => b"CXX_SCAN_RSP_NO_DEPFILE",
-                    (false, false) => b"CXX_SCAN_NO_DEPFILE",
-                };
-                (
-                    rule,
-                    vec![self.node(source)],
-                    std::slice::from_ref(
-                        scan_response.map_or(invocation, |(_, response)| &response.invocation),
-                    ),
-                    depfile.as_ref(),
-                )
-            }
-            BuildStep::Collate {
-                dd,
-                ddis,
-                tdi,
-                implicit_inputs,
-                depend_info,
-                ..
-            } => {
-                implicit_outputs.extend(
-                    depend_info
-                        .bmi_installation
-                        .iter()
-                        .filter(|install| !install.script_location.is_empty())
-                        .map(|install| self.node(&install.script_location)),
-                );
-                implicit.push(self.node(tdi));
-                implicit.extend(implicit_inputs.iter().map(|input| self.node(input)));
-                for export in exports.iter().filter(|export| export.dyndep == *dd) {
-                    implicit.push(self.node(&export.script));
-                    implicit_outputs.push(self.node(&export.output));
-                    export_commands.extend_from_slice(b" && ");
-                    export_commands.extend_from_slice(cmake);
-                    export_commands.extend_from_slice(b" -P ");
-                    shell_word(&self.node(&export.script), &mut export_commands);
-                }
-                (
-                    b"CXX_DYNDEP".as_slice(),
-                    ddis.iter().map(|ddi| self.node(ddi)).collect(),
-                    &[][..],
-                    None,
-                )
-            }
-            BuildStep::Link {
-                inputs,
-                step,
-                invocations,
-            } => {
-                let rule: &[u8] = match step.kind {
-                    LinkKind::Executable => b"LINK_EXECUTABLE",
-                    LinkKind::SharedLibrary => b"LINK_SHARED_LIBRARY",
-                    LinkKind::ModuleLibrary => b"LINK_MODULE_LIBRARY",
-                    LinkKind::StaticArchive => b"STATIC_ARCHIVE",
-                };
-                (
-                    rule,
-                    inputs.iter().map(|input| self.node(input)).collect(),
-                    invocations.as_slice(),
-                    None,
-                )
-            }
-            BuildStep::Custom(custom) => {
-                let rule: &[u8] = if custom.invocations.is_empty() {
-                    b"phony"
-                } else {
-                    b"CUSTOM_COMMAND"
-                };
-                let inputs = custom
-                    .depends
-                    .iter()
-                    .map(|input| self.custom_input(input))
-                    .collect();
-                (
-                    rule,
-                    inputs,
-                    custom.invocations.as_slice(),
-                    custom.depfile.as_ref(),
-                )
-            }
-        };
-        let inputs = unique(inputs);
-        let implicit = unique(implicit);
+        let plan = self.plan_step(step, nodes, cmake, modmap_flag, exports);
+        let inputs = unique(plan.inputs);
+        let implicit = unique(plan.implicit_inputs);
         let mut order_only = Vec::new();
-        if dyndep_node.is_some() || !nodes.order_only.is_empty() {
+        if plan.dyndep.is_some() || !nodes.order_only.is_empty() {
             let mut seen: HashSet<_> = inputs
                 .iter()
                 .chain(&implicit)
                 .chain(&nodes.outputs)
                 .chain(&nodes.byproducts)
                 .collect();
-            order_only.extend(dyndep_node.iter().filter(|node| seen.insert(node)));
+            order_only.extend(plan.dyndep.iter().filter(|node| seen.insert(node)));
             for entry in &nodes.order_only {
                 match entry {
                     OrderOnly::Targets(indices) => order_only.extend(
@@ -557,81 +452,192 @@ impl<'a> Graph<'a> {
             }
         }
         ninja.edge(
-            rule,
+            plan.rule,
             Edge {
                 outputs: &nodes.outputs,
-                implicit_outputs: &implicit_outputs,
+                implicit_outputs: &plan.implicit_outputs,
                 inputs: &inputs,
                 implicit_inputs: &implicit,
                 order_only: &order_only,
             },
         );
-        if rule == b"phony" {
-            return;
+
+        for (key, value) in plan.bindings {
+            ninja.binding(key, &value);
         }
-        if let BuildStep::Collate { tdi, .. } = step {
-            let mut tdi_arg = Vec::new();
-            shell_word(&self.node(tdi), &mut tdi_arg);
-            ninja.binding(b"CMAKE_COMMAND", cmake);
-            ninja.binding(b"in_tdi", &tdi_arg);
-            ninja.binding(b"MODMAP_FLAG", modmap_flag);
-            if !export_commands.is_empty() {
-                ninja.binding(b"MODULE_EXPORT_COMMANDS", &export_commands);
+    }
+
+    fn plan_step(
+        &self,
+        step: &BuildStep,
+        nodes: &StepNodes<'_>,
+        cmake: &[u8],
+        modmap_flag: &[u8],
+        exports: &[ModuleExportJob],
+    ) -> EdgePlan {
+        match step {
+            BuildStep::Compile {
+                object,
+                source,
+                invocation,
+                depfile,
+                modmap,
+                dyndep,
+            } => {
+                let rule: &[u8] = match (dyndep.is_some() || modmap.is_some(), depfile.is_some()) {
+                    (false, false) => b"COMPILE",
+                    (false, true) => b"COMPILE_DEPFILE",
+                    (true, false) => b"CXX_COMPILE_SCANNED",
+                    (true, true) => b"CXX_COMPILE_SCANNED_DEPFILE",
+                };
+                let mut plan = EdgePlan::new(rule, vec![self.node(source)], nodes);
+                plan.implicit_inputs
+                    .extend(modmap.iter().map(|map| self.node(map)));
+                plan.implicit_inputs.extend(
+                    self.compile_inputs
+                        .and_then(|inputs| inputs.get(object))
+                        .into_iter()
+                        .flatten()
+                        .map(|input| self.node(input)),
+                );
+                plan.bind(
+                    b"COMMAND",
+                    command_line(std::slice::from_ref(invocation), false),
+                );
+                if let Some(output) = nodes.outputs.first() {
+                    plan.bind(
+                        b"DESC",
+                        progress::compile_description(
+                            self.compile_languages.get(object.as_slice()).copied(),
+                            output,
+                        ),
+                    );
+                }
+                if let Some(depfile) = depfile {
+                    plan.bind(b"DEP_FILE", self.node(depfile));
+                }
+                if let Some(map) = modmap {
+                    plan.bind(b"DYNDEP_MODULE_MAP_FILE", self.node(map));
+                }
+                if let Some(dd) = dyndep {
+                    let node = self.node(dd);
+                    plan.bind(b"dyndep", node.clone());
+                    plan.dyndep = Some(node);
+                }
+                plan
             }
-            return;
-        }
-        ninja.binding(
-            b"COMMAND",
-            &command_line(invocations, matches!(step, BuildStep::Custom(_))),
-        );
-        if let Some(output) = nodes.outputs.first() {
-            let description = match step {
-                BuildStep::Compile { object, .. } => Some(progress::compile_description(
-                    self.compile_languages.get(object.as_slice()).copied(),
-                    output,
-                )),
-                BuildStep::Link { step, .. } => Some(progress::link_description(step, output)),
-                _ => None,
-            };
-            if let Some(description) = description {
-                ninja.binding(b"DESC", &description);
+            BuildStep::Scan {
+                source,
+                ddi,
+                invocation,
+                depfile,
+                ..
+            } => {
+                let response = self.scan_responses.get(ddi.as_slice()).copied();
+                let rule: &[u8] = match (depfile.is_some(), response.is_some()) {
+                    (true, true) => b"CXX_SCAN_RSP",
+                    (true, false) => b"CXX_SCAN",
+                    (false, true) => b"CXX_SCAN_RSP_NO_DEPFILE",
+                    (false, false) => b"CXX_SCAN_NO_DEPFILE",
+                };
+                let mut plan = EdgePlan::new(rule, vec![self.node(source)], nodes);
+                let invocation = response.map_or(invocation, |response| &response.invocation);
+                plan.bind(
+                    b"COMMAND",
+                    command_line(std::slice::from_ref(invocation), false),
+                );
+                if let Some(response) = response {
+                    let rsp = [self.node(ddi).as_slice(), b".rsp"].concat();
+                    plan.bind(b"RSP_FILE", rsp);
+                    plan.bind(b"RSP_ARGS", response.arguments.clone());
+                }
+                if let Some(depfile) = depfile {
+                    plan.bind(b"DEP_FILE", self.node(depfile));
+                }
+                plan
             }
-        }
-        if let Some((ddi, response)) = scan_response {
-            let rsp = [self.node(ddi).as_slice(), b".rsp"].concat();
-            ninja.binding(b"RSP_FILE", &rsp);
-            ninja.binding(b"RSP_ARGS", &response.arguments);
-        }
-        if let Some(depfile) = depfile {
-            let key: &[u8] = if matches!(step, BuildStep::Compile { .. } | BuildStep::Scan { .. }) {
-                b"DEP_FILE"
-            } else {
-                b"depfile"
-            };
-            ninja.binding(key, &self.node(depfile));
-        }
-        if let BuildStep::Compile {
-            modmap: Some(map), ..
-        } = step
-        {
-            ninja.binding(b"DYNDEP_MODULE_MAP_FILE", &self.node(map));
-        }
-        if let Some(dd) = dyndep_node {
-            ninja.binding(b"dyndep", &dd);
-        }
-        if let BuildStep::Custom(custom) = step {
-            ninja.binding(
-                b"DESC",
-                custom
+            BuildStep::Collate {
+                dd,
+                ddis,
+                tdi,
+                implicit_inputs,
+                depend_info,
+                ..
+            } => {
+                let inputs = ddis.iter().map(|ddi| self.node(ddi)).collect();
+                let mut plan = EdgePlan::new(b"CXX_DYNDEP", inputs, nodes);
+                plan.implicit_outputs.extend(
+                    depend_info
+                        .bmi_installation
+                        .iter()
+                        .filter(|install| !install.script_location.is_empty())
+                        .map(|install| self.node(&install.script_location)),
+                );
+                let tdi = self.node(tdi);
+                let mut tdi_arg = Vec::new();
+                shell_word(&tdi, &mut tdi_arg);
+                plan.implicit_inputs.push(tdi);
+                plan.implicit_inputs
+                    .extend(implicit_inputs.iter().map(|input| self.node(input)));
+                plan.bind(b"CMAKE_COMMAND", cmake);
+                plan.bind(b"in_tdi", tdi_arg);
+                plan.bind(b"MODMAP_FLAG", modmap_flag);
+                let mut export_commands = Vec::new();
+                for export in exports.iter().filter(|export| export.dyndep == *dd) {
+                    let script = self.node(&export.script);
+                    plan.implicit_outputs.push(self.node(&export.output));
+                    export_commands.extend_from_slice(b" && ");
+                    export_commands.extend_from_slice(cmake);
+                    export_commands.extend_from_slice(b" -P ");
+                    shell_word(&script, &mut export_commands);
+                    plan.implicit_inputs.push(script);
+                }
+                if !export_commands.is_empty() {
+                    plan.bind(b"MODULE_EXPORT_COMMANDS", export_commands);
+                }
+                plan
+            }
+            BuildStep::Link {
+                inputs,
+                step,
+                invocations,
+            } => {
+                let inputs = inputs.iter().map(|input| self.node(input)).collect();
+                let mut plan = EdgePlan::new(step.kind.ninja_rule(), inputs, nodes);
+                plan.bind(b"COMMAND", command_line(invocations, false));
+                if let Some(output) = nodes.outputs.first() {
+                    plan.bind(b"DESC", progress::link_description(step, output));
+                }
+                plan
+            }
+            BuildStep::Custom(custom) => {
+                let inputs = custom
+                    .depends
+                    .iter()
+                    .map(|input| self.custom_input(input))
+                    .collect();
+                if custom.invocations.is_empty() {
+                    return EdgePlan::new(b"phony", inputs, nodes);
+                }
+                let mut plan = EdgePlan::new(b"CUSTOM_COMMAND", inputs, nodes);
+                plan.bind(b"COMMAND", command_line(&custom.invocations, true));
+                if let Some(depfile) = &custom.depfile {
+                    plan.bind(b"depfile", self.node(depfile));
+                }
+                let description = custom
                     .comment
-                    .as_deref()
-                    .map(Vec::as_slice)
-                    .unwrap_or(b"Running custom command"),
-            );
-            if custom.uses_terminal {
-                ninja.binding(b"pool", b"console");
-            } else if let Some(pool) = custom.job_pool.as_ref().filter(|pool| !pool.is_empty()) {
-                ninja.binding(b"pool", pool);
+                    .as_ref()
+                    .map_or(b"Running custom command".as_slice(), |comment| {
+                        comment.as_slice()
+                    });
+                plan.bind(b"DESC", description);
+                if custom.uses_terminal {
+                    plan.bind(b"pool", b"console".as_slice());
+                } else if let Some(pool) = custom.job_pool.as_ref().filter(|pool| !pool.is_empty())
+                {
+                    plan.bind(b"pool", pool.as_slice());
+                }
+                plan
             }
         }
     }

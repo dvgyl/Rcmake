@@ -1,7 +1,7 @@
 //! Link and archive rules.
 
 use indexmap::IndexSet;
-use rcmake_base::{BString, list, path_lex::Lexical, truth};
+use rcmake_base::{BString, list, path_lex::Lexical, shell::quote, truth};
 use rcmake_genex::{ConfigId, EvalContext};
 use rcmake_model::{DirId, ProjectModel, Target, TargetId};
 
@@ -10,7 +10,7 @@ use super::compile::{apple_flags, language_flags};
 use super::install_rpath::MachORpathEdit;
 use super::launcher;
 use super::policy_flags::Flags;
-use super::shell::{direct, join_words, quote, rule_invocations, simple_args};
+use super::shell::{direct, join_words, rule_invocations, simple_args};
 use super::{definition, join, target_property};
 use crate::{
     ArtifactSet, BuildStep, Invocation, LinkFragmentRole, LinkKind, LinkStep, ResolveError,
@@ -32,26 +32,11 @@ pub(super) fn link(
     }
     let language = step.language.as_slice();
     let darwin = is_darwin(model, target.dir);
-    let (rule, class, default_create): (&[u8], &[u8], &[u8]) = match step.kind {
-        LinkKind::Executable => (b"LINK_EXECUTABLE", b"EXE", b""),
-        LinkKind::SharedLibrary => (
-            b"CREATE_SHARED_LIBRARY",
-            b"SHARED",
-            if darwin { b"-dynamiclib" } else { b"-shared" },
-        ),
-        LinkKind::ModuleLibrary => (
-            b"CREATE_SHARED_MODULE",
-            b"MODULE",
-            if darwin { b"-bundle" } else { b"-shared" },
-        ),
-        LinkKind::StaticArchive => (b"CREATE_STATIC_LIBRARY", b"STATIC", b""),
-    };
-    let static_archive = step.kind == LinkKind::StaticArchive;
-    let shared = step.kind == LinkKind::SharedLibrary;
+    let kind = step.kind;
     let policy = Flags::new(model, target, language);
     let ipo = policy.ipo(config);
     let mut driver = language_flags(model, target, config, language);
-    if !static_archive {
+    if kind != LinkKind::StaticArchive {
         driver.extend(policy.link(ipo));
         driver.extend(apple_flags(model, target, config, language));
     }
@@ -61,38 +46,25 @@ pub(super) fn link(
         definition(model, target.dir, b"CMAKE_COMMAND").map_or_else(|| "cmake".into(), Clone::clone)
     };
     let mut flags = Vec::new();
-    if !static_archive {
+    if kind != LinkKind::StaticArchive {
         flags.extend(option(b"LINK_FLAGS").cloned());
     }
-    let base = [b"CMAKE_", class, b"_LINKER_FLAGS"].concat();
+    let base = [b"CMAKE_", kind.flag_class(), b"_LINKER_FLAGS"].concat();
     let configured = [base.as_slice(), b"_", &config.0.to_ascii_uppercase()].concat();
     flags.extend(
         [base.as_slice(), configured.as_slice()]
             .into_iter()
             .filter_map(|key| definition(model, target.dir, key).cloned()),
     );
-    let create_key = match step.kind {
-        LinkKind::Executable => [b"CMAKE_EXECUTABLE_CREATE_", language, b"_FLAGS"].concat(),
-        _ => [b"CMAKE_", class, b"_LIBRARY_CREATE_", language, b"_FLAGS"].concat(),
-    };
-    let create_key = if step.kind == LinkKind::ModuleLibrary {
-        [b"CMAKE_SHARED_MODULE_CREATE_", language, b"_FLAGS"].concat()
-    } else {
-        create_key
-    };
     flags.push(
-        definition(model, target.dir, &create_key)
-            .map_or_else(|| default_create.into(), Clone::clone),
+        definition(model, target.dir, &kind.create_flags_key(language))
+            .map_or_else(|| kind.default_create_flag(darwin).into(), Clone::clone),
     );
     flags.extend(policy.pie_link());
-    if shared && darwin {
+    if kind == LinkKind::SharedLibrary && darwin {
         flags.extend(darwin_versions(model, target, language));
     }
-    let raw_flags = if static_archive {
-        b"STATIC_LIBRARY_FLAGS".as_slice()
-    } else {
-        b"LINK_FLAGS"
-    };
+    let raw_flags = kind.target_flags_property();
     flags.extend(target.props.get(raw_flags).cloned());
     flags.extend(
         target
@@ -112,23 +84,8 @@ pub(super) fn link(
     let flags = join_words(flags);
 
     let mut inputs = objects.clone();
-    let libraries = if static_archive {
-        BString::default()
-    } else {
-        let link_fragments = step
-            .fragments
-            .iter()
-            .filter(|f| f.role != LinkFragmentRole::Flags);
-        let libraries = linked_libraries(&step);
-        let rpaths = rpaths(model, target, config, &step, darwin, &libraries)?;
-        inputs.extend(libraries);
-        join_words(
-            rpaths
-                .into_iter()
-                .chain(link_fragments.map(|f| f.text.value.clone())),
-        )
-    };
-    let soname = if shared {
+    let libraries = link_libraries(model, target, config, &step, darwin, &mut inputs)?;
+    let soname = if kind == LinkKind::SharedLibrary {
         artifacts.soname_file.as_ref()
     } else {
         None
@@ -216,55 +173,36 @@ pub(super) fn link(
     let fallback = [
         compiler.as_slice(),
         b" <FLAGS> <LINK_FLAGS>",
-        if shared { soname_template } else { b"" },
+        if kind == LinkKind::SharedLibrary {
+            soname_template
+        } else {
+            b""
+        },
         b" <OBJECTS> -o <TARGET> <LINK_LIBRARIES>",
     ]
     .concat();
 
-    let template = option(rule).filter(|v| !v.is_empty());
-    let mut invocations = if static_archive {
-        let mut commands = vec![direct(
-            vec![
-                cmake(),
-                "-E".into(),
-                "rm".into(),
-                "-f".into(),
-                step.output.clone(),
-            ],
-            None,
-        )];
-        let archive = |key: &[u8]| {
-            ipo.then(|| option(&[key, b"_IPO"].concat()))
-                .flatten()
-                .or_else(|| option(key))
-        };
-        if let Some(template) =
-            template.filter(|_| !(ipo && option(b"ARCHIVE_CREATE_IPO").is_some()))
-        {
-            commands.extend(expand(template, &objects));
-        } else {
-            let create = archive(b"ARCHIVE_CREATE").map_or(
-                b"<CMAKE_AR> qc <TARGET> <LINK_FLAGS> <OBJECTS>".as_slice(),
-                |v| v.as_slice(),
-            );
-            let append = archive(b"ARCHIVE_APPEND").map_or(
-                b"<CMAKE_AR> q <TARGET> <LINK_FLAGS> <OBJECTS>".as_slice(),
-                |v| v.as_slice(),
-            );
-            let finish = archive(b"ARCHIVE_FINISH")
-                .map_or(b"<CMAKE_RANLIB> <TARGET>".as_slice(), |v| v.as_slice());
-            commands.extend(archive_invocations(
-                expand, create, append, finish, &objects,
-            ));
-        }
-        commands
+    let template = option(kind.rule_variable()).filter(|v| !v.is_empty());
+    let mut invocations = if kind == LinkKind::StaticArchive {
+        archive_commands(
+            &step.output,
+            &objects,
+            cmake(),
+            &policy,
+            ipo,
+            template,
+            expand,
+        )
     } else {
         expand(
             template.map_or(fallback.as_slice(), |v| v.as_slice()),
             &objects,
         )
     };
-    for invocation in invocations.iter_mut().skip(usize::from(static_archive)) {
+    for invocation in invocations
+        .iter_mut()
+        .skip(usize::from(kind == LinkKind::StaticArchive))
+    {
         let command = launcher::Command {
             role: "link",
             config,
@@ -273,12 +211,12 @@ pub(super) fn link(
             language: &step.language,
         };
         let mut link = std::mem::take(invocation);
-        if !static_archive {
+        if kind != LinkKind::StaticArchive {
             link = command.launch_tool(model, target, b"_LINKER_LAUNCHER", link)?;
         }
         *invocation = command.wrap(model, target, link);
     }
-    if shared
+    if kind == LinkKind::SharedLibrary
         && let (Some(file), Some(soname), Some(linker)) = (
             &artifacts.file,
             &artifacts.soname_file,
@@ -298,7 +236,7 @@ pub(super) fn link(
             None,
         ));
     }
-    if step.kind == LinkKind::Executable
+    if kind == LinkKind::Executable
         && let (Some(file), Some(linker)) = (&artifacts.file, &artifacts.linker_file)
         && file != linker
     {
@@ -318,6 +256,69 @@ pub(super) fn link(
         step,
         invocations,
     })
+}
+
+fn link_libraries(
+    model: &ProjectModel,
+    target: &Target,
+    config: &ConfigId,
+    step: &LinkStep,
+    darwin: bool,
+    inputs: &mut Vec<BString>,
+) -> Result<BString, ResolveError> {
+    if step.kind == LinkKind::StaticArchive {
+        return Ok(BString::default());
+    }
+    let link_fragments = step
+        .fragments
+        .iter()
+        .filter(|f| f.role != LinkFragmentRole::Flags);
+    let libraries = linked_libraries(step);
+    let rpaths = rpaths(model, target, config, step, darwin, &libraries)?;
+    inputs.extend(libraries);
+    Ok(join_words(
+        rpaths
+            .into_iter()
+            .chain(link_fragments.map(|f| f.text.value.clone())),
+    ))
+}
+
+fn archive_commands(
+    output: &BString,
+    objects: &[BString],
+    cmake: BString,
+    policy: &Flags<'_>,
+    ipo: bool,
+    template: Option<&BString>,
+    expand: impl Fn(&[u8], &[BString]) -> Vec<Invocation>,
+) -> Vec<Invocation> {
+    let mut commands = vec![direct(
+        vec![cmake, "-E".into(), "rm".into(), "-f".into(), output.clone()],
+        None,
+    )];
+    let archive = |key: &[u8]| {
+        ipo.then(|| policy.option(&[key, b"_IPO"].concat()))
+            .flatten()
+            .or_else(|| policy.option(key))
+    };
+    if let Some(template) =
+        template.filter(|_| !(ipo && policy.option(b"ARCHIVE_CREATE_IPO").is_some()))
+    {
+        commands.extend(expand(template, objects));
+    } else {
+        let create = archive(b"ARCHIVE_CREATE").map_or(
+            b"<CMAKE_AR> qc <TARGET> <LINK_FLAGS> <OBJECTS>".as_slice(),
+            |v| v.as_slice(),
+        );
+        let append = archive(b"ARCHIVE_APPEND").map_or(
+            b"<CMAKE_AR> q <TARGET> <LINK_FLAGS> <OBJECTS>".as_slice(),
+            |v| v.as_slice(),
+        );
+        let finish = archive(b"ARCHIVE_FINISH")
+            .map_or(b"<CMAKE_RANLIB> <TARGET>".as_slice(), |v| v.as_slice());
+        commands.extend(archive_invocations(expand, create, append, finish, objects));
+    }
+    commands
 }
 
 fn deduplicate_darwin_flags(flags: &mut [BString]) {

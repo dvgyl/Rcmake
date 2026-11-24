@@ -8,7 +8,7 @@ use rcmake_eval::{CmdError, CmdResult, Cx, Flow};
 use rcmake_expr::ExpandedArg;
 use rcmake_model::{BT, DiscoverySpec, TestEntry, TestKind};
 
-use super::{status, values};
+use super::values;
 
 const OPTIONS: &[&[u8]] = &[
     b"COMMAND",
@@ -77,7 +77,7 @@ pub(super) fn discover_tests(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult
         return Err(crate::command_error(cx, message));
     }
     if let Some(word) = unknown {
-        return Err(status(format!(
+        return Err(CmdError::status(format!(
             "given unknown argument \"{}\".",
             BString::from(word)
         )));
@@ -127,7 +127,7 @@ pub(super) fn discover_tests(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult
     };
     cx.project()
         .add_test(test)
-        .map_err(|error| status(error.to_string()))?;
+        .map_err(|error| CmdError::status(error.to_string()))?;
     Ok(Flow::Normal)
 }
 
@@ -137,7 +137,7 @@ fn property_pairs(values: Vec<BString>, name: &str) -> Result<Vec<(BString, BStr
     while let Some(key) = values.next() {
         let value = values
             .next()
-            .ok_or_else(|| status(format!("{name} must be key-value pairs.")))?;
+            .ok_or_else(|| CmdError::status(format!("{name} must be key-value pairs.")))?;
         pairs.push((key, value));
     }
     Ok(pairs)

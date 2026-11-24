@@ -1,6 +1,6 @@
 //! Ninja file syntax and POSIX shell arguments.
 
-use rcmake_base::BString;
+use rcmake_base::{BString, shell::quote_always};
 
 #[derive(Default)]
 pub(crate) struct Ninja(pub(crate) Vec<u8>);
@@ -83,13 +83,5 @@ pub(crate) fn shell_word(word: &[u8], out: &mut Vec<u8>) {
         return;
     }
 
-    out.push(b'\'');
-    for &byte in word {
-        if byte == b'\'' {
-            out.extend_from_slice(b"'\\''");
-        } else {
-            out.push(byte);
-        }
-    }
-    out.push(b'\'');
+    out.extend_from_slice(&quote_always(word));
 }

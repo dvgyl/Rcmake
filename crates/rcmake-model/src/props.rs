@@ -32,6 +32,11 @@ pub enum PropScope {
     Cache(BString),
     /// `FILE_SET`: properties of one file set of a target.
     FileSet(FileSetId),
+    /// `INSTALL`: properties of one installed file.
+    Install {
+        /// Name of the installed file.
+        file: BString,
+    },
 }
 
 /// `set_property(APPEND)` or `set_property(APPEND_STRING)`.

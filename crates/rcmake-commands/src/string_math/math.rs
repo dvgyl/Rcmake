@@ -1,20 +1,22 @@
 use rcmake_base::ByteSlice;
 use rcmake_diag::{DiagCategory, Effect, MessageKind};
-use rcmake_eval::{CmdResult, Cx};
+use rcmake_eval::{CmdError, CmdResult, Cx};
 use rcmake_expr::ExpandedArg;
 
-use super::{set, status, trim_start};
+use super::{set, trim_start};
 
 pub(super) fn command(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
     let args: Vec<&[u8]> = args.iter().map(|arg| arg.value.as_slice()).collect();
     match args.as_slice() {
         [b"EXPR", args @ ..] => expression(cx, args),
         [mode @ (b"INCREMENT" | b"DECREMENT"), args @ ..] => adjust(cx, mode, args),
-        [mode, ..] => Err(status(format!(
+        [mode, ..] => Err(CmdError::status(format!(
             "does not recognize sub-command {}",
             mode.to_str_lossy()
         ))),
-        [] => Err(status("must be called with at least one argument.")),
+        [] => Err(CmdError::status(
+            "must be called with at least one argument.",
+        )),
     }
 }
 
@@ -23,18 +25,18 @@ fn expression(cx: &mut Cx<'_>, args: &[&[u8]]) -> CmdResult {
         [out, source] | [out, source, b"OUTPUT_FORMAT", b"DECIMAL"] => (*out, *source, false),
         [out, source, b"OUTPUT_FORMAT", b"HEXADECIMAL"] => (*out, *source, true),
         [_, _, b"OUTPUT_FORMAT", value] => {
-            return Err(status(format!(
+            return Err(CmdError::status(format!(
                 "sub-command EXPR value \"{}\" for option \"OUTPUT_FORMAT\" is invalid.",
                 value.to_str_lossy()
             )));
         }
         [_, _, option, _] => {
-            return Err(status(format!(
+            return Err(CmdError::status(format!(
                 "sub-command EXPR option \"{}\" is unknown.",
                 option.to_str_lossy()
             )));
         }
-        _ => return Err(status("EXPR called with incorrect arguments.")),
+        _ => return Err(CmdError::status("EXPR called with incorrect arguments.")),
     };
 
     let mut parser = Parser {
@@ -58,7 +60,7 @@ fn expression(cx: &mut Cx<'_>, args: &[&[u8]]) -> CmdResult {
             ParseError::Syntax(detail) => ("parse", detail),
             ParseError::Evaluate(detail) => ("evaluate", detail.to_owned()),
         };
-        status(format!(
+        CmdError::status(format!(
             "cannot {action} the expression: \"{}\": {detail}.",
             source.to_str_lossy()
         ))
@@ -80,12 +82,12 @@ fn expression(cx: &mut Cx<'_>, args: &[&[u8]]) -> CmdResult {
 fn adjust(cx: &mut Cx<'_>, mode: &[u8], args: &[&[u8]]) -> CmdResult {
     let name = mode.to_str_lossy();
     let [out] = args else {
-        return Err(status(format!(
+        return Err(CmdError::status(format!(
             "sub-command {name} wrong number of arguments"
         )));
     };
     let value = cx.var(out).ok_or_else(|| {
-        status(format!(
+        CmdError::status(format!(
             "sub-command {name} variable \"{}\" is not defined",
             out.to_str_lossy()
         ))
@@ -94,7 +96,7 @@ fn adjust(cx: &mut Cx<'_>, mode: &[u8], args: &[&[u8]]) -> CmdResult {
         .ok()
         .and_then(|s| s.parse().ok())
         .ok_or_else(|| {
-            status(format!(
+            CmdError::status(format!(
                 "sub-command {name} value \"{}\" is not a valid integer",
                 value.to_str_lossy()
             ))

@@ -1,6 +1,6 @@
 //! The arena-based [`ProjectModel`] and its scoped property API.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use indexmap::IndexMap;
 use rcmake_base::{BString, list};
@@ -10,8 +10,8 @@ use crate::target::join_entries;
 use crate::{
     AppendMode, BT, BuildExport, Cache, CacheEntry, CacheType, CommandId, CustomCommand, DirId,
     Directory, ExportSet, FileSet, FileSetId, GeneratorKind, GeneratorSpec, GlobalState,
-    ImportedVisibility, InstallRule, LinkItem, PropOrigin, PropScope, Target, TargetBinding,
-    TargetId, TargetOrigin, TestEntry, TestId, UsageField, UsageProps,
+    ImportedVisibility, InstallRule, LinkItem, PropOrigin, PropScope, PropertyMap, Target,
+    TargetBinding, TargetId, TargetOrigin, TestEntry, TestId, UsageField, UsageProps,
 };
 
 /// Error of a [`ProjectModel`] operation.
@@ -54,6 +54,8 @@ pub struct ProjectModel {
     pub generator_spec: GeneratorSpec,
     /// Install rules in call order.
     pub installs: Vec<InstallRule>,
+    /// Properties by install file name.
+    pub install_props: BTreeMap<BString, PropertyMap>,
     /// Export sets by name.
     pub exports: IndexMap<BString, ExportSet>,
     /// `export()` calls that write build-tree files, in call order.
@@ -112,6 +114,32 @@ impl ProjectModel {
             .chain(&self.subdirs)
             .enumerate()
             .filter_map(|(i, dir)| DirId::from_index(i).map(|id| (id, dir)))
+    }
+
+    /// Return `dir` and its ancestors in child-to-parent order.
+    /// Stop if the parent index does not decrease.
+    pub fn ancestors(&self, dir: DirId) -> impl Iterator<Item = DirId> + '_ {
+        core::iter::successors(Some(dir), |&id| {
+            self.dir(id)
+                .parent
+                .filter(|parent| parent.index() < id.index())
+        })
+    }
+
+    /// Check if a directory or one of its ancestors is excluded from the default build.
+    #[must_use]
+    pub fn dir_excluded_from_all(&self, dir: DirId) -> bool {
+        self.ancestors(dir).any(|id| self.dir(id).exclude_from_all)
+    }
+
+    /// Check if a target is excluded from the default build.
+    /// An explicit target property overrides the directory setting.
+    #[must_use]
+    pub fn excluded_from_all(&self, target: &Target) -> bool {
+        target.props.get(b"EXCLUDE_FROM_ALL").map_or_else(
+            || self.dir_excluded_from_all(target.dir),
+            |value| rcmake_base::truth::is_on(value),
+        )
     }
 
     /// Set the source and binary directory of the root directory.
@@ -409,6 +437,7 @@ impl ProjectModel {
             }
             PropScope::Cache(entry) => cache_prop(self.cache.get(entry)?, name),
             PropScope::FileSet(id) => self.file_set(*id)?.props.get(name).cloned(),
+            PropScope::Install { file } => self.install_props.get(file)?.get(name).cloned(),
         }
     }
 
@@ -428,11 +457,14 @@ impl ProjectModel {
                 PropScope::Source { dir, .. } | PropScope::Test { dir, .. } => {
                     PropScope::Directory(dir)
                 }
-                PropScope::Directory(id) => match self.dir(id).parent {
-                    Some(parent) => PropScope::Directory(parent),
-                    None => PropScope::Global,
-                },
-                PropScope::Global | PropScope::Cache(_) => return None,
+                PropScope::Directory(id) => {
+                    return self
+                        .ancestors(id)
+                        .skip(1)
+                        .find_map(|parent| self.directory_prop(parent, name))
+                        .or_else(|| self.global.props.get(name).cloned());
+                }
+                PropScope::Global | PropScope::Cache(_) | PropScope::Install { .. } => return None,
             };
         }
     }
@@ -486,6 +518,20 @@ impl ProjectModel {
             PropScope::FileSet(id) => {
                 let file_set = self.file_set_mut(*id).ok_or(ModelError::UnknownObject)?;
                 set_map(&mut file_set.props, name, value);
+                Ok(())
+            }
+            PropScope::Install { file } => {
+                if let Some(value) = value {
+                    self.install_props
+                        .entry(file.clone())
+                        .or_default()
+                        .set(name.into(), value);
+                } else if let Some(props) = self.install_props.get_mut(file) {
+                    props.unset(name);
+                    if props.names().is_empty() {
+                        self.install_props.remove(file);
+                    }
+                }
                 Ok(())
             }
         }
@@ -753,6 +799,40 @@ mod tests {
             Backtrace::default(),
             PolicyMap::default(),
         )
+    }
+
+    #[test]
+    fn ancestors_follow_decreasing_parent_indices_and_stop_at_a_cycle() {
+        let mut model = ProjectModel::default();
+        let child = model
+            .add_directory(
+                DirId::ROOT,
+                "/s/c".into(),
+                "/b/c".into(),
+                Backtrace::default(),
+            )
+            .unwrap();
+        let grandchild = model
+            .add_directory(
+                child,
+                "/s/c/g".into(),
+                "/b/c/g".into(),
+                Backtrace::default(),
+            )
+            .unwrap();
+        for (id, directory) in model.dirs() {
+            if let Some(parent) = directory.parent {
+                assert!(parent.index() < id.index());
+            }
+        }
+        assert!(
+            model
+                .ancestors(grandchild)
+                .eq([grandchild, child, DirId::ROOT])
+        );
+
+        model.dir_mut(child).parent = Some(grandchild);
+        assert!(model.ancestors(grandchild).eq([grandchild, child]));
     }
 
     #[test]

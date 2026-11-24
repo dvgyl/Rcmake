@@ -3,7 +3,7 @@
 #![forbid(unsafe_code)]
 
 use rcmake_base::BString;
-use rcmake_eval::{CmdError, CmdFlags, Registry};
+use rcmake_eval::{CmdFlags, Registry};
 use rcmake_expr::ExpandedArg;
 
 mod callbacks;
@@ -28,10 +28,6 @@ pub(crate) fn register(registry: &mut Registry) {
 
 fn bytes(arg: &ExpandedArg) -> &[u8] {
     arg.value.as_slice()
-}
-
-fn status(message: impl Into<BString>) -> CmdError {
-    CmdError::Status(message.into())
 }
 
 fn cat(parts: &[&[u8]]) -> BString {

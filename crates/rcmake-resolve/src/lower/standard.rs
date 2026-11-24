@@ -1,10 +1,10 @@
 //! Language standards and compile feature requirements.
 
-use rcmake_base::{BString, list, truth};
+use rcmake_base::{BString, list, shell::quote, truth};
 use rcmake_diag::{PolicyId, PolicyStatus};
 use rcmake_model::{BT, ProjectModel, Target};
 
-use super::shell::{join_words, quote};
+use super::shell::join_words;
 use super::{definition, target_property};
 
 pub(crate) fn required_standard(

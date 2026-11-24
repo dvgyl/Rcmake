@@ -65,26 +65,7 @@ pub fn write_module_exports(
             continue;
         };
         let directory = safe_directory(directory, plan)?;
-        let members: Vec<_> = plan
-            .targets
-            .iter()
-            .filter_map(|exported| {
-                let matches_name = |target: &Target| {
-                    target.props.get(b"EXPORT_NAME").unwrap_or(&target.name) == &exported.name
-                };
-                if let Some(set) = model.exports.get(&plan.set) {
-                    set.targets
-                        .iter()
-                        .filter_map(|&id| model.target(id))
-                        .find(|target| matches_name(target))
-                } else {
-                    model
-                        .targets()
-                        .map(|(_, target)| target)
-                        .find(|target| !target.is_imported() && matches_name(target))
-                }
-            })
-            .collect();
+        let members = module_export_members(model, plan);
         if !members
             .iter()
             .any(|target| module_sets(model, target).next().is_some())
@@ -118,8 +99,13 @@ pub fn write_module_exports(
             plan.set.clone()
         };
         validate_file_component(&key, plan)?;
-        let stem = BString::from([b"cxx-modules-".as_slice(), &key].concat());
-        let index_file = filename(&stem, b"");
+        let index = ModuleExportIndex {
+            root,
+            directory,
+            stem: [b"cxx-modules-".as_slice(), &key].concat().into(),
+            plan,
+            action,
+        };
         let mut main = BString::default();
         let mut config_files: BTreeMap<&BString, (&ConfigId, BString)> = result
             .configs
@@ -212,7 +198,7 @@ pub fn write_module_exports(
                     continue;
                 }
                 let name = filename(&target_stem, label(config));
-                let output = root.join(to_native(&name));
+                let output = index.root.join(to_native(&name));
                 let module_table = bin
                     .join(to_native(dyndep))
                     .with_file_name("CXXModules.json");
@@ -239,7 +225,13 @@ pub fn write_module_exports(
                     script: from_native(&script),
                     output: from_native(&output),
                 });
-                add_install(&mut install, action, &directory, Some(config), &output);
+                add_install(
+                    &mut install,
+                    action,
+                    &index.directory,
+                    Some(config),
+                    &output,
+                );
             }
             if let Some(features) = target.usage.fields.get(&UsageField::CompileFeatures) {
                 let features = list::join(features.iter().map(|entry| &entry.value));
@@ -253,40 +245,8 @@ pub fn write_module_exports(
                 main.extend_from_slice(b")\n");
             }
         }
-        let mut index_contents = BString::default();
-        if plan.install {
-            index_contents.extend_from_slice(
-                b"file(GLOB _cmake_cxx_module_includes \"${CMAKE_CURRENT_LIST_DIR}/",
-            );
-            quoted_content(&mut index_contents, &stem);
-            index_contents.extend_from_slice(
-                br#"-*.cmake")
-foreach(_cmake_cxx_module_include IN LISTS _cmake_cxx_module_includes)
-  include("${_cmake_cxx_module_include}")
-endforeach()
-unset(_cmake_cxx_module_include)
-unset(_cmake_cxx_module_includes)
-"#,
-            );
-        }
-        for (config, contents) in config_files.into_values() {
-            let name = filename(&stem, label(config));
-            if !plan.install {
-                include(&mut index_contents, &name, multi_config);
-            }
-            let path = root.join(to_native(&name));
-            write_output(host, &path, &contents)?;
-            add_install(&mut install, action, &directory, Some(config), &path);
-        }
-        let path = root.join(to_native(&index_file));
-        write_output(host, &path, &index_contents)?;
-        add_install(&mut install, action, &directory, None, &path);
-
-        include(
-            &mut main,
-            &Lexical::new(&directory).append(&index_file),
-            false,
-        );
+        let index_path = index.write(host, config_files, multi_config, &mut install)?;
+        include(&mut main, &index_path, false);
         let prefix = model
             .definition(DirId::ROOT, b"CMAKE_INSTALL_PREFIX")
             .map_or(b"/usr/local".as_slice(), |value| value.as_slice());
@@ -298,6 +258,78 @@ unset(_cmake_cxx_module_includes)
     }
     write_module_install(host, bin, &install)?;
     Ok(jobs)
+}
+
+struct ModuleExportIndex<'a> {
+    root: PathBuf,
+    directory: BString,
+    stem: BString,
+    plan: &'a ExportPlan,
+    action: Option<&'a InstallAction>,
+}
+
+impl ModuleExportIndex<'_> {
+    fn write(
+        &self,
+        host: &dyn Host,
+        config_files: BTreeMap<&BString, (&ConfigId, BString)>,
+        multi_config: bool,
+        install: &mut InstallManifest,
+    ) -> Result<BString, GenError> {
+        let mut index_contents = BString::default();
+        if self.plan.install {
+            index_contents.extend_from_slice(
+                b"file(GLOB _cmake_cxx_module_includes \"${CMAKE_CURRENT_LIST_DIR}/",
+            );
+            quoted_content(&mut index_contents, &self.stem);
+            index_contents.extend_from_slice(
+                br#"-*.cmake")
+foreach(_cmake_cxx_module_include IN LISTS _cmake_cxx_module_includes)
+  include("${_cmake_cxx_module_include}")
+endforeach()
+unset(_cmake_cxx_module_include)
+unset(_cmake_cxx_module_includes)
+"#,
+            );
+        }
+        for (config, contents) in config_files.into_values() {
+            let name = filename(&self.stem, label(config));
+            if !self.plan.install {
+                include(&mut index_contents, &name, multi_config);
+            }
+            let path = self.root.join(to_native(&name));
+            write_output(host, &path, &contents)?;
+            add_install(install, self.action, &self.directory, Some(config), &path);
+        }
+        let index_file = filename(&self.stem, b"");
+        let path = self.root.join(to_native(&index_file));
+        write_output(host, &path, &index_contents)?;
+        add_install(install, self.action, &self.directory, None, &path);
+
+        Ok(Lexical::new(&self.directory).append(&index_file))
+    }
+}
+
+fn module_export_members<'a>(model: &'a ProjectModel, plan: &ExportPlan) -> Vec<&'a Target> {
+    plan.targets
+        .iter()
+        .filter_map(|exported| {
+            let matches_name = |target: &Target| {
+                target.props.get(b"EXPORT_NAME").unwrap_or(&target.name) == &exported.name
+            };
+            if let Some(set) = model.exports.get(&plan.set) {
+                set.targets
+                    .iter()
+                    .filter_map(|&id| model.target(id))
+                    .find(|target| matches_name(target))
+            } else {
+                model
+                    .targets()
+                    .map(|(_, target)| target)
+                    .find(|target| !target.is_imported() && matches_name(target))
+            }
+        })
+        .collect()
 }
 
 fn module_sets<'a>(

@@ -1,5 +1,4 @@
-use rcmake_base::BString;
-use rcmake_eval::{BuiltinFn, CmdError, CmdFlags, Registry};
+use rcmake_eval::{BuiltinFn, CmdFlags, Registry};
 use rcmake_expr::ExpandedArg;
 
 mod cache;
@@ -32,8 +31,4 @@ pub(crate) fn register(registry: &mut Registry) {
 
 fn values(args: &[ExpandedArg]) -> Vec<&[u8]> {
     args.iter().map(|arg| arg.value.as_slice()).collect()
-}
-
-fn status(message: impl Into<BString>) -> CmdError {
-    CmdError::Status(message.into())
 }

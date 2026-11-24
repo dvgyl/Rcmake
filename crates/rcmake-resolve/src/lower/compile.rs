@@ -1,7 +1,7 @@
 //! Compile flags and compiler rule expansion.
 
 use indexmap::IndexSet;
-use rcmake_base::{BString, list, path_lex::Lexical, truth};
+use rcmake_base::{BString, list, path_lex::Lexical, shell::quote, truth};
 use rcmake_genex::ConfigId;
 use rcmake_model::{ProjectModel, Target};
 
@@ -9,7 +9,7 @@ use super::artifacts::is_darwin;
 use super::launcher;
 use super::pch::PchFlags;
 use super::policy_flags::Flags;
-use super::shell::{command, join_words, quote, rule_invocations};
+use super::shell::{command, join_words, rule_invocations};
 use super::standard::standard_flag;
 use super::{
     definition, expand_rule, join, object_path, target_property, without_trailing_slashes,

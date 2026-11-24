@@ -5,7 +5,7 @@ use rcmake_host::path;
 use rcmake_model::DirId;
 use rcmake_syntax::Argument;
 
-use super::{quoted, status};
+use super::quoted;
 use crate::dirs::{find_directory, normalized_path};
 
 const TOP_LEVEL_INCLUDES: &[u8] = b"_RCMAKE_IN_TOP_LEVEL_INCLUDES";
@@ -43,7 +43,7 @@ impl LanguageArgs<'_> {
     }
 
     fn required(&mut self, cx: &mut Cx<'_>, message: &str) -> Result<BString, CmdError> {
-        self.next(cx)?.ok_or_else(|| status(message))
+        self.next(cx)?.ok_or_else(|| CmdError::status(message))
     }
 
     fn finish(&mut self, cx: &mut Cx<'_>) -> Result<Vec<ExpandedArg>, CmdError> {
@@ -92,7 +92,7 @@ fn language_operation(cx: &mut Cx<'_>, args: &mut LanguageArgs<'_>) -> CmdResult
             let code = args.required(cx, "EXIT requires one argument")?;
             exit(cx, &code)
         }
-        _ => Err(status("called with unknown meta-operation")),
+        _ => Err(CmdError::status("called with unknown meta-operation")),
     }
 }
 
@@ -101,14 +101,14 @@ fn trace(cx: &mut Cx<'_>, args: &mut LanguageArgs<'_>) -> CmdResult {
     if truth::is_on(&mode) {
         let expand = if let Some(arg) = args.next(cx)? {
             if arg != b"EXPAND" {
-                return Err(status(quoted(
+                return Err(CmdError::status(quoted(
                     "TRACE ON given an invalid argument ",
                     &arg,
                     "",
                 )));
             }
             if args.next(cx)?.is_some() {
-                return Err(status("TRACE ON given too many arguments"));
+                return Err(CmdError::status("TRACE ON given too many arguments"));
             }
             true
         } else {
@@ -117,10 +117,12 @@ fn trace(cx: &mut Cx<'_>, args: &mut LanguageArgs<'_>) -> CmdResult {
         cx.push_trace(expand);
     } else {
         if args.next(cx)?.is_some() {
-            return Err(status("TRACE OFF given too many arguments"));
+            return Err(CmdError::status("TRACE OFF given too many arguments"));
         }
         if !cx.pop_trace() {
-            return Err(status("TRACE OFF request without a corresponding TRACE ON"));
+            return Err(CmdError::status(
+                "TRACE OFF request without a corresponding TRACE ON",
+            ));
         }
     }
     Ok(Flow::Normal)
@@ -133,7 +135,7 @@ fn call_name(
 ) -> Result<BString, CmdError> {
     let command = args.required(cx, "CALL missing command name")?;
     if args.expanded.len() != 0 {
-        return Err(status("CALL command's arguments must be literal"));
+        return Err(CmdError::status("CALL command's arguments must be literal"));
     }
     let lower = command.to_ascii_lowercase();
     if matches!(
@@ -154,14 +156,20 @@ fn call_name(
             | b"endblock"
     ) || (deferred && lower == b"return")
     {
-        return Err(status(quoted("invalid command specified: ", &command, "")));
+        return Err(CmdError::status(quoted(
+            "invalid command specified: ",
+            &command,
+            "",
+        )));
     }
     Ok(command)
 }
 
 fn eval(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
     let Some((code, args)) = args.split_first() else {
-        return Err(status("called with incorrect number of arguments"));
+        return Err(CmdError::status(
+            "called with incorrect number of arguments",
+        ));
     };
     if code.value != b"CODE" {
         let message = if args.iter().any(|arg| arg.value == b"CODE") {
@@ -169,7 +177,7 @@ fn eval(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
         } else {
             "called without CODE argument"
         };
-        return Err(status(message));
+        return Err(CmdError::status(message));
     }
     let mut code = BString::default();
     for (i, arg) in args.iter().enumerate() {
@@ -179,7 +187,7 @@ fn eval(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
             .saturating_add(usize::from(i > 0))
             > cx.limits().max_value_bytes
         {
-            return Err(status("EVAL CODE exceeds the value size limit."));
+            return Err(CmdError::status("EVAL CODE exceeds the value size limit."));
         }
         if i > 0 {
             code.push(b' ');
@@ -191,7 +199,7 @@ fn eval(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
 
 fn get_message_log_level(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
     let [var] = args else {
-        return Err(status(
+        return Err(CmdError::status(
             "sub-command GET_MESSAGE_LOG_LEVEL expects exactly one argument",
         ));
     };
@@ -216,7 +224,7 @@ fn set_dependency_provider(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
             .get(TOP_LEVEL_INCLUDES)
             .is_some_and(|value| value == b"ON")
     {
-        return Err(status(
+        return Err(CmdError::status(
             "Dependency providers can only be set as part of the first call to \
              project(). More specifically, cmake_language(SET_DEPENDENCY_PROVIDER) \
              can only be called while the first project() command processes files \
@@ -242,26 +250,34 @@ fn set_dependency_provider(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
                     methods.push(method);
                 }
             }
-            _ => return Err(status(quoted("Unrecognized keyword: \"", arg, "\""))),
+            _ => {
+                return Err(CmdError::status(quoted(
+                    "Unrecognized keyword: \"",
+                    arg,
+                    "\"",
+                )));
+            }
         }
     }
 
     if command.is_empty() {
         if !methods.is_empty() {
-            return Err(status(
+            return Err(CmdError::status(
                 "Must specify a non-empty command name when provider methods are given",
             ));
         }
     } else {
         if !cx.command_exists(command) {
-            return Err(status(quoted(
+            return Err(CmdError::status(quoted(
                 "Command \"",
                 command,
                 "\" is not a defined command",
             )));
         }
         if methods.is_empty() {
-            return Err(status("Must specify at least one provider method"));
+            return Err(CmdError::status(
+                "Must specify at least one provider method",
+            ));
         }
     }
 
@@ -272,7 +288,7 @@ fn set_dependency_provider(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
             b"FIND_PACKAGE" => find_package = true,
             b"FETCHCONTENT_MAKEAVAILABLE_SERIAL" => fetchcontent = true,
             _ => {
-                return Err(status(quoted(
+                return Err(CmdError::status(quoted(
                     "Unknown dependency provider method \"",
                     method,
                     "\"",
@@ -306,15 +322,15 @@ fn defer(cx: &mut Cx<'_>, args: &mut LanguageArgs<'_>) -> CmdResult {
         match op.as_slice() {
             b"DIRECTORY" => {
                 if directory.is_some() {
-                    return Err(status("DEFER given multiple DIRECTORY arguments"));
+                    return Err(CmdError::status("DEFER given multiple DIRECTORY arguments"));
                 }
                 let dir = args.required(cx, "DEFER DIRECTORY missing value")?;
                 if dir.is_empty() {
-                    return Err(status("DEFER DIRECTORY may not be empty"));
+                    return Err(CmdError::status("DEFER DIRECTORY may not be empty"));
                 }
                 directory = Some(find_directory(cx, &dir).ok_or_else(|| {
                     let full_path = path::from_native(&normalized_path(&cx.resolve_path(&dir)));
-                    status(quoted(
+                    CmdError::status(quoted(
                         "DEFER DIRECTORY:\n  ",
                         &full_path,
                         "\nis not known.  It may not have been processed yet.",
@@ -323,31 +339,31 @@ fn defer(cx: &mut Cx<'_>, args: &mut LanguageArgs<'_>) -> CmdResult {
             }
             b"ID" => {
                 if id.is_some() {
-                    return Err(status("DEFER given multiple ID arguments"));
+                    return Err(CmdError::status("DEFER given multiple ID arguments"));
                 }
                 let value = args.required(cx, "DEFER ID missing value")?;
                 if value.is_empty() {
-                    return Err(status("DEFER ID may not be empty"));
+                    return Err(CmdError::status("DEFER ID may not be empty"));
                 }
                 if starts_uppercase(&value) {
-                    return Err(status("DEFER ID may not start in A-Z."));
+                    return Err(CmdError::status("DEFER ID may not start in A-Z."));
                 }
                 id = Some(value);
             }
             b"ID_VAR" => {
                 if id_var.is_some() {
-                    return Err(status("DEFER given multiple ID_VAR arguments"));
+                    return Err(CmdError::status("DEFER given multiple ID_VAR arguments"));
                 }
                 let var = args.required(cx, "DEFER ID_VAR missing variable name")?;
                 if var.is_empty() {
-                    return Err(status("DEFER ID_VAR may not be empty"));
+                    return Err(CmdError::status("DEFER ID_VAR may not be empty"));
                 }
                 id_var = Some(var);
             }
             b"CALL" => return defer_call(cx, args, directory, id, id_var),
             b"GET_CALL_IDS" | b"GET_CALL" | b"CANCEL_CALL" => {
                 if id.is_some() || id_var.is_some() {
-                    return Err(status(quoted(
+                    return Err(CmdError::status(quoted(
                         "DEFER ",
                         &op,
                         " does not accept ID or ID_VAR.",
@@ -355,7 +371,13 @@ fn defer(cx: &mut Cx<'_>, args: &mut LanguageArgs<'_>) -> CmdResult {
                 }
                 return defer_queue_operation(cx, &op, args, directory);
             }
-            _ => return Err(status(quoted("DEFER unknown option:\n  ", &op, ""))),
+            _ => {
+                return Err(CmdError::status(quoted(
+                    "DEFER unknown option:\n  ",
+                    &op,
+                    "",
+                )));
+            }
         }
         op = args.required(cx, "DEFER must be followed by a CALL argument")?;
     }
@@ -405,7 +427,7 @@ fn defer_queue_operation(
     if op == b"CANCEL_CALL" {
         for id in values {
             if starts_uppercase(id) {
-                return Err(status(quoted(
+                return Err(CmdError::status(quoted(
                     "DEFER CANCEL_CALL unknown argument:\n  ",
                     id,
                     "",
@@ -424,7 +446,7 @@ fn defer_queue_operation(
 
     let (var, result, message) = if op == b"GET_CALL_IDS" {
         let [var] = values.as_slice() else {
-            return Err(status(if values.is_empty() {
+            return Err(CmdError::status(if values.is_empty() {
                 "DEFER GET_CALL_IDS missing output variable"
             } else {
                 "DEFER GET_CALL_IDS given too many arguments"
@@ -437,16 +459,16 @@ fn defer_queue_operation(
         )
     } else {
         let (id, var) = match values.as_slice() {
-            [] => return Err(status("DEFER GET_CALL missing id")),
-            [_] => return Err(status("DEFER GET_CALL missing output variable")),
+            [] => return Err(CmdError::status("DEFER GET_CALL missing id")),
+            [_] => return Err(CmdError::status("DEFER GET_CALL missing output variable")),
             [id, var] => (*id, *var),
-            _ => return Err(status("DEFER GET_CALL given too many arguments")),
+            _ => return Err(CmdError::status("DEFER GET_CALL given too many arguments")),
         };
         if id.is_empty() {
-            return Err(status("DEFER GET_CALL id may not be empty"));
+            return Err(CmdError::status("DEFER GET_CALL id may not be empty"));
         }
         if starts_uppercase(id) {
-            return Err(status(quoted(
+            return Err(CmdError::status(quoted(
                 "DEFER GET_CALL unknown argument:\n ",
                 id,
                 "",
@@ -470,12 +492,12 @@ fn defer_directory_error(cx: &mut Cx<'_>, directory: Option<DirId>, message: &st
         Some(id) => cx.project().dir(id).binary_dir.clone(),
         None => path::from_native(&cx.current_binary_dir()),
     };
-    status(quoted(message, &binary, "\nat this time."))
+    CmdError::status(quoted(message, &binary, "\nat this time."))
 }
 
 fn exit(cx: &mut Cx<'_>, arg: &[u8]) -> CmdResult {
     if cx.mode() != RunMode::Script {
-        return Err(status("EXIT can be used only in SCRIPT mode"));
+        return Err(CmdError::status("EXIT can be used only in SCRIPT mode"));
     }
     let code = core::str::from_utf8(arg)
         .ok()
@@ -486,7 +508,7 @@ fn exit(cx: &mut Cx<'_>, arg: &[u8]) -> CmdResult {
                 .ok()
         })
         .ok_or_else(|| {
-            status(quoted(
+            CmdError::status(quoted(
                 "EXIT requires one integral argument, got \"",
                 arg,
                 "\"",

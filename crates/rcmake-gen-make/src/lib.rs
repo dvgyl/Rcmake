@@ -11,7 +11,7 @@ pub use build::build_commands;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::Path;
 
-use rcmake_base::{BString, ByteVec};
+use rcmake_base::{BString, ByteVec, shell::quote_always};
 use rcmake_gen_common::{GenError, write_if_changed};
 use rcmake_host::{Host, WriteMode, path};
 use rcmake_model::ProjectModel;
@@ -143,6 +143,66 @@ fn build_path(value: &[u8], build_dir: &Path) -> BString {
     rcmake_host::path::from_native(&path)
 }
 
+fn plan_step<'a>(
+    action: &'a BuildStep,
+    step_index: usize,
+    result: &GenerationResult,
+    build_dir: &Path,
+) -> Result<Step<'a>, GenError> {
+    let make_path = |value: &BString| build_path(value, build_dir);
+    let step = match action {
+        BuildStep::Compile {
+            object,
+            source,
+            depfile,
+            ..
+        } => Step {
+            action,
+            goal: make_path(object),
+            outputs: vec![make_path(object)],
+            inputs: std::iter::once(source)
+                .chain(result.compile_inputs.get(object).into_iter().flatten())
+                .map(make_path)
+                .collect(),
+            depfile: depfile.as_ref().map(make_path),
+            always: false,
+            progress: None,
+        },
+        BuildStep::Link { step, inputs, .. } => Step {
+            action,
+            goal: make_path(&step.output),
+            outputs: vec![make_path(&step.output)],
+            inputs: inputs.iter().map(make_path).collect(),
+            depfile: None,
+            always: false,
+            progress: None,
+        },
+        BuildStep::Custom(custom) => Step {
+            action,
+            goal: custom.outputs.first().map_or_else(
+                || format!("CMakeFiles/rcmake-step-{step_index}").into(),
+                make_path,
+            ),
+            outputs: custom
+                .outputs
+                .iter()
+                .chain(&custom.byproducts)
+                .map(make_path)
+                .collect(),
+            inputs: custom.depends.clone(),
+            depfile: custom.depfile.as_ref().map(make_path),
+            always: custom.outputs.is_empty(),
+            progress: None,
+        },
+        BuildStep::Scan { .. } | BuildStep::Collate { .. } => {
+            return Err(GenError::Unimplemented(
+                "C++ module build steps for Unix Makefiles",
+            ));
+        }
+    };
+    Ok(step)
+}
+
 fn plan_targets<'a>(
     result: &GenerationResult,
     graph: &'a BuildGraph,
@@ -200,60 +260,11 @@ fn plan_targets<'a>(
                 .steps
                 .get(step_index)
                 .ok_or_else(|| invalid_graph("invalid build step index"))?;
-            let make_path = |value: &BString| build_path(value, build_dir);
-            let mut step = match action {
-                BuildStep::Compile {
-                    object,
-                    source,
-                    depfile,
-                    ..
-                } => Step {
-                    action,
-                    goal: make_path(object),
-                    outputs: vec![make_path(object)],
-                    inputs: std::iter::once(source)
-                        .chain(result.compile_inputs.get(object).into_iter().flatten())
-                        .map(make_path)
-                        .collect(),
-                    depfile: depfile.as_ref().map(make_path),
-                    always: false,
-                    progress: None,
-                },
-                BuildStep::Link { step, inputs, .. } => Step {
-                    action,
-                    goal: make_path(&step.output),
-                    outputs: vec![make_path(&step.output)],
-                    inputs: inputs.iter().map(make_path).collect(),
-                    depfile: None,
-                    always: false,
-                    progress: None,
-                },
-                BuildStep::Custom(custom) => Step {
-                    action,
-                    goal: custom.outputs.first().map_or_else(
-                        || format!("CMakeFiles/rcmake-step-{step_index}").into(),
-                        make_path,
-                    ),
-                    outputs: custom
-                        .outputs
-                        .iter()
-                        .chain(&custom.byproducts)
-                        .map(make_path)
-                        .collect(),
-                    inputs: custom.depends.clone(),
-                    depfile: custom.depfile.as_ref().map(make_path),
-                    always: custom.outputs.is_empty(),
-                    progress: None,
-                },
-                BuildStep::Scan { .. } | BuildStep::Collate { .. } => {
-                    return Err(GenError::Unimplemented(
-                        "C++ module build steps for Unix Makefiles",
-                    ));
-                }
-            };
+            let mut step = plan_step(action, step_index, result, build_dir)?;
             if matches!(action, BuildStep::Link { .. })
                 && let Some(artifacts) = artifacts.get(target.name)
             {
+                let make_path = |value: &BString| build_path(value, build_dir);
                 step.outputs.extend(
                     [&artifacts.linker_file, &artifacts.soname_file]
                         .into_iter()
@@ -395,7 +406,7 @@ fn top_level(
     // Separate entry points can build the same target. Submakes still run in parallel.
     out.push_str(b".NOTPARALLEL:\nCMAKE_COMMAND ?= ");
     let mut cmake_value = Vec::new();
-    make_recipe_text(&mut cmake_value, &shell_quote(cmake))?;
+    make_recipe_text(&mut cmake_value, &quote_always(cmake))?;
     for byte in cmake_value {
         if byte == b'#' {
             out.push(b'\\');
@@ -434,7 +445,7 @@ fn top_level(
             .then(|| path::from_native(file.parent().unwrap_or(Path::new("."))))
     }) {
         configure.push_str(b" -S ");
-        make_recipe_text(&mut configure, &shell_quote(&source_dir))?;
+        make_recipe_text(&mut configure, &quote_always(&source_dir))?;
     }
     phony(&mut out, b"rebuild_cache", []);
     out.push_str(b"\t$(SILENT)");
@@ -472,7 +483,7 @@ fn top_level(
         .chain(prep.keys().map(|name| name.as_slice()))
     {
         out.push_str(b"\t@printf '%s\\n' ");
-        make_recipe_text(&mut out, &shell_quote(&[b"... ", name].concat()))?;
+        make_recipe_text(&mut out, &quote_always(&[b"... ", name].concat()))?;
         out.push(b'\n');
     }
     for (index, target) in targets.iter().enumerate() {
@@ -558,7 +569,7 @@ fn build_file(
     phony(&mut out, &target.clean_goal, []);
     for product in target.products.iter().collect::<BTreeSet<_>>() {
         out.push_str(b"\t$(SILENT)rm -f -- ");
-        make_recipe_text(&mut out, &shell_quote(product))?;
+        make_recipe_text(&mut out, &quote_always(product))?;
         out.push(b'\n');
     }
     phony(&mut out, FORCE, []);
@@ -610,7 +621,7 @@ fn write_step(
         commands.push(
             [
                 b"mkdir -p -- ".as_slice(),
-                &shell_quote(&path::from_native(&directory)),
+                &quote_always(&path::from_native(&directory)),
             ]
             .concat(),
         );
@@ -670,7 +681,7 @@ fn write_step(
         rule(out, output, [step.goal.as_slice()]);
         // A recipe makes Make read the new file timestamp after the producer runs.
         out.push_str(b"\t$(SILENT)test -e ");
-        let output = shell_quote(output);
+        let output = quote_always(output);
         make_recipe_text(out, &output)?;
         out.push_str(b" || test -L ");
         make_recipe_text(out, &output)?;
@@ -692,9 +703,9 @@ fn shell_invocation(invocation: &Invocation) -> Option<Vec<u8>> {
     if let Some(directory) = &invocation.working_dir {
         command.push_str(b"CDPATH= cd ");
         if directory.starts_with(b"-") {
-            command.push_str(shell_quote(&[b"./", directory.as_slice()].concat()));
+            command.push_str(quote_always(&[b"./", directory.as_slice()].concat()));
         } else {
-            command.push_str(shell_quote(directory));
+            command.push_str(quote_always(directory));
         }
         command.push_str(b" && ");
     }
@@ -703,26 +714,13 @@ fn shell_invocation(invocation: &Invocation) -> Option<Vec<u8>> {
             if index != 0 {
                 command.push(b' ');
             }
-            command.push_str(shell_quote(arg));
+            command.push_str(quote_always(arg));
         }
     } else {
         command.push_str(&invocation.shell);
     }
     command.push(b')');
     Some(command)
-}
-
-fn shell_quote(value: &[u8]) -> Vec<u8> {
-    let mut out = vec![b'\''];
-    for &byte in value {
-        if byte == b'\'' {
-            out.push_str(b"'\\''");
-        } else {
-            out.push(byte);
-        }
-    }
-    out.push(b'\'');
-    out
 }
 
 fn make_recipe_text(out: &mut Vec<u8>, text: &[u8]) -> Result<(), GenError> {
@@ -793,7 +791,7 @@ fn recursive_make(out: &mut Vec<u8>, file: &[u8], goal: &[u8]) {
         if index != 0 {
             out.push(b' ');
         }
-        for byte in shell_quote(part) {
+        for &byte in quote_always(part).iter() {
             if byte == b'$' {
                 out.push(b'$');
             }

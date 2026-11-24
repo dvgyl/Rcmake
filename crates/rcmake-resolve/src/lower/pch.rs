@@ -1,10 +1,10 @@
 use indexmap::{IndexMap, IndexSet};
-use rcmake_base::{BString, list, truth};
+use rcmake_base::{BString, list, shell::quote, truth};
 use rcmake_genex::{ConfigId, EvalContext};
 use rcmake_host::{Host, ReadRange, WriteMode, path::to_native};
 use rcmake_model::{DirId, ProjectModel, Target, TargetId, UsageField};
 
-use super::{definition, expand_rule, join, object_dir, policy_flags::Flags, shell::quote};
+use super::{definition, expand_rule, join, object_dir, policy_flags::Flags};
 use crate::{CompileUnit, ResolveError, ResolvedTarget, sources, usage::UsageResolver};
 
 const REUSE: &[u8] = b"PRECOMPILE_HEADERS_REUSE_FROM";

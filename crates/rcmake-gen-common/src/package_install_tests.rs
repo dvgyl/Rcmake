@@ -61,14 +61,11 @@ fn add_export(model: &mut ProjectModel, kind: ExportKind) {
 }
 
 fn install_property(model: &mut ProjectModel, path: &[u8], property: &[u8], value: &[u8]) {
-    let key = [
-        b"\0INSTALL".as_slice(),
-        &path.len().to_be_bytes(),
-        path,
-        property,
-    ]
-    .concat();
-    model.global.props.set(key.into(), value.into());
+    model
+        .install_props
+        .entry(path.into())
+        .or_default()
+        .set(property.into(), value.into());
 }
 
 fn fixture(source: &Path, build: &Path, configs: &[&str]) -> (ProjectModel, GenerationResult) {
@@ -422,7 +419,7 @@ fn add_bmi_fixture(
 
 #[cfg(unix)]
 #[test]
-fn cmake_451_matches_wave_three_outputs() {
+fn cmake_451_matches_package_install_outputs() {
     use std::time::Duration;
 
     use rcmake_host::{CommandSpec, Input, NativeHost, Output, ProcessResult, RunRequest};
@@ -432,7 +429,10 @@ fn cmake_451_matches_wave_three_outputs() {
     let Some(oracle) = host.env_get(b"RCMAKE_TEST_REFERENCE_CMAKE") else {
         return;
     };
-    let root = PathBuf::from(format!("/tmp/rcmake-wave3-oracle-{}", host.system().pid));
+    let root = PathBuf::from(format!(
+        "/tmp/rcmake-package-install-oracle-{}",
+        host.system().pid
+    ));
     struct Cleanup<'a>(&'a dyn Host, &'a Path);
     impl Drop for Cleanup<'_> {
         fn drop(&mut self) {
@@ -519,7 +519,6 @@ fn cmake_451_matches_wave_three_outputs() {
         ]);
         let (mut model, mut result) = fixture(&source, &build, configs);
         add_bmi_fixture(&mut model, &mut result, &build, &host);
-        // Keep the oracle artifacts intact while staging the Rcmake install files.
         let oracle_root = export_stage(&build, "Export", b"lib/cps/Sdk");
         let mut expected = Vec::new();
         for path in [oracle_root.join("Sdk.cps"), build.join("cps/Sdk/Sdk.cps")] {

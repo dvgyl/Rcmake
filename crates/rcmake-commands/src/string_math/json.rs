@@ -1,16 +1,22 @@
 use rcmake_base::{BString, ByteSlice};
-use rcmake_eval::{CmdResult, Cx};
+use rcmake_eval::{CmdError, CmdResult, Cx};
 use rcmake_json::{JsonError, ReadOptions, Value, parse, write_compact, write_styled};
 
-use super::{append, check_size, set, status, trim_start};
+use super::{append, check_size, set, trim_start};
 
 pub(super) fn command(cx: &mut Cx<'_>, args: &[&[u8]]) -> CmdResult {
     let [out, args @ ..] = args else {
-        return Err(status("sub-command JSON missing out-var argument."));
+        return Err(CmdError::status(
+            "sub-command JSON missing out-var argument.",
+        ));
     };
     let (error_out, args) = match args {
         [b"ERROR_VARIABLE", error, rest @ ..] => (Some(*error), rest),
-        [b"ERROR_VARIABLE"] => return Err(status("sub-command JSON missing error-var argument.")),
+        [b"ERROR_VARIABLE"] => {
+            return Err(CmdError::status(
+                "sub-command JSON missing error-var argument.",
+            ));
+        }
         _ => (None, args),
     };
     match evaluate(cx, args) {
@@ -36,7 +42,10 @@ pub(super) fn command(cx: &mut Cx<'_>, args: &[&[u8]]) -> CmdResult {
             if let Some(error_out) = error_out {
                 set(cx, error_out, error.message)
             } else {
-                Err(status(format!("sub-command JSON {}.", error.message)))
+                Err(CmdError::status(format!(
+                    "sub-command JSON {}.",
+                    error.message
+                )))
             }
         }
     }

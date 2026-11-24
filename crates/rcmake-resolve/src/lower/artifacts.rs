@@ -5,7 +5,11 @@ use rcmake_genex::ConfigId;
 use rcmake_model::{DirId, GeneratorKind, ProjectModel, Target, TargetKind};
 
 use super::{definition, join, target_property};
-use crate::ArtifactSet;
+use crate::{
+    ArtifactSet,
+    ide::{self, IdeFlavor},
+    unity::UnityFile,
+};
 
 pub(crate) fn is_darwin(model: &ProjectModel, dir: DirId) -> bool {
     if let Some(system) = definition(model, dir, b"CMAKE_SYSTEM_NAME") {
@@ -307,6 +311,27 @@ fn source_extension(
         "Fortran" => matches!(extension, b"f" | b"F" | b"f90" | b"F90"),
         "CUDA" => extension == b"cu",
         _ => false,
+    }
+}
+
+pub(crate) fn compile_object_path(
+    model: &ProjectModel,
+    target: &Target,
+    config: &ConfigId,
+    source: &[u8],
+    unity_file: Option<&UnityFile>,
+    flavor: Option<IdeFlavor>,
+) -> BString {
+    if let Some(flavor) = flavor {
+        build_relative(
+            model,
+            &ide::object_path(model, target, config, source, flavor),
+        )
+    } else {
+        unity_file.map_or_else(
+            || object_path(model, target, config, source),
+            |file| file.object_path(model, target, config, source),
+        )
     }
 }
 

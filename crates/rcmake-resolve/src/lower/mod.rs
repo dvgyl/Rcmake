@@ -22,7 +22,7 @@ mod tests;
 use rcmake_base::{BString, path_lex::Lexical};
 use rcmake_model::{DirId, ProjectModel, Target};
 
-pub(crate) use artifacts::{build_relative, is_darwin};
+pub(crate) use artifacts::{build_relative, compile_object_path, is_darwin};
 pub use artifacts::{compute_artifacts, linker_language, object_path, source_language};
 pub(crate) use artifacts::{object_dir, short_object_paths};
 pub(crate) use compile::language_flags;
@@ -40,27 +40,17 @@ pub(crate) use standard::required_standard;
 
 pub(crate) fn definition<'a>(
     model: &'a ProjectModel,
-    mut dir: DirId,
+    dir: DirId,
     key: &[u8],
 ) -> Option<&'a BString> {
     if let Some(value) = model.definition(dir, key) {
         return Some(value);
     }
     // Models without variable snapshots can supply definitions as properties.
-    loop {
-        let directory = model.dir(dir);
-        if let Some(value) = directory.props.get(key) {
-            return Some(value);
-        }
-        let Some(parent) = directory
-            .parent
-            .filter(|parent| parent.index() < dir.index())
-        else {
-            break;
-        };
-        dir = parent;
-    }
-    model.global.props.get(key)
+    model
+        .ancestors(dir)
+        .find_map(|ancestor| model.dir(ancestor).props.get(key))
+        .or_else(|| model.global.props.get(key))
 }
 
 fn target_property<'a>(

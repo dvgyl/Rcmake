@@ -5,7 +5,7 @@ use rcmake_base::list_ops::{SortCompare, SortOptions, sort_items};
 use rcmake_eval::{CmdError, Cx};
 use rcmake_expr::ExpandedArg;
 
-use super::{bytes, callbacks::Callback, cat, status};
+use super::{bytes, callbacks::Callback, cat};
 
 #[derive(Default)]
 pub(super) struct Sort<'a> {
@@ -20,14 +20,14 @@ impl<'a> Sort<'a> {
         let mut args = args.iter().map(bytes);
         while let Some(option) = args.next() {
             if !matches!(option, b"COMPARE" | b"COMPARATOR" | b"CASE" | b"ORDER") {
-                return Err(status(cat(&[
+                return Err(CmdError::status(cat(&[
                     b"sub-command SORT option \"",
                     option,
                     b"\" is unknown.",
                 ])));
             }
             if !seen.insert(option) {
-                return Err(status(cat(&[
+                return Err(CmdError::status(cat(&[
                     b"sub-command SORT option \"",
                     option,
                     b"\" has been specified multiple times.",
@@ -43,7 +43,7 @@ impl<'a> Sort<'a> {
                 _ => None,
             };
             if let Some(other) = incompatible {
-                return Err(status(cat(&[
+                return Err(CmdError::status(cat(&[
                     b"sub-command SORT option \"",
                     option,
                     b"\" is incompatible with \"",
@@ -52,7 +52,7 @@ impl<'a> Sort<'a> {
                 ])));
             }
             let value = args.next().ok_or_else(|| {
-                status(cat(&[
+                CmdError::status(cat(&[
                     b"sub-command SORT missing argument for option \"",
                     option,
                     b"\".",
@@ -70,7 +70,7 @@ impl<'a> Sort<'a> {
                 (b"ORDER", b"ASCENDING") => sort.options.descending = false,
                 (b"ORDER", b"DESCENDING") => sort.options.descending = true,
                 _ => {
-                    return Err(status(cat(&[
+                    return Err(CmdError::status(cat(&[
                         b"sub-command SORT value \"",
                         value,
                         b"\" for option \"",
@@ -143,7 +143,7 @@ impl<'a> Sort<'a> {
         };
         let less = callback.test(cx, [a, b])?;
         if less && callback.test(cx, [b, a])? {
-            return Err(status(
+            return Err(CmdError::status(
                 "sub-command SORT, COMPARATOR: function does not induce a strict weak ordering.  The comparator returned TRUE for both (a, b) and (b, a).",
             ));
         }

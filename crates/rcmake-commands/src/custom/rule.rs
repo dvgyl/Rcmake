@@ -1,14 +1,14 @@
 use rcmake_base::BString;
-use rcmake_eval::{CmdResult, Cx, Flow};
+use rcmake_eval::{CmdError, CmdResult, Cx, Flow};
 use rcmake_expr::ExpandedArg;
 use rcmake_json::{Value, write_compact};
 use rcmake_model::ProjectModel;
 
-use super::status;
-
 pub(super) fn add(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
     let Some((name, args)) = args.split_first() else {
-        return Err(status("called with incorrect number of arguments."));
+        return Err(CmdError::status(
+            "called with incorrect number of arguments.",
+        ));
     };
     let name = &name.value;
     if name.is_empty()
@@ -16,13 +16,15 @@ pub(super) fn add(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
             .iter()
             .all(|byte| byte.is_ascii_alphanumeric() || b"_.+-".contains(byte))
     {
-        return Err(status(format!("invalid name for RULE: {name}.")));
+        return Err(CmdError::status(format!("invalid name for RULE: {name}.")));
     }
     if name.iter().any(u8::is_ascii_uppercase)
         && !name.iter().any(u8::is_ascii_lowercase)
         && !name.iter().any(u8::is_ascii_digit)
     {
-        return Err(status("names in all uppercase are reserved for CMake."));
+        return Err(CmdError::status(
+            "names in all uppercase are reserved for CMake.",
+        ));
     }
 
     let mut has_output = false;
@@ -42,7 +44,7 @@ pub(super) fn add(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
                 if let Some(function) = args_iter.next()
                     && !cx.command_exists(&function.value)
                 {
-                    return Err(status(format!(
+                    return Err(CmdError::status(format!(
                         "command specified for \"{}\" does not exist: {}.",
                         arg.value, function.value
                     )));
@@ -52,7 +54,7 @@ pub(super) fn add(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
         }
     }
     if base.is_none() && !(has_output && has_command) {
-        return Err(status(format!(
+        return Err(CmdError::status(format!(
             "cannot create RULE \"{name}\" because the mandatory options \"COMMAND\" or \"OUTPUT\" are missing."
         )));
     }
@@ -61,14 +63,14 @@ pub(super) fn add(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
     let project = cx.project();
     let key = rule_key(name);
     if project.dir(dir).props.get(&key).is_some() || project.global.props.get(&key).is_some() {
-        return Err(status(format!(
+        return Err(CmdError::status(format!(
             "cannot create RULE \"{name}\" because another RULE with the same name already exists."
         )));
     }
     if let Some(base) = base
         && !rule_visible(project, dir, base)
     {
-        return Err(status(format!(
+        return Err(CmdError::status(format!(
             "cannot create RULE \"{name}\" because the RULE \"{base}\" does not exist or is not accessible."
         )));
     }
@@ -108,19 +110,12 @@ fn rule_key(name: &BString) -> BString {
     [b"_RCMAKE_CUSTOM_RULE_", name.as_slice()].concat().into()
 }
 
-fn rule_visible(project: &ProjectModel, mut dir: rcmake_model::DirId, name: &BString) -> bool {
+fn rule_visible(project: &ProjectModel, dir: rcmake_model::DirId, name: &BString) -> bool {
     let key = rule_key(name);
     if project.global.props.get(&key).is_some() {
         return true;
     }
-    loop {
-        let directory = project.dir(dir);
-        if directory.props.get(&key).is_some() {
-            return true;
-        }
-        let Some(parent) = directory.parent else {
-            return false;
-        };
-        dir = parent;
-    }
+    project
+        .ancestors(dir)
+        .any(|id| project.dir(id).props.get(&key).is_some())
 }

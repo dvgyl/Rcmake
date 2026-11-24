@@ -1,7 +1,7 @@
 //! Lower C++ named module scans and collation.
 
 use indexmap::{IndexMap, IndexSet};
-use rcmake_base::{BString, path_lex::Lexical};
+use rcmake_base::{BString, path_lex::Lexical, shell::quote};
 use rcmake_cxxmodules::{
     BmiInstallInfo, ModmapFormat, ModuleSourceInfo, ScannedSourceInfo, TargetDependInfo,
 };
@@ -9,7 +9,7 @@ use rcmake_model::{DirId, GeneratorKind, ProjectModel, Target};
 
 use super::compile::compile_arguments;
 use super::launcher;
-use super::shell::{command, join_words, quote, rule_invocations};
+use super::shell::{command, join_words, rule_invocations};
 use super::{definition, expand_rule};
 use crate::{BuildStep, CompileUnit, ResolveError, ResolvedTarget, ScanResponse};
 
@@ -48,7 +48,7 @@ pub(super) fn module_map_flag(model: &ProjectModel, target: &Target, path: &[u8]
 }
 
 pub(super) fn is_std_bmi(model: &ProjectModel, target: &Target) -> bool {
-    target.name == crate::STD_MODULE_TARGET
+    target.name == crate::cxx_modules::STD_MODULE_TARGET
         && definition(model, target.dir, b"CMAKE_CXX_COMPILER_ID")
             .is_none_or(|id| id != b"MSVC".as_slice())
 }

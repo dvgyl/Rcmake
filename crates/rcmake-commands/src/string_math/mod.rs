@@ -23,7 +23,9 @@ pub(crate) fn register(registry: &mut Registry) {
 fn string(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
     let args: Vec<&[u8]> = args.iter().map(|arg| arg.value.as_slice()).collect();
     let Some((&mode, args)) = args.split_first() else {
-        return Err(status("must be called with at least one argument."));
+        return Err(CmdError::status(
+            "must be called with at least one argument.",
+        ));
     };
     match mode {
         b"FIND" => find(cx, args),
@@ -44,22 +46,18 @@ fn string(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
         _ => {
             let mode_name = mode.to_str_lossy();
             let Some(algo) = HashAlgo::parse(mode) else {
-                return Err(status(format!(
+                return Err(CmdError::status(format!(
                     "does not recognize sub-command {mode_name}"
                 )));
             };
             let [out, input] = args else {
-                return Err(status(format!(
+                return Err(CmdError::status(format!(
                     "{mode_name} requires an output variable and an input string"
                 )));
             };
             set(cx, out, algo.hex_digest(input))
         }
     }
-}
-
-fn status(message: impl Into<BString>) -> CmdError {
-    CmdError::Status(message.into())
 }
 
 fn set(cx: &mut Cx<'_>, out: &[u8], value: impl Into<BString>) -> CmdResult {
@@ -71,7 +69,7 @@ fn set(cx: &mut Cx<'_>, out: &[u8], value: impl Into<BString>) -> CmdResult {
 
 fn check_size(cx: &Cx<'_>, size: usize) -> Result<(), CmdError> {
     if size > cx.limits().max_value_bytes {
-        return Err(status("result exceeds the value size limit."));
+        return Err(CmdError::status("result exceeds the value size limit."));
     }
     Ok(())
 }
@@ -92,13 +90,19 @@ fn concat(cx: &Cx<'_>, args: &[&[u8]]) -> Result<Vec<u8>, CmdError> {
 
 fn find(cx: &mut Cx<'_>, args: &[&[u8]]) -> CmdResult {
     let [input, needle, out, rest @ ..] = args else {
-        return Err(status("sub-command FIND requires 3 or 4 parameters."));
+        return Err(CmdError::status(
+            "sub-command FIND requires 3 or 4 parameters.",
+        ));
     };
     let offset = match rest {
         [] => input.find(needle),
         [b"REVERSE"] => input.rfind(needle),
-        [_] => return Err(status("sub-command FIND: unknown last parameter")),
-        _ => return Err(status("sub-command FIND requires 3 or 4 parameters.")),
+        [_] => return Err(CmdError::status("sub-command FIND: unknown last parameter")),
+        _ => {
+            return Err(CmdError::status(
+                "sub-command FIND requires 3 or 4 parameters.",
+            ));
+        }
     };
     set(
         cx,
@@ -109,12 +113,12 @@ fn find(cx: &mut Cx<'_>, args: &[&[u8]]) -> CmdResult {
 
 fn replace(cx: &mut Cx<'_>, args: &[&[u8]]) -> CmdResult {
     let [needle, replacement, out, inputs @ ..] = args else {
-        return Err(status(
+        return Err(CmdError::status(
             "sub-command REPLACE requires at least four arguments.",
         ));
     };
     if inputs.is_empty() {
-        return Err(status(
+        return Err(CmdError::status(
             "sub-command REPLACE requires at least four arguments.",
         ));
     }
@@ -137,7 +141,9 @@ fn replace(cx: &mut Cx<'_>, args: &[&[u8]]) -> CmdResult {
 fn join(cx: &mut Cx<'_>, mode: &[u8], args: &[&[u8]]) -> CmdResult {
     if mode == b"JOIN" {
         let [glue, out, inputs @ ..] = args else {
-            return Err(status("sub-command JOIN requires at least two arguments."));
+            return Err(CmdError::status(
+                "sub-command JOIN requires at least two arguments.",
+            ));
         };
         let mut result = Vec::new();
         for (index, input) in inputs.iter().enumerate() {
@@ -149,7 +155,7 @@ fn join(cx: &mut Cx<'_>, mode: &[u8], args: &[&[u8]]) -> CmdResult {
         return set(cx, out, result);
     }
     let [out, inputs @ ..] = args else {
-        return Err(status(format!(
+        return Err(CmdError::status(format!(
             "sub-command {} requires at least one argument.",
             mode.to_str_lossy()
         )));
@@ -171,7 +177,7 @@ fn join(cx: &mut Cx<'_>, mode: &[u8], args: &[&[u8]]) -> CmdResult {
 fn transform(cx: &mut Cx<'_>, mode: &[u8], args: &[&[u8]]) -> CmdResult {
     if matches!(mode, b"TOLOWER" | b"TOUPPER") {
         let [input, out, ..] = args else {
-            return Err(status(if args.is_empty() {
+            return Err(CmdError::status(if args.is_empty() {
                 "no input string specified"
             } else {
                 "no output variable specified"
@@ -189,7 +195,7 @@ fn transform(cx: &mut Cx<'_>, mode: &[u8], args: &[&[u8]]) -> CmdResult {
     }
 
     let [input, out] = args else {
-        return Err(status(if mode == b"HEX" {
+        return Err(CmdError::status(if mode == b"HEX" {
             "Incorrect number of arguments".to_owned()
         } else {
             format!(
@@ -212,7 +218,7 @@ fn transform(cx: &mut Cx<'_>, mode: &[u8], args: &[&[u8]]) -> CmdResult {
             check_size(cx, input.len().saturating_mul(2))?;
             set(cx, out, hex(input))
         }
-        _ => Err(status("invalid string transformation.")),
+        _ => Err(CmdError::status("invalid string transformation.")),
     }
 }
 
@@ -338,12 +344,14 @@ fn decimal_prefix(bytes: &[u8]) -> i64 {
 
 fn substring(cx: &mut Cx<'_>, args: &[&[u8]]) -> CmdResult {
     let [input, begin, length, out] = args else {
-        return Err(status("sub-command SUBSTRING requires four arguments."));
+        return Err(CmdError::status(
+            "sub-command SUBSTRING requires four arguments.",
+        ));
     };
     let begin = decimal_prefix(begin) as i32;
     let length = decimal_prefix(length) as i32;
     let invalid_begin = || {
-        status(format!(
+        CmdError::status(format!(
             "begin index: {begin} is out of range 0 - {}",
             input.len()
         ))
@@ -351,7 +359,7 @@ fn substring(cx: &mut Cx<'_>, args: &[&[u8]]) -> CmdResult {
     let start = usize::try_from(begin).map_err(|_| invalid_begin())?;
     let suffix = input.get(start..).ok_or_else(invalid_begin)?;
     if length < -1 {
-        return Err(status(format!(
+        return Err(CmdError::status(format!(
             "end index: {length} should be -1 or greater"
         )));
     }
@@ -383,7 +391,7 @@ fn repeat(cx: &mut Cx<'_>, args: &[&[u8]]) -> CmdResult {
 
 fn compare(cx: &mut Cx<'_>, args: &[&[u8]]) -> CmdResult {
     let [mode, a, b, out, ..] = args else {
-        return Err(status(
+        return Err(CmdError::status(
             "sub-command COMPARE requires at least four arguments.",
         ));
     };
@@ -395,7 +403,7 @@ fn compare(cx: &mut Cx<'_>, args: &[&[u8]]) -> CmdResult {
         b"LESS_EQUAL" => a <= b,
         b"GREATER_EQUAL" => a >= b,
         _ => {
-            return Err(status(format!(
+            return Err(CmdError::status(format!(
                 "sub-command COMPARE does not recognize mode {}",
                 mode.to_str_lossy()
             )));

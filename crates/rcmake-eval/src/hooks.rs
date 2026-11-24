@@ -13,7 +13,7 @@ use rcmake_syntax::{ArgKind, Argument, CommandInvocation};
 
 use crate::Interp;
 use crate::code::Code;
-use crate::exec::cat;
+use crate::util::cat;
 
 /// Line number that CMake gives to the synthetic command of a variable watch callback
 /// (`std::numeric_limits<long>::max()`). [`display_line`] prints it as CMake does.

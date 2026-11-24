@@ -5,7 +5,7 @@ use rcmake_diag::{DiagCategory, Effect, MessageKind, PolicyId, PolicyStatus};
 use rcmake_eval::{CmdError, CmdResult, Cx, Flow};
 use rcmake_expr::ExpandedArg;
 
-use super::{quoted, status, unsigned, values};
+use super::{quoted, unsigned, values};
 
 enum Keyword {
     Option(bool),
@@ -49,7 +49,11 @@ pub(super) fn parse(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
             let input = tail.iter().flat_map(|arg| split(arg)).collect();
             (*prefix, [*options, *one, *multi], input, false)
         }
-        _ => return Err(status("must be called with at least 4 arguments.")),
+        _ => {
+            return Err(CmdError::status(
+                "must be called with at least 4 arguments.",
+            ));
+        }
     };
 
     let mut keywords = BTreeMap::new();
@@ -190,7 +194,9 @@ fn caller_args(cx: &mut Cx<'_>, index: Option<u32>) -> Result<Vec<BString>, CmdE
             .ok_or_else(|| fatal(cx, format!("{mode} called with {name} not set").into()))?;
         size = size.saturating_add(value.len()).saturating_add(1);
         if size > cx.limits().max_value_bytes {
-            return Err(status("argument data exceeds the value size limit."));
+            return Err(CmdError::status(
+                "argument data exceeds the value size limit.",
+            ));
         }
         input.push(value);
     }

@@ -10,9 +10,9 @@ use rcmake_syntax::{Argument, CommandInvocation};
 
 use crate::args::{KeywordParser, Slot};
 use crate::code::Code;
-use crate::exec::{BodyMode, cat};
 use crate::util::{IntError, escape_for_cmake, stoi};
 use crate::{CmdError, CmdResult, Flow, Interp, UserCommand, UserCommandKind};
+use crate::{interp::BodyMode, util::cat};
 
 /// Result of a block command. The outer `Err` means that the opener command failed and
 /// did not open a block, so the caller runs the body as ordinary commands. The inner

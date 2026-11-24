@@ -7,8 +7,8 @@ use rcmake_diag::{PolicyId, PolicyStatus};
 use rcmake_genex::{EvalContext, EvalFlags, GenexError, UsageTraversal};
 use rcmake_model::{BT, LinkItem, ProjectModel, TargetId, TargetKind};
 
-use super::{Limits, UsageResolver, UsageValue, context, handle, host::definition};
-use crate::ResolveError;
+use super::{Limits, UsageResolver, UsageValue, context, handle};
+use crate::{ResolveError, lower::definition};
 
 /// A link entry with its evaluated text, provenance, and link semantics.
 #[derive(Clone, Debug, PartialEq)]
@@ -795,10 +795,11 @@ fn deduplicate(
         return;
     };
     let policy = |number| target.policies.policies.get(PolicyId::new(number)) == PolicyStatus::New;
-    let platform = definition(model, target.dir, b"CMAKE_SYSTEM_NAME").unwrap_or_default();
+    let platform = definition(model, target.dir, b"CMAKE_SYSTEM_NAME")
+        .map_or(b"".as_slice(), |value| value.as_slice());
     let windows = platform.starts_with(b"Windows");
     let apple = matches!(
-        platform.as_slice(),
+        platform,
         b"Darwin" | b"iOS" | b"tvOS" | b"watchOS" | b"visionOS"
     ) || (platform.is_empty() && cfg!(target_os = "macos"));
     let processing = ctx
@@ -812,9 +813,7 @@ fn deduplicate(
                 format!("CMAKE_{language}_LINK_LIBRARIES_PROCESSING").as_bytes(),
             )
         });
-    let settings = processing
-        .as_ref()
-        .map(|value| list::split(value, list::Empty::Drop));
+    let settings = processing.map(|value| list::split(value, list::Empty::Drop));
     let setting = |name: &[u8]| {
         settings
             .as_ref()

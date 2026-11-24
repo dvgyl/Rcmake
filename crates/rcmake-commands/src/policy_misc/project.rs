@@ -7,7 +7,7 @@ use rcmake_expr::ExpandedArg;
 use rcmake_host::path;
 use rcmake_model::{CacheEntry, CacheType};
 
-use super::{quoted, status, values};
+use super::{quoted, values};
 
 const METADATA: [&str; 5] = [
     "VERSION",
@@ -20,7 +20,9 @@ const METADATA: [&str; 5] = [
 pub(super) fn project(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
     let args = values(args);
     let Some((name, tail)) = args.split_first() else {
-        return Err(status("PROJECT called with incorrect number of arguments"));
+        return Err(CmdError::status(
+            "PROJECT called with incorrect number of arguments",
+        ));
     };
     crate::configure::project_include_hook(cx, b"CMAKE_PROJECT_INCLUDE_BEFORE")?;
     crate::configure::project_include_hook(
@@ -35,7 +37,7 @@ pub(super) fn project(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
     let version = metadata.get(b"VERSION".as_slice()).copied();
     let compat = metadata.get(b"COMPAT_VERSION".as_slice()).copied();
     if compat.is_some() && version.is_none() {
-        return Err(status(
+        return Err(CmdError::status(
             "project with COMPAT_VERSION must also provide VERSION.",
         ));
     }
@@ -43,7 +45,7 @@ pub(super) fn project(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
         if let Some(value) = value
             && !valid_version(value)
         {
-            return Err(status(quoted(
+            return Err(CmdError::status(quoted(
                 &format!("{key} \""),
                 value,
                 "\" format invalid.",
@@ -53,7 +55,7 @@ pub(super) fn project(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
     if let (Some(version), Some(compat)) = (version, compat)
         && version::compare(compat, version).is_gt()
     {
-        return Err(status(
+        return Err(CmdError::status(
             "COMPAT_VERSION must be less than or equal to VERSION",
         ));
     }
@@ -167,14 +169,18 @@ fn parse_metadata<'a>(cx: &mut Cx<'_>, args: &[&'a [u8]]) -> Result<Arguments<'a
     while let Some(arg) = args.next() {
         if arg == b"LANGUAGES" {
             if languages_seen {
-                return Err(status("LANGUAGES may be specified at most once."));
+                return Err(CmdError::status("LANGUAGES may be specified at most once."));
             }
             languages_seen = true;
             in_languages = true;
         } else if is_metadata(arg) {
             in_languages = false;
             if metadata.contains_key(arg) {
-                return Err(status(quoted("", arg, " may be specified at most once.")));
+                return Err(CmdError::status(quoted(
+                    "",
+                    arg,
+                    " may be specified at most once.",
+                )));
             }
             let value = args.next_if(|next| *next != b"LANGUAGES" && !is_metadata(next));
             if value.is_none() {
@@ -199,7 +205,7 @@ fn parse_metadata<'a>(cx: &mut Cx<'_>, args: &[&'a [u8]]) -> Result<Arguments<'a
         .any(|key| metadata.contains_key(key));
     if !bare_languages.is_empty() && has_metadata {
         if !languages_seen {
-            return Err(status(
+            return Err(CmdError::status(
                 "with VERSION, DESCRIPTION or HOMEPAGE_URL must use LANGUAGES before language names.",
             ));
         }

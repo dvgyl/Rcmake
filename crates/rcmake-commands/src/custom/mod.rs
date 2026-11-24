@@ -197,7 +197,7 @@ pub(crate) fn new_command(cx: &mut Cx<'_>) -> CustomCommand {
 
 fn add_command(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
     if args.len() < 4 {
-        return Err(status("called with wrong number of arguments."));
+        return Err(CmdError::status("called with wrong number of arguments."));
     }
     let mut body = new_command(cx);
     let mut options = Options::default();
@@ -220,7 +220,7 @@ fn add_command(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
         (Some(target), true) => return add_event(cx, body, &options, target),
         (None, false) => {}
         _ => {
-            return Err(status(
+            return Err(CmdError::status(
                 "Wrong syntax. A TARGET or OUTPUT must be specified.",
             ));
         }
@@ -270,7 +270,7 @@ fn add_command(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
         )?;
     }
     if body.depfile.is_some() && !body.implicit_depends.is_empty() {
-        return Err(status(
+        return Err(CmdError::status(
             "IMPLICIT_DEPENDS and DEPFILE can not both be specified.",
         ));
     }
@@ -335,7 +335,7 @@ fn check_policy(cx: &mut Cx<'_>, message: impl Into<BString>) -> Result<(), CmdE
 
 fn append(cx: &mut Cx<'_>, body: CustomCommand) -> CmdResult {
     let Some(output) = body.outputs.first() else {
-        return Err(status("APPEND requires an OUTPUT."));
+        return Err(CmdError::status("APPEND requires an OUTPUT."));
     };
     let project = cx.project();
     let existing = project.commands().find_map(|(id, command)| {
@@ -411,7 +411,7 @@ fn add_event(
     };
     let entry = project
         .target(target)
-        .ok_or_else(|| status("Unknown target."))?;
+        .ok_or_else(|| CmdError::status("Unknown target."))?;
     let problem = if entry.dir != body.dir {
         Some(format!(
             "TARGET '{name_text}' was not created in this directory."
@@ -443,7 +443,9 @@ fn add_event(
 
 fn add_target(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
     let Some((name, args)) = args.split_first() else {
-        return Err(status("called with incorrect number of arguments"));
+        return Err(CmdError::status(
+            "called with incorrect number of arguments",
+        ));
     };
     let name = &name.value;
     if name.is_empty()
@@ -451,7 +453,7 @@ fn add_target(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
             .iter()
             .all(|byte| byte.is_ascii_alphanumeric() || b"_.+-".contains(byte))
     {
-        return Err(status(format!("Invalid target name \"{name}\".")));
+        return Err(CmdError::status(format!("Invalid target name \"{name}\".")));
     }
 
     if matches!(
@@ -508,7 +510,7 @@ fn add_target(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
 
 fn resolve_paths(cx: &mut Cx<'_>, body: &mut CustomCommand) -> Result<(), CmdError> {
     if body.uses_terminal && body.job_pool.is_some() {
-        return Err(status("JOB_POOL is shadowed by USES_TERMINAL."));
+        return Err(CmdError::status("JOB_POOL is shadowed by USES_TERMINAL."));
     }
     let base = from_native(&cx.current_binary_dir());
     for entry in body.outputs.iter_mut().chain(&mut body.byproducts) {
@@ -573,9 +575,5 @@ pub(crate) fn record(
 }
 
 fn model_error(error: ModelError) -> CmdError {
-    status(error.to_string())
-}
-
-fn status(message: impl Into<BString>) -> CmdError {
-    CmdError::Status(message.into())
+    CmdError::status(error.to_string())
 }

@@ -2,7 +2,7 @@
 
 use std::{collections::HashMap, path::Path};
 
-use rcmake_base::{BString, path_lex::Lexical};
+use rcmake_base::{BString, path_lex::Lexical, shell::quote};
 use rcmake_host::{Host, path::from_native};
 use rcmake_json::{Value, write_styled};
 use rcmake_model::GeneratorKind;
@@ -67,7 +67,7 @@ fn render_with_directories(
             let local_object = Lexical::new(&absolute_object).relative(Lexical::new(directory));
             let paths = local_object
                 .filter(|path| path.as_slice() != object.as_slice())
-                .map(|path| (quote_shell_word(object), quote_shell_word(&path)));
+                .map(|path| (quote(object), quote(&path)));
             (
                 directory,
                 compile_command(
@@ -134,27 +134,6 @@ fn compile_command(shell: &[u8], object_paths: Option<(&[u8], &[u8])>) -> BStrin
     } else {
         command
     }
-}
-
-// Use the same shell word form as the compile rule in the build graph.
-fn quote_shell_word(path: &[u8]) -> BString {
-    if !path.is_empty()
-        && path
-            .iter()
-            .all(|byte| byte.is_ascii_alphanumeric() || b"_@%+=:,./-".contains(byte))
-    {
-        return path.into();
-    }
-    let mut word = BString::from("'");
-    for &byte in path {
-        if byte == b'\'' {
-            word.extend_from_slice(b"'\\''");
-        } else {
-            word.push(byte);
-        }
-    }
-    word.push(b'\'');
-    word
 }
 
 // Keep the original shell quoting, including quoted paths that contain spaces.

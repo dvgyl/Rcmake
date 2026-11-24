@@ -3,7 +3,7 @@ use rcmake_eval::{CmdError, Cx, UserCommandKind};
 use rcmake_expr::ExpandedArg;
 use rcmake_syntax::ArgKind;
 
-use super::{cat, status};
+use super::cat;
 
 pub(super) struct Callback<'a> {
     command: &'a [u8],
@@ -19,7 +19,7 @@ impl<'a> Callback<'a> {
         purpose: &str,
     ) -> Result<Self, CmdError> {
         if !cx.command_exists(command) {
-            return Err(status(cat(&[
+            return Err(CmdError::status(cat(&[
                 context,
                 b"unknown function \"",
                 command,
@@ -27,7 +27,7 @@ impl<'a> Callback<'a> {
             ])));
         }
         if cx.user_command_kind(command) == Some(UserCommandKind::Macro) {
-            return Err(status(cat(&[
+            return Err(CmdError::status(cat(&[
                 context,
                 b"macro \"",
                 command,
@@ -72,7 +72,7 @@ impl<'a> Callback<'a> {
         cx.unset_var(&self.output);
         call?;
         result.ok_or_else(|| {
-            status(cat(&[
+            CmdError::status(cat(&[
                 self.context,
                 b"function \"",
                 self.command,
