@@ -1,0 +1,180 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+# L1 configures and compares generated data. L2 compares Ninja dry-run commands.
+# L3 builds selected targets. L4 runs the listed test, install, or package checks.
+# An empty L2 target list selects the default Ninja targets.
+# Use the Ninja install target for L4 if L3 built only a subset of targets.
+schema_version = 1
+
+[[project]]
+name = "duckdb"
+repository = "duckdb/duckdb"
+version = "v1.3.2"
+commit = "0b83e5d2f68bc02dfefde74b846bd039f078affa"
+configure_args = [
+    "-DBUILD_UNITTESTS=ON", "-DBUILD_SHELL=ON", "-DDISABLE_UNITY=ON",
+    "-DOVERRIDE_GIT_DESCRIBE=v1.3.2-0-g0b83e5d2f6",
+]
+l1 = true
+l2_targets = ["duckdb", "shell"]
+l3_targets = ["duckdb", "shell", "unittest"]
+l4 = { executables = ["test/unittest"], install = true }
+runner = { memory_gib = 8, gpu = "none", tier = "standard" }
+
+[[project]]
+name = "opencv"
+repository = "opencv/opencv"
+version = "4.12.0"
+commit = "49486f61fb25722cbcf586b7f4320921d46fb38e"
+apt = ["libjpeg-dev", "libpng-dev", "zlib1g-dev"]
+configure_args = [
+    "-DBUILD_LIST=core,imgproc,imgcodecs", "-DBUILD_TESTS=ON",
+    "-DBUILD_PERF_TESTS=OFF", "-DBUILD_EXAMPLES=OFF", "-DBUILD_JAVA=OFF",
+    "-DWITH_IPP=OFF", "-DWITH_ITT=OFF", "-DWITH_OPENCL=OFF", "-DWITH_CUDA=OFF",
+    "-DWITH_FFMPEG=OFF", "-DWITH_GSTREAMER=OFF", "-DWITH_GTK=OFF",
+    "-DWITH_OPENJPEG=OFF", "-DWITH_OPENEXR=OFF", "-DWITH_TIFF=OFF",
+    "-DWITH_WEBP=OFF", "-DWITH_JASPER=OFF",
+]
+l1 = true
+l2_targets = ["opencv_core", "opencv_imgproc", "opencv_imgcodecs"]
+l3_targets = ["opencv_core", "opencv_imgproc", "opencv_imgcodecs", "opencv_test_core"]
+l4 = { ctest = ["-R", "^opencv_test_core$"], install = true }
+runner = { memory_gib = 8, gpu = "none", tier = "standard" }
+
+[[project]]
+name = "llvm-project"
+repository = "llvm/llvm-project"
+version = "llvmorg-20.1.8"
+commit = "87f0227cb60147a26a1eeb4fb06e3b505e9c7261"
+source_subdir = "llvm"
+configure_args = [
+    "-DLLVM_ENABLE_PROJECTS=clang", "-DLLVM_TARGETS_TO_BUILD=host",
+    "-DLLVM_ENABLE_TERMINFO=OFF", "-DLLVM_ENABLE_LIBXML2=OFF", "-DLLVM_ENABLE_ZSTD=OFF",
+]
+l1 = true
+l2_targets = ["clang"]
+l3_targets = ["clang"]
+l4 = { ninja = ["check-clang"], install = true }
+runner = { memory_gib = 12, gpu = "none", tier = "large" }
+
+[[project]]
+name = "boost"
+repository = "boostorg/boost"
+version = "boost-1.88.0"
+commit = "199ef13d6034c85232431130142159af3adfce22"
+submodules = true
+configure_args = ["-DBOOST_INCLUDE_LIBRARIES=filesystem;system", "-DBUILD_TESTING=ON"]
+l1 = true
+l2_targets = ["boost_filesystem"]
+l3_targets = ["boost_filesystem"]
+l4 = { ninja = ["tests"], ctest = ["-R", "boost_filesystem"], install = true }
+runner = { memory_gib = 8, gpu = "none", tier = "standard" }
+
+[[project]]
+name = "vtk"
+repository = "Kitware/VTK"
+version = "v9.5.0"
+commit = "e70c856bd9122ad759921c61d86a153e0311e20d"
+apt = ["libgl1-mesa-dev", "libx11-dev", "libxcursor-dev", "libxfixes-dev", "libxrandr-dev"]
+configure_args = [
+    "-DVTK_BUILD_TESTING=OFF", "-DVTK_BUILD_EXAMPLES=OFF",
+    "-DVTK_GROUP_ENABLE_Qt=NO", "-DVTK_GROUP_ENABLE_Web=NO",
+    "-DVTK_GROUP_ENABLE_MPI=NO", "-DVTK_WRAP_PYTHON=OFF",
+]
+l1 = true
+l2_targets = ["vtkCommonCore", "vtkFiltersCore"]
+l3_targets = ["vtkCommonCore", "vtkFiltersCore"]
+l4 = { install = true }
+runner = { memory_gib = 12, gpu = "none", tier = "large" }
+
+[[project]]
+name = "qtbase"
+repository = "qt/qtbase"
+version = "v6.8.3"
+commit = "c07c2d5a527a644d36e7853d55132ae38921682f"
+apt = ["libdbus-1-dev", "libglib2.0-dev", "libicu-dev", "libssl-dev"]
+configure_args = [
+    "-DQT_BUILD_TESTS=OFF", "-DQT_BUILD_EXAMPLES=OFF", "-DFEATURE_gui=OFF",
+    "-DFEATURE_widgets=OFF", "-DFEATURE_sql=OFF", "-DFEATURE_xcb=OFF",
+]
+l1 = true
+l2_targets = ["Core", "Network"]
+l3_targets = ["Core", "Network"]
+l4 = { install = true }
+runner = { memory_gib = 12, gpu = "none", tier = "large" }
+
+[[project]]
+name = "kcoreaddons"
+repository = "KDE/kcoreaddons"
+version = "v6.15.0"
+commit = "f53fad49b1ee7821e6a23f709192883260624298"
+apt = ["libudev-dev", "libdbus-1-dev", "libglib2.0-dev", "libicu-dev", "libssl-dev"]
+use_qt = true
+configure_args = ["-DBUILD_TESTING=OFF", "-DBUILD_QCH=OFF", "-DKCOREADDONS_USE_QML=OFF",
+                  "-DBUILD_PYTHON_BINDINGS=OFF"]
+l1 = true
+l2_targets = ["KF6CoreAddons"]
+l3_targets = ["KF6CoreAddons"]
+l4 = { install = true }
+runner = { memory_gib = 12, gpu = "none", tier = "large" }
+
+[[project.prerequisite]]
+repository = "KDE/extra-cmake-modules"
+commit = "d3263ec15541584c211ce106db92486881e07172"
+configure_args = ["-DBUILD_TESTING=OFF", "-DBUILD_HTML_DOCS=OFF", "-DBUILD_MAN_DOCS=OFF", "-DBUILD_QTHELP_DOCS=OFF"]
+
+[[project]]
+name = "rclcpp"
+repository = "ros2/rclcpp"
+version = "28.1.8"
+commit = "3ca1e69c206613124fad01d8cef5df651e3bad80"
+source_subdir = "rclcpp"
+use_ros_jazzy = true
+configure_args = ["-DBUILD_TESTING=OFF"]
+l1 = true
+l2_targets = ["rclcpp"]
+l3_targets = ["rclcpp"]
+l4 = { install = true }
+runner = { memory_gib = 8, gpu = "none", tier = "standard" }
+
+[[project]]
+name = "blender"
+repository = "blender/blender"
+version = "v4.5.0"
+commit = "8cb6b388974a817afedf1317ce26f0c75aa5f181"
+apt = ["libboost-dev", "libeigen3-dev", "libepoxy-dev", "libfreetype-dev", "libgl1-mesa-dev",
+       "libgmp-dev", "libjpeg-dev", "liblzo2-dev", "libopenexr-dev", "libopenimageio-dev",
+       "libpng-dev", "libtiff-dev", "libzstd-dev"]
+configure_args = [
+    "-DWITH_HEADLESS=ON", "-DWITH_LIBS_PRECOMPILED=OFF", "-DWITH_PYTHON=OFF",
+    "-DWITH_CYCLES=OFF", "-DWITH_VULKAN_BACKEND=OFF", "-DWITH_GHOST_X11=OFF",
+    "-DWITH_GHOST_WAYLAND=OFF", "-DWITH_ALEMBIC=OFF", "-DWITH_USD=OFF",
+    "-DWITH_OPENCOLLADA=OFF", "-DWITH_OPENVDB=OFF", "-DWITH_OPENSUBDIV=OFF",
+    "-DWITH_OPENCOLORIO=OFF", "-DWITH_OPENIMAGEDENOISE=OFF", "-DWITH_FFMPEG=OFF",
+    "-DWITH_PULSEAUDIO=OFF", "-DWITH_PIPEWIRE=OFF", "-DWITH_JACK=OFF",
+    "-DWITH_OPENAL=OFF", "-DWITH_XR_OPENXR=OFF", "-DWITH_MANPAGE=OFF",
+    "-DWITH_AUDASPACE=OFF", "-DWITH_BLENDER_THUMBNAILER=OFF", "-DWITH_TBB=OFF",
+]
+l1 = true
+l2_targets = ["blender"]
+l3_targets = ["blender"]
+l4 = { install = true }
+runner = { memory_gib = 16, gpu = "none", tier = "large" }
+
+[[project]]
+name = "pytorch"
+repository = "pytorch/pytorch"
+version = "v2.7.1"
+commit = "e2d141dbde55c2a4370fac5165b0561b6af4798b"
+submodules = true
+python = ["numpy==2.2.6", "PyYAML==6.0.2", "setuptools==80.9.0", "typing_extensions==4.14.0"]
+configure_args = [
+    "-DBUILD_PYTHON=OFF", "-DBUILD_TEST=OFF", "-DBUILD_CAFFE2_OPS=OFF",
+    "-DUSE_CUDA=OFF", "-DUSE_ROCM=OFF", "-DUSE_DISTRIBUTED=OFF", "-DUSE_KINETO=OFF",
+    "-DUSE_MKLDNN=OFF", "-DUSE_XNNPACK=OFF", "-DUSE_QNNPACK=OFF", "-DUSE_FBGEMM=OFF",
+    "-DUSE_NNPACK=OFF", "-DUSE_PYTORCH_QNNPACK=OFF",
+]
+l1 = true
+l2_targets = ["torch_cpu"]
+l3_targets = ["torch_cpu"]
+l4 = { install = true }
+runner = { memory_gib = 16, gpu = "none", tier = "large" }
