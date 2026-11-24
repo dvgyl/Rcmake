@@ -129,43 +129,44 @@ fn add(cx: &mut Cx<'_>, args: &[ExpandedArg], own: Field, interface: Field) -> C
             .unwrap_or(tail.len());
         let (items, next) = tail.split_at(end);
         rest = next;
+        if items.is_empty() {
+            continue;
+        }
         let target = cx
             .project()
             .target(id)
             .ok_or_else(|| model_error(ModelError::UnknownObject))?;
         validate_scope(target, scope, false)?;
-        if items.is_empty() {
-            continue;
-        }
         if let (Some(tables), Some(enabled)) = (&feature_tables, &enabled_languages)
             && scope != UsageScope::Interface
         {
-            for feature in items
-                .iter()
-                .flat_map(|arg| list::split(bytes(arg), list::Empty::Drop))
-            {
+            for feature in items.iter().map(bytes) {
+                if feature.windows(2).any(|pair| pair == b"$<") {
+                    continue;
+                }
+                let known_in = |cx: &mut Cx<'_>, lang: &[u8]| {
+                    cx.global()
+                        .props
+                        .get(&[b"CMAKE_", lang, b"_KNOWN_FEATURES"].concat())
+                        .is_some_and(|table| feature_in_table(feature, table))
+                };
                 let deferred = [b"C".as_slice(), b"CXX", b"CUDA", b"HIP"]
                     .iter()
-                    .any(|&lang| {
-                        !enabled.iter().any(|value| value == lang)
-                            && cx
-                                .global()
-                                .props
-                                .get(&[b"CMAKE_", lang, b"_KNOWN_FEATURES"].concat())
-                                .is_some_and(|table| {
-                                    list::iter(table, list::Empty::Drop)
-                                        .any(|known| feature.as_slice() == known.as_ref())
-                                })
-                    });
-                if !deferred
-                    && !feature.windows(2).any(|pair| pair == b"$<")
-                    && let Err(message) = cx.project().validate_compile_feature(&feature, |key| {
+                    .any(|&lang| !enabled.iter().any(|value| value == lang) && known_in(cx, lang));
+                if deferred {
+                    continue;
+                }
+                let result = if feature.starts_with(b"sycl_cxx_std_") && known_in(cx, b"SYCL") {
+                    validate_sycl_standard(cx, feature, enabled)
+                } else {
+                    cx.project().validate_compile_feature(feature, |key| {
                         tables
                             .iter()
                             .find(|(name, _)| *name == key)
                             .and_then(|(_, value)| value.as_ref())
                     })
-                {
+                };
+                if let Err(message) = result {
                     return Err(crate::command_error(
                         cx,
                         format!(
@@ -212,6 +213,31 @@ fn add(cx: &mut Cx<'_>, args: &[ExpandedArg], own: Field, interface: Field) -> C
         }
     }
     Ok(Flow::Normal)
+}
+
+fn feature_in_table(feature: &[u8], table: &[u8]) -> bool {
+    list::iter(table, list::Empty::Drop).any(|known| feature == known.as_ref())
+}
+
+fn validate_sycl_standard(
+    cx: &mut Cx<'_>,
+    feature: &[u8],
+    enabled: &[BString],
+) -> Result<(), BString> {
+    if !enabled.iter().any(|lang| lang == b"SYCL") {
+        return Ok(());
+    }
+    if cx
+        .var(b"CMAKE_SYCL_COMPILE_FEATURES")
+        .is_some_and(|table| feature_in_table(feature, &table))
+    {
+        return Ok(());
+    }
+    Err(format!(
+        "compiler does not support feature \"{}\"",
+        BString::from(feature)
+    )
+    .into())
 }
 
 fn take(args: &mut &[ExpandedArg], token: &[u8]) -> bool {

@@ -1,12 +1,13 @@
 use rcmake_base::{BString, list};
-use rcmake_diag::{PolicyId, PolicyStatus};
+use rcmake_diag::{Location, MessageKind, PolicyId, PolicyStatus};
 use rcmake_eval::{CmdError, CmdResult, Cx, Flow};
 use rcmake_expr::ExpandedArg;
+use rcmake_host::{FileKind, Follow};
 use rcmake_model::{
-    BT, ImportedVisibility, ModelError, Target, TargetBinding, TargetKind, TargetOrigin,
+    BT, DirId, ImportedVisibility, ModelError, Target, TargetBinding, TargetKind, TargetOrigin,
 };
 
-use super::{bytes, init, model_error};
+use super::{bytes, generation_diagnostic, init, model_error, schedule_target_validation};
 
 pub(super) fn executable(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
     add(cx, args, true)
@@ -165,6 +166,9 @@ fn add(cx: &mut Cx<'_>, args: &[ExpandedArg], executable: bool) -> CmdResult {
         .add_target(target)
         .map_err(|err| duplicate(cx, name, options.imported, err))?;
     crate::dirs::source_groups::apply_to_target(cx, id)?;
+    if !options.imported && generated_reservation(name).is_some() {
+        schedule_target_validation(cx);
+    }
     Ok(Flow::Normal)
 }
 
@@ -177,21 +181,17 @@ fn validate_name(cx: &mut Cx<'_>, name: &BString, special: bool) -> Result<(), C
     let reserved = matches!(
         name.as_slice(),
         b"all"
-            | b"clean"
+            | b"ALL_BUILD"
             | b"help"
             | b"install"
-            | b"package"
-            | b"package_source"
+            | b"INSTALL"
+            | b"preinstall"
+            | b"clean"
             | b"edit_cache"
             | b"rebuild_cache"
+            | b"ZERO_CHECK"
     );
-    if name == b"test" && cx.var_is_on(b"CMAKE_TESTING_ENABLED") {
-        return Err(crate::command_error(
-            cx,
-            "The target name \"test\" is reserved when CTest testing is enabled.",
-        ));
-    }
-    if valid && (special || !reserved) {
+    if valid && !reserved {
         Ok(())
     } else {
         Err(crate::command_error(
@@ -201,6 +201,50 @@ fn validate_name(cx: &mut Cx<'_>, name: &BString, special: bool) -> Result<(), C
             ),
         ))
     }
+}
+
+fn generated_reservation(name: &[u8]) -> Option<(Option<&'static str>, &'static str)> {
+    Some(match name {
+        b"package" | b"PACKAGE" => (Some("CPackConfig.cmake"), "CPack packaging"),
+        b"package_source" => (Some("CPackSourceConfig.cmake"), "CPack source packaging"),
+        b"test" | b"RUN_TESTS" => (None, "CTest testing"),
+        _ => return None,
+    })
+}
+
+pub(super) fn validate_generated_names(cx: &mut Cx<'_>) -> bool {
+    let model = cx.project();
+    let root = model.dir(DirId::ROOT).source_dir.clone();
+    let candidates: Vec<_> = model
+        .targets()
+        .filter(|(_, target)| !target.is_imported())
+        .filter_map(|(_, target)| {
+            let (file, feature) = generated_reservation(&target.name)?;
+            Some((target.name.clone(), target.backtrace.clone(), file, feature))
+        })
+        .collect();
+    let binary = cx.current_binary_dir();
+    let mut failed = false;
+    for (name, trace, file, feature) in candidates {
+        let enabled = match file {
+            Some(file) => cx
+                .host()
+                .metadata(&binary.join(file), Follow::Yes)
+                .is_ok_and(|metadata| metadata.kind == FileKind::File),
+            None => cx.var_is_on(b"CMAKE_TESTING_ENABLED"),
+        };
+        if enabled {
+            failed |= generation_diagnostic(
+                cx,
+                &root,
+                Location::Backtrace(trace),
+                MessageKind::Error,
+                None,
+                format!("The target name \"{name}\" is reserved when {feature} is enabled.").into(),
+            );
+        }
+    }
+    failed
 }
 
 fn alias(

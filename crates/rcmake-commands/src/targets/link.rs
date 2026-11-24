@@ -94,9 +94,6 @@ pub(super) fn add(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
     while let Some((index, arg)) = args.next() {
         let value = bytes(arg);
         if let Some(keyword) = link_scope(value) {
-            if let Some(pending) = qualifier {
-                return Err(missing_library(cx, pending));
-            }
             if index != 0 && (signature == Signature::Plain || signature != keyword.signature) {
                 let option = if keyword.signature == Signature::Modern {
                     "INTERFACE, PUBLIC or PRIVATE option"
@@ -485,7 +482,7 @@ fn ipo_diagnostic(
     let extensions: Vec<_> = declaration
         .filter_map(|source| {
             let offset = source.iter().rposition(|&byte| byte == b'.')?;
-            let extension = &source[offset + 1..];
+            let extension = source.get(offset + 1..)?;
             (!extension.contains(&b'/') && !extension.contains(&b'>')).then(|| extension.to_vec())
         })
         .collect();
@@ -611,10 +608,14 @@ fn validate_scope(target: &Target, scope: UsageScope) -> Result<(), CmdError> {
 }
 
 fn maybe_target_name(value: &[u8]) -> bool {
-    value.windows(2).any(|pair| pair == b"$<")
+    value
+        .iter()
+        .all(|byte| byte.is_ascii_alphanumeric() || b"_.+-:".contains(byte))
         || value
-            .iter()
-            .all(|byte| byte.is_ascii_alphanumeric() || b"_.+-:".contains(byte))
+            .windows(2)
+            .position(|pair| pair == b"$<")
+            .and_then(|start| value.get(start + 2..))
+            .is_some_and(|tail| tail.contains(&b'>'))
 }
 
 fn signature_error(target: &Target, signature: Signature, has_item: bool) -> Option<String> {

@@ -45,6 +45,7 @@ pub(super) const LANGUAGES: &[&str] = &[
     "CMAKE_CXX_KNOWN_FEATURES",
     "CMAKE_CUDA_KNOWN_FEATURES",
     "CMAKE_HIP_KNOWN_FEATURES",
+    "CMAKE_SYCL_KNOWN_FEATURES",
 ];
 
 pub(super) fn known_features(name: &[u8]) -> Option<String> {
@@ -65,6 +66,9 @@ pub(super) fn known_features(name: &[u8]) -> Option<String> {
         }
         b"CMAKE_CUDA_KNOWN_FEATURES" => CUDA.to_owned(),
         b"CMAKE_HIP_KNOWN_FEATURES" => HIP.to_owned(),
+        b"CMAKE_SYCL_KNOWN_FEATURES" => format!(
+            "sycl_cxx_std_98;sycl_cxx_std_11;sycl_cxx_std_14;sycl_cxx_std_17;sycl_cxx_std_20;sycl_cxx_std_23;sycl_cxx_std_26;{CXX98};{CXX11};{CXX14}"
+        ),
         _ => return None,
     })
 }

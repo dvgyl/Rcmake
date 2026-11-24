@@ -9,8 +9,9 @@ use rcmake_resolve::usage::UsageResolver;
 use super::computed::{boolean, directory_value, global_value, source_value};
 use super::file_set::{file_set_id, file_set_selection, file_set_target, file_set_value};
 use super::scope::{
-    SOURCE_EXTENSIONS, SourceSelection, alias_value, check_directory, find_target, select_source,
-    single_name, source_directory, source_paths, source_scopes, test_names,
+    RESOLVED_SOURCE_LOCATION, SOURCE_EXTENSIONS, SourceSelection, alias_value, check_directory,
+    find_target, select_source, single_name, source_directory, source_paths, source_scopes,
+    test_names,
 };
 use super::{is_inherited, model_value, quoted, values};
 
@@ -149,8 +150,20 @@ fn query_source(
         return Some(value);
     }
     let scope = select_source(cx, dir, source, scoped, create || name == b"LOCATION")?;
-    if name == b"LOCATION" {
-        return source_location(cx, dir, source, &scope, scoped);
+    if name == b"LOCATION"
+        && let PropScope::Source { path: key, .. } = &scope
+    {
+        if let Some(path) = cx.project().get_prop(&scope, RESOLVED_SOURCE_LOCATION) {
+            return Some(path);
+        }
+        let path = source_location(cx, dir, source, key, scoped)?;
+        cx.project()
+            .dir_mut(dir)
+            .source_props
+            .entry(key.clone())
+            .or_default()
+            .set(RESOLVED_SOURCE_LOCATION.into(), path.clone());
+        return Some(path);
     }
     if name == b"GENERATED"
         && super::generated::is_strict(cx, dir)
@@ -167,14 +180,11 @@ fn source_location(
     cx: &mut Cx<'_>,
     dir: DirId,
     source: &[u8],
-    scope: &PropScope,
+    known: &BString,
     scoped: bool,
 ) -> Option<BString> {
-    let PropScope::Source { path: known, .. } = scope else {
-        return None;
-    };
-    let paths = source_paths(cx, source);
-    let paths = if scoped { &paths[..1] } else { &paths[..] };
+    let [source_path, binary_path] = source_paths(cx, source);
+    let paths = std::iter::once(&source_path).chain((!scoped).then_some(&binary_path));
     let is_global = super::generated::is_strict(cx, dir);
     let is_generated = |cx: &mut Cx<'_>, path: &BString| {
         let model = cx.project();
@@ -186,7 +196,7 @@ fn source_location(
         .and_then(|props| props.get(b"GENERATED"))
         .is_some_and(|value| truth::is_on(value))
     {
-        return paths.last().cloned();
+        return Some(if scoped { source_path } else { binary_path });
     }
     let policy = PolicyId::new(115);
     let status = super::generated::policy(cx, dir, policy);

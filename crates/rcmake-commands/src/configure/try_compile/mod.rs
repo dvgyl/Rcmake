@@ -188,12 +188,12 @@ fn probe(cx: &mut Cx<'_>, args: &[ExpandedArg], run: bool) -> CmdResult {
         );
     }
     if let Some(denial) = process_denial(cx.host()) {
-        cx.set_var(build_var, "FALSE".into());
-        if let Some(var) = options
-            .one(b"COMPILE_OUTPUT_VARIABLE")
-            .or_else(|| options.one(b"OUTPUT_VARIABLE"))
-        {
-            cx.set_var(var, denial.clone());
+        set_build_result(cx, build_var, &options, false, &denial);
+        if let Some(var) = run_var {
+            run_executable(cx, &options, None, var, &denial);
+        }
+        if let Some(var) = options.one(b"COPY_FILE_ERROR") {
+            cx.set_var(var, BString::default());
         }
         let command = if run { "try_run" } else { "try_compile" };
         cx.issue(
@@ -393,23 +393,7 @@ fn build_probe(
         ),
     };
     output.extend_from_slice(&outcome.output);
-    let no_cache = options.has(b"NO_CACHE");
-    set_result(
-        cx,
-        build_var,
-        if outcome.success {
-            "TRUE".into()
-        } else {
-            "FALSE".into()
-        },
-        no_cache,
-    );
-    if let Some(var) = options
-        .one(b"COMPILE_OUTPUT_VARIABLE")
-        .or_else(|| options.one(b"OUTPUT_VARIABLE"))
-    {
-        cx.set_var(var, output.clone());
-    }
+    set_build_result(cx, build_var, options, outcome.success, &output);
     let run_result = if outcome.success
         && let Some(var) = run_var
     {
@@ -510,6 +494,23 @@ fn copy_artifact(
             preserve_mtime: false,
         },
     )
+}
+
+fn set_build_result(
+    cx: &mut Cx<'_>,
+    name: &[u8],
+    options: &Options<'_>,
+    success: bool,
+    output: &[u8],
+) {
+    let value = if success { "TRUE" } else { "FALSE" };
+    set_result(cx, name, value.into(), options.has(b"NO_CACHE"));
+    if let Some(var) = options
+        .one(b"COMPILE_OUTPUT_VARIABLE")
+        .or_else(|| options.one(b"OUTPUT_VARIABLE"))
+    {
+        cx.set_var(var, output.into());
+    }
 }
 
 fn set_result(cx: &mut Cx<'_>, name: &[u8], value: BString, no_cache: bool) {

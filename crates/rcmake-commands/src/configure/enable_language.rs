@@ -88,8 +88,11 @@ pub(super) fn enable_language(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResul
                 let Some(value) = cx.var_normal_only(name) else {
                     return false;
                 };
-                let index = saved.binary_search_by(|(key, _)| key.cmp(name));
-                index.is_err() || index.is_ok_and(|index| saved[index].1 != value)
+                saved
+                    .binary_search_by(|(key, _)| key.cmp(name))
+                    .ok()
+                    .and_then(|index| saved.get(index))
+                    .is_none_or(|(_, previous)| *previous != value)
             })
             .collect();
         cx.raise_scope(&changed);

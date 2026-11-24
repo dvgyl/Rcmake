@@ -4,7 +4,7 @@ use rcmake_eval::Cx;
 use rcmake_model::DirId;
 
 use super::computed::boolean;
-use super::scope::{select_source, source_paths};
+use super::scope::{RESOLVED_SOURCE_LOCATION, select_source, source_paths};
 use super::set::Update;
 
 const CMP0118: PolicyId = PolicyId::new(118);
@@ -92,8 +92,15 @@ pub(super) fn set(
         )
     } else {
         let [source_path, binary_path] = source_paths(cx, source);
-        let path = if let Some(rcmake_model::PropScope::Source { path, .. }) =
-            select_source(cx, dir, source, scoped, false)
+        let selected = select_source(cx, dir, source, scoped, false);
+        let resolved = selected
+            .as_ref()
+            .and_then(|scope| cx.project().get_prop(scope, RESOLVED_SOURCE_LOCATION));
+        let path = if let Some(resolved) = resolved {
+            resolved
+        } else if policy_id == CMP0163 && !scoped {
+            binary_path
+        } else if let Some(rcmake_model::PropScope::Source { path, .. }) = selected
             && cx.project().dir(dir).source_props.contains_key(&path)
         {
             // An unscoped relative source with no resolved file uses the binary directory.

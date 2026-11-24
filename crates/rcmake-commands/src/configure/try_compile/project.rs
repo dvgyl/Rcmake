@@ -37,7 +37,7 @@ pub(super) fn write_project(
     let enabled = enabled_languages(cx);
     for &source in sources {
         let file = match source {
-            Source::File(file) => absolute(&cx.current_source_dir(), file),
+            Source::File(file) => path::to_native(file),
             Source::Content(name, value) => write_source(cx.host(), directory, name, value)?,
             Source::Variable(name, var) => {
                 write_source(cx.host(), directory, name, &cx.var_or_empty(var))?
@@ -89,11 +89,15 @@ pub(super) fn write_project(
         if !languages.contains(&language) {
             languages.push(language);
         }
-        if matches!(source, Source::File(_)) && !file.starts_with(directory) {
-            let dir = cx.current_dir_id();
-            let inputs = &mut cx.project().dir_mut(dir).listfiles;
-            if !inputs.contains(&file_path) {
-                inputs.push(file_path.clone());
+        if let Source::File(name) = source {
+            let input = absolute(directory, name);
+            if !input.starts_with(directory) {
+                let input = path::from_native_cmake(&input);
+                let dir = cx.current_dir_id();
+                let inputs = &mut cx.project().dir_mut(dir).listfiles;
+                if !inputs.contains(&input) {
+                    inputs.push(input);
+                }
             }
         }
         files.push(file_path);

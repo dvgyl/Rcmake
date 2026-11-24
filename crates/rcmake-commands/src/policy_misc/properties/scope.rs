@@ -8,6 +8,7 @@ use crate::dirs::{find_directory, normalized_path, scoped_test_directory};
 use super::quoted;
 
 const DIRECTORY_ERROR: &str = "DIRECTORY scope provided but requested directory was not found.  This could be because the directory argument was invalid or, it is valid but has not been processed yet.";
+pub(super) const RESOLVED_SOURCE_LOCATION: &[u8] = b"\0rcmake-source-location";
 
 pub(super) fn source_scope(cx: &mut Cx<'_>, dir: DirId, source: &[u8]) -> PropScope {
     select_source(cx, dir, source, false, true).unwrap_or_else(|| PropScope::Source {
@@ -23,15 +24,15 @@ pub(super) fn select_source(
     scoped: bool,
     create: bool,
 ) -> Option<PropScope> {
-    let paths = source_paths(cx, source);
+    let [source_path, binary_path] = source_paths(cx, source);
     let relative = !scoped && !path::to_native(source).is_absolute();
-    let paths = if relative { &paths[..] } else { &paths[..1] };
+    let paths = std::iter::once(&source_path).chain(relative.then_some(&binary_path));
     let exact_extension = [115, 187].into_iter().all(|id| {
         super::generated::policy(cx, dir, rcmake_diag::PolicyId::new(id))
             == rcmake_diag::PolicyStatus::New
     });
     let matches = |candidate: &[u8]| {
-        paths.iter().any(|prefix| {
+        paths.clone().any(|prefix| {
             candidate == prefix.as_slice()
                 || !exact_extension
                     && candidate
@@ -69,7 +70,7 @@ pub(super) fn select_source(
     if !create {
         return key.map(|path| PropScope::Source { dir, path });
     }
-    let key = key.unwrap_or_else(|| paths[0].clone());
+    let key = key.unwrap_or(source_path);
     cx.project()
         .dir_mut(dir)
         .source_props

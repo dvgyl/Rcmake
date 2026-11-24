@@ -139,7 +139,10 @@ fn add_library(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
         }
         let mut options_args = args.to_vec();
         if let Some((index, _)) = options.kind {
-            options_args[index].value = "STATIC".into();
+            let option = options_args
+                .get_mut(index)
+                .ok_or_else(|| CmdError::status("could not locate the library type argument"))?;
+            option.value = "STATIC".into();
         } else {
             options_args.insert(
                 1,
@@ -237,27 +240,6 @@ fn validate_creation<'a>(
             }
             _ => break,
         }
-    }
-    if matches!(
-        bytes(name),
-        b"all"
-            | b"ALL_BUILD"
-            | b"help"
-            | b"install"
-            | b"INSTALL"
-            | b"preinstall"
-            | b"clean"
-            | b"edit_cache"
-            | b"rebuild_cache"
-            | b"ZERO_CHECK"
-    ) {
-        return Err(crate::command_error(
-            cx,
-            format!(
-                "The target name \"{}\" is reserved or not valid for certain CMake features, such as generator expressions, and may result in undefined behavior.",
-                name.value
-            ),
-        ));
     }
     let dir = cx.current_dir_id();
     if options.alias {
@@ -423,88 +405,94 @@ fn generation_failed(cx: &mut Cx<'_>) {
     cx.set_fatal();
 }
 
-const CHECK_DEPENDENCY: &[u8] = b"\0rcmake-check-dependency";
+const CHECK_TARGETS: &[u8] = b"\0rcmake-check-targets";
+
+fn schedule_target_validation(cx: &mut Cx<'_>) {
+    if cx.global().props.get(CHECK_TARGETS).is_none()
+        && defer_validation(cx, b"add_dependencies", &[CHECK_TARGETS])
+    {
+        cx.global().props.set(CHECK_TARGETS.into(), "1".into());
+    }
+}
 
 fn add_dependencies(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
-    if let [marker, dir, target, dep] = args
-        && bytes(marker) == CHECK_DEPENDENCY
+    if let [marker] = args
+        && bytes(marker) == CHECK_TARGETS
         && cx.running_deferred()
     {
-        let model = cx.project();
-        let scope = model
-            .dirs()
-            .find_map(|(id, entry)| (entry.source_dir == dir.value).then_some(id));
-        if let Some(scope) = scope
-            && model.find_target(scope, bytes(dep)).is_none()
-            && let Some(entry) = model
-                .find_target(scope, bytes(target))
-                .and_then(|id| model.target(id))
-                .and_then(|target| {
-                    target
-                        .utility_deps
-                        .iter()
-                        .find(|entry| entry.value == dep.value)
-                })
+        // A deferred call can create targets or queue more calls.
+        if cx
+            .defer_get_call_ids(DirId::ROOT)
+            .is_some_and(|ids| !ids.is_empty())
         {
-            let root = model.dir(DirId::ROOT).source_dir.clone();
-            let location = Location::Backtrace(entry.backtrace.clone());
-            generation_diagnostic(
-                cx,
-                &root,
-                location,
-                MessageKind::Error,
-                None,
-                format!(
-                    "The dependency target \"{}\" of target \"{}\" does not exist.",
-                    dep.value, target.value
-                )
-                .into(),
-            );
+            defer_validation(cx, b"add_dependencies", &[CHECK_TARGETS]);
+            return Ok(Flow::Normal);
+        }
+        cx.global().props.unset(CHECK_TARGETS);
+        let mut failed = validate_dependencies(cx);
+        failed |= create::validate_generated_names(cx);
+        if failed {
             generation_failed(cx);
         }
         return Ok(Flow::Normal);
     }
 
     properties::add_dependencies(cx, args)?;
-    if let [name, deps @ ..] = args
-        && cx.defer_active()
-    {
-        let dir = cx.current_dir_id();
-        let model = cx.project();
-        let target = model
-            .find_target(dir, bytes(name))
-            .and_then(|id| model.target(id));
-        if let Some(target) = target.filter(|target| !target.is_imported()) {
-            let target_name = target.name.clone();
-            let dir_name = model.dir(dir).source_dir.clone();
-            let missing: Vec<_> = deps
-                .iter()
-                .filter(|dep| model.find_target(dir, bytes(dep)).is_none())
-                .collect();
-            for dep in missing {
-                defer_validation(
-                    cx,
-                    b"add_dependencies",
-                    &[CHECK_DEPENDENCY, &dir_name, &target_name, bytes(dep)],
-                );
-            }
-        }
+    if matches!(args, [_, _, ..]) {
+        schedule_target_validation(cx);
     }
     Ok(Flow::Normal)
+}
+
+fn validate_dependencies(cx: &mut Cx<'_>) -> bool {
+    let model = cx.project();
+    let root = model.dir(DirId::ROOT).source_dir.clone();
+    let mut missing = Vec::new();
+    for (_, target) in model.targets().filter(|(_, target)| !target.is_imported()) {
+        let mut deps: Vec<_> = target
+            .utility_deps
+            .iter()
+            .filter(|dep| model.find_target(target.dir, &dep.value).is_none())
+            .collect();
+        deps.sort_unstable_by(|left, right| left.value.cmp(&right.value));
+        missing.extend(deps.into_iter().map(|dep| {
+            (
+                Location::Backtrace(dep.backtrace.clone()),
+                format!(
+                    "The dependency target \"{}\" of target \"{}\" does not exist.",
+                    dep.value, target.name
+                ),
+            )
+        }));
+    }
+    let failed = !missing.is_empty();
+    for (location, message) in missing {
+        generation_diagnostic(
+            cx,
+            &root,
+            location,
+            MessageKind::Error,
+            None,
+            message.into(),
+        );
+    }
+    failed
 }
 
 fn set_target_properties(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
     let Some(marker) = args.iter().position(|arg| bytes(arg) == b"PROPERTIES") else {
         return properties::set(cx, args);
     };
-    let Some((names, [keyword, pairs @ ..])) = args.split_at_checked(marker) else {
+    let (Some(names_and_keyword), Some((names, [keyword, pairs @ ..]))) =
+        (args.get(..=marker), args.split_at_checked(marker))
+    else {
         return properties::set(cx, args);
     };
     let (pairs, trailing) = pairs.as_chunks::<2>();
     if !trailing.is_empty() || names.is_empty() {
         return properties::set(cx, args);
     }
-    properties::set(cx, &args[..=marker])?;
+    properties::set(cx, names_and_keyword)?;
     let dir = cx.current_dir_id();
     for name in names {
         let id = usage_target(cx, &name.value, "target properties")?;
