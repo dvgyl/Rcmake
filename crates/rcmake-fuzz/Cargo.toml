@@ -12,6 +12,7 @@ publish = false
 rcmake-archive.workspace = true
 rcmake-base.workspace = true
 rcmake-cps.workspace = true
+rcmake-diag.workspace = true
 rcmake-expr.workspace = true
 rcmake-genex.workspace = true
 rcmake-host.workspace = true

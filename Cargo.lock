@@ -596,6 +596,7 @@ dependencies = [
  "rcmake-archive",
  "rcmake-base",
  "rcmake-cps",
+ "rcmake-diag",
  "rcmake-expr",
  "rcmake-genex",
  "rcmake-host",
