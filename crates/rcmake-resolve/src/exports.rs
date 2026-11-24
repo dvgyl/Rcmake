@@ -90,6 +90,8 @@ pub(crate) fn resolve_exports(
         for &id in &members.targets {
             let mut target = export_target(
                 model,
+                usage,
+                &plan.set,
                 id,
                 targets.iter().filter(|target| {
                     target.id == id
@@ -142,6 +144,8 @@ pub(crate) fn resolve_exports(
         for &id in &members {
             let mut target = export_target(
                 model,
+                usage,
+                &plan.set,
                 id,
                 targets.iter().filter(|target| target.id == id),
                 None,
@@ -378,6 +382,8 @@ fn export_filename(set: &[u8]) -> BString {
 
 fn export_target<'a>(
     model: &ProjectModel,
+    usage: &mut UsageResolver<'_>,
+    set: &[u8],
     id: TargetId,
     resolved: impl Iterator<Item = &'a ResolvedTarget>,
     install: Option<&InstallManifest>,
@@ -422,6 +428,21 @@ fn export_target<'a>(
             add_export_property(&mut exported, key.into(), &value, mode)?;
         }
     }
+    let alternative = model
+        .export_xcframeworks
+        .get(set)
+        .and_then(|entries| entries.get(&target.name))
+        .map(|expression| {
+            let ast = rcmake_genex::strip(&rcmake_genex::parse(expression)?, mode);
+            let value = render(&ast.nodes);
+            Ok::<_, ResolveError>(if install.is_some() {
+                rcmake_genex::rewrite_install_prefix(&value, b"${_IMPORT_PREFIX}")
+            } else {
+                value
+            })
+        })
+        .transpose()?;
+    let layout = crate::ide::bundle_kind(target);
     for facts in resolved {
         let mut properties = IndexMap::new();
         for (key, path) in [
@@ -429,9 +450,28 @@ fn export_target<'a>(
             ("IMPORTED_IMPLIB", &facts.artifacts.import_file),
         ] {
             if let Some(path) = path
-                && let Some(path) = exported_location(install, facts, path)
+                && let Some(path) = exported_location(install, facts, path, &layout)
             {
                 properties.insert(key.into(), path);
+            }
+        }
+        if let Some(expression) = &alternative {
+            let context = EvalContext {
+                config: facts.config.clone(),
+                head: Some(crate::usage::handle(id)),
+                ..EvalContext::default()
+            };
+            let value =
+                usage.eval_ide_property(id, b"XCFRAMEWORK_LOCATION", expression, &context)?;
+            if !value.is_empty() {
+                let path = if install.is_some() {
+                    value
+                } else {
+                    absolute_path(&model.dir(target.dir).binary_dir, &value)
+                };
+                exported
+                    .xcframework_locations
+                    .insert(facts.config.0.clone(), path);
             }
         }
         if properties.contains_key(b"IMPORTED_LOCATION".as_slice()) {
@@ -460,7 +500,7 @@ fn export_target<'a>(
                 .map(|unit| absolute_path(base, &unit.object));
             properties.insert("IMPORTED_OBJECTS".into(), list::join(paths));
         }
-        if !properties.is_empty() {
+        if !properties.is_empty() || exported.xcframework_locations.contains_key(&facts.config.0) {
             exported
                 .config_properties
                 .insert(facts.config.0.clone(), properties);
@@ -481,31 +521,37 @@ fn exported_location(
     install: Option<&InstallManifest>,
     target: &ResolvedTarget,
     path: &BString,
+    layout: &crate::ide::BundleKind,
 ) -> Option<BString> {
     let Some(install) = install else {
         return Some(path.clone());
     };
     install.actions.iter().find_map(|action| {
-        let InstallActionKind::Files {
-            files, file_type, ..
-        } = &action.kind
-        else {
-            return None;
-        };
-        if matches!(file_type.as_slice(), b"FILE" | b"PROGRAM")
-            || !files.contains(path)
-            || (!action.configurations.is_empty()
-                && !action
-                    .configurations
-                    .iter()
-                    .any(|name| target.config.matches(name)))
+        if !action.configurations.is_empty()
+            && !action
+                .configurations
+                .iter()
+                .any(|name| target.config.matches(name))
         {
             return None;
         }
-        Some(absolute_path(
-            &action.destination,
-            Lexical::new(path).filename(),
-        ))
+        let installed = match &action.kind {
+            InstallActionKind::Files {
+                files, file_type, ..
+            } if !matches!(file_type.as_slice(), b"FILE" | b"PROGRAM") && files.contains(path) => {
+                Lexical::new(path).filename()
+            }
+            InstallActionKind::Directory { dirs, .. } => {
+                let root = layout.root(path)?;
+                if !dirs.iter().any(|dir| dir == root) {
+                    return None;
+                }
+                path.get(Lexical::new(root).parent().len()..)?
+                    .strip_prefix(b"/")?
+            }
+            _ => return None,
+        };
+        Some(absolute_path(&action.destination, installed))
     })
 }
 

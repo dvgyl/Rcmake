@@ -7,7 +7,8 @@ use rcmake_host::path::to_native;
 use rcmake_model::{BT, DirId, ProjectModel, Target, TargetId, UsageField};
 
 use crate::{
-    LinkFragment, LinkFragmentRole, LinkKind, LinkStep, ResolveError, ResolvedTarget, ide, lower,
+    InterfaceInclude, LinkFragment, LinkFragmentRole, LinkKind, LinkStep, ResolveError,
+    ResolvedTarget, ide, lower,
     sources::{SourcePaths, TargetInputs},
     usage::{ResolvedLinkItem, ResolvedLinkKind, UsageResolver},
 };
@@ -22,11 +23,14 @@ pub(crate) struct ResolvedLink {
     dependencies: Vec<TargetId>,
     module_links: Vec<TargetId>,
     objects: IndexSet<BString>,
+    xcframework_inputs: IndexSet<BString>,
+    xcframework_includes: Vec<InterfaceInclude>,
     ide: Option<IdeLinkSettings>,
 }
 
 struct IdeLinkSettings {
     items: Vec<ide::IdeLinkItem>,
+    xcframeworks: IndexMap<BString, BString>,
     options: Vec<BT<BString>>,
     directories: Vec<BString>,
     rpaths: Vec<BString>,
@@ -155,20 +159,59 @@ pub(crate) fn resolve_link(
             LinkFragmentRole::LibraryPath,
         ));
     }
+    let mut slices = IndexMap::new();
+    if lower::is_darwin(model, target.dir) {
+        for item in link_items(&items) {
+            if let Some(root) = xcframework_root(usage, model, &ctx.config, item)
+                && let indexmap::map::Entry::Vacant(entry) = slices.entry(root.clone())
+            {
+                let slice = paths
+                    .xcframeworks
+                    .select(model, paths, target, &root, &item.text)?;
+                let wrapper = Lexical::new(&slice.library);
+                let framework = wrapper.filename().strip_suffix(b".framework");
+                let include = match framework {
+                    Some(_) => Some(&slice.library),
+                    None => slice.headers.as_ref(),
+                };
+                if let Some(include) = include {
+                    link.xcframework_includes.push(InterfaceInclude {
+                        path: BT::new(include.clone(), item.text.backtrace.clone()),
+                        system: false,
+                    });
+                }
+                if kind != LinkKind::StaticArchive {
+                    let dependency = if let Some(name) = framework {
+                        lower::join(&slice.library, name)
+                    } else {
+                        slice.library.clone()
+                    };
+                    link.xcframework_inputs.insert(dependency);
+                }
+                entry.insert(slice);
+            }
+        }
+    }
     let mut features = Features::new(model, target, paths, &language);
     features.append(
         items.iter().map(Arc::as_ref),
         &mut fragments,
         &mut |item, fragments| {
-            append_link_item(
-                model,
-                usage,
-                resolved,
-                target.dir,
-                &ctx.config,
-                item,
-                fragments,
-            );
+            if let Some(slice) =
+                xcframework_root(usage, model, &ctx.config, item).and_then(|root| slices.get(&root))
+            {
+                append_library_path(model, target.dir, &slice.library, &item.text, fragments);
+            } else {
+                append_link_item(
+                    model,
+                    usage,
+                    resolved,
+                    target.dir,
+                    &ctx.config,
+                    item,
+                    fragments,
+                );
+            }
         },
     )?;
     fragments.sort_by_key(|fragment| fragment.role == LinkFragmentRole::Libraries);
@@ -195,7 +238,14 @@ pub(crate) fn resolve_link(
         output,
     };
     if let Some(flavor) = usage.ide() {
-        let items = ide::collect_link_items(usage, model, &ctx.config, link_items(&items));
+        let mut items = ide::collect_link_items(usage, model, &ctx.config, link_items(&items));
+        for item in &mut items {
+            if let ide::IdeLinkItem::File(path) = item
+                && let Some(slice) = slices.get(&Lexical::new(path).normalize())
+            {
+                *path = slice.library.clone();
+            }
+        }
         let (rpaths, install_name_dir) = if flavor == ide::IdeFlavor::Xcode {
             let libraries = items
                 .iter()
@@ -216,6 +266,10 @@ pub(crate) fn resolve_link(
         };
         link.ide = Some(IdeLinkSettings {
             items,
+            xcframeworks: slices
+                .into_iter()
+                .map(|(root, slice)| (root, slice.library))
+                .collect(),
             options,
             directories: directories.into_iter().map(|entry| entry.value).collect(),
             rpaths,
@@ -254,11 +308,32 @@ pub(crate) fn attach_links(
     for ((target, inputs), link) in resolved.values_mut().zip(inputs.values_mut()).zip(links) {
         if let (Some(facts), Some(settings)) = (&mut target.ide, link.ide) {
             facts.link_items = settings.items;
+            facts.xcframeworks = settings.xcframeworks;
+            for group in &mut facts.compile {
+                for entry in &link.xcframework_includes {
+                    let include = ide::include(entry, ide::IdeFlavor::Xcode);
+                    if !group.includes.contains(&include) {
+                        group.includes.push(include);
+                    }
+                }
+            }
             facts.link_options = settings.options;
             facts.link_directories = settings.directories;
             facts.build_rpaths = settings.rpaths;
             facts.install_name_dir = settings.install_name_dir;
         }
+        for group in &mut target.compile_groups {
+            for include in &link.xcframework_includes {
+                if !group
+                    .includes
+                    .iter()
+                    .any(|entry| entry.path.value == include.path.value)
+                {
+                    group.includes.push(include.clone());
+                }
+            }
+        }
+        inputs.xcframework_inputs = link.xcframework_inputs;
         target.link = link.step;
         target.dependencies = link.dependencies;
         inputs.position_independent = link.position_independent;
@@ -287,6 +362,27 @@ fn link_items(items: &[Arc<ResolvedLinkItem>]) -> impl Iterator<Item = &Resolved
         ResolvedLinkKind::Group { members, .. } => members.as_slice(),
         _ => std::slice::from_ref(item.as_ref()),
     })
+}
+
+fn xcframework_root(
+    usage: &UsageResolver<'_>,
+    model: &ProjectModel,
+    config: &ConfigId,
+    item: &ResolvedLinkItem,
+) -> Option<BString> {
+    let path = match item.kind {
+        ResolvedLinkKind::Library(id) if model.target(id)?.is_imported() => {
+            usage.artifact(id, ArtifactKind::File, ArtifactPart::Full, config)?
+        }
+        ResolvedLinkKind::Raw if Lexical::new(&item.text.value).absolute() => {
+            item.text.value.clone()
+        }
+        _ => return None,
+    };
+    Lexical::new(&path)
+        .filename()
+        .ends_with(b".xcframework")
+        .then(|| Lexical::new(&path).normalize())
 }
 
 fn append_link_item(

@@ -79,6 +79,38 @@ impl UsageResolver<'_> {
             .map(|artifact| artifact.part(part)))
     }
 
+    pub(super) fn expression_artifact(
+        &self,
+        id: TargetId,
+        kind: ArtifactKind,
+        part: ArtifactPart,
+        config: &ConfigId,
+    ) -> Result<Option<BString>, ResolveError> {
+        let Some(mut artifact) = self.output_artifact(id, kind, part, config)? else {
+            return Ok(None);
+        };
+        if matches!(
+            kind,
+            ArtifactKind::File | ArtifactKind::LinkerFile | ArtifactKind::LinkerLibraryFile
+        ) && Lexical::new(&artifact.path)
+            .filename()
+            .ends_with(b".xcframework")
+            && let Some(paths) = self.source_paths()
+            && let Some(target) = self
+                .model
+                .target(id)
+                .filter(|target| target.is_imported() && lower::is_darwin(self.model, target.dir))
+        {
+            let root = Lexical::new(&artifact.path).normalize();
+            let origin = BT::new(root.clone(), target.backtrace.clone());
+            let slice = paths
+                .xcframeworks
+                .select(self.model, paths, target, &root, &origin)?;
+            artifact = Artifact::from_path(slice.library, &artifact.prefix, &artifact.suffix);
+        }
+        Ok(Some(artifact.part(part)))
+    }
+
     fn output_artifact(
         &self,
         id: TargetId,
@@ -93,7 +125,11 @@ impl UsageResolver<'_> {
         };
         let variable = |name: &[u8]| definition(self.model, target.dir, name).cloned();
         let system = variable(b"CMAKE_SYSTEM_NAME").unwrap_or_default();
-        let platform = ArtifactPlatform::new(&system, self.ide);
+        let platform = ArtifactPlatform::new(
+            &system,
+            self.ide,
+            lower::apple::variant(self.model, target.dir),
+        );
         let ArtifactPlatform {
             apple,
             windows,
@@ -191,10 +227,14 @@ impl UsageResolver<'_> {
         } = naming;
         let config_upper = BString::from(config.0.to_ascii_uppercase());
         let bundle = kind == BundleDir || kind == BundleContentDir;
-        let app = apple && target.kind == Executable && on(target, b"MACOSX_BUNDLE");
-        let framework = apple && target.kind.is_library() && on(target, b"FRAMEWORK");
-        let module_bundle =
-            apple && matches!(crate::ide::bundle_kind(target), BundleKind::Bundle { .. });
+        let layout = if apple {
+            crate::ide::bundle_kind(target)
+        } else {
+            BundleKind::None
+        };
+        let app = matches!(layout, BundleKind::App { .. });
+        let framework = matches!(layout, BundleKind::Framework { .. });
+        let module_bundle = matches!(layout, BundleKind::Bundle { .. });
         if (bundle && !(app || framework || module_bundle))
             || (kind == PdbFile && !windows)
             || (kind == SonameFile && (windows || on(target, b"NO_SONAME")))
@@ -276,21 +316,9 @@ impl UsageResolver<'_> {
             Some(version) => [p, n, s, b".", version.as_slice()].concat(),
             None => [p, n, s].concat(),
         };
-        let subdir = if app {
-            let extension = target
-                .props
-                .get(b"BUNDLE_EXTENSION")
-                .map_or(b"app".as_slice(), |value| value.as_slice());
-            [n, b".", extension].concat()
-        } else if framework {
-            [n, b".framework"].concat()
-        } else if let BundleKind::Bundle { extension } = crate::ide::bundle_kind(target)
-            && module_bundle
-        {
+        let subdir = layout.extension().map_or_else(Vec::new, |extension| {
             [n, b".", extension.as_slice()].concat()
-        } else {
-            Vec::new()
-        };
+        });
         let mut path = Lexical::new(&dir).append(&subdir);
         if kind == BundleDir {
             return Ok(Some(Artifact::from_path(path, b"", b"")));
@@ -303,13 +331,11 @@ impl UsageResolver<'_> {
         }
         if (app || module_bundle) && desktop_apple {
             path = Lexical::new(&path).append(b"MacOS");
-        } else if framework && desktop_apple && kind != LinkerFile {
-            let version = target
-                .props
-                .get(b"FRAMEWORK_VERSION")
-                .or(target.props.get(b"VERSION"));
-            let version = version.map_or(b"A".as_slice(), |value| value.as_slice());
-            path = Lexical::new(&Lexical::new(&path).append(b"Versions")).append(version);
+        } else if desktop_apple
+            && kind != LinkerFile
+            && let BundleKind::Framework { version, .. } = layout
+        {
+            path = Lexical::new(&Lexical::new(&path).append(b"Versions")).append(&version);
         }
         path = Lexical::new(&path).append(&file);
         Ok(Some(Artifact {
@@ -574,7 +600,7 @@ struct ArtifactPlatform {
 }
 
 impl ArtifactPlatform {
-    fn new(system: &[u8], ide: Option<IdeFlavor>) -> Self {
+    fn new(system: &[u8], ide: Option<IdeFlavor>, variant: Option<lower::apple::Variant>) -> Self {
         let xcode = ide == Some(IdeFlavor::Xcode);
         let vs = ide == Some(IdeFlavor::VisualStudio);
         let apple = xcode
@@ -584,7 +610,8 @@ impl ArtifactPlatform {
                     b"Darwin" | b"iOS" | b"tvOS" | b"watchOS" | b"visionOS"
                 ) || (system.is_empty() && cfg!(target_os = "macos"))));
         let windows = vs || (!xcode && (system.starts_with(b"Windows") || system == b"CYGWIN"));
-        let desktop_apple = system == b"Darwin"
+        let desktop_apple = variant == Some(lower::apple::Variant::Catalyst)
+            || system == b"Darwin"
             || system.is_empty()
             || (xcode && !matches!(system, b"iOS" | b"tvOS" | b"watchOS" | b"visionOS"));
         Self {

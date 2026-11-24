@@ -240,8 +240,13 @@ fn lower_install_rules<E>(
                     };
                     let matching: Vec<_> = targets.iter().filter(|t| t.id == *id).collect();
                     for target in &matching {
+                        let layout = if super::is_darwin(model, raw.dir) {
+                            crate::ide::bundle_kind(raw)
+                        } else {
+                            crate::ide::BundleKind::None
+                        };
                         let Some((class, file_type, fallback)) =
-                            target_install_kind(target.metadata.kind)
+                            target_install_kind(target.metadata.kind, &layout)
                         else {
                             continue;
                         };
@@ -263,7 +268,16 @@ fn lower_install_rules<E>(
                             compute_artifacts(model, raw, &target.config)
                         };
                         let bin = &model.dir(DirId::ROOT).binary_dir;
-                        let mut files = artifact_paths(&artifacts, extra);
+                        let bundle_root = artifacts
+                            .file
+                            .as_ref()
+                            .and_then(|file| layout.root(file))
+                            .map(BString::from);
+                        let mut files = if layout == crate::ide::BundleKind::None {
+                            artifact_paths(&artifacts, extra)
+                        } else {
+                            bundle_root.iter().collect()
+                        };
                         let (key, default) = fallback;
                         let default =
                             definition(model, rule.dir, key).map_or(default, |v| v.as_slice());
@@ -306,7 +320,14 @@ fn lower_install_rules<E>(
                             let action = make_action(
                                 &options,
                                 default,
-                                file_action(file_type, files, &options),
+                                if layout == crate::ide::BundleKind::None {
+                                    file_action(file_type, files, &options)
+                                } else {
+                                    InstallActionKind::Directory {
+                                        dirs: files,
+                                        options: vec!["USE_SOURCE_PERMISSIONS".into()],
+                                    }
+                                },
                             );
                             let edit_action = macho_rpath.map(|edit| InstallAction {
                                 kind: InstallActionKind::Code(edit.render(
@@ -362,7 +383,11 @@ fn lower_install_rules<E>(
                             }
                         }
                     }
-                    if let Some(headers) = raw.props.get(b"PUBLIC_HEADER") {
+                    if !matches!(
+                        crate::ide::bundle_kind(raw),
+                        crate::ide::BundleKind::Framework { .. }
+                    ) && let Some(headers) = raw.props.get(b"PUBLIC_HEADER")
+                    {
                         let files: Vec<_> = list::split(headers, list::Empty::Drop)
                             .iter()
                             .map(|path| join(source, path))
@@ -598,7 +623,24 @@ fn file_action(
 
 type TargetInstallKind = (&'static [u8], &'static [u8], (&'static [u8], &'static [u8]));
 
-fn target_install_kind(kind: TargetKind) -> Option<TargetInstallKind> {
+fn target_install_kind(
+    kind: TargetKind,
+    layout: &crate::ide::BundleKind,
+) -> Option<TargetInstallKind> {
+    use crate::ide::BundleKind;
+    match layout {
+        BundleKind::Framework { .. } => {
+            return Some((
+                b"FRAMEWORK",
+                b"DIRECTORY",
+                (b"CMAKE_INSTALL_LIBDIR", b"lib"),
+            ));
+        }
+        BundleKind::App { .. } => {
+            return Some((b"BUNDLE", b"DIRECTORY", (b"CMAKE_INSTALL_BINDIR", b"bin")));
+        }
+        _ => {}
+    }
     match kind {
         TargetKind::Executable => {
             Some((b"RUNTIME", b"EXECUTABLE", (b"CMAKE_INSTALL_BINDIR", b"bin")))

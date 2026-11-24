@@ -1,10 +1,14 @@
 //! Project and target build settings for each configuration.
 
-use std::path::{Path, PathBuf};
+use std::{
+    collections::BTreeSet,
+    path::{Path, PathBuf},
+};
 
 use rcmake_gen_common::GenError;
 
-use rcmake_base::{list as cmake_list, truth};
+use rcmake_base::{BString, list as cmake_list, truth};
+use rcmake_diag::{PolicyId, PolicyStatus};
 use rcmake_model::{DirId, ParsedToolset, ProjectModel, Target, TargetKind};
 use rcmake_resolve::{
     BuildStep, GenerationResult, ResolvedTarget,
@@ -126,27 +130,7 @@ impl Product {
             dir: dir.to_string_lossy().into_owned(),
             prefix: affix("PREFIX", prefix),
             suffix: affix("SUFFIX", suffix),
-            bundle: if on(raw, b"MACOSX_BUNDLE") {
-                BundleKind::App
-            } else if on(raw, b"FRAMEWORK") {
-                BundleKind::Framework {
-                    version: raw
-                        .props
-                        .get(b"FRAMEWORK_VERSION")
-                        .cloned()
-                        .unwrap_or_else(|| "A".into()),
-                }
-            } else if on(raw, b"BUNDLE") {
-                BundleKind::Bundle {
-                    extension: raw
-                        .props
-                        .get(b"BUNDLE_EXTENSION")
-                        .cloned()
-                        .unwrap_or_else(|| "bundle".into()),
-                }
-            } else {
-                BundleKind::None
-            },
+            bundle: rcmake_resolve::ide::bundle_kind(raw),
             kind,
             version: version(b"VERSION"),
             soversion: version(b"SOVERSION"),
@@ -155,17 +139,15 @@ impl Product {
     }
 
     pub(crate) fn file(&self) -> String {
-        match &self.bundle {
-            BundleKind::App => format!("{}.app", self.name),
-            BundleKind::Framework { .. } => format!("{}.framework", self.name),
-            BundleKind::Bundle { extension } => format!("{}.{}", self.name, text(extension)),
-            BundleKind::None => format!("{}{}{}", self.prefix, self.name, self.suffix),
-        }
+        self.bundle.extension().map_or_else(
+            || format!("{}{}{}", self.prefix, self.name, self.suffix),
+            |extension| format!("{}.{}", self.name, text(extension)),
+        )
     }
 
     pub(crate) fn types(&self) -> (&'static str, &'static str) {
         match self.bundle {
-            BundleKind::App => ("application", "wrapper.application"),
+            BundleKind::App { .. } => ("application", "wrapper.application"),
             BundleKind::Framework { .. } => ("framework", "wrapper.framework"),
             BundleKind::Bundle { .. } => ("bundle", "wrapper.cfbundle"),
             BundleKind::None => match self.kind {
@@ -273,7 +255,14 @@ fn project_defaults(
     ]);
     let deployment = value(b"CMAKE_OSX_DEPLOYMENT_TARGET");
     if !deployment.is_empty() {
-        settings.insert("MACOSX_DEPLOYMENT_TARGET".into(), deployment.into());
+        let platform = match value(b"CMAKE_SYSTEM_NAME").as_str() {
+            "iOS" => "IPHONEOS",
+            "tvOS" => "TVOS",
+            "watchOS" => "WATCHOS",
+            "visionOS" => "XROS",
+            _ => "MACOSX",
+        };
+        settings.insert(format!("{platform}_DEPLOYMENT_TARGET"), deployment.into());
     }
     if config != "Debug" {
         settings.insert("SWIFT_COMPILATION_MODE".into(), "wholemodule".into());
@@ -325,6 +314,7 @@ pub(crate) struct TargetSettings<'a> {
     pub(crate) arch: &'a str,
     pub(crate) raw: &'a Target,
     pub(crate) target: Option<&'a ResolvedTarget>,
+    pub(crate) xcframeworks: &'a BTreeSet<BString>,
 }
 
 impl TargetSettings<'_> {
@@ -332,6 +322,16 @@ impl TargetSettings<'_> {
         let mut settings =
             project_defaults(self.model, self.raw.dir, self.bin, self.arch, self.config);
         let ide = self.target.and_then(|target| target.ide.as_deref());
+        let arch_key = format!("OSX_ARCHITECTURES_{}", self.config.to_ascii_uppercase());
+        if let Some(arches) = self
+            .raw
+            .props
+            .get(arch_key.as_bytes())
+            .or_else(|| self.raw.props.get(b"OSX_ARCHITECTURES"))
+            .filter(|arches| !arches.is_empty())
+        {
+            settings.insert("ARCHS".into(), text(arches).replace(';', " ").into());
+        }
         self.add_product_settings(&mut settings, product, plist);
         self.add_compile_settings(&mut settings, ide);
         self.add_link_settings(&mut settings, product, ide);
@@ -393,7 +393,7 @@ impl TargetSettings<'_> {
         ]));
         if !matches!(
             product.bundle,
-            BundleKind::App | BundleKind::Framework { .. }
+            BundleKind::App { .. } | BundleKind::Framework { .. }
         ) {
             settings.extend(attrs([
                 ("EXECUTABLE_PREFIX", product.prefix.clone().into()),
@@ -407,12 +407,14 @@ impl TargetSettings<'_> {
             );
             settings.insert("CODE_SIGNING_ALLOWED".into(), "NO".into());
         }
+        if let Some(extension) = product.bundle.extension() {
+            settings.insert("WRAPPER_EXTENSION".into(), text(extension).into());
+        }
         match &product.bundle {
-            BundleKind::Framework { version } => {
+            BundleKind::Framework { version, .. } => {
                 settings.insert("FRAMEWORK_VERSION".into(), text(version).into());
             }
-            BundleKind::Bundle { extension } => {
-                settings.insert("WRAPPER_EXTENSION".into(), text(extension).into());
+            BundleKind::Bundle { .. } => {
                 settings.insert("MACH_O_TYPE".into(), "mh_bundle".into());
             }
             _ => {}
@@ -482,16 +484,25 @@ impl TargetSettings<'_> {
                     flags.push(format!("-include {}", xcode_flag(&text(&pch.header))));
                 }
             }
-            flags.push(INHERITED.into());
-            settings.insert(key.into(), flags.join(" ").into());
+            settings.insert(key.into(), flags_with_inherited(flags));
         }
-        for (key, mut values) in [
+        if let Some(ide) = ide {
+            for item in &ide.link_items {
+                if let IdeLinkItem::File(path) | IdeLinkItem::Framework(path) = item
+                    && let Some(parent) = framework_search_path(path)
+                {
+                    unique(&mut frameworks, parent);
+                }
+            }
+        }
+        for (key, values) in [
             ("GCC_PREPROCESSOR_DEFINITIONS", defines),
             ("HEADER_SEARCH_PATHS", headers),
             ("FRAMEWORK_SEARCH_PATHS", frameworks),
         ] {
-            let values = values.drain(..).map(|value| xcode_flag(&value));
-            settings.insert(key.into(), list(values.chain([INHERITED.into()])));
+            if !values.is_empty() {
+                settings.insert(key.into(), inherited_paths(values));
+            }
         }
         let raw = self.raw;
         if let Some(standard) = raw
@@ -528,7 +539,15 @@ impl TargetSettings<'_> {
         let mut ldflags = Vec::new();
         let mut libraries = Vec::new();
         if let Some(ide) = ide {
-            libraries.extend(ide.link_directories.iter().map(|dir| text(dir)));
+            let use_config_directory =
+                raw.policies.policies.get(PolicyId::new(142)) != PolicyStatus::New;
+            for directory in &ide.link_directories {
+                let directory = text(directory);
+                if use_config_directory {
+                    libraries.push(format!("{}/{CONFIG_DIR}", directory.trim_end_matches('/')));
+                }
+                libraries.push(directory);
+            }
             ldflags.extend(
                 ide.link_options
                     .iter()
@@ -579,14 +598,20 @@ impl TargetSettings<'_> {
                         ldflags.push(xcode_flag(&format!("-l{}", text(name))))
                     }
                     IdeLinkItem::File(path) => {
-                        if !ide.sources.iter().any(|source| {
-                            source.path == *path
-                                && matches!(
-                                    source.kind,
-                                    rcmake_resolve::ide::IdeSourceKind::Object
-                                        | rcmake_resolve::ide::IdeSourceKind::ExternalObject
-                                )
-                        }) {
+                        let in_frameworks_phase = self
+                            .xcframeworks
+                            .iter()
+                            .any(|root| ide.xcframeworks.get(root) == Some(path));
+                        if !in_frameworks_phase
+                            && !ide.sources.iter().any(|source| {
+                                source.path == *path
+                                    && matches!(
+                                        source.kind,
+                                        rcmake_resolve::ide::IdeSourceKind::Object
+                                            | rcmake_resolve::ide::IdeSourceKind::ExternalObject
+                                    )
+                            })
+                        {
                             ldflags.push(link_file(&text(path)));
                         }
                     }
@@ -620,17 +645,10 @@ impl TargetSettings<'_> {
         } else {
             ldflags.splice(0..0, objects);
         }
-        ldflags.push(INHERITED.into());
-        settings.insert("OTHER_LDFLAGS".into(), ldflags.join(" ").into());
-        settings.insert(
-            "LIBRARY_SEARCH_PATHS".into(),
-            list(
-                libraries
-                    .into_iter()
-                    .map(|path| xcode_flag(&path))
-                    .chain([INHERITED.into()]),
-            ),
-        );
+        settings.insert("OTHER_LDFLAGS".into(), flags_with_inherited(&ldflags));
+        if !libraries.is_empty() {
+            settings.insert("LIBRARY_SEARCH_PATHS".into(), inherited_paths(libraries));
+        }
         if product.kind == TargetKind::SharedLibrary {
             if let Some(version) = product.version.as_ref().or(product.soversion.as_ref()) {
                 settings.insert("DYLIB_CURRENT_VERSION".into(), version.clone().into());
@@ -776,6 +794,42 @@ fn link_file(path: &str) -> String {
         ));
     }
     xcode_flag(path)
+}
+
+fn inherited_paths(values: Vec<String>) -> Value {
+    list(
+        values
+            .into_iter()
+            .chain([INHERITED.into()])
+            .map(Value::QuotedText),
+    )
+}
+
+fn flags_with_inherited(flags: &[String]) -> Value {
+    list([
+        Value::QuotedText(flags.join(" ")),
+        Value::QuotedText(INHERITED.into()),
+    ])
+}
+
+fn framework_search_path(path: &[u8]) -> Option<String> {
+    let path = rcmake_base::path_lex::Lexical::new(path);
+    if !path.absolute() {
+        return None;
+    }
+    let mut candidate = path.relative_part();
+    let mut wrapper = path;
+    loop {
+        if wrapper.filename().ends_with(b".framework") {
+            return Some(text(wrapper.parent()));
+        }
+        let parent = wrapper.parent();
+        if parent.is_empty() || parent == candidate {
+            return None;
+        }
+        candidate = parent;
+        wrapper = rcmake_base::path_lex::Lexical::new(parent);
+    }
 }
 
 fn unique(values: &mut Vec<String>, value: String) {

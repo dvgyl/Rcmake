@@ -509,6 +509,8 @@ pub struct ExportedTarget {
     pub properties: IndexMap<BString, BString>,
     /// Per-configuration `IMPORTED_*` properties.
     pub config_properties: IndexMap<BString, IndexMap<BString, BString>>,
+    /// Alternative XCFramework locations by configuration.
+    pub xcframework_locations: IndexMap<BString, BString>,
     /// Source file sets to declare on the imported target.
     pub source_sets: Vec<ExportedSourceSet>,
 }

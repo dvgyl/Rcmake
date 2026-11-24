@@ -8,6 +8,8 @@ use rcmake_host::{CommandSpec, Input, Output, ProcessResult, RunRequest, path};
 use rcmake_model::DirId;
 use rcmake_resolve::BuildStep;
 
+mod apple;
+
 use super::args::Options;
 use super::seed::toolchain_variable;
 use super::{TIMEOUT, absolute, set_result};
@@ -27,6 +29,7 @@ pub(super) fn build_child(
             model.dir_mut(DirId::ROOT).props.set(name, value);
         }
     }
+    apple::resolve(child, &mut model, directory, &config)?;
     let graph = rcmake_resolve::resolve(&model, child.host(), std::slice::from_ref(&config))
         .map_err(|error| error.to_string())?
         .graphs

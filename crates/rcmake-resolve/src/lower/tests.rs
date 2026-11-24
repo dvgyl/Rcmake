@@ -445,7 +445,7 @@ fn compile_flag_order_matches_the_lowering_contract() -> TestResult {
             "/system include",
             "-isystem",
             "/system dot/.",
-            "-F/Framework Path/"
+            "-I/Framework Path/Foo.framework/Headers"
         ]));
     assert!(
         matches!(graph.steps.last(), Some(BuildStep::Link { step, .. }) if step.language == "CXX")

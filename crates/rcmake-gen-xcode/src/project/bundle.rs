@@ -133,7 +133,7 @@ impl Project<'_> {
     ) -> Result<Option<PathBuf>, GenError> {
         let (template, prefix, executable_key, package) = match product.bundle {
             BundleKind::None => return Ok(None),
-            BundleKind::App => (
+            BundleKind::App { .. } => (
                 "MacOSXBundleInfo.plist.in",
                 "MACOSX_BUNDLE",
                 "MACOSX_BUNDLE_EXECUTABLE_NAME",

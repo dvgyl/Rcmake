@@ -689,10 +689,10 @@ fn export(cx: &mut Cx<'_>, input: &[ExpandedArg]) -> CmdResult {
         }
         return Ok(Flow::Normal);
     }
-    let packages = matches!(*signature, b"EXPORT" | b"SETUP") && package_dependencies::enabled(cx);
-    if *signature == b"SETUP" && packages {
+    if *signature == b"SETUP" {
         return package_dependencies::setup(cx, rest);
     }
+    let packages = *signature == b"EXPORT" && package_dependencies::enabled(cx);
     let normalized;
     let input = if *signature == b"EXPORT" {
         normalized = export_options::normalize(cx, &input)?;

@@ -136,6 +136,7 @@ pub(crate) fn append_compile_flags(
 
 #[derive(Default)]
 pub(crate) struct TargetInputs {
+    pub(crate) xcframework_inputs: IndexSet<BString>,
     pub(crate) sources: IndexSet<BString>,
     pub(crate) objects: IndexSet<BString>,
     pub(crate) sources_without_pch: IndexSet<BString>,
@@ -146,6 +147,7 @@ pub(crate) struct TargetInputs {
 
 pub(crate) struct SourcePaths<'a> {
     pub(crate) host: &'a dyn Host,
+    pub(crate) xcframeworks: crate::xcframework::Plists,
     pub(crate) ide: Option<crate::ide::IdeFlavor>,
     generated: IndexMap<BString, IndexSet<BString>>,
     objects: IndexMap<BString, TargetId>,
@@ -156,6 +158,7 @@ impl<'a> SourcePaths<'a> {
     pub(crate) fn new(host: &'a dyn Host) -> Self {
         Self {
             host,
+            xcframeworks: crate::xcframework::Plists::default(),
             ide: None,
             generated: IndexMap::new(),
             objects: IndexMap::new(),

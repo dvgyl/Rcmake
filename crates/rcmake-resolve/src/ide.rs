@@ -15,7 +15,7 @@ use rcmake_base::{BString, list, path_lex::Lexical, truth};
 use rcmake_diag::Backtrace;
 use rcmake_genex::{ConfigId, EvalContext};
 use rcmake_model::{
-    BT, DirId, Directory, FileSetKind, GeneratorKind, ProjectModel, Target, TargetId, TargetKind,
+    BT, DirId, Directory, FileSetKind, GeneratorKind, ProjectModel, Target, TargetId,
 };
 
 use crate::{
@@ -53,6 +53,8 @@ pub struct IdeFacts {
     pub compile: Vec<IdeCompileSettings>,
     /// Link items in link order.
     pub link_items: Vec<IdeLinkItem>,
+    /// XCFramework wrappers and their selected library paths.
+    pub xcframeworks: IndexMap<BString, BString>,
     /// Raw link options (not shell-escaped).
     pub link_options: Vec<BT<BString>>,
     /// Link directories.
@@ -87,25 +89,7 @@ pub struct OutputNaming {
     pub soversion: Option<BString>,
 }
 
-/// Apple bundle form of a target.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub enum BundleKind {
-    /// Not a bundle.
-    #[default]
-    None,
-    /// `MACOSX_BUNDLE` executable (`.app`).
-    App,
-    /// `FRAMEWORK` library.
-    Framework {
-        /// `FRAMEWORK_VERSION` (default `A`).
-        version: BString,
-    },
-    /// `BUNDLE` module or library.
-    Bundle {
-        /// `BUNDLE_EXTENSION` (default `bundle`).
-        extension: BString,
-    },
-}
+pub use crate::lower::framework::{BundleKind, bundle_kind};
 
 /// The role of one file in an IDE project.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -243,39 +227,6 @@ impl IdeFlavor {
             Some(GeneratorKind::VisualStudio(_)) => Some(Self::VisualStudio),
             _ => None,
         }
-    }
-}
-
-pub(crate) fn bundle_kind(target: &Target) -> BundleKind {
-    let on = |key| {
-        target
-            .props
-            .get(key)
-            .is_some_and(|value| truth::is_on(value))
-    };
-    let value = |key, fallback: &str| {
-        target
-            .props
-            .get(key)
-            .cloned()
-            .unwrap_or_else(|| fallback.into())
-    };
-    match target.kind {
-        TargetKind::Executable if on(b"MACOSX_BUNDLE") => BundleKind::App,
-        TargetKind::StaticLibrary | TargetKind::SharedLibrary if on(b"FRAMEWORK") => {
-            BundleKind::Framework {
-                version: target
-                    .props
-                    .get(b"FRAMEWORK_VERSION")
-                    .or_else(|| target.props.get(b"VERSION"))
-                    .cloned()
-                    .unwrap_or_else(|| "A".into()),
-            }
-        }
-        TargetKind::ModuleLibrary if on(b"BUNDLE") => BundleKind::Bundle {
-            extension: value(b"BUNDLE_EXTENSION", "bundle"),
-        },
-        _ => BundleKind::None,
     }
 }
 
@@ -635,21 +586,11 @@ fn compile_settings(group: &CompileGroup, flavor: IdeFlavor) -> IdeCompileSettin
     }
 }
 
-fn include(entry: &InterfaceInclude, flavor: IdeFlavor) -> IdeInclude {
+pub(crate) fn include(entry: &InterfaceInclude, flavor: IdeFlavor) -> IdeInclude {
     let path = &entry.path.value;
-    let framework = (flavor == IdeFlavor::Xcode)
-        .then(|| {
-            path.split_inclusive(|&byte| byte == b'/')
-                .scan(0, |index, part| {
-                    let offset = *index;
-                    *index += part.len();
-                    Some((offset, part.strip_suffix(b"/").unwrap_or(part)))
-                })
-                .find(|(_, part)| part.ends_with(b".framework"))
-                .and_then(|(index, _)| path.get(..index))
-                .map(|parent| Lexical::new(parent).parent().into())
-        })
-        .flatten();
+    let wrapper = Lexical::new(lower::without_trailing_slashes(path));
+    let framework = (flavor == IdeFlavor::Xcode && wrapper.filename().ends_with(b".framework"))
+        .then(|| BString::from(wrapper.parent()));
     IdeInclude {
         framework: framework.is_some(),
         path: framework.unwrap_or_else(|| path.clone()),

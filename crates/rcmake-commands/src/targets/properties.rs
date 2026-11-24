@@ -111,6 +111,7 @@ pub(super) fn get(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
         ));
     };
     let dir = cx.current_dir_id();
+    let config = rcmake_genex::ConfigId(cx.var_or_empty(b"CMAKE_BUILD_TYPE"));
     let model = cx.project();
     let Some(binding) = model.lookup_target(dir, bytes(name)) else {
         return Err(super::reported(
@@ -130,6 +131,11 @@ pub(super) fn get(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
         (TargetBinding::Alias(_), b"ALIAS_GLOBAL") => {
             let local = model.dir(dir).local_targets.contains_key(bytes(name));
             Some(if local { "FALSE" } else { "TRUE" }.into())
+        }
+        (_, b"LOCATION") if model.target(binding.id()).is_some_and(Target::is_imported) => {
+            model.target(binding.id()).and_then(|target| {
+                rcmake_resolve::lower::compute_artifacts(model, target, &config).file
+            })
         }
         (_, b"MANUALLY_ADDED_DEPENDENCIES") => model.target(binding.id()).and_then(|target| {
             let mut deps: Vec<_> = target

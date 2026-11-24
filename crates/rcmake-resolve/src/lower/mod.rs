@@ -1,8 +1,10 @@
 //! Lowering of resolved targets into a build graph and install manifest.
 
+pub(crate) mod apple;
 mod artifacts;
 mod compile;
 mod custom;
+pub(crate) mod framework;
 mod graph;
 mod install;
 mod install_rpath;
@@ -64,7 +66,7 @@ fn target_property<'a>(
         .or_else(|| definition(model, target.dir, &[b"CMAKE_", key].concat()))
 }
 
-fn join(base: &[u8], path: &[u8]) -> BString {
+pub(crate) fn join(base: &[u8], path: &[u8]) -> BString {
     if path.is_empty() {
         base.into()
     } else {

@@ -442,7 +442,7 @@ impl<'a> TargetPlan<'a> {
                 &mut self.dependencies,
                 self.ide_steps.as_mut(),
             )?;
-            let after = commands.events(
+            let mut after = commands.events(
                 resolved.id,
                 &[Some(TargetEvent::PostBuild)],
                 usage,
@@ -451,11 +451,28 @@ impl<'a> TargetPlan<'a> {
                 self.ide_steps.as_mut(),
             )?;
             let position_independent = self.inputs.and_then(|inputs| inputs.position_independent);
+            let mut linker_artifacts = artifacts.clone();
+            if super::is_darwin(model, target.dir)
+                && matches!(
+                    crate::ide::bundle_kind(target),
+                    crate::ide::BundleKind::Framework { .. }
+                )
+                && usage.ide().is_none()
+                && let Some(paths) = usage.source_paths()
+            {
+                let framework = super::framework::prepare(model, target, artifacts, paths.host)?;
+                after.invocations.splice(..0, framework.invocations);
+                after.depends.extend(framework.depends);
+                after.byproducts.extend(framework.byproducts);
+                linker_artifacts
+                    .linker_file
+                    .clone_from(&linker_artifacts.file);
+            }
             let link = link(
                 model,
                 target,
                 config,
-                artifacts,
+                &linker_artifacts,
                 step,
                 objects,
                 position_independent,
@@ -468,6 +485,16 @@ impl<'a> TargetPlan<'a> {
                 }
                 error
             })?;
+            let mut link = link;
+            if let (BuildStep::Link { inputs, .. }, Some(target_inputs)) = (&mut link, self.inputs)
+            {
+                for dependency in &target_inputs.xcframework_inputs {
+                    let dependency = super::build_relative(model, dependency);
+                    if !inputs.contains(&dependency) {
+                        inputs.push(dependency);
+                    }
+                }
+            }
             let link = attach_link_events(model, artifacts, link, before, after);
             self.steps.insert(push(graph_steps, link));
         } else {

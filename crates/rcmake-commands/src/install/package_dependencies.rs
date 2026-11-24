@@ -13,15 +13,41 @@ pub(super) fn setup(cx: &mut Cx<'_>, args: &[&[u8]]) -> CmdResult {
     let [set, options @ ..] = args else {
         return Err(fail("SETUP requires an export set name."));
     };
+    let packages = options.contains(&b"PACKAGE_DEPENDENCY".as_slice()) && enabled(cx);
+    cx.project()
+        .exports
+        .entry((*set).into())
+        .or_insert_with(|| rcmake_model::ExportSet {
+            name: (*set).into(),
+            ..Default::default()
+        });
     let mut options = options;
     while let Some((&key, tail)) = options.split_first() {
         let (section, rest) = tail.split_at(
             tail.iter()
-                .position(|value| *value == b"PACKAGE_DEPENDENCY")
+                .position(|value| matches!(*value, b"PACKAGE_DEPENDENCY" | b"TARGET"))
                 .unwrap_or(tail.len()),
         );
         options = rest;
-        if key != b"PACKAGE_DEPENDENCY" {
+        if key == b"TARGET" {
+            match section {
+                [name, b"XCFRAMEWORK_LOCATION", location] => {
+                    cx.project()
+                        .export_xcframeworks
+                        .entry((*set).into())
+                        .or_default()
+                        .insert((*name).into(), (*location).into());
+                }
+                [_, unexpected, ..] => return Err(super::unknown(unexpected)),
+                _ => {
+                    return Err(fail(
+                        "TARGET requires a target name and XCFRAMEWORK_LOCATION.",
+                    ));
+                }
+            }
+            continue;
+        }
+        if key != b"PACKAGE_DEPENDENCY" || !packages {
             return Err(super::unknown(key));
         }
         let [name, settings @ ..] = section else {

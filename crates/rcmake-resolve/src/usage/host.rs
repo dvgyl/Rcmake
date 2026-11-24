@@ -189,7 +189,7 @@ impl GenexHost for ModelGenexHost<'_, '_> {
         };
         let path = self
             .resolver
-            .checked_artifact(id, kind, part, config)
+            .expression_artifact(id, kind, part, config)
             .map_err(genex_error)?;
         if path.is_none() {
             return Ok(None);

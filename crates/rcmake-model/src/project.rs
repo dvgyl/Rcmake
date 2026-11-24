@@ -60,6 +60,8 @@ pub struct ProjectModel {
     pub exports: IndexMap<BString, ExportSet>,
     /// `export()` calls that write build-tree files, in call order.
     pub build_exports: Vec<BuildExport>,
+    /// XCFramework alternatives by export set and target name.
+    pub export_xcframeworks: IndexMap<BString, IndexMap<BString, BString>>,
     /// Package setup options by export set and package name, in call order.
     pub export_dependencies: IndexMap<BString, IndexMap<BString, ExportDependencySetup>>,
     /// Package names in the order in which lookups began.

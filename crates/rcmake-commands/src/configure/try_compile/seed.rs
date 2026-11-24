@@ -41,6 +41,7 @@ pub(super) fn toolchain_variable(name: &[u8]) -> bool {
                 | b"CMAKE_RANLIB"
                 | b"CMAKE_MAKE_PROGRAM"
                 | b"_CMAKE_OSX_SYSROOT_PATH"
+                | b"_CMAKE_APPLE_ARCHS_DEFAULT"
         )
 }
 
@@ -91,16 +92,12 @@ impl TryCompileSeed {
         ] {
             seed_var(cx, &mut defines, name.as_bytes());
         }
-        if cx.var_or_empty(b"CMAKE_SYSTEM_NAME") == b"Darwin" {
-            let sysroot = cx.var_or_empty(b"CMAKE_OSX_SYSROOT");
-            let resolved = cx.var_or_empty(b"_CMAKE_OSX_SYSROOT_PATH");
-            if !sysroot.contains(&b'/') && !resolved.is_empty() {
-                defines.push(CacheDefine {
-                    name: "CMAKE_OSX_SYSROOT".into(),
-                    ty: Some(CacheType::Path),
-                    value: resolved,
-                });
-            }
+        if let Some(archs) = cx.var(b"CMAKE_TRY_COMPILE_OSX_ARCHITECTURES") {
+            defines.push(CacheDefine {
+                name: "CMAKE_OSX_ARCHITECTURES".into(),
+                ty: Some(CacheType::String),
+                value: archs,
+            });
         }
         for language in PROBE_LANGUAGES {
             defines.push(CacheDefine {

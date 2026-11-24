@@ -24,6 +24,7 @@ mod resolve_link;
 mod sources;
 mod target;
 mod unity;
+mod xcframework;
 
 pub mod ide;
 pub mod lower;

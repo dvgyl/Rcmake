@@ -45,42 +45,71 @@ pub(super) fn apple_flags(
         .flatten()
         .or_else(|| target_property(model, target, b"OSX_ARCHITECTURES"))
         .map_or_else(Vec::new, |value| list::split(value, list::Empty::Drop));
+    let compiler_target = definition(
+        model,
+        target.dir,
+        &[b"CMAKE_", language, b"_COMPILER_TARGET"].concat(),
+    )
+    .filter(|value| !value.is_empty());
     if architectures.is_empty()
         && matches!(
             language,
             b"C" | b"CXX" | b"OBJC" | b"OBJCXX" | b"ASM" | b"SYCL"
         )
-        && definition(
-            model,
-            target.dir,
-            &[b"CMAKE_", language, b"_COMPILER_TARGET"].concat(),
-        )
-        .is_none_or(|value| value.is_empty())
+        && compiler_target.is_none()
         && let Some(default) = definition(model, target.dir, b"_CMAKE_APPLE_ARCHS_DEFAULT")
     {
         architectures = list::split(default, list::Empty::Drop);
     }
+    let system = super::apple::system(model, target.dir);
+    let variant = super::apple::variant(model, target.dir);
     let mut flags = Vec::new();
-    for arch in architectures {
+    let version = definition(model, target.dir, b"CMAKE_OSX_DEPLOYMENT_TARGET")
+        .map_or(b"".as_slice(), |value| value.as_slice());
+    let triple = match (system, variant) {
+        (b"iOS", Some(super::apple::Variant::Catalyst)) => {
+            Some((b"ios".as_slice(), b"-macabi".as_slice()))
+        }
+        (b"visionOS", Some(super::apple::Variant::Simulator)) => {
+            Some((b"xros".as_slice(), b"-simulator".as_slice()))
+        }
+        (b"visionOS", _) => Some((b"xros".as_slice(), b"".as_slice())),
+        _ => None,
+    };
+    for arch in &architectures {
         flags.push("-arch".into());
-        flags.push(quote(&arch));
+        flags.push(quote(arch));
+    }
+    if let Some((platform, suffix)) = triple
+        && compiler_target.is_none()
+        && !version.is_empty()
+    {
+        let arch = architectures
+            .iter()
+            .find(|arch| *arch == "arm64")
+            .or_else(|| architectures.first())
+            .map_or(b"arm64".as_slice(), |arch| arch.as_slice());
+        flags.push(quote(
+            &[b"--target=", arch, b"-apple-", platform, version, suffix].concat(),
+        ));
     }
     if let Some(sdk) = definition(model, target.dir, b"CMAKE_OSX_SYSROOT").filter(|v| !v.is_empty())
     {
         flags.push("-isysroot".into());
         flags.push(quote(sdk));
     }
-    if let Some(version) =
-        definition(model, target.dir, b"CMAKE_OSX_DEPLOYMENT_TARGET").filter(|v| !v.is_empty())
-    {
-        let prefix: &[u8] =
-            match definition(model, target.dir, b"CMAKE_SYSTEM_NAME").map(|v| v.as_slice()) {
-                Some(b"iOS") => b"-miphoneos-version-min=",
-                Some(b"tvOS") => b"-mtvos-version-min=",
-                Some(b"watchOS") => b"-mwatchos-version-min=",
-                Some(b"visionOS") => b"-mxros-version-min=",
-                _ => b"-mmacosx-version-min=",
-            };
+    if !version.is_empty() && triple.is_none() {
+        let prefix: &[u8] = match (system, variant) {
+            (b"iOS", Some(super::apple::Variant::Simulator)) => b"-mios-simulator-version-min=",
+            (b"iOS", _) => b"-miphoneos-version-min=",
+            (b"tvOS", Some(super::apple::Variant::Simulator)) => b"-mtvos-simulator-version-min=",
+            (b"tvOS", _) => b"-mtvos-version-min=",
+            (b"watchOS", Some(super::apple::Variant::Simulator)) => {
+                b"-mwatchos-simulator-version-min="
+            }
+            (b"watchOS", _) => b"-mwatchos-version-min=",
+            _ => b"-mmacosx-version-min=",
+        };
         flags.push(quote(&[prefix, version].concat()));
     }
     flags
@@ -146,18 +175,15 @@ fn includes(model: &ProjectModel, target: &Target, group: &CompileGroup) -> BStr
         {
             return None;
         }
-        if darwin
-            && let Some(end) = path
-                .split(|&b| b == b'/')
-                .find(|part| part.ends_with(b".framework"))
-        {
-            let framework = path.windows(end.len()).position(|part| part == end);
-            if let Some(index) = framework {
-                let dir = path.get(..index).unwrap_or_default();
-                return Some(quote(
-                    &[b"-F".as_slice(), if dir.is_empty() { b"." } else { dir }].concat(),
-                ));
-            }
+        let wrapper = Lexical::new(without_trailing_slashes(path));
+        if darwin && wrapper.filename().ends_with(b".framework") {
+            let parent = wrapper.parent();
+            let directory = if parent.is_empty() {
+                b".".as_slice()
+            } else {
+                parent
+            };
+            return Some(quote(&[b"-F", directory].concat()));
         }
         Some(if include.system {
             join_words(["-isystem".into(), quote(path)])

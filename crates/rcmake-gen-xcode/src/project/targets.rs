@@ -2,6 +2,7 @@
 
 use std::collections::BTreeSet;
 
+use crate::text;
 use rcmake_base::truth;
 use rcmake_gen_common::GenError;
 
@@ -46,6 +47,28 @@ impl Project<'_> {
         } else {
             None
         };
+        let phase_mode = raw.props.get(b"XCODE_LINK_BUILD_PHASE_MODE").or_else(|| {
+            self.model
+                .definition(raw.dir, b"CMAKE_XCODE_LINK_BUILD_PHASE_MODE")
+        });
+        let mut xcframeworks = BTreeSet::new();
+        if phase_mode.is_some_and(|mode| mode == "KNOWN_LOCATION")
+            && let Some(ide) = first_target.and_then(|facts| facts.ide.as_deref())
+        {
+            xcframeworks.extend(
+                ide.xcframeworks
+                    .keys()
+                    .filter(|root| {
+                        self.configs.iter().all(|config| {
+                            self.resolved
+                                .get(&(*id, config.clone()))
+                                .and_then(|facts| facts.ide.as_deref())
+                                .is_some_and(|ide| ide.xcframeworks.contains_key(*root))
+                        })
+                    })
+                    .cloned(),
+            );
+        }
         for config in &self.configs {
             let facts = self.resolved.get(&(*id, config.clone())).copied();
             let configured_product = Product::new(self.model, raw, facts, config, self.bin);
@@ -91,6 +114,7 @@ impl Project<'_> {
                     arch: &self.arch,
                     raw,
                     target: facts,
+                    xcframeworks: &xcframeworks,
                 }
                 .build(&configured_product, plist.as_deref())
             } else {
@@ -130,7 +154,7 @@ impl Project<'_> {
             format!("Generate CMakeFiles/{name}")
         };
         build_phases.extend(phase(&mut self.objects, custom.rules, "rules", &rule_name)?);
-        let (tree, files) = self.add_sources(
+        let (mut tree, mut files) = self.add_sources(
             &key,
             raw,
             sources.into_iter().flatten(),
@@ -152,6 +176,25 @@ impl Project<'_> {
                 "prelink",
                 "CMake PreLink Rules",
             )?);
+            for root in xcframeworks {
+                let path = text(&root);
+                let file_key = format!("{key}/xcframework/{path}");
+                let reference = file_ref(
+                    &mut self.objects,
+                    &file_key,
+                    &path,
+                    ("lastKnownFileType", "wrapper.xcframework"),
+                    "<absolute>",
+                )?;
+                tree.add("Frameworks", reference.clone())?;
+                files.frameworks.push(phases::build_file(
+                    &mut self.objects,
+                    &format!("{file_key}/build"),
+                    "Frameworks",
+                    &reference,
+                    Attrs::new(),
+                )?);
+            }
             build_phases.push(phases::files(
                 &mut self.objects,
                 Isa::PBXFrameworksBuildPhase,

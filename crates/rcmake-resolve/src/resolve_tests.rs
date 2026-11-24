@@ -1932,10 +1932,16 @@ fn xcode_ide_facts_keep_raw_settings_and_resolve_apple_artifacts() -> TestResult
             .ok_or("Missing framework facts.")?
             .bundle,
         BundleKind::Framework {
+            extension: "framework".into(),
             version: "A".into()
         }
     );
-    assert_eq!(facts.bundle, BundleKind::App);
+    assert_eq!(
+        facts.bundle,
+        BundleKind::App {
+            extension: "app".into()
+        }
+    );
     assert_eq!(
         facts.info_plist,
         Some("/out/CMakeFiles/app.dir/Info.plist".into())
@@ -1994,9 +2000,9 @@ fn xcode_ide_facts_keep_raw_settings_and_resolve_apple_artifacts() -> TestResult
         compile.includes,
         [
             ide::IdeInclude {
-                path: "/sdk".into(),
+                path: "/sdk/Kit.framework/Headers".into(),
                 system: false,
-                framework: true
+                framework: false
             },
             ide::IdeInclude {
                 path: "/path with spaces".into(),
