@@ -1,0 +1,644 @@
+use std::{
+    cell::RefCell,
+    collections::{BTreeMap, BTreeSet},
+    ops::Range,
+    path::{Path, PathBuf},
+};
+
+use rcmake_api::{CompletionKind, ExecutedSymbol, SourceLocation, WorkspaceIndex};
+use rcmake_base::BString;
+use rcmake_diag::{SourceId, source::SourceKind};
+use rcmake_host::{
+    Host, ReadRange,
+    path::{from_native_cmake, to_native},
+};
+use rcmake_json::Value;
+use rcmake_syntax::{ArgKind, Argument, CommandInvocation};
+
+use crate::{
+    Position, PositionEncoding, SemanticContext, SemanticLocation,
+    analysis::Document,
+    expression::{self, Kind as ExprKind},
+    json::{object, uint},
+    lexical,
+    position::{Lines, range},
+    roles::{Arguments, Role, Variable},
+    uri,
+};
+
+use super::{Buffers, EvalSemanticProvider, Snapshot, buffer_path, presentation::Binding};
+
+const MAX_DEFINITIONS: usize = 32;
+const MAX_COMPLETIONS: usize = 256;
+
+impl EvalSemanticProvider {
+    /// Get a Markdown hover and the version of the buffer that supplied it.
+    ///
+    /// A provisional result may come from a partial configure or an earlier edit.
+    #[must_use]
+    pub fn hover_markdown(&self, context: &SemanticContext<'_>) -> Option<(String, Option<i64>)> {
+        self.render_hover(context, true)
+    }
+
+    pub(super) fn render_hover(
+        &self,
+        context: &SemanticContext<'_>,
+        markdown: bool,
+    ) -> Option<(String, Option<i64>)> {
+        let (snapshot, buffers) = self.snapshots.view()?;
+        let query = Query::new(self.host(), &snapshot, &buffers, context)?;
+        let (kind, name) = query.subject()?;
+        let mut sections = Vec::new();
+        for binding in query.bindings(kind, name) {
+            let section = binding.hover(&snapshot.result, markdown);
+            if !sections.contains(&section) {
+                sections.push(section);
+                if sections.len() == 8 {
+                    break;
+                }
+            }
+        }
+        if sections.is_empty() {
+            return None;
+        }
+        let text = sections.join(if markdown { "\n\n---\n\n" } else { "\n\n" });
+        let text = if !query.fresh || query.index.is_provisional() {
+            format!(
+                "{}\n\n{text}",
+                if markdown {
+                    "*(provisional snapshot)*"
+                } else {
+                    "Provisional snapshot."
+                }
+            )
+        } else {
+            text
+        };
+        Some((
+            text,
+            snapshot
+                .document_versions
+                .get(&query.path)
+                .copied()
+                .map(i64::from),
+        ))
+    }
+
+    /// Get evaluated definitions or file destinations in execution order.
+    ///
+    /// When a file executes in several scopes, each distinct location appears
+    /// once. An empty array lets the server use its lexical resolver.
+    #[must_use]
+    pub fn definitions(&self, context: &SemanticContext<'_>) -> Vec<SemanticLocation> {
+        let Some((snapshot, buffers)) = self.snapshots.view() else {
+            return Vec::new();
+        };
+        let Some(query) =
+            Query::new(self.host(), &snapshot, &buffers, context).filter(|query| query.fresh)
+        else {
+            return Vec::new();
+        };
+        let mut locations = Vec::new();
+        if query.on_path_argument() {
+            for path in &query.spellings {
+                let Some(site) = query.site(path) else {
+                    continue;
+                };
+                for edge in query.index.resolve_file_edges(None, &site) {
+                    if !query.source_matches(&edge.site) {
+                        continue;
+                    }
+                    if let Some(uri) = query.file_uri(&edge.destination) {
+                        push_location(
+                            &mut locations,
+                            SemanticLocation {
+                                uri,
+                                start: Position::default(),
+                                end: Position::default(),
+                            },
+                        );
+                        if locations.len() == MAX_DEFINITIONS {
+                            return locations;
+                        }
+                    }
+                }
+            }
+            if !locations.is_empty() {
+                return locations;
+            }
+        }
+        if let Some((kind, name)) = query.subject() {
+            let mut origins = BTreeSet::new();
+            for binding in query.bindings(kind, name) {
+                if let Some(site) = binding.origin()
+                    && origins.insert(site)
+                    && let Some(location) = query.location(site)
+                {
+                    push_location(&mut locations, location);
+                    if locations.len() == MAX_DEFINITIONS {
+                        break;
+                    }
+                }
+            }
+        }
+        locations
+    }
+
+    /// Get evaluated LSP completion items for the cursor's syntactic context.
+    ///
+    /// Each item includes its kind, a detail preview, and the replacement range.
+    /// An empty array lets the server use its lexical completion items.
+    #[must_use]
+    pub fn completions(&self, context: &SemanticContext<'_>) -> Vec<Value> {
+        let Some((snapshot, buffers)) = self.snapshots.view() else {
+            return Vec::new();
+        };
+        let Some(query) =
+            Query::new(self.host(), &snapshot, &buffers, context).filter(|query| query.fresh)
+        else {
+            return Vec::new();
+        };
+        let Some((kind, span)) = query.completion_site() else {
+            return Vec::new();
+        };
+        let Some(prefix) = query
+            .doc
+            .text
+            .get(span.start..query.offset)
+            .filter(|prefix| prefix.len() <= 4096)
+        else {
+            return Vec::new();
+        };
+        let edit = query.doc.span(span, query.encoding);
+        let mut seen = BTreeSet::new();
+        let mut items = Vec::new();
+        for dir in query
+            .spellings
+            .iter()
+            .flat_map(|path| query.index.scopes_for_file(path))
+        {
+            for item in query.index.completions_for_scope(*dir, prefix.as_bytes()) {
+                let name = item.name.as_slice();
+                let binding = match (kind, item.kind) {
+                    (Kind::Target, CompletionKind::Target) => {
+                        query.index.lookup_target(*dir, name).map(Binding::Target)
+                    }
+                    (Kind::Callable, CompletionKind::Callable) => {
+                        query.index.lookup_callable(name).map(Binding::Callable)
+                    }
+                    (Kind::Variable(Variable::Normal), CompletionKind::Variable) => query
+                        .index
+                        .lookup_variable(*dir, name)
+                        .map(|var| Binding::variable(name, var)),
+                    (Kind::Variable(Variable::Cache), CompletionKind::Variable) => {
+                        query.cache(name)
+                    }
+                    _ => None,
+                };
+                if let Some(binding) = binding
+                    && let Ok(label) = std::str::from_utf8(name)
+                    && seen.insert(label)
+                {
+                    let mut detail = binding.detail();
+                    if query.index.is_provisional() {
+                        detail.push_str(" (provisional snapshot)");
+                    }
+                    items.push(object([
+                        ("label", Value::string(label)),
+                        ("kind", uint(binding.completion_kind())),
+                        ("detail", Value::string(detail)),
+                        (
+                            "textEdit",
+                            object([("range", edit.clone()), ("newText", Value::string(label))]),
+                        ),
+                    ]));
+                    if items.len() == MAX_COMPLETIONS {
+                        return items;
+                    }
+                }
+            }
+        }
+        items
+    }
+
+    pub(super) fn host(&self) -> &dyn Host {
+        self.snapshots.request.host.as_ref()
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Kind {
+    Target,
+    Callable,
+    Variable(Variable),
+}
+
+impl Kind {
+    fn expression(kind: ExprKind) -> Option<Self> {
+        match kind {
+            ExprKind::Target => Some(Self::Target),
+            ExprKind::Reference(Variable::Environment) | ExprKind::Generator => None,
+            ExprKind::Reference(namespace) => Some(Self::Variable(namespace)),
+        }
+    }
+}
+
+struct Query<'a> {
+    host: &'a dyn Host,
+    snapshot: &'a Snapshot,
+    index: &'a WorkspaceIndex,
+    buffers: &'a Buffers,
+    path: PathBuf,
+    spellings: Vec<BString>,
+    doc: &'a Document,
+    offset: usize,
+    encoding: PositionEncoding,
+    fresh: bool,
+    same_buffer: bool,
+    checked_sources: RefCell<BTreeMap<SourceId, bool>>,
+}
+
+impl<'a> Query<'a> {
+    fn new(
+        host: &'a dyn Host,
+        snapshot: &'a Snapshot,
+        buffers: &'a Buffers,
+        context: &SemanticContext<'_>,
+    ) -> Option<Self> {
+        let uri_path = uri::path(context.uri)?;
+        let path = buffer_path(host, &uri_path);
+        let doc = &buffers.get(&path)?.document;
+        if doc.version != context.version
+            || doc.text != context.text
+            || !doc.text.is_char_boundary(context.offset)
+        {
+            return None;
+        }
+        let spellings = snapshot.paths.get(&path).map_or_else(
+            || vec![from_native_cmake(&uri_path)],
+            |paths| paths.iter().cloned().collect(),
+        );
+        Some(Self {
+            host,
+            snapshot,
+            index: snapshot.result.index.as_ref()?,
+            buffers,
+            same_buffer: snapshot
+                .inputs
+                .get(&path)
+                .is_some_and(|buffer| buffer.document.text == doc.text),
+            path,
+            spellings,
+            doc,
+            offset: context.offset,
+            encoding: context.encoding,
+            fresh: std::ptr::eq(buffers, snapshot.inputs.as_ref()),
+            checked_sources: RefCell::default(),
+        })
+    }
+
+    fn site(&self, path: &BString) -> Option<SourceLocation> {
+        self.same_buffer.then_some(())?;
+        Some(SourceLocation {
+            path: path.clone(),
+            line: u32::try_from(self.doc.lines.line_at(self.offset) + 1).ok()?,
+            byte_offset: Some(u32::try_from(self.offset).ok()?),
+            source_id: None,
+            range: None,
+        })
+    }
+
+    fn source_matches(&self, site: &SourceLocation) -> bool {
+        // The file lexer normalizes CRLF in tokens, but retains raw byte spans.
+        site.source_id.is_none_or(|id| {
+            self.index.source(id).is_some_and(|source| {
+                source.path == site.path
+                    && *self
+                        .checked_sources
+                        .borrow_mut()
+                        .entry(id)
+                        .or_insert_with(|| {
+                            source.kind == SourceKind::File
+                                && source.text.as_ref() == self.doc.text.as_bytes()
+                        })
+            })
+        })
+    }
+
+    fn on_path_argument(&self) -> bool {
+        self.doc.command_at(self.offset).is_some_and(|command| {
+            Arguments::new(command).role(0) == Role::Path
+                && command
+                    .args
+                    .first()
+                    .is_some_and(|arg| arg.span.contains(&self.offset))
+        })
+    }
+
+    fn subject(&self) -> Option<(Kind, &'a [u8])> {
+        let command = self.doc.command_at(self.offset)?;
+        if self.offset <= name_end(command) {
+            return Some((Kind::Callable, command.name.as_slice()));
+        }
+        let (index, arg) = command
+            .args
+            .iter()
+            .enumerate()
+            .find(|(_, arg)| arg.span.contains(&self.offset))?;
+        let span = argument_payload(&self.doc.text, arg)?;
+        let raw = self.doc.text.get(span.clone())?;
+        let relative = self.offset.checked_sub(span.start)?;
+        if let Some(expr) = expression::expressions(raw)
+            .into_iter()
+            .find(|expr| expr.span.contains(&relative))
+        {
+            return Some((Kind::expression(expr.kind)?, raw.get(expr.name)?.as_bytes()));
+        }
+        if !span.contains(&self.offset) {
+            return None;
+        }
+        let arguments = Arguments::new(command);
+        if arguments.keyword(index, arg).is_some() {
+            return None;
+        }
+        match arguments.role(index) {
+            Role::Target | Role::TargetDeclaration if expression::target_name(raw) => {
+                Some((Kind::Target, raw.as_bytes()))
+            }
+            Role::CommandDeclaration => Some((Kind::Callable, raw.as_bytes())),
+            Role::Variable(Variable::Normal) => {
+                Some((Kind::Variable(Variable::Normal), raw.as_bytes()))
+            }
+            Role::Variable(Variable::Cache) => {
+                let name = raw
+                    .strip_prefix("CACHE{")
+                    .and_then(|name| name.strip_suffix('}'))
+                    .unwrap_or(raw);
+                Some((Kind::Variable(Variable::Cache), name.as_bytes()))
+            }
+            _ => None,
+        }
+    }
+
+    fn bindings(&self, kind: Kind, name: &'a [u8]) -> Vec<Binding<'a>> {
+        let mut observed = false;
+        let mut bindings = Vec::new();
+        for path in &self.spellings {
+            let Some(site) = self.site(path) else {
+                continue;
+            };
+            for record in self.index.executed_at(None, &site) {
+                let binding = match (kind, &record.symbol) {
+                    (
+                        Kind::Callable,
+                        ExecutedSymbol::Callable {
+                            name: actual,
+                            definition,
+                        },
+                    ) if actual.eq_ignore_ascii_case(name) => {
+                        Some(definition.as_ref().map(Binding::Callable))
+                    }
+                    (
+                        Kind::Target,
+                        ExecutedSymbol::Target {
+                            name: actual,
+                            definition,
+                        },
+                    ) if actual.as_slice() == name => {
+                        Some(definition.as_ref().map(Binding::Target))
+                    }
+                    (
+                        Kind::Variable(namespace),
+                        ExecutedSymbol::Variable {
+                            name: actual,
+                            definition,
+                        },
+                    ) if actual.as_slice() == name
+                        && (namespace == Variable::Normal
+                            || definition.as_ref().is_some_and(|value| value.cached)) =>
+                    {
+                        Some(
+                            definition
+                                .as_ref()
+                                .map(|value| Binding::variable(name, value)),
+                        )
+                    }
+                    _ => None,
+                };
+                if let Some(binding) = binding
+                    && self.source_matches(&record.site)
+                {
+                    observed = true;
+                    bindings.extend(binding);
+                }
+            }
+        }
+        // An executed but undefined name also takes precedence over the final state.
+        if observed {
+            return bindings;
+        }
+        let mut dirs = self
+            .spellings
+            .iter()
+            .flat_map(|path| self.index.scopes_for_file(path).iter().copied())
+            .peekable();
+        if dirs.peek().is_none() {
+            return Vec::new();
+        }
+        match kind {
+            Kind::Callable => self
+                .index
+                .lookup_callable(name)
+                .map(Binding::Callable)
+                .into_iter()
+                .collect(),
+            Kind::Target => dirs
+                .filter_map(|dir| self.index.lookup_target(dir, name).map(Binding::Target))
+                .collect(),
+            Kind::Variable(Variable::Cache) => self.cache(name).into_iter().collect(),
+            Kind::Variable(Variable::Normal) => dirs
+                .filter_map(|dir| {
+                    self.index
+                        .lookup_variable(dir, name)
+                        .map(|var| Binding::variable(name, var))
+                })
+                .collect(),
+            Kind::Variable(Variable::Environment) => Vec::new(),
+        }
+    }
+
+    fn cache(&self, name: &'a [u8]) -> Option<Binding<'a>> {
+        let result = &self.snapshot.result;
+        let entry = result.model.cache.get(name)?;
+        Some(Binding::Variable {
+            name,
+            value: &entry.value,
+            origin: result.facts.cache_sites.get(name),
+            cached: true,
+        })
+    }
+
+    fn file_uri(&self, path: &[u8]) -> Option<String> {
+        let path = to_native(path);
+        path.is_absolute().then(|| self.display_uri(&path))
+    }
+
+    fn display_uri(&self, path: &Path) -> String {
+        self.buffers
+            .get(&buffer_path(self.host, path))
+            .map_or_else(|| uri::file(path), |buffer| buffer.uri.clone())
+    }
+
+    fn location(&self, site: &SourceLocation) -> Option<SemanticLocation> {
+        let path = to_native(&site.path);
+        if !path.is_absolute() {
+            return None;
+        }
+        let key = buffer_path(self.host, &path);
+        let buffer = self.buffers.get(&key);
+        let owned;
+        let disk_lines;
+        let (text, lines) = if let Some(buffer) = buffer {
+            (buffer.document.text.as_str(), &buffer.document.lines)
+        } else {
+            owned = self
+                .host
+                .read(
+                    &path,
+                    ReadRange::All {
+                        limit: crate::rpc::MAX_MESSAGE_BYTES as u64,
+                    },
+                )
+                .ok()?;
+            let text = std::str::from_utf8(&owned).ok()?;
+            disk_lines = Lines::new(text);
+            (text, &disk_lines)
+        };
+        if let Some(id) = site.source_id {
+            let source = self.index.source(id)?;
+            if source.kind != SourceKind::File
+                || source.path != site.path
+                || source.text.as_ref() != text.as_bytes()
+            {
+                return None;
+            }
+        }
+        let offsets = (site.source_id.is_some() || self.snapshot.inputs.contains_key(&key))
+            .then(|| {
+                site.range
+                    .map(|span| (span.start, span.end))
+                    .or_else(|| site.byte_offset.map(|offset| (offset, offset)))
+            })
+            .flatten();
+        let (start, end) = if let Some((start, end)) = offsets {
+            let (start, end) = (usize::try_from(start).ok()?, usize::try_from(end).ok()?);
+            text.get(start..end)?;
+            (
+                lines.position(text, start, self.encoding),
+                lines.position(text, end, self.encoding),
+            )
+        } else {
+            let line = usize::try_from(site.line.saturating_sub(1)).ok()?;
+            lines.start(line)?;
+            let position = Position { line, character: 0 };
+            (position, position)
+        };
+        Some(SemanticLocation {
+            uri: self.display_uri(&path),
+            start,
+            end,
+        })
+    }
+
+    fn completion_site(&self) -> Option<(Kind, Range<usize>)> {
+        if self
+            .doc
+            .comments()
+            .iter()
+            .any(|comment| comment.start <= self.offset && self.offset <= comment.end)
+        {
+            return None;
+        }
+        let word = word_at(&self.doc.text, self.offset);
+        let Some(command) = self.doc.command_at(self.offset) else {
+            let start = self.doc.lines.start(self.doc.lines.line_at(self.offset))?;
+            return self
+                .doc
+                .text
+                .get(start..word.start)?
+                .trim_start_matches('\u{feff}')
+                .trim_ascii()
+                .is_empty()
+                .then_some((Kind::Callable, word));
+        };
+        if self.offset <= name_end(command) {
+            return Some((Kind::Callable, command.span.start..name_end(command)));
+        }
+        if !self
+            .doc
+            .text
+            .get(name_end(command)..self.offset)?
+            .contains('(')
+        {
+            return None;
+        }
+        let index = command
+            .args
+            .partition_point(|arg| arg.span.end < self.offset);
+        let arguments = Arguments::new(command);
+        if let Some(arg) = command
+            .args
+            .get(index)
+            .filter(|arg| arg.span.start <= self.offset)
+        {
+            let span = argument_payload(&self.doc.text, arg)?;
+            let relative = self.offset.checked_sub(span.start)?;
+            let raw = self.doc.text.get(span.clone())?;
+            if let Some(expr) = expression::expressions(raw)
+                .into_iter()
+                .find(|expr| expr.name.start <= relative && relative <= expr.name.end)
+            {
+                return Some((
+                    Kind::expression(expr.kind)?,
+                    span.start + expr.name.start..span.start + expr.name.end,
+                ));
+            }
+            if arguments.keyword(index, arg).is_some() {
+                return None;
+            }
+        }
+        (arguments.role(index) == Role::Target).then_some((Kind::Target, word))
+    }
+}
+
+fn name_end(command: &CommandInvocation) -> usize {
+    command.span.start + command.name.len()
+}
+
+fn argument_payload(text: &str, arg: &Argument) -> Option<Range<usize>> {
+    match arg.kind {
+        ArgKind::Unquoted => Some(arg.span.clone()),
+        ArgKind::Quoted => {
+            let raw = text.as_bytes().get(arg.span.clone())?;
+            let (end, closed) = lexical::quoted_end(raw, 0);
+            Some(arg.span.start + 1..arg.span.start + end - usize::from(closed))
+        }
+        ArgKind::Bracket => None,
+    }
+}
+
+fn word_at(text: &str, offset: usize) -> Range<usize> {
+    let word = |byte: u8| byte.is_ascii_alphanumeric() || b"_-.+:".contains(&byte);
+    let (before, after) = text.as_bytes().split_at(offset);
+    let left = before.iter().rev().take_while(|&&byte| word(byte)).count();
+    let right = after.iter().take_while(|&&byte| word(byte)).count();
+    offset - left..offset + right
+}
+
+fn push_location(locations: &mut Vec<SemanticLocation>, candidate: SemanticLocation) {
+    if !locations.iter().any(|prior| {
+        prior.uri == candidate.uri && prior.start == candidate.start && prior.end == candidate.end
+    }) {
+        locations.push(candidate);
+    }
+}
