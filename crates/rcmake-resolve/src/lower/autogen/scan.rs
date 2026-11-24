@@ -15,7 +15,7 @@ use rcmake_model::{ProjectModel, Target, TargetId};
 
 use super::{ConfiguredSources, checksum::PathChecksum};
 use crate::ResolveError;
-use crate::lower::{compute_artifacts, definition, join, target_property};
+use crate::lower::{compute_artifacts, join};
 use crate::sources::{SourcePaths, absolute_path, properties};
 use crate::usage::{ModelGenexHost, UsageResolver, handle};
 
@@ -66,9 +66,14 @@ impl Tool {
         [self.property(), suffix].concat().into()
     }
 
-    /// Check if the target requests this tool.
-    pub(super) fn requested(self, model: &ProjectModel, target: &Target) -> bool {
-        target_property(model, target, self.property()).is_some_and(|value| truth::is_on(value))
+    /// Check the tool property that target creation initialized.
+    ///
+    /// Directory variables set after target creation cannot enable a tool for this target.
+    pub(super) fn requested(self, target: &Target) -> bool {
+        target
+            .props
+            .get(self.property())
+            .is_some_and(|value| truth::is_on(value))
     }
 }
 
@@ -149,8 +154,10 @@ pub(super) fn qt_version(
     let mut usage = UsageResolver::new(model);
     let mut deps = IndexSet::new();
     let mut program = BString::default();
-    if let Some(value) =
-        target_property(model, target, b"AUTOMOC_EXECUTABLE").filter(|value| !truth::is_off(value))
+    if let Some(value) = target
+        .props
+        .get(b"AUTOMOC_EXECUTABLE")
+        .filter(|value| !truth::is_off(value))
     {
         program = eval_property(
             &mut usage,
@@ -264,11 +271,11 @@ impl ToolDiscovery<'_> {
     ) -> Result<ToolPlan, ResolveError> {
         let model = self.model;
         let target = self.target;
-        if !kind.requested(model, target) {
+        if !kind.requested(target) {
             return Ok(ToolPlan::default());
         }
         let key = kind.property_key(b"_EXECUTABLE");
-        let explicit = target_property(model, target, &key).filter(|value| !truth::is_off(value));
+        let explicit = target.props.get(&key).filter(|value| !truth::is_off(value));
         if explicit.is_none() && self.version.0 == 0 {
             diagnostics.push(warning(
                 target,
@@ -310,7 +317,8 @@ impl ToolDiscovery<'_> {
             std::slice::from_ref(self.configurations.first().unwrap_or(&default))
         };
         let cwd = &model.dir(target.dir).binary_dir;
-        let mut capabilities = BTreeMap::new();
+        let imported = tool_target.is_some_and(Target::is_imported);
+        let mut capabilities = BTreeMap::<BString, Vec<BString>>::new();
         for config in selected {
             let program = if let Some(raw) = explicit {
                 let evaluation_config = if self.per_config { config } else { &default };
@@ -328,17 +336,32 @@ impl ToolDiscovery<'_> {
                     .and_then(|tool| compute_artifacts(model, tool, config).file)
                     .unwrap_or_default()
             };
+            if imported && !is_file(self.host, &program) {
+                return Err(ResolveError::Message(
+                    format!(
+                        "AUTOGEN for target \"{}\": Imported executable \"{name}\" has no file at \"{program}\".",
+                        target.name,
+                    )
+                    .into(),
+                ));
+            }
             if program.is_empty() && kind != Tool::Uic {
                 return Err(ResolveError::Message(
                     format!("AUTOGEN: {key} evaluates to an empty value").into(),
                 ));
             }
-            let options = if kind == Tool::Rcc && explicit.is_none() && is_file(self.host, &program)
+            let options = if kind == Tool::Rcc
+                && explicit.is_none()
+                && matches!(self.version.0, 5 | 6)
+                && (imported || is_file(self.host, &program))
             {
-                capabilities
-                    .entry(program.clone())
-                    .or_insert_with(|| rcc_list_options(self.host, &program, cwd))
-                    .clone()
+                match capabilities.entry(program.clone()) {
+                    std::collections::btree_map::Entry::Occupied(entry) => entry.get().clone(),
+                    std::collections::btree_map::Entry::Vacant(entry) => {
+                        let options = rcc_list_options(self.host, &program, cwd)?;
+                        entry.insert(options).clone()
+                    }
+                }
             } else {
                 Vec::new()
             };
@@ -356,23 +379,34 @@ impl ToolDiscovery<'_> {
     }
 }
 
-fn rcc_list_options(host: &dyn Host, program: &[u8], cwd: &[u8]) -> Vec<BString> {
-    let Ok(output) = run_tool(host, program, cwd, vec!["--help".into()]) else {
-        return Vec::new();
+fn rcc_list_options(
+    host: &dyn Host,
+    program: &[u8],
+    cwd: &[u8],
+) -> Result<Vec<BString>, ResolveError> {
+    let error = |reason: &dyn std::fmt::Display| {
+        ResolveError::Message(
+            format!(
+                "Cannot run the Qt resource compiler \"{}\" with -h. {reason}",
+                BString::from(program)
+            )
+            .into(),
+        )
     };
-    if output.results != [ProcessResult::Exited(0)] {
-        return Vec::new();
+    let output =
+        run_tool(host, program, cwd, vec!["-h".into()]).map_err(|reason| error(&reason))?;
+    if !matches!(output.results.as_slice(), [ProcessResult::Exited(_)]) {
+        return Err(error(&format!("{:?}", output.results)));
     }
-    [b"--list".as_slice(), b"-list"]
+    Ok([b"--list".as_slice(), b"-list"]
         .into_iter()
         .find(|option| {
-            [&output.stdout, &output.stderr].into_iter().any(|bytes| {
-                bytes
-                    .split(|byte| byte.is_ascii_whitespace() || matches!(byte, b',' | b'[' | b']'))
-                    .any(|token| token == *option)
-            })
+            output
+                .stdout
+                .windows(option.len())
+                .any(|part| part == *option)
         })
-        .map_or_else(Vec::new, |option| vec![option.into()])
+        .map_or_else(Vec::new, |option| vec![option.into()]))
 }
 
 fn run_tool(
@@ -847,45 +881,4 @@ fn option_key(value: &[u8], modern: bool) -> Option<&[u8]> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn resource_parser_preserves_order_and_duplicates() -> Result<(), &'static str> {
-        assert_eq!(
-            parse_resource_entries(b"<RCC><qresource><file alias=\"a\">one.txt</file><file>one.txt</file><file> two.txt </file></qresource></RCC>")?,
-            ["one.txt", "one.txt", "one.txt", " two.txt ", " two.txt "],
-        );
-        assert_eq!(
-            parse_resource_entries(b"<file>first</file><file>second</file>")?,
-            ["first", "second"]
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn source_kinds_cover_headers_and_module_sources() {
-        assert_eq!(source_kind(b"hh", false), Some(ScanKind::Header));
-        assert_eq!(source_kind(b"cpp", false), Some(ScanKind::Source));
-        assert_eq!(source_kind(b"cpp", true), Some(ScanKind::Module));
-        assert_eq!(source_kind(b"qrc", false), None);
-        assert_eq!(
-            version_from_output(b"Qt Meta Object Compiler version 6.8.1"),
-            Some(QtVersion(6, 8))
-        );
-    }
-
-    #[test]
-    fn source_options_replace_existing_values() {
-        let mut opts = ["-name", "default", "-compress", "1"]
-            .map(BString::from)
-            .to_vec();
-        merge_options(
-            &mut opts,
-            vec!["--name".into(), "resource".into()],
-            &[b"name", b"compress"],
-            true,
-        );
-        assert_eq!(opts, ["-name", "resource", "-compress", "1"]);
-    }
-}
+mod tests;

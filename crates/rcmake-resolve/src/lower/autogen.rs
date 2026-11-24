@@ -199,7 +199,7 @@ mod tests {
     use rcmake_diag::{Backtrace, PolicyId, PolicyMap, PolicyStatus};
     use rcmake_host::{Follow, PureHost};
     use rcmake_json::{ReadOptions, parse};
-    use rcmake_model::{CustomCommandKind, TargetKind, TargetOrigin};
+    use rcmake_model::{BT, CustomCommandKind, LinkItem, TargetKind, TargetOrigin};
 
     use super::*;
     use rcmake_host::{ReadRange, path::to_native};
@@ -214,6 +214,20 @@ mod tests {
         generator: GeneratorKind,
         version: &str,
         better: Option<&str>,
+    ) -> Result<AutogenPlan, Box<dyn std::error::Error>> {
+        fixture_with(host, generator, version, better, |_, _, _| Ok(()))
+    }
+
+    fn fixture_with(
+        host: &PureHost,
+        generator: GeneratorKind,
+        version: &str,
+        better: Option<&str>,
+        configure: impl FnOnce(
+            &mut ProjectModel,
+            TargetId,
+            &mut [ConfiguredSources],
+        ) -> Result<(), Box<dyn std::error::Error>>,
     ) -> Result<AutogenPlan, Box<dyn std::error::Error>> {
         host.seed_file(&to_native(b"/src/main.cpp"), b"int main() { return 0; }")?;
         host.seed_file(&to_native(b"/src/main.h"), b"")?;
@@ -269,7 +283,7 @@ mod tests {
         } else {
             vec![ConfigId::default()]
         };
-        let input: Vec<_> = configs
+        let mut input: Vec<_> = configs
             .iter()
             .map(|config| ConfiguredSources {
                 config: config.clone(),
@@ -283,6 +297,7 @@ mod tests {
                 link_targets: Vec::new(),
             })
             .collect();
+        configure(&mut model, id, &mut input)?;
         let paths = SourcePaths::new(host);
         prepare(&model, &paths, &configs, &IndexMap::from([(id, input)]))?
             .ok_or_else(|| "Expected an AUTOGEN plan.".into())
@@ -410,6 +425,13 @@ mod tests {
             Some(&Value::Array(vec![Value::string("/src/asset.txt"); 3]))
         );
         assert_eq!(plan.reconfigure_inputs, ["/src/sample.qrc"]);
+        assert_eq!(
+            info.get(b"CMAKE_LIST_FILES".as_slice()),
+            Some(&Value::Array(vec![
+                Value::string("/src/CMakeLists.txt"),
+                Value::string("/src/sample.qrc"),
+            ]))
+        );
         let path = to_native(b"/build/CMakeFiles/sample_autogen.dir/AutogenInfo.json");
         let before = host.metadata(&path, Follow::Yes)?.ino;
         plan.write_info(&host, &[])?;
@@ -485,6 +507,205 @@ mod tests {
             Some(&Value::string("qrc_sample.cpp"))
         );
         assert!(!rcc.contains_key(b"RCC_EXECUTABLE_Debug".as_slice()));
+        Ok(())
+    }
+
+    #[test]
+    fn late_autogen_variables_do_not_enable_existing_targets()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let host = PureHost::new("/".into(), "/cmake".into());
+        let plan = fixture_with(&host, GeneratorKind::Ninja, "8", None, |model, _, _| {
+            let earlier = Target::new(
+                "earlier".into(),
+                TargetKind::Executable,
+                TargetOrigin::Normal,
+                DirId::ROOT,
+                Backtrace::default(),
+                PolicyMap::default(),
+            );
+            model.add_target(earlier)?;
+            model.dir_mut(DirId::ROOT).vars.extend([
+                ("CMAKE_AUTOMOC".into(), "ON".into()),
+                ("CMAKE_AUTOMOC_EXECUTABLE".into(), "/qt/moc".into()),
+            ]);
+            Ok(())
+        })?;
+        assert!(
+            plan.model
+                .find_target(DirId::ROOT, b"sample_autogen")
+                .is_some()
+        );
+        assert!(
+            plan.model
+                .find_target(DirId::ROOT, b"earlier_autogen")
+                .is_none()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn autogen_requires_an_absolute_build_directory() -> Result<(), Box<dyn std::error::Error>> {
+        let host = PureHost::new("/".into(), "/cmake".into());
+        let result = fixture_with(&host, GeneratorKind::Ninja, "8", None, |model, id, _| {
+            model
+                .target_mut(id)
+                .ok_or("Expected the sample target.")?
+                .props
+                .set("AUTOGEN_BUILD_DIR".into(), "generated".into());
+            Ok(())
+        });
+        let Err(error) = result else {
+            return Err("Expected a relative build directory error.".into());
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("AUTOGEN_BUILD_DIR for target \"sample\" must be an absolute path")
+        );
+        Ok(())
+    }
+
+    fn static_ordering(cyclic: bool) -> Result<Vec<BString>, Box<dyn std::error::Error>> {
+        let host = PureHost::new("/".into(), "/cmake".into());
+        let plan = fixture_with(
+            &host,
+            GeneratorKind::NinjaMultiConfig,
+            "8",
+            None,
+            |model, id, input| {
+                let mut dep = Target::new(
+                    "dep".into(),
+                    TargetKind::StaticLibrary,
+                    TargetOrigin::Normal,
+                    DirId::ROOT,
+                    Backtrace::default(),
+                    PolicyMap::default(),
+                );
+                let link = |name: &str| LinkItem {
+                    text: BT::new(name.into(), Backtrace::default()),
+                    lookup_dir: DirId::ROOT,
+                };
+                if cyclic {
+                    dep.usage.link_libraries = Some(vec![link("$<$<CONFIG:Release>:sample>")]);
+                }
+                let dep = model.add_target(dep)?;
+                let target = model.target_mut(id).ok_or("Expected the sample target.")?;
+                target.kind = TargetKind::StaticLibrary;
+                target.usage.link_libraries = Some(vec![link("dep")]);
+                for config in input {
+                    config.link_targets.push(dep);
+                }
+                Ok(())
+            },
+        )?;
+        let ordering = plan
+            .model
+            .find_target(DirId::ROOT, b"sample_autogen_timestamp_deps")
+            .and_then(|id| plan.model.target(id))
+            .ok_or("Expected an AUTOGEN timestamp dependency target.")?;
+        Ok(ordering
+            .utility_deps
+            .iter()
+            .map(|dep| dep.value.clone())
+            .collect())
+    }
+
+    #[test]
+    fn autogen_keeps_acyclic_static_library_dependencies() -> Result<(), Box<dyn std::error::Error>>
+    {
+        assert_eq!(static_ordering(false)?, ["dep"]);
+        Ok(())
+    }
+
+    #[test]
+    fn autogen_excludes_static_library_cycles_in_any_configuration()
+    -> Result<(), Box<dyn std::error::Error>> {
+        assert!(static_ordering(true)?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_cross_config_stamp_produces_all_module_moc_outputs()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let host = PureHost::new("/".into(), "/cmake".into());
+        let plan = fixture_with(
+            &host,
+            GeneratorKind::NinjaMultiConfig,
+            "13",
+            Some("OFF"),
+            |model, _, input| {
+                model
+                    .dir_mut(DirId::ROOT)
+                    .vars
+                    .insert("CMAKE_CROSS_CONFIGS".into(), "all".into());
+                for config in input {
+                    config.sources.push(SourceInput {
+                        path: "/src/shared.cppm".into(),
+                        cxx_module: true,
+                        generated: false,
+                    });
+                    if config.config.0 == b"Debug" {
+                        config.sources.push(SourceInput {
+                            path: "/src/debug.cppm".into(),
+                            cxx_module: true,
+                            generated: false,
+                        });
+                    }
+                }
+                Ok(())
+            },
+        )?;
+        let stamp = plan
+            .model
+            .commands()
+            .map(|(_, command)| command)
+            .find(|command| {
+                command
+                    .depfile
+                    .as_ref()
+                    .is_some_and(|file| file == b"/build/sample_autogen/deps")
+            })
+            .ok_or("Expected a shared timestamp command.")?;
+        assert_eq!(
+            stamp
+                .command_lines
+                .iter()
+                .filter(|line| line.get(2).is_some_and(|arg| arg == b"cmake_autogen"))
+                .filter_map(|line| line.last())
+                .map(|config| config.as_slice())
+                .collect::<Vec<_>>(),
+            [b"Debug".as_slice(), b"Release"],
+        );
+        let target = plan
+            .model
+            .find_target(DirId::ROOT, b"sample")
+            .and_then(|id| plan.model.target(id))
+            .ok_or("Expected the sample target.")?;
+        for (config, source) in [
+            ("Debug", "debug"),
+            ("Debug", "shared"),
+            ("Release", "shared"),
+        ] {
+            let path =
+                format!("/build/sample_autogen/include_{config}/EWIEGA46WW/moc_{source}.cpp");
+            assert!(
+                stamp
+                    .byproducts
+                    .iter()
+                    .any(|output| output.value == path.as_bytes())
+            );
+            let source = format!("$<$<CONFIG:{config}>:{path}>");
+            assert!(
+                target
+                    .sources
+                    .iter()
+                    .any(|item| item.value == source.as_bytes())
+            );
+        }
+        assert!(!stamp.byproducts.iter().any(|item| {
+            item.value
+                .ends_with(b"include_Release/EWIEGA46WW/moc_debug.cpp")
+        }));
         Ok(())
     }
 }

@@ -13,7 +13,7 @@ use rcmake_model::{DirId, ProjectModel, Target, UsageField};
 use super::graph::target_list;
 use super::scan::{ConfigValues, HEADER_EXTENSIONS, QtVersion, ScanKind, eval_property};
 use super::{ResourceJob, TargetPlan, concatenate, named};
-use crate::lower::{definition, join, target_property};
+use crate::lower::{definition, join};
 use crate::sources::absolute_path;
 use crate::usage::UsageResolver;
 use crate::usage::link_options::shell_arguments;
@@ -149,6 +149,7 @@ fn autogen_info(
         }
         config_values(&mut info, key, &dep, value_string);
     }
+    // The overlay adds registered resource manifests to the directory listfiles.
     info.insert("CMAKE_LIST_FILES".into(), strings(&dir.listfiles));
     info.insert(
         "HEADER_EXTENSIONS".into(),
@@ -221,29 +222,20 @@ fn add_moc_info(
     );
     info.insert(
         "MOC_OPTIONS".into(),
-        strings(&target_list(model, target, b"AUTOMOC_MOC_OPTIONS")),
+        strings(&target_list(target, b"AUTOMOC_MOC_OPTIONS")),
     );
-    for (field, property, variable) in [
+    for (field, value) in [
         (
             "MOC_RELAXED_MODE",
-            b"".as_slice(),
-            b"CMAKE_AUTOMOC_RELAXED_MODE".as_slice(),
+            definition(model, target.dir, b"CMAKE_AUTOMOC_RELAXED_MODE"),
         ),
-        (
-            "MOC_PATH_PREFIX",
-            b"AUTOMOC_PATH_PREFIX".as_slice(),
-            b"CMAKE_AUTOMOC_PATH_PREFIX".as_slice(),
-        ),
+        ("MOC_PATH_PREFIX", target.props.get(b"AUTOMOC_PATH_PREFIX")),
     ] {
-        let enabled = target
-            .props
-            .get(property)
-            .or_else(|| definition(model, target.dir, variable))
-            .is_some_and(|value| truth::is_on(value));
+        let enabled = value.is_some_and(|value| truth::is_on(value));
         info.insert(field.into(), Value::Bool(enabled));
     }
 
-    let macros = if let Some(value) = target_property(model, target, b"AUTOMOC_MACRO_NAMES") {
+    let macros = if let Some(value) = target.props.get(b"AUTOMOC_MACRO_NAMES") {
         list::split(value, list::Empty::Drop)
             .into_iter()
             .collect::<IndexSet<_>>()
@@ -314,7 +306,7 @@ fn add_moc_info(
     });
     config_values(info, "MOC_INCLUDES", &includes, |values| strings(values));
 
-    let filters = target_list(model, target, b"AUTOMOC_DEPEND_FILTERS");
+    let filters = target_list(target, b"AUTOMOC_DEPEND_FILTERS");
     if filters.len() % 2 != 0 {
         return Err(ResolveError::Message(
             "AUTOMOC_DEPEND_FILTERS must contain keyword and regular expression pairs.".into(),
@@ -412,7 +404,7 @@ fn moc_includes(
     group: Option<&CompileGroup>,
 ) -> Result<(Vec<BString>, bool), ResolveError> {
     let property = b"AUTOMOC_INCLUDE_DIRECTORIES";
-    if let Some(raw) = target_property(model, target, property) {
+    if let Some(raw) = target.props.get(property) {
         let value = eval_property(
             usage,
             plan.id,
@@ -457,7 +449,9 @@ fn predefs_command(
     plan: &TargetPlan,
     usage: &mut UsageResolver<'_>,
 ) -> Result<Vec<BString>, ResolveError> {
-    let enabled = target_property(model, target, b"AUTOMOC_COMPILER_PREDEFINES")
+    let enabled = target
+        .props
+        .get(b"AUTOMOC_COMPILER_PREDEFINES")
         .is_none_or(|value| truth::is_on(value));
     if !enabled || plan.version < QtVersion(5, 8) {
         return Ok(Vec::new());
@@ -492,7 +486,7 @@ fn add_uic_info(
     usage: &mut UsageResolver<'_>,
 ) -> Result<(), ResolveError> {
     let dir = model.dir(target.dir);
-    let search: Vec<_> = target_list(model, target, b"AUTOUIC_SEARCH_PATHS")
+    let search: Vec<_> = target_list(target, b"AUTOUIC_SEARCH_PATHS")
         .iter()
         .map(|path| absolute_path(&dir.source_dir, path))
         .collect();
@@ -543,7 +537,7 @@ fn add_uic_info(
                     );
                 }
             }
-            if let Some(raw) = target_property(model, target, b"AUTOUIC_OPTIONS") {
+            if let Some(raw) = target.props.get(b"AUTOUIC_OPTIONS") {
                 let value = eval_property(
                     usage,
                     plan.id,

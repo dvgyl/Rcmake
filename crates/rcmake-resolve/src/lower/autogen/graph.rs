@@ -1,5 +1,7 @@
 //! Model overlay and custom commands for Qt automatic generation.
 
+mod ordering;
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use indexmap::{IndexMap, IndexSet};
@@ -18,7 +20,7 @@ use super::scan::{
 };
 use super::{AutogenPlan, ConfiguredSources, ResourceJob, TargetPlan};
 use crate::ResolveError;
-use crate::lower::{definition, join, object_dir, short_object_paths, target_property};
+use crate::lower::{definition, join, object_dir, short_object_paths};
 use crate::sources::{SourcePaths, absolute_path};
 
 /// Add autogen inputs, outputs, and utilities to a copy of the project model.
@@ -40,9 +42,7 @@ pub(super) fn prepare(
                 .props
                 .get(b"LINKER_LANGUAGE")
                 .is_some_and(|lang| lang == b"CSharp")
-            || !Tool::ALL
-                .into_iter()
-                .any(|tool| tool.requested(model, target))
+            || !Tool::ALL.into_iter().any(|tool| tool.requested(target))
         {
             continue;
         }
@@ -111,6 +111,10 @@ pub(super) fn prepare(
             }
             if !job.generated && !global_rcc {
                 plan.reconfigure_inputs.push(job.source.clone());
+                let listfiles = &mut overlay.dir_mut(origin.dir).listfiles;
+                if !listfiles.contains(&job.source) {
+                    listfiles.push(job.source.clone());
+                }
             }
             plan.info_outputs.push(job.info_path());
             let settings = concatenate(&[&job.prefix, b"_Used"]);
@@ -151,7 +155,9 @@ impl PlanContext<'_, '_> {
         let cross = self.generator == GeneratorKind::NinjaMultiConfig
             && definition(model, DirId::ROOT, b"CMAKE_CROSS_CONFIGS")
                 .is_some_and(|value| !truth::is_off(value));
-        let better = target_property(model, target, b"AUTOGEN_BETTER_GRAPH_MULTI_CONFIG")
+        let better = target
+            .props
+            .get(b"AUTOGEN_BETTER_GRAPH_MULTI_CONFIG")
             .map_or(version >= QtVersion(6, 8), |value| truth::is_on(value));
         let discovery = ToolDiscovery {
             model,
@@ -202,9 +208,19 @@ impl PlanContext<'_, '_> {
                 join(&dir.binary_dir, &concatenate(&[name, b"_autogen"])),
             )
         };
-        let build_dir = target_property(model, target, b"AUTOGEN_BUILD_DIR")
+        let build_dir = match target
+            .props
+            .get(b"AUTOGEN_BUILD_DIR")
             .filter(|value| !value.is_empty())
-            .map_or(default_build, |value| absolute_path(&dir.binary_dir, value));
+        {
+            Some(value) if !Lexical::new(value).absolute() => {
+                return Err(ResolveError::Message(
+                    format!("AUTOGEN_BUILD_DIR for target \"{name}\" must be an absolute path. The current value is \"{value}\".").into(),
+                ));
+            }
+            Some(value) => Lexical::new(value).normalize(),
+            None => default_build,
+        };
         let cmake = definition(model, target.dir, b"CMAKE_COMMAND")
             .filter(|value| !value.is_empty())
             .cloned()
@@ -221,7 +237,7 @@ impl PlanContext<'_, '_> {
             .map_or(0, |value| {
                 scan::uint(value).unwrap_or_else(|| u32::from(truth::is_on(value)))
             });
-        let parallel = target_property(model, target, b"AUTOGEN_PARALLEL").map_or_else(
+        let parallel = target.props.get(b"AUTOGEN_PARALLEL").map_or_else(
             || host.system().cpu_count.clamp(1, 64),
             |value| {
                 if value.is_empty() || value == b"AUTO" {
@@ -238,14 +254,14 @@ impl PlanContext<'_, '_> {
         );
         let command_length =
             (host.system().sysname.eq_ignore_ascii_case(b"Windows") || cfg!(windows)).then(|| {
-                target_property(model, target, b"AUTOGEN_COMMAND_LINE_LENGTH_MAX").map_or(
-                    32_000,
-                    |value| {
+                target
+                    .props
+                    .get(b"AUTOGEN_COMMAND_LINE_LENGTH_MAX")
+                    .map_or(32_000, |value| {
                         scan::uint(value)
                             .filter(|count| *count > 0)
                             .unwrap_or(u32::MAX)
-                    },
-                )
+                    })
             });
         let mut plan = TargetPlan {
             id,
@@ -284,7 +300,7 @@ impl PlanContext<'_, '_> {
                 .entry(Lexical::new(source).stem_extension(true).0)
                 .or_insert(0usize) += 1;
         }
-        let base_options = target_list(self.model, target, b"AUTORCC_OPTIONS");
+        let base_options = target_list(target, b"AUTORCC_OPTIONS");
         let mut jobs = Vec::new();
         let mut artifacts = BTreeSet::new();
         for (source, file) in &plan.scan.qrc {
@@ -381,28 +397,11 @@ fn add_autogen(
 ) -> Result<Option<BString>, ResolveError> {
     let mut generated = Vec::new();
     let mut tool_files = Vec::new();
-    let mut ordering = IndexSet::new();
+    let mut ordering = ordering::origin_dependencies(model, plan.id, origin, inventory)?;
     let mut order_files = IndexSet::new();
     let configured = plan.config_pattern();
     let dir = origin.dir;
-    let origin_depends = target_property(model, origin, b"AUTOGEN_ORIGIN_DEPENDS")
-        .is_none_or(|value| truth::is_on(value));
-    if origin_depends {
-        ordering.extend(origin.utility_deps.iter().map(|dep| dep.value.clone()));
-        if let Some(first) = inventory.first() {
-            for &id in &first.link_targets {
-                if id != plan.id
-                    && inventory.iter().all(|cfg| cfg.link_targets.contains(&id))
-                    && let Some(target) = model.target(id).filter(|target| !target.is_imported())
-                    && !(origin.kind == TargetKind::StaticLibrary
-                        && target.kind == TargetKind::StaticLibrary)
-                {
-                    ordering.insert(target.name.clone());
-                }
-            }
-        }
-    }
-    for value in target_list(model, origin, b"AUTOGEN_TARGET_DEPENDS") {
+    for value in target_list(origin, b"AUTOGEN_TARGET_DEPENDS") {
         if model.find_target(dir, &value).is_some() {
             ordering.insert(value);
         } else {
@@ -445,13 +444,20 @@ fn add_autogen(
             .filter(|file| file.kind == ScanKind::Module && file.moc)
         {
             let moc = join(&plan.include_dir(configured), &file.moc_output);
-            if file.configs.len() < plan.configs.len() && plan.multi {
-                for config in &file.configs {
+            // The shared stamp runs moc for all configurations. Its byproducts
+            // must list each path even though each source has a config condition.
+            let shared_stamp = plan.cross && !plan.better;
+            if configured.is_some() && (shared_stamp || file.configs.len() < plan.configs.len()) {
+                for config in plan
+                    .configs
+                    .iter()
+                    .filter(|cfg| file.configs.is_empty() || file.configs.contains(*cfg))
+                {
                     let actual = join(&plan.include_dir(Some(&config.0)), &file.moc_output);
                     let source = in_config(config, &actual);
                     add_source(model, plan, origin, source.clone(), false, true)?;
-                    mark_source(model, origin, actual, true);
-                    generated.push(source);
+                    mark_source(model, origin, actual.clone(), true);
+                    generated.push(if shared_stamp { actual } else { source });
                 }
             } else {
                 add_source(model, plan, origin, moc.clone(), false, true)?;
@@ -774,7 +780,7 @@ fn add_include(
     plan: &TargetPlan,
     origin: &Target,
 ) -> Result<(), ResolveError> {
-    let system = target_property(model, origin, b"AUTOGEN_USE_SYSTEM_INCLUDE").map_or_else(
+    let system = origin.props.get(b"AUTOGEN_USE_SYSTEM_INCLUDE").map_or_else(
         || {
             model
                 .dir(origin.dir)
@@ -901,8 +907,10 @@ pub(super) fn concatenate(parts: &[&[u8]]) -> BString {
 }
 
 /// Read a target property as a list of non-empty values.
-pub(super) fn target_list(model: &ProjectModel, target: &Target, key: &[u8]) -> Vec<BString> {
-    target_property(model, target, key)
+pub(super) fn target_list(target: &Target, key: &[u8]) -> Vec<BString> {
+    target
+        .props
+        .get(key)
         .map_or_else(Vec::new, |value| list::split(value, list::Empty::Drop))
 }
 

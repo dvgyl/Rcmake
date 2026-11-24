@@ -7,8 +7,10 @@ use rcmake_diag::{PolicyId, PolicyStatus};
 use rcmake_genex::ConfigId;
 use rcmake_model::{ProjectModel, Target, TargetKind};
 
-use super::arch::{expand_architectures, target_architectures};
-use crate::lower::shell::{direct, join_words, rule_invocations};
+mod rule;
+
+use super::arch::{expand_architectures, ipo_enabled, target_architectures};
+use crate::lower::shell::{direct, join_words};
 use crate::lower::{compute_artifacts, definition, join, object_dir};
 use crate::usage::link_options::{Wrapper, shell_arguments};
 use crate::usage::{ResolvedLinkItem, ResolvedLinkKind};
@@ -34,6 +36,8 @@ pub(crate) enum DeviceLinkMode {
     Driver {
         /// Link command.
         invocation: Invocation,
+        /// Inputs that the driver can read from a response file.
+        response_file: Option<DeviceLinkResponseFile>,
     },
     /// Separate tools link each architecture and compile the registration stub.
     Explicit {
@@ -48,6 +52,17 @@ pub(crate) enum DeviceLinkMode {
         /// Command that compiles the registration stub into the device object.
         compile: Invocation,
     },
+}
+
+/// Arguments that a generator can move into device-link response files.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DeviceLinkResponseFile {
+    /// Toolchain prefix for a response file path. Trailing space separates arguments.
+    pub(crate) flag: BString,
+    /// Arguments from `<OBJECTS>` in command order.
+    pub(crate) objects: Vec<BString>,
+    /// Library arguments from `<LINK_LIBRARIES>`. Link directories stay on the command line.
+    pub(crate) libraries: Vec<BString>,
 }
 
 /// One invocation of an explicit device linker.
@@ -119,17 +134,29 @@ pub(crate) fn require_device_linking(
             TargetKind::SharedLibrary | TargetKind::ModuleLibrary | TargetKind::Executable
         );
     }
-    link_items
+    unresolved_static_libraries(model, link_items, lang)
+        .next()
+        .is_some()
+}
+
+fn unresolved_static_libraries<'a>(
+    model: &'a ProjectModel,
+    items: &'a [ResolvedLinkItem],
+    lang: &[u8],
+) -> impl Iterator<Item = &'a Target> + 'a {
+    let separable = [lang, b"_SEPARABLE_COMPILATION"].concat();
+    let resolves = [lang, b"_RESOLVE_DEVICE_SYMBOLS"].concat();
+    items
         .iter()
         .flat_map(ResolvedLinkItem::targets)
-        .filter_map(|id| model.target(id))
-        .any(|dependency| {
-            dependency.kind == TargetKind::StaticLibrary
-                && dependency
+        .filter_map(move |id| model.target(id))
+        .filter(move |dep| {
+            dep.kind == TargetKind::StaticLibrary
+                && dep
                     .props
                     .get(&separable)
                     .is_some_and(|value| truth::is_on(value))
-                && !dependency
+                && !dep
                     .props
                     .get(&resolves)
                     .is_some_and(|value| truth::is_on(value))
@@ -143,6 +170,8 @@ pub(crate) struct DeviceLibraries {
     pub(crate) args: Vec<BString>,
     /// Objects and archives that activate the rule when they change.
     pub(crate) files: Vec<BString>,
+    /// Whether an unresolved separable static library uses interprocedural optimization.
+    pub(crate) requires_ipo: bool,
 }
 
 /// Select the libraries and file prerequisites that the device linker can consume.
@@ -153,7 +182,11 @@ pub(crate) fn device_libraries(
     items: &[ResolvedLinkItem],
     lang: &[u8],
 ) -> DeviceLibraries {
-    let mut libraries = DeviceLibraries::default();
+    let mut libraries = DeviceLibraries {
+        requires_ipo: unresolved_static_libraries(model, items, lang)
+            .any(|dep| ipo_enabled(model, dep, config, lang)),
+        ..DeviceLibraries::default()
+    };
     let mut seen = BTreeSet::new();
     let mut iter = items.iter().flat_map(|item| match &item.kind {
         ResolvedLinkKind::Group { members, .. } => members.as_slice(),
@@ -248,8 +281,10 @@ fn matches_library_flag(value: &[u8]) -> bool {
 
 /// Filter evaluated link options and expand the linker wrapper for the selected phase.
 ///
-/// Evaluate the options with the generator expression context for that phase.
-/// The returned values contain individual arguments.
+/// Supply raw evaluated `LINK_OPTIONS` and interface options in the selected phase.
+/// For a static library's device link, use `LINK_OPTIONS`. Use `STATIC_LIBRARY_OPTIONS`
+/// for the archive command. Keep phase markers and `SHELL:` and `LINKER:` groups
+/// intact until this function returns the individual arguments.
 pub(crate) fn link_options(
     model: &ProjectModel,
     target: &Target,
@@ -278,7 +313,11 @@ pub(crate) fn link_options(
             b"</HOST_LINK>" => in_host = false,
             _ if (in_device && !device) || (in_host && device) => {}
             _ if unique.insert(option) => {
-                let args = if device && !in_device {
+                let args = if device
+                    && !in_device
+                    && !option.starts_with(b"LINKER:")
+                    && !option.starts_with(b"DEVICE_LINKER:")
+                {
                     let value = option.strip_prefix(b"SHELL:").unwrap_or(option);
                     host_options(model, target, lang, shell_arguments(value))?
                 } else {
@@ -370,7 +409,7 @@ pub(crate) struct DeviceLinkInputs<'a> {
     pub(crate) libraries: &'a DeviceLibraries,
     /// Device link directories, expressed as compiler arguments.
     pub(crate) directories: &'a [BString],
-    /// Device link options, including architecture and interprocedural optimization flags.
+    /// Device link options, including architecture flags.
     pub(crate) link_flags: &'a [BString],
     /// Device compiler flags, excluding the flags already in link_flags.
     pub(crate) compile_flags: &'a [BString],
@@ -399,8 +438,29 @@ pub(crate) fn plan(
     let explicit = get(b"_DEVICE_LINK_MODE").is_some_and(|mode| mode == b"EXPLICIT")
         || (lang == b"CUDA" && get(b"_COMPILER_ID").is_some_and(|id| id == b"Clang"));
 
+    let mut link_flags = Vec::new();
+    if (input.libraries.requires_ipo || ipo_enabled(model, target, config, lang))
+        && let Some(flags) = get(b"_DEVICE_LINK_OPTIONS_IPO")
+    {
+        for flag in list::iter(flags, list::Empty::Drop).flat_map(|value| shell_arguments(&value)) {
+            if !input.link_flags.contains(&flag) && !link_flags.contains(&flag) {
+                link_flags.push(flag);
+            }
+        }
+    }
+    link_flags.extend_from_slice(input.link_flags);
+    let rule = rule::Rule {
+        model,
+        target,
+        config,
+        lang,
+        dir: &dir,
+        output: &output,
+        input,
+        link_flags: &link_flags,
+    };
     let mode = if explicit {
-        explicit_plan(model, target, &dir, &output, &inputs, input)?
+        explicit_plan(&rule, &inputs)?
     } else {
         let suffix: &[u8] = match target.kind {
             TargetKind::StaticLibrary | TargetKind::SharedLibrary | TargetKind::ModuleLibrary => {
@@ -409,27 +469,18 @@ pub(crate) fn plan(
             _ => b"_DEVICE_LINK_EXECUTABLE",
         };
         let template = get(suffix).ok_or_else(|| missing(lang, suffix))?;
-        let invocation = single_rule(model, target, template, |key| {
-            Some(match key {
-                b"TARGET" => quote(&output),
-                b"OBJECTS" => words(input.objects),
-                b"LINK_LIBRARIES" => join_words(
-                    input
-                        .directories
-                        .iter()
-                        .chain(&input.libraries.args)
-                        .map(|arg| quote(arg)),
-                ),
-                b"FLAGS" | b"LANGUAGE_COMPILE_FLAGS" => words(input.compile_flags),
-                b"LINK_FLAGS" => words(input.link_flags),
-                b"LINK_PATH" => words(input.directories),
-                b"TARGET_NAME" => quote(&target.name),
-                b"TARGET_TYPE" => target.kind.as_str().into(),
-                b"CONFIG" => quote(&config.0),
-                _ => return None,
-            })
-        })?;
-        DeviceLinkMode::Driver { invocation }
+        let invocation = rule.expand(template, None)?;
+        let response_file = get(b"_RESPONSE_FILE_DEVICE_LINK_FLAG")
+            .filter(|flag| !flag.is_empty())
+            .map(|flag| DeviceLinkResponseFile {
+                flag: flag.clone(),
+                objects: input.objects.to_vec(),
+                libraries: input.libraries.args.clone(),
+            });
+        DeviceLinkMode::Driver {
+            invocation,
+            response_file,
+        }
     };
     Ok(DeviceLinkPlan {
         lang: lang.into(),
@@ -440,22 +491,19 @@ pub(crate) fn plan(
 }
 
 fn explicit_plan(
-    model: &ProjectModel,
-    target: &Target,
-    dir: &[u8],
-    output: &[u8],
+    rule: &rule::Rule<'_>,
     inputs: &[BString],
-    input: &DeviceLinkInputs<'_>,
 ) -> Result<DeviceLinkMode, ResolveError> {
-    let spec = target_architectures(model, target).map_err(ResolveError::Message)?;
-    let archs = expand_architectures(model, target, &spec).map_err(ResolveError::Message)?;
+    let spec = target_architectures(rule.target).map_err(ResolveError::Message)?;
+    let archs =
+        expand_architectures(rule.model, rule.target, &spec).map_err(ResolveError::Message)?;
     if archs.is_empty() {
         return Err(ResolveError::Message(
             "CUDA_SEPARABLE_COMPILATION on Clang requires CUDA_ARCHITECTURES to be set.".into(),
         ));
     }
     let get = |key: &[u8]| {
-        definition(model, target.dir, key)
+        definition(rule.model, rule.target.dir, key)
             .filter(|value| !value.is_empty())
             .ok_or_else(|| {
                 ResolveError::Message(
@@ -468,8 +516,8 @@ fn explicit_plan(
             })
     };
     let linker = get(b"CMAKE_CUDA_DEVICE_LINKER")?;
-    let register_header = join(dir, b"cmake_cuda_register.h");
-    let fatbin_header = join(dir, b"cmake_cuda_fatbin.h");
+    let register_header = join(rule.dir, b"cmake_cuda_register.h");
+    let fatbin_header = join(rule.dir, b"cmake_cuda_fatbin.h");
     let mut cubins = Vec::new();
     let mut seen = BTreeSet::new();
     let mut fatbinary = vec![
@@ -485,7 +533,7 @@ fn explicit_plan(
         .filter(|arch| seen.insert(arch.name.clone()))
     {
         let profile = prefixed(b"sm_", &arch.name);
-        let cubin = join(dir, &[profile.as_slice(), b".cubin"].concat());
+        let cubin = join(rule.dir, &[profile.as_slice(), b".cubin"].concat());
         let mut argv = vec![linker.clone(), prefixed(b"-arch=", &profile)];
         if cubins.is_empty() {
             argv.push(prefixed(b"--register-link-binaries=", &register_header));
@@ -503,20 +551,9 @@ fn explicit_plan(
             invocation: direct(argv, None),
         });
     }
-    let compile = single_rule(
-        model,
-        target,
+    let compile = rule.expand(
         get(b"CMAKE_CUDA_DEVICE_LINK_COMPILE")?,
-        |key| {
-            Some(match key {
-                b"OBJECT" | b"TARGET" => quote(output),
-                b"FLAGS" | b"LANGUAGE_COMPILE_FLAGS" => words(input.compile_flags),
-                b"LINK_FLAGS" => words(input.link_flags),
-                b"FATBINARY" => quote(&fatbin_header),
-                b"REGISTER_FILE" => quote(&register_header),
-                _ => return None,
-            })
-        },
+        Some((&fatbin_header, &register_header)),
     )?;
     Ok(DeviceLinkMode::Explicit {
         cubins,
@@ -541,23 +578,6 @@ fn missing(lang: &[u8], suffix: &[u8]) -> ResolveError {
     ResolveError::Message(format!("{variable} is required for device linking.").into())
 }
 
-fn single_rule(
-    model: &ProjectModel,
-    target: &Target,
-    template: &[u8],
-    lookup: impl Fn(&[u8]) -> Option<BString>,
-) -> Result<Invocation, ResolveError> {
-    let mut rules = rule_invocations(model, target.dir, template, lookup);
-    if rules.len() != 1 {
-        return Err(ResolveError::Message(
-            "A device-link rule must contain one command.".into(),
-        ));
-    }
-    rules
-        .pop()
-        .ok_or_else(|| ResolveError::Message("The device-link command is empty.".into()))
-}
-
 fn words(args: &[BString]) -> BString {
     join_words(args.iter().map(|arg| quote(arg)))
 }
@@ -567,265 +587,4 @@ fn prefixed(prefix: &[u8], value: &[u8]) -> BString {
 }
 
 #[cfg(test)]
-mod tests {
-    use rcmake_diag::{Backtrace, PolicyMap};
-    use rcmake_model::{BT, DirId, TargetOrigin};
-
-    use super::*;
-
-    fn target(name: &str, kind: TargetKind) -> Target {
-        Target::new(
-            name.into(),
-            kind,
-            TargetOrigin::Normal,
-            DirId::ROOT,
-            Backtrace::default(),
-            PolicyMap::default(),
-        )
-    }
-
-    fn item(value: &str, kind: ResolvedLinkKind) -> ResolvedLinkItem {
-        ResolvedLinkItem {
-            text: BT::new(value.into(), Backtrace::default()),
-            kind,
-            feature: None,
-            direct: true,
-        }
-    }
-
-    #[test]
-    fn unresolved_static_library_requires_device_link() -> Result<(), rcmake_model::ModelError> {
-        let mut model = ProjectModel::default();
-        model
-            .global
-            .props
-            .set("ENABLED_LANGUAGES".into(), "CXX;CUDA".into());
-        model.dir_mut(DirId::ROOT).vars.insert(
-            "CMAKE_CUDA_COMPILER_HAS_DEVICE_LINK_PHASE".into(),
-            "ON".into(),
-        );
-        let mut library = target("kernels", TargetKind::StaticLibrary);
-        library
-            .props
-            .set("CUDA_SEPARABLE_COMPILATION".into(), "ON".into());
-        let id = model.add_target(library)?;
-        let mut app = target("app", TargetKind::Executable);
-        let items = [item("kernels", ResolvedLinkKind::Library(id))];
-        let languages = [BString::from("CUDA")];
-        assert_eq!(
-            device_link_language(&model, &app, &languages, &items),
-            Some(b"CUDA".as_slice())
-        );
-        assert_eq!(device_link_language(&model, &app, &[], &items), None);
-        app.props
-            .set("CUDA_RESOLVE_DEVICE_SYMBOLS".into(), "OFF".into());
-        assert_eq!(device_link_language(&model, &app, &languages, &items), None);
-        app.props
-            .set("CUDA_RESOLVE_DEVICE_SYMBOLS".into(), "ON".into());
-        assert_eq!(
-            device_link_language(&model, &app, &[], &[]),
-            Some(b"CUDA".as_slice())
-        );
-        app.kind = TargetKind::ObjectLibrary;
-        assert_eq!(device_link_language(&model, &app, &languages, &items), None);
-        Ok(())
-    }
-
-    #[test]
-    fn library_filter_skips_host_libraries_and_flags() {
-        let model = ProjectModel::default();
-        let app = target("app", TargetKind::Executable);
-        let items = [
-            "-framework",
-            "Cocoa",
-            "-framework Metal",
-            "-pthread",
-            "/lib/libhost.so.1",
-            "/lib/libkernel.a",
-            "/lib/libkernel.a",
-            "-lcuda",
-            "-L/cuda",
-            "--library=cudadevrt",
-            "bare",
-        ]
-        .map(|name| item(name, ResolvedLinkKind::Raw));
-        let libraries = device_libraries(&model, &app, &ConfigId::default(), &items, b"CUDA");
-        assert_eq!(
-            libraries.args,
-            [
-                "/lib/libkernel.a",
-                "-lcuda",
-                "-L/cuda",
-                "--library=cudadevrt",
-                "bare",
-            ]
-        );
-        assert_eq!(libraries.files, ["/lib/libkernel.a"]);
-    }
-
-    #[test]
-    fn link_options_obey_markers_and_policy() -> Result<(), Box<dyn std::error::Error>> {
-        let mut model = ProjectModel::default();
-        model.dir_mut(DirId::ROOT).vars.insert(
-            "CMAKE_CUDA_DEVICE_LINKER_WRAPPER_FLAG".into(),
-            "-Xlinker=".into(),
-        );
-        model.dir_mut(DirId::ROOT).vars.insert(
-            "CMAKE_CUDA_DEVICE_LINKER_WRAPPER_FLAG_SEP".into(),
-            ",".into(),
-        );
-        let mut app = target("app", TargetKind::Executable);
-        let options = [
-            "-common",
-            "<DEVICE_LINK>",
-            "LINKER:--first,--second",
-            "</DEVICE_LINK>",
-            "<HOST_LINK>",
-            "-host",
-            "</HOST_LINK>",
-        ]
-        .map(BString::from);
-        assert!(link_options(&model, &app, b"CUDA", &options, true)?.is_empty());
-        app.policies
-            .policies
-            .set(PolicyId::new(105), PolicyStatus::New)?;
-        assert_eq!(
-            link_options(&model, &app, b"CUDA", &options, true)?,
-            ["-common", "-Xlinker=--first,--second",]
-        );
-        assert_eq!(
-            link_options(&model, &app, b"CUDA", &options, false)?,
-            ["-common", "-host"]
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn driver_uses_the_library_rule_for_static_archives() -> Result<(), ResolveError> {
-        let mut model = ProjectModel::default();
-        model.generator = Some(rcmake_model::GeneratorKind::NinjaMultiConfig);
-        model.set_root_dirs("/src".into(), "/build".into());
-        model.dir_mut(DirId::ROOT).vars.extend([
-            ("CMAKE_CUDA_COMPILER".into(), "/cuda/nvcc".into()),
-            (
-                "CMAKE_CUDA_DEVICE_LINK_LIBRARY".into(),
-                "<CMAKE_CUDA_COMPILER> -dlink <OBJECTS> -o <TARGET> <LINK_LIBRARIES>".into(),
-            ),
-        ]);
-        let lib = target("kernels", TargetKind::StaticLibrary);
-        let libraries = DeviceLibraries {
-            args: vec!["libdevice.a".into()],
-            files: vec!["libdevice.a".into()],
-        };
-        let plan = plan(
-            &model,
-            &lib,
-            &ConfigId("Debug".into()),
-            b"CUDA",
-            &DeviceLinkInputs {
-                objects: &["kernel.o".into()],
-                libraries: &libraries,
-                directories: &[],
-                link_flags: &[],
-                compile_flags: &[],
-            },
-        )?;
-        assert_eq!(
-            plan.output,
-            "CMakeFiles/kernels.dir/Debug/cmake_device_link.o"
-        );
-        assert_eq!(plan.inputs, ["kernel.o", "libdevice.a"]);
-        let DeviceLinkMode::Driver { invocation } = plan.mode else {
-            return Err(ResolveError::Message(
-                "Expected driver device linking.".into(),
-            ));
-        };
-        assert_eq!(
-            invocation.argv,
-            [
-                "/cuda/nvcc",
-                "-dlink",
-                "kernel.o",
-                "-o",
-                "CMakeFiles/kernels.dir/Debug/cmake_device_link.o",
-                "libdevice.a",
-            ]
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn explicit_plan_emits_one_registration_header() -> Result<(), ResolveError> {
-        let mut model = ProjectModel::default();
-        model.set_root_dirs("/src".into(), "/build".into());
-        for (key, value) in [
-            ("CMAKE_CUDA_COMPILER_ID", "Clang"),
-            ("CMAKE_CUDA_ARCHITECTURES", "75-real;90-virtual;75"),
-            ("CMAKE_CUDA_DEVICE_LINKER", "/cuda/nvlink"),
-            ("CMAKE_CUDA_FATBINARY", "/cuda/fatbinary"),
-            (
-                "CMAKE_CUDA_DEVICE_LINK_COMPILE",
-                "clang -c link.stub -o <OBJECT> <FATBINARY> <REGISTER_FILE>",
-            ),
-        ] {
-            model
-                .dir_mut(DirId::ROOT)
-                .vars
-                .insert(key.into(), value.into());
-        }
-        let app = target("app", TargetKind::Executable);
-        let libraries = DeviceLibraries::default();
-        let plan = plan(
-            &model,
-            &app,
-            &ConfigId::default(),
-            b"CUDA",
-            &DeviceLinkInputs {
-                objects: &["a.o".into()],
-                libraries: &libraries,
-                directories: &[],
-                link_flags: &[],
-                compile_flags: &[],
-            },
-        )?;
-        assert!(plan.output.ends_with(b"cmake_device_link.o"));
-        if let DeviceLinkMode::Explicit {
-            cubins,
-            fatbinary,
-            compile,
-            ..
-        } = plan.mode
-        {
-            assert_eq!(
-                cubins
-                    .iter()
-                    .map(|link| link.arch.clone())
-                    .collect::<Vec<_>>(),
-                ["75", "90"]
-            );
-            assert_eq!(
-                cubins
-                    .iter()
-                    .filter(|link| link
-                        .invocation
-                        .argv
-                        .iter()
-                        .any(|arg| arg.starts_with(b"--register-link-binaries=")))
-                    .count(),
-                1
-            );
-            assert!(
-                fatbinary
-                    .argv
-                    .iter()
-                    .any(|arg| arg.starts_with(b"-im=profile=sm_90,"))
-            );
-            assert!(compile.argv.iter().any(|arg| arg == b"link.stub"));
-        } else {
-            return Err(ResolveError::Message(
-                "Expected explicit device linking.".into(),
-            ));
-        }
-        Ok(())
-    }
-}
+mod tests;

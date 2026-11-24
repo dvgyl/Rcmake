@@ -1,10 +1,13 @@
 //! CUDA architecture selection and compiler flags.
 
 use rcmake_base::{BString, list, truth, version};
-use rcmake_diag::{Diagnostic, Effect, Location, MessageKind, PolicyId, PolicyStatus};
+use rcmake_diag::{
+    DiagCategory, Diagnostic, Effect, Location, MessageKind, PolicyId, PolicyStatus,
+};
+use rcmake_genex::ConfigId;
 use rcmake_model::{ProjectModel, Target};
 
-use crate::lower::{definition, target_property};
+use crate::lower::{definition, policy_flags::Flags};
 use crate::usage::link_options::shell_arguments;
 
 /// Architecture selection before compiler-specific expansion.
@@ -44,13 +47,20 @@ pub(crate) enum ArchPhase {
     Link,
 }
 
-/// Read the target architecture property, with the variable used as its initial value.
-pub(crate) fn target_architectures(
-    model: &ProjectModel,
-    target: &Target,
-) -> Result<ArchSpec, BString> {
-    let value = target_property(model, target, b"CUDA_ARCHITECTURES");
-    parse_architectures(value.map_or(b"", |value| value.as_slice()))
+/// Read the architecture property that target creation initialized.
+///
+/// Validate the directory variable separately before compiler detection. A later
+/// assignment to that variable cannot change this target. Rcmake checks the syntax
+/// of an explicit target property before it passes architecture names to the compiler.
+pub(crate) fn target_architectures(target: &Target) -> Result<ArchSpec, BString> {
+    let value = target.props.get(b"CUDA_ARCHITECTURES");
+    parse_architectures(value.map_or(b"", |value| value.as_slice())).map_err(|error| {
+        format!(
+            "Invalid CUDA_ARCHITECTURES property for target \"{}\". {error}",
+            target.name
+        )
+        .into()
+    })
 }
 
 /// Parse a CUDA architecture property.
@@ -88,7 +98,7 @@ pub(crate) fn validate_architecture_variable(value: &[u8]) -> Result<(), BString
         return Ok(());
     }
     Err(format!(
-        "CMAKE_CUDA_ARCHITECTURES:\n  {}\nis not one of the following:\n  * a semicolon-separated list of integers, each optionally\n    followed by '-real' or '-virtual'\n  * a special value: all, all-major, native\n",
+        "CMAKE_CUDA_ARCHITECTURES:\n  {}\nis not one of the following:\n  * a semicolon-separated list of architecture numbers, such as 75, 90a, or 100f\n    Each number can end in 'a' or 'f' and can use '-real' or '-virtual'.\n  * a special value: all, all-major, native, or a false value such as OFF\n",
         BString::from(value)
     )
     .into())
@@ -132,6 +142,10 @@ fn parse_list(value: &[u8]) -> Result<Vec<CudaArch>, BString> {
 }
 
 /// Expand a named selection to individual architectures for an explicit device link.
+///
+/// For Clang 19, use the same architectures as compilation. CMake 4.5.1 can
+/// pass a selection name such as `all` to nvlink and request `sm_all.cubin`.
+/// nvlink requires a GPU architecture such as `sm_75`.
 pub(crate) fn expand_architectures(
     model: &ProjectModel,
     target: &Target,
@@ -163,7 +177,7 @@ pub(crate) fn architecture_flags(
     ipo: bool,
     in_try_compile: bool,
 ) -> (Vec<BString>, Vec<Diagnostic>) {
-    let spec = match target_architectures(model, target) {
+    let spec = match target_architectures(target) {
         Ok(spec) => spec,
         Err(body) => return (Vec::new(), vec![fatal(target, None, body)]),
     };
@@ -215,7 +229,9 @@ pub(crate) fn architecture_flags(
                 .map(|arch| nvidia_flag(arch, phase, ipo)),
         );
     } else if compiler == b"Clang" && phase == ArchPhase::Compile {
-        let separable = target_property(model, target, b"CUDA_SEPARABLE_COMPILATION")
+        let separable = target
+            .props
+            .get(b"CUDA_SEPARABLE_COMPILATION")
             .is_some_and(|value| truth::is_on(value));
         let modern = at_least(b"20.0");
         for arch in &architectures {
@@ -231,6 +247,25 @@ pub(crate) fn architecture_flags(
         }
     }
     (flags, diagnostics)
+}
+
+/// Check the target's interprocedural optimization property for this configuration.
+pub(super) fn ipo_enabled(
+    model: &ProjectModel,
+    target: &Target,
+    config: &ConfigId,
+    lang: &[u8],
+) -> bool {
+    Flags::new(model, target, lang).ipo(config)
+}
+
+/// Give rich diagnostic consumers a corrective action for an empty architecture property.
+///
+/// Keep the CMP0104 message body available for compatibility output.
+pub(crate) fn architecture_hint(diagnostic: &Diagnostic) -> Option<&'static str> {
+    (diagnostic.policy == Some(PolicyId::new(104))).then_some(
+        "Set -DCMAKE_CUDA_ARCHITECTURES=75 to select architecture 75. Set CUDA_ARCHITECTURES to OFF if the project supplies its own architecture flags.",
+    )
 }
 
 fn nvidia_flag(arch: &CudaArch, phase: ArchPhase, ipo: bool) -> BString {
@@ -306,12 +341,13 @@ fn empty_diagnostic(target: &Target, in_try_compile: bool) -> Option<Diagnostic>
         PolicyStatus::Old => None,
         PolicyStatus::Warn if in_try_compile => None,
         PolicyStatus::Warn => {
-            let summary = policy.info().map_or("", |info| info.summary);
             let body: BString = body();
-            Some(diagnostic(
+            let mut warning = diagnostic(
                 target, MessageKind::AuthorWarning, Effect::None, Some(policy),
-                format!("Policy CMP0104 is not set: {summary}  Run \"cmake --help-policy CMP0104\" for policy details.  Use the cmake_policy command to set the policy and suppress this warning.\n\n{body}").into(),
-            ))
+                format!("Policy CMP0104 is not set: CMAKE_CUDA_ARCHITECTURES now detected for NVCC, empty CUDA_ARCHITECTURES not allowed.  Run \"cmake --help-policy CMP0104\" for policy details.  Use the cmake_policy command to set the policy and suppress this warning.\n\n{body}").into(),
+            );
+            warning.category = Some(DiagCategory::Policy);
+            Some(warning)
         }
         PolicyStatus::New => Some(fatal(target, Some(policy), body())),
     }
@@ -365,13 +401,12 @@ mod tests {
         for (key, value) in [
             ("CMAKE_CUDA_COMPILER_ID", id),
             ("CMAKE_CUDA_COMPILER_VERSION", version),
-            ("CMAKE_CUDA_ARCHITECTURES", value),
             ("CMAKE_CUDA_ARCHITECTURES_ALL", "52-real;75"),
             ("CMAKE_CUDA_ARCHITECTURES_ALL_MAJOR", "52-real;86"),
         ] {
             vars.insert(key.into(), value.into());
         }
-        let target = Target::new(
+        let mut target = Target::new(
             "app".into(),
             TargetKind::Executable,
             TargetOrigin::Normal,
@@ -379,7 +414,37 @@ mod tests {
             Backtrace::default(),
             PolicyMap::default(),
         );
+        target.props.set("CUDA_ARCHITECTURES".into(), value.into());
         (model, target)
+    }
+
+    #[test]
+    fn architecture_validation_uses_the_target_snapshot() -> Result<(), BString> {
+        let (mut model, mut target) = fixture("NVIDIA", "12.6", "75");
+        model
+            .dir_mut(DirId::ROOT)
+            .vars
+            .insert("CMAKE_CUDA_ARCHITECTURES".into(), "90a".into());
+        assert_eq!(target_architectures(&target)?, parse_architectures(b"75")?);
+        let unset = Target::new(
+            "earlier".into(),
+            TargetKind::Executable,
+            TargetOrigin::Normal,
+            DirId::ROOT,
+            Backtrace::default(),
+            PolicyMap::default(),
+        );
+        assert_eq!(target_architectures(&unset)?, ArchSpec::Empty);
+        target
+            .props
+            .set("CUDA_ARCHITECTURES".into(), "75;abc".into());
+        let error = target_architectures(&target).expect_err("Expected a target property error.");
+        assert!(error.starts_with(b"Invalid CUDA_ARCHITECTURES property for target \"app\"."));
+        let error =
+            validate_architecture_variable(b"75;abc").expect_err("Expected a variable error.");
+        assert!(error.starts_with(b"CMAKE_CUDA_ARCHITECTURES:"));
+        assert!(error.as_slice().windows(4).any(|bytes| bytes == b"100f"));
+        Ok(())
     }
 
     #[test]
@@ -449,6 +514,13 @@ mod tests {
                 architecture_flags(&model, &target, ArchPhase::Compile, false, false);
             assert!(flags.is_empty());
             assert_eq!(diagnostics.first().map(|diag| diag.effect), effect);
+            if let Some(diag) = diagnostics.first() {
+                assert!(
+                    diag.body
+                        .ends_with(b"CUDA_ARCHITECTURES is empty for target \"app\".")
+                );
+                assert!(architecture_hint(diag).is_some_and(|hint| hint.contains("=75")));
+            }
         }
         target
             .policies
