@@ -265,6 +265,20 @@ impl Cx<'_> {
         })
     }
 
+    /// Check whether to display find diagnostics for the given output variable.
+    #[must_use]
+    pub fn find_variable_debug(&self, name: &[u8]) -> bool {
+        self.var_is_on(b"CMAKE_FIND_DEBUG_MODE")
+            || self.interp.find_debug_variables.iter().any(|item| item == name)
+    }
+
+    /// Check whether to display find diagnostics for the given package.
+    #[must_use]
+    pub fn find_package_debug(&self, name: &[u8]) -> bool {
+        self.var_is_on(b"CMAKE_FIND_DEBUG_MODE")
+            || self.interp.find_debug_packages.iter().any(|item| item == name)
+    }
+
     /// Enable tracing until the next matching `cmake_language(TRACE OFF)`.
     pub fn push_trace(&mut self, expand: bool) {
         self.interp.trace_stack.push(expand);

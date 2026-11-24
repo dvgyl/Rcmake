@@ -94,13 +94,13 @@ impl FrameworkOrder {
 }
 
 impl<'a> Search<'a> {
-    pub(super) fn new(cx: &Cx<'_>, kind: Kind, options: &'a Options) -> Self {
+    pub(super) fn new(cx: &Cx<'_>, kind: Kind, options: &'a Options, var: &[u8]) -> Self {
         Self {
             kind,
             options,
             decoration: matches!(kind, Kind::Library).then(|| LibraryNames::new(cx)),
             ignored: IgnoredPaths::new(cx),
-            considered: cx.var_is_on(b"CMAKE_FIND_DEBUG_MODE").then(String::new),
+            considered: cx.find_variable_debug(var).then(String::new),
             match_path: None,
         }
     }

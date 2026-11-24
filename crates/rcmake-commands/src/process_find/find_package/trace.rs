@@ -11,8 +11,8 @@ pub(super) struct SearchTrace {
 }
 
 impl SearchTrace {
-    pub(super) fn new(cx: &Cx<'_>) -> Self {
-        let enabled = cx.var_is_on(b"CMAKE_FIND_DEBUG_MODE");
+    pub(super) fn new(cx: &Cx<'_>, name: &[u8]) -> Self {
+        let enabled = cx.find_package_debug(name);
         Self {
             body: enabled.then(BString::default),
             candidates: Vec::new(),

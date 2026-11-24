@@ -144,7 +144,7 @@ pub(super) fn find_package_with_diagnostics(
         vars.add(find(b"REGISTRY_VIEW"), registry_view.clone());
     }
     let found = vars.scoped(cx, |cx| {
-        let mut trace = SearchTrace::new(cx);
+        let mut trace = SearchTrace::new(cx, name);
         let result = search(
             cx,
             name,

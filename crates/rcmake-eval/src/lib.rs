@@ -429,6 +429,8 @@ pub struct Interp {
     configure_log: Vec<u8>,
     /// Expansion settings for nested `cmake_language(TRACE ON)` calls.
     trace_stack: Vec<bool>,
+    find_debug_variables: Vec<BString>,
+    find_debug_packages: Vec<BString>,
     next_defer_id: u64,
     running_deferred: bool,
     /// Identifier of the deferred call whose frame is on top of the backtrace.
@@ -516,6 +518,8 @@ impl Interp {
             trace: None,
             configure_log: Vec::new(),
             trace_stack: Vec::new(),
+            find_debug_variables: Vec::new(),
+            find_debug_packages: Vec::new(),
             next_defer_id: 0,
             running_deferred: false,
             top_defer_id: None,

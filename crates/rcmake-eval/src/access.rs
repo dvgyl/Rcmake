@@ -5,6 +5,12 @@ use rcmake_base::BString;
 use crate::Interp;
 
 impl Interp {
+    /// Restrict command-line find diagnostics to the named variables and packages.
+    pub fn set_find_debug_filters(&mut self, variables: Vec<BString>, packages: Vec<BString>) {
+        self.find_debug_variables = variables;
+        self.find_debug_packages = packages;
+    }
+
     /// Track the named variables and reset their access status.
     pub fn track_variable_reads(&mut self, names: impl IntoIterator<Item = BString>) {
         self.variable_access

@@ -101,7 +101,7 @@ fn find(cx: &mut Cx<'_>, args: &[ExpandedArg], kind: Kind) -> CmdResult {
     }
 
     let directories = directories(cx, kind, &options);
-    let mut search = Search::new(cx, kind, &options);
+    let mut search = Search::new(cx, kind, &options, var);
     let found = search.run(cx, directories)?;
     search.log(cx, var);
     let mut value = found
