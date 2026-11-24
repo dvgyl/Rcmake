@@ -6,6 +6,7 @@ use rcmake_diag::{PolicyId, PolicyStatus};
 use rcmake_eval::{Cx, RunMode};
 use rcmake_host::{FileKind, Follow, path};
 
+use super::super::RootMode;
 use super::super::search_paths::{
     cmake_paths, host_env_paths, is_file, resolved_lexical_path, search_path, split_env,
     system_prefixes,
@@ -23,57 +24,63 @@ impl ConfigSearch<'_> {
         &self,
         cx: &mut Cx<'_>,
         package_roots: &[BString],
+        mode: RootMode,
         trace: &mut SearchTrace,
     ) -> Vec<(PathBuf, Option<PathBuf>)> {
         let request = self.request;
         let mut groups = Vec::new();
-        groups.push((
+        groups.push(vec![(
             BString::from("The internally managed CMAKE_FIND_PACKAGE_REDIRECTS_DIR."),
             redirects_directory(cx)
                 .iter()
                 .map(|dir| path::from_native(dir))
                 .collect(),
-        ));
+        )]);
         if request.use_source(cx, b"PACKAGE_ROOT_PATH") {
-            groups.push((PACKAGE_ROOT_HEADING.into(), package_roots.to_vec()));
+            groups.push(vec![(PACKAGE_ROOT_HEADING.into(), package_roots.to_vec())]);
         }
         let apple_paths = [b"CMAKE_FRAMEWORK_PATH".as_slice(), b"CMAKE_APPBUNDLE_PATH"];
         if request.use_source(cx, b"CMAKE_PATH") {
-            groups.push((
-                "CMAKE_PREFIX_PATH variable [CMAKE_FIND_USE_CMAKE_PATH].".into(),
-                cmake_paths(cx, b"CMAKE_PREFIX_PATH"),
-            ));
-            groups.push((
-                FRAMEWORK_VARS_HEADING.into(),
-                apple_paths
-                    .iter()
-                    .flat_map(|key| cmake_paths(cx, key))
-                    .collect(),
-            ));
+            groups.push(vec![
+                (
+                    "CMAKE_PREFIX_PATH variable [CMAKE_FIND_USE_CMAKE_PATH].".into(),
+                    cmake_paths(cx, b"CMAKE_PREFIX_PATH"),
+                ),
+                (
+                    FRAMEWORK_VARS_HEADING.into(),
+                    apple_paths
+                        .iter()
+                        .flat_map(|key| cmake_paths(cx, key))
+                        .collect(),
+                ),
+            ]);
         }
         if request.use_source(cx, b"CMAKE_ENVIRONMENT_PATH") {
             let dir = text(&[self.name, b"_DIR"]);
-            groups.push((
-                text(&[
-                    b"Env variable ",
-                    &dir,
-                    b" [CMAKE_FIND_USE_CMAKE_ENVIRONMENT_PATH].",
-                ]),
-                host_env_paths(cx, &dir),
-            ));
-            groups.push((
-                "CMAKE_PREFIX_PATH env variable [CMAKE_FIND_USE_CMAKE_ENVIRONMENT_PATH].".into(),
-                host_env_paths(cx, b"CMAKE_PREFIX_PATH"),
-            ));
-            groups.push((
-                "CMAKE_FRAMEWORK_PATH and CMAKE_APPBUNDLE_PATH env variables [CMAKE_FIND_USE_CMAKE_ENVIRONMENT_PATH].".into(),
-                apple_paths.iter().flat_map(|key| host_env_paths(cx, key)).collect(),
-            ));
+            groups.push(vec![
+                (
+                    text(&[
+                        b"Env variable ",
+                        &dir,
+                        b" [CMAKE_FIND_USE_CMAKE_ENVIRONMENT_PATH].",
+                    ]),
+                    host_env_paths(cx, &dir),
+                ),
+                (
+                    "CMAKE_PREFIX_PATH env variable [CMAKE_FIND_USE_CMAKE_ENVIRONMENT_PATH]."
+                        .into(),
+                    host_env_paths(cx, b"CMAKE_PREFIX_PATH"),
+                ),
+                (
+                    "CMAKE_FRAMEWORK_PATH and CMAKE_APPBUNDLE_PATH env variables [CMAKE_FIND_USE_CMAKE_ENVIRONMENT_PATH].".into(),
+                    apple_paths.iter().flat_map(|key| host_env_paths(cx, key)).collect(),
+                ),
+            ]);
         }
-        groups.push((
+        groups.push(vec![(
             "Paths specified by the find_package HINTS option.".into(),
             request.hints.clone(),
-        ));
+        )]);
         if request.use_source(cx, b"SYSTEM_ENVIRONMENT_PATH") {
             let paths = host_env_paths(cx, b"PATH").into_iter().map(|value| {
                 let dir = path::to_native(&value);
@@ -84,48 +91,49 @@ impl ConfigSearch<'_> {
                 }
                 value
             });
-            groups.push((
+            groups.push(vec![(
                 "Standard system environment variables [CMAKE_FIND_USE_SYSTEM_ENVIRONMENT_PATH]."
                     .into(),
                 paths.collect(),
-            ));
+            )]);
         }
         if request.use_source(cx, b"PACKAGE_REGISTRY")
             && (cx.var_defined(b"CMAKE_FIND_USE_PACKAGE_REGISTRY")
                 || !cx.var_is_on(b"CMAKE_FIND_PACKAGE_NO_PACKAGE_REGISTRY"))
         {
-            groups.push((
+            groups.push(vec![(
                 "CMake User Package Registry [CMAKE_FIND_USE_PACKAGE_REGISTRY].".into(),
                 user_registry(cx, self.name),
-            ));
+            )]);
         }
         if request.use_source(cx, b"CMAKE_SYSTEM_PATH") {
-            groups.push((
+            groups.push(vec![(
                 "CMake variables defined in the Platform file [CMAKE_FIND_USE_CMAKE_SYSTEM_PATH]."
                     .into(),
                 self.system_prefixes(cx),
-            ));
+            )]);
         }
         if request.use_source(cx, b"SYSTEM_PACKAGE_REGISTRY")
             && (cx.var_defined(b"CMAKE_FIND_USE_SYSTEM_PACKAGE_REGISTRY")
                 || !cx.var_is_on(b"CMAKE_FIND_PACKAGE_NO_SYSTEM_PACKAGE_REGISTRY"))
         {
-            groups.push((
+            groups.push(vec![(
                 "CMake System Package Registry [CMAKE_FIND_PACKAGE_NO_SYSTEM_PACKAGE_REGISTRY]."
                     .into(),
                 Vec::new(),
-            ));
+            )]);
         }
-        groups.push((
+        groups.push(vec![(
             "Paths specified by the find_package PATHS option.".into(),
             request.paths.clone(),
-        ));
+        )]);
 
         let mut seen = BTreeSet::new();
         let mut spellings = BTreeMap::new();
-        let prefixes = groups
-            .into_iter()
-            .flat_map(|(heading, values)| {
+        let mut prefixes = Vec::new();
+        for group in groups {
+            let mut group_has_paths = false;
+            for (heading, values) in group {
                 let paths: Vec<_> = values
                     .into_iter()
                     .filter(|value| !value.is_empty() && !value.starts_with(b"[HKEY_"))
@@ -144,7 +152,7 @@ impl ConfigSearch<'_> {
                         Some(path)
                     })
                     .collect();
-                if paths.is_empty() && heading == FRAMEWORK_VARS_HEADING {
+                if paths.is_empty() && group_has_paths {
                     trace.heading(&heading);
                 } else {
                     trace.section(
@@ -152,13 +160,11 @@ impl ConfigSearch<'_> {
                         paths.iter().map(|path| spellings.get(path).unwrap_or(path)),
                     );
                 }
-                paths
-            })
-            .collect();
-        let mode = request
-            .root_mode
-            .resolve(cx, b"CMAKE_FIND_ROOT_PATH_MODE_PACKAGE");
-        if !matches!(mode, super::super::RootMode::Never) {
+                group_has_paths |= !paths.is_empty();
+                prefixes.extend(paths);
+            }
+        }
+        if !matches!(mode, RootMode::Never) {
             let roots = [
                 b"CMAKE_FIND_ROOT_PATH".as_slice(),
                 b"CMAKE_SYSROOT_COMPILE",

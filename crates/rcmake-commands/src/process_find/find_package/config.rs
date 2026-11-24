@@ -140,16 +140,26 @@ impl<'a> ConfigSearch<'a> {
         package_roots: &[BString],
         trace: &mut SearchTrace,
     ) -> Result<Option<ConfigMatch>, CmdError> {
-        let ignored = paths_from_vars(cx, &[b"CMAKE_IGNORE_PATH", b"CMAKE_SYSTEM_IGNORE_PATH"]);
-        let ignored_prefixes = paths_from_vars(
+        let mode = self
+            .request
+            .root_mode
+            .resolve(cx, b"CMAKE_FIND_ROOT_PATH_MODE_PACKAGE");
+        let ignored = mode.reroot(
             cx,
-            &[
-                b"CMAKE_IGNORE_PREFIX_PATH",
-                b"CMAKE_SYSTEM_IGNORE_PREFIX_PATH",
-            ],
+            paths_from_vars(cx, &[b"CMAKE_IGNORE_PATH", b"CMAKE_SYSTEM_IGNORE_PATH"]),
+        );
+        let ignored_prefixes = mode.reroot(
+            cx,
+            paths_from_vars(
+                cx,
+                &[
+                    b"CMAKE_IGNORE_PREFIX_PATH",
+                    b"CMAKE_SYSTEM_IGNORE_PREFIX_PATH",
+                ],
+            ),
         );
         let redirects = redirects_directory(cx);
-        for (prefix, spelling) in self.prefixes(cx, package_roots, trace) {
+        for (prefix, spelling) in self.prefixes(cx, package_roots, mode, trace) {
             if ignored.contains(&prefix)
                 || ignored_prefixes.contains(&prefix)
                 || Some(&prefix) != redirects.as_ref()
