@@ -515,15 +515,11 @@ fn file_archive_commands_validate_missing_options() -> TestResult {
     for (code, problem) in [
         (
             "file(ARCHIVE_CREATE PATHS input)",
-            "option OUTPUT is required.",
+            "file failed to compress:",
         ),
         (
             "file(ARCHIVE_CREATE OUTPUT result.tar)",
-            "option PATHS is required.",
-        ),
-        (
-            "file(ARCHIVE_EXTRACT LIST_ONLY)",
-            "option INPUT is required.",
+            "file ARCHIVE_CREATE requires a non-empty list of PATHS",
         ),
         (
             "file(GLOB output CONFIGURE_DEPENDS *)",
@@ -542,6 +538,10 @@ fn file_archive_commands_validate_missing_options() -> TestResult {
             "{stderr}"
         );
     }
+    let (host, mut interp) = interpreter();
+    let script = Path::new("/work/test.cmake");
+    host.seed_file(script, b"file(ARCHIVE_EXTRACT LIST_ONLY)")?;
+    assert_eq!(interp.run_script(script).exit_code, 0);
     Ok(())
 }
 
@@ -647,8 +647,8 @@ file(ARCHIVE_CREATE OUTPUT result.tar.gz WORKING_DIRECTORY inputs PATHS data oth
         &host,
         &mut interp,
         r#"
-file(ARCHIVE_EXTRACT INPUT result.tar.gz DESTINATION restored PATTERNS data VERBOSE)
-file(ARCHIVE_EXTRACT INPUT result.tar.gz DESTINATION list-only PATTERNS other LIST_ONLY TOUCH)
+file(ARCHIVE_EXTRACT INPUT inputs/result.tar.gz DESTINATION restored PATTERNS data VERBOSE)
+file(ARCHIVE_EXTRACT INPUT inputs/result.tar.gz DESTINATION list-only PATTERNS other LIST_ONLY TOUCH)
 "#,
     )?;
     let restored = Path::new("/work/restored/data");
