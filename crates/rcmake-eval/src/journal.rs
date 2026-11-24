@@ -15,6 +15,6 @@ pub use replay::{
     verify_configure, verify_region,
 };
 pub use trace::{
-    JournalInput, PropertyKey, PropertyOwner, StateKey, StateLookup, TargetKey, VariableScope,
-    policy_digest,
+    JournalDigest, JournalFileStat, JournalInput, JournalStamp, PropertyKey, PropertyOwner,
+    StateKey, StateLookup, TargetKey, VariableScope, directory_digest, file_digest, policy_digest,
 };

@@ -3,7 +3,6 @@ use std::path::Path;
 
 use rcmake_host::{Host, HostError, path};
 use rcmake_model::{AppendMode, DirId, ModelError, ProjectModel, PropOrigin, PropScope};
-use rcmake_store::file_digest;
 use serde::{Deserialize, Serialize};
 
 use crate::Cx;
@@ -12,7 +11,9 @@ use super::region::{
     EntryContext, JournalEffect, MAX_EFFECTS, MAX_INPUTS, OpaqueReason, PropertyEdit, RegionKey,
     RegionKind, RegionPayload, RegionRecord,
 };
-use super::trace::{JournalInput, PropertyOwner, StateKey, StateLookup, VariableScope};
+use super::trace::{
+    JournalInput, PropertyOwner, StateKey, StateLookup, VariableScope, file_digest,
+};
 
 /// Versioned manifest of a successful whole configure.
 ///
@@ -313,15 +314,12 @@ pub fn verify_configure<'a, M>(
 mod tests {
     use super::*;
     use crate::journal::{
-        CacheValue, CommandClass, OutputStream, PropertyKey, PropertyOrigin, RegionState,
-        VariableScope, policy_digest,
+        CacheValue, CommandClass, JournalDigest, JournalFileStat, JournalStamp, OutputStream,
+        PropertyKey, PropertyOrigin, RegionState, VariableScope, directory_digest, policy_digest,
     };
     use rcmake_diag::{Backtrace, Frame, FrameKind, PolicyStatus};
     use rcmake_host::{FileTime, HostResult, PureHost};
     use rcmake_model::{CacheEntry, CacheType, PropertyMap};
-    use rcmake_store::{
-        Digest, Domain, Entry, FastStat, InputStamp, Store, StoreConfig, directory_digest,
-    };
     use std::path::PathBuf;
 
     fn fixture(kind: RegionKind) -> (PureHost, RegionKey, EntryContext) {
@@ -333,10 +331,10 @@ mod tests {
             kind,
         };
         let context = EntryContext {
-            policies: Digest::hash(b"policies"),
-            diag: Digest::hash(b"diagnostics"),
+            policies: JournalDigest::hash(b"policies"),
+            diag: JournalDigest::hash(b"diagnostics"),
             log_level: 0,
-            flags: Digest::hash(b"flags"),
+            flags: JournalDigest::hash(b"flags"),
         };
         (host, key, context)
     }
@@ -351,7 +349,7 @@ mod tests {
     fn read(state: &mut RegionState, key: StateKey, bytes: Option<&[u8]>) {
         state.record_input(JournalInput::State {
             key,
-            value: bytes.map(Digest::hash),
+            value: bytes.map(JournalDigest::hash),
         });
     }
 
@@ -382,7 +380,7 @@ mod tests {
         let record = state.finish(key.clone(), context.clone());
         let verified = verify_region(&host, &record, &key, &context, |seen| {
             assert_eq!(seen, &parent);
-            StateLookup::Observed(Some(Digest::hash(b"old")))
+            StateLookup::Observed(Some(JournalDigest::hash(b"old")))
         })?;
         assert_eq!(verified.inputs().len(), 1);
         let result = verify_region(&host, &record, &key, &context, |_| {
@@ -480,7 +478,7 @@ mod tests {
         let verify = |value: &[u8]| {
             verify_region(&host, &record, &key, &context, |seen| {
                 assert_eq!(seen, &input);
-                StateLookup::Observed(Some(Digest::hash(value)))
+                StateLookup::Observed(Some(JournalDigest::hash(value)))
             })
         };
         assert!(verify(b"first").is_ok());
@@ -556,20 +554,20 @@ mod tests {
         host.env_set(b"OPTION", Some(b"initial"));
         let mut state = RegionState::default();
         for stamp in [
-            InputStamp::FileHash {
+            JournalStamp::FileHash {
                 path: file.clone(),
-                digest: Digest::hash(b"original"),
+                digest: JournalDigest::hash(b"original"),
             },
-            InputStamp::DirEntries {
+            JournalStamp::DirEntries {
                 path: key.source_dir.clone(),
                 digest: directory_digest(&host, &key.source_dir)?,
             },
-            InputStamp::Missing {
+            JournalStamp::Missing {
                 path: missing.clone(),
             },
-            InputStamp::EnvVar {
+            JournalStamp::EnvVar {
                 name: b"OPTION".to_vec(),
-                digest: Some(Digest::hash(b"initial")),
+                digest: Some(JournalDigest::hash(b"initial")),
             },
         ] {
             state.record_input(JournalInput::Host(stamp));
@@ -594,10 +592,10 @@ mod tests {
         let file = key.source_dir.join("input.cmake");
         host.seed_file(&file, b"initial")?;
         let mut state = RegionState::default();
-        state.record_input(JournalInput::Host(InputStamp::FileStat {
+        state.record_input(JournalInput::Host(JournalStamp::FileStat {
             path: file.clone(),
-            stat: FastStat::read(&host, &file)?,
-            digest: Some(Digest::hash(b"initial")),
+            stat: JournalFileStat::read(&host, &file)?,
+            digest: Some(JournalDigest::hash(b"initial")),
         }));
         let record = state.finish(key.clone(), context.clone());
         let verify = || verify_region(&host, &record, &key, &context, unavailable);
@@ -614,14 +612,16 @@ mod tests {
     }
 
     #[test]
-    fn configure_round_trips_and_checks_final_generated_contents() -> HostResult<()> {
+    fn configure_checks_final_generated_contents() -> HostResult<()> {
+        fn requires_serde<T: Serialize + serde::de::DeserializeOwned>() {}
+        requires_serde::<ConfigureSnapshot<Vec<u8>>>();
         let (host, key, context) = fixture(RegionKind::Configure);
         let generated = key.binary_dir.join("generated.h");
         host.seed_file(&generated, b"finish")?;
         let mut state = RegionState::default();
         state.record_effect(JournalEffect::GeneratedFile {
             path: generated.clone(),
-            digest: Digest::hash(b"start"),
+            digest: JournalDigest::hash(b"start"),
         });
         state.record_effect(JournalEffect::Diagnostic {
             stream: OutputStream::Stdout,
@@ -629,7 +629,7 @@ mod tests {
         });
         state.record_effect(JournalEffect::GeneratedFile {
             path: generated.clone(),
-            digest: Digest::hash(b"finish"),
+            digest: JournalDigest::hash(b"finish"),
         });
         let snapshot =
             ConfigureSnapshot::new(state.finish(key.clone(), context.clone()), vec![0xff_u8]);
@@ -637,24 +637,7 @@ mod tests {
         let Ok(snapshot) = snapshot else {
             return Ok(());
         };
-        let store = Store::new(&host, StoreConfig::new(key.binary_dir.join("store")))?;
-        let store_key = Domain::ConfigureV1.key(b"test");
-        store.put_entry(
-            Domain::ConfigureV1,
-            store_key,
-            &Entry {
-                trace: Vec::new(),
-                blobs: Vec::new(),
-                payload: snapshot.clone(),
-            },
-        )?;
-        let loaded =
-            store.get_entry::<ConfigureSnapshot<Vec<u8>>>(Domain::ConfigureV1, store_key)?;
-        assert_eq!(loaded.as_ref().map(|entry| &entry.payload), Some(&snapshot));
-        let Some(loaded) = loaded else {
-            return Ok(());
-        };
-        let checked = verify_configure(&host, &loaded.payload, &key, &context, unavailable);
+        let checked = verify_configure(&host, &snapshot, &key, &context, unavailable);
         assert!(checked.is_ok());
         if let Ok(checked) = checked {
             assert_eq!(checked.model, &[0xff]);
@@ -667,7 +650,7 @@ mod tests {
             })?;
             assert_eq!(seen, [false, true, false]);
         }
-        let mut future_snapshot = loaded.payload.clone();
+        let mut future_snapshot = snapshot.clone();
         future_snapshot.schema = "configure.v2".into();
         assert!(matches!(
             verify_configure(&host, &future_snapshot, &key, &context, unavailable),
@@ -675,7 +658,7 @@ mod tests {
         ));
         host.remove_file(&generated)?;
         assert!(matches!(
-            verify_configure(&host, &loaded.payload, &key, &context, unavailable),
+            verify_configure(&host, &snapshot, &key, &context, unavailable),
             Err(ReplayMiss::GeneratedFile(2))
         ));
         Ok(())

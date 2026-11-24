@@ -3,10 +3,11 @@ use std::path::PathBuf;
 
 use rcmake_diag::{Backtrace, Frame, FrameKind};
 use rcmake_model::{CacheEntry, CacheType, PropertyMap};
-use rcmake_store::{Digest, Domain, KeyHasher};
 use serde::{Deserialize, Serialize};
 
-use super::trace::{JournalInput, PropertyKey, PropertyOwner, StateKey, VariableScope};
+use super::trace::{
+    JournalDigest, JournalHasher, JournalInput, PropertyKey, PropertyOwner, StateKey, VariableScope,
+};
 
 pub(super) const MAX_INPUTS: usize = 50_000;
 pub(super) const MAX_EFFECTS: usize = 200_000;
@@ -40,13 +41,13 @@ pub struct RegionKey {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EntryContext {
     /// Digest of the effective policy stack at entry.
-    pub policies: Digest,
+    pub policies: JournalDigest,
     /// Digest of the effective diagnostic state at entry.
-    pub diag: Digest,
+    pub diag: JournalDigest,
     /// Active log level at entry.
     pub log_level: u8,
     /// Digest of configure options and the selected generator and toolchain.
-    pub flags: Digest,
+    pub flags: JournalDigest,
 }
 
 /// Reason a region must be evaluated again.
@@ -127,9 +128,8 @@ impl CacheValue {
 
     /// Compute the trace digest for the complete cache entry.
     #[must_use]
-    pub fn digest(&self) -> Digest {
-        let mut hasher = KeyHasher::new(Domain::ConfigureV1);
-        hasher.field(0, b"cache-entry");
+    pub fn digest(&self) -> JournalDigest {
+        let mut hasher = JournalHasher::new(b"cache-entry");
         hasher.field(1, &self.value);
         hasher.field(2, self.ty.as_bytes());
         hasher.field(3, &self.help);
@@ -268,7 +268,7 @@ pub enum JournalEffect {
         /// Absolute path of the written file.
         path: PathBuf,
         /// Digest of its contents after the write.
-        digest: Digest,
+        digest: JournalDigest,
     },
 }
 
@@ -316,7 +316,7 @@ impl JournalEffect {
 pub struct Journal {
     inputs: Vec<JournalInput>,
     effects: Vec<JournalEffect>,
-    read: BTreeMap<StateKey, Option<Digest>>,
+    read: BTreeMap<StateKey, Option<JournalDigest>>,
     written: BTreeSet<StateKey>,
 }
 
