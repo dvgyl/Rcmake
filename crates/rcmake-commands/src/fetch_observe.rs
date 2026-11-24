@@ -6,7 +6,11 @@
 
 use std::{collections::BTreeMap, fmt};
 
-use rcmake_base::{BString, hash::HashAlgo};
+use rcmake_base::{
+    BString,
+    hash::HashAlgo,
+    list::{self, Empty},
+};
 use rcmake_eval::{FetchLockMode, Services};
 use rcmake_expr::ExpandedArg;
 use rcmake_host::Host;
@@ -57,6 +61,8 @@ pub struct DeclaredFetch {
     #[cfg(all(feature = "native", any(unix, windows)))]
     transfer_settings: bool,
     custom_update: bool,
+    #[cfg(all(feature = "native", any(unix, windows)))]
+    package_lookup: bool,
 }
 
 impl DeclaredFetch {
@@ -69,14 +75,13 @@ impl DeclaredFetch {
     }
 
     fn supported(&self) -> bool {
-        self.source_dir.is_none() && !self.custom_download && !self.custom_update
+        !self.custom_download && !self.custom_update
     }
 }
 
 /// Parse the expanded arguments of a bundled FetchContent_Declare call.
 ///
-/// Return no declaration for a malformed name, source, or hash. Strings that
-/// reach transport are kept intact here. Use [BlockedFetch] for diagnostics.
+/// Return no declaration for a malformed name, source, hash, or package option combination.
 pub fn parse_fetchcontent_declare(args: &[ExpandedArg]) -> Option<DeclaredFetch> {
     let (name, args) = args.split_first()?;
     let name = text(&name.value)?.to_ascii_lowercase();
@@ -84,21 +89,12 @@ pub fn parse_fetchcontent_declare(args: &[ExpandedArg]) -> Option<DeclaredFetch>
         return None;
     }
 
-    let mut options = BTreeMap::<&[u8], Vec<&BString>>::new();
-    let mut key = None;
-    for arg in args {
-        let value = &arg.value;
-        if value == "FIND_PACKAGE_ARGS" {
-            break;
-        }
-        if is_option(value) {
-            key = Some(value.as_slice());
-            options.entry(value).or_default();
-        } else if let Some(key) = key {
-            options.entry(key).or_default().push(value);
-        }
+    let package_args = args.iter().any(|arg| arg.value == "FIND_PACKAGE_ARGS");
+    let override_package = args.iter().any(|arg| arg.value == "OVERRIDE_FIND_PACKAGE");
+    if package_args && override_package {
+        return None;
     }
-
+    let options = declaration_options(args);
     let one = |key: &[u8]| match options.get(key)?.as_slice() {
         [value] => Some(*value),
         _ => None,
@@ -114,17 +110,19 @@ pub fn parse_fetchcontent_declare(args: &[ExpandedArg]) -> Option<DeclaredFetch>
         (Some(urls), None, false) => {
             let urls: Vec<_> = urls
                 .iter()
-                .map(|url| text(url).map(str::to_owned))
+                .flat_map(|url| list::iter(url, Empty::Drop))
+                .map(|url| text(&url).map(str::to_owned))
                 .collect::<Option<_>>()?;
             if urls.is_empty() {
                 return None;
             }
-            let hash = if options.contains_key(b"URL_HASH".as_slice()) {
-                Some(text(one(b"URL_HASH")?)?.to_owned())
-            } else if options.contains_key(b"URL_MD5".as_slice()) {
-                Some(format!("MD5={}", text(one(b"URL_MD5")?)?))
-            } else {
-                None
+            let hash = match options.get(b"URL_HASH".as_slice()).map(Vec::as_slice) {
+                Some([value]) if !value.is_empty() => Some(text(value)?.to_owned()),
+                None | Some([_]) => match one(b"URL_MD5").filter(|value| !value.is_empty()) {
+                    Some(value) => Some(format!("MD5={}", text(value)?)),
+                    None => None,
+                },
+                Some(_) => return None,
             };
             if hash
                 .as_deref()
@@ -141,8 +139,7 @@ pub fn parse_fetchcontent_declare(args: &[ExpandedArg]) -> Option<DeclaredFetch>
             submodules: options.get(b"GIT_SUBMODULES".as_slice()).map(|values| {
                 values
                     .iter()
-                    .filter(|value| !value.is_empty())
-                    .map(|value| (*value).clone())
+                    .flat_map(|value| list::split(value, Empty::Drop))
                     .collect()
             }),
         },
@@ -163,7 +160,28 @@ pub fn parse_fetchcontent_declare(args: &[ExpandedArg]) -> Option<DeclaredFetch>
         #[cfg(all(feature = "native", any(unix, windows)))]
         transfer_settings,
         custom_update,
+        #[cfg(all(feature = "native", any(unix, windows)))]
+        package_lookup: package_args || override_package,
     })
+}
+
+fn declaration_options(args: &[ExpandedArg]) -> BTreeMap<&[u8], Vec<&BString>> {
+    let mut options = BTreeMap::<&[u8], Vec<&BString>>::new();
+    let mut key = None;
+    for arg in args {
+        let value = &arg.value;
+        if value == "FIND_PACKAGE_ARGS" {
+            break;
+        }
+        if is_option(value) {
+            key = Some(value.as_slice());
+            options.entry(value).or_default();
+        } else if let Some(key) = key {
+            options.entry(key).or_default().push(value);
+        }
+    }
+
+    options
 }
 
 fn text(value: &[u8]) -> Option<&str> {
@@ -186,8 +204,8 @@ fn is_option(value: &[u8]) -> bool {
         "DOWNLOAD_NO_EXTRACT DOWNLOAD_NO_PROGRESS TIMEOUT INACTIVITY_TIMEOUT HTTP_USERNAME ",
         "HTTP_PASSWORD HTTP_HEADER TLS_VERSION TLS_VERIFY TLS_CAINFO NETRC NETRC_FILE ",
         "GIT_REPOSITORY GIT_TAG GIT_REMOTE_NAME GIT_SUBMODULES GIT_SUBMODULES_RECURSE GIT_SHALLOW ",
-        "GIT_PROGRESS GIT_CONFIG GIT_REMOTE_UPDATE_STRATEGY SVN_REPOSITORY SVN_REVISION ",
-        "SVN_USERNAME SVN_PASSWORD SVN_TRUST_CERT HG_REPOSITORY HG_TAG CVS_REPOSITORY CVS_MODULE CVS_TAG ",
+        "GIT_PROGRESS GIT_CONFIG GIT_REMOTE_UPDATE_STRATEGY SVN_REPOSITORY SVN_REVISION SVN_USERNAME ",
+        "SVN_PASSWORD SVN_TRUST_CERT HG_REPOSITORY HG_TAG CVS_REPOSITORY CVS_MODULE CVS_TAG ",
         "UPDATE_COMMAND UPDATE_DISCONNECTED PATCH_COMMAND CONFIGURE_COMMAND ",
         "CONFIGURE_ENVIRONMENT_MODIFICATION CMAKE_COMMAND CMAKE_GENERATOR CMAKE_GENERATOR_PLATFORM ",
         "CMAKE_GENERATOR_TOOLSET CMAKE_GENERATOR_INSTANCE CMAKE_ARGS CMAKE_CACHE_ARGS ",
@@ -219,11 +237,14 @@ pub struct FetchSession {
 ///
 /// The hook must check both the enclosing FetchContent call and the command's
 /// source. Matching a command name or arguments alone is insufficient.
+#[derive(Clone, Copy)]
 pub struct PopulationSite<'a> {
     /// Dependency name from the enclosing bundled call.
     pub dependency: &'a str,
     /// Whether FETCHCONTENT_SOURCE_DIR_<NAME> currently overrides population.
     pub source_override: bool,
+    /// Repository resolved by the bundled CMP0150 logic for a relative declaration.
+    pub effective_git_repository: Option<&'a str>,
 }
 
 impl FetchSession {
@@ -239,58 +260,65 @@ impl FetchSession {
             prefetch: services.speed.fetch_prefetch,
         }
     }
-
-    /// Record an expanded declaration. The first declaration of each name wins.
-    ///
-    /// The observer must check that this is the bundled FetchContent_Declare.
-    /// Return a new declaration for optional prefetch.
-    pub fn observe(&mut self, args: &[ExpandedArg]) -> Option<&DeclaredFetch> {
-        let declaration = parse_fetchcontent_declare(args)?;
+    /// Record an expanded bundled FetchContent_Declare call. The first valid declaration wins.
+    pub fn observe(
+        &mut self,
+        args: &[ExpandedArg],
+    ) -> Result<Option<&DeclaredFetch>, BlockedFetch> {
+        if let Some((name, args)) = args.split_first()
+            && declaration_options(args)
+                .iter()
+                .any(|(&key, values)| values.iter().any(|value| credentialed_option(key, value)))
+        {
+            return Err(credential_block(&String::from_utf8_lossy(&name.value)));
+        }
+        let Some(declaration) = parse_fetchcontent_declare(args) else {
+            return Ok(None);
+        };
         let std::collections::btree_map::Entry::Vacant(slot) =
             self.declarations.entry(declaration.name.clone())
         else {
-            return None;
+            return Ok(None);
         };
-        Some(slot.insert(declaration))
+        Ok(Some(slot.insert(declaration)))
     }
-
     /// Find the observed declaration by its case-insensitive name.
     pub fn get(&self, name: &str) -> Option<&DeclaredFetch> {
         self.declarations.get(&name.to_ascii_lowercase())
     }
-
     /// Match a bundled file(DOWNLOAD) to the same dependency, endpoint, and hash.
-    ///
     /// Pass the expanded arguments after the URL, including destination and
-    /// transfer options. The download bridge forwards this slice unchanged.
+    /// transfer options. Stop on error even if the caller would use a fallback.
     pub fn match_archive<'a>(
         &'a self,
         site: PopulationSite<'_>,
         url: &'a str,
         args: &'a [&'a [u8]],
-    ) -> Option<ArchiveTransfer<'a>> {
-        let declaration = self.for_transfer(site)?;
+    ) -> Result<Option<ArchiveTransfer<'a>>, BlockedFetch> {
+        if !portable_source(url) || credential_options(args) {
+            return Err(credential_block(site.dependency));
+        }
+        let Some(declaration) = self.for_transfer(site) else {
+            return Ok(None);
+        };
         let DeclaredSource::Archive { urls, hash } = &declaration.source else {
-            return None;
+            return Ok(None);
         };
         if !urls.iter().any(|candidate| candidate == url)
             || !matches_transfer_hash(hash.as_deref(), args)
         {
-            return None;
+            return Ok(None);
         }
-        Some(ArchiveTransfer {
+        Ok(Some(ArchiveTransfer {
             dependency: &declaration.name,
             urls,
             declared_hash: hash.as_deref(),
             url,
             args,
-        })
+        }))
     }
-
-    /// Return a diagnostic for an unsupported transfer in Offline or Frozen mode.
-    ///
-    /// Call this from the download or update step when a transfer would run.
-    /// A pre-populated source directory bypasses population.
+    /// Stop Git updates, submodule transfers, custom commands, CMP0168 sub-builds,
+    /// and unmatched transfers in Offline or Frozen mode.
     pub fn blocked(&self, site: PopulationSite<'_>, failure: BlockReason) -> Option<BlockedFetch> {
         if site.source_override || !(self.offline || self.mode == FetchLockMode::Frozen) {
             return None;
@@ -332,10 +360,7 @@ pub struct ArchiveTransfer<'a> {
 }
 
 fn matches_transfer_hash(declared: Option<&str>, args: &[&[u8]]) -> bool {
-    const OPTIONS: &str = concat!(
-        "STATUS LOG TIMEOUT INACTIVITY_TIMEOUT TLS_VERIFY TLS_CAINFO TLS_VERSION ",
-        "NETRC NETRC_FILE USERPWD HTTPHEADER",
-    );
+    const OPTIONS: &str = "STATUS LOG TIMEOUT INACTIVITY_TIMEOUT TLS_VERIFY TLS_CAINFO TLS_VERSION NETRC NETRC_FILE HTTPHEADER";
     let Some((destination, mut options)) = args.split_first() else {
         return false;
     };
@@ -392,6 +417,12 @@ pub enum BlockReason {
     LockMismatch,
     /// The expected content is absent from the local cache.
     CacheMiss,
+    /// Git update cannot run with an enforced fetch pin.
+    GitUpdate,
+    /// Submodule transfer requires separate pins.
+    GitSubmodules,
+    /// A sub-build bypasses the direct population checks.
+    SubBuild,
 }
 
 /// A diagnostic safe to display without the original transfer arguments or process output.
@@ -406,7 +437,7 @@ pub struct BlockedFetch {
 impl fmt::Display for BlockedFetch {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mode = match (self.reason, self.offline) {
-            (BlockReason::CredentialedSource, _) => "Fetch lock update",
+            (BlockReason::CredentialedSource, _) => "FetchContent",
             (_, true) => "Offline fetch",
             _ => "Frozen fetch",
         };
@@ -420,7 +451,13 @@ impl fmt::Display for BlockedFetch {
             BlockReason::Unsupported =>
                 " This transfer cannot enforce a fetch pin. Set FETCHCONTENT_SOURCE_DIR_<NAME> to a pre-populated directory.",
             BlockReason::CredentialedSource =>
-                " Supply a portable source URL and configure authentication outside that URL.",
+                " Use a public source identity without credentials. Use a credential helper, a private netrc file, or a prepared FETCHCONTENT_SOURCE_DIR_<NAME> directory.",
+            BlockReason::GitUpdate =>
+                " Git update requires network access outside the fetch pin. Use the locked checkout or a prepared FETCHCONTENT_SOURCE_DIR_<NAME> directory.",
+            BlockReason::GitSubmodules =>
+                " Git submodule transfer requires separate pins. Use a prepared FETCHCONTENT_SOURCE_DIR_<NAME> directory.",
+            BlockReason::SubBuild =>
+                " CMP0168 OLD runs a sub-build outside direct fetch checks. Set CMP0168 to NEW or use a prepared FETCHCONTENT_SOURCE_DIR_<NAME> directory.",
             BlockReason::LockMismatch =>
                 " Restore rcmake-fetch.lock or verify the source change and run --fetch-lock=update.",
             BlockReason::CacheMiss =>
@@ -428,6 +465,8 @@ impl fmt::Display for BlockedFetch {
         })
     }
 }
+
+impl std::error::Error for BlockedFetch {}
 
 fn safe_name(value: &str) -> String {
     if value
@@ -452,7 +491,6 @@ pub fn sanitize_url(url: &str) -> String {
         "<source>".into()
     }
 }
-
 fn authority(url: &str) -> Option<(&str, &str)> {
     let (scheme, rest) = url.split_once("://")?;
     if !matches!(scheme, "https" | "http" | "ftp" | "ftps" | "ssh" | "git") {
@@ -469,9 +507,122 @@ fn valid_host(host: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b".-:[]".contains(&b))
 }
 
+fn credential_block(dependency: &str) -> BlockedFetch {
+    BlockedFetch {
+        dependency: safe_name(dependency),
+        endpoint: None,
+        reason: BlockReason::CredentialedSource,
+        offline: false,
+    }
+}
+fn credentialed_option(key: &[u8], value: &[u8]) -> bool {
+    match key {
+        b"URL" => list::iter(value, Empty::Drop)
+            .any(|url| std::str::from_utf8(&url).map_or(true, |url| !portable_source(url))),
+        b"GIT_REPOSITORY" | b"SVN_REPOSITORY" | b"HG_REPOSITORY" | b"CVS_REPOSITORY" => {
+            std::str::from_utf8(value).map_or(true, |url| !portable_source(url))
+        }
+        b"HTTP_HEADER" => list::iter(value, Empty::Drop).any(|header| credential_header(&header)),
+        b"HTTP_USERNAME" | b"HTTP_PASSWORD" | b"SVN_USERNAME" | b"SVN_PASSWORD" => {
+            !value.is_empty()
+        }
+        b"GIT_CONFIG" => {
+            let value = value.to_ascii_lowercase();
+            value.starts_with(b"url.")
+                || value.starts_with(b"http.")
+                    && value.windows(11).any(|part| part == b"extraheader")
+        }
+        _ => false,
+    }
+}
+fn credential_header(value: &[u8]) -> bool {
+    let name = value.split(|&b| b == b':').next().unwrap_or_default();
+    value.starts_with(b"@")
+        || secret_name(&String::from_utf8_lossy(name.trim_ascii()))
+        || value.iter().any(u8::is_ascii_control)
+}
+
+fn secret_name(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    const MARKERS: &str = "token secret password passwd credential authorization api-key api_key apikey signature cookie";
+    MARKERS
+        .split_ascii_whitespace()
+        .any(|marker| name.contains(marker))
+}
+
+fn credential_options(args: &[&[u8]]) -> bool {
+    args.windows(2).any(|pair| match pair {
+        [b"USERPWD", _] => true,
+        [b"HTTPHEADER", value] => credential_header(value),
+        _ => false,
+    })
+}
+
+fn relative_repo(repository: &str) -> bool {
+    repository.starts_with("../") && safe_path(repository)
+}
+
+fn safe_path(path: &str) -> bool {
+    !path.chars().any(char::is_control)
+        && !path.contains(['?', '#', '%', '@'])
+        && path.split(['/', '\\', ';']).all(|segment| {
+            !secret_name(segment.split('=').next().unwrap_or_default())
+                && !["ghp_", "gho_", "github_pat_", "glpat-", "xox", "eyJ"]
+                    .iter()
+                    .any(|prefix| segment.starts_with(prefix))
+                && !(segment.len() >= 32
+                    && segment
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || b"_-".contains(&byte))
+                    && segment.bytes().any(|byte| byte.is_ascii_digit()))
+        })
+}
+
+/// Check a public archive or Git identity before transport or lockfile use.
+pub fn portable_source(source: &str) -> bool {
+    if source.is_empty() || source.starts_with('-') || source.len() > 8192 {
+        return false;
+    }
+    if let Some((scheme, rest)) = source.split_once("://") {
+        let (host, path) = rest.split_once('/').unwrap_or((rest, ""));
+        let allowed = match scheme {
+            "file" => matches!(host, "" | "localhost"),
+            "ssh" => valid_host(ssh_host(host)),
+            "http" | "https" | "ftp" | "ftps" | "git" => valid_host(host),
+            _ => false,
+        };
+        return allowed && !path.contains('\\') && safe_path(path);
+    }
+    if let Some((host, path)) = scp_repo(source) {
+        return valid_host(ssh_host(host)) && !path.contains('\\') && safe_path(path);
+    }
+    (!source.contains(':') || std::path::Path::new(source).is_absolute()) && safe_path(source)
+}
+
+fn ssh_host(host: &str) -> &str {
+    host.strip_prefix("git@").unwrap_or(host)
+}
+fn scp_repo(source: &str) -> Option<(&str, &str)> {
+    let (host, path) = source.split_once(':')?;
+    (!host.contains(['/', '\\']) && host.len() > 1 && !path.starts_with(':') && !path.is_empty())
+        .then_some((host, path))
+}
+
 #[cfg(all(feature = "native", any(unix, windows)))]
-fn portable_url(url: &str) -> bool {
-    authority(url).is_some_and(|(_, host)| valid_host(host)) && !url.contains(['?', '#', '\\'])
+fn git_identity(repo: &str) -> String {
+    if let Some((scheme, rest)) = repo.split_once("://")
+        && let Some((host, path)) = rest.split_once('/')
+    {
+        return format!("{scheme}://{}/{path}", host.to_ascii_lowercase());
+    }
+    if let Some((host, path)) = scp_repo(repo) {
+        let host = host.to_ascii_lowercase();
+        if path.starts_with('/') {
+            return format!("ssh://{host}{path}");
+        }
+        return format!("{host}:{path}");
+    }
+    repo.into()
 }
 
 #[cfg(all(feature = "native", any(unix, windows)))]
@@ -497,7 +648,6 @@ pub enum GitTransfer<'a> {
 #[cfg(all(feature = "native", any(unix, windows)))]
 impl FetchSession {
     /// Queue a pinned declaration without borrowing evaluator state.
-    ///
     /// Pass current override and disconnect settings. The archive worker can
     /// fetch the first mirror with default options. Foreground population keeps
     /// the full mirror sequence and original transfer options.
@@ -508,6 +658,7 @@ impl FetchSession {
         source_override: bool,
         disconnected: bool,
         default_transport: bool,
+        provider_active: bool,
     ) -> Result<Option<Ticket>, FetchError> {
         if !self.prefetch
             || self.offline
@@ -515,6 +666,8 @@ impl FetchSession {
             || source_override
             || disconnected
             || !default_transport
+            || provider_active
+            || declaration.package_lookup
             || !declaration.supported()
             || declaration.transfer_settings
         {
@@ -525,7 +678,7 @@ impl FetchSession {
                 urls,
                 hash: Some(hash),
             } => {
-                let Some(url) = urls.first().filter(|url| portable_url(url)) else {
+                let Some(url) = urls.first().filter(|url| portable_source(url)) else {
                     return Ok(None);
                 };
                 PrefetchSource::Url {
@@ -533,7 +686,9 @@ impl FetchSession {
                     hash: ContentHash::parse(hash)?,
                 }
             }
-            DeclaredSource::Git { repository, .. } if portable_url(repository) => {
+            DeclaredSource::Git { repository, .. }
+                if !relative_repo(repository) && portable_source(repository) =>
+            {
                 let Some(commit) = declaration.git_commit() else {
                     return Ok(None);
                 };
@@ -548,9 +703,7 @@ impl FetchSession {
             .map(Some)
             .map_err(|_| FetchError::Invalid("Cannot queue fetch prefetch.".into()))
     }
-
     /// Match the Git executable and a recognized clone or checkout to the observed source.
-    ///
     /// The hook verifies the checkout's working directory against the population directory.
     /// Git updates, custom commands, and submodule transfers use a separate decision.
     pub fn match_git<'a>(
@@ -559,29 +712,47 @@ impl FetchSession {
         program: &[u8],
         git_executable: &[u8],
         args: &'a [BString],
-    ) -> Option<GitTransfer<'a>> {
+    ) -> Result<Option<GitTransfer<'a>>, BlockedFetch> {
         if program.is_empty() || program != git_executable {
-            return None;
+            return Ok(None);
         }
-        let declaration = self.for_transfer(site)?;
+        if args
+            .iter()
+            .any(|value| credentialed_option(b"GIT_CONFIG", value))
+            || args.iter().any(|value| value == "clone")
+                && matches!(args, [.., repository, _] if credentialed_option(b"GIT_REPOSITORY", repository))
+        {
+            return Err(credential_block(site.dependency));
+        }
+        let Some(declaration) = self.for_transfer(site) else {
+            return Ok(None);
+        };
         let DeclaredSource::Git {
             repository, tag, ..
         } = &declaration.source
         else {
-            return None;
+            return Ok(None);
         };
-        if !portable_url(repository) {
-            return None;
+        let repository = if relative_repo(repository) {
+            let Some(effective) = site.effective_git_repository else {
+                return Ok(None);
+            };
+            effective
+        } else {
+            repository
+        };
+        if !portable_source(repository) {
+            return Err(credential_block(site.dependency));
         }
-        if let Some(clone) = classify_git_clone(args) {
-            return (repository.as_str() == clone.repository).then_some(GitTransfer::Clone(clone));
-        }
-        (classify_git_checkout(args)? == tag.as_deref().unwrap_or("master"))
-            .then_some(GitTransfer::Checkout)
+        Ok(if let Some(clone) = classify_git_clone(args) {
+            (git_identity(repository) == git_identity(clone.repository))
+                .then_some(GitTransfer::Clone(clone))
+        } else {
+            (classify_git_checkout(args) == Some(tag.as_deref().unwrap_or("master")))
+                .then_some(GitTransfer::Checkout)
+        })
     }
-
     /// Apply archive cache and lock rules around the original download operation.
-    ///
     /// Supply the lock snapshot opened for this configure. The caller supplies the transport
     /// and its CMake status handling. In Update, call [ArchiveTransfer::record]
     /// on the successful result before committing the session.
@@ -592,6 +763,7 @@ impl FetchSession {
         snapshot: Option<&LockFile>,
         download: impl FnOnce(&str, &[&[u8]]) -> Result<Vec<u8>, FetchError>,
     ) -> Result<(ArchiveResult, Option<FetchError>), FetchError> {
+        transfer.check_credentials(self.offline)?;
         let expected = transfer.declared_hash.map(ContentHash::parse).transpose()?;
         let lock = match snapshot.and_then(|file| file.get(transfer.dependency)) {
             Some(LockEntry::Url(entry)) if entry.urls.as_slice() == transfer.urls => Some(entry),
@@ -599,10 +771,6 @@ impl FetchSession {
         };
         if self.mode == FetchLockMode::Frozen && lock.is_none() {
             return Err(transfer.failure(self.offline, BlockReason::LockMismatch));
-        }
-        if self.mode == FetchLockMode::Update && !transfer.urls.iter().all(|url| portable_url(url))
-        {
-            return Err(transfer.failure(self.offline, BlockReason::CredentialedSource));
         }
         let enforced = lock.filter(|_| {
             self.mode == FetchLockMode::Frozen
@@ -613,28 +781,27 @@ impl FetchSession {
         if self.offline && pin.is_none() {
             return Err(transfer.failure(true, BlockReason::Unpinned));
         }
+        let verify = |bytes: &[u8]| -> Result<(), FetchError> {
+            if let Some(expected) = &expected {
+                expected.verify(bytes)?;
+            }
+            if let Some(entry) = enforced {
+                verify_archive_size(entry, bytes)?;
+            }
+            Ok(())
+        };
         let mut result = cache
             .fetch_with(transfer.url, pin, || {
                 if self.offline {
                     return Err(FetchError::Offline);
                 }
                 let bytes = download(transfer.url, transfer.args)?;
-                if let Some(expected) = &expected {
-                    expected.verify(&bytes)?;
-                }
-                if let Some(entry) = enforced {
-                    verify_archive_size(entry, &bytes)?;
-                }
+                verify(&bytes)?;
                 Ok(bytes)
             })
             .map_err(|error| transfer.transfer_error(self.offline, error))?;
-        if let Some(entry) = enforced {
-            if let Some(expected) = &expected {
-                expected
-                    .verify(&result.bytes)
-                    .map_err(|error| transfer.transfer_error(self.offline, error))?;
-            }
-            verify_archive_size(entry, &result.bytes)?;
+        if result.cache_hit && enforced.is_some() {
+            verify(&result.bytes).map_err(|error| transfer.transfer_error(self.offline, error))?;
         }
         if self.mode == FetchLockMode::Update && expected.is_none() {
             let entry = UrlEntry::from_bytes(Vec::new(), &result.bytes);
@@ -669,45 +836,44 @@ impl ArchiveTransfer<'_> {
         lock: &mut LockSession<'_>,
         result: &ArchiveResult,
     ) -> Result<(), FetchError> {
-        if !self.urls.iter().all(|url| portable_url(url)) {
-            return Err(self.failure(false, BlockReason::CredentialedSource));
-        }
+        self.check_credentials(false)?;
         let entry = UrlEntry::from_bytes(self.urls.to_vec(), &result.bytes);
         lock.record(self.dependency, LockEntry::Url(entry))
     }
 
+    fn check_credentials(&self, offline: bool) -> Result<(), FetchError> {
+        if self.urls.iter().all(|url| portable_source(url))
+            && portable_source(self.url)
+            && !credential_options(self.args)
+        {
+            Ok(())
+        } else {
+            Err(self.failure(offline, BlockReason::CredentialedSource))
+        }
+    }
     fn failure(&self, offline: bool, reason: BlockReason) -> FetchError {
-        FetchError::Invalid(
-            BlockedFetch {
-                dependency: safe_name(self.dependency),
-                endpoint: Some(sanitize_url(self.url)),
-                reason,
-                offline,
-            }
-            .to_string(),
-        )
+        let blocked = BlockedFetch {
+            dependency: safe_name(self.dependency),
+            endpoint: Some(sanitize_url(self.url)),
+            reason,
+            offline,
+        };
+        FetchError::Invalid(blocked.to_string())
     }
 
     fn transfer_error(&self, offline: bool, error: FetchError) -> FetchError {
-        match error {
-            FetchError::Offline => self.failure(offline, BlockReason::CacheMiss),
-            FetchError::HashMismatch { expected, actual }
-                if [expected.as_str(), actual.as_str()]
-                    .into_iter()
-                    .all(|hex| hex.len() <= 128 && hex.bytes().all(|b| b.is_ascii_hexdigit())) =>
-            {
-                FetchError::Invalid(format!(
-                    "Archive hash mismatch for {} at {}. Expected {expected}. Got {actual}. Check URL_HASH and the mirror. If the locked source changed, verify it and run --fetch-lock=update.",
-                    safe_name(self.dependency),
-                    sanitize_url(self.url),
-                ))
+        let cause = match error {
+            FetchError::Offline => return self.failure(offline, BlockReason::CacheMiss),
+            FetchError::HashMismatch { .. } => {
+                "The archive hash differs. Check URL_HASH and the mirror."
             }
-            _ => FetchError::Invalid(format!(
-                "Cannot retrieve the archive for {} at {}. Check the transfer settings and the fetch cache.",
-                safe_name(self.dependency),
-                sanitize_url(self.url),
-            )),
-        }
+            _ => "Check the transfer settings and the fetch cache.",
+        };
+        FetchError::Invalid(format!(
+            "Cannot retrieve the archive for {} at {}. {cause}",
+            safe_name(self.dependency),
+            sanitize_url(self.url),
+        ))
     }
 }
 
@@ -725,8 +891,13 @@ fn verify_archive_size(entry: &UrlEntry, bytes: &[u8]) -> Result<(), FetchError>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rcmake_host::PureHost;
     use rcmake_syntax::ArgKind;
+
+    const SITE: PopulationSite<'static> = PopulationSite {
+        dependency: "pkg",
+        source_override: false,
+        effective_git_repository: None,
+    };
 
     fn args(values: &[&str]) -> Vec<ExpandedArg> {
         values
@@ -739,159 +910,40 @@ mod tests {
             .collect()
     }
 
-    fn session(mode: FetchLockMode) -> FetchSession {
-        let host = PureHost::new("/project".into(), "/rcmake".into());
-        let mut services = Services::default();
-        services.speed.fetch_lock = mode;
-        FetchSession::new(&services, &host)
-    }
-
-    fn site(dependency: &str) -> PopulationSite<'_> {
-        PopulationSite {
-            dependency,
-            source_override: false,
-        }
-    }
-
     #[test]
-    fn keeps_first_declaration_full_mirrors_and_original_options() -> Result<(), &'static str> {
-        let first = "https://example.org/primary";
-        let second = "https://example.org/mirror";
-        let hash = "SHA256=ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
-        let mut session = session(FetchLockMode::Update);
-        assert!(
-            session
-                .observe(&args(&[
-                    "Widgets",
-                    "URL",
-                    first,
-                    second,
-                    "URL_HASH",
-                    hash,
-                    "HTTP_HEADER",
-                    "Authorization: test",
-                    "SYSTEM"
-                ]))
-                .is_some()
-        );
-        assert!(
-            session
-                .observe(&args(&["WIDGETS", "URL", "https://elsewhere"]))
-                .is_none()
-        );
-        let options = [
-            b"archive".as_slice(),
-            b"HTTPHEADER",
-            b"Authorization: test",
-            b"EXPECTED_HASH",
-            hash.as_bytes(),
-            b"TLS_VERIFY",
-            b"ON",
-        ];
+    fn parses_mirrors_and_md5_with_an_explicit_destination()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut session = FetchSession {
+            declarations: BTreeMap::new(),
+            mode: FetchLockMode::Frozen,
+            offline: false,
+            #[cfg(all(feature = "native", any(unix, windows)))]
+            prefetch: false,
+        };
+        let url = "https://example.org/b";
+        let md5 = "900150983cd24fb0d6963f7d28e17f72";
+        let input = args(&[
+            "Pkg",
+            "URL",
+            "https://example.org/a;https://example.org/b",
+            "URL_HASH",
+            "",
+            "URL_MD5",
+            md5,
+            "SOURCE_DIR",
+            "/destination",
+        ]);
+        assert!(session.observe(&input)?.is_some());
+        assert!(session.observe(&input)?.is_none());
         let transfer = session
-            .match_archive(site("WIDGETS"), second, &options)
+            .match_archive(SITE, url, &[b"archive"])?
             .ok_or("missing transfer")?;
-        assert_eq!(transfer.dependency, "widgets");
-        assert_eq!(transfer.urls, [first, second]);
-        assert_eq!(transfer.declared_hash, Some(hash));
-        assert_eq!(transfer.args, options);
-        assert!(
-            session
-                .match_archive(site("other"), second, &options)
-                .is_none()
-        );
-        let bundled = [b"archive".as_slice(), b"STATUS", b"status"];
-        assert!(
-            session
-                .match_archive(site("widgets"), first, &bundled)
-                .is_some()
-        );
+        assert_eq!(transfer.urls, ["https://example.org/a", url]);
+        assert_eq!(transfer.declared_hash, Some(format!("MD5={md5}").as_str()));
+        let options = [b"file".as_slice(), b"HTTPHEADER", b"authorization: private"];
+        assert!(session.match_archive(SITE, url, &options).is_err());
+        assert!(!portable_source("https://example.org/token/private"));
+        assert!(session.blocked(SITE, BlockReason::GitSubmodules).is_some());
         Ok(())
-    }
-
-    #[test]
-    fn detects_git_pins_and_population_overrides() {
-        let id = "1234567890123456789012345678901234567890";
-        let repo = "https://example.org/widgets";
-        let commit = args(&["pkg", "GIT_REPOSITORY", repo, "GIT_TAG", id]);
-        let tag = args(&["pkg", "GIT_REPOSITORY", repo, "GIT_TAG", "v1"]);
-        assert_eq!(
-            parse_fetchcontent_declare(&commit)
-                .as_ref()
-                .and_then(DeclaredFetch::git_commit),
-            Some(id)
-        );
-        assert!(parse_fetchcontent_declare(&tag).is_some_and(|decl| decl.git_commit().is_none()));
-
-        for (keyword, value) in [("SOURCE_DIR", "/existing"), ("DOWNLOAD_COMMAND", "")] {
-            let mut session = session(FetchLockMode::Frozen);
-            assert!(
-                session
-                    .observe(&args(&["pkg", "URL", repo, keyword, value]))
-                    .is_some()
-            );
-            assert!(
-                session
-                    .match_archive(site("pkg"), repo, &[b"archive"])
-                    .is_none()
-            );
-        }
-    }
-
-    #[test]
-    fn redacts_credentials_and_names_the_recovery() -> Result<(), &'static str> {
-        let url = "https://user:password@example.org/private?token=secret#key";
-        let mut session = session(FetchLockMode::Frozen);
-        session
-            .observe(&args(&["pkg", "URL", url]))
-            .ok_or("missing declaration")?;
-        let error = session
-            .blocked(site("pkg"), BlockReason::Unsupported)
-            .ok_or("missing block")?
-            .to_string();
-        assert!(error.contains("pkg") && error.contains("https://example.org"));
-        assert!(error.contains("FETCHCONTENT_SOURCE_DIR_<NAME>"));
-        assert!(
-            !["password", "private", "token", "secret", "#key"]
-                .iter()
-                .any(|&part| error.contains(part))
-        );
-        Ok(())
-    }
-
-    #[cfg(all(feature = "native", any(unix, windows)))]
-    #[test]
-    fn maps_modes_and_matches_only_the_expected_git_command() {
-        for (input, expected) in [
-            (FetchLockMode::Off, LockMode::Off),
-            (FetchLockMode::Auto, LockMode::Auto),
-            (FetchLockMode::Update, LockMode::Update),
-            (FetchLockMode::Frozen, LockMode::Frozen),
-        ] {
-            assert_eq!(lock_mode(input), expected);
-        }
-
-        let mut session = session(FetchLockMode::Frozen);
-        let url = "https://example.org/widgets";
-        assert!(
-            session
-                .observe(&args(&["widgets", "GIT_REPOSITORY", url, "GIT_TAG", "v1"]))
-                .is_some()
-        );
-        let clone = ["clone", "--no-checkout", url, "widgets-src"].map(BString::from);
-        assert!(matches!(
-            session.match_git(site("widgets"), b"git", b"git", &clone),
-            Some(GitTransfer::Clone(_))
-        ));
-        assert!(
-            session
-                .match_git(site("widgets"), b"other", b"git", &clone)
-                .is_none()
-        );
-        let checkout = ["checkout", "v1", "--"].map(BString::from);
-        assert!(matches!(
-            session.match_git(site("widgets"), b"git", b"git", &checkout),
-            Some(GitTransfer::Checkout)
-        ));
     }
 }

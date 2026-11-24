@@ -5,14 +5,14 @@
 #![forbid(unsafe_code)]
 
 use std::{
-    collections::BTreeSet,
-    fmt,
+    collections::{BTreeMap, BTreeSet},
+    fmt::{self, Write as _},
     io::ErrorKind,
     path::{Component, Path, PathBuf},
 };
 
 use rcmake_base::BString;
-use rcmake_host::{Follow, Host, path::to_native};
+use rcmake_host::{FileKind, Follow, Host, path::to_native};
 
 use crate::services::HermeticMode;
 
@@ -34,6 +34,7 @@ const MAX_DISPLAY_CHARS: usize = 256;
 pub struct HermeticPolicy {
     env: BTreeSet<BString>,
     case_insensitive_env: bool,
+    case_insensitive_roots: bool,
     roots: BTreeSet<PathBuf>,
     programs: BTreeSet<PathBuf>,
     pinned_network: bool,
@@ -50,6 +51,7 @@ impl HermeticPolicy {
         let mut policy = Self {
             env: BTreeSet::new(),
             case_insensitive_env: host.system().sysname == "Windows",
+            case_insensitive_roots: false,
             roots: BTreeSet::new(),
             programs: BTreeSet::new(),
             pinned_network: true,
@@ -94,6 +96,15 @@ impl HermeticPolicy {
         true
     }
 
+    /// Permit path aliases on hosts with case-insensitive filesystems.
+    ///
+    /// This still requires the host to report the same directory identity for
+    /// an alias. A distinct directory on a case-sensitive volume stays outside
+    /// the allowed root even when the names differ only by case.
+    pub fn allow_case_insensitive_roots(&mut self, allow: bool) {
+        self.case_insensitive_roots = allow;
+    }
+
     /// Allow one existing, absolute executable path. The caller resolves tool names first.
     pub fn allow_program(&mut self, host: &dyn Host, program: &Path) -> bool {
         if !program.is_absolute() {
@@ -136,8 +147,12 @@ impl HermeticPolicy {
     }
 
     fn allows_path(&self, host: &dyn Host, path: &Path) -> bool {
-        resolve_path(host, path)
-            .is_some_and(|path| self.roots.iter().any(|root| path.starts_with(root)))
+        resolve_path(host, path).is_some_and(|path| {
+            self.roots.iter().any(|root| {
+                path.starts_with(root)
+                    || (self.case_insensitive_roots && same_root(host, &path, root))
+            })
+        })
     }
 
     fn allows_program(&self, host: &dyn Host, path: &Path) -> bool {
@@ -146,6 +161,29 @@ impl HermeticPolicy {
                 .canonicalize(path)
                 .is_ok_and(|path| self.programs.contains(&path))
     }
+}
+
+fn same_root(host: &dyn Host, path: &Path, root: &Path) -> bool {
+    let Some(depth) = path
+        .components()
+        .count()
+        .checked_sub(root.components().count())
+    else {
+        return false;
+    };
+    let Some(ancestor) = path.ancestors().nth(depth) else {
+        return false;
+    };
+    let (Ok(actual), Ok(allowed)) = (
+        host.metadata(ancestor, Follow::No),
+        host.metadata(root, Follow::No),
+    ) else {
+        return false;
+    };
+    actual.kind == FileKind::Dir
+        && allowed.kind == FileKind::Dir
+        && actual.ino != 0
+        && (actual.dev, actual.ino) == (allowed.dev, allowed.ino)
 }
 
 fn valid_env_name(name: &[u8]) -> bool {
@@ -188,24 +226,27 @@ fn resolve_path(host: &dyn Host, path: &Path) -> Option<PathBuf> {
     None
 }
 
-/// Source location supplied by the command or expression that reads an input.
+/// Source location of the project command or expression that caused an input read.
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub struct HermeticSite {
-    file: String,
+pub struct SourceLocation {
+    file: PathBuf,
     line: u32,
 }
 
-impl HermeticSite {
+/// Source location supplied by the caller. Use the project site for generated code.
+pub type HermeticSite = SourceLocation;
+
+impl SourceLocation {
     /// Create a location with a 1-based line number.
     pub fn new(file: &Path, line: u32) -> Self {
         Self {
-            file: display_path(file),
+            file: file.into(),
             line,
         }
     }
 
-    /// Return the file name as it appears in diagnostics.
-    pub fn file(&self) -> &str {
+    /// Return the original source path.
+    pub fn file(&self) -> &Path {
         &self.file
     }
 
@@ -215,9 +256,12 @@ impl HermeticSite {
     }
 }
 
-impl fmt::Display for HermeticSite {
+impl fmt::Display for SourceLocation {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "{}:{}", self.file, self.line)
+        for ch in self.file.to_string_lossy().chars() {
+            formatter.write_char(if ch.is_control() { '?' } else { ch })?;
+        }
+        write!(formatter, ":{}", self.line)
     }
 }
 
@@ -264,29 +308,13 @@ pub struct HermeticViolation {
     pub site: HermeticSite,
     /// Input name, path, or remote host with credentials removed.
     pub value: String,
+    hint: String,
 }
 
 impl HermeticViolation {
     /// Return an action the project or caller can take.
-    pub fn hint(&self) -> String {
-        match self.kind {
-            ViolationKind::UndeclaredEnvRead if valid_env_name(self.value.as_bytes()) => format!(
-                "Pass -D{0}=... and read ${{{0}}}, or add {0} to RCMAKE_HERMETIC_ALLOW_ENV.",
-                self.value
-            ),
-            ViolationKind::UndeclaredEnvRead => {
-                "Use a cache variable or add a valid name to RCMAKE_HERMETIC_ALLOW_ENV.".into()
-            }
-            ViolationKind::OutOfTreePathRead => {
-                "Declare the input root or add its path to RCMAKE_HERMETIC_ALLOW_PATHS.".into()
-            }
-            ViolationKind::NetworkAccess => {
-                "Pin the dependency in rcmake-fetch.lock and use the fetch cache.".into()
-            }
-            ViolationKind::UnapprovedProcess => {
-                "Declare the executable by absolute path or remove the process call.".into()
-            }
-        }
+    pub fn hint(&self) -> &str {
+        &self.hint
     }
 }
 
@@ -337,17 +365,25 @@ impl fmt::Display for AuditSummary {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             formatter,
-            "Hermetic checks recorded {} violation(s) and omitted {} observation(s).",
-            self.recorded, self.omitted
+            "Additional hermetic violations omitted: {}.",
+            self.omitted
         )
     }
+}
+
+#[derive(Eq, Ord, PartialEq, PartialOrd)]
+enum InputIdentity {
+    Env(BString),
+    Path(PathBuf),
+    Remote(String, Option<String>),
 }
 
 /// Checks inputs and retains a bounded set of distinct records for one configure.
 pub struct HermeticAuditor {
     mode: HermeticMode,
     policy: HermeticPolicy,
-    records: BTreeSet<HermeticViolation>,
+    records: BTreeMap<(HermeticSite, ViolationKind, InputIdentity), HermeticViolation>,
+    reported_omissions: bool,
     record_limit: usize,
     omitted: usize,
 }
@@ -358,7 +394,8 @@ impl HermeticAuditor {
         Self {
             mode,
             policy,
-            records: BTreeSet::new(),
+            records: BTreeMap::new(),
+            reported_omissions: false,
             record_limit: DEFAULT_RECORD_LIMIT,
             omitted: 0,
         }
@@ -375,15 +412,40 @@ impl HermeticAuditor {
         if self.mode == HermeticMode::Off || self.policy.allows_env(name) {
             return allowed();
         }
-        let value = if valid_env_name(name) {
-            display_text(&String::from_utf8_lossy(name))
+        let (value, hint) = if valid_env_name(name) {
+            let name = String::from_utf8_lossy(name);
+            (
+                display_text(&name),
+                format!(
+                    "Set RCMAKE_HERMETIC_ALLOW_ENV={name}. For a non-secret value, you can pass -D{name}=... and read ${{{name}}}. Keep secrets out of the CMake cache and command arguments."
+                ),
+            )
         } else {
-            "<invalid variable name>".into()
+            (
+                "<invalid variable name>".into(),
+                "Use a valid name in RCMAKE_HERMETIC_ALLOW_ENV. Keep secrets out of -D variables."
+                    .into(),
+            )
         };
-        self.record(site, ViolationKind::UndeclaredEnvRead, value)
+        self.record(
+            site,
+            ViolationKind::UndeclaredEnvRead,
+            InputIdentity::Env(self.policy.env_key(name)),
+            value,
+            hint,
+        )
+    }
+
+    /// Check `DEFINED ENV{...}`. In warning mode the caller treats the variable as undefined.
+    pub fn check_env_defined(&mut self, site: &HermeticSite, name: &[u8]) -> AuditOutcome<'_> {
+        self.check_env(site, name)
     }
 
     /// Check an absolute path, including symlink traversal and parent components.
+    ///
+    /// The caller must enforce containment at open time if the filesystem can
+    /// change between this check and the read. A separate canonicalization cannot
+    /// prevent a symlink or ancestor from changing before access.
     pub fn check_path(
         &mut self,
         host: &dyn Host,
@@ -393,20 +455,78 @@ impl HermeticAuditor {
         if self.mode == HermeticMode::Off || self.policy.allows_path(host, path) {
             return allowed();
         }
-        self.record(site, ViolationKind::OutOfTreePathRead, display_path(path))
+        let directory = path.parent().filter(|parent| parent.is_absolute());
+        let directory = directory.map_or_else(|| "<DIR>".into(), |dir| dir.to_string_lossy());
+        let directory = if directory.chars().any(|ch| ch.is_control() || ch == ';') {
+            "<DIR>"
+        } else {
+            &directory
+        };
+        self.record(
+            site,
+            ViolationKind::OutOfTreePathRead,
+            InputIdentity::Path(path.into()),
+            display_input_path(path),
+            format!("Declare the input root or set RCMAKE_HERMETIC_ALLOW_PATHS={directory}."),
+        )
     }
 
-    /// Check network access. Set `enforced_pin` only for a transfer that verifies its content.
+    /// Check a direct network operation. Set `enforced_pin` only for a verified transfer.
     pub fn check_network(
         &mut self,
         site: &HermeticSite,
         target: &str,
         enforced_pin: bool,
     ) -> AuditOutcome<'_> {
+        self.check_transfer(site, target, enforced_pin, None)
+    }
+
+    /// Check a FetchContent transfer at the project call site with its dependency name.
+    pub fn check_fetch_network(
+        &mut self,
+        site: &HermeticSite,
+        target: &str,
+        enforced_pin: bool,
+        dependency: &str,
+    ) -> AuditOutcome<'_> {
+        self.check_transfer(site, target, enforced_pin, Some(dependency))
+    }
+
+    fn check_transfer(
+        &mut self,
+        site: &HermeticSite,
+        target: &str,
+        enforced_pin: bool,
+        dependency: Option<&str>,
+    ) -> AuditOutcome<'_> {
         if self.mode == HermeticMode::Off || (enforced_pin && self.policy.pinned_network) {
             return allowed();
         }
-        self.record(site, ViolationKind::NetworkAccess, display_remote(target))
+        let hint = match dependency {
+            Some(name) => {
+                let name = if name.len() <= 256
+                    && name
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || b"_.+-".contains(&byte))
+                    && !name.is_empty()
+                {
+                    name.to_ascii_uppercase()
+                } else {
+                    "<NAME>".into()
+                };
+                format!(
+                    "Verify the dependency and run --fetch-lock=update, or set -DFETCHCONTENT_SOURCE_DIR_{name}=... to a prepared source directory."
+                )
+            }
+            None => "Use a local input or configure a transfer that verifies its content.".into(),
+        };
+        self.record(
+            site,
+            ViolationKind::NetworkAccess,
+            InputIdentity::Remote(target.into(), dependency.map(str::to_owned)),
+            display_remote(target),
+            hint,
+        )
     }
 
     /// Check the resolved executable path of one stage of a process pipeline.
@@ -420,11 +540,17 @@ impl HermeticAuditor {
             return allowed();
         }
         let identity = if program.is_absolute() {
-            display_path(program)
+            display_text(&program.to_string_lossy())
         } else {
             "<unresolved executable>".into()
         };
-        self.record(site, ViolationKind::UnapprovedProcess, identity)
+        self.record(
+            site,
+            ViolationKind::UnapprovedProcess,
+            InputIdentity::Path(program.into()),
+            identity,
+            "Declare the executable by absolute path or remove the process call.".into(),
+        )
     }
 
     /// Supply the environment for a child process under the current mode.
@@ -438,7 +564,7 @@ impl HermeticAuditor {
 
     /// Return retained diagnostic records in a stable order.
     pub fn records(&self) -> impl ExactSizeIterator<Item = &HermeticViolation> {
-        self.records.iter()
+        self.records.values()
     }
 
     /// Return the number of retained and omitted diagnostics.
@@ -449,30 +575,43 @@ impl HermeticAuditor {
         }
     }
 
+    /// Return the final omitted count once, if any observations were omitted.
+    pub fn take_omission_summary(&mut self) -> Option<AuditSummary> {
+        if self.omitted == 0 || self.reported_omissions {
+            return None;
+        }
+        self.reported_omissions = true;
+        Some(self.summary())
+    }
+
     fn record(
         &mut self,
         site: &HermeticSite,
         kind: ViolationKind,
+        identity: InputIdentity,
         value: String,
+        hint: String,
     ) -> AuditOutcome<'_> {
         let decision = match self.mode {
             HermeticMode::Off => return allowed(),
             HermeticMode::Warn => AuditDecision::Warn,
             HermeticMode::Strict => AuditDecision::Deny,
         };
-        let record = HermeticViolation {
-            kind,
-            site: site.clone(),
-            value,
-        };
-        let diagnostic = if self.records.contains(&record) {
-            None
-        } else if self.records.len() == self.record_limit {
-            self.omitted = self.omitted.saturating_add(1);
-            None
-        } else {
-            self.records.insert(record.clone());
-            self.records.get(&record)
+        let full = self.records.len() >= self.record_limit;
+        let diagnostic = match self.records.entry((site.clone(), kind, identity)) {
+            std::collections::btree_map::Entry::Occupied(_) => None,
+            std::collections::btree_map::Entry::Vacant(_) if full => {
+                self.omitted = self.omitted.saturating_add(1);
+                None
+            }
+            std::collections::btree_map::Entry::Vacant(slot) => {
+                Some(&*slot.insert(HermeticViolation {
+                    kind,
+                    site: site.clone(),
+                    value,
+                    hint,
+                }))
+            }
         };
         AuditOutcome {
             decision,
@@ -488,12 +627,12 @@ fn allowed() -> AuditOutcome<'static> {
     }
 }
 
-fn display_path(path: &Path) -> String {
-    let path = path.to_string_lossy();
-    if path.contains("://") {
-        display_remote(&path)
+fn display_input_path(path: &Path) -> String {
+    let text = path.to_string_lossy();
+    if !path.is_absolute() && text.contains("://") {
+        display_remote(&text)
     } else {
-        display_text(path.split(['?', '#']).next().unwrap_or_default())
+        display_text(&text)
     }
 }
 
@@ -640,6 +779,28 @@ mod tests {
     }
 
     #[test]
+    fn keeps_untruncated_paths_for_deduplication() -> Result<(), &'static str> {
+        let host = host();
+        let mut auditor =
+            HermeticAuditor::new(HermeticMode::Strict, HermeticPolicy::from_host(&host, []));
+        let prefix = "a".repeat(200);
+        let path = abs(&format!("/{prefix}/{prefix}/CMakeLists#dev?.txt"));
+        let site = HermeticSite::new(&path, 12);
+        assert_eq!(site.file(), path.as_path());
+        assert!(site.to_string().ends_with("CMakeLists#dev?.txt:12"));
+        for suffix in ["#one", "?two"] {
+            let input = abs(&format!("/{prefix}/{prefix}/{suffix}"));
+            let violation = auditor
+                .check_path(&host, &site, &input)
+                .diagnostic
+                .ok_or("Missing diagnostic.")?;
+            assert_eq!(violation.site, site);
+        }
+        assert_eq!(auditor.records().len(), 2);
+        Ok(())
+    }
+
+    #[test]
     fn bounds_records_and_formats_clickable_diagnostics() -> Result<(), Box<dyn std::error::Error>>
     {
         let host = host();
@@ -659,11 +820,11 @@ mod tests {
             auditor.check_network(&site, url, true).decision,
             AuditDecision::Allow
         );
-        let denied = auditor.check_network(&site, url, false);
+        let denied = auditor.check_fetch_network(&site, url, false, "widget");
         assert_eq!(denied.decision, AuditDecision::Deny);
         let record = denied.diagnostic.ok_or("missing network diagnostic")?;
         assert_eq!(record.value, "https://example.org");
-        assert!(record.hint().contains("rcmake-fetch.lock"));
+        assert!(record.hint().contains("--fetch-lock=update"));
         assert!(auditor.check_env(&site, b"FOO").diagnostic.is_none());
         assert_eq!(
             auditor.check_env(&site, b"BAR").decision,
@@ -677,6 +838,8 @@ mod tests {
             }
         );
         assert_eq!(auditor.records().len(), 2);
+        assert!(auditor.take_omission_summary().is_some());
+        assert!(auditor.take_omission_summary().is_none());
         Ok(())
     }
 }
