@@ -174,7 +174,8 @@ jobs:
           source env/env.sh
           timeout 120s sudo apt-get update
           timeout 300s sudo apt-get install -y --no-install-recommends \
-            autoconf automake bison curl flex g++ gperf libtool nasm ninja-build             patchelf pkg-config python3 tar unzip zip
+            autoconf automake bison curl flex g++ gperf libtool nasm ninja-build \
+            patchelf pkg-config python3 tar unzip zip
           timeout 30s git init "$RUNNER_TEMP/vcpkg"
           timeout 180s git -C "$RUNNER_TEMP/vcpkg" fetch --depth=1 \
             https://github.com/microsoft/vcpkg.git "$VCPKG_COMMIT"
@@ -188,8 +189,10 @@ jobs:
           import json
           import os
           from pathlib import Path
+          import shutil
           import signal
           import subprocess
+          from tempfile import TemporaryDirectory
 
           root = Path(os.environ["RUNNER_TEMP"])
           vcpkg = root / "vcpkg"
@@ -203,17 +206,38 @@ jobs:
 
           engines = {}
           for name, variable in (("oracle", "ECOSYSTEM_ORACLE"), ("rcmake", "ECOSYSTEM_RCMAKE")):
-              buildtrees = root / name / "buildtrees"
-              buildtrees.mkdir(parents=True)
+              expected = Path(os.environ[variable]).resolve(strict=True)
               env = os.environ.copy()
               env["PATH"] = str(Path(env[variable]).parent) + os.pathsep + env["PATH"]
-              engines[name] = (buildtrees, env)
-              version = subprocess.check_output(["cmake", "--version"], env=env, timeout=10).splitlines()
-              if version[0] != b"cmake version 4.5.1" or (name == "rcmake" and b"Rcmake" not in b" ".join(version)):
+              tool = shutil.which("cmake", path=env["PATH"])
+              if not tool or Path(tool).resolve(strict=True) != expected:
+                  raise SystemExit(f"PATH selected an unexpected CMake executable for {name}: {tool}")
+              version = subprocess.check_output([tool, "--version"], env=env, timeout=10).splitlines()
+              if version[:1] != [b"cmake version 4.5.1"] or (name == "rcmake") != any(
+                      b"Rcmake" in line for line in version):
                   raise SystemExit(f"Incorrect CMake executable for {name}.")
+              engines[name] = (expected, env)
 
-          def configure(port, name, buildtrees, env):
-              work = buildtrees.parent
+          def observe(port_build, expected):
+              profiles = []
+              identity_errors = []
+              marker = "CMAKE_COMMAND:INTERNAL="
+              for tree in sorted(port_build.glob("x64-linux-*")):
+                  cache = tree / "CMakeCache.txt"
+                  if not cache.is_file() or not any(
+                          (tree / file).is_file() for file in ("build.ninja", "Makefile")):
+                      continue
+                  values = [line.removeprefix(marker) for line in
+                            cache.read_text(errors="replace").splitlines() if line.startswith(marker)]
+                  if len(values) != 1 or not Path(values[0]).is_absolute() or Path(values[0]).resolve() != expected:
+                      identity_errors.append({"profile": tree.name, "commands": values})
+                  else:
+                      profiles.append(tree.name.removeprefix("x64-linux-"))
+              return profiles, identity_errors
+
+          def configure(port, name, work, expected, env):
+              buildtrees = work / "buildtrees"
+              buildtrees.mkdir(parents=True)
               command = [
                   str(vcpkg / "vcpkg"), "install", f"{port}:x64-linux", "--classic",
                   "--allow-unsupported", "--clean-packages-after-build",
@@ -232,42 +256,41 @@ jobs:
                               pass
                           proc.wait(timeout=10)
                           result = 124
-              port_build = buildtrees / port
-              profiles = []
-              expected = Path(env["ECOSYSTEM_ORACLE" if name == "oracle" else "ECOSYSTEM_RCMAKE"]).resolve()
-              for tree in sorted(port_build.glob("x64-linux-*")):
-                  cache = tree / "CMakeCache.txt"
-                  if not cache.is_file() or not any((tree / file).is_file() for file in ("build.ninja", "Makefile")):
-                      continue
-                  marker = "CMAKE_COMMAND:INTERNAL="
-                  tool = next((line.removeprefix(marker) for line in cache.read_text(errors="replace").splitlines()
-                               if line.startswith(marker)), "")
-                  if (tool and Path(tool).resolve() != expected) or (name == "oracle" and not tool):
-                      raise SystemExit(f"{port} used an unexpected CMake executable for {name}: {tool}")
-                  profiles.append(tree.name.removeprefix("x64-linux-"))
-              return {"configure_profiles": profiles, "install_exit": result}
+              profiles, identity_errors = observe(buildtrees / port, expected)
+              return {"configure_profiles": profiles, "identity_errors": identity_errors, "install_exit": result}
+
+          def score(left, right):
+              if left["identity_errors"] or right["identity_errors"]:
+                  return "cmake-identity-mismatch"
+              if left["configure_profiles"]:
+                  if left["configure_profiles"] == right["configure_profiles"]:
+                      return "pass"
+                  return "configure-mismatch"
+              if left["install_exit"] == 0:
+                  return "no-observed-cmake-configure"
+              return "oracle-blocked-before-configure"
 
           summary = Counter()
+          scored = 0
           with (report / "results.jsonl").open("w", buffering=1) as rows:
               for port in ports:
-                  left = configure(port, "oracle", *engines["oracle"])
-                  right = configure(port, "rcmake", *engines["rcmake"])
-                  if left["configure_profiles"]:
-                      status = ("pass" if right["configure_profiles"] == left["configure_profiles"]
-                                else "configure-mismatch")
-                  elif left["install_exit"] == 0:
-                      status = "no-observed-cmake-configure"
-                  else:
-                      status = "oracle-blocked-before-configure"
+                  with TemporaryDirectory(prefix=f"vcpkg-{port}-", dir=root) as temporary:
+                      work = Path(temporary)
+                      left = configure(port, "oracle", work / "oracle", *engines["oracle"])
+                      right = configure(port, "rcmake", work / "rcmake", *engines["rcmake"])
+                  status = score(left, right)
+                  scored += bool(left["configure_profiles"])
                   summary[status] += 1
                   print(json.dumps({"port": port, "status": status, "oracle": left, "rcmake": right}),
                         file=rows)
                   print(port, status, flush=True)
           with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as output:
-              print(f"vcpkg shard {index}/{count}. {len(ports)} ports.", file=output)
+              print(f"vcpkg shard {index}/{count}. {scored} of {len(ports)} ports scored.", file=output)
               for status, total in sorted(summary.items()):
                   print(f"- {status}: {total}", file=output)
-          raise SystemExit(bool(summary["configure-mismatch"]))
+          if not scored:
+              raise SystemExit("The shard did not score any CMake ports.")
+          raise SystemExit(bool(summary["configure-mismatch"] or summary["cmake-identity-mismatch"]))
           PY
       - uses: actions/upload-artifact@v6
         if: always()
@@ -591,6 +614,27 @@ jobs:
           path: ${{ runner.temp }}/boss/report
           if-no-files-found: ignore
 
+  linux-extended:
+    name: Linux extended conformance
+    if: github.event_name == 'schedule' || inputs.lane == 'all' || inputs.lane == 'toolchains'
+    needs: prepare
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - *checkout
+      - *python
+      - *binary
+      - *oracle
+      - name: Check ELF dependencies, Fortran modules, and registered RunCMake suites
+        timeout-minutes: 50
+        run: |
+          source env/env.sh
+          timeout 120s sudo apt-get update
+          timeout 300s sudo apt-get install -y --no-install-recommends gcc g++ gfortran ninja-build make binutils
+          oracle_env="$(scripts/fetch-oracle.sh --print-env)"
+          eval "$oracle_env"
+          timeout --kill-after=30s 45m scripts/linux-vm-test.sh --extended-only target/stage/bin
+
   toolchains:
     name: Linux T2 toolchains
     if: github.event_name == 'schedule' || inputs.lane == 'all' || inputs.lane == 'toolchains'
@@ -618,6 +662,7 @@ jobs:
         run: |
           source env/env.sh
           timeout --kill-after=15s 22m python3 - <<'PY'
+          import json
           import os
           from pathlib import Path
           import shutil
@@ -662,27 +707,80 @@ jobs:
           }
           cuda_project = """project(CudaProbe LANGUAGES CXX)
           enable_language(CUDA)
-          add_executable(probe main.cu)
+          add_executable(probe basic.cu)
           add_executable(separable main.cu device.cu)
           set_property(TARGET separable PROPERTY CUDA_SEPARABLE_COMPILATION ON)
+          if(MOCK_CUDA_LINKER)
+            set_property(TARGET separable PROPERTY CUDA_LINKER_LAUNCHER "${MOCK_CUDA_LINKER}")
+            target_compile_definitions(separable PRIVATE MOCK_CUDA_DEVICE_LINK)
+          endif()
           """
+          cuda_files = {
+              "basic.cu": "__global__ void kernel() {}\nint main() { return 0; }\n",
+              "device.cu": "__device__ int value() { return 42; }\n",
+              "main.cu": """
+          __device__ int value();
+          __global__ void kernel() {
+          #ifdef MOCK_CUDA_DEVICE_LINK
+            (void)value();
+          #else
+            if (value() != 42) asm("trap;");
+          #endif
+          }
+          #ifdef MOCK_CUDA_DEVICE_LINK
+          extern "C" int rcmake_mock_device_link();
+          int main() { kernel(); return value() != 42 || rcmake_mock_device_link() != 42; }
+          #else
+          int main() { return 0; }
+          #endif
+          """,
+          }
           fixtures["cuda-mock"] = (
-              cuda_project,
-              {"main.cu": "__global__ void kernel() {}\nint main() { return 0; }\n",
-               "device.cu": "__device__ int value() { return 42; }\n"},
-              [f"-DCMAKE_CUDA_COMPILER={mock / 'bin/nvcc'}"], ["./separable"],
+              cuda_project, cuda_files,
+              [f"-DCMAKE_CUDA_COMPILER={mock / 'bin/nvcc'}", "-DCMAKE_CUDA_ARCHITECTURES=75",
+               f"-DMOCK_CUDA_LINKER={mock / 'mock/host-link'}"], ["./separable"],
           )
           if os.environ["CUDA_PROVIDER"] == "apt":
               nvcc = shutil.which("nvcc")
               if nvcc is None:
                   raise SystemExit("The apt CUDA compiler is missing.")
               fixtures["cuda-apt"] = (
-                  cuda_project,
-                  {"main.cu": "__global__ void kernel() {}\nint main() { return 0; }\n",
-                   "device.cu": "__device__ int value() { return 42; }\n"},
+                  cuda_project, cuda_files,
                   [f"-DCMAKE_CUDA_COMPILER={nvcc}", "-DCMAKE_CUDA_HOST_COMPILER=/usr/bin/g++-12",
-                   "-DCMAKE_CUDA_ARCHITECTURES=75"], ["cuobjdump", "--list-elf", "./separable"],
+                   "-DCMAKE_CUDA_ARCHITECTURES=75"], ["cuobjdump", "--extract-elf", "all", "./separable"],
               )
+
+          def check_cuda_log(log, source, build):
+              records = [json.loads(line) for line in log.read_text().splitlines()]
+              architecture = ["--generate-code=arch=compute_75,code=[compute_75,sm_75]"]
+
+              def require_one(phase, description, matches):
+                  found = [row for row in records if row["phase"] == phase and matches(row)]
+                  if len(found) != 1 or found[0]["exit_code"] != 0:
+                      raise ValueError(f"Expected one successful {description}. Found {found}.")
+                  output = Path(found[0]["output"])
+                  if not output.is_file() or not output.stat().st_size:
+                      raise ValueError(f"{description} did not produce {output}.")
+                  return found[0]
+
+              objects = set()
+              for name in ("basic.cu", "main.cu", "device.cu"):
+                  row = require_one("compile", f"compile of {name}",
+                                    lambda row: row["inputs"] == [str(source / name)])
+                  if row["architectures"] != architecture or row["relocatable"] != (name != "basic.cu"):
+                      raise ValueError(f"Unexpected CUDA flags for {name}: {row['argv']}")
+                  if name != "basic.cu":
+                      objects.add(row["output"])
+              if len(objects) != 2:
+                  raise ValueError("The separable sources did not produce distinct objects.")
+              device = require_one("device-link", "device link", lambda row: True)
+              if (device["architectures"] != architecture or sorted(device["inputs"]) != sorted(objects)
+                      or device["output"] in objects):
+                  raise ValueError(f"Unexpected device-link command: {device['argv']}")
+              final = require_one("host-link", "link of separable",
+                                  lambda row: row["output"] == str(build / "separable"))
+              if not objects.union({device["output"]}).issubset(final["inputs"]):
+                  raise ValueError(f"The final link omitted a separable object: {final['argv']}")
 
           failures = []
           for fixture, (project, files, args, test) in fixtures.items():
@@ -701,17 +799,22 @@ jobs:
                       env = {**os.environ, "MOCK_NVCC_LOG": str(nvcc_log)}
                       subprocess.run([cmake, "-S", source, "-B", build, "-G", "Ninja", *args],
                                      env=env, timeout=90, check=True)
+                      nvcc_log.unlink(missing_ok=True)
                       subprocess.run([cmake, "--build", build, "--parallel", "2", "--verbose"],
                                      env=env, timeout=150, check=True)
-                      if fixture == "cuda-mock" and '"-dlink"' not in nvcc_log.read_text():
-                          raise ValueError("The build did not run the mock device linker.")
+                      if fixture == "cuda-mock":
+                          check_cuda_log(nvcc_log, source, build)
                       if test:
                           command = [cmake.with_name("ctest"), *test[1:]] if test[0] == "ctest" else test
                           output = subprocess.check_output(command, cwd=build, timeout=30, text=True)
                           print(output, end="", flush=True)
                           if fixture == "bare-metal-arm" and "ARM" not in output:
                               raise ValueError("The executable does not target ARM.")
-                  except (OSError, ValueError, subprocess.SubprocessError) as error:
+                          if fixture == "cuda-apt" and not any(
+                                  image.stat().st_size > 4 and image.read_bytes()[:4] == b"\x7fELF"
+                                  for image in build.glob("*.sm_75.cubin")):
+                              raise ValueError("The executable has no sm_75 ELF device image.")
+                  except (KeyError, OSError, TypeError, ValueError, subprocess.SubprocessError) as error:
                       print(error, flush=True)
                       failures.append(label)
                   finally:
@@ -719,3 +822,9 @@ jobs:
           if failures:
               raise SystemExit("Failed fixtures: " + ", ".join(failures))
           PY
+      - uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: cuda-build-logs
+          path: ${{ runner.temp }}/toolchains/cuda-*.jsonl
+          if-no-files-found: ignore

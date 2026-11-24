@@ -1,15 +1,18 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: MIT OR Apache-2.0
-"""Check real compiler probe invalidation and shared-store crash recovery.
+"""Check compiler probe invalidation and shared-store recovery on macOS or Linux.
 
-Source env/env.sh before use. Smoke mode checks the fixture and process
-handling on a staged binary. It does not require probe-cache support.
+Source env/env.sh before use. Use --smoke to check baseline compiler behavior
+on a staged binary. Gate mode requires probe caching, libzstd and a binary
+that accepts a native dynamic-loader hook.
 """
 
 from __future__ import annotations
 
 import argparse
 from contextlib import ExitStack
+import ctypes
+from ctypes.util import find_library
 from dataclasses import dataclass
 import hashlib
 import json
@@ -20,6 +23,7 @@ import re
 import shlex
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -31,18 +35,25 @@ from oracle_prop_test import clean_environment, executable, run_command, write_j
 
 WORKERS = 8
 TRIGGERS = {
-    "cpath": ('#include <rcmake_m6_cpath.h>\n', False, True),
-    "lang": ("", True, True),
-    "compiler": ("#ifndef RCMAKE_M6_SWAP\n#error Missing wrapper definition\n#endif\n", False, True),
-    "header-root": ('#include <rcmake_m6_root.h>\n', False, True),
-    "header-subdir": ('#include <existing/rcmake_m6_subdir.h>\n', False, True),
-    "library": ("", False, True),
-    "toolchain": ("", True, True),
-    "developer-dir": ("", True, True),
-    "transitive": ('#include <rcmake_m6_outer.h>\n', False, True),
+    "cpath": '#include <rcmake_m6_cpath.h>\n',
+    "lang": "#ifndef RCMAKE_M6_POSIX\n#error Expected POSIX LANG\n#endif\n",
+    "compiler": "#ifndef RCMAKE_M6_SWAP\n#error Expected the new compiler wrapper\n#endif\n",
+    "header-root": '#include <rcmake_m6_root.h>\n',
+    "header-subdir": '#include <existing/rcmake_m6_subdir.h>\n',
+    "library": "int m6_archive(void);\n",
+    "toolchain": "#ifndef RCMAKE_M6_TOOLCHAIN\n#error Expected the new toolchain\n#endif\n",
+    "developer-dir": "#ifndef RCMAKE_M6_DEVELOPER\n#error Expected the new developer directory\n#endif\n",
+    "transitive": '#include <rcmake_m6_outer.h>\n',
 }
 PROBE_STATUS = b"-- M6 probe results "
+COMPILER_MARKER = b"M6 compiler reached the probe"
+SCRATCH_ID = re.compile(rb"\b(?:TryCompile-[A-Za-z0-9]+|cmTC_[A-Za-z0-9]+)\b")
 PANIC = re.compile(rb"(?im)thread [^\n]+ panicked at|(?:^|\n)fatal runtime error:|RUST_BACKTRACE")
+PARITY_KEYS = ("result", "probe stdout", "stdout", "stderr")
+DIGEST = re.compile(r"[0-9a-f]{64}")
+ENTRY_LIMIT = 16 * 1024 * 1024
+BLOB_LIMIT = 512 * 1024 * 1024
+ARTIFACT_LIMIT = 4 * 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -51,7 +62,8 @@ class Fixture:
 
     root: Path
     compiler: str
-    delay: float
+    probes: int
+    alternate_developer_dir: str = ""
 
     @property
     def source(self) -> Path:
@@ -63,23 +75,26 @@ class Fixture:
 
     def wrapper(self, swapped: bool = False) -> None:
         """Log attempted fixture compilations and invoke the system compiler."""
-        actions = []
-        if self.delay:
-            actions.append(f"    sleep {self.delay:g}\n")
-        if swapped:
-            actions.append('    set -- -DRCMAKE_M6_SWAP=1 "$@"\n')
+        swap = '    set -- -DRCMAKE_M6_SWAP=1 "$@"\n' if swapped else ""
         script = f"""#!/bin/sh
 compile=no
-source=no
+source=
 for arg do
     case "$arg" in
         -c) compile=yes ;;
-        */m6_probe_*.c|m6_probe_*.c) source=yes ;;
+        */m6_probe_*.c|m6_probe_*.c) source=${{arg##*/}} ;;
     esac
 done
-if [ "$compile:$source" = yes:yes ]; then
-    printf '%s\\n' "$PWD" >> {shlex.quote(str(self.log))}
-{''.join(actions)}fi
+if [ "$compile" = yes ] && [ -n "$source" ]; then
+    printf '%s\\t%s\\n' "$PWD" "$source" >> {shlex.quote(str(self.log))}
+    printf '%s\\n' '{COMPILER_MARKER.decode()}' >&2
+    if [ "${{LANG-}}" = POSIX ]; then
+        set -- -DRCMAKE_M6_POSIX=1 "$@"
+    fi
+    if [ -n "${{DEVELOPER_DIR-}}" ] && [ "$DEVELOPER_DIR" = {shlex.quote(self.alternate_developer_dir)} ]; then
+        set -- -DRCMAKE_M6_DEVELOPER=1 "$@"
+    fi
+{swap}fi
 exec {shlex.quote(self.compiler)} "$@"
 """
         replacement = self.root / "compiler.new"
@@ -93,15 +108,16 @@ exec {shlex.quote(self.compiler)} "$@"
 
 
 def fixture(root: Path, compiler: str, prefix: str = "", probes: int = 1,
-            delay: float = 0, library: bool = False) -> Fixture:
+            library: bool = False, alternate_developer_dir: str = "") -> Fixture:
     """Create a C project with a leaf directory that runs real try_compile probes."""
-    case = Fixture(root, compiler, delay)
+    case = Fixture(root, compiler, probes, alternate_developer_dir)
     for name in ("source/leaf", "include/existing", "library", "empty", "alternate"):
         (root / name).mkdir(parents=True)
     case.wrapper()
     (root / "toolchain.cmake").write_text(
         'set(CMAKE_C_COMPILER "${CMAKE_CURRENT_LIST_DIR}/compiler")\n'
-        'set(M6_TOOLCHAIN_REVISION 1)\n', encoding="utf-8",
+        'set(CMAKE_C_COMPILER_FORCED TRUE)\n'
+        'set(M6_TOOLCHAIN_DEFINITION "")\n', encoding="utf-8",
     )
     (case.source / "CMakeLists.txt").write_text(
         "cmake_minimum_required(VERSION 4.5)\nproject(M6ProbeCache C)\n"
@@ -109,17 +125,22 @@ def fixture(root: Path, compiler: str, prefix: str = "", probes: int = 1,
     )
     link = ('LINK_OPTIONS "-L${CMAKE_CURRENT_SOURCE_DIR}/../../library" '
             'LINK_LIBRARIES "-lrcmake_m6_probe"') if library else ""
+    result_code = "m6_archive() + ${index} - 1" if library else "${index}"
     # Keep each probe source different so a cold storm performs many writes.
     leaf = f"""\
 set(results "")
 set(prefix [==[{prefix}]==])
 foreach(index RANGE 1 {probes})
+  set(log "${{CMAKE_BINARY_DIR}}/probe-${{index}}.log")
   try_compile(result
     SOURCE_FROM_CONTENT "m6_probe_${{index}}.c"
-      "${{prefix}}int main(void) {{ return ${{index}} - ${{index}}; }}"
-    COMPILE_DEFINITIONS "-I${{CMAKE_CURRENT_SOURCE_DIR}}/../../include"
+      "${{prefix}}int main(void) {{ return {result_code}; }}"
+    COMPILE_DEFINITIONS "-I${{CMAKE_CURRENT_SOURCE_DIR}}/../../include" ${{M6_TOOLCHAIN_DEFINITION}}
     {link}
+    OUTPUT_VARIABLE compile_output
+    COPY_FILE "${{CMAKE_BINARY_DIR}}/probe-${{index}}"
     NO_CACHE)
+  file(WRITE "${{log}}" "${{compile_output}}")
   string(APPEND results "${{result}}\\n")
 endforeach()
 file(WRITE "${{CMAKE_BINARY_DIR}}/probe-results.txt" "${{results}}")
@@ -133,12 +154,17 @@ message(STATUS "M6 probe results ${{display}}")
 def environment(case: Fixture, store: Path) -> dict[str, str]:
     """Use a private store and a stable baseline for the changed inputs."""
     env = clean_environment()
-    for key in ("RCMAKE_PROBE_CACHE", "RCMAKE_NO_PROBE_CACHE", "RCMAKE_NO_INCREMENTAL",
-                "RCMAKE_PROBE_ENV_EXTRA", "DEVELOPER_DIR", "LANGUAGE", "LC_ALL",
-                "LC_MESSAGES", "CFLAGS", "CPPFLAGS", "LDFLAGS", "CC"):
-        env.pop(key, None)
-    env.update(LANG="C", CPATH=str(case.root / "empty"), RCMAKE_PROBE_JOBS="1",
-               RCMAKE_CACHE_DIR=str(store), RCMAKE_PROBE_CACHE_DIR=str(store))
+    for key in tuple(env):
+        if key.startswith(("RCMAKE_PROBE_", "RCMAKE_CACHE_", "RCMAKE_NO_", "RCMAKE_MEASURE_")) or key in {
+            "RCMAKE_STORE_DIR", "DEVELOPER_DIR", "LANGUAGE", "LC_ALL", "LC_MESSAGES", "CFLAGS",
+            "CPPFLAGS", "LDFLAGS", "CC", "SDKROOT", "C_INCLUDE_PATH", "LIBRARY_PATH",
+            "LD_PRELOAD", "DYLD_INSERT_LIBRARIES",
+        }:
+            del env[key]
+    # StoreConfig reads RCMAKE_CACHE_DIR. The storm uses eight configure processes.
+    # Keep each process serial when the probe pool is active.
+    env.update(LANG="C", CPATH=str(case.root / "empty"), RCMAKE_CACHE_DIR=str(store),
+               RCMAKE_PROBE_JOBS="1")
     return env
 
 
@@ -149,8 +175,8 @@ def command(binary: Path, case: Fixture, build: Path, no_cache: bool = False) ->
             f"-DCMAKE_TOOLCHAIN_FILE={case.root / 'toolchain.cmake'}"]
 
 
-def output(result: dict, case: Fixture, build: Path) -> dict[str, bytes]:
-    """Read exact probe results and normalized configure streams."""
+def output(result: dict, case: Fixture, build: Path, args, env: dict) -> dict:
+    """Read probe output and run each copied executable."""
     stdout = normalize(result["stdout"].encode(), case.source, build)
     stderr = normalize(result["stderr"].encode(), case.source, build)
     if result["error"] or result["returncode"] != 0 or PANIC.search(stdout + b"\n" + stderr):
@@ -159,14 +185,39 @@ def output(result: dict, case: Fixture, build: Path) -> dict[str, bytes]:
     probe_stdout = b"\n".join(line for line in stdout.splitlines() if line.startswith(PROBE_STATUS))
     if not probe_stdout or not result_file.is_file():
         raise ValueError(f"Configure did not report probe results in {build}.")
-    return {"result": result_file.read_bytes(), "probe stdout": probe_stdout + b"\n",
-            "stdout": stdout, "stderr": stderr}
+    results = result_file.read_bytes()
+    values = results.splitlines()
+    if len(values) != case.probes or any(value not in (b"TRUE", b"FALSE") for value in values):
+        raise ValueError(f"Invalid probe results in {result_file}.")
+    logs = []
+    copies = []
+    for index, value in enumerate(values, 1):
+        log = (build / f"probe-{index}.log").read_bytes()
+        if COMPILER_MARKER not in log:
+            raise ValueError(f"OUTPUT_VARIABLE did not contain the compiler output for probe {index}.")
+        logs.append(SCRATCH_ID.sub(b"<PROBE>", normalize(log, case.source, build)))
+        path = build / f"probe-{index}"
+        if value == b"FALSE":
+            if path.exists():
+                raise ValueError(f"COPY_FILE created an executable for failed probe {index}.")
+            copies.append(None)
+            continue
+        if path.is_symlink() or not path.is_file():
+            raise ValueError(f"COPY_FILE did not produce a regular executable for probe {index}.")
+        status = run_command([path], build, args.timeout, env)
+        if status["error"] or status["returncode"] != index or status["stdout"] or status["stderr"]:
+            raise ValueError(f"COPY_FILE produced the wrong executable for probe {index}. {status}")
+        copies.append((hashlib.sha256(path.read_bytes()).hexdigest(), stat.S_IMODE(path.stat().st_mode)))
+    return {"result": results, "probe stdout": probe_stdout + b"\n", "stdout": stdout,
+            "stderr": stderr, "logs": logs, "copies": copies}
 
 
 def compare(actual: dict, expected: dict, keys, label: str) -> None:
     """Report the first output difference."""
     for key in keys:
         if actual[key] != expected[key]:
+            if not isinstance(expected[key], bytes):
+                raise ValueError(f"{label} differs for {key}.")
             diff = diff_bytes(expected[key], actual[key], f"expected/{key}", f"actual/{key}")
             raise ValueError(f"{label} differs.\n{diff.decode(errors='replace')}")
 
@@ -184,7 +235,7 @@ def configure(args, case: Fixture, name: str, env: dict, *, oracle: bool = False
     binary = args.oracle if oracle else args.rcmake
     before = len(case.invocations())
     result = run_command(command(binary, case, build, no_cache), case.root, args.timeout, env)
-    return output(result, case, build), len(case.invocations()) - before
+    return output(result, case, build, args, env), len(case.invocations()) - before
 
 
 def change_input(name: str, case: Fixture, env: dict, args) -> None:
@@ -204,9 +255,9 @@ def change_input(name: str, case: Fixture, env: dict, args) -> None:
         case.wrapper(swapped=True)
     elif name == "toolchain":
         with (case.root / "toolchain.cmake").open("a", encoding="utf-8") as stream:
-            stream.write("set(M6_TOOLCHAIN_REVISION 2)\n")
+            stream.write('set(M6_TOOLCHAIN_DEFINITION "-DRCMAKE_M6_TOOLCHAIN=1")\n')
     elif name == "developer-dir":
-        env["DEVELOPER_DIR"] = args.developer_dir
+        env["DEVELOPER_DIR"] = args.developer_dirs[1]
     elif name == "library":
         source = case.root / "archive.c"
         source.write_text("int m6_archive(void) { return 1; }\n", encoding="utf-8")
@@ -219,9 +270,10 @@ def change_input(name: str, case: Fixture, env: dict, args) -> None:
 
 
 def invalidation(args, root: Path, name: str, row: dict) -> None:
-    """Require a cold compile, a warm hit, and a miss after each input change."""
-    prefix, before, after = TRIGGERS[name]
-    case = fixture(root, args.compiler, prefix, library=name == "library")
+    """Require a warm hit and a fresh compile after each input change."""
+    alternate = args.developer_dirs[1] if name == "developer-dir" else ""
+    case = fixture(root, args.compiler, TRIGGERS[name], library=name == "library",
+                   alternate_developer_dir=alternate)
     if name == "cpath":
         (root / "alternate/rcmake_m6_cpath.h").write_text(
             "#define RCMAKE_M6_HEADER 1\n", encoding="utf-8")
@@ -230,67 +282,231 @@ def invalidation(args, root: Path, name: str, row: dict) -> None:
             "#include <existing/rcmake_m6_inner.h>\n", encoding="utf-8")
     store = root / "store"
     env = environment(case, store)
+    if name == "developer-dir":
+        env["DEVELOPER_DIR"] = args.developer_dirs[0]
     calls = row["compiler_calls"] = {}
     cold, calls["cold"] = configure(args, case, "cold", env)
-    check_result(cold, before)
-    warm, calls["warm"] = configure(args, case, "warm", env)
-    compare(warm, cold, cold.keys(), "Warm configure")
-    if not calls["cold"]:
-        raise ValueError("The cold configure did not invoke the probe compiler.")
+    check_result(cold, False)
+    require_calls(calls, "cold", 1)
+    before_oracle, calls["oracle_before"] = configure(args, case, "oracle-before", env, oracle=True)
+    require_calls(calls, "oracle_before", 1)
+    compare(cold, before_oracle, PARITY_KEYS, "Cold CMake parity")
+    if not args.smoke:
+        if len(audit_store(store)) != 1:
+            raise ValueError("Expected one published entry for the cold probe.")
+        warm, calls["warm"] = configure(args, case, "warm", env)
+        compare(warm, cold, cold.keys(), "Warm configure")
+        require_calls(calls, "warm", 0)
     change_input(name, case, env, args)
     changed, calls["changed"] = configure(args, case, "changed", env)
     oracle, calls["oracle"] = configure(args, case, "oracle", env, oracle=True)
-    check_result(oracle, after)
-    if not args.smoke:
+    require_calls(calls, "oracle", 1)
+    check_result(oracle, True)
+    compare(changed, oracle, PARITY_KEYS, "Changed CMake parity")
+    require_calls(calls, "changed", 1)
+
+
+def require_calls(calls: dict, lane: str, expected: int) -> None:
+    """Check the exact number of fixture compiler calls in a lane."""
+    if calls[lane] != expected:
+        raise ValueError(f"Wrong compiler call count in the {lane} lane. Found {calls[lane]}. Expected {expected}.")
+
+
+def cache_control(args, root: Path, row: dict) -> None:
+    """Prove that the candidate reads and bypasses the same seeded store."""
+    case = fixture(root, args.compiler)
+    store = root / "store"
+    env = environment(case, store)
+    calls = row["compiler_calls"] = {}
+    cold, calls["cold"] = configure(args, case, "cold", env)
+    check_result(cold, True)
+    require_calls(calls, "cold", 1)
+    oracle, calls["oracle"] = configure(args, case, "oracle", env, oracle=True)
+    require_calls(calls, "oracle", 1)
+    compare(cold, oracle, PARITY_KEYS, "Cold CMake parity")
+    if args.smoke:
+        return
+
+    errors = []
+    entries = {}
+    try:
+        entries = audit_store(store)
+        row["published"] = len(entries)
+        require_artifacts(entries, set(cold["copies"]), exact=True)
+    except (OSError, ValueError) as error:
+        errors.append(str(error))
+    try:
+        warm, calls["warm"] = configure(args, case, "warm", env)
+        require_calls(calls, "warm", 0)
+        compare(warm, cold, cold.keys(), "Warm configure")
+    except (OSError, ValueError, subprocess.SubprocessError) as error:
+        errors.append(str(error))
+    try:
         disabled, calls["cache_off"] = configure(args, case, "cache-off", env, no_cache=True)
-        check_result(disabled, after)
-        compare(disabled, oracle, oracle.keys(), "Cache-off CMake parity")
-        if not calls["cache_off"]:
-            raise ValueError("The cache-off configure did not invoke the probe compiler.")
-    expected_stale = name == "transitive" and not calls["changed"] and changed["result"] == cold["result"]
-    if expected_stale:
-        row["transitive_behavior"] = "Documented stale failure"
-        compare(changed, cold, cold.keys(), "Transitive cached result")
-    else:
-        baseline = oracle if args.smoke else disabled
-        compare(changed, baseline, baseline.keys(), "Changed configure")
-        if name == "transitive":
-            row["transitive_behavior"] = "Recompiled and found the new header"
-    if not args.smoke and calls["warm"]:
-        raise ValueError("The warm configure invoked the compiler. Expected a cache hit.")
-    if not calls["changed"] and not expected_stale:
-        raise ValueError("The changed configure did not invoke the compiler. Expected a cache miss.")
+        compare(disabled, oracle, PARITY_KEYS, "Cache-off CMake parity")
+        require_calls(calls, "cache_off", 1)
+        if audit_store(store) != entries:
+            raise ValueError("The cache-off lane changed the seeded probe entries.")
+    except (OSError, ValueError, subprocess.SubprocessError) as error:
+        errors.append(str(error))
+    if errors:
+        raise ValueError("Probe cache control failed. " + "\n".join(errors))
 
 
-def audit_store(store: Path) -> int:
-    """Check published entry and blob frames. Ignore private staging files."""
-    frames = [
-        *(("binary entry", path) for path in (store / "entries").rglob("*.entry")),
-        *(("binary blob", path) for path in (store / "blobs").rglob("*.blob")),
-        *(("text entry", path) for path in (store / "probe/v1").rglob("*.json")),
-    ]
-    entries = 0
-    for kind, path in frames:
-        if not path.is_file() or path.is_symlink():
-            raise ValueError(f"Invalid published cache path {path}.")
-        data = path.read_bytes()
-        if kind.startswith("binary"):
-            magic = b"RCMENTRY" if kind == "binary entry" else b"RCM_BLOB"
-            body, checksum = data[:-32], data[-32:]
-            valid = (len(body) > 17 and body.startswith(magic + b"\x01")
-                     and body[17:21] == b"\x28\xb5\x2f\xfd"
-                     and hashlib.sha256(body).digest() == checksum)
-        else:
-            header, _, body = data.partition(b"\n")
-            expected = f"rcmake-entry 1 {len(body)} {hashlib.sha256(body).hexdigest()}".encode()
-            valid = header == expected
-            if valid:
-                json.loads(body)
-        if not valid:
-            raise ValueError(f"Corrupt published cache file {path}.")
-        if kind == "text entry" or path.is_relative_to(store / "entries/probe-v1"):
-            entries += 1
+class Zstd:
+    """Decode one complete Zstandard frame with the Rust store limits."""
+
+    def __init__(self) -> None:
+        name = find_library("zstd")
+        if not name:
+            raise ValueError("Install libzstd to validate probe store files.")
+        self.lib = ctypes.CDLL(name)
+        self.lib.ZSTD_findFrameCompressedSize.argtypes = (ctypes.c_char_p, ctypes.c_size_t)
+        self.lib.ZSTD_findFrameCompressedSize.restype = ctypes.c_size_t
+        self.lib.ZSTD_compressBound.argtypes = (ctypes.c_size_t,)
+        self.lib.ZSTD_compressBound.restype = ctypes.c_size_t
+        self.lib.ZSTD_decompress.argtypes = (ctypes.c_void_p, ctypes.c_size_t, ctypes.c_char_p,
+                                            ctypes.c_size_t)
+        self.lib.ZSTD_decompress.restype = ctypes.c_size_t
+
+    def read(self, path: Path, magic: bytes, limit: int) -> bytes:
+        """Check the frame header, size, checksum and decoded bytes."""
+        header = 17
+        footer = 32
+        info = path.lstat()
+        if not stat.S_ISREG(info.st_mode):
+            raise ValueError(f"Expected a regular cache file at {path}.")
+        with path.open("rb") as source:
+            prefix = source.read(header)
+            length = int.from_bytes(prefix[9:], "little")
+            cap = self.lib.ZSTD_compressBound(length) if length <= limit else 0
+            if (len(prefix) != header or prefix[:9] != magic + b"\x01" or length > limit
+                    or not header + footer < info.st_size <= header + cap + footer):
+                raise ValueError(f"Invalid cache frame header in {path}.")
+            data = source.read(cap + footer + 1)
+        compressed, checksum = data[:-footer], data[-footer:]
+        if (hashlib.sha256(prefix + compressed).digest() != checksum
+                or compressed[:4] != b"\x28\xb5\x2f\xfd"
+                or self.lib.ZSTD_findFrameCompressedSize(compressed, len(compressed)) != len(compressed)):
+            raise ValueError(f"Invalid cache frame in {path}.")
+        decoded = ctypes.create_string_buffer(length)
+        if self.lib.ZSTD_decompress(decoded, length, compressed, len(compressed)) != length:
+            raise ValueError(f"Invalid cache payload length in {path}.")
+        return decoded.raw
+
+
+def cache_files(root: Path, suffix: str):
+    """List regular cache files on their exact digest shards."""
+    if root.is_symlink() or root.parent.is_symlink():
+        raise ValueError(f"Invalid cache directory {root}.")
+    if not root.exists():
+        return
+    for shard in sorted(root.iterdir()):
+        if shard.is_symlink() or not shard.is_dir() or not re.fullmatch(r"[0-9a-f]{2}", shard.name):
+            raise ValueError(f"Invalid cache shard {shard}.")
+        for path in sorted(shard.iterdir()):
+            if path.suffix != suffix or not DIGEST.fullmatch(path.stem) or path.stem[:2] != shard.name:
+                raise ValueError(f"Invalid cache path {path}.")
+            yield path
+
+
+def template(value) -> bool:
+    """Check that a probe template has typed segments."""
+    def byte_list(items):
+        return isinstance(items, list) and all(type(byte) is int and 0 <= byte <= 255 for byte in items)
+
+    if not isinstance(value, list) or len(value) > 32_768:
+        return False
+    for segment in value:
+        if not isinstance(segment, dict) or len(segment) != 1:
+            return False
+        if "Literal" in segment and byte_list(segment["Literal"]):
+            continue
+        bindings = segment["Binding"]
+        if not isinstance(bindings, list) or not bindings or not all(
+                isinstance(item["token"], str) and isinstance(item["encodings"], list)
+                and 1 <= len(item["encodings"]) <= 3
+                and all(encoding in ("Raw", "Forward", "Backslash", "LowerDrive", "UpperDrive",
+                                     "Escaped", "Quoted") for encoding in item["encodings"])
+                and byte_list(item["raw_special"]) for item in bindings):
+            return False
+    return True
+
+
+def probe_entry(decoded: bytes, path: Path, blobs: dict) -> tuple[str, int] | None:
+    """Validate entry identity, payload shape and artifact references."""
+    try:
+        record = json.loads(decoded)
+        if record["domain"] != "ProbeV1" or record["key"] != path.stem:
+            raise ValueError("The domain or key does not match the path.")
+        entry = record["entry"]
+        trace, references, payload = entry["trace"], entry["blobs"], entry["payload"]
+        if not isinstance(trace, list) or not all(
+                isinstance(stamp, dict) and len(stamp) == 1 and isinstance(next(iter(stamp.values())), dict)
+                and next(iter(stamp)) in ("FileStat", "FileHash", "DirEntries", "Missing", "EnvVar", "NegativeLookup")
+                for stamp in trace):
+            raise ValueError("Invalid trace.")
+        checks = payload["checks"]
+        if not isinstance(checks, list) or not all(
+                isinstance(check, list) and len(check) == 2 and DIGEST.fullmatch(check[1])
+                for check in checks):
+            raise ValueError("Invalid journal checks.")
+        outcome = payload["outcome"]
+        if (type(outcome["compiled"]) is not bool or type(outcome["exit_code"]) is not int
+                or not -(2**31) <= outcome["exit_code"] < 2**31 or not template(outcome["output"])):
+            raise ValueError("Invalid probe outcome.")
+        diagnostics = outcome["diagnostics"]
+        if (not isinstance(diagnostics, list) or len(diagnostics) > 16_384 or not all(
+                diag["stream"] in ("Stdout", "Stderr") and template(diag["message"])
+                for diag in diagnostics)):
+            raise ValueError("Invalid probe diagnostics.")
+        artifact = outcome.get("artifact")
+        if artifact is None and references == [] and not outcome["compiled"]:
+            return None
+        digest, mode = artifact["blob"], artifact["mode"]
+        if (not outcome["compiled"] or references != [digest] or digest not in blobs
+                or not 0 < blobs[digest] <= ARTIFACT_LIMIT or type(mode) is not int
+                or not 0 <= mode < 2**32 or not template(artifact["relative_path"])):
+            raise ValueError("Invalid or missing artifact reference.")
+        return digest, stat.S_IMODE(mode)
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError(f"Invalid probe entry {path}. {error}") from error
+
+
+@dataclass(frozen=True)
+class PublishedProbe:
+    """Keep the observed entry content and its artifact identity."""
+
+    digest: str
+    artifact: tuple[str, int] | None
+
+
+def audit_store(store: Path) -> dict[Path, PublishedProbe]:
+    """Check published bytes. The runtime checks input stamps during recovery."""
+    blob_paths = list(cache_files(store / "blobs", ".blob"))
+    entry_paths = list(cache_files(store / "entries/probe-v1", ".entry"))
+    if not entry_paths and not blob_paths:
+        return {}
+    decoder = Zstd()
+    blobs = {}
+    for path in blob_paths:
+        decoded = decoder.read(path, b"RCM_BLOB", BLOB_LIMIT)
+        if hashlib.sha256(decoded).hexdigest() != path.stem:
+            raise ValueError(f"The blob content does not match its digest in {path}.")
+        blobs[path.stem] = len(decoded)
+    entries = {}
+    for path in entry_paths:
+        decoded = decoder.read(path, b"RCMENTRY", ENTRY_LIMIT)
+        entries[path] = PublishedProbe(hashlib.sha256(decoded).hexdigest(), probe_entry(decoded, path, blobs))
     return entries
+
+
+def require_artifacts(entries: dict[Path, PublishedProbe], copies: set, *, exact: bool) -> None:
+    """Check that the published artifacts match the fixture executables."""
+    artifacts = {entry.artifact for entry in entries.values()}
+    if len(artifacts) != len(entries) or not artifacts <= copies or (exact and artifacts != copies):
+        raise ValueError(f"Expected {'all' if exact else 'distinct'} fixture artifacts in the store. "
+                         f"Entry count {len(entries)}. Copied executable count {len(copies)}.")
 
 
 def kill_group(process: subprocess.Popen) -> None:
@@ -301,38 +517,8 @@ def kill_group(process: subprocess.Popen) -> None:
         pass
 
 
-def crash_victims(workers: list, case: Fixture, store: Path, deadline: float,
-                  args) -> dict[int, Path | None]:
-    """Kill seeded workers during a probe or while a staging file exists."""
-    rng = random.Random(args.seed)
-    victims = rng.sample(range(WORKERS), WORKERS // 2)
-    selected = set(victims)
-    killed = {}
-    staging = store / "tmp"
-    while selected and time.monotonic() < deadline:
-        active = case.invocations()
-        staged = {name.split("-", 1)[0]: staging / name
-                  for name in os.listdir(staging)} if staging.is_dir() else {}
-        for index in sorted(selected):
-            process, build, _, _ = workers[index]
-            if process.poll() is not None:
-                raise ValueError(f"Crash victim {index} completed before SIGKILL.")
-            candidate = staged.get(str(process.pid))
-            writing = candidate is not None and candidate.exists()
-            probing = any(path.startswith(str(build) + os.sep) for path in active)
-            if writing or (probing and (args.smoke or index != victims[0])):
-                kill_group(process)
-                killed[index] = candidate if writing else None
-        selected.difference_update(killed)
-        if selected:
-            time.sleep(0.001)
-    if selected:
-        raise ValueError(f"Timed out before killing crash victims {sorted(selected)}.")
-    return killed
-
-
-def parallel(args, case: Fixture, store: Path, env: dict, crash: bool, row: dict) -> list[dict]:
-    """Start all workers before waiting. Check each survivor and killed worker."""
+def parallel(args, case: Fixture, env: dict) -> list[dict]:
+    """Start all workers before waiting and check each result."""
     workers = []
     deadline = time.monotonic() + args.timeout
     with ExitStack() as stack:
@@ -346,23 +532,15 @@ def parallel(args, case: Fixture, store: Path, env: dict, crash: bool, row: dict
                     stdin=subprocess.DEVNULL, stdout=stdout, stderr=stderr, start_new_session=True,
                 )
                 workers.append((process, build, stdout, stderr))
-            killed = crash_victims(workers, case, store, deadline, args) if crash else {}
-            row["killed"] = sorted(killed)
             outputs = []
-            for index, (process, build, out, err) in enumerate(workers):
+            for process, build, out, err in workers:
                 status = process.wait(timeout=max(0, deadline - time.monotonic()))
                 out.seek(0)
                 err.seek(0)
                 stdout, stderr = out.read(), err.read()
-                if index in killed:
-                    if status != -signal.SIGKILL or PANIC.search(stdout + b"\n" + stderr):
-                        raise ValueError(f"Worker {index} did not stop cleanly on SIGKILL. {status}.")
-                else:
-                    outputs.append(output({"stdout": stdout.decode(errors="replace"),
-                                           "stderr": stderr.decode(errors="replace"),
-                                           "returncode": status, "error": None}, case, build))
-            row["staging_interruptions"] = sum(path is not None and path.exists() for path in killed.values())
-            row["completed"] = len(outputs)
+                outputs.append(output({"stdout": stdout.decode(errors="replace"),
+                                       "stderr": stderr.decode(errors="replace"),
+                                       "returncode": status, "error": None}, case, build, args, env))
             return outputs
         finally:
             for process, _, _, _ in workers:
@@ -371,54 +549,284 @@ def parallel(args, case: Fixture, store: Path, env: dict, crash: bool, row: dict
                     process.wait(timeout=5)
 
 
-def concurrency(args, root: Path, crash: bool, row: dict) -> None:
-    """Compare the eight-worker run and a post-crash configure with CMake."""
-    probes = 4 if args.smoke else 24
-    case = fixture(root, args.compiler, probes=probes, delay=0.15 if crash else 0)
+def concurrency(args, root: Path, row: dict) -> None:
+    """Compare eight workers with CMake and reuse every published result."""
+    probes = 24
+    case = fixture(root, args.compiler, probes=probes)
     store = root / "store"
     env = environment(case, store)
     oracle, _ = configure(args, case, "oracle", env, oracle=True)
     check_result(oracle, True, probes)
-    survivors = parallel(args, case, store, env, crash, row)
-    for actual in survivors:
-        compare(actual, oracle, oracle.keys(), "Parallel CMake parity")
-    row["published_before_recovery"] = audit_store(store)
+    results = parallel(args, case, env)
+    row["completed"] = len(results)
+    for actual in results:
+        compare(actual, oracle, PARITY_KEYS, "Parallel CMake parity")
+    entries = audit_store(store)
+    row["published_before_recovery"] = len(entries)
     recovered, row["recovery_compiler_calls"] = configure(args, case, "recovery", env)
-    compare(recovered, oracle, oracle.keys(), "Recovery CMake parity")
-    row["published_after_recovery"] = audit_store(store)
-    if not args.smoke:
-        if not row["published_before_recovery"] or not row["published_after_recovery"]:
-            raise ValueError("The shared store has no published probe entries.")
-        if row["recovery_compiler_calls"] >= probes:
-            raise ValueError("Recovery did not reuse any published probe results.")
-        if crash and not row["staging_interruptions"]:
-            raise ValueError("No SIGKILL left a staging file. A write interruption is unverified.")
+    compare(recovered, oracle, PARITY_KEYS, "Parallel recovery parity")
+    compare(recovered, results[0], ("logs",), "Parallel output replay")
+    require_calls(row, "recovery_compiler_calls", 0)
+    require_artifacts(entries, set(recovered["copies"]), exact=True)
+    if audit_store(store) != entries:
+        raise ValueError("The warm worker changed the published probe entries.")
+
+
+# Stop at the close of an entry's staging file. Store publication calls
+# rename after this close. The checkpoint is an atomic symlink to that file.
+PUBLICATION_HOOK = r"""
+#define _GNU_SOURCE
+#include <fcntl.h>
+#include <limits.h>
+#include <stdatomic.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#ifndef __APPLE__
+#include <dlfcn.h>
+#endif
+
+static _Atomic unsigned entries;
+
+static void before_close(int fd, int (*real_close)(int)) {
+    const char *arm = getenv("RCMAKE_MEASURE_ARM");
+    if (!arm || access(arm, F_OK) != 0) return;
+    const char *prefix = getenv("RCMAKE_MEASURE_TMP");
+    const char *checkpoint = getenv("RCMAKE_MEASURE_CHECKPOINT");
+    const char *entry = getenv("RCMAKE_MEASURE_ENTRY");
+    if (!prefix || !checkpoint || !entry) return;
+    char path[PATH_MAX];
+#ifdef __APPLE__
+    if (fcntl(fd, F_GETPATH, path) != 0) return;
+#else
+    char proc_fd[64];
+    snprintf(proc_fd, sizeof proc_fd, "/proc/self/fd/%d", fd);
+    ssize_t size = readlink(proc_fd, path, sizeof path - 1);
+    if (size < 0 || size == sizeof path - 1) return;
+    path[size] = '\0';
+#endif
+    if (strncmp(path, prefix, strlen(prefix)) != 0) return;
+    int staged = open(path, O_RDONLY | O_CLOEXEC);
+    if (staged < 0) return;
+    char magic[8];
+    ssize_t length = read(staged, magic, sizeof magic);
+    real_close(staged);
+    if (length != sizeof magic || memcmp(magic, "RCMENTRY", sizeof magic) != 0) return;
+    unsigned target = (unsigned)strtoul(entry, NULL, 10);
+    if (atomic_fetch_add(&entries, 1) + 1 == target && symlink(path, checkpoint) == 0) {
+        for (;;) pause();
+    }
+}
+
+#ifdef __APPLE__
+static int checkpoint_close(int fd) {
+    before_close(fd, close);
+    return close(fd);
+}
+__attribute__((used, section("__DATA,__interpose")))
+static const void *const interpose[] = {checkpoint_close, close};
+#else
+int close(int fd) {
+    int (*real_close)(int) = dlsym(RTLD_NEXT, "close");
+    before_close(fd, real_close);
+    return real_close(fd);
+}
+#endif
+"""
+
+
+def publication_hook(args, case: Fixture, store: Path, env: dict, target: int) -> Path:
+    """Build and arm a checkpoint for one store entry publication."""
+    source = case.root / "publication.c"
+    library = case.root / "publication-hook.so"
+    source.write_text(PUBLICATION_HOOK, encoding="utf-8")
+    flags = ["-dynamiclib"] if sys.platform == "darwin" else ["-shared", "-fPIC"]
+    libs = [] if sys.platform == "darwin" else ["-ldl"]
+    result = run_command([case.compiler, *flags, source, "-o", library, *libs], case.root,
+                         args.timeout, env)
+    if result["error"] or result["returncode"]:
+        raise ValueError(f"Could not build the publication checkpoint. {result}")
+    loader = "DYLD_INSERT_LIBRARIES" if sys.platform == "darwin" else "LD_PRELOAD"
+    arm = case.root / "armed"
+    checkpoint = case.root / "checkpoint"
+    arm.touch()
+    env.update({loader: str(library), "RCMAKE_MEASURE_ARM": str(arm),
+                "RCMAKE_MEASURE_TMP": str(store / "tmp") + os.sep,
+                "RCMAKE_MEASURE_CHECKPOINT": str(checkpoint), "RCMAKE_MEASURE_ENTRY": str(target)})
+    return checkpoint
+
+
+def interrupt(args, case: Fixture, env: dict, checkpoint: Path) -> int:
+    """Kill one configure after its checkpoint and wait for SIGKILL."""
+    with tempfile.TemporaryFile() as streams:
+        process = subprocess.Popen(
+            command(args.rcmake, case, case.root / "interrupted"), cwd=case.root, env=env,
+            stdin=subprocess.DEVNULL, stdout=streams, stderr=streams, start_new_session=True,
+        )
+        try:
+            deadline = time.monotonic() + args.timeout
+            while not checkpoint.is_symlink():
+                if process.poll() is not None:
+                    streams.seek(0)
+                    raise ValueError("The configure exited before its checkpoint.\n"
+                                     + streams.read().decode(errors="replace"))
+                if time.monotonic() >= deadline:
+                    raise ValueError("The configure did not reach its checkpoint before the timeout.")
+                time.sleep(0.01)
+            kill_group(process)
+            status = process.wait(timeout=5)
+            streams.seek(0)
+            if status != -signal.SIGKILL or PANIC.search(streams.read()):
+                raise ValueError(f"Expected SIGKILL at the checkpoint. Exit status {status}.")
+            return process.pid
+        finally:
+            if process.poll() is None:
+                kill_group(process)
+                process.wait(timeout=5)
+
+
+def crash_recovery(args, root: Path, row: dict) -> None:
+    """Check reuse of each intact entry after a stopped publication."""
+    probes = 24
+    intact = random.Random(args.seed).randrange(8, 17)
+    case = fixture(root, args.compiler, probes=probes)
+    store = root / "store"
+    env = environment(case, store)
+    oracle, _ = configure(args, case, "oracle", env, oracle=True)
+    check_result(oracle, True, probes)
+    checkpoint = publication_hook(args, case, store, env, intact + 1)
+    victim = interrupt(args, case, env, checkpoint)
+    Path(env["RCMAKE_MEASURE_ARM"]).unlink()
+    stage = checkpoint.readlink()
+    if stage.parent != store / "tmp" or not stage.name.startswith(f"{victim}-"):
+        raise ValueError(f"The checkpoint did not identify the victim's staged entry. {stage}")
+    decoded = Zstd().read(stage, b"RCMENTRY", ENTRY_LIMIT)
+    record = json.loads(decoded)
+    key = record.get("key") if isinstance(record, dict) else None
+    if not isinstance(key, str) or not DIGEST.fullmatch(key):
+        raise ValueError("The staged probe entry has an invalid key.")
+    destination = store / "entries/probe-v1" / key[:2] / f"{key}.entry"
+    if destination.exists():
+        raise ValueError("The staged probe entry was already published.")
+    row["staging_interruptions"] = 1
+    entries = audit_store(store)
+    row["published_before_recovery"] = len(entries)
+    if len(entries) != intact:
+        raise ValueError(f"Expected {intact} intact probe entries after the interruption.")
+    recovered, row["recovery_compiler_calls"] = configure(args, case, "recovery", env)
+    compare(recovered, oracle, PARITY_KEYS, "Crash recovery parity")
+    require_calls(row, "recovery_compiler_calls", probes - intact)
+    expected = [f"m6_probe_{index}.c" for index in range(intact + 1, probes + 1)]
+    actual = [line.split("\t")[-1] for line in case.invocations()[-len(expected):]]
+    if actual != expected:
+        raise ValueError(f"Recovery compiled {actual}. Expected {expected}.")
+    copies = set(recovered["copies"])
+    require_artifacts(entries, copies, exact=False)
+    final = audit_store(store)
+    row["published_after_recovery"] = len(final)
+    require_artifacts(final, copies, exact=True)
+    if any(final.get(path) != data for path, data in entries.items()):
+        raise ValueError("Recovery changed an intact probe entry.")
+
+
+def corrupt_entry(args, root: Path, row: dict) -> None:
+    """Recompile just the probe whose published entry was corrupted."""
+    case = fixture(root, args.compiler, probes=2)
+    store = root / "store"
+    env = environment(case, store)
+    cold, count = configure(args, case, "cold", env)
+    check_result(cold, True, 2)
+    if count != 2:
+        raise ValueError(f"Expected a cold compile for both probes. Found {count} compiler calls.")
+    entries = audit_store(store)
+    require_artifacts(entries, set(cold["copies"]), exact=True)
+    victim, entry = next(iter(entries.items()))
+    index = cold["copies"].index(entry.artifact) + 1
+    victim.write_bytes(victim.read_bytes()[:-1])
+    recovered, row["recovery_compiler_calls"] = configure(args, case, "recovery", env)
+    compare(recovered, cold, (*PARITY_KEYS, "logs"), "Corrupt entry recovery parity")
+    require_calls(row, "recovery_compiler_calls", 1)
+    actual_source = case.invocations()[-1].split("\t")[-1]
+    if actual_source != f"m6_probe_{index}.c":
+        raise ValueError(f"Recovery compiled {actual_source}. Expected probe {index}.")
+    final = audit_store(store)
+    require_artifacts(final, set(recovered["copies"]), exact=True)
+    if any(final.get(path) != data for path, data in entries.items() if path != victim):
+        raise ValueError("Recovery changed the intact probe entry.")
+
+
+def developer_dirs(root: Path, timeout: int) -> tuple[str, str] | None:
+    """Find two distinct Apple developer directories with usable SDKs."""
+    if sys.platform != "darwin":
+        return None
+    env = clean_environment()
+    env.pop("DEVELOPER_DIR", None)
+    env.pop("SDKROOT", None)
+    active = run_command(["xcode-select", "-p"], root, timeout, env)
+    if active["error"] or active["returncode"]:
+        return None
+    candidates = [Path(active["stdout"].strip()), Path("/Library/Developer/CommandLineTools")]
+    candidates.extend(app / "Contents/Developer" for app in sorted(Path("/Applications").glob("Xcode*.app")))
+    usable = []
+    for path in candidates:
+        path = path.resolve()
+        if path in usable or not path.is_dir():
+            continue
+        result = run_command(["xcrun", "--sdk", "macosx", "--show-sdk-path"], root,
+                             timeout, {**env, "DEVELOPER_DIR": str(path)})
+        sdk = result["stdout"].strip()
+        if not result["error"] and not result["returncode"] and sdk and Path(sdk).is_dir():
+            usable.append(path)
+        if len(usable) == 2:
+            return str(usable[0]), str(usable[1])
+    return None
 
 
 def evaluate(args, root: Path, report: dict) -> None:
-    """Run each gate case and record individual failures."""
+    """Check the fixture and run the selected cache cases."""
+    if sys.platform not in ("darwin", "linux"):
+        raise ValueError("This probe fixture requires macOS or Linux and a POSIX C compiler.")
     version = run_command([args.oracle, "--version"], root, args.timeout, clean_environment())
     if version["returncode"] or version["error"] or version["stdout"].splitlines()[:1] != ["cmake version 4.5.1"]:
         raise ValueError(f"Expected the CMake 4.5.1 oracle. {version}")
-    if sys.platform == "darwin":
-        dev = run_command(["xcode-select", "-p"], root, args.timeout, clean_environment())
-        if dev["returncode"] or dev["error"] or not Path(dev["stdout"].strip()).is_dir():
-            raise ValueError(f"Could not find the active macOS developer directory. {dev}")
-        args.developer_dir = dev["stdout"].strip()
-    else:
-        args.developer_dir = str(root)
-    for name in [*TRIGGERS, "parallel", "crash"]:
-        row = {"case": name, "gate": "G3" if name in TRIGGERS else "G4"}
+    candidate = run_command([args.rcmake, "--version"], root, args.timeout, clean_environment())
+    if candidate["returncode"] or candidate["error"] or "Rcmake" not in candidate["stdout"]:
+        raise ValueError(f"Expected a staged Rcmake executable. {candidate}")
+    cases = ("transitive",) if args.smoke else TRIGGERS
+    rows = [("cache-control", "G3/G4", cache_control)]
+    rows.extend((name, "G3", None) for name in cases)
+    if not args.smoke:
+        rows.extend((("parallel", "G4", concurrency), ("crash", "G4", crash_recovery),
+                     ("corrupt-entry", "G4", corrupt_entry)))
+    control_ready = True
+    for name, gate, run in rows:
+        row = {"case": name, "gate": "Smoke" if args.smoke else gate, "status": "passed"}
         report["cases"].append(row)
+        if not control_ready:
+            row.update(status="blocked", reason="The probe cache control failed.", passed=False)
+            continue
         try:
-            if name in TRIGGERS:
+            if name == "developer-dir":
+                args.developer_dirs = developer_dirs(root, args.timeout)
+                if not args.developer_dirs:
+                    reason = "The case requires two macOS developer directories with usable SDKs."
+                    if sys.platform == "darwin" and not args.smoke:
+                        raise ValueError(reason)
+                    row.update(status="skipped", reason=reason, passed=None)
+                    continue
+                row["developer_dirs"] = list(args.developer_dirs)
+            if run is None:
                 invalidation(args, root / name, name, row)
             else:
-                concurrency(args, root / name, name == "crash", row)
+                run(args, root / name, row)
         except (OSError, ValueError, subprocess.SubprocessError) as error:
+            row["status"] = "failed"
             row["error"] = str(error)
             print(f"{name}. {error}", file=sys.stderr)
-        row["passed"] = "error" not in row
+            if name == "cache-control" and not args.smoke:
+                control_ready = False
+        row["passed"] = row["status"] == "passed"
 
 
 def main() -> int:
@@ -448,18 +856,19 @@ def main() -> int:
     except (OSError, ValueError, subprocess.SubprocessError) as error:
         report["error"] = str(error)
         print(error, file=sys.stderr)
-    report["passed"] = "error" not in report and all(row["passed"] for row in report["cases"])
+    report["passed"] = ("error" not in report and any(row["passed"] for row in report["cases"])
+                        and all(row["status"] in ("passed", "skipped") for row in report["cases"]))
     write_json(args.out_json, report)
     lines = ["# M6 compiler probe cache", "", f"Mode {report['mode']}. Seed {args.seed}."]
     if args.smoke:
-        lines.extend(("", "Smoke mode checks fixture results and recovery after SIGKILL.",
-                      "Cache hits, cache-off parity, and interrupted store writes require gate mode."))
+        lines.extend(("", "Smoke mode checks compiler success, compiler failure, output and copied executables.",
+                      "G3 and G4 require gate mode."))
     lines.extend(("", "| Gate | Case | Result |", "| --- | --- | --- |"))
     for row in report["cases"]:
-        lines.append(f"| {row['gate']} | {row['case']} | {'Pass' if row['passed'] else 'Fail'} |")
+        lines.append(f"| {row['gate']} | {row['case']} | {row['status'].capitalize()} |")
     for row in report["cases"]:
-        if "error" in row:
-            lines.extend(("", f"## {row['case']}", "", row["error"]))
+        if "error" in row or "reason" in row:
+            lines.extend(("", f"## {row['case']}", "", row.get("error", row.get("reason"))))
     if "error" in report:
         lines.extend(("", report["error"]))
     args.out_md.parent.mkdir(parents=True, exist_ok=True)

@@ -5,13 +5,18 @@ name: CI
     branches: [main]
   pull_request:
   workflow_dispatch:
+    inputs:
+      full_measurement_gates:
+        description: "Run the full replay and probe-cache gates."
+        type: boolean
+        default: false
 
 permissions:
   contents: read
 
 env:
-  CARGO_BUILD_JOBS: "4"
-  RUSTUP_TOOLCHAIN: stable
+  CARGO_BUILD_JOBS: "2"
+  RUST_TEST_THREADS: "3"
 
 jobs:
   ci:
@@ -30,14 +35,10 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@stable
-        if: runner.os == 'Linux'
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: "1.99.1"
           components: rustfmt, clippy
-      - uses: dtolnay/rust-toolchain@stable
-        if: runner.os != 'Linux'
-        with:
-          components: clippy
       - uses: Swatinem/rust-cache@v2
 
       - name: Install Linux build tools
@@ -48,7 +49,8 @@ jobs:
       - name: Install Ninja on macOS
         if: runner.os == 'macOS'
         run: brew install ninja
-      - name: Install Visual Studio 2022 Build Tools
+      - &vs2022
+        name: Install Visual Studio 2022 Build Tools
         if: runner.os == 'Windows'
         shell: pwsh
         timeout-minutes: 25
@@ -70,21 +72,43 @@ jobs:
             $instance = & $vswhere @search
           }
           if (-not $instance) { throw 'Visual Studio 2022 Build Tools are missing.' }
+          "RCMAKE_VS2022_INSTALLATION=$instance" |
+            Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           Join-Path $instance 'MSBuild\Current\Bin\amd64' |
             Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-      - uses: ilammy/msvc-dev-cmd@v1
+      - &msvc
+        uses: ilammy/msvc-dev-cmd@v1
         if: runner.os == 'Windows'
         with:
           arch: x64
           vsversion: "2022"
-      - name: Install Ninja on Windows
+      - &windows_tools
+        name: Verify MSVC 2022 and Ninja
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          if (-not (Get-Command ninja -ErrorAction SilentlyContinue)) {
-            choco install ninja -y --no-progress
+          $ErrorActionPreference = 'Stop'
+          if ($env:VisualStudioVersion -notlike '17.*' -or
+              $env:VSINSTALLDIR.TrimEnd('\') -ne $env:RCMAKE_VS2022_INSTALLATION.TrimEnd('\')) {
+            throw "Expected Visual Studio 2022. Found $env:VisualStudioVersion at $env:VSINSTALLDIR."
           }
-          Get-Command cl.exe, MSBuild.exe, ninja
+          if (-not (Get-Command ninja.exe -ErrorAction SilentlyContinue)) {
+            choco install ninja -y --no-progress
+            if ($LASTEXITCODE -ne 0) { throw "Ninja installer exited with $LASTEXITCODE." }
+          }
+          foreach ($name in 'cl.exe', 'link.exe', 'lib.exe', 'rc.exe', 'mt.exe') {
+            $path = (Get-Command $name -CommandType Application).Source
+            if ($name -in 'cl.exe', 'link.exe', 'lib.exe' -and
+                -not $path.StartsWith($env:VCToolsInstallDir, [StringComparison]::OrdinalIgnoreCase)) {
+              throw "Expected $name from MSVC 2022. Found $path."
+            }
+            $version = (Get-Item -LiteralPath $path).VersionInfo.FileVersion
+            Write-Host "$name $version at $path"
+          }
+          Write-Host "Windows SDK $env:WindowsSDKVersion at $env:WindowsSdkDir"
+          Get-Command MSBuild.exe, ninja.exe -CommandType Application
+          ninja.exe --version
+          if ($LASTEXITCODE -ne 0) { throw "Ninja exited with $LASTEXITCODE." }
           $linker = Join-Path $env:VCToolsInstallDir 'bin\Hostx64\x64\link.exe'
           if (-not (Test-Path -LiteralPath $linker -PathType Leaf)) {
             throw "The Visual Studio linker is missing at $linker."
@@ -101,17 +125,17 @@ jobs:
       - name: Run Clippy
         run: |
           source env/env.sh
-          cargo clippy --workspace --all-targets -- -D warnings
+          cargo clippy --locked --workspace --all-targets -- -D warnings
       - name: Run Clippy with cross-platform generators
         if: runner.os == 'Linux'
         run: |
           source env/env.sh
-          cargo clippy -p rcmake-cli --features vs-cross,xcode-cross --all-targets -- -D warnings
+          cargo clippy --locked -p rcmake-cli --features vs-cross,xcode-cross --all-targets -- -D warnings
       - name: Build Rust documentation
         if: runner.os == 'Linux'
         run: |
           source env/env.sh
-          RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
+          RUSTDOCFLAGS="-D warnings" cargo doc --locked --workspace --no-deps
       - name: Check licences and Git hygiene
         if: runner.os == 'Linux'
         run: |
@@ -120,7 +144,7 @@ jobs:
       - name: Run workspace tests
         run: |
           source env/env.sh
-          cargo test --workspace --no-fail-fast
+          cargo test --locked --workspace --no-fail-fast
 
       - name: Stage Rcmake
         run: |
@@ -138,6 +162,45 @@ jobs:
       - name: Test native C and C++ builds
         timeout-minutes: 15
         run: scripts/linux-vm-test.sh --smoke-only target/stage/bin
+      - name: Run measurement smoke tests with CMake 4.5.1
+        if: runner.os == 'Linux'
+        timeout-minutes: 12
+        run: |
+          source env/env.sh
+          oracle_env="$(scripts/fetch-oracle.sh --print-env)"
+          eval "$oracle_env"
+          reports="$RUNNER_TEMP/measurement"
+          mkdir -p "$reports"
+          python3 tools/measure/mutation_eval.py --smoke --rcmake target/stage/bin/rcmake \
+            --edits 8 --timeout 30 --out-json "$reports/mutation.json" --out-md "$reports/mutation.md"
+          python3 tools/measure/probe_cache_eval.py --smoke --rcmake target/stage/bin/rcmake \
+            --timeout 30 --out-json "$reports/probe.json" --out-md "$reports/probe.md"
+          python3 tools/measure/path_swap_eval.py --smoke --rcmake-bin target/stage/bin/rcmake \
+            --timeout 30 --out "$reports/path-swap.json"
+      # Require the full replay and probe-cache gates when the configure path enables both.
+      - name: Run full measurement gates
+        if: runner.os == 'Linux' && inputs.full_measurement_gates
+        timeout-minutes: 35
+        run: |
+          source env/env.sh
+          oracle_env="$(scripts/fetch-oracle.sh --print-env)"
+          eval "$oracle_env"
+          reports="$RUNNER_TEMP/measurement"
+          failed=0
+          python3 tools/measure/mutation_eval.py --fixture --rcmake target/stage/bin/rcmake \
+            --out-json "$reports/mutation-gate.json" --out-md "$reports/mutation-gate.md" || failed=1
+          python3 tools/measure/probe_cache_eval.py --rcmake target/stage/bin/rcmake \
+            --out-json "$reports/probe-gate.json" --out-md "$reports/probe-gate.md" || failed=1
+          python3 tools/measure/path_swap_eval.py --rcmake-bin target/stage/bin/rcmake \
+            --out "$reports/path-swap-gate.json" || failed=1
+          exit "$failed"
+      - uses: actions/upload-artifact@v6
+        if: always() && runner.os == 'Linux'
+        with:
+          name: rcmake-measurement
+          path: ${{ runner.temp }}/measurement
+          if-no-files-found: ignore
+          retention-days: 3
       - uses: actions/upload-artifact@v6
         if: github.event_name == 'workflow_dispatch' || github.event_name == 'push'
         with:
@@ -148,12 +211,16 @@ jobs:
           if-no-files-found: error
           retention-days: 3
 
+  # Enable the WASI gate after W0 adds rcmake-api to the workspace.
+  # Build --example wasm_smoke for wasm32-wasip1 and pass its artifact to
+  # wasm_smoke.py --require-wasi --wasi-bin. Keep the wasm32-unknown-unknown
+  # build and dependency checks.
   corpus-smoke:
     name: Corpus smoke on ${{ matrix.os }}
     if: github.event_name == 'workflow_dispatch' || github.event_name == 'push'
     needs: ci
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 20
+    timeout-minutes: 50
     strategy:
       fail-fast: false
       matrix:
@@ -169,10 +236,9 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
-      - if: runner.os == 'Windows'
-        uses: ilammy/msvc-dev-cmd@v1
-        with:
-          arch: x64
+      - *vs2022
+      - *msvc
+      - *windows_tools
       - if: runner.os == 'Linux'
         name: Install Ninja on Linux
         run: |
@@ -181,9 +247,6 @@ jobs:
       - if: runner.os == 'macOS'
         name: Install Ninja on macOS
         run: brew install ninja
-      - if: runner.os == 'Windows'
-        name: Verify Ninja on Windows
-        run: Get-Command ninja
       - name: Build, test, and install zlib and cJSON
         shell: bash
         run: |

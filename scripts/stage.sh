@@ -11,10 +11,10 @@ fi
 
 PROFILE="${RCMAKE_STAGE_PROFILE:-debug}"
 if [[ "$PROFILE" == "release" ]]; then
-  cargo build --release --bin rcmake
+  cargo build --locked --release --bin rcmake
   BIN_SRC="$ROOT/target/release/rcmake"
 else
-  cargo build --bin rcmake
+  cargo build --locked --bin rcmake
   BIN_SRC="$ROOT/target/debug/rcmake"
 fi
 

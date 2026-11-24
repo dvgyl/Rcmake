@@ -1,18 +1,19 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: MIT OR Apache-2.0
-"""Compare incremental and cache-off reconfigures after seeded leaf edits.
+"""Verify the results of seeded edits to configured leaf directories.
 
-Source env/env.sh before use. Set --fresh-clean to recreate the reference
-build before each reference reconfigure. Use --cmake-arg=-DNAME=VALUE
-for project options.
-Set --model-dump to compare a model dump emitted by the selected binary.
+Source env/env.sh before use. Use --project or --fixture to verify configure
+replay. Use --smoke for short checks of the built-in project.
+Set --fresh-clean to compare stable outputs with a separate clean configure.
+Use --cmake-arg=-DNAME=VALUE for project options. Use --model-dump to
+include a model dump that the selected binary generates.
 """
 
 from __future__ import annotations
 
 import argparse
 from collections import Counter, defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import difflib
 import hashlib
 import json
@@ -32,6 +33,13 @@ QUERIES = ("codemodel-v2", "cache-v2", "cmakeFiles-v1", "toolchains-v1")
 TARGET_TYPES = {"EXECUTABLE", "STATIC_LIBRARY", "SHARED_LIBRARY", "MODULE_LIBRARY", "OBJECT_LIBRARY"}
 TARGET_NAME = re.compile(r"[A-Za-z0-9_.+-]+")
 DURATION = re.compile(rb"(?m)^(-- (?:Configuring|Generating) done) \([0-9.]+s\)$")
+REPLAY_RECORD = Path("CMakeFiles/rcmake/configure.v1.bin")
+REPLAY_MAGIC = b"RCMAKE-CONFIGURE\0\x01"
+REPLAY_LIMIT = 16 * 1024 * 1024
+TRACE = Path("mutation-trace.jsonl")
+EDIT_GROUPS = (("comment",), ("directory definition",), ("add source", "remove source"),
+               ("set target definition", "toggle definition"), ("target property",))
+CYCLE_SIZE = sum(map(len, EDIT_GROUPS))
 FIXTURE = {
     "CMakeLists.txt": "cmake_minimum_required(VERSION 4.5)\nproject(M6Mutation C)\n"
                       "add_subdirectory(core)\nadd_subdirectory(helper)\n",
@@ -51,11 +59,23 @@ class Leaf:
 
 
 @dataclass(frozen=True)
+class Effect:
+    """Identify one observable change in a generated target."""
+
+    target: str
+    field: str
+    value: str
+    added: bool
+
+
+@dataclass(frozen=True)
 class Edit:
     """Record one reversible change to source files."""
 
     kind: str
+    leaf: Path
     files: dict[Path, tuple[bytes | None, bytes | None]]
+    effects: tuple[Effect, ...] = ()
 
     def apply(self, source: Path) -> None:
         """Apply the edit only if the source still matches its recorded state."""
@@ -72,8 +92,9 @@ class Edit:
 
     def reverse(self) -> Edit:
         """Return an edit that restores the previous file contents."""
-        return Edit("remove source", {name: (after, before)
-                                      for name, (before, after) in self.files.items()})
+        files = {name: (after, before) for name, (before, after) in self.files.items()}
+        return Edit("remove source", self.leaf, files,
+                    tuple(Effect(e.target, e.field, e.value, not e.added) for e in self.effects))
 
 
 def read_optional(path: Path) -> bytes | None:
@@ -107,14 +128,18 @@ def normalize_json(value, source: Path, build: Path, names: dict[str, str]):
     return value
 
 
-def file_api(build: Path, source: Path, successful: bool) -> dict[str, bytes]:
-    """Read all File API replies and normalize generated names and references."""
+def file_api(build: Path, source: Path) -> dict[str, bytes]:
+    """Require a complete set of File API replies and normalize its names."""
     reply = build / API / "reply"
     files = {path.name: json.loads(path.read_bytes()) for path in reply.glob("*.json")}
-    indices = sorted(name for name in files if name.startswith("index-"))
-    if successful and (len(indices) != 1 or not set(QUERIES) <= files[indices[0]]["reply"].keys()):
+    indices = [name for name in files if name.startswith("index-")]
+    if len(indices) != 1:
         raise ValueError(f"Missing or ambiguous File API index in {reply}.")
-    stems = {name: "index.json" if name in indices else
+    index = files[indices[0]]["reply"]
+    for query in QUERIES:
+        if query not in index or index[query].get("jsonFile") not in files:
+            raise ValueError(f"Missing File API reply for {query} in {reply}.")
+    stems = {name: "index.json" if name.startswith("index-") else
              re.sub(r"-[a-f0-9]{20}(?=\.json$)", "", name) for name in files}
     counts = Counter(stems.values())
     names = {}
@@ -134,7 +159,10 @@ def file_api(build: Path, source: Path, successful: bool) -> dict[str, bytes]:
 def discover_leaves(source: Path, build: Path) -> list[Leaf]:
     """Find active leaf directories and their buildable targets."""
     reply = build / API / "reply"
-    index = json.loads(next(reply.glob("index-*.json")).read_bytes())
+    indices = list(reply.glob("index-*.json"))
+    if len(indices) != 1:
+        raise ValueError(f"Missing or ambiguous File API index in {reply}.")
+    index = json.loads(indices[0].read_bytes())
     name = index["reply"]["codemodel-v2"]["jsonFile"]
     codemodel = json.loads((reply / name).read_bytes())
     leaves = defaultdict(set)
@@ -162,10 +190,9 @@ def make_edit(kind: str, leaf: Leaf, source: Path, step: int, rng: random.Random
     lists = (source / leaf.lists).read_bytes()
     marker = f"RCMAKE_M6_{step}"
     files = {}
+    effects = ()
     if kind == "comment":
         new = lists + f"\n# Mutation {step}.\n".encode()
-    elif kind == "directory definition":
-        new = lists + f"\nadd_compile_definitions({marker}=1)\n".encode()
     else:
         target, extension = rng.choice(leaf.targets)
         if kind == "add source":
@@ -173,13 +200,19 @@ def make_edit(kind: str, leaf: Leaf, source: Path, step: int, rng: random.Random
             relative = leaf.lists.with_name(name)
             files[relative] = (None, f"int rcmake_m6_mutation_{step}(void) {{ return {step}; }}\n".encode())
             command = f'target_sources({target} PRIVATE "{name}")'
-        elif kind == "toggle definition":
+            effects = (Effect(target, "source", relative.as_posix(), True),)
+        elif kind == "directory definition":
+            command = f"add_compile_definitions({marker}=1)"
+            effects = (Effect(target, "definition", f"{marker}=1", True),)
+        elif kind == "set target definition":
             command = f"target_compile_definitions({target} PRIVATE {marker}=1)"
+            effects = (Effect(target, "definition", f"{marker}=1", True),)
         else:
-            command = f"set_property(TARGET {target} PROPERTY POSITION_INDEPENDENT_CODE ON)"
+            command = f"set_property(TARGET {target} APPEND PROPERTY COMPILE_OPTIONS -D{marker}=1)"
+            effects = (Effect(target, "flag", f"-D{marker}=1", True),)
         new = lists + f"\n{command}\n".encode()
     files[leaf.lists] = (lists, new)
-    return Edit(kind, files)
+    return Edit(kind, leaf.lists, files, effects)
 
 
 def configure(args, source: Path, build: Path, env: dict[str, str]) -> dict:
@@ -188,35 +221,119 @@ def configure(args, source: Path, build: Path, env: dict[str, str]) -> dict:
     query.mkdir(parents=True, exist_ok=True)
     for kind in QUERIES:
         (query / kind).touch()
+    reply = build / API / "reply"
+    if reply.exists():
+        shutil.rmtree(reply)
+    if args.model_dump:
+        (build / args.model_dump).unlink(missing_ok=True)
+    trace_args = []
+    if not args.smoke:
+        trace = build / TRACE
+        trace.unlink(missing_ok=True)
+        trace_args = ["--trace", "--trace-format=json-v1", f"--trace-redirect={trace}"]
     return run_command(
         [args.rcmake, "-S", source, "-B", build, "-G", "Ninja",
-         "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON", *args.cmake_arg],
+         "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON", *args.cmake_arg, *trace_args],
         source, args.timeout, env,
     )
 
 
-def snapshot(result: dict, source: Path, build: Path, args) -> dict[str, bytes | None]:
+def snapshot(result: dict, source: Path, build: Path, args) -> dict[str, bytes]:
     """Collect configure output and generated artifacts."""
     outputs = {name: normalize(result[name].encode(), source, build)
                for name in ("stdout", "stderr")}
-    outputs["exit status"] = str(result["returncode"]).encode() + b"\n"
-    outputs["execution error"] = (result["error"] or "").encode()
-    successful = result["returncode"] == 0 and not result["error"]
-    artifacts = {"CMakeCache.txt", "build.ninja", "compile_commands.json", "CMakeFiles/rules.ninja"}
-    artifacts.update(str(path.relative_to(build)) for path in build.rglob("*.ninja")
-                     if not {"CMakeScratch", "CMakeTmp"} & set(path.relative_to(build).parts))
-    if args.model_dump:
-        artifacts.add(args.model_dump)
-    required = {"CMakeCache.txt", "build.ninja"}
+    required = {"CMakeCache.txt", "build.ninja", "compile_commands.json", "CMakeFiles/rules.ninja"}
     if args.model_dump:
         required.add(args.model_dump)
+    artifacts = set(required)
+    artifacts.update(str(path.relative_to(build)) for path in build.rglob("*.ninja")
+                     if not {"CMakeScratch", "CMakeTmp"} & set(path.relative_to(build).parts))
     for name in artifacts:
-        raw = read_optional(build / name)
-        if raw is None and successful and name in required:
-            raise ValueError(f"Missing generated file {build / name}.")
-        outputs[name] = normalize(raw, source, build) if raw is not None else None
-    outputs.update(file_api(build, source, successful))
+        raw = (build / name).read_bytes()
+        if name in required and not raw:
+            raise ValueError(f"Empty generated file {build / name}.")
+        if name == "compile_commands.json" and not isinstance(json.loads(raw), list):
+            raise ValueError(f"Invalid compilation database in {build / name}.")
+        outputs[name] = normalize(raw, source, build)
+    outputs.update(file_api(build, source))
     return outputs
+
+
+def target_values(outputs: dict[str, bytes], target: str) -> dict[str, set[str]]:
+    """Read compiled sources, definitions, and options for one target."""
+    reply = f"{API}/reply"
+    index = json.loads(outputs[f"{reply}/index.json"])
+    name = index["reply"]["codemodel-v2"]["jsonFile"]
+    codemodel = json.loads(outputs[f"{reply}/{name}"])
+    values = {"source": set(), "definition": set(), "flag": set()}
+    for config in codemodel["configurations"]:
+        for entry in config["targets"]:
+            if entry["name"] != target:
+                continue
+            model = json.loads(outputs[f"{reply}/{entry['jsonFile']}"])
+            values["source"].update(item["path"] for item in model["sources"]
+                                    if "compileGroupIndex" in item)
+            for group in model["compileGroups"]:
+                values["definition"].update(item["define"] for item in group.get("defines", []))
+                for item in group.get("compileCommandFragments", []):
+                    values["flag"].update(item["fragment"].split())
+            return values  # Ninja generates one configuration.
+    raise ValueError(f"Target {target} is missing from the codemodel.")
+
+
+def verify_effects(edit: Edit, before: dict[str, bytes], after: dict[str, bytes]) -> None:
+    """Check each requested change against the previous and current codemodels."""
+    if not edit.effects:
+        return
+    target = edit.effects[0].target
+    old = target_values(before, target)
+    new = target_values(after, target)
+    for effect in edit.effects:
+        was_present = effect.value in old[effect.field]
+        is_present = effect.value in new[effect.field]
+        if was_present == effect.added or is_present != effect.added:
+            action = "addition" if effect.added else "removal"
+            raise ValueError(f"Target {target} did not show the {action} of {effect.value}.")
+
+
+def executed_leaves(source: Path, build: Path) -> set[Path]:
+    """Read the JSON command trace and return the listfiles that executed."""
+    executed = set()
+    with (build / TRACE).open(encoding="utf-8") as stream:
+        header = json.loads(stream.readline())
+        if header.get("version", {}).get("major") != 1:
+            raise ValueError(f"Invalid command trace in {build / TRACE}.")
+        for line in stream:
+            event = json.loads(line)
+            path = Path(event["file"])
+            if event["cmd"] and path.name == "CMakeLists.txt" and path.is_relative_to(source):
+                executed.add(path.relative_to(source))
+    return executed
+
+
+def require_replay_record(source: Path, build: Path) -> None:
+    """Check the current configure journal frame and its tree identity."""
+    path = build / REPLAY_RECORD
+    if not path.is_file():
+        raise ValueError(f"No configure replay record in {path}.")
+    header_size = len(REPLAY_MAGIC) + 5
+    limit = header_size + REPLAY_LIMIT + 32
+    with path.open("rb") as stream:
+        record = stream.read(limit + 1)
+    header = REPLAY_MAGIC + bytes([1 if os.name == "nt" else 2])
+    size = int.from_bytes(record[len(header):header_size], "little")
+    if (len(record) != header_size + size + 32 or size > REPLAY_LIMIT
+            or not record.startswith(header) or hashlib.sha256(record[:-32]).digest() != record[-32:]):
+        raise ValueError(f"Invalid configure replay record in {path}.")
+    payload = json.loads(record[header_size:-32])
+    region = payload.get("region", {})
+    key = region.get("key", {})
+    paths = [str(p).encode("utf-16-le", errors="surrogatepass") if os.name == "nt" else os.fsencode(p)
+             for p in (source, build)]
+    if (payload.get("schema") != "configure.v1" or "model" not in payload
+            or "Complete" not in region.get("payload", {}) or key.get("kind") != "Configure"
+            or [key.get("source_dir"), key.get("binary_dir")] != [list(p) for p in paths]):
+        raise ValueError(f"Configure replay record does not match the configure in {path}.")
 
 
 def diff_bytes(before: bytes | None, after: bytes | None, left: str, right: str) -> bytes:
@@ -235,37 +352,105 @@ def diff_bytes(before: bytes | None, after: bytes | None, left: str, right: str)
                     for line in diff) or f"File presence differs for {left} and {right}.\n".encode()
 
 
-def compare(args, report: dict, sources, builds, envs, step: int, edit: Edit | None) -> None:
+@dataclass(frozen=True)
+class Observation:
+    """Keep the output and the leaf state for one configure."""
+
+    outputs: dict[str, bytes]
+    executed: set[Path]
+    leaf_digests: dict[Path, str]
+    replayed: set[Path] = field(default_factory=set)
+
+
+def observe(args, result: dict, source: Path, build: Path) -> Observation:
+    """Collect fresh outputs and the leaf state for one lane."""
+    outputs = snapshot(result, source, build, args)
+    if args.smoke:
+        return Observation(outputs, set(), {})
+    executed = executed_leaves(source, build)
+    digests = {leaf.lists: hashlib.sha256((source / leaf.lists).read_bytes()).hexdigest()
+               for leaf in discover_leaves(source, build)}
+    return Observation(outputs, executed, digests)
+
+
+def verify_replay(row: dict, sources, builds, current: list[Observation],
+                  previous: list[Observation], edit: Edit | None) -> None:
+    """Require execution of the changed leaf and replay of an unchanged leaf."""
+    require_replay_record(sources[0], builds[0])
+    row["replay_record"] = True
+    if any((build / REPLAY_RECORD).exists() for build in builds[1:]):
+        raise ValueError("A replay-disabled configure published a replay record.")
+    left, right = current[:2]
+    if edit is None:
+        if len(left.executed & right.executed & left.leaf_digests.keys()) < 2:
+            raise ValueError("The initial traces must show two configured leaf directories.")
+        return
+    changed = edit.leaf
+    if changed not in left.executed or changed not in right.executed:
+        raise ValueError(f"The command traces must show execution of the changed leaf {changed}.")
+    row["changed_leaf_executed"] = str(changed)
+    demonstrated = previous[0].executed | previous[0].replayed
+    controls = right.executed & previous[1].executed & demonstrated
+    controls -= left.executed | {changed}
+    replayed = sorted(path for path in controls if path in left.leaf_digests
+                      and left.leaf_digests[path] == previous[0].leaf_digests.get(path)
+                      == right.leaf_digests.get(path) == previous[1].leaf_digests.get(path))
+    if not replayed:
+        raise ValueError("The command traces show no replay of an unchanged configured leaf.")
+    left.replayed.update(replayed)
+    row["replayed_leaves"] = [str(path) for path in replayed]
+
+
+def compare(args, report: dict, sources, builds, envs, step: int, edit: Edit | None,
+            previous: list[Observation]) -> list[Observation]:
     """Stop at the first divergence and save the edit and output differences."""
-    left_result = configure(args, sources[0], builds[0], envs[0])
-    right_result = configure(args, sources[1], builds[1], envs[1])
-    if step and args.fresh_clean and right_result["returncode"] == 0 and not right_result["error"]:
-        right_result = configure(args, sources[1], builds[1], envs[1])
-    results = (left_result, right_result)
+    lanes = ("incremental", "replay-off", "fresh-clean")
+    results = [configure(args, source, build, env)
+               for source, build, env in zip(sources, builds, envs)]
     row = {"step": step, "edit": edit.kind if edit else "initial configure",
            "files": [str(path) for path in edit.files] if edit else [],
-           "exit_status": [result["returncode"] for result in results]}
+           "exit_status": [result["returncode"] for result in results[:2]]}
     report["steps"].append(row)
+    if args.fresh_clean:
+        fresh = results[2]
+        row["fresh_configure"] = {
+            **fresh,
+            **{name: normalize(fresh[name].encode(), sources[2], builds[2]).decode()
+               for name in ("stdout", "stderr")},
+        }
     edit_diff = b""
     if edit:
         edit_diff = b"".join(diff_bytes(before, after, f"a/{path}", f"b/{path}")
                              for path, (before, after) in edit.files.items())
         row["patch"] = edit_diff.decode(errors="replace")
-    differences = []
+    failures = [f"{lane} configure failed. {result}\n".encode()
+                for lane, result in zip(lanes, results)
+                if result["returncode"] != 0 or result["error"]]
+    current = []
     try:
-        left, right = [snapshot(result, source, build, args)
+        if not failures:
+            current = [observe(args, result, source, build)
                        for result, source, build in zip(results, sources, builds)]
-        for name in sorted(left.keys() | right.keys()):
-            differences.append(diff_bytes(left.get(name), right.get(name),
-                                          f"incremental/{name}", f"clean/{name}"))
-        if any(result["error"] for result in results) or (
-            (step == 0 or args.smoke) and left_result["returncode"]
-        ):
-            for lane, result in zip(("incremental", "clean"), results):
-                differences.append(f"{lane}: {result}\n".encode())
-    except (OSError, ValueError, KeyError) as error:
-        differences.append(f"{error}\n".encode())
-    difference = b"".join(differences)
+            left = current[0].outputs
+            for index, lane in enumerate(lanes[1:len(current)], start=1):
+                right = current[index].outputs
+                names = left.keys() | right.keys()
+                if lane == "fresh-clean" and step:
+                    # Cold compiler detection changes the input list and Ninja files.
+                    names -= {"stdout", "stderr", f"{API}/reply/cmakeFiles-v1.json"}
+                    names = {name for name in names if not name.endswith(".ninja")
+                             or name == args.model_dump}
+                failures.extend(diff_bytes(left.get(name), right.get(name),
+                                           f"incremental/{name}", f"{lane}/{name}")
+                                for name in sorted(names))
+            if edit:
+                for before, after in zip(previous, current):
+                    verify_effects(edit, before.outputs, after.outputs)
+            if not args.smoke:
+                verify_replay(row, sources, builds, current, previous, edit)
+    except (OSError, ValueError, KeyError, TypeError, AttributeError) as error:
+        failures.append(f"{error}\n".encode())
+    difference = b"".join(failures)
     row["passed"] = not difference
     if difference:
         repro = args.out_json.with_suffix(".repro.diff")
@@ -276,18 +461,45 @@ def compare(args, report: dict, sources, builds, envs, step: int, edit: Edit | N
                           + edit_diff + b"\n" + difference)
         report["repro_diff"] = str(repro)
         raise ValueError(f"Configure comparison failed at step {step}. See {repro}.")
+    return current
+
+
+def edit_kinds(count: int, rng: random.Random):
+    """Generate complete edit groups up to the requested count."""
+    while count:
+        groups = list(EDIT_GROUPS)
+        rng.shuffle(groups)
+        for group in groups:
+            if len(group) <= count:
+                yield from group
+                count -= len(group)
+
+
+def toggle_definition(edit: Edit) -> Edit:
+    """Change the target definition from one to zero."""
+    effect = edit.effects[0]
+    before = edit.files[edit.leaf][1]
+    after = before.removesuffix(b"=1)\n") + b"=0)\n"
+    return Edit("toggle definition", edit.leaf, {edit.leaf: (before, after)}, (
+        Effect(effect.target, effect.field, effect.value, False),
+        Effect(effect.target, effect.field, effect.value.removesuffix("1") + "0", True),
+    ))
 
 
 def evaluate(args, report: dict, root: Path) -> None:
-    """Copy the project and apply the same sequence of edits to both copies."""
+    """Copy the project and apply the same sequence of edits to each copy."""
+    if not args.smoke and args.edits < CYCLE_SIZE:
+        raise ValueError(f"Gate mode requires at least {CYCLE_SIZE} edits for one complete cycle.")
     original = args.project
-    if args.smoke:
+    if original is None:
         original = root / "fixture"
         for name, contents in FIXTURE.items():
             path = original / name
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(contents, encoding="utf-8")
-    lanes = [root / "incremental", root / "clean"]
+    lanes = [root / "incremental", root / "replay-off"]
+    if args.fresh_clean:
+        lanes.append(root / "fresh-clean")
     sources = [lane / "source" for lane in lanes]
     builds = [lane / "build" for lane in lanes]
     envs = []
@@ -296,53 +508,46 @@ def evaluate(args, report: dict, root: Path) -> None:
                         ignore=shutil.ignore_patterns(".git", "._*"))
         env = clean_environment()
         env.pop("RCMAKE_NO_INCREMENTAL", None)
+        env.pop("RCMAKE_PROBE_CACHE_DIR", None)
         env["RCMAKE_CACHE_DIR"] = str(lane / "cache")
-        env["RCMAKE_PROBE_CACHE_DIR"] = str(lane / "cache")
+        if lane != lanes[0]:
+            env["RCMAKE_NO_INCREMENTAL"] = "1"
         envs.append(env)
-    envs[1]["RCMAKE_NO_INCREMENTAL"] = "1"
-    compare(args, report, sources, builds, envs, 0, None)
-    leaves = discover_leaves(sources[0], builds[0])
-    if not leaves:
-        raise ValueError("The configured project has no editable leaf CMakeLists.txt.")
-    target_leaves = [leaf for leaf in leaves if leaf.targets]
+    previous = compare(args, report, sources, builds, envs, 0, None, [])
     rng = random.Random(args.seed)
     pending = None
-    kinds = []
-    for step in range(1, args.edits + 1):
-        if pending:
+    for step, kind in enumerate(edit_kinds(args.edits, rng), start=1):
+        if pending is not None:
             edit, pending = pending, None
         else:
-            if not kinds:
-                kinds = ["comment", "directory definition"]
-                if target_leaves:
-                    kinds += ["add source", "toggle definition", "target property"]
-                rng.shuffle(kinds)
-            kind = kinds.pop()
-            leaf = rng.choice(leaves if kind in {"comment", "directory definition"} else target_leaves)
+            leaves = discover_leaves(sources[0], builds[0])
+            eligible = [leaf for leaf in leaves if kind == "comment" or leaf.targets]
+            if not eligible:
+                raise ValueError(f"No configured leaf can accept a {kind} edit.")
+            leaf = rng.choice(eligible)
             edit = make_edit(kind, leaf, sources[0], step, rng)
             if kind == "add source":
                 pending = edit.reverse()
-            elif kind == "toggle definition":
-                path = leaf.lists
-                before = edit.files[path][1]
-                marker = f"RCMAKE_M6_{step}=".encode()
-                after = before.removesuffix(marker + b"1)\n") + marker + b"0)\n"
-                pending = Edit(kind, {path: (before, after)})
+            elif kind == "set target definition":
+                pending = toggle_definition(edit)
         for source in sources:
             edit.apply(source)
         if args.fresh_clean:
-            shutil.rmtree(builds[1])
-        compare(args, report, sources, builds, envs, step, edit)
-    if args.smoke and read_optional(builds[0] / "compile_commands.json") is None:
-        raise ValueError("The smoke fixture did not generate a compilation database.")
+            shutil.rmtree(builds[2])
+        previous = compare(args, report, sources, builds, envs, step, edit, previous)
+        report["effective_edits"] += 1
+        if edit.effects:
+            report["semantic_edits"] += 1
+    report["replay_verified"] = not args.smoke
 
 
 def main() -> int:
     """Run the comparison and write JSON and Markdown reports."""
     parser = argparse.ArgumentParser(description=__doc__)
     project = parser.add_mutually_exclusive_group(required=True)
-    project.add_argument("--project", type=Path)
-    project.add_argument("--smoke", action="store_true")
+    project.add_argument("--project", type=Path, help="Verify replay for a project directory.")
+    project.add_argument("--smoke", action="store_true", help="Run smoke checks on the fixture.")
+    project.add_argument("--fixture", action="store_true", help="Verify replay for the fixture.")
     parser.add_argument("--rcmake", required=True)
     parser.add_argument("--edits", type=int, default=20)
     parser.add_argument("--seed", type=int, default=0)
@@ -357,12 +562,18 @@ def main() -> int:
         parser.error("Use different paths for the JSON and Markdown reports.")
     if args.edits < 1 or args.timeout < 1:
         parser.error("Use positive values for --edits and --timeout.")
-    if args.model_dump and (Path(args.model_dump).is_absolute() or ".." in Path(args.model_dump).parts):
-        parser.error("Use a build-relative path for --model-dump.")
-    report = {"gate": "G7", "project": str(args.project) if args.project else "smoke",
+    if args.model_dump is not None:
+        path = Path(args.model_dump)
+        if path.is_absolute() or not path.parts or ".." in path.parts:
+            parser.error("Use a build-relative file path for --model-dump.")
+    project_name = "smoke" if args.smoke else "fixture"
+    if args.project:
+        project_name = str(args.project)
+    report = {"gate": "G7", "project": project_name,
               "rcmake": args.rcmake, "seed": args.seed, "edits": args.edits,
               "mode": "smoke" if args.smoke else "gate", "fresh_clean": args.fresh_clean,
-              "model_dump": args.model_dump, "cmake_args": args.cmake_arg, "steps": []}
+              "model_dump": args.model_dump, "cmake_args": args.cmake_arg, "steps": [],
+              "effective_edits": 0, "semantic_edits": 0, "replay_verified": False}
     try:
         args.rcmake = executable(args.rcmake)
         if args.project:
@@ -377,6 +588,8 @@ def main() -> int:
     report["passed"] = "error" not in report
     write_json(args.out_json, report)
     rows = ["# M6 leaf-edit comparison", "", f"Seed {args.seed}. Mode {report['mode']}.",
+            f"Verified edits {report['effective_edits']} of {args.edits}. "
+            f"Semantic edits {report['semantic_edits']}.",
             "", "| Step | Edit | Result |", "| --- | --- | --- |"]
     rows.extend(f"| {row['step']} | {row['edit']} | {'Pass' if row.get('passed') else 'Fail'} |"
                 for row in report["steps"])

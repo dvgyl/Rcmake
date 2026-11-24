@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: MIT OR Apache-2.0
-"""Run CUDA configuration and host-only build tests without an NVIDIA toolkit.
+"""Run NVIDIA compiler detection and simple host-only CUDA builds on POSIX.
 
 Use --install-mock-toolkit DIRECTORY to create bin/nvcc and the toolkit stubs.
-Set MOCK_NVCC_CXX to select a host compiler and MOCK_NVCC_LOG to record argv.
+The toolkit metadata matches Linux. Set MOCK_NVCC_CXX to select a host
+compiler and MOCK_NVCC_LOG to record build operations as JSON lines.
 """
 
 from dataclasses import dataclass, field
@@ -26,9 +27,12 @@ VALUE_OPTIONS = {
     "-ccbin", "--compiler-bindir", "-Xcompiler", "--compiler-options", "-o", "--output-file",
 }
 IGNORED_VALUES = {
-    "--keep-dir", "-rdc", "--relocatable-device-code", "-cudart", "--cudart",
+    "--keep-dir", "-cudart", "--cudart",
     "-cudadevrt", "--cudadevrt", "-Xnvlink", "--nvlink-options",
 }
+RELOCATABLE_OPTIONS = {"-rdc", "--relocatable-device-code"}
+DEVICE_ARCH = r"(?:compute|sm)_[1-9][0-9]+[af]?"
+CODE_ARCH = rf"(?:{DEVICE_ARCH}|lto_[1-9][0-9]+[af]?)"
 IGNORED_FLAGS = {
     "--keep", "-keep", "-forward-unknown-to-host-compiler", "--forward-unknown-to-host-compiler",
     "--expt-relaxed-constexpr", "--extended-lambda", "--expt-extended-lambda",
@@ -79,11 +83,26 @@ class Invocation:
     host_args: list[str] = field(default_factory=list)
     host_flags: list[str] = field(default_factory=list)
     architectures: list[str] = field(default_factory=list)
+    inputs: list[Path] = field(default_factory=list)
     sources: list[Path] = field(default_factory=list)
     compiler: str = ""
     output: Path | None = None
     mode: str = "host"
     verbose: bool = False
+    compile_only: bool = False
+    relocatable: bool = False
+
+
+def architecture(option: str, value: str) -> str:
+    if option in {"-gencode", "--generate-code"}:
+        match = re.fullmatch(rf"arch=(compute_[1-9][0-9]+[af]?),code=({CODE_ARCH}|\[{CODE_ARCH}(?:,{CODE_ARCH})*\])", value)
+    elif option in {"-arch", "--gpu-architecture"}:
+        match = re.fullmatch(rf"{DEVICE_ARCH}|all|all-major|native", value)
+    else:
+        match = re.fullmatch(rf"{CODE_ARCH}(?:,{CODE_ARCH})*", value)
+    if not match:
+        raise ValueError(f"Invalid CUDA architecture option {option}={value}.")
+    return f"{option}={value}"
 
 
 def parse(argv: list[str]) -> Invocation:
@@ -93,11 +112,15 @@ def parse(argv: list[str]) -> Invocation:
     host_cuda_language = False
     for argument in arguments:
         option, equals, value = argument.partition("=")
-        if option in ARCH_OPTIONS | VALUE_OPTIONS | IGNORED_VALUES | HOST_VALUE_OPTIONS:
+        if option in ARCH_OPTIONS | VALUE_OPTIONS | IGNORED_VALUES | HOST_VALUE_OPTIONS | RELOCATABLE_OPTIONS:
             if not equals and (value := next(arguments, None)) is None:
                 raise ValueError(f"Missing value for {option}.")
             if option in ARCH_OPTIONS:
-                result.architectures.append(value)
+                result.architectures.append(architecture(option, value))
+            elif option in RELOCATABLE_OPTIONS:
+                if value not in {"true", "false"}:
+                    raise ValueError(f"Use true or false for {option}.")
+                result.relocatable = value == "true"
             elif option in {"-ccbin", "--compiler-bindir"}:
                 result.compiler = value
             elif option in {"-Xcompiler", "--compiler-options"}:
@@ -117,8 +140,11 @@ def parse(argv: list[str]) -> Invocation:
             result.mode = "device-link"
         elif option in ARTIFACT_MODES:
             result.mode = ARTIFACT_MODES[option]
-        elif option in {"-dc", "--device-c", "--compile", "-dw", "--device-w"}:
+        elif option in {"-c", "-dc", "--device-c", "--compile", "-dw", "--device-w"}:
             result.host_args.append("-c")
+            result.compile_only = True
+            if option in {"-dc", "--device-c"}:
+                result.relocatable = True
         elif option in {"-x", "--x"}:
             language = value if equals else next(arguments, "")
             cuda_language = language in {"cu", "cuda"}
@@ -132,6 +158,7 @@ def parse(argv: list[str]) -> Invocation:
         elif argument.startswith("-"):
             result.host_args.append(argument)
         else:
+            result.inputs.append(Path(argument))
             is_cuda = cuda_language or argument.endswith(".cu")
             if is_cuda != host_cuda_language:
                 result.host_args.extend(["-x", "c++" if is_cuda else "none"])
@@ -176,11 +203,7 @@ def install(root: Path, version: tuple[str, str, str]) -> None:
     nvcc = root / "bin" / "nvcc"
     shutil.copyfile(Path(__file__).resolve(), nvcc)
     nvcc.chmod(0o755)
-    for tool in ("nvlink", "fatbinary"):
-        link = nvcc.parent / tool
-        if link.exists() or link.is_symlink():
-            link.unlink()
-        link.symlink_to("nvcc")
+    (root / "mock" / "host-link").symlink_to("../bin/nvcc")
     (root / "bin/crt/link.stub").touch()
     (root / "include/cuda_runtime.h").write_text(RUNTIME_HEADER, encoding="utf-8")
     (root / "include/cuda.h").write_text(
@@ -234,13 +257,53 @@ def print_verbose(root: Path, compiler: str, options: Invocation) -> None:
     print("#$ " + shlex.join([compiler, "-o", str(output), *objects, *libraries]), file=sys.stderr)
 
 
+def record(argv: list[str], options: Invocation, phase: str, exit_code: int) -> int:
+    if log := os.environ.get("MOCK_NVCC_LOG"):
+        entry = {
+            "phase": phase,
+            "argv": argv,
+            "inputs": [str(path.resolve()) for path in options.inputs],
+            "output": str(options.output.resolve()) if options.output else None,
+            "architectures": options.architectures,
+            "relocatable": options.relocatable,
+            "exit_code": exit_code,
+        }
+        with open(log, "a", encoding="utf-8") as stream:
+            stream.write(json.dumps(entry) + "\n")
+    return exit_code
+
+
+def host_link(argv: list[str]) -> int:
+    if not argv:
+        raise ValueError("Pass a link command to the mock launcher.")
+    options = parse(argv[1:])
+    exit_code = subprocess.run(argv, timeout=TIMEOUT).returncode
+    if options.mode == "device-link":
+        return exit_code
+    return record(argv, options, "host-link", exit_code)
+
+
+def device_link(argv: list[str], options: Invocation, compiler: str) -> int:
+    if not options.inputs:
+        raise ValueError("Pass at least one object file or archive to the device linker.")
+    for path in options.inputs:
+        if path.suffix not in {".o", ".obj", ".a", ".lib"} or not path.is_file() or not path.stat().st_size:
+            raise ValueError(f"Invalid device-link input {path}.")
+    options.output = options.output or Path("a_dlink.o")
+    command = [compiler, *options.host_flags, "-fPIC", "-x", "c++", "-c", "-", "-o", str(options.output)]
+    source = b'extern "C" int rcmake_mock_device_link() { return 42; }\n'
+    exit_code = subprocess.run(command, input=source, timeout=TIMEOUT).returncode
+    return record(argv, options, "device-link", exit_code)
+
+
 def run(argv: list[str]) -> int:
     if argv == ["--help"]:
         print(__doc__)
         return 0
-    if log := os.environ.get("MOCK_NVCC_LOG"):
-        with open(log, "a", encoding="utf-8") as stream:
-            stream.write(json.dumps(argv) + "\n")
+    if os.name != "posix":
+        raise ValueError("The mock toolkit requires POSIX host tools.")
+    if Path(sys.argv[0]).name == "host-link":
+        return host_link(argv)
     version = version_parts()
     if argv[:1] == ["--install-mock-toolkit"]:
         if len(argv) != 2:
@@ -263,7 +326,8 @@ def run(argv: list[str]) -> int:
             raise ValueError("Specify a source or an output for the mock device artifact.")
         architectures = options.architectures or ["compute_52"]
         output.write_text(f"{options.mode}\n" + "\n".join(architectures) + "\n", encoding="utf-8")
-        return 0
+        options.output = output
+        return record(argv, options, options.mode, 0)
 
     compiler = host_compiler(options.compiler)
     if options.verbose:
@@ -271,9 +335,7 @@ def run(argv: list[str]) -> int:
     if "__cmake_determine_cuda" in argv or argv == ["-v"]:
         return 0
     if options.mode == "device-link":
-        output = options.output or Path("a_dlink.o")
-        command = [compiler, *options.host_flags, "-fPIC", "-x", "c++", "-c", "-", "-o", str(output)]
-        return subprocess.run(command, input=b"", timeout=TIMEOUT).returncode
+        return device_link(argv, options, compiler)
 
     command = [compiler]
     if options.sources:
@@ -281,7 +343,8 @@ def run(argv: list[str]) -> int:
                         "-D__NVCC__", "-D__CUDACC__"])
         for component, value in zip(("MAJOR", "MINOR", "BUILD"), version):
             command.append(f"-D__CUDACC_VER_{component}__={value}")
-    return subprocess.run([*command, *options.host_args], timeout=TIMEOUT).returncode
+    exit_code = subprocess.run([*command, *options.host_args], timeout=TIMEOUT).returncode
+    return record(argv, options, "compile" if options.compile_only else "link", exit_code)
 
 
 if __name__ == "__main__":

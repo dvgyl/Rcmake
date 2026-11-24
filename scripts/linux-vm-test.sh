@@ -172,6 +172,126 @@ PY
   done
 )
 
+linux_integration() (
+  local bin="$1"
+  work="$(mktemp -d)"
+  trap 'rm -rf "$work"' EXIT
+  cd "$work"
+
+  printf 'int leaf(void) { return 42; }\n' > leaf.c
+  printf 'extern int leaf(void); int parent(void) { return leaf(); }\n' > parent.c
+  printf 'extern int parent(void); int main(void) { return parent() != 42; }\n' > main.c
+  gcc -shared -fPIC leaf.c -Wl,-soname,librcmake_leaf.so -o librcmake_leaf.so
+  gcc -shared -fPIC parent.c -Wl,-soname,librcmake_parent.so -Wl,-rpath,'$ORIGIN' \
+    -L. -lrcmake_leaf -o librcmake_parent.so
+  gcc main.c -Wl,-rpath,'$ORIGIN' -Wl,-rpath-link,. -L. -lrcmake_parent -o probe
+  ./probe
+  cat > dependencies.cmake <<'CMAKE'
+cmake_minimum_required(VERSION 4.5)
+file(GET_RUNTIME_DEPENDENCIES
+  EXECUTABLES "${CMAKE_CURRENT_LIST_DIR}/probe"
+  PRE_INCLUDE_REGEXES "^librcmake_(parent|leaf)[.]so$"
+  PRE_EXCLUDE_REGEXES ".*"
+  RESOLVED_DEPENDENCIES_VAR resolved
+  UNRESOLVED_DEPENDENCIES_VAR unresolved)
+if(unresolved)
+  message(FATAL_ERROR "Unresolved ELF dependencies: ${unresolved}")
+endif()
+file(WRITE "${CMAKE_CURRENT_LIST_DIR}/resolved.txt" "${resolved}")
+CMAKE
+  "$bin/cmake" -P dependencies.cmake
+  LC_ALL=C python3 - <<'PY'
+from pathlib import Path
+import re
+import subprocess
+import sys
+
+def fixture_dependencies(binary):
+    dynamic = subprocess.check_output(["readelf", "-d", binary], text=True, timeout=10)
+    return set(re.findall(r"\(NEEDED\).*\[(librcmake_[^\]]+\.so)\]", dynamic))
+
+direct = fixture_dependencies("probe")
+transitive = fixture_dependencies("librcmake_parent.so")
+if direct != {"librcmake_parent.so"} or transitive != {"librcmake_leaf.so"}:
+    sys.exit(f"Unexpected ELF fixture dependencies. Found {direct} and {transitive}.")
+expected = sorted(Path(name).resolve() for name in direct | transitive)
+resolved = Path("resolved.txt").read_text().split(";")
+if sorted(Path(name).resolve(strict=True) for name in resolved if name) != expected:
+    sys.exit(f"ELF dependency paths differ from readelf. Found {resolved}. Expected {expected}.")
+PY
+
+  if command -v gfortran >/dev/null 2>&1; then
+    mkdir fortran
+    cat > fortran/CMakeLists.txt <<'CMAKE'
+cmake_minimum_required(VERSION 4.5)
+project(FortranModules LANGUAGES Fortran)
+add_executable(probe main.f90 number.f90)
+CMAKE
+    cat > fortran/main.f90 <<'FORTRAN'
+program main
+use number
+if (value /= 42) stop 1
+end program
+FORTRAN
+    cat > fortran/number.f90 <<'FORTRAN'
+module number
+integer, parameter :: value = 42
+end module
+FORTRAN
+    "$bin/cmake" -S fortran -B fortran-build -G Ninja -DCMAKE_Fortran_COMPILER=gfortran
+    "$bin/cmake" --build fortran-build --parallel 2
+    test -n "$(find fortran-build -type f -iname number.mod -print -quit)"
+    ./fortran-build/probe
+  else
+    printf 'Skip the Fortran check because gfortran is unavailable.\n'
+  fi
+)
+
+linux_runcmake() (
+  local bin="$1" status=0
+  local -a suites=(RuntimePath file-RPATH file-GET_RUNTIME_DEPENDENCIES Ninja Make try_compile install)
+  local -a args=()
+  local suite
+  output="$(mktemp)"
+  trap 'rm -f "$output"' EXIT
+  for suite in "${suites[@]}"; do
+    args+=(--suite "$suite")
+  done
+  timeout --kill-after=15s 40m python3 "$root/tools/measure/runcmake_eval.py" --profile linux --stage "$bin" \
+    "${args[@]}" --timeout 300 --json "$output" || status=$?
+  if [[ ! -s "$output" ]]; then
+    printf 'RunCMake did not write a report. Exit status %s.\n' "$status" >&2
+    exit 1
+  fi
+  python3 - "$output" "${suites[@]}" <<'PY' || exit 1
+import json
+from pathlib import Path
+import sys
+
+report, *expected = sys.argv[1:]
+suites = json.loads(Path(report).read_text())["suites"]
+for name in expected:
+    suite = suites[name]
+    problems = [case for case in suite.get("cases", ()) if case["status"] != "passed"]
+    for case in problems[:5]:
+        print(f"{name} / {case['name']}. Result {case['status']}.", file=sys.stderr)
+    if len(problems) > 5:
+        print(f"{name} has {len(problems)} cases that did not pass.", file=sys.stderr)
+    if suite["total"] < 1 or suite["passed"] < 1:
+        sys.exit(f"{name} did not report any passing cases.")
+    if name == "install":
+        variants = {"install-Files", "install-Targets", "install-Exports"}
+        for lane in ("oracle", "rcmake"):
+            if set(suite[f"{lane}_driver"]["variants"]) != variants:
+                sys.exit(f"{lane} did not run all three install variants.")
+        for variant in variants:
+            if not any(case["name"].startswith(variant + ": ") and case["status"] == "passed"
+                       for case in suite["cases"]):
+                sys.exit(f"{variant} did not report any passing cases.")
+PY
+  exit "$status"
+)
+
 case "$(uname -s)" in
   Linux) platform=Linux ;;
   Darwin) platform=Darwin ;;
@@ -180,8 +300,9 @@ case "$(uname -s)" in
 esac
 case "${1:-}" in
   -h|--help)
-    printf 'Usage: %s [--smoke-only <staged-bin-dir>]\n' "$0"
-    printf 'Run the full test on Ubuntu 24.04, or test a staged binary on any CI host.\n'
+    printf 'Usage: %s [--smoke-only <staged-bin-dir> | --extended-only <staged-bin-dir>]\n' "$0"
+    printf 'Run the full test on Ubuntu 24.04. Use --smoke-only on Linux, macOS, or Windows.\n'
+    printf 'Use --extended-only on Linux with a staged binary and a configured oracle.\n'
     exit 0
     ;;
   --smoke-only)
@@ -191,6 +312,18 @@ case "${1:-}" in
     fi
     smoke "$2" "$platform"
     exit
+    ;;
+  --extended-only)
+    if [[ $# != 2 || "$platform" != Linux ]]; then
+      printf 'Use --extended-only with a staged bin directory on Linux.\n' >&2
+      exit 2
+    fi
+    bin="$(cd "$2" && pwd -P)"
+    status=0
+    export -f linux_integration
+    timeout --kill-after=10s 5m bash -euo pipefail -c 'linux_integration "$1"' _ "$bin" || status=1
+    linux_runcmake "$bin" || status=1
+    exit "$status"
     ;;
 esac
 if [[ $# != 0 || "$platform" != Linux ]]; then
@@ -204,13 +337,19 @@ original_path="$PATH"
 source "$root/env/env.sh"
 export PATH="$HOME/.cargo/bin:$original_path"
 export CARGO_TARGET_DIR="$root/target"
+export CARGO_BUILD_JOBS=2 RUST_TEST_THREADS=3
 
-for tool in gcc g++ clang clang++ ninja make patchelf readelf python3 curl git; do
+if [[ "$( . /etc/os-release && printf '%s:%s' "$ID" "$VERSION_ID" )" != ubuntu:24.04 ]]; then
+  printf 'The full test requires Ubuntu 24.04.\n' >&2
+  exit 2
+fi
+
+for tool in gcc g++ clang clang++ gfortran ninja make patchelf readelf python3 curl git; do
   if ! command -v "$tool" >/dev/null 2>&1; then
     apt=(apt-get)
     if [[ "$EUID" != 0 ]]; then apt=(sudo apt-get); fi
     "${apt[@]}" update
-    "${apt[@]}" install -y gcc g++ clang ninja-build make patchelf binutils python3 curl git ca-certificates
+    "${apt[@]}" install -y gcc g++ clang gfortran ninja-build make patchelf binutils python3 curl git ca-certificates
     break
   fi
 done
@@ -235,51 +374,13 @@ run_gate() {
   failed=1
 }
 
-run_gate timeout --kill-after=30s 45m cargo test --workspace
+run_gate timeout --kill-after=30s 45m cargo test --locked --workspace
 timeout --kill-after=30s 30m scripts/stage.sh
 timeout --kill-after=30s 30m cargo build --locked --bin rcmake-harness
-run_gate timeout --kill-after=30s 15m "$0" --smoke-only "$root/target/stage/bin"
+run_gate timeout --kill-after=30s 15m "$root/scripts/linux-vm-test.sh" --smoke-only "$root/target/stage/bin"
 run_gate timeout --kill-after=30s 15m "$CARGO_TARGET_DIR/debug/rcmake-harness" --suite all
 
-timeout --kill-after=10s 120s gcc "$RCMAKE_ORACLE_RUNCMAKE_DIR/detect_jobserver.c" -o "$work/detect_jobserver"
-run_runcmake() {
-  python3 - "$work/detect_jobserver" "$@" <<'PY'
-import platform
-import shutil
-import sys
-
-sys.path.insert(0, "tools/measure")
-import runcmake_eval
-
-detect_jobserver, install_variant = sys.argv[1:3]
-del sys.argv[1:3]
-run_suite = runcmake_eval.run_suite
-
-# The standalone evaluator lacks the settings that upstream CTest supplies for these suites.
-def run_linux_suite(driver, target, source, build, wrapper, settings, env, timeout):
-    settings = {**settings, "CMAKE_EXECUTABLE_FORMAT": "ELF",
-                "CMAKE_SHARED_LIBRARY_RUNTIME_C_FLAG": "-Wl,-rpath,"}
-    if source.name == "Make":
-        settings.update(RunCMake_GENERATOR="Unix Makefiles", RunCMake_MAKE_PROGRAM=shutil.which("make"),
-                        MAKE_IS_GNU=1, DETECT_JOBSERVER=detect_jobserver)
-    if source.name == "install":
-        settings.update(CMake_TEST_install_VARIANT=install_variant, NO_NAMELINK=0,
-                        CMAKE_SYSTEM_PROCESSOR=platform.machine(), CMAKE_SHARED_LIBRARY_RPATH_ORIGIN_TOKEN="$ORIGIN")
-    return run_suite(driver, target, source, build, wrapper, settings, env, timeout)
-
-runcmake_eval.run_suite = run_linux_suite
-sys.exit(runcmake_eval.main())
-PY
-}
-
-if ! run_runcmake "" --suite RuntimePath --suite file-RPATH --suite Ninja --suite Make --suite try_compile --timeout 300; then
-  failed=1
-fi
-for variant in Files Targets Exports; do
-  if ! run_runcmake "$variant" --suite install --timeout 300; then
-    failed=1
-  fi
-done
+run_gate timeout --kill-after=30s 45m "$root/scripts/linux-vm-test.sh" --extended-only "$root/target/stage/bin"
 
 for project in zlib cJSON pugixml lz4; do
   run_gate python3 tools/measure/corpus_eval.py --project "$project" --generator Ninja --timeout 300
