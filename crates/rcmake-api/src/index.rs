@@ -1,8 +1,13 @@
-use std::collections::{BTreeMap, BTreeSet};
+mod site;
 
-use rcmake_base::{BString, fold_command_name, path_lex::Lexical};
-use rcmake_diag::Backtrace;
-use rcmake_eval::{UserCommandKind, VarOp};
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
+
+pub use site::{ExecutedSite, ExecutedSites, ExecutedSymbol, SourceRange};
+
+use rcmake_base::{BString, fold_command_name};
+use rcmake_diag::{Backtrace, SourceFile, SourceId, SourceMap};
+use rcmake_eval::UserCommandKind;
 use rcmake_model::{
     DirId, ProjectModel, PropScope, TargetBinding, TargetId, TargetKind, UsageField,
 };
@@ -19,6 +24,10 @@ pub struct SourceLocation {
     pub line: u32,
     /// Zero-based byte offset in the file, when recorded.
     pub byte_offset: Option<u32>,
+    /// Identity of the exact evaluated buffer, when known.
+    pub source_id: Option<SourceId>,
+    /// Full range of the symbol or command, when recorded.
+    pub range: Option<SourceRange>,
 }
 
 impl SourceLocation {
@@ -30,7 +39,35 @@ impl SourceLocation {
             path: frame.file.as_ref().into(),
             line: frame.line,
             byte_offset: None,
+            source_id: None,
+            range: None,
         })
+    }
+
+    fn matches(&self, query: &Self) -> bool {
+        self.matches_range(query, None)
+    }
+
+    fn matches_range(&self, query: &Self, argument: Option<SourceRange>) -> bool {
+        if self
+            .source_id
+            .zip(query.source_id)
+            .is_some_and(|(a, b)| a != b)
+        {
+            return false;
+        }
+        let offset = query.byte_offset.or(query.range.map(|range| range.start));
+        if let Some(offset) = offset {
+            if [self.range, argument]
+                .into_iter()
+                .flatten()
+                .any(|range| range.start <= offset && offset < range.end)
+            {
+                return true;
+            }
+            return self.byte_offset == Some(offset);
+        }
+        self.line == query.line
     }
 }
 
@@ -112,6 +149,8 @@ pub struct FileEdge {
     pub dir: DirId,
     /// Source location of the command.
     pub site: SourceLocation,
+    /// Argument range, when the evaluator recorded the original syntax.
+    pub argument_range: Option<SourceRange>,
     /// Exact path selected by evaluation.
     pub destination: BString,
 }
@@ -136,8 +175,6 @@ pub struct Completion<'a> {
     pub kind: CompletionKind,
 }
 
-type FileLine = (BString, u32);
-
 /// Immutable workspace facts for evaluated editor queries.
 ///
 /// Directory IDs distinguish repeated evaluations of the same source file in
@@ -152,7 +189,10 @@ pub struct WorkspaceIndex {
     callables: BTreeMap<BString, CallableDefinition>,
     variables: BTreeMap<DirId, BTreeMap<BString, VariableDefinition>>,
     cache: BTreeMap<BString, VariableDefinition>,
-    files: BTreeMap<DirId, BTreeMap<FileLine, Vec<FileEdge>>>,
+    files: BTreeMap<BString, Vec<FileEdge>>,
+    executed_sites: Arc<ExecutedSites>,
+    source_map: Option<Arc<SourceMap>>,
+    provisional: bool,
     file_scopes: BTreeMap<BString, Vec<DirId>>,
 }
 
@@ -168,7 +208,12 @@ impl WorkspaceIndex {
         facts: &EvaluationFacts,
         provisional: bool,
     ) -> Self {
-        let mut index = Self::default();
+        let mut index = Self {
+            executed_sites: Arc::clone(&facts.executed_sites),
+            source_map: facts.source_map.clone(),
+            provisional,
+            ..Self::default()
+        };
         for (id, target) in model.targets() {
             let declared_links = target
                 .usage
@@ -190,7 +235,11 @@ impl WorkspaceIndex {
                     name: target.name.clone(),
                     id,
                     kind: target.kind,
-                    location: SourceLocation::from_backtrace(&target.backtrace),
+                    location: facts
+                        .target_sites
+                        .get(&id)
+                        .cloned()
+                        .or_else(|| SourceLocation::from_backtrace(&target.backtrace)),
                     alias_of: None,
                     declared_links,
                     link_dependencies: Vec::new(),
@@ -200,9 +249,6 @@ impl WorkspaceIndex {
                     },
                 },
             );
-            if target.is_global() {
-                index.global_targets.insert(target.name.clone(), id);
-            }
         }
         let mut dependencies = BTreeMap::<TargetId, BTreeSet<TargetId>>::new();
         for entry in &facts.resolved_entries {
@@ -233,19 +279,25 @@ impl WorkspaceIndex {
         }
         let mut alias_sites = BTreeMap::new();
         for alias in &facts.aliases {
-            if let Some(TargetBinding::Alias(id)) = model.lookup_target(alias.dir, &alias.name)
-                && let Some(target) = index.targets.get(&id)
-            {
-                if alias.global {
-                    index.aliases.entry(None).or_default().insert(
-                        alias.name.clone(),
-                        alias_definition(target, &alias.name, Some(alias.location.clone())),
-                    );
-                } else {
-                    alias_sites
-                        .entry(alias.dir)
-                        .or_insert_with(BTreeMap::new)
-                        .insert(alias.name.as_slice(), &alias.location);
+            alias_sites.insert(
+                ((!alias.global).then_some(alias.dir), &alias.name),
+                &alias.location,
+            );
+        }
+        for (name, binding) in model.global_target_bindings() {
+            match binding {
+                TargetBinding::Target(id) => {
+                    index.global_targets.insert(name.clone(), id);
+                }
+                TargetBinding::Alias(id) => {
+                    if let Some(target) = index.targets.get(&id) {
+                        let location = alias_sites.get(&(None, name)).copied().cloned();
+                        index
+                            .aliases
+                            .entry(None)
+                            .or_default()
+                            .insert(name.clone(), alias_definition(target, name, location));
+                    }
                 }
             }
         }
@@ -255,18 +307,11 @@ impl WorkspaceIndex {
                 .insert(fold_command_name(&callable.name), callable.clone());
         }
         for (name, entry) in model.cache().iter() {
-            let location = facts.cache_sites.get(name).cloned().or_else(|| {
-                let ledger = variables.filter(|ledger| !ledger.is_incomplete())?;
-                let event = ledger
-                    .history(name)
-                    .rfind(|event| matches!(event.op, VarOp::CacheSet | VarOp::CacheUnset))?;
-                (event.op == VarOp::CacheSet
-                    && event.value_preview.as_ref().is_some_and(|value| {
-                        value.len == value.prefix.len() && value.prefix == entry.value
-                    }))
-                .then(|| SourceLocation::from_backtrace(&event.backtrace))
-                .flatten()
-            });
+            let location = facts
+                .cache_sites
+                .get(name)
+                .cloned()
+                .or_else(|| crate::result::infer_cache_location(variables, name, &entry.value));
             index.cache.insert(
                 name.clone(),
                 VariableDefinition {
@@ -291,11 +336,11 @@ impl WorkspaceIndex {
                     && let Some(target) = index.targets.get(id)
                 {
                     let location = model.ancestors(dir).find_map(|owner| {
-                        alias_sites
-                            .get(&owner)?
-                            .get(name.as_slice())
-                            .copied()
-                            .cloned()
+                        if model.dir(owner).local_targets.get(name) == Some(binding) {
+                            alias_sites.get(&(Some(owner), name)).copied().cloned()
+                        } else {
+                            None
+                        }
                     });
                     index
                         .aliases
@@ -335,46 +380,57 @@ impl WorkspaceIndex {
             }
         }
         for edge in &facts.file_edges {
-            index.add_edge(edge.clone());
-        }
-        for (_, directory) in model.dirs() {
-            if let (Some(dir), Some(site)) = (
-                directory.parent,
-                SourceLocation::from_backtrace(&directory.backtrace),
-            ) {
-                let destination = Lexical::new(&directory.source_dir).append(b"CMakeLists.txt");
-                let edge = FileEdge {
-                    kind: FileEdgeKind::AddSubdirectory,
-                    dir,
-                    site,
-                    destination,
-                };
-                if !index.resolve_include(dir, &edge.site).any(|existing| {
-                    existing.kind == edge.kind && existing.destination == edge.destination
-                }) {
-                    index.add_edge(edge);
+            if index.local_targets.contains_key(&edge.dir) {
+                index
+                    .files
+                    .entry(edge.site.path.clone())
+                    .or_default()
+                    .push(edge.clone());
+                let scopes = index.file_scopes.entry(edge.site.path.clone()).or_default();
+                if let Err(index) = scopes.binary_search(&edge.dir) {
+                    scopes.insert(index, edge.dir);
                 }
             }
         }
         index
     }
 
-    fn add_edge(&mut self, edge: FileEdge) {
-        let by_line = self.files.entry(edge.dir).or_default();
-        by_line
-            .entry((edge.site.path.clone(), edge.site.line))
-            .or_default()
-            .push(edge);
+    /// Return whether the index came from a partial configure.
+    #[must_use]
+    pub fn is_provisional(&self) -> bool {
+        self.provisional
+    }
+
+    /// Return whether the executed-site limit caused records to be discarded.
+    #[must_use]
+    pub fn executed_sites_truncated(&self) -> bool {
+        self.executed_sites.is_truncated()
+    }
+
+    /// Get the buffer used for the specified source ID.
+    ///
+    /// File buffers may use normalized line endings. Map positions to the
+    /// editor's document only after checking its version and line endings.
+    #[must_use]
+    pub fn source(&self, id: SourceId) -> Option<&SourceFile> {
+        self.source_map.as_ref()?.get(id)
+    }
+
+    /// Find bindings observed at the site during evaluation, in execution order.
+    ///
+    /// Pass no directory to match all evaluations of the file.
+    pub fn executed_at(
+        &self,
+        dir: Option<DirId>,
+        site: &SourceLocation,
+    ) -> impl Iterator<Item = &ExecutedSite> {
+        self.executed_sites.matching(dir, site)
     }
 
     /// Find a target or alias visible in `dir`.
     #[must_use]
     pub fn lookup_target(&self, dir: DirId, name: &[u8]) -> Option<&TargetDefinition> {
-        if let Some(binding) = self
-            .local_targets
-            .get(&dir)
-            .and_then(|names| names.get(name))
-        {
+        if let Some(binding) = self.local_targets.get(&dir)?.get(name) {
             match binding {
                 TargetBinding::Alias(_) => return self.aliases.get(&Some(dir))?.get(name),
                 TargetBinding::Target(id) => return self.targets.get(id),
@@ -396,30 +452,40 @@ impl WorkspaceIndex {
     #[must_use]
     pub fn lookup_variable(&self, dir: DirId, name: &[u8]) -> Option<&VariableDefinition> {
         self.variables
-            .get(&dir)
-            .and_then(|values| values.get(name))
+            .get(&dir)?
+            .get(name)
             .or_else(|| self.cache.get(name))
     }
 
     /// Iterate over the destinations read at a command site, in evaluation order.
     ///
-    /// A query with a byte offset matches the same offset. If the recorded site
-    /// has only a line number, the line is the available match.
-    pub fn resolve_include<'a>(
-        &'a self,
+    /// A query with a byte offset matches a recorded offset or range. A query
+    /// with only a line number can return several calls on that line.
+    pub fn resolve_include(
+        &self,
         dir: DirId,
         site: &SourceLocation,
-    ) -> impl Iterator<Item = &'a FileEdge> + 'a {
-        let offset = site.byte_offset;
-        self.files
-            .get(&dir)
-            .and_then(|lines| lines.get(&(site.path.clone(), site.line)))
-            .into_iter()
-            .flatten()
-            .filter(move |edge| match (offset, edge.site.byte_offset) {
-                (Some(query), Some(recorded)) => query == recorded,
-                _ => true,
-            })
+    ) -> impl Iterator<Item = &FileEdge> {
+        self.resolve_file_edges(Some(dir), site)
+    }
+
+    /// Find the files read at this site, in evaluation order.
+    ///
+    /// Pass no directory to see results from all directory scopes. A range can
+    /// match a cursor inside the command or its argument. Only successful
+    /// evaluated reads appear here. A caller can use lexical fallback on a miss.
+    pub fn resolve_file_edges(
+        &self,
+        dir: Option<DirId>,
+        site: &SourceLocation,
+    ) -> impl Iterator<Item = &FileEdge> {
+        let query = site.clone();
+        let edges = self.files.get(&query.path).into_iter().flatten();
+        let at_site = move |edge: &&FileEdge| {
+            dir.is_none_or(|dir| dir == edge.dir)
+                && edge.site.matches_range(&query, edge.argument_range)
+        };
+        edges.filter(at_site)
     }
 
     /// Get directories that evaluated this listfile, in model order.
@@ -433,17 +499,15 @@ impl WorkspaceIndex {
     /// Callable names use ASCII case folding. Target and variable names are case-sensitive.
     #[must_use]
     pub fn completions_for_scope(&self, dir: DirId, prefix: &[u8]) -> Vec<Completion<'_>> {
+        let Some(local) = self.local_targets.get(&dir) else {
+            return Vec::new();
+        };
         let mut matches = BTreeMap::new();
         for name in self
             .global_targets
             .keys()
             .chain(self.aliases.get(&None).into_iter().flat_map(BTreeMap::keys))
-            .chain(
-                self.local_targets
-                    .get(&dir)
-                    .into_iter()
-                    .flat_map(BTreeMap::keys),
-            )
+            .chain(local.keys())
             .filter(|name| name.starts_with(prefix))
         {
             matches.insert((name, CompletionKind::Target), name);

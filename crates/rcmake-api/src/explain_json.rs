@@ -6,6 +6,7 @@ use rcmake_eval::ValuePreview;
 use rcmake_json::{Value, write_compact};
 use rcmake_model::BT;
 
+use crate::explain_entries::link_role;
 use crate::explain_render::{chain_kind, prop_op, usage_scope, var_op};
 use crate::{
     ExplainConfig, ExplainReport, ExplainTarget, ExplainVariable, PreviousValue, SourceLocation,
@@ -22,23 +23,83 @@ pub fn render_explain_json(report: &ExplainReport, config: Option<&[u8]>) -> BSt
 
 /// Convert a report to a JSON value for command-line and editor clients.
 ///
-/// The top-level object has `schema`, `kind`, `name`, and `details` fields.
-/// Configuration filtering affects only target configuration records. A byte
-/// string with invalid UTF-8 is an object with a lowercase `bytes_hex` string.
-/// A JSON null records an unavailable optional field.
+/// # Schema
+///
+/// The top-level object contains `schema`, `kind`, `name`, and `details`.
+/// The value of `kind` selects the fields in `details`.
+///
+/// - `target` contains `target`, `target_kind`, `definition`,
+///   `alias_definition`, `sources`, `filter`, `configuration_selection`,
+///   `configurations`, `properties`, `property_history_incomplete`, and
+///   `provisional`. Configuration selection contains `requested`, `available`,
+///   and `status`. Status is `all`, `no_resolved_configurations`, `matched`, or
+///   `unavailable`. An empty configuration name is the default configuration.
+///   Each selected configuration has `name`, `sources`, `compile_groups`,
+///   and `entries`. Entry positions index the compile groups and preserve
+///   the order within each group. A chain is an ordered array of link hops.
+///   An empty chain is direct. A null chain means provenance is unavailable.
+///   A property record lists the configurations that use the contributor.
+///   Its writes apply across configurations. Each write includes an old and
+///   new value preview when a value exists. The property record also has
+///   `dropped_writes`, which counts discarded events for that property.
+/// - `variable` contains `value`, `location`, `binding`, `directory`, `cache`,
+///   `writes`, `history`, `session_history_truncated`, and `provisional`.
+///   History is `unavailable`, `excluded`, `complete`, `truncated`, or
+///   `unknown`. Complete history can have zero writes. A write's `previous`
+///   field has a `state` of `unknown`, `unset`, or `value`. The value state
+///   includes `preview`. A preview contains `prefix`, `byte_length`,
+///   `truncated`, and a fixed-width lowercase hexadecimal 64-bit FNV-1a
+///   hash of the full value. A null write value indicates removal.
+/// - `ambiguous` contains `kinds`, with values `target` and `variable`.
+/// - `not_found` contains ordered `suggestions`. Each has `name` and `kind`.
+/// - `invalid_directory` contains the invalid `directory_id`.
+///
+/// Event `sequence` and variable `scope_id` values are unsigned 64-bit
+/// integers encoded as decimal
+/// strings. Parse them as `u64` or JavaScript `BigInt`. Source IDs, directory
+/// IDs, line numbers, and offsets are JSON numbers. Lines are one-based with
+/// zero for an unknown line. Byte ranges use zero-based, half-open offsets.
+/// Trace arrays list the innermost frame first. Each frame has `path`, `line`,
+/// `command`, and `kind`.
+///
+/// Byte strings are JSON strings when valid UTF-8. Other byte strings are
+/// objects with a lowercase `bytes_hex` field. The encoder preserves the
+/// input bytes. A Host path conversion can be lossy outside Unix.
+/// Null represents an unavailable optional field unless stated above. Empty
+/// arrays represent zero retained records.
+///
+/// Readers should accept additional fields. Changes to existing field types
+/// or meanings require a new schema identifier.
 #[must_use]
 pub fn explain_json(report: &ExplainReport, config: Option<&[u8]>) -> Value {
     let (kind, name, details) = match report {
         ExplainReport::Target(target) => ("target", &target.name, target_json(target, config)),
         ExplainReport::Variable(variable) => ("variable", &variable.name, variable_json(variable)),
-        ExplainReport::Ambiguous { name } => ("ambiguous", name, object([])),
+        ExplainReport::Ambiguous { name, kinds } => (
+            "ambiguous",
+            name,
+            object([(
+                "kinds",
+                array(kinds.iter().map(|kind| Value::string(kind.as_str()))),
+            )]),
+        ),
         ExplainReport::NotFound { name, suggestions } => (
             "not_found",
             name,
             object([(
                 "suggestions",
-                array(suggestions.iter().map(|name| bytes(name))),
+                array(suggestions.iter().map(|item| {
+                    object([
+                        ("name", bytes(&item.name)),
+                        ("kind", Value::string(item.kind.as_str())),
+                    ])
+                })),
             )]),
+        ),
+        ExplainReport::InvalidDirectory { name, directory } => (
+            "invalid_directory",
+            name,
+            object([("directory_id", Value::UInt(directory.index() as u64))]),
         ),
     };
     object([
@@ -50,21 +111,56 @@ pub fn explain_json(report: &ExplainReport, config: Option<&[u8]>) -> Value {
 }
 
 fn target_json(target: &ExplainTarget, config: Option<&[u8]>) -> Value {
-    let configs = target
-        .configurations
-        .iter()
-        .filter(|entry| config.is_none_or(|name| name.eq_ignore_ascii_case(&entry.name)))
-        .map(config_json);
-    let properties = target.properties.iter().map(|property| {
+    let configs = target.configurations_for(config).map(config_json);
+    let status = match config {
+        Some(_) if target.configurations_for(config).next().is_none() => "unavailable",
+        Some(_) => "matched",
+        None if target.configurations.is_empty() => "no_resolved_configurations",
+        None => "all",
+    };
+    let selection = object([
+        ("requested", optional(config.map(bytes))),
+        (
+            "available",
+            array(
+                target
+                    .configurations
+                    .iter()
+                    .map(|config| bytes(&config.name)),
+            ),
+        ),
+        ("status", Value::string(status)),
+    ]);
+    let properties = target.properties_for(config).map(|property| {
         object([
             ("target", bytes(&property.target)),
             ("name", bytes(&property.name)),
             (
+                "configurations",
+                array(property.configurations.iter().map(|name| bytes(name))),
+            ),
+            (
+                "dropped_writes",
+                Value::UInt(u64::from(property.dropped_writes)),
+            ),
+            (
                 "writes",
                 array(property.writes.iter().map(|event| {
                     object([
-                        ("sequence", Value::UInt(event.seq)),
+                        ("sequence", Value::string(event.seq.to_string())),
                         ("operation", Value::string(prop_op(event.op))),
+                        (
+                            "previous",
+                            optional(event.old_value.as_ref().map(|value| {
+                                preview_fields(value.prefix(), value.len(), value.hash())
+                            })),
+                        ),
+                        (
+                            "value",
+                            optional(event.new_value.as_ref().map(|value| {
+                                preview_fields(value.prefix(), value.len(), value.hash())
+                            })),
+                        ),
                         ("origin", trace(&event.origin)),
                     ])
                 })),
@@ -80,6 +176,11 @@ fn target_json(target: &ExplainTarget, config: Option<&[u8]>) -> Value {
             optional(target.alias_definition.as_ref().map(location)),
         ),
         ("sources", array(target.sources.iter().map(tagged))),
+        (
+            "filter",
+            optional(target.filter.as_ref().map(|value| bytes(value))),
+        ),
+        ("configuration_selection", selection),
         ("configurations", array(configs)),
         ("properties", array(properties)),
         (
@@ -95,6 +196,46 @@ fn config_json(config: &ExplainConfig) -> Value {
         object([
             ("kind", Value::string(chain_kind(entry.kind))),
             ("value", bytes(&entry.value)),
+            (
+                "spelling",
+                optional(entry.spelling.as_ref().map(|value| bytes(value))),
+            ),
+            (
+                "system_include",
+                optional(entry.system_include.map(Value::Bool)),
+            ),
+            ("build_entry", Value::Bool(entry.build_entry)),
+            (
+                "compile_positions",
+                array(entry.compile_positions.iter().map(|position| {
+                    object([
+                        ("group", Value::UInt(position.group as u64)),
+                        ("ordinal", Value::UInt(position.ordinal as u64)),
+                    ])
+                })),
+            ),
+            (
+                "link_role",
+                optional(entry.link_role.map(|role| Value::string(link_role(role)))),
+            ),
+            (
+                "link_targets",
+                array(
+                    entry
+                        .link_targets
+                        .iter()
+                        .map(|id| Value::UInt(id.index() as u64)),
+                ),
+            ),
+            (
+                "input",
+                optional(entry.input.as_ref().map(|input| {
+                    object([
+                        ("name", bytes(&input.name)),
+                        ("location", optional(input.location.as_ref().map(location))),
+                    ])
+                })),
+            ),
             ("origin", trace(&entry.origin)),
             (
                 "chain",
@@ -117,6 +258,18 @@ fn config_json(config: &ExplainConfig) -> Value {
     object([
         ("name", bytes(&config.name)),
         ("sources", array(config.sources.iter().map(tagged))),
+        (
+            "compile_groups",
+            array(config.compile_groups.iter().map(|group| {
+                object([
+                    ("language", bytes(&group.language)),
+                    (
+                        "sources",
+                        array(group.sources.iter().map(|source| bytes(source))),
+                    ),
+                ])
+            })),
+        ),
         ("entries", array(entries)),
     ])
 }
@@ -128,6 +281,7 @@ fn variable_json(variable: &ExplainVariable) -> Value {
             ("type", Value::string(cache.kind.as_str())),
             ("help", bytes(&cache.help)),
             ("force", optional(cache.force.map(Value::Bool))),
+            ("location", optional(cache.location.as_ref().map(location))),
         ])
     });
     let writes = variable.writes.iter().map(|event| {
@@ -140,7 +294,7 @@ fn variable_json(variable: &ExplainVariable) -> Value {
             ]),
         };
         object([
-            ("sequence", Value::UInt(event.sequence)),
+            ("sequence", Value::string(event.sequence.to_string())),
             ("operation", Value::string(var_op(event.operation))),
             (
                 "command",
@@ -150,7 +304,21 @@ fn variable_json(variable: &ExplainVariable) -> Value {
                 "directory_id",
                 optional(event.directory.map(|id| Value::UInt(id.index() as u64))),
             ),
+            (
+                "directory",
+                optional(event.directory_path.as_ref().map(|path| bytes(path))),
+            ),
+            (
+                "binding_directory_id",
+                optional(
+                    event
+                        .binding_directory
+                        .map(|id| Value::UInt(id.index() as u64)),
+                ),
+            ),
+            ("in_queried_scope", Value::Bool(event.in_queried_scope)),
             ("scope_depth", Value::UInt(u64::from(event.scope_depth))),
+            ("scope_id", Value::string(event.scope_id.to_string())),
             ("previous", previous),
             ("value", optional(event.value.as_ref().map(preview))),
             ("origin", trace(&event.origin)),
@@ -161,11 +329,25 @@ fn variable_json(variable: &ExplainVariable) -> Value {
             "value",
             optional(variable.value.as_ref().map(|value| bytes(value))),
         ),
+        (
+            "location",
+            optional(variable.location.as_ref().map(location)),
+        ),
+        (
+            "binding",
+            match (variable.normal_binding, &variable.cache) {
+                (true, _) => Value::string("normal"),
+                (false, Some(_)) => Value::string("cache"),
+                (false, None) => Value::Null,
+            },
+        ),
+        ("directory", bytes(&variable.directory)),
         ("cache", optional(cache)),
         ("writes", array(writes)),
+        ("history", Value::string(variable.history.as_str())),
         (
-            "history_incomplete",
-            optional(variable.history_incomplete.map(Value::Bool)),
+            "session_history_truncated",
+            optional(variable.session_history_truncated.map(Value::Bool)),
         ),
         ("provisional", Value::Bool(variable.provisional)),
     ])
@@ -201,6 +383,23 @@ fn location(location: &SourceLocation) -> Value {
         ("path", bytes(&location.path)),
         ("line", Value::UInt(u64::from(location.line))),
         (
+            "source_id",
+            optional(
+                location
+                    .source_id
+                    .map(|id| Value::UInt(u64::from(id.get()))),
+            ),
+        ),
+        (
+            "range",
+            optional(location.range.map(|range| {
+                object([
+                    ("start", Value::UInt(u64::from(range.start))),
+                    ("end", Value::UInt(u64::from(range.end))),
+                ])
+            })),
+        ),
+        (
             "byte_offset",
             optional(
                 location
@@ -212,10 +411,15 @@ fn location(location: &SourceLocation) -> Value {
 }
 
 fn preview(value: &ValuePreview) -> Value {
+    preview_fields(&value.prefix, value.len, value.hash)
+}
+
+fn preview_fields(prefix: &[u8], length: usize, hash: u64) -> Value {
     object([
-        ("prefix", bytes(&value.prefix)),
-        ("byte_length", Value::UInt(value.len as u64)),
-        ("hash", Value::string(format!("{:016x}", value.hash))),
+        ("prefix", bytes(prefix)),
+        ("byte_length", Value::UInt(length as u64)),
+        ("hash", Value::string(format!("{hash:016x}"))),
+        ("truncated", Value::Bool(length > prefix.len())),
     ])
 }
 

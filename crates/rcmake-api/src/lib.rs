@@ -27,25 +27,33 @@
 
 mod config;
 mod explain;
+mod explain_entries;
 mod explain_json;
 mod explain_render;
 mod index;
+mod overlay_diff;
 mod result;
+mod variable_history;
 
 pub use config::{ApiError, ConfigureRequest, PreparedConfigure, ProcessPolicy, WriteMode};
 pub use explain::{
-    ExplainCache, ExplainConfig, ExplainEntry, ExplainHop, ExplainProperty, ExplainQuery,
-    ExplainReport, ExplainTarget, ExplainVariable, ExplainWrite,
+    CompilePosition, ExplainCache, ExplainCompileGroup, ExplainConfig, ExplainEntry, ExplainHop,
+    ExplainInput, ExplainItemKind, ExplainProperty, ExplainQuery, ExplainReport, ExplainRoots,
+    ExplainSuggestion, ExplainTarget, ExplainVariable, ExplainWrite,
 };
 pub use explain_json::{EXPLAIN_SCHEMA, explain_json, render_explain_json};
 pub use explain_render::{ExplainRenderOptions, render_explain_terminal};
 pub use index::{
-    CallableDefinition, Completion, CompletionKind, FileEdge, FileEdgeKind, SourceLocation,
-    TargetDefinition, UsageSummary, VariableDefinition, WorkspaceIndex,
+    CallableDefinition, Completion, CompletionKind, ExecutedSite, ExecutedSites, ExecutedSymbol,
+    FileEdge, FileEdgeKind, SourceLocation, SourceRange, TargetDefinition, UsageSummary,
+    VariableDefinition, WorkspaceIndex,
 };
+pub use overlay_diff::{OverlayBytes, OverlayChange, OverlayDiff, OverlayEntryKind};
 pub use result::{
-    AliasSite, CompletionState, ConfigureResult, EvaluationFacts, OverlayDiff, PreviousValue,
-    ResolvedEntry, VarLedgerSnapshot, VariableWriteDetails,
+    AliasSite, CompletionState, ConfigureResult, EvaluationFacts, PreviousValue, ResolvedEntry,
+    VariableWriteDetails,
 };
 
-pub use rcmake_eval::{CacheDefine, CancelToken, LedgerLevel, Services};
+pub use rcmake_eval::{CacheDefine, CancelToken, LedgerLevel, Services, VarWrite};
+
+pub use variable_history::{VarLedgerSnapshot, VariableHistory};

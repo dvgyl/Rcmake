@@ -1,22 +1,30 @@
 use core::fmt::Write as _;
 
-use rcmake_base::ByteSlice as _;
-use rcmake_diag::{Backtrace, Frame};
+use rcmake_base::path_lex::Lexical;
+use rcmake_diag::Backtrace;
 use rcmake_eval::{ValuePreview, VarOp};
 use rcmake_host::{Host, Stream};
 use rcmake_model::{AppendMode, PropOp, UsageField, UsageScope};
-use rcmake_resolve::ChainKind;
+use rcmake_resolve::{ChainKind, LinkFragmentRole};
 
-use crate::{ExplainReport, ExplainTarget, ExplainVariable, PreviousValue, SourceLocation};
+use crate::{
+    ExplainEntry, ExplainReport, ExplainRoots, ExplainTarget, ExplainVariable, ExplainWrite,
+    PreviousValue, SourceLocation, VariableHistory,
+};
 
-/// Options for rendering an explain report in a terminal.
+const LINE_WIDTH: usize = 96;
+const VALUE_BYTES: usize = 64;
+
+/// Options for rendering an explanation in a terminal.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ExplainRenderOptions<'a> {
     /// Show only this configuration, if specified.
     pub config: Option<&'a [u8]>,
     /// Use ANSI color.
     pub color: bool,
-    /// Show all frames in each recorded call stack.
+    /// Emit OSC 8 links for absolute source paths.
+    pub hyperlinks: bool,
+    /// Show all stack frames and full effective and cache values.
     pub verbose: bool,
 }
 
@@ -25,16 +33,34 @@ impl ExplainRenderOptions<'_> {
     ///
     /// Nonempty `CLICOLOR_FORCE` other than `0` enables color. Then a nonempty
     /// `NO_COLOR` disables color. Otherwise color follows terminal detection.
+    /// Links require a terminal with a known hyperlink capability.
     #[must_use]
     pub fn for_host(host: &dyn Host, stream: Stream) -> Self {
+        let terminal = host.is_terminal(stream);
         let forced = host
             .env_get(b"CLICOLOR_FORCE")
             .is_some_and(|value| !value.is_empty() && value.as_slice() != b"0");
         let disabled = host
             .env_get(b"NO_COLOR")
             .is_some_and(|value| !value.is_empty());
+        let hyperlinks = terminal
+            && (host.env_get(b"VTE_VERSION").is_some_and(|value| {
+                core::str::from_utf8(&value)
+                    .ok()
+                    .and_then(|version| version.parse::<u32>().ok())
+                    .is_some_and(|version| version >= 5000)
+            }) || host
+                .env_get(b"WT_SESSION")
+                .is_some_and(|value| !value.is_empty())
+                || host.env_get(b"TERM_PROGRAM").is_some_and(|value| {
+                    matches!(
+                        value.as_slice(),
+                        b"iTerm.app" | b"WezTerm" | b"vscode" | b"ghostty"
+                    )
+                }));
         Self {
-            color: forced || (!disabled && host.is_terminal(stream)),
+            color: forced || (!disabled && terminal),
+            hyperlinks,
             ..Self::default()
         }
     }
@@ -46,280 +72,550 @@ pub fn render_explain_terminal(
     report: &ExplainReport,
     options: ExplainRenderOptions<'_>,
 ) -> String {
-    let mut renderer = Renderer {
+    let default_roots = ExplainRoots::default();
+    let roots = match report {
+        ExplainReport::Target(target) => &target.roots,
+        ExplainReport::Variable(variable) => &variable.roots,
+        _ => &default_roots,
+    };
+    let mut out = Renderer {
         text: String::new(),
         options,
+        roots,
     };
     match report {
-        ExplainReport::Target(target) => renderer.target(target),
-        ExplainReport::Variable(variable) => renderer.variable(variable),
-        ExplainReport::Ambiguous { name } => {
-            let name = text(name);
-            let _ = writeln!(
-                renderer.text,
-                "{name} names a target and a variable. Use --target or --var."
-            );
-        }
+        ExplainReport::Target(target) => out.target(target),
+        ExplainReport::Variable(variable) => out.variable(variable),
+        ExplainReport::Ambiguous { name, .. } => out.row(
+            0,
+            &format!(
+                "{} names a target and a variable. Use --target or --var.",
+                text(name)
+            ),
+        ),
         ExplainReport::NotFound { name, suggestions } => {
-            let _ = writeln!(renderer.text, "No match for {}.", text(name));
+            out.row(0, &format!("No match for {}.", text(name)));
             if !suggestions.is_empty() {
-                let names = suggestions
-                    .iter()
-                    .map(|name| text(name))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                let _ = writeln!(renderer.text, "Similar names  {names}");
+                out.row(2, "Similar names");
+                for suggestion in suggestions {
+                    let flag = match suggestion.kind {
+                        crate::ExplainItemKind::Target => "--target",
+                        crate::ExplainItemKind::Variable => "--var",
+                    };
+                    out.row(4, &format!("{flag} {}", text(&suggestion.name)));
+                }
             }
         }
+        ExplainReport::InvalidDirectory { name, directory } => out.row(
+            0,
+            &format!(
+                "Cannot explain {}. Directory ID {} is invalid for this snapshot.",
+                text(name),
+                directory.index()
+            ),
+        ),
     }
-    renderer.text
+    out.text
 }
 
 struct Renderer<'a> {
     text: String,
     options: ExplainRenderOptions<'a>,
+    roots: &'a ExplainRoots,
 }
 
 impl Renderer<'_> {
     fn target(&mut self, target: &ExplainTarget) {
-        let name = self.paint(1, &text(&target.name));
-        let _ = write!(self.text, "{name} ({})", target.kind.as_str());
+        let name = text(&target.name);
+        self.styled_row(0, &format!("{name} ({})", target.kind.as_str()), 1, None);
         if target.name != target.target {
-            let _ = write!(self.text, "  alias of {}", text(&target.target));
-            if let Some(location) = &target.alias_definition {
-                self.location(location);
-            }
+            self.row(2, &format!("Alias of {}", text(&target.target)));
+            self.location(4, target.alias_definition.as_ref());
         }
-        self.end_trace(&target.definition, 2);
+        self.trace(2, &target.definition);
         self.provisional(target.provisional);
-        if !target.sources.is_empty() {
-            self.text.push_str("  Declared sources\n");
+        if let Some(filter) = &target.filter {
+            self.row(2, &format!("Entry filter {}", quoted(filter)));
+        } else if !target.sources.is_empty() {
+            self.row(2, "Declared sources");
             for source in &target.sources {
-                let _ = write!(self.text, "    {}", text(&source.value));
-                self.end_trace(&source.backtrace, 6);
+                self.row(4, &self.display_path(&source.value));
+                self.trace(6, &source.backtrace);
             }
         }
-        let mut matched = false;
-        for config in &target.configurations {
-            if self
-                .options
-                .config
-                .is_some_and(|name| !name.eq_ignore_ascii_case(&config.name))
-            {
-                continue;
-            }
-            matched = true;
-            let name = if config.name.is_empty() {
-                "(default)".to_owned()
+        if !target.configurations.is_empty() {
+            let available = target
+                .configurations
+                .iter()
+                .map(|config| config_name(&config.name))
+                .collect::<Vec<_>>()
+                .join(", ");
+            self.row(2, &format!("Available configurations  {available}"));
+        } else {
+            self.row(2, "No resolved configurations.");
+        }
+        if let Some(requested) = self.options.config {
+            let status = if target.configurations_for(Some(requested)).next().is_some() {
+                "matched"
             } else {
-                text(&config.name)
+                "unavailable"
             };
-            let _ = writeln!(self.text, "  Configuration {name}");
-            for source in &config.sources {
-                let _ = write!(self.text, "    {:<21} {}", "Source", text(&source.value));
-                self.end_trace(&source.backtrace, 6);
+            self.row(
+                2,
+                &format!(
+                    "Requested configuration {} {status}.",
+                    config_name(requested)
+                ),
+            );
+        }
+        for config in target.configurations_for(self.options.config) {
+            self.row(2, &format!("Configuration {}", config_name(&config.name)));
+            if target.filter.is_none() {
+                for source in &config.sources {
+                    self.row(4, &format!("Source {}", self.display_path(&source.value)));
+                    self.trace(6, &source.backtrace);
+                }
+            }
+            if target.filter.is_some() && config.entries.is_empty() {
+                self.row(4, "No entry matches the filter.");
             }
             for entry in &config.entries {
-                let _ = write!(
-                    self.text,
-                    "    {:<21} {}",
-                    usage_label(entry.kind),
-                    text(&entry.value)
-                );
-                if entry.chain.is_none() {
-                    self.text.push_str("  [chain unavailable]");
-                }
-                self.end_trace(&entry.origin, 6);
-                if let Some(chain) = &entry.chain {
-                    for hop in chain {
-                        let target = hop.target.as_ref().map_or_else(
-                            || format!("target #{}", hop.id.index()),
-                            |name| text(name),
-                        );
-                        let _ = write!(self.text, "      via {:<9} {target}", usage_scope(hop.via));
-                        self.end_trace(&hop.origin, 8);
+                self.entry(&target.target, entry, config.compile_groups.len());
+            }
+            for (index, group) in config.compile_groups.iter().enumerate() {
+                if config.entries.iter().any(|entry| {
+                    !entry.compile_positions.is_empty()
+                        && entry.compile_positions.len() < config.compile_groups.len()
+                        && entry
+                            .compile_positions
+                            .iter()
+                            .any(|position| position.group == index)
+                }) {
+                    self.row(
+                        4,
+                        &format!("Compile group {} ({})", index + 1, text(&group.language)),
+                    );
+                    for source in &group.sources {
+                        self.row(6, &self.display_path(source));
                     }
                 }
             }
         }
-        if let Some(config) = self.options.config.filter(|_| !matched) {
-            let config = text(config);
-            let _ = writeln!(self.text, "  Configuration {config} is unavailable.");
-        } else if !matched {
-            self.text.push_str("  No resolved configurations.\n");
+
+        let mut properties = target.properties_for(self.options.config).peekable();
+        if properties.peek().is_some() {
+            self.row(2, "Property history (writes at configure time)");
         }
-        if !target.properties.is_empty() {
-            self.text.push_str("  Property history\n");
-            for property in &target.properties {
-                let _ = writeln!(
-                    self.text,
-                    "    {}  {}",
-                    text(&property.target),
-                    text(&property.name)
+        for property in properties {
+            self.row(
+                4,
+                &format!("{}  {}", text(&property.target), text(&property.name)),
+            );
+            if property.configurations.len() > 1 {
+                let names = property
+                    .configurations
+                    .iter()
+                    .map(|name| config_name(name))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                self.row(6, &format!("Shared by {names}"));
+            }
+            if property.dropped_writes != 0 {
+                self.row(
+                    6,
+                    &format!("{} earlier writes discarded", property.dropped_writes),
                 );
-                for event in &property.writes {
-                    let _ = write!(self.text, "      #{} {}", event.seq, prop_op(event.op));
-                    self.end_trace(&event.origin, 8);
+            }
+            for event in &property.writes {
+                self.row(6, &format!("#{} {}", event.seq, prop_op(event.op)));
+                self.trace(8, &event.origin);
+            }
+        }
+        match target.property_history_incomplete {
+            Some(false) => {}
+            Some(true) => self.warning("The session discarded some property writes."),
+            None => self.row(2, "Property history is unavailable."),
+        }
+    }
+
+    fn entry(&mut self, target: &[u8], entry: &ExplainEntry, group_count: usize) {
+        let label = match entry.link_role {
+            Some(LinkFragmentRole::LibraryPath) => "Library search path",
+            Some(LinkFragmentRole::FrameworkPath) => "Framework search path",
+            _ => usage_label(entry.kind),
+        };
+        let value = entry.spelling.as_ref().unwrap_or(&entry.value);
+        let mut header = format!("{label}  {}", text(value));
+        match &entry.chain {
+            None => header.push_str("  [chain unavailable]"),
+            Some(chain) if chain.is_empty() => header.push_str("  [direct]"),
+            Some(_) => {}
+        }
+        self.row(4, &header);
+        if !entry.compile_positions.is_empty() && entry.compile_positions.len() < group_count {
+            let group_ids = entry
+                .compile_positions
+                .iter()
+                .map(|p| (p.group + 1).to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            self.row(6, &format!("Compile groups {group_ids}"));
+        }
+        if let Some(input) = &entry.input {
+            self.row(6, &format!("From variable {}", text(&input.name)));
+            self.location(8, input.location.as_ref());
+        }
+        if let Some(chain) = &entry.chain {
+            if !chain.is_empty() {
+                let hops: Vec<_> = chain
+                    .iter()
+                    .map(|hop| {
+                        hop.target.as_ref().map_or_else(
+                            || format!("target #{}", hop.id.index()),
+                            |name| text(name),
+                        )
+                    })
+                    .collect();
+                let mut path = text(target);
+                for (hop, name) in chain.iter().zip(&hops) {
+                    let _ = write!(path, " -> {} {name}", usage_scope(hop.via));
+                }
+                self.row(6, &path);
+                let mut from = text(target);
+                for (hop, to) in chain.iter().zip(hops) {
+                    self.row(8, &format!("{from} -> {} {to}", usage_scope(hop.via)));
+                    self.trace(10, &hop.origin);
+                    from = to;
                 }
             }
         }
-        self.history_notice("Property", target.property_history_incomplete);
+        self.trace(6, &entry.origin);
     }
 
     fn variable(&mut self, variable: &ExplainVariable) {
-        let name = self.paint(1, &text(&variable.name));
-        let value = variable
-            .value
-            .as_ref()
-            .map_or_else(|| "(undefined)".into(), |value| quoted(value));
-        let _ = writeln!(self.text, "{name} = {value}");
+        let name = text(&variable.name);
+        self.styled_row(0, &name, 1, None);
         self.provisional(variable.provisional);
+        if !variable.directory.is_empty() {
+            self.row(
+                2,
+                &format!(
+                    "Source directory {}",
+                    self.display_path(&variable.directory)
+                ),
+            );
+        }
+        let label = match (variable.normal_binding, &variable.cache) {
+            (true, Some(_)) => "Effective value (normal variable shadows cache)",
+            (true, None) => "Effective value (normal variable)",
+            (false, Some(_)) => "Effective value (cache)",
+            (false, None) => "Effective value",
+        };
+        self.row(2, label);
+        if let Some(value) = &variable.value {
+            self.full_value(4, value);
+            self.location(4, variable.location.as_ref());
+        } else {
+            self.row(4, "(undefined)");
+        }
         if let Some(cache) = &variable.cache {
             let force = match cache.force {
                 Some(true) => "  FORCE",
                 Some(false) => "",
                 None => "  [FORCE status unavailable]",
             };
-            let _ = writeln!(
-                self.text,
-                "  Cache {} = {}{force}",
-                cache.kind.as_str(),
-                quoted(&cache.value)
-            );
+            self.row(2, &format!("Cache entry {}{force}", cache.kind.as_str()));
+            self.full_value(4, &cache.value);
+            self.location(4, cache.location.as_ref());
             if !cache.help.is_empty() {
-                let _ = writeln!(self.text, "    Help  {}", text(&cache.help));
+                self.row(4, &format!("Help  {}", text(&cache.help)));
             }
         }
         if !variable.writes.is_empty() {
-            self.text.push_str("  Write history\n");
-        }
-        for event in &variable.writes {
-            let command = event.command.as_ref().map_or_else(
-                || {
-                    event
-                        .origin
-                        .top()
-                        .and_then(|frame| frame.name.as_deref())
-                        .map_or_else(|| var_op(event.operation).to_owned(), text)
-                },
-                |command| text(command),
-            );
-            let _ = write!(
-                self.text,
-                "    #{} {command}  scope {}",
-                event.sequence, event.scope_depth
-            );
-            match event.operation {
-                VarOp::CacheSet | VarOp::CacheUnset => self.text.push_str("  cache"),
-                VarOp::ParentScope => self.text.push_str("  parent scope"),
-                VarOp::Set | VarOp::Unset => {}
+            self.row(2, "Write history");
+            for write in &variable.writes {
+                self.variable_write(write);
             }
-            if let Some(dir) = event.directory {
-                let _ = write!(self.text, "  directory {}", dir.index());
-            }
-            let previous = match &event.previous {
-                PreviousValue::Unknown => "(unknown)".to_owned(),
-                PreviousValue::Unset => "(unset)".to_owned(),
-                PreviousValue::Value(previous) => preview(previous),
-            };
-            let next = event
-                .value
-                .as_ref()
-                .map_or_else(|| "(unset)".into(), preview);
-            let _ = write!(self.text, "  {previous} -> {next}");
-            self.end_trace(&event.origin, 6);
         }
-        self.history_notice("Variable", variable.history_incomplete);
+        match variable.history {
+            VariableHistory::Unavailable => self.row(2, "Variable history is unavailable."),
+            VariableHistory::Excluded => {
+                self.row(2, "The recording policy excluded this variable.")
+            }
+            VariableHistory::Complete if variable.writes.is_empty() => {
+                self.row(2, "No writes recorded for this variable.")
+            }
+            VariableHistory::Complete => {}
+            VariableHistory::Truncated => self.warning("Variable history reached its limit."),
+            VariableHistory::Unknown => {
+                self.warning("The ledger cannot determine whether this variable lost writes.")
+            }
+        }
+        if variable.session_history_truncated == Some(true) {
+            self.warning("Variable history reached a session-wide limit.");
+        }
     }
 
-    fn history_notice(&mut self, kind: &str, incomplete: Option<bool>) {
-        match incomplete {
-            Some(false) => {}
-            Some(true) => {
-                let warning = self.paint(33, "Warning");
-                let _ = writeln!(self.text, "  {warning}  {kind} history reached its limit.");
-            }
-            None => {
-                let _ = writeln!(self.text, "  {kind} history is unavailable.");
-            }
+    fn variable_write(&mut self, event: &ExplainWrite) {
+        let command = event.command.as_ref().map_or_else(
+            || {
+                event
+                    .origin
+                    .top()
+                    .and_then(|frame| frame.name.as_deref())
+                    .map_or_else(|| var_op(event.operation).to_owned(), text)
+            },
+            |command| text(command),
+        );
+        let scope = match event.operation {
+            VarOp::CacheSet | VarOp::CacheUnset => "cache",
+            _ if event.in_queried_scope => "queried directory binding",
+            _ if event.binding_directory.is_some() => "other directory binding",
+            _ => "local or unknown binding",
+        };
+        self.row(
+            4,
+            &format!(
+                "#{} {command} ({scope}, scope depth {})",
+                event.sequence, event.scope_depth
+            ),
+        );
+        if let Some(dir) = &event.directory_path {
+            self.row(6, &format!("Ran in {}", self.display_path(dir)));
         }
+        let previous = match &event.previous {
+            PreviousValue::Unknown => "(unknown)".to_owned(),
+            PreviousValue::Unset => "(unset)".to_owned(),
+            PreviousValue::Value(value) => self.preview(value),
+        };
+        let next = event
+            .value
+            .as_ref()
+            .map_or_else(|| "(unset)".into(), |value| self.preview(value));
+        self.row(6, &format!("{previous} -> {next}"));
+        self.trace(6, &event.origin);
+    }
+
+    fn full_value(&mut self, indent: usize, value: &[u8]) {
+        let visible = self.value_prefix(value);
+        self.row(indent, &quoted(visible));
+        if visible.len() != value.len() {
+            self.row(
+                indent,
+                &format!(
+                    "(truncated, {} bytes total; use --verbose or --json for full value)",
+                    value.len()
+                ),
+            );
+        }
+    }
+
+    fn preview(&self, value: &ValuePreview) -> String {
+        let visible = self.value_prefix(&value.prefix);
+        if value.len <= visible.len() {
+            quoted(visible)
+        } else {
+            format!(
+                "{}… ({} bytes, hash {:016x})",
+                quoted(visible),
+                value.len,
+                value.hash
+            )
+        }
+    }
+
+    fn value_prefix<'a>(&self, value: &'a [u8]) -> &'a [u8] {
+        if self.options.verbose || value.len() <= VALUE_BYTES {
+            return value;
+        }
+        let end = core::str::from_utf8(value)
+            .map_or(VALUE_BYTES, |value| value.floor_char_boundary(VALUE_BYTES));
+        value.get(..end).unwrap_or_default()
+    }
+
+    fn warning(&mut self, message: &str) {
+        self.styled_row(2, &format!("Warning  {message}"), 33, None);
     }
 
     fn provisional(&mut self, provisional: bool) {
         if provisional {
-            let warning = self.paint(33, "Partial configure");
-            let _ = writeln!(self.text, "  [{warning}]");
+            self.styled_row(2, "Partial configure", 33, None);
         }
     }
 
-    fn end_trace(&mut self, trace: &Backtrace, indent: usize) {
+    fn location(&mut self, indent: usize, location: Option<&SourceLocation>) {
+        if let Some(location) = location {
+            self.path_line(indent, "At", &location.path, location.line, None);
+        } else {
+            self.row(indent, "Source location unavailable.");
+        }
+    }
+
+    fn trace(&mut self, indent: usize, trace: &Backtrace) {
         let mut frames = trace.frames();
         if let Some(frame) = frames.next() {
-            self.frame(frame);
+            self.path_line(indent, "At", &frame.file, frame.line, frame.name.as_deref());
         }
-        self.text.push('\n');
         if self.options.verbose {
             for frame in frames {
-                let _ = write!(self.text, "{:indent$}called from", "");
-                self.frame(frame);
-                self.text.push('\n');
+                self.path_line(
+                    indent,
+                    "Called from",
+                    &frame.file,
+                    frame.line,
+                    frame.name.as_deref(),
+                );
             }
         }
     }
 
-    fn frame(&mut self, frame: &Frame) {
-        self.path_line(&frame.file, frame.line);
-        if let Some(command) = &frame.name {
-            let _ = write!(self.text, " ({})", text(command));
+    fn display_path(&self, path: &[u8]) -> String {
+        if path.starts_with(b"/") || Lexical::new(path).absolute() {
+            let normalized = Lexical::new(path).normalize();
+            for (root, prefix) in [(&self.roots.source, ""), (&self.roots.build, "<build>/")] {
+                if root.is_empty() {
+                    continue;
+                }
+                let root = Lexical::new(root).normalize();
+                if let Some(relative) = Lexical::new(&normalized).relative(Lexical::new(&root))
+                    && relative != ".."
+                    && !relative.starts_with(b"../")
+                {
+                    return format!("{prefix}{}", text(&relative));
+                }
+            }
+        }
+        text(path)
+    }
+
+    fn path_line(
+        &mut self,
+        indent: usize,
+        label: &str,
+        path: &[u8],
+        line: u32,
+        command: Option<&[u8]>,
+    ) {
+        let mut display = format!("{label} {}", self.display_path(path));
+        if line != 0 {
+            let _ = write!(display, ":{line}");
+        }
+        if let Some(command) = command {
+            let _ = write!(display, " ({})", text(command));
+        }
+        let uri = self
+            .options
+            .hyperlinks
+            .then(|| file_uri(path, line))
+            .flatten();
+        self.styled_row(indent, &display, 36, uri.as_deref());
+    }
+
+    fn row(&mut self, indent: usize, value: &str) {
+        self.styled_row(indent, value, 0, None);
+    }
+
+    fn styled_row(&mut self, indent: usize, value: &str, color: u8, link: Option<&str>) {
+        let mut remaining = value;
+        let mut pad = indent;
+        loop {
+            let split = line_end(remaining, LINE_WIDTH.saturating_sub(pad));
+            let Some((line, rest)) = remaining.split_at_checked(split) else {
+                break;
+            };
+            let _ = write!(self.text, "{:pad$}", "");
+            if let Some(link) = link {
+                let _ = write!(self.text, "\x1b]8;;{link}\x1b\\");
+            }
+            if color != 0 && self.options.color {
+                let _ = write!(self.text, "\x1b[{color}m{line}\x1b[0m");
+            } else {
+                self.text.push_str(line);
+            }
+            if link.is_some() {
+                self.text.push_str("\x1b]8;;\x1b\\");
+            }
+            self.text.push('\n');
+            remaining = rest;
+            if remaining.is_empty() {
+                break;
+            }
+            pad = indent + 2;
         }
     }
+}
 
-    fn location(&mut self, location: &SourceLocation) {
-        self.path_line(&location.path, location.line);
-    }
-
-    fn path_line(&mut self, path: &[u8], line: u32) {
-        let location = if line == 0 {
-            text(path)
-        } else {
-            format!("{}:{line}", text(path))
-        };
-        let location = self.paint(36, &location);
-        let _ = write!(self.text, "  {location}");
-    }
-
-    fn paint(&self, color: u8, label: &str) -> String {
-        if self.options.color {
-            format!("\x1b[{color}m{label}\x1b[0m")
-        } else {
-            label.to_owned()
+fn line_end(value: &str, width: usize) -> usize {
+    let mut columns = 0;
+    let mut space = 0;
+    for (offset, ch) in value.char_indices() {
+        columns += if ch.is_ascii() { 1 } else { 2 };
+        if columns > width {
+            return if space == 0 { offset } else { space };
         }
+        if ch == ' ' {
+            space = offset + 1;
+        }
+    }
+    value.len()
+}
+
+fn file_uri(path: &[u8], line: u32) -> Option<String> {
+    if !path.starts_with(b"/") && !Lexical::new(path).absolute() {
+        return None;
+    }
+    let path = Lexical::new(path).normalize();
+    let mut uri = String::from("file://");
+    let mut path = path.as_slice();
+    if let Some(unc) = path.strip_prefix(b"//") {
+        path = unc;
+    } else if !path.starts_with(b"/") {
+        uri.push('/');
+    }
+    for &byte in path {
+        if byte.is_ascii_alphanumeric() || b"-._~/:".contains(&byte) {
+            uri.push(char::from(byte));
+        } else {
+            let _ = write!(uri, "%{byte:02X}");
+        }
+    }
+    if line != 0 {
+        let _ = write!(uri, "#L{line}");
+    }
+    Some(uri)
+}
+
+fn config_name(name: &[u8]) -> String {
+    if name.is_empty() {
+        "(default)".to_owned()
+    } else {
+        text(name)
     }
 }
 
 fn text(bytes: &[u8]) -> String {
-    let mut escaped = String::new();
-    for ch in bytes.to_str_lossy().chars() {
-        if ch.is_control() {
-            escaped.extend(ch.escape_default());
-        } else {
-            escaped.push(ch);
-        }
-    }
-    escaped
+    escape(bytes, false)
 }
 
 fn quoted(bytes: &[u8]) -> String {
-    format!("{:?}", bytes.to_str_lossy())
+    format!("\"{}\"", escape(bytes, true))
 }
 
-fn preview(value: &ValuePreview) -> String {
-    let prefix = quoted(&value.prefix);
-    if value.len <= value.prefix.len() {
-        prefix
-    } else {
-        format!("{prefix}… ({} bytes, hash {:016x})", value.len, value.hash)
+fn escape(bytes: &[u8], quoted: bool) -> String {
+    let mut escaped = String::new();
+    for chunk in bytes.utf8_chunks() {
+        for ch in chunk.valid().chars() {
+            if ch.is_control() || (quoted && matches!(ch, '"' | '\\')) {
+                escaped.extend(ch.escape_default());
+            } else {
+                escaped.push(ch);
+            }
+        }
+        for byte in chunk.invalid() {
+            let _ = write!(escaped, "\\x{byte:02x}");
+        }
     }
+    escaped
 }
 
 fn usage_label(kind: ChainKind) -> &'static str {

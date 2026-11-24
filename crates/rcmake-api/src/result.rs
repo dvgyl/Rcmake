@@ -1,17 +1,17 @@
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use rcmake_base::BString;
-use rcmake_diag::Diagnostic;
-use rcmake_eval::{ValuePreview, VarLedger};
-use rcmake_host::{Host, no_process::DeniedCommand, overlay::OverlayHost};
+use rcmake_diag::{Diagnostic, SourceMap};
+use rcmake_eval::{ValuePreview, VarOp};
+use rcmake_host::no_process::DeniedCommand;
 use rcmake_model::{BT, DirId, ProjectModel, TargetId};
 use rcmake_resolve::{ChainKey, GenerationResult};
 
-use crate::{CallableDefinition, FileEdge, SourceLocation, WorkspaceIndex};
-
-/// Retained variable writes from one evaluation.
-pub type VarLedgerSnapshot = VarLedger;
+use crate::{
+    CallableDefinition, ExecutedSites, FileEdge, OverlayDiff, SourceLocation, VarLedgerSnapshot,
+    WorkspaceIndex,
+};
 
 /// Whether evaluation reached a complete result.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -23,6 +23,10 @@ pub enum CompletionState {
     Partial {
         /// Retained subprocess requests that the host denied.
         denied_processes: Vec<DeniedCommand>,
+        /// Number of complete denial records that the host evicted.
+        omitted_denials: usize,
+        /// Total request bytes in the evicted records.
+        omitted_denial_bytes: usize,
         /// Whether the evaluator stopped because the caller cancelled it.
         cancelled: bool,
     },
@@ -33,39 +37,6 @@ impl CompletionState {
     #[must_use]
     pub fn is_partial(&self) -> bool {
         matches!(self, Self::Partial { .. })
-    }
-}
-
-/// Filesystem changes retained by a session's in-memory overlay.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct OverlayDiff {
-    /// Added or changed paths. A value contains file bytes when stored in memory.
-    /// Directories and metadata-only changes can have no byte contents.
-    pub written: BTreeMap<PathBuf, Option<Vec<u8>>>,
-    /// Tombstones for deleted paths, in path order.
-    pub deleted: Vec<PathBuf>,
-}
-
-impl OverlayDiff {
-    pub(crate) fn from_host<H: Host + ?Sized>(host: &OverlayHost<H>) -> Self {
-        let written = host
-            .written_paths()
-            .into_iter()
-            .map(|path| {
-                let contents = host.read_overlay_file(&path);
-                (path, contents)
-            })
-            .collect();
-        Self {
-            written,
-            deleted: host.deleted_paths(),
-        }
-    }
-
-    /// Get bytes stored for a changed file. This method reads the snapshot only.
-    #[must_use]
-    pub fn read_file(&self, path: &Path) -> Option<&[u8]> {
-        self.written.get(path)?.as_deref()
     }
 }
 
@@ -99,6 +70,9 @@ pub enum PreviousValue {
 pub struct VariableWriteDetails {
     /// Directory in which the write occurred, when recorded.
     pub dir: Option<DirId>,
+    /// Directory whose persistent normal binding changed, if applicable.
+    /// A function or block local write has no directory binding.
+    pub binding_dir: Option<DirId>,
     /// Command and operation, such as `list(APPEND)`, when recorded.
     pub command: Option<BString>,
     /// Value in the written scope immediately before the write.
@@ -124,6 +98,12 @@ pub struct ResolvedEntry {
 pub struct EvaluationFacts {
     /// Alias declaration sites in evaluation order.
     pub aliases: Vec<AliasSite>,
+    /// Definition locations for real targets, when recorded.
+    pub target_sites: BTreeMap<TargetId, SourceLocation>,
+    /// Registered buffers used during evaluation, if available.
+    pub source_map: Option<Arc<SourceMap>>,
+    /// Bounded executed symbol references for position-sensitive queries.
+    pub executed_sites: Arc<ExecutedSites>,
     /// Evaluated command definitions in registration order.
     pub callables: Vec<CallableDefinition>,
     /// Resolved include and subdirectory edges in evaluation order.
@@ -162,6 +142,22 @@ pub struct ConfigureResult {
 }
 
 impl ConfigureResult {
+    pub(crate) fn cache_location(&self, name: &[u8], value: &[u8]) -> Option<SourceLocation> {
+        self.facts
+            .cache_sites
+            .get(name)
+            .cloned()
+            .or_else(|| infer_cache_location(self.var_ledger.as_ref(), name, value))
+    }
+
+    pub(crate) fn binding_location(&self, dir: DirId, name: &[u8]) -> Option<SourceLocation> {
+        if self.model.dir(dir).vars.contains_key(name) {
+            return self.facts.variable_sites.get(&dir)?.get(name).cloned();
+        }
+        let entry = self.model.cache().get(name)?;
+        self.cache_location(name, &entry.value)
+    }
+
     /// Build an index from the result's current model and recorded data.
     pub fn build_index(&mut self) {
         self.index = Some(WorkspaceIndex::build(
@@ -174,4 +170,22 @@ impl ConfigureResult {
             self.completion.is_partial(),
         ));
     }
+}
+
+pub(crate) fn infer_cache_location(
+    ledger: Option<&VarLedgerSnapshot>,
+    name: &[u8],
+    value: &[u8],
+) -> Option<SourceLocation> {
+    let ledger = ledger.filter(|ledger| {
+        ledger.session_truncated() == Some(false)
+            || ledger.coverage(name) == crate::VariableHistory::Complete
+    })?;
+    let event = ledger
+        .history(name)
+        .rfind(|event| matches!(event.op, VarOp::CacheSet | VarOp::CacheUnset))?;
+    let preview = event.new_value.as_ref()?;
+    (event.op == VarOp::CacheSet && preview.len == value.len() && preview.prefix == value)
+        .then(|| SourceLocation::from_backtrace(&event.backtrace))
+        .flatten()
 }

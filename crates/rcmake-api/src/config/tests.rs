@@ -3,6 +3,7 @@ use rcmake_host::{
 };
 
 use super::*;
+use crate::{OverlayBytes, OverlayEntryKind};
 
 fn workspace() -> (PathBuf, Arc<PureHost>) {
     let root = Path::new(if cfg!(windows) { "C:/" } else { "/" }).join("workspace");
@@ -68,7 +69,7 @@ fn captures_overlay_writes_and_process_denials() -> Result<(), ApiError> {
     assert!(host.metadata(&output, Follow::No).is_err());
     let result = prepared.finish(ConfigureResult::default());
     assert!(matches!(result.completion, CompletionState::Partial {
-        denied_processes, cancelled: false
+        denied_processes, cancelled: false, omitted_denials: 0, omitted_denial_bytes: 0
     } if denied_processes.len() == 1));
     assert_eq!(
         result
@@ -78,5 +79,98 @@ fn captures_overlay_writes_and_process_denials() -> Result<(), ApiError> {
         Some(b"overlay data".as_slice()),
     );
     assert!(result.index.is_some());
+    Ok(())
+}
+
+#[test]
+fn rejects_names_that_the_cache_writer_cannot_persist() {
+    for (name, escaped) in [
+        ("A\nB", r#""A\nB""#),
+        ("A\rB", r#""A\rB""#),
+        ("A\"B", r#""A\"B""#),
+    ] {
+        let (_, host) = workspace();
+        let request = ConfigureRequest::new("source", "build", "cmake", host).define(CacheDefine {
+            name: name.into(),
+            ty: None,
+            value: "value".into(),
+        });
+        assert!(matches!(
+            request.prepare(),
+            Err(ApiError::InvalidConfig { field: "defines", message })
+                if message.contains(escaped)
+        ));
+    }
+}
+
+#[test]
+fn describes_overlay_paths_and_bounds_captured_bytes() -> Result<(), Box<dyn std::error::Error>> {
+    let (root, base) = workspace();
+    let mode = root.join("mode");
+    let old = root.join("old");
+    let moved = root.join("moved");
+    let hard = root.join("hard");
+    let link = root.join("link");
+    let large = root.join("large");
+    let dir = root.join("newdir");
+    let target = Path::new("mode");
+    base.create_dir_all(&root)?;
+    base.write(&mode, b"unchanged", HostWrite::Truncate)?;
+    base.write(&old, b"move me", HostWrite::Truncate)?;
+    let prepared = ConfigureRequest::new("source", "build", "cmake", base)
+        .write_mode(WriteMode::Overlay)
+        .prepare()?;
+    let host = prepared.host();
+    host.set_permissions(&mode, 0o755)?;
+    host.rename(&old, &moved)?;
+    host.hard_link(&moved, &hard)?;
+    host.symlink(target, &link)?;
+    host.create_dir_all(&dir)?;
+    host.write(&large, &vec![0; 1024 * 1024 + 1], HostWrite::Truncate)?;
+    let result = prepared.finish(ConfigureResult::default());
+    let diff = result.overlay_diff.ok_or("missing overlay diff")?;
+
+    assert!(diff.changes.get(&dir).is_some_and(|change| {
+        change.kind == OverlayEntryKind::Directory && change.bytes == OverlayBytes::NotApplicable
+    }));
+    assert!(diff.changes.get(&link).is_some_and(|change| {
+        change.kind == OverlayEntryKind::Symlink && change.link_target.as_deref() == Some(target)
+    }));
+    assert!(diff.changes.get(&mode).is_some_and(|change| {
+        change.kind == OverlayEntryKind::File
+            && change.bytes == OverlayBytes::FromBase
+            && change
+                .metadata
+                .as_ref()
+                .is_some_and(|metadata| metadata.mode == 0o755)
+    }));
+    assert!(
+        diff.changes
+            .get(&old)
+            .is_some_and(|change| change.kind == OverlayEntryKind::Removed)
+    );
+    let inode = |path: &Path| {
+        diff.changes
+            .get(path)?
+            .metadata
+            .as_ref()
+            .map(|metadata| (metadata.dev, metadata.ino))
+    };
+    assert!(inode(&moved).is_some());
+    assert_eq!(inode(&moved), inode(&hard));
+    assert_eq!(
+        inode(&moved),
+        diff.changes.get(&old).and_then(|change| {
+            change
+                .previous_metadata
+                .as_ref()
+                .map(|metadata| (metadata.dev, metadata.ino))
+        })
+    );
+    assert_eq!(
+        diff.changes.get(&large).map(|change| &change.bytes),
+        Some(&OverlayBytes::OmittedByLimit)
+    );
+    assert_eq!(diff.audit.deleted_paths, 1);
     Ok(())
 }

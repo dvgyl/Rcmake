@@ -43,7 +43,7 @@ pub enum ApiError {
         /// Field that caused the error.
         field: &'static str,
         /// Description of the required value.
-        message: &'static str,
+        message: String,
     },
     /// The caller cancelled the evaluation.
     #[error("Configure was cancelled.")]
@@ -219,6 +219,10 @@ impl ConfigureRequest {
     /// Return an error for an invalid path or cache name, a cancelled session,
     /// or a zero command budget.
     pub fn validate(&self) -> Result<(), ApiError> {
+        self.validate_at(&self.host.initial_cwd())
+    }
+
+    fn validate_at(&self, cwd: &Path) -> Result<(), ApiError> {
         for (field, value) in [
             ("source_dir", &self.source_dir),
             ("build_dir", &self.build_dir),
@@ -227,25 +231,32 @@ impl ConfigureRequest {
             if value.as_os_str().is_empty() || path::from_native(value).contains(&0) {
                 return Err(ApiError::InvalidConfig {
                     field,
-                    message: "Supply a nonempty path without null bytes.",
+                    message: "Supply a nonempty path without null bytes.".into(),
                 });
             }
-            if !value.is_absolute() && !self.host.initial_cwd().join(value).is_absolute() {
+            if !cwd.join(value).is_absolute() {
                 return Err(ApiError::InvalidConfig {
                     field,
-                    message: "Supply an absolute path or an absolute host working directory.",
+                    message: "Supply an absolute path or an absolute host working directory."
+                        .into(),
                 });
             }
         }
-        if self
-            .defines
-            .iter()
-            .any(|entry| entry.name.is_empty() || entry.name.contains(&0))
-        {
-            return Err(ApiError::InvalidConfig {
-                field: "defines",
-                message: "Supply cache names without null bytes.",
-            });
+        for entry in &self.defines {
+            if entry.name.is_empty()
+                || entry
+                    .name
+                    .iter()
+                    .any(|byte| matches!(*byte, 0 | b'\n' | b'\r' | b'"'))
+            {
+                return Err(ApiError::InvalidConfig {
+                    field: "defines",
+                    message: format!(
+                        "Cannot write cache name {:?}. Use a nonempty name without null bytes, line breaks, or double quotes.",
+                        entry.name
+                    ),
+                });
+            }
         }
         if self
             .cancel
@@ -270,8 +281,8 @@ impl ConfigureRequest {
     ///
     /// Return any error from [Self::validate].
     pub fn prepare(&self) -> Result<PreparedConfigure, ApiError> {
-        self.validate()?;
         let cwd = self.host.initial_cwd();
+        self.validate_at(&cwd)?;
         let absolute = |path: &Path| cwd.join(path);
         let overlay = (self.write_mode == WriteMode::Overlay)
             .then(|| Arc::new(OverlayHost::from_shared(Arc::clone(&self.host))));
@@ -292,12 +303,21 @@ impl ConfigureRequest {
         if self.collect_index && matches!(services.provenance, LedgerLevel::Off) {
             services.provenance = LedgerLevel::Full { per_name_cap: 16 };
         }
+        let source_dir = absolute(&self.source_dir);
+        let build_dir = absolute(&self.build_dir);
+        let cmake_root = absolute(&self.cmake_root);
         Ok(PreparedConfigure {
-            source_dir: absolute(&self.source_dir),
-            build_dir: absolute(&self.build_dir),
-            cmake_root: absolute(&self.cmake_root),
+            source_dir,
+            build_dir,
+            cmake_root,
+            cwd,
+            generator: self.generator,
+            defines: self.defines.clone(),
+            limits: self.limits.clone(),
+            diag: self.diag.clone(),
             services: Arc::new(services),
             host,
+            base: Arc::clone(&self.host),
             overlay,
             denied,
             collect_index: self.collect_index,
@@ -313,9 +333,20 @@ pub struct PreparedConfigure {
     pub build_dir: PathBuf,
     /// Absolute root of the CMake module library.
     pub cmake_root: PathBuf,
+    /// Initial working directory used to resolve relative paths.
+    pub cwd: PathBuf,
+    /// Generator selected by the caller, if specified.
+    pub generator: Option<GeneratorKind>,
+    /// Cache definitions in application order.
+    pub defines: Vec<CacheDefine>,
+    /// Evaluator safety limits.
+    pub limits: Limits,
+    /// Initial diagnostic settings.
+    pub diag: DiagOptions,
     /// Combined evaluator settings for this session.
     pub services: Arc<Services>,
     host: Arc<dyn Host>,
+    base: Arc<dyn Host>,
     overlay: Option<Arc<OverlayHost<dyn Host>>>,
     denied: Option<Arc<NoProcessHost<dyn Host>>>,
     collect_index: bool,
@@ -343,22 +374,33 @@ impl PreparedConfigure {
     /// step if the caller requires a complete snapshot.
     #[must_use]
     pub fn finish(self, mut result: ConfigureResult) -> ConfigureResult {
-        let denied = self.denied_processes();
-        if !denied.is_empty() {
-            match &mut result.completion {
-                CompletionState::Complete => {
+        if let Some(adapter) = self.denied {
+            let log = adapter.take_denied();
+            if !log.commands.is_empty() || log.omitted_entries != 0 {
+                if matches!(result.completion, CompletionState::Complete) {
                     result.completion = CompletionState::Partial {
-                        denied_processes: denied,
+                        denied_processes: Vec::new(),
+                        omitted_denials: 0,
+                        omitted_denial_bytes: 0,
                         cancelled: false,
                     };
                 }
-                CompletionState::Partial {
-                    denied_processes, ..
-                } => *denied_processes = denied,
+                if let CompletionState::Partial {
+                    denied_processes,
+                    omitted_denials,
+                    omitted_denial_bytes,
+                    ..
+                } = &mut result.completion
+                {
+                    denied_processes.extend(log.commands);
+                    *omitted_denials = omitted_denials.saturating_add(log.omitted_entries);
+                    *omitted_denial_bytes = omitted_denial_bytes.saturating_add(log.omitted_bytes);
+                }
             }
         }
         if let Some(overlay) = self.overlay {
-            result.overlay_diff = Some(OverlayDiff::from_host(&overlay));
+            result.overlay_diff =
+                Some(OverlayDiff::from_host(overlay.as_ref(), self.base.as_ref()));
         }
         if self.collect_index {
             result.build_index();

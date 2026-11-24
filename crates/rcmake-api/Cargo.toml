@@ -11,12 +11,12 @@ repository.workspace = true
 [features]
 default = ["native", "archive"]
 native = []
-archive = ["rcmake-commands/archive"]
+archive = ["dep:rcmake-commands", "rcmake-commands/archive"]
 
 [dependencies]
 indexmap.workspace = true
 rcmake-base.workspace = true
-rcmake-commands = { path = "../rcmake-commands", default-features = false }
+rcmake-commands = { path = "../rcmake-commands", default-features = false, optional = true }
 rcmake-diag.workspace = true
 rcmake-eval.workspace = true
 rcmake-host.workspace = true
