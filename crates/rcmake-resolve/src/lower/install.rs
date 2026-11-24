@@ -3,10 +3,11 @@
 use std::convert::Infallible;
 
 use indexmap::{IndexMap, IndexSet};
-use rcmake_base::{BString, list, path_lex::Lexical};
+use rcmake_base::{BString, list};
+use rcmake_diag::Backtrace;
 use rcmake_genex::{ConfigId, EvalContext, EvalSite, evaluate, parse};
 use rcmake_model::{
-    BT, DirId, GeneratorKind, InstallKind, InstallOptions, InstallRule, ProjectModel, TargetKind,
+    DirId, GeneratorKind, InstallKind, InstallOptions, InstallRule, ProjectModel, TargetKind,
 };
 
 use super::{compute_artifacts, definition, join};
@@ -95,11 +96,8 @@ fn compiler_language(key: &[u8]) -> Option<BString> {
 /// same order.
 #[must_use]
 pub fn lower_install_manifest(model: &ProjectModel, targets: &[ResolvedTarget]) -> InstallManifest {
-    match lower_install_rules(model, targets, |rule, files| {
-        Ok::<_, Infallible>(vec![(
-            rule.options.clone(),
-            literal_files(model, rule, files),
-        )])
+    match lower_install_rules(model, targets, &[], |_, _, _, value| {
+        Ok::<_, Infallible>(value.into())
     }) {
         Ok(manifest) => manifest,
         Err(never) => match never {},
@@ -113,72 +111,44 @@ pub(crate) fn lower_install_manifest_with_configs(
     ide: Option<crate::ide::IdeFlavor>,
 ) -> Result<InstallManifest, ResolveError> {
     let mut usage = UsageResolver::new(model).with_ide(ide);
-    lower_install_rules(model, targets, |rule, files| {
-        if !files
-            .iter()
-            .any(|path| path.value.windows(2).any(|pair| pair == b"$<"))
-        {
-            return Ok(vec![(
-                rule.options.clone(),
-                literal_files(model, rule, files),
-            )]);
+    lower_install_rules(model, targets, configs, |dir, config, backtrace, value| {
+        if !has_genex(value) {
+            return Ok(value.into());
         }
-        let source = &model.dir(rule.dir).source_dir;
-        let mut host = usage.host(rule.dir);
-        let mut groups = Vec::new();
-        for config in configs {
-            let mut options = rule.options.clone();
-            if !options.configurations.is_empty()
-                && !options
-                    .configurations
-                    .iter()
-                    .any(|name| config.matches(name))
-            {
-                continue;
-            }
-            if configs.len() > 1 {
-                options.configurations = vec![config.0.clone()];
-            }
-            let mut paths = Vec::new();
-            for file in files {
-                let context = EvalContext {
-                    config: config.clone(),
-                    site: EvalSite {
-                        backtrace: file.backtrace.clone(),
-                        property: None,
-                    },
-                    ..EvalContext::default()
-                };
-                let (value, _) = evaluate(&parse(&file.value)?, &context, &mut host)?;
-                paths.extend(
-                    list::split(&value, list::Empty::Drop)
-                        .into_iter()
-                        .map(|path| join(source, &path)),
-                );
-            }
-            if !paths.is_empty() {
-                groups.push((options, paths));
-            }
-        }
-        Ok(groups)
+        let context = EvalContext {
+            config: config.clone(),
+            site: EvalSite {
+                backtrace: backtrace.clone(),
+                property: None,
+            },
+            ..EvalContext::default()
+        };
+        let (value, _) = evaluate(&parse(value)?, &context, &mut usage.host(dir))?;
+        Ok(value)
     })
 }
 
-fn literal_files(model: &ProjectModel, rule: &InstallRule, files: &[BT<BString>]) -> Vec<BString> {
-    let source = &model.dir(rule.dir).source_dir;
-    files.iter().map(|file| join(source, &file.value)).collect()
+fn has_genex(value: &[u8]) -> bool {
+    value.windows(2).any(|pair| pair == b"$<")
+}
+
+fn matches_config(options: &InstallOptions, config: &ConfigId) -> bool {
+    options.configurations.is_empty()
+        || options
+            .configurations
+            .iter()
+            .any(|name| config.matches(name))
 }
 
 fn lower_install_rules<E>(
     model: &ProjectModel,
     targets: &[ResolvedTarget],
-    mut files_for_configs: impl FnMut(
-        &InstallRule,
-        &[BT<BString>],
-    ) -> Result<Vec<(InstallOptions, Vec<BString>)>, E>,
+    configs: &[ConfigId],
+    mut eval: impl FnMut(DirId, &ConfigId, &Backtrace, &[u8]) -> Result<BString, E>,
 ) -> Result<InstallManifest, E> {
     let mut manifest = InstallManifest::default();
     let mut export_plan = 0;
+    let multi = configs.len() > 1 || model.generator.is_some_and(GeneratorKind::multi_config);
     for (index, rule) in model.installs.iter().enumerate() {
         if dir_excluded_from_all(model, rule.dir) {
             continue;
@@ -186,6 +156,12 @@ fn lower_install_rules<E>(
         let options = &rule.options;
         let recorded = recorded_args(model, index);
         let source = &model.dir(rule.dir).source_dir;
+        let mut eval_destination = |options: &mut InstallOptions, dir, config| {
+            if let Some(destination) = &mut options.destination {
+                *destination = eval(dir, config, &rule.backtrace, destination)?;
+            }
+            Ok::<_, E>(())
+        };
         let kind = match &rule.kind {
             InstallKind::Targets { targets: ids, .. } => {
                 let groups = target_options(&recorded);
@@ -203,15 +179,13 @@ fn lower_install_rules<E>(
                         let extra = groups.get(class);
                         let mut options =
                             extra.map_or_else(|| options.clone(), |extra| extra.merge(options));
-                        if !options.configurations.is_empty()
-                            && !options
-                                .configurations
-                                .iter()
-                                .any(|config| target.config.matches(config))
+                        let per_config = multi || matching.len() > 1;
+                        if (configs.is_empty() || per_config)
+                            && !matches_config(&options, &target.config)
                         {
                             continue;
                         }
-                        if matching.len() > 1 {
+                        if per_config {
                             options.configurations = vec![target.config.0.clone()];
                         }
                         let artifacts = if target.artifacts.file.is_some() {
@@ -224,6 +198,10 @@ fn lower_install_rules<E>(
                         let (key, default) = fallback;
                         let default =
                             definition(model, rule.dir, key).map_or(default, |v| v.as_slice());
+                        if !configs.is_empty() {
+                            options.destination.get_or_insert_with(|| default.into());
+                            eval_destination(&mut options, raw.dir, &target.config)?;
+                        }
                         let namelink = extra.and_then(|group| group.namelink_component).and_then(
                             |component| {
                                 let linker = artifacts.linker_file.as_ref()?;
@@ -271,13 +249,15 @@ fn lower_install_rules<E>(
                                     .iter()
                                     .any(|group| group.language == b"CXX")
                                 {
+                                    let mut bmi = bmi.clone();
+                                    eval_destination(&mut bmi, raw.dir, &target.config)?;
                                     add_bmi_include(
                                         &mut manifest,
                                         model,
                                         rule,
                                         &bmi,
                                         target,
-                                        matching.len() > 1,
+                                        multi || matching.len() > 1,
                                     );
                                 }
                             }
@@ -294,33 +274,71 @@ fn lower_install_rules<E>(
                                 .map_or_else(|| options.clone(), |extra| extra.merge(options));
                             let default = definition(model, rule.dir, b"CMAKE_INSTALL_INCLUDEDIR")
                                 .map_or(b"include".as_slice(), |value| value.as_slice());
-                            let kind = file_action(b"FILE", files, &options);
-                            manifest
-                                .actions
-                                .push(action(model, rule, &options, default, kind));
+                            let mut options = options;
+                            if !configs.is_empty() {
+                                options.destination.get_or_insert_with(|| default.into());
+                            }
+                            for config in action_configs(configs, &options, false, multi) {
+                                let mut options = options.clone();
+                                if let Some(config) = config {
+                                    eval_destination(&mut options, rule.dir, config)?;
+                                    if multi {
+                                        options.configurations = vec![config.0.clone()];
+                                    }
+                                }
+                                let kind = file_action(b"FILE", files.clone(), &options);
+                                manifest
+                                    .actions
+                                    .push(action(model, rule, &options, default, kind));
+                            }
                         }
                     }
                 }
                 continue;
             }
-            InstallKind::Files(files) | InstallKind::Programs(files) => {
-                let file_type = if matches!(rule.kind, InstallKind::Programs(_)) {
-                    b"PROGRAM".as_slice()
-                } else {
-                    b"FILE"
-                };
-                for (options, files) in files_for_configs(rule, files)? {
-                    let kind = file_action(file_type, files, &options);
+            InstallKind::Files(paths)
+            | InstallKind::Programs(paths)
+            | InstallKind::Directory(paths) => {
+                let expand_paths = !matches!(rule.kind, InstallKind::Directory(_))
+                    && paths.iter().any(|path| has_genex(&path.value));
+                for config in action_configs(configs, options, expand_paths, multi) {
+                    let mut options = options.clone();
+                    let mut files = Vec::new();
+                    if let Some(config) = config {
+                        if let Some(destination) = &mut options.destination {
+                            *destination = eval(rule.dir, config, &rule.backtrace, destination)?;
+                        }
+                        if multi {
+                            options.configurations = vec![config.0.clone()];
+                        }
+                    }
+                    for path in paths {
+                        if let Some(config) = config.filter(|_| expand_paths) {
+                            let value = eval(rule.dir, config, &path.backtrace, &path.value)?;
+                            files.extend(
+                                list::split(&value, list::Empty::Drop)
+                                    .into_iter()
+                                    .map(|path| join(source, &path)),
+                            );
+                        } else {
+                            files.push(join(source, &path.value));
+                        }
+                    }
+                    let kind = match &rule.kind {
+                        InstallKind::Directory(_) => InstallActionKind::Directory {
+                            dirs: files,
+                            options: directory_options(&recorded, &options.permissions),
+                        },
+                        _ if files.is_empty() && expand_paths => continue,
+                        InstallKind::Programs(_) => file_action(b"PROGRAM", files, &options),
+                        _ => file_action(b"FILE", files, &options),
+                    };
                     manifest
                         .actions
                         .push(action(model, rule, &options, b"", kind));
                 }
                 continue;
             }
-            InstallKind::Directory(dirs) => InstallActionKind::Directory {
-                dirs: dirs.iter().map(|d| join(source, &d.value)).collect(),
-                options: directory_options(&recorded, &options.permissions),
-            },
             InstallKind::Script(path) => InstallActionKind::Script(join(source, path)),
             InstallKind::Code(code) => InstallActionKind::Code(code.clone()),
             InstallKind::Export { .. } => {
@@ -336,6 +354,29 @@ fn lower_install_rules<E>(
             .push(action(model, rule, options, b"", kind));
     }
     Ok(manifest)
+}
+
+fn action_configs<'a>(
+    configs: &'a [ConfigId],
+    options: &InstallOptions,
+    expand_paths: bool,
+    multi: bool,
+) -> Vec<Option<&'a ConfigId>> {
+    if configs.is_empty()
+        || (!expand_paths
+            && !options
+                .destination
+                .as_ref()
+                .is_some_and(|path| has_genex(path)))
+    {
+        vec![None]
+    } else {
+        configs
+            .iter()
+            .filter(|config| !multi || matches_config(options, config))
+            .map(Some)
+            .collect()
+    }
 }
 
 fn dir_excluded_from_all(model: &ProjectModel, mut dir: DirId) -> bool {
@@ -599,9 +640,7 @@ fn target_options<'a>(recorded: &[&'a [u8]]) -> IndexMap<&'a [u8], Group<'a>> {
             }
         };
         match key {
-            b"DESTINATION" => {
-                entry.options.destination = read().map(|v| Lexical::new(&v).normalize())
-            }
+            b"DESTINATION" => entry.options.destination = read(),
             b"COMPONENT" => entry.options.component = read(),
             b"OPTIONAL" => entry.options.optional = true,
             b"EXCLUDE_FROM_ALL" => entry.options.exclude_from_all = true,

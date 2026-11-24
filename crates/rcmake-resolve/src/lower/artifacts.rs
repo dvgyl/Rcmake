@@ -1,6 +1,6 @@
 //! Artifact names and source classification.
 
-use rcmake_base::{BString, hash::HashAlgo, list, path_lex::Lexical, truth};
+use rcmake_base::{BString, ByteSlice, hash::HashAlgo, list, path_lex::Lexical, truth};
 use rcmake_genex::ConfigId;
 use rcmake_model::{DirId, GeneratorKind, ProjectModel, Target, TargetKind};
 
@@ -363,30 +363,15 @@ pub fn object_path(
         return join(&object_dir(model, target, config), &name);
     }
 
-    let mut relative = if let Some(path) = relative {
-        let mut parts = Lexical::new(&path).components().peekable();
-        let mut relative = BString::default();
-        while parts.next_if_eq(&b"..".as_slice()).is_some() {
-            relative.extend_from_slice(b"__/");
+    let name = relative.unwrap_or_else(|| absolute.normalize());
+    let mut safe = name.trim_start_with(|ch| ch == '/').replace(b"../", b"__/");
+    for byte in &mut safe {
+        if matches!(*byte, b':' | b' ') {
+            *byte = b'_';
         }
-        if relative.is_empty() && parts.peek() == Some(&b"__".as_slice()) {
-            relative.extend_from_slice(b"__/source/");
-        }
-        relative.extend_from_slice(&list_path(parts));
-        relative
-    } else {
-        let mut path = if absolute.root_directory().is_empty() {
-            BString::from(format!("__/external/relative-{parent_count}"))
-        } else {
-            BString::from("__/external/root-")
-        };
-        for byte in absolute.root_name() {
-            path.extend_from_slice(format!("{byte:02x}").as_bytes());
-        }
-        join(&path, &list_path(absolute.components().skip(parent_count)))
-    };
-    relative.extend_from_slice(suffix);
-    join(&object_dir(model, target, config), &relative)
+    }
+    safe.extend_from_slice(suffix);
+    join(&object_dir(model, target, config), &safe)
 }
 
 /// Choose a link language from the languages of the target's translation units.

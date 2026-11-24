@@ -1295,6 +1295,165 @@ fn install_file_paths_use_target_artifacts_and_the_install_configuration() -> Te
     Ok(())
 }
 
+#[test]
+fn evaluates_install_destinations_with_the_selected_configuration() -> TestResult {
+    let mut model = project();
+    let host = PureHost::default();
+    host.seed_file(Path::new("/src/lib.c"), b"")?;
+    let library = model.add_target(target("demo", TargetKind::StaticLibrary, &["lib.c"]))?;
+    model.exports.insert(
+        "demo".into(),
+        ExportSet {
+            name: "demo".into(),
+            targets: vec![library],
+            install_rules: vec![0],
+        },
+    );
+    for (kind, destination) in [
+        (
+            InstallKind::Targets {
+                targets: vec![library],
+                export: Some("demo".into()),
+            },
+            "$<IF:$<CONFIG:Debug>,debug/lib,/release/lib>",
+        ),
+        (
+            InstallKind::Files(vec![entry("header.h")]),
+            "headers/$<CONFIG>",
+        ),
+        (
+            InstallKind::Programs(vec![entry("tool")]),
+            "tools/$<CONFIG>",
+        ),
+        (
+            InstallKind::Directory(vec![entry("data/")]),
+            "data/$<CONFIG>",
+        ),
+        (
+            InstallKind::Export {
+                set: "demo".into(),
+                namespace: "Demo::".into(),
+                file: None,
+                cxx_modules_directory: None,
+            },
+            "cmake/$<CONFIG>",
+        ),
+    ] {
+        model.add_install(InstallRule {
+            dir: DirId::ROOT,
+            backtrace: backtrace(15),
+            kind,
+            options: InstallOptions {
+                destination: Some(destination.into()),
+                ..InstallOptions::default()
+            },
+        });
+    }
+    let configs = [ConfigId("Debug".into()), ConfigId("Release".into())];
+    let result = resolve(&model, &host, &configs)?;
+    let destinations: Vec<_> = result
+        .install
+        .actions
+        .iter()
+        .map(|action| action.destination.as_slice())
+        .collect();
+    assert_eq!(
+        destinations,
+        [
+            b"debug/lib".as_slice(),
+            b"/release/lib",
+            b"headers/Debug",
+            b"headers/Release",
+            b"tools/Debug",
+            b"tools/Release",
+            b"data/Debug",
+            b"data/Release",
+            b"cmake/$<CONFIG>",
+        ]
+    );
+    for (index, action) in result.install.actions[..8].iter().enumerate() {
+        assert_eq!(action.configurations, [configs[index % 2].0.clone()]);
+    }
+    let exported = &result.exports[0].targets[0].config_properties;
+    assert_eq!(
+        exported[b"Debug".as_slice()][b"IMPORTED_LOCATION".as_slice()],
+        "debug/lib/libdemo.a"
+    );
+    assert_eq!(
+        exported[b"Release".as_slice()][b"IMPORTED_LOCATION".as_slice()],
+        "/release/lib/libdemo.a"
+    );
+
+    model.installs[1].options.destination = Some("$<$<CONFIG:Debug>:headers>".into());
+    let result = resolve(&model, &host, &configs[1..])?;
+    assert_eq!(result.install.actions[0].destination, "/release/lib");
+    assert!(result.install.actions[0].configurations.is_empty());
+    assert_eq!(
+        result.install.actions[1].kind,
+        InstallActionKind::Code("file(INSTALL DESTINATION \"\")".into())
+    );
+    Ok(())
+}
+
+#[test]
+fn current_directory_includes_are_local_to_the_compile_group() -> TestResult {
+    let mut model = project();
+    let dir = model.add_directory(
+        DirId::ROOT,
+        "/src/child".into(),
+        "/out/child".into(),
+        Default::default(),
+    )?;
+    let mut library = target("child", TargetKind::StaticLibrary, &["child.c"]);
+    library.dir = dir;
+    library
+        .usage
+        .push(UsageField::IncludeDirectories, entry("/src/extra"));
+    library
+        .usage
+        .push(UsageField::IncludeDirectories, entry("/out/child/"));
+    let child = model.add_target(library)?;
+    let parent = model.add_target(target("parent", TargetKind::StaticLibrary, &["parent.c"]))?;
+    model
+        .dir_mut(dir)
+        .vars
+        .insert("CMAKE_INCLUDE_CURRENT_DIR".into(), "ON".into());
+    let host = PureHost::default();
+    host.seed_file(Path::new("/src/child/child.c"), b"")?;
+    host.seed_file(Path::new("/src/parent.c"), b"")?;
+    let result = resolve(&model, &host, &[ConfigId::default()])?;
+    for (target, includes) in [
+        (child, &["/out/child", "/src/child", "/src/extra"][..]),
+        (parent, &[][..]),
+    ] {
+        let found = result
+            .targets
+            .iter()
+            .find(|resolved| resolved.id == target)
+            .ok_or("Missing target.")?;
+        let actual: Vec<_> = found.compile_groups[0]
+            .includes
+            .iter()
+            .map(|include| &include.path.value)
+            .collect();
+        assert_eq!(actual, includes);
+    }
+    let property = UsageResolver::new(&model).collect(
+        child,
+        UsageField::IncludeDirectories,
+        &EvalContext::default(),
+    )?;
+    assert_eq!(
+        property
+            .entries
+            .into_iter()
+            .map(|entry| entry.value)
+            .collect::<Vec<_>>(),
+        ["/src/extra", "/out/child/"]
+    );
+    Ok(())
+}
+
 fn clang_scan(model: &mut ProjectModel) {
     for (key, value) in [
         ("CMAKE_CXX_COMPILER_ID", "Clang"),

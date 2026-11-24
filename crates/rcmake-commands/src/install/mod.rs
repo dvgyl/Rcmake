@@ -135,11 +135,12 @@ fn common(
 }
 
 fn destination(cx: &Cx<'_>, path: &[u8]) -> BString {
-    if path.windows(2).any(|window| window == b"$<")
-        || path.is_empty()
-        || cx.policy(PolicyId::new(177)) != PolicyStatus::New
-    {
+    if path.is_empty() || cx.policy(PolicyId::new(177)) != PolicyStatus::New {
         path.into()
+    } else if path.windows(2).any(|window| window == b"$<") {
+        [b"$<PATH:CMAKE_PATH,NORMALIZE,", path, b">"]
+            .concat()
+            .into()
     } else {
         Lexical::new(path).normalize()
     }
@@ -213,7 +214,11 @@ fn install(cx: &mut Cx<'_>, input: &[ExpandedArg]) -> CmdResult {
     {
         options.component = Some(default_component(cx));
     }
-    for path in options.destination.iter().chain(extra_destinations.iter()) {
+    for path in options
+        .destination
+        .iter()
+        .chain(extra_destinations.iter().map(|(_, path)| path))
+    {
         if Lexical::new(path).absolute() {
             cx.issue(
                 MessageKind::Warning,
@@ -245,6 +250,11 @@ fn install(cx: &mut Cx<'_>, input: &[ExpandedArg]) -> CmdResult {
     });
     let section = format!("_RCMAKE_INSTALL_{index}");
     record_args(cx, &section, &input);
+    for (argument, path) in extra_destinations {
+        cx.global()
+            .props
+            .set(format!("{section}_ARG{argument}").into(), path);
+    }
     if let Some((name, targets)) = members {
         let set = cx
             .project()
@@ -270,11 +280,13 @@ fn targets(
     cx: &mut Cx<'_>,
     args: &mut Args<'_>,
     options: &mut InstallOptions,
-    destinations: &mut Vec<BString>,
+    destinations: &mut Vec<(usize, BString)>,
 ) -> Result<InstallKind> {
+    let argument_count = args.len() + 1;
     let targets = target_ids(cx, values(args), b"TARGETS")?;
     let mut export = None;
     let mut artifact_options = InstallOptions::default();
+    let mut destination_argument = None;
     let mut group: Option<&[u8]> = None;
     let mut namelink = None;
     let mut file_sets = Vec::new();
@@ -310,7 +322,11 @@ fn targets(
                 }
             }
             key if artifact(key) => {
-                destinations.extend(artifact_options.destination.take());
+                destinations.extend(
+                    destination_argument
+                        .take()
+                        .zip(artifact_options.destination.take()),
+                );
                 artifact_options = InstallOptions::default();
                 group = Some(key);
                 namelink = None;
@@ -324,6 +340,9 @@ fn targets(
                 }
             }
             _ => {
+                if group.is_some() && key == b"DESTINATION" {
+                    destination_argument = Some(argument_count - args.len());
+                }
                 let options = if group.is_some() {
                     &mut artifact_options
                 } else {
@@ -335,7 +354,7 @@ fn targets(
             }
         }
     }
-    destinations.extend(artifact_options.destination);
+    destinations.extend(destination_argument.zip(artifact_options.destination));
     if export.is_some() {
         require_exported_file_sets(cx, &targets, &file_sets)?;
     }

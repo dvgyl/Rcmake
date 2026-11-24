@@ -169,18 +169,18 @@ fn executable_rules_preserve_paths_and_library_inputs() -> TestResult {
             "/tool dir/cc",
             "-MD",
             "-MF",
-            "CMakeFiles/main.dir/main file.c.o.d",
+            "CMakeFiles/main.dir/main_file.c.o.d",
             "-c",
             "/project/main file.c",
             "-o",
-            "CMakeFiles/main.dir/main file.c.o"
+            "CMakeFiles/main.dir/main_file.c.o"
         ]
     );
-    assert_eq!(*depfile, Some("CMakeFiles/main.dir/main file.c.o.d".into()));
+    assert_eq!(*depfile, Some("CMakeFiles/main.dir/main_file.c.o.d".into()));
     assert_eq!(step.output, "my bin/my app");
     assert_eq!(
         *inputs,
-        ["CMakeFiles/main.dir/main file.c.o", "/other libs/libx.a"]
+        ["CMakeFiles/main.dir/main_file.c.o", "/other libs/libx.a"]
     );
     let [linker] = invocations.as_slice() else {
         return Err("Expected one linker invocation.".into());
@@ -189,7 +189,7 @@ fn executable_rules_preserve_paths_and_library_inputs() -> TestResult {
         linker.argv,
         [
             "/tool dir/cc",
-            "CMakeFiles/main.dir/main file.c.o",
+            "CMakeFiles/main.dir/main_file.c.o",
             "-g",
             "-L/other libs",
             "/other libs/libx.a",
@@ -504,14 +504,8 @@ fn object_paths_use_the_project_source_and_build_trees() -> TestResult {
         ("../../src/os.cc", "__/__/src/os.cc.o"),
         ("/build/test/generated.c", "__/generated.c.o"),
         ("/build/test/detail/generated.c", "generated.c.o"),
-        (
-            "/build-other/generated.c",
-            "__/external/root-/build-other/generated.c.o",
-        ),
-        (
-            "../../../external/os.cc",
-            "__/external/root-/external/os.cc.o",
-        ),
+        ("/build-other/generated.c", "build-other/generated.c.o"),
+        ("../../../external/os.cc", "external/os.cc.o"),
     ] {
         let expected = format!("test/detail/CMakeFiles/scan-test.dir/{object}");
         assert_eq!(
@@ -563,7 +557,7 @@ fn classifies_sources_and_keeps_external_object_paths_distinct() {
         "CMakeFiles/main.dir/d/main.c.o"
     );
     let out = object_path(&model, &raw, &config, b"../ext/main.c");
-    assert!(out.starts_with(b"CMakeFiles/main.dir/__/"));
+    assert_eq!(out, "CMakeFiles/main.dir/ext/main.c.o");
     assert_ne!(out, object_path(&model, &raw, &config, b"/ext2/main.c"));
     assert_ne!(
         out,

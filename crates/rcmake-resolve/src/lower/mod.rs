@@ -76,6 +76,16 @@ fn join(base: &[u8], path: &[u8]) -> BString {
     }
 }
 
+pub(crate) fn without_trailing_slashes(path: &[u8]) -> &[u8] {
+    let root = Lexical::new(path);
+    let root_len = root.root_name().len() + root.root_directory().len();
+    let end = path
+        .iter()
+        .rposition(|&byte| byte != b'/')
+        .map_or(0, |i| i + 1);
+    path.get(..end.max(root_len)).unwrap_or(path)
+}
+
 /// Expand the `<NAME>` placeholders of a rule template with `lookup`. Unknown
 /// placeholders stay as written.
 #[must_use]

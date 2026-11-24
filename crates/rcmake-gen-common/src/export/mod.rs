@@ -502,6 +502,102 @@ mod tests {
     #[cfg(unix)]
     use std::time::Duration;
 
+    #[test]
+    fn renders_namespace_qualified_sibling_links() -> Result<(), Box<dyn std::error::Error>> {
+        use rcmake_model::{
+            BT, DirId, ExportSet, InstallKind, InstallOptions, InstallRule, LinkItem, ProjectModel,
+            Target, TargetKind, TargetOrigin,
+        };
+
+        let mut model = ProjectModel::default();
+        model.set_root_dirs("/src".into(), "/build".into());
+        let interface = |name: &str| {
+            Target::new(
+                name.into(),
+                TargetKind::InterfaceLibrary,
+                TargetOrigin::Normal,
+                DirId::ROOT,
+                Default::default(),
+                Default::default(),
+            )
+        };
+        let mut dependency = interface("dep");
+        dependency.props.set("EXPORT_NAME".into(), "renamed".into());
+        let dependency = model.add_target(dependency)?;
+        model.add_alias(DirId::ROOT, "Local::dep".into(), dependency)?;
+        let mut consumer = interface("consumer");
+        consumer.usage.interface_link_libraries = Some(vec![LinkItem {
+            text: BT::new(
+                concat!(
+                    "dep;$<LINK_ONLY:Local::dep>;",
+                    "$<$<CONFIG:Debug>:$<TARGET_NAME:dep>>;",
+                    "$<$<CONFIG:Debug>:dep>;pthread"
+                )
+                .into(),
+                Default::default(),
+            ),
+            lookup_dir: DirId::ROOT,
+        }]);
+        let consumer = model.add_target(consumer)?;
+        model.exports.insert(
+            "sample".into(),
+            ExportSet {
+                name: "sample".into(),
+                targets: vec![consumer, dependency],
+                install_rules: Vec::new(),
+            },
+        );
+        model.add_install(InstallRule {
+            dir: DirId::ROOT,
+            backtrace: Default::default(),
+            kind: InstallKind::Export {
+                set: "sample".into(),
+                namespace: "Install::".into(),
+                file: None,
+                cxx_modules_directory: None,
+            },
+            options: InstallOptions {
+                destination: Some("lib/cmake".into()),
+                ..Default::default()
+            },
+        });
+        for (index, arg) in [
+            "EXPORT",
+            "sample",
+            "NAMESPACE",
+            "Build::",
+            "FILE",
+            "targets.cmake",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            model.global.props.set(
+                format!("_RCMAKE_BUILD_EXPORT_0_ARG{index}").into(),
+                arg.into(),
+            );
+        }
+        model
+            .global
+            .props
+            .set("_RCMAKE_BUILD_EXPORT_COUNT".into(), "1".into());
+        model
+            .global
+            .props
+            .set("_RCMAKE_BUILD_EXPORT_0_DIRECTORY".into(), "0".into());
+        let result = rcmake_resolve::resolve(&model, &PureHost::default(), &[Default::default()])?;
+        assert_eq!(result.exports.len(), 2);
+        for (plan, prefix) in result.exports.iter().zip(["Install::", "Build::"]) {
+            let name = format!("{prefix}renamed");
+            let main = render_main(plan, b"lib/cmake", None, b"")?;
+            let expected = format!(
+                "\"INTERFACE_LINK_LIBRARIES\" \"{name};$<LINK_ONLY:{name}>;$<$<CONFIG:Debug>:{name}>;$<$<CONFIG:Debug>:dep>;pthread\""
+            );
+            assert!(String::from_utf8_lossy(&main).contains(&expected), "{main}");
+        }
+        Ok(())
+    }
+
     fn export_plan(install: bool) -> ExportPlan {
         let location = |path: &str| -> BString {
             if install {

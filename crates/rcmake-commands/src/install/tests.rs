@@ -144,6 +144,38 @@ export(PACKAGE Enabled)
 }
 
 #[test]
+fn install_records_destination_normalization_at_the_call_site() -> TestResult {
+    let (_, mut interp) = configure(
+        r#"
+install(FILES header DESTINATION "./include/../$<CONFIG>/")
+install(TARGETS core ARCHIVE DESTINATION "./lib/../$<CONFIG>/")
+cmake_policy(SET CMP0177 OLD)
+install(TARGETS core ARCHIVE DESTINATION "./lib/../$<CONFIG>/")
+"#,
+        0,
+    )?;
+    let mut cx = interp.cx();
+    let model = cx.project();
+    assert_eq!(
+        model.installs[0].options.destination,
+        Some("$<PATH:CMAKE_PATH,NORMALIZE,./include/../$<CONFIG>/>".into())
+    );
+    for (rule, expected) in [
+        (1, "$<PATH:CMAKE_PATH,NORMALIZE,./lib/../$<CONFIG>/>"),
+        (2, "./lib/../$<CONFIG>/"),
+    ] {
+        assert_eq!(
+            model
+                .global
+                .props
+                .get(format!("_RCMAKE_INSTALL_{rule}_ARG4").as_bytes()),
+            Some(&expected.into())
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn install_and_export_reject_invalid_argument_sets() -> TestResult {
     for (code, expected) in [
         (

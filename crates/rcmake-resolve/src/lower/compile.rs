@@ -9,7 +9,9 @@ use super::artifacts::is_darwin;
 use super::launcher;
 use super::shell::{command, join_words, quote, rule_invocations};
 use super::standard::standard_flag;
-use super::{definition, expand_rule, join, object_path, target_property};
+use super::{
+    definition, expand_rule, join, object_path, target_property, without_trailing_slashes,
+};
 use crate::{ArtifactSet, BuildStep, CompileGroup, CompileUnit, ResolveError};
 
 pub(crate) fn language_flags(
@@ -190,16 +192,6 @@ fn includes(model: &ProjectModel, target: &Target, group: &CompileGroup) -> BStr
             quote(&[b"-I", path].concat())
         })
     }))
-}
-
-fn without_trailing_slashes(path: &[u8]) -> &[u8] {
-    let root = Lexical::new(path);
-    let root_len = root.root_name().len() + root.root_directory().len();
-    let end = path
-        .iter()
-        .rposition(|&byte| byte != b'/')
-        .map_or(0, |i| i + 1);
-    path.get(..end.max(root_len)).unwrap_or(path)
 }
 
 pub(super) fn compile_arguments(

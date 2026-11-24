@@ -29,6 +29,7 @@ use rcmake_model::{
 use sources::{SourcePaths, TargetInputs, external_object};
 use usage::{ResolvedLinkItem, ResolvedLinkKind, UsageResolver};
 
+mod export_links;
 mod sources;
 mod unity;
 
@@ -705,7 +706,7 @@ pub fn resolve_with_options(
     if let Some(error) = xcode_link_error {
         return Err(error);
     }
-    let install =
+    let mut install =
         lower::lower_install_manifest_with_configs(model, &targets, &configs, options.ide)?;
     let exports = resolve_exports(
         model,
@@ -713,6 +714,17 @@ pub fn resolve_with_options(
         &targets,
         &install,
     )?;
+    for action in &mut install.actions {
+        if action.destination.is_empty()
+            && matches!(
+                action.kind,
+                InstallActionKind::Files { .. } | InstallActionKind::Directory { .. }
+            )
+        {
+            // Keep the empty destination in the generated file(INSTALL) command.
+            action.kind = InstallActionKind::Code("file(INSTALL DESTINATION \"\")".into());
+        }
+    }
     let mut metadata = lower::collect_metadata(model);
     if let Some(toolchain) = metadata.toolchains.get_mut(b"CXX".as_slice())
         && toolchain.module_map_format.is_none()
@@ -2162,12 +2174,20 @@ fn resolve_exports(
             if let Some(rules) = include_rules.get(&id) {
                 add_include_destinations(usage, id, rules, &mut target)?;
             }
+            export_links::qualify(
+                model,
+                id,
+                &members.targets,
+                &plan.namespace,
+                PreprocessMode::Install,
+                &mut target,
+            )?;
             plan.targets.push(target);
         }
         plans.push(plan);
     }
 
-    let mut build_plans = IndexMap::<BString, ExportPlan>::new();
+    let mut build_plans = IndexMap::<BString, (ExportPlan, IndexSet<TargetId>)>::new();
     let props = &model.global.props;
     let count = props
         .get(b"_RCMAKE_BUILD_EXPORT_COUNT")
@@ -2242,17 +2262,24 @@ fn resolve_exports(
             }
         }
         let file = absolute_path(&directory.binary_dir, &file);
-        let plan = build_plans
-            .entry(file.clone())
-            .or_insert_with(|| ExportPlan {
-                set,
-                namespace,
-                file,
-                cxx_modules_directory,
-                ..ExportPlan::default()
-            });
-        for id in ids {
-            let target = export_target(
+        let (_, members) = build_plans.entry(file.clone()).or_insert_with(|| {
+            (
+                ExportPlan {
+                    set,
+                    namespace,
+                    file,
+                    cxx_modules_directory,
+                    ..ExportPlan::default()
+                },
+                IndexSet::new(),
+            )
+        });
+        members.extend(ids);
+    }
+    for (mut plan, members) in build_plans.into_values() {
+        let members: Vec<_> = members.into_iter().collect();
+        for &id in &members {
+            let mut target = export_target(
                 model,
                 id,
                 targets.iter().filter(|target| target.id == id),
@@ -2263,11 +2290,19 @@ fn resolve_exports(
                 .iter()
                 .any(|existing| existing.name == target.name)
             {
+                export_links::qualify(
+                    model,
+                    id,
+                    &members,
+                    &plan.namespace,
+                    PreprocessMode::Build,
+                    &mut target,
+                )?;
                 plan.targets.push(target);
             }
         }
+        plans.push(plan);
     }
-    plans.extend(build_plans.into_values());
     Ok(plans)
 }
 
@@ -2363,11 +2398,7 @@ fn export_target<'a>(
         _ => return Err(invalid_export_record()),
     };
     let mut exported = ExportedTarget {
-        name: target
-            .props
-            .get(b"EXPORT_NAME")
-            .cloned()
-            .unwrap_or_else(|| target.name.clone()),
+        name: export_name(target).clone(),
         kind: kind.into(),
         ..ExportedTarget::default()
     };
@@ -2392,15 +2423,6 @@ fn export_target<'a>(
             let value = list::join(entries.iter().map(|entry| &entry.value));
             add_export_property(&mut exported, key.into(), &value, mode)?;
         }
-    }
-    if let Some(items) = &target.usage.interface_link_libraries {
-        let value = list::join(items.iter().map(|item| &item.text.value));
-        add_export_property(
-            &mut exported,
-            "INTERFACE_LINK_LIBRARIES".into(),
-            &value,
-            mode,
-        )?;
     }
     for facts in resolved {
         let mut properties = IndexMap::new();
@@ -2449,6 +2471,14 @@ fn export_target<'a>(
     Ok(exported)
 }
 
+fn export_name(target: &Target) -> &BString {
+    target
+        .props
+        .get(b"EXPORT_NAME")
+        .filter(|name| !name.is_empty())
+        .unwrap_or(&target.name)
+}
+
 fn exported_location(
     install: Option<&InstallManifest>,
     target: &ResolvedTarget,
@@ -2487,6 +2517,27 @@ fn add_export_property(
     value: &[u8],
     mode: PreprocessMode,
 ) -> Result<(), ResolveError> {
+    let mut items = export_property_items(value, mode)?;
+    if mode == PreprocessMode::Install {
+        for item in &mut items {
+            *item = rcmake_genex::rewrite_install_prefix(item, b"${_IMPORT_PREFIX}");
+            if matches!(
+                key.as_slice(),
+                b"INTERFACE_INCLUDE_DIRECTORIES" | b"INTERFACE_SYSTEM_INCLUDE_DIRECTORIES"
+            ) && !Lexical::new(item).absolute()
+                && !item.starts_with(b"$")
+            {
+                *item = [b"${_IMPORT_PREFIX}/", item.as_slice()].concat().into();
+            }
+        }
+    }
+    if !items.is_empty() {
+        target.properties.insert(key, list::join(items));
+    }
+    Ok(())
+}
+
+fn export_property_items(value: &[u8], mode: PreprocessMode) -> Result<Vec<BString>, ResolveError> {
     let ast = rcmake_genex::strip(&rcmake_genex::parse(value)?, mode);
     let mut items = Vec::new();
     let mut item = BString::default();
@@ -2511,23 +2562,7 @@ fn add_export_property(
     if !item.is_empty() {
         items.push(item);
     }
-    if mode == PreprocessMode::Install {
-        for item in &mut items {
-            *item = rcmake_genex::rewrite_install_prefix(item, b"${_IMPORT_PREFIX}");
-            if matches!(
-                key.as_slice(),
-                b"INTERFACE_INCLUDE_DIRECTORIES" | b"INTERFACE_SYSTEM_INCLUDE_DIRECTORIES"
-            ) && !Lexical::new(item).absolute()
-                && !item.starts_with(b"$")
-            {
-                *item = [b"${_IMPORT_PREFIX}/", item.as_slice()].concat().into();
-            }
-        }
-    }
-    if !items.is_empty() {
-        target.properties.insert(key, list::join(items));
-    }
-    Ok(())
+    Ok(items)
 }
 
 fn write_genex(nodes: &[GenexNode], output: &mut BString) {

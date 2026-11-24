@@ -19,7 +19,11 @@ use rcmake_model::{
     UsageField, UsageScope,
 };
 
-use crate::{InterfaceInclude, sources::SourcePaths};
+use crate::{
+    InterfaceInclude,
+    lower::{definition, without_trailing_slashes},
+    sources::SourcePaths,
+};
 
 mod artifacts;
 mod host;
@@ -625,13 +629,27 @@ impl<'a> UsageResolver<'a> {
 
         let system: HashSet<_> = system
             .entries
-            .into_iter()
-            .map(|entry| entry.value)
+            .iter()
+            .map(|entry| without_trailing_slashes(&entry.value))
             .collect();
-        let mut includes: Vec<_> = entries
+        let directory = self.model.dir(owner.dir);
+        let current_dirs = definition(self.model, owner.dir, b"CMAKE_INCLUDE_CURRENT_DIR")
+            .filter(|value| truth::is_on(value))
             .into_iter()
+            .flat_map(|_| [&directory.binary_dir, &directory.source_dir])
+            .filter(|path| !path.is_empty())
+            .map(|path| BT::new(path.clone(), Default::default()));
+        let mut seen = HashSet::new();
+        let mut includes: Vec<_> = current_dirs
+            .chain(entries)
+            .map(|mut path| {
+                let len = without_trailing_slashes(&path.value).len();
+                path.value.truncate(len);
+                path
+            })
+            .filter(|path| seen.insert(path.value.clone()))
             .map(|path| InterfaceInclude {
-                system: system.contains(&path.value),
+                system: system.contains(path.value.as_slice()),
                 path,
             })
             .collect();
