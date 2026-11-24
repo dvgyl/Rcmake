@@ -6,12 +6,13 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use rcmake_base::list::{Empty, split_into};
 use rcmake_base::{BString, Limits, truth};
 use rcmake_diag::{DiagAction, DiagCategory, DiagOptions, PolicyId, PolicyStatus};
 use rcmake_expr::{CondEnv, CondError, ExpandEnv, ExpandError, ExpandedArg};
-use rcmake_host::{PureHost, Stream};
+use rcmake_host::{Host, NativeHost, PureHost, Stream};
 use rcmake_syntax::{ArgKind, Argument};
 
 use rcmake_model::DirId;
@@ -463,6 +464,43 @@ fn run_files(main: &str, files: &[(&str, &str)]) -> Out {
         stdout: String::from_utf8_lossy(&host.stream_bytes(Stream::Stdout)).into_owned(),
         stderr: String::from_utf8_lossy(&host.stream_bytes(Stream::Stderr)).into_owned(),
     }
+}
+
+fn assert_empty_loop_hits_budget(script: &'static [u8]) {
+    let (send, receive) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let (mut interp, _) = new_interp(&[], RunMode::Script);
+        let host = Arc::new(NativeHost::new().expect("native host"));
+        let budget = Duration::from_millis(50);
+        interp.config.host = host.clone();
+        interp.config.limits.wall_budget = Some(budget);
+        interp.started = host.monotonic();
+        assert!(interp.eval_code(script).is_ok(), "valid script");
+        assert!(
+            interp.fatal_occurred(),
+            "the empty loop must exhaust the budget"
+        );
+        assert!(host.monotonic() - interp.started > budget);
+        send.send(()).expect("send test result");
+    });
+    match receive.recv_timeout(Duration::from_secs(5)) {
+        Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            worker.join().expect("run budget test");
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            panic!("the empty loop did not stop within five seconds");
+        }
+    }
+}
+
+#[test]
+fn empty_while_stops_at_wall_budget() {
+    assert_empty_loop_hits_budget(b"while(TRUE)\nendwhile()");
+}
+
+#[test]
+fn empty_foreach_range_stops_at_wall_budget() {
+    assert_empty_loop_hits_budget(b"foreach(i RANGE 1000000000)\nendforeach()");
 }
 
 fn run(main: &str) -> Out {

@@ -882,7 +882,7 @@ impl Interp {
         let lower = fold_command_name(name);
         FLOW_CONTROL.contains(&lower.as_slice())
             || self.scripted.contains_key(&lower)
-            || self.registry.get(&lower).is_some()
+            || self.registry.get_lower(&lower).is_some()
     }
 
     pub(crate) fn lookup_command(&self, lower: &[u8]) -> Option<Command> {
@@ -890,8 +890,8 @@ impl Interp {
             return Some(cmd.clone());
         }
         self.registry
-            .get(lower)
-            .map(|(f, flags)| Command::Builtin(f, flags, self.registry.takes_raw_args(lower)))
+            .get_lower(lower)
+            .map(|b| Command::Builtin(b.func, b.flags, b.raw))
     }
 
     /// Sorted names of all known commands (`cmState::GetCommandNames`).
@@ -933,6 +933,16 @@ impl Interp {
         configured.min(HARD_RECURSION_CEILING)
     }
 
+    /// Get the current backtrace with a new command frame.
+    pub(crate) fn command_backtrace(&self, file: &Arc<[u8]>, line: u32, name: &[u8]) -> Backtrace {
+        self.bt.push(Frame {
+            file: Arc::clone(file),
+            line,
+            name: Some(Arc::from(name)),
+            kind: FrameKind::Command,
+        })
+    }
+
     /// Run `f` with a call frame for `name` at `file:line` (`CallScope`), enforce the
     /// recursion limit, and convert command errors into diagnostics.
     pub(crate) fn with_command_frame(
@@ -955,13 +965,8 @@ impl Interp {
         defer_id: Option<BString>,
         f: impl FnOnce(&mut Self) -> CmdResult,
     ) -> CmdResult {
-        let saved_bt = self.bt.clone();
-        self.bt = self.bt.push(Frame {
-            file: Arc::clone(file),
-            line,
-            name: Some(Arc::from(name)),
-            kind: FrameKind::Command,
-        });
+        let bt = self.command_backtrace(file, line, name);
+        let saved_bt = core::mem::replace(&mut self.bt, bt);
         let saved_defer = core::mem::replace(&mut self.top_defer_id, defer_id);
         self.depth = self.depth.saturating_add(1);
         let saved_line = core::mem::replace(&mut self.cur_line, line);
@@ -1012,6 +1017,23 @@ impl Interp {
         let expand = self.frontend.expand;
         let mut failed = false;
         for arg in args {
+            // Short literal arguments need no variable lookups, escape processing,
+            // or list splitting. Keep their original kind and line number.
+            let text = arg.text.as_slice();
+            if text.len() <= 64
+                && !text.iter().any(|&b| {
+                    matches!(b, b'$' | b'\\') || (b == b';' && arg.kind == ArgKind::Unquoted)
+                })
+            {
+                if !text.is_empty() || arg.kind != ArgKind::Unquoted {
+                    out.push(ExpandedArg {
+                        value: arg.text.clone(),
+                        kind: arg.kind,
+                        line: arg.line,
+                    });
+                }
+                continue;
+            }
             if let Err(e) = expand(core::slice::from_ref(arg), self, &mut out) {
                 let body = self.syntax_error_text(arg, e.message);
                 self.fatal_here(body);
@@ -1207,7 +1229,8 @@ impl Interp {
         Ok(Flow::Normal)
     }
 
-    fn over_budget(&mut self) -> bool {
+    /// Stop execution if the optional wall-clock budget has expired.
+    pub(crate) fn over_budget(&mut self) -> bool {
         let Some(budget) = self.config.limits.wall_budget else {
             return false;
         };
@@ -1220,12 +1243,9 @@ impl Interp {
 
     /// Execute the command at `i` and return the index of the next command.
     fn exec_at(&mut self, code: &Code, i: usize) -> (CmdResult, usize) {
-        let cmds = Arc::clone(&code.cmds);
-        let Some(cmd) = cmds.get(i) else {
+        let Some(cmd) = code.cmds.get(i) else {
             return (Ok(Flow::Normal), i + 1);
         };
-        let end = code.end_of(i);
-        let after = end.max(i) + 1;
         let result = match cmd.lower.as_slice() {
             b"if" => self.exec_if(code, i),
             b"foreach" => self.exec_foreach(code, i),
@@ -1236,7 +1256,7 @@ impl Interp {
             _ => return (self.exec_command(code, i), i + 1),
         };
         match result {
-            Ok(result) => (result, after),
+            Ok(result) => (result, code.end_of(i).max(i) + 1),
             // The opener failed and did not open a block: run its body as ordinary
             // commands, so that the end command reports its own error.
             Err(e) => (Err(e), i + 1),

@@ -63,7 +63,11 @@ impl VarStack {
 
     fn insert_top(&mut self, name: &[u8], binding: Binding) {
         if let Some(top) = self.scopes.last_mut() {
-            top.insert(BString::from(name), binding);
+            if let Some(current) = top.get_mut(name) {
+                *current = binding;
+            } else {
+                top.insert(BString::from(name), binding);
+            }
         }
     }
 

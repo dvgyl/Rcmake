@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use rcmake_base::BString;
 use rcmake_base::list::{Empty, split_into};
-use rcmake_diag::{DiagCategory, Effect, Frame, FrameKind, MessageKind, PolicyId, PolicyStatus};
+use rcmake_diag::{Backtrace, DiagCategory, Effect, MessageKind, PolicyId, PolicyStatus};
 use rcmake_expr::ExpandedArg;
 use rcmake_syntax::{Argument, CommandInvocation};
 
@@ -71,13 +71,17 @@ impl Interp {
         name: &[u8],
         f: impl FnOnce(&mut Self) -> R,
     ) -> R {
-        let saved = self.bt.clone();
-        self.bt = self.bt.push(Frame {
-            file: Arc::clone(file),
-            line,
-            name: Some(Arc::from(name)),
-            kind: FrameKind::Command,
-        });
+        let bt = self.command_backtrace(file, line, name);
+        self.with_plain_backtrace(bt, line, f)
+    }
+
+    fn with_plain_backtrace<R>(
+        &mut self,
+        bt: Backtrace,
+        line: u32,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        let saved = core::mem::replace(&mut self.bt, bt);
         let saved_line = core::mem::replace(&mut self.cur_line, line);
         let r = f(self);
         self.cur_line = saved_line;
@@ -514,6 +518,9 @@ impl Interp {
             ForeachPlan::Items { var, items } => {
                 let saved = self.loop_var_saved(&var);
                 for item in items {
+                    if self.over_budget() {
+                        return Err(CmdError::Reported);
+                    }
                     self.define(&var, item);
                     let pass = self.loop_pass(code, start, end);
                     restore = pass.restore;
@@ -535,6 +542,9 @@ impl Interp {
                 let saved = self.loop_var_saved(&var);
                 let mut value = first;
                 for _ in 0..count {
+                    if self.over_budget() {
+                        return Err(CmdError::Reported);
+                    }
                     self.define(&var, value.to_string().into());
                     value = value.saturating_add(step);
                     let pass = self.loop_pass(code, start, end);
@@ -553,6 +563,9 @@ impl Interp {
                     vars.iter().map(|v| self.loop_var_saved(v)).collect();
                 let max = lists.iter().map(Vec::len).max().unwrap_or(0);
                 for n in 0..max {
+                    if self.over_budget() {
+                        return Err(CmdError::Reported);
+                    }
                     for (var, list) in vars.iter().zip(&lists) {
                         match list.get(n) {
                             Some(v) => self.define(var, v.clone()),
@@ -618,11 +631,12 @@ impl Interp {
         end: usize,
         cmd: &CommandInvocation,
     ) -> CmdResult {
+        let bt = self.command_backtrace(&code.file, cmd.line, &cmd.name);
         loop {
-            if self.fatal {
+            if self.fatal || self.over_budget() {
                 return Err(CmdError::Reported);
             }
-            let outcome = self.with_plain_frame(&code.file, cmd.line, &cmd.name, |this| {
+            let outcome = self.with_plain_backtrace(bt.clone(), cmd.line, |this| {
                 let expanded = this.expand(&cmd.args)?;
                 let cond = this.frontend.cond;
                 Ok::<_, CmdError>((cond(&expanded, this), expanded))

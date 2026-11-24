@@ -97,9 +97,14 @@ pub struct CmdFlags {
 /// Registry of built-in commands indexed by ASCII-lowercased name.
 #[derive(Default)]
 pub struct Registry {
-    builtins: BTreeMap<BString, (BuiltinFn, CmdFlags)>,
-    /// Commands that expand their own arguments ([`Self::add_raw`]).
-    raw: BTreeSet<BString>,
+    builtins: BTreeMap<BString, Builtin>,
+}
+
+#[derive(Clone, Copy)]
+struct Builtin {
+    func: BuiltinFn,
+    flags: CmdFlags,
+    raw: bool,
 }
 
 impl Registry {
@@ -110,9 +115,7 @@ impl Registry {
     /// `set_tests_properties`, `subdirs`, and other commands after
     /// `rcmake_commands::register_all`.
     pub fn add(&mut self, name: &'static str, func: BuiltinFn, flags: CmdFlags) {
-        let lower = fold_command_name(name.as_bytes());
-        self.raw.remove(&lower);
-        self.builtins.insert(lower, (func, flags));
+        self.insert(name, func, flags, false);
     }
 
     /// Register a built-in command that expands its own arguments, as CMake commands
@@ -123,22 +126,32 @@ impl Registry {
     /// empty argument slice. The command reads [`Cx::raw_args`] and expands them with
     /// [`Cx::expand_raw_args`].
     pub fn add_raw(&mut self, name: &'static str, func: BuiltinFn, flags: CmdFlags) {
-        let lower = fold_command_name(name.as_bytes());
-        self.raw.insert(lower.clone());
-        self.builtins.insert(lower, (func, flags));
+        self.insert(name, func, flags, true);
+    }
+
+    fn insert(&mut self, name: &str, func: BuiltinFn, flags: CmdFlags, raw: bool) {
+        self.builtins.insert(
+            fold_command_name(name.as_bytes()),
+            Builtin { func, flags, raw },
+        );
     }
 
     /// `true` if the command was registered with [`Self::add_raw`].
     #[must_use]
     pub fn takes_raw_args(&self, name: &[u8]) -> bool {
-        self.raw.contains(&fold_command_name(name))
+        self.get_lower(&fold_command_name(name))
+            .is_some_and(|b| b.raw)
     }
 
     /// Look up a built-in command by any-case name.
     #[must_use]
     pub fn get(&self, name: &[u8]) -> Option<(BuiltinFn, CmdFlags)> {
-        let lower = fold_command_name(name);
-        self.builtins.get(&lower).copied()
+        self.get_lower(&fold_command_name(name))
+            .map(|b| (b.func, b.flags))
+    }
+
+    fn get_lower(&self, name: &[u8]) -> Option<Builtin> {
+        self.builtins.get(name).copied()
     }
 
     /// All registered lowercase names in sorted order.
