@@ -2,6 +2,7 @@
 name = "rcmake-resolve"
 description = "Per-configuration target resolution, transitive usage requirements, and build graph lowering for Rcmake (ADR-009)."
 version.workspace = true
+publish.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true

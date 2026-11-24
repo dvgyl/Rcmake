@@ -2,6 +2,7 @@
 name = "rcmake-presets"
 description = "CMake Presets schema v13 loader, inheritance resolver, condition evaluator, and macro expander."
 version.workspace = true
+publish.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true

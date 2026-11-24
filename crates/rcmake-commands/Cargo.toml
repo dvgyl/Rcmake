@@ -2,6 +2,7 @@
 name = "rcmake-commands"
 description = "Built-in CMake 4.5.1 command families organized into disjoint submodules."
 version.workspace = true
+publish.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true

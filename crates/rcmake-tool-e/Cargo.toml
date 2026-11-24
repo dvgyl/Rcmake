@@ -2,6 +2,7 @@
 name = "rcmake-tool-e"
 description = "Cross-platform `cmake -E` built-in command-line utilities for Rcmake."
 version.workspace = true
+publish.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true

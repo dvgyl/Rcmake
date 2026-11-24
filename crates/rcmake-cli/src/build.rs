@@ -368,8 +368,24 @@ fn dispatch(
             rcmake_gen_ninja::build_commands(&request)
         }
         GeneratorKind::UnixMakefiles => rcmake_gen_make::build_commands(&request),
+        #[cfg(any(target_os = "macos", feature = "xcode-cross"))]
         GeneratorKind::Xcode => rcmake_gen_xcode::build_commands(&request),
+        #[cfg(any(windows, feature = "vs-cross"))]
         GeneratorKind::VisualStudio(_) => rcmake_gen_vs::build_commands(&request),
+        #[cfg(not(any(target_os = "macos", feature = "xcode-cross")))]
+        GeneratorKind::Xcode => {
+            return error(
+                host,
+                &format!("could not create CMAKE_GENERATOR \"{}\"", generator.value),
+            );
+        }
+        #[cfg(not(any(windows, feature = "vs-cross")))]
+        GeneratorKind::VisualStudio(_) => {
+            return error(
+                host,
+                &format!("could not create CMAKE_GENERATOR \"{}\"", generator.value),
+            );
+        }
     };
     let commands = match planned {
         Ok(commands) => commands,

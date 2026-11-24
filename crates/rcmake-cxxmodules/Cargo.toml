@@ -2,6 +2,7 @@
 name = "rcmake-cxxmodules"
 description = "C++20 named module collation (P1689r5, CXXDependInfo.json, CXXModules.json, Ninja dyndep, module maps) for Rcmake (ADR-012)."
 version.workspace = true
+publish.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true

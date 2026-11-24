@@ -2,11 +2,11 @@
 name = "rcmake-fuzz"
 description = "Safe-Rust adversarial fuzz harness for the Rcmake engine crates (ADR-016). Never linked into rcmake."
 version.workspace = true
+publish.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-publish = false
 
 [dependencies]
 rcmake-archive.workspace = true

@@ -2,6 +2,7 @@
 name = "rcmake-model"
 description = "CMake cache store, property maps, global state, and project model for Rcmake."
 version.workspace = true
+publish.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -17,6 +18,7 @@ thiserror.workspace = true
 # Make the Visual Studio generators available on every host. Only the structural
 # test build enables this feature (ADR-015). Release binaries never enable it.
 vs-cross = []
+xcode-cross = []
 
 [lints]
 workspace = true

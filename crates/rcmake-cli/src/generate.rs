@@ -84,6 +84,7 @@ pub(crate) fn run(
     // An IDE generator writes its project files first, so that a generator that is not
     // implemented yet leaves no partial output.
     let ide_result = match kind {
+        #[cfg(any(target_os = "macos", feature = "xcode-cross"))]
         GeneratorKind::Xcode => {
             let generated = rcmake_gen_xcode::generate(&result, interp.cx().project(), host, bin);
             if generated.is_ok() {
@@ -91,6 +92,7 @@ pub(crate) fn run(
             }
             Some(generated)
         }
+        #[cfg(any(windows, feature = "vs-cross"))]
         GeneratorKind::VisualStudio(version) => Some(rcmake_gen_vs::generate(
             version,
             &result,
@@ -98,6 +100,14 @@ pub(crate) fn run(
             host,
             bin,
         )),
+        #[cfg(not(any(target_os = "macos", feature = "xcode-cross")))]
+        GeneratorKind::Xcode => {
+            return Err(format!("Could not create named generator {}", kind.name()));
+        }
+        #[cfg(not(any(windows, feature = "vs-cross")))]
+        GeneratorKind::VisualStudio(_) => {
+            return Err(format!("Could not create named generator {}", kind.name()));
+        }
         GeneratorKind::Ninja | GeneratorKind::NinjaMultiConfig | GeneratorKind::UnixMakefiles => {
             None
         }
