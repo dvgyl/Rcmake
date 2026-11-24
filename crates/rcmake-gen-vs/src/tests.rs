@@ -1,0 +1,618 @@
+#![allow(clippy::expect_used)]
+
+use std::path::Path;
+
+use rcmake_gen_common::ide::{BuildRequest, Jobs};
+use rcmake_host::{NativeHost, PureHost, ReadRange, path::to_native};
+use rcmake_model::{
+    BT, CacheEntry, CacheType, CustomCommand, CustomCommandKind, GeneratorSpec, InstallKind,
+    InstallRule, Target, TargetEvent, TargetOrigin, UsageField,
+};
+use rcmake_resolve::{
+    BuildGraph, BuildStep, CustomStep, GraphTarget, Invocation, TargetMetadata,
+    ide::{
+        IdeCompileSettings, IdeCustomPhase, IdeCustomStep, IdeFacts, IdeLinkItem, IdeSource,
+        IdeSourceKind, OutputNaming,
+    },
+};
+
+use super::*;
+
+fn bt(value: &str) -> BT<BString> {
+    BT::new(value.into(), Default::default())
+}
+
+fn target(name: &str, kind: TargetKind, source: &str) -> Target {
+    let mut target = Target::new(
+        name.into(),
+        kind,
+        TargetOrigin::Normal,
+        DirId::ROOT,
+        Default::default(),
+        Default::default(),
+    );
+    if !source.is_empty() {
+        target.sources.push(bt(source));
+    }
+    target
+}
+
+#[test]
+fn uuid_matches_cmake_namespace_and_reuses_cache() {
+    let mut model = ProjectModel::default();
+    assert_eq!(
+        guid::for_name(&model, "/out", "app"),
+        "{C14FBFFA-70CA-3300-849E-3C063E50CF05}"
+    );
+    assert_ne!(
+        guid::for_name(&model, "/out/other", "app"),
+        guid::for_name(&model, "/out", "app")
+    );
+    model.cache.insert(
+        "app_GUID_CMAKE".into(),
+        CacheEntry {
+            value: "deadbeef-0000-4000-8000-000000000000".into(),
+            ty: CacheType::Internal,
+            help: Default::default(),
+            advanced: false,
+            props: Default::default(),
+        },
+    );
+    assert_eq!(
+        guid::for_name(&model, "/out", "app"),
+        "{DEADBEEF-0000-4000-8000-000000000000}"
+    );
+}
+
+#[test]
+fn xml_preserves_utf8_and_escapes_values() {
+    let mut xml = xml::Writer::new(true, "utf-8");
+    xml.start("Project", &[("Name", "a<&>\"\t\n")]);
+    xml.text("Message", &[], "café & <ok>\r\n");
+    xml.empty("Empty", &[]);
+    assert_eq!(
+        xml.finish(),
+        "\u{feff}<?xml version=\"1.0\" encoding=\"utf-8\"?>\r\n<Project Name=\"a&lt;&amp;&gt;&quot;&#x9;&#xA;\">\r\n  <Message>café &amp; &lt;ok&gt;&#xD;&#xA;</Message>\r\n  <Empty />\r\n</Project>\r\n"
+    );
+}
+
+#[test]
+fn compile_flags_use_last_values_and_inherit_options() {
+    let mut xml = xml::Writer::new(false, "utf-8");
+    flags_table::compile(flags_table::split(r#"/Od /O2 /W4 /WX /MDd /Zi /EHsc /GR- /std:c++20 /Zc:preprocessor /Zc:__cplusplus /D"NAME=two words" /I "C:\Program Files\SDK""#)).write(&mut xml);
+    let xml = xml.finish();
+    for element in [
+        "<Optimization>MaxSpeed",
+        "<WarningLevel>Level4",
+        "<TreatWarningAsError>true",
+        "<RuntimeLibrary>MultiThreadedDebugDLL",
+        "<DebugInformationFormat>ProgramDatabase",
+        "<ExceptionHandling>Sync",
+        "<RuntimeTypeInfo>false",
+        "<LanguageStandard>stdcpp20",
+        "<UseStandardPreprocessor>true",
+        "<AdditionalOptions>/Zc:__cplusplus %(AdditionalOptions)",
+        "<PreprocessorDefinitions>NAME=two words;%(PreprocessorDefinitions)",
+        "<AdditionalIncludeDirectories>C:\\Program Files\\SDK;%(AdditionalIncludeDirectories)",
+    ] {
+        assert!(xml.contains(element), "{element}: {xml}");
+    }
+}
+
+#[test]
+fn build_plans_support_clean_parallel_targets_and_devenv() {
+    let targets = ["app".into(), "lib.vcxproj".into()];
+    let req = BuildRequest {
+        generator: GeneratorKind::VisualStudio(VsVersion::Vs18),
+        build_dir: b"/out",
+        project_name: b"Demo",
+        make_program: b"",
+        config: Some(b"Release"),
+        targets: &targets,
+        jobs: Jobs::Count(4),
+        clean_first: true,
+        verbose: true,
+        native_args: &["/nr:false".into()],
+        platform: b"ARM64",
+    };
+    let commands = build_commands(&req).expect("MSBuild plan");
+    assert_eq!(
+        commands
+            .iter()
+            .map(|cmd| cmd.argv.get(1).map(|arg| string(arg)))
+            .collect::<Vec<_>>(),
+        [
+            Some("Demo.slnx".into()),
+            Some("app.vcxproj".into()),
+            Some("lib.vcxproj".into())
+        ]
+    );
+    assert_eq!(
+        commands.first().and_then(|cmd| cmd.argv.get(2)),
+        Some(&"/t:Clean".into())
+    );
+    let build = commands.get(1).expect("build command");
+    assert_eq!(
+        build.argv.iter().map(|arg| string(arg)).collect::<Vec<_>>(),
+        [
+            "MSBuild.exe",
+            "app.vcxproj",
+            "/p:Configuration=Release",
+            "/p:Platform=ARM64",
+            "/p:VisualStudioVersion=18.0",
+            "/m:4",
+            "/v:n",
+            "/nr:false",
+        ]
+    );
+    assert_eq!(build.working_dir, "/out");
+
+    let req = BuildRequest {
+        generator: GeneratorKind::VisualStudio(VsVersion::Vs17),
+        make_program: br"C:\Tools\devenv.com",
+        clean_first: false,
+        targets: &[],
+        config: None,
+        platform: b"Win32",
+        native_args: &[],
+        ..req
+    };
+    let commands = build_commands(&req).expect("devenv plan");
+    assert_eq!(
+        commands
+            .first()
+            .expect("build command")
+            .argv
+            .iter()
+            .map(|arg| string(arg))
+            .collect::<Vec<_>>(),
+        [
+            r"C:\Tools\devenv.com",
+            "Demo.sln",
+            "/Build",
+            "Debug|Win32",
+            "/Project",
+            "ALL_BUILD"
+        ]
+    );
+}
+
+fn fixture(
+    version: VsVersion,
+    platform: &str,
+    bin: &Path,
+    host: &dyn Host,
+) -> (ProjectModel, GenerationResult) {
+    let kind = GeneratorKind::VisualStudio(version);
+    let mut model = ProjectModel::default();
+    model.generator = Some(kind);
+    model.generator_spec = GeneratorSpec::parse(
+        kind,
+        b"host=x64,version=14.44",
+        format!("{platform},version=10.0").as_bytes(),
+        b"",
+        None,
+    )
+    .expect("generator options");
+    model.set_root_dirs("/source tree".into(), from_native(bin));
+    let root = model.dir_mut(DirId::ROOT);
+    root.vars.insert("PROJECT_NAME".into(), "Demo".into());
+    root.vars
+        .insert("CMAKE_CONFIGURATION_TYPES".into(), "Debug;Release".into());
+    root.props.set("CMAKE_TESTING_ENABLED".into(), "ON".into());
+    root.props.set("VS_STARTUP_PROJECT".into(), "app".into());
+    model.add_install(InstallRule {
+        dir: DirId::ROOT,
+        backtrace: Default::default(),
+        kind: InstallKind::Code("".into()),
+        options: Default::default(),
+    });
+    write_if_changed(host, &bin.join("CPackConfig.cmake"), b"").expect("CPack configuration");
+    let lib = model
+        .add_target(target(
+            "static_lib",
+            TargetKind::StaticLibrary,
+            "lib.c;lib.hpp",
+        ))
+        .expect("static library");
+    model
+        .add_target(target(
+            "shared_lib",
+            TargetKind::SharedLibrary,
+            "shared.cpp",
+        ))
+        .expect("shared library");
+    let object = model
+        .add_target(target("objects", TargetKind::ObjectLibrary, "object.cpp"))
+        .expect("object library");
+    model
+        .add_target(target(
+            "headers",
+            TargetKind::InterfaceLibrary,
+            "interface.hpp",
+        ))
+        .expect("interface library");
+    model
+        .add_target(target("unused_interface", TargetKind::InterfaceLibrary, ""))
+        .expect("empty interface library");
+    let job = model
+        .add_target(target("run", TargetKind::Utility, ""))
+        .expect("utility");
+    let mut app = target("app", TargetKind::Executable, "main.cpp");
+    app.props.set("FOLDER".into(), "Products/Tools".into());
+    app.props
+        .set("EXCLUDE_FROM_DEFAULT_BUILD_RELEASE".into(), "ON".into());
+    app.utility_deps.push(bt("run"));
+    let app = model.add_target(app).expect("executable");
+    let mut fallback = target("fallback", TargetKind::Executable, "fallback.c");
+    fallback.usage.push(UsageField::CompileOptions, bt("/W3"));
+    let fallback = model.add_target(fallback).expect("fallback executable");
+
+    let mut event = CustomCommand::new(
+        DirId::ROOT,
+        CustomCommandKind::TargetEvent {
+            target: fallback,
+            event: TargetEvent::PreLink,
+        },
+        Default::default(),
+        Default::default(),
+    );
+    event.command_lines.push(vec![
+        "cmake".into(),
+        "-E".into(),
+        "echo".into(),
+        "linking".into(),
+    ]);
+    model.add_command(event).expect("pre-link command");
+
+    let mut result = GenerationResult::default();
+    result.configs.resize_with(2, Default::default);
+    for (config, name) in result.configs.iter_mut().zip(["Debug", "Release"]) {
+        config.0 = name.into();
+        let make = |phase, args: &[&str], outputs: &[&str]| IdeCustomStep {
+            phase,
+            commands: vec![args.iter().map(|arg| (*arg).into()).collect()],
+            working_dir: from_native(bin),
+            outputs: outputs.iter().map(|path| (*path).into()).collect(),
+            byproducts: Vec::new(),
+            depends: vec!["/source tree/script.cmake".into()],
+            comment: Some("Run <step> & check".into()),
+            always_run: false,
+        };
+        result.targets.push(ResolvedTarget {
+            id: app,
+            config: config.clone(),
+            metadata: TargetMetadata {
+                name: "app".into(),
+                kind: TargetKind::Executable,
+                source_dir: "/source tree".into(),
+                binary_dir: from_native(bin),
+                backtrace: Default::default(),
+                folder: None,
+                exclude_from_all: false,
+                generator_provided: false,
+            },
+            artifacts: Default::default(),
+            compile_groups: Vec::new(),
+            compile_units: Vec::new(),
+            link: None,
+            dependencies: vec![lib, object, job],
+            cxx_modules: None,
+            ide: Some(Box::new(IdeFacts {
+                naming: OutputNaming {
+                    dir: from_native(&bin.join(name)),
+                    base_name: "application".into(),
+                    suffix: ".exe".into(),
+                    ..Default::default()
+                },
+                sources: vec![
+                    IdeSource {
+                        path: "/source tree/main.cpp".into(),
+                        kind: IdeSourceKind::Compile {
+                            language: "CXX".into(),
+                        },
+                        group: r"Code\Client".into(),
+                        generated: false,
+                        excluded_configs: Vec::new(),
+                    },
+                    IdeSource {
+                        path: from_native(&bin.join("generated.cpp")),
+                        kind: IdeSourceKind::Compile {
+                            language: "CXX".into(),
+                        },
+                        group: BString::default(),
+                        generated: true,
+                        excluded_configs: vec!["Release".into()],
+                    },
+                    IdeSource {
+                        path: "/source tree/main.hpp".into(),
+                        kind: IdeSourceKind::Header,
+                        group: BString::default(),
+                        generated: false,
+                        excluded_configs: Vec::new(),
+                    },
+                ],
+                compile: vec![IdeCompileSettings {
+                    language: "CXX".into(),
+                    flags: vec![
+                        bt("/W4"),
+                        bt("/Zc:__cplusplus"),
+                        bt(if name == "Debug" { "/Od" } else { "/O2" }),
+                    ],
+                    defines: vec![bt("PROJECT_NAME=Demo")],
+                    ..Default::default()
+                }],
+                link_items: vec![
+                    IdeLinkItem::Target(lib),
+                    IdeLinkItem::Target(object),
+                    IdeLinkItem::Library("kernel32".into()),
+                ],
+                link_options: vec![bt("/DEBUG"), bt("/SUBSYSTEM:CONSOLE")],
+                custom: vec![
+                    make(
+                        IdeCustomPhase::Rule,
+                        &["cmake", "-E", "touch", "generated.cpp"],
+                        &["generated.cpp"],
+                    ),
+                    make(
+                        IdeCustomPhase::PreBuild,
+                        &["cmake", "-E", "echo", "starting"],
+                        &[],
+                    ),
+                    make(
+                        IdeCustomPhase::PostBuild,
+                        &["cmake", "-E", "echo", "done"],
+                        &[],
+                    ),
+                ],
+                ..Default::default()
+            })),
+        });
+        result.graphs.push(BuildGraph {
+            config: config.clone(),
+            targets: vec![GraphTarget {
+                name: "fallback".into(),
+                steps: vec![0, 1],
+                ..Default::default()
+            }],
+            steps: vec![
+                BuildStep::Compile {
+                    object: format!("{name}/fallback.obj").into(),
+                    source: "/source tree/fallback.c".into(),
+                    invocation: Invocation {
+                        argv: vec![
+                            "cl.exe".into(),
+                            "/W3".into(),
+                            "/MDd".into(),
+                            "/c".into(),
+                            "/source tree/fallback.c".into(),
+                            format!("/Fo{name}/fallback.obj").into(),
+                        ],
+                        ..Default::default()
+                    },
+                    depfile: None,
+                    modmap: None,
+                    dyndep: None,
+                },
+                BuildStep::Custom(CustomStep {
+                    outputs: vec!["graph.out".into()],
+                    invocations: vec![Invocation {
+                        argv: vec![
+                            "cmake".into(),
+                            "-E".into(),
+                            "touch".into(),
+                            "graph.out".into(),
+                        ],
+                        working_dir: Some(from_native(bin)),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }),
+            ],
+        });
+    }
+    result.metadata.listfiles = vec![
+        "/source tree/CMakeLists.txt".into(),
+        "/source tree/script.cmake".into(),
+        "/source tree/script.cmake".into(),
+    ];
+    (model, result)
+}
+
+fn contents(host: &dyn Host, bin: &Path, filename: &str) -> String {
+    string(
+        &host
+            .read(&bin.join(filename), ReadRange::All { limit: 256 * 1024 })
+            .expect("generated file"),
+    )
+}
+
+fn check_fixture(version: VsVersion, platform: &str, host: &dyn Host, bin: &Path) {
+    host.create_dir_all(bin).expect("build directory");
+    let (model, result) = fixture(version, platform, bin, host);
+    generate(version, &result, &model, host, bin).expect("generate project");
+    let solution = contents(host, bin, &format!("Demo.{}", solution_ext(version)));
+    if version.writes_slnx() {
+        assert!(solution.contains("<Folder Name=\"/Products/Tools/\""));
+        assert!(solution.contains("DefaultStartup=\"true\""));
+        assert!(solution.contains(&format!("<Platform Name=\"{platform}\"")));
+        assert!(solution.contains("<Build Solution=\"Release|*\" Project=\"false\""));
+    } else {
+        assert!(solution.starts_with("\u{feff}"));
+        assert!(solution.contains("# Visual Studio Version 17"));
+        assert!(solution.contains("GlobalSection(NestedProjects)"));
+        assert!(solution.contains("ProjectSection(ProjectDependencies)"));
+        assert!(solution.contains(&format!(".Release|{platform}.ActiveCfg")));
+        assert!(solution.contains(&format!("Debug|{platform} = Debug|{platform}")));
+    }
+    let app = contents(host, bin, "app.vcxproj");
+    for text in [
+        "<ConfigurationType>Application",
+        "<TargetName Condition=",
+        ">application</TargetName>",
+        "<PreferredToolArchitecture>x64",
+        "<VCToolsVersion>14.44",
+        "<WindowsTargetPlatformVersion>10.0",
+        "<PreBuildEvent>",
+        "<PostBuildEvent>",
+        ".rule\">",
+        "<CustomBuild",
+        "Run &lt;step&gt; &amp; check",
+        "<ExcludedFromBuild",
+        "<Optimization>Disabled",
+        "<Optimization>MaxSpeed",
+        "<WarningLevel>Level4",
+        "<GenerateDebugInformation>true",
+        "<SubSystem>Console",
+        "<ProjectReference Include=\"static_lib.vcxproj\"",
+        "objects.dir",
+        "kernel32.lib;%(AdditionalDependencies)",
+    ] {
+        assert!(app.contains(text), "{text}: {app}");
+    }
+    assert!(app.contains(version.default_toolset()));
+    assert!(solution.contains("ZERO_CHECK.vcxproj"));
+    for name in ["ALL_BUILD", "INSTALL", "RUN_TESTS", "PACKAGE"] {
+        assert!(solution.contains(&format!("{name}.vcxproj")));
+    }
+    for (name, kind) in [
+        ("static_lib", "StaticLibrary"),
+        ("shared_lib", "DynamicLibrary"),
+        ("objects", "Utility"),
+        ("headers", "Utility"),
+        ("run", "Utility"),
+    ] {
+        assert!(
+            contents(host, bin, &format!("{name}.vcxproj"))
+                .contains(&format!("<ConfigurationType>{kind}</ConfigurationType>"))
+        );
+    }
+    assert!(!solution.contains("unused_interface"));
+    assert!(contents(host, bin, "objects.vcxproj").contains("DependsOnTargets=\"ClCompile\""));
+    let fallback = contents(host, bin, "fallback.vcxproj");
+    assert!(fallback.contains("graph.out"));
+    assert!(fallback.contains("<PreLinkEvent>"));
+    assert!(fallback.contains("<WarningLevel Condition="));
+    assert!(fallback.contains(">Level3</WarningLevel>"));
+    assert!(fallback.contains(">MultiThreadedDebugDLL</RuntimeLibrary>"));
+    assert!(!fallback.contains("/Fo"));
+    let zero = contents(host, bin, "ZERO_CHECK.vcxproj");
+    assert!(zero.contains("--regenerate-during-build"));
+    assert!(zero.contains("CMakeLists.txt"));
+    assert!(zero.contains("generate.stamp"));
+    let filters = contents(host, bin, "app.vcxproj.filters");
+    for group in [
+        "Code",
+        r"Code\Client",
+        "CMake Rules",
+        "Header Files",
+        "Source Files",
+    ] {
+        assert!(filters.contains(&format!("<Filter Include=\"{group}\"")));
+    }
+
+    generate(version, &result, &model, host, bin).expect("repeat generation");
+    assert_eq!(
+        contents(host, bin, &format!("Demo.{}", solution_ext(version))),
+        solution
+    );
+    assert_eq!(contents(host, bin, "app.vcxproj"), app);
+}
+
+#[test]
+fn both_solution_formats_cover_three_platforms() {
+    let native = NativeHost::new().expect("host");
+    let output = native.env_get(b"RCMAKE_VS_TEST_OUTPUT");
+    let pure = PureHost::default();
+    for version in VsVersion::ALL {
+        for platform in ["x64", "ARM64", "Win32"] {
+            let name = format!("{}-{platform}", solution_ext(version));
+            if let Some(output) = &output {
+                check_fixture(version, platform, &native, &to_native(output).join(name));
+            } else {
+                let dir = if cfg!(windows) { "C:/out" } else { "/out" };
+                check_fixture(version, platform, &pure, &Path::new(dir).join(name));
+            }
+        }
+    }
+}
+
+#[test]
+fn regeneration_can_be_disabled_and_empty_projects_generate() {
+    let host = PureHost::default();
+    let dir = if cfg!(windows) { "C:/out" } else { "/out" };
+    let bin = Path::new(dir);
+    let mut model = ProjectModel::default();
+    model.set_root_dirs(dir.into(), dir.into());
+    model
+        .dir_mut(DirId::ROOT)
+        .props
+        .set("CMAKE_SUPPRESS_REGENERATION".into(), "ON".into());
+    generate(
+        VsVersion::Vs18,
+        &GenerationResult::default(),
+        &model,
+        &host,
+        bin,
+    )
+    .expect("generate empty solution");
+    let solution = contents(&host, bin, "Project.slnx");
+    assert!(solution.contains("ALL_BUILD.vcxproj"));
+    assert!(!solution.contains("ZERO_CHECK"));
+    assert!(solution.contains("RelWithDebInfo"));
+}
+
+#[test]
+fn nested_solutions_build_only_local_targets_and_their_dependencies() {
+    let host = PureHost::default();
+    let dir = if cfg!(windows) { "C:/out" } else { "/out" };
+    let bin = Path::new(dir);
+    let mut model = ProjectModel::default();
+    model.set_root_dirs(dir.into(), dir.into());
+    let subdir = model
+        .add_directory(
+            DirId::ROOT,
+            format!("{dir}/sub").into(),
+            format!("{dir}/sub").into(),
+            Default::default(),
+        )
+        .expect("subdirectory");
+    let sub = model.dir_mut(subdir);
+    sub.vars.insert("PROJECT_NAME".into(), "Child".into());
+    sub.vars
+        .insert("PROJECT_SOURCE_DIR".into(), sub.source_dir.clone());
+    model
+        .add_target(target("dependency", TargetKind::Utility, ""))
+        .expect("dependency");
+    model
+        .add_target(target("unrelated", TargetKind::Utility, ""))
+        .expect("unrelated target");
+    let mut child = target("child", TargetKind::Executable, "child.cpp");
+    child.dir = subdir;
+    child.utility_deps.push(bt("dependency"));
+    child
+        .props
+        .set("EXCLUDE_FROM_ALL_RELEASE".into(), "ON".into());
+    model.add_target(child).expect("child target");
+
+    generate(
+        VsVersion::Vs18,
+        &GenerationResult::default(),
+        &model,
+        &host,
+        bin,
+    )
+    .expect("generate solutions");
+    let solution = contents(&host, bin, "sub/Child.slnx");
+    assert!(solution.contains("Path=\"../dependency.vcxproj\""));
+    assert!(solution.contains("Path=\"child.vcxproj\""));
+    assert!(solution.contains("Path=\"ALL_BUILD.vcxproj\""));
+    assert!(!solution.contains("unrelated"));
+    let aggregate = contents(&host, bin, "sub/ALL_BUILD.vcxproj");
+    let reference = aggregate
+        .lines()
+        .find(|line| line.contains("ProjectReference Include=\"child.vcxproj\""))
+        .expect("child reference");
+    assert!(reference.contains("Debug"));
+    assert!(!reference.contains("Release|"));
+}

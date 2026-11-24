@@ -1,3 +1,67 @@
-//! `.slnx` XML solution writer for `Visual Studio 18 2026`, with lowercase GUIDs. Pure.
-//!
-//! Owner after Milestone 4 Wave 0: Wave 1 worker B.
+//! Visual Studio 18 XML solutions.
+
+use crate::{CPP_TYPE, Project, Solution, guid, relative, xml::Writer};
+
+pub(crate) fn render(solution: &Solution<'_>) -> String {
+    let mut xml = Writer::new(false, "UTF-8");
+    xml.start("Solution", &[]);
+    xml.start("Configurations", &[]);
+    for config in &solution.settings.configs {
+        xml.empty("BuildType", &[("Name", config)]);
+    }
+    xml.empty("Platform", &[("Name", &solution.settings.platform)]);
+    xml.end();
+    for (folder, id) in &solution.folders {
+        let name = format!("/{folder}/");
+        xml.start("Folder", &[("Name", &name), ("Id", &guid::bare(id))]);
+        for project in solution
+            .members()
+            .filter(|project| project.folder == *folder)
+        {
+            write_project(&mut xml, solution, project);
+        }
+        xml.end();
+    }
+    for project in solution
+        .members()
+        .filter(|project| project.folder.is_empty())
+    {
+        write_project(&mut xml, solution, project);
+    }
+    xml.finish()
+}
+
+fn write_project(xml: &mut Writer, solution: &Solution<'_>, project: &Project) {
+    let path = relative(solution.dir, &project.path());
+    let kind = guid::bare(CPP_TYPE);
+    let id = guid::bare(&project.guid);
+    let mut attrs = vec![("Path", path.as_str()), ("Type", &kind), ("Id", &id)];
+    if solution.startup.as_ref() == Some(&project.name) {
+        attrs.push(("DefaultStartup", "true"));
+    }
+    let mut dependencies = solution.dependencies(project).peekable();
+    if dependencies.peek().is_none()
+        && project.build.iter().all(|&build| build)
+        && !project.deploy.iter().any(|&deploy| deploy)
+    {
+        xml.empty("Project", &attrs);
+        return;
+    }
+    xml.start("Project", &attrs);
+    for dep in dependencies {
+        xml.empty(
+            "BuildDependency",
+            &[("Project", &relative(solution.dir, &dep.path()))],
+        );
+    }
+    for (index, config) in solution.settings.configs.iter().enumerate() {
+        let selection = format!("{config}|*");
+        if project.build.get(index) != Some(&true) {
+            xml.empty("Build", &[("Solution", &selection), ("Project", "false")]);
+        }
+        if project.deploy.get(index) == Some(&true) {
+            xml.empty("Deploy", &[("Solution", &selection), ("Project", "true")]);
+        }
+    }
+    xml.end();
+}
