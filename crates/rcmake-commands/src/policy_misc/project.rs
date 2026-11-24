@@ -1,11 +1,11 @@
 use std::collections::BTreeMap;
 
 use rcmake_base::{BString, version};
-use rcmake_diag::{Effect, MessageKind};
+use rcmake_diag::{DiagCategory, Effect, MessageKind, PolicyId, PolicyStatus};
 use rcmake_eval::{CmdError, CmdResult, Cx, Flow};
 use rcmake_expr::ExpandedArg;
 use rcmake_host::path;
-use rcmake_model::{CacheEntry, CacheType};
+use rcmake_model::{CacheEntry, CacheType, DirId};
 
 use super::{quoted, values};
 
@@ -24,6 +24,20 @@ pub(super) fn project(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
             "PROJECT called with incorrect number of arguments",
         ));
     };
+    let top_level = cx.current_dir_id() == DirId::ROOT;
+    if name == &b"LANGUAGES".as_slice() || is_metadata(name) {
+        author_warning(
+            cx,
+            quoted(
+                "project() called with '",
+                name,
+                "' as first argument. The first parameter should be the project name, not a keyword argument. See the cmake-commands(7) manual for correct usage of the project() command.",
+            ),
+        );
+    }
+    if top_level && !cx.var_defined(b"CMAKE_MINIMUM_REQUIRED_VERSION") {
+        author_warning(cx, "cmake_minimum_required() should be called prior to this top-level project() call. Please see the cmake-commands(7) manual for usage documentation of both commands.".into());
+    }
     crate::configure::project_include_hook(cx, b"CMAKE_PROJECT_INCLUDE_BEFORE")?;
     crate::configure::project_include_hook(
         cx,
@@ -37,7 +51,8 @@ pub(super) fn project(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
     let version = metadata.get(b"VERSION".as_slice()).copied();
     let compat = metadata.get(b"COMPAT_VERSION".as_slice()).copied();
     if compat.is_some() && version.is_none() {
-        return Err(CmdError::status(
+        return Err(crate::command_error(
+            cx,
             "project with COMPAT_VERSION must also provide VERSION.",
         ));
     }
@@ -45,30 +60,34 @@ pub(super) fn project(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
         if let Some(value) = value
             && !valid_version(value)
         {
-            return Err(CmdError::status(quoted(
-                &format!("{key} \""),
-                value,
-                "\" format invalid.",
-            )));
+            return Err(crate::command_error(
+                cx,
+                quoted(&format!("{key} \""), value, "\" format invalid."),
+            ));
         }
     }
+    let normalized;
+    let version = if cx.policy(PolicyId::new(96)) == PolicyStatus::New {
+        version
+    } else {
+        normalized = version.map(normalize_version);
+        normalized.as_deref()
+    };
     if let (Some(version), Some(compat)) = (version, compat)
         && version::compare(compat, version).is_gt()
     {
-        return Err(CmdError::status(
+        return Err(crate::command_error(
+            cx,
             "COMPAT_VERSION must be less than or equal to VERSION",
         ));
     }
 
     let source = path::from_native(&cx.current_source_dir());
     let binary = path::from_native(&cx.current_binary_dir());
-    let top_level = source == cx.var_or_empty(b"CMAKE_SOURCE_DIR");
     cx.set_var(b"PROJECT_NAME", (*name).into());
     cx.directory_props()
         .set("_RCMAKE_PROJECT_NAME".into(), (*name).into());
-    if top_level {
-        set_static(cx, b"CMAKE_PROJECT_NAME", name);
-    }
+    set_top_level(cx, b"CMAKE_PROJECT_NAME", name, top_level);
     let top_level_value = if top_level { b"ON".as_slice() } else { b"OFF" };
     for (key, value) in [
         (b"_SOURCE_DIR".as_slice(), source.as_slice()),
@@ -76,7 +95,12 @@ pub(super) fn project(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
         (b"_IS_TOP_LEVEL", top_level_value),
     ] {
         cx.set_var(&field(b"PROJECT", key), value.into());
-        set_static(cx, &field(name, key), value);
+        let var = field(name, key);
+        if cx.policy(PolicyId::new(180)) == PolicyStatus::New || cx.var_normal_only(&var).is_some()
+        {
+            cx.set_var(&var, value.into());
+        }
+        set_static(cx, &var, value);
     }
 
     let mut components = version.unwrap_or_default().split(|byte| *byte == b'.');
@@ -89,17 +113,15 @@ pub(super) fn project(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
     ] {
         for prefix in [b"PROJECT".as_slice(), name] {
             let var = field(prefix, key);
-            if version.is_some() || cx.var_defined(&var) {
+            if version.is_some() || !cx.var_or_empty(&var).is_empty() {
                 cx.set_var(&var, value.into());
             }
         }
-        if top_level {
-            let var = field(b"CMAKE_PROJECT", key);
-            if version.is_some() {
-                set_static(cx, &var, value);
-            } else if cx.var_defined(&var) {
-                cx.set_var(&var, BString::default());
-            }
+        let var = field(b"CMAKE_PROJECT", key);
+        if version.is_some() {
+            set_top_level(cx, &var, value, top_level);
+        } else if top_level && !cx.var_or_empty(&var).is_empty() {
+            cx.set_var(&var, BString::default());
         }
     }
 
@@ -108,9 +130,12 @@ pub(super) fn project(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
         let suffix = format!("_{key}");
         cx.set_var(&field(b"PROJECT", suffix.as_bytes()), value.into());
         cx.set_var(&field(name, suffix.as_bytes()), value.into());
-        if top_level {
-            set_static(cx, &field(b"CMAKE_PROJECT", suffix.as_bytes()), value);
-        }
+        set_top_level(
+            cx,
+            &field(b"CMAKE_PROJECT", suffix.as_bytes()),
+            value,
+            top_level,
+        );
     }
 
     if cx.running_deferred() {
@@ -162,38 +187,29 @@ struct Arguments<'a> {
 fn parse_metadata<'a>(cx: &mut Cx<'_>, args: &[&'a [u8]]) -> Result<Arguments<'a>, CmdError> {
     let mut metadata = BTreeMap::new();
     let mut args = args.iter().copied().peekable();
+    let mut seen = std::collections::BTreeSet::new();
+    let mut missing = Vec::new();
     let mut languages_seen = false;
     let mut in_languages = false;
     let mut bare_languages = Vec::new();
     let mut languages = Vec::new();
     while let Some(arg) = args.next() {
+        if (arg == b"LANGUAGES" || is_metadata(arg)) && !seen.insert(arg) {
+            return Err(crate::command_error(
+                cx,
+                quoted("", arg, " may be specified at most once."),
+            ));
+        }
         if arg == b"LANGUAGES" {
-            if languages_seen {
-                return Err(CmdError::status("LANGUAGES may be specified at most once."));
-            }
             languages_seen = true;
             in_languages = true;
         } else if is_metadata(arg) {
             in_languages = false;
-            if metadata.contains_key(arg) {
-                return Err(CmdError::status(quoted(
-                    "",
-                    arg,
-                    " may be specified at most once.",
-                )));
+            if let Some(value) = args.next_if(|next| *next != b"LANGUAGES" && !is_metadata(next)) {
+                metadata.insert(arg, value);
+            } else {
+                missing.push(arg);
             }
-            let value = args.next_if(|next| *next != b"LANGUAGES" && !is_metadata(next));
-            if value.is_none() {
-                warn(
-                    cx,
-                    quoted(
-                        "",
-                        arg,
-                        " keyword not followed by a value or was followed by a value that expanded to nothing.",
-                    ),
-                );
-            }
-            metadata.insert(arg, value.unwrap_or_default());
         } else if in_languages {
             languages.push(arg);
         } else {
@@ -203,20 +219,32 @@ fn parse_metadata<'a>(cx: &mut Cx<'_>, args: &[&'a [u8]]) -> Result<Arguments<'a
     let has_metadata = [b"VERSION".as_slice(), b"DESCRIPTION", b"HOMEPAGE_URL"]
         .iter()
         .any(|key| metadata.contains_key(key));
-    if !bare_languages.is_empty() && has_metadata {
-        if !languages_seen {
-            return Err(CmdError::status(
-                "with VERSION, DESCRIPTION or HOMEPAGE_URL must use LANGUAGES before language names.",
-            ));
-        }
+    for arg in missing {
         warn(
             cx,
             quoted(
-                "the following parameters must be specified after LANGUAGES keyword: ",
-                &bare_languages.join(b";".as_slice()),
-                ".",
+                "",
+                arg,
+                " keyword not followed by a value or was followed by a value that expanded to nothing.",
             ),
         );
+    }
+    if !bare_languages.is_empty() {
+        if languages_seen {
+            warn(
+                cx,
+                quoted(
+                    "the following parameters must be specified after LANGUAGES keyword: ",
+                    &bare_languages.join(b", ".as_slice()),
+                    ".",
+                ),
+            );
+        } else if has_metadata {
+            return Err(crate::command_error(
+                cx,
+                "project with VERSION, DESCRIPTION or HOMEPAGE_URL must use LANGUAGES before language names.",
+            ));
+        }
     }
     Ok(Arguments {
         metadata,
@@ -233,6 +261,32 @@ fn warn(cx: &mut Cx<'_>, body: BString) {
     cx.issue(MessageKind::Warning, Effect::None, None, body);
 }
 
+fn author_warning(cx: &mut Cx<'_>, body: BString) {
+    cx.issue(
+        MessageKind::AuthorWarning,
+        Effect::None,
+        Some(DiagCategory::Author),
+        body,
+    );
+}
+
+fn normalize_version(version: &[u8]) -> Vec<u8> {
+    if version.is_empty() {
+        return Vec::new();
+    }
+    version
+        .split(|&byte| byte == b'.')
+        .map(|part| {
+            let number = part.iter().fold(0_u32, |value, &digit| {
+                value.wrapping_mul(10).wrapping_add(u32::from(digit - b'0'))
+            });
+            number.to_string()
+        })
+        .collect::<Vec<_>>()
+        .join(".")
+        .into_bytes()
+}
+
 fn valid_version(version: &[u8]) -> bool {
     let parts = version.split(|byte| *byte == b'.');
     version.is_empty()
@@ -246,8 +300,16 @@ fn field(prefix: &[u8], suffix: &[u8]) -> BString {
     [prefix, suffix].concat().into()
 }
 
+fn set_top_level(cx: &mut Cx<'_>, name: &[u8], value: &[u8], top_level: bool) {
+    if top_level || !cx.var_defined(name) {
+        if cx.var_normal_only(name).is_some() {
+            cx.unset_var(name);
+        }
+        set_static(cx, name, value);
+    }
+}
+
 fn set_static(cx: &mut Cx<'_>, name: &[u8], value: &[u8]) {
-    cx.set_var(name, value.into());
     cx.cache().insert(
         name.into(),
         CacheEntry {

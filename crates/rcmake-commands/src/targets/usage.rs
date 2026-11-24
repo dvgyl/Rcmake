@@ -1,4 +1,4 @@
-use rcmake_base::{BString, list};
+use rcmake_base::{BString, list, truth};
 use rcmake_eval::{CmdError, CmdResult, Cx, Flow};
 use rcmake_expr::ExpandedArg;
 use rcmake_model::{BT, ModelError, Target, TargetKind, UsageField, UsageScope};
@@ -70,6 +70,20 @@ fn add(cx: &mut Cx<'_>, args: &[ExpandedArg], own: Field, interface: Field) -> C
     let paths = matches!(own, Field::IncludeDirectories | Field::LinkDirectories);
     let what = own.name().to_ascii_lowercase().replace('_', " ");
     let id = usage_target(cx, &name.value, &what)?;
+    let target = cx
+        .project()
+        .target(id)
+        .ok_or_else(|| model_error(ModelError::UnknownObject))?;
+    if target
+        .props
+        .get(b"SYMBOLIC")
+        .is_some_and(|value| truth::is_on(value))
+    {
+        return Err(CmdError::status("can not be used on a SYMBOLIC target."));
+    }
+    if matches!(target.kind, TargetKind::Utility | TargetKind::GlobalTarget) {
+        return Err(CmdError::status("called with non-compilable target type"));
+    }
     let system = own == Field::IncludeDirectories && take(&mut rest, b"SYSTEM");
     let before = if paths || matches!(own, Field::CompileOptions | Field::LinkOptions) {
         let before = take(&mut rest, b"BEFORE");
@@ -80,6 +94,11 @@ fn add(cx: &mut Cx<'_>, args: &[ExpandedArg], own: Field, interface: Field) -> C
     } else {
         false
     };
+    if rest.is_empty() {
+        return Err(CmdError::status(
+            "called with incorrect number of arguments",
+        ));
+    }
     let dir = if paths {
         source_dir(cx)
     } else {
@@ -104,6 +123,9 @@ fn add(cx: &mut Cx<'_>, args: &[ExpandedArg], own: Field, interface: Field) -> C
             .unwrap_or(tail.len());
         let (items, next) = tail.split_at(end);
         rest = next;
+        if items.is_empty() {
+            continue;
+        }
         if let Some(tables) = &feature_tables
             && scope != UsageScope::Interface
         {
@@ -134,9 +156,6 @@ fn add(cx: &mut Cx<'_>, args: &[ExpandedArg], own: Field, interface: Field) -> C
             .target_mut(id)
             .ok_or_else(|| model_error(ModelError::UnknownObject))?;
         validate_scope(target, scope, false)?;
-        if items.is_empty() {
-            continue;
-        }
         let value = list::join(items.iter().map(|arg| {
             let value = bytes(arg);
             if paths {

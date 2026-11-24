@@ -11,7 +11,7 @@ use super::compile::{apple_flags, language_flags};
 use super::install_rpath::MachORpathEdit;
 use super::launcher;
 use super::policy_flags::Flags;
-use super::shell::{direct, join_words, rule_invocations, simple_args};
+use super::shell::{command as shell_command, direct, join_words, rule_invocations, simple_args};
 use super::{definition, join, target_property};
 use crate::{
     ArtifactSet, BuildStep, Invocation, LinkFragmentRole, LinkKind, LinkStep, ResolveError,
@@ -64,13 +64,6 @@ pub(super) fn link(
     if kind != LinkKind::StaticArchive {
         flags.extend(option(b"LINK_FLAGS").cloned());
     }
-    let base = [b"CMAKE_", kind.flag_class(), b"_LINKER_FLAGS"].concat();
-    let configured = [base.as_slice(), b"_", &config.0.to_ascii_uppercase()].concat();
-    for key in [&base, &configured] {
-        if let Some(value) = definition(model, target.dir, key) {
-            flags.push(parse_flags(value.clone())?);
-        }
-    }
     flags.push(parse_flags(
         definition(model, target.dir, &kind.create_flags_key(language))
             .map_or_else(|| kind.default_create_flag(darwin).into(), Clone::clone),
@@ -101,6 +94,24 @@ pub(super) fn link(
     flags.extend(policy.pie_link(position_independent));
     if kind == LinkKind::SharedLibrary && darwin {
         flags.extend(darwin_versions(model, target, language));
+    }
+    let base = if kind == LinkKind::SharedLibrary
+        && darwin
+        && target
+            .props
+            .get(b"FRAMEWORK")
+            .is_some_and(|value| truth::is_on(value))
+        && model.generator == Some(rcmake_model::GeneratorKind::UnixMakefiles)
+    {
+        b"CMAKE_MACOSX_FRAMEWORK_LINKER_FLAGS".to_vec()
+    } else {
+        [b"CMAKE_", kind.flag_class(), b"_LINKER_FLAGS"].concat()
+    };
+    let configured = [base.as_slice(), b"_", &config.0.to_ascii_uppercase()].concat();
+    for key in [&base, &configured] {
+        if let Some(value) = definition(model, target.dir, key) {
+            flags.push(parse_flags(value.clone())?);
+        }
     }
     let raw_flags = kind.target_flags_property();
     flags.extend(target.props.get(raw_flags).cloned());
@@ -238,6 +249,29 @@ pub(super) fn link(
             &objects,
         )
     };
+    let rule_launcher = target
+        .props
+        .get(b"RULE_LAUNCH_LINK")
+        .or_else(|| {
+            model
+                .ancestors(target.dir)
+                .find_map(|dir| model.dir(dir).props.get(b"RULE_LAUNCH_LINK"))
+        })
+        .or_else(|| model.global.props.get(b"RULE_LAUNCH_LINK"))
+        .filter(|value| !value.is_empty());
+    if let Some(program) = rule_launcher.and_then(|prefix| simple_args(prefix)?.into_iter().next())
+    {
+        for dep in &target.utility_deps {
+            if let Some(dependency) = model
+                .find_target(target.dir, &dep.value)
+                .and_then(|id| model.target(id))
+                && let Some(file) = super::compute_artifacts(model, dependency, config).file
+                && (program == file || program == build_relative(model, &file))
+            {
+                inputs.push(build_relative(model, &file));
+            }
+        }
+    }
     for invocation in invocations
         .iter_mut()
         .skip(usize::from(kind == LinkKind::StaticArchive))
@@ -252,6 +286,9 @@ pub(super) fn link(
         let mut link = std::mem::take(invocation);
         if kind != LinkKind::StaticArchive {
             link = command.launch_tool(model, target, b"_LINKER_LAUNCHER", link)?;
+        }
+        if let Some(prefix) = rule_launcher {
+            link = shell_command(join_words([prefix.clone(), link.shell]));
         }
         *invocation = command.wrap(model, target, link);
     }

@@ -29,6 +29,7 @@ mod artifacts;
 mod compatible;
 mod host;
 mod link;
+pub(crate) mod link_options;
 #[cfg(test)]
 mod tests;
 
@@ -219,19 +220,33 @@ impl<'a> UsageResolver<'a> {
         ctx: &EvalContext,
     ) -> Result<UsageValue, ResolveError> {
         let name = field.name().as_bytes();
-        let ctx = self.property_context(target, name, ctx)?;
-        let result = self.walk(target, name, &ctx)?;
+        let mut ctx = self.property_context(target, name, ctx)?;
+        let mut value = if field == UsageField::LinkOptions
+            && self.target(target)?.kind == TargetKind::StaticLibrary
+        {
+            self.archive_options(target, &ctx)?
+        } else {
+            if field == UsageField::LinkOptions {
+                ctx.traversal = link_options::traversal(self.target(target)?);
+            }
+            let result = self.walk(target, name, &ctx)?;
+            UsageValue {
+                entries: result
+                    .contributions
+                    .iter()
+                    .flat_map(|(_, entries)| entries.iter().cloned())
+                    .collect(),
+                flags: result.flags,
+            }
+        };
         let mut seen = HashSet::new();
-        Ok(UsageValue {
-            entries: result
-                .contributions
-                .iter()
-                .flat_map(|(_, entries)| entries.iter())
-                .filter(|entry| seen.insert(entry.value.as_slice()))
-                .cloned()
-                .collect(),
-            flags: result.flags,
-        })
+        value
+            .entries
+            .retain(|entry| seen.insert(entry.value.clone()));
+        if field == UsageField::LinkOptions {
+            self.prepare_link_options(target, &ctx, &mut value)?;
+        }
+        Ok(value)
     }
 
     /// Collect a usage property by name, including sources and custom transitive properties.
@@ -534,6 +549,20 @@ impl<'a> UsageResolver<'a> {
         result: &mut UsageValue,
     ) -> Result<(), ResolveError> {
         let dir = self.target(target)?.dir;
+        let link_ctx;
+        let ctx = if matches!(
+            property,
+            b"LINK_OPTIONS" | b"INTERFACE_LINK_OPTIONS" | b"STATIC_LIBRARY_OPTIONS"
+        ) && ctx.traversal != UsageTraversal::Link
+        {
+            link_ctx = EvalContext {
+                traversal: UsageTraversal::Link,
+                ..ctx.clone()
+            };
+            &link_ctx
+        } else {
+            ctx
+        };
         for entry in entries {
             let (value, flags) = self.eval_entry(target, dir, property, entry, ctx, false)?;
             result.flags = result.flags.union(flags);

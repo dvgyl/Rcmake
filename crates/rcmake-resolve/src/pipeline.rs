@@ -10,7 +10,7 @@ use rcmake_model::{CommandId, DirId, FileSetKind, GeneratorKind, ProjectModel, T
 use crate::{
     BuildGraph, BuildStep, CrossConfiguration, GenerationResult, InstallActionKind, ResolveError,
     ResolveOptions, ResolvedTarget,
-    cxx_modules::{generation_location, std_module_model},
+    cxx_modules::{generation_location, module_error, std_module_model},
     exports::resolve_exports,
     ide, lower,
     resolve_link::{attach_links, resolve_link},
@@ -19,6 +19,8 @@ use crate::{
     unity,
     usage::{ResolvedLinkKind, UsageResolver},
 };
+
+mod header_verify;
 
 /// Resolve and lower the project in configuration order.
 /// Use `CMAKE_BUILD_TYPE` if `configs` is empty.
@@ -56,10 +58,20 @@ pub fn resolve_with_options(
     let mut paths = SourcePaths::new(host);
     paths.ide = options.ide;
     paths.unity = Some(unity::prepare(model, host, &mut paths, &configs)?);
-    let configured_targets = configs
+    let mut configured_targets = configs
         .iter()
         .map(|config| resolve_targets(model, &mut paths, config))
         .collect::<Result<Vec<_>, _>>()?;
+    let prepared = header_verify::prepare(model, &paths, &configs, &configured_targets)?;
+    let model = if let Some(prepared) = &prepared {
+        for (config, configured) in configs.iter().zip(&mut configured_targets) {
+            resolve_verification_targets(model, &prepared.model, &mut paths, config, configured)?;
+        }
+        &prepared.model
+    } else {
+        model
+    };
+    validate_languages(model, &paths, &configured_targets)?;
     validate_target_sources(model, &paths, &configured_targets)?;
     let plan = ConfigurationPlan {
         cross: CrossPlan::new(model, &configs)?,
@@ -68,6 +80,7 @@ pub fn resolve_with_options(
         } else {
             IndexMap::new()
         },
+        verification: prepared.as_ref(),
     };
     let mut targets = Vec::new();
     let mut graphs = Vec::with_capacity(configs.len());
@@ -159,6 +172,7 @@ struct ConfigOutput {
 struct ConfigurationPlan<'a> {
     cross: CrossPlan<'a>,
     link_languages: IndexMap<TargetId, BString>,
+    verification: Option<&'a header_verify::Verification>,
 }
 
 #[derive(Default)]
@@ -268,6 +282,79 @@ fn resolve_targets(
         }
     }
     Ok(configured)
+}
+
+fn resolve_verification_targets(
+    original: &ProjectModel,
+    prepared: &ProjectModel,
+    paths: &mut SourcePaths<'_>,
+    config: &ConfigId,
+    configured: &mut ConfigTargets,
+) -> Result<(), ResolveError> {
+    paths.index_generated(prepared, config)?;
+    paths.index_objects(prepared, config);
+    let mut usage = UsageResolver::with_source_paths(prepared, paths);
+    let ctx = EvalContext {
+        config: config.clone(),
+        ..EvalContext::default()
+    };
+    for (id, target) in prepared
+        .targets()
+        .filter(|(id, _)| original.target(*id).is_none())
+    {
+        let (facts, inputs) = resolve_target(prepared, paths, &mut usage, id, target, &ctx)?;
+        configured.targets.insert(id, facts);
+        configured.inputs.insert(id, inputs);
+    }
+    Ok(())
+}
+
+fn enabled_languages(model: &ProjectModel) -> Vec<BString> {
+    model
+        .global
+        .props
+        .get(b"ENABLED_LANGUAGES")
+        .map_or_else(Vec::new, |value| list::split(value, list::Empty::Drop))
+}
+
+fn validate_languages(
+    model: &ProjectModel,
+    paths: &SourcePaths<'_>,
+    configured: &[ConfigTargets],
+) -> Result<(), ResolveError> {
+    if model.global.props.get(b"ENABLED_LANGUAGES").is_none() {
+        return Ok(());
+    }
+    let enabled = enabled_languages(model);
+    let mut reported = IndexSet::new();
+    let mut failure = None;
+    for facts in configured.iter().flat_map(|config| config.targets.values()) {
+        let Some(target) = model.target(facts.id) else {
+            continue;
+        };
+        let languages = facts
+            .compile_groups
+            .iter()
+            .map(|group| (&group.language, "compilation"))
+            .chain(
+                target
+                    .props
+                    .get(b"LINKER_LANGUAGE")
+                    .map(|language| (language, "linking")),
+            );
+        for (language, purpose) in languages {
+            if !language.is_empty()
+                && !enabled.contains(language)
+                && reported.insert((target.dir, language, purpose))
+            {
+                let error = module_error(model, paths, target, format!(
+                    "The language {language} was requested for {purpose} but was not enabled.  To enable a language it needs to be specified in a 'project' or 'enable_language' command in the root CMakeLists.txt"
+                ).into());
+                failure.get_or_insert(error);
+            }
+        }
+    }
+    failure.map_or(Ok(()), Err)
 }
 
 fn validate_target_sources(
@@ -386,6 +473,9 @@ fn resolve_config(
         result => result?,
     };
     attach_links(&mut resolved, &mut inputs, links, std_id);
+    if let Some(verification) = plan.verification {
+        verification.add_header_inputs(config, &mut resolved, &mut inputs);
+    }
     for (&id, facts) in &mut resolved {
         if facts.cxx_modules.is_some()
             && let (Some(target), Some(inputs)) = (model.target(id), inputs.get(&id))

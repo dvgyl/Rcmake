@@ -322,6 +322,13 @@ fn link_only_skips_compile_usage_and_keeps_link_usage() {
         true,
         &["$<LINK_ONLY:$<TARGET_NAME_IF_EXISTS:hidden>>"],
     );
+    model
+        .target_mut(app)
+        .unwrap()
+        .policies
+        .policies
+        .set(PolicyId::new(99), PolicyStatus::New)
+        .unwrap();
     let ctx = EvalContext::default();
     let mut resolver = UsageResolver::new(&model);
 
