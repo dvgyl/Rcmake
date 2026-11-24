@@ -118,6 +118,7 @@ fn add_library(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
     };
     let kind = options.kind.map_or(default_kind, |(_, kind)| kind);
     let args = if !options.alias
+        && !options.imported
         && matches!(kind, b"SHARED" | b"MODULE")
         && cx
             .global()
@@ -420,21 +421,29 @@ fn schedule_target_validation(cx: &mut Cx<'_>) {
 
 fn schedule_alias_validation(cx: &mut Cx<'_>, name: &[u8]) {
     let trace = cx.backtrace();
-    if let Some(frame) = trace.top()
-        && let Some(command) = &frame.name
-    {
-        defer_validation(
-            cx,
-            b"add_dependencies",
-            &[
-                CHECK_TARGETS,
-                name,
-                command,
-                &frame.file,
-                frame.line.to_string().as_bytes(),
-            ],
-        );
-    }
+    let frames: Vec<_> = trace
+        .frames()
+        .map(|frame| {
+            let kind = match frame.kind {
+                FrameKind::Command => b"command".as_slice(),
+                FrameKind::Deferred => b"deferred",
+                FrameKind::ModuleInclude => b"include",
+            };
+            (frame, frame.line.to_string(), kind)
+        })
+        .collect();
+    let args: Vec<_> = [CHECK_TARGETS, name]
+        .into_iter()
+        .chain(frames.iter().flat_map(|(frame, line, kind)| {
+            [
+                frame.name.as_deref().unwrap_or_default(),
+                frame.file.as_ref(),
+                line.as_bytes(),
+                *kind,
+            ]
+        }))
+        .collect();
+    defer_validation(cx, b"add_dependencies", &args);
 }
 
 fn has_pending_deferred_commands(cx: &Cx<'_>) -> bool {
@@ -442,7 +451,8 @@ fn has_pending_deferred_commands(cx: &Cx<'_>) -> bool {
         ids.iter().any(|id| {
             cx.defer_get_call(DirId::ROOT, id).is_some_and(|call| {
                 !matches!(call.as_slice(), [command, marker, ..]
-                    if command == b"add_dependencies" && marker == CHECK_TARGETS)
+                    if (command == b"add_dependencies" && marker == CHECK_TARGETS)
+                    || (command == b"target_link_libraries" && marker == link::CHECK_LINKS))
             })
         })
     })
@@ -499,24 +509,43 @@ fn run_target_validation(
                 generation_failed(cx);
             }
         }
-        [name, command, file, line] => {
-            let line = std::str::from_utf8(bytes(line))
-                .ok()
-                .and_then(|line| line.parse().ok())
-                .ok_or_else(|| CmdError::status("Invalid deferred alias location."))?;
-            let trace = Backtrace::default().push(Frame {
-                file: Arc::from(bytes(file)),
-                line,
-                name: Some(Arc::from(bytes(command))),
-                kind: FrameKind::Command,
-            });
+        [name, frames @ ..] => {
+            let trace = deferred_alias_backtrace(frames)?;
             if create::validate_generated_name(cx, &name.value, trace) {
                 cx.set_fatal();
             }
         }
-        _ => return Err(CmdError::status("Invalid deferred target check.")),
     }
     Ok(Flow::Normal)
+}
+
+fn deferred_alias_backtrace(args: &[ExpandedArg]) -> Result<Backtrace, CmdError> {
+    let invalid = || CmdError::status("Invalid deferred alias location.");
+    let (frames, rest) = args.as_chunks::<4>();
+    if !rest.is_empty() {
+        return Err(invalid());
+    }
+    let mut trace = Backtrace::default();
+    for [command, file, line, kind] in frames.iter().rev() {
+        let line = std::str::from_utf8(bytes(line))
+            .ok()
+            .and_then(|line| line.parse().ok())
+            .ok_or_else(invalid)?;
+        let kind = match bytes(kind) {
+            b"command" => FrameKind::Command,
+            b"deferred" => FrameKind::Deferred,
+            b"include" => FrameKind::ModuleInclude,
+            _ => return Err(invalid()),
+        };
+        let command = bytes(command);
+        trace = trace.push(Frame {
+            file: Arc::from(bytes(file)),
+            line,
+            name: (!command.is_empty()).then(|| Arc::from(command)),
+            kind,
+        });
+    }
+    Ok(trace)
 }
 
 fn validate_dependencies(cx: &mut Cx<'_>) -> bool {

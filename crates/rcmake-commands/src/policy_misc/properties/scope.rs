@@ -1,14 +1,16 @@
-use rcmake_base::{BString, list};
+use rcmake_base::BString;
 use rcmake_eval::{CmdError, Cx, RunMode};
-use rcmake_host::path;
+use rcmake_host::{Follow, path};
 use rcmake_model::{DirId, PropScope, TargetBinding, TargetId};
 
+use crate::custom::{SOURCE_BINARY_ALTERNATIVE, bind_source};
 use crate::dirs::{find_directory, normalized_path, scoped_test_directory};
 
 use super::quoted;
 
 const DIRECTORY_ERROR: &str = "DIRECTORY scope provided but requested directory was not found.  This could be because the directory argument was invalid or, it is valid but has not been processed yet.";
 pub(super) const RESOLVED_SOURCE_LOCATION: &[u8] = b"\0rcmake-source-location";
+const ABSOLUTE_SOURCE_PATH: &[u8] = b"\0rcmake-source-absolute";
 
 pub(super) fn source_scope(cx: &mut Cx<'_>, dir: DirId, source: &[u8]) -> PropScope {
     select_source(cx, dir, source, false, true).unwrap_or_else(|| PropScope::Source {
@@ -26,7 +28,17 @@ pub(super) fn select_source(
 ) -> Option<PropScope> {
     let [source_path, binary_path] = source_paths(cx, source);
     let relative = !scoped && !path::to_native(source).is_absolute();
-    let paths = std::iter::once(&source_path).chain(relative.then_some(&binary_path));
+    let existing = relative
+        .then(|| {
+            [&source_path, &binary_path]
+                .into_iter()
+                .find(|path| source_file_resolves_path(cx, path))
+        })
+        .flatten();
+    let first = existing.unwrap_or(&source_path);
+    let alternative =
+        (relative && existing.is_none() && source_path != binary_path).then_some(&binary_path);
+    let paths = std::iter::once(first).chain(alternative);
     let exact_extension = [115, 187].into_iter().all(|id| {
         super::generated::policy(cx, dir, rcmake_diag::PolicyId::new(id))
             == rcmake_diag::PolicyStatus::New
@@ -38,45 +50,78 @@ pub(super) fn select_source(
                     && candidate
                         .strip_prefix(prefix.as_slice())
                         .and_then(|suffix| suffix.strip_prefix(b"."))
-                        .is_some_and(|ext| {
-                            SOURCE_EXTENSIONS
-                                .split_ascii_whitespace()
-                                .any(|known| ext == known.as_bytes())
-                        })
+                        .is_some_and(known_source_extension)
         })
     };
-    let model = cx.project();
-    let directory = model.dir(dir);
-    let known = directory
+    let known = cx
+        .project()
+        .dir(dir)
         .source_props
-        .keys()
-        .find(|key| matches(key))
-        .cloned();
-    let key = known.or_else(|| {
-        model
-            .targets()
-            .filter(|(_, target)| target.dir == dir)
-            .flat_map(|(_, target)| &target.sources)
-            .flat_map(|entry| list::iter(&entry.value, list::Empty::Drop))
-            .filter(|entry| !entry.starts_with(b"$<"))
-            .flat_map(|entry| {
-                let entry = path::to_native(&entry);
-                [&directory.source_dir, &directory.binary_dir].map(|base| {
-                    path::from_native_cmake(&normalized_path(&path::to_native(base).join(&entry)))
-                })
-            })
-            .find(|key| matches(key))
-    });
-    if !create {
-        return key.map(|path| PropScope::Source { dir, path });
+        .iter()
+        .find_map(|(key, props)| {
+            if let Some(resolved) = props.get(RESOLVED_SOURCE_LOCATION) {
+                return matches(resolved).then(|| (key.clone(), resolved.clone()));
+            }
+            if matches(key) {
+                return Some((key.clone(), key.clone()));
+            }
+            props
+                .get(SOURCE_BINARY_ALTERNATIVE)
+                .filter(|alternate| matches(alternate))
+                .map(|alternate| (key.clone(), alternate.clone()))
+        });
+    let key = match known {
+        Some((key, matched)) => {
+            if key != matched {
+                bind_source(cx.project().dir_mut(dir), &key, &matched);
+            }
+            matched
+        }
+        None if !create => return None,
+        None => {
+            let key = first.clone();
+            let props = cx
+                .project()
+                .dir_mut(dir)
+                .source_props
+                .entry(key.clone())
+                .or_default();
+            if let Some(alternate) = alternative {
+                // An absolute lookup can bind this record to either directory.
+                props.set(SOURCE_BINARY_ALTERNATIVE.into(), alternate.clone());
+            }
+            key
+        }
+    };
+    if !relative || existing.is_some() {
+        let props = cx
+            .project()
+            .dir_mut(dir)
+            .source_props
+            .entry(key.clone())
+            .or_default();
+        props.unset(SOURCE_BINARY_ALTERNATIVE);
+        if !relative {
+            props.set(ABSOLUTE_SOURCE_PATH.into(), "1".into());
+        }
     }
-    let key = key.unwrap_or(source_path);
-    cx.project()
-        .dir_mut(dir)
-        .source_props
-        .entry(key.clone())
-        .or_default();
     Some(PropScope::Source { dir, path: key })
+}
+
+pub(super) fn source_file_resolves_path(cx: &Cx<'_>, source: &[u8]) -> bool {
+    let file = path::to_native(source);
+    // A recognized extension has a definite spelling even if its directory is ambiguous.
+    !file
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| known_source_extension(ext.as_bytes()))
+        && cx.host().metadata(&file, Follow::Yes).is_ok()
+}
+
+fn known_source_extension(extension: &[u8]) -> bool {
+    SOURCE_EXTENSIONS
+        .split_ascii_whitespace()
+        .any(|known| extension == known.as_bytes())
 }
 
 pub(super) const SOURCE_EXTENSIONS: &str = "c C c++ cc cpp cxx cu mpp m M mm ixx cppm ccm cxxm c++m h hh h++ hm hpp hxx in txx f F for f77 f90 f95 f03 hip ispc";

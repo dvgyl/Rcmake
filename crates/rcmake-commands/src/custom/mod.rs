@@ -9,7 +9,7 @@ use rcmake_expr::ExpandedArg;
 use rcmake_genex::{ConfigId, EvalContext, EvalSite, evaluate, find_genex, parse};
 use rcmake_host::path::{from_native, to_native};
 use rcmake_model::{
-    BT, CommandId, CustomCommand, CustomCommandKind, DirId, GeneratorKind, ModelError,
+    BT, CommandId, CustomCommand, CustomCommandKind, DirId, Directory, GeneratorKind, ModelError,
     ProjectModel, Target, TargetBinding, TargetEvent, TargetKind, TargetOrigin,
 };
 use rcmake_resolve::usage::UsageResolver;
@@ -20,6 +20,9 @@ mod rule;
 mod tests;
 
 const DEFERRED_APPEND: &[u8] = b"\0RCMAKE_CUSTOM_APPEND";
+
+/// Possible binary path of a relative source property record.
+pub(crate) const SOURCE_BINARY_ALTERNATIVE: &[u8] = b"\0rcmake-source-binary-alternative";
 
 pub(crate) fn register(registry: &mut Registry) {
     let project_only = CmdFlags { scriptable: false };
@@ -849,11 +852,35 @@ pub(crate) fn record(
     let project = cx.project();
     let id = project.add_command(body).map_err(model_error)?;
     for path in generated {
-        if !path.windows(2).any(|pair| pair == b"$<") {
+        if find_genex(&path).is_none() {
+            let directory = project.dir_mut(dir);
+            if directory.source_props.len() > directory.generated_sources.len()
+                && let Some(key) = directory.source_props.iter().find_map(|(key, props)| {
+                    let alternate = props.get(SOURCE_BINARY_ALTERNATIVE)?;
+                    (key == &path || alternate == &path).then(|| key.clone())
+                })
+            {
+                bind_source(directory, &key, &path);
+            }
             project.mark_generated(dir, path);
         }
     }
     Ok(id)
+}
+
+/// Bind a relative source record to its resolved path. Keep its insertion order.
+pub(crate) fn bind_source(directory: &mut Directory, old: &BString, new: &BString) {
+    let sources = &mut directory.source_props;
+    if old == new {
+        if let Some(props) = sources.get_mut(old) {
+            props.unset(SOURCE_BINARY_ALTERNATIVE);
+        }
+    } else if !sources.contains_key(new)
+        && let Some((position, _, mut props)) = sources.shift_remove_full(old)
+    {
+        props.unset(SOURCE_BINARY_ALTERNATIVE);
+        sources.shift_insert(position, new.clone(), props);
+    }
 }
 
 fn model_error(error: ModelError) -> CmdError {

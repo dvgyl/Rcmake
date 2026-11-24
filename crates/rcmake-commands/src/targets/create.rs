@@ -8,7 +8,7 @@ use rcmake_model::{
 };
 
 use super::{
-    bytes, generation_diagnostic, init, model_error, schedule_alias_validation,
+    bytes, generation_diagnostic, init, model_error, reported, schedule_alias_validation,
     schedule_target_validation,
 };
 
@@ -111,6 +111,11 @@ fn add(cx: &mut Cx<'_>, args: &[ExpandedArg], executable: bool) -> CmdResult {
         ));
     }
     if options.imported {
+        if options.exclude && !executable {
+            return Err(CmdError::status(
+                "excludeFromAll with IMPORTED target makes no sense.",
+            ));
+        }
         for (set, flag) in [
             (options.win32, "WIN32"),
             (options.bundle, "MACOSX_BUNDLE"),
@@ -164,12 +169,18 @@ fn add(cx: &mut Cx<'_>, args: &[ExpandedArg], executable: bool) -> CmdResult {
                 .push(BT::new(sources, target.backtrace.clone()));
         }
     }
+    let global = target.is_global();
+    let clear_legacy_dependencies = super::link::has_legacy_link_cache(&target);
     let id = cx
         .project()
         .add_target(target)
         .map_err(|err| duplicate(cx, name, options.imported, err))?;
     crate::dirs::source_groups::apply_to_target(cx, id)?;
-    if !options.imported {
+    if clear_legacy_dependencies {
+        let key = super::link::legacy_link_cache_key(name);
+        cx.cache().remove(&key);
+    }
+    if global {
         schedule_generated_name_validation(cx, name);
     }
     Ok(Flow::Normal)
@@ -197,7 +208,7 @@ fn validate_name(cx: &mut Cx<'_>, name: &BString, special: bool) -> Result<(), C
     if valid && !reserved {
         Ok(())
     } else {
-        Err(crate::command_error(
+        Err(reported(
             cx,
             format!(
                 "The target name \"{name}\" is reserved or not valid for certain CMake features, such as generator expressions, and may result in undefined behavior."
@@ -226,9 +237,7 @@ pub(super) fn validate_generated_names(cx: &mut Cx<'_>) -> bool {
     let model = cx.project();
     let candidates: Vec<_> = model
         .targets()
-        .filter(|(_, target)| {
-            !target.is_imported() && generated_reservation(&target.name).is_some()
-        })
+        .filter(|(_, target)| target.is_global() && generated_reservation(&target.name).is_some())
         .map(|(_, target)| (target.name.clone(), target.backtrace.clone()))
         .collect();
     let mut failed = false;
@@ -283,7 +292,7 @@ fn alias(
         || options.kind.is_some()
     {
         return Err(CmdError::status(
-            "ALIAS target may not have other arguments.",
+            "ALIAS requires exactly one target argument.",
         ));
     }
     let referent = &referent.value;
@@ -320,32 +329,31 @@ fn alias(
     }
     let global = target.is_global();
     if !reject_collision && let Some(existing) = model.lookup_target(dir, name) {
-        let directories: Vec<_> = if global {
-            model.dirs().map(|(dir, _)| dir).collect()
-        } else {
-            model
-                .dirs()
-                .filter_map(|(child, _)| {
-                    model.ancestors(child).any(|id| id == dir).then_some(child)
-                })
-                .collect()
-        };
-        for dir in directories {
-            // A built target in this directory takes precedence over the alias.
-            let aliased = match existing {
-                TargetBinding::Target(current)
-                    if model
-                        .target(current)
-                        .is_some_and(|target| target.dir == dir && !target.is_imported()) =>
-                {
-                    current
-                }
-                _ => id,
-            };
+        if !global {
+            // New subdirectories inherit the local alias when they start.
             model
                 .dir_mut(dir)
                 .local_targets
-                .insert(name.clone(), TargetBinding::Alias(aliased));
+                .insert(name.clone(), TargetBinding::Alias(id));
+        } else {
+            let directories: Vec<_> = model.dirs().map(|(dir, _)| dir).collect();
+            for dir in directories {
+                // A built target in this directory takes precedence over the alias.
+                let aliased = match existing {
+                    TargetBinding::Target(current)
+                        if model
+                            .target(current)
+                            .is_some_and(|target| target.dir == dir && !target.is_imported()) =>
+                    {
+                        current
+                    }
+                    _ => id,
+                };
+                model
+                    .dir_mut(dir)
+                    .local_targets
+                    .insert(name.clone(), TargetBinding::Alias(aliased));
+            }
         }
     } else {
         model.add_alias(dir, name.clone(), id).map_err(|err| {

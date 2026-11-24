@@ -1,10 +1,14 @@
-use rcmake_base::truth;
+use rcmake_base::{BString, truth};
 use rcmake_diag::{DiagCategory, Effect, MessageKind, PolicyId, PolicyStatus};
 use rcmake_eval::Cx;
-use rcmake_model::DirId;
+use rcmake_model::{DirId, PropScope};
+
+use crate::custom::{SOURCE_BINARY_ALTERNATIVE, bind_source};
 
 use super::computed::boolean;
-use super::scope::{RESOLVED_SOURCE_LOCATION, select_source, source_paths};
+use super::scope::{
+    RESOLVED_SOURCE_LOCATION, select_source, source_file_resolves_path, source_paths,
+};
 use super::set::Update;
 
 const CMP0118: PolicyId = PolicyId::new(118);
@@ -19,11 +23,7 @@ pub(super) fn policy(cx: &mut Cx<'_>, dir: DirId, id: PolicyId) -> PolicyStatus 
     cx.policy(id)
 }
 
-pub(super) fn global_value(
-    cx: &mut Cx<'_>,
-    dir: DirId,
-    source: &[u8],
-) -> Option<rcmake_base::BString> {
+pub(super) fn global_value(cx: &mut Cx<'_>, dir: DirId, source: &[u8]) -> Option<BString> {
     if policy(cx, dir, CMP0163) != PolicyStatus::New {
         return None;
     }
@@ -91,59 +91,53 @@ pub(super) fn set(
             "Policy {policy_id} is set to NEW and appending to the 'GENERATED' property is therefore not allowed. Only setting it to \"1\" is allowed!\n"
         )
     } else {
-        let [source_path, binary_path] = source_paths(cx, source);
-        let selected = select_source(cx, dir, source, scoped, false);
-        let resolved = selected
-            .as_ref()
-            .and_then(|scope| cx.project().get_prop(scope, RESOLVED_SOURCE_LOCATION));
-        let path = if let Some(resolved) = resolved {
-            resolved
-        } else if policy_id == CMP0163 && !scoped {
-            binary_path
-        } else if let Some(rcmake_model::PropScope::Source { path, .. }) = selected
-            && cx.project().dir(dir).source_props.contains_key(&path)
-        {
-            // An unscoped relative source with no resolved file uses the binary directory.
-            if !scoped
-                && path == source_path
-                && !rcmake_host::path::to_native(source).is_absolute()
-                && cx
-                    .host()
-                    .metadata(
-                        &rcmake_host::path::to_native(&path),
-                        rcmake_host::Follow::Yes,
-                    )
-                    .is_err()
-            {
-                binary_path
-            } else {
-                path
-            }
-        } else if scoped {
+        mark_source(cx, dir, source, scoped);
+        return true;
+    };
+    let _ = select_source(cx, dir, source, scoped, true);
+    cx.issue_in_directory(
+        MessageKind::AuthorWarning,
+        Effect::None,
+        Some(DiagCategory::Author),
+        diagnostic.into(),
+    );
+    true
+}
+
+fn mark_source(cx: &mut Cx<'_>, dir: DirId, source: &[u8], scoped: bool) {
+    let [source_path, binary_path] = source_paths(cx, source);
+    let fallback =
+        if scoped || source_path == binary_path || source_file_resolves_path(cx, &source_path) {
             source_path
         } else {
             binary_path
         };
-        cx.project().mark_generated(dir, path);
-        return true;
-    };
-    let _ = select_source(cx, dir, source, scoped, true);
-    if dir == cx.current_dir_id() {
-        cx.issue(
-            MessageKind::AuthorWarning,
-            Effect::None,
-            Some(DiagCategory::Author),
-            diagnostic.into(),
-        );
+    let path = if let Some(PropScope::Source { path, .. }) =
+        select_source(cx, dir, source, scoped, false)
+    {
+        let unresolved = cx
+            .project()
+            .dir(dir)
+            .source_props
+            .get(&path)
+            .is_some_and(|props| props.get(SOURCE_BINARY_ALTERNATIVE).is_some());
+        if unresolved {
+            bind_source(cx.project().dir_mut(dir), &path, &fallback);
+            fallback
+        } else {
+            path
+        }
     } else {
-        cx.issue_in_directory(
-            MessageKind::AuthorWarning,
-            Effect::None,
-            Some(DiagCategory::Author),
-            diagnostic.into(),
-        );
-    }
-    true
+        fallback
+    };
+    let model = cx.project();
+    model.mark_generated(dir, path.clone());
+    model
+        .dir_mut(dir)
+        .source_props
+        .entry(path.clone())
+        .or_default()
+        .set(RESOLVED_SOURCE_LOCATION.into(), path);
 }
 
 pub(super) fn is_strict(cx: &mut Cx<'_>, dir: DirId) -> bool {

@@ -6,10 +6,10 @@ use rcmake_diag::{
     DiagAction, DiagCategory, Diagnostic, Effect, Location, MessageKind, PolicyId, PolicyStatus,
     RenderOptions, render,
 };
-use rcmake_genex::{ConfigId, EvalContext};
+use rcmake_genex::{ConfigId, EvalContext, UsageTraversal};
 use rcmake_host::{Host, Stream};
 use rcmake_model::{
-    CommandId, CustomCommandKind, DirId, FileSetKind, GeneratorKind, ProjectModel, TargetId,
+    CommandId, CustomCommandKind, DirId, FileSetKind, GeneratorKind, ProjectModel, Target, TargetId,
 };
 
 use crate::{
@@ -19,10 +19,13 @@ use crate::{
     exports::resolve_exports,
     ide, lower,
     resolve_link::{attach_links, resolve_link},
-    sources::{SourcePaths, TargetInputs, generation_source_location},
+    sources::{
+        SourcePaths, TargetInputs, assign_file_set_source_groups, generation_source_location,
+        validate_object_sources,
+    },
     target::resolve_target,
     unity,
-    usage::{ResolvedLinkKind, UsageResolver},
+    usage::{ResolvedLinkItem, ResolvedLinkKind, UsageResolver, handle},
 };
 
 mod header_verify;
@@ -91,6 +94,7 @@ fn resolve_project(
     let mut paths = SourcePaths::new(host);
     paths.ide = options.ide;
     paths.collect_source_errors = collect_source_errors;
+    paths.index_source_records(model);
     paths.unity = Some(unity::prepare(model, host, &mut paths, &configs)?);
     let mut configured_targets = configs
         .iter()
@@ -325,7 +329,18 @@ fn resolve_targets(
     };
     let mut configured = ConfigTargets::default();
     for (id, target) in model.targets().filter(|(_, target)| !target.is_imported()) {
-        let (facts, target_inputs) = resolve_target(model, paths, &mut usage, id, target, &ctx)?;
+        let (mut facts, target_inputs) =
+            resolve_target(model, paths, &mut usage, id, target, &ctx)?;
+        validate_object_sources(
+            model,
+            paths,
+            &mut usage,
+            target,
+            &facts,
+            &target_inputs,
+            &ctx,
+        )?;
+        assign_file_set_source_groups(model, target, &mut facts);
         configured.targets.insert(id, facts);
         configured.inputs.insert(id, target_inputs);
     }
@@ -596,6 +611,149 @@ fn link_languages(
         .collect()
 }
 
+fn validate_link_items(
+    model: &ProjectModel,
+    paths: &SourcePaths<'_>,
+    usage: &mut UsageResolver<'_>,
+    resolved: &IndexMap<TargetId, ResolvedTarget>,
+    ctx: &EvalContext,
+    plan: &ConfigurationPlan<'_>,
+) -> Result<(), ResolveError> {
+    let only_targets = |target: &Target| {
+        target
+            .props
+            .get(b"LINK_LIBRARIES_ONLY_TARGETS")
+            .is_some_and(|value| truth::is_on(value))
+    };
+    if !model.targets().any(|(_, target)| {
+        only_targets(target)
+            || [
+                &target.usage.link_libraries,
+                &target.usage.interface_link_libraries,
+            ]
+            .into_iter()
+            .flatten()
+            .flatten()
+            .any(|item| {
+                item.text
+                    .value
+                    .windows(2)
+                    .any(|pair| matches!(pair, b"::" | b"$<"))
+            })
+    }) {
+        return Ok(());
+    }
+    let mut reported = IndexSet::new();
+    let mut checked_interfaces = IndexSet::new();
+    let mut failure = None;
+    let mut check = |id, interface, item: &ResolvedLinkItem| {
+        let Some(target) = model.target(id) else {
+            return;
+        };
+        let name = &item.text.value;
+        if !matches!(item.kind, ResolvedLinkKind::Raw)
+            || name
+                .first()
+                .is_none_or(|&byte| matches!(byte, b'-' | b'$' | b'`'))
+            || name.iter().any(|&byte| matches!(byte, b'/' | b'\\'))
+            || (!only_targets(target) && !name.windows(2).any(|pair| pair == b"::"))
+            || !reported.insert((id, name.clone()))
+        {
+            return;
+        }
+        let message = if only_targets(target) {
+            let verb = if interface {
+                "its link interface contains"
+            } else {
+                "it links to"
+            };
+            format!(
+                "Target \"{}\" has LINK_LIBRARIES_ONLY_TARGETS enabled, but {verb}:\n\n  {name}\n\nwhich is not a target.",
+                target.name
+            )
+        } else {
+            let head = if interface {
+                format!("The link interface of target \"{}\" contains:", target.name)
+            } else {
+                format!("Target \"{}\" links to:", target.name)
+            };
+            format!("{head}\n\n  {name}\n\nbut the target was not found.")
+        };
+        let body = BString::from(format!(
+            "{message}  Possible reasons include:\n\n  * There is a typo in the target name.\n  * A find_package call is missing for an IMPORTED target.\n  * An ALIAS target is missing."
+        ));
+        paths.emit(
+            model,
+            MessageKind::Error,
+            Location::Backtrace(item.text.backtrace.clone()),
+            body.clone(),
+        );
+        failure.get_or_insert(ResolveError::Reported(body));
+    };
+    fn with_members(item: &ResolvedLinkItem) -> impl Iterator<Item = &ResolvedLinkItem> {
+        let members = match &item.kind {
+            ResolvedLinkKind::Group { members, .. } => members.as_slice(),
+            _ => &[],
+        };
+        std::iter::once(item).chain(members)
+    }
+    for (id, target) in model.targets().filter(|(_, target)| {
+        !target.is_imported()
+            && target.kind.compiles_objects()
+            && target
+                .usage
+                .link_libraries
+                .as_ref()
+                .is_some_and(|links| !links.is_empty())
+    }) {
+        let mut ctx = EvalContext {
+            head: Some(handle(id)),
+            traversal: UsageTraversal::Link,
+            link_language: plan.link_languages.get(&id).cloned(),
+            ..ctx.clone()
+        };
+        ctx.link_language = usage.select_link_language(id, target, resolved, &ctx)?;
+        for item in usage
+            .direct_links(id, &ctx)?
+            .0
+            .iter()
+            .flat_map(|item| with_members(item))
+        {
+            check(id, false, item);
+        }
+        for dependency in usage.link_targets(id, &ctx)? {
+            checked_interfaces.insert(dependency);
+            for item in usage
+                .graphviz_interface_links(dependency, &ctx)?
+                .0
+                .iter()
+                .flat_map(|item| with_members(item))
+            {
+                check(dependency, true, item);
+            }
+        }
+    }
+    for (id, _) in model
+        .targets()
+        .filter(|(id, target)| !checked_interfaces.contains(id) && only_targets(target))
+    {
+        let ctx = EvalContext {
+            head: Some(handle(id)),
+            traversal: UsageTraversal::Link,
+            ..ctx.clone()
+        };
+        for item in usage
+            .graphviz_interface_links(id, &ctx)?
+            .0
+            .iter()
+            .flat_map(|item| with_members(item))
+        {
+            check(id, true, item);
+        }
+    }
+    failure.map_or(Ok(()), Err)
+}
+
 fn resolve_config(
     model: &ProjectModel,
     paths: &SourcePaths<'_>,
@@ -635,6 +793,7 @@ fn resolve_config(
     if paths.ide == Some(ide::IdeFlavor::Xcode) {
         ide::check_xcode_sources(model, paths, xcode_sources, &inputs, config)?;
     }
+    validate_link_items(model, paths, &mut usage, &resolved, &ctx, plan)?;
     let links = model
         .targets()
         .filter(|(_, target)| !target.is_imported())

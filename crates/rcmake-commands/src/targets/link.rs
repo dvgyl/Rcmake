@@ -4,13 +4,17 @@ use rcmake_eval::{CmdError, CmdResult, Cx, Flow};
 use rcmake_expr::ExpandedArg;
 use rcmake_genex::{ConfigId, EvalContext, EvalSite, TargetHandle, UsageTraversal};
 use rcmake_model::{
-    BT, DirId, LinkItem, ModelError, ProjectModel, Target, TargetBinding, TargetKind, UsageScope,
+    BT, CacheType, DirId, LinkItem, ModelError, ProjectModel, Target, TargetBinding, TargetKind,
+    UsageScope,
 };
 use rcmake_resolve::usage::UsageResolver;
 
-use super::{bytes, defer_validation, generation_diagnostic, model_error, reported, scope};
+use super::{
+    bytes, defer_validation, generation_diagnostic, has_pending_deferred_commands, model_error,
+    reported, scope,
+};
 
-const CHECK_LINKS: &[u8] = b"\0rcmake-check-links";
+pub(super) const CHECK_LINKS: &[u8] = b"\0rcmake-check-links";
 const PLAIN_CALLS: &[u8] = b"\0target_link_libraries/plain";
 const KEYWORD_CALLS: &[u8] = b"\0target_link_libraries/keyword";
 
@@ -19,7 +23,12 @@ pub(super) fn add(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
         && bytes(marker) == CHECK_LINKS
         && cx.running_deferred()
     {
-        validate_links(cx);
+        if has_pending_deferred_commands(cx) {
+            defer_validation(cx, b"target_link_libraries", &[CHECK_LINKS]);
+        } else {
+            cx.global().props.unset(CHECK_LINKS);
+            validate_links(cx);
+        }
         return Ok(Flow::Normal);
     }
     let [name, rest @ ..] = args else {
@@ -84,6 +93,9 @@ pub(super) fn add(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
         .ok_or_else(|| model_error(ModelError::UnknownObject))?;
     let owner = target.dir;
     let propagate_private = target.kind.propagates_private_links();
+    let legacy_cache = has_legacy_link_cache(target)
+        && target.policies.policies.get(PolicyId::new(73)) != PolicyStatus::New;
+    let mut legacy_dependencies = BString::default();
     let mut qualifier = None;
     let mut own = Vec::new();
     let mut interface = Vec::new();
@@ -119,7 +131,14 @@ pub(super) fn add(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
             }
             continue;
         }
-        validate_scope(target, scope)?;
+        if let Some(kind) = invalid_link_scope(target, scope, signature) {
+            return Err(reported(
+                cx,
+                format!(
+                    "{kind} library can only be used with the INTERFACE keyword of target_link_libraries"
+                ),
+            ));
+        }
         let mut text = arg.value.clone();
         if qualifier.is_none() {
             let mut depth = genex_depth(0, value);
@@ -135,6 +154,12 @@ pub(super) fn add(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
         let value = text.as_slice();
         let qualifier = qualifier.take().unwrap_or(Qualifier::General);
         has_item = true;
+        if legacy_cache && scope != UsageScope::Interface && !contains_genex(value) {
+            legacy_dependencies.extend_from_slice(qualifier.name().as_bytes());
+            legacy_dependencies.push(b';');
+            legacy_dependencies.extend_from_slice(value);
+            legacy_dependencies.push(b';');
+        }
         if value.is_empty() {
             continue;
         }
@@ -194,13 +219,16 @@ pub(super) fn add(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
     if owner != dir && cx.policy(PolicyId::new(79)) != PolicyStatus::New {
         if let Some(item) = own.first() {
             let text = &item.text.value;
-            return Err(crate::command_error(
-                cx,
+            cx.issue_in_directory(
+                MessageKind::Error,
+                Effect::SetError,
+                None,
                 format!(
                     "Attempt to add link library \"{text}\" to target \"{}\" which is not built in this directory.\n\nThis is allowed only when policy CMP0079 is set to NEW.",
                     name.value
-                ),
-            ));
+                ).into(),
+            );
+            return Err(CmdError::Reported);
         }
         for item in &mut interface {
             item.lookup_dir = owner;
@@ -227,6 +255,7 @@ pub(super) fn add(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
             .append_string(signature.property(), call.as_bytes());
     }
     let check_links = !own.is_empty();
+    let cache_key = (!legacy_dependencies.is_empty()).then(|| legacy_link_cache_key(&target.name));
     if check_links {
         target
             .usage
@@ -241,10 +270,35 @@ pub(super) fn add(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
             .get_or_insert_default()
             .extend(interface);
     }
+    if let Some(key) = cache_key {
+        let mut value = cx
+            .cache()
+            .get(&key)
+            .map_or_else(BString::default, |entry| entry.value.clone());
+        value.extend_from_slice(&legacy_dependencies);
+        cx.write_cache(
+            &key,
+            value,
+            CacheType::Static,
+            b"Dependencies for the target",
+        );
+    }
     if check_links {
         schedule_validation(cx);
     }
     Ok(Flow::Normal)
+}
+
+pub(super) fn has_legacy_link_cache(target: &Target) -> bool {
+    !target.is_imported()
+        && matches!(
+            target.kind,
+            TargetKind::StaticLibrary | TargetKind::SharedLibrary | TargetKind::ModuleLibrary
+        )
+}
+
+pub(super) fn legacy_link_cache_key(name: &[u8]) -> BString {
+    [name, b"_LIB_DEPENDS"].concat().into()
 }
 
 fn linkable(target: &Target) -> bool {
@@ -365,7 +419,6 @@ fn validate_links(cx: &mut Cx<'_>) {
                         "Target \"{}\" links to item \"{}\" which has leading or trailing whitespace.  This is now an error according to policy CMP0004.",
                         target.name, BString::from(item)
                     )));
-                        break;
                     }
                     if trimmed == target.name.as_slice()
                         || target.policies.policies.get(PolicyId::new(108)) == PolicyStatus::New
@@ -589,33 +642,35 @@ fn genex_depth(mut depth: usize, arg: &[u8]) -> usize {
     depth
 }
 
-fn validate_scope(target: &Target, scope: UsageScope) -> Result<(), CmdError> {
-    if scope != UsageScope::Interface {
-        let kind = if target.kind == TargetKind::InterfaceLibrary {
-            Some("INTERFACE")
-        } else if target.is_imported() {
-            Some("IMPORTED")
-        } else {
-            None
-        };
-        if let Some(kind) = kind {
-            return Err(CmdError::status(format!(
-                "{kind} library can only be used with the INTERFACE keyword of target_link_libraries"
-            )));
-        }
+fn invalid_link_scope(
+    target: &Target,
+    scope: UsageScope,
+    signature: Signature,
+) -> Option<&'static str> {
+    if scope == UsageScope::Interface && signature == Signature::Modern {
+        None
+    } else if target.kind == TargetKind::InterfaceLibrary {
+        Some("INTERFACE")
+    } else if target.is_imported() {
+        Some("IMPORTED")
+    } else {
+        None
     }
-    Ok(())
 }
 
 fn maybe_target_name(value: &[u8]) -> bool {
     value
         .iter()
         .all(|byte| byte.is_ascii_alphanumeric() || b"_.+-:".contains(byte))
-        || value
-            .windows(2)
-            .position(|pair| pair == b"$<")
-            .and_then(|start| value.get(start + 2..))
-            .is_some_and(|tail| tail.contains(&b'>'))
+        || contains_genex(value)
+}
+
+fn contains_genex(value: &[u8]) -> bool {
+    value
+        .windows(2)
+        .position(|pair| pair == b"$<")
+        .and_then(|start| value.get(start + 2..))
+        .is_some_and(|tail| tail.contains(&b'>'))
 }
 
 fn signature_error(target: &Target, signature: Signature, has_item: bool) -> Option<String> {

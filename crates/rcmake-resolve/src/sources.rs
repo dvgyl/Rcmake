@@ -10,10 +10,12 @@ use rcmake_diag::{
 };
 use rcmake_genex::{ConfigId, EvalContext, EvalSite, evaluate, parse};
 use rcmake_host::{FileKind, Follow, Host, Stream, path::to_native};
-use rcmake_model::{BT, DirId, Directory, ProjectModel, PropertyMap, Target, TargetId};
+use rcmake_model::{
+    BT, DirId, Directory, FileSetKind, ProjectModel, PropertyMap, Target, TargetId, TargetKind,
+};
 
 use crate::{
-    CompileGroup, InterfaceInclude, ResolveError,
+    CompileGroup, InterfaceInclude, ResolveError, ResolvedTarget,
     target::FileSetMember,
     usage::{self, UsageResolver},
 };
@@ -119,6 +121,32 @@ pub(crate) fn apply_compile_properties(
             )?,
             None => Vec::new(),
         };
+        if matches!(field, SourceUsage::Includes)
+            && let Some(include) = source_values
+                .iter()
+                .find(|entry| !Lexical::new(&entry.value).absolute())
+        {
+            let file = BString::from(Lexical::new(&source.value).filename());
+            let body = BString::from(format!(
+                "Found relative path while evaluating include directories of \"{file}\":\n\n  \"{}\"",
+                include.value
+            ));
+            if let Some(paths) = usage.source_paths() {
+                paths.emit_with_base(
+                    paths.root_source_dir.clone(),
+                    MessageKind::Error,
+                    Location::FileLine {
+                        file: absolute_path(source_props.source_dir, b"CMakeLists.txt")
+                            .as_slice()
+                            .into(),
+                        line: 0,
+                    },
+                    body.clone(),
+                );
+                return Err(ResolveError::Reported(body));
+            }
+            return Err(ResolveError::Message(body));
+        }
         if matches!(field, SourceUsage::Definitions) && !ctx.config.0.is_empty() {
             let key = config_definition_property(&ctx.config);
             let configured = source_props
@@ -180,6 +208,8 @@ pub(crate) struct SourcePaths<'a> {
     pub(crate) collect_source_errors: bool,
     extension_warnings: RefCell<IndexSet<(BString, BString)>>,
     missing: RefCell<IndexSet<(BString, BString)>>,
+    root_source_dir: Option<BString>,
+    absolute_sources: IndexMap<BString, IndexSet<BString>>,
     generated: IndexMap<BString, IndexSet<BString>>,
     objects: IndexMap<BString, TargetId>,
     pub(crate) unity: Option<crate::unity::UnityPlan>,
@@ -194,9 +224,31 @@ impl<'a> SourcePaths<'a> {
             collect_source_errors: true,
             extension_warnings: RefCell::default(),
             missing: RefCell::default(),
+            root_source_dir: None,
+            absolute_sources: IndexMap::new(),
             generated: IndexMap::new(),
             objects: IndexMap::new(),
             unity: None,
+        }
+    }
+
+    pub(crate) fn index_source_records(&mut self, model: &ProjectModel) {
+        self.root_source_dir = Some(model.dir(DirId::ROOT).source_dir.clone());
+        for (_, target) in model.targets() {
+            let paths = self
+                .absolute_sources
+                .entry(model.dir(target.dir).binary_dir.clone())
+                .or_default();
+            paths.extend(
+                target
+                    .sources
+                    .iter()
+                    .flat_map(|entry| list::iter(&entry.value, list::Empty::Drop))
+                    .filter(|path| {
+                        Lexical::new(path).absolute() && !path.windows(2).any(|part| part == b"$<")
+                    })
+                    .map(|path| Lexical::new(&path).normalize()),
+            );
         }
     }
 
@@ -235,7 +287,10 @@ impl<'a> SourcePaths<'a> {
         let usage = UsageResolver::with_source_paths(model, self);
         self.objects = model
             .targets()
-            .filter(|(_, target)| target.kind.compiles_objects() && !target.is_imported())
+            .filter(|(_, target)| {
+                target.kind.compiles_objects()
+                    && (!target.is_imported() || target.kind == TargetKind::ObjectLibrary)
+            })
             .filter_map(|(id, _)| Some((id, usage.target_objects(id, config, None)?)))
             .flat_map(|(id, objects)| {
                 list::split(&objects, list::Empty::Drop)
@@ -262,8 +317,8 @@ impl<'a> SourcePaths<'a> {
                 producers.contains(&dir.binary_dir)
                     || dir.final_policies.is_some_and(|policies| {
                         [PolicyId::new(118), PolicyId::new(163)]
-                            .iter()
-                            .any(|&policy| policies.get(policy) == PolicyStatus::New)
+                            .into_iter()
+                            .any(|policy| policies.get(policy) == PolicyStatus::New)
                     })
             })
     }
@@ -275,26 +330,65 @@ impl<'a> SourcePaths<'a> {
         binary: &BString,
     ) -> bool {
         !self.generated_in(dir, binary)
+            && !generated_at_binary_alternative(dir, source, binary)
             && (self.host.metadata(&to_native(source), Follow::Yes).is_ok()
                 || dir.source_props.contains_key(source))
     }
 
     pub(crate) fn find(&self, dir: &Directory, source: &[u8]) -> Option<BString> {
-        let paths = [
-            absolute_path(&dir.source_dir, source),
-            absolute_path(&dir.binary_dir, source),
-        ];
-        if let Some(path) = paths
-            .iter()
-            .find(|path| self.generated_in(dir, path) || self.objects.contains_key(*path))
+        let source_path = absolute_path(&dir.source_dir, source);
+        let binary_path = absolute_path(&dir.binary_dir, source);
+        if self.generated_in(dir, &binary_path)
+            || self.objects.contains_key(&binary_path)
+            || generated_at_binary_alternative(dir, &source_path, &binary_path)
+        {
+            return Some(binary_path);
+        }
+        if let Some(path) = dir
+            .source_props
+            .get(&source_path)
+            .and_then(|props| props.get(b"\0rcmake-source-location"))
         {
             return Some(path.clone());
         }
-        paths.into_iter().find(|path| {
+        if self.generated_in(dir, &source_path) || self.objects.contains_key(&source_path) {
+            return Some(source_path);
+        }
+        [source_path, binary_path].into_iter().find(|path| {
             self.host
                 .metadata(&to_native(path), Follow::Yes)
                 .is_ok_and(|metadata| matches!(metadata.kind, FileKind::File | FileKind::Dir))
         })
+    }
+
+    fn missing_identity(&self, dir: &Directory, source: &[u8]) -> (BString, BString) {
+        let source_path = absolute_path(&dir.source_dir, source);
+        if Lexical::new(source).absolute() {
+            return (source_path.clone(), source_path);
+        }
+        let binary_path = absolute_path(&dir.binary_dir, source);
+        let props = |path: &BString| {
+            dir.source_props
+                .get_full(path)
+                .filter(|(_, _, props)| props.get(b"\0rcmake-source-absolute").is_some())
+        };
+        let recorded = [props(&source_path), props(&binary_path)]
+            .into_iter()
+            .flatten()
+            .min_by_key(|(index, _, _)| *index)
+            .map(|(_, path, _)| path)
+            .or_else(|| {
+                let paths = self.absolute_sources.get(&dir.binary_dir)?;
+                [&source_path, &binary_path]
+                    .into_iter()
+                    .filter_map(|path| Some((paths.get_index_of(path)?, path)))
+                    .min_by_key(|(index, _)| *index)
+                    .map(|(_, path)| path)
+            });
+        match recorded {
+            Some(path) => (path.clone(), path.clone()),
+            None => (source_path, source.into()),
+        }
     }
 
     pub(crate) fn is_directory(&self, path: &[u8]) -> bool {
@@ -321,8 +415,8 @@ impl<'a> SourcePaths<'a> {
         let status = dir
             .final_policies
             .map_or(PolicyStatus::New, |policies| policies.get(policy));
-        let identity = absolute_path(&dir.source_dir, &source.value);
-        let mut body: BString = [b"Cannot find source file:\n\n  ", source.value.as_slice()]
+        let (identity, display_path) = self.missing_identity(dir, &source.value);
+        let mut body: BString = [b"Cannot find source file:\n\n  ", display_path.as_slice()]
             .concat()
             .into();
         if status != PolicyStatus::New {
@@ -384,12 +478,18 @@ impl<'a> SourcePaths<'a> {
             .borrow_mut()
             .insert((dir.binary_dir.clone(), identity))
         {
-            self.emit(
-                model,
-                MessageKind::Error,
-                Location::Backtrace(source.backtrace.clone()),
-                body,
-            );
+            let frames: Vec<_> = source
+                .backtrace
+                .frames()
+                .take_while(|frame| Some(*frame) != dir.backtrace.top())
+                .collect();
+            let trace = frames
+                .into_iter()
+                .rev()
+                .fold(Backtrace::default(), |trace, frame| {
+                    trace.push(frame.clone())
+                });
+            self.emit(model, MessageKind::Error, Location::Backtrace(trace), body);
         }
         Ok(None)
     }
@@ -401,8 +501,23 @@ impl<'a> SourcePaths<'a> {
         location: Location,
         body: BString,
     ) {
+        self.emit_with_base(
+            Some(model.dir(DirId::ROOT).source_dir.clone()),
+            kind,
+            location,
+            body,
+        );
+    }
+
+    fn emit_with_base(
+        &self,
+        relative_base: Option<BString>,
+        kind: MessageKind,
+        location: Location,
+        body: BString,
+    ) {
         let options = RenderOptions {
-            relative_base: Some(model.dir(rcmake_model::DirId::ROOT).source_dir.clone()),
+            relative_base,
             ..RenderOptions::default()
         };
         let location = generation_source_location(location);
@@ -434,6 +549,90 @@ impl<'a> SourcePaths<'a> {
     }
 }
 
+pub(crate) fn assign_file_set_source_groups(
+    model: &ProjectModel,
+    target: &Target,
+    facts: &mut ResolvedTarget,
+) {
+    let Some(ide) = &mut facts.ide else {
+        return;
+    };
+    for source in &mut ide.sources {
+        let Some(name) = &source.file_set else {
+            continue;
+        };
+        if let Some(group) = target
+            .file_sets
+            .iter()
+            .filter_map(|&id| model.file_set(id))
+            .find(|set| &set.name == name)
+            .and_then(|set| {
+                set.props
+                    .get(b"SOURCE_GROUP")
+                    .or_else(|| set.props.get(b"\0source_group_file_set"))
+            })
+        {
+            source.group.clone_from(group);
+        }
+    }
+}
+
+pub(crate) fn validate_object_sources(
+    model: &ProjectModel,
+    paths: &SourcePaths<'_>,
+    usage: &mut UsageResolver<'_>,
+    target: &Target,
+    facts: &ResolvedTarget,
+    inputs: &TargetInputs,
+    ctx: &EvalContext,
+) -> Result<(), ResolveError> {
+    if target.kind != TargetKind::ObjectLibrary {
+        return Ok(());
+    }
+    let dir = model.dir(target.dir);
+    let mut invalid = inputs
+        .sources
+        .iter()
+        .filter(|source| {
+            let extension = Lexical::new(source).stem_extension(true).1;
+            (extension.eq_ignore_ascii_case(b".def") || extension.eq_ignore_ascii_case(b".idl"))
+                && !external_object(dir, source)
+                && !properties(dir, source)
+                    .get(b"HEADER_FILE_ONLY")
+                    .is_some_and(|value| truth::is_on(value))
+                && !facts
+                    .compile_units
+                    .iter()
+                    .any(|unit| unit.source.value == **source)
+        })
+        .collect::<IndexSet<_>>();
+    if invalid.is_empty() {
+        return Ok(());
+    }
+    for (_, set) in usage.source_file_sets(facts.id, ctx)? {
+        if set.kind == FileSetKind::Headers
+            && let Some(owner) = model.target(set.target)
+        {
+            let owner_dir = model.dir(owner.dir);
+            for file in usage.file_set_paths(set.target, b"SOURCES", &set.files, ctx)? {
+                if let Some(path) = paths.find(owner_dir, &file.value) {
+                    invalid.shift_remove(&path);
+                }
+            }
+        }
+    }
+    if invalid.is_empty() {
+        return Ok(());
+    }
+    let mut body = BString::from(format!("OBJECT library \"{}\" contains:\n", target.name));
+    for source in invalid {
+        body.extend_from_slice(b"\n  ");
+        body.extend_from_slice(Lexical::new(source).filename());
+    }
+    body.extend_from_slice(b"\n\nbut may contain only sources that compile, header files, and other files that would not affect linking of a normal library.");
+    Err(paths.target_error(model, target, body))
+}
+
 pub(crate) fn external_object(dir: &Directory, path: &BString) -> bool {
     source_flag(dir, path, b"EXTERNAL_OBJECT")
         || matches!(Lexical::new(path).stem_extension(true).1, b".o" | b".obj")
@@ -441,6 +640,7 @@ pub(crate) fn external_object(dir: &Directory, path: &BString) -> bool {
 
 #[derive(Clone, Copy)]
 pub(crate) struct SourceProperties<'a> {
+    source_dir: &'a BString,
     path: Option<&'a PropertyMap>,
     relative: Option<&'a PropertyMap>,
 }
@@ -466,6 +666,7 @@ pub(crate) fn properties<'a>(dir: &'a Directory, source: &BString) -> SourceProp
             .get(&absolute_path(&dir.source_dir, &relative))
     };
     SourceProperties {
+        source_dir: &dir.source_dir,
         path: dir.source_props.get(source),
         relative: relative(),
     }
@@ -476,6 +677,15 @@ fn source_flag(dir: &Directory, source: &[u8], property: &[u8]) -> bool {
         .get(source)
         .and_then(|props| props.get(property))
         .is_some_and(|value| truth::is_on(value))
+}
+
+fn generated_at_binary_alternative(dir: &Directory, source: &[u8], binary: &BString) -> bool {
+    dir.source_props.get(source).is_some_and(|props| {
+        props.get(b"\0rcmake-source-binary-alternative") == Some(binary)
+            && props
+                .get(b"GENERATED")
+                .is_some_and(|value| truth::is_on(value))
+    })
 }
 
 pub(crate) fn absolute_path(base: &[u8], path: &[u8]) -> BString {
