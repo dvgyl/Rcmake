@@ -23,7 +23,7 @@ fn scan_rule<'a>(model: &'a ProjectModel, target: &Target) -> Option<&'a BString
 }
 
 fn missing_scanner(target: &Target) -> ResolveError {
-    ResolveError::Message(format!(
+    ResolveError::Reported(format!(
         "The target named \"{}\" has C++ sources that may use modules, but the compiler does not provide a way to discover the import graph dependencies.",
         target.name
     ).into())
@@ -49,7 +49,7 @@ pub(crate) fn module_error(
         generation_location(model, target),
         body.clone(),
     );
-    ResolveError::Message(body)
+    ResolveError::Reported(body)
 }
 
 pub(crate) fn validate_module_source(

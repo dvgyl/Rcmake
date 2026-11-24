@@ -13,9 +13,12 @@ pub enum ResolveError {
     /// A generator expression failed.
     #[error(transparent)]
     Genex(#[from] rcmake_genex::GenexError),
-    /// A diagnostic was issued with CMake's message text.
+    /// An error that the caller must report.
     #[error("{0}")]
     Message(BString),
+    /// An error that the resolver has already reported.
+    #[error("{0}")]
+    Reported(BString),
 }
 
 /// Everything a generator needs (output of [`resolve`](crate::resolve) plus lowering).
