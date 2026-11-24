@@ -13,7 +13,7 @@ from urllib.parse import unquote
 import xml.etree.ElementTree as ET
 
 MSBUILD = "{http://schemas.microsoft.com/developer/msbuild/2003}"
-FOLDER_TYPE = "66a26720-8fb5-11d2-aa7e-00c04f688dde"
+FOLDER_TYPE = "2150e333-8fdc-42a3-9474-1a3956d46de8"
 GUID = re.compile(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", re.I)
 SLN_PROJECT = re.compile(
     r'^Project\("([^"]+)"\) = "((?:[^"]|"")*)", "((?:[^"]|"")*)", "([^"]+)"$'
