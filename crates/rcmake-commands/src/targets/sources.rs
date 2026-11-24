@@ -98,19 +98,34 @@ fn add_file_set<'a>(
     };
     let bt = cx.backtrace();
     let (args, rest) = parse_file_set(args, dir, &bt)?;
+    let directory = cx.current_dir_id();
     let model = cx.project();
     let target = model
         .target(id)
         .ok_or_else(|| model_error(ModelError::UnknownObject))?;
     usage::validate_scope(target, scope, true)?;
-    if target.kind == TargetKind::Utility {
+    let existing = find_file_set(model, id, &name.value);
+    let previous = existing.and_then(|id| model.file_set(id));
+    let custom = args
+        .kind
+        .filter(|value| model.custom_rule(directory, value).is_some())
+        .map(BString::from)
+        .or_else(|| {
+            args.kind
+                .is_none()
+                .then(|| previous?.props.get(b"_RCMAKE_RULE").cloned())
+                .flatten()
+        });
+    if target.kind == TargetKind::Utility && custom.is_none() {
         return Err(CmdError::status(
             "FILE_SETs of type \"HEADERS\", \"SOURCES\", \"SYCL\", \"SYCL_HEADERS\", \"CXX_MODULES\" may not be added to custom targets.",
         ));
     }
-    let existing = find_file_set(model, id, &name.value);
-    let previous = existing.and_then(|id| model.file_set(id));
-    let (kind, sycl) = file_set_kind(&name.value, args.kind, previous)?;
+    let (kind, sycl) = file_set_kind(
+        &name.value,
+        custom.as_ref().map(|_| b"SOURCES".as_slice()).or(args.kind),
+        previous,
+    )?;
     if kind == FileSetKind::Headers
         && target
             .props
@@ -156,6 +171,10 @@ fn add_file_set<'a>(
             props: Default::default(),
         }
     };
+    let selects_rule = custom.is_some() && (args.kind.is_some() || existing.is_none());
+    if let Some(rule) = custom {
+        set.props.set("_RCMAKE_RULE".into(), rule);
+    }
     if let Some(alias) = sycl {
         require_sycl(cx, format!("File set TYPE \"{}\"", BString::from(alias)))?;
         set.props.set("LANGUAGE".into(), "SYCL".into());
@@ -204,6 +223,9 @@ fn add_file_set<'a>(
     } else {
         model.add_file_set(set).map_err(model_error)?
     };
+    if selects_rule {
+        model.set_file_set_rule_dir(set_id, directory);
+    }
     properties::store_file_set_properties(model, set_id);
     Ok(rest)
 }

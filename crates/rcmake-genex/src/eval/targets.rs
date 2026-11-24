@@ -187,6 +187,89 @@ impl Evaluator<'_> {
         ))
     }
 
+    pub(super) fn source_property(&mut self, call: Call<'_>) -> Value {
+        let arguments = self.arguments(call)?;
+        let (source, scope, property) = match arguments.as_slice() {
+            [source, property] => (source, None, property),
+            [source, option, property] => {
+                let scope = option
+                    .strip_prefix(b"DIRECTORY:")
+                    .map(|value| (b"DIRECTORY".as_slice(), value))
+                    .or_else(|| {
+                        option
+                            .strip_prefix(b"TARGET_DIRECTORY:")
+                            .map(|value| (b"TARGET_DIRECTORY".as_slice(), value))
+                    })
+                    .ok_or_else(|| {
+                        call.error("Invalid option.  DIRECTORY: or TARGET_DIRECTORY: expected.")
+                    })?;
+                if scope.1.is_empty() {
+                    return Err(call.error(format!(
+                        "No value provided for the {}: option.",
+                        BString::from(scope.0)
+                    )));
+                }
+                (source, Some(scope), property)
+            }
+            [] | [_] => {
+                return Err(
+                    call.error("$<SOURCE_PROPERTY> expression requires at least two parameters.")
+                );
+            }
+            _ => {
+                return Err(call.error(
+                    "$<SOURCE_PROPERTY:...> expression requires at most three parameters.",
+                ));
+            }
+        };
+        if source.is_empty() {
+            return Err(call.error(
+                "$<SOURCE_PROPERTY:src,prop> expression requires a non-empty source name.",
+            ));
+        }
+        if property.is_empty() {
+            return Err(call.error(
+                "$<SOURCE_PROPERTY:src,prop> expression requires a non-empty property name.",
+            ));
+        }
+        if !property
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+        {
+            return Err(call.error("Property name not supported."));
+        }
+        self.flags.context_sensitive = true;
+        let value = self
+            .host
+            .source_property(source, scope, property, call.ctx)
+            .map_err(|error| call.error(error.to_string()))?;
+        if !matches!(
+            property.as_slice(),
+            b"INCLUDE_DIRECTORIES"
+                | b"COMPILE_DEFINITIONS"
+                | b"COMPILE_OPTIONS"
+                | b"COMPILE_FLAGS"
+                | b"OBJECT_OUTPUTS"
+                | b"VS_DEPLOYMENT_CONTENT"
+                | b"VS_SETTINGS"
+        ) {
+            return Ok(value);
+        }
+        let key = crate::parse::render_expr(call.expr);
+        let DAGEntry::Entered(_active) = DAGChecker::enter(
+            call.ctx.head,
+            FrameKind::Property,
+            &key,
+            self.limits.max_recursion,
+        )?
+        else {
+            return Err(call.error("A source property depends on itself."));
+        };
+        let parsed = crate::parse(&value)?;
+        let evaluated = self.nodes(&parsed.nodes, call.ctx)?;
+        Ok(list::join(list::split(&evaluated, list::Empty::Drop)))
+    }
+
     fn property(&mut self, call: Call<'_>) -> Value {
         let arguments = self.arguments(call)?;
         let (target, property) = match arguments.as_slice() {

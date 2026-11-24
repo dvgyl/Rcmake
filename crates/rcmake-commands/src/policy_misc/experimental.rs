@@ -27,8 +27,8 @@ const FEATURES: &[Feature] = &[
     Feature {
         name: b"ExportBuildDatabase",
         variable: b"CMAKE_EXPERIMENTAL_EXPORT_BUILD_DATABASE",
-        activation: b"70ef007e-b743-492d-9407-e35eeac03a40",
-        description: "CMake's support for exporting build databases is experimental.",
+        activation: rcmake_diag::EXPORT_BUILD_DATABASE_ACTIVATION,
+        description: rcmake_diag::EXPORT_BUILD_DATABASE_DESCRIPTION,
     },
     Feature {
         name: b"Rust",

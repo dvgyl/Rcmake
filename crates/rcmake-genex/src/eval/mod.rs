@@ -259,6 +259,7 @@ impl Evaluator<'_> {
             | b"HOST_LINK"
             | b"DEVICE_LINK" => self.interface(call),
             _ if context::compiler_operator(&name) => self.compiler(call),
+            b"SOURCE_PROPERTY" => self.source_property(call),
             _ if name.starts_with(b"TARGET_") => self.target(call),
             _ => Err(unknown(call)),
         }

@@ -5,7 +5,7 @@ use rcmake_gen_common::GenError;
 use rcmake_genex::ConfigId;
 
 use crate::generation_error;
-use crate::graph::qualified;
+use crate::graph::{Graph, qualified};
 use crate::syntax::{Edge, Ninja, shell_word};
 
 pub(crate) struct Selection {
@@ -85,26 +85,27 @@ fn parse(value: &[u8], index: impl Fn(&[u8]) -> Option<usize>) -> Option<Vec<usi
 
 pub(crate) fn emit_clean<'a>(
     ninja: &mut Ninja,
+    graph: &Graph<'_>,
     implementation: &[u8],
     included: impl Iterator<Item = &'a [u8]>,
     cross: impl Iterator<Item = &'a [u8]>,
 ) {
     let mut base = b"ninja -f ".to_vec();
-    shell_word(implementation, &mut base);
+    shell_word(&graph.node(implementation), &mut base);
     base.extend_from_slice(b" -t clean");
     let mut emit = |name, configs: &mut dyn Iterator<Item = &'a [u8]>| {
         let mut command = base.clone();
         for config in configs {
             command.push(b' ');
             shell_word(
-                &qualified(&"CMakeFiles/rcmake-clean".into(), Some(config)),
+                &qualified(&graph.node(b"CMakeFiles/rcmake-clean"), Some(config)),
                 &mut command,
             );
         }
         ninja.edge(
             b"CLEAN",
             Edge {
-                outputs: &[qualified(&"clean".into(), Some(name))],
+                outputs: &[qualified(&graph.node(b"clean"), Some(name))],
                 ..Edge::default()
             },
         );

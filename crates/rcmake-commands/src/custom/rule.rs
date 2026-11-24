@@ -1,121 +1,290 @@
-use rcmake_base::BString;
-use rcmake_eval::{CmdError, CmdResult, Cx, Flow};
+use std::collections::BTreeSet;
+
+use rcmake_base::{BString, list};
+use rcmake_diag::{Effect, MessageKind};
+use rcmake_eval::{CmdError, CmdResult, Cx, Flow, UserCommandKind};
 use rcmake_expr::ExpandedArg;
 use rcmake_json::{Value, write_compact};
-use rcmake_model::ProjectModel;
+use rcmake_model::PropertyMap;
+
+const OPTIONS: &[&[u8]] = &[
+    b"COMMAND",
+    b"OUTPUT",
+    b"DEPENDS",
+    b"BYPRODUCTS",
+    b"DEPFILE",
+    b"GLOBAL",
+    b"CONFIGURATOR",
+    b"FROM_RULE",
+    b"FOR_FILE_SET",
+    b"FOR_SOURCE",
+];
 
 pub(super) fn add(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
     let Some((name, args)) = args.split_first() else {
         return Err(CmdError::status(
-            "called with incorrect number of arguments.",
+            "called with incorrect number of arguments",
         ));
     };
     let name = &name.value;
-    if name.is_empty()
-        || !name
-            .iter()
-            .all(|byte| byte.is_ascii_alphanumeric() || b"_.+-".contains(byte))
+    let error = if name.is_empty() || OPTIONS.contains(&name.as_slice()) {
+        Some("rule name is missing.".to_owned())
+    } else if !name
+        .iter()
+        .all(|ch| ch.is_ascii_alphanumeric() || b"_.+-".contains(ch))
     {
-        return Err(CmdError::status(format!("invalid name for RULE: {name}.")));
-    }
-    if name.iter().any(u8::is_ascii_uppercase)
-        && !name.iter().any(u8::is_ascii_lowercase)
-        && !name.iter().any(u8::is_ascii_digit)
-    {
-        return Err(CmdError::status(
-            "names in all uppercase are reserved for CMake.",
-        ));
-    }
-
-    let mut has_output = false;
-    let mut has_command = false;
-    let mut base = None;
-    let mut global = false;
-    let mut configurator = false;
-    let mut args_iter = args.iter().peekable();
-    while let Some(arg) = args_iter.next() {
-        match arg.value.as_slice() {
-            b"OUTPUT" => has_output |= args_iter.peek().is_some_and(|arg| !keyword(&arg.value)),
-            b"COMMAND" => has_command |= args_iter.peek().is_some_and(|arg| !keyword(&arg.value)),
-            b"FROM_RULE" => base = args_iter.next().map(|arg| &arg.value),
-            b"GLOBAL" => global = true,
-            b"CONFIGURATOR" => configurator = true,
-            b"FOR_FILE_SET" | b"FOR_SOURCE" if configurator => {
-                if let Some(function) = args_iter.next()
-                    && !cx.command_exists(&function.value)
-                {
-                    return Err(CmdError::status(format!(
-                        "command specified for \"{}\" does not exist: {}.",
-                        arg.value, function.value
-                    )));
-                }
-            }
-            _ => {}
-        }
-    }
-    if base.is_none() && !(has_output && has_command) {
-        return Err(CmdError::status(format!(
-            "cannot create RULE \"{name}\" because the mandatory options \"COMMAND\" or \"OUTPUT\" are missing."
-        )));
+        Some(format!("invalid name for RULE: {name}."))
+    } else if name.iter().any(u8::is_ascii_uppercase) && !name.iter().any(u8::is_ascii_lowercase) {
+        Some("names in all uppercase are reserved for CMake.".to_owned())
+    } else {
+        None
+    };
+    if let Some(error) = error {
+        cx.issue(
+            MessageKind::Error,
+            Effect::SetError,
+            None,
+            format!("add_custom_rule {error}").into(),
+        );
+        return Ok(Flow::Normal);
     }
 
     let dir = cx.current_dir_id();
+    let values = args
+        .iter()
+        .map(|arg| arg.value.as_slice())
+        .collect::<Vec<_>>();
+    let derived = values.contains(&b"FROM_RULE".as_slice());
+    let mut parsed = Declaration::default();
+    if let Err(error) = parsed.parse(cx, name, &values, derived) {
+        return Err(CmdError::status(error));
+    }
     let project = cx.project();
-    let key = rule_key(name);
-    if project.dir(dir).props.get(&key).is_some() || project.global.props.get(&key).is_some() {
+    if project.custom_rule(dir, name).is_some() {
         return Err(CmdError::status(format!(
             "cannot create RULE \"{name}\" because another RULE with the same name already exists."
         )));
     }
-    if let Some(base) = base
-        && !rule_visible(project, dir, base)
-    {
-        return Err(CmdError::status(format!(
-            "cannot create RULE \"{name}\" because the RULE \"{base}\" does not exist or is not accessible."
-        )));
+    let mut props = if let Some(base) = parsed.base {
+        project.custom_rule(dir, base).cloned().ok_or_else(|| CmdError::status(format!(
+            "cannot create RULE \"{name}\" because the RULE \"{}\" does not exist or is not accessible.", BString::from(base)
+        )))?
+    } else {
+        parsed.properties(name)?
+    };
+    props.set("NAME".into(), name.clone());
+    props.set("PARENT_RULE".into(), parsed.base.unwrap_or_default().into());
+    props.set(
+        "GLOBAL".into(),
+        if parsed.global { "1" } else { "0" }.into(),
+    );
+    for (key, configurator) in [
+        (b"FILE_SET_CONFIGURATORS".as_slice(), parsed.file_set),
+        (b"SOURCE_CONFIGURATORS".as_slice(), parsed.source),
+    ] {
+        let previous = props.get(key).filter(|text| !text.is_empty());
+        let value = match (previous, configurator) {
+            (Some(previous), Some((next, true))) => list::join([previous.as_slice(), next]),
+            (_, Some((next, _))) => next.into(),
+            (Some(previous), None) => previous.clone(),
+            (None, None) => BString::default(),
+        };
+        props.set(key.into(), value);
     }
-
-    // Keep the template arguments intact for the generator and file set commands.
-    let definition = Value::Array(
-        args.iter()
-            .map(|arg| Value::string(arg.value.clone()))
+    project.store_custom_rule((!parsed.global).then_some(dir), name.clone(), props);
+    let declaration = Value::Array(
+        values
+            .into_iter()
+            .map(|value| Value::string(BString::from(value)))
             .collect(),
     );
-    let definition = write_compact(&definition);
-    if global {
-        project.global.props.set(key, definition);
+    let key = [b"_RCMAKE_CUSTOM_RULE_", name.as_slice()].concat().into();
+    let scope = if parsed.global {
+        &mut project.global.props
     } else {
-        project.dir_mut(dir).props.set(key, definition);
-    }
+        &mut project.dir_mut(dir).props
+    };
+    scope.set(key, write_compact(&declaration));
     Ok(Flow::Normal)
 }
 
-fn keyword(value: &[u8]) -> bool {
-    matches!(
-        value,
-        b"OUTPUT"
-            | b"COMMAND"
-            | b"DEPENDS"
-            | b"BYPRODUCTS"
-            | b"DEPFILE"
-            | b"CONFIGURATOR"
-            | b"FOR_FILE_SET"
-            | b"FOR_SOURCE"
-            | b"FROM_RULE"
-            | b"GLOBAL"
-    )
+#[derive(Default)]
+struct Declaration<'a> {
+    commands: Vec<BString>,
+    outputs: Vec<&'a [u8]>,
+    depends: Vec<&'a [u8]>,
+    byproducts: Vec<&'a [u8]>,
+    depfile: Option<&'a [u8]>,
+    base: Option<&'a [u8]>,
+    global: bool,
+    file_set: Option<(&'a [u8], bool)>,
+    source: Option<(&'a [u8], bool)>,
 }
 
-fn rule_key(name: &BString) -> BString {
-    [b"_RCMAKE_CUSTOM_RULE_", name.as_slice()].concat().into()
-}
-
-fn rule_visible(project: &ProjectModel, dir: rcmake_model::DirId, name: &BString) -> bool {
-    let key = rule_key(name);
-    if project.global.props.get(&key).is_some() {
-        return true;
+impl<'a> Declaration<'a> {
+    fn parse(
+        &mut self,
+        cx: &Cx<'_>,
+        name: &[u8],
+        mut args: &[&'a [u8]],
+        derived: bool,
+    ) -> Result<(), BString> {
+        let singleton_options = if derived {
+            (
+                b"FROM_RULE".as_slice(),
+                b"CONFIGURATOR".as_slice(),
+                "only one occurrence of \"FROM_RULE\" or \"CONFIGURATOR\" options is allowed.",
+            )
+        } else {
+            (
+                b"DEPFILE".as_slice(),
+                b"CONFIGURATOR".as_slice(),
+                "only one occurrence of \"DEPFILE\" or \"CONFIGURATOR\" options is allowed.",
+            )
+        };
+        let (first, second, message) = singleton_options;
+        if [first, second]
+            .iter()
+            .any(|key| args.iter().filter(|word| *word == key).count() > 1)
+        {
+            return Err(message.into());
+        }
+        let mut seen = BTreeSet::new();
+        let mut missing = BTreeSet::new();
+        let mut configuring = false;
+        while let Some((&key, rest)) = args.split_first() {
+            let end = rest
+                .iter()
+                .position(|arg| OPTIONS.contains(arg))
+                .unwrap_or(rest.len());
+            let (values, tail) = rest.split_at(end);
+            args = tail;
+            if !seen.insert(key) && matches!(key, b"FOR_FILE_SET" | b"FOR_SOURCE") {
+                return Err("only one occurrence of \"FOR_FILE_SET\" or \"FOR_SOURCE\" sub-options of \"CONFIGURATOR\" option is allowed.".into());
+            }
+            match key {
+                b"CONFIGURATOR" => configuring = true,
+                b"GLOBAL" => self.global = true,
+                b"FOR_FILE_SET" | b"FOR_SOURCE" if configuring => {
+                    if let Some((&function, mode)) = values.split_first() {
+                        let issue = if !cx.command_exists(function) {
+                            Some("does not exist")
+                        } else if cx.user_command_kind(function) != Some(UserCommandKind::Function)
+                        {
+                            Some("is not a function")
+                        } else {
+                            None
+                        };
+                        if let Some(issue) = issue {
+                            return Err(format!(
+                                "command specified for \"{}\" {issue}: {}.",
+                                BString::from(key),
+                                BString::from(function)
+                            )
+                            .into());
+                        }
+                        let chain = mode.contains(&b"CHAIN".as_slice());
+                        let override_ = mode.contains(&b"OVERRIDE".as_slice());
+                        if chain && override_ {
+                            return Err(format!("cannot create RULE \"{}\" because the \"CHAIN\" and \"OVERRIDE\" options of CONFIGURATOR \"{}\" are mutually exclusive.", BString::from(name), BString::from(function)).into());
+                        }
+                        if let Some(extra) = mode
+                            .iter()
+                            .find(|arg| !derived || !matches!(**arg, b"CHAIN" | b"OVERRIDE"))
+                        {
+                            return Err(unknown(extra));
+                        }
+                        let entry = if key == b"FOR_FILE_SET" {
+                            &mut self.file_set
+                        } else {
+                            &mut self.source
+                        };
+                        *entry = Some((function, chain));
+                    } else {
+                        missing.insert(key);
+                    }
+                    continue;
+                }
+                b"FROM_RULE" | b"DEPFILE" if key == b"FROM_RULE" || !derived => {
+                    let slot = if key == b"FROM_RULE" {
+                        &mut self.base
+                    } else {
+                        &mut self.depfile
+                    };
+                    *slot = values.first().copied();
+                    if slot.is_none() {
+                        missing.insert(key);
+                    }
+                    if let Some(extra) = values.get(1) {
+                        return Err(unknown(extra));
+                    }
+                    continue;
+                }
+                b"OUTPUT" | b"COMMAND" | b"BYPRODUCTS" | b"DEPENDS" if !derived => {
+                    if values.is_empty() {
+                        missing.insert(key);
+                    }
+                    match key {
+                        b"OUTPUT" => self.outputs.extend(values),
+                        b"COMMAND" => self.commands.push(list::join(values)),
+                        b"DEPENDS" => self.depends.extend(values),
+                        _ => self.byproducts.extend(values),
+                    }
+                    continue;
+                }
+                _ => return Err(unknown(key)),
+            }
+            if let Some(extra) = values.first() {
+                return Err(unknown(extra));
+            }
+        }
+        if !missing.is_empty() {
+            let entries = missing
+                .iter()
+                .map(|key| format!("  {}: missing required value", BString::from(*key)))
+                .collect::<Vec<_>>();
+            let count = if entries.len() == 1 {
+                "argument"
+            } else {
+                "arguments"
+            };
+            return Err(format!("given invalid {count}:\n\n{}", entries.join("\n")).into());
+        }
+        Ok(())
     }
-    project
-        .ancestors(dir)
-        .any(|id| project.dir(id).props.get(&key).is_some())
+
+    fn properties(&self, name: &[u8]) -> Result<PropertyMap, CmdError> {
+        if self.commands.is_empty() || self.outputs.is_empty() {
+            return Err(CmdError::status(format!(
+                "cannot create RULE \"{}\" because the mandatory options \"COMMAND\" or \"OUTPUT\" are missing.",
+                BString::from(name)
+            )));
+        }
+        let mut props = PropertyMap::default();
+        props.set("OUTPUT".into(), list::join(&self.outputs));
+        props.set("DEPENDS".into(), list::join(&self.depends));
+        props.set("BYPRODUCTS".into(), list::join(&self.byproducts));
+        props.set("DEPFILE".into(), self.depfile.unwrap_or_default().into());
+        if let Some(command) = self.commands.first() {
+            props.set("COMMAND".into(), command.clone());
+        }
+        props.set(
+            "COMMAND_COUNT".into(),
+            self.commands.len().to_string().into(),
+        );
+        for (index, command) in self.commands.iter().enumerate() {
+            props.set(format!("COMMAND_{index}").into(), command.clone());
+        }
+        props.set("COMMAND_EXPAND_LISTS".into(), "1".into());
+        props.set("VERBATIM".into(), "1".into());
+        props.set(
+            "OUTPUT_FILE_SET".into(),
+            "__cmake_rule_<RULE>_<TARGET>_<FILE_SET>_outputs;SOURCES".into(),
+        );
+        Ok(props)
+    }
+}
+
+fn unknown(key: &[u8]) -> BString {
+    format!("given unknown argument: \"{}\".", BString::from(key)).into()
 }

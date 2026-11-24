@@ -2,10 +2,15 @@ use std::collections::BTreeMap;
 
 use indexmap::{IndexMap, IndexSet};
 use rcmake_base::{BString, list, truth};
-use rcmake_diag::{Location, MessageKind};
+use rcmake_diag::{
+    DiagAction, DiagCategory, Diagnostic, Effect, Location, MessageKind, PolicyId, PolicyStatus,
+    RenderOptions, render,
+};
 use rcmake_genex::{ConfigId, EvalContext};
-use rcmake_host::Host;
-use rcmake_model::{CommandId, DirId, FileSetKind, GeneratorKind, ProjectModel, TargetId};
+use rcmake_host::{Host, Stream};
+use rcmake_model::{
+    CommandId, CustomCommandKind, DirId, FileSetKind, GeneratorKind, ProjectModel, TargetId,
+};
 
 use crate::{
     BuildGraph, BuildStep, CrossConfiguration, GenerationResult, InstallActionKind, ResolveError,
@@ -14,7 +19,7 @@ use crate::{
     exports::resolve_exports,
     ide, lower,
     resolve_link::{attach_links, resolve_link},
-    sources::{SourcePaths, TargetInputs},
+    sources::{SourcePaths, TargetInputs, generation_source_location},
     target::resolve_target,
     unity,
     usage::{ResolvedLinkKind, UsageResolver},
@@ -25,17 +30,18 @@ mod header_verify;
 /// Resolve and lower the project in configuration order.
 /// Use `CMAKE_BUILD_TYPE` if `configs` is empty.
 ///
-/// This is [`resolve_with_options`] with the default [`ResolveOptions`].
+/// Return the first missing source as an error.
 pub fn resolve(
     model: &ProjectModel,
     host: &dyn Host,
     configs: &[ConfigId],
 ) -> Result<GenerationResult, ResolveError> {
-    resolve_with_options(model, host, configs, &ResolveOptions::default())
+    resolve_project(model, host, configs, &ResolveOptions::default(), false)
 }
 
 /// Resolve and lower the project in configuration order, with `options`.
 /// Use `CMAKE_BUILD_TYPE` if `configs` is empty.
+/// Report missing sources with their call stacks before returning an error.
 ///
 /// With [`ResolveOptions::ide`] set, the IDE generators get [`ResolvedTarget::ide`].
 pub fn resolve_with_options(
@@ -44,6 +50,18 @@ pub fn resolve_with_options(
     configs: &[ConfigId],
     options: &ResolveOptions,
 ) -> Result<GenerationResult, ResolveError> {
+    resolve_project(model, host, configs, options, true)
+}
+
+fn resolve_project(
+    model: &ProjectModel,
+    host: &dyn Host,
+    configs: &[ConfigId],
+    options: &ResolveOptions,
+    collect_source_errors: bool,
+) -> Result<GenerationResult, ResolveError> {
+    let rules = crate::target::instantiate_rules(model, host)?;
+    let model = rules.as_ref().unwrap_or(model);
     crate::exports::source_sets::validate(model)?;
     lower::warn_about_wrappers(model, host);
     let configs = if configs.is_empty() {
@@ -55,8 +73,22 @@ pub fn resolve_with_options(
     } else {
         configs.to_vec()
     };
+    validate_codegen_name(model, host)?;
+    if model
+        .commands()
+        .any(|(_, command)| command.codegen && !command.implicit_depends.is_empty())
+    {
+        let body = "Cannot append IMPLICIT_DEPENDS to existing CODEGEN custom command.";
+        host.write_out(
+            Stream::Stderr,
+            format!("CMake Error:\n  {body}\n\n\n").as_bytes(),
+        );
+        return Err(ResolveError::Reported(body.into()));
+    }
+    crate::InstallManifest::validate_bmi_destinations(model, &configs, host)?;
     let mut paths = SourcePaths::new(host);
     paths.ide = options.ide;
+    paths.collect_source_errors = collect_source_errors;
     paths.unity = Some(unity::prepare(model, host, &mut paths, &configs)?);
     let mut configured_targets = configs
         .iter()
@@ -71,8 +103,16 @@ pub fn resolve_with_options(
     } else {
         model
     };
-    validate_languages(model, &paths, &configured_targets)?;
+    if matches!(
+        model.generator,
+        Some(GeneratorKind::UnixMakefiles | GeneratorKind::Ninja | GeneratorKind::NinjaMultiConfig)
+    ) {
+        validate_languages(model, &paths, &configured_targets)?;
+    }
     validate_target_sources(model, &paths, &configured_targets)?;
+    if paths.missing_sources() {
+        return Err(ResolveError::Reported("Cannot find source file.".into()));
+    }
     let plan = ConfigurationPlan {
         cross: CrossPlan::new(model, &configs)?,
         link_languages: if configs.len() > 1 {
@@ -118,8 +158,9 @@ pub fn resolve_with_options(
     if let Some(error) = xcode_link_error {
         return Err(error);
     }
+    warn_link_flags(model, host, &targets);
     let mut install =
-        lower::lower_install_manifest_with_configs(model, &targets, &configs, options.ide)?;
+        lower::lower_install_manifest_with_configs(model, &targets, &configs, options.ide, host)?;
     let exports = resolve_exports(
         model,
         &mut UsageResolver::new(model).with_ide(options.ide),
@@ -139,6 +180,31 @@ pub fn resolve_with_options(
         }
     }
     let mut metadata = lower::collect_metadata(model);
+    if model.generator == Some(GeneratorKind::UnixMakefiles)
+        && let Some(graph) = graphs.first()
+    {
+        let aware: IndexSet<_> = model
+            .commands()
+            .filter_map(|(_, command)| match command.kind {
+                CustomCommandKind::Utility(target)
+                | CustomCommandKind::TargetEvent { target, .. }
+                    if command.job_server_aware =>
+                {
+                    Some(target)
+                }
+                _ => None,
+            })
+            .collect();
+        for target in &graph.targets {
+            if model
+                .find_target(DirId::ROOT, &target.name)
+                .is_some_and(|id| aware.contains(&id))
+                && let Some(&step) = target.steps.last()
+            {
+                metadata.jobserver_steps.insert(step);
+            }
+        }
+    }
     if let Some(toolchain) = metadata.toolchains.get_mut(b"CXX".as_slice())
         && toolchain.module_map_format.is_none()
         && let Some(format) = graphs
@@ -309,6 +375,128 @@ fn resolve_verification_targets(
     Ok(())
 }
 
+fn warn_link_flags(model: &ProjectModel, host: &dyn Host, targets: &[ResolvedTarget]) {
+    let policy = PolicyId::new(210);
+    let mut warned = IndexSet::new();
+    for facts in targets {
+        let Some(target) = model.target(facts.id).filter(|target| {
+            matches!(
+                target.kind,
+                rcmake_model::TargetKind::SharedLibrary | rcmake_model::TargetKind::ModuleLibrary
+            ) && target.policies.policies.get(policy) == PolicyStatus::Warn
+        }) else {
+            continue;
+        };
+        let Some(link) = &facts.link else { continue };
+        let language = link.language.as_slice();
+        let key = [b"CMAKE_", language, b"_LINK_FLAGS"].concat();
+        let create = [b"CMAKE_EXECUTABLE_CREATE_", language, b"_FLAGS"].concat();
+        if let Some(flags) = model
+            .definition(target.dir, &key)
+            .filter(|flags| !flags.is_empty())
+            && model.definition(target.dir, &create) != Some(flags)
+            && warned.insert(language)
+        {
+            policy_warning(
+                model,
+                host,
+                policy,
+                target,
+                &format!(
+                    "For compatibility with older versions of CMake, {} will be ignored for all non-EXECUTABLE targets which use these flags.",
+                    BString::from(key)
+                ),
+            );
+        }
+    }
+}
+
+fn validate_codegen_name(model: &ProjectModel, host: &dyn Host) -> Result<(), ResolveError> {
+    let policy = PolicyId::new(171);
+    let status = model
+        .dir(DirId::ROOT)
+        .final_policies
+        .map_or(PolicyStatus::Warn, |policies| policies.get(policy));
+    let Some(target) = model
+        .targets()
+        .map(|(_, target)| target)
+        .find(|target| target.name == "codegen" && !target.is_imported())
+    else {
+        return Ok(());
+    };
+    let message = "The target name \"codegen\" is reserved.";
+    match status {
+        PolicyStatus::Old => Ok(()),
+        PolicyStatus::New => {
+            SourcePaths::new(host).emit(
+                model,
+                MessageKind::Error,
+                Location::Backtrace(target.backtrace.clone()),
+                message.into(),
+            );
+            Err(ResolveError::Reported(message.into()))
+        }
+        PolicyStatus::Warn => {
+            if target
+                .props
+                .get(b"_RCMAKE_CODEGEN_NAME_DIAGNOSTIC")
+                .and_then(|value| DiagAction::parse(value))
+                != Some(DiagAction::Ignore)
+            {
+                policy_warning(model, host, policy, target, message);
+            }
+            Ok(())
+        }
+    }
+}
+
+fn policy_warning(
+    model: &ProjectModel,
+    host: &dyn Host,
+    policy: PolicyId,
+    target: &rcmake_model::Target,
+    message: &str,
+) {
+    if model
+        .definition(target.dir, b"CMAKE_SUPPRESS_DEVELOPER_WARNINGS")
+        .is_some_and(|value| truth::is_on(value))
+    {
+        return;
+    }
+    let summary = match policy {
+        id if id == PolicyId::new(171) => "'codegen' is a reserved target name.".into(),
+        id if id == PolicyId::new(210) => {
+            "CMAKE_<LANG>_LINK_FLAGS adds link flags to all target types.".into()
+        }
+        _ => policy
+            .info()
+            .map_or("", |info| info.summary)
+            .replace("``", ""),
+    };
+    let warning = Diagnostic {
+        kind: MessageKind::AuthorWarning,
+        effect: Effect::None,
+        category: Some(DiagCategory::Policy),
+        policy: Some(policy),
+        location: if policy == PolicyId::new(171) {
+            generation_source_location(Location::Backtrace(target.backtrace.clone()))
+        } else {
+            generation_location(model, target)
+        },
+        body: format!("Policy {policy} is not set: {summary}  Run \"cmake --help-policy {policy}\" for policy details.  Use the cmake_policy command to set the policy and suppress this warning.\n\n{message}").into(),
+    };
+    host.write_out(
+        Stream::Stderr,
+        &render(
+            &warning,
+            &RenderOptions {
+                relative_base: Some(model.dir(DirId::ROOT).source_dir.clone()),
+                ..RenderOptions::default()
+            },
+        ),
+    );
+}
+
 fn enabled_languages(model: &ProjectModel) -> Vec<BString> {
     model
         .global
@@ -332,23 +520,13 @@ fn validate_languages(
         let Some(target) = model.target(facts.id) else {
             continue;
         };
-        let languages = facts
-            .compile_groups
-            .iter()
-            .map(|group| (&group.language, "compilation"))
-            .chain(
-                target
-                    .props
-                    .get(b"LINKER_LANGUAGE")
-                    .map(|language| (language, "linking")),
-            );
-        for (language, purpose) in languages {
+        for language in facts.compile_groups.iter().map(|group| &group.language) {
             if !language.is_empty()
                 && !enabled.contains(language)
-                && reported.insert((target.dir, language, purpose))
+                && reported.insert((target.dir, language))
             {
                 let error = module_error(model, paths, target, format!(
-                    "The language {language} was requested for {purpose} but was not enabled.  To enable a language it needs to be specified in a 'project' or 'enable_language' command in the root CMakeLists.txt"
+                    "The language {language} was requested for compilation but was not enabled.  To enable a language it needs to be specified in a 'project' or 'enable_language' command in the root CMakeLists.txt"
                 ).into());
                 failure.get_or_insert(error);
             }

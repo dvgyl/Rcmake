@@ -70,7 +70,8 @@ pub(in crate::policy_misc) fn get_source(cx: &mut Cx<'_>, args: &[ExpandedArg]) 
         }
     };
     let inherited = is_inherited(cx, b"SOURCE", name);
-    let value = query_source(cx, dir, source, name, inherited).unwrap_or_else(|| "NOTFOUND".into());
+    let value =
+        query_source(cx, dir, source, name, inherited, false).unwrap_or_else(|| "NOTFOUND".into());
     cx.set_var(out, value);
     Ok(Flow::Normal)
 }
@@ -81,21 +82,60 @@ fn query_source(
     source: &[u8],
     name: &[u8],
     inherited: bool,
+    create: bool,
 ) -> Option<BString> {
-    if name == b"GENERATED" {
-        if let Some(value) = super::generated::global_value(cx, dir, source) {
-            return Some(value);
-        }
-        if super::generated::is_strict(cx, dir) {
-            let PropScope::Source { path, .. } = source_scope(cx, dir, source) else {
-                return None;
-            };
-            return Some(boolean(
-                cx.project().dir(dir).generated_sources.contains(&path),
-            ));
+    if name == b"GENERATED"
+        && let Some(value) = super::generated::global_value(cx, dir, source)
+    {
+        return Some(value);
+    }
+    if !create && name != b"LOCATION" {
+        let source_path = crate::dirs::normalized_path(&cx.resolve_path(source));
+        let binary_path = crate::dirs::normalized_path(
+            &cx.current_binary_dir()
+                .join(rcmake_host::path::to_native(source)),
+        );
+        let source_path = rcmake_host::path::from_native(&source_path);
+        let binary_path = rcmake_host::path::from_native(&binary_path);
+        let project = cx.project();
+        let directory = project.dir(dir);
+        let known = [source_path.as_slice(), binary_path.as_slice()];
+        if !known
+            .iter()
+            .any(|path| directory.source_props.contains_key(*path))
+            && (name == b"GENERATED"
+                || !project
+                    .targets()
+                    .filter(|(_, target)| target.dir == dir)
+                    .any(|(_, target)| {
+                        target.sources.iter().any(|source| {
+                            let path = rcmake_base::path_lex::Lexical::new(&directory.source_dir)
+                                .append(&source.value);
+                            known.contains(&path.as_slice())
+                        })
+                    }))
+        {
+            return None;
         }
     }
     let scope = source_scope(cx, dir, source);
+    if (create || name == b"LOCATION")
+        && let PropScope::Source { path, .. } = &scope
+    {
+        cx.project()
+            .dir_mut(dir)
+            .source_props
+            .entry(path.clone())
+            .or_default();
+    }
+    if name == b"GENERATED"
+        && super::generated::is_strict(cx, dir)
+        && let PropScope::Source { path, .. } = &scope
+    {
+        return Some(boolean(
+            cx.project().dir(dir).generated_sources.contains(path),
+        ));
+    }
     source_value(cx, &scope, name, inherited)
 }
 
@@ -192,9 +232,12 @@ impl<'a> PropertyQuery<'a> {
             }
             QueryMode::Value | QueryMode::Set => {
                 let inherited = definition.is_some_and(|entry| entry.inherited);
+                let rule = matches!(self.owner, PropertyOwner::Rule(_));
                 let value = self.owner.value(cx, self.name, inherited)?;
                 if matches!(self.mode, QueryMode::Set) {
                     Some(boolean(value.is_some()))
+                } else if rule {
+                    Some(value.unwrap_or_else(|| "NOTFOUND".into()))
                 } else {
                     value
                 }
@@ -208,6 +251,7 @@ enum PropertyOwner<'a> {
     Global,
     Variable,
     Target(&'a [u8]),
+    Rule(&'a [u8]),
     FileSet { set: &'a [u8], target: &'a [u8] },
     Source(Option<SourceSelection<'a>>),
     Model(PropScope),
@@ -226,6 +270,7 @@ impl<'a> PropertyOwner<'a> {
                 )));
             }
             b"TARGET" => Self::Target(single_name(scope, names)?),
+            b"RULE" => Self::Rule(single_name(scope, names)?),
             b"CACHE" => Self::Model(PropScope::Cache(single_name(scope, names)?.into())),
             b"INSTALL" => Self::Model(PropScope::Install {
                 file: single_name(scope, names)?.into(),
@@ -261,6 +306,19 @@ impl<'a> PropertyOwner<'a> {
         Ok(match self {
             Self::Global => global_value(cx, name),
             Self::Variable => cx.var(name),
+            Self::Rule(rule) => {
+                let dir = cx.current_dir_id();
+                cx.project()
+                    .custom_rule(dir, rule)
+                    .ok_or_else(|| {
+                        CmdError::status(format!(
+                            "could not find RULE \"{}\".",
+                            BString::from(rule)
+                        ))
+                    })?
+                    .get(name)
+                    .cloned()
+            }
             Self::Target(target) => {
                 let scope = PropScope::Target(find_target(cx, target)?);
                 alias_value(cx, target, name).or_else(|| model_value(cx, &scope, name, inherited))
@@ -270,9 +328,8 @@ impl<'a> PropertyOwner<'a> {
                 let id = file_set_id(cx, target_id, target, set)?;
                 file_set_value(cx, id, name, inherited)
             }
-            Self::Source(scope) => {
-                scope.and_then(|scope| query_source(cx, scope.dir, scope.source, name, inherited))
-            }
+            Self::Source(scope) => scope
+                .and_then(|scope| query_source(cx, scope.dir, scope.source, name, inherited, true)),
             Self::Model(PropScope::Directory(dir)) => directory_value(cx, dir, name, inherited),
             Self::Model(scope @ PropScope::Test { .. }) => {
                 if let PropScope::Test { dir, name: test } = &scope

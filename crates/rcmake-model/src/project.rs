@@ -71,6 +71,8 @@ pub struct ProjectModel {
     /// Property print requests in call order.
     pub property_prints: Vec<PropertyPrint>,
     globally_generated: BTreeSet<BString>,
+    custom_rules: BTreeMap<Option<DirId>, IndexMap<BString, PropertyMap>>,
+    file_set_rule_dirs: BTreeMap<FileSetId, DirId>,
     root: Directory,
     subdirs: Vec<Directory>,
     targets: Vec<Target>,
@@ -99,6 +101,58 @@ impl ProjectModel {
             .vars
             .get(name)
             .or_else(|| self.cache.get(name).map(|e| &e.value))
+    }
+
+    /// Find the owner of a visible rule. A global rule has no directory owner.
+    #[must_use]
+    pub fn custom_rule_owner(&self, dir: DirId, name: &[u8]) -> Option<Option<DirId>> {
+        self.ancestors(dir).map(Some).chain([None]).find(|owner| {
+            self.custom_rules
+                .get(owner)
+                .is_some_and(|rules| rules.contains_key(name))
+        })
+    }
+
+    /// Get the declared properties of a visible custom rule.
+    #[must_use]
+    pub fn custom_rule(&self, dir: DirId, name: &[u8]) -> Option<&PropertyMap> {
+        self.custom_rules
+            .get(&self.custom_rule_owner(dir, name)?)?
+            .get(name)
+    }
+
+    /// Record the directory that selected a rule for a file set.
+    pub fn set_file_set_rule_dir(&mut self, set: FileSetId, dir: DirId) {
+        self.file_set_rule_dirs.insert(set, dir);
+    }
+
+    /// Get the directory that selected a rule for a file set.
+    #[must_use]
+    pub fn file_set_rule_dir(&self, set: FileSetId) -> Option<DirId> {
+        self.file_set_rule_dirs.get(&set).copied()
+    }
+
+    /// Return the local rule names in declaration order.
+    pub fn directory_rules(&self, dir: DirId) -> impl Iterator<Item = &BString> {
+        self.custom_rules
+            .get(&Some(dir))
+            .into_iter()
+            .flat_map(|rules| rules.keys())
+    }
+
+    /// Store properties for a custom rule in the specified scope.
+    pub fn store_custom_rule(&mut self, dir: Option<DirId>, name: BString, props: PropertyMap) {
+        self.custom_rules
+            .entry(dir)
+            .or_default()
+            .insert(name, props);
+    }
+
+    /// Remove a custom rule from its specified scope.
+    pub fn remove_custom_rule(&mut self, dir: Option<DirId>, name: &[u8]) {
+        if let Some(rules) = self.custom_rules.get_mut(&dir) {
+            rules.shift_remove(name);
+        }
     }
 
     /// Mark an absolute file path as generated in this directory and the project.

@@ -5,91 +5,23 @@ use std::convert::Infallible;
 
 use indexmap::{IndexMap, IndexSet};
 use rcmake_base::{BString, list, path_lex::Lexical};
-use rcmake_diag::Backtrace;
+use rcmake_diag::{
+    Backtrace, DiagAction, DiagCategory, Diagnostic, Effect, Location, MessageKind, RenderOptions,
+    render,
+};
 use rcmake_genex::{ConfigId, EvalContext, EvalSite, evaluate, parse};
+use rcmake_host::{Host, Stream};
 use rcmake_model::{
     DirId, GeneratorKind, InstallKind, InstallOptions, InstallRule, ProjectModel, TargetKind,
 };
 
 use super::{compute_artifacts, definition, join, link::install_rpath};
 use crate::{
-    ConfigureMetadata, InstallAction, InstallActionKind, InstallManifest, ResolveError,
-    ResolvedTarget, Toolchain, usage::UsageResolver,
+    InstallAction, InstallActionKind, InstallManifest, ResolveError, ResolvedTarget,
+    usage::UsageResolver,
 };
 
-/// Collect listfiles and compiler data from the model.
-///
-/// Listfiles keep the order of their first appearance. Read compiler values
-/// from directory variable snapshots and the cache.
-#[must_use]
-pub fn collect_metadata(model: &ProjectModel) -> ConfigureMetadata {
-    let mut listfiles = IndexSet::new();
-    let mut languages = IndexMap::new();
-    for (dir, directory) in model.dirs() {
-        listfiles.extend(directory.listfiles.iter().cloned());
-        for key in directory.vars.keys().chain(directory.props.names().iter()) {
-            if let Some(language) = compiler_language(key) {
-                languages.entry(language).or_insert(dir);
-            }
-        }
-    }
-    for key in model
-        .global
-        .props
-        .names()
-        .iter()
-        .chain(model.cache.iter().map(|(key, _)| key))
-    {
-        if let Some(language) = compiler_language(key) {
-            languages.entry(language).or_insert(DirId::ROOT);
-        }
-    }
-    let toolchains = languages
-        .into_iter()
-        .filter_map(|(language, dir)| {
-            let read = |suffix: &[u8]| {
-                definition(
-                    model,
-                    dir,
-                    &[b"CMAKE_", language.as_slice(), b"_", suffix].concat(),
-                )
-            };
-            let compiler = read(b"COMPILER")?;
-            if rcmake_base::truth::is_off(compiler) {
-                return None;
-            }
-            let value = |suffix| read(suffix).cloned().unwrap_or_default();
-            let optional = |suffix| read(suffix).filter(|v| !v.is_empty()).cloned();
-            let paths =
-                |suffix| read(suffix).map_or_else(Vec::new, |v| list::split(v, list::Empty::Drop));
-            let toolchain = Toolchain {
-                compiler_path: compiler.clone(),
-                compiler_id: value(b"COMPILER_ID"),
-                compiler_version: value(b"COMPILER_VERSION"),
-                implicit_includes: paths(b"IMPLICIT_INCLUDE_DIRECTORIES"),
-                implicit_link_dirs: paths(b"IMPLICIT_LINK_DIRECTORIES"),
-                source_extensions: paths(b"SOURCE_FILE_EXTENSIONS"),
-                scandep_rule: optional(b"SCANDEP_SOURCE"),
-                module_map_format: optional(b"MODULE_MAP_FORMAT"),
-                module_map_flag: optional(b"MODULE_MAP_FLAG"),
-                compile_bmi_rule: optional(b"MODULE_BMI_ONLY_FLAG"),
-            };
-            Some((language, toolchain))
-        })
-        .collect();
-    ConfigureMetadata {
-        listfiles: listfiles.into_iter().collect(),
-        toolchains,
-        configure_log: definition(model, DirId::ROOT, b"CMAKE_CONFIGURE_LOG").cloned(),
-        cmake_command: definition(model, DirId::ROOT, b"CMAKE_COMMAND").cloned(),
-        ctest_command: definition(model, DirId::ROOT, b"CMAKE_CTEST_COMMAND").cloned(),
-    }
-}
-
-fn compiler_language(key: &[u8]) -> Option<BString> {
-    let lang = key.strip_prefix(b"CMAKE_")?.strip_suffix(b"_COMPILER")?;
-    (!lang.is_empty()).then(|| lang.into())
-}
+pub use super::graph::collect_metadata;
 
 /// Lower install rules in model order.
 ///
@@ -97,9 +29,15 @@ fn compiler_language(key: &[u8]) -> Option<BString> {
 /// same order.
 #[must_use]
 pub fn lower_install_manifest(model: &ProjectModel, targets: &[ResolvedTarget]) -> InstallManifest {
-    match lower_install_rules(model, targets, &[], |_, _, _, value| {
-        Ok::<_, Infallible>(value.into())
-    }) {
+    match lower_install_rules(
+        model,
+        targets,
+        &[],
+        |_, _, _, value| Ok::<_, Infallible>(value.into()),
+        |dir, config, source| {
+            Ok(crate::sources::install_object_name(model, dir, source, config).unwrap_or_default())
+        },
+    ) {
         Ok(manifest) => manifest,
         Err(never) => match never {},
     }
@@ -110,23 +48,151 @@ pub(crate) fn lower_install_manifest_with_configs(
     targets: &[ResolvedTarget],
     configs: &[ConfigId],
     ide: Option<crate::ide::IdeFlavor>,
+    host: &dyn Host,
 ) -> Result<InstallManifest, ResolveError> {
     let mut usage = UsageResolver::new(model).with_ide(ide);
-    lower_install_rules(model, targets, configs, |dir, config, backtrace, value| {
-        if !has_genex(value) {
-            return Ok(value.into());
+    lower_install_rules(
+        model,
+        targets,
+        configs,
+        |dir, config, backtrace, value| {
+            if !has_genex(value) {
+                return Ok(value.into());
+            }
+            let context = EvalContext {
+                config: config.clone(),
+                site: EvalSite {
+                    backtrace: backtrace.clone(),
+                    property: None,
+                },
+                ..EvalContext::default()
+            };
+            let (value, _) = evaluate(&parse(value)?, &context, &mut usage.host(dir))?;
+            Ok::<_, ResolveError>(value)
+        },
+        |dir, config, source| {
+            crate::sources::install_object_name(model, dir, source, config).map_err(|error| {
+                let ResolveError::Message(body) = error else {
+                    return error;
+                };
+                let paths = crate::sources::SourcePaths::new(host);
+                let file = join(&model.dir(dir).source_dir, b"CMakeLists.txt");
+                paths.emit(
+                    model,
+                    MessageKind::Error,
+                    Location::FileLine {
+                        file: file.as_slice().into(),
+                        line: 0,
+                    },
+                    body.clone(),
+                );
+                ResolveError::Reported(body)
+            })
+        },
+    )
+}
+
+impl InstallManifest {
+    pub(crate) fn validate_bmi_destinations(
+        model: &ProjectModel,
+        configs: &[ConfigId],
+        host: &dyn Host,
+    ) -> Result<(), ResolveError> {
+        if !matches!(
+            model.generator,
+            Some(GeneratorKind::Ninja | GeneratorKind::NinjaMultiConfig)
+        ) {
+            return Ok(());
         }
-        let context = EvalContext {
-            config: config.clone(),
-            site: EvalSite {
-                backtrace: backtrace.clone(),
-                property: None,
-            },
-            ..EvalContext::default()
-        };
-        let (value, _) = evaluate(&parse(value)?, &context, &mut usage.host(dir))?;
-        Ok(value)
-    })
+        let category = DiagCategory::InstallAbsoluteDestination;
+        let mut usage = UsageResolver::new(model);
+        let mut failure = None;
+        for (index, rule, _) in ordered_install_rules(model) {
+            let InstallKind::Targets { targets, .. } = &rule.kind else {
+                continue;
+            };
+            let action = model
+                .global
+                .props
+                .get(format!("_RCMAKE_INSTALL_{index}_ABSOLUTE_ACTION").as_bytes())
+                .and_then(|value| DiagAction::parse(value))
+                .unwrap_or_else(|| category.default_action());
+            if action == DiagAction::Ignore {
+                continue;
+            }
+            let recorded = recorded_args(model, index);
+            let groups = target_options(&recorded);
+            let Some(group) = groups.get(b"CXX_MODULES_BMI".as_slice()) else {
+                continue;
+            };
+            let options = group.merge(&rule.options);
+            let Some(value) = &options.destination else {
+                continue;
+            };
+            let mut reported = IndexSet::new();
+            for target in targets.iter().filter_map(|id| model.target(*id)) {
+                if !target
+                    .file_sets
+                    .iter()
+                    .filter_map(|id| model.file_set(*id))
+                    .any(|set| set.kind == rcmake_model::FileSetKind::CxxModules)
+                {
+                    continue;
+                }
+                for config in configs
+                    .iter()
+                    .filter(|config| matches_config(&options, config))
+                {
+                    let context = EvalContext {
+                        config: config.clone(),
+                        site: EvalSite {
+                            backtrace: rule.backtrace.clone(),
+                            property: None,
+                        },
+                        ..EvalContext::default()
+                    };
+                    let path = evaluate(&parse(value)?, &context, &mut usage.host(target.dir))?.0;
+                    if !Lexical::new(&path).absolute() || !reported.insert(path.clone()) {
+                        continue;
+                    }
+                    let body: BString =
+                        format!("INSTALL command given absolute DESTINATION path:\n\n  {path}")
+                            .into();
+                    let diagnostic = Diagnostic {
+                        kind: if action == DiagAction::Warn {
+                            MessageKind::Warning
+                        } else {
+                            MessageKind::Error
+                        },
+                        effect: Effect::None,
+                        category: Some(category),
+                        policy: None,
+                        location: crate::sources::generation_source_location(Location::Backtrace(
+                            rule.backtrace.clone(),
+                        )),
+                        body: body.clone(),
+                    };
+                    host.write_out(
+                        Stream::Stderr,
+                        &render(
+                            &diagnostic,
+                            &RenderOptions {
+                                relative_base: Some(model.dir(DirId::ROOT).source_dir.clone()),
+                                ..RenderOptions::default()
+                            },
+                        ),
+                    );
+                    if action == DiagAction::FatalError {
+                        return Err(ResolveError::Reported(body));
+                    }
+                    if action == DiagAction::SendError {
+                        failure = Some(ResolveError::Reported(body));
+                    }
+                }
+            }
+        }
+        failure.map_or(Ok(()), Err)
+    }
 }
 
 fn has_genex(value: &[u8]) -> bool {
@@ -213,6 +279,7 @@ fn lower_install_rules<E>(
     targets: &[ResolvedTarget],
     configs: &[ConfigId],
     mut eval: impl FnMut(DirId, &ConfigId, &Backtrace, &[u8]) -> Result<BString, E>,
+    mut object_name: impl FnMut(DirId, &ConfigId, &[u8]) -> Result<BString, E>,
 ) -> Result<InstallManifest, E> {
     let mut manifest = InstallManifest::default();
     let multi = configs.len() > 1 || model.generator.is_some_and(GeneratorKind::multi_config);
@@ -239,6 +306,69 @@ fn lower_install_rules<E>(
                         continue;
                     };
                     let matching: Vec<_> = targets.iter().filter(|t| t.id == *id).collect();
+                    if raw.kind == TargetKind::ObjectLibrary {
+                        let object_options = groups
+                            .get(b"OBJECTS".as_slice())
+                            .map_or_else(|| options.clone(), |group| group.merge(options));
+                        if object_options
+                            .destination
+                            .as_ref()
+                            .is_none_or(|value| value.is_empty())
+                        {
+                            continue;
+                        }
+                        for target in &matching {
+                            if !matches_config(&object_options, &target.config) {
+                                continue;
+                            }
+                            let mut options = object_options.clone();
+                            eval_destination(
+                                &mut options,
+                                raw.dir,
+                                &target.config,
+                                rule,
+                                &mut eval,
+                            )?;
+                            let destination = options
+                                .destination
+                                .as_deref()
+                                .map_or(b"".as_slice(), Vec::as_slice);
+                            let destination = super::artifacts::object_install_directory(
+                                model,
+                                raw,
+                                &target.config,
+                                destination,
+                            );
+                            for unit in &target.compile_units {
+                                let custom_name =
+                                    object_name(raw.dir, &target.config, &unit.source.value)?;
+                                let name = super::artifacts::install_object_name(
+                                    model,
+                                    raw,
+                                    &unit.source.value,
+                                    &custom_name,
+                                );
+                                let name = Lexical::new(&name);
+                                options.destination = Some(join(&destination, name.parent()));
+                                options.rename = Some(name.filename().into());
+                                let mut action = make_action(
+                                    &options,
+                                    b"",
+                                    file_action(
+                                        b"FILE",
+                                        vec![join(
+                                            &model.dir(DirId::ROOT).binary_dir,
+                                            &unit.object,
+                                        )],
+                                        &options,
+                                    ),
+                                );
+                                action.configurations = vec![target.config.0.clone()];
+                                manifest.actions.push(action);
+                            }
+                        }
+                        continue;
+                    }
                     for target in &matching {
                         let layout = if super::is_darwin(model, raw.dir) {
                             crate::ide::bundle_kind(raw)

@@ -3,7 +3,7 @@
 use std::collections::BTreeSet;
 
 use rcmake_base::{BString, path_lex::Lexical, truth};
-use rcmake_diag::{Effect, MessageKind, PolicyId, PolicyStatus};
+use rcmake_diag::{DiagCategory, Effect, MessageKind, PolicyId, PolicyStatus};
 use rcmake_eval::{CmdError, CmdFlags, CmdResult, Cx, Flow, Registry};
 use rcmake_expr::ExpandedArg;
 use rcmake_host::path::from_native;
@@ -215,6 +215,22 @@ fn add_command(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
             cx,
             "add_custom_command Wrong syntax.  Unknown type of argument.",
         ));
+    }
+    if body.codegen {
+        let error = if body.outputs.is_empty() {
+            Some("CODEGEN requires at least 1 OUTPUT.")
+        } else if options.append {
+            Some("CODEGEN may not be used with APPEND.")
+        } else if options.keywords.contains("IMPLICIT_DEPENDS") {
+            Some("CODEGEN is not compatible with IMPLICIT_DEPENDS.")
+        } else if cx.policy(PolicyId::new(171)) != PolicyStatus::New {
+            Some("CODEGEN option requires policy CMP0171 be set to NEW!")
+        } else {
+            None
+        };
+        if let Some(error) = error {
+            return Err(CmdError::status(error));
+        }
     }
     if options.append && body.outputs.is_empty() {
         return Err(crate::command_error(
@@ -448,22 +464,25 @@ fn add_event(
     let target = match project.lookup_target(body.dir, name) {
         Some(TargetBinding::Target(id) | TargetBinding::Alias(id)) => id,
         None => {
-            return Err(crate::command_error(
-                cx,
-                format!("No TARGET '{name_text}' has been created in this directory."),
-            ));
+            cx.issue_in_directory(
+                MessageKind::Error,
+                Effect::SetError,
+                None,
+                format!("No TARGET '{name_text}' has been created in this directory.").into(),
+            );
+            return Ok(Flow::Normal);
         }
     };
     let entry = project
         .target(target)
         .ok_or_else(|| CmdError::status("Unknown target."))?;
-    let problem = if entry.dir != body.dir {
-        Some(format!(
-            "TARGET '{name_text}' was not created in this directory."
-        ))
-    } else if entry.is_imported() {
+    let problem = if entry.is_imported() {
         Some(format!(
             "TARGET '{name_text}' is IMPORTED and does not build here."
+        ))
+    } else if entry.dir != body.dir {
+        Some(format!(
+            "TARGET '{name_text}' was not created in this directory."
         ))
     } else {
         match entry.kind {
@@ -475,7 +494,8 @@ fn add_event(
         ))
     };
     if let Some(problem) = problem {
-        return Err(crate::command_error(cx, problem));
+        cx.issue_in_directory(MessageKind::Error, Effect::SetError, None, problem.into());
+        return Ok(Flow::Normal);
     }
     body.kind = CustomCommandKind::TargetEvent { target, event };
     resolve_paths(cx, &mut body)?;
@@ -559,6 +579,13 @@ fn add_target(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
         target.props.set("EXCLUDE_FROM_ALL".into(), "TRUE".into());
     }
     target.sources = options.sources;
+    if target.name == b"codegen" {
+        let action = cx.diag_state().get(DiagCategory::Policy);
+        target.props.set(
+            "_RCMAKE_CODEGEN_NAME_DIAGNOSTIC".into(),
+            action.as_str().into(),
+        );
+    }
     let id = cx.project().add_target(target).map_err(model_error)?;
     body.kind = CustomCommandKind::Utility(id);
     record(cx, body)?;

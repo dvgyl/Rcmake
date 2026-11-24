@@ -222,3 +222,14 @@ impl DiagEngine {
         self.sarif_results.push(Value::Object(entry));
     }
 }
+
+/// Summary for the CMP0224 fixture repeat policy.
+pub const CMP0224_SUMMARY: &str =
+    "Test fixtures use AROUND_EACH_REPEAT mode by default with ctest --repeat.";
+
+/// Activation value for the experimental build database export.
+pub const EXPORT_BUILD_DATABASE_ACTIVATION: &[u8] = b"70ef007e-b743-492d-9407-e35eeac03a40";
+
+/// Description of the experimental build database export.
+pub const EXPORT_BUILD_DATABASE_DESCRIPTION: &str =
+    "CMake's support for exporting build databases is experimental.";

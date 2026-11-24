@@ -182,6 +182,17 @@ pub trait GenexHost {
         None
     }
 
+    /// Read a source property in the selected directory.
+    fn source_property(
+        &self,
+        _source: &[u8],
+        _scope: Option<(&[u8], &[u8])>,
+        _property: &[u8],
+        _ctx: &EvalContext,
+    ) -> Result<BString, BString> {
+        Ok(BString::default())
+    }
+
     /// Raw (unevaluated) value of a non-transitive property.
     fn raw_property(&self, target: TargetHandle, name: &[u8]) -> Option<BString>;
 

@@ -497,7 +497,7 @@ impl TargetSettings<'_> {
         }
         settings.insert(
             "GCC_PREPROCESSOR_DEFINITIONS".into(),
-            inherited_paths(
+            inherited_values(
                 defines
                     .into_iter()
                     .map(|value| xcode_flag(&value))
@@ -556,11 +556,13 @@ impl TargetSettings<'_> {
                 }
                 libraries.push(directory);
             }
-            ldflags.extend(
-                ide.link_options
-                    .iter()
-                    .map(|option| flag_text(&option.value)),
-            );
+            if raw.kind != TargetKind::StaticLibrary {
+                ldflags.extend(
+                    ide.link_options
+                        .iter()
+                        .map(|option| flag_text(&option.value)),
+                );
+            }
             for item in &ide.link_items {
                 match item {
                     IdeLinkItem::Target(id) => {
@@ -639,16 +641,19 @@ impl TargetSettings<'_> {
             raw.kind,
             TargetKind::StaticLibrary | TargetKind::ObjectLibrary
         ) {
-            if !objects.is_empty() {
-                settings.insert(
-                    "OTHER_LIBTOOLFLAGS".into(),
-                    objects
-                        .into_iter()
-                        .chain([INHERITED.into()])
-                        .collect::<Vec<_>>()
-                        .join(" ")
-                        .into(),
+            let mut flags = objects;
+            if raw.kind == TargetKind::StaticLibrary
+                && let Some(ide) = ide
+            {
+                flags.extend(
+                    ide.link_options
+                        .iter()
+                        .map(|option| flag_text(&option.value)),
                 );
+            }
+            if !flags.is_empty() {
+                flags.push(INHERITED.into());
+                settings.insert("OTHER_LIBTOOLFLAGS".into(), flags.join(" ").into());
             }
         } else {
             ldflags.splice(0..0, objects);
@@ -805,6 +810,23 @@ fn link_file(path: &str) -> String {
 }
 
 fn inherited_paths(values: Vec<String>) -> Value {
+    inherited_values(
+        values
+            .into_iter()
+            .map(|path| xcode_escape_path(&path))
+            .collect(),
+    )
+}
+
+fn xcode_escape_path(path: &str) -> String {
+    if path.contains([' ', '[', ']']) {
+        format!(r#""{path}""#)
+    } else {
+        path.into()
+    }
+}
+
+fn inherited_values(values: Vec<String>) -> Value {
     list(
         values
             .into_iter()

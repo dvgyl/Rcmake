@@ -1,9 +1,10 @@
 use indexmap::{IndexMap, IndexSet, map::Entry};
-use rcmake_base::{BString, list, path_lex::Lexical, truth};
+use rcmake_base::{BString, ByteSlice, list, path_lex::Lexical, truth};
 use rcmake_diag::{Backtrace, Location, MessageKind};
 use rcmake_genex::EvalContext;
 use rcmake_model::{
-    BT, FileSet, FileSetId, FileSetKind, ProjectModel, Target, TargetId, TargetKind, UsageField,
+    BT, CustomCommand, CustomCommandKind, FileSet, FileSetId, FileSetKind, ProjectModel, Target,
+    TargetId, TargetKind, UsageField,
 };
 
 use crate::{
@@ -87,7 +88,11 @@ pub(crate) fn resolve_target<'a>(
         .map(|source| (source, None));
     for (mut source, unity_file) in unity_sources.chain(original_sources) {
         if unity_file.is_none() {
-            source.value = paths.resolve_at(model, dir, &source)?;
+            let Some(value) = paths.resolve_at(model, dir, &source)? else {
+                inputs.sources.clear();
+                break;
+            };
+            source.value = value;
         }
         if !inputs.sources.insert(source.value.clone())
             || unity
@@ -262,6 +267,22 @@ pub(crate) fn resolve_target<'a>(
             }
         };
         facts.units.push(resolved.compile_units.len());
+        if flavor.is_none() && !lower::short_object_paths(model) {
+            crate::sources::custom_object_name(model, target.dir, &source.value).map_err(
+                |error| match error {
+                    ResolveError::Message(body) => {
+                        paths.emit(
+                            model,
+                            MessageKind::Error,
+                            crate::cxx_modules::generation_location(model, target),
+                            body.clone(),
+                        );
+                        ResolveError::Reported(body)
+                    }
+                    error => error,
+                },
+            )?;
+        }
         let object = lower::compile_object_path(
             model,
             target,
@@ -377,7 +398,9 @@ fn collect_file_sets<'a>(
             bases.push(dir.source_dir.clone());
         }
         for file in usage.file_set_paths(set.target, b"SOURCES", &set.files, &ctx)? {
-            let value = paths.resolve_at(model, dir, &file)?;
+            let Some(value) = paths.resolve_at(model, dir, &file)? else {
+                continue;
+            };
             let parent = Lexical::new(&value).parent();
             let relative_directory = bases.iter().find_map(|base| {
                 let base = Lexical::new(base);
@@ -440,4 +463,230 @@ fn export_symbol(target: &Target) -> Option<BString> {
     }));
     symbol.extend_from_slice(b"_EXPORTS");
     Some(symbol)
+}
+
+pub(crate) fn instantiate_rules(
+    model: &ProjectModel,
+    host: &dyn rcmake_host::Host,
+) -> Result<Option<ProjectModel>, ResolveError> {
+    let selected = model
+        .targets()
+        .flat_map(|(_, target)| {
+            target.file_sets.iter().filter_map(move |id| {
+                let set = model.file_set(*id)?;
+                let name = set.props.get(b"_RCMAKE_RULE")?;
+                let dir = model.file_set_rule_dir(*id).unwrap_or(target.dir);
+                Some((*id, target, set, name, dir, model.custom_rule(dir, name)?))
+            })
+        })
+        .collect::<Vec<_>>();
+    if selected.is_empty() {
+        return Ok(None);
+    }
+    let mut prepared = model.clone();
+    let diagnostics = SourcePaths::new(host);
+    for (id, target, set, name, dir, rule) in selected {
+        let directory = model.dir(dir);
+        let mut replacements = IndexMap::from_iter([
+            ("RULE".into(), name.clone()),
+            ("TARGET".into(), target.name.clone()),
+            ("FILE_SET".into(), set.name.clone()),
+        ]);
+        let output_set = rule
+            .get(b"OUTPUT_FILE_SET")
+            .map_or_else(Vec::new, |value| list::split(value, list::Empty::Keep));
+        let [output_name, output_type] = output_set.as_slice() else {
+            continue;
+        };
+        let output_name = expand_rule_patterns(output_name, &replacements);
+        let output_kind =
+            FileSetKind::from_name(output_type).unwrap_or(if output_type == b"SYCL_HEADERS" {
+                FileSetKind::Headers
+            } else {
+                FileSetKind::Sources
+            });
+        let existing = target.file_sets.iter().copied().find(|&id| {
+            model
+                .file_set(id)
+                .is_some_and(|set| set.name == output_name)
+        });
+        let invalid = if output_name.contains(&b'<') || output_name.contains(&b'>') {
+            Some(format!(
+                "Output File Set name, for rule \"{name}\", did not expand correctly:\n\n  \"{output_name}\""
+            ))
+        } else {
+            existing.and_then(|id| model.file_set(id)).filter(|set| set.kind != output_kind).map(|set| {
+                format!("The output file set \"{output_name}\", for the target \"{}\", has the type \"{}\" instead of \"{output_type}\", as specified by the rule \"{name}\".", target.name, set.kind.as_str())
+            })
+        };
+        if let Some(body) = invalid {
+            let body = BString::from(body);
+            diagnostics.emit(
+                model,
+                MessageKind::Error,
+                Location::FileLine {
+                    file: lower::join(&directory.source_dir, b"CMakeLists.txt")
+                        .as_slice()
+                        .into(),
+                    line: 0,
+                },
+                body.clone(),
+            );
+            return Err(ResolveError::Reported(body));
+        }
+        replacements.insert("OUTPUT_FILE_SET".into(), output_name.clone());
+        replacements.insert("CURRENT_BINARY_DIR".into(), directory.binary_dir.clone());
+        replacements.insert("CURRENT_SOURCE_DIR".into(), directory.source_dir.clone());
+        let output_dir = &model.dir(target.dir).binary_dir;
+        replacements.insert("OUTPUT_CURRENT_BINARY_DIR".into(), output_dir.clone());
+        let mut generated = Vec::new();
+        for source in &set.files {
+            let absolute = absolute_path(&directory.source_dir, &source.value);
+            let lexical = Lexical::new(&absolute);
+            let filename = lexical.filename();
+            let stem = filename
+                .rsplit_once_str(b".")
+                .map_or(filename, |(base, _)| base);
+            let mut replacements = replacements.clone();
+            replacements.extend([
+                ("SOURCE".into(), absolute.clone()),
+                ("INPUT_DIR".into(), lexical.parent().into()),
+                ("FILE_NAME".into(), filename.into()),
+                ("BASE_NAME".into(), stem.into()),
+            ]);
+            let source_props = directory.source_props.get(&absolute);
+            for key in [
+                b"INCLUDE_DIRECTORIES".as_slice(),
+                b"COMPILE_OPTIONS",
+                b"COMPILE_DEFINITIONS",
+            ] {
+                let values = [
+                    rule.get(key),
+                    source_props.and_then(|props| props.get(key)),
+                    set.props.get(key),
+                ]
+                .into_iter()
+                .flatten()
+                .filter(|value| !value.is_empty());
+                replacements.insert(key.into(), list::join(values));
+            }
+            let source_key = [name.as_slice(), b"_PATTERNS"].concat();
+            let patterns = set
+                .props
+                .get(b"RULE_PATTERNS")
+                .or_else(|| set.props.get(b"_RCMAKE_RULE_FILE_SET_PATTERNS"))
+                .into_iter()
+                .chain(
+                    directory
+                        .source_props
+                        .get(&absolute)
+                        .and_then(|props| props.get(&source_key)),
+                )
+                .chain(
+                    set.props
+                        .get(&[b"_RCMAKE_RULE_PATTERNS_".as_slice(), &absolute].concat()),
+                );
+            for pattern in patterns.flat_map(|value| list::split(value, list::Empty::Drop)) {
+                if let Some((key, value)) = pattern.split_once_str(b"=") {
+                    replacements.insert(key.into(), value.into());
+                }
+            }
+            let expand = |value: &[u8]| expand_rule_patterns(value, &replacements);
+            let words = |key: &[u8]| {
+                rule.get(key)
+                    .map_or_else(Vec::new, |value| list::split(value, list::Empty::Drop))
+            };
+            let paths = |key: &[u8]| {
+                words(key)
+                    .iter()
+                    .map(|path| {
+                        BT::new(
+                            crate::sources::absolute_path(&directory.binary_dir, &expand(path)),
+                            source.backtrace.clone(),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let mut command = CustomCommand::new(
+                target.dir,
+                CustomCommandKind::Output,
+                source.backtrace.clone(),
+                target.policies.policies,
+            );
+            command.outputs = paths(b"OUTPUT");
+            command.byproducts = paths(b"BYPRODUCTS");
+            command.depends = words(b"DEPENDS")
+                .iter()
+                .map(|value| BT::new(expand(value), source.backtrace.clone()))
+                .collect();
+            command
+                .depends
+                .push(BT::new(absolute, source.backtrace.clone()));
+            command.depfile = rule
+                .get(b"DEPFILE")
+                .filter(|value| !value.is_empty())
+                .map(|value| expand(value));
+            command.comment = rule.get(b"COMMENT").map(|value| expand(value));
+            command.verbatim = rule
+                .get(b"VERBATIM")
+                .is_some_and(|value| truth::is_on(value));
+            command.command_expand_lists = rule
+                .get(b"COMMAND_EXPAND_LISTS")
+                .is_some_and(|value| truth::is_on(value));
+            command.command_lines = (0..)
+                .map_while(|index| {
+                    rule.get(format!("COMMAND_{index}").as_bytes())
+                        .map(|value| {
+                            list::split(value, list::Empty::Keep)
+                                .iter()
+                                .map(|arg| expand(arg))
+                                .collect()
+                        })
+                })
+                .collect();
+            generated.extend(command.outputs.iter().cloned());
+            prepared
+                .add_command(command)
+                .map_err(|error| ResolveError::Message(error.to_string().into()))?;
+        }
+        if let Some(input) = prepared.file_set_mut(id) {
+            input.files.clear();
+            if existing.is_none() {
+                input.name = output_name;
+                input.kind = output_kind;
+                input.base_dirs.clear();
+            }
+        }
+        if let Some(output) = prepared.file_set_mut(existing.unwrap_or(id)) {
+            output.files.extend(generated);
+            if output.base_dirs.is_empty() {
+                output.base_dirs.push(BT::new(
+                    directory.binary_dir.clone(),
+                    target.backtrace.clone(),
+                ));
+            }
+        }
+    }
+    Ok(Some(prepared))
+}
+
+fn expand_rule_patterns(value: &[u8], patterns: &IndexMap<BString, BString>) -> BString {
+    let mut value = BString::from(value);
+    for _ in 0..patterns.len().min(32) {
+        let mut next = value.clone();
+        for (key, replacement) in patterns {
+            let pattern = [b"<", key.as_slice(), b">"].concat();
+            let extra = replacement.len().saturating_sub(pattern.len());
+            let growth = next.find_iter(&pattern).count().saturating_mul(extra);
+            if next.len().saturating_add(growth) > 65_536 {
+                return value;
+            }
+            next = next.replace(&pattern, replacement).into();
+        }
+        if value == next {
+            break;
+        }
+        value = next;
+    }
+    value
 }

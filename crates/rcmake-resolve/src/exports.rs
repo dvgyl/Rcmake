@@ -500,6 +500,42 @@ fn export_target<'a>(
                 .map(|unit| absolute_path(base, &unit.object));
             properties.insert("IMPORTED_OBJECTS".into(), list::join(paths));
         }
+        if target.kind == TargetKind::ObjectLibrary
+            && let Some(manifest) = install
+        {
+            let root = &model.dir(DirId::ROOT).binary_dir;
+            let paths = facts
+                .compile_units
+                .iter()
+                .filter_map(|unit| {
+                    let object = absolute_path(root, &unit.object);
+                    manifest
+                        .actions
+                        .iter()
+                        .filter(|action| {
+                            action
+                                .configurations
+                                .iter()
+                                .any(|config| facts.config.matches(config))
+                        })
+                        .find_map(|action| match &action.kind {
+                            InstallActionKind::Files {
+                                files,
+                                rename: Some(name),
+                                file_type,
+                                ..
+                            } if file_type == b"FILE" && files.contains(&object) => {
+                                Some(absolute_path(&action.destination, name))
+                            }
+                            _ => None,
+                        })
+                })
+                .collect::<Vec<_>>();
+            if !paths.is_empty() {
+                exported.kind = "OBJECT".into();
+                properties.insert("IMPORTED_OBJECTS".into(), list::join(paths));
+            }
+        }
         if !properties.is_empty() || exported.xcframework_locations.contains_key(&facts.config.0) {
             exported
                 .config_properties

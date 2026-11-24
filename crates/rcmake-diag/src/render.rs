@@ -40,6 +40,12 @@ pub fn render(diag: &Diagnostic, opts: &RenderOptions) -> BString {
     let mut out = Vec::new();
 
     match &diag.location {
+        Location::None if diag.policy == Some(crate::PolicyId::new(224)) => {
+            out.extend_from_slice(prefix);
+            out.extend_from_slice(b":\n");
+            out.extend_from_slice(&format_paragraphs(&diag.body, 2, opts.wrap_width));
+            append_footer_and_trailer(diag, &mut out);
+        }
         Location::None => {
             out.extend_from_slice(prefix);
             out.extend_from_slice(b": ");

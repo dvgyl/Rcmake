@@ -397,12 +397,10 @@ fn verification_target(
     let original_name = BT::new(original.name.clone(), original.backtrace.clone());
     match side {
         Side::Interface => {
-            if original.kind != TargetKind::Executable || is_on(original, b"ENABLE_EXPORTS") {
-                target.usage.link_libraries = Some(vec![LinkItem {
-                    text: original_name,
-                    lookup_dir: original.dir,
-                }]);
-            }
+            target.usage.link_libraries = Some(vec![LinkItem {
+                text: original_name,
+                lookup_dir: original.dir,
+            }]);
         }
         Side::Private => {
             for field in [

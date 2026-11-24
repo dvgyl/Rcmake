@@ -2,7 +2,7 @@
 
 use indexmap::IndexSet;
 use rcmake_base::{BString, list, path_lex::Lexical, shell::quote, truth};
-use rcmake_genex::ConfigId;
+use rcmake_genex::{ConfigId, EvalContext, evaluate, parse};
 use rcmake_model::{GeneratorKind, ProjectModel, Target};
 
 use super::artifacts::is_darwin;
@@ -122,13 +122,50 @@ fn compile_flags(
     group: &CompileGroup,
     required_standard: Option<&[u8]>,
     position_independent: Option<bool>,
-) -> Vec<BString> {
+) -> Result<Vec<BString>, ResolveError> {
     let language = group.language.as_slice();
     let mut flags = language_flags(model, target, config, language);
     flags.extend(standard_flag(model, target, language, required_standard));
     flags.extend(apple_flags(model, target, config, language));
     let policy = Flags::new(model, target, language);
     flags.extend(policy.compile(policy.ipo(config), position_independent));
+
+    if let Some(default) = definition(model, target.dir, b"CMAKE_MSVC_RUNTIME_LIBRARY_DEFAULT")
+        .filter(|value| !value.is_empty())
+    {
+        let raw = target.props.get(b"MSVC_RUNTIME_LIBRARY").unwrap_or(default);
+        let target_id = model
+            .find_target(target.dir, &target.name)
+            .map(crate::usage::handle);
+        let context = EvalContext {
+            config: config.clone(),
+            head: target_id,
+            current: target_id,
+            language: Some(group.language.clone()),
+            ..EvalContext::default()
+        };
+        let mut usage = crate::usage::UsageResolver::new(model);
+        let (runtime, _) = evaluate(&parse(raw)?, &context, &mut usage.host(target.dir))?;
+        if !runtime.is_empty()
+            && let Some(options) = definition(
+                model,
+                target.dir,
+                &[
+                    b"CMAKE_",
+                    language,
+                    b"_COMPILE_OPTIONS_MSVC_RUNTIME_LIBRARY_",
+                    &runtime,
+                ]
+                .concat(),
+            )
+        {
+            flags.extend(
+                list::split(options, list::Empty::Drop)
+                    .iter()
+                    .map(|option| quote(option)),
+            );
+        }
+    }
 
     let preset_key = [language, b"_VISIBILITY_PRESET"].concat();
     if let Some(preset) = target_property(model, target, &preset_key).filter(|p| !p.is_empty()) {
@@ -151,7 +188,7 @@ fn compile_flags(
                     .map_or_else(|| quote(&flag.value), BString::from)
             }),
     );
-    flags
+    Ok(flags)
 }
 
 fn includes(model: &ProjectModel, target: &Target, group: &CompileGroup) -> BString {
@@ -201,7 +238,7 @@ pub(super) fn compile_arguments(
     required_standard: Option<&[u8]>,
     source: &[u8],
     position_independent: Option<bool>,
-) -> (Vec<BString>, BString, BString) {
+) -> Result<(Vec<BString>, BString, BString), ResolveError> {
     let language = group.language.as_slice();
     let mut flags = compile_flags(
         model,
@@ -210,7 +247,7 @@ pub(super) fn compile_arguments(
         group,
         required_standard,
         position_independent,
-    );
+    )?;
     let mut defines: Vec<_> = group
         .defines
         .iter()
@@ -251,7 +288,7 @@ pub(super) fn compile_arguments(
                 .map(|value| quote(&value)),
         );
     }
-    (flags, defines, includes)
+    Ok((flags, defines, includes))
 }
 
 #[derive(Default)]
@@ -280,7 +317,7 @@ pub(super) fn compile(
         settings.standard,
         &source,
         settings.position_independent,
-    );
+    )?;
     if let Some(pch) = settings.pch {
         flags.extend(pch.options(model, target, language));
     }

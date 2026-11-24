@@ -303,3 +303,72 @@ fn write_bmi_install(info: &BmiInstallInfo) -> Value {
     }
     Value::Object(fields)
 }
+
+/// A translation unit in a build database template.
+pub struct DatabaseUnit<'a> {
+    /// The absolute source path.
+    pub source: &'a [u8],
+    /// The object file path.
+    pub object: &'a [u8],
+    /// The compiler invocation.
+    pub arguments: &'a [BString],
+    /// The compiler's working directory.
+    pub working_directory: &'a [u8],
+    /// Whether the unit is private to its target.
+    pub private: bool,
+}
+
+/// Serialize a build database template for one target and configuration.
+#[must_use]
+pub fn write_database_template<'a>(
+    target: &[u8],
+    config: &[u8],
+    units: impl IntoIterator<Item = DatabaseUnit<'a>>,
+) -> BString {
+    let units = units
+        .into_iter()
+        .map(|unit| {
+            Value::Object(
+                [
+                    ("source".into(), Value::string(unit.source)),
+                    ("object".into(), Value::string(unit.object)),
+                    (
+                        "work-directory".into(),
+                        Value::string(unit.working_directory),
+                    ),
+                    (
+                        "arguments".into(),
+                        Value::Array(unit.arguments.iter().cloned().map(Value::string).collect()),
+                    ),
+                    ("baseline-arguments".into(), Value::Array(Vec::new())),
+                    ("local-arguments".into(), Value::Array(Vec::new())),
+                    ("private".into(), Value::Bool(unit.private)),
+                    ("provides".into(), Value::Object(Default::default())),
+                    ("requires".into(), Value::Array(Vec::new())),
+                ]
+                .into_iter()
+                .collect(),
+            )
+        })
+        .collect();
+    let set = Value::Object(
+        [
+            ("family-name".into(), Value::string(target)),
+            (
+                "name".into(),
+                Value::string([target, b"@", config].concat()),
+            ),
+            ("translation-units".into(), Value::Array(units)),
+        ]
+        .into_iter()
+        .collect(),
+    );
+    rcmake_json::write_compact(&Value::Object(
+        [
+            ("revision".into(), Value::UInt(0)),
+            ("sets".into(), Value::Array(vec![set])),
+        ]
+        .into_iter()
+        .collect(),
+    ))
+}

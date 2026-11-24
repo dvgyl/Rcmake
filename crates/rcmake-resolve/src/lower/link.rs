@@ -3,7 +3,7 @@
 use indexmap::IndexSet;
 use rcmake_base::{BString, list, path_lex::Lexical, shell::quote, truth};
 use rcmake_diag::{PolicyId, PolicyStatus};
-use rcmake_genex::{ConfigId, EvalContext};
+use rcmake_genex::{ConfigId, EvalContext, UsageTraversal, evaluate, parse};
 use rcmake_model::{DirId, ProjectModel, Target, TargetId};
 
 use super::artifacts::{build_relative, is_darwin};
@@ -52,7 +52,6 @@ pub(super) fn link(
     let ipo = policy.ipo(config);
     let mut driver = language_flags(model, target, config, language);
     if kind != LinkKind::StaticArchive {
-        driver.extend(policy.link(ipo));
         driver.extend(apple_flags(model, target, config, language));
     }
     let driver = join_words(driver);
@@ -61,40 +60,27 @@ pub(super) fn link(
         definition(model, target.dir, b"CMAKE_COMMAND").map_or_else(|| "cmake".into(), Clone::clone)
     };
     let mut flags = Vec::new();
-    if kind != LinkKind::StaticArchive {
-        flags.extend(option(b"LINK_FLAGS").cloned());
-    }
+    let language_flags = [b"CMAKE_", language, b"_LINK_FLAGS"].concat();
+    let key = if kind == LinkKind::Executable && !policy_new(210) {
+        BString::from(language_flags.clone())
+    } else {
+        kind.create_flags_key(language)
+    };
     flags.push(parse_flags(
-        definition(model, target.dir, &kind.create_flags_key(language))
+        definition(model, target.dir, &key)
+            .or_else(|| {
+                (kind == LinkKind::ModuleLibrary)
+                    .then(|| {
+                        definition(
+                            model,
+                            target.dir,
+                            &LinkKind::SharedLibrary.create_flags_key(language),
+                        )
+                    })
+                    .flatten()
+            })
             .map_or_else(|| kind.default_create_flag(darwin).into(), Clone::clone),
     )?);
-    if kind == LinkKind::Executable {
-        let form = if target
-            .props
-            .get(b"WIN32_EXECUTABLE")
-            .is_some_and(|value| truth::is_on(value))
-        {
-            b"_CREATE_WIN32_EXE".as_slice()
-        } else {
-            b"_CREATE_CONSOLE_EXE"
-        };
-        if let Some(value) = definition(model, target.dir, &[b"CMAKE_", language, form].concat()) {
-            flags.push(parse_flags(value.clone())?);
-        }
-    }
-    if (kind == LinkKind::Executable || (kind != LinkKind::StaticArchive && policy_new(210)))
-        && let Some(value) = definition(
-            model,
-            target.dir,
-            &[b"CMAKE_", language, b"_LINK_FLAGS"].concat(),
-        )
-    {
-        flags.push(wrapper.flag_string(value)?);
-    }
-    flags.extend(policy.pie_link(position_independent));
-    if kind == LinkKind::SharedLibrary && darwin {
-        flags.extend(darwin_versions(model, target, language));
-    }
     let base = if kind == LinkKind::SharedLibrary
         && darwin
         && target
@@ -113,6 +99,33 @@ pub(super) fn link(
             flags.push(parse_flags(value.clone())?);
         }
     }
+    if kind != LinkKind::StaticArchive && policy_new(210) {
+        let configured = [
+            language_flags.as_slice(),
+            b"_",
+            &config.0.to_ascii_uppercase(),
+        ]
+        .concat();
+        for key in [&language_flags, &configured] {
+            if let Some(value) = definition(model, target.dir, key) {
+                flags.push(parse_flags(value.clone())?);
+            }
+        }
+    }
+    if kind == LinkKind::Executable {
+        let form = if target
+            .props
+            .get(b"WIN32_EXECUTABLE")
+            .is_some_and(|value| truth::is_on(value))
+        {
+            b"_CREATE_WIN32_EXE".as_slice()
+        } else {
+            b"_CREATE_CONSOLE_EXE"
+        };
+        if let Some(value) = definition(model, target.dir, &[b"CMAKE_", language, form].concat()) {
+            flags.push(parse_flags(value.clone())?);
+        }
+    }
     let raw_flags = kind.target_flags_property();
     flags.extend(target.props.get(raw_flags).cloned());
     flags.extend(
@@ -127,6 +140,13 @@ pub(super) fn link(
         .filter(|f| f.role == LinkFragmentRole::Flags)
     {
         flags.push(wrapper.argument(&fragment.text.value)?);
+    }
+    if kind != LinkKind::StaticArchive {
+        flags.extend(policy.pie_link(position_independent));
+        flags.extend(policy.link(ipo));
+    }
+    if kind == LinkKind::SharedLibrary && darwin {
+        flags.extend(darwin_versions(model, target, language));
     }
     if darwin {
         deduplicate_darwin_flags(&mut flags);
@@ -258,8 +278,31 @@ pub(super) fn link(
                 .find_map(|dir| model.dir(dir).props.get(b"RULE_LAUNCH_LINK"))
         })
         .or_else(|| model.global.props.get(b"RULE_LAUNCH_LINK"))
+        .map(|value| {
+            if !value.windows(2).any(|part| part == b"$<") {
+                return Ok(value.clone());
+            }
+            let handle = model
+                .find_target(target.dir, &target.name)
+                .map(crate::usage::handle);
+            let ctx = EvalContext {
+                config: config.clone(),
+                current: handle,
+                head: handle,
+                link_language: Some(step.language.clone()),
+                traversal: UsageTraversal::Link,
+                ..EvalContext::default()
+            };
+            let mut usage = UsageResolver::new(model);
+            evaluate(&parse(value)?, &ctx, &mut usage.host(target.dir))
+                .map(|(text, _)| text)
+                .map_err(ResolveError::from)
+        })
+        .transpose()?
         .filter(|value| !value.is_empty());
-    if let Some(program) = rule_launcher.and_then(|prefix| simple_args(prefix)?.into_iter().next())
+    if let Some(program) = rule_launcher
+        .as_ref()
+        .and_then(|prefix| simple_args(prefix)?.into_iter().next())
     {
         for dep in &target.utility_deps {
             if let Some(dependency) = model
@@ -287,7 +330,7 @@ pub(super) fn link(
         if kind != LinkKind::StaticArchive {
             link = command.launch_tool(model, target, b"_LINKER_LAUNCHER", link)?;
         }
-        if let Some(prefix) = rule_launcher {
+        if let Some(prefix) = &rule_launcher {
             link = shell_command(join_words([prefix.clone(), link.shell]));
         }
         *invocation = command.wrap(model, target, link);

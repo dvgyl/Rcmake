@@ -137,6 +137,7 @@ struct Step<'a> {
     depfile: Option<BString>,
     always: bool,
     progress: Option<usize>,
+    jobserver_aware: bool,
 }
 
 fn invalid_graph(message: impl Into<BString>) -> GenError {
@@ -150,7 +151,7 @@ fn build_path(value: &[u8], build_dir: &Path) -> BString {
     let path = path::to_native(value);
     let path = path.strip_prefix(build_dir).unwrap_or(&path);
     let path: std::path::PathBuf = path.components().collect();
-    rcmake_host::path::from_native(&path)
+    rcmake_base::path_lex::cmake_style(&path::from_native(&path))
 }
 
 fn plan_step<'a>(
@@ -177,6 +178,7 @@ fn plan_step<'a>(
             depfile: depfile.as_ref().map(make_path),
             always: false,
             progress: None,
+            jobserver_aware: result.metadata.jobserver_steps.contains(&step_index),
         },
         BuildStep::Link { step, inputs, .. } => Step {
             action,
@@ -186,6 +188,7 @@ fn plan_step<'a>(
             depfile: None,
             always: false,
             progress: None,
+            jobserver_aware: result.metadata.jobserver_steps.contains(&step_index),
         },
         BuildStep::Custom(custom) => Step {
             action,
@@ -203,6 +206,7 @@ fn plan_step<'a>(
             depfile: custom.depfile.as_ref().map(make_path),
             always: custom.outputs.is_empty() || custom.symbolic,
             progress: None,
+            jobserver_aware: result.metadata.jobserver_steps.contains(&step_index),
         },
         BuildStep::Scan { .. } | BuildStep::Collate { .. } => {
             return Err(GenError::Unimplemented(
@@ -269,6 +273,13 @@ fn plan_targets<'a>(
             .is_some_and(|target| {
                 target.policies.policies.get(PolicyId::new(113)) != PolicyStatus::New
             });
+        let codegen = target.name == b"codegen"
+            && project.is_some_and(|project| {
+                project
+                    .dir(DirId::ROOT)
+                    .final_policies
+                    .is_some_and(|policies| policies.get(PolicyId::new(171)) == PolicyStatus::New)
+            });
         for &step_index in &model.steps {
             let action = graph
                 .steps
@@ -276,7 +287,7 @@ fn plan_targets<'a>(
                 .ok_or_else(|| invalid_graph("invalid build step index"))?;
             let owner = *owners.entry(step_index).or_insert(index);
             let repeated = owner != index;
-            if repeated {
+            if repeated && !codegen {
                 target.dependencies.insert(owner);
                 if !repeat_rules
                     || !matches!(action, BuildStep::Custom(_))
@@ -357,6 +368,7 @@ fn plan_targets<'a>(
                 };
                 if let Some(owner) = producers.get(&file)
                     && *owner != index
+                    && !own_outputs.contains(&file)
                 {
                     target.dependencies.insert(*owner);
                     if symbolic.contains(&file) && !own_outputs.contains(&file) {
@@ -726,8 +738,42 @@ fn write_step(
     if !message.is_empty() {
         progress::report(out, &message, step.progress)?;
     }
-    commands.extend(invocations.iter().filter_map(shell_invocation));
-    if !commands.is_empty() {
+    if step.jobserver_aware {
+        for command in commands {
+            out.push_str(b"\t$(SILENT)");
+            make_recipe_text(out, &command)?;
+            out.push(b'\n');
+        }
+        for invocation in invocations {
+            if invocation
+                .argv
+                .first()
+                .is_some_and(|program| program == b"$(CMAKE_COMMAND)")
+            {
+                out.push_str(b"\t@+");
+                if let Some(directory) = &invocation.working_dir {
+                    out.push_str(b"cd ");
+                    make_recipe_text(out, &quote_always(directory))?;
+                    out.push_str(b" && ");
+                }
+                out.push_str(b"$(CMAKE_COMMAND)");
+                for arg in invocation.argv.iter().skip(1) {
+                    out.push(b' ');
+                    make_recipe_text(out, &rcmake_base::shell::quote(arg))?;
+                }
+                out.push(b'\n');
+            } else if let Some(command) = shell_invocation(invocation) {
+                out.push_str(b"\t+$(SILENT)");
+                make_recipe_text(out, &command)?;
+                out.push(b'\n');
+            }
+        }
+    } else if let commands = commands
+        .into_iter()
+        .chain(invocations.iter().filter_map(shell_invocation))
+        .collect::<Vec<_>>()
+        && !commands.is_empty()
+    {
         out.push_str(b"\t$(SILENT)");
         for (index, command) in commands.iter().enumerate() {
             if index != 0 {

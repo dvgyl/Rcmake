@@ -3,7 +3,7 @@
 use indexmap::IndexSet;
 use rcmake_base::{BString, list};
 use rcmake_genex::{GenexNode, PreprocessMode, parse, render, rewrite_install_prefix};
-use rcmake_model::{DirId, ProjectModel, Target, TargetId};
+use rcmake_model::{DirId, ExportKind, InstallKind, ProjectModel, Target, TargetId};
 use std::collections::BTreeMap;
 
 use crate::{
@@ -34,6 +34,21 @@ pub(crate) fn qualify(
     let mut packages = IndexSet::new();
     let Some(target) = model.target(id) else {
         return Ok(packages);
+    };
+    let contains = |set: &[u8]| {
+        model
+            .exports
+            .get(set)
+            .is_some_and(|set| set.targets.contains(&id))
+    };
+    let package_export = match mode {
+        PreprocessMode::Install => model.installs.iter().any(|rule| {
+            matches!(&rule.kind, InstallKind::PackageInfo(spec) if contains(&spec.export))
+                && !model.dir_excluded_from_all(rule.dir)
+        }),
+        _ => model.build_exports.iter().any(
+            |rule| matches!(&rule.kind, ExportKind::PackageInfo(spec) if contains(&spec.export)),
+        ),
     };
     for key in [
         LINK_LIBRARIES,
@@ -81,6 +96,10 @@ pub(crate) fn qualify(
                     .iter()
                     .any(|placement| placement.namespace != first.namespace);
                 if multiple_sets || multiple_namespaces {
+                    if package_export {
+                        // Package export validation reports the combined placements.
+                        return Ok(None);
+                    }
                     let scenario = if multiple_sets {
                         "in multiple other export sets"
                     } else {

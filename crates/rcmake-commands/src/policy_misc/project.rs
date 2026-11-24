@@ -208,6 +208,9 @@ fn parse_metadata<'a>(cx: &mut Cx<'_>, args: &[&'a [u8]]) -> Result<Arguments<'a
             if let Some(value) = args.next_if(|next| *next != b"LANGUAGES" && !is_metadata(next)) {
                 metadata.insert(arg, value);
             } else {
+                if matches!(arg, b"VERSION" | b"COMPAT_VERSION") {
+                    metadata.insert(arg, b"");
+                }
                 missing.push(arg);
             }
         } else if in_languages {

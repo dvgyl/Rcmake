@@ -131,6 +131,26 @@ pub(super) fn lower_modules_with_standard(
         forward_modules_from_target_dirs: module_info.forward_from.clone(),
         ..TargetDependInfo::default()
     };
+    if target
+        .props
+        .get(b"EXPORT_BUILD_DATABASE")
+        .or_else(|| definition(model, target.dir, b"CMAKE_EXPORT_BUILD_DATABASE"))
+        .is_some_and(|value| rcmake_base::truth::is_on(value))
+        && definition(
+            model,
+            target.dir,
+            b"CMAKE_EXPERIMENTAL_EXPORT_BUILD_DATABASE",
+        )
+        .is_some_and(|value| value == rcmake_diag::EXPORT_BUILD_DATABASE_ACTIVATION)
+    {
+        let directory = Lexical::new(&module_info.tdi).parent();
+        let output = Lexical::new(&root.binary_dir)
+            .append(&Lexical::new(directory).append(b"CXX_build_database.json"));
+        info.database_info = Some(rcmake_cxxmodules::DatabaseInfo {
+            template_path: [output.as_slice(), b".in"].concat().into(),
+            output,
+        });
+    }
     if let Some(rule) = &module_info.bmi_install {
         let destination = destination(&rule.destination)?;
         info.bmi_installation = (!destination.is_empty()).then(|| BmiInstallInfo {
@@ -226,7 +246,7 @@ pub(super) fn lower_modules_with_standard(
             standard,
             &unit.source.value,
             position_independent,
-        );
+        )?;
         let step = scan(
             model,
             target,
@@ -297,7 +317,7 @@ pub(crate) fn scan_responses(
             standard,
             &unit.source.value,
             position_independent,
-        );
+        )?;
         let arguments = [defines, includes, join_words(flags)]
             .iter()
             .filter(|part| !part.is_empty())

@@ -7,7 +7,8 @@ use super::{quoted, values};
 pub(super) use define::define;
 pub(super) use get::{get, get_cmake, get_directory, get_source};
 pub(super) use print::print_value;
-pub(super) use set::{set, set_directory, set_sources};
+pub(super) use rule::set;
+pub(super) use set::{set_directory, set_sources};
 
 mod computed;
 mod define;
@@ -15,6 +16,7 @@ mod file_set;
 mod generated;
 mod get;
 mod print;
+mod rule;
 mod scope;
 mod set;
 

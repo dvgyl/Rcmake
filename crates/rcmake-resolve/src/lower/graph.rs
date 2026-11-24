@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 
 use indexmap::{IndexMap, IndexSet};
 use rcmake_base::{BString, list};
+use rcmake_diag::{PolicyId, PolicyStatus};
 use rcmake_genex::ConfigId;
 use rcmake_model::{
     BT, DirId, GeneratorKind, ProjectModel, Target, TargetEvent, TargetId, TargetKind,
@@ -16,12 +17,12 @@ use super::custom::{
 };
 use super::link::link;
 use super::pch::{self, PchFlags};
-use super::{compute_artifacts, linker_language};
+use super::{compute_artifacts, definition, linker_language};
 use crate::ide::{IdeCustomPhase, IdeCustomStep};
 use crate::{
-    ArtifactSet, BuildGraph, BuildStep, CompileUnit, CrossConfiguration, CustomStep, GraphTarget,
-    LinkFragmentRole, LinkKind, LinkStep, ResolveError, ResolvedTarget, sources::TargetInputs,
-    unity::TargetUnity, usage::UsageResolver,
+    ArtifactSet, BuildGraph, BuildStep, CompileUnit, ConfigureMetadata, CrossConfiguration,
+    CustomStep, GraphTarget, LinkFragmentRole, LinkKind, LinkStep, ResolveError, ResolvedTarget,
+    Toolchain, sources::TargetInputs, unity::TargetUnity, usage::UsageResolver,
 };
 
 /// Lower resolved targets for one configuration.
@@ -83,7 +84,7 @@ pub(crate) fn lower_with_inputs(
     let precompiled = pch::Plans::new(model, &resolved, inputs, config, usage)?;
     let rule_count = graph.steps.len();
     let mut unity_prerequisites = Vec::new();
-    for (target, resolved) in local {
+    for &(target, resolved) in &local {
         let mut plan = TargetPlan::new(model, config, target, resolved, inputs.get(&resolved.id));
         let unity = usage
             .source_paths()
@@ -137,10 +138,98 @@ pub(crate) fn lower_with_inputs(
         });
     }
     graph.targets.extend(unity_prerequisites);
+    if matches!(
+        model.generator,
+        Some(GeneratorKind::Ninja | GeneratorKind::NinjaMultiConfig | GeneratorKind::UnixMakefiles)
+    ) && model
+        .dir(DirId::ROOT)
+        .final_policies
+        .is_some_and(|policies| policies.get(PolicyId::new(171)) == PolicyStatus::New)
+    {
+        add_codegen_target(model, &local, &target_indices, &commands, &mut graph)?;
+    }
     if usage.ide() == Some(crate::ide::IdeFlavor::Xcode) {
         remove_inherited_xcode_rules(&graph, &target_indices, rule_count, ide_custom);
     }
     Ok(graph)
+}
+
+fn add_codegen_target(
+    model: &ProjectModel,
+    local: &[(&Target, &ResolvedTarget)],
+    indices: &IndexMap<TargetId, usize>,
+    commands: &Commands<'_>,
+    graph: &mut BuildGraph,
+) -> Result<(), ResolveError> {
+    let mut reachable: IndexSet<_> = graph
+        .targets
+        .iter()
+        .take(local.len())
+        .enumerate()
+        .filter_map(|(index, target)| target.in_all.then_some(index))
+        .collect();
+    let mut pending: Vec<_> = reachable.iter().rev().copied().collect();
+    let mut roots = IndexSet::new();
+    let mut requirements = IndexMap::<usize, IndexSet<usize>>::new();
+    while let Some(index) = pending.pop() {
+        let Some(((target, _), owner)) = local.get(index).zip(graph.targets.get(index)) else {
+            continue;
+        };
+        let explicit = target.utility_deps.iter().filter_map(|dep| {
+            let id = model.find_target(target.dir, &dep.value)?;
+            indices.get(&id).copied()
+        });
+        for dependency in explicit.clone() {
+            if reachable.insert(dependency) {
+                pending.push(dependency);
+            }
+        }
+        for &step in &owner.steps {
+            if commands.codegen.contains(&step) {
+                roots.insert(step);
+                let owner_deps: IndexSet<_> = explicit
+                    .clone()
+                    .filter(|&dep| {
+                        dep != index
+                            && graph
+                                .targets
+                                .get(dep)
+                                .is_some_and(|target| !target.steps.contains(&step))
+                    })
+                    .collect();
+                requirements
+                    .entry(step)
+                    .and_modify(|common| common.retain(|dep| owner_deps.contains(dep)))
+                    .or_insert(owner_deps);
+            }
+        }
+    }
+    let mut steps = IndexSet::new();
+    let mut dependencies = IndexSet::new();
+    commands.add_producers(roots, &mut steps, &mut dependencies)?;
+    for (step, required) in requirements {
+        if let Some(BuildStep::Custom(command)) = graph.steps.get_mut(step) {
+            for target in required
+                .into_iter()
+                .filter_map(|index| graph.targets.get(index))
+            {
+                let name = &target.name;
+                if !command.depends.contains(name) {
+                    command.depends.push(name.clone());
+                }
+            }
+        }
+    }
+    graph.targets.push(GraphTarget {
+        name: "codegen".into(),
+        steps: steps.into_iter().collect(),
+        depends: dependencies
+            .iter()
+            .filter_map(|id| indices.get(id).copied())
+            .collect(),
+        in_all: false,
+    });
+    Ok(())
 }
 
 fn remove_inherited_xcode_rules(
@@ -606,4 +695,85 @@ pub(super) fn push(steps: &mut Vec<BuildStep>, step: BuildStep) -> usize {
     let index = steps.len();
     steps.push(step);
     index
+}
+
+/// Collect listfiles and compiler data from the model.
+///
+/// Listfiles keep the order of their first appearance. Read compiler values
+/// from directory variable snapshots and the cache.
+#[must_use]
+pub fn collect_metadata(model: &ProjectModel) -> ConfigureMetadata {
+    let mut listfiles = IndexSet::new();
+    let mut languages = IndexMap::new();
+    for (dir, directory) in model.dirs() {
+        listfiles.extend(directory.listfiles.iter().cloned());
+        for key in directory.vars.keys().chain(directory.props.names().iter()) {
+            if let Some(language) = compiler_language(key) {
+                languages.entry(language).or_insert(dir);
+            }
+        }
+    }
+    for key in model
+        .global
+        .props
+        .names()
+        .iter()
+        .chain(model.cache.iter().map(|(key, _)| key))
+    {
+        if let Some(language) = compiler_language(key) {
+            languages.entry(language).or_insert(DirId::ROOT);
+        }
+    }
+    let toolchains = languages
+        .into_iter()
+        .filter_map(|(language, dir)| {
+            let read = |suffix: &[u8]| {
+                definition(
+                    model,
+                    dir,
+                    &[b"CMAKE_", language.as_slice(), b"_", suffix].concat(),
+                )
+            };
+            let compiler = read(b"COMPILER")?;
+            if rcmake_base::truth::is_off(compiler) {
+                return None;
+            }
+            let value = |suffix| read(suffix).cloned().unwrap_or_default();
+            let optional = |suffix| read(suffix).filter(|v| !v.is_empty()).cloned();
+            let paths =
+                |suffix| read(suffix).map_or_else(Vec::new, |v| list::split(v, list::Empty::Drop));
+            let toolchain = Toolchain {
+                compiler_path: compiler.clone(),
+                compiler_id: value(b"COMPILER_ID"),
+                compiler_version: value(b"COMPILER_VERSION"),
+                implicit_includes: paths(b"IMPLICIT_INCLUDE_DIRECTORIES"),
+                implicit_link_dirs: paths(b"IMPLICIT_LINK_DIRECTORIES"),
+                source_extensions: paths(b"SOURCE_FILE_EXTENSIONS"),
+                scandep_rule: optional(b"SCANDEP_SOURCE"),
+                module_map_format: optional(b"MODULE_MAP_FORMAT"),
+                module_map_flag: optional(b"MODULE_MAP_FLAG"),
+                compile_bmi_rule: optional(b"MODULE_BMI_ONLY_FLAG"),
+            };
+            Some((language, toolchain))
+        })
+        .collect();
+    ConfigureMetadata {
+        listfiles: listfiles.into_iter().collect(),
+        toolchains,
+        configure_log: definition(model, DirId::ROOT, b"CMAKE_CONFIGURE_LOG").cloned(),
+        cmake_command: definition(model, DirId::ROOT, b"CMAKE_COMMAND").cloned(),
+        ctest_command: definition(model, DirId::ROOT, b"CMAKE_CTEST_COMMAND").cloned(),
+        jobserver_steps: model
+            .commands()
+            .map(|(_, command)| command)
+            .filter(|command| command.kind == rcmake_model::CustomCommandKind::Output)
+            .enumerate()
+            .filter_map(|(step, command)| command.job_server_aware.then_some(step))
+            .collect(),
+    }
+}
+
+fn compiler_language(key: &[u8]) -> Option<BString> {
+    let lang = key.strip_prefix(b"CMAKE_")?.strip_suffix(b"_COMPILER")?;
+    (!lang.is_empty()).then(|| lang.into())
 }

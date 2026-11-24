@@ -92,6 +92,84 @@ impl GenexHost for ModelGenexHost<'_, '_> {
             .map(handle)
     }
 
+    fn source_property(
+        &self,
+        source: &[u8],
+        scope: Option<(&[u8], &[u8])>,
+        property: &[u8],
+        ctx: &EvalContext,
+    ) -> Result<BString, BString> {
+        let model = self.resolver.model;
+        let dir = self.directory(ctx);
+        let dir = match scope {
+            Some((b"DIRECTORY", name)) => {
+                let path = absolute_path(&model.dir(dir).source_dir, name);
+                model
+                    .dirs()
+                    .find(|(_, dir)| dir.source_dir == path || dir.binary_dir == path)
+                    .map(|(id, _)| id)
+                    .ok_or_else(|| {
+                        BString::from(format!("Directory \"{path}\" is not known from CMake."))
+                    })?
+            }
+            Some((_, name)) => model
+                .find_target(dir, name)
+                .and_then(|id| model.target(id))
+                .map(|target| target.dir)
+                .ok_or_else(|| {
+                    BString::from(format!("Non-existent target: {}", BString::from(name)))
+                })?,
+            None => dir,
+        };
+        let lookup = model.dir(if scope.is_some() {
+            self.directory(ctx)
+        } else {
+            dir
+        });
+        let directory = model.dir(dir);
+        let explicit = scope.is_some();
+        let paths = [
+            Some(absolute_path(&lookup.source_dir, source)),
+            (!explicit).then(|| absolute_path(&directory.binary_dir, source)),
+        ];
+        let path = paths
+            .iter()
+            .flatten()
+            .find(|path| directory.source_props.contains_key(*path))
+            .or_else(|| {
+                paths
+                    .iter()
+                    .flatten()
+                    .find(|path| model.is_globally_generated(path))
+            })
+            .ok_or_else(|| {
+                BString::from(format!(
+                    "Source file \"{}\" is not known from CMake.",
+                    BString::from(source)
+                ))
+            })?;
+        if property == b"OBJECT_NAME" {
+            if ctx.site.property.as_ref().is_some_and(|key| {
+                matches!(key.as_slice(), b"OBJECT_NAME" | b"INSTALL_OBJECT_NAME")
+            }) {
+                return Err(
+                    "The OBJECT_NAME property cannot read an OBJECT_NAME source property.".into(),
+                );
+            }
+            return crate::sources::custom_object_name(model, dir, path)
+                .map_err(|error| error.to_string().into());
+        }
+        Ok(model
+            .get_prop(
+                &PropScope::Source {
+                    dir,
+                    path: path.clone(),
+                },
+                property,
+            )
+            .unwrap_or_default())
+    }
+
     fn target_name(&self, target: TargetHandle) -> BString {
         self.id(target)
             .and_then(|id| self.resolver.model.target(id))

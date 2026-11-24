@@ -74,10 +74,11 @@ impl TryCompileSeed {
             .filter(|name| toolchain_variable(name))
         {
             if !honor_link_flags
-                && name
-                    .strip_prefix(b"CMAKE_")
-                    .and_then(|name| name.strip_suffix(b"_LINK_FLAGS"))
-                    .is_some_and(|part| PROBE_LANGUAGES.iter().any(|lang| lang.as_bytes() == part))
+                && PROBE_LANGUAGES.iter().any(|lang| {
+                    let key = format!("CMAKE_{lang}_LINK_FLAGS");
+                    name.strip_prefix(key.as_bytes())
+                        .is_some_and(|suffix| suffix.is_empty() || suffix.starts_with(b"_"))
+                })
             {
                 continue;
             }

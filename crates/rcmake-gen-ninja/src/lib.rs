@@ -111,16 +111,26 @@ pub fn generate_single_config_with_model(
     generate_single(result, host, build_dir, Some(model))
 }
 
+fn output_prefix(model: Option<&ProjectModel>) -> BString {
+    model
+        .and_then(|model| model.definition(DirId::ROOT, b"CMAKE_NINJA_OUTPUT_PATH_PREFIX"))
+        .map(|prefix| rcmake_base::path_lex::cmake_style(prefix))
+        .map_or_else(BString::default, |prefix| {
+            rcmake_base::path_lex::Lexical::new(&prefix).normalize()
+        })
+}
+
 fn generate_single(
     result: &GenerationResult,
     host: &dyn Host,
     build_dir: &Path,
     model: Option<&ProjectModel>,
 ) -> Result<(), GenError> {
+    let prefix = output_prefix(model);
     let empty = BuildGraph::default();
     let input = result.graphs.first().unwrap_or(&empty);
     let artifacts = config_artifacts(result, input);
-    let mut graph = Graph::new(input, &artifacts, build_dir, None)?;
+    let mut graph = Graph::with_prefix(input, &artifacts, build_dir, None, &prefix)?;
     graph.add_aliases(&artifacts, model);
     graph.resolve_custom_inputs(model, host);
     graph.connect_custom_dependencies(model);
@@ -139,7 +149,10 @@ fn generate_single(
         .map(|model| write_module_exports(result, model, host, build_dir, false))
         .transpose()?
         .unwrap_or_default();
-    let mut manifests = vec![BString::from("build.ninja"), RULES_PATH.into()];
+    let mut manifests = vec![
+        graph.node(b"build.ninja"),
+        graph.node(RULES_PATH.as_bytes()),
+    ];
     manifests.extend(exports.iter().map(|job| graph.node(&job.script)));
     if uses_modules {
         manifests.extend(
@@ -149,7 +162,7 @@ fn generate_single(
         );
     }
     let mut ninja = graph.manifest();
-    ninja.include(RULES_PATH.as_bytes());
+    ninja.include(&graph.node(RULES_PATH.as_bytes()));
     graph.emit(&mut ninja, &programs.cmake, &module_flag, &exports);
     graph.emit_assumed_sources(&mut ninja, model);
     prep.emit(&mut ninja, &graph);
@@ -168,7 +181,9 @@ fn generate_single(
         &programs,
         &configure_command(result, build_dir, &programs.cmake, false),
     );
-    ninja.0.extend_from_slice(b"default all\n");
+    if graph.prefix.is_empty() {
+        ninja.0.extend_from_slice(b"default all\n");
+    }
 
     write_rules(result, host, build_dir, uses_modules)?;
     write_if_changed(host, &build_dir.join("build.ninja"), &ninja.0)
@@ -213,6 +228,7 @@ fn generate_multi(
     build_dir: &Path,
     model: Option<&ProjectModel>,
 ) -> Result<(), GenError> {
+    let prefix = output_prefix(model);
     let mut configs = Vec::new();
     let mut names = HashSet::new();
     for config in &result.configs {
@@ -236,7 +252,7 @@ fn generate_multi(
                 generation_error(build_dir, "A Ninja configuration has no build graph.")
             })?;
         let artifacts = config_artifacts(result, input);
-        let mut graph = Graph::new(input, &artifacts, build_dir, Some(name))?;
+        let mut graph = Graph::with_prefix(input, &artifacts, build_dir, Some(name), &prefix)?;
         graph.add_aliases(&artifacts, model);
         graph.resolve_custom_inputs(model, host);
         graph.set_compile_metadata(result);
@@ -263,9 +279,15 @@ fn generate_multi(
         .iter()
         .filter_map(|&index| configs.get(index).map(|(graph, _)| graph))
         .collect();
-    let mut manifests = vec!["build.ninja".into(), RULES_PATH.into()];
+    let mut manifests = vec![
+        default.node(b"build.ninja"),
+        default.node(RULES_PATH.as_bytes()),
+    ];
     for (_, files) in &configs {
-        manifests.extend([files.entry.clone(), files.implementation.clone()]);
+        manifests.extend([
+            default.node(&files.entry),
+            default.node(&files.implementation),
+        ]);
     }
 
     let graphs: Vec<_> = configs.iter().map(|(graph, _)| graph.input).collect();
@@ -295,7 +317,7 @@ fn generate_multi(
     let regenerate = configure_command(result, build_dir, &programs.cmake, true);
     for (index, (graph, files)) in configs.iter().enumerate() {
         let mut ninja = graph.manifest();
-        ninja.include(RULES_PATH.as_bytes());
+        ninja.include(&graph.node(RULES_PATH.as_bytes()));
         let mut emitted = HashSet::new();
         let included = std::iter::once(index).chain(
             selection
@@ -317,7 +339,8 @@ fn generate_multi(
                 .flatten()
                 .map(|input| {
                     let artifacts = config_artifacts(result, input);
-                    let mut variant = Graph::new(input, &artifacts, build_dir, output.config)?;
+                    let mut variant =
+                        Graph::with_prefix(input, &artifacts, build_dir, output.config, &prefix)?;
                     variant.add_aliases(&artifacts, model);
                     variant.resolve_custom_inputs(model, host);
                     variant.set_compile_metadata(result);
@@ -337,6 +360,7 @@ fn generate_multi(
         }
         multi::emit_clean(
             &mut ninja,
+            graph,
             &files.implementation,
             included
                 .filter_map(|selected| configs.get(selected).and_then(|(graph, _)| graph.config)),
@@ -428,18 +452,20 @@ fn write_entry(
     let mut ninja = Ninja::default();
     // The include path can contain a literal pipe.
     ninja.0.extend_from_slice(b"ninja_pipe = |\n");
-    ninja.include(&files.implementation);
+    ninja.include(&graph.node(&files.implementation));
     graph.emit_aliases(&mut ninja, None, aliases, emitted);
     if !graph.has_target(&"clean".into()) {
         let targets = aliases
             .iter()
-            .map(|graph| qualified(&"clean".into(), graph.config))
+            .map(|graph| qualified(&graph.node(b"clean"), graph.config))
             .collect::<Vec<_>>();
-        ninja.phony(&"clean".into(), &targets);
+        ninja.phony(&graph.node(b"clean"), &targets);
     }
     files.prep.emit_aliases(&mut ninja, graph);
     emit_utilities(&mut ninja, graph, entry, programs, rebuild);
-    ninja.0.extend_from_slice(b"default all\n");
+    if graph.prefix.is_empty() {
+        ninja.0.extend_from_slice(b"default all\n");
+    }
     write_if_changed(host, &build_dir.join(path::to_native(entry)), &ninja.0)
 }
 
@@ -530,9 +556,9 @@ fn emit_regeneration(
         .collect();
 
     if let Some(cmake) = verify {
-        let script: BString = rcmake_gen_common::glob::SCRIPT.into();
-        let stamp: BString = rcmake_gen_common::glob::STAMP.into();
-        let force: BString = "CMakeFiles/VerifyGlobs.force".into();
+        let script = graph.node(rcmake_gen_common::glob::SCRIPT.as_bytes());
+        let stamp = graph.node(rcmake_gen_common::glob::STAMP.as_bytes());
+        let force = graph.node(b"CMakeFiles/VerifyGlobs.force");
         ninja.phony(&force, &[]);
         ninja.edge(
             b"VERIFY_GLOBS",
@@ -561,7 +587,9 @@ fn emit_regeneration(
 
     for listfile in &listfiles {
         // Missing listfiles must trigger regeneration so CMake can check them.
-        if listfile != rcmake_gen_common::glob::STAMP.as_bytes() && !graph.has_target(listfile) {
+        if *listfile != graph.node(rcmake_gen_common::glob::STAMP.as_bytes())
+            && !graph.has_target(listfile)
+        {
             ninja.phony(listfile, &[]);
         }
     }
@@ -624,9 +652,9 @@ fn emit_utilities(
     }
     install.extend_from_slice(b" -P cmake_install.cmake");
     let mut clean = b"ninja".to_vec();
-    if entry != b"build.ninja" {
+    if entry != b"build.ninja" || !graph.prefix.is_empty() {
         clean.extend_from_slice(b" -f ");
-        shell_word(entry, &mut clean);
+        shell_word(&graph.node(entry), &mut clean);
     }
     let mut help = clean.clone();
     clean.extend_from_slice(b" -t clean");
@@ -735,21 +763,30 @@ struct Utility<'a> {
 }
 
 fn emit_utility(ninja: &mut Ninja, graph: &Graph<'_>, utility: Utility<'_>) {
-    let name = BString::from(utility.name);
+    let name = graph.node(utility.name.as_bytes());
     if graph.has_target(&name) {
         return;
     }
-    let output = BString::from(format!("CMakeFiles/{}.util", utility.name));
+    let output = graph.node(format!("CMakeFiles/{}.util", utility.name).as_bytes());
+    let inputs: Vec<_> = utility
+        .inputs
+        .iter()
+        .map(|input| graph.node(input))
+        .collect();
     ninja.edge(
         utility.rule,
         Edge {
             outputs: std::slice::from_ref(&output),
-            inputs: utility.inputs,
+            inputs: &inputs,
             ..Edge::default()
         },
     );
     if !utility.command.is_empty() {
-        ninja.binding(b"COMMAND", utility.command);
+        if matches!(utility.name, "clean" | "help") {
+            ninja.binding(b"COMMAND", utility.command);
+        } else {
+            ninja.binding(b"COMMAND", &graph.in_build_dir(utility.command));
+        }
     }
     if !utility.pool.is_empty() {
         ninja.binding(b"pool", utility.pool);

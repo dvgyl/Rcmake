@@ -30,14 +30,7 @@ pub(super) fn directory_value(
     match name {
         b"VARIABLES" if dir == cx.current_dir_id() => Some(list::join(cx.variable_names())),
         b"CACHE_VARIABLES" => Some(cache_names(cx)),
-        b"RULES" => Some(list::join(
-            cx.project()
-                .dir(dir)
-                .props
-                .names()
-                .iter()
-                .filter_map(|key| key.strip_prefix(b"_RCMAKE_CUSTOM_RULE_")),
-        )),
+        b"RULES" => Some(list::join(cx.project().directory_rules(dir))),
         b"MACROS" => Some(
             cx.project()
                 .dir(dir)

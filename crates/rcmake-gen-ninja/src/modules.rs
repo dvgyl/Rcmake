@@ -109,7 +109,9 @@ pub(crate) fn modmap_flag(
 }
 
 pub(crate) fn modules_json(dd: &BString) -> BString {
-    path::from_native(&path::to_native(dd).with_file_name("CXXModules.json"))
+    rcmake_base::path_lex::cmake_style(&path::from_native(
+        &path::to_native(dd).with_file_name("CXXModules.json"),
+    ))
 }
 
 pub(crate) fn write_metadata(
@@ -127,8 +129,9 @@ pub(crate) fn write_metadata(
             || source_directory(result, build_dir),
             |dir| path::to_native(dir),
         );
-    let top_src = path::from_native(&source_dir);
-    let top_bld = path::from_native(build_dir);
+    let cmake_path = |path| rcmake_base::path_lex::cmake_style(&path::from_native(path));
+    let top_src = cmake_path(source_dir.as_path());
+    let top_bld = cmake_path(build_dir);
     let targets: HashMap<_, _> = result
         .targets
         .iter()
@@ -217,6 +220,51 @@ pub(crate) fn write_metadata(
             }
             if let Some(raw) = resolved.and_then(|target| model?.target(target.id)) {
                 info.exports = module_exports(result, raw, &top_bld, &graph.config.0);
+            }
+            if let Some(database) = &info.database_info
+                && let Some(resolved) = resolved
+            {
+                let units = resolved
+                    .compile_units
+                    .iter()
+                    .map(|unit| &unit.object)
+                    .collect::<HashSet<_>>();
+                let contents = rcmake_cxxmodules::tdi::write_database_template(
+                    target,
+                    &graph.config.0,
+                    graph.steps.iter().filter_map(|step| {
+                        let BuildStep::Compile {
+                            object,
+                            source,
+                            invocation,
+                            ..
+                        } = step
+                        else {
+                            return None;
+                        };
+                        units
+                            .contains(object)
+                            .then(|| rcmake_cxxmodules::tdi::DatabaseUnit {
+                                source,
+                                object,
+                                arguments: &invocation.argv,
+                                working_directory: invocation
+                                    .working_dir
+                                    .as_deref()
+                                    .map_or(top_bld.as_slice(), Vec::as_slice),
+                                private: info.cxx_modules.get(object).is_none_or(|source| {
+                                    source.visibility == ModuleVisibility::Private
+                                }),
+                            })
+                    }),
+                );
+                let template = path::to_native(&database.template_path);
+                if let Some(directory) = template.parent() {
+                    host.create_dir_all(directory)
+                        .map_err(|error| generation_error(directory, error.to_string()))?;
+                }
+                write_if_changed(host, &template, &contents)?;
+                files.push(database.template_path.clone());
             }
             let contents =
                 write_tdi(&info).map_err(|error| generation_error(&path, error.to_string()))?;

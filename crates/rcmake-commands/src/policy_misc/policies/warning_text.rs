@@ -317,10 +317,7 @@ const SUMMARY_OVERRIDES: &[(u16, &str)] = &[
         222,
         "The if() command supports path prefix tests using PATH_IS_PREFIX operator.",
     ),
-    (
-        224,
-        "Test fixtures use AROUND_EACH_REPEAT mode by default with ctest --repeat.",
-    ),
+    (224, rcmake_diag::CMP0224_SUMMARY),
     (
         225,
         "ExternalProject sets CMAKE_INSTALL_PREFIX to <INSTALL_DIR> in the default configure command.",

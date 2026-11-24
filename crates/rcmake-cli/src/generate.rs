@@ -6,7 +6,9 @@ use rcmake_base::{
     list::{Empty, split},
     path_lex::Lexical,
 };
-use rcmake_diag::{Diagnostic, Effect, Location, MessageKind, RenderOptions, render};
+use rcmake_diag::{
+    DiagAction, DiagCategory, Diagnostic, Effect, Location, MessageKind, RenderOptions, render,
+};
 use rcmake_eval::Interp;
 use rcmake_gen_common::{self as common, GenError};
 use rcmake_genex::ConfigId;
@@ -15,7 +17,7 @@ use rcmake_instrument::snippet::{self, ContentTarget};
 use rcmake_instrument::{
     CustomContent, CustomContentType, InstrumentError, InstrumentOption, Query,
 };
-use rcmake_model::{GeneratorKind, ProjectModel, TargetOrigin};
+use rcmake_model::{FileSetId, GeneratorKind, ProjectModel, TargetOrigin};
 use rcmake_resolve::ide::IdeFlavor;
 use rcmake_resolve::{GenerationResult, InstallActionKind, InstallManifest, ResolveOptions};
 
@@ -43,6 +45,9 @@ pub(crate) fn run(
     let Some(kind) = interp.cx().project().generator else {
         return Ok(false);
     };
+    if matches!(kind, GeneratorKind::Ninja | GeneratorKind::NinjaMultiConfig) {
+        interp.cx().var(b"CMAKE_NINJA_OUTPUT_PATH_PREFIX");
+    }
     let configs = if kind.multi_config() {
         match interp.cx().var(b"CMAKE_CONFIGURATION_TYPES") {
             Some(value) => split(&value, Empty::Drop)
@@ -67,6 +72,7 @@ pub(crate) fn run(
             | GeneratorKind::UnixMakefiles => None,
         },
     };
+    configure_rules(interp)?;
     let resolved = {
         let mut cx = interp.cx();
         let model = cx.project();
@@ -90,6 +96,28 @@ pub(crate) fn run(
         Err(rcmake_resolve::ResolveError::Reported(_)) => return Err(Failure::Reported),
         Err(err) => return Err(err.to_string().into()),
     };
+    if result.graphs.iter().flat_map(|graph| &graph.steps).any(|step| {
+        matches!(step, rcmake_resolve::BuildStep::Collate { depend_info, .. } if depend_info.database_info.is_some())
+    }) {
+        let category = DiagCategory::Experimental;
+        let action = interp.cx().diag_state().get(category);
+        if action != DiagAction::Ignore {
+            let failure = action > DiagAction::Warn;
+            let diagnostic = Diagnostic {
+                kind: if failure { MessageKind::AuthorError } else { MessageKind::AuthorWarning },
+                effect: if failure { Effect::SetError } else { Effect::None },
+                category: Some(category),
+                policy: None,
+                location: Location::FileLine { file: Arc::from(b"CMakeLists.txt".as_slice()), line: 0 },
+                body: format!("{}  It is meant only for experimentation and feedback to CMake developers.",
+                    rcmake_diag::EXPORT_BUILD_DATABASE_DESCRIPTION).into(),
+            };
+            host.write_out(Stream::Stderr, &render(&diagnostic, &RenderOptions::default()));
+            if failure {
+                return Err(Failure::Reported);
+            }
+        }
+    }
     if !queries.is_empty() && !kind.is_ide() {
         instrument::wrap_custom_commands(&mut result, interp.cx().project(), host, bin);
     }
@@ -125,7 +153,16 @@ pub(crate) fn run(
     if let Some(Err(err)) = ide_result {
         return Err(err.to_string().into());
     }
-    write_common(interp, host, bin, &result, kind).map_err(|err| err.to_string())?;
+    write_common(interp, host, bin, &result, kind).map_err(|err| match err {
+        GenError::Invalid(message) if message.starts_with(b"\nCMake Error") => {
+            host.write_out(
+                Stream::Stderr,
+                message.strip_prefix(b"\n").unwrap_or(&message),
+            );
+            Failure::Reported
+        }
+        error => Failure::Message(error.to_string()),
+    })?;
     let result = match kind {
         GeneratorKind::Ninja => rcmake_gen_ninja::generate_single_config_with_model(
             &result,
@@ -162,6 +199,128 @@ pub(crate) fn run(
         Err(GenError::Unimplemented(_)) => Ok(false),
         Err(err) => Err(err.to_string().into()),
     }
+}
+
+fn configure_rules(interp: &mut Interp) -> Result<(), Failure> {
+    struct RuleCall {
+        set: FileSetId,
+        name: BString,
+        target: BString,
+        file_set: BString,
+        output_set: BString,
+        files: Vec<BString>,
+        file_set_configurators: Vec<BString>,
+        source_configurators: Vec<BString>,
+    }
+    let calls = {
+        let mut cx = interp.cx();
+        let model: &ProjectModel = cx.project();
+        model
+            .targets()
+            .flat_map(|(_, target)| {
+                target.file_sets.iter().filter_map(move |&id| {
+                    let set = model.file_set(id)?;
+                    let name = set.props.get(b"_RCMAKE_RULE")?;
+                    let dir = model.file_set_rule_dir(id).unwrap_or(target.dir);
+                    let rule = model.custom_rule(dir, name)?;
+                    let list = |key: &[u8]| {
+                        rule.get(key)
+                            .map_or_else(Vec::new, |value| split(value, Empty::Drop))
+                    };
+                    let file_set_configurators = list(b"FILE_SET_CONFIGURATORS");
+                    let source_configurators = list(b"SOURCE_CONFIGURATORS");
+                    if file_set_configurators.is_empty() && source_configurators.is_empty() {
+                        return None;
+                    }
+                    let output_set = list(b"OUTPUT_FILE_SET")
+                        .into_iter()
+                        .next()
+                        .unwrap_or_default();
+                    use rcmake_base::ByteSlice;
+                    let output_set = output_set
+                        .replace(b"<RULE>", name)
+                        .replace(b"<TARGET>", &target.name)
+                        .replace(b"<FILE_SET>", &set.name)
+                        .into();
+                    Some(RuleCall {
+                        set: id,
+                        name: name.clone(),
+                        target: target.name.clone(),
+                        file_set: set.name.clone(),
+                        output_set,
+                        files: set.files.iter().map(|file| file.value.clone()).collect(),
+                        file_set_configurators,
+                        source_configurators,
+                    })
+                })
+            })
+            .collect::<Vec<_>>()
+    };
+    for call in calls {
+        let mut cx = interp.cx();
+        let mut invoke =
+            |commands: &[BString], source: Option<&BString>| -> Result<BString, Failure> {
+                let mut args = vec![
+                    call.name.clone(),
+                    call.target.clone(),
+                    call.file_set.clone(),
+                    call.output_set.clone(),
+                ];
+                args.extend(source.cloned());
+                let variable = b"_rcmake_custom_rule_patterns";
+                args.push(variable.as_slice().into());
+                let args = args
+                    .into_iter()
+                    .map(|text| rcmake_syntax::Argument {
+                        kind: rcmake_syntax::ArgKind::Bracket,
+                        text,
+                        line: 0,
+                        span: 0..0,
+                    })
+                    .collect::<Vec<_>>();
+                cx.with_variable_scope(|cx| {
+                    cx.set_var(variable, BString::default());
+                    cx.global().props.set(
+                        b"\0RCMAKE_IN_RULE_CONFIGURATOR".as_slice().into(),
+                        "1".into(),
+                    );
+                    let result = commands.iter().try_for_each(|command| {
+                        let args = cx.expand_raw_args(&args)?;
+                        cx.call_command(command, args).map(|_| ())
+                    });
+                    cx.global().props.unset(b"\0RCMAKE_IN_RULE_CONFIGURATOR");
+                    result.map_err(|_| Failure::Reported)?;
+                    if cx.diag_engine().error_occurred() {
+                        return Err(Failure::Reported);
+                    }
+                    Ok(cx.var_or_empty(variable))
+                })
+            };
+        let file_set = invoke(&call.file_set_configurators, None)?;
+        let sources = call
+            .files
+            .iter()
+            .filter(|_| !call.source_configurators.is_empty())
+            .map(|file| invoke(&call.source_configurators, Some(file)).map(|value| (file, value)))
+            .collect::<Result<Vec<_>, _>>()?;
+        if let Some(set) = cx.project().file_set_mut(call.set) {
+            if !file_set.is_empty() {
+                set.props
+                    .set("_RCMAKE_RULE_FILE_SET_PATTERNS".into(), file_set);
+            }
+            for (source, value) in sources {
+                if !value.is_empty() {
+                    set.props.set(
+                        [b"_RCMAKE_RULE_PATTERNS_".as_slice(), source]
+                            .concat()
+                            .into(),
+                        value,
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn write_instrumentation_content(
@@ -238,9 +397,9 @@ fn write_common(
     } else {
         configuration.as_slice()
     };
-    let (mut manifest, export_files) = write_exports(result, bin, prefix, host)?;
     let supplementary =
         common::write_supplementary_outputs(interp.cx().project(), result, host, bin)?;
+    let (mut manifest, export_files) = write_exports(result, bin, prefix, host)?;
     manifest.actions.extend(supplementary.actions);
     if interp.cx().var_is_on(b"CMAKE_SKIP_INSTALL_RULES") {
         if !manifest.actions.is_empty() {
@@ -285,7 +444,7 @@ fn write_common(
         let content = common::configure_log::render(&result.metadata)?;
         host.create_dir_all(&cmake_files)
             .map_err(|err| GenError::Write {
-                path: path::from_native(&cmake_files),
+                path: rcmake_base::path_lex::cmake_style(&path::from_native(&cmake_files)),
                 message: err.to_string().into(),
             })?;
         common::write_if_changed(host, &log_path, &content)?;

@@ -345,6 +345,17 @@ pub fn object_path(
     config: &ConfigId,
     source: &[u8],
 ) -> BString {
+    let name = object_name(model, target, source, short_object_paths(model), None);
+    join(&object_dir(model, target, config), &name)
+}
+
+fn object_name(
+    model: &ProjectModel,
+    target: &Target,
+    source: &[u8],
+    short: bool,
+    custom_install_name: Option<&[u8]>,
+) -> BString {
     let dir = model.dir(target.dir);
     let root = model.dir(DirId::ROOT);
     let absolute = Lexical::new(&join(&dir.source_dir, source)).normalize();
@@ -372,7 +383,10 @@ pub fn object_path(
         .flatten()
         .min_by_key(rank);
 
-    let suffix = source_language(model, target, source)
+    let suffix = crate::sources::properties(dir, &source.into())
+        .get(b"LANGUAGE")
+        .cloned()
+        .or_else(|| source_language(model, target, source))
         .and_then(|lang| {
             definition(
                 model,
@@ -381,11 +395,22 @@ pub fn object_path(
             )
         })
         .map_or(b".o".as_slice(), |v| v.as_slice());
-    if short_object_paths(model) {
+    if let Some(name) = custom_install_name.filter(|name| !name.is_empty()) {
+        return [name, suffix].concat().into();
+    }
+    if short {
         let hash_input = relative.unwrap_or_else(|| absolute.normalize());
         let hash = sha3_prefix(&hash_input, 8);
-        let name = [hash.as_bytes(), suffix].concat();
-        return join(&object_dir(model, target, config), &name);
+        return [hash.as_bytes(), suffix].concat().into();
+    }
+
+    if matches!(
+        model.generator,
+        Some(GeneratorKind::UnixMakefiles | GeneratorKind::Ninja | GeneratorKind::NinjaMultiConfig)
+    ) && let Ok(name) = crate::sources::custom_object_name(model, target.dir, source)
+        && !name.is_empty()
+    {
+        return [name.as_slice(), suffix].concat().into();
     }
 
     let name = relative.unwrap_or_else(|| absolute.normalize());
@@ -396,7 +421,37 @@ pub fn object_path(
         }
     }
     safe.extend_from_slice(suffix);
-    join(&object_dir(model, target, config), &safe)
+    safe.into()
+}
+
+pub(super) fn object_install_directory(
+    model: &ProjectModel,
+    target: &Target,
+    config: &ConfigId,
+    dest: &[u8],
+) -> BString {
+    if target_property(model, target, b"INSTALL_OBJECT_ONLY_USE_DESTINATION")
+        .is_some_and(|value| truth::is_on(value))
+    {
+        return dest.into();
+    }
+    let component = if config.0.is_empty() {
+        BString::from("objects")
+    } else {
+        [b"objects-", config.0.as_slice()].concat().into()
+    };
+    join(&join(dest, &component), &target.name)
+}
+
+pub(super) fn install_object_name(
+    model: &ProjectModel,
+    target: &Target,
+    source: &[u8],
+    custom_name: &[u8],
+) -> BString {
+    let short = target_property(model, target, b"INSTALL_OBJECT_NAME_STRATEGY")
+        .is_some_and(|strategy| strategy == b"SHORT");
+    object_name(model, target, source, short, Some(custom_name))
 }
 
 /// Choose a link language from the languages of the target's translation units.

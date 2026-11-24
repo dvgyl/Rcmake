@@ -61,6 +61,8 @@ pub struct ConfigureMetadata {
     pub cmake_command: Option<BString>,
     /// Executable path from `CMAKE_CTEST_COMMAND`.
     pub ctest_command: Option<BString>,
+    /// Output command step indices that need the GNU Make jobserver.
+    pub jobserver_steps: IndexSet<usize>,
 }
 
 /// Compiler facts of one language (`toolchains-v1`).

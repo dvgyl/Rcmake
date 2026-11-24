@@ -230,13 +230,18 @@ fn install(cx: &mut Cx<'_>, input: &[ExpandedArg]) -> CmdResult {
     {
         options.component = Some(default_component(cx));
     }
-    for path in options
+    let destinations = extra_destinations
+        .iter()
+        .filter_map(|(_, path, bmi)| (!bmi).then_some(path));
+    let absolute_destinations = options
         .destination
         .iter()
-        .chain(extra_destinations.iter().map(|(_, path)| path))
+        .chain(destinations)
         .filter(|path| Lexical::new(path).absolute())
-    {
-        warn_absolute_destination(cx, path);
+        .cloned()
+        .collect::<Vec<_>>();
+    for path in absolute_destinations {
+        warn_absolute_destination(cx, &path);
     }
     let members = match &kind {
         InstallKind::Targets {
@@ -255,13 +260,20 @@ fn install(cx: &mut Cx<'_>, input: &[ExpandedArg]) -> CmdResult {
     });
     let section = format!("_RCMAKE_INSTALL_{index}");
     record_args(cx, &section, &input);
+    let absolute_action = cx
+        .diag_state()
+        .get(DiagCategory::InstallAbsoluteDestination);
+    cx.global().props.set(
+        format!("{section}_ABSOLUTE_ACTION").into(),
+        absolute_action.as_str().into(),
+    );
     let message = cx.var_or_empty(b"CMAKE_INSTALL_MESSAGE");
     if matches!(message.as_slice(), b"ALWAYS" | b"LAZY" | b"NEVER") {
         cx.global()
             .props
             .set(format!("{section}_MESSAGE").into(), message);
     }
-    for (argument, path) in extra_destinations {
+    for (argument, path, _) in extra_destinations {
         cx.global()
             .props
             .set(format!("{section}_ARG{argument}").into(), path);
@@ -305,7 +317,7 @@ fn targets(
     cx: &mut Cx<'_>,
     args: &mut Args<'_>,
     options: &mut InstallOptions,
-    destinations: &mut Vec<(usize, BString)>,
+    destinations: &mut Vec<(usize, BString, bool)>,
 ) -> Result<InstallKind> {
     let argument_count = args.len() + 1;
     let targets = target_ids(cx, values(args), b"TARGETS")?;
@@ -371,7 +383,8 @@ fn targets(
                 destinations.extend(
                     destination_argument
                         .take()
-                        .zip(artifact_options.destination.take()),
+                        .zip(artifact_options.destination.take())
+                        .map(|(index, path)| (index, path, group == Some(b"CXX_MODULES_BMI"))),
                 );
                 artifact_options = InstallOptions::default();
                 group = Some(key);
@@ -400,7 +413,11 @@ fn targets(
             }
         }
     }
-    destinations.extend(destination_argument.zip(artifact_options.destination));
+    destinations.extend(
+        destination_argument
+            .zip(artifact_options.destination)
+            .map(|(index, path)| (index, path, group == Some(b"CXX_MODULES_BMI"))),
+    );
     if export.is_some() {
         require_exported_file_sets(cx, &targets, &file_sets)?;
     }

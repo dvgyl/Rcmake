@@ -27,6 +27,7 @@ pub(super) struct Commands<'a> {
     cross: Option<CrossConfiguration<'a>>,
     outputs: IndexMap<BString, usize>,
     inputs: Vec<Vec<BString>>,
+    pub(super) codegen: IndexSet<usize>,
     dependencies: Vec<IndexSet<TargetId>>,
 }
 
@@ -47,6 +48,7 @@ impl<'a> Commands<'a> {
             cross,
             outputs: IndexMap::new(),
             inputs: Vec::new(),
+            codegen: IndexSet::new(),
             dependencies: Vec::new(),
         };
         for (id, command) in model
@@ -55,6 +57,9 @@ impl<'a> Commands<'a> {
         {
             let (step, dependencies) = commands.lower_command(id, command, usage)?;
             let index = steps.len();
+            if command.codegen {
+                commands.codegen.insert(index);
+            }
             for path in step.outputs.iter().chain(&step.byproducts) {
                 commands.outputs.entry(path.clone()).or_insert(index);
             }
