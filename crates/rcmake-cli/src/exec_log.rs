@@ -35,7 +35,9 @@ pub(crate) struct ExecLogEntry<'a> {
 
 /// Append a JSON line when `RCMAKE_EXEC_LOG` names a log file.
 ///
-/// Use private files. Reject symbolic links at the log and lock paths.
+/// Reject symbolic links at the log and lock paths.
+/// On Unix, restrict access to the file owner.
+/// On Windows, select a trusted directory and restrict access to both files.
 /// A logging error leaves the tool's output and exit code intact.
 pub(crate) fn append_exec_log(host: &dyn Host, entry: &ExecLogEntry<'_>) {
     let Some(path) = host
@@ -48,23 +50,31 @@ pub(crate) fn append_exec_log(host: &dyn Host, entry: &ExecLogEntry<'_>) {
     let _ = append_at_path(host, &requested, &json_line(entry));
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 fn append_at_path(_host: &dyn Host, _path: &Path, _line: &[u8]) -> std::io::Result<()> {
     // The native log needs private creation and a no-follow open in one operation.
     Err(std::io::ErrorKind::Unsupported.into())
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use private_log::append_at_path;
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 mod private_log {
-    use std::fs::{File, OpenOptions, Permissions, TryLockError};
-    use std::io::{self, ErrorKind, Write as _};
-    use std::os::unix::fs::{
-        FileExt as _, MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _,
+    #[cfg(unix)]
+    use std::fs::Permissions;
+    use std::fs::{File, OpenOptions, TryLockError};
+    use std::io::{self, ErrorKind, Read as _, Seek as _, SeekFrom, Write as _};
+    #[cfg(unix)]
+    use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
+    #[cfg(windows)]
+    use std::os::windows::{
+        ffi::OsStrExt as _,
+        fs::{MetadataExt as _, OpenOptionsExt as _},
     };
 
+    #[cfg(windows)]
+    use rcmake_host::Follow;
     use rcmake_json::{ReadOptions, parse};
 
     use super::*;
@@ -83,7 +93,7 @@ mod private_log {
         let path = parent.join(name);
         let mut lock_name = name.to_os_string();
         lock_name.push(".lock");
-        let lock = open_private(&parent.join(lock_name), false)?;
+        let lock = open_log_file(host, &parent.join(lock_name), false)?;
         let start = host.monotonic();
         loop {
             match lock.try_lock() {
@@ -98,15 +108,18 @@ mod private_log {
                 Err(TryLockError::Error(error)) => return Err(error),
             }
         }
-        let mut file = open_private(&path, true)?;
+        let mut file = open_log_file(host, &path, true)?;
         let end = file.metadata()?.len();
-        if end != 0 && read_exact(&file, end - 1, 1)? != b"\n" {
+        if end != 0 && read_exact(&mut file, end - 1, 1)? != b"\n" {
             repair_tail(&mut file, end)?;
         }
+        #[cfg(windows)]
+        file.seek(SeekFrom::End(0))?;
         file.write_all(line)
     }
 
-    fn open_private(path: &Path, append: bool) -> io::Result<File> {
+    #[cfg(unix)]
+    fn open_log_file(_host: &dyn Host, path: &Path, append: bool) -> io::Result<File> {
         let file = OpenOptions::new()
             .read(true)
             .write(!append)
@@ -128,6 +141,7 @@ mod private_log {
         Ok(file)
     }
 
+    #[cfg(unix)]
     fn open_flags() -> io::Result<i32> {
         // O_NOFOLLOW and O_NONBLOCK from the native fcntl ABI.
         if cfg!(any(
@@ -147,6 +161,60 @@ mod private_log {
         } else {
             Err(ErrorKind::Unsupported.into())
         }
+    }
+
+    #[cfg(windows)]
+    fn open_log_file(host: &dyn Host, path: &Path, _append: bool) -> io::Result<File> {
+        use std::fs::symlink_metadata;
+
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        const FILE_SHARE_READ: u32 = 0x1;
+        const FILE_SHARE_WRITE: u32 = 0x2;
+
+        // Reject alternate data streams.
+        let name = path.file_name().ok_or(ErrorKind::InvalidInput)?;
+        if name.encode_wide().any(|unit| unit == u16::from(b':')) {
+            return Err(ErrorKind::InvalidInput.into());
+        }
+        match symlink_metadata(path) {
+            Ok(metadata) => check_windows_file(&metadata)?,
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+
+        // The flag prevents the open from following a reparse point added after the path check.
+        // New files inherit directory access controls. The standard library cannot set or
+        // verify those controls, or open the file relative to a directory handle.
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)?;
+        check_windows_file(&file.metadata()?)?;
+        // Omit FILE_SHARE_DELETE so Host can check the hard link count while the file is open.
+        let metadata = host
+            .metadata(path, Follow::No)
+            .map_err(|error| io::Error::from(error.kind))?;
+        if metadata.nlink != 1 {
+            return Err(ErrorKind::InvalidInput.into());
+        }
+        Ok(file)
+    }
+
+    #[cfg(windows)]
+    fn check_windows_file(metadata: &std::fs::Metadata) -> io::Result<()> {
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+
+        if metadata.file_type().is_symlink()
+            || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+            || !metadata.is_file()
+        {
+            return Err(ErrorKind::InvalidInput.into());
+        }
+        Ok(())
     }
 
     fn repair_tail(file: &mut File, end: u64) -> io::Result<()> {
@@ -176,7 +244,7 @@ mod private_log {
         }
     }
 
-    fn record_start(file: &File, mut end: u64) -> io::Result<u64> {
+    fn record_start(file: &mut File, mut end: u64) -> io::Result<u64> {
         while end > 0 {
             let offset = end.saturating_sub(REPAIR_CHUNK_BYTES);
             let chunk = read_exact(file, offset, end - offset)?;
@@ -188,10 +256,11 @@ mod private_log {
         Ok(0)
     }
 
-    fn read_exact(file: &File, offset: u64, len: u64) -> io::Result<Vec<u8>> {
+    fn read_exact(file: &mut File, offset: u64, len: u64) -> io::Result<Vec<u8>> {
         let len = usize::try_from(len).map_err(|_| ErrorKind::InvalidInput)?;
         let mut bytes = vec![0; len];
-        file.read_exact_at(&mut bytes, offset)?;
+        file.seek(SeekFrom::Start(offset))?;
+        file.read_exact(&mut bytes)?;
         Ok(bytes)
     }
 }
@@ -263,7 +332,7 @@ fn json_text(bytes: &[u8]) -> Value {
     Value::string(String::from_utf8_lossy(bytes).as_bytes())
 }
 
-#[cfg(all(test, unix))]
+#[cfg(all(test, any(unix, windows)))]
 mod tests {
     use rcmake_host::{Follow, HostResult, NativeHost, ReadRange, WriteMode};
     use rcmake_json::{ReadOptions, parse};
@@ -294,7 +363,7 @@ mod tests {
     }
 
     #[test]
-    fn log_and_lock_are_private_and_reject_symlinks() -> HostResult<()> {
+    fn log_and_lock_reject_symlinks_and_allow_regular_files() -> HostResult<()> {
         let host = NativeHost::new()?;
         let pid = host.system().pid;
         let now = host.now();
@@ -309,6 +378,8 @@ mod tests {
     }
 
     fn check_log(host: &dyn Host, root: &Path) -> HostResult<()> {
+        const ERROR_PRIVILEGE_NOT_HELD: i32 = 1314;
+
         let path = root.join("calls.jsonl");
         let lock = root.join("calls.jsonl.lock");
         let target = root.join("target");
@@ -326,16 +397,23 @@ mod tests {
         let log_name = from_native(&path);
         host.env_set(b"RCMAKE_EXEC_LOG", Some(&log_name));
         host.write(&target, b"unchanged", WriteMode::CreateNew)?;
-        host.symlink(&target, &lock)?;
-        append_exec_log(host, &entry);
-        assert!(host.metadata(&path, Follow::No).is_err());
-        host.remove_file(&lock)?;
-        host.symlink(&target, &path)?;
-        append_exec_log(host, &entry);
-        assert_eq!(host.read(&target, range)?, b"unchanged");
-        host.remove_file(&path)?;
+        match host.symlink(&target, &lock) {
+            Ok(()) => {
+                append_exec_log(host, &entry);
+                assert!(host.metadata(&path, Follow::No).is_err());
+                host.remove_file(&lock)?;
+                host.symlink(&target, &path)?;
+                append_exec_log(host, &entry);
+                assert_eq!(host.read(&target, range)?, b"unchanged");
+                host.remove_file(&path)?;
+            }
+            // Windows can require a privilege to create symbolic links.
+            Err(error) if cfg!(windows) && error.errno == Some(ERROR_PRIVILEGE_NOT_HELD) => {}
+            Err(error) => return Err(error),
+        }
 
         append_exec_log(host, &entry);
+        #[cfg(unix)]
         for private in [&path, &lock] {
             assert_eq!(host.metadata(private, Follow::No)?.mode & 0o7777, 0o600);
         }
