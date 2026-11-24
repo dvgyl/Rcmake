@@ -314,6 +314,9 @@ fn fixture(
                         group: r"Code\Client".into(),
                         generated: false,
                         excluded_configs: Vec::new(),
+                        file_set: None,
+                        package_location: None,
+                        compile: None,
                     },
                     IdeSource {
                         path: from_native(&bin.join("generated.cpp")),
@@ -323,6 +326,9 @@ fn fixture(
                         group: BString::default(),
                         generated: true,
                         excluded_configs: vec!["Release".into()],
+                        file_set: None,
+                        package_location: None,
+                        compile: None,
                     },
                     IdeSource {
                         path: "/source tree/main.hpp".into(),
@@ -330,6 +336,9 @@ fn fixture(
                         group: BString::default(),
                         generated: false,
                         excluded_configs: Vec::new(),
+                        file_set: None,
+                        package_location: None,
+                        compile: None,
                     },
                 ],
                 compile: vec![IdeCompileSettings {

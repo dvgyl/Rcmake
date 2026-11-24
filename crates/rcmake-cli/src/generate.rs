@@ -80,12 +80,13 @@ pub(crate) fn run(
     // An IDE generator writes its project files first, so that a generator that is not
     // implemented yet leaves no partial output.
     let ide_result = match kind {
-        GeneratorKind::Xcode => Some(rcmake_gen_xcode::generate(
-            &result,
-            interp.cx().project(),
-            host,
-            bin,
-        )),
+        GeneratorKind::Xcode => {
+            let generated = rcmake_gen_xcode::generate(&result, interp.cx().project(), host, bin);
+            if generated.is_ok() {
+                rcmake_gen_xcode::populate_guid_cache(&result, interp.cx().project(), host);
+            }
+            Some(generated)
+        }
         GeneratorKind::VisualStudio(version) => Some(rcmake_gen_vs::generate(
             version,
             &result,

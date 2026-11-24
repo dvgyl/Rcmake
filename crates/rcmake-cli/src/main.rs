@@ -13,7 +13,33 @@ use rcmake_host::{Host, NativeHost, Stream};
 /// debug builds) never overflows macOS's 8 MiB main thread stack.
 const WORKER_STACK_BYTES: usize = 64 * 1024 * 1024;
 
+fn install_panic_hook() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        if std::env::var_os("RUST_BACKTRACE").is_some_and(|v| !v.is_empty() && v != "0") {
+            default_hook(info);
+            return;
+        }
+        let message = info
+            .payload()
+            .downcast_ref::<&str>()
+            .copied()
+            .or_else(|| info.payload().downcast_ref::<String>().map(String::as_str))
+            .unwrap_or("unexpected internal error");
+        let line = match info.location() {
+            Some(loc) => format!(
+                "rcmake: internal error: {message} ({}:{})\n",
+                loc.file(),
+                loc.line()
+            ),
+            None => format!("rcmake: internal error: {message}\n"),
+        };
+        let _ = std::io::Write::write_all(&mut std::io::stderr(), line.as_bytes());
+    }));
+}
+
 fn main() -> ExitCode {
+    install_panic_hook();
     let argv: Vec<_> = std::env::args_os()
         .map(|a| rcmake_host::path::from_native(Path::new(&a)))
         .collect();
