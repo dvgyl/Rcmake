@@ -376,6 +376,7 @@ fn native_make_builds_install_and_test_inputs_on_demand() {
                 working_directory: None,
                 command_expand_lists: false,
                 old_style: false,
+                policies: Default::default(),
                 props: Default::default(),
                 build_depends: vec![BT::new(input.into(), Default::default())],
             })

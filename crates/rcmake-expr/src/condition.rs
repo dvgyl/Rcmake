@@ -97,21 +97,28 @@ fn reduce(mut tokens: Vec<Token<'_>>, env: &mut dyn CondEnv) -> Result<bool, Con
         (op == b"NOT").then(|| !operand.truth(env))
     });
 
-    let mut tokens = tokens.into_iter();
-    let Some(mut left) = tokens.next() else {
-        return Ok(false);
-    };
-    while let Some(operator) = tokens.next() {
-        let Some(right) = tokens.next() else {
+    while tokens.len() > 1 {
+        let before = tokens.len();
+        let mut input = tokens.into_iter();
+        tokens = Vec::with_capacity(before);
+        while let Some(left) = input.next() {
+            let result = match input.as_slice() {
+                [op, right, ..] if op.keyword() == b"AND" => left.truth(env) & right.truth(env),
+                [op, right, ..] if op.keyword() == b"OR" => left.truth(env) | right.truth(env),
+                _ => {
+                    tokens.push(left);
+                    continue;
+                }
+            };
+            input.next();
+            input.next();
+            tokens.push(Token::Bool(result));
+        }
+        if tokens.len() == before {
             return Err(error("Unknown arguments specified"));
-        };
-        left = match operator.keyword() {
-            b"AND" => Token::Bool(left.truth(env) & right.truth(env)),
-            b"OR" => Token::Bool(left.truth(env) | right.truth(env)),
-            _ => return Err(error("Unknown arguments specified")),
-        };
+        }
     }
-    Ok(left.truth(env))
+    Ok(tokens.first().is_some_and(|token| token.truth(env)))
 }
 
 fn prefix_pass<'a>(

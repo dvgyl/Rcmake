@@ -117,6 +117,7 @@ pub(super) fn discover_tests(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult
         working_directory,
         command_expand_lists,
         old_style: false,
+        policies: Default::default(),
         props: Default::default(),
         build_depends: take(b"BUILD_DEPENDS")
             .into_iter()

@@ -669,6 +669,7 @@ fn prep_targets_preserve_user_outputs_and_select_dependencies()
         working_directory: None,
         command_expand_lists: false,
         old_style: false,
+        policies: Default::default(),
         props: Default::default(),
         build_depends: vec![],
         kind: TestKind::Single,

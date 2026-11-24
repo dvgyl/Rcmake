@@ -250,6 +250,8 @@ pub struct TestEntry {
     pub command_expand_lists: bool,
     /// `add_test(<name> <command>...)` (old signature, no generator expressions).
     pub old_style: bool,
+    /// Policy settings from the test declaration.
+    pub policies: rcmake_diag::PolicyMap,
     /// Test properties.
     pub props: PropertyMap,
     /// `BUILD_DEPENDS`: targets or files that must build before the test runs.

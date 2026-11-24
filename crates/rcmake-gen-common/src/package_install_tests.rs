@@ -197,6 +197,7 @@ fn fixture(source: &Path, build: &Path, configs: &[&str]) -> (ProjectModel, Gene
                 working_directory: None,
                 command_expand_lists: false,
                 old_style: false,
+                policies: Default::default(),
                 props: Default::default(),
                 build_depends: match name {
                     "discovery" => vec![BT::new(from_native(&source.join("code.c")), backtrace)],

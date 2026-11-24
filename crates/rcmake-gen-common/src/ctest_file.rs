@@ -2,10 +2,14 @@
 
 use std::collections::{BTreeSet, HashMap};
 
-use rcmake_base::{BString, ByteSlice, list, path_lex::Lexical};
+use rcmake_base::{BString, ByteSlice, list, path_lex::Lexical, truth};
+use rcmake_diag::{
+    DiagCategory, Diagnostic, Effect, Location, MessageKind, PolicyId, PolicyStatus, RenderOptions,
+    render as render_diagnostic,
+};
 use rcmake_genex::{ConfigId, EvalContext};
 use rcmake_host::{
-    Host,
+    Host, Stream,
     path::{from_native, to_native},
 };
 use rcmake_model::{
@@ -41,6 +45,9 @@ pub fn render_resolved_with_host(
     result: &GenerationResult,
     host: &dyn Host,
 ) -> Result<BString, GenError> {
+    if dir == DirId::ROOT {
+        warn_fixture_defaults(model, host);
+    }
     render_file(model, dir, Some(result), Some(host))
 }
 
@@ -103,7 +110,7 @@ fn render_file(
                 ..EvalContext::default()
             };
             let mut evaluate = |value: &[u8]| genex(&mut usage, test.dir, &context, value, None);
-            let mut resolved = resolve_test(test, lookup, |value| {
+            let mut resolved = resolve_test(test, |value| {
                 if test.is_discovery() {
                     evaluate(value)
                 } else {
@@ -113,6 +120,7 @@ fn render_file(
                     })
                 }
             })?;
+            resolve_test_program(model, &mut resolved, lookup, &mut evaluate, host)?;
             if let TestKind::Discover(spec) = &mut resolved.kind {
                 resolve_discovery(spec, &mut evaluate)?;
             }
@@ -151,6 +159,18 @@ fn render_file(
                     if let Some((target, file)) = lookup(&value) {
                         if !target.is_imported() {
                             dependencies.extend(file);
+                            if target.kind == TargetKind::ObjectLibrary
+                                && let Some(id) = model.find_target(test.dir, &value)
+                                && let Some(entry) = targets.get(&(config.0.as_slice(), id))
+                            {
+                                let root = Lexical::new(&model.dir(DirId::ROOT).binary_dir);
+                                dependencies.extend(
+                                    entry
+                                        .compile_units
+                                        .iter()
+                                        .map(|unit| root.append(&unit.object)),
+                                );
+                            }
                         }
                     } else {
                         let source = Lexical::new(&dir.source_dir).append(&value);
@@ -201,6 +221,11 @@ fn render_file(
         let path = path.strip_prefix(&binary_dir).unwrap_or(&path);
         out.extend_from_slice(b"subdirs(");
         test_argument(&mut out, &from_native(path));
+        out.extend_from_slice(b")\n");
+    }
+    if let Some(labels) = dir.props.get(b"LABELS") {
+        out.extend_from_slice(b"set_directory_properties(PROPERTIES LABELS ");
+        test_argument(&mut out, labels);
         out.extend_from_slice(b")\n");
     }
     Ok(out)
@@ -301,9 +326,8 @@ fn resolve_discovery(
     Ok(())
 }
 
-fn resolve_test<'a>(
+fn resolve_test(
     test: &TestEntry,
-    lookup: impl Fn(&[u8]) -> Option<(&'a Target, Option<BString>)>,
     mut resolve: impl FnMut(&[u8]) -> Result<BString, GenError>,
 ) -> Result<TestEntry, GenError> {
     let mut resolved = test.clone();
@@ -313,16 +337,10 @@ fn resolve_test<'a>(
         if test.command_expand_lists {
             resolved
                 .command
-                .extend(list::split(&value, list::Empty::Drop));
+                .extend(list::split(&value, list::Empty::Keep));
         } else {
             resolved.command.push(value);
         }
-    }
-    if let Some(program) = resolved.command.first_mut()
-        && let Some((target, Some(file))) = lookup(program)
-        && target.kind == TargetKind::Executable
-    {
-        *program = file;
     }
     for name in test.props.names() {
         if name != b"_BACKTRACE_TRIPLES"
@@ -337,6 +355,153 @@ fn resolve_test<'a>(
         resolved.working_directory = Some(resolve(value)?);
     }
     Ok(resolved)
+}
+
+fn resolve_test_program<'a>(
+    model: &ProjectModel,
+    test: &mut TestEntry,
+    lookup: impl Fn(&[u8]) -> Option<(&'a Target, Option<BString>)>,
+    mut evaluate: impl FnMut(&[u8]) -> Result<BString, GenError>,
+    host: Option<&dyn Host>,
+) -> Result<(), GenError> {
+    let Some(program) = test.command.first_mut() else {
+        test.command.push(BString::default());
+        return Ok(());
+    };
+    let Some((target, Some(file))) =
+        lookup(program).filter(|(target, _)| target.kind == TargetKind::Executable)
+    else {
+        return Ok(());
+    };
+    *program = file;
+    let emulator_enabled = test.policies.get(PolicyId::new(158)) != PolicyStatus::New
+        || model
+            .definition(test.dir, b"CMAKE_CROSSCOMPILING")
+            .is_some_and(|value| truth::is_on(value));
+    let policy = PolicyId::new(178);
+    let status = test.policies.get(policy);
+    let keep_empty = if status == PolicyStatus::New {
+        list::Empty::Keep
+    } else {
+        list::Empty::Drop
+    };
+    let mut prefix = Vec::new();
+    for property in [b"TEST_LAUNCHER".as_slice(), b"CROSSCOMPILING_EMULATOR"] {
+        if property == b"CROSSCOMPILING_EMULATOR" && !emulator_enabled {
+            continue;
+        }
+        if let Some(value) = target.props.get(property).filter(|value| !value.is_empty()) {
+            let folded = evaluate(value)?;
+            let words = list::split(&folded, keep_empty);
+            if words.first().is_some_and(|word| !word.is_empty()) {
+                if status == PolicyStatus::Warn
+                    && let Some(host) = host
+                    && list::split(&folded, list::Empty::Keep) != words
+                {
+                    let file =
+                        Lexical::new(&model.dir(test.dir).source_dir).append(b"CMakeLists.txt");
+                    warn_policy(
+                        model,
+                        host,
+                        policy,
+                        Location::FileLine {
+                            file: file.as_slice().into(),
+                            line: 0,
+                        },
+                        &format!(
+                            "The {} property of target '{}' contains empty list items. Those empty items are being silently discarded to preserve backward compatibility.",
+                            BString::from(property),
+                            target.name
+                        ),
+                        "",
+                    );
+                }
+                prefix.extend(words);
+            }
+        }
+    }
+    test.command.splice(0..0, prefix);
+    Ok(())
+}
+
+fn fixture_default_applies(test: &TestEntry) -> bool {
+    !test.is_discovery()
+        && test.props.get(b"FIXTURE_REPEAT_MODE").is_none()
+        && (test.props.get(b"FIXTURES_SETUP").is_some()
+            || test.props.get(b"FIXTURES_CLEANUP").is_some())
+}
+
+fn warn_fixture_defaults(model: &ProjectModel, host: &dyn Host) {
+    let policy = PolicyId::new(224);
+    let tests: BTreeSet<_> = model
+        .dirs()
+        .filter(|(dir, _)| {
+            model
+                .definition(*dir, b"CMAKE_POLICY_WARNING_CMP0224")
+                .is_some_and(|value| truth::is_on(value))
+        })
+        .flat_map(|(dir, _)| model.dir_tests(dir))
+        .map(|(_, test)| test)
+        .filter(|test| {
+            fixture_default_applies(test) && test.policies.get(policy) == PolicyStatus::Warn
+        })
+        .map(|test| test.name.to_string())
+        .collect();
+    if !tests.is_empty() {
+        let names = tests.into_iter().collect::<Vec<_>>().join("\n ");
+        warn_policy(
+            model,
+            host,
+            policy,
+            Location::None,
+            "",
+            &format!(
+                "For compatibility with older versions of CMake, the fixtures of the following tests will use EACH_TEST_SEPARATELY mode:\n {names}"
+            ),
+        );
+    }
+}
+
+fn warn_policy(
+    model: &ProjectModel,
+    host: &dyn Host,
+    id: PolicyId,
+    location: Location,
+    preface: &str,
+    postface: &str,
+) {
+    if model
+        .definition(DirId::ROOT, b"CMAKE_SUPPRESS_DEVELOPER_WARNINGS")
+        .is_some_and(|value| truth::is_on(value))
+    {
+        return;
+    }
+    let summary = id.info().map_or("", |info| info.summary).replace("``", "");
+    let policy = format!(
+        "Policy {id} is not set: {summary}  Run \"cmake --help-policy {id}\" for policy details.  Use the cmake_policy command to set the policy and suppress this warning."
+    );
+    let parts = [preface, &policy, postface]
+        .into_iter()
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    let diagnostic = Diagnostic {
+        kind: MessageKind::AuthorWarning,
+        effect: Effect::None,
+        category: Some(DiagCategory::Policy),
+        policy: Some(id),
+        location,
+        body: parts.join("\n").into(),
+    };
+    host.write_out(
+        Stream::Stderr,
+        &render_diagnostic(
+            &diagnostic,
+            &RenderOptions {
+                relative_base: Some(model.dir(DirId::ROOT).source_dir.clone()),
+                ..Default::default()
+            },
+        ),
+    );
 }
 
 fn resolve_argument<'a>(
@@ -471,6 +636,9 @@ fn render_test(out: &mut BString, test: &TestEntry, indent: &[u8]) {
         }
     }
 
+    if test.policies.get(PolicyId::new(224)) == PolicyStatus::New && fixture_default_applies(test) {
+        out.extend_from_slice(b" _CMAKE_DEFAULT_FIXTURE_REPEAT_MODE AROUND_EACH_REPEAT");
+    }
     out.extend_from_slice(b" _BACKTRACE_TRIPLES ");
     test_argument(out, &backtrace_triples(test));
     out.extend_from_slice(b")\n");
@@ -759,6 +927,7 @@ mod tests {
             working_directory: None,
             command_expand_lists: false,
             old_style: false,
+            policies: Default::default(),
             props: Default::default(),
             build_depends: Vec::new(),
             kind: rcmake_model::TestKind::Single,

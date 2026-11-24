@@ -1,4 +1,5 @@
 use rcmake_base::BString;
+use rcmake_diag::{PolicyId, PolicyStatus};
 use rcmake_eval::{CmdError, CmdFlags, CmdResult, Cx, Flow, Registry};
 use rcmake_expr::ExpandedArg;
 use rcmake_model::{BT, PropScope, TestEntry};
@@ -48,12 +49,22 @@ fn add_test(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
         working_directory: None,
         command_expand_lists: false,
         old_style,
+        policies: *cx.policies_mut(),
         props: Default::default(),
         build_depends: Vec::new(),
         kind: rcmake_model::TestKind::Single,
     };
     if old_style {
-        test.command.extend(args.iter().copied().map(BString::from));
+        let end = args
+            .iter()
+            .skip(1)
+            .position(|arg| *arg == b"__CMP0178")
+            .map_or(args.len(), |index| index + 1);
+        if end != args.len() {
+            test_launcher_policy(&mut test, args.get(end + 1).copied())?;
+        }
+        test.command
+            .extend(args.iter().take(end).copied().map(BString::from));
     } else {
         parse_test_options(&mut test, args)?;
     }
@@ -95,6 +106,7 @@ fn parse_test_options(test: &mut TestEntry, mut args: &[&[u8]]) -> Result<(), Cm
                                 | b"WORKING_DIRECTORY"
                                 | b"COMMAND_EXPAND_LISTS"
                                 | b"BUILD_DEPENDS"
+                                | b"__CMP0178"
                         )
                     })
                     .unwrap_or(args.len());
@@ -140,6 +152,10 @@ fn parse_test_options(test: &mut TestEntry, mut args: &[&[u8]]) -> Result<(), Cm
                 args = rest;
             }
             b"COMMAND_EXPAND_LISTS" => test.command_expand_lists = true,
+            b"__CMP0178" => {
+                test_launcher_policy(test, args.first().copied())?;
+                args = args.get(1..).unwrap_or_default();
+            }
             _ => {
                 return Err(CmdError::status(
                     [b"given unknown argument:\n  ".as_slice(), option].concat(),
@@ -151,6 +167,18 @@ fn parse_test_options(test: &mut TestEntry, mut args: &[&[u8]]) -> Result<(), Cm
         return Err(CmdError::status("must be given non-empty COMMAND."));
     }
     Ok(())
+}
+
+fn test_launcher_policy(test: &mut TestEntry, value: Option<&[u8]>) -> Result<(), CmdError> {
+    let policy = match value {
+        Some(b"NEW") => PolicyStatus::New,
+        Some(b"OLD") => PolicyStatus::Old,
+        Some(_) => PolicyStatus::Warn,
+        None => return Err(CmdError::status("__CMP0178 keyword missing value")),
+    };
+    test.policies
+        .set(PolicyId::new(178), policy)
+        .map_err(|error| CmdError::status(error.to_string()))
 }
 
 fn set_tests_properties(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
