@@ -308,7 +308,7 @@ impl Evaluator<'_> {
             [property] => {
                 self.flags.head_sensitive = true;
                 let target = call.ctx.head.ok_or_else(|| call.error(
-                    "$<TARGET_PROPERTY:prop> may only be used with binary targets. It may not be used with add_custom_command or add_custom_target. Specify the target name $<TARGET_PROPERTY:tgt,prop>.",
+                    "$<TARGET_PROPERTY:prop> may only be used with binary targets. It may not be used with add_custom_command or add_custom_target. Specify the target to read a property from using the $<TARGET_PROPERTY:tgt,prop> signature instead.",
                 ))?;
                 (target, property)
             }

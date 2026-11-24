@@ -415,10 +415,7 @@ fn records_sources_and_file_sets() -> TestResult {
         0,
     )?;
     for (name, value) in [
-        (
-            "sources",
-            "lib.c;/work/src/src.c;$<1:unchanged>;/work/src/private.c",
-        ),
+        ("sources", "lib.c;src.c;$<1:unchanged>;private.c"),
         ("api_src", "/work/src/src.c;$<1:unchanged>"),
         (
             "api_inc",

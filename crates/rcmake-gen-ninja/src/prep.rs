@@ -38,11 +38,11 @@ impl PrepTargets {
             if let Some(model) = model {
                 collect_tests(graph, model, &mut targets)?;
             }
-            let all = BString::from("test_prep/all");
+            let all = graph.node(b"test_prep/all");
             if available(graph, &all) {
                 let tests = targets
                     .keys()
-                    .filter(|name| name.starts_with(b"test_prep/"))
+                    .filter(|name| name.starts_with(&graph.node(b"test_prep/")))
                     .map(|name| qualified(name, graph.config))
                     .collect();
                 targets.insert(all, tests);

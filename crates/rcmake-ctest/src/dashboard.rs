@@ -10,6 +10,7 @@ use rcmake_presets::{EnvSnapshot, PresetKind};
 use crate::cli::Invocation;
 use crate::dart::{self, Configuration, Model, Tag};
 
+pub(crate) mod instrumentation_xml;
 pub(crate) mod submit;
 mod update;
 
@@ -207,7 +208,14 @@ pub(crate) fn run(host: &dyn Host, invocation: &Invocation) -> Result<Option<i32
         .join("Testing")
         .join(tag.stamp())
         .join("Configure.xml");
-    write_configure_report(host, &file, &command, &output, code)?;
+    write_configure_report(
+        host,
+        &file,
+        &command,
+        &output,
+        code,
+        &config.labels_for_subprojects,
+    )?;
     Ok(Some(if code == 0 { 0 } else { 2 }))
 }
 
@@ -240,6 +248,7 @@ pub(crate) fn write_configure_report(
     command: &rcmake_host::CommandSpec,
     output: &rcmake_host::RunOutput,
     code: i32,
+    labels: &[u8],
 ) -> Result<(), String> {
     use crate::junit::escape;
     use std::fmt::Write as _;
@@ -254,8 +263,17 @@ pub(crate) fn write_configure_report(
     let stdout = escape(&output.stdout, false);
     let stderr = escape(&output.stderr, false);
     let command = escape(line.as_bytes(), false);
+    let build = file.ancestors().nth(3);
+    let instrumentation = build
+        .and_then(|build| {
+            instrumentation_xml::Instrumentation::load(host, build)
+                .map(|query| query.configure(host, build, 0))
+        })
+        .unwrap_or_default();
+    let mut subprojects = String::new();
+    dart::write_subprojects(&mut subprojects, labels);
     let xml = format!(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Site><Configure>\n<ConfigureCommand>{command}</ConfigureCommand>\n<Log>{stdout}{stderr}</Log>\n<ConfigureStatus>{code}</ConfigureStatus>\n</Configure></Site>\n"
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Site>\n{subprojects}<Configure>\n<ConfigureCommand>{command}</ConfigureCommand>\n<Log>{stdout}{stderr}</Log>\n<ConfigureStatus>{code}</ConfigureStatus>\n{instrumentation}</Configure></Site>\n"
     );
     crate::junit::write_file(host, file, xml.as_bytes()).map_err(|error| error.to_string())
 }

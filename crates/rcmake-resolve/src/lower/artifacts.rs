@@ -124,7 +124,12 @@ pub fn compute_artifacts(model: &ProjectModel, target: &Target, config: &ConfigI
         .unwrap_or(&target.name);
     let postfix_key = [&config.0.to_ascii_uppercase()[..], b"_POSTFIX"].concat();
     let postfix = if !config.0.is_empty() {
-        target_property(model, target, &postfix_key).map_or(b"".as_slice(), |v| v.as_slice())
+        let postfix = if target.kind == TargetKind::Executable {
+            target.props.get(&postfix_key)
+        } else {
+            target_property(model, target, &postfix_key)
+        };
+        postfix.map_or(b"".as_slice(), |value| value.as_slice())
     } else {
         b""
     };
@@ -395,13 +400,13 @@ fn object_name(
             )
         })
         .map_or(b".o".as_slice(), |v| v.as_slice());
-    if let Some(name) = custom_install_name.filter(|name| !name.is_empty()) {
-        return [name, suffix].concat().into();
-    }
     if short {
         let hash_input = relative.unwrap_or_else(|| absolute.normalize());
         let hash = sha3_prefix(&hash_input, 8);
         return [hash.as_bytes(), suffix].concat().into();
+    }
+    if let Some(name) = custom_install_name.filter(|name| !name.is_empty()) {
+        return [name, suffix].concat().into();
     }
 
     if matches!(
@@ -443,14 +448,22 @@ pub(super) fn object_install_directory(
     join(&join(dest, &component), &target.name)
 }
 
+pub(crate) fn install_object_name_strategy<'a>(
+    model: &'a ProjectModel,
+    target: &'a Target,
+) -> Option<&'a BString> {
+    target_property(model, target, b"INSTALL_OBJECT_NAME_STRATEGY")
+        .filter(|value| !value.is_empty())
+}
+
 pub(super) fn install_object_name(
     model: &ProjectModel,
     target: &Target,
     source: &[u8],
     custom_name: &[u8],
 ) -> BString {
-    let short = target_property(model, target, b"INSTALL_OBJECT_NAME_STRATEGY")
-        .is_some_and(|strategy| strategy == b"SHORT");
+    let short =
+        install_object_name_strategy(model, target).is_some_and(|strategy| strategy == b"SHORT");
     object_name(model, target, source, short, Some(custom_name))
 }
 

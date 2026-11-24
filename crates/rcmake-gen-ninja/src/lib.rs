@@ -4,6 +4,9 @@
 
 mod build;
 mod graph;
+mod install;
+
+use install::emit_utilities;
 mod instrumented;
 mod modules;
 mod multi;
@@ -65,6 +68,11 @@ rule CUSTOM_COMMAND
 rule VERIFY_GLOBS
   command = $COMMAND
   description = Re-checking globbed directories...
+  restat = 1
+
+rule CMAKE_SYMLINK_LIBRARY
+  command = $COMMAND
+  description = $DESC
   restat = 1
 
 rule RERUN_CMAKE
@@ -164,6 +172,7 @@ fn generate_single(
     let mut ninja = graph.manifest();
     ninja.include(&graph.node(RULES_PATH.as_bytes()));
     graph.emit(&mut ninja, &programs.cmake, &module_flag, &exports);
+    graph.emit_entry_aliases(&mut ninja);
     graph.emit_assumed_sources(&mut ninja, model);
     prep.emit(&mut ninja, &graph);
     emit_regeneration(
@@ -185,7 +194,7 @@ fn generate_single(
         ninja.0.extend_from_slice(b"default all\n");
     }
 
-    write_rules(result, host, build_dir, uses_modules)?;
+    write_rules(result, host, build_dir, uses_modules, model)?;
     write_if_changed(host, &build_dir.join("build.ninja"), &ninja.0)
 }
 
@@ -311,7 +320,7 @@ fn generate_multi(
                 .map(|file| default.node(file)),
         );
     }
-    write_rules(result, host, build_dir, uses_modules)?;
+    write_rules(result, host, build_dir, uses_modules, model)?;
     let programs = Programs::new(result, host, build_dir, model);
     let rebuild = configure_command(result, build_dir, &programs.cmake, false);
     let regenerate = configure_command(result, build_dir, &programs.cmake, true);
@@ -480,6 +489,7 @@ fn write_rules(
     host: &dyn Host,
     build_dir: &Path,
     uses_modules: bool,
+    model: Option<&ProjectModel>,
 ) -> Result<(), GenError> {
     let mut ninja = if uses_modules {
         let mut rules = RULES.replacen(
@@ -494,44 +504,59 @@ fn write_rules(
     };
     instrumented::emit_rules(&mut ninja, result);
     let mut pools = BTreeMap::new();
-    if let Some(specs) = configuration_setting(host, build_dir, b"CMAKE_JOB_POOLS") {
-        for spec in specs.split(|&byte| byte == b';') {
-            let mut fields = spec.splitn(2, |&byte| byte == b'=');
-            let (Some(name), Some(depth)) = (fields.next(), fields.next()) else {
-                continue;
+    let specs = if let Some(model) = model {
+        model
+            .global
+            .props
+            .get(b"JOB_POOLS")
+            .or_else(|| model.definition(DirId::ROOT, b"CMAKE_JOB_POOLS"))
+            .cloned()
+    } else {
+        configuration_setting(host, build_dir, b"CMAKE_JOB_POOLS")
+    };
+    if let Some(specs) = specs {
+        for spec in rcmake_base::list::split(&specs, rcmake_base::list::Empty::Drop) {
+            let invalid = || {
+                generation_error(
+                    build_dir,
+                    format!("Invalid pool defined by property 'JOB_POOLS': {spec}"),
+                )
             };
-            if let Some(depth) = std::str::from_utf8(depth)
-                .ok()
-                .and_then(|value| value.parse::<u32>().ok())
-                && depth != 0
+            let mut fields = spec.splitn(2, |&byte| byte == b'=');
+            let name = fields
+                .next()
+                .filter(|name| {
+                    !name.is_empty()
+                        && name
+                            .iter()
+                            .all(|byte| byte.is_ascii_alphanumeric() || b"_.-".contains(byte))
+                })
+                .ok_or_else(invalid)?;
+            let depth = fields
+                .next()
+                .and_then(|depth| std::str::from_utf8(depth).ok())
+                .and_then(|depth| depth.parse::<u32>().ok())
+                .filter(|&depth| depth > 0)
+                .ok_or_else(invalid)?;
+            pools.insert(BString::from(name), depth);
+        }
+    }
+    if model.is_none() {
+        for step in result.graphs.iter().flat_map(|graph| &graph.steps) {
+            if let BuildStep::Custom(custom) = step
+                && !custom.uses_terminal
+                && let Some(name) = custom
+                    .job_pool
+                    .as_ref()
+                    .filter(|name| !name.is_empty() && *name != "console")
             {
-                pools.insert(BString::from(name), depth);
+                pools.entry(name.clone()).or_insert(1);
             }
         }
     }
-
-    // The graph contains pool names. Use one job per pool when no depth is available.
-    let mut selected = BTreeMap::new();
-    for step in result.graphs.iter().flat_map(|graph| &graph.steps) {
-        if let BuildStep::Custom(custom) = step
-            && !custom.uses_terminal
-            && let Some(name) = custom
-                .job_pool
-                .as_ref()
-                .filter(|name| !name.is_empty() && *name != "console")
-        {
-            selected.insert(name, pools.get(name).copied().unwrap_or(1));
-        }
-    }
-    for (name, depth) in selected {
-        if !name
-            .iter()
-            .all(|byte| byte.is_ascii_alphanumeric() || b"_.-".contains(byte))
-        {
-            return Err(generation_error(build_dir, "Invalid Ninja job pool name."));
-        }
+    for (name, depth) in pools {
         ninja.0.extend_from_slice(b"\npool ");
-        ninja.0.extend_from_slice(name);
+        ninja.0.extend_from_slice(&name);
         ninja.0.push(b'\n');
         ninja.binding(b"depth", depth.to_string().as_bytes());
     }
@@ -634,170 +659,6 @@ fn configure_command(
     command
 }
 
-fn emit_utilities(
-    ninja: &mut Ninja,
-    graph: &Graph<'_>,
-    entry: &[u8],
-    programs: &Programs,
-    rebuild: &[u8],
-) {
-    let mut install = programs.cmake.clone();
-    let mut test = programs.ctest.clone();
-    test.extend_from_slice(b" --force-new-ctest-process");
-    if let Some(config) = graph.config {
-        install.extend_from_slice(b" -DCMAKE_INSTALL_CONFIG_NAME=");
-        shell_word(config, &mut install);
-        test.extend_from_slice(b" -C ");
-        shell_word(config, &mut test);
-    }
-    install.extend_from_slice(b" -P cmake_install.cmake");
-    let mut clean = b"ninja".to_vec();
-    if entry != b"build.ninja" || !graph.prefix.is_empty() {
-        clean.extend_from_slice(b" -f ");
-        shell_word(&graph.node(entry), &mut clean);
-    }
-    let mut help = clean.clone();
-    clean.extend_from_slice(b" -t clean");
-    help.extend_from_slice(b" -t targets");
-    for (name, command, inputs, pool, rule) in [
-        (
-            "install",
-            install,
-            vec!["all".into()],
-            b"console".as_slice(),
-            b"CUSTOM_COMMAND".as_slice(),
-        ),
-        (
-            "test",
-            test,
-            vec![],
-            b"console".as_slice(),
-            b"CUSTOM_COMMAND".as_slice(),
-        ),
-        ("clean", clean, vec![], b"".as_slice(), b"CLEAN".as_slice()),
-        ("help", help, vec![], b"".as_slice(), b"HELP".as_slice()),
-    ] {
-        if name == "clean" && graph.config.is_some() {
-            continue;
-        }
-        emit_utility(
-            ninja,
-            graph,
-            Utility {
-                name,
-                command: &command,
-                inputs: &inputs,
-                pool,
-                rule,
-            },
-        );
-    }
-    for (name, config_file, enabled, inputs) in [
-        (
-            "package",
-            b"./CPackConfig.cmake".as_slice(),
-            programs.package,
-            programs.package_inputs.as_slice(),
-        ),
-        (
-            "package_source",
-            b"./CPackSourceConfig.cmake",
-            programs.package_source,
-            &[],
-        ),
-    ] {
-        if enabled {
-            let mut command = programs.cpack.clone();
-            if let Some(config) = graph.config {
-                command.extend_from_slice(b" -C ");
-                shell_word(config, &mut command);
-            }
-            command.extend_from_slice(b" --config ");
-            shell_word(config_file, &mut command);
-            emit_utility(
-                ninja,
-                graph,
-                Utility {
-                    name,
-                    command: &command,
-                    inputs,
-                    pool: b"console",
-                    rule: b"CUSTOM_COMMAND",
-                },
-            );
-        }
-    }
-    emit_utility(
-        ninja,
-        graph,
-        Utility {
-            name: "rebuild_cache",
-            command: rebuild,
-            inputs: &[],
-            pool: b"console",
-            rule: b"CUSTOM_COMMAND",
-        },
-    );
-    let mut edit_cache = programs.cmake.clone();
-    edit_cache.extend_from_slice(b" -E echo ");
-    shell_word(b"No interactive CMake dialog available.", &mut edit_cache);
-    emit_utility(
-        ninja,
-        graph,
-        Utility {
-            name: "edit_cache",
-            command: &edit_cache,
-            inputs: &[],
-            pool: b"console",
-            rule: b"CUSTOM_COMMAND",
-        },
-    );
-}
-
-struct Utility<'a> {
-    name: &'a str,
-    command: &'a [u8],
-    inputs: &'a [BString],
-    pool: &'a [u8],
-    rule: &'a [u8],
-}
-
-fn emit_utility(ninja: &mut Ninja, graph: &Graph<'_>, utility: Utility<'_>) {
-    let name = graph.node(utility.name.as_bytes());
-    if graph.has_target(&name) {
-        return;
-    }
-    let output = graph.node(format!("CMakeFiles/{}.util", utility.name).as_bytes());
-    let inputs: Vec<_> = utility
-        .inputs
-        .iter()
-        .map(|input| graph.node(input))
-        .collect();
-    ninja.edge(
-        utility.rule,
-        Edge {
-            outputs: std::slice::from_ref(&output),
-            inputs: &inputs,
-            ..Edge::default()
-        },
-    );
-    if !utility.command.is_empty() {
-        if matches!(utility.name, "clean" | "help") {
-            ninja.binding(b"COMMAND", utility.command);
-        } else {
-            ninja.binding(b"COMMAND", &graph.in_build_dir(utility.command));
-        }
-    }
-    if !utility.pool.is_empty() {
-        ninja.binding(b"pool", utility.pool);
-        ninja.binding(b"DESC", &name);
-    }
-    ninja.phony(&name, std::slice::from_ref(&output));
-    if graph.config.is_some() {
-        ninja.phony(&qualified(&name, graph.config), &[output]);
-    }
-}
-
 fn configuration_setting(host: &dyn Host, build_dir: &Path, name: &[u8]) -> Option<BString> {
     host.env_get(name)
         .or_else(|| cache_setting(&read_cache(host, build_dir)?, name))
@@ -828,6 +689,12 @@ struct Programs {
     package: bool,
     package_source: bool,
     package_inputs: Vec<BString>,
+    testing: bool,
+    install: bool,
+    strip: bool,
+    parallel_install: bool,
+    directories: Vec<BString>,
+    install_directories: Vec<BString>,
 }
 
 impl Programs {
@@ -896,6 +763,34 @@ impl Programs {
             cpack: program(cpack, b"cpack"),
             package: has_config("CPackConfig.cmake"),
             package_source: has_config("CPackSourceConfig.cmake"),
+            testing: model.is_none()
+                || definition(b"CMAKE_TESTING_ENABLED")
+                    .is_some_and(|value| rcmake_base::truth::is_on(value)),
+            install: model.is_none()
+                || (!result.install.actions.is_empty()
+                    && !definition(b"CMAKE_SKIP_INSTALL_RULES")
+                        .is_some_and(|value| rcmake_base::truth::is_on(value))),
+            strip: definition(b"CMAKE_STRIP")
+                .is_some_and(|value| !value.is_empty() && !value.ends_with(b"-NOTFOUND")),
+            parallel_install: model
+                .and_then(|model| model.global.props.get(b"INSTALL_PARALLEL"))
+                .is_some_and(|value| rcmake_base::truth::is_on(value)),
+            directories: model
+                .into_iter()
+                .flat_map(|model| model.dirs())
+                .filter_map(|(id, dir)| (id != DirId::ROOT).then_some(dir.binary_dir.clone()))
+                .collect(),
+            install_directories: model
+                .into_iter()
+                .flat_map(|model| model.dirs())
+                .filter_map(|(id, dir)| {
+                    result
+                        .install
+                        .directories
+                        .contains_key(&id)
+                        .then_some(dir.binary_dir.clone())
+                })
+                .collect(),
             package_inputs: if skip_all {
                 Vec::new()
             } else {

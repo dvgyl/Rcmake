@@ -124,7 +124,24 @@ impl UsageResolver<'_> {
             return Ok(None);
         };
         let variable = |name: &[u8]| definition(self.model, target.dir, name).cloned();
-        let system = variable(b"CMAKE_SYSTEM_NAME").unwrap_or_default();
+        let mut system = variable(b"CMAKE_SYSTEM_NAME").unwrap_or_default();
+        if matches!(system.as_slice(), b"" | b"Darwin")
+            && let Some(sdk) = variable(b"CMAKE_OSX_SYSROOT")
+        {
+            let sdk = Lexical::new(&sdk).filename().to_ascii_lowercase();
+            for (prefix, platform) in [
+                (b"iphone".as_slice(), b"iOS".as_slice()),
+                (b"appletv", b"tvOS"),
+                (b"watch", b"watchOS"),
+                (b"xros", b"visionOS"),
+                (b"xrsimulator", b"visionOS"),
+            ] {
+                if sdk.starts_with(prefix) {
+                    system = platform.into();
+                    break;
+                }
+            }
+        }
         let platform = ArtifactPlatform::new(
             &system,
             self.ide,
@@ -136,8 +153,23 @@ impl UsageResolver<'_> {
             visual_studio,
             ..
         } = platform;
+        let apple_import = apple
+            && target.kind == SharedLibrary
+            && on(target, b"ENABLE_EXPORTS")
+            && (target.is_imported()
+                || definition(self.model, target.dir, b"CMAKE_TAPI")
+                    .is_some_and(|value| !value.is_empty() && !value.ends_with(b"-NOTFOUND")))
+            && !target
+                .props
+                .get(b"XCODE_ATTRIBUTE_GENERATE_TEXT_BASED_STUBS")
+                .is_some_and(|value| value.eq_ignore_ascii_case(b"NO"));
         let import = matches!(kind, ImportFile | LinkerImportFile | SonameImportFile)
-            || (kind == LinkerFile && windows && matches!(target.kind, SharedLibrary | Executable));
+            || (kind == LinkerFile
+                && ((windows && matches!(target.kind, SharedLibrary | Executable))
+                    || apple_import));
+        if apple && import && !apple_import {
+            return Ok(None);
+        }
         let Some(kind_defaults) = artifact_defaults(target, import, apple, windows, visual_studio)
         else {
             return Ok(None);
@@ -196,6 +228,7 @@ impl UsageResolver<'_> {
             target,
             platform,
             ArtifactNaming {
+                import,
                 category,
                 prefix,
                 suffix,
@@ -221,6 +254,7 @@ impl UsageResolver<'_> {
             ..
         } = platform;
         let ArtifactNaming {
+            import,
             category,
             prefix,
             suffix,
@@ -242,7 +276,13 @@ impl UsageResolver<'_> {
             return Ok(None);
         }
         let nested = app || framework || module_bundle;
-        let category = if kind == PdbFile { "PDB" } else { category };
+        let category = if kind == PdbFile {
+            "PDB"
+        } else if framework && target.kind == TargetKind::SharedLibrary {
+            "LIBRARY"
+        } else {
+            category
+        };
         let dir = if matches!(part, ArtifactPart::Dir | ArtifactPart::Full) {
             self.artifact_output_directory(id, config, target, category, &config_upper)?
         } else {
@@ -282,7 +322,13 @@ impl UsageResolver<'_> {
         let (prefix, suffix) = if framework || module_bundle || kind == PdbFile {
             (
                 BString::default(),
-                BString::from(if kind == PdbFile { ".pdb" } else { "" }),
+                BString::from(if kind == PdbFile {
+                    ".pdb"
+                } else if framework && import {
+                    ".tbd"
+                } else {
+                    ""
+                }),
             )
         } else {
             (prefix, suffix)
@@ -332,7 +378,7 @@ impl UsageResolver<'_> {
         if (app || module_bundle) && desktop_apple {
             path = Lexical::new(&path).append(b"MacOS");
         } else if desktop_apple
-            && kind != LinkerFile
+            && !matches!(kind, LinkerFile | LinkerLibraryFile | LinkerImportFile)
             && let BundleKind::Framework { version, .. } = layout
         {
             path = Lexical::new(&Lexical::new(&path).append(b"Versions")).append(&version);
@@ -406,7 +452,16 @@ impl UsageResolver<'_> {
         let path = |kind| Ok::<_, ResolveError>(artifact(kind)?.map(|file| file.path));
         let artifacts = ArtifactSet {
             file: main.map(|file| file.path),
-            linker_file: path(LinkerFile)?,
+            linker_file: if target.is_some_and(|target| {
+                !target.is_imported()
+                    && target.kind == TargetKind::SharedLibrary
+                    && self.ide != Some(IdeFlavor::VisualStudio)
+                    && lower::is_darwin(self.model, target.dir)
+            }) {
+                path(LinkerLibraryFile)?
+            } else {
+                path(LinkerFile)?
+            },
             soname_file: path(SonameFile)?,
             import_file: path(ImportFile)?,
             pdb_file: path(PdbFile)?,
@@ -624,6 +679,7 @@ impl ArtifactPlatform {
 }
 
 struct ArtifactNaming {
+    import: bool,
     category: &'static str,
     prefix: BString,
     suffix: BString,
@@ -694,8 +750,18 @@ fn imported_artifact(
     let path = if matches!(kind, SonameFile | SonameImportFile) {
         let name = imported_for_config(target, b"IMPORTED_SONAME", &selected)
             .or_else(|| on(target, b"IMPORTED_NO_SONAME").then(|| path.clone()))?;
-        Lexical::new(Lexical::new(&path).parent())
-            .append(name.strip_prefix(b"@rpath/").unwrap_or(&name))
+        let base = crate::ide::bundle_kind(target)
+            .root(&path)
+            .filter(|root| {
+                name.strip_prefix(b"@rpath/")
+                    .unwrap_or(&name)
+                    .starts_with(Lexical::new(root).filename())
+            })
+            .map_or_else(
+                || Lexical::new(&path).parent(),
+                |root| Lexical::new(root).parent(),
+            );
+        Lexical::new(base).append(name.strip_prefix(b"@rpath/").unwrap_or(&name))
     } else {
         path
     };

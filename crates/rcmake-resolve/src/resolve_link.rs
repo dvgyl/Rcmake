@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use indexmap::{IndexMap, IndexSet};
-use rcmake_base::{BString, list, path_lex::Lexical, shell::quote};
+use rcmake_base::{BString, list, path_lex::Lexical, shell::quote, truth};
 use rcmake_genex::{ArtifactKind, ArtifactPart, ConfigId, EvalContext};
 use rcmake_host::path::to_native;
 use rcmake_model::{BT, DirId, ProjectModel, Target, TargetId, UsageField};
@@ -358,25 +358,45 @@ pub(crate) fn framework_dirs<'a>(
     target: &Target,
     dependencies: &[TargetId],
     artifact: &impl Fn(TargetId) -> Option<&'a BString>,
-) -> Vec<BString> {
-    if !lower::is_darwin(model, target.dir) {
-        return Vec::new();
+    config: &ConfigId,
+) -> Vec<(BString, bool)> {
+    let no_imported_system = target
+        .props
+        .get(b"NO_SYSTEM_FROM_IMPORTED")
+        .is_some_and(|value| truth::is_on(value));
+    let mut directories: IndexMap<BString, bool> = IndexMap::new();
+    for (directory, system) in dependencies.iter().filter_map(|&id| {
+        let dependency = model.target(id)?;
+        let imported = dependency.is_imported();
+        let layout = ide::bundle_kind(dependency);
+        if !imported && !matches!(layout, ide::BundleKind::Framework { .. }) {
+            return None;
+        }
+        let fallback;
+        let path = if let Some(path) = artifact(id) {
+            path
+        } else {
+            fallback = lower::compute_artifacts(model, dependency, config);
+            fallback.file.as_ref()?
+        };
+        let root = layout.root(path).or_else(|| {
+            imported
+                .then(|| lower::framework::wrapper_root(path, b".framework"))
+                .flatten()
+        })?;
+        let system = !(imported && no_imported_system)
+            && dependency
+                .props
+                .get(b"SYSTEM")
+                .map_or(imported, |value| truth::is_on(value));
+        Some((Lexical::new(root).parent().into(), system))
+    }) {
+        directories
+            .entry(directory)
+            .and_modify(|previous| *previous &= system)
+            .or_insert(system);
     }
-    dependencies
-        .iter()
-        .filter_map(|&id| {
-            let dependency = model.target(id)?;
-            let layout = ide::bundle_kind(dependency);
-            if !matches!(layout, ide::BundleKind::Framework { .. }) {
-                return None;
-            }
-            let path = artifact(id)?;
-            let root = layout.root(path)?;
-            Some(Lexical::new(root).parent().into())
-        })
-        .collect::<IndexSet<_>>()
-        .into_iter()
-        .collect()
+    directories.into_iter().collect()
 }
 
 fn append_link_item(
@@ -395,9 +415,13 @@ fn append_link_item(
             if lower::is_darwin(model, dir)
                 && let Some(dependency) = model.target(*id).filter(|target| !target.is_imported())
                 && let layout @ ide::BundleKind::Framework { .. } = ide::bundle_kind(dependency)
-                && let Some(path) = resolved
-                    .get(id)
-                    .and_then(|target| target.artifacts.file.as_ref())
+                && let Some(path) = resolved.get(id).and_then(|target| {
+                    target
+                        .artifacts
+                        .import_file
+                        .as_ref()
+                        .or(target.artifacts.file.as_ref())
+                })
                 && let Some(root) = layout.root(path)
             {
                 append_framework_dir(
@@ -417,13 +441,36 @@ fn append_link_item(
             let path = if let Some(target) = resolved.get(id) {
                 target
                     .artifacts
-                    .linker_file
+                    .import_file
                     .as_ref()
-                    .or(target.artifacts.file.as_ref())
+                    .or_else(|| {
+                        if matches!(
+                            model.generator,
+                            Some(
+                                rcmake_model::GeneratorKind::Ninja
+                                    | rcmake_model::GeneratorKind::NinjaMultiConfig
+                            )
+                        ) {
+                            target
+                                .artifacts
+                                .file
+                                .as_ref()
+                                .or(target.artifacts.linker_file.as_ref())
+                        } else {
+                            target
+                                .artifacts
+                                .linker_file
+                                .as_ref()
+                                .or(target.artifacts.file.as_ref())
+                        }
+                    })
                     .cloned()
             } else {
                 usage
-                    .artifact(*id, ArtifactKind::LinkerFile, ArtifactPart::Full, config)
+                    .artifact(*id, ArtifactKind::ImportFile, ArtifactPart::Full, config)
+                    .or_else(|| {
+                        usage.artifact(*id, ArtifactKind::LinkerFile, ArtifactPart::Full, config)
+                    })
                     .or_else(|| usage.artifact(*id, ArtifactKind::File, ArtifactPart::Full, config))
             };
             if let Some(path) = path {

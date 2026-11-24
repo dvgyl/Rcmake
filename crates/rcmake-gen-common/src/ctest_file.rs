@@ -22,6 +22,10 @@ use crate::{
     write_if_changed,
 };
 
+mod test_command;
+
+use test_command::{resolve_argument, resolve_discovery, resolve_test, resolve_test_program};
+
 /// Render the test file for a directory. Commands and properties use the values
 /// stored in the model.
 pub fn render(model: &ProjectModel, dir: DirId) -> Result<BString, GenError> {
@@ -77,8 +81,44 @@ fn render_file(
     let multi_config = multi_config || configs.len() > 1;
     render_includes(&mut out, model, dir_id, &mut usage, configs, multi_config)?;
     for (_, test) in model.dir_tests(dir_id) {
+        let policy = PolicyId::new(110);
+        let quoting = dir
+            .final_policies
+            .map_or(PolicyStatus::New, |policies| policies.get(policy));
+        let name = |out: &mut BString| {
+            if quoting == PolicyStatus::New {
+                test_argument(out, &test.name);
+            } else {
+                out.extend_from_slice(&test.name);
+            }
+        };
+        if quoting == PolicyStatus::Warn
+            && let Some(host) = host
+            && test
+                .name
+                .iter()
+                .any(|byte| b"$[] #;\t\n\"\\".contains(byte))
+        {
+            warn_policy(
+                model,
+                host,
+                policy,
+                Location::FileLine {
+                    file: Lexical::new(&dir.source_dir)
+                        .append(b"CMakeLists.txt")
+                        .as_slice()
+                        .into(),
+                    line: 0,
+                },
+                "",
+                &format!(
+                    "The following name given to add_test() is invalid if CMP0110 is not set or set to OLD:\n  `{}´\n",
+                    test.name
+                ),
+            );
+        }
         let Some(result) = result.filter(|r| !test.old_style && !r.configs.is_empty()) else {
-            render_guarded_test(&mut out, test);
+            render_guarded_test(&mut out, test, name);
             continue;
         };
         let mut guarded = false;
@@ -110,16 +150,18 @@ fn render_file(
                 ..EvalContext::default()
             };
             let mut evaluate = |value: &[u8]| genex(&mut usage, test.dir, &context, value, None);
-            let mut resolved = resolve_test(test, |value| {
-                if test.is_discovery() {
-                    evaluate(value)
-                } else {
-                    resolve_argument(value, &config.0, &lookup).map_err(|message| GenError::Write {
-                        path: from_native(&to_native(&dir.binary_dir).join("CTestTestfile.cmake")),
-                        message,
-                    })
-                }
-            })?;
+            let mut command_usage = UsageResolver::new(model);
+            let mut resolved = resolve_test(
+                test,
+                |value| {
+                    if test.is_discovery() {
+                        genex(&mut command_usage, test.dir, &context, value, None)
+                    } else {
+                        resolve_argument(value, &config.0, &lookup).map_err(GenError::Invalid)
+                    }
+                },
+                &mut evaluate,
+            )?;
             resolve_test_program(model, &mut resolved, lookup, &mut evaluate, host)?;
             if let TestKind::Discover(spec) = &mut resolved.kind {
                 resolve_discovery(spec, &mut evaluate)?;
@@ -201,15 +243,15 @@ fn render_file(
                 out.extend_from_slice(if guarded { b"elseif" } else { b"if" });
                 configuration_condition(&mut out, std::slice::from_ref(&config.0));
                 guarded = true;
-                render_test(&mut out, &resolved, b"  ");
+                render_test(&mut out, &resolved, b"  ", name);
             } else {
-                render_guarded_test(&mut out, &resolved);
+                render_guarded_test(&mut out, &resolved, name);
             }
         }
         if guarded {
             if test.configurations.is_empty() && !test.is_discovery() {
                 out.extend_from_slice(b"else()\n  add_test(");
-                test_argument(&mut out, &test.name);
+                name(&mut out);
                 out.extend_from_slice(b" NOT_AVAILABLE)\n");
             }
             out.extend_from_slice(b"endif()\n");
@@ -226,9 +268,16 @@ fn render_file(
         );
         out.extend_from_slice(b")\n");
     }
-    if let Some(labels) = dir.props.get(b"LABELS") {
+    let labels = list::join(
+        dir.props
+            .get(b"LABELS")
+            .into_iter()
+            .chain(model.definition(dir_id, b"CMAKE_DIRECTORY_LABELS"))
+            .filter(|labels| !labels.is_empty()),
+    );
+    if !labels.is_empty() {
         out.extend_from_slice(b"set_directory_properties(PROPERTIES LABELS ");
-        test_argument(&mut out, labels);
+        test_argument(&mut out, &labels);
         out.extend_from_slice(b")\n");
     }
     Ok(out)
@@ -312,121 +361,6 @@ fn render_includes(
     Ok(())
 }
 
-fn resolve_discovery(
-    spec: &mut DiscoverySpec,
-    mut evaluate: impl FnMut(&[u8]) -> Result<BString, GenError>,
-) -> Result<(), GenError> {
-    for value in spec
-        .discovery_args
-        .iter_mut()
-        .chain([&mut spec.discovery_match, &mut spec.test_name])
-        .chain(&mut spec.test_args)
-        .chain(spec.discovery_props.iter_mut().map(|(_, value)| value))
-        .chain(spec.test_props.iter_mut().map(|(_, value)| value))
-    {
-        *value = evaluate(value)?;
-    }
-    Ok(())
-}
-
-fn resolve_test(
-    test: &TestEntry,
-    mut resolve: impl FnMut(&[u8]) -> Result<BString, GenError>,
-) -> Result<TestEntry, GenError> {
-    let mut resolved = test.clone();
-    resolved.command.clear();
-    for arg in &test.command {
-        let value = resolve(arg)?;
-        if test.command_expand_lists {
-            resolved
-                .command
-                .extend(list::split(&value, list::Empty::Keep));
-        } else {
-            resolved.command.push(value);
-        }
-    }
-    for name in test.props.names() {
-        if name != b"_BACKTRACE_TRIPLES"
-            && let Some(value) = test.props.get(&name)
-        {
-            resolved.props.set(name, resolve(value)?);
-        }
-    }
-    if test.props.get(b"WORKING_DIRECTORY").is_none()
-        && let Some(value) = &test.working_directory
-    {
-        resolved.working_directory = Some(resolve(value)?);
-    }
-    Ok(resolved)
-}
-
-fn resolve_test_program<'a>(
-    model: &ProjectModel,
-    test: &mut TestEntry,
-    lookup: impl Fn(&[u8]) -> Option<(&'a Target, Option<BString>)>,
-    mut evaluate: impl FnMut(&[u8]) -> Result<BString, GenError>,
-    host: Option<&dyn Host>,
-) -> Result<(), GenError> {
-    let Some(program) = test.command.first_mut() else {
-        test.command.push(BString::default());
-        return Ok(());
-    };
-    let Some((target, Some(file))) =
-        lookup(program).filter(|(target, _)| target.kind == TargetKind::Executable)
-    else {
-        return Ok(());
-    };
-    *program = file;
-    let emulator_enabled = test.policies.get(PolicyId::new(158)) != PolicyStatus::New
-        || model
-            .definition(test.dir, b"CMAKE_CROSSCOMPILING")
-            .is_some_and(|value| truth::is_on(value));
-    let policy = PolicyId::new(178);
-    let status = test.policies.get(policy);
-    let keep_empty = if status == PolicyStatus::New {
-        list::Empty::Keep
-    } else {
-        list::Empty::Drop
-    };
-    let mut prefix = Vec::new();
-    for property in [b"TEST_LAUNCHER".as_slice(), b"CROSSCOMPILING_EMULATOR"] {
-        if property == b"CROSSCOMPILING_EMULATOR" && !emulator_enabled {
-            continue;
-        }
-        if let Some(value) = target.props.get(property).filter(|value| !value.is_empty()) {
-            let folded = evaluate(value)?;
-            let words = list::split(&folded, keep_empty);
-            if words.first().is_some_and(|word| !word.is_empty()) {
-                if status == PolicyStatus::Warn
-                    && let Some(host) = host
-                    && list::split(&folded, list::Empty::Keep) != words
-                {
-                    let file =
-                        Lexical::new(&model.dir(test.dir).source_dir).append(b"CMakeLists.txt");
-                    warn_policy(
-                        model,
-                        host,
-                        policy,
-                        Location::FileLine {
-                            file: file.as_slice().into(),
-                            line: 0,
-                        },
-                        &format!(
-                            "The {} property of target '{}' contains empty list items. Those empty items are being silently discarded to preserve backward compatibility.",
-                            BString::from(property),
-                            target.name
-                        ),
-                        "",
-                    );
-                }
-                prefix.extend(words);
-            }
-        }
-    }
-    test.command.splice(0..0, prefix);
-    Ok(())
-}
-
 fn fixture_default_applies(test: &TestEntry) -> bool {
     !test.is_discovery()
         && test.props.get(b"FIXTURE_REPEAT_MODE").is_none()
@@ -498,7 +432,7 @@ fn warn_policy(
         policy: Some(id),
         location,
         body: parts
-            .join(if id == PolicyId::new(224) {
+            .join(if id == PolicyId::new(110) || id == PolicyId::new(224) {
                 "\n\n"
             } else {
                 "\n"
@@ -515,50 +449,6 @@ fn warn_policy(
             },
         ),
     );
-}
-
-fn resolve_argument<'a>(
-    arg: &[u8],
-    config: &[u8],
-    lookup: &impl Fn(&[u8]) -> Option<(&'a Target, Option<BString>)>,
-) -> Result<BString, BString> {
-    let mut out = BString::default();
-    let mut rest = arg;
-    while let Some((before, after_open)) = rest.split_once_str(b"$<")
-        && let Some((expr, tail)) = after_open.split_once_str(b">")
-    {
-        out.extend_from_slice(before);
-        if expr == b"CONFIG" {
-            out.extend_from_slice(config);
-        } else if let Some((op, name)) = expr.split_once_str(b":")
-            && matches!(
-                op,
-                b"TARGET_FILE" | b"TARGET_FILE_NAME" | b"TARGET_FILE_DIR"
-            )
-        {
-            let file = lookup(name).and_then(|(_, file)| file).ok_or_else(|| {
-                BString::from([b"No target file for ".as_slice(), name, b" in test."].concat())
-            })?;
-            let path = Lexical::new(&file);
-            out.extend_from_slice(match op {
-                b"TARGET_FILE_NAME" => path.filename(),
-                b"TARGET_FILE_DIR" => path.parent(),
-                _ => file.as_slice(),
-            });
-        } else if let Some(name) = expr.strip_prefix(b"TARGET_FILE_BASE_NAME:")
-            && let Some((target, _)) = lookup(name)
-            && target.is_imported()
-        {
-            out.extend_from_slice(&target.name);
-        } else {
-            out.extend_from_slice(b"$<");
-            out.extend_from_slice(expr);
-            out.push(b'>');
-        }
-        rest = tail;
-    }
-    out.extend_from_slice(rest);
-    Ok(out)
 }
 
 /// Write the test file to the directory's existing binary directory.
@@ -586,25 +476,25 @@ fn configuration_condition(out: &mut BString, configurations: &[BString]) {
     out.extend_from_slice(b")\n");
 }
 
-fn render_guarded_test(out: &mut BString, test: &TestEntry) {
+fn render_guarded_test(out: &mut BString, test: &TestEntry, name: impl Fn(&mut BString)) {
     if test.configurations.is_empty() {
-        render_test(out, test, b"");
+        render_test(out, test, b"", name);
     } else {
         out.extend_from_slice(b"if");
         configuration_condition(out, &test.configurations);
-        render_test(out, test, b"  ");
+        render_test(out, test, b"  ", name);
         out.extend_from_slice(b"endif()\n");
     }
 }
 
-fn render_test(out: &mut BString, test: &TestEntry, indent: &[u8]) {
+fn render_test(out: &mut BString, test: &TestEntry, indent: &[u8], name: impl Fn(&mut BString)) {
     if let TestKind::Discover(spec) = &test.kind {
         render_discovery(out, test, spec, indent);
         return;
     }
     out.extend_from_slice(indent);
     out.extend_from_slice(b"add_test(");
-    test_argument(out, &test.name);
+    name(out);
     for arg in &test.command {
         out.push(b' ');
         test_argument(out, arg);
@@ -612,7 +502,7 @@ fn render_test(out: &mut BString, test: &TestEntry, indent: &[u8]) {
     out.extend_from_slice(b")\n");
     out.extend_from_slice(indent);
     out.extend_from_slice(b"set_tests_properties(");
-    test_argument(out, &test.name);
+    name(out);
     out.extend_from_slice(b" PROPERTIES ");
 
     let mut names = test.props.names();

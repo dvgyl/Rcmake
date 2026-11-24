@@ -142,7 +142,15 @@ fn parse(host: &dyn Host, args: &[BString]) -> Result<Options, String> {
             opts.native.extend(args.map(BString::from));
             break;
         }
-        let (flag, inline) = split_flag(arg, b'=');
+        let (mut flag, mut inline) = split_flag(arg, b'=');
+        if let Some(target) = flag
+            .strip_prefix(b"-t ")
+            .filter(|value| !value.trim_ascii().is_empty())
+            && inline.is_none()
+        {
+            flag = b"-t";
+            inline = Some(target.trim_ascii());
+        }
         if let Some((job_flag, suffix)) = [b"--parallel".as_slice(), b"-j"]
             .into_iter()
             .find_map(|name| flag.strip_prefix(name).map(|tail| (name, tail)))

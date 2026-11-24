@@ -203,13 +203,15 @@ fn install(cx: &mut Cx<'_>, input: &[ExpandedArg]) -> CmdResult {
     if *signature == b"RUNTIME_DEPENDENCY_SET" {
         return runtime::set(cx, rest);
     }
+    if matches!(*signature, b"CODE" | b"SCRIPT") {
+        return scripts(cx, signature, rest);
+    }
     let mut args = rest.iter().copied().peekable();
     let mut options = InstallOptions::default();
     let mut extra_destinations = Vec::new();
     let kind = match *signature {
         b"TARGETS" => targets(cx, &mut args, &mut options, &mut extra_destinations)?,
         b"FILES" | b"PROGRAMS" | b"DIRECTORY" => paths(cx, signature, &mut args, &mut options)?,
-        b"CODE" | b"SCRIPT" => script(cx, signature, &mut args, &mut options)?,
         b"EXPORT" => install_export(cx, &mut args, &mut options)?,
         b"PACKAGE_INFO" | b"SBOM" => metadata::install(cx, signature, rest, &mut options)?,
         _ => {
@@ -250,6 +252,27 @@ fn install(cx: &mut Cx<'_>, input: &[ExpandedArg]) -> CmdResult {
         } => Some((set.clone(), targets.clone())),
         _ => None,
     };
+    let snapshots = if let InstallKind::Targets { targets, .. } = &kind {
+        let model = cx.project();
+        targets
+            .iter()
+            .filter_map(|id| {
+                model.target(*id).map(|target| {
+                    let entries = [
+                        b"PUBLIC_HEADER".as_slice(),
+                        b"PRIVATE_HEADER",
+                        b"RESOURCE",
+                        b"FRAMEWORK",
+                    ]
+                    .map(|key| (key, target.props.get(key).cloned().unwrap_or_default()));
+                    (id, entries)
+                })
+            })
+            .map(|(id, entries)| (*id, entries))
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
     let dir = cx.current_dir_id();
     let backtrace = cx.backtrace();
     let index = cx.project().add_install(InstallRule {
@@ -260,12 +283,25 @@ fn install(cx: &mut Cx<'_>, input: &[ExpandedArg]) -> CmdResult {
     });
     let section = format!("_RCMAKE_INSTALL_{index}");
     record_args(cx, &section, &input);
+    for (id, entries) in snapshots {
+        for (key, value) in entries {
+            let key = String::from_utf8_lossy(key);
+            cx.global()
+                .props
+                .set(format!("{section}_{key}_{}", id.index()).into(), value);
+        }
+    }
     let absolute_action = cx
         .diag_state()
         .get(DiagCategory::InstallAbsoluteDestination);
     cx.global().props.set(
         format!("{section}_ABSOLUTE_ACTION").into(),
         absolute_action.as_str().into(),
+    );
+    let author_action = cx.diag_state().get(DiagCategory::Author);
+    cx.global().props.set(
+        format!("{section}_AUTHOR_ACTION").into(),
+        author_action.as_str().into(),
     );
     let message = cx.var_or_empty(b"CMAKE_INSTALL_MESSAGE");
     if matches!(message.as_slice(), b"ALWAYS" | b"LAZY" | b"NEVER") {
@@ -399,6 +435,10 @@ fn targets(
                 }
             }
             _ => {
+                if key == b"DESTINATION" && args.peek().is_some_and(|next| *next == b"DESTINATION")
+                {
+                    continue;
+                }
                 if group.is_some() && key == b"DESTINATION" {
                     destination_argument = Some(argument_count - args.len());
                 }
@@ -530,34 +570,87 @@ fn source_path(cx: &Cx<'_>, path: &[u8]) -> BString {
     }
 }
 
-fn script(
-    cx: &Cx<'_>,
-    signature: &[u8],
-    args: &mut Args<'_>,
-    options: &mut InstallOptions,
-) -> Result<InstallKind> {
-    let input = args
-        .next()
-        .ok_or_else(|| fail([signature, b" requires an argument."].concat()))?;
-    while let Some(key) = args.next() {
+fn scripts(cx: &mut Cx<'_>, signature: &[u8], rest: &[&[u8]]) -> CmdResult {
+    let mut args = rest.iter().copied().peekable();
+    let mut options = InstallOptions::default();
+    let mut blocks = Vec::new();
+    let mut shared = Vec::new();
+    let mut key = signature;
+    loop {
         match key {
-            b"ALL_COMPONENTS" => options.all_components = true,
-            b"COMPONENT" => options.component = Some(value(args, key)?.into()),
-            b"EXCLUDE_FROM_ALL" => options.exclude_from_all = true,
-            b"BUILD_DEPENDS" => options
-                .build_depends
-                .extend(values(args).into_iter().map(BString::from)),
+            b"SCRIPT" | b"CODE" => {
+                let input = args
+                    .next_if(|token| !matches!(*token, b"SCRIPT" | b"CODE") && !keyword(token))
+                    .ok_or_else(|| fail([key, b" requires an argument."].concat()))?;
+                let kind = if key == b"SCRIPT" {
+                    let path = source_path(cx, input);
+                    if !path.starts_with(b"$<")
+                        && cx
+                            .host()
+                            .metadata(&to_native(&path), rcmake_host::Follow::Yes)
+                            .is_ok_and(|metadata| metadata.kind == rcmake_host::FileKind::Dir)
+                    {
+                        return Err(fail(format!("given a directory as a script: {path}")));
+                    }
+                    InstallKind::Script(path)
+                } else {
+                    InstallKind::Code(input.into())
+                };
+                blocks.push((key, input, kind));
+            }
+            b"ALL_COMPONENTS" => {
+                options.all_components = true;
+                shared.push(key);
+            }
+            b"COMPONENT" => {
+                let name = args
+                    .next_if(|token| !matches!(*token, b"SCRIPT" | b"CODE") && !keyword(token))
+                    .ok_or_else(|| fail("option COMPONENT requires a value."))?;
+                options.component = Some(name.into());
+                shared.extend([key, name]);
+            }
+            b"EXCLUDE_FROM_ALL" => {
+                options.exclude_from_all = true;
+                shared.push(key);
+            }
+            b"BUILD_DEPENDS" => {
+                shared.push(key);
+                while let Some(path) =
+                    args.next_if(|token| !matches!(*token, b"SCRIPT" | b"CODE") && !keyword(token))
+                {
+                    shared.push(path);
+                    options.build_depends.push(path.into());
+                }
+            }
             _ => return Err(unknown(key)),
         }
+        let Some(next) = args.next() else { break };
+        key = next;
     }
     if options.all_components && options.component.is_some() {
         return Err(fail("ALL_COMPONENTS and COMPONENT are mutually exclusive."));
     }
-    Ok(if signature == b"SCRIPT" {
-        InstallKind::Script(source_path(cx, input))
-    } else {
-        InstallKind::Code(input.into())
-    })
+    if options
+        .component
+        .as_ref()
+        .is_none_or(|name| name.is_empty())
+    {
+        options.component = Some(default_component(cx));
+    }
+    let dir = cx.current_dir_id();
+    let backtrace = cx.backtrace();
+    for (signature, input, kind) in blocks {
+        let index = cx.project().add_install(InstallRule {
+            dir,
+            backtrace: backtrace.clone(),
+            kind,
+            options: options.clone(),
+        });
+        let mut recorded = vec![signature, input];
+        recorded.extend_from_slice(&shared);
+        record_args(cx, &format!("_RCMAKE_INSTALL_{index}"), &recorded);
+    }
+    Ok(Flow::Normal)
 }
 
 fn install_export(

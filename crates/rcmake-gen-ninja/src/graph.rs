@@ -16,6 +16,7 @@ use rcmake_resolve::{
 use crate::syntax::{Edge, Ninja, shell_word};
 use crate::{generation_error, modules};
 
+mod aliases;
 mod implicit;
 mod plan;
 
@@ -33,6 +34,7 @@ pub(crate) struct Graph<'a> {
     artifact_targets: HashSet<usize>,
     producers: HashMap<BString, usize>,
     generated_inputs: HashMap<BString, BString>,
+    pools: HashMap<BString, BString>,
     steps: Vec<StepNodes<'a>>,
     order_only_alias_bytes: usize,
     compile_prerequisites: Vec<Vec<usize>>,
@@ -85,6 +87,7 @@ impl<'a> Graph<'a> {
             artifact_targets: HashSet::new(),
             producers: HashMap::with_capacity(input.steps.len()),
             generated_inputs: HashMap::new(),
+            pools: HashMap::new(),
             steps: Vec::with_capacity(input.steps.len()),
             order_only_alias_bytes: 0,
             compile_prerequisites: Vec::new(),
@@ -180,6 +183,11 @@ impl<'a> Graph<'a> {
     }
 
     fn add_link_byproducts(&mut self, artifacts: &BTreeMap<&[u8], &ArtifactSet>) {
+        let explicit: HashSet<_> = self
+            .steps
+            .iter()
+            .flat_map(|step| step.outputs.iter().chain(&step.byproducts).cloned())
+            .collect();
         for target in &self.input.targets {
             let Some(artifacts) = artifacts.get(target.name.as_slice()) else {
                 continue;
@@ -206,7 +214,7 @@ impl<'a> Graph<'a> {
                         continue;
                     }
                     for path in &paths {
-                        if !nodes.outputs.contains(path) && !nodes.byproducts.contains(path) {
+                        if !explicit.contains(path) && !nodes.byproducts.contains(path) {
                             nodes.byproducts.push(path.clone());
                         }
                     }
@@ -278,6 +286,62 @@ impl<'a> Graph<'a> {
             self.extra_aliases.remove(&name);
         }
         let Some(model) = model else { return };
+        for (index, build_target) in self.input.targets.iter().enumerate() {
+            let Some(target) = model
+                .find_target(DirId::ROOT, &build_target.name)
+                .and_then(|id| model.target(id))
+            else {
+                continue;
+            };
+            let directory = self.node(&model.dir(target.dir).binary_dir);
+            if target.kind == rcmake_model::TargetKind::Utility && target.dir != DirId::ROOT {
+                let name = Lexical::new(&directory).append(&build_target.name);
+                let alias = qualified(&name, self.config);
+                if !self.producers.contains_key(&alias)
+                    && let Some(primary) = self.aliases.get_mut(index)
+                {
+                    *primary = alias;
+                }
+            }
+            for step in build_target
+                .steps
+                .iter()
+                .filter_map(|index| self.input.steps.get(*index))
+            {
+                let (property, output, source) = match step {
+                    BuildStep::Compile { source, object, .. } => {
+                        (b"JOB_POOL_COMPILE".as_slice(), object, Some(source))
+                    }
+                    BuildStep::Link { step, .. } => {
+                        (b"JOB_POOL_LINK".as_slice(), &step.output, None)
+                    }
+                    _ => continue,
+                };
+                let dir = model.dir(target.dir);
+                let source = source.map(|source| {
+                    let absolute = Lexical::new(&dir.source_dir).append(source);
+                    Lexical::new(&absolute).normalize()
+                });
+                let file_set = source.as_ref().and_then(|source| {
+                    target
+                        .file_sets
+                        .iter()
+                        .filter_map(|id| model.file_set(*id))
+                        .find(|set| set.files.iter().any(|entry| entry.value == *source))
+                });
+                let pool = file_set
+                    .and_then(|set| set.props.get(property))
+                    .or_else(|| {
+                        source
+                            .as_ref()
+                            .and_then(|source| dir.source_props.get(source)?.get(property))
+                    })
+                    .or_else(|| target.props.get(property));
+                if let Some(pool) = pool.filter(|value| !value.is_empty()) {
+                    self.pools.insert(output.clone(), pool.clone());
+                }
+            }
+        }
         let directories: BTreeMap<_, _> = model
             .dirs()
             .filter(|(id, _)| *id != DirId::ROOT)
@@ -426,7 +490,8 @@ impl<'a> Graph<'a> {
                 continue;
             };
             steps.extend(target.steps.iter().copied().filter(|&step| {
-                matches!(self.input.steps.get(step), Some(BuildStep::Custom(_)))
+                matches!(self.input.steps.get(step), Some(BuildStep::Custom(custom))
+                    if !is_library_symlink(custom))
                     && self.steps.get(step).is_some_and(|nodes| !nodes.link)
                     && seen_steps.insert(step)
             }));
@@ -542,56 +607,6 @@ impl<'a> Graph<'a> {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn emit_entry_aliases(&self, ninja: &mut Ninja) {
-        self.emit_aliases(ninja, None, &[self], &HashSet::new());
-    }
-
-    pub(crate) fn emit_aliases(
-        &self,
-        ninja: &mut Ninja,
-        suffix: Option<&[u8]>,
-        configurations: &[&Self],
-        reserved: &HashSet<BString>,
-    ) {
-        let extra: BTreeSet<_> = configurations
-            .iter()
-            .flat_map(|graph| graph.extra_aliases.keys())
-            .collect();
-        let names = self
-            .input
-            .targets
-            .iter()
-            .map(|target| self.node(&target.name))
-            .chain([self.node(b"all")])
-            .chain(extra.into_iter().cloned());
-        for name in names {
-            let output = qualified(&name, suffix);
-            if self.producers.contains_key(&output)
-                || reserved.contains(&output)
-                || self.aliases.contains(&output)
-            {
-                continue;
-            }
-            let inputs = configurations
-                .iter()
-                .filter_map(|graph| {
-                    if name == self.node(b"all") || graph.extra_aliases.contains_key(&name) {
-                        Some(qualified(&name, graph.config))
-                    } else {
-                        graph
-                            .names
-                            .get(&name)
-                            .and_then(|&index| graph.aliases.get(index).cloned())
-                    }
-                })
-                .collect::<Vec<_>>();
-            if !inputs.is_empty() {
-                ninja.phony(&output, &inputs);
-            }
-        }
-    }
-
     pub(crate) fn emit_clean_inputs(&self, ninja: &mut Ninja) {
         let inputs = self
             .steps
@@ -697,6 +712,15 @@ impl<'a> Graph<'a> {
             }
         }
     }
+}
+
+fn is_library_symlink(custom: &rcmake_resolve::CustomStep) -> bool {
+    custom.invocations.first().is_some_and(|invocation| {
+        invocation
+            .argv
+            .get(2)
+            .is_some_and(|word| word == b"cmake_symlink_library")
+    })
 }
 
 pub(crate) fn qualified(name: &BString, config: Option<&[u8]>) -> BString {

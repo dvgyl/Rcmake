@@ -39,6 +39,7 @@ pub(crate) struct ResultLine {
     pub(crate) exit_code: Option<i32>,
     pub(crate) skip_reason: Option<SkipReason>,
     pub(crate) regex_reason: Option<String>,
+    pub(crate) snippet: Option<Box<std::path::PathBuf>>,
 }
 
 impl ResultLine {
@@ -51,6 +52,7 @@ impl ResultLine {
             exit_code: None,
             skip_reason: None,
             regex_reason: None,
+            snippet: None,
         }
     }
 
@@ -77,9 +79,7 @@ pub(crate) fn request(
 ) -> Result<RunRequest, String> {
     let mut command = test.command.clone();
     resolve_program(host, test, &mut command, options);
-    let cwd = test
-        .directory
-        .join(to_native(test.property(b"WORKING_DIRECTORY")));
+    let cwd = test.working_directory();
     let timeout = parse_timeout(test.property(b"TIMEOUT")).or(options.timeout);
     Ok(RunRequest {
         pipeline: vec![command],
@@ -103,12 +103,26 @@ pub(crate) fn resolve_program(
     command: &mut CommandSpec,
     options: &CtestOptions,
 ) {
-    let program = to_native(&command.program);
-    if command.program.is_empty() || command.program == "NOT_AVAILABLE" {
+    resolve_program_at(
+        host,
+        &mut command.program,
+        &test.working_directory(),
+        options.config.as_ref(),
+    );
+}
+
+pub(crate) fn resolve_program_at(
+    host: &dyn Host,
+    command: &mut BString,
+    directory: &std::path::Path,
+    config: Option<&BString>,
+) {
+    if command.is_empty() || command.as_slice() == b"NOT_AVAILABLE" {
         return;
     }
-    let local = test.directory.join(&program);
-    let config_path = options.config.as_ref().and_then(|config| {
+    let program = to_native(command);
+    let local = directory.join(&program);
+    let config_path = config.and_then(|config| {
         Some(
             local
                 .parent()?
@@ -121,12 +135,12 @@ pub(crate) fn resolve_program(
             .metadata(path, Follow::Yes)
             .is_ok_and(|metadata| metadata.kind == FileKind::File)
         {
-            command.program = from_native(path);
+            *command = from_native(path);
             return;
         }
     }
     if program.components().count() > 1 {
-        command.program = from_native(&local);
+        *command = from_native(&local);
     }
 }
 
@@ -231,9 +245,9 @@ pub(crate) fn execute(
     let elapsed = host.monotonic().saturating_sub(started);
     let mut result = match run {
         Ok((run, metrics)) => {
-            if let Some((instrument, sample)) = instrument.zip(sample) {
-                instrument.test(test, request, (&run, metrics), sample, elapsed);
-            }
+            let snippet = instrument.zip(sample).and_then(|(instrument, sample)| {
+                instrument.test(test, request, (&run, metrics), sample, elapsed)
+            });
             let mut output = run.stdout;
             output.extend(run.stderr);
             let mut result = match run.results.first() {
@@ -250,6 +264,7 @@ pub(crate) fn execute(
                 None => ResultLine::not_run("The host returned no process status."),
             };
             result.output = output;
+            result.snippet = snippet.map(Box::new);
             result
         }
         Err(error) => ResultLine::not_run(error.to_string()),

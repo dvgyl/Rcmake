@@ -21,6 +21,7 @@ pub(crate) enum Mode {
     #[default]
     Test,
     Help(Vec<BString>),
+    BuildAndTest(Box<crate::build_and_test::BuildAndTest>),
     Version {
         json: bool,
         file: Option<PathBuf>,
@@ -107,13 +108,17 @@ pub(crate) fn parse(args: &[BString], host: &dyn Host) -> Result<Invocation, Str
             ..Invocation::default()
         });
     }
-    if args
+    if let Some(index) = args
         .iter()
         .take_while(|arg| *arg != "--")
-        .any(|arg| arg == "--build-and-test")
-        && args.iter().any(|arg| arg == "--")
+        .position(|arg| arg == "--build-and-test")
     {
-        return Err("The -- option cannot be used with --build-and-test. Use --build-options or --test-command to forward arguments.".into());
+        return Ok(Invocation {
+            mode: Mode::BuildAndTest(Box::new(crate::build_and_test::BuildAndTest::parse(
+                args, index,
+            )?)),
+            ..Invocation::default()
+        });
     }
     let mut cli = Invocation::default();
     let mut timeout = None;

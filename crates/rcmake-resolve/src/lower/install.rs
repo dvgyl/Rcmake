@@ -11,15 +11,18 @@ use rcmake_diag::{
 };
 use rcmake_genex::{ConfigId, EvalContext, EvalSite, evaluate, parse};
 use rcmake_host::{Host, Stream};
-use rcmake_model::{
-    DirId, GeneratorKind, InstallKind, InstallOptions, InstallRule, ProjectModel, TargetKind,
-};
+use rcmake_model::{DirId, GeneratorKind, InstallKind, InstallOptions, InstallRule, ProjectModel};
 
-use super::{compute_artifacts, definition, join, link::install_rpath};
+use super::{definition, join};
 use crate::{
     InstallAction, InstallActionKind, InstallManifest, ResolveError, ResolvedTarget,
     usage::UsageResolver,
 };
+
+mod objects;
+mod targets;
+
+pub(crate) use objects::exported_path as exported_object_path;
 
 pub use super::graph::collect_metadata;
 
@@ -50,6 +53,9 @@ pub(crate) fn lower_install_manifest_with_configs(
     ide: Option<crate::ide::IdeFlavor>,
     host: &dyn Host,
 ) -> Result<InstallManifest, ResolveError> {
+    for (index, rule, _) in ordered_install_rules(model) {
+        targets::warn_framework_change(model, index, rule, host)?;
+    }
     let mut usage = UsageResolver::new(model).with_ide(ide);
     lower_install_rules(
         model,
@@ -214,6 +220,16 @@ enum InstallEntry<'a> {
 }
 
 fn ordered_install_rules(model: &ProjectModel) -> Vec<(usize, &InstallRule, Option<usize>)> {
+    ordered_entries(model)
+        .into_iter()
+        .filter_map(|entry| match entry {
+            InstallEntry::Rule(index, rule, export) => Some((index, rule, export)),
+            InstallEntry::Directory(_) => None,
+        })
+        .collect()
+}
+
+fn ordered_entries(model: &ProjectModel) -> Vec<InstallEntry<'_>> {
     use rcmake_diag::{PolicyId, PolicyStatus};
 
     let mut entries: BTreeMap<_, Vec<_>> = BTreeMap::new();
@@ -263,8 +279,9 @@ fn ordered_install_rules(model: &ProjectModel) -> Vec<(usize, &InstallRule, Opti
     let mut ordered = Vec::with_capacity(model.installs.len());
     while let Some(entry) = pending.pop() {
         match entry {
-            InstallEntry::Rule(index, rule, export) => ordered.push((index, rule, export)),
+            InstallEntry::Rule(..) => ordered.push(entry),
             InstallEntry::Directory(id) => {
+                ordered.push(entry);
                 if let Some(items) = entries.remove(&id) {
                     pending.extend(items.into_iter().rev().map(|entry| entry.2));
                 }
@@ -283,328 +300,140 @@ fn lower_install_rules<E>(
 ) -> Result<InstallManifest, E> {
     let mut manifest = InstallManifest::default();
     let multi = configs.len() > 1 || model.generator.is_some_and(GeneratorKind::multi_config);
-    for (index, rule, export_plan) in ordered_install_rules(model) {
-        let options = &rule.options;
-        let recorded = recorded_args(model, index);
-        let source = &model.dir(rule.dir).source_dir;
-        let message = model
-            .global
-            .props
-            .get(format!("_RCMAKE_INSTALL_{index}_MESSAGE").as_bytes());
-        let make_action = |options: &InstallOptions, destination: &[u8], kind| {
-            let mut action = action(model, rule, options, destination, kind);
-            if let Some(message) = message {
-                action.message.clone_from(message);
+    for entry in ordered_entries(model) {
+        let (index, rule, export_plan) = match entry {
+            InstallEntry::Rule(index, rule, export) => (index, rule, export),
+            InstallEntry::Directory(dir) => {
+                manifest.directories.entry(dir).or_default();
+                if let Some(parent) = model.dir(dir).parent {
+                    manifest
+                        .directories
+                        .entry(parent)
+                        .or_default()
+                        .push(crate::InstallEntry::Child(dir));
+                }
+                continue;
             }
-            action
         };
-        let kind = match &rule.kind {
-            InstallKind::Targets { targets: ids, .. } => {
-                let groups = target_options(&recorded);
-                for id in ids {
-                    let Some(raw) = model.target(*id).filter(|raw| !raw.is_imported()) else {
-                        continue;
-                    };
-                    let matching: Vec<_> = targets.iter().filter(|t| t.id == *id).collect();
-                    if raw.kind == TargetKind::ObjectLibrary {
-                        let object_options = groups
-                            .get(b"OBJECTS".as_slice())
-                            .map_or_else(|| options.clone(), |group| group.merge(options));
-                        if object_options
-                            .destination
-                            .as_ref()
-                            .is_none_or(|value| value.is_empty())
-                        {
-                            continue;
-                        }
-                        for target in &matching {
-                            if !matches_config(&object_options, &target.config) {
-                                continue;
+        let first = manifest.actions.len();
+        (|| -> Result<(), E> {
+            let options = &rule.options;
+            let recorded = recorded_args(model, index);
+            let source = &model.dir(rule.dir).source_dir;
+            let message = model
+                .global
+                .props
+                .get(format!("_RCMAKE_INSTALL_{index}_MESSAGE").as_bytes());
+            let make_action = |options: &InstallOptions, destination: &[u8], kind| {
+                let mut action = action(model, rule, options, destination, kind);
+                if let Some(message) = message {
+                    action.message.clone_from(message);
+                }
+                action
+            };
+            let kind = match &rule.kind {
+                InstallKind::Targets { targets: ids, .. } => {
+                    targets::lower(
+                        model,
+                        (index, rule),
+                        (targets, configs, ids),
+                        &recorded,
+                        &mut manifest,
+                        &make_action,
+                        (&mut eval, &mut object_name),
+                    )?;
+                    return Ok(());
+                }
+                InstallKind::Files(paths)
+                | InstallKind::Programs(paths)
+                | InstallKind::Directory(paths) => {
+                    let expand_paths = !matches!(rule.kind, InstallKind::Directory(_))
+                        && paths.iter().any(|path| has_genex(&path.value));
+                    for config in action_configs(configs, options, expand_paths, multi) {
+                        let mut options = options.clone();
+                        let mut files = Vec::new();
+                        if let Some(config) = config {
+                            if let Some(destination) = &mut options.destination {
+                                *destination =
+                                    eval(rule.dir, config, &rule.backtrace, destination)?;
                             }
-                            let mut options = object_options.clone();
-                            eval_destination(
-                                &mut options,
-                                raw.dir,
-                                &target.config,
-                                rule,
-                                &mut eval,
-                            )?;
-                            let destination = options
-                                .destination
-                                .as_deref()
-                                .map_or(b"".as_slice(), Vec::as_slice);
-                            let destination = super::artifacts::object_install_directory(
-                                model,
-                                raw,
-                                &target.config,
-                                destination,
-                            );
-                            for unit in &target.compile_units {
-                                let custom_name =
-                                    object_name(raw.dir, &target.config, &unit.source.value)?;
-                                let name = super::artifacts::install_object_name(
-                                    model,
-                                    raw,
-                                    &unit.source.value,
-                                    &custom_name,
-                                );
-                                let name = Lexical::new(&name);
-                                options.destination = Some(join(&destination, name.parent()));
-                                options.rename = Some(name.filename().into());
-                                let mut action = make_action(
-                                    &options,
-                                    b"",
-                                    file_action(
-                                        b"FILE",
-                                        vec![join(
-                                            &model.dir(DirId::ROOT).binary_dir,
-                                            &unit.object,
-                                        )],
-                                        &options,
-                                    ),
-                                );
-                                action.configurations = vec![target.config.0.clone()];
-                                manifest.actions.push(action);
+                            if multi {
+                                options.configurations = vec![config.0.clone()];
                             }
                         }
-                        continue;
-                    }
-                    for target in &matching {
-                        let layout = if super::is_darwin(model, raw.dir) {
-                            crate::ide::bundle_kind(raw)
-                        } else {
-                            crate::ide::BundleKind::None
-                        };
-                        let Some((class, file_type, fallback)) =
-                            target_install_kind(target.metadata.kind, &layout)
-                        else {
-                            continue;
-                        };
-                        let extra = groups.get(class);
-                        let mut options =
-                            extra.map_or_else(|| options.clone(), |extra| extra.merge(options));
-                        let per_config = multi || matching.len() > 1;
-                        if (configs.is_empty() || per_config)
-                            && !matches_config(&options, &target.config)
-                        {
-                            continue;
-                        }
-                        if per_config {
-                            options.configurations = vec![target.config.0.clone()];
-                        }
-                        let artifacts = if target.artifacts.file.is_some() {
-                            target.artifacts.clone()
-                        } else {
-                            compute_artifacts(model, raw, &target.config)
-                        };
-                        let bin = &model.dir(DirId::ROOT).binary_dir;
-                        let bundle_root = artifacts
-                            .file
-                            .as_ref()
-                            .and_then(|file| layout.root(file))
-                            .map(BString::from);
-                        let mut files = if layout == crate::ide::BundleKind::None {
-                            artifact_paths(&artifacts, extra)
-                        } else {
-                            bundle_root.iter().collect()
-                        };
-                        let (key, default) = fallback;
-                        let default =
-                            definition(model, rule.dir, key).map_or(default, |v| v.as_slice());
-                        if !configs.is_empty() {
-                            options.destination.get_or_insert_with(|| default.into());
-                            eval_destination(
-                                &mut options,
-                                raw.dir,
-                                &target.config,
-                                rule,
-                                &mut eval,
-                            )?;
-                        }
-                        let namelink = extra.and_then(|group| group.namelink_component).and_then(
-                            |component| {
-                                let linker = artifacts.linker_file.as_ref()?;
-                                (artifacts
-                                    .soname_file
-                                    .as_ref()
-                                    .is_some_and(|soname| soname != linker)
-                                    && files.shift_remove(linker))
-                                .then(|| (component, join(bin, linker)))
-                            },
-                        );
-                        if !files.is_empty() {
-                            let macho_rpath = if let Some(file) = artifacts.file.as_ref()
-                                && files.contains(file)
-                            {
-                                let name = options.rename.as_ref().map_or_else(
-                                    || Lexical::new(file).filename(),
-                                    |name| name.as_slice(),
+                        for path in paths {
+                            if let Some(config) = config.filter(|_| expand_paths) {
+                                let value = eval(rule.dir, config, &path.backtrace, &path.value)?;
+                                files.extend(
+                                    list::split(&value, list::Empty::Drop)
+                                        .into_iter()
+                                        .map(|path| join(source, &path)),
                                 );
-                                install_rpath(model, raw, target, name, |value| {
-                                    eval(raw.dir, &target.config, &rule.backtrace, value)
-                                })?
                             } else {
-                                None
-                            };
-                            let files = files.into_iter().map(|path| join(bin, path)).collect();
-                            let action = make_action(
-                                &options,
-                                default,
-                                if layout == crate::ide::BundleKind::None {
-                                    file_action(file_type, files, &options)
-                                } else {
-                                    InstallActionKind::Directory {
-                                        dirs: files,
-                                        options: vec!["USE_SOURCE_PERMISSIONS".into()],
-                                    }
-                                },
-                            );
-                            let edit_action = macho_rpath.map(|edit| InstallAction {
-                                kind: InstallActionKind::Code(edit.render(
-                                    &action.destination,
-                                    !action.configurations.is_empty(),
-                                )),
-                                ..action.clone()
-                            });
-                            manifest.actions.push(action);
-                            manifest.actions.extend(edit_action);
-                        }
-                        if let Some((component, file)) = namelink {
-                            options.component = Some(component.into());
-                            let kind = file_action(file_type, vec![file], &options);
-                            manifest.actions.push(make_action(&options, default, kind));
-                        }
-                    }
-                    if matches!(
-                        model.generator,
-                        Some(GeneratorKind::Ninja | GeneratorKind::NinjaMultiConfig)
-                    ) {
-                        let bmi = groups
-                            .get(b"CXX_MODULES_BMI".as_slice())
-                            .map_or_else(|| options.clone(), |group| group.merge(options));
-                        if bmi
-                            .destination
-                            .as_ref()
-                            .is_some_and(|destination| !destination.is_empty())
-                        {
-                            for target in &matching {
-                                if target
-                                    .compile_groups
-                                    .iter()
-                                    .any(|group| group.language == b"CXX")
-                                {
-                                    let mut bmi = bmi.clone();
-                                    eval_destination(
-                                        &mut bmi,
-                                        raw.dir,
-                                        &target.config,
-                                        rule,
-                                        &mut eval,
-                                    )?;
-                                    add_bmi_include(
-                                        &mut manifest,
-                                        model,
-                                        rule,
-                                        &bmi,
-                                        target,
-                                        multi || matching.len() > 1,
-                                    );
-                                }
+                                files.push(join(source, &path.value));
                             }
                         }
+                        let kind = match &rule.kind {
+                            InstallKind::Directory(_) => InstallActionKind::Directory {
+                                dirs: files,
+                                options: directory_options(&recorded, &options.permissions),
+                            },
+                            _ if files.is_empty() && expand_paths => continue,
+                            InstallKind::Programs(_) => file_action(b"PROGRAM", files, &options),
+                            _ => file_action(b"FILE", files, &options),
+                        };
+                        manifest.actions.push(make_action(&options, b"", kind));
                     }
-                    if !matches!(
-                        crate::ide::bundle_kind(raw),
-                        crate::ide::BundleKind::Framework { .. }
-                    ) && let Some(headers) = raw.props.get(b"PUBLIC_HEADER")
-                    {
-                        let files: Vec<_> = list::split(headers, list::Empty::Drop)
-                            .iter()
-                            .map(|path| join(source, path))
-                            .collect();
-                        if !files.is_empty() {
-                            let options = groups
-                                .get(b"PUBLIC_HEADER".as_slice())
-                                .map_or_else(|| options.clone(), |extra| extra.merge(options));
-                            let default = definition(model, rule.dir, b"CMAKE_INSTALL_INCLUDEDIR")
-                                .map_or(b"include".as_slice(), |value| value.as_slice());
-                            let mut options = options;
-                            if !configs.is_empty() {
-                                options.destination.get_or_insert_with(|| default.into());
-                            }
-                            for config in action_configs(configs, &options, false, multi) {
-                                let mut options = options.clone();
-                                if let Some(config) = config {
-                                    eval_destination(
-                                        &mut options,
-                                        rule.dir,
-                                        config,
-                                        rule,
-                                        &mut eval,
-                                    )?;
-                                    if multi {
-                                        options.configurations = vec![config.0.clone()];
-                                    }
-                                }
-                                let kind = file_action(b"FILE", files.clone(), &options);
-                                manifest.actions.push(make_action(&options, default, kind));
-                            }
-                        }
-                    }
+                    return Ok(());
                 }
-                continue;
-            }
-            InstallKind::Files(paths)
-            | InstallKind::Programs(paths)
-            | InstallKind::Directory(paths) => {
-                let expand_paths = !matches!(rule.kind, InstallKind::Directory(_))
-                    && paths.iter().any(|path| has_genex(&path.value));
-                for config in action_configs(configs, options, expand_paths, multi) {
-                    let mut options = options.clone();
-                    let mut files = Vec::new();
-                    if let Some(config) = config {
-                        if let Some(destination) = &mut options.destination {
-                            *destination = eval(rule.dir, config, &rule.backtrace, destination)?;
-                        }
-                        if multi {
-                            options.configurations = vec![config.0.clone()];
-                        }
-                    }
-                    for path in paths {
-                        if let Some(config) = config.filter(|_| expand_paths) {
-                            let value = eval(rule.dir, config, &path.backtrace, &path.value)?;
-                            files.extend(
-                                list::split(&value, list::Empty::Drop)
-                                    .into_iter()
-                                    .map(|path| join(source, &path)),
-                            );
+                InstallKind::Script(value) | InstallKind::Code(value) => {
+                    let script = matches!(rule.kind, InstallKind::Script(_));
+                    let value =
+                        rcmake_genex::rewrite_install_prefix(value, b"${CMAKE_INSTALL_PREFIX}");
+                    for config in action_configs(configs, options, has_genex(&value), multi) {
+                        let value = if let Some(config) = config {
+                            eval(rule.dir, config, &rule.backtrace, &value)?
                         } else {
-                            files.push(join(source, &path.value));
+                            value.clone()
+                        };
+                        let kind = if script {
+                            InstallActionKind::Script(
+                                if value.starts_with(b"${CMAKE_INSTALL_PREFIX}") {
+                                    value
+                                } else {
+                                    join(source, &value)
+                                },
+                            )
+                        } else {
+                            InstallActionKind::Code(value)
+                        };
+                        let mut action = make_action(options, b"", kind);
+                        if let Some(config) = config.filter(|_| multi) {
+                            action.configurations = vec![config.0.clone()];
                         }
+                        manifest.actions.push(action);
                     }
-                    let kind = match &rule.kind {
-                        InstallKind::Directory(_) => InstallActionKind::Directory {
-                            dirs: files,
-                            options: directory_options(&recorded, &options.permissions),
-                        },
-                        _ if files.is_empty() && expand_paths => continue,
-                        InstallKind::Programs(_) => file_action(b"PROGRAM", files, &options),
-                        _ => file_action(b"FILE", files, &options),
-                    };
-                    manifest.actions.push(make_action(&options, b"", kind));
+                    return Ok(());
                 }
-                continue;
-            }
-            InstallKind::Script(path) => InstallActionKind::Script(join(source, path)),
-            InstallKind::Code(code) => InstallActionKind::Code(code.clone()),
-            InstallKind::Export { .. } => {
-                let Some(plan) = export_plan else { continue };
-                InstallActionKind::Export { plan }
-            }
-            // CPS and SBOM files do not have install actions yet.
-            InstallKind::PackageInfo(_) | InstallKind::Sbom(_) => continue,
-        };
-        manifest.actions.push(make_action(options, b"", kind));
+                InstallKind::Export { .. } => {
+                    let Some(plan) = export_plan else {
+                        return Ok(());
+                    };
+                    InstallActionKind::Export { plan }
+                }
+                // CPS and SBOM files do not have install actions yet.
+                InstallKind::PackageInfo(_) | InstallKind::Sbom(_) => return Ok(()),
+            };
+            manifest.actions.push(make_action(options, b"", kind));
+            Ok(())
+        })()?;
+        if first < manifest.actions.len() {
+            manifest
+                .directories
+                .entry(rule.dir)
+                .or_default()
+                .push(crate::InstallEntry::Actions(first..manifest.actions.len()));
+        }
     }
     Ok(manifest)
 }
@@ -751,68 +580,6 @@ fn file_action(
     }
 }
 
-type TargetInstallKind = (&'static [u8], &'static [u8], (&'static [u8], &'static [u8]));
-
-fn target_install_kind(
-    kind: TargetKind,
-    layout: &crate::ide::BundleKind,
-) -> Option<TargetInstallKind> {
-    use crate::ide::BundleKind;
-    match layout {
-        BundleKind::Framework { .. } => {
-            return Some((
-                b"FRAMEWORK",
-                b"DIRECTORY",
-                (b"CMAKE_INSTALL_LIBDIR", b"lib"),
-            ));
-        }
-        BundleKind::App { .. } => {
-            return Some((b"BUNDLE", b"DIRECTORY", (b"CMAKE_INSTALL_BINDIR", b"bin")));
-        }
-        _ => {}
-    }
-    match kind {
-        TargetKind::Executable => {
-            Some((b"RUNTIME", b"EXECUTABLE", (b"CMAKE_INSTALL_BINDIR", b"bin")))
-        }
-        TargetKind::StaticLibrary => Some((
-            b"ARCHIVE",
-            b"STATIC_LIBRARY",
-            (b"CMAKE_INSTALL_LIBDIR", b"lib"),
-        )),
-        TargetKind::SharedLibrary => Some((
-            b"LIBRARY",
-            b"SHARED_LIBRARY",
-            (b"CMAKE_INSTALL_LIBDIR", b"lib"),
-        )),
-        TargetKind::ModuleLibrary => Some((
-            b"LIBRARY",
-            b"MODULE_LIBRARY",
-            (b"CMAKE_INSTALL_LIBDIR", b"lib"),
-        )),
-        _ => None,
-    }
-}
-
-fn artifact_paths<'a>(
-    artifacts: &'a crate::ArtifactSet,
-    group: Option<&Group<'_>>,
-) -> IndexSet<&'a BString> {
-    let mut paths = IndexSet::new();
-    let has_namelink = artifacts
-        .soname_file
-        .as_ref()
-        .zip(artifacts.linker_file.as_ref())
-        .is_some_and(|(soname, linker)| soname != linker);
-    if !group.is_some_and(|group| group.namelink_only) {
-        paths.extend(artifacts.file.iter().chain(&artifacts.soname_file));
-    }
-    if group.is_none_or(|group| !group.namelink_skip && (!group.namelink_only || has_namelink)) {
-        paths.extend(&artifacts.linker_file);
-    }
-    paths
-}
-
 fn recorded_args(model: &ProjectModel, rule: usize) -> Vec<&[u8]> {
     let section = format!("_RCMAKE_INSTALL_{rule}_ARG");
     (0..)
@@ -906,7 +673,10 @@ fn target_options<'a>(recorded: &[&'a [u8]]) -> IndexMap<&'a [u8], Group<'a>> {
             while args.next_if(|arg| !target_option(arg)).is_some() {}
             continue;
         }
-        let mut read = || args.next().map(BString::from);
+        let mut read = || {
+            args.next_if(|value| !target_option(value))
+                .map(BString::from)
+        };
         let entry: &mut Group<'_> = match group {
             Some(group) => groups.entry(group).or_default(),
             None => {

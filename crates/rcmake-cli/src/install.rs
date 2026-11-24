@@ -67,9 +67,15 @@ fn parse(args: &[BString], host: &dyn Host) -> Result<Options, ParseError> {
 
     while let Some(arg) = args.next() {
         let (mut flag, mut inline) = split_flag(arg, b'=');
+        if let Some(component) = flag.strip_prefix(b"--component ")
+            && inline.is_none()
+        {
+            flag = b"--component";
+            inline = Some(component.trim_ascii());
+        }
         if let Some(jobs) = flag.strip_prefix(b"-j").filter(|jobs| !jobs.is_empty()) {
             flag = b"-j";
-            inline = Some(jobs);
+            inline = Some(jobs.trim_ascii());
         }
         let mut value = || {
             inline
@@ -79,7 +85,10 @@ fn parse(args: &[BString], host: &dyn Host) -> Result<Options, ParseError> {
         };
         let var: (&[u8], BString) = match flag {
             b"--config" => (b"CMAKE_INSTALL_CONFIG_NAME", value()?.into()),
-            b"--prefix" => (b"CMAKE_INSTALL_PREFIX", value()?.into()),
+            b"--prefix" => (
+                b"CMAKE_INSTALL_PREFIX",
+                path::from_native_cmake(&resolve_cli_path(host, value()?)),
+            ),
             b"--strip" if inline.is_none() => (b"CMAKE_INSTALL_DO_STRIP", "1".into()),
             b"--default-directory-permissions" => (
                 b"CMAKE_INSTALL_DEFAULT_DIRECTORY_PERMISSIONS",
@@ -244,7 +253,7 @@ fn install(argv: &[BString], opts: Options, host: Arc<dyn Host>) -> i32 {
         }
         let outcome = interp.run_script(&script);
         if outcome.exit_code != 0 {
-            return outcome.exit_code;
+            return 1;
         }
     }
     0

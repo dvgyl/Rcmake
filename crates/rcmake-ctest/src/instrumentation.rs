@@ -119,16 +119,14 @@ impl<'a> Recorder<'a> {
         run: (&RunOutput, Option<ProcessMetrics>),
         sample: TestSample,
         elapsed: Duration,
-    ) {
-        let Some(command) = request.pipeline.first() else {
-            return;
-        };
+    ) -> Option<PathBuf> {
+        let command = request.pipeline.first()?;
         let (run, metrics) = run;
         let (result, interrupt_signal) = match run.results.first() {
             Some(ProcessResult::Exited(code)) => (Some(i64::from(*code)), None),
             Some(ProcessResult::Signaled(signal)) => (None, Some(*signal)),
             Some(ProcessResult::TimedOut) => (None, None),
-            _ => return,
+            _ => return None,
         };
         let command = std::iter::once(&command.program)
             .chain(&command.args)
@@ -159,10 +157,12 @@ impl<'a> Recorder<'a> {
             process_metrics: self.process_metrics.then_some(metrics),
             ..SnippetDetails::default()
         };
-        if let Err(error) =
-            snippet::write_snippet_with_details(self.host, &self.data, &snippet, &details)
-        {
-            self.report(error);
+        match snippet::write_snippet_with_details(self.host, &self.data, &snippet, &details) {
+            Ok(path) => Some(path),
+            Err(error) => {
+                self.report(error);
+                None
+            }
         }
     }
 

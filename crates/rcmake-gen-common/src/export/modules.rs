@@ -66,12 +66,6 @@ pub fn write_module_exports(
         };
         let directory = safe_directory(directory, plan)?;
         let members = module_export_members(model, plan);
-        if !members
-            .iter()
-            .any(|target| module_sets(model, target).next().is_some())
-        {
-            continue;
-        }
         let action = result.install.actions.iter().find(
             |action| matches!(action.kind, InstallActionKind::Export { plan } if plan == index),
         );

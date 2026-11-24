@@ -47,6 +47,7 @@ struct Settings {
     include_labels: Vec<BString>,
     exclude_labels: Vec<BString>,
     definitions: BTreeMap<BString, BString>,
+    overrides: Vec<BString>,
 }
 
 struct Session {
@@ -102,16 +103,33 @@ pub(crate) fn run_script(
         no_tests_action: invocation.execution.no_tests_action,
         include_labels: invocation.options.include_labels.clone(),
         exclude_labels: invocation.options.exclude_labels.clone(),
+        overrides: invocation.overwrite_configuration_file.clone(),
         definitions: invocation
             .definitions
             .iter()
             .filter_map(|definition| {
                 let (key, value) = dart::split(definition, b'=')?;
+                let key = dart::split(key, b':').map_or(key, |(key, _)| key);
                 Some((key.into(), value.into()))
             })
             .collect(),
     };
     execute_script(host, settings, &script.argument, script.new_process, 0)
+        .map(|outcome| outcome.code)
+}
+
+struct ScriptOutcome {
+    code: i32,
+    failed: bool,
+}
+
+impl ScriptOutcome {
+    fn status(code: i32) -> Self {
+        Self {
+            code,
+            failed: false,
+        }
+    }
 }
 
 fn execute_script(
@@ -120,7 +138,7 @@ fn execute_script(
     argument: &[u8],
     new_process: bool,
     depth: u32,
-) -> Result<i32, CtestError> {
+) -> Result<ScriptOutcome, CtestError> {
     if settings.depth >= MAX_SCRIPT_DEPTH {
         return Err(CtestError::Schedule(
             "Dashboard script nesting limit exceeded.".into(),
@@ -160,7 +178,7 @@ fn execute_script(
             !settings.quiet,
         )
         .map_err(|source| CtestError::Access { path: file, source })?;
-        return Ok(process_code(&output).unwrap_or(1));
+        return Ok(ScriptOutcome::status(process_code(&output).unwrap_or(1)));
     }
 
     if !host
@@ -171,7 +189,7 @@ fn execute_script(
             Stream::Stderr,
             format!("CMake Error: Cannot find file: {}\n", file.display()).as_bytes(),
         );
-        return Ok(1);
+        return Ok(ScriptOutcome::status(1));
     }
     let cmake_command = cmake_executable(host.as_ref());
     let (_, cmake_root) = rcmake_host::discover_cmake_root(host.as_ref(), None);
@@ -224,21 +242,24 @@ fn execute_script(
         failed: false,
     })));
     let code = interp.run_script(&file).exit_code;
+    let nested_failure =
+        SESSION.with_borrow(|session| session.as_ref().is_some_and(|session| session.failed));
+    let diagnostic_failure = interp.diag_engine().error_occurred();
     if let Some(code) = interp.requested_exit_code() {
         // Match the exit status from a CTest script that runs in a child process.
         #[cfg(unix)]
         let code = code & 0xff;
-        return Ok(code);
+        return Ok(ScriptOutcome {
+            code,
+            failed: nested_failure || diagnostic_failure,
+        });
     }
-    let failed =
-        SESSION.with_borrow(|session| session.as_ref().is_some_and(|session| session.failed));
-    if code == 0 && failed {
-        return Ok(255);
-    }
-    if code == 1 && (interp.diag_engine().error_occurred() || interp.fatal_occurred()) {
-        return Ok(255);
-    }
-    Ok(code)
+    let failed = (code == 0 && nested_failure)
+        || (code == 1 && (diagnostic_failure || interp.fatal_occurred()));
+    Ok(ScriptOutcome {
+        code: if failed { 255 } else { code },
+        failed,
+    })
 }
 
 pub(crate) fn cmake_executable(host: &dyn Host) -> PathBuf {
@@ -307,12 +328,25 @@ fn configuration(
         (b"CTEST_BUILD_NAME", &mut config.build_name),
         (b"CTEST_NIGHTLY_START_TIME", &mut config.nightly_start),
         (b"CTEST_CHANGE_ID", &mut config.change_id),
+        (
+            b"CTEST_LABELS_FOR_SUBPROJECTS",
+            &mut config.labels_for_subprojects,
+        ),
         (b"CTEST_TEST_COVERAGE_TOOL", &mut config.coverage_tool),
     ] {
         if cx.var_defined(key) {
             *value = cx.var_or_empty(key);
         }
     }
+    SESSION.with_borrow(|session| {
+        if let Some(session) = session {
+            for entry in &session.settings.overrides {
+                if let Some((key, value)) = dart::split(entry, b'=') {
+                    config.set(key, value);
+                }
+            }
+        }
+    });
     Ok(config)
 }
 
@@ -547,12 +581,15 @@ fn handler_process(
                 .join("Testing")
                 .join(tag.stamp())
                 .join("Configure.xml");
+            let source = prior_start().map(|start| start.source);
+            let config = configuration(cx, &build, source.as_deref())?;
             crate::dashboard::write_configure_report(
                 host,
                 &file,
                 &spec,
                 &output,
                 process_code(&output).unwrap_or(-1),
+                &config.labels_for_subprojects,
             )
             .map_err(error)?;
         }
@@ -696,7 +733,7 @@ fn ctest_run_script(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
     let mut code = 0;
     settings.depth += usize::from(!new_process);
     for script in scripts {
-        code = execute_script(
+        let outcome = execute_script(
             &host,
             settings.clone(),
             script,
@@ -704,6 +741,14 @@ fn ctest_run_script(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
             cx.recursion_depth(),
         )
         .map_err(|err| error(err.to_string()))?;
+        code = outcome.code;
+        if outcome.failed {
+            SESSION.with_borrow_mut(|session| {
+                if let Some(session) = session {
+                    session.failed = true;
+                }
+            });
+        }
     }
     if let Some(var) = return_value {
         cx.set_var(var, code.to_string().into());

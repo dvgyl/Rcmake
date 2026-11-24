@@ -14,6 +14,7 @@ use rcmake_presets::{EnvSnapshot, PresetKind};
 use crate::cli::{Invocation, Mode};
 use crate::runner::run_tests;
 
+mod build_and_test;
 mod cli;
 mod dart;
 mod dashboard;
@@ -22,6 +23,7 @@ mod discovery;
 mod execution;
 mod instrumentation;
 mod junit;
+mod launch;
 mod measurements;
 mod memcheck;
 mod reporting;
@@ -157,6 +159,11 @@ pub fn run(host: Arc<dyn Host>, options: &CtestOptions) -> Result<CtestOutcome, 
 /// Return the exit code for this CTest invocation or its launcher command.
 pub fn main(argv: &[BString], host: Arc<dyn Host>) -> i32 {
     let args = argv.get(1..).unwrap_or_default();
+    if let Some((flag, launcher)) = args.split_first()
+        && flag == "--launch"
+    {
+        return launch::run(host.as_ref(), launcher);
+    }
     match cli::parse(args, host.as_ref()).and_then(|mut invocation| {
         invocation.command = argv.to_vec();
         dispatch(&host, &invocation, args)
@@ -182,6 +189,7 @@ fn dispatch(
     args: &[BString],
 ) -> Result<i32, String> {
     match &invocation.mode {
+        Mode::BuildAndTest(command) => command.run(host.as_ref(), invocation.command.first()),
         Mode::CollectInstrumentation(dir) => {
             if host
                 .metadata(dir, Follow::Yes)
@@ -295,7 +303,7 @@ fn dispatch(
                         Ok(8)
                     }
                     Err(CtestError::Load(_)) => {
-                        reporting::failure_summary(host.as_ref(), dir);
+                        host.write_out(Stream::Stderr, b"Errors while running CTest\n");
                         Ok(8)
                     }
                     Err(error @ CtestError::Schedule(_)) => {
@@ -321,10 +329,8 @@ fn dispatch(
             }
             let mut code = 0;
             for script in &invocation.scripts {
-                code = code.max(
-                    script::run_script(host, invocation, script)
-                        .map_err(|error| error.to_string())?,
-                );
+                code |= script::run_script(host, invocation, script)
+                    .map_err(|error| error.to_string())?;
             }
             Ok(code)
         }

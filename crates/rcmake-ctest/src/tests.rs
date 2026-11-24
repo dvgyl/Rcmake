@@ -227,7 +227,7 @@ fn sets_the_working_directory_and_isolates_environment_changes() -> TestResult {
         add_test(second echo)
     "#,
     )?;
-    host.seed_file(Path::new("/work/local-run"), b"")?;
+    host.seed_file(Path::new("/work/run/local-run"), b"")?;
     host.env_set(b"VAR", Some(b"host"));
     host.env_set(b"DROP", Some(b"present"));
     let requests = commands(&host)?;
@@ -240,7 +240,7 @@ fn sets_the_working_directory_and_isolates_environment_changes() -> TestResult {
     let command = first.pipeline.first().ok_or("Expected a command.")?;
     assert_eq!(
         rcmake_host::path::to_native(&command.program),
-        Path::new("/work/local-run")
+        Path::new("/work/run/local-run")
     );
     assert_eq!(command.args, ["", "a;b"]);
     assert_eq!(

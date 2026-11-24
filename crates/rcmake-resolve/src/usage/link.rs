@@ -170,6 +170,14 @@ impl<'a> UsageResolver<'a> {
         self.usage_links(target, false, &link_context(target, ctx))
     }
 
+    pub(crate) fn graphviz_interface_links(
+        &mut self,
+        target: TargetId,
+        ctx: &EvalContext,
+    ) -> Result<SharedLinks, ResolveError> {
+        self.usage_links(target, true, ctx)
+    }
+
     /// Return the configuration requested by a computed target LOCATION property.
     #[must_use]
     pub fn location_property_config(kind: TargetKind, property: &[u8]) -> Option<ConfigId> {

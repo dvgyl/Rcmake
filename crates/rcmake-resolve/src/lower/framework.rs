@@ -1,6 +1,7 @@
 use rcmake_base::{BString, list, path_lex::Lexical, truth};
+use rcmake_genex::{ConfigId, EvalContext};
 use rcmake_host::{Host, ReadRange, WriteMode, path::to_native};
-use rcmake_model::{ProjectModel, Target, TargetKind};
+use rcmake_model::{ProjectModel, Target, TargetId, TargetKind};
 
 use super::{build_relative, definition, join, shell::direct};
 use crate::{ArtifactSet, CustomStep, ResolveError};
@@ -84,25 +85,30 @@ impl BundleKind {
 
     pub(crate) fn root<'a>(&self, executable: &'a [u8]) -> Option<&'a [u8]> {
         let suffix = [b".".as_slice(), self.extension()?.as_slice()].concat();
-        let mut path = Lexical::new(executable).parent();
-        while !path.is_empty() {
-            let current = Lexical::new(path);
-            if current.filename().ends_with(&suffix) {
-                return Some(path);
-            }
-            let parent = current.parent();
-            if path == parent {
-                break;
-            }
-            path = parent;
-        }
-        None
+        wrapper_root(Lexical::new(executable).parent(), &suffix)
     }
+}
+
+pub(crate) fn wrapper_root<'a>(mut path: &'a [u8], suffix: &[u8]) -> Option<&'a [u8]> {
+    while !path.is_empty() {
+        let current = Lexical::new(path);
+        if current.filename().ends_with(suffix) {
+            return Some(path);
+        }
+        let parent = current.parent();
+        if path == parent {
+            break;
+        }
+        path = parent;
+    }
+    None
 }
 
 pub(super) fn prepare(
     model: &ProjectModel,
     target: &Target,
+    id: TargetId,
+    config: &ConfigId,
     artifacts: &ArtifactSet,
     host: &dyn Host,
 ) -> Result<CustomStep, ResolveError> {
@@ -239,7 +245,110 @@ pub(super) fn prepare(
             step.byproducts.push(relative(&output));
         }
     }
+    let context = EvalContext {
+        config: config.clone(),
+        ..Default::default()
+    };
+    let mut usage = crate::usage::UsageResolver::new(model);
+    let directory = model.dir(target.dir);
+    for entry in usage.collect_property(id, b"SOURCES", &context)?.entries {
+        let source = join(source_dir, &entry.value);
+        let Some(location) =
+            crate::sources::properties(directory, &source).get(b"MACOSX_PACKAGE_LOCATION")
+        else {
+            continue;
+        };
+        let location = if desktop {
+            location.as_slice()
+        } else if location == b"Resources" {
+            b""
+        } else {
+            location.strip_prefix(b"Resources/").unwrap_or(location)
+        };
+        let dest = join(content, location);
+        let output = relative(&join(&dest, Lexical::new(&source).filename()));
+        let copy = if host
+            .metadata(&to_native(&source), rcmake_host::Follow::Yes)
+            .is_ok_and(|metadata| metadata.kind == rcmake_host::FileKind::Dir)
+        {
+            "copy_directory"
+        } else {
+            "copy"
+        };
+        let source = relative(&source);
+        run("make_directory", &[relative(&dest)]);
+        run(copy, &[source.clone(), output.clone()]);
+        step.depends.push(source);
+        step.byproducts.push(output);
+    }
     Ok(step)
+}
+
+pub(super) fn append_text_stub(
+    model: &ProjectModel,
+    target: &Target,
+    id: TargetId,
+    config: &ConfigId,
+    artifacts: &ArtifactSet,
+    step: &mut CustomStep,
+) -> Result<(), ResolveError> {
+    let (Some(stub), Some(runtime), Some(rule)) = (
+        artifacts.import_file.as_ref(),
+        artifacts.file.as_ref(),
+        definition(model, target.dir, b"CMAKE_CREATE_TEXT_STUBS"),
+    ) else {
+        return Ok(());
+    };
+    let relative = |path: &[u8]| build_relative(model, path);
+    let quote = |path: &[u8]| rcmake_base::shell::quote(path);
+    let cmake = definition(model, target.dir, b"CMAKE_COMMAND")
+        .cloned()
+        .unwrap_or_else(|| "cmake".into());
+    let run = |operation: &str, args: &[BString]| {
+        let mut argv = vec![cmake.clone(), "-E".into(), operation.into()];
+        argv.extend_from_slice(args);
+        direct(argv, None)
+    };
+    let parent = relative(Lexical::new(stub).parent());
+    if !parent.is_empty() {
+        step.invocations.push(run("make_directory", &[parent]));
+    }
+    let command = super::expand_rule(rule, |key| match key {
+        b"TARGET" => Some(quote(&relative(runtime))),
+        b"TARGET_IMPLIB" => Some(quote(&relative(stub))),
+        b"CMAKE_OSX_SYSROOT" => Some(quote(
+            definition(model, target.dir, b"CMAKE_OSX_SYSROOT")
+                .filter(|value| !value.is_empty())
+                .map_or(b"/", |value| value.as_slice()),
+        )),
+        _ => definition(model, target.dir, key).map(|value| quote(value)),
+    });
+    step.invocations.push(super::shell::command(command));
+    step.byproducts.push(relative(stub));
+    let usage = crate::usage::UsageResolver::new(model);
+    for kind in [
+        rcmake_genex::ArtifactKind::SonameImportFile,
+        rcmake_genex::ArtifactKind::LinkerImportFile,
+    ] {
+        let Some(path) = usage.artifact(id, kind, rcmake_genex::ArtifactPart::Full, config) else {
+            continue;
+        };
+        let path = relative(&path);
+        if step.byproducts.contains(&path) {
+            continue;
+        }
+        let source = if let Some(root) = bundle_kind(target).root(stub)
+            && Lexical::new(stub).parent() != root
+        {
+            join(b"Versions/Current", Lexical::new(stub).filename())
+        } else {
+            Lexical::new(stub).filename().into()
+        };
+        step.invocations
+            .push(run("create_symlink", &[source, path.clone()]));
+        step.byproducts.push(path);
+    }
+    Ok(())
 }
 
 fn expand<'a>(input: &[u8], lookup: impl Fn(&[u8]) -> &'a [u8]) -> Vec<u8> {

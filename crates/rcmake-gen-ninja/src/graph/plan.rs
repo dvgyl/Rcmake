@@ -2,7 +2,7 @@ use rcmake_base::BString;
 use rcmake_gen_common::export::ModuleExportJob;
 use rcmake_resolve::{BuildStep, Invocation, progress};
 
-use super::{Graph, StepNodes, shell_word};
+use super::{Graph, StepNodes, is_library_symlink, shell_word};
 
 pub(super) struct EdgePlan {
     pub(super) rule: &'static [u8],
@@ -76,6 +76,9 @@ impl<'a> Graph<'a> {
                             output,
                         ),
                     );
+                }
+                if let Some(pool) = self.pools.get(object) {
+                    plan.bind(b"pool", pool.clone());
                 }
                 if let Some(depfile) = depfile {
                     plan.bind(b"DEP_FILE", self.node(depfile));
@@ -169,6 +172,9 @@ impl<'a> Graph<'a> {
                 let inputs = inputs.iter().map(|input| self.node(input)).collect();
                 let mut plan = EdgePlan::new(step.kind.ninja_rule(), inputs, nodes);
                 plan.bind(b"COMMAND", command_line(invocations, false));
+                if let Some(pool) = self.pools.get(&step.output) {
+                    plan.bind(b"pool", pool.clone());
+                }
                 if let Some(output) = nodes.outputs.first() {
                     plan.bind(b"DESC", progress::link_description(step, output));
                 }
@@ -183,17 +189,29 @@ impl<'a> Graph<'a> {
                 if custom.invocations.is_empty() {
                     return EdgePlan::new(b"phony", inputs, nodes);
                 }
-                let mut plan = EdgePlan::new(b"CUSTOM_COMMAND", inputs, nodes);
+                let rule = if is_library_symlink(custom) {
+                    b"CMAKE_SYMLINK_LIBRARY".as_slice()
+                } else {
+                    b"CUSTOM_COMMAND"
+                };
+                let mut plan = EdgePlan::new(rule, inputs, nodes);
                 plan.bind(b"COMMAND", command_line(&custom.invocations, true));
                 if let Some(depfile) = &custom.depfile {
                     plan.bind(b"depfile", self.node(depfile));
                 }
-                let description = custom
-                    .comment
-                    .as_ref()
-                    .map_or(b"Running custom command".as_slice(), |comment| {
-                        comment.as_slice()
-                    });
+                let description = custom.comment.clone().unwrap_or_else(|| {
+                    if custom.outputs.is_empty() {
+                        return "Running custom command".into();
+                    }
+                    let mut description = BString::from("Generating ");
+                    for (index, output) in custom.outputs.iter().enumerate() {
+                        if index > 0 {
+                            description.extend_from_slice(b", ");
+                        }
+                        description.extend_from_slice(output);
+                    }
+                    description
+                });
                 plan.bind(b"DESC", description);
                 if custom.uses_terminal {
                     plan.bind(b"pool", b"console".as_slice());

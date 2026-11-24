@@ -44,18 +44,6 @@ pub(crate) fn initialize_diagnostics(
                 DiagAction::SendError,
                 false,
             ),
-            (
-                b"CMAKE_WARN_DEPRECATED",
-                DiagCategory::Deprecated,
-                DiagAction::Ignore,
-                false,
-            ),
-            (
-                b"CMAKE_ERROR_DEPRECATED",
-                DiagCategory::Deprecated,
-                DiagAction::SendError,
-                true,
-            ),
         ] {
             if cache
                 .get(name)
@@ -63,6 +51,28 @@ pub(crate) fn initialize_diagnostics(
             {
                 state.set(cat, action, false);
             }
+        }
+    }
+    for (name, on, off) in [
+        (
+            b"CMAKE_WARN_DEPRECATED".as_slice(),
+            DiagAction::Warn,
+            DiagAction::Ignore,
+        ),
+        (
+            b"CMAKE_ERROR_DEPRECATED",
+            DiagAction::SendError,
+            DiagAction::Warn,
+        ),
+    ] {
+        if let Some(entry) = cache.get(name) {
+            let current = state.get(DiagCategory::Deprecated);
+            let next = if is_on(&entry.value) {
+                current.max(on)
+            } else {
+                current.min(off)
+            };
+            state.set(DiagCategory::Deprecated, next, false);
         }
     }
     let initial = state;
@@ -115,7 +125,8 @@ pub(crate) fn initialize_diagnostics(
         ),
     ] {
         let action = state.get(cat);
-        if initial.get(cat) != action
+        if (configure && cat == DiagCategory::Deprecated)
+            || initial.get(cat) != action
             || preset.iter().chain(cli).any(|f| {
                 f.ends_with(b"dev")
                     || f.ends_with(b"author")
@@ -125,20 +136,48 @@ pub(crate) fn initialize_diagnostics(
             let enabled = if cat == DiagCategory::Author {
                 [action == DiagAction::Ignore, action < DiagAction::SendError]
             } else {
-                [
-                    action != DiagAction::Ignore,
-                    action >= DiagAction::SendError,
-                ]
+                [action >= DiagAction::Warn, action >= DiagAction::SendError]
             };
             for (name, value) in vars.into_iter().zip(enabled) {
                 cache::insert(
                     cache,
                     name,
-                    (if value { "TRUE" } else { "FALSE" }).into(),
+                    (if configure && cat == DiagCategory::Deprecated {
+                        if value { "ON" } else { "OFF" }
+                    } else if value {
+                        "TRUE"
+                    } else {
+                        "FALSE"
+                    })
+                    .into(),
                     Some(CacheType::Internal),
                 );
+                if configure
+                    && let Some(option) = legacy_warning_option(name)
+                    && let Some(entry) = cache.get_mut(name)
+                {
+                    entry.help = format!("Deprecated.  Use {option} instead.").into();
+                }
             }
         }
     }
     state
+}
+
+fn legacy_warning_option(name: &[u8]) -> Option<&'static str> {
+    match name {
+        b"CMAKE_WARN_DEPRECATED" => Some("-W[no-]deprecated"),
+        b"CMAKE_ERROR_DEPRECATED" => Some("-W[no-]error=deprecated"),
+        _ => None,
+    }
+}
+
+pub(super) fn warn_legacy_define(host: &dyn Host, name: &[u8]) {
+    if let Some(option) = legacy_warning_option(name) {
+        let variable = BString::from(name);
+        host.write_out(
+            Stream::Stderr,
+            format!("The {variable} variable is deprecated.  Use {option} instead.\n").as_bytes(),
+        );
+    }
 }

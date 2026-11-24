@@ -76,7 +76,6 @@ fn resolve_project(
     } else {
         configs.to_vec()
     };
-    validate_codegen_name(model, host)?;
     if model
         .commands()
         .any(|(_, command)| command.codegen && !command.implicit_depends.is_empty())
@@ -419,7 +418,8 @@ fn warn_link_flags(model: &ProjectModel, host: &dyn Host, targets: &[ResolvedTar
     }
 }
 
-fn validate_codegen_name(model: &ProjectModel, host: &dyn Host) -> Result<(), ResolveError> {
+/// Check for a target with the reserved name `codegen`.
+pub fn validate_codegen_name(model: &ProjectModel, host: &dyn Host) -> Result<(), ResolveError> {
     let policy = PolicyId::new(171);
     let status = model
         .dir(DirId::ROOT)
@@ -439,7 +439,7 @@ fn validate_codegen_name(model: &ProjectModel, host: &dyn Host) -> Result<(), Re
             SourcePaths::new(host).emit(
                 model,
                 MessageKind::Error,
-                Location::Backtrace(target.backtrace.clone()),
+                generation_source_location(Location::Backtrace(target.backtrace.clone())),
                 message.into(),
             );
             Err(ResolveError::Reported(message.into()))

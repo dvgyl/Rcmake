@@ -107,6 +107,14 @@ endif()
     Ok(out)
 }
 
+/// Return a serial include for a child install script.
+pub fn include_child_script(path: &[u8]) -> BString {
+    let mut code = BString::from("if(NOT CMAKE_INSTALL_LOCAL_ONLY)\n  include(");
+    quote(&mut code, path);
+    code.extend_from_slice(b")\nendif()");
+    code
+}
+
 /// Write the install script to an existing binary directory.
 pub fn write_install_script(
     manifest: &InstallManifest,
@@ -198,7 +206,13 @@ fn render_payload(
         }
         InstallActionKind::Script(script) => {
             out.extend_from_slice(b"include(");
-            quote(out, script);
+            if let Some(rest) = script.strip_prefix(b"${CMAKE_INSTALL_PREFIX}") {
+                out.extend_from_slice(b"\"${CMAKE_INSTALL_PREFIX}");
+                quoted_content(out, rest);
+                out.push(b'"');
+            } else {
+                quote(out, script);
+            }
             if action.optional {
                 out.extend_from_slice(b" OPTIONAL");
             }
@@ -338,7 +352,8 @@ fn regex_literal(out: &mut BString, byte: u8) {
     out.push(byte);
 }
 
-fn render_manifest(out: &mut BString, binary_dir: &[u8]) {
+/// Append the commands that write the top-level install manifest.
+pub fn render_manifest(out: &mut BString, binary_dir: &[u8]) {
     out.extend_from_slice(
         br#"if(CMAKE_INSTALL_COMPONENT)
   if(CMAKE_INSTALL_COMPONENT MATCHES "^[a-zA-Z0-9_.+-]+$")

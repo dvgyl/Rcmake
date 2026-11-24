@@ -153,6 +153,7 @@ fn install_script_covers_each_action_and_manifest_scope() {
     );
     file.optional = true;
     let manifest = InstallManifest {
+        directories: Default::default(),
         actions: vec![
             file,
             action(
@@ -694,6 +695,7 @@ mod differential {
         {
             let fixture = Fixture::new(&host);
             let manifest = InstallManifest {
+                directories: Default::default(),
                 actions: ["Debug", "Release"]
                     .into_iter()
                     .map(|config| {
@@ -775,6 +777,7 @@ mod differential {
             let mut dirs = from_native(&fixture.root.join("src/assets"));
             dirs.push(b'/');
             let manifest = InstallManifest {
+                directories: Default::default(),
                 actions: vec![
                     skipped,
                     wrong_config,

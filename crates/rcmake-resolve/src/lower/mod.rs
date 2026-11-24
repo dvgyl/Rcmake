@@ -21,10 +21,14 @@ mod property_tests;
 #[cfg(test)]
 mod tests;
 
+pub(crate) use install::exported_object_path;
+
 use rcmake_base::{BString, path_lex::Lexical};
 use rcmake_model::{DirId, ProjectModel, Target};
 
-pub(crate) use artifacts::{build_relative, compile_object_path, is_darwin};
+pub(crate) use artifacts::{
+    build_relative, compile_object_path, install_object_name_strategy, is_darwin,
+};
 pub use artifacts::{compute_artifacts, linker_language, object_path, source_language};
 pub(crate) use artifacts::{object_dir, short_object_paths};
 pub(crate) use compile::language_flags;
@@ -34,7 +38,7 @@ pub(crate) use graph::lower_with_inputs;
 pub(crate) use install::lower_install_manifest_with_configs;
 pub use install::{collect_metadata, lower_install_manifest};
 pub use launcher::instrumentation_launcher;
-pub(crate) use link::{ide_rpaths, install_name_dir};
+pub(crate) use link::{ide_rpaths, install_name_dir, install_name_prefix};
 pub(crate) use modules::scan_responses;
 pub use modules::{bmi_script_path, lower_modules};
 pub(crate) use policy_flags::warn_about_wrappers;

@@ -255,7 +255,27 @@ pub fn read_queries(host: &dyn Host, build_dir: &Path) -> Result<Vec<Query>, Ins
         for name in json_files(host, &dir)? {
             let file = dir.join(path::to_native(&name));
             match parse_query_file(&read_bytes(host, &file)?, &name.to_string()) {
-                Ok(query) => queries.push(query),
+                Ok(mut query) => {
+                    if query.options.iter().any(|option| {
+                        matches!(
+                            option,
+                            InstrumentOption::CdashSubmit | InstrumentOption::CdashVerbose
+                        )
+                    }) {
+                        if !query
+                            .options
+                            .contains(&InstrumentOption::DynamicSystemInformation)
+                        {
+                            query
+                                .options
+                                .push(InstrumentOption::DynamicSystemInformation);
+                        }
+                        if !query.hooks.contains(&Hook::PrepareForCDash) {
+                            query.hooks.push(Hook::PrepareForCDash);
+                        }
+                    }
+                    queries.push(query);
+                }
                 Err(InstrumentError::UnsupportedVersion) => {}
                 Err(error) => errors.push(error.to_string()),
             }

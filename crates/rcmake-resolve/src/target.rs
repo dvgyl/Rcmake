@@ -3,8 +3,8 @@ use rcmake_base::{BString, ByteSlice, list, path_lex::Lexical, truth};
 use rcmake_diag::{Backtrace, Location, MessageKind};
 use rcmake_genex::EvalContext;
 use rcmake_model::{
-    BT, CustomCommand, CustomCommandKind, FileSet, FileSetId, FileSetKind, ProjectModel, Target,
-    TargetId, TargetKind, UsageField,
+    BT, CustomCommand, CustomCommandKind, DirId, FileSet, FileSetId, FileSetKind, ProjectModel,
+    Target, TargetId, TargetKind, UsageField,
 };
 
 use crate::{
@@ -39,6 +39,20 @@ pub(crate) fn resolve_target<'a>(
         generator_provided: target.kind == TargetKind::GlobalTarget
             || target.name == STD_MODULE_TARGET,
     };
+    if let Some(strategy) = lower::install_object_name_strategy(model, target)
+        && !matches!(strategy.as_slice(), b"FULL" | b"SHORT")
+    {
+        let body: BString = format!(
+            "Property INSTALL_OBJECT_NAME_STRATEGY of target \"{}\" set to the unsupported strategy {strategy}", target.name
+        ).into();
+        paths.emit(
+            model,
+            MessageKind::Error,
+            crate::cxx_modules::generation_location(model, target),
+            body.clone(),
+        );
+        return Err(ResolveError::Reported(body));
+    }
     let flavor = usage.ide();
     let (artifacts, ide) = if let Some(flavor) = flavor {
         let (artifacts, facts) = ide_artifacts(model, usage, id, target, ctx, flavor)?;
@@ -118,7 +132,15 @@ pub(crate) fn resolve_target<'a>(
         }
         let member = members.get(&source.value);
         let source_props = sources::properties(dir, &source.value);
-        if member.is_some_and(|member| member.set.kind == FileSetKind::Headers) {
+        if source_props.get(b"MACOSX_PACKAGE_LOCATION").is_some()
+            && lower::is_darwin(model, target.dir)
+            && ide::bundle_kind(target) != ide::BundleKind::None
+        {
+            continue;
+        }
+        if paths.is_directory(&source.value)
+            || member.is_some_and(|member| member.set.kind == FileSetKind::Headers)
+        {
             continue;
         }
         let module = member.filter(|member| member.set.kind == FileSetKind::CxxModules);
@@ -159,7 +181,8 @@ pub(crate) fn resolve_target<'a>(
         let group_key = (
             language.clone(),
             member.map(|member| member.id),
-            sources::has_source_compile_properties(source_props).then(|| source.value.clone()),
+            sources::has_source_compile_properties(source_props, &ctx.config)
+                .then(|| source.value.clone()),
             unity_file.map(|file| (file.relocatable, file.config_guard)),
         );
         let (group, facts) = match groups.entry(group_key) {
@@ -241,6 +264,7 @@ pub(crate) fn resolve_target<'a>(
                     language,
                     flags,
                     defines,
+                    source_define_start: None,
                     includes,
                     units: Vec::new(),
                 };
@@ -266,6 +290,22 @@ pub(crate) fn resolve_target<'a>(
                 (group, facts)
             }
         };
+        if let Err(error) =
+            sources::install_object_name(model, target.dir, &source.value, &ctx.config)
+        {
+            return Err(match error {
+                ResolveError::Message(body) => {
+                    paths.emit(
+                        model,
+                        MessageKind::Error,
+                        crate::cxx_modules::generation_location(model, target),
+                        body.clone(),
+                    );
+                    ResolveError::Reported(body)
+                }
+                error => error,
+            });
+        }
         facts.units.push(resolved.compile_units.len());
         if flavor.is_none() && !lower::short_object_paths(model) {
             crate::sources::custom_object_name(model, target.dir, &source.value).map_err(
@@ -319,7 +359,13 @@ pub(crate) fn resolve_target<'a>(
 }
 
 fn has_configured_artifact_path(model: &ProjectModel, target: &Target) -> bool {
-    (lower::is_darwin(model, target.dir) && ide::bundle_kind(target) != ide::BundleKind::None)
+    (lower::is_darwin(model, target.dir)
+        && (ide::bundle_kind(target) != ide::BundleKind::None
+            || (target.kind == TargetKind::SharedLibrary
+                && target
+                    .props
+                    .get(b"ENABLE_EXPORTS")
+                    .is_some_and(|value| truth::is_on(value)))))
         || target.props.names().iter().any(|key| {
             (key.windows(b"OUTPUT_NAME".len())
                 .any(|part| part == b"OUTPUT_NAME")
@@ -491,6 +537,18 @@ pub(crate) fn instantiate_rules(
             ("RULE".into(), name.clone()),
             ("TARGET".into(), target.name.clone()),
             ("FILE_SET".into(), set.name.clone()),
+            (
+                "SOURCE_DIR".into(),
+                model.dir(DirId::ROOT).source_dir.clone(),
+            ),
+            (
+                "BINARY_DIR".into(),
+                model.dir(DirId::ROOT).binary_dir.clone(),
+            ),
+            (
+                "OUTPUT_CURRENT_SOURCE_DIR".into(),
+                model.dir(target.dir).source_dir.clone(),
+            ),
         ]);
         let output_set = rule
             .get(b"OUTPUT_FILE_SET")
@@ -498,7 +556,7 @@ pub(crate) fn instantiate_rules(
         let [output_name, output_type] = output_set.as_slice() else {
             continue;
         };
-        let output_name = expand_rule_patterns(output_name, &replacements);
+        let output_name = expand_rule_patterns(output_name, &replacements, true);
         let output_kind =
             FileSetKind::from_name(output_type).unwrap_or(if output_type == b"SYCL_HEADERS" {
                 FileSetKind::Headers
@@ -560,21 +618,28 @@ pub(crate) fn instantiate_rules(
                 b"COMPILE_OPTIONS",
                 b"COMPILE_DEFINITIONS",
             ] {
-                let values = [
+                let mut values = [
                     rule.get(key),
                     source_props.and_then(|props| props.get(key)),
                     set.props.get(key),
-                ]
-                .into_iter()
-                .flatten()
-                .filter(|value| !value.is_empty());
+                ];
+                if key == b"INCLUDE_DIRECTORIES" {
+                    values.swap(0, 2);
+                }
+                let values = values
+                    .into_iter()
+                    .flatten()
+                    .filter(|value| !value.is_empty());
                 replacements.insert(key.into(), list::join(values));
             }
             let source_key = [name.as_slice(), b"_PATTERNS"].concat();
+            let reserved = replacements
+                .keys()
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>();
             let patterns = set
                 .props
                 .get(b"RULE_PATTERNS")
-                .or_else(|| set.props.get(b"_RCMAKE_RULE_FILE_SET_PATTERNS"))
                 .into_iter()
                 .chain(
                     directory
@@ -582,16 +647,24 @@ pub(crate) fn instantiate_rules(
                         .get(&absolute)
                         .and_then(|props| props.get(&source_key)),
                 )
+                .chain(set.props.get(b"_RCMAKE_RULE_FILE_SET_PATTERNS"))
                 .chain(
                     set.props
                         .get(&[b"_RCMAKE_RULE_PATTERNS_".as_slice(), &absolute].concat()),
                 );
             for pattern in patterns.flat_map(|value| list::split(value, list::Empty::Drop)) {
-                if let Some((key, value)) = pattern.split_once_str(b"=") {
+                if let Some((key, value)) = pattern.split_once_str(b"=")
+                    && key.len() >= 2
+                    && key.first().is_some_and(u8::is_ascii_uppercase)
+                    && key
+                        .iter()
+                        .all(|key| key.is_ascii_uppercase() || key.is_ascii_digit() || *key == b'_')
+                    && !reserved.contains(key)
+                {
                     replacements.insert(key.into(), value.into());
                 }
             }
-            let expand = |value: &[u8]| expand_rule_patterns(value, &replacements);
+            let expand = |value: &[u8]| expand_rule_patterns(value, &replacements, false);
             let words = |key: &[u8]| {
                 rule.get(key)
                     .map_or_else(Vec::new, |value| list::split(value, list::Empty::Drop))
@@ -670,7 +743,11 @@ pub(crate) fn instantiate_rules(
     Ok(Some(prepared))
 }
 
-fn expand_rule_patterns(value: &[u8], patterns: &IndexMap<BString, BString>) -> BString {
+fn expand_rule_patterns(
+    value: &[u8],
+    patterns: &IndexMap<BString, BString>,
+    preserve_unknown: bool,
+) -> BString {
     let mut value = BString::from(value);
     for _ in 0..patterns.len().min(32) {
         let mut next = value.clone();
@@ -688,5 +765,30 @@ fn expand_rule_patterns(value: &[u8], patterns: &IndexMap<BString, BString>) -> 
         }
         value = next;
     }
-    value
+    if preserve_unknown {
+        return value;
+    }
+    let mut expanded = BString::default();
+    let mut remaining = value.as_slice();
+    while let Some((before, after)) = remaining.split_once_str(b"<")
+        && let Some((name, tail)) = after.split_once_str(b">")
+    {
+        expanded.extend_from_slice(before);
+        let placeholder = !before.ends_with(b"$")
+            && !name.is_empty()
+            && name
+                .iter()
+                .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'_');
+        let (open, close) = if placeholder {
+            (b'{', b'}')
+        } else {
+            (b'<', b'>')
+        };
+        expanded.push(open);
+        expanded.extend_from_slice(name);
+        expanded.push(close);
+        remaining = tail;
+    }
+    expanded.extend_from_slice(remaining);
+    expanded
 }

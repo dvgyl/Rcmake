@@ -191,21 +191,43 @@ impl<'a> Commands<'a> {
                     .borrow_mut()
                     .insert((id, command_config.clone()));
                 *program = file;
+                if !target.is_imported()
+                    && definition(self.model, command.dir, b"CMAKE_CROSSCOMPILING")
+                        .is_some_and(|value| truth::is_on(value))
+                    && let Some(emulator) = target.props.get(b"CROSSCOMPILING_EMULATOR")
+                {
+                    eval.context.config = command_config.clone();
+                    let emulator = eval.value(emulator)?;
+                    argv.splice(0..0, list::split(&emulator, list::Empty::Drop));
+                }
             }
             invocations.push(direct(argv, working_dir.clone()));
         }
         command_result((), errors)?;
-        for (id, config) in artifact_dependencies.into_inner() {
-            if Some(id) != command_target(command)
-                && let Some(target) = self.model.target(id).filter(|target| !target.is_imported())
-            {
-                if config == *self.config {
-                    dependencies.insert(id);
-                }
-                // File inputs also order custom commands whose target has no compile steps.
-                if let Some(file) = self.artifact(id, target, &config) {
-                    depends.insert(build_relative(self.model, &file));
-                }
+        let mut artifact_dependencies = artifact_dependencies.into_inner();
+        let mut next = 0;
+        while let Some((id, config)) = artifact_dependencies.get_index(next).cloned() {
+            next += 1;
+            let Some(target) = self
+                .model
+                .target(id)
+                .filter(|_| Some(id) != command_target(command))
+            else {
+                continue;
+            };
+            if target.is_imported() {
+                artifact_dependencies.extend(target.utility_deps.iter().filter_map(|entry| {
+                    let dependency = self.model.find_target(target.dir, &entry.value)?;
+                    Some((dependency, config.clone()))
+                }));
+                continue;
+            }
+            if config == *self.config {
+                dependencies.insert(id);
+            }
+            // File inputs also order custom commands whose target has no compile steps.
+            if let Some(file) = self.artifact(id, target, &config) {
+                depends.insert(build_relative(self.model, &file));
             }
         }
         let relative = |paths: Vec<BString>| {

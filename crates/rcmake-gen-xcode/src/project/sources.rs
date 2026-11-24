@@ -197,7 +197,9 @@ pub(super) fn source_files<'a>(
             let props = dir.source_props.get(path.as_bytes());
             if props
                 .and_then(|props| props.get(b"MACOSX_PACKAGE_LOCATION"))
-                .is_some_and(|location| location.as_slice() == b"Resources")
+                .is_some_and(|location| {
+                    location.as_slice() == b"Resources" || location.starts_with(b"Resources/")
+                })
             {
                 kind = IdeSourceKind::Resource;
             }

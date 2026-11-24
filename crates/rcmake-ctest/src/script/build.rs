@@ -93,7 +93,7 @@ pub(super) fn ctest_build(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
                 cx.host().write_out(Stream::Stdout, b"Build project\n");
             }
             let command_line = render_command(&command);
-            let start = cx.host().now().secs;
+            let start = cx.host().now();
             let output = handler_process(cx, args, cwd, command)?;
             let mut warnings = 0;
             let mut errors = 0;
@@ -131,7 +131,11 @@ pub(super) fn ctest_build(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
             }
             let source = previous.as_ref().map(|start| start.source.as_path());
             let config = configuration(cx, &build, source)?;
-            if let Ok(tag) = Tag::read(cx.host(), &build) {
+            let tag = previous
+                .as_ref()
+                .map(|start| start.tag.clone())
+                .or_else(|| Tag::read(cx.host(), &build).ok());
+            if let Some(tag) = tag {
                 let source = source.map_or_else(
                     || {
                         absolute(
@@ -245,7 +249,7 @@ struct BuildReport<'a> {
     config: &'a crate::dart::Configuration,
     command: &'a str,
     output: &'a RunOutput,
-    start: i64,
+    start: rcmake_host::FileTime,
     code: i32,
     errors: usize,
     warnings: usize,
@@ -270,6 +274,8 @@ fn write_build_report(
         let id = escape(&report.config.change_id, true);
         let _ = write!(xml, " ChangeId=\"{id}\"");
     }
+    xml.push_str(">\n");
+    crate::dart::write_subprojects(&mut xml, &report.config.labels_for_subprojects);
     let command = escape(report.command.as_bytes(), false);
     let stdout = escape(&report.output.stdout, false);
     let stderr = escape(&report.output.stderr, false);
@@ -277,8 +283,8 @@ fn write_build_report(
     let binary = escape(&path::from_native(dir), false);
     let _ = write!(
         xml,
-        ">\n<Build>\n<StartBuildTime>{}</StartBuildTime>\n<BuildCommand>{command}</BuildCommand>\n<SourceDirectory>{source}</SourceDirectory>\n<BinaryDirectory>{binary}</BinaryDirectory>\n<Log>{stdout}{stderr}</Log>\n",
-        report.start
+        "<Build>\n<StartBuildTime>{}</StartBuildTime>\n<BuildCommand>{command}</BuildCommand>\n<SourceDirectory>{source}</SourceDirectory>\n<BinaryDirectory>{binary}</BinaryDirectory>\n<Log>{stdout}{stderr}</Log>\n",
+        report.start.secs
     );
     for line in [
         report.output.stdout.as_slice(),
@@ -298,6 +304,12 @@ fn write_build_report(
         let text = escape(line, false);
         let _ = writeln!(xml, "<{diagnostic}><Text>{text}</Text></{diagnostic}>");
     }
+    if let Some(instrumentation) =
+        crate::dashboard::instrumentation_xml::Instrumentation::load(host, dir)
+    {
+        xml.push_str(&instrumentation.build(host, dir, report.start.secs));
+    }
+    xml.push_str(&crate::launch::diagnostics(host, dir, report.start));
     if report.abnormal {
         xml.push_str("<Failure type=\"Error\"><Result>Terminated abnormally</Result></Failure>\n");
     }

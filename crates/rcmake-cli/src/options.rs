@@ -134,7 +134,12 @@ struct Argument<'a, 'rest> {
 
 impl<'a, 'rest> Argument<'a, 'rest> {
     fn new(original: &'a [u8], rest: &'rest mut Arguments<'a>) -> Self {
-        let (flag, inline) = if original.starts_with(b"--") {
+        let (flag, inline) = if let Some(path) = original.strip_prefix(b"--install-prefix ") {
+            (
+                b"--install-prefix".as_slice(),
+                Some(path.trim_ascii_start()),
+            )
+        } else if original.starts_with(b"--") {
             split_flag(original, b'=')
         } else {
             let (flag, tail) = original.split_at(original.len().min(2));

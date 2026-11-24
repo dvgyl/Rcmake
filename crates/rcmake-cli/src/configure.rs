@@ -15,6 +15,9 @@ use crate::options::{self, CacheEdit, DirectoryArg, Options};
 use crate::{cache, emit_cli_error, new_interp, new_interp_with_paths, presets, resolve_cli_path};
 
 mod diagnostics;
+mod graphviz;
+
+use graphviz::write_graphviz;
 mod unused_cli;
 
 pub(crate) use diagnostics::initialize_diagnostics;
@@ -314,6 +317,24 @@ impl<'a> ConfigureSession<'a> {
             path::from_native(&self.src),
             Some(CacheType::Internal),
         );
+        for key in [
+            b"CMAKE_ROOT".as_slice(),
+            b"CMAKE_COMMAND",
+            b"CMAKE_CTEST_COMMAND",
+            b"CMAKE_CPACK_COMMAND",
+        ] {
+            let value = interp.cx().var_or_empty(key);
+            cache::insert(interp.cx().cache(), key, value, Some(CacheType::Internal));
+        }
+        let directory = path::from_native(&self.bin);
+        for (key, value) in [
+            (b"CMAKE_CACHEFILE_DIR".as_slice(), directory),
+            (b"CMAKE_CACHE_MAJOR_VERSION", "4".into()),
+            (b"CMAKE_CACHE_MINOR_VERSION", "5".into()),
+            (b"CMAKE_CACHE_PATCH_VERSION", "1".into()),
+        ] {
+            cache::insert(interp.cx().cache(), key, value, Some(CacheType::Internal));
+        }
         set_directory_vars(&mut interp, &self.src, &self.bin);
         Ok((interp, has_cache))
     }
@@ -326,6 +347,7 @@ impl<'a> ConfigureSession<'a> {
             match edit {
                 CacheEdit::Define(def) => {
                     let name = def.name.clone();
+                    diagnostics::warn_legacy_define(host, &name);
                     if unused_cli::apply_define(interp.cx().cache(), def)
                         && preloads.tracked.insert(name.clone())
                     {
@@ -470,9 +492,49 @@ impl<'a> ConfigureSession<'a> {
         }
         rcmake_instrument::query::clear_generated_queries(host, &self.bin)
             .map_err(Exit::message)?;
+        if host
+            .env_get(b"CTEST_USE_INSTRUMENTATION")
+            .is_some_and(|value| is_on(&value))
+        {
+            use rcmake_instrument::{DATA_VERSION, InstrumentOption, Query};
+            let mut query = Query {
+                version: DATA_VERSION,
+                callbacks: Vec::new(),
+                hooks: Vec::new(),
+                options: vec![
+                    InstrumentOption::CdashSubmit,
+                    InstrumentOption::DynamicSystemInformation,
+                ],
+            };
+            if host
+                .env_get(b"CTEST_USE_VERBOSE_INSTRUMENTATION")
+                .is_some_and(|value| is_on(&value))
+            {
+                query.options.push(InstrumentOption::CdashVerbose);
+            }
+            rcmake_instrument::query::write_generated_query(host, &self.bin, &query)
+                .map_err(Exit::message)?;
+        }
         // Configure scripts can add a query that requests the initial sample.
         let mut configure_step = crate::InstrumentationStep::start(host, true);
+        let key = b"CMAKE_INSTALL_PREFIX";
+        if let Some(entry) = interp.cx().cache().get_mut(key)
+            && !entry.value.is_empty()
+            && !rcmake_base::path_lex::Lexical::new(&entry.value).absolute()
+        {
+            entry.value =
+                path::from_native_cmake(&host.initial_cwd().join(path::to_native(&entry.value)));
+        }
         let result = interp.run_configure(&self.src, &self.bin, &[]);
+        if result.exit_code == 0
+            && rcmake_resolve::validate_codegen_name(interp.cx().project(), host).is_err()
+        {
+            if self.show_status() {
+                options::out(host, "-- Configuring incomplete, errors occurred!\n");
+            }
+            self.list_cache(interp);
+            return Err(Exit::Code(1));
+        }
         let queries =
             rcmake_instrument::query::read_queries(host, &self.bin).map_err(Exit::message)?;
         let sample = crate::sample_instrumentation(&queries);
@@ -518,7 +580,7 @@ impl<'a> ConfigureSession<'a> {
         let host = self.host.as_ref();
         let Configured { queries, sample } = configured;
         if let Some(graph) = &self.opts.graphviz {
-            write_graphviz(host, graph, interp)?;
+            write_graphviz(Arc::clone(&self.host), graph, interp)?;
         }
         let show_status = self.show_status();
         if self.opts.debug_output && show_status {
@@ -773,6 +835,7 @@ fn apply_environment_defaults(
         (b"CMAKE_BUILD_TYPE", CacheType::String),
         (b"CMAKE_EXPORT_COMPILE_COMMANDS", CacheType::Bool),
         (b"CMAKE_COLOR_DIAGNOSTICS", CacheType::Bool),
+        (b"CMAKE_CROSSCOMPILING_EMULATOR", CacheType::String),
     ] {
         if !has_cache
             && !cache.contains(name)
@@ -895,27 +958,6 @@ fn list_cache(host: &dyn Host, interp: &mut Interp, list: &options::ListCache) {
         }
     }
     host.write_out(Stream::Stdout, &out);
-}
-
-fn write_graphviz(host: &dyn Host, path: &Path, interp: &mut Interp) -> Result<(), Exit> {
-    let mut cx = interp.cx();
-    let name = cx.var_or_empty(b"CMAKE_PROJECT_NAME");
-    let mut graph = format!("digraph \"{}\" {{\n", dot_escape(&name));
-    for (_, target) in cx.project().targets() {
-        graph.push_str(&format!("  \"{}\";\n", dot_escape(&target.name)));
-    }
-    graph.push_str("}\n");
-    host.write(path, graph.as_bytes(), WriteMode::Truncate)
-        .map_err(|err| Exit::Message(format!("Could not write Graphviz output: {err}")))?;
-    options::out(host, &format!("Generate graphviz: {}\n", path.display()));
-    Ok(())
-}
-
-fn dot_escape(value: &[u8]) -> String {
-    String::from_utf8_lossy(value)
-        .replace('\\', "\\\\")
-        .replace('"', "\\\"")
-        .replace('\n', "\\n")
 }
 
 fn is_preload_file(host: &dyn Host, path: &Path) -> bool {

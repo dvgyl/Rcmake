@@ -1,9 +1,14 @@
 //! Link and archive rules.
 
+use std::borrow::Cow;
+use std::collections::BTreeMap;
+
 use indexmap::IndexSet;
 use rcmake_base::{BString, list, path_lex::Lexical, shell::quote, truth};
 use rcmake_diag::{PolicyId, PolicyStatus};
-use rcmake_genex::{ConfigId, EvalContext, UsageTraversal, evaluate, parse};
+use rcmake_genex::{
+    ArtifactKind, ArtifactPart, ConfigId, EvalContext, UsageTraversal, evaluate, parse,
+};
 use rcmake_model::{DirId, ProjectModel, Target, TargetId};
 
 use super::artifacts::{build_relative, is_darwin};
@@ -232,20 +237,7 @@ pub(super) fn link(
         })
     });
     let install_name_dir = if darwin && soname.is_some() {
-        let mut dir = install_name_dir(model, target, artifacts);
-        if let layout @ crate::ide::BundleKind::Framework { .. } = crate::ide::bundle_kind(target)
-            && let Some(file) = &artifacts.file
-            && let Some(root) = layout.root(file)
-            && let Some(relative) = Lexical::new(Lexical::new(file).parent())
-                .relative(Lexical::new(Lexical::new(root).parent()))
-            && !dir
-                .strip_suffix(b"/")
-                .is_some_and(|dir| Lexical::new(dir).normalize() == Lexical::new(file).parent())
-        {
-            dir.extend_from_slice(&relative);
-            dir.push(b'/');
-        }
-        dir
+        install_name_prefix(model, target, artifacts)
     } else {
         BString::default()
     };
@@ -336,6 +328,20 @@ pub(super) fn link(
             &objects,
         )
     };
+    if kind == LinkKind::StaticArchive
+        && darwin
+        && matches!(
+            model.generator,
+            Some(
+                rcmake_model::GeneratorKind::Ninja | rcmake_model::GeneratorKind::NinjaMultiConfig
+            )
+        )
+    {
+        invocations.push(direct(
+            vec![cmake(), "-E".into(), "touch".into(), step.output.clone()],
+            None,
+        ));
+    }
     let rule_launcher = target
         .props
         .get(b"RULE_LAUNCH_LINK")
@@ -472,7 +478,8 @@ fn link_libraries(
         .iter()
         .filter(|f| f.role != LinkFragmentRole::Flags);
     let libraries = linked_libraries(step);
-    let rpaths = rpaths(model, target, config, step, darwin, &libraries)?;
+    let runtime = runtime_libraries(model, target, config, step, &libraries);
+    let rpaths = rpaths(model, target, config, step, darwin, &runtime)?;
     inputs.extend(libraries);
     let mut arguments = rpaths;
     for fragment in link_fragments {
@@ -672,6 +679,27 @@ pub(crate) fn install_name_dir(
     dir
 }
 
+pub(crate) fn install_name_prefix(
+    model: &ProjectModel,
+    target: &Target,
+    artifacts: &ArtifactSet,
+) -> BString {
+    let mut dir = install_name_dir(model, target, artifacts);
+    if let layout @ crate::ide::BundleKind::Framework { .. } = crate::ide::bundle_kind(target)
+        && let Some(file) = &artifacts.file
+        && let Some(root) = layout.root(file)
+        && let Some(relative) = Lexical::new(Lexical::new(file).parent())
+            .relative(Lexical::new(Lexical::new(root).parent()))
+        && !dir
+            .strip_suffix(b"/")
+            .is_some_and(|dir| Lexical::new(dir).normalize() == Lexical::new(file).parent())
+    {
+        dir.extend_from_slice(&relative);
+        dir.push(b'/');
+    }
+    dir
+}
+
 fn rpaths(
     model: &ProjectModel,
     target: &Target,
@@ -738,6 +766,46 @@ fn linked_libraries(step: &LinkStep) -> Vec<BString> {
         .collect()
 }
 
+fn runtime_libraries<'a>(
+    model: &ProjectModel,
+    target: &Target,
+    config: &ConfigId,
+    step: &LinkStep,
+    libraries: &'a [BString],
+) -> Cow<'a, [BString]> {
+    if !is_darwin(model, target.dir) || !libraries.iter().any(|file| file.ends_with(b".tbd")) {
+        return Cow::Borrowed(libraries);
+    }
+    let Some(id) = model.find_target(target.dir, &target.name) else {
+        return Cow::Borrowed(libraries);
+    };
+    let mut usage = UsageResolver::new(model);
+    let ctx = EvalContext {
+        config: config.clone(),
+        link_language: Some(step.language.clone()),
+        ..EvalContext::default()
+    };
+    let Ok(dependencies) = usage.link_targets(id, &ctx) else {
+        return Cow::Borrowed(libraries);
+    };
+    let build = &model.dir(DirId::ROOT).binary_dir;
+    let absolute = |path: &[u8]| Lexical::new(&join(build, path)).normalize();
+    let runtimes: BTreeMap<_, _> = dependencies
+        .into_iter()
+        .filter_map(|id| {
+            let stub = usage.artifact(id, ArtifactKind::ImportFile, ArtifactPart::Full, config)?;
+            let file = usage.artifact(id, ArtifactKind::File, ArtifactPart::Full, config)?;
+            Some((absolute(&stub), file))
+        })
+        .collect();
+    Cow::Owned(
+        libraries
+            .iter()
+            .map(|file| runtimes.get(&absolute(file)).unwrap_or(file).clone())
+            .collect(),
+    )
+}
+
 fn runtime_flag<'a>(model: &'a ProjectModel, target: &Target, language: &[u8]) -> &'a [u8] {
     definition(
         model,
@@ -769,7 +837,8 @@ pub(super) fn install_rpath<E>(
     {
         return Ok(None);
     }
-    let libraries = linked_libraries(link);
+    let link_libraries = linked_libraries(link);
+    let libraries = runtime_libraries(model, target, &resolved.config, link, &link_libraries);
     let mut property = |key| {
         target_property(model, target, key)
             .map_or_else(|| Ok(BString::default()), |value| eval(value))

@@ -1,4 +1,7 @@
+use std::{collections::BTreeMap, ops::Range};
+
 use rcmake_base::BString;
+use rcmake_model::DirId;
 
 /// One install action of `cmake_install.cmake`.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -58,4 +61,15 @@ pub enum InstallActionKind {
 pub struct InstallManifest {
     /// Actions.
     pub actions: Vec<InstallAction>,
+    /// Local actions and child scripts in each directory's install order.
+    pub directories: BTreeMap<DirId, Vec<InstallEntry>>,
+}
+
+/// An entry in a directory's install script.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum InstallEntry {
+    /// A range of local actions in the flat manifest.
+    Actions(Range<usize>),
+    /// A child script included during serial installation.
+    Child(DirId),
 }

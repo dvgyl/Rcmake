@@ -26,14 +26,15 @@ mod target;
 mod unity;
 mod xcframework;
 
+pub mod graphviz;
 pub mod ide;
 pub mod lower;
 pub mod progress;
 pub mod usage;
 
-pub use install_manifest::{InstallAction, InstallActionKind, InstallManifest};
+pub use install_manifest::{InstallAction, InstallActionKind, InstallEntry, InstallManifest};
 pub use model::*;
-pub use pipeline::{resolve, resolve_with_options};
+pub use pipeline::{resolve, resolve_with_options, validate_codegen_name};
 
 #[cfg(test)]
 mod resolve_tests;

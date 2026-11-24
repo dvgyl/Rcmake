@@ -1,6 +1,6 @@
 //! Dashboard files for `-T Test` and dashboard scripts.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
@@ -23,6 +23,7 @@ pub(crate) struct Configuration {
     pub(crate) build_directory: BString,
     pub(crate) coverage_tool: BString,
     pub(crate) change_id: BString,
+    pub(crate) labels_for_subprojects: BString,
     pub(crate) submit_url: BString,
     pub(crate) submit_inactivity_timeout: Option<BString>,
     pub(crate) drop_method: BString,
@@ -106,9 +107,10 @@ impl Configuration {
         write_file(host, &file, &data)
     }
 
-    fn set(&mut self, key: &[u8], value: &[u8]) {
+    pub(crate) fn set(&mut self, key: &[u8], value: &[u8]) {
         match key {
             b"Site" => self.site = value.into(),
+            b"LabelsForSubprojects" => self.labels_for_subprojects = value.into(),
             b"BuildName" => self.build_name = value.into(),
             b"NightlyStartTime" => self.nightly_start = value.into(),
             b"SourceDirectory" => self.source_directory = value.into(),
@@ -350,7 +352,9 @@ pub(crate) fn write_test_xml(
     if !config.change_id.is_empty() {
         let _ = write!(xml, "\n\tChangeId=\"{}\"", escape(&config.change_id, true));
     }
-    xml.push_str("\n\t>\n\t<Testing>\n");
+    xml.push_str("\n\t>\n");
+    write_subprojects(&mut xml, &config.labels_for_subprojects);
+    xml.push_str("\t<Testing>\n");
     date_elements(host, &mut xml, "Start", run.started);
     xml.push_str("\t\t<TestList>\n");
     let tests = || {
@@ -373,6 +377,8 @@ pub(crate) fn write_test_xml(
         element(&mut xml, 3, "Test", full_name.as_bytes());
     }
     xml.push_str("\t\t</TestList>\n");
+    let instrumentation =
+        crate::dashboard::instrumentation_xml::Instrumentation::load(host, &dashboard.directory);
     let empty = TestRecord::default();
     for (test, status, relative, full_name) in tests() {
         let record = run.records.get(&test.number).unwrap_or(&empty);
@@ -481,7 +487,12 @@ pub(crate) fn write_test_xml(
             "Value",
             &truncate_output(&contents, limit, run.output.test_output_truncation),
         );
-        xml.push_str("\t\t\t\t</Measurement>\n\t\t\t</Results>\n");
+        xml.push_str("\t\t\t\t</Measurement>\n");
+        if let Some((instrumentation, file)) = instrumentation.as_ref().zip(record.snippet.as_ref())
+        {
+            instrumentation.test(host, &mut xml, file);
+        }
+        xml.push_str("\t\t\t</Results>\n");
         if !labels.is_empty() {
             xml.push_str("\t\t\t<Labels>\n");
             for label in labels {
@@ -559,6 +570,19 @@ fn date_elements(host: &dyn Host, xml: &mut String, prefix: &str, time: FileTime
         &format!("{prefix}TestTime"),
         time.secs.to_string().as_bytes(),
     );
+}
+
+pub(crate) fn write_subprojects(xml: &mut String, names: &[u8]) {
+    let names: BTreeSet<_> = rcmake_base::list::split(names, rcmake_base::list::Empty::Drop)
+        .into_iter()
+        .collect();
+    for label in names {
+        let name = escape(&label, true);
+        let _ = writeln!(xml, "\t<Subproject name=\"{name}\">");
+        xml.push_str("\t\t<Labels>\n");
+        element(xml, 3, "Label", &label);
+        xml.push_str("\t\t</Labels>\n\t</Subproject>\n");
+    }
 }
 
 fn measurement(xml: &mut String, kind: &str, name: &str, value: &str) {

@@ -1079,7 +1079,7 @@ fn relative_custom_dependencies_resolve_to_source_files_or_generated_outputs() -
         recipe.depends,
         [
             "/src/source.txt",
-            "/src/both.txt",
+            "both.txt",
             "generated.txt",
             "byproduct.txt",
             "missing.txt"

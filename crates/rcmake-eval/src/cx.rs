@@ -671,6 +671,32 @@ impl Cx<'_> {
         result
     }
 
+    /// Run a callback with a configured directory's definitions and policies.
+    pub fn with_directory_scope<T>(&mut self, dir: DirId, run: impl FnOnce(&mut Self) -> T) -> T {
+        let directory = self.interp.project.dir(dir);
+        let definitions = directory.vars.clone();
+        let policies = directory.final_policies;
+        self.interp.dir_stack.push(crate::DirFrame {
+            id: dir,
+            trace_base: self.interp.depth,
+            defer: None,
+        });
+        let policy_base = self.interp.policies.len();
+        self.interp.policies.push_copy();
+        if let Some(policies) = policies {
+            *self.interp.policies.top_mut() = policies;
+        }
+        let result = self.with_variable_scope(|cx| {
+            for (key, value) in definitions {
+                cx.interp.vars.set(&key, value);
+            }
+            run(cx)
+        });
+        self.interp.policies.pop_above(policy_base);
+        self.interp.dir_stack.pop();
+        result
+    }
+
     /// Read one package module or configuration file with its own unwind scope.
     pub fn include_package_file(&mut self, path: &Path, options: IncludeOptions) -> CmdResult {
         let limit = (self.recursion_limit() / 2).max(100) as usize;
@@ -681,10 +707,19 @@ impl Cx<'_> {
             return Err(CmdError::Reported);
         }
         let saved = core::mem::take(&mut self.interp.unwinding_package);
+        let prefix = (self.interp.package_file_depth != 0)
+            .then(|| self.var_normal_only(b"PACKAGE_PREFIX_DIR"));
         self.interp.package_file_depth += 1;
         let result = self.include_file(path, options);
         self.interp.package_file_depth -= 1;
         self.interp.unwinding_package = saved;
+        if let Some(prefix) = prefix {
+            if let Some(value) = prefix {
+                self.set_var(b"PACKAGE_PREFIX_DIR", value);
+            } else {
+                self.unset_var(b"PACKAGE_PREFIX_DIR");
+            }
+        }
         result
     }
 

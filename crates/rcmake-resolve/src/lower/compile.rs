@@ -315,7 +315,7 @@ fn linked_framework_includes(
     model: &ProjectModel,
     target: &Target,
     group: &CompileGroup,
-    directories: &[BString],
+    directories: &[(BString, bool)],
 ) -> BString {
     if directories.is_empty() {
         return BString::default();
@@ -325,12 +325,13 @@ fn linked_framework_includes(
         let path = clean_include_path(&include.path.value);
         framework_directory(&path).map(|path| Lexical::new(path).normalize())
     }));
-    join_words(directories.iter().filter_map(|directory| {
+    join_words(directories.iter().filter_map(|(directory, system)| {
         let path = clean_include_path(directory);
         emitted.insert(Lexical::new(&path).normalize()).then(|| {
-            let system = group.includes.iter().any(|include| {
-                include.system && Lexical::new(&path).equal(Lexical::new(&include.path.value))
-            });
+            let system = *system
+                || group.includes.iter().any(|include| {
+                    include.system && Lexical::new(&path).equal(Lexical::new(&include.path.value))
+                });
             framework_flag(model, target, &group.language, &path, system)
         })
     }))
@@ -354,13 +355,22 @@ pub(super) fn compile_arguments(
         required_standard,
         position_independent,
     )?;
-    let mut defines: Vec<_> = group
+    let boundary = group.source_define_start.unwrap_or(group.defines.len());
+    let (target_defines, source_defines) = group
         .defines
-        .iter()
-        .map(|define| define.value.as_slice())
-        .collect();
-    defines.sort_unstable();
-    defines.dedup();
+        .split_at_checked(boundary)
+        .unwrap_or((&group.defines, &[]));
+    let defines = [target_defines, source_defines]
+        .into_iter()
+        .flat_map(|definitions| {
+            let mut definitions: Vec<_> = definitions
+                .iter()
+                .map(|define| define.value.as_slice())
+                .collect();
+            definitions.sort_unstable();
+            definitions.dedup();
+            definitions
+        });
     let intdir = (model.generator == Some(GeneratorKind::NinjaMultiConfig)).then(|| {
         let mut define = BString::from(b"-DCMAKE_INTDIR=\\\"".as_slice());
         define.extend_from_slice(&quote(&config.0));
@@ -368,11 +378,9 @@ pub(super) fn compile_arguments(
         define
     });
     let defines = join_words(
-        intdir.into_iter().chain(
-            defines
-                .into_iter()
-                .map(|define| quote(&[b"-D", define].concat())),
-        ),
+        intdir
+            .into_iter()
+            .chain(defines.map(|define| quote(&[b"-D", define].concat()))),
     );
     let includes = includes(model, target, group);
     if (model
@@ -403,7 +411,7 @@ pub(super) struct Settings<'a> {
     pub(super) pch: Option<PchFlags<'a>>,
     pub(super) position_independent: Option<bool>,
     pub(super) skip_file_set_linting: Option<bool>,
-    pub(super) extra_framework_dirs: &'a [BString],
+    pub(super) extra_framework_dirs: &'a [(BString, bool)],
 }
 
 #[expect(

@@ -183,7 +183,7 @@ pub(crate) fn run(
     };
     match result {
         Ok(()) => {
-            if !queries.is_empty() {
+            if !queries.is_empty() || interp.cx().var_is_on(b"CTEST_USE_LAUNCHERS") {
                 let project_name = interp.cx().var_or_empty(b"CMAKE_PROJECT_NAME");
                 write_instrumentation_content(
                     host,
@@ -204,6 +204,7 @@ pub(crate) fn run(
 fn configure_rules(interp: &mut Interp) -> Result<(), Failure> {
     struct RuleCall {
         set: FileSetId,
+        dir: rcmake_model::DirId,
         name: BString,
         target: BString,
         file_set: BString,
@@ -244,6 +245,7 @@ fn configure_rules(interp: &mut Interp) -> Result<(), Failure> {
                         .into();
                     Some(RuleCall {
                         set: id,
+                        dir,
                         name: name.clone(),
                         target: target.name.clone(),
                         file_set: set.name.clone(),
@@ -256,53 +258,51 @@ fn configure_rules(interp: &mut Interp) -> Result<(), Failure> {
             })
             .collect::<Vec<_>>()
     };
+    let mut failed = false;
     for call in calls {
         let mut cx = interp.cx();
-        let mut invoke =
-            |commands: &[BString], source: Option<&BString>| -> Result<BString, Failure> {
-                let mut args = vec![
-                    call.name.clone(),
-                    call.target.clone(),
-                    call.file_set.clone(),
-                    call.output_set.clone(),
-                ];
-                args.extend(source.cloned());
-                let variable = b"_rcmake_custom_rule_patterns";
-                args.push(variable.as_slice().into());
-                let args = args
-                    .into_iter()
-                    .map(|text| rcmake_syntax::Argument {
-                        kind: rcmake_syntax::ArgKind::Bracket,
-                        text,
-                        line: 0,
-                        span: 0..0,
-                    })
-                    .collect::<Vec<_>>();
-                cx.with_variable_scope(|cx| {
-                    cx.set_var(variable, BString::default());
-                    cx.global().props.set(
-                        b"\0RCMAKE_IN_RULE_CONFIGURATOR".as_slice().into(),
-                        "1".into(),
-                    );
-                    let result = commands.iter().try_for_each(|command| {
-                        let args = cx.expand_raw_args(&args)?;
-                        cx.call_command(command, args).map(|_| ())
-                    });
-                    cx.global().props.unset(b"\0RCMAKE_IN_RULE_CONFIGURATOR");
-                    result.map_err(|_| Failure::Reported)?;
-                    if cx.diag_engine().error_occurred() {
-                        return Err(Failure::Reported);
-                    }
-                    Ok(cx.var_or_empty(variable))
+        let mut invoke = |commands: &[BString], source: Option<&BString>| {
+            let mut args = vec![
+                call.name.clone(),
+                call.target.clone(),
+                call.file_set.clone(),
+                call.output_set.clone(),
+            ];
+            args.extend(source.cloned());
+            let variable = b"_CMAKE_RULE_PATTERNS";
+            args.push(variable.as_slice().into());
+            let args = args
+                .into_iter()
+                .map(|text| rcmake_syntax::Argument {
+                    kind: rcmake_syntax::ArgKind::Bracket,
+                    text,
+                    line: 0,
+                    span: 0..0,
                 })
-            };
-        let file_set = invoke(&call.file_set_configurators, None)?;
+                .collect::<Vec<_>>();
+            cx.with_directory_scope(call.dir, |cx| {
+                cx.set_var(variable, BString::default());
+                cx.global().props.set(
+                    b"\0RCMAKE_IN_RULE_CONFIGURATOR".as_slice().into(),
+                    "1".into(),
+                );
+                for command in commands {
+                    let result = cx
+                        .expand_raw_args(&args)
+                        .and_then(|args| cx.call_command(command, args));
+                    failed |= result.is_err();
+                }
+                cx.global().props.unset(b"\0RCMAKE_IN_RULE_CONFIGURATOR");
+                cx.var_or_empty(variable)
+            })
+        };
+        let file_set = invoke(&call.file_set_configurators, None);
         let sources = call
             .files
             .iter()
             .filter(|_| !call.source_configurators.is_empty())
-            .map(|file| invoke(&call.source_configurators, Some(file)).map(|value| (file, value)))
-            .collect::<Result<Vec<_>, _>>()?;
+            .map(|file| (file, invoke(&call.source_configurators, Some(file))))
+            .collect::<Vec<_>>();
         if let Some(set) = cx.project().file_set_mut(call.set) {
             if !file_set.is_empty() {
                 set.props
@@ -319,6 +319,9 @@ fn configure_rules(interp: &mut Interp) -> Result<(), Failure> {
                 }
             }
         }
+    }
+    if failed || interp.cx().diag_engine().error_occurred() {
+        return Err(Failure::Reported);
     }
     Ok(())
 }
@@ -352,7 +355,13 @@ fn write_instrumentation_content(
             labels: target
                 .props
                 .get(b"LABELS")
-                .map_or_else(Vec::new, |v| split(v, Empty::Drop)),
+                .into_iter()
+                .chain(model.dir(target.dir).props.get(b"LABELS"))
+                .chain(model.definition(target.dir, b"CMAKE_DIRECTORY_LABELS"))
+                .flat_map(|value| split(value, Empty::Drop))
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect(),
         })
         .collect::<Vec<_>>();
     let include_static = queries.iter().any(|query| {
@@ -423,20 +432,7 @@ fn write_common(
             export_files: &export_files,
             ..Default::default()
         };
-        write(
-            host,
-            &bin.join("cmake_install.cmake"),
-            common::install_script::render_with_options(&manifest, &binary_dir, &options),
-        )?;
-        let mut cx = interp.cx();
-        let model = cx.project();
-        let parallel = model.dirs().count() == 1
-            && model
-                .global
-                .props
-                .get(b"INSTALL_PARALLEL")
-                .is_some_and(|value| rcmake_base::truth::is_on(value));
-        install_index::write(host, bin, &manifest, options, parallel)?;
+        install_index::write(host, bin, interp.cx().project(), &manifest, options)?;
     }
     let cmake_files = bin.join("CMakeFiles");
     let log_path = cmake_files.join("CMakeConfigureLog.yaml");
@@ -535,7 +531,9 @@ fn write_exports(
                 .map_or_else(BString::default, |file| path::from_native_cmake(file))
         })
         .collect::<Vec<_>>();
+    let mut offsets = Vec::with_capacity(result.install.actions.len() + 1);
     for action in &result.install.actions {
+        offsets.push(manifest.actions.len());
         manifest.actions.push(action.clone());
         if let InstallActionKind::Export { plan } = action.kind {
             let (main, configurations) = staged
@@ -563,6 +561,18 @@ fn write_exports(
                 action.kind = InstallActionKind::Export { plan };
                 manifest.actions.push(action);
             }
+        }
+    }
+    offsets.push(manifest.actions.len());
+    manifest.directories = result.install.directories.clone();
+    for entry in manifest.directories.values_mut().flatten() {
+        if let rcmake_resolve::InstallEntry::Actions(range) = entry {
+            let Some((&start, &end)) = offsets.get(range.start).zip(offsets.get(range.end)) else {
+                return Err(GenError::Invalid(
+                    "Invalid range of install actions.".into(),
+                ));
+            };
+            *range = start..end;
         }
     }
     Ok((manifest, export_files))

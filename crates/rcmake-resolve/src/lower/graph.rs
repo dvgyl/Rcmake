@@ -110,9 +110,24 @@ pub(crate) fn lower_with_inputs(
         let artifacts = artifacts(model, target, resolved);
         let lint = lint_settings(model, resolved.id, usage, config)?;
         let framework_dirs =
-            crate::resolve_link::framework_dirs(model, target, &resolved.dependencies, &|id| {
-                resolved_targets.get(&id)?.artifacts.file.as_ref()
-            });
+            if !resolved.compile_units.is_empty() && super::is_darwin(model, target.dir) {
+                let context = EvalContext {
+                    config: config.clone(),
+                    link_language: resolved.link.as_ref().map(|link| link.language.clone()),
+                    ..Default::default()
+                };
+                let mut framework_dependencies = resolved.dependencies.clone();
+                framework_dependencies.extend(usage.link_targets(resolved.id, &context)?);
+                crate::resolve_link::framework_dirs(
+                    model,
+                    target,
+                    &framework_dependencies,
+                    &|id| resolved_targets.get(&id)?.artifacts.file.as_ref(),
+                    config,
+                )
+            } else {
+                Vec::new()
+            };
         let objects = plan.add_compile_steps(
             &artifacts,
             &commands,
@@ -188,15 +203,19 @@ fn add_codegen_target(
     commands: &Commands<'_>,
     graph: &mut BuildGraph,
 ) -> Result<(), ResolveError> {
-    let mut reachable: IndexSet<_> = graph
-        .targets
+    let mut reachable: IndexSet<_> = local
         .iter()
-        .take(local.len())
         .enumerate()
-        .filter_map(|(index, target)| target.in_all.then_some(index))
+        .filter_map(|(index, (target, _))| {
+            let excluded = target
+                .props
+                .get(b"EXCLUDE_FROM_ALL")
+                .is_some_and(|value| truth::is_on(value));
+            (!excluded).then_some(index)
+        })
         .collect();
     let mut pending: Vec<_> = reachable.iter().rev().copied().collect();
-    let mut roots = IndexSet::new();
+    let mut roots = BTreeMap::<DirId, IndexSet<usize>>::new();
     let mut requirements = IndexMap::<usize, IndexSet<usize>>::new();
     while let Some(index) = pending.pop() {
         let Some(((target, _), owner)) = local.get(index).zip(graph.targets.get(index)) else {
@@ -213,7 +232,7 @@ fn add_codegen_target(
         }
         for &step in &owner.steps {
             if commands.codegen.contains(&step) {
-                roots.insert(step);
+                roots.entry(target.dir).or_default().insert(step);
                 let owner_deps: IndexSet<_> = explicit
                     .clone()
                     .filter(|&dep| {
@@ -231,9 +250,6 @@ fn add_codegen_target(
             }
         }
     }
-    let mut steps = IndexSet::new();
-    let mut dependencies = IndexSet::new();
-    commands.add_producers(roots, &mut steps, &mut dependencies)?;
     for (step, required) in requirements {
         if let Some(BuildStep::Custom(command)) = graph.steps.get_mut(step) {
             for target in required
@@ -247,15 +263,36 @@ fn add_codegen_target(
             }
         }
     }
-    graph.targets.push(GraphTarget {
-        name: "codegen".into(),
-        steps: steps.into_iter().collect(),
-        depends: dependencies
-            .iter()
-            .filter_map(|id| indices.get(id).copied())
-            .collect(),
-        in_all: false,
-    });
+    let offset = graph.targets.len();
+    let directories = model
+        .dirs()
+        .enumerate()
+        .map(|(index, (id, _))| (id, offset + index))
+        .collect::<BTreeMap<_, _>>();
+    for (dir, directory) in model.dirs() {
+        let mut steps = IndexSet::new();
+        let mut dependencies = IndexSet::new();
+        commands.add_producers(
+            roots.remove(&dir).unwrap_or_default(),
+            &mut steps,
+            &mut dependencies,
+        )?;
+        let prefix = super::build_relative(model, &directory.binary_dir);
+        graph.targets.push(GraphTarget {
+            name: super::join(&prefix, b"codegen"),
+            steps: steps.into_iter().collect(),
+            depends: dependencies
+                .iter()
+                .filter_map(|id| indices.get(id).copied())
+                .chain(directory.children.iter().filter_map(|child| {
+                    (!model.dir(*child).exclude_from_all)
+                        .then(|| directories.get(child).copied())
+                        .flatten()
+                }))
+                .collect(),
+            in_all: false,
+        });
+    }
     Ok(())
 }
 
@@ -430,7 +467,7 @@ impl<'a> TargetPlan<'a> {
         artifacts: &ArtifactSet,
         commands: &Commands<'_>,
         precompiled: &pch::Plans,
-        (lint, framework_dirs): (&IndexMap<BString, bool>, &[BString]),
+        (lint, framework_dirs): (&IndexMap<BString, bool>, &[(BString, bool)]),
         usage: &mut UsageResolver<'_>,
         graph_steps: &mut Vec<BuildStep>,
         compile_inputs: &mut BTreeMap<BString, Vec<BString>>,
@@ -563,7 +600,7 @@ impl<'a> TargetPlan<'a> {
         let (model, config, target, resolved) =
             (self.model, self.config, self.target, self.resolved);
         if let Some(step) = link_step(model, target, resolved, artifacts)? {
-            let before = commands.events(
+            let mut before = commands.events(
                 resolved.id,
                 &[Some(TargetEvent::PreBuild), Some(TargetEvent::PreLink)],
                 usage,
@@ -581,22 +618,38 @@ impl<'a> TargetPlan<'a> {
             )?;
             let position_independent = self.inputs.and_then(|inputs| inputs.position_independent);
             let mut linker_artifacts = artifacts.clone();
+            let framework = matches!(
+                crate::ide::bundle_kind(target),
+                crate::ide::BundleKind::Framework { .. }
+            );
             if super::is_darwin(model, target.dir)
-                && matches!(
-                    crate::ide::bundle_kind(target),
-                    crate::ide::BundleKind::Framework { .. }
-                )
+                && (framework || artifacts.import_file.is_some())
                 && usage.ide().is_none()
                 && let Some(paths) = usage.source_paths()
             {
-                let framework =
+                let mut resources =
                     prepare_framework(model, target, config, resolved, artifacts, paths.host)?;
-                after.invocations.splice(..0, framework.invocations);
-                after.depends.extend(framework.depends);
-                after.byproducts.extend(framework.byproducts);
-                linker_artifacts
-                    .linker_file
-                    .clone_from(&linker_artifacts.file);
+                if !resources.invocations.is_empty() {
+                    resources.outputs = std::mem::take(&mut resources.byproducts);
+                    before.depends.extend(resources.outputs.iter().cloned());
+                    resources.comment =
+                        Some(format!("Copying framework resources for {}", target.name).into());
+                    self.steps
+                        .insert(push(graph_steps, BuildStep::Custom(resources)));
+                }
+                super::framework::append_text_stub(
+                    model,
+                    target,
+                    resolved.id,
+                    config,
+                    artifacts,
+                    &mut after,
+                )?;
+                if framework {
+                    linker_artifacts
+                        .linker_file
+                        .clone_from(&linker_artifacts.file);
+                }
             }
             let link = link(
                 model,
@@ -626,8 +679,25 @@ impl<'a> TargetPlan<'a> {
                     }
                 }
             }
-            let link = attach_link_events(model, artifacts, link, before, after);
+            let symlink = if matches!(
+                model.generator,
+                Some(GeneratorKind::Ninja | GeneratorKind::NinjaMultiConfig)
+            ) {
+                separate_library_symlinks(&mut link, &mut after)
+            } else {
+                None
+            };
+            let mut link_outputs = artifacts.clone();
+            if symlink.is_some() || framework {
+                link_outputs.soname_file = None;
+                link_outputs.linker_file = None;
+            }
+            let link = attach_link_events(model, &link_outputs, link, before, after);
             self.steps.insert(push(graph_steps, link));
+            if let Some(symlink) = symlink {
+                self.steps
+                    .insert(push(graph_steps, BuildStep::Custom(symlink)));
+            }
         } else {
             // Ninja and Make run the utility command before PRE_BUILD and POST_BUILD.
             let mut utility = commands.events(
@@ -684,6 +754,35 @@ fn lint_settings(
     Ok(settings)
 }
 
+fn separate_library_symlinks(link: &mut BuildStep, after: &mut CustomStep) -> Option<CustomStep> {
+    let BuildStep::Link {
+        step, invocations, ..
+    } = link
+    else {
+        return None;
+    };
+    let index = invocations.iter().position(|invocation| {
+        invocation
+            .argv
+            .get(2)
+            .is_some_and(|word| word == b"cmake_symlink_library")
+    })?;
+    let mut symlink = std::mem::take(after);
+    let command = invocations.remove(index);
+    let links: IndexSet<_> = command
+        .argv
+        .get(4..)?
+        .iter()
+        .filter(|path| **path != step.output)
+        .cloned()
+        .collect();
+    symlink.comment = Some(format!("Creating library symlink {}", list::join(&links)).into());
+    symlink.outputs.extend(links);
+    symlink.depends.push(step.output.clone());
+    symlink.invocations.insert(0, command);
+    Some(symlink)
+}
+
 fn prepare_framework(
     model: &ProjectModel,
     target: &Target,
@@ -693,7 +792,7 @@ fn prepare_framework(
     host: &dyn rcmake_host::Host,
 ) -> Result<CustomStep, ResolveError> {
     debug_assert!(config.matches(&resolved.config.0));
-    super::framework::prepare(model, target, artifacts, host)
+    super::framework::prepare(model, target, resolved.id, config, artifacts, host)
 }
 
 fn link_step(

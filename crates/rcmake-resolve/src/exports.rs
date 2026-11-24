@@ -1,3 +1,5 @@
+mod interface_paths;
+
 use indexmap::{IndexMap, IndexSet, map::Entry};
 use rcmake_base::{BString, list, path_lex::Lexical};
 use rcmake_genex::{ConfigId, EvalContext, GenexNode, PreprocessMode, TargetHandle, render};
@@ -407,6 +409,15 @@ fn export_target<'a>(
         kind: kind.into(),
         ..ExportedTarget::default()
     };
+    if target
+        .props
+        .get(b"ENABLE_EXPORTS")
+        .is_some_and(|value| rcmake_base::truth::is_on(value))
+    {
+        exported
+            .properties
+            .insert("ENABLE_EXPORTS".into(), "1".into());
+    }
     let mode = if install.is_some() {
         PreprocessMode::Install
     } else {
@@ -419,14 +430,14 @@ fn export_target<'a>(
         .filter(|key| key.starts_with(b"INTERFACE_"))
     {
         if let Some(value) = target.props.get(&key) {
-            add_export_property(&mut exported, key, value, mode)?;
+            add_export_property(model, target, &mut exported, key, value, mode)?;
         }
     }
     for (field, entries) in &target.usage.fields {
         let key = field.name();
         if key.starts_with("INTERFACE_") {
             let value = list::join(entries.iter().map(|entry| &entry.value));
-            add_export_property(&mut exported, key.into(), &value, mode)?;
+            add_export_property(model, target, &mut exported, key.into(), &value, mode)?;
         }
     }
     let alternative = model
@@ -444,6 +455,10 @@ fn export_target<'a>(
         })
         .transpose()?;
     let layout = crate::ide::bundle_kind(target);
+    let darwin = crate::lower::is_darwin(model, target.dir);
+    if darwin && matches!(layout, crate::ide::BundleKind::Framework { .. }) {
+        exported.properties.insert("FRAMEWORK".into(), "1".into());
+    }
     for facts in resolved {
         let mut properties = IndexMap::new();
         for (key, path) in [
@@ -477,10 +492,13 @@ fn export_target<'a>(
         }
         if properties.contains_key(b"IMPORTED_LOCATION".as_slice()) {
             if let Some(soname) = &facts.artifacts.soname_file {
-                properties.insert(
-                    "IMPORTED_SONAME".into(),
-                    Lexical::new(soname).filename().into(),
-                );
+                let mut value = if darwin {
+                    crate::lower::install_name_prefix(model, target, &facts.artifacts)
+                } else {
+                    BString::default()
+                };
+                value.extend_from_slice(Lexical::new(soname).filename());
+                properties.insert("IMPORTED_SONAME".into(), value);
             }
             if kind == "STATIC" {
                 let languages: IndexSet<_> = facts
@@ -509,27 +527,8 @@ fn export_target<'a>(
                 .compile_units
                 .iter()
                 .filter_map(|unit| {
-                    let object = absolute_path(root, &unit.object);
-                    manifest
-                        .actions
-                        .iter()
-                        .filter(|action| {
-                            action
-                                .configurations
-                                .iter()
-                                .any(|config| facts.config.matches(config))
-                        })
-                        .find_map(|action| match &action.kind {
-                            InstallActionKind::Files {
-                                files,
-                                rename: Some(name),
-                                file_type,
-                                ..
-                            } if file_type == b"FILE" && files.contains(&object) => {
-                                Some(absolute_path(&action.destination, name))
-                            }
-                            _ => None,
-                        })
+                    let built = absolute_path(root, &unit.object);
+                    crate::lower::exported_object_path(manifest, &facts.config, &built)
                 })
                 .collect::<Vec<_>>();
             if !paths.is_empty() {
@@ -593,6 +592,8 @@ fn exported_location(
 }
 
 fn add_export_property(
+    model: &ProjectModel,
+    raw: &rcmake_model::Target,
     target: &mut ExportedTarget,
     key: BString,
     value: &[u8],
@@ -600,15 +601,31 @@ fn add_export_property(
 ) -> Result<(), ResolveError> {
     let mut items = export_property_items(value, mode)?;
     if mode == PreprocessMode::Install {
+        let path_property = matches!(
+            key.as_slice(),
+            b"INTERFACE_INCLUDE_DIRECTORIES"
+                | b"INTERFACE_SYSTEM_INCLUDE_DIRECTORIES"
+                | b"INTERFACE_SOURCES"
+        );
+        let wrapped = rcmake_genex::parse(value)?;
+        let mut install_paths = Vec::new();
+        for node in &wrapped.nodes {
+            let raw = render(std::slice::from_ref(node));
+            if raw.starts_with(b"$<INSTALL_INTERFACE:") {
+                install_paths.extend(export_property_items(&raw, mode)?);
+            }
+        }
         for item in &mut items {
-            *item = rcmake_genex::rewrite_install_prefix(item, b"${_IMPORT_PREFIX}");
-            if matches!(
-                key.as_slice(),
-                b"INTERFACE_INCLUDE_DIRECTORIES" | b"INTERFACE_SYSTEM_INCLUDE_DIRECTORIES"
-            ) && Lexical::new(item).root_directory().is_empty()
+            if path_property
+                && install_paths.contains(item)
+                && !Lexical::new(item).absolute()
                 && !item.starts_with(b"$")
             {
                 *item = [b"${_IMPORT_PREFIX}/", item.as_slice()].concat().into();
+            }
+            *item = rcmake_genex::rewrite_install_prefix(item, b"${_IMPORT_PREFIX}");
+            if path_property {
+                interface_paths::validate(model, raw, &key, item)?;
             }
         }
     }

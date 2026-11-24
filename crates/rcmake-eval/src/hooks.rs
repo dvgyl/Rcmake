@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use rcmake_base::BString;
-use rcmake_diag::{Backtrace, Effect, Frame, FrameKind, MessageKind, PolicyStatus};
+use rcmake_diag::{Backtrace, Effect, Frame, FrameKind, MessageKind, PolicyId, PolicyStatus};
 use rcmake_host::{Stream, WriteMode};
 use rcmake_model::DirId;
 use rcmake_syntax::{ArgKind, Argument, CommandInvocation};
@@ -207,8 +207,9 @@ impl Interp {
         access: WatchAccess,
         value: Option<&[u8]>,
     ) -> bool {
-        if self.watches.is_empty() {
-            return false;
+        let policy = PolicyId::new(218);
+        if deprecated_cache_variable(name) && self.policy_status(policy) == PolicyStatus::Warn {
+            self.issue_policy_warning(policy, b"", b"");
         }
         let Some(list) = self.watches.get(name) else {
             return false;
@@ -325,7 +326,7 @@ impl Interp {
     /// Define a normal variable and notify its watches (`cmMakefile::AddDefinition`).
     pub(crate) fn define(&mut self, name: &[u8], value: BString) {
         self.record_variable_access(name);
-        if self.watches.contains_key(name) {
+        if deprecated_cache_variable(name) || self.watches.contains_key(name) {
             self.vars.set(name, value.clone());
             self.fire_watches(name, WatchAccess::Modified, Some(&value));
         } else {
@@ -343,7 +344,7 @@ impl Interp {
     /// Read a variable and notify its watches (`cmMakefile::GetDefinition`).
     pub(crate) fn read_var(&mut self, name: &[u8]) -> Option<BString> {
         let value = self.lookup_var(name).cloned();
-        if !self.watches.contains_key(name) {
+        if !deprecated_cache_variable(name) && !self.watches.contains_key(name) {
             return value;
         }
         let access = if value.is_some() {
@@ -628,6 +629,10 @@ fn synthetic_code(name: &[u8], args: Vec<Argument>, line: u32, file: Arc<[u8]>) 
         Arc::from(vec![synthetic_invocation(name, args, line)]),
         file,
     )
+}
+
+fn deprecated_cache_variable(name: &[u8]) -> bool {
+    matches!(name, b"CMAKE_WARN_DEPRECATED" | b"CMAKE_ERROR_DEPRECATED")
 }
 
 #[cfg(test)]

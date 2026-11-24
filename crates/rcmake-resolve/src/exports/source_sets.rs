@@ -73,7 +73,10 @@ pub(super) fn export(
         .file_sets
         .iter()
         .filter_map(|id| model.file_set(*id))
-        .filter(|set| set.kind == FileSetKind::Sources && set.scope != UsageScope::Private)
+        .filter(|set| {
+            matches!(set.kind, FileSetKind::Sources | FileSetKind::Headers)
+                && set.scope != UsageScope::Private
+        })
         .map(|set| {
             let mut entries = Vec::new();
             for config in configs {
@@ -102,6 +105,7 @@ pub(super) fn export(
             let base_paths = collect_paths(&entries, |(_, bases, _)| bases, install.is_some());
             let files = collect_paths(&entries, |(_, _, files)| files, install.is_some());
             Ok(ExportedSourceSet {
+                kind: set.kind,
                 name: set.name.clone(),
                 bases: base_paths,
                 files,
@@ -215,7 +219,15 @@ fn resolve_destination(
         {
             continue;
         }
-        if let Some(destination) = options.destination {
+        let destination = options.destination.or_else(|| {
+            (set.kind == FileSetKind::Headers).then(|| {
+                model
+                    .definition(dir, b"CMAKE_INSTALL_INCLUDEDIR")
+                    .cloned()
+                    .unwrap_or_else(|| "include".into())
+            })
+        });
+        if let Some(destination) = destination {
             let ctx = EvalContext {
                 config: config.clone(),
                 ..EvalContext::default()

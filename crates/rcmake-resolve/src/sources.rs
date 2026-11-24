@@ -48,9 +48,14 @@ impl SourceUsage {
             Self::Options => group
                 .flags
                 .extend(source_values.into_iter().chain(set_values)),
-            Self::Definitions => group
-                .defines
-                .extend(source_values.into_iter().chain(set_values)),
+            Self::Definitions => {
+                if !source_values.is_empty() || !set_values.is_empty() {
+                    group.source_define_start = Some(group.defines.len());
+                    group
+                        .defines
+                        .extend(source_values.into_iter().chain(set_values));
+                }
+            }
             Self::Includes => {
                 let mut seen = IndexSet::new();
                 group.includes = set_values
@@ -68,8 +73,20 @@ impl SourceUsage {
     }
 }
 
-pub(crate) fn has_source_compile_properties(props: SourceProperties<'_>) -> bool {
+fn config_definition_property(config: &ConfigId) -> Vec<u8> {
+    [
+        b"COMPILE_DEFINITIONS_".as_slice(),
+        &config.0.to_ascii_uppercase(),
+    ]
+    .concat()
+}
+
+pub(crate) fn has_source_compile_properties(
+    props: SourceProperties<'_>,
+    config: &ConfigId,
+) -> bool {
     props.get(b"COMPILE_FLAGS").is_some()
+        || (!config.0.is_empty() && props.get(&config_definition_property(config)).is_some())
         || SourceUsage::ALL
             .into_iter()
             .any(|usage| props.get(usage.property()).is_some())
@@ -93,7 +110,7 @@ pub(crate) fn apply_compile_properties(
     }
     for field in SourceUsage::ALL {
         let name = field.property();
-        let source_values = match source_props.get(name) {
+        let mut source_values = match source_props.get(name) {
             Some(value) => usage.file_set_paths(
                 target,
                 name,
@@ -102,6 +119,15 @@ pub(crate) fn apply_compile_properties(
             )?,
             None => Vec::new(),
         };
+        if matches!(field, SourceUsage::Definitions) && !ctx.config.0.is_empty() {
+            let key = config_definition_property(&ctx.config);
+            let configured = source_props
+                .get(&key)
+                .into_iter()
+                .map(|value| BT::new(value.clone(), source.backtrace.clone()))
+                .collect::<Vec<_>>();
+            source_values.extend(usage.file_set_paths(target, &key, &configured, &ctx)?);
+        }
         let set_values = if let Some(member) = member {
             let owner = member.set.target;
             let key = if owner == target {
@@ -248,8 +274,9 @@ impl<'a> SourcePaths<'a> {
         source: &BString,
         binary: &BString,
     ) -> bool {
-        self.host.metadata(&to_native(source), Follow::Yes).is_ok()
-            || (!self.generated.contains_key(binary) && dir.source_props.contains_key(source))
+        !self.generated_in(dir, binary)
+            && (self.host.metadata(&to_native(source), Follow::Yes).is_ok()
+                || dir.source_props.contains_key(source))
     }
 
     pub(crate) fn find(&self, dir: &Directory, source: &[u8]) -> Option<BString> {
@@ -266,8 +293,14 @@ impl<'a> SourcePaths<'a> {
         paths.into_iter().find(|path| {
             self.host
                 .metadata(&to_native(path), Follow::Yes)
-                .is_ok_and(|metadata| metadata.kind == FileKind::File)
+                .is_ok_and(|metadata| matches!(metadata.kind, FileKind::File | FileKind::Dir))
         })
+    }
+
+    pub(crate) fn is_directory(&self, path: &[u8]) -> bool {
+        self.host
+            .metadata(&to_native(path), Follow::Yes)
+            .is_ok_and(|metadata| metadata.kind == FileKind::Dir)
     }
 
     pub(crate) fn missing_sources(&self) -> bool {
@@ -486,14 +519,16 @@ fn object_property(
         },
         ..EvalContext::default()
     };
-    let (name, flags) = evaluate(&parse(raw)?, &ctx, &mut usage.host(dir))?;
+    let ast = parse(raw).map_err(rcmake_genex::GenexError::without_location)?;
+    let (name, flags) = evaluate(&ast, &ctx, &mut usage.host(dir))
+        .map_err(rcmake_genex::GenexError::without_location)?;
     let path = Lexical::new(&name);
     let reason = if flags.head_sensitive
         || flags.link_language_sensitive
         || (config.is_none() && flags.context_sensitive)
     {
         format!(
-            "contains a context-sensitive generator expression ({}).",
+            "contains a context-sensitive condition which is not supported\n  ({}).",
             raw
         )
     } else if path.absolute() || !path.root_name().is_empty() {

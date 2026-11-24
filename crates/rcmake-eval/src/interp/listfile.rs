@@ -17,6 +17,15 @@ pub(crate) const CMP0198: PolicyId = PolicyId::new(198);
 impl Interp {
     /// Execute a standalone `-P` script at `path`.
     pub fn run_script(&mut self, path: &Path) -> RunOutcome {
+        self.run_script_impl(path, true)
+    }
+
+    /// Run a listfile for a caller that reports its own file processing errors.
+    pub fn run_embedded_script(&mut self, path: &Path) -> RunOutcome {
+        self.run_script_impl(path, false)
+    }
+
+    fn run_script_impl(&mut self, path: &Path, report_processing_error: bool) -> RunOutcome {
         self.init_policy_minimum();
         let cwd = rcmake_host::path::from_native_cmake(&self.config.cwd);
         let abs = collapse_full_path(&rcmake_host::path::from_native_cmake(path), &cwd);
@@ -33,7 +42,7 @@ impl Interp {
         if !self.is_regular_file(&abs) {
             self.error_no_location(cat(&[b"Not a file: ", &abs]));
         }
-        if !self.read_list_file(&abs) {
+        if !self.read_list_file(&abs) && report_processing_error {
             self.error_no_location(cat(&[b"Error processing file: ", &abs]));
         }
         RunOutcome {

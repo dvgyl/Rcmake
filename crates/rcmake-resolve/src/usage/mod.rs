@@ -8,8 +8,8 @@ use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use rcmake_base::{BString, Limits, list, truth};
-use rcmake_diag::Frame;
+use rcmake_base::{BString, Limits, list, path_lex::Lexical, truth};
+use rcmake_diag::{Frame, Location, MessageKind};
 use rcmake_genex::{
     EvalContext, EvalFlags, EvalSite, GenexError, GenexNode, TargetHandle, UsageTraversal,
     evaluate, parse,
@@ -567,8 +567,41 @@ impl<'a> UsageResolver<'a> {
         for entry in entries {
             let (value, flags) = self.eval_entry(target, dir, property, entry, ctx, false)?;
             result.flags = result.flags.union(flags);
+            let values = list::split(&value, list::Empty::Drop);
+            if matches!(
+                property,
+                b"INTERFACE_INCLUDE_DIRECTORIES" | b"INTERFACE_SOURCES"
+            ) && let Some(paths) = self.source_paths()
+                && let Some(path) = values.iter().find(|value| !Lexical::new(value).absolute())
+            {
+                result.flags.head_sensitive = true;
+                if let Some(head) = ctx.head.filter(|head| *head != handle(target))
+                    && let Some(consumer) = self
+                        .ids
+                        .get(head.0 as usize)
+                        .and_then(|id| self.model.target(*id))
+                {
+                    let name = &self.target(target)?.name;
+                    let property = BString::from(property);
+                    let body: BString = format!(
+                        "Target \"{name}\" contains relative path in its {property}:\n\n  \"{path}\""
+                    ).into();
+                    let file = Lexical::new(&self.model.dir(consumer.dir).source_dir)
+                        .append(b"CMakeLists.txt");
+                    paths.emit(
+                        self.model,
+                        MessageKind::Error,
+                        Location::FileLine {
+                            file: file.as_slice().into(),
+                            line: 0,
+                        },
+                        body.clone(),
+                    );
+                    return Err(ResolveError::Reported(body));
+                }
+            }
             result.entries.extend(
-                list::split(&value, list::Empty::Drop)
+                values
                     .into_iter()
                     .map(|value| BT::new(value, entry.backtrace.clone())),
             );

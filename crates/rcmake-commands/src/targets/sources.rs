@@ -42,26 +42,49 @@ pub(super) fn add(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
                     .position(|arg| super::scope(bytes(arg)).is_some())
                     .unwrap_or(tail.len());
                 let (items, next) = tail.split_at(end);
+                let model = cx.project();
+                let target_dir = model
+                    .target(id)
+                    .map(|target| model.dir(target.dir).source_dir.clone())
+                    .ok_or_else(|| model_error(ModelError::UnknownObject))?;
+                let different_dir = target_dir != dir;
+                let policy = PolicyId::new(76);
+                let status = cx.policy(policy);
+                let items = || items.iter().map(bytes).filter(|item| !item.is_empty());
+                let needs_conversion = different_dir || scope != UsageScope::Private;
+                if needs_conversion
+                    && status == PolicyStatus::Warn
+                    && items()
+                        .any(|item| !item.starts_with(b"$<") && !Lexical::new(item).absolute())
+                {
+                    cx.issue_policy_warning(policy, b"", b"");
+                }
                 let target = cx
                     .project()
                     .target_mut(id)
                     .ok_or_else(|| model_error(ModelError::UnknownObject))?;
                 usage::validate_scope(target, scope, true)?;
-                let value = list::join(
-                    items
-                        .iter()
-                        .map(bytes)
-                        .filter(|item| !item.is_empty())
-                        .map(|item| absolute(item, &dir)),
-                );
-                if !value.is_empty() {
-                    if scope != UsageScope::Interface {
-                        target.sources.push(BT::new(value.clone(), bt.clone()));
+                let value = |convert| {
+                    list::join(items().map(|item| {
+                        if convert && status == PolicyStatus::New {
+                            absolute(item, &dir)
+                        } else {
+                            BString::from(item)
+                        }
+                    }))
+                };
+                if scope != UsageScope::Interface {
+                    let direct = value(different_dir);
+                    if !direct.is_empty() {
+                        target.sources.push(BT::new(direct, bt.clone()));
                     }
-                    if scope != UsageScope::Private {
+                }
+                if scope != UsageScope::Private {
+                    let interface = value(true);
+                    if !interface.is_empty() {
                         target
                             .usage
-                            .push(UsageField::InterfaceSources, BT::new(value, bt.clone()));
+                            .push(UsageField::InterfaceSources, BT::new(interface, bt.clone()));
                     }
                 }
                 rest = next;

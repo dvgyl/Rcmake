@@ -228,7 +228,12 @@ fn plan_targets<'a>(
     for (index, target) in graph.targets.iter().enumerate() {
         let name = target.name.as_slice();
         check_make_path(name)?;
-        if name.contains(&b'/')
+        let directory_codegen = name.ends_with(b"/codegen")
+            && !name.starts_with(b"/")
+            && !name
+                .split(|&byte| byte == b'/')
+                .any(|part| matches!(part, b"" | b"." | b".."));
+        if (name.contains(&b'/') && !directory_codegen)
             || GLOBAL_TARGETS.contains(&name)
             || names.insert(name, index).is_some()
         {
@@ -273,7 +278,7 @@ fn plan_targets<'a>(
             .is_some_and(|target| {
                 target.policies.policies.get(PolicyId::new(113)) != PolicyStatus::New
             });
-        let codegen = target.name == b"codegen"
+        let codegen = (target.name == b"codegen" || target.name.ends_with(b"/codegen"))
             && project.is_some_and(|project| {
                 project
                     .dir(DirId::ROOT)

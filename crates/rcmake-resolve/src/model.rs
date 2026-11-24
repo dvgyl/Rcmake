@@ -245,6 +245,8 @@ pub struct CompileGroup {
     pub flags: Vec<BT<BString>>,
     /// Preprocessor definitions (`NAME` or `NAME=value`).
     pub defines: Vec<BT<BString>>,
+    /// Index of the first source-level definition, if present.
+    pub source_define_start: Option<usize>,
     /// Include directories in search order.
     pub includes: Vec<InterfaceInclude>,
     /// Indices into [`ResolvedTarget::compile_units`].
@@ -520,6 +522,8 @@ pub struct ExportedTarget {
 /// A source file set for one imported target.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ExportedSourceSet {
+    /// File set type.
+    pub kind: rcmake_model::FileSetKind,
     /// Name of the file set.
     pub name: BString,
     /// Exported base directories.

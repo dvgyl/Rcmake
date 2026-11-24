@@ -336,6 +336,19 @@ impl ProjectModel {
         Ok(id)
     }
 
+    /// List the names that alias a target.
+    pub fn target_aliases(&self, id: TargetId) -> impl Iterator<Item = &BString> {
+        self.global_targets
+            .iter()
+            .chain(
+                self.dirs()
+                    .flat_map(|(_, directory)| &directory.local_targets),
+            )
+            .filter_map(move |(name, binding)| {
+                (*binding == TargetBinding::Alias(id)).then_some(name)
+            })
+    }
+
     /// Add `ALIAS` name `alias` for `target`, created in directory `dir`. An alias of a
     /// non-global imported target is local to `dir`.
     pub fn add_alias(

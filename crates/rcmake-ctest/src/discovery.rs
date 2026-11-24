@@ -37,6 +37,15 @@ impl Test {
     pub(crate) fn list(&self, key: &[u8]) -> Vec<BString> {
         list::split(self.property(key), list::Empty::Drop)
     }
+
+    pub(crate) fn working_directory(&self) -> PathBuf {
+        let directory = self.property(b"WORKING_DIRECTORY");
+        if directory.is_empty() {
+            self.directory.clone()
+        } else {
+            self.directory.join(to_native(directory))
+        }
+    }
 }
 
 #[derive(Default)]
@@ -82,7 +91,7 @@ pub(crate) fn load(
         config.cloned().unwrap_or_default(),
     );
     let _scope = DiscoveryScope::enter();
-    if interp.run_script(&path).exit_code != 0 {
+    if interp.run_embedded_script(&path).exit_code != 0 {
         return Err(CtestError::Load(path));
     }
     Ok(COLLECTOR.take().tests)

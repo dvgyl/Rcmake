@@ -59,7 +59,22 @@ impl Interp {
         body: BString,
         mark_failed: bool,
     ) {
-        let location = Location::Backtrace(self.bt.clone());
+        let location = if self
+            .project
+            .global
+            .props
+            .get(b"\0RCMAKE_IN_RULE_CONFIGURATOR")
+            .is_some()
+        {
+            let directory = &self.project.dir(self.current_dir_id()).source_dir;
+            let file = rcmake_base::path_lex::Lexical::new(directory).append(b"CMakeLists.txt");
+            Location::FileLine {
+                file: file.as_slice().into(),
+                line: 0,
+            }
+        } else {
+            Location::Backtrace(self.bt.clone())
+        };
         self.issue_at(kind, effect, category, None, location, body, mark_failed);
     }
 
@@ -137,6 +152,8 @@ impl Interp {
     pub(crate) fn policy_warning_text(id: PolicyId) -> BString {
         let summary = if id == PolicyId::new(82) {
             b"Install rules from add_subdirectory() are interleaved with those in caller.".to_vec()
+        } else if id == PolicyId::new(218) {
+            b"The CMAKE_WARN_DEPRECATED and CMAKE_ERROR_DEPRECATED variables are ignored.".to_vec()
         } else {
             id.info()
                 .map(|i| crate::util::replace_all(i.summary.as_bytes(), b"``", b""))

@@ -253,21 +253,30 @@ impl TestRun<'_> {
             }
         };
         let started = host.monotonic();
-        let configuration;
-        let coverage_tool = if let Some(tool) = &invocation.coverage_tool {
-            tool
-        } else if let Some(dashboard) = dashboard {
-            &dashboard.configuration.coverage_tool
+        let loaded;
+        let configuration = if let Some(dashboard) = dashboard {
+            &dashboard.configuration
         } else {
-            configuration = self.configuration()?;
-            &configuration.coverage_tool
+            loaded = self.configuration()?;
+            &loaded
         };
+        let coverage_tool = invocation
+            .coverage_tool
+            .as_ref()
+            .unwrap_or(&configuration.coverage_tool);
         let custom = discovery::custom_commands(Arc::clone(self.host), dir)?;
         run_custom_commands(host, dir, custom.before, options.quiet)?;
         let _debug_environment = self.debug_environment(dashboard.is_some());
         let results = schedule::run(host, dir, invocation, plan, report, deadline, coverage_tool)?;
         let elapsed = host.monotonic().saturating_sub(started);
-        report.summary(plan, &results, elapsed, dir, write_dashboard);
+        report.summary(
+            plan,
+            &results,
+            elapsed,
+            dir,
+            write_dashboard,
+            &configuration.labels_for_subprojects,
+        );
         run_custom_commands(host, dir, custom.after, options.quiet)?;
         let records = report.records();
         let reports = dart::TestRun {
@@ -280,9 +289,13 @@ impl TestRun<'_> {
         };
         let outcome = self.finish(&reports, dashboard, junit)?;
         record_run(outcome.outcome.exit_code, false, None);
-        if let Err(error) =
-            rcmake_instrument::hooks::run_hook(host, dir, rcmake_instrument::Hook::PostCTest)
-        {
+        for hook in [
+            rcmake_instrument::Hook::PrepareForCDash,
+            rcmake_instrument::Hook::PostCTest,
+        ] {
+            let Err(error) = rcmake_instrument::hooks::run_hook(host, dir, hook) else {
+                continue;
+            };
             host.write_out(
                 Stream::Stderr,
                 format!("CTest instrumentation error: {error}\n").as_bytes(),

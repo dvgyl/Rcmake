@@ -329,11 +329,19 @@ fn render_source_set(
     set: &rcmake_resolve::ExportedSourceSet,
     install: bool,
 ) {
-    out.extend_from_slice(b"if(NOT CMAKE_VERSION VERSION_LESS 4.5)\n  target_sources(");
+    let version = if set.kind == rcmake_model::FileSetKind::Headers {
+        b"3.23".as_slice()
+    } else {
+        b"4.5"
+    };
+    out.extend_from_slice(b"if(NOT CMAKE_VERSION VERSION_LESS ");
+    out.extend_from_slice(version);
+    out.extend_from_slice(b")\n  target_sources(");
     quote(out, target);
     out.extend_from_slice(b" INTERFACE FILE_SET ");
     quote(out, &set.name);
-    out.extend_from_slice(b" TYPE SOURCES");
+    out.extend_from_slice(b" TYPE ");
+    out.extend_from_slice(set.kind.as_str().as_bytes());
     for (key, entries) in [
         (b" BASE_DIRS".as_slice(), &set.bases),
         (b" FILES", &set.files),

@@ -1,12 +1,13 @@
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use rcmake_base::{BString, Limits, hash::HashAlgo};
 use rcmake_host::{
-    CommandSpec, Follow, Host, Input, Output, ProcessResult, ReadRange, RunRequest, WriteMode,
-    discover_cmake_root, path,
+    CommandSpec, Follow, Host, Input, Output, ProcessResult, ReadRange, RunRequest, Stream,
+    WriteMode, discover_cmake_root, path,
 };
 use rcmake_json::{ReadOptions, Value, parse};
 
@@ -80,13 +81,17 @@ pub(super) fn run(
     let enabled = !rcmake_instrument::query::read_queries(host, &opts.dir)
         .map_err(|error| error.to_string())?
         .is_empty();
-    let jobs = opts
-        .jobs
-        .or_else(|| {
-            host.env_get(b"CMAKE_INSTALL_PARALLEL_LEVEL")
-                .and_then(|jobs| job_count(&jobs).ok())
-        })
-        .unwrap_or(1) as usize;
+    let jobs = match opts.jobs {
+        Some(jobs) => jobs,
+        None => host
+            .env_get(b"CMAKE_INSTALL_PARALLEL_LEVEL")
+            .map(|value| {
+                job_count(&value)
+                    .map_err(|_| format!("Invalid CMAKE_INSTALL_PARALLEL_LEVEL value '{value}'."))
+            })
+            .transpose()?
+            .unwrap_or(1),
+    } as usize;
     let configs = match opts.vars.get(b"CMAKE_INSTALL_CONFIG_NAME".as_slice()) {
         Some(config) => vec![Some(config)],
         None if !index.configs.is_empty() => index.configs.iter().map(Some).collect(),
@@ -101,6 +106,8 @@ pub(super) fn run(
         let manifest = manifest_name(component);
         let mut paths = Vec::new();
         for config in &configs {
+            let token = invocation_token(host);
+            let completed = Mutex::new(0);
             let tasks = Tasks {
                 host,
                 opts,
@@ -109,11 +116,18 @@ pub(super) fn run(
                 config: *config,
                 component,
                 enabled,
+                token: &token,
+                completed: &completed,
             };
-            if !tasks.run(jobs)? {
+            let success = tasks.run(jobs);
+            let part = local_manifests(host, &index.scripts, &token);
+            for script in &index.scripts {
+                let _ = host.remove_file(&local_manifest(script, &token));
+            }
+            if !success? {
                 return Ok(1);
             }
-            let part = local_manifests(host, &index.scripts)?;
+            let part = part?;
             if paths.len().saturating_add(part.len()) as u64 > Limits::default().max_file_read {
                 return Err("The install manifest exceeds the size limit.".into());
             }
@@ -132,6 +146,8 @@ struct Tasks<'a> {
     config: Option<&'a BString>,
     component: Option<&'a BString>,
     enabled: bool,
+    token: &'a str,
+    completed: &'a Mutex<usize>,
 }
 
 impl Tasks<'_> {
@@ -180,6 +196,10 @@ impl Tasks<'_> {
         if let Some(component) = self.component {
             command.push(define(b"CMAKE_INSTALL_COMPONENT", component));
         }
+        command.push(define(
+            b"_RCMAKE_INSTALL_LOCAL_MANIFEST",
+            &path::from_native(&local_manifest(script, self.token)),
+        ));
         command.extend(["-P".into(), path::from_native(script)]);
         if self.enabled {
             return rcmake_instrument::launcher::run_install(
@@ -203,21 +223,44 @@ impl Tasks<'_> {
                         program: program.clone(),
                         args: args.to_vec(),
                     }],
-                    cwd: self.host.initial_cwd(),
+                    cwd: script.parent().unwrap_or(&self.opts.dir).to_path_buf(),
                     env: self.host.env_all(),
                     stdin: Input::Inherit,
-                    stdout: Output::Inherit,
-                    stderr: Output::Inherit,
+                    stdout: Output::Capture,
+                    stderr: Output::SharedWithStdout,
                     timeout: Some(Duration::from_secs(600)),
                     tee: false,
                 },
                 &mut |_, _| {},
             )
             .map_err(|error| error.to_string())?;
-        Ok(matches!(
-            result.results.as_slice(),
-            [ProcessResult::Exited(0)]
-        ))
+        let mut completed = self.completed.lock().map_err(|error| error.to_string())?;
+        *completed += 1;
+        let display = script.strip_prefix(&self.opts.dir).unwrap_or(script);
+        let mut message = format!(
+            "[{}/{}] {}\n",
+            *completed,
+            self.scripts.len(),
+            display.display()
+        )
+        .into_bytes();
+        message.extend_from_slice(&result.stdout);
+        self.host.write_out(Stream::Stdout, &message);
+        match result.results.as_slice() {
+            [ProcessResult::Exited(0)] => Ok(true),
+            [ProcessResult::Exited(code)] => {
+                self.host.write_out(
+                    Stream::Stderr,
+                    format!(
+                        "install script '{}' exited with code {code}\n",
+                        script.display()
+                    )
+                    .as_bytes(),
+                );
+                Ok(false)
+            }
+            _ => Ok(false),
+        }
     }
 }
 
@@ -259,11 +302,27 @@ fn publish_manifest(host: &dyn Host, dir: &Path, name: &str, content: &[u8]) -> 
     result.map_err(|error| error.to_string())
 }
 
-fn local_manifests(host: &dyn Host, scripts: &[PathBuf]) -> Result<Vec<u8>, String> {
+fn invocation_token(host: &dyn Host) -> String {
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    let now = host.now();
+    let sequence = NEXT.fetch_add(1, Ordering::Relaxed);
+    format!(
+        "{}-{}-{}-{sequence}",
+        host.system().pid,
+        now.secs,
+        now.nanos
+    )
+}
+
+fn local_manifest(script: &Path, token: &str) -> PathBuf {
+    script.with_file_name(format!("install_local_manifest.{token}.txt"))
+}
+
+fn local_manifests(host: &dyn Host, scripts: &[PathBuf], token: &str) -> Result<Vec<u8>, String> {
     let mut paths = Vec::new();
     let limit = Limits::default().max_file_read;
     for script in scripts {
-        let file = script.with_file_name("install_local_manifest.txt");
+        let file = local_manifest(script, token);
         let remaining = limit.saturating_sub(paths.len() as u64);
         match host.read(&file, ReadRange::All { limit: remaining }) {
             Ok(data) if !data.is_empty() => {
