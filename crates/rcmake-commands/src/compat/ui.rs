@@ -2,7 +2,7 @@ use rcmake_base::{BString, truth};
 use rcmake_diag::{DiagCategory, Effect, MessageKind};
 use rcmake_eval::{CmdError, CmdResult, Cx, Flow};
 use rcmake_expr::ExpandedArg;
-use rcmake_host::path::{from_native, to_native};
+use rcmake_host::path::{from_native_cmake, to_native};
 use rcmake_model::{BT, PropOrigin, PropScope, TargetBinding};
 use rcmake_syntax::{ArgKind, Argument};
 
@@ -27,14 +27,14 @@ pub(super) fn fltk(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
     }
     let fluid = required(cx, b"FLTK_FLUID_EXECUTABLE");
     let backtrace = cx.backtrace();
-    let binary = from_native(&cx.current_binary_dir());
+    let binary = from_native_cmake(&cx.current_binary_dir());
     crate::dirs::record_include_directories(cx, &[BT::new(binary, backtrace)], &[], false);
     let mut sources = BString::default();
     for arg in inputs {
         if source(cx, &arg.value).is_none() {
             continue;
         }
-        let source_dir = from_native(&cx.current_source_dir());
+        let source_dir = from_native_cmake(&cx.current_source_dir());
         let input = BString::from([source_dir.as_slice(), b"/", &arg.value].concat());
         let base = file_stem(&arg.value, false);
         let header = output(cx, b"", base, b".h");
@@ -69,7 +69,7 @@ pub(super) fn fltk(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
 
 fn check_fltk_target(cx: &mut Cx<'_>, target: &[u8]) {
     if !has_fltk_target(cx, target) {
-        let source = from_native(&cx.current_source_dir());
+        let source = from_native_cmake(&cx.current_source_dir());
         cx.issue(
             MessageKind::AuthorWarning,
             Effect::None,
@@ -211,9 +211,9 @@ fn required(cx: &mut Cx<'_>, name: &[u8]) -> BString {
 
 fn source(cx: &mut Cx<'_>, arg: &[u8]) -> Option<BString> {
     let path = to_native(arg);
-    let mut input = from_native(&cx.current_source_dir().join(&path));
+    let mut input = from_native_cmake(&cx.current_source_dir().join(&path));
     if !path.is_absolute() {
-        let generated = from_native(&cx.current_binary_dir().join(&path));
+        let generated = from_native_cmake(&cx.current_binary_dir().join(&path));
         if source_property(cx, &generated, b"GENERATED").is_some_and(|value| truth::is_on(&value)) {
             input = generated;
         }
@@ -250,7 +250,7 @@ fn file_stem(path: &[u8], last_extension: bool) -> &[u8] {
 
 fn output(cx: &Cx<'_>, prefix: &[u8], base: &[u8], suffix: &[u8]) -> BString {
     let name = [prefix, base, suffix].concat();
-    from_native(&cx.current_binary_dir().join(to_native(&name)))
+    from_native_cmake(&cx.current_binary_dir().join(to_native(&name)))
 }
 
 fn append(list: &mut BString, value: &[u8]) {

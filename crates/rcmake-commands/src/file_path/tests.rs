@@ -244,7 +244,11 @@ cmake_path(HASH normal hash2)
             ),
             (
                 "cmake_list",
-                if cfg!(windows) { "a;b;C:/d" } else { "a;:b;/d" },
+                if cfg!(windows) {
+                    "a;;b;C:/d"
+                } else {
+                    "a;:b;/d"
+                },
             ),
             ("native_list", if cfg!(windows) { "a;c" } else { "a:c" }),
         ],
@@ -888,7 +892,14 @@ cmake_path(ABSOLUTE_PATH p BASE_DIRECTORY "" OUTPUT_VARIABLE abs)
         &[
             ("a b;$名", "file.tar.gz"),
             ("1", "file.tar"),
-            (" ", "dir/file.tar.gz"),
+            (
+                " ",
+                if cfg!(windows) {
+                    r"dir\file.tar.gz"
+                } else {
+                    "dir/file.tar.gz"
+                },
+            ),
             ("found", "ON"),
             ("new", "/root/item"),
             ("new filename", "dir/"),
@@ -1066,14 +1077,14 @@ file(GLOB_RECURSE chained FOLLOW_SYMLINKS RELATIVE /work/entry "entry/*")
     let stderr = host.stream_bytes(Stream::Stderr).to_string();
     assert_eq!(
         stderr.matches(
-            "  Cyclic recursion detected while globbing for 'tree/*':\n\n  /work/tree/sub/deep\n\n  /work/tree/sub/deep/loop\n"
+            format!("  Cyclic recursion detected while globbing for 'tree/*':\n\n  {DRIVE}/work/tree/sub/deep\n\n  {DRIVE}/work/tree/sub/deep/loop\n").as_str()
         ).count(),
         2,
         "{stderr}"
     );
     assert!(
         stderr.contains(
-            "  Cyclic recursion detected while globbing for 'entry/*':\n\n  /work/outer/inner\n\n  /work/outer/inner/loop\n"
+            format!("  Cyclic recursion detected while globbing for 'entry/*':\n\n  {DRIVE}/work/outer/inner\n\n  {DRIVE}/work/outer/inner/loop\n").as_str()
         ),
         "{stderr}"
     );

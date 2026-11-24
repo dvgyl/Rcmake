@@ -873,7 +873,7 @@ impl Programs {
                 configured
                     .filter(|path| path.components().count() > 1)
                     .or_else(|| host.current_exe().ok().map(|exe| sibling(&exe)))
-                    .map(|path| path::from_native(&path))
+                    .map(|path| path::from_native_cmake(&path))
             });
         let has_config = |name| {
             host.metadata(&build_dir.join(name), Follow::Yes)

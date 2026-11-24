@@ -279,12 +279,10 @@ fn check_directories(host: &dyn Host, root: &Path) -> HostResult<()> {
         host.canonicalize(&tree.join("link/../tree/./child"))?,
         child
     );
-    if !cfg!(windows) || !root.is_absolute() {
-        assert_message(
-            host.canonicalize(&tree.join("file/../child")),
-            "Not a directory",
-        );
-    }
+    assert_kind(
+        host.canonicalize(&tree.join("file/../child")),
+        ErrorKind::NotADirectory,
+    );
     assert_message(host.read(&tree, ALL), "Is a directory");
     assert_message(host.remove_dir(&tree), "Directory not empty");
     assert_message(host.remove_dir(&tree.join("link")), "Not a directory");

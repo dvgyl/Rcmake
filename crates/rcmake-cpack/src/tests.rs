@@ -484,16 +484,12 @@ file(WRITE "${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_CONFIG_NAME}" "staged")
             Path::new(exe)
         );
         assert_eq!(request.timeout, None);
+        assert_eq!(command.args[0], "--build");
         assert_eq!(
-            &command.args[..5],
-            [
-                "--build",
-                "/work/build",
-                "--target",
-                "preinstall",
-                "--config"
-            ]
+            rcmake_host::path::to_native(&command.args[1]),
+            Path::new("/work/build")
         );
+        assert_eq!(&command.args[2..5], ["--target", "preinstall", "--config"]);
         let marker = Path::new("/work").join(command.args.last().unwrap().to_str().unwrap());
         host.write(&marker, b"preinstall", WriteMode::CreateNew)?;
         Ok(RunOutput {

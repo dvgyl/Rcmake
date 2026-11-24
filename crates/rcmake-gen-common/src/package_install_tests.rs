@@ -3,7 +3,10 @@ use std::path::{Path, PathBuf};
 use rcmake_base::{BString, hash::HashAlgo};
 use rcmake_diag::{Backtrace, Frame, FrameKind};
 use rcmake_genex::ConfigId;
-use rcmake_host::{Host, PureHost, ReadRange, path::from_native};
+use rcmake_host::{
+    Host, PureHost, ReadRange,
+    path::{from_native, from_native_cmake},
+};
 use rcmake_model::{
     BT, BuildExport, DirId, DiscoverySpec, ExportKind, ExportSet, FileSet, FileSetKind,
     GeneratorKind, InstallKind, InstallOptions, InstallRule, PackageInfoSpec, ProjectModel,
@@ -250,7 +253,7 @@ fn fixture(source: &Path, build: &Path, configs: &[&str]) -> (ProjectModel, Gene
                 generator_provided: false,
             },
             artifacts: ArtifactSet {
-                file: Some(from_native(&artifact)),
+                file: Some(from_native_cmake(&artifact)),
                 ..Default::default()
             },
             compile_groups: vec![CompileGroup {

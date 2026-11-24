@@ -70,10 +70,8 @@ pub fn utility_targets(
     };
     let has_file = |name: &str| {
         let path = to_native(&root.binary_dir).join(name);
-        path.is_absolute()
-            && host
-                .metadata(&path, Follow::Yes)
-                .is_ok_and(|meta| meta.kind == FileKind::File)
+        host.metadata(&path, Follow::Yes)
+            .is_ok_and(|meta| meta.kind == FileKind::File)
     };
     let mut out = vec![named("ALL_BUILD", UtilityKind::AllBuild)];
     if !is_on(b"CMAKE_SUPPRESS_REGENERATION") {

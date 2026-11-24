@@ -225,7 +225,7 @@ pub(super) fn presets(rng: &mut Rng, limits: &Limits) -> Check {
                 .map_err(|err| format!("Cannot resolve generated configure preset. {err}"))?;
                 require(
                     preset.binary_dir
-                        == Some(rcmake_host::path::from_native(&project.join("build"))),
+                        == Some(rcmake_host::path::from_native_cmake(&project.join("build"))),
                     || {
                         format!(
                             "Unexpected build directory in generated configure preset. {:?}",

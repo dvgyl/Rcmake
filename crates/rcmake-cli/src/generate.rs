@@ -532,7 +532,7 @@ fn write_exports(
         .map(|files| {
             files
                 .first()
-                .map_or_else(BString::default, |file| path::from_native(file))
+                .map_or_else(BString::default, |file| path::from_native_cmake(file))
         })
         .collect::<Vec<_>>();
     for action in &result.install.actions {
@@ -543,12 +543,12 @@ fn write_exports(
                 .and_then(|files| files.split_first())
                 .ok_or(GenError::MissingExport(plan))?;
             // The script writer accepts one file per export action.
-            let main = path::from_native(main);
+            let main = path::from_native_cmake(main);
             let filename = Lexical::new(&main).filename();
             let stem = filename.strip_suffix(b".cmake").unwrap_or(filename);
             let filename_prefix = [stem, b"-"].concat();
             for file in configurations {
-                let file = path::from_native(file);
+                let file = path::from_native_cmake(file);
                 let config = Lexical::new(&file)
                     .filename()
                     .strip_prefix(filename_prefix.as_slice())

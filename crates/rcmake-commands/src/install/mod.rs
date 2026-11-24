@@ -8,7 +8,7 @@ use rcmake_base::{BString, path_lex::Lexical};
 use rcmake_diag::{DiagCategory, Effect, MessageKind, PolicyId, PolicyStatus};
 use rcmake_eval::{CmdError, CmdFlags, CmdResult, Cx, Flow, Registry};
 use rcmake_expr::ExpandedArg;
-use rcmake_host::path::{from_native, to_native};
+use rcmake_host::path::{from_native, from_native_cmake, to_native};
 use rcmake_model::{
     BT, ExportSet, InstallKind, InstallOptions, InstallRule, TargetBinding, TargetId, TargetKind,
     UsageScope,
@@ -526,7 +526,7 @@ fn source_path(cx: &Cx<'_>, path: &[u8]) -> BString {
     if Lexical::new(path).absolute() || path.starts_with(b"$<") {
         path.into()
     } else {
-        from_native(&cx.current_source_dir().join(to_native(path)))
+        from_native_cmake(&cx.current_source_dir().join(to_native(path)))
     }
 }
 

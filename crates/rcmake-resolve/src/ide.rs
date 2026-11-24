@@ -722,7 +722,9 @@ pub(crate) fn collect_link_items<'a>(
                         IdeLinkItem::Framework(name.into())
                     } else if value.starts_with(b"-") || value.starts_with(b"/DEFAULTLIB:") {
                         IdeLinkItem::Flag(value.clone())
-                    } else if Lexical::new(value).absolute() {
+                    } else if Lexical::new(value).absolute()
+                        || (usage.ide() == Some(IdeFlavor::Xcode) && value.starts_with(b"/"))
+                    {
                         classify(value.clone())
                     } else {
                         IdeLinkItem::Library(value.clone())

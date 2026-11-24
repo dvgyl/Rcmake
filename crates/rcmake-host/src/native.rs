@@ -364,6 +364,30 @@ impl Host for NativeHost {
 
     fn canonicalize(&self, p: &Path) -> HostResult<PathBuf> {
         require_absolute(p)?;
+        #[cfg(windows)]
+        {
+            use std::path::Component;
+
+            // Resolve a symlink before applying its parent component.
+            if p.components().any(|part| part == Component::ParentDir) {
+                let mut resolved = PathBuf::new();
+                for part in p.components() {
+                    match part {
+                        Component::ParentDir => {
+                            let directory = io_at(fs::canonicalize(&resolved), p)?;
+                            if !io_at(fs::metadata(&directory), p)?.is_dir() {
+                                return Err(SyntheticError::NotADirectory.at(Some(p)));
+                            }
+                            resolved = directory;
+                            resolved.pop();
+                        }
+                        Component::CurDir => {}
+                        other => resolved.push(other.as_os_str()),
+                    }
+                }
+                return io_at(fs::canonicalize(&resolved), p).map(platform::normalize_path);
+            }
+        }
         // macOS realpath can simplify ".." after an entry that is not a directory.
         io_at(fs::metadata(p), p)?;
         io_at(fs::canonicalize(p), p).map(platform::normalize_path)

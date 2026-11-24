@@ -365,10 +365,7 @@ fn object_reference_path(value: &str, config: &str) -> String {
     let Ok(suffix) = path.strip_prefix(directory) else {
         return value.into();
     };
-    root.join(settings::CONFIG_DIR)
-        .join(suffix)
-        .to_string_lossy()
-        .into_owned()
+    rcmake_host::path::from_native_cmake(&root.join(settings::CONFIG_DIR).join(suffix)).to_string()
 }
 
 fn file_type(file: &Source<'_>) -> &'static str {

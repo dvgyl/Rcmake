@@ -75,7 +75,7 @@ fn source_dir(cx: &mut Cx<'_>) -> BString {
 }
 
 fn absolute(path: &[u8], dir: &[u8]) -> BString {
-    if path.starts_with(b"$<") || Lexical::new(path).absolute() {
+    if path.starts_with(b"$<") || !Lexical::new(path).root_directory().is_empty() {
         return path.into();
     }
     let separator = if dir.ends_with(b"/") {

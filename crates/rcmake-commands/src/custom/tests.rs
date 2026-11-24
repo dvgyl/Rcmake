@@ -2,7 +2,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use rcmake_eval::{Interp, InterpConfig, RunMode};
-use rcmake_host::{PureHost, Stream, path::to_native};
+use rcmake_host::{
+    PureHost, Stream,
+    path::{from_native_cmake, to_native},
+};
 use rcmake_model::{DirId, PropScope, TargetKind};
 
 use super::*;
@@ -109,7 +112,7 @@ fn output_commands_resolve_paths_and_append_dependencies() -> TestResult {
     assert_eq!(command.job_pool, Some("pool".into()));
     assert_eq!(
         command.working_directory,
-        Some(from_native(&f.binary.join("work")))
+        Some(from_native_cmake(&f.binary.join("work")))
     );
     assert_eq!(command.comment, Some("Generating files".into()));
     assert!(command.verbatim && command.job_server_aware && command.command_expand_lists);
@@ -130,7 +133,7 @@ fn output_commands_resolve_paths_and_append_dependencies() -> TestResult {
         .chain(&command.byproducts)
         .zip(["result", "other", "side"])
     {
-        let path = from_native(&f.binary.join(name));
+        let path = from_native_cmake(&f.binary.join(name));
         assert_eq!(entry.value, path);
         assert_eq!(
             project.get_prop(
@@ -219,7 +222,7 @@ fn utility_targets_and_build_events_keep_their_attachments() -> TestResult {
         assert!(!command.backtrace.is_empty());
     }
     for name in ["staged", "report"] {
-        let path = from_native(&f.binary.join(name));
+        let path = from_native_cmake(&f.binary.join(name));
         assert_eq!(
             project.get_prop(
                 &PropScope::Source {

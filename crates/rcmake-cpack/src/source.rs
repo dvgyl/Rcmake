@@ -5,7 +5,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use rcmake_eval::Interp;
-use rcmake_host::path::{from_native, to_native};
+use rcmake_host::path::{from_native_cmake, to_native};
 use rcmake_host::{CopyOptions, FileKind, Follow, Host, ReadRange};
 
 use crate::config::{CpackConfig, absolute, interpreter};
@@ -63,7 +63,7 @@ pub(crate) fn copy_directories(
     let steps_per_path = interp.cx().limits().regex_steps;
     let ignored = |path: &Path, kind: FileKind| -> Result<bool, CpackError> {
         let mut budget = steps_per_path;
-        let mut name = from_native(path);
+        let mut name = from_native_cmake(path);
         if kind == FileKind::Dir {
             name.push(b'/');
         }

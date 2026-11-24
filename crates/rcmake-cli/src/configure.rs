@@ -587,7 +587,7 @@ impl<'a> ConfigureSession<'a> {
                 host,
                 &format!(
                     "-- Build files have been written to: {}\n",
-                    self.bin.display()
+                    path::from_native_cmake(&self.bin)
                 ),
             );
         }
@@ -730,8 +730,8 @@ fn resolve_directories(
 
 fn set_directory_vars(interp: &mut Interp, src: &Path, bin: &Path) {
     let mut cx = interp.cx();
-    let source = path::from_native(src);
-    let binary = path::from_native(bin);
+    let source = path::from_native_cmake(src);
+    let binary = path::from_native_cmake(bin);
     cx.set_var(b"CMAKE_SOURCE_DIR", source.clone());
     cx.set_var(b"CMAKE_CURRENT_SOURCE_DIR", source);
     cx.set_var(b"CMAKE_BINARY_DIR", binary.clone());

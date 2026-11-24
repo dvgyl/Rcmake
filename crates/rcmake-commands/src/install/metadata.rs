@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 
 use rcmake_base::{BString, path_lex::Lexical};
 use rcmake_eval::Cx;
-use rcmake_host::path::{from_native, to_native};
+use rcmake_host::path::{from_native_cmake, to_native};
 use rcmake_model::{
     BuildExport, ExportKind, InstallKind, InstallOptions, PackageInfoSpec, ProjectMetadata,
     SbomSpec,
@@ -431,7 +431,7 @@ pub(super) fn export(cx: &mut Cx<'_>, signature: &[u8], input: &[&[u8]]) -> Resu
         let name = spec.name.clone();
         (ExportKind::Sbom(spec), file, name, BString::default(), None)
     };
-    let file = from_native(&cx.current_binary_dir().join(to_native(&file)));
+    let file = from_native_cmake(&cx.current_binary_dir().join(to_native(&file)));
     let file = Lexical::new(&file).normalize();
     if cx
         .project()

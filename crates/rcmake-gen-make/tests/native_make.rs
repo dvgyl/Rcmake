@@ -241,6 +241,8 @@ fn native_make_builds_c_archive_and_executable_incrementally() {
     }
     run(&host, root, "./bin/app", &[]);
 
+    // Some Make versions compare timestamps in whole seconds.
+    host.sleep(Duration::from_millis(1100));
     host.remove_file(&root.join("gen $/value.h"))
         .expect("remove secondary output");
     make(&["-j2", "CMAKE_COMMAND=/bin/sh record.sh"]);

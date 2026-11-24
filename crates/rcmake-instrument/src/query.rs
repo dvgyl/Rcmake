@@ -263,7 +263,7 @@ pub fn read_queries(host: &dyn Host, build_dir: &Path) -> Result<Vec<Query>, Ins
         if !errors.is_empty() {
             return Err(invalid(format!(
                 "Could not load instrumentation queries from {}:\n{}",
-                dir.display(),
+                path::from_native_cmake(&dir),
                 errors.join("\n")
             )));
         }

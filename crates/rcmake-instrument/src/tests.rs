@@ -195,7 +195,7 @@ fn query_errors_show_the_source_value_and_file() {
                 "  \"options\": [\"trace\", \"bad option\"]\n",
                 "                       ^"
             ),
-            query.display()
+            rcmake_host::path::from_native_cmake(&query)
         ),
     );
 }

@@ -339,7 +339,8 @@ fn add_include_destinations(
                 if !includes.is_empty() {
                     includes.push(b';');
                 }
-                if !Lexical::new(&path).absolute() && !path.starts_with(PREFIX) {
+                let rooted = !Lexical::new(&path).root_directory().is_empty();
+                if !rooted && !path.starts_with(PREFIX) {
                     includes.extend_from_slice(PREFIX);
                     includes.push(b'/');
                 }
@@ -604,7 +605,7 @@ fn add_export_property(
             if matches!(
                 key.as_slice(),
                 b"INTERFACE_INCLUDE_DIRECTORIES" | b"INTERFACE_SYSTEM_INCLUDE_DIRECTORIES"
-            ) && !Lexical::new(item).absolute()
+            ) && Lexical::new(item).root_directory().is_empty()
                 && !item.starts_with(b"$")
             {
                 *item = [b"${_IMPORT_PREFIX}/", item.as_slice()].concat().into();

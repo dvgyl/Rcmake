@@ -221,12 +221,18 @@ jobs:
                   build = work / "build"
                   prefix = work / "install"
                   compiler = ["-DCMAKE_C_COMPILER=cl.exe"] if os.name == "nt" else []
+                  # zlib sets absolute install destinations during configuration.
                   subprocess.run([cmake, "-S", source, "-B", build, "-G", "Ninja",
-                                  "-DCMAKE_BUILD_TYPE=Release", *compiler,
+                                  "-DCMAKE_BUILD_TYPE=Release",
+                                  f"-DCMAKE_INSTALL_PREFIX={prefix.as_posix()}", *compiler,
                                   *pin["configure_args"]], check=True, timeout=300)
                   subprocess.run([cmake, "--build", build, "--parallel", "2"], check=True, timeout=300)
+                  test_env = os.environ.copy()
+                  if os.name == "nt":
+                      # cJSON tests run in a subdirectory of the DLL output directory.
+                      test_env["PATH"] = str(build) + os.pathsep + test_env["PATH"]
                   subprocess.run([ctest, "--test-dir", build, "--output-on-failure", "--no-tests=error"],
-                                 check=True, timeout=300)
+                                 env=test_env, check=True, timeout=300)
                   subprocess.run([cmake, "--install", build, "--prefix", prefix], check=True, timeout=300)
                   if not any(path.is_file() for path in prefix.rglob("*")):
                       sys.exit(f"{name} did not install any files.")

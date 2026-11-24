@@ -246,7 +246,13 @@ fn snapshot(root: &Path) -> io::Result<FileTree> {
                     entry.path().display()
                 )));
             };
-            entries.insert(path.to_string_lossy().into_owned(), data);
+            let key = path.to_string_lossy();
+            let key = if cfg!(windows) {
+                key.replace('\\', "/")
+            } else {
+                key.into_owned()
+            };
+            entries.insert(key, data);
         }
     }
     Ok(entries)
