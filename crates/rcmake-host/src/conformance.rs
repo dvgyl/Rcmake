@@ -275,11 +275,11 @@ fn check_directories(host: &dyn Host, root: &Path) -> HostResult<()> {
         host.read_dir(&root.join("dir-link"))?,
         host.read_dir(&outside)?
     );
+    assert_eq!(
+        host.canonicalize(&tree.join("link/../tree/./child"))?,
+        child
+    );
     if !cfg!(windows) || !root.is_absolute() {
-        assert_eq!(
-            host.canonicalize(&tree.join("link/../tree/./child"))?,
-            child
-        );
         assert_message(
             host.canonicalize(&tree.join("file/../child")),
             "Not a directory",

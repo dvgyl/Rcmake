@@ -108,13 +108,7 @@ pub(crate) fn execute(exe: &Path, case: &Case) -> Result<Outcome, String> {
         let mut child = command.spawn()?;
         let status = wait(&mut child, &stdout, &stderr)?;
 
-        let exit_code = status.code().unwrap_or_else(|| {
-            #[cfg(unix)]
-            if let Some(signal) = status.signal() {
-                return -signal;
-            }
-            -1
-        });
+        let exit_code = status_exit_code(status);
         let normalizer = Normalizer::new(root, exe);
         stdout.rewind()?;
         stderr.rewind()?;
@@ -130,6 +124,17 @@ pub(crate) fn execute(exe: &Path, case: &Case) -> Result<Outcome, String> {
         })
     };
     run().map_err(|error| format!("case {} with {}: {error}", case.name, exe.display()))
+}
+
+fn status_exit_code(status: ExitStatus) -> i32 {
+    if let Some(code) = status.code() {
+        return code;
+    }
+    #[cfg(unix)]
+    if let Some(signal) = status.signal() {
+        return -signal;
+    }
+    -1
 }
 
 fn wait(child: &mut Child, stdout: &File, stderr: &File) -> io::Result<ExitStatus> {

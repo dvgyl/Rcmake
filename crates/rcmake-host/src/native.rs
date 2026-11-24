@@ -359,14 +359,14 @@ impl Host for NativeHost {
 
     fn read_link(&self, p: &Path) -> HostResult<PathBuf> {
         require_absolute(p)?;
-        io_at(fs::read_link(p), p)
+        io_at(fs::read_link(p), p).map(platform::normalize_path)
     }
 
     fn canonicalize(&self, p: &Path) -> HostResult<PathBuf> {
         require_absolute(p)?;
         // macOS realpath can simplify ".." after an entry that is not a directory.
         io_at(fs::metadata(p), p)?;
-        io_at(fs::canonicalize(p), p)
+        io_at(fs::canonicalize(p), p).map(platform::normalize_path)
     }
 
     fn set_permissions(&self, p: &Path, mode: u32) -> HostResult<()> {

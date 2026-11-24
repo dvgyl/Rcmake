@@ -771,7 +771,7 @@ fn project_accepts_legacy_languages_and_clears_version_metadata() -> TestResult 
     assert_var(&mut interp, "PROJECT_VERSION", Some(""));
     assert_var(&mut interp, "CMAKE_PROJECT_VERSION", Some(""));
     assert_var(&mut interp, "Other_VERSION", None);
-    assert_var(&mut interp, "Test_VERSION", Some("001.02"));
+    assert_var(&mut interp, "Test_VERSION", Some("1.2"));
     Ok(())
 }
 

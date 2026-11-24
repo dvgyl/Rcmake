@@ -422,13 +422,28 @@ mod tests {
     #[test]
     fn configure_and_build_collect_instrumentation() {
         let host = crate::driver_tests::project_host();
+        for (module, content) in [
+            (
+                "CMakeDetermineCCompiler.cmake",
+                "file(WRITE \"${CMAKE_PLATFORM_INFO_DIR}/CMakeCCompiler.cmake\" \"set(CMAKE_C_COMPILER_LOADED 1)\\n\")\n",
+            ),
+            ("CMakeCInformation.cmake", ""),
+            ("CMakeTestCCompiler.cmake", ""),
+        ] {
+            host.seed_file(
+                &Path::new("/usr/local/share/cmake-4.5/Modules").join(module),
+                content.as_bytes(),
+            )
+            .unwrap();
+        }
+        host.seed_file(Path::new("/tools/cc"), b"").unwrap();
         let source = Path::new("/work/CMakeLists.txt");
         let bin = Path::new("/work/out");
         let api = bin.join(".cmake/instrumentation/v1");
         let data = api.join("data");
         let project = br#"cmake_minimum_required(VERSION 4.5)
-project(example NONE)
-set(CMAKE_C_COMPILER cc)
+set(CMAKE_C_COMPILER /tools/cc)
+project(example LANGUAGES C)
 add_executable(app main.c)
 "#;
         host.seed_file(source, project).unwrap();

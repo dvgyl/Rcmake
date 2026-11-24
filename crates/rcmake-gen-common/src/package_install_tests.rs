@@ -11,7 +11,9 @@ use rcmake_model::{
 };
 use rcmake_resolve::{ArtifactSet, CompileGroup, GenerationResult, ResolvedTarget, TargetMetadata};
 
-use crate::{ctest_file, install_script, write_supplementary_outputs};
+#[cfg(unix)]
+use crate::ctest_file;
+use crate::{install_script, write_supplementary_outputs};
 
 #[cfg(unix)]
 const PROJECT: &[u8] = br#"cmake_minimum_required(VERSION 4.5)

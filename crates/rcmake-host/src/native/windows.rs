@@ -12,6 +12,7 @@ use winapi_util::{
 use winreg::{RegKey, enums::HKEY_LOCAL_MACHINE};
 
 use super::{file_kind, io_at, rename_noreplace_with_link};
+use crate::error::{HostError, SyntheticError};
 use crate::{FileTime, Follow, HostResult, Metadata, SystemInfo};
 
 const FILE_READ_ATTRIBUTES: u32 = 0x80;
@@ -143,11 +144,43 @@ pub(super) fn symlink(target: &Path, link: &Path) -> io::Result<()> {
     }
 }
 
+pub(super) fn normalize_path(path: PathBuf) -> PathBuf {
+    let Some(text) = path.to_str() else {
+        return path;
+    };
+    if let Some(unc) = text.strip_prefix(r"\\?\UNC\") {
+        return PathBuf::from(format!(r"\\{unc}"));
+    }
+    if let Some(rest) = text.strip_prefix(r"\\?\")
+        && matches!(
+            rest.as_bytes(),
+            [drive, b':', b'\\' | b'/', ..] if drive.is_ascii_alphabetic()
+        )
+    {
+        return PathBuf::from(rest);
+    }
+    path
+}
+
 pub(super) fn remove_file(path: &Path) -> io::Result<()> {
     if fs::symlink_metadata(path)?.file_type().is_symlink_dir() {
         fs::remove_dir(path)
     } else {
-        fs::remove_file(path)
+        match fs::remove_file(path) {
+            Err(err) if err.kind() == ErrorKind::PermissionDenied => {
+                if let Ok(meta) = fs::symlink_metadata(path) {
+                    let mut permissions = meta.permissions();
+                    if permissions.readonly() {
+                        #[allow(clippy::permissions_set_readonly_false)]
+                        permissions.set_readonly(false);
+                        let _ = fs::set_permissions(path, permissions);
+                        return fs::remove_file(path);
+                    }
+                }
+                Err(err)
+            }
+            result => result,
+        }
     }
 }
 
@@ -165,7 +198,19 @@ pub(super) fn remove_dir_all(path: &Path) -> io::Result<()> {
 pub(super) use std::fs::hard_link;
 
 pub(super) fn rename_noreplace(from: &Path, to: &Path) -> HostResult<()> {
-    rename_noreplace_with_link(from, to)
+    let source = io_at(fs::symlink_metadata(from), from)?;
+    if !source.file_type().is_dir() {
+        match rename_noreplace_with_link(from, to) {
+            Err(err) if err.kind == ErrorKind::Unsupported => {}
+            result => return result,
+        }
+    }
+    match fs::symlink_metadata(to) {
+        Ok(_) => return Err(SyntheticError::AlreadyExists.at(Some(to))),
+        Err(err) if err.kind() == ErrorKind::NotFound => {}
+        Err(err) => return Err(HostError::from_io(err, Some(to.to_path_buf()))),
+    }
+    io_at(fs::rename(from, to), to)
 }
 
 pub(super) fn system() -> SystemInfo {

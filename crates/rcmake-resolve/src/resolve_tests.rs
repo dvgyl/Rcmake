@@ -905,8 +905,8 @@ fn archive_commands_keep_flags_and_objects_with_full_resolved_fragments() -> Tes
     let mut archive = target("archive", TargetKind::StaticLibrary, &[]);
     archive.usage.link_libraries = Some(vec![link_item("lib"), link_item("obj")]);
     archive
-        .usage
-        .push(UsageField::LinkOptions, entry("-archive-flag"));
+        .props
+        .set(b"STATIC_LIBRARY_OPTIONS".into(), "-archive-flag".into());
     archive
         .usage
         .push(UsageField::LinkDirectories, entry("/lib/path"));
@@ -2042,7 +2042,14 @@ fn xcode_ide_facts_keep_raw_settings_and_resolve_apple_artifacts() -> TestResult
     assert_eq!(facts.custom[0].commands[0], ["echo", "two words Debug"]);
     assert_eq!(facts.custom[0].working_dir, "/out");
 
-    assert_eq!(facts.link_options[0].value, "SHELL:-exported_symbol _main");
+    assert_eq!(
+        facts
+            .link_options
+            .iter()
+            .map(|item| item.value.as_slice())
+            .collect::<Vec<_>>(),
+        [b"-exported_symbol".as_slice(), b"_main".as_slice()]
+    );
     assert_eq!(facts.link_directories, ["/link path/Debug"]);
     assert_eq!(
         facts.link_items,

@@ -1,7 +1,7 @@
 use std::fs::{self, File};
 use std::io;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use rcmake_base::BString;
 use rustix::fs::{AtFlags, CWD, Timespec, Timestamps, UTIME_OMIT};
@@ -126,6 +126,10 @@ fn timestamp(time: Option<FileTime>) -> Timespec {
             tv_nsec: UTIME_OMIT,
         },
     }
+}
+
+pub(super) fn normalize_path(path: PathBuf) -> PathBuf {
+    path
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
