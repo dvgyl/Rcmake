@@ -302,6 +302,7 @@ fn ctest_file_keeps_test_arguments_properties_backtraces_and_children() {
             working_directory: None,
             command_expand_lists: false,
             old_style: true,
+            policies: Default::default(),
             props: PropertyMap::default(),
             build_depends: Vec::new(),
             kind: rcmake_model::TestKind::Single,
