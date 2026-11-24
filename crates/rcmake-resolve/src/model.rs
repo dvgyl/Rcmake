@@ -16,9 +16,6 @@ pub enum ResolveError {
     /// A diagnostic was issued with CMake's message text.
     #[error("{0}")]
     Message(BString),
-    /// The stage is not implemented yet.
-    #[error("{0} is not implemented yet")]
-    Unimplemented(&'static str),
 }
 
 /// Everything a generator needs (output of [`resolve`](crate::resolve) plus lowering).

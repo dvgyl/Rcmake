@@ -14,7 +14,10 @@ def main():
     parser.add_argument("help_source", type=Path, help="CMake's installed Help directory")
     args = parser.parse_args()
     cmake = args.cmake.resolve()
-    output = Path(__file__).resolve().parent
+    repo = Path(__file__).resolve().parents[2]
+    usage_out = repo / "crates/rcmake-cli/help/usage.txt"
+    reference_out = repo / "modules/cmake-4.5/Help/reference.zst"
+    reference_out.parent.mkdir(parents=True, exist_ok=True)
 
     def run(*flags):
         return subprocess.check_output([cmake, *flags], cwd=work, timeout=15)
@@ -23,7 +26,7 @@ def main():
         if run("--version").splitlines()[0] != b"cmake version 4.5.1":
             parser.error("Use CMake 4.5.1 to render the help.")
         usage = run("--help").split(b"\nGenerators\n", 1)[0]
-        (output / "usage.txt").write_bytes(usage)
+        usage_out.write_bytes(usage)
 
         entries = [(("full", ""), ("--help-full",))]
         for category in ("command", "diagnostic", "manual", "module", "policy", "property", "variable"):
@@ -62,7 +65,7 @@ def main():
         with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
             data = b"".join(pool.map(render, dict.fromkeys(entries)))
         subprocess.run(
-            ["zstd", "-q", "-T2", "-19", "--long=25", "-f", "-o", output / "reference.zst"],
+            ["zstd", "-q", "-T2", "-19", "--long=25", "-f", "-o", reference_out],
             input=data, timeout=120, check=True,
         )
 

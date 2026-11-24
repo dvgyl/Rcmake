@@ -17,9 +17,7 @@ use rcmake_instrument::{
 };
 use rcmake_model::{GeneratorKind, ProjectModel, TargetOrigin};
 use rcmake_resolve::ide::IdeFlavor;
-use rcmake_resolve::{
-    GenerationResult, InstallActionKind, InstallManifest, ResolveError, ResolveOptions,
-};
+use rcmake_resolve::{GenerationResult, InstallActionKind, InstallManifest, ResolveOptions};
 
 mod file_generate;
 mod instrument;
@@ -77,7 +75,6 @@ pub(crate) fn run(
     };
     let mut result = match resolved {
         Ok(result) => result,
-        Err(ResolveError::Unimplemented(_)) => return Ok(false),
         Err(err) => return Err(err.to_string()),
     };
     if !queries.is_empty() && !kind.is_ide() {

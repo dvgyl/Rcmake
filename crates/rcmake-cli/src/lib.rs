@@ -251,7 +251,7 @@ fn run_cmake(argv: &[BString], rest: &[BString], host: Arc<dyn Host>) -> i32 {
         return workflow::run(args, host);
     }
 
-    if let Some(code) = help::run(rest, host.as_ref()) {
+    if let Some(code) = help::run(argv.first(), rest, host.as_ref()) {
         return code;
     }
 

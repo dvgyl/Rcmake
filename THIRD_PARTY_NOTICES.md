@@ -9,8 +9,8 @@ Rcmake also bundles and attributes the following permissively licensed third-par
 - **Upstream project:** CMake 4.5.1 (Kitware, Inc. and Contributors)
 - **Upstream URL:** <https://github.com/Kitware/CMake/releases/tag/v4.5.1>
 - **Licence:** OSI-approved BSD 3-Clause License
-- **Vendored paths:** `modules/cmake-4.5/Modules/` and `modules/cmake-4.5/Templates/`
-- **Rendered help:** `crates/rcmake-cli/help/usage.txt` and `crates/rcmake-cli/help/reference.zst`
+- **Vendored paths:** `modules/cmake-4.5/Modules/`, `modules/cmake-4.5/Templates/`, and `modules/cmake-4.5/Help/reference.zst`
+- **Rendered CLI usage:** `crates/rcmake-cli/help/usage.txt`
 - **Full licence & contributors:**
   - `third_party/licences/CMake-BSD-3-Clause.txt`
   - `third_party/licences/CMake-CONTRIBUTORS.rst`

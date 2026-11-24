@@ -1,9 +1,8 @@
 use rcmake_base::BString;
-use rcmake_host::{Host, Stream, WriteMode};
+use rcmake_host::{Host, ReadRange, Stream, WriteMode, discover_cmake_root};
 
 use crate::{options, resolve_cli_path};
 
-const REFERENCE: &[u8] = include_bytes!("../help/reference.zst");
 const USAGE: &[u8] = include_bytes!("../help/usage.txt");
 
 const MISSING_MANUAL: &str =
@@ -54,7 +53,7 @@ fn argument<'a>(
     args.next_if(|arg| !arg.starts_with(b"-") && !matches!(arg.as_slice(), b"/V" | b"/?"))
 }
 
-pub(crate) fn run(args: &[BString], host: &dyn Host) -> Option<i32> {
+pub(crate) fn run(argv0: Option<&BString>, args: &[BString], host: &dyn Host) -> Option<i32> {
     let mut args = args.iter().peekable();
     let mut requests = Vec::new();
     while let Some(flag) = args.next() {
@@ -111,9 +110,18 @@ pub(crate) fn run(args: &[BString], host: &dyn Host) -> Option<i32> {
         .iter()
         .any(|(request, _)| !matches!(request, Request::Usage))
     {
-        match zstd::bulk::decompress(REFERENCE, 32 * 1024 * 1024) {
-            Ok(data) => data,
-            Err(_) => {
+        let compressed = discover_cmake_root(host, argv0).1.and_then(|root| {
+            host.read(
+                &root.join("Help/reference.zst"),
+                ReadRange::All {
+                    limit: 4 * 1024 * 1024,
+                },
+            )
+            .ok()
+        });
+        match compressed.and_then(|raw| zstd::bulk::decompress(&raw, 32 * 1024 * 1024).ok()) {
+            Some(data) => data,
+            None => {
                 crate::emit_cli_error(host, "Cannot read CMake help.");
                 return Some(1);
             }
