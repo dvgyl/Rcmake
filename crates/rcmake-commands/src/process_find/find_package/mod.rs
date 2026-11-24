@@ -9,7 +9,7 @@ use super::search_paths::{cmake_paths, is_file};
 use super::{cps_import, diagnostic, text};
 use config::ConfigSearch;
 use messages::report_missing;
-use paths::{package_roots, redirects_directory};
+use paths::{package_roots, redirects_directory, resolve_package_root};
 use request::VersionRequest;
 use trace::SearchTrace;
 
@@ -23,6 +23,7 @@ mod trace;
 
 const PROVIDER: &[u8] = b"_RCMAKE_FIND_PACKAGE_PROVIDER";
 pub(super) const PACKAGE_ROOTS: &[u8] = b"_RCMAKE_FIND_PACKAGE_ROOTS";
+const PACKAGE_ROOT_SPELLINGS: &[u8] = b"_RCMAKE_FIND_PACKAGE_ROOT_SPELLINGS";
 
 pub(super) fn find_package(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
     find_package_with_diagnostics(cx, args, None)
@@ -44,7 +45,15 @@ pub(super) fn find_package_with_diagnostics(
     let unwind = request.unwind_include;
     cx.check_package_find(unwind)?;
     cx.project().package_lookups.insert(name.clone());
+    let prefix = cx.var_normal_only(b"PACKAGE_PREFIX_DIR");
     let result = find_requested_package(cx, args, name, request, dependency);
+    if cx.var_normal_only(b"PACKAGE_PREFIX_DIR") != prefix {
+        if let Some(prefix) = prefix {
+            cx.set_var(b"PACKAGE_PREFIX_DIR", prefix);
+        } else {
+            cx.unset_var(b"PACKAGE_PREFIX_DIR");
+        }
+    }
     if unwind && (result.is_err() || !cx.var_is_on(&text(&[name, b"_FOUND"]))) {
         cx.unwind_package();
     }
@@ -100,7 +109,6 @@ fn find_requested_package(
     let found_var = text(&[name, b"_FOUND"]);
     let disable = text(&[b"CMAKE_DISABLE_FIND_PACKAGE_", name]);
     if cx.var_is_on(&disable) {
-        cx.set_var(&found_var, "0".into());
         let require = text(&[b"CMAKE_REQUIRE_FIND_PACKAGE_", name]);
         if cx.var_is_on(&require) {
             cx.issue(
@@ -155,7 +163,18 @@ fn find_requested_package(
     vars.add("CMAKE_FIND_PACKAGE_NAME".into(), name.clone());
     vars.add("CMAKE_FIND_REQUIRED".into(), "");
     let package_roots = package_roots(cx, name);
-    vars.add(PACKAGE_ROOTS.into(), list::join(package_roots.iter()));
+    vars.add(
+        PACKAGE_ROOTS.into(),
+        list::join(
+            package_roots
+                .iter()
+                .map(|root| path::from_native_cmake(&resolve_package_root(cx, root))),
+        ),
+    );
+    vars.add(
+        PACKAGE_ROOT_SPELLINGS.into(),
+        list::join(package_roots.iter()),
+    );
     vars.add(
         find(b"COMPONENTS"),
         list::join(request.components.iter().map(|(name, _)| name)),

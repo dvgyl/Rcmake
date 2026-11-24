@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use rcmake_base::{BString, list, path_lex::Lexical};
-use rcmake_diag::{PolicyId, PolicyStatus};
+use rcmake_diag::{Effect, MessageKind, PolicyId, PolicyStatus};
 use rcmake_eval::{
     Cx, Flow, RunMode,
     args::{KeywordParser, Parsed, Slot},
@@ -263,10 +263,24 @@ struct Filters<'a> {
 
 impl<'a> Filters<'a> {
     fn new(cx: &mut Cx<'_>, args: &'a Parsed) -> Self {
-        let mut regexes = |key| {
+        let mut regexes = |key: &str| {
             args.multi(key)
                 .iter()
-                .filter_map(|pattern| cx.regex(pattern).ok())
+                .filter_map(|pattern| match cx.regex(pattern) {
+                    Ok(regex) => Some(regex),
+                    Err(err) => {
+                        cx.issue(
+                            MessageKind::Warning,
+                            Effect::None,
+                            None,
+                            format!(
+                                "GET_RUNTIME_DEPENDENCIES could not compile the regular expression \"{pattern}\" for {key}.\n  {err}"
+                            )
+                            .into(),
+                        );
+                        None
+                    }
+                })
                 .collect()
         };
         Self {

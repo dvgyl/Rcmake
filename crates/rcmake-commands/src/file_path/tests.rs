@@ -361,6 +361,10 @@ fn file_makes_mutates_and_removes_entries() -> TestResult {
         &mut interp,
         r#"
 file(MAKE_DIRECTORY dst/deep RESULT mkdir)
+file(MAKE_DIRECTORY source-tree target-tree RESULT)
+file(WRITE source-tree/kept content)
+file(WRITE target-tree/stale old)
+file(CREATE_LINK source-tree target-tree COPY_ON_ERROR RESULT directory_link)
 file(WRITE src original)
 file(TOUCH touched)
 file(TOUCH_NOCREATE missing)
@@ -387,6 +391,7 @@ file(REMOVE_RECURSE dst/deep)
         &mut interp,
         &[
             ("mkdir", "0"),
+            ("directory_link", "0"),
             ("copy", "0"),
             ("blocked", "NO_REPLACE"),
             ("rename", "0"),
@@ -397,6 +402,17 @@ file(REMOVE_RECURSE dst/deep)
         ],
     );
     assert_eq!(interp.cx().var(b"before"), interp.cx().var(b"after"));
+    assert_eq!(
+        host.read(
+            Path::new("/work/target-tree/kept"),
+            ReadRange::All { limit: 32 }
+        )?,
+        b"content"
+    );
+    assert!(
+        host.metadata(Path::new("/work/target-tree/stale"), Follow::No)
+            .is_err()
+    );
     assert!(
         interp
             .cx()
@@ -1473,6 +1489,16 @@ file(RPATH_CHECK FILE binary RPATH /lib)
         )?;
         let data = host.read(path, ReadRange::All { limit: 512 })?;
         assert!(data[321..].starts_with(b"/replacement/longer/path\0"));
+        script(
+            &host,
+            &mut interp,
+            r#"
+file(RPATH_SET FILE binary NEW_RPATH "/old:/keep")
+file(RPATH_CHANGE FILE binary OLD_RPATH /old NEW_RPATH "")
+"#,
+        )?;
+        let data = host.read(path, ReadRange::All { limit: 512 })?;
+        assert!(data[321..].starts_with(b":/keep\0"));
         script(
             &host,
             &mut interp,

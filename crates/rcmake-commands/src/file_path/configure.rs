@@ -1,5 +1,8 @@
 use rcmake_base::BString;
-use rcmake_eval::{Cx, Flow};
+use rcmake_eval::{
+    Cx, Flow,
+    args::{KeywordParser, Slot},
+};
 use rcmake_expr::{
     ExpandEnv,
     configure::{ConfigureOptions, configure},
@@ -8,81 +11,61 @@ use rcmake_host::{ReadRange, WriteMode};
 
 use super::{Result, error, file::binary_destination};
 
-struct Request<'a> {
-    output: &'a [u8],
-    content: &'a [u8],
+struct Request {
+    output: BString,
+    content: BString,
     newline: Option<&'static [u8]>,
     options: ConfigureOptions,
 }
 
-impl<'a> Request<'a> {
-    fn parse(cx: &mut Cx<'_>, args: &[&'a [u8]]) -> Result<Self> {
-        let mut output = None;
-        let mut content = None;
-        let mut newline = None;
-        let mut options = ConfigureOptions::default();
-        let mut args = args.iter().copied().peekable();
-        while let Some(arg) = args.next() {
-            match arg {
-                b"OUTPUT" | b"CONTENT" => {
-                    let value = args.next_if(|&value| {
-                        !matches!(
-                            value,
-                            b"OUTPUT" | b"CONTENT" | b"@ONLY" | b"ESCAPE_QUOTES" | b"NEWLINE_STYLE"
-                        )
-                    });
-                    let Some(value) = value else {
-                        return Err(crate::command_error(
-                            cx,
-                            [
-                                b"Error after keyword \"".as_slice(),
-                                arg,
-                                b"\":\n  missing required value\n",
-                            ]
-                            .concat(),
-                        ));
-                    };
-                    if arg == b"OUTPUT" {
-                        output = Some(value);
-                    } else {
-                        content = Some(value);
-                    }
-                }
-                b"@ONLY" => options.at_only = true,
-                b"ESCAPE_QUOTES" => options.escape_quotes = true,
-                b"NEWLINE_STYLE" => {
-                    let style = args.next();
-                    if newline.is_none() {
-                        newline = Some(match style {
-                            Some(b"LF" | b"UNIX") => b"\n".as_slice(),
-                            Some(b"CRLF" | b"DOS" | b"WIN32") => b"\r\n",
-                            Some(_) => {
-                                return Err(error(
-                                    "CONFIGURE NEWLINE_STYLE sets an unknown style, only LF, CRLF, UNIX, DOS, and WIN32 are supported",
-                                ));
-                            }
-                            None => {
-                                return Err(error(
-                                    "CONFIGURE NEWLINE_STYLE must set a style: LF, CRLF, UNIX, DOS, or WIN32",
-                                ));
-                            }
-                        });
-                    }
-                }
-                _ => {
+impl Request {
+    fn parse(cx: &mut Cx<'_>, args: &[&[u8]]) -> Result<Self> {
+        let parsed = KeywordParser::new()
+            .keyword("OUTPUT", Slot::Single)
+            .keyword("CONTENT", Slot::Single)
+            .keyword("@ONLY", Slot::Flag)
+            .keyword("ESCAPE_QUOTES", Slot::Flag)
+            .keyword("NEWLINE_STYLE", Slot::SingleMaybe)
+            .parse(args);
+        if let Some(arg) = parsed.unparsed().first() {
+            cx.set_fatal();
+            return Err(error(
+                [
+                    b"CONFIGURE Unrecognized argument: \"".as_slice(),
+                    arg,
+                    b"\"",
+                ]
+                .concat(),
+            ));
+        }
+        if let Some(message) = parsed.report_error_text() {
+            return Err(crate::command_error(cx, message));
+        }
+        let Some(output) = parsed.single("OUTPUT") else {
+            cx.set_fatal();
+            return Err(error("CONFIGURE OUTPUT option is mandatory."));
+        };
+        let Some(content) = parsed.single("CONTENT") else {
+            cx.set_fatal();
+            return Err(error("CONFIGURE CONTENT option is mandatory."));
+        };
+        let newline = match args.iter().position(|arg| *arg == b"NEWLINE_STYLE") {
+            None => None,
+            Some(index) => Some(match args.get(index + 1).copied() {
+                Some(b"LF" | b"UNIX") => b"\n".as_slice(),
+                Some(b"CRLF" | b"DOS" | b"WIN32") => b"\r\n",
+                Some(_) => {
                     return Err(error(
-                        [
-                            b"CONFIGURE Unrecognized argument: \"".as_slice(),
-                            arg,
-                            b"\"",
-                        ]
-                        .concat(),
+                        "CONFIGURE NEWLINE_STYLE sets an unknown style, only LF, CRLF, UNIX, DOS, and WIN32 are supported",
                     ));
                 }
-            }
-        }
-        let output = output.ok_or_else(|| error("CONFIGURE OUTPUT option is mandatory."))?;
-        let content = content.ok_or_else(|| error("CONFIGURE CONTENT option is mandatory."))?;
+                None => {
+                    return Err(error(
+                        "CONFIGURE NEWLINE_STYLE must set a style: LF, CRLF, UNIX, DOS, or WIN32",
+                    ));
+                }
+            }),
+        };
         for character in *b"<>" {
             if output.contains(&character) {
                 return Err(error(
@@ -96,10 +79,13 @@ impl<'a> Request<'a> {
             }
         }
         Ok(Self {
-            output,
-            content,
+            output: output.clone(),
+            content: content.clone(),
             newline,
-            options,
+            options: ConfigureOptions {
+                at_only: parsed.flag("@ONLY"),
+                escape_quotes: parsed.flag("ESCAPE_QUOTES"),
+            },
         })
     }
 }
@@ -109,7 +95,7 @@ pub(super) fn run(cx: &mut Cx<'_>, args: &[&[u8]]) -> Result {
     if request.output.is_empty() {
         return Ok(Flow::Normal);
     }
-    let output = binary_destination(cx, request.output);
+    let output = binary_destination(cx, &request.output);
     let limit = cx.limits().max_value_bytes;
     let mut configured = BString::default();
     for line in request.content.split_inclusive(|&byte| byte == b'\n') {

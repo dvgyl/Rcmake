@@ -19,11 +19,16 @@ impl SearchTrace {
         }
     }
 
-    pub(super) fn section(&mut self, heading: &[u8], paths: &[PathBuf]) {
+    pub(super) fn section<'a>(
+        &mut self,
+        heading: &[u8],
+        paths: impl IntoIterator<Item = &'a PathBuf>,
+    ) {
         if let Some(body) = &mut self.body {
             body.extend_from_slice(heading);
             body.push(b'\n');
-            if paths.is_empty() {
+            let mut paths = paths.into_iter().peekable();
+            if paths.peek().is_none() {
                 body.extend_from_slice(b"  none\n");
             } else {
                 for path in paths {
@@ -40,9 +45,9 @@ impl SearchTrace {
         }
     }
 
-    pub(super) fn candidate(&mut self, path: &Path) {
+    pub(super) fn candidate(&mut self, dir: &Path, filename: &Path) {
         if self.body.is_some() {
-            self.candidates.push(path::from_native(path));
+            self.candidates.push(path::from_native(&dir.join(filename)));
         }
     }
 

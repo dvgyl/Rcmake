@@ -112,13 +112,13 @@ impl<'a> ConfigSearch<'a> {
             .or_else(|| (!dir.is_empty() && !truth::is_off(&dir)).then(|| cx.resolve_path(&dir)));
         if let Some(dir) = preferred {
             let found = if self.redirect.is_none() || !self.request.module {
-                self.in_directory(cx, &dir, true, trace)?
+                self.in_directory(cx, &dir, &dir, true, trace)?
             } else {
                 None
             };
             let found = match found {
                 Some(found) => Some(found),
-                None => self.in_directory(cx, &dir, false, trace)?,
+                None => self.in_directory(cx, &dir, &dir, false, trace)?,
             };
             trace.config(self.name, None, true);
             if let Some(found) = found {
@@ -149,7 +149,7 @@ impl<'a> ConfigSearch<'a> {
             ],
         );
         let redirects = redirects_directory(cx);
-        for prefix in self.prefixes(cx, package_roots, trace) {
+        for (prefix, spelling) in self.prefixes(cx, package_roots, trace) {
             if ignored.contains(&prefix)
                 || ignored_prefixes.contains(&prefix)
                 || Some(&prefix) != redirects.as_ref()
@@ -168,8 +168,18 @@ impl<'a> ConfigSearch<'a> {
                     .map(|suffix| dir.join(relative_suffix(suffix)));
                 for dir in std::iter::once(dir.clone()).chain(suffixes) {
                     let dir = resolved_lexical_path(cx, &path::from_native_cmake(&dir));
+                    let display = spelling
+                        .as_ref()
+                        .zip(dir.strip_prefix(&prefix).ok())
+                        .map(|(root, suffix)| root.join(suffix));
                     if !ignored.contains(&dir)
-                        && let Some(found) = self.in_directory(cx, &dir, cps, trace)?
+                        && let Some(found) = self.in_directory(
+                            cx,
+                            &dir,
+                            display.as_deref().unwrap_or(&dir),
+                            cps,
+                            trace,
+                        )?
                     {
                         return Ok(Some(found));
                     }
@@ -183,6 +193,7 @@ impl<'a> ConfigSearch<'a> {
         &mut self,
         cx: &mut Cx<'_>,
         dir: &Path,
+        display: &Path,
         cps: bool,
         trace: &mut SearchTrace,
     ) -> Result<Option<ConfigMatch>, CmdError> {
@@ -190,11 +201,12 @@ impl<'a> ConfigSearch<'a> {
             return Ok(None);
         }
         if cps {
-            return self.in_cps_directory(cx, dir, trace);
+            return self.in_cps_directory(cx, dir, display, trace);
         }
         for config in &self.configs {
-            let file = dir.join(path::to_native(config));
-            trace.candidate(&file);
+            let filename = path::to_native(config);
+            let file = dir.join(&filename);
+            trace.candidate(display, &filename);
             if !is_file(cx, &file) {
                 continue;
             }
@@ -228,12 +240,14 @@ impl<'a> ConfigSearch<'a> {
         &mut self,
         cx: &mut Cx<'_>,
         dir: &Path,
+        display: &Path,
         trace: &mut SearchTrace,
     ) -> Result<Option<ConfigMatch>, CmdError> {
         let mut visited = BTreeSet::new();
         for filename in &self.cps_names {
-            let file = dir.join(path::to_native(filename));
-            trace.candidate(&file);
+            let native = path::to_native(filename);
+            let file = dir.join(&native);
+            trace.candidate(display, &native);
             if !is_file(cx, &file) {
                 continue;
             }

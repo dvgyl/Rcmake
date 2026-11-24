@@ -2,19 +2,24 @@
 
 use std::collections::BTreeSet;
 
-use rcmake_base::{BString, path_lex::Lexical, truth};
+use rcmake_base::{BString, list, path_lex::Lexical, truth};
 use rcmake_diag::{DiagCategory, Effect, MessageKind, PolicyId, PolicyStatus};
 use rcmake_eval::{CmdError, CmdFlags, CmdResult, Cx, Flow, Registry};
 use rcmake_expr::ExpandedArg;
+use rcmake_genex::{ConfigId, EvalContext, EvalSite, evaluate, find_genex, parse};
 use rcmake_host::path::{from_native, to_native};
 use rcmake_model::{
-    BT, CustomCommand, CustomCommandKind, ModelError, Target, TargetBinding, TargetEvent,
-    TargetKind, TargetOrigin,
+    BT, CommandId, CustomCommand, CustomCommandKind, DirId, GeneratorKind, ModelError,
+    ProjectModel, Target, TargetBinding, TargetEvent, TargetKind, TargetOrigin,
 };
+use rcmake_resolve::usage::UsageResolver;
+use rcmake_syntax::{ArgKind, Argument};
 
 mod rule;
 #[cfg(test)]
 mod tests;
+
+const DEFERRED_APPEND: &[u8] = b"\0RCMAKE_CUSTOM_APPEND";
 
 pub(crate) fn register(registry: &mut Registry) {
     let project_only = CmdFlags { scriptable: false };
@@ -213,6 +218,20 @@ pub(crate) fn new_command(cx: &mut Cx<'_>) -> CustomCommand {
 }
 
 fn add_command(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
+    if let [marker, count, rest @ ..] = args
+        && marker.value == DEFERRED_APPEND
+        && cx.running_deferred()
+    {
+        let count = std::str::from_utf8(&count.value)
+            .ok()
+            .and_then(|count| count.parse::<usize>().ok())
+            .ok_or_else(|| CmdError::status("Invalid deferred APPEND command count."))?;
+        let mut body = new_command(cx);
+        let mut options = Options::default();
+        options.parse(&mut body, rest, false);
+        resolve_paths(cx, &mut body, false)?;
+        return append(cx, body, count);
+    }
     if args.len() < 4 {
         return Err(CmdError::status("called with wrong number of arguments."));
     }
@@ -276,7 +295,7 @@ fn add_command(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
         .as_ref()
         .is_some_and(|depfile| !depfile.is_empty())
         && !body.implicit_depends.is_empty()
-        && cx.var_or_empty(b"CMAKE_GENERATOR") != b"Ninja"
+        && cx.project().generator != Some(GeneratorKind::Ninja)
     {
         return Err(CmdError::status(
             "IMPLICIT_DEPENDS and DEPFILE can not both be specified.",
@@ -357,7 +376,26 @@ fn add_command(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
     }
     resolve_paths(cx, &mut body, !options.append)?;
     if options.append {
-        return append(cx, body);
+        let count = cx.project().commands().count();
+        if cx.defer_active() {
+            // Keep each argument until the directory finishes configuration.
+            let line = cx.current_line();
+            let deferred: Vec<_> = [DEFERRED_APPEND.into(), count.to_string().into()]
+                .into_iter()
+                .chain(args.iter().map(|arg| arg.value.clone()))
+                .map(|text| Argument {
+                    kind: ArgKind::Bracket,
+                    text,
+                    line,
+                    span: 0..0,
+                })
+                .collect();
+            let id = cx.defer_new_id();
+            if cx.defer_call(body.dir, id, b"add_custom_command", &deferred) {
+                return Ok(Flow::Normal);
+            }
+        }
+        return append(cx, body, count);
     }
     let explicit_only = options.explicit_only
         || truth::is_on(&cx.var_or_empty(b"CMAKE_ADD_CUSTOM_COMMAND_DEPENDS_EXPLICIT_ONLY"));
@@ -416,18 +454,36 @@ fn check_policy(cx: &mut Cx<'_>, message: impl Into<BString>, advice: &[u8]) -> 
     }
 }
 
-fn append(cx: &mut Cx<'_>, body: CustomCommand) -> CmdResult {
+fn append(cx: &mut Cx<'_>, body: CustomCommand, count: usize) -> CmdResult {
     let Some(output) = body.outputs.first() else {
         return Err(CmdError::status("APPEND requires an OUTPUT."));
     };
+    let generator = cx.project().generator;
+    let mut configs = if let Some(generator) = generator.filter(|kind| kind.multi_config()) {
+        cx.var(b"CMAKE_CONFIGURATION_TYPES").map_or_else(
+            || {
+                generator
+                    .default_configuration_types()
+                    .iter()
+                    .map(|name| ConfigId((*name).into()))
+                    .collect()
+            },
+            |value| {
+                list::split(&value, list::Empty::Drop)
+                    .into_iter()
+                    .map(ConfigId)
+                    .collect()
+            },
+        )
+    } else {
+        vec![ConfigId(cx.var_or_empty(b"CMAKE_BUILD_TYPE"))]
+    };
+    if configs.is_empty() {
+        configs.push(ConfigId::default());
+    }
     let project = cx.project();
-    let existing = project.commands().find_map(|(id, command)| {
-        (command.dir == body.dir
-            && command.kind == CustomCommandKind::Output
-            && command.outputs.contains(output))
-        .then_some(id)
-    });
-    let Some(existing) = existing.and_then(|id| project.command_mut(id)) else {
+    let id = find_append_command(project, body.dir, output, count, &configs)?;
+    let Some(existing) = id.and_then(|id| project.command_mut(id)) else {
         return Err(crate::command_error(
             cx,
             format!(
@@ -440,6 +496,64 @@ fn append(cx: &mut Cx<'_>, body: CustomCommand) -> CmdResult {
     existing.depends.extend(body.depends);
     existing.implicit_depends.extend(body.implicit_depends);
     Ok(Flow::Normal)
+}
+
+fn find_append_command(
+    project: &ProjectModel,
+    dir: DirId,
+    output: &BT<BString>,
+    count: usize,
+    configs: &[ConfigId],
+) -> Result<Option<CommandId>, CmdError> {
+    let binary = &project.dir(dir).binary_dir;
+    let mut usage = None;
+    let mut expand = |output: &BT<BString>| {
+        if find_genex(&output.value).is_none() {
+            return Ok(vec![output.value.clone()]);
+        }
+        let ast = parse(&output.value)?;
+        let mut host = usage
+            .get_or_insert_with(|| UsageResolver::new(project))
+            .host(dir);
+        let mut paths = Vec::new();
+        for config in configs {
+            let context = EvalContext {
+                config: config.clone(),
+                site: EvalSite {
+                    backtrace: output.backtrace.clone(),
+                    property: None,
+                },
+                ..EvalContext::default()
+            };
+            let (value, _) = evaluate(&ast, &context, &mut host)?;
+            paths.extend(
+                list::split(&value, list::Empty::Drop)
+                    .into_iter()
+                    .map(|path| Lexical::new(&Lexical::new(binary).append(&path)).normalize()),
+            );
+        }
+        Ok::<_, rcmake_genex::GenexError>(paths)
+    };
+    let requested = expand(output).map_err(|err| CmdError::status(err.to_string()))?;
+    let mut best = None;
+    for (id, command) in project.commands().take(count) {
+        if command.dir != dir || command.kind != CustomCommandKind::Output {
+            continue;
+        }
+        for output in &command.outputs {
+            // Generation reports errors in the original output expression.
+            let Ok(paths) = expand(output) else { continue };
+            if let Some(index) = requested.iter().position(|path| paths.contains(path))
+                && best.is_none_or(|(previous, _)| index < previous)
+            {
+                best = Some((index, id));
+            }
+        }
+        if best.is_some_and(|(index, _)| index == 0) {
+            break;
+        }
+    }
+    Ok(best.map(|(_, id)| id))
 }
 
 fn add_event(

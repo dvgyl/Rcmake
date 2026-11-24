@@ -117,14 +117,20 @@ fn make_directory(cx: &mut Cx<'_>, args: &[&[u8]]) -> Result {
     if let Some(index) = args.iter().position(|arg| *arg == b"RESULT") {
         let (directories, options) = args.split_at(index);
         parsed = KeywordParser::new()
-            .keyword("RESULT", Slot::Single)
+            .keyword("RESULT", Slot::SingleMaybe)
             .parse(options);
         if !parsed.unparsed().is_empty() {
-            let mut message = b"MAKE_DIRECTORY called with unexpected\narguments:".to_vec();
-            for argument in parsed.unparsed() {
-                message.extend_from_slice(b"\n  ");
-                message.extend_from_slice(argument);
-            }
+            let unexpected = parsed
+                .unparsed()
+                .iter()
+                .map(|argument| argument.as_slice())
+                .collect::<Vec<_>>()
+                .join(&b'\n');
+            let message = [
+                b"MAKE_DIRECTORY called with unexpected\narguments:\n  ".as_slice(),
+                &unexpected,
+            ]
+            .concat();
             return Err(error(message));
         }
         paths = directories;
@@ -425,9 +431,10 @@ fn copy_error(err: &HostError, input: bool) -> (ErrorKind, BString) {
 }
 
 fn link(cx: &mut Cx<'_>, input: &[u8], output: &[u8], symbolic: bool, fallback: bool) -> Operation {
-    let source = cx.resolve_path(input);
-    let target = cx.resolve_path(output);
     let host = cx.host();
+    let cwd = host.initial_cwd();
+    let source = cwd.join(to_native(input));
+    let target = cwd.join(to_native(output));
     if source == target || input == output {
         return Err("CREATE_LINK cannot use same file and newfile".into());
     }
@@ -436,9 +443,9 @@ fn link(cx: &mut Cx<'_>, input: &[u8], output: &[u8], symbolic: bool, fallback: 
             .concat()
             .into());
     }
-    if let Ok(existing) = host.metadata(&target, Follow::No)
-        && existing.kind != FileKind::Dir
-    {
+    let policy = PolicyId::new(205);
+    let policy_status = cx.policy(policy);
+    if let Ok(existing) = host.metadata(&target, Follow::No) {
         if !symbolic
             && host
                 .metadata(&source, Follow::No)
@@ -446,13 +453,27 @@ fn link(cx: &mut Cx<'_>, input: &[u8], output: &[u8], symbolic: bool, fallback: 
         {
             return Ok(());
         }
-        host.remove_file(&target).map_err(os_message)?;
+        let removed =
+            if existing.kind == FileKind::Dir && fallback && policy_status == PolicyStatus::New {
+                host.remove_dir_all(&target)
+            } else {
+                host.remove_file(&target)
+            };
+        removed.map_err(|err| -> BString {
+            [
+                b"Failed to create link '".as_slice(),
+                output,
+                b"' because existing path cannot be removed: ",
+                err.os_message.as_bytes(),
+                b"\n",
+            ]
+            .concat()
+            .into()
+        })?;
     }
     let directory = host
         .metadata(&source, Follow::Yes)
         .is_ok_and(|meta| meta.kind == FileKind::Dir);
-    let policy = PolicyId::new(205);
-    let policy_status = cx.policy(policy);
     let warn_directory = directory && fallback && policy_status == PolicyStatus::Warn;
     let warn = |cx: &mut Cx<'_>, detail: &[u8]| {
         cx.issue_policy_warning(
@@ -466,6 +487,8 @@ fn link(cx: &mut Cx<'_>, input: &[u8], output: &[u8], symbolic: bool, fallback: 
     }
     let linked = if symbolic {
         cx.host().symlink(&to_native(input), &target)
+    } else if directory && policy_status == PolicyStatus::New {
+        Err(HostError::unsupported("not supported", None))
     } else {
         cx.host().hard_link(&source, &target)
     };
@@ -475,17 +498,10 @@ fn link(cx: &mut Cx<'_>, input: &[u8], output: &[u8], symbolic: bool, fallback: 
             b"It will be copied recursively when CMP0205 is set to NEW.",
         );
     }
-    let host = cx.host();
     match linked {
         Ok(()) => Ok(()),
         Err(_) if fallback => {
-            let source = if symbolic && !to_native(input).is_absolute() {
-                target
-                    .parent()
-                    .map_or(source, |parent| parent.join(to_native(input)))
-            } else {
-                source
-            };
+            let host = cx.host();
             let meta = host.metadata(&source, Follow::Yes).map_err(os_message)?;
             if meta.kind == FileKind::Dir {
                 if policy_status == PolicyStatus::New {
@@ -588,10 +604,11 @@ fn chmod(cx: &mut Cx<'_>, recurse: bool, args: &[&[u8]]) -> Result {
         files: mode("FILE_PERMISSIONS")?,
         directories: mode("DIRECTORY_PERMISSIONS")?,
     };
+    let cwd = cx.host().initial_cwd();
     for input in parsed.unparsed() {
-        let start = cx.resolve_path(input);
-        let mut pending = vec![(start, 0_u32, None)];
-        while let Some((path, depth, post_order_mode)) = pending.pop() {
+        let mut pending = vec![(to_native(input), 0_u32, None)];
+        while let Some((operand, depth, post_order_mode)) = pending.pop() {
+            let path = cwd.join(&operand);
             let host = cx.host();
             if let Some(mode) = post_order_mode {
                 host.set_permissions(&path, mode)
@@ -601,29 +618,38 @@ fn chmod(cx: &mut Cx<'_>, recurse: bool, args: &[&[u8]]) -> Result {
             if depth > cx.limits().max_recursion.min(256) {
                 return Err(error("CHMOD_RECURSE exceeds the directory depth limit"));
             }
-            let metadata = host
-                .metadata(&path, Follow::No)
-                .map_err(|_| error([b"does not exist:\n\n  ", input, b"\n"].concat()))?;
-            let follow = if metadata.kind == FileKind::Symlink {
-                let Ok(meta) = host.metadata(&path, Follow::Yes) else {
-                    continue;
+            let metadata = host.metadata(&path, Follow::No).and_then(|meta| {
+                let symlink = meta.kind == FileKind::Symlink;
+                if symlink {
+                    host.metadata(&path, Follow::Yes)
+                        .map(|target| (target, symlink))
+                } else {
+                    Ok((meta, symlink))
+                }
+            });
+            let Ok((metadata, symlink)) = metadata else {
+                cx.set_fatal();
+                let spelling = if depth == 0 {
+                    input.clone()
+                } else {
+                    from_native(&operand)
                 };
-                meta
-            } else {
-                metadata.clone()
+                return Err(error(
+                    [b"does not exist:\n  ", spelling.as_slice()].concat(),
+                ));
             };
-            let directory = follow.kind == FileKind::Dir;
+            let directory = metadata.kind == FileKind::Dir;
             let mode = modes.get(directory);
             if let Some(mode) = mode {
-                pending.push((path.clone(), depth, Some(mode)));
+                pending.push((operand.clone(), depth, Some(mode)));
             }
-            if recurse && metadata.kind == FileKind::Dir {
+            if recurse && directory && !symlink {
                 let children = host.read_dir(&path).map_err(|e| error(e.os_message))?;
                 pending.extend(
                     children
                         .into_iter()
                         .rev()
-                        .map(|entry| (path.join(to_native(&entry.name)), depth + 1, None)),
+                        .map(|entry| (operand.join(to_native(&entry.name)), depth + 1, None)),
                 );
             }
         }

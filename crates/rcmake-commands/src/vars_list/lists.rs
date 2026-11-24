@@ -329,21 +329,18 @@ fn sublist(cx: &mut Cx<'_>, raw: &[u8], begin: &[u8], length: &[u8]) -> Result<B
     }
     let begin = list_number(cx, begin)?;
     let length = list_number(cx, length)?;
-    let mut items = list::iter(raw, list::Empty::Keep);
-    let Some(first) = usize::try_from(begin)
-        .ok()
-        .and_then(|start| items.nth(start))
-    else {
+    let begin_error = || {
         let last = signed_len(list::iter(raw, list::Empty::Keep).count()) - 1;
-        return Err(CmdError::status(format!(
-            "begin index: {begin} is out of range 0 - {last}"
-        )));
+        CmdError::status(format!("begin index: {begin} is out of range 0 - {last}"))
     };
+    let start = usize::try_from(begin).map_err(|_| begin_error())?;
     if length < -1 {
         return Err(CmdError::status(format!(
             "length: {length} should be -1 or greater"
         )));
     }
+    let mut items = list::iter(raw, list::Empty::Keep);
+    let first = items.nth(start).ok_or_else(begin_error)?;
     let count = usize::try_from(length).unwrap_or(usize::MAX);
     Ok(list::join(std::iter::once(first).chain(items).take(count)))
 }

@@ -1,19 +1,22 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-use rcmake_base::{BString, list_ops, truth};
+use rcmake_base::{BString, list, list_ops, truth};
 use rcmake_diag::{PolicyId, PolicyStatus};
 use rcmake_eval::{Cx, RunMode};
 use rcmake_host::{FileKind, Follow, path};
 
 use super::super::search_paths::{
-    cmake_paths, host_env_paths, is_file, resolved_lexical_path, search_path, system_prefixes,
+    cmake_paths, host_env_paths, is_file, resolved_lexical_path, search_path, split_env,
+    system_prefixes,
 };
 use super::config::ConfigSearch;
-use super::{PACKAGE_ROOTS, text, trace::SearchTrace};
+use super::{PACKAGE_ROOT_SPELLINGS, text, trace::SearchTrace};
 
 const FRAMEWORK_VARS_HEADING: &[u8] =
     b"CMAKE_FRAMEWORK_PATH and CMAKE_APPBUNDLE_PATH variables [CMAKE_FIND_USE_CMAKE_PATH].";
+const PACKAGE_ROOT_HEADING: &[u8] =
+    b"<PackageName>_ROOT CMake variable [CMAKE_FIND_USE_PACKAGE_ROOT_PATH].";
 
 impl ConfigSearch<'_> {
     pub(super) fn prefixes(
@@ -21,7 +24,7 @@ impl ConfigSearch<'_> {
         cx: &mut Cx<'_>,
         package_roots: &[BString],
         trace: &mut SearchTrace,
-    ) -> Vec<PathBuf> {
+    ) -> Vec<(PathBuf, Option<PathBuf>)> {
         let request = self.request;
         let mut groups = Vec::new();
         groups.push((
@@ -32,10 +35,7 @@ impl ConfigSearch<'_> {
                 .collect(),
         ));
         if request.use_source(cx, b"PACKAGE_ROOT_PATH") {
-            groups.push((
-                "<PackageName>_ROOT CMake variable [CMAKE_FIND_USE_PACKAGE_ROOT_PATH].".into(),
-                package_roots.to_vec(),
-            ));
+            groups.push((PACKAGE_ROOT_HEADING.into(), package_roots.to_vec()));
         }
         let apple_paths = [b"CMAKE_FRAMEWORK_PATH".as_slice(), b"CMAKE_APPBUNDLE_PATH"];
         if request.use_source(cx, b"CMAKE_PATH") {
@@ -122,19 +122,35 @@ impl ConfigSearch<'_> {
         ));
 
         let mut seen = BTreeSet::new();
+        let mut spellings = BTreeMap::new();
         let prefixes = groups
             .into_iter()
             .flat_map(|(heading, values)| {
                 let paths: Vec<_> = values
                     .into_iter()
                     .filter(|value| !value.is_empty() && !value.starts_with(b"[HKEY_"))
-                    .map(|value| resolved_lexical_path(cx, &value))
-                    .filter(|path| seen.insert(path.clone()))
+                    .filter_map(|value| {
+                        let path = if heading == PACKAGE_ROOT_HEADING {
+                            resolve_package_root(cx, &value)
+                        } else {
+                            resolved_lexical_path(cx, &value)
+                        };
+                        if !seen.insert(path.clone()) {
+                            return None;
+                        }
+                        if heading == PACKAGE_ROOT_HEADING {
+                            spellings.insert(path.clone(), path::to_native(&value));
+                        }
+                        Some(path)
+                    })
                     .collect();
                 if paths.is_empty() && heading == FRAMEWORK_VARS_HEADING {
                     trace.heading(&heading);
                 } else {
-                    trace.section(&heading, &paths);
+                    trace.section(
+                        &heading,
+                        paths.iter().map(|path| spellings.get(path).unwrap_or(path)),
+                    );
                 }
                 paths
             })
@@ -158,6 +174,12 @@ impl ConfigSearch<'_> {
             }
         }
         mode.reroot(cx, prefixes)
+            .into_iter()
+            .map(|path| {
+                let spelling = spellings.get(&path).cloned();
+                (path, spelling)
+            })
+            .collect()
     }
 
     fn system_prefixes(&self, cx: &Cx<'_>) -> Vec<BString> {
@@ -360,42 +382,76 @@ pub(super) fn package_roots(cx: &mut Cx<'_>, name: &[u8]) -> Vec<BString> {
     let preserved = text(&[name, b"_ROOT"]);
     let uppercase = text(&[&name.to_ascii_uppercase(), b"_ROOT"]);
     let policy = PolicyId::new(74);
+    let values = |cx: &Cx<'_>, key: &[u8]| {
+        [
+            Some(cx.var_or_empty(key)).filter(|value| !value.is_empty()),
+            cx.host().env_get(key).filter(|value| !value.is_empty()),
+        ]
+    };
+    let [preserved_var, preserved_env] = values(cx, &preserved);
     match cx.policy(policy) {
         PolicyStatus::New => {
             let upper_policy = PolicyId::new(144);
-            let include_upper =
-                preserved != uppercase && cx.policy(upper_policy) == PolicyStatus::New;
-            let keys = [preserved.as_slice(), uppercase.as_slice()];
-            let keys = if include_upper { &keys[..] } else { &keys[..1] };
-            roots.extend(keys.iter().flat_map(|key| cmake_paths(cx, key)));
-            roots.extend(keys.iter().flat_map(|key| host_env_paths(cx, key)));
-            if preserved != uppercase && cx.policy(upper_policy) == PolicyStatus::Warn {
-                warn_ignored_root(
-                    cx,
-                    upper_policy,
-                    &uppercase,
-                    b"For compatibility, find_package is ignoring the variable, but code in a .cmake module might still use it.",
-                );
+            let [upper_var, upper_env] = if preserved == uppercase {
+                [None, None]
+            } else {
+                let [var, env] = values(cx, &uppercase);
+                [
+                    var.filter(|value| Some(value) != preserved_var.as_ref()),
+                    env.filter(|value| Some(value) != preserved_env.as_ref()),
+                ]
+            };
+            let upper_status = cx.policy(upper_policy);
+            let [upper_var, upper_env] = if upper_status == PolicyStatus::New {
+                [upper_var, upper_env]
+            } else {
+                if upper_status == PolicyStatus::Warn {
+                    warn_ignored_root(
+                        cx,
+                        upper_policy,
+                        &uppercase,
+                        [upper_var, upper_env],
+                        b"For compatibility, find_package is ignoring the variable, but code in a .cmake module might still use it.",
+                    );
+                }
+                [None, None]
+            };
+            for value in [preserved_var, upper_var].into_iter().flatten() {
+                roots.extend(list::split(&value, list::Empty::Drop));
+            }
+            let separator = if cx.host().system().sysname == b"Windows" {
+                b';'
+            } else {
+                b':'
+            };
+            for value in [preserved_env, upper_env].into_iter().flatten() {
+                roots.extend(split_env(&value, separator).map(BString::from));
             }
         }
         PolicyStatus::Warn => warn_ignored_root(
             cx,
             policy,
             &preserved,
+            [preserved_var, preserved_env],
             b"For compatibility, CMake is ignoring the variable.",
         ),
         PolicyStatus::Old => {}
     }
-    let cwd = cx.host().initial_cwd();
-    let mut roots: Vec<_> = roots
-        .into_iter()
-        .map(|root| path::from_native_cmake(&search_path(cx, &cwd, &root)))
-        .collect();
-    roots.extend(cmake_paths(cx, PACKAGE_ROOTS));
+    roots.extend(cmake_paths(cx, PACKAGE_ROOT_SPELLINGS));
     roots
 }
 
-fn warn_ignored_root(cx: &mut Cx<'_>, policy: PolicyId, key: &[u8], explanation: &[u8]) {
+pub(super) fn resolve_package_root(cx: &Cx<'_>, root: &[u8]) -> PathBuf {
+    search_path(cx, &cx.host().initial_cwd(), root)
+}
+
+fn warn_ignored_root(
+    cx: &mut Cx<'_>,
+    policy: PolicyId,
+    key: &[u8],
+    values: [Option<BString>; 2],
+    explanation: &[u8],
+) {
     let warned = text(&[
         b"_RCMAKE_FIND_PACKAGE_WARNED_",
         policy.to_string().as_bytes(),
@@ -406,11 +462,11 @@ fn warn_ignored_root(cx: &mut Cx<'_>, policy: PolicyId, key: &[u8], explanation:
         return;
     }
     let mut body = BString::default();
-    for (source, value) in [
-        (b"CMake".as_slice(), cx.var(key)),
-        (b"Environment", cx.host().env_get(key)),
-    ] {
-        if let Some(value) = value.filter(|value| !value.is_empty()) {
+    for (source, value) in [b"CMake".as_slice(), b"Environment"]
+        .into_iter()
+        .zip(values)
+    {
+        if let Some(value) = value {
             body.extend_from_slice(&text(&[
                 b"\n",
                 source,
