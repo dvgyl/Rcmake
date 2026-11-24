@@ -53,22 +53,6 @@ impl Header {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::Header;
-
-    #[test]
-    fn reads_characteristics_after_the_optional_header_size() {
-        let object = b"\x64\x86\0\0\0\0\0\0\0\0\0\0\0\0\0\0\x02\0\0\0";
-        let linked = b"\x64\x86\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\x02\0";
-        assert_eq!(
-            Header::parse(object).map(|header| header.section_start),
-            Some(22)
-        );
-        assert!(Header::parse(linked).is_none());
-    }
-}
-
 pub(super) fn exports(
     bytes: &[u8],
     data: &mut BTreeSet<BString>,
@@ -233,4 +217,20 @@ fn dword(bytes: &[u8], offset: usize) -> Option<u32> {
     Some(u32::from_le_bytes(
         region(bytes, offset, 1, 4)?.try_into().ok()?,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Header;
+
+    #[test]
+    fn reads_characteristics_after_the_optional_header_size() {
+        let object = b"\x64\x86\0\0\0\0\0\0\0\0\0\0\0\0\0\0\x02\0\0\0";
+        let linked = b"\x64\x86\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\x02\0";
+        assert_eq!(
+            Header::parse(object).map(|header| header.section_start),
+            Some(22)
+        );
+        assert!(Header::parse(linked).is_none());
+    }
 }

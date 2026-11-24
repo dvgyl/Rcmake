@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use rcmake_base::BString;
-use rcmake_eval::{CmdError, CmdResult, Cx};
+use rcmake_eval::{CmdResult, Cx};
 use rcmake_expr::ExpandedArg;
 use rcmake_host::{Host, ProcessResult, RunOutput, Stream, path};
 

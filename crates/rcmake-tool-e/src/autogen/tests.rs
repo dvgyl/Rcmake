@@ -240,7 +240,9 @@ fn generates_moc_and_ui_then_reuses_outputs_and_tracks_moc_dependencies() -> Tes
     {
         let calls = requests.lock().unwrap_or_else(PoisonError::into_inner);
         assert_eq!(calls.len(), 5);
-        assert!(calls.iter().all(|call| call.timeout.is_none()));
+        for call in calls.iter() {
+            assert_eq!(call.timeout, Some(Duration::from_secs(1800)));
+        }
         let uic = calls
             .iter()
             .flat_map(|call| &call.pipeline)

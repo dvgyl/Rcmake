@@ -22,7 +22,7 @@ impl Selection {
 }
 
 pub(super) fn select(
-    cx: &Cx<'_>,
+    cx: &mut Cx<'_>,
     args: &Arguments<'_>,
     source: &Path,
     kind: PresetKind,
@@ -33,20 +33,21 @@ pub(super) fn select(
         b"CTEST_BUILD_PRESET".as_slice()
     };
     let category = kind.label();
-    let option = |argument: &[u8], variable: &[u8]| {
+    let option = |cx: &mut Cx<'_>, argument: &[u8], variable: &[u8]| {
         args.value(argument)
             .cloned()
             .filter(|value| !value.is_empty())
             .or_else(|| cx.var(variable).filter(|value| !value.is_empty()))
     };
-    let specific = option(b"PRESET", key);
+    let specific = option(cx, b"PRESET", key);
     let Some(name) = specific
         .clone()
         .or_else(|| cx.var(b"CTEST_PRESET").filter(|name| !name.is_empty()))
     else {
         return Ok(None);
     };
-    let file = option(b"PRESETS_FILE", b"CTEST_PRESETS_FILE").map(|file| absolute(source, &file));
+    let file =
+        option(cx, b"PRESETS_FILE", b"CTEST_PRESETS_FILE").map(|file| absolute(source, &file));
     let host = cx.host();
     let presets = match &file {
         Some(file) => rcmake_presets::load_file(source, file, host),

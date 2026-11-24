@@ -1,7 +1,7 @@
 use std::{path::Path, time::Duration};
 
 use rcmake_base::BString;
-use rcmake_host::{CommandSpec, Host, Input, Output, ProcessResult, RunRequest, path};
+use rcmake_host::{CommandSpec, Host, Input, Output, ProcessResult, RunRequest, Stream, path};
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct BuildAndTest {
