@@ -48,22 +48,6 @@ impl<'a> Flags<'a> {
         if ipo {
             self.extend(&mut flags, b"COMPILE_OPTIONS_IPO");
         }
-        if let Some(color) = definition(self.model, self.target.dir, b"CMAKE_COLOR_DIAGNOSTICS")
-            .filter(|value| {
-                !value.is_empty()
-                    && !value.ends_with(b"-NOTFOUND")
-                    && value.as_slice() != b"NOTFOUND"
-            })
-        {
-            self.extend(
-                &mut flags,
-                if truth::is_on(color) {
-                    b"COMPILE_OPTIONS_COLOR_DIAGNOSTICS"
-                } else {
-                    b"COMPILE_OPTIONS_COLOR_DIAGNOSTICS_OFF"
-                },
-            );
-        }
         let pic = position_independent
             .or_else(|| self.position_independent())
             .unwrap_or(matches!(
@@ -97,7 +81,27 @@ impl<'a> Flags<'a> {
         {
             self.extend(&mut flags, b"COMPILE_OPTIONS_WARNING_AS_ERROR");
         }
+        self.append_color(&mut flags);
         flags
+    }
+
+    pub(super) fn append_color(&self, flags: &mut Vec<BString>) {
+        if let Some(color) = definition(self.model, self.target.dir, b"CMAKE_COLOR_DIAGNOSTICS")
+            .filter(|value| {
+                !value.is_empty()
+                    && !value.ends_with(b"-NOTFOUND")
+                    && value.as_slice() != b"NOTFOUND"
+            })
+        {
+            self.extend(
+                flags,
+                if truth::is_on(color) {
+                    b"COMPILE_OPTIONS_COLOR_DIAGNOSTICS"
+                } else {
+                    b"COMPILE_OPTIONS_COLOR_DIAGNOSTICS_OFF"
+                },
+            );
+        }
     }
 
     pub(super) fn link(&self, ipo: bool) -> Vec<BString> {

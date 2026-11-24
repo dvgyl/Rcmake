@@ -10,10 +10,59 @@ use crate::{
     usage::{UsageResolver, handle},
 };
 use rcmake_base::{BString, list, path_lex::Lexical};
-use rcmake_diag::{Backtrace, Location, MessageKind};
+use rcmake_diag::{Backtrace, Location, MessageKind, PolicyId, PolicyStatus};
 use rcmake_genex::{ConfigId, EvalContext};
 use rcmake_host::{FileKind, Follow, Host, path::to_native};
-use rcmake_model::{BT, DirId, FileSet, InstallOptions, ProjectModel, Target};
+use rcmake_model::{
+    BT, DirId, FileSet, FileSetKind, InstallOptions, ProjectModel, Target, UsageScope,
+};
+
+/// Collect the configuration and language contexts for `file(GENERATE)`.
+#[must_use]
+pub fn file_generate_contexts(model: &ProjectModel, configs: &[ConfigId]) -> Vec<EvalContext> {
+    let languages = model
+        .global
+        .props
+        .get(b"ENABLED_LANGUAGES")
+        .map_or_else(Vec::new, |value| list::split(value, list::Empty::Drop));
+    let no_language = languages.is_empty().then_some(None);
+    languages
+        .into_iter()
+        .map(Some)
+        .chain(no_language)
+        .flat_map(|language| {
+            configs.iter().map(move |config| EvalContext {
+                config: config.clone(),
+                language: language.clone(),
+                ..EvalContext::default()
+            })
+        })
+        .collect()
+}
+
+/// Read CMP0070 for a `file(GENERATE)` request.
+#[must_use]
+pub fn file_generate_policy(model: &ProjectModel, dir: DirId, request: usize) -> PolicyStatus {
+    let key = format!("_RCMAKE_FILE_GENERATE_{request}_CMP0070");
+    match model
+        .global
+        .props
+        .get(key.as_bytes())
+        .map(|value| value.as_slice())
+    {
+        Some(b"New") => PolicyStatus::New,
+        Some(b"Old") => PolicyStatus::Old,
+        Some(b"Warn") => PolicyStatus::Warn,
+        // Older records only have the directory's final policy map.
+        _ => model
+            .dir(dir)
+            .final_policies
+            .as_ref()
+            .map_or(PolicyStatus::Warn, |policies| {
+                policies.get(PolicyId::new(70))
+            }),
+    }
+}
 
 /// Get the install options for a named file set in one install rule.
 pub fn options_for_set(model: &ProjectModel, index: usize, name: &[u8]) -> Option<InstallOptions> {
@@ -83,7 +132,12 @@ pub fn set_files(
     set: &FileSet,
     config: &ConfigId,
 ) -> Result<BTreeMap<BString, Vec<(BString, BString)>>, ResolveError> {
-    map_set_files(model, usage, target, set, config, |_, body| {
+    let context = EvalContext {
+        config: config.clone(),
+        head: Some(handle(set.target)),
+        ..EvalContext::default()
+    };
+    map_set_files(model, usage, target, set, &context, |_, body| {
         ResolveError::Message(body)
     })
 }
@@ -94,18 +148,41 @@ pub(crate) fn validate_membership(
     configs: &[ConfigId],
 ) -> Result<(), ResolveError> {
     let mut usage = UsageResolver::new(model).with_ide(paths.ide);
-    for (_, target) in model.targets().filter(|(_, target)| !target.is_imported()) {
-        for set in target.file_sets.iter().filter_map(|&id| model.file_set(id)) {
-            for config in configs {
-                map_set_files(model, &mut usage, target, set, config, |backtrace, body| {
-                    paths.emit(
-                        model,
-                        MessageKind::Error,
-                        Location::Backtrace(backtrace.clone()),
-                        body.clone(),
-                    );
-                    ResolveError::Reported(body)
-                })?;
+    let has_interface_sources = model
+        .targets()
+        .flat_map(|(_, target)| &target.file_sets)
+        .filter_map(|&id| model.file_set(id))
+        .any(|set| set.kind == FileSetKind::Sources && set.scope != UsageScope::Private);
+    let report = |backtrace: &Backtrace, body: BString| {
+        paths.emit(
+            model,
+            MessageKind::Error,
+            Location::Backtrace(backtrace.clone()),
+            body.clone(),
+        );
+        ResolveError::Reported(body)
+    };
+    for (id, target) in model.targets().filter(|(_, target)| !target.is_imported()) {
+        for config in configs {
+            let context = EvalContext {
+                config: config.clone(),
+                head: Some(handle(id)),
+                ..EvalContext::default()
+            };
+            for set in target
+                .file_sets
+                .iter()
+                .filter_map(|&id| model.file_set(id))
+                .filter(|set| set.scope != UsageScope::Interface)
+            {
+                map_set_files(model, &mut usage, target, set, &context, report)?;
+            }
+            if has_interface_sources && target.kind.compiles_objects() {
+                for (_, set) in usage.source_file_sets(id, &context)? {
+                    if set.target != id {
+                        map_set_files(model, &mut usage, target, set, &context, report)?;
+                    }
+                }
             }
         }
     }
@@ -162,23 +239,16 @@ fn map_set_files(
     usage: &mut UsageResolver<'_>,
     target: &Target,
     set: &FileSet,
-    config: &ConfigId,
+    context: &EvalContext,
     error: impl Fn(&Backtrace, BString) -> ResolveError,
 ) -> Result<BTreeMap<BString, Vec<(BString, BString)>>, ResolveError> {
-    let handle = handle(set.target);
-    let context = EvalContext {
-        config: config.clone(),
-        head: Some(handle),
-        current: Some(handle),
-        ..EvalContext::default()
-    };
     let source = Lexical::new(&model.dir(target.dir).source_dir);
     let mut bases = IndexMap::<BString, BString>::new();
     if set.base_dirs.is_empty() {
         let dir = &model.dir(target.dir).source_dir;
         bases.insert(Lexical::new(dir).normalize(), dir.clone());
     }
-    for base in usage.file_set_paths(set.target, b"BASE_DIRS", &set.base_dirs, &context)? {
+    for base in usage.file_set_paths(set.target, b"BASE_DIRS", &set.base_dirs, context)? {
         let path = source.append(&base.value);
         let normalized = Lexical::new(&path).normalize();
         for (prior, spelling) in &bases {
@@ -198,7 +268,7 @@ fn map_set_files(
         .cloned()
         .map(|base| (base, Vec::new()))
         .collect();
-    for file in usage.file_set_paths(set.target, b"SOURCES", &set.files, &context)? {
+    for file in usage.file_set_paths(set.target, b"SOURCES", &set.files, context)? {
         let path = source.append(&file.value);
         let normalized = Lexical::new(&path).normalize();
         let (base, relative) = bases

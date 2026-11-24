@@ -2,8 +2,8 @@ use std::collections::HashMap;
 
 use jiff::{Timestamp, fmt::strtime, tz::TimeZone};
 
-use rcmake_base::{BString, list, truth};
-use rcmake_diag::{Backtrace, Frame, FrameKind, PolicyId, PolicyStatus, format_paragraphs};
+use rcmake_base::{BString, truth};
+use rcmake_diag::{Backtrace, Frame, FrameKind, PolicyStatus, format_paragraphs};
 use rcmake_gen_common::{
     GenError,
     export::{
@@ -16,6 +16,7 @@ use rcmake_host::{Host, Stream, path::to_native};
 use rcmake_model::{DirId, ProjectModel, PropertyMap};
 use rcmake_resolve::{
     GenerationResult,
+    file_sets::{file_generate_contexts, file_generate_policy},
     usage::{ObjectPaths, UsageResolver},
 };
 
@@ -32,14 +33,7 @@ pub(super) fn write(
     let count = index(count).ok_or_else(invalid_record)?;
     let dirs: Vec<_> = model
         .dirs()
-        .map(|(id, dir)| {
-            (
-                id,
-                dir,
-                to_native(&dir.source_dir),
-                to_native(&dir.binary_dir),
-            )
-        })
+        .map(|(id, dir)| (id, to_native(&dir.source_dir), to_native(&dir.binary_dir)))
         .collect();
     let cwd = host.initial_cwd();
     let mut requests = Vec::new();
@@ -53,7 +47,7 @@ pub(super) fn write(
                 .ok_or_else(invalid_record)
         };
         let dir = number("DIRECTORY")?;
-        let (id, directory, source, binary) = dirs.get(dir).ok_or_else(invalid_record)?;
+        let (id, source, binary) = dirs.get(dir).ok_or_else(invalid_record)?;
         let args = (0..number("ARGC")?)
             .map(|arg| {
                 props
@@ -65,12 +59,7 @@ pub(super) fn write(
         let [b"OUTPUT", output, input_kind, input, options @ ..] = args.as_slice() else {
             return Err(invalid_record());
         };
-        let policy = directory
-            .final_policies
-            .as_ref()
-            .map_or(PolicyStatus::Warn, |policies| {
-                policies.get(PolicyId::new(70))
-            });
+        let policy = file_generate_policy(model, *id, request);
         let use_directory = policy == PolicyStatus::New;
         let mut request = FileGenerateRequest {
             input_base: if use_directory { source } else { &cwd },
@@ -104,23 +93,15 @@ pub(super) fn write(
         .map(std::ptr::from_ref)
         .zip(request_dirs)
         .collect();
-    let mut languages = props
-        .get(b"ENABLED_LANGUAGES")
-        .map_or_else(Vec::new, |value| list::split(value, list::Empty::Drop));
-    languages.retain(|language| language != "NONE");
-    let no_language = languages.is_empty().then_some(None);
-    let contexts = languages
+    let eval_contexts = file_generate_contexts(model, &result.configs);
+    let contexts = eval_contexts
         .iter()
-        .map(|language| Some(language.as_slice()))
-        .chain(no_language)
-        .flat_map(|language| {
-            result
-                .configs
-                .iter()
-                .map(move |config| FileGenerateContext {
-                    configuration: &config.0,
-                    language,
-                })
+        .map(|context| FileGenerateContext {
+            configuration: &context.config.0,
+            language: context
+                .language
+                .as_ref()
+                .map(|language| language.as_slice()),
         })
         .collect::<Vec<_>>();
     let mut usage = UsageResolver::new(model);
@@ -128,12 +109,14 @@ pub(super) fn write(
     let root = &model.dir(DirId::ROOT).source_dir;
     let timestamp = |format: Option<&[u8]>, utc| format_timestamp(host, format, utc);
     let mut condition_result: Option<BString> = None;
+    let mut request_dir = None;
     let evaluate = |value: &[u8],
                     request: &FileGenerateRequest<'_>,
                     context: FileGenerateContext<'_>| {
         let (dir, backtrace, policy) = request_dirs
             .get(&std::ptr::from_ref(request))
             .ok_or_else(invalid_record)?;
+        request_dir = Some(*dir);
         let mut genex_host = usage
             .host(*dir)
             .with_object_paths(&objects)
@@ -186,11 +169,7 @@ pub(super) fn write(
                             "Evaluation file condition \"{}\" did not evaluate to valid content. Got \"{condition_value}\".",
                             BString::from(condition),
                         );
-                        let file = listfile(model, *dir);
-                        let body = format_paragraphs(message.as_bytes(), 2, 77);
-                        return Err(GenError::Invalid(
-                            format!("\nCMake Error in {file}:\n{body}\n\n").into(),
-                        ));
+                        return Err(generation_error(model, *dir, &message));
                     }
                 }
             }
@@ -202,7 +181,8 @@ pub(super) fn write(
         }
         evaluate_value(value, &mut genex_host)
     };
-    write_generated_files(&requests, &contexts, evaluate, host).map_err(collision_error)?;
+    let generated = write_generated_files(&requests, &contexts, evaluate, host);
+    generated.map_err(|error| collision_error(model, request_dir, error))?;
     Ok(())
 }
 
@@ -241,7 +221,13 @@ fn warn_relative_path(model: &ProjectModel, host: &dyn Host, dir: DirId, role: &
     );
 }
 
-fn collision_error(error: GenError) -> GenError {
+fn generation_error(model: &ProjectModel, dir: DirId, message: &str) -> GenError {
+    let file = listfile(model, dir);
+    let body = format_paragraphs(message.as_bytes(), 2, 77);
+    GenError::Invalid(format!("\nCMake Error in {file}:\n{body}\n\n").into())
+}
+
+fn collision_error(model: &ProjectModel, dir: Option<DirId>, error: GenError) -> GenError {
     match error {
         GenError::Write { path, message }
             if message == "more than one file(GENERATE) request uses the same output path" =>
@@ -251,11 +237,12 @@ fn collision_error(error: GenError) -> GenError {
             ).into())
         }
         GenError::Write { path, message }
-            if message == "file(GENERATE) produced different content for the same output path" =>
+            if message == "file(GENERATE) produced different content for the same output path"
+                && let Some(dir) = dir =>
         {
-            GenError::Invalid(format!(
-                "\nCMake Error: Evaluation file to be written multiple times with different content. This is generally caused by the content evaluating the configuration type, language, or location of object files:\n {path}\n\n"
-            ).into())
+            generation_error(model, dir, &format!(
+                "Evaluation file to be written multiple times with different content. This is generally caused by the content evaluating the configuration type, language, or location of object files:\n {path}"
+            ))
         }
         error => error,
     }

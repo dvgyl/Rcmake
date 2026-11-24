@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use rcmake_base::{BString, list, shell::quote, truth};
+use rcmake_base::{BString, ByteSlice, list, shell::quote, truth};
 use rcmake_model::{ProjectModel, Target};
 
 use super::{LinkFragment, LinkFragmentRole, ResolvedLinkItem, ResolvedLinkKind, link_fragment};
@@ -97,19 +97,10 @@ impl<'a, 'host> Features<'a, 'host> {
                     {
                         continue;
                     }
-                    let mut template = alternative(template, use_path);
-                    if let Some(arguments) = template.strip_prefix(b"LINKER:")
-                        && !arguments.starts_with(b"SHELL:")
-                    {
-                        // Split the template before substituting paths. File names can contain commas.
-                        let mut rewritten = b"LINKER:SHELL:".to_vec();
-                        rewritten.extend(
-                            arguments
-                                .iter()
-                                .map(|&byte| if byte == b',' { b' ' } else { byte }),
-                        );
-                        template = rewritten;
-                    }
+                    let template = alternative(template, use_path);
+                    let comma_arguments = template
+                        .strip_prefix(b"LINKER:")
+                        .is_some_and(|arguments| !arguments.starts_with(b"SHELL:"));
                     let definition = |key: &[u8]| {
                         lower::definition(self.model, self.target.dir, key)
                             .map_or(b"".as_slice(), |v| v.as_slice())
@@ -119,18 +110,46 @@ impl<'a, 'host> Features<'a, 'host> {
                     let flag =
                         lower::definition(self.model, self.target.dir, b"CMAKE_LINK_LIBRARY_FLAG")
                             .map_or(b"-l".as_slice(), |v| v.as_slice());
-                    let text = lower::expand_rule(&template, |key| match key {
-                        b"LINK_ITEM" | b"LIBRARY" | b"LIB_ITEM" if use_path => Some(value.clone()),
-                        b"LIBRARY" | b"LIB_ITEM" if framework.is_some() => {
-                            framework.map(BString::from)
-                        }
-                        b"LINK_ITEM" if framework.is_some() => Some(value.clone()),
-                        b"LINK_ITEM" => Some(quote(&[flag, &name].concat())),
-                        b"LIBRARY" => Some(quote(&name)),
-                        b"LIB_ITEM" => Some(quote(raw)),
-                        _ => None,
-                    });
-                    fragment.text.value = self.render(&text)?;
+                    let expand = |template: &[u8]| {
+                        let word = |arg: &[u8]| {
+                            if comma_arguments {
+                                BString::from(arg)
+                            } else {
+                                quote(arg)
+                            }
+                        };
+                        let fragment_word = |arg: &[u8]| {
+                            if comma_arguments {
+                                unquote_link_word(arg)
+                            } else {
+                                BString::from(arg)
+                            }
+                        };
+                        lower::expand_rule(template, |key| match key {
+                            b"LINK_ITEM" | b"LIBRARY" | b"LIB_ITEM" if use_path => {
+                                Some(fragment_word(value))
+                            }
+                            b"LIBRARY" | b"LIB_ITEM" if framework.is_some() => {
+                                framework.map(fragment_word)
+                            }
+                            b"LINK_ITEM" if framework.is_some() => framework.map(|name| {
+                                [b"-framework ", fragment_word(name).as_slice()]
+                                    .concat()
+                                    .into()
+                            }),
+                            b"LINK_ITEM" => Some(word(&[flag, &name].concat())),
+                            b"LIBRARY" => Some(word(&name)),
+                            b"LIB_ITEM" => Some(word(raw)),
+                            _ => None,
+                        })
+                    };
+                    fragment.text.value = if comma_arguments {
+                        // Let the wrapper split commas before it sees library paths.
+                        let args = self.wrapper.expand(&template)?;
+                        render_arguments(args.iter().map(|arg| expand(arg)))
+                    } else {
+                        self.render(&expand(&template))?
+                    };
                 }
             }
         }
@@ -144,14 +163,7 @@ impl<'a, 'host> Features<'a, 'host> {
         if !text.starts_with(b"LINKER:") {
             return Ok(text.clone());
         }
-        let args = self.wrapper.expand(text)?;
-        let parts: Vec<_> = args.iter().map(|arg| quote(arg)).collect();
-        Ok(parts
-            .iter()
-            .map(|arg| arg.as_slice())
-            .collect::<Vec<_>>()
-            .join(b" ".as_slice())
-            .into())
+        Ok(render_arguments(self.wrapper.expand(text)?))
     }
 
     fn push(
@@ -187,7 +199,7 @@ impl<'a, 'host> Features<'a, 'host> {
                 "Feature '{feature}', specified through generator-expression '$<{operator}>' to link target '{target}', is not {reason} for the '{language}' link language."
             ))
         };
-        let variable = if supports(&specific).is_some_and(|value| !group || truth::is_on(value)) {
+        let variable = if supports(&specific).is_some() {
             specific
         } else {
             generic
@@ -232,6 +244,22 @@ impl<'a, 'host> Features<'a, 'host> {
         self.paths
             .target_error(self.model, self.target, body.into())
     }
+}
+
+fn render_arguments(args: impl IntoIterator<Item = BString>) -> BString {
+    let parts: Vec<_> = args.into_iter().map(|arg| quote(&arg)).collect();
+    parts
+        .iter()
+        .map(|arg| arg.as_slice())
+        .collect::<Vec<_>>()
+        .join(b" ".as_slice())
+        .into()
+}
+
+fn unquote_link_word(arg: &[u8]) -> BString {
+    arg.strip_prefix(b"'")
+        .and_then(|word| word.strip_suffix(b"'"))
+        .map_or_else(|| arg.into(), |word| word.replace(b"'\\''", b"'").into())
 }
 
 fn validate_template(value: &[u8]) -> Result<(), &'static str> {

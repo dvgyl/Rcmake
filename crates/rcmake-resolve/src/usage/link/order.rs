@@ -49,13 +49,22 @@ impl UsageResolver<'_> {
             .iter()
             .map(|item| (graph.insert(item), Arc::clone(item)))
             .collect();
+        let mut inferred = IndexMap::new();
+        let mut edge_budget = Limits::default().max_value_bytes / 64;
+        graph.infer_raw_edges(
+            &mut inferred,
+            &mut edge_budget,
+            original.iter().map(|(id, _)| *id),
+        )?;
         let mut index = 0;
         while let Some((_, (item, _))) = graph.nodes.get_index(index) {
             let item = Arc::clone(item);
             let mut edges = IndexSet::new();
             for parent in item.edge_targets() {
                 let (items, _) = self.usage_links(parent, true, &ctx)?;
-                edges.extend(items.iter().map(|item| graph.insert(item)));
+                let indices: Vec<_> = items.iter().map(|item| graph.insert(item)).collect();
+                graph.infer_raw_edges(&mut inferred, &mut edge_budget, indices.iter().copied())?;
+                edges.extend(indices);
             }
             if let Some((_, (_, current_edges))) = graph.nodes.get_index_mut(index) {
                 *current_edges = edges;
@@ -63,10 +72,15 @@ impl UsageResolver<'_> {
             index += 1;
         }
 
+        for (index, inferred) in inferred {
+            if let Some((_, (_, edges))) = graph.nodes.get_index_mut(index) {
+                edges.extend(inferred);
+            }
+        }
         let overrides = self.link_feature_overrides(target, owner, &ctx)?;
         let features =
             graph.apply_features(self.model, owner, &ctx, &overrides, paths, &mut original)?;
-        graph.apply_groups(&mut original);
+        graph.apply_groups(&mut original)?;
         let mut ordered = graph
             .order(self.model, owner, &ctx, original, strategy)
             .map_err(|error_value| match error_value {
@@ -151,11 +165,11 @@ struct LinkGraph {
     feature_variants: Vec<Arc<ResolvedLinkItem>>,
 }
 
-#[expect(
-    clippy::indexing_slicing,
-    reason = "Node and component indices come from the graph and its component table."
-)]
 impl LinkGraph {
+    fn node(&self, index: usize) -> Option<&LinkNode> {
+        self.nodes.get_index(index).map(|(_, node)| node)
+    }
+
     fn insert(&mut self, item: &Arc<ResolvedLinkItem>) -> usize {
         let entry = self.nodes.entry(item.key());
         let index = entry.index();
@@ -166,6 +180,37 @@ impl LinkGraph {
             self.feature_variants.push(Arc::clone(item));
         }
         index
+    }
+
+    fn infer_raw_edges(
+        &self,
+        inferred: &mut IndexMap<usize, IndexSet<usize>>,
+        budget: &mut usize,
+        entries: impl Iterator<Item = usize>,
+    ) -> Result<(), ResolveError> {
+        let mut positions = IndexMap::new();
+        for (position, id) in entries.enumerate() {
+            if self.node(id).is_some_and(|(item, _)| raw_library(item)) {
+                let (_, last) = positions.entry(id).or_insert((position, position));
+                *last = position;
+            }
+        }
+        // Infer an edge when the same item follows this library in each list.
+        for (&id, &(first, _)) in &positions {
+            let follows = |other: &usize| {
+                *other != id && positions.get(other).is_some_and(|&(_, last)| last > first)
+            };
+            if let Some(edges) = inferred.get_mut(&id) {
+                edges.retain(follows);
+            } else {
+                let edges = positions.keys().copied().filter(follows);
+                *budget = budget.checked_sub(edges.clone().count()).ok_or_else(|| {
+                    ResolveError::Message("The link graph exceeds the size limit.".into())
+                })?;
+                inferred.insert(id, edges.collect());
+            }
+        }
+        Ok(())
     }
 
     fn apply_features(
@@ -308,7 +353,10 @@ impl LinkGraph {
         Ok(attributes)
     }
 
-    fn apply_groups(&mut self, direct: &mut [(usize, Arc<ResolvedLinkItem>)]) {
+    fn apply_groups(
+        &mut self,
+        direct: &mut [(usize, Arc<ResolvedLinkItem>)],
+    ) -> Result<(), ResolveError> {
         let mut replacements = HashMap::new();
         for (index, (_, (item, _))) in self.nodes.iter().enumerate() {
             if let ResolvedLinkKind::Group { members, .. } = &item.kind {
@@ -324,12 +372,13 @@ impl LinkGraph {
                 edges.shift_remove(&index);
                 edges.sort_unstable();
             }
-            return;
+            return Ok(());
         }
         for (index, item) in direct {
-            if let Some(group) = replacements.get(index) {
-                *index = *group;
-                *item = Arc::clone(&self.nodes[*group].0);
+            if let Some(&group) = replacements.get(index) {
+                let (group_item, _) = self.node(group).ok_or_else(invalid_link_graph)?;
+                *index = group;
+                *item = Arc::clone(group_item);
                 Arc::make_mut(item).direct = true;
             }
         }
@@ -343,6 +392,7 @@ impl LinkGraph {
             }
             edges.sort_unstable();
         }
+        Ok(())
     }
 
     fn order(
@@ -353,22 +403,22 @@ impl LinkGraph {
         direct: Vec<(usize, Arc<ResolvedLinkItem>)>,
         strategy: LinkOrder,
     ) -> Result<Vec<Arc<ResolvedLinkItem>>, ResolveError> {
-        let (component_ids, mut components) = self.components();
-        for (index, (_, (_, edges))) in self.nodes.iter().enumerate() {
-            let id = component_ids[index];
+        let (component_ids, mut components) = self.components().ok_or_else(invalid_link_graph)?;
+        for (&id, (_, edges)) in component_ids.iter().zip(self.nodes.values()) {
+            let component = components.get_mut(id).ok_or_else(invalid_link_graph)?;
             for &next in edges {
-                let next = component_ids[next];
+                let &next = component_ids.get(next).ok_or_else(invalid_link_graph)?;
                 if id != next {
-                    components[id].edges.insert(next);
+                    component.edges.push(next);
                 }
             }
         }
-        set_component_order(&mut components);
+        set_component_order(&mut components).ok_or_else(invalid_link_graph)?;
         for component in &mut components {
             if component.members.len() > 1 {
                 component.passes = 2;
                 for &index in &component.members {
-                    let (item, _) = &self.nodes[index];
+                    let (item, _) = self.node(index).ok_or_else(invalid_link_graph)?;
                     match item.kind {
                         ResolvedLinkKind::Group { .. } => {
                             return Err(self.group_cycle(owner, component));
@@ -405,27 +455,28 @@ impl LinkGraph {
         match strategy {
             LinkOrder::Minimal => {
                 for (index, item) in direct {
-                    visit(index, &component_ids, &mut components, &mut pending);
+                    visit(index, &component_ids, &mut components, &mut pending)
+                        .ok_or_else(invalid_link_graph)?;
                     order.push(item);
                 }
             }
             LinkOrder::Free => {
                 for (index, _) in direct {
-                    let id = component_ids[index];
-                    if pending.insert((components[id].order, id)) {
-                        components[id].reset();
+                    let &id = component_ids.get(index).ok_or_else(invalid_link_graph)?;
+                    let component = components.get_mut(id).ok_or_else(invalid_link_graph)?;
+                    if pending.insert((component.order, id)) {
+                        component.reset();
                     }
                 }
             }
         }
         while let Some((_, id)) = pending.first().copied() {
-            let Some(index) = components[id].remaining.first().copied() else {
-                return Err(ResolveError::Message(
-                    "A pending link component has no members.".into(),
-                ));
-            };
-            visit(index, &component_ids, &mut components, &mut pending);
-            order.push(Arc::clone(&self.nodes[index].0));
+            let component = components.get(id).ok_or_else(invalid_link_graph)?;
+            let &index = component.remaining.first().ok_or_else(invalid_link_graph)?;
+            visit(index, &component_ids, &mut components, &mut pending)
+                .ok_or_else(invalid_link_graph)?;
+            let (item, _) = self.node(index).ok_or_else(invalid_link_graph)?;
+            order.push(Arc::clone(item));
             if order.len() > Limits::default().max_value_bytes / 64 {
                 return Err(ResolveError::Message(
                     "The link line exceeds the size limit.".into(),
@@ -436,8 +487,7 @@ impl LinkGraph {
     }
 
     fn group_cycle(&self, owner: &Target, component: &Component) -> ResolveError {
-        let item_name = |index: usize| -> String {
-            let (item, _) = &self.nodes[index];
+        let item_name = |item: &ResolvedLinkItem| -> String {
             if let ResolvedLinkKind::Group { feature, members } = &item.kind {
                 let names: Vec<_> = members
                     .iter()
@@ -452,24 +502,29 @@ impl LinkGraph {
             "The inter-target dependency graph, for the target \"{}\", contains the following strongly connected component (cycle):\n\n",
             owner.name
         );
-        for &index in &component.members {
-            let _ = writeln!(body, "  {}", item_name(index));
-            let (_, edges) = &self.nodes[index];
+        for (item, edges) in component
+            .members
+            .iter()
+            .filter_map(|&index| self.node(index))
+        {
+            let _ = writeln!(body, "  {}", item_name(item));
             for &edge in edges {
-                if component.members.binary_search(&edge).is_ok() {
-                    let _ = writeln!(body, "    depends on {}", item_name(edge));
+                if component.members.binary_search(&edge).is_ok()
+                    && let Some((dependency, _)) = self.node(edge)
+                {
+                    let _ = writeln!(body, "    depends on {}", item_name(dependency));
                 }
             }
         }
         ResolveError::Message(body.into())
     }
 
-    fn components(&self) -> (Vec<usize>, Vec<Component>) {
+    fn components(&self) -> Option<(Vec<usize>, Vec<Component>)> {
         let count = self.nodes.len();
         let mut reverse = vec![Vec::new(); count];
         for (id, (_, (_, edges))) in self.nodes.iter().enumerate() {
             for &next in edges {
-                reverse[next].push(id);
+                reverse.get_mut(next)?.push(id);
             }
         }
 
@@ -483,9 +538,10 @@ impl LinkGraph {
             while let Some((node, done)) = stack.pop() {
                 if done {
                     finished.push(node);
-                } else if !std::mem::replace(&mut visited[node], true) {
+                } else if !std::mem::replace(visited.get_mut(node)?, true) {
                     stack.push((node, true));
-                    stack.extend(self.nodes[node].1.iter().rev().map(|&edge| (edge, false)));
+                    let (_, edges) = self.node(node)?;
+                    stack.extend(edges.iter().rev().map(|&edge| (edge, false)));
                 }
             }
         }
@@ -493,62 +549,65 @@ impl LinkGraph {
         let mut components = Vec::new();
         let mut stack = Vec::new();
         for index in finished.into_iter().rev() {
-            if ids[index] != usize::MAX {
+            if *ids.get(index)? != usize::MAX {
                 continue;
             }
             let id = components.len();
             let mut members = Vec::new();
             stack.push(index);
             while let Some(node) = stack.pop() {
-                if ids[node] == usize::MAX {
-                    ids[node] = id;
+                let component = ids.get_mut(node)?;
+                if *component == usize::MAX {
+                    *component = id;
                     members.push(node);
-                    stack.extend(&reverse[node]);
+                    stack.extend(reverse.get(node)?.iter().copied());
                 }
             }
             members.sort_unstable();
             components.push(Component {
                 members,
                 order: 0,
-                edges: IndexSet::new(),
+                edges: Vec::new(),
                 passes: 1,
                 left: 0,
                 remaining: IndexSet::new(),
             });
         }
-        (ids, components)
+        Some((ids, components))
     }
+}
+
+fn invalid_link_graph() -> ResolveError {
+    ResolveError::Message("The link graph contains an invalid node or component.".into())
 }
 
 struct Component {
     members: Vec<usize>,
     order: usize,
-    edges: IndexSet<usize>,
+    edges: Vec<usize>,
     passes: usize,
     left: usize,
     remaining: IndexSet<usize>,
 }
 
-#[expect(
-    clippy::indexing_slicing,
-    reason = "Edges contain indices into the component table."
-)]
-fn set_component_order(components: &mut [Component]) {
+fn set_component_order(components: &mut [Component]) -> Option<()> {
     let mut visited = vec![false; components.len()];
     let mut next = components.len();
     let mut stack = Vec::new();
     for id in 0..components.len() {
         stack.push((id, false));
         while let Some((id, done)) = stack.pop() {
+            let component = components.get_mut(id)?;
             if done {
                 next -= 1;
-                components[id].order = next;
-            } else if !std::mem::replace(&mut visited[id], true) {
+                component.order = next;
+            } else if !std::mem::replace(visited.get_mut(id)?, true) {
                 stack.push((id, true));
-                stack.extend(components[id].edges.iter().map(|&edge| (edge, false)));
+                stack.extend(component.edges.iter().map(|&edge| (edge, false)));
             }
         }
     }
+    Some(())
 }
 
 impl Component {
@@ -559,39 +618,37 @@ impl Component {
     }
 }
 
-#[expect(
-    clippy::indexing_slicing,
-    reason = "The pending set and edges contain component indices from the component table."
-)]
 fn visit(
     item: usize,
     ids: &[usize],
     components: &mut [Component],
     pending: &mut BTreeSet<(usize, usize)>,
-) {
-    let id = ids[item];
-    let component = &mut components[id];
+) -> Option<()> {
+    let &id = ids.get(item)?;
+    let component = components.get_mut(id)?;
     let key = (component.order, id);
     if pending.insert(key) {
         component.reset();
     }
     component.remaining.shift_remove(&item);
     if !component.remaining.is_empty() {
-        return;
+        return Some(());
     }
     component.left -= 1;
     if component.left > 0 {
         component
             .remaining
             .extend(component.members.iter().copied());
-        return;
+        return Some(());
     }
     pending.remove(&key);
-    let edges = component.edges.clone();
-    for next in edges {
-        pending.insert((components[next].order, next));
-        components[next].reset();
+    let next_components: IndexSet<_> = component.edges.iter().copied().collect();
+    for next in next_components {
+        let component = components.get_mut(next)?;
+        pending.insert((component.order, next));
+        component.reset();
     }
+    Some(())
 }
 
 fn describe_feature(feature: &[u8]) -> String {
@@ -771,6 +828,14 @@ fn invalid_options(variable: &str, invalid: &[BString]) -> BString {
     body
 }
 
+fn raw_library(item: &ResolvedLinkItem) -> bool {
+    let text = &item.text.value;
+    matches!(item.kind, ResolvedLinkKind::Raw)
+        && (!text.starts_with(b"-") || text.starts_with(b"-l") || text.starts_with(b"-framework "))
+        && !text.starts_with(b"LINKER:")
+        && !text.starts_with(b"SHELL:")
+}
+
 fn deduplicate(
     model: &ProjectModel,
     target: &Target,
@@ -779,17 +844,10 @@ fn deduplicate(
     items: &mut Vec<Arc<ResolvedLinkItem>>,
 ) -> Result<(), BString> {
     let policy = |number| target.policies.policies.get(PolicyId::new(number)) == PolicyStatus::New;
-    let platform = definition(model, target.dir, b"CMAKE_SYSTEM_NAME")
-        .map_or(b"".as_slice(), |value| value.as_slice());
-    let windows = platform.starts_with(b"Windows");
-    let apple = matches!(
-        platform,
-        b"Darwin" | b"iOS" | b"tvOS" | b"watchOS" | b"visionOS"
-    ) || (platform.is_empty() && cfg!(target_os = "macos"));
     let language = ctx.link_language.as_ref().or(ctx.language.as_ref());
-    let mut all = policy(156) && (apple || windows);
+    let mut all = false;
     let mut shared = true;
-    let mut forward = policy(156) && windows;
+    let mut forward = false;
     if policy(156)
         && let Some(language) = language
     {
@@ -861,13 +919,7 @@ fn deduplicate(
                 _ if all => Some(forward),
                 _ => None,
             },
-            ResolvedLinkKind::Raw if all => {
-                let text = &item.text.value;
-                (!text.starts_with(b"-")
-                    || text.starts_with(b"-l")
-                    || text.starts_with(b"-framework "))
-                .then_some(forward)
-            }
+            ResolvedLinkKind::Raw if all && raw_library(item) => Some(forward),
             _ => None,
         }
     };

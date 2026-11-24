@@ -53,6 +53,8 @@ pub(super) fn dependencies(
         }
     }
     visited.clear();
+    let mut endpoints: Vec<_> = (0..graph.len()).map(|id| (id, id)).collect();
+    let mut dependencies = vec![IndexSet::new(); graph.len()];
     for id in finished.into_iter().rev() {
         if visited.contains(&id) {
             continue;
@@ -86,50 +88,95 @@ pub(super) fn dependencies(
             };
             return Err(cycle_error(local, graph, strong_edges, &component, reason));
         }
-        let mut remaining = component.clone();
-        let mut order = Vec::with_capacity(remaining.len());
-        while !remaining.is_empty() {
-            let next = remaining
-                .iter()
-                .copied()
-                .filter(|&id| {
-                    strong_edges
-                        .get(id)
-                        .into_iter()
-                        .flatten()
-                        .all(|dep| !remaining.contains(dep))
-                })
-                .max();
-            let Some(next) = next else {
-                return Err(cycle_error(
-                    local,
-                    graph,
-                    strong_edges,
-                    &component,
-                    "The component contains at least one cycle consisting of strong dependencies (created by add_dependencies) that cannot be broken.",
-                ));
-            };
-            remaining.shift_remove(&next);
-            order.push(next);
-        }
+        let Some(order) = component_order(graph, strong_edges, &component) else {
+            return Err(cycle_error(
+                local,
+                graph,
+                strong_edges,
+                &component,
+                "The component contains at least one cycle consisting of strong dependencies (created by add_dependencies) that cannot be broken.",
+            ));
+        };
+        let (Some(&tail), Some(&head)) = (order.first(), order.last()) else {
+            continue;
+        };
+        let mut previous = None;
         for next in order {
-            if let Some(target) = graph.get_mut(next) {
-                target.depends.retain(|dep| {
-                    !component.contains(dep)
-                        || strong_edges
-                            .get(next)
-                            .is_some_and(|edges| edges.contains(dep))
-                });
-                if let Some(&previous) = pending.last()
-                    && !target.depends.contains(&previous)
-                {
-                    target.depends.push(previous);
-                }
+            if let Some(pair) = endpoints.get_mut(next) {
+                *pair = (tail, head);
             }
-            pending.push(next);
+            if let Some(deps) = dependencies.get_mut(next) {
+                deps.extend(strong_dependencies(graph, strong_edges, &component, next));
+                deps.extend(previous);
+            }
+            previous = Some(next);
         }
     }
+
+    for (target, &(tail, _)) in graph.iter().zip(&endpoints) {
+        let Some(edges) = dependencies.get_mut(tail) else {
+            continue;
+        };
+        for &dep in &target.depends {
+            if let Some(&(dep_tail, dep_head)) = endpoints.get(dep)
+                && tail != dep_tail
+            {
+                edges.insert(dep_head);
+            }
+        }
+    }
+    for (target, edges) in graph.iter_mut().zip(dependencies) {
+        target.depends = edges.into_iter().collect();
+    }
     Ok(())
+}
+
+fn component_order(
+    graph: &[GraphTarget],
+    strong_edges: &[IndexSet<usize>],
+    members: &IndexSet<usize>,
+) -> Option<Vec<usize>> {
+    let mut roots: Vec<_> = members.iter().copied().collect();
+    roots.sort_unstable();
+    let mut order = Vec::with_capacity(roots.len());
+    let mut emitted = IndexSet::new();
+    let mut active = IndexSet::new();
+    let mut stack = Vec::new();
+    for root in roots.into_iter().rev() {
+        stack.push((root, false));
+        while let Some((node, done)) = stack.pop() {
+            if done {
+                active.swap_remove(&node);
+                emitted.insert(node);
+                order.push(node);
+            } else if !emitted.contains(&node) {
+                if !active.insert(node) {
+                    return None;
+                }
+                stack.push((node, true));
+                stack.extend(
+                    strong_dependencies(graph, strong_edges, members, node)
+                        .rev()
+                        .map(|dep| (dep, false)),
+                );
+            }
+        }
+    }
+    Some(order)
+}
+
+fn strong_dependencies<'a>(
+    graph: &'a [GraphTarget],
+    strong_edges: &'a [IndexSet<usize>],
+    members: &'a IndexSet<usize>,
+    node: usize,
+) -> impl DoubleEndedIterator<Item = usize> + 'a {
+    let strong = strong_edges.get(node);
+    graph
+        .get(node)
+        .into_iter()
+        .flat_map(|target| target.depends.iter().copied())
+        .filter(move |dep| members.contains(dep) && strong.is_some_and(|edges| edges.contains(dep)))
 }
 
 fn prune_dependencies(

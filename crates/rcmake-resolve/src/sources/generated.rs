@@ -1,10 +1,14 @@
-use rcmake_base::list;
-use rcmake_diag::{PolicyId, PolicyStatus};
+use rcmake_diag::PolicyStatus;
 use rcmake_genex::{ConfigId, EvalContext, GenexHost, evaluate, parse};
+use rcmake_host::path::from_native_cmake;
 use rcmake_model::ProjectModel;
 
 use super::{SourcePaths, absolute_path};
-use crate::{ResolveError, usage::UsageResolver};
+use crate::{
+    ResolveError,
+    file_sets::{file_generate_contexts, file_generate_policy},
+    usage::UsageResolver,
+};
 
 impl SourcePaths<'_> {
     pub(super) fn index_file_generations(
@@ -20,10 +24,8 @@ impl SourcePaths<'_> {
         else {
             return Ok(());
         };
-        let mut languages = props
-            .get(b"ENABLED_LANGUAGES")
-            .map_or_else(Vec::new, |value| list::split(value, list::Empty::Drop));
-        languages.retain(|language| language != "NONE");
+        let contexts = file_generate_contexts(model, std::slice::from_ref(config));
+        let cwd = from_native_cmake(&self.host.initial_cwd());
         let directories: Vec<_> = model.dirs().collect();
         for index in 0..count {
             let key = format!("_RCMAKE_FILE_GENERATE_{index}");
@@ -34,13 +36,10 @@ impl SourcePaths<'_> {
             let (Some(&(id, dir)), Some(output)) = (directory, get("ARG1")) else {
                 break;
             };
-            let use_directory = dir
-                .final_policies
-                .is_some_and(|policies| policies.get(PolicyId::new(70)) == PolicyStatus::New);
-            let base = if use_directory {
+            let base = if file_generate_policy(model, id, index) == PolicyStatus::New {
                 &dir.binary_dir
             } else {
-                &dir.source_dir
+                &cwd
             };
             let ast = parse(output)?;
             let mut host = usage.host(id);
@@ -58,14 +57,11 @@ impl SourcePaths<'_> {
                     _ => {}
                 }
             }
-            let no_language = languages.is_empty().then_some(None);
-            for language in languages.iter().cloned().map(Some).chain(no_language) {
+            for context in &contexts {
                 let context = EvalContext {
-                    config: config.clone(),
-                    language,
                     current: target,
                     head: target,
-                    ..EvalContext::default()
+                    ..(*context).clone()
                 };
                 let output = evaluate(&ast, &context, &mut host)?.0;
                 if !output.is_empty() {

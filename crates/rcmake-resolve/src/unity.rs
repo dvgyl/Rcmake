@@ -395,7 +395,7 @@ impl UnityWriter<'_> {
     ) -> bool {
         let guard = candidate.configs.len() < self.config_count;
         if guard {
-            let mut sep = &b"#if "[..];
+            let mut sep = b"#if ".as_slice();
             for config in &candidate.configs {
                 content.extend_from_slice(sep);
                 content.extend_from_slice(b"defined(");
@@ -416,14 +416,14 @@ impl UnityWriter<'_> {
             let include = source_path
                 .relative(Lexical::new(Lexical::new(unity).parent()))
                 .unwrap_or_else(|| source.clone());
-            (&b"BLD_"[..], relative, include)
+            (b"BLD_".as_slice(), relative, include)
         } else if source_root.prefix(source_path) {
             let relative = source_path
                 .relative(source_root)
                 .unwrap_or_else(|| source.clone());
-            (&b"SRC_"[..], relative.clone(), relative)
+            (b"SRC_".as_slice(), relative.clone(), relative)
         } else {
-            (&b"ABS_"[..], source.clone(), source.clone())
+            (b"ABS_".as_slice(), source.clone(), source.clone())
         };
         if let Some(unique_id) = self.options.unique_id {
             let name = [tag, relative.as_slice()].concat();

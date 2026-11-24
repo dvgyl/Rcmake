@@ -6,6 +6,7 @@ use rcmake_model::{BT, ProjectModel, Target};
 
 use super::shell::join_words;
 use super::{definition, target_property};
+use crate::ResolveError;
 
 pub(crate) fn required_standard(
     language: &[u8],
@@ -126,14 +127,56 @@ pub(super) fn standard_flag(
     language: &[u8],
     required: Option<&[u8]>,
 ) -> Option<BString> {
-    let standard_key = [language, b"_STANDARD"].concat();
-    let explicit = if language == b"CUDA" {
-        target.props.get(&standard_key)
-    } else {
-        target_property(model, target, &standard_key)
+    checked_standard_flag(model, target, language, required)
+        .ok()
+        .flatten()
+}
+
+/// Select the standard flag and report invalid CUDA settings.
+pub(super) fn checked_standard_flag(
+    model: &ProjectModel,
+    target: &Target,
+    language: &[u8],
+    required: Option<&[u8]>,
+) -> Result<Option<BString>, ResolveError> {
+    let new_policy = target.policies.policies.get(PolicyId::new(128)) == PolicyStatus::New;
+    if language == b"CUDA" {
+        return cuda_standard_flag(model, target, required, new_policy);
     }
-    .map(|value| value.as_slice())
-    .filter(|value| !value.is_empty() && value.iter().all(u8::is_ascii_digit));
+    Ok(other_standard_flag(
+        model, target, language, required, new_policy,
+    ))
+}
+
+fn other_standard_flag(
+    model: &ProjectModel,
+    target: &Target,
+    language: &[u8],
+    required: Option<&[u8]>,
+    new_policy: bool,
+) -> Option<BString> {
+    let paired: Option<&[u8]> = match language {
+        b"OBJC" => Some(b"C"),
+        b"OBJCXX" => Some(b"CXX"),
+        _ => None,
+    };
+    let property = |suffix: &[u8]| {
+        target_property(model, target, &[language, suffix].concat()).or_else(|| {
+            paired.and_then(|paired| target_property(model, target, &[paired, suffix].concat()))
+        })
+    };
+    let explicit = property(b"_STANDARD")
+        .or_else(|| {
+            paired.and_then(|paired| {
+                definition(
+                    model,
+                    target.dir,
+                    &[b"CMAKE_", paired, b"_STANDARD_DEFAULT"].concat(),
+                )
+            })
+        })
+        .map(|value| value.as_slice())
+        .filter(|value| !value.is_empty() && value.iter().all(u8::is_ascii_digit));
     let default = definition(
         model,
         target.dir,
@@ -141,71 +184,14 @@ pub(super) fn standard_flag(
     )
     .map(|value| value.as_slice())
     .filter(|value| rank(language, value).is_some());
-    let new_policy = target.policies.policies.get(PolicyId::new(128)) == PolicyStatus::New;
-    if language == b"CUDA" {
-        let default = default?;
-        let default_extensions = definition(model, target.dir, b"CMAKE_CUDA_EXTENSIONS_DEFAULT")
-            .is_some_and(|value| truth::is_on(value));
-        let extensions = target
-            .props
-            .get(b"CUDA_EXTENSIONS")
-            .map_or(!new_policy || default_extensions, |value| {
-                truth::is_on(value)
-            });
-        let required_property = target
-            .props
-            .get(b"CUDA_STANDARD_REQUIRED")
-            .is_some_and(|value| truth::is_on(value));
-        let standard = explicit
-            .into_iter()
-            .chain(required.filter(|value| {
-                rank(language, value) > rank(language, explicit.unwrap_or(default))
-            }))
-            .max_by_key(|value| rank(language, value));
-        let cuda_option = |standard: &[u8]| {
-            let kind = if extensions {
-                b"EXTENSION".as_slice()
-            } else {
-                b"STANDARD"
-            };
-            let key = [b"CMAKE_CUDA_", standard, b"_", kind, b"_COMPILE_OPTION"].concat();
-            definition(model, target.dir, &key)
-        };
-        let flag = match standard {
-            None if new_policy && extensions != default_extensions => cuda_option(default),
-            None if !new_policy && extensions => {
-                definition(model, target.dir, b"CMAKE_CUDA_EXTENSION_COMPILE_OPTION")
-            }
-            None => None,
-            Some(value) if required_property => cuda_option(value),
-            Some(value) => {
-                let requested = rank(language, value)?;
-                let latest = rank(language, default)?;
-                if requested < latest
-                    || extensions != default_extensions
-                    || !new_policy && requested == latest
-                {
-                    cuda_option(CUDA_LEVELS.get(requested)?)
-                } else {
-                    CUDA_LEVELS
-                        .get(latest + 1..=requested)
-                        .unwrap_or_default()
-                        .iter()
-                        .rev()
-                        .find_map(|level| cuda_option(level))
-                }
-            }
-        }?;
-        return Some(standard_options(flag));
-    }
     let default_extensions = definition(
         model,
         target.dir,
         &[b"CMAKE_", language, b"_EXTENSIONS_DEFAULT"].concat(),
     )
     .is_none_or(|value| truth::is_on(value));
-    let extensions = target_property(model, target, &[language, b"_EXTENSIONS"].concat())
-        .map_or(default_extensions, |value| truth::is_on(value));
+    let extensions =
+        property(b"_EXTENSIONS").map_or(default_extensions, |value| truth::is_on(value));
     let standard = match (explicit, required) {
         (Some(explicit), _)
             if rank(language, explicit) >= required.and_then(|s| rank(language, s)) =>
@@ -222,8 +208,7 @@ pub(super) fn standard_flag(
         _ => return None,
     };
     let standard_required =
-        target_property(model, target, &[language, b"_STANDARD_REQUIRED"].concat())
-            .is_some_and(|value| truth::is_on(value));
+        property(b"_STANDARD_REQUIRED").is_some_and(|value| truth::is_on(value));
     if new_policy
         && !standard_required
         && Some(standard) == default
@@ -236,8 +221,22 @@ pub(super) fn standard_flag(
     } else {
         b"_STANDARD_COMPILE_OPTION"
     };
-    let key = [b"CMAKE_", language, b"_", standard, option].concat();
-    if let Some(flag) = definition(model, target.dir, &key) {
+    let flag = paired
+        .and_then(|_| {
+            definition(
+                model,
+                target.dir,
+                &[b"CMAKE_", language, standard, option].concat(),
+            )
+        })
+        .or_else(|| {
+            definition(
+                model,
+                target.dir,
+                &[b"CMAKE_", language, b"_", standard, option].concat(),
+            )
+        });
+    if let Some(flag) = flag {
         return Some(standard_options(flag));
     }
     let dialect: &[u8] = match (language, extensions) {
@@ -248,6 +247,99 @@ pub(super) fn standard_flag(
         _ => return None,
     };
     Some([b"-std=", dialect, standard].concat().into())
+}
+
+fn cuda_standard_flag(
+    model: &ProjectModel,
+    target: &Target,
+    required: Option<&[u8]>,
+    new_policy: bool,
+) -> Result<Option<BString>, ResolveError> {
+    let definition = |key: &[u8]| definition(model, target.dir, key);
+    let Some(default) = definition(b"CMAKE_CUDA_STANDARD_DEFAULT").filter(|v| !v.is_empty()) else {
+        return Ok(None);
+    };
+    let default_extensions =
+        definition(b"CMAKE_CUDA_EXTENSIONS_DEFAULT").is_some_and(|value| truth::is_on(value));
+    let extensions = target
+        .props
+        .get(b"CUDA_EXTENSIONS")
+        .map_or(!new_policy || default_extensions, |value| {
+            truth::is_on(value)
+        });
+    let option: &[u8] = if extensions {
+        b"_EXTENSION_COMPILE_OPTION"
+    } else {
+        b"_STANDARD_COMPILE_OPTION"
+    };
+    let cuda_option = |standard: &[u8]| definition(&[b"CMAKE_CUDA", standard, option].concat());
+    let explicit = target
+        .props
+        .get(b"CUDA_STANDARD")
+        .map(|value| value.as_slice());
+    let explicit_rank = explicit
+        .map(|value| {
+            rank(b"CUDA", value).ok_or_else(|| {
+                ResolveError::Message(
+                    format!(
+                        "CUDA_STANDARD is set to invalid value '{}'",
+                        BString::from(value)
+                    )
+                    .into(),
+                )
+            })
+        })
+        .transpose()?;
+    let default_rank = rank(b"CUDA", default);
+    let standard = required
+        .filter(|value| rank(b"CUDA", value) > explicit_rank.or(default_rank))
+        .or(explicit);
+    let Some(standard) = standard else {
+        let flag = if new_policy && extensions != default_extensions {
+            cuda_option(default)
+        } else if !new_policy && extensions {
+            definition(b"CMAKE_CUDA_EXTENSION_COMPILE_OPTION")
+        } else {
+            None
+        };
+        return Ok(flag.map(|flag| standard_options(flag)));
+    };
+    if target
+        .props
+        .get(b"CUDA_STANDARD_REQUIRED")
+        .is_some_and(|value| truth::is_on(value))
+    {
+        let flag = cuda_option(standard).ok_or_else(|| {
+            let compiler = definition(b"CMAKE_CUDA_COMPILER_ID").map_or(b"".as_slice(), |id| id.as_slice());
+            let extensions = if extensions { "(with compiler extensions)" } else { "" };
+            ResolveError::Message(format!(
+                "Target \"{}\" requires the language dialect \"CUDA{}\" {extensions}. But the current compiler \"{}\" does not support this, or CMake does not know the flags to enable it.",
+                target.name, BString::from(standard), BString::from(compiler)
+            ).into())
+        })?;
+        return Ok(Some(standard_options(flag)));
+    }
+    let (Some(requested), Some(default_rank)) = (rank(b"CUDA", standard), default_rank) else {
+        return Err(ResolveError::Message(
+            format!("CMAKE_CUDA_STANDARD_DEFAULT is set to invalid value '{default}'").into(),
+        ));
+    };
+    let flag = if requested < default_rank
+        || (new_policy && extensions != default_extensions)
+        || (!new_policy && requested == default_rank)
+    {
+        CUDA_LEVELS
+            .get(requested)
+            .and_then(|level| cuda_option(level))
+    } else {
+        CUDA_LEVELS
+            .iter()
+            .take(requested + 1)
+            .skip(default_rank + 1)
+            .rev()
+            .find_map(|level| cuda_option(level))
+    };
+    Ok(flag.map(|flag| standard_options(flag)))
 }
 
 fn standard_options(flag: &[u8]) -> BString {

@@ -99,6 +99,7 @@ impl Plans {
             return Ok(Self::default());
         }
         let mut plans = Self::default();
+        let mut warned = IndexSet::new();
         for (&id, resolved) in targets {
             let Some(target) = model.target(id) else {
                 continue;
@@ -106,29 +107,29 @@ impl Plans {
             if disabled(target) {
                 continue;
             }
-            if target.props.get(REUSE).is_some_and(|name| !name.is_empty()) {
-                let owner = reuse_owner(model, id, target).map_err(|body| {
-                    paths.emit(
-                        model,
-                        MessageKind::Error,
-                        generation_location(model, target),
-                        body.clone(),
-                    );
-                    ResolveError::Reported(body)
-                })?;
-                if let Some(owner_target) = model.target(owner).filter(|owner| disabled(owner)) {
+            let owner = reuse_owner(model, id, target, |id, target, name| {
+                if warned.insert(id) {
                     paths.emit(
                         model,
                         MessageKind::Warning,
                         generation_location(model, target),
                         format!(
-                            "Target \"{}\" for the \"{}\" target's \"PRECOMPILE_HEADERS_REUSE_FROM\" property has set \"DISABLE_PRECOMPILE_HEADERS\"; ignoring.",
-                            owner_target.name, target.name
+                            "Target \"{name}\" for the \"{}\" target's \"PRECOMPILE_HEADERS_REUSE_FROM\" property has set \"DISABLE_PRECOMPILE_HEADERS\"; ignoring.",
+                            target.name
                         ).into(),
                     );
-                } else {
-                    plans.owners.insert(id, owner);
                 }
+            }).map_err(|body| {
+                paths.emit(
+                    model,
+                    MessageKind::Error,
+                    generation_location(model, target),
+                    body.clone(),
+                );
+                ResolveError::Reported(body)
+            })?;
+            if let Some(owner) = owner {
+                plans.owners.insert(id, owner);
                 continue;
             }
             let languages = resolved
@@ -174,24 +175,34 @@ pub(super) fn skip_unit(
         || inputs.is_some_and(|inputs| inputs.sources_without_pch.contains(&unit.source.value))
 }
 
-fn reuse_owner(model: &ProjectModel, id: TargetId, origin: &Target) -> Result<TargetId, BString> {
+fn reuse_owner(
+    model: &ProjectModel,
+    id: TargetId,
+    origin: &Target,
+    mut warn: impl FnMut(TargetId, &Target, &BString),
+) -> Result<Option<TargetId>, BString> {
     let mut visited = IndexSet::from([id]);
     let (mut current, mut target) = (id, origin);
     while let Some(name) = target.props.get(REUSE).filter(|name| !name.is_empty()) {
-        let missing = || {
+        let missing = || -> BString {
             format!(
                 "Unable to resolve precompiled header reuse target \"{name}\" for target \"{}\".",
-                origin.name
+                target.name
             )
             .into()
         };
-        current = model.find_target(target.dir, name).ok_or_else(missing)?;
-        target = model.target(current).ok_or_else(missing)?;
-        if !visited.insert(current) {
-            return Err(format!("Circular PCH reuse target involving '{}'", target.name).into());
+        let next = model.find_target(target.dir, name).ok_or_else(missing)?;
+        let provider = model.target(next).ok_or_else(missing)?;
+        if disabled(provider) {
+            warn(current, target, name);
+            break;
         }
+        if !visited.insert(next) {
+            return Err(format!("Circular PCH reuse target involving '{}'", provider.name).into());
+        }
+        (current, target) = (next, provider);
     }
-    Ok(current)
+    Ok((current != id).then_some(current))
 }
 
 const LANGUAGES: &[(&[u8], &[u8], &[u8])] = &[
