@@ -7,7 +7,7 @@ use rcmake_genex::{ConfigId, EvalContext};
 use rcmake_model::{BT, TargetId};
 
 use super::{MemoKey, UsageResolver, handle};
-use crate::{ResolveError, lower};
+use crate::{LinkKind, ResolveError, lower};
 
 impl UsageResolver<'_> {
     /// Evaluate a target toolchain setting for one configuration and language.
@@ -51,6 +51,9 @@ impl UsageResolver<'_> {
             let mut other = ctx.clone();
             let kind = if prefix == b"COMPILE" {
                 let target = self.target(id)?;
+                if LinkKind::for_target(target.kind).is_none() {
+                    return result;
+                }
                 let languages = target
                     .sources
                     .iter()
@@ -209,7 +212,7 @@ impl UsageResolver<'_> {
             })
             .filter(|(name, _)| names.insert(*name))
             .collect::<Vec<_>>();
-        self.log_wrappers(id, prefix, &property, &ctx, &entries)?;
+        self.log_wrappers(id, prefix, &property, &entries)?;
         entries.sort_by_key(|(name, _)| *name);
         let mut args = Vec::new();
         for (name, origin) in entries {
@@ -242,10 +245,9 @@ impl UsageResolver<'_> {
         id: TargetId,
         prefix: &[u8],
         property: &[u8],
-        ctx: &EvalContext,
         entries: &[(&BString, &Backtrace)],
     ) -> Result<(), ResolveError> {
-        let Some(paths) = self.source_paths().filter(|_| !entries.is_empty()) else {
+        let Some(paths) = self.source_paths() else {
             return Ok(());
         };
         let target = self.target(id)?;
@@ -266,7 +268,7 @@ impl UsageResolver<'_> {
             config: Cow::Borrowed(b""),
             language: None,
             head: None,
-            traversal: ctx.traversal,
+            traversal: Default::default(),
             link_language: None,
             command_config: None,
             output_config: None,

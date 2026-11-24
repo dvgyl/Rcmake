@@ -21,20 +21,20 @@ impl Selection {
         build_dir: &Path,
         setting: impl Fn(&[u8]) -> Option<BString>,
     ) -> Result<Self, GenError> {
-        if configs.is_empty() {
+        let Some(first) = configs.first() else {
             return Err(generation_error(
                 build_dir,
                 "Ninja Multi-Config requires at least one configuration.",
             ));
-        }
+        };
         let index = |name: &[u8]| configs.iter().position(|config| config.0 == name);
         let requested = setting(b"CMAKE_DEFAULT_BUILD_TYPE").filter(|value| !value.is_empty());
-        let default_name = requested.as_ref().unwrap_or(&configs[0].0);
+        let default_name = requested.as_ref().unwrap_or(&first.0);
         let default = index(default_name).ok_or_else(|| config_error(format!(
             "The configuration specified by CMAKE_DEFAULT_BUILD_TYPE ({default_name}) is not present in CMAKE_CONFIGURATION_TYPES"
         )))?;
         let sorted = |mut selection: Vec<usize>| {
-            selection.sort_unstable_by_key(|&index| &configs[index].0);
+            selection.sort_unstable_by_key(|&index| configs.get(index).map(|config| &config.0));
             selection
         };
         let all = sorted((0..configs.len()).collect());
@@ -84,7 +84,7 @@ fn parse(
     index: impl Fn(&[u8]) -> Option<usize>,
 ) -> Option<Vec<usize>> {
     let names = list::split(value, list::Empty::Drop);
-    if names.len() == 1 && names[0] == "all" {
+    if matches!(names.as_slice(), [name] if name == "all") {
         return Some(all.to_vec());
     }
     let mut selected = Vec::new();

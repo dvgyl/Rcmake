@@ -4,7 +4,7 @@ use std::{
 };
 
 use rcmake_base::parse_source_date_epoch;
-use rcmake_base::{BString, hash::HashAlgo, list, path_lex::Lexical};
+use rcmake_base::{BString, hash::HashAlgo, path_lex::Lexical};
 use rcmake_cps::{naming, writer};
 use rcmake_genex::{EvalContext, PreprocessMode};
 use rcmake_host::{
@@ -220,16 +220,13 @@ fn validate_fragment(name: &[u8]) -> Result<(), GenError> {
 }
 
 fn automatic_sboms(model: &ProjectModel) -> Result<Vec<SbomSpec>, GenError> {
-    let Some(formats) = model.definition(DirId::ROOT, b"CMAKE_INSTALL_SBOM_FORMATS") else {
+    let Some(format) = model
+        .definition(DirId::ROOT, b"CMAKE_INSTALL_SBOM_FORMATS")
+        .filter(|value| !value.is_empty())
+    else {
         return Ok(Vec::new());
     };
-    let formats = list::split(formats, list::Empty::Drop);
-    for format in &formats {
-        sbom::validate_format(format)?;
-    }
-    let Some(format) = formats.into_iter().next() else {
-        return Ok(Vec::new());
-    };
+    sbom::validate_format(format)?;
     let project = model
         .definition(DirId::ROOT, b"PROJECT_NAME")
         .cloned()

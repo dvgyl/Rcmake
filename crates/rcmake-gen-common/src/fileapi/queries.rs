@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
@@ -198,21 +198,26 @@ impl ReplyWriter<'_> {
         if self.files.is_empty() {
             return Ok(());
         }
-        let mut by_name = BTreeMap::<_, Vec<&BString>>::new();
+        let mut stale = old_entries
+            .iter()
+            .filter(|entry| entry.kind == FileKind::File && !self.files.contains(&entry.name))
+            .peekable();
+        if stale.peek().is_none() {
+            return Ok(());
+        }
+        let mut identities = BTreeSet::new();
         for name in &self.files {
-            by_name
-                .entry(name.to_ascii_lowercase())
-                .or_default()
-                .push(name);
+            let path = self.dir.join(to_native(name));
+            let metadata = self
+                .host
+                .metadata(&path, Follow::No)
+                .map_err(|error| write_error(&path, error))?;
+            if metadata.ino != 0 {
+                identities.insert((metadata.dev, metadata.ino));
+            }
         }
         let mut aliases = Vec::new();
-        for entry in old_entries {
-            if entry.kind != FileKind::File || self.files.contains(&entry.name) {
-                continue;
-            }
-            let Some(candidates) = by_name.get(&entry.name.to_ascii_lowercase()) else {
-                continue;
-            };
+        for entry in stale {
             // The old spelling can still refer to a new reply on this filesystem.
             let path = self.dir.join(to_native(&entry.name));
             let metadata = match self.host.metadata(&path, Follow::No) {
@@ -220,21 +225,45 @@ impl ReplyWriter<'_> {
                 Err(error) if error.kind == ErrorKind::NotFound => continue,
                 Err(error) => return Err(write_error(&path, error)),
             };
-            for name in candidates {
-                let path = self.dir.join(to_native(name));
-                let current = self
-                    .host
-                    .metadata(&path, Follow::No)
-                    .map_err(|error| write_error(&path, error))?;
-                if current.ino != 0 && (current.dev, current.ino) == (metadata.dev, metadata.ino) {
-                    aliases.push(entry.name.clone());
-                    break;
-                }
+            if identities.contains(&(metadata.dev, metadata.ino)) {
+                aliases.push(entry.name.clone());
             }
         }
         self.files.extend(aliases);
         Ok(())
     }
+}
+
+#[cfg(test)]
+#[test]
+fn preserves_unicode_case_aliases_during_reply_cleanup() -> Result<(), Box<dyn std::error::Error>> {
+    use rcmake_host::{PureHost, WriteMode};
+
+    let host = PureHost::default();
+    let dir = Path::new("/reply");
+    host.create_dir_all(dir)?;
+    let old_name = "target-app-Débug.json";
+    let new_name = "target-app-DÉBUG.json";
+    let stale = dir.join("target-stale-Débug.json");
+    host.write(&dir.join(old_name), b"{}", WriteMode::CreateNew)?;
+    host.write(&stale, b"{}", WriteMode::CreateNew)?;
+    let old_entries = host.read_dir(dir)?;
+    // Give both spellings the same identity on the test filesystem.
+    host.hard_link(&dir.join(old_name), &dir.join(new_name))?;
+    let mut writer = ReplyWriter {
+        host: &host,
+        dir,
+        files: BTreeSet::from([new_name.into()]),
+    };
+    writer.retain_file_aliases(&old_entries)?;
+    writer.remove_stale(old_entries)?;
+    let names = host
+        .read_dir(dir)?
+        .into_iter()
+        .map(|entry| entry.name)
+        .collect::<BTreeSet<_>>();
+    assert_eq!(names, BTreeSet::from([old_name.into(), new_name.into()]));
+    Ok(())
 }
 
 fn error(message: &str) -> Value {

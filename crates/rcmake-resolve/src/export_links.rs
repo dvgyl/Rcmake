@@ -65,7 +65,9 @@ pub(crate) fn qualify(
     ] {
         let mut items = Vec::new();
         let mut append = |value: &[u8], dir: DirId| -> Result<(), ResolveError> {
-            let mut name = |input: &[u8]| -> Result<Option<BString>, ResolveError> {
+            let mut name = |input: &[u8],
+                            expand_components|
+             -> Result<Option<BString>, ResolveError> {
                 let Some(id) = model.find_target(dir, input) else {
                     return Ok(None);
                 };
@@ -80,6 +82,12 @@ pub(crate) fn qualify(
                         .or_else(|| dependency.props.get(b"_RCMAKE_FIND_PACKAGE_NAME"))
                     {
                         packages.insert(package.clone());
+                        if expand_components
+                            && dependency.name == *package
+                            && let Some(components) = cps_default_component_names(model, dependency)
+                        {
+                            return Ok(Some(list::join(components)));
+                        }
                     }
                     return Ok(Some(dependency.name.clone()));
                 }
@@ -87,7 +95,7 @@ pub(crate) fn qualify(
                 if members.contains(&id) {
                     return Ok(Some([namespace, exported.as_slice()].concat().into()));
                 }
-                let placements = catalog.get(&id).map_or(&[][..], Vec::as_slice);
+                let placements = catalog.get(&id).map(Vec::as_slice).unwrap_or_default();
                 let Some(first) = placements.first() else {
                     return Err(closure_error(
                         model,
@@ -143,9 +151,9 @@ pub(crate) fn qualify(
             for item in export_property_items(value, mode)? {
                 let mut ast = parse(&item)?;
                 let mut item = if ast.is_plain() {
-                    name(&item)?.unwrap_or(item)
+                    name(&item, true)?.unwrap_or(item)
                 } else {
-                    qualify_expressions(&mut ast.nodes, &mut name)?;
+                    qualify_expressions(&mut ast.nodes, &mut |input| name(input, false))?;
                     render(&ast.nodes)
                 };
                 if mode == PreprocessMode::Install {
@@ -172,6 +180,35 @@ pub(crate) fn qualify(
         }
     }
     Ok(packages)
+}
+
+fn cps_default_component_names<'a>(
+    model: &'a ProjectModel,
+    target: &Target,
+) -> Option<Vec<&'a BString>> {
+    if target.kind != TargetKind::InterfaceLibrary {
+        return None;
+    }
+    let source = target.props.get(b"_RCMAKE_CPS_SOURCE")?;
+    let links = target.usage.interface_link_libraries.as_ref()?;
+    if links.is_empty() {
+        return None;
+    }
+    let namespace = [target.name.as_slice(), b"::"].concat();
+    links
+        .iter()
+        .map(|link| {
+            let component = link.text.value.strip_prefix(namespace.as_slice())?;
+            if component.is_empty() || component.windows(2).any(|pair| pair == b"::") {
+                return None;
+            }
+            let member = model.target(model.find_target(link.lookup_dir, &link.text.value)?)?;
+            (member.is_imported()
+                && member.name == link.text.value
+                && member.props.get(b"_RCMAKE_CPS_SOURCE") == Some(source))
+            .then_some(&member.name)
+        })
+        .collect()
 }
 
 fn closure_error(
@@ -236,6 +273,81 @@ fn qualify_expressions(
         for arg in args {
             qualify_expressions(arg, name)?;
         }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+#[test]
+fn expands_plain_cps_package_links_in_cmake_exports() -> Result<(), Box<dyn std::error::Error>> {
+    use rcmake_model::{BT, ImportedVisibility, LinkItem, TargetOrigin};
+
+    let mut model = ProjectModel::default();
+    let dir = DirId::ROOT;
+    let mut imported = |name: &str, links| {
+        let mut target = Target::new(
+            name.into(),
+            TargetKind::InterfaceLibrary,
+            TargetOrigin::Imported(ImportedVisibility::Local),
+            dir,
+            Default::default(),
+            Default::default(),
+        );
+        target
+            .props
+            .set("_RCMAKE_CPS_SOURCE".into(), "foo.cps".into());
+        target
+            .props
+            .set("_RCMAKE_FIND_PACKAGE_NAME".into(), "foo".into());
+        target.usage.interface_link_libraries = links;
+        model.add_target(target)
+    };
+    let components = ["foo::one", "foo::two"];
+    for name in components {
+        imported(name, None)?;
+    }
+    imported(
+        "foo",
+        Some(
+            components
+                .into_iter()
+                .map(|name| LinkItem {
+                    text: BT::new(name.into(), Default::default()),
+                    lookup_dir: dir,
+                })
+                .collect(),
+        ),
+    )?;
+    let mut consumer = Target::new(
+        "consumer".into(),
+        TargetKind::InterfaceLibrary,
+        TargetOrigin::Normal,
+        dir,
+        Default::default(),
+        Default::default(),
+    );
+    consumer.props.set(
+        LINK_LIBRARIES.into(),
+        "foo;$<1:foo>;$<LINK_ONLY:foo>".into(),
+    );
+    let id = model.add_target(consumer)?;
+    for mode in [PreprocessMode::Build, PreprocessMode::Install] {
+        let mut exported = ExportedTarget::default();
+        let packages = qualify(
+            &model,
+            id,
+            &[id],
+            b"",
+            mode,
+            &ExportCatalog::new(),
+            &mut exported,
+        )?;
+        assert_eq!(packages, IndexSet::from([BString::from("foo")]));
+        let links = exported
+            .properties
+            .get(LINK_LIBRARIES)
+            .ok_or("missing exported links")?;
+        assert_eq!(links, b"foo::one;foo::two;$<1:foo>;$<LINK_ONLY:foo>");
     }
     Ok(())
 }

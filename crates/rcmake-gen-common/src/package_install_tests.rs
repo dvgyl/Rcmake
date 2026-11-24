@@ -16,7 +16,9 @@ use rcmake_resolve::{ArtifactSet, CompileGroup, GenerationResult, ResolvedTarget
 
 #[cfg(unix)]
 use crate::ctest_file;
-use crate::{install_script, write_supplementary_outputs};
+use crate::{GenError, install_script, write_supplementary_outputs};
+
+type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
 #[cfg(unix)]
 const PROJECT: &[u8] = br#"cmake_minimum_required(VERSION 4.5)
@@ -73,7 +75,11 @@ fn install_property(model: &mut ProjectModel, path: &[u8], property: &[u8], valu
         .set(property.into(), value.into());
 }
 
-fn fixture(source: &Path, build: &Path, configs: &[&str]) -> (ProjectModel, GenerationResult) {
+fn fixture(
+    source: &Path,
+    build: &Path,
+    configs: &[&str],
+) -> TestResult<(ProjectModel, GenerationResult)> {
     let mut model = ProjectModel::default();
     model.set_root_dirs(from_native(source), from_native(build));
     let multi = configs.len() > 1;
@@ -83,20 +89,18 @@ fn fixture(source: &Path, build: &Path, configs: &[&str]) -> (ProjectModel, Gene
         GeneratorKind::Ninja
     });
     let mut library = |name: &str, kind| {
-        model
-            .add_target(Target::new(
-                name.into(),
-                kind,
-                TargetOrigin::Normal,
-                DirId::ROOT,
-                Default::default(),
-                Default::default(),
-            ))
-            .unwrap()
+        model.add_target(Target::new(
+            name.into(),
+            kind,
+            TargetOrigin::Normal,
+            DirId::ROOT,
+            Default::default(),
+            Default::default(),
+        ))
     };
-    let dep = library("dep", TargetKind::InterfaceLibrary);
-    let core = library("core", TargetKind::StaticLibrary);
-    let props = &mut model.target_mut(core).unwrap().props;
+    let dep = library("dep", TargetKind::InterfaceLibrary)?;
+    let core = library("core", TargetKind::StaticLibrary)?;
+    let props = &mut model.target_mut(core).ok_or("missing core target")?.props;
     for (key, value) in [
         ("SPDX_LICENSE", "MIT"),
         ("INTERFACE_COMPILE_DEFINITIONS", "FLAG;FIXED=1"),
@@ -105,17 +109,15 @@ fn fixture(source: &Path, build: &Path, configs: &[&str]) -> (ProjectModel, Gene
     ] {
         props.set(key.into(), value.into());
     }
-    model
-        .add_file_set(FileSet {
-            target: core,
-            name: "HEADERS".into(),
-            kind: FileSetKind::Headers,
-            scope: UsageScope::Public,
-            base_dirs: vec![BT::new("headers".into(), Default::default())],
-            files: vec![BT::new("headers/api/core.h".into(), Default::default())],
-            props: Default::default(),
-        })
-        .unwrap();
+    model.add_file_set(FileSet {
+        target: core,
+        name: "HEADERS".into(),
+        kind: FileSetKind::Headers,
+        scope: UsageScope::Public,
+        base_dirs: vec![BT::new("headers".into(), Default::default())],
+        files: vec![BT::new("headers/api/core.h".into(), Default::default())],
+        props: Default::default(),
+    })?;
     let targets = vec![dep, core];
     let index = add_install(
         &mut model,
@@ -192,43 +194,41 @@ fn fixture(source: &Path, build: &Path, configs: &[&str]) -> (ProjectModel, Gene
             .push(frame(0, None))
             .push(frame(line, Some(command)));
         let discover = name == "discovery";
-        model
-            .add_test(TestEntry {
-                name: name.into(),
-                dir: DirId::ROOT,
-                backtrace: backtrace.clone(),
-                command: vec!["tool".into(), "$<CONFIG>".into()],
-                configurations: Vec::new(),
-                working_directory: None,
-                command_expand_lists: false,
-                old_style: false,
-                policies: Default::default(),
-                props: Default::default(),
-                build_depends: match name {
-                    "discovery" => vec![BT::new(from_native(&source.join("code.c")), backtrace)],
-                    "first" => vec![BT::new("code.c".into(), backtrace)],
-                    _ => Vec::new(),
-                },
-                kind: if discover {
-                    TestKind::Discover(Box::new(DiscoverySpec {
-                        discovery_args: vec!["--list".into()],
-                        discovery_match: "^(.*)$".into(),
-                        test_name: "\\1".into(),
-                        test_args: vec!["--run".into(), "\\1".into()],
-                        test_props: vec![
-                            ("LABELS".into(), "discovery".into()),
-                            (
-                                "_CMAKE_DEFAULT_FIXTURE_REPEAT_MODE".into(),
-                                "AROUND_EACH_REPEAT".into(),
-                            ),
-                        ],
-                        ..Default::default()
-                    }))
-                } else {
-                    TestKind::Single
-                },
-            })
-            .unwrap();
+        model.add_test(TestEntry {
+            name: name.into(),
+            dir: DirId::ROOT,
+            backtrace: backtrace.clone(),
+            command: vec!["tool".into(), "$<CONFIG>".into()],
+            configurations: Vec::new(),
+            working_directory: None,
+            command_expand_lists: false,
+            old_style: false,
+            policies: Default::default(),
+            props: Default::default(),
+            build_depends: match name {
+                "discovery" => vec![BT::new(from_native(&source.join("code.c")), backtrace)],
+                "first" => vec![BT::new("code.c".into(), backtrace)],
+                _ => Vec::new(),
+            },
+            kind: if discover {
+                TestKind::Discover(Box::new(DiscoverySpec {
+                    discovery_args: vec!["--list".into()],
+                    discovery_match: "^(.*)$".into(),
+                    test_name: "\\1".into(),
+                    test_args: vec!["--run".into(), "\\1".into()],
+                    test_props: vec![
+                        ("LABELS".into(), "discovery".into()),
+                        (
+                            "_CMAKE_DEFAULT_FIXTURE_REPEAT_MODE".into(),
+                            "AROUND_EACH_REPEAT".into(),
+                        ),
+                    ],
+                    ..Default::default()
+                }))
+            } else {
+                TestKind::Single
+            },
+        })?;
     }
     let mut result = GenerationResult::default();
     for name in configs {
@@ -268,13 +268,11 @@ fn fixture(source: &Path, build: &Path, configs: &[&str]) -> (ProjectModel, Gene
         });
     }
     result.install = rcmake_resolve::lower::lower_install_manifest(&model, &result.targets);
-    (model, result)
+    Ok((model, result))
 }
 
-fn read(host: &dyn Host, path: &Path) -> BString {
-    host.read(path, ReadRange::All { limit: 4_000_000 })
-        .unwrap()
-        .into()
+fn read(host: &dyn Host, path: &Path) -> TestResult<BString> {
+    Ok(host.read(path, ReadRange::All { limit: 4_000_000 })?.into())
 }
 
 fn export_stage(base: &Path, kind: &str, destination: &[u8]) -> PathBuf {
@@ -284,16 +282,16 @@ fn export_stage(base: &Path, kind: &str, destination: &[u8]) -> PathBuf {
 }
 
 #[test]
-fn stages_noconfig_cps_and_explicit_sbom_and_preserves_header_paths() {
+fn stages_noconfig_cps_and_explicit_sbom_and_preserves_header_paths() -> TestResult {
     let source = Path::new("/source");
     let build = Path::new("/out");
     let host = PureHost::default();
-    let (mut model, result) = fixture(source, build, &[""]);
+    let (mut model, result) = fixture(source, build, &[""])?;
     model
         .dir_mut(DirId::ROOT)
         .vars
         .insert("CMAKE_INSTALL_SBOM_FORMATS".into(), "spdx".into());
-    let manifest = write_supplementary_outputs(&model, &result, &host, build).unwrap();
+    let manifest = write_supplementary_outputs(&model, &result, &host, build)?;
     let destination = if cfg!(windows) {
         b"cps/Sdk".as_slice()
     } else {
@@ -301,64 +299,66 @@ fn stages_noconfig_cps_and_explicit_sbom_and_preserves_header_paths() {
     };
     let stage = export_stage(build, "Export", destination);
     assert!(
-        read(&host, &stage.join("Sdk@noconfig.cps"))
+        read(&host, &stage.join("Sdk@noconfig.cps"))?
             .to_string()
             .contains("@prefix@/lib/libcore.a")
     );
     assert!(
-        read(&host, &build.join("cps/Sdk/Sdk.cps"))
+        read(&host, &build.join("cps/Sdk/Sdk.cps"))?
             .to_string()
             .contains("\"noconfig\"")
     );
-    let script = install_script::render(&manifest, b"/out")
-        .unwrap()
-        .to_string();
+    let script = install_script::render(&manifest, b"/out")?.to_string();
     assert!(script.contains("${CMAKE_INSTALL_PREFIX}/include/api"));
     assert!(script.contains(r#"CMAKE_INSTALL_CONFIG_NAME MATCHES "^()$""#));
     assert!(script.contains("Bill-noconfig.spdx.json"));
     assert!(!script.contains("sdk-noconfig.spdx.json"));
+    Ok(())
 }
 
 #[test]
-fn automatic_sbom_validates_formats_and_uses_project_metadata() {
+fn automatic_sbom_validates_formats_and_uses_project_metadata() -> TestResult {
     let source = Path::new("/source");
     let build = Path::new("/out");
     let host = PureHost::default();
-    let (mut model, result) = fixture(source, build, &["Debug"]);
+    let (mut model, result) = fixture(source, build, &["Debug"])?;
     model
         .installs
         .retain(|rule| !matches!(rule.kind, InstallKind::Sbom(_)));
     let vars = &mut model.dir_mut(DirId::ROOT).vars;
     vars.insert("PROJECT_NAME".into(), "Sdk".into());
     vars.insert("Sdk_SPDX_LICENSE".into(), "BSD-3-Clause".into());
-    vars.insert(
-        "CMAKE_INSTALL_SBOM_FORMATS".into(),
-        "spdx-3.0+json;spdx-3.0.1+json".into(),
-    );
-    write_supplementary_outputs(&model, &result, &host, build).unwrap();
+    vars.insert("CMAKE_INSTALL_SBOM_FORMATS".into(), "spdx-3.0+json".into());
+    write_supplementary_outputs(&model, &result, &host, build)?;
     let stage = export_stage(build, "sbom", b"lib/sbom/sdk");
-    let contents = read(&host, &stage.join("sdk-Debug.spdx.json")).to_string();
+    let contents = read(&host, &stage.join("sdk-Debug.spdx.json"))?.to_string();
     assert!(contents.contains("urn:sdk#DataLicenseExpression"));
     assert!(contents.contains("BSD-3-Clause"));
     assert!(contents.contains("urn:core#DeclaredLicenseRelationship"));
-    model
-        .dir_mut(DirId::ROOT)
-        .vars
-        .insert("CMAKE_INSTALL_SBOM_FORMATS".into(), "spdx;invalid".into());
-    let error = write_supplementary_outputs(&model, &result, &host, build).unwrap_err();
-    assert!(
-        error
-            .to_string()
-            .contains("Invalid SBOM format \"invalid\"")
-    );
+    for format in ["invalid", "spdx;spdx-3.0+json"] {
+        model
+            .dir_mut(DirId::ROOT)
+            .vars
+            .insert("CMAKE_INSTALL_SBOM_FORMATS".into(), format.into());
+        let Err(GenError::Invalid(message)) =
+            write_supplementary_outputs(&model, &result, &host, build)
+        else {
+            return Err(format!("expected an invalid format error for {format}").into());
+        };
+        assert!(message.starts_with(b"\nCMake Error in CMakeLists.txt:\n"));
+        assert!(message.to_string().contains(&format!(
+            r#"CMAKE_INSTALL_SBOM_FORMATS given invalid format "{format}"."#,
+        )));
+    }
+    Ok(())
 }
 
 #[test]
-fn stages_appendix_files_with_lower_case_package_names() {
+fn stages_appendix_files_with_lower_case_package_names() -> TestResult {
     let source = Path::new("/source");
     let build = Path::new("/out");
     let host = PureHost::default();
-    let (mut model, result) = fixture(source, build, &["Debug"]);
+    let (mut model, result) = fixture(source, build, &["Debug"])?;
     let spec = PackageInfoSpec {
         package: "Sdk".into(),
         export: "sdk".into(),
@@ -368,7 +368,7 @@ fn stages_appendix_files_with_lower_case_package_names() {
     };
     add_install(&mut model, InstallKind::PackageInfo(Box::new(spec.clone())));
     add_export(&mut model, ExportKind::PackageInfo(spec));
-    write_supplementary_outputs(&model, &result, &host, build).unwrap();
+    write_supplementary_outputs(&model, &result, &host, build)?;
     let destination = if cfg!(windows) {
         b"cps/sdk".as_slice()
     } else {
@@ -376,15 +376,16 @@ fn stages_appendix_files_with_lower_case_package_names() {
     };
     let stage = export_stage(build, "Export", destination);
     assert!(
-        read(&host, &stage.join("sdk-Tools@debug.cps"))
+        read(&host, &stage.join("sdk-Tools@debug.cps"))?
             .to_string()
             .contains("\"Debug\"")
     );
     assert!(
-        read(&host, &build.join("cps/sdk/sdk-Tools.cps"))
+        read(&host, &build.join("cps/sdk/sdk-Tools.cps"))?
             .to_string()
             .contains("\"Sdk\"")
     );
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -393,14 +394,17 @@ fn add_bmi_fixture(
     result: &mut GenerationResult,
     build: &Path,
     host: &dyn Host,
-) {
+) -> TestResult {
     use rcmake_resolve::{BmiInstall, BuildGraph, CompileUnit, CxxModuleInfo};
 
     model
         .dir_mut(DirId::ROOT)
         .vars
         .insert("CMAKE_CXX_SCANDEP_SOURCE".into(), "scanner <SOURCE>".into());
-    let facts = result.targets.first_mut().unwrap();
+    let facts = result
+        .targets
+        .first_mut()
+        .ok_or("missing resolved core target")?;
     facts.cxx_modules = Some(CxxModuleInfo {
         tdi: "modules/CXXDependInfo.json".into(),
         dyndep: "modules/CXX.dd".into(),
@@ -418,7 +422,7 @@ fn add_bmi_fixture(
         scan: true,
         ..Default::default()
     });
-    let steps = rcmake_resolve::lower::lower_modules(model, &target).unwrap();
+    let steps = rcmake_resolve::lower::lower_modules(model, &target)?;
     result.graphs.push(BuildGraph {
         config: facts.config.clone(),
         steps,
@@ -429,21 +433,22 @@ fn add_bmi_fixture(
         ("modules/CXXModules.json", br#"{"modules":{"core":{"bmi":"modules/core.pcm"},"forwarded":{"bmi":"modules/forwarded.pcm"}}}"#),
         ("modules/core.pcm", b"BMI content"),
     ] {
-        crate::export::write_output(host, &build.join(name), contents).unwrap();
+        crate::export::write_output(host, &build.join(name), contents)?;
     }
+    Ok(())
 }
 
 #[cfg(unix)]
 #[test]
-fn cmake_451_matches_package_install_outputs() {
+fn cmake_451_matches_package_install_outputs() -> TestResult {
     use std::time::Duration;
 
     use rcmake_host::{CommandSpec, Input, NativeHost, Output, ProcessResult, RunRequest};
     use rcmake_json::{ReadOptions, Value};
 
-    let host = NativeHost::new().unwrap();
+    let host = NativeHost::new()?;
     let Some(oracle) = host.env_get(b"RCMAKE_TEST_REFERENCE_CMAKE") else {
-        return;
+        return Ok(());
     };
     let root = PathBuf::from(format!(
         "/tmp/rcmake-package-install-oracle-{}",
@@ -455,7 +460,7 @@ fn cmake_451_matches_package_install_outputs() {
             let _ = self.0.remove_dir_all(self.1);
         }
     }
-    host.create_dir_all(&root).unwrap();
+    host.create_dir_all(&root)?;
     let _cleanup = Cleanup(&host, &root);
     let source = root.join("source");
     let build = root.join("oracle");
@@ -466,27 +471,25 @@ fn cmake_451_matches_package_install_outputs() {
         ("code.c", b"void demo(void) {}\n".as_slice()),
         ("headers/api/core.h", b"void demo(void);\n"),
     ] {
-        crate::export::write_output(&host, &source.join(name), contents).unwrap();
+        crate::export::write_output(&host, &source.join(name), contents)?;
     }
-    let run = |args: Vec<BString>| {
-        let report = host
-            .run(
-                &RunRequest {
-                    pipeline: vec![CommandSpec {
-                        program: oracle.clone(),
-                        args,
-                    }],
-                    cwd: root.clone(),
-                    env: host.env_all(),
-                    stdin: Input::Null,
-                    stdout: Output::Capture,
-                    stderr: Output::Capture,
-                    timeout: Some(Duration::from_secs(40)),
-                    tee: false,
-                },
-                &mut |_, _| {},
-            )
-            .unwrap();
+    let run = |args: Vec<BString>| -> TestResult {
+        let report = host.run(
+            &RunRequest {
+                pipeline: vec![CommandSpec {
+                    program: oracle.clone(),
+                    args,
+                }],
+                cwd: root.clone(),
+                env: host.env_all(),
+                stdin: Input::Null,
+                stdout: Output::Capture,
+                stderr: Output::Capture,
+                timeout: Some(Duration::from_secs(40)),
+                tee: false,
+            },
+            &mut |_, _| {},
+        )?;
         assert_eq!(
             report.results,
             [ProcessResult::Exited(0)],
@@ -494,6 +497,7 @@ fn cmake_451_matches_package_install_outputs() {
             BString::from(report.stdout),
             BString::from(report.stderr)
         );
+        Ok(())
     };
     fn normalize_spdx(node: &mut Value) {
         match node {
@@ -514,15 +518,17 @@ fn cmake_451_matches_package_install_outputs() {
             _ => {}
         }
     }
-    let json = |contents: &BString| {
-        let mut value = rcmake_json::parse(contents, &ReadOptions::default()).unwrap();
+    let json = |contents: &BString| -> TestResult<Value> {
+        let mut value = rcmake_json::parse(contents, &ReadOptions::default())?;
         normalize_spdx(&mut value);
-        value
+        Ok(value)
     };
-    for (generator, configs) in [
-        ("Ninja", &[""][..]),
-        ("Ninja Multi-Config", &["Debug", "Release"][..]),
-    ] {
+    let cases: [(&str, &[&str]); 2] = [
+        ("Ninja", &[""]),
+        ("Ninja Multi-Config", &["Debug", "Release"]),
+    ];
+    for (generator, configs) in cases {
+        let config = configs.first().ok_or("missing install configuration")?;
         let build = build.join(if configs.len() > 1 { "multi" } else { "single" });
         run(vec![
             "-S".into(),
@@ -532,13 +538,13 @@ fn cmake_451_matches_package_install_outputs() {
             "-G".into(),
             generator.into(),
             "-DCMAKE_CONFIGURATION_TYPES=Debug;Release".into(),
-        ]);
-        let (mut model, mut result) = fixture(&source, &build, configs);
-        add_bmi_fixture(&mut model, &mut result, &build, &host);
+        ])?;
+        let (mut model, mut result) = fixture(&source, &build, configs)?;
+        add_bmi_fixture(&mut model, &mut result, &build, &host)?;
         let oracle_root = export_stage(&build, "Export", b"lib/cps/Sdk");
         let mut expected = Vec::new();
         for path in [oracle_root.join("Sdk.cps"), build.join("cps/Sdk/Sdk.cps")] {
-            expected.push((path.clone(), read(&host, &path)));
+            expected.push((path.clone(), read(&host, &path)?));
         }
         for config in configs {
             let label = if config.is_empty() {
@@ -547,59 +553,58 @@ fn cmake_451_matches_package_install_outputs() {
                 config
             };
             let path = oracle_root.join(format!("Sdk@{}.cps", label.to_ascii_lowercase()));
-            expected.push((path.clone(), read(&host, &path)));
+            expected.push((path.clone(), read(&host, &path)?));
             let bill = format!("Bill-{label}.spdx.json");
             for path in [
                 export_stage(&build, "sbom", b"lib/sbom/Bill").join(&bill),
                 build.join("sbom/Bill").join(&bill),
             ] {
-                expected.push((path.clone(), read(&host, &path)));
+                expected.push((path.clone(), read(&host, &path)?));
             }
         }
         let cpack = build.join("CPackProperties.cmake");
-        expected.push((cpack.clone(), read(&host, &cpack)));
-        let manifest = write_supplementary_outputs(&model, &result, &host, &build).unwrap();
+        expected.push((cpack.clone(), read(&host, &cpack)?));
+        let manifest = write_supplementary_outputs(&model, &result, &host, &build)?;
         for (path, oracle) in expected {
-            let actual = read(&host, &path);
+            let actual = read(&host, &path)?;
             if path.extension().is_some_and(|ext| ext == "json") {
-                assert_eq!(json(&actual), json(&oracle), "{}", path.display());
+                assert_eq!(json(&actual)?, json(&oracle)?, "{}", path.display());
             } else {
                 assert_eq!(actual, oracle, "{}", path.display());
             }
         }
-        let actual =
-            ctest_file::render_resolved_with_host(&model, DirId::ROOT, &result, &host).unwrap();
-        let expected = read(&host, &build.join("CTestTestfile.cmake"));
+        let actual = ctest_file::render_resolved_with_host(&model, DirId::ROOT, &result, &host)?;
+        let expected = read(&host, &build.join("CTestTestfile.cmake"))?;
         // Both quoting forms pass the same regular expression to CMake.
         assert_eq!(actual.to_string().replace(r"\$", "$"), expected.to_string());
-        host.create_dir_all(&output).unwrap();
+        host.create_dir_all(&output)?;
         let prefix = from_native(&install);
         install_script::write_install_script(
             &manifest,
             &output,
             &install_script::InstallScriptOptions {
                 prefix: &prefix,
-                configuration: configs.first().unwrap().as_bytes(),
+                configuration: config.as_bytes(),
                 ..Default::default()
             },
             &host,
-        )
-        .unwrap();
+        )?;
         run(vec![
             "-P".into(),
             from_native(&output.join("cmake_install.cmake")),
-        ]);
+        ])?;
         assert_eq!(
-            read(&host, &install.join("lib/bmi/core.pcm")),
+            read(&host, &install.join("lib/bmi/core.pcm"))?,
             b"BMI content"
         );
         assert_eq!(
-            read(&host, &install.join("include/api/core.h")),
+            read(&host, &install.join("include/api/core.h"))?,
             b"void demo(void);\n"
         );
         assert_eq!(
-            read(&host, &install.join("lib/cps/Sdk/Sdk.cps")),
-            read(&host, &oracle_root.join("Sdk.cps"))
+            read(&host, &install.join("lib/cps/Sdk/Sdk.cps"))?,
+            read(&host, &oracle_root.join("Sdk.cps"))?
         );
     }
+    Ok(())
 }
