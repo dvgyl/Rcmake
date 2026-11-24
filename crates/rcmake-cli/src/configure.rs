@@ -533,8 +533,23 @@ impl<'a> ConfigureSession<'a> {
         }
         let start = host.monotonic();
         let generate_step = crate::InstrumentationStep::start(host, sample);
-        let generated = crate::generate::run(interp, host, &self.bin, &queries)
-            .map_err(|err| Exit::Message(format!("{err}\nCMake Generate step failed.")))?;
+        let generated = match crate::generate::run(interp, host, &self.bin, &queries) {
+            Ok(generated) => generated,
+            Err(failure) => {
+                if let crate::generate::Failure::Message(message) = failure {
+                    if message.starts_with("CMake Error ") || message.starts_with("CMake Error:") {
+                        host.write_out(Stream::Stderr, message.as_bytes());
+                        if !message.ends_with('\n') {
+                            host.write_out(Stream::Stderr, b"\n");
+                        }
+                    } else {
+                        emit_cli_error(host, message);
+                    }
+                }
+                generation_failed(host);
+                return Err(Exit::Code(1));
+            }
+        };
         let elapsed = host.monotonic().saturating_sub(start);
         if generated && !queries.is_empty() {
             generate_step
@@ -556,10 +571,7 @@ impl<'a> ConfigureSession<'a> {
             );
         }
         if unused_cli::report(host, interp, results) {
-            host.write_out(
-                Stream::Stderr,
-                b"CMake Generate step failed.  Build files cannot be regenerated correctly.\n",
-            );
+            generation_failed(host);
             return Err(Exit::Code(1));
         }
         if generated && !queries.is_empty() {
@@ -924,6 +936,13 @@ pub(crate) fn is_file(host: &dyn Host, path: &Path) -> bool {
 pub(crate) fn is_dir(host: &dyn Host, path: &Path) -> bool {
     host.metadata(path, Follow::Yes)
         .is_ok_and(|meta| meta.kind == FileKind::Dir)
+}
+
+fn generation_failed(host: &dyn Host) {
+    host.write_out(
+        Stream::Stderr,
+        b"CMake Generate step failed.  Build files cannot be regenerated correctly.\n",
+    );
 }
 
 fn error(host: &dyn Host, message: String) -> i32 {

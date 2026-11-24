@@ -23,12 +23,23 @@ mod file_generate;
 mod install_index;
 mod instrument;
 
+pub(crate) enum Failure {
+    Reported,
+    Message(String),
+}
+
+impl From<String> for Failure {
+    fn from(message: String) -> Self {
+        Self::Message(message)
+    }
+}
+
 pub(crate) fn run(
     interp: &mut Interp,
     host: &dyn Host,
     bin: &Path,
     queries: &[Query],
-) -> Result<bool, String> {
+) -> Result<bool, Failure> {
     let Some(kind) = interp.cx().project().generator else {
         return Ok(false);
     };
@@ -76,7 +87,8 @@ pub(crate) fn run(
     };
     let mut result = match resolved {
         Ok(result) => result,
-        Err(err) => return Err(err.to_string()),
+        Err(rcmake_resolve::ResolveError::Reported(_)) => return Err(Failure::Reported),
+        Err(err) => return Err(err.to_string().into()),
     };
     if !queries.is_empty() && !kind.is_ide() {
         instrument::wrap_custom_commands(&mut result, interp.cx().project(), host, bin);
@@ -100,18 +112,18 @@ pub(crate) fn run(
         )),
         #[cfg(not(any(target_os = "macos", feature = "xcode-cross")))]
         GeneratorKind::Xcode => {
-            return Err(format!("Could not create named generator {}", kind.name()));
+            return Err(format!("Could not create named generator {}", kind.name()).into());
         }
         #[cfg(not(any(windows, feature = "vs-cross")))]
         GeneratorKind::VisualStudio(_) => {
-            return Err(format!("Could not create named generator {}", kind.name()));
+            return Err(format!("Could not create named generator {}", kind.name()).into());
         }
         GeneratorKind::Ninja | GeneratorKind::NinjaMultiConfig | GeneratorKind::UnixMakefiles => {
             None
         }
     };
     if let Some(Err(err)) = ide_result {
-        return Err(err.to_string());
+        return Err(err.to_string().into());
     }
     write_common(interp, host, bin, &result, kind).map_err(|err| err.to_string())?;
     let result = match kind {
@@ -148,7 +160,7 @@ pub(crate) fn run(
             Ok(true)
         }
         Err(GenError::Unimplemented(_)) => Ok(false),
-        Err(err) => Err(err.to_string()),
+        Err(err) => Err(err.to_string().into()),
     }
 }
 
