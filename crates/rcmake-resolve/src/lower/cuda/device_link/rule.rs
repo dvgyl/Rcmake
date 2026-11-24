@@ -1,15 +1,15 @@
 //! Expand toolchain rule templates for the driver and registration stub.
 
 use rcmake_base::{BString, list, path_lex::Lexical, shell::quote};
-use rcmake_genex::ConfigId;
+use rcmake_genex::{ConfigId, EvalContext, UsageTraversal, evaluate, parse};
 use rcmake_model::{DirId, ProjectModel, Target};
 
 use crate::lower::shell::{command, join_words};
-use crate::lower::{definition, expand_rule, launcher, object_dir};
-use crate::usage::{UsageResolver, link_options::shell_arguments};
+use crate::lower::{definition, expand_rule, object_dir};
+use crate::usage::{UsageResolver, handle};
 use crate::{Invocation, ResolveError};
 
-use super::{DeviceLinkInputs, lang_definition, words};
+use super::{DeviceLinkInputs, lang_definition, missing, words};
 
 /// Target and arguments shared by the driver and registration stub templates.
 pub(super) struct Rule<'a> {
@@ -42,33 +42,20 @@ impl Rule<'_> {
     ) -> Result<Invocation, ResolveError> {
         let get = |suffix: &[u8]| lang_definition(self.model, self.target, self.lang, suffix);
         let language: BString = self.lang.into();
-        let linker_launcher = [self.lang, b"_LINKER_LAUNCHER"].concat();
-        let launcher_suffix = if stub.is_none() && self.target.props.get(&linker_launcher).is_some()
-        {
-            b"_LINKER_LAUNCHER".as_slice()
+        let launcher = if stub.is_none() {
+            self.rule_launcher()?
         } else {
-            b"_COMPILER_LAUNCHER"
+            BString::default()
         };
-        let launcher = launcher::Command {
-            role: if stub.is_some() { "compile" } else { "link" },
-            config: self.config,
-            output: self.output,
-            source: stub.map(|(_, register)| register),
-            language: &language,
-        }
-        .tool_prefix(
-            self.model,
-            self.target,
-            launcher_suffix,
-            &mut UsageResolver::new(self.model),
-        )?;
-        let launcher = words(&launcher);
         let compiler_key = compiler_key(self.lang, b"_COMPILER");
         let arg1_key = compiler_key(self.lang, b"_COMPILER_ARG1");
         let launcher_key = compiler_key(self.lang, b"_COMPILER_LAUNCHER");
-        let arg1 = get(b"_COMPILER_ARG1")
-            .map_or_else(BString::default, |arg| words(&shell_arguments(arg)));
-        let compiler = quote(get(b"_COMPILER").map_or(b"cc".as_slice(), |path| path.as_slice()));
+        let linker_launcher_key = compiler_key(self.lang, b"_LINKER_LAUNCHER");
+        let arg1 = get(b"_COMPILER_ARG1").cloned().unwrap_or_default();
+        let compiler = get(b"_COMPILER")
+            .filter(|path| !path.is_empty())
+            .ok_or_else(|| missing(self.lang, b"_COMPILER"))?;
+        let compiler = quote(compiler);
         let sysroot = if stub.is_some() {
             b"CMAKE_SYSROOT_COMPILE".as_slice()
         } else {
@@ -97,12 +84,11 @@ impl Rule<'_> {
                 continue;
             }
             let compiler = join_words([
-                implicit(&rule, &launcher_key, &launcher),
                 compiler.clone(),
                 implicit(&rule, &arg1_key, &arg1),
                 toolchain.clone(),
             ]);
-            let expanded = expand_rule(&rule, |key| {
+            let expanded = expand_rule(&join_words([launcher.clone(), rule]), |key| {
                 Some(match key {
                     b"TARGET" | b"OBJECT" => quote(self.output),
                     b"TARGET_BASE" => quote(base),
@@ -117,8 +103,8 @@ impl Rule<'_> {
                     b"TARGET_TYPE" => self.target.kind.as_str().into(),
                     b"CONFIG" => quote(&self.config.0),
                     b"LANGUAGE" => language.clone(),
-                    b"FATBINARY" => quote(stub?.0),
-                    b"REGISTER_FILE" => quote(stub?.1),
+                    b"FATBINARY" => macro_path(stub?.0),
+                    b"REGISTER_FILE" => macro_path(stub?.1),
                     b"CMAKE_CURRENT_BINARY_DIR" => {
                         quote(&self.model.dir(self.target.dir).binary_dir)
                     }
@@ -129,7 +115,11 @@ impl Rule<'_> {
                     }
                     key if key == compiler_key.as_slice() => compiler.clone(),
                     key if key == arg1_key.as_slice() => arg1.clone(),
-                    key if key == launcher_key.as_slice() => launcher.clone(),
+                    key if key == launcher_key.as_slice()
+                        || key == linker_launcher_key.as_slice() =>
+                    {
+                        BString::default()
+                    }
                     _ => return definition(key).cloned(),
                 })
             });
@@ -147,6 +137,56 @@ impl Rule<'_> {
         }
         Ok(command(shell))
     }
+
+    fn rule_launcher(&self) -> Result<BString, ResolveError> {
+        let property = b"RULE_LAUNCH_LINK";
+        let value = self
+            .target
+            .props
+            .get(property)
+            .or_else(|| {
+                self.model
+                    .ancestors(self.target.dir)
+                    .find_map(|dir| self.model.dir(dir).props.get(property))
+            })
+            .or_else(|| self.model.global.props.get(property));
+        let Some(value) = value else {
+            return Ok(BString::default());
+        };
+        if !value.windows(2).any(|part| part == b"$<") {
+            return Ok(value.clone());
+        }
+        let target = self
+            .model
+            .find_target(self.target.dir, &self.target.name)
+            .map(handle);
+        let ctx = EvalContext {
+            config: self.config.clone(),
+            current: target,
+            head: target,
+            link_language: Some(self.lang.into()),
+            traversal: UsageTraversal::Link,
+            ..EvalContext::default()
+        };
+        let mut usage = UsageResolver::new(self.model);
+        Ok(evaluate(&parse(value)?, &ctx, &mut usage.host(self.target.dir))?.0)
+    }
+}
+
+fn macro_path(path: &[u8]) -> BString {
+    let quoted = quote(path);
+    if quoted == path {
+        return quoted;
+    }
+    let mut escaped = BString::from("\"");
+    for &byte in path {
+        if matches!(byte, b'\\' | b'"' | b'$' | b'`') {
+            escaped.push(b'\\');
+        }
+        escaped.push(byte);
+    }
+    escaped.push(b'"');
+    escaped
 }
 
 fn compiler_key(lang: &[u8], suffix: &[u8]) -> Vec<u8> {

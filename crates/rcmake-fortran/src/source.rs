@@ -1,4 +1,4 @@
-use rcmake_base::{BString, path_lex::Lexical};
+use rcmake_base::{BString, list, path_lex::Lexical};
 
 /// Source form used by the compiler.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -10,6 +10,26 @@ pub enum SourceForm {
 }
 
 impl SourceForm {
+    /// Select the last recognized value of a `Fortran_FORMAT` property.
+    pub fn from_property(value: &[u8]) -> Option<Self> {
+        list::split(value, list::Empty::Drop)
+            .iter()
+            .rev()
+            .find_map(|entry| match entry.as_slice() {
+                b"FIXED" => Some(Self::Fixed),
+                b"FREE" => Some(Self::Free),
+                _ => None,
+            })
+    }
+
+    /// Return the CMake `Fortran_FORMAT` value for this source form.
+    pub const fn property_value(self) -> &'static str {
+        match self {
+            Self::Fixed => "FIXED",
+            Self::Free => "FREE",
+        }
+    }
+
     /// Select the source form from a conventional, case-insensitive file extension.
     pub fn from_path(path: &[u8]) -> Option<Self> {
         let (_, ext) = Lexical::new(path).stem_extension(true);
@@ -116,4 +136,18 @@ pub(crate) fn identifier(word: &[u8]) -> bool {
         && word
             .iter()
             .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SourceForm;
+
+    #[test]
+    fn format_uses_the_last_recognized_uppercase_entry() {
+        assert_eq!(
+            SourceForm::from_property(b"FIXED;FREE;fixed"),
+            Some(SourceForm::Free)
+        );
+        assert_eq!(SourceForm::from_property(b"fixed;free"), None);
+    }
 }

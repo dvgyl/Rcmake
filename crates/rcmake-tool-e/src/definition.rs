@@ -8,7 +8,6 @@ mod tests;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
 
 use rcmake_base::{BString, ByteSlice};
 use rcmake_host::{
@@ -254,7 +253,7 @@ fn read_symbols(
         stdin: Input::Null,
         stdout: Output::Capture,
         stderr: Output::Capture,
-        timeout: Some(Duration::from_secs(120)),
+        timeout: None,
         tee: false,
     };
     let result = cx.host.run(&request, &mut |_, _| {});

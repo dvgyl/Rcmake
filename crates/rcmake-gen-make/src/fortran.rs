@@ -33,12 +33,8 @@ pub(crate) struct DependencyRule<'a> {
 /// Additional inputs for the target dependency file.
 #[derive(Default)]
 pub(crate) struct DependencyFiles<'a> {
-    /// Support directories with module summaries to forward.
-    pub(crate) forward_target_dirs: &'a [BString],
     /// Native depfile records in source, object, compiler, depfile order.
     pub(crate) native_depfiles: &'a [BString],
-    /// Whether the compiler builds its intrinsic modules.
-    pub(crate) building_intrinsic_modules: bool,
 }
 
 /// Write the target's Fortran dependency information using the host.
@@ -58,11 +54,12 @@ pub(crate) fn write_depend_info(
 }
 
 fn depend_info(info: &DependInfo, files: &DependencyFiles<'_>) -> Result<Vec<u8>, GenError> {
-    let DependInfo::Fortran(info) = info else {
+    let DependInfo::Fortran(tdi) = info else {
         return Err(GenError::Invalid(
             "Expected Fortran dependency information.".into(),
         ));
     };
+    let info = &tdi.scan;
     let mut out =
         b"set(CMAKE_DEPENDS_IN_PROJECT_ONLY OFF)\nset(CMAKE_DEPENDS_LANGUAGES \"Fortran\")\n"
             .to_vec();
@@ -76,13 +73,24 @@ fn depend_info(info: &DependInfo, files: &DependencyFiles<'_>) -> Result<Vec<u8>
         out.push(b'\n');
     }
     out.extend_from_slice(b")\n");
+    if !tdi.source_formats.is_empty() {
+        out.extend_from_slice(b"set(_RCMAKE_Fortran_SOURCE_FORMATS\n");
+        for (source, form) in &tdi.source_formats {
+            out.extend_from_slice(b"  ");
+            cmake_argument(&mut out, source, true);
+            out.push(b' ');
+            cmake_argument(&mut out, form.property_value().as_bytes(), true);
+            out.push(b'\n');
+        }
+        out.extend_from_slice(b")\n");
+    }
     let linked = info
         .linked_target_dirs
         .iter()
         .map(|dir| Lexical::new(dir).append(b"DependInfo.cmake"))
         .collect::<Vec<_>>();
-    let forwarded: Vec<_> = files
-        .forward_target_dirs
+    let forwarded: Vec<_> = tdi
+        .forward_modules_from_target_dirs
         .iter()
         .map(|dir| Lexical::new(dir).append(b"DependInfo.cmake"))
         .collect();
@@ -91,6 +99,7 @@ fn depend_info(info: &DependInfo, files: &DependencyFiles<'_>) -> Result<Vec<u8>
             b"CMAKE_Fortran_TARGET_INCLUDE_PATH".as_slice(),
             info.include_dirs.as_slice(),
         ),
+        (b"CMAKE_TARGET_DEFINITIONS_Fortran", tdi.defines.as_slice()),
         (b"CMAKE_Fortran_TARGET_LINKED_INFO_FILES", linked.as_slice()),
         (
             b"CMAKE_Fortran_TARGET_FORWARD_LINKED_INFO_FILES",
@@ -131,7 +140,7 @@ fn depend_info(info: &DependInfo, files: &DependencyFiles<'_>) -> Result<Vec<u8>
         cmake_argument(&mut out, value, false);
         out.extend_from_slice(b")\n");
     }
-    if files.building_intrinsic_modules {
+    if tdi.building_intrinsic_modules {
         out.extend_from_slice(b"set(CMAKE_Fortran_TARGET_BUILDING_INTRINSIC_MODULES ON)\n");
     }
     Ok(out)

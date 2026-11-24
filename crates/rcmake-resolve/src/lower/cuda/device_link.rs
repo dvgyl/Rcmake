@@ -105,7 +105,15 @@ pub(crate) fn require_device_linking(
                 .iter()
                 .any(|language| language.as_slice() == lang)
         });
-    if !enabled || target.kind == TargetKind::ObjectLibrary {
+    if !enabled
+        || !matches!(
+            target.kind,
+            TargetKind::Executable
+                | TargetKind::StaticLibrary
+                | TargetKind::SharedLibrary
+                | TargetKind::ModuleLibrary
+        )
+    {
         return false;
     }
     if !lang_definition(model, target, lang, b"_COMPILER_HAS_DEVICE_LINK_PHASE")
@@ -435,8 +443,7 @@ pub(crate) fn plan(
         .filter(|value| seen.insert(*value))
         .cloned()
         .collect();
-    let explicit = get(b"_DEVICE_LINK_MODE").is_some_and(|mode| mode == b"EXPLICIT")
-        || (lang == b"CUDA" && get(b"_COMPILER_ID").is_some_and(|id| id == b"Clang"));
+    let explicit = lang == b"CUDA" && get(b"_COMPILER_ID").is_some_and(|id| id == b"Clang");
 
     let mut link_flags = Vec::new();
     if (input.libraries.requires_ipo || ipo_enabled(model, target, config, lang))

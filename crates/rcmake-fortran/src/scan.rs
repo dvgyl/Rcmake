@@ -343,13 +343,14 @@ impl Scanner<'_, '_, '_> {
             {
                 return Err(ScanError::ConditionalLimit);
             }
+            let mut restarted = false;
             for state in &mut states {
-                state.push(line, self.input, conditional, &mut self.output);
+                restarted |= state.push(line, self.input, conditional, &mut self.output);
             }
             for (include, conditional) in std::mem::take(&mut self.output.includes) {
                 self.include(path, include, depth, conditional)?;
             }
-            if states.len() > 1 {
+            if restarted && states.len() > 1 {
                 normalize_states(&mut states)?;
             }
         }
@@ -447,6 +448,26 @@ fn splice_directive<'a>(line: &[u8], lines: &mut impl Iterator<Item = &'a [u8]>)
     directive
 }
 
+fn fixed_statement(text: &[u8]) -> &[u8] {
+    // The statement field starts at column seven. A sequence field starts at column 73.
+    let Some((statement, tail)) = text.split_at_checked(66) else {
+        return text;
+    };
+    if tail.trim_ascii().is_empty()
+        || tail.get(..8).is_some_and(|sequence| {
+            sequence
+                .iter()
+                .all(|byte| matches!(byte, b'0'..=b'9' | b' '))
+                && tail
+                    .get(8..)
+                    .is_some_and(|rest| rest.trim_ascii().is_empty())
+        })
+    {
+        return statement;
+    }
+    text
+}
+
 impl LogicalLine {
     fn push(
         &mut self,
@@ -454,16 +475,16 @@ impl LogicalLine {
         input: &ScanInput<'_>,
         conditional: bool,
         output: &mut FileScan,
-    ) {
+    ) -> bool {
         let trimmed = line.trim_ascii_start();
         if trimmed.is_empty() {
-            return;
+            return false;
         }
         match input.form {
             SourceForm::Free => {
                 let line = trimmed;
                 if line.starts_with(b"!") {
-                    return;
+                    return false;
                 }
                 let fragment =
                     if let Some(rest) = line.strip_prefix(b"&").filter(|_| !self.text.is_empty()) {
@@ -480,20 +501,22 @@ impl LogicalLine {
                 if let Some(rest) = fragment.strip_suffix(b"&") {
                     self.quote = quote;
                     self.text.extend_from_slice(rest);
+                    false
                 } else {
                     self.text.extend_from_slice(fragment);
                     self.flush(input, output);
+                    true
                 }
             }
             SourceForm::Fixed => {
                 if trimmed.starts_with(b"!") && line.len() - trimmed.len() != 5 {
-                    return;
+                    return false;
                 }
                 if line
                     .first()
-                    .is_some_and(|byte| matches!(byte, b'C' | b'c' | b'*' | b'!'))
+                    .is_some_and(|byte| matches!(byte, b'C' | b'c' | b'D' | b'd' | b'*' | b'!'))
                 {
-                    return;
+                    return false;
                 }
                 let tab_statement = line
                     .iter()
@@ -505,21 +528,19 @@ impl LogicalLine {
                         .first()
                         .is_some_and(|byte| matches!(byte, b'1'..=b'9'));
                     let fragment = after.get(usize::from(continued)..).unwrap_or_default();
-                    (continued, fragment.get(..66).unwrap_or(fragment))
+                    (continued, fragment)
                 } else {
                     let continued = line.get(5).is_some_and(|byte| !matches!(byte, b' ' | b'0'));
-                    (
-                        continued,
-                        line.get(6..line.len().min(72)).unwrap_or_default(),
-                    )
+                    (continued, line.get(6..).unwrap_or_default())
                 };
                 if !continued {
                     self.flush(input, output);
                 }
                 self.conditional |= conditional;
-                let (fragment, quote) = strip_comment(fragment, self.quote);
+                let (fragment, quote) = strip_comment(fixed_statement(fragment), self.quote);
                 self.quote = quote;
                 self.text.extend_from_slice(fragment);
+                !continued
             }
         }
     }
@@ -705,4 +726,45 @@ fn include_name(text: &[u8], cpp: bool) -> Option<Include> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn keeps_extended_fixed_statements_and_ignores_sequence_numbers() -> Result<(), ScanError> {
+        let name = "long_module_name";
+        let text = format!(
+            "      MODULE {:>59}{name}\n\tUSE {:>62}{name}\n{:<72}00123456\nD     USE debug_upper\nd     USE debug_lower\n",
+            "", "", "      USE with_sequence",
+        );
+        let input = ScanInput::new(b"extended.f", text.as_bytes(), SourceForm::Fixed);
+        let info = scan(&input, None, &Limits::default())?;
+        assert_eq!(info.provides, BTreeSet::from([name.into()]));
+        assert_eq!(
+            info.requires,
+            BTreeSet::from([name.into(), "with_sequence".into()])
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn continues_both_states_from_an_unknown_branch() -> Result<(), ScanError> {
+        let mut text =
+            b"#if UNKNOWN_EXPRESSION()\nmodule first_&\n#else\nmodule second_&\n#endif\n".to_vec();
+        for _ in 0..4096 {
+            text.extend_from_slice(b"&a&\n");
+        }
+        text.extend_from_slice(b"&name\n");
+        let input = ScanInput::new(b"branch.f90", &text, SourceForm::Free);
+        let info = scan(&input, None, &Limits::default())?;
+        let continuation = "a".repeat(4096);
+        let expected = ["first_", "second_"]
+            .into_iter()
+            .map(|branch| BString::from(format!("{branch}{continuation}name")))
+            .collect();
+        assert_eq!(info.provides, expected);
+        Ok(())
+    }
 }

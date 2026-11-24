@@ -6,7 +6,6 @@ mod response;
 mod tests;
 
 use std::io::ErrorKind;
-use std::time::Duration;
 
 use rcmake_base::{BString, ByteSlice};
 use rcmake_host::{
@@ -368,7 +367,7 @@ fn run_tool(
         stdin: Input::Null,
         stdout: Output::Capture,
         stderr: Output::SharedWithStdout,
-        timeout: Some(Duration::from_secs(120)),
+        timeout: None,
         tee: false,
     };
     match cx.host.run(&request, &mut |_, _| {}) {

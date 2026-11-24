@@ -12,14 +12,14 @@ use super::{
     required_time, resolve, run_generator, timestamp,
 };
 
-pub(super) fn settings_digest(uic: &Uic) -> Option<String> {
-    let executable = from_native(uic.executable.as_ref()?);
+pub(super) fn settings_digest(uic: &Uic) -> String {
+    let executable = from_native(&uic.executable);
     let file_paths: Vec<_> = uic
         .file_options
         .keys()
         .map(|file| from_native(file))
         .collect();
-    Some(settings_hash(
+    settings_hash(
         std::iter::once(&executable)
             .chain(&uic.options)
             .chain(
@@ -29,7 +29,7 @@ pub(super) fn settings_digest(uic: &Uic) -> Option<String> {
                     .flat_map(|(path, options)| std::iter::once(path).chain(options)),
             )
             .map(|value| value.as_slice()),
-    ))
+    )
 }
 
 pub(super) fn plan(
@@ -97,12 +97,7 @@ pub(super) fn generate(cx: &ToolCtx<'_>, info: &Autogen, changed: bool, jobs: &J
         if job.kind != JobKind::Uic {
             continue;
         }
-        let executable = uic.executable.as_ref().ok_or_else(|| {
-            format!(
-                "The UI file \"{}\" requires uic, but QT_UIC_EXECUTABLE is empty.",
-                job.input.display()
-            )
-        })?;
+        let executable = &uic.executable;
         let input_time = required_time(cx, &job.input)?;
         let tool_time = required_time(cx, executable)?;
         if changed || timestamp(cx, output).is_none_or(|time| time < input_time || time < tool_time)

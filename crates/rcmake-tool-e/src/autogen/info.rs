@@ -349,12 +349,10 @@ impl Autogen {
         rows.extend(reader.rows("CXX_MODULE_UNITS", JobKind::Module, &common, moc.is_some())?);
         rows.extend(reader.rows("SOURCES", JobKind::Source, &common, moc.is_some())?);
         rows.sort_by(|a, b| a.path.cmp(&b.path));
-        let executable = reader.tool("QT_UIC_EXECUTABLE", &common, false)?;
-        let uic = if executable.is_some() || rows.iter().any(|row| row.uic) {
-            Some(Uic::read(reader, &common, executable)?)
-        } else {
-            None
-        };
+        let uic = reader
+            .tool("QT_UIC_EXECUTABLE", &common, false)?
+            .map(|executable| Uic::read(reader, &common, executable))
+            .transpose()?;
         Ok(Self {
             common,
             cmake,
@@ -477,7 +475,7 @@ pub(super) fn prefixed(prefix: &[u8], value: &[u8]) -> BString {
 }
 
 pub(super) struct Uic {
-    pub(super) executable: Option<PathBuf>,
+    pub(super) executable: PathBuf,
     pub(super) options: Vec<BString>,
     pub(super) file_options: BTreeMap<PathBuf, Vec<BString>>,
     pub(super) search_paths: Vec<PathBuf>,
@@ -485,9 +483,9 @@ pub(super) struct Uic {
 }
 
 impl Uic {
-    fn read(reader: &Reader<'_>, common: &Common, executable: Option<PathBuf>) -> Result<Self> {
+    fn read(reader: &Reader<'_>, common: &Common, executable: PathBuf) -> Result<Self> {
         let mut file_options = BTreeMap::new();
-        for value in reader.values(b"UIC_UI_FILES", executable.is_some())? {
+        for value in reader.values(b"UIC_UI_FILES", true)? {
             let [path, options] = array(value, "UIC_UI_FILES")? else {
                 return Err(invalid("UIC_UI_FILES", "a path and its options"));
             };

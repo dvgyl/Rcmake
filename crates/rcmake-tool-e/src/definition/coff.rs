@@ -37,20 +37,35 @@ impl Header {
                 symbol_size: 20,
             }
         } else {
-            // COFF object files have no executable optional header.
-            if word(bytes, 16)? != 0 {
+            if word(bytes, 18)? != 0 {
                 return None;
             }
             Self {
                 machine: first,
                 sections: second as usize,
-                section_start: 20,
+                section_start: 20 + usize::from(word(bytes, 16)?),
                 symbol_start: dword(bytes, 8)? as usize,
                 symbols: dword(bytes, 12)? as usize,
                 symbol_size: 18,
             }
         };
         Some(header)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Header;
+
+    #[test]
+    fn reads_characteristics_after_the_optional_header_size() {
+        let object = b"\x64\x86\0\0\0\0\0\0\0\0\0\0\0\0\0\0\x02\0\0\0";
+        let linked = b"\x64\x86\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\x02\0";
+        assert_eq!(
+            Header::parse(object).map(|header| header.section_start),
+            Some(22)
+        );
+        assert!(Header::parse(linked).is_none());
     }
 }
 

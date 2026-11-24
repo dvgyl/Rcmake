@@ -2,7 +2,6 @@ use std::{
     collections::BTreeSet,
     io::ErrorKind,
     path::{Component, Path, PathBuf},
-    time::Duration,
 };
 
 use rcmake_base::{BString, path_lex::Lexical};
@@ -29,7 +28,6 @@ type Result<T> = std::result::Result<T, String>;
 
 const DATA_LIMIT: u64 = 16 * 1024 * 1024;
 const ITEM_LIMIT: usize = 262_144;
-const TOOL_TIMEOUT: Duration = Duration::from_secs(120);
 
 pub(super) fn run(args: &[BString], cx: &ToolCtx<'_>) -> i32 {
     dispatch(args, cx, false)
@@ -93,7 +91,7 @@ fn generate(cx: &ToolCtx<'_>, info: info::Autogen) -> Result<()> {
         .moc
         .as_ref()
         .map(|moc| moc::settings_digest(moc, info.qt_version));
-    let uic_hash = info.uic.as_ref().and_then(uic::settings_digest);
+    let uic_hash = info.uic.as_ref().map(uic::settings_digest);
     let moc_changed = previous.get(b"moc".as_slice()) != moc_hash.as_ref();
     let uic_changed = previous.get(b"uic".as_slice()) != uic_hash.as_ref();
     if moc_changed || uic_changed {
@@ -107,8 +105,7 @@ fn generate(cx: &ToolCtx<'_>, info: info::Autogen) -> Result<()> {
     let uic_time = info
         .uic
         .as_ref()
-        .and_then(|uic| uic.executable.as_ref())
-        .map(|exe| required_time(cx, exe))
+        .map(|uic| required_time(cx, &uic.executable))
         .transpose()?;
 
     let mut cache = cache::ParseCache::read(cx, &info.parse_cache);
@@ -397,7 +394,7 @@ fn run_tool(
         stdin: Input::Null,
         stdout: Output::Capture,
         stderr: Output::Capture,
-        timeout: Some(TOOL_TIMEOUT),
+        timeout: None,
         tee: false,
     };
     let output = cx

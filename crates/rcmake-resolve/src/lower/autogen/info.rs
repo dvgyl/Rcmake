@@ -8,7 +8,7 @@ use rcmake_base::{BString, list, path_lex::Lexical, truth};
 use rcmake_genex::{ConfigId, EvalContext};
 use rcmake_host::{Host, ReadRange, WriteMode, path::to_native};
 use rcmake_json::{Value, write_styled};
-use rcmake_model::{DirId, ProjectModel, Target, UsageField};
+use rcmake_model::{DirId, GeneratorKind, ProjectModel, Target, UsageField};
 
 use super::graph::target_list;
 use super::scan::{ConfigValues, HEADER_EXTENSIONS, QtVersion, ScanKind, eval_property};
@@ -318,9 +318,16 @@ fn add_moc_info(
     ])];
     dependencies.extend(filters.chunks(2).map(strings));
     info.insert("MOC_DEPEND_FILTERS".into(), Value::Array(dependencies));
-    config_paths(info, "MOC_COMPILATION_FILE", plan, |config| {
-        plan.compilation_file(config)
-    });
+    if plan.generator == GeneratorKind::Xcode {
+        info.insert(
+            "MOC_COMPILATION_FILE".into(),
+            Value::string(plan.compilation_file(None)),
+        );
+    } else {
+        config_paths(info, "MOC_COMPILATION_FILE", plan, |config| {
+            plan.compilation_file(config)
+        });
+    }
     if predefs.is_empty() {
         info.insert("MOC_PREDEFS_FILE".into(), Value::string(""));
     } else {

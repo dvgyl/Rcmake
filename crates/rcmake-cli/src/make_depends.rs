@@ -124,6 +124,15 @@ fn scan(args: &[BString], host: &Arc<dyn Host>) -> Result<i32, String> {
             include_dirs: include_dirs.clone(),
         });
         if language.as_slice() == b"Fortran" {
+            let formats = values(b"_RCMAKE_Fortran_SOURCE_FORMATS");
+            let (formats, remainder) = formats.as_chunks::<2>();
+            if !remainder.is_empty() {
+                return Err("Invalid Fortran source format pairs.".into());
+            }
+            let formats: BTreeMap<_, _> = formats
+                .iter()
+                .map(|[path, format]| (path.as_slice(), format))
+                .collect();
             fortran = Some(FortranTarget {
                 build_dir: build.clone(),
                 module_dir: optional(b"CMAKE_Fortran_TARGET_MODULE_DIR")
@@ -144,9 +153,10 @@ fn scan(args: &[BString], host: &Arc<dyn Host>) -> Result<i32, String> {
                     .map(|file| root.join(path::to_native(file)))
                     .collect(),
                 sources: entries
-                    .map(|source| FortranSource {
+                    .zip(pairs)
+                    .map(|(source, [input, _])| FortranSource {
                         source,
-                        format: None,
+                        format: formats.get(input.as_slice()).copied().cloned(),
                     })
                     .collect(),
             });
@@ -576,8 +586,8 @@ mod tests {
         let host = Arc::new(PureHost::new(dir.to_path_buf(), dir.join("rcmake")));
         let output = dir.join("build/sub/CMakeFiles/mixed.dir");
         host.seed_file(
-            &dir.join("src/child.f90"),
-            b"submodule (parent) child\n  include 'defines.inc'\nend submodule child\n",
+            &dir.join("src/child.f"),
+            b"#ifdef USE_BUILTINS\nsubmodule (parent) child\n  include 'defines.inc'\nend submodule child\n#else\nmodule wrong\n#endif\n",
         )?;
         host.seed_file(
             &dir.join("src/builtins.f90"),
@@ -596,8 +606,10 @@ mod tests {
             format!(
                 r#"set(CMAKE_DEPENDS_LANGUAGES Fortran)
 set(CMAKE_DEPENDS_CHECK_Fortran
-  "{work}/src/child.f90" "sub/CMakeFiles/mixed.dir/child.o"
+  "{work}/src/child.f" "sub/CMakeFiles/mixed.dir/child.o"
   "{work}/src/builtins.f90" "sub/CMakeFiles/mixed.dir/builtins.o")
+set(_RCMAKE_Fortran_SOURCE_FORMATS "{work}/src/child.f" FREE)
+set(CMAKE_TARGET_DEFINITIONS_Fortran USE_BUILTINS=1)
 set(CMAKE_Fortran_COMPILER_ID GNU)
 set(CMAKE_Fortran_TARGET_BUILDING_INSTRINSIC_MODULES OFF)
 set(CMAKE_DEPENDS_DEPENDENCY_FILES
@@ -637,6 +649,7 @@ set(CMAKE_DEPENDS_DEPENDENCY_FILES
         assert!(fortran_internal.contains("build/includes/defines.inc"));
         let modules = read_output(cli_host.as_ref(), &output, "fortran.internal")?;
         assert!(modules.contains("\n child.mod\n"));
+        assert!(!modules.contains("wrong.mod"));
         Ok(())
     }
 

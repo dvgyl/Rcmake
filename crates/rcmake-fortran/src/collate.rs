@@ -3,7 +3,7 @@ use std::fmt;
 
 use rcmake_base::{BString, path_lex::Lexical};
 
-use crate::{FortranCompiler, FortranSourceInfo, ModuleCase};
+use crate::{FortranCompiler, FortranSourceInfo, ModuleCase, SourceForm};
 
 /// Map from lowercase logical module names to build paths.
 pub type ModuleMap = BTreeMap<BString, BString>;
@@ -76,6 +76,25 @@ pub struct FortranTdi {
     pub module_case: ModuleCase,
     /// Source paths for the target.
     pub sources: Vec<DependSource>,
+}
+
+/// Fortran dependency data written to the build system.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FortranBuildTdi {
+    /// Source and collation settings.
+    pub scan: FortranTdi,
+    /// Current source directory.
+    pub dir_cur_src: BString,
+    /// Top-level source directory.
+    pub dir_top_src: BString,
+    /// Directories with dependency summaries to forward to other targets.
+    pub forward_modules_from_target_dirs: Vec<BString>,
+    /// Whether the target builds intrinsic modules.
+    pub building_intrinsic_modules: bool,
+    /// Explicit source forms, keyed by the original source path.
+    pub source_formats: BTreeMap<BString, SourceForm>,
+    /// Target preprocessor definitions, without source-specific definitions.
+    pub defines: Vec<BString>,
 }
 
 impl FortranTdi {

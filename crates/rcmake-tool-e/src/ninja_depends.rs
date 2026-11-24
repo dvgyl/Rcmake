@@ -101,7 +101,12 @@ fn execute(request: &Request<'_>, cx: &ToolCtx<'_>) -> Result<(), BString> {
                 format!("{COMMAND} failed to read {file}: {error}")
             }
         })?;
-    let metadata = format::read_metadata(&document).map_err(|error| {
+    let original_source = if request.src_orig.is_empty() {
+        request.src
+    } else {
+        request.src_orig
+    };
+    let metadata = format::read_metadata(&document, original_source).map_err(|error| {
         format!(
             "{COMMAND} failed to parse {}{error}",
             BString::from(request.tdi)
@@ -117,7 +122,9 @@ fn execute(request: &Request<'_>, cx: &ToolCtx<'_>) -> Result<(), BString> {
     let settings = ScanSettings {
         dir: cx.cwd,
         include_dirs: &include_dirs,
-        form: SourceForm::from_path(request.src)
+        form: metadata
+            .source_form
+            .or_else(|| SourceForm::from_path(request.src))
             .or_else(|| SourceForm::from_path(request.src_orig)),
         defines: &[],
         building_intrinsic_modules: metadata.building_intrinsic_modules,
@@ -146,8 +153,8 @@ fn execute(request: &Request<'_>, cx: &ToolCtx<'_>) -> Result<(), BString> {
         append_depfile_path(&mut dep, &include)?;
     }
     dep.push(b'\n');
-    dyndep::write_output(cx, &path(cx, request.dep), &dep, true)?;
-    dyndep::write_output(cx, &path(cx, request.ddi), &ddi, true)
+    dyndep::write_output(cx, &path(cx, request.dep), &dep, false)?;
+    dyndep::write_output(cx, &path(cx, request.ddi), &ddi, false)
 }
 
 fn append_depfile_path(output: &mut Vec<u8>, path: &[u8]) -> Result<(), BString> {

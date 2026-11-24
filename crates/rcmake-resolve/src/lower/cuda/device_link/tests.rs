@@ -60,8 +60,14 @@ fn unresolved_static_library_requires_device_link() -> Result<(), rcmake_model::
         device_link_language(&model, &app, &[], &[]),
         Some(b"CUDA".as_slice())
     );
-    app.kind = TargetKind::ObjectLibrary;
-    assert_eq!(device_link_language(&model, &app, &languages, &items), None);
+    for kind in [
+        TargetKind::ObjectLibrary,
+        TargetKind::InterfaceLibrary,
+        TargetKind::Utility,
+    ] {
+        app.kind = kind;
+        assert_eq!(device_link_language(&model, &app, &languages, &items), None);
+    }
     Ok(())
 }
 
@@ -244,6 +250,7 @@ fn driver_expands_library_rule_and_records_response_file_arguments() -> Result<(
     model.dir_mut(DirId::ROOT).vars.extend([
         ("CMAKE_CUDA_COMPILER".into(), "/cuda tools/nvcc".into()),
         ("CMAKE_CUDA_COMPILER_ARG1".into(), r#"--required "required value""#.into()),
+        ("CMAKE_CUDA_DEVICE_LINK_MODE".into(), "EXPLICIT".into()),
         ("CMAKE_CUDA_RESPONSE_FILE_DEVICE_LINK_FLAG".into(), "--options-file ".into()),
         (
             "CMAKE_CUDA_DEVICE_LINK_LIBRARY".into(),
@@ -254,6 +261,12 @@ fn driver_expands_library_rule_and_records_response_file_arguments() -> Result<(
     lib.props.set(
         "CUDA_COMPILER_LAUNCHER".into(),
         "/tool path/wrap;launch argument".into(),
+    );
+    lib.props
+        .set("CUDA_LINKER_LAUNCHER".into(), "link-wrapper".into());
+    lib.props.set(
+        "RULE_LAUNCH_LINK".into(),
+        "rule-wrapper <TARGET_NAME>".into(),
     );
     model
         .add_target(lib.clone())
@@ -293,8 +306,8 @@ fn driver_expands_library_rule_and_records_response_file_arguments() -> Result<(
     assert_eq!(
         invocation.argv,
         [
-            "/tool path/wrap",
-            "launch argument",
+            "rule-wrapper",
+            "kernels",
             "/cuda tools/nvcc",
             "--required",
             "required value",
@@ -310,6 +323,12 @@ fn driver_expands_library_rule_and_records_response_file_arguments() -> Result<(
             "CMakeFiles/kernels.dir",
             "CMakeFiles/kernels.dir/Debug/cmake_device_link",
         ]
+    );
+    assert!(
+        invocation
+            .shell
+            .to_string()
+            .contains(r#"--required "required value""#)
     );
     assert_eq!(
         response_file,
@@ -352,6 +371,7 @@ fn unresolved_archives_enable_device_ipo_when_the_executable_disables_it()
     library
         .props
         .set("CUDA_SEPARABLE_COMPILATION".into(), "ON".into());
+    library.props.set("CUDA_ARCHITECTURES".into(), "75".into());
     let id = model.add_target(library)?;
     let mut archive = item("kernels", ResolvedLinkKind::Library(id));
     archive.direct = false;
@@ -433,6 +453,7 @@ fn clang_fixture() -> ProjectModel {
     let mut model = ProjectModel::default();
     model.set_root_dirs("/src".into(), "/build".into());
     for (key, value) in [
+        ("CMAKE_CUDA_COMPILER", "clang"),
         ("CMAKE_CUDA_COMPILER_ID", "Clang"),
         ("CMAKE_CUDA_COMPILER_VERSION", "19.1"),
         ("CMAKE_CUDA_ARCHITECTURES_ALL", "52-real;75;52"),
@@ -442,7 +463,7 @@ fn clang_fixture() -> ProjectModel {
         ("CMAKE_CUDA_FATBINARY", "/cuda/fatbinary"),
         (
             "CMAKE_CUDA_DEVICE_LINK_COMPILE",
-            "clang -c link.stub -o <OBJECT> <FATBINARY> <REGISTER_FILE>",
+            r#"<CMAKE_CUDA_COMPILER> -c link.stub -o <OBJECT> -DFATBINFILE=\"<FATBINARY>\" -DREGISTERLINKBINARYFILE=\"<REGISTER_FILE>\""#,
         ),
     ] {
         model
@@ -456,9 +477,15 @@ fn clang_fixture() -> ProjectModel {
 #[test]
 fn explicit_plan_emits_one_registration_header() -> Result<(), ResolveError> {
     let model = clang_fixture();
-    let mut app = target("app", TargetKind::Executable);
+    let mut app = target("cuda app", TargetKind::Executable);
     app.props
         .set("CUDA_ARCHITECTURES".into(), "75-real;90-virtual;75".into());
+    app.props
+        .set("RULE_LAUNCH_LINK".into(), "rule-wrapper".into());
+    app.props
+        .set("CUDA_COMPILER_LAUNCHER".into(), "compiler-wrapper".into());
+    app.props
+        .set("CUDA_LINKER_LAUNCHER".into(), "link-wrapper".into());
     let libraries = DeviceLibraries::default();
     let plan = plan(
         &model,
@@ -506,6 +533,18 @@ fn explicit_plan_emits_one_registration_header() -> Result<(), ResolveError> {
                 .any(|arg| arg.starts_with(b"-im=profile=sm_90,"))
         );
         assert!(compile.argv.iter().any(|arg| arg == b"link.stub"));
+        assert_eq!(
+            compile.argv.first().map(|arg| arg.as_slice()),
+            Some(b"clang".as_slice())
+        );
+        assert!(
+            compile
+                .argv
+                .iter()
+                .any(|arg| arg == b"-DFATBINFILE=\"CMakeFiles/cuda app.dir/cmake_cuda_fatbin.h\"")
+        );
+        assert!(compile.argv.iter().any(|arg| arg
+            == b"-DREGISTERLINKBINARYFILE=\"CMakeFiles/cuda app.dir/cmake_cuda_register.h\""));
     } else {
         return Err(ResolveError::Message(
             "Expected explicit device linking.".into(),
@@ -520,9 +559,9 @@ fn clang_19_device_link_expands_named_architectures() -> Result<(), Box<dyn std:
     let mut app = target("app", TargetKind::Executable);
     let libraries = DeviceLibraries::default();
     for (value, expected) in [
-        ("all", &["-arch=sm_52", "-arch=sm_75"][..]),
-        ("all-major", &["-arch=sm_52", "-arch=sm_86"][..]),
-        ("native", &["-arch=sm_90a"][..]),
+        ("all", ["-arch=sm_52", "-arch=sm_75"].as_slice()),
+        ("all-major", ["-arch=sm_52", "-arch=sm_86"].as_slice()),
+        ("native", ["-arch=sm_90a"].as_slice()),
     ] {
         app.props.set("CUDA_ARCHITECTURES".into(), value.into());
         let plan = plan(

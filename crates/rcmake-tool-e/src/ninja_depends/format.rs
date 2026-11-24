@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use rcmake_base::{BString, path_lex::Lexical};
-use rcmake_fortran::{FortranCompiler, FortranSourceInfo, ModuleMap, ObjectScan};
+use rcmake_fortran::{FortranCompiler, FortranSourceInfo, ModuleMap, ObjectScan, SourceForm};
 use rcmake_json::{ReadOptions, Value};
 
 use super::Request;
@@ -17,6 +17,7 @@ pub(super) struct ScanMetadata {
     pub(super) submodule_sep: Option<BString>,
     pub(super) submodule_ext: Option<BString>,
     pub(super) building_intrinsic_modules: bool,
+    pub(super) source_form: Option<SourceForm>,
 }
 
 impl ScanMetadata {
@@ -42,10 +43,15 @@ pub(crate) fn compiler<'a>(
     }
 }
 
-pub(super) fn read_metadata(input: &[u8]) -> Result<ScanMetadata, BString> {
+pub(super) fn read_metadata(input: &[u8], source: &[u8]) -> Result<ScanMetadata, BString> {
     let document = parse(input)?;
     let root = object(&document)?;
+    let source_form = match root.get(b"_rcmake_source_formats".as_slice()) {
+        None | Some(Value::Null) => None,
+        Some(formats) => field(object(formats)?, source)?.and_then(SourceForm::from_property),
+    };
     Ok(ScanMetadata {
+        source_form,
         top_build: field(root, b"dir-top-bld")?.unwrap_or_default().into(),
         module_dir: field(root, b"module-dir")?.unwrap_or_default().into(),
         include_dirs: array(root, b"include-dirs")?

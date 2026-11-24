@@ -174,7 +174,7 @@ pub(crate) fn architecture_flags(
     model: &ProjectModel,
     target: &Target,
     phase: ArchPhase,
-    ipo: bool,
+    config: &ConfigId,
     in_try_compile: bool,
 ) -> (Vec<BString>, Vec<Diagnostic>) {
     let spec = match target_architectures(target) {
@@ -220,6 +220,7 @@ pub(crate) fn architecture_flags(
     let mut flags = Vec::new();
     let mut diagnostics = Vec::new();
     if compiler == b"NVIDIA" {
+        let ipo = ipo_enabled(model, target, config, b"CUDA");
         if ipo && phase == ArchPhase::Link {
             flags.extend(shell_arguments(get(b"CMAKE_CUDA_LINK_OPTIONS_IPO")));
         }
@@ -256,6 +257,21 @@ pub(super) fn ipo_enabled(
     config: &ConfigId,
     lang: &[u8],
 ) -> bool {
+    if lang == b"CUDA"
+        && [
+            b"CUDA_ARCHITECTURES".as_slice(),
+            b"CUDA_SEPARABLE_COMPILATION",
+        ]
+        .iter()
+        .any(|key| {
+            target
+                .props
+                .get(key)
+                .is_none_or(|value| truth::is_off(value))
+        })
+    {
+        return false;
+    }
     Flags::new(model, target, lang).ipo(config)
 }
 
@@ -450,8 +466,13 @@ mod tests {
     #[test]
     fn nvidia_real_virtual_and_family_architectures() {
         let (model, target) = fixture("NVIDIA", "12.6", "75;86-real;90a-virtual");
-        let (flags, diagnostics) =
-            architecture_flags(&model, &target, ArchPhase::Compile, false, false);
+        let (flags, diagnostics) = architecture_flags(
+            &model,
+            &target,
+            ArchPhase::Compile,
+            &ConfigId::default(),
+            false,
+        );
         assert!(diagnostics.is_empty());
         assert_eq!(
             flags,
@@ -478,13 +499,24 @@ mod tests {
                 .dir_mut(DirId::ROOT)
                 .vars
                 .insert("CMAKE_CUDA_ARCHITECTURES_NATIVE".into(), "90".into());
-            let (flags, diagnostics) =
-                architecture_flags(&model, &target, ArchPhase::Compile, false, false);
+            let (flags, diagnostics) = architecture_flags(
+                &model,
+                &target,
+                ArchPhase::Compile,
+                &ConfigId::default(),
+                false,
+            );
             assert_eq!(flags, [expected]);
             assert!(diagnostics.is_empty());
         }
         let (model, target) = fixture("NVIDIA", "11.4", "all-major");
-        let (flags, _) = architecture_flags(&model, &target, ArchPhase::Compile, false, false);
+        let (flags, _) = architecture_flags(
+            &model,
+            &target,
+            ArchPhase::Compile,
+            &ConfigId::default(),
+            false,
+        );
         assert_eq!(flags.len(), 2);
         assert!(
             flags
@@ -492,12 +524,22 @@ mod tests {
                 .any(|flag| flag.ends_with(b"[compute_86,sm_86]"))
         );
         let (model, target) = fixture("NVIDIA", "12.6", "OFF");
-        let (flags, diagnostics) =
-            architecture_flags(&model, &target, ArchPhase::Compile, false, false);
+        let (flags, diagnostics) = architecture_flags(
+            &model,
+            &target,
+            ArchPhase::Compile,
+            &ConfigId::default(),
+            false,
+        );
         assert!(flags.is_empty() && diagnostics.is_empty());
         let (model, target) = fixture("NVIDIA", "12.6", "native");
-        let (_, diagnostics) =
-            architecture_flags(&model, &target, ArchPhase::Compile, false, false);
+        let (_, diagnostics) = architecture_flags(
+            &model,
+            &target,
+            ArchPhase::Compile,
+            &ConfigId::default(),
+            false,
+        );
         assert!(diagnostics.iter().any(|item| item.effect == Effect::Fatal));
     }
 
@@ -510,8 +552,13 @@ mod tests {
             (PolicyStatus::New, Some(Effect::Fatal)),
         ] {
             target.policies.policies.set(PolicyId::new(104), status)?;
-            let (flags, diagnostics) =
-                architecture_flags(&model, &target, ArchPhase::Compile, false, false);
+            let (flags, diagnostics) = architecture_flags(
+                &model,
+                &target,
+                ArchPhase::Compile,
+                &ConfigId::default(),
+                false,
+            );
             assert!(flags.is_empty());
             assert_eq!(diagnostics.first().map(|diag| diag.effect), effect);
             if let Some(diag) = diagnostics.first() {
@@ -527,18 +574,29 @@ mod tests {
             .policies
             .set(PolicyId::new(104), PolicyStatus::Warn)?;
         assert!(
-            architecture_flags(&model, &target, ArchPhase::Compile, false, true)
-                .1
-                .is_empty()
+            architecture_flags(
+                &model,
+                &target,
+                ArchPhase::Compile,
+                &ConfigId::default(),
+                true
+            )
+            .1
+            .is_empty()
         );
         Ok(())
     }
 
     #[test]
-    fn clang_offload_modes_and_nvidia_ipo() {
+    fn clang_offload_modes_and_nvidia_ipo() -> Result<(), Box<dyn std::error::Error>> {
         let (model, target) = fixture("Clang", "19.0", "75-real;90-virtual");
-        let (flags, diagnostics) =
-            architecture_flags(&model, &target, ArchPhase::Compile, false, false);
+        let (flags, diagnostics) = architecture_flags(
+            &model,
+            &target,
+            ArchPhase::Compile,
+            &ConfigId::default(),
+            false,
+        );
         assert_eq!(
             flags,
             [
@@ -549,25 +607,59 @@ mod tests {
         );
         assert_eq!(diagnostics.len(), 1);
         let (mut model, mut target) = fixture("Clang", "20.0", "75");
-        let (flags, _) = architecture_flags(&model, &target, ArchPhase::Compile, false, false);
+        let (flags, _) = architecture_flags(
+            &model,
+            &target,
+            ArchPhase::Compile,
+            &ConfigId::default(),
+            false,
+        );
         assert_eq!(flags, ["--offload-arch=sm_75", "--cuda-include-ptx=sm_75"]);
         target
             .props
             .set("CUDA_SEPARABLE_COMPILATION".into(), "ON".into());
-        let (flags, diagnostics) =
-            architecture_flags(&model, &target, ArchPhase::Compile, false, false);
+        let (flags, diagnostics) = architecture_flags(
+            &model,
+            &target,
+            ArchPhase::Compile,
+            &ConfigId::default(),
+            false,
+        );
         assert_eq!(flags, ["--offload-arch=sm_75"]);
         assert_eq!(diagnostics.len(), 1);
         model
             .dir_mut(DirId::ROOT)
             .vars
             .insert("CMAKE_CUDA_COMPILER_ID".into(), "NVIDIA".into());
-        let (flags, _) = architecture_flags(&model, &target, ArchPhase::Compile, true, false);
+        target
+            .policies
+            .policies
+            .set(PolicyId::new(69), PolicyStatus::New)?;
+        target
+            .props
+            .set("INTERPROCEDURAL_OPTIMIZATION".into(), "ON".into());
+        let config = ConfigId::default();
+        let (flags, _) = architecture_flags(&model, &target, ArchPhase::Compile, &config, false);
         assert_eq!(
             flags,
             ["--generate-code=arch=compute_75,code=[compute_75,lto_75]"]
         );
+        target
+            .props
+            .set("CUDA_SEPARABLE_COMPILATION".into(), "OFF".into());
+        let (flags, _) = architecture_flags(&model, &target, ArchPhase::Compile, &config, false);
+        assert_eq!(
+            flags,
+            ["--generate-code=arch=compute_75,code=[compute_75,sm_75]"]
+        );
+        assert!(!ipo_enabled(&model, &target, &config, b"CUDA"));
+        target
+            .props
+            .set("CUDA_SEPARABLE_COMPILATION".into(), "ON".into());
+        target.props.set("CUDA_ARCHITECTURES".into(), "OFF".into());
+        assert!(!ipo_enabled(&model, &target, &config, b"CUDA"));
         assert!(standard_rank(b"98") < standard_rank(b"11"));
         assert!(standard_rank(b"20") < standard_rank(b"23"));
+        Ok(())
     }
 }

@@ -1,8 +1,56 @@
-use std::path::PathBuf;
+use std::{path::PathBuf, time::Duration};
 
-use rcmake_host::{Host, PureHost, Stream, path::from_native_cmake};
+use rcmake_host::{Follow, Host, PureHost, Stream, path::from_native_cmake};
 
 use super::*;
+
+#[test]
+fn scans_free_form_f_sources_and_rewrites_identical_outputs()
+-> Result<(), Box<dyn std::error::Error>> {
+    let cwd = PathBuf::from(if cfg!(windows) { "C:/out" } else { "/out" });
+    let host = PureHost::new(cwd.clone(), cwd.join("cmake"));
+    let cx = ToolCtx {
+        host: &host,
+        cwd: &cwd,
+        exe_display: b"cmake",
+        capabilities: &|| rcmake_json::Value::Null,
+    };
+    host.seed_file(
+        &cwd.join("tdi.json"),
+        br#"{"_rcmake_source_formats":{"original.f":"FREE"}}"#,
+    )?;
+    host.seed_file(&cwd.join("original.f"), b"")?;
+    host.seed_file(&cwd.join("scan.f"), b"module first; module second\n")?;
+    let args = [
+        "--lang=Fortran",
+        "--tdi=tdi.json",
+        "--src=scan.f",
+        "--src-orig=original.f",
+        "--out=scan.f",
+        "--dep=scan.d",
+        "--obj=scan.o",
+        "--ddi=scan.ddi",
+    ]
+    .map(BString::from);
+    assert_eq!(run(&args, &cx), 0, "{}", host.stream_bytes(Stream::Stderr));
+    let ddi = cwd.join("scan.ddi");
+    let dep = cwd.join("scan.d");
+    let result = read_ddi(
+        &host.read(&ddi, read_all())?,
+        &rcmake_fortran::FortranCompiler::from_id(b"GNU"),
+    )
+    .map_err(|error| error.to_string())?;
+    assert_eq!(result.scan.info.provides.len(), 2);
+    assert!(result.scan.info.provides.contains(b"first".as_slice()));
+    assert!(result.scan.info.provides.contains(b"second".as_slice()));
+    let ddi_mtime = host.metadata(&ddi, Follow::Yes)?.mtime;
+    let dep_mtime = host.metadata(&dep, Follow::Yes)?.mtime;
+    host.sleep(Duration::from_secs(1));
+    assert_eq!(run(&args, &cx), 0, "{}", host.stream_bytes(Stream::Stderr));
+    assert!(host.metadata(&ddi, Follow::Yes)?.mtime > ddi_mtime);
+    assert!(host.metadata(&dep, Follow::Yes)?.mtime > dep_mtime);
+    Ok(())
+}
 
 #[test]
 fn scans_fortran_and_resolves_linked_module_dyndep() -> Result<(), Box<dyn std::error::Error>> {

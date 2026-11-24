@@ -1,11 +1,12 @@
 //! Model overlay and custom commands for Qt automatic generation.
 
 mod ordering;
+mod source;
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use indexmap::{IndexMap, IndexSet};
-use rcmake_base::{BString, ByteSlice, list, path_lex::Lexical, truth};
+use rcmake_base::{BString, list, path_lex::Lexical, truth};
 use rcmake_diag::{Diagnostic, PolicyId, PolicyStatus};
 use rcmake_genex::ConfigId;
 use rcmake_host::path;
@@ -22,6 +23,7 @@ use super::{AutogenPlan, ConfiguredSources, ResourceJob, TargetPlan};
 use crate::ResolveError;
 use crate::lower::{definition, join, object_dir, short_object_paths};
 use crate::sources::{SourcePaths, absolute_path};
+use source::{GeneratedSource, add_source, mark_configured, mark_source};
 
 /// Add autogen inputs, outputs, and utilities to a copy of the project model.
 pub(super) fn prepare(
@@ -425,7 +427,13 @@ fn add_autogen(
     }
     if plan.moc.enabled {
         let file = plan.compilation_file(configured);
-        add_source(model, plan, origin, file.clone(), true, false)?;
+        add_source(
+            model,
+            plan,
+            origin,
+            file.clone(),
+            GeneratedSource::MocCompilation,
+        )?;
         if plan.cross && !plan.better {
             generated.extend(
                 plan.configs
@@ -443,11 +451,12 @@ fn add_autogen(
             .values()
             .filter(|file| file.kind == ScanKind::Module && file.moc)
         {
-            let moc = join(&plan.include_dir(configured), &file.moc_output);
+            let include_config = plan.multi.then_some(b"$<CONFIG>".as_slice());
+            let moc = join(&plan.include_dir(include_config), &file.moc_output);
             // The shared stamp runs moc for all configurations. Its byproducts
             // must list each path even though each source has a config condition.
             let shared_stamp = plan.cross && !plan.better;
-            if configured.is_some() && (shared_stamp || file.configs.len() < plan.configs.len()) {
+            if plan.multi && (shared_stamp || file.configs.len() < plan.configs.len()) {
                 for config in plan
                     .configs
                     .iter()
@@ -455,12 +464,18 @@ fn add_autogen(
                 {
                     let actual = join(&plan.include_dir(Some(&config.0)), &file.moc_output);
                     let source = in_config(config, &actual);
-                    add_source(model, plan, origin, source.clone(), false, true)?;
-                    mark_source(model, origin, actual.clone(), true);
+                    add_source(
+                        model,
+                        plan,
+                        origin,
+                        source.clone(),
+                        GeneratedSource::MocModule,
+                    )?;
+                    mark_source(model, origin, actual.clone(), GeneratedSource::MocModule);
                     generated.push(if shared_stamp { actual } else { source });
                 }
             } else {
-                add_source(model, plan, origin, moc.clone(), false, true)?;
+                add_source(model, plan, origin, moc.clone(), GeneratedSource::MocModule)?;
                 generated.push(moc);
             }
         }
@@ -477,7 +492,7 @@ fn add_autogen(
                 continue;
             };
             let header = concatenate(&[b"ui_", path.stem_extension(true).0, b".h"]);
-            let include = plan.include_dir(configured);
+            let include = plan.include_dir(plan.multi.then_some(b"$<CONFIG>"));
             let include = if relative == b"." {
                 include
             } else {
@@ -486,7 +501,7 @@ fn add_autogen(
             ui_byproducts.push(join(&include, &header));
         }
         for file in &ui_byproducts {
-            mark_configured(model, plan, origin, file, false);
+            mark_configured(model, plan, origin, file, GeneratedSource::Auxiliary);
         }
     }
 
@@ -503,7 +518,7 @@ fn add_autogen(
     let visual_studio = matches!(plan.generator, GeneratorKind::VisualStudio(_));
     if visual_studio && !global && order_files.is_empty() {
         if plan.use_stamp {
-            let stamp = attach_stamp(
+            attach_stamp(
                 model,
                 plan,
                 origin,
@@ -511,7 +526,6 @@ fn add_autogen(
                 tool_files,
                 generated.into_iter().chain(ui_byproducts).collect(),
             )?;
-            add_source(model, plan, origin, stamp, false, false)?;
         } else {
             driver.kind = CustomCommandKind::TargetEvent {
                 target: plan.id,
@@ -577,7 +591,13 @@ fn attach_stamp(
         stamp.clone(),
     ]);
     model.add_command(driver).map_err(model_error)?;
-    mark_configured(model, plan, origin, &stamp, false);
+    add_source(
+        model,
+        plan,
+        origin,
+        stamp.clone(),
+        GeneratedSource::Auxiliary,
+    )?;
     Ok(stamp)
 }
 
@@ -589,7 +609,13 @@ fn add_rcc(
     folder: &BString,
     global: bool,
 ) -> Result<Option<BString>, ResolveError> {
-    add_source(model, plan, origin, job.output.clone(), false, false)?;
+    add_source(
+        model,
+        plan,
+        origin,
+        job.output.clone(),
+        GeneratedSource::Resource,
+    )?;
     let info = job.info_path();
     let mut driver = command(model, origin, CustomCommandKind::Output);
     driver.command_lines = plan.tool_lines("cmake_autorcc", &info);
@@ -718,63 +744,6 @@ fn add_utility_dep(
     Ok(())
 }
 
-fn add_source(
-    model: &mut ProjectModel,
-    plan: &TargetPlan,
-    origin: &Target,
-    file: BString,
-    first: bool,
-    module: bool,
-) -> Result<(), ResolveError> {
-    mark_configured(model, plan, origin, &file, module);
-    let sources = &mut model
-        .target_mut(plan.id)
-        .ok_or_else(missing_origin)?
-        .sources;
-    let source = BT::new(file, origin.backtrace.clone());
-    if first {
-        sources.insert(0, source);
-    } else {
-        sources.push(source);
-    }
-    Ok(())
-}
-
-fn mark_configured(
-    model: &mut ProjectModel,
-    plan: &TargetPlan,
-    origin: &Target,
-    pattern: &BString,
-    module: bool,
-) {
-    if pattern.starts_with(b"$<$<CONFIG:") {
-        return;
-    }
-    if pattern.windows(9).any(|window| window == b"$<CONFIG>") {
-        for config in &plan.configs {
-            let file = BString::from(pattern.replace(b"$<CONFIG>", config.0.as_slice()));
-            mark_source(model, origin, file, module);
-        }
-    } else {
-        mark_source(model, origin, pattern.clone(), module);
-    }
-}
-
-fn mark_source(model: &mut ProjectModel, origin: &Target, path: BString, module: bool) {
-    model.mark_generated(origin.dir, path.clone());
-    let map = model
-        .dir_mut(origin.dir)
-        .source_props
-        .entry(path)
-        .or_default();
-    map.set("SKIP_AUTOGEN".into(), "ON".into());
-    map.set("SKIP_UNITY_BUILD_INCLUSION".into(), "ON".into());
-    if module {
-        map.set("CXX_SCAN_FOR_MODULES".into(), "ON".into());
-        map.set("SKIP_PRECOMPILE_HEADERS".into(), "ON".into());
-    }
-}
-
 fn add_include(
     model: &mut ProjectModel,
     plan: &TargetPlan,
@@ -791,7 +760,7 @@ fn add_include(
         },
         |value| truth::is_on(value),
     );
-    let include = plan.include_dir(plan.config_pattern());
+    let include = plan.include_dir(plan.multi.then_some(b"$<CONFIG>"));
     let entry = BT::new(include, origin.backtrace.clone());
     let target = model.target_mut(plan.id).ok_or_else(missing_origin)?;
     let entries = target
