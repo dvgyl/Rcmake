@@ -79,7 +79,18 @@ impl Record {
                 .unwrap_or_default();
             (hidden, inherits)
         };
-        let fields = reader.into_fields();
+        let mut fields = reader.into_fields();
+        if kind == PresetKind::Configure {
+            for key in [b"architecture".as_slice(), b"toolset"] {
+                if let Some(field) = fields.get_mut(key)
+                    && matches!(field.value.as_ref(), Value::String(_))
+                {
+                    let members = Fields::from([("value".into(), field.clone())]);
+                    field.value = Arc::new(Value::Object(BTreeMap::new()));
+                    field.members = Some(Arc::new(members));
+                }
+            }
+        }
         let record = Self {
             summary: PresetSummary {
                 kind,
@@ -538,6 +549,8 @@ fn merge_fields(child: &mut Fields, parent: &Fields, prefix: &str) -> Result<(),
                 b"environment"
                     | b"cacheVariables"
                     | b"variables"
+                    | b"architecture"
+                    | b"toolset"
                     | b"warnings"
                     | b"errors"
                     | b"debug"

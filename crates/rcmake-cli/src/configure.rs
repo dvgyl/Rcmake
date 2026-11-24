@@ -1,9 +1,9 @@
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use rcmake_base::{BString, truth::is_on};
-use rcmake_diag::{DiagAction, DiagCategory, DiagState};
-use rcmake_eval::{IncludeOptions, Interp, RunMode};
+use rcmake_diag::{DiagAction, DiagCategory, DiagState, Effect, MessageKind};
+use rcmake_eval::{BuiltinFn, CmdError, Cx, IncludeOptions, Interp, Registry, RunMode};
 use rcmake_host::{FileKind, Follow, Host, Stream, WriteMode, path};
 use rcmake_json::Value;
 use rcmake_model::{Cache, CacheType, GeneratorKind};
@@ -14,6 +14,45 @@ use crate::{apply_warning_flag, cache, emit_cli_error, new_interp, presets, reso
 const HOME_DIR: &[u8] = b"CMAKE_HOME_DIRECTORY";
 const GENERATOR: &[u8] = b"CMAKE_GENERATOR";
 const DIAG_INIT: &[u8] = b"CMAKE_DIAGNOSTIC_INIT";
+
+pub(crate) fn register(registry: &mut Registry) {
+    rcmake_commands::register_all(registry);
+    static PROJECT: OnceLock<BuiltinFn> = OnceLock::new();
+    if let Some((command, flags)) = registry.get(b"project") {
+        PROJECT.get_or_init(|| command);
+        registry.add(
+            "project",
+            |cx, args| {
+                validate_generator(cx)?;
+                PROJECT.get().ok_or(CmdError::Reported)?(cx, args)
+            },
+            flags,
+        );
+    }
+}
+
+fn validate_generator(cx: &mut Cx<'_>) -> Result<(), CmdError> {
+    let model = cx.project();
+    if let Some(kind) = model.generator.filter(|kind| !kind.is_ide()) {
+        let spec = &model.generator_spec;
+        if let Err(error) = rcmake_model::GeneratorSpec::parse(
+            kind,
+            &spec.toolset,
+            &spec.platform,
+            &spec.instance,
+            None,
+        ) {
+            cx.issue(
+                MessageKind::Error,
+                Effect::Fatal,
+                None,
+                error.to_string().into(),
+            );
+            return Err(CmdError::Reported);
+        }
+    }
+    Ok(())
+}
 
 pub(crate) fn run(argv: &[BString], mut opts: Options, host: Arc<dyn Host>) -> i32 {
     let (mut src, mut bin) = resolve_directories(host.as_ref(), &opts.directories);
@@ -322,9 +361,6 @@ pub(crate) fn run(argv: &[BString], mut opts: Options, host: Arc<dyn Host>) -> i
     ) {
         return 1;
     }
-    if let Some(list) = &opts.list_cache {
-        list_cache(host.as_ref(), &mut interp, list);
-    }
     if let Some(path) = &opts.profile_output {
         let elapsed = host.monotonic().saturating_sub(start);
         let profile = format!(
@@ -340,6 +376,9 @@ pub(crate) fn run(argv: &[BString], mut opts: Options, host: Arc<dyn Host>) -> i
         }
     }
     if result.exit_code != 0 || preloads.exit_code != 0 {
+        if let Some(list) = &opts.list_cache {
+            list_cache(host.as_ref(), &mut interp, list);
+        }
         return if result.exit_code == 0 {
             preloads.exit_code
         } else {
@@ -350,6 +389,16 @@ pub(crate) fn run(argv: &[BString], mut opts: Options, host: Arc<dyn Host>) -> i
         && !write_graphviz(host.as_ref(), graph, &mut interp)
     {
         return 1;
+    }
+    if opts.debug_output && show_status {
+        options::out(
+            host.as_ref(),
+            &format!(
+                "-- Generating {}\n   Called from: [1]\t{}\n",
+                bin.display(),
+                src.join("CMakeLists.txt").display()
+            ),
+        );
     }
     let start = host.monotonic();
     let generate_step = crate::InstrumentationStep::start(host.as_ref(), sample);
@@ -397,6 +446,9 @@ pub(crate) fn run(argv: &[BString], mut opts: Options, host: Arc<dyn Host>) -> i
             host.as_ref(),
             &format!("-- Build files have been written to: {}\n", bin.display()),
         );
+    }
+    if let Some(list) = &opts.list_cache {
+        list_cache(host.as_ref(), &mut interp, list);
     }
     0
 }
@@ -587,74 +639,57 @@ fn resolve_directories(
 ) -> (Option<PathBuf>, Option<PathBuf>) {
     let mut source = None;
     let mut binary = None;
-    let explicit_source = args
-        .iter()
-        .any(|arg| matches!(arg, DirectoryArg::Source(_)));
     let explicit_binary = args
         .iter()
         .any(|arg| matches!(arg, DirectoryArg::Binary(_)));
     let mut ignored = Vec::new();
-    for arg in args {
-        match arg {
-            DirectoryArg::Source(path) => {
-                if let Some(old) = source.replace(path.clone())
-                    && old != *path
-                {
-                    ignored.push(old);
-                }
-            }
-            DirectoryArg::Binary(path) => {
-                if let Some(old) = binary.replace(path.clone())
-                    && old != *path
-                {
-                    ignored.push(old);
-                }
-            }
-            DirectoryArg::Positional(pos) => {
+    for (index, arg) in args.iter().enumerate() {
+        let (slot, path, slash) = match arg {
+            DirectoryArg::Source(path) => (&mut source, path.as_path(), false),
+            DirectoryArg::Binary(path) => (&mut binary, path.as_path(), false),
+            DirectoryArg::Positional(pos, slash) => {
                 let path = match pos.file_name().and_then(|name| name.to_str()) {
                     Some("CMakeCache.txt" | "CMakeLists.txt") => pos.parent().unwrap_or(pos),
                     _ => pos,
                 };
-                if !explicit_binary
-                    && binary.is_none()
-                    && is_file(host, &path.join("CMakeCache.txt"))
-                {
-                    binary = Some(path.to_path_buf());
-                } else if explicit_source || is_file(host, &path.join("CMakeLists.txt")) {
-                    if !explicit_source && is_file(host, &path.join("CMakeLists.txt")) {
-                        if let Some(old) = source.replace(path.to_path_buf())
-                            && old != path
-                        {
-                            ignored.push(old);
-                        }
-                    } else if !explicit_binary
-                        && binary.is_none()
-                        && !is_file(host, &path.join("CMakeLists.txt"))
-                    {
-                        binary = Some(path.to_path_buf());
-                    } else {
-                        ignored.push(path.to_path_buf());
-                    }
-                } else if source.is_none() {
-                    source = Some(path.to_path_buf());
+                if is_file(host, &path.join("CMakeCache.txt")) && !explicit_binary {
+                    (&mut binary, path, *slash)
+                } else if is_file(host, &path.join("CMakeLists.txt")) || source.is_none() {
+                    (&mut source, path, *slash)
+                } else if !explicit_binary && binary.is_none() {
+                    (&mut binary, path, *slash)
                 } else {
-                    ignored.push(path.to_path_buf());
+                    ignored.push((index, path, *slash));
+                    continue;
                 }
             }
+        };
+        if let Some(old) = slot.replace((index, path, slash))
+            && old.1 != path
+        {
+            ignored.push(old);
         }
     }
-    for path in ignored {
-        if source.as_deref() != Some(&path) && binary.as_deref() != Some(&path) {
+    let source = source.map(|(_, path, _)| path);
+    let binary = binary.map(|(_, path, _)| path);
+    ignored.sort_by_key(|(index, _, _)| *index);
+    for (_, path, slash) in ignored {
+        if source != Some(path) && binary != Some(path) {
+            let suffix = if slash && path.parent().is_some() {
+                "/"
+            } else {
+                ""
+            };
             options::warn(
                 host,
                 &format!(
-                    "Ignoring extra path from command line:\n\n   \"{}\"",
+                    "Ignoring extra path from command line:\n\n   \"{}{suffix}\"",
                     path.display()
                 ),
             );
         }
     }
-    (source, binary)
+    (source.map(Path::to_path_buf), binary.map(Path::to_path_buf))
 }
 
 fn set_directory_vars(interp: &mut Interp, src: &Path, bin: &Path) {

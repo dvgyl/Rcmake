@@ -417,13 +417,17 @@ pub(crate) fn write_test_xml(
         let raw_output = output(test, status, record);
         let mut contents = Vec::new();
         let mut details = None;
+        let cwd = test
+            .directory
+            .join(path::to_native(test.property(b"WORKING_DIRECTORY")));
+        let scratch = dashboard.directory.join("Testing/Temporary");
         for line in raw_output.split_inclusive(|&byte| byte == b'\n') {
             let text = line.trim_ascii();
             if let Some(label) = element_value(text, b"<CTestLabel>", b"</CTestLabel>") {
                 labels.insert(BString::from(label));
             } else if let Some(value) = element_value(text, b"<CTestDetails>", b"</CTestDetails>") {
                 details = Some(String::from_utf8_lossy(value));
-            } else {
+            } else if !crate::measurements::write(host, &scratch, &cwd, &mut xml, text) {
                 contents.extend_from_slice(line);
             }
         }

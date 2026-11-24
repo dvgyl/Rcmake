@@ -3,16 +3,22 @@
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use rcmake_base::list;
-use rcmake_host::{Host, HostResult, WriteMode};
+use rcmake_host::{Host, HostError, HostResult, WriteMode};
 
 use crate::dart::Configuration;
 use crate::execution::{SkipReason, Status};
 use crate::reporting::{TestRecord, format_date, labels};
 use crate::selection::{Plan, PlannedTest};
+
+pub(crate) struct WriteError {
+    pub(crate) temporary: PathBuf,
+    pub(crate) source: HostError,
+}
 
 pub(crate) fn write(
     host: &dyn Host,
@@ -22,7 +28,7 @@ pub(crate) fn write(
     statuses: &[Option<Status>],
     records: &BTreeMap<usize, TestRecord>,
     elapsed: Duration,
-) -> HostResult<()> {
+) -> Result<(), WriteError> {
     let tests = statuses.iter().flatten().count();
     let count = |matches: fn(Status) -> bool| {
         statuses
@@ -58,7 +64,31 @@ pub(crate) fn write(
         }
     }
     xml.push_str("</testsuite>\n");
-    write_file(host, file, xml.as_bytes())
+    write_report_file(host, file, xml.as_bytes())
+}
+
+fn write_report_file(host: &dyn Host, file: &Path, data: &[u8]) -> Result<(), WriteError> {
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    let id = SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let mut temporary = file.as_os_str().to_os_string();
+    temporary.push(format!(".tmp{}-{id}", std::process::id()));
+    let temporary = PathBuf::from(temporary);
+    if let Some(parent) = file.parent() {
+        host.create_dir_all(parent).map_err(|source| WriteError {
+            temporary: temporary.clone(),
+            source,
+        })?;
+    }
+    host.write(&temporary, data, WriteMode::CreateNew)
+        .map_err(|source| WriteError {
+            temporary: temporary.clone(),
+            source,
+        })?;
+    if let Err(source) = host.rename(&temporary, file) {
+        let _ = host.remove_file(&temporary);
+        return Err(WriteError { temporary, source });
+    }
+    Ok(())
 }
 
 fn testcase(xml: &mut String, test: &PlannedTest, status: Status, record: &TestRecord) {

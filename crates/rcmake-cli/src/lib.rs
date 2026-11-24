@@ -205,6 +205,15 @@ fn run_cmake(argv: &[BString], rest: &[BString], host: Arc<dyn Host>) -> i32 {
         if let [command, args @ ..] = sub_args {
             match command.as_slice() {
                 b"cmake_llvm_rc" => return resource::run(args, host.as_ref()),
+                b"__instrument" => {
+                    return match rcmake_instrument::launcher::run_launcher(host.as_ref(), args) {
+                        Ok(code) => code,
+                        Err(err) => {
+                            emit_cli_error(host.as_ref(), err.to_string());
+                            1
+                        }
+                    };
+                }
                 b"server" => {
                     emit_cli_error(
                         host.as_ref(),
@@ -465,9 +474,12 @@ fn new_interp(argv: &[BString], opts: &Options, mode: RunMode, host: Arc<dyn Hos
         defines: Vec::new(),
         script_args: argv.to_vec(),
     };
-    let mut interp = Interp::new(cfg, rcmake_commands::register_all);
+    let mut interp = Interp::new(cfg, configure::register);
     if opts.debug_trycompile {
         interp.cx().set_var(b"CMAKE_DEBUG_TRY_COMPILE", "ON".into());
+    }
+    if opts.debug_find {
+        interp.cx().set_var(b"CMAKE_FIND_DEBUG_MODE", "ON".into());
     }
     interp.set_log_level(opts.log_level);
     interp.set_log_context(opts.log_context);

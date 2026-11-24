@@ -4,6 +4,8 @@
 
 mod archive;
 mod binary;
+mod co_compile;
+mod definition;
 mod depfile;
 mod dyndep;
 mod files;
@@ -56,6 +58,8 @@ pub fn run(args: &[BString], cx: &ToolCtx<'_>) -> i32 {
             0
         }
         b"capabilities" => error(cx, &[b"-E capabilities accepts no additional arguments\n"]),
+        b"__run_co_compile" => co_compile::run(args, cx),
+        b"__create_def" => definition::run(args, cx),
         b"cat" => binary::cat(args, cx),
         b"bin2c" => binary::bin2c(args, cx),
         b"make_directory" => files::make_directory(args, cx),

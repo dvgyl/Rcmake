@@ -22,6 +22,17 @@ pub(crate) fn execute(
     capture: bool,
     timeout: Option<Duration>,
 ) -> Result<RunOutput, InstrumentError> {
+    let request = request(host, cwd, command, capture, timeout)?;
+    Ok(host.run(&request, &mut |stream, bytes| host.write_out(stream, bytes))?)
+}
+
+fn request(
+    host: &dyn Host,
+    cwd: PathBuf,
+    command: &[BString],
+    capture: bool,
+    timeout: Option<Duration>,
+) -> Result<RunRequest, InstrumentError> {
     let Some((program, args)) = command.split_first() else {
         return Err(invalid("The instrumentation command is missing."));
     };
@@ -30,7 +41,7 @@ pub(crate) fn execute(
     } else {
         Output::Inherit
     };
-    let request = RunRequest {
+    Ok(RunRequest {
         pipeline: vec![CommandSpec {
             program: program.clone(),
             args: args.to_vec(),
@@ -42,11 +53,12 @@ pub(crate) fn execute(
         stderr: output,
         timeout,
         tee: capture,
-    };
-    Ok(host.run(&request, &mut |stream, bytes| host.write_out(stream, bytes))?)
+    })
 }
 
-pub(crate) fn command_line(command: &[BString]) -> BString {
+/// Format arguments for the command field of an instrumentation snippet.
+#[must_use]
+pub fn command_line(command: &[BString]) -> BString {
     let mut line = BString::default();
     for (index, arg) in command.iter().enumerate() {
         if index > 0 {
@@ -231,7 +243,23 @@ fn run(
         .and_then(|file| host.metadata(file, Follow::Yes).ok().map(|meta| meta.mtime));
     let time_start = epoch_millis(host);
     let start = host.monotonic();
-    let output = execute(host, cwd.to_path_buf(), command, capture, None)?;
+    let collect_metrics = enabled(InstrumentOption::ProcessMetrics)
+        && matches!(
+            role,
+            SnippetRole::Compile
+                | SnippetRole::Link
+                | SnippetRole::Custom
+                | SnippetRole::Install
+                | SnippetRole::Test
+        );
+    let request = request(host, cwd.to_path_buf(), command, capture, None)?;
+    let (output, metrics) = crate::metrics::run(
+        host,
+        &request,
+        &data,
+        collect_metrics,
+        &mut |stream, bytes| host.write_out(stream, bytes),
+    )?;
     let duration =
         u64::try_from(host.monotonic().saturating_sub(start).as_millis()).unwrap_or(u64::MAX);
     let dynamic = before.map(|before| (before, SystemSample::collect(host)));
@@ -287,16 +315,7 @@ fn run(
             output_base: Some(build_dir.to_path_buf()),
             interrupt_signal,
             dynamic,
-            process_metrics: (enabled(InstrumentOption::ProcessMetrics)
-                && matches!(
-                    role,
-                    SnippetRole::Compile
-                        | SnippetRole::Link
-                        | SnippetRole::Custom
-                        | SnippetRole::Install
-                        | SnippetRole::Test
-                ))
-            .then_some(None),
+            process_metrics: collect_metrics.then_some(metrics),
             cmake_content,
             trace_file: (role == SnippetRole::Compile && enabled(InstrumentOption::CompileTrace))
                 .then_some(saved_trace),
@@ -389,7 +408,8 @@ pub fn run_launcher(host: &dyn Host, argv: &[BString]) -> Result<i32, Instrument
             b"--source" => metadata.source = Some(value.clone()),
             b"--language" => metadata.language = Some(value.clone()),
             b"--test-name" => metadata.test_name = Some(value.clone()),
-            b"--output" => metadata.outputs = comma_list(value),
+            b"--output" => metadata.outputs.extend(comma_list(value)),
+            b"--output-path" => metadata.outputs.push(value.clone()),
             b"--output-as-file-name" => {
                 let file = absolute(host, &path::to_native(value));
                 metadata.outputs = comma_list(&read_bytes(host, &file)?);

@@ -18,7 +18,7 @@ pub(crate) enum CacheEdit {
 pub(crate) enum DirectoryArg {
     Source(PathBuf),
     Binary(PathBuf),
-    Positional(PathBuf),
+    Positional(PathBuf, bool),
 }
 
 #[derive(Default)]
@@ -32,6 +32,8 @@ pub(crate) struct Options {
     pub log_level: Option<LogLevel>,
     pub log_context: bool,
     pub debug_trycompile: bool,
+    pub debug_output: bool,
+    pub debug_find: bool,
     pub sarif: Option<PathBuf>,
     pub script: Option<PathBuf>,
     pub preset: Option<BString>,
@@ -231,7 +233,10 @@ fn parse_args(args: &[BString], host: &dyn Host) -> Result<Option<Options>, Stri
                 b"--check-system-vars" => {
                     out(host, "Find problems with variable usage in system files.\n")
                 }
-                b"--debug-output" => out(host, "Running with debug output on.\n"),
+                b"--debug-output" => {
+                    out(host, "Running with debug output on.\n");
+                    opts.debug_output = true;
+                }
                 b"--debug-trycompile" => {
                     out(host, "debug trycompile on\n");
                     opts.debug_trycompile = true;
@@ -239,13 +244,9 @@ fn parse_args(args: &[BString], host: &dyn Host) -> Result<Option<Options>, Stri
                 b"--debug-find" => {
                     out(
                         host,
-                        "Running with debug output on for the 'find' commands.\n",
+                        "Running with debug output on for the `find` commands.\n",
                     );
-                    opts.cache_edits.push(CacheEdit::Define(CacheDefine {
-                        name: "CMAKE_FIND_DEBUG_MODE".into(),
-                        ty: Some(CacheType::Bool),
-                        value: "ON".into(),
-                    }));
+                    opts.debug_find = true;
                 }
                 b"--debug-find-pkg" | b"--debug-find-var" => {
                     let list = value!("No names specified for debug find");
@@ -350,8 +351,10 @@ fn parse_args(args: &[BString], host: &dyn Host) -> Result<Option<Options>, Stri
             continue;
         }
         if !arg.starts_with(b"-") {
-            opts.directories
-                .push(DirectoryArg::Positional(resolve_cli_path(host, arg)));
+            opts.directories.push(DirectoryArg::Positional(
+                resolve_cli_path(host, arg),
+                arg.ends_with(b"/"),
+            ));
             continue;
         }
         match arg {
@@ -409,6 +412,12 @@ fn parse_args(args: &[BString], host: &dyn Host) -> Result<Option<Options>, Stri
                                 )
                             })?,
                         );
+                        if flag == b"-H" {
+                            host.write_out(
+                                Stream::Stderr,
+                                b"The -H option is deprecated.  Use -S instead.\n",
+                            );
+                        }
                         opts.directories.push(if is_build {
                             DirectoryArg::Binary(path)
                         } else {

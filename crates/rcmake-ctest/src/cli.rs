@@ -43,6 +43,7 @@ pub(crate) struct Script {
 #[derive(Debug, Default)]
 pub(crate) struct Invocation {
     pub(crate) options: CtestOptions,
+    pub(crate) command: Vec<BString>,
     pub(crate) selection: SelectionOptions,
     pub(crate) execution: TestExecution,
     pub(crate) output: TestOutput,

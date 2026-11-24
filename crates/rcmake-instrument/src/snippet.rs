@@ -6,7 +6,9 @@ use rcmake_base::{BString, list, truth};
 use rcmake_host::{Follow, Host, path};
 use rcmake_json::{ReadOptions, Value, parse};
 
-use crate::files::{absolute, api_dir, command_hash, newest_content, publish_at, timestamp};
+use crate::files::{
+    absolute, api_dir, command_hash, newest_content, publish_at, read_json, timestamp,
+};
 use crate::system::{dynamic_information, static_information};
 use crate::{
     CustomContent, CustomContentType, DATA_VERSION, IndexFile, InstrumentError, Object, Snippet,
@@ -267,12 +269,19 @@ pub fn write_content(
     if include_static {
         value.insert("staticSystemInformation".into(), static_information(host));
     }
-    let dir = api_dir(&absolute(host, build_dir)).join("data/content");
+    let data = api_dir(&absolute(host, build_dir)).join("data");
+    let value = Value::Object(value);
+    if let Some(previous) = newest_content(host, &data)? {
+        let previous = data.join(path::to_native(&previous));
+        if read_json(host, &previous).is_ok_and(|old| old == value) {
+            return Ok(previous);
+        }
+    }
     publish_at(
         host,
-        &dir,
+        &data.join("content"),
         &format!("cmake-{}", timestamp(host)),
-        &Value::Object(value),
+        &value,
     )
 }
 

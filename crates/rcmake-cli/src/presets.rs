@@ -337,7 +337,10 @@ pub(crate) fn apply(host: &dyn Host, src: &Path, opts: &mut Options) -> Result<A
         .map_err(|err| {
             let reason = if err.message.starts_with("No such configure preset") {
                 Some("No such configure preset")
-            } else if err.message.starts_with("Cannot use hidden preset") {
+            } else if err
+                .message
+                .starts_with("Cannot use hidden configure preset")
+            {
                 Some("Cannot use hidden configure preset")
             } else if err.message.contains("disabled")
                 || err.message.contains("condition evaluates to false")
@@ -354,13 +357,11 @@ pub(crate) fn apply(host: &dyn Host, src: &Path, opts: &mut Options) -> Result<A
                     &env,
                     Listing::available(PresetKind::Configure),
                 );
-            } else if err.message.contains("unsupported vendor macro") {
-                emit_cli_error(
-                    host,
-                    format!(
-                        "Could not evaluate configure preset \"{name}\": Invalid macro expansion"
-                    ),
-                );
+            } else if err
+                .message
+                .starts_with("Could not evaluate configure preset ")
+            {
+                emit_cli_error(host, err.message);
             } else {
                 let msg = if err.message.starts_with("Could not read presets from ") {
                     err.message
@@ -481,23 +482,13 @@ pub(crate) fn apply(host: &dyn Host, src: &Path, opts: &mut Options) -> Result<A
     }
     if let Some(debug) = &settings.debug {
         if debug.output == Some(true) {
-            options::out(host, "Running with debug output on.\n");
+            opts.debug_output = true;
         }
         if debug.try_compile == Some(true) {
-            if !opts.debug_trycompile {
-                options::out(host, "debug trycompile on\n");
-            }
             opts.debug_trycompile = true;
         }
         if debug.find == Some(true) {
-            opts.cache_edits.insert(
-                0,
-                CacheEdit::Define(CacheDefine {
-                    name: "CMAKE_FIND_DEBUG_MODE".into(),
-                    ty: Some(CacheType::Bool),
-                    value: "ON".into(),
-                }),
-            );
+            opts.debug_find = true;
         }
     }
     if let Some(trace) = &settings.trace

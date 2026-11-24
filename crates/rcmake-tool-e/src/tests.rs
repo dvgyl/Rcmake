@@ -422,11 +422,25 @@ fn checksums_cover_full_and_partial_chunks() -> HostResult<()> {
 }
 
 #[test]
-fn env_prints_sorted_values_and_modifies_a_local_snapshot() {
+fn env_prints_sorted_values_and_modifies_a_local_snapshot() -> HostResult<()> {
     let f = Fixture::new();
     f.host.env_set(b"Z", Some(b"original"));
     f.host.env_set(b"A", Some(b"keep"));
     assert_eq!(f.run(&["environment"]), 0);
+    f.host.set_command_handler(|_, request, _| {
+        assert_eq!(
+            request.env,
+            [
+                ("X".into(), "here".into()),
+                ("Y".into(), "y".into()),
+                ("Z".into(), "pre-original;last".into()),
+            ]
+        );
+        Ok(RunOutput {
+            results: vec![ProcessResult::Exited(0)],
+            ..RunOutput::default()
+        })
+    })?;
     assert_eq!(
         f.run(&[
             "env",
@@ -442,17 +456,18 @@ fn env_prints_sorted_values_and_modifies_a_local_snapshot() {
             "Y=set:y",
             "--modify",
             "X=string_append:here",
+            "check-env",
         ]),
         0
     );
-    assert_eq!(
-        f.out(),
-        b"A=keep\nZ=original\nX=here\nY=y\nZ=pre-original;last\n"
-    );
+    assert_eq!(f.out(), b"A=keep\nZ=original\n");
+    assert_eq!(f.run(&["env", "Z=changed"]), 1);
+    assert_eq!(f.err(), b"cmake -E env: no command given\n");
     assert_eq!(f.host.env_get(b"A"), Some(BString::from("keep")));
     assert_eq!(f.host.env_get(b"Z"), Some(BString::from("original")));
     assert_eq!(f.run(&["env", "--modify", "X=wrong:foo"]), 1);
-    assert_eq!(f.err(), b"CMake Error: Error: Unrecognized environment manipulation argument: wrong\n\ncmake -E env: invalid parameter to --modify: X=wrong:foo\n");
+    assert_eq!(f.err(), b"cmake -E env: no command given\nCMake Error: Error: Unrecognized environment manipulation argument: wrong\n\ncmake -E env: invalid parameter to --modify: X=wrong:foo\n");
+    Ok(())
 }
 
 #[test]

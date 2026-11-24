@@ -157,10 +157,10 @@ impl<'a> Report<'a> {
                 ""
             };
             self.write(format_args!(
-                "  Test #{:>width$}: {}{disabled}\n",
-                test.number,
+                "  Test {:>width$}: {}{disabled}\n",
+                format!("#{}", test.number),
                 test.name,
-                width = self.number_width
+                width = self.number_width + 1
             ));
         }
         self.write(format_args!("\nTotal Tests: {}\n", self.total));

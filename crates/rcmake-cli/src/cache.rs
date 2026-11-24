@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use rcmake_base::BString;
 use rcmake_eval::CacheDefine;
-use rcmake_host::{FileKind, Follow, Host, HostResult, ReadRange, WriteMode};
+use rcmake_host::{FileKind, Follow, Host, HostResult, ReadRange, Stream, WriteMode};
 use rcmake_model::{Cache, CacheEntry, CacheType};
 
 const MAX_CACHE_BYTES: u64 = 64 * 1024 * 1024;
@@ -37,7 +37,7 @@ pub(crate) fn load(host: &dyn Host, dir: &Path) -> HostResult<Cache> {
     let mut advanced = Vec::new();
     let mut strings = BTreeMap::new();
     let mut help = BString::default();
-    for line in data.split(|b| *b == b'\n') {
+    for (index, line) in data.split(|b| *b == b'\n').enumerate() {
         let line = line.strip_suffix(b"\r").unwrap_or(line);
         if let Some(comment) = line.strip_prefix(b"//") {
             if !help.is_empty() {
@@ -48,6 +48,16 @@ pub(crate) fn load(host: &dyn Host, dir: &Path) -> HostResult<Cache> {
         }
         let description = std::mem::take(&mut help);
         let Some((name, ty, value)) = parse_entry(line) else {
+            if !line.starts_with(b"#") && (!line.trim_ascii().is_empty() || !description.is_empty())
+            {
+                host.write_out(
+                    Stream::Stderr,
+                    format!(
+                        "CMake Error: Parse error in cache file {} on line {}. Offending entry: {}\n",
+                        path.display(), index + 1, String::from_utf8_lossy(line)
+                    ).as_bytes(),
+                );
+            }
             continue;
         };
         if ty == CacheType::Internal {

@@ -357,7 +357,9 @@ fn dispatch(
             Some(Jobs::Count(count)) => BuildJobs::Count(count),
         },
         clean_first: opts.clean_first,
-        verbose: opts.verbose,
+        verbose: opts.verbose
+            || matches!(kind, GeneratorKind::Ninja | GeneratorKind::NinjaMultiConfig)
+                && rcmake_base::truth::is_on(&cached(b"CMAKE_VERBOSE_MAKEFILE")),
         native_args: &opts.native,
         platform: &platform,
     };

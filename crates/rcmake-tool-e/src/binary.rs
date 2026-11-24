@@ -3,7 +3,7 @@ use std::io::ErrorKind;
 use std::path::PathBuf;
 
 use rcmake_base::{BString, Limits};
-use rcmake_host::{FileKind, Follow, HostResult, ReadRange, Stream, WriteMode};
+use rcmake_host::{FileKind, Follow, HostError, HostResult, ReadRange, Stream, WriteMode};
 
 use super::{ToolCtx, error, is_dir, path, read_all, split_once};
 
@@ -11,6 +11,12 @@ const CHUNK: u64 = 64 * 1024;
 const STDIO: &[u8] = b"-";
 
 pub(super) fn cat(args: &[BString], cx: &ToolCtx<'_>) -> i32 {
+    let stdin = BString::from(STDIO);
+    let args = if args.is_empty() {
+        std::slice::from_ref(&stdin)
+    } else {
+        args
+    };
     let mut options = true;
     let mut status = 0;
     for arg in args {
@@ -56,21 +62,12 @@ fn stream_file(arg: &[u8], cx: &ToolCtx<'_>) -> Result<(), String> {
     if arg.is_empty() {
         return Err("no such file or directory".to_owned());
     }
-    let metadata = cx.host.metadata(&path, Follow::Yes).map_err(|err| {
-        if err.kind == ErrorKind::NotFound {
-            "no such file or directory".to_owned()
-        } else {
-            err.os_message
-        }
-    })?;
+    let metadata = cx.host.metadata(&path, Follow::Yes).map_err(file_error)?;
     if metadata.kind == FileKind::Dir {
         return Err("is a directory".to_owned());
     }
     if metadata.kind != FileKind::File || metadata.len == 0 {
-        let data = cx
-            .host
-            .read(&path, read_all())
-            .map_err(|err| err.os_message)?;
+        let data = cx.host.read(&path, read_all()).map_err(file_error)?;
         cx.host.write_out(Stream::Stdout, &data);
         return Ok(());
     }
@@ -80,7 +77,7 @@ fn stream_file(arg: &[u8], cx: &ToolCtx<'_>) -> Result<(), String> {
             offset,
             len: Some(CHUNK.min(metadata.len - offset)),
         };
-        let data = cx.host.read(&path, range).map_err(|err| err.os_message)?;
+        let data = cx.host.read(&path, range).map_err(file_error)?;
         if data.is_empty() {
             break;
         }
@@ -88,6 +85,14 @@ fn stream_file(arg: &[u8], cx: &ToolCtx<'_>) -> Result<(), String> {
         offset += data.len() as u64;
     }
     Ok(())
+}
+
+fn file_error(err: HostError) -> String {
+    match err.kind {
+        ErrorKind::NotFound => "no such file or directory".to_owned(),
+        ErrorKind::PermissionDenied => "permission denied".to_owned(),
+        _ => err.os_message,
+    }
 }
 
 const BIN2C_USAGE: &[u8] =

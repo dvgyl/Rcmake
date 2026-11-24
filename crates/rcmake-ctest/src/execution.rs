@@ -208,15 +208,29 @@ fn join(left: &[u8], separator: &[u8], right: &[u8]) -> BString {
     [left, separator, right].concat().into()
 }
 
-pub(crate) fn execute(host: &dyn Host, test: &PlannedTest, request: &RunRequest) -> ResultLine {
+pub(crate) fn execute(
+    host: &dyn Host,
+    test: &PlannedTest,
+    request: &RunRequest,
+    instrument: Option<&crate::instrumentation::Recorder<'_>>,
+) -> ResultLine {
     if test.command.program == "NOT_AVAILABLE" {
         return ResultLine::not_run("The test is unavailable in this configuration.");
     }
+    let sample = instrument.map(crate::instrumentation::Recorder::start_test);
     let started = host.monotonic();
-    let run = host.run(request, &mut |_, _| {});
+    let run = if let Some(instrument) = instrument {
+        instrument.run_test(request)
+    } else {
+        host.run(request, &mut |_, _| {})
+            .map(|output| (output, None))
+    };
     let elapsed = host.monotonic().saturating_sub(started);
     let mut result = match run {
-        Ok(run) => {
+        Ok((run, metrics)) => {
+            if let Some((instrument, sample)) = instrument.zip(sample) {
+                instrument.test(test, request, (&run, metrics), sample, elapsed);
+            }
             let mut output = run.stdout;
             output.extend(run.stderr);
             let mut result = match run.results.first() {

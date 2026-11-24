@@ -65,8 +65,7 @@ pub(super) fn env(args: &[BString], cx: &ToolCtx<'_>) -> i32 {
     if let Some((program, args)) = args.as_slice().split_first() {
         return run_child(program, args, cx.cwd, env.into_iter().collect(), false, cx);
     }
-    print_environment(env, cx);
-    0
+    error(cx, &[b"cmake -E env: no command given\n"])
 }
 
 fn modify(env: &mut Environment, original: &Environment, change: &[u8]) -> Result<(), Vec<u8>> {

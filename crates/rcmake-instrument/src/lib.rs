@@ -23,6 +23,7 @@ mod system;
 
 pub mod hooks;
 pub mod launcher;
+pub mod metrics;
 pub mod query;
 pub mod snippet;
 pub mod trace;

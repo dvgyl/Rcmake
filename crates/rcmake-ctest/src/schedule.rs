@@ -398,10 +398,10 @@ fn run_attempts(
     host: &dyn Host,
     test: &PlannedTest,
     mut request: RunRequest,
-    id: usize,
+    instrument: Option<&crate::instrumentation::Recorder<'_>>,
     repeat: Option<TestRepeat>,
     deadline: Option<Duration>,
-    send: &mpsc::SyncSender<Attempt>,
+    send: impl Fn(ResultLine, bool) -> bool,
 ) {
     let count = repeat.map_or(1, |repeat| repeat.count);
     let timeout = request.timeout;
@@ -409,7 +409,7 @@ fn run_attempts(
         request.timeout = remaining_time(host, deadline)
             .map(|remaining| remaining.min(timeout.unwrap_or(Duration::MAX)))
             .or(timeout);
-        let result = execution::execute(host, test, &request);
+        let result = execution::execute(host, test, &request, instrument);
         let again = attempt < count
             && !matches!(
                 result.status,
@@ -423,7 +423,7 @@ fn run_attempts(
                     result.status == Status::Timeout,
                 )
             });
-        if send.send(Attempt { id, result, again }).is_err() || !again {
+        if !send(result, again) || !again {
             break;
         }
     }
@@ -635,6 +635,8 @@ pub(crate) fn run(
     let mut load = 0;
     let mut runs = vec![0; plan.tests.len()];
 
+    let instrument = crate::instrumentation::Recorder::open(host, dir, options.config.as_ref())?;
+    let instrument = instrument.as_ref();
     thread::scope(|scope| -> Result<(), CtestError> {
         let (send, receive) = mpsc::sync_channel::<Attempt>(jobs.min(64));
         let mut budget = None;
@@ -689,10 +691,12 @@ pub(crate) fn run(
                                             host,
                                             test,
                                             worker_request,
-                                            id,
+                                            instrument,
                                             repeat,
                                             deadline,
-                                            &send,
+                                            |result, again| {
+                                                send.send(Attempt { id, result, again }).is_ok()
+                                            },
                                         );
                                     }));
                                 if result.is_err() {

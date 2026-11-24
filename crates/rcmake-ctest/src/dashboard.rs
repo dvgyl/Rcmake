@@ -115,9 +115,14 @@ pub(crate) fn run(host: &dyn Host, invocation: &Invocation) -> Result<Option<i32
                 message
             }
         })?;
-        let preset = presets
-            .resolve(PresetKind::Configure, name, &EnvSnapshot::from_host(host))
-            .map_err(|error| error.message)?;
+        let preset =
+            match presets.resolve(PresetKind::Configure, name, &EnvSnapshot::from_host(host)) {
+                Ok(preset) => preset,
+                Err(error) => {
+                    host.write_out(Stream::Stderr, format!("{}\n", error.message).as_bytes());
+                    return Ok(Some(1));
+                }
+            };
         if invocation.build_dir.is_none()
             && config.build_directory.is_empty()
             && let Some(dir) = preset.binary_dir

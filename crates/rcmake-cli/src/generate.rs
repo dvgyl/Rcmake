@@ -20,6 +20,7 @@ use rcmake_resolve::{
 };
 
 mod file_generate;
+mod instrument;
 
 pub(crate) fn run(
     interp: &mut Interp,
@@ -72,11 +73,14 @@ pub(crate) fn run(
             resolved
         }
     };
-    let result = match resolved {
+    let mut result = match resolved {
         Ok(result) => result,
         Err(ResolveError::Unimplemented(_)) => return Ok(false),
         Err(err) => return Err(err.to_string()),
     };
+    if !queries.is_empty() && !kind.is_ide() {
+        instrument::wrap_custom_commands(&mut result, interp.cx().project(), host, bin);
+    }
     // An IDE generator writes its project files first, so that a generator that is not
     // implemented yet leaves no partial output.
     let ide_result = match kind {

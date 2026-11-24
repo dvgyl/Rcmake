@@ -93,14 +93,8 @@ pub struct GeneratorSelection {
 }
 
 fn selection(field: &Field, expand: &mut Expand<'_>) -> Result<GeneratorSelection, PresetsError> {
-    if let Value::String(value) = field.value.as_ref() {
-        return Ok(GeneratorSelection {
-            value: Some(value.clone()),
-            strategy: None,
-        });
-    }
     let mut reader = Reader::object(field, "preset")?;
-    let value = reader.optional("value", 1, 13, expand)?;
+    let value = reader.optional("value", 1, 13, &mut schema::literal)?;
     let strategy = reader
         .take("strategy", 1, 13)?
         .map(|field| Strategy::decode(&field, expand).map_err(|_| field.invalid("Invalid preset")))

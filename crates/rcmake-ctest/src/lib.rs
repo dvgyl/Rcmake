@@ -19,7 +19,9 @@ mod dashboard;
 mod discover;
 mod discovery;
 mod execution;
+mod instrumentation;
 mod junit;
+mod measurements;
 mod reporting;
 mod schedule;
 mod script;
@@ -154,8 +156,10 @@ pub fn run(host: Arc<dyn Host>, options: &CtestOptions) -> Result<CtestOutcome, 
 /// Return the exit code for this CTest invocation or its launcher command.
 pub fn main(argv: &[BString], host: Arc<dyn Host>) -> i32 {
     let args = argv.get(1..).unwrap_or_default();
-    match cli::parse(args, host.as_ref()).and_then(|invocation| dispatch(&host, &invocation, args))
-    {
+    match cli::parse(args, host.as_ref()).and_then(|mut invocation| {
+        invocation.command = argv.to_vec();
+        dispatch(&host, &invocation, args)
+    }) {
         Ok(code) => code,
         Err(error) => {
             let prefix = if error.starts_with("Unknown value for CTEST_NO_TESTS_ACTION:") {
@@ -405,7 +409,23 @@ fn run_tests_with_dashboard(
     let dir = host.initial_cwd().join(&options.test_dir);
     let normalized = rcmake_base::path_lex::Lexical::new(&path::from_native(&dir)).normalize();
     let dir: PathBuf = path::to_native(&normalized).components().collect();
-    let mut tests = discovery::load(Arc::clone(&host), &dir, options.config.as_ref())?;
+    let show_project = dashboard
+        .as_ref()
+        .is_none_or(|dashboard| dashboard.show_project);
+    let json_only = matches!(
+        invocation.execution.show_only,
+        Some(ShowOnly::JsonV1 | ShowOnly::JsonV1Raw)
+    );
+    let mut tests = match discovery::load(Arc::clone(&host), &dir, options.config.as_ref()) {
+        Err(error @ CtestError::Load(_)) if show_project && !json_only && !options.quiet => {
+            host.write_out(
+                Stream::Stdout,
+                format!("Test project {}\n", dir.display()).as_bytes(),
+            );
+            return Err(error);
+        }
+        result => result?,
+    };
     if let Some(args) = &invocation.execution.test_passthrough_arguments {
         for test in &mut tests {
             test.command.args.extend_from_slice(args);
@@ -448,17 +468,30 @@ fn run_tests_with_dashboard(
         &plan,
         write_dashboard || junit.is_some(),
     )?;
+    let instrument = instrumentation::Recorder::open(host.as_ref(), &dir, options.config.as_ref())?;
+    let run_sample = instrument
+        .as_ref()
+        .map(instrumentation::Recorder::start_test);
+    let run_start = host.monotonic();
     let show_only = invocation.execution.show_only;
     if let Some(format @ (ShowOnly::JsonV1 | ShowOnly::JsonV1Raw)) = show_only {
         if !options.quiet {
             reporting::show_json(host.as_ref(), &plan, options, format == ShowOnly::JsonV1Raw);
         }
+        if let Some((instrument, sample)) = instrument.as_ref().zip(run_sample)
+            && !invocation.command.is_empty()
+        {
+            instrument.ctest(
+                &invocation.command,
+                sample,
+                host.monotonic().saturating_sub(run_start),
+                0,
+                true,
+            );
+        }
         return Ok(TestRunOutcome::default());
     }
-    if dashboard
-        .as_ref()
-        .is_none_or(|dashboard| dashboard.show_project)
-    {
+    if show_project {
         report.project(&dir);
     }
     if invocation.print_labels {
@@ -469,6 +502,17 @@ fn run_tests_with_dashboard(
     }
     if options.show_only {
         report.list(&plan);
+        if let Some((instrument, sample)) = instrument.as_ref().zip(run_sample)
+            && !invocation.command.is_empty()
+        {
+            instrument.ctest(
+                &invocation.command,
+                sample,
+                host.monotonic().saturating_sub(run_start),
+                0,
+                true,
+            );
+        }
         return Ok(TestRunOutcome::default());
     }
 
@@ -584,18 +628,11 @@ fn run_tests_with_dashboard(
         deadline,
         coverage_tool,
     )?;
-    if let Err(error) =
-        rcmake_instrument::hooks::run_hook(host.as_ref(), &dir, rcmake_instrument::Hook::PostCTest)
-    {
-        host.write_out(
-            Stream::Stderr,
-            format!("CTest instrumentation error: {error}\n").as_bytes(),
-        );
-    }
     let elapsed = host.monotonic().saturating_sub(started);
     report.summary(&plan, &results, elapsed, &dir, write_dashboard);
     run_custom_commands(host.as_ref(), &dir, custom.after, options.quiet)?;
     let records = report.records();
+    let mut junit_failed = false;
     if let Some(file) = junit {
         let file = dir.join(path::to_native(file));
         let configuration;
@@ -613,7 +650,7 @@ fn run_tests_with_dashboard(
             })?;
             &configuration
         };
-        junit::write(
+        if let Err(error) = junit::write(
             host.as_ref(),
             &file,
             config,
@@ -621,8 +658,26 @@ fn run_tests_with_dashboard(
             &results,
             &records,
             elapsed,
-        )
-        .map_err(|source| CtestError::Access { path: file, source })?;
+        ) {
+            let message = if matches!(
+                error.source.kind,
+                std::io::ErrorKind::NotADirectory | std::io::ErrorKind::AlreadyExists
+            ) {
+                "Not a directory"
+            } else {
+                error.source.os_message.as_str()
+            };
+            host.write_out(
+                Stream::Stderr,
+                format!(
+                    "CMake Error: Cannot open file for write: {}\nCMake Error: : System Error: {message}\nProblem opening file: {}\n",
+                    error.temporary.display(),
+                    file.display()
+                ).as_bytes(),
+            );
+            reporting::failure_summary(host.as_ref(), &dir);
+            junit_failed = true;
+        }
     }
     if let Some(dashboard) = &dashboard {
         let run = dart::TestRun {
@@ -661,8 +716,27 @@ fn run_tests_with_dashboard(
             _ => {}
         }
     }
-    if !outcome.failed.is_empty() || (options.error_on_no_tests && no_tests) {
+    if junit_failed || !outcome.failed.is_empty() || (options.error_on_no_tests && no_tests) {
         outcome.exit_code = 8;
+    }
+    if let Some((instrument, sample)) = instrument.as_ref().zip(run_sample)
+        && !invocation.command.is_empty()
+    {
+        instrument.ctest(
+            &invocation.command,
+            sample,
+            host.monotonic().saturating_sub(run_start),
+            outcome.exit_code,
+            false,
+        );
+    }
+    if let Err(error) =
+        rcmake_instrument::hooks::run_hook(host.as_ref(), &dir, rcmake_instrument::Hook::PostCTest)
+    {
+        host.write_out(
+            Stream::Stderr,
+            format!("CTest instrumentation error: {error}\n").as_bytes(),
+        );
     }
     Ok(TestRunOutcome {
         outcome,
