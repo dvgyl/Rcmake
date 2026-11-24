@@ -1,0 +1,32 @@
+[package]
+name = "rcmake-api"
+description = "Configure requests, provenance reports, and evaluated workspace queries for Rcmake."
+version.workspace = true
+publish.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = ["native", "archive"]
+native = []
+archive = ["rcmake-commands/archive"]
+
+[dependencies]
+indexmap.workspace = true
+rcmake-base.workspace = true
+rcmake-commands = { path = "../rcmake-commands", default-features = false }
+rcmake-diag.workspace = true
+rcmake-eval.workspace = true
+rcmake-host.workspace = true
+rcmake-json.workspace = true
+rcmake-model.workspace = true
+rcmake-resolve.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+rcmake-genex.workspace = true
+
+[lints]
+workspace = true
