@@ -241,6 +241,20 @@ pub trait GenexHost {
     /// on).
     fn definition(&self, name: &[u8]) -> Option<BString>;
 
+    /// Report whether a language is enabled when that information is available.
+    fn language_enabled(&self, _language: &[u8]) -> Option<bool> {
+        None
+    }
+
+    /// Return the configurations that can match a CONFIG test on an imported target.
+    fn imported_config_matches(
+        &self,
+        _target: TargetHandle,
+        _consumer: &ConfigId,
+    ) -> Option<Vec<BString>> {
+        None
+    }
+
     /// Return the policy state at target creation.
     fn target_policy(&self, target: TargetHandle, policy: &[u8]) -> Option<bool> {
         self.raw_property(target, policy)

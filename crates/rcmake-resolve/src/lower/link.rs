@@ -2,6 +2,7 @@
 
 use indexmap::IndexSet;
 use rcmake_base::{BString, list, path_lex::Lexical, shell::quote, truth};
+use rcmake_diag::{PolicyId, PolicyStatus};
 use rcmake_genex::{ConfigId, EvalContext};
 use rcmake_model::{DirId, ProjectModel, Target, TargetId};
 
@@ -16,6 +17,9 @@ use crate::{
     ArtifactSet, BuildStep, Invocation, LinkFragmentRole, LinkKind, LinkStep, ResolveError,
     ResolvedTarget, usage::UsageResolver,
 };
+
+mod driver;
+use driver::LinkerDriver;
 
 pub(super) fn link(
     model: &ProjectModel,
@@ -32,6 +36,16 @@ pub(super) fn link(
         step.output = build_relative(model, file);
     }
     let language = step.language.as_slice();
+    let wrapper = LinkerDriver::new(model, target, language);
+    let policy_new =
+        |policy| target.policies.policies.get(PolicyId::new(policy)) == PolicyStatus::New;
+    let parse_flags = |flags: BString| {
+        if policy_new(181) {
+            wrapper.flag_string(&flags)
+        } else {
+            Ok(flags)
+        }
+    };
     let darwin = is_darwin(model, target.dir);
     let kind = step.kind;
     let policy = Flags::new(model, target, language);
@@ -52,15 +66,38 @@ pub(super) fn link(
     }
     let base = [b"CMAKE_", kind.flag_class(), b"_LINKER_FLAGS"].concat();
     let configured = [base.as_slice(), b"_", &config.0.to_ascii_uppercase()].concat();
-    flags.extend(
-        [base.as_slice(), configured.as_slice()]
-            .into_iter()
-            .filter_map(|key| definition(model, target.dir, key).cloned()),
-    );
-    flags.push(
+    for key in [&base, &configured] {
+        if let Some(value) = definition(model, target.dir, key) {
+            flags.push(parse_flags(value.clone())?);
+        }
+    }
+    flags.push(parse_flags(
         definition(model, target.dir, &kind.create_flags_key(language))
             .map_or_else(|| kind.default_create_flag(darwin).into(), Clone::clone),
-    );
+    )?);
+    if kind == LinkKind::Executable {
+        let form = if target
+            .props
+            .get(b"WIN32_EXECUTABLE")
+            .is_some_and(|value| truth::is_on(value))
+        {
+            b"_CREATE_WIN32_EXE".as_slice()
+        } else {
+            b"_CREATE_CONSOLE_EXE"
+        };
+        if let Some(value) = definition(model, target.dir, &[b"CMAKE_", language, form].concat()) {
+            flags.push(parse_flags(value.clone())?);
+        }
+    }
+    if (kind == LinkKind::Executable || (kind != LinkKind::StaticArchive && policy_new(210)))
+        && let Some(value) = definition(
+            model,
+            target.dir,
+            &[b"CMAKE_", language, b"_LINK_FLAGS"].concat(),
+        )
+    {
+        flags.push(wrapper.flag_string(value)?);
+    }
     flags.extend(policy.pie_link(position_independent));
     if kind == LinkKind::SharedLibrary && darwin {
         flags.extend(darwin_versions(model, target, language));
@@ -73,19 +110,20 @@ pub(super) fn link(
             .get(&[raw_flags, b"_", &config.0.to_ascii_uppercase()].concat())
             .cloned(),
     );
-    flags.extend(
-        step.fragments
-            .iter()
-            .filter(|f| f.role == LinkFragmentRole::Flags)
-            .map(|f| f.text.value.clone()),
-    );
+    for fragment in step
+        .fragments
+        .iter()
+        .filter(|f| f.role == LinkFragmentRole::Flags)
+    {
+        flags.push(wrapper.argument(&fragment.text.value)?);
+    }
     if darwin {
         deduplicate_darwin_flags(&mut flags);
     }
     let flags = join_words(flags);
 
     let mut inputs = objects.clone();
-    let libraries = link_libraries(model, target, config, &step, darwin, &mut inputs)?;
+    let libraries = link_libraries(model, target, config, &step, darwin, &mut inputs, &wrapper)?;
     let soname = if kind == LinkKind::SharedLibrary {
         artifacts.soname_file.as_ref()
     } else {
@@ -266,6 +304,7 @@ fn link_libraries(
     step: &LinkStep,
     darwin: bool,
     inputs: &mut Vec<BString>,
+    wrapper: &LinkerDriver<'_>,
 ) -> Result<BString, ResolveError> {
     if step.kind == LinkKind::StaticArchive {
         return Ok(BString::default());
@@ -277,11 +316,11 @@ fn link_libraries(
     let libraries = linked_libraries(step);
     let rpaths = rpaths(model, target, config, step, darwin, &libraries)?;
     inputs.extend(libraries);
-    Ok(join_words(
-        rpaths
-            .into_iter()
-            .chain(link_fragments.map(|f| f.text.value.clone())),
-    ))
+    let mut arguments = rpaths;
+    for fragment in link_fragments {
+        arguments.push(wrapper.argument(&fragment.text.value)?);
+    }
+    Ok(join_words(arguments))
 }
 
 fn archive_commands(

@@ -55,9 +55,15 @@ impl Project<'_> {
                 .graphs
                 .iter()
                 .find(|g| g.config.0.as_slice() == config.as_bytes());
+            let graph_target =
+                graph.and_then(|graph| graph.targets.iter().find(|item| item.name == raw.name));
             if let Some(facts) = facts {
                 dependencies.extend(facts.dependencies.iter().copied());
-                custom.collect(raw, facts, self.bin);
+                let steps = graph_target
+                    .into_iter()
+                    .flat_map(|target| &target.steps)
+                    .filter_map(|index| graph.and_then(|graph| graph.steps.get(*index)));
+                custom.collect(facts, self.bin, steps);
                 let items = source_files(self.model, raw, facts)?;
                 if let Some(original) = &sources {
                     validate_source_flags(original, &items)?;
@@ -66,7 +72,7 @@ impl Project<'_> {
                 }
             }
             if let Some(graph) = graph
-                && let Some(item) = graph.targets.iter().find(|item| item.name == raw.name)
+                && let Some(item) = graph_target
             {
                 for index in &item.depends {
                     if let Some(dep) = graph.targets.get(*index)

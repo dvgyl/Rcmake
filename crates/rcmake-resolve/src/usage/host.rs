@@ -34,7 +34,7 @@ pub struct ModelGenexHost<'model, 'resolver> {
     pub(super) resolver: &'resolver mut UsageResolver<'model>,
     pub(super) lookup_dir: DirId,
     pub(crate) current: Option<TargetHandle>,
-    pub(crate) artifact_dependencies: Option<&'resolver RefCell<IndexSet<TargetId>>>,
+    pub(crate) artifact_dependencies: Option<&'resolver RefCell<IndexSet<(TargetId, ConfigId)>>>,
     objects: Option<&'resolver ObjectPaths<'resolver>>,
 }
 
@@ -201,7 +201,7 @@ impl GenexHost for ModelGenexHost<'_, '_> {
                     ArtifactKind::BundleDir | ArtifactKind::BundleContentDir
                 );
             if full_file || self.target_policy(target, b"CMP0112") == Some(false) {
-                dependencies.borrow_mut().insert(id);
+                dependencies.borrow_mut().insert((id, config.clone()));
             }
         }
         Ok(path)
@@ -245,7 +245,7 @@ impl GenexHost for ModelGenexHost<'_, '_> {
             self.resolver.target_objects(id, config, sources)?
         };
         if let Some(dependencies) = self.artifact_dependencies {
-            dependencies.borrow_mut().insert(id);
+            dependencies.borrow_mut().insert((id, config.clone()));
         }
         Some(objects)
     }
@@ -274,6 +274,38 @@ impl GenexHost for ModelGenexHost<'_, '_> {
 
     fn definition(&self, name: &[u8]) -> Option<BString> {
         definition(self.resolver.model, self.lookup_dir, name).cloned()
+    }
+
+    fn language_enabled(&self, language: &[u8]) -> Option<bool> {
+        let enabled = self.resolver.model.global.props.get(b"ENABLED_LANGUAGES")?;
+        Some(
+            list::split(enabled, list::Empty::Drop)
+                .iter()
+                .any(|item| item == language),
+        )
+    }
+
+    fn imported_config_matches(
+        &self,
+        target: TargetHandle,
+        consumer: &ConfigId,
+    ) -> Option<Vec<BString>> {
+        let target = self.resolver.model.target(self.id(target)?)?;
+        if !target.is_imported() {
+            return None;
+        }
+        let cps = super::artifacts::imported_from_cps(target);
+        let mut configurations = Vec::new();
+        if !cps {
+            configurations.push(consumer.0.clone());
+            if target.policies.policies.get(PolicyId::new(199)) != PolicyStatus::New
+                && let Some(mapped) = super::artifacts::imported_config_map(target, consumer)
+            {
+                configurations.extend(list::split(mapped, list::Empty::Keep));
+            }
+        }
+        configurations.extend(super::artifacts::selected_imported_config(target, consumer));
+        Some(configurations)
     }
 
     fn target_policy(&self, target: TargetHandle, policy: &[u8]) -> Option<bool> {

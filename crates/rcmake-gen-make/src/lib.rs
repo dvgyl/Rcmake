@@ -12,9 +12,10 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::Path;
 
 use rcmake_base::{BString, ByteVec, shell::quote_always};
+use rcmake_diag::{PolicyId, PolicyStatus};
 use rcmake_gen_common::{GenError, write_if_changed};
 use rcmake_host::{Host, WriteMode, path};
-use rcmake_model::ProjectModel;
+use rcmake_model::{DirId, ProjectModel};
 use rcmake_resolve::{BuildGraph, BuildStep, GenerationResult, Invocation};
 
 const MAKEFILE2: &[u8] = b"CMakeFiles/Makefile2";
@@ -64,7 +65,7 @@ fn generate_impl(
     let build_dir = host.initial_cwd().join(build_dir);
     let empty = BuildGraph::default();
     let graph = result.graphs.first().unwrap_or(&empty);
-    let mut targets = plan_targets(result, graph, &build_dir)?;
+    let mut targets = plan_targets(result, graph, &build_dir, model)?;
     let cmake_command = result
         .metadata
         .cmake_command
@@ -200,7 +201,7 @@ fn plan_step<'a>(
                 .collect(),
             inputs: custom.depends.clone(),
             depfile: custom.depfile.as_ref().map(make_path),
-            always: custom.outputs.is_empty(),
+            always: custom.outputs.is_empty() || custom.symbolic,
             progress: None,
         },
         BuildStep::Scan { .. } | BuildStep::Collate { .. } => {
@@ -216,6 +217,7 @@ fn plan_targets<'a>(
     result: &GenerationResult,
     graph: &'a BuildGraph,
     build_dir: &Path,
+    project: Option<&ProjectModel>,
 ) -> Result<Vec<Target<'a>>, GenError> {
     let mut targets = Vec::with_capacity(graph.targets.len());
     let mut names = BTreeMap::new();
@@ -253,22 +255,36 @@ fn plan_targets<'a>(
         .collect();
     let mut owners = BTreeMap::new();
     let mut producers = BTreeMap::new();
+    let mut symbolic = BTreeSet::new();
     for index in dependency_order(&targets)? {
         let (Some(model), Some(target)) = (graph.targets.get(index), targets.get_mut(index)) else {
             continue;
         };
+        let repeat_rules = project
+            .and_then(|project| {
+                project
+                    .find_target(DirId::ROOT, target.name)
+                    .and_then(|id| project.target(id))
+            })
+            .is_some_and(|target| {
+                target.policies.policies.get(PolicyId::new(113)) != PolicyStatus::New
+            });
         for &step_index in &model.steps {
-            if let Some(&owner) = owners.get(&step_index) {
-                if index != owner {
-                    target.dependencies.insert(owner);
-                }
-                continue;
-            }
-            owners.insert(step_index, index);
             let action = graph
                 .steps
                 .get(step_index)
                 .ok_or_else(|| invalid_graph("invalid build step index"))?;
+            let owner = *owners.entry(step_index).or_insert(index);
+            let repeated = owner != index;
+            if repeated {
+                target.dependencies.insert(owner);
+                if !repeat_rules
+                    || !matches!(action, BuildStep::Custom(_))
+                    || !has_dependency(graph, index, owner)
+                {
+                    continue;
+                }
+            }
             let mut step = plan_step(action, step_index, result, build_dir)?;
             if matches!(action, BuildStep::Link { .. })
                 && let Some(artifacts) = artifacts.get(target.name)
@@ -291,11 +307,14 @@ fn plan_targets<'a>(
             let mut seen = BTreeSet::new();
             step.outputs.retain(|output| seen.insert(output.clone()));
             for output in &step.outputs {
-                if producers.insert(output.clone(), index).is_some() {
+                if !repeated && producers.insert(output.clone(), index).is_some() {
                     return Err(invalid_graph(format!(
                         "multiple build steps produce {output}"
                     )));
                 }
+            }
+            if matches!(action, BuildStep::Custom(custom) if custom.symbolic) {
+                symbolic.insert(step.goal.clone());
             }
             target
                 .products
@@ -315,6 +334,11 @@ fn plan_targets<'a>(
         })
         .collect();
     for (index, target) in targets.iter_mut().enumerate() {
+        let own_outputs: BTreeSet<_> = target
+            .rules
+            .iter()
+            .flat_map(|rule| rule.outputs.iter().cloned())
+            .collect();
         for step in &mut target.rules {
             let mut inputs = BTreeSet::new();
             for input in &step.inputs {
@@ -335,6 +359,10 @@ fn plan_targets<'a>(
                     && *owner != index
                 {
                     target.dependencies.insert(*owner);
+                    if symbolic.contains(&file) && !own_outputs.contains(&file) {
+                        inputs.insert(BString::from(FORCE));
+                        continue;
+                    }
                 }
                 inputs.insert(file);
             }
@@ -343,6 +371,22 @@ fn plan_targets<'a>(
     }
     dependency_order(&targets)?;
     Ok(targets)
+}
+
+fn has_dependency(graph: &BuildGraph, target: usize, dependency: usize) -> bool {
+    let mut pending = vec![target];
+    let mut visited = BTreeSet::new();
+    while let Some(index) = pending.pop() {
+        if index == dependency {
+            return true;
+        }
+        if visited.insert(index)
+            && let Some(target) = graph.targets.get(index)
+        {
+            pending.extend(&target.depends);
+        }
+    }
+    false
 }
 
 fn dependency_order(targets: &[Target<'_>]) -> Result<Vec<usize>, GenError> {

@@ -42,6 +42,7 @@ fn single_config_writes_rules_edges_and_utilities() {
                     depfile: Some("a $:file.d".into()),
                     uses_terminal: true,
                     job_pool: Some("ignored".into()),
+                    symbolic: false,
                 }),
                 BuildStep::Compile {
                     object: "obj/a $:file.o".into(),

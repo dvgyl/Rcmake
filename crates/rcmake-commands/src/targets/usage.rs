@@ -86,10 +86,15 @@ fn add(cx: &mut Cx<'_>, args: &[ExpandedArg], own: Field, interface: Field) -> C
         BString::default()
     };
     let bt = cx.backtrace();
-    let target = cx
-        .project()
-        .target_mut(id)
-        .ok_or_else(|| model_error(ModelError::UnknownObject))?;
+    let feature_tables = (own == Field::CompileFeatures).then(|| {
+        [
+            b"CMAKE_C_COMPILE_FEATURES".as_slice(),
+            b"CMAKE_CXX_COMPILE_FEATURES",
+            b"CMAKE_CUDA_COMPILE_FEATURES",
+            b"CMAKE_HIP_COMPILE_FEATURES",
+        ]
+        .map(|key| (key, cx.var(key)))
+    });
     while let Some((keyword, tail)) = rest.split_first() {
         let scope = scope(bytes(keyword))
             .ok_or_else(|| CmdError::status("called with invalid arguments"))?;
@@ -99,6 +104,35 @@ fn add(cx: &mut Cx<'_>, args: &[ExpandedArg], own: Field, interface: Field) -> C
             .unwrap_or(tail.len());
         let (items, next) = tail.split_at(end);
         rest = next;
+        if let Some(tables) = &feature_tables
+            && scope != UsageScope::Interface
+        {
+            for feature in items
+                .iter()
+                .flat_map(|arg| list::split(bytes(arg), list::Empty::Drop))
+            {
+                if !feature.windows(2).any(|pair| pair == b"$<")
+                    && let Err(message) = cx.project().validate_compile_feature(&feature, |key| {
+                        tables
+                            .iter()
+                            .find(|(name, _)| *name == key)
+                            .and_then(|(_, value)| value.as_ref())
+                    })
+                {
+                    return Err(crate::command_error(
+                        cx,
+                        format!(
+                            "target_compile_features {message} for target \"{}\".",
+                            name.value
+                        ),
+                    ));
+                }
+            }
+        }
+        let target = cx
+            .project()
+            .target_mut(id)
+            .ok_or_else(|| model_error(ModelError::UnknownObject))?;
         validate_scope(target, scope, false)?;
         if items.is_empty() {
             continue;

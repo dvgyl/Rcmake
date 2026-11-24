@@ -7,8 +7,7 @@ use std::{
 };
 
 use rcmake_gen_common::{GenError, ide::UtilityKind};
-use rcmake_model::{Target, TargetKind};
-use rcmake_resolve::{ResolvedTarget, ide::IdeCustomPhase};
+use rcmake_resolve::{BuildStep, ResolvedTarget, ide::IdeCustomPhase};
 
 use crate::{
     object::{self, Isa, Objects, Reference, Value, attrs, list},
@@ -85,6 +84,7 @@ pub(crate) struct Script {
     lines: BTreeMap<String, Vec<String>>,
     inputs: ConfigPaths,
     outputs: ConfigPaths,
+    depfiles: ConfigPaths,
     comment: Option<String>,
     always: bool,
 }
@@ -105,17 +105,17 @@ impl Script {
         config: &str,
         product: &crate::settings::Product,
     ) -> Result<(), GenError> {
-        if let Some((actual, aliases)) = product.version_links() {
-            crate::file_name(&actual)?;
-            let mut commands = Vec::new();
-            for alias in aliases {
-                crate::file_name(&alias)?;
-                commands.push(format!(
-                    "/bin/ln -sfn {} {}",
-                    quote(&actual),
-                    quote(&format!("./{alias}"))
-                ));
-            }
+        let mut commands = Vec::new();
+        for (alias, destination) in product.version_links() {
+            crate::file_name(&destination)?;
+            crate::file_name(&alias)?;
+            commands.push(format!(
+                "/bin/ln -sfn {} {}",
+                quote(&destination),
+                quote(&format!("./{alias}"))
+            ));
+        }
+        if !commands.is_empty() {
             self.push(config, &product.dir, commands);
             self.always = true;
         }
@@ -133,6 +133,13 @@ impl Script {
             return Ok(None);
         }
         let name = self.comment.as_deref().unwrap_or(default_name);
+        let depfiles = phase_paths(&self.depfiles, configs);
+        let merged = (depfiles.len() > 1).then(|| {
+            format!(
+                "${{TARGET_TEMP_DIR}}/rcmake-{}.d",
+                rcmake_base::hash::HashAlgo::Sha256.hex_digest(key.as_bytes())
+            )
+        });
         let mut script = String::from("set -e\n");
         for config in configs {
             if let Some(lines) = self.lines.get(config) {
@@ -144,15 +151,24 @@ impl Script {
                 for line in lines {
                     let _ = writeln!(script, "  {line}");
                 }
+                if let Some(merged) = &merged {
+                    let _ = write!(script, "  /bin/cat");
+                    for depfile in self.depfiles.get(config).into_iter().flatten() {
+                        let _ = write!(script, " {}", quote_command(depfile));
+                    }
+                    let _ = writeln!(script, " < /dev/null > \"{merged}\"");
+                }
                 script.push_str("fi\n");
             }
         }
+        let outputs = phase_paths(&self.outputs, configs);
+        let inputs = phase_paths(&self.inputs, configs);
         let mut fields = attrs([
             ("buildActionMask", "2147483647".into()),
             ("files", list(Vec::<Reference>::new())),
-            ("inputPaths", list(phase_paths(&self.inputs, configs))),
+            ("inputPaths", list(inputs.difference(&outputs).cloned())),
             ("name", name.into()),
-            ("outputPaths", list(phase_paths(&self.outputs, configs))),
+            ("outputPaths", list(outputs)),
             ("runOnlyForDeploymentPostprocessing", "0".into()),
             ("shellPath", "/bin/sh".into()),
             ("shellScript", script.into()),
@@ -160,6 +176,14 @@ impl Script {
         ]);
         if self.always {
             fields.insert("alwaysOutOfDate".into(), "1".into());
+        }
+        if let Some(depfile) = merged.or_else(|| depfiles.into_iter().next()) {
+            fields.insert(
+                "dependencyFile".into(),
+                depfile
+                    .replace("${TARGET_TEMP_DIR}", "$(TARGET_TEMP_DIR)")
+                    .into(),
+            );
         }
         objects
             .add(Isa::PBXShellScriptBuildPhase, key, name, fields)
@@ -176,10 +200,25 @@ pub(crate) struct Custom {
 }
 
 impl Custom {
-    pub(crate) fn collect(&mut self, raw: &Target, target: &ResolvedTarget, bin: &Path) {
+    pub(crate) fn collect<'a>(
+        &mut self,
+        target: &ResolvedTarget,
+        bin: &Path,
+        steps: impl Iterator<Item = &'a BuildStep>,
+    ) {
         let config = text(&target.config.0);
         let build_dir = bin.join(text(&target.metadata.binary_dir));
         let build_dir = build_dir.to_string_lossy();
+        let depfiles: BTreeMap<_, _> = steps
+            .filter_map(|step| {
+                let BuildStep::Custom(step) = step else {
+                    return None;
+                };
+                let output = bin.join(text(step.outputs.first()?));
+                let depfile = bin.join(text(step.depfile.as_ref()?));
+                Some((output, depfile.to_string_lossy().into_owned()))
+            })
+            .collect();
         if let Some(ide) = target.ide.as_deref() {
             for step in &ide.custom {
                 let phase = match step.phase {
@@ -210,7 +249,16 @@ impl Custom {
                         }),
                 );
                 phase.paths(bin, &config, &step.depends, &step.outputs, &step.byproducts);
-                phase.always |= step.always_run || raw.kind == TargetKind::Utility;
+                for output in &step.outputs {
+                    if let Some(depfile) = depfiles.get(&bin.join(text(output))) {
+                        phase
+                            .depfiles
+                            .entry(config.clone())
+                            .or_default()
+                            .insert(depfile.clone());
+                    }
+                }
+                phase.always |= step.always_run && !step.commands.is_empty();
             }
         }
     }

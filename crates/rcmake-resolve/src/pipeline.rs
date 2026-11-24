@@ -1,23 +1,23 @@
 use std::collections::BTreeMap;
 
-use indexmap::IndexMap;
-use rcmake_base::{BString, truth};
-use rcmake_diag::MessageKind;
+use indexmap::{IndexMap, IndexSet};
+use rcmake_base::{BString, list, truth};
+use rcmake_diag::{Location, MessageKind};
 use rcmake_genex::{ConfigId, EvalContext};
 use rcmake_host::Host;
-use rcmake_model::{DirId, FileSetKind, ProjectModel, TargetId};
+use rcmake_model::{CommandId, DirId, FileSetKind, GeneratorKind, ProjectModel, TargetId};
 
 use crate::{
-    BuildGraph, BuildStep, GenerationResult, InstallActionKind, ResolveError, ResolveOptions,
-    ResolvedTarget,
+    BuildGraph, BuildStep, CrossConfiguration, GenerationResult, InstallActionKind, ResolveError,
+    ResolveOptions, ResolvedTarget,
     cxx_modules::{generation_location, std_module_model},
     exports::resolve_exports,
     ide, lower,
     resolve_link::{attach_links, resolve_link},
-    sources::SourcePaths,
+    sources::{SourcePaths, TargetInputs},
     target::resolve_target,
     unity,
-    usage::UsageResolver,
+    usage::{ResolvedLinkKind, UsageResolver},
 };
 
 /// Resolve and lower the project in configuration order.
@@ -56,20 +56,41 @@ pub fn resolve_with_options(
     let mut paths = SourcePaths::new(host);
     paths.ide = options.ide;
     paths.unity = Some(unity::prepare(model, host, &mut paths, &configs)?);
+    let configured_targets = configs
+        .iter()
+        .map(|config| resolve_targets(model, &mut paths, config))
+        .collect::<Result<Vec<_>, _>>()?;
+    validate_target_sources(model, &paths, &configured_targets)?;
+    let plan = ConfigurationPlan {
+        cross: CrossPlan::new(model, &configs)?,
+        link_languages: if configs.len() > 1 {
+            link_languages(model, &configured_targets)
+        } else {
+            IndexMap::new()
+        },
+    };
     let mut targets = Vec::new();
     let mut graphs = Vec::with_capacity(configs.len());
+    let mut cross_graphs = IndexMap::new();
     let mut compile_inputs = BTreeMap::new();
     let mut xcode_link_error = None;
     let mut xcode_sources = IndexMap::new();
-    for config in &configs {
+    for (config, configured) in configs.iter().zip(configured_targets) {
+        if configs.len() != 1 {
+            paths.index_generated(model, config)?;
+            paths.index_objects(model, config);
+        }
         let output = resolve_config(
             model,
-            &mut paths,
+            &paths,
             config,
+            configured,
             &mut compile_inputs,
             &mut xcode_sources,
+            &plan,
         )?;
         targets.extend(output.targets);
+        cross_graphs.extend(output.cross_graphs);
         match output.graph {
             Ok(graph) => graphs.push(graph),
             Err(error) => {
@@ -121,6 +142,7 @@ pub fn resolve_with_options(
         configs,
         targets,
         graphs,
+        cross_graphs,
         compile_inputs,
         install,
         exports,
@@ -131,15 +153,81 @@ pub fn resolve_with_options(
 struct ConfigOutput {
     targets: Vec<ResolvedTarget>,
     graph: Result<BuildGraph, ResolveError>,
+    cross_graphs: IndexMap<(ConfigId, ConfigId), BuildGraph>,
 }
 
-fn resolve_config(
+struct ConfigurationPlan<'a> {
+    cross: CrossPlan<'a>,
+    link_languages: IndexMap<TargetId, BString>,
+}
+
+#[derive(Default)]
+struct CrossPlan<'a> {
+    commands: &'a [ConfigId],
+    outputs: IndexSet<ConfigId>,
+    shared_outputs: IndexSet<CommandId>,
+}
+
+impl<'a> CrossPlan<'a> {
+    fn new(model: &ProjectModel, configs: &'a [ConfigId]) -> Result<Self, ResolveError> {
+        let Some(setting) = lower::definition(model, DirId::ROOT, b"CMAKE_CROSS_CONFIGS")
+            .filter(|_| model.generator == Some(GeneratorKind::NinjaMultiConfig))
+        else {
+            return Ok(Self::default());
+        };
+        let values = list::split(setting, list::Empty::Drop);
+        let outputs: IndexSet<_> = configs
+            .iter()
+            .filter(|config| setting == "all" || values.contains(&config.0))
+            .cloned()
+            .collect();
+        if outputs.is_empty() || !model.commands().any(|_| true) {
+            return Ok(Self::default());
+        }
+        let mut shared_outputs = IndexSet::new();
+        let mut usage = UsageResolver::new(model);
+        for (id, command) in model.commands() {
+            let mut seen = IndexSet::new();
+            for config in configs {
+                let (outputs, byproducts) =
+                    lower::command_outputs(model, command, config, &mut usage)?;
+                let paths: IndexSet<_> = outputs.into_iter().chain(byproducts).collect();
+                if paths.into_iter().any(|path| !seen.insert(path)) {
+                    shared_outputs.insert(id);
+                    break;
+                }
+            }
+        }
+        Ok(Self {
+            commands: configs,
+            outputs,
+            shared_outputs,
+        })
+    }
+
+    fn commands_for(&self, output: &ConfigId) -> impl Iterator<Item = CrossConfiguration<'_>> {
+        self.commands
+            .iter()
+            .filter(move |command| *command != output && self.outputs.contains(output))
+            .map(|command| CrossConfiguration {
+                command,
+                shared_outputs: &self.shared_outputs,
+            })
+    }
+}
+
+#[derive(Default)]
+struct ConfigTargets {
+    targets: IndexMap<TargetId, ResolvedTarget>,
+    inputs: IndexMap<TargetId, TargetInputs>,
+    linked_object_sources: IndexSet<TargetId>,
+}
+
+fn resolve_targets(
     model: &ProjectModel,
     paths: &mut SourcePaths<'_>,
     config: &ConfigId,
-    compile_inputs: &mut BTreeMap<BString, Vec<BString>>,
-    xcode_sources: &mut IndexMap<TargetId, (ConfigId, Vec<BString>)>,
-) -> Result<ConfigOutput, ResolveError> {
+) -> Result<ConfigTargets, ResolveError> {
     paths.index_generated(model, config)?;
     validate_file_sets(model, paths, config)?;
     paths.index_objects(model, config);
@@ -148,13 +236,111 @@ fn resolve_config(
         config: config.clone(),
         ..EvalContext::default()
     };
-    let mut resolved = IndexMap::new();
-    let mut inputs = IndexMap::new();
+    let mut configured = ConfigTargets::default();
     for (id, target) in model.targets().filter(|(_, target)| !target.is_imported()) {
         let (facts, target_inputs) = resolve_target(model, paths, &mut usage, id, target, &ctx)?;
-        resolved.insert(id, facts);
-        inputs.insert(id, target_inputs);
+        configured.targets.insert(id, facts);
+        configured.inputs.insert(id, target_inputs);
     }
+    for (&id, inputs) in &configured.inputs {
+        if !inputs.sources.is_empty()
+            || !model
+                .target(id)
+                .is_some_and(|target| target.kind.compiles_objects())
+        {
+            continue;
+        }
+        let links = usage.collect_link_items(id, &ctx)?;
+        if links.iter().any(|link| {
+            let ResolvedLinkKind::Objects(object_library) = link.kind else {
+                return false;
+            };
+            configured.targets.get(&object_library).map_or_else(
+                || {
+                    usage
+                        .target_objects(object_library, config, None)
+                        .is_some_and(|objects| !objects.is_empty())
+                },
+                |object| !object.compile_units.is_empty(),
+            )
+        }) {
+            configured.linked_object_sources.insert(id);
+        }
+    }
+    Ok(configured)
+}
+
+fn validate_target_sources(
+    model: &ProjectModel,
+    paths: &SourcePaths<'_>,
+    configurations: &[ConfigTargets],
+) -> Result<(), ResolveError> {
+    let sourced: IndexSet<_> = configurations
+        .iter()
+        .flat_map(|config| {
+            config
+                .inputs
+                .iter()
+                .filter_map(|(&id, inputs)| (!inputs.sources.is_empty()).then_some(id))
+                .chain(config.linked_object_sources.iter().copied())
+        })
+        .collect();
+    let mut failure = None;
+    for (id, target) in model.targets() {
+        if target.is_imported() || sourced.contains(&id) || !target.kind.compiles_objects() {
+            continue;
+        }
+        let body = BString::from(format!("No SOURCES given to target: {}", target.name));
+        paths.emit(
+            model,
+            MessageKind::Error,
+            Location::Backtrace(target.backtrace.clone()),
+            body.clone(),
+        );
+        failure.get_or_insert(ResolveError::Reported(body));
+    }
+    failure.map_or(Ok(()), Err)
+}
+
+fn link_languages(
+    model: &ProjectModel,
+    configurations: &[ConfigTargets],
+) -> IndexMap<TargetId, BString> {
+    model
+        .targets()
+        .filter_map(|(id, target)| {
+            let languages = configurations
+                .iter()
+                .filter_map(|config| config.targets.get(&id))
+                .flat_map(|facts| {
+                    facts
+                        .compile_groups
+                        .iter()
+                        .map(|group| group.language.as_slice())
+                });
+            lower::linker_language(model, target, languages).map(|language| (id, language))
+        })
+        .collect()
+}
+
+fn resolve_config(
+    model: &ProjectModel,
+    paths: &SourcePaths<'_>,
+    config: &ConfigId,
+    configured: ConfigTargets,
+    compile_inputs: &mut BTreeMap<BString, Vec<BString>>,
+    xcode_sources: &mut IndexMap<TargetId, (ConfigId, Vec<BString>)>,
+    plan: &ConfigurationPlan<'_>,
+) -> Result<ConfigOutput, ResolveError> {
+    let ConfigTargets {
+        targets: mut resolved,
+        mut inputs,
+        ..
+    } = configured;
+    let ctx = EvalContext {
+        config: config.clone(),
+        ..EvalContext::default()
+    };
     let std_model = if resolved
         .values()
         .any(|target| target.compile_units.iter().any(|unit| unit.scan))
@@ -164,11 +350,7 @@ fn resolve_config(
         None
     };
     let model = std_model.as_ref().map_or(model, |(model, _)| model);
-    let mut usage = if std_model.is_some() {
-        UsageResolver::with_source_paths(model, paths)
-    } else {
-        usage
-    };
+    let mut usage = UsageResolver::with_source_paths(model, paths);
     let std_id = std_model.as_ref().map(|(_, id)| *id);
     if let Some(id) = std_id
         && let Some(target) = model.target(id)
@@ -183,7 +365,13 @@ fn resolve_config(
     let links = model
         .targets()
         .filter(|(_, target)| !target.is_imported())
-        .map(|(id, target)| resolve_link(model, &mut usage, paths, &resolved, id, target, &ctx))
+        .map(|(id, target)| {
+            let ctx = EvalContext {
+                link_language: plan.link_languages.get(&id).cloned(),
+                ..ctx.clone()
+            };
+            resolve_link(model, &mut usage, paths, &resolved, id, target, &ctx)
+        })
         .collect::<Result<Vec<_>, _>>();
     let links = match links {
         Err(error) if paths.ide == Some(ide::IdeFlavor::Xcode) => {
@@ -192,6 +380,7 @@ fn resolve_config(
             return Ok(ConfigOutput {
                 targets: resolved.into_values().collect(),
                 graph: Err(error),
+                cross_graphs: IndexMap::new(),
             });
         }
         result => result?,
@@ -219,7 +408,23 @@ fn resolve_config(
         &mut usage,
         &mut ide_custom,
         compile_inputs,
+        None,
     )?;
+    let mut cross_graphs = IndexMap::new();
+    for settings in plan.cross.commands_for(config) {
+        let key = (settings.command.clone(), config.clone());
+        let graph = lower::lower_with_inputs(
+            model,
+            &resolved,
+            config,
+            &inputs,
+            &mut usage,
+            &mut IndexMap::new(),
+            &mut BTreeMap::new(),
+            Some(settings),
+        )?;
+        cross_graphs.insert(key, graph);
+    }
     for target in &mut resolved {
         if let Some(facts) = &mut target.ide {
             facts.custom = ide_custom.swap_remove(&target.id).unwrap_or_default();
@@ -228,6 +433,7 @@ fn resolve_config(
     Ok(ConfigOutput {
         targets: resolved,
         graph: Ok(graph),
+        cross_graphs,
     })
 }
 

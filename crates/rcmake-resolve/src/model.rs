@@ -1,9 +1,9 @@
-use indexmap::IndexMap;
+use indexmap::{IndexMap, IndexSet};
 use rcmake_base::BString;
 use rcmake_cxxmodules::{ModmapFormat, ModuleVisibility, TargetDependInfo};
 use rcmake_diag::Backtrace;
 use rcmake_genex::ConfigId;
-use rcmake_model::{BT, TargetId, TargetKind};
+use rcmake_model::{BT, CommandId, TargetId, TargetKind};
 
 use crate::{InstallManifest, ide};
 
@@ -30,6 +30,8 @@ pub struct GenerationResult {
     pub targets: Vec<ResolvedTarget>,
     /// One lowered build graph per configuration.
     pub graphs: Vec<BuildGraph>,
+    /// Cross-config graphs indexed by command and output configuration.
+    pub cross_graphs: IndexMap<(ConfigId, ConfigId), BuildGraph>,
     /// Additional file dependencies of each compile output.
     pub compile_inputs: std::collections::BTreeMap<BString, Vec<BString>>,
     /// Install actions for `cmake_install.cmake`.
@@ -38,6 +40,11 @@ pub struct GenerationResult {
     pub exports: Vec<ExportPlan>,
     /// Non-target metadata.
     pub metadata: ConfigureMetadata,
+}
+
+pub(crate) struct CrossConfiguration<'a> {
+    pub(crate) command: &'a ConfigId,
+    pub(crate) shared_outputs: &'a IndexSet<CommandId>,
 }
 
 /// Non-target configure metadata (`cmakeFiles-v1`, `cache-v2`, `toolchains-v1`,
@@ -400,6 +407,8 @@ pub struct CustomStep {
     pub uses_terminal: bool,
     /// `JOB_POOL`.
     pub job_pool: Option<BString>,
+    /// The primary output is a symbolic name, with no file to update.
+    pub symbolic: bool,
 }
 
 /// One step of a [`BuildGraph`].

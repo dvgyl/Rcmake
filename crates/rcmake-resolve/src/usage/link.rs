@@ -140,6 +140,26 @@ impl<'a> UsageResolver<'a> {
         ctx: &EvalContext,
     ) -> Result<Vec<Arc<ResolvedLinkItem>>, ResolveError> {
         let ctx = link_context(target, ctx);
+        let strategy = self
+            .model
+            .target(target)
+            .and_then(|target| target.props.get(b"LINK_LIBRARIES_STRATEGY"));
+        let strategy = match strategy.map(|value| value.as_slice()) {
+            None | Some(b"REORDER_MINIMALLY") => LinkOrder::Minimal,
+            Some(b"REORDER_FREELY") => LinkOrder::Free,
+            Some(value) => {
+                let body = BString::from(format!(
+                    "LINK_LIBRARIES_STRATEGY value '{}' is not recognized.",
+                    BString::from(value)
+                ));
+                if let Some(paths) = self.source_paths()
+                    && let Some(target) = self.model.target(target)
+                {
+                    return Err(paths.target_error(self.model, target, body));
+                }
+                return Err(ResolveError::Message(body));
+            }
+        };
         let (direct, _) = self.usage_links(target, false, &ctx)?;
         let mut graph = LinkGraph::default();
         let mut original: Vec<_> = direct
@@ -161,7 +181,7 @@ impl<'a> UsageResolver<'a> {
         }
 
         graph.apply_groups(&mut original);
-        let mut ordered = graph.order(self.model, &ctx, original)?;
+        let mut ordered = graph.order(self.model, &ctx, original, strategy)?;
         deduplicate(self.model, target, &ctx, &mut ordered);
         // Explicit object inputs are placed before the libraries.
         ordered.retain(|item| !matches!(item.kind, ResolvedLinkKind::Interface(_)));
@@ -606,6 +626,11 @@ impl Injection {
 
 type LinkNode = (Arc<ResolvedLinkItem>, IndexSet<usize>);
 
+enum LinkOrder {
+    Minimal,
+    Free,
+}
+
 #[derive(Default)]
 struct LinkGraph {
     nodes: IndexMap<LinkKey, LinkNode>,
@@ -663,6 +688,7 @@ impl LinkGraph {
         model: &ProjectModel,
         ctx: &EvalContext,
         direct: Vec<(usize, Arc<ResolvedLinkItem>)>,
+        strategy: LinkOrder,
     ) -> Result<Vec<Arc<ResolvedLinkItem>>, ResolveError> {
         let (component_ids, mut components) =
             self.components(direct.iter().rev().map(|(index, _)| *index));
@@ -715,9 +741,21 @@ impl LinkGraph {
         // The component identifiers are in topological order.
         let mut order = Vec::with_capacity(self.nodes.len().max(direct.len()));
         let mut pending = BTreeSet::new();
-        for (index, item) in direct {
-            visit(index, &component_ids, &mut components, &mut pending);
-            order.push(item);
+        match strategy {
+            LinkOrder::Minimal => {
+                for (index, item) in direct {
+                    visit(index, &component_ids, &mut components, &mut pending);
+                    order.push(item);
+                }
+            }
+            LinkOrder::Free => {
+                for (index, _) in direct {
+                    let id = component_ids[index];
+                    if pending.insert(id) {
+                        components[id].reset();
+                    }
+                }
+            }
         }
         while let Some(id) = pending.first().copied() {
             let Some(index) = components[id].remaining.first().copied() else {
@@ -878,7 +916,7 @@ fn deduplicate(
         | ResolvedLinkKind::ObjectFile
         | ResolvedLinkKind::Group { .. } => Some(true),
         ResolvedLinkKind::Library(id) => match model.target(id)?.kind {
-            TargetKind::StaticLibrary if all => Some(forward || policy(179)),
+            TargetKind::StaticLibrary if all => Some(policy(179)),
             TargetKind::SharedLibrary
                 if !policy(156) || setting(b"DEDUPLICATION=") != Some(b"NONE") =>
             {

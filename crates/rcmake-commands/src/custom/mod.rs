@@ -3,7 +3,7 @@
 use std::collections::BTreeSet;
 
 use rcmake_base::{BString, path_lex::Lexical, truth};
-use rcmake_diag::{PolicyId, PolicyStatus};
+use rcmake_diag::{Effect, MessageKind, PolicyId, PolicyStatus};
 use rcmake_eval::{CmdError, CmdFlags, CmdResult, Cx, Flow, Registry};
 use rcmake_expr::ExpandedArg;
 use rcmake_host::path::from_native;
@@ -40,6 +40,7 @@ enum Section {
     Depfile,
     JobPool,
     JobServerAware,
+    Legacy,
 }
 
 impl Section {
@@ -69,6 +70,7 @@ struct Options {
     implicit_language: Option<BString>,
     missing_values: BTreeSet<&'static str>,
     extra_comment: bool,
+    unknown_signature: bool,
 }
 
 impl Options {
@@ -86,8 +88,12 @@ impl Options {
                     self.extra_comment = true;
                 }
             } else {
+                self.unknown_signature |= self.keywords.is_empty() && !utility;
                 self.value(body, arg.value.clone());
             }
+        }
+        if let Some(keyword) = self.section.pending_value(body) {
+            self.missing_values.insert(keyword);
         }
         body.command_lines.retain(|line| !line.is_empty());
     }
@@ -116,6 +122,8 @@ impl Options {
             b"DEPFILE" if !utility => (Section::Depfile, "DEPFILE"),
             b"JOB_POOL" => (Section::JobPool, "JOB_POOL"),
             b"JOB_SERVER_AWARE" => (Section::JobServerAware, "JOB_SERVER_AWARE"),
+            b"OUTPUTS" if !utility => (Section::Legacy, "OUTPUTS"),
+            b"SOURCE" if !utility => (Section::Legacy, "SOURCE"),
             _ => {
                 let keyword = match arg {
                     b"VERBATIM" => (&mut body.verbatim, "VERBATIM"),
@@ -151,7 +159,7 @@ impl Options {
     fn value(&mut self, body: &mut CustomCommand, value: BString) {
         let tagged = |value| BT::new(value, body.backtrace.clone());
         match self.section {
-            Section::None => {}
+            Section::None | Section::Legacy => {}
             Section::Command => {
                 if let Some(line) = body.command_lines.last_mut() {
                     line.push(value);
@@ -202,31 +210,55 @@ fn add_command(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
     let mut body = new_command(cx);
     let mut options = Options::default();
     options.parse(&mut body, args, false);
+    if options.unknown_signature {
+        return Err(crate::command_error(
+            cx,
+            "add_custom_command Wrong syntax.  Unknown type of argument.",
+        ));
+    }
+    if options.append && body.outputs.is_empty() {
+        return Err(crate::command_error(
+            cx,
+            "add_custom_command given APPEND option with no OUTPUT.",
+        ));
+    }
 
     for keyword in &options.missing_values {
-        check_policy(
+        if !check_policy(
             cx,
             format!("Keyword {keyword} requires a value, but none was given."),
-        )?;
+            b"",
+        ) {
+            return Ok(Flow::Normal);
+        }
     }
-    if options.extra_comment {
-        check_policy(
+    if options.extra_comment
+        && !check_policy(
             cx,
             "COMMENT requires exactly one argument, but multiple values or COMMENT keywords have been given.",
-        )?;
+            b"",
+        )
+    {
+        return Ok(Flow::Normal);
     }
 
     match (&options.target, body.outputs.is_empty()) {
         (Some(target), true) => return add_event(cx, body, &options, target),
         (None, false) => {}
-        _ => {
+        (Some(_), false) => {
+            return Err(crate::command_error(
+                cx,
+                "add_custom_command Wrong syntax.  A TARGET and OUTPUT can not both be specified.",
+            ));
+        }
+        (None, true) => {
             return Err(CmdError::status(
                 "Wrong syntax. A TARGET or OUTPUT must be specified.",
             ));
         }
     }
 
-    if options.append {
+    let valid = if options.append {
         check_keywords(
             cx,
             &options,
@@ -242,7 +274,7 @@ fn add_command(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
                 "COMMENT",
             ],
             "using APPEND with add_custom_command(OUTPUT)",
-        )?;
+        )
     } else {
         check_keywords(
             cx,
@@ -267,7 +299,10 @@ fn add_command(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
                 "CODEGEN",
             ],
             "using add_custom_command(OUTPUT)",
-        )?;
+        )
+    };
+    if !valid {
+        return Ok(Flow::Normal);
     }
     if body.depfile.is_some() && !body.implicit_depends.is_empty() {
         return Err(CmdError::status(
@@ -296,40 +331,42 @@ fn add_command(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
     Ok(Flow::Normal)
 }
 
-fn check_keywords(
-    cx: &mut Cx<'_>,
-    options: &Options,
-    allowed: &[&str],
-    context: &str,
-) -> Result<(), CmdError> {
+fn check_keywords(cx: &mut Cx<'_>, options: &Options, allowed: &[&str], context: &str) -> bool {
     let unsupported: Vec<_> = options
         .keywords
         .iter()
         .copied()
         .filter(|keyword| !allowed.contains(keyword))
         .collect();
-    if !unsupported.is_empty() {
-        check_policy(
+    unsupported.is_empty()
+        || check_policy(
             cx,
             format!(
                 "The following keywords are not supported when {context}: {}",
                 unsupported.join(", ")
             ),
-        )?;
-    }
-    Ok(())
+            b"",
+        )
 }
 
-fn check_policy(cx: &mut Cx<'_>, message: impl Into<BString>) -> Result<(), CmdError> {
+fn check_policy(cx: &mut Cx<'_>, message: impl Into<BString>, advice: &[u8]) -> bool {
     let policy = PolicyId::new(175);
     match cx.policy(policy) {
-        PolicyStatus::New => Err(crate::command_error(cx, message)),
-        PolicyStatus::Warn => {
-            let message = message.into();
-            cx.issue_policy_warning(policy, b"", &message);
-            Ok(())
+        PolicyStatus::New => {
+            cx.issue(MessageKind::Error, Effect::SetError, None, message.into());
+            false
         }
-        PolicyStatus::Old => Ok(()),
+        PolicyStatus::Warn => {
+            let mut message = message.into();
+            if !message.ends_with(b".") {
+                message.push(b'.');
+            }
+            message.extend_from_slice(advice);
+            message.push(b'\n');
+            cx.issue_policy_warning(policy, &message, b"");
+            true
+        }
+        PolicyStatus::Old => true,
     }
 }
 
@@ -365,7 +402,7 @@ fn add_event(
     options: &Options,
     name: &[u8],
 ) -> CmdResult {
-    check_keywords(
+    if !check_keywords(
         cx,
         options,
         &[
@@ -378,20 +415,28 @@ fn add_event(
             "BYPRODUCTS",
             "WORKING_DIRECTORY",
             "COMMENT",
+            "JOB_SERVER_AWARE",
             "VERBATIM",
             "COMMAND_EXPAND_LISTS",
             "USES_TERMINAL",
         ],
         "using add_custom_command(TARGET)",
-    )?;
-    if options.events.len() != 1 {
-        check_policy(
+    ) {
+        return Ok(Flow::Normal);
+    }
+    if options.events.len() != 1
+        && !check_policy(
             cx,
             "Exactly one of PRE_BUILD, PRE_LINK, or POST_BUILD must be given.",
-        )?;
+            b"  Assuming POST_BUILD to preserve backward compatibility.",
+        )
+    {
+        return Ok(Flow::Normal);
     }
-    if body.command_lines.is_empty() {
-        check_policy(cx, "At least one COMMAND must be given.")?;
+    if body.command_lines.is_empty()
+        && !check_policy(cx, "At least one COMMAND must be given.", b"")
+    {
+        return Ok(Flow::Normal);
     }
     let event = options
         .events
@@ -487,6 +532,19 @@ fn add_target(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
         ..Options::default()
     };
     options.parse(&mut body, args, true);
+    if body.command_lines.is_empty() {
+        let required = if body.uses_terminal {
+            Some("USES_TERMINAL")
+        } else {
+            (!body.byproducts.is_empty()).then_some("BYPRODUCTS")
+        };
+        if let Some(keyword) = required {
+            return Err(crate::command_error(
+                cx,
+                format!("{keyword} may not be specified without any COMMAND"),
+            ));
+        }
+    }
     resolve_paths(cx, &mut body)?;
 
     let mut target = Target::new(

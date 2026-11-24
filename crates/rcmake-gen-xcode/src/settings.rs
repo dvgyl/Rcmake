@@ -191,15 +191,18 @@ impl Product {
         format!("{}{}.{version}{}", self.prefix, self.name, self.suffix)
     }
 
-    pub(crate) fn version_links(&self) -> Option<(String, Vec<String>)> {
-        let version = self.library_version()?;
+    pub(crate) fn version_links(&self) -> Vec<(String, String)> {
+        let Some(version) = self.library_version() else {
+            return Vec::new();
+        };
         let actual = self.versioned_file(version);
         let soname = self.versioned_file(self.soversion.as_deref().unwrap_or(version));
-        let mut aliases = vec![self.file()];
+        let mut links = Vec::new();
         if actual != soname {
-            aliases.push(soname);
+            links.push((soname.clone(), actual));
         }
-        Some((actual, aliases))
+        links.push((self.file(), soname));
+        links
     }
 
     fn link_file(&self) -> String {

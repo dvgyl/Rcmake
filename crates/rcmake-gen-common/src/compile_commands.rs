@@ -12,7 +12,7 @@ use crate::{GenError, write_if_changed};
 
 /// Render `compile_commands.json` for one build graph.
 pub fn render(graph: &BuildGraph, build_dir: &[u8]) -> Result<BString, GenError> {
-    render_with_directories(graph, build_dir, &HashMap::new())
+    render_with_directories(std::iter::once(graph), build_dir, &HashMap::new())
 }
 
 /// Render `compile_commands.json` with the selected generator's path conventions.
@@ -22,6 +22,9 @@ pub fn render_for_generator(
     build_dir: &[u8],
     generator: GeneratorKind,
 ) -> Result<BString, GenError> {
+    if generator == GeneratorKind::NinjaMultiConfig {
+        return render_with_directories(&result.graphs, build_dir, &HashMap::new());
+    }
     if generator != GeneratorKind::UnixMakefiles {
         return render(graph, build_dir);
     }
@@ -39,17 +42,17 @@ pub fn render_for_generator(
             })
         })
         .collect();
-    render_with_directories(graph, build_dir, &directories)
+    render_with_directories(std::iter::once(graph), build_dir, &directories)
 }
 
-fn render_with_directories(
-    graph: &BuildGraph,
+fn render_with_directories<'a>(
+    graphs: impl IntoIterator<Item = &'a BuildGraph>,
     build_dir: &[u8],
     directories: &HashMap<&[u8], &[u8]>,
 ) -> Result<BString, GenError> {
     let mut out = BString::from("[");
     let mut separator = b"\n".as_slice();
-    for step in &graph.steps {
+    for step in graphs.into_iter().flat_map(|graph| &graph.steps) {
         let BuildStep::Compile {
             object,
             source,

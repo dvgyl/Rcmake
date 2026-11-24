@@ -81,6 +81,17 @@ impl Evaluator<'_> {
         if values.iter().any(|v| !valid_id(v)) {
             return Err(call.error("Expression syntax not recognized."));
         }
+        if let Some(configs) = call
+            .ctx
+            .current
+            .and_then(|target| self.host.imported_config_matches(target, &call.ctx.config))
+        {
+            return Ok(boolean(configs.iter().any(|config| {
+                values
+                    .iter()
+                    .any(|value| value.eq_ignore_ascii_case(config))
+            })));
+        }
         if values.iter().any(|v| call.ctx.config.matches(v)) {
             return Ok(boolean(true));
         }
@@ -205,6 +216,12 @@ impl Evaluator<'_> {
             }) else {
                 return Err(call.error(format!("specified unknown feature \"{feature}\"")));
             };
+            if self.host.language_enabled(lang) == Some(false) {
+                return Err(call.error(format!(
+                    "cannot use features from non-enabled language {}",
+                    BString::from(lang)
+                )));
+            }
             let mut key = b"CMAKE_".to_vec();
             key.extend_from_slice(lang);
             key.extend_from_slice(b"_COMPILE_FEATURES");

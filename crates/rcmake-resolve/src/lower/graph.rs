@@ -19,9 +19,9 @@ use super::pch::{self, PchFlags};
 use super::{compute_artifacts, linker_language};
 use crate::ide::{IdeCustomPhase, IdeCustomStep};
 use crate::{
-    ArtifactSet, BuildGraph, BuildStep, CompileUnit, CustomStep, GraphTarget, LinkFragmentRole,
-    LinkKind, LinkStep, ResolveError, ResolvedTarget, sources::TargetInputs, unity::TargetUnity,
-    usage::UsageResolver,
+    ArtifactSet, BuildGraph, BuildStep, CompileUnit, CrossConfiguration, CustomStep, GraphTarget,
+    LinkFragmentRole, LinkKind, LinkStep, ResolveError, ResolvedTarget, sources::TargetInputs,
+    unity::TargetUnity, usage::UsageResolver,
 };
 
 /// Lower resolved targets for one configuration.
@@ -40,9 +40,14 @@ pub fn lower(
         &mut UsageResolver::new(model),
         &mut IndexMap::new(),
         &mut BTreeMap::new(),
+        None,
     )
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Lowering writes compile inputs and IDE steps alongside the graph."
+)]
 pub(crate) fn lower_with_inputs(
     model: &ProjectModel,
     targets: &[ResolvedTarget],
@@ -51,6 +56,7 @@ pub(crate) fn lower_with_inputs(
     usage: &mut UsageResolver<'_>,
     ide_custom: &mut IndexMap<TargetId, Vec<IdeCustomStep>>,
     compile_inputs: &mut BTreeMap<BString, Vec<BString>>,
+    cross: Option<CrossConfiguration<'_>>,
 ) -> Result<BuildGraph, ResolveError> {
     let resolved: IndexMap<_, _> = targets
         .iter()
@@ -73,8 +79,8 @@ pub(crate) fn lower_with_inputs(
         config: config.clone(),
         ..BuildGraph::default()
     };
-    let commands = Commands::new(model, &resolved, config, usage, &mut graph.steps)?;
-    let precompiled = pch::Plans::new(model, &resolved, config, usage)?;
+    let commands = Commands::new(model, &resolved, config, cross, usage, &mut graph.steps)?;
+    let precompiled = pch::Plans::new(model, &resolved, inputs, config, usage)?;
     let rule_count = graph.steps.len();
     let mut unity_prerequisites = Vec::new();
     for (target, resolved) in local {
@@ -131,7 +137,51 @@ pub(crate) fn lower_with_inputs(
         });
     }
     graph.targets.extend(unity_prerequisites);
+    if usage.ide() == Some(crate::ide::IdeFlavor::Xcode) {
+        remove_inherited_xcode_rules(&graph, &target_indices, rule_count, ide_custom);
+    }
     Ok(graph)
+}
+
+fn remove_inherited_xcode_rules(
+    graph: &BuildGraph,
+    targets: &IndexMap<TargetId, usize>,
+    rule_count: usize,
+    ide_custom: &mut IndexMap<TargetId, Vec<IdeCustomStep>>,
+) {
+    for (&id, &index) in targets {
+        let Some(target) = graph.targets.get(index) else {
+            continue;
+        };
+        let Some(steps) = ide_custom.get_mut(&id) else {
+            continue;
+        };
+        if !target.steps.iter().any(|step| *step < rule_count) {
+            continue;
+        }
+        let mut pending = target.depends.clone();
+        let mut visited = IndexSet::from([index]);
+        let mut inherited = IndexSet::<usize>::new();
+        while let Some(dependency) = pending.pop() {
+            if visited.insert(dependency)
+                && let Some(dependency) = graph.targets.get(dependency)
+            {
+                pending.extend(&dependency.depends);
+                inherited.extend(
+                    dependency
+                        .steps
+                        .iter()
+                        .copied()
+                        .filter(|step| *step < rule_count),
+                );
+            }
+        }
+        let mut rules = target.steps.iter().filter(|step| **step < rule_count);
+        steps.retain(|step| {
+            step.phase != IdeCustomPhase::Rule
+                || rules.next().is_none_or(|rule| !inherited.contains(rule))
+        });
+    }
 }
 
 struct TargetPlan<'a> {
@@ -301,7 +351,7 @@ impl<'a> TargetPlan<'a> {
                 .and_then(|inputs| inputs.standard_requirements.get(&group.language).copied());
             let pch = precompiled
                 .find(resolved.id, &group.language)
-                .filter(|_| !pch::skip_unit(model, target, unit));
+                .filter(|_| !pch::skip_unit(model, target, unit, self.inputs));
             if let Some((owner, plan)) = pch {
                 if owner != resolved.id {
                     self.dependencies.insert(owner);
@@ -409,7 +459,15 @@ impl<'a> TargetPlan<'a> {
                 step,
                 objects,
                 position_independent,
-            )?;
+            )
+            .map_err(|error| {
+                if let ResolveError::Message(body) = &error
+                    && let Some(paths) = usage.source_paths()
+                {
+                    return paths.target_error(model, target, body.clone());
+                }
+                error
+            })?;
             let link = attach_link_events(model, artifacts, link, before, after);
             self.steps.insert(push(graph_steps, link));
         } else {

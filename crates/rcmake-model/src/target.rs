@@ -4,7 +4,65 @@ use indexmap::IndexMap;
 use rcmake_base::{BString, list};
 use rcmake_diag::{Backtrace, PolicyMap};
 
-use crate::{BT, CommandId, DirId, FileSetId, PropertyMap, TargetId};
+use crate::{BT, CommandId, DirId, FileSetId, ProjectModel, PropertyMap, TargetId};
+
+impl ProjectModel {
+    /// Check a compile feature against the known and compiler-supported feature tables.
+    ///
+    /// # Errors
+    ///
+    /// Returns the diagnostic text for an unknown or unavailable feature.
+    pub fn validate_compile_feature<'a>(
+        &self,
+        feature: &[u8],
+        definition: impl Fn(&[u8]) -> Option<&'a BString>,
+    ) -> Result<(), BString> {
+        for language in [b"C".as_slice(), b"CXX", b"CUDA", b"HIP"] {
+            let key = |suffix: &[u8]| [b"CMAKE_", language, suffix].concat();
+            let contains = |table: &BString| {
+                list::split(table, list::Empty::Drop)
+                    .iter()
+                    .any(|value| value == feature)
+            };
+            let available = definition(&key(b"_COMPILE_FEATURES"));
+            if available.is_some_and(contains) {
+                return Ok(());
+            }
+            if self
+                .global
+                .props
+                .get(&key(b"_KNOWN_FEATURES"))
+                .is_some_and(contains)
+            {
+                if self
+                    .global
+                    .props
+                    .get(b"ENABLED_LANGUAGES")
+                    .is_some_and(|enabled| {
+                        !list::split(enabled, list::Empty::Drop)
+                            .iter()
+                            .any(|entry| entry == language)
+                    })
+                {
+                    return Err(format!(
+                        "cannot use features from non-enabled language {}",
+                        BString::from(language)
+                    )
+                    .into());
+                }
+                return Err(format!(
+                    "compiler does not support feature \"{}\"",
+                    BString::from(feature),
+                )
+                .into());
+            }
+        }
+        if self.global.props.get(b"CMAKE_CXX_KNOWN_FEATURES").is_none() {
+            return Ok(());
+        }
+        Err(format!("specified unknown feature \"{}\"", BString::from(feature)).into())
+    }
+}
 
 /// Target type (`TYPE` target property).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]

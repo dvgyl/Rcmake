@@ -304,10 +304,27 @@ fn generate_multi(
                 .copied()
                 .filter(|&other| other != index),
         );
-        for (graph, files) in included
+        for (output_index, (output, files)) in included
             .clone()
-            .filter_map(|selected| configs.get(selected))
+            .filter_map(|selected| configs.get(selected).map(|config| (selected, config)))
         {
+            let cross = (index != output_index)
+                .then(|| {
+                    result
+                        .cross_graphs
+                        .get(&(graph.input.config.clone(), output.input.config.clone()))
+                })
+                .flatten()
+                .map(|input| {
+                    let artifacts = config_artifacts(result, input);
+                    let mut variant = Graph::new(input, &artifacts, build_dir, output.config)?;
+                    variant.add_aliases(&artifacts, model);
+                    variant.resolve_custom_inputs(model, host);
+                    variant.set_compile_metadata(result);
+                    Ok::<_, GenError>(variant)
+                })
+                .transpose()?;
+            let graph = cross.as_ref().unwrap_or(output);
             graph.emit_into(
                 &mut ninja,
                 &programs.cmake,

@@ -75,6 +75,7 @@ impl Plans {
     pub(super) fn new(
         model: &ProjectModel,
         targets: &IndexMap<TargetId, &ResolvedTarget>,
+        inputs: &IndexMap<TargetId, sources::TargetInputs>,
         config: &ConfigId,
         usage: &mut UsageResolver<'_>,
     ) -> Result<Self, ResolveError> {
@@ -107,7 +108,7 @@ impl Plans {
             let languages = resolved
                 .compile_units
                 .iter()
-                .filter(|unit| !skip_unit(model, target, unit))
+                .filter(|unit| !skip_unit(model, target, unit, inputs.get(&id)))
                 .filter_map(|unit| resolved.compile_groups.get(unit.group))
                 .map(|group| &group.language)
                 .collect::<IndexSet<_>>();
@@ -135,10 +136,16 @@ fn disabled(target: &Target) -> bool {
         .is_some_and(|value| truth::is_on(value))
 }
 
-pub(super) fn skip_unit(model: &ProjectModel, target: &Target, unit: &CompileUnit) -> bool {
+pub(super) fn skip_unit(
+    model: &ProjectModel,
+    target: &Target,
+    unit: &CompileUnit,
+    inputs: Option<&sources::TargetInputs>,
+) -> bool {
     sources::properties(model.dir(target.dir), &unit.source.value)
         .get(b"SKIP_PRECOMPILE_HEADERS")
         .is_some_and(|value| truth::is_on(value))
+        || inputs.is_some_and(|inputs| inputs.sources_without_pch.contains(&unit.source.value))
 }
 
 fn reuse_owner(

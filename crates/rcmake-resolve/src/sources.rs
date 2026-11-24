@@ -8,7 +8,7 @@ use rcmake_diag::{
 };
 use rcmake_genex::{ConfigId, EvalContext};
 use rcmake_host::{FileKind, Follow, Host, Stream, path::to_native};
-use rcmake_model::{BT, Directory, ProjectModel, PropertyMap, TargetId};
+use rcmake_model::{BT, Directory, ProjectModel, PropertyMap, Target, TargetId};
 
 use crate::{
     CompileGroup, InterfaceInclude, ResolveError,
@@ -138,6 +138,7 @@ pub(crate) fn append_compile_flags(
 pub(crate) struct TargetInputs {
     pub(crate) sources: IndexSet<BString>,
     pub(crate) objects: IndexSet<BString>,
+    pub(crate) sources_without_pch: IndexSet<BString>,
     pub(crate) position_independent: Option<bool>,
     pub(crate) standard_requirements: IndexMap<BString, &'static [u8]>,
     pub(crate) unity_groups: IndexMap<BString, Option<BString>>,
@@ -272,23 +273,10 @@ impl<'a> SourcePaths<'a> {
     ) -> Result<BString, ResolveError> {
         self.resolve(dir, &source.value).inspect_err(|error| {
             if !source.backtrace.is_empty() {
-                let frames: Vec<_> = source
-                    .backtrace
-                    .frames()
-                    .enumerate()
-                    .filter(|(index, frame)| *index == 0 || frame.kind != FrameKind::ModuleInclude)
-                    .map(|(_, frame)| frame)
-                    .collect();
-                let backtrace = frames
-                    .into_iter()
-                    .rev()
-                    .fold(Backtrace::default(), |stack, frame| {
-                        stack.push(frame.clone())
-                    });
                 self.emit(
                     model,
                     MessageKind::Error,
-                    Location::Backtrace(backtrace),
+                    Location::Backtrace(source.backtrace.clone()),
                     error.to_string().into(),
                 );
             }
@@ -306,6 +294,25 @@ impl<'a> SourcePaths<'a> {
             relative_base: Some(model.dir(rcmake_model::DirId::ROOT).source_dir.clone()),
             ..RenderOptions::default()
         };
+        let location = match location {
+            Location::Backtrace(trace) => {
+                let frames: Vec<_> = trace
+                    .frames()
+                    .enumerate()
+                    .filter(|(index, frame)| *index == 0 || frame.kind != FrameKind::ModuleInclude)
+                    .map(|(_, frame)| frame)
+                    .collect();
+                Location::Backtrace(
+                    frames
+                        .into_iter()
+                        .rev()
+                        .fold(Backtrace::default(), |trace, frame| {
+                            trace.push(frame.clone())
+                        }),
+                )
+            }
+            other => other,
+        };
         let diagnostic = Diagnostic {
             kind,
             effect: Effect::None,
@@ -316,6 +323,21 @@ impl<'a> SourcePaths<'a> {
         };
         self.host
             .write_out(Stream::Stderr, &render(&diagnostic, &options));
+    }
+
+    pub(crate) fn target_error(
+        &self,
+        model: &ProjectModel,
+        target: &Target,
+        body: BString,
+    ) -> ResolveError {
+        self.emit(
+            model,
+            MessageKind::Error,
+            Location::Backtrace(target.backtrace.clone()),
+            body.clone(),
+        );
+        ResolveError::Reported(body)
     }
 }
 

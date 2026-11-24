@@ -1,6 +1,6 @@
 use indexmap::{IndexMap, IndexSet, map::Entry};
-use rcmake_base::{BString, path_lex::Lexical, truth};
-use rcmake_diag::Backtrace;
+use rcmake_base::{BString, list, path_lex::Lexical, truth};
+use rcmake_diag::{Backtrace, Location, MessageKind};
 use rcmake_genex::EvalContext;
 use rcmake_model::{
     BT, FileSet, FileSetId, FileSetKind, ProjectModel, Target, TargetId, TargetKind, UsageField,
@@ -138,6 +138,16 @@ pub(crate) fn resolve_target<'a>(
             validate_module_source(model, paths, target, &source.value, language.as_ref())?;
         }
         let Some(language) = language else { continue };
+        if member.is_some_and(|member| {
+            member.set.kind == FileSetKind::Sources
+                && member
+                    .set
+                    .props
+                    .get(b"SKIP_PRECOMPILE_HEADERS")
+                    .is_some_and(|value| truth::is_on(value))
+        }) {
+            inputs.sources_without_pch.insert(source.value.clone());
+        }
         if collect_unity && let Some(group) = unity::source_group(id, source_props, member) {
             inputs.unity_groups.insert(source.value.clone(), group);
         }
@@ -155,6 +165,43 @@ pub(crate) fn resolve_target<'a>(
                     ..ctx.clone()
                 };
                 let features = usage.collect(id, UsageField::CompileFeatures, &compile_ctx)?;
+                for feature in &features.entries {
+                    if let Err(message) = model.validate_compile_feature(&feature.value, |key| {
+                        lower::definition(model, target.dir, key)
+                    }) {
+                        if lower::definition(model, target.dir, b"CMAKE_DEBUG_TARGET_PROPERTIES")
+                            .is_some_and(|properties| {
+                                list::split(properties, list::Empty::Drop)
+                                    .iter()
+                                    .any(|property| property == "COMPILE_FEATURES")
+                            })
+                        {
+                            paths.emit(
+                                model,
+                                MessageKind::Log,
+                                Location::Backtrace(feature.backtrace.clone()),
+                                format!(
+                                    "Used compile features for target {}:\n\n * {}",
+                                    target.name, feature.value
+                                )
+                                .into(),
+                            );
+                        }
+                        let mut message = message;
+                        if let Some(first) = message.first_mut() {
+                            first.make_ascii_uppercase();
+                        }
+                        let body =
+                            BString::from(format!("{message} for target \"{}\".", target.name));
+                        paths.emit(
+                            model,
+                            MessageKind::Error,
+                            crate::cxx_modules::generation_location(model, target),
+                            body.clone(),
+                        );
+                        return Err(ResolveError::Reported(body));
+                    }
+                }
                 if let Some(standard) = lower::required_standard(&language, &features.entries) {
                     inputs
                         .standard_requirements

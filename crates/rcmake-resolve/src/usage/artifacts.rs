@@ -1,5 +1,6 @@
 use indexmap::IndexSet;
 use rcmake_base::{BString, list, path_lex::Lexical, truth};
+use rcmake_diag::{PolicyId, PolicyStatus};
 use rcmake_genex::{ArtifactKind, ArtifactPart, ConfigId, EvalContext, GenexError};
 use rcmake_model::{BT, DirId, FileSetKind, Target, TargetId, TargetKind};
 
@@ -695,30 +696,24 @@ fn imported_property(
     property: &[u8],
     config: &ConfigId,
 ) -> Option<(BString, BString)> {
-    let config: BString = if config.0.is_empty() {
-        "NOCONFIG".into()
-    } else {
-        config.0.to_ascii_uppercase().into()
-    };
-    let map = [b"MAP_IMPORTED_CONFIG_", config.as_slice()].concat();
+    if advertised_imports(target) {
+        let selected = selected_imported_config(target, config)?;
+        let path = imported_for_config(target, property, &selected)
+            .filter(|path| !path.is_empty())
+            .or_else(|| {
+                imported_for_config(target, property, b"").filter(|path| !path.is_empty())
+            })?;
+        return Some((path, selected));
+    }
     let select = |config: BString| {
         imported_for_config(target, property, &config)
             .filter(|value| !value.is_empty())
             .map(|value| (value, config))
     };
-    if let Some(mapped) = target.props.get(&map) {
-        return list::split(mapped, list::Empty::Keep)
-            .into_iter()
-            .map(|config| config.to_ascii_uppercase().into())
-            .find_map(select)
-            .or_else(|| {
-                mapped
-                    .is_empty()
-                    .then(|| select(BString::default()))
-                    .flatten()
-            });
+    if let Some(mapped) = imported_config_map(target, config) {
+        return imported_configs(mapped).into_iter().find_map(select);
     }
-    select(config)
+    select(imported_consumer_config(config))
         .or_else(|| select(BString::default()))
         .or_else(|| {
             let available = target.props.get(b"IMPORTED_CONFIGURATIONS")?;
@@ -727,4 +722,91 @@ fn imported_property(
                 .map(|config| config.to_ascii_uppercase().into())
                 .find_map(select)
         })
+}
+
+fn imported_consumer_config(config: &ConfigId) -> BString {
+    if config.0.is_empty() {
+        "NOCONFIG".into()
+    } else {
+        config.0.to_ascii_uppercase().into()
+    }
+}
+
+pub(super) fn imported_config_map<'a>(
+    target: &'a Target,
+    config: &ConfigId,
+) -> Option<&'a BString> {
+    target.props.get(
+        &[
+            b"MAP_IMPORTED_CONFIG_",
+            imported_consumer_config(config).as_slice(),
+        ]
+        .concat(),
+    )
+}
+
+pub(super) fn imported_from_cps(target: &Target) -> bool {
+    target.props.get(b"_RCMAKE_CPS_SOURCE").is_some()
+}
+
+fn advertised_imports(target: &Target) -> bool {
+    imported_from_cps(target)
+        || target.policies.policies.get(PolicyId::new(200)) == PolicyStatus::New
+}
+
+fn imported_configs(value: &[u8]) -> Vec<BString> {
+    if value.is_empty() {
+        return vec![BString::default()];
+    }
+    list::split(value, list::Empty::Keep)
+        .into_iter()
+        .map(|config| config.to_ascii_uppercase().into())
+        .collect()
+}
+
+pub(super) fn selected_imported_config(target: &Target, config: &ConfigId) -> Option<BString> {
+    let consumer = imported_consumer_config(config);
+    let mapping = imported_config_map(target, config).map(|value| imported_configs(value));
+    let advertised = target
+        .props
+        .get(b"IMPORTED_CONFIGURATIONS")
+        .map(|value| imported_configs(value));
+    let location = |config: &[u8]| {
+        [b"IMPORTED_LOCATION".as_slice(), b"IMPORTED_IMPLIB"]
+            .iter()
+            .any(|property| {
+                imported_for_config(target, property, config).is_some_and(|path| !path.is_empty())
+            })
+    };
+    let interface = target.kind == TargetKind::InterfaceLibrary;
+    if advertised_imports(target) {
+        let usable = |config: &[u8]| interface || location(config) || location(b"");
+        return match (mapping, advertised) {
+            (Some(mapped), Some(advertised)) => mapped
+                .into_iter()
+                .find(|config| advertised.contains(config)),
+            (Some(mapped), None) => mapped.into_iter().find(|config| usable(config)),
+            (None, Some(advertised)) if advertised.contains(&consumer) => Some(consumer),
+            (None, Some(advertised)) => advertised.into_iter().next(),
+            (None, None) => usable(&consumer).then_some(consumer),
+        };
+    }
+    if let Some(mapped) = mapping {
+        return mapped
+            .into_iter()
+            .find(|config| location(config))
+            .or_else(|| interface.then_some(consumer));
+    }
+    let advertised = advertised.unwrap_or_default();
+    if location(&consumer) {
+        return Some(consumer);
+    }
+    if location(b"") {
+        return Some(BString::default());
+    }
+    advertised
+        .iter()
+        .find(|config| location(config))
+        .cloned()
+        .or_else(|| interface.then(|| advertised.into_iter().next_back().unwrap_or(consumer)))
 }

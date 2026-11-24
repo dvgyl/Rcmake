@@ -3,7 +3,7 @@
 use indexmap::IndexSet;
 use rcmake_base::{BString, list, path_lex::Lexical, shell::quote, truth};
 use rcmake_genex::ConfigId;
-use rcmake_model::{ProjectModel, Target};
+use rcmake_model::{GeneratorKind, ProjectModel, Target};
 
 use super::artifacts::is_darwin;
 use super::launcher;
@@ -192,10 +192,18 @@ pub(super) fn compile_arguments(
         .collect();
     defines.sort_unstable();
     defines.dedup();
+    let intdir = (model.generator == Some(GeneratorKind::NinjaMultiConfig)).then(|| {
+        let mut define = BString::from(b"-DCMAKE_INTDIR=\\\"".as_slice());
+        define.extend_from_slice(&quote(&config.0));
+        define.extend_from_slice(b"\\\"");
+        define
+    });
     let defines = join_words(
-        defines
-            .into_iter()
-            .map(|define| quote(&[b"-D", define].concat())),
+        intdir.into_iter().chain(
+            defines
+                .into_iter()
+                .map(|define| quote(&[b"-D", define].concat())),
+        ),
     );
     let includes = includes(model, target, group);
     if (model

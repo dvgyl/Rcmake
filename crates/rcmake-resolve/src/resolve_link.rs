@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use indexmap::{IndexMap, IndexSet};
 use rcmake_base::{BString, list, path_lex::Lexical, shell::quote};
-use rcmake_genex::{ConfigId, EvalContext};
+use rcmake_genex::{ArtifactKind, ArtifactPart, ConfigId, EvalContext};
 use rcmake_host::path::to_native;
 use rcmake_model::{BT, DirId, ProjectModel, Target, TargetId, UsageField};
 
@@ -11,6 +11,9 @@ use crate::{
     sources::{SourcePaths, TargetInputs},
     usage::{ResolvedLinkItem, ResolvedLinkKind, UsageResolver},
 };
+
+mod features;
+use features::Features;
 
 #[derive(Default)]
 pub(crate) struct ResolvedLink {
@@ -50,8 +53,10 @@ pub(crate) fn resolve_link(
                 .iter()
                 .map(|group| group.language.as_slice())
         });
+    let fallback_language = ctx.link_language.clone();
     let mut ctx = EvalContext {
-        link_language: lower::linker_language(model, target, languages.clone()),
+        link_language: lower::linker_language(model, target, languages.clone())
+            .or_else(|| fallback_language.clone()),
         ..ctx.clone()
     };
     let kind = LinkKind::for_target(target.kind);
@@ -71,6 +76,7 @@ pub(crate) fn resolve_link(
                         .map(|group| group.language.as_slice())
                 });
             lower::linker_language(model, target, languages.clone().chain(linked_languages))
+                .or_else(|| fallback_language.clone())
         };
         let language = language_for(&items);
         if language != ctx.link_language {
@@ -132,9 +138,13 @@ pub(crate) fn resolve_link(
     let mut fragments = Vec::with_capacity(options.len() + directories.len() + items.len());
     for option in &options {
         let value = option.value.as_slice();
-        let text = value
-            .strip_prefix(b"SHELL:")
-            .map_or_else(|| quote(value), BString::from);
+        let text = if value.starts_with(b"LINKER:") {
+            value.into()
+        } else {
+            value
+                .strip_prefix(b"SHELL:")
+                .map_or_else(|| quote(value), BString::from)
+        };
         fragments.push(link_fragment(text, option, LinkFragmentRole::Flags));
     }
     for directory in &directories {
@@ -145,16 +155,22 @@ pub(crate) fn resolve_link(
             LinkFragmentRole::LibraryPath,
         ));
     }
-    for item in &items {
-        append_link_item(
-            model,
-            resolved,
-            target.dir,
-            &ctx.config,
-            item,
-            &mut fragments,
-        );
-    }
+    let mut features = Features::new(model, target, paths, &language);
+    features.append(
+        items.iter().map(Arc::as_ref),
+        &mut fragments,
+        &mut |item, fragments| {
+            append_link_item(
+                model,
+                usage,
+                resolved,
+                target.dir,
+                &ctx.config,
+                item,
+                fragments,
+            );
+        },
+    )?;
     fragments.sort_by_key(|fragment| fragment.role == LinkFragmentRole::Libraries);
     for item in link_items(&items) {
         if let ResolvedLinkKind::Objects(id) = item.kind {
@@ -275,6 +291,7 @@ fn link_items(items: &[Arc<ResolvedLinkItem>]) -> impl Iterator<Item = &Resolved
 
 fn append_link_item(
     model: &ProjectModel,
+    usage: &UsageResolver<'_>,
     resolved: &IndexMap<TargetId, ResolvedTarget>,
     dir: DirId,
     config: &ConfigId,
@@ -285,17 +302,20 @@ fn append_link_item(
     let value = item.text.value.as_slice();
     let (text, role) = match &item.kind {
         ResolvedLinkKind::Library(id) => {
-            let Some(raw) = model.target(*id) else { return };
-            let imported;
-            let artifacts = if let Some(target) = resolved.get(id) {
-                &target.artifacts
+            let path = if let Some(target) = resolved.get(id) {
+                target
+                    .artifacts
+                    .linker_file
+                    .as_ref()
+                    .or(target.artifacts.file.as_ref())
+                    .cloned()
             } else {
-                imported = lower::compute_artifacts(model, raw, config);
-                &imported
+                usage
+                    .artifact(*id, ArtifactKind::LinkerFile, ArtifactPart::Full, config)
+                    .or_else(|| usage.artifact(*id, ArtifactKind::File, ArtifactPart::Full, config))
             };
-            let path = artifacts.linker_file.as_ref().or(artifacts.file.as_ref());
             if let Some(path) = path {
-                append_library_path(model, dir, path, &item.text, fragments);
+                append_library_path(model, dir, &path, &item.text, fragments);
                 return;
             }
             (raw_library(value), Libraries)
@@ -303,11 +323,12 @@ fn append_link_item(
         ResolvedLinkKind::Objects(_) | ResolvedLinkKind::Interface(_) => return,
         ResolvedLinkKind::Group { members, .. } => {
             for member in members {
-                append_link_item(model, resolved, dir, config, member, fragments);
+                append_link_item(model, usage, resolved, dir, config, member, fragments);
             }
             return;
         }
         ResolvedLinkKind::ObjectFile => (quote(value), Libraries),
+        ResolvedLinkKind::Raw if value.starts_with(b"LINKER:") => (value.into(), Libraries),
         ResolvedLinkKind::Raw if value.contains(&b'/') && !value.starts_with(b"-") => {
             append_library_path(model, dir, value, &item.text, fragments);
             return;
