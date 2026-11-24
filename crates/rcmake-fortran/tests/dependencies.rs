@@ -63,7 +63,10 @@ fn fixed_form_uses_statement_columns_and_column_six_continuation() -> Result<(),
     source.extend_from_slice(b"; USE PAST_CUTOFF\n      INCLUDE 'a;!''b.inc'\n");
     let info = scan_text(&source, SourceForm::Fixed)?;
     assert_eq!(info.provides, names(&["thing"]));
-    assert_eq!(info.requires, names(&["second_half", "third", "fourth"]));
+    assert_eq!(
+        info.requires,
+        names(&["second_half", "third", "fourth", "past_cutoff"])
+    );
     assert_eq!(info.includes, names(&["a;!'b.inc"]));
     Ok(())
 }
