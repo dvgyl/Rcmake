@@ -2,6 +2,8 @@
 
 #![forbid(unsafe_code)]
 
+use std::ops::Range;
+
 use rcmake_base::BString;
 
 use crate::SourceId;
@@ -31,10 +33,23 @@ pub struct Label {
 /// One text replacement.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Edit {
-    /// Range to replace. An empty range marks an insertion.
+    /// Range to replace. Both offsets must be UTF-8 boundaries in the source.
+    /// An empty range marks an insertion.
     pub span: SourceSpan,
-    /// Bytes to insert. An empty replacement deletes the range.
+    /// UTF-8 bytes to insert. An empty replacement deletes the range.
     pub replacement: BString,
+}
+
+impl Edit {
+    /// Get the range and replacement if they are valid for this UTF-8 source.
+    pub(crate) fn validate(&self, text: &str) -> Option<(Range<usize>, &str)> {
+        let start = usize::try_from(self.span.start).ok()?;
+        let end = usize::try_from(self.span.end).ok()?;
+        let range = start..end;
+        text.get(range.clone())?;
+        let replacement = std::str::from_utf8(self.replacement.as_slice()).ok()?;
+        Some((range, replacement))
+    }
 }
 
 /// Whether a consumer can apply a suggested fix automatically.
@@ -51,7 +66,8 @@ pub enum Confidence {
 pub struct Fix {
     /// Text that describes the fix.
     pub message: BString,
-    /// Edits to apply together. Ranges must not overlap. An empty list gives advice.
+    /// Edits to apply together. Ranges in one source must have distinct start
+    /// offsets and must not overlap. An empty list gives advice.
     pub edits: Vec<Edit>,
     /// Whether a consumer can apply the fix automatically.
     pub confidence: Confidence,

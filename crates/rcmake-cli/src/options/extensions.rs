@@ -44,23 +44,15 @@ impl ProfileRequest {
 
 /// Identifies a subcommand and its arguments in the Native persona.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(
+    dead_code,
+    reason = "Reserved until the Native subcommand handlers are available."
+)]
 pub(crate) enum NativeSubcommand {
     /// Explain where a value came from.
     Explain(Vec<BString>),
     /// Start the language server.
     Lsp(Vec<BString>),
-}
-
-impl NativeSubcommand {
-    /// Parse the first positional argument, if it names a Native subcommand.
-    pub(crate) fn parse(args: &[BString]) -> Option<Self> {
-        let (name, rest) = args.split_first()?;
-        match name.as_slice() {
-            b"explain" => Some(Self::Explain(rest.to_vec())),
-            b"lsp" => Some(Self::Lsp(rest.to_vec())),
-            _ => None,
-        }
-    }
 }
 
 /// Identifies an explicit probe cache request from the command line.
@@ -69,8 +61,16 @@ pub(crate) enum ProbeCacheRequest {
     /// Bypass the probe cache.
     Off,
     /// Compare cached probe results with fresh results.
+    #[allow(
+        dead_code,
+        reason = "Reserved until probe cache verification is available."
+    )]
     Verify,
     /// Request probe cache maintenance.
+    #[allow(
+        dead_code,
+        reason = "Reserved until probe cache maintenance is available."
+    )]
     Clear,
 }
 
@@ -82,6 +82,10 @@ pub(crate) struct RcmakeExt {
     /// Output directory requested on the command line.
     pub(crate) profile: Option<ProfileRequest>,
     /// Subcommand requested on the command line.
+    #[allow(
+        dead_code,
+        reason = "Reserved until the Native subcommand handlers are available."
+    )]
     pub(crate) subcommand: Option<NativeSubcommand>,
     /// Probe cache mode requested on the command line.
     pub(crate) probe_cache: Option<ProbeCacheRequest>,
@@ -95,13 +99,11 @@ pub(crate) struct RcmakeExt {
 pub(crate) const NATIVE_EXTENSION_HELP: &str = "\
 \nRcmake extensions\n\
   --diagnostics=cmake|rich           Select the diagnostic format.\n\
-  --profile[=<dir>]                 Write a configure profile.\n\
+  --profile                         Write a profile to rcmake-profile in the build directory.\n\
+  --profile=<dir>                   Write a profile to <dir>. For example, use --profile=dir.\n\
   --no-probe-cache                  Bypass the probe cache.\n\
-  --probe-cache=verify|clear        Verify or clear the probe cache.\n\
   --fetch-lock=off|auto|update|frozen  Select the fetch lock mode.\n\
-  --hermetic[=warn|strict]           Check for undeclared inputs. Omit the value to warn.\n\
-  explain, lsp                     Run a Native subcommand.\n\
-  Use -S explain or -S lsp to select a source directory with that name.\n";
+  --hermetic[=warn|strict]           Check for undeclared inputs. Omit the value to warn.\n";
 
 /// Parse one Native extension flag without consuming another argument.
 ///
@@ -113,6 +115,14 @@ pub(crate) fn parse_native_extension_flag(
 ) -> Result<bool, BString> {
     let (flag, value) = split_flag(arg, b'=');
     match flag {
+        b"--diagnostic" => {
+            let hint = match value.and_then(DiagStyle::parse) {
+                Some(DiagStyle::Rich) => "Use --diagnostics=rich.",
+                Some(DiagStyle::Cmake) => "Use --diagnostics=cmake.",
+                None => "Use --diagnostics=cmake or --diagnostics=rich.",
+            };
+            return Err(hint.into());
+        }
         b"--diagnostics" => {
             ext.diagnostics =
                 Some(value.and_then(DiagStyle::parse).ok_or_else(|| {
@@ -122,26 +132,31 @@ pub(crate) fn parse_native_extension_flag(
         b"--profile" => {
             ext.profile = Some(match value {
                 None => ProfileRequest::BuildDefault,
-                Some(b"") => return Err("Specify a directory after --profile=.".into()),
+                Some(b"") => {
+                    return Err(
+                        "Specify a profile directory. For example, use --profile=dir.".into(),
+                    );
+                }
                 Some(dir) => ProfileRequest::Directory(to_native(dir)),
             });
         }
         b"--no-probe-cache" if value.is_none() => ext.probe_cache = Some(ProbeCacheRequest::Off),
         b"--no-probe-cache" => return Err("Use --no-probe-cache without a value.".into()),
-        b"--probe-cache" => {
-            ext.probe_cache = Some(match value {
-                Some(b"verify") => ProbeCacheRequest::Verify,
-                Some(b"clear") => ProbeCacheRequest::Clear,
-                _ => return Err("Use --probe-cache=verify or --probe-cache=clear.".into()),
-            });
-        }
         b"--fetch-lock" => {
             ext.fetch_lock = Some(match value {
                 Some(b"off") => FetchLockMode::Off,
                 Some(b"auto") => FetchLockMode::Auto,
                 Some(b"update") => FetchLockMode::Update,
                 Some(b"frozen") => FetchLockMode::Frozen,
-                _ => return Err("Set --fetch-lock to off, auto, update, or frozen.".into()),
+                Some(value) => {
+                    let value = String::from_utf8_lossy(value);
+                    return Err(format!(
+                        "Invalid fetch lock mode {value:?}. Valid modes are off, auto, update, and frozen. For example, use --fetch-lock=frozen."
+                    ).into());
+                }
+                None => {
+                    return Err("Specify off, auto, update, or frozen after --fetch-lock=. For example, use --fetch-lock=frozen.".into());
+                }
             });
         }
         b"--hermetic" => {
@@ -189,16 +204,6 @@ mod tests {
             ext.profile,
             Some(ProfileRequest::Directory("data=a".into()))
         );
-        assert!(parse_native_extension_flag(
-            b"--probe-cache=verify",
-            &mut ext
-        )?);
-        assert_eq!(ext.probe_cache, Some(ProbeCacheRequest::Verify));
-        assert!(parse_native_extension_flag(
-            b"--probe-cache=clear",
-            &mut ext
-        )?);
-        assert_eq!(ext.probe_cache, Some(ProbeCacheRequest::Clear));
         Ok(())
     }
 
@@ -210,7 +215,6 @@ mod tests {
             "--diagnostics=json",
             "--profile=",
             "--no-probe-cache=1",
-            "--probe-cache=off",
             "--fetch-lock",
             "--fetch-lock=typo",
             "--hermetic=",
@@ -222,7 +226,41 @@ mod tests {
     }
 
     #[test]
-    fn resolves_profile_paths_and_matches_only_first_argument_for_subcommands() {
+    fn reports_native_option_corrections() {
+        let mut ext = RcmakeExt::default();
+        for (flag, hint) in [
+            ("--diagnostic=rich", "--diagnostics=rich"),
+            ("--profile=", "--profile=dir"),
+            ("--fetch-lock=bad", "--fetch-lock=frozen"),
+        ] {
+            let result = parse_native_extension_flag(flag.as_bytes(), &mut ext);
+            assert!(matches!(result, Err(message) if message.to_string().contains(hint)));
+        }
+        let result = parse_native_extension_flag(b"--fetch-lock=bad", &mut ext);
+        assert!(matches!(result, Err(message) if message.to_string().contains("\"bad\"")));
+    }
+
+    #[test]
+    fn leaves_reserved_extensions_inactive() -> Result<(), BString> {
+        let mut ext = RcmakeExt::default();
+        for name in [
+            "--probe-cache=verify",
+            "--probe-cache=clear",
+            "explain",
+            "lsp",
+        ] {
+            assert!(!parse_native_extension_flag(name.as_bytes(), &mut ext)?);
+        }
+        assert_eq!(ext.probe_cache, None);
+        assert_eq!(ext.subcommand, None);
+        assert!(!NATIVE_EXTENSION_HELP.contains("--probe-cache="));
+        assert!(!NATIVE_EXTENSION_HELP.contains("explain"));
+        assert!(!NATIVE_EXTENSION_HELP.contains("lsp"));
+        Ok(())
+    }
+
+    #[test]
+    fn resolves_profile_paths() {
         let host = PureHost::default();
         assert_eq!(ProfileRequest::from_env(&host), None);
         host.env_set(b"RCMAKE_PROFILE", Some(b"reports"));
@@ -234,22 +272,6 @@ mod tests {
         assert_eq!(
             ProfileRequest::BuildDefault.output_directory(Path::new("build"), &host),
             host.initial_cwd().join("build/rcmake-profile"),
-        );
-        let args = ["explain".into(), "target".into(), "demo".into()];
-        assert_eq!(
-            NativeSubcommand::parse(&args),
-            Some(NativeSubcommand::Explain(vec![
-                "target".into(),
-                "demo".into()
-            ]))
-        );
-        assert_eq!(
-            NativeSubcommand::parse(&["lsp".into()]),
-            Some(NativeSubcommand::Lsp(Vec::new()))
-        );
-        assert_eq!(
-            NativeSubcommand::parse(&["-S".into(), "explain".into()]),
-            None
         );
     }
 }

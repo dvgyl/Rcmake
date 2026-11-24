@@ -55,16 +55,19 @@ pub(crate) fn persona_from_argv0(argv0: &OsStr) -> Persona {
     }
 }
 
+/// Return whether this invocation uses oracle mode.
+pub(crate) fn oracle_mode(host: &dyn Host) -> bool {
+    host.env_get(b"RCMAKE_ORACLE_MODE")
+        .is_some_and(|value| value.as_slice() == b"1")
+}
+
 /// Select the style from oracle mode, a Native flag, the environment, or the terminal.
 pub(crate) fn resolve_diag_style(
     persona: Persona,
     cli_override: Option<DiagStyle>,
     host: &dyn Host,
 ) -> DiagStyle {
-    if host
-        .env_get(b"RCMAKE_ORACLE_MODE")
-        .is_some_and(|value| value.as_slice() == b"1")
-    {
+    if oracle_mode(host) {
         return DiagStyle::Cmake;
     }
     if persona == Persona::Native
@@ -79,6 +82,23 @@ pub(crate) fn resolve_diag_style(
         return style;
     }
     terminal_style(persona, || host.is_terminal(Stream::Stderr))
+}
+
+/// Select ANSI color for rich diagnostics on standard error.
+/// Oracle mode disables color. `CLICOLOR_FORCE=1` takes precedence over `NO_COLOR`.
+pub(crate) fn resolve_rich_color(host: &dyn Host, stderr_is_tty: bool, style: DiagStyle) -> bool {
+    style == DiagStyle::Rich
+        && !oracle_mode(host)
+        && (host
+            .env_get(b"CLICOLOR_FORCE")
+            .is_some_and(|value| value.as_slice() == b"1")
+            || (stderr_is_tty && host.env_get(b"NO_COLOR").is_none()))
+}
+
+/// Set the resolved diagnostic style in the host environment for CLI-owned children.
+/// Call this before the host captures the child environment.
+pub(crate) fn stick_diag_style(host: &dyn Host, style: DiagStyle) {
+    host.env_set(b"RCMAKE_DIAGNOSTICS", Some(style.as_bytes()));
 }
 
 fn terminal_style(persona: Persona, is_terminal: impl FnOnce() -> bool) -> DiagStyle {
@@ -134,5 +154,39 @@ mod tests {
         for style in [DiagStyle::Cmake, DiagStyle::Rich] {
             assert_eq!(DiagStyle::parse(style.as_bytes()), Some(style));
         }
+    }
+
+    #[test]
+    fn rich_color_obeys_oracle_force_and_terminal_precedence() {
+        let host = PureHost::default();
+        let color = |tty, style| resolve_rich_color(&host, tty, style);
+        assert!(!color(false, DiagStyle::Rich));
+        assert!(color(true, DiagStyle::Rich));
+
+        host.env_set(b"NO_COLOR", Some(b""));
+        assert!(!color(true, DiagStyle::Rich));
+        host.env_set(b"CLICOLOR_FORCE", Some(b"0"));
+        assert!(!color(true, DiagStyle::Rich));
+        host.env_set(b"CLICOLOR_FORCE", Some(b"1"));
+        assert!(color(false, DiagStyle::Rich));
+        assert!(!color(true, DiagStyle::Cmake));
+
+        host.env_set(b"RCMAKE_ORACLE_MODE", Some(b"1"));
+        assert!(!color(true, DiagStyle::Rich));
+    }
+
+    #[test]
+    fn child_style_uses_the_value_written_to_the_host() {
+        let host = PureHost::default();
+        stick_diag_style(&host, DiagStyle::Rich);
+        assert_eq!(
+            resolve_diag_style(Persona::Compat, None, &host),
+            DiagStyle::Rich
+        );
+
+        host.env_set(b"RCMAKE_ORACLE_MODE", Some(b"1"));
+        let style = resolve_diag_style(Persona::Native, Some(DiagStyle::Rich), &host);
+        stick_diag_style(&host, style);
+        assert_eq!(host.env_get(b"RCMAKE_DIAGNOSTICS"), Some("cmake".into()));
     }
 }

@@ -2,14 +2,19 @@
 
 #![forbid(unsafe_code)]
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::cmp::{Ordering, Reverse};
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap};
+use std::io::ErrorKind;
+use std::mem::size_of;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
+use std::thread::{self, ThreadId};
 use std::time::Duration;
 
 use rcmake_base::{BString, Limits};
-use rcmake_eval::{CommandSample, Interp, SampleKind};
-use rcmake_host::{Host, HostError, HostResult, Stream, WriteMode};
+use rcmake_eval::Interp;
+use rcmake_host::{FileKind, Follow, Host, HostError, HostResult, Stream, WriteMode};
 use rcmake_json::{Value, write_compact};
 
 mod flamegraph;
@@ -112,27 +117,36 @@ pub(crate) fn attach_profilers(
     }
     let legacy = legacy.cloned();
     let native = native.cloned();
-    interp.set_command_profiler(Some(Arc::new(move |sample| {
-        if let Some(legacy) = &legacy
-            && sample.kind != SampleKind::ListFile
-        {
-            legacy.event(
-                sample.name,
-                sample.file,
-                sample.line,
-                sample.start,
-                sample.elapsed,
-            );
+    interp.set_command_profiler(Some(Arc::new(move |name, file, line, start, elapsed| {
+        if let Some(legacy) = &legacy {
+            legacy.event(name, file, line, start, elapsed);
         }
         if let Some(native) = &native {
-            native.record_command(sample);
+            // The current evaluator callback supplies only timing and location.
+            native.record_sample(
+                ProfileSample {
+                    name,
+                    file,
+                    line,
+                    depth: 0,
+                    start,
+                    elapsed,
+                    kind: ProfileKind::Builtin,
+                },
+                true,
+            );
         }
     })));
 }
 
 const MAX_SAMPLES: usize = 4_000_000;
+const MAX_SAMPLE_BYTES: usize = 96 * 1024 * 1024;
 const MAX_SITES: usize = 256 * 1024;
 const MAX_LABEL_BYTES: usize = 32 * 1024 * 1024;
+const MAX_LABEL_SIZE: usize = 16 * 1024;
+const TRACE_BYTES: usize = 64 * 1024 * 1024;
+const FOLDED_BYTES: usize = 32 * 1024 * 1024;
+const HTML_BYTES: usize = 16 * 1024 * 1024;
 
 /// Identifies a phase of configuration or generation.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -236,9 +250,9 @@ pub(crate) struct ProfileRecorder {
 struct State {
     labels: BTreeSet<Arc<[u8]>>,
     label_bytes: usize,
-    spans: Vec<Span>,
-    sites: BTreeMap<Site, Totals>,
-    trace_bytes: usize,
+    spans: BinaryHeap<Span>,
+    sites: BTreeMap<Site, usize>,
+    clipped_labels: usize,
     dropped_spans: usize,
     dropped_totals: usize,
     command_count: usize,
@@ -250,7 +264,10 @@ impl State {
             return Arc::clone(label);
         }
         let estimate = |bytes: &[u8]| bytes.len().saturating_add(64);
-        let bytes = if self.label_bytes.saturating_add(estimate(bytes)) > MAX_LABEL_BYTES {
+        let bytes = if bytes.len() > MAX_LABEL_SIZE
+            || self.label_bytes.saturating_add(estimate(bytes)) > MAX_LABEL_BYTES
+        {
+            self.clipped_labels = self.clipped_labels.saturating_add(1);
             let fallback = b"[label limit reached]".as_slice();
             if let Some(label) = self.labels.get(fallback) {
                 return Arc::clone(label);
@@ -274,11 +291,17 @@ struct Site {
     kind: ProfileKind,
 }
 
+#[derive(Clone)]
 struct Span {
     site: Site,
     depth: u32,
+    infer_depth: bool,
     start: Duration,
     elapsed: Duration,
+    thread: ThreadId,
+    parent: Option<usize>,
+    tid: u32,
+    self_time: Duration,
 }
 
 impl Span {
@@ -287,23 +310,60 @@ impl Span {
     }
 }
 
+impl PartialEq for Span {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other).is_eq()
+    }
+}
+
+impl Eq for Span {}
+
+impl PartialOrd for Span {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Span {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.start
+            .cmp(&other.start)
+            .then_with(|| other.elapsed.cmp(&self.elapsed))
+            .then_with(|| self.depth.cmp(&other.depth))
+            .then_with(|| {
+                other
+                    .site
+                    .kind
+                    .is_eval_phase()
+                    .cmp(&self.site.kind.is_eval_phase())
+            })
+            .then_with(|| self.site.cmp(&other.site))
+    }
+}
+
 #[derive(Clone, Copy, Default)]
-struct Totals {
-    count: usize,
+struct Coverage {
+    until: Duration,
     elapsed: Duration,
 }
 
-impl Totals {
-    fn add(&mut self, other: Self) {
-        self.count = self.count.saturating_add(other.count);
-        self.elapsed = self.elapsed.saturating_add(other.elapsed);
+impl Coverage {
+    // Intervals arrive in start order.
+    fn add(&mut self, start: Duration, end: Duration) {
+        self.elapsed = self
+            .elapsed
+            .saturating_add(end.saturating_sub(start.max(self.until)));
+        self.until = self.until.max(end);
     }
 }
 
 impl ProfileRecorder {
     /// Start an empty native profile.
     pub(crate) fn new() -> Self {
-        Self::with_limits(MAX_SAMPLES, Limits::default().max_value_bytes)
+        Self::with_limits(
+            MAX_SAMPLES.min(MAX_SAMPLE_BYTES / size_of::<Span>()),
+            TRACE_BYTES,
+        )
     }
 
     fn with_limits(sample_limit: usize, trace_limit: usize) -> Self {
@@ -314,25 +374,12 @@ impl ProfileRecorder {
         }
     }
 
-    fn record_command(&self, sample: &CommandSample<'_>) {
-        self.record(ProfileSample {
-            name: sample.name,
-            file: sample.file,
-            line: sample.line,
-            depth: sample.depth,
-            start: sample.start,
-            elapsed: sample.elapsed,
-            kind: match sample.kind {
-                SampleKind::Builtin => ProfileKind::Builtin,
-                SampleKind::Function => ProfileKind::Function,
-                SampleKind::Macro => ProfileKind::Macro,
-                SampleKind::ListFile => ProfileKind::ListFile,
-            },
-        });
+    /// Store a sample with its evaluator depth and update the call counts.
+    pub(crate) fn record(&self, sample: ProfileSample<'_>) {
+        self.record_sample(sample, false);
     }
 
-    /// Store a sample and update the terminal totals.
-    pub(crate) fn record(&self, sample: ProfileSample<'_>) {
+    fn record_sample(&self, sample: ProfileSample<'_>, infer_depth: bool) {
         let Ok(mut state) = self.state.lock() else {
             return;
         };
@@ -346,42 +393,37 @@ impl ProfileRecorder {
             state.command_count = state.command_count.saturating_add(1);
         }
         let new_site_allowed = state.sites.len() < MAX_SITES;
-        if let Some(totals) = state.sites.get_mut(&site) {
-            totals.add(Totals {
-                count: 1,
-                elapsed: sample.elapsed,
-            });
+        if let Some(count) = state.sites.get_mut(&site) {
+            *count = count.saturating_add(1);
         } else if new_site_allowed || matches!(site.kind, ProfileKind::Phase(_)) {
-            state.sites.insert(
-                site.clone(),
-                Totals {
-                    count: 1,
-                    elapsed: sample.elapsed,
-                },
-            );
+            state.sites.insert(site.clone(), 1);
         } else {
             state.dropped_totals = state.dropped_totals.saturating_add(1);
         }
 
-        // Reserve for the fixed fields and up to six output bytes per input byte.
-        let estimate = site
-            .name
-            .len()
-            .saturating_add(site.file.len())
-            .saturating_mul(6)
-            .saturating_add(256);
-        let total_bytes = state.trace_bytes.saturating_add(estimate);
-        if state.spans.len() >= self.sample_limit || total_bytes > self.trace_limit {
-            state.dropped_spans = state.dropped_spans.saturating_add(1);
-            return;
-        }
-        state.trace_bytes = total_bytes;
-        state.spans.push(Span {
+        let span = Span {
             site,
             depth: sample.depth,
+            infer_depth,
             start: sample.start,
             elapsed: sample.elapsed,
-        });
+            thread: thread::current().id(),
+            parent: None,
+            tid: 0,
+            self_time: sample.elapsed,
+        };
+        if state.spans.len() < self.sample_limit {
+            state.spans.push(span);
+        } else {
+            state.dropped_spans = state.dropped_spans.saturating_add(1);
+            // Completion order puts children first. Keep the earliest spans, with
+            // enclosing spans first when start times match.
+            if let Some(mut latest) = state.spans.peek_mut()
+                && span < *latest
+            {
+                *latest = span;
+            }
+        }
     }
 
     /// Store a phase sample with times from the host's monotonic clock.
@@ -397,7 +439,7 @@ impl ProfileRecorder {
         });
     }
 
-    /// Write the profile files and the terminal summary.
+    /// Write the terminal summary and publish the complete native profile files.
     pub(crate) fn write(
         &self,
         host: &dyn Host,
@@ -408,45 +450,299 @@ impl ProfileRecorder {
             .state
             .lock()
             .map_err(|_| HostError::unsupported("Cannot read the profile samples."))?;
-        let mut spans: Vec<_> = state.spans.iter().collect();
-        spans.sort_unstable_by(|a, b| {
-            a.start
-                .cmp(&b.start)
-                .then_with(|| b.elapsed.cmp(&a.elapsed))
-                .then_with(|| a.depth.cmp(&b.depth))
-                .then_with(|| {
-                    b.site
-                        .kind
-                        .is_eval_phase()
-                        .cmp(&a.site.kind.is_eval_phase())
-                })
-                .then_with(|| a.site.kind.cmp(&b.site.kind))
-                .then_with(|| a.site.cmp(&b.site))
-        });
+        let mut spans = state.spans.clone().into_sorted_vec();
+        let coverage = resolve_spans(&mut spans);
+        let dropped = state.dropped_spans;
+        host.write_out(
+            Stream::Stderr,
+            terminal::render(&state, &spans, wall, coverage).as_bytes(),
+        );
+        drop(state);
 
-        let graph = flamegraph::Graph::from_spans(&spans);
-        let folded = graph.folded(self.trace_limit).ok_or_else(|| {
-            HostError::unsupported("Folded profile stacks exceed the size limit.")
-        })?;
         host.create_dir_all(directory)?;
-        host.write(
-            &directory.join("trace.json"),
-            &trace::render(&spans, host.system().pid),
-            WriteMode::Truncate,
-        )?;
-        host.write(
-            &directory.join("stacks.folded"),
+        let directory = host.canonicalize(directory)?;
+        let graph = flamegraph::Graph::from_spans(&spans, coverage);
+
+        let (trace, trace_omitted) =
+            trace::render(&spans, host.system().pid, self.trace_limit, dropped);
+        let trace = Artifact::stage(host, &directory, "trace.json", &trace, trace_omitted)?;
+        let (folded, folded_omitted) = graph.folded(FOLDED_BYTES, dropped);
+        let folded = Artifact::stage(
+            host,
+            &directory,
+            "stacks.folded",
             folded.as_bytes(),
-            WriteMode::Truncate,
+            folded_omitted,
         )?;
-        host.write(
-            &directory.join("flamegraph.html"),
-            graph.html().as_bytes(),
-            WriteMode::Truncate,
+        let (html, html_omitted) = graph.html(HTML_BYTES, dropped);
+        let html = Artifact::stage(
+            host,
+            &directory,
+            "flamegraph.html",
+            html.as_bytes(),
+            html_omitted,
         )?;
-        host.write_out(Stream::Stderr, terminal::render(&state, wall).as_bytes());
+
+        let artifacts = [trace, folded, html];
+        let _lock = host.lock_file(
+            &directory.join(".rcmake-profile.lock"),
+            Some(Duration::from_secs(10)),
+        )?;
+        for artifact in &artifacts {
+            artifact.check_destination()?;
+        }
+        for artifact in artifacts {
+            artifact.publish()?;
+        }
+        let message = format!("Profile files: {}\n", terminal::display_path(&directory));
+        host.write_out(Stream::Stderr, message.as_bytes());
         Ok(())
     }
+}
+
+struct Artifact<'a> {
+    host: &'a dyn Host,
+    staged: std::path::PathBuf,
+    final_path: std::path::PathBuf,
+}
+
+impl<'a> Artifact<'a> {
+    fn stage(
+        host: &'a dyn Host,
+        directory: &Path,
+        name: &str,
+        bytes: &[u8],
+        omitted: usize,
+    ) -> HostResult<Self> {
+        if omitted > 0 {
+            let message = format!("{name} omitted entries at the export limit ({omitted}).\n");
+            host.write_out(Stream::Stderr, message.as_bytes());
+        }
+        static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
+        let pid = host.system().pid;
+        let now = host.now();
+        for _ in 0..64 {
+            let serial = NEXT_TEMP.fetch_add(1, AtomicOrdering::Relaxed);
+            let staged = directory.join(format!(
+                ".{name}.{pid}-{}-{}-{serial}.tmp",
+                now.secs, now.nanos
+            ));
+            match host.write(&staged, bytes, WriteMode::CreateNew) {
+                Ok(()) => {
+                    return Ok(Self {
+                        host,
+                        staged,
+                        final_path: directory.join(name),
+                    });
+                }
+                Err(error) if error.kind == ErrorKind::AlreadyExists => {}
+                Err(error) => {
+                    let _ = host.remove_file(&staged);
+                    return Err(error);
+                }
+            }
+        }
+        Err(HostError::unsupported(
+            "Cannot allocate a temporary profile file.",
+        ))
+    }
+
+    fn check_destination(&self) -> HostResult<()> {
+        match self.host.metadata(&self.final_path, Follow::No) {
+            Ok(metadata) if matches!(metadata.kind, FileKind::File | FileKind::Symlink) => Ok(()),
+            Err(error) if error.kind == ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+            Ok(_) => Err(HostError::from_io(
+                std::io::Error::new(
+                    ErrorKind::InvalidInput,
+                    "The profile destination is not a file.",
+                ),
+                Some(self.final_path.clone()),
+            )),
+        }
+    }
+
+    fn publish(mut self) -> HostResult<()> {
+        let result = self.host.rename(&self.staged, &self.final_path);
+        if result.is_ok() {
+            self.staged.clear();
+        }
+        result
+    }
+}
+
+impl Drop for Artifact<'_> {
+    fn drop(&mut self) {
+        if !self.staged.as_os_str().is_empty() {
+            let _ = self.host.remove_file(&self.staged);
+        }
+    }
+}
+
+#[derive(Default)]
+struct Ancestry {
+    eval: EnclosingSpans,
+    by_depth: BTreeMap<u32, EnclosingSpans>,
+    legacy: EnclosingSpans,
+}
+
+impl Ancestry {
+    fn parent(&self, span: &Span) -> Option<usize> {
+        let command_parent = match span.site.kind {
+            ProfileKind::Phase(_) => None,
+            _ if span.infer_depth => self.legacy.find(span, true),
+            _ => self
+                .by_depth
+                .range(..span.depth)
+                .rev()
+                .find_map(|(_, candidates)| candidates.find(span, false)),
+        };
+        command_parent.or_else(|| {
+            if span.site.kind.is_eval_phase() {
+                None
+            } else {
+                self.eval
+                    .find(span, matches!(span.site.kind, ProfileKind::Phase(_)))
+            }
+        })
+    }
+
+    fn insert(&mut self, span: &Span, index: usize) {
+        match span.site.kind {
+            ProfileKind::Phase(ProfilePhase::Eval) => self.eval.insert(span, index),
+            ProfileKind::Phase(_) => {}
+            _ if span.infer_depth => self.legacy.insert(span, index),
+            _ => self
+                .by_depth
+                .entry(span.depth)
+                .or_default()
+                .insert(span, index),
+        }
+    }
+}
+
+#[derive(Default)]
+struct EnclosingSpans {
+    // Starts increase and ends decrease. An entry with an earlier end than a new
+    // span cannot enclose any future span better than that new span.
+    spans: Vec<(Duration, Duration, usize)>,
+}
+
+impl EnclosingSpans {
+    fn find(&self, child: &Span, strict: bool) -> Option<usize> {
+        let end = child.end();
+        let eligible = self.spans.partition_point(|&(_, candidate_end, _)| {
+            candidate_end >= end && candidate_end > child.start
+        });
+        let mut candidates = self.spans[..eligible].iter().rev();
+        let &(start, candidate_end, index) = candidates.next()?;
+        if strict && (start, candidate_end) == (child.start, end) {
+            candidates.next().map(|&(_, _, index)| index)
+        } else {
+            Some(index)
+        }
+    }
+
+    fn insert(&mut self, span: &Span, index: usize) {
+        let end = span.end();
+        while self.spans.last().is_some_and(|&(start, previous_end, _)| {
+            previous_end < end || (start, previous_end) == (span.start, end)
+        }) {
+            self.spans.pop();
+        }
+        self.spans.push((span.start, end, index));
+    }
+}
+
+#[derive(Default)]
+struct Tracks {
+    tops: Vec<Option<usize>>,
+    finishing: BinaryHeap<Reverse<(Duration, usize)>>,
+    free: HashMap<ThreadId, BinaryHeap<Reverse<u32>>>,
+}
+
+impl Tracks {
+    fn assign(&mut self, spans: &[Span], span: &Span, index: usize) -> u32 {
+        while let Some(&Reverse((end, previous))) = self.finishing.peek() {
+            if end > span.start {
+                break;
+            }
+            self.finishing.pop();
+            let finished = &spans[previous];
+            let top = &mut self.tops[finished.tid as usize];
+            if *top != Some(previous) {
+                continue;
+            }
+            // Equal endpoints are common for nested operations. Remove them
+            // together so the next sibling finds the right top frame.
+            *top = finished.parent;
+            while let Some(parent) = *top {
+                let enclosing = &spans[parent];
+                if enclosing.tid != finished.tid {
+                    *top = None;
+                } else if enclosing.end() <= span.start {
+                    *top = enclosing.parent;
+                } else {
+                    break;
+                }
+            }
+            if top.is_none() {
+                self.free
+                    .entry(finished.thread)
+                    .or_default()
+                    .push(Reverse(finished.tid));
+            }
+        }
+
+        let parent_track = span.parent.map(|parent| spans[parent].tid);
+        let tid = parent_track
+            .filter(|&tid| self.tops[tid as usize] == span.parent)
+            .or_else(|| {
+                self.free
+                    .get_mut(&span.thread)?
+                    .pop()
+                    .map(|Reverse(tid)| tid)
+            })
+            .unwrap_or_else(|| {
+                let tid = self.tops.len() as u32;
+                self.tops.push(None);
+                tid
+            });
+        self.tops[tid as usize] = Some(index);
+        self.finishing.push(Reverse((span.end(), index)));
+        tid
+    }
+}
+
+fn resolve_spans(spans: &mut [Span]) -> Duration {
+    let mut ancestry = HashMap::<ThreadId, Ancestry>::new();
+    let mut tracks = Tracks::default();
+    let mut covered = vec![Coverage::default(); spans.len()];
+    let mut root = Coverage::default();
+    for index in 0..spans.len() {
+        let (prior, remaining) = spans.split_at_mut(index);
+        let span = &mut remaining[0];
+        let thread = ancestry.entry(span.thread).or_default();
+        span.parent = thread.parent(span);
+        if span.infer_depth {
+            span.depth = span.parent.map_or(0, |parent| {
+                let enclosing = &prior[parent];
+                enclosing
+                    .depth
+                    .saturating_add(u32::from(enclosing.site.kind.is_command()))
+            });
+        }
+        if let Some(parent) = span.parent {
+            covered[parent].add(span.start, span.end());
+        }
+        root.add(span.start, span.end());
+        thread.insert(span, index);
+        span.tid = tracks.assign(prior, span, index);
+    }
+    for (span, children) in spans.iter_mut().zip(covered) {
+        span.self_time = span.elapsed.saturating_sub(children.elapsed);
+    }
+    root.elapsed
 }
 
 #[cfg(test)]
@@ -504,7 +800,7 @@ mod tests {
         );
         let html =
             String::from_utf8_lossy(&host.read(&a.join("flamegraph.html"), RANGE)?).into_owned();
-        assert!(html.contains("&lt;macro&gt;&amp;&quot;&#39;"));
+        assert!(html.contains(r#"\u003cmacro\u003e\u0026"#));
         let stderr = host.stream_bytes(Stream::Stderr);
         let stderr = String::from_utf8_lossy(stderr.as_slice());
         assert!(stderr.contains("4.00 s"));
@@ -514,7 +810,7 @@ mod tests {
     }
 
     #[test]
-    fn keeps_totals_when_the_trace_reaches_its_limit() -> HostResult<()> {
+    fn keeps_call_counts_and_marks_recording_omissions() -> HostResult<()> {
         let host = PureHost::default();
         let recorder = ProfileRecorder::with_limits(1, 4096);
         let entry = sample(ProfileKind::Builtin, b"set");
@@ -524,12 +820,68 @@ mod tests {
         recorder.write(&host, &directory, Duration::from_secs(5))?;
         let trace = host.read(&directory.join("trace.json"), RANGE)?;
         assert!(
-            matches!(parse(&trace, &ReadOptions::default()), Ok(Value::Array(events)) if events.len() == 1)
+            matches!(parse(&trace, &ReadOptions::default()), Ok(Value::Array(events)) if events.len() == 2)
         );
         let stderr = host.stream_bytes(Stream::Stderr);
         let stderr = String::from_utf8_lossy(stderr.as_slice());
         assert!(stderr.contains("2 commands"));
-        assert!(stderr.contains("Samples omitted from trace and flamegraph: 1"));
+        assert!(stderr.contains("Omitted samples at the recording limit (1)."));
+        Ok(())
+    }
+
+    #[test]
+    fn crossing_and_coextensive_phases_use_separate_tracks() -> HostResult<()> {
+        let recorder = ProfileRecorder::new();
+        for (phase, start, end) in [
+            (ProfilePhase::Parse, 10, 65),
+            (ProfilePhase::Probes, 50, 80),
+            (ProfilePhase::Resolve, 81, 90),
+            (ProfilePhase::Generate, 81, 90),
+            (ProfilePhase::Eval, 0, 100),
+        ] {
+            recorder.record_phase(
+                phase,
+                Duration::from_micros(start),
+                Duration::from_micros(end),
+            );
+        }
+        let mut spans = recorder
+            .state
+            .lock()
+            .map_err(|_| HostError::unsupported("Cannot read the profile samples."))?
+            .spans
+            .clone()
+            .into_sorted_vec();
+        assert_eq!(resolve_spans(&mut spans), Duration::from_micros(100));
+        let [eval, parse, probes, resolve, generate] = spans.as_slice() else {
+            return Err(HostError::unsupported("Expected five profile spans."));
+        };
+        assert_eq!(eval.self_time, Duration::from_micros(21));
+        for span in [parse, probes, resolve, generate] {
+            assert_eq!(span.parent, Some(0));
+        }
+        assert_ne!(parse.tid, probes.tid);
+        assert_ne!(resolve.tid, generate.tid);
+        Ok(())
+    }
+
+    #[test]
+    fn retains_late_finishing_parent_and_writes_summary_on_export_error() -> HostResult<()> {
+        let host = PureHost::default();
+        let recorder = ProfileRecorder::with_limits(1, 4096);
+        recorder.record(sample(ProfileKind::Builtin, b"include"));
+        recorder.record_phase(ProfilePhase::Eval, Duration::ZERO, Duration::from_secs(4));
+        let directory = host.initial_cwd().join("profile");
+        host.create_dir_all(&directory.join("flamegraph.html"))?;
+        assert!(
+            recorder
+                .write(&host, &directory, Duration::from_secs(4))
+                .is_err()
+        );
+        assert!(host.read(&directory.join("trace.json"), RANGE).is_err());
+        assert!(host.read(&directory.join("stacks.folded"), RANGE).is_err());
+        let report = host.stream_bytes(Stream::Stderr);
+        assert!(String::from_utf8_lossy(&report).contains("4.00 s of recorded wall time"));
         Ok(())
     }
 }
