@@ -1457,3 +1457,32 @@ file(GENERATE OUTPUT second INPUT in USE_SOURCE_PERMISSIONS)
     );
     Ok(())
 }
+
+#[test]
+fn file_lock_contends_with_host_locks_and_can_reacquire() -> TestResult {
+    use std::io::ErrorKind;
+    use std::time::Duration;
+
+    let (host, mut interp) = interpreter();
+    let path = Path::new("/work/shared.lk");
+    let lock = host.lock_file(path, Some(Duration::ZERO))?;
+    script(
+        &host,
+        &mut interp,
+        "file(LOCK shared.lk TIMEOUT 0 RESULT_VARIABLE blocked)",
+    )?;
+    vars(&mut interp, &[("blocked", "Timeout reached")]);
+
+    drop(lock);
+    script(&host, &mut interp, "file(LOCK shared.lk TIMEOUT 0)")?;
+    let busy = host
+        .lock_file(path, Some(Duration::ZERO))
+        .err()
+        .map(|error| error.kind);
+    assert_eq!(busy, Some(ErrorKind::TimedOut));
+
+    script(&host, &mut interp, "file(LOCK shared.lk RELEASE)")?;
+    let lock = host.lock_file(path, Some(Duration::ZERO))?;
+    assert_eq!(lock.path(), path);
+    Ok(())
+}

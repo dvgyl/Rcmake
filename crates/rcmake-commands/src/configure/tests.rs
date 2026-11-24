@@ -383,3 +383,332 @@ fn build_command_matches_cmake_build_syntax() -> TestResult {
     );
     Ok(())
 }
+
+#[test]
+fn project_sets_xcode_generator_variables() -> TestResult {
+    use rcmake_host::{ProcessResult, RunOutput};
+    use rcmake_model::{GeneratorKind, ParsedToolset};
+
+    let host = new_host();
+    seed_modules(&host, &[])?;
+    host.seed_file(
+        &Path::new(ROOT).join("CMakeFindXCode.cmake"),
+        b"set(CMAKE_MAKE_PROGRAM /usr/bin/xcodebuild CACHE FILEPATH \"\")",
+    )?;
+    host.set_command_handler(|_, request, _| {
+        assert!(matches!(request.pipeline.as_slice(), [command]
+            if command.program == b"xcodebuild" && command.args == [BString::from("-version")]));
+        Ok(RunOutput {
+            results: vec![ProcessResult::Exited(0)],
+            stdout: b"Xcode 27.2\nBuild version 27C12\n".to_vec(),
+            stderr: Vec::new(),
+        })
+    })?;
+    let mut interp = interp(&host, Vec::new());
+    interp.cx().project().generator = Some(GeneratorKind::Xcode);
+    interp.cx().project().generator_spec.toolset = "foo,buildsystem=12".into();
+
+    configure(&host, &mut interp, "project(P NONE)", 0)?;
+    for (name, value) in [
+        ("XCODE", "1"),
+        ("XCODE_VERSION", "27.2"),
+        ("CMAKE_XCODE_BUILD_SYSTEM", "12"),
+        ("CMAKE_XCODE_PLATFORM_TOOLSET", "foo"),
+        (
+            "CMAKE_CFG_INTDIR",
+            "$(CONFIGURATION)$(EFFECTIVE_PLATFORM_NAME)",
+        ),
+        (
+            "CMAKE_CONFIGURATION_TYPES",
+            "Debug;Release;MinSizeRel;RelWithDebInfo",
+        ),
+        ("CMAKE_GENERATOR_TOOLSET", "foo,buildsystem=12"),
+        ("CMAKE_GENERATOR_PLATFORM", ""),
+        ("CMAKE_GENERATOR_INSTANCE", ""),
+    ] {
+        assert_eq!(var(&mut interp, name), Some(value.into()), "{name}");
+    }
+    assert!(matches!(
+        &interp.cx().project().generator_spec.parsed,
+        ParsedToolset::Xcode { toolset: Some(toolset), .. } if toolset == b"foo"
+    ));
+    assert_eq!(
+        interp
+            .cx()
+            .cache()
+            .get(b"CMAKE_CONFIGURATION_TYPES")
+            .map(|entry| entry.ty),
+        Some(CacheType::String)
+    );
+    Ok(())
+}
+
+#[test]
+fn enable_language_sets_xcode_defaults_without_xcodebuild() -> TestResult {
+    let host = new_host();
+    let mut interp = interp(&host, Vec::new());
+    interp.cx().project().generator = Some(rcmake_model::GeneratorKind::Xcode);
+    configure(
+        &host,
+        &mut interp,
+        "cmake_minimum_required(VERSION 3.29)\nenable_language(NONE)\nproject(P NONE)",
+        0,
+    )?;
+    assert_eq!(var(&mut interp, "XCODE_VERSION"), Some("".into()));
+    assert_eq!(
+        var(&mut interp, "CMAKE_XCODE_BUILD_SYSTEM"),
+        Some("12".into())
+    );
+    assert_eq!(var(&mut interp, "CMAKE_XCODE_PLATFORM_TOOLSET"), None);
+    Ok(())
+}
+
+#[test]
+fn project_sets_visual_studio_generator_variables() -> TestResult {
+    use rcmake_model::{GeneratorKind, VsVersion};
+
+    for (version, toolset, platform, expected_toolset, expected_platform, expected_host) in [
+        (VsVersion::Vs17, "", "", "v143", "ARM64", "ARM64"),
+        (VsVersion::Vs18, "", "", "v145", "ARM64", "ARM64"),
+        (
+            VsVersion::Vs18,
+            "ClangCL,host=x64",
+            "Win32,version=10.0",
+            "ClangCL",
+            "Win32",
+            "x64",
+        ),
+    ] {
+        let host = new_host();
+        seed_modules(&host, &[])?;
+        let mut interp = interp(
+            &host,
+            vec![
+                define("CMAKE_GENERATOR_INSTANCE", "C:/VS,version="),
+                define("CMAKE_MAKE_PROGRAM", "C:/VS/MSBuild.exe"),
+            ],
+        );
+        let mut cx = interp.cx();
+        let project = cx.project();
+        project.generator = Some(GeneratorKind::VisualStudio(version));
+        project.generator_spec.toolset = toolset.into();
+        project.generator_spec.platform = platform.into();
+        configure(
+            &host,
+            &mut interp,
+            "set(CMAKE_CONFIGURATION_TYPES Profile)\nproject(P NONE)",
+            0,
+        )?;
+        for (name, value) in [
+            ("MSVC_IDE", "1"),
+            ("CMAKE_VS_PLATFORM_NAME", expected_platform),
+            ("CMAKE_VS_PLATFORM_NAME_DEFAULT", "ARM64"),
+            ("CMAKE_VS_PLATFORM_TOOLSET", expected_toolset),
+            ("CMAKE_VS_PLATFORM_TOOLSET_HOST_ARCHITECTURE", expected_host),
+            ("CMAKE_CFG_INTDIR", "$(Configuration)"),
+            ("CMAKE_CONFIGURATION_TYPES", "Profile"),
+            ("CMAKE_GENERATOR_PLATFORM", platform),
+            ("CMAKE_GENERATOR_TOOLSET", toolset),
+            ("CMAKE_GENERATOR_INSTANCE", "C:/VS,version="),
+        ] {
+            assert_eq!(var(&mut interp, name), Some(value.into()), "{name}");
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn project_reports_xcode_generator_spec_errors() -> TestResult {
+    use rcmake_host::{ProcessResult, RunOutput};
+    use rcmake_model::GeneratorKind;
+
+    for (toolset, platform, instance, body) in [
+        (
+            "buildsystem=1",
+            "",
+            "",
+            "toolset specification field\n\n    buildsystem=1\n\n  is not allowed with Xcode 27.2.",
+        ),
+        (
+            "bogus=1",
+            "",
+            "",
+            "given toolset specification that contains invalid field 'bogus'.",
+        ),
+        (
+            "",
+            "arm64",
+            "",
+            "does not support platform specification, but platform\n\n    arm64\n\n  was specified.",
+        ),
+        (
+            "",
+            "",
+            "/IDE",
+            "does not support instance specification, but instance\n\n    /IDE\n\n  was specified.",
+        ),
+        (
+            "buildsystem=7",
+            "",
+            "",
+            "toolset specification field\n\n    buildsystem=7\n\n  value is unknown.  It must be '1' or '12'.",
+        ),
+        (
+            "foo,bar",
+            "",
+            "",
+            "given toolset specification\n\n    foo,bar\n\n  that contains a field after the first ',' with no '='.",
+        ),
+        (
+            "foo,buildsystem=12,buildsystem=12",
+            "",
+            "",
+            "given toolset specification\n\n    foo,buildsystem=12,buildsystem=12\n\n  that contains duplicate field key 'buildsystem'.",
+        ),
+    ] {
+        let host = new_host();
+        host.set_command_handler(|_, _, _| {
+            Ok(RunOutput {
+                results: vec![ProcessResult::Exited(0)],
+                stdout: b"Xcode 27.2\n".to_vec(),
+                stderr: Vec::new(),
+            })
+        })?;
+        let mut interp = interp(&host, Vec::new());
+        let mut cx = interp.cx();
+        let project = cx.project();
+        project.generator = Some(GeneratorKind::Xcode);
+        project.generator_spec.toolset = toolset.into();
+        project.generator_spec.platform = platform.into();
+        project.generator_spec.instance = instance.into();
+        configure(
+            &host,
+            &mut interp,
+            "cmake_minimum_required(VERSION 4.5)\nproject(P NONE)",
+            1,
+        )?;
+        assert_generator_error(&host, "Xcode", body);
+    }
+    Ok(())
+}
+
+#[test]
+fn project_reports_visual_studio_generator_spec_errors() -> TestResult {
+    use rcmake_model::{GeneratorKind, VsVersion};
+
+    for (toolset, platform, instance, field, spec, reason) in [
+        (
+            "v143,host=bad",
+            "",
+            "",
+            "toolset",
+            "v143,host=bad",
+            "that contains invalid field 'host=bad'.",
+        ),
+        (
+            "v143,host=x64,host=x86",
+            "",
+            "",
+            "toolset",
+            "v143,host=x64,host=x86",
+            "that contains duplicate field key 'host'.",
+        ),
+        (
+            "v143,host",
+            "",
+            "",
+            "toolset",
+            "v143,host",
+            "that contains a field after the first ',' with no '='.",
+        ),
+        (
+            "",
+            "x64,bad=1",
+            "",
+            "platform",
+            "x64,bad=1",
+            "that contains invalid field 'bad=1'.",
+        ),
+        (
+            "",
+            "x64,version=8.1,version=10.0",
+            "",
+            "platform",
+            "x64,version=8.1,version=10.0",
+            "that contains duplicate field key 'version'.",
+        ),
+        (
+            "",
+            "x64,version",
+            "",
+            "platform",
+            "x64,version",
+            "that contains a field after the first ',' with no '='.",
+        ),
+        (
+            "",
+            "",
+            "C:/VS,bad=1",
+            "instance",
+            "C:/VS,bad=1",
+            "that contains invalid field 'bad=1'.",
+        ),
+        (
+            "",
+            "",
+            "C:/VS,version",
+            "instance",
+            "C:/VS,version",
+            "that contains a field after the first ',' with no '='.",
+        ),
+        (
+            "",
+            "",
+            "version=17.0.12345.1,version=17.0.12345.2",
+            "instance",
+            "version=17.0.12345.1,version=17.0.12345.2",
+            "that contains duplicate field key 'version'.",
+        ),
+        (
+            "",
+            "x64,bad=1",
+            "version=18.0.12345.1",
+            "instance",
+            "version=18.0.12345.1",
+            "but the version field is not 4 integer components starting in 17.",
+        ),
+    ] {
+        let host = new_host();
+        let mut interp = interp(&host, vec![define("CMAKE_GENERATOR_INSTANCE", instance)]);
+        let mut cx = interp.cx();
+        let project = cx.project();
+        project.generator = Some(GeneratorKind::VisualStudio(VsVersion::Vs17));
+        project.generator_spec.toolset = toolset.into();
+        project.generator_spec.platform = platform.into();
+        configure(
+            &host,
+            &mut interp,
+            "cmake_minimum_required(VERSION 4.5)\nproject(P NONE)",
+            1,
+        )?;
+        assert_generator_error(
+            &host,
+            "Visual Studio 17 2022",
+            &format!("given {field} specification\n\n    {spec}\n\n  {reason}"),
+        );
+    }
+    Ok(())
+}
+
+fn assert_generator_error(host: &PureHost, generator: &str, body: &str) {
+    let stderr = host.stream_bytes(Stream::Stderr);
+    let error = format!(
+        "CMake Error at CMakeLists.txt:2 (project):\n  Generator\n\n    {generator}\n\n  {body}"
+    );
+    assert!(
+        stderr
+            .windows(error.len())
+            .any(|part| part == error.as_bytes()),
+        "{stderr}"
+    );
+}

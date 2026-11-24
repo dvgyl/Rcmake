@@ -123,6 +123,7 @@ pub(crate) fn enable_languages(
     optional: bool,
 ) -> Result<(), CmdError> {
     let generator = generator(cx);
+    super::generator_env::initialize(cx, generator)?;
     cx.set_var(b"CMAKE_CFG_INTDIR", generator.cfg_int_dir().into());
 
     let mut unique: Vec<BString> = Vec::new();
@@ -327,23 +328,25 @@ impl Bootstrap {
             read_list_file(cx, &system_file)?;
         }
         if read_system {
-            for (var, what) in [
-                (b"CMAKE_GENERATOR_INSTANCE".as_slice(), "instance"),
-                (b"CMAKE_GENERATOR_PLATFORM", "platform"),
-                (b"CMAKE_GENERATOR_TOOLSET", "toolset"),
-            ] {
-                let value = cx.var_or_empty(var);
-                if !value.is_empty() {
-                    let body = cat(&[
-                        b"Generator\n  ",
-                        self.generator.name().as_bytes(),
-                        format!("\ndoes not support {what} specification, but {what}\n  ")
-                            .as_bytes(),
-                        &value,
-                        b"\nwas specified.",
-                    ]);
-                    cx.issue(MessageKind::Error, Effect::Fatal, None, body);
-                    return Err(CmdError::Reported);
+            if !self.generator.is_ide() {
+                for (var, what) in [
+                    (b"CMAKE_GENERATOR_INSTANCE".as_slice(), "instance"),
+                    (b"CMAKE_GENERATOR_PLATFORM", "platform"),
+                    (b"CMAKE_GENERATOR_TOOLSET", "toolset"),
+                ] {
+                    let value = cx.var_or_empty(var);
+                    if !value.is_empty() {
+                        let body = cat(&[
+                            b"Generator\n  ",
+                            self.generator.name().as_bytes(),
+                            format!("\ndoes not support {what} specification, but {what}\n  ")
+                                .as_bytes(),
+                            &value,
+                            b"\nwas specified.",
+                        ]);
+                        cx.issue(MessageKind::Error, Effect::Fatal, None, body);
+                        return Err(CmdError::Reported);
+                    }
                 }
             }
             self.find_make_program(cx)?;
@@ -754,7 +757,7 @@ fn compiler_advice(lang: &[u8], env_var: Option<&[u8]>) -> BString {
 }
 
 /// `cmMakefile::AddCacheDefinition` for a value that the bootstrap computes.
-fn add_cache(cx: &mut Cx<'_>, name: &[u8], value: BString, ty: CacheType, help: &str) {
+pub(super) fn add_cache(cx: &mut Cx<'_>, name: &[u8], value: BString, ty: CacheType, help: &str) {
     let advanced = cx.cache().get(name).is_some_and(|entry| entry.advanced);
     cx.cache().insert(
         name.into(),

@@ -9,6 +9,7 @@ use rcmake_eval::{CmdError, CmdFlags, Cx, IncludeOptions, Registry};
 
 mod build_command;
 mod enable_language;
+mod generator_env;
 #[cfg(test)]
 mod tests;
 mod try_compile;

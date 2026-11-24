@@ -1,5 +1,5 @@
-use std::collections::BTreeMap;
-use std::fs::{File, OpenOptions, TryLockError};
+use std::collections::{BTreeMap, btree_map::Entry};
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
@@ -8,7 +8,7 @@ use rcmake_base::{BString, path_lex::Lexical};
 use rcmake_diag::FrameKind;
 use rcmake_eval::{Cx, Flow, UserCommandKind};
 use rcmake_host::{
-    FileKind, Follow, Host, WriteMode,
+    FileKind, FileLockGuard, Follow, Host, WriteMode,
     path::{from_native, to_native},
 };
 
@@ -24,11 +24,16 @@ enum Guard {
 
 struct Held {
     scope: Option<Weak<[u8]>>,
-    _file: Option<File>,
+    _guard: Box<dyn FileLockGuard>,
+}
+
+enum Lock {
+    Acquiring,
+    Held(Held),
 }
 
 type Key = (usize, PathBuf);
-static LOCKS: Mutex<BTreeMap<Key, Held>> = Mutex::new(BTreeMap::new());
+static LOCKS: Mutex<BTreeMap<Key, Lock>> = Mutex::new(BTreeMap::new());
 
 pub(super) fn run(cx: &mut Cx<'_>, args: &[&[u8]]) -> Result {
     let [path, options @ ..] = args else {
@@ -146,16 +151,21 @@ fn scope(cx: &Cx<'_>, guard: Guard) -> std::result::Result<Option<Weak<[u8]>>, B
 fn finish(path: &Path, owner: usize) -> std::result::Result<(), BString> {
     let mut locks = LOCKS.lock().map_err(|err| BString::from(err.to_string()))?;
     remove_expired(&mut locks);
-    locks.remove(&(owner, path.to_path_buf()));
+    let key = (owner, path.to_path_buf());
+    if matches!(locks.get(&key), Some(Lock::Held(_))) {
+        locks.remove(&key);
+    }
     Ok(())
 }
 
-// The evaluator owns the scope frames. Reap locks when its frames are released.
-fn remove_expired(locks: &mut BTreeMap<Key, Held>) {
-    locks.retain(|_, lock| {
-        lock.scope
+// Check the scope frames before each lock operation.
+fn remove_expired(locks: &mut BTreeMap<Key, Lock>) {
+    locks.retain(|_, lock| match lock {
+        Lock::Acquiring => true,
+        Lock::Held(held) => held
+            .scope
             .as_ref()
-            .is_none_or(|scope| scope.strong_count() != 0)
+            .is_none_or(|scope| scope.strong_count() != 0),
     });
 }
 
@@ -167,49 +177,45 @@ fn acquire(
     timeout: Option<Duration>,
 ) -> std::result::Result<(), BString> {
     let key = (owner, path.to_path_buf());
+    {
+        let mut locks = LOCKS.lock().map_err(|err| BString::from(err.to_string()))?;
+        remove_expired(&mut locks);
+        let Entry::Vacant(entry) = locks.entry(key.clone()) else {
+            return Err("File already locked".into());
+        };
+        entry.insert(Lock::Acquiring);
+    }
+
+    // Wait without the table mutex so other files can be locked or released.
     let host = cx.host();
-    let start = host.monotonic();
-    loop {
-        {
-            let mut locks = LOCKS.lock().map_err(|err| BString::from(err.to_string()))?;
-            remove_expired(&mut locks);
-            if locks.contains_key(&key) {
-                return Err("File already locked".into());
-            }
-            let file = if owner == 0 {
-                let file = OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .open(path)
-                    .map_err(|err| BString::from(err.to_string()))?;
-                match file.try_lock() {
-                    Ok(()) => Some(file),
-                    Err(TryLockError::WouldBlock) => {
-                        drop(locks);
-                        let elapsed = host.monotonic().saturating_sub(start);
-                        let remaining = timeout.map(|timeout| timeout.saturating_sub(elapsed));
-                        if remaining.is_some_and(|value| value.is_zero())
-                            || cx
-                                .limits()
-                                .wall_budget
-                                .is_some_and(|budget| host.monotonic() >= budget)
-                        {
-                            return Err("Timeout reached".into());
-                        }
-                        host.sleep(
-                            remaining
-                                .unwrap_or(Duration::from_secs(1))
-                                .min(Duration::from_secs(1)),
-                        );
-                        continue;
-                    }
-                    Err(TryLockError::Error(err)) => return Err(err.to_string().into()),
-                }
-            } else {
-                None
-            };
-            locks.insert(key, Held { scope, _file: file });
+    let budget = cx
+        .limits()
+        .wall_budget
+        .map(|budget| budget.saturating_sub(host.monotonic()));
+    let timeout = match (timeout, budget) {
+        (Some(timeout), Some(budget)) => Some(timeout.min(budget)),
+        _ => timeout.or(budget),
+    };
+    let result = host.lock_file(path, timeout);
+    let mut locks = LOCKS.lock().map_err(|err| BString::from(err.to_string()))?;
+    match result {
+        Ok(guard) => {
+            locks.insert(
+                key,
+                Lock::Held(Held {
+                    scope,
+                    _guard: guard,
+                }),
+            );
+            Ok(())
         }
-        return Ok(());
+        Err(err) => {
+            locks.remove(&key);
+            if err.kind == ErrorKind::TimedOut {
+                Err("Timeout reached".into())
+            } else {
+                Err(err.to_string().into())
+            }
+        }
     }
 }
