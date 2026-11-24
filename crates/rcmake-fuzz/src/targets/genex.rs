@@ -64,15 +64,18 @@ fn tree(rng: &mut Rng, depth: u64) -> String {
 
 fn evaluate_input(input: &[u8], limits: &Limits, valid: bool) -> Check {
     let stripped = genex_strip(input);
-    let again = genex_strip(&stripped);
-    require(again == stripped, || {
-        format!(
-            "GENEX_STRIP changed on the second pass. Input {}. First {}. Second {}.",
-            preview(input),
-            preview(&stripped),
-            preview(&again),
-        )
-    })?;
+    // Removing an expression after a literal '$' can join it to a following '<'.
+    if !input.windows(3).any(|bytes| bytes == b"$$<") {
+        let again = genex_strip(&stripped);
+        require(again == stripped, || {
+            format!(
+                "GENEX_STRIP changed on the second pass. Input {}. First {}. Second {}.",
+                preview(input),
+                preview(&stripped),
+                preview(&again),
+            )
+        })?;
+    }
 
     let context = EvalContext {
         config: ConfigId("Debug".into()),
@@ -146,5 +149,17 @@ impl GenexHost for Stub<'_> {
 
     fn limits(&self) -> Limits {
         self.0.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn strip_can_form_a_new_expression() {
+        let input = b"$$<CONFIG><BOOL:ON>";
+        assert_eq!(genex_strip(input), "$<BOOL:ON>");
+        assert!(evaluate_input(input, &Limits::fuzz(), false).is_ok());
     }
 }

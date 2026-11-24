@@ -247,13 +247,16 @@ impl FileApi<'_, '_> {
         Ok(reference)
     }
 
+    fn generator(&self) -> Option<GeneratorKind> {
+        self.model
+            .generator
+            .or_else(|| GeneratorKind::from_name(cache_value(self.model, b"CMAKE_GENERATOR")?))
+    }
+
     fn cmake(&self) -> Value {
         let exe = self.writer.host.current_exe().unwrap_or_default();
         let tool_dir = exe.parent().unwrap_or(Path::new(""));
-        let generator = self
-            .model
-            .generator
-            .or_else(|| GeneratorKind::from_name(cache_value(self.model, b"CMAKE_GENERATOR")?));
+        let generator = self.generator();
         let mut generator_json = members([
             (
                 "name",

@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use rcmake_base::{BString, list, truth::is_on};
-use rcmake_diag::Backtrace;
+use rcmake_diag::{Backtrace, Frame, FrameKind};
 use rcmake_host::path::{from_native, to_native};
 use rcmake_model::{
     BT, Directory, InstallKind, InstallRule, ProjectModel, Target, TargetId, TargetKind,
@@ -16,7 +16,10 @@ use super::{
     Bool, FileApi, Kind, Members, Object, UInt, Value, array, cache_value, hash_prefix, members,
     object, paths, relative, strings,
 };
-use crate::GenError;
+use crate::{
+    GenError,
+    ide::{UtilityKind, project_roots, targets_for_root, utility_targets},
+};
 
 impl FileApi<'_, '_> {
     pub(super) fn codemodel(&mut self) -> Result<Members, GenError> {
@@ -169,10 +172,100 @@ impl FileApi<'_, '_> {
             );
             list.push(target.id);
         }
-        let target_refs =
+        let mut target_refs =
             self.target_references(config, &references, &identities, &rules_by_target)?;
         let abstract_refs =
             self.target_references(config, &abstract_refs, &identities, &rules_by_target)?;
+
+        if let Some(kind) = self.generator().filter(|kind| kind.is_ide()) {
+            let utilities = utility_targets(kind, self.model, self.writer.host);
+            let zero_check = utilities
+                .iter()
+                .find(|target| target.kind == UtilityKind::ZeroCheck);
+            for root in project_roots(kind, self.model) {
+                let dir_index = root.dir.index();
+                let Some(&project_index) = project_by_dir.get(dir_index) else {
+                    continue;
+                };
+                let (Some(directory_targets), Some(project)) = (
+                    dir_targets.get_mut(dir_index),
+                    projects.get_mut(project_index),
+                ) else {
+                    continue;
+                };
+                let dir = self.model.dir(root.dir);
+                let build = relative(&dir.binary_dir, self.build);
+                let dependencies = targets_for_root(self.model, self.result, root.dir)
+                    .into_iter()
+                    .filter_map(|id| identities.get(&id))
+                    .filter(|target| {
+                        !target.abstract_target && !target.target.metadata.exclude_from_all
+                    })
+                    .map(|target| object([("id", Value::string(target.id.as_str()))]))
+                    .collect::<Vec<_>>();
+                for utility in utilities.iter().filter(|utility| {
+                    matches!(utility.kind, UtilityKind::AllBuild | UtilityKind::ZeroCheck)
+                }) {
+                    let name = &utility.name;
+                    let id = format!("{name}::@{}", hash_prefix(&build));
+                    let mut body = members([
+                        ("codemodelVersion", Kind::Codemodel.version_json()),
+                        ("name", Value::string(name.clone())),
+                        ("id", Value::string(id.as_str())),
+                        ("type", Value::string("UTILITY")),
+                        (
+                            "paths",
+                            self.relative_paths(&dir.source_dir, &dir.binary_dir),
+                        ),
+                        ("isGeneratorProvided", Bool(true)),
+                    ]);
+                    let listfile = to_native(&dir.source_dir).join("CMakeLists.txt");
+                    let trace = Backtrace::default().push(Frame {
+                        file: from_native(&listfile).as_slice().into(),
+                        line: 0,
+                        name: None,
+                        kind: FrameKind::Command,
+                    });
+                    let mut graph = Backtraces::new(self.source);
+                    graph.tag(&mut body, &trace);
+                    body.insert("backtraceGraph".into(), graph.into_json());
+                    if utility.kind == UtilityKind::AllBuild {
+                        optional_array(
+                            &mut body,
+                            "orderDependencies",
+                            dependencies.iter().cloned(),
+                        );
+                        optional_array(
+                            &mut body,
+                            "dependencies",
+                            dependencies.iter().cloned().chain(zero_check.map(|zero| {
+                                object([(
+                                    "id",
+                                    Value::string(format!(
+                                        "{}::@{}",
+                                        zero.name,
+                                        hash_prefix(&build)
+                                    )),
+                                )])
+                            })),
+                        );
+                    }
+                    let file = self
+                        .writer
+                        .hashed(&file_prefix("target", name, config), &Object(body))?;
+                    let index = target_refs.len();
+                    directory_targets.build_targets.push(index);
+                    project.targets.build_targets.push(index);
+                    target_refs.push(object([
+                        ("name", Value::string(name.clone())),
+                        ("id", Value::string(id.as_str())),
+                        ("directoryIndex", number(dir_index)),
+                        ("projectIndex", number(project_index)),
+                        ("jsonFile", file),
+                    ]));
+                }
+            }
+        }
 
         let mut directory_refs = Vec::new();
         for (((id, dir), project_index), target_indexes) in dir_ids

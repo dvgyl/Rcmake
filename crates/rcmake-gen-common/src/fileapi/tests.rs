@@ -5,7 +5,7 @@ use rcmake_host::{PureHost, ReadRange};
 use rcmake_json::ReadOptions;
 use rcmake_model::{
     BT, CacheEntry, CacheType, InstallKind, InstallOptions, InstallRule, Target, TargetKind,
-    TargetOrigin,
+    TargetOrigin, VsVersion,
 };
 use rcmake_resolve::{
     ArtifactSet, CompileGroup, CompileUnit, InterfaceInclude, LinkFragment, LinkFragmentRole,
@@ -577,6 +577,117 @@ fn indexes_subprojects_and_abstract_targets_per_configuration() {
         assert_eq!(uint(get(directory, "parentIndex")), 0);
         assert_eq!(get(project, "name"), &Value::string("Child"));
         assert_eq!(uint(get(project, "parentIndex")), 0);
+    }
+}
+
+#[test]
+fn xcode_reports_configuration_artifacts_and_utility_targets() {
+    check_ide_replies(GeneratorKind::Xcode, "", false);
+}
+
+#[test]
+fn visual_studio_reports_configuration_artifacts_and_utility_targets() {
+    for version in VsVersion::ALL {
+        check_ide_replies(GeneratorKind::VisualStudio(version), ".exe", true);
+    }
+}
+
+fn check_ide_replies(kind: GeneratorKind, suffix: &str, platform: bool) {
+    let host = PureHost::default();
+    let build = Path::new("/build");
+    let (mut model, mut result) = fixture(Path::new("/src"), build);
+    if platform {
+        cache_entry(
+            &mut model,
+            "CMAKE_GENERATOR",
+            kind.name().as_bytes(),
+            CacheType::Internal,
+            "",
+        );
+        cache_entry(
+            &mut model,
+            "CMAKE_GENERATOR_PLATFORM",
+            b"x64",
+            CacheType::Internal,
+            "",
+        );
+        model.generator = None;
+    } else {
+        model.generator = Some(kind);
+    }
+    let mut artifact_model = model.clone();
+    artifact_model.generator = Some(kind);
+    let app = artifact_model.find_target(DirId::ROOT, b"app").unwrap();
+    artifact_model
+        .target_mut(app)
+        .unwrap()
+        .props
+        .set("SUFFIX".into(), suffix.into());
+    let debug = rcmake_genex::ConfigId("Debug".into());
+    let release = rcmake_genex::ConfigId("Release".into());
+    result.configs = vec![debug.clone(), release.clone()];
+    let mut release_targets = result.targets.clone();
+    for (targets, config) in [
+        (&mut result.targets, debug),
+        (&mut release_targets, release),
+    ] {
+        for target in targets {
+            let raw = artifact_model.target(target.id).unwrap();
+            target.artifacts =
+                rcmake_resolve::lower::compute_artifacts(&artifact_model, raw, &config);
+            target.config = config.clone();
+        }
+    }
+    result.targets.extend(release_targets);
+
+    write(&host, &build.join(API_DIR).join("query/codemodel-v2"), b"");
+    write_replies(&model, &result, &host, build).unwrap();
+    let reply = build.join(API_DIR).join("reply");
+    let (_, index) = index(&host, &reply);
+    let generator = get(get(&index, "cmake"), "generator");
+    assert_eq!(get(generator, "name"), &Value::string(kind.name()));
+    assert_eq!(get(generator, "multiConfig"), &Bool(true));
+    if platform {
+        assert_eq!(get(generator, "platform"), &Value::string("x64"));
+    }
+    let codemodel = follow(&host, &reply, get(get(&index, "reply"), "codemodel-v2"));
+    let configs = get(&codemodel, "configurations");
+    assert_eq!(items(configs).len(), 2);
+    for name in ["Debug", "Release"] {
+        let config = entry(configs, "name", name);
+        let targets = get(config, "targets");
+        let app = entry(targets, "name", "app");
+        let target = follow(&host, &reply, app);
+        let artifacts = items(get(&target, "artifacts"));
+        assert_eq!(artifacts.len(), 1);
+        assert_eq!(
+            get(&artifacts[0], "path"),
+            &Value::string(format!("{name}/app{suffix}"))
+        );
+        assert_eq!(
+            get(&target, "nameOnDisk"),
+            &Value::string(format!("app{suffix}"))
+        );
+
+        let all = entry(targets, "name", "ALL_BUILD");
+        let all = follow(&host, &reply, all);
+        assert_eq!(get(&all, "type"), &Value::string("UTILITY"));
+        assert_eq!(get(&all, "isGeneratorProvided"), &Bool(true));
+        let zero_ref = entry(targets, "name", "ZERO_CHECK");
+        let zero = follow(&host, &reply, zero_ref);
+        assert_eq!(get(&zero, "isGeneratorProvided"), &Bool(true));
+        for dependency in [app, zero_ref] {
+            assert!(
+                items(get(&all, "dependencies"))
+                    .iter()
+                    .any(|target| get(target, "id") == get(dependency, "id"))
+            );
+        }
+        let directory = &items(get(config, "directories"))[0];
+        assert_eq!(
+            items(get(directory, "targetIndexes")).len(),
+            items(targets).len()
+        );
     }
 }
 

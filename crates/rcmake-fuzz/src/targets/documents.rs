@@ -119,10 +119,15 @@ fn check_json(
             return Ok(false);
         }
     };
-    for (name, output) in [
+    let outputs = [
         ("compact", write_compact(&value)),
         ("styled", write_styled(&value, "  ")),
-    ] {
+    ];
+    // The parser keeps raw bytes. The writers can replace invalid UTF-8.
+    if std::str::from_utf8(input).is_err() {
+        return Ok(true);
+    }
+    for (name, output) in outputs {
         match parse(&output, options) {
             Ok(decoded) if decoded == value => {}
             Ok(_) => {
@@ -142,6 +147,21 @@ fn check_json(
         }
     }
     Ok(true)
+}
+
+#[cfg(test)]
+#[test]
+fn json_writer_can_replace_invalid_utf8() {
+    let options = ReadOptions::default();
+    let limits = Limits::fuzz();
+    assert_eq!(
+        check_json(b"{\"x\":\"\xff\"}", &options, &limits, Some(true)),
+        Ok(true)
+    );
+    assert_eq!(
+        check_json(br#"{"x":"\ufffd"}"#, &options, &limits, Some(true)),
+        Ok(true)
+    );
 }
 
 pub(super) fn presets(rng: &mut Rng, limits: &Limits) -> Check {

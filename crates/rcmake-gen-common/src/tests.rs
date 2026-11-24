@@ -670,6 +670,65 @@ mod differential {
     }
 
     #[test]
+    fn install_script_selects_the_ide_configuration() {
+        let host = NativeHost::new().unwrap();
+        for executable in [
+            b"RCMAKE_TEST_REFERENCE_CMAKE".as_slice(),
+            b"RCMAKE_TEST_EXECUTABLE",
+        ]
+        .into_iter()
+        .filter_map(|key| host.env_get(key))
+        {
+            let fixture = Fixture::new(&host);
+            let manifest = InstallManifest {
+                actions: ["Debug", "Release"]
+                    .into_iter()
+                    .map(|config| {
+                        let source = fixture.file(&format!("{config}/app"), config.as_bytes());
+                        let mut install = action("bin".into(), files(vec![source], None, vec![]));
+                        install.configurations = vec![config.into()];
+                        install
+                    })
+                    .collect(),
+            };
+            let script = from_native(&fixture.root.join("cmake_install.cmake"));
+            write_install_script(
+                &manifest,
+                &fixture.root,
+                &InstallScriptOptions {
+                    configuration: b"Release",
+                    ..Default::default()
+                },
+                &host,
+            )
+            .unwrap();
+            for (folder, flags, expected) in [
+                ("default", &[][..], b"Release".as_slice()),
+                ("ide", &["-DBUILD_TYPE=Debug"][..], b"Debug"),
+                (
+                    "explicit",
+                    &["-DBUILD_TYPE=Debug", "-DCMAKE_INSTALL_CONFIG_NAME=Release"][..],
+                    b"Release",
+                ),
+            ] {
+                let prefix = fixture.root.join(folder);
+                let args = flags
+                    .iter()
+                    .copied()
+                    .map(BString::from)
+                    .chain([
+                        format!("-DCMAKE_INSTALL_PREFIX={}", prefix.display()).into(),
+                        "-P".into(),
+                        script.clone(),
+                    ])
+                    .collect();
+                fixture.run(executable.clone(), args);
+                assert_eq!(read(&host, &prefix.join("bin/app")), expected);
+            }
+        }
+    }
+
+    #[test]
     fn install_script_runs_with_cmake_and_rcmake() {
         let host = NativeHost::new().unwrap();
         let tools = [
