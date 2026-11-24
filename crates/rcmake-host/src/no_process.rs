@@ -61,21 +61,92 @@ macro_rules! forward_host_services {
 pub(crate) use forward_host_services;
 
 const DENIED_LIMIT: usize = 128;
-const DENIED_MESSAGE: &str = "process execution is disabled in this host mode";
+const MAX_LOG_BYTES: usize = 1024 * 1024;
+const MAX_RECORD_BYTES: usize = 16 * 1024;
+const MAX_STAGES: usize = 16;
+const MAX_ARGS: usize = 64;
+const MAX_REASON_BYTES: usize = 1024;
+pub(super) const DENIED_MESSAGE: &str = "process execution is disabled in this host mode";
 
-/// A denied request's working directory and command pipeline.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct DeniedCommand {
-    /// Working directory requested for the process.
-    pub cwd: PathBuf,
-    /// Command stages in the requested order.
-    pub pipeline: Vec<CommandSpec>,
+/// Host method that received the process request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeniedMethod {
+    /// The request used [`Host::run`].
+    Run,
+    /// The request used [`Host::run_with_timeout_signal`].
+    RunWithTimeout,
+    /// The request used [`Host::run_bounded`].
+    RunBounded,
 }
 
-/// Forwards non-process operations to the base host and denies all child processes.
+/// A process request that this host denied.
+///
+/// The working directory and pipeline can contain sensitive data. The debug
+/// representation shows only the method and counts.
+#[derive(Clone, PartialEq, Eq)]
+pub struct DeniedCommand {
+    /// Working directory of the request. An empty value can indicate omission.
+    pub cwd: PathBuf,
+    /// Retained stages and leading arguments, in request order.
+    pub pipeline: Vec<CommandSpec>,
+    /// Method that received the request.
+    pub method: DeniedMethod,
+    /// Reason supplied when this host was created.
+    pub reason: Arc<str>,
+    /// Number of stages omitted from the record.
+    pub omitted_stages: usize,
+    /// Number of arguments omitted, including arguments of omitted stages.
+    pub omitted_args: usize,
+    /// Number of working directory, program, and argument bytes omitted.
+    pub omitted_bytes: usize,
+}
+
+impl core::fmt::Debug for DeniedCommand {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("DeniedCommand")
+            .field("method", &self.method)
+            .field("retained_stages", &self.pipeline.len())
+            .field("omitted_stages", &self.omitted_stages)
+            .field("omitted_args", &self.omitted_args)
+            .field("omitted_bytes", &self.omitted_bytes)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Records and eviction counts since the last call to [`NoProcessHost::take_denied`].
+#[derive(Debug, Default)]
+pub struct DeniedLog {
+    /// Retained records, oldest first.
+    pub commands: VecDeque<DeniedCommand>,
+    /// Number of complete records evicted from the log.
+    pub omitted_entries: usize,
+    /// Total request bytes in evicted records, including bytes omitted at capture.
+    pub omitted_bytes: usize,
+}
+
+#[derive(Default)]
+struct LogState {
+    log: DeniedLog,
+    costs: VecDeque<(usize, usize)>,
+    bytes: usize,
+}
+
+impl LogState {
+    fn evict(&mut self) {
+        if let Some((cost, request_bytes)) = self.costs.pop_front() {
+            self.log.commands.pop_front();
+            self.bytes -= cost;
+            self.log.omitted_entries = self.log.omitted_entries.saturating_add(1);
+            self.log.omitted_bytes = self.log.omitted_bytes.saturating_add(request_bytes);
+        }
+    }
+}
+
+/// Forwards non-process operations and denies all child processes.
 pub struct NoProcessHost<H: Host + ?Sized> {
     base: Arc<H>,
-    denied: Mutex<VecDeque<DeniedCommand>>,
+    reason: Arc<str>,
+    denied: Mutex<LogState>,
 }
 
 impl<H: Host> NoProcessHost<H> {
@@ -84,40 +155,139 @@ impl<H: Host> NoProcessHost<H> {
     pub fn new(base: H) -> Self {
         Self::from_shared(Arc::new(base))
     }
+
+    /// Wrap an owned host and record the caller's reason for denying processes.
+    #[must_use]
+    pub fn with_reason(base: H, reason: &str) -> Self {
+        Self::from_shared_with_reason(Arc::new(base), reason)
+    }
 }
 
 impl<H: Host + ?Sized> NoProcessHost<H> {
     /// Wrap a shared host, including a shared trait object.
     #[must_use]
     pub fn from_shared(base: Arc<H>) -> Self {
+        Self::from_shared_with_reason(base, DENIED_MESSAGE)
+    }
+
+    /// Wrap a shared host and record up to 1024 UTF-8 bytes of the caller's reason.
+    ///
+    /// The host uses a fixed error message. The reason is available in the log.
+    #[must_use]
+    pub fn from_shared_with_reason(base: Arc<H>, reason: &str) -> Self {
+        let reason = if reason.is_empty() {
+            DENIED_MESSAGE
+        } else {
+            reason
+        };
+        let len = reason.floor_char_boundary(MAX_REASON_BYTES);
         Self {
             base,
+            reason: Arc::from(reason.get(..len).unwrap_or_default()),
             denied: Mutex::default(),
         }
     }
 
-    /// Return up to 128 denied requests, from oldest to newest.
+    /// Copy the retained requests, oldest first.
     #[must_use]
     pub fn denied_commands(&self) -> Vec<DeniedCommand> {
         self.denied
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .log
+            .commands
             .iter()
             .cloned()
             .collect()
     }
 
-    fn deny(&self, req: &RunRequest) -> HostResult<RunOutput> {
-        let mut denied = self
+    /// Transfer the records and eviction counts to the caller and clear the log.
+    #[must_use]
+    pub fn take_denied(&self) -> DeniedLog {
+        let mut state = self
             .denied
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if denied.len() == DENIED_LIMIT {
-            denied.pop_front();
+        std::mem::take(&mut *state).log
+    }
+
+    fn deny(&self, req: &RunRequest, method: DeniedMethod) -> HostResult<RunOutput> {
+        let cwd_bytes = req.cwd.as_os_str().as_encoded_bytes().len();
+        let (request_bytes, args) =
+            req.pipeline
+                .iter()
+                .fold((cwd_bytes, 0_usize), |(bytes, args), stage| {
+                    (
+                        stage
+                            .args
+                            .iter()
+                            .fold(bytes.saturating_add(stage.program.len()), |b, arg| {
+                                b.saturating_add(arg.len())
+                            }),
+                        args.saturating_add(stage.args.len()),
+                    )
+                });
+        let fixed_cost = size_of::<DeniedCommand>() + size_of::<(usize, usize)>();
+        let reserve = fixed_cost
+            .saturating_add(request_bytes)
+            .saturating_add(req.pipeline.len().min(MAX_STAGES) * size_of::<CommandSpec>())
+            .saturating_add(args.min(MAX_ARGS) * size_of::<BString>())
+            .min(MAX_RECORD_BYTES);
+        let mut state = self
+            .denied
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while state.log.commands.len() >= DENIED_LIMIT || reserve > MAX_LOG_BYTES - state.bytes {
+            state.evict();
         }
-        denied.push_back(DeniedCommand {
-            cwd: req.cwd.clone(),
-            pipeline: req.pipeline.clone(),
+
+        let mut left = reserve - fixed_cost;
+        let mut kept_bytes = 0;
+        let mut kept_args = 0;
+        let mut pipeline = Vec::new();
+        let cwd = if cwd_bytes <= left {
+            left -= cwd_bytes;
+            kept_bytes += cwd_bytes;
+            req.cwd.clone()
+        } else {
+            PathBuf::new()
+        };
+        for stage in req.pipeline.iter().take(MAX_STAGES) {
+            let cost = stage.program.len().saturating_add(size_of::<CommandSpec>());
+            if cost > left {
+                break;
+            }
+            left -= cost;
+            kept_bytes += stage.program.len();
+            let mut args = Vec::new();
+            for arg in stage.args.iter().take(MAX_ARGS - kept_args) {
+                let cost = arg.len().saturating_add(size_of::<BString>());
+                if cost > left {
+                    break;
+                }
+                left -= cost;
+                kept_bytes += arg.len();
+                kept_args += 1;
+                args.reserve_exact(1);
+                args.push(arg.clone());
+            }
+            pipeline.reserve_exact(1);
+            pipeline.push(CommandSpec {
+                program: stage.program.clone(),
+                args,
+            });
+        }
+        let cost = reserve - left;
+        state.bytes += cost;
+        state.costs.push_back((cost, request_bytes));
+        state.log.commands.push_back(DeniedCommand {
+            cwd,
+            method,
+            reason: Arc::clone(&self.reason),
+            omitted_stages: req.pipeline.len() - pipeline.len(),
+            omitted_args: args.saturating_sub(kept_args),
+            omitted_bytes: request_bytes.saturating_sub(kept_bytes),
+            pipeline,
         });
         Err(HostError::unsupported(DENIED_MESSAGE))
     }
@@ -129,7 +299,7 @@ impl<H: Host + ?Sized> Host for NoProcessHost<H> {
         req: &RunRequest,
         _on_output: &mut dyn FnMut(Stream, &[u8]),
     ) -> HostResult<RunOutput> {
-        self.deny(req)
+        self.deny(req, DeniedMethod::Run)
     }
 
     fn run_with_timeout_signal(
@@ -138,11 +308,11 @@ impl<H: Host + ?Sized> Host for NoProcessHost<H> {
         _timeout: GracefulTimeout,
         _on_output: &mut dyn FnMut(Stream, &[u8]),
     ) -> HostResult<RunOutput> {
-        self.deny(req)
+        self.deny(req, DeniedMethod::RunWithTimeout)
     }
 
     fn run_bounded(&self, req: &RunRequest, _limit: usize) -> HostResult<RunOutput> {
-        self.deny(req)
+        self.deny(req, DeniedMethod::RunBounded)
     }
 
     fn metadata(&self, p: &Path, follow: Follow) -> HostResult<Metadata> {
@@ -311,11 +481,26 @@ mod tests {
         }
         assert_eq!(callbacks, 0);
         assert_eq!(base.env_get(b"RAN"), None);
-        let expected = [normal, timed, bounded].map(|req| DeniedCommand {
-            cwd: req.cwd,
-            pipeline: req.pipeline,
-        });
-        assert_eq!(host.denied_commands(), expected);
+        let log = host.take_denied();
+        assert_eq!(log.omitted_entries, 0);
+        assert_eq!(log.commands.len(), 3);
+        let methods = [
+            DeniedMethod::Run,
+            DeniedMethod::RunWithTimeout,
+            DeniedMethod::RunBounded,
+        ];
+        for ((record, req), method) in log
+            .commands
+            .iter()
+            .zip([normal, timed, bounded])
+            .zip(methods)
+        {
+            assert_eq!(record.cwd, req.cwd);
+            assert!(record.pipeline == req.pipeline);
+            assert_eq!(record.method, method);
+            assert_eq!(&*record.reason, DENIED_MESSAGE);
+        }
+        assert!(host.take_denied().commands.is_empty());
         host.env_set(b"FORWARDED", Some(b"yes"));
         assert_eq!(base.env_get(b"FORWARDED"), Some("yes".into()));
         Ok(())
@@ -336,6 +521,68 @@ mod tests {
             .map(|entry| entry.pipeline)
             .collect();
         assert_eq!(pipelines, expected);
+    }
+
+    #[test]
+    fn bounds_record_bytes_stages_and_arguments() {
+        let host = NoProcessHost::with_reason(PureHost::default(), "Local configure is required");
+        let mut req = request("private-program");
+        req.pipeline = vec![CommandSpec {
+            program: "private-program".into(),
+            args: vec!["private-arg".into(); MAX_ARGS + 1],
+        }];
+        req.pipeline.extend((0..MAX_STAGES).map(|_| CommandSpec {
+            program: "stage".into(),
+            args: vec!["arg".into()],
+        }));
+        assert!(host.run_bounded(&req, 0).is_err());
+
+        let mut large = request("program");
+        large.pipeline = vec![CommandSpec {
+            program: "program".into(),
+            args: vec![BString::from(vec![b'x'; MAX_RECORD_BYTES + 1])],
+        }];
+        assert!(host.run_bounded(&large, 0).is_err());
+
+        let log = host.take_denied();
+        assert_eq!(log.commands.len(), 2);
+        let mut records = log.commands.into_iter();
+        if let (Some(record), Some(large)) = (records.next(), records.next()) {
+            assert_eq!(record.pipeline.len(), MAX_STAGES);
+            assert_eq!(
+                record
+                    .pipeline
+                    .iter()
+                    .map(|stage| stage.args.len())
+                    .sum::<usize>(),
+                MAX_ARGS
+            );
+            assert_eq!(record.omitted_stages, 1);
+            assert_eq!(record.omitted_args, MAX_STAGES + 1);
+            assert!(!format!("{record:?}").contains("private-arg"));
+            assert_eq!(&*record.reason, "Local configure is required");
+            assert_eq!(large.omitted_bytes, MAX_RECORD_BYTES + 1);
+            assert_eq!(large.omitted_args, 1);
+        }
+        assert!(host.take_denied().commands.is_empty());
+    }
+
+    #[test]
+    fn reports_evictions_when_the_log_reaches_its_byte_limit() {
+        let host = NoProcessHost::new(PureHost::default());
+        let mut req = request("program");
+        req.pipeline = vec![CommandSpec {
+            program: "program".into(),
+            args: vec![BString::from(vec![b'x'; MAX_RECORD_BYTES - 1024])],
+        }];
+        for _ in 0..DENIED_LIMIT {
+            assert!(host.run_bounded(&req, 0).is_err());
+        }
+        let log = host.take_denied();
+        assert!(log.omitted_entries > 0);
+        assert_eq!(log.omitted_entries + log.commands.len(), DENIED_LIMIT);
+        assert!(log.omitted_bytes >= log.omitted_entries * (MAX_RECORD_BYTES - 1024));
+        assert_eq!(host.take_denied().omitted_entries, 0);
     }
 
     #[test]
@@ -384,7 +631,7 @@ mod tests {
         assert!(host.read_dir(old)?.is_empty());
         host.create_dir_all(&moved.join("child"))?;
         assert_eq!(host.metadata(moved, Follow::No)?.nlink, 3);
-        assert_eq!(overlay.audit_clean_base().overlay_files, 0);
+        assert_eq!(overlay.audit().overlay_files, 0);
         assert_eq!(base.read(&old.join("a"), ALL)?, b"old");
         assert_eq!(base.read(&old.join("c"), ALL)?, b"delete");
         assert_missing(base.metadata(&old.join("d"), Follow::No));
@@ -432,7 +679,7 @@ mod tests {
         assert_eq!(host.read(src, ALL)?, b"new");
         host.env_set(b"MODE", None);
         assert_eq!(host.env_get(b"MODE"), None);
-        assert_eq!(overlay.audit_clean_base().environment_overrides, 1);
+        assert_eq!(overlay.audit().environment_overrides, 1);
         assert_eq!(base.env_get(b"MODE"), Some("base".into()));
         assert_eq!(base.metadata(src, Follow::No)?, original);
         assert_eq!(base.read(alias, ALL)?, b"base");

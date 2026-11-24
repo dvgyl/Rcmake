@@ -1,428 +1,40 @@
-//! An in-memory overlay for a read-only base host.
+//! An in-memory filesystem view over a stable base host.
 
 #![forbid(unsafe_code)]
 
+mod paths;
+mod state;
+
+#[cfg(test)]
+mod tests;
+
 use core::time::Duration;
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::ffi::OsString;
-use std::io::ErrorKind;
-use std::ops::Bound::{Excluded, Unbounded};
-use std::path::{Component, Path, PathBuf};
-use std::sync::{Arc, Condvar, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
+#[cfg(not(target_family = "wasm"))]
+use std::sync::Condvar;
+use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use rcmake_base::BString;
 
 use crate::error::SyntheticError;
 use crate::{
-    CopyOptions, DirEntry, FileKind, FileLockGuard, FileTime, Follow, Host, HostError, HostResult,
-    Metadata, ReadRange, RunOutput, RunRequest, Stream, WriteMode, path,
+    CopyOptions, DirEntry, FILE_CHUNK_SIZE, FileKind, FileLockGuard, FileTime, Follow, Host,
+    HostError, HostResult, Metadata, ReadRange, RunOutput, RunRequest, Stream, WriteMode, path,
 };
 
-const MAX_SYMLINK_HOPS: usize = 40;
-const MAX_FILE_BYTES: usize = 256 * 1024 * 1024;
-const MAX_REMOVAL_ENTRIES: usize = 1_000_000;
+use self::paths::{budget_error, validate_length};
+use self::state::{CONTENTS_OVERHEAD, Contents, Edit, Entry, Inode, Node, Resolved, State};
 
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
-enum Inode {
-    Base(u64, u64),
-    Local(u64),
-}
+pub use self::paths::{OverlayPathPolicy, OverlayPathStyle};
 
-#[derive(Clone)]
-struct Node {
-    stat: Metadata,
-    backing: Option<PathBuf>,
-    target: Option<PathBuf>,
-}
-
-impl Node {
-    fn inode(&self) -> Inode {
-        if self.backing.is_some() {
-            Inode::Base(self.stat.dev, self.stat.ino)
-        } else {
-            Inode::Local(self.stat.ino)
-        }
-    }
-
-    fn target(&self, base: &(impl Host + ?Sized), p: &Path) -> HostResult<PathBuf> {
-        if let Some(target) = &self.target {
-            return Ok(target.clone());
-        }
-        base.read_link(self.backing(p)?)
-    }
-
-    fn backing(&self, p: &Path) -> HostResult<&Path> {
-        self.backing
-            .as_deref()
-            .ok_or_else(|| SyntheticError::NotFound.at(Some(p)))
-    }
-
-    fn require_file(&self, p: &Path) -> HostResult<()> {
-        match self.stat.kind {
-            FileKind::File => Ok(()),
-            FileKind::Dir => Err(SyntheticError::IsADirectory.at(Some(p))),
-            _ => Err(SyntheticError::InvalidInput.at(Some(p))),
-        }
-    }
-}
-
-#[derive(Default)]
-struct Override {
-    bytes: Option<Vec<u8>>,
-    mode: Option<u32>,
-    atime: Option<FileTime>,
-    mtime: Option<FileTime>,
-    links: i64,
-}
-
-impl Override {
-    fn apply(&self, stat: &mut Metadata) {
-        if let Some(bytes) = &self.bytes {
-            stat.len = bytes.len() as u64;
-        }
-        stat.mode = self.mode.unwrap_or(stat.mode);
-        stat.atime = self.atime.unwrap_or(stat.atime);
-        stat.mtime = self.mtime.unwrap_or(stat.mtime);
-        stat.nlink = stat.nlink.saturating_add_signed(self.links);
-    }
-}
-
-struct OverlayState<H: Host + ?Sized> {
-    base: Arc<H>,
-    // An absent node at a key hides the base path and its descendants.
-    paths: BTreeMap<PathBuf, Option<Node>>,
-    overrides: BTreeMap<Inode, Override>,
-    env: BTreeMap<BString, Option<BString>>,
-    next_ino: u64,
-}
-
-struct Resolved {
-    path: PathBuf,
-    node: Option<Node>,
-}
-
-impl Resolved {
-    fn existing(self, original: &Path) -> HostResult<(PathBuf, Node)> {
-        let node = self
-            .node
-            .ok_or_else(|| SyntheticError::NotFound.at(Some(original)))?;
-        Ok((self.path, node))
-    }
-}
-
-enum Part {
-    Name(OsString, bool),
-    Parent,
-    Directory,
-}
-
-fn split(p: &Path, create_dirs: bool) -> (PathBuf, VecDeque<Part>) {
-    let mut root = PathBuf::new();
-    let mut parts = VecDeque::new();
-    for component in p.components() {
-        match component {
-            Component::Prefix(_) | Component::RootDir => root.push(component.as_os_str()),
-            Component::Normal(name) => parts.push_back(Part::Name(name.to_owned(), create_dirs)),
-            Component::ParentDir => parts.push_back(Part::Parent),
-            Component::CurDir => {}
-        }
-    }
-    let bytes = path::from_native(p);
-    let separator = |byte| byte == b'/' || (cfg!(windows) && byte == b'\\');
-    if bytes.last().copied().is_some_and(separator)
-        || matches!(bytes.as_slice(), [.., sep, b'.'] if separator(*sep))
-    {
-        parts.push_back(Part::Directory);
-    }
-    (root, parts)
-}
-
-fn absolute(p: &Path) -> HostResult<()> {
-    if !p.has_root() {
-        return Err(HostError::not_absolute(p.to_path_buf()));
-    }
-    if path::from_native(p).as_slice().contains(&0) {
-        return Err(SyntheticError::InvalidInput.at(Some(p)));
-    }
-    Ok(())
-}
-
-impl<H: Host + ?Sized> OverlayState<H> {
-    fn new(base: Arc<H>) -> Self {
-        Self {
-            base,
-            paths: BTreeMap::new(),
-            overrides: BTreeMap::new(),
-            env: BTreeMap::new(),
-            next_ino: 0,
-        }
-    }
-
-    fn new_node(&mut self, kind: FileKind, now: FileTime, target: Option<PathBuf>) -> Node {
-        self.next_ino += 1;
-        Node {
-            stat: Metadata {
-                kind,
-                mode: match kind {
-                    FileKind::Dir => 0o755,
-                    FileKind::Symlink => 0o777,
-                    _ => 0o644,
-                },
-                len: target
-                    .as_ref()
-                    .map_or(0, |p| path::from_native(p).len() as u64),
-                atime: now,
-                mtime: now,
-                dev: u64::MAX,
-                ino: self.next_ino,
-                nlink: if kind == FileKind::Dir { 2 } else { 1 },
-            },
-            backing: None,
-            target,
-        }
-    }
-
-    fn lookup(&self, mut p: PathBuf, backing: Option<PathBuf>) -> HostResult<Resolved> {
-        if let Some(node) = self.paths.get(&p) {
-            return Ok(Resolved {
-                path: p,
-                node: node.clone(),
-            });
-        }
-        let mut node = None;
-        if let Some(mut backing) = backing
-            && let Some(stat) = present(self.base.metadata(&backing, Follow::No))?
-        {
-            if stat.kind != FileKind::Symlink
-                && let Ok(canonical) = self.base.canonicalize(&backing)
-            {
-                // Use the base's spelling, also when the directory has moved in the overlay.
-                if let Some(name) = canonical.file_name() {
-                    p.set_file_name(name);
-                }
-                backing = canonical;
-            }
-            node = Some(Node {
-                stat,
-                backing: Some(backing),
-                target: None,
-            });
-        }
-        let node = self.paths.get(&p).cloned().unwrap_or(node);
-        Ok(Resolved { path: p, node })
-    }
-
-    fn child(&self, dir: &Resolved, name: &Path) -> HostResult<Resolved> {
-        let backing = dir.node.as_ref().and_then(|node| node.backing.as_ref());
-        self.lookup(dir.path.join(name), backing.map(|p| p.join(name)))
-    }
-
-    fn root(&self, root: PathBuf) -> HostResult<Resolved> {
-        let resolved = self.lookup(root.clone(), Some(root.clone()))?;
-        match resolved.node.as_ref().map(|node| node.stat.kind) {
-            Some(FileKind::Dir) => Ok(resolved),
-            None => Err(SyntheticError::NotFound.at(Some(&root))),
-            _ => Err(SyntheticError::NotADirectory.at(Some(&root))),
-        }
-    }
-
-    fn resolve(
-        &self,
-        p: &Path,
-        follow: Follow,
-        allow_missing_leaf: bool,
-        mut new_dirs: Option<&mut BTreeSet<PathBuf>>,
-    ) -> HostResult<Resolved> {
-        absolute(p)?;
-        let (root, mut pending) = split(p, new_dirs.is_some());
-        let mut parents = vec![self.root(root)?];
-        let mut hops = 0;
-        while let Some(part) = pending.pop_front() {
-            let Part::Name(name, may_create) = part else {
-                if matches!(part, Part::Parent) && parents.len() > 1 {
-                    parents.pop();
-                }
-                continue;
-            };
-            let dir = parents
-                .last()
-                .ok_or_else(|| SyntheticError::NotFound.at(Some(p)))?;
-            let child = self.child(dir, Path::new(&name))?;
-            match child.node.as_ref().map(|node| node.stat.kind) {
-                None => {
-                    if let Some(dirs) = new_dirs.as_deref_mut()
-                        && (may_create || dirs.contains(&child.path))
-                    {
-                        dirs.insert(child.path.clone());
-                        parents.push(child);
-                    } else if allow_missing_leaf && pending.is_empty() {
-                        return Ok(child);
-                    } else {
-                        return Err(SyntheticError::NotFound.at(Some(p)));
-                    }
-                }
-                Some(FileKind::Dir) => parents.push(child),
-                Some(FileKind::Symlink) if follow == Follow::Yes || !pending.is_empty() => {
-                    hops += 1;
-                    if hops > MAX_SYMLINK_HOPS {
-                        return Err(SyntheticError::LinkLoop.at(Some(p)));
-                    }
-                    let (_, node) = child.existing(p)?;
-                    let mut target = node.target(self.base.as_ref(), p)?;
-                    if cfg!(windows) && target.has_root() && !target.is_absolute() {
-                        target = dir.path.join(target);
-                    }
-                    let (root, mut parts) = split(&target, false);
-                    if root.has_root() {
-                        parents = vec![self.root(root)?];
-                    } else if !root.as_os_str().is_empty() {
-                        return Err(SyntheticError::InvalidInput.at(Some(p)));
-                    }
-                    parts.append(&mut pending);
-                    pending = parts;
-                }
-                Some(_) if pending.is_empty() && new_dirs.is_none() => return Ok(child),
-                Some(_) => return Err(SyntheticError::NotADirectory.at(Some(p))),
-            }
-        }
-        parents
-            .pop()
-            .ok_or_else(|| SyntheticError::NotFound.at(Some(p)))
-    }
-
-    fn existing(&self, p: &Path, follow: Follow) -> HostResult<(PathBuf, Node)> {
-        self.resolve(p, follow, false, None)?.existing(p)
-    }
-
-    fn destination(&self, p: &Path, follow: Follow) -> HostResult<Resolved> {
-        self.resolve(p, follow, true, None)
-    }
-
-    fn descendants<'a>(
-        &'a self,
-        dir: &'a Path,
-    ) -> impl Iterator<Item = (&'a PathBuf, &'a Option<Node>)> {
-        self.paths
-            .range::<Path, _>((Excluded(dir), Unbounded))
-            .take_while(move |(p, _)| p.starts_with(dir))
-    }
-
-    fn children(&self, p: &Path, dir: &Node) -> HostResult<Vec<DirEntry>> {
-        let mut entries = match &dir.backing {
-            Some(backing) => self
-                .base
-                .read_dir(backing)?
-                .into_iter()
-                .map(|entry| (entry.name, entry.kind))
-                .collect::<BTreeMap<_, _>>(),
-            None => BTreeMap::new(),
-        };
-        for (child, node) in self
-            .descendants(p)
-            .filter(|(child, _)| child.parent() == Some(p))
-        {
-            if let Some(name) = child
-                .file_name()
-                .map(|name| path::from_native(Path::new(name)))
-            {
-                match node {
-                    Some(node) => {
-                        entries.insert(name, node.stat.kind);
-                    }
-                    None => {
-                        entries.remove(&name);
-                    }
-                }
-            }
-        }
-        Ok(entries
-            .into_iter()
-            .map(|(name, kind)| DirEntry { name, kind })
-            .collect())
-    }
-
-    fn stat(&self, node: &Node) -> Metadata {
-        let mut stat = node.stat.clone();
-        if let Some(change) = self.overrides.get(&node.inode()) {
-            change.apply(&mut stat);
-        }
-        stat
-    }
-
-    fn bytes(&self, node: &Node) -> Option<&[u8]> {
-        self.overrides.get(&node.inode())?.bytes.as_deref()
-    }
-
-    fn store(&mut self, p: PathBuf, node: Node) -> &mut Override {
-        let key = node.inode();
-        self.paths.insert(p, Some(node));
-        self.overrides.entry(key).or_default()
-    }
-
-    fn unlink(&mut self, node: &Node) {
-        if node.stat.kind != FileKind::Dir && self.stat(node).nlink > 1 {
-            self.overrides.entry(node.inode()).or_default().links -= 1;
-        } else {
-            self.overrides.remove(&node.inode());
-        }
-    }
-
-    fn clear_tree(&mut self, p: &Path) {
-        let children: Vec<_> = self.descendants(p).map(|(p, _)| p.clone()).collect();
-        for child in children {
-            self.paths.remove(&child);
-        }
-        self.paths.insert(p.to_path_buf(), None);
-    }
-
-    fn removed_nodes(&self, p: PathBuf, node: Node) -> HostResult<Vec<Node>> {
-        let mut nodes = Vec::new();
-        let mut pending = vec![(p, node)];
-        while let Some((p, node)) = pending.pop() {
-            if node.stat.kind == FileKind::Dir {
-                let children = self.children(&p, &node)?;
-                let dir = Resolved {
-                    path: p.clone(),
-                    node: Some(node.clone()),
-                };
-                for child in children {
-                    let child_path = path::to_native(&child.name);
-                    let mut parts = child_path.components();
-                    if !matches!(
-                        (parts.next(), parts.next()),
-                        (Some(Component::Normal(_)), None)
-                    ) {
-                        return Err(SyntheticError::InvalidInput.at(Some(&p)));
-                    }
-                    pending.push(self.child(&dir, &child_path)?.existing(&p)?);
-                    if pending.len().saturating_add(nodes.len()) > MAX_REMOVAL_ENTRIES {
-                        return Err(HostError::unsupported(
-                            "Too many entries in the overlay directory tree",
-                        ));
-                    }
-                }
-            }
-            nodes.push(node);
-        }
-        Ok(nodes)
-    }
-}
-
-fn present<T>(result: HostResult<T>) -> HostResult<Option<T>> {
-    match result {
-        Ok(value) => Ok(Some(value)),
-        Err(err) if err.kind == ErrorKind::NotFound => Ok(None),
-        Err(err) => Err(err),
-    }
-}
-
-fn poisoned() -> HostError {
-    HostError::unsupported("Cannot access the overlay host state")
-}
+const MAX_OVERLAY_BYTES: usize = 256 * 1024 * 1024;
+const MAX_HELD_LOCKS: usize = 65_536;
 
 #[derive(Debug, Default)]
 struct LockTable {
     held: Mutex<BTreeSet<Inode>>,
+    #[cfg(not(target_family = "wasm"))]
     released: Condvar,
 }
 
@@ -444,37 +56,40 @@ impl Drop for OverlayLock {
         if let Ok(mut held) = self.table.held.lock() {
             held.remove(&self.key);
         }
+        #[cfg(not(target_family = "wasm"))]
         self.table.released.notify_all();
     }
 }
 
-/// Counts of changes present in the overlay.
+/// Counts of changes held in the overlay.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct OverlayAudit {
-    /// Paths added, changed, or moved in the overlay.
+    /// Paths added, changed, or moved in the overlay, as in [`OverlayHost::written_paths`].
     pub written_paths: usize,
-    /// Paths with tombstones. A directory tombstone also hides its descendants.
+    /// Tombstones that hide base entries or subtrees.
     pub deleted_paths: usize,
-    /// File contents stored in memory, counted once per inode.
+    /// Files with overlay contents, counted once per inode.
     pub overlay_files: usize,
     /// Environment keys set or unset in the overlay.
     pub environment_overrides: usize,
 }
 
-/// Stores filesystem and environment changes in memory.
+/// Stores explicit filesystem and environment changes in memory.
 ///
-/// The adapter never calls a base filesystem mutation method or starts a process.
-/// The base must remain stable while the overlay is in use. Base reads can change
-/// access timestamps. The adapter can store up to 256 MiB per file. Use
-/// [`NoProcessHost`](crate::no_process::NoProcessHost) around this host to log process denials.
+/// The base must remain stable during use. Base reads can change access times.
+/// Standard output and error go to the base. The overlay denies process requests.
+/// Wrap it in [`crate::no_process::NoProcessHost`] to record those requests.
+///
+/// The overlay limits the retained state to 256 MiB and 65,536 entries. When an
+/// environment change exceeds a limit, [`Host::env_set`] leaves the value in place.
 pub struct OverlayHost<H: Host + ?Sized> {
     base: Arc<H>,
-    state: RwLock<OverlayState<H>>,
+    state: RwLock<State<H>>,
     locks: Arc<LockTable>,
 }
 
 impl<H: Host> OverlayHost<H> {
-    /// Wrap an owned base host.
+    /// Wrap an owned host with the default path policy.
     #[must_use]
     pub fn new(base: H) -> Self {
         Self::from_shared(Arc::new(base))
@@ -482,57 +97,97 @@ impl<H: Host> OverlayHost<H> {
 }
 
 impl<H: Host + ?Sized> OverlayHost<H> {
-    /// Wrap a shared base host, including a shared trait object.
+    /// Wrap a shared host, including a shared trait object.
+    ///
+    /// The default uses virtual paths for [`crate::PureHost`]. For other hosts it
+    /// uses the platform's path style. Windows and macOS use case-insensitive
+    /// lookup by default. Set the policy explicitly for other filesystem rules.
     #[must_use]
     pub fn from_shared(base: Arc<H>) -> Self {
+        let virtual_base = base.system().sysname.as_slice() == b"PureOS";
+        let policy = OverlayPathPolicy {
+            style: if virtual_base {
+                OverlayPathStyle::Virtual
+            } else if cfg!(windows) {
+                OverlayPathStyle::Windows
+            } else {
+                OverlayPathStyle::Posix
+            },
+            case_sensitive: virtual_base || !cfg!(any(windows, target_os = "macos")),
+        };
+        Self::with_path_policy(base, policy)
+    }
+
+    /// Wrap a shared host with explicit root, separator, and case rules.
+    #[must_use]
+    pub fn with_path_policy(base: Arc<H>, policy: OverlayPathPolicy) -> Self {
+        Self::with_limit(base, policy, MAX_OVERLAY_BYTES)
+    }
+
+    fn with_limit(base: Arc<H>, policy: OverlayPathPolicy, limit: usize) -> Self {
         Self {
-            state: RwLock::new(OverlayState::new(Arc::clone(&base))),
+            state: RwLock::new(State::new(Arc::clone(&base), policy, limit)),
             base,
             locks: Arc::default(),
         }
     }
 
-    /// Return paths added, changed, or moved in the overlay, in sorted order.
+    /// Return sorted paths added, changed, or moved in the overlay.
+    ///
+    /// This includes both names supplied to [`Host::hard_link`] and base aliases
+    /// changed by path. Other base hard links share the inode changes when accessed.
+    /// The overlay does not search the base tree for their names. Implicit changes
+    /// to parent directory times do not add paths to this list.
     #[must_use]
     pub fn written_paths(&self) -> Vec<PathBuf> {
         self.paths(true)
     }
 
-    /// Return tombstone paths in sorted order.
+    /// Return sorted tombstone paths.
     #[must_use]
     pub fn deleted_paths(&self) -> Vec<PathBuf> {
         self.paths(false)
     }
 
     fn paths(&self, written: bool) -> Vec<PathBuf> {
-        self.state
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .paths
-            .iter()
-            .filter(|(_, node)| node.is_some() == written)
-            .map(|(p, _)| p.clone())
-            .collect()
-    }
-
-    /// Return the bytes stored in the overlay for this path, following symbolic links.
-    ///
-    /// A file that still uses its base contents has no bytes in the overlay.
-    #[must_use]
-    pub fn read_overlay_file(&self, p: &Path) -> Option<Vec<u8>> {
-        let state = self.state.read().ok()?;
-        let (_, node) = state.existing(p, Follow::Yes).ok()?;
-        state.bytes(&node).map(<[u8]>::to_vec)
-    }
-
-    /// Count changes held in memory. The counts cover this adapter's state.
-    #[must_use]
-    pub fn audit_clean_base(&self) -> OverlayAudit {
         let state = self
             .state
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let written_paths = state.paths.values().filter(|node| node.is_some()).count();
+        let mut paths: Vec<_> = state
+            .paths
+            .values()
+            .filter(|entry| entry.node.is_some() == written)
+            .map(|entry| entry.path.clone())
+            .collect();
+        paths.sort_unstable();
+        paths
+    }
+
+    /// Return a copy of the file's overlay contents, following symbolic links.
+    ///
+    /// Return `None` when the contents still come from the base host.
+    #[must_use]
+    pub fn read_overlay_file(&self, p: &Path) -> Option<Vec<u8>> {
+        let state = self.state.read().ok()?;
+        let entry = state.existing(p, Follow::Yes).ok()?;
+        state
+            .bytes(entry.existing(p).ok()?)
+            .map(|bytes| bytes.0.to_vec())
+    }
+
+    /// Count retained overlay changes.
+    #[must_use]
+    pub fn audit(&self) -> OverlayAudit {
+        let state = self
+            .state
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let written_paths = state
+            .paths
+            .values()
+            .filter(|entry| entry.node.is_some())
+            .count();
         OverlayAudit {
             written_paths,
             deleted_paths: state.paths.len() - written_paths,
@@ -545,101 +200,238 @@ impl<H: Host + ?Sized> OverlayHost<H> {
         }
     }
 
-    fn read_state(&self) -> HostResult<RwLockReadGuard<'_, OverlayState<H>>> {
+    fn read_state(&self) -> HostResult<RwLockReadGuard<'_, State<H>>> {
         self.state.read().map_err(|_| poisoned())
     }
 
-    fn write_state(&self) -> HostResult<RwLockWriteGuard<'_, OverlayState<H>>> {
+    fn write_state(&self) -> HostResult<RwLockWriteGuard<'_, State<H>>> {
         self.state.write().map_err(|_| poisoned())
     }
 
-    fn store_file<'a>(
-        &self,
-        state: &'a mut OverlayState<H>,
-        dest: Resolved,
-        bytes: Vec<u8>,
-    ) -> &'a mut Override {
-        let now = self.base.now();
-        let node = dest
-            .node
-            .unwrap_or_else(|| state.new_node(FileKind::File, now, None));
-        let change = state.store(dest.path, node);
-        change.bytes = Some(bytes);
-        change.mtime = Some(now);
-        change.atime = Some(now);
-        change
-    }
-
     fn rename_entry(&self, from: &Path, to: &Path, replace: bool) -> HostResult<()> {
-        absolute(from)?;
-        absolute(to)?;
         let mut state = self.write_state()?;
-        let (src, node) = state.existing(from, Follow::No)?;
-        let dst = state.destination(to, Follow::No)?;
-        if !replace && dst.node.is_some() {
+        let trailing_from = state
+            .policy
+            .with_absolute(from, |p| Ok(p.endpoint(from)?.1))?;
+        let (name, trailing_to) = state.policy.with_absolute(to, |p| {
+            let (name, trailing) = p.endpoint(to)?;
+            Ok((name.to_vec(), trailing))
+        })?;
+        let src = state.resolve(from, Follow::No, false, None, true)?;
+        let dst = state.resolve(to, Follow::No, true, None, true)?;
+        let node = src.existing(from)?;
+        let src_dir = node.stat.kind == FileKind::Dir;
+        if trailing_from && !src_dir {
+            return Err(SyntheticError::NotADirectory.at(Some(from)));
+        }
+        if trailing_to
+            && (!src_dir
+                || dst
+                    .entry
+                    .node
+                    .as_ref()
+                    .is_some_and(|n| n.stat.kind != FileKind::Dir))
+        {
+            return Err(SyntheticError::NotADirectory.at(Some(to)));
+        }
+        if !replace && dst.entry.node.is_some() {
             return Err(SyntheticError::AlreadyExists.at(Some(to)));
         }
-        if dst
-            .node
-            .as_ref()
-            .is_some_and(|other| other.inode() == node.inode())
-        {
-            return Ok(());
-        }
-        if src.parent().is_none() || dst.path.parent().is_none() {
-            return Err(SyntheticError::ResourceBusy.at(Some(from)));
-        }
-        if dst.path.starts_with(&src) {
-            return Err(SyntheticError::InvalidInput.at(Some(to)));
-        }
-        if let Some(other) = &dst.node {
-            match (node.stat.kind, other.stat.kind) {
-                (FileKind::Dir, FileKind::Dir) => {
-                    if !state.children(&dst.path, other)?.is_empty() {
+
+        let renamed = dst.path_with_name(&name);
+        let same_key = src.key == dst.key;
+        let mut edit = Edit::default();
+        if let Some(other) = &dst.entry.node {
+            if other.inode() == node.inode() {
+                if !same_key || renamed == src.entry.path {
+                    return Ok(());
+                }
+            } else {
+                match (src_dir, other.stat.kind) {
+                    (true, FileKind::Dir) if !state.children(&dst, other)?.is_empty() => {
                         return Err(SyntheticError::DirectoryNotEmpty.at(Some(to)));
                     }
+                    (true, FileKind::Dir) => {}
+                    (true, _) => return Err(SyntheticError::NotADirectory.at(Some(to))),
+                    (false, FileKind::Dir) => return Err(SyntheticError::IsADirectory.at(Some(to))),
+                    (false, _) => {}
                 }
-                (FileKind::Dir, _) => return Err(SyntheticError::NotADirectory.at(Some(to))),
-                (_, FileKind::Dir) => return Err(SyntheticError::IsADirectory.at(Some(to))),
-                _ => {}
+                edit.unlink(&state, other);
             }
-            state.unlink(other);
         }
-        let moved: Vec<_> = state
-            .descendants(&src)
-            .filter_map(|(p, entry)| {
-                Some((dst.path.join(p.strip_prefix(&src).ok()?), entry.clone()))
-            })
-            .collect();
-        state.clear_tree(&dst.path);
-        state.clear_tree(&src);
-        state.paths.insert(dst.path, Some(node));
-        state.paths.extend(moved);
+        if !same_key && dst.key.is_under(&src.key) {
+            return Err(SyntheticError::InvalidInput.at(Some(to)));
+        }
+        if !same_key {
+            for (key, _) in state.descendants(&dst.key) {
+                edit.paths.insert(key.clone(), None);
+            }
+            edit.paths.insert(src.key.clone(), state.tombstone(&src)?);
+        }
+
+        let dest_display = path::from_native(&renamed);
+        let mut name_bytes = 0_usize;
+        for (key, entry) in state.descendants(&src.key) {
+            let display = path::from_native(&entry.path);
+            let levels = key
+                .0
+                .strip_prefix(src.key.0.as_slice())
+                .unwrap_or_default()
+                .split(|&byte| byte == 0)
+                .count()
+                - 1;
+            let prefix = display
+                .rsplitn(levels + 1, |&byte| byte == b'/')
+                .nth(levels)
+                .ok_or_else(|| SyntheticError::InvalidInput.at(Some(from)))?;
+            let suffix = display.get(prefix.len()..).unwrap_or_default();
+            name_bytes = name_bytes.saturating_add(
+                dest_display.len() + suffix.len() + dst.key.0.len() + key.0.len() - src.key.0.len(),
+            );
+            if name_bytes > state.limit() {
+                return Err(budget_error(to));
+            }
+            let name = path::to_native(&[dest_display.as_slice(), suffix].concat());
+            validate_length(&name)?;
+            edit.paths.insert(key.clone(), None);
+            edit.paths.insert(
+                key.rebased(&src.key, &dst.key),
+                Some(Entry {
+                    path: name,
+                    node: entry.node.clone(),
+                }),
+            );
+        }
+
+        let now = state.tick();
+        edit.touch_parent(&state, &src, now);
+        edit.touch_parent(&state, &dst, now);
+        edit.paths.insert(
+            dst.key,
+            Some(Entry {
+                path: renamed,
+                node: Some(node.clone()),
+            }),
+        );
+        state.check(&edit, 0, to)?;
+        state.commit(edit);
         Ok(())
     }
 
-    fn contents(&self, state: &OverlayState<H>, node: &Node, p: &Path) -> HostResult<Vec<u8>> {
-        if let Some(bytes) = state.bytes(node) {
-            return Ok(bytes.to_vec());
-        }
-        let range = ReadRange::All {
-            limit: MAX_FILE_BYTES as u64,
+    fn remove_entry(&self, p: &Path, directory: Option<bool>) -> HostResult<()> {
+        let mut state = self.write_state()?;
+        let resolved = if directory.is_some() {
+            state
+                .policy
+                .with_absolute(p, |parsed| parsed.endpoint(p).map(|_| ()))?;
+            state.resolve(p, Follow::No, false, None, true)?
+        } else {
+            state.existing(p, Follow::No)?
         };
-        self.base.read(node.backing(p)?, range)
+        let node = resolved.existing(p)?;
+        let mut edit = Edit::default();
+        match (directory, node.stat.kind) {
+            (None, FileKind::Dir) => return Err(SyntheticError::IsADirectory.at(Some(p))),
+            (Some(false), FileKind::Dir) => {
+                if !state.children(&resolved, node)?.is_empty() {
+                    return Err(SyntheticError::DirectoryNotEmpty.at(Some(p)));
+                }
+            }
+            (Some(true), FileKind::Dir | FileKind::Symlink) | (None, _) => {}
+            (Some(_), _) => return Err(SyntheticError::NotADirectory.at(Some(p))),
+        }
+        if directory == Some(true) {
+            state.remove_tree(&mut edit, &resolved, p)?;
+        } else {
+            edit.unlink(&state, node);
+        }
+        let now = state.tick();
+        edit.touch_parent(&state, &resolved, now);
+        for (key, _) in state.descendants(&resolved.key) {
+            edit.paths.insert(key.clone(), None);
+        }
+        let tombstone = state.tombstone(&resolved)?;
+        edit.paths.insert(resolved.key, tombstone);
+        state.check(&edit, 0, p)?;
+        state.commit(edit);
+        Ok(())
+    }
+
+    fn file_edit(
+        state: &mut State<H>,
+        dest: Resolved,
+        len: usize,
+        p: &Path,
+    ) -> HostResult<(Edit, Node)> {
+        let now = state.tick();
+        let mut edit = Edit::default();
+        let node = if let Some(node) = &dest.entry.node {
+            node.require_file(p)?;
+            node.clone()
+        } else {
+            edit.touch_parent(state, &dest, now);
+            state.new_node(FileKind::File, now)
+        };
+        edit.store(dest, node.clone());
+        let change = edit.change(state, &node);
+        change.bytes = None;
+        change.mtime = Some(now);
+        change.atime = Some(now);
+        state.check(&edit, len.saturating_add(CONTENTS_OVERHEAD), p)?;
+        Ok((edit, node))
+    }
+
+    fn join_file_bytes(
+        &self,
+        state: &State<H>,
+        source: &Node,
+        prefix_len: usize,
+        suffix: &[u8],
+        p: &Path,
+    ) -> HostResult<Arc<[u8]>> {
+        if let Some(bytes) = state.bytes(source) {
+            return Ok(bytes.0.iter().chain(suffix).copied().collect());
+        }
+        // Read directly into the final allocation. Appending never grows a Vec
+        // or buffers a second copy of the base contents.
+        let len = prefix_len + suffix.len();
+        let mut bytes: Arc<[u8]> = std::iter::repeat_n(0, len).collect();
+        let dest = Arc::get_mut(&mut bytes).ok_or_else(poisoned)?;
+        let (prefix, tail) = dest.split_at_mut(prefix_len);
+        let mut offset = 0_usize;
+        self.base.read_chunks(source.backing(p)?, &mut |chunk| {
+            let end = offset.saturating_add(chunk.len());
+            if let Some(slot) = prefix.get_mut(offset..end) {
+                slot.copy_from_slice(chunk);
+            }
+            offset = end;
+        })?;
+        if offset != prefix_len {
+            return Err(HostError::from_io(
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "The base file size changed",
+                ),
+                Some(p.to_path_buf()),
+            ));
+        }
+        tail.copy_from_slice(suffix);
+        Ok(bytes)
     }
 }
 
 impl<H: Host + ?Sized> Host for OverlayHost<H> {
     fn metadata(&self, p: &Path, follow: Follow) -> HostResult<Metadata> {
         let state = self.read_state()?;
-        let (key, node) = state.existing(p, follow)?;
-        let mut stat = state.stat(&node);
+        let resolved = state.existing(p, follow)?;
+        let node = resolved.existing(p)?;
+        let mut stat = state.stat(node);
         if stat.kind == FileKind::Dir
             && stat.nlink >= 2
             && state
-                .descendants(&key)
-                .any(|(child, _)| child.parent() == Some(key.as_path()))
-            && let Ok(entries) = state.children(&key, &node)
+                .descendants(&resolved.key)
+                .any(|(key, _)| key.is_child_of(&resolved.key))
+            && let Ok(entries) = state.children(&resolved, node)
         {
             stat.nlink = 2 + entries
                 .iter()
@@ -651,25 +443,49 @@ impl<H: Host + ?Sized> Host for OverlayHost<H> {
 
     fn read(&self, p: &Path, range: ReadRange) -> HostResult<Vec<u8>> {
         let state = self.read_state()?;
-        let (_, node) = state.existing(p, Follow::Yes)?;
+        let resolved = state.existing(p, Follow::Yes)?;
+        let node = resolved.existing(p)?;
         if node.stat.kind == FileKind::Dir {
             return Err(SyntheticError::IsADirectory.at(Some(p)));
         }
-        let Some(bytes) = state.bytes(&node) else {
-            return self.base.read(node.backing(p)?, range);
+        let Some(bytes) = state.bytes(node) else {
+            let backing = node.backing(p)?;
+            drop(state);
+            return self.base.read(backing, range);
         };
+        let bytes = &bytes.0;
         match range {
             ReadRange::All { limit } if bytes.len() as u64 > limit => {
                 Err(SyntheticError::FileTooLarge.at(Some(p)))
             }
             ReadRange::All { .. } => Ok(bytes.to_vec()),
             ReadRange::Slice { offset, len } => {
-                let start = (offset.min(bytes.len() as u64)) as usize;
+                let start = offset.min(bytes.len() as u64) as usize;
                 let end = offset
                     .saturating_add(len.unwrap_or(u64::MAX))
                     .min(bytes.len() as u64);
                 Ok(bytes.get(start..end as usize).unwrap_or_default().to_vec())
             }
+        }
+    }
+
+    fn read_chunks(&self, p: &Path, consume: &mut dyn FnMut(&[u8])) -> HostResult<()> {
+        let state = self.read_state()?;
+        let resolved = state.existing(p, Follow::Yes)?;
+        let node = resolved.existing(p)?;
+        if node.stat.kind == FileKind::Dir {
+            return Err(SyntheticError::IsADirectory.at(Some(p)));
+        }
+        if let Some(bytes) = state.bytes(node).cloned() {
+            drop(state);
+            for chunk in bytes.0.chunks(FILE_CHUNK_SIZE) {
+                consume(chunk);
+            }
+            Ok(())
+        } else {
+            let backing = node.backing(p)?;
+            drop(state);
+            self.base.read_chunks(backing, consume)
         }
     }
 
@@ -681,82 +497,69 @@ impl<H: Host + ?Sized> Host for OverlayHost<H> {
             Follow::Yes
         };
         let dest = state.destination(p, follow)?;
-        let mut bytes = Vec::new();
-        if let Some(node) = &dest.node {
-            if mode == WriteMode::CreateNew {
-                return Err(SyntheticError::AlreadyExists.at(Some(p)));
-            }
-            node.require_file(p)?;
-            if mode == WriteMode::Append {
-                bytes = self.contents(&state, node, p)?;
-            }
+        if mode == WriteMode::CreateNew && dest.entry.node.is_some() {
+            return Err(SyntheticError::AlreadyExists.at(Some(p)));
         }
-        if bytes.len().saturating_add(data.len()) > MAX_FILE_BYTES {
-            return Err(SyntheticError::FileTooLarge.at(Some(p)));
-        }
-        bytes.extend_from_slice(data);
-        self.store_file(&mut state, dest, bytes);
+        let append = dest
+            .entry
+            .node
+            .clone()
+            .filter(|_| mode == WriteMode::Append);
+        let prefix_len = append.as_ref().map_or(0, |node| state.stat(node).len);
+        let prefix_len = usize::try_from(prefix_len).map_err(|_| budget_error(p))?;
+        let len = prefix_len.saturating_add(data.len());
+        let (mut edit, node) = Self::file_edit(&mut state, dest, len, p)?;
+        let bytes = if let Some(source) = &append {
+            self.join_file_bytes(&state, source, prefix_len, data, p)?
+        } else {
+            Arc::from(data)
+        };
+        edit.change(&state, &node).bytes = Some(Arc::new(Contents(bytes)));
+        state.commit(edit);
         Ok(())
     }
 
     fn read_dir(&self, p: &Path) -> HostResult<Vec<DirEntry>> {
         let state = self.read_state()?;
-        let (dir, node) = state.existing(p, Follow::Yes)?;
+        let dir = state.existing(p, Follow::Yes)?;
+        let node = dir.existing(p)?;
         if node.stat.kind != FileKind::Dir {
             return Err(SyntheticError::NotADirectory.at(Some(p)));
         }
-        state.children(&dir, &node)
+        state.children(&dir, node)
     }
 
     fn create_dir_all(&self, p: &Path) -> HostResult<()> {
         let mut state = self.write_state()?;
-        let mut new_dirs = BTreeSet::new();
-        state.resolve(p, Follow::Yes, false, Some(&mut new_dirs))?;
-        for dir in new_dirs {
-            let node = state.new_node(FileKind::Dir, self.base.now(), None);
-            state.paths.insert(dir, Some(node));
+        let mut dirs = BTreeMap::new();
+        state.resolve(p, Follow::Yes, false, Some(&mut dirs), false)?;
+        if dirs.is_empty() {
+            return Ok(());
         }
+        let now = state.tick();
+        let mut edit = Edit::default();
+        for (key, (mut entry, parent)) in dirs {
+            if let Some(parent) = parent {
+                edit.change(&state, &parent).mtime = Some(now);
+            }
+            entry.node = Some(state.new_node(FileKind::Dir, now));
+            edit.paths.insert(key, Some(entry));
+        }
+        state.check(&edit, 0, p)?;
+        state.commit(edit);
         Ok(())
     }
 
     fn remove_file(&self, p: &Path) -> HostResult<()> {
-        let mut state = self.write_state()?;
-        let (key, node) = state.existing(p, Follow::No)?;
-        if node.stat.kind == FileKind::Dir {
-            return Err(SyntheticError::IsADirectory.at(Some(p)));
-        }
-        state.unlink(&node);
-        state.paths.insert(key, None);
-        Ok(())
+        self.remove_entry(p, None)
     }
 
     fn remove_dir(&self, p: &Path) -> HostResult<()> {
-        let trimmed = path::directory_removal_path(p, absolute, cfg!(windows))?;
-        let mut state = self.write_state()?;
-        let (key, node) = state.existing(&trimmed, Follow::No)?;
-        if node.stat.kind != FileKind::Dir {
-            return Err(SyntheticError::NotADirectory.at(Some(p)));
-        }
-        if !state.children(&key, &node)?.is_empty() {
-            return Err(SyntheticError::DirectoryNotEmpty.at(Some(p)));
-        }
-        state.unlink(&node);
-        state.clear_tree(&key);
-        Ok(())
+        self.remove_entry(p, Some(false))
     }
 
     fn remove_dir_all(&self, p: &Path) -> HostResult<()> {
-        let trimmed = path::directory_removal_path(p, absolute, cfg!(windows))?;
-        let mut state = self.write_state()?;
-        let (key, node) = state.existing(&trimmed, Follow::No)?;
-        if !matches!(node.stat.kind, FileKind::Dir | FileKind::Symlink) {
-            return Err(SyntheticError::NotADirectory.at(Some(p)));
-        }
-        for node in state.removed_nodes(key.clone(), node)? {
-            state.unlink(&node);
-        }
-        state.clear_tree(&key);
-        Ok(())
+        self.remove_entry(p, Some(true))
     }
 
     fn rename(&self, from: &Path, to: &Path) -> HostResult<()> {
@@ -775,16 +578,17 @@ impl<H: Host + ?Sized> Host for OverlayHost<H> {
         let (key, path) = {
             let mut state = self.write_state()?;
             let dest = state.destination(path, Follow::Yes)?;
-            let key = if let Some(node) = &dest.node {
+            let display = dest.entry.path.clone();
+            let key = if let Some(node) = &dest.entry.node {
                 node.require_file(path)?;
                 node.inode()
             } else {
-                let node = state.new_node(FileKind::File, self.base.now(), None);
-                let key = node.inode();
-                state.store(dest.path.clone(), node).bytes = Some(Vec::new());
-                key
+                let (mut edit, node) = Self::file_edit(&mut state, dest, 0, path)?;
+                edit.change(&state, &node).bytes = Some(Arc::new(Contents(Arc::<[u8]>::default())));
+                state.commit(edit);
+                node.inode()
             };
-            (key, dest.path)
+            (key, display)
         };
         let mut held = self.locks.held.lock().map_err(|_| poisoned())?;
         if held.contains(&key) {
@@ -813,6 +617,9 @@ impl<H: Host + ?Sized> Host for OverlayHost<H> {
                 }
             }
         }
+        if held.len() >= MAX_HELD_LOCKS {
+            return Err(budget_error(&path));
+        }
         held.insert(key.clone());
         Ok(Box::new(OverlayLock {
             table: Arc::clone(&self.locks),
@@ -822,71 +629,87 @@ impl<H: Host + ?Sized> Host for OverlayHost<H> {
     }
 
     fn copy_file(&self, from: &Path, to: &Path, opts: CopyOptions) -> HostResult<()> {
-        absolute(from)?;
-        absolute(to)?;
         let mut state = self.write_state()?;
-        let (_, source) = state.existing(from, Follow::Yes)?;
+        let source = state.existing(from, Follow::Yes)?;
+        let source = source.existing(from)?;
         if source.stat.kind != FileKind::File {
             return Err(SyntheticError::InvalidInput.at(Some(from)));
         }
         let dest = state.destination(to, Follow::Yes)?;
-        if let Some(node) = &dest.node {
-            node.require_file(to)?;
-            if node.inode() == source.inode() {
-                return Err(SyntheticError::InvalidInput.at(Some(to)));
-            }
+        if dest
+            .entry
+            .node
+            .as_ref()
+            .is_some_and(|node| node.inode() == source.inode())
+        {
+            return Err(SyntheticError::InvalidInput.at(Some(to)));
         }
-        let stat = state.stat(&source);
-        let bytes = self.contents(&state, &source, from)?;
-        let change = self.store_file(&mut state, dest, bytes);
+        let stat = state.stat(source);
+        let len = usize::try_from(stat.len).map_err(|_| budget_error(to))?;
+        let (mut edit, node) = Self::file_edit(&mut state, dest, len, to)?;
+        let bytes = self.join_file_bytes(&state, source, len, &[], from)?;
+        let change = edit.change(&state, &node);
+        change.bytes = Some(Arc::new(Contents(bytes)));
         if opts.preserve_permissions {
             change.mode = Some(stat.mode);
         }
         if opts.preserve_mtime {
             change.mtime = Some(stat.mtime);
         }
+        state.commit(edit);
         Ok(())
     }
 
     fn symlink(&self, target: &Path, link: &Path) -> HostResult<()> {
         let mut state = self.write_state()?;
         let dest = state.destination(link, Follow::No)?;
-        if dest.node.is_some() {
+        if dest.entry.node.is_some() {
             return Err(SyntheticError::AlreadyExists.at(Some(link)));
         }
         if target.as_os_str().is_empty() {
             return Err(SyntheticError::NotFound.at(Some(link)));
         }
-        if path::from_native(target).as_slice().contains(&0) {
-            return Err(SyntheticError::InvalidInput.at(Some(link)));
+        validate_length(target)?;
+        let now = state.tick();
+        let mut edit = Edit::default();
+        edit.touch_parent(&state, &dest, now);
+        let mut node = state.new_node(FileKind::Symlink, now);
+        let key = dest.key.clone();
+        edit.store(dest, node.clone());
+        state.check(&edit, target.as_os_str().as_encoded_bytes().len(), link)?;
+        node.set_target(target);
+        if let Some(Some(entry)) = edit.paths.get_mut(&key) {
+            entry.node = Some(node);
         }
-        let node = state.new_node(
-            FileKind::Symlink,
-            self.base.now(),
-            Some(target.to_path_buf()),
-        );
-        state.paths.insert(dest.path, Some(node));
+        state.commit(edit);
         Ok(())
     }
 
     fn hard_link(&self, src: &Path, dst: &Path) -> HostResult<()> {
-        absolute(src)?;
-        absolute(dst)?;
         let mut state = self.write_state()?;
-        let (_, source) = state.existing(src, Follow::No)?;
+        let source = state.existing(src, Follow::No)?;
         let dest = state.destination(dst, Follow::No)?;
-        if dest.node.is_some() {
+        if dest.entry.node.is_some() {
             return Err(SyntheticError::AlreadyExists.at(Some(dst)));
         }
-        if source.stat.kind == FileKind::Dir {
+        let node = source.existing(src)?.clone();
+        if node.stat.kind == FileKind::Dir {
             return Err(SyntheticError::PermissionDenied.at(Some(src)));
         }
-        state.store(dest.path, source).links += 1;
+        let now = state.tick();
+        let mut edit = Edit::default();
+        edit.touch_parent(&state, &dest, now);
+        edit.link(&state, &node);
+        edit.store(source, node.clone());
+        edit.store(dest, node);
+        state.check(&edit, 0, dst)?;
+        state.commit(edit);
         Ok(())
     }
 
     fn read_link(&self, p: &Path) -> HostResult<PathBuf> {
-        let (_, node) = self.read_state()?.existing(p, Follow::No)?;
+        let resolved = self.read_state()?.existing(p, Follow::No)?;
+        let node = resolved.existing(p)?;
         if node.stat.kind != FileKind::Symlink {
             return Err(SyntheticError::InvalidInput.at(Some(p)));
         }
@@ -894,13 +717,18 @@ impl<H: Host + ?Sized> Host for OverlayHost<H> {
     }
 
     fn canonicalize(&self, p: &Path) -> HostResult<PathBuf> {
-        self.read_state()?.existing(p, Follow::Yes).map(|(p, _)| p)
+        Ok(self.read_state()?.existing(p, Follow::Yes)?.entry.path)
     }
 
     fn set_permissions(&self, p: &Path, mode: u32) -> HostResult<()> {
         let mut state = self.write_state()?;
-        let (key, node) = state.existing(p, Follow::Yes)?;
-        state.store(key, node).mode = Some(mode & 0o7777);
+        let resolved = state.existing(p, Follow::Yes)?;
+        let node = resolved.existing(p)?.clone();
+        let mut edit = Edit::default();
+        edit.change(&state, &node).mode = Some(mode & 0o7777);
+        edit.store(resolved, node);
+        state.check(&edit, 0, p)?;
+        state.commit(edit);
         Ok(())
     }
 
@@ -910,7 +738,6 @@ impl<H: Host + ?Sized> Host for OverlayHost<H> {
         atime: Option<FileTime>,
         mtime: Option<FileTime>,
     ) -> HostResult<()> {
-        absolute(p)?;
         if atime
             .into_iter()
             .chain(mtime)
@@ -919,11 +746,16 @@ impl<H: Host + ?Sized> Host for OverlayHost<H> {
             return Err(SyntheticError::InvalidInput.at(Some(p)));
         }
         let mut state = self.write_state()?;
-        let (key, node) = state.existing(p, Follow::Yes)?;
+        let resolved = state.existing(p, Follow::Yes)?;
         if atime.is_some() || mtime.is_some() {
-            let change = state.store(key, node);
+            let node = resolved.existing(p)?.clone();
+            let mut edit = Edit::default();
+            let change = edit.change(&state, &node);
             change.atime = atime.or(change.atime);
             change.mtime = mtime.or(change.mtime);
+            edit.store(resolved, node);
+            state.check(&edit, 0, p)?;
+            state.commit(edit);
         }
         Ok(())
     }
@@ -938,8 +770,10 @@ impl<H: Host + ?Sized> Host for OverlayHost<H> {
     }
 
     fn env_set(&self, key: &[u8], value: Option<&[u8]>) {
-        if let Ok(mut state) = self.state.write() {
-            state.env.insert(env_key(key), value.map(BString::from));
+        if key.len().saturating_add(value.map_or(0, <[u8]>::len)) <= MAX_OVERLAY_BYTES
+            && let Ok(mut state) = self.state.write()
+        {
+            state.set_env(env_key(key), value);
         }
     }
 
@@ -965,9 +799,7 @@ impl<H: Host + ?Sized> Host for OverlayHost<H> {
         _req: &RunRequest,
         _on_output: &mut dyn FnMut(Stream, &[u8]),
     ) -> HostResult<RunOutput> {
-        Err(HostError::unsupported(
-            "process execution is disabled in this host mode",
-        ))
+        Err(HostError::unsupported(crate::no_process::DENIED_MESSAGE))
     }
 
     crate::no_process::forward_host_services!(base);
@@ -981,14 +813,6 @@ fn env_key(key: &[u8]) -> BString {
     key
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::PureHost;
-
-    #[test]
-    fn conforms_to_shared_host_checks() {
-        let host = OverlayHost::new(PureHost::default());
-        crate::conformance::run_all(&host, Path::new("/work/conformance"));
-    }
+fn poisoned() -> HostError {
+    HostError::unsupported("Cannot access the overlay host state")
 }

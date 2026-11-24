@@ -3,18 +3,18 @@
 #![forbid(unsafe_code)]
 
 use core::time::Duration;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::io::ErrorKind;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use rcmake_base::BString;
 
 use crate::{
-    CopyOptions, DirEntry, FileKind, FileLockGuard, FileTime, Follow, GracefulTimeout, Host,
-    HostResult, Metadata, ReadRange, RunOutput, RunRequest, Stream, WriteMode,
+    CopyOptions, DirEntry, FileLockGuard, FileTime, Follow, GracefulTimeout, Host, HostResult,
+    Metadata, ReadRange, RunOutput, RunRequest, Stream, WriteMode,
 };
 
 /// Counts of cache operations since the adapter was created.
@@ -28,99 +28,47 @@ pub struct MemoStats {
     pub invalidations: u64,
 }
 
-struct Cached<T> {
-    result: HostResult<T>,
-    direct: bool,
-}
+const MAX_CACHE_ENTRIES: usize = 8_192;
+const MAX_CACHE_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Default)]
 struct Queries {
-    follow: Option<Cached<Metadata>>,
-    no_follow: Option<Cached<Metadata>>,
-    entries: Option<Cached<Vec<DirEntry>>>,
-    canonical: Option<Cached<PathBuf>>,
-}
-
-impl Queries {
-    fn keep_direct(&mut self) -> bool {
-        fn retain<T>(entry: &mut Option<Cached<T>>) {
-            if entry.as_ref().is_some_and(|entry| !entry.direct) {
-                *entry = None;
-            }
-        }
-
-        retain(&mut self.follow);
-        retain(&mut self.no_follow);
-        retain(&mut self.entries);
-        retain(&mut self.canonical);
-        self.follow.is_some()
-            || self.no_follow.is_some()
-            || self.entries.is_some()
-            || self.canonical.is_some()
-    }
+    follow: Option<HostResult<Metadata>>,
+    no_follow: Option<HostResult<Metadata>>,
+    entries: Option<HostResult<Vec<DirEntry>>>,
+    canonical: Option<HostResult<PathBuf>>,
 }
 
 #[derive(Default)]
 struct Cache {
-    // Keep the exact spelling. A trailing separator can change a query's result.
+    // Keep exact spelling. A trailing separator can change the result.
     paths: BTreeMap<OsString, Queries>,
+    entries: usize,
+    bytes: usize,
     generation: u64,
-    unscoped_changes: usize,
+    active_changes: usize,
 }
 
-#[derive(Default)]
-struct Affected {
-    trees: BTreeSet<PathBuf>,
-    parents: BTreeSet<PathBuf>,
+fn path_bytes(path: &Path) -> usize {
+    path.as_os_str().as_encoded_bytes().len()
 }
 
-impl Affected {
-    fn add_tree(&mut self, p: &Path) {
-        if let Some(parent) = p.parent() {
-            self.parents.insert(parent.to_path_buf());
-        }
-        self.trees.insert(p.to_path_buf());
-    }
-
-    fn contains(&self, p: &Path) -> bool {
-        self.parents.contains(p) || self.trees.iter().any(|root| p.starts_with(root))
-    }
-
-    fn add_path(&mut self, base: &(impl Host + ?Sized), p: &Path) -> Option<()> {
-        if !p.has_root() || p.components().any(|part| part == Component::ParentDir) {
-            return None;
-        }
-        self.add_tree(p);
-        match base.canonicalize(p) {
-            Ok(canonical) => self.add_tree(&canonical),
-            Err(err) if err.kind == ErrorKind::NotFound => {}
-            Err(_) => return None,
-        }
-        // Use the first missing component so create_dir_all also invalidates
-        // the listing of the closest existing parent.
-        let mut child = p;
-        for parent in p.ancestors().skip(1) {
-            match base.canonicalize(parent) {
-                Ok(directory) => {
-                    self.add_tree(&directory.join(child.file_name()?));
-                    return Some(());
-                }
-                Err(err) if err.kind == ErrorKind::NotFound => child = parent,
-                Err(_) => return None,
-            }
-        }
-        Some(())
-    }
+fn listing_bytes(entries: &[DirEntry]) -> usize {
+    entries.iter().fold(0_usize, |bytes, entry| {
+        bytes
+            .saturating_add(size_of::<DirEntry>())
+            .saturating_add(entry.name.len())
+    })
 }
 
-/// Memoizes metadata, directory listings, and canonical paths for one configure.
+/// Caches metadata, directory listings, and canonical paths for one configure.
 ///
-/// The cache includes failed queries. Mutations through this adapter invalidate the
-/// affected entries. A command or file lock can change paths outside that scope.
-/// The adapter bypasses the cache while those calls are active.
+/// The cache stores successes and not-found results within fixed entry and byte
+/// limits. Filesystem changes, file locks, and process calls clear all queries.
+/// Queries bypass the cache while these calls are active.
 ///
-/// Use a new adapter when the base may have changed outside this adapter.
-/// File access timestamps reflect the time when the adapter cached the metadata.
+/// Use a new adapter when the base can change through another handle.
+/// Cached metadata reflects the access time at the time of the base query.
 pub struct MemoHost<H: Host + ?Sized> {
     base: Arc<H>,
     cache: RwLock<Cache>,
@@ -175,104 +123,73 @@ impl<H: Host + ?Sized> MemoHost<H> {
     fn lookup<T: Clone>(
         &self,
         p: &Path,
-        report: bool,
-        get: impl FnOnce(&Queries) -> Option<&Cached<T>>,
-        store: impl FnOnce(&mut Queries, Cached<T>),
-        query: impl FnOnce() -> Cached<T>,
+        get: impl Fn(&Queries) -> &Option<HostResult<T>>,
+        slot: impl FnOnce(&mut Queries) -> &mut Option<HostResult<T>>,
+        retained_bytes: impl FnOnce(&T) -> usize,
+        query: impl FnOnce() -> HostResult<T>,
     ) -> HostResult<T> {
         let generation = {
             let cache = self.read_cache();
-            if let Some(entry) = cache.paths.get(p.as_os_str()).and_then(get) {
-                if report {
-                    self.hits.fetch_add(1, Ordering::Relaxed);
-                }
-                return entry.result.clone();
+            if let Some(entry) = cache.paths.get(p.as_os_str()).and_then(|q| get(q).as_ref()) {
+                self.hits.fetch_add(1, Ordering::Relaxed);
+                return entry.clone();
             }
-            cache.generation
+            (cache.active_changes == 0 && cache.entries < MAX_CACHE_ENTRIES)
+                .then_some(cache.generation)
         };
-        if report {
-            self.misses.fetch_add(1, Ordering::Relaxed);
-        }
-        let entry = query();
+        self.misses.fetch_add(1, Ordering::Relaxed);
+        let result = query();
+        let Some(generation) = generation else {
+            return result;
+        };
+        let value_bytes = match &result {
+            Ok(value) => retained_bytes(value),
+            Err(err) if err.kind == ErrorKind::NotFound => err
+                .os_message
+                .len()
+                .saturating_add(err.path.as_deref().map_or(0, path_bytes)),
+            Err(_) => return result,
+        };
+        // Charge each query for its full path and a map slot.
+        let bytes = value_bytes
+            .saturating_add(path_bytes(p))
+            .saturating_add(size_of::<(OsString, Queries)>());
         let mut cache = self.write_cache();
-        // A concurrent mutation can finish while the base query is in progress.
-        if cache.generation != generation || cache.unscoped_changes != 0 {
-            return entry.result;
-        }
-        let result = entry.result.clone();
-        store(
-            cache.paths.entry(p.as_os_str().to_owned()).or_default(),
-            entry,
-        );
-        result
-    }
-
-    fn canonical(&self, p: &Path, report: bool) -> HostResult<PathBuf> {
-        self.lookup(
-            p,
-            report,
-            |queries| queries.canonical.as_ref(),
-            |queries, entry| queries.canonical = Some(entry),
-            || {
-                let result = self.base.canonicalize(p);
-                let direct = result
-                    .as_ref()
-                    .is_ok_and(|path| path.as_os_str() == p.as_os_str());
-                Cached { direct, result }
-            },
-        )
-    }
-
-    fn direct(&self, p: &Path) -> bool {
-        self.canonical(p, false)
-            .is_ok_and(|canonical| canonical.as_os_str() == p.as_os_str())
-    }
-
-    fn change<T>(
-        &self,
-        paths: &[&Path],
-        operation: impl FnOnce() -> HostResult<T>,
-    ) -> HostResult<T> {
-        let mut cache = self.write_cache();
-        // On a panic the next reader must discard the cache as well.
-        cache.generation = cache.generation.wrapping_add(1);
-        self.invalidations.fetch_add(1, Ordering::Relaxed);
-        let mut affected = Affected::default();
-        let mut entries = std::mem::take(&mut cache.paths);
-        let scoped = !entries.is_empty()
-            && paths
-                .iter()
-                .all(|p| affected.add_path(self.base.as_ref(), p).is_some());
-        let result = operation();
-        if scoped
-            && paths
-                .iter()
-                .all(|p| affected.add_path(self.base.as_ref(), p).is_some())
+        if cache.generation == generation
+            && cache.active_changes == 0
+            && cache.entries < MAX_CACHE_ENTRIES
+            && bytes <= MAX_CACHE_BYTES - cache.bytes
         {
-            // An alias or a failed lookup can depend on a symlink outside this scope.
-            entries.retain(|p, queries| !affected.contains(Path::new(p)) && queries.keep_direct());
-            cache.paths = entries;
+            let queries = cache.paths.entry(p.as_os_str().to_owned()).or_default();
+            let slot = slot(queries);
+            if slot.is_none() {
+                *slot = Some(result.clone());
+                cache.entries += 1;
+                cache.bytes += bytes;
+            }
         }
         result
     }
 
-    fn begin_unscoped_change(&self) -> UnscopedChange<'_, H> {
+    fn begin_change(&self) -> ActiveChange<'_, H> {
         let mut cache = self.write_cache();
         cache.generation = cache.generation.wrapping_add(1);
-        cache.unscoped_changes += 1;
+        cache.active_changes += 1;
         cache.paths.clear();
-        UnscopedChange { host: self }
+        cache.entries = 0;
+        cache.bytes = 0;
+        ActiveChange { host: self }
     }
 }
 
-struct UnscopedChange<'a, H: Host + ?Sized> {
+struct ActiveChange<'a, H: Host + ?Sized> {
     host: &'a MemoHost<H>,
 }
 
-impl<H: Host + ?Sized> Drop for UnscopedChange<'_, H> {
+impl<H: Host + ?Sized> Drop for ActiveChange<'_, H> {
     fn drop(&mut self) {
         let mut cache = self.host.write_cache();
-        cache.unscoped_changes -= 1;
+        cache.active_changes -= 1;
         cache.generation = cache.generation.wrapping_add(1);
         self.host.invalidations.fetch_add(1, Ordering::Relaxed);
     }
@@ -282,24 +199,16 @@ impl<H: Host + ?Sized> Host for MemoHost<H> {
     fn metadata(&self, p: &Path, follow: Follow) -> HostResult<Metadata> {
         self.lookup(
             p,
-            true,
             |queries| match follow {
-                Follow::Yes => queries.follow.as_ref(),
-                Follow::No => queries.no_follow.as_ref(),
+                Follow::Yes => &queries.follow,
+                Follow::No => &queries.no_follow,
             },
-            |queries, entry| match follow {
-                Follow::Yes => queries.follow = Some(entry),
-                Follow::No => queries.no_follow = Some(entry),
+            |queries| match follow {
+                Follow::Yes => &mut queries.follow,
+                Follow::No => &mut queries.no_follow,
             },
-            || {
-                let result = self.base.metadata(p, follow);
-                let direct = result.as_ref().is_ok_and(|stat| {
-                    (stat.kind == FileKind::Dir || stat.nlink == 1)
-                        && stat.kind != FileKind::Symlink
-                        && self.direct(p)
-                });
-                Cached { direct, result }
-            },
+            |_| 0,
+            || self.base.metadata(p, follow),
         )
     }
 
@@ -312,45 +221,48 @@ impl<H: Host + ?Sized> Host for MemoHost<H> {
     }
 
     fn write(&self, p: &Path, data: &[u8], mode: WriteMode) -> HostResult<()> {
-        self.change(&[p], || self.base.write(p, data, mode))
+        let _change = self.begin_change();
+        self.base.write(p, data, mode)
     }
 
     fn read_dir(&self, p: &Path) -> HostResult<Vec<DirEntry>> {
         self.lookup(
             p,
-            true,
-            |queries| queries.entries.as_ref(),
-            |queries, entry| queries.entries = Some(entry),
-            || {
-                let result = self.base.read_dir(p);
-                let direct = result.is_ok() && self.direct(p);
-                Cached { direct, result }
-            },
+            |queries| &queries.entries,
+            |queries| &mut queries.entries,
+            |entries| listing_bytes(entries),
+            || self.base.read_dir(p),
         )
     }
 
     fn create_dir_all(&self, p: &Path) -> HostResult<()> {
-        self.change(&[p], || self.base.create_dir_all(p))
+        let _change = self.begin_change();
+        self.base.create_dir_all(p)
     }
 
     fn remove_file(&self, p: &Path) -> HostResult<()> {
-        self.change(&[p], || self.base.remove_file(p))
+        let _change = self.begin_change();
+        self.base.remove_file(p)
     }
 
     fn remove_dir(&self, p: &Path) -> HostResult<()> {
-        self.change(&[p], || self.base.remove_dir(p))
+        let _change = self.begin_change();
+        self.base.remove_dir(p)
     }
 
     fn remove_dir_all(&self, p: &Path) -> HostResult<()> {
-        self.change(&[p], || self.base.remove_dir_all(p))
+        let _change = self.begin_change();
+        self.base.remove_dir_all(p)
     }
 
     fn rename(&self, from: &Path, to: &Path) -> HostResult<()> {
-        self.change(&[from, to], || self.base.rename(from, to))
+        let _change = self.begin_change();
+        self.base.rename(from, to)
     }
 
     fn rename_noreplace(&self, from: &Path, to: &Path) -> HostResult<()> {
-        self.change(&[from, to], || self.base.rename_noreplace(from, to))
+        let _change = self.begin_change();
+        self.base.rename_noreplace(from, to)
     }
 
     fn lock_file(
@@ -358,20 +270,23 @@ impl<H: Host + ?Sized> Host for MemoHost<H> {
         path: &Path,
         timeout: Option<Duration>,
     ) -> HostResult<Box<dyn FileLockGuard>> {
-        let _change = self.begin_unscoped_change();
+        let _change = self.begin_change();
         self.base.lock_file(path, timeout)
     }
 
     fn copy_file(&self, from: &Path, to: &Path, opts: CopyOptions) -> HostResult<()> {
-        self.change(&[from, to], || self.base.copy_file(from, to, opts))
+        let _change = self.begin_change();
+        self.base.copy_file(from, to, opts)
     }
 
     fn symlink(&self, target: &Path, link: &Path) -> HostResult<()> {
-        self.change(&[link], || self.base.symlink(target, link))
+        let _change = self.begin_change();
+        self.base.symlink(target, link)
     }
 
     fn hard_link(&self, src: &Path, dst: &Path) -> HostResult<()> {
-        self.change(&[src, dst], || self.base.hard_link(src, dst))
+        let _change = self.begin_change();
+        self.base.hard_link(src, dst)
     }
 
     fn read_link(&self, p: &Path) -> HostResult<PathBuf> {
@@ -379,11 +294,18 @@ impl<H: Host + ?Sized> Host for MemoHost<H> {
     }
 
     fn canonicalize(&self, p: &Path) -> HostResult<PathBuf> {
-        self.canonical(p, true)
+        self.lookup(
+            p,
+            |queries| &queries.canonical,
+            |queries| &mut queries.canonical,
+            |path| path_bytes(path),
+            || self.base.canonicalize(p),
+        )
     }
 
     fn set_permissions(&self, p: &Path, mode: u32) -> HostResult<()> {
-        self.change(&[p], || self.base.set_permissions(p, mode))
+        let _change = self.begin_change();
+        self.base.set_permissions(p, mode)
     }
 
     fn set_times(
@@ -392,7 +314,8 @@ impl<H: Host + ?Sized> Host for MemoHost<H> {
         atime: Option<FileTime>,
         mtime: Option<FileTime>,
     ) -> HostResult<()> {
-        self.change(&[p], || self.base.set_times(p, atime, mtime))
+        let _change = self.begin_change();
+        self.base.set_times(p, atime, mtime)
     }
 
     fn env_get(&self, key: &[u8]) -> Option<BString> {
@@ -412,7 +335,7 @@ impl<H: Host + ?Sized> Host for MemoHost<H> {
         req: &RunRequest,
         on_output: &mut dyn FnMut(Stream, &[u8]),
     ) -> HostResult<RunOutput> {
-        let _change = self.begin_unscoped_change();
+        let _change = self.begin_change();
         self.base.run(req, on_output)
     }
 
@@ -422,12 +345,12 @@ impl<H: Host + ?Sized> Host for MemoHost<H> {
         timeout: GracefulTimeout,
         on_output: &mut dyn FnMut(Stream, &[u8]),
     ) -> HostResult<RunOutput> {
-        let _change = self.begin_unscoped_change();
+        let _change = self.begin_change();
         self.base.run_with_timeout_signal(req, timeout, on_output)
     }
 
     fn run_bounded(&self, req: &RunRequest, limit: usize) -> HostResult<RunOutput> {
-        let _change = self.begin_unscoped_change();
+        let _change = self.begin_change();
         self.base.run_bounded(req, limit)
     }
 
@@ -437,7 +360,231 @@ impl<H: Host + ?Sized> Host for MemoHost<H> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{CommandSpec, Input, Output, PureHost, TimeoutSignal};
+    use crate::{CommandSpec, FileKind, Input, Output, PureHost, TimeoutSignal};
+
+    use crate::HostError;
+    use std::sync::Mutex;
+
+    type Observer = Arc<dyn Fn() -> HostResult<()> + Send + Sync>;
+
+    #[derive(Default)]
+    struct ProbeHost {
+        base: PureHost,
+        metadata_error: Mutex<Option<ErrorKind>>,
+        observer: Mutex<Option<Observer>>,
+    }
+
+    fn fixture_error() -> HostError {
+        HostError::unsupported("Cannot access the test host")
+    }
+
+    fn map_mount(path: &Path) -> PathBuf {
+        path.strip_prefix("/mount")
+            .map_or_else(|_| path.to_path_buf(), |rest| Path::new("/work").join(rest))
+    }
+
+    impl Host for ProbeHost {
+        fn run(
+            &self,
+            req: &RunRequest,
+            on_output: &mut dyn FnMut(Stream, &[u8]),
+        ) -> HostResult<RunOutput> {
+            self.base.run(req, on_output)
+        }
+
+        fn metadata(&self, p: &Path, follow: Follow) -> HostResult<Metadata> {
+            if let Some(kind) = self
+                .metadata_error
+                .lock()
+                .map_err(|_| fixture_error())?
+                .take()
+            {
+                return Err(HostError::from_io(kind.into(), Some(p.to_path_buf())));
+            }
+            self.base.metadata(&map_mount(p), follow)
+        }
+
+        fn read(&self, p: &Path, range: ReadRange) -> HostResult<Vec<u8>> {
+            self.base.read(p, range)
+        }
+
+        fn read_chunks(&self, p: &Path, consume: &mut dyn FnMut(&[u8])) -> HostResult<()> {
+            self.base.read_chunks(p, consume)
+        }
+
+        fn write(&self, p: &Path, data: &[u8], mode: WriteMode) -> HostResult<()> {
+            self.base.write(&map_mount(p), data, mode)?;
+            let observer = self.observer.lock().map_err(|_| fixture_error())?.clone();
+            if let Some(observer) = observer {
+                observer()?;
+            }
+            Ok(())
+        }
+
+        fn read_dir(&self, p: &Path) -> HostResult<Vec<DirEntry>> {
+            if p == Path::new("/large") {
+                return Ok(vec![DirEntry {
+                    name: vec![b'x'; MAX_CACHE_BYTES].into(),
+                    kind: FileKind::File,
+                }]);
+            }
+            self.base.read_dir(&map_mount(p))
+        }
+
+        fn create_dir_all(&self, p: &Path) -> HostResult<()> {
+            self.base.create_dir_all(p)
+        }
+
+        fn remove_file(&self, p: &Path) -> HostResult<()> {
+            self.base.remove_file(p)
+        }
+
+        fn remove_dir(&self, p: &Path) -> HostResult<()> {
+            self.base.remove_dir(p)
+        }
+
+        fn remove_dir_all(&self, p: &Path) -> HostResult<()> {
+            self.base.remove_dir_all(p)
+        }
+
+        fn rename(&self, from: &Path, to: &Path) -> HostResult<()> {
+            self.base.rename(from, to)
+        }
+
+        fn rename_noreplace(&self, from: &Path, to: &Path) -> HostResult<()> {
+            self.base.rename_noreplace(from, to)
+        }
+
+        fn lock_file(
+            &self,
+            path: &Path,
+            timeout: Option<Duration>,
+        ) -> HostResult<Box<dyn FileLockGuard>> {
+            self.base.lock_file(path, timeout)
+        }
+
+        fn copy_file(&self, from: &Path, to: &Path, opts: CopyOptions) -> HostResult<()> {
+            self.base.copy_file(from, to, opts)
+        }
+
+        fn symlink(&self, target: &Path, link: &Path) -> HostResult<()> {
+            self.base.symlink(target, link)
+        }
+
+        fn hard_link(&self, src: &Path, dst: &Path) -> HostResult<()> {
+            self.base.hard_link(src, dst)
+        }
+
+        fn read_link(&self, p: &Path) -> HostResult<PathBuf> {
+            self.base.read_link(p)
+        }
+
+        fn canonicalize(&self, p: &Path) -> HostResult<PathBuf> {
+            self.base.canonicalize(&map_mount(p))?;
+            Ok(p.to_path_buf())
+        }
+
+        fn set_permissions(&self, p: &Path, mode: u32) -> HostResult<()> {
+            self.base.set_permissions(p, mode)
+        }
+
+        fn set_times(
+            &self,
+            p: &Path,
+            atime: Option<FileTime>,
+            mtime: Option<FileTime>,
+        ) -> HostResult<()> {
+            self.base.set_times(p, atime, mtime)
+        }
+
+        fn env_get(&self, key: &[u8]) -> Option<BString> {
+            self.base.env_get(key)
+        }
+
+        fn env_set(&self, key: &[u8], value: Option<&[u8]>) {
+            self.base.env_set(key, value);
+        }
+
+        fn env_all(&self) -> Vec<(BString, BString)> {
+            self.base.env_all()
+        }
+
+        crate::no_process::forward_host_services!(base);
+    }
+
+    #[test]
+    fn invalidates_metadata_and_listings_across_mount_aliases() -> HostResult<()> {
+        let base = ProbeHost::default();
+        base.base.seed_file(Path::new("/work/file"), b"a")?;
+        let host = MemoHost::new(base);
+        let alias = Path::new("/mount/file");
+        let root = Path::new("/mount");
+        assert_eq!(host.canonicalize(alias)?, alias);
+        let stat = host.metadata(alias, Follow::No)?;
+        assert_eq!((stat.len, stat.nlink), (1, 1));
+        assert_eq!(host.read_dir(root)?.len(), 1);
+
+        host.write(Path::new("/work/file"), b"changed", WriteMode::Truncate)?;
+        assert_eq!(host.metadata(alias, Follow::No)?.len, 7);
+        host.write(Path::new("/work/other"), b"new", WriteMode::CreateNew)?;
+        assert_eq!(host.read_dir(root)?.len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn transient_errors_do_not_enter_the_cache() -> HostResult<()> {
+        let base = Arc::new(ProbeHost::default());
+        let p = Path::new("/work/file");
+        base.base.seed_file(p, b"data")?;
+        let host = MemoHost::from_shared(Arc::clone(&base));
+        for (kind, follow) in [
+            (ErrorKind::Interrupted, Follow::Yes),
+            (ErrorKind::PermissionDenied, Follow::No),
+        ] {
+            *base.metadata_error.lock().map_err(|_| fixture_error())? = Some(kind);
+            assert!(matches!(host.metadata(p, follow), Err(err) if err.kind == kind));
+            assert_eq!(host.metadata(p, follow)?.len, 4);
+        }
+        assert_eq!(host.stats().hits, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn limits_entries_and_bypasses_large_listings() -> HostResult<()> {
+        let host = MemoHost::new(ProbeHost::default());
+        for _ in 0..2 {
+            assert_eq!(host.read_dir(Path::new("/large"))?.len(), 1);
+        }
+        assert_eq!(host.read_cache().entries, 0);
+        assert_eq!(host.stats().misses, 2);
+        for id in 0..=MAX_CACHE_ENTRIES {
+            let p = Path::new("/work").join(id.to_string());
+            assert!(host.metadata(&p, Follow::No).is_err());
+        }
+        assert_eq!(host.read_cache().entries, MAX_CACHE_ENTRIES);
+        assert!(host.read_cache().bytes <= MAX_CACHE_BYTES);
+        Ok(())
+    }
+
+    #[test]
+    fn mutation_can_query_the_adapter_before_it_returns() -> HostResult<()> {
+        let base = Arc::new(ProbeHost::default());
+        let host = Arc::new(MemoHost::from_shared(Arc::clone(&base)));
+        let p = Path::new("/work/file");
+        assert!(host.metadata(p, Follow::No).is_err());
+        let weak = Arc::downgrade(&host);
+        *base.observer.lock().map_err(|_| fixture_error())? = Some(Arc::new(move || {
+            let host = weak.upgrade().ok_or_else(fixture_error)?;
+            assert!(host.cache.try_read().is_ok());
+            assert_eq!(host.metadata(p, Follow::No)?.len, 3);
+            assert_eq!(host.read_cache().entries, 0);
+            Ok(())
+        }));
+        host.write(p, b"new", WriteMode::CreateNew)?;
+        assert_eq!(host.metadata(p, Follow::No)?.len, 3);
+        assert_eq!(host.read_cache().entries, 1);
+        Ok(())
+    }
 
     #[test]
     fn caches_successes_failures_and_follow_modes() -> HostResult<()> {
@@ -460,8 +607,8 @@ mod tests {
         assert_eq!(
             host.stats(),
             MemoStats {
-                hits: 6,
-                misses: 4,
+                hits: 5,
+                misses: 5,
                 invalidations: 0
             }
         );
@@ -485,7 +632,7 @@ mod tests {
         assert_eq!(host.read_dir(work)?.len(), 2);
         let before = host.stats();
         host.metadata(&sibling, Follow::Yes)?;
-        assert_eq!(host.stats().hits, before.hits + 1);
+        assert_eq!(host.stats().misses, before.misses + 1);
 
         let link = work.join("link");
         let hard = work.join("hard");
