@@ -488,7 +488,7 @@ fn link(cx: &mut Cx<'_>, input: &[u8], output: &[u8], symbolic: bool, fallback: 
     let linked = if symbolic {
         cx.host().symlink(&to_native(input), &target)
     } else if directory && policy_status == PolicyStatus::New {
-        Err(HostError::unsupported("not supported", None))
+        Err(HostError::unsupported("not supported"))
     } else {
         cx.host().hard_link(&source, &target)
     };

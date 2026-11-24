@@ -1,5 +1,3 @@
-#![allow(clippy::indexing_slicing)]
-
 use std::path::Path;
 use std::sync::Arc;
 
@@ -1232,7 +1230,9 @@ file(READ_MACHO fat ARCHITECTURES fat CAPTURE_ERROR capture)
             ],
         );
     }
-    host.seed_file(Path::new("/work/truncated"), &fat_macho(true, false)[..80])?;
+    let fat = fat_macho(true, false);
+    let truncated = fat.get(..80).ok_or("missing Mach-O fixture bytes")?;
+    host.seed_file(Path::new("/work/truncated"), truncated)?;
     script(
         &host,
         &mut interp,
@@ -1413,17 +1413,19 @@ file(INSTALL DESTINATION /prefix TYPE FILE FILES src/keep.txt MESSAGE_LAZY)
     Ok(())
 }
 
-fn elf_with_path(wide: bool, little: bool, tag: u64) -> Vec<u8> {
+fn elf_with_path(wide: bool, little: bool, tag: u64) -> Result<Vec<u8>, &'static str> {
     let mut data = vec![0; 384];
-    data[..7].copy_from_slice(&[
-        0x7f,
-        b'E',
-        b'L',
-        b'F',
-        if wide { 2 } else { 1 },
-        if little { 1 } else { 2 },
-        1,
-    ]);
+    data.get_mut(..7)
+        .ok_or("missing ELF header")?
+        .copy_from_slice(&[
+            0x7f,
+            b'E',
+            b'L',
+            b'F',
+            if wide { 2 } else { 1 },
+            if little { 1 } else { 2 },
+            1,
+        ]);
     let mut field = |offset: usize, size: usize, value: u64| {
         let bytes = if little {
             value.to_le_bytes()
@@ -1431,36 +1433,45 @@ fn elf_with_path(wide: bool, little: bool, tag: u64) -> Vec<u8> {
             value.to_be_bytes()
         };
         let value = if little {
-            &bytes[..size]
+            bytes.get(..size)
         } else {
-            &bytes[8 - size..]
-        };
-        data[offset..offset + size].copy_from_slice(value);
+            bytes
+                .len()
+                .checked_sub(size)
+                .and_then(|start| bytes.get(start..))
+        }
+        .ok_or("invalid ELF field width")?;
+        data.get_mut(offset..offset + size)
+            .ok_or("missing ELF field")?
+            .copy_from_slice(value);
+        Ok::<_, &'static str>(())
     };
     let (word, ph_offset, ph_size_at, ph_width, seg_offset, seg_address, seg_size) = if wide {
         (8, 32, 54, 56, 8, 16, 32)
     } else {
         (4, 28, 42, 32, 4, 8, 16)
     };
-    field(ph_offset, word, 64);
-    field(ph_size_at, 2, ph_width as u64);
-    field(ph_size_at + 2, 2, 2);
-    field(64, 4, 1);
-    field(64 + seg_address, word, 0x1000);
-    field(64 + seg_size, word, 384);
-    field(64 + ph_width, 4, 2);
-    field(64 + ph_width + seg_offset, word, 192);
-    field(64 + ph_width + seg_size, word, (word * 2 * 4) as u64);
+    field(ph_offset, word, 64)?;
+    field(ph_size_at, 2, ph_width as u64)?;
+    field(ph_size_at + 2, 2, 2)?;
+    field(64, 4, 1)?;
+    field(64 + seg_address, word, 0x1000)?;
+    field(64 + seg_size, word, 384)?;
+    field(64 + ph_width, 4, 2)?;
+    field(64 + ph_width + seg_offset, word, 192)?;
+    field(64 + ph_width + seg_size, word, (word * 2 * 4) as u64)?;
     for (index, (kind, value)) in [(5, 0x1140), (tag, 1), (10, 40), (0, 0)]
         .into_iter()
         .enumerate()
     {
-        field(192 + word * 2 * index, word, kind);
-        field(192 + word * (2 * index + 1), word, value);
+        field(192 + word * 2 * index, word, kind)?;
+        field(192 + word * (2 * index + 1), word, value)?;
     }
     let path = b"/toolchain:/build/lib:/vendor";
-    data[321..321 + path.len()].copy_from_slice(path);
-    data
+    data.get_mut(321..321 + path.len())
+        .ok_or("missing ELF path field")?
+        .copy_from_slice(path);
+    Ok(data)
 }
 
 #[test]
@@ -1468,7 +1479,7 @@ fn file_rpath_changes_and_removes_elf_dynamic_paths() -> TestResult {
     let (host, mut interp) = interpreter();
     let path = Path::new("/work/binary");
     for (wide, little, tag) in [(true, true, 29), (false, false, 15)] {
-        host.seed_file(path, &elf_with_path(wide, little, tag))?;
+        host.seed_file(path, &elf_with_path(wide, little, tag)?)?;
         script(
             &host,
             &mut interp,
@@ -1488,7 +1499,10 @@ file(RPATH_CHECK FILE binary RPATH /lib)
             "file(RPATH_SET FILE binary NEW_RPATH /replacement/longer/path)",
         )?;
         let data = host.read(path, ReadRange::All { limit: 512 })?;
-        assert!(data[321..].starts_with(b"/replacement/longer/path\0"));
+        assert!(
+            data.get(321..)
+                .is_some_and(|path| path.starts_with(b"/replacement/longer/path\0"))
+        );
         script(
             &host,
             &mut interp,
@@ -1498,7 +1512,10 @@ file(RPATH_CHANGE FILE binary OLD_RPATH /old NEW_RPATH "")
 "#,
         )?;
         let data = host.read(path, ReadRange::All { limit: 512 })?;
-        assert!(data[321..].starts_with(b":/keep\0"));
+        assert!(
+            data.get(321..)
+                .is_some_and(|path| path.starts_with(b":/keep\0"))
+        );
         script(
             &host,
             &mut interp,
@@ -1508,7 +1525,10 @@ file(RPATH_CHECK FILE binary RPATH "")
 "#,
         )?;
         let data = host.read(path, ReadRange::All { limit: 512 })?;
-        assert!(data[321..360].iter().all(|&byte| byte == 0));
+        assert!(
+            data.get(321..360)
+                .is_some_and(|path| path.iter().all(|&byte| byte == 0))
+        );
         script(
             &host,
             &mut interp,
@@ -1581,6 +1601,7 @@ file(GET_RUNTIME_DEPENDENCIES
   UNRESOLVED_DEPENDENCIES_VAR unresolved
   CONFLICTING_DEPENDENCIES_PREFIX conflict
   RPATH_PREFIX rpaths
+  PRE_EXCLUDE_REGEXES "["
   POST_INCLUDE_REGEXES "liba[.]dylib$"
   POST_EXCLUDE_REGEXES ".*"
   POST_INCLUDE_FILES /work/lib2/alias.dylib)
@@ -1595,6 +1616,12 @@ file(GET_RUNTIME_DEPENDENCIES
             ("rpaths_/work/lib1/liba.dylib", "/unused"),
         ],
     );
+    assert_eq!(
+        host.stream_bytes(Stream::Stdout),
+        b"RegularExpression::compile(): Unmatched [].\nRegularExpression::compile(): Error in compile.\n"
+            .as_slice()
+    );
+    assert!(host.stream_bytes(Stream::Stderr).is_empty());
     Ok(())
 }
 
@@ -1779,7 +1806,10 @@ fn download_has_no_default_total_timeout_and_uses_the_last_range() -> TestResult
     let (host, mut interp) = interpreter();
     host.set_command_handler(|_, request, _| {
         assert_eq!(request.timeout, None);
-        let args = &request.pipeline[0].args;
+        let [command] = request.pipeline.as_slice() else {
+            panic!("Expected one command.");
+        };
+        let args = &command.args;
         assert_eq!(args.iter().filter(|arg| *arg == "--range").count(), 1);
         assert!(args.windows(2).any(|pair| pair == ["--range", "20-29"]));
         Ok(RunOutput {
@@ -1802,7 +1832,10 @@ fn download_passes_netrc_file_only_when_netrc_is_enabled() -> TestResult {
     use rcmake_host::{ProcessResult, RunOutput};
     let (host, mut interp) = interpreter();
     host.set_command_handler(|_, request, _| {
-        let args = &request.pipeline[0].args;
+        let [command] = request.pipeline.as_slice() else {
+            panic!("Expected one command.");
+        };
+        let args = &command.args;
         let flag = if args
             .iter()
             .any(|arg| arg == "https://example.invalid/optional")

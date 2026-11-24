@@ -1,5 +1,5 @@
 use rcmake_base::{BString, list};
-use rcmake_diag::{Location, MessageKind, PolicyId, PolicyStatus};
+use rcmake_diag::{Backtrace, Location, MessageKind, PolicyId, PolicyStatus};
 use rcmake_eval::{CmdError, CmdResult, Cx, Flow};
 use rcmake_expr::ExpandedArg;
 use rcmake_host::{FileKind, Follow};
@@ -7,7 +7,10 @@ use rcmake_model::{
     BT, DirId, ImportedVisibility, ModelError, Target, TargetBinding, TargetKind, TargetOrigin,
 };
 
-use super::{bytes, generation_diagnostic, init, model_error, schedule_target_validation};
+use super::{
+    bytes, generation_diagnostic, init, model_error, schedule_alias_validation,
+    schedule_target_validation,
+};
 
 pub(super) fn executable(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
     add(cx, args, true)
@@ -166,8 +169,8 @@ fn add(cx: &mut Cx<'_>, args: &[ExpandedArg], executable: bool) -> CmdResult {
         .add_target(target)
         .map_err(|err| duplicate(cx, name, options.imported, err))?;
     crate::dirs::source_groups::apply_to_target(cx, id)?;
-    if !options.imported && generated_reservation(name).is_some() {
-        schedule_target_validation(cx);
+    if !options.imported {
+        schedule_generated_name_validation(cx, name);
     }
     Ok(Flow::Normal)
 }
@@ -203,48 +206,61 @@ fn validate_name(cx: &mut Cx<'_>, name: &BString, special: bool) -> Result<(), C
     }
 }
 
-fn generated_reservation(name: &[u8]) -> Option<(Option<&'static str>, &'static str)> {
-    Some(match name {
-        b"package" | b"PACKAGE" => (Some("CPackConfig.cmake"), "CPack packaging"),
-        b"package_source" => (Some("CPackSourceConfig.cmake"), "CPack source packaging"),
-        b"test" | b"RUN_TESTS" => (None, "CTest testing"),
-        _ => return None,
-    })
+/// Schedule the late reservation check for a build target.
+pub(crate) fn schedule_generated_name_validation(cx: &mut Cx<'_>, name: &[u8]) {
+    if generated_reservation(name).is_some() {
+        schedule_target_validation(cx);
+    }
+}
+
+fn generated_reservation(name: &[u8]) -> Option<(&'static str, Option<&'static str>)> {
+    match name {
+        b"package" | b"PACKAGE" => Some(("CPack packaging", Some("CPackConfig.cmake"))),
+        b"package_source" => Some(("CPack source packaging", Some("CPackSourceConfig.cmake"))),
+        b"test" | b"RUN_TESTS" => Some(("CTest testing", None)),
+        _ => None,
+    }
 }
 
 pub(super) fn validate_generated_names(cx: &mut Cx<'_>) -> bool {
     let model = cx.project();
-    let root = model.dir(DirId::ROOT).source_dir.clone();
     let candidates: Vec<_> = model
         .targets()
-        .filter(|(_, target)| !target.is_imported())
-        .filter_map(|(_, target)| {
-            let (file, feature) = generated_reservation(&target.name)?;
-            Some((target.name.clone(), target.backtrace.clone(), file, feature))
+        .filter(|(_, target)| {
+            !target.is_imported() && generated_reservation(&target.name).is_some()
         })
+        .map(|(_, target)| (target.name.clone(), target.backtrace.clone()))
         .collect();
-    let binary = cx.current_binary_dir();
     let mut failed = false;
-    for (name, trace, file, feature) in candidates {
-        let enabled = match file {
-            Some(file) => cx
-                .host()
-                .metadata(&binary.join(file), Follow::Yes)
-                .is_ok_and(|metadata| metadata.kind == FileKind::File),
-            None => cx.var_is_on(b"CMAKE_TESTING_ENABLED"),
-        };
-        if enabled {
-            failed |= generation_diagnostic(
-                cx,
-                &root,
-                Location::Backtrace(trace),
-                MessageKind::Error,
-                None,
-                format!("The target name \"{name}\" is reserved when {feature} is enabled.").into(),
-            );
-        }
+    for (name, trace) in candidates {
+        failed |= validate_generated_name(cx, &name, trace);
     }
     failed
+}
+
+pub(super) fn validate_generated_name(cx: &mut Cx<'_>, name: &BString, trace: Backtrace) -> bool {
+    let Some((feature, file)) = generated_reservation(name) else {
+        return false;
+    };
+    let enabled = match file {
+        Some(file) => cx
+            .host()
+            .metadata(&cx.current_binary_dir().join(file), Follow::Yes)
+            .is_ok_and(|metadata| metadata.kind == FileKind::File),
+        None => cx.var_is_on(b"CMAKE_TESTING_ENABLED"),
+    };
+    if !enabled {
+        return false;
+    }
+    let root = cx.project().dir(DirId::ROOT).source_dir.clone();
+    generation_diagnostic(
+        cx,
+        &root,
+        Location::Backtrace(trace),
+        MessageKind::Error,
+        None,
+        format!("The target name \"{name}\" is reserved when {feature} is enabled.").into(),
+    )
 }
 
 fn alias(
@@ -302,8 +318,8 @@ fn alias(
             "cannot create ALIAS target \"{name}\" because target \"{referent}\" is not {kind}."
         )));
     }
+    let global = target.is_global();
     if !reject_collision && let Some(existing) = model.lookup_target(dir, name) {
-        let global = target.is_global();
         let directories: Vec<_> = if global {
             model.dirs().map(|(dir, _)| dir).collect()
         } else {
@@ -331,15 +347,18 @@ fn alias(
                 .local_targets
                 .insert(name.clone(), TargetBinding::Alias(aliased));
         }
-        return Ok(Flow::Normal);
+    } else {
+        model.add_alias(dir, name.clone(), id).map_err(|err| {
+            if matches!(err, ModelError::DuplicateTarget(_)) {
+                CmdError::status(format!("cannot create ALIAS target \"{name}\" because another target with the same name already exists."))
+            } else {
+                model_error(err)
+            }
+        })?;
     }
-    model.add_alias(dir, name.clone(), id).map_err(|err| {
-        if matches!(err, ModelError::DuplicateTarget(_)) {
-            CmdError::status(format!("cannot create ALIAS target \"{name}\" because another target with the same name already exists."))
-        } else {
-            model_error(err)
-        }
-    })?;
+    if global && generated_reservation(name).is_some() {
+        schedule_alias_validation(cx, name);
+    }
     Ok(Flow::Normal)
 }
 

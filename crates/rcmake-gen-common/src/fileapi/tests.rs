@@ -963,12 +963,12 @@ fn compare_codemodel(
         host,
         actual_dir,
         entry(get(actual, "targets"), "name", "app"),
-    );
+    )?;
     let expected = follow(
         host,
         expected_dir,
         entry(get(expected, "targets"), "name", "app"),
-    );
+    )?;
     assert_fields(
         &actual,
         &expected,

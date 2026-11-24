@@ -4,13 +4,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use rcmake_base::{BString, list, path_lex::Lexical};
-use rcmake_diag::{Effect, MessageKind, PolicyId, PolicyStatus};
+use rcmake_diag::{PolicyId, PolicyStatus};
 use rcmake_eval::{
     Cx, Flow, RunMode,
     args::{KeywordParser, Parsed, Slot},
 };
 use rcmake_host::{
-    CommandSpec, Follow, Input, Output, ProcessResult, RunRequest,
+    CommandSpec, Follow, Input, Output, ProcessResult, RunRequest, Stream,
     path::{executable_on_absolute_path, from_native, to_native},
 };
 use rcmake_regex::{MatchOptions, Regex};
@@ -268,15 +268,14 @@ impl<'a> Filters<'a> {
                 .iter()
                 .filter_map(|pattern| match cx.regex(pattern) {
                     Ok(regex) => Some(regex),
-                    Err(err) => {
-                        cx.issue(
-                            MessageKind::Warning,
-                            Effect::None,
-                            None,
+                    Err(error) => {
+                        cx.host().write_out(
+                            Stream::Stdout,
                             format!(
-                                "GET_RUNTIME_DEPENDENCIES could not compile the regular expression \"{pattern}\" for {key}.\n  {err}"
+                                "{}\nRegularExpression::compile(): Error in compile.\n",
+                                error.message
                             )
-                            .into(),
+                            .as_bytes(),
                         );
                         None
                     }

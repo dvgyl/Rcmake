@@ -230,7 +230,7 @@ fn add_command(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
         let mut options = Options::default();
         options.parse(&mut body, rest, false);
         resolve_paths(cx, &mut body, false)?;
-        return append(cx, body, count);
+        return append(cx, body, count, None);
     }
     if args.len() < 4 {
         return Err(CmdError::status("called with wrong number of arguments."));
@@ -377,25 +377,7 @@ fn add_command(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
     resolve_paths(cx, &mut body, !options.append)?;
     if options.append {
         let count = cx.project().commands().count();
-        if cx.defer_active() {
-            // Keep each argument until the directory finishes configuration.
-            let line = cx.current_line();
-            let deferred: Vec<_> = [DEFERRED_APPEND.into(), count.to_string().into()]
-                .into_iter()
-                .chain(args.iter().map(|arg| arg.value.clone()))
-                .map(|text| Argument {
-                    kind: ArgKind::Bracket,
-                    text,
-                    line,
-                    span: 0..0,
-                })
-                .collect();
-            let id = cx.defer_new_id();
-            if cx.defer_call(body.dir, id, b"add_custom_command", &deferred) {
-                return Ok(Flow::Normal);
-            }
-        }
-        return append(cx, body, count);
+        return append(cx, body, count, Some(args));
     }
     let explicit_only = options.explicit_only
         || truth::is_on(&cx.var_or_empty(b"CMAKE_ADD_CUSTOM_COMMAND_DEPENDS_EXPLICIT_ONLY"));
@@ -454,7 +436,12 @@ fn check_policy(cx: &mut Cx<'_>, message: impl Into<BString>, advice: &[u8]) -> 
     }
 }
 
-fn append(cx: &mut Cx<'_>, body: CustomCommand, count: usize) -> CmdResult {
+fn append(
+    cx: &mut Cx<'_>,
+    body: CustomCommand,
+    count: usize,
+    args: Option<&[ExpandedArg]>,
+) -> CmdResult {
     let Some(output) = body.outputs.first() else {
         return Err(CmdError::status("APPEND requires an OUTPUT."));
     };
@@ -481,21 +468,46 @@ fn append(cx: &mut Cx<'_>, body: CustomCommand, count: usize) -> CmdResult {
     if configs.is_empty() {
         configs.push(ConfigId::default());
     }
-    let project = cx.project();
-    let id = find_append_command(project, body.dir, output, count, &configs)?;
-    let Some(existing) = id.and_then(|id| project.command_mut(id)) else {
-        return Err(crate::command_error(
-            cx,
-            format!(
-                "Attempt to APPEND to custom command with output\n\n  {}\n\nwhich is not already a custom command output.",
-                output.value
-            ),
-        ));
-    };
-    existing.command_lines.extend(body.command_lines);
-    existing.depends.extend(body.depends);
-    existing.implicit_depends.extend(body.implicit_depends);
-    Ok(Flow::Normal)
+    let matched = find_append_command(cx.project(), body.dir, output, count, &configs);
+    if let Ok(Some(id)) = matched {
+        let existing = cx
+            .project()
+            .command_mut(id)
+            .ok_or_else(|| model_error(ModelError::UnknownObject))?;
+        existing.command_lines.extend(body.command_lines);
+        existing.depends.extend(body.depends);
+        existing.implicit_depends.extend(body.implicit_depends);
+        return Ok(Flow::Normal);
+    }
+    if let Some(args) = args
+        && cx.defer_active()
+    {
+        // Retry after configuration. Only commands that preceded APPEND can match.
+        // Move this retry to an internal post-directory hook after W11B.
+        let line = cx.current_line();
+        let deferred: Vec<_> = [DEFERRED_APPEND.into(), count.to_string().into()]
+            .into_iter()
+            .chain(args.iter().map(|arg| arg.value.clone()))
+            .map(|text| Argument {
+                kind: ArgKind::Bracket,
+                text,
+                line,
+                span: 0..0,
+            })
+            .collect();
+        let id = cx.defer_new_id();
+        if cx.defer_call(body.dir, id, b"add_custom_command", &deferred) {
+            return Ok(Flow::Normal);
+        }
+    }
+    let _ = matched?;
+    Err(crate::command_error(
+        cx,
+        format!(
+            "Attempt to APPEND to custom command with output\n\n  {}\n\nwhich is not already a custom command output.",
+            output.value
+        ),
+    ))
 }
 
 fn find_append_command(
@@ -685,13 +697,6 @@ fn add_target(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
         );
         return Ok(Flow::Normal);
     }
-    if name == b"test" && cx.var_is_on(b"CMAKE_TESTING_ENABLED") {
-        return Err(crate::command_error(
-            cx,
-            "The target name \"test\" is reserved when CTest testing is enabled.",
-        ));
-    }
-
     let all = args.first().is_some_and(|arg| arg.value == b"ALL");
     let args = if all {
         args.get(1..).unwrap_or_default()
@@ -748,6 +753,7 @@ fn add_target(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
     body.kind = CustomCommandKind::Utility(id);
     record(cx, body)?;
     crate::dirs::source_groups::apply_to_target(cx, id)?;
+    crate::targets::schedule_generated_name_validation(cx, name);
     Ok(Flow::Normal)
 }
 

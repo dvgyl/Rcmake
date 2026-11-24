@@ -2,10 +2,12 @@
 
 #![forbid(unsafe_code)]
 
+use std::sync::Arc;
+
 use rcmake_base::{BString, path_lex::Lexical, truth};
 use rcmake_diag::{
-    DiagAction, DiagCategory, Diagnostic, Effect, Location, MessageKind, PolicyId, PolicyStatus,
-    RenderOptions,
+    Backtrace, DiagAction, DiagCategory, Diagnostic, Effect, Frame, FrameKind, Location,
+    MessageKind, PolicyId, PolicyStatus, RenderOptions,
 };
 use rcmake_eval::{CmdError, CmdFlags, CmdResult, Cx, Flow, Registry};
 use rcmake_expr::ExpandedArg;
@@ -20,6 +22,7 @@ mod properties;
 mod sources;
 mod usage;
 
+pub(crate) use create::schedule_generated_name_validation;
 pub(crate) use sources::{find_file_set, replace_file_set_paths, require_sycl, scope_name};
 
 #[cfg(test)]
@@ -415,31 +418,103 @@ fn schedule_target_validation(cx: &mut Cx<'_>) {
     }
 }
 
+fn schedule_alias_validation(cx: &mut Cx<'_>, name: &[u8]) {
+    let trace = cx.backtrace();
+    if let Some(frame) = trace.top()
+        && let Some(command) = &frame.name
+    {
+        defer_validation(
+            cx,
+            b"add_dependencies",
+            &[
+                CHECK_TARGETS,
+                name,
+                command,
+                &frame.file,
+                frame.line.to_string().as_bytes(),
+            ],
+        );
+    }
+}
+
+fn has_pending_deferred_commands(cx: &Cx<'_>) -> bool {
+    cx.defer_get_call_ids(DirId::ROOT).is_some_and(|ids| {
+        ids.iter().any(|id| {
+            cx.defer_get_call(DirId::ROOT, id).is_some_and(|call| {
+                !matches!(call.as_slice(), [command, marker, ..]
+                    if command == b"add_dependencies" && marker == CHECK_TARGETS)
+            })
+        })
+    })
+}
+
 fn add_dependencies(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
-    if let [marker] = args
+    if let [marker, check @ ..] = args
         && bytes(marker) == CHECK_TARGETS
         && cx.running_deferred()
     {
-        // A deferred call can create targets or queue more calls.
-        if cx
-            .defer_get_call_ids(DirId::ROOT)
-            .is_some_and(|ids| !ids.is_empty())
-        {
-            defer_validation(cx, b"add_dependencies", &[CHECK_TARGETS]);
-            return Ok(Flow::Normal);
-        }
-        cx.global().props.unset(CHECK_TARGETS);
-        let mut failed = validate_dependencies(cx);
-        failed |= create::validate_generated_names(cx);
-        if failed {
-            generation_failed(cx);
-        }
-        return Ok(Flow::Normal);
+        return run_target_validation(cx, args, check);
     }
 
     properties::add_dependencies(cx, args)?;
-    if matches!(args, [_, _, ..]) {
-        schedule_target_validation(cx);
+    if let [name, deps @ ..] = args
+        && !deps.is_empty()
+    {
+        let dir = cx.current_dir_id();
+        let model = cx.project();
+        let target = model
+            .find_target(dir, bytes(name))
+            .and_then(|id| model.target(id));
+        if target.is_some_and(|target| {
+            !target.is_imported()
+                && deps
+                    .iter()
+                    .any(|dep| model.find_target(target.dir, bytes(dep)).is_none())
+        }) {
+            // A later command can define the dependency. Move this check to an
+            // internal post-directory hook after W11B.
+            schedule_target_validation(cx);
+        }
+    }
+    Ok(Flow::Normal)
+}
+
+fn run_target_validation(
+    cx: &mut Cx<'_>,
+    args: &[ExpandedArg],
+    check: &[ExpandedArg],
+) -> CmdResult {
+    // A deferred command can create targets, enable testing, or queue more commands.
+    if has_pending_deferred_commands(cx) {
+        let values: Vec<_> = args.iter().map(bytes).collect();
+        defer_validation(cx, b"add_dependencies", &values);
+        return Ok(Flow::Normal);
+    }
+    match check {
+        [] => {
+            cx.global().props.unset(CHECK_TARGETS);
+            if create::validate_generated_names(cx) {
+                cx.set_fatal();
+            } else if validate_dependencies(cx) {
+                generation_failed(cx);
+            }
+        }
+        [name, command, file, line] => {
+            let line = std::str::from_utf8(bytes(line))
+                .ok()
+                .and_then(|line| line.parse().ok())
+                .ok_or_else(|| CmdError::status("Invalid deferred alias location."))?;
+            let trace = Backtrace::default().push(Frame {
+                file: Arc::from(bytes(file)),
+                line,
+                name: Some(Arc::from(bytes(command))),
+                kind: FrameKind::Command,
+            });
+            if create::validate_generated_name(cx, &name.value, trace) {
+                cx.set_fatal();
+            }
+        }
+        _ => return Err(CmdError::status("Invalid deferred target check.")),
     }
     Ok(Flow::Normal)
 }

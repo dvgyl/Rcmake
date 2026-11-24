@@ -399,8 +399,12 @@ fn append_make_word(out: &mut Vec<u8>, word: &[u8], target: bool) -> Result<(), 
     }
     for &byte in word {
         match byte {
-            b'\r' | b'\n' | 0 | b';' | b'=' | b'|' => {
+            b'\r' | b'\n' | 0 | b';' | b'|' => {
                 return Err("Invalid compiler dependency path.".into());
+            }
+            b'=' => {
+                out.extend_from_slice(b"$(EQUALS)");
+                continue;
             }
             b' ' | b'\t' | b'#' | b':' | b'\\' => out.push(b'\\'),
             b'%' if target => out.push(b'\\'),
@@ -540,6 +544,30 @@ mod tests {
     use rcmake_host::{HostResult, PureHost};
 
     use super::*;
+
+    #[test]
+    fn compiler_scan_escapes_equals_in_make_paths() -> Result<(), String> {
+        let work = Path::new(if cfg!(windows) { "C:/work" } else { "/work" });
+        let host = PureHost::new(work.to_path_buf(), work.join("rcmake"));
+        let scan = CompilerScan {
+            source_root: work,
+            build_root: work,
+            build_dir: work,
+            output_dir: work,
+            project_only: false,
+        };
+        host.seed_file(&work.join("obj.o.d"), b"obj.o: dep=abc.h\n")
+            .map_err(|error| error.to_string())?;
+        scan.update(&host, b"main.c;obj.o;gcc;obj.o.d", None)?;
+        let rules =
+            read_output(&host, work, "compiler_depend.make").map_err(|error| error.to_string())?;
+        assert!(rules.contains("  dep$(EQUALS)abc.h\n"));
+        assert!(rules.contains("\ndep$(EQUALS)abc.h:\n"));
+        let internal = read_output(&host, work, "compiler_depend.internal")
+            .map_err(|error| error.to_string())?;
+        assert!(internal.contains("/dep=abc.h\n"));
+        Ok(())
+    }
 
     #[test]
     fn mixed_target_refreshes_both_dependency_outputs() -> Result<(), Box<dyn std::error::Error>> {
