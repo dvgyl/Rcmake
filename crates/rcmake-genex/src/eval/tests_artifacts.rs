@@ -3,6 +3,144 @@ use super::{
 };
 use rcmake_diag::{Frame, FrameKind};
 
+use crate::{
+    ArtifactKind, ArtifactPart, BString, ConfigId, GenexError, GenexHost, InterfaceView,
+    TargetHandle, evaluate, parse,
+};
+
+struct DllHost(Host);
+
+impl GenexHost for DllHost {
+    fn find_target(&self, name: &[u8]) -> Option<TargetHandle> {
+        self.0.find_target(name)
+    }
+
+    fn target_name(&self, target: TargetHandle) -> BString {
+        self.0.target_name(target)
+    }
+
+    fn raw_property(&self, target: TargetHandle, name: &[u8]) -> Option<BString> {
+        self.0.raw_property(target, name)
+    }
+
+    fn transitive_property(
+        &mut self,
+        target: TargetHandle,
+        name: &[u8],
+        ctx: &EvalContext,
+    ) -> Result<InterfaceView, GenexError> {
+        self.0.transitive_property(target, name, ctx)
+    }
+
+    fn artifact(
+        &self,
+        target: TargetHandle,
+        kind: ArtifactKind,
+        part: ArtifactPart,
+        _: &ConfigId,
+    ) -> Option<BString> {
+        let name = match (target, kind) {
+            (OTHER, ArtifactKind::LinkerLibraryFile | ArtifactKind::File)
+            | (RIGHT, ArtifactKind::File) => "shared.dll",
+            (LEFT, ArtifactKind::File) => "module.dll",
+            (LEFT, ArtifactKind::LinkerLibraryFile)
+                if self
+                    .raw_property(target, b"TYPE")
+                    .is_some_and(|kind| kind == "STATIC_LIBRARY") =>
+            {
+                "static.lib"
+            }
+            _ => return None,
+        };
+        match part {
+            ArtifactPart::Full => Some(format!("/out/{name}").into()),
+            ArtifactPart::Name => Some(name.into()),
+            ArtifactPart::Dir => Some("/out".into()),
+            _ => None,
+        }
+    }
+
+    fn link_closure(
+        &mut self,
+        _: TargetHandle,
+        _: &EvalContext,
+    ) -> Result<Vec<TargetHandle>, GenexError> {
+        Ok(vec![OTHER, RIGHT, OTHER, LEFT])
+    }
+
+    fn definition(&self, name: &[u8]) -> Option<BString> {
+        self.0.definition(name)
+    }
+}
+
+#[test]
+fn dll_platform_suppresses_linker_library_paths_for_shared_and_module_targets() {
+    let mut host = DllHost(Host::default());
+    host.0
+        .definitions
+        .insert("CMAKE_SYSTEM_NAME".into(), "Windows".into());
+    host.0.set(OTHER, "TYPE", "SHARED_LIBRARY");
+    host.0.set(LEFT, "TYPE", "MODULE_LIBRARY");
+    let ctx = context();
+    for (suffix, shared, module) in [
+        ("", "/out/shared.dll", "/out/module.dll"),
+        ("_NAME", "shared.dll", "module.dll"),
+        ("_DIR", "/out", "/out"),
+    ] {
+        for (name, expected) in [("other", shared), ("left", module)] {
+            let expression = format!("$<TARGET_LINKER_LIBRARY_FILE{suffix}:{name}>");
+            let value = |host: &mut DllHost| {
+                evaluate(&parse(expression.as_bytes())?, &ctx, host).map(|(value, _)| value)
+            };
+            host.0
+                .definitions
+                .insert("CMAKE_IMPORT_LIBRARY_SUFFIX".into(), ".lib".into());
+            assert_eq!(value(&mut host), Ok(BString::default()), "{expression}");
+            host.0
+                .definitions
+                .insert("CMAKE_IMPORT_LIBRARY_SUFFIX".into(), "".into());
+            assert_eq!(value(&mut host), Ok(expected.into()), "{expression}");
+        }
+    }
+    host.0
+        .definitions
+        .insert("CMAKE_IMPORT_LIBRARY_SUFFIX".into(), ".lib".into());
+    host.0.set(LEFT, "TYPE", "STATIC_LIBRARY");
+    let result = parse(b"$<TARGET_LINKER_LIBRARY_FILE:left>")
+        .and_then(|ast| evaluate(&ast, &ctx, &mut host));
+    assert_eq!(result.map(|(value, _)| value), Ok("/out/static.lib".into()));
+}
+
+#[test]
+fn runtime_dll_lists_keep_distinct_dependency_targets_with_the_same_file() {
+    let mut host = DllHost(Host::default());
+    host.0
+        .definitions
+        .insert("CMAKE_SYSTEM_NAME".into(), "CustomToolchain".into());
+    host.0
+        .definitions
+        .insert("CMAKE_IMPORT_LIBRARY_SUFFIX".into(), ".implib".into());
+    host.0.set(HEAD, "TYPE", "EXECUTABLE");
+    host.0.set(OTHER, "TYPE", "SHARED_LIBRARY");
+    host.0.set(RIGHT, "TYPE", "SHARED_LIBRARY");
+    host.0.set(LEFT, "TYPE", "MODULE_LIBRARY");
+    let ctx = context();
+    for (expr, expected) in [
+        (
+            "$<TARGET_RUNTIME_DLLS:head>",
+            "/out/shared.dll;/out/shared.dll",
+        ),
+        ("$<TARGET_RUNTIME_DLL_DIRS:head>", "/out"),
+    ] {
+        let result = parse(expr.as_bytes()).and_then(|ast| evaluate(&ast, &ctx, &mut host));
+        assert_eq!(
+            result.map(|(value, _)| value),
+            Ok(expected.into()),
+            "{expr}"
+        );
+    }
+}
+
 #[test]
 fn runtime_dll_queries_validate_targets_and_evaluate_links_on_darwin() {
     let mut host = Host::default();

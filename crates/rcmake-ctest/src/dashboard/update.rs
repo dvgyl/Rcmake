@@ -1,114 +1,231 @@
+use std::collections::BTreeSet;
 use std::fmt::Write as _;
 use std::path::Path;
+use std::time::Duration;
 
 use rcmake_base::{BString, truth};
-use rcmake_host::{FileTime, Host, ProcessResult, path};
-use rcmake_presets::{EnvSnapshot, PresetKind};
+use rcmake_host::{CommandSpec, Follow, Host, Input, Output, ProcessResult, RunRequest, Stream};
 
 use crate::cli::Invocation;
-use crate::dart::{Configuration, Model, Tag};
+use crate::dart::{Configuration, Tag};
 use crate::junit::{escape, write_file};
 
-use super::definition;
+use super::{Dashboard, definition};
 
-pub(super) fn run(host: &dyn Host, invocation: &Invocation) -> Result<i32, String> {
-    let cwd = host.initial_cwd();
-    let initial = &invocation.options.test_dir;
-    let preliminary = Configuration::load(host, initial, &invocation.overwrite_configuration_file)
-        .map_err(|error| error.to_string())?;
-    let source = invocation.source_dir.as_ref().map_or_else(
-        || initial.join(path::to_native(&preliminary.source_directory)),
-        |source| cwd.join(source),
-    );
-    let mut build = initial.clone();
-    if invocation.build_dir.is_none() {
-        if !preliminary.build_directory.is_empty() {
-            build = cwd.join(path::to_native(&preliminary.build_directory));
-        } else if let Some(preset) = definition(invocation, b"CTEST_CONFIGURE_PRESET")
-            .or_else(|| definition(invocation, b"CTEST_PRESET"))
-        {
-            let set = match &invocation.presets_file {
-                Some(file) => rcmake_presets::load_file(&source, file, host),
-                None => rcmake_presets::load(&source, host),
-            }
-            .map_err(|error| error.message)?;
-            let preset = set
-                .resolve(PresetKind::Configure, preset, &EnvSnapshot::from_host(host))
-                .map_err(|error| error.message)?;
-            if let Some(dir) = preset.binary_dir {
-                build = source.join(path::to_native(&dir));
-            }
-        }
-    }
-    let config = Configuration::load(host, &build, &invocation.overwrite_configuration_file)
-        .map_err(|error| error.to_string())?;
-    let tag = Tag::read(host, &build)
-        .or_else(|_| {
-            Tag::create(
-                host,
-                &build,
-                host.now(),
-                invocation.dashboard_model.unwrap_or(Model::Experimental),
-                None,
-                &config.nightly_start,
-            )
-        })
-        .map_err(|error| error.to_string())?;
-    let started = host.now();
-    let program = definition(invocation, b"CTEST_UPDATE_COMMAND").unwrap_or(&config.update_command);
-    let version_only =
-        definition(invocation, b"CTEST_UPDATE_VERSION_ONLY").is_some_and(truth::is_on);
-    let output = if program.is_empty() {
-        None
-    } else {
-        let args = if version_only {
-            vec!["--version".into()]
-        } else {
-            Vec::new()
-        };
-        Some(
-            crate::script::run_process(host, source, program.into(), args, host.env_all(), false)
-                .map_err(|error| error.to_string())?,
+pub(super) fn run(
+    host: &dyn Host,
+    invocation: &Invocation,
+    dashboard: &Dashboard,
+) -> Result<i32, String> {
+    let Dashboard {
+        source,
+        build,
+        tag,
+        config,
+        ..
+    } = dashboard;
+    let setting = |name, key| {
+        definition(invocation, name).map_or_else(
+            || dashboard.value(host, invocation, key),
+            |value| Ok(BString::from(value)),
         )
     };
-    let succeeded = output
-        .as_ref()
-        .is_none_or(|output| matches!(output.results.as_slice(), [ProcessResult::Exited(0)]));
-    let status = if succeeded {
-        ""
-    } else {
-        "Update command failed."
-    };
-    write_report(
+    let program = definition(invocation, b"CTEST_UPDATE_COMMAND")
+        .filter(|value| !value.is_empty())
+        .unwrap_or(&config.update_command);
+    let git = setting(b"CTEST_GIT_COMMAND", b"GITCommand")?;
+    let version_only = setting(b"CTEST_UPDATE_VERSION_ONLY", b"UpdateVersionOnly")?;
+    let revision = setting(b"CTEST_UPDATE_VERSION_OVERRIDE", b"UpdateVersionOverride")?;
+    update(
         host,
-        &build,
-        &tag,
-        &config,
-        Report {
-            started,
-            command: program,
-            repository: "Unknown",
-            revision: definition(invocation, b"CTEST_UPDATE_VERSION_OVERRIDE"),
-            status,
+        source,
+        build,
+        tag,
+        config,
+        Options {
+            program,
+            git: &git,
+            version_only: truth::is_on(&version_only),
+            revision: &revision,
+            log: !invocation.options.quiet,
         },
-    )?;
-    Ok(if succeeded { 0 } else { 1 })
+    )
+    .map(|_| 0)
 }
 
-pub(crate) struct Report<'a> {
-    pub(crate) started: FileTime,
-    pub(crate) command: &'a [u8],
-    pub(crate) repository: &'a str,
-    pub(crate) revision: Option<&'a [u8]>,
-    pub(crate) status: &'a str,
+pub(crate) struct Options<'a> {
+    pub(crate) program: &'a [u8],
+    pub(crate) git: &'a [u8],
+    pub(crate) version_only: bool,
+    pub(crate) revision: &'a [u8],
+    pub(crate) log: bool,
 }
 
-pub(crate) fn write_report(
+pub(crate) fn update(
+    host: &dyn Host,
+    source: &Path,
+    build: &Path,
+    tag: &Tag,
+    config: &Configuration,
+    options: Options<'_>,
+) -> Result<i32, String> {
+    let started = host.now();
+    let is_git = host.metadata(&source.join(".git"), Follow::Yes).is_ok();
+    let repository = if is_git { "GIT" } else { "Unknown" };
+    if options.log {
+        host.write_out(
+            Stream::Stdout,
+            format!(
+                "   Updating {repository} repository: {}\n",
+                source.display()
+            )
+            .as_bytes(),
+        );
+    }
+    let mut report = Report {
+        command: BString::default(),
+        repository,
+        revision: options.revision.into(),
+        prior_revision: BString::default(),
+        updated: BTreeSet::new(),
+        status: String::new(),
+    };
+    if report.revision.is_empty() {
+        let program = if !options.program.is_empty() {
+            options.program
+        } else if !is_git {
+            b"".as_slice()
+        } else if !options.git.is_empty() {
+            options.git
+        } else {
+            b"git".as_slice()
+        };
+        if program.is_empty() {
+            return Err("Update command is not specified.".into());
+        }
+        if let Err(message) = collect(
+            host,
+            source,
+            program,
+            is_git,
+            options.version_only,
+            &mut report,
+        ) {
+            host.write_out(Stream::Stderr, format!("   {message}\n").as_bytes());
+            report.status = message;
+        }
+    }
+    write_report(host, build, tag, config, &report, started)?;
+    if report.status.is_empty() {
+        let count = report.updated.len();
+        if options.log && count != 0 {
+            host.write_out(
+                Stream::Stdout,
+                format!("   Found {count} updated files\n").as_bytes(),
+            );
+        }
+        i32::try_from(count).map_err(|failure| failure.to_string())
+    } else {
+        Ok(-1)
+    }
+}
+
+fn collect(
+    host: &dyn Host,
+    source: &Path,
+    program: &[u8],
+    is_git: bool,
+    version_only: bool,
+    report: &mut Report,
+) -> Result<(), String> {
+    let run = |args| {
+        let output = host
+            .run_bounded(
+                &RunRequest {
+                    pipeline: vec![CommandSpec {
+                        program: program.into(),
+                        args,
+                    }],
+                    cwd: source.to_path_buf(),
+                    env: host.env_all(),
+                    stdin: Input::Null,
+                    stdout: Output::Capture,
+                    stderr: Output::Capture,
+                    timeout: Some(Duration::from_secs(30 * 60)),
+                    tee: false,
+                },
+                16 * 1024 * 1024,
+            )
+            .map_err(|failure| failure.to_string())?;
+        if matches!(output.results.as_slice(), [ProcessResult::Exited(0)]) {
+            Ok(output.stdout)
+        } else {
+            Err("Update command failed.".to_owned())
+        }
+    };
+    if !is_git {
+        if !version_only {
+            report.command = program.into();
+            run(Vec::new())?;
+        }
+        return Ok(());
+    }
+    let revision = || {
+        let output = run(vec!["rev-parse".into(), "HEAD".into()])?;
+        let hash = output.trim_ascii();
+        if matches!(hash.len(), 40 | 64) && hash.iter().all(u8::is_ascii_hexdigit) {
+            Ok(BString::from(hash))
+        } else {
+            Err("Git did not return a commit ID.".into())
+        }
+    };
+    if version_only {
+        report.revision = revision()?;
+        return Ok(());
+    }
+    report.prior_revision = revision()?;
+    report.command = format!("{} pull --ff-only", BString::from(program)).into();
+    run(vec!["pull".into(), "--ff-only".into()])?;
+    report.revision = revision()?;
+    if report.revision != report.prior_revision {
+        let range = format!("{}..{}", report.prior_revision, report.revision);
+        let paths = run([
+            "log",
+            "--format=",
+            "--name-only",
+            "--no-renames",
+            "-z",
+            &range,
+            "--",
+        ]
+        .into_iter()
+        .map(BString::from)
+        .collect())?;
+        report.updated = paths
+            .split(|&byte| byte == 0)
+            .filter(|name| !name.is_empty())
+            .map(BString::from)
+            .collect();
+    }
+    Ok(())
+}
+
+struct Report {
+    command: BString,
+    repository: &'static str,
+    revision: BString,
+    prior_revision: BString,
+    updated: BTreeSet<BString>,
+    status: String,
+}
+
+fn write_report(
     host: &dyn Host,
     build: &Path,
     tag: &Tag,
     config: &Configuration,
-    report: Report<'_>,
+    report: &Report,
+    started: rcmake_host::FileTime,
 ) -> Result<(), String> {
     let mut xml = format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Update mode=\"Client\" Generator=\"ctest-{}\">\n",
@@ -123,15 +240,34 @@ pub(crate) fn write_report(
             "BuildStamp",
             format!("{}-{}", tag.stamp(), tag.track).into(),
         ),
-        ("StartDateTime", date(report.started).into()),
-        ("StartTime", report.started.secs.to_string().into()),
-        ("UpdateCommand", report.command.into()),
+        ("StartDateTime", date(started).into()),
+        ("StartTime", started.secs.to_string().into()),
+        ("UpdateCommand", report.command.clone()),
         ("UpdateType", report.repository.into()),
     ] {
         let _ = writeln!(xml, "<{name}>{}</{name}>", escape(&value, false));
     }
-    if let Some(revision) = report.revision {
-        let _ = writeln!(xml, "<Revision>{}</Revision>", escape(revision, false));
+    let revision = escape(&report.revision, false);
+    let prior_revision = escape(&report.prior_revision, false);
+    if !revision.is_empty() {
+        let _ = writeln!(xml, "<Revision>{revision}</Revision>");
+    }
+    if !prior_revision.is_empty() && prior_revision != revision {
+        let _ = writeln!(xml, "<PriorRevision>{prior_revision}</PriorRevision>");
+    }
+    for file in &report.updated {
+        let (directory, name) = file
+            .iter()
+            .rposition(|&byte| byte == b'/')
+            .and_then(|pos| file.get(..pos).zip(file.get(pos + 1..)))
+            .unwrap_or((b"".as_slice(), file.as_slice()));
+        let full = escape(file, false);
+        let directory = escape(directory, false);
+        let name = escape(name, false);
+        let _ = writeln!(
+            xml,
+            "<Directory><Name>{directory}</Name><Updated><File>{name}</File><Directory>{directory}</Directory><FullName>{full}</FullName><Revision>{revision}</Revision><PriorRevision>{prior_revision}</PriorRevision></Updated></Directory>"
+        );
     }
     if !config.change_id.is_empty() {
         let _ = writeln!(
@@ -140,12 +276,12 @@ pub(crate) fn write_report(
             escape(&config.change_id, false)
         );
     }
-    let minutes = ended.secs.saturating_sub(report.started.secs).max(0) / 60;
+    let minutes = ended.secs.saturating_sub(started.secs).max(0) / 60;
     let values: [(&str, BString); 4] = [
         ("EndDateTime", date(ended).into()),
         ("EndTime", ended.secs.to_string().into()),
         ("ElapsedMinutes", minutes.to_string().into()),
-        ("UpdateReturnStatus", report.status.into()),
+        ("UpdateReturnStatus", report.status.as_str().into()),
     ];
     for (name, value) in values {
         let _ = writeln!(xml, "<{name}>{}</{name}>", escape(&value, false));

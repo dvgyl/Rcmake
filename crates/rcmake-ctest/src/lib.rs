@@ -12,7 +12,7 @@ use rcmake_host::{FileKind, Follow, Host, HostError, Stream, WriteMode};
 use rcmake_presets::{EnvSnapshot, PresetKind};
 
 use crate::cli::{Invocation, Mode};
-use crate::runner::run_tests;
+use crate::runner::{run_tests, run_tests_with_dashboard};
 
 mod build_and_test;
 mod cli;
@@ -166,7 +166,7 @@ pub fn main(argv: &[BString], host: Arc<dyn Host>) -> i32 {
     }
     match cli::parse(args, host.as_ref()).and_then(|mut invocation| {
         invocation.command = argv.to_vec();
-        dispatch(&host, &invocation, args)
+        dispatch(&host, &mut invocation, args)
     }) {
         Ok(code) => code,
         Err(error) => {
@@ -185,7 +185,7 @@ const USAGE: &[u8] = b"Usage\n\n  ctest [options]\n\n";
 
 fn dispatch(
     host: &Arc<dyn Host>,
-    invocation: &Invocation,
+    invocation: &mut Invocation,
     args: &[BString],
 ) -> Result<i32, String> {
     match &invocation.mode {
@@ -242,90 +242,12 @@ fn dispatch(
         Mode::Test => {
             let _environment = PresetEnvironment::apply(host.as_ref(), &invocation.environment);
             if invocation.scripts.is_empty() {
-                if let Some(code) = dashboard::run(host.as_ref(), invocation)? {
+                if let Some(code) = dashboard::run(host, invocation, |invocation, dashboard| {
+                    run_cli_tests(host, invocation, false, Some(dashboard))
+                }) {
                     return Ok(code);
                 }
-                let dir = &invocation.options.test_dir;
-                let metadata = host.metadata(dir, Follow::Yes);
-                if !metadata
-                    .as_ref()
-                    .is_ok_and(|meta| meta.kind == FileKind::Dir)
-                    && (invocation.build_dir.is_some()
-                        || invocation.preset.is_none()
-                        || !metadata
-                            .as_ref()
-                            .is_err_and(|error| error.kind == std::io::ErrorKind::NotFound))
-                {
-                    let message = metadata
-                        .err()
-                        .map_or_else(|| "Not a directory".into(), |error| error.os_message);
-                    host.write_out(
-                        Stream::Stderr,
-                        format!(
-                            "Failed to change working directory to \"{}\": {message}\n",
-                            dir.display()
-                        )
-                        .as_bytes(),
-                    );
-                    return Ok(1);
-                }
-                if args.is_empty()
-                    && host
-                        .metadata(&dir.join("CTestTestfile.cmake"), Follow::Yes)
-                        .is_err()
-                {
-                    host.write_out(Stream::Stdout, USAGE);
-                    host.write_out(Stream::Stderr, b"*********************************\nNo test configuration file found!\n*********************************\n");
-                    return Ok(1);
-                }
-                if invocation.actions.iter().any(|action| action == "test")
-                    && [
-                        "CTestConfiguration.ini",
-                        "DartConfiguration.tcl",
-                        "CTestTestfile.cmake",
-                    ]
-                    .iter()
-                    .all(|name| host.metadata(&dir.join(name), Follow::Yes).is_err())
-                {
-                    host.write_out(
-                        Stream::Stderr,
-                        format!(
-                            "Cannot find file: {}\n",
-                            dir.join("DartConfiguration.tcl").display()
-                        )
-                        .as_bytes(),
-                    );
-                }
-                return match run_tests(Arc::clone(host), invocation, true) {
-                    Ok(outcome) => Ok(outcome.exit_code),
-                    Err(error @ CtestError::DependencyCycle(_)) => {
-                        host.write_out(Stream::Stderr, format!("{error}\n").as_bytes());
-                        Ok(8)
-                    }
-                    Err(CtestError::Load(_)) => {
-                        host.write_out(Stream::Stderr, b"Errors while running CTest\n");
-                        Ok(8)
-                    }
-                    Err(error @ CtestError::Schedule(_)) => {
-                        host.write_out(Stream::Stderr, format!("{error}\n").as_bytes());
-                        reporting::failure_summary(host.as_ref(), dir);
-                        Ok(8)
-                    }
-                    Err(CtestError::TestList(file)) => {
-                        if !invocation.options.quiet {
-                            host.write_out(
-                                Stream::Stdout,
-                                format!("Test project {}\n", dir.display()).as_bytes(),
-                            );
-                        }
-                        host.write_out(
-                            Stream::Stderr,
-                            format!("{}\n", CtestError::TestList(file)).as_bytes(),
-                        );
-                        Ok(1)
-                    }
-                    Err(error) => Err(error.to_string()),
-                };
+                return run_cli_tests(host, invocation, args.is_empty(), None);
             }
             let mut code = 0;
             for script in &invocation.scripts {
@@ -334,6 +256,95 @@ fn dispatch(
             }
             Ok(code)
         }
+    }
+}
+
+fn run_cli_tests(
+    host: &Arc<dyn Host>,
+    invocation: &Invocation,
+    no_args: bool,
+    dashboard: Option<dart::Dashboard>,
+) -> Result<i32, String> {
+    let dir = &invocation.options.test_dir;
+    let metadata = host.metadata(dir, Follow::Yes);
+    if !metadata
+        .as_ref()
+        .is_ok_and(|meta| meta.kind == FileKind::Dir)
+        && (invocation.build_dir.is_some()
+            || invocation.preset.is_none()
+            || !metadata
+                .as_ref()
+                .is_err_and(|error| error.kind == std::io::ErrorKind::NotFound))
+    {
+        let message = metadata
+            .err()
+            .map_or_else(|| "Not a directory".into(), |error| error.os_message);
+        host.write_out(
+            Stream::Stderr,
+            format!(
+                "Failed to change working directory to \"{}\": {message}\n",
+                dir.display()
+            )
+            .as_bytes(),
+        );
+        return Ok(1);
+    }
+    if no_args
+        && host
+            .metadata(&dir.join("CTestTestfile.cmake"), Follow::Yes)
+            .is_err()
+    {
+        host.write_out(Stream::Stdout, USAGE);
+        host.write_out(Stream::Stderr, b"*********************************\nNo test configuration file found!\n*********************************\n");
+        return Ok(1);
+    }
+    if invocation.actions.iter().any(|action| action == "test")
+        && [
+            "CTestConfiguration.ini",
+            "DartConfiguration.tcl",
+            "CTestTestfile.cmake",
+        ]
+        .iter()
+        .all(|name| host.metadata(&dir.join(name), Follow::Yes).is_err())
+    {
+        host.write_out(
+            Stream::Stderr,
+            format!(
+                "Cannot find file: {}\n",
+                dir.join("DartConfiguration.tcl").display()
+            )
+            .as_bytes(),
+        );
+    }
+    match run_tests_with_dashboard(Arc::clone(host), invocation, true, dashboard) {
+        Ok(run) => Ok(run.outcome.exit_code),
+        Err(error @ CtestError::DependencyCycle(_)) => {
+            host.write_out(Stream::Stderr, format!("{error}\n").as_bytes());
+            Ok(8)
+        }
+        Err(CtestError::Load(_)) => {
+            host.write_out(Stream::Stderr, b"Errors while running CTest\n");
+            Ok(8)
+        }
+        Err(error @ CtestError::Schedule(_)) => {
+            host.write_out(Stream::Stderr, format!("{error}\n").as_bytes());
+            reporting::failure_summary(host.as_ref(), dir);
+            Ok(8)
+        }
+        Err(CtestError::TestList(file)) => {
+            if !invocation.options.quiet {
+                host.write_out(
+                    Stream::Stdout,
+                    format!("Test project {}\n", dir.display()).as_bytes(),
+                );
+            }
+            host.write_out(
+                Stream::Stderr,
+                format!("{}\n", CtestError::TestList(file)).as_bytes(),
+            );
+            Ok(1)
+        }
+        Err(error) => Err(error.to_string()),
     }
 }
 

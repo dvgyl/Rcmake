@@ -347,6 +347,17 @@ impl Evaluator<'_> {
         let diagnostic_operator = artifact_diagnostic_operator(call.name, kind, part);
         self.validate_artifact(call, name, target, target_type, kind, &diagnostic_operator)?;
 
+        if kind == ArtifactKind::LinkerLibraryFile
+            && matches!(
+                part,
+                ArtifactPart::Full | ArtifactPart::Name | ArtifactPart::Dir
+            )
+            && target_type != Some(b"STATIC_LIBRARY")
+            && self.dll_platform()
+        {
+            return Ok(BString::default());
+        }
+
         let exclude_postfix = match postfix.map(|value| value.as_slice()) {
             None | Some(b"POSTFIX:INCLUDE") => false,
             Some(b"POSTFIX:EXCLUDE") => true,
@@ -491,10 +502,8 @@ impl Evaluator<'_> {
 
     fn dll_platform(&self) -> bool {
         self.host
-            .definition(b"CMAKE_SYSTEM_NAME")
-            .is_some_and(|system| {
-                system.starts_with(b"Windows") || matches!(system.as_slice(), b"CYGWIN" | b"MSYS")
-            })
+            .definition(b"CMAKE_IMPORT_LIBRARY_SUFFIX")
+            .is_some_and(|suffix| !suffix.is_empty())
     }
 
     fn runtime_dlls(&mut self, call: Call<'_>) -> Value {
@@ -535,7 +544,8 @@ impl Evaluator<'_> {
         if !self.dll_platform() {
             return Ok(BString::default());
         }
-        let mut seen = HashSet::new();
+        let mut seen_targets = HashSet::new();
+        let mut seen_dirs = HashSet::new();
         let mut paths = BString::default();
         let part = if call.name == b"TARGET_RUNTIME_DLL_DIRS" {
             ArtifactPart::Dir
@@ -543,10 +553,11 @@ impl Evaluator<'_> {
             ArtifactPart::Full
         };
         for dependency in targets {
-            if !self
-                .host
-                .raw_property(dependency, b"TYPE")
-                .is_some_and(|kind| kind == "SHARED_LIBRARY")
+            if !seen_targets.insert(dependency)
+                || !self
+                    .host
+                    .raw_property(dependency, b"TYPE")
+                    .is_some_and(|kind| kind == "SHARED_LIBRARY")
             {
                 continue;
             }
@@ -557,7 +568,7 @@ impl Evaluator<'_> {
                 continue;
             };
             self.charge(path.len().max(1))?;
-            if !path.is_empty() && seen.insert(path.clone()) {
+            if !path.is_empty() && (part == ArtifactPart::Full || seen_dirs.insert(path.clone())) {
                 if !paths.is_empty() {
                     self.append(&mut paths, b";")?;
                 }

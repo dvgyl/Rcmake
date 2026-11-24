@@ -7,11 +7,11 @@ use rcmake_host::{
 };
 
 use crate::cli::Invocation;
-use crate::dart::{Configuration, Model, Tag};
+use crate::dart::{Configuration, Tag};
 use crate::junit::write_file;
 use rcmake_json::Value;
 
-use super::definition;
+use super::{Dashboard, definition};
 
 pub(crate) const PARTS: &[&str] = &[
     "Start",
@@ -28,7 +28,11 @@ pub(crate) const PARTS: &[&str] = &[
     "Done",
 ];
 
-pub(super) fn run(host: &dyn Host, invocation: &Invocation) -> Result<i32, String> {
+pub(super) fn run(
+    host: &dyn Host,
+    invocation: &Invocation,
+    dashboard: &Dashboard,
+) -> Result<i32, String> {
     let requested = definition(invocation, b"CTEST_SUBMIT_PARTS")
         .map(|value| list::split(value, list::Empty::Drop));
     if let Some(part) = requested
@@ -43,25 +47,12 @@ pub(super) fn run(host: &dyn Host, invocation: &Invocation) -> Result<i32, Strin
         );
         return Ok(64);
     }
-    let dir = &invocation.options.test_dir;
-    let config = Configuration::load(host, dir, &invocation.overwrite_configuration_file)
-        .map_err(|error| error.to_string())?;
-    let create_tag = || {
-        Tag::create(
-            host,
-            dir,
-            host.now(),
-            invocation.dashboard_model.unwrap_or(Model::Experimental),
-            None,
-            &config.nightly_start,
-        )
-    };
-    let tag = if invocation.actions.iter().any(|action| action == "start") {
-        create_tag()
-    } else {
-        Tag::read(host, dir).or_else(|_| create_tag())
-    }
-    .map_err(|error| error.to_string())?;
+    let Dashboard {
+        build: dir,
+        config,
+        tag,
+        ..
+    } = dashboard;
     let log = invocation.options.verbose && !invocation.options.quiet;
     let mut transport = Transport::new(
         false,
@@ -74,19 +65,19 @@ pub(super) fn run(host: &dyn Host, invocation: &Invocation) -> Result<i32, Strin
     );
     tls(
         host,
-        &config,
+        config,
         |name| definition(invocation, name).map(BString::from),
         log,
         &mut transport.flags,
     )?;
     let job = Submission {
-        url: submission_url(&config),
-        config: &config,
+        url: submission_url(config),
+        config,
         parts: requested,
         files: Vec::new(),
         subproject: None,
     };
-    submit(host, dir, &tag, &transport, &job).map(|result| if result.code == 0 { 0 } else { 64 })
+    submit(host, dir, tag, &transport, &job).map(|result| if result.code == 0 { 0 } else { 64 })
 }
 
 pub(crate) fn submission_url(config: &Configuration) -> String {
@@ -529,25 +520,27 @@ fn encode(value: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rcmake_host::{PureHost, RunOutput};
+    use rcmake_host::{HostError, PureHost, RunOutput};
 
     #[test]
-    fn rejects_header_file_arguments() {
+    fn rejects_header_file_arguments() -> Result<(), String> {
         let host = PureHost::default();
         let mut transport = Transport::new(false, false, None, None);
         assert!(transport.header(&host, "@secret".into()).is_err());
         assert!(!transport.flags.iter().any(|flag| flag == "--header"));
-        transport.header(&host, "X-Example: value".into()).unwrap();
+        transport.header(&host, "X-Example: value".into())?;
         assert!(
             transport
                 .flags
                 .windows(2)
                 .any(|pair| pair == ["--header", "X-Example: value"])
         );
+        Ok(())
     }
 
     #[test]
-    fn sends_literal_post_data_and_applies_the_inactivity_timeout() {
+    fn sends_literal_post_data_and_applies_the_inactivity_timeout()
+    -> Result<(), Box<dyn std::error::Error>> {
         let dir = if cfg!(windows) { "C:/work" } else { "/work" };
         for (configured, speed_time, timeout) in [
             (None, "120", None),
@@ -555,11 +548,15 @@ mod tests {
         ] {
             let host = PureHost::new(dir.into(), dir.into());
             let curl = Path::new(dir).join(format!("curl{}", std::env::consts::EXE_SUFFIX));
-            host.seed_file(&curl, b"").unwrap();
-            host.set_permissions(&curl, 0o755).unwrap();
+            host.seed_file(&curl, b"")?;
+            host.set_permissions(&curl, 0o755)?;
             host.env_set(b"PATH", Some(dir.as_bytes()));
             host.set_command_handler(move |_, request, _| {
-                let args = &request.pipeline[0].args;
+                let args = &request
+                    .pipeline
+                    .first()
+                    .ok_or_else(|| HostError::unsupported("Missing submission command"))?
+                    .args;
                 assert_eq!(request.timeout, timeout);
                 assert!(args.windows(2).any(|pair| pair == ["--speed-limit", "1"]));
                 assert!(
@@ -571,15 +568,13 @@ mod tests {
                         .any(|pair| pair == ["--data-raw", "@literal&key=value"])
                 );
                 Ok(RunOutput::default())
-            })
-            .unwrap();
-            Transport::new(false, false, configured, timeout)
-                .request(
-                    &host,
-                    Path::new(dir),
-                    Transfer::Post("@literal&key=value", "https://example.invalid/"),
-                )
-                .unwrap();
+            })?;
+            Transport::new(false, false, configured, timeout).request(
+                &host,
+                Path::new(dir),
+                Transfer::Post("@literal&key=value", "https://example.invalid/"),
+            )?;
         }
+        Ok(())
     }
 }

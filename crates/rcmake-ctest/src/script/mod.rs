@@ -414,7 +414,12 @@ impl<'a> Arguments<'a> {
             if takes_value(key) {
                 let multiple = matches!(
                     key,
-                    b"INCLUDE_LABEL" | b"EXCLUDE_LABEL" | b"PARTS" | b"FILES" | b"HTTPHEADER"
+                    b"INCLUDE_LABEL"
+                        | b"EXCLUDE_LABEL"
+                        | b"PARTS"
+                        | b"FILES"
+                        | b"HTTPHEADER"
+                        | b"LABELS"
                 );
                 while let Some(value) = args.next_if(|value| !takes_value(value) && !is_flag(value))
                 {
@@ -431,7 +436,9 @@ impl<'a> Arguments<'a> {
                         BString::from(key)
                     )));
                 }
-                if values.is_empty() && !matches!(key, b"PARALLEL_LEVEL" | b"PARTS" | b"FILES") {
+                if values.is_empty()
+                    && !matches!(key, b"PARALLEL_LEVEL" | b"PARTS" | b"FILES" | b"LABELS")
+                {
                     return Err(error(format!(
                         "requires a value for {}",
                         String::from_utf8_lossy(key)
@@ -539,6 +546,30 @@ fn with_capture(
         }
     }
     result
+}
+
+pub(crate) fn split_dashboard_command(
+    host: &Arc<dyn Host>,
+    command: &[u8],
+) -> Result<Vec<BString>, String> {
+    let mut interp = Interp::new(
+        InterpConfig {
+            host: Arc::clone(host),
+            mode: RunMode::Script,
+            cmake_root: PathBuf::new(),
+            cmake_command: cmake_executable(host.as_ref()),
+            cwd: host.initial_cwd(),
+            limits: Limits::default(),
+            diag: rcmake_diag::DiagOptions::default(),
+            defines: Vec::new(),
+            script_args: Vec::new(),
+        },
+        rcmake_commands::register_all,
+    );
+    split_command(&mut interp.cx(), command).map_err(|failure| match failure {
+        CmdError::Status(message) => message.to_string(),
+        CmdError::Reported => "Cannot parse the command line.".into(),
+    })
 }
 
 pub(crate) fn split_command(cx: &mut Cx<'_>, command: &[u8]) -> Result<Vec<BString>, CmdError> {

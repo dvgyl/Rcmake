@@ -49,7 +49,9 @@ pub(super) fn ctest_build(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
             let preset =
                 super::preset::select(cx, args, &source, rcmake_presets::PresetKind::Build)?;
             let custom = cx.var_or_empty(b"CTEST_BUILD_COMMAND");
-            let (cwd, command) = if custom.is_empty() || preset.is_some() {
+            let (cwd, command) = if let Some(custom) = custom_command(preset.is_some(), &custom) {
+                (build.clone(), split_command(cx, custom)?)
+            } else {
                 let config = args
                     .value(b"CONFIGURATION")
                     .cloned()
@@ -92,8 +94,6 @@ pub(super) fn ctest_build(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
                     command.extend(split_command(cx, &flags)?);
                 }
                 (cwd, command)
-            } else {
-                (build.clone(), split_command(cx, &custom)?)
             };
             let log = verbose() && !args.flag(b"QUIET");
             if log {
@@ -150,6 +150,10 @@ pub(super) fn ctest_build(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
             })
         },
     )
+}
+
+pub(crate) fn custom_command(preset: bool, command: &[u8]) -> Option<&[u8]> {
+    (!preset && !command.is_empty()).then_some(command)
 }
 
 pub(crate) fn diagnostics(output: &RunOutput, code: i32) -> (usize, usize, bool) {
