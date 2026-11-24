@@ -20,8 +20,8 @@ use crate::{
 };
 
 use super::provenance::{
-    author_warning, component, exports, generation_error, imported_package, imported_version,
-    package_variable, unknown_import,
+    author_warning, component, cps_default_components, exports, generation_error, imported_package,
+    imported_version, package_variable, unknown_import,
 };
 
 mod dependencies;
@@ -672,9 +672,14 @@ fn collect_links(
         )?;
         for name in list::split(&items, list::Empty::Drop) {
             if let Some(id) = model.find_target(dir, &name) {
-                match dependencies.name(id, target) {
-                    Ok(dependency) => push_unique(requires, dependency.record(model, package)?),
-                    Err(messages) => errors.extend(messages),
+                let components = model
+                    .target(id)
+                    .and_then(|target| cps_default_components(model, target));
+                for id in components.as_deref().unwrap_or(std::slice::from_ref(&id)) {
+                    match dependencies.name(*id, target) {
+                        Ok(dependency) => push_unique(requires, dependency.record(model, package)?),
+                        Err(messages) => errors.extend(messages),
+                    }
                 }
             } else {
                 push_unique(&mut usage.link_libraries, name);

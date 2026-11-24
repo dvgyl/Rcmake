@@ -23,7 +23,7 @@ pub fn build_commands(req: &BuildRequest<'_>) -> Result<Vec<BuildCommand>, GenEr
     };
     let mut base = vec![program, "-C".into(), req.build_dir.into()];
     if req.generator == GeneratorKind::NinjaMultiConfig
-        && let Some(config) = req.config
+        && let Some(config) = req.config.filter(|config| !config.is_empty())
     {
         let mut file = BString::from("build-");
         file.extend_from_slice(config);
@@ -88,6 +88,17 @@ mod tests {
             ]
         );
         assert!(commands.iter().all(|command| command.working_dir == "/b"));
+    }
+
+    #[test]
+    fn empty_config_uses_default_manifest() {
+        let mut req = request(GeneratorKind::NinjaMultiConfig, &[]);
+        req.config = Some(b"");
+        req.clean_first = false;
+        assert_eq!(
+            argv(&build_commands(&req).unwrap_or_default()),
+            ["/bin/ninja -C /b -j 4 -v"]
+        );
     }
 
     #[test]

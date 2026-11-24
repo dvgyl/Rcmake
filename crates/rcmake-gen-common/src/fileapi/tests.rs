@@ -385,6 +385,71 @@ fn discovers_queries_and_replaces_stale_replies() {
 }
 
 #[test]
+fn empty_directory_and_user_queries_publish_an_index() {
+    let host = PureHost::new("/src".into(), "/bin/cmake".into());
+    let build = Path::new("/build");
+    let reply = build.join(API_DIR).join("reply");
+    let (model, result) = fixture(Path::new("/src"), build);
+    host.create_dir_all(&build.join(API_DIR).join("query"))
+        .unwrap();
+    write_replies(&model, &result, &host, build).unwrap();
+    let (_, empty) = index(&host, &reply);
+    assert!(fields(get(&empty, "reply")).is_empty());
+    assert!(items(get(&empty, "objects")).is_empty());
+
+    host.env_set(b"CMAKE_CONFIG_DIR", Some(b"/settings"));
+    write(&host, Path::new("/settings/api/v1/query/__test-v1"), b"");
+    write(&host, Path::new("/settings/api/v1/query/codemodel-v2"), b"");
+    write_replies(&model, &result, &host, build).unwrap();
+    let (_, user) = index(&host, &reply);
+    let objects = items(get(&user, "objects"));
+    assert_eq!(objects.len(), 2);
+    let test = get(get(&user, "reply"), "__test-v1");
+    assert_eq!(test, entry(get(&user, "objects"), "kind", "__test"));
+    let object = follow(&host, &reply, test);
+    assert_eq!(uint(get(get(&object, "version"), "minor")), 3);
+}
+
+#[test]
+fn codemodel_merges_interface_includes_by_language_and_system_status() {
+    let host = PureHost::new("/src".into(), "/bin/cmake".into());
+    let build = Path::new("/build");
+    let reply = build.join(API_DIR).join("reply");
+    let (mut model, result) = fixture(Path::new("/src"), build);
+    model
+        .global
+        .props
+        .set("ENABLED_LANGUAGES".into(), "C;CXX".into());
+    let lib = model.find_target(DirId::ROOT, b"lib").unwrap();
+    let target = model.target_mut(lib).unwrap();
+    target.props.set(
+        "INTERFACE_INCLUDE_DIRECTORIES".into(),
+        "/common;/mixed;$<$<COMPILE_LANGUAGE:C>:/c-only>;$<INSTALL_INTERFACE:/install>".into(),
+    );
+    target.props.set(
+        "INTERFACE_SYSTEM_INCLUDE_DIRECTORIES".into(),
+        "$<$<COMPILE_LANGUAGE:CXX>:/mixed>".into(),
+    );
+    write(&host, &build.join(API_DIR).join("query/codemodel-v2"), b"");
+    write_replies(&model, &result, &host, build).unwrap();
+    let (_, index) = index(&host, &reply);
+    let codemodel = follow(&host, &reply, get(get(&index, "reply"), "codemodel-v2"));
+    let targets = get(&items(get(&codemodel, "configurations"))[0], "targets");
+    let lib = follow(&host, &reply, entry(targets, "name", "lib"));
+    assert_eq!(
+        get(&lib, "interfaceIncludes"),
+        &parse(
+            br#"[
+        {"path":"/common"},
+        {"path":"/mixed","languages":["C"]},
+        {"path":"/c-only","languages":["C"]},
+        {"path":"/mixed","isSystem":true,"languages":["CXX"]}
+    ]"#
+        )
+    );
+}
+
+#[test]
 fn links_object_replies_and_backtraces() {
     let host = PureHost::default();
     let build = Path::new("/build");

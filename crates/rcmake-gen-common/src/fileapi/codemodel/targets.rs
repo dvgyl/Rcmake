@@ -3,12 +3,13 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
-use rcmake_base::{list, truth::is_on};
+use rcmake_base::{hash::HashAlgo, list, truth::is_on};
 use rcmake_diag::{Backtrace, Frame, FrameKind};
 use rcmake_host::path::{from_native, from_native_cmake, to_native};
 use rcmake_model::{BT, DirId, Directory, InstallRule, ProjectModel, Target, TargetId, TargetKind};
 use rcmake_resolve::{
     ArtifactSet, CompileGroup, LinkFragmentRole, LinkKind, ResolvedTarget, TargetMetadata,
+    usage::UsageResolver,
 };
 
 use crate::{
@@ -17,11 +18,12 @@ use crate::{
 };
 
 use super::super::{
-    Bool, FileApi, Kind, Members, Object, UInt, Value, array, cache_value, hash_prefix, members,
-    object, relative,
+    Bool, FileApi, Kind, Members, Object, UInt, Value, array, cache_value, members, object,
+    relative,
 };
 use super::{
-    backtraces::Backtraces, file_prefix, indices, number, optional_array, projects::Project,
+    backtraces::Backtraces, file_prefix, includes::interface_includes, indices, number,
+    optional_array, projects::Project,
 };
 
 pub(super) struct TargetRef<'a> {
@@ -119,7 +121,7 @@ impl<'a> TargetReferences<'a> {
             directory.push(index);
             project.push(index);
             let dir = relative(&target.metadata.binary_dir, build);
-            let id = format!("{}::@{}", target.metadata.name, hash_prefix(&dir));
+            let id = target_id(&target.metadata.name, &dir);
             identities.insert(
                 target.id,
                 TargetRef {
@@ -219,7 +221,7 @@ impl FileApi<'_, '_> {
                     matches!(utility.kind, UtilityKind::AllBuild | UtilityKind::ZeroCheck)
                 }) {
                     let name = &utility.name;
-                    let id = format!("{name}::@{}", hash_prefix(&build));
+                    let id = target_id(name, &build);
                     let mut body = members([
                         ("codemodelVersion", Kind::Codemodel.version_json()),
                         ("name", Value::string(name.clone())),
@@ -251,14 +253,7 @@ impl FileApi<'_, '_> {
                             &mut body,
                             "dependencies",
                             dependencies.iter().cloned().chain(zero_check.map(|zero| {
-                                object([(
-                                    "id",
-                                    Value::string(format!(
-                                        "{}::@{}",
-                                        zero.name,
-                                        hash_prefix(&build)
-                                    )),
-                                )])
+                                object([("id", Value::string(target_id(&zero.name, &build)))])
                             })),
                         );
                     }
@@ -288,17 +283,23 @@ impl FileApi<'_, '_> {
         targets: &BTreeMap<TargetId, TargetRef<'_>>,
         install_rules: &BTreeMap<TargetId, Vec<&InstallRule>>,
     ) -> Result<Vec<Value>, GenError> {
+        let mut usage = UsageResolver::new(self.model);
         ids.iter()
             .filter_map(|id| targets.get(id))
             .map(|reference| {
                 let rules = install_rules
                     .get(&reference.target.id)
                     .map_or(&[][..], Vec::as_slice);
-                let value = self.target_object(config, reference, targets, rules);
+                let mut value = self.target_object(config, reference, targets, rules);
+                if let Some(target) = self.model.target(reference.target.id) {
+                    let includes =
+                        interface_includes(self.model, &mut usage, reference.target, target)?;
+                    optional_array(&mut value, "interfaceIncludes", includes);
+                }
                 let name = &reference.target.metadata.name;
                 let file = self
                     .writer
-                    .hashed(&file_prefix("target", name, config), &value)?;
+                    .hashed(&file_prefix("target", name, config), &Object(value))?;
                 Ok(object([
                     ("name", Value::string(name.clone())),
                     ("id", Value::string(reference.id.as_str())),
@@ -316,7 +317,7 @@ impl FileApi<'_, '_> {
         reference: &TargetRef<'_>,
         targets: &BTreeMap<TargetId, TargetRef<'_>>,
         rules: &[&InstallRule],
-    ) -> Value {
+    ) -> Members {
         let target = reference.target;
         let metadata = &target.metadata;
         let raw = self.model.target(target.id);
@@ -453,7 +454,7 @@ impl FileApi<'_, '_> {
         );
         self.target_sources(target, raw, &mut body, &mut graph);
         body.insert("backtraceGraph".into(), graph.into_json());
-        Object(body)
+        body
     }
 
     fn target_sources(
@@ -558,6 +559,11 @@ fn is_abstract(target: &Target) -> bool {
         || (target.kind == TargetKind::InterfaceLibrary
             && target.sources.is_empty()
             && target.file_sets.is_empty())
+}
+
+fn target_id(name: &rcmake_base::BString, dir: &[u8]) -> String {
+    let hash = HashAlgo::Sha3_256.hex_digest(dir);
+    format!("{name}::@{:.20}", hash)
 }
 
 fn dependency_backtrace<'a>(

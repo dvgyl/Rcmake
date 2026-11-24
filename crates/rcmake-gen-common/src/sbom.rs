@@ -48,12 +48,21 @@ pub fn render_sbom(
 }
 
 pub(crate) fn validate_format(format: &[u8]) -> Result<(), GenError> {
-    match format {
-        b"spdx" | b"spdx-3.0+json" | b"spdx-3.0.1+json" => Ok(()),
-        _ => Err(GenError::Invalid(
-            format!("Invalid SBOM format \"{}\".", BString::from(format)).into(),
-        )),
+    if valid_format(format) {
+        return Ok(());
     }
+    Err(generation_error([format!(
+        r#"CMAKE_INSTALL_SBOM_FORMATS given invalid format "{}"."#,
+        BString::from(format),
+    )
+    .into()]))
+}
+
+fn valid_format(format: &[u8]) -> bool {
+    matches!(
+        format,
+        b"" | b"spdx" | b"spdx-3.0+json" | b"spdx-3.0.1+json"
+    )
 }
 
 pub(crate) fn with_project_metadata(model: &ProjectModel, dir: DirId, spec: &SbomSpec) -> SbomSpec {
@@ -95,8 +104,12 @@ pub(crate) fn render_for_tree(
     mode: PreprocessMode,
     epoch_seconds: i64,
 ) -> Result<SbomOutput, GenError> {
-    if let Some(format) = &spec.format {
-        validate_format(format)?;
+    if let Some(format) = &spec.format
+        && !valid_format(format)
+    {
+        return Err(GenError::Invalid(
+            format!(r#"SBOM given invalid format "{format}"."#).into(),
+        ));
     }
     let explicit_default_license = spec.default_license.is_some();
     let spec = with_project_metadata(model, dir, spec);

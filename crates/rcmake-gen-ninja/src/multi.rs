@@ -1,6 +1,7 @@
 use std::path::Path;
 
 use rcmake_base::{BString, list};
+use rcmake_diag::{RenderOptions, format_paragraphs};
 use rcmake_gen_common::GenError;
 use rcmake_genex::ConfigId;
 
@@ -28,42 +29,34 @@ impl Selection {
         }
         let index = |name: &[u8]| configs.iter().position(|config| config.0 == name);
         let requested = setting(b"CMAKE_DEFAULT_BUILD_TYPE").filter(|value| !value.is_empty());
-        let default = match requested.as_ref() {
-            Some(name) => index(name).ok_or_else(|| generation_error(build_dir, format!(
-                "The configuration specified by CMAKE_DEFAULT_BUILD_TYPE ({name}) is not present in CMAKE_CONFIGURATION_TYPES"
-            )))?,
-            None => 0,
+        let default_name = requested.as_ref().unwrap_or(&configs[0].0);
+        let default = index(default_name).ok_or_else(|| config_error(format!(
+            "The configuration specified by CMAKE_DEFAULT_BUILD_TYPE ({default_name}) is not present in CMAKE_CONFIGURATION_TYPES"
+        )))?;
+        let sorted = |mut selection: Vec<usize>| {
+            selection.sort_unstable_by_key(|&index| &configs[index].0);
+            selection
         };
-        let cross_setting = setting(b"CMAKE_CROSS_CONFIGS");
-        let cross = match cross_setting.as_ref().map(|value| value.as_slice()) {
-            Some(b"all") => (0..configs.len()).collect(),
-            Some(value) => parse(value, index).ok_or_else(|| {
-                generation_error(
-                    build_dir,
-                    "CMAKE_CROSS_CONFIGS is not a subset of CMAKE_CONFIGURATION_TYPES",
-                )
-            })?,
-            None => Vec::new(),
-        };
-        let defaults = match setting(b"CMAKE_DEFAULT_CONFIGS").filter(|value| !value.is_empty()) {
-            Some(value) if cross.is_empty() && (requested.is_none() || value == "all") => {
-                return Err(generation_error(
-                    build_dir,
-                    "CMAKE_DEFAULT_CONFIGS cannot be used without CMAKE_DEFAULT_BUILD_TYPE or CMAKE_CROSS_CONFIGS",
-                ));
-            }
-            Some(value) if value == "all" && !cross.is_empty() => cross.clone(),
-            Some(value) => parse(&value, |name| {
+        let all = sorted((0..configs.len()).collect());
+        let cross_setting = setting(b"CMAKE_CROSS_CONFIGS").unwrap_or_default();
+        let cross = sorted(parse(&cross_setting, &all, index).ok_or_else(|| {
+            config_error("CMAKE_CROSS_CONFIGS is not a subset of CMAKE_CONFIGURATION_TYPES")
+        })?);
+        let defaults_setting = setting(b"CMAKE_DEFAULT_CONFIGS").filter(|value| !value.is_empty());
+        let defaults_name = defaults_setting.as_ref().unwrap_or(default_name);
+        if defaults_name != default_name && (default_name.is_empty() || cross.is_empty()) {
+            return Err(config_error(
+                "CMAKE_DEFAULT_CONFIGS cannot be used without CMAKE_DEFAULT_BUILD_TYPE or CMAKE_CROSS_CONFIGS",
+            ));
+        }
+        let defaults = sorted(
+            parse(defaults_name, &cross, |name| {
                 index(name).filter(|config| *config == default || cross.contains(config))
             })
             .ok_or_else(|| {
-                generation_error(
-                    build_dir,
-                    "CMAKE_DEFAULT_CONFIGS is not a subset of CMAKE_CROSS_CONFIGS",
-                )
+                config_error("CMAKE_DEFAULT_CONFIGS is not a subset of CMAKE_CROSS_CONFIGS")
             })?,
-            None => vec![default],
-        };
+        );
         Ok(Self {
             default,
             cross,
@@ -72,9 +65,33 @@ impl Selection {
     }
 }
 
-fn parse(value: &[u8], index: impl Fn(&[u8]) -> Option<usize>) -> Option<Vec<usize>> {
+fn config_error(message: impl AsRef<str>) -> GenError {
+    let body = format_paragraphs(
+        message.as_ref().as_bytes(),
+        2,
+        RenderOptions::default().wrap_width,
+    );
+    GenError::Invalid(
+        [b"CMake Error:\n".as_slice(), &body, b"\n\n"]
+            .concat()
+            .into(),
+    )
+}
+
+fn parse(
+    value: &[u8],
+    all: &[usize],
+    index: impl Fn(&[u8]) -> Option<usize>,
+) -> Option<Vec<usize>> {
+    let names = list::split(value, list::Empty::Drop);
+    if names.len() == 1 && names[0] == "all" {
+        return Some(all.to_vec());
+    }
     let mut selected = Vec::new();
-    for name in list::split(value, list::Empty::Drop) {
+    for name in names {
+        if name == "all" {
+            return None;
+        }
         let index = index(&name)?;
         if !selected.contains(&index) {
             selected.push(index);
@@ -110,6 +127,8 @@ pub(crate) fn emit_clean<'a>(
             },
         );
         ninja.binding(b"COMMAND", &command);
+        // Default aliases can run multiple clean edges that share outputs.
+        ninja.binding(b"pool", b"console");
     };
     for config in included {
         emit(config, &mut std::iter::once(config));
@@ -117,5 +136,37 @@ pub(crate) fn emit_clean<'a>(
     let mut cross = cross.peekable();
     if cross.peek().is_some() {
         emit(b"all", &mut cross);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_aliases_use_the_cross_set_for_all() -> Result<(), GenError> {
+        let configs = [ConfigId("Release".into()), ConfigId("Debug".into())];
+        let selection = Selection::new(&configs, Path::new("/build"), |name| match name {
+            b"CMAKE_DEFAULT_BUILD_TYPE" => Some("".into()),
+            b"CMAKE_CROSS_CONFIGS" => Some("Debug".into()),
+            b"CMAKE_DEFAULT_CONFIGS" => Some("all".into()),
+            _ => None,
+        })?;
+        assert_eq!(selection.default, 0);
+        assert_eq!(selection.cross, [1]);
+        assert_eq!(selection.defaults, [1]);
+        Ok(())
+    }
+
+    #[test]
+    fn default_alias_must_match_the_entry_manifest_without_cross_configs() {
+        let configs = [ConfigId("Release".into()), ConfigId("Debug".into())];
+        let select = |name| {
+            Selection::new(&configs, Path::new("/build"), |setting| {
+                (setting == b"CMAKE_DEFAULT_CONFIGS").then(|| BString::from(name))
+            })
+        };
+        assert!(select("Release").is_ok());
+        assert!(select("Debug").is_err());
     }
 }

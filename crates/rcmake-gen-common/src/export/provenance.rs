@@ -3,7 +3,7 @@ use rcmake_diag::{
     Backtrace, DiagCategory, Diagnostic, Effect, Location, MessageKind, RenderOptions, render,
 };
 use rcmake_genex::PreprocessMode;
-use rcmake_model::{DirId, ExportKind, InstallKind, ProjectModel, Target, TargetId};
+use rcmake_model::{DirId, ExportKind, InstallKind, ProjectModel, Target, TargetId, TargetKind};
 use rcmake_resolve::GenerationResult;
 
 use super::cps::export_name;
@@ -139,6 +139,42 @@ pub(crate) fn imported_package<'a>(model: &ProjectModel, target: &'a Target) -> 
                 .filter(|found| truth::is_on(found))
                 .map(|_| namespace)
         })
+}
+
+pub(super) fn cps_default_components(
+    model: &ProjectModel,
+    target: &Target,
+) -> Option<Vec<TargetId>> {
+    if !target.is_imported() || target.kind != TargetKind::InterfaceLibrary {
+        return None;
+    }
+    let source = target.props.get(b"_RCMAKE_CPS_SOURCE")?;
+    let package = imported_package(model, target)?;
+    // The CPS importer gives the default-component target the package name.
+    if target.name != package {
+        return None;
+    }
+    let links = target
+        .usage
+        .interface_link_libraries
+        .as_ref()
+        .filter(|links| !links.is_empty())?;
+    let namespace = [package, b"::"].concat();
+    links
+        .iter()
+        .map(|link| {
+            let component = link.text.value.strip_prefix(namespace.as_slice())?;
+            if component.is_empty() || component.windows(2).any(|pair| pair == b"::") {
+                return None;
+            }
+            let id = model.find_target(link.lookup_dir, &link.text.value)?;
+            let member = model.target(id)?;
+            (member.is_imported()
+                && member.name == link.text.value
+                && member.props.get(b"_RCMAKE_CPS_SOURCE") == Some(source))
+            .then_some(id)
+        })
+        .collect()
 }
 
 pub(crate) fn unknown_import(consumer: &Target, target: &Target) -> BString {

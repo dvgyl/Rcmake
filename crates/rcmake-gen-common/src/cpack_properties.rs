@@ -14,11 +14,17 @@ use crate::{GenError, configuration_pattern, genex, quoted_content, script_argum
 /// Return an error if a generator expression is invalid.
 pub fn render_cpack_properties(model: &ProjectModel) -> Result<Option<BString>, GenError> {
     let dir = DirId::ROOT;
-    let configs = if model.generator.is_some_and(|kind| kind.multi_config()) {
+    let configs = if let Some(generator) = model.generator.filter(|kind| kind.multi_config()) {
         model
             .definition(dir, b"CMAKE_CONFIGURATION_TYPES")
             .map_or_else(
-                || vec!["Debug".into(), "Release".into(), "RelWithDebInfo".into()],
+                || {
+                    generator
+                        .default_configuration_types()
+                        .iter()
+                        .map(|name| (*name).into())
+                        .collect()
+                },
                 |value| list::split(value, list::Empty::Drop),
             )
     } else {
