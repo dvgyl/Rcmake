@@ -30,6 +30,9 @@ pub(crate) fn exports(
     let mut exports = Vec::new();
     if mode == PreprocessMode::Install {
         for rule in &model.installs {
+            if model.dir_excluded_from_all(rule.dir) {
+                continue;
+            }
             let (set, namespace, destination, file) = match &rule.kind {
                 InstallKind::Export {
                     set,
@@ -149,17 +152,12 @@ pub(super) fn cps_default_components(
         return None;
     }
     let source = target.props.get(b"_RCMAKE_CPS_SOURCE")?;
-    let package = imported_package(model, target)?;
-    // The CPS importer gives the default-component target the package name.
-    if target.name != package {
-        return None;
-    }
     let links = target
         .usage
         .interface_link_libraries
         .as_ref()
         .filter(|links| !links.is_empty())?;
-    let namespace = [package, b"::"].concat();
+    let namespace = [target.name.as_slice(), b"::"].concat();
     links
         .iter()
         .map(|link| {

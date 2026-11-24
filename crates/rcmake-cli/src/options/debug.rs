@@ -11,17 +11,12 @@ pub(super) fn parse<'a>(
     profile_format: &mut Option<&'a [u8]>,
 ) -> Result<bool, String> {
     match arg.flag {
-        b"--debugger" | b"--debugger-pipe" | b"--debugger-dap-log" => {
-            let name = String::from_utf8_lossy(arg.flag);
-            if arg.flag != b"--debugger" {
-                let label = if arg.flag == b"--debugger-pipe" {
-                    "path"
-                } else {
-                    "file"
-                };
-                let _ = arg.required(format!("No {label} specified for {name}"))?;
-            }
-            return Err(format!("CMake was not built with support for {name}"));
+        b"--debugger" => return Err("CMake was not built with support for --debugger".into()),
+        b"--debugger-pipe" => {
+            arg.required("No path specified for --debugger-pipe")?;
+        }
+        b"--debugger-dap-log" => {
+            arg.required("No file specified for --debugger-dap-log")?;
         }
         b"--debug-output" => {
             out(host, "Running with debug output on.\n");

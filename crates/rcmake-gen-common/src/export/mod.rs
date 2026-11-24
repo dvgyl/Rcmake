@@ -276,16 +276,34 @@ fn render_target(
 ) -> Result<(), GenError> {
     let name = qualified_name(plan, target);
     let kind = target.kind.as_slice();
-    match kind {
-        b"EXECUTABLE" => {
-            out.extend_from_slice(b"add_executable(");
-            quote(out, &name);
+    let symbolic = kind == b"INTERFACE"
+        && target
+            .properties
+            .get(b"SYMBOLIC".as_slice())
+            .is_some_and(|value| rcmake_base::truth::is_on(value));
+    match (kind, symbolic) {
+        (b"INTERFACE", true) => {
+            out.extend_from_slice(
+                b"if(CMAKE_VERSION VERSION_GREATER_EQUAL \"4.2.0\")\n  add_library(",
+            );
+            target_argument(out, &name);
+            out.extend_from_slice(b" INTERFACE SYMBOLIC IMPORTED)\nelseif(CMAKE_VERSION VERSION_GREATER_EQUAL \"3.2.0\")\n  add_library(");
+            target_argument(out, &name);
+            out.extend_from_slice(b" INTERFACE IMPORTED)\n  set_target_properties(");
+            target_argument(out, &name);
+            out.extend_from_slice(b" PROPERTIES SYMBOLIC TRUE)\nendif()\n");
         }
-        b"STATIC" | b"SHARED" | b"MODULE" | b"INTERFACE" | b"OBJECT" | b"UNKNOWN" => {
+        (b"EXECUTABLE", _) => {
+            out.extend_from_slice(b"add_executable(");
+            target_argument(out, &name);
+            out.extend_from_slice(b" IMPORTED)\n");
+        }
+        (b"STATIC" | b"SHARED" | b"MODULE" | b"INTERFACE" | b"OBJECT" | b"UNKNOWN", _) => {
             out.extend_from_slice(b"add_library(");
-            quote(out, &name);
+            target_argument(out, &name);
             out.push(b' ');
             out.extend_from_slice(kind);
+            out.extend_from_slice(b" IMPORTED)\n");
         }
         _ => {
             return Err(output_error(
@@ -297,15 +315,15 @@ fn render_target(
             ));
         }
     }
-    out.extend_from_slice(b" IMPORTED)\n");
     let mut properties = target
         .properties
         .iter()
         .filter(|(property, _)| {
-            !matches!(
-                property.as_slice(),
-                b"INTERFACE_CXX_MODULE_SETS" | b"INTERFACE_FILE_SETS_CXX_MODULES"
-            )
+            !(symbolic && property.as_slice() == b"SYMBOLIC")
+                && !matches!(
+                    property.as_slice(),
+                    b"INTERFACE_CXX_MODULE_SETS" | b"INTERFACE_FILE_SETS_CXX_MODULES"
+                )
         })
         .collect::<Vec<_>>();
     if !properties.is_empty() {
@@ -526,8 +544,20 @@ fn qualified_name(plan: &ExportPlan, target: &ExportedTarget) -> BString {
 
 fn start_properties(out: &mut BString, name: &[u8]) {
     out.extend_from_slice(b"set_target_properties(");
-    quote(out, name);
+    target_argument(out, name);
     out.extend_from_slice(b" PROPERTIES\n");
+}
+
+fn target_argument(out: &mut BString, name: &[u8]) {
+    if !name.is_empty()
+        && name
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"_.+-".contains(byte))
+    {
+        out.extend_from_slice(name);
+    } else {
+        quote(out, name);
+    }
 }
 
 fn start_property(out: &mut BString, key: &[u8]) {

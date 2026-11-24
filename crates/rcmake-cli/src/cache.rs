@@ -114,6 +114,34 @@ fn parse_entry(line: &[u8]) -> Option<(&[u8], CacheType, &[u8])> {
 
 pub(crate) fn apply(cache: &mut Cache, def: CacheDefine) {
     insert(cache, &def.name, def.value, def.ty);
+    if let Some(entry) = cache.get_mut(&def.name)
+        && entry.help.is_empty()
+    {
+        entry.help = command_line_help(&def.name).into();
+    }
+}
+
+fn command_line_help(name: &[u8]) -> &'static str {
+    if name == b"CMAKE_COMPILE_WARNING_AS_ERROR" {
+        return "Specify whether to treat warnings on compile as errors. This variable is used to initialize the COMPILE_WARNING_AS_ERROR property on all the targets.";
+    }
+    if let Some(name) = name.strip_prefix(b"CMAKE_") {
+        let has_language = |suffix: &[u8]| {
+            name.strip_suffix(suffix).is_some_and(|language| {
+                !language.is_empty()
+                    && language
+                        .iter()
+                        .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+            })
+        };
+        if has_language(b"_CLANG_TIDY") {
+            return "Default value for the <LANG>_CLANG_TIDY target property; names a clang-tidy command (with arguments) run alongside compilation. Applies only when <LANG> is C, CXX, OBJC, or OBJCXX.";
+        }
+        if has_language(b"_CPPCHECK") {
+            return "Default value for the <LANG>_CPPCHECK target property; names a cppcheck command (with arguments) run alongside compilation. Applies only when <LANG> is C or CXX.";
+        }
+    }
+    "No help, variable specified on the command line."
 }
 
 pub(crate) fn insert(cache: &mut Cache, name: &[u8], value: BString, ty: Option<CacheType>) {
@@ -139,6 +167,9 @@ pub(crate) fn insert(cache: &mut Cache, name: &[u8], value: BString, ty: Option<
 pub(crate) fn save(host: &dyn Host, dir: &Path, cache: &Cache) -> HostResult<()> {
     let mut data = BString::from("# This is the CMakeCache file.\n\n");
     for (name, entry) in sorted(cache) {
+        if name.iter().any(|byte| matches!(byte, b'\n' | b'\r' | b'"')) {
+            continue;
+        }
         for line in entry
             .help
             .split(|b| *b == b'\n')
@@ -149,6 +180,27 @@ pub(crate) fn save(host: &dyn Host, dir: &Path, cache: &Cache) -> HostResult<()>
             data.push(b'\n');
         }
         write_entry(&mut data, name, entry.ty, &entry.value);
+        if entry.value.contains(&b'\n') {
+            let warning = format!("Value of {name} contained a newline");
+            host.write_out(
+                Stream::Stderr,
+                format!("CMake Warning:\n  {warning}; truncating\n\n\n").as_bytes(),
+            );
+            data.extend_from_slice(
+                format!("# WARNING: {warning} and was\n#  truncated. Original value:\n").as_bytes(),
+            );
+            let mut lines = entry.value.split(|byte| *byte == b'\n');
+            if let Some(first) = lines.next().filter(|line| !line.is_empty()) {
+                data.extend_from_slice(b"# ");
+                data.extend_from_slice(first);
+                data.push(b'\n');
+            }
+            for line in lines {
+                data.extend_from_slice(b"# \\n");
+                data.extend_from_slice(line);
+                data.push(b'\n');
+            }
+        }
         if entry.advanced {
             write_entry(
                 &mut data,
@@ -185,9 +237,6 @@ pub(crate) fn save(host: &dyn Host, dir: &Path, cache: &Cache) -> HostResult<()>
 }
 
 fn write_entry(data: &mut BString, name: &[u8], ty: CacheType, value: &[u8]) {
-    if name.contains(&b'\n') || name.contains(&b'\r') || name.contains(&b'"') {
-        return;
-    }
     let quote_name = name.contains(&b':') || name.starts_with(b"#") || name.starts_with(b"//");
     if quote_name {
         data.push(b'"');

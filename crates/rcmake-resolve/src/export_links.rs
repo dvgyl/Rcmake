@@ -82,12 +82,11 @@ pub(crate) fn qualify(
                         .or_else(|| dependency.props.get(b"_RCMAKE_FIND_PACKAGE_NAME"))
                     {
                         packages.insert(package.clone());
-                        if expand_components
-                            && dependency.name == *package
-                            && let Some(components) = cps_default_component_names(model, dependency)
-                        {
-                            return Ok(Some(list::join(components)));
-                        }
+                    }
+                    if expand_components
+                        && let Some(components) = cps_default_component_names(model, dependency)
+                    {
+                        return Ok(Some(list::join(components)));
                     }
                     return Ok(Some(dependency.name.clone()));
                 }

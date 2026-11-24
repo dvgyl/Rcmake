@@ -2,6 +2,10 @@ mod interface_paths;
 
 use indexmap::{IndexMap, IndexSet, map::Entry};
 use rcmake_base::{BString, list, path_lex::Lexical};
+use rcmake_diag::{
+    Diagnostic, Effect, Location, MessageKind, PolicyId, PolicyStatus, RenderOptions,
+    render as render_diagnostic,
+};
 use rcmake_genex::{ConfigId, EvalContext, GenexNode, PreprocessMode, TargetHandle, render};
 use rcmake_model::{
     DirId, ExportDependencyMode, ExportSet, InstallKind, InstallRule, ProjectModel, Target,
@@ -53,7 +57,7 @@ pub(crate) fn resolve_exports(
         }
     }
     let mut plans = Vec::new();
-    for rule in &model.installs {
+    for (index, rule) in model.installs.iter().enumerate() {
         if model.dir_excluded_from_all(rule.dir) {
             continue;
         }
@@ -66,7 +70,20 @@ pub(crate) fn resolve_exports(
         else {
             continue;
         };
-        let members = export_set(model, set)?;
+        let members = model.exports.get(set).ok_or_else(|| {
+            ResolveError::Message(
+                format!("CMake Error: INSTALL(EXPORT) given unknown export \"{set}\"\n").into(),
+            )
+        })?;
+        let legacy_interface = (2..)
+            .map_while(|arg| {
+                model
+                    .global
+                    .props
+                    .get(format!("_RCMAKE_INSTALL_{index}_ARG{arg}").as_bytes())
+            })
+            .any(|arg| arg == b"EXPORT_LINK_INTERFACE_LIBRARIES");
+        validate_members(model, &members.targets, Some(set))?;
         let mut include_rules = IndexMap::<TargetId, Vec<_>>::new();
         for &index in &members.install_rules {
             let Some(rule) = model.installs.get(index) else {
@@ -104,7 +121,10 @@ pub(crate) fn resolve_exports(
                                 .iter()
                                 .any(|c| target.config.matches(c)))
                 }),
-                Some(install),
+                ExportOptions {
+                    install: Some(install),
+                    legacy_interface,
+                },
             )?;
             if let Some(rules) = include_rules.get(&id) {
                 add_include_destinations(usage, id, rules, &mut target)?;
@@ -130,7 +150,7 @@ pub(crate) fn resolve_exports(
 
     let build_plans = build_exports(model)?;
     let mut build_catalog = ExportCatalog::new();
-    for (plan, members, _) in build_plans.values() {
+    for BuildExport { plan, members, .. } in build_plans.values() {
         let placement = ExportPlacement {
             set: plan.set.clone(),
             namespace: plan.namespace.clone(),
@@ -140,9 +160,15 @@ pub(crate) fn resolve_exports(
             build_catalog.entry(id).or_default().push(placement.clone());
         }
     }
-    for (mut plan, members, export_packages) in build_plans.into_values() {
+    for BuildExport {
+        mut plan,
+        members,
+        export_packages,
+        legacy_interface,
+    } in build_plans.into_values()
+    {
         let mut packages = IndexSet::new();
-        let members: Vec<_> = members.into_iter().collect();
+        validate_members(model, &members, None)?;
         for &id in &members {
             let mut target = export_target(
                 model,
@@ -150,25 +176,22 @@ pub(crate) fn resolve_exports(
                 &plan.set,
                 id,
                 targets.iter().filter(|target| target.id == id),
-                None,
+                ExportOptions {
+                    install: None,
+                    legacy_interface,
+                },
             )?;
-            if !plan
-                .targets
-                .iter()
-                .any(|existing| existing.name == target.name)
-            {
-                packages.extend(export_links::qualify(
-                    model,
-                    id,
-                    &members,
-                    &plan.namespace,
-                    PreprocessMode::Build,
-                    &build_catalog,
-                    &mut target,
-                )?);
-                target.source_sets = source_sets::export(model, usage, configs, id, None)?;
-                plan.targets.push(target);
-            }
+            packages.extend(export_links::qualify(
+                model,
+                id,
+                &members,
+                &plan.namespace,
+                PreprocessMode::Build,
+                &build_catalog,
+                &mut target,
+            )?);
+            target.source_sets = source_sets::export(model, usage, configs, id, None)?;
+            plan.targets.push(target);
         }
         if export_packages {
             plan.package_dependencies = package_dependencies(model, &plan.set, packages);
@@ -178,10 +201,15 @@ pub(crate) fn resolve_exports(
     Ok(plans)
 }
 
-type BuildExports = IndexMap<BString, (ExportPlan, IndexSet<TargetId>, bool)>;
+struct BuildExport {
+    plan: ExportPlan,
+    members: Vec<TargetId>,
+    export_packages: bool,
+    legacy_interface: bool,
+}
 
-fn build_exports(model: &ProjectModel) -> Result<BuildExports, ResolveError> {
-    let mut build_plans = BuildExports::new();
+fn build_exports(model: &ProjectModel) -> Result<IndexMap<BString, BuildExport>, ResolveError> {
+    let mut build_plans = IndexMap::<BString, BuildExport>::new();
     let props = &model.global.props;
     let count = props
         .get(b"_RCMAKE_BUILD_EXPORT_COUNT")
@@ -237,6 +265,7 @@ fn build_exports(model: &ProjectModel) -> Result<BuildExports, ResolveError> {
         let mut namespace = BString::default();
         let mut file = export_filename(&set);
         let mut export_packages = false;
+        let mut legacy_interface = false;
         let mut append = false;
         let mut cxx_modules_directory = None;
         while let Some((key, rest)) = options.split_first() {
@@ -255,27 +284,29 @@ fn build_exports(model: &ProjectModel) -> Result<BuildExports, ResolveError> {
                 }
                 b"EXPORT_PACKAGE_DEPENDENCIES" => export_packages = true,
                 b"APPEND" => append = true,
-                b"EXPORT_LINK_INTERFACE_LIBRARIES" => {}
+                b"EXPORT_LINK_INTERFACE_LIBRARIES" => legacy_interface = true,
                 _ => return Err(invalid_export_record()),
             }
         }
         let file = absolute_path(&directory.binary_dir, &file);
-        if append && let Some((_, members, _)) = build_plans.get_mut(&file) {
-            members.extend(ids);
+        if append && let Some(existing) = build_plans.get_mut(&file) {
+            existing.members.extend(ids);
+            existing.legacy_interface |= legacy_interface;
         } else {
             build_plans.insert(
                 file.clone(),
-                (
-                    ExportPlan {
+                BuildExport {
+                    plan: ExportPlan {
                         set,
                         namespace,
                         file,
                         cxx_modules_directory,
                         ..ExportPlan::default()
                     },
-                    ids.into_iter().collect(),
+                    members: ids,
                     export_packages,
-                ),
+                    legacy_interface,
+                },
             );
         }
     }
@@ -383,14 +414,119 @@ fn export_filename(set: &[u8]) -> BString {
     [set, b".cmake"].concat().into()
 }
 
+#[derive(Clone, Copy)]
+struct ExportOptions<'a> {
+    install: Option<&'a InstallManifest>,
+    legacy_interface: bool,
+}
+
+impl ResolveError {
+    /// Add the export diagnostic when an exported target has no linker language.
+    pub fn with_export_linker_language(self, model: &ProjectModel) -> Self {
+        let Self::Message(message) = &self else {
+            return self;
+        };
+        let Some(name) = message.strip_prefix(b"Cannot determine link language for target ") else {
+            return self;
+        };
+        let Some((id, target)) = model.targets().find(|(_, target)| target.name == name) else {
+            return self;
+        };
+        let contains = |set: &BString| {
+            model
+                .exports
+                .get(set)
+                .is_some_and(|set| set.targets.contains(&id))
+        };
+        let installed = model.installs.iter().any(|rule| {
+            !model.dir_excluded_from_all(rule.dir)
+                && match &rule.kind {
+                    InstallKind::Export { set, .. } => contains(set),
+                    InstallKind::PackageInfo(spec) => contains(&spec.export),
+                    _ => false,
+                }
+        });
+        let exported = build_exports(model).is_ok_and(|plans| {
+            plans.values().any(|plan| plan.members.contains(&id))
+        }) || model.build_exports.iter().any(|rule| {
+            matches!(&rule.kind, rcmake_model::ExportKind::PackageInfo(spec) if contains(&spec.export))
+        });
+        if !installed && !exported {
+            return self;
+        }
+        let error = export_diagnostic(
+            model,
+            target,
+            format!(
+                "Exporting the target \"{}\" is not allowed since its linker language cannot be determined",
+                target.name,
+            ),
+        );
+        Self::Message(
+            format!(
+                "CMake Error: CMake can not determine linker language for target: {}\n{error}",
+                target.name
+            )
+            .into(),
+        )
+    }
+}
+
+fn export_diagnostic(model: &ProjectModel, target: &Target, body: impl Into<BString>) -> BString {
+    render_diagnostic(
+        &Diagnostic {
+            kind: MessageKind::Error,
+            effect: Effect::Fatal,
+            category: None,
+            policy: None,
+            location: crate::cxx_modules::generation_location(model, target),
+            body: body.into(),
+        },
+        &RenderOptions {
+            relative_base: Some(model.dir(DirId::ROOT).source_dir.clone()),
+            ..RenderOptions::default()
+        },
+    )
+}
+
+fn validate_members(
+    model: &ProjectModel,
+    members: &[TargetId],
+    install_set: Option<&BString>,
+) -> Result<(), ResolveError> {
+    let mut seen = IndexSet::new();
+    for &id in members {
+        if seen.insert(id) {
+            continue;
+        }
+        let target = model.target(id).ok_or_else(invalid_export_record)?;
+        let body = if let Some(set) = install_set {
+            format!(
+                "install(EXPORT \"{set}\" ...) includes target \"{}\" more than once in the export set.",
+                target.name,
+            )
+        } else {
+            format!("given target \"{}\" more than once.", target.name)
+        };
+        return Err(ResolveError::Message(export_diagnostic(
+            model, target, body,
+        )));
+    }
+    Ok(())
+}
+
 fn export_target<'a>(
     model: &ProjectModel,
     usage: &mut UsageResolver<'_>,
     set: &[u8],
     id: TargetId,
     resolved: impl Iterator<Item = &'a ResolvedTarget>,
-    install: Option<&InstallManifest>,
+    options: ExportOptions<'_>,
 ) -> Result<ExportedTarget, ResolveError> {
+    let ExportOptions {
+        install,
+        legacy_interface,
+    } = options;
     let target = model
         .target(id)
         .filter(|target| !target.is_imported())
@@ -409,6 +545,7 @@ fn export_target<'a>(
         kind: kind.into(),
         ..ExportedTarget::default()
     };
+    export_properties(model, target, &mut exported)?;
     if target
         .props
         .get(b"ENABLE_EXPORTS")
@@ -490,6 +627,30 @@ fn export_target<'a>(
                     .insert(facts.config.0.clone(), path);
             }
         }
+        let legacy_key = [
+            b"LINK_INTERFACE_LIBRARIES_",
+            facts.config.0.to_ascii_uppercase().as_slice(),
+        ]
+        .concat();
+        if target.kind != TargetKind::InterfaceLibrary
+            && let Some(value) = target
+                .props
+                .get(&legacy_key)
+                .or_else(|| target.props.get(b"LINK_INTERFACE_LIBRARIES"))
+        {
+            if legacy_interface {
+                properties.insert("IMPORTED_LINK_INTERFACE_LIBRARIES".into(), value.clone());
+            } else if target.policies.policies.get(PolicyId::new(22)) == PolicyStatus::New {
+                return Err(ResolveError::Message(export_diagnostic(
+                    model,
+                    target,
+                    format!(
+                        "Target \"{}\" has policy CMP0022 enabled, but also has old-style LINK_INTERFACE_LIBRARIES properties populated, but it was exported without the EXPORT_LINK_INTERFACE_LIBRARIES to export the old-style properties",
+                        target.name,
+                    ),
+                )));
+            }
+        }
         if properties.contains_key(b"IMPORTED_LOCATION".as_slice()) {
             if let Some(soname) = &facts.artifacts.soname_file {
                 let mut value = if darwin {
@@ -543,6 +704,44 @@ fn export_target<'a>(
         }
     }
     Ok(exported)
+}
+
+fn export_properties(
+    model: &ProjectModel,
+    target: &Target,
+    exported: &mut ExportedTarget,
+) -> Result<(), ResolveError> {
+    for key in [b"SPDX_LICENSE".as_slice(), b"SYMBOLIC"] {
+        if let Some(value) = target.props.get(key) {
+            exported.properties.insert(key.into(), value.clone());
+        }
+    }
+    let Some(keys) = target.props.get(b"EXPORT_PROPERTIES") else {
+        return Ok(());
+    };
+    for key in list::split(keys, list::Empty::Drop) {
+        let reason = if key.starts_with(b"IMPORTED_") || key.starts_with(b"INTERFACE_") {
+            "IMPORTED_* and INTERFACE_* properties are reserved."
+        } else {
+            let Some(value) = target.props.get(&key) else {
+                continue;
+            };
+            if !value.windows(2).any(|bytes| bytes == b"$<") {
+                exported.properties.insert(key, value.clone());
+                continue;
+            }
+            "this property contains a generator expression.  This is not allowed."
+        };
+        return Err(ResolveError::Message(export_diagnostic(
+            model,
+            target,
+            format!(
+                "Target \"{}\" contains property \"{key}\" in EXPORT_PROPERTIES but {reason}",
+                target.name,
+            ),
+        )));
+    }
+    Ok(())
 }
 
 pub(crate) fn export_name(target: &Target) -> &BString {

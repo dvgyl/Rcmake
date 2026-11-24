@@ -42,6 +42,21 @@ pub(crate) fn run(
     bin: &Path,
     queries: &[Query],
 ) -> Result<bool, Failure> {
+    let outcome = generate(interp, host, bin, queries);
+    if outcome.is_err()
+        && let Err(error) = common::fileapi::write_error_replies(interp.cx().project(), host, bin)
+    {
+        crate::emit_cli_error(host, error.to_string());
+    }
+    outcome
+}
+
+fn generate(
+    interp: &mut Interp,
+    host: &dyn Host,
+    bin: &Path,
+    queries: &[Query],
+) -> Result<bool, Failure> {
     let Some(kind) = interp.cx().project().generator else {
         return Ok(false);
     };
@@ -50,10 +65,16 @@ pub(crate) fn run(
     }
     let configs = if kind.multi_config() {
         match interp.cx().var(b"CMAKE_CONFIGURATION_TYPES") {
-            Some(value) => split(&value, Empty::Drop)
-                .into_iter()
-                .map(ConfigId)
-                .collect(),
+            Some(value) => {
+                let mut configs: Vec<_> = split(&value, Empty::Drop)
+                    .into_iter()
+                    .map(ConfigId)
+                    .collect();
+                if configs.is_empty() {
+                    configs.push(ConfigId(BString::default()));
+                }
+                configs
+            }
             None => kind
                 .default_configuration_types()
                 .iter()
@@ -94,7 +115,12 @@ pub(crate) fn run(
     let mut result = match resolved {
         Ok(result) => result,
         Err(rcmake_resolve::ResolveError::Reported(_)) => return Err(Failure::Reported),
-        Err(err) => return Err(err.to_string().into()),
+        Err(err) => {
+            return Err(err
+                .with_export_linker_language(interp.cx().project())
+                .to_string()
+                .into());
+        }
     };
     if result.graphs.iter().flat_map(|graph| &graph.steps).any(|step| {
         matches!(step, rcmake_resolve::BuildStep::Collate { depend_info, .. } if depend_info.database_info.is_some())
@@ -163,7 +189,7 @@ pub(crate) fn run(
         }
         error => Failure::Message(error.to_string()),
     })?;
-    let result = match kind {
+    let generated = match kind {
         GeneratorKind::Ninja => rcmake_gen_ninja::generate_single_config_with_model(
             &result,
             host,
@@ -181,7 +207,7 @@ pub(crate) fn run(
         }
         GeneratorKind::Xcode | GeneratorKind::VisualStudio(_) => Ok(()),
     };
-    match result {
+    match generated {
         Ok(()) => {
             if !queries.is_empty() || interp.cx().var_is_on(b"CTEST_USE_LAUNCHERS") {
                 let project_name = interp.cx().var_or_empty(b"CMAKE_PROJECT_NAME");
@@ -194,6 +220,8 @@ pub(crate) fn run(
                 )
                 .map_err(|err| err.to_string())?;
             }
+            common::fileapi::write_replies(interp.cx().project(), &result, host, bin)
+                .map_err(|err| err.to_string())?;
             Ok(true)
         }
         Err(GenError::Unimplemented(_)) => Ok(false),
@@ -478,8 +506,7 @@ fn write_common(
             )?;
         }
     }
-    file_generate::write(interp.cx().project(), result, host)?;
-    common::fileapi::write_replies(interp.cx().project(), result, host, bin)
+    file_generate::write(interp.cx().project(), result, host)
 }
 
 fn write_exports(
@@ -584,12 +611,12 @@ fn write(host: &dyn Host, path: &Path, content: Result<BString, GenError>) -> Re
 
 #[cfg(test)]
 mod tests {
-    use rcmake_host::{Follow, ProcessResult, ReadRange, RunOutput, Stream};
+    use rcmake_host::{Follow, HostError, ProcessResult, ReadRange, RunOutput, Stream};
 
     use super::*;
 
     #[test]
-    fn configure_and_build_collect_instrumentation() {
+    fn configure_and_build_collect_instrumentation() -> Result<(), Box<dyn std::error::Error>> {
         let host = crate::driver_tests::project_host();
         for (module, content) in [
             (
@@ -602,10 +629,9 @@ mod tests {
             host.seed_file(
                 &Path::new("/usr/local/share/cmake-4.5/Modules").join(module),
                 content.as_bytes(),
-            )
-            .unwrap();
+            )?;
         }
-        host.seed_file(Path::new("/tools/cc"), b"").unwrap();
+        host.seed_file(Path::new("/tools/cc"), b"")?;
         let source = Path::new("/work/CMakeLists.txt");
         let bin = Path::new("/work/out");
         let api = bin.join(".cmake/instrumentation/v1");
@@ -615,9 +641,8 @@ set(CMAKE_C_COMPILER /tools/cc)
 project(example LANGUAGES C)
 add_executable(app main.c)
 "#;
-        host.seed_file(source, project).unwrap();
-        host.seed_file(Path::new("/work/main.c"), b"int main(void) { return 0; }\n")
-            .unwrap();
+        host.seed_file(source, project)?;
+        host.seed_file(Path::new("/work/main.c"), b"int main(void) { return 0; }\n")?;
 
         let invoke = |args: &[&str]| {
             let argv: Vec<_> = args.iter().copied().map(BString::from).collect();
@@ -642,14 +667,12 @@ add_executable(app main.c)
             ]);
         };
         let read = |name: &str| {
-            BString::from(
-                host.read(&bin.join(name), ReadRange::All { limit: 65536 })
-                    .unwrap(),
-            )
+            host.read(&bin.join(name), ReadRange::All { limit: 65536 })
+                .map(BString::from)
         };
         configure();
-        let manifest = read("build.ninja");
-        let commands = read("compile_commands.json");
+        let manifest = read("build.ninja")?;
+        let commands = read("compile_commands.json")?;
         assert!(!manifest.to_string().contains("--instrument"));
         assert!(!commands.to_string().contains("--instrument"));
         assert!(host.metadata(&api, Follow::Yes).is_err());
@@ -662,27 +685,35 @@ cmake_instrumentation(API_VERSION 1 DATA_VERSION 1.2
   CALLBACK record)
 "#,
         );
-        host.seed_file(source, &instrumented).unwrap();
+        host.seed_file(source, &instrumented)?;
         let callback_dir = data.clone();
         host.set_command_handler(move |host, request, _| {
-            let command = &request.pipeline[0];
+            let command = request
+                .pipeline
+                .first()
+                .ok_or_else(|| HostError::unsupported("Missing command."))?;
             if command.program == "record" {
-                let index = path::to_native(&command.args[0]);
+                let argument = command
+                    .args
+                    .first()
+                    .ok_or_else(|| HostError::unsupported("Missing index argument."))?;
+                let index = path::to_native(argument);
                 assert!(index.starts_with(callback_dir.join("index")));
                 assert!(
                     host.metadata(Path::new("/work/out/CMakeCache.txt"), Follow::Yes)
                         .is_ok()
                 );
                 let index = host.read(&index, ReadRange::All { limit: 65536 })?;
-                let index =
-                    rcmake_json::parse(&index, &rcmake_json::ReadOptions::default()).unwrap();
+                let index = rcmake_json::parse(&index, &rcmake_json::ReadOptions::default())
+                    .map_err(|error| HostError::unsupported(error.to_string()))?;
                 let rcmake_json::Value::Object(fields) = index else {
                     panic!("Expected an index object.");
                 };
-                let rcmake_json::Value::String(hook) = &fields[b"hook".as_slice()] else {
+                let Some(rcmake_json::Value::String(hook)) = fields.get(b"hook".as_slice()) else {
                     panic!("Expected the hook name.");
                 };
-                let rcmake_json::Value::Array(snippets) = &fields[b"snippets".as_slice()] else {
+                let Some(rcmake_json::Value::Array(snippets)) = fields.get(b"snippets".as_slice())
+                else {
                     panic!("Expected a list of snippet files.");
                 };
                 let roles: Vec<_> = snippets
@@ -695,7 +726,7 @@ cmake_instrumentation(API_VERSION 1 DATA_VERSION 1.2
                             host.metadata(&callback_dir.join(path::to_native(name)), Follow::Yes)
                                 .is_ok()
                         );
-                        name.split(|byte| *byte == b'-').next().unwrap()
+                        name.split(|byte| *byte == b'-').next().unwrap_or_default()
                     })
                     .collect();
                 let expected: &[&[u8]] = match hook.as_slice() {
@@ -720,13 +751,12 @@ cmake_instrumentation(API_VERSION 1 DATA_VERSION 1.2
                 results: vec![ProcessResult::Exited(0)],
                 ..RunOutput::default()
             })
-        })
-        .unwrap();
+        })?;
         configure();
-        let rules = read("CMakeFiles/rules.ninja")
+        let rules = read("CMakeFiles/rules.ninja")?
             .to_string()
             .replace("$ ", " ");
-        let wrapped = read("build.ninja").to_string().replace("$ ", " ");
+        let wrapped = read("build.ninja")?.to_string().replace("$ ", " ");
         assert!(rules.contains("--instrument $COMMAND"));
         assert!(
             wrapped.contains("COMPILE_INSTRUMENTED")
@@ -735,14 +765,12 @@ cmake_instrumentation(API_VERSION 1 DATA_VERSION 1.2
         assert!(wrapped.contains("--command-type compile"));
         assert!(wrapped.contains("--instrument --command-type link"));
         assert!(
-            host.read_dir(&api.join("query/generated"))
-                .unwrap()
+            host.read_dir(&api.join("query/generated"))?
                 .iter()
                 .any(|entry| entry.name.starts_with(b"query-"))
         );
         assert!(
-            host.read_dir(&data.join("content"))
-                .unwrap()
+            host.read_dir(&data.join("content"))?
                 .iter()
                 .any(|entry| entry.name.starts_with(b"cmake-"))
         );
@@ -765,18 +793,15 @@ cmake_instrumentation(API_VERSION 1 DATA_VERSION 1.2
         let after_interrupt = host.stream_bytes(Stream::Stdout).to_string();
         assert_eq!(after_interrupt.strip_prefix(&stdout), Some("preCMakeBuild"));
         let snippet = host
-            .read_dir(&data)
-            .unwrap()
+            .read_dir(&data)?
             .into_iter()
             .find(|entry| entry.name.starts_with(b"cmakeBuild-"))
-            .unwrap();
-        let snippet = host
-            .read(
-                &data.join(path::to_native(&snippet.name)),
-                ReadRange::All { limit: 65536 },
-            )
-            .unwrap();
-        let snippet = rcmake_json::parse(&snippet, &rcmake_json::ReadOptions::default()).unwrap();
+            .ok_or("Missing build snippet.")?;
+        let snippet = host.read(
+            &data.join(path::to_native(&snippet.name)),
+            ReadRange::All { limit: 65536 },
+        )?;
+        let snippet = rcmake_json::parse(&snippet, &rcmake_json::ReadOptions::default())?;
         let rcmake_json::Value::Object(fields) = snippet else {
             panic!("Expected a snippet object.");
         };
@@ -789,13 +814,14 @@ cmake_instrumentation(API_VERSION 1 DATA_VERSION 1.2
             Some(&rcmake_json::Value::Int(2))
         );
 
-        host.seed_file(source, project).unwrap();
+        host.seed_file(source, project)?;
         configure();
-        assert_eq!(read("build.ninja"), manifest);
-        assert_eq!(read("compile_commands.json"), commands);
+        assert_eq!(read("build.ninja")?, manifest);
+        assert_eq!(read("compile_commands.json")?, commands);
         assert!(
             host.metadata(&api.join("query/generated"), Follow::Yes)
                 .is_err()
         );
+        Ok(())
     }
 }

@@ -2,27 +2,25 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
-use rcmake_base::BString;
 use rcmake_host::{DirEntry, FileKind, Follow, Host, ReadRange, path::to_native};
 use rcmake_json::{ReadOptions, Value};
 
-use super::{
-    Array, FileApi, Kind, Members, Object, ReplyWriter, UInt, array, index_name, json_bytes,
-    object, read_dir,
-};
+use super::{Array, FileApi, Kind, Members, Object, ReplyWriter, UInt, array, object, read_dir};
 use crate::{GenError, write_error};
 
 const QUERY_LIMIT: u64 = 4 * 1024 * 1024;
 
 impl FileApi<'_, '_> {
-    pub(super) fn read_queries(&mut self, dir: &Path) -> Result<Members, GenError> {
+    pub(super) fn read_queries(
+        &mut self,
+        dir: &Path,
+    ) -> Result<Option<(Members, TestReplies)>, GenError> {
         let host = self.writer.host;
-        let old_entries = read_dir(host, self.writer.dir)?;
         let user = user_query_dir(host);
         let mut query_exists = false;
         let mut reply = Members::new();
         let mut tests = BTreeMap::new();
-        for root in user.as_deref().into_iter().chain([dir]) {
+        for root in [dir].into_iter().chain(user.as_deref()) {
             query_exists |= host
                 .metadata(root, Follow::Yes)
                 .is_ok_and(|meta| meta.kind == FileKind::Dir);
@@ -31,29 +29,14 @@ impl FileApi<'_, '_> {
                     continue;
                 }
                 let response = if entry.name.starts_with(b"client-") {
-                    self.client_queries(&dir.join(to_native(&entry.name)), &mut tests)?
+                    self.client_queries(&root.join(to_native(&entry.name)), &mut tests)?
                 } else {
                     self.stateless(&entry.name, &mut tests)?
                 };
                 reply.insert(entry.name, response);
             }
         }
-        self.writer.retain_file_aliases(&old_entries)?;
-        // The caller writes an index for a nonempty reply and lists public objects.
-        if (query_exists && reply.is_empty()) || !tests.is_empty() {
-            let index = object([
-                ("cmake", self.cmake()),
-                (
-                    "objects",
-                    array(self.objects.values().cloned().chain(tests.into_values())),
-                ),
-                ("reply", Object(reply)),
-            ]);
-            self.writer
-                .write(&index_name(host, &old_entries), &json_bytes(&index))?;
-            return Ok(Members::new());
-        }
-        Ok(reply)
+        Ok(query_exists.then_some((reply, tests)))
     }
 
     fn client_queries(&mut self, dir: &Path, tests: &mut TestReplies) -> Result<Value, GenError> {
@@ -146,6 +129,7 @@ impl FileApi<'_, '_> {
     fn respond(&mut self, kind: QueryKind, tests: &mut TestReplies) -> Result<Value, GenError> {
         match kind {
             QueryKind::Public(kind) => self.reference(kind),
+            QueryKind::Test(_) if self.failed => Ok(error("no buildsystem generated")),
             QueryKind::Test(major) => {
                 if let Some(reference) = tests.get(&major) {
                     return Ok(reference.clone());
@@ -194,7 +178,7 @@ fn user_query_dir(host: &dyn Host) -> Option<PathBuf> {
 }
 
 impl ReplyWriter<'_> {
-    fn retain_file_aliases(&mut self, old_entries: &[DirEntry]) -> Result<(), GenError> {
+    pub(super) fn retain_file_aliases(&mut self, old_entries: &[DirEntry]) -> Result<(), GenError> {
         if self.files.is_empty() {
             return Ok(());
         }
@@ -266,7 +250,7 @@ fn preserves_unicode_case_aliases_during_reply_cleanup() -> Result<(), Box<dyn s
     Ok(())
 }
 
-fn error(message: &str) -> Value {
+pub(super) fn error(message: &str) -> Value {
     object([("error", Value::string(message))])
 }
 
@@ -274,7 +258,7 @@ fn member<'a>(object: &'a Members, key: &[u8]) -> Option<&'a Value> {
     object.get(key).filter(|value| **value != Value::Null)
 }
 
-type TestReplies = BTreeMap<u32, Value>;
+pub(super) type TestReplies = BTreeMap<u32, Value>;
 
 enum QueryKind {
     Public(Kind),

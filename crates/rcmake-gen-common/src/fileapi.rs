@@ -10,8 +10,11 @@ use std::path::Path;
 use rcmake_base::{
     BString, CMAKE_VERSION_MAJOR, CMAKE_VERSION_MINOR, CMAKE_VERSION_PATCH, CMAKE_VERSION_STR,
     hash::HashAlgo,
+    list::{self, Empty},
 };
-use rcmake_host::{DirEntry, FileKind, Host, WriteMode, path::from_native_cmake, path::to_native};
+use rcmake_host::{
+    DirEntry, FileKind, Follow, Host, WriteMode, path::from_native_cmake, path::to_native,
+};
 use rcmake_json::Value::{self, Array, Bool, Object, UInt};
 use rcmake_model::{DirId, GeneratorKind, ProjectModel};
 use rcmake_resolve::{ConfigureMetadata, GenerationResult};
@@ -33,6 +36,25 @@ pub fn write_replies(
     result: &GenerationResult,
     host: &dyn Host,
     build_dir: &Path,
+) -> Result<(), GenError> {
+    write_index(model, result, host, build_dir, false)
+}
+
+/// Report a failed generation to File API clients and preserve earlier replies.
+pub fn write_error_replies(
+    model: &ProjectModel,
+    host: &dyn Host,
+    build_dir: &Path,
+) -> Result<(), GenError> {
+    write_index(model, &GenerationResult::default(), host, build_dir, true)
+}
+
+fn write_index(
+    model: &ProjectModel,
+    result: &GenerationResult,
+    host: &dyn Host,
+    build_dir: &Path,
+    failed: bool,
 ) -> Result<(), GenError> {
     let api_dir = build_dir.join(API_DIR);
     let reply_dir = api_dir.join("reply");
@@ -56,17 +78,25 @@ pub fn write_replies(
         build: &build,
         writer: &mut writer,
         objects: BTreeMap::new(),
+        failed,
     };
-    let replies = api.read_queries(&api_dir.join("query"))?;
-    if !replies.is_empty() {
+    if let Some((replies, tests)) = api.read_queries(&api_dir.join("query"))? {
         let index = object([
             ("cmake", api.cmake()),
-            ("objects", array(api.objects.into_values())),
+            (
+                "objects",
+                array(api.objects.into_values().chain(tests.into_values())),
+            ),
             ("reply", Object(replies)),
         ]);
-        writer.write(&index_name(host, &old_entries), &json_bytes(&index))?;
+        let prefix = if failed { "error" } else { "index" };
+        writer.write(&index_name(host, &old_entries, prefix), &json_bytes(&index))?;
     }
-    writer.remove_stale(old_entries)
+    if !failed {
+        writer.retain_file_aliases(&old_entries)?;
+        writer.remove_stale(old_entries)?;
+    }
+    Ok(())
 }
 
 fn read_dir(host: &dyn Host, dir: &Path) -> Result<Vec<DirEntry>, GenError> {
@@ -79,17 +109,23 @@ fn read_dir(host: &dyn Host, dir: &Path) -> Result<Vec<DirEntry>, GenError> {
     }
 }
 
-fn index_name(host: &dyn Host, old: &[DirEntry]) -> String {
+fn index_name(host: &dyn Host, old: &[DirEntry], prefix: &str) -> String {
     let now = host.now();
-    let stamp = format!("index-{:020}-{:09}-", now.secs, now.nanos);
-    let id = old
-        .iter()
-        .filter_map(|entry| entry.name.as_slice().strip_prefix(stamp.as_bytes()))
-        .filter_map(|suffix| suffix.strip_suffix(b".json"))
-        .filter_map(|id| std::str::from_utf8(id).ok()?.parse::<u64>().ok())
-        .max()
-        .map_or(0, |id| id.saturating_add(1));
-    format!("{stamp}{id:04}.json")
+    let old: BTreeSet<_> = old.iter().map(|entry| entry.name.as_slice()).collect();
+    let name = |offset| {
+        let ticks = now.nanos as usize / 100_000 + offset;
+        let seconds = now.secs.saturating_add((ticks / 10_000) as i64);
+        let time = jiff::Timestamp::from_second(seconds).unwrap_or(jiff::Timestamp::UNIX_EPOCH);
+        format!(
+            "{prefix}-{}-{:04}.json",
+            time.strftime("%Y-%m-%dT%H-%M-%S"),
+            ticks % 10_000
+        )
+    };
+    (0..old.len())
+        .map(name)
+        .find(|candidate| !old.contains(candidate.as_bytes()))
+        .unwrap_or_else(|| name(old.len()))
 }
 
 struct ReplyWriter<'a> {
@@ -177,6 +213,7 @@ struct FileApi<'a, 'w> {
     build: &'a [u8],
     writer: &'w mut ReplyWriter<'a>,
     objects: BTreeMap<Kind, Value>,
+    failed: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -224,15 +261,18 @@ impl Kind {
 
 impl FileApi<'_, '_> {
     fn reference(&mut self, kind: Kind) -> Result<Value, GenError> {
+        if self.failed && kind != Kind::ConfigureLog {
+            return Ok(queries::error("no buildsystem generated"));
+        }
         if let Some(reference) = self.objects.get(&kind) {
             return Ok(reference.clone());
         }
         let mut body = match kind {
             Kind::Codemodel => self.codemodel()?,
-            Kind::ConfigureLog => configure_log(&self.result.metadata, self.build),
+            Kind::ConfigureLog => self.configure_log()?,
             Kind::Cache => cache(self.model),
             Kind::CmakeFiles => self.cmake_files(),
-            Kind::Toolchains => toolchains(&self.result.metadata),
+            Kind::Toolchains => toolchains(self.model, &self.result.metadata),
         };
         body.insert("kind".into(), Value::string(kind.name()));
         body.insert("version".into(), kind.version_json());
@@ -338,10 +378,57 @@ impl FileApi<'_, '_> {
             }
             Object(input)
         });
-        members([
+        let mut body = members([
             ("paths", paths(self.source, self.build)),
             ("inputs", array(inputs)),
-        ])
+        ]);
+        if !self.model.glob_checks.is_empty() {
+            let globs = self.model.glob_checks.iter().map(|(key, check)| {
+                let mut glob = members([
+                    ("expression", Value::string(key.expression.clone())),
+                    ("paths", strings(&list::split(&check.files, Empty::Drop))),
+                ]);
+                for (name, enabled) in [
+                    ("recurse", key.recursive),
+                    ("listDirectories", key.directories),
+                    ("followSymlinks", key.follow),
+                ] {
+                    if enabled {
+                        glob.insert(name.into(), Bool(true));
+                    }
+                }
+                if let Some(relative) = &key.relative {
+                    glob.insert("relative".into(), Value::string(relative.clone()));
+                }
+                Object(glob)
+            });
+            body.insert("globsDependent".into(), array(globs));
+        }
+        body
+    }
+
+    fn configure_log(&self) -> Result<Members, GenError> {
+        let metadata = &self.result.metadata;
+        let path = metadata.configure_log.clone().unwrap_or_else(|| {
+            from_native_cmake(&to_native(self.build).join("CMakeFiles/CMakeConfigureLog.yaml"))
+        });
+        if self.failed {
+            let log_path = to_native(&path);
+            if let Err(error) = self.writer.host.metadata(&log_path, Follow::Yes) {
+                if error.kind != ErrorKind::NotFound {
+                    return Err(write_error(&log_path, error));
+                }
+                if let Some(dir) = log_path.parent() {
+                    self.writer
+                        .host
+                        .create_dir_all(dir)
+                        .map_err(|err| write_error(dir, err))?;
+                }
+                let content = crate::configure_log::render(metadata)?;
+                crate::write_if_changed(self.writer.host, &log_path, &content)?;
+            }
+        }
+        Ok(configure_log(path))
     }
 }
 
@@ -379,44 +466,88 @@ fn cache(model: &ProjectModel) -> Members {
     members([("entries", array(entries))])
 }
 
-fn toolchains(metadata: &ConfigureMetadata) -> Members {
+fn toolchains(model: &ProjectModel, metadata: &ConfigureMetadata) -> Members {
     let mut languages: Vec<_> = metadata.toolchains.iter().collect();
     languages.sort_by_key(|(language, _)| *language);
-    let entries = languages.into_iter().map(|(language, toolchain)| {
-        let mut compiler = members([(
-            "implicit",
-            object([
-                ("includeDirectories", strings(&toolchain.implicit_includes)),
-                ("linkDirectories", strings(&toolchain.implicit_link_dirs)),
-                ("linkFrameworkDirectories", array([])),
-                ("linkLibraries", array([])),
-            ]),
-        )]);
-        for (key, value) in [
-            ("path", &toolchain.compiler_path),
-            ("id", &toolchain.compiler_id),
-            ("version", &toolchain.compiler_version),
-        ] {
-            if !value.is_empty() {
-                compiler.insert(key.into(), Value::string(value.clone()));
+    let entries = languages
+        .into_iter()
+        .filter(|(language, _)| language.as_slice() != b"NONE")
+        .map(|(language, toolchain)| {
+            let definition = |suffix: &[u8]| {
+                let variable = [b"CMAKE_", language.as_slice(), b"_", suffix].concat();
+                model
+                    .dirs()
+                    .find_map(|(dir, _)| model.definition(dir, &variable))
+            };
+            let mut implicit = Members::new();
+            for (key, suffix, fallback) in [
+                (
+                    "includeDirectories",
+                    b"IMPLICIT_INCLUDE_DIRECTORIES".as_slice(),
+                    toolchain.implicit_includes.as_slice(),
+                ),
+                (
+                    "linkDirectories",
+                    b"IMPLICIT_LINK_DIRECTORIES",
+                    toolchain.implicit_link_dirs.as_slice(),
+                ),
+                (
+                    "linkFrameworkDirectories",
+                    b"IMPLICIT_LINK_FRAMEWORK_DIRECTORIES",
+                    &[],
+                ),
+                ("linkLibraries", b"IMPLICIT_LINK_LIBRARIES", &[]),
+            ] {
+                if let Some(value) = definition(suffix) {
+                    implicit.insert(key.into(), strings(&list::split(value, Empty::Drop)));
+                } else if !fallback.is_empty() {
+                    implicit.insert(key.into(), strings(fallback));
+                }
             }
-        }
-        object([
-            ("language", Value::string(language.clone())),
-            ("compiler", Object(compiler)),
-            (
-                "sourceFileExtensions",
-                strings(&toolchain.source_extensions),
-            ),
-        ])
-    });
+            let mut compiler = members([("implicit", Object(implicit))]);
+            for (key, suffix, fallback) in [
+                (
+                    "path",
+                    b"COMPILER".as_slice(),
+                    Some(&toolchain.compiler_path),
+                ),
+                ("id", b"COMPILER_ID", Some(&toolchain.compiler_id)),
+                (
+                    "version",
+                    b"COMPILER_VERSION",
+                    Some(&toolchain.compiler_version),
+                ),
+                ("target", b"COMPILER_TARGET", None),
+                ("commandFragment", b"COMPILER_ARG1", None),
+            ] {
+                if let Some(value) = definition(suffix)
+                    .filter(|value| key != "commandFragment" || !value.is_empty())
+                    .or_else(|| fallback.filter(|value| !value.is_empty()))
+                {
+                    compiler.insert(key.into(), Value::string(value.clone()));
+                }
+            }
+            let mut entry = members([
+                ("language", Value::string(language.clone())),
+                ("compiler", Object(compiler)),
+            ]);
+            if let Some(value) = definition(b"SOURCE_FILE_EXTENSIONS") {
+                entry.insert(
+                    "sourceFileExtensions".into(),
+                    strings(&list::split(value, Empty::Drop)),
+                );
+            } else if !toolchain.source_extensions.is_empty() {
+                entry.insert(
+                    "sourceFileExtensions".into(),
+                    strings(&toolchain.source_extensions),
+                );
+            }
+            Object(entry)
+        });
     members([("toolchains", array(entries))])
 }
 
-fn configure_log(metadata: &ConfigureMetadata, build: &[u8]) -> Members {
-    let path = metadata.configure_log.clone().unwrap_or_else(|| {
-        from_native_cmake(&to_native(build).join("CMakeFiles/CMakeConfigureLog.yaml"))
-    });
+fn configure_log(path: BString) -> Members {
     members([
         ("path", Value::string(path)),
         (
@@ -481,3 +612,5 @@ fn strings(items: &[BString]) -> Value {
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_extra;

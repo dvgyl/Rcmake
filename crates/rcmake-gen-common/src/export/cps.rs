@@ -74,7 +74,17 @@ pub(crate) fn render_for_tree(
     warnings: &mut BTreeSet<BString>,
 ) -> Result<CpsFileSet, GenError> {
     let set = model.exports.get(&spec.export).ok_or_else(|| {
-        GenError::Invalid(format!("Unknown export set \"{}\".", spec.export).into())
+        if install.is_some() {
+            GenError::Invalid(
+                format!(
+                    "\nCMake Error: INSTALL(PACKAGE_INFO) given unknown export \"{}\"\n",
+                    spec.export
+                )
+                .into(),
+            )
+        } else {
+            GenError::Invalid(format!("Unknown export set \"{}\".", spec.export).into())
+        }
     })?;
     let appendix = spec.appendix.as_deref().map(Vec::as_slice);
     let file_name = naming::package_file_name(&spec.package, appendix, spec.lower_case_file)
@@ -631,14 +641,10 @@ fn interface_value(
                         format!(r#"$<{name}:...> expression in "{property}" of target "{target}""#)
                     },
                 );
-                let mut error = generation_error([format!(
+                return Err(generation_error([format!(
                     "{subject} contains a generator expression.  This is not allowed."
                 )
-                .into()]);
-                if let GenError::Invalid(message) = &mut error {
-                    message.extend_from_slice(b"CMake Generate step failed.  Build files cannot be regenerated correctly.");
-                }
-                return Err(error);
+                .into()]));
             }
         }
     }

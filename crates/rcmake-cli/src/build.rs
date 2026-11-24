@@ -7,7 +7,7 @@ use rcmake_host::{
     CommandSpec, FileKind, Follow, Host, Input, Output, ProcessResult, RunRequest, Stream, path,
 };
 use rcmake_model::GeneratorKind;
-use rcmake_presets::{BuildSettings, PresetKind, PresetSettings};
+use rcmake_presets::{BuildSettings, EnvSnapshot, PresetKind, PresetSettings, ResolvedPreset};
 
 use crate::options::{split_flag, take_value, unknown_mode_option};
 use crate::presets::{self, Listing};
@@ -170,15 +170,21 @@ fn parse(host: &dyn Host, args: &[BString]) -> Result<Options, String> {
             opts.jobs = Some(parse_jobs(job_flag, value.unwrap_or_default(), false)?);
             continue;
         }
-        let mut required = || {
+        let mut required = |missing: Option<&str>| {
             inline
                 .or_else(|| take_value(&mut args))
                 .filter(|value| !value.is_empty())
-                .ok_or_else(|| invalid_value(flag))
+                .ok_or_else(|| missing.map_or_else(|| invalid_value(flag), str::to_owned))
         };
         match flag {
-            b"--preset" => opts.preset = Some(required()?.into()),
-            b"--presets-file" => opts.presets_file = Some(resolve_cli_path(host, required()?)),
+            b"--preset" => {
+                opts.preset =
+                    Some(required(Some("CMake Error: No preset specified for --preset"))?.into());
+            }
+            b"--presets-file" => {
+                let value = required(Some("CMake Error: No file specified for --presets-file"))?;
+                opts.presets_file = Some(resolve_cli_path(host, value));
+            }
             b"--list-presets" => {
                 let value = inline.or_else(|| take_value(&mut args));
                 opts.list_presets = Some(
@@ -186,9 +192,9 @@ fn parse(host: &dyn Host, args: &[BString]) -> Result<Options, String> {
                         .map_err(|err| format!("CMake Error: {err}"))?,
                 );
             }
-            b"--config" => opts.config = Some(required()?.into()),
+            b"--config" => opts.config = Some(required(None)?.into()),
             b"--target" | b"-t" => {
-                opts.targets.push(required()?.into());
+                opts.targets.push(required(None)?.into());
                 while let Some(target) = take_value(&mut args) {
                     opts.targets.push(target.into());
                 }
@@ -214,15 +220,16 @@ fn parse(host: &dyn Host, args: &[BString]) -> Result<Options, String> {
 }
 
 impl Options {
-    fn apply_preset(&mut self, settings: BuildSettings) {
-        if self.jobs.is_none() {
-            self.jobs = settings.jobs.map(|n| {
-                if n == 0 {
-                    Jobs::Default
-                } else {
-                    Jobs::Count(n)
-                }
-            });
+    fn apply_preset(&mut self, settings: BuildSettings) -> Result<(), &'static str> {
+        if self.jobs.is_none()
+            && let Some(count) = settings.jobs
+        {
+            let jobs = match i32::try_from(count) {
+                Ok(0) => Jobs::Default,
+                Ok(_) => Jobs::Count(count),
+                Err(_) => return Err("The build preset \"jobs\" value is too large."),
+            };
+            self.jobs = Some(jobs);
         }
         if self.targets.is_empty() {
             self.targets = settings.targets.unwrap_or_default();
@@ -236,7 +243,37 @@ impl Options {
             native.append(&mut self.native);
             self.native = native;
         }
+        Ok(())
     }
+}
+
+fn preset_source(host: &dyn Host, dir: Option<&Path>) -> PathBuf {
+    let Some(dir) = dir else {
+        return host.initial_cwd();
+    };
+    cache::load(host, dir)
+        .ok()
+        .and_then(|cache| {
+            cache
+                .get(b"CMAKE_HOME_DIRECTORY")
+                .map(|entry| path::to_native(&entry.value))
+        })
+        .unwrap_or_else(|| dir.to_path_buf())
+}
+
+fn resolve_preset(host: &dyn Host, opts: &Options, name: &[u8]) -> Result<ResolvedPreset, i32> {
+    let custom = opts.presets_file.as_deref();
+    if opts.dir.is_none() {
+        return presets::resolve_for_mode(host, PresetKind::Build, name, custom);
+    }
+    let source = preset_source(host, opts.dir.as_deref());
+    let presets = presets::load(host, &source, custom)?;
+    presets
+        .resolve(PresetKind::Build, name, &EnvSnapshot::from_host(host))
+        .map_err(|error| {
+            crate::emit_cli_error(host, error.message);
+            1
+        })
 }
 
 pub(crate) fn run(argv: &[BString], args: &[BString], host: &dyn Host) -> i32 {
@@ -247,29 +284,34 @@ pub(crate) fn run(argv: &[BString], args: &[BString], host: &dyn Host) -> i32 {
     if let Some(listing) = opts.list_presets {
         return presets::list(
             host,
-            &host.initial_cwd(),
+            &preset_source(host, opts.dir.as_deref()),
             opts.presets_file.as_deref(),
             listing,
         );
     }
 
     let mut env: BTreeMap<_, _> = host.env_all().into_iter().collect();
-    if let Some(name) = &opts.preset {
-        if opts.dir.is_some() {
-            return usage(host, "");
+    if opts.jobs.is_none()
+        && let Some(value) = env.get(b"CMAKE_BUILD_PARALLEL_LEVEL".as_slice())
+    {
+        match parse_jobs(b"CMAKE_BUILD_PARALLEL_LEVEL", value, true) {
+            Ok(jobs) => opts.jobs = Some(jobs),
+            Err(message) => return usage(host, &message),
         }
-        let preset = match presets::resolve_for_mode(
-            host,
-            PresetKind::Build,
-            name,
-            opts.presets_file.as_deref(),
-        ) {
+    }
+    if let Some(name) = &opts.preset {
+        let preset = match resolve_preset(host, &opts, name) {
             Ok(preset) => preset,
             Err(code) => return code,
         };
-        opts.dir = preset.binary_dir.map(|dir| resolve_cli_path(host, &dir));
-        if let PresetSettings::Build(settings) = preset.settings {
-            opts.apply_preset(settings);
+        if opts.dir.is_none() {
+            opts.dir = preset.binary_dir.map(|dir| resolve_cli_path(host, &dir));
+        }
+        if let PresetSettings::Build(settings) = preset.settings
+            && let Err(message) = opts.apply_preset(settings)
+        {
+            crate::emit_cli_error(host, message);
+            return 1;
         }
         for (key, value) in preset.environment {
             if let Some(value) = value {
@@ -287,14 +329,6 @@ pub(crate) fn run(argv: &[BString], args: &[BString], host: &dyn Host) -> i32 {
             host,
             "Error: Building 'clean' and other targets together is not supported.",
         );
-    }
-    if opts.jobs.is_none()
-        && let Some(value) = env.get(b"CMAKE_BUILD_PARALLEL_LEVEL".as_slice())
-    {
-        match parse_jobs(b"CMAKE_BUILD_PARALLEL_LEVEL", value, true) {
-            Ok(jobs) => opts.jobs = Some(jobs),
-            Err(message) => return usage(host, &message),
-        }
     }
     opts.verbose |= env.contains_key(b"VERBOSE".as_slice());
     crate::instrument_lifecycle(
