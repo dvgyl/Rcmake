@@ -16,6 +16,55 @@ struct Scratch<'a> {
     dir: PathBuf,
 }
 
+#[test]
+fn index_lock_is_released_when_process_exits() {
+    let host = NativeHost::new().expect("native host");
+    let child_build = b"RCMAKE_TEST_INDEX_LOCK_BUILD";
+    if let Some(build) = host.env_get(child_build) {
+        let path = crate::files::api_dir(&path::to_native(&build)).join(".index.lock");
+        let guard = host
+            .lock_file(&path, Some(Duration::ZERO))
+            .expect("child acquires the index lock");
+        // Exit the process while the lock is still held.
+        std::mem::forget(guard);
+        return;
+    }
+    let temp = host
+        .env_get(b"TMPDIR")
+        .map_or_else(|| PathBuf::from("/tmp"), |dir| path::to_native(&dir));
+    let scratch = Scratch {
+        host: &host,
+        dir: temp.join(format!(
+            "rcmake-index-lock-{}-{}",
+            host.system().pid,
+            timestamp(&host)
+        )),
+    };
+    let api = crate::files::api_dir(&scratch.dir);
+    host.create_dir_all(&api)
+        .expect("create instrumentation directory");
+    host.env_set(child_build, Some(&path::from_native(&scratch.dir)));
+    let exe = host.current_exe().expect("test binary");
+    run(
+        &host,
+        &scratch.dir,
+        &[
+            path::from_native(&exe),
+            "--exact".into(),
+            "tests::oracle::index_lock_is_released_when_process_exits".into(),
+        ],
+        0,
+    );
+    let lock = api.join(".index.lock");
+    assert_eq!(crate::files::read_bytes(&host, &lock), Ok(Vec::new()));
+    let guard = host
+        .lock_file(&lock, Some(Duration::ZERO))
+        .expect("parent acquires the index lock");
+    drop(guard);
+    hooks::run_hook(&host, &scratch.dir, Hook::Manual).expect("run hook");
+    assert_eq!(crate::files::read_bytes(&host, &lock), Ok(Vec::new()));
+}
+
 impl Drop for Scratch<'_> {
     fn drop(&mut self) {
         let _ = self.host.remove_dir_all(&self.dir);

@@ -1,16 +1,16 @@
 //! Run and record a command for `ctest --instrument`.
 
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use rcmake_base::BString;
 use rcmake_host::{
-    CommandSpec, Follow, Host, Input, Output, ProcessResult, RunOutput, RunRequest, path,
+    CommandSpec, CopyOptions, FileTime, Follow, Host, Input, Output, ProcessResult, RunOutput,
+    RunRequest, Stream, path,
 };
 
-use crate::files::{
-    absolute, api_dir, epoch_millis, newest_content, publish_at, read_bytes, read_json, timestamp,
-};
+use crate::files::{absolute, api_dir, command_hash, epoch_millis, newest_content, read_bytes};
 use crate::query::read_queries;
 use crate::snippet::{SnippetDetails, SystemSample, write_snippet_with_details};
 use crate::{InstrumentError, InstrumentOption, Snippet, SnippetRole, invalid};
@@ -103,6 +103,104 @@ fn compile_trace_path(
     None
 }
 
+fn trace_suffix(end_millis: u64) -> String {
+    let seconds = end_millis / 1000;
+    let mut days = seconds / 86_400;
+    let days_per_400_years = 146_097;
+    let mut year = 1970 + days / days_per_400_years * 400;
+    days %= days_per_400_years;
+    let leap = |year: u64| {
+        year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400))
+    };
+    loop {
+        let year_days = 365 + u64::from(leap(year));
+        if days < year_days {
+            break;
+        }
+        days -= year_days;
+        year += 1;
+    }
+    let mut month = 1;
+    for month_days in [
+        31,
+        28 + u64::from(leap(year)),
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ] {
+        if days < month_days {
+            break;
+        }
+        days -= month_days;
+        month += 1;
+    }
+    let day = days + 1;
+    let hour = seconds / 3600 % 24;
+    let minute = seconds / 60 % 60;
+    let second = seconds % 60;
+    let millis = end_millis % 1000;
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}-{minute:02}-{second:02}-{millis:04}")
+}
+
+fn copy_compile_trace(
+    host: &dyn Host,
+    data: &Path,
+    source: &Path,
+    old_mtime: Option<FileTime>,
+    command: &[u8],
+    end_millis: u64,
+) -> Result<Option<BString>, InstrumentError> {
+    match host.metadata(source, Follow::Yes) {
+        Ok(metadata) if Some(metadata.mtime) == old_mtime => return Ok(None),
+        Err(error) if error.kind == ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(invalid(format!(
+                "Cannot read compile trace file {}. {error}",
+                source.display()
+            )));
+        }
+        Ok(_) => {}
+    }
+    let name = source.file_name().ok_or_else(|| {
+        invalid(format!(
+            "No compile trace file name in {}.",
+            source.display()
+        ))
+    })?;
+    let name = path::from_native(Path::new(name));
+    let extension = name
+        .iter()
+        .rposition(|&byte| byte == b'.')
+        .unwrap_or(name.len());
+    let (stem, extension) = name.split_at(extension);
+    let suffix = format!(
+        "-{}-{}",
+        command_hash(host, command),
+        trace_suffix(end_millis)
+    );
+    let name = [stem, suffix.as_bytes(), extension].concat();
+    let dir = Path::new("compile-trace");
+    let relative = dir.join(path::to_native(&name));
+    let dest = data.join(&relative);
+    host.create_dir_all(&data.join(dir))
+        .and_then(|()| host.copy_file(source, &dest, CopyOptions::default()))
+        .map_err(|error| {
+            invalid(format!(
+                "Failed to copy compile trace file {} to {}. {error}",
+                source.display(),
+                dest.display()
+            ))
+        })?;
+    Ok(Some(path::from_native(&relative)))
+}
+
 fn comma_list(value: &[u8]) -> Vec<BString> {
     value
         .split(|byte| *byte == b',')
@@ -146,23 +244,26 @@ fn run(
         Some(ProcessResult::SpawnFailed(error)) => return Err(error.clone().into()),
         None => return Err(invalid("The instrumentation command returned no result.")),
     };
-    let mut saved_trace = None;
-    if let Some(file) = compiler_trace
-        && let Ok(meta) = host.metadata(&file, Follow::Yes)
-        && Some(meta.mtime) != trace_mtime
-    {
-        let value = read_json(host, &file)?;
-        let saved = publish_at(
+    let command = command_line(command);
+    let saved_trace = compiler_trace.and_then(|file| {
+        match copy_compile_trace(
             host,
-            &data.join("compile-trace"),
-            &format!("compile-{}", timestamp(host)),
-            &value,
-        )?;
-        saved_trace = saved.strip_prefix(&data).ok().map(path::from_native);
-    }
+            &data,
+            &file,
+            trace_mtime,
+            &command,
+            time_start.saturating_add(duration),
+        ) {
+            Ok(trace) => trace,
+            Err(error) => {
+                host.write_out(Stream::Stderr, format!("CMake Error: {error}\n").as_bytes());
+                None
+            }
+        }
+    });
     let snippet = Snippet {
         role,
-        command: command_line(command),
+        command,
         working_dir: path::from_native(cwd),
         result,
         time_start,
@@ -176,39 +277,54 @@ fn run(
         stdout: capture.then(|| BString::from(output.stdout)),
         stderr: capture.then(|| BString::from(output.stderr)),
     };
-    let details = SnippetDetails {
-        output_base: Some(build_dir.to_path_buf()),
-        interrupt_signal,
-        dynamic,
-        process_metrics: (enabled(InstrumentOption::ProcessMetrics)
-            && matches!(
-                role,
-                SnippetRole::Compile
-                    | SnippetRole::Link
-                    | SnippetRole::Custom
-                    | SnippetRole::Install
-                    | SnippetRole::Test
-            ))
-        .then_some(None),
-        cmake_content: if role == SnippetRole::Test {
-            None
-        } else {
-            newest_content(host, &data)?
-        },
-        trace_file: (role == SnippetRole::Compile && enabled(InstrumentOption::CompileTrace))
-            .then_some(saved_trace),
-        target_labels: Some(metadata.labels),
-        show_only: false,
+    let cmake_content = if role == SnippetRole::Test {
+        Ok(None)
+    } else {
+        newest_content(host, &data)
     };
-    write_snippet_with_details(host, &data, &snippet, &details)?;
+    let written = cmake_content.and_then(|cmake_content| {
+        let details = SnippetDetails {
+            output_base: Some(build_dir.to_path_buf()),
+            interrupt_signal,
+            dynamic,
+            process_metrics: (enabled(InstrumentOption::ProcessMetrics)
+                && matches!(
+                    role,
+                    SnippetRole::Compile
+                        | SnippetRole::Link
+                        | SnippetRole::Custom
+                        | SnippetRole::Install
+                        | SnippetRole::Test
+                ))
+            .then_some(None),
+            cmake_content,
+            trace_file: (role == SnippetRole::Compile && enabled(InstrumentOption::CompileTrace))
+                .then_some(saved_trace),
+            target_labels: Some(metadata.labels),
+            show_only: false,
+        };
+        write_snippet_with_details(host, &data, &snippet, &details)
+    });
+    if let Err(error) = written {
+        host.write_out(
+            Stream::Stderr,
+            format!(
+                "CMake Error: Failed to write instrumentation snippet in {}. {error}\n",
+                data.display()
+            )
+            .as_bytes(),
+        );
+    }
     Ok(code)
 }
 
-/// Run a command in `build_dir`, write a snippet, and return the command exit code.
+/// Run a command in `build_dir` and return its exit code.
+///
+/// Report trace and snippet write errors to stderr.
 ///
 /// # Errors
 ///
-/// Returns an error for invalid arguments or failed host operations.
+/// Returns an error if command setup or execution fails before an exit code is available.
 pub fn run_instrumented(
     host: &dyn Host,
     build_dir: &Path,
@@ -223,10 +339,11 @@ pub fn run_instrumented(
 ///
 /// The command runs in the current working directory. The build directory is
 /// used to find queries and outputs and to store the snippet.
+/// Report trace and snippet write errors to stderr.
 ///
 /// # Errors
 ///
-/// Returns an error if the arguments are invalid or a host operation fails.
+/// Returns an error if command setup or execution fails before an exit code is available.
 pub fn run_launcher(host: &dyn Host, argv: &[BString]) -> Result<i32, InstrumentError> {
     let mut args = argv.iter().peekable();
     if argv

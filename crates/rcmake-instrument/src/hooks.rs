@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use rcmake_base::BString;
-use rcmake_host::{FileTime, Follow, Host, Stream, WriteMode, path};
+use rcmake_host::{FileTime, Follow, Host, Stream, path};
 use rcmake_json::Value;
 
 use crate::files::{absolute, api_dir, file_stem, json_files, publish_at, read_json, timestamp};
@@ -18,37 +18,6 @@ use crate::trace::trace_value;
 use crate::{Hook, IndexFile, InstrumentError, InstrumentOption, invalid};
 
 static NEXT_BATCH: AtomicU64 = AtomicU64::new(0);
-
-struct IndexLock<'a> {
-    host: &'a dyn Host,
-    file: PathBuf,
-}
-
-impl<'a> IndexLock<'a> {
-    fn acquire(host: &'a dyn Host, data: &Path) -> Result<Self, InstrumentError> {
-        host.create_dir_all(data)?;
-        let file = data.join(".index.lock");
-        for _ in 0..200 {
-            match host.write(&file, b"", WriteMode::CreateNew) {
-                Ok(()) => return Ok(Self { host, file }),
-                Err(error) if error.kind == ErrorKind::AlreadyExists => {
-                    host.sleep(Duration::from_millis(25));
-                }
-                Err(error) => return Err(error.into()),
-            }
-        }
-        Err(invalid(format!(
-            "Timed out waiting for the instrumentation index lock at {}.",
-            file.display()
-        )))
-    }
-}
-
-impl Drop for IndexLock<'_> {
-    fn drop(&mut self) {
-        let _ = self.host.remove_file(&self.file);
-    }
-}
 
 fn callback_arguments(command: &[u8]) -> Result<Vec<BString>, InstrumentError> {
     let mut command = command.iter().copied();
@@ -157,7 +126,6 @@ fn write_batch(
     include_static: bool,
     include_trace: bool,
 ) -> Result<(PathBuf, Vec<BString>), InstrumentError> {
-    let _lock = IndexLock::acquire(host, data)?;
     let (snippets, _) = pending(host, data)?;
     let mut index = IndexFile {
         build_dir: path::from_native(build),
@@ -238,15 +206,21 @@ pub fn run_hook(host: &dyn Host, build_dir: &Path, hook: Hook) -> Result<(), Ins
         return Ok(());
     }
     let enabled = |option| queries.iter().any(|query| query.options.contains(&option));
-    let data = api_dir(&build).join("data");
-    let (index, snippets) = write_batch(
-        host,
-        &build,
-        &data,
-        hook,
-        enabled(InstrumentOption::StaticSystemInformation),
-        enabled(InstrumentOption::Trace),
-    )?;
+    let api = api_dir(&build);
+    let data = api.join("data");
+    let lock_path = api.join(".index.lock");
+    host.create_dir_all(&api)?;
+    let (index, snippets) = {
+        let _lock = host.lock_file(&lock_path, None)?;
+        write_batch(
+            host,
+            &build,
+            &data,
+            hook,
+            enabled(InstrumentOption::StaticSystemInformation),
+            enabled(InstrumentOption::Trace),
+        )?
+    };
     for callback in queries.iter().flat_map(|query| &query.callbacks) {
         let result = callback_arguments(callback).and_then(|mut command| {
             command.push(path::from_native(&index));
@@ -268,7 +242,7 @@ pub fn run_hook(host: &dyn Host, build_dir: &Path, hook: Hook) -> Result<(), Ins
             }
         }
     }
-    let _lock = IndexLock::acquire(host, &data)?;
+    let _lock = host.lock_file(&lock_path, None)?;
     for name in snippets {
         remove_file(host, &data.join(path::to_native(&name)))?;
     }

@@ -7,7 +7,7 @@ use rcmake_base::BString;
 use rcmake_host::{Host, Output, ProcessResult, PureHost, RunOutput, Stream, path};
 use rcmake_json::Value;
 
-use crate::files::{json_files, read_json};
+use crate::files::{command_hash, epoch_millis, json_files, read_bytes, read_json};
 use crate::{
     CustomContent, CustomContentType, DATA_VERSION, Hook, InstrumentError, InstrumentOption,
     Object, hooks, launcher, query, snippet,
@@ -420,6 +420,91 @@ fn launcher_records_metadata_and_hook_dispatches_callbacks_once_per_batch() {
 }
 
 #[test]
+fn launcher_copies_invalid_json_trace_bytes() -> Result<(), InstrumentError> {
+    let host = host();
+    let build = Path::new("/work");
+    let api = crate::files::api_dir(build);
+    let data = api.join("data");
+    let bytes = b"invalid JSON\0\xff";
+    host.seed_file(
+        &api.join("query/trace.json"),
+        br#"{"version":1,"options":["compileTrace"]}"#,
+    )?;
+    // Start the command at 00:00:00 UTC on February 29, 2024.
+    host.sleep(Duration::from_millis(
+        1_709_164_800_000 - epoch_millis(&host),
+    ));
+    host.set_command_handler(move |host, _, _| {
+        host.sleep(Duration::from_millis(125));
+        host.seed_file(Path::new("/work/main.trace.json"), bytes)?;
+        Ok(RunOutput {
+            results: vec![ProcessResult::Exited(0)],
+            ..RunOutput::default()
+        })
+    })?;
+    let command = ["cc", "-ftime-trace=main.trace.json"].map(BString::from);
+    assert_eq!(
+        launcher::run_instrumented(&host, build, crate::SnippetRole::Compile, &command)?,
+        0
+    );
+    let value = read_json(&host, &only_file(&host, &data))?;
+    let hash = command_hash(&host, &launcher::command_line(&command));
+    let trace = format!("compile-trace/main.trace-{hash}-2024-02-29T00-00-00-0125.json");
+    assert_eq!(*field(&value, "traceFile"), Value::string(trace.as_str()));
+    assert_eq!(read_bytes(&host, &data.join(trace))?, bytes);
+    assert!(host.stream_bytes(Stream::Stderr).is_empty());
+    Ok(())
+}
+
+#[test]
+fn launcher_keeps_exit_code_when_instrumentation_writes_fail() -> Result<(), InstrumentError> {
+    let host = host();
+    let build = Path::new("/work");
+    let api = crate::files::api_dir(build);
+    host.seed_file(
+        &api.join("query/trace.json"),
+        br#"{"version":1,"options":["compileTrace"]}"#,
+    )?;
+    host.seed_file(
+        &api.join("data/compile-trace"),
+        b"blocks the trace directory",
+    )?;
+    host.set_command_handler(|host, _, _| {
+        host.sleep(Duration::from_millis(1));
+        host.seed_file(Path::new("/work/main.json"), b"trace")?;
+        Ok(RunOutput {
+            results: vec![ProcessResult::Exited(0)],
+            ..RunOutput::default()
+        })
+    })?;
+    let command = ["cc", "-ftime-trace=main.json"].map(BString::from);
+    assert_eq!(
+        launcher::run_instrumented(&host, build, crate::SnippetRole::Compile, &command)?,
+        0
+    );
+    assert!(
+        host.stream_bytes(Stream::Stderr)
+            .starts_with(b"CMake Error: Failed to copy compile trace file ")
+    );
+    let data = api.join("data");
+    let value = read_json(&host, &only_file(&host, &data))?;
+    assert_eq!(*field(&value, "traceFile"), Value::Null);
+
+    host.remove_dir_all(&data)?;
+    host.seed_file(&data, b"blocks the snippet directory")?;
+    assert_eq!(
+        launcher::run_instrumented(&host, build, crate::SnippetRole::Test, &command)?,
+        0
+    );
+    assert!(
+        host.stream_bytes(Stream::Stderr)
+            .to_string()
+            .contains("CMake Error: Failed to write instrumentation snippet")
+    );
+    Ok(())
+}
+
+#[test]
 fn interrupted_command_records_signal() {
     let host = host();
     host.set_command_handler(|_, _, _| {
@@ -460,6 +545,8 @@ fn simultaneous_hooks_do_not_index_the_same_snippet() {
         br#"{"version":1,"hooks":["preBuild","postBuild"],"callbacks":["observe"]}"#,
     )
     .expect("seed query");
+    host.seed_file(&api.join("data/.index.lock"), b"")
+        .expect("leave an old lock file in the data directory");
     let (first_started, wait_for_first) = mpsc::channel();
     let (second_finished, wait_for_second) = mpsc::channel();
     let wait_for_second = Mutex::new(wait_for_second);
@@ -502,4 +589,5 @@ fn simultaneous_hooks_do_not_index_the_same_snippet() {
             .expect("pre-build hook");
     });
     assert_eq!(host.stream_bytes(Stream::Stdout), "10");
+    assert_eq!(read_bytes(&host, &api.join(".index.lock")), Ok(Vec::new()));
 }

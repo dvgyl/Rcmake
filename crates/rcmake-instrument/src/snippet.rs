@@ -2,11 +2,11 @@
 
 use std::path::{Path, PathBuf};
 
-use rcmake_base::{BString, hash::HashAlgo, list, truth};
+use rcmake_base::{BString, list, truth};
 use rcmake_host::{Follow, Host, path};
 use rcmake_json::{ReadOptions, Value, parse};
 
-use crate::files::{absolute, api_dir, newest_content, publish_at, timestamp};
+use crate::files::{absolute, api_dir, command_hash, newest_content, publish_at, timestamp};
 use crate::system::{dynamic_information, static_information};
 use crate::{
     CustomContent, CustomContentType, DATA_VERSION, IndexFile, InstrumentError, Object, Snippet,
@@ -192,10 +192,7 @@ pub fn write_snippet_with_details(
             )
         })
         .collect();
-    let mut hash_input = snippet.command.clone();
-    hash_input.extend_from_slice(host.system().pid.to_string().as_bytes());
-    let digest = HashAlgo::Sha3_256.hex_digest(&hash_input);
-    let hash = digest.get(..20).unwrap_or(&digest);
+    let hash = command_hash(host, &snippet.command);
     let stem = format!("{}-{hash}-{}", snippet.role.as_str(), timestamp(host));
     publish_at(
         host,

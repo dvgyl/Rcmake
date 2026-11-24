@@ -399,6 +399,29 @@ fn checksum_requires_an_operand_and_reads_stdin_once() -> HostResult<()> {
 }
 
 #[test]
+fn checksums_cover_full_and_partial_chunks() -> HostResult<()> {
+    let exact = vec![b'a'; 1024 * 1024];
+    let mut partial = exact.clone();
+    partial.extend_from_slice(b"tail");
+    for (command, algo) in [("md5sum", HashAlgo::Md5), ("sha256sum", HashAlgo::Sha256)] {
+        let f = Fixture::new();
+        f.seed("exact", &exact)?;
+        f.seed("partial", &partial)?;
+        assert_eq!(f.run(&[command, "exact", "partial"]), 0);
+        assert_eq!(
+            f.out(),
+            format!(
+                "{}  exact\n{}  partial\n",
+                algo.hex_digest(&exact),
+                algo.hex_digest(&partial)
+            )
+        );
+        assert!(f.err().is_empty());
+    }
+    Ok(())
+}
+
+#[test]
 fn env_prints_sorted_values_and_modifies_a_local_snapshot() {
     let f = Fixture::new();
     f.host.env_set(b"Z", Some(b"original"));

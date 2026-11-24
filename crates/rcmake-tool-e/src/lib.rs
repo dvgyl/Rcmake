@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 
 use rcmake_base::{BString, hash::HashAlgo, limits::Limits};
 use rcmake_host::Host;
-use rcmake_host::{FileKind, Follow, ReadRange, Stream, path::to_native};
+use rcmake_host::{FileKind, Follow, HostResult, ReadRange, Stream, path::to_native};
 use rcmake_json::Value;
 
 /// Context for a `cmake -E` command.
@@ -211,22 +211,28 @@ fn checksum(algo: HashAlgo, args: &[BString], cx: &ToolCtx<'_>) -> i32 {
                 continue;
             }
             stdin_used = true;
-            cx.host.read_stdin(Limits::default().max_file_read)
+            cx.host
+                .read_stdin(Limits::default().max_file_read)
+                .map(|bytes| algo.hex_digest(&bytes))
         } else {
             let file_path = path(cx, file);
-            if is_dir(cx, &file_path) && !file.is_empty() {
-                error(cx, &[b"Error: ", file, b" is a directory\n"]);
-                failures = failures.saturating_add(1);
-                continue;
+            match cx.host.metadata(&file_path, Follow::Yes) {
+                Ok(meta) if meta.kind == FileKind::Dir && !file.is_empty() => {
+                    error(cx, &[b"Error: ", file, b" is a directory\n"]);
+                    failures = failures.saturating_add(1);
+                    continue;
+                }
+                // A special file can require a single open and can fail on seek.
+                Ok(meta) if meta.kind == FileKind::Other => cx
+                    .host
+                    .read(&file_path, read_all())
+                    .map(|bytes| algo.hex_digest(&bytes)),
+                Ok(_) => file_digest(cx.host, &file_path, algo),
+                Err(error) => Err(error),
             }
-            cx.host.read(&file_path, read_all())
         };
         match result {
-            Ok(bytes) => write(
-                cx,
-                Stream::Stdout,
-                &[algo.hex_digest(&bytes).as_bytes(), b"  ", file, b"\n"],
-            ),
+            Ok(digest) => write(cx, Stream::Stdout, &[digest.as_bytes(), b"  ", file, b"\n"]),
             Err(err) => {
                 let reason = if file.is_empty() {
                     "No such file or directory"
@@ -239,4 +245,24 @@ fn checksum(algo: HashAlgo, args: &[BString], cx: &ToolCtx<'_>) -> i32 {
         }
     }
     failures
+}
+
+fn file_digest(host: &dyn Host, file: &Path, algo: HashAlgo) -> HostResult<String> {
+    const CHUNK_SIZE: u64 = 1024 * 1024;
+    let mut hasher = algo.hasher();
+    let mut offset = 0;
+    loop {
+        let bytes = host.read(
+            file,
+            ReadRange::Slice {
+                offset,
+                len: Some(CHUNK_SIZE),
+            },
+        )?;
+        hasher.update(&bytes);
+        if (bytes.len() as u64) < CHUNK_SIZE {
+            return Ok(hasher.finish_hex());
+        }
+        offset += CHUNK_SIZE;
+    }
 }

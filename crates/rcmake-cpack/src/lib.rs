@@ -20,10 +20,10 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 use rcmake_base::hash::HashAlgo;
-use rcmake_base::{BString, Limits, list};
+use rcmake_base::{BString, list};
 use rcmake_eval::Interp;
 use rcmake_host::path::{from_native, to_native};
-use rcmake_host::{CopyOptions, Host, ReadRange, Stream, WriteMode};
+use rcmake_host::{CopyOptions, Host, HostResult, ReadRange, Stream, WriteMode};
 
 use crate::config::{CpackConfig, Environment, absolute, script, snapshot};
 
@@ -405,17 +405,12 @@ fn publish(
         }
         log(host, format!("- package: {} generated.", path.display()));
         if !algorithms.is_empty() {
-            let bytes = host.read(
-                package,
-                ReadRange::All {
-                    limit: Limits::default().max_file_read,
-                },
-            )?;
+            let digests = package_digests(host, package, algorithms.values().copied())?;
             let file = from_native(Path::new(name));
-            for (extension, algo) in &algorithms {
+            for (extension, digest) in algorithms.keys().zip(digests) {
                 let checksum_name = [file.as_slice(), b".", extension].concat();
                 let checksum = output.join(safe_name(&checksum_name)?);
-                let text = format!("{}  {file}\n", algo.hex_digest(&bytes));
+                let text = format!("{digest}  {file}\n");
                 stage::clear_output_file(host, &checksum)?;
                 host.write(&checksum, text.as_bytes(), WriteMode::CreateNew)?;
                 log(
@@ -426,6 +421,36 @@ fn publish(
         }
     }
     Ok(())
+}
+
+fn package_digests(
+    host: &dyn Host,
+    package: &Path,
+    algorithms: impl Iterator<Item = HashAlgo>,
+) -> HostResult<Vec<String>> {
+    const CHUNK_SIZE: u64 = 1024 * 1024;
+    let mut hashers = algorithms.map(HashAlgo::hasher).collect::<Vec<_>>();
+    let mut offset = 0;
+    loop {
+        let bytes = host.read(
+            package,
+            ReadRange::Slice {
+                offset,
+                len: Some(CHUNK_SIZE),
+            },
+        )?;
+        for hasher in &mut hashers {
+            hasher.update(&bytes);
+        }
+        if (bytes.len() as u64) < CHUNK_SIZE {
+            break;
+        }
+        offset += CHUNK_SIZE;
+    }
+    Ok(hashers
+        .into_iter()
+        .map(|hasher| hasher.finish_hex())
+        .collect())
 }
 
 fn safe_name(value: &[u8]) -> Result<PathBuf, CpackError> {

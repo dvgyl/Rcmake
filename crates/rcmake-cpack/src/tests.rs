@@ -561,6 +561,20 @@ fn check_checksums(host: &dyn Host, package: &Path) {
     }
 }
 
+#[test]
+fn package_digests_match_one_shot_hashes_across_chunks() -> Result<(), crate::CpackError> {
+    let host = memory_host();
+    let package = Path::new("/work/package.tar");
+    let mut bytes = vec![b'a'; 1024 * 1024];
+    bytes.extend(vec![b'b'; 1024 * 1024]);
+    bytes.extend_from_slice(b"tail");
+    host.seed_file(package, &bytes)?;
+    let algorithms = [HashAlgo::Md5, HashAlgo::Sha256, HashAlgo::Sha3_512];
+    let digests = crate::package_digests(host.as_ref(), package, algorithms.into_iter())?;
+    assert_eq!(digests, algorithms.map(|algo| algo.hex_digest(&bytes)));
+    Ok(())
+}
+
 fn run(host: &dyn Host, program: BString, cwd: &Path, args: Vec<BString>) {
     let output = host
         .run(

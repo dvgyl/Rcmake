@@ -4,8 +4,8 @@ use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use rcmake_base::BString;
-use rcmake_host::{FileKind, Follow, Host, HostError, ReadRange, WriteMode, path};
+use rcmake_base::{BString, hash::HashAlgo};
+use rcmake_host::{FileKind, Follow, Host, HostError, HostResult, ReadRange, WriteMode, path};
 use rcmake_json::{ReadOptions, Value, parse, write_styled};
 
 use crate::{InstrumentError, invalid};
@@ -73,12 +73,39 @@ pub(crate) fn epoch_millis(host: &dyn Host) -> u64 {
         .saturating_add(u64::from(time.nanos / 1_000_000))
 }
 
-/// The final name becomes visible only after the staged file is complete.
+pub(crate) fn command_hash(host: &dyn Host, command: &[u8]) -> String {
+    let mut hasher = HashAlgo::Sha3_256.hasher();
+    hasher.update(command);
+    hasher.update(host.system().pid.to_string().as_bytes());
+    let mut digest = hasher.finish_hex();
+    digest.truncate(20);
+    digest
+}
+
+/// Publish a staged file without replacing an existing file.
 pub(crate) fn publish(
     host: &dyn Host,
     dir: &Path,
     value: &Value,
     filename: impl Fn(u64) -> String,
+) -> Result<PathBuf, InstrumentError> {
+    publish_with(
+        host,
+        dir,
+        value,
+        filename,
+        |from, to| host.rename_noreplace(from, to),
+        |from, to| host.hard_link(from, to),
+    )
+}
+
+fn publish_with(
+    host: &dyn Host,
+    dir: &Path,
+    value: &Value,
+    filename: impl Fn(u64) -> String,
+    rename: impl Fn(&Path, &Path) -> HostResult<()>,
+    link: impl Fn(&Path, &Path) -> HostResult<()>,
 ) -> Result<PathBuf, InstrumentError> {
     host.create_dir_all(dir)?;
     let data = write_styled(value, "\t");
@@ -101,7 +128,12 @@ pub(crate) fn publish(
     let result = (0..FILE_NAME_ATTEMPTS)
         .find_map(|n| {
             let path = dir.join(filename(n));
-            match host.hard_link(&staged, &path) {
+            let result = rename(&staged, &path)
+                .or_else(|error| publication_fallback(error, || link(&staged, &path)))
+                .or_else(|error| {
+                    publication_fallback(error, || host.write(&path, &data, WriteMode::CreateNew))
+                });
+            match result {
                 Ok(()) => Some(Ok(path)),
                 Err(error) if error.kind == ErrorKind::AlreadyExists => None,
                 Err(error) => Some(Err(error.into())),
@@ -110,6 +142,16 @@ pub(crate) fn publish(
         .unwrap_or_else(|| Err(invalid("No instrumentation file name is available.")));
     let _ = host.remove_file(&staged);
     result
+}
+
+fn publication_fallback(
+    error: HostError,
+    fallback: impl FnOnce() -> HostResult<()>,
+) -> HostResult<()> {
+    match error.kind {
+        ErrorKind::Unsupported | ErrorKind::PermissionDenied => fallback(),
+        _ => Err(error),
+    }
 }
 
 pub(crate) fn publish_at(
@@ -140,4 +182,33 @@ pub(crate) fn newest_content(
 
 pub(crate) fn file_stem(name: &[u8]) -> &[u8] {
     name.strip_suffix(b".json").unwrap_or(name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rcmake_host::PureHost;
+
+    #[test]
+    fn publish_without_rename_or_hard_links() -> Result<(), InstrumentError> {
+        let host = PureHost::new("/work".into(), "/bin/rcmake".into());
+        let dir = Path::new("/work");
+        let existing = dir.join("0.json");
+        host.write(&existing, b"existing", WriteMode::CreateNew)?;
+        let unsupported = |_: &Path, _: &Path| Err(HostError::unsupported("Not supported."));
+        let value = Value::string("new");
+        let file = publish_with(
+            &host,
+            dir,
+            &value,
+            |n| format!("{n}.json"),
+            unsupported,
+            unsupported,
+        )?;
+        assert_eq!(file, dir.join("1.json"));
+        assert_eq!(read_bytes(&host, &file)?, write_styled(&value, "\t"));
+        assert_eq!(read_bytes(&host, &existing)?, b"existing");
+        assert_eq!(host.read_dir(dir)?.len(), 2);
+        Ok(())
+    }
 }
