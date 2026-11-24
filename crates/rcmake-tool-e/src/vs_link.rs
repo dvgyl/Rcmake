@@ -8,7 +8,7 @@ mod tests;
 use std::io::ErrorKind;
 use std::time::Duration;
 
-use rcmake_base::{BString, ByteSlice};
+use rcmake_base::{BString, ByteSlice, shell::quote};
 use rcmake_host::{
     CommandSpec, FileKind, Follow, Input, Output, ProcessResult, RunRequest, Stream, WriteMode,
     path::{from_native, to_native},
@@ -39,11 +39,7 @@ struct Link {
 
 impl Link {
     fn parse(id: char, args: &[BString], cx: &ToolCtx<'_>) -> Result<Self, String> {
-        let response::Expanded {
-            options,
-            tool,
-            inspected,
-        } = response::expand(args, cx)?;
+        let response::Expanded { options, tool } = response::expand(args, cx)?;
         let mut link = Self {
             id,
             intdir: BString::default(),
@@ -87,7 +83,7 @@ impl Link {
             return Err("The link wrapper requires --intdir=<directory>.".into());
         }
 
-        let mut args = inspected.iter();
+        let mut args = link.tool.args.iter();
         while let Some(arg) = args.next() {
             let Some(option) = arg.strip_prefix(b"/").or_else(|| arg.strip_prefix(b"-")) else {
                 continue;
@@ -342,10 +338,17 @@ fn run_tool(
             env.push(("PATH".into(), dir.into()));
         }
     }
+    let command = || {
+        std::iter::once(&tool.program)
+            .chain(&tool.args)
+            .map(|arg| quote(arg))
+            .collect::<Vec<_>>()
+            .join(b" ".as_slice())
+    };
     if cx.host.env_get(b"VERBOSE").is_some() {
         cx.host.write_out(
             Stream::Stdout,
-            format!("{stage}: {}\n", tool.program).as_bytes(),
+            &[stage.as_bytes(), b": ", &command(), b"\n"].concat(),
         );
     }
 
@@ -355,33 +358,52 @@ fn run_tool(
         env,
         stdin: Input::Null,
         stdout: Output::Capture,
-        stderr: Output::Capture,
+        stderr: Output::SharedWithStdout,
         timeout: Some(Duration::from_secs(120)),
         tee: false,
     };
     match cx.host.run(&request, &mut |_, _| {}) {
         Ok(result) => {
-            cx.host.write_out(Stream::Stdout, &result.stdout);
-            cx.host.write_out(Stream::Stderr, &result.stderr);
             let status = match result.results.first() {
                 Some(ProcessResult::Exited(code)) => *code,
                 Some(ProcessResult::Signaled(signal)) => 128_i32.saturating_add(*signal),
                 Some(ProcessResult::TimedOut) => 124,
-                Some(ProcessResult::SpawnFailed(error)) => {
-                    cx.host
-                        .write_out(Stream::Stderr, format!("{error}\n").as_bytes());
-                    127
-                }
+                Some(ProcessResult::SpawnFailed(_)) => 127,
                 None => 1,
             };
-            if status != 0 && !(accept_update && mt_updated(status)) {
-                cx.host.write_out(
-                    Stream::Stderr,
-                    format!("{stage} failed with exit code {status}.\n").as_bytes(),
-                );
+            if status == 0 || (accept_update && mt_updated(status)) {
+                cx.host.write_out(Stream::Stdout, &result.stdout);
+                cx.host.write_out(Stream::Stderr, &result.stderr);
+                return status;
             }
-            status
+            cx.host.write_out(
+                Stream::Stderr,
+                &[
+                    format!("{stage}: command ").as_bytes(),
+                    &command(),
+                    format!(" failed (exit code {status}) with the following output:\n").as_bytes(),
+                    &result.stdout,
+                    &result.stderr,
+                ]
+                .concat(),
+            );
+            if let Some(ProcessResult::SpawnFailed(error)) = result.results.first() {
+                cx.host
+                    .write_out(Stream::Stderr, format!("{error}\n").as_bytes());
+            }
+            if stage == "MT" { status } else { -1 }
         }
-        Err(err) => error(cx, &[format!("{stage} failed. {err}\n").as_bytes()]),
+        Err(err) => {
+            cx.host.write_out(
+                Stream::Stderr,
+                &[
+                    format!("{stage}: Cannot run ").as_bytes(),
+                    &command(),
+                    format!("\n{err}\n").as_bytes(),
+                ]
+                .concat(),
+            );
+            -1
+        }
     }
 }

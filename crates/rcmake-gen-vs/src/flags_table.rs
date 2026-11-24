@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::{msbuild_value, rules::quote, windows, xml::Writer};
+use crate::{cuda::OptionText, msbuild_value, rules::quote, windows, xml::Writer};
 
 #[derive(Default)]
 pub(crate) struct Settings {
@@ -218,7 +218,8 @@ pub(crate) fn link(flags: impl IntoIterator<Item = String>, archive: bool) -> Se
     for flag in flags {
         let key = flag.trim_start_matches(['-', '/']);
         match key.to_ascii_uppercase().as_str() {
-            "DEBUG" | "DEBUG:FULL" if !archive => settings.set("GenerateDebugInformation", "true"),
+            "DEBUG" if !archive => settings.set("GenerateDebugInformation", "true"),
+            "DEBUG:FULL" if !archive => settings.set("GenerateDebugInformation", "DebugFull"),
             "DEBUG:NONE" if !archive => settings.set("GenerateDebugInformation", "false"),
             "DEBUG:FASTLINK" if !archive => {
                 settings.set("GenerateDebugInformation", "DebugFastLink")
@@ -244,7 +245,8 @@ pub(crate) fn link(flags: impl IntoIterator<Item = String>, archive: bool) -> Se
                     "PDB" => Some("ProgramDatabaseFile"),
                     _ => None,
                 } {
-                    settings.set(property, msbuild_value(&windows(value)));
+                    let path = windows(value);
+                    settings.set(property, OptionText::WithProperties(&path).escaped());
                 } else if name.eq_ignore_ascii_case("LIBPATH") {
                     settings.list(
                         "AdditionalLibraryDirectories",

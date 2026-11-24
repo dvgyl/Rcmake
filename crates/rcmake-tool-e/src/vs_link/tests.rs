@@ -27,7 +27,7 @@ fn exit(status: i32) -> RunOutput {
 }
 
 #[test]
-fn embeds_manifests_without_expanding_the_linker_command_length() {
+fn expands_nmake_response_files_and_retains_cmake_response_files() {
     for (name, id) in [(b"vs_link_exe".as_slice(), "1"), (b"vs_link_dll", "2")] {
         let host = PureHost::default();
         host.env_set(b"Path", Some(b"C:/Existing Path"));
@@ -40,7 +40,18 @@ fn embeds_manifests_without_expanding_the_linker_command_length() {
             assert_eq!(request.pipeline[0].program, "C:/VC Tools/link.exe");
             assert_eq!(
                 request.pipeline[0].args,
-                ["@link args.rsp", &format!("/MANIFEST:EMBED,ID={id}"), "/MANIFESTINPUT:extra file.manifest"]
+                [
+                    "/OUT:target dir/main.exe",
+                    "/INCREMENTAL:NO",
+                    "/DKEY=\"with space\"",
+                    "C:\\object dir\\leaf\\",
+                    "my'file.obj",
+                    "@CMakeFiles/objects.rsp",
+                    "@.o/first.rsp",
+                    "@.o\\second.rsp",
+                    &format!("/MANIFEST:EMBED,ID={id}"),
+                    "/MANIFESTINPUT:extra file.manifest",
+                ]
             );
             assert!(request.env.iter().any(|(key, value)| key == b"Path" && value == b"C:/Existing Path;C:/SDK Tools"));
             Ok(exit(0))
@@ -59,6 +70,9 @@ fn embeds_manifests_without_expanding_the_linker_command_length() {
                     "--",
                     "C:/VC Tools/link.exe",
                     "@link args.rsp",
+                    "@CMakeFiles/objects.rsp",
+                    "@.o/first.rsp",
+                    "@.o\\second.rsp",
                 ]
             ),
             0
@@ -89,12 +103,15 @@ fn retains_manifest_no_and_adds_an_embed_option_for_explicit_input() {
         if explicit {
             args.extend(["--manifests", "user.manifest"]);
         }
-        args.extend(["--", "link", "/Fe", "target path/main.exe", "/MANIFEST:NO"]);
+        if explicit {
+            args.push("--");
+        }
+        args.extend(["link", "/Fe", "target path/main.exe", "/MANIFEST:NO"]);
 
-        assert_eq!(command(&host, b"vs_link_exe", &args), 7);
+        assert_eq!(command(&host, b"vs_link_exe", &args), -1);
         assert!(
             host.stream_bytes(Stream::Stderr)
-                .contains_str(b"LINK failed with exit code 7.")
+                .contains_str(b"LINK: command link /Fe 'target path/main.exe' /MANIFEST:NO")
         );
     }
 }
@@ -179,6 +196,7 @@ fn propagates_each_incremental_tool_failure() {
     for (program, exit_code) in [("rc", 12), ("link", 23), ("mt", 34)] {
         let host = PureHost::default();
         host.set_command_handler(move |host, request, _| {
+            assert_eq!(request.stderr, Output::SharedWithStdout);
             let tool = &request.pipeline[0];
             if tool.program == b"link" {
                 host.seed_file(Path::new("/work/obj/intermediate.manifest"), b"manifest")?;
@@ -204,7 +222,7 @@ fn propagates_each_incremental_tool_failure() {
                     "/out:demo.exe",
                 ]
             ),
-            exit_code
+            if program == "mt" { exit_code } else { -1 }
         );
         assert!(
             host.stream_bytes(Stream::Stderr)

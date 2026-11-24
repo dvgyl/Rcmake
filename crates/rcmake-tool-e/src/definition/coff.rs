@@ -9,6 +9,7 @@ const SECTION_SIZE: usize = 40;
 const SECTION_EXECUTE: u32 = 0x2000_0000;
 const SECTION_READ: u32 = 0x4000_0000;
 const SECTION_WRITE: u32 = 0x8000_0000;
+pub(super) const ARM64EC: u16 = 0xa641;
 
 struct Header {
     machine: u16,
@@ -49,11 +50,7 @@ impl Header {
                 symbol_size: 18,
             }
         };
-        matches!(
-            header.machine,
-            0x14c | 0x8664 | 0x1c0 | 0x1c4 | 0xaa64 | 0xa641
-        )
-        .then_some(header)
+        Some(header)
     }
 }
 
@@ -61,10 +58,34 @@ pub(super) fn exports(
     bytes: &[u8],
     data: &mut BTreeSet<BString>,
     functions: &mut BTreeSet<BString>,
-) -> Result<(), &'static str> {
-    let header = Header::parse(bytes)
-        .ok_or("The file is not a supported COFF object. Use --nm for LLVM bitcode.")?;
-    read_symbols(bytes, &header, data, functions).ok_or("The COFF symbol table is invalid.")
+) -> Result<bool, &'static str> {
+    let big = bytes.starts_with(b"\0\0\xff\xff")
+        && (bytes.get(12..28) == Some(BIGOBJ_CLASS.as_slice())
+            || word(bytes, 4).is_none_or(|version| version >= 2));
+    if !big
+        && !matches!(
+            machine(bytes),
+            0x14c | 0x8664 | 0x1c0 | 0x1c4 | 0xaa64 | ARM64EC
+        )
+    {
+        return Ok(false);
+    }
+    // Short import objects share the first four bytes with bigobj.
+    if !big && bytes.starts_with(b"\0\0\xff\xff") {
+        return Ok(false);
+    }
+    let header = Header::parse(bytes).ok_or("The COFF header is invalid.")?;
+    read_symbols(bytes, &header, data, functions).ok_or("The COFF symbol table is invalid.")?;
+    Ok(true)
+}
+
+pub(super) fn machine(bytes: &[u8]) -> u16 {
+    let offset = if bytes.starts_with(b"\0\0\xff\xff") {
+        6
+    } else {
+        0
+    };
+    word(bytes, offset).unwrap_or_default()
 }
 
 fn read_symbols(
@@ -122,7 +143,7 @@ fn read_symbols(
             continue;
         }
         let vftable = name.starts_with(b"??_7");
-        if (kind == 0 && flags & SECTION_WRITE != 0) || (vftable && header.machine == 0xa641) {
+        if (kind == 0 && flags & SECTION_WRITE != 0) || (vftable && header.machine == ARM64EC) {
             data.insert(name.into());
         } else if kind != 0 || flags & SECTION_READ == 0 || flags & SECTION_EXECUTE != 0 || vftable
         {
@@ -145,7 +166,7 @@ fn name<'a>(entry: &'a [u8], strings: &'a [u8]) -> Option<&'a [u8]> {
     long.get(..long.iter().position(|&byte| byte == 0)?)
 }
 
-fn normalize(name: &[u8], machine: u16) -> &[u8] {
+pub(super) fn normalize(name: &[u8], machine: u16) -> &[u8] {
     let mut name = name.trim_ascii_start();
     if name.starts_with(b"_") {
         if let Some(suffix) = name.iter().position(|&byte| byte == b'@') {
@@ -158,7 +179,7 @@ fn normalize(name: &[u8], machine: u16) -> &[u8] {
     name
 }
 
-fn excluded(name: &[u8], machine: u16) -> bool {
+pub(super) fn excluded(name: &[u8], machine: u16) -> bool {
     name.is_empty()
         || name.contains(&b'.')
         || name
@@ -172,7 +193,7 @@ fn excluded(name: &[u8], machine: u16) -> bool {
         || name
             .iter()
             .all(|byte| b"=<>+-*/%,?|~!^&[]()".contains(byte))
-        || (machine == 0xa641
+        || (machine == ARM64EC
             && [
                 b"$entry_thunk".as_slice(),
                 b"$ientry_thunk",

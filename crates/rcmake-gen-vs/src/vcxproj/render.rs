@@ -1,6 +1,11 @@
 //! Render the project plan as MSBuild XML.
 
-use crate::{MSBUILD_NS, relative, xml::Writer};
+use crate::{
+    MSBUILD_NS,
+    cuda::{self, ImportKind},
+    relative,
+    xml::Writer,
+};
 
 use super::*;
 
@@ -46,6 +51,11 @@ pub(crate) fn render(ctx: &Context<'_>, plan: &Plan) -> String {
     xml.text("Platform", &[], &settings.platform);
     xml.text("ProjectName", &[], &project.name);
     xml.text("VCProjectUpgraderObjectName", &[], "NoUpgrade");
+    if let Some(root) = &settings.cuda_toolkit
+        && plan.configs.values().any(|config| config.cuda.is_some())
+    {
+        cuda::cuda_toolkit_custom_dir(&mut xml, root);
+    }
     if let Some(target) = project.target.and_then(|id| ctx.model.target(id)) {
         for key in target.props.names() {
             let name = string(&key);
@@ -84,7 +94,9 @@ pub(crate) fn render(ctx: &Context<'_>, plan: &Plan) -> String {
         "Import",
         &[("Project", r"$(VCTargetsPath)\Microsoft.Cpp.props")],
     );
-    xml.empty("ImportGroup", &[("Label", "ExtensionSettings")]);
+    xml.start("ImportGroup", &[("Label", "ExtensionSettings")]);
+    ctx.tool_imports(&mut xml, plan, ImportKind::Props);
+    xml.end();
     xml.start("ImportGroup", &[("Label", "PropertySheets")]);
     xml.empty(
         "Import",
@@ -153,6 +165,9 @@ pub(crate) fn render(ctx: &Context<'_>, plan: &Plan) -> String {
         config.resource.write(&mut xml);
         xml.end();
         xml.empty("Midl", &[]);
+        if let Some(cuda) = &config.cuda {
+            ctx.write_cuda_config(&mut xml, cuda);
+        }
         if project.kind == TargetKind::StaticLibrary {
             xml.start("Lib", &[]);
             config.link.write(&mut xml);
@@ -189,8 +204,8 @@ pub(crate) fn render(ctx: &Context<'_>, plan: &Plan) -> String {
         }
         xml.end();
     }
-    write_items(&mut xml, plan, settings, true);
-    write_items(&mut xml, plan, settings, false);
+    write_items(&mut xml, ctx, plan, true);
+    write_items(&mut xml, ctx, plan, false);
     if !project.dependencies.is_empty() {
         xml.start("ItemGroup", &[]);
         for dep in project
@@ -242,12 +257,7 @@ pub(crate) fn render(ctx: &Context<'_>, plan: &Plan) -> String {
         );
         for (name, config) in &plan.configs {
             if !config.link_output_dirs.is_empty() {
-                let dirs = config
-                    .link_output_dirs
-                    .iter()
-                    .map(|dir| msbuild(&windows(dir)))
-                    .collect::<Vec<_>>()
-                    .join(";");
+                let dirs = config.link_output_dirs.join(";");
                 xml.empty(
                     "MakeDir",
                     &[
@@ -269,11 +279,14 @@ pub(crate) fn render(ctx: &Context<'_>, plan: &Plan) -> String {
             ],
         );
     }
-    xml.empty("ImportGroup", &[("Label", "ExtensionTargets")]);
+    xml.start("ImportGroup", &[("Label", "ExtensionTargets")]);
+    ctx.tool_imports(&mut xml, plan, ImportKind::Targets);
+    xml.end();
     xml.finish()
 }
 
-fn write_items(xml: &mut Writer, plan: &Plan, settings: &Settings, custom: bool) {
+fn write_items(xml: &mut Writer, ctx: &Context<'_>, plan: &Plan, custom: bool) {
+    let settings = ctx.settings;
     let mut items = plan
         .items
         .values()
@@ -284,6 +297,10 @@ fn write_items(xml: &mut Writer, plan: &Plan, settings: &Settings, custom: bool)
     }
     xml.start("ItemGroup", &[]);
     for item in items {
+        if matches!(item.kind, Kind::Cuda | Kind::Masm | Kind::Nasm) {
+            ctx.write_tool_item(xml, item);
+            continue;
+        }
         let path = msbuild(&windows(&item.path));
         let attrs = [("Include", path.as_str())];
         if matches!(item.kind, Kind::Header | Kind::Other) {

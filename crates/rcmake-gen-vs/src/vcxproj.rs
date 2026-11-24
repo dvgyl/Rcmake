@@ -16,6 +16,7 @@ use crate::{
     string, windows,
 };
 
+mod extensions;
 mod fallback;
 mod link;
 mod render;
@@ -36,6 +37,9 @@ pub(crate) struct Context<'a> {
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum Kind {
     Compile,
+    Cuda,
+    Masm,
+    Nasm,
     Header,
     Resource,
     Object,
@@ -47,6 +51,9 @@ impl Kind {
     pub(crate) fn tag(self) -> &'static str {
         match self {
             Self::Compile => "ClCompile",
+            Self::Cuda => "CudaCompile",
+            Self::Masm => "MASM",
+            Self::Nasm => "NASM",
             Self::Header => "ClInclude",
             Self::Resource => "ResourceCompile",
             Self::Object => "Object",
@@ -57,11 +64,24 @@ impl Kind {
 
     pub(crate) fn default_group(self) -> &'static str {
         match self {
-            Self::Compile | Self::Object => "Source Files",
+            Self::Compile | Self::Cuda | Self::Masm | Self::Nasm | Self::Object => "Source Files",
             Self::Header => "Header Files",
             Self::Resource => "Resource Files",
             Self::Custom => "CMake Rules",
             Self::Other => "",
+        }
+    }
+
+    fn compiles(self) -> bool {
+        matches!(self, Self::Compile | Self::Cuda | Self::Masm | Self::Nasm)
+    }
+
+    fn from_language(language: &[u8], fallback: Self) -> Self {
+        match crate::cuda::Assembler::from_language(language) {
+            Some(crate::cuda::Assembler::Masm) => Self::Masm,
+            Some(crate::cuda::Assembler::Nasm) => Self::Nasm,
+            None if language == b"CUDA" => Self::Cuda,
+            None => fallback,
         }
     }
 }
@@ -80,6 +100,7 @@ struct SourceConfig {
     language: String,
     object: String,
     compile: Option<flags_table::Settings>,
+    tool_compile: Option<IdeCompileSettings>,
     rule: Option<Rule>,
 }
 
@@ -104,6 +125,7 @@ struct Config {
     generate_manifest: Option<String>,
     debugger: Vec<(&'static str, String)>,
     dpi_aware: Option<&'static str>,
+    cuda: Option<extensions::CudaConfig>,
 }
 
 impl Plan {
@@ -197,10 +219,10 @@ impl Context<'_> {
                     }
                     compiled
                 };
-                let languages = ide
-                    .compile
-                    .iter()
-                    .filter(|settings| settings.language != b"RC");
+                let languages = ide.compile.iter().filter(|settings| {
+                    settings.language != b"RC"
+                        && Kind::from_language(&settings.language, Kind::Compile) == Kind::Compile
+                });
                 let use_common = languages.clone().count() == 1;
                 if use_common && let Some(settings) = languages.clone().next() {
                     config.compile = target_compile(settings);
@@ -215,17 +237,31 @@ impl Context<'_> {
                 for source in &ide.sources {
                     let path = self.source_path(&string(&source.path));
                     let (kind, language) = match &source.kind {
-                        IdeSourceKind::Compile { language } => {
-                            (source_kind(&path, Kind::Compile), string(language))
-                        }
+                        IdeSourceKind::Compile { language } => (
+                            Kind::from_language(
+                                language,
+                                self.fallback_source_kind(&path, Kind::Compile),
+                            ),
+                            string(language),
+                        ),
                         IdeSourceKind::Header => (Kind::Header, String::new()),
                         IdeSourceKind::Resource => (source_kind(&path, Kind::Other), String::new()),
                         IdeSourceKind::Object | IdeSourceKind::ExternalObject => {
                             (Kind::Object, String::new())
                         }
-                        IdeSourceKind::ListFile | IdeSourceKind::Other => {
-                            (Kind::Other, String::new())
+                        IdeSourceKind::Other => {
+                            let kind = match self.fallback_source_kind(&path, Kind::Other) {
+                                Kind::Masm => Kind::Masm,
+                                Kind::Nasm
+                                    if self.definition(b"CMAKE_ASM_NASM_COMPILER").is_some() =>
+                                {
+                                    Kind::Nasm
+                                }
+                                _ => Kind::Other,
+                            };
+                            (kind, String::new())
                         }
+                        IdeSourceKind::ListFile => (Kind::Other, String::new()),
                     };
                     let kind = if self.project.kind == TargetKind::InterfaceLibrary {
                         Kind::Other
@@ -259,6 +295,9 @@ impl Context<'_> {
                         item.language = language;
                     } else if kind == Kind::Resource {
                         item.compile = source.compile.as_ref().map(visual_studio_compile);
+                    } else if kind.compiles() {
+                        item.object = self.object_path(&path, name, fact);
+                        item.tool_compile.clone_from(&source.compile);
                     }
                 }
                 if let Some(resource) = ide
@@ -292,6 +331,7 @@ impl Context<'_> {
                 self.fallback(&mut plan, &mut config, fact, &steps, link, name);
             }
             self.windows_link(&plan, &mut config, fact, name);
+            self.toolchain_settings(&plan, &mut config, fact, name)?;
             let property = |key: &[u8]| {
                 fact.and_then(|fact| fact.ide.as_ref())
                     .and_then(|ide| ide.attributes.get(key))
@@ -522,6 +562,8 @@ fn source_kind(path: &str, otherwise: Kind) -> Kind {
         .as_str()
     {
         "c" | "cc" | "cpp" | "cxx" | "c++" | "ixx" | "cppm" => Kind::Compile,
+        "cu" => Kind::Cuda,
+        "nasm" => Kind::Nasm,
         "h" | "hh" | "hpp" | "hxx" | "inl" => Kind::Header,
         "rc" => Kind::Resource,
         "obj" | "o" => Kind::Object,

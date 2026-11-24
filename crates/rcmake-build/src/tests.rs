@@ -521,3 +521,53 @@ fn windows_shell_fragment_runs_from_a_temporary_command_file() {
         std::io::ErrorKind::NotFound
     );
 }
+
+#[test]
+fn windows_compound_rule_uses_comspec_and_preserves_literal_arguments() {
+    use rcmake_base::shell::quote;
+
+    let host = PureHost::default();
+    host.env_set(b"COMSPEC", Some(b"C:/Windows/System32/cmd.exe"));
+    host.set_command_handler(|host, request, _| {
+        let tool = &request.pipeline[0];
+        assert_eq!(tool.program, "C:/Windows/System32/cmd.exe");
+        assert_eq!(tool.args[..3], ["/D", "/V:OFF", "/C"]);
+        let path = request.cwd.join(path::to_native(&tool.args[3][2..]));
+        assert_eq!(
+            host.read(&path, ReadRange::All { limit: 1024 })?,
+            concat!(
+                "@echo off\r\n",
+                r#""C:\MSVC Tools\cl.exe" "C:\100%% complete\\" && link.exe "/PDB:symbol dir\build%%PATH%%.pdb""#,
+                "\r\n"
+            ).as_bytes(),
+        );
+        assert!(host.metadata(&request.cwd.join("symbol dir"), Follow::Yes)?.kind == rcmake_host::FileKind::Dir);
+        Ok(RunOutput {
+            results: vec![ProcessResult::Exited(0)],
+            ..RunOutput::default()
+        })
+    }).unwrap();
+    let shell = BString::from(format!(
+        "{} {} && link.exe {}",
+        quote(br"C:\MSVC Tools\cl.exe"),
+        quote(br"C:\100% complete\"),
+        quote(br"/PDB:symbol dir\build%PATH%.pdb"),
+    ));
+    let invocation = Invocation {
+        argv: vec!["sh".into(), "-c".into(), shell.clone()],
+        shell,
+        working_dir: None,
+    };
+    assert_eq!(
+        run(
+            &host,
+            Path::new("/work"),
+            &invocation,
+            true,
+            false,
+            &mut Vec::new()
+        )
+        .unwrap(),
+        0
+    );
+}

@@ -56,6 +56,7 @@ fn write_definition(
         .read(&path(cx, response), read_all())
         .map_err(|err| err.to_string())?;
     let mut objects = Vec::new();
+    let mut machines = BTreeMap::new();
     for line in list
         .lines()
         .map(<[u8]>::trim_ascii)
@@ -77,7 +78,23 @@ fn write_definition(
                 explicit.insert(BString::from(name), BString::from(entry));
             }
         } else {
-            objects.push(line);
+            let object = path(cx, line);
+            let file = cx
+                .host
+                .read(&object, read_all())
+                .map_err(|error| format!("{}: {error}", object.display()))?;
+            if !coff::exports(&file, &mut data, &mut exports)
+                .map_err(|message| format!("{}: {message}", object.display()))?
+            {
+                if nm.is_none() {
+                    return Err(format!(
+                        "{} is not a supported COFF object. Use --nm for LLVM bitcode.",
+                        object.display()
+                    ));
+                }
+                objects.push(line);
+                machines.insert(object, coff::machine(&file));
+            }
         }
     }
     if let Some(nm) = nm.filter(|_| !objects.is_empty()) {
@@ -98,6 +115,11 @@ fn write_definition(
                     String::from_utf8_lossy(line)
                 ));
             };
+            let machine = machines.get(&path(cx, object)).copied().unwrap_or_default();
+            let symbol = coff::normalize(symbol, machine);
+            if coff::excluded(symbol, machine) {
+                continue;
+            }
             match kind {
                 b"B" | b"D" => {
                     data.insert(BString::from(symbol));
@@ -106,7 +128,11 @@ fn write_definition(
                     exports.insert(BString::from(symbol));
                 }
                 b"R" if symbol.starts_with(b"??_7") => {
-                    exports.insert(BString::from(symbol));
+                    if machine == coff::ARM64EC {
+                        data.insert(BString::from(symbol));
+                    } else {
+                        exports.insert(BString::from(symbol));
+                    }
                 }
                 b"A" | b"C" | b"I" | b"N" | b"R" | b"S" | b"U" | b"V" | b"W" | b"a" | b"b"
                 | b"c" | b"d" | b"i" | b"n" | b"r" | b"s" | b"t" | b"v" | b"w" => {}
@@ -124,15 +150,6 @@ fn write_definition(
                     ],
                 ),
             }
-        }
-    } else {
-        for object in objects {
-            let file = cx
-                .host
-                .read(&path(cx, object), read_all())
-                .map_err(|err| err.to_string())?;
-            coff::exports(&file, &mut data, &mut exports)
-                .map_err(|message| format!("{}: {message}", BString::from(object)))?;
         }
     }
     data.retain(|name| !explicit.contains_key(name));

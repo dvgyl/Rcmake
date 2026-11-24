@@ -458,22 +458,28 @@ fn run(
         },
     );
     let mut script = None;
-    let (program, args) = match invocation.argv.split_first() {
-        Some((program, args)) => {
-            if windows {
-                windows::prepare_outputs(host, &cwd, args)?;
-            }
-            (program.clone(), args.to_vec())
-        }
-        None if windows => {
-            let (command, file) = windows::shell_command(host, &cwd, &invocation.shell)?;
-            script = Some(file);
+    let batch = windows.then(|| windows::batch_rule(invocation)).flatten();
+    let (program, args) = if let Some((launcher, shell)) = batch {
+        let (command, file) = windows::shell_command(host, &cwd, shell)?;
+        script = Some(file);
+        if let Some((program, args)) = launcher.split_first() {
+            let mut args = args.to_vec();
+            args.push(command.program);
+            args.extend(command.args);
+            (program.clone(), args)
+        } else {
             (command.program, command.args)
         }
-        None => (
+    } else if let Some((program, args)) = invocation.argv.split_first() {
+        if windows {
+            windows::prepare_outputs(host, &cwd, args)?;
+        }
+        (program.clone(), args.to_vec())
+    } else {
+        (
             "/bin/sh".into(),
             vec!["-c".into(), invocation.shell.clone()],
-        ),
+        )
     };
     if verbose {
         if invocation.shell.is_empty() {

@@ -1,4 +1,4 @@
-//! Read MSVC response files while retaining linker response file arguments.
+//! Expand NMake response files and retain CMake-owned response file arguments.
 
 use rcmake_base::BString;
 use rcmake_host::{CommandSpec, ReadRange};
@@ -8,52 +8,48 @@ use super::{ToolCtx, path};
 pub(super) struct Expanded {
     pub(super) options: Vec<BString>,
     pub(super) tool: CommandSpec,
-    pub(super) inspected: Vec<BString>,
 }
 
 pub(super) fn expand(args: &[BString], cx: &ToolCtx<'_>) -> Result<Expanded, String> {
     let mut budget = 16 * 1024 * 1024;
-    let mut prefix = Vec::new();
-    let mut linker = Vec::new();
-    let mut separator = false;
+    let mut expanded = Vec::new();
     for arg in args {
-        if separator {
-            linker.push(arg.clone());
-        } else if let Some(file) = arg.strip_prefix(b"@") {
-            for arg in read(cx, file, &mut budget)? {
-                if separator {
-                    linker.push(arg);
-                } else if arg == b"--" {
-                    separator = true;
-                } else {
-                    prefix.push(arg);
-                }
-            }
-        } else if arg == b"--" {
-            separator = true;
+        if let Some(file) = arg.strip_prefix(b"@").filter(|_| !retained(arg)) {
+            expanded.extend(read(cx, file, &mut budget)?);
         } else {
-            prefix.push(arg.clone());
+            expanded.push(arg.clone());
         }
     }
 
-    let mut linker = linker.into_iter();
-    let Some(program) = linker.next().filter(|program| !program.is_empty()) else {
-        return Err("The link wrapper requires -- followed by a linker command.".into());
-    };
-    let args: Vec<_> = linker.collect();
-    let mut inspected = Vec::new();
-    for arg in &args {
-        if let Some(file) = arg.strip_prefix(b"@") {
-            inspected.extend(read(cx, file, &mut budget)?);
-        } else {
-            inspected.push(arg.clone());
+    let mut linker = expanded.into_iter().peekable();
+    let mut options = Vec::new();
+    while linker.peek().is_some_and(|arg| arg.starts_with(b"-")) {
+        let Some(arg) = linker.next() else { break };
+        if arg == b"--" {
+            break;
+        }
+        let manifests = arg == b"--manifests";
+        options.push(arg);
+        if manifests {
+            while let Some(arg) = linker.next_if(|arg| !arg.starts_with(b"-")) {
+                options.push(arg);
+            }
         }
     }
+    let Some(program) = linker.next().filter(|program| !program.is_empty()) else {
+        return Err("The link wrapper requires a linker command.".into());
+    };
     Ok(Expanded {
-        options: prefix,
-        tool: CommandSpec { program, args },
-        inspected,
+        options,
+        tool: CommandSpec {
+            program,
+            args: linker.collect(),
+        },
     })
+}
+
+fn retained(arg: &[u8]) -> bool {
+    arg.starts_with(b"@CMakeFiles") || arg.starts_with(b"@.o/") || arg.starts_with(b"@.o\\")
 }
 
 fn read(cx: &ToolCtx<'_>, file: &[u8], budget: &mut u64) -> Result<Vec<BString>, String> {
@@ -80,7 +76,10 @@ fn read(cx: &ToolCtx<'_>, file: &[u8], budget: &mut u64) -> Result<Vec<BString>,
     } else {
         words(contents.strip_prefix(b"\xef\xbb\xbf").unwrap_or(&contents))
     }?;
-    if words.iter().any(|word| word.starts_with(b"@")) {
+    if words
+        .iter()
+        .any(|word| word.starts_with(b"@") && !retained(word))
+    {
         return Err("The linker response file contains a nested response file.".into());
     }
     Ok(words)

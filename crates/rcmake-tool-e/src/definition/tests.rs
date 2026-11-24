@@ -63,3 +63,45 @@ fn merges_coff_and_explicit_exports_without_nm() {
     assert_ne!(run(&args, &ctx), 0);
     assert!(host.stream_bytes(Stream::Stderr).contains_str("COFF"));
 }
+
+#[test]
+fn sends_only_non_coff_objects_to_nm() {
+    let host = PureHost::default();
+    let cwd = Path::new("/work");
+    let ctx = ToolCtx {
+        host: &host,
+        cwd,
+        exe_display: b"cmake",
+        capabilities: &|| rcmake_json::Value::Null,
+    };
+    host.seed_file(&cwd.join("objects.rsp"), b"native.obj\nbitcode.obj\n")
+        .unwrap();
+    host.seed_file(&cwd.join("native.obj"), &object()).unwrap();
+    host.seed_file(&cwd.join("bitcode.obj"), b"BC\xc0\xde")
+        .unwrap();
+    host.set_command_handler(|host, request, _| {
+        let tool = &request.pipeline[0];
+        let response = tool.args.last().unwrap().strip_prefix(b"@").unwrap();
+        assert_eq!(
+            host.read(&native::to_native(response), read_all())?,
+            b"\"bitcode.obj\"\n"
+        );
+        Ok(rcmake_host::RunOutput {
+            results: vec![ProcessResult::Exited(0)],
+            stdout: b"bitcode.obj: _external@8 T 0 1\nbitcode.obj: ??_Gexcluded T 0 1\n".to_vec(),
+            ..Default::default()
+        })
+    })
+    .unwrap();
+    assert_eq!(
+        run(
+            &["export.def".into(), "objects.rsp".into(), "--nm=nm".into()],
+            &ctx
+        ),
+        0
+    );
+    assert_eq!(
+        host.read(&cwd.join("export.def"), read_all()).unwrap(),
+        b"EXPORTS \n\tvariable \t DATA\n\t_external\n\tfunction\n\tmore_than_eight\n"
+    );
+}

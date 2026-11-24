@@ -312,7 +312,7 @@ pub(super) fn generate(
                 has_depfiles.then_some(sidecar.as_path()),
             );
             if let Err(error) = result {
-                return Err(format!("{error}\nIncluders: {:?}.", job.includers));
+                return Err(super::with_includers(error, &job.includers));
             }
             if has_depfiles {
                 dependencies = if timestamp(cx, &sidecar).is_some() {

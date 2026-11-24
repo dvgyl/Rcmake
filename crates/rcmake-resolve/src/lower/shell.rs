@@ -1,6 +1,6 @@
 //! Process arguments and POSIX shell command lines.
 
-use rcmake_base::{BString, list, shell::quote};
+use rcmake_base::{BString, list, shell::quote, truth};
 use rcmake_model::{DirId, ProjectModel};
 
 use super::{definition, expand_rule};
@@ -123,7 +123,17 @@ pub(super) fn rule_invocations(
     };
     list::split(template, list::Empty::Drop)
         .into_iter()
-        .map(|rule| expand_rule(&rule, |key| lookup(key).or_else(|| expander.value(key))))
+        .map(|rule| {
+            expand_rule(&rule, |key| {
+                lookup(key).or_else(|| {
+                    if key == b"CUDA_COMPILE_MODE" {
+                        Some(expander.cuda_compile_mode(lookup(b"TARGET_NAME")))
+                    } else {
+                        expander.value(key)
+                    }
+                })
+            })
+        })
         .filter(|shell| shell.iter().any(|b| !b.is_ascii_whitespace()))
         .map(command)
         .collect()
@@ -138,6 +148,43 @@ struct RuleExpander<'a> {
 impl RuleExpander<'_> {
     fn definition(&self, key: &[u8]) -> Option<&[u8]> {
         definition(self.model, self.dir, key).map(|value| value.as_slice())
+    }
+
+    fn cuda_compile_mode(&self, target_name: Option<BString>) -> BString {
+        let target = target_name
+            .and_then(|name| simple_args(&name))
+            .and_then(|args| self.model.find_target(self.dir, args.first()?))
+            .and_then(|id| self.model.target(id));
+        let enabled = |name: &[u8]| {
+            target
+                .and_then(|target| target.props.get(name))
+                .is_some_and(|value| truth::is_on(value))
+        };
+        let clang = self.definition(b"CMAKE_CUDA_COMPILER_ID") == Some(b"Clang".as_slice());
+        let rdc = enabled(b"CUDA_SEPARABLE_COMPILATION").then(|| {
+            self.definition(b"_CMAKE_CUDA_RDC_FLAG")
+                .unwrap_or(if clang { b"-fgpu-rdc" } else { b"-rdc=true" })
+        });
+        let (mode, fallback): (&[u8], &[u8]) = [
+            (
+                b"PTX".as_slice(),
+                if clang {
+                    b"--cuda-device-only -S".as_slice()
+                } else {
+                    b"-ptx"
+                },
+            ),
+            (b"CUBIN", b"-cubin"),
+            (b"FATBIN", b"-fatbin"),
+            (b"OPTIX", b"-optix-ir"),
+        ]
+        .into_iter()
+        .find(|(mode, _)| enabled(&[b"CUDA_", *mode, b"_COMPILATION"].concat()))
+        .unwrap_or((b"WHOLE", b"-c"));
+        let flag = self
+            .definition(&[b"_CMAKE_CUDA_", mode, b"_FLAG"].concat())
+            .unwrap_or(fallback);
+        join_words(rdc.into_iter().chain([flag]).map(BString::from))
     }
 
     fn value(&self, key: &[u8]) -> Option<BString> {
@@ -205,6 +252,56 @@ impl RuleExpander<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn expands_cuda_whole_and_target_compile_modes() -> Result<(), rcmake_model::ModelError> {
+        use rcmake_model::{Target, TargetKind, TargetOrigin};
+
+        let mut model = ProjectModel::default();
+        let id = model.add_target(Target::new(
+            "kernels".into(),
+            TargetKind::ObjectLibrary,
+            TargetOrigin::Normal,
+            DirId::ROOT,
+            Default::default(),
+            Default::default(),
+        ))?;
+        let compile = |model: &ProjectModel, name: Option<&str>| {
+            rule_invocations(model, DirId::ROOT, b"nvcc <CUDA_COMPILE_MODE>", |key| {
+                (key == b"TARGET_NAME")
+                    .then_some(name)
+                    .flatten()
+                    .map(|name| quote(name.as_bytes()))
+            })
+            .remove(0)
+            .argv
+        };
+        assert_eq!(compile(&model, None), ["nvcc", "-c"]);
+        let modes = ["PTX", "CUBIN", "FATBIN", "OPTIX"];
+        for (mode, flag) in modes
+            .into_iter()
+            .zip(["-ptx", "-cubin", "-fatbin", "-optix-ir"])
+        {
+            let target = model
+                .target_mut(id)
+                .ok_or(rcmake_model::ModelError::InvalidValue)?;
+            target
+                .props
+                .set("CUDA_SEPARABLE_COMPILATION".into(), "ON".into());
+            for candidate in modes {
+                let enabled = candidate == mode || candidate == "OPTIX";
+                target.props.set(
+                    format!("CUDA_{candidate}_COMPILATION").into(),
+                    if enabled { "ON".into() } else { "OFF".into() },
+                );
+            }
+            assert_eq!(
+                compile(&model, Some("kernels")),
+                ["nvcc", "-rdc=true", flag]
+            );
+        }
+        Ok(())
+    }
 
     #[test]
     fn compile_and_link_select_their_sysroots_and_preserve_tool_arguments() {

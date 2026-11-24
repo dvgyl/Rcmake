@@ -17,6 +17,7 @@ use rcmake_resolve::GenerationResult;
 use plan::Project;
 
 pub mod build;
+mod cuda;
 pub mod filters;
 pub mod flags_table;
 pub mod guid;
@@ -42,6 +43,9 @@ pub(crate) struct Settings {
     toolset: String,
     tool_host: Option<String>,
     tool_version: Option<String>,
+    cuda_version: Option<String>,
+    cuda_toolkit: Option<String>,
+    nasm_templates: Option<String>,
     cmake: String,
     ctest: String,
     cpack: String,
@@ -106,6 +110,7 @@ pub fn generate(
 
 fn write_project(host: &dyn Host, context: &vcxproj::Context<'_>) -> Result<(), GenError> {
     let plan = context.plan()?;
+    context.write_tool_imports(host, &plan)?;
     for item in plan.items.values().filter(|item| item.synthetic) {
         write(host, &item.path, b"# MSBuild custom command\r\n")?;
     }
@@ -173,6 +178,30 @@ impl Settings {
         let mut unique = BTreeSet::new();
         configs.retain(|name| unique.insert(name.to_ascii_lowercase()));
         let bin = string(&from_native(bin));
+        let cuda_toolset = toolset.and_then(|toolset| toolset.cuda.as_ref());
+        let cuda_toolkit = var(b"CMAKE_VS_PLATFORM_TOOLSET_CUDA_CUSTOM_DIR")
+            .or_else(|| {
+                cuda_toolset.filter(|value| value.iter().any(|byte| matches!(byte, b'/' | b'\\')))
+            })
+            .map(|value| absolute(&bin, &string(value)));
+        let cuda_version = var(b"CMAKE_VS_PLATFORM_TOOLSET_CUDA")
+            .or_else(|| cuda_toolset.filter(|_| cuda_toolkit.is_none()))
+            .or_else(|| var(b"CMAKE_CUDA_COMPILER_VERSION"))
+            .map(|value| string(value))
+            .and_then(|version| {
+                let mut parts = version.split('.');
+                let (major, minor) = (parts.next()?, parts.next()?);
+                (major.parse::<u32>().is_ok() && minor.parse::<u32>().is_ok())
+                    .then(|| format!("{major}.{minor}"))
+            });
+        let nasm_templates = var(b"CMAKE_ROOT")
+            .map(|root| string(root))
+            .or_else(|| {
+                rcmake_host::discover_cmake_root(host, result.metadata.cmake_command.as_ref())
+                    .1
+                    .map(|root| string(&from_native(&root)))
+            })
+            .map(|root| join(&root, "Templates/MSBuild"));
         let executable = |primary: Option<&BString>, key: &[u8], default: &str| {
             primary
                 .filter(|path| !path.is_empty())
@@ -205,6 +234,9 @@ impl Settings {
                 .and_then(|t| t.version.as_ref())
                 .or_else(|| var(b"CMAKE_VS_PLATFORM_TOOLSET_VERSION"))
                 .map(|value| string(value)),
+            cuda_version,
+            cuda_toolkit,
+            nasm_templates,
             cmake: executable(
                 result.metadata.cmake_command.as_ref(),
                 b"CMAKE_COMMAND",

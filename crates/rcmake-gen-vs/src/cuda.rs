@@ -25,7 +25,7 @@ impl Default for OptionText<'_> {
 }
 
 impl OptionText<'_> {
-    fn escaped(self) -> String {
+    pub(crate) fn escaped(self) -> String {
         let mut text = match self {
             Self::Literal(text) => return msbuild(text),
             Self::WithProperties(text) => text,
@@ -259,6 +259,8 @@ impl Assembler {
 pub(crate) struct SourceOptions<'a> {
     /// Project-relative file path.
     pub(crate) path: &'a str,
+    /// Configuration condition for this source item.
+    pub(crate) condition: Option<&'a str>,
     /// Conditions for configurations that exclude this source.
     pub(crate) excluded_conditions: &'a [String],
     /// Source-level include directories.
@@ -271,6 +273,8 @@ pub(crate) struct SourceOptions<'a> {
     pub(crate) dependencies: &'a [String],
     /// Custom NASM output path. The import supplies the default.
     pub(crate) nasm_output: Option<OptionText<'a>>,
+    /// Object file path for a CUDA or MASM source.
+    pub(crate) object_output: Option<&'a str>,
     /// NASM output switch from the Visual Studio flag table.
     pub(crate) nasm_output_switch: Option<&'a str>,
 }
@@ -301,13 +305,25 @@ fn source_item(
     source: &SourceOptions<'_>,
 ) {
     let path = msbuild(&windows(source.path));
-    xml.start(item, &[("Include", &path)]);
+    let mut attrs = vec![("Include", path.as_str())];
+    if let Some(condition) = source.condition {
+        attrs.push(("Condition", condition));
+    }
+    xml.start(item, &attrs);
     for condition in source.excluded_conditions {
         xml.text("ExcludedFromBuild", &[("Condition", condition)], "true");
     }
     include_paths(xml, include_property, source.includes, nasm);
     defines(xml, define_property, source.defines);
     additional_options(xml, [source.additional_options], true);
+    if let Some(output) = source.object_output {
+        let property = if item == "CudaCompile" {
+            "CompileOut"
+        } else {
+            "ObjectFileName"
+        };
+        xml.text(property, &[], &msbuild(output));
+    }
     if nasm {
         if let Some(output) = source.nasm_output {
             xml.text("OutputFormat", &[], &output.escaped());

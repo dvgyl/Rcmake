@@ -115,7 +115,7 @@ pub(super) fn generate(cx: &ToolCtx<'_>, info: &Autogen, changed: bool, jobs: &J
             if let Err(error) =
                 run_generator(cx, &info.common, executable, args, &job.input, output, None)
             {
-                return Err(format!("{error}\nIncluders: {:?}.", job.includers));
+                return Err(super::with_includers(error, &job.includers));
             }
         }
     }

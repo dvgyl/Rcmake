@@ -98,6 +98,70 @@ fn compile_flags_use_last_values_and_inherit_options() {
 }
 
 #[test]
+fn writes_link_output_directories_and_cuda_and_nasm_tool_imports() {
+    let host = PureHost::default();
+    let bin = Path::new("/out");
+    let mut model = ProjectModel::default();
+    let root = model.dir_mut(DirId::ROOT);
+    for (name, value) in [
+        ("CMAKE_ROOT", "/cmake"),
+        ("CMAKE_CUDA_COMPILER_VERSION", "12.6.91"),
+        ("CMAKE_ASM_NASM_COMPILER", "C:/Assembler Tools/nasm.exe"),
+        ("CMAKE_ASM_NASM_OBJECT_FORMAT", "win64"),
+    ] {
+        root.vars.insert(name.into(), value.into());
+    }
+    host.seed_file(
+        Path::new("/cmake/Templates/MSBuild/nasm.props.in"),
+        b"<CompilerNasm>@CMAKE_ASM_NASM_COMPILER@</CompilerNasm>",
+    )
+    .unwrap();
+    let mut app = target("app", TargetKind::Executable, "kernel.cu");
+    app.sources.push(bt("start.nasm"));
+    app.props
+        .set("CUDA_SEPARABLE_COMPILATION".into(), "ON".into());
+    app.props.set("CUDA_ARCHITECTURES".into(), "75-real".into());
+    app.props.set(
+        "LINK_FLAGS".into(),
+        r#"/DEBUG:FULL /PDB:"$(IntDir)symbols/app.pdb" /IMPLIB:"link files/app.lib""#.into(),
+    );
+    model.add_target(app).unwrap();
+
+    generate(
+        VsVersion::Vs17,
+        &GenerationResult::default(),
+        &model,
+        &host,
+        bin,
+    )
+    .unwrap();
+    let file = bin.join("app.vcxproj");
+    let text = string(&host.read(&file, ReadRange::All { limit: 65536 }).unwrap());
+    for fragment in [
+        "<GenerateDebugInformation>DebugFull</GenerateDebugInformation>",
+        r"<ProgramDatabaseFile>$(IntDir)symbols\app.pdb</ProgramDatabaseFile>",
+        r#"Directories="link files;$(IntDir)symbols""#,
+        r"BuildCustomizations\CUDA 12.6.props",
+        r"BuildCustomizations\CUDA 12.6.targets",
+        r"app.dir\nasm.props",
+        r"Templates\MSBuild\nasm.targets",
+        "<GenerateRelocatableDeviceCode>true</GenerateRelocatableDeviceCode>",
+        "<PerformDeviceLink>true</PerformDeviceLink>",
+        "--generate-code=arch=compute_75,code=sm_75",
+        "<CudaCompile Include=",
+        "<NASM Include=",
+        "<Outputswitch>1</Outputswitch>",
+    ] {
+        assert!(text.contains(fragment), "{fragment}\n{text}");
+    }
+    let props = bin.join("app.dir/nasm.props");
+    assert_eq!(
+        host.read(&props, ReadRange::All { limit: 65536 }).unwrap(),
+        br"<CompilerNasm>C:\Assembler Tools\nasm.exe</CompilerNasm>"
+    );
+}
+
+#[test]
 fn build_plans_support_clean_parallel_targets_and_devenv() {
     let host = PureHost::default();
     let targets = ["app".into(), "lib.vcxproj".into()];

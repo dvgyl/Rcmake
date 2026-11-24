@@ -157,30 +157,37 @@ pub(super) fn bin2c(args: &[BString], cx: &ToolCtx<'_>) -> i32 {
 
     let output_path: Option<PathBuf> = (output != STDIO).then(|| path(cx, output));
     if let Some(path) = &output_path {
-        if let Some(parent) = path.parent()
-            && cx.host.create_dir_all(parent).is_err()
+        if output.is_empty()
+            || path.parent().is_some_and(|parent| !is_dir(cx, parent))
+            || cx.host.write(path, b"", WriteMode::Truncate).is_err()
         {
-            return 0;
-        }
-        if cx.host.write(path, b"", WriteMode::Truncate).is_err() {
-            return 0;
+            return error(
+                cx,
+                &[b"Could not open file for writing: \"", output, b"\"\n"],
+            );
         }
     }
+    let mut write_failed = false;
     let mut emit = |bytes: &[u8]| {
         if let Some(path) = &output_path {
-            let _ = cx.host.write(path, bytes, WriteMode::Append);
+            if !write_failed {
+                write_failed = cx.host.write(path, bytes, WriteMode::Append).is_err();
+            }
         } else {
             cx.host.write_out(Stream::Stdout, bytes);
         }
     };
-    match template {
-        Some(template) => render_template(&template, &raw, &options, &mut emit)
-            .map_or_else(|message| error(cx, &[message]), |()| 0),
+    let rendered = match template {
+        Some(template) => render_template(&template, &raw, &options, &mut emit),
         None => {
             render_array(&raw, &options, &mut emit);
-            0
+            Ok(())
         }
+    };
+    if write_failed {
+        return error(cx, &[b"Could not write to file: \"", output, b"\"\n"]);
     }
+    rendered.map_or_else(|message| error(cx, &[message]), |()| 0)
 }
 
 fn bin2c_options(args: &[BString]) -> Result<(Bin2cOptions<'_>, &[BString]), Vec<u8>> {

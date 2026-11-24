@@ -96,6 +96,9 @@ fn generate(cx: &ToolCtx<'_>, info: info::Autogen) -> Result<()> {
     let uic_hash = info.uic.as_ref().and_then(uic::settings_digest);
     let moc_changed = previous.get(b"moc".as_slice()) != moc_hash.as_ref();
     let uic_changed = previous.get(b"uic".as_slice()) != uic_hash.as_ref();
+    if moc_changed || uic_changed {
+        remove(cx, &info.common.settings)?;
+    }
     let moc_time = info
         .moc
         .as_ref()
@@ -340,14 +343,44 @@ fn run_tool(
     cwd: &Path,
     verbose: bool,
 ) -> Result<RunOutput> {
+    let program = from_native(executable);
+    let command = || {
+        let windows = cx.host.system().sysname.eq_ignore_ascii_case(b"Windows");
+        let mut command = BString::from(if windows { "&" } else { "" });
+        for arg in std::iter::once(&program).chain(&args) {
+            if !command.is_empty() {
+                command.push(b' ');
+            }
+            if windows {
+                command.push(b'\'');
+                for &byte in arg.as_slice() {
+                    if byte == b'\'' {
+                        command.push(byte);
+                    }
+                    command.push(byte);
+                }
+                command.push(b'\'');
+            } else {
+                command.extend_from_slice(&rcmake_base::shell::quote(arg));
+            }
+        }
+        command
+    };
     if verbose {
-        let message = format!("Running {} {:?}\n", executable.display(), args);
+        let message = format!("Running {}\n", command());
         cx.host.write_out(Stream::Stdout, message.as_bytes());
     }
+    let failure = |status: &dyn std::fmt::Display| {
+        format!(
+            "The tool failed.\nCommand: {}\nWorking directory: {}\nStatus: {status}\n",
+            command(),
+            cwd.display(),
+        )
+    };
     let request = RunRequest {
         pipeline: vec![CommandSpec {
-            program: from_native(executable),
-            args,
+            program: program.clone(),
+            args: args.clone(),
         }],
         cwd: cwd.to_path_buf(),
         env: cx.host.env_all(),
@@ -360,17 +393,28 @@ fn run_tool(
     let output = cx
         .host
         .run_bounded(&request, DATA_LIMIT as usize)
-        .map_err(|error| format!("Cannot run \"{}\": {error}", executable.display()))?;
+        .map_err(|error| failure(&error))?;
     if output.results.as_slice() != [ProcessResult::Exited(0)] {
         return Err(format!(
-            "The tool \"{}\" failed with {:?}.\n{}{}",
-            executable.display(),
-            output.results,
+            "{}Output:\n{}{}",
+            failure(&format_args!("{:?}", output.results)),
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         ));
     }
     Ok(output)
+}
+
+fn with_includers(mut error: String, includers: &BTreeSet<PathBuf>) -> String {
+    use std::fmt::Write;
+
+    if !includers.is_empty() {
+        error.push_str("\nIncluders:");
+        for path in includers {
+            let _ = write!(error, "\n  {}", path.display());
+        }
+    }
+    error
 }
 
 fn run_generator(

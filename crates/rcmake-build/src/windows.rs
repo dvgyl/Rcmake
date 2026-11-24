@@ -4,8 +4,11 @@ use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use rcmake_base::{BString, ByteSlice};
+use rcmake_base::{BString, ByteSlice, shell::quote};
 use rcmake_host::{CommandSpec, Host, HostError, WriteMode, path};
+use rcmake_resolve::Invocation;
+
+mod batch;
 
 pub(super) fn absolute(base: &Path, value: &[u8]) -> PathBuf {
     // PureHost accepts drive and UNC paths on all platforms.
@@ -66,7 +69,8 @@ pub(super) fn shell_command(
     static SEQUENCE: AtomicU64 = AtomicU64::new(0);
     let pid = host.system().pid;
     let mut contents = Vec::from(b"@echo off\r\n".as_slice());
-    contents.extend_from_slice(command);
+    let rule = batch::render(command, |args| prepare_outputs(host, cwd, args))?;
+    contents.extend_from_slice(&rule);
     contents.extend_from_slice(b"\r\n");
     let program = host
         .env_all()
@@ -96,4 +100,21 @@ pub(super) fn shell_command(
     Err(HostError::unsupported(
         "Cannot reserve a file for the Windows build command.",
     ))
+}
+
+pub(super) fn batch_rule(invocation: &Invocation) -> Option<(&[BString], &[u8])> {
+    match invocation.argv.as_slice() {
+        [] => Some((&[], &invocation.shell)),
+        [launcher @ .., program, option, command]
+            if program == b"sh"
+                && option == b"-c"
+                && (invocation.shell == *command
+                    || (!launcher.is_empty()
+                        && (invocation.shell.ends_with(command)
+                            || invocation.shell.ends_with(&quote(command))))) =>
+        {
+            Some((launcher, command))
+        }
+        _ => None,
+    }
 }

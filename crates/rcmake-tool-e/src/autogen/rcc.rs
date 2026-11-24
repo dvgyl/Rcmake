@@ -8,7 +8,7 @@ use rcmake_host::path::from_native_cmake as from_native;
 
 use super::{
     ITEM_LIMIT, Result, TOOL_TIMEOUT, ToolCtx, cache, ensure_parent, info::Rcc, output_path, read,
-    required_time, resolve, run_generator, run_tool, timestamp, touch, write_changed,
+    remove, required_time, resolve, run_generator, run_tool, timestamp, touch, write_changed,
 };
 
 pub(super) fn run(cx: &ToolCtx<'_>, info: Rcc) -> Result<()> {
@@ -28,28 +28,19 @@ pub(super) fn run(cx: &ToolCtx<'_>, info: Rcc) -> Result<()> {
     } else {
         info.public.clone()
     };
-    let inputs = if info.inputs.is_empty() {
-        list_inputs(cx, &info)?
-    } else {
-        info.inputs.clone()
-    };
-    let mut newest = source_time.max(tool_time);
-    for input in inputs {
-        let time = timestamp(cx, &input).ok_or_else(|| {
-            format!(
-                "The resource file \"{}\" listed in \"{}\" does not exist.",
-                input.display(),
-                info.source.display()
-            )
-        })?;
-        newest = newest.max(time);
-    }
-
     let hash = settings_digest(&info);
     let settings = cache::settings(cx, &info.common.settings);
     let changed = settings.get(b"rcc".as_slice()) != Some(&hash);
+    if changed {
+        remove(cx, &info.common.settings)?;
+    }
     let output_time = timestamp(cx, &output);
-    let generate = changed || output_time.is_none_or(|time| time < newest);
+    let generate = match output_time {
+        Some(time) if !changed && time >= source_time.max(tool_time) => {
+            resources_changed(cx, &info, time)?
+        }
+        _ => true,
+    };
     let mut output_updated = generate;
     if generate {
         let mut args = info.options.clone();
@@ -80,6 +71,32 @@ pub(super) fn run(cx: &ToolCtx<'_>, info: Rcc) -> Result<()> {
         }
     }
     cache::write_settings(cx, &info.common.settings, [("rcc", Some(hash))])
+}
+
+fn resources_changed(
+    cx: &ToolCtx<'_>,
+    info: &Rcc,
+    output_time: rcmake_host::FileTime,
+) -> Result<bool> {
+    let listed;
+    let inputs = if info.inputs.is_empty() {
+        listed = list_inputs(cx, info)?;
+        &listed
+    } else {
+        &info.inputs
+    };
+    let mut changed = false;
+    for input in inputs {
+        let time = timestamp(cx, input).ok_or_else(|| {
+            format!(
+                "The resource file \"{}\" listed in \"{}\" does not exist.",
+                input.display(),
+                info.source.display()
+            )
+        })?;
+        changed |= time > output_time;
+    }
+    Ok(changed)
 }
 
 fn settings_digest(info: &Rcc) -> String {

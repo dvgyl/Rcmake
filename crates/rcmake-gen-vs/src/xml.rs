@@ -74,7 +74,7 @@ impl Writer {
     }
 }
 
-fn escape(output: &mut String, value: &str, attribute: bool) {
+pub(crate) fn escape(output: &mut String, value: &str, attribute: bool) {
     for ch in value.chars() {
         match ch {
             '&' => output.push_str("&amp;"),

@@ -59,13 +59,24 @@ impl Context<'_> {
             }
             for unit in &fact.compile_units {
                 let path = self.source_path(&string(&unit.source.value));
-                let kind = source_kind(&path, Kind::Compile);
+                let group = fact.compile_groups.get(unit.group);
+                let kind = group.map_or_else(
+                    || self.fallback_source_kind(&path, Kind::Compile),
+                    |group| {
+                        Kind::from_language(
+                            &group.language,
+                            self.fallback_source_kind(&path, Kind::Compile),
+                        )
+                    },
+                );
                 let item = plan.source(path.clone(), kind, "", name);
-                if kind != Kind::Compile {
+                if !kind.compiles() {
                     continue;
                 }
                 item.object = self.object_path(&path, name, Some(fact));
-                if let Some(group) = fact.compile_groups.get(unit.group) {
+                if kind == Kind::Compile
+                    && let Some(group) = group
+                {
                     item.language = string(&group.language);
                     if fact.compile_groups.len() > 1 {
                         item.compile = Some(group_settings(group));
@@ -83,9 +94,9 @@ impl Context<'_> {
                 } = step
                 {
                     let path = self.source_path(&string(source));
-                    let kind = source_kind(&path, Kind::Compile);
+                    let kind = self.fallback_source_kind(&path, Kind::Compile);
                     let item = plan.source(path.clone(), kind, "", name);
-                    if kind != Kind::Compile {
+                    if !kind.compiles() {
                         continue;
                     }
                     let object = string(object);
@@ -94,6 +105,9 @@ impl Context<'_> {
                     } else {
                         self.object_path(&path, name, fact)
                     };
+                    if kind != Kind::Compile {
+                        continue;
+                    }
                     item.language = source_language(&path).into();
                     item.compile = invocation_settings(invocation, source, object.as_bytes())
                         .or_else(|| Some(self.compile_settings(target, name, &item.language)));
@@ -128,12 +142,14 @@ impl Context<'_> {
                 {
                     Kind::Header
                 } else {
-                    source_kind(&path, Kind::Other)
+                    self.fallback_source_kind(&path, Kind::Other)
                 };
-                if kind != Kind::Compile || !has_compile_facts {
+                if !kind.compiles() || !has_compile_facts {
                     let item = plan.source(path.clone(), kind, "", name);
-                    if kind == Kind::Compile {
+                    if kind.compiles() {
                         item.object = self.object_path(&path, name, fact);
+                    }
+                    if kind == Kind::Compile {
                         item.language = source_language(&path).into();
                         if item.language != language {
                             item.compile =
@@ -225,7 +241,10 @@ impl Context<'_> {
                             .as_ref()
                             .map(|path| self.source_path(&string(path)));
                         let main = main.filter(|path| {
-                            !plan.items.contains_key(&(Kind::Compile, path.clone()))
+                            !plan
+                                .items
+                                .values()
+                                .any(|item| item.kind.compiles() && item.path == *path)
                         });
                         self.custom(plan, name, steps.len() + index.index(), main, rule);
                     }

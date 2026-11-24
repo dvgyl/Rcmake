@@ -530,6 +530,11 @@ fn bin2c_formats_bytes_and_expands_templates() -> HostResult<()> {
         "template",
         b"int x[] = {@arr@};\r\nsize_t n = @len@; @other@\r\n",
     )?;
+    assert_eq!(f.run(&["bin2c", "binary", "out/embedded.inc"]), 1);
+    assert!(f.host.metadata(&f.cwd.join("out"), Follow::Yes).is_err());
+    f.seed("invalid", b"file")?;
+    assert_eq!(f.run(&["bin2c", "binary", "invalid/embedded.inc"]), 1);
+    f.host.create_dir_all(&f.cwd.join("out"))?;
     assert_eq!(
         f.run(&[
             "bin2c",
@@ -557,7 +562,7 @@ fn bin2c_formats_bytes_and_expands_templates() -> HostResult<()> {
         1
     );
     assert!(f.out().ends_with(b"prefix "));
-    assert_eq!(f.err(), b"Cannot print length before array\n");
+    assert!(f.err().ends_with(b"Cannot print length before array\n"));
     Ok(())
 }
 

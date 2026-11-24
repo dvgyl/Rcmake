@@ -34,14 +34,22 @@ impl Context<'_> {
                 fact.and_then(|fact| fact.artifacts.pdb_file.as_ref()),
             ),
         ] {
-            let explicit = config.link.has(property);
-            if let Some(file) = file.filter(|_| !explicit) {
-                let file = absolute(&self.settings.bin, &string(file));
-                let dir = string(Lexical::new(file.as_bytes()).parent());
-                if !dir.is_empty() && dir != config.dir && !config.link_output_dirs.contains(&dir) {
+            let file = config.link.take(property).or_else(|| {
+                let file = absolute(&self.settings.bin, &string(file?));
+                Some(crate::cuda::OptionText::WithProperties(&windows(&file)).escaped())
+            });
+            if let Some(file) = file {
+                let path = file.replace('\\', "/");
+                let path = Lexical::new(path.as_bytes());
+                let dir = if string(path.filename()).contains("$(") {
+                    format!("$([System.IO.Path]::GetDirectoryName('{file}'))")
+                } else {
+                    windows(&string(path.parent()))
+                };
+                if !dir.is_empty() && !config.link_output_dirs.contains(&dir) {
                     config.link_output_dirs.push(dir);
                 }
-                config.link.set(property, msbuild(&windows(&file)));
+                config.link.set(property, file);
             }
         }
         if config.link.has("ModuleDefinitionFile") {
@@ -206,7 +214,7 @@ impl Context<'_> {
                 .filter_map(|&index| match graph.steps.get(index) {
                     Some(BuildStep::Compile { object, source, .. }) => {
                         let source = absolute(&project.source, &string(source));
-                        if source_kind(&source, Kind::Compile) != Kind::Compile {
+                        if !source_kind(&source, Kind::Compile).compiles() {
                             return None;
                         }
                         let object = string(object);
@@ -227,7 +235,7 @@ impl Context<'_> {
                 .flat_map(|target| &target.sources)
                 .flat_map(|entry| list::split(&entry.value, list::Empty::Drop))
                 .map(|path| string(&path))
-                .filter(|path| source_kind(path, Kind::Other) == Kind::Compile)
+                .filter(|path| source_kind(path, Kind::Other).compiles())
                 .collect()
         };
         sources
