@@ -13,6 +13,7 @@ use rcmake_model::{
 use super::graph::push;
 use super::shell::direct;
 use super::{build_relative, compute_artifacts, join};
+use crate::ide::{IdeCustomPhase, IdeCustomStep};
 use crate::sources::SourcePaths;
 use crate::usage::{ModelGenexHost, UsageResolver, handle};
 use crate::{ArtifactSet, BuildStep, CustomStep, ResolveError, ResolvedTarget, absolute_path};
@@ -197,6 +198,7 @@ impl<'a> Commands<'a> {
         usage: &mut UsageResolver<'_>,
         steps: &mut IndexSet<usize>,
         dependencies: &mut IndexSet<TargetId>,
+        mut ide_steps: Option<&mut Vec<IdeCustomStep>>,
     ) -> Result<CustomStep, ResolveError> {
         let mut recipe = CustomStep::default();
         for &event in events {
@@ -215,6 +217,15 @@ impl<'a> Commands<'a> {
                     steps,
                     dependencies,
                 )?;
+                if let Some(steps) = &mut ide_steps {
+                    let phase = match event {
+                        None => IdeCustomPhase::Rule,
+                        Some(TargetEvent::PreBuild) => IdeCustomPhase::PreBuild,
+                        Some(TargetEvent::PreLink) => IdeCustomPhase::PreLink,
+                        Some(TargetEvent::PostBuild) => IdeCustomPhase::PostBuild,
+                    };
+                    steps.push(ide_custom_step(self.model, &step, phase, event.is_none()));
+                }
                 merge(&mut recipe, step);
             }
         }
@@ -314,6 +325,34 @@ impl<'model, 'resolver> CommandEvaluation<'model, 'resolver> {
             );
         }
         Ok(paths)
+    }
+}
+
+pub(super) fn ide_custom_step(
+    model: &ProjectModel,
+    step: &CustomStep,
+    phase: IdeCustomPhase,
+    always_run: bool,
+) -> IdeCustomStep {
+    let root = &model.dir(DirId::ROOT).binary_dir;
+    let paths = |paths: &[BString]| paths.iter().map(|path| absolute_path(root, path)).collect();
+    IdeCustomStep {
+        phase,
+        always_run,
+        commands: step
+            .invocations
+            .iter()
+            .map(|invocation| invocation.argv.clone())
+            .collect(),
+        working_dir: step
+            .invocations
+            .first()
+            .and_then(|invocation| invocation.working_dir.clone())
+            .unwrap_or_else(|| root.clone()),
+        outputs: paths(&step.outputs),
+        byproducts: paths(&step.byproducts),
+        depends: paths(&step.depends),
+        comment: step.comment.clone(),
     }
 }
 

@@ -109,6 +109,7 @@ pub(crate) struct TargetInputs {
 
 pub(crate) struct SourcePaths<'a> {
     host: &'a dyn Host,
+    pub(crate) ide: Option<crate::ide::IdeFlavor>,
     generated: IndexSet<BString>,
     objects: IndexMap<BString, TargetId>,
     pub(crate) unity: Option<crate::unity::UnityPlan>,
@@ -118,6 +119,7 @@ impl<'a> SourcePaths<'a> {
     pub(crate) fn new(host: &'a dyn Host) -> Self {
         Self {
             host,
+            ide: None,
             generated: IndexSet::new(),
             objects: IndexMap::new(),
             unity: None,
@@ -130,7 +132,7 @@ impl<'a> SourcePaths<'a> {
         config: &ConfigId,
     ) -> Result<(), ResolveError> {
         self.generated.clear();
-        let mut usage = UsageResolver::new(model);
+        let mut usage = UsageResolver::new(model).with_ide(self.ide);
         for (_, command) in model.commands() {
             let (outputs, byproducts) =
                 crate::lower::command_outputs(model, command, config, &mut usage)?;

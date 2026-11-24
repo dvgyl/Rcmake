@@ -2,15 +2,18 @@
 
 use indexmap::IndexSet;
 use rcmake_base::{BString, list, path_lex::Lexical, truth};
-use rcmake_genex::ConfigId;
-use rcmake_model::{DirId, ProjectModel, Target};
+use rcmake_genex::{ConfigId, EvalContext};
+use rcmake_model::{DirId, ProjectModel, Target, TargetId};
 
 use super::artifacts::{build_relative, is_darwin};
 use super::compile::{apple_flags, language_flags};
 use super::launcher;
 use super::shell::{direct, join_words, quote, rule_invocations, simple_args};
 use super::{definition, join, target_property};
-use crate::{ArtifactSet, BuildStep, Invocation, LinkFragmentRole, LinkKind, LinkStep};
+use crate::{
+    ArtifactSet, BuildStep, Invocation, LinkFragmentRole, LinkKind, LinkStep, ResolveError,
+    usage::UsageResolver,
+};
 
 fn definition_for_language<'a>(
     model: &'a ProjectModel,
@@ -407,7 +410,11 @@ fn macho_version(value: &[u8]) -> Option<BString> {
     (major != 0 || minor != 0 || patch != 0).then(|| format!("{major}.{minor}.{patch}").into())
 }
 
-fn install_name_dir(model: &ProjectModel, target: &Target, artifacts: &ArtifactSet) -> BString {
+pub(crate) fn install_name_dir(
+    model: &ProjectModel,
+    target: &Target,
+    artifacts: &ArtifactSet,
+) -> BString {
     let property = |key| target_property(model, target, key);
     let install = property(b"BUILD_WITH_INSTALL_NAME_DIR").is_some_and(|v| truth::is_on(v));
     let rpath = property(b"MACOSX_RPATH").map_or_else(
@@ -448,24 +455,9 @@ fn rpaths(
     libraries: &[BString],
 ) -> Vec<BString> {
     let language = step.language.as_slice();
-    if definition(model, target.dir, b"CMAKE_SKIP_RPATH").is_some_and(|v| truth::is_on(v)) {
+    let Some((property, installs)) = rpath_property(model, target) else {
         return Vec::new();
-    }
-    let installs = target_property(model, target, b"BUILD_WITH_INSTALL_RPATH")
-        .is_some_and(|v| truth::is_on(v));
-    let dir = if installs {
-        b"INSTALL_RPATH".as_slice()
-    } else {
-        b"BUILD_RPATH"
     };
-    let skip = if installs {
-        b"SKIP_INSTALL_RPATH".as_slice()
-    } else {
-        b"SKIP_BUILD_RPATH"
-    };
-    if target_property(model, target, skip).is_some_and(|v| truth::is_on(v)) {
-        return Vec::new();
-    }
     let prefix = definition(
         model,
         target.dir,
@@ -476,10 +468,74 @@ fn rpaths(
     if prefix.is_empty() {
         return Vec::new();
     }
-    let mut paths: IndexSet<BString> = target_property(model, target, dir)
-        .into_iter()
-        .flat_map(|value| list::split(value, list::Empty::Drop))
-        .collect();
+    let value =
+        target_property(model, target, property).map_or(b"".as_slice(), |value| value.as_slice());
+    let paths = rpath_entries(model, target, step, darwin, libraries, installs, value);
+    if darwin {
+        paths
+            .iter()
+            .map(|path| [prefix, quote(path).as_slice()].concat().into())
+            .collect()
+    } else if paths.is_empty() {
+        Vec::new()
+    } else {
+        let paths = paths
+            .iter()
+            .map(|v| v.as_slice())
+            .collect::<Vec<_>>()
+            .join(&b':');
+        vec![[prefix, quote(&paths).as_slice()].concat().into()]
+    }
+}
+
+pub(crate) fn ide_rpaths(
+    model: &ProjectModel,
+    target: &Target,
+    id: TargetId,
+    ctx: &EvalContext,
+    usage: &mut UsageResolver<'_>,
+    step: &LinkStep,
+    libraries: &[BString],
+) -> Result<Vec<BString>, ResolveError> {
+    let Some((property, installs)) = rpath_property(model, target) else {
+        return Ok(Vec::new());
+    };
+    let value = target_property(model, target, property)
+        .map(|value| usage.eval_ide_property(id, property, value, ctx))
+        .transpose()?
+        .unwrap_or_default();
+    Ok(
+        rpath_entries(model, target, step, true, libraries, installs, &value)
+            .into_iter()
+            .collect(),
+    )
+}
+
+fn rpath_property(model: &ProjectModel, target: &Target) -> Option<(&'static [u8], bool)> {
+    if definition(model, target.dir, b"CMAKE_SKIP_RPATH").is_some_and(|value| truth::is_on(value)) {
+        return None;
+    }
+    let installs = target_property(model, target, b"BUILD_WITH_INSTALL_RPATH")
+        .is_some_and(|value| truth::is_on(value));
+    let (property, skip): (&[u8], &[u8]) = if installs {
+        (b"INSTALL_RPATH", b"SKIP_INSTALL_RPATH")
+    } else {
+        (b"BUILD_RPATH", b"SKIP_BUILD_RPATH")
+    };
+    (!target_property(model, target, skip).is_some_and(|value| truth::is_on(value)))
+        .then_some((property, installs))
+}
+
+fn rpath_entries(
+    model: &ProjectModel,
+    target: &Target,
+    step: &LinkStep,
+    darwin: bool,
+    libraries: &[BString],
+    installs: bool,
+    value: &[u8],
+) -> IndexSet<BString> {
+    let mut paths: IndexSet<BString> = list::split(value, list::Empty::Drop).into_iter().collect();
     if !installs {
         let build = &model.dir(DirId::ROOT).binary_dir;
         let build_path = Lexical::new(build);
@@ -511,19 +567,5 @@ fn rpaths(
             }
         }
     }
-    if darwin {
-        paths
-            .iter()
-            .map(|path| [prefix, quote(path).as_slice()].concat().into())
-            .collect()
-    } else if paths.is_empty() {
-        Vec::new()
-    } else {
-        let paths = paths
-            .iter()
-            .map(|v| v.as_slice())
-            .collect::<Vec<_>>()
-            .join(&b':');
-        vec![[prefix, quote(&paths).as_slice()].concat().into()]
-    }
+    paths
 }

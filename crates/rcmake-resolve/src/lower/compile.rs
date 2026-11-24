@@ -12,7 +12,7 @@ use super::standard::standard_flag;
 use super::{definition, expand_rule, join, object_path, target_property};
 use crate::{ArtifactSet, BuildStep, CompileGroup, CompileUnit, ResolveError};
 
-pub(super) fn language_flags(
+pub(crate) fn language_flags(
     model: &ProjectModel,
     target: &Target,
     config: &ConfigId,

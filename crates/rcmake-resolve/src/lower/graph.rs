@@ -7,9 +7,12 @@ use rcmake_model::{DirId, GeneratorKind, ProjectModel, Target, TargetEvent, Targ
 
 use super::artifacts::build_relative;
 use super::compile::compile;
-use super::custom::{Commands, attach_link_events, command_path, remove_own_outputs};
+use super::custom::{
+    Commands, attach_link_events, command_path, ide_custom_step, remove_own_outputs,
+};
 use super::link::link;
 use super::{compute_artifacts, linker_language};
+use crate::ide::{IdeCustomPhase, IdeCustomStep};
 use crate::{
     ArtifactSet, BuildGraph, BuildStep, CustomStep, GraphTarget, LinkKind, LinkStep, ResolveError,
     ResolvedTarget, sources::TargetInputs, usage::UsageResolver,
@@ -29,6 +32,7 @@ pub fn lower(
         config,
         &IndexMap::new(),
         &mut UsageResolver::new(model),
+        &mut IndexMap::new(),
     )
 }
 
@@ -38,6 +42,7 @@ pub(crate) fn lower_with_inputs(
     config: &ConfigId,
     inputs: &IndexMap<TargetId, TargetInputs>,
     usage: &mut UsageResolver<'_>,
+    ide_custom: &mut IndexMap<TargetId, Vec<IdeCustomStep>>,
 ) -> Result<BuildGraph, ResolveError> {
     let resolved: IndexMap<_, _> = targets
         .iter()
@@ -61,8 +66,10 @@ pub(crate) fn lower_with_inputs(
         ..BuildGraph::default()
     };
     let commands = Commands::new(model, &resolved, config, usage, &mut graph.steps)?;
+    let rule_count = graph.steps.len();
     let mut unity_prerequisites = Vec::new();
     for (target, resolved) in local {
+        let mut ide_steps = resolved.ide.as_ref().map(|_| Vec::new());
         let mut dependencies: IndexSet<_> = resolved.dependencies.iter().copied().collect();
         dependencies.extend(
             target
@@ -236,6 +243,7 @@ pub(crate) fn lower_with_inputs(
                 usage,
                 &mut steps,
                 &mut dependencies,
+                ide_steps.as_mut(),
             )?;
             let after = commands.events(
                 resolved.id,
@@ -243,6 +251,7 @@ pub(crate) fn lower_with_inputs(
                 usage,
                 &mut steps,
                 &mut dependencies,
+                ide_steps.as_mut(),
             )?;
             let link = link(model, target, config, &artifacts, step, objects);
             let link = attach_link_events(model, &artifacts, link, before, after);
@@ -259,11 +268,25 @@ pub(crate) fn lower_with_inputs(
                 usage,
                 &mut steps,
                 &mut dependencies,
+                ide_steps.as_mut(),
             )?;
             if utility != CustomStep::default() {
                 remove_own_outputs(&mut utility);
                 steps.insert(push(&mut graph.steps, BuildStep::Custom(utility)));
             }
+        }
+
+        if let Some(events) = ide_steps {
+            let rules = steps
+                .iter()
+                .filter(|&&index| index < rule_count)
+                .filter_map(|&index| {
+                    let BuildStep::Custom(step) = graph.steps.get(index)? else {
+                        return None;
+                    };
+                    Some(ide_custom_step(model, step, IdeCustomPhase::Rule, false))
+                });
+            ide_custom.insert(resolved.id, rules.chain(events).collect());
         }
 
         graph.targets.push(GraphTarget {

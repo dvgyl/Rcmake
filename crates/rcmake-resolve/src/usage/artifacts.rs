@@ -5,12 +5,15 @@ use rcmake_model::{BT, DirId, FileSetKind, Target, TargetId, TargetKind};
 
 use super::{UsageResolver, handle, host::definition, on};
 use crate::{
-    absolute_path, lower,
+    ArtifactSet, absolute_path,
+    ide::{BundleKind, IdeFlavor, OutputNaming},
+    lower,
     sources::{external_object, properties},
 };
 
 struct Artifact {
     path: BString,
+    output_dir: BString,
     prefix: BString,
     base: BString,
     suffix: BString,
@@ -31,6 +34,7 @@ impl Artifact {
             prefix: prefix.into(),
             base: base.into(),
             suffix: suffix.into(),
+            output_dir: Lexical::new(&path).parent().into(),
             path,
         }
     }
@@ -72,18 +76,31 @@ impl UsageResolver<'_> {
         let target = self.model.target(id)?;
         let variable = |name: &[u8]| definition(self.model, target.dir, name);
         let system = variable(b"CMAKE_SYSTEM_NAME").unwrap_or_default();
-        let apple = matches!(
-            system.as_slice(),
-            b"Darwin" | b"iOS" | b"tvOS" | b"watchOS" | b"visionOS"
-        ) || (system.is_empty() && cfg!(target_os = "macos"));
-        let windows = system.starts_with(b"Windows") || system == "CYGWIN";
+        let xcode = self.ide == Some(IdeFlavor::Xcode);
+        let vs = self.ide == Some(IdeFlavor::VisualStudio);
+        let apple = xcode
+            || (!vs
+                && (matches!(
+                    system.as_slice(),
+                    b"Darwin" | b"iOS" | b"tvOS" | b"watchOS" | b"visionOS"
+                ) || (system.is_empty() && cfg!(target_os = "macos"))));
+        let windows = vs || (!xcode && (system.starts_with(b"Windows") || system == "CYGWIN"));
+        let desktop_apple = system == "Darwin"
+            || system.is_empty()
+            || (xcode
+                && !matches!(
+                    system.as_slice(),
+                    b"iOS" | b"tvOS" | b"watchOS" | b"visionOS"
+                ));
         let import = matches!(kind, ImportFile | LinkerImportFile | SonameImportFile)
             || (kind == LinkerFile && windows && matches!(target.kind, SharedLibrary | Executable));
         let (category, stem, prefix, suffix) = match (target.kind, import) {
+            (StaticLibrary, false) if vs => ("ARCHIVE", "STATIC_LIBRARY", "", ".lib"),
             (StaticLibrary, false) => ("ARCHIVE", "STATIC_LIBRARY", "lib", ".a"),
             (SharedLibrary, false) if windows => ("RUNTIME", "SHARED_LIBRARY", "", ".dll"),
             (SharedLibrary, false) if apple => ("LIBRARY", "SHARED_LIBRARY", "lib", ".dylib"),
             (SharedLibrary, false) => ("LIBRARY", "SHARED_LIBRARY", "lib", ".so"),
+            (ModuleLibrary, false) if vs => ("RUNTIME", "SHARED_MODULE", "", ".dll"),
             (ModuleLibrary, false) => (
                 "LIBRARY",
                 "SHARED_MODULE",
@@ -162,6 +179,7 @@ impl UsageResolver<'_> {
                 path
             };
             return Some(Artifact {
+                output_dir: Lexical::new(&path).parent().into(),
                 path,
                 prefix,
                 suffix,
@@ -173,7 +191,9 @@ impl UsageResolver<'_> {
         let bundle = kind == BundleDir || kind == BundleContentDir;
         let app = apple && target.kind == Executable && on(target, b"MACOSX_BUNDLE");
         let framework = apple && target.kind.is_library() && on(target, b"FRAMEWORK");
-        if (bundle && !(app || framework))
+        let module_bundle =
+            xcode && matches!(crate::ide::bundle_kind(target), BundleKind::Bundle { .. });
+        if (bundle && !(app || framework || module_bundle))
             || (kind == PdbFile && !windows)
             || (kind == SonameFile && (windows || on(target, b"NO_SONAME")))
         {
@@ -218,10 +238,11 @@ impl UsageResolver<'_> {
                 || self.model.dir(target.dir).binary_dir.clone(),
                 |path| binary.append(&path),
             );
-        if self
-            .model
-            .generator
-            .is_some_and(|generator| generator.multi_config())
+        if (self.ide.is_some()
+            || self
+                .model
+                .generator
+                .is_some_and(|generator| generator.multi_config()))
             && !config.0.is_empty()
             && !configured
             && !general.is_some_and(|value| value.windows(2).any(|part| part == b"$<"))
@@ -230,7 +251,7 @@ impl UsageResolver<'_> {
         }
         let dir = Lexical::new(&dir).normalize();
 
-        let (prefix, suffix) = if framework || kind == PdbFile {
+        let (prefix, suffix) = if framework || module_bundle || kind == PdbFile {
             (
                 BString::default(),
                 BString::from(if kind == PdbFile { ".pdb" } else { "" }),
@@ -242,6 +263,7 @@ impl UsageResolver<'_> {
         let soversion = target.props.get(b"SOVERSION");
         let version = if target.kind == SharedLibrary
             && !framework
+            && !module_bundle
             && !windows
             && !on(target, b"NO_SONAME")
         {
@@ -265,6 +287,10 @@ impl UsageResolver<'_> {
             [n, b".app"].concat()
         } else if framework {
             [n, b".framework"].concat()
+        } else if let BundleKind::Bundle { extension } = crate::ide::bundle_kind(target)
+            && module_bundle
+        {
+            [n, b".", extension.as_slice()].concat()
         } else {
             Vec::new()
         };
@@ -272,15 +298,15 @@ impl UsageResolver<'_> {
         if kind == BundleDir {
             return Some(Artifact::from_path(path, b"", b""));
         }
-        if app && (system == "Darwin" || system.is_empty()) {
+        if (app || module_bundle) && desktop_apple {
             path = Lexical::new(&path).append(b"Contents");
         }
         if kind == BundleContentDir {
             return Some(Artifact::from_path(path, b"", b""));
         }
-        if app && (system == "Darwin" || system.is_empty()) {
+        if (app || module_bundle) && desktop_apple {
             path = Lexical::new(&path).append(b"MacOS");
-        } else if framework && (system == "Darwin" || system.is_empty()) && kind != LinkerFile {
+        } else if framework && desktop_apple && kind != LinkerFile {
             let version = target
                 .props
                 .get(b"FRAMEWORK_VERSION")
@@ -290,11 +316,50 @@ impl UsageResolver<'_> {
         }
         path = Lexical::new(&path).append(&file);
         Some(Artifact {
+            output_dir: dir,
             path,
             prefix,
             base,
             suffix,
         })
+    }
+
+    pub(crate) fn ide_artifacts(
+        &self,
+        id: TargetId,
+        config: &ConfigId,
+    ) -> (ArtifactSet, OutputNaming) {
+        use ArtifactKind::*;
+        let artifact = |kind| self.output_artifact(id, kind, config);
+        let main = artifact(File);
+        let target = self.model.target(id);
+        let naming = main
+            .as_ref()
+            .map_or_else(OutputNaming::default, |file| OutputNaming {
+                dir: file.output_dir.clone(),
+                prefix: file.prefix.clone(),
+                base_name: file.base.clone(),
+                suffix: file.suffix.clone(),
+                version: target
+                    .and_then(|target| target.props.get(b"VERSION"))
+                    .cloned(),
+                soversion: target
+                    .and_then(|target| target.props.get(b"SOVERSION"))
+                    .cloned(),
+            });
+        let path = |kind| artifact(kind).map(|file| file.path);
+        let artifacts = ArtifactSet {
+            file: main.map(|file| file.path),
+            linker_file: path(LinkerFile),
+            soname_file: path(SonameFile),
+            import_file: path(ImportFile),
+            pdb_file: path(PdbFile),
+            object_dir: target
+                .filter(|target| target.kind.is_library() || target.kind == TargetKind::Executable)
+                .and_then(|_| self.object_directory(id, config))
+                .map(|path| lower::build_relative(self.model, &path)),
+        };
+        (artifacts, naming)
     }
 
     fn artifact_property(
@@ -316,16 +381,28 @@ impl UsageResolver<'_> {
             ..Default::default()
         };
         let entry = BT::new(value.clone(), target.backtrace.clone());
-        Self::new(self.model)
-            .eval_entry(id, target.dir, name.as_bytes(), &entry, &ctx, false)
-            .ok()
-            .map(|(value, _)| value)
+        if self.artifact_depth >= super::MAX_WALK_DEPTH {
+            return None;
+        }
+        Self {
+            ide: self.ide,
+            artifact_depth: self.artifact_depth + 1,
+            ..Self::new(self.model)
+        }
+        .eval_entry(id, target.dir, name.as_bytes(), &entry, &ctx, false)
+        .ok()
+        .map(|(value, _)| value)
     }
 
     /// Compute the object directory used by the selected generator.
     #[must_use]
     pub fn object_directory(&self, id: TargetId, config: &ConfigId) -> Option<BString> {
         let target = self.model.target(id)?;
+        if let Some(flavor) = self.ide {
+            return Some(crate::ide::object_directory(
+                self.model, target, config, flavor,
+            ));
+        }
         let path = Lexical::new(&self.model.dir(target.dir).binary_dir)
             .append(format!("CMakeFiles/{}.dir", target.name).as_bytes());
         if self
@@ -371,6 +448,8 @@ impl UsageResolver<'_> {
         // Keep the active property chain when TARGET_OBJECTS queries another target.
         let mut resolver = Self {
             source_paths: self.source_paths,
+            ide: self.ide,
+            artifact_depth: self.artifact_depth,
             active: self.active.clone(),
             ..Self::new(self.model)
         };
@@ -445,6 +524,9 @@ impl UsageResolver<'_> {
                         || lower::source_language(self.model, target, source).is_some())
             })
             .map(|(source, _)| {
+                if let Some(flavor) = self.ide {
+                    return crate::ide::object_path(self.model, target, config, &source, flavor);
+                }
                 let object = unity.and_then(|plan| plan.files.get(&source)).map_or_else(
                     || lower::object_path(self.model, target, config, &source),
                     |file| file.object_path(self.model, target, config, &source),

@@ -1567,19 +1567,516 @@ fn synthesizes_std_module_target_and_bmi_install_metadata() -> TestResult {
 }
 
 #[test]
-fn ide_options_keep_wave_zero_result_unchanged() -> TestResult {
+fn xcode_ide_facts_keep_raw_settings_and_resolve_apple_artifacts() -> TestResult {
+    use ide::{BundleKind, IdeFlavor, IdeLinkItem, IdeSourceKind};
+    use rcmake_model::GeneratorKind;
+
     let mut model = project();
-    model.add_target(target("app", TargetKind::Executable, &["a.cpp"]))?;
-    let host = PureHost::default();
-    host.seed_file(Path::new("/src/a.cpp"), b"")?;
-    let configs = [ConfigId("Debug".into()), ConfigId("Release".into())];
-    let plain = resolve(&model, &host, &configs)?;
-    for flavor in [ide::IdeFlavor::Xcode, ide::IdeFlavor::VisualStudio] {
-        let options = ResolveOptions { ide: Some(flavor) };
-        let with_ide = resolve_with_options(&model, &host, &configs, &options)?;
-        assert!(with_ide.targets.iter().all(|target| target.ide.is_none()));
-        assert_eq!(with_ide.graphs, plain.graphs);
-        assert_eq!(with_ide.targets.len(), plain.targets.len());
+    model.generator = Some(GeneratorKind::Xcode);
+    model
+        .global
+        .props
+        .set("CMAKE_XCODE_ARCHS".into(), "arm64".into());
+    model
+        .global
+        .props
+        .set("CMAKE_C_FLAGS_DEBUG".into(), "-g".into());
+    let obj = model.add_target(target("obj", TargetKind::ObjectLibrary, &["core.c"]))?;
+    let mut fw = target("fw", TargetKind::SharedLibrary, &["core.c"]);
+    fw.props.set("FRAMEWORK".into(), "ON".into());
+    let fw = model.add_target(fw)?;
+    let plain = model.add_target(target("tool", TargetKind::Executable, &["main.c"]))?;
+    let archive = model.add_target(target("archive", TargetKind::StaticLibrary, &["core.c"]))?;
+    let mut app = target(
+        "app",
+        TargetKind::Executable,
+        &["main.c", "$<TARGET_OBJECTS:obj>"],
+    );
+    for (name, value) in [
+        ("MACOSX_BUNDLE", "ON"),
+        ("MACOSX_BUNDLE_GUI_IDENTIFIER", "org.example.app"),
+        ("MACOSX_BUNDLE_INFO_PLIST", "Custom.plist.in"),
+        ("PUBLIC_HEADER", "public.h"),
+        ("RESOURCE", "image.png"),
+        (
+            "XCODE_ATTRIBUTE_TEST[variant=Debug][arch=arm64]",
+            "debug $<CONFIG>",
+        ),
+        ("XCODE_ATTRIBUTE_TEST[arch=arm64]", "generic $<CONFIG>"),
+        (
+            "XCODE_ATTRIBUTE_FILTER[sdk=macosx*][variant=Debug]",
+            "filtered",
+        ),
+        ("XCODE_GENERATE_SCHEME", "ON"),
+        ("XCODE_SCHEME_ARGUMENTS", "an argument;second"),
+        ("COMPILE_FLAGS", "-DNAME=\"two words\""),
+    ] {
+        app.props.set(name.into(), value.into());
     }
+    for (field, value) in [
+        (UsageField::CompileOptions, "-fno-common"),
+        (UsageField::CompileDefinitions, "APP_$<CONFIG>"),
+        (UsageField::IncludeDirectories, "/path with spaces"),
+        (UsageField::IncludeDirectories, "/sdk/Kit.framework/Headers"),
+        (UsageField::LinkDirectories, "/link path/$<CONFIG>"),
+        (UsageField::LinkOptions, "SHELL:-exported_symbol _main"),
+    ] {
+        app.usage.push(field, entry(value));
+    }
+    app.props.set(
+        "SYSTEM_INCLUDE_DIRECTORIES".into(),
+        "/path with spaces".into(),
+    );
+    app.usage.link_libraries = Some(
+        ["fw", "z", "/vendor/lib.a", "-framework Cocoa", "-pthread"]
+            .into_iter()
+            .map(link_item)
+            .collect(),
+    );
+    let app = model.add_target(app)?;
+    model.add_file_set(FileSet {
+        target: app,
+        name: "headers".into(),
+        kind: FileSetKind::Headers,
+        scope: UsageScope::Private,
+        base_dirs: vec![entry("/src")],
+        files: vec![entry("/src/file_set.h")],
+        props: Default::default(),
+    })?;
+    let mut event = rcmake_model::CustomCommand::new(
+        DirId::ROOT,
+        rcmake_model::CustomCommandKind::TargetEvent {
+            target: app,
+            event: rcmake_model::TargetEvent::PreLink,
+        },
+        Backtrace::default(),
+        Default::default(),
+    );
+    event
+        .command_lines
+        .push(vec!["echo".into(), "two words $<CONFIG>".into()]);
+    model.add_command(event)?;
+
+    let source = model
+        .dir_mut(DirId::ROOT)
+        .source_props
+        .entry("/src/main.c".into())
+        .or_default();
+    source.set("COMPILE_FLAGS".into(), "-DSOURCE=\"$<CONFIG> x\"".into());
+    source.set("COMPILE_OPTIONS".into(), "-Wextra".into());
+    source.set("COMPILE_DEFINITIONS".into(), "SOURCE=$<CONFIG>".into());
+    source.set("SOURCE_GROUP".into(), "App\\Code".into());
+    let host = PureHost::default();
+    for path in [
+        "/src/core.c",
+        "/src/main.c",
+        "/src/public.h",
+        "/src/file_set.h",
+        "/src/image.png",
+    ] {
+        host.seed_file(Path::new(path), b"")?;
+    }
+
+    let configs = [ConfigId("Debug".into()), ConfigId("Release".into())];
+    let result = resolve_with_options(
+        &model,
+        &host,
+        &configs,
+        &ResolveOptions {
+            ide: Some(IdeFlavor::Xcode),
+        },
+    )?;
+    let resolved = |id, config| {
+        result
+            .targets
+            .iter()
+            .find(|target| target.id == id && target.config.0 == config)
+            .ok_or("Missing target.")
+    };
+    let debug = resolved(app, "Debug")?;
+    let facts = debug.ide.as_deref().ok_or("Missing Xcode facts.")?;
+    assert_eq!(result.graphs.len(), 2);
+    assert_eq!(
+        debug.artifacts.file,
+        Some("/out/Debug/app.app/Contents/MacOS/app".into())
+    );
+    assert_eq!(
+        resolved(plain, "Debug")?.artifacts.file,
+        Some("/out/Debug/tool".into())
+    );
+    assert_eq!(
+        resolved(archive, "Debug")?.artifacts.file,
+        Some("/out/Debug/libarchive.a".into())
+    );
+    assert_eq!(
+        resolved(fw, "Debug")?.artifacts.file,
+        Some("/out/Debug/fw.framework/Versions/A/fw".into())
+    );
+    assert_eq!(
+        resolved(fw, "Debug")?
+            .ide
+            .as_deref()
+            .ok_or("Missing framework facts.")?
+            .bundle,
+        BundleKind::Framework {
+            version: "A".into()
+        }
+    );
+    assert_eq!(facts.bundle, BundleKind::App);
+    assert_eq!(
+        facts.info_plist,
+        Some("/out/CMakeFiles/app.dir/Info.plist".into())
+    );
+    assert_eq!(facts.naming.dir, "/out/Debug");
+    assert_eq!(facts.naming.base_name, "app");
+    assert_eq!(
+        facts.attributes[b"MACOSX_BUNDLE_GUI_IDENTIFIER".as_slice()],
+        "org.example.app"
+    );
+    assert_eq!(
+        facts.attributes[b"MACOSX_BUNDLE_INFO_PLIST".as_slice()],
+        "Custom.plist.in"
+    );
+    assert_eq!(
+        facts.attributes[b"XCODE_SCHEME_ARGUMENTS".as_slice()],
+        "an argument;second"
+    );
+    assert_eq!(
+        facts.attributes[b"XCODE_ATTRIBUTE_TEST[arch=arm64]".as_slice()],
+        "debug Debug"
+    );
+    assert_eq!(
+        facts.attributes[b"XCODE_ATTRIBUTE_FILTER[sdk=macosx*]".as_slice()],
+        "filtered"
+    );
+    let release = resolved(app, "Release")?
+        .ide
+        .as_deref()
+        .ok_or("Missing Release facts.")?;
+    assert_eq!(
+        release.attributes[b"XCODE_ATTRIBUTE_TEST[arch=arm64]".as_slice()],
+        "generic Release"
+    );
+    assert!(
+        !release
+            .attributes
+            .contains_key(b"XCODE_ATTRIBUTE_FILTER[sdk=macosx*]".as_slice())
+    );
+
+    let compile = &facts.compile[0];
+    assert_eq!(
+        compile
+            .flags
+            .iter()
+            .map(|flag| flag.value.as_slice())
+            .collect::<Vec<_>>(),
+        [
+            b"SHELL:-g".as_slice(),
+            b"SHELL:-DNAME=\"two words\"",
+            b"-fno-common"
+        ]
+    );
+    assert_eq!(compile.defines[0].value, "APP_Debug");
+    assert_eq!(
+        compile.includes,
+        [
+            ide::IdeInclude {
+                path: "/sdk".into(),
+                system: false,
+                framework: true
+            },
+            ide::IdeInclude {
+                path: "/path with spaces".into(),
+                system: true,
+                framework: false
+            },
+        ]
+    );
+    let main = facts
+        .sources
+        .iter()
+        .find(|source| source.path == "/src/main.c")
+        .ok_or("Missing main.c.")?;
+    assert_eq!(main.group, "App\\Code");
+    let overrides = main
+        .compile
+        .as_ref()
+        .ok_or("Missing source compile settings.")?;
+    assert_eq!(overrides.flags[0].value, "SHELL:-DSOURCE=\"Debug x\"");
+    assert_eq!(overrides.flags[1].value, "-Wextra");
+    assert_eq!(overrides.defines[0].value, "SOURCE=Debug");
+    assert!(
+        facts
+            .sources
+            .iter()
+            .any(|source| source.path == "/src/public.h" && source.kind == IdeSourceKind::Header)
+    );
+    assert!(facts.sources.iter().any(|source| source.path == "/src/image.png" && source.kind == IdeSourceKind::Resource));
+    assert!(facts.sources.iter().any(|source| source.path
+        == "/out/build/obj.build/Debug/Objects-normal/arm64/core.o"
+        && source.kind == IdeSourceKind::Object));
+
+    assert!(facts.sources.iter().any(|source| {
+        source.path == "/src/file_set.h"
+            && source
+                .file_set
+                .as_ref()
+                .is_some_and(|name| name == "headers")
+            && source.kind == IdeSourceKind::Header
+    }));
+    assert_eq!(facts.custom.len(), 1);
+    assert_eq!(facts.custom[0].phase, ide::IdeCustomPhase::PreLink);
+    assert_eq!(facts.custom[0].commands[0], ["echo", "two words Debug"]);
+    assert_eq!(facts.custom[0].working_dir, "/out");
+
+    assert_eq!(facts.link_options[0].value, "SHELL:-exported_symbol _main");
+    assert_eq!(facts.link_directories, ["/link path/Debug"]);
+    assert_eq!(
+        facts.link_items,
+        [
+            IdeLinkItem::Target(fw),
+            IdeLinkItem::Library("z".into()),
+            IdeLinkItem::File("/vendor/lib.a".into()),
+            IdeLinkItem::Framework("Cocoa".into()),
+            IdeLinkItem::Flag("-pthread".into()),
+        ]
+    );
+    let usage = UsageResolver::new(&model);
+    assert_eq!(
+        usage.target_objects(obj, &configs[0], None),
+        Some("/out/build/obj.build/Debug/Objects-normal/arm64/core.o".into())
+    );
+    model
+        .target_mut(obj)
+        .ok_or("Missing object library.")?
+        .props
+        .set("OSX_ARCHITECTURES".into(), "arm64;x86_64".into());
+    assert_eq!(
+        UsageResolver::new(&model).target_objects(obj, &configs[0], None),
+        Some("/out/build/obj.build/Debug/Objects-normal/$(CURRENT_ARCH)/core.o".into())
+    );
+    Ok(())
+}
+
+#[test]
+fn visual_studio_layout_and_per_configuration_source_union() -> TestResult {
+    use ide::{IdeFlavor, IdeLinkItem};
+    let mut model = project();
+    let obj = model.add_target(target("obj", TargetKind::ObjectLibrary, &["obj.c"]))?;
+    let lib = model.add_target(target("support", TargetKind::StaticLibrary, &["lib.c"]))?;
+    let dll = model.add_target(target("shared", TargetKind::SharedLibrary, &["lib.c"]))?;
+    let mut app = target(
+        "app",
+        TargetKind::Executable,
+        &[
+            "main.c",
+            "$<$<CONFIG:Debug>:debug.c>",
+            "$<$<CONFIG:Release>:release.c>",
+        ],
+    );
+    for (name, value) in [
+        ("FOLDER", "Apps/$<CONFIG>"),
+        ("VS_GLOBAL_RootNamespace", "tools"),
+        ("VS_DEBUGGER_COMMAND_ARGUMENTS", "--config $<CONFIG>"),
+        ("VS_DPI_AWARE", "PerMonitor"),
+    ] {
+        app.props.set(name.into(), value.into());
+    }
+    app.usage.link_libraries = Some(
+        ["support", "shared", "kernel32.lib"]
+            .into_iter()
+            .map(link_item)
+            .collect(),
+    );
+    let app = model.add_target(app)?;
+    let host = PureHost::default();
+    for path in [
+        "/src/main.c",
+        "/src/debug.c",
+        "/src/release.c",
+        "/src/lib.c",
+        "/src/obj.c",
+    ] {
+        host.seed_file(Path::new(path), b"")?;
+    }
+    let result = resolve_with_options(
+        &model,
+        &host,
+        &[ConfigId("Debug".into()), ConfigId("Release".into())],
+        &ResolveOptions {
+            ide: Some(IdeFlavor::VisualStudio),
+        },
+    )?;
+    let debug = |id| {
+        result
+            .targets
+            .iter()
+            .find(|target| target.id == id && target.config.0 == "Debug")
+            .ok_or("Missing Debug target.")
+    };
+    let facts = debug(app)?
+        .ide
+        .as_deref()
+        .ok_or("Missing Visual Studio facts.")?;
+    assert_eq!(
+        debug(app)?.artifacts.file,
+        Some("/out/Debug/app.exe".into())
+    );
+    assert_eq!(
+        debug(lib)?.artifacts.file,
+        Some("/out/Debug/support.lib".into())
+    );
+    assert_eq!(
+        debug(dll)?.artifacts.file,
+        Some("/out/Debug/shared.dll".into())
+    );
+    assert_eq!(
+        debug(dll)?.artifacts.linker_file,
+        Some("/out/Debug/shared.lib".into())
+    );
+    assert_eq!(debug(obj)?.compile_units[0].object, "obj.dir/Debug/obj.obj");
+    assert_eq!(
+        facts.attributes[b"VS_GLOBAL_RootNamespace".as_slice()],
+        "tools"
+    );
+    assert_eq!(
+        facts.attributes[b"VS_DEBUGGER_COMMAND_ARGUMENTS".as_slice()],
+        "--config Debug"
+    );
+    assert_eq!(facts.attributes[b"VS_DPI_AWARE".as_slice()], "PerMonitor");
+    assert_eq!(facts.attributes[b"FOLDER".as_slice()], "Apps/Debug");
+    assert_eq!(
+        facts.link_items,
+        [
+            IdeLinkItem::Target(lib),
+            IdeLinkItem::Target(dll),
+            IdeLinkItem::Library("kernel32.lib".into()),
+        ]
+    );
+    for resolved in result.targets.iter().filter(|target| target.id == app) {
+        let facts = resolved.ide.as_deref().ok_or("Missing source union.")?;
+        assert_eq!(facts.sources.len(), 3);
+        assert_eq!(facts.sources[0].path, "/src/main.c");
+        assert!(facts.sources[0].excluded_configs.is_empty());
+        assert_eq!(facts.sources[1].path, "/src/debug.c");
+        assert_eq!(facts.sources[1].excluded_configs, ["Release"]);
+        assert_eq!(facts.sources[2].path, "/src/release.c");
+        assert_eq!(facts.sources[2].excluded_configs, ["Debug"]);
+    }
+    Ok(())
+}
+
+#[test]
+fn xcode_rejects_sources_that_vary_by_configuration() -> TestResult {
+    let mut model = project();
+    model.add_target(target(
+        "pc",
+        TargetKind::Executable,
+        &["main.c", "$<$<CONFIG:Debug>:core.c>"],
+    ))?;
+    let host = PureHost::default();
+    for path in ["/src/main.c", "/src/core.c"] {
+        host.seed_file(Path::new(path), b"")?;
+    }
+    let result = resolve_with_options(
+        &model,
+        &host,
+        &[ConfigId("Debug".into()), ConfigId("Release".into())],
+        &ResolveOptions {
+            ide: Some(ide::IdeFlavor::Xcode),
+        },
+    );
+    assert_eq!(result.err(), Some(ResolveError::Message(concat!(
+        "Target \"pc\" has source files which vary by configuration.  This is not supported by the \"Xcode\" generator.",
+        "\n\nConfig \"Debug\":\n\n  /src/main.c\n  /src/core.c",
+        "\n\nConfig \"Release\":\n\n  /src/main.c",
+    ).into())));
+    Ok(())
+}
+
+#[test]
+fn default_resolve_keeps_ninja_and_make_layouts() -> TestResult {
+    use rcmake_model::GeneratorKind;
+    let mut model = project();
+    let obj = model.add_target(target("obj", TargetKind::ObjectLibrary, &["core.c"]))?;
+    let mut app = target(
+        "app",
+        TargetKind::Executable,
+        &["main.c", "$<TARGET_OBJECTS:obj>"],
+    );
+    app.props.set("MACOSX_BUNDLE".into(), "ON".into());
+    let app = model.add_target(app)?;
+    let host = PureHost::default();
+    for path in ["/src/main.c", "/src/core.c"] {
+        host.seed_file(Path::new(path), b"")?;
+    }
+    for (generator, object, artifact) in [
+        (
+            GeneratorKind::Ninja,
+            "CMakeFiles/obj.dir/core.c.o",
+            "/out/app",
+        ),
+        (
+            GeneratorKind::NinjaMultiConfig,
+            "CMakeFiles/obj.dir/Debug/core.c.o",
+            "/out/Debug/app",
+        ),
+        (
+            GeneratorKind::UnixMakefiles,
+            "CMakeFiles/obj.dir/core.c.o",
+            "/out/app",
+        ),
+    ] {
+        model.generator = Some(generator);
+        let configs = [ConfigId("Debug".into())];
+        let legacy = resolve(&model, &host, &configs)?;
+        let explicit =
+            resolve_with_options(&model, &host, &configs, &ResolveOptions { ide: None })?;
+        assert_eq!(legacy.graphs, explicit.graphs);
+        assert!(
+            legacy
+                .targets
+                .iter()
+                .chain(&explicit.targets)
+                .all(|target| target.ide.is_none())
+        );
+        let resolved = |id| {
+            legacy
+                .targets
+                .iter()
+                .find(|target| target.id == id)
+                .ok_or("Missing target.")
+        };
+        assert_eq!(resolved(obj)?.compile_units[0].object, object);
+        assert_eq!(resolved(app)?.artifacts.file, Some(artifact.into()));
+        assert!(legacy.graphs[0].steps.iter().any(|step| matches!(step,
+            BuildStep::Link { inputs, .. } if inputs.iter().any(|input| input == object))));
+    }
+    Ok(())
+}
+
+#[test]
+fn xcode_reports_configuration_with_no_sources_before_link_language_error() -> TestResult {
+    let mut model = project();
+    model.add_target(target(
+        "pc",
+        TargetKind::Executable,
+        &["$<$<CONFIG:Debug>:main.c>"],
+    ))?;
+    let host = PureHost::default();
+    host.seed_file(Path::new("/src/main.c"), b"")?;
+    let result = resolve_with_options(
+        &model,
+        &host,
+        &[ConfigId("Debug".into()), ConfigId("Release".into())],
+        &ResolveOptions {
+            ide: Some(ide::IdeFlavor::Xcode),
+        },
+    );
+    assert_eq!(result.err(), Some(ResolveError::Message(concat!(
+        "Target \"pc\" has source files which vary by configuration.  This is not supported by the \"Xcode\" generator.",
+        "\n\nConfig \"Debug\":\n\n  /src/main.c",
+        "\n\nConfig \"Release\":",
+    ).into())));
     Ok(())
 }

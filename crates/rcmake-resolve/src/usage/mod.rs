@@ -77,6 +77,8 @@ const MAX_WALK_DEPTH: usize = 128;
 /// Evaluate usage requirements against one immutable project model.
 pub struct UsageResolver<'a> {
     model: &'a ProjectModel,
+    ide: Option<crate::ide::IdeFlavor>,
+    artifact_depth: usize,
     source_paths: Option<&'a SourcePaths<'a>>,
     ids: Vec<TargetId>,
     memo: HashMap<MemoKey, WalkValue>,
@@ -91,6 +93,8 @@ impl<'a> UsageResolver<'a> {
     pub fn new(model: &'a ProjectModel) -> Self {
         Self {
             model,
+            ide: crate::ide::IdeFlavor::from_model(model),
+            artifact_depth: 0,
             source_paths: None,
             ids: model.targets().map(|(id, _)| id).collect(),
             memo: HashMap::new(),
@@ -105,9 +109,32 @@ impl<'a> UsageResolver<'a> {
 
     pub(crate) fn with_source_paths(model: &'a ProjectModel, paths: &'a SourcePaths<'a>) -> Self {
         Self {
+            ide: paths.ide,
             source_paths: Some(paths),
             ..Self::new(model)
         }
+    }
+
+    pub(crate) fn with_ide(mut self, ide: Option<crate::ide::IdeFlavor>) -> Self {
+        self.ide = ide;
+        self
+    }
+
+    pub(crate) fn ide(&self) -> Option<crate::ide::IdeFlavor> {
+        self.ide
+    }
+
+    pub(crate) fn eval_ide_property(
+        &mut self,
+        id: TargetId,
+        property: &[u8],
+        value: &BString,
+        ctx: &EvalContext,
+    ) -> Result<BString, ResolveError> {
+        let target = self.target(id)?;
+        let entry = BT::new(value.clone(), target.backtrace.clone());
+        self.eval_entry(id, target.dir, property, &entry, ctx, false)
+            .map(|(value, _)| value)
     }
 
     pub(crate) fn source_paths(&self) -> Option<&'a SourcePaths<'a>> {
@@ -358,7 +385,7 @@ impl<'a> UsageResolver<'a> {
             .filter(|(_, set)| {
                 let own = set.target == target;
                 match set.kind {
-                    FileSetKind::Headers => false,
+                    FileSetKind::Headers => own && self.ide.is_some(),
                     FileSetKind::Sources if !own => set.scope != UsageScope::Private,
                     _ => {
                         own && (set.scope != UsageScope::Interface

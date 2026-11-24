@@ -108,8 +108,9 @@ pub(crate) fn lower_install_manifest_with_configs(
     model: &ProjectModel,
     targets: &[ResolvedTarget],
     configs: &[ConfigId],
+    ide: Option<crate::ide::IdeFlavor>,
 ) -> Result<InstallManifest, ResolveError> {
-    let mut usage = UsageResolver::new(model);
+    let mut usage = UsageResolver::new(model).with_ide(ide);
     lower_install_rules(model, targets, |rule, files| {
         if !files
             .iter()

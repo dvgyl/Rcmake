@@ -537,16 +537,12 @@ pub fn resolve(
 /// Use `CMAKE_BUILD_TYPE` if `configs` is empty.
 ///
 /// With [`ResolveOptions::ide`] set, the IDE generators get [`ResolvedTarget::ide`].
-/// Milestone 4 Wave 0 freezes only the contract: the field stays `None`, and the
-/// result is the same as the result of [`resolve`].
 pub fn resolve_with_options(
     model: &ProjectModel,
     host: &dyn Host,
     configs: &[ConfigId],
     options: &ResolveOptions,
 ) -> Result<GenerationResult, ResolveError> {
-    // Wave 1 (worker C) computes the IDE facts here.
-    let _ = options.ide;
     let configs = if configs.is_empty() {
         vec![ConfigId(
             lower::definition(model, DirId::ROOT, b"CMAKE_BUILD_TYPE")
@@ -557,9 +553,11 @@ pub fn resolve_with_options(
         configs.to_vec()
     };
     let mut paths = SourcePaths::new(host);
+    paths.ide = options.ide;
     paths.unity = Some(unity::prepare(model, host, &mut paths, &configs)?);
     let mut targets = Vec::new();
     let mut graphs = Vec::with_capacity(configs.len());
+    let mut xcode_link_error = None;
     for config in &configs {
         paths.index_generated(model, config)?;
         validate_file_sets(model, &paths, config)?;
@@ -606,7 +604,17 @@ pub fn resolve_with_options(
             .map(|(id, target)| {
                 resolve_link(model, &mut usage, &paths, &resolved, id, target, &ctx)
             })
-            .collect::<Result<Vec<_>, _>>()?;
+            .collect::<Result<Vec<_>, _>>();
+        let links = match links {
+            Err(error) if options.ide == Some(ide::IdeFlavor::Xcode) => {
+                // A configuration with no sources can also have no link language.
+                // Compare the source lists before returning the link error.
+                xcode_link_error.get_or_insert(error);
+                targets.extend(resolved.into_values());
+                continue;
+            }
+            result => result?,
+        };
         let std_objects = std_id
             .and_then(|id| resolved.get(&id))
             .and_then(|target| Some((target, target.cxx_modules.as_ref()?)))
@@ -627,6 +635,13 @@ pub fn resolve_with_options(
             })
             .collect();
         for ((target, inputs), link) in resolved.values_mut().zip(inputs.values_mut()).zip(links) {
+            if let (Some(facts), Some(settings)) = (&mut target.ide, link.ide) {
+                facts.link_items = settings.items;
+                facts.link_options = settings.options;
+                facts.link_directories = settings.directories;
+                facts.build_rpaths = settings.rpaths;
+                facts.install_name_dir = settings.install_name_dir;
+            }
             target.link = link.step;
             target.dependencies = link.dependencies;
             inputs.objects.extend(link.objects);
@@ -647,15 +662,38 @@ pub fn resolve_with_options(
                 );
             }
         }
-        let resolved = resolved.into_values().collect::<Vec<_>>();
+        let mut resolved = resolved.into_values().collect::<Vec<_>>();
+        let mut ide_custom = IndexMap::new();
         graphs.push(lower::lower_with_inputs(
-            model, &resolved, config, &inputs, &mut usage,
+            model,
+            &resolved,
+            config,
+            &inputs,
+            &mut usage,
+            &mut ide_custom,
         )?);
+        for target in &mut resolved {
+            if let Some(facts) = &mut target.ide {
+                facts.custom = ide_custom.swap_remove(&target.id).unwrap_or_default();
+            }
+        }
         targets.extend(resolved);
     }
 
-    let install = lower::lower_install_manifest_with_configs(model, &targets, &configs)?;
-    let exports = resolve_exports(model, &mut UsageResolver::new(model), &targets, &install)?;
+    if let Some(flavor) = options.ide {
+        ide::finish_sources(model, &paths, &mut targets, flavor)?;
+    }
+    if let Some(error) = xcode_link_error {
+        return Err(error);
+    }
+    let install =
+        lower::lower_install_manifest_with_configs(model, &targets, &configs, options.ide)?;
+    let exports = resolve_exports(
+        model,
+        &mut UsageResolver::new(model).with_ide(options.ide),
+        &targets,
+        &install,
+    )?;
     let mut metadata = lower::collect_metadata(model);
     if let Some(toolchain) = metadata.toolchains.get_mut(b"CXX".as_slice())
         && toolchain.module_map_format.is_none()
@@ -691,7 +729,7 @@ fn validate_file_sets(
     paths: &SourcePaths<'_>,
     config: &ConfigId,
 ) -> Result<(), ResolveError> {
-    let mut usage = UsageResolver::new(model);
+    let mut usage = UsageResolver::new(model).with_ide(paths.ide);
     let ctx = EvalContext {
         config: config.clone(),
         ..EvalContext::default()
@@ -757,7 +795,7 @@ fn resolve_target<'a>(
     ctx: &EvalContext,
 ) -> Result<(ResolvedTarget, TargetInputs), ResolveError> {
     let dir = model.dir(target.dir);
-    let metadata = TargetMetadata {
+    let mut metadata = TargetMetadata {
         name: target.name.clone(),
         kind: target.kind,
         source_dir: dir.source_dir.clone(),
@@ -768,23 +806,51 @@ fn resolve_target<'a>(
         generator_provided: target.kind == TargetKind::GlobalTarget
             || target.name == STD_MODULE_TARGET,
     };
+    let flavor = usage.ide();
+    let (artifacts, ide) = if let Some(flavor) = flavor {
+        let (artifacts, naming) = usage.ide_artifacts(id, &ctx.config);
+        let bundle = if flavor == ide::IdeFlavor::Xcode {
+            ide::bundle_kind(target)
+        } else {
+            ide::BundleKind::None
+        };
+        let info_plist = (bundle != ide::BundleKind::None).then(|| {
+            absolute_path(
+                &dir.binary_dir,
+                &[b"CMakeFiles/", target.name.as_slice(), b".dir/Info.plist"].concat(),
+            )
+        });
+        let mut facts = Box::new(ide::IdeFacts {
+            naming,
+            bundle,
+            info_plist,
+            ..Default::default()
+        });
+        facts.collect_properties(usage, target, id, ctx, flavor)?;
+        metadata.folder = facts.attributes.get(b"FOLDER".as_slice()).cloned();
+        (artifacts, Some(facts))
+    } else {
+        (lower::compute_artifacts(model, target, &ctx.config), None)
+    };
     let mut resolved = ResolvedTarget {
         id,
         config: ctx.config.clone(),
         metadata,
-        artifacts: lower::compute_artifacts(model, target, &ctx.config),
+        artifacts,
         compile_groups: Vec::new(),
         compile_units: Vec::new(),
         link: None,
         dependencies: Vec::new(),
         cxx_modules: None,
-        ide: None,
+        ide,
     };
 
     let export_symbol = export_symbol(target);
     let mut dependencies = IndexSet::new();
     let mut inputs = TargetInputs::default();
     let mut groups = IndexMap::new();
+    let mut ide_compile = IndexMap::new();
+    let mut ide_source_compile = IndexMap::new();
     let (file_sets, members) = collect_file_sets(model, paths, usage, id, ctx)?;
     let sources = usage.collect_property(id, b"SOURCES", ctx)?.entries;
     let unity = paths.unity.as_ref().and_then(|plan| plan.get(&id));
@@ -883,7 +949,13 @@ fn resolve_target<'a>(
                 }
                 let mut flags = Vec::new();
                 if let Some(value) = target.props.get(b"COMPILE_FLAGS") {
-                    sources::append_compile_flags(&mut flags, value, Backtrace::default());
+                    if flavor.is_some() {
+                        let value =
+                            usage.eval_ide_property(id, b"COMPILE_FLAGS", value, &compile_ctx)?;
+                        sources::append_compile_flags(&mut flags, &value, Backtrace::default());
+                    } else {
+                        sources::append_compile_flags(&mut flags, value, Backtrace::default());
+                    }
                 }
                 flags.extend(
                     usage
@@ -907,6 +979,7 @@ fn resolve_target<'a>(
                     includes,
                     units: Vec::new(),
                 };
+                let base = flavor.map(|flavor| ide::compile_settings(&facts, flavor));
                 sources::apply_compile_properties(
                     usage,
                     id,
@@ -919,15 +992,48 @@ fn resolve_target<'a>(
                 if let Some(file) = unity_file {
                     file.apply_compile_properties(model, &ctx.config, &mut facts);
                 }
+                if let (Some(flavor), Some(base)) = (flavor, base) {
+                    let mut overrides = ide::compile_settings(&facts, flavor);
+                    overrides.flags.drain(..base.flags.len());
+                    overrides.defines.drain(..base.defines.len());
+                    overrides
+                        .includes
+                        .retain(|include| !base.includes.contains(include));
+                    if !overrides.flags.is_empty()
+                        || !overrides.defines.is_empty()
+                        || !overrides.includes.is_empty()
+                    {
+                        ide_source_compile.insert(group, overrides);
+                    }
+                    ide_compile.entry(base.language.clone()).or_insert_with(|| {
+                        let mut base = base;
+                        let mut flags = Vec::new();
+                        for value in
+                            lower::language_flags(model, target, &ctx.config, &base.language)
+                        {
+                            sources::append_compile_flags(&mut flags, &value, Backtrace::default());
+                        }
+                        flags.append(&mut base.flags);
+                        base.flags = flags;
+                        base
+                    });
+                }
                 let facts = entry.insert(facts);
                 (group, facts)
             }
         };
         facts.units.push(resolved.compile_units.len());
-        let object = unity_file.map_or_else(
-            || lower::object_path(model, target, &ctx.config, &source.value),
-            |file| file.object_path(model, target, &ctx.config, &source.value),
-        );
+        let object = if let Some(flavor) = flavor {
+            lower::build_relative(
+                model,
+                &ide::object_path(model, target, &ctx.config, &source.value, flavor),
+            )
+        } else {
+            unity_file.map_or_else(
+                || lower::object_path(model, target, &ctx.config, &source.value),
+                |file| file.object_path(model, target, &ctx.config, &source.value),
+            )
+        };
         resolved.compile_units.push(CompileUnit {
             object,
             source,
@@ -936,6 +1042,24 @@ fn resolve_target<'a>(
         });
     }
     resolved.compile_groups = groups.into_values().collect();
+    if let Some(facts) = &mut resolved.ide {
+        facts.compile = ide_compile.into_values().collect();
+        let compiled = resolved
+            .compile_units
+            .iter()
+            .filter_map(|unit| {
+                let group = resolved.compile_groups.get(unit.group)?;
+                Some((
+                    unit.source.value.clone(),
+                    (
+                        group.language.clone(),
+                        ide_source_compile.get(&unit.group).cloned(),
+                    ),
+                ))
+            })
+            .collect();
+        ide::collect_sources(facts, dir, paths, &inputs, &members, compiled);
+    }
     resolve_module_info(
         model,
         target,
@@ -1582,6 +1706,15 @@ struct ResolvedLink {
     dependencies: Vec<TargetId>,
     module_links: Vec<TargetId>,
     objects: IndexSet<BString>,
+    ide: Option<IdeLinkSettings>,
+}
+
+struct IdeLinkSettings {
+    items: Vec<ide::IdeLinkItem>,
+    options: Vec<BT<BString>>,
+    directories: Vec<BString>,
+    rpaths: Vec<BString>,
+    install_name_dir: Option<BString>,
 }
 
 fn resolve_link(
@@ -1680,21 +1813,22 @@ fn resolve_link(
         )
     })?;
     let mut fragments = Vec::new();
-    for option in usage.collect(id, UsageField::LinkOptions, &ctx)?.entries {
+    let options = usage.collect(id, UsageField::LinkOptions, &ctx)?.entries;
+    for option in &options {
         let value = option.value.as_slice();
         let text = value
             .strip_prefix(b"SHELL:")
             .map_or_else(|| shell_quote(value), BString::from);
-        fragments.push(link_fragment(text, &option, LinkFragmentRole::Flags));
+        fragments.push(link_fragment(text, option, LinkFragmentRole::Flags));
     }
-    for directory in usage
+    let directories = usage
         .collect(id, UsageField::LinkDirectories, &ctx)?
-        .entries
-    {
+        .entries;
+    for directory in &directories {
         let text = shell_quote(&[b"-L", directory.value.as_slice()].concat());
         fragments.push(link_fragment(
             text,
-            &directory,
+            directory,
             LinkFragmentRole::LibraryPath,
         ));
     }
@@ -1725,12 +1859,41 @@ fn resolve_link(
         .file
         .as_ref()
         .map_or_else(BString::default, |path| build_path(model, path));
-    link.step = Some(LinkStep {
+    let step = LinkStep {
         kind,
         language,
         fragments,
         output,
-    });
+    };
+    if let Some(flavor) = usage.ide() {
+        let items = ide::collect_link_items(usage, model, &ctx.config, link_items(&items));
+        let (rpaths, install_name_dir) = if flavor == ide::IdeFlavor::Xcode {
+            let libraries = items
+                .iter()
+                .filter_map(|item| match item {
+                    ide::IdeLinkItem::File(path) => Some(path.clone()),
+                    ide::IdeLinkItem::Target(id) => resolved.get(id)?.artifacts.linker_file.clone(),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            let rpaths = lower::ide_rpaths(model, target, id, &ctx, usage, &step, &libraries)?;
+            let install_name_dir = (kind == LinkKind::SharedLibrary)
+                .then(|| lower::install_name_dir(model, target, &facts.artifacts))
+                .map(|dir| usage.eval_ide_property(id, b"INSTALL_NAME_DIR", &dir, &ctx))
+                .transpose()?;
+            (rpaths, install_name_dir)
+        } else {
+            (Vec::new(), None)
+        };
+        link.ide = Some(IdeLinkSettings {
+            items,
+            options,
+            directories: directories.into_iter().map(|entry| entry.value).collect(),
+            rpaths,
+            install_name_dir,
+        });
+    }
+    link.step = Some(step);
     Ok(link)
 }
 

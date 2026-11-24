@@ -8,12 +8,19 @@
 //! values for its own file format.
 //!
 //! The resolver fills [`crate::ResolvedTarget::ide`] only when
-//! [`crate::ResolveOptions::ide`] is set. In Wave 0 of Milestone 4, the field always
-//! stays `None`.
+//! [`crate::ResolveOptions::ide`] is set.
 
-use indexmap::IndexMap;
-use rcmake_base::BString;
-use rcmake_model::{BT, TargetId};
+use indexmap::{IndexMap, IndexSet};
+use rcmake_base::{BString, list, path_lex::Lexical, truth};
+use rcmake_genex::{ConfigId, EvalContext};
+use rcmake_model::{BT, FileSetKind, GeneratorKind, ProjectModel, Target, TargetId, TargetKind};
+
+use crate::{
+    CompileGroup, FileSetMember, InterfaceInclude, ResolveError, ResolvedTarget, absolute_path,
+    lower, module_error,
+    sources::{SourcePaths, TargetInputs, external_object, properties},
+    usage::{ResolvedLinkItem, ResolvedLinkKind, UsageResolver, handle},
+};
 
 /// The IDE file format that the facts are for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -49,8 +56,8 @@ pub struct IdeFacts {
     pub install_name_dir: Option<BString>,
     /// Custom commands and build events of the target.
     pub custom: Vec<IdeCustomStep>,
-    /// `XCODE_ATTRIBUTE_*` (Xcode) or `VS_*` (Visual Studio) values for this
-    /// configuration. The keys keep `[sdk=...]` and `[arch=...]` filters.
+    /// Target properties for this configuration, with their original prefixes.
+    /// Xcode attribute keys keep their `[sdk=...]` and `[arch=...]` filters.
     pub attributes: IndexMap<BString, BString>,
     /// Precompiled headers, one entry per language.
     pub pch: Vec<IdePch>,
@@ -116,7 +123,7 @@ pub enum IdeSourceKind {
 }
 
 /// One file of an IDE project.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct IdeSource {
     /// Absolute path.
     pub path: BString,
@@ -128,6 +135,12 @@ pub struct IdeSource {
     pub generated: bool,
     /// Visual Studio: configurations that do not build the file (`ExcludedFromBuild`).
     pub excluded_configs: Vec<BString>,
+    /// Name of the file set that contains the source, if any.
+    pub file_set: Option<BString>,
+    /// Bundle subdirectory from `MACOSX_PACKAGE_LOCATION`.
+    pub package_location: Option<BString>,
+    /// Compile settings that apply to this source only.
+    pub compile: Option<IdeCompileSettings>,
 }
 
 /// Compile settings of one language.
@@ -214,4 +227,487 @@ pub struct IdePch {
     pub source: BString,
     /// Target whose precompiled header this target uses (`REUSE_FROM`).
     pub reuse_from: Option<TargetId>,
+}
+
+impl IdeFlavor {
+    pub(crate) fn from_model(model: &ProjectModel) -> Option<Self> {
+        match model.generator {
+            Some(GeneratorKind::Xcode) => Some(Self::Xcode),
+            Some(GeneratorKind::VisualStudio(_)) => Some(Self::VisualStudio),
+            _ => None,
+        }
+    }
+}
+
+pub(crate) fn bundle_kind(target: &Target) -> BundleKind {
+    let on = |key| {
+        target
+            .props
+            .get(key)
+            .is_some_and(|value| truth::is_on(value))
+    };
+    let value = |key, fallback: &str| {
+        target
+            .props
+            .get(key)
+            .cloned()
+            .unwrap_or_else(|| fallback.into())
+    };
+    match target.kind {
+        TargetKind::Executable if on(b"MACOSX_BUNDLE") => BundleKind::App,
+        TargetKind::StaticLibrary | TargetKind::SharedLibrary if on(b"FRAMEWORK") => {
+            BundleKind::Framework {
+                version: target
+                    .props
+                    .get(b"FRAMEWORK_VERSION")
+                    .or_else(|| target.props.get(b"VERSION"))
+                    .cloned()
+                    .unwrap_or_else(|| "A".into()),
+            }
+        }
+        TargetKind::ModuleLibrary if on(b"BUNDLE") => BundleKind::Bundle {
+            extension: value(b"BUNDLE_EXTENSION", "bundle"),
+        },
+        _ => BundleKind::None,
+    }
+}
+
+pub(crate) fn object_directory(
+    model: &ProjectModel,
+    target: &Target,
+    config: &ConfigId,
+    flavor: IdeFlavor,
+) -> BString {
+    let binary = &model.dir(target.dir).binary_dir;
+    match flavor {
+        IdeFlavor::Xcode => {
+            let key = [
+                b"OSX_ARCHITECTURES_",
+                config.0.to_ascii_uppercase().as_slice(),
+            ]
+            .concat();
+            let architectures = target
+                .props
+                .get(&key)
+                .or_else(|| target.props.get(b"OSX_ARCHITECTURES"))
+                .or_else(|| lower::definition(model, target.dir, b"CMAKE_OSX_ARCHITECTURES"));
+            let architectures = architectures
+                .into_iter()
+                .chain(
+                    [
+                        b"CMAKE_XCODE_ARCHS".as_slice(),
+                        b"_CMAKE_APPLE_ARCHS_DEFAULT",
+                        b"CMAKE_SYSTEM_PROCESSOR",
+                    ]
+                    .into_iter()
+                    .filter_map(|key| lower::definition(model, target.dir, key)),
+                )
+                .find(|value| !value.is_empty())
+                .map(|value| list::split(value, list::Empty::Drop))
+                .unwrap_or_default();
+            let arch = match architectures.as_slice() {
+                [arch] => arch.as_slice(),
+                [] if cfg!(target_arch = "aarch64") => b"arm64",
+                [] if cfg!(target_arch = "x86_64") => b"x86_64",
+                _ => b"$(CURRENT_ARCH)",
+            };
+            let build = absolute_path(
+                binary,
+                &[b"build/", target.name.as_slice(), b".build"].concat(),
+            );
+            let config = absolute_path(&build, &config.0);
+            absolute_path(&config, &[b"Objects-normal/", arch].concat())
+        }
+        IdeFlavor::VisualStudio => {
+            let dir = absolute_path(binary, &[target.name.as_slice(), b".dir"].concat());
+            absolute_path(&dir, &config.0)
+        }
+    }
+}
+
+pub(crate) fn object_path(
+    model: &ProjectModel,
+    target: &Target,
+    config: &ConfigId,
+    source: &[u8],
+    flavor: IdeFlavor,
+) -> BString {
+    let (name, _) = Lexical::new(source).stem_extension(true);
+    let suffix = match flavor {
+        IdeFlavor::Xcode => b".o".as_slice(),
+        IdeFlavor::VisualStudio => b".obj",
+    };
+    absolute_path(
+        &object_directory(model, target, config, flavor),
+        &[name, suffix].concat(),
+    )
+}
+
+impl IdeFacts {
+    pub(crate) fn collect_properties(
+        &mut self,
+        usage: &mut UsageResolver<'_>,
+        target: &Target,
+        id: TargetId,
+        ctx: &EvalContext,
+        flavor: IdeFlavor,
+    ) -> Result<(), ResolveError> {
+        let ctx = EvalContext {
+            head: Some(handle(id)),
+            ..ctx.clone()
+        };
+        let mut selected = IndexMap::new();
+        for property in target
+            .props
+            .names()
+            .into_iter()
+            .filter(|name| is_ide_property(name, flavor))
+        {
+            let (key, specific) = if property.starts_with(b"XCODE_ATTRIBUTE_") {
+                let Some(filter) = xcode_attribute_name(&property, &ctx.config.0) else {
+                    continue;
+                };
+                filter
+            } else {
+                (property.clone(), false)
+            };
+            if specific || !selected.contains_key(&key) {
+                selected.insert(key, property);
+            }
+        }
+        for (key, property) in selected {
+            if let Some(value) = target.props.get(&property) {
+                self.attributes
+                    .insert(key, usage.eval_ide_property(id, &property, value, &ctx)?);
+            }
+        }
+        Ok(())
+    }
+}
+
+fn is_ide_property(name: &[u8], flavor: IdeFlavor) -> bool {
+    matches!(
+        name,
+        b"FOLDER" | b"PUBLIC_HEADER" | b"PRIVATE_HEADER" | b"RESOURCE"
+    ) || match flavor {
+        IdeFlavor::Xcode => {
+            name.starts_with(b"XCODE_")
+                || name.starts_with(b"MACOSX_BUNDLE")
+                || matches!(
+                    name,
+                    b"FRAMEWORK"
+                        | b"FRAMEWORK_VERSION"
+                        | b"BUNDLE"
+                        | b"BUNDLE_EXTENSION"
+                        | b"INFO_PLIST"
+                        | b"MACOSX_FRAMEWORK_INFO_PLIST"
+                )
+        }
+        IdeFlavor::VisualStudio => name.starts_with(b"VS_"),
+    }
+}
+
+fn xcode_attribute_name(name: &[u8], config: &[u8]) -> Option<(BString, bool)> {
+    let mut sections = name.split_inclusive(|&byte| byte == b']');
+    let mut key = BString::default();
+    let mut specific = false;
+    for section in &mut sections {
+        let Some(open) = section.iter().position(|&byte| byte == b'[') else {
+            key.extend_from_slice(section);
+            continue;
+        };
+        let (prefix, filter) = section.split_at(open);
+        key.extend_from_slice(prefix);
+        if let Some(variant) = filter
+            .strip_prefix(b"[variant=")
+            .and_then(|v| v.strip_suffix(b"]"))
+        {
+            if variant != config {
+                return None;
+            }
+            specific = true;
+        } else {
+            key.extend_from_slice(filter);
+        }
+    }
+    Some((key, specific))
+}
+
+pub(crate) fn compile_settings(group: &CompileGroup, flavor: IdeFlavor) -> IdeCompileSettings {
+    IdeCompileSettings {
+        language: group.language.clone(),
+        flags: group.flags.clone(),
+        defines: group.defines.clone(),
+        includes: group
+            .includes
+            .iter()
+            .map(|entry| include(entry, flavor))
+            .collect(),
+    }
+}
+
+fn include(entry: &InterfaceInclude, flavor: IdeFlavor) -> IdeInclude {
+    let path = &entry.path.value;
+    let framework = (flavor == IdeFlavor::Xcode)
+        .then(|| {
+            path.split_inclusive(|&byte| byte == b'/')
+                .scan(0, |index, part| {
+                    let offset = *index;
+                    *index += part.len();
+                    Some((offset, part.strip_suffix(b"/").unwrap_or(part)))
+                })
+                .find(|(_, part)| part.ends_with(b".framework"))
+                .and_then(|(index, _)| path.get(..index))
+                .map(|parent| Lexical::new(parent).parent().into())
+        })
+        .flatten();
+    IdeInclude {
+        framework: framework.is_some(),
+        path: framework.unwrap_or_else(|| path.clone()),
+        system: entry.system,
+    }
+}
+
+pub(crate) fn collect_sources(
+    facts: &mut IdeFacts,
+    dir: &rcmake_model::Directory,
+    paths: &SourcePaths<'_>,
+    inputs: &TargetInputs,
+    members: &IndexMap<BString, FileSetMember<'_>>,
+    mut compiled: IndexMap<BString, (BString, Option<IdeCompileSettings>)>,
+) {
+    let property_files = |name: &[u8]| -> IndexSet<BString> {
+        facts
+            .attributes
+            .get(name)
+            .into_iter()
+            .flat_map(|value| list::split(value, list::Empty::Drop))
+            .map(|path| {
+                paths
+                    .find(dir, &path)
+                    .unwrap_or_else(|| absolute_path(&dir.source_dir, &path))
+            })
+            .collect()
+    };
+    let public_headers = property_files(b"PUBLIC_HEADER");
+    let private_headers = property_files(b"PRIVATE_HEADER");
+    let resources = property_files(b"RESOURCE");
+    let sources: IndexSet<_> = inputs
+        .sources
+        .iter()
+        .chain(&public_headers)
+        .chain(&private_headers)
+        .chain(&resources)
+        .cloned()
+        .collect();
+    facts.sources = sources
+        .into_iter()
+        .map(|path| {
+            let props = properties(dir, &path);
+            let member = members.get(&path).map(|entry| entry.set);
+            let package_location = props.get(b"MACOSX_PACKAGE_LOCATION").cloned();
+            let file = Lexical::new(&path);
+            let generated = paths.is_generated(dir, &path)
+                || props
+                    .get(b"GENERATED")
+                    .is_some_and(|value| truth::is_on(value))
+                || paths.object_owner(&path).is_some();
+            let (kind, compile) = if resources.contains(&path) || package_location.is_some() {
+                (IdeSourceKind::Resource, None)
+            } else if public_headers.contains(&path)
+                || private_headers.contains(&path)
+                || member.is_some_and(|set| set.kind == FileSetKind::Headers)
+                || props
+                    .get(b"HEADER_FILE_ONLY")
+                    .is_some_and(|value| truth::is_on(value))
+            {
+                (IdeSourceKind::Header, None)
+            } else if let Some((language, compile)) = compiled.swap_remove(&path) {
+                (IdeSourceKind::Compile { language }, compile)
+            } else if paths.object_owner(&path).is_some() {
+                (IdeSourceKind::Object, None)
+            } else if external_object(dir, &path) {
+                (IdeSourceKind::ExternalObject, None)
+            } else if matches!(
+                file.stem_extension(true).1,
+                b".h" | b".hh" | b".hpp" | b".hxx" | b".inl"
+            ) {
+                (IdeSourceKind::Header, None)
+            } else if file.filename() == b"CMakeLists.txt"
+                || file.stem_extension(true).1 == b".cmake"
+            {
+                (IdeSourceKind::ListFile, None)
+            } else {
+                (IdeSourceKind::Other, None)
+            };
+            IdeSource {
+                group: props.get(b"SOURCE_GROUP").cloned().unwrap_or_default(),
+                generated,
+                file_set: member.map(|set| set.name.clone()),
+                package_location,
+                path,
+                kind,
+                excluded_configs: Vec::new(),
+                compile,
+            }
+        })
+        .collect();
+}
+
+pub(crate) fn collect_link_items<'a>(
+    usage: &UsageResolver<'_>,
+    model: &ProjectModel,
+    config: &ConfigId,
+    items: impl Iterator<Item = &'a ResolvedLinkItem>,
+) -> Vec<IdeLinkItem> {
+    use rcmake_genex::{ArtifactKind, ArtifactPart};
+    items
+        .filter_map(|item| {
+            let classify = |path: BString| {
+                if Lexical::new(&path)
+                    .components()
+                    .any(|part| part.ends_with(b".framework"))
+                {
+                    IdeLinkItem::Framework(path)
+                } else {
+                    IdeLinkItem::File(path)
+                }
+            };
+            let value = &item.text.value;
+            match item.kind {
+                ResolvedLinkKind::Library(id) | ResolvedLinkKind::Objects(id) => {
+                    if model.target(id)?.is_imported() {
+                        usage
+                            .artifact(id, ArtifactKind::LinkerFile, ArtifactPart::Full, config)
+                            .or_else(|| {
+                                usage.artifact(id, ArtifactKind::File, ArtifactPart::Full, config)
+                            })
+                            .map(classify)
+                    } else {
+                        Some(IdeLinkItem::Target(id))
+                    }
+                }
+                ResolvedLinkKind::Raw => {
+                    Some(if let Some(name) = value.strip_prefix(b"-framework ") {
+                        IdeLinkItem::Framework(name.into())
+                    } else if value.starts_with(b"-") || value.starts_with(b"/DEFAULTLIB:") {
+                        IdeLinkItem::Flag(value.clone())
+                    } else if Lexical::new(value).absolute() {
+                        classify(value.clone())
+                    } else {
+                        IdeLinkItem::Library(value.clone())
+                    })
+                }
+                ResolvedLinkKind::ObjectFile => Some(IdeLinkItem::File(value.clone())),
+                _ => None,
+            }
+        })
+        .collect()
+}
+
+fn xcode_source_key(source: &IdeSource) -> (BString, Option<BString>) {
+    if source.kind == IdeSourceKind::Object {
+        // The build directory contains the configuration and architecture.
+        // Compare the object library directory and the file name.
+        let path = Lexical::new(&source.path);
+        let arch = Lexical::new(path.parent());
+        let objects = Lexical::new(arch.parent());
+        let config = Lexical::new(objects.parent());
+        if objects.filename() == b"Objects-normal" {
+            return (config.parent().into(), Some(path.filename().into()));
+        }
+    }
+    (source.path.clone(), None)
+}
+
+pub(crate) fn finish_sources(
+    model: &ProjectModel,
+    paths: &SourcePaths<'_>,
+    targets: &mut [ResolvedTarget],
+    flavor: IdeFlavor,
+) -> Result<(), ResolveError> {
+    let mut by_id = IndexMap::<_, Vec<_>>::new();
+    for target in targets {
+        if target.ide.is_some() {
+            by_id.entry(target.id).or_default().push(target);
+        }
+    }
+    for (id, configs) in by_id {
+        match flavor {
+            IdeFlavor::Xcode => {
+                let sources = |target: &ResolvedTarget| {
+                    target
+                        .ide
+                        .iter()
+                        .flat_map(|facts| &facts.sources)
+                        .map(xcode_source_key)
+                        .collect::<IndexSet<_>>()
+                };
+                if let (Some(raw), Some(first)) = (model.target(id), configs.first()) {
+                    let first = sources(first);
+                    if configs
+                        .iter()
+                        .skip(1)
+                        .all(|target| sources(target) == first)
+                    {
+                        continue;
+                    }
+                    let mut body = format!(
+                        "Target \"{}\" has source files which vary by configuration.  This is not supported by the \"Xcode\" generator.\n",
+                        raw.name
+                    );
+                    for target in configs {
+                        use std::fmt::Write;
+                        let _ = write!(body, "\nConfig \"{}\":\n\n", target.config.0);
+                        for source in target.ide.iter().flat_map(|facts| &facts.sources) {
+                            let _ = writeln!(body, "  {}", source.path);
+                        }
+                    }
+                    return Err(module_error(model, paths, raw, body.trim_end().into()));
+                }
+            }
+            IdeFlavor::VisualStudio => {
+                let mut sources = IndexMap::<_, (IdeSource, IndexSet<BString>)>::new();
+                for target in &configs {
+                    for source in target.ide.iter().flat_map(|facts| &facts.sources) {
+                        sources
+                            .entry(source.path.clone())
+                            .or_insert_with(|| (source.clone(), IndexSet::new()))
+                            .1
+                            .insert(target.config.0.clone());
+                    }
+                }
+                let all_configs: Vec<_> = configs
+                    .iter()
+                    .map(|target| target.config.0.clone())
+                    .collect();
+                for target in configs {
+                    let Some(facts) = &mut target.ide else {
+                        continue;
+                    };
+                    let mut local: IndexMap<_, _> = std::mem::take(&mut facts.sources)
+                        .into_iter()
+                        .map(|source| (source.path.clone(), source))
+                        .collect();
+                    facts.sources = sources
+                        .iter()
+                        .map(|(path, (source, included))| {
+                            let mut source = local.swap_remove(path).unwrap_or_else(|| {
+                                let mut source = source.clone();
+                                source.compile = None;
+                                source
+                            });
+                            source.excluded_configs = all_configs
+                                .iter()
+                                .filter(|config| !included.contains(*config))
+                                .cloned()
+                                .collect();
+                            source
+                        })
+                        .collect();
+                }
+            }
+        }
+    }
+    Ok(())
 }
