@@ -1,0 +1,5 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+Name: local
+Description: Local compile flag
+Version: 1.0
+Cflags: -DLOCAL_VALUE=1

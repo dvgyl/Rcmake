@@ -1,0 +1,6 @@
+{
+  "name": "rcmake-vcpkg-probe",
+  "version": "1.0.0",
+  "license": "MIT OR Apache-2.0",
+  "dependencies": ["fmt", "zlib", "spdlog", "nlohmann-json", "boost-headers"]
+}
