@@ -5,6 +5,8 @@ use std::collections::BTreeSet;
 use crate::text;
 use rcmake_base::truth;
 use rcmake_gen_common::GenError;
+use rcmake_model::DirId;
+use rcmake_resolve::ide::IdeCustomPhase;
 
 use crate::{
     object::{Attrs, Isa, Objects, Reference, Value, attrs, list},
@@ -13,7 +15,7 @@ use crate::{
 };
 
 use super::{
-    Project, TargetEntry, file_ref,
+    Group, Project, TargetEntry, file_ref,
     sources::{Source, source_files, validate_source_flags},
     target_fields, target_key,
 };
@@ -24,6 +26,7 @@ impl Project<'_> {
         target: &TargetEntry<'_>,
         all: &[TargetEntry<'_>],
         project: &Reference,
+        project_dir: DirId,
         zero: Option<&Reference>,
     ) -> Result<(Reference, Option<Reference>), GenError> {
         let TargetEntry {
@@ -37,6 +40,7 @@ impl Project<'_> {
         let mut custom = phases::Custom::default();
         let mut dependencies = BTreeSet::new();
         let mut target_settings = Vec::new();
+        let mut config_files = Group::default();
         let mut sources: Option<Vec<Source<'_>>> = None;
         let native = matches!(isa, Isa::PBXNativeTarget);
         let first = self.configs.first().cloned().unwrap_or_default();
@@ -69,7 +73,9 @@ impl Project<'_> {
                     .cloned(),
             );
         }
-        for config in &self.configs {
+        let phase_links = self.phase_links(target, phase_mode, &xcframeworks);
+        for config in self.configs.clone() {
+            let config = &config;
             let facts = self.resolved.get(&(*id, config.clone())).copied();
             let configured_product = Product::new(self.model, raw, facts, config, self.bin);
             custom.post.version_links(config, &configured_product)?;
@@ -85,11 +91,15 @@ impl Project<'_> {
                 let steps = graph_target
                     .into_iter()
                     .flat_map(|target| &target.steps)
-                    .filter_map(|index| graph.and_then(|graph| graph.steps.get(*index)));
-                custom.collect(facts, self.bin, steps);
-                let items = source_files(self.model, raw, facts)?;
+                    .filter_map(|&index| {
+                        graph.and_then(|graph| graph.steps.get(index).map(|step| (index, step)))
+                    });
+                custom.collect(facts, self.model, self.bin, steps);
+                let items = source_files(self.model, raw, facts)
+                    .map_err(|error| self.source_error(project_dir, error))?;
                 if let Some(original) = &sources {
-                    validate_source_flags(original, &items)?;
+                    validate_source_flags(original, &items)
+                        .map_err(|error| self.source_error(project_dir, error))?;
                 } else {
                     sources = Some(items);
                 }
@@ -111,16 +121,22 @@ impl Project<'_> {
                     result: self.result,
                     bin: self.bin,
                     config,
-                    arch: &self.arch,
                     raw,
                     target: facts,
                     xcframeworks: &xcframeworks,
+                    phase_links: &phase_links,
                 }
                 .build(&configured_product, plist.as_deref())
             } else {
                 Attrs::new()
             };
-            target_settings.push(settings);
+            let base_config = facts
+                .and_then(|facts| facts.ide.as_deref())
+                .and_then(|ide| ide.attributes.get(b"XCODE_XCCONFIG".as_slice()))
+                .map(|path| self.xcconfig(raw.dir, &key, config, &text(path), &mut config_files))
+                .transpose()?
+                .flatten();
+            target_settings.push((settings, base_config));
         }
         for dep in &raw.utility_deps {
             if let Some(binding) = self.model.find_target(raw.dir, &dep.value) {
@@ -136,6 +152,7 @@ impl Project<'_> {
                     .map(|dep| &dep.reference),
             ),
         )?;
+        let has_xcconfig = target_settings.iter().any(|(_, file)| file.is_some());
         let config_list = self.config_list(&key, name, *isa, target_settings)?;
         let configs = self.configs.clone();
         let phase = |objects: &mut Objects, script: phases::Script, role: &str, label: &str| {
@@ -161,8 +178,23 @@ impl Project<'_> {
             native,
             &product.bundle,
         )?;
+        if has_xcconfig {
+            tree.push(config_files.finish(
+                &mut self.objects,
+                &format!("{key}/xcconfig"),
+                "Configurations",
+            )?);
+        }
         let mut product_ref = None;
         if native {
+            self.remove_object_inputs(first_target, &mut files.frameworks);
+            if matches!(
+                product.bundle,
+                rcmake_resolve::ide::BundleKind::Framework { .. }
+            ) && let Some(ide) = first_target.and_then(|target| target.ide.as_deref())
+            {
+                self.framework_headers(raw, ide, &mut files);
+            }
             build_phases.push(phases::files(
                 &mut self.objects,
                 Isa::PBXSourcesBuildPhase,
@@ -193,6 +225,28 @@ impl Project<'_> {
                     "Frameworks",
                     &reference,
                     Attrs::new(),
+                )?);
+            }
+            for (index, item) in phase_links.iter().enumerate() {
+                let file_key = format!("{key}/link/{index}");
+                let reference = file_ref(
+                    &mut self.objects,
+                    &file_key,
+                    &item.path,
+                    ("lastKnownFileType", item.file_type),
+                    item.source_tree,
+                )?;
+                tree.add("Frameworks", reference.clone())?;
+                files.frameworks.push(phases::build_file(
+                    &mut self.objects,
+                    &format!("{file_key}/build"),
+                    "Frameworks",
+                    &reference,
+                    if item.weak {
+                        attrs([("ATTRIBUTES", list(["Weak"]))])
+                    } else {
+                        Attrs::new()
+                    },
                 )?);
             }
             build_phases.push(phases::files(
@@ -227,7 +281,10 @@ impl Project<'_> {
                 ("explicitFileType", product.types().1),
                 "BUILT_PRODUCTS_DIR",
             )?);
-            build_phases.extend(self.embeds(&key, *id, raw)?);
+            build_phases.extend(
+                self.embeds(&key, *id, raw)
+                    .map_err(|error| self.source_error(project_dir, error))?,
+            );
         }
         build_phases.extend(phase(
             &mut self.objects,
@@ -267,5 +324,52 @@ impl Project<'_> {
         }
         let group = tree.finish(&mut self.objects, &format!("{key}/group"), name)?;
         Ok((group, product_ref))
+    }
+
+    pub(super) fn validate_custom_command_owners(
+        &self,
+        dir: DirId,
+        targets: &[TargetEntry<'_>],
+    ) -> Result<(), GenError> {
+        if self
+            .model
+            .definition(dir, b"CMAKE_XCODE_BUILD_SYSTEM")
+            .is_some_and(|value| value == "1")
+        {
+            return Ok(());
+        }
+        for config in &self.configs {
+            let mut owners = std::collections::BTreeMap::new();
+            for entry in targets {
+                if let Some(ide) = self
+                    .resolved
+                    .get(&(entry.id, config.clone()))
+                    .and_then(|target| target.ide.as_deref())
+                {
+                    for command in &ide.custom {
+                        if command.phase == IdeCustomPhase::Rule
+                            && !command.always_run
+                            && let Some(output) = command.outputs.first()
+                        {
+                            owners
+                                .entry(output)
+                                .or_insert_with(BTreeSet::new)
+                                .insert(&entry.raw.name);
+                        }
+                    }
+                }
+            }
+            if let Some((output, names)) = owners.into_iter().find(|(_, names)| names.len() > 1) {
+                let names = names
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join("\n  ");
+                return Err(self.project_error(dir, GenError::Invalid(format!(
+                    "The custom command generating\n\n  {output}\n\nis attached to multiple targets:\n\n  {names}\n\nbut none of these is a common dependency of the other(s).  This is not allowed by the Xcode \"new build system\"."
+                ).into())));
+            }
+        }
+        Ok(())
     }
 }

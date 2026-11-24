@@ -188,8 +188,7 @@ impl Interp {
     /// `<prefix>given arguments:\n  <args>\n<message>` as a fatal error.
     fn eval_reporting(&mut self, args: &[Argument], prefix: &[u8]) -> Result<bool, CmdError> {
         let expanded = self.expand(args)?;
-        let cond = self.frontend.cond;
-        match cond(&expanded, self) {
+        match self.eval_command_condition(&expanded) {
             Ok(v) => Ok(v),
             Err(e) => {
                 let mut msg = prefix.to_vec();

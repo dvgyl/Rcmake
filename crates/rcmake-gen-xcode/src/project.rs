@@ -1,6 +1,8 @@
 //! Convert resolved build facts to an Xcode project.
 
 mod bundle;
+mod config;
+pub(crate) mod link;
 mod sources;
 mod targets;
 
@@ -36,7 +38,6 @@ struct Project<'a> {
     path: PathBuf,
     configs: Vec<String>,
     default_config: String,
-    arch: String,
     upgrade: String,
     objects: Objects,
     resolved: BTreeMap<(TargetId, String), &'a ResolvedTarget>,
@@ -168,7 +169,6 @@ pub(crate) fn generate(
         .or_else(|| configs.first())
         .cloned()
         .unwrap_or_default();
-    let arch = text(&host.system().machine);
     let upgrade = model.definition(DirId::ROOT, b"XCODE_VERSION").map_or_else(
         || "1200".into(),
         |version| {
@@ -198,7 +198,6 @@ pub(crate) fn generate(
         path,
         configs,
         default_config,
-        arch,
         upgrade,
         objects: Objects::default(),
         resolved: result
@@ -254,10 +253,12 @@ impl Project<'_> {
             .iter()
             .find(|(kind, _)| *kind == UtilityKind::ZeroCheck)
             .map(|(_, r)| r);
+        self.validate_custom_command_owners(root.dir, &targets)?;
         let mut products = Vec::new();
         let mut tree = Group::default();
+        let project_settings = self.project_settings(root.dir, &key, &mut tree)?;
         for target in &targets {
-            let (group, product) = self.target(target, &targets, &project_ref, zero)?;
+            let (group, product) = self.target(target, &targets, &project_ref, root.dir, zero)?;
             let folder = target
                 .raw
                 .props
@@ -331,7 +332,7 @@ impl Project<'_> {
                 &key,
                 &reference.comment,
                 Isa::PBXAggregateTarget,
-                self.configs.iter().map(|_| Attrs::new()).collect(),
+                self.configs.iter().map(|_| (Attrs::new(), None)).collect(),
             )?;
             self.objects.insert(
                 Isa::PBXAggregateTarget,
@@ -369,15 +370,7 @@ impl Project<'_> {
             .chain(utility_refs.into_iter().map(|(_, reference)| reference))
             .collect::<Vec<_>>();
         project_targets.sort_by_cached_key(|r| (r.comment.to_ascii_lowercase(), r.comment.clone()));
-        let config_list = self.config_list(
-            &key,
-            name,
-            Isa::PBXProject,
-            self.configs
-                .iter()
-                .map(|config| settings::project(self.model, root.dir, self.bin, &self.arch, config))
-                .collect::<Result<_, _>>()?,
-        )?;
+        let config_list = self.config_list(&key, name, Isa::PBXProject, project_settings)?;
         let development_region = self
             .model
             .definition(root.dir, b"CMAKE_XCODE_ATTRIBUTE_developmentRegion")
@@ -461,21 +454,25 @@ impl Project<'_> {
         key: &str,
         name: &str,
         isa: Isa,
-        settings: Vec<Attrs>,
+        settings: Vec<(Attrs, Option<Reference>)>,
     ) -> Result<Reference, GenError> {
         let configs = self
             .configs
             .iter()
             .zip(settings)
-            .map(|(config, settings)| {
+            .map(|(config, (settings, base_config))| {
+                let mut fields = attrs([
+                    ("buildSettings", Value::Dict(settings)),
+                    ("name", config.as_str().into()),
+                ]);
+                if let Some(reference) = base_config {
+                    fields.insert("baseConfigurationReference".into(), reference.into());
+                }
                 self.objects.add(
                     Isa::XCBuildConfiguration,
                     &format!("{key}/config/{config}"),
                     config,
-                    attrs([
-                        ("buildSettings", Value::Dict(settings)),
-                        ("name", config.as_str().into()),
-                    ]),
+                    fields,
                 )
             })
             .collect::<Result<Vec<_>, _>>()?;

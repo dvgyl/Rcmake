@@ -306,7 +306,7 @@ impl Decode for u32 {
             }
             _ => None,
         }
-        .ok_or_else(|| field.invalid("Expected a non-negative integer"))
+        .ok_or_else(|| field.expected("an unsigned integer"))
     }
 }
 

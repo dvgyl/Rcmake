@@ -334,7 +334,7 @@ settings! {
     /// Build preset settings.
     BuildSettings {
         /// Number of parallel jobs. Zero uses the native tool's default.
-        jobs: u32 = "jobs" => nonnegative,
+        jobs: u32 = "jobs",
         /// Targets to build.
         targets: Vec<BString> = "targets" => schema::string_or_array,
         /// Build configuration for a multi-configuration generator.

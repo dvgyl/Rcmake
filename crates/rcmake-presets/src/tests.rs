@@ -36,6 +36,27 @@ fn named(presets: &Presets, kind: PresetKind, name: &str) -> ResolvedPreset {
 }
 
 #[test]
+fn build_jobs_use_the_unsigned_integer_range() {
+    let document = |jobs| {
+        format!(
+            r#"{{"version":13,"configurePresets":[{{"name":"cfg","generator":"Ninja","binaryDir":"build"}}],"buildPresets":[{{"name":"build","configurePreset":"cfg","jobs":{jobs}}}]}}"#
+        )
+    };
+    let presets = root(&document("4294967295")).expect("valid build job count");
+    let build = named(&presets, PresetKind::Build, "build");
+    assert!(matches!(build.settings, PresetSettings::Build(settings)
+        if settings.jobs == Some(u32::MAX)));
+    let error = root(&document("-10"))
+        .err()
+        .expect("invalid build job count");
+    assert!(
+        error
+            .message
+            .contains("\"jobs\" expected an unsigned integer, got: -10")
+    );
+}
+
+#[test]
 fn schema_versions_and_root_metadata() {
     for version in 1..=13 {
         let presets = root(&format!(

@@ -1,19 +1,117 @@
-use std::sync::Arc;
+use std::{path::Path, sync::Arc};
 
 use rcmake_base::suggest::{Threshold, closest};
-use rcmake_base::{BString, fold_command_name};
-use rcmake_diag::{Backtrace, Frame, FrameKind};
-use rcmake_expr::ExpandedArg;
+use rcmake_base::{BString, fold_command_name, truth};
+use rcmake_diag::{
+    Backtrace, DiagCategory, Diagnostic, Effect, Frame, FrameKind, Location, MessageKind, PolicyId,
+    PolicyStatus,
+};
+use rcmake_expr::{CondEnv, CondError, ExpandEnv, ExpandedArg};
+use rcmake_host::Host;
+use rcmake_regex::{Captures, Regex, RegexError};
 use rcmake_syntax::{ArgKind, Argument, CommandInvocation};
 
 use super::BodyMode;
 use crate::code::Code;
 use crate::hooks::display_line;
+use crate::profiler::{CommandSample, SampleKind};
 use crate::util::cat;
 use crate::{
     CmdError, CmdResult, Command, Cx, FLOW_CONTROL, Flow, HARD_RECURSION_CEILING, Interp, RunMode,
     UserCommand, UserCommandKind,
 };
+
+struct CommandExpansion<'a>(&'a mut Interp);
+
+impl ExpandEnv for CommandExpansion<'_> {
+    fn var(&mut self, name: &[u8]) -> Option<BString> {
+        let value = self.0.var(name);
+        self.0.warn_deprecated_variable(name);
+        value
+    }
+
+    fn cache_var(&mut self, name: &[u8]) -> Option<BString> {
+        self.0.cache_var(name)
+    }
+
+    fn env_var(&mut self, name: &[u8]) -> Option<BString> {
+        self.0.env_var(name)
+    }
+
+    fn missing_reference(&mut self, name: &[u8]) {
+        self.0.missing_reference(name);
+    }
+
+    fn current_line(&self) -> u32 {
+        self.0.current_line()
+    }
+}
+
+impl CondEnv for CommandExpansion<'_> {
+    fn is_defined(&mut self, name: &[u8]) -> bool {
+        let defined = self.0.is_defined(name);
+        if !defined {
+            self.0.warn_deprecated_variable(name);
+        }
+        defined
+    }
+
+    fn cache_defined(&mut self, name: &[u8]) -> bool {
+        self.0.cache_defined(name)
+    }
+
+    fn env_defined(&mut self, name: &[u8]) -> bool {
+        self.0.env_defined(name)
+    }
+
+    fn command_exists(&self, name: &[u8]) -> bool {
+        self.0.command_exists(name)
+    }
+
+    fn policy_known(&self, name: &[u8]) -> bool {
+        self.0.policy_known(name)
+    }
+
+    fn diagnostic_known(&self, name: &[u8]) -> bool {
+        self.0.diagnostic_known(name)
+    }
+
+    fn target_exists(&self, name: &[u8]) -> bool {
+        self.0.target_exists(name)
+    }
+
+    fn test_exists(&self, name: &[u8]) -> bool {
+        self.0.test_exists(name)
+    }
+
+    fn rule_exists(&self, name: &[u8]) -> bool {
+        self.0.rule_exists(name)
+    }
+
+    fn policy(&self, id: PolicyId) -> PolicyStatus {
+        self.0.policy(id)
+    }
+
+    fn host(&self) -> &dyn Host {
+        self.0.host()
+    }
+
+    fn base_dir(&self) -> &Path {
+        self.0.base_dir()
+    }
+
+    fn regex(&mut self, pattern: &[u8]) -> Result<Arc<Regex>, RegexError> {
+        self.0.regex(pattern)
+    }
+
+    fn set_match_vars(&mut self, captures: Option<(&Captures, &[u8])>) {
+        self.0.set_match_vars(captures);
+    }
+
+    fn warn(&mut self, diag: Diagnostic) {
+        self.0.warn(diag)
+    }
+}
 
 /// Error text of commands that only close or continue a block.
 fn unexpected_text(lower: &[u8]) -> Option<&'static str> {
@@ -121,6 +219,21 @@ impl Interp {
         })
     }
 
+    pub(crate) fn local_command_backtrace(&self) -> Backtrace {
+        let count = self.depth.saturating_sub(self.dir_frame().trace_base) as usize;
+        let frames: Vec<_> = self
+            .bt
+            .frames()
+            .filter(|frame| frame.kind != FrameKind::ModuleInclude)
+            .take(count)
+            .cloned()
+            .collect();
+        frames
+            .into_iter()
+            .rev()
+            .fold(Backtrace::default(), |trace, frame| trace.push(frame))
+    }
+
     /// Run `f` with a call frame for `name` at `file:line` (`CallScope`), enforce the
     /// recursion limit, and convert command errors into diagnostics.
     pub(crate) fn with_command_frame(
@@ -153,27 +266,27 @@ impl Interp {
         let limit = self.recursion_limit();
         let result = if self.depth > limit {
             self.recursion_exceeded = true;
-            let local_frames = self.depth.saturating_sub(self.dir_frame().trace_base) as usize;
-            let frames = self
-                .bt
-                .frames()
-                .filter(|frame| frame.kind != FrameKind::ModuleInclude)
-                .take(local_frames)
-                .cloned()
-                .collect::<Vec<_>>();
-            let local = frames
-                .into_iter()
-                .rev()
-                .fold(Backtrace::default(), |trace, frame| trace.push(frame));
+            let local = self.local_command_backtrace();
             let backtrace = core::mem::replace(&mut self.bt, local);
             self.fatal_here(format!("Maximum recursion depth of {limit} exceeded").into());
             self.bt = backtrace;
             Err(CmdError::Reported)
         } else if let Some(profiler) = self.command_profiler.clone() {
+            let name = fold_command_name(name);
+            let kind = self.sample_kind(&name);
+            let depth = self.depth;
             let start = self.config.host.monotonic();
             let result = f(self);
             let elapsed = self.config.host.monotonic().saturating_sub(start);
-            profiler(&fold_command_name(name), file, line, start, elapsed);
+            profiler(&CommandSample {
+                name: &name,
+                file,
+                line,
+                depth,
+                start,
+                elapsed,
+                kind,
+            });
             result
         } else {
             f(self)
@@ -186,6 +299,16 @@ impl Interp {
         self.top_defer_id = saved_defer;
         self.bt = saved_bt;
         result
+    }
+
+    fn sample_kind(&self, name: &[u8]) -> SampleKind {
+        match self.scripted.get(name) {
+            Some(Command::User(command)) => match command.kind {
+                UserCommandKind::Function => SampleKind::Function,
+                UserCommandKind::Macro => SampleKind::Macro,
+            },
+            _ => SampleKind::Builtin,
+        }
     }
 
     fn finish_command(&mut self, name: &[u8], result: CmdResult) -> CmdResult {
@@ -233,7 +356,11 @@ impl Interp {
                 }
                 continue;
             }
-            if let Err(e) = expand(core::slice::from_ref(arg), self, &mut out) {
+            if let Err(e) = expand(
+                core::slice::from_ref(arg),
+                &mut CommandExpansion(self),
+                &mut out,
+            ) {
                 let body = self.syntax_error_text(arg, e.message);
                 self.fatal_here(body);
                 failed = true;
@@ -244,6 +371,13 @@ impl Interp {
         } else {
             Ok(out)
         }
+    }
+
+    pub(crate) fn eval_command_condition(
+        &mut self,
+        args: &[ExpandedArg],
+    ) -> Result<bool, CondError> {
+        (self.frontend.cond)(args, &mut CommandExpansion(self))
     }
 
     /// `ExpandVariablesInStringImpl` error text for an argument of the command on top of
@@ -312,7 +446,7 @@ impl Interp {
             return Err(CmdError::Reported);
         };
         if matches!(command, Command::Builtin(_, _, true)) {
-            return self.invoke(command, &[]);
+            return self.invoke(lower, command, &[]);
         }
         let args = self.expand(&cmd.args)?;
         if self.running_deferred
@@ -322,7 +456,7 @@ impl Interp {
             self.error_here("Languages may not be enabled during deferred execution.".into());
             return Err(CmdError::Reported);
         }
-        self.invoke(command, &args)
+        self.invoke(lower, command, &args)
     }
 
     fn unknown_command(&mut self, name: &[u8]) {
@@ -336,15 +470,40 @@ impl Interp {
         self.fatal_here(msg);
     }
 
-    fn invoke(&mut self, command: Command, args: &[ExpandedArg]) -> CmdResult {
+    fn invoke(&mut self, name: &[u8], command: Command, args: &[ExpandedArg]) -> CmdResult {
         match command {
             Command::Builtin(f, flags, _) => {
                 if self.config.mode == RunMode::Script && !flags.scriptable {
                     return Err(CmdError::Status("command is not scriptable".into()));
                 }
+                if matches!(name, b"mark_as_advanced" | b"_mark_as_advanced") {
+                    self.warn_missing_advanced_entries(args);
+                }
+                let legacy_deprecation = if matches!(name, b"cmake_policy" | b"_cmake_policy")
+                    && matches!(args, [op, policy, status] if op.value == "SET" && status.value == "OLD"
+                        && PolicyId::parse(&policy.value).is_some_and(|id| id.number() <= 161))
+                    && self.policy_status(PolicyId::new(218)) != PolicyStatus::New
+                {
+                    let state = *self.diag_top();
+                    let action = self.legacy_deprecation_action(false);
+                    self.diag_top_mut()
+                        .set(DiagCategory::Deprecated, action, false);
+                    Some(state)
+                } else {
+                    None
+                };
                 // Install rules use this setting at the call site.
                 let first_install = self.project.installs.len();
                 let result = f(&mut Cx { interp: self }, args);
+                if let Some(state) = legacy_deprecation {
+                    *self.diag_top_mut() = state;
+                }
+                if result.is_ok()
+                    && matches!(name, b"set" | b"_set" | b"unset" | b"_unset")
+                    && let Some(arg) = args.first()
+                {
+                    self.warn_deprecated_variable(&arg.value);
+                }
                 if first_install < self.project.installs.len()
                     && self
                         .bt
@@ -366,6 +525,40 @@ impl Interp {
                 UserCommandKind::Function => self.call_function(&u, args),
                 UserCommandKind::Macro => self.call_macro(&u, args),
             },
+        }
+    }
+
+    fn warn_missing_advanced_entries(&mut self, args: &[ExpandedArg]) {
+        let id = PolicyId::new(102);
+        if self.policy_status(id) != PolicyStatus::Warn
+            || !self
+                .lookup_var(b"CMAKE_POLICY_WARNING_CMP0102")
+                .map_or_else(|| self.trace_enabled(), |value| truth::is_on(value))
+        {
+            return;
+        }
+        let skip = args
+            .first()
+            .is_some_and(|arg| matches!(arg.value.as_slice(), b"CLEAR" | b"FORCE"));
+        let mut warned = std::collections::BTreeSet::new();
+        for arg in args.iter().skip(usize::from(skip)) {
+            let name = arg.value.as_slice();
+            if self.project.cache.contains(name) || !warned.insert(name) {
+                continue;
+            }
+            self.issue_at(
+                MessageKind::AuthorWarning,
+                Effect::None,
+                Some(DiagCategory::Policy),
+                Some(id),
+                Location::Backtrace(self.bt.clone()),
+                cat(&[
+                    b"Policy CMP0102 is not set: The variable named \"",
+                    name,
+                    b"\" is not in the cache. This results in an empty cache entry which is no longer created when policy CMP0102 is set to NEW. Run \"cmake --help-policy CMP0102\" for policy details. Use the cmake_policy command to set the policy and suppress this warning.",
+                ]),
+                true,
+            );
         }
     }
 
@@ -416,7 +609,9 @@ impl Interp {
         });
         let args = if raw.is_some() { Vec::new() } else { args };
         let saved = core::mem::replace(&mut self.cur_cmd, raw);
-        let result = self.with_command_frame(&file, line, name, |this| this.invoke(command, &args));
+        let result = self.with_command_frame(&file, line, name, |this| {
+            this.invoke(&lower, command, &args)
+        });
         self.cur_cmd = saved;
         result
     }

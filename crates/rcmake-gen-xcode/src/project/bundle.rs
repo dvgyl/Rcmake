@@ -1,7 +1,8 @@
 //! Bundle metadata and files to embed in a product.
 
-use std::path::PathBuf;
+use std::{collections::BTreeMap, path::PathBuf};
 
+use rcmake_base::path_lex::Lexical;
 use rcmake_gen_common::GenError;
 use rcmake_host::{ReadRange, path::to_native};
 use rcmake_model::{Target, TargetId};
@@ -11,7 +12,7 @@ use rcmake_resolve::{
 };
 
 use crate::{
-    object::{Isa, Reference, attrs, list},
+    object::{Isa, Reference, Value, attrs, list},
     phases,
     settings::{self, Product},
     text, workspace, write_file,
@@ -19,10 +20,89 @@ use crate::{
 
 use super::{
     Project, file_ref,
-    sources::{extension_file_type, references_config},
+    sources::{BuildFiles, extension_file_type, references_config},
 };
 
 impl Project<'_> {
+    pub(super) fn framework_headers(
+        &mut self,
+        raw: &Target,
+        ide: &IdeFacts,
+        files: &mut BuildFiles,
+    ) {
+        let source_dir = Lexical::new(&self.model.dir(raw.dir).source_dir);
+        let mut visibility = BTreeMap::new();
+        for (property, attribute) in [
+            (b"PUBLIC_HEADER".as_slice(), "Public"),
+            (b"PRIVATE_HEADER", "Private"),
+        ] {
+            if let Some(value) = ide.attributes.get(property) {
+                for path in rcmake_base::list::split(value, rcmake_base::list::Empty::Drop) {
+                    visibility.insert(
+                        Lexical::new(&source_dir.append(&path)).normalize(),
+                        attribute,
+                    );
+                }
+            }
+        }
+        for source in &ide.sources {
+            match source
+                .package_location
+                .as_ref()
+                .map(|value| value.as_slice())
+            {
+                Some(b"Headers") => visibility.insert(source.path.clone(), "Public"),
+                Some(b"PrivateHeaders") => visibility.insert(source.path.clone(), "Private"),
+                _ => None,
+            };
+        }
+        let headers = &mut files.headers;
+        files.resources.retain(|file| {
+            if self.set_header_visibility(file, &visibility) {
+                headers.push(file.clone());
+                false
+            } else {
+                true
+            }
+        });
+        for file in &files.headers {
+            self.set_header_visibility(file, &visibility);
+        }
+    }
+
+    fn set_header_visibility(
+        &mut self,
+        file: &Reference,
+        visibility: &BTreeMap<rcmake_base::BString, &str>,
+    ) -> bool {
+        let key = (Isa::PBXBuildFile.name(), file.id.clone());
+        let entries = &mut self.objects.entries;
+        let attribute = entries
+            .get(&key)
+            .and_then(|build| match build.attrs.get("fileRef") {
+                Some(Value::Ref(file)) => {
+                    entries.get(&(Isa::PBXFileReference.name(), file.id.clone()))
+                }
+                _ => None,
+            })
+            .and_then(|file| match file.attrs.get("path") {
+                Some(Value::Text(path) | Value::QuotedText(path)) => {
+                    visibility.get(path.as_bytes())
+                }
+                _ => None,
+            });
+        if let Some(attribute) = attribute
+            && let Some(build) = entries.get_mut(&key)
+        {
+            build.attrs.insert(
+                "settings".into(),
+                Value::Dict(attrs([("ATTRIBUTES", list([*attribute]))])),
+            );
+            return true;
+        }
+        false
+    }
+
     pub(super) fn embeds(
         &mut self,
         key: &str,

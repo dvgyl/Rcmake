@@ -7,6 +7,7 @@ use std::{
 };
 
 use rcmake_gen_common::{GenError, ide::UtilityKind};
+use rcmake_model::{CustomCommandKind, ProjectModel, TargetEvent};
 use rcmake_resolve::{BuildStep, ResolvedTarget, ide::IdeCustomPhase};
 
 use crate::{
@@ -39,6 +40,16 @@ fn quote_command(value: &str) -> String {
     }
     quoted.push_str(&quote(remainder));
     quoted
+}
+
+fn quote_legacy_argument(value: &str) -> String {
+    if value.is_empty() {
+        return quote(value);
+    }
+    value
+        .replace("$(CONFIGURATION)", "${CONFIGURATION}")
+        .replace("$(EFFECTIVE_PLATFORM_NAME)", "${EFFECTIVE_PLATFORM_NAME}")
+        .replace(' ', "\\ ")
 }
 
 pub(crate) fn files(
@@ -203,24 +214,62 @@ impl Custom {
     pub(crate) fn collect<'a>(
         &mut self,
         target: &ResolvedTarget,
+        model: &ProjectModel,
         bin: &Path,
-        steps: impl Iterator<Item = &'a BuildStep>,
+        steps: impl Iterator<Item = (usize, &'a BuildStep)>,
     ) {
         let config = text(&target.config.0);
         let build_dir = bin.join(text(&target.metadata.binary_dir));
         let build_dir = build_dir.to_string_lossy();
+        // The graph starts with the output rules in model order.
+        let output_rules: Vec<_> = model
+            .commands()
+            .filter(|(_, command)| command.kind == CustomCommandKind::Output)
+            .map(|(_, command)| command.verbatim)
+            .collect();
+        let mut legacy_outputs = BTreeSet::new();
         let depfiles: BTreeMap<_, _> = steps
-            .filter_map(|step| {
+            .filter_map(|(index, step)| {
                 let BuildStep::Custom(step) = step else {
                     return None;
                 };
                 let output = bin.join(text(step.outputs.first()?));
+                if output_rules.get(index) == Some(&false) {
+                    legacy_outputs.insert(output.clone());
+                }
                 let depfile = bin.join(text(step.depfile.as_ref()?));
                 Some((output, depfile.to_string_lossy().into_owned()))
             })
             .collect();
+        let mut legacy_events = model
+            .commands()
+            .filter_map(|(_, command)| {
+                let phase = match command.kind {
+                    CustomCommandKind::Utility(id) if id == target.id => IdeCustomPhase::Rule,
+                    CustomCommandKind::TargetEvent { target: id, event } if id == target.id => {
+                        match event {
+                            TargetEvent::PreBuild => IdeCustomPhase::PreBuild,
+                            TargetEvent::PreLink => IdeCustomPhase::PreLink,
+                            TargetEvent::PostBuild => IdeCustomPhase::PostBuild,
+                        }
+                    }
+                    _ => return None,
+                };
+                Some((phase, !command.verbatim))
+            })
+            .collect::<Vec<_>>();
         if let Some(ide) = target.ide.as_deref() {
             for step in &ide.custom {
+                let legacy = if step.phase != IdeCustomPhase::Rule || step.always_run {
+                    legacy_events
+                        .iter()
+                        .position(|(phase, _)| *phase == step.phase)
+                        .is_some_and(|index| legacy_events.remove(index).1)
+                } else {
+                    step.outputs
+                        .first()
+                        .is_some_and(|output| legacy_outputs.contains(&bin.join(text(output))))
+                };
                 let phase = match step.phase {
                     IdeCustomPhase::Rule => &mut self.rules,
                     IdeCustomPhase::PreBuild => &mut self.pre,
@@ -243,7 +292,15 @@ impl Custom {
                         .filter(|argv| !argv.is_empty())
                         .map(|argv| {
                             argv.iter()
-                                .map(|arg| quote_command(&text(arg)))
+                                .enumerate()
+                                .map(|(index, arg)| {
+                                    let arg = text(arg);
+                                    if legacy && index != 0 {
+                                        quote_legacy_argument(&arg)
+                                    } else {
+                                        quote_command(&arg)
+                                    }
+                                })
                                 .collect::<Vec<_>>()
                                 .join(" ")
                         }),

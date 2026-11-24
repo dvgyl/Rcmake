@@ -114,6 +114,31 @@ fn is_sub_path(path: &[u8], dir: &[u8]) -> bool {
 }
 
 impl Interp {
+    pub(crate) fn warn_deprecated_variable(&mut self, name: &[u8]) {
+        let id = PolicyId::new(218);
+        if matches!(name, b"CMAKE_WARN_DEPRECATED" | b"CMAKE_ERROR_DEPRECATED")
+            && self.policy_status(id) == PolicyStatus::Warn
+        {
+            self.issue_policy_warning(id, b"", b"");
+        }
+    }
+
+    pub(crate) fn legacy_deprecation_action(&self, message: bool) -> DiagAction {
+        let is_on = rcmake_base::truth::is_on;
+        let error = self
+            .lookup_var(b"CMAKE_ERROR_DEPRECATED")
+            .is_some_and(|v| is_on(v));
+        let silent = self
+            .lookup_var(b"CMAKE_WARN_DEPRECATED")
+            .is_some_and(|v| !is_on(v));
+        match (message, error, silent) {
+            (true, true, _) => DiagAction::FatalError,
+            (_, _, true) => DiagAction::Ignore,
+            (false, true, false) => DiagAction::SendError,
+            _ => DiagAction::Warn,
+        }
+    }
+
     /// `cmMakefile::GetModulesFile`: returns `(path, system)`; `path` is empty when the
     /// module is not found.
     pub(crate) fn modules_file(&self, file: &[u8]) -> (BString, bool) {
@@ -230,7 +255,18 @@ fn cmd_include(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
         {
             let id = PolicyId::new(num);
             match cx.policy(id) {
-                PolicyStatus::Warn => cx.issue_policy_warning(id, b"", b""),
+                PolicyStatus::Warn => {
+                    let interp = &mut *cx.interp;
+                    interp.issue_at(
+                        MessageKind::AuthorWarning,
+                        Effect::None,
+                        Some(DiagCategory::Policy),
+                        Some(id),
+                        Location::Backtrace(interp.local_command_backtrace()),
+                        Interp::policy_warning_text(id),
+                        true,
+                    );
+                }
                 PolicyStatus::Old => {}
                 PolicyStatus::New => mfile = BString::default(),
             }
@@ -534,18 +570,8 @@ fn cmd_message(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
         b"DEPRECATION" => {
             let action = if interp.policy_status(PolicyId::new(218)) == PolicyStatus::New {
                 interp.diag_top().get(DiagCategory::Deprecated)
-            } else if interp
-                .lookup_var(b"CMAKE_ERROR_DEPRECATED")
-                .is_some_and(|v| rcmake_base::truth::is_on(v))
-            {
-                DiagAction::FatalError
-            } else if interp
-                .lookup_var(b"CMAKE_WARN_DEPRECATED")
-                .is_some_and(|v| !rcmake_base::truth::is_on(v))
-            {
-                DiagAction::Ignore
             } else {
-                DiagAction::Warn
+                interp.legacy_deprecation_action(true)
             };
             let Some((kind, effect, fatal)) = category_display(
                 action,
