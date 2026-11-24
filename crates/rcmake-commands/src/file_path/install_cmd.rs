@@ -23,6 +23,7 @@ enum Message {
 struct Install<'a> {
     inputs: Vec<&'a [u8]>,
     destination: &'a [u8],
+    source_base: Option<&'a [u8]>,
     rename: Option<&'a [u8]>,
     message: Message,
     optional: bool,
@@ -63,7 +64,11 @@ pub(super) fn run(cx: &mut Cx<'_>, args: &[&[u8]]) -> Result {
             }
             return Ok(());
         }
-        let source = cx.resolve_path(input);
+        let relative = to_native(input);
+        let source = match install.source_base {
+            Some(base) => cx.resolve_path(base).join(&relative),
+            None => cx.resolve_path(input),
+        };
         if let Err(err) = host.metadata(&source, Follow::No) {
             if install.optional && err.kind == ErrorKind::NotFound {
                 return Ok(());
@@ -76,6 +81,8 @@ pub(super) fn run(cx: &mut Cx<'_>, args: &[&[u8]]) -> Result {
         }
         let target = if let Some(rename) = install.rename {
             destination.join(to_native(rename))
+        } else if install.source_base.is_some() {
+            destination.join(&relative)
         } else if input.ends_with(b"/") || Lexical::new(input).filename() == b"." {
             destination.clone()
         } else {
@@ -122,6 +129,7 @@ fn parse<'a>(cx: &mut Cx<'_>, args: &[&'a [u8]]) -> Result<Install<'a>> {
     let mut install = Install {
         inputs: Vec::new(),
         destination: b"",
+        source_base: None,
         rename: None,
         message: Message::Always,
         optional: false,
@@ -134,7 +142,7 @@ fn parse<'a>(cx: &mut Cx<'_>, args: &[&'a [u8]]) -> Result<Install<'a>> {
         ),
     };
     let mut args = args.iter().copied().peekable();
-    let mut files = false;
+    let mut files = true;
     let mut matching = false;
     let mut message = None;
     while let Some(option) = args.next() {
@@ -150,7 +158,12 @@ fn parse<'a>(cx: &mut Cx<'_>, args: &[&'a [u8]]) -> Result<Install<'a>> {
             }
             _ if matching => {
                 return Err(error(
-                    [b"option ", option, b" may not follow PATTERN or REGEX."].concat(),
+                    [
+                        b"option ",
+                        option,
+                        b" may not appear after PATTERN or REGEX.",
+                    ]
+                    .concat(),
                 ));
             }
             b"FILES" | b"PROGRAMS" | b"DIRECTORY" => {
@@ -163,6 +176,7 @@ fn parse<'a>(cx: &mut Cx<'_>, args: &[&'a [u8]]) -> Result<Install<'a>> {
                 }
                 continue;
             }
+            b"FILES_FROM_DIR" => install.source_base = Some(arg(&mut args, option)?),
             b"DESTINATION" => install.destination = arg(&mut args, option)?,
             b"RENAME" => install.rename = Some(arg(&mut args, option)?),
             b"TYPE" => match arg(&mut args, option)? {
@@ -195,7 +209,9 @@ fn parse<'a>(cx: &mut Cx<'_>, args: &[&'a [u8]]) -> Result<Install<'a>> {
                     .replace(mode)
                     .is_some_and(|previous| previous != mode)
                 {
-                    return Err(error("INSTALL message options are mutually exclusive."));
+                    return Err(error(
+                        "INSTALL options MESSAGE_ALWAYS, MESSAGE_LAZY, and MESSAGE_NEVER are mutually exclusive.",
+                    ));
                 }
                 install.message = mode;
             }
@@ -213,6 +229,22 @@ fn parse<'a>(cx: &mut Cx<'_>, args: &[&'a [u8]]) -> Result<Install<'a>> {
     }
     if install.destination.is_empty() {
         return Err(error("INSTALL given no DESTINATION."));
+    }
+    if install.source_base.is_some() {
+        if install
+            .inputs
+            .iter()
+            .any(|input| to_native(input).is_absolute())
+        {
+            return Err(error(
+                "option FILES_FROM_DIR requires all files to be specified as relative paths.",
+            ));
+        }
+        if install.rename.is_some() {
+            return Err(error(
+                "INSTALL option RENAME may not be combined with FILES_FROM_DIR.",
+            ));
+        }
     }
     if let Some(rename) = install.rename
         && (install.inputs.len() != 1 || install.directory || to_native(rename).is_absolute())

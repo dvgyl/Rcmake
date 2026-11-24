@@ -66,6 +66,7 @@ fn expression(cx: &mut Cx<'_>, args: &[&[u8]]) -> CmdResult {
         ))
     })?;
     if !parser.warnings.is_empty() {
+        parser.warnings.push('\n');
         warn(cx, parser.warnings);
     }
     set(

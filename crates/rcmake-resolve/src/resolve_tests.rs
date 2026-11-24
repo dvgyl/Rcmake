@@ -2207,7 +2207,7 @@ fn xcode_rejects_sources_that_vary_by_configuration() -> TestResult {
             ide: Some(ide::IdeFlavor::Xcode),
         },
     );
-    assert_eq!(result.err(), Some(ResolveError::Message(concat!(
+    assert_eq!(result.err(), Some(ResolveError::Reported(concat!(
         "Target \"pc\" has source files which vary by configuration. This is not supported by the \"Xcode\" generator.",
         "\n\nConfig \"Debug\":\n\n  /src/main.c\n  /src/core.c",
         "\n\nConfig \"Release\":\n\n  /src/main.c",
@@ -2294,7 +2294,7 @@ fn xcode_reports_configuration_with_no_sources_before_link_language_error() -> T
             ide: Some(ide::IdeFlavor::Xcode),
         },
     );
-    assert_eq!(result.err(), Some(ResolveError::Message(concat!(
+    assert_eq!(result.err(), Some(ResolveError::Reported(concat!(
         "Target \"pc\" has source files which vary by configuration. This is not supported by the \"Xcode\" generator.",
         "\n\nConfig \"Debug\":\n\n  /src/main.c",
         "\n\nConfig \"Release\":",

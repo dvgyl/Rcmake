@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use rcmake_base::{BString, list};
 use rcmake_diag::{FrameKind, PolicyId, PolicyStatus};
-use rcmake_eval::{CmdError, Cx};
+use rcmake_eval::{CmdError, Cx, FindEvent, RunMode};
 use rcmake_expr::ExpandedArg;
 use rcmake_host::{CommandSpec, FileKind, Follow, Input, Output, ProcessResult, RunRequest, path};
 use rcmake_syntax::ArgKind;
@@ -52,6 +52,14 @@ pub(super) struct Search<'a> {
     ignored: IgnoredPaths,
     considered: Option<String>,
     match_path: Option<PathBuf>,
+    event: Option<SearchEvent>,
+}
+
+#[derive(Default)]
+struct SearchEvent {
+    candidates: Vec<BString>,
+    attempted: Vec<BString>,
+    bytes: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -102,6 +110,10 @@ impl<'a> Search<'a> {
             ignored: IgnoredPaths::new(cx),
             considered: cx.find_variable_debug(var).then(String::new),
             match_path: None,
+            event: (cx.mode() == RunMode::Configure
+                && (cx.find_variable_debug(var)
+                    || !cx.var_is_on(b"CMAKE_FIND_DEBUG_MODE_NO_IMPLICIT_CONFIGURE_LOG")))
+            .then(SearchEvent::default),
         }
     }
 
@@ -118,6 +130,11 @@ impl<'a> Search<'a> {
             .reroot(cx, dirs);
         let mut seen = BTreeSet::new();
         dirs.retain(|dir| seen.insert(dir.clone()));
+        if let Some(event) = &mut self.event {
+            event
+                .candidates
+                .extend(dirs.iter().map(|dir| directory_path(dir)));
+        }
         let names: Vec<_> = self
             .options
             .names
@@ -305,6 +322,19 @@ impl<'a> Search<'a> {
                 return Ok(Some(found));
             }
         }
+        if let Some(event) = &mut self.event
+            && !self.ignored.ignores_prefix(&direct)
+        {
+            let attempt = if matches!(self.kind, Kind::Library) {
+                directory_path(dir)
+            } else {
+                path::from_native(&direct)
+            };
+            event.bytes = event.bytes.saturating_add(attempt.len() + 8);
+            if event.bytes <= 1024 * 1024 {
+                event.attempted.push(attempt);
+            }
+        }
         if self.considered.is_some() && !self.ignored.ignores_prefix(&direct) {
             let path = self.decoration.as_ref().map_or_else(
                 || direct.display().to_string(),
@@ -377,6 +407,71 @@ impl<'a> Search<'a> {
             return Ok(valid);
         }
         Ok(true)
+    }
+
+    pub(super) fn log_event(
+        &self,
+        cx: &mut Cx<'_>,
+        var: &[u8],
+        found: Option<&Path>,
+        was_defined: bool,
+    ) {
+        let Some(event) = &self.event else { return };
+        if was_defined && found.is_none() && self.considered.is_none() {
+            return;
+        }
+        let mode = self
+            .kind
+            .command()
+            .strip_prefix("find_")
+            .unwrap_or_default();
+        let description = self.options.doc.clone().unwrap_or_else(|| self.kind.help());
+        let order = |key: &[u8]| {
+            let value = cx.var_or_empty(key);
+            if value.is_empty() {
+                if cx.host().system().sysname == b"Darwin" {
+                    "FIRST".into()
+                } else {
+                    "NEVER".into()
+                }
+            } else {
+                value
+            }
+        };
+        let settings = [
+            ("CMAKE_FIND_USE_CMAKE_PATH", self.options.no_cmake),
+            (
+                "CMAKE_FIND_USE_CMAKE_ENVIRONMENT_PATH",
+                self.options.no_cmake_env,
+            ),
+            (
+                "CMAKE_FIND_USE_SYSTEM_ENVIRONMENT_PATH",
+                self.options.no_system_env,
+            ),
+            ("CMAKE_FIND_USE_CMAKE_SYSTEM_PATH", self.options.no_system),
+            ("CMAKE_FIND_USE_INSTALL_PREFIX", self.options.no_install),
+        ]
+        .map(|(key, disabled)| {
+            (
+                key,
+                use_default(cx, self.options.no_defaults || disabled, key.as_bytes()),
+            )
+        });
+        let framework = order(b"CMAKE_FIND_FRAMEWORK");
+        let app_bundle = order(b"CMAKE_FIND_APPBUNDLE");
+        let found = found.map(path::from_native);
+        cx.log_configure_find(FindEvent {
+            mode,
+            variable: var,
+            description: &description,
+            framework: &framework,
+            app_bundle: &app_bundle,
+            settings: &settings,
+            names: &self.options.names,
+            candidates: &event.candidates,
+            attempted: &event.attempted,
+            found: found.as_ref().map(|value| value.as_slice()),
+        });
     }
 
     pub(super) fn log(&self, cx: &Cx<'_>, var: &[u8]) {
@@ -677,4 +772,12 @@ fn candidate(cx: &mut Cx<'_>, kind: Kind, path: &Path) -> bool {
         cx.issue_policy_warning(policy, b"", body.as_bytes());
     }
     readable
+}
+
+fn directory_path(dir: &Path) -> BString {
+    let mut path = path::from_native(dir);
+    if !path.ends_with(b"/") {
+        path.push(b'/');
+    }
+    path
 }

@@ -2,6 +2,7 @@ use rcmake_diag::{DiagCategory, Effect, MessageKind};
 use rcmake_eval::{CmdError, CmdFlags, Cx, Registry, RunMode};
 
 mod files;
+pub(crate) use files::can_write_project_file;
 mod install;
 mod process;
 mod removed;

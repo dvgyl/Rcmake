@@ -96,19 +96,7 @@ pub(super) fn remove(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
 }
 
 fn protect_source(cx: &mut Cx<'_>, path: &[u8], operation: &[u8]) -> Result<(), CmdError> {
-    if !cx.var_is_on(b"CMAKE_DISABLE_SOURCE_CHANGES") {
-        return Ok(());
-    }
-    let root = cx.project().dir(DirId::ROOT);
-    let source = to_native(&root.source_dir);
-    let binary = to_native(&root.binary_dir);
-    let path_native = to_native(path);
-    let prohibited = if source == binary {
-        cx.var_is_on(b"CMAKE_DISABLE_IN_SOURCE_BUILD")
-    } else {
-        path_native != source && path_native.starts_with(source) && !path_native.starts_with(binary)
-    };
-    if prohibited {
+    if !can_write_project_file(cx, &to_native(path)) {
         cx.set_fatal();
         return Err(CmdError::Status(
             [operation, path, b" into a source directory."]
@@ -117,5 +105,23 @@ fn protect_source(cx: &mut Cx<'_>, path: &[u8], operation: &[u8]) -> Result<(), 
         ));
     }
     Ok(())
+}
+
+pub(crate) fn can_write_project_file(cx: &mut Cx<'_>, path: &std::path::Path) -> bool {
+    if !cx.var_is_on(b"CMAKE_DISABLE_SOURCE_CHANGES") {
+        return true;
+    }
+    let root = cx.project().dir(DirId::ROOT);
+    let source = to_native(&root.source_dir);
+    let binary = to_native(&root.binary_dir);
+    let path = crate::dirs::normalized_path(path);
+    let source = cx.host().canonicalize(&source).unwrap_or(source);
+    let binary = cx.host().canonicalize(&binary).unwrap_or(binary);
+    let path = cx.host().canonicalize(&path).unwrap_or(path);
+    if source == binary {
+        !cx.var_is_on(b"CMAKE_DISABLE_IN_SOURCE_BUILD")
+    } else {
+        path == source || !path.starts_with(source) || path.starts_with(binary)
+    }
 }
 use std::collections::BTreeSet;

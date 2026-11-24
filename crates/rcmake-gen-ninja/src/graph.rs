@@ -284,12 +284,8 @@ impl<'a> Graph<'a> {
             else {
                 continue;
             };
-            if build_target.steps.is_empty()
-                || target
-                    .props
-                    .get(b"EXCLUDE_FROM_ALL")
-                    .is_some_and(|value| truth::is_on(value))
-            {
+            let excluded = target.props.get(b"EXCLUDE_FROM_ALL");
+            if build_target.steps.is_empty() || excluded.is_some_and(|value| truth::is_on(value)) {
                 continue;
             }
             for ancestor in model.ancestors(target.dir) {
@@ -298,7 +294,7 @@ impl<'a> Graph<'a> {
                 {
                     inputs.push(alias.clone());
                 }
-                if model.dir(ancestor).exclude_from_all {
+                if excluded.is_none() && model.dir(ancestor).exclude_from_all {
                     break;
                 }
             }
@@ -703,12 +699,11 @@ impl<'a> Graph<'a> {
                 modmap,
                 dyndep,
             } => {
-                let rule: &[u8] = match (dyndep.is_some() || modmap.is_some(), depfile.is_some()) {
-                    (false, false) => b"COMPILE",
-                    (false, true) => b"COMPILE_DEPFILE",
-                    (true, false) => b"CXX_COMPILE_SCANNED",
-                    (true, true) => b"CXX_COMPILE_SCANNED_DEPFILE",
-                };
+                let (rule, command) = crate::instrumented::compile(
+                    invocation,
+                    dyndep.is_some() || modmap.is_some(),
+                    depfile.is_some(),
+                );
                 let mut plan = EdgePlan::new(rule, vec![self.node(source)], nodes);
                 plan.implicit_inputs
                     .extend(modmap.iter().map(|map| self.node(map)));
@@ -721,7 +716,8 @@ impl<'a> Graph<'a> {
                 );
                 plan.bind(
                     b"COMMAND",
-                    command_line(std::slice::from_ref(invocation), false),
+                    command
+                        .unwrap_or_else(|| command_line(std::slice::from_ref(invocation), false)),
                 );
                 if let Some(output) = nodes.outputs.first() {
                     plan.bind(

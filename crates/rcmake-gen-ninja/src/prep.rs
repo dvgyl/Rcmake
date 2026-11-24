@@ -5,7 +5,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use rcmake_base::{BString, hash::HashAlgo, list, path_lex::Lexical, truth};
 use rcmake_gen_common::GenError;
 use rcmake_genex::{EvalContext, evaluate, parse};
-use rcmake_model::{DirId, InstallKind, ProjectModel, TargetKind};
+use rcmake_host::{Follow, Host, path::to_native};
+use rcmake_model::{DirId, InstallKind, InstallRule, ProjectModel, TargetKind};
 use rcmake_resolve::{
     GenerationResult, InstallAction, InstallActionKind, lower::lower_install_manifest,
     usage::UsageResolver,
@@ -24,10 +25,14 @@ impl PrepTargets {
         graph: &Graph<'_>,
         result: &GenerationResult,
         model: Option<&ProjectModel>,
+        host: &dyn Host,
     ) -> Result<Self, GenError> {
         let mut targets = Targets::new();
         if !skip(model, b"CMAKE_SKIP_INSTALL_PREP_TARGETS") {
             collect_install(graph, result, model, &mut targets);
+            if let Some(model) = model {
+                collect_install_inputs(graph, model, host, &mut targets)?;
+            }
         }
         if !skip(model, b"CMAKE_SKIP_TEST_PREP_TARGETS") {
             if let Some(model) = model {
@@ -138,6 +143,125 @@ fn collect_install(
         .flat_map(|action| install_dependencies(graph, action))
         .collect();
     targets.insert(all, inputs);
+}
+
+fn collect_install_inputs(
+    graph: &Graph<'_>,
+    model: &ProjectModel,
+    host: &dyn Host,
+    targets: &mut Targets,
+) -> Result<(), GenError> {
+    let context = EvalContext {
+        config: graph.input.config.clone(),
+        ..EvalContext::default()
+    };
+    let mut usage = UsageResolver::new(model);
+    let components = model.install_components();
+    let all = BString::from("install_prep/all");
+    for rule in &model.installs {
+        let options = &rule.options;
+        if options.build_depends.is_empty()
+            || model.dir_excluded_from_all(rule.dir)
+            || !options.configurations.is_empty()
+                && !options
+                    .configurations
+                    .iter()
+                    .any(|config| context.config.matches(config))
+        {
+            continue;
+        }
+        let mut deps = BTreeSet::new();
+        let mut genex_host = usage.host(rule.dir);
+        for input in &options.build_depends {
+            let (value, _) = parse(input)
+                .and_then(|expression| evaluate(&expression, &context, &mut genex_host))
+                .map_err(|error| generation_error(graph.build_dir, error.to_string()))?;
+            for entry in list::split(&value, list::Empty::Drop) {
+                if let Some(dependency) = install_dependency(graph, model, host, rule, &entry)? {
+                    deps.insert(dependency);
+                }
+            }
+        }
+        if available(graph, &all) && !options.exclude_from_all {
+            targets
+                .entry(all.clone())
+                .or_default()
+                .extend(deps.iter().cloned());
+        }
+        let component = options
+            .component
+            .as_ref()
+            .or_else(|| {
+                model
+                    .definition(rule.dir, b"CMAKE_INSTALL_DEFAULT_COMPONENT_NAME")
+                    .filter(|value| !value.is_empty())
+            })
+            .map_or(b"Unspecified".as_slice(), |value| value.as_slice());
+        if options.all_components {
+            for component in &components {
+                if let Some(inputs) = add_component(graph, targets, component) {
+                    inputs.extend(deps.iter().cloned());
+                }
+            }
+        } else if let Some(inputs) = add_component(graph, targets, component) {
+            inputs.extend(deps);
+        }
+    }
+    Ok(())
+}
+
+fn install_dependency(
+    graph: &Graph<'_>,
+    model: &ProjectModel,
+    host: &dyn Host,
+    rule: &InstallRule,
+    entry: &[u8],
+) -> Result<Option<BString>, GenError> {
+    if let Some(target) = model
+        .find_target(rule.dir, entry)
+        .and_then(|id| model.target(id))
+    {
+        return Ok(graph.target_dependency(&target.name));
+    }
+    let directory = model.dir(rule.dir);
+    let source = Lexical::new(&Lexical::new(&directory.source_dir).append(entry)).normalize();
+    if host.metadata(&to_native(&source), Follow::Yes).is_ok() {
+        return Ok(Some(graph.node(&source)));
+    }
+    let binary = Lexical::new(&Lexical::new(&directory.binary_dir).append(entry)).normalize();
+    if let Some(file) = graph.file_dependency(&binary) {
+        return Ok(Some(file));
+    }
+    if host.metadata(&to_native(&binary), Follow::Yes).is_ok() {
+        return Ok(Some(graph.node(&binary)));
+    }
+    let signature = match rule.kind {
+        InstallKind::Files(_) => "FILES",
+        InstallKind::Programs(_) => "PROGRAMS",
+        InstallKind::Directory(_) => "DIRECTORY",
+        InstallKind::Script(_) => "SCRIPT",
+        InstallKind::Code(_) => "CODE",
+        _ => return Ok(None),
+    };
+    let diagnostic = rcmake_diag::Diagnostic {
+        kind: rcmake_diag::MessageKind::Error,
+        effect: rcmake_diag::Effect::SetError,
+        category: None,
+        policy: None,
+        location: rcmake_diag::Location::Backtrace(rule.backtrace.clone()),
+        body: format!(
+            "install({signature}) BUILD_DEPENDS entry \"{}\" is neither a target nor a file that exists or is generated by the build.",
+            String::from_utf8_lossy(entry)
+        )
+        .into(),
+    };
+    Err(GenError::Invalid(rcmake_diag::render(
+        &diagnostic,
+        &rcmake_diag::RenderOptions {
+            relative_base: Some(model.dir(DirId::ROOT).source_dir.clone()),
+            ..Default::default()
+        },
+    )))
 }
 
 fn add_component<'a>(

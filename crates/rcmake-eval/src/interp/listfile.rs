@@ -1,9 +1,10 @@
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use rcmake_base::BString;
-use rcmake_diag::{PolicyId, PolicyStatus};
-use rcmake_host::Stream;
+use rcmake_diag::{DiagCategory, Effect, Location, MessageKind, PolicyId, PolicyStatus};
+use rcmake_host::{FileKind, Follow, HostResult, Stream, path};
 use rcmake_model::{CacheEntry, CacheType, DirId};
 
 use super::BodyMode;
@@ -171,6 +172,19 @@ impl Interp {
             };
         }
 
+        if let Err(error) = self.reset_package_redirects(&bin_native) {
+            self.error_no_location(
+                format!(
+                    "Unable to (re)create the private pkgRedirects directory:\n  {}\n  {error}",
+                    bin_native.join("CMakeFiles/pkgRedirects").display()
+                )
+                .into(),
+            );
+            return RunOutcome {
+                exit_code: self.exit_code(),
+            };
+        }
+
         let _ = self.run_list_file(&lists_bytes, true);
         self.write_configure_log(&bin_native);
         self.snapshot_dir_vars(DirId::ROOT);
@@ -183,6 +197,38 @@ impl Interp {
         RunOutcome {
             exit_code: self.exit_code(),
         }
+    }
+
+    fn reset_package_redirects(&mut self, binary_dir: &Path) -> HostResult<()> {
+        let host = self.config.host.as_ref();
+        let parent = binary_dir.join("CMakeFiles");
+        let redirects = parent.join("pkgRedirects");
+        if let Ok(metadata) = host.metadata(&parent, Follow::No)
+            && metadata.kind != FileKind::Dir
+        {
+            return Err(rcmake_host::HostError::from_io(
+                std::io::Error::from(ErrorKind::NotADirectory),
+                Some(parent),
+            ));
+        }
+        match host.metadata(&redirects, Follow::No) {
+            Ok(metadata) if metadata.kind == FileKind::Dir => host.remove_dir_all(&redirects)?,
+            Ok(_) => host.remove_file(&redirects)?,
+            Err(error) if error.kind == ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        host.create_dir_all(&redirects)?;
+        self.project.cache.insert(
+            "CMAKE_FIND_PACKAGE_REDIRECTS_DIR".into(),
+            CacheEntry {
+                value: path::from_native(&redirects),
+                ty: CacheType::Static,
+                help: "Value Computed by CMake.".into(),
+                advanced: false,
+                props: Default::default(),
+            },
+        );
+        Ok(())
     }
 
     /// Execute one `-C` initial cache script in the current session.
@@ -304,7 +350,6 @@ impl Interp {
         };
         let dir = self.project.dir_mut(id);
         dir.exclude_from_all |= options.exclude_from_all;
-        dir.system |= options.system;
         if options.exclude_from_all {
             dir.props.set("EXCLUDE_FROM_ALL".into(), "TRUE".into());
         }
@@ -329,7 +374,11 @@ impl Interp {
         self.diags.push_copy();
         let policy_base = self.policies.len() - 1;
         let diag_base = self.diags.len() - 1;
-        self.dir_stack.push(DirFrame { id, defer: None });
+        self.dir_stack.push(DirFrame {
+            id,
+            trace_base: self.depth,
+            defer: None,
+        });
         self.define(b"CMAKE_CURRENT_SOURCE_DIR", src_abs);
         self.define(b"CMAKE_CURRENT_BINARY_DIR", bin_abs);
 
@@ -349,6 +398,7 @@ impl Interp {
     /// directory scope exits so generate-time resolution and lowering observe normal
     /// compiler rules, flags, and platform variables.
     fn snapshot_dir_vars(&mut self, id: DirId) {
+        self.warn_install_order(id);
         let names = self.vars.visible_names();
         let mut snap = indexmap::IndexMap::with_capacity(names.len());
         for name in names {
@@ -357,6 +407,53 @@ impl Interp {
             }
         }
         self.project.dir_mut(id).vars = snap;
+    }
+
+    fn warn_install_order(&mut self, id: DirId) {
+        const POLICY: PolicyId = PolicyId::new(82);
+        if self.config.mode != RunMode::Configure
+            || self.policy_status(POLICY) != PolicyStatus::Warn
+            || !self
+                .lookup_var(b"CMAKE_POLICY_WARNING_CMP0082")
+                .is_some_and(|value| rcmake_base::truth::is_on(value))
+        {
+            return;
+        }
+        let directory = self.project.dir(id);
+        let last_rule = self
+            .project
+            .installs
+            .iter()
+            .rposition(|rule| rule.dir == id);
+        let Some(last_rule) = last_rule else { return };
+        let different_order = self.project.installs.iter().any(|rule| {
+            if rule.dir == id || self.project.dir_excluded_from_all(rule.dir) {
+                return false;
+            }
+            self.project
+                .ancestors(rule.dir)
+                .take_while(|dir| *dir != id)
+                .last()
+                .is_some_and(|child| {
+                    self.project.dir(child).parent == Some(id)
+                        && self.project.dir(child).install_position <= last_rule
+                })
+        });
+        if different_order {
+            let file = cat(&[&directory.source_dir, b"/CMakeLists.txt"]);
+            self.issue_at(
+                MessageKind::AuthorWarning,
+                Effect::None,
+                Some(DiagCategory::Policy),
+                Some(POLICY),
+                Location::FileLine {
+                    file: file.as_slice().into(),
+                    line: 0,
+                },
+                Self::policy_warning_text(POLICY),
+                true,
+            );
+        }
     }
 
     pub(super) fn current_source_dir_bytes(&self) -> BString {

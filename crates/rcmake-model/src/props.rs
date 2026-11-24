@@ -71,7 +71,11 @@ impl ProjectModel {
             PropScope::Directory(id) => self.directory_prop(*id, name),
             PropScope::Target(id) => self.target_prop(self.target(*id)?, name),
             PropScope::Source { dir, path } => {
-                let value = self.dir(*dir).source_props.get(path)?.get(name)?;
+                let directory = self.dir(*dir);
+                if name == b"GENERATED" && directory.generated_sources.contains(path) {
+                    return Some("1".into());
+                }
+                let value = directory.source_props.get(path)?.get(name)?;
                 if name == b"GENERATED" {
                     Some(if truth::is_on(value) { "1" } else { "0" }.into())
                 } else {

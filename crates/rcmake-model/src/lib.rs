@@ -14,20 +14,26 @@ use rcmake_diag::Backtrace;
 
 mod command;
 mod directory;
+mod export_dependency;
 mod generator;
+mod glob;
 mod ids;
 mod install;
+mod property_print;
+pub use property_print::PropertyPrint;
 mod project;
 mod props;
 mod target;
 
 pub use command::{CustomCommand, CustomCommandKind, TargetEvent};
 pub use directory::Directory;
+pub use export_dependency::{ExportDependencyMode, ExportDependencySetup};
 pub use generator::{
     GeneratorKind, GeneratorSpec, GeneratorSpecError, ParsedToolset, SpecField, ToolsetSupport,
     VsPlatform, VsToolset, VsVersion, XcodeBuildSystem, XcodeVersion, parse_vs_platform,
     parse_vs_toolset, parse_xcode_toolset,
 };
+pub use glob::{GlobCall, GlobCheck, GlobKey};
 pub use ids::{BT, CommandId, DirId, FileSetId, TargetId, TestId};
 pub use install::{
     BuildExport, DiscoverySpec, ExportKind, ExportSet, InstallKind, InstallOptions, InstallRule,

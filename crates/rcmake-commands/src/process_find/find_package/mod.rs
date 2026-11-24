@@ -33,13 +33,31 @@ pub(super) fn find_package_with_diagnostics(
     args: &[ExpandedArg],
     dependency: Option<&mut Vec<cps_import::PackageDiagnostic>>,
 ) -> CmdResult {
+    cx.check_package_find(false)?;
     let Some((package, parameters)) = args.split_first() else {
         return Err(CmdError::status(
             "called with incorrect number of arguments",
         ));
     };
     let name = &package.value;
-    let mut request = Request::parse(cx, parameters)?;
+    let request = Request::parse(cx, parameters)?;
+    let unwind = request.unwind_include;
+    cx.check_package_find(unwind)?;
+    cx.project().package_lookups.insert(name.clone());
+    let result = find_requested_package(cx, args, name, request, dependency);
+    if unwind && (result.is_err() || !cx.var_is_on(&text(&[name, b"_FOUND"]))) {
+        cx.unwind_package();
+    }
+    result
+}
+
+fn find_requested_package(
+    cx: &mut Cx<'_>,
+    args: &[ExpandedArg],
+    name: &BString,
+    mut request: Request,
+    dependency: Option<&mut Vec<cps_import::PackageDiagnostic>>,
+) -> CmdResult {
     let find = |suffix| text(&[name, b"_FIND_", suffix]);
     if cx.var_is_on(&find(b"MODULE")) {
         if request.version.is_none() && cx.var_defined(&find(b"VERSION")) {
@@ -246,6 +264,43 @@ fn search(
     mut dependency: Option<&mut Vec<cps_import::PackageDiagnostic>>,
     trace: &mut SearchTrace,
 ) -> Result<bool, CmdError> {
+    let lookup_names = if request.names.is_empty() {
+        [name].as_slice().to_vec()
+    } else {
+        request.names.iter().map(|name| name.as_slice()).collect()
+    };
+    for package in lookup_names {
+        let key = text(&[
+            b"_FetchContent_",
+            &package.to_ascii_lowercase(),
+            b"_override_find_package",
+        ]);
+        if cx
+            .global()
+            .props
+            .get(&key)
+            .is_some_and(|value| rcmake_base::truth::is_on(value))
+        {
+            cx.call_command(
+                b"FetchContent_MakeAvailable",
+                vec![ExpandedArg {
+                    value: package.into(),
+                    kind: ArgKind::Unquoted,
+                    line: cx.current_line(),
+                }],
+            )?;
+        }
+        if let Some(directory) = redirects_directory(cx) {
+            let lower = text(&[&package.to_ascii_lowercase(), b"-config.cmake"]);
+            let mixed = text(&[package, b"Config.cmake"]);
+            if [lower, mixed]
+                .iter()
+                .any(|file| is_file(cx, &directory.join(path::to_native(file))))
+            {
+                break;
+            }
+        }
+    }
     let mut config = ConfigSearch::new(name, request);
     let redirected = redirects_directory(cx).is_some_and(|dir| config.redirect(cx, &dir));
     let prefer_config = !request.module && cx.var_is_on(b"CMAKE_FIND_PACKAGE_PREFER_CONFIG");
@@ -420,7 +475,9 @@ fn load_module(
     };
     let mut vars = Bindings::default();
     vars.add(text(&[name, b"_FIND_MODULE"]), "1");
-    vars.scoped(cx, |cx| cx.include_file(&module, request.include_options()))?;
+    vars.scoped(cx, |cx| {
+        cx.include_package_file(&module, request.include_options())
+    })?;
     if cx.fatal_occurred() {
         return Err(CmdError::Reported);
     }

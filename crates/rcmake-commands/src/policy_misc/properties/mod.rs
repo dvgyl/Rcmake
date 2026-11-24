@@ -12,6 +12,7 @@ pub(super) use set::{set, set_directory, set_sources};
 mod computed;
 mod define;
 mod file_set;
+mod generated;
 mod get;
 mod print;
 mod scope;

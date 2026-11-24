@@ -1,8 +1,10 @@
 //! Target names in exported link interfaces.
 
+use indexmap::IndexSet;
 use rcmake_base::{BString, list};
 use rcmake_genex::{GenexNode, PreprocessMode, parse, render, rewrite_install_prefix};
-use rcmake_model::{DirId, ProjectModel, TargetId};
+use rcmake_model::{DirId, ProjectModel, Target, TargetId};
+use std::collections::BTreeMap;
 
 use crate::{
     ExportedTarget, ResolveError,
@@ -11,16 +13,27 @@ use crate::{
 
 const LINK_LIBRARIES: &[u8] = b"INTERFACE_LINK_LIBRARIES";
 
+#[derive(Clone)]
+pub(crate) struct ExportPlacement {
+    pub(crate) set: BString,
+    pub(crate) namespace: BString,
+    pub(crate) file: BString,
+}
+
+pub(crate) type ExportCatalog = BTreeMap<TargetId, Vec<ExportPlacement>>;
+
 pub(crate) fn qualify(
     model: &ProjectModel,
     id: TargetId,
     members: &[TargetId],
     namespace: &[u8],
     mode: PreprocessMode,
+    catalog: &ExportCatalog,
     exported: &mut ExportedTarget,
-) -> Result<(), ResolveError> {
+) -> Result<IndexSet<BString>, ResolveError> {
+    let mut packages = IndexSet::new();
     let Some(target) = model.target(id) else {
-        return Ok(());
+        return Ok(packages);
     };
     for key in [
         LINK_LIBRARIES,
@@ -29,23 +42,83 @@ pub(crate) fn qualify(
     ] {
         let mut items = Vec::new();
         let mut append = |value: &[u8], dir: DirId| -> Result<(), ResolveError> {
-            let name = |input: &[u8]| {
-                let id = model.find_target(dir, input)?;
-                let dependency = model.target(id)?;
+            let mut name = |input: &[u8]| -> Result<Option<BString>, ResolveError> {
+                let Some(id) = model.find_target(dir, input) else {
+                    return Ok(None);
+                };
+                let Some(dependency) = model.target(id) else {
+                    return Ok(None);
+                };
                 if dependency.is_imported() {
-                    return Some(dependency.name.clone());
+                    if let Some(package) = dependency
+                        .props
+                        .get(b"EXPORT_FIND_PACKAGE_NAME")
+                        .filter(|name| !name.is_empty())
+                        .or_else(|| dependency.props.get(b"_RCMAKE_FIND_PACKAGE_NAME"))
+                    {
+                        packages.insert(package.clone());
+                    }
+                    return Ok(Some(dependency.name.clone()));
                 }
-                members.contains(&id).then(|| {
-                    let exported = export_name(dependency);
-                    [namespace, exported.as_slice()].concat().into()
-                })
+                let exported = export_name(dependency);
+                if members.contains(&id) {
+                    return Ok(Some([namespace, exported.as_slice()].concat().into()));
+                }
+                let placements = catalog.get(&id).map_or(&[][..], Vec::as_slice);
+                let Some(first) = placements.first() else {
+                    return Err(closure_error(
+                        model,
+                        target,
+                        dependency,
+                        mode,
+                        "that is not in any export set.".into(),
+                    ));
+                };
+                let multiple_sets = placements
+                    .iter()
+                    .any(|placement| placement.set != first.set);
+                let multiple_namespaces = placements
+                    .iter()
+                    .any(|placement| placement.namespace != first.namespace);
+                if multiple_sets || multiple_namespaces {
+                    let scenario = if multiple_sets {
+                        "in multiple other export sets"
+                    } else {
+                        "in another export set which is exported multiple times with different namespaces"
+                    };
+                    let mut files = placements
+                        .iter()
+                        .map(|placement| placement.file.as_slice())
+                        .collect::<Vec<_>>();
+                    files.sort_unstable();
+                    let files = files
+                        .into_iter()
+                        .map(String::from_utf8_lossy)
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    return Err(closure_error(
+                        model,
+                        target,
+                        dependency,
+                        mode,
+                        format!(
+                            "that is not in this export set, but {scenario}: {files}.\n\nAn exported target cannot depend upon another target which is exported in more than one export set or with more than one namespace.  Consider consolidating the exports of the \"{}\" target to a single export.",
+                            dependency.name
+                        ),
+                    ));
+                }
+                Ok(Some(
+                    [first.namespace.as_slice(), exported.as_slice()]
+                        .concat()
+                        .into(),
+                ))
             };
             for item in export_property_items(value, mode)? {
                 let mut ast = parse(&item)?;
                 let mut item = if ast.is_plain() {
-                    name(&item).unwrap_or(item)
+                    name(&item)?.unwrap_or(item)
                 } else {
-                    qualify_expressions(&mut ast.nodes, &name);
+                    qualify_expressions(&mut ast.nodes, &mut name)?;
                     render(&ast.nodes)
                 };
                 if mode == PreprocessMode::Install {
@@ -71,15 +144,51 @@ pub(crate) fn qualify(
             exported.properties.insert(key.into(), list::join(items));
         }
     }
-    Ok(())
+    Ok(packages)
 }
 
-fn qualify_expressions(nodes: &mut [GenexNode], name: &impl Fn(&[u8]) -> Option<BString>) {
+fn closure_error(
+    model: &ProjectModel,
+    target: &Target,
+    dependency: &Target,
+    mode: PreprocessMode,
+    reason: String,
+) -> ResolveError {
+    let command = if mode == PreprocessMode::Install {
+        "install(EXPORT)"
+    } else {
+        "export"
+    };
+    let diagnostic = rcmake_diag::Diagnostic {
+        kind: rcmake_diag::MessageKind::Error,
+        effect: rcmake_diag::Effect::SetError,
+        category: None,
+        policy: None,
+        location: crate::cxx_modules::generation_location(model, target),
+        body: format!(
+            "{command} called with target \"{}\" which requires target \"{}\" {reason}",
+            target.name, dependency.name
+        )
+        .into(),
+    };
+    ResolveError::Message(rcmake_diag::render(
+        &diagnostic,
+        &rcmake_diag::RenderOptions {
+            relative_base: Some(model.dir(DirId::ROOT).source_dir.clone()),
+            ..Default::default()
+        },
+    ))
+}
+
+fn qualify_expressions(
+    nodes: &mut [GenexNode],
+    name: &mut impl FnMut(&[u8]) -> Result<Option<BString>, ResolveError>,
+) -> Result<(), ResolveError> {
     for node in nodes {
         let GenexNode::Expr(expr) = node else {
             continue;
         };
-        qualify_expressions(&mut expr.identifier, name);
+        qualify_expressions(&mut expr.identifier, name)?;
         let Some(args) = &mut expr.params else {
             continue;
         };
@@ -89,7 +198,7 @@ fn qualify_expressions(nodes: &mut [GenexNode], name: &impl Fn(&[u8]) -> Option<
                 (b"LINK_ONLY" | b"COMPILE_ONLY" | b"TARGET_NAME", 1) | (b"TARGET_PROPERTY", 2)
             )
             && let Some([GenexNode::Text(target)]) = args.first_mut().map(Vec::as_mut_slice)
-            && let Some(qualified) = name(target)
+            && let Some(qualified) = name(target)?
         {
             if operator == b"TARGET_NAME" {
                 *node = GenexNode::Text(qualified);
@@ -98,7 +207,8 @@ fn qualify_expressions(nodes: &mut [GenexNode], name: &impl Fn(&[u8]) -> Option<
             *target = qualified;
         }
         for arg in args {
-            qualify_expressions(arg, name);
+            qualify_expressions(arg, name)?;
         }
     }
+    Ok(())
 }

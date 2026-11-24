@@ -1,5 +1,6 @@
 //! Install actions and configure metadata.
 
+use std::collections::BTreeMap;
 use std::convert::Infallible;
 
 use indexmap::{IndexMap, IndexSet};
@@ -140,6 +141,73 @@ fn matches_config(options: &InstallOptions, config: &ConfigId) -> bool {
             .any(|name| config.matches(name))
 }
 
+#[derive(Clone, Copy)]
+enum InstallEntry<'a> {
+    Rule(usize, &'a InstallRule, Option<usize>),
+    Directory(DirId),
+}
+
+fn ordered_install_rules(model: &ProjectModel) -> Vec<(usize, &InstallRule, Option<usize>)> {
+    use rcmake_diag::{PolicyId, PolicyStatus};
+
+    let mut entries: BTreeMap<_, Vec<_>> = BTreeMap::new();
+    let mut export_count = 0;
+    for (index, rule) in model.installs.iter().enumerate() {
+        let included = !model.dir_excluded_from_all(rule.dir);
+        let export = if included && matches!(rule.kind, InstallKind::Export { .. }) {
+            let plan = export_count;
+            export_count += 1;
+            Some(plan)
+        } else {
+            None
+        };
+        if included {
+            entries.entry(rule.dir).or_default().push((
+                index,
+                true,
+                InstallEntry::Rule(index, rule, export),
+            ));
+        }
+    }
+    for (id, directory) in model.dirs().skip(1) {
+        let Some(parent) = directory.parent else {
+            continue;
+        };
+        if model.dir_excluded_from_all(id) {
+            continue;
+        }
+        let interleave = model
+            .dir(parent)
+            .final_policies
+            .is_none_or(|policies| policies.get(PolicyId::new(82)) == PolicyStatus::New);
+        let position = if interleave {
+            directory.install_position
+        } else {
+            usize::MAX
+        };
+        entries
+            .entry(parent)
+            .or_default()
+            .push((position, false, InstallEntry::Directory(id)));
+    }
+    for directory in entries.values_mut() {
+        directory.sort_by_key(|&(position, is_rule, _)| (position, is_rule));
+    }
+    let mut pending = vec![InstallEntry::Directory(DirId::ROOT)];
+    let mut ordered = Vec::with_capacity(model.installs.len());
+    while let Some(entry) = pending.pop() {
+        match entry {
+            InstallEntry::Rule(index, rule, export) => ordered.push((index, rule, export)),
+            InstallEntry::Directory(id) => {
+                if let Some(items) = entries.remove(&id) {
+                    pending.extend(items.into_iter().rev().map(|entry| entry.2));
+                }
+            }
+        }
+    }
+    ordered
+}
+
 fn lower_install_rules<E>(
     model: &ProjectModel,
     targets: &[ResolvedTarget],
@@ -147,12 +215,8 @@ fn lower_install_rules<E>(
     mut eval: impl FnMut(DirId, &ConfigId, &Backtrace, &[u8]) -> Result<BString, E>,
 ) -> Result<InstallManifest, E> {
     let mut manifest = InstallManifest::default();
-    let mut export_plan = 0;
     let multi = configs.len() > 1 || model.generator.is_some_and(GeneratorKind::multi_config);
-    for (index, rule) in model.installs.iter().enumerate() {
-        if model.dir_excluded_from_all(rule.dir) {
-            continue;
-        }
+    for (index, rule, export_plan) in ordered_install_rules(model) {
         let options = &rule.options;
         let recorded = recorded_args(model, index);
         let source = &model.dir(rule.dir).source_dir;
@@ -379,8 +443,7 @@ fn lower_install_rules<E>(
             InstallKind::Script(path) => InstallActionKind::Script(join(source, path)),
             InstallKind::Code(code) => InstallActionKind::Code(code.clone()),
             InstallKind::Export { .. } => {
-                let plan = export_plan;
-                export_plan += 1;
+                let Some(plan) = export_plan else { continue };
                 InstallActionKind::Export { plan }
             }
             // CPS and SBOM files do not have install actions yet.
@@ -422,6 +485,8 @@ fn action(
     kind: InstallActionKind,
 ) -> InstallAction {
     InstallAction {
+        all_components: options.all_components,
+        exclude_from_all: options.exclude_from_all,
         component: options
             .component
             .clone()

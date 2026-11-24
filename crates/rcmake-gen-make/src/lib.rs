@@ -85,7 +85,16 @@ fn generate_impl(
             })?,
     };
     let prep = prep::targets(result, graph, &targets, &build_dir, model)?;
-    let top = top_level(result, graph, &targets, &cmake, &prep, report_progress)?;
+    let verify_globs = rcmake_gen_common::glob::write_verification(model, &build_dir, host)?;
+    let top = top_level(
+        result,
+        graph,
+        &targets,
+        &cmake,
+        &prep,
+        report_progress,
+        verify_globs,
+    )?;
     let dispatch = dispatch(graph, &targets, &prep, report_progress)?;
     let languages = rcmake_resolve::progress::compile_languages(result, graph);
     let build_files = targets
@@ -401,6 +410,7 @@ fn top_level(
     cmake: &[u8],
     prep: &prep::Targets,
     report_progress: bool,
+    verify_globs: bool,
 ) -> Result<Vec<u8>, GenError> {
     let mut out = makefile();
     // Separate entry points can build the same target. Submakes still run in parallel.
@@ -459,6 +469,21 @@ fn top_level(
             check_make_path(file)?;
         }
         phony(&mut out, b"cmake_check_build_system", [REGEN_STAMP]);
+        if verify_globs {
+            let script = rcmake_gen_common::glob::SCRIPT.as_bytes();
+            let marker = b"CMakeFiles/rcmake-glob-mismatch";
+            out.push_str(b"\t$(SILENT)$(CMAKE_COMMAND) -E rm -f ");
+            out.push_str(marker);
+            out.push_str(b" && $(CMAKE_COMMAND) -D_RCMAKE_GLOB_MISMATCH_MARKER=");
+            out.push_str(marker);
+            out.push_str(b" -P ");
+            out.push_str(script);
+            out.push_str(b" && if test -f ");
+            out.push_str(marker);
+            out.push_str(b"; then ");
+            out.push_str(&configure);
+            out.push_str(b" --regenerate-during-build; fi\n");
+        }
         rule(
             &mut out,
             REGEN_STAMP,

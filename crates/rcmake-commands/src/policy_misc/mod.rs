@@ -7,9 +7,9 @@ use rcmake_eval::{CmdFlags, Registry};
 use rcmake_expr::ExpandedArg;
 
 mod arguments;
-mod experimental;
+pub(crate) mod experimental;
 pub(crate) mod files;
-mod introspection;
+pub(crate) mod introspection;
 mod language;
 mod policies;
 mod project;

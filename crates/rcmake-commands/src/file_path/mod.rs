@@ -22,6 +22,7 @@ mod path_cmd;
 mod path_hash;
 mod reading;
 mod strings;
+mod upload;
 
 pub(crate) use mutation::permission;
 

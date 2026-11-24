@@ -430,7 +430,8 @@ impl Interp {
                 out.push(b')');
             }
             TraceFormat::JsonV1 => {
-                let frame = u64::from(self.depth) + u64::from(missing);
+                let global_frame = u64::from(self.depth) + u64::from(missing);
+                let frame = global_frame.saturating_sub(u64::from(self.dir_frame().trace_base));
                 out.extend_from_slice(b"{\"args\":[");
                 for (i, arg) in args.iter().enumerate() {
                     if i > 0 {
@@ -449,7 +450,7 @@ impl Interp {
                 let now = self.config.host.now();
                 out.extend_from_slice(
                     format!(
-                        ",\"frame\":{frame},\"global_frame\":{frame},\"line\":{}",
+                        ",\"frame\":{frame},\"global_frame\":{global_frame},\"line\":{}",
                         display_line(cmd.line)
                     )
                     .as_bytes(),

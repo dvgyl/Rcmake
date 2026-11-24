@@ -361,6 +361,8 @@ impl Outputs {
             })
             .unwrap_or_else(|| "Unspecified".into());
         let action = InstallAction {
+            all_components: false,
+            exclude_from_all: false,
             component,
             destination: destination.into(),
             configurations,
@@ -484,6 +486,8 @@ impl Outputs {
                 };
                 let table = bin.join(to_native(dd)).with_file_name("CXXModules.json");
                 let action = InstallAction {
+                    all_components: false,
+                    exclude_from_all: false,
                     component: rule.component.clone(),
                     destination: rule.destination.clone(),
                     configurations: vec![graph.config.0.clone()],

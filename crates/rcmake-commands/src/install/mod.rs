@@ -14,7 +14,9 @@ use rcmake_model::{
     UsageScope,
 };
 
+mod export_options;
 mod metadata;
+mod package_dependencies;
 mod runtime;
 
 type Result<T> = std::result::Result<T, CmdError>;
@@ -85,10 +87,12 @@ fn keyword(token: &[u8]) -> bool {
                 | b"NAMESPACE"
                 | b"FILE"
                 | b"EXPORT_LINK_INTERFACE_LIBRARIES"
+                | b"EXPORT_PACKAGE_DEPENDENCIES"
                 | b"CXX_MODULES_DIRECTORY"
                 | b"APPEND"
                 | b"RUNTIME_DEPENDENCY_SET"
                 | b"RUNTIME_DEPENDENCIES"
+                | b"BUILD_DEPENDS"
         )
         || runtime::filter_keyword(token)
 }
@@ -130,6 +134,11 @@ fn common(
         }
         b"OPTIONAL" if signature != b"EXPORT" => options.optional = true,
         b"EXCLUDE_FROM_ALL" => options.exclude_from_all = true,
+        b"BUILD_DEPENDS" if matches!(signature, b"FILES" | b"PROGRAMS" | b"DIRECTORY") => {
+            options
+                .build_depends
+                .extend(values(args).into_iter().map(BString::from));
+        }
         b"RENAME" if matches!(signature, b"FILES" | b"PROGRAMS") => {
             options.rename = Some(value(args, key)?.into())
         }
@@ -513,16 +522,18 @@ fn script(
     let input = args
         .next()
         .ok_or_else(|| fail([signature, b" requires an argument."].concat()))?;
-    let mut all = false;
     while let Some(key) = args.next() {
         match key {
-            b"ALL_COMPONENTS" => all = true,
+            b"ALL_COMPONENTS" => options.all_components = true,
             b"COMPONENT" => options.component = Some(value(args, key)?.into()),
             b"EXCLUDE_FROM_ALL" => options.exclude_from_all = true,
+            b"BUILD_DEPENDS" => options
+                .build_depends
+                .extend(values(args).into_iter().map(BString::from)),
             _ => return Err(unknown(key)),
         }
     }
-    if all && options.component.is_some() {
+    if options.all_components && options.component.is_some() {
         return Err(fail("ALL_COMPONENTS and COMPONENT are mutually exclusive."));
     }
     Ok(if signature == b"SCRIPT" {
@@ -533,10 +544,11 @@ fn script(
 }
 
 fn install_export(
-    cx: &Cx<'_>,
+    cx: &mut Cx<'_>,
     args: &mut Args<'_>,
     options: &mut InstallOptions,
 ) -> Result<InstallKind> {
+    let packages = package_dependencies::enabled(cx);
     let set = value(args, b"EXPORT")?.into();
     let mut namespace = BString::default();
     let mut file = None;
@@ -558,9 +570,16 @@ fn install_export(
                 file = Some(name.into());
             }
             b"CXX_MODULES_DIRECTORY" => cxx_modules_directory = Some(value(args, key)?.into()),
+            b"EXPORT_PACKAGE_DEPENDENCIES" if packages => {
+                options.export_package_dependencies = true
+            }
             b"EXPORT_LINK_INTERFACE_LIBRARIES" => {}
             _ if common(cx, b"EXPORT", options, key, args)? => {}
-            _ => return Err(unknown(key)),
+            _ => {
+                return Err(fail(
+                    [b"EXPORT given unknown argument \"", key, b"\"."].concat(),
+                ));
+            }
         }
     }
     if options
@@ -670,15 +689,21 @@ fn export(cx: &mut Cx<'_>, input: &[ExpandedArg]) -> CmdResult {
         }
         return Ok(Flow::Normal);
     }
+    let packages = matches!(*signature, b"EXPORT" | b"SETUP") && package_dependencies::enabled(cx);
+    if *signature == b"SETUP" && packages {
+        return package_dependencies::setup(cx, rest);
+    }
+    let normalized;
+    let input = if *signature == b"EXPORT" {
+        normalized = export_options::normalize(cx, &input)?;
+        normalized.as_slice()
+    } else {
+        input.as_slice()
+    };
+    let rest = input.get(1..).unwrap_or_default();
     let mut args = rest.iter().copied().peekable();
     let name = match *signature {
-        b"EXPORT" => {
-            let name = value(&mut args, b"EXPORT")?;
-            if !cx.project().exports.contains_key(name) {
-                return Err(fail([b"Export set \"", name, b"\" not found."].concat()));
-            }
-            Some(name)
-        }
+        b"EXPORT" => Some(value(&mut args, b"EXPORT")?),
         b"TARGETS" => {
             target_ids(cx, values(&mut args), b"TARGETS")?;
             None
@@ -708,10 +733,21 @@ fn export(cx: &mut Cx<'_>, input: &[ExpandedArg]) -> CmdResult {
             b"CXX_MODULES_DIRECTORY" => {
                 value(&mut args, key)?;
             }
+            b"EXPORT_PACKAGE_DEPENDENCIES" if name.is_some() && packages => {}
             b"APPEND" if name.is_none() => append = true,
             b"EXPORT_LINK_INTERFACE_LIBRARIES" if name.is_none() => {}
+            _ if name.is_some() => {
+                return Err(fail(
+                    [b"EXPORT given unknown argument: \"", key, b"\"."].concat(),
+                ));
+            }
             _ => return Err(unknown(key)),
         }
+    }
+    if let Some(name) = name
+        && !cx.project().exports.contains_key(name)
+    {
+        return Err(fail([b"Export set \"", name, b"\" not found."].concat()));
     }
     let file = file.or_else(|| name.map(|name| [name, b".cmake"].concat().into()));
     if let Some(file) = file {
@@ -721,17 +757,10 @@ fn export(cx: &mut Cx<'_>, input: &[ExpandedArg]) -> CmdResult {
         .normalize();
         let key = [b"_RCMAKE_EXPORT_OUTPUT_".as_slice(), output.as_slice()].concat();
         if !append && cx.global().props.get(&key).is_some() {
-            return Err(fail(
-                [
-                    b"command already specified for the file ",
-                    file.as_slice(),
-                    b". Did you miss 'APPEND' keyword?",
-                ]
-                .concat(),
-            ));
+            export_options::repeat(cx, &file)?;
         }
         cx.global().props.set(key.into(), b"1".as_slice().into());
-        record_request(cx, "_RCMAKE_BUILD_EXPORT", &input);
+        record_request(cx, "_RCMAKE_BUILD_EXPORT", input);
     }
     Ok(Flow::Normal)
 }

@@ -727,6 +727,8 @@ fn prep_targets_preserve_user_outputs_and_select_dependencies()
             });
         }
         result.install.actions.push(InstallAction {
+            all_components: false,
+            exclude_from_all: false,
             component: component.into(),
             destination: "share".into(),
             configurations: vec![],

@@ -123,14 +123,25 @@ fn render_action(
     action: &InstallAction,
     options: &InstallScriptOptions<'_>,
 ) -> Result<(), GenError> {
-    out.extend_from_slice(b"if(CMAKE_INSTALL_COMPONENT STREQUAL ");
-    quote(out, &action.component);
-    out.extend_from_slice(b" OR NOT CMAKE_INSTALL_COMPONENT)\n");
+    let component_guard = !action.all_components || action.exclude_from_all;
+    if action.all_components && action.exclude_from_all {
+        out.extend_from_slice(b"if(CMAKE_INSTALL_COMPONENT)\n");
+    } else if !action.all_components {
+        out.extend_from_slice(b"if(CMAKE_INSTALL_COMPONENT STREQUAL ");
+        quote(out, &action.component);
+        if !action.exclude_from_all {
+            out.extend_from_slice(b" OR NOT CMAKE_INSTALL_COMPONENT");
+        }
+        out.extend_from_slice(b")\n");
+    }
 
     let guarded = !action.configurations.is_empty();
     let indent = if guarded {
         out.extend_from_slice(b"  if(CMAKE_INSTALL_CONFIG_NAME MATCHES ");
-        quote(out, &configuration_pattern(&action.configurations));
+        let pattern = configuration_pattern(&action.configurations);
+        out.push(b'"');
+        quoted_content(out, pattern.strip_suffix(b"$").unwrap_or(&pattern));
+        out.extend_from_slice(b"$\"");
         out.extend_from_slice(b")\n");
         b"    ".as_slice()
     } else {
@@ -141,7 +152,9 @@ fn render_action(
     if guarded {
         out.extend_from_slice(b"  endif()\n");
     }
-    out.extend_from_slice(b"endif()\n\n");
+    if component_guard {
+        out.extend_from_slice(b"endif()\n\n");
+    }
     Ok(())
 }
 

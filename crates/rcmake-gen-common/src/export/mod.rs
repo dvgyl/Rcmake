@@ -92,7 +92,6 @@ pub fn write_export_plan_with_prefix(
 
 fn export_output_directory(plan: &ExportPlan, out_dir: &Path, destination: &[u8]) -> PathBuf {
     if plan.install
-        && plan.cxx_modules_directory.is_some()
         && out_dir
             .file_name()
             .and_then(|name| name.to_str())
@@ -128,6 +127,7 @@ cmake_policy(VERSION 3.0...4.3)
     );
     out.extend_from_slice(IMPORT_VERSION);
     render_guard(&mut out, plan);
+    render_package_dependencies(&mut out, plan);
     if plan.install {
         render_prefix(&mut out, plan, install_dest, install_prefix)?;
     }
@@ -149,6 +149,44 @@ cmake_policy(VERSION 3.0...4.3)
     out.extend_from_slice(END_IMPORT_VERSION);
     out.extend_from_slice(b"cmake_policy(POP)\n");
     Ok(out)
+}
+
+fn render_package_dependencies(out: &mut BString, plan: &ExportPlan) {
+    if plan.package_dependencies.is_empty() {
+        return;
+    }
+    out.extend_from_slice(
+        b"include(CMakeFindDependencyMacro)\nif(DEFINED CMAKE_FIND_PACKAGE_NAME)\n  set(_cmake_unwind_arg UNWIND_INCLUDE)\nendif()\n\n"
+    );
+    for (name, args) in &plan.package_dependencies {
+        out.extend_from_slice(b"__find_dependency_no_return(");
+        let plain = !name.is_empty()
+            && name
+                .iter()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"_.+-".contains(byte));
+        if plain {
+            out.extend_from_slice(name);
+        } else {
+            crate::script_argument(out, name);
+        }
+        for arg in args {
+            out.push(b' ');
+            crate::script_argument(out, arg);
+        }
+        out.extend_from_slice(b" ${_cmake_unwind_arg})\nif(NOT ");
+        if plain {
+            out.extend_from_slice(name);
+            out.extend_from_slice(b"_FOUND");
+        } else {
+            out.extend_from_slice(b"\"${");
+            quoted_content(out, name);
+            out.extend_from_slice(b"_FOUND}\"");
+        }
+        out.extend_from_slice(
+            b")\n  unset(_cmake_unwind_arg)\n  cmake_policy(POP)\n  return()\nendif()\n\n",
+        );
+    }
+    out.extend_from_slice(b"unset(_cmake_unwind_arg)\n\n");
 }
 
 fn render_guard(out: &mut BString, plan: &ExportPlan) {
@@ -268,16 +306,60 @@ fn render_target(
                 b"INTERFACE_CXX_MODULE_SETS" | b"INTERFACE_FILE_SETS_CXX_MODULES"
             )
         })
-        .peekable();
-    if properties.peek().is_some() {
+        .collect::<Vec<_>>();
+    if !properties.is_empty() {
+        properties.sort_unstable_by_key(|(key, _)| *key);
         start_properties(out, &name);
         for (property, value) in properties {
             render_property(out, property, value, plan.install);
         }
         out.extend_from_slice(b")\n");
     }
+    for set in &target.source_sets {
+        render_source_set(out, &name, set, plan.install);
+    }
     out.push(b'\n');
     Ok(())
+}
+
+fn render_source_set(
+    out: &mut BString,
+    target: &[u8],
+    set: &rcmake_resolve::ExportedSourceSet,
+    install: bool,
+) {
+    out.extend_from_slice(b"if(NOT CMAKE_VERSION VERSION_LESS 4.5)\n  target_sources(");
+    quote(out, target);
+    out.extend_from_slice(b" INTERFACE FILE_SET ");
+    quote(out, &set.name);
+    out.extend_from_slice(b" TYPE SOURCES");
+    for (key, entries) in [
+        (b" BASE_DIRS".as_slice(), &set.bases),
+        (b" FILES", &set.files),
+    ] {
+        if entries.is_empty() {
+            continue;
+        }
+        out.extend_from_slice(key);
+        for value in entries {
+            out.extend_from_slice(b" \"");
+            quote_export_content(out, value, install, true);
+            out.push(b'"');
+        }
+    }
+    out.extend_from_slice(b")\n");
+    for (key, value) in &set.properties {
+        out.extend_from_slice(b"  set_property(FILE_SET ");
+        quote(out, &set.name);
+        out.extend_from_slice(b" TARGET ");
+        quote(out, target);
+        out.extend_from_slice(b" PROPERTY ");
+        quote(out, key);
+        out.extend_from_slice(b" \"");
+        quote_export_content(out, value, install, false);
+        out.extend_from_slice(b"\")\n");
+    }
+    out.extend_from_slice(b"endif()\n");
 }
 
 type ConfigTargets<'a> = Vec<(&'a ExportedTarget, &'a BString)>;
@@ -436,7 +518,16 @@ fn start_property(out: &mut BString, key: &[u8]) {
 }
 
 fn render_property(out: &mut BString, key: &[u8], value: &[u8], install: bool) {
-    start_property(out, key);
+    if key
+        .iter()
+        .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+    {
+        out.extend_from_slice(b"  ");
+        out.extend_from_slice(key);
+        out.extend_from_slice(b" \"");
+    } else {
+        start_property(out, key);
+    }
     quote_export_content(out, value, install, false);
     out.extend_from_slice(b"\"\n");
 }
@@ -591,7 +682,7 @@ mod tests {
             let name = format!("{prefix}renamed");
             let main = render_main(plan, b"lib/cmake", None, b"")?;
             let expected = format!(
-                "\"INTERFACE_LINK_LIBRARIES\" \"{name};$<LINK_ONLY:{name}>;$<$<CONFIG:Debug>:{name}>;$<$<CONFIG:Debug>:dep>;pthread\""
+                "INTERFACE_LINK_LIBRARIES \"{name};$<LINK_ONLY:{name}>;$<$<CONFIG:Debug>:{name}>;$<$<CONFIG:Debug>:dep>;pthread\""
             );
             assert!(String::from_utf8_lossy(&main).contains(&expected), "{main}");
         }
@@ -706,9 +797,9 @@ mod tests {
         assert!(
             no_config.contains("\"IMPORTED_LOCATION_NOCONFIG\" \"${_IMPORT_PREFIX}/lib/libfmt.a\"")
         );
-        assert!(no_config.contains("\"IMPORTED_LINK_INTERFACE_LANGUAGES_NOCONFIG\" \"CXX\""));
+        assert!(no_config.contains("IMPORTED_LINK_INTERFACE_LANGUAGES_NOCONFIG \"CXX\""));
         let release = read_text(&host, &out.join("fmt-targets-release.cmake"));
-        assert!(release.contains("\"IMPORTED_SONAME_RELEASE\" \"libfmt.so.2\""));
+        assert!(release.contains("IMPORTED_SONAME_RELEASE \"libfmt.so.2\""));
         assert!(release.contains(
             "\"_cmake_import_check_files_for_fmt::tool\" \"${_IMPORT_PREFIX}/bin/tool\\\\;driver\""
         ));
@@ -727,8 +818,8 @@ mod tests {
         let script = read_text(&host, &path);
         assert!(script.contains("add_library(\"fmt::fmt\" STATIC IMPORTED)"));
         assert!(script.contains("add_library(\"fmt::shared\" SHARED IMPORTED)"));
-        assert!(script.contains("\"IMPORTED_LOCATION_NOCONFIG\" \"/build/lib/libfmt.a\""));
-        assert!(script.contains("\"IMPORTED_LOCATION_RELEASE\" \"/build/lib/libfmt.so.2\""));
+        assert!(script.contains("IMPORTED_LOCATION_NOCONFIG \"/build/lib/libfmt.a\""));
+        assert!(script.contains("IMPORTED_LOCATION_RELEASE \"/build/lib/libfmt.so.2\""));
         assert!(!script.contains("_IMPORT_PREFIX"));
         assert!(!script.contains("file(GLOB"));
     }

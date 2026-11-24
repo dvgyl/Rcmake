@@ -6,8 +6,8 @@ use rcmake_model::PropScope;
 use super::computed::{boolean, directory_value, global_value, source_value};
 use super::file_set::{file_set_id, file_set_selection, file_set_target, file_set_value};
 use super::scope::{
-    alias_value, check_directory, find_target, single_name, source_directory, source_scope,
-    source_scopes, test_names,
+    SourceSelection, alias_value, check_directory, find_target, single_name, source_directory,
+    source_scope, source_scopes, test_names,
 };
 use super::{is_inherited, model_value, quoted, values};
 
@@ -25,7 +25,13 @@ pub(in crate::policy_misc) fn get_directory(cx: &mut Cx<'_>, args: &[ExpandedArg
     let dir = check_directory(cx, directory.as_slice())?;
     let result = match query {
         [b"DEFINITION", name] if dir == cx.current_dir_id() => cx.var(name),
-        [b"DEFINITION", _] => None,
+        [b"DEFINITION", name] => cx
+            .project()
+            .dir(dir)
+            .vars
+            .get(*name)
+            .cloned()
+            .or_else(|| cx.cache().get(name).map(|entry| entry.value.clone())),
         [b""] => {
             return Err(CmdError::status(
                 "given empty string for the property name to get",
@@ -63,11 +69,34 @@ pub(in crate::policy_misc) fn get_source(cx: &mut Cx<'_>, args: &[ExpandedArg]) 
             ));
         }
     };
-    let scope = source_scope(cx, dir, source);
     let inherited = is_inherited(cx, b"SOURCE", name);
-    let value = source_value(cx, &scope, name, inherited).unwrap_or_else(|| "NOTFOUND".into());
+    let value = query_source(cx, dir, source, name, inherited).unwrap_or_else(|| "NOTFOUND".into());
     cx.set_var(out, value);
     Ok(Flow::Normal)
+}
+
+fn query_source(
+    cx: &mut Cx<'_>,
+    dir: rcmake_model::DirId,
+    source: &[u8],
+    name: &[u8],
+    inherited: bool,
+) -> Option<BString> {
+    if name == b"GENERATED" {
+        if let Some(value) = super::generated::global_value(cx, dir, source) {
+            return Some(value);
+        }
+        if super::generated::is_strict(cx, dir) {
+            let PropScope::Source { path, .. } = source_scope(cx, dir, source) else {
+                return None;
+            };
+            return Some(boolean(
+                cx.project().dir(dir).generated_sources.contains(&path),
+            ));
+        }
+    }
+    let scope = source_scope(cx, dir, source);
+    source_value(cx, &scope, name, inherited)
 }
 
 #[derive(Clone, Copy)]
@@ -180,7 +209,7 @@ enum PropertyOwner<'a> {
     Variable,
     Target(&'a [u8]),
     FileSet { set: &'a [u8], target: &'a [u8] },
-    Source(Option<PropScope>),
+    Source(Option<SourceSelection<'a>>),
     Model(PropScope),
 }
 
@@ -242,7 +271,7 @@ impl<'a> PropertyOwner<'a> {
                 file_set_value(cx, id, name, inherited)
             }
             Self::Source(scope) => {
-                scope.and_then(|scope| source_value(cx, &scope, name, inherited))
+                scope.and_then(|scope| query_source(cx, scope.dir, scope.source, name, inherited))
             }
             Self::Model(PropScope::Directory(dir)) => directory_value(cx, dir, name, inherited),
             Self::Model(scope @ PropScope::Test { .. }) => {

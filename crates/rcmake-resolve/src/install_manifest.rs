@@ -5,6 +5,10 @@ use rcmake_base::BString;
 pub struct InstallAction {
     /// Install component.
     pub component: BString,
+    /// Run in every component install.
+    pub all_components: bool,
+    /// Skip this action during a full install.
+    pub exclude_from_all: bool,
     /// Destination (relative to `CMAKE_INSTALL_PREFIX` unless absolute).
     pub destination: BString,
     /// Configurations the action applies to (empty means all).

@@ -22,6 +22,7 @@ pub(super) fn write(
     result: &GenerationResult,
     host: &dyn Host,
 ) -> Result<(), GenError> {
+    rcmake_commands::print_deferred_properties(model, result, host).map_err(GenError::Invalid)?;
     let props = &model.global.props;
     let Some(count) = props.get(b"_RCMAKE_FILE_GENERATE_COUNT") else {
         return Ok(());

@@ -80,12 +80,23 @@ fn write(cx: &Cx<'_>, append: bool, args: &[&[u8]]) -> Result {
     Ok(Flow::Normal)
 }
 
-fn touch(cx: &Cx<'_>, create: bool, args: &[&[u8]]) -> Result {
+fn touch(cx: &mut Cx<'_>, create: bool, args: &[&[u8]]) -> Result {
     for &input in args {
         if input.is_empty() {
             continue;
         }
         let path = cx.resolve_path(input);
+        if !crate::compat::can_write_project_file(cx, &path) {
+            cx.set_fatal();
+            return Err(error(
+                [
+                    b"attempted to touch a file: ".as_slice(),
+                    &from_native(&path),
+                    b" in a source directory.",
+                ]
+                .concat(),
+            ));
+        }
         let now = cx.host().now();
         let result = match cx.host().set_times(&path, Some(now), Some(now)) {
             Err(e) if e.kind == ErrorKind::NotFound && create => {

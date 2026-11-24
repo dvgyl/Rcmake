@@ -5,7 +5,7 @@ use std::time::Duration;
 use rcmake_base::{BString, ByteSlice, truth};
 use rcmake_diag::{DiagCategory, Effect, MessageKind, PolicyId, PolicyStatus};
 use rcmake_eval::args::{KeywordParser, Slot};
-use rcmake_eval::{CmdError, CmdResult, Cx, Flow};
+use rcmake_eval::{CmdError, CmdResult, Cx, Flow, IncludeOptions};
 use rcmake_expr::ExpandedArg;
 use rcmake_host::{
     CommandSpec, Input, Output, ProcessResult, ReadRange, RunRequest, SystemInfo, path,
@@ -515,69 +515,39 @@ fn distribution_fallback(
         .map(|script| cx.resolve_path(script)),
     );
     scripts.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
-    let token = (0..)
-        .map(|index| format!("_rcmake_release_{index}"))
-        .find(|prefix| {
-            [
-                prefix.clone(),
-                format!("{prefix}_root"),
-                format!("{prefix}_script"),
-            ]
-            .iter()
-            .all(|key| !cx.var_defined(key.as_bytes()))
-        })
-        .unwrap_or_default();
-    let root_var = format!("{token}_root");
-    let script_var = format!("{token}_script");
-    let code = format!(
-        r#"
-block(SCOPE_FOR VARIABLES PROPAGATE {token})
-  set(CMAKE_SYSROOT "${{{root_var}}}")
-  unset(CMAKE_GET_OS_RELEASE_FALLBACK_RESULT)
-  include("${{{script_var}}}" OPTIONAL)
-  set({token})
-  foreach(_rcmake_release_field IN LISTS CMAKE_GET_OS_RELEASE_FALLBACK_RESULT)
-    string(HEX "${{${{_rcmake_release_field}}}}" _rcmake_release_value)
-    list(APPEND {token} "${{_rcmake_release_field}}=${{_rcmake_release_value}}")
-  endforeach()
-endblock()
-"#
-    );
-    cx.set_var(root_var.as_bytes(), path::from_native(root));
-    let mut fields = BTreeMap::new();
     for script in scripts {
-        cx.set_var(script_var.as_bytes(), path::from_native(&script));
-        let result = cx.eval_code(code.as_bytes());
-        let values = cx.var_or_empty(token.as_bytes());
-        cx.unset_var(token.as_bytes());
-        if let Err(error) = result {
-            cx.unset_var(root_var.as_bytes());
-            cx.unset_var(script_var.as_bytes());
-            return Err(error);
-        }
+        let mut fields = cx.with_variable_scope(|cx| {
+            cx.set_var(b"CMAKE_SYSROOT", path::from_native(root));
+            let result = b"CMAKE_GET_OS_RELEASE_FALLBACK_RESULT";
+            cx.unset_var(result);
+            cx.include_file(
+                &script,
+                IncludeOptions {
+                    optional: true,
+                    ..IncludeOptions::default()
+                },
+            )?;
+            let names =
+                rcmake_base::list::split(&cx.var_or_empty(result), rcmake_base::list::Empty::Drop);
+            Ok::<BTreeMap<_, _>, CmdError>(
+                names
+                    .into_iter()
+                    .filter_map(|name| {
+                        let field = name.strip_prefix(PREFIX)?;
+                        Some((BString::from(field), cx.var_or_empty(&name)))
+                    })
+                    .collect(),
+            )
+        })?;
         if cx.fatal_occurred() {
-            break;
+            return Err(CmdError::Reported);
         }
-        fields.extend(values.split(|&byte| byte == b';').filter_map(|entry| {
-            let (name, value) = entry.split_once_str(b"=")?;
-            let name = name.strip_prefix(PREFIX)?;
-            let decoded: Option<Vec<u8>> = value
-                .chunks(2)
-                .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).ok()?, 16).ok())
-                .collect();
-            Some((BString::from(name), BString::from(decoded?)))
-        }));
         if !fields.is_empty() {
             fields.insert("USED_FALLBACK_SCRIPT".into(), path::from_native(&script));
-            break;
+            return Ok(fields);
         }
     }
-    cx.unset_var(root_var.as_bytes());
-    cx.unset_var(script_var.as_bytes());
-    if cx.fatal_occurred() {
-        return Err(CmdError::Reported);
-    }
-    Ok(fields)
+    Ok(BTreeMap::new())
 }
 
 fn read(cx: &Cx<'_>, path: &Path) -> Vec<u8> {

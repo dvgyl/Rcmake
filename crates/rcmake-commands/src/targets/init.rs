@@ -46,7 +46,14 @@ pub(super) fn initialize(cx: &mut Cx<'_>, target: &mut Target) {
         inherit_directory_usage(cx, target);
     }
     initialize_from_variables(cx, target, builds);
-    if target.is_imported() || cx.project().dir(target.dir).system {
+    if target.is_imported()
+        || cx
+            .project()
+            .dir(target.dir)
+            .props
+            .get(b"SYSTEM")
+            .is_some_and(|value| rcmake_base::truth::is_on(value))
+    {
         target.props.set("SYSTEM".into(), "ON".into());
     }
     let definitions: Vec<_> = cx

@@ -89,7 +89,11 @@ fn subdirectory_commands_share_the_model_with_property_commands() -> TestResult 
         return Err("Expected one child directory".into());
     };
     let child = model.dir(*child_id);
-    assert!(child.exclude_from_all && child.system);
+    assert!(child.exclude_from_all);
+    assert_eq!(
+        child.props.get(b"SYSTEM").map(|v| v.as_slice()),
+        Some(b"TRUE".as_slice())
+    );
     assert_eq!(
         child.usage.joined(UsageField::IncludeDirectories),
         Some("/work/src/three;/work/src/two;/work/src/one".into())

@@ -304,7 +304,7 @@ fn stages_noconfig_cps_and_explicit_sbom_and_preserves_header_paths() {
         .unwrap()
         .to_string();
     assert!(script.contains("${CMAKE_INSTALL_PREFIX}/include/api"));
-    assert!(script.contains(r#"CMAKE_INSTALL_CONFIG_NAME MATCHES "^()\$""#));
+    assert!(script.contains(r#"CMAKE_INSTALL_CONFIG_NAME MATCHES "^()$""#));
     assert!(script.contains("Bill-noconfig.spdx.json"));
     assert!(!script.contains("sdk-noconfig.spdx.json"));
 }

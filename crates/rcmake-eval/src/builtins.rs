@@ -156,6 +156,9 @@ impl Interp {
 }
 
 fn cmd_include(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
+    if cx.interp.unwinding_package {
+        return Err(CmdError::status("called while already in an UNWIND state"));
+    }
     if args.is_empty() || args.len() > 4 {
         return Err(CmdError::Status(
             "called with wrong number of arguments.  include() only takes one file.".into(),
@@ -273,6 +276,9 @@ fn cmd_include(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
             b"could not load requested file:\n  ",
             &fname,
         ])));
+    }
+    if read && cx.interp.unwinding_package {
+        return Ok(Flow::Return { propagate: None });
     }
     Ok(Flow::Normal)
 }

@@ -366,7 +366,7 @@ impl<'a> ConfigSearch<'a> {
                     }
                 }
             } else {
-                cx.include_file(
+                cx.include_package_file(
                     &path::to_native(&found.file),
                     self.request.include_options(),
                 )?;

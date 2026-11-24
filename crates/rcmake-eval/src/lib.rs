@@ -51,6 +51,7 @@ mod util;
 #[cfg(test)]
 mod tests;
 
+pub use configure_log::FindEvent;
 pub use cx::Cx;
 pub use file_lock::FileLockScope;
 pub use hooks::{TraceConfig, TraceFormat, WatchAccess};
@@ -243,6 +244,7 @@ pub struct SubdirOptions {
 pub(crate) struct DirFrame {
     /// The directory in the [`ProjectModel`] arena.
     pub(crate) id: DirId,
+    pub(crate) trace_base: u32,
     /// Deferred-call queue of the directory listfile being processed (`None` outside
     /// a directory listfile).
     pub(crate) defer: Option<Vec<hooks::DeferredCall>>,
@@ -403,6 +405,8 @@ pub struct Interp {
     render: RenderOptions,
     bt: Backtrace,
     depth: u32,
+    package_file_depth: usize,
+    unwinding_package: bool,
     /// `LoopBlockCounter`: one counter per function/directory barrier.
     loop_blocks: Vec<u32>,
     fatal: bool,
@@ -486,6 +490,7 @@ impl Interp {
             project,
             root_frame: DirFrame {
                 id: DirId::ROOT,
+                trace_base: 0,
                 defer: None,
             },
             dir_stack: Vec::new(),
@@ -502,6 +507,8 @@ impl Interp {
             render,
             bt: Backtrace::default(),
             depth: 0,
+            package_file_depth: 0,
+            unwinding_package: false,
             loop_blocks: vec![0],
             fatal: false,
             cmd_failed: false,

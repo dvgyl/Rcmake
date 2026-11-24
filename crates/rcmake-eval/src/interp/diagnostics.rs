@@ -135,10 +135,13 @@ impl Interp {
 
     /// `cmPolicies::GetPolicyWarning`.
     pub(crate) fn policy_warning_text(id: PolicyId) -> BString {
-        let summary = id
-            .info()
-            .map(|i| crate::util::replace_all(i.summary.as_bytes(), b"``", b""))
-            .unwrap_or_default();
+        let summary = if id == PolicyId::new(82) {
+            b"Install rules from add_subdirectory() are interleaved with those in caller.".to_vec()
+        } else {
+            id.info()
+                .map(|i| crate::util::replace_all(i.summary.as_bytes(), b"``", b""))
+                .unwrap_or_default()
+        };
         let name = id.to_string();
         cat(&[
             b"Policy ",

@@ -180,6 +180,14 @@ impl<'a> SourcePaths<'a> {
                     .insert(dir.binary_dir.clone());
             }
         }
+        for (_, dir) in model.dirs() {
+            for path in &dir.generated_sources {
+                self.generated
+                    .entry(path.clone())
+                    .or_default()
+                    .insert(dir.binary_dir.clone());
+            }
+        }
         self.index_file_generations(model, config, &mut usage)?;
         Ok(())
     }

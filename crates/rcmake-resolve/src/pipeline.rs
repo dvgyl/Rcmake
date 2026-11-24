@@ -42,6 +42,7 @@ pub fn resolve_with_options(
     configs: &[ConfigId],
     options: &ResolveOptions,
 ) -> Result<GenerationResult, ResolveError> {
+    crate::exports::source_sets::validate(model)?;
     lower::warn_about_wrappers(model, host);
     let configs = if configs.is_empty() {
         vec![ConfigId(
@@ -90,6 +91,7 @@ pub fn resolve_with_options(
         &mut UsageResolver::new(model).with_ide(options.ide),
         &targets,
         &install,
+        &configs,
     )?;
     for action in &mut install.actions {
         if action.destination.is_empty()

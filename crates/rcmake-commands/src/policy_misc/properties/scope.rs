@@ -63,11 +63,17 @@ pub(super) fn test_names<'a, 'b>(
     }
 }
 
-pub(super) fn source_scopes(
+pub(super) struct SourceSelection<'a> {
+    pub dir: DirId,
+    pub source: &'a [u8],
+    pub scoped: bool,
+}
+
+pub(super) fn source_scopes<'a>(
     cx: &mut Cx<'_>,
-    mut names: &[&[u8]],
+    mut names: &[&'a [u8]],
     query: bool,
-) -> Result<Vec<PropScope>, CmdError> {
+) -> Result<Vec<SourceSelection<'a>>, CmdError> {
     let is_option = |word: &[u8]| matches!(word, b"DIRECTORY" | b"TARGET_DIRECTORY");
     let section_end = |words: &[&[u8]]| {
         words
@@ -77,6 +83,7 @@ pub(super) fn source_scopes(
     };
     let (sources, rest) = names.split_at(section_end(names));
     names = rest;
+    let scoped = !rest.is_empty();
     if query {
         single_name(b"SOURCE", sources)?;
     }
@@ -106,7 +113,11 @@ pub(super) fn source_scopes(
     }
     let mut scopes = Vec::new();
     for dir in dirs {
-        scopes.extend(sources.iter().map(|source| source_scope(cx, dir, source)));
+        scopes.extend(sources.iter().map(|&source| SourceSelection {
+            dir,
+            source,
+            scoped,
+        }));
     }
     Ok(scopes)
 }

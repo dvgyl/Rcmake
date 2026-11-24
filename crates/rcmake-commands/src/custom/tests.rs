@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use rcmake_eval::{Interp, InterpConfig, RunMode};
 use rcmake_host::{PureHost, Stream, path::to_native};
-use rcmake_model::{DirId, TargetKind};
+use rcmake_model::{DirId, PropScope, TargetKind};
 
 use super::*;
 

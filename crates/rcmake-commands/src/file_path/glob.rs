@@ -10,6 +10,7 @@ use rcmake_host::{
     FileKind, Follow,
     path::{from_native, to_native},
 };
+use rcmake_model::{GlobCall, GlobCheck, GlobKey};
 use rcmake_regex::{MatchOptions, Regex};
 
 use super::{Result, error, set, warning};
@@ -95,10 +96,15 @@ pub(super) fn run(cx: &mut Cx<'_>, recursive: bool, args: &[&[u8]]) -> Result {
             }
             pattern => {
                 evaluated = true;
+                let mut matched = BTreeSet::new();
                 let mut glob = Glob {
                     cx,
                     options: &options,
-                    output: &mut output,
+                    output: if configure_depends {
+                        &mut matched
+                    } else {
+                        &mut output
+                    },
                     budget: &mut budget,
                     bytes: &mut bytes,
                     case_insensitive: cfg!(any(target_os = "macos", windows)),
@@ -106,10 +112,79 @@ pub(super) fn run(cx: &mut Cx<'_>, recursive: bool, args: &[&[u8]]) -> Result {
                     links: Vec::new(),
                 };
                 glob.run()?;
+                if configure_depends {
+                    record(cx, out, pattern, &options, &matched)?;
+                    output.extend(matched);
+                }
             }
         }
     }
     set(cx, out, list::join(output))
+}
+
+fn record(
+    cx: &mut Cx<'_>,
+    variable: &[u8],
+    pattern: &[u8],
+    options: &Options,
+    files: &BTreeSet<BString>,
+) -> Result<()> {
+    let key = GlobKey {
+        expression: from_native(&cx.resolve_path(pattern)),
+        recursive: options.recursive,
+        directories: options.directories,
+        follow: options.follow,
+        relative: options.relative.clone(),
+    };
+    let files = list::join(files);
+    let call = GlobCall {
+        variable: variable.into(),
+        backtrace: cx.backtrace(),
+    };
+    let root = rcmake_host::path::from_native(&cx.current_source_dir());
+    let Some(previous) = cx.project().glob_checks.get_mut(&key) else {
+        cx.project().glob_checks.insert(
+            key,
+            GlobCheck {
+                files,
+                calls: vec![call],
+            },
+        );
+        return Ok(());
+    };
+    if previous.files == files {
+        previous.calls.push(call);
+        return Ok(());
+    }
+    let locations = previous
+        .calls
+        .iter()
+        .map(|record| {
+            if let Some(frame) = record.backtrace.top() {
+                let file = frame
+                    .file
+                    .strip_prefix(root.as_slice())
+                    .and_then(|path| path.strip_prefix(b"/"))
+                    .unwrap_or(&frame.file);
+                format!(
+                    "  {} at {}:{} (file)",
+                    record.variable,
+                    BString::from(file),
+                    frame.line
+                )
+            } else {
+                format!("  {}", record.variable)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    Err(crate::command_error(
+        cx,
+        format!(
+            "The glob expression\n\n {}\n\nwas already present in the glob cache but the directory contents have changed during the configuration run.\n\nMatching glob expressions:\n\n{locations}",
+            key.expression,
+        ),
+    ))
 }
 
 struct Options {

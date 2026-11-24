@@ -636,10 +636,10 @@ impl<'a> UsageResolver<'a> {
                 continue;
             }
             let dependency = self.target(id)?;
-            let default_system = dependency.props.get(b"SYSTEM").map_or(
-                dependency.is_imported() || self.model.dir(dependency.dir).system,
-                |value| truth::is_on(value),
-            );
+            let default_system = dependency
+                .props
+                .get(b"SYSTEM")
+                .map_or(dependency.is_imported(), |value| truth::is_on(value));
             self.eval_entries(
                 id,
                 InterfaceSystemIncludeDirectories.name().as_bytes(),

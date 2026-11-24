@@ -78,7 +78,7 @@ fn subdirs(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
             "called with incorrect number of arguments",
         ));
     }
-    cx.issue(
+    cx.issue_in_directory(
         MessageKind::DeprecationWarning,
         Effect::None,
         Some(DiagCategory::Deprecated),

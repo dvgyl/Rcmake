@@ -5,7 +5,9 @@ use rcmake_expr::ExpandedArg;
 use rcmake_model::{AppendMode, CacheType, ModelError, PropOrigin, PropScope, TargetId};
 
 use super::file_set::{file_set_id, file_set_selection, file_set_target, set_file_set};
-use super::scope::{check_directory, source_scopes, test_names, writable_target};
+use super::scope::{
+    SourceSelection, check_directory, source_scope, source_scopes, test_names, writable_target,
+};
 use super::{known_features, quoted, values};
 
 pub(in crate::policy_misc) fn set_directory(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
@@ -31,7 +33,7 @@ pub(in crate::policy_misc) fn set_sources(cx: &mut Cx<'_>, args: &[ExpandedArg])
     let pairs = property_pairs(tail.get(1..).unwrap_or_default())?;
     for scope in source_scopes(cx, sources, false)? {
         for [name, value] in pairs {
-            update_scoped(cx, &scope, name, Some((*value).into()), Update::Set)?;
+            update_source(cx, &scope, name, Some((*value).into()), Update::Set)?;
         }
     }
     Ok(Flow::Normal)
@@ -106,7 +108,7 @@ pub(in crate::policy_misc) fn set(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdR
         }
         b"SOURCE" => {
             for scope in source_scopes(cx, &names, false)? {
-                update_scoped(cx, &scope, name, value.clone(), update)?;
+                update_source(cx, &scope, name, value.clone(), update)?;
             }
         }
         b"FILE_SET" => {
@@ -185,19 +187,20 @@ fn set_imported_global(
         .target(id)
         .ok_or_else(|| CmdError::status(ModelError::UnknownObject.to_string()))?;
     let name = target.name.clone();
+    let target_dir = target.dir;
     let invalid_directory =
         target.dir != dir && target.is_imported() && matches!(update, Update::Set);
     let error = if !target.is_imported() {
         Some(format!(
-            "IMPORTED_GLOBAL property can't be set on non-imported targets(\"{name}\")"
+            "IMPORTED_GLOBAL property can't be set on non-imported targets(\"{name}\")\n"
         ))
     } else if !matches!(update, Update::Set) {
         Some(format!(
-            "IMPORTED_GLOBAL property can't be appended, only set on imported targets (\"{name}\")"
+            "IMPORTED_GLOBAL property can't be appended, only set on imported targets (\"{name}\")\n"
         ))
     } else if !value.is_some_and(|value| rcmake_base::truth::is_on(value)) {
         Some(format!(
-            "IMPORTED_GLOBAL property can't be set to FALSE on targets (\"{name}\")"
+            "IMPORTED_GLOBAL property can't be set to FALSE on targets (\"{name}\")\n"
         ))
     } else {
         project
@@ -206,14 +209,43 @@ fn set_imported_global(
         None
     };
     if let Some(error) = error {
-        cx.issue(MessageKind::Error, Effect::SetError, None, error.into());
+        if invalid_directory {
+            cx.issue_directory_error(target_dir, error.into());
+        } else {
+            cx.issue_in_directory(MessageKind::Error, Effect::SetError, None, error.into());
+        }
     }
     if invalid_directory {
-        cx.issue(MessageKind::Error, Effect::SetError, None, format!(
+        cx.issue_in_directory(MessageKind::Error, Effect::SetError, None, format!(
             "Attempt to promote imported target \"{name}\" to global scope (by setting IMPORTED_GLOBAL) which is not built in this directory."
         ).into());
     }
     Ok(())
+}
+
+fn update_source(
+    cx: &mut Cx<'_>,
+    selection: &SourceSelection<'_>,
+    name: &[u8],
+    value: Option<BString>,
+    update: Update,
+) -> Result<(), CmdError> {
+    if name == b"GENERATED"
+        && super::generated::set(
+            cx,
+            selection.dir,
+            selection.source,
+            selection.scoped,
+            value
+                .as_ref()
+                .map_or(b"".as_slice(), |value| value.as_slice()),
+            update,
+        )
+    {
+        return Ok(());
+    }
+    let scope = source_scope(cx, selection.dir, selection.source);
+    update_scoped(cx, &scope, name, value, update)
 }
 
 /// Apply `update` to a model-owned property scope.

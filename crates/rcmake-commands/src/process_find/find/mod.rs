@@ -83,8 +83,9 @@ fn find(cx: &mut Cx<'_>, args: &[ExpandedArg], kind: Kind) -> CmdResult {
     let var = &var.value;
     let options = Options::parse(cx, rest)?;
     let had_normal = cx.var_normal_only(var).is_some();
-    if cx
-        .var(var)
+    let existing = cx.var(var);
+    if existing
+        .as_ref()
         .is_some_and(|v| v.as_slice() != b"NOTFOUND" && !v.ends_with(b"-NOTFOUND"))
     {
         use_existing(cx, kind, var, &options);
@@ -104,6 +105,7 @@ fn find(cx: &mut Cx<'_>, args: &[ExpandedArg], kind: Kind) -> CmdResult {
     let mut search = Search::new(cx, kind, &options, var);
     let found = search.run(cx, directories)?;
     search.log(cx, var);
+    search.log_event(cx, var, found.as_deref(), existing.is_some());
     let mut value = found
         .as_deref()
         .map_or_else(|| text(&[var, b"-NOTFOUND"]), path::from_native);

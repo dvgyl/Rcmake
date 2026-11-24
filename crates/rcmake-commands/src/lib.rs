@@ -14,6 +14,7 @@ mod file_path;
 mod install;
 mod instrumentation;
 mod policy_misc;
+pub use policy_misc::introspection::print_deferred_properties;
 mod process_find;
 mod string_math;
 mod targets;

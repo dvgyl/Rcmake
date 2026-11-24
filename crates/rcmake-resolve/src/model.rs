@@ -500,6 +500,21 @@ pub struct ExportedTarget {
     pub properties: IndexMap<BString, BString>,
     /// Per-configuration `IMPORTED_*` properties.
     pub config_properties: IndexMap<BString, IndexMap<BString, BString>>,
+    /// Source file sets to declare on the imported target.
+    pub source_sets: Vec<ExportedSourceSet>,
+}
+
+/// A source file set for one imported target.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExportedSourceSet {
+    /// Name of the file set.
+    pub name: BString,
+    /// Exported base directories.
+    pub bases: Vec<BString>,
+    /// Exported file paths.
+    pub files: Vec<BString>,
+    /// Interface properties and language.
+    pub properties: IndexMap<BString, BString>,
 }
 
 /// An `install(EXPORT)` or `export()` file plan.
@@ -517,4 +532,6 @@ pub struct ExportPlan {
     pub install: bool,
     /// Targets in order.
     pub targets: Vec<ExportedTarget>,
+    /// Package names and extra arguments in lookup order.
+    pub package_dependencies: IndexMap<BString, Vec<BString>>,
 }

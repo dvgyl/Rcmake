@@ -174,6 +174,32 @@ impl<'a> UsageResolver<'a> {
         Ok(ordered)
     }
 
+    /// Visit all implementation and interface link targets in breadth-first order.
+    pub fn reachable_link_targets(
+        &mut self,
+        target: TargetId,
+        ctx: &EvalContext,
+    ) -> Result<Vec<TargetId>, ResolveError> {
+        let ctx = link_context(target, ctx);
+        let mut seen = HashSet::from([target]);
+        let mut pending = vec![target];
+        let mut i = 0;
+        while let Some(&id) = pending.get(i) {
+            for interface in [false, true] {
+                let (items, _) = self.usage_links(id, interface, &ctx)?;
+                pending.extend(
+                    items
+                        .iter()
+                        .flat_map(|item| item.edge_targets())
+                        .filter(|id| seen.insert(*id)),
+                );
+            }
+            i += 1;
+        }
+        pending.remove(0);
+        Ok(pending)
+    }
+
     pub(crate) fn link_targets(
         &mut self,
         target: TargetId,

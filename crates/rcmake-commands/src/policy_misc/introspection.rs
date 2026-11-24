@@ -9,6 +9,9 @@ use rcmake_regex::{MatchOptions, Regex, Scratch};
 
 use super::{properties, quoted};
 
+mod deferred;
+pub use deferred::print_deferred_properties;
+
 pub(super) fn targets(cx: &mut Cx<'_>, args: &[&[u8]]) -> CmdResult {
     const KEYS: &[&[u8]] = &[b"REGEX", b"IGNORE_CASE", b"IMPORTED_ONLY", b"NO_IMPORTED"];
     let options = Options::parse(cx, args, KEYS, &[b"REGEX"], &[])?;
@@ -267,10 +270,32 @@ pub(super) fn properties(cx: &mut Cx<'_>, args: &[&[u8]]) -> CmdResult {
         }
     }
     let filters = Filters::new(cx, "PROPERTY_", name, value, false)?;
-    if options.has(b"DEFERRED") || options.has(b"FOLLOW_DEPENDENCIES") {
-        return Err(CmdError::status(
-            "generation-time property printing is not supported.",
-        ));
+    let follow = options.has(b"FOLLOW_DEPENDENCIES");
+    if options.has(b"DEFERRED") || follow {
+        let request = rcmake_model::PropertyPrint {
+            dir: cx.current_dir_id(),
+            backtrace: cx.backtrace(),
+            targets: options
+                .list(keyword)
+                .iter()
+                .copied()
+                .map(BString::from)
+                .collect(),
+            names: named.then(|| {
+                options
+                    .list(b"NAMED")
+                    .iter()
+                    .copied()
+                    .map(BString::from)
+                    .collect()
+            }),
+            name_filter: name.map(BString::from),
+            value_filter: value.map(BString::from),
+            follow,
+            legacy,
+        };
+        cx.project().property_prints.push(request);
+        return Ok(Flow::Normal);
     }
 
     let description = filters.description(false);

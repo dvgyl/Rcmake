@@ -1,5 +1,6 @@
 use std::ops::Range;
 
+use rcmake_base::BString;
 use rcmake_eval::{Cx, Flow};
 use rcmake_host::{FileKind, Follow, ReadRange, WriteMode};
 
@@ -32,7 +33,13 @@ impl Layout {
 struct Paths {
     dynamic: Range<usize>,
     stride: usize,
-    entries: Vec<(usize, Range<usize>)>,
+    entries: Vec<PathEntry>,
+}
+
+struct PathEntry {
+    offset: usize,
+    tag: u64,
+    range: Range<usize>,
 }
 
 fn parse(data: &[u8]) -> Option<Paths> {
@@ -97,11 +104,11 @@ fn parse(data: &[u8]) -> Option<Paths> {
             }
             5 => strtab = Some(value),
             10 => strsz = Some(value),
-            RPATH | RUNPATH => {
+            tag @ (RPATH | RUNPATH) => {
                 if offsets.len() == 2 {
                     return None;
                 }
-                offsets.push((start + stride * index, value));
+                offsets.push((start + stride * index, tag, value));
             }
             _ => {}
         }
@@ -126,12 +133,16 @@ fn parse(data: &[u8]) -> Option<Paths> {
     let strings = data.get(str_start..str_end)?;
     let entries = offsets
         .into_iter()
-        .map(|(entry, offset)| {
+        .map(|(entry, tag, offset)| {
             let offset = usize::try_from(offset).ok()?;
             let path = strings.get(offset..)?;
             let len = path.iter().position(|&byte| byte == 0)?;
             let start = str_start + offset;
-            Some((entry, start..start + len))
+            Some(PathEntry {
+                offset: entry,
+                tag,
+                range: start..start + len,
+            })
         })
         .collect::<Option<Vec<_>>>()?;
     Some(Paths {
@@ -165,7 +176,7 @@ fn change(
 ) -> std::result::Result<bool, &'static str> {
     const INVALID: &str = "Invalid ELF runtime path range.";
     let mut edits = Vec::new();
-    for (_, range) in &paths.entries {
+    for PathEntry { range, .. } in &paths.entries {
         let path = data.get(range.clone()).ok_or(INVALID)?;
         let Some(start) = find(path, old) else {
             if find(path, new).is_some() {
@@ -217,7 +228,7 @@ fn remove(data: &mut [u8], paths: &Paths) -> bool {
     let mut skip = paths.entries.iter().peekable();
     let mut write = paths.dynamic.start;
     for read in paths.dynamic.clone().step_by(paths.stride) {
-        if skip.next_if(|(offset, _)| *offset == read).is_none() {
+        if skip.next_if(|entry| entry.offset == read).is_none() {
             data.copy_within(read..read + paths.stride, write);
             write += paths.stride;
         }
@@ -225,12 +236,89 @@ fn remove(data: &mut [u8], paths: &Paths) -> bool {
     if let Some(tail) = data.get_mut(write..paths.dynamic.end) {
         tail.fill(0);
     }
-    for (_, range) in &paths.entries {
+    for PathEntry { range, .. } in &paths.entries {
         if let Some(path) = data.get_mut(range.clone()) {
             path.fill(0);
         }
     }
     true
+}
+
+pub(super) fn read(cx: &mut Cx<'_>, args: &[&[u8]]) -> Result {
+    let [input, options @ ..] = args else {
+        return Err(error(
+            "READ_ELF must be called with at least three additional arguments.",
+        ));
+    };
+    if options.len() < 2 {
+        return Err(error(
+            "READ_ELF must be called with at least three additional arguments.",
+        ));
+    }
+    let mut rpath = None;
+    let mut runpath = None;
+    let mut capture = None;
+    let mut options = options.iter().copied().peekable();
+    while let Some(key) = options.next() {
+        let slot = match key {
+            b"RPATH" => &mut rpath,
+            b"RUNPATH" => &mut runpath,
+            b"CAPTURE_ERROR" => &mut capture,
+            _ => continue,
+        };
+        *slot =
+            options.next_if(|&value| !matches!(value, b"RPATH" | b"RUNPATH" | b"CAPTURE_ERROR"));
+    }
+    let file = cx.resolve_path(input);
+    let host = cx.host();
+    if !host
+        .metadata(&file, Follow::Yes)
+        .is_ok_and(|metadata| metadata.kind == FileKind::File)
+    {
+        return Err(error(
+            [
+                b"READ_ELF given FILE \"".as_slice(),
+                input,
+                b"\" that does not exist.",
+            ]
+            .concat(),
+        ));
+    }
+    let data = host
+        .read(
+            &file,
+            ReadRange::All {
+                limit: cx.limits().max_file_read,
+            },
+        )
+        .ok();
+    if let Some((data, paths)) = data.as_deref().and_then(|data| Some((data, parse(data)?))) {
+        for entry in paths.entries {
+            if let Some(name) = if entry.tag == RPATH { rpath } else { runpath }
+                && !name.is_empty()
+                && let Some(value) = data.get(entry.range)
+            {
+                let value = value
+                    .iter()
+                    .map(|&byte| if byte == b':' { b';' } else { byte })
+                    .collect::<Vec<_>>();
+                cx.set_var(name, BString::from(value));
+            }
+        }
+        return Ok(Flow::Normal);
+    }
+    if let Some(name) = capture.filter(|name| !name.is_empty()) {
+        super::set(cx, name, "not a valid ELF file")
+    } else {
+        Err(error(
+            [
+                b"READ_ELF given FILE:\n  ".as_slice(),
+                input,
+                b"\nthat is not a valid ELF file.",
+            ]
+            .concat(),
+        ))
+    }
 }
 
 pub(super) fn run(cx: &mut Cx<'_>, command: &[u8], args: &[&[u8]]) -> Result {
@@ -313,7 +401,7 @@ pub(super) fn run(cx: &mut Cx<'_>, command: &[u8], args: &[&[u8]]) -> Result {
             .as_ref()
             .filter(|paths| !paths.entries.is_empty())
             .map_or(new.is_empty(), |paths| {
-                paths.entries.iter().any(|(_, range)| {
+                paths.entries.iter().any(|PathEntry { range, .. }| {
                     let Some(path) = data.get(range.clone()) else {
                         return false;
                     };
@@ -346,7 +434,7 @@ pub(super) fn run(cx: &mut Cx<'_>, command: &[u8], args: &[&[u8]]) -> Result {
                 && paths
                     .entries
                     .iter()
-                    .all(|(_, range)| data.get(range.clone()) == Some(old))
+                    .all(|PathEntry { range, .. }| data.get(range.clone()) == Some(old))
             {
                 remove(&mut data, &paths)
             } else {

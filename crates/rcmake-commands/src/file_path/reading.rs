@@ -245,7 +245,6 @@ fn open_error(path: &std::path::Path, err: &HostError) -> rcmake_eval::CmdError 
             err.os_message.as_bytes(),
             b"):\n\n  ",
             &from_native(path),
-            b"\n",
         ]
         .concat(),
     )

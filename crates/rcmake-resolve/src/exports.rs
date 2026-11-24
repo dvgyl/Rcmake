@@ -1,21 +1,55 @@
 use indexmap::{IndexMap, IndexSet, map::Entry};
 use rcmake_base::{BString, list, path_lex::Lexical};
-use rcmake_genex::{EvalContext, GenexNode, PreprocessMode, TargetHandle, render};
+use rcmake_genex::{ConfigId, EvalContext, GenexNode, PreprocessMode, TargetHandle, render};
 use rcmake_model::{
-    DirId, ExportSet, InstallKind, InstallRule, ProjectModel, Target, TargetId, TargetKind,
+    DirId, ExportDependencyMode, ExportSet, InstallKind, InstallRule, ProjectModel, Target,
+    TargetId, TargetKind,
 };
 
 use crate::{
     ExportPlan, ExportedTarget, InstallActionKind, InstallManifest, ResolveError, ResolvedTarget,
-    export_links, sources::absolute_path, usage::UsageResolver,
+    export_links::{self, ExportCatalog, ExportPlacement},
+    sources::absolute_path,
+    usage::UsageResolver,
 };
+
+pub(crate) mod source_sets;
 
 pub(crate) fn resolve_exports(
     model: &ProjectModel,
     usage: &mut UsageResolver<'_>,
     targets: &[ResolvedTarget],
     install: &InstallManifest,
+    configs: &[ConfigId],
 ) -> Result<Vec<ExportPlan>, ResolveError> {
+    let mut install_catalog = ExportCatalog::new();
+    for rule in &model.installs {
+        if model.dir_excluded_from_all(rule.dir) {
+            continue;
+        }
+        let InstallKind::Export {
+            set,
+            namespace,
+            file,
+            ..
+        } = &rule.kind
+        else {
+            continue;
+        };
+        if let Some(members) = model.exports.get(set) {
+            let placement = ExportPlacement {
+                set: set.clone(),
+                namespace: namespace.clone(),
+                file: file.clone().unwrap_or_else(|| export_filename(set)),
+            };
+            for &id in &members.targets {
+                install_catalog
+                    .entry(id)
+                    .or_default()
+                    .push(placement.clone());
+            }
+        }
+    }
     let mut plans = Vec::new();
     for rule in &model.installs {
         if model.dir_excluded_from_all(rule.dir) {
@@ -52,6 +86,7 @@ pub(crate) fn resolve_exports(
             install: true,
             ..ExportPlan::default()
         };
+        let mut packages = IndexSet::new();
         for &id in &members.targets {
             let mut target = export_target(
                 model,
@@ -70,20 +105,77 @@ pub(crate) fn resolve_exports(
             if let Some(rules) = include_rules.get(&id) {
                 add_include_destinations(usage, id, rules, &mut target)?;
             }
-            export_links::qualify(
+            packages.extend(export_links::qualify(
                 model,
                 id,
                 &members.targets,
                 &plan.namespace,
                 PreprocessMode::Install,
+                &install_catalog,
                 &mut target,
-            )?;
+            )?);
+            target.source_sets =
+                source_sets::export(model, usage, configs, id, Some(&members.install_rules))?;
             plan.targets.push(target);
+        }
+        if rule.options.export_package_dependencies {
+            plan.package_dependencies = package_dependencies(model, &plan.set, packages);
         }
         plans.push(plan);
     }
 
-    let mut build_plans = IndexMap::<BString, (ExportPlan, IndexSet<TargetId>)>::new();
+    let build_plans = build_exports(model)?;
+    let mut build_catalog = ExportCatalog::new();
+    for (plan, members, _) in build_plans.values() {
+        let placement = ExportPlacement {
+            set: plan.set.clone(),
+            namespace: plan.namespace.clone(),
+            file: plan.file.clone(),
+        };
+        for &id in members {
+            build_catalog.entry(id).or_default().push(placement.clone());
+        }
+    }
+    for (mut plan, members, export_packages) in build_plans.into_values() {
+        let mut packages = IndexSet::new();
+        let members: Vec<_> = members.into_iter().collect();
+        for &id in &members {
+            let mut target = export_target(
+                model,
+                id,
+                targets.iter().filter(|target| target.id == id),
+                None,
+            )?;
+            if !plan
+                .targets
+                .iter()
+                .any(|existing| existing.name == target.name)
+            {
+                packages.extend(export_links::qualify(
+                    model,
+                    id,
+                    &members,
+                    &plan.namespace,
+                    PreprocessMode::Build,
+                    &build_catalog,
+                    &mut target,
+                )?);
+                target.source_sets = source_sets::export(model, usage, configs, id, None)?;
+                plan.targets.push(target);
+            }
+        }
+        if export_packages {
+            plan.package_dependencies = package_dependencies(model, &plan.set, packages);
+        }
+        plans.push(plan);
+    }
+    Ok(plans)
+}
+
+type BuildExports = IndexMap<BString, (ExportPlan, IndexSet<TargetId>, bool)>;
+
+fn build_exports(model: &ProjectModel) -> Result<BuildExports, ResolveError> {
+    let mut build_plans = BuildExports::new();
     let props = &model.global.props;
     let count = props
         .get(b"_RCMAKE_BUILD_EXPORT_COUNT")
@@ -138,6 +230,8 @@ pub(crate) fn resolve_exports(
         };
         let mut namespace = BString::default();
         let mut file = export_filename(&set);
+        let mut export_packages = false;
+        let mut append = false;
         let mut cxx_modules_directory = None;
         while let Some((key, rest)) = options.split_first() {
             options = rest;
@@ -153,53 +247,61 @@ pub(crate) fn resolve_exports(
                     }
                     options = rest;
                 }
-                b"APPEND" | b"EXPORT_LINK_INTERFACE_LIBRARIES" => {}
+                b"EXPORT_PACKAGE_DEPENDENCIES" => export_packages = true,
+                b"APPEND" => append = true,
+                b"EXPORT_LINK_INTERFACE_LIBRARIES" => {}
                 _ => return Err(invalid_export_record()),
             }
         }
         let file = absolute_path(&directory.binary_dir, &file);
-        let (_, members) = build_plans.entry(file.clone()).or_insert_with(|| {
-            (
-                ExportPlan {
-                    set,
-                    namespace,
-                    file,
-                    cxx_modules_directory,
-                    ..ExportPlan::default()
-                },
-                IndexSet::new(),
-            )
-        });
-        members.extend(ids);
+        if append && let Some((_, members, _)) = build_plans.get_mut(&file) {
+            members.extend(ids);
+        } else {
+            build_plans.insert(
+                file.clone(),
+                (
+                    ExportPlan {
+                        set,
+                        namespace,
+                        file,
+                        cxx_modules_directory,
+                        ..ExportPlan::default()
+                    },
+                    ids.into_iter().collect(),
+                    export_packages,
+                ),
+            );
+        }
     }
-    for (mut plan, members) in build_plans.into_values() {
-        let members: Vec<_> = members.into_iter().collect();
-        for &id in &members {
-            let mut target = export_target(
-                model,
-                id,
-                targets.iter().filter(|target| target.id == id),
-                None,
-            )?;
-            if !plan
-                .targets
-                .iter()
-                .any(|existing| existing.name == target.name)
-            {
-                export_links::qualify(
-                    model,
-                    id,
-                    &members,
-                    &plan.namespace,
-                    PreprocessMode::Build,
-                    &mut target,
-                )?;
-                plan.targets.push(target);
+    Ok(build_plans)
+}
+
+fn package_dependencies(
+    model: &ProjectModel,
+    set: &[u8],
+    mut inferred: IndexSet<BString>,
+) -> IndexMap<BString, Vec<BString>> {
+    let mut dependencies = IndexMap::new();
+    if let Some(configured) = model.export_dependencies.get(set) {
+        for (name, setup) in configured {
+            let used = inferred.shift_remove(name);
+            let enabled = match setup.mode {
+                ExportDependencyMode::On => true,
+                ExportDependencyMode::Off => false,
+                ExportDependencyMode::Auto => used,
+            };
+            if enabled {
+                dependencies.insert(name.clone(), setup.args.clone());
             }
         }
-        plans.push(plan);
     }
-    Ok(plans)
+    for name in &model.package_lookups {
+        if inferred.shift_remove(name) {
+            dependencies.insert(name.clone(), Vec::new());
+        }
+    }
+    dependencies.extend(inferred.into_iter().map(|name| (name, Vec::new())));
+    dependencies
 }
 
 fn add_include_destinations(

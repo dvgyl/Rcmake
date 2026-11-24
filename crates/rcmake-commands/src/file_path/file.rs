@@ -6,7 +6,7 @@ use rcmake_host::path::{from_native, to_native};
 
 use super::{
     Result, archive, configure, elf_rpath, error, generate, glob, install_cmd, lock, macho,
-    mutation, reading, set, unknown, warning,
+    mutation, reading, set, unknown, upload, warning,
 };
 use rcmake_base::path_lex::{Lexical, native_list, native_style};
 
@@ -23,8 +23,10 @@ pub(super) fn run(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
         | b"REMOVE_RECURSE" | b"RENAME" | b"COPY_FILE" | b"CREATE_LINK" | b"CHMOD"
         | b"CHMOD_RECURSE" | b"COPY" => mutation::run(cx, command, rest),
         b"GLOB" | b"GLOB_RECURSE" => glob::run(cx, *command == b"GLOB_RECURSE", rest),
+        b"READ_ELF" => elf_rpath::read(cx, rest),
         b"READ_MACHO" => macho::run(cx, rest),
         b"INSTALL" => install_cmd::run(cx, rest),
+        b"UPLOAD" => upload::run(cx, rest),
         b"RPATH_CHECK" | b"RPATH_CHANGE" | b"RPATH_REMOVE" | b"CHRPATH" => {
             elf_rpath::run(cx, command, rest)
         }

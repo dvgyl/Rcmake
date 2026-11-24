@@ -16,6 +16,7 @@
 mod cxx_modules;
 mod export_links;
 mod exports;
+pub mod file_sets;
 mod install_manifest;
 mod model;
 mod pipeline;

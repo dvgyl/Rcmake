@@ -50,9 +50,15 @@ pub(super) fn enabled(cx: &mut Cx<'_>, args: &[&[u8]]) -> CmdResult {
             "sub-command GET_EXPERIMENTAL_FEATURE_ENABLED expects exactly two arguments",
         ));
     };
+    let enabled = feature_enabled(cx, name)?;
+    cx.set_var(out, if enabled { "TRUE" } else { "FALSE" }.into());
+    Ok(Flow::Normal)
+}
+
+pub(crate) fn feature_enabled(cx: &mut Cx<'_>, name: &[u8]) -> Result<bool, CmdError> {
     let feature = FEATURES
         .iter()
-        .find(|feature| feature.name == *name)
+        .find(|feature| feature.name == name)
         .ok_or_else(|| {
             CmdError::status(quoted(
                 "Experimental feature name \"",
@@ -87,6 +93,5 @@ pub(super) fn enabled(cx: &mut Cx<'_>, args: &[&[u8]]) -> CmdResult {
             );
         }
     }
-    cx.set_var(out, if enabled { "TRUE" } else { "FALSE" }.into());
-    Ok(Flow::Normal)
+    Ok(enabled)
 }

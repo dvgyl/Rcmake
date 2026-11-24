@@ -2,15 +2,16 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use indexmap::IndexMap;
+use indexmap::{IndexMap, IndexSet};
 use rcmake_base::{BString, list};
 use rcmake_diag::Backtrace;
 
 use crate::{
     AppendMode, BT, BuildExport, Cache, CacheEntry, CacheType, CommandId, CustomCommand, DirId,
-    Directory, ExportSet, FileSet, FileSetId, GeneratorKind, GeneratorSpec, GlobalState,
-    ImportedVisibility, InstallRule, LinkItem, PropOrigin, PropScope, PropertyMap, Target,
-    TargetBinding, TargetId, TargetOrigin, TestEntry, TestId, UsageField, UsageProps,
+    Directory, ExportDependencySetup, ExportSet, FileSet, FileSetId, GeneratorKind, GeneratorSpec,
+    GlobCheck, GlobKey, GlobalState, ImportedVisibility, InstallRule, LinkItem, PropOrigin,
+    PropScope, PropertyMap, PropertyPrint, Target, TargetBinding, TargetId, TargetOrigin,
+    TestEntry, TestId, UsageField, UsageProps,
 };
 
 /// Error of a [`ProjectModel`] operation.
@@ -59,6 +60,15 @@ pub struct ProjectModel {
     pub exports: IndexMap<BString, ExportSet>,
     /// `export()` calls that write build-tree files, in call order.
     pub build_exports: Vec<BuildExport>,
+    /// Package setup options by export set and package name, in call order.
+    pub export_dependencies: IndexMap<BString, IndexMap<BString, ExportDependencySetup>>,
+    /// Package names in the order in which lookups began.
+    pub package_lookups: IndexSet<BString>,
+    /// Rules that ask the build tool to verify glob results.
+    pub glob_checks: IndexMap<GlobKey, GlobCheck>,
+    /// Property print requests in call order.
+    pub property_prints: Vec<PropertyPrint>,
+    globally_generated: BTreeSet<BString>,
     root: Directory,
     subdirs: Vec<Directory>,
     targets: Vec<Target>,
@@ -87,6 +97,24 @@ impl ProjectModel {
             .vars
             .get(name)
             .or_else(|| self.cache.get(name).map(|e| &e.value))
+    }
+
+    /// Mark an absolute file path as generated in this directory and the project.
+    pub fn mark_generated(&mut self, dir: DirId, path: BString) {
+        self.globally_generated.insert(path.clone());
+        let directory = self.dir_mut(dir);
+        directory.generated_sources.insert(path.clone());
+        directory
+            .source_props
+            .entry(path)
+            .or_default()
+            .set("GENERATED".into(), "1".into());
+    }
+
+    /// Check whether any directory marked this absolute file path as generated.
+    #[must_use]
+    pub fn is_globally_generated(&self, path: &[u8]) -> bool {
+        self.globally_generated.contains(path)
     }
 
     /// Directory `id`. An id from a different model resolves to the root directory.
@@ -165,11 +193,13 @@ impl ProjectModel {
             b"INCLUDE_REGULAR_EXPRESSION",
             b"LABELS",
             b"LINK_LIBRARIES",
+            b"SYSTEM",
             b"_RCMAKE_INCLUDE_REGEX_COMPLAIN",
         ];
         let parent_dir = self.dir(parent);
         let mut dir = Directory {
             parent: Some(parent),
+            install_position: self.installs.len(),
             source_dir,
             binary_dir,
             backtrace,
@@ -435,6 +465,11 @@ impl ProjectModel {
             }
             PropScope::Directory(id) => {
                 let dir = self.dir_mut(*id);
+                if name == b"EXCLUDE_FROM_ALL" {
+                    dir.exclude_from_all = value
+                        .as_ref()
+                        .is_some_and(|value| rcmake_base::truth::is_on(value));
+                }
                 match UsageField::from_name(name).filter(|f| f.on_directory()) {
                     Some(field) => set_usage(&mut dir.usage, field, value, origin.backtrace),
                     None => set_map(&mut dir.props, name, value),

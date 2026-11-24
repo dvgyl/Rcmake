@@ -3,8 +3,8 @@ use std::sync::Arc;
 
 use rcmake_base::{BString, Limits, fold_command_name};
 use rcmake_diag::{
-    Backtrace, DiagCategory, DiagEngine, DiagState, Effect, MessageKind, PolicyError, PolicyId,
-    PolicyMap, PolicyStatus,
+    Backtrace, DiagCategory, DiagEngine, DiagState, Effect, FrameKind, Location, MessageKind,
+    PolicyError, PolicyId, PolicyMap, PolicyStatus,
 };
 use rcmake_expr::{CondError, ExpandError, ExpandedArg};
 use rcmake_host::Host;
@@ -412,6 +412,62 @@ impl Cx<'_> {
         self.interp.issue_here(kind, effect, category, body, true);
     }
 
+    /// Issue a diagnostic with the caller stack of the current directory.
+    pub fn issue_in_directory(
+        &mut self,
+        kind: MessageKind,
+        effect: Effect,
+        category: Option<DiagCategory>,
+        body: BString,
+    ) {
+        let source = self.interp.current_source_dir();
+        let root_file = rcmake_host::path::from_native(&source.join("CMakeLists.txt"));
+        let frames: Vec<_> = self
+            .interp
+            .bt
+            .frames()
+            .take_while(|frame| {
+                frame.kind != FrameKind::ModuleInclude
+                    || frame.file.as_ref() != root_file.as_slice()
+            })
+            .collect();
+        let trace = frames
+            .into_iter()
+            .rev()
+            .fold(Backtrace::default(), |trace, frame| {
+                trace.push(frame.clone())
+            });
+        self.interp.issue_at(
+            kind,
+            effect,
+            category,
+            None,
+            Location::Backtrace(trace),
+            body,
+            true,
+        );
+    }
+
+    /// Report an error associated with a directory's main listfile.
+    pub fn issue_directory_error(&mut self, dir: DirId, body: BString) {
+        let source = &self.interp.project.dir(dir).source_dir;
+        let file = rcmake_host::path::from_native(
+            &rcmake_host::path::to_native(source).join("CMakeLists.txt"),
+        );
+        self.interp.issue_at(
+            MessageKind::Error,
+            Effect::SetError,
+            None,
+            None,
+            Location::FileLine {
+                file: file.as_slice().into(),
+                line: 0,
+            },
+            body,
+            true,
+        );
+    }
+
     /// Issue the standard `Policy CMPnnnn is not set: ...` warning (`CMD_POLICY`),
     /// with optional text before and after it.
     pub fn issue_policy_warning(&mut self, id: PolicyId, preface: &[u8], postface: &[u8]) {
@@ -495,6 +551,42 @@ impl Cx<'_> {
     /// not be read, unless `options.optional` is set.
     pub fn include_file(&mut self, path: &Path, options: IncludeOptions) -> CmdResult {
         self.interp.include_file(path, options)
+    }
+
+    /// Run a callback in a temporary normal variable scope.
+    pub fn with_variable_scope<T>(&mut self, run: impl FnOnce(&mut Self) -> T) -> T {
+        self.interp.vars.push();
+        let result = run(self);
+        self.interp.vars.pop();
+        result
+    }
+
+    /// Read one package module or configuration file with its own unwind scope.
+    pub fn include_package_file(&mut self, path: &Path, options: IncludeOptions) -> CmdResult {
+        let saved = core::mem::take(&mut self.interp.unwinding_package);
+        self.interp.package_file_depth += 1;
+        let result = self.include_file(path, options);
+        self.interp.package_file_depth -= 1;
+        self.interp.unwinding_package = saved;
+        result
+    }
+
+    /// Validate the lookup context for `find_package()`.
+    pub fn check_package_find(&self, unwind: bool) -> Result<(), CmdError> {
+        if self.interp.unwinding_package {
+            return Err(CmdError::status("called while already in an UNWIND state"));
+        }
+        if unwind && self.interp.package_file_depth == 0 {
+            return Err(CmdError::status(
+                "called with UNWIND_INCLUDE in an invalid context",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Start returning at include boundaries after a failed dependency lookup.
+    pub fn unwind_package(&mut self) {
+        self.interp.unwinding_package = self.interp.package_file_depth != 0;
     }
 
     /// Parse and execute virtual CMake code (`cmake_language(EVAL CODE ...)`).

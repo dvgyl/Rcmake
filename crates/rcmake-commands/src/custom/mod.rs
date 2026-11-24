@@ -8,8 +8,8 @@ use rcmake_eval::{CmdError, CmdFlags, CmdResult, Cx, Flow, Registry};
 use rcmake_expr::ExpandedArg;
 use rcmake_host::path::from_native;
 use rcmake_model::{
-    BT, CustomCommand, CustomCommandKind, ModelError, PropOrigin, PropScope, Target, TargetBinding,
-    TargetEvent, TargetKind, TargetOrigin,
+    BT, CustomCommand, CustomCommandKind, ModelError, Target, TargetBinding, TargetEvent,
+    TargetKind, TargetOrigin,
 };
 
 mod rule;
@@ -547,7 +547,6 @@ pub(crate) fn record(
     body: CustomCommand,
 ) -> Result<rcmake_model::CommandId, CmdError> {
     let dir = body.dir;
-    let backtrace = body.backtrace.clone();
     let generated: Vec<_> = body
         .outputs
         .iter()
@@ -558,17 +557,7 @@ pub(crate) fn record(
     let id = project.add_command(body).map_err(model_error)?;
     for path in generated {
         if !path.windows(2).any(|pair| pair == b"$<") {
-            project
-                .set_prop(
-                    &PropScope::Source { dir, path },
-                    b"GENERATED",
-                    Some("1".into()),
-                    PropOrigin {
-                        dir,
-                        backtrace: &backtrace,
-                    },
-                )
-                .map_err(model_error)?;
+            project.mark_generated(dir, path);
         }
     }
     Ok(id)

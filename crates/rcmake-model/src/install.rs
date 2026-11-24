@@ -24,6 +24,12 @@ pub struct InstallOptions {
     pub rename: Option<BString>,
     /// `INCLUDES DESTINATION` paths from `install(TARGETS ... INCLUDES DESTINATION ...)`.
     pub includes_destination: Vec<BString>,
+    /// Targets and files requested by `BUILD_DEPENDS`.
+    pub build_depends: Vec<BString>,
+    /// Run this script or code for every install component.
+    pub all_components: bool,
+    /// Generate package dependency lookups with this export.
+    pub export_package_dependencies: bool,
 }
 
 /// The `install()` signature of a rule.

@@ -4,6 +4,7 @@
 
 mod build;
 mod graph;
+mod instrumented;
 mod modules;
 mod multi;
 mod prep;
@@ -59,6 +60,11 @@ rule STATIC_ARCHIVE
 rule CUSTOM_COMMAND
   command = $COMMAND
   description = $DESC
+  restat = 1
+
+rule VERIFY_GLOBS
+  command = $COMMAND
+  description = Re-checking globbed directories...
   restat = 1
 
 rule RERUN_CMAKE
@@ -119,7 +125,7 @@ fn generate_single(
     graph.resolve_custom_inputs(model, host);
     graph.connect_custom_dependencies(model);
     graph.set_compile_metadata(result);
-    let prep = PrepTargets::new(&graph, result, model)?;
+    let prep = PrepTargets::new(&graph, result, model, host)?;
     let programs = Programs::new(result, host, build_dir, model);
     let uses_modules = modules::uses_modules(input);
     let module_flag = if uses_modules {
@@ -128,6 +134,7 @@ fn generate_single(
         BString::default()
     };
     prepare_directory(host, build_dir)?;
+    let verify_globs = rcmake_gen_common::glob::write_verification(model, build_dir, host)?;
     let exports = model
         .map(|model| write_module_exports(result, model, host, build_dir, false))
         .transpose()?
@@ -152,6 +159,7 @@ fn generate_single(
         &manifests,
         result,
         &configure_command(result, build_dir, &programs.cmake, true),
+        verify_globs.then_some(programs.cmake.as_slice()),
     );
     emit_utilities(
         &mut ninja,
@@ -232,7 +240,7 @@ fn generate_multi(
         graph.add_aliases(&artifacts, model);
         graph.resolve_custom_inputs(model, host);
         graph.set_compile_metadata(result);
-        let prep = PrepTargets::new(&graph, result, model)?;
+        let prep = PrepTargets::new(&graph, result, model, host)?;
         configs.push((graph, ConfigFiles::new(name, prep)));
     }
 
@@ -268,6 +276,7 @@ fn generate_multi(
         BString::default()
     };
     prepare_directory(host, build_dir)?;
+    let verify_globs = rcmake_gen_common::glob::write_verification(model, build_dir, host)?;
     let exports = model
         .map(|model| write_module_exports(result, model, host, build_dir, true))
         .transpose()?
@@ -319,7 +328,14 @@ fn generate_multi(
         if !cross.is_empty() {
             graph.emit_aliases(&mut ninja, Some(b"all"), &cross, &emitted);
         }
-        emit_regeneration(&mut ninja, graph, &manifests, result, &regenerate);
+        emit_regeneration(
+            &mut ninja,
+            graph,
+            &manifests,
+            result,
+            &regenerate,
+            verify_globs.then_some(programs.cmake.as_slice()),
+        );
         write_if_changed(
             host,
             &build_dir.join(path::to_native(&files.implementation)),
@@ -433,6 +449,7 @@ fn write_rules(
     } else {
         Ninja(RULES.as_bytes().to_vec())
     };
+    instrumented::emit_rules(&mut ninja, result);
     let mut pools = BTreeMap::new();
     if let Some(specs) = configuration_setting(host, build_dir, b"CMAKE_JOB_POOLS") {
         for spec in specs.split(|&byte| byte == b';') {
@@ -484,15 +501,36 @@ fn emit_regeneration(
     outputs: &[BString],
     result: &GenerationResult,
     regenerate: &[u8],
+    verify: Option<&[u8]>,
 ) {
     let mut seen = HashSet::new();
-    let listfiles: Vec<_> = result
+    let mut listfiles: Vec<_> = result
         .metadata
         .listfiles
         .iter()
         .map(|file| graph.node(file))
         .filter(|file| !outputs.contains(file) && seen.insert(file.clone()))
         .collect();
+
+    if let Some(cmake) = verify {
+        let script: BString = rcmake_gen_common::glob::SCRIPT.into();
+        let stamp: BString = rcmake_gen_common::glob::STAMP.into();
+        let force: BString = "CMakeFiles/VerifyGlobs.force".into();
+        ninja.phony(&force, &[]);
+        ninja.edge(
+            b"VERIFY_GLOBS",
+            Edge {
+                outputs: std::slice::from_ref(&stamp),
+                implicit_inputs: &[script.clone(), force],
+                ..Edge::default()
+            },
+        );
+        let mut command = cmake.to_vec();
+        command.extend_from_slice(b" -P ");
+        shell_word(&script, &mut command);
+        ninja.binding(b"COMMAND", &command);
+        listfiles.push(stamp);
+    }
 
     ninja.edge(
         b"RERUN_CMAKE",
@@ -506,7 +544,7 @@ fn emit_regeneration(
 
     for listfile in &listfiles {
         // Missing listfiles must trigger regeneration so CMake can check them.
-        if !graph.has_target(listfile) {
+        if listfile != rcmake_gen_common::glob::STAMP.as_bytes() && !graph.has_target(listfile) {
             ninja.phony(listfile, &[]);
         }
     }

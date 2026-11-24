@@ -19,6 +19,7 @@ pub(in crate::process_find) struct Request {
     pub(in crate::process_find) global: bool,
     no_policy_scope: bool,
     pub(super) bypass_provider: bool,
+    pub(super) unwind_include: bool,
     pub(super) registry_view: Option<BString>,
     pub(in crate::process_find) components: Vec<(BString, bool)>,
     pub(super) config_options: Vec<BString>,
@@ -57,6 +58,7 @@ impl Request {
                 b"GLOBAL" => request.global = true,
                 b"NO_POLICY_SCOPE" => request.no_policy_scope = true,
                 b"BYPASS_PROVIDER" => request.bypass_provider = true,
+                b"UNWIND_INCLUDE" => request.unwind_include = true,
                 b"REQUIRED" | b"OPTIONAL" => {
                     request.required |= key == b"REQUIRED";
                     request.optional |= key == b"OPTIONAL";

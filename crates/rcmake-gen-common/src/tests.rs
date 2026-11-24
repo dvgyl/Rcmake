@@ -110,6 +110,8 @@ fn compile_database_preserves_order_and_round_trips_paths_and_commands() {
 
 fn action(destination: BString, kind: InstallActionKind) -> InstallAction {
     InstallAction {
+        all_components: false,
+        exclude_from_all: false,
         component: "Data".into(),
         destination,
         configurations: vec!["Debug".into(), "Rel.With+Info".into()],
@@ -202,7 +204,7 @@ two]])"#
         r#"set(CMAKE_INSTALL_SO_NO_EXE "TRUE")"#,
         r#"set(CMAKE_CROSSCOMPILING "TRUE")"#,
         r#"if(CMAKE_INSTALL_COMPONENT STREQUAL "Data" OR NOT CMAKE_INSTALL_COMPONENT)"#,
-        r#"if(CMAKE_INSTALL_CONFIG_NAME MATCHES "^([Dd][Ee][Bb][Uu][Gg]|[Rr][Ee][Ll]\\.[Ww][Ii][Tt][Hh]\\+[Ii][Nn][Ff][Oo])\$")"#,
+        r#"if(CMAKE_INSTALL_CONFIG_NAME MATCHES "^([Dd][Ee][Bb][Uu][Gg]|[Rr][Ee][Ll]\\.[Ww][Ii][Tt][Hh]\\+[Ii][Nn][Ff][Oo])$")"#,
         r#"file(INSTALL DESTINATION "${CMAKE_INSTALL_PREFIX}/share/data" TYPE "FILE" OPTIONAL RENAME "renamed.txt" PERMISSIONS "OWNER_READ" FILES "/src/a \${literal}.txt")"#,
         r#"file(INSTALL DESTINATION "/absolute" TYPE "DIRECTORY" FILES "/src/assets/" "FILES_MATCHING" REGEX "/[^/]*\\.txt\$" "EXCLUDE")"#,
         r#"include("/src/setup.cmake")"#,
