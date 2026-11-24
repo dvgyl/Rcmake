@@ -392,6 +392,7 @@ impl Host for PureHost {
             machine: BString::from("arm64"),
             hostname: BString::from("purehost"),
             cpu_count: 4,
+            total_memory: 0,
             pid: 1000,
         }
     }

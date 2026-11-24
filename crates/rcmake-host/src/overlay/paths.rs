@@ -117,6 +117,10 @@ impl OverlayPathPolicy {
         }
     }
 
+    pub(super) fn require_absolute(self, p: &Path) -> HostResult<()> {
+        self.with_absolute(p, |_| Ok(()))
+    }
+
     pub(super) fn with_absolute<T>(
         self,
         p: &Path,

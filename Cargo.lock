@@ -922,6 +922,7 @@ dependencies = [
  "rcmake-base",
  "rcmake-cxxmodules",
  "rcmake-diag",
+ "rcmake-fortran",
  "rcmake-host",
  "rcmake-json",
 ]

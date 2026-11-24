@@ -75,9 +75,21 @@ pub fn executable_on_absolute_path(host: &dyn crate::Host, name: &str) -> Option
     ) {
         return None;
     }
-    let name = format!("{name}{}", std::env::consts::EXE_SUFFIX);
-    let value = to_native(&host.env_get(b"PATH")?);
-    std::env::split_paths(&value)
+    #[cfg(any(unix, windows))]
+    const EXE_SUFFIX: &str = std::env::consts::EXE_SUFFIX;
+    #[cfg(not(any(unix, windows)))]
+    const EXE_SUFFIX: &str = "";
+
+    let name = format!("{name}{EXE_SUFFIX}");
+    let value = host.env_get(b"PATH")?;
+    #[cfg(any(unix, windows))]
+    let native_value = to_native(&value);
+    #[cfg(any(unix, windows))]
+    let directories = std::env::split_paths(&native_value);
+    #[cfg(not(any(unix, windows)))]
+    let directories = value.split(|&byte| byte == b':').map(to_native);
+
+    directories
         .filter(|dir| dir.is_absolute())
         .map(|dir| dir.join(&name))
         .find(|file| {

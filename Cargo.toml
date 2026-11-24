@@ -51,7 +51,7 @@ bstr = { version = "1.12", default-features = false, features = ["std", "alloc"]
 bzip2 = "0.6"
 flate2 = "1"
 indexmap = "2"
-jiff = { version = "0.2", default-features = false, features = ["std", "tz-system", "tzdb-zoneinfo", "tzdb-bundle-platform"] }
+jiff = { version = "0.2", default-features = false, features = ["std"] }
 liblzma = { version = "0.4", default-features = false, features = ["static"] }
 md-5 = "0.10"
 memchr = "2"

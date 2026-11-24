@@ -1,5 +1,6 @@
-//! Deterministic OS abstraction (`Host` trait) with [`NativeHost`] and [`PureHost`]
-//! implementations plus a shared [`conformance`] suite (ADR-004).
+//! The [`Host`] trait provides a common interface for system operations.
+//! [`PureHost`] works in memory. `NativeHost` uses the operating system on Unix and Windows.
+//! Both use the shared [`conformance`] suite.
 //!
 //! All engine crates interact with the filesystem, environment, child processes, stdio,
 //! clock, and system identity exclusively through [`Host`] (mechanically enforced via
@@ -10,7 +11,11 @@
 mod cmake_root;
 pub mod conformance;
 pub mod error;
+pub mod memo;
+#[cfg(any(unix, windows))]
 pub mod native;
+pub mod no_process;
+pub mod overlay;
 pub mod path;
 pub mod pure;
 
@@ -22,7 +27,11 @@ use rcmake_base::BString;
 
 pub use cmake_root::discover_cmake_root;
 pub use error::{HostError, HostResult};
+pub use memo::{MemoHost, MemoStats};
+#[cfg(any(unix, windows))]
 pub use native::NativeHost;
+pub use no_process::{DeniedCommand, DeniedLog, DeniedMethod, NoProcessHost};
+pub use overlay::{OverlayAudit, OverlayHost, OverlayPathPolicy, OverlayPathStyle};
 pub use pure::PureHost;
 
 /// Whether a metadata query follows symbolic links (`stat` vs `lstat`).
@@ -258,6 +267,8 @@ pub struct SystemInfo {
     pub hostname: BString,
     /// Logical CPU count.
     pub cpu_count: u32,
+    /// Total physical memory in bytes. Zero means unknown.
+    pub total_memory: u64,
     /// Current process ID.
     pub pid: u32,
 }

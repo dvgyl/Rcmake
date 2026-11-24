@@ -630,6 +630,8 @@ impl<H: Host + ?Sized> Host for OverlayHost<H> {
 
     fn copy_file(&self, from: &Path, to: &Path, opts: CopyOptions) -> HostResult<()> {
         let mut state = self.write_state()?;
+        state.policy.require_absolute(from)?;
+        state.policy.require_absolute(to)?;
         let source = state.existing(from, Follow::Yes)?;
         let source = source.existing(from)?;
         if source.stat.kind != FileKind::File {
@@ -687,6 +689,8 @@ impl<H: Host + ?Sized> Host for OverlayHost<H> {
 
     fn hard_link(&self, src: &Path, dst: &Path) -> HostResult<()> {
         let mut state = self.write_state()?;
+        state.policy.require_absolute(src)?;
+        state.policy.require_absolute(dst)?;
         let source = state.existing(src, Follow::No)?;
         let dest = state.destination(dst, Follow::No)?;
         if dest.entry.node.is_some() {

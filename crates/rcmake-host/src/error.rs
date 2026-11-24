@@ -119,7 +119,7 @@ impl SyntheticError {
             };
             from_errno(errno, path)
         }
-        #[cfg(windows)]
+        #[cfg(not(unix))]
         {
             let (kind, message) = match self {
                 Self::NotFound => (ErrorKind::NotFound, "No such file or directory"),

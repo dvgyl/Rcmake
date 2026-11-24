@@ -16,6 +16,9 @@ thiserror.workspace = true
 [lints]
 workspace = true
 
+[target.'cfg(any(unix, windows))'.dependencies]
+jiff = { workspace = true, features = ["tz-system", "tzdb-zoneinfo", "tzdb-bundle-platform"] }
+
 [target.'cfg(unix)'.dependencies]
 rustix.workspace = true
 

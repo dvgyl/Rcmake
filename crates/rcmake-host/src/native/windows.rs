@@ -237,6 +237,7 @@ pub(super) fn system() -> SystemInfo {
             &get_computer_name(ComputerNameKind::DnsHostname).unwrap_or_default(),
         )),
         cpu_count: 0,
+        total_memory: 0,
         pid: 0,
     }
 }

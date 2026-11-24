@@ -111,6 +111,7 @@ pub(super) fn system() -> SystemInfo {
         machine: BString::from(u.machine().to_bytes()),
         hostname: BString::from(u.nodename().to_bytes()),
         cpu_count: 0,
+        total_memory: 0,
         pid: 0,
     }
 }
