@@ -250,6 +250,7 @@ pub trait GenexHost {
     fn imported_config_matches(
         &self,
         _target: TargetHandle,
+        _head: Option<TargetHandle>,
         _consumer: &ConfigId,
     ) -> Option<Vec<BString>> {
         None

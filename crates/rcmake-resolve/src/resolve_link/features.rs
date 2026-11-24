@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use rcmake_base::{BString, list, truth};
+use rcmake_base::{BString, list, shell::quote, truth};
 use rcmake_model::{ProjectModel, Target};
 
 use super::{LinkFragment, LinkFragmentRole, ResolvedLinkItem, ResolvedLinkKind, link_fragment};
@@ -84,10 +84,30 @@ impl<'a, 'host> Features<'a, 'host> {
                     let value = &fragment.text.value;
                     let use_path =
                         value.contains(&b'/') || matches!(item.kind, ResolvedLinkKind::Library(_));
-                    let template =
-                        alternative(template, if use_path { b"PATH{" } else { b"NAME{" });
-                    fragment.text.value = lower::expand_rule(template, |key| match key {
-                        b"LINK_ITEM" | b"LIBRARY" | b"LIB_ITEM" => Some(value.clone()),
+                    let raw = item.text.value.as_slice();
+                    if !use_path
+                        && (raw.starts_with(b"-")
+                            || raw.starts_with(b"$")
+                            || raw.starts_with(b"`")
+                            || raw.starts_with(b"LINKER:"))
+                    {
+                        continue;
+                    }
+                    let template = alternative(template, use_path);
+                    let definition = |key: &[u8]| {
+                        lower::definition(self.model, self.target.dir, key)
+                            .map_or(b"".as_slice(), |v| v.as_slice())
+                    };
+                    let suffix = definition(b"CMAKE_LINK_LIBRARY_SUFFIX");
+                    let name = [library_name(raw, &definition), suffix].concat();
+                    let flag =
+                        lower::definition(self.model, self.target.dir, b"CMAKE_LINK_LIBRARY_FLAG")
+                            .map_or(b"-l".as_slice(), |v| v.as_slice());
+                    fragment.text.value = lower::expand_rule(&template, |key| match key {
+                        b"LINK_ITEM" | b"LIBRARY" | b"LIB_ITEM" if use_path => Some(value.clone()),
+                        b"LINK_ITEM" => Some(quote(&[flag, &name].concat())),
+                        b"LIBRARY" => Some(quote(&name)),
+                        b"LIB_ITEM" => Some(quote(raw)),
                         _ => None,
                     });
                 }
@@ -108,8 +128,7 @@ impl<'a, 'host> Features<'a, 'host> {
         let specific = format!("CMAKE_{}_{operator}_USING_{feature}", self.language);
         let generic = format!("CMAKE_{operator}_USING_{feature}");
         let find = |key: &str| lower::definition(self.model, self.target.dir, key.as_bytes());
-        let supports =
-            |key: &str| find(&format!("{key}_SUPPORTED")).is_some_and(|value| truth::is_on(value));
+        let supports = |key: &str| find(&format!("{key}_SUPPORTED"));
         let target = &self.target.name;
         let language = self.language;
         let describe = |reason| {
@@ -117,10 +136,14 @@ impl<'a, 'host> Features<'a, 'host> {
                 "Feature '{feature}', specified through generator-expression '$<{operator}>' to link target '{target}', is not {reason} for the '{language}' link language."
             ))
         };
-        let variable = [specific, generic]
-            .into_iter()
-            .find(|name| supports(name))
-            .ok_or_else(|| describe("supported"))?;
+        let variable = if supports(&specific).is_some() {
+            specific
+        } else {
+            generic
+        };
+        if !supports(&variable).is_some_and(|value| truth::is_on(value)) {
+            return Err(describe("supported"));
+        }
         let value = find(&variable).ok_or_else(|| describe("defined"))?;
         let mut elements = list::split(value, list::Empty::Keep).into_iter();
         let malformed = |reason| {
@@ -180,14 +203,14 @@ fn validate_template(value: &[u8]) -> Result<(), &'static str> {
                     .any(|token| token == *placeholder)
             })
     };
-    if !has_placeholder(alternative(value, b"PATH{")) {
+    if !has_placeholder(&alternative(value, true)) {
         return Err(if value.windows(5).any(|token| token == b"PATH{") {
             "\"<LIBRARY>\", \"<LIB_ITEM>\", or \"<LINK_ITEM>\" patterns are missing for \"PATH{}\" alternative"
         } else {
             "\"<LIBRARY>\", \"<LIB_ITEM>\", or \"<LINK_ITEM>\" patterns are missing"
         });
     }
-    if !has_placeholder(alternative(value, b"NAME{")) {
+    if !has_placeholder(&alternative(value, false)) {
         return Err(
             "\"<LIBRARY>\", \"<LIB_ITEM>\", or \"<LINK_ITEM>\" patterns are missing for \"NAME{}\" alternative",
         );
@@ -195,15 +218,55 @@ fn validate_template(value: &[u8]) -> Result<(), &'static str> {
     Ok(())
 }
 
-fn alternative<'a>(template: &'a [u8], marker: &[u8]) -> &'a [u8] {
-    template
-        .windows(marker.len())
-        .position(|bytes| bytes == marker)
-        .and_then(|start| template.get(start + marker.len()..))
-        .and_then(|tail| {
-            tail.iter()
-                .position(|&byte| byte == b'}')
-                .and_then(|end| tail.get(..end))
-        })
-        .unwrap_or(template)
+fn alternative(template: &[u8], use_path: bool) -> Vec<u8> {
+    let (active, inactive) = if use_path {
+        (b"PATH{", b"NAME{")
+    } else {
+        (b"NAME{", b"PATH{")
+    };
+    let position = |value: &[u8], tag: &[u8]| value.windows(tag.len()).position(|part| part == tag);
+    let mut value = template.to_vec();
+    if let Some(start) = position(&value, inactive)
+        && let Some(tail) = value.get(start + inactive.len()..)
+        && let Some(end) = position(tail, b"}")
+    {
+        value.drain(start..start + inactive.len() + end + 1);
+    }
+    if let Some(start) = position(&value, active) {
+        value.drain(start..start + active.len());
+        if let Some(end) = value.get(start..).and_then(|tail| position(tail, b"}")) {
+            value.remove(start + end);
+        }
+    }
+    value
+}
+
+fn library_name<'a, 'model>(
+    raw: &'a [u8],
+    definition: &impl Fn(&[u8]) -> &'model [u8],
+) -> &'a [u8] {
+    for (prefix, suffix) in [
+        (
+            b"CMAKE_IMPORT_LIBRARY_PREFIX".as_slice(),
+            b"CMAKE_IMPORT_LIBRARY_SUFFIX".as_slice(),
+        ),
+        (
+            b"CMAKE_SHARED_LIBRARY_PREFIX",
+            b"CMAKE_SHARED_LIBRARY_SUFFIX",
+        ),
+        (
+            b"CMAKE_STATIC_LIBRARY_PREFIX",
+            b"CMAKE_STATIC_LIBRARY_SUFFIX",
+        ),
+    ] {
+        let extension = definition(suffix);
+        if !extension.is_empty()
+            && let Some(name) = raw
+                .strip_prefix(definition(prefix))
+                .and_then(|name| name.strip_suffix(extension))
+        {
+            return name;
+        }
+    }
+    raw
 }

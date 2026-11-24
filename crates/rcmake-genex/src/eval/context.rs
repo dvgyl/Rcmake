@@ -81,11 +81,10 @@ impl Evaluator<'_> {
         if values.iter().any(|v| !valid_id(v)) {
             return Err(call.error("Expression syntax not recognized."));
         }
-        if let Some(configs) = call
-            .ctx
-            .current
-            .and_then(|target| self.host.imported_config_matches(target, &call.ctx.config))
-        {
+        if let Some(configs) = call.ctx.current.and_then(|target| {
+            self.host
+                .imported_config_matches(target, call.ctx.head, &call.ctx.config)
+        }) {
             return Ok(boolean(configs.iter().any(|config| {
                 values
                     .iter()

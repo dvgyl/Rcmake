@@ -288,6 +288,7 @@ impl GenexHost for ModelGenexHost<'_, '_> {
     fn imported_config_matches(
         &self,
         target: TargetHandle,
+        head: Option<TargetHandle>,
         consumer: &ConfigId,
     ) -> Option<Vec<BString>> {
         let target = self.resolver.model.target(self.id(target)?)?;
@@ -298,7 +299,7 @@ impl GenexHost for ModelGenexHost<'_, '_> {
         let mut configurations = Vec::new();
         if !cps {
             configurations.push(consumer.0.clone());
-            if target.policies.policies.get(PolicyId::new(199)) != PolicyStatus::New
+            if head.and_then(|head| self.target_policy(head, b"CMP0199")) != Some(true)
                 && let Some(mapped) = super::artifacts::imported_config_map(target, consumer)
             {
                 configurations.extend(list::split(mapped, list::Empty::Keep));
