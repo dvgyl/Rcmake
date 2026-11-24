@@ -10,7 +10,9 @@ use rcmake_gen_common::GenError;
 use rcmake_host::Host;
 use rcmake_resolve::DependInfo;
 
-use crate::{Word, check_make_path, make_recipe_text, make_word, phony, rule, write_makefile};
+use crate::{
+    Word, build_path, check_make_path, make_recipe_text, make_word, phony, rule, write_makefile,
+};
 
 /// Inputs for the per-target dependency scan.
 pub(crate) struct DependencyRule<'a> {
@@ -28,6 +30,17 @@ pub(crate) struct DependencyRule<'a> {
     pub(crate) goal: &'a [u8],
 }
 
+/// Additional inputs for the target dependency file.
+#[derive(Default)]
+pub(crate) struct DependencyFiles<'a> {
+    /// Support directories with module summaries to forward.
+    pub(crate) forward_target_dirs: &'a [BString],
+    /// Native depfile records in source, object, compiler, depfile order.
+    pub(crate) native_depfiles: &'a [BString],
+    /// Whether the compiler builds its intrinsic modules.
+    pub(crate) building_intrinsic_modules: bool,
+}
+
 /// Write the target's Fortran dependency information using the host.
 ///
 /// # Errors
@@ -39,11 +52,12 @@ pub(crate) fn write_depend_info(
     build_dir: &Path,
     file: &[u8],
     info: &DependInfo,
+    files: &DependencyFiles<'_>,
 ) -> Result<(), GenError> {
-    write_makefile(host, build_dir, file, &depend_info(info)?)
+    write_makefile(host, build_dir, file, &depend_info(info, files)?)
 }
 
-fn depend_info(info: &DependInfo) -> Result<Vec<u8>, GenError> {
+fn depend_info(info: &DependInfo, files: &DependencyFiles<'_>) -> Result<Vec<u8>, GenError> {
     let DependInfo::Fortran(info) = info else {
         return Err(GenError::Invalid(
             "Expected Fortran dependency information.".into(),
@@ -67,14 +81,22 @@ fn depend_info(info: &DependInfo) -> Result<Vec<u8>, GenError> {
         .iter()
         .map(|dir| Lexical::new(dir).append(b"DependInfo.cmake"))
         .collect::<Vec<_>>();
+    let forwarded: Vec<_> = files
+        .forward_target_dirs
+        .iter()
+        .map(|dir| Lexical::new(dir).append(b"DependInfo.cmake"))
+        .collect();
     for (name, values) in [
         (
             b"CMAKE_Fortran_TARGET_INCLUDE_PATH".as_slice(),
             info.include_dirs.as_slice(),
         ),
         (b"CMAKE_Fortran_TARGET_LINKED_INFO_FILES", linked.as_slice()),
-        (b"CMAKE_Fortran_TARGET_FORWARD_LINKED_INFO_FILES", &[]),
-        (b"CMAKE_DEPENDS_DEPENDENCY_FILES", &[]),
+        (
+            b"CMAKE_Fortran_TARGET_FORWARD_LINKED_INFO_FILES",
+            forwarded.as_slice(),
+        ),
+        (b"CMAKE_DEPENDS_DEPENDENCY_FILES", files.native_depfiles),
     ] {
         out.extend_from_slice(b"set(");
         out.extend_from_slice(name);
@@ -109,6 +131,9 @@ fn depend_info(info: &DependInfo) -> Result<Vec<u8>, GenError> {
         cmake_argument(&mut out, value, false);
         out.extend_from_slice(b")\n");
     }
+    if files.building_intrinsic_modules {
+        out.extend_from_slice(b"set(CMAKE_Fortran_TARGET_BUILDING_INTRINSIC_MODULES ON)\n");
+    }
     Ok(out)
 }
 
@@ -127,21 +152,79 @@ fn cmake_argument(out: &mut Vec<u8>, word: &[u8], list_element: bool) {
     out.push(b'"');
 }
 
-/// Include the dependency scanner's output in build.make.
+/// Include the scanner's object dependencies and module stamp recipes.
 ///
-/// The generated include has the object dependencies and the module stamp
-/// recipes. The scanner emits calls to `cmake_copy_f90_mod`. That command
-/// leaves the stamp timestamp intact when the contents are equal.
+/// Pass the actual target goal and the configured CMake executable. Native
+/// compiler depfile includes in build.make remain in effect.
 ///
 /// # Errors
 ///
-/// Returns an error if the include path cannot be written in Make.
-pub(crate) fn include_depend_make(out: &mut Vec<u8>, path: &[u8]) -> Result<(), GenError> {
+/// Returns an error if a path or the command cannot be written in Make.
+pub(crate) fn include_depend_make(
+    out: &mut Vec<u8>,
+    path: &[u8],
+    goal: &[u8],
+    cmake: &[u8],
+) -> Result<(), GenError> {
+    let stamp_goal = Lexical::new(Lexical::new(path).parent()).append(b"build");
     check_make_path(path)?;
-    out.extend_from_slice(b"CMAKE_COMMAND ?= cmake\n-include ");
+    check_make_path(goal)?;
+    check_make_path(&stamp_goal)?;
+    if cmake.is_empty() {
+        return Err(GenError::Invalid("CMAKE_COMMAND is empty.".into()));
+    }
+    out.extend_from_slice(b"override CMAKE_COMMAND := ");
+    let mut command = Vec::new();
+    make_recipe_text(&mut command, &quote_always(cmake))?;
+    for byte in command {
+        if byte == b'#' {
+            out.push(b'\\');
+        }
+        out.push(byte);
+    }
+    out.extend_from_slice(b"\n-include ");
     make_word(out, path, Word::Input);
     out.push(b'\n');
+    if stamp_goal != goal {
+        rule(out, goal, [stamp_goal.as_slice()]);
+    }
+    // A target without providers has no stamp prerequisites.
+    rule(out, &stamp_goal, []);
     Ok(())
+}
+
+/// Collect the files that the target's clean goal removes.
+///
+/// Pass the configured support directory, original objects and module paths
+/// discovered by the Fortran scanner. Include both compiler basename cases.
+pub(crate) fn clean_artifacts<'a>(
+    build_dir: &Path,
+    support_dir: &[u8],
+    objects: &[BString],
+    modules: impl IntoIterator<Item = &'a BString>,
+) -> BTreeSet<BString> {
+    let mut products = BTreeSet::new();
+    for module in modules {
+        let path = Lexical::new(module);
+        let (stem, extension) = path.stem_extension(true);
+        products.insert(build_path(module, build_dir));
+        let uppercase = [stem.to_ascii_uppercase().as_slice(), extension].concat();
+        products.insert(build_path(
+            &Lexical::new(path.parent()).append(&uppercase),
+            build_dir,
+        ));
+        let stamp = [path.filename(), b".stamp"].concat();
+        products.insert(build_path(
+            &Lexical::new(support_dir).append(&stamp),
+            build_dir,
+        ));
+    }
+    products.extend(
+        objects
+            .iter()
+            .map(|object| build_path(&[object.as_slice(), b".provides.build"].concat(), build_dir)),
+    );
+    products
 }
 
 /// Write the scan goal. Pass prerequisites that generate sources before the scan.
@@ -234,11 +317,12 @@ mod tests {
             },
             &["generated $unit.f90".into()],
         )?;
-        include_depend_make(&mut out, b"obj/depend.make")?;
+        include_depend_make(&mut out, b"obj/depend.make", b"obj/all", b"/my tools/cmake")?;
         let text = String::from_utf8_lossy(&out);
         assert!(text.contains("obj/depend: obj/DependInfo.cmake generated\\ $$unit.f90\n"));
         assert!(text.contains("$(CMAKE_COMMAND) -E cmake_depends \"Unix Makefiles\" '/source tree' '/source tree/sub' '/build' '/build/sub' 'obj/DependInfo.cmake'\n"));
-        assert!(text.contains("-include obj/depend.make\n"));
+        assert!(text.contains("override CMAKE_COMMAND := '/my tools/cmake'\n"));
+        assert!(text.contains("-include obj/depend.make\nobj/all: obj/build\nobj/build:\n"));
         Ok(())
     }
 

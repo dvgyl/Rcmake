@@ -7,6 +7,7 @@ use std::collections::BTreeSet;
 use std::slice::from_ref;
 
 use rcmake_base::BString;
+use rcmake_host::path;
 use rcmake_resolve::{BuildStep, DeviceLinkMode, Invocation};
 
 use crate::graph::Graph;
@@ -33,13 +34,15 @@ rule CUDA_DEVICE_LINK_STUB
 
 /// Write the edges for a device-link step. Return whether this module handled it.
 ///
-/// Pass the normalized order-only prerequisites from the graph. A driver
+/// Pass the file-only link dependencies and normalized order-only inputs.
+/// A driver
 /// invocation keeps the resolver's argument order. For explicit linking, the
 /// first planned cubin owns the registration header even if its edge sorts later.
 pub(crate) fn emit(
     ninja: &mut Ninja,
     graph: &Graph<'_>,
     step: &BuildStep,
+    link_depends: &[BString],
     order_only: &[&BString],
 ) -> bool {
     let BuildStep::DeviceLink {
@@ -57,6 +60,20 @@ pub(crate) fn emit(
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect();
+    let implicit_inputs: Vec<_> = link_depends
+        .iter()
+        .map(|input| graph.node(input))
+        .filter(|input| inputs.binary_search(input).is_err())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let order_only: Vec<_> = order_only
+        .iter()
+        .copied()
+        .filter(|input| {
+            inputs.binary_search(input).is_err() && implicit_inputs.binary_search(input).is_err()
+        })
+        .collect();
     let output = graph.node(output);
     match mode {
         DeviceLinkMode::Driver { invocation } => {
@@ -65,7 +82,8 @@ pub(crate) fn emit(
                 Edge {
                     outputs: from_ref(&output),
                     inputs: &inputs,
-                    order_only,
+                    implicit_inputs: &implicit_inputs,
+                    order_only: &order_only,
                     ..Edge::default()
                 },
             );
@@ -103,7 +121,8 @@ pub(crate) fn emit(
                             &[]
                         },
                         inputs: &inputs,
-                        order_only,
+                        implicit_inputs: &implicit_inputs,
+                        order_only: &order_only,
                         ..Edge::default()
                     },
                 );
@@ -136,6 +155,14 @@ pub(crate) fn emit(
 impl Ninja {
     /// Bind a lowered command and run it from the build directory.
     pub(crate) fn invocation(&mut self, graph: &Graph<'_>, invocation: &Invocation) {
+        if cfg!(windows) {
+            let build_dir = (!graph.prefix.is_empty()).then(|| path::from_native(graph.build_dir));
+            self.binding(
+                b"COMMAND",
+                &windows_invocation(invocation, build_dir.as_ref()),
+            );
+            return;
+        }
         let mut command = Vec::new();
         if let Some(directory) = &invocation.working_dir {
             command.extend_from_slice(b"cd -- ");
@@ -162,6 +189,73 @@ impl Ninja {
             }
         }
         self.binding(b"COMMAND", &graph.in_build_dir(&command));
+    }
+}
+
+/// Quote one argument for the Windows executable or response-file parser.
+pub(crate) fn windows_argument(word: &[u8], out: &mut Vec<u8>) {
+    if !word.is_empty()
+        && word
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"_+-./:=@\\".contains(byte))
+    {
+        out.extend_from_slice(word);
+        return;
+    }
+    out.push(b'"');
+    let mut slashes = 0;
+    for &byte in word {
+        if byte == b'\\' {
+            slashes += 1;
+            continue;
+        }
+        out.extend(std::iter::repeat_n(
+            b'\\',
+            if byte == b'"' {
+                2 * slashes + 1
+            } else {
+                slashes
+            },
+        ));
+        out.push(byte);
+        slashes = 0;
+    }
+    out.extend(std::iter::repeat_n(b'\\', 2 * slashes));
+    out.push(b'"');
+}
+
+fn windows_invocation(invocation: &Invocation, build_dir: Option<&BString>) -> Vec<u8> {
+    let mut script = Vec::new();
+    for directory in build_dir.into_iter().chain(&invocation.working_dir) {
+        // CD parses the quoted path itself, including a trailing backslash.
+        script.extend_from_slice(b"cd /D \"");
+        script.extend_from_slice(directory);
+        script.extend_from_slice(b"\" && ");
+    }
+    let chain =
+        invocation
+            .argv
+            .starts_with(&["cmd.exe".into(), "/D".into(), "/S".into(), "/C".into()]);
+    let uses_shell = chain || invocation.argv.is_empty();
+    let needs_shell = uses_shell || !script.is_empty();
+    if uses_shell {
+        if invocation.shell.is_empty() {
+            script.extend_from_slice(b"ver >NUL");
+        } else {
+            script.extend_from_slice(&invocation.shell);
+        }
+    } else {
+        for (index, word) in invocation.argv.iter().enumerate() {
+            if index != 0 {
+                script.push(b' ');
+            }
+            windows_argument(word, &mut script);
+        }
+    }
+    if needs_shell {
+        [b"cmd.exe /D /S /V:OFF /C \"".as_slice(), &script, b"\""].concat()
+    } else {
+        script
     }
 }
 
@@ -193,10 +287,23 @@ mod tests {
             },
         };
         let mut ninja = Ninja::default();
-        assert!(emit(&mut ninja, &graph, &step, &[&"order".into()]));
+        assert!(emit(
+            &mut ninja,
+            &graph,
+            &step,
+            &["device script.ld".into(), "z.a".into()],
+            &[&"order".into()]
+        ));
         let text = String::from_utf8_lossy(&ninja.0);
-        assert!(text.contains("build obj/device$ link.o: CUDA_DEVICE_LINK a$ $$.o z.a || order\n"));
-        assert!(text.contains("  COMMAND = 'cuda$ nvcc'$ -dlink$ z.a$ 'a$ $$.o'\n"));
+        assert!(text.contains(
+            "build obj/device$ link.o: CUDA_DEVICE_LINK a$ $$.o z.a | device$ script.ld || order\n"
+        ));
+        let argv = if cfg!(windows) {
+            "  COMMAND = \"cuda$ nvcc\"$ -dlink$ z.a$ \"a$ $$.o\"\n"
+        } else {
+            "  COMMAND = 'cuda$ nvcc'$ -dlink$ z.a$ 'a$ $$.o'\n"
+        };
+        assert!(text.contains(argv));
         Ok(())
     }
 
@@ -228,7 +335,7 @@ mod tests {
             },
         };
         let mut ninja = Ninja::default();
-        assert!(emit(&mut ninja, &graph, &step, &[]));
+        assert!(emit(&mut ninja, &graph, &step, &["device.ld".into()], &[]));
         let text = String::from_utf8_lossy(&ninja.0);
         let edges: Vec<_> = text
             .lines()
@@ -237,12 +344,23 @@ mod tests {
         assert_eq!(
             edges,
             [
-                "build sm_75.cubin: CUDA_DEVICE_LINK_CUBIN kernel.o",
-                "build sm_90.cubin | reg.h: CUDA_DEVICE_LINK_CUBIN kernel.o",
+                "build sm_75.cubin: CUDA_DEVICE_LINK_CUBIN kernel.o | device.ld",
+                "build sm_90.cubin | reg.h: CUDA_DEVICE_LINK_CUBIN kernel.o | device.ld",
                 "build fat.h: CUDA_DEVICE_LINK_FATBINARY sm_75.cubin sm_90.cubin",
                 "build device.o: CUDA_DEVICE_LINK_STUB fat.h reg.h",
             ]
         );
+        assert_eq!(text.matches("device.ld").count(), 2);
         Ok(())
+    }
+
+    #[test]
+    fn windows_quotes_program_arguments_and_working_directory() {
+        let mut call = invocation(&[r"C:\Program Files\NVIDIA\nvcc.exe", r"obj\a b.o"]);
+        call.working_dir = Some(r"D:\build files\".into());
+        assert_eq!(
+            windows_invocation(&call, None),
+            br#"cmd.exe /D /S /V:OFF /C "cd /D "D:\build files\" && "C:\Program Files\NVIDIA\nvcc.exe" "obj\a b.o"""#
+        );
     }
 }

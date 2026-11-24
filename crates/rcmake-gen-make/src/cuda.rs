@@ -10,14 +10,16 @@ use rcmake_gen_common::GenError;
 use rcmake_resolve::{BuildStep, DeviceLinkMode, Invocation};
 
 use crate::{
-    build_path, check_make_path, invalid_graph, make_recipe_text, progress, rule, shell_invocation,
+    FORCE, Word, build_path, check_make_path, invalid_graph, make_recipe_text, make_word, progress,
+    rule, shell_invocation,
 };
 
 /// Render one device-object rule. Return whether this module handled the step.
 ///
 /// Supply the host link's file-only dependencies and the path to this
 /// target's build.make file. The cubin commands run in the planned order.
-/// Make stops the recipe if one of the commands fails.
+/// Make stops the recipe if a command fails and reruns it if an intermediate
+/// file is missing.
 ///
 /// # Errors
 ///
@@ -39,6 +41,7 @@ pub(crate) fn emit(
     else {
         return Ok(false);
     };
+    let intermediates = intermediate_paths(mode).map(|path| build_path(path, build_dir));
     let output = build_path(output, build_dir);
     let inputs = prerequisites(inputs.iter().chain(link_depends), build_dir)?;
     check_make_path(&output)?;
@@ -92,7 +95,42 @@ pub(crate) fn emit(
     for invocation in invocations {
         write_invocation(out, invocation)?;
     }
+    for path in intermediates {
+        check_make_path(&path)?;
+        out.extend_from_slice(b"ifeq ($(wildcard ");
+        make_word(out, &path, Word::Wildcard);
+        out.extend_from_slice(b"),)\n");
+        rule(out, &output, [FORCE]);
+        out.extend_from_slice(b"endif\n");
+    }
     Ok(true)
+}
+
+/// Return the device object and all intermediate files for Make clean.
+pub(crate) fn clean_artifacts(step: &BuildStep, build_dir: &Path) -> Vec<BString> {
+    let BuildStep::DeviceLink { output, mode, .. } = step else {
+        return Vec::new();
+    };
+    std::iter::once(output)
+        .chain(intermediate_paths(mode))
+        .map(|path| build_path(path, build_dir))
+        .collect()
+}
+
+fn intermediate_paths(mode: &DeviceLinkMode) -> impl Iterator<Item = &BString> {
+    let (cubins, headers) = match mode {
+        DeviceLinkMode::Explicit {
+            cubins,
+            fatbin_header,
+            register_header,
+            ..
+        } => (cubins.as_slice(), Some([fatbin_header, register_header])),
+        DeviceLinkMode::Driver { .. } => (&[][..], None),
+    };
+    cubins
+        .iter()
+        .map(|cubin| &cubin.output)
+        .chain(headers.into_iter().flatten())
 }
 
 /// Add file-only prerequisites to a host link or archive rule.
@@ -156,13 +194,14 @@ mod tests {
         }
     }
 
-    fn render(mode: DeviceLinkMode) -> Result<String, GenError> {
+    fn render(mode: DeviceLinkMode) -> Result<(String, Vec<BString>), GenError> {
         let step = BuildStep::DeviceLink {
             lang: "CUDA".into(),
             output: "obj/device link.o".into(),
             inputs: vec!["/build/obj/kernel.o".into()],
             mode,
         };
+        let products = clean_artifacts(&step, Path::new("/build"));
         let mut out = Vec::new();
         assert!(emit(
             &mut out,
@@ -172,12 +211,12 @@ mod tests {
             b"CMakeFiles/app.dir/build.make",
             None,
         )?);
-        Ok(String::from_utf8_lossy(&out).into_owned())
+        Ok((String::from_utf8_lossy(&out).into_owned(), products))
     }
 
     #[test]
     fn driver_adds_link_depends_only_to_the_rule() -> Result<(), GenError> {
-        let text = render(DeviceLinkMode::Driver {
+        let (text, products) = render(DeviceLinkMode::Driver {
             invocation: invocation(&["nvcc", "-dlink", "obj/kernel.o"]),
         })?;
         assert!(text.starts_with(
@@ -185,12 +224,13 @@ mod tests {
         ));
         assert!(text.contains("\t$(SILENT)('nvcc' '-dlink' 'obj/kernel.o')\n"));
         assert_eq!(text.matches("file.ld").count(), 1);
+        assert_eq!(products, ["obj/device link.o"]);
         Ok(())
     }
 
     #[test]
     fn explicit_device_link_runs_one_recipe_in_dependency_order() -> Result<(), GenError> {
-        let text = render(DeviceLinkMode::Explicit {
+        let (text, products) = render(DeviceLinkMode::Explicit {
             cubins: vec![
                 CubinLink {
                     arch: "90".into(),
@@ -220,9 +260,18 @@ mod tests {
             ],
         );
         assert_eq!(
-            text.lines().filter(|line| !line.starts_with('\t')).count(),
-            1
+            products,
+            [
+                "obj/device link.o",
+                "obj/sm_90.cubin",
+                "obj/sm_75.cubin",
+                "obj/fat.h",
+                "obj/reg.h"
+            ],
         );
+        for intermediate in &products[1..] {
+            assert!(text.contains(&format!("ifeq ($(wildcard {intermediate}),)\n")));
+        }
         Ok(())
     }
 }

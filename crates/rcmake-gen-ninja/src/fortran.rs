@@ -7,8 +7,9 @@ use std::collections::BTreeSet;
 use std::slice::from_ref;
 
 use rcmake_base::{BString, path_lex::Lexical};
-use rcmake_resolve::{BuildStep, FortranTargetInfo, Invocation};
+use rcmake_resolve::{BuildStep, DependInfo, FortranTargetInfo, Invocation};
 
+use crate::cuda::windows_argument;
 use crate::graph::Graph;
 use crate::syntax::{Edge, Ninja, shell_word};
 
@@ -110,12 +111,13 @@ pub(crate) fn emit_collate(
         tdi,
         modmap_format,
         implicit_inputs,
+        depend_info,
         ..
     } = step
     else {
         return false;
     };
-    if lang != "Fortran" {
+    if lang != "Fortran" || !matches!(depend_info.as_ref(), DependInfo::Fortran(_)) {
         return false;
     }
     let modules = Lexical::new(Lexical::new(dd).parent()).append(b"FortranModules.json");
@@ -137,28 +139,36 @@ pub(crate) fn emit_collate(
     );
 
     let rspfile = [dd.as_slice(), b".rsp"].concat();
-    let mut command = Vec::new();
-    shell_word(cmake, &mut command);
-    command.extend_from_slice(b" -E cmake_ninja_dyndep");
-    option(&mut command, b"--tdi=", tdi);
-    command.extend_from_slice(b" --lang=Fortran");
+    let mut argv = vec![
+        cmake.into(),
+        "-E".into(),
+        "cmake_ninja_dyndep".into(),
+        option(b"--tdi=", tdi),
+        "--lang=Fortran".into(),
+        option(b"--dd=", dd),
+        option(b"@", &rspfile),
+    ];
     if let Some(format) = modmap_format {
-        option(&mut command, b"--modmapfmt=", format.as_str().as_bytes());
+        argv.push(option(b"--modmapfmt=", format.as_str().as_bytes()));
     }
-    option(&mut command, b"--dd=", dd);
-    option(&mut command, b"@", &rspfile);
-    ninja.binding(b"COMMAND", &graph.in_build_dir(&command));
+    ninja.invocation(
+        graph,
+        &Invocation {
+            argv,
+            ..Invocation::default()
+        },
+    );
     ninja.binding(b"RSP_FILE", &graph.node(&rspfile));
 
-    // The command reads paths from its build directory. Keep that path
-    // spelling in the response file even if the Ninja manifest has a prefix.
+    // The command opens the response file and the scans from the physical
+    // build directory. Scan records carry the separate manifest object names.
     let mut response = Vec::new();
     let mut seen = BTreeSet::new();
     for ddi in ddis.iter().filter(|ddi| seen.insert(*ddi)) {
         if !response.is_empty() {
             response.push(b' ');
         }
-        shell_word(ddi, &mut response);
+        response_argument(ddi, &mut response, cfg!(windows));
     }
     ninja.binding(b"RSP_ARGS", &response);
     true
@@ -188,11 +198,20 @@ pub(crate) fn emit_compile(
     else {
         return false;
     };
+    let scan_only = compile_input
+        .is_none()
+        .then(|| graph.node(&[object.as_slice(), b".ddi"].concat()));
+    let implicit_inputs = unique(implicit_inputs.iter().cloned().chain(scan_only));
     let object = graph.node(object);
     let source = graph.node(compile_input.as_ref().unwrap_or(source));
     let dd = graph.node(dd);
     let order_only: Vec<_> = std::iter::once(&dd)
-        .chain(order_only.iter().copied().filter(|path| **path != dd))
+        .chain(
+            order_only
+                .iter()
+                .copied()
+                .filter(|path| **path != dd && !implicit_inputs.contains(path)),
+        )
         .collect();
     let rule = if depfile.is_some() {
         b"COMPILE_DEPFILE".as_slice()
@@ -204,7 +223,7 @@ pub(crate) fn emit_compile(
         Edge {
             outputs: from_ref(&object),
             inputs: from_ref(&source),
-            implicit_inputs,
+            implicit_inputs: &implicit_inputs,
             order_only: &order_only,
             ..Edge::default()
         },
@@ -221,9 +240,16 @@ pub(crate) fn emit_compile(
     true
 }
 
-fn option(out: &mut Vec<u8>, flag: &[u8], path: &[u8]) {
-    out.push(b' ');
-    shell_word(&[flag, path].concat(), out);
+fn option(flag: &[u8], path: &[u8]) -> BString {
+    [flag, path].concat().into()
+}
+
+fn response_argument(path: &[u8], out: &mut Vec<u8>, windows: bool) {
+    if windows {
+        windows_argument(path, out);
+    } else {
+        shell_word(path, out);
+    }
 }
 
 fn unique(paths: impl IntoIterator<Item = BString>) -> Vec<BString> {
@@ -285,29 +311,115 @@ mod tests {
     }
 
     #[test]
-    fn collate_declares_the_module_summary_and_linked_target_inputs() -> Result<(), GenError> {
-        use rcmake_resolve::DependInfo;
-
+    fn scan_only_object_has_a_normal_ddi_prerequisite() -> Result<(), GenError> {
         let input = BuildGraph::default();
-        let graph = Graph::new(&input, &BTreeMap::new(), Path::new("/build"), None)?;
+        let graph = Graph::with_prefix(
+            &input,
+            &BTreeMap::new(),
+            Path::new("/build/prefix"),
+            None,
+            b"prefix",
+        )?;
         let mut ninja = Ninja::default();
-        let step = BuildStep::Collate {
-            lang: "Fortran".into(),
-            target: "app".into(),
-            ddis: vec!["obj/a $.ddi".into()],
-            dd: "obj/Fortran.dd".into(),
-            modmaps: Vec::new(),
-            tdi: "obj/FortranDependInfo.json".into(),
-            depend_info: Box::new(DependInfo::Cxx(Default::default())),
-            modmap_format: None,
-            implicit_inputs: vec!["lib/FortranModules.json".into()],
+        let compile = BuildStep::Compile {
+            object: "obj/a.o".into(),
+            source: "src/a.f90".into(),
+            compile_input: None,
+            invocation: Invocation::default(),
+            depfile: None,
+            modmap: None,
+            dyndep: Some("obj/Fortran.dd".into()),
         };
+        assert!(emit_compile(&mut ninja, &graph, &compile, &[], &[]));
+        let text = String::from_utf8_lossy(&ninja.0);
+        assert!(text.contains(
+            "build prefix/obj/a.o: COMPILE prefix/src/a.f90 | prefix/obj/a.o.ddi || prefix/obj/Fortran.dd\n"
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn collate_declares_the_module_summary_and_linked_target_inputs()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use rcmake_diag::{Backtrace, PolicyMap};
+        use rcmake_host::PureHost;
+        use rcmake_model::{
+            BT, DirId, GeneratorKind, ProjectModel, Target, TargetKind, TargetOrigin,
+        };
+
+        let mut model = ProjectModel::default();
+        model.generator = Some(GeneratorKind::Ninja);
+        model.set_root_dirs("/src".into(), "/build".into());
+        let mut target = Target::new(
+            "app".into(),
+            TargetKind::ObjectLibrary,
+            TargetOrigin::Normal,
+            DirId::ROOT,
+            Backtrace::default(),
+            PolicyMap::default(),
+        );
+        target.props.set("Fortran_PREPROCESS".into(), "OFF".into());
+        target
+            .sources
+            .push(BT::new("test.f90".into(), Backtrace::default()));
+        model.add_target(target)?;
+        model
+            .dir_mut(DirId::ROOT)
+            .source_props
+            .entry("/src/test.f90".into())
+            .or_default()
+            .set("LANGUAGE".into(), "Fortran".into());
+        let host = PureHost::default();
+        host.seed_file(Path::new("/src/test.f90"), b"end\n")?;
+        let result = rcmake_resolve::resolve(&model, &host, &[])?;
+        let input = result.graphs.first().ok_or("Missing build graph.")?;
+        let mut step = input
+            .steps
+            .iter()
+            .find(|step| {
+                matches!(
+                    step, BuildStep::Collate { depend_info, .. }
+                    if matches!(depend_info.as_ref(), DependInfo::Fortran(_))
+                )
+            })
+            .cloned()
+            .ok_or("Missing Fortran collation step.")?;
+        if let BuildStep::Collate {
+            ddis,
+            dd,
+            tdi,
+            implicit_inputs,
+            ..
+        } = &mut step
+        {
+            *ddis = vec!["obj/a $.ddi".into()];
+            *dd = "obj/Fortran.dd".into();
+            *tdi = "obj/FortranDependInfo.json".into();
+            *implicit_inputs = vec!["lib/FortranModules.json".into()];
+        }
+        let graph = Graph::new(input, &BTreeMap::new(), Path::new("/build"), None)?;
+        let mut ninja = Ninja::default();
         assert!(emit_collate(&mut ninja, &graph, &step, b"/my tools/cmake"));
         let text = String::from_utf8_lossy(&ninja.0);
         assert!(text.contains("build obj/Fortran.dd | obj/FortranModules.json: Fortran_DYNDEP obj/a$ $$.ddi | obj/FortranDependInfo.json lib/FortranModules.json"));
         assert!(text.contains("cmake_ninja_dyndep$ --tdi=obj/FortranDependInfo.json$ --lang=Fortran$ --dd=obj/Fortran.dd$ @obj/Fortran.dd.rsp"));
-        assert!(text.contains("  RSP_ARGS = 'obj/a$ $$.ddi'\n"));
+        let quoted = if cfg!(windows) {
+            "  RSP_ARGS = \"obj/a$ $$.ddi\"\n"
+        } else {
+            "  RSP_ARGS = 'obj/a$ $$.ddi'\n"
+        };
+        assert!(text.contains(quoted));
         assert!(RULES.contains("restat = 1"));
         Ok(())
+    }
+
+    #[test]
+    fn windows_response_file_preserves_spaces_backslashes_and_quotes() {
+        let mut response = Vec::new();
+        response_argument(br#"C:\build files\a.ddi"#, &mut response, true);
+        assert_eq!(response, br#""C:\build files\a.ddi""#);
+        response.clear();
+        response_argument(br#"C:\some folder\"#, &mut response, true);
+        assert_eq!(response, br#""C:\some folder\\""#);
     }
 }

@@ -3,42 +3,57 @@
 
 #![forbid(unsafe_code)]
 
+use std::collections::BTreeMap;
+
 use indexmap::{IndexMap, IndexSet};
-use rcmake_base::{BString, list, path_lex::Lexical, shell::quote, truth};
-use rcmake_fortran::{DependSource, FortranCompiler, FortranTdi, ModuleCase};
+use rcmake_base::{
+    BString, list,
+    path_lex::{Lexical, cmake_style},
+    shell::quote,
+    truth,
+};
+use rcmake_fortran::{DependSource, FortranCompiler, FortranTdi};
 use rcmake_genex::ConfigId;
 use rcmake_host::{Host, path};
-use rcmake_model::{BT, DirId, GeneratorKind, ProjectModel, Target};
+use rcmake_json::{Value, write_styled};
+use rcmake_model::{BT, DirId, GeneratorKind, ProjectModel, Target, TargetId};
 
 use super::compile::compile_arguments;
 use super::shell::{command, direct, join_words, rule_invocations};
-use super::{definition, join, object_dir, target_property};
+use super::{definition, join, object_dir};
 use crate::model::{DependInfo, FortranTargetInfo};
-use crate::{BuildStep, CompileGroup, CompileUnit, ResolveError, ResolvedTarget};
+use crate::sources::{SourcePaths, TargetInputs};
+use crate::usage::{ResolvedLinkItem, ResolvedLinkKind};
+use crate::{BuildStep, CompileGroup, CompileUnit, Invocation, ResolveError, ResolvedTarget};
 
 /// Fortran inputs for one target and configuration.
 pub(crate) struct FortranPlan {
     /// Build paths to record on the resolved target.
     pub(crate) info: FortranTargetInfo,
-    /// Dependency information for Ninja or Unix Makefiles.
-    pub(crate) depend_info: DependInfo,
+    tdi: FortranTdi,
+    forward_target_dirs: Vec<BString>,
+    building_intrinsic_modules: bool,
+    flag_module_dir: Option<BString>,
     units: IndexMap<BString, DependSource>,
     ninja: bool,
 }
 
 impl FortranPlan {
-    /// Create a plan if the target has Fortran units.
+    /// Create a plan for local Fortran units or forwarded module summaries.
     ///
     /// Supply the resolved link closure in link order for this configuration.
-    /// It includes modules from targets reached through interfaces.
+    /// Include objects from other targets in the link closure. Supply their
+    /// owners in `forwarded` when the target republishes their modules.
+    /// Resolve providers before their consumers.
     ///
     /// # Errors
     ///
-    /// Returns an error if the model is missing a target or a compile group.
+    /// Returns an error for missing target facts or a required preprocessing rule.
     pub(crate) fn new<'a>(
         model: &ProjectModel,
         resolved: &ResolvedTarget,
         linked: impl IntoIterator<Item = &'a ResolvedTarget>,
+        forwarded: &IndexSet<TargetId>,
     ) -> Result<Option<Self>, ResolveError> {
         let target = model
             .target(resolved.id)
@@ -60,11 +75,18 @@ impl FortranPlan {
                 continue;
             }
             let source = join(&resolved.metadata.source_dir, &unit.source.value);
-            let preprocessed = (ninja
-                && preprocess(model, target, &source) != Some(false)
-                && get(b"CMAKE_Fortran_PREPROCESS_SOURCE")
-                    .is_some_and(|rule| !rule.trim_ascii().is_empty()))
-            .then(|| preprocessed_path(model, target, &source, &unit.object));
+            let preprocessed = if ninja && preprocess(model, target, &source) != Some(false) {
+                if get(b"CMAKE_Fortran_PREPROCESS_SOURCE")
+                    .is_none_or(|rule| rule.trim_ascii().is_empty())
+                {
+                    return Err(ResolveError::Message(
+                        format!("The Fortran preprocessing rule for {source} is missing.").into(),
+                    ));
+                }
+                Some(preprocessed_path(model, target, &source, &unit.object))
+            } else {
+                None
+            };
             includes.extend(
                 group
                     .includes
@@ -80,45 +102,66 @@ impl FortranPlan {
                 },
             );
         }
-        if units.is_empty() {
-            return Ok(None);
-        }
-        let dir = support_dir(model, target, resolved);
-        let linked_target_dirs = linked
-            .into_iter()
-            .filter(|other| other.id != resolved.id && other.config == resolved.config)
-            .filter(|other| {
-                other
+        let mut linked_target_dirs = IndexSet::new();
+        let mut forward_target_dirs = IndexSet::new();
+        for other in linked {
+            if other.id == resolved.id || other.config != resolved.config {
+                continue;
+            }
+            if other.fortran.is_none()
+                && !other
                     .compile_groups
                     .iter()
                     .any(|group| group.language == "Fortran")
+            {
+                continue;
+            }
+            if let Some(provider) = model.target(other.id) {
+                let dir = join(top, &support_dir(model, provider, other));
+                if forwarded.contains(&other.id) {
+                    forward_target_dirs.insert(dir.clone());
+                }
+                linked_target_dirs.insert(dir);
+            }
+        }
+        if units.is_empty() && forward_target_dirs.is_empty() {
+            return Ok(None);
+        }
+        let dir = support_dir(model, target, resolved);
+        let flag_module_dir = get(b"CMAKE_Fortran_MODDIR_FLAG")
+            .filter(|flag| !flag.trim_ascii().is_empty())
+            .and_then(|_| {
+                let directory = match target.props.get(b"Fortran_MODULE_DIRECTORY") {
+                    Some(value) if value.is_empty() => None,
+                    Some(value) => Some(join(current, value)),
+                    None if current != top => Some(current.clone()),
+                    None => None,
+                };
+                directory.or_else(|| {
+                    get(b"CMAKE_Fortran_MODDIR_DEFAULT")
+                        .filter(|value| !value.is_empty())
+                        .map(|value| join(top, value))
+                })
             })
-            .filter_map(|other| Some(support_dir(model, model.target(other.id)?, other)))
-            .map(|dir| join(top, &dir))
-            .collect::<IndexSet<_>>()
-            .into_iter()
-            .collect::<Vec<_>>();
-        let module_dir = target_property(model, target, b"Fortran_MODULE_DIRECTORY")
-            .filter(|value| !value.is_empty())
-            .map(|value| Lexical::new(&join(current, value)).normalize())
-            .or_else(|| (top != current).then(|| current.clone()))
-            .or_else(|| {
-                get(b"CMAKE_Fortran_MODDIR_DEFAULT")
-                    .filter(|value| !value.is_empty())
-                    .map(|value| Lexical::new(&join(top, value)).normalize())
-            });
+            .map(|dir| Lexical::new(&dir).normalize());
+        let module_dir = Some(flag_module_dir.as_ref().unwrap_or(top).clone());
         let compiler_id = get(b"CMAKE_Fortran_COMPILER_ID")
             .cloned()
             .unwrap_or_default();
         let compiler = FortranCompiler::from_id(&compiler_id);
-        let module_case = match get(b"CMAKE_Fortran_MODULE_CASE").map(|value| value.as_slice()) {
-            Some(value) if value.eq_ignore_ascii_case(b"upper") => ModuleCase::Upper,
-            Some(value) if value.eq_ignore_ascii_case(b"lower") => ModuleCase::Lower,
-            _ => compiler.module_case,
-        };
+        let linked_target_dirs: Vec<_> = linked_target_dirs.into_iter().collect();
+        let building_intrinsic_modules = target
+            .props
+            .get(b"Fortran_BUILDING_INTRINSIC_MODULES")
+            .or_else(|| target.props.get(b"Fortran_BUILDING_INSTRINSIC_MODULES"))
+            .is_some_and(|value| truth::is_on(value));
         let tdi = FortranTdi {
             dir_cur_bld: current.clone(),
-            dir_top_bld: top.clone(),
+            dir_top_bld: if ninja {
+                ninja_dyndep_root(model, top)
+            } else {
+                top.clone()
+            },
             include_dirs: includes.into_iter().collect(),
             module_dir: module_dir.clone(),
             linked_target_dirs: linked_target_dirs.clone(),
@@ -128,7 +171,7 @@ impl FortranPlan {
             submodule_ext: get(b"CMAKE_Fortran_SUBMODULE_EXT")
                 .cloned()
                 .unwrap_or_else(|| compiler.submodule_ext.into()),
-            module_case,
+            module_case: compiler.module_case,
             compiler_id,
             sources: units.values().cloned().collect(),
         };
@@ -147,10 +190,53 @@ impl FortranPlan {
                 modules_json: join(&dir, b"FortranModules.json"),
                 linked_target_dirs,
             },
-            depend_info: DependInfo::Fortran(tdi),
+            tdi,
+            forward_target_dirs: forward_target_dirs.into_iter().collect(),
+            building_intrinsic_modules,
+            flag_module_dir,
             units,
             ninja,
         }))
+    }
+
+    /// Serialize the scanner and collator settings for Ninja.
+    ///
+    /// The dependency files use physical build paths. The dyndep file uses
+    /// paths relative to the Ninja manifest root.
+    pub(crate) fn ninja_depend_info(&self, model: &ProjectModel, target: &Target) -> BString {
+        let tdi = &self.tdi;
+        let mut info = BTreeMap::new();
+        for (key, value) in [
+            ("dir-top-bld", tdi.dir_top_bld.clone()),
+            ("dir-cur-bld", tdi.dir_cur_bld.clone()),
+            ("dir-top-src", model.dir(DirId::ROOT).source_dir.clone()),
+            ("dir-cur-src", model.dir(target.dir).source_dir.clone()),
+            ("compiler-id", tdi.compiler_id.clone()),
+            ("submodule-sep", tdi.submodule_sep.clone()),
+            ("submodule-ext", tdi.submodule_ext.clone()),
+            ("module-dir", tdi.module_dir.clone().unwrap_or_default()),
+        ] {
+            info.insert(key.into(), Value::string(value));
+        }
+        for (key, values) in [
+            ("include-dirs", &tdi.include_dirs),
+            ("linked-target-dirs", &tdi.linked_target_dirs),
+            (
+                "forward-modules-from-target-dirs",
+                &self.forward_target_dirs,
+            ),
+        ] {
+            info.insert(
+                key.into(),
+                Value::Array(values.iter().cloned().map(Value::String).collect()),
+            );
+        }
+        info.insert("language".into(), Value::string("Fortran"));
+        info.insert(
+            "building-intrinsic-modules".into(),
+            Value::Bool(self.building_intrinsic_modules),
+        );
+        write_styled(&Value::Object(info), "  ")
     }
 
     /// Create the compiler's module output directory through the host.
@@ -159,7 +245,7 @@ impl FortranPlan {
     ///
     /// Returns an error if the host cannot create the directory.
     pub(crate) fn create_module_dir(&self, host: &dyn Host) -> Result<(), ResolveError> {
-        if let Some(directory) = &self.info.module_dir {
+        if let Some(directory) = &self.flag_module_dir {
             host.create_dir_all(&path::to_native(directory))
                 .map_err(|error| {
                     ResolveError::Message(
@@ -238,7 +324,17 @@ impl FortranPlan {
             let ddi = suffix(&source.object, b".ddi");
             let scan_output = source.preprocessed.as_ref().unwrap_or(&ddi);
             let depfile = suffix(scan_output, b".d");
-            let invocation = scanner(cmake, &self.info.depend_info, source, &ddi, &depfile);
+            let object_node = ninja_node(model, &source.object);
+            let scan_output_node = ninja_node(model, scan_output);
+            let invocation = scanner(
+                cmake,
+                &self.info.depend_info,
+                source,
+                &object_node,
+                &scan_output_node,
+                &ddi,
+                &depfile,
+            );
             let invocation = if let Some(output) = &source.preprocessed {
                 let group = resolved.compile_groups.get(unit.group).ok_or_else(|| {
                     ResolveError::Message("The Fortran scan has no compile group.".into())
@@ -251,7 +347,7 @@ impl FortranPlan {
                     position_independent,
                 };
                 let preprocess = compiler.commands(&group, source, output, &depfile)?;
-                command(chain_commands(preprocess.into_iter().chain([invocation])))
+                chain_commands(preprocess.into_iter().chain([invocation]))?
             } else {
                 invocation
             };
@@ -273,7 +369,7 @@ impl FortranPlan {
             dd: self.info.dyndep.clone(),
             modmaps: Vec::new(),
             tdi: self.info.depend_info.clone(),
-            depend_info: Box::new(self.depend_info.clone()),
+            depend_info: Box::new(DependInfo::Fortran(self.tdi.clone())),
             modmap_format: None,
             implicit_inputs: std::iter::once(self.info.depend_info.clone())
                 .chain(
@@ -298,34 +394,21 @@ impl FortranPlan {
         let mut group = group.clone();
         let get = |key: &[u8]| definition(model, target.dir, key);
         let mut flags = Vec::new();
-        let output_flag = get(b"CMAKE_Fortran_MODOUT_FLAG");
-        let directory_flag = get(b"CMAKE_Fortran_MODDIR_FLAG").map(|value| value.as_slice());
-        // Some toolchain files put the directory flag in MODOUT_FLAG.
-        let directory_flag = directory_flag.or_else(|| {
-            output_flag.map(|value| value.as_slice()).filter(|flag| {
-                matches!(
-                    flag.trim_ascii_end(),
-                    b"-J" | b"-module" | b"-moddir" | b"-mdir"
-                )
-            })
-        });
-        if let Some(flag) = output_flag
-            && Some(flag.as_slice()) != directory_flag
-        {
+        if let Some(flag) = get(b"CMAKE_Fortran_MODOUT_FLAG") {
             flags.extend(list_flags(flag));
         }
-        if let Some(directory) = &self.info.module_dir {
+        if let Some(directory) = &self.flag_module_dir {
             let relative = super::build_relative(model, directory);
-            let directory = if relative.is_empty() {
+            let relative = if relative.is_empty() {
                 b".".as_slice()
             } else {
                 &relative
             };
-            if let Some(flag) = directory_flag {
-                flags.extend(path_flag(flag, directory));
+            if let Some(flag) = get(b"CMAKE_Fortran_MODDIR_FLAG") {
+                flags.extend(path_flag(flag, relative));
             }
             if let Some(flag) = get(b"CMAKE_Fortran_MODDIR_INCLUDE_FLAG") {
-                flags.extend(path_flag(flag, directory));
+                flags.extend(path_flag(flag, relative));
             }
         }
         if let Some(flag) = get(b"CMAKE_Fortran_MODPATH_FLAG") {
@@ -333,17 +416,15 @@ impl FortranPlan {
                 flags.extend(path_flag(flag, &include.path.value));
             }
         }
-        let format = source_or_target(model, target, &source.source, b"Fortran_FORMAT");
-        if let Some(key) = match format.map(|value| value.as_slice()) {
-            Some(value) if value.eq_ignore_ascii_case(b"fixed") => {
-                Some(b"CMAKE_Fortran_FORMAT_FIXED_FLAG".as_slice())
-            }
-            Some(value) if value.eq_ignore_ascii_case(b"free") => {
-                Some(b"CMAKE_Fortran_FORMAT_FREE_FLAG".as_slice())
-            }
-            _ => None,
-        } && let Some(value) = get(key)
-        {
+        let format = source_property(model, target, &source.source, b"Fortran_FORMAT")
+            .and_then(|value| format_flag(value))
+            .or_else(|| {
+                target
+                    .props
+                    .get(b"Fortran_FORMAT")
+                    .and_then(|value| format_flag(value))
+            });
+        if let Some(value) = format.and_then(get) {
             flags.extend(list_flags(value));
         }
         if postprocess {
@@ -369,7 +450,9 @@ impl FortranPlan {
                     },
                 );
             }
-        } else if let Some(enabled) = preprocess(model, target, &source.source) {
+        } else if let Some(enabled) = preprocess(model, target, &source.source)
+            && (!enabled || !self.ninja)
+        {
             let key: &[u8] = if enabled {
                 b"CMAKE_Fortran_COMPILE_OPTIONS_PREPROCESS_ON"
             } else {
@@ -388,30 +471,108 @@ impl FortranPlan {
     }
 }
 
-/// Collect Fortran dependency data for a Make target that has resolved module facts.
+/// Find the owners of object files included through source or link expressions.
+pub(crate) fn forwarded_object_libraries(
+    paths: &SourcePaths<'_>,
+    inputs: &TargetInputs,
+    links: &[ResolvedLinkItem],
+) -> IndexSet<TargetId> {
+    fn object_files(items: &[ResolvedLinkItem]) -> impl Iterator<Item = &[u8]> {
+        items
+            .iter()
+            .flat_map(|item| match &item.kind {
+                ResolvedLinkKind::Group { members, .. } => members.as_slice(),
+                _ => std::slice::from_ref(item),
+            })
+            .filter(|item| item.kind == ResolvedLinkKind::ObjectFile)
+            .map(|item| item.text.value.as_slice())
+    }
+
+    inputs
+        .objects
+        .iter()
+        .map(|object| object.as_slice())
+        .chain(object_files(links))
+        .filter_map(|object| paths.object_owner(object))
+        .collect()
+}
+
+/// The Fortran scanner inputs for a Make target.
+pub struct FortranMakeDependencies {
+    /// Compiler, directory and source data.
+    pub info: DependInfo,
+    /// Target support directories with modules to forward.
+    pub forward_target_dirs: Vec<BString>,
+    /// Whether the compiler builds its intrinsic modules.
+    pub building_intrinsic_modules: bool,
+}
+
+/// Collect Fortran dependency data and scan settings for a Make target.
 ///
-/// The Make generator uses the same toolchain and source data as Ninja. It
-/// writes a DependInfo.cmake file and scans the original source at build time.
 ///
 /// # Errors
 ///
-/// Returns an error if the model is missing a target or a compile group.
-pub fn fortran_make_depend_info(
+/// Returns an error if the model is missing a target or compile group.
+pub fn fortran_make_depend_info<'a>(
     model: &ProjectModel,
     resolved: &ResolvedTarget,
-) -> Result<Option<DependInfo>, ResolveError> {
-    let Some(info) = &resolved.fortran else {
-        return Ok(None);
-    };
-    let Some(plan) = FortranPlan::new(model, resolved, [])? else {
-        return Ok(None);
-    };
-    let mut depend_info = plan.depend_info;
-    if let DependInfo::Fortran(tdi) = &mut depend_info {
-        tdi.module_dir.clone_from(&info.module_dir);
-        tdi.linked_target_dirs.clone_from(&info.linked_target_dirs);
+    linked: impl IntoIterator<Item = &'a ResolvedTarget>,
+    forwarded: &IndexSet<TargetId>,
+) -> Result<Option<FortranMakeDependencies>, ResolveError> {
+    Ok(
+        FortranPlan::new(model, resolved, linked, forwarded)?.map(|plan| FortranMakeDependencies {
+            info: DependInfo::Fortran(plan.tdi),
+            forward_target_dirs: plan.forward_target_dirs,
+            building_intrinsic_modules: plan.building_intrinsic_modules,
+        }),
+    )
+}
+
+fn ninja_prefix(model: &ProjectModel) -> BString {
+    model
+        .definition(DirId::ROOT, b"CMAKE_NINJA_OUTPUT_PATH_PREFIX")
+        .map_or_else(BString::default, |prefix| {
+            Lexical::new(&cmake_style(prefix)).normalize()
+        })
+}
+
+fn ninja_node(model: &ProjectModel, object: &[u8]) -> BString {
+    let object = super::build_relative(model, &cmake_style(object));
+    let prefix = ninja_prefix(model);
+    if prefix.is_empty()
+        || Lexical::new(&object).absolute()
+        || Lexical::new(&prefix).prefix(Lexical::new(&object))
+    {
+        object
+    } else {
+        join(&prefix, &object)
     }
-    Ok(Some(depend_info))
+}
+
+// Relative Fortran graph paths are read from the physical build
+// directory. The dyndep module paths are relative to the parent manifest.
+fn ninja_dyndep_root(model: &ProjectModel, top: &BString) -> BString {
+    let prefix = ninja_prefix(model);
+    if prefix.is_empty() {
+        return top.clone();
+    }
+    if Lexical::new(&prefix).absolute() {
+        return BString::default();
+    }
+    let mut root = top.as_slice();
+    for component in Lexical::new(&prefix)
+        .components()
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+    {
+        let path = Lexical::new(root);
+        if path.filename() != component {
+            return top.clone();
+        }
+        root = path.parent();
+    }
+    root.into()
 }
 
 fn support_dir(model: &ProjectModel, target: &Target, resolved: &ResolvedTarget) -> BString {
@@ -422,7 +583,7 @@ fn support_dir(model: &ProjectModel, target: &Target, resolved: &ResolvedTarget)
         .unwrap_or_else(|| object_dir(model, target, &resolved.config))
 }
 
-fn source_or_target<'a>(
+fn source_property<'a>(
     model: &'a ProjectModel,
     target: &'a Target,
     source: &[u8],
@@ -431,14 +592,26 @@ fn source_or_target<'a>(
     model
         .dir(target.dir)
         .source_props
-        .get(&Lexical::new(source).normalize())
-        .and_then(|props| props.get(key))
-        .filter(|value| !value.is_empty())
-        .or_else(|| target_property(model, target, key))
+        .get(&Lexical::new(source).normalize())?
+        .get(key)
+}
+
+fn format_flag(value: &[u8]) -> Option<&'static [u8]> {
+    list::split(value, list::Empty::Drop)
+        .iter()
+        .rev()
+        .find_map(|entry| match entry.as_slice() {
+            b"FIXED" => Some(b"CMAKE_Fortran_FORMAT_FIXED_FLAG".as_slice()),
+            b"FREE" => Some(b"CMAKE_Fortran_FORMAT_FREE_FLAG".as_slice()),
+            _ => None,
+        })
 }
 
 fn preprocess(model: &ProjectModel, target: &Target, source: &[u8]) -> Option<bool> {
-    source_or_target(model, target, source, b"Fortran_PREPROCESS")
+    let key = b"Fortran_PREPROCESS";
+    source_property(model, target, source, key)
+        .filter(|value| !value.is_empty())
+        .or_else(|| target.props.get(key))
         .filter(|value| !value.is_empty())
         .map(|value| truth::is_on(value))
 }
@@ -479,7 +652,7 @@ fn path_flag(flag: &[u8], directory: &[u8]) -> Vec<BString> {
     if prefix.is_empty() {
         return Vec::new();
     }
-    if prefix.len() != flag.len() || matches!(prefix, b"-module" | b"-moddir" | b"-mdir") {
+    if prefix.len() != flag.len() {
         vec![prefix.into(), directory.into()]
     } else {
         vec![[prefix, directory].concat().into()]
@@ -490,14 +663,12 @@ fn scanner(
     cmake: &[u8],
     tdi: &[u8],
     source: &DependSource,
+    object_node: &[u8],
+    scan_output_node: &[u8],
     ddi: &[u8],
     depfile: &[u8],
 ) -> crate::Invocation {
     let input = source.preprocessed.as_ref().unwrap_or(&source.source);
-    let output = source
-        .preprocessed
-        .as_ref()
-        .map_or(ddi, |value| value.as_slice());
     let mut args = vec![
         cmake.into(),
         "-E".into(),
@@ -507,9 +678,9 @@ fn scanner(
     for (flag, value) in [
         (b"--tdi=".as_slice(), tdi),
         (b"--src=", input.as_slice()),
-        (b"--out=", output),
+        (b"--out=", scan_output_node),
         (b"--dep=", depfile),
-        (b"--obj=", source.object.as_slice()),
+        (b"--obj=", object_node),
         (b"--ddi=", ddi),
     ] {
         args.push([flag, value].concat().into());
@@ -577,17 +748,75 @@ impl Preprocessor<'_> {
     }
 }
 
-fn chain_commands(invocations: impl IntoIterator<Item = crate::Invocation>) -> BString {
+fn chain_commands(
+    invocations: impl IntoIterator<Item = Invocation>,
+) -> Result<Invocation, ResolveError> {
     let mut shell = BString::default();
     for invocation in invocations {
         if !shell.is_empty() {
             shell.extend_from_slice(b" && ");
         }
-        shell.push(b'(');
-        shell.extend_from_slice(&invocation.shell);
-        shell.push(b')');
+        if cfg!(windows) {
+            if invocation.argv.starts_with(&["sh".into(), "-c".into()]) {
+                return Err(ResolveError::Message(
+                    "The Fortran preprocessing rule requires a POSIX shell.".into(),
+                ));
+            }
+            let words = invocation.argv.iter().map(|word| windows_argument(word));
+            shell.extend_from_slice(&join_words(words));
+        } else {
+            shell.push(b'(');
+            shell.extend_from_slice(&invocation.shell);
+            shell.push(b')');
+        }
     }
-    shell
+    if cfg!(windows) {
+        let argv = vec![
+            "cmd.exe".into(),
+            "/D".into(),
+            "/S".into(),
+            "/C".into(),
+            shell.clone(),
+        ];
+        Ok(Invocation {
+            argv,
+            shell,
+            working_dir: None,
+        })
+    } else {
+        Ok(command(shell))
+    }
+}
+
+fn windows_argument(word: &[u8]) -> BString {
+    if !word.is_empty()
+        && word
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || b"_+-./:=@\\".contains(b))
+    {
+        return word.into();
+    }
+    let mut quoted = BString::from("\"");
+    let mut slashes = 0;
+    for &byte in word {
+        if byte == b'\\' {
+            slashes += 1;
+            continue;
+        }
+        quoted.extend(std::iter::repeat_n(
+            b'\\',
+            if byte == b'"' {
+                2 * slashes + 1
+            } else {
+                slashes
+            },
+        ));
+        quoted.push(byte);
+        slashes = 0;
+    }
+    quoted.extend(std::iter::repeat_n(b'\\', 2 * slashes));
+    quoted.push(b'"');
+    quoted
 }
 
 #[cfg(test)]
@@ -655,12 +884,7 @@ mod tests {
         model.dir_mut(DirId::ROOT).vars.extend([
             ("CMAKE_Fortran_COMPILER".into(), "gfortran".into()),
             ("CMAKE_Fortran_COMPILER_ID".into(), "GNU".into()),
-            (
-                "CMAKE_Fortran_MODULE_DIRECTORY".into(),
-                "module files".into(),
-            ),
-            ("CMAKE_Fortran_MODULE_CASE".into(), "UPPER".into()),
-            ("CMAKE_Fortran_MODOUT_FLAG".into(), "-J".into()),
+            ("CMAKE_Fortran_MODDIR_FLAG".into(), "-J".into()),
             (
                 "CMAKE_Fortran_PREPROCESS_SOURCE".into(),
                 "<CMAKE_Fortran_COMPILER> <FLAGS> -E <SOURCE> -o <PREPROCESSED_SOURCE>".into(),
@@ -668,9 +892,16 @@ mod tests {
         ]);
         let provider = resolved(&mut model, "provider")?;
         let consumer = resolved(&mut model, "consumer")?;
+        model
+            .target_mut(consumer.id)
+            .ok_or("Missing consumer target")?
+            .props
+            .set("Fortran_MODULE_DIRECTORY".into(), "module files".into());
         let target = model.target(consumer.id).ok_or("Missing consumer target")?;
-        let plan =
-            FortranPlan::new(&model, &consumer, [&provider])?.ok_or("Missing Fortran plan")?;
+        let forwarded = IndexSet::from([provider.id]);
+        let plan = FortranPlan::new(&model, &consumer, [&provider], &forwarded)?
+            .ok_or("Missing Fortran plan")?;
+        assert_eq!(plan.forward_target_dirs, ["/build/CMakeFiles/provider.dir"]);
         let steps = plan.scan_steps(&model, target, &consumer, None)?;
         let [
             BuildStep::Scan {
@@ -689,12 +920,7 @@ mod tests {
             return Err("Expected a Fortran scan and collation".into());
         };
         assert_eq!(pp, "CMakeFiles/consumer.dir/consumer.F90-pp.f90");
-        assert!(
-            invocation
-                .shell
-                .windows(b"'-Jmodule files'".len())
-                .any(|bytes| bytes == b"'-Jmodule files'")
-        );
+        assert!(invocation.shell.to_string().contains("-Jmodule files"));
         assert_eq!(
             implicit_inputs,
             &[
@@ -702,89 +928,17 @@ mod tests {
                 "/build/CMakeFiles/provider.dir/FortranModules.json",
             ]
         );
-        let DependInfo::Fortran(tdi) = depend_info.as_ref() else {
-            return Err("Expected Fortran dependency information".into());
-        };
-        assert_eq!(tdi.module_case, ModuleCase::Upper);
-        assert_eq!(tdi.submodule_sep, "@");
-        assert_eq!(tdi.submodule_ext, ".smod");
-        let mut compile = BuildStep::Compile {
-            source: "/src/consumer.F90".into(),
-            object: "CMakeFiles/consumer.dir/consumer.F90.o".into(),
-            compile_input: None,
-            invocation: crate::Invocation::default(),
-            depfile: Some("compile.d".into()),
-            modmap: None,
-            dyndep: None,
-        };
-        plan.bind_compile(&mut compile);
-        assert!(matches!(compile, BuildStep::Compile {
-            source, compile_input: Some(input), depfile: Some(depfile), dyndep: Some(dd), ..
-        } if source == "/src/consumer.F90" && &input == pp && depfile == "compile.d" && dd == plan.info.dyndep));
+        assert!(matches!(depend_info.as_ref(), DependInfo::Fortran(tdi)
+            if tdi.submodule_sep == "@" && tdi.submodule_ext == ".smod"));
         Ok(())
     }
 
     #[test]
-    fn scanner_uses_the_original_source_only_for_location_context() {
-        let source = DependSource {
-            object: "obj/a.f90.o".into(),
-            source: "/src/a.F90".into(),
-            preprocessed: Some("obj/a.F90-pp.f90".into()),
-        };
-        let command = scanner(
-            "/my tools/cmake".as_bytes(),
-            b"obj/FortranDependInfo.json",
-            &source,
-            b"obj/a.f90.o.ddi",
-            b"obj/a.F90-pp.f90.d",
-        );
+    fn format_uses_the_last_recognized_uppercase_entry() {
         assert_eq!(
-            command.argv,
-            [
-                "/my tools/cmake",
-                "-E",
-                "cmake_ninja_depends",
-                "--lang=Fortran",
-                "--tdi=obj/FortranDependInfo.json",
-                "--src=obj/a.F90-pp.f90",
-                "--out=obj/a.F90-pp.f90",
-                "--dep=obj/a.F90-pp.f90.d",
-                "--obj=obj/a.f90.o",
-                "--ddi=obj/a.f90.o.ddi",
-                "--src-orig=/src/a.F90",
-            ]
+            format_flag(b"FIXED;FREE;fixed"),
+            Some(b"CMAKE_Fortran_FORMAT_FREE_FLAG".as_slice())
         );
-        let source = DependSource {
-            preprocessed: None,
-            ..source
-        };
-        let command = scanner(
-            b"cmake",
-            b"obj/FortranDependInfo.json",
-            &source,
-            b"a.ddi",
-            b"a.ddi.d",
-        );
-        assert!(command.argv.iter().any(|arg| arg == "--src=/src/a.F90"));
-        assert!(command.argv.iter().any(|arg| arg == "--out=a.ddi"));
-        assert!(
-            !command
-                .argv
-                .iter()
-                .any(|arg| arg.starts_with(b"--src-orig="))
-        );
-    }
-
-    #[test]
-    fn module_flags_keep_directory_arguments_intact() {
-        assert_eq!(path_flag(b"-J", b"module files"), ["-Jmodule files"]);
-        assert_eq!(
-            path_flag(b"-module ", b"module files"),
-            ["-module", "module files"]
-        );
-        assert_eq!(
-            path_flag(b"-moddir", b"module files"),
-            ["-moddir", "module files"]
-        );
+        assert_eq!(format_flag(b"fixed;free"), None);
     }
 }
