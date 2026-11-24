@@ -193,11 +193,13 @@ fn parse_option<'a>(arg: &'a [u8], opts: &mut TarOptions<'a>, cx: &ToolCtx<'_>) 
 fn parse_integer(option: &[u8], value: &[u8], cx: &ToolCtx<'_>) -> Result<i32, i32> {
     let parsed = std::str::from_utf8(value)
         .ok()
-        .and_then(|text| text.trim_ascii_start().parse::<std::ffi::c_long>().ok());
+        .and_then(|text| text.trim_ascii_start().parse::<i64>().ok());
     let reason = match parsed {
-        Some(number) if i32::try_from(number).is_ok() => return Ok(number as i32),
-        Some(number) if number < 0 => b"too small".as_slice(),
-        Some(_) => b"too large",
+        Some(number) => match i32::try_from(number) {
+            Ok(value) => return Ok(value),
+            Err(_) if number < 0 => b"too small".as_slice(),
+            Err(_) => b"too large",
+        },
         None => b"not a number",
     };
     Err(error(
