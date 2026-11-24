@@ -253,7 +253,7 @@ fn read_symbols(
         stdin: Input::Null,
         stdout: Output::Capture,
         stderr: Output::Capture,
-        timeout: None,
+        timeout: Some(std::time::Duration::from_secs(1800)),
         tee: false,
     };
     let result = cx.host.run(&request, &mut |_, _| {});

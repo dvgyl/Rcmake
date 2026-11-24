@@ -367,7 +367,7 @@ fn run_tool(
         stdin: Input::Null,
         stdout: Output::Capture,
         stderr: Output::SharedWithStdout,
-        timeout: None,
+        timeout: Some(std::time::Duration::from_secs(1800)),
         tee: false,
     };
     match cx.host.run(&request, &mut |_, _| {}) {

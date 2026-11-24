@@ -394,7 +394,7 @@ fn run_tool(
         stdin: Input::Null,
         stdout: Output::Capture,
         stderr: Output::Capture,
-        timeout: None,
+        timeout: Some(std::time::Duration::from_secs(1800)),
         tee: false,
     };
     let output = cx

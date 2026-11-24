@@ -348,6 +348,12 @@ impl<'a> SourcePaths<'a> {
             .source_props
             .get(&source_path)
             .and_then(|props| props.get(b"\0rcmake-source-location"))
+            && (self.generated_in(dir, path)
+                || self.objects.contains_key(path)
+                || self
+                    .host
+                    .metadata(&to_native(path), Follow::Yes)
+                    .is_ok_and(|metadata| matches!(metadata.kind, FileKind::File | FileKind::Dir)))
         {
             return Some(path.clone());
         }

@@ -15,7 +15,7 @@ pub(super) fn run(cx: &ToolCtx<'_>, info: Rcc) -> Result<()> {
     ensure_parent(cx, &info.lock)?;
     let _lock = cx
         .host
-        .lock_file(&info.lock, None)
+        .lock_file(&info.lock, Some(std::time::Duration::from_secs(600)))
         .map_err(|error| format!("Cannot lock \"{}\": {error}", info.lock.display()))?;
     let source_time = required_time(cx, &info.source)?;
     let tool_time = required_time(cx, &info.executable)?;
