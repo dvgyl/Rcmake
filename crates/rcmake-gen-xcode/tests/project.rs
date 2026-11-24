@@ -336,6 +336,8 @@ fn generates_multiconfig_projects_from_ide_facts() {
         "CLANG_ENABLE_MODULES = YES;",
         "GCC_OPTIMIZATION_LEVEL = 1;",
         "test.rcmake.app",
+        "INFOPLIST_FILE = /out/CMakeFiles/app.dir/Info.plist;",
+        "INFOPLIST_FILE = /out/CMakeFiles/framework.dir/Info.plist;",
     ] {
         assert!(pbx.contains(expected), "{expected} is absent");
     }

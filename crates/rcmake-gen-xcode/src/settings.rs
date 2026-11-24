@@ -9,6 +9,7 @@ use rcmake_gen_common::GenError;
 
 use rcmake_base::{BString, list as cmake_list, truth};
 use rcmake_diag::{PolicyId, PolicyStatus};
+use rcmake_host::path::from_native_cmake;
 use rcmake_model::{DirId, ParsedToolset, ProjectModel, Target, TargetKind};
 use rcmake_resolve::{
     BuildStep, GenerationResult, ResolvedTarget,
@@ -403,7 +404,7 @@ impl TargetSettings<'_> {
         if let Some(plist) = plist {
             settings.insert(
                 "INFOPLIST_FILE".into(),
-                plist.to_string_lossy().into_owned().into(),
+                from_native_cmake(plist).to_string().into(),
             );
             settings.insert("CODE_SIGNING_ALLOWED".into(), "NO".into());
         }
