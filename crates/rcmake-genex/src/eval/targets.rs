@@ -348,10 +348,6 @@ impl Evaluator<'_> {
         self.validate_artifact(call, name, target, target_type, kind, &diagnostic_operator)?;
 
         if kind == ArtifactKind::LinkerLibraryFile
-            && matches!(
-                part,
-                ArtifactPart::Full | ArtifactPart::Name | ArtifactPart::Dir
-            )
             && target_type != Some(b"STATIC_LIBRARY")
             && self.dll_platform()
         {

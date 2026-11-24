@@ -32,7 +32,7 @@ pub(super) fn ctest_coverage(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult
                 .or(Some(&build)),
         )?;
         let config = configuration(cx, &build, Some(&source))?;
-        let setting = |key: &[u8], variable: &[u8]| {
+        let mut setting = |key: &[u8], variable: &[u8]| {
             if let Some(value) = cx.var(variable) {
                 Ok(value)
             } else {

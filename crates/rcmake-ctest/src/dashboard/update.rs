@@ -170,7 +170,7 @@ fn collect(
         }
         return Ok(());
     }
-    let revision = || {
+    let revision = || -> Result<BString, String> {
         let output = run(vec!["rev-parse".into(), "HEAD".into()])?;
         let hash = output.trim_ascii();
         if matches!(hash.len(), 40 | 64) && hash.iter().all(u8::is_ascii_hexdigit) {
