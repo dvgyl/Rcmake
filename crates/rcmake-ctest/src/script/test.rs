@@ -87,13 +87,9 @@ fn run_test(cx: &mut Cx<'_>, args: &Arguments<'_>) -> Result<HandlerResult, CmdE
         cx.set_fatal();
         return Err(CmdError::Reported);
     }
-    for message in &run.not_run {
-        host.write_out(Stream::Stderr, message);
-        host.write_out(Stream::Stderr, b"\n");
-    }
     Ok(HandlerResult {
         code: if run.outcome.exit_code == 0 { 0 } else { -1 },
-        capture_error: !run.not_run.is_empty(),
+        capture_error: run.start_error,
     })
 }
 
@@ -113,7 +109,10 @@ fn test_invocation(
     .map(|var| cx.var_or_empty(var))
     .find(|value| !value.is_empty())
     .or(settings.config);
-    let timeout = cli::number_prefix(&cx.var_or_empty(b"CTEST_TEST_TIMEOUT"));
+    let timeout = settings
+        .timeout
+        .map(|timeout| timeout.as_secs_f64())
+        .or_else(|| cli::number_prefix(&cx.var_or_empty(b"CTEST_TEST_TIMEOUT")));
     let parallel = args
         .value(b"PARALLEL_LEVEL")
         .map(|value| value.as_slice())

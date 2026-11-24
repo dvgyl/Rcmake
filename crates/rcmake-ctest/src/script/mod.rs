@@ -19,8 +19,10 @@ use crate::CtestError;
 use crate::cli::{Invocation, Script};
 use crate::dart::{self, Configuration, Tag};
 
-mod build;
+pub(crate) mod build;
 mod configure;
+mod preset;
+mod reports;
 mod start;
 mod submit;
 mod test;
@@ -39,6 +41,7 @@ struct Settings {
     quiet: bool,
     depth: usize,
     config: Option<BString>,
+    timeout: Option<Duration>,
     include: Option<BString>,
     exclude: Option<BString>,
     selection: crate::selection::SelectionOptions,
@@ -96,6 +99,7 @@ pub(crate) fn run_script(
             .and_then(|n| n.to_string().parse().ok())
             .unwrap_or_default(),
         config: invocation.options.config.clone(),
+        timeout: invocation.options.timeout,
         include: invocation.options.include.clone(),
         exclude: invocation.options.exclude.clone(),
         selection: invocation.selection.clone(),
@@ -163,6 +167,9 @@ fn execute_script(
         }
         if let Some(config) = settings.config {
             args.extend(["-C".into(), config]);
+        }
+        if let Some(timeout) = settings.timeout {
+            args.extend(["--timeout".into(), timeout.as_secs_f64().to_string().into()]);
         }
         for (key, value) in settings.definitions {
             args.push(format!("-D{key}={value}").into());
@@ -284,6 +291,9 @@ fn register(registry: &mut Registry) {
         ("ctest_configure", configure::ctest_configure),
         ("ctest_build", build::ctest_build),
         ("ctest_submit", submit::ctest_submit),
+        ("ctest_coverage", reports::ctest_coverage),
+        ("ctest_update", reports::ctest_update),
+        ("ctest_upload", reports::ctest_upload),
         ("ctest_read_custom_files", ctest_read_custom_files),
         ("ctest_test", test::ctest_test),
         ("ctest_empty_binary_directory", ctest_empty_binary_directory),
@@ -429,7 +439,7 @@ impl<'a> Arguments<'a> {
                 }
             } else if !is_flag(key) {
                 return Err(error(format!(
-                    "called with unknown argument \"{}\"",
+                    "called with unknown argument \"{}\".",
                     String::from_utf8_lossy(key)
                 )));
             }
@@ -505,8 +515,16 @@ fn with_capture(
             pair.first()
                 .is_some_and(|arg| arg.value == "CAPTURE_CMAKE_ERROR")
         }) {
-            cx.host()
-                .write_out(Stream::Stderr, format!("{message}\n").as_bytes());
+            let mut diagnostic = BString::default();
+            if message.starts_with(b"called with unknown argument ")
+                && let Some(name) = cx.backtrace().top().and_then(|frame| frame.name.clone())
+            {
+                diagnostic.extend_from_slice(&name);
+                diagnostic.push(b' ');
+            }
+            diagnostic.extend_from_slice(message);
+            diagnostic.push(b'\n');
+            cx.host().write_out(Stream::Stderr, &diagnostic);
             cx.set_var(&var.value, "-1".into());
             return Ok(Flow::Normal);
         }
@@ -541,7 +559,8 @@ pub(crate) fn split_command(cx: &mut Cx<'_>, command: &[u8]) -> Result<Vec<BStri
 fn handler_process(
     cx: &Cx<'_>,
     args: &Arguments<'_>,
-    build: PathBuf,
+    cwd: PathBuf,
+    build: &Path,
     command: Vec<BString>,
 ) -> Result<RunOutput, CmdError> {
     let mut command = command.into_iter();
@@ -566,23 +585,30 @@ fn handler_process(
         spec.args.push("-DCTEST_USE_LAUNCHERS:BOOL=TRUE".into());
     }
     let report_command = configure.then(|| spec.clone());
+    let mut env: BTreeMap<_, _> = host.env_all().into_iter().collect();
+    if !configure && cx.var_is_on(b"CTEST_USE_LAUNCHERS") {
+        env.insert(
+            "CTEST_LAUNCH_LOGS".into(),
+            path::from_native(&build.join("Testing/Temporary/Launch")),
+        );
+    }
     let output = run_process(
         host,
-        build.clone(),
+        cwd,
         spec.program,
         spec.args,
-        host.env_all(),
+        env.into_iter().collect(),
         extra_verbose() && !args.flag(b"QUIET"),
     )
     .map_err(|err| error(err.to_string()))?;
     if let Some(spec) = report_command {
-        if let Ok(tag) = Tag::read(host, &build) {
+        if let Ok(tag) = Tag::read(host, build) {
             let file = build
                 .join("Testing")
                 .join(tag.stamp())
                 .join("Configure.xml");
             let source = prior_start().map(|start| start.source);
-            let config = configuration(cx, &build, source.as_deref())?;
+            let config = configuration(cx, build, source.as_deref())?;
             crate::dashboard::write_configure_report(
                 host,
                 &file,
@@ -593,7 +619,7 @@ fn handler_process(
             )
             .map_err(error)?;
         }
-        if verbose() && !args.flag(b"QUIET") {
+        if verbose() {
             report_size(host, &output);
         }
     }
@@ -668,7 +694,17 @@ fn ctest_empty_binary_directory(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdRes
         .metadata(&dir.join("CMakeCache.txt"), Follow::Yes)
         .is_ok_and(|meta| meta.kind == FileKind::File)
     {
-        return Err(error("requires a directory that contains CMakeCache.txt"));
+        cx.issue(
+            rcmake_diag::MessageKind::Error,
+            rcmake_diag::Effect::SetError,
+            None,
+            format!(
+                "Did not remove the binary directory:\n\n  {}\n\nbecause:\n\n  path does not contain an existing CMakeCache.txt file",
+                dir.display()
+            )
+            .into(),
+        );
+        return Ok(Flow::Normal);
     }
     host.remove_dir_all(&dir)
         .map_err(|err| error(err.to_string()))?;

@@ -7,7 +7,7 @@ use rcmake_diag::{
     DiagCategory, Diagnostic, Effect, Location, MessageKind, PolicyId, PolicyStatus, RenderOptions,
     render as render_diagnostic,
 };
-use rcmake_genex::{ConfigId, EvalContext};
+use rcmake_genex::{ConfigId, EvalContext, EvalSite};
 use rcmake_host::{
     Host, Stream,
     path::{from_native, to_native},
@@ -18,8 +18,7 @@ use rcmake_model::{
 use rcmake_resolve::{GenerationResult, lower::compute_artifacts, usage::UsageResolver};
 
 use crate::{
-    GenError, configuration_pattern, genex, quote, script_argument as test_argument,
-    write_if_changed,
+    GenError, configuration_pattern, quote, script_argument as test_argument, write_if_changed,
 };
 
 mod test_command;
@@ -77,7 +76,7 @@ fn render_file(
           # testing this directory and lists subdirectories to be tested as well.\n",
     );
     let mut usage = UsageResolver::new(model);
-    let configs = result.map_or(&[][..], |result| result.configs.as_slice());
+    let configs = result.map_or(&[] as &[ConfigId], |result| result.configs.as_slice());
     let multi_config = multi_config || configs.len() > 1;
     render_includes(&mut out, model, dir_id, &mut usage, configs, multi_config)?;
     for (_, test) in model.dir_tests(dir_id) {
@@ -147,32 +146,29 @@ fn render_file(
             };
             let context = EvalContext {
                 config: config.clone(),
+                site: EvalSite {
+                    backtrace: test.backtrace.clone(),
+                    property: None,
+                },
                 ..EvalContext::default()
             };
-            let mut evaluate = |value: &[u8]| genex(&mut usage, test.dir, &context, value, None);
-            let mut command_usage = UsageResolver::new(model);
-            let mut resolved = resolve_test(
-                test,
-                |value| {
-                    if test.is_discovery() {
-                        genex(&mut command_usage, test.dir, &context, value, None)
-                    } else {
-                        resolve_argument(value, &config.0, &lookup).map_err(GenError::Invalid)
-                    }
-                },
-                &mut evaluate,
-            )?;
+            let mut evaluate = |value: &[u8]| {
+                resolve_argument(
+                    value,
+                    &context,
+                    &mut usage,
+                    test.dir,
+                    &model.dir(DirId::ROOT).source_dir,
+                    &lookup,
+                )
+            };
+            let mut resolved = resolve_test(test, &mut evaluate)?;
+            let program = resolved.command.first().cloned();
             resolve_test_program(model, &mut resolved, lookup, &mut evaluate, host)?;
             if let TestKind::Discover(spec) = &mut resolved.kind {
                 resolve_discovery(spec, &mut evaluate)?;
             }
             let mut dependencies = BTreeSet::new();
-            let program = test
-                .command
-                .first()
-                .map(|value| resolve_argument(value, &config.0, &lookup))
-                .transpose()
-                .map_err(GenError::Invalid)?;
             if let Some((target, Some(file))) = program.as_ref().and_then(|name| lookup(name))
                 && target.kind == TargetKind::Executable
                 && !target.is_imported()
@@ -292,11 +288,15 @@ fn render_includes(
     multi_config: bool,
 ) -> Result<(), GenError> {
     let props = &model.dir(dir).props;
-    let includes = props.get(b"TEST_INCLUDE_FILES");
-    for item in includes
-        .into_iter()
-        .flat_map(|value| list::split(value, list::Empty::Drop))
-    {
+    let singular = props
+        .get(b"TEST_INCLUDE_FILE")
+        .filter(|value| !value.is_empty());
+    let plural = props.get(b"TEST_INCLUDE_FILES");
+    for item in singular.into_iter().cloned().chain(
+        plural
+            .into_iter()
+            .flat_map(|value| list::split(value, list::Empty::Drop)),
+    ) {
         let render = |out: &mut BString, value: &[u8], indent: &[u8]| {
             for path in list::split(value, list::Empty::Drop) {
                 out.extend_from_slice(indent);
@@ -306,9 +306,10 @@ fn render_includes(
             }
         };
         if rcmake_genex::find_genex(&item).is_none() {
-            out.extend_from_slice(b"include(");
-            test_argument(out, &item);
-            out.extend_from_slice(b")\n");
+            // CTest expands variables in plain include paths when it reads this file.
+            out.extend_from_slice(b"include(\"");
+            out.extend_from_slice(&item);
+            out.extend_from_slice(b"\")\n");
             continue;
         }
         let fallback = [ConfigId(
@@ -325,15 +326,16 @@ fn render_includes(
         let values = configs
             .iter()
             .map(|config| {
-                genex(
-                    usage,
-                    dir,
+                resolve_argument(
+                    &item,
                     &EvalContext {
                         config: config.clone(),
                         ..EvalContext::default()
                     },
-                    &item,
-                    None,
+                    usage,
+                    dir,
+                    &model.dir(DirId::ROOT).source_dir,
+                    &|_| None,
                 )
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -522,7 +524,7 @@ fn render_test(out: &mut BString, test: &TestEntry, indent: &[u8], name: impl Fn
             let value = if dependencies.is_empty() {
                 test.props
                     .get(&name)
-                    .map_or(&[][..], |value| value.as_slice())
+                    .map_or(&[] as &[u8], |value| value.as_slice())
             } else {
                 &dependencies
             };

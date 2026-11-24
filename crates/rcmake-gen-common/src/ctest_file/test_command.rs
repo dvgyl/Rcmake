@@ -1,6 +1,8 @@
+use rcmake_genex::{EvalContext, GenexNode, evaluate, parse};
+
 use super::{
-    BString, ByteSlice, DiscoverySpec, GenError, Host, Lexical, Location, PolicyId, PolicyStatus,
-    ProjectModel, Target, TargetKind, TestEntry, list, truth, warn_policy,
+    BString, DirId, DiscoverySpec, GenError, Host, Lexical, Location, PolicyId, PolicyStatus,
+    ProjectModel, Target, TargetKind, TestEntry, UsageResolver, list, truth, warn_policy,
 };
 
 pub(super) fn resolve_discovery(
@@ -23,7 +25,6 @@ pub(super) fn resolve_discovery(
 pub(super) fn resolve_test(
     test: &TestEntry,
     mut resolve: impl FnMut(&[u8]) -> Result<BString, GenError>,
-    mut property: impl FnMut(&[u8]) -> Result<BString, GenError>,
 ) -> Result<TestEntry, GenError> {
     let mut resolved = test.clone();
     resolved.command.clear();
@@ -41,13 +42,13 @@ pub(super) fn resolve_test(
         if name != b"_BACKTRACE_TRIPLES"
             && let Some(value) = test.props.get(&name)
         {
-            resolved.props.set(name, property(value)?);
+            resolved.props.set(name, resolve(value)?);
         }
     }
     if test.props.get(b"WORKING_DIRECTORY").is_none()
         && let Some(value) = &test.working_directory
     {
-        resolved.working_directory = Some(property(value)?);
+        resolved.working_directory = Some(resolve(value)?);
     }
     Ok(resolved)
 }
@@ -120,45 +121,63 @@ pub(super) fn resolve_test_program<'a>(
 }
 
 pub(super) fn resolve_argument<'a>(
-    arg: &[u8],
-    config: &[u8],
+    value: &[u8],
+    context: &EvalContext,
+    usage: &mut UsageResolver<'_>,
+    dir: DirId,
+    root: &[u8],
     lookup: &impl Fn(&[u8]) -> Option<(&'a Target, Option<BString>)>,
-) -> Result<BString, BString> {
-    let mut out = BString::default();
-    let mut rest = arg;
-    while let Some((before, after_open)) = rest.split_once_str(b"$<")
-        && let Some((expr, tail)) = after_open.split_once_str(b">")
-    {
-        out.extend_from_slice(before);
-        if expr == b"CONFIG" {
-            out.extend_from_slice(config);
-        } else if let Some((op, name)) = expr.split_once_str(b":")
-            && matches!(
-                op,
-                b"TARGET_FILE" | b"TARGET_FILE_NAME" | b"TARGET_FILE_DIR"
-            )
-        {
-            let file = lookup(name).and_then(|(_, file)| file).ok_or_else(|| {
-                BString::from([b"No target file for ".as_slice(), name, b" in test."].concat())
-            })?;
-            let path = Lexical::new(&file);
-            out.extend_from_slice(match op {
-                b"TARGET_FILE_NAME" => path.filename(),
-                b"TARGET_FILE_DIR" => path.parent(),
-                _ => file.as_slice(),
-            });
-        } else if let Some(name) = expr.strip_prefix(b"TARGET_FILE_BASE_NAME:")
-            && let Some((target, _)) = lookup(name)
-            && target.is_imported()
-        {
-            out.extend_from_slice(&target.name);
+) -> Result<BString, GenError> {
+    let result = parse(value).and_then(|mut ast| {
+        use_resolved_artifacts(&mut ast.nodes, lookup);
+        evaluate(&ast, context, &mut usage.host(dir)).map(|(value, _)| value)
+    });
+    result.map_err(|error| {
+        let diagnostic = if context.site.backtrace.is_empty() {
+            error.without_location()
         } else {
-            out.extend_from_slice(b"$<");
-            out.extend_from_slice(expr);
-            out.push(b'>');
+            error.at(&context.site.backtrace, root)
+        };
+        GenError::Invalid(format!("\n{diagnostic}").into())
+    })
+}
+
+fn use_resolved_artifacts<'a>(
+    nodes: &mut [GenexNode],
+    lookup: &impl Fn(&[u8]) -> Option<(&'a Target, Option<BString>)>,
+) {
+    for node in nodes {
+        let GenexNode::Expr(expr) = node else {
+            continue;
+        };
+        if let ([GenexNode::Text(op)], Some([parameter])) =
+            (expr.identifier.as_slice(), expr.params.as_deref())
+            && let [GenexNode::Text(name)] = parameter.as_slice()
+            && matches!(
+                op.as_slice(),
+                b"TARGET_FILE"
+                    | b"TARGET_FILE_DIR"
+                    | b"TARGET_FILE_NAME"
+                    | b"TARGET_FILE_BASE_NAME"
+            )
+            && let Some((target, Some(file))) = lookup(name)
+        {
+            let path = Lexical::new(&file);
+            let value = match op.as_slice() {
+                b"TARGET_FILE" => Some(file.clone()),
+                b"TARGET_FILE_DIR" => Some(path.parent().into()),
+                b"TARGET_FILE_NAME" => Some(path.filename().into()),
+                b"TARGET_FILE_BASE_NAME" if target.is_imported() => Some(target.name.clone()),
+                _ => None,
+            };
+            if let Some(value) = value {
+                *node = GenexNode::Text(value);
+                continue;
+            }
         }
-        rest = tail;
+        use_resolved_artifacts(&mut expr.identifier, lookup);
+        for parameter in expr.params.iter_mut().flatten() {
+            use_resolved_artifacts(parameter, lookup);
+        }
     }
-    out.extend_from_slice(rest);
-    Ok(out)
 }

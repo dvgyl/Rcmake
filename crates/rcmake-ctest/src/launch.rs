@@ -1,6 +1,6 @@
 use std::{fmt::Write, path::Path, time::Duration};
 
-use rcmake_base::{BString, Limits};
+use rcmake_base::{BString, Limits, hash::HashAlgo};
 use rcmake_host::{
     CommandSpec, FileTime, Follow, Host, Input, Output, ProcessResult, ReadRange, RunRequest,
     Stream, WriteMode, path,
@@ -41,6 +41,7 @@ fn run_command(
     program: &BString,
     arguments: &[BString],
 ) -> Result<i32, String> {
+    let cwd = host.initial_cwd();
     let output = host
         .run(
             &RunRequest {
@@ -48,7 +49,7 @@ fn run_command(
                     program: program.clone(),
                     args: arguments.to_vec(),
                 }],
-                cwd: host.initial_cwd(),
+                cwd: cwd.clone(),
                 env: host.env_all(),
                 stdin: Input::Inherit,
                 stdout: Output::Capture,
@@ -61,28 +62,113 @@ fn run_command(
         .map_err(|error| error.to_string())?;
     host.write_out(Stream::Stdout, &output.stdout);
     host.write_out(Stream::Stderr, &output.stderr);
-    let code = match output.results.as_slice() {
-        [ProcessResult::Exited(code)] => *code,
-        [ProcessResult::Signaled(signal)] => 128_i32.saturating_add(*signal),
-        [ProcessResult::SpawnFailed(error)] => return Err(error.to_string()),
-        _ => 1,
+    let (code, exit) = match output.results.as_slice() {
+        [ProcessResult::Exited(code)] => (*code, code.to_string()),
+        [ProcessResult::Signaled(signal)] => {
+            let reason = match signal {
+                2 => "User interrupt",
+                9 => "Subprocess killed",
+                15 => "Subprocess terminated",
+                _ => "Subprocess received a signal",
+            };
+            (1, format!("Terminated abnormally: {reason}"))
+        }
+        [ProcessResult::SpawnFailed(error)] => (
+            1,
+            format!(
+                "Error administrating child process: {}",
+                error.os_message.to_ascii_lowercase()
+            ),
+        ),
+        _ => (1, "Child process timeout".into()),
     };
-    let warning = output
-        .stderr
-        .split(|&byte| byte == b'\n')
-        .chain(output.stdout.split(|&byte| byte == b'\n'))
-        .any(|line| {
-            line.windows(8)
-                .any(|part| part.eq_ignore_ascii_case(b"warning:"))
-        });
-    if (code != 0 || warning)
-        && let Some(build) = option(args, b"--build-dir")
-        && let Some(target) = option(args, b"--target-name")
+    if let Some(logs) = host
+        .env_get(b"CTEST_LAUNCH_LOGS")
+        .filter(|dir| !dir.is_empty())
     {
-        let build = host.initial_cwd().join(path::to_native(build));
-        write_failure(host, &build, target, code, &output)?;
+        let stdout = diagnostic_output(&output.stdout);
+        let stderr = diagnostic_output(&output.stderr);
+        let warning = stdout.1 || stderr.1;
+        if code != 0 || warning {
+            let kind = if code == 0 { "Warning" } else { "Error" };
+            let mut xml = format!("<Failure type=\"{kind}\">\n<Action>\n");
+            for (key, tag) in [
+                (b"--target-name".as_slice(), "TargetName"),
+                (b"--language", "Language"),
+                (b"--source", "SourceFile"),
+                (b"--output", "OutputFile"),
+            ] {
+                if let Some(value) = option(args, key) {
+                    element(&mut xml, tag, value);
+                    if tag == "OutputFile" && option(args, b"--language").is_some() {
+                        element(&mut xml, "OutputType", b"object file");
+                    }
+                }
+            }
+            xml.push_str("</Action>\n<Command>\n");
+            let canonical = host.canonicalize(&cwd).unwrap_or_else(|_| cwd.clone());
+            let cwd_value = path::from_native_cmake(&canonical);
+            element(&mut xml, "WorkingDirectory", &cwd_value);
+            let mut identity = cwd_value;
+            for arg in std::iter::once(program).chain(arguments) {
+                element(&mut xml, "Argument", arg);
+                identity.extend_from_slice(arg);
+            }
+            xml.push_str("</Command>\n<Result>\n");
+            element(&mut xml, "StdOut", &stdout.0);
+            element(&mut xml, "StdErr", &stderr.0);
+            element(&mut xml, "ExitCondition", exit.as_bytes());
+            xml.push_str("</Result>\n");
+            let build = option(args, b"--build-dir").map(|dir| cwd.join(path::to_native(dir)));
+            if let Some((build, target)) = build.as_deref().zip(option(args, b"--target-name")) {
+                let labels = instrumentation_xml::target_labels(host, build, target);
+                if !labels.is_empty() {
+                    xml.push_str("<Labels>\n");
+                    for label in labels {
+                        element(&mut xml, "Label", &label);
+                    }
+                    xml.push_str("</Labels>\n");
+                }
+            }
+            xml.push_str("</Failure>\n");
+            let logs = cwd.join(path::to_native(&logs));
+            host.create_dir_all(&logs)
+                .map_err(|error| error.to_string())?;
+            let digest = HashAlgo::Md5.hex_digest(&identity);
+            let file = logs.join(format!("{}-{digest}.xml", kind.to_ascii_lowercase()));
+            host.write(&file, xml.as_bytes(), WriteMode::Truncate)
+                .map_err(|error| error.to_string())?;
+        }
     }
     Ok(code)
+}
+
+fn diagnostic_output(bytes: &[u8]) -> (BString, bool) {
+    let mut output = BString::default();
+    let mut warning = false;
+    let bytes = bytes.strip_suffix(b"\n").unwrap_or(bytes);
+    for (index, line) in bytes.split(|&byte| byte == b'\n').enumerate() {
+        if index != 0 {
+            output.push(b'\n');
+        }
+        if line
+            .windows(8)
+            .any(|part| part.eq_ignore_ascii_case(b"warning:"))
+        {
+            warning = true;
+            output.extend_from_slice(b"[CTest: warning matched] ");
+        }
+        output.extend_from_slice(line);
+    }
+    (output, warning)
+}
+
+fn element(xml: &mut String, tag: &str, value: &[u8]) {
+    if value.is_empty() {
+        let _ = writeln!(xml, "<{tag}/>");
+    } else {
+        let _ = writeln!(xml, "<{tag}>{}</{tag}>", escape(value, false));
+    }
 }
 
 fn option<'a>(args: &'a [BString], key: &[u8]) -> Option<&'a BString> {
@@ -92,45 +178,6 @@ fn option<'a>(args: &'a [BString], key: &[u8]) -> Option<&'a BString> {
             _ => None,
         })
         .filter(|value| !value.is_empty() && !value.starts_with(b"--"))
-}
-
-fn write_failure(
-    host: &dyn Host,
-    build: &Path,
-    target: &[u8],
-    code: i32,
-    output: &rcmake_host::RunOutput,
-) -> Result<(), String> {
-    let dir = build.join("Testing/Temporary/Launch");
-    host.create_dir_all(&dir)
-        .map_err(|error| error.to_string())?;
-    let now = host.now();
-    let file = dir.join(format!(
-        "{}-{}-{}.xml",
-        now.secs,
-        now.nanos,
-        host.system().pid
-    ));
-    let kind = if code == 0 { "Warning" } else { "Error" };
-    let mut xml = format!("<Failure type=\"{kind}\">\n");
-    let name = escape(target, false);
-    let stdout = escape(&output.stdout, false);
-    let stderr = escape(&output.stderr, false);
-    let _ = writeln!(
-        xml,
-        "<TargetName>{name}</TargetName>\n<Stdout>{stdout}</Stdout>\n<Stderr>{stderr}</Stderr>"
-    );
-    let labels = instrumentation_xml::target_labels(host, build, target);
-    if !labels.is_empty() {
-        xml.push_str("<Labels>\n");
-        for label in labels {
-            let _ = writeln!(xml, "<Label>{}</Label>", escape(&label, false));
-        }
-        xml.push_str("</Labels>\n");
-    }
-    xml.push_str("</Failure>\n");
-    host.write(&file, xml.as_bytes(), WriteMode::CreateNew)
-        .map_err(|error| error.to_string())
 }
 
 pub(crate) fn diagnostics(host: &dyn Host, build: &Path, since: FileTime) -> String {

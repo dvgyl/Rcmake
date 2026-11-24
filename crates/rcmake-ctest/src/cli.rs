@@ -172,6 +172,7 @@ pub(crate) fn parse(args: &[BString], host: &dyn Host) -> Result<Invocation, Str
             }
             b"--source-dir" => cli.source_dir = Some(to_native(value()?)),
             b"-C" | b"--build-config" => cli.options.config = Some(value()?.into()),
+            b"--force-new-ctest-process" if inline.is_none() => {}
             b"--timeout" => timeout = Some(number_prefix(value()?).unwrap_or_default()),
             b"--stop-on-failure" => cli.execution.stop_on_failure = Some(true),
             b"--repeat" | b"--repeat-until-fail" => {

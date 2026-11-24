@@ -23,6 +23,7 @@ pub(crate) struct Report<'a> {
     label_summary: bool,
     subproject_summary: bool,
     capture: bool,
+    color: bool,
     log_file: Option<PathBuf>,
     records: RefCell<BTreeMap<usize, TestRecord>>,
 }
@@ -79,6 +80,9 @@ impl<'a> Report<'a> {
             label_summary: invocation.output.label_summary.unwrap_or(true),
             subproject_summary: invocation.output.subproject_summary.unwrap_or(true),
             capture,
+            color: host
+                .env_get(b"CLICOLOR_FORCE")
+                .is_some_and(|value| !value.is_empty() && value != "0"),
             log_file,
             records: RefCell::new(BTreeMap::new()),
         })
@@ -95,6 +99,22 @@ impl<'a> Report<'a> {
         if !self.options.quiet {
             self.host.write_out(stream, bytes);
         }
+    }
+
+    fn write_summary_line(&self, message: std::fmt::Arguments<'_>, failed: bool) {
+        let text = message.to_string();
+        if !self.color || self.options.quiet {
+            self.emit(Stream::Stdout, text.as_bytes());
+            return;
+        }
+        if let Some(file) = &self.log_file {
+            let _ = self.host.write(file, text.as_bytes(), WriteMode::Append);
+        }
+        let code = if failed { 31 } else { 32 };
+        self.host.write_out(
+            Stream::Stdout,
+            format!("\x1b[{code}m{text}\x1b[0m").as_bytes(),
+        );
     }
 
     pub(crate) fn announce_tests(&self) {
@@ -270,22 +290,12 @@ impl<'a> Report<'a> {
         if self.options.quiet {
             return;
         }
-        if result.status == Status::NotRun
-            && test.command.program != "NOT_AVAILABLE"
-            && resolved_command(self.host, test, self.options).is_none()
-            && result
-                .detail
-                .as_deref()
-                .is_some_and(|detail| !detail.starts_with("Failed test dependencies:"))
-        {
-            self.missing_command(test);
-        } else if let Some(detail) = &result.detail {
-            let stream = if detail.starts_with("Unable to find build dependency:") {
-                Stream::Stderr
+        if let Some(detail) = &result.detail {
+            if result.status == Status::NotRun {
+                self.not_run(test, detail);
             } else {
-                Stream::Stdout
-            };
-            self.emit(stream, format!("{detail}\n").as_bytes());
+                self.emit(Stream::Stdout, format!("{detail}\n").as_bytes());
+            }
         }
         if self.options.verbose {
             for line in result.output.split_inclusive(|&byte| byte == b'\n') {
@@ -293,19 +303,6 @@ impl<'a> Report<'a> {
                 self.emit(Stream::Stdout, line);
             }
             self.end_output_line(&result.output);
-        }
-        if result.status == Status::NotRun
-            && test.command.program != "NOT_AVAILABLE"
-            && resolved_command(self.host, test, self.options).is_none()
-            && result
-                .detail
-                .as_ref()
-                .is_some_and(|detail| !detail.starts_with("Failed test dependencies:"))
-        {
-            self.emit(
-                Stream::Stderr,
-                format!("Unable to find executable: {}\n", test.command.program).as_bytes(),
-            );
         }
         let dots = ".".repeat(self.name_width.saturating_sub(test.name.len()).min(4096) + 3);
         let progress_width = self.total.to_string().len();
@@ -324,6 +321,51 @@ impl<'a> Report<'a> {
         if !self.options.verbose && result.status.failed() && self.options.output_on_failure {
             self.emit(Stream::Stdout, &result.output);
             self.end_output_line(&result.output);
+        }
+    }
+
+    fn not_run(&self, test: &PlannedTest, detail: &str) {
+        if test.command.program == "NOT_AVAILABLE"
+            || detail.starts_with("Failed test dependencies:")
+            || !test.timeout.errors.is_empty()
+        {
+            self.emit(Stream::Stdout, format!("{detail}\n").as_bytes());
+            return;
+        }
+
+        let working_directory = test.working_directory();
+        let setting = test.property(b"WORKING_DIRECTORY");
+        let directory_error = match self.host.metadata(&working_directory, Follow::Yes) {
+            Ok(entry) if entry.kind != FileKind::Dir => Some("Not a directory".into()),
+            Err(error) => Some(error.os_message),
+            _ => None,
+        };
+        if let Some(error) = environment_error(detail) {
+            self.emit(
+                Stream::Stderr,
+                format!("CMake Error: {error}\n\n").as_bytes(),
+            );
+        } else if !setting.is_empty()
+            && let Some(reason) = directory_error
+        {
+            self.emit(
+                Stream::Stderr,
+                format!(
+                    "Failed to change working directory to \"{}\": {reason}\n",
+                    BString::from(setting)
+                )
+                .as_bytes(),
+            );
+        } else if detail.starts_with("Unable to find build dependency:") {
+            self.emit(Stream::Stderr, format!("{detail}\n").as_bytes());
+        } else if resolved_command(self.host, test, self.options).is_none() {
+            self.missing_command(test);
+            self.emit(
+                Stream::Stderr,
+                format!("Unable to find executable: {}\n", test.command.program).as_bytes(),
+            );
+        } else {
+            self.emit(Stream::Stdout, format!("{detail}\n").as_bytes());
         }
     }
 
@@ -365,13 +407,19 @@ impl<'a> Report<'a> {
             return;
         }
         if failed == 0 {
-            self.write(format_args!("\n100% tests passed out of {counted}\n"));
+            self.write_summary_line(
+                format_args!("\n100% tests passed out of {counted}\n"),
+                false,
+            );
         } else {
             let percent = (100.0 * (counted - failed) as f64 / counted as f64).round() as u32;
-            self.write(format_args!(
-                "\n{}% tests passed, {failed} tests failed out of {counted}\n",
-                percent.min(99)
-            ));
+            self.write_summary_line(
+                format_args!(
+                    "\n{}% tests passed, {failed} tests failed out of {counted}\n",
+                    percent.min(99)
+                ),
+                true,
+            );
         }
         if self.label_summary || self.subproject_summary {
             self.label_summary(plan, statuses, subprojects);
@@ -464,7 +512,12 @@ impl<'a> Report<'a> {
                 let name = format!("{} ({label})", test.name);
                 let labels = labels(test);
                 if labels.is_empty() || !status.failed() {
-                    self.write(format_args!("\t{:>3} - {name}\n", test.number));
+                    let line = format_args!("\t{:>3} - {name}\n", test.number).to_string();
+                    if status.failed() {
+                        self.write_summary_line(format_args!("{line}"), true);
+                    } else {
+                        self.write(format_args!("{line}"));
+                    }
                 } else {
                     let padding = " ".repeat(50usize.saturating_sub(name.len()).max(1));
                     let labels = labels
@@ -472,13 +525,31 @@ impl<'a> Report<'a> {
                         .map(ToString::to_string)
                         .collect::<Vec<_>>()
                         .join(" ");
-                    self.write(format_args!(
-                        "\t{:>3} - {name}{padding}{labels}\n",
-                        test.number
-                    ));
+                    self.write_summary_line(
+                        format_args!("\t{:>3} - {name}{padding}{labels}\n", test.number),
+                        true,
+                    );
                 }
             }
         }
+    }
+}
+
+fn environment_error(detail: &str) -> Option<String> {
+    if let Some(operation) = detail.strip_prefix("Unknown environment modification operation: ") {
+        return Some(format!(
+            "Error: Unrecognized environment manipulation argument: {operation}"
+        ));
+    }
+    let entry = detail.strip_prefix("Invalid environment modification: ")?;
+    if entry.contains('=') {
+        Some(format!(
+            "Error: Missing `:` after the operation in: {entry}"
+        ))
+    } else {
+        Some(format!(
+            "Error: Missing `=` after the variable name in: {entry}"
+        ))
     }
 }
 

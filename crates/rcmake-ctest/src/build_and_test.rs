@@ -65,9 +65,16 @@ impl BuildAndTest {
                 b"--build-nocmake" => input.configure = false,
                 b"--build-two-config" => input.configure_twice = true,
                 b"--build-exe-dir" => input.executable_directory = Some(next()?),
-                b"--build-project" => {
+                b"--build-project"
+                | b"-S"
+                | b"-SP"
+                | b"--script"
+                | b"--script-new-process"
+                | b"--output-log"
+                | b"-O" => {
                     next()?;
                 }
+                b"--no-compress-output" => {}
                 b"--test-timeout" => {
                     let raw = next()?;
                     let value = raw
@@ -104,6 +111,25 @@ impl BuildAndTest {
         let cwd = host.initial_cwd();
         let source = cwd.join(path::to_native(&self.source));
         let build = cwd.join(path::to_native(&self.build));
+        if let Err(error) = host.create_dir_all(&build) {
+            let reason = if host
+                .metadata(&build, rcmake_host::Follow::Yes)
+                .is_ok_and(|entry| entry.kind != rcmake_host::FileKind::Dir)
+            {
+                "Not a directory"
+            } else {
+                &error.os_message
+            };
+            host.write_out(
+                Stream::Stdout,
+                format!(
+                    "Failed to change working directory to \"{}\": {reason}\n",
+                    build.display()
+                )
+                .as_bytes(),
+            );
+            return Ok(1);
+        }
         let (ctest, _) = rcmake_host::discover_cmake_root(host, argv0);
         let cmake = if ctest
             .extension()

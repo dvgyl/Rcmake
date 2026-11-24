@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use rcmake_base::BString;
 use rcmake_eval::{CmdError, CmdResult, Cx};
@@ -9,8 +9,8 @@ use crate::dart::Tag;
 use crate::junit::{escape, write_file};
 
 use super::{
-    Arguments, HandlerResult, Start, absolute, configuration, directory, error, handler_process,
-    prior_start, process_code, report_size, split_command, verbose, with_capture,
+    HandlerResult, absolute, configuration, directory, error, handler_process, prior_start,
+    process_code, report_size, split_command, verbose, with_capture,
 };
 
 pub(super) fn ctest_build(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
@@ -37,7 +37,17 @@ pub(super) fn ctest_build(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
                 b"CTEST_BINARY_DIRECTORY",
                 previous.as_ref().map(|start| start.build.as_path()),
             )?;
-            let preset = ctest_build_preset(cx, args, previous.as_ref())?;
+            let source = previous.as_ref().map_or_else(
+                || {
+                    absolute(
+                        &cx.host().initial_cwd(),
+                        &cx.var_or_empty(b"CTEST_SOURCE_DIRECTORY"),
+                    )
+                },
+                |start| start.source.clone(),
+            );
+            let preset =
+                super::preset::select(cx, args, &source, rcmake_presets::PresetKind::Build)?;
             let custom = cx.var_or_empty(b"CTEST_BUILD_COMMAND");
             let (cwd, command) = if custom.is_empty() || preset.is_some() {
                 let config = args
@@ -47,15 +57,12 @@ pub(super) fn ctest_build(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
                     .or_else(|| setting(cx, b"CTEST_CONFIGURATION_TYPE"))
                     .unwrap_or_default();
                 let mut command = vec![cx.var_or_empty(b"CMAKE_COMMAND"), "--build".into()];
-                let cwd = if let Some((source, name, file)) = preset {
-                    command.extend(["--preset".into(), name]);
-                    if let Some(file) = file {
-                        command.extend(["--presets-file".into(), path::from_native(&file)]);
-                    }
+                let cwd = if let Some(preset) = preset {
+                    preset.append_to(&mut command);
                     if !config.is_empty() {
                         command.extend(["--config".into(), config]);
                     }
-                    source
+                    source.clone()
                 } else {
                     let config = if config.is_empty() {
                         "Release".into()
@@ -94,26 +101,10 @@ pub(super) fn ctest_build(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
             }
             let command_line = render_command(&command);
             let start = cx.host().now();
-            let output = handler_process(cx, args, cwd, command)?;
-            let mut warnings = 0;
-            let mut errors = 0;
-            for line in output
-                .stdout
-                .split(|&byte| byte == b'\n')
-                .chain(output.stderr.split(|&byte| byte == b'\n'))
-            {
-                let text = String::from_utf8_lossy(line).to_ascii_lowercase();
-                errors += usize::from(text.contains("error:") || text.contains(" error "));
-                warnings += usize::from(text.contains("warning:") || text.contains(" warning "));
-            }
+            let output = handler_process(cx, args, cwd, &build, command)?;
             let code = process_code(&output).unwrap_or(-1);
-            let abnormal = matches!(output.results.last(), Some(ProcessResult::Signaled(_)))
-                || cfg!(unix) && (129..=192).contains(&code);
-            if abnormal && errors == 0 {
-                errors = 1;
-            }
+            let (errors, warnings, abnormal) = diagnostics(&output, code);
             args.set(cx, b"NUMBER_ERRORS", errors.to_string());
-            let warnings = warnings + usize::from(code != 0);
             args.set(cx, b"NUMBER_WARNINGS", warnings.to_string());
             if code != 0 {
                 cx.host()
@@ -129,22 +120,12 @@ pub(super) fn ctest_build(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
                         .as_bytes(),
                 );
             }
-            let source = previous.as_ref().map(|start| start.source.as_path());
-            let config = configuration(cx, &build, source)?;
+            let config = configuration(cx, &build, Some(&source))?;
             let tag = previous
                 .as_ref()
                 .map(|start| start.tag.clone())
                 .or_else(|| Tag::read(cx.host(), &build).ok());
             if let Some(tag) = tag {
-                let source = source.map_or_else(
-                    || {
-                        absolute(
-                            &cx.host().initial_cwd(),
-                            &cx.var_or_empty(b"CTEST_SOURCE_DIRECTORY"),
-                        )
-                    },
-                    Path::to_path_buf,
-                );
                 write_build_report(
                     cx.host(),
                     &build,
@@ -171,56 +152,24 @@ pub(super) fn ctest_build(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
     )
 }
 
-fn ctest_build_preset(
-    cx: &mut Cx<'_>,
-    args: &Arguments<'_>,
-    start: Option<&Start>,
-) -> Result<Option<(PathBuf, BString, Option<PathBuf>)>, CmdError> {
-    let specific = args.value(b"PRESET").cloned().or_else(|| {
-        cx.var(b"CTEST_BUILD_PRESET")
-            .filter(|name| !name.is_empty())
-    });
-    let Some(name) = specific
-        .clone()
-        .or_else(|| cx.var(b"CTEST_PRESET").filter(|name| !name.is_empty()))
-    else {
-        return Ok(None);
-    };
-    let cwd = cx.host().initial_cwd();
-    let source = start.map_or_else(
-        || absolute(&cwd, &cx.var_or_empty(b"CTEST_SOURCE_DIRECTORY")),
-        |start| start.source.clone(),
-    );
-    let file = args
-        .value(b"PRESETS_FILE")
-        .cloned()
-        .or_else(|| cx.var(b"CTEST_PRESETS_FILE"))
-        .filter(|file| !file.is_empty())
-        .map(|file| absolute(&source, &file));
-    let host = cx.host();
-    let presets = match &file {
-        Some(file) => rcmake_presets::load_file(&source, file, host),
-        None => rcmake_presets::load(&source, host),
-    };
-    let resolved = presets.and_then(|presets| {
-        presets.resolve(
-            rcmake_presets::PresetKind::Build,
-            &name,
-            &rcmake_presets::EnvSnapshot::from_host(host),
-        )
-    });
-    match resolved {
-        Ok(_) => Ok(Some((source, name, file))),
-        Err(failure) if specific.is_some() => Err(error(failure.message)),
-        Err(_) => {
-            host.write_out(
-                Stream::Stderr,
-                format!("No build preset named \"{name}\" found, ignoring CTEST_PRESET.\n")
-                    .as_bytes(),
-            );
-            Ok(None)
-        }
+pub(crate) fn diagnostics(output: &RunOutput, code: i32) -> (usize, usize, bool) {
+    let mut warnings = 0;
+    let mut errors = 0;
+    for line in output
+        .stdout
+        .split(|&byte| byte == b'\n')
+        .chain(output.stderr.split(|&byte| byte == b'\n'))
+    {
+        let text = String::from_utf8_lossy(line).to_ascii_lowercase();
+        errors += usize::from(text.contains("error:") || text.contains(" error "));
+        warnings += usize::from(text.contains("warning:") || text.contains(" warning "));
     }
+    let abnormal = matches!(output.results.last(), Some(ProcessResult::Signaled(_)))
+        || cfg!(unix) && (129..=192).contains(&code);
+    if abnormal && errors == 0 {
+        errors = 1;
+    }
+    (errors, warnings + usize::from(code != 0), abnormal)
 }
 
 fn setting(cx: &Cx<'_>, name: &[u8]) -> Option<BString> {
@@ -228,7 +177,7 @@ fn setting(cx: &Cx<'_>, name: &[u8]) -> Option<BString> {
     (!value.is_empty()).then_some(value)
 }
 
-fn render_command(command: &[BString]) -> String {
+pub(crate) fn render_command(command: &[BString]) -> String {
     use std::fmt::Write as _;
     let mut line = String::new();
     for arg in command {
@@ -244,19 +193,19 @@ fn render_command(command: &[BString]) -> String {
     line
 }
 
-struct BuildReport<'a> {
-    source: &'a Path,
-    config: &'a crate::dart::Configuration,
-    command: &'a str,
-    output: &'a RunOutput,
-    start: rcmake_host::FileTime,
-    code: i32,
-    errors: usize,
-    warnings: usize,
-    abnormal: bool,
+pub(crate) struct BuildReport<'a> {
+    pub(crate) source: &'a Path,
+    pub(crate) config: &'a crate::dart::Configuration,
+    pub(crate) command: &'a str,
+    pub(crate) output: &'a RunOutput,
+    pub(crate) start: rcmake_host::FileTime,
+    pub(crate) code: i32,
+    pub(crate) errors: usize,
+    pub(crate) warnings: usize,
+    pub(crate) abnormal: bool,
 }
 
-fn write_build_report(
+pub(crate) fn write_build_report(
     host: &dyn Host,
     dir: &Path,
     tag: &Tag,

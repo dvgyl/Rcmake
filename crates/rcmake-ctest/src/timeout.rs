@@ -50,7 +50,7 @@ fn grace(value: &BString) -> Result<Duration, String> {
     if cfg!(windows) {
         return Err("TIMEOUT_SIGNAL_GRACE_PERIOD is not supported on Windows.".into());
     }
-    let seconds = value.to_string().trim().parse::<f64>().unwrap_or_default();
+    let seconds = crate::cli::number_prefix(value).unwrap_or_default();
     if !seconds.is_finite() || seconds <= 0.0 {
         Err(format!(
             "TIMEOUT_SIGNAL_GRACE_PERIOD \"{value}\" is not greater than \"0\" seconds."

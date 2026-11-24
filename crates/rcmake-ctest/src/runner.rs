@@ -24,7 +24,7 @@ pub(crate) fn run_tests(
 #[derive(Default)]
 pub(crate) struct TestRunOutcome {
     pub(crate) outcome: CtestOutcome,
-    pub(crate) not_run: Vec<BString>,
+    pub(crate) start_error: bool,
     pub(crate) no_tests: bool,
 }
 
@@ -397,18 +397,17 @@ impl TestRun<'_> {
             .flatten()
             .all(|status| *status == execution::Status::Disabled);
         let mut outcome = CtestOutcome::default();
-        let mut not_run = Vec::new();
+        let mut start_error = false;
         for (test, &result) in report.plan.tests.iter().zip(report.statuses) {
             match result {
                 Some(execution::Status::Passed) => outcome.passed.push(test.name.clone()),
                 Some(status) if status.failed() => {
                     outcome.failed.push(test.name.clone());
-                    if status == execution::Status::NotRun
-                        && let Some(record) = report.records.get(&test.number)
-                        && junit::completion(status, record) != "Fixture dependency failed"
-                    {
-                        not_run.push(junit::output(test, status, record).into_owned().into());
-                    }
+                    start_error |= status == execution::Status::NotRun
+                        && test.timeout.errors.is_empty()
+                        && report.records.get(&test.number).is_some_and(|record| {
+                            junit::completion(status, record) != "Fixture dependency failed"
+                        });
                 }
                 _ => {}
             }
@@ -421,8 +420,8 @@ impl TestRun<'_> {
         }
         Ok(TestRunOutcome {
             outcome,
-            not_run,
-            no_tests: report.plan.tests.is_empty(),
+            start_error,
+            no_tests,
         })
     }
 

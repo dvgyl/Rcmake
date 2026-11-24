@@ -10,9 +10,10 @@ use rcmake_presets::{EnvSnapshot, PresetKind};
 use crate::cli::Invocation;
 use crate::dart::{self, Configuration, Model, Tag};
 
+mod build;
 pub(crate) mod instrumentation_xml;
 pub(crate) mod submit;
-mod update;
+pub(crate) mod update;
 
 pub(crate) fn run(host: &dyn Host, invocation: &Invocation) -> Result<Option<i32>, String> {
     let configure = invocation
@@ -25,6 +26,13 @@ pub(crate) fn run(host: &dyn Host, invocation: &Invocation) -> Result<Option<i32
                 .and_then(Model::parse)
                 .is_some()
         });
+    let build = invocation.actions.iter().any(|action| action == "build")
+        || invocation.definitions.iter().any(|definition| {
+            definition
+                .strip_suffix(b"Build")
+                .and_then(Model::parse)
+                .is_some()
+        });
     let start =
         invocation.actions.len() == 1 && invocation.actions.iter().any(|action| action == "start");
     let action = |name: &[u8]| {
@@ -34,6 +42,13 @@ pub(crate) fn run(host: &dyn Host, invocation: &Invocation) -> Result<Option<i32
             .any(|action| action.as_slice() == name)
     };
     if !configure {
+        if build {
+            let code = build::run(host, invocation)?;
+            if code != 0 || !(action(b"test") || action(b"memcheck")) {
+                return Ok(Some(code));
+            }
+            return Ok(None);
+        }
         if action(b"update") {
             return update::run(host, invocation).map(Some);
         }
@@ -107,7 +122,16 @@ pub(crate) fn run(host: &dyn Host, invocation: &Invocation) -> Result<Option<i32
     }
 
     missing_configuration(host, initial_build);
-    let preset = definition(b"CTEST_CONFIGURE_PRESET").or_else(|| definition(b"CTEST_PRESET"));
+    let preset = definition(b"CTEST_CONFIGURE_PRESET")
+        .filter(|value| !value.is_empty())
+        .or_else(|| definition(b"CTEST_PRESET").filter(|value| !value.is_empty()));
+    let presets_file = invocation
+        .presets_file
+        .as_ref()
+        .map(|file| cwd.join(file))
+        .or_else(|| {
+            definition(b"CTEST_PRESETS_FILE").map(|file| source.join(path::to_native(file)))
+        });
     let mut build = if invocation.build_dir.is_none() && !config.build_directory.is_empty() {
         cwd.join(path::to_native(&config.build_directory))
     } else {
@@ -115,7 +139,7 @@ pub(crate) fn run(host: &dyn Host, invocation: &Invocation) -> Result<Option<i32
     };
     let mut args = Vec::<BString>::new();
     if let Some(name) = preset {
-        let presets = match &invocation.presets_file {
+        let presets = match &presets_file {
             Some(file) => rcmake_presets::load_file(&source, file, host),
             None => rcmake_presets::load(&source, host),
         }
@@ -145,6 +169,9 @@ pub(crate) fn run(host: &dyn Host, invocation: &Invocation) -> Result<Option<i32
             build = source.join(path::to_native(&dir));
         }
         args.extend(["--preset".into(), name.into()]);
+        if let Some(file) = presets_file {
+            args.extend(["--presets-file".into(), path::from_native(&file)]);
+        }
     }
     args.extend([
         "-S".into(),
@@ -222,6 +249,7 @@ pub(crate) fn run(host: &dyn Host, invocation: &Invocation) -> Result<Option<i32
 fn definition<'a>(invocation: &'a Invocation, name: &[u8]) -> Option<&'a [u8]> {
     invocation.definitions.iter().rev().find_map(|value| {
         let (key, value) = dart::split(value, b'=')?;
+        let key = dart::split(key, b':').map_or(key, |(key, _)| key);
         (key == name).then_some(value)
     })
 }

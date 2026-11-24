@@ -1,6 +1,6 @@
 use std::error::Error;
 
-use rcmake_host::{PureHost, ReadRange};
+use rcmake_host::{HostError, PureHost, ReadRange};
 
 use super::*;
 
@@ -33,7 +33,7 @@ fn checks_test_arguments_in_input_order() -> Result<(), Box<dyn Error>> {
         "requires a value for INCLUDE\n\
          called with more than one value for QUIET\n\
          Error after keyword \"INCLUDE_LABEL\":\n  missing required value\n\
-         called with unknown argument \"UNKNOWN\"\n",
+         ctest_test called with unknown argument \"UNKNOWN\".\n",
     );
     Ok(())
 }
@@ -83,7 +83,11 @@ fn configures_from_a_ctest_link_outside_the_install_directory() -> Result<(), Bo
     "#,
     )?;
     host.set_command_handler(move |_, request, _| {
-        assert_eq!(path::to_native(&request.pipeline[0].program), cmake);
+        let command = request
+            .pipeline
+            .first()
+            .ok_or_else(|| HostError::unsupported("Missing configure command"))?;
+        assert_eq!(path::to_native(&command.program), cmake);
         Ok(RunOutput {
             results: vec![ProcessResult::Exited(0)],
             ..RunOutput::default()
@@ -140,12 +144,15 @@ fn runs_dashboard_handlers_and_sets_script_variables() -> Result<(), Box<dyn Err
     "#)?;
     host.set_command_handler(|_, request, _| {
         assert_eq!(request.cwd, Path::new("/work/build"));
-        let command = &request.pipeline[0];
+        let command = request
+            .pipeline
+            .first()
+            .ok_or_else(|| HostError::unsupported("Missing dashboard command"))?;
         let (code, text): (_, &[u8]) = if command.program == "runner" {
             (12, b"test output")
         } else {
             assert_eq!(command.program, "fake-cmake");
-            if command.args[0] == "--build" {
+            if command.args.first().is_some_and(|arg| arg == "--build") {
                 assert_eq!(
                     command.args,
                     [
@@ -207,10 +214,11 @@ fn runs_dashboard_handlers_and_sets_script_variables() -> Result<(), Box<dyn Err
 fn starts_a_child_ctest_for_sp() -> Result<(), Box<dyn Error>> {
     let host = Arc::new(PureHost::default());
     host.set_command_handler(|_, request, _| {
-        assert_eq!(
-            request.pipeline[0].args,
-            ["-S", "/work/dashboard.cmake,argument", "-V"]
-        );
+        let command = request
+            .pipeline
+            .first()
+            .ok_or_else(|| HostError::unsupported("Missing child CTest command"))?;
+        assert_eq!(command.args, ["-S", "/work/dashboard.cmake,argument", "-V"]);
         assert!(
             request
                 .env

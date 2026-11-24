@@ -210,7 +210,7 @@ pub(crate) fn register_test(test: Test) {
     });
 }
 
-fn set_properties(_: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
+fn set_properties(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
     let Some(keyword) = args.iter().position(|arg| arg.value == "PROPERTIES") else {
         return Err(CmdError::Status("requires the PROPERTIES keyword".into()));
     };
@@ -221,13 +221,29 @@ fn set_properties(_: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
             "requires test names and property-value pairs".into(),
         ));
     }
+    let directory = cx.current_binary_dir();
     COLLECTOR.with_borrow_mut(|state| {
         for name in names {
             if let Some(ids) = state.names.get(&name.value) {
                 for &id in ids {
-                    if let Some(test) = state.tests.get_mut(id) {
+                    if let Some(test) = state
+                        .tests
+                        .get_mut(id)
+                        .filter(|test| test.directory == directory)
+                    {
                         for [key, value] in pairs {
                             test.timeout.apply(&key.value, &value.value);
+                            if key.value == "TIMEOUT_AFTER_MATCH" {
+                                let count = list::split(&value.value, list::Empty::Drop).len();
+                                if count != 2 {
+                                    let message = format!(
+                                        "TIMEOUT_AFTER_MATCH expects two arguments, found {count}\n"
+                                    );
+                                    cx.host()
+                                        .write_out(rcmake_host::Stream::Stderr, message.as_bytes());
+                                    continue;
+                                }
+                            }
                             if matches!(key.value.as_slice(), b"REQUIRED_FILES" | b"LABELS") {
                                 let property =
                                     test.properties.entry(key.value.clone()).or_default();

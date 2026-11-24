@@ -1,5 +1,8 @@
-use rcmake_base::truth;
-use rcmake_host::{Host, ProcessResult, path};
+use std::fmt::Write as _;
+use std::path::Path;
+
+use rcmake_base::{BString, truth};
+use rcmake_host::{FileTime, Host, ProcessResult, path};
 use rcmake_presets::{EnvSnapshot, PresetKind};
 
 use crate::cli::Invocation;
@@ -51,6 +54,7 @@ pub(super) fn run(host: &dyn Host, invocation: &Invocation) -> Result<i32, Strin
             )
         })
         .map_err(|error| error.to_string())?;
+    let started = host.now();
     let program = definition(invocation, b"CTEST_UPDATE_COMMAND").unwrap_or(&config.update_command);
     let version_only =
         definition(invocation, b"CTEST_UPDATE_VERSION_ONLY").is_some_and(truth::is_on);
@@ -75,18 +79,82 @@ pub(super) fn run(host: &dyn Host, invocation: &Invocation) -> Result<i32, Strin
     } else {
         "Update command failed."
     };
-    let xml = format!(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Update mode=\"Client\">\n<Site>{}</Site>\n<BuildName>{}</BuildName>\n<BuildStamp>{}-{}</BuildStamp>\n<UpdateReturnStatus>{status}</UpdateReturnStatus>\n</Update>\n",
-        escape(&config.site, false),
-        escape(&config.build_name, false),
-        tag.stamp(),
-        escape(tag.track.as_bytes(), false),
+    write_report(
+        host,
+        &build,
+        &tag,
+        &config,
+        Report {
+            started,
+            command: program,
+            repository: "Unknown",
+            revision: definition(invocation, b"CTEST_UPDATE_VERSION_OVERRIDE"),
+            status,
+        },
+    )?;
+    Ok(if succeeded { 0 } else { 1 })
+}
+
+pub(crate) struct Report<'a> {
+    pub(crate) started: FileTime,
+    pub(crate) command: &'a [u8],
+    pub(crate) repository: &'a str,
+    pub(crate) revision: Option<&'a [u8]>,
+    pub(crate) status: &'a str,
+}
+
+pub(crate) fn write_report(
+    host: &dyn Host,
+    build: &Path,
+    tag: &Tag,
+    config: &Configuration,
+    report: Report<'_>,
+) -> Result<(), String> {
+    let mut xml = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Update mode=\"Client\" Generator=\"ctest-{}\">\n",
+        rcmake_base::CMAKE_VERSION_STR
     );
+    let ended = host.now();
+    let date = |time| crate::reporting::format_date(host, time, true, "%b %d %H:%M GMT");
+    for (name, value) in [
+        ("Site", config.site.clone()),
+        ("BuildName", config.build_name.clone()),
+        (
+            "BuildStamp",
+            format!("{}-{}", tag.stamp(), tag.track).into(),
+        ),
+        ("StartDateTime", date(report.started).into()),
+        ("StartTime", report.started.secs.to_string().into()),
+        ("UpdateCommand", report.command.into()),
+        ("UpdateType", report.repository.into()),
+    ] {
+        let _ = writeln!(xml, "<{name}>{}</{name}>", escape(&value, false));
+    }
+    if let Some(revision) = report.revision {
+        let _ = writeln!(xml, "<Revision>{}</Revision>", escape(revision, false));
+    }
+    if !config.change_id.is_empty() {
+        let _ = writeln!(
+            xml,
+            "<ChangeId>{}</ChangeId>",
+            escape(&config.change_id, false)
+        );
+    }
+    let minutes = ended.secs.saturating_sub(report.started.secs).max(0) / 60;
+    let values: [(&str, BString); 4] = [
+        ("EndDateTime", date(ended).into()),
+        ("EndTime", ended.secs.to_string().into()),
+        ("ElapsedMinutes", minutes.to_string().into()),
+        ("UpdateReturnStatus", report.status.into()),
+    ];
+    for (name, value) in values {
+        let _ = writeln!(xml, "<{name}>{}</{name}>", escape(&value, false));
+    }
+    xml.push_str("</Update>\n");
     write_file(
         host,
         &build.join("Testing").join(tag.stamp()).join("Update.xml"),
         xml.as_bytes(),
     )
-    .map_err(|error| error.to_string())?;
-    Ok(if succeeded { 0 } else { 1 })
+    .map_err(|error| error.to_string())
 }

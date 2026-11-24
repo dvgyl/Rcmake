@@ -1,5 +1,5 @@
 use rcmake_base::BString;
-use rcmake_diag::{PolicyId, PolicyStatus};
+use rcmake_diag::{Effect, MessageKind, PolicyId, PolicyStatus};
 use rcmake_eval::{CmdError, CmdFlags, CmdResult, Cx, Flow, Registry};
 use rcmake_expr::ExpandedArg;
 use rcmake_model::{BT, PropScope, TestEntry};
@@ -151,7 +151,14 @@ fn parse_test_options(test: &mut TestEntry, mut args: &[&[u8]]) -> Result<(), Cm
                 test.working_directory = Some(directory);
                 args = rest;
             }
-            b"COMMAND_EXPAND_LISTS" => test.command_expand_lists = true,
+            b"COMMAND_EXPAND_LISTS" => {
+                if test.command_expand_lists {
+                    return Err(CmdError::status(
+                        "may be given at most one COMMAND_EXPAND_LISTS.",
+                    ));
+                }
+                test.command_expand_lists = true;
+            }
             b"__CMP0178" => {
                 test_launcher_policy(test, args.first().copied())?;
                 args = args.get(1..).unwrap_or_default();
@@ -196,10 +203,13 @@ fn set_tests_properties(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
     let (tests, dir) = match tests {
         [tests @ .., b"DIRECTORY", directory] => (tests, scoped_test_directory(cx, directory)?),
         [.., b"DIRECTORY"] => {
-            return Err(crate::command_error(
-                cx,
-                "Error after keyword \"DIRECTORY\":\n  missing required value",
-            ));
+            cx.issue(
+                MessageKind::Error,
+                Effect::SetError,
+                None,
+                "Error after keyword \"DIRECTORY\":\n  missing required value".into(),
+            );
+            return Ok(Flow::Normal);
         }
         _ => (tests, cx.current_dir_id()),
     };

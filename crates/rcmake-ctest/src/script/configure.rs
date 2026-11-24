@@ -12,7 +12,7 @@ pub(super) fn ctest_configure(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResul
     with_capture(
         cx,
         args,
-        &[b"SOURCE", b"OPTIONS"],
+        &[b"SOURCE", b"OPTIONS", b"PRESET", b"PRESETS_FILE"],
         &[b"APPEND"],
         |cx, args| {
             let previous = prior_start();
@@ -37,10 +37,17 @@ pub(super) fn ctest_configure(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResul
                     "called with invalid source directory. CTEST_SOURCE_DIRECTORY must be set to a directory that contains CMakeLists.txt.",
                 ));
             }
+            let preset =
+                super::preset::select(cx, args, &source, rcmake_presets::PresetKind::Configure)?;
             let custom = cx.var_or_empty(b"CTEST_CONFIGURE_COMMAND");
-            let command = if custom.is_empty() {
+            let cwd = if preset.is_some() {
+                source.clone()
+            } else {
+                build.clone()
+            };
+            let command = if custom.is_empty() || preset.is_some() {
                 let generator = cx.var_or_empty(b"CTEST_CMAKE_GENERATOR");
-                if generator.is_empty() {
+                if generator.is_empty() && preset.is_none() {
                     return Err(error(
                         "requires CTEST_CMAKE_GENERATOR or CTEST_CONFIGURE_COMMAND",
                     ));
@@ -53,8 +60,12 @@ pub(super) fn ctest_configure(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResul
                     [b"-B", path::from_native_cmake(&build).as_slice()]
                         .concat()
                         .into(),
-                    [b"-G", generator.as_slice()].concat().into(),
                 ];
+                if let Some(preset) = preset {
+                    preset.append_to(&mut command);
+                } else {
+                    command.push([b"-G", generator.as_slice()].concat().into());
+                }
                 if let Some(options) = args.value(b"OPTIONS") {
                     command.extend(list::split(options, list::Empty::Drop));
                 }
@@ -77,7 +88,7 @@ pub(super) fn ctest_configure(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResul
             if verbose() && !args.flag(b"QUIET") {
                 cx.host().write_out(Stream::Stdout, b"Configure project\n");
             }
-            let output = handler_process(cx, args, build, command)?;
+            let output = handler_process(cx, args, cwd, &build, command)?;
             let code = process_code(&output).unwrap_or(-1);
             if code != 0 {
                 cx.host()
