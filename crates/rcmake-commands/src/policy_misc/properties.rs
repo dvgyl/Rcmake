@@ -316,8 +316,12 @@ pub(super) fn set(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
                 .map(|target| writable_target(cx, target))
                 .collect::<Result<Vec<_>, _>>()?;
             for target in targets {
-                let scope = PropScope::Target(target);
-                update_scoped(cx, &scope, name, value.clone(), update)?;
+                if *name == b"IMPORTED_GLOBAL" {
+                    set_imported_global(cx, target, value.as_ref(), update)?;
+                } else {
+                    let scope = PropScope::Target(target);
+                    update_scoped(cx, &scope, name, value.clone(), update)?;
+                }
             }
         }
         b"TEST" => {
@@ -362,6 +366,49 @@ pub(super) fn set(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
     Ok(Flow::Normal)
 }
 
+fn set_imported_global(
+    cx: &mut Cx<'_>,
+    id: TargetId,
+    value: Option<&BString>,
+    update: Update,
+) -> Result<(), CmdError> {
+    let dir = cx.current_dir_id();
+    let project = cx.project();
+    let target = project
+        .target(id)
+        .ok_or_else(|| status(ModelError::UnknownObject.to_string()))?;
+    let name = target.name.clone();
+    let invalid_directory =
+        target.dir != dir && target.is_imported() && matches!(update, Update::Set);
+    let error = if !target.is_imported() {
+        Some(format!(
+            "IMPORTED_GLOBAL property can't be set on non-imported targets(\"{name}\")"
+        ))
+    } else if !matches!(update, Update::Set) {
+        Some(format!(
+            "IMPORTED_GLOBAL property can't be appended, only set on imported targets (\"{name}\")"
+        ))
+    } else if !value.is_some_and(|value| rcmake_base::truth::is_on(value)) {
+        Some(format!(
+            "IMPORTED_GLOBAL property can't be set to FALSE on targets (\"{name}\")"
+        ))
+    } else {
+        project
+            .set_imported_global(id)
+            .map_err(|err| status(err.to_string()))?;
+        None
+    };
+    if let Some(error) = error {
+        cx.issue(MessageKind::Error, Effect::SetError, None, error.into());
+    }
+    if invalid_directory {
+        cx.issue(MessageKind::Error, Effect::SetError, None, format!(
+            "Attempt to promote imported target \"{name}\" to global scope (by setting IMPORTED_GLOBAL) which is not built in this directory."
+        ).into());
+    }
+    Ok(())
+}
+
 /// Apply `update` to a model-owned property scope.
 fn update_scoped(
     cx: &mut Cx<'_>,
@@ -385,6 +432,14 @@ fn update_scoped(
     {
         return Ok(());
     }
+    let value = if matches!(scope, PropScope::Target(_))
+        && name == b"SOURCES"
+        && !matches!(update, Update::AppendString)
+    {
+        value.map(|value| list::join(list::split(&value, list::Empty::Drop)))
+    } else {
+        value
+    };
     let backtrace = cx.backtrace();
     let origin = PropOrigin {
         dir: cx.current_dir_id(),
@@ -426,11 +481,29 @@ fn update_scoped(
     }
 }
 
-fn source_scope(cx: &Cx<'_>, dir: DirId, source: &[u8]) -> PropScope {
-    PropScope::Source {
-        dir,
-        path: path::from_native(&normalized_path(&cx.resolve_path(source))),
+fn source_scope(cx: &mut Cx<'_>, dir: DirId, source: &[u8]) -> PropScope {
+    let resolved = normalized_path(&cx.resolve_path(source));
+    let mut key = path::from_native(&resolved);
+    let binary = normalized_path(&cx.current_binary_dir().join(path::to_native(source)));
+    let binary = path::from_native(&binary);
+    let known = &mut cx.project().dir_mut(dir).source_props;
+    if !known.contains_key(&key) {
+        if known.contains_key(&binary) {
+            key = binary;
+        } else if resolved.extension().is_none()
+            && let Some(existing) = known.keys().find(|candidate| {
+                [key.as_slice(), binary.as_slice()].iter().any(|prefix| {
+                    candidate
+                        .strip_prefix(*prefix)
+                        .is_some_and(|suffix| suffix.starts_with(b".") && !suffix.contains(&b'/'))
+                })
+            })
+        {
+            key = existing.clone();
+        }
     }
+    known.entry(key.clone()).or_default();
+    PropScope::Source { dir, path: key }
 }
 
 fn install_prop_name(file: &[u8], name: &[u8]) -> BString {
@@ -952,6 +1025,14 @@ fn directory_value(cx: &mut Cx<'_>, dir: DirId, name: &[u8], inherited: bool) ->
     match name {
         b"VARIABLES" if dir == cx.current_dir_id() => Some(list::join(cx.variable_names())),
         b"CACHE_VARIABLES" => Some(cache_names(cx)),
+        b"RULES" => Some(list::join(
+            cx.project()
+                .dir(dir)
+                .props
+                .names()
+                .iter()
+                .filter_map(|key| key.strip_prefix(b"_RCMAKE_CUSTOM_RULE_")),
+        )),
         b"MACROS" => Some(
             cx.project()
                 .dir(dir)
@@ -1063,4 +1144,133 @@ pub(super) fn get_cmake(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
     };
     cx.set_var(&out.value, value.unwrap_or_else(|| "NOTFOUND".into()));
     Ok(Flow::Normal)
+}
+
+pub(super) fn print_value(
+    cx: &mut Cx<'_>,
+    scope: &[u8],
+    object: &[u8],
+    name: &[u8],
+) -> Result<Option<Option<BString>>, CmdError> {
+    let dir = cx.current_dir_id();
+    let inherited = is_inherited(cx, scope, name);
+    let value = match scope {
+        b"TARGET" => {
+            let id = find_target(cx, object)?;
+            if let Some(config) = location_config(name) {
+                let model = cx.project();
+                if !model
+                    .target(id)
+                    .is_some_and(rcmake_model::Target::is_imported)
+                {
+                    cx.issue(
+                        rcmake_diag::MessageKind::Warning,
+                        rcmake_diag::Effect::None,
+                        None,
+                        format!(
+                            "The {} property may not be read from non-imported target \"{}\"; skipping.",
+                            BString::from(name),
+                            BString::from(object)
+                        ).into(),
+                    );
+                    return Ok(None);
+                }
+                let owner = PropScope::Target(id);
+                let configuration = config
+                    .filter(|name| !name.is_empty())
+                    .map(|name| name.to_ascii_uppercase())
+                    .or_else(|| {
+                        let value = cx.var_or_empty(b"CMAKE_BUILD_TYPE");
+                        (!value.is_empty()).then(|| value.to_ascii_uppercase())
+                    });
+                let model = cx.project();
+                configuration
+                    .and_then(|config| {
+                        model.get_prop(&owner, &[b"IMPORTED_LOCATION_", config.as_slice()].concat())
+                    })
+                    .or_else(|| model.get_prop(&owner, b"IMPORTED_LOCATION"))
+                    .or_else(|| {
+                        let configurations = model.get_prop(&owner, b"IMPORTED_CONFIGURATIONS")?;
+                        list::split(&configurations, list::Empty::Drop)
+                            .into_iter()
+                            .find_map(|config| {
+                                model.get_prop(
+                                    &owner,
+                                    &[
+                                        b"IMPORTED_LOCATION_".as_slice(),
+                                        &config.to_ascii_uppercase(),
+                                    ]
+                                    .concat(),
+                                )
+                            })
+                    })
+            } else {
+                alias_value(cx, object, name)
+                    .or_else(|| model_value(cx, &PropScope::Target(id), name, inherited))
+            }
+        }
+        b"DIRECTORY" => {
+            let id = check_directory(cx, &[object])?;
+            directory_value(cx, id, name, inherited)
+        }
+        b"SOURCE" => {
+            let owner = source_scope(cx, dir, object);
+            source_value(cx, &owner, name, inherited).or_else(|| {
+                (name == b"LANGUAGE").then(|| {
+                    let extension = object.rsplit(|&b| b == b'.').next().unwrap_or_default();
+                    let languages = global_value(cx, b"ENABLED_LANGUAGES").unwrap_or_default();
+                    for language in list::split(&languages, list::Empty::Drop) {
+                        let key =
+                            [b"CMAKE_", language.as_slice(), b"_SOURCE_FILE_EXTENSIONS"].concat();
+                        if list::split(&cx.var_or_empty(&key), list::Empty::Drop)
+                            .iter()
+                            .any(|item| item == extension)
+                        {
+                            return language;
+                        }
+                    }
+                    BString::default()
+                })
+            })
+        }
+        b"TEST" => {
+            if cx.project().find_test(dir, object).is_none() {
+                return Err(status(quoted(
+                    "given TEST name that does not exist: ",
+                    object,
+                    "",
+                )));
+            }
+            model_value(
+                cx,
+                &PropScope::Test {
+                    dir,
+                    name: object.into(),
+                },
+                name,
+                inherited,
+            )
+        }
+        b"CACHE" => cx
+            .project()
+            .get_prop(&PropScope::Cache(object.into()), name),
+        _ => None,
+    };
+    Ok(Some(value))
+}
+
+// The suffix form excludes the IMPORTED_LOCATION property.
+fn location_config(name: &[u8]) -> Option<Option<&[u8]>> {
+    if name == b"LOCATION" {
+        Some(None)
+    } else if let Some(config) = name.strip_prefix(b"LOCATION_") {
+        Some(Some(config))
+    } else if let Some(config) = name
+        .strip_suffix(b"_LOCATION")
+        .filter(|&p| p != b"IMPORTED")
+    {
+        Some(Some(config))
+    } else {
+        None
+    }
 }

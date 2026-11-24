@@ -1,12 +1,13 @@
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
 use std::path::{Component, Path, PathBuf};
+use std::time::Duration;
 
 use rcmake_base::{BString, list};
 use rcmake_diag::{FrameKind, PolicyId, PolicyStatus};
 use rcmake_eval::{CmdError, CmdResult, Cx, Flow, UserCommandKind};
 use rcmake_expr::ExpandedArg;
-use rcmake_host::{FileKind, Follow, path};
+use rcmake_host::{CommandSpec, FileKind, Follow, Input, Output, ProcessResult, RunRequest, path};
 use rcmake_model::{CacheEntry, CacheType};
 use rcmake_syntax::ArgKind;
 
@@ -365,6 +366,8 @@ fn directories(cx: &Cx<'_>, kind: Kind, options: &Options) -> Vec<PathBuf> {
         );
         if library {
             add_framework_dirs(cx, &mut paths, cmake_paths(cx, b"CMAKE_FRAMEWORK_PATH"));
+        } else if matches!(kind, Kind::Program) {
+            add_framework_dirs(cx, &mut paths, cmake_paths(cx, b"CMAKE_APPBUNDLE_PATH"));
         }
     }
     if use_default(
@@ -385,6 +388,8 @@ fn directories(cx: &Cx<'_>, kind: Kind, options: &Options) -> Vec<PathBuf> {
         );
         if library {
             add_framework_dirs(cx, &mut paths, env_paths(cx, b"CMAKE_FRAMEWORK_PATH"));
+        } else if matches!(kind, Kind::Program) {
+            add_framework_dirs(cx, &mut paths, env_paths(cx, b"CMAKE_APPBUNDLE_PATH"));
         }
     }
     paths.extend(options.hints.iter().map(|dir| cx.resolve_path(dir)));
@@ -413,6 +418,12 @@ fn directories(cx: &Cx<'_>, kind: Kind, options: &Options) -> Vec<PathBuf> {
                 cx,
                 &mut paths,
                 cmake_paths(cx, b"CMAKE_SYSTEM_FRAMEWORK_PATH"),
+            );
+        } else if matches!(kind, Kind::Program) {
+            add_framework_dirs(
+                cx,
+                &mut paths,
+                cmake_paths(cx, b"CMAKE_SYSTEM_APPBUNDLE_PATH"),
             );
         }
     }
@@ -631,6 +642,7 @@ struct Search<'a> {
 enum SearchPass {
     Regular,
     Framework,
+    AppBundle,
 }
 
 #[derive(Clone, Copy)]
@@ -731,10 +743,18 @@ impl<'a> Search<'a> {
                 return Ok(None);
             }
         }
-        let passes = if matches!(self.kind, Kind::Library) {
-            FrameworkOrder::new(cx).passes()
-        } else {
-            &[SearchPass::Regular]
+        let passes = match self.kind {
+            Kind::Library => FrameworkOrder::new(cx).passes(),
+            Kind::Program if cx.host().system().sysname == b"Darwin" => {
+                use SearchPass::{AppBundle, Regular};
+                match cx.var_or_empty(b"CMAKE_FIND_APPBUNDLE").as_slice() {
+                    b"NEVER" => &[Regular][..],
+                    b"ONLY" => &[AppBundle],
+                    b"LAST" => &[Regular, AppBundle],
+                    _ => &[AppBundle, Regular],
+                }
+            }
+            _ => &[SearchPass::Regular],
         };
         for &pass in passes {
             if let Some(found) = self.scan(cx, &dirs, &names, pass)? {
@@ -754,8 +774,9 @@ impl<'a> Search<'a> {
         let search = match pass {
             SearchPass::Regular => Self::in_directory,
             SearchPass::Framework => Self::framework,
+            SearchPass::AppBundle => Self::app_bundle,
         };
-        if self.options.names_per_dir {
+        if self.options.names_per_dir && !matches!(pass, SearchPass::AppBundle) {
             for name in names.iter().filter(|name| name.is_absolute()) {
                 if let Some(found) = search(self, cx, Path::new(""), name)? {
                     return Ok(Some(found));
@@ -814,6 +835,26 @@ impl<'a> Search<'a> {
                 self.match_path = Some(path.clone());
                 return Ok(Some(path));
             }
+        }
+        Ok(None)
+    }
+
+    fn app_bundle(
+        &mut self,
+        cx: &mut Cx<'_>,
+        dir: &Path,
+        name: &Path,
+    ) -> Result<Option<PathBuf>, CmdError> {
+        let Some(stem) = name.file_name() else {
+            return Ok(None);
+        };
+        let mut bundle_name = name.as_os_str().to_os_string();
+        bundle_name.push(".app");
+        let bundle = dir.join(bundle_name);
+        let executable = bundle_executable(cx, &bundle, stem);
+        if !self.ignored.ignores_prefix(&executable) && candidate(cx, Kind::File, &executable) {
+            self.match_path = Some(executable.clone());
+            return Ok(Some(executable));
         }
         Ok(None)
     }
@@ -1137,11 +1178,90 @@ fn library_parts(cx: &Cx<'_>, var: &[u8], default: &[u8]) -> Vec<BString> {
     }
 }
 
-fn candidate(cx: &Cx<'_>, kind: Kind, candidate: &Path) -> bool {
-    cx.host()
-        .metadata(candidate, Follow::Yes)
-        .is_ok_and(|metadata| {
-            metadata.kind == FileKind::File
-                && (!matches!(kind, Kind::Program) || cfg!(windows) || metadata.mode & 0o111 != 0)
-        })
+fn bundle_executable(cx: &Cx<'_>, bundle: &Path, stem: &std::ffi::OsStr) -> PathBuf {
+    let contents = bundle.join("Contents");
+    let plist = contents.join("Info.plist");
+    let host = cx.host();
+    let executable = if host
+        .metadata(&plist, Follow::Yes)
+        .is_ok_and(|info| info.kind == FileKind::File)
+    {
+        let request = RunRequest {
+            pipeline: vec![CommandSpec {
+                program: "/usr/bin/plutil".into(),
+                args: vec![
+                    "-extract".into(),
+                    "CFBundleExecutable".into(),
+                    "raw".into(),
+                    "-o".into(),
+                    "-".into(),
+                    path::from_native(&plist),
+                ],
+            }],
+            cwd: cx.current_binary_dir(),
+            env: host.env_all(),
+            stdin: Input::Null,
+            stdout: Output::Capture,
+            stderr: Output::Null,
+            timeout: Some(Duration::from_secs(2)),
+            tee: false,
+        };
+        host.run(&request, &mut |_, _| {})
+            .ok()
+            .filter(|run| run.results == [ProcessResult::Exited(0)])
+            .map(|run| path::to_native(run.stdout.strip_suffix(b"\n").unwrap_or(&run.stdout)))
+            .filter(|name| {
+                matches!(
+                    name.components().collect::<Vec<_>>().as_slice(),
+                    [Component::Normal(_)]
+                )
+            })
+    } else {
+        None
+    };
+    normalize(
+        &contents
+            .join("MacOS")
+            .join(executable.as_deref().unwrap_or_else(|| Path::new(stem))),
+    )
+}
+
+fn candidate(cx: &mut Cx<'_>, kind: Kind, path: &Path) -> bool {
+    let Ok(metadata) = cx.host().metadata(path, Follow::Yes) else {
+        return false;
+    };
+    if metadata.kind != FileKind::File {
+        return false;
+    }
+    if !matches!(kind, Kind::Program) || cfg!(windows) {
+        return true;
+    }
+
+    let executable = metadata.mode & 0o111 != 0;
+    let policy = PolicyId::new(109);
+    let state = cx.policy(policy);
+    if state == PolicyStatus::New {
+        return executable;
+    }
+    let readable = metadata.mode & 0o444 != 0
+        && cx
+            .host()
+            .read(
+                path,
+                rcmake_host::ReadRange::Slice {
+                    offset: 0,
+                    len: Some(0),
+                },
+            )
+            .is_ok();
+    if state == PolicyStatus::Warn && readable != executable {
+        let reason = if readable {
+            "is readable but not executable.  CMake is using it for compatibility."
+        } else {
+            "is executable but not readable.  CMake is ignoring it for compatibility."
+        };
+        let body = format!("The file\n  {}\n{reason}", path.display());
+        cx.issue_policy_warning(policy, b"", body.as_bytes());
+    }
+    readable
 }

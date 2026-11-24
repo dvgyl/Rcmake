@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use rcmake_base::{BString, ByteSlice as _};
+use rcmake_diag::{PolicyId, PolicyStatus};
 use rcmake_eval::{Interp, InterpConfig, RunMode};
 use rcmake_host::{
     CommandSpec, Host, HostError, HostResult, Input, NativeHost, Output, ProcessResult, PureHost,
@@ -495,6 +496,12 @@ fn find_program_requires_a_regular_executable_file_and_supports_both_loop_orders
         host.seed_file(Path::new(file), b"")?;
         host.set_permissions(Path::new(file), 0o711)?;
     }
+    assert!(
+        interp
+            .cx()
+            .set_policy(PolicyId::new(109), PolicyStatus::New)
+            .is_ok()
+    );
     let script = r#"
 find_program(NAMES_FIRST NAMES only_dir first second PATHS one two NO_DEFAULT_PATH)
 find_program(DIRS_FIRST NAMES only_dir first second PATHS one two NAMES_PER_DIR NO_DEFAULT_PATH)

@@ -300,6 +300,13 @@ fn apply_version(cx: &mut Cx<'_>, raw: &[u8], required: bool) -> CmdResult {
             .ok_or_else(|| invalid_version(cx, "CMAKE_POLICY_VERSION_MINIMUM", &floor))?;
         effective = effective.max(version);
     }
+    // Older install(EXPORT) files set policy version 2.6 in a policy scope.
+    let legacy_export = !required
+        && (effective.major(), effective.minor(), effective.patch()) == (2, 6, 0)
+        && cx.parent_policy(PolicyId::new(66)).is_some();
+    if legacy_export {
+        effective = Version::from_tuple(3, 5, 0);
+    }
     let result = if required {
         cx.set_cmake_minimum_required(minimum, &effective)
     } else {
@@ -330,7 +337,7 @@ fn apply_version(cx: &mut Cx<'_>, raw: &[u8], required: bool) -> CmdResult {
         cx.set_policy(policy.id, state)
             .map_err(|error| policy_error(cx, error))?;
     }
-    if effective < Version::from_tuple(3, 10, 0) {
+    if !legacy_export && effective < Version::from_tuple(3, 10, 0) {
         cx.issue(
             MessageKind::DeprecationWarning,
             Effect::None,

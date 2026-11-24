@@ -7,7 +7,9 @@ use rcmake_eval::{CmdError, CmdFlags, Registry};
 use rcmake_expr::ExpandedArg;
 
 mod arguments;
+mod experimental;
 mod files;
+mod introspection;
 mod language;
 mod policies;
 mod project;

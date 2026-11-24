@@ -62,9 +62,22 @@ fn language_operation(cx: &mut Cx<'_>, args: &mut LanguageArgs<'_>) -> CmdResult
             cx.call_command(&command, expanded)
         }
         b"DEFER" => defer(cx, args),
+        b"PRINT_TARGETS" | b"PRINT_VARIABLES" | b"PRINT_PROPERTIES" => {
+            let args = args.finish(cx)?;
+            let args = super::values(&args);
+            match op.as_slice() {
+                b"PRINT_TARGETS" => super::introspection::targets(cx, &args),
+                b"PRINT_VARIABLES" => super::introspection::variables(cx, &args),
+                _ => super::introspection::properties(cx, &args),
+            }
+        }
         b"EVAL" => {
             let args = args.finish(cx)?;
             eval(cx, &args)
+        }
+        b"GET_EXPERIMENTAL_FEATURE_ENABLED" => {
+            let args = args.finish(cx)?;
+            super::experimental::enabled(cx, &super::values(&args))
         }
         b"GET_MESSAGE_LOG_LEVEL" => {
             let args = args.finish(cx)?;
