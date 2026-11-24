@@ -1,17 +1,21 @@
 //! Select libraries for the Xcode Frameworks build phase.
 
-use std::{collections::BTreeSet, path::Path};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::Path,
+};
 
-use rcmake_base::BString;
+use rcmake_base::{BString, shell::quote};
+use rcmake_host::path::to_native;
 use rcmake_model::TargetKind;
 use rcmake_resolve::{
-    LinkFragmentRole, ResolvedTarget,
-    ide::{IdeLinkItem, IdeSourceKind},
+    BuildStep, LinkFragment, LinkFragmentRole, ResolvedTarget,
+    ide::{IdeFacts, IdeLinkItem, IdeSourceKind},
 };
 
 use crate::{
     object::{Isa, Reference, Value},
-    settings::{CONFIG_DIR, Product, xcode_flag},
+    settings::{CONFIG_DIR, Product, TargetSettings, xcode_flag},
     text,
 };
 
@@ -23,6 +27,7 @@ pub(crate) struct PhaseLink {
     pub(crate) file_type: &'static str,
     pub(crate) source_tree: &'static str,
     pub(crate) weak: bool,
+    fragments: BTreeMap<String, usize>,
 }
 
 impl Project<'_> {
@@ -41,8 +46,9 @@ impl Project<'_> {
             .filter(|file| file.kind == IdeSourceKind::Object)
             .flat_map(|file| {
                 let original = text(&file.path);
-                let configured = object_input(&original, &text(&target.config.0));
-                [original, configured]
+                let configured =
+                    configured_object_path(&original, &text(&target.config.0), "Objects-normal");
+                std::iter::once(original).chain(configured)
             })
             .collect();
         let objects = &mut self.objects.entries;
@@ -88,14 +94,15 @@ impl Project<'_> {
             return Vec::new();
         };
         let mut used = BTreeSet::new();
-        first
-            .link_items
-            .iter()
-            .filter_map(|item| {
+        xcode_items(first)
+            .filter_map(|(item, feature)| {
+                let weak = phase_weak(feature)?;
                 if !self.configs.iter().all(|config| {
                     facts(config)
                         .and_then(|facts| facts.ide.as_deref())
-                        .is_some_and(|facts| facts.link_items.contains(item))
+                        .is_some_and(|facts| {
+                            xcode_items(facts).any(|entry| entry == (item, feature))
+                        })
                 }) {
                     return None;
                 }
@@ -165,13 +172,26 @@ impl Project<'_> {
                     }
                     _ => return None,
                 };
-                let weak = phase_weak(facts(config), &path)?;
-                if !self
-                    .configs
-                    .iter()
-                    .all(|config| phase_weak(facts(config), &path) == Some(weak))
-                {
-                    return None;
+                let mut fragments = BTreeMap::new();
+                for config in &self.configs {
+                    let facts = facts(config)?;
+                    if !has_link_features(facts.ide.as_deref()?) {
+                        continue;
+                    }
+                    let library = match item {
+                        IdeLinkItem::Target(id) => {
+                            let producer = self.resolved.get(&(*id, config.clone()))?;
+                            producer
+                                .artifacts
+                                .linker_file
+                                .as_ref()
+                                .or(producer.artifacts.file.as_ref())?
+                        }
+                        IdeLinkItem::File(path) | IdeLinkItem::Framework(path) => path,
+                        _ => return None,
+                    };
+                    let fragment = phase_fragment(facts, library, feature, self.bin)?;
+                    fragments.insert(config.clone(), fragment);
                 }
                 used.insert((source_tree, path.clone())).then(|| PhaseLink {
                     item: item.clone(),
@@ -179,18 +199,105 @@ impl Project<'_> {
                     file_type,
                     source_tree,
                     weak,
+                    fragments,
                 })
             })
             .collect()
     }
 }
 
-fn phase_weak(target: Option<&ResolvedTarget>, library: &str) -> Option<bool> {
-    match apple_link_feature(target, library) {
-        None | Some("-framework") => Some(false),
-        Some("-weak_framework" | "-weak_library" | "-weak-l") => Some(true),
+fn phase_weak(feature: Option<&BString>) -> Option<bool> {
+    match feature.map(|name| name.as_slice()) {
+        None | Some(b"FRAMEWORK" | b"XCFRAMEWORK") => Some(false),
+        Some(b"WEAK_FRAMEWORK" | b"WEAK_LIBRARY") => Some(true),
         _ => None,
     }
+}
+
+fn xcode_items(ide: &IdeFacts) -> impl Iterator<Item = (&IdeLinkItem, Option<&BString>)> {
+    let mut feature = None;
+    ide.link_items.iter().filter_map(move |item| match item {
+        IdeLinkItem::XcodeFeature(name) => {
+            feature = Some(name);
+            None
+        }
+        _ => Some((item, feature.take())),
+    })
+}
+
+fn has_link_features(ide: &IdeFacts) -> bool {
+    ide.link_items
+        .iter()
+        .any(|item| matches!(item, IdeLinkItem::XcodeFeature(_)))
+}
+
+fn library_fragments(target: &ResolvedTarget) -> impl Iterator<Item = (usize, &LinkFragment)> {
+    target
+        .link
+        .iter()
+        .flat_map(|link| &link.fragments)
+        .enumerate()
+        .filter(|(_, fragment)| fragment.role == LinkFragmentRole::Libraries)
+}
+
+fn phase_fragment(
+    target: &ResolvedTarget,
+    library: &[u8],
+    feature: Option<&BString>,
+    bin: &Path,
+) -> Option<usize> {
+    let mut paths = vec![BString::from(library)];
+    if let Ok(relative) = to_native(library).strip_prefix(bin) {
+        paths.push(rcmake_host::path::from_native(relative));
+    }
+    let mut signatures = Vec::new();
+    for path in paths {
+        let path_text = text(&path);
+        let framework =
+            library_basename(&path_text).filter(|_| framework_root(&path_text).is_some());
+        let flag = match feature.map(|name| name.as_slice()) {
+            Some(b"FRAMEWORK") => Some(("-framework", framework?.as_bytes())),
+            Some(b"WEAK_FRAMEWORK") => Some(("-weak_framework", framework?.as_bytes())),
+            Some(b"WEAK_LIBRARY") => Some(("-weak_library", path.as_slice())),
+            _ => {
+                signatures.push(quote(&path));
+                if let Some(name) = framework {
+                    signatures.push(format!("-framework {}", quote(name.as_bytes())).into());
+                }
+                None
+            }
+        };
+        if let Some((flag, arg)) = flag {
+            signatures.push(format!("-Xlinker {flag} -Xlinker {}", quote(arg)).into());
+        }
+    }
+    let mut matches =
+        library_fragments(target).filter(|(_, fragment)| signatures.contains(&fragment.text.value));
+    let (index, _) = matches.next()?;
+    matches.next().is_none().then_some(index)
+}
+
+fn xcframework_fragment(target: &ResolvedTarget, root: &BString, bin: &Path) -> Option<usize> {
+    let ide = target.ide.as_deref()?;
+    let path = ide.xcframeworks.get(root)?;
+    let feature = xcode_items(ide).find_map(|(item, feature)| {
+        matches!(item, IdeLinkItem::File(file) | IdeLinkItem::Framework(file) if file == path || file == root)
+            .then_some(feature)
+    })?;
+    (phase_weak(feature) == Some(false))
+        .then(|| phase_fragment(target, path, feature, bin))
+        .flatten()
+}
+
+pub(super) fn xcframework_phase_allowed(
+    target: &ResolvedTarget,
+    root: &BString,
+    bin: &Path,
+) -> bool {
+    target.ide.as_deref().is_some_and(|ide| {
+        ide.xcframeworks.contains_key(root)
+            && (!has_link_features(ide) || xcframework_fragment(target, root, bin).is_some())
+    })
 }
 
 fn apple_link_feature(target: Option<&ResolvedTarget>, library: &str) -> Option<&'static str> {
@@ -260,16 +367,99 @@ pub(crate) fn library_basename(path: &str) -> Option<&str> {
 }
 
 pub(crate) fn object_input(path: &str, config: &str) -> String {
-    let Some((prefix, suffix)) = path.rsplit_once("/Objects-normal/") else {
-        return path.into();
-    };
-    let Some((target_dir, directory)) = prefix.rsplit_once('/') else {
-        return path.into();
-    };
-    if directory != config {
-        return path.into();
+    configured_object_path(path, config, "$(OBJECT_FILE_DIR_normal:base)")
+        .unwrap_or_else(|| path.into())
+}
+
+fn configured_object_path(path: &str, config: &str, objects: &str) -> Option<String> {
+    let (prefix, suffix) = path.rsplit_once("/Objects-normal/")?;
+    let (target_dir, directory) = prefix.rsplit_once('/')?;
+    (directory == config).then(|| format!("{target_dir}/{CONFIG_DIR}/{objects}/{suffix}"))
+}
+
+impl TargetSettings<'_> {
+    pub(crate) fn rendered_link_flags(&self, ide: &IdeFacts) -> Option<Vec<String>> {
+        let target = self.target.filter(|_| has_link_features(ide))?;
+        let phase_fragments = self
+            .phase_links
+            .iter()
+            .filter_map(|link| link.fragments.get(self.config).copied())
+            .chain(
+                self.xcframeworks
+                    .iter()
+                    .filter_map(|root| xcframework_fragment(target, root, self.bin)),
+            )
+            .collect::<BTreeSet<_>>();
+        let objects = ide
+            .sources
+            .iter()
+            .filter(|source| {
+                matches!(
+                    source.kind,
+                    IdeSourceKind::Object | IdeSourceKind::ExternalObject
+                )
+            })
+            .map(|source| quote(&source.path))
+            .collect::<BTreeSet<_>>();
+        Some(
+            library_fragments(target)
+                .filter(|(index, fragment)| {
+                    !phase_fragments.contains(index) && !objects.contains(&fragment.text.value)
+                })
+                .map(|(_, fragment)| {
+                    let value = &fragment.text.value;
+                    text(value.strip_prefix(b"SHELL:").unwrap_or(value))
+                })
+                .collect(),
+        )
     }
-    format!("{target_dir}/{CONFIG_DIR}/Objects-normal/{suffix}")
+
+    pub(crate) fn link_objects(&self) -> impl Iterator<Item = String> {
+        let inputs = self
+            .result
+            .graphs
+            .iter()
+            .find(|graph| graph.config.0.as_slice() == self.config.as_bytes())
+            .and_then(|graph| {
+                let entry = graph
+                    .targets
+                    .iter()
+                    .find(|entry| entry.name == self.raw.name)?;
+                entry
+                    .steps
+                    .iter()
+                    .filter_map(|index| graph.steps.get(*index))
+                    .find_map(|step| {
+                        if let BuildStep::Link { inputs, .. } = step {
+                            Some(inputs)
+                        } else {
+                            None
+                        }
+                    })
+            });
+        inputs.into_iter().flatten().filter_map(move |input| {
+            let target = self.target?;
+            let path = self.bin.join(text(input));
+            if target.ide.as_ref().is_some_and(|ide| {
+                ide.sources.iter().any(|file| {
+                    file.kind == IdeSourceKind::Object
+                        && (file.path == *input || path == Path::new(&text(&file.path)))
+                })
+            }) {
+                return None;
+            }
+            self.result
+                .targets
+                .iter()
+                .any(|dep| {
+                    dep.metadata.kind == TargetKind::ObjectLibrary
+                        && dep.config == target.config
+                        && target.dependencies.contains(&dep.id)
+                        && dep.compile_units.iter().any(|unit| unit.object == *input)
+                })
+                .then(|| object_input(&path.to_string_lossy(), self.config))
+        })
+    }
 }
 
 pub(crate) fn framework_root(path: &str) -> Option<&str> {

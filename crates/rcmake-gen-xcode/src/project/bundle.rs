@@ -19,7 +19,7 @@ use crate::{
 };
 
 use super::{
-    Project, file_ref,
+    Project, TargetEntry, file_ref,
     sources::{BuildFiles, extension_file_type, references_config},
 };
 
@@ -108,6 +108,7 @@ impl Project<'_> {
         key: &str,
         id: TargetId,
         raw: &Target,
+        targets: &[TargetEntry<'_>],
     ) -> Result<Vec<Reference>, GenError> {
         let mut phases = Vec::new();
         for (kind, destination, label) in [
@@ -147,31 +148,21 @@ impl Project<'_> {
             }
             for (index, item) in settings::strings(&items).into_iter().enumerate() {
                 let file_key = format!("{key}/{index}");
-                let (item, source_tree) = self
+                let product = self
                     .model
                     .find_target(raw.dir, item.as_bytes())
-                    .and_then(|binding| self.model.target(binding))
-                    .filter(|target| !target.is_imported())
-                    .map_or((item, "<absolute>"), |target| {
-                        let config = &self.default_config;
-                        let resolved =
-                            self.model
-                                .find_target(raw.dir, &target.name)
-                                .and_then(|binding| {
-                                    self.resolved.get(&(binding, config.clone())).copied()
-                                });
-                        (
-                            Product::new(self.model, target, resolved, config, self.bin).file(),
-                            "BUILT_PRODUCTS_DIR",
-                        )
-                    });
-                let file = file_ref(
-                    &mut self.objects,
-                    &file_key,
-                    &item,
-                    ("explicitFileType", extension_file_type(&item)),
-                    source_tree,
-                )?;
+                    .and_then(|id| targets.iter().find(|target| target.id == id))
+                    .and_then(|target| target.product_ref.as_ref());
+                let file = match product {
+                    Some(product) => product.clone(),
+                    None => file_ref(
+                        &mut self.objects,
+                        &file_key,
+                        &item,
+                        ("explicitFileType", extension_file_type(&item)),
+                        "<absolute>",
+                    )?,
+                };
                 files.push(phases::build_file(
                     &mut self.objects,
                     &format!("{file_key}/build"),

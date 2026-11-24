@@ -43,9 +43,6 @@ fn quote_command(value: &str) -> String {
 }
 
 fn quote_legacy_argument(value: &str) -> String {
-    if value.is_empty() {
-        return quote(value);
-    }
     value
         .replace("$(CONFIGURATION)", "${CONFIGURATION}")
         .replace("$(EFFECTIVE_PLATFORM_NAME)", "${EFFECTIVE_PLATFORM_NAME}")
@@ -443,6 +440,12 @@ pub(crate) fn utility(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn empty_arguments_use_the_command_escaping_mode() {
+        assert_eq!(quote_legacy_argument(""), "");
+        assert_eq!(quote_command(""), "''");
+    }
 
     #[test]
     fn expands_xcode_variables_in_working_directory_and_argument() {

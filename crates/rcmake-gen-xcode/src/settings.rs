@@ -12,7 +12,7 @@ use rcmake_diag::{PolicyId, PolicyStatus};
 use rcmake_host::path::from_native_cmake;
 use rcmake_model::{DirId, ParsedToolset, ProjectModel, Target, TargetKind};
 use rcmake_resolve::{
-    BuildStep, GenerationResult, ResolvedTarget,
+    GenerationResult, ResolvedTarget,
     ide::{BundleKind, IdeCompileSettings, IdeFacts, IdeLinkItem},
 };
 
@@ -588,7 +588,10 @@ impl TargetSettings<'_> {
                         .map(|option| flag_text(&option.value)),
                 );
             }
-            for item in &ide.link_items {
+            let rendered = self.rendered_link_flags(ide);
+            let use_legacy = rendered.is_none();
+            ldflags.extend(rendered.into_iter().flatten());
+            for item in ide.link_items.iter().filter(|_| use_legacy) {
                 if self.phase_links.iter().any(|link| &link.item == item) {
                     continue;
                 }
@@ -663,6 +666,7 @@ impl TargetSettings<'_> {
                         }
                     }
                     IdeLinkItem::Flag(flag) => ldflags.push(flag_text(flag)),
+                    IdeLinkItem::XcodeFeature(_) => {}
                 }
             }
             if let Some(dir) = &ide.install_name_dir {
@@ -675,7 +679,7 @@ impl TargetSettings<'_> {
             .flat_map(|ide| &ide.sources)
             .filter(|source| source.kind == rcmake_resolve::ide::IdeSourceKind::Object)
             .map(|source| object_input(&text(&source.path), self.config));
-        let objects = source_objects.chain(self.link_objects().map(|(_, path)| path));
+        let objects = source_objects.chain(self.link_objects());
         if matches!(
             raw.kind,
             TargetKind::StaticLibrary | TargetKind::ObjectLibrary
@@ -717,72 +721,6 @@ impl TargetSettings<'_> {
                 );
             }
         }
-    }
-
-    pub(crate) fn link_objects(&self) -> impl Iterator<Item = (String, String)> {
-        let target = self.target;
-        let graph = self
-            .result
-            .graphs
-            .iter()
-            .find(|graph| graph.config.0.as_slice() == self.config.as_bytes());
-        let inputs = graph.and_then(|graph| {
-            let entry = graph
-                .targets
-                .iter()
-                .find(|entry| entry.name == self.raw.name)?;
-            entry
-                .steps
-                .iter()
-                .filter_map(|index| graph.steps.get(*index))
-                .find_map(|step| {
-                    if let BuildStep::Link { inputs, .. } = step {
-                        Some(inputs)
-                    } else {
-                        None
-                    }
-                })
-        });
-        inputs.into_iter().flatten().filter_map(move |input| {
-            let target = target?;
-            for &id in &target.dependencies {
-                let Some(dep) = self
-                    .result
-                    .targets
-                    .iter()
-                    .find(|dep| dep.id == id && dep.config == target.config)
-                else {
-                    continue;
-                };
-                if dep.metadata.kind != TargetKind::ObjectLibrary {
-                    continue;
-                }
-                if target.ide.as_ref().is_some_and(|ide| {
-                    ide.sources.iter().any(|file| {
-                        file.kind == rcmake_resolve::ide::IdeSourceKind::Object
-                            && (file.path == *input
-                                || self.bin.join(text(input)) == Path::new(&text(&file.path)))
-                    })
-                }) {
-                    return None;
-                }
-                let Some(unit) = dep.compile_units.iter().find(|unit| unit.object == *input) else {
-                    continue;
-                };
-                let stem = Path::new(&text(&unit.source.value))
-                    .file_stem()?
-                    .to_str()?
-                    .to_owned();
-                let name = text(&dep.metadata.name);
-                let path = target_temp_dir(self.bin, &dep.metadata.name)
-                    .join(format!("Objects-normal/$(CURRENT_ARCH)/{stem}.o"));
-                return Some((
-                    format!("{name}/{stem}"),
-                    path.to_string_lossy().into_owned(),
-                ));
-            }
-            None
-        })
     }
 }
 

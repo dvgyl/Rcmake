@@ -20,7 +20,7 @@ use rcmake_gen_common::{
 };
 use rcmake_host::{Host, path::to_native};
 use rcmake_model::{DirId, GeneratorKind, ProjectModel, Target, TargetId, TargetKind};
-use rcmake_resolve::{GenerationResult, ResolvedTarget};
+use rcmake_resolve::{GenerationResult, ResolvedTarget, ide::XcodeConfigFiles};
 
 use crate::{
     file_name, ids,
@@ -41,6 +41,7 @@ struct Project<'a> {
     upgrade: String,
     objects: Objects,
     resolved: BTreeMap<(TargetId, String), &'a ResolvedTarget>,
+    config_sources: BTreeMap<String, XcodeConfigFiles<'a>>,
 }
 
 struct TargetEntry<'a> {
@@ -48,6 +49,8 @@ struct TargetEntry<'a> {
     raw: &'a Target,
     reference: Reference,
     isa: Isa,
+    product: settings::Product,
+    product_ref: Option<Reference>,
 }
 
 pub(crate) fn cmake(result: &GenerationResult, model: &ProjectModel) -> String {
@@ -200,6 +203,7 @@ pub(crate) fn generate(
         default_config,
         upgrade,
         objects: Objects::default(),
+        config_sources: BTreeMap::new(),
         resolved: result
             .targets
             .iter()
@@ -225,16 +229,36 @@ impl Project<'_> {
             ids::cached(&self.model.cache, &project_cache_key(name)),
         )?;
         let mut targets = Vec::new();
+        let mut products = Vec::new();
+        let first_config = self.configs.first().cloned().unwrap_or_default();
         for id in targets_for_root(self.model, self.result, root.dir) {
             if let Some(raw) = self.model.target(id)
                 && let Some(isa) = target_type(raw, self.result, id)
             {
                 let reference = self.reserve_target(isa, &text(&raw.name))?;
+                let facts = self.resolved.get(&(id, first_config.clone())).copied();
+                let product =
+                    settings::Product::new(self.model, raw, facts, &first_config, self.bin);
+                let product_ref = if matches!(isa, Isa::PBXNativeTarget) {
+                    let file = file_ref(
+                        &mut self.objects,
+                        &format!("product/{}", reference.comment),
+                        &product.file(),
+                        ("explicitFileType", product.types().1),
+                        "BUILT_PRODUCTS_DIR",
+                    )?;
+                    products.push(file.clone());
+                    Some(file)
+                } else {
+                    None
+                };
                 targets.push(TargetEntry {
                     id,
                     raw,
                     reference,
                     isa,
+                    product,
+                    product_ref,
                 });
             }
         }
@@ -254,18 +278,16 @@ impl Project<'_> {
             .find(|(kind, _)| *kind == UtilityKind::ZeroCheck)
             .map(|(_, r)| r);
         self.validate_custom_command_owners(root.dir, &targets)?;
-        let mut products = Vec::new();
         let mut tree = Group::default();
         let project_settings = self.project_settings(root.dir, &key, &mut tree)?;
         for target in &targets {
-            let (group, product) = self.target(target, &targets, &project_ref, root.dir, zero)?;
+            let group = self.target(target, &targets, &project_ref, zero)?;
             let folder = target
                 .raw
                 .props
                 .get(b"FOLDER")
                 .map_or_else(String::new, |s| text(s));
             tree.add(&folder, group)?;
-            products.extend(product);
         }
         let products = group(&mut self.objects, "group/products", "Products", products)?;
         let listfile = to_native(&self.model.dir(root.dir).source_dir).join("CMakeLists.txt");

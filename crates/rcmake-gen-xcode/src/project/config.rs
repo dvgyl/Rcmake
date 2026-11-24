@@ -1,14 +1,13 @@
 //! Xcode configuration files and project diagnostics.
 
-use std::sync::Arc;
+use std::{collections::btree_map::Entry, sync::Arc};
 
+use rcmake_base::path_lex::Lexical;
 use rcmake_diag::{Diagnostic, Effect, Location, MessageKind, RenderOptions, render};
 use rcmake_gen_common::GenError;
-use rcmake_host::{
-    FileKind, Follow,
-    path::{from_native_cmake, to_native},
-};
+use rcmake_host::path::{from_native_cmake, to_native};
 use rcmake_model::DirId;
+use rcmake_resolve::ide::XcodeConfigFiles;
 
 use crate::{
     object::{Attrs, Reference, Value},
@@ -50,7 +49,7 @@ impl Project<'_> {
                 xcconfig.map(|value| text(value))
             };
             let reference = path
-                .map(|path| self.xcconfig(dir, key, &config, &path, group))
+                .map(|path| self.xcconfig(dir, key, &config, &path, None, group))
                 .transpose()?
                 .flatten();
             configurations.push((attrs, reference));
@@ -64,33 +63,36 @@ impl Project<'_> {
         key: &str,
         config: &str,
         path: &str,
+        target: Option<&str>,
         group: &mut Group,
     ) -> Result<Option<Reference>, GenError> {
         if path.is_empty() {
             return Ok(None);
         }
         let directory = self.model.dir(dir);
-        let source = to_native(&directory.source_dir).join(path);
-        let binary = to_native(&directory.binary_dir).join(path);
-        let exists = |path: &std::path::Path| {
-            self.host
-                .metadata(path, Follow::Yes)
-                .is_ok_and(|file| file.kind == FileKind::File)
+        let files = match self.config_sources.entry(config.into()) {
+            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Vacant(entry) => entry.insert(
+                XcodeConfigFiles::new(self.model, self.host, config.as_bytes())
+                    .map_err(|error| GenError::Invalid(error.to_string().into()))?,
+            ),
         };
-        let path = if !exists(&source)
-            && (directory
-                .generated_sources
-                .contains(&from_native_cmake(&binary))
-                || exists(&binary))
-        {
-            binary
-        } else {
-            source
+        let Some(path) = files.find(directory, path.as_bytes()) else {
+            if let Some(target) = target {
+                return Err(GenError::Invalid(format!(
+                    "CMake Error: target sources for target {target} do not contain xcconfig file: '{path}' (configuration: {config})"
+                ).into()));
+            }
+            let source = Lexical::new(&directory.source_dir).append(path.as_bytes());
+            return Err(self.project_error(
+                dir,
+                GenError::Invalid(format!("Cannot find source file:\n\n  {source}").into()),
+            ));
         };
         let reference = file_ref(
             &mut self.objects,
             &format!("{key}/xcconfig/{config}"),
-            &path.to_string_lossy(),
+            &text(&path),
             ("lastKnownFileType", "text.xcconfig"),
             "<absolute>",
         )?;

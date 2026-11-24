@@ -16,6 +16,7 @@ use crate::{
 
 use super::{
     Group, Project, TargetEntry, file_ref,
+    link::xcframework_phase_allowed,
     sources::{Source, source_files, validate_source_flags},
     target_fields, target_key,
 };
@@ -26,14 +27,15 @@ impl Project<'_> {
         target: &TargetEntry<'_>,
         all: &[TargetEntry<'_>],
         project: &Reference,
-        project_dir: DirId,
         zero: Option<&Reference>,
-    ) -> Result<(Reference, Option<Reference>), GenError> {
+    ) -> Result<Reference, GenError> {
         let TargetEntry {
             id,
             raw,
             reference,
             isa,
+            product,
+            product_ref,
         } = target;
         let name = &reference.comment;
         let key = target_key(name);
@@ -45,9 +47,8 @@ impl Project<'_> {
         let native = matches!(isa, Isa::PBXNativeTarget);
         let first = self.configs.first().cloned().unwrap_or_default();
         let first_target = self.resolved.get(&(*id, first.clone())).copied();
-        let product = Product::new(self.model, raw, first_target, &first, self.bin);
         let plist = if native {
-            self.info_plist(raw, name, &product, first_target)?
+            self.info_plist(raw, name, product, first_target)?
         } else {
             None
         };
@@ -66,8 +67,9 @@ impl Project<'_> {
                         self.configs.iter().all(|config| {
                             self.resolved
                                 .get(&(*id, config.clone()))
-                                .and_then(|facts| facts.ide.as_deref())
-                                .is_some_and(|ide| ide.xcframeworks.contains_key(*root))
+                                .is_some_and(|facts| {
+                                    xcframework_phase_allowed(facts, root, self.bin)
+                                })
                         })
                     })
                     .cloned(),
@@ -87,6 +89,13 @@ impl Project<'_> {
             let graph_target =
                 graph.and_then(|graph| graph.targets.iter().find(|item| item.name == raw.name));
             if let Some(facts) = facts {
+                if let Some(error) = facts
+                    .ide
+                    .as_deref()
+                    .and_then(|ide| ide.xcode_config_sensitive_embed.as_ref())
+                {
+                    return Err(self.project_error(raw.dir, GenError::Invalid(error.clone())));
+                }
                 dependencies.extend(facts.dependencies.iter().copied());
                 let steps = graph_target
                     .into_iter()
@@ -96,10 +105,10 @@ impl Project<'_> {
                     });
                 custom.collect(facts, self.model, self.bin, steps);
                 let items = source_files(self.model, raw, facts)
-                    .map_err(|error| self.source_error(project_dir, error))?;
+                    .map_err(|error| self.source_error(raw.dir, error))?;
                 if let Some(original) = &sources {
                     validate_source_flags(original, &items)
-                        .map_err(|error| self.source_error(project_dir, error))?;
+                        .map_err(|error| self.source_error(raw.dir, error))?;
                 } else {
                     sources = Some(items);
                 }
@@ -133,7 +142,16 @@ impl Project<'_> {
             let base_config = facts
                 .and_then(|facts| facts.ide.as_deref())
                 .and_then(|ide| ide.attributes.get(b"XCODE_XCCONFIG".as_slice()))
-                .map(|path| self.xcconfig(raw.dir, &key, config, &text(path), &mut config_files))
+                .map(|path| {
+                    self.xcconfig(
+                        raw.dir,
+                        &key,
+                        config,
+                        &text(path),
+                        Some(name),
+                        &mut config_files,
+                    )
+                })
                 .transpose()?
                 .flatten();
             target_settings.push((settings, base_config));
@@ -185,7 +203,6 @@ impl Project<'_> {
                 "Configurations",
             )?);
         }
-        let mut product_ref = None;
         if native {
             self.remove_object_inputs(first_target, &mut files.frameworks);
             if matches!(
@@ -274,16 +291,9 @@ impl Project<'_> {
                     files.resources,
                 )?);
             }
-            product_ref = Some(file_ref(
-                &mut self.objects,
-                &format!("product/{name}"),
-                &product.file(),
-                ("explicitFileType", product.types().1),
-                "BUILT_PRODUCTS_DIR",
-            )?);
             build_phases.extend(
-                self.embeds(&key, *id, raw)
-                    .map_err(|error| self.source_error(project_dir, error))?,
+                self.embeds(&key, *id, raw, all)
+                    .map_err(|error| self.source_error(raw.dir, error))?,
             );
         }
         build_phases.extend(phase(
@@ -293,7 +303,7 @@ impl Project<'_> {
             "CMake PostBuild Rules",
         )?);
         let mut fields = target_fields(reference, config_list, build_phases, dependencies);
-        if let Some(product_ref) = &product_ref {
+        if let Some(product_ref) = product_ref {
             fields.extend(attrs([
                 ("buildRules", list(Vec::<Value>::new())),
                 ("productReference", product_ref.clone().into()),
@@ -322,8 +332,7 @@ impl Project<'_> {
                 &self.upgrade,
             )?;
         }
-        let group = tree.finish(&mut self.objects, &format!("{key}/group"), name)?;
-        Ok((group, product_ref))
+        tree.finish(&mut self.objects, &format!("{key}/group"), name)
     }
 
     pub(super) fn validate_custom_command_owners(

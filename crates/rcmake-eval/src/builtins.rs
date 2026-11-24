@@ -130,7 +130,10 @@ impl Interp {
             .is_some_and(|v| is_on(v));
         let silent = self
             .lookup_var(b"CMAKE_WARN_DEPRECATED")
-            .is_some_and(|v| !is_on(v));
+            .is_some_and(|value| {
+                let v = value.as_slice();
+                !v.is_empty() && v != b"NOTFOUND" && !v.ends_with(b"-NOTFOUND") && !is_on(v)
+            });
         match (message, error, silent) {
             (true, true, _) => DiagAction::FatalError,
             (_, _, true) => DiagAction::Ignore,

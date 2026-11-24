@@ -14,6 +14,7 @@ use indexmap::{IndexMap, IndexSet};
 use rcmake_base::{BString, list, path_lex::Lexical, truth};
 use rcmake_diag::Backtrace;
 use rcmake_genex::{ConfigId, EvalContext};
+use rcmake_host::Host;
 use rcmake_model::{
     BT, DirId, Directory, FileSetKind, GeneratorKind, ProjectModel, Target, TargetId,
 };
@@ -68,6 +69,8 @@ pub struct IdeFacts {
     /// Target properties for this configuration, with their original prefixes.
     /// Xcode attribute keys keep their `[sdk=...]` and `[arch=...]` filters.
     pub attributes: IndexMap<BString, BString>,
+    /// Error body for an Xcode embed property that depends on the configuration.
+    pub xcode_config_sensitive_embed: Option<BString>,
     /// Precompiled headers, one entry per language.
     pub pch: Vec<IdePch>,
 }
@@ -171,6 +174,8 @@ pub enum IdeLinkItem {
     Library(BString),
     /// A raw linker flag.
     Flag(BString),
+    /// The resolved `LINK_LIBRARY` feature of the next Xcode link item.
+    XcodeFeature(BString),
 }
 
 /// When a custom step runs.
@@ -386,10 +391,11 @@ impl IdeFacts {
                     )
                 {
                     let name = &target.name;
-                    let body = format!(
-                        "Xcode does not support per-config {property}:\n\n  {value}\n\nspecified for target:\n\n  {name}"
-                    );
-                    return Err(ResolveError::Message(body.into()));
+                    self.xcode_config_sensitive_embed.get_or_insert_with(|| {
+                        format!(
+                            "Xcode does not support per-config {property}:\n\n  {value}\n\nspecified for target:\n\n  {name}"
+                        ).into()
+                    });
                 }
                 self.attributes.insert(key, evaluated);
             }
@@ -417,6 +423,32 @@ fn is_ide_property(name: &[u8], flavor: IdeFlavor) -> bool {
                 )
         }
         IdeFlavor::VisualStudio => name.starts_with(b"VS_"),
+    }
+}
+
+/// Configuration-file paths for one Xcode build configuration.
+pub struct XcodeConfigFiles<'a>(SourcePaths<'a>);
+
+impl<'a> XcodeConfigFiles<'a> {
+    /// Index generated files for the specified configuration.
+    ///
+    /// # Errors
+    /// Returns an error if a generated output path cannot be evaluated.
+    pub fn new(
+        model: &ProjectModel,
+        host: &'a dyn Host,
+        config: &[u8],
+    ) -> Result<Self, ResolveError> {
+        let mut paths = SourcePaths::new(host);
+        paths.ide = Some(IdeFlavor::Xcode);
+        paths.index_generated(model, &ConfigId(config.into()))?;
+        Ok(Self(paths))
+    }
+
+    /// Find an existing or generated configuration file in the source or build directory.
+    #[must_use]
+    pub fn find(&self, directory: &Directory, path: &[u8]) -> Option<BString> {
+        self.0.find(directory, path)
     }
 }
 
@@ -704,7 +736,7 @@ pub(crate) fn collect_link_items<'a>(
                 }
             };
             let value = &item.text.value;
-            match item.kind {
+            let link = match item.kind {
                 ResolvedLinkKind::Library(id) | ResolvedLinkKind::Objects(id) => {
                     if model.target(id)?.is_imported() {
                         usage
@@ -732,8 +764,19 @@ pub(crate) fn collect_link_items<'a>(
                 }
                 ResolvedLinkKind::ObjectFile => Some(IdeLinkItem::File(value.clone())),
                 _ => None,
-            }
+            }?;
+            let feature = item
+                .feature
+                .as_ref()
+                .filter(|name| {
+                    name.as_slice() != b"DEFAULT" && usage.ide() == Some(IdeFlavor::Xcode)
+                })
+                .cloned()
+                .map(IdeLinkItem::XcodeFeature);
+            Some([feature, Some(link)])
         })
+        .flatten()
+        .flatten()
         .collect()
 }
 
