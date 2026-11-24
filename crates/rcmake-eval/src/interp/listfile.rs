@@ -140,7 +140,13 @@ impl Interp {
 
         self.init_policy_minimum();
         self.project.set_root_dirs(src_abs.clone(), bin_abs.clone());
-        self.render.relative_base = Some(src_abs.clone());
+        let probe = self
+            .project
+            .global
+            .props
+            .get(b"IN_TRY_COMPILE")
+            .is_some_and(|value| rcmake_base::truth::is_on(value));
+        self.render.relative_base = (!probe).then(|| src_abs.clone());
 
         for var in [b"CMAKE_SOURCE_DIR".as_slice(), b"CMAKE_CURRENT_SOURCE_DIR"] {
             self.vars.set(var, src_abs.clone());
@@ -188,7 +194,7 @@ impl Interp {
         let _ = self.run_list_file(&lists_bytes, true);
         self.write_configure_log(&bin_native);
         self.snapshot_dir_vars(DirId::ROOT);
-        if self.exit_code() != 0 && self.exit_override.is_none() {
+        if !probe && self.exit_code() != 0 && self.exit_override.is_none() {
             self.config.host.write_out(
                 Stream::Stdout,
                 b"-- Configuring incomplete, errors occurred!\n",
@@ -361,13 +367,6 @@ impl Interp {
             .host
             .create_dir_all(&rcmake_host::path::to_native(&bin_abs));
 
-        self.depth = self.depth.saturating_add(1);
-        let limit = self.recursion_limit();
-        if self.depth > limit {
-            self.depth = self.depth.saturating_sub(1);
-            self.fatal_here(format!("Maximum recursion depth of {limit} exceeded").into());
-            return Err(CmdError::Reported);
-        }
         self.vars.push();
         self.loop_blocks.push(0);
         self.policies.push_copy();
@@ -390,7 +389,6 @@ impl Interp {
         self.policies.pop_above(policy_base);
         self.loop_blocks.pop();
         self.vars.pop();
-        self.depth = self.depth.saturating_sub(1);
         Ok(id)
     }
 

@@ -1,61 +1,107 @@
 use rcmake_base::BString;
+use rcmake_eval::args::{KeywordParser, Slot};
 use rcmake_eval::{Cx, Flow};
 
-use super::{Result, arg, error, permission};
+use super::{Result, error, permission};
 
 pub(super) fn run(cx: &mut Cx<'_>, args: &[&[u8]]) -> Result {
-    let [b"OUTPUT", _, rest @ ..] = args else {
+    const SINGLE: &[&str] = &[
+        "OUTPUT",
+        "INPUT",
+        "CONTENT",
+        "CONDITION",
+        "TARGET",
+        "NEWLINE_STYLE",
+    ];
+    const FLAGS: &[&str] = &["NO_SOURCE_PERMISSIONS", "USE_SOURCE_PERMISSIONS"];
+    if args.len() < 4 {
+        return Err(error("Incorrect arguments to GENERATE subcommand."));
+    }
+    let mut parser = KeywordParser::new().keyword("FILE_PERMISSIONS", Slot::MultiNonEmpty);
+    for keyword in SINGLE {
+        parser = parser.keyword(keyword, Slot::Single);
+    }
+    for keyword in FLAGS {
+        parser = parser.keyword(keyword, Slot::Flag);
+    }
+    let parsed = parser.parse(args);
+    if let Some(message) = parsed.report_error_text() {
+        return Err(crate::command_error(cx, message));
+    }
+    if !parsed.unparsed().is_empty() {
+        return Err(error("Unknown argument to GENERATE subcommand."));
+    }
+    let Some(output) = parsed
+        .single("OUTPUT")
+        .filter(|_| args.first() == Some(&b"OUTPUT".as_slice()))
+    else {
         return Err(error("GENERATE requires OUTPUT as first option."));
     };
-    let [input @ (b"INPUT" | b"CONTENT"), _, options @ ..] = rest else {
-        return Err(error("Unknown argument to GENERATE subcommand."));
+    let input_kind = match args.get(2).copied() {
+        Some(b"INPUT") => "INPUT",
+        Some(b"CONTENT") => "CONTENT",
+        _ if !parsed.seen("INPUT") && !parsed.seen("CONTENT") => {
+            return Err(error("GENERATE requires INPUT or CONTENT option."));
+        }
+        _ => return Err(error("Unknown argument to GENERATE subcommand.")),
     };
-    let mut args_iter = options.iter().copied().peekable();
-    let mut permissions = None;
-    while let Some(option) = args_iter.next() {
-        match option {
-            b"CONDITION" | b"TARGET" => {
-                arg(&mut args_iter, option)?;
+    let input = parsed
+        .single(input_kind)
+        .ok_or_else(|| error("GENERATE requires INPUT or CONTENT option."))?;
+    let mut record = vec![b"OUTPUT".as_slice(), output, input_kind.as_bytes(), input];
+    for keyword in ["CONDITION", "TARGET", "NEWLINE_STYLE"] {
+        if let Some(value) = parsed.single(keyword) {
+            if keyword != "NEWLINE_STYLE" && value.is_empty() {
+                return Err(error(format!(
+                    "{keyword} of sub-command GENERATE must not be empty if specified."
+                )));
             }
-            b"NEWLINE_STYLE" => {
-                if !matches!(
-                    arg(&mut args_iter, option)?,
+            if keyword == "NEWLINE_STYLE"
+                && !matches!(
+                    value.as_slice(),
                     b"LF" | b"CRLF" | b"UNIX" | b"DOS" | b"WIN32"
-                ) {
-                    return Err(error(
-                        "GENERATE NEWLINE_STYLE sets an unknown style, only LF, CRLF, UNIX, DOS, and WIN32 are supported",
-                    ));
-                }
+                )
+            {
+                return Err(error(
+                    "GENERATE NEWLINE_STYLE sets an unknown style, only LF, CRLF, UNIX, DOS, and WIN32 are supported",
+                ));
             }
-            b"NO_SOURCE_PERMISSIONS" | b"USE_SOURCE_PERMISSIONS" | b"FILE_PERMISSIONS" => {
-                if option == b"USE_SOURCE_PERMISSIONS" && *input == b"CONTENT" {
-                    return Err(error("given USE_SOURCE_PERMISSIONS without a file INPUT."));
-                }
-                if permissions
-                    .replace(option)
-                    .is_some_and(|mode| mode != option)
-                {
-                    return Err(error("GENERATE given conflicting permission options."));
-                }
-                if option == b"FILE_PERMISSIONS" {
-                    let mut count = 0;
-                    while args_iter
-                        .next_if(|token| permission(token).is_some())
-                        .is_some()
-                    {
-                        count += 1;
-                    }
-                    if count == 0 {
-                        return Err(error(
-                            "GENERATE FILE_PERMISSIONS requires a valid permission.",
-                        ));
-                    }
-                }
-            }
-            _ => return Err(error("Unknown argument to GENERATE subcommand.")),
+            record.extend([keyword.as_bytes(), value]);
         }
     }
-    let request = crate::install::record_request(cx, "_RCMAKE_FILE_GENERATE", args);
+    let modes = [
+        "NO_SOURCE_PERMISSIONS",
+        "USE_SOURCE_PERMISSIONS",
+        "FILE_PERMISSIONS",
+    ]
+    .into_iter()
+    .filter(|mode| parsed.seen(mode))
+    .collect::<Vec<_>>();
+    if let [first, second, ..] = modes.as_slice() {
+        return Err(error(format!(
+            "given both {first} and {second}. Only one option allowed."
+        )));
+    }
+    if let [mode] = modes.as_slice() {
+        if *mode == "USE_SOURCE_PERMISSIONS" && input_kind == "CONTENT" {
+            return Err(error("given USE_SOURCE_PERMISSIONS without a file INPUT."));
+        }
+        record.push(mode.as_bytes());
+    }
+    let permissions = parsed.multi("FILE_PERMISSIONS");
+    let invalid = permissions
+        .iter()
+        .filter(|token| permission(token).is_none())
+        .map(|token| format!("\"{}\"", BString::from(token.as_slice())))
+        .collect::<Vec<_>>();
+    if !invalid.is_empty() {
+        return Err(error(format!(
+            "given invalid permission {}.",
+            invalid.join(",")
+        )));
+    }
+    record.extend(permissions.iter().map(|value| value.as_slice()));
+    let request = crate::install::record_request(cx, "_RCMAKE_FILE_GENERATE", &record);
     let backtrace = cx.backtrace();
     let props = &mut cx.global().props;
     for (index, frame) in backtrace.frames().enumerate() {

@@ -3,17 +3,13 @@ use rcmake_diag::{DiagCategory, Effect, MessageKind, PolicyId, PolicyStatus};
 use rcmake_eval::args::{KeywordParser, Slot};
 use rcmake_eval::{CmdError, CmdResult, Cx, Flow};
 use rcmake_expr::ExpandedArg;
-use rcmake_host::path::{from_native, to_native};
-use rcmake_model::{CacheEntry, CacheType};
+use rcmake_model::CacheType;
 
 use super::{bytes, cat};
 
 const ARG_COUNT: &str = "called with incorrect number of arguments";
 const CMP0077: PolicyId = PolicyId::new(77);
 const CMP0102: PolicyId = PolicyId::new(102);
-const CMP0126: PolicyId = PolicyId::new(126);
-// This flag distinguishes a legacy placeholder from an untyped command-line value.
-const PLACEHOLDER: &[u8] = b"\0mark_as_advanced_placeholder";
 
 fn wrapped<'a>(name: &'a [u8], prefix: &[u8]) -> Option<&'a [u8]> {
     name.strip_prefix(prefix)?.strip_suffix(b"}")
@@ -190,90 +186,18 @@ fn assign_cache(
         if entry.ty != CacheType::Uninitialized && !force {
             return;
         }
-        if entry.ty == CacheType::Uninitialized && entry.props.get(PLACEHOLDER).is_none() {
+        if entry.ty == CacheType::Uninitialized && entry.props.get(Cx::CACHE_PLACEHOLDER).is_none()
+        {
             if !force {
                 value.clone_from(&entry.value);
             }
             if matches!(ty, CacheType::Path | CacheType::Filepath) {
-                value = cache_paths(cx, &value);
+                value = cx.cache_paths(&value);
             }
         }
     }
-    write_cache(cx, name, value, ty, help);
-    clear_cache_shadow(cx, name);
-}
-
-fn clear_cache_shadow(cx: &mut Cx<'_>, name: &[u8]) {
-    let policy = cx.policy(CMP0126);
-    if policy != PolicyStatus::New {
-        if policy == PolicyStatus::Warn
-            && cx.var_is_on(b"CMAKE_POLICY_WARNING_CMP0126")
-            && cx.var_normal_only(name).is_some()
-        {
-            cx.issue_policy_warning(
-                CMP0126,
-                b"",
-                &cat(&[
-                    b"\nFor compatibility with older versions of CMake, normal variable \"",
-                    name,
-                    b"\" will be removed from the current scope.",
-                ]),
-            );
-        }
-        cx.unset_var(name);
-    }
-}
-
-fn cache_paths(cx: &Cx<'_>, value: &[u8]) -> BString {
-    let directory = cx.host().initial_cwd();
-    let home = cx.host().env_get(b"HOME").filter(|home| !home.is_empty());
-    list::join(
-        list::split(value, list::Empty::Drop)
-            .into_iter()
-            .map(|path| {
-                if truth::is_off(&path) {
-                    return path;
-                }
-                let path = match (home.as_ref(), path.as_slice()) {
-                    (Some(home), b"~") => home.clone(),
-                    (Some(home), path) if path.starts_with(b"~/") => {
-                        cat(&[home, path.get(1..).unwrap_or_default()])
-                    }
-                    _ => path,
-                };
-                let path = directory.join(to_native(&path));
-                let mut clean = std::path::PathBuf::new();
-                for component in path.components() {
-                    match component {
-                        std::path::Component::ParentDir => {
-                            clean.pop();
-                        }
-                        _ => clean.push(component),
-                    }
-                }
-                from_native(&clean)
-            }),
-    )
-}
-
-fn write_cache(cx: &mut Cx<'_>, name: &[u8], value: BString, ty: CacheType, help: &[u8]) {
-    if let Some(entry) = cx.cache().get_mut(name) {
-        entry.value = value;
-        entry.ty = ty;
-        entry.help = BString::from(help);
-        entry.props.unset(PLACEHOLDER);
-    } else {
-        cx.cache().insert(
-            name.into(),
-            CacheEntry {
-                value,
-                ty,
-                help: help.into(),
-                advanced: false,
-                props: Default::default(),
-            },
-        );
-    }
+    cx.write_cache(name, value, ty, help);
+    cx.clear_cache_shadow(name);
 }
 
 pub(super) fn unset(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
@@ -321,12 +245,12 @@ pub(super) fn option(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
             entry.help.clone_from(&help.value);
             return Ok(Flow::Normal);
         }
-        if entry.props.get(PLACEHOLDER).is_none() {
+        if entry.props.get(Cx::CACHE_PLACEHOLDER).is_none() {
             value.clone_from(&entry.value);
         }
     }
-    write_cache(cx, name, value, CacheType::Bool, bytes(help));
-    clear_cache_shadow(cx, name);
+    cx.write_cache(name, value, CacheType::Bool, bytes(help));
+    cx.clear_cache_shadow(name);
     if policy != PolicyStatus::New {
         if normal && policy == PolicyStatus::Warn {
             cx.issue_policy_warning(
@@ -365,9 +289,11 @@ pub(super) fn mark_as_advanced(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResu
     let create = cx.policy(CMP0102) != PolicyStatus::New;
     for name in names.iter().map(bytes) {
         if create && !cx.cache().contains(name) {
-            write_cache(cx, name, BString::default(), CacheType::Uninitialized, b"");
+            cx.write_cache(name, BString::default(), CacheType::Uninitialized, b"");
             if let Some(entry) = cx.cache().get_mut(name) {
-                entry.props.set(PLACEHOLDER.into(), BString::default());
+                entry
+                    .props
+                    .set(Cx::CACHE_PLACEHOLDER.into(), BString::default());
             }
         }
         if let Some(entry) = cx.cache().get_mut(name)

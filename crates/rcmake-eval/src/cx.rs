@@ -1,14 +1,17 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use rcmake_base::{BString, Limits, fold_command_name};
+use rcmake_base::{BString, Limits, fold_command_name, list, truth};
 use rcmake_diag::{
     Backtrace, DiagCategory, DiagEngine, DiagState, Effect, FrameKind, Location, MessageKind,
     PolicyError, PolicyId, PolicyMap, PolicyStatus,
 };
 use rcmake_expr::{CondError, ExpandError, ExpandedArg};
-use rcmake_host::Host;
-use rcmake_model::{Cache, DirId, GlobalState, ProjectModel, PropertyMap};
+use rcmake_host::{
+    Host,
+    path::{from_native, to_native},
+};
+use rcmake_model::{Cache, CacheEntry, CacheType, DirId, GlobalState, ProjectModel, PropertyMap};
 use rcmake_regex::{Captures, Regex, RegexError};
 use rcmake_syntax::Argument;
 
@@ -23,6 +26,91 @@ pub struct Cx<'a> {
 }
 
 impl Cx<'_> {
+    /// Internal property for an unset cache entry marked as advanced.
+    pub const CACHE_PLACEHOLDER: &'static [u8] = b"\0mark_as_advanced_placeholder";
+
+    /// Apply CMP0126 after a command writes a cache entry.
+    pub fn clear_cache_shadow(&mut self, name: &[u8]) {
+        let cmp0126 = PolicyId::new(126);
+        let policy = self.policy(cmp0126);
+        if policy != PolicyStatus::New {
+            if policy == PolicyStatus::Warn
+                && self.var_is_on(b"CMAKE_POLICY_WARNING_CMP0126")
+                && self.var_normal_only(name).is_some()
+            {
+                self.interp.issue_at(
+                    MessageKind::AuthorWarning,
+                    Effect::None,
+                    Some(DiagCategory::Policy),
+                    Some(cmp0126),
+                    Location::Backtrace(self.interp.bt.clone()),
+                    crate::util::cat(&[
+                        b"Policy CMP0126 is not set: set(CACHE) does not remove a normal variable of the same name.  Run \"cmake --help-policy CMP0126\" for policy details.  Use the cmake_policy command to set the policy and suppress this warning.\n\n",
+                        b"For compatibility with older versions of CMake, normal variable \"",
+                        name,
+                        b"\" will be removed from the current scope.",
+                    ]),
+                    false,
+                );
+            }
+            self.unset_var(name);
+        }
+    }
+
+    /// Normalize the paths in a path-valued cache entry.
+    pub fn cache_paths(&self, value: &[u8]) -> BString {
+        let directory = self.host().initial_cwd();
+        let home = self.host().env_get(b"HOME").filter(|home| !home.is_empty());
+        list::join(
+            list::split(value, list::Empty::Drop)
+                .into_iter()
+                .map(|path| {
+                    if truth::is_off(&path) {
+                        return path;
+                    }
+                    let path = match (home.as_ref(), path.as_slice()) {
+                        (Some(home), b"~") => home.clone(),
+                        (Some(home), path) if path.starts_with(b"~/") => {
+                            crate::util::cat(&[home, path.get(1..).unwrap_or_default()])
+                        }
+                        _ => path,
+                    };
+                    let path = directory.join(to_native(&path));
+                    let mut clean = std::path::PathBuf::new();
+                    for component in path.components() {
+                        match component {
+                            std::path::Component::ParentDir => {
+                                clean.pop();
+                            }
+                            _ => clean.push(component),
+                        }
+                    }
+                    from_native(&clean)
+                }),
+        )
+    }
+
+    /// Write a cache entry and preserve its additional properties.
+    pub fn write_cache(&mut self, name: &[u8], value: BString, ty: CacheType, help: &[u8]) {
+        if let Some(entry) = self.cache().get_mut(name) {
+            entry.value = value;
+            entry.ty = ty;
+            entry.help = BString::from(help);
+            entry.props.unset(Self::CACHE_PLACEHOLDER);
+        } else {
+            self.cache().insert(
+                name.into(),
+                CacheEntry {
+                    value,
+                    ty,
+                    help: help.into(),
+                    advanced: false,
+                    props: Default::default(),
+                },
+            );
+        }
+    }
+
     /// Access the [`Host`].
     #[must_use]
     pub fn host(&self) -> &dyn Host {
@@ -39,6 +127,28 @@ impl Cx<'_> {
     #[must_use]
     pub fn mode(&self) -> RunMode {
         self.interp.config.mode
+    }
+
+    /// Command recursion depth across active makefiles.
+    pub fn recursion_depth(&self) -> u32 {
+        self.interp.depth
+    }
+
+    /// Active command recursion limit.
+    pub fn recursion_limit(&self) -> u32 {
+        self.interp.recursion_limit()
+    }
+
+    /// Report that a nested configure stopped at the command recursion limit.
+    pub fn fail_nested_recursion(&mut self) {
+        self.interp.recursion_exceeded = true;
+        self.interp
+            .fatal_here("Failed to configure test project build system.".into());
+    }
+
+    /// Report an unresolved template reference at the current command.
+    pub fn warn_uninitialized(&mut self, name: &[u8]) {
+        self.interp.warn_uninitialized(name, true);
     }
 
     /// Execution limits.
@@ -563,6 +673,13 @@ impl Cx<'_> {
 
     /// Read one package module or configuration file with its own unwind scope.
     pub fn include_package_file(&mut self, path: &Path, options: IncludeOptions) -> CmdResult {
+        let limit = (self.recursion_limit() / 2).max(100) as usize;
+        if self.interp.package_file_depth >= limit {
+            self.interp.fatal_here(
+                format!("find_package maximum nesting depth of {limit} exceeded.").into(),
+            );
+            return Err(CmdError::Reported);
+        }
         let saved = core::mem::take(&mut self.interp.unwinding_package);
         self.interp.package_file_depth += 1;
         let result = self.include_file(path, options);

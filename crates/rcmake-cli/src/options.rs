@@ -31,6 +31,7 @@ pub(crate) enum DirectoryArg {
 pub(crate) struct Options {
     pub directories: Vec<DirectoryArg>,
     pub cache_edits: Vec<CacheEdit>,
+    pub check_system_vars: bool,
     pub warning_flags: Vec<BString>,
     pub generator: Option<BString>,
     pub architecture: Option<BString>,

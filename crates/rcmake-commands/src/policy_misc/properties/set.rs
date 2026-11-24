@@ -122,7 +122,7 @@ pub(in crate::policy_misc) fn set(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdR
         b"TARGET" => {
             let targets = names
                 .iter()
-                .map(|target| writable_target(cx, target))
+                .map(|target| writable_target(cx, target, name))
                 .collect::<Result<Vec<_>, _>>()?;
             for target in targets {
                 if *name == b"IMPORTED_GLOBAL" {

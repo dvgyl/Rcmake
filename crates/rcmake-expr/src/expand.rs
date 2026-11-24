@@ -237,15 +237,21 @@ impl<'a> Scanner<'a, '_> {
     }
 
     fn lookup(&mut self, reference: Reference, name: &[u8], line: u32) -> BString {
-        match reference {
-            Reference::Normal if name == LINE_VAR => self
-                .env
-                .var(name)
-                .unwrap_or_else(|| line.to_string().into()),
-            Reference::Normal => self.env.var(name).unwrap_or_default(),
-            Reference::Cache => self.env.cache_var(name).unwrap_or_default(),
-            Reference::Environment => self.env.env_var(name).unwrap_or_default(),
-        }
+        let value = match reference {
+            Reference::Normal if name == LINE_VAR => {
+                return self
+                    .env
+                    .var(name)
+                    .unwrap_or_else(|| line.to_string().into());
+            }
+            Reference::Normal => self.env.var(name),
+            Reference::Cache => self.env.cache_var(name),
+            Reference::Environment => self.env.env_var(name),
+        };
+        value.unwrap_or_else(|| {
+            self.env.missing_reference(name);
+            BString::default()
+        })
     }
 
     fn append_value(&mut self, output: &mut Vec<u8>, value: &[u8]) -> Result<(), ExpandError> {

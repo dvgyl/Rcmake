@@ -3,7 +3,7 @@ use rcmake_diag::{PolicyId, PolicyStatus};
 use rcmake_eval::{CmdError, CmdResult, Cx, Flow};
 use rcmake_expr::ExpandedArg;
 use rcmake_host::{Follow, path};
-use rcmake_model::{CacheEntry, CacheType};
+use rcmake_model::CacheType;
 
 use super::search_paths::setting_enabled;
 use super::{diagnostic, text};
@@ -82,13 +82,40 @@ fn find(cx: &mut Cx<'_>, args: &[ExpandedArg], kind: Kind) -> CmdResult {
     };
     let var = &var.value;
     let options = Options::parse(cx, rest)?;
-    let had_normal = cx.var_normal_only(var).is_some();
+    let previous = cx.cache().get(var).cloned();
+    let new = cx.policy(PolicyId::new(125)) == PolicyStatus::New;
     let existing = cx.var(var);
-    if existing
+    let untyped = previous
         .as_ref()
-        .is_some_and(|v| v.as_slice() != b"NOTFOUND" && !v.ends_with(b"-NOTFOUND"))
+        .is_some_and(|entry| entry.ty == CacheType::Uninitialized);
+    let (ty, help) = previous.as_ref().filter(|_| !untyped).map_or_else(
+        || {
+            (
+                kind.cache_type(),
+                options.doc.clone().unwrap_or_else(|| kind.help()),
+            )
+        },
+        |entry| (entry.ty, entry.help.clone()),
+    );
+    if let Some(existing) = existing
+        .as_ref()
+        .filter(|v| v.as_slice() != b"NOTFOUND" && !v.ends_with(b"-NOTFOUND"))
     {
-        use_existing(cx, kind, var, &options);
+        if new {
+            let normalized = normalize_existing(cx, existing);
+            if options.no_cache {
+                cx.set_var(var, normalized);
+            } else if normalized != *existing || untyped {
+                cx.write_cache(var, normalized.clone(), ty, &help);
+                update_normal(cx, var, normalized, false);
+            }
+        } else if options.no_cache {
+            cx.set_var(var, existing.clone());
+        } else if let Some(entry) = previous.filter(|_| untyped) {
+            let value = cx.cache_paths(&entry.value);
+            cx.write_cache(var, value.clone(), ty, &help);
+            update_normal(cx, var, value, true);
+        }
         return Ok(Flow::Normal);
     }
 
@@ -112,21 +139,20 @@ fn find(cx: &mut Cx<'_>, args: &[ExpandedArg], kind: Kind) -> CmdResult {
     if found.is_some() && options.no_cache && matches!(kind, Kind::Path) && !value.ends_with(b"/") {
         value.push(b'/');
     }
-    if options.no_cache || had_normal {
-        cx.set_var(var, value.clone());
-    }
-    if !options.no_cache {
-        let entry = cx.cache().get(var).cloned();
-        cx.cache().insert(
-            var.clone(),
-            CacheEntry {
-                value,
-                ty: kind.cache_type(),
-                help: options.doc.unwrap_or_else(|| kind.help()),
-                advanced: entry.as_ref().is_some_and(|entry| entry.advanced),
-                props: entry.map_or_else(Default::default, |entry| entry.props),
-            },
-        );
+    if options.no_cache {
+        cx.set_var(var, value);
+    } else {
+        let mut cached = value.clone();
+        if let Some(entry) = previous.filter(|_| untyped) {
+            if !new {
+                cached = entry.value;
+            }
+            if matches!(ty, CacheType::Path | CacheType::Filepath) {
+                cached = cx.cache_paths(&cached);
+            }
+        }
+        cx.write_cache(var, cached, ty, &help);
+        update_normal(cx, var, value, true);
     }
     if found.is_none()
         && (options.required || !options.optional && cx.var_is_on(b"CMAKE_FIND_REQUIRED"))
@@ -155,37 +181,27 @@ fn find(cx: &mut Cx<'_>, args: &[ExpandedArg], kind: Kind) -> CmdResult {
     Ok(Flow::Normal)
 }
 
-fn use_existing(cx: &mut Cx<'_>, kind: Kind, var: &[u8], options: &Options) {
-    let new = cx.policy(PolicyId::new(125)) == PolicyStatus::New;
-    let normal = cx.var_normal_only(var);
-    let cached = cx.cache().get(var).cloned();
-    let untyped = cached
-        .as_ref()
-        .is_some_and(|entry| entry.ty == CacheType::Uninitialized);
-    let value = if new {
-        normal.or_else(|| cached.as_ref().map(|entry| entry.value.clone()))
-    } else {
-        cached
-            .as_ref()
-            .filter(|_| untyped || options.no_cache)
-            .map(|entry| entry.value.clone())
-            .or(normal)
-    };
-    let Some(mut value) = value else { return };
-    if new && !value.is_empty() && !path::to_native(&value).is_absolute() {
-        let relative = cx.current_binary_dir().join(path::to_native(&value));
-        if cx.host().metadata(&relative, Follow::Yes).is_ok() {
-            value = path::from_native(&normalize(&relative));
-        }
+fn normalize_existing(cx: &Cx<'_>, value: &BString) -> BString {
+    if value.is_empty() {
+        return value.clone();
     }
-    if options.no_cache {
-        cx.set_var(var, value);
-    } else if let Some(entry) = cx.cache().get_mut(var)
-        && untyped
-    {
-        entry.ty = kind.cache_type();
-        entry.help = options.doc.clone().unwrap_or_else(|| kind.help());
-        entry.value = value;
+    let absolute = normalize(&cx.host().initial_cwd().join(path::to_native(value)));
+    if cx.host().metadata(&absolute, Follow::Yes).is_ok() {
+        path::from_native(&absolute)
+    } else {
+        value.clone()
+    }
+}
+
+fn update_normal(cx: &mut Cx<'_>, name: &[u8], value: BString, warn: bool) {
+    if cx.policy(PolicyId::new(126)) == PolicyStatus::New {
+        if cx.var_normal_only(name).is_some() {
+            cx.set_var(name, value);
+        }
+    } else if warn {
+        cx.clear_cache_shadow(name);
+    } else {
+        cx.unset_var(name);
     }
 }
 

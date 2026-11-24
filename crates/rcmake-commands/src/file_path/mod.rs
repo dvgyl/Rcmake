@@ -9,6 +9,7 @@ use rcmake_eval::{CmdError, CmdFlags, Cx, Flow, Registry};
 mod archive;
 mod configure;
 mod copy;
+mod download;
 mod elf_rpath;
 mod file;
 mod generate;

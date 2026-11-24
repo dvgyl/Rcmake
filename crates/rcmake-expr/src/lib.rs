@@ -50,6 +50,9 @@ pub trait ExpandEnv {
     /// Look up a host environment variable (`$ENV{...}`).
     fn env_var(&mut self, name: &[u8]) -> Option<BString>;
 
+    /// Report a reference whose lookup did not return a value.
+    fn missing_reference(&mut self, _name: &[u8]) {}
+
     /// Current 1-based listfile line number for `${CMAKE_CURRENT_LIST_LINE}`.
     fn current_line(&self) -> u32;
 

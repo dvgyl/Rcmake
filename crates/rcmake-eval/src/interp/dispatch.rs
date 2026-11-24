@@ -89,11 +89,22 @@ impl Interp {
         true
     }
 
-    pub(super) fn recursion_limit(&self) -> u32 {
-        let configured = self
-            .lookup_var(b"CMAKE_MAXIMUM_RECURSION_DEPTH")
-            .filter(|v| !v.is_empty() && v.iter().all(u8::is_ascii_digit))
-            .and_then(|v| core::str::from_utf8(v).ok()?.parse::<u64>().ok())
+    pub(crate) fn recursion_limit(&self) -> u32 {
+        let name = b"CMAKE_MAXIMUM_RECURSION_DEPTH";
+        let environment;
+        let value = if let Some(value) = self.lookup_var(name) {
+            Some(value)
+        } else {
+            environment = self.config.host.env_get(name);
+            environment.as_ref()
+        };
+        let configured = value
+            .and_then(|v| {
+                core::str::from_utf8(v.trim_ascii_start())
+                    .ok()?
+                    .parse::<u64>()
+                    .ok()
+            })
             .map_or(self.config.limits.max_recursion, |v| {
                 u32::try_from(v).unwrap_or(u32::MAX)
             });
@@ -141,7 +152,22 @@ impl Interp {
 
         let limit = self.recursion_limit();
         let result = if self.depth > limit {
+            self.recursion_exceeded = true;
+            let local_frames = self.depth.saturating_sub(self.dir_frame().trace_base) as usize;
+            let frames = self
+                .bt
+                .frames()
+                .filter(|frame| frame.kind != FrameKind::ModuleInclude)
+                .take(local_frames)
+                .cloned()
+                .collect::<Vec<_>>();
+            let local = frames
+                .into_iter()
+                .rev()
+                .fold(Backtrace::default(), |trace, frame| trace.push(frame));
+            let backtrace = core::mem::replace(&mut self.bt, local);
             self.fatal_here(format!("Maximum recursion depth of {limit} exceeded").into());
+            self.bt = backtrace;
             Err(CmdError::Reported)
         } else if let Some(profiler) = self.command_profiler.clone() {
             let start = self.config.host.monotonic();

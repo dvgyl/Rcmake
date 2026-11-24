@@ -5,7 +5,9 @@ use std::path::Path;
 use std::sync::Arc;
 
 use rcmake_base::BString;
-use rcmake_diag::{DiagCategory, Diagnostic, Location, PolicyId, PolicyStatus};
+use rcmake_diag::{
+    DiagAction, DiagCategory, Diagnostic, Effect, Location, MessageKind, PolicyId, PolicyStatus,
+};
 use rcmake_expr::{CondEnv, ExpandEnv};
 use rcmake_host::Host;
 use rcmake_regex::{Captures, Regex, RegexError};
@@ -38,8 +40,41 @@ impl ExpandEnv for Interp {
         self.config.host.env_get(name)
     }
 
+    fn missing_reference(&mut self, name: &[u8]) {
+        self.warn_uninitialized(name, !self.trace_expanding);
+    }
+
     fn current_line(&self) -> u32 {
         self.cur_line
+    }
+}
+
+impl Interp {
+    pub(crate) fn warn_uninitialized(&mut self, name: &[u8], has_source: bool) {
+        let category = DiagCategory::Uninitialized;
+        if self.diag_top().get(category) == DiagAction::Ignore || self.vars.lookup(name).is_some() {
+            return;
+        }
+        let project_file = has_source
+            && self.bt.top().is_some_and(|frame| {
+                let file = rcmake_host::path::to_native(&frame.file);
+                let root = self.project.dir(rcmake_model::DirId::ROOT);
+                let source = rcmake_host::path::to_native(&root.source_dir);
+                let binary = rcmake_host::path::to_native(&root.binary_dir);
+                (file.starts_with(&source) || file.starts_with(&binary))
+                    && (self.config.cmake_root.as_os_str().is_empty()
+                        || !file.starts_with(&self.config.cmake_root))
+                    && !file.starts_with(binary.join("CMakeFiles"))
+            });
+        if self.check_system_vars || project_file {
+            self.issue_here(
+                MessageKind::Warning,
+                Effect::None,
+                Some(category),
+                crate::util::cat(&[b"uninitialized variable '", name, b"'"]),
+                true,
+            );
+        }
     }
 }
 

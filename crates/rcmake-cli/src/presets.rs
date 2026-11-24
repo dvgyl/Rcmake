@@ -389,6 +389,12 @@ pub(crate) fn apply(host: &dyn Host, src: &Path, opts: &mut Options) -> Result<A
         });
     };
 
+    opts.check_system_vars |= settings
+        .warnings
+        .as_ref()
+        .and_then(|warnings| warnings.system_vars)
+        .unwrap_or(false);
+
     let mut definitions = BTreeMap::new();
     if let Some(vars) = &settings.cache_variables {
         for (name, entry) in vars {

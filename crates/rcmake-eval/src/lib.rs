@@ -405,6 +405,8 @@ pub struct Interp {
     render: RenderOptions,
     bt: Backtrace,
     depth: u32,
+    recursion_exceeded: bool,
+    check_system_vars: bool,
     package_file_depth: usize,
     unwinding_package: bool,
     /// `LoopBlockCounter`: one counter per function/directory barrier.
@@ -507,6 +509,8 @@ impl Interp {
             render,
             bt: Backtrace::default(),
             depth: 0,
+            recursion_exceeded: false,
+            check_system_vars: false,
             package_file_depth: 0,
             unwinding_package: false,
             loop_blocks: vec![0],
@@ -600,5 +604,21 @@ impl Interp {
     pub fn exit_code(&self) -> i32 {
         self.exit_override
             .unwrap_or_else(|| i32::from(self.fatal || self.engine.error_occurred()))
+    }
+
+    /// Include system files in variable usage diagnostics.
+    pub fn set_check_system_vars(&mut self, check: bool) {
+        self.check_system_vars = check;
+    }
+
+    /// Return whether a command exceeded the recursion limit.
+    pub fn recursion_exceeded(&self) -> bool {
+        self.recursion_exceeded
+    }
+
+    /// Start a nested configure with the caller's command recursion depth.
+    pub fn inherit_recursion_depth(&mut self, depth: u32) {
+        self.depth = depth;
+        self.root_frame.trace_base = depth;
     }
 }

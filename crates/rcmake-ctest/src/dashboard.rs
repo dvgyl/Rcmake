@@ -10,7 +10,7 @@ use rcmake_presets::{EnvSnapshot, PresetKind};
 use crate::cli::Invocation;
 use crate::dart::{self, Configuration, Model, Tag};
 
-mod submit;
+pub(crate) mod submit;
 mod update;
 
 pub(crate) fn run(host: &dyn Host, invocation: &Invocation) -> Result<Option<i32>, String> {
@@ -234,7 +234,7 @@ fn missing_configuration(host: &dyn Host, dir: &Path) {
     }
 }
 
-fn write_configure_report(
+pub(crate) fn write_configure_report(
     host: &dyn Host,
     file: &Path,
     command: &rcmake_host::CommandSpec,

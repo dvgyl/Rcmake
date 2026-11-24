@@ -22,6 +22,7 @@ use crate::dart::{self, Configuration, Tag};
 mod build;
 mod configure;
 mod start;
+mod submit;
 mod test;
 
 const SCRIPTABLE: CmdFlags = CmdFlags { scriptable: true };
@@ -34,6 +35,7 @@ struct Settings {
     ctest: BString,
     verbose: bool,
     extra_verbose: bool,
+    debug: bool,
     quiet: bool,
     depth: usize,
     config: Option<BString>,
@@ -87,6 +89,7 @@ pub(crate) fn run_script(
         verbose: invocation.options.verbose,
         extra_verbose: invocation.output.verbosity == Some(rcmake_presets::TestVerbosity::Extra),
         quiet: invocation.options.quiet,
+        debug: invocation.output.debug.unwrap_or(false),
         depth: host
             .env_get(DEPTH_KEY)
             .and_then(|n| n.to_string().parse().ok())
@@ -108,7 +111,7 @@ pub(crate) fn run_script(
             })
             .collect(),
     };
-    execute_script(host, settings, &script.argument, script.new_process)
+    execute_script(host, settings, &script.argument, script.new_process, 0)
 }
 
 fn execute_script(
@@ -116,6 +119,7 @@ fn execute_script(
     settings: Settings,
     argument: &[u8],
     new_process: bool,
+    depth: u32,
 ) -> Result<i32, CtestError> {
     if settings.depth >= MAX_SCRIPT_DEPTH {
         return Err(CtestError::Schedule(
@@ -188,6 +192,7 @@ fn execute_script(
         },
         register,
     );
+    interp.inherit_recursion_depth(depth);
     if settings.quiet || !settings.verbose {
         interp.set_log_level(Some(LogLevel::Notice));
     }
@@ -257,6 +262,8 @@ fn register(registry: &mut Registry) {
         ("ctest_start", start::ctest_start as rcmake_eval::BuiltinFn),
         ("ctest_configure", configure::ctest_configure),
         ("ctest_build", build::ctest_build),
+        ("ctest_submit", submit::ctest_submit),
+        ("ctest_read_custom_files", ctest_read_custom_files),
         ("ctest_test", test::ctest_test),
         ("ctest_empty_binary_directory", ctest_empty_binary_directory),
         ("ctest_run_script", ctest_run_script),
@@ -340,6 +347,14 @@ fn extra_verbose() -> bool {
     })
 }
 
+fn debug() -> bool {
+    SESSION.with_borrow(|session| {
+        session
+            .as_ref()
+            .is_some_and(|session| session.settings.debug && !session.settings.quiet)
+    })
+}
+
 struct Arguments<'a>(BTreeMap<&'a [u8], Vec<&'a BString>>);
 
 impl<'a> Arguments<'a> {
@@ -353,20 +368,26 @@ impl<'a> Arguments<'a> {
             let key = key.as_slice();
             let mut values = Vec::new();
             if takes_value(key) {
+                let multiple = matches!(
+                    key,
+                    b"INCLUDE_LABEL" | b"EXCLUDE_LABEL" | b"PARTS" | b"FILES" | b"HTTPHEADER"
+                );
                 while let Some(value) = args.next_if(|value| !takes_value(value) && !is_flag(value))
                 {
                     values.push(value);
-                    if !matches!(key, b"INCLUDE_LABEL" | b"EXCLUDE_LABEL") {
+                    if !multiple {
                         break;
                     }
                 }
-                if values.is_empty() && matches!(key, b"INCLUDE_LABEL" | b"EXCLUDE_LABEL") {
+                if values.is_empty()
+                    && matches!(key, b"INCLUDE_LABEL" | b"EXCLUDE_LABEL" | b"CDASH_UPLOAD")
+                {
                     return Err(error(format!(
                         "Error after keyword \"{}\":\n  missing required value",
                         BString::from(key)
                     )));
                 }
-                if values.is_empty() && key != b"PARALLEL_LEVEL" {
+                if values.is_empty() && !matches!(key, b"PARALLEL_LEVEL" | b"PARTS" | b"FILES") {
                     return Err(error(format!(
                         "requires a value for {}",
                         String::from_utf8_lossy(key)
@@ -378,7 +399,9 @@ impl<'a> Arguments<'a> {
                     String::from_utf8_lossy(key)
                 )));
             }
-            if parsed.insert(key, values).is_some() {
+            if key == b"HTTPHEADER" {
+                parsed.entry(key).or_insert_with(Vec::new).extend(values);
+            } else if parsed.insert(key, values).is_some() {
                 return Err(error(format!(
                     "called with more than one value for {}",
                     String::from_utf8_lossy(key)
@@ -493,15 +516,60 @@ fn handler_process(
         .filter(|program| !program.is_empty())
         .ok_or_else(|| error("has an empty command"))?;
     let host = cx.host();
-    run_process(
-        host,
-        build,
+    let configure = cx
+        .backtrace()
+        .top()
+        .and_then(|frame| frame.name.as_ref())
+        .is_some_and(|name| name.eq_ignore_ascii_case(b"ctest_configure"));
+    let mut spec = CommandSpec {
         program,
-        command.collect(),
+        args: command.collect(),
+    };
+    if configure
+        && cx.var_is_on(b"CTEST_USE_LAUNCHERS")
+        && cx.var_or_empty(b"CTEST_CONFIGURE_COMMAND").is_empty()
+    {
+        spec.args.push("-DCTEST_USE_LAUNCHERS:BOOL=TRUE".into());
+    }
+    let report_command = configure.then(|| spec.clone());
+    let output = run_process(
+        host,
+        build.clone(),
+        spec.program,
+        spec.args,
         host.env_all(),
         extra_verbose() && !args.flag(b"QUIET"),
     )
-    .map_err(|err| error(err.to_string()))
+    .map_err(|err| error(err.to_string()))?;
+    if let Some(spec) = report_command {
+        if let Ok(tag) = Tag::read(host, &build) {
+            let file = build
+                .join("Testing")
+                .join(tag.stamp())
+                .join("Configure.xml");
+            crate::dashboard::write_configure_report(
+                host,
+                &file,
+                &spec,
+                &output,
+                process_code(&output).unwrap_or(-1),
+            )
+            .map_err(error)?;
+        }
+        if verbose() && !args.flag(b"QUIET") {
+            report_size(host, &output);
+        }
+    }
+    Ok(output)
+}
+
+fn report_size(host: &dyn Host, output: &RunOutput) {
+    let size = (output.stdout.len() + output.stderr.len()) / 1024;
+    host.write_out(
+        Stream::Stdout,
+        format!("   Each . represents 1024 bytes of output\n    . Size of output: {size}K\n")
+            .as_bytes(),
+    );
 }
 
 pub(crate) fn run_process(
@@ -570,6 +638,34 @@ fn ctest_empty_binary_directory(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdRes
     Ok(Flow::Normal)
 }
 
+fn ctest_read_custom_files(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
+    if args.is_empty() {
+        return Err(error("called with incorrect number of arguments"));
+    }
+    let cwd = cx.host().initial_cwd();
+    for arg in args {
+        let directory = absolute(&cwd, &arg.value);
+        let file = ["CTestCustom.cmake", "CTestCustom.ctest"]
+            .into_iter()
+            .map(|name| directory.join(name))
+            .find(|path| {
+                cx.host()
+                    .metadata(path, Follow::Yes)
+                    .is_ok_and(|meta| meta.kind == FileKind::File)
+            });
+        if let Some(file) = file
+            && (cx.include_file(&file, Default::default()).is_err() || cx.fatal_occurred())
+        {
+            cx.host().write_out(
+                Stream::Stderr,
+                format!("Problem reading custom configuration: {}\n", file.display()).as_bytes(),
+            );
+            return Err(CmdError::Reported);
+        }
+    }
+    Ok(Flow::Normal)
+}
+
 fn ctest_run_script(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
     let mut scripts = Vec::new();
     let mut new_process = false;
@@ -600,8 +696,14 @@ fn ctest_run_script(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
     let mut code = 0;
     settings.depth += usize::from(!new_process);
     for script in scripts {
-        code = execute_script(&host, settings.clone(), script, new_process)
-            .map_err(|err| error(err.to_string()))?;
+        code = execute_script(
+            &host,
+            settings.clone(),
+            script,
+            new_process,
+            cx.recursion_depth(),
+        )
+        .map_err(|err| error(err.to_string()))?;
     }
     if let Some(var) = return_value {
         cx.set_var(var, code.to_string().into());

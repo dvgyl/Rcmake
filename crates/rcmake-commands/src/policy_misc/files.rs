@@ -324,6 +324,10 @@ impl ExpandEnv for TemplateEnv<'_, '_> {
         self.0.host().env_get(name)
     }
 
+    fn missing_reference(&mut self, name: &[u8]) {
+        self.0.warn_uninitialized(name);
+    }
+
     fn current_line(&self) -> u32 {
         self.0.current_line()
     }

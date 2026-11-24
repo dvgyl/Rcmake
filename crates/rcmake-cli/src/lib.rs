@@ -351,6 +351,7 @@ fn new_interp_with_paths(
         script_args: argv.to_vec(),
     };
     let mut interp = Interp::new(cfg, configure::register);
+    interp.set_check_system_vars(opts.check_system_vars);
     if opts.debug_trycompile {
         interp.cx().set_var(b"CMAKE_DEBUG_TRY_COMPILE", "ON".into());
     }

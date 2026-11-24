@@ -193,7 +193,13 @@ fn probe(cx: &mut Cx<'_>, args: &[ExpandedArg], run: bool) -> CmdResult {
         );
     }
     let depth = PROBE_DEPTH.get();
-    if depth >= 2 {
+    const MAX_LIMITED_PROBES: u8 = 32;
+    let probe_limit = if cx.recursion_limit() <= u32::from(MAX_LIMITED_PROBES) {
+        MAX_LIMITED_PROBES
+    } else {
+        2
+    };
+    if depth >= probe_limit {
         return Err(CmdError::status("The try_compile nesting limit is two."));
     }
     let dirs = ProbeDirs::create(cx, &signature)?;
@@ -258,12 +264,27 @@ fn build_probe(
         }
         Signature::Project { target, .. } => *target,
     };
-    let seed = TryCompileSeed::new(cx, options, source_signature);
+    let mut seed = TryCompileSeed::new(cx, options, source_signature);
+    let depth = cx.recursion_depth();
+    let limit = b"CMAKE_MAXIMUM_RECURSION_DEPTH";
+    if let Some(value) = cx.var(limit)
+        && !seed
+            .defines
+            .iter()
+            .any(|define| define.name.as_slice() == limit)
+    {
+        seed.defines.push(rcmake_eval::CacheDefine {
+            name: limit.as_slice().into(),
+            ty: Some(rcmake_model::CacheType::String),
+            value,
+        });
+    }
     let cmake_root = path::to_native(&cx.var_or_empty(b"CMAKE_ROOT"));
     let cmake_command = path::to_native(&cx.var_or_empty(b"CMAKE_COMMAND"));
     let limits = cx.limits().clone();
     let trace = cx.trace_config().cloned();
     let generator = cx.project().generator;
+    let mut recursion_exceeded = false;
     let (build, mut output) = CapturingHost::capture(cx.host(), &dirs.binary, |host| {
         let mut child = Interp::new(
             InterpConfig {
@@ -279,6 +300,7 @@ fn build_probe(
             },
             crate::register_all,
         );
+        child.inherit_recursion_depth(depth);
         if let Some(mut trace) = trace {
             let redirect = trace.redirect.replace(PathBuf::new());
             child.set_trace_config(Some(trace));
@@ -306,6 +328,7 @@ fn build_probe(
         }
         let configure = child.run_configure(&dirs.source, &dirs.binary, &[]);
         if configure.exit_code != 0 {
+            recursion_exceeded = child.recursion_exceeded();
             return Ok((
                 BuildOutcome {
                     exit_code: configure.exit_code,
@@ -317,6 +340,11 @@ fn build_probe(
         build_child(&mut child.cx(), &dirs.binary, target, source_signature)
     })
     .map_err(error_text)?;
+    if recursion_exceeded {
+        cx.host().write_out(rcmake_host::Stream::Stderr, &output);
+        cx.fail_nested_recursion();
+        return Err(CmdError::Reported);
+    }
     let (outcome, artifact) = match build {
         Ok(values) => values,
         Err(error) => (

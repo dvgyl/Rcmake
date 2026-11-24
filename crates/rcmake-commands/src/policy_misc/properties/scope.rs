@@ -162,15 +162,34 @@ pub(super) fn find_target(cx: &mut Cx<'_>, target: &[u8]) -> Result<TargetId, Cm
     })
 }
 
-pub(super) fn writable_target(cx: &mut Cx<'_>, name: &[u8]) -> Result<TargetId, CmdError> {
+pub(super) fn writable_target(
+    cx: &mut Cx<'_>,
+    name: &[u8],
+    property: &[u8],
+) -> Result<TargetId, CmdError> {
     let dir = cx.current_dir_id();
-    if matches!(
-        cx.project().lookup_target(dir, name),
-        Some(TargetBinding::Alias(_))
-    ) {
-        return Err(CmdError::status("can not be used on an ALIAS target."));
+    if matches!(property, b"ALIASED_TARGET" | b"ALIAS_GLOBAL")
+        && matches!(
+            cx.project().lookup_target(dir, name),
+            Some(TargetBinding::Alias(_))
+        )
+    {
+        return Err(CmdError::status(format!(
+            "can not set property {} on an ALIAS target: {}",
+            BString::from(property),
+            BString::from(name),
+        )));
     }
-    find_target(cx, name)
+    let id = find_target(cx, name)?;
+    if cx.project().target(id).is_some_and(|target| {
+        target
+            .props
+            .get(b"SYMBOLIC")
+            .is_some_and(|value| rcmake_base::truth::is_on(value))
+    }) {
+        return Err(CmdError::status("can not be used on a SYMBOLIC target."));
+    }
+    Ok(id)
 }
 
 pub(super) fn alias_value(cx: &mut Cx<'_>, target: &[u8], name: &[u8]) -> Option<BString> {
@@ -179,10 +198,16 @@ pub(super) fn alias_value(cx: &mut Cx<'_>, target: &[u8], name: &[u8]) -> Option
     let TargetBinding::Alias(id) = model.lookup_target(dir, target)? else {
         return None;
     };
-    let target = model.target(id)?;
     match name {
-        b"ALIASED_TARGET" => Some(target.name.clone()),
-        b"ALIAS_GLOBAL" => Some(if target.is_global() { "TRUE" } else { "FALSE" }.into()),
+        b"ALIASED_TARGET" => Some(model.target(id)?.name.clone()),
+        b"ALIAS_GLOBAL" => Some(
+            if model.dir(dir).local_targets.contains_key(target) {
+                "FALSE"
+            } else {
+                "TRUE"
+            }
+            .into(),
+        ),
         _ => None,
     }
 }

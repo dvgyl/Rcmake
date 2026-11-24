@@ -296,7 +296,11 @@ impl Interp {
             .top()
             .map_or_else(|| Arc::from(&b""[..]), |f| Arc::clone(&f.file));
         let code = synthetic_code(command, args, WATCH_CALLBACK_LINE, file);
-        if self.exec_command(&code, 0).is_err() {
+        let already_exceeded = self.recursion_exceeded;
+        let direct_call_exceeds = self.depth.saturating_add(1) > self.recursion_limit();
+        if self.exec_command(&code, 0).is_err()
+            && (!self.recursion_exceeded || direct_call_exceeds && !already_exceeded)
+        {
             self.error_no_location(cat(&[
                 b"Error in cmake code at\nUnknown:0:\nA command failed during the invocation of callback \"",
                 command,

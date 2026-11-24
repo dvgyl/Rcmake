@@ -37,7 +37,10 @@ pub(super) fn parse(
             );
             opts.warning_flags.push("-Wno-unused-cli".into());
         }
-        b"--check-system-vars" => out(host, "Find problems with variable usage in system files.\n"),
+        b"--check-system-vars" => {
+            opts.check_system_vars = true;
+            out(host, "Find problems with variable usage in system files.\n");
+        }
         b"-W" => {
             let raw = arg.value().ok_or("-W must be followed with [no-]<name>.")?;
             let warning = [b"-W", raw].concat();
