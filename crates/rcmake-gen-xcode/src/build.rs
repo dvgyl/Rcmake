@@ -20,26 +20,31 @@ pub fn build_commands(req: &BuildRequest<'_>) -> Result<Vec<BuildCommand>, GenEr
         ));
     }
     let command = |action: &str, targets: &[BString], native_args: &[BString]| {
-        let mut project = BString::from(req.project_name);
-        project.extend_from_slice(b".xcodeproj");
-        let mut argv = vec![
-            if req.make_program.is_empty() {
-                "/usr/bin/xcodebuild".into()
-            } else {
-                req.make_program.into()
-            },
-            "-project".into(),
-            project,
+        let mut argv = vec![if req.make_program.is_empty() {
+            "/usr/bin/xcodebuild".into()
+        } else {
+            req.make_program.into()
+        }];
+        if !req.project_name.is_empty() {
+            let mut project = BString::from(req.project_name);
+            project.extend_from_slice(b".xcodeproj");
+            argv.extend(["-project".into(), project]);
+        }
+        argv.extend([
             action.into(),
             "-configuration".into(),
-            req.config.unwrap_or(b"Debug").into(),
+            req.config
+                .filter(|config| !config.is_empty())
+                .unwrap_or(b"Debug")
+                .into(),
             "-parallelizeTargets".into(),
-        ];
+        ]);
         if let Jobs::Count(count) = req.jobs {
             argv.extend(["-jobs".into(), count.to_string().into()]);
         }
         argv.push("-hideShellScriptEnvironment".into());
-        if targets.is_empty() {
+        argv.extend_from_slice(native_args);
+        if targets.is_empty() || matches!(targets, [target] if target.is_empty()) {
             argv.extend(["-target".into(), "ALL_BUILD".into()]);
         } else {
             for target in targets {
@@ -48,7 +53,6 @@ pub fn build_commands(req: &BuildRequest<'_>) -> Result<Vec<BuildCommand>, GenEr
                 }
             }
         }
-        argv.extend_from_slice(native_args);
         BuildCommand {
             argv,
             working_dir: req.build_dir.into(),

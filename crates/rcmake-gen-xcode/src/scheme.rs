@@ -48,13 +48,31 @@ pub(crate) fn write(
         out,
         "  <LaunchAction buildConfiguration=\"{launch_config}\" selectedDebuggerIdentifier=\"Xcode.DebuggerFoundation.Debugger.LLDB\" selectedLauncherIdentifier=\"Xcode.DebuggerFoundation.Launcher.LLDB\""
     );
+    let enabled = |prop| property(prop).is_some_and(|value| rcmake_base::truth::is_on(value));
+    let asan = enabled("ADDRESS_SANITIZER");
+    let tsan = !asan && enabled("THREAD_SANITIZER");
+    let launch_style = if property("LAUNCH_MODE").is_some_and(|mode| mode == b"WAIT") {
+        "1"
+    } else {
+        "0"
+    };
+    let document_versioning = if property("DEBUG_DOCUMENT_VERSIONING")
+        .is_none_or(|value| rcmake_base::truth::is_on(value))
+    {
+        "YES"
+    } else {
+        "NO"
+    };
+    let _ = write!(
+        out,
+        " launchStyle=\"{launch_style}\" ignoresPersistentStateOnLaunch=\"NO\" debugDocumentVersioning=\"{document_versioning}\" debugServiceExtension=\"internal\" allowLocationSimulation=\"YES\""
+    );
     for (prop, name) in [
         ("ADDRESS_SANITIZER", "enableAddressSanitizer"),
         (
             "ADDRESS_SANITIZER_USE_AFTER_RETURN",
             "enableASanStackUseAfterReturn",
         ),
-        ("THREAD_SANITIZER", "enableThreadSanitizer"),
         ("THREAD_SANITIZER_STOP", "stopOnEveryThreadSanitizerIssue"),
         ("UNDEFINED_BEHAVIOUR_SANITIZER", "enableUBSanitizer"),
         (
@@ -72,7 +90,6 @@ pub(crate) fn write(
             "enableGPUShaderValidationMode",
         ),
         ("DEBUG_AS_ROOT", "debugAsRoot"),
-        ("DEBUG_DOCUMENT_VERSIONING", "debugDocumentVersioning"),
     ] {
         if property(prop).is_some() {
             let enabled = if on(target, format!("XCODE_SCHEME_{prop}").as_bytes()) {
@@ -83,21 +100,21 @@ pub(crate) fn write(
             let _ = write!(out, " {name}=\"{enabled}\"");
         }
     }
-    for (prop, attr) in [
-        ("LLDB_INIT_FILE", "customLLDBInitFile"),
-        ("LAUNCH_MODE", "launchStyle"),
-        ("ENABLE_GPU_FRAME_CAPTURE_MODE", "enableGPUFrameCaptureMode"),
-    ] {
-        if let Some(value) = property(prop) {
-            let value = match (prop, value.as_slice()) {
-                ("LAUNCH_MODE", b"AUTO") => "0".into(),
-                ("LAUNCH_MODE", b"WAIT") => "1".into(),
-                ("ENABLE_GPU_FRAME_CAPTURE_MODE", b"Metal") => "1".into(),
-                ("ENABLE_GPU_FRAME_CAPTURE_MODE", b"Disabled") => "3".into(),
-                _ => text(value),
-            };
-            let _ = write!(out, " {attr}=\"{}\"", escape(&value));
-        }
+    if tsan {
+        out.push_str(" enableThreadSanitizer=\"YES\"");
+    }
+    if let Some(value) = property("LLDB_INIT_FILE") {
+        let _ = write!(out, " customLLDBInitFile=\"{}\"", escape(&text(value)));
+    }
+    if let Some(value) = property("ENABLE_GPU_FRAME_CAPTURE_MODE") {
+        let value = if value.eq_ignore_ascii_case(b"Metal") {
+            "1".into()
+        } else if value.eq_ignore_ascii_case(b"Disabled") {
+            "3".into()
+        } else {
+            text(value)
+        };
+        let _ = write!(out, " enableGPUFrameCaptureMode=\"{}\"", escape(&value));
     }
     if let Some(path) = property("WORKING_DIRECTORY") {
         let _ = write!(
@@ -132,39 +149,43 @@ pub(crate) fn write(
         }
         out.push_str("    </CommandLineArguments>\n");
     }
-    let mut env = property("ENVIRONMENT").map_or_else(Vec::new, |value| strings(value));
-    for (prop, key) in [
-        ("DYNAMIC_LIBRARY_LOADS", "DYLD_PRINT_LIBRARIES"),
-        ("DYNAMIC_LINKER_API_USAGE", "DYLD_PRINT_APIS"),
-        ("GUARD_MALLOC", "DYLD_INSERT_LIBRARIES"),
-        ("MALLOC_GUARD_EDGES", "MallocGuardEdges"),
-        ("MALLOC_SCRIBBLE", "MallocScribble"),
-        ("MALLOC_STACK", "MallocStackLogging"),
-        ("ZOMBIE_OBJECTS", "NSZombieEnabled"),
-    ] {
-        if on(target, format!("XCODE_SCHEME_{prop}").as_bytes()) {
-            let value = if prop == "GUARD_MALLOC" {
-                "/usr/lib/libgmalloc.dylib"
-            } else {
-                "1"
-            };
-            env.push(format!("{key}={value}"));
-        }
-    }
+    let env = property("ENVIRONMENT").map_or_else(Vec::new, |value| strings(value));
     if !env.is_empty() {
         out.push_str("    <EnvironmentVariables>\n");
         for entry in env {
-            if let Some((key, value)) = entry.split_once('=') {
-                let _ = writeln!(
-                    out,
-                    "      <EnvironmentVariable key=\"{}\" value=\"{}\" isEnabled=\"YES\"></EnvironmentVariable>",
-                    escape(key),
-                    escape(value)
-                );
-            }
+            let (key, value) = entry.split_once('=').unwrap_or((&entry, ""));
+            let _ = writeln!(
+                out,
+                "      <EnvironmentVariable key=\"{}\" value=\"{}\" isEnabled=\"YES\"></EnvironmentVariable>",
+                escape(key),
+                escape(value)
+            );
         }
         out.push_str("    </EnvironmentVariables>\n");
     }
+    out.push_str("    <AdditionalOptions>\n");
+    for (prop, key, value, allowed) in [
+        ("MALLOC_SCRIBBLE", "MallocScribble", "", !tsan),
+        ("MALLOC_GUARD_EDGES", "MallocGuardEdges", "", !tsan && !asan),
+        (
+            "GUARD_MALLOC",
+            "DYLD_INSERT_LIBRARIES",
+            "/usr/lib/libgmalloc.dylib",
+            !tsan && !asan,
+        ),
+        ("ZOMBIE_OBJECTS", "NSZombieEnabled", "YES", true),
+        ("MALLOC_STACK", "MallocStackLogging", "", !tsan && !asan),
+        ("DYNAMIC_LINKER_API_USAGE", "DYLD_PRINT_APIS", "", true),
+        ("DYNAMIC_LIBRARY_LOADS", "DYLD_PRINT_LIBRARIES", "", true),
+    ] {
+        if allowed && enabled(prop) {
+            let _ = writeln!(
+                out,
+                "      <AdditionalOption key=\"{key}\" value=\"{value}\" isEnabled=\"YES\"></AdditionalOption>"
+            );
+        }
+    }
+    out.push_str("    </AdditionalOptions>\n");
     out.push_str("  </LaunchAction>\n");
     let default = escape(config);
     let _ = writeln!(

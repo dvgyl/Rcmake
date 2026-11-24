@@ -12,7 +12,7 @@ use rcmake_model::{
     InstallRule, ProjectModel, Target, TargetEvent, TargetId, TargetKind, TargetOrigin,
 };
 use rcmake_resolve::{
-    BuildGraph, GenerationResult, ResolveOptions, ide::IdeFlavor, resolve, resolve_with_options,
+    BuildGraph, GenerationResult, ResolveOptions, ide::IdeFlavor, resolve_with_options,
 };
 
 fn add(model: &mut ProjectModel, name: &str, kind: TargetKind, source: Option<&str>) -> TargetId {
@@ -73,25 +73,21 @@ fn read(host: &dyn Host, path: &Path) -> String {
     String::from_utf8(data).expect("UTF-8")
 }
 
-fn resolved(model: &mut ProjectModel, host: &dyn Host, ide: bool) -> GenerationResult {
+fn resolved(model: &ProjectModel, host: &dyn Host) -> GenerationResult {
     let configs = ["Debug", "Release", "MinSizeRel", "RelWithDebInfo"].map(|name| {
         let mut graph = BuildGraph::default();
         graph.config.0 = name.into();
         graph.config
     });
-    if ide {
-        resolve_with_options(
-            model,
-            host,
-            &configs,
-            &ResolveOptions {
-                ide: Some(IdeFlavor::Xcode),
-            },
-        )
-        .expect("resolve IDE project")
-    } else {
-        resolve(model, host, &configs).expect("resolve build graph")
-    }
+    resolve_with_options(
+        model,
+        host,
+        &configs,
+        &ResolveOptions {
+            ide: Some(IdeFlavor::Xcode),
+        },
+    )
+    .expect("resolve IDE project")
 }
 
 #[test]
@@ -144,11 +140,11 @@ fn builds_argument_vectors_in_oracle_order() {
             "-jobs",
             "4",
             "-hideShellScriptEnvironment",
+            "-quiet",
             "-target",
             "core",
             "-target",
-            "app",
-            "-quiet"
+            "app"
         ]
     );
     assert_eq!(build.working_dir, "/out");
@@ -176,10 +172,28 @@ fn builds_argument_vectors_in_oracle_order() {
             "ALL_BUILD"
         ]
     );
+    let empty_target = ["".into()];
+    request.targets = &empty_target;
+    request.config = Some(b"");
+    request.project_name = b"";
+    let commands = build_commands(&request).expect("plan");
+    assert_eq!(
+        commands.first().expect("build command").argv,
+        [
+            "/usr/bin/xcodebuild",
+            "build",
+            "-configuration",
+            "Debug",
+            "-parallelizeTargets",
+            "-hideShellScriptEnvironment",
+            "-target",
+            "ALL_BUILD",
+        ]
+    );
 }
 
 #[test]
-fn generates_multiconfig_projects_from_build_graph() {
+fn generates_multiconfig_projects_from_ide_facts() {
     let host = PureHost::default();
     let source = Path::new("/src");
     let out = Path::new("/out");
@@ -231,6 +245,17 @@ fn generates_multiconfig_projects_from_build_graph() {
     let app = add(&mut model, "app", TargetKind::Executable, Some("main.c"));
     prop(&mut model, app, "MACOSX_BUNDLE", "ON");
     prop(&mut model, app, "XCODE_GENERATE_SCHEME", "ON");
+    prop(&mut model, app, "XCODE_SCHEME_ADDRESS_SANITIZER", "ON");
+    prop(&mut model, app, "XCODE_SCHEME_GUARD_MALLOC", "ON");
+    prop(&mut model, app, "XCODE_SCHEME_ZOMBIE_OBJECTS", "ON");
+    prop(&mut model, app, "XCODE_SCHEME_ENVIRONMENT", "EMPTY");
+    prop(&mut model, app, "XCODE_SCHEME_LAUNCH_MODE", "OTHER");
+    prop(
+        &mut model,
+        app,
+        "XCODE_SCHEME_ENABLE_GPU_FRAME_CAPTURE_MODE",
+        "metal",
+    );
     prop(&mut model, app, "XCODE_SCHEME_ARGUMENTS", "hello world;a&b");
     prop(
         &mut model,
@@ -284,7 +309,7 @@ fn generates_multiconfig_projects_from_build_graph() {
         .dir_mut(sub)
         .vars
         .insert("PROJECT_SOURCE_DIR".into(), "/src/sub".into());
-    let mut results = resolved(&mut model, &host, false);
+    let mut results = resolved(&model, &host);
     results.metadata.listfiles = vec!["/src/CMakeLists.txt".into()];
     populate_guid_cache(&results, &mut model, &host);
     model.cache.get_mut(b"app_GUID_CMAKE").expect("GUID").value = "ABCDEF0123456789ABCDEF01".into();
@@ -314,13 +339,21 @@ fn generates_multiconfig_projects_from_build_graph() {
     ] {
         assert!(pbx.contains(expected), "{expected} is absent");
     }
-    assert!(
-        read(
-            &host,
-            &out.join("Demo.xcodeproj/xcshareddata/xcschemes/app.xcscheme")
-        )
-        .contains("a&amp;b")
+    let scheme = read(
+        &host,
+        &out.join("Demo.xcodeproj/xcshareddata/xcschemes/app.xcscheme"),
     );
+    for expected in [
+        "a&amp;b",
+        "enableAddressSanitizer=\"YES\"",
+        "<AdditionalOption key=\"NSZombieEnabled\" value=\"YES\"",
+        "<EnvironmentVariable key=\"EMPTY\" value=\"\"",
+        "launchStyle=\"0\"",
+        "enableGPUFrameCaptureMode=\"1\"",
+    ] {
+        assert!(scheme.contains(expected), "{expected} is absent");
+    }
+    assert!(!scheme.contains("DYLD_INSERT_LIBRARIES"));
     assert!(
         read(&host, &out.join("sub/Sub.xcodeproj/project.pbxproj"))
             .contains("projectDirPath = /src/sub")
@@ -337,6 +370,109 @@ fn generates_multiconfig_projects_from_build_graph() {
     assert!(
         error.to_string().contains("target/app") && error.to_string().contains("target/static")
     );
+}
+
+#[test]
+fn writes_flags_only_on_the_source_that_uses_them() {
+    let host = PureHost::default();
+    let source = Path::new("/src");
+    let out = Path::new("/out");
+    let mut model = model(source, out);
+    add(
+        &mut model,
+        "app",
+        TargetKind::Executable,
+        Some("main.c;helper.c"),
+    );
+    for file in ["main.c", "helper.c"] {
+        host.seed_file(&source.join(file), b"")
+            .expect("seed source");
+    }
+    let properties = model
+        .dir_mut(DirId::ROOT)
+        .source_props
+        .entry("/src/main.c".into())
+        .or_default();
+    for (name, value) in [
+        ("COMPILE_FLAGS", "-Wall -Wextra"),
+        ("COMPILE_OPTIONS", "-fno-common"),
+        ("COMPILE_DEFINITIONS", "-DMAIN_ONLY=1"),
+        ("INCLUDE_DIRECTORIES", "/src/include dir"),
+    ] {
+        properties.set(name.into(), value.into());
+    }
+    let result = resolved(&model, &host);
+    generate(&result, &model, &host, out).expect("generate");
+    let pbx = read(&host, &out.join("Demo.xcodeproj/project.pbxproj"));
+    assert!(
+        pbx.lines().any(|line| line.contains("main.c in Sources")
+            && line.contains("COMPILER_FLAGS")
+            && line.contains("-Wall -Wextra -fno-common '-DMAIN_ONLY=1' '-I/src/include dir'")),
+        "{pbx}"
+    );
+    assert_eq!(pbx.matches("MAIN_ONLY").count(), 1);
+    assert!(!pbx.contains("RCMAKE_SOURCE_FLAGS_"));
+}
+
+#[test]
+fn rejects_per_configuration_source_properties() {
+    let host = PureHost::default();
+    let source = Path::new("/src");
+    let out = Path::new("/out");
+    host.seed_file(&source.join("main.c"), b"")
+        .expect("seed source");
+    for (name, value) in [
+        ("COMPILE_FLAGS", "$<$<CONFIG:Debug>:-DMYDEBUG>"),
+        ("COMPILE_OPTIONS", "$<$<CONFIG:Debug>:-Wall>"),
+        ("COMPILE_DEFINITIONS", "$<$<CONFIG:Debug>:MYDEBUG>"),
+        ("INCLUDE_DIRECTORIES", "$<$<CONFIG:Debug>:/src/debug>"),
+        ("COMPILE_DEFINITIONS", "$<IF:$<CONFIG:Debug>,SAME,SAME>"),
+    ] {
+        let mut model = model(source, out);
+        add(&mut model, "app", TargetKind::Executable, Some("main.c"));
+        model
+            .dir_mut(DirId::ROOT)
+            .source_props
+            .entry("/src/main.c".into())
+            .or_default()
+            .set(name.into(), value.into());
+        let result = resolved(&model, &host);
+        let error = generate(&result, &model, &host, out).expect_err("per-config source property");
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "Xcode does not support per-config per-source {name}:\n\n  {value}\n\nspecified for source:\n\n  /src/main.c"
+            )
+        );
+    }
+}
+
+#[test]
+fn source_and_build_paths_have_distinct_file_references() {
+    let host = PureHost::default();
+    let source = Path::new("/src");
+    let out = Path::new("/out");
+    let mut model = model(source, out);
+    let paths = ["/src/generated/x.c", "/out/x.c"];
+    for path in paths {
+        host.seed_file(Path::new(path), b"").expect("seed source");
+    }
+    add(
+        &mut model,
+        "app",
+        TargetKind::Executable,
+        Some("/src/generated/x.c;/out/x.c"),
+    );
+    let result = resolved(&model, &host);
+    generate(&result, &model, &host, out).expect("generate");
+    let pbx = read(&host, &out.join("Demo.xcodeproj/project.pbxproj"));
+    for path in paths {
+        assert!(
+            pbx.lines()
+                .any(|line| line.contains("isa = PBXFileReference;") && line.contains(path)),
+            "{pbx}"
+        );
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -404,8 +540,8 @@ fn native_xcodebuild_compiles_and_runs_program() {
             stamp.nanos
         )),
     );
-    let source = tmp.1.join("src");
-    let out = tmp.1.join("build dir");
+    let source = tmp.1.join("Debug/src");
+    let out = tmp.1.join("Release/build dir");
     host.create_dir_all(&source.join("include dir"))
         .expect("source dir");
     host.create_dir_all(&out).expect("build dir");
@@ -414,7 +550,7 @@ fn native_xcodebuild_compiles_and_runs_program() {
     for (file, data) in [
         (
             "main.c",
-            "#include <stdio.h>\n#include <string.h>\n#include \"test_header.h\"\n#ifndef MAIN_ONLY\n#error MAIN_ONLY is required\n#endif\nint core(void); int shared(void); int obj(void); int generated(void);\nint main(void) { if (core() + shared() + obj() + generated() != EXPECTED_TOTAL || strlen(CMAKE_INTDIR) == 0) return 1; puts(\"Rcmake Xcode smoke test\"); return 0; }\n",
+            "#include <stdio.h>\n#include <string.h>\n#include \"test_header.h\"\n#if !defined(MAIN_ONLY) || SOURCE_ONLY != 1\n#error Source settings are required\n#endif\nint core(void); int shared(void); int obj(void); int generated(void);\nint main(void) { if (core() + shared() + obj() + generated() != EXPECTED_TOTAL || strlen(CMAKE_INTDIR) == 0) return 1; puts(\"Rcmake Xcode smoke test\"); return 0; }\n",
         ),
         ("include dir/test_header.h", "#define EXPECTED_TOTAL 42\n"),
         ("bundle.c", "int main(void) { return 0; }\n"),
@@ -430,7 +566,7 @@ fn native_xcodebuild_compiles_and_runs_program() {
         ("generate.in", "int generated(void) { return 7; }\n"),
         (
             "CMakeLists.txt",
-            "cmake_minimum_required(VERSION 4.5)\nproject(Demo C)\nadd_library(core STATIC core.c)\nadd_library(shared SHARED shared.c)\nset_target_properties(shared PROPERTIES VERSION 5.2.0 SOVERSION 5)\nadd_subdirectory(objects)\nadd_custom_command(OUTPUT generated.c COMMAND /bin/cp \"${CMAKE_CURRENT_SOURCE_DIR}/generate.in\" generated.c DEPENDS generate.in VERBATIM)\nadd_executable(app main.c generated.c)\ntarget_link_libraries(app PRIVATE core shared object)\ntarget_include_directories(app PRIVATE \"include dir\")\nset_source_files_properties(main.c PROPERTIES COMPILE_OPTIONS -DMAIN_ONLY)\nadd_library(bridge SHARED shared.c bridge.h)\nset_target_properties(bridge PROPERTIES FRAMEWORK TRUE PUBLIC_HEADER bridge.h)\nadd_executable(bundle MACOSX_BUNDLE bundle.c resource.txt)\nset_source_files_properties(resource.txt PROPERTIES MACOSX_PACKAGE_LOCATION Resources)\n",
+            "cmake_minimum_required(VERSION 4.5)\nproject(Demo C)\nadd_library(core STATIC core.c)\nadd_library(shared SHARED shared.c)\nset_target_properties(shared PROPERTIES VERSION 5.2.0 SOVERSION 5)\nadd_subdirectory(objects)\nadd_custom_command(OUTPUT generated.c COMMAND /bin/cp \"${CMAKE_CURRENT_SOURCE_DIR}/generate.in\" generated.c DEPENDS generate.in VERBATIM)\nadd_executable(app main.c generated.c)\ntarget_link_libraries(app PRIVATE core shared object)\nset_source_files_properties(main.c PROPERTIES COMPILE_OPTIONS -DMAIN_ONLY COMPILE_DEFINITIONS SOURCE_ONLY=1 INCLUDE_DIRECTORIES \"${CMAKE_CURRENT_SOURCE_DIR}/include dir\")\nadd_library(bridge SHARED shared.c bridge.h)\nset_target_properties(bridge PROPERTIES FRAMEWORK TRUE PUBLIC_HEADER bridge.h)\nadd_executable(bundle MACOSX_BUNDLE bundle.c resource.txt)\nset_source_files_properties(resource.txt PROPERTIES MACOSX_PACKAGE_LOCATION Resources)\n",
         ),
     ] {
         host.write(&source.join(file), data.as_bytes(), WriteMode::Truncate)
@@ -501,6 +637,12 @@ fn native_xcodebuild_compiles_and_runs_program() {
     let dir = model.dir_mut(DirId::ROOT);
     for (file, key, value) in [
         ("main.c", "COMPILE_OPTIONS", "-DMAIN_ONLY"),
+        ("main.c", "COMPILE_DEFINITIONS", "SOURCE_ONLY=1"),
+        (
+            "main.c",
+            "INCLUDE_DIRECTORIES",
+            source.join("include dir").to_str().expect("include path"),
+        ),
         ("resource.txt", "MACOSX_PACKAGE_LOCATION", "Resources"),
     ] {
         dir.source_props
@@ -508,10 +650,6 @@ fn native_xcodebuild_compiles_and_runs_program() {
             .or_default()
             .set(key.into(), value.into());
     }
-    model.target_mut(app).expect("app").usage.push(
-        rcmake_model::UsageField::IncludeDirectories,
-        BT::new(from_native(&source.join("include dir")), Default::default()),
-    );
     model.target_mut(app).expect("app").usage.link_libraries = Some(
         ["core", "shared", "object"]
             .into_iter()
@@ -538,7 +676,30 @@ fn native_xcodebuild_compiles_and_runs_program() {
         .command_lines
         .push(vec!["/bin/cp".into(), data, "generated.c".into()]);
     model.add_command(generate_source).expect("custom command");
-    let result = resolved(&mut model, &host, true);
+    let mut post = CustomCommand::new(
+        DirId::ROOT,
+        CustomCommandKind::TargetEvent {
+            target: app,
+            event: TargetEvent::PostBuild,
+        },
+        Default::default(),
+        Default::default(),
+    );
+    let config_dir = out.join("$(CONFIGURATION)$(EFFECTIVE_PLATFORM_NAME)");
+    post.working_directory = Some(from_native(&config_dir));
+    post.command_lines.push(vec![
+        "/bin/cp".into(),
+        from_native(&config_dir.join("app")),
+        "app-copy".into(),
+    ]);
+    let post = model.add_command(post).expect("post-build command");
+    model
+        .target_mut(app)
+        .expect("app")
+        .event_commands
+        .push(post);
+
+    let result = resolved(&model, &host);
     generate(&result, &model, &host, &out).expect("generate");
     let list = check(run(
         &out,
@@ -569,6 +730,7 @@ fn native_xcodebuild_compiles_and_runs_program() {
         ));
         assert!(log.contains("BUILD SUCCEEDED"), "{log}");
         for artifact in [
+            "app-copy",
             "libshared.5.2.0.dylib",
             "libshared.5.dylib",
             "libshared.dylib",
@@ -597,36 +759,30 @@ fn native_xcodebuild_compiles_and_runs_program() {
 
 #[test]
 fn applies_ide_facts_and_checks_config_source_lists() {
-    use rcmake_resolve::ide::{IdeCompileSettings, IdeFacts, OutputNaming};
-
     let host = PureHost::default();
     let bin = Path::new("/out");
     let mut model = model(Path::new("/src"), bin);
     host.seed_file(Path::new("/src/main.c"), b"")
         .expect("seed source");
     let app = add(&mut model, "app", TargetKind::Executable, Some("main.c"));
-    let mut result = resolved(&mut model, &host, false);
-    for target in result.targets.iter_mut().filter(|target| target.id == app) {
-        let config = &target.config.0;
-        let mut facts = IdeFacts {
-            naming: OutputNaming {
-                dir: format!("/out/artifacts/{config}").into(),
-                base_name: "renamed".into(),
-                ..OutputNaming::default()
-            },
-            compile: vec![IdeCompileSettings {
-                language: "C".into(),
-                defines: vec![BT::new("IDE_FACT=1".into(), Default::default())],
-                ..IdeCompileSettings::default()
-            }],
-            ..IdeFacts::default()
-        };
-        facts.attributes.insert(
-            "XCODE_ATTRIBUTE_GCC_TREAT_WARNINGS_AS_ERRORS".into(),
-            "YES".into(),
-        );
-        target.ide = Some(Box::new(facts));
-    }
+    prop(&mut model, app, "OUTPUT_NAME", "renamed");
+    prop(
+        &mut model,
+        app,
+        "RUNTIME_OUTPUT_DIRECTORY",
+        "/out/artifacts/$<CONFIG>",
+    );
+    prop(
+        &mut model,
+        app,
+        "XCODE_ATTRIBUTE_GCC_TREAT_WARNINGS_AS_ERRORS",
+        "YES",
+    );
+    model.target_mut(app).expect("app").usage.push(
+        rcmake_model::UsageField::CompileDefinitions,
+        BT::new("IDE_FACT=1".into(), Default::default()),
+    );
+    let result = resolved(&model, &host);
     generate(&result, &model, &host, bin).expect("generate IDE facts");
     let pbx = read(&host, &bin.join("Demo.xcodeproj/project.pbxproj"));
     for expected in [
@@ -637,16 +793,21 @@ fn applies_ide_facts_and_checks_config_source_lists() {
     ] {
         assert!(pbx.contains(expected), "{expected} is absent");
     }
-    for target in &mut result.targets {
-        target.ide = None;
-    }
-    let release = result
-        .targets
-        .iter_mut()
-        .find(|target| target.id == app && target.config.0.as_slice() == b"Release")
-        .expect("Release");
-    release.compile_units.clear();
-    let error = generate(&result, &model, &host, bin).expect_err("config-specific sources");
+    host.seed_file(Path::new("/src/debug.c"), b"")
+        .expect("seed debug source");
+    model.target_mut(app).expect("app").sources.push(BT::new(
+        "$<$<CONFIG:Debug>:debug.c>".into(),
+        Default::default(),
+    ));
+    let error = resolve_with_options(
+        &model,
+        &host,
+        &result.configs,
+        &ResolveOptions {
+            ide: Some(IdeFlavor::Xcode),
+        },
+    )
+    .expect_err("config-specific sources");
     assert!(
         error
             .to_string()

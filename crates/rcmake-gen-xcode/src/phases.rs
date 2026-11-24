@@ -7,8 +7,8 @@ use std::{
 };
 
 use rcmake_gen_common::{GenError, ide::UtilityKind};
-use rcmake_model::{CustomCommandKind, ProjectModel, Target, TargetEvent, TargetKind};
-use rcmake_resolve::{BuildGraph, BuildStep, ResolvedTarget, ide::IdeCustomPhase};
+use rcmake_model::{Target, TargetKind};
+use rcmake_resolve::{ResolvedTarget, ide::IdeCustomPhase};
 
 use crate::{
     object::{self, Isa, Objects, Reference, Value, attrs, list},
@@ -25,6 +25,29 @@ pub(crate) fn quote(value: &str) -> String {
     } else {
         format!("'{}'", value.replace('\'', "'\\''"))
     }
+}
+
+fn quote_command(value: &str) -> String {
+    let mut remainder = value;
+    let mut quoted = String::new();
+    while let Some(start) = remainder.find("$(") {
+        let (before, placeholder) = remainder.split_at(start);
+        if let Some(after) = placeholder.strip_prefix("$(CONFIGURATION)") {
+            quoted.push_str(&quote(before));
+            quoted.push_str(r#""${CONFIGURATION}""#);
+            remainder = after;
+        } else if let Some(after) = placeholder.strip_prefix("$(EFFECTIVE_PLATFORM_NAME)") {
+            quoted.push_str(&quote(before));
+            quoted.push_str(r#""${EFFECTIVE_PLATFORM_NAME}""#);
+            remainder = after;
+        } else {
+            let (literal, after) = remainder.split_at(start + 2);
+            quoted.push_str(&quote(literal));
+            remainder = after;
+        }
+    }
+    quoted.push_str(&quote(remainder));
+    quoted
 }
 
 pub(crate) fn files(
@@ -68,8 +91,8 @@ pub(crate) fn build_file(
 #[derive(Default)]
 pub(crate) struct Script {
     lines: BTreeMap<String, Vec<String>>,
-    inputs: BTreeSet<String>,
-    outputs: BTreeSet<String>,
+    inputs: ConfigPaths,
+    outputs: ConfigPaths,
     comment: Option<String>,
     always: bool,
 }
@@ -81,7 +104,7 @@ impl Script {
             return;
         }
         let lines = self.lines.entry(config.into()).or_default();
-        lines.push(format!("cd {}", quote(cwd)));
+        lines.push(format!("cd {}", quote_command(cwd)));
         lines.extend(commands);
     }
 
@@ -135,9 +158,9 @@ impl Script {
         let mut fields = attrs([
             ("buildActionMask", "2147483647".into()),
             ("files", list(Vec::<Reference>::new())),
-            ("inputPaths", list(self.inputs)),
+            ("inputPaths", list(phase_paths(&self.inputs, configs))),
             ("name", name.into()),
-            ("outputPaths", list(self.outputs)),
+            ("outputPaths", list(phase_paths(&self.outputs, configs))),
             ("runOnlyForDeploymentPostprocessing", "0".into()),
             ("shellPath", "/bin/sh".into()),
             ("shellScript", script.into()),
@@ -161,14 +184,7 @@ pub(crate) struct Custom {
 }
 
 impl Custom {
-    pub(crate) fn collect(
-        &mut self,
-        model: &ProjectModel,
-        raw: &Target,
-        target: &ResolvedTarget,
-        graph: Option<&BuildGraph>,
-        bin: &Path,
-    ) {
+    pub(crate) fn collect(&mut self, raw: &Target, target: &ResolvedTarget, bin: &Path) {
         let config = text(&target.config.0);
         let build_dir = bin.join(text(&target.metadata.binary_dir));
         let build_dir = build_dir.to_string_lossy();
@@ -196,7 +212,7 @@ impl Custom {
                         .filter(|argv| !argv.is_empty())
                         .map(|argv| {
                             argv.iter()
-                                .map(|arg| quote(&text(arg)))
+                                .map(|arg| quote_command(&text(arg)))
                                 .collect::<Vec<_>>()
                                 .join(" ")
                         }),
@@ -204,76 +220,63 @@ impl Custom {
                 phase.paths(bin, &config, &step.depends, &step.outputs, &step.byproducts);
                 phase.always |= step.always_run || raw.kind == TargetKind::Utility;
             }
-            return;
-        }
-        if let Some(graph) = graph
-            && let Some(graph_target) = graph.targets.iter().find(|item| item.name == raw.name)
-        {
-            for index in &graph_target.steps {
-                if let Some(BuildStep::Custom(step)) = graph.steps.get(*index) {
-                    if target
-                        .link
-                        .as_ref()
-                        .is_some_and(|link| step.outputs.contains(&link.output))
-                    {
-                        continue;
-                    }
-                    for invocation in &step.invocations {
-                        let cwd = invocation
-                            .working_dir
-                            .as_ref()
-                            .map_or_else(|| bin.to_path_buf(), |path| bin.join(text(path)));
-                        self.rules
-                            .push(&config, &cwd.to_string_lossy(), [text(&invocation.shell)]);
-                    }
-                    self.rules
-                        .paths(bin, &config, &step.depends, &step.outputs, &step.byproducts);
-                    self.rules.always |= step.outputs.is_empty() || raw.kind == TargetKind::Utility;
-                }
-            }
-        }
-        if raw.kind == TargetKind::Utility {
-            return;
-        }
-        for command in raw
-            .event_commands
-            .iter()
-            .filter_map(|id| model.command(*id))
-        {
-            let CustomCommandKind::TargetEvent { event, .. } = command.kind else {
-                continue;
-            };
-            let phase = match event {
-                TargetEvent::PreBuild => &mut self.pre,
-                TargetEvent::PreLink => &mut self.link,
-                TargetEvent::PostBuild => &mut self.post,
-            };
-            let cwd = command.working_directory.as_ref().map_or_else(
-                || build_dir.to_string(),
-                |dir| {
-                    Path::new(build_dir.as_ref())
-                        .join(text(dir))
-                        .to_string_lossy()
-                        .into_owned()
-                },
-            );
-            phase.push(
-                &config,
-                &cwd,
-                command
-                    .command_lines
-                    .iter()
-                    .filter(|line| !line.is_empty())
-                    .map(|line| {
-                        line.iter()
-                            .map(|arg| quote(&text(arg)))
-                            .collect::<Vec<_>>()
-                            .join(" ")
-                    }),
-            );
-            phase.always = true;
         }
     }
+}
+
+type ConfigPaths = BTreeMap<String, BTreeSet<String>>;
+
+fn phase_paths(paths: &ConfigPaths, configs: &[String]) -> BTreeSet<String> {
+    let mut result: BTreeSet<_> = paths.values().flatten().cloned().collect();
+    let [first, _, ..] = configs else {
+        return result;
+    };
+    let Some(first_paths) = paths.get(first) else {
+        return result;
+    };
+    let present =
+        |config: &str, path: &str| paths.get(config).is_some_and(|paths| paths.contains(path));
+    let common: BTreeSet<_> = first_paths
+        .iter()
+        .filter(|path| configs.iter().all(|config| present(config, path)))
+        .map(String::as_str)
+        .collect();
+    for path in first_paths
+        .iter()
+        .filter(|path| !common.contains(path.as_str()))
+    {
+        let components: Vec<_> = path.split('/').collect();
+        for (index, part) in components.iter().enumerate() {
+            if part != first {
+                continue;
+            }
+            let Some((before, [_, after @ ..])) = components.split_at_checked(index) else {
+                continue;
+            };
+            let substitute = |config: &str| {
+                before
+                    .iter()
+                    .copied()
+                    .chain([config])
+                    .chain(after.iter().copied())
+                    .collect::<Vec<_>>()
+                    .join("/")
+            };
+            let variants: Vec<_> = configs.iter().map(|config| substitute(config)).collect();
+            if configs.iter().zip(&variants).all(|(config, variant)| {
+                result.contains(variant)
+                    && present(config, variant)
+                    && !common.contains(variant.as_str())
+            }) {
+                for variant in variants {
+                    result.remove(&variant);
+                }
+                result.insert(substitute("$(CONFIGURATION)"));
+                break;
+            }
+        }
+    }
+    result
 }
 
 impl Script {
@@ -285,24 +288,15 @@ impl Script {
         outputs: &[rcmake_base::BString],
         byproducts: &[rcmake_base::BString],
     ) {
-        let path = |value: &rcmake_base::BString| {
-            let path = bin.join(text(value));
-            let mut output = String::new();
-            for component in path.components() {
-                let name = component.as_os_str().to_string_lossy();
-                if !output.is_empty() && !output.ends_with('/') {
-                    output.push('/');
-                }
-                output.push_str(if name == config {
-                    "$(CONFIGURATION)"
-                } else {
-                    &name
-                });
-            }
-            output
-        };
-        self.inputs.extend(inputs.iter().map(path));
+        let path =
+            |value: &rcmake_base::BString| bin.join(text(value)).to_string_lossy().into_owned();
+        self.inputs
+            .entry(config.into())
+            .or_default()
+            .extend(inputs.iter().map(path));
         self.outputs
+            .entry(config.into())
+            .or_default()
             .extend(outputs.iter().chain(byproducts).map(path));
     }
 }
@@ -347,4 +341,50 @@ pub(crate) fn utility(
         script.push(config, &cwd.to_string_lossy(), [command.clone()]);
     }
     script
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn expands_xcode_variables_in_working_directory_and_argument() {
+        let path = "/build dir/$(CONFIGURATION)$(EFFECTIVE_PLATFORM_NAME)/a";
+        let expected = r#"'/build dir/'"${CONFIGURATION}"''"${EFFECTIVE_PLATFORM_NAME}"/a"#;
+        let mut script = Script::default();
+        let argument = quote_command(path);
+        script.push("Debug", path, [format!("/bin/echo {argument}")]);
+        assert_eq!(
+            script.lines.get("Debug"),
+            Some(&vec![
+                format!("cd {expected}"),
+                format!("/bin/echo {expected}")
+            ])
+        );
+        assert_eq!(quote_command("$(echo unsafe)"), "'$(''echo unsafe)'");
+    }
+
+    #[test]
+    fn substitutes_only_the_component_that_varies_by_configuration() {
+        let configs = ["Debug", "Release"].map(str::to_owned);
+        let paths = configs
+            .iter()
+            .map(|config| {
+                (
+                    config.clone(),
+                    BTreeSet::from([
+                        "/work/Release/app/Debug/gen.py".into(),
+                        format!("/work/Debug/app/build/{config}/out.c"),
+                    ]),
+                )
+            })
+            .collect();
+        assert_eq!(
+            phase_paths(&paths, &configs),
+            BTreeSet::from([
+                "/work/Release/app/Debug/gen.py".into(),
+                "/work/Debug/app/build/$(CONFIGURATION)/out.c".into(),
+            ])
+        );
+    }
 }

@@ -1,20 +1,19 @@
 //! Project and target build settings for each configuration.
 
 use std::{
-    collections::BTreeSet,
+    collections::BTreeMap,
     path::{Path, PathBuf},
 };
 
 use rcmake_base::{list as cmake_list, truth};
 use rcmake_model::{DirId, ParsedToolset, ProjectModel, Target, TargetKind};
 use rcmake_resolve::{
-    BuildStep, GenerationResult, LinkFragmentRole, ResolvedTarget,
-    ide::{BundleKind, IdeLinkItem},
+    BuildStep, GenerationResult, ResolvedTarget,
+    ide::{BundleKind, IdeCompileSettings, IdeLinkItem},
 };
 
 use crate::{
     object::{Attrs, attrs, list},
-    phases::quote,
     text,
 };
 
@@ -267,18 +266,15 @@ pub(crate) fn project(
     {
         settings.insert("GCC_VERSION".into(), text(toolset).into());
     }
-    for (key, value) in &model.dir(root).vars {
-        attribute(&mut settings, key, value, "CMAKE_XCODE_ATTRIBUTE_", config);
-    }
-    for (key, entry) in model.cache.iter() {
-        if !model.dir(root).vars.contains_key(key.as_slice()) {
-            attribute(
-                &mut settings,
-                key,
-                &entry.value,
-                "CMAKE_XCODE_ATTRIBUTE_",
-                config,
-            );
+    let mut attributes = BTreeMap::new();
+    attributes.extend(model.cache.iter().map(|(key, entry)| (key, &entry.value)));
+    attributes.extend(&model.dir(root).vars);
+    for (key, value) in attributes {
+        if !matches!(
+            key.as_slice(),
+            b"CMAKE_XCODE_ATTRIBUTE_knownRegions" | b"CMAKE_XCODE_ATTRIBUTE_developmentRegion"
+        ) {
+            attribute(&mut settings, key, value, "CMAKE_XCODE_ATTRIBUTE_", config);
         }
     }
     settings
@@ -429,25 +425,11 @@ impl TargetSettings<'_> {
             ("C", "OTHER_CFLAGS", &mut cflags),
             ("CXX", "OTHER_CPLUSPLUSFLAGS", &mut cxxflags),
         ] {
-            if ide.is_none() {
-                let flag_key = format!("CMAKE_{language}_FLAGS");
-                for var in [
-                    flag_key.clone(),
-                    format!("{flag_key}_{}", config.to_ascii_uppercase()),
-                ] {
-                    if let Some(value) = model
-                        .definition(raw.dir, var.as_bytes())
-                        .filter(|v| !v.is_empty())
-                    {
-                        flags.push(text(value));
-                    }
-                }
-            }
             let mut include = |flags: &mut Vec<String>, path: &[u8], system, framework| {
                 if framework {
                     unique(&mut frameworks, text(path));
                 } else if system {
-                    flags.push(format!("-isystem {}", quote(&text(path))));
+                    flags.push(format!("-isystem {}", xcode_flag(&text(path))));
                 } else {
                     unique(&mut headers, text(path));
                 }
@@ -471,26 +453,8 @@ impl TargetSettings<'_> {
                     .iter()
                     .find(|pch| pch.language.as_slice() == language.as_bytes())
                 {
-                    flags.push(format!("-include {}", quote(&text(&pch.header))));
+                    flags.push(format!("-include {}", xcode_flag(&text(&pch.header))));
                 }
-            } else if let Some(target) = target {
-                for group in target
-                    .compile_groups
-                    .iter()
-                    .filter(|group| group.language.as_slice() == language.as_bytes())
-                {
-                    for dir in &group.includes {
-                        include(flags, &dir.path.value, dir.system, false);
-                    }
-                    for define in &group.defines {
-                        unique(&mut defines, text(&define.value));
-                    }
-                }
-                flags.extend(
-                    common_flags(target, language.as_bytes())
-                        .iter()
-                        .map(|flag| flag_text(&flag.value)),
-                );
             }
             flags.push(INHERITED.into());
             settings.insert(key.into(), flags.join(" ").into());
@@ -500,7 +464,7 @@ impl TargetSettings<'_> {
             ("HEADER_SEARCH_PATHS", headers),
             ("FRAMEWORK_SEARCH_PATHS", frameworks),
         ] {
-            let values = values.drain(..).map(|value| quote(&value));
+            let values = values.drain(..).map(|value| xcode_flag(&value));
             settings.insert(key.into(), list(values.chain([INHERITED.into()])));
         }
         let mut ldflags = Vec::new();
@@ -536,7 +500,7 @@ impl TargetSettings<'_> {
                                     TargetKind::InterfaceLibrary | TargetKind::ObjectLibrary
                                 )
                             {
-                                ldflags.push(quote(
+                                ldflags.push(xcode_flag(
                                     &Product::new(model, dep, resolved, config, bin).link_file(),
                                 ));
                             }
@@ -549,11 +513,13 @@ impl TargetSettings<'_> {
                         } else {
                             ldflags.push(format!(
                                 "-framework {}",
-                                quote(name.strip_suffix(".framework").unwrap_or(&name))
+                                xcode_flag(name.strip_suffix(".framework").unwrap_or(&name))
                             ));
                         }
                     }
-                    IdeLinkItem::Library(name) => ldflags.push(quote(&format!("-l{}", text(name)))),
+                    IdeLinkItem::Library(name) => {
+                        ldflags.push(xcode_flag(&format!("-l{}", text(name))))
+                    }
                     IdeLinkItem::File(path) => {
                         if !ide.sources.iter().any(|source| {
                             source.path == *path
@@ -573,36 +539,10 @@ impl TargetSettings<'_> {
                 settings.insert("DYLIB_INSTALL_NAME_BASE".into(), text(dir).into());
             }
             ldflags.extend(ide.build_rpaths.iter().map(|path| rpath(&text(path))));
-        } else if let Some(target) = target.and_then(|target| target.link.as_ref()) {
-            for fragment in &target.fragments {
-                let fragment_text = text(&fragment.text.value);
-                if fragment.role == LinkFragmentRole::LibraryPath
-                    && let Some(path) = fragment_text.strip_prefix("-L")
-                {
-                    libraries.push(path.into());
-                    continue;
-                }
-                ldflags.push(self.fallback_library(&fragment_text, fragment.role));
-            }
-        }
-        // Shared libraries linked by the fallback resolver still use @rpath install names.
-        if ide.is_none()
-            && let Some(target) = target
-        {
-            let rpaths: BTreeSet<_> = target
-                .dependencies
-                .iter()
-                .filter_map(|id| {
-                    let dep = model.target(*id)?;
-                    (dep.kind == TargetKind::SharedLibrary && !dep.is_imported())
-                        .then(|| Product::new(model, dep, None, config, bin).dir)
-                })
-                .collect();
-            ldflags.extend(rpaths.iter().map(|path| rpath(path)));
         }
         let objects = self
             .link_objects()
-            .map(|(_, path)| quote(&path))
+            .map(|(_, path)| xcode_flag(&path))
             .collect::<Vec<_>>();
         if matches!(
             raw.kind,
@@ -622,33 +562,6 @@ impl TargetSettings<'_> {
         } else {
             ldflags.splice(0..0, objects);
         }
-        if let Some(target) = target {
-            for unit in &target.compile_units {
-                if let Some(group) = target.compile_groups.get(unit.group) {
-                    let common = if let Some(ide) = ide {
-                        ide.compile
-                            .iter()
-                            .find(|item| item.language == group.language)
-                            .map(|item| item.flags.iter().collect())
-                            .unwrap_or_default()
-                    } else {
-                        common_flags(target, &group.language)
-                    };
-                    let flags = group
-                        .flags
-                        .iter()
-                        .filter(|flag| !common.iter().any(|base| base.value == flag.value))
-                        .map(|flag| flag_text(&flag.value))
-                        .collect::<Vec<_>>();
-                    if !flags.is_empty() {
-                        settings.insert(
-                            source_flag_setting(&text(&unit.source.value)),
-                            flags.join(" ").into(),
-                        );
-                    }
-                }
-            }
-        }
         ldflags.push(INHERITED.into());
         settings.insert("OTHER_LDFLAGS".into(), ldflags.join(" ").into());
         settings.insert(
@@ -656,7 +569,7 @@ impl TargetSettings<'_> {
             list(
                 libraries
                     .into_iter()
-                    .map(|path| quote(&path))
+                    .map(|path| xcode_flag(&path))
                     .chain([INHERITED.into()]),
             ),
         );
@@ -697,50 +610,12 @@ impl TargetSettings<'_> {
                 );
             }
         }
-        for key in raw.props.names() {
-            if let Some(value) = raw.props.get(&key) {
-                attribute(&mut settings, &key, value, "XCODE_ATTRIBUTE_", config);
-            }
-        }
         if let Some(ide) = ide {
             for (key, value) in &ide.attributes {
                 attribute(&mut settings, key, value, "XCODE_ATTRIBUTE_", config);
             }
         }
         settings
-    }
-
-    fn fallback_library(&self, fragment: &str, role: LinkFragmentRole) -> String {
-        if role == LinkFragmentRole::Libraries
-            && let Some(target) = self.target
-        {
-            for &id in &target.dependencies {
-                let Some(raw) = self.model.target(id).filter(|raw| !raw.is_imported()) else {
-                    continue;
-                };
-                let Some(dep) = self
-                    .result
-                    .targets
-                    .iter()
-                    .find(|dep| dep.id == id && dep.config == target.config)
-                else {
-                    continue;
-                };
-                if let Some(path) = dep
-                    .artifacts
-                    .linker_file
-                    .as_ref()
-                    .or(dep.artifacts.file.as_ref())
-                    && quote(&text(path)) == fragment
-                {
-                    return quote(
-                        &Product::new(self.model, raw, Some(dep), self.config, self.bin)
-                            .link_file(),
-                    );
-                }
-            }
-        }
-        fragment.into()
     }
 
     pub(crate) fn link_objects(&self) -> impl Iterator<Item = (String, String)> {
@@ -810,39 +685,41 @@ impl TargetSettings<'_> {
     }
 }
 
-fn common_flags<'a>(
-    target: &'a ResolvedTarget,
-    language: &[u8],
-) -> Vec<&'a rcmake_model::BT<rcmake_base::BString>> {
-    let mut groups = target
-        .compile_groups
-        .iter()
-        .filter(|group| group.language.as_slice() == language);
-    let Some(group) = groups.next() else {
-        return Vec::new();
-    };
-    group
+pub(crate) fn source_flags(compile: &IdeCompileSettings) -> String {
+    compile
         .flags
         .iter()
-        .filter(|flag| {
-            groups
-                .clone()
-                .all(|group| group.flags.iter().any(|other| other.value == flag.value))
-        })
-        .collect()
+        .map(|flag| flag_text(&flag.value))
+        .chain(compile.defines.iter().map(|define| {
+            let define = text(&define.value);
+            xcode_flag(&format!(
+                "-D{}",
+                define.strip_prefix("-D").unwrap_or(&define)
+            ))
+        }))
+        .chain(compile.includes.iter().map(|include| {
+            let prefix = if include.framework { "-F" } else { "-I" };
+            xcode_flag(&format!("{prefix}{}", text(&include.path)))
+        }))
+        .filter(|flag| !flag.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
-pub(crate) fn source_flag_setting(path: &str) -> String {
-    format!(
-        "RCMAKE_SOURCE_FLAGS_{}",
-        crate::ids::generate(crate::object::Isa::PBXBuildFile, path)
-    )
+fn xcode_flag(value: &str) -> String {
+    let escaped = value.replace('\\', "\\\\").replace('\'', "'\\''");
+    if value.contains(|ch: char| "`~!@#$%^&*()+={}[]|:;\"'<>,.?".contains(ch) || ch.is_whitespace())
+    {
+        format!("'{escaped}'")
+    } else {
+        escaped
+    }
 }
 
 pub(crate) fn flag_text(value: &[u8]) -> String {
     value
         .strip_prefix(b"SHELL:")
-        .map_or_else(|| quote(&text(value)), text)
+        .map_or_else(|| xcode_flag(&text(value)), text)
 }
 
 pub(crate) fn strings(value: &[u8]) -> Vec<String> {
@@ -853,23 +730,43 @@ pub(crate) fn strings(value: &[u8]) -> Vec<String> {
 }
 
 fn rpath(path: &str) -> String {
-    format!("-Xlinker -rpath -Xlinker {}", quote(path))
+    format!("-Xlinker -rpath -Xlinker {}", xcode_flag(path))
 }
 
 fn link_file(path: &str) -> String {
     if path.ends_with(".framework")
         && let Some(name) = Path::new(path).file_name()
     {
-        return quote(&format!(
+        return xcode_flag(&format!(
             "{path}/{}",
             name.to_string_lossy().trim_end_matches(".framework")
         ));
     }
-    quote(path)
+    xcode_flag(path)
 }
 
 fn unique(values: &mut Vec<String>, value: String) {
     if !values.contains(&value) {
         values.push(value);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::xcode_flag;
+
+    #[test]
+    fn escapes_xcode_flag_quotes_and_backslashes() {
+        for (input, escaped) in [
+            (r"a\b", r"a\\b"),
+            (r"a\", r"a\\"),
+            (r"C:\dir\", r"'C:\\dir\\'"),
+            ("it's", r"'it'\''s'"),
+            ("x=y", "'x=y'"),
+            (r#"KEY="\""#, r#"'KEY="\\"'"#),
+            ("", ""),
+        ] {
+            assert_eq!(xcode_flag(input), escaped);
+        }
     }
 }

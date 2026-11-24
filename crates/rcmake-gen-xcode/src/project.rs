@@ -16,7 +16,7 @@ use rcmake_host::{Host, ReadRange, path::to_native};
 use rcmake_model::{DirId, GeneratorKind, ProjectModel, Target, TargetId, TargetKind};
 use rcmake_resolve::{
     GenerationResult, ResolvedTarget,
-    ide::{BundleKind, IdeSourceKind},
+    ide::{BundleKind, IdeCompileSettings, IdeFacts, IdeSourceKind},
 };
 
 use crate::{
@@ -181,16 +181,11 @@ pub(crate) fn generate(
                 .next()
                 .and_then(|part| part.parse::<u32>().ok())
                 .unwrap_or(0);
-            let patch = parts
-                .next()
-                .and_then(|part| part.parse::<u32>().ok())
-                .unwrap_or(0);
             format!(
                 "{:04}",
                 major
                     .saturating_mul(100)
                     .saturating_add(minor.saturating_mul(10))
-                    .saturating_add(patch)
             )
         },
     );
@@ -358,6 +353,24 @@ impl Project<'_> {
                 .map(|config| settings::project(self.model, root.dir, self.bin, &self.arch, config))
                 .collect(),
         )?;
+        let development_region = self
+            .model
+            .definition(root.dir, b"CMAKE_XCODE_ATTRIBUTE_developmentRegion")
+            .map_or_else(|| "English".into(), |value| text(value).trim().to_owned());
+        let known_regions = self
+            .model
+            .definition(root.dir, b"CMAKE_XCODE_ATTRIBUTE_knownRegions")
+            .map_or_else(
+                || vec!["en".into(), "Base".into()],
+                |value| {
+                    text(value)
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|region| !region.is_empty())
+                        .map(str::to_owned)
+                        .collect()
+                },
+            );
         self.objects.insert(
             Isa::PBXProject,
             &project_ref,
@@ -371,9 +384,9 @@ impl Project<'_> {
                 ),
                 ("buildConfigurationList", config_list.into()),
                 ("compatibilityVersion", "Xcode 3.2".into()),
-                ("developmentRegion", "English".into()),
+                ("developmentRegion", development_region.into()),
                 ("hasScannedForEncodings", "0".into()),
-                ("knownRegions", list(["en", "Base"])),
+                ("knownRegions", list(known_regions)),
                 ("mainGroup", main.into()),
                 ("productRefGroup", products.into()),
                 (
@@ -525,7 +538,7 @@ impl Project<'_> {
         let mut custom = phases::Custom::default();
         let mut dependencies = BTreeSet::new();
         let mut target_settings = Vec::new();
-        let mut sources: Option<(Vec<Source>, String)> = None;
+        let mut sources: Option<Vec<Source<'_>>> = None;
         let native = matches!(isa, Isa::PBXNativeTarget);
         let first = self.configs.first().cloned().unwrap_or_default();
         let first_target = self.resolved.get(&(*id, first.clone())).copied();
@@ -546,17 +559,12 @@ impl Project<'_> {
                 .find(|g| g.config.0.as_slice() == config.as_bytes());
             if let Some(facts) = facts {
                 dependencies.extend(facts.dependencies.iter().copied());
-                custom.collect(self.model, raw, facts, graph, self.bin);
-                let items = source_files(self.model, raw, facts, self.bin);
-                if let Some((original, original_config)) = &sources {
-                    if native && !same_sources(original, &items) {
-                        return Err(GenError::Invalid(format!(
-                            "Target \"{name}\" has source files which vary by configuration. This is not supported by the \"Xcode\" generator.\n\n  Config \"{original_config}\":\n\n{}\n\n  Config \"{config}\":\n\n{}",
-                            source_lines(original), source_lines(&items),
-                        ).into()));
-                    }
+                custom.collect(raw, facts, self.bin);
+                let items = source_files(self.model, raw, facts)?;
+                if let Some(original) = &sources {
+                    validate_source_flags(original, &items)?;
                 } else {
-                    sources = Some((items, config.clone()));
+                    sources = Some(items);
                 }
             }
             if let Some(graph) = graph
@@ -600,12 +608,6 @@ impl Project<'_> {
                     .map(|dep| &dep.reference),
             ),
         )?;
-        let source_settings = target_settings
-            .iter()
-            .flat_map(|settings| settings.keys())
-            .filter(|key| key.starts_with("RCMAKE_SOURCE_FLAGS_"))
-            .cloned()
-            .collect::<BTreeSet<_>>();
         let config_list = self.config_list(&key, name, *isa, target_settings)?;
         let configs = self.configs.clone();
         let phase = |objects: &mut Objects, script: phases::Script, role: &str, label: &str| {
@@ -626,19 +628,17 @@ impl Project<'_> {
         build_phases.extend(phase(&mut self.objects, custom.rules, "rules", &rule_name)?);
         let mut tree = Group::default();
         let mut files = BuildFiles::default();
-        for file in sources.into_iter().flat_map(|(items, _)| items) {
+        for file in sources.into_iter().flatten() {
             let path = Path::new(&file.path);
             let source_dir = to_native(&self.model.dir(DirId::ROOT).source_dir);
-            let file_key = path
-                .strip_prefix(source_dir)
-                .unwrap_or(path)
-                .to_string_lossy();
-            let build_path = path.strip_prefix(self.bin).ok();
-            let file_key = build_path.map_or_else(
-                || file_key.into_owned(),
-                |p| format!("generated/{}", p.display()),
-            );
-            let file_key = format!("{key}/file/{file_key}");
+            let role = if let Ok(relative) = path.strip_prefix(self.bin) {
+                format!("bin:{}", relative.display())
+            } else if let Ok(relative) = path.strip_prefix(source_dir) {
+                format!("src:{}", relative.display())
+            } else {
+                format!("abs:{}", path.display())
+            };
+            let file_key = format!("{key}/file/{role}");
             let props = self
                 .model
                 .dir(raw.dir)
@@ -698,12 +698,9 @@ impl Project<'_> {
                     if let Some(visibility) = file.visibility {
                         build_settings.insert("ATTRIBUTES".into(), list([visibility]));
                     }
-                    if matches!(file.kind, IdeSourceKind::Compile { .. }) {
-                        let setting = settings::source_flag_setting(&file.path);
-                        if source_settings.contains(&setting) {
-                            build_settings
-                                .insert("COMPILER_FLAGS".into(), format!("$({setting})").into());
-                        }
+                    if !file.flags.is_empty() && matches!(file.kind, IdeSourceKind::Compile { .. })
+                    {
+                        build_settings.insert("COMPILER_FLAGS".into(), file.flags.into());
                     }
                     items.push(phases::build_file(
                         &mut self.objects,
@@ -762,7 +759,7 @@ impl Project<'_> {
                 ("explicitFileType", product.types().1),
                 "BUILT_PRODUCTS_DIR",
             )?);
-            build_phases.extend(self.embeds(&key, raw)?);
+            build_phases.extend(self.embeds(&key, *id, raw)?);
         }
         build_phases.extend(phase(
             &mut self.objects,
@@ -804,7 +801,12 @@ impl Project<'_> {
         Ok((group, product_ref))
     }
 
-    fn embeds(&mut self, key: &str, raw: &Target) -> Result<Vec<Reference>, GenError> {
+    fn embeds(
+        &mut self,
+        key: &str,
+        id: TargetId,
+        raw: &Target,
+    ) -> Result<Vec<Reference>, GenError> {
         let mut phases = Vec::new();
         for (kind, destination, label) in [
             ("FRAMEWORKS", "10", "Embed Frameworks"),
@@ -814,9 +816,22 @@ impl Project<'_> {
             ("RESOURCES", "7", "Embed Resources"),
         ] {
             let property = format!("XCODE_EMBED_{kind}");
-            let Some(items) = raw.props.get(property.as_bytes()) else {
+            let Some(expression) = raw.props.get(property.as_bytes()) else {
                 continue;
             };
+            let property_value = |ide: &IdeFacts| ide.attributes.get(property.as_bytes()).cloned();
+            let mut values = self.configs.iter().filter_map(|config| {
+                let target = self.resolved.get(&(id, config.clone()))?;
+                target.ide.as_deref().map(property_value)
+            });
+            let items = values.next().flatten().unwrap_or_default();
+            if references_config(&text(expression))
+                || values.any(|value| value.as_ref() != Some(&items))
+            {
+                return Err(GenError::Invalid(format!(
+                    "Xcode does not support per-config {property}:\n\n  {expression}\n\nspecified for target:\n\n  {}", raw.name
+                ).into()));
+            }
             let key = format!("{key}/embed/{kind}");
             let mut files = Vec::new();
             let mut attributes = Vec::new();
@@ -828,7 +843,7 @@ impl Project<'_> {
                     attributes.push(name);
                 }
             }
-            for (index, item) in settings::strings(items).into_iter().enumerate() {
+            for (index, item) in settings::strings(&items).into_iter().enumerate() {
                 let file_key = format!("{key}/{index}");
                 let (item, source_tree) = self
                     .model
@@ -852,7 +867,7 @@ impl Project<'_> {
                     &mut self.objects,
                     &file_key,
                     &item,
-                    ("explicitFileType", "wrapper.framework"),
+                    ("explicitFileType", extension_file_type(&item)),
                     source_tree,
                 )?;
                 files.push(phases::build_file(
@@ -953,7 +968,7 @@ impl Project<'_> {
             raw.props
                 .get(key.as_bytes())
                 .or_else(|| self.model.definition(raw.dir, key.as_bytes()))
-                .map_or_else(String::new, |value| workspace::escape(&text(value)))
+                .map_or_else(String::new, |value| text(value))
         };
         let info = expand_plist(&input, lookup);
         let path = to_native(&self.model.dir(raw.dir).binary_dir)
@@ -1086,25 +1101,26 @@ struct BuildFiles {
     resources: Vec<Reference>,
 }
 
-struct Source {
+struct Source<'a> {
     path: String,
     kind: IdeSourceKind,
     group: String,
     visibility: Option<&'static str>,
+    flags: String,
+    compile: Option<&'a IdeCompileSettings>,
 }
 
-fn source_files(
+fn source_files<'a>(
     model: &ProjectModel,
     raw: &Target,
-    target: &ResolvedTarget,
-    bin: &Path,
-) -> Vec<Source> {
+    target: &'a ResolvedTarget,
+) -> Result<Vec<Source<'a>>, GenError> {
     let dir = model.dir(raw.dir);
     let mut files = Vec::new();
     let mut seen = BTreeSet::new();
-    let mut add = |path: String, mut kind, group| {
+    let mut add = |path: String, mut kind, group, compile: Option<&'a IdeCompileSettings>| {
         if !seen.insert(path.clone()) {
-            return;
+            return Ok(());
         }
         let props = dir.source_props.get(path.as_bytes());
         if props
@@ -1125,46 +1141,55 @@ fn source_files(
                 .any(|name| Path::new(&path) == to_native(&dir.source_dir).join(name))
                 .then_some(visibility)
         });
+        if matches!(kind, IdeSourceKind::Compile { .. }) {
+            let relative_props = Path::new(&path)
+                .strip_prefix(to_native(&dir.binary_dir))
+                .ok()
+                .and_then(|relative| {
+                    let path = to_native(&dir.source_dir).join(relative);
+                    dir.source_props.get(path.to_str()?.as_bytes())
+                });
+            for name in SOURCE_COMPILE_PROPERTIES {
+                let value = props
+                    .and_then(|props| props.get(name.as_bytes()))
+                    .or_else(|| relative_props.and_then(|props| props.get(name.as_bytes())));
+                if let Some(value) = value {
+                    let value = text(value);
+                    if references_config(&value) {
+                        return Err(per_config_source_error(name, &value, &path));
+                    }
+                }
+            }
+        }
+        let path = if kind == IdeSourceKind::Object {
+            object_reference_path(&path, &text(&target.config.0))
+        } else {
+            path
+        };
+        let flags = compile.map_or_else(String::new, settings::source_flags);
         files.push(Source {
             path,
             kind,
             group,
             visibility,
+            flags,
+            compile,
         });
+        Ok(())
     };
     if let Some(ide) = target.ide.as_deref() {
         for source in &ide.sources {
-            add(text(&source.path), source.kind.clone(), text(&source.group));
-        }
-    } else {
-        for unit in &target.compile_units {
-            if let Some(group) = target.compile_groups.get(unit.group) {
-                add(
-                    text(&unit.source.value),
-                    IdeSourceKind::Compile {
-                        language: group.language.clone(),
-                    },
-                    String::new(),
-                );
-            }
-        }
-        for name in raw
-            .sources
-            .iter()
-            .flat_map(|item| settings::strings(&item.value))
-            .filter(|name| !name.contains("$<"))
-        {
-            let path = to_native(&dir.source_dir).join(&name);
-            let kind = match path
-                .extension()
-                .and_then(|ext| ext.to_str())
-                .unwrap_or_default()
-            {
-                "h" | "hh" | "hpp" | "hxx" | "inl" => IdeSourceKind::Header,
-                "o" | "obj" => IdeSourceKind::ExternalObject,
-                _ => IdeSourceKind::Other,
-            };
-            add(path.to_string_lossy().into_owned(), kind, String::new());
+            let path = std::str::from_utf8(&source.path).map_err(|_| {
+                GenError::Invalid(
+                    format!("Xcode source path is not valid UTF-8: {:?}", source.path).into(),
+                )
+            })?;
+            add(
+                path.into(),
+                source.kind.clone(),
+                text(&source.group),
+                source.compile.as_ref(),
+            )?;
         }
     }
     let listfile = to_native(&dir.source_dir).join("CMakeLists.txt");
@@ -1172,45 +1197,103 @@ fn source_files(
         listfile.to_string_lossy().into_owned(),
         IdeSourceKind::ListFile,
         String::new(),
-    );
-    for file in &mut files {
-        if file.kind == IdeSourceKind::Object
-            && let Ok(rel) = Path::new(&file.path).strip_prefix(bin)
+        None,
+    )?;
+    Ok(files)
+}
+
+const SOURCE_COMPILE_PROPERTIES: [&str; 4] = [
+    "COMPILE_FLAGS",
+    "COMPILE_OPTIONS",
+    "COMPILE_DEFINITIONS",
+    "INCLUDE_DIRECTORIES",
+];
+
+fn references_config(value: &str) -> bool {
+    ["$<CONFIG>", "$<CONFIG:", "$<CONFIGURATION>"]
+        .iter()
+        .any(|expression| value.contains(expression))
+}
+
+fn per_config_source_error(property: &str, value: &str, path: &str) -> GenError {
+    GenError::Invalid(
+        format!(
+            "Xcode does not support per-config per-source {property}:
+
+  {value}
+
+specified for source:
+
+  {path}"
+        )
+        .into(),
+    )
+}
+
+fn validate_source_flags(first: &[Source<'_>], current: &[Source<'_>]) -> Result<(), GenError> {
+    let originals: BTreeMap<_, _> = first.iter().map(|source| (&source.path, source)).collect();
+    for source in current {
+        if let Some(original) = originals.get(&source.path)
+            && original.flags != source.flags
         {
-            let config = text(&target.config.0);
-            let mut path = bin.to_owned();
-            for part in rel.components() {
-                let part = part.as_os_str();
-                path.push(if part == config.as_str() {
-                    "$(CONFIGURATION)$(EFFECTIVE_PLATFORM_NAME)".as_ref()
-                } else {
-                    part
-                });
-            }
-            file.path = path.to_string_lossy().into_owned();
+            let first = original.compile;
+            let current = source.compile;
+            let property = if first.map(|compile| &compile.defines)
+                != current.map(|compile| &compile.defines)
+                && first
+                    .into_iter()
+                    .chain(current)
+                    .any(|compile| !compile.defines.is_empty())
+            {
+                "COMPILE_DEFINITIONS"
+            } else if first.map(|compile| &compile.includes)
+                != current.map(|compile| &compile.includes)
+                && first
+                    .into_iter()
+                    .chain(current)
+                    .any(|compile| !compile.includes.is_empty())
+            {
+                "INCLUDE_DIRECTORIES"
+            } else {
+                "COMPILE_OPTIONS"
+            };
+            let flags = if source.flags.is_empty() {
+                &original.flags
+            } else {
+                &source.flags
+            };
+            return Err(per_config_source_error(property, flags, &source.path));
         }
     }
-    files
+    Ok(())
 }
 
-fn same_sources(first: &[Source], second: &[Source]) -> bool {
-    first.len() == second.len()
-        && first
-            .iter()
-            .zip(second)
-            .all(|(a, b)| a.path == b.path && a.kind == b.kind)
+fn object_reference_path(value: &str, config: &str) -> String {
+    let path = Path::new(value);
+    let Some(objects) = path.parent().and_then(Path::parent) else {
+        return value.into();
+    };
+    let Some(directory) = objects.parent() else {
+        return value.into();
+    };
+    if objects.file_name().and_then(|part| part.to_str()) != Some("Objects-normal")
+        || directory.file_name().and_then(|part| part.to_str()) != Some(config)
+    {
+        return value.into();
+    }
+    let Some(root) = directory.parent() else {
+        return value.into();
+    };
+    let Ok(suffix) = path.strip_prefix(directory) else {
+        return value.into();
+    };
+    root.join(settings::CONFIG_DIR)
+        .join(suffix)
+        .to_string_lossy()
+        .into_owned()
 }
 
-fn source_lines(sources: &[Source]) -> String {
-    sources
-        .iter()
-        .filter(|source| source.kind != IdeSourceKind::ListFile)
-        .map(|file| format!("    {}", file.path))
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-fn file_type(file: &Source) -> &'static str {
+fn file_type(file: &Source<'_>) -> &'static str {
     match &file.kind {
         IdeSourceKind::Compile { language } => match language.as_slice() {
             b"C" => "sourcecode.c.c",
@@ -1224,15 +1307,41 @@ fn file_type(file: &Source) -> &'static str {
         IdeSourceKind::Object | IdeSourceKind::ExternalObject => "compiled.mach-o.objfile",
         IdeSourceKind::Header => "sourcecode.c.h",
         IdeSourceKind::ListFile => "sourcecode.text",
-        _ => match Path::new(&file.path)
-            .extension()
-            .and_then(|ext| ext.to_str())
-        {
-            Some("plist") => "text.plist.xml",
-            Some("xcassets") => "folder.assetcatalog",
-            Some("storyboard") => "file.storyboard",
-            Some("xib") => "file.xib",
-            _ => "default",
-        },
+        _ => extension_file_type(&file.path),
+    }
+}
+
+fn extension_file_type(path: &str) -> &'static str {
+    match Path::new(path).extension().and_then(|ext| ext.to_str()) {
+        Some("plist") => "text.plist.xml",
+        Some("xcassets") => "folder.assetcatalog",
+        Some("storyboard") => "file.storyboard",
+        Some("xib") => "file.xib",
+        Some("app") => "wrapper.application",
+        Some("appex") => "wrapper.app-extension",
+        Some("bundle" | "plugin") => "wrapper.plug-in",
+        Some("framework") => "wrapper.framework",
+        Some("xpc") => "wrapper.xpc-service",
+        _ => "default",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::object_reference_path;
+
+    #[test]
+    fn replaces_only_the_object_configuration_directory() {
+        assert_eq!(
+            object_reference_path(
+                "/work/Debug/build/lib.build/Debug/Objects-normal/Debug/a.o",
+                "Debug"
+            ),
+            "/work/Debug/build/lib.build/$(CONFIGURATION)$(EFFECTIVE_PLATFORM_NAME)/Objects-normal/Debug/a.o"
+        );
+        assert_eq!(
+            object_reference_path("/work/Debug/a.o", "Debug"),
+            "/work/Debug/a.o"
+        );
     }
 }
