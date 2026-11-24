@@ -117,7 +117,7 @@ impl PackageGenerator for ArchiveGenerator {
         };
         let archive_name = cfg
             .get(b"CPACK_ARCHIVE_FILE_NAME")
-            .filter(|name| !name.is_empty())
+            .filter(|name| archive_name_is_set(name))
             .unwrap_or(cx.file_name);
         let extension = cfg
             .get(b"CPACK_ARCHIVE_FILE_EXTENSION")
@@ -256,7 +256,10 @@ fn component_archive_name(
 ) -> BString {
     let upper = BString::from(name.to_ascii_uppercase());
     let variable = format!("CPACK_ARCHIVE_{upper}_FILE_NAME");
-    if let Some(name) = cfg.get(variable.as_bytes()).filter(|name| !name.is_empty()) {
+    if let Some(name) = cfg
+        .get(variable.as_bytes())
+        .filter(|name| archive_name_is_set(name))
+    {
         return name.into();
     }
     let display = format!("CPACK_{generator}_USE_DISPLAY_NAME_IN_FILENAME");
@@ -267,6 +270,10 @@ fn component_archive_name(
         name
     };
     [base, b"-", suffix].concat().into()
+}
+
+fn archive_name_is_set(name: &[u8]) -> bool {
+    !name.is_empty() && name != b"NOTFOUND" && !name.ends_with(b"-NOTFOUND")
 }
 
 fn component_workspace(cx: &PackageContext<'_>) -> Result<PathBuf, CpackError> {
@@ -310,6 +317,18 @@ fn write_component_archive(
         .next()
         .ok_or_else(|| error("CPack component group is empty"))?;
     let component_inputs = |root: &Path| {
+        let metadata = cx.host.metadata(root, Follow::No).map_err(|err| {
+            error(format!(
+                "Failed to change working directory to {}: {err}",
+                root.display()
+            ))
+        })?;
+        if metadata.kind != rcmake_host::FileKind::Dir {
+            return Err(error(format!(
+                "Failed to change working directory to {}",
+                root.display()
+            )));
+        }
         children(cx.host, &root.join(prefix))
             .map(|files| files.into_iter().map(|file| prefix.join(file)))
     };
@@ -322,8 +341,8 @@ fn write_component_archive(
         let mut seen = BTreeSet::new();
         let mut inputs = Vec::new();
         for root in std::iter::once(first).chain(roots) {
-            crate::source::merge_component(cx.host, &root, &merged)?;
             inputs.extend(component_inputs(&root)?.filter(|file| seen.insert(file.clone())));
+            crate::source::merge_component(cx.host, &root, &merged)?;
         }
         write_archive(cx, path, &merged, &inputs, options)
     })();

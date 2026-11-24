@@ -48,21 +48,23 @@ pub(crate) fn install(
     let clear_destdir = BTreeMap::from([("DESTDIR".into(), None)]);
     let _env = stage_files.then(|| Environment::apply(host.as_ref(), &clear_destdir));
     let cfg = if stage_files {
-        interp
-            .cx()
-            .set_var(b"CMAKE_INSTALL_PREFIX", from_native(staging));
         let install_scripts = if cfg.get(b"CPACK_INSTALL_SCRIPTS").is_some() {
             b"CPACK_INSTALL_SCRIPTS".as_slice()
         } else {
             b"CPACK_INSTALL_SCRIPT"
         };
-        run_hooks(
-            host.as_ref(),
-            cwd,
-            interp,
-            install_scripts,
-            "- Install script",
-        )?;
+        let scripts = cfg.list(install_scripts);
+        if !scripts.is_empty() {
+            let location = InstallLocation::new(&cfg, staging, b"CPACK_INSTALL_PREFIX")?;
+            let _env = location.environment(host.as_ref());
+            for file in scripts {
+                interp
+                    .cx()
+                    .set_var(b"CMAKE_INSTALL_PREFIX", location.prefix.clone());
+                log(host.as_ref(), format!("- Install script: {file}"));
+                script(interp, &absolute(cwd, &file))?;
+            }
+        }
         let cfg = snapshot(interp);
         crate::source::copy_directories(host.as_ref(), &cfg, cwd, staging, interp)?;
         cfg
@@ -100,18 +102,28 @@ fn install_projects(
     cfg: &CpackConfig,
     staging: &Path,
 ) -> Result<(), CpackError> {
-    let projects = cfg.list(b"CPACK_INSTALL_CMAKE_PROJECTS");
-    if !projects.is_empty() && cfg.get(b"CPACK_CMAKE_GENERATOR").is_none() {
-        return Err(error(
-            "CPACK_INSTALL_CMAKE_PROJECTS is specified, but CPACK_CMAKE_GENERATOR is not. CPACK_CMAKE_GENERATOR is required to install the project.",
-        ));
+    let project_key = b"CPACK_INSTALL_CMAKE_PROJECTS";
+    if cfg.get(project_key).is_none_or(<[u8]>::is_empty) {
+        return Ok(());
     }
+    let generator = cfg.get(b"CPACK_CMAKE_GENERATOR").ok_or_else(|| {
+        error(
+            "CPACK_INSTALL_CMAKE_PROJECTS is specified, but CPACK_CMAKE_GENERATOR is not. CPACK_CMAKE_GENERATOR is required to install the project.",
+        )
+    })?;
+    let projects = cfg.list(project_key);
     let (tuples, remainder) = projects.as_chunks::<4>();
     if !remainder.is_empty() {
         return Err(error(
             "Not enough items on list: CPACK_INSTALL_CMAKE_PROJECTS. CPACK_INSTALL_CMAKE_PROJECTS should hold quadruplet of install directory, install project name, install component, and install subdirectory.",
         ));
     }
+    if tuples.is_empty() {
+        return Ok(());
+    }
+    let build_generator = build_generator(generator).ok_or_else(|| {
+        error("Specified package generator not found. CPACK_CMAKE_GENERATOR value is invalid.")
+    })?;
     let mut configs = cfg.list(b"CPACK_BUILD_CONFIG");
     configs.sort();
     configs.dedup();
@@ -120,16 +132,16 @@ fn install_projects(
     }
     let external = cfg.get(b"CPACK_GENERATOR") == Some(b"External");
     let stage_project = !external || cfg.on(b"CPACK_EXTERNAL_ENABLE_STAGING");
-    if !tuples.is_empty() && cfg.get(b"CPACK_CMAKE_GENERATOR") == Some(b"") {
-        return Err(error(
-            "Specified package generator not found. CPACK_CMAKE_GENERATOR value is invalid.",
-        ));
-    }
+    let prefix_key = if cfg.get(b"CPACK_SET_DESTDIR") == Some(b"I_ON") {
+        b"CPACK_PACKAGING_INSTALL_PREFIX".as_slice()
+    } else {
+        b"CPACK_INSTALL_PREFIX"
+    };
     for [build, project, component, subdir] in tuples {
         let build = absolute(cwd, build);
         for config in &configs {
             if stage_project {
-                preinstall(host.as_ref(), cfg, &build, config)?;
+                preinstall(host.as_ref(), cfg, build_generator, &build, config)?;
             }
             log(
                 host.as_ref(),
@@ -144,8 +156,9 @@ fn install_projects(
                 if separate {
                     log(host.as_ref(), format!("-   Install component: {component}"));
                 }
-                ensure_dir(host.as_ref(), staging, destination)?;
-                install_project(host, options, cfg, &build, config, component, destination)?;
+                let location = InstallLocation::new(cfg, destination, prefix_key)?;
+                ensure_dir(host.as_ref(), staging, &location.directory)?;
+                install_project(host, options, cfg, &build, config, component, location)?;
             }
         }
     }
@@ -158,26 +171,61 @@ fn install_destinations(
     component: &BString,
     subdir: &[u8],
 ) -> Result<Vec<(BString, PathBuf)>, CpackError> {
-    let subdir = relative_install_path(subdir)?;
-    let prefix = relative_install_path(
-        cfg.get(b"CPACK_PACKAGING_INSTALL_PREFIX")
-            .unwrap_or_default(),
-    )?;
+    let mut root = staging.to_owned();
+    root.extend(relative_install_path(subdir)?.iter());
     let components = package_components(cfg, component);
     if components.is_empty() {
-        return Ok(vec![(component.clone(), staging.join(subdir).join(prefix))]);
+        return Ok(vec![(component.clone(), root)]);
     }
     components
         .into_iter()
         .map(|name| {
-            let mut destination = staging.join(component_dir(&name));
+            let mut destination = root.join(component_dir(&name));
             if cfg.on(b"CPACK_COMPONENT_INCLUDE_TOPLEVEL_DIRECTORY") {
                 let file_name = safe_name(cfg.get(b"CPACK_PACKAGE_FILE_NAME").unwrap_or_default())?;
                 destination.push(file_name);
             }
-            Ok((name, destination.join(&subdir).join(&prefix)))
+            Ok((name, destination))
         })
         .collect()
+}
+
+struct InstallLocation {
+    prefix: BString,
+    destdir: Option<BString>,
+    directory: PathBuf,
+}
+
+impl InstallLocation {
+    fn new(cfg: &CpackConfig, root: &Path, destdir_prefix: &[u8]) -> Result<Self, CpackError> {
+        let use_destdir =
+            cfg.on(b"CPACK_SET_DESTDIR") || cfg.get(b"CPACK_SET_DESTDIR") == Some(b"I_ON");
+        let key = if use_destdir {
+            destdir_prefix
+        } else {
+            b"CPACK_PACKAGING_INSTALL_PREFIX"
+        };
+        let configured_prefix = cfg.get(key).unwrap_or_default();
+        let mut directory = root.to_owned();
+        directory.extend(relative_install_path(configured_prefix)?.iter());
+        let prefix = if use_destdir {
+            configured_prefix.into()
+        } else {
+            from_native(&directory)
+        };
+        Ok(Self {
+            prefix,
+            destdir: use_destdir.then(|| from_native(root)),
+            directory,
+        })
+    }
+
+    fn environment<'a>(&self, host: &'a dyn Host) -> Environment<'a> {
+        Environment::apply(
+            host,
+            &BTreeMap::from([("DESTDIR".into(), self.destdir.clone())]),
+        )
+    }
 }
 
 fn install_project(
@@ -187,22 +235,12 @@ fn install_project(
     build: &Path,
     config: &[u8],
     component: &[u8],
-    destination: &Path,
+    location: InstallLocation,
 ) -> Result<(), CpackError> {
     let mut interp = interpreter(host, build, options, None)?;
-    let destdir = cfg.on(b"CPACK_SET_DESTDIR");
-    let prefix = if destdir {
-        cfg.get(b"CPACK_INSTALL_PREFIX").unwrap_or(b"/").into()
-    } else {
-        from_native(destination)
-    };
-    if destdir {
-        relative_install_path(&prefix)?;
-    }
-    let env = BTreeMap::from([("DESTDIR".into(), destdir.then(|| from_native(destination)))]);
-    let _env = Environment::apply(host.as_ref(), &env);
+    let _env = location.environment(host.as_ref());
     let mut cx = interp.cx();
-    cx.set_var(b"CMAKE_INSTALL_PREFIX", prefix);
+    cx.set_var(b"CMAKE_INSTALL_PREFIX", location.prefix);
     if !config.is_empty() {
         cx.set_var(b"CMAKE_INSTALL_CONFIG_NAME", config.into());
     }
@@ -231,24 +269,85 @@ fn install_project(
     Ok(())
 }
 
+// CPack can install a tree generated by CMake, including generators that Rcmake does not implement.
+fn build_generator(name: &[u8]) -> Option<&[u8]> {
+    let windows = cfg!(windows);
+    let name = if let Some(separator) = name.windows(3).position(|part| part == b" - ") {
+        let extra = name.get(..separator)?;
+        let base = name.get(separator + 3..)?;
+        match (extra, base) {
+            (
+                b"CodeBlocks" | b"CodeLite" | b"Eclipse CDT4" | b"Kate" | b"Sublime Text 2",
+                b"Ninja" | b"Unix Makefiles",
+            )
+            | (b"Kate", b"Ninja Multi-Config") => base,
+            (
+                b"CodeBlocks" | b"CodeLite" | b"Eclipse CDT4" | b"Kate" | b"Sublime Text 2",
+                b"MinGW Makefiles" | b"NMake Makefiles",
+            )
+            | (b"CodeBlocks", b"NMake Makefiles JOM")
+                if windows =>
+            {
+                base
+            }
+            _ => return None,
+        }
+    } else {
+        match name {
+            b"CodeBlocks" | b"CodeLite" | b"Kate" | b"Sublime Text 2" if windows => {
+                b"MinGW Makefiles"
+            }
+            b"Eclipse CDT4" if windows => b"NMake Makefiles",
+            b"CodeBlocks" | b"CodeLite" | b"Eclipse CDT4" | b"Kate" | b"Sublime Text 2" => b"Ninja",
+            _ => name,
+        }
+    };
+    match name {
+        b"Ninja" | b"Ninja Multi-Config" | b"Unix Makefiles" | b"FASTBuild" | b"Watcom WMake" => {
+            Some(name)
+        }
+        b"Xcode" if cfg!(target_os = "macos") => Some(name),
+        b"Green Hills MULTI" if windows || cfg!(target_os = "linux") => Some(name),
+        b"MSYS Makefiles"
+        | b"MinGW Makefiles"
+        | b"Borland Makefiles"
+        | b"NMake Makefiles"
+        | b"NMake Makefiles JOM"
+        | b"Visual Studio 15"
+        | b"Visual Studio 15 2017"
+        | b"Visual Studio 15 2017 Win64"
+        | b"Visual Studio 15 2017 ARM"
+        | b"Visual Studio 16"
+        | b"Visual Studio 16 2019"
+        | b"Visual Studio 17"
+        | b"Visual Studio 17 2022"
+        | b"Visual Studio 18"
+        | b"Visual Studio 18 2026"
+            if windows =>
+        {
+            Some(name)
+        }
+        _ => None,
+    }
+}
+
 fn preinstall(
     host: &dyn Host,
     cfg: &CpackConfig,
+    generator: &[u8],
     build: &Path,
     config: &[u8],
 ) -> Result<(), CpackError> {
     if cfg.on(b"CPACK_SKIP_PREINSTALL")
         || !matches!(
-            cfg.get(b"CPACK_CMAKE_GENERATOR"),
-            Some(
-                b"Unix Makefiles"
-                    | b"MSYS Makefiles"
-                    | b"MinGW Makefiles"
-                    | b"NMake Makefiles"
-                    | b"NMake Makefiles JOM"
-                    | b"Watcom WMake"
-                    | b"Borland Makefiles"
-            )
+            generator,
+            b"Unix Makefiles"
+                | b"MSYS Makefiles"
+                | b"MinGW Makefiles"
+                | b"NMake Makefiles"
+                | b"NMake Makefiles JOM"
+                | b"Watcom WMake"
+                | b"Borland Makefiles"
         )
         || host
             .metadata(&build.join("CMakeCache.txt"), Follow::Yes)
