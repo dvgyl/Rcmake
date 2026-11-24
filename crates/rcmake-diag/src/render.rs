@@ -164,6 +164,24 @@ fn warning_footer(diag: &Diagnostic) -> Option<&'static [u8]> {
         Some(DiagCategory::Author) if is_error_kind(diag.kind) => {
             Some(b"This error is for project developers.  Use -Wno-error=author to suppress it.\n")
         }
+        Some(DiagCategory::Experimental) if is_warning_kind(diag.kind) => Some(
+            b"This warning is for project developers.  Use -Wno-author or -Wno-experimental\nto suppress it.\n",
+        ),
+        Some(DiagCategory::Experimental) if is_error_kind(diag.kind) => Some(
+            b"This error is for project developers.  Use -Wno-error=author or\n-Wno-error=experimental to suppress it.\n",
+        ),
+        Some(DiagCategory::NonTargetDirective) if is_warning_kind(diag.kind) => Some(
+            b"This warning is for project developers.  Use -Wno-author or\n-Wno-non-target-directive to suppress it.\n",
+        ),
+        Some(DiagCategory::NonTargetDirective) if is_error_kind(diag.kind) => Some(
+            b"This error is for project developers.  Use -Wno-error=author or\n-Wno-error=non-target-directive to suppress it.\n",
+        ),
+        Some(DiagCategory::InstallAbsoluteDestination) if is_warning_kind(diag.kind) => Some(
+            b"This warning is for project developers.  Use -Wno-author or\n-Wno-install-absolute-destination to suppress it.\n",
+        ),
+        Some(DiagCategory::InstallAbsoluteDestination) if is_error_kind(diag.kind) => Some(
+            b"This error is for project developers.  Use -Wno-error=author or\n-Wno-error=install-absolute-destination to suppress it.\n",
+        ),
         _ => match diag.kind {
             MessageKind::AuthorWarning => {
                 Some(b"This warning is for project developers.  Use -Wno-author to suppress it.\n")
@@ -269,7 +287,7 @@ pub fn format_paragraphs(text: &[u8], indent: usize, width: usize) -> BString {
         }
     }
 
-    if prev_preformatted && text.ends_with(b"\n") {
+    if wrote_any && text.ends_with(b"\n") {
         out.push(b'\n');
     }
 

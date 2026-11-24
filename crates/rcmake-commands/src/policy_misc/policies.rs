@@ -5,7 +5,6 @@ use rcmake_diag::{
 };
 use rcmake_eval::{CmdError, CmdResult, Cx, Flow};
 use rcmake_expr::ExpandedArg;
-use rcmake_model::{CacheEntry, CacheType};
 
 use super::{quoted, status, values};
 
@@ -277,23 +276,6 @@ fn apply_version(cx: &mut Cx<'_>, raw: &[u8], required: bool) -> CmdResult {
         minimum_version
     };
     let floor_name = b"CMAKE_POLICY_VERSION_MINIMUM";
-    if !cx.var_defined(floor_name)
-        && let Some(value) = cx
-            .host()
-            .env_get(floor_name)
-            .filter(|value| !value.is_empty())
-    {
-        cx.cache().insert(
-            floor_name.as_slice().into(),
-            CacheEntry {
-                value,
-                ty: CacheType::String,
-                help: "Minimum policy version".into(),
-                advanced: false,
-                props: Default::default(),
-            },
-        );
-    }
     let floor = cx.var_or_empty(floor_name);
     if !floor.is_empty() {
         let version = parse_version(&floor)

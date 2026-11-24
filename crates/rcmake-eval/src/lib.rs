@@ -35,6 +35,7 @@ pub mod args;
 
 mod builtins;
 mod code;
+mod configure_log;
 mod env;
 mod exec;
 mod file_lock;
@@ -414,7 +415,12 @@ pub struct Interp {
     next_watch_id: u64,
     /// Command tracing configuration (`--trace*`).
     trace: Option<TraceConfig>,
+    /// Configure log events for this run.
+    configure_log: Vec<u8>,
+    /// Expansion settings for nested `cmake_language(TRACE ON)` calls.
+    trace_stack: Vec<bool>,
     next_defer_id: u64,
+    running_deferred: bool,
     /// Identifier of the deferred call whose frame is on top of the backtrace.
     top_defer_id: Option<BString>,
     /// The listfile command being executed (raw arguments for [`Cx::raw_args`]).
@@ -497,7 +503,10 @@ impl Interp {
             watches: BTreeMap::new(),
             next_watch_id: 0,
             trace: None,
+            configure_log: Vec::new(),
+            trace_stack: Vec::new(),
             next_defer_id: 0,
+            running_deferred: false,
             top_defer_id: None,
             cur_cmd: None,
             trace_expanding: false,
@@ -837,6 +846,22 @@ impl Cx<'_> {
         })
     }
 
+    /// Enable tracing until the next matching `cmake_language(TRACE OFF)`.
+    pub fn push_trace(&mut self, expand: bool) {
+        self.interp.trace_stack.push(expand);
+    }
+
+    /// Restore the previous trace setting. Return false if the stack is empty.
+    pub fn pop_trace(&mut self) -> bool {
+        self.interp.trace_stack.pop().is_some()
+    }
+
+    /// Return true while this directory runs its deferred calls.
+    #[must_use]
+    pub fn running_deferred(&self) -> bool {
+        self.interp.running_deferred
+    }
+
     /// Active command tracing configuration (`--trace`), if enabled.
     #[must_use]
     pub fn trace_config(&self) -> Option<&TraceConfig> {
@@ -1103,31 +1128,37 @@ impl Cx<'_> {
     }
 
     /// Queue `command` with raw `args` (see [`Self::raw_args`]) for the end of the
-    /// current directory. The arguments are expanded when the call runs. The call keeps
+    /// selected directory. The arguments are expanded when the call runs. The call keeps
     /// the file and line of the current command, and runs with the policies that are
     /// active at the end of the directory. Returns `false` when no queue is active
     /// (`DEFER CALL may not be scheduled in directory ... at this time.`).
-    pub fn defer_call(&mut self, id: BString, command: &[u8], args: &[Argument]) -> bool {
-        self.interp.queue_deferred(id, command, args)
+    pub fn defer_call(
+        &mut self,
+        dir: DirId,
+        id: BString,
+        command: &[u8],
+        args: &[Argument],
+    ) -> bool {
+        self.interp.queue_deferred(dir, id, command, args)
     }
 
     /// Identifiers of the queued calls that are not canceled, in queue order. `None`
     /// when no queue is active.
     #[must_use]
-    pub fn defer_get_call_ids(&self) -> Option<Vec<BString>> {
-        self.interp.deferred_ids()
+    pub fn defer_get_call_ids(&self, dir: DirId) -> Option<Vec<BString>> {
+        self.interp.deferred_ids(dir)
     }
 
     /// `[command, args...]` of the queued call `id` (raw argument text), or an empty
     /// list if `id` is unknown. `None` when no queue is active.
     #[must_use]
-    pub fn defer_get_call(&self, id: &[u8]) -> Option<Vec<BString>> {
-        self.interp.deferred_call(id)
+    pub fn defer_get_call(&self, dir: DirId, id: &[u8]) -> Option<Vec<BString>> {
+        self.interp.deferred_call(dir, id)
     }
 
     /// Cancel every queued call with identifier `id`. Returns `false` when no queue is
     /// active.
-    pub fn defer_cancel_call(&mut self, id: &[u8]) -> bool {
-        self.interp.cancel_deferred(id)
+    pub fn defer_cancel_call(&mut self, dir: DirId, id: &[u8]) -> bool {
+        self.interp.cancel_deferred(dir, id)
     }
 }

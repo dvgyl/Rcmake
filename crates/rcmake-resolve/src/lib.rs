@@ -161,6 +161,17 @@ pub struct CxxModuleInfo {
     pub forward_from: Vec<BString>,
     /// Install rule of the module files (`install(TARGETS ... CXX_MODULES_BMI)`).
     pub bmi_install: Option<BmiInstall>,
+    /// Ninja scanner commands that use response files, indexed by scan output path.
+    pub scan_responses: IndexMap<BString, ScanResponse>,
+}
+
+/// A scanner invocation and the arguments that Ninja writes to its response file.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScanResponse {
+    /// Scanner invocation with a reference to its response file.
+    pub invocation: Invocation,
+    /// Response file contents.
+    pub arguments: BString,
 }
 
 /// One unit of a `CXX_MODULES` file set.
@@ -195,6 +206,8 @@ pub struct BmiInstall {
     pub exclude_from_all: bool,
     /// `OPTIONAL`.
     pub optional: bool,
+    /// The `CMAKE_INSTALL_MESSAGE` setting when the install rule was created.
+    pub message: BString,
 }
 
 /// Descriptive target facts (`codemodel` target object fields).
@@ -1081,6 +1094,11 @@ fn resolve_target<'a>(
     );
     if file_sets || resolved.compile_units.iter().any(|unit| unit.scan) {
         validate_module_scanning(model, paths, target, &inputs, file_sets)?;
+        let standard = inputs.standard_requirements.get(b"CXX".as_slice()).copied();
+        let responses = lower::scan_responses(model, target, &resolved, standard)?;
+        if let Some(modules) = &mut resolved.cxx_modules {
+            modules.scan_responses = responses;
+        }
     }
     resolved.dependencies = dependencies.into_iter().collect();
     Ok((resolved, inputs))
@@ -1384,8 +1402,10 @@ fn module_install(
                     break;
                 }
             }
-        } else {
-            args.find(|arg| *arg == b"CXX_MODULES_BMI")?;
+        } else if args.find(|arg| *arg == b"CXX_MODULES_BMI").is_none()
+            && rule.options.destination.is_none()
+        {
+            return None;
         }
         let options = &rule.options;
         let mut install = BmiInstall {
@@ -1400,9 +1420,15 @@ fn module_install(
             permissions: options.permissions.clone(),
             exclude_from_all: options.exclude_from_all,
             optional: options.optional,
+            message: model
+                .global
+                .props
+                .get(format!("_RCMAKE_INSTALL_{index}_MESSAGE").as_bytes())
+                .cloned()
+                .unwrap_or_default(),
             ..BmiInstall::default()
         };
-        let mut has_destination = file_set.is_some() && options.destination.is_some();
+        let mut has_destination = options.destination.is_some();
         if has_destination {
             install.destination = options.destination.clone().unwrap_or_default();
         }
@@ -1457,8 +1483,10 @@ fn module_install(
                 _ => break,
             }
         }
-        (has_destination && (configs.is_empty() || configs.iter().any(|name| config.matches(name))))
-            .then_some(install)
+        (has_destination
+            && !install.destination.is_empty()
+            && (configs.is_empty() || configs.iter().any(|name| config.matches(name))))
+        .then_some(install)
     })
 }
 

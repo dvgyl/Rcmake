@@ -114,6 +114,7 @@ fn generate_single(
     let input = result.graphs.first().unwrap_or(&empty);
     let mut graph = Graph::new(input, &config_artifacts(result, input), build_dir, None)?;
     graph.resolve_custom_inputs(model, host);
+    graph.set_scan_responses(result);
     let prep = PrepTargets::new(&graph, result, model)?;
     let programs = Programs::new(result, host, build_dir, model);
     let uses_modules = modules::uses_modules(input);
@@ -228,6 +229,7 @@ fn generate_multi(
             Some(name),
         )?;
         graph.resolve_custom_inputs(model, host);
+        graph.set_scan_responses(result);
         let prep = PrepTargets::new(&graph, result, model)?;
         configs.push((graph, ConfigFiles::new(name, prep)));
     }

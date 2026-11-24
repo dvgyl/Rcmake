@@ -348,7 +348,7 @@ fn t_defer(cx: &mut Cx<'_>, _: &[ExpandedArg]) -> CmdResult {
         return Err(CmdError::Status("bad args".into()));
     };
     let rest = raw.get(2..).unwrap_or_default();
-    if cx.defer_call(id.value.clone(), &command.value, rest) {
+    if cx.defer_call(cx.current_dir_id(), id.value.clone(), &command.value, rest) {
         Ok(Flow::Normal)
     } else {
         Err(CmdError::Status("no defer queue".into()))
@@ -362,11 +362,17 @@ fn t_defer_query(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
     let var = v.first().cloned().unwrap_or_default();
     let value = match v.get(1).map(|s| s.as_slice()) {
         Some(b"CANCEL") => {
-            cx.defer_cancel_call(v.get(2).map_or(&b""[..], |s| s.as_slice()));
-            cx.defer_get_call_ids()
+            cx.defer_cancel_call(
+                cx.current_dir_id(),
+                v.get(2).map_or(&b""[..], |s| s.as_slice()),
+            );
+            cx.defer_get_call_ids(cx.current_dir_id())
         }
-        Some(b"GET") => cx.defer_get_call(v.get(2).map_or(&b""[..], |s| s.as_slice())),
-        _ => cx.defer_get_call_ids(),
+        Some(b"GET") => cx.defer_get_call(
+            cx.current_dir_id(),
+            v.get(2).map_or(&b""[..], |s| s.as_slice()),
+        ),
+        _ => cx.defer_get_call_ids(cx.current_dir_id()),
     };
     match value {
         Some(items) => cx.set_var(&var, rcmake_base::list::join(items.iter())),

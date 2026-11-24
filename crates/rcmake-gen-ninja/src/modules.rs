@@ -3,15 +3,15 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
-use rcmake_base::{BString, path_lex::Lexical};
+use rcmake_base::{BString, hash::HashAlgo, path_lex::Lexical};
 use rcmake_cxxmodules::{
-    BmiInstallInfo, ModmapFormat, ModuleSourceInfo, ModuleVisibility, ScannedSourceInfo,
-    TargetDependInfo, tdi::write_tdi,
+    BmiInstallInfo, ModmapFormat, ModuleExportInfo, ModuleSourceInfo, ModuleVisibility,
+    ScannedSourceInfo, TargetDependInfo, tdi::write_tdi,
 };
 use rcmake_gen_common::{GenError, write_if_changed};
 use rcmake_host::{Host, path};
 use rcmake_model::{DirId, FileSetKind, ProjectModel, UsageScope};
-use rcmake_resolve::{BuildGraph, BuildStep, GenerationResult, ResolvedTarget};
+use rcmake_resolve::{BuildGraph, BuildStep, GenerationResult, InstallActionKind, ResolvedTarget};
 
 use crate::{generation_error, source_directory};
 
@@ -25,6 +25,20 @@ rule CXX_SCAN
 rule CXX_SCAN_NO_DEPFILE
   command = $COMMAND
   description = Scanning $in for C++ dependencies
+
+rule CXX_SCAN_RSP
+  command = $COMMAND
+  description = Scanning $in for C++ dependencies
+  depfile = $DEP_FILE
+  deps = gcc
+  rspfile = $RSP_FILE
+  rspfile_content = $RSP_ARGS
+
+rule CXX_SCAN_RSP_NO_DEPFILE
+  command = $COMMAND
+  description = Scanning $in for C++ dependencies
+  rspfile = $RSP_FILE
+  rspfile_content = $RSP_ARGS
 
 rule CXX_DYNDEP
   command = ${CMAKE_COMMAND} -E cmake_ninja_dyndep --tdi=$in_tdi --lang=CXX $MODMAP_FLAG --dd=$out @$out.rsp$MODULE_EXPORT_COMMANDS
@@ -130,6 +144,7 @@ pub(crate) fn write_metadata(
                 dd,
                 tdi,
                 implicit_inputs,
+                depend_info,
                 ..
             } = step
             else {
@@ -181,8 +196,27 @@ pub(crate) fn write_metadata(
                     .cloned()
                     .unwrap_or_default();
             }
-            if let Some(target) = resolved {
-                add_target_metadata(&mut info, target, model, &path, multi_config)?;
+            if depend_info.language.is_empty() {
+                if let Some(target) = resolved {
+                    add_target_metadata(&mut info, target, model, &path, multi_config)?;
+                }
+            } else {
+                info = depend_info.as_ref().clone();
+                if let Some(install) = &mut info.bmi_installation {
+                    install.script_location = rcmake_resolve::lower::bmi_script_path(
+                        &top_bld,
+                        tdi,
+                        &info.config,
+                        multi_config,
+                    );
+                    if !install.permissions.is_empty() {
+                        install.permissions =
+                            [" ".as_bytes(), &install.permissions].concat().into();
+                    }
+                }
+            }
+            if let Some(raw) = resolved.and_then(|target| model?.target(target.id)) {
+                info.exports = module_exports(result, raw, &top_bld, &graph.config.0);
             }
             let contents =
                 write_tdi(&info).map_err(|error| generation_error(&path, error.to_string()))?;
@@ -287,39 +321,89 @@ fn add_target_metadata(
         }
     }
     if let Some(install) = &modules.bmi_install {
-        let config = if info.config.is_empty() {
-            b"noconfig"
-        } else {
-            info.config.as_slice()
-        };
-        let script =
-            BString::from([b"install-cxx-module-bmi-".as_slice(), config, b".cmake"].concat());
         let mut permissions = BString::default();
         for permission in &install.permissions {
             permissions.push(b' ');
             permissions.extend_from_slice(permission);
         }
-        let support_dir = tdi.parent().and_then(|dir| {
-            if multi_config {
-                dir.parent()
-            } else {
-                Some(dir)
-            }
-        });
-        let script = path::to_native(&script);
         info.bmi_installation = Some(BmiInstallInfo {
             destination: install.destination.clone(),
             component: install.component.clone(),
             permissions,
             exclude_from_all: install.exclude_from_all,
             optional: install.optional,
-            script_location: path::from_native(
-                &support_dir.map_or(script.clone(), |dir| dir.join(&script)),
+            script_location: rcmake_resolve::lower::bmi_script_path(
+                &info.dir_top_bld,
+                &path::from_native(tdi),
+                &info.config,
+                multi_config,
             ),
             ..BmiInstallInfo::default()
         });
     }
     Ok(())
+}
+
+fn module_exports(
+    result: &GenerationResult,
+    target: &rcmake_model::Target,
+    top_bld: &[u8],
+    config: &[u8],
+) -> Vec<ModuleExportInfo> {
+    let name = target.props.get(b"EXPORT_NAME").unwrap_or(&target.name);
+    let filesystem_name = filesystem_export_name(name);
+    result
+        .exports
+        .iter()
+        .enumerate()
+        .filter_map(|(index, plan)| {
+            let directory = plan
+                .cxx_modules_directory
+                .as_ref()
+                .filter(|dir| !dir.is_empty())?;
+            if !plan
+                .targets
+                .iter()
+                .any(|export| &export.name == name && export.config_properties.contains_key(config))
+            {
+                return None;
+            }
+            let (destination, export_prefix) = if plan.install {
+                let install = result.install.actions.iter().find(|action| {
+                matches!(action.kind, InstallActionKind::Export { plan } if plan == index)
+            })?;
+                let hash = HashAlgo::Md5.hex_digest(&install.destination);
+                (
+                    install.destination.clone(),
+                    absolute(top_bld, format!("CMakeFiles/Export/{hash}").as_bytes()),
+                )
+            } else {
+                let dir = absolute(top_bld, parent(&plan.file));
+                (dir.clone(), dir)
+            };
+            Some(ModuleExportInfo {
+                export_name: name.clone(),
+                filesystem_export_name: filesystem_name.clone(),
+                namespace: plan.namespace.clone(),
+                destination,
+                cxx_module_info_dir: directory.clone(),
+                export_prefix,
+                install: plan.install,
+            })
+        })
+        .collect()
+}
+
+fn filesystem_export_name(name: &[u8]) -> BString {
+    let mut result = BString::default();
+    for &byte in name {
+        match byte {
+            b':' => result.extend_from_slice(b"_c"),
+            b'_' => result.extend_from_slice(b"__"),
+            _ => result.push(byte),
+        }
+    }
+    result
 }
 
 fn absolute(base: &[u8], name: &[u8]) -> BString {

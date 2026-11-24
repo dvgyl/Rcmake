@@ -464,6 +464,49 @@ fn is_ide_property(name: &[u8], flavor: IdeFlavor) -> bool {
     }
 }
 
+/// Evaluate the project-wide Xcode build settings for one configuration.
+///
+/// # Errors
+/// Returns an error if a build setting contains an invalid generator expression.
+pub fn xcode_project_attributes(
+    model: &ProjectModel,
+    dir: DirId,
+    config: &[u8],
+) -> Result<IndexMap<BString, BString>, ResolveError> {
+    const PREFIX: &[u8] = b"CMAKE_XCODE_ATTRIBUTE_";
+    let mut definitions = IndexMap::new();
+    definitions.extend(model.cache.iter().map(|(key, entry)| (key, &entry.value)));
+    definitions.extend(&model.dir(dir).vars);
+    let mut selected = IndexMap::new();
+    for (key, value) in definitions {
+        let Some(name) = key.strip_prefix(PREFIX) else {
+            continue;
+        };
+        if matches!(name, b"knownRegions" | b"developmentRegion") {
+            continue;
+        }
+        if let Some((name, specific)) = xcode_attribute_name(name, config)
+            && (specific || !selected.contains_key(&name))
+        {
+            selected.insert(name, value);
+        }
+    }
+    let ctx = EvalContext {
+        config: ConfigId(BString::from(config)),
+        ..EvalContext::default()
+    };
+    let mut usage = UsageResolver::new(model).with_ide(Some(IdeFlavor::Xcode));
+    let mut host = usage.host(dir);
+    selected
+        .into_iter()
+        .map(|(name, value)| {
+            let ast = rcmake_genex::parse(value)?;
+            let (value, _) = rcmake_genex::evaluate(&ast, &ctx, &mut host)?;
+            Ok((name, value))
+        })
+        .collect()
+}
+
 fn xcode_attribute_name(name: &[u8], config: &[u8]) -> Option<(BString, bool)> {
     let mut sections = name.split_inclusive(|&byte| byte == b']');
     let mut key = BString::default();

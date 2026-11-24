@@ -13,7 +13,7 @@ use rcmake_diag::{
 };
 use rcmake_expr::ExpandedArg;
 use rcmake_host::{FileKind, Follow, ReadRange, Stream};
-use rcmake_model::DirId;
+use rcmake_model::{CacheEntry, CacheType, DirId};
 use rcmake_regex::Captures;
 use rcmake_syntax::{ArgKind, Argument, CommandInvocation, ParseError};
 
@@ -213,6 +213,7 @@ impl Interp {
     }
 
     pub(crate) fn run_script_impl(&mut self, path: &Path) -> RunOutcome {
+        self.init_policy_minimum();
         let cwd = rcmake_host::path::from_native(&self.config.cwd);
         let abs = collapse_full_path(&rcmake_host::path::from_native(path), &cwd);
 
@@ -342,6 +343,7 @@ impl Interp {
         let src_native = rcmake_host::path::to_native(&src_abs);
         let bin_native = rcmake_host::path::to_native(&bin_abs);
 
+        self.init_policy_minimum();
         self.project.set_root_dirs(src_abs.clone(), bin_abs.clone());
         self.render.relative_base = Some(src_abs.clone());
 
@@ -376,6 +378,7 @@ impl Interp {
         }
 
         let _ = self.read_list_file_impl(&lists_bytes, true);
+        self.write_configure_log(&bin_native);
         self.snapshot_dir_vars(DirId::ROOT);
         if self.exit_code() != 0 && self.exit_override.is_none() {
             self.config.host.write_out(
@@ -389,6 +392,7 @@ impl Interp {
     }
 
     pub(crate) fn run_preload_script_impl(&mut self, path: &Path) -> bool {
+        self.init_policy_minimum();
         let cwd = rcmake_host::path::from_native(&self.config.cwd);
         let abs = collapse_full_path(&rcmake_host::path::from_native(path), &cwd);
         let display = path.to_string_lossy();
@@ -400,7 +404,33 @@ impl Interp {
             self.error_no_location(cat(&[b"Error processing file: ", &abs]));
             return false;
         }
-        self.read_list_file(&abs)
+        let base = self.lookup_var(b"CMAKE_SOURCE_DIR").cloned();
+        let saved = core::mem::replace(&mut self.render.relative_base, base);
+        let read = self.read_list_file(&abs);
+        self.render.relative_base = saved;
+        read
+    }
+
+    fn init_policy_minimum(&mut self) {
+        const NAME: &[u8] = b"CMAKE_POLICY_VERSION_MINIMUM";
+        if !self.project.cache.contains(NAME)
+            && let Some(value) = self
+                .config
+                .host
+                .env_get(NAME)
+                .filter(|value| !value.is_empty())
+        {
+            self.project.cache.insert(
+                NAME.into(),
+                CacheEntry {
+                    value,
+                    ty: CacheType::String,
+                    help: "Minimum policy version".into(),
+                    advanced: false,
+                    props: Default::default(),
+                },
+            );
+        }
     }
 
     /// The directory being processed.
@@ -448,6 +478,10 @@ impl Interp {
         bin: &Path,
         options: SubdirOptions,
     ) -> Result<DirId, CmdError> {
+        if self.running_deferred {
+            self.error_here("Subdirectories may not be created during deferred execution.".into());
+            return Err(CmdError::Reported);
+        }
         let src_abs = collapse_full_path(
             &rcmake_host::path::from_native(src),
             &self.current_source_dir_bytes(),
@@ -1090,9 +1124,11 @@ impl Interp {
             return;
         };
         let saved = self.cur_cmd.replace((Arc::clone(&code.cmds), 0));
+        let vars = self.push_list_file_vars(&code.file);
         let _ = self.with_frame(&code.file, cmd.line, &cmd.name, Some(id), |this| {
             this.dispatch(cmd, &code.file)
         });
+        self.pop_list_file_vars(vars);
         self.cur_cmd = saved;
     }
 
@@ -1102,7 +1138,7 @@ impl Interp {
         }
         let lower = cmd.lower.as_slice();
         let command = self.lookup_command(lower);
-        if self.trace.is_some() && (command.is_some() || unexpected_text(lower).is_some()) {
+        if self.trace_enabled() && (command.is_some() || unexpected_text(lower).is_some()) {
             self.trace_command(cmd, file, false);
         }
         if let Some(text) = unexpected_text(lower) {
@@ -1116,6 +1152,13 @@ impl Interp {
             return self.invoke(command, &[]);
         }
         let args = self.expand(&cmd.args)?;
+        if self.running_deferred
+            && lower == b"enable_language"
+            && matches!(command, Command::Builtin(..))
+        {
+            self.error_here("Languages may not be enabled during deferred execution.".into());
+            return Err(CmdError::Reported);
+        }
         self.invoke(command, &args)
     }
 
@@ -1123,7 +1166,7 @@ impl Interp {
         let mut msg = cat(&[b"Unknown CMake command \"", name, b"\"."]);
         let names = self.command_names();
         if let Some(s) = closest(name, &names) {
-            msg.extend_from_slice(b" Did you mean: \"");
+            msg.extend_from_slice(b"  Did you mean: \"");
             msg.extend_from_slice(s);
             msg.extend_from_slice(b"\"?");
         }
@@ -1136,8 +1179,25 @@ impl Interp {
                 if self.config.mode == RunMode::Script && !flags.scriptable {
                     return Err(CmdError::Status("command is not scriptable".into()));
                 }
-                let mut cx = Cx { interp: self };
-                f(&mut cx, args)
+                // Install rules use this setting at the call site.
+                let first_install = self.project.installs.len();
+                let result = f(&mut Cx { interp: self }, args);
+                if first_install < self.project.installs.len()
+                    && self
+                        .bt
+                        .top()
+                        .and_then(|frame| frame.name.as_deref())
+                        .is_some_and(|name| name.eq_ignore_ascii_case(b"install"))
+                    && let Some(level) = self.lookup_var(b"CMAKE_INSTALL_MESSAGE").cloned()
+                {
+                    for index in first_install..self.project.installs.len() {
+                        self.project.global.props.set(
+                            format!("_RCMAKE_INSTALL_{index}_MESSAGE").into(),
+                            level.clone(),
+                        );
+                    }
+                }
+                result
             }
             Command::User(u) => match u.kind {
                 UserCommandKind::Function => self.call_function(&u, args),
@@ -1155,17 +1215,20 @@ impl Interp {
                 name,
             ])));
         }
-        let Some(command) = self.lookup_command(&lower) else {
-            return Err(CmdError::Status(cat(&[
-                b"invalid command specified: ",
-                name,
-            ])));
-        };
         let file = self
             .bt
             .top()
             .map_or_else(|| Arc::from(&b""[..]), |f| Arc::clone(&f.file));
         let line = self.cur_line;
+        let Some(command) = self.lookup_command(&lower) else {
+            let saved = core::mem::take(&mut self.bt);
+            let result = self.with_command_frame(&file, line, name, |this| {
+                this.unknown_command(name);
+                Err(CmdError::Reported)
+            });
+            self.bt = saved;
+            return result;
+        };
         // A command that expands its own arguments reads them from `cur_cmd`. The
         // arguments are expanded already, so pass them as bracket arguments.
         let raw = matches!(command, Command::Builtin(_, _, true)).then(|| {

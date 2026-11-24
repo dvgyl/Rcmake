@@ -14,6 +14,10 @@ fn string(out: &mut String, value: &str) {
         out.push_str(value);
         return;
     }
+    quoted_string(out, value);
+}
+
+fn quoted_string(out: &mut String, value: &str) {
     out.push('"');
     for ch in value.chars() {
         if matches!(ch, '"' | '\\') {
@@ -42,6 +46,7 @@ fn indent(out: &mut String, level: usize) {
 fn value(out: &mut String, item: &Value, level: usize, inline: bool) {
     match item {
         Value::Text(text) => string(out, text),
+        Value::QuotedText(text) => quoted_string(out, text),
         Value::Ref(item) => reference(out, item),
         Value::List(items) => {
             out.push('(');
@@ -61,6 +66,17 @@ fn value(out: &mut String, item: &Value, level: usize, inline: bool) {
                 out.push('\n');
                 indent(out, level);
             }
+            out.push(')');
+        }
+        Value::ListRow(items) => {
+            out.push_str("(\n");
+            for (index, item) in items.iter().enumerate() {
+                if index != 0 {
+                    out.push(',');
+                }
+                string(out, item);
+            }
+            indent(out, level);
             out.push(')');
         }
         Value::Dict(items) => {

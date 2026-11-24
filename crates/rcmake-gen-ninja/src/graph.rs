@@ -8,7 +8,9 @@ use rcmake_gen_common::GenError;
 use rcmake_gen_common::export::ModuleExportJob;
 use rcmake_host::{Follow, Host, path};
 use rcmake_model::ProjectModel;
-use rcmake_resolve::{ArtifactSet, BuildGraph, BuildStep, Invocation, LinkKind};
+use rcmake_resolve::{
+    ArtifactSet, BuildGraph, BuildStep, GenerationResult, Invocation, LinkKind, ScanResponse,
+};
 
 use crate::syntax::{Edge, Ninja, shell_word};
 use crate::{generation_error, modules};
@@ -18,6 +20,7 @@ pub(crate) struct Graph<'a> {
     pub(crate) build_dir: &'a Path,
     pub(crate) config: Option<&'a [u8]>,
     names: HashMap<BString, usize>,
+    scan_responses: HashMap<&'a [u8], &'a ScanResponse>,
     aliases: Vec<BString>,
     artifact_targets: HashSet<usize>,
     producers: HashMap<BString, usize>,
@@ -50,6 +53,7 @@ impl<'a> Graph<'a> {
             build_dir,
             config,
             names: HashMap::with_capacity(input.targets.len()),
+            scan_responses: HashMap::new(),
             aliases: Vec::with_capacity(input.targets.len()),
             artifact_targets: HashSet::new(),
             producers: HashMap::with_capacity(input.steps.len()),
@@ -292,6 +296,18 @@ impl<'a> Graph<'a> {
         Ninja(Vec::with_capacity(capacity))
     }
 
+    pub(crate) fn set_scan_responses(&mut self, result: &'a GenerationResult) {
+        self.scan_responses.extend(
+            result
+                .targets
+                .iter()
+                .filter(|target| target.config == self.input.config)
+                .filter_map(|target| target.cxx_modules.as_ref())
+                .flat_map(|modules| modules.scan_responses.iter())
+                .map(|(file, response)| (file.as_slice(), response)),
+        );
+    }
+
     pub(crate) fn emit(
         &self,
         ninja: &mut Ninja,
@@ -377,6 +393,7 @@ impl<'a> Graph<'a> {
         let mut implicit_outputs = nodes.byproducts.clone();
         let mut export_commands = Vec::new();
         let mut dyndep_node = None;
+        let mut scan_response = None;
         let (rule, inputs, invocations, depfile) = match step {
             BuildStep::Compile {
                 source,
@@ -403,26 +420,45 @@ impl<'a> Graph<'a> {
             }
             BuildStep::Scan {
                 source,
+                ddi,
                 invocation,
                 depfile,
                 ..
-            } => (
-                if depfile.is_some() {
-                    b"CXX_SCAN".as_slice()
-                } else {
-                    b"CXX_SCAN_NO_DEPFILE".as_slice()
-                },
-                vec![self.node(source)],
-                std::slice::from_ref(invocation),
-                depfile.as_ref(),
-            ),
+            } => {
+                scan_response = self
+                    .scan_responses
+                    .get(ddi.as_slice())
+                    .map(|&response| (ddi, response));
+                let rule: &[u8] = match (depfile.is_some(), scan_response.is_some()) {
+                    (true, true) => b"CXX_SCAN_RSP",
+                    (true, false) => b"CXX_SCAN",
+                    (false, true) => b"CXX_SCAN_RSP_NO_DEPFILE",
+                    (false, false) => b"CXX_SCAN_NO_DEPFILE",
+                };
+                (
+                    rule,
+                    vec![self.node(source)],
+                    std::slice::from_ref(
+                        scan_response.map_or(invocation, |(_, response)| &response.invocation),
+                    ),
+                    depfile.as_ref(),
+                )
+            }
             BuildStep::Collate {
                 dd,
                 ddis,
                 tdi,
                 implicit_inputs,
+                depend_info,
                 ..
             } => {
+                implicit_outputs.extend(
+                    depend_info
+                        .bmi_installation
+                        .iter()
+                        .filter(|install| !install.script_location.is_empty())
+                        .map(|install| self.node(&install.script_location)),
+                );
                 implicit.push(self.node(tdi));
                 implicit.extend(implicit_inputs.iter().map(|input| self.node(input)));
                 for export in exports.iter().filter(|export| export.dyndep == *dd) {
@@ -534,6 +570,11 @@ impl<'a> Graph<'a> {
             b"COMMAND",
             &command_line(invocations, matches!(step, BuildStep::Custom(_))),
         );
+        if let Some((ddi, response)) = scan_response {
+            let rsp = [self.node(ddi).as_slice(), b".rsp"].concat();
+            ninja.binding(b"RSP_FILE", &rsp);
+            ninja.binding(b"RSP_ARGS", &response.arguments);
+        }
         if let Some(depfile) = depfile {
             let key: &[u8] = if matches!(step, BuildStep::Compile { .. } | BuildStep::Scan { .. }) {
                 b"DEP_FILE"

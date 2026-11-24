@@ -337,6 +337,30 @@ impl Project<'_> {
                 reference,
                 target_fields(reference, config_list, phase, deps),
             );
+            if *kind == UtilityKind::AllBuild
+                && self
+                    .model
+                    .definition(root.dir, b"CMAKE_XCODE_GENERATE_SCHEME")
+                    .is_some_and(|value| truth::is_on(value))
+            {
+                let target = Target::new(
+                    reference.comment.as_str().into(),
+                    TargetKind::Utility,
+                    rcmake_model::TargetOrigin::Normal,
+                    root.dir,
+                    Default::default(),
+                    Default::default(),
+                );
+                scheme::write(
+                    self.host,
+                    &self.path,
+                    &target,
+                    reference,
+                    &reference.comment,
+                    &self.default_config,
+                    &self.upgrade,
+                )?;
+            }
         }
         let mut project_targets = targets
             .into_iter()
@@ -351,7 +375,7 @@ impl Project<'_> {
             self.configs
                 .iter()
                 .map(|config| settings::project(self.model, root.dir, self.bin, &self.arch, config))
-                .collect(),
+                .collect::<Result<_, _>>()?,
         )?;
         let development_region = self
             .model
@@ -386,7 +410,7 @@ impl Project<'_> {
                 ("compatibilityVersion", "Xcode 3.2".into()),
                 ("developmentRegion", development_region.into()),
                 ("hasScannedForEncodings", "0".into()),
-                ("knownRegions", list(known_regions)),
+                ("knownRegions", Value::ListRow(known_regions)),
                 ("mainGroup", main.into()),
                 ("productRefGroup", products.into()),
                 (
@@ -680,6 +704,9 @@ impl Project<'_> {
             if native {
                 let phase = match file.kind {
                     IdeSourceKind::Compile { .. } => Some((&mut files.sources, "Sources")),
+                    IdeSourceKind::ListFile if file.explicit => {
+                        Some((&mut files.sources, "Sources"))
+                    }
                     IdeSourceKind::Header
                         if matches!(product.bundle, BundleKind::Framework { .. }) =>
                     {
@@ -1108,6 +1135,7 @@ struct Source<'a> {
     visibility: Option<&'static str>,
     flags: String,
     compile: Option<&'a IdeCompileSettings>,
+    explicit: bool,
 }
 
 fn source_files<'a>(
@@ -1118,65 +1146,67 @@ fn source_files<'a>(
     let dir = model.dir(raw.dir);
     let mut files = Vec::new();
     let mut seen = BTreeSet::new();
-    let mut add = |path: String, mut kind, group, compile: Option<&'a IdeCompileSettings>| {
-        if !seen.insert(path.clone()) {
-            return Ok(());
-        }
-        let props = dir.source_props.get(path.as_bytes());
-        if props
-            .and_then(|props| props.get(b"MACOSX_PACKAGE_LOCATION"))
-            .is_some_and(|location| location.as_slice() == b"Resources")
-        {
-            kind = IdeSourceKind::Resource;
-        }
-        let visibility = [
-            (b"PUBLIC_HEADER".as_slice(), "Public"),
-            (b"PRIVATE_HEADER", "Private"),
-        ]
-        .into_iter()
-        .find_map(|(key, visibility)| {
-            let names = settings::strings(raw.props.get(key)?);
-            names
-                .iter()
-                .any(|name| Path::new(&path) == to_native(&dir.source_dir).join(name))
-                .then_some(visibility)
-        });
-        if matches!(kind, IdeSourceKind::Compile { .. }) {
-            let relative_props = Path::new(&path)
-                .strip_prefix(to_native(&dir.binary_dir))
-                .ok()
-                .and_then(|relative| {
-                    let path = to_native(&dir.source_dir).join(relative);
-                    dir.source_props.get(path.to_str()?.as_bytes())
-                });
-            for name in SOURCE_COMPILE_PROPERTIES {
-                let value = props
-                    .and_then(|props| props.get(name.as_bytes()))
-                    .or_else(|| relative_props.and_then(|props| props.get(name.as_bytes())));
-                if let Some(value) = value {
-                    let value = text(value);
-                    if references_config(&value) {
-                        return Err(per_config_source_error(name, &value, &path));
+    let mut add =
+        |path: String, mut kind, group, compile: Option<&'a IdeCompileSettings>, explicit| {
+            if !seen.insert(path.clone()) {
+                return Ok(());
+            }
+            let props = dir.source_props.get(path.as_bytes());
+            if props
+                .and_then(|props| props.get(b"MACOSX_PACKAGE_LOCATION"))
+                .is_some_and(|location| location.as_slice() == b"Resources")
+            {
+                kind = IdeSourceKind::Resource;
+            }
+            let visibility = [
+                (b"PUBLIC_HEADER".as_slice(), "Public"),
+                (b"PRIVATE_HEADER", "Private"),
+            ]
+            .into_iter()
+            .find_map(|(key, visibility)| {
+                let names = settings::strings(raw.props.get(key)?);
+                names
+                    .iter()
+                    .any(|name| Path::new(&path) == to_native(&dir.source_dir).join(name))
+                    .then_some(visibility)
+            });
+            if matches!(kind, IdeSourceKind::Compile { .. }) {
+                let relative_props = Path::new(&path)
+                    .strip_prefix(to_native(&dir.binary_dir))
+                    .ok()
+                    .and_then(|relative| {
+                        let path = to_native(&dir.source_dir).join(relative);
+                        dir.source_props.get(path.to_str()?.as_bytes())
+                    });
+                for name in SOURCE_COMPILE_PROPERTIES {
+                    let value = props
+                        .and_then(|props| props.get(name.as_bytes()))
+                        .or_else(|| relative_props.and_then(|props| props.get(name.as_bytes())));
+                    if let Some(value) = value {
+                        let value = text(value);
+                        if references_config(&value) {
+                            return Err(per_config_source_error(name, &value, &path));
+                        }
                     }
                 }
             }
-        }
-        let path = if kind == IdeSourceKind::Object {
-            object_reference_path(&path, &text(&target.config.0))
-        } else {
-            path
+            let path = if kind == IdeSourceKind::Object {
+                object_reference_path(&path, &text(&target.config.0))
+            } else {
+                path
+            };
+            let flags = compile.map_or_else(String::new, settings::source_flags);
+            files.push(Source {
+                path,
+                kind,
+                group,
+                visibility,
+                flags,
+                compile,
+                explicit,
+            });
+            Ok(())
         };
-        let flags = compile.map_or_else(String::new, settings::source_flags);
-        files.push(Source {
-            path,
-            kind,
-            group,
-            visibility,
-            flags,
-            compile,
-        });
-        Ok(())
-    };
     if let Some(ide) = target.ide.as_deref() {
         for source in &ide.sources {
             let path = std::str::from_utf8(&source.path).map_err(|_| {
@@ -1189,6 +1219,7 @@ fn source_files<'a>(
                 source.kind.clone(),
                 text(&source.group),
                 source.compile.as_ref(),
+                true,
             )?;
         }
     }
@@ -1198,6 +1229,7 @@ fn source_files<'a>(
         IdeSourceKind::ListFile,
         String::new(),
         None,
+        false,
     )?;
     Ok(files)
 }

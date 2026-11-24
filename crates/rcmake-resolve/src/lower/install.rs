@@ -5,7 +5,9 @@ use std::convert::Infallible;
 use indexmap::{IndexMap, IndexSet};
 use rcmake_base::{BString, list, path_lex::Lexical};
 use rcmake_genex::{ConfigId, EvalContext, EvalSite, evaluate, parse};
-use rcmake_model::{BT, DirId, InstallKind, InstallOptions, InstallRule, ProjectModel, TargetKind};
+use rcmake_model::{
+    BT, DirId, GeneratorKind, InstallKind, InstallOptions, InstallRule, ProjectModel, TargetKind,
+};
 
 use super::{compute_artifacts, definition, join};
 use crate::{
@@ -251,6 +253,36 @@ fn lower_install_rules<E>(
                                 .push(action(model, rule, &options, default, kind));
                         }
                     }
+                    if matches!(
+                        model.generator,
+                        Some(GeneratorKind::Ninja | GeneratorKind::NinjaMultiConfig)
+                    ) {
+                        let bmi = groups
+                            .get(b"CXX_MODULES_BMI".as_slice())
+                            .map_or_else(|| options.clone(), |group| group.merge(options));
+                        if bmi
+                            .destination
+                            .as_ref()
+                            .is_some_and(|destination| !destination.is_empty())
+                        {
+                            for target in &matching {
+                                if target
+                                    .compile_groups
+                                    .iter()
+                                    .any(|group| group.language == b"CXX")
+                                {
+                                    add_bmi_include(
+                                        &mut manifest,
+                                        model,
+                                        rule,
+                                        &bmi,
+                                        target,
+                                        matching.len() > 1,
+                                    );
+                                }
+                            }
+                        }
+                    }
                     if let Some(headers) = raw.props.get(b"PUBLIC_HEADER") {
                         let files: Vec<_> = list::split(headers, list::Empty::Drop)
                             .iter()
@@ -342,6 +374,67 @@ fn action(
         kind,
         optional: options.optional,
     }
+}
+
+fn add_bmi_include(
+    manifest: &mut InstallManifest,
+    model: &ProjectModel,
+    rule: &InstallRule,
+    options: &InstallOptions,
+    target: &ResolvedTarget,
+    multiple: bool,
+) {
+    let Some(directory) = &target.artifacts.object_dir else {
+        return;
+    };
+    let multi = model.generator == Some(GeneratorKind::NinjaMultiConfig);
+    if multiple
+        && !options.configurations.is_empty()
+        && !options
+            .configurations
+            .iter()
+            .any(|name| target.config.matches(name))
+    {
+        return;
+    }
+    let tdi = join(directory, b"CXXDependInfo.json");
+    let path = super::bmi_script_path(
+        &model.dir(DirId::ROOT).binary_dir,
+        &tdi,
+        &target.config.0,
+        multi,
+    );
+    let mut action = action(
+        model,
+        rule,
+        options,
+        b"",
+        InstallActionKind::Script(path.clone()),
+    );
+    action.optional = true;
+    if multiple {
+        action.configurations = vec![target.config.0.clone()];
+    }
+    if options.exclude_from_all {
+        let mut body = BString::from("if(CMAKE_INSTALL_COMPONENT STREQUAL ");
+        cmake_quote(&mut body, &action.component);
+        body.extend_from_slice(b")\n    include(");
+        cmake_quote(&mut body, &path);
+        body.extend_from_slice(b" OPTIONAL)\n  endif()");
+        action.kind = InstallActionKind::Code(body);
+    }
+    manifest.actions.push(action);
+}
+
+fn cmake_quote(out: &mut BString, text: &[u8]) {
+    out.push(b'"');
+    for &byte in text {
+        if matches!(byte, b'\\' | b'"' | b'$') {
+            out.push(b'\\');
+        }
+        out.push(byte);
+    }
+    out.push(b'"');
 }
 
 fn file_action(
@@ -437,6 +530,7 @@ impl Group<'_> {
             options.configurations.clone_from(&group.configurations);
         }
         options.optional |= group.optional;
+        options.exclude_from_all |= group.exclude_from_all;
         options
     }
 }
@@ -483,6 +577,7 @@ fn target_options<'a>(recorded: &[&'a [u8]]) -> IndexMap<&'a [u8], Group<'a>> {
     while let Some(key) = args.next() {
         if group_key(key) {
             group = Some(key);
+            groups.entry(key).or_default();
             if key == b"FILE_SET" {
                 args.next();
             }
@@ -509,6 +604,7 @@ fn target_options<'a>(recorded: &[&'a [u8]]) -> IndexMap<&'a [u8], Group<'a>> {
             }
             b"COMPONENT" => entry.options.component = read(),
             b"OPTIONAL" => entry.options.optional = true,
+            b"EXCLUDE_FROM_ALL" => entry.options.exclude_from_all = true,
             b"NAMELINK_ONLY" => entry.namelink_only = true,
             b"NAMELINK_SKIP" => entry.namelink_skip = true,
             b"NAMELINK_COMPONENT" => entry.namelink_component = args.next(),

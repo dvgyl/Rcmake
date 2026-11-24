@@ -28,7 +28,8 @@ pub(crate) use install::lower_install_manifest_with_configs;
 pub use install::{collect_metadata, lower_install_manifest};
 pub use launcher::instrumentation_launcher;
 pub(crate) use link::{ide_rpaths, install_name_dir};
-pub use modules::lower_modules;
+pub(crate) use modules::scan_responses;
+pub use modules::{bmi_script_path, lower_modules};
 pub(crate) use standard::required_standard;
 
 pub(crate) fn definition<'a>(

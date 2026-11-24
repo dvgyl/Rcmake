@@ -97,7 +97,7 @@ impl Interp {
         f: impl FnOnce(&mut Self) -> CmdResult,
     ) -> CmdResult {
         self.with_command_frame(&code.file, cmd.line, &cmd.name, |this| {
-            if this.trace.is_some() && !this.fatal {
+            if this.trace_enabled() && !this.fatal {
                 this.trace_command(cmd, &code.file, false);
             }
             f(this)
@@ -107,7 +107,7 @@ impl Interp {
     /// Trace the command at `idx` that is evaluated without its own call frame (`else`,
     /// `elseif`, and end commands).
     fn trace_unframed(&mut self, code: &Code, idx: usize) {
-        if self.trace.is_none() {
+        if !self.trace_enabled() {
             return;
         }
         if let Some(cmd) = code.cmds.get(idx) {

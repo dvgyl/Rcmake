@@ -36,7 +36,7 @@ pub struct CollationInput {
 pub struct CollationOutput {
     /// Content of the Ninja dyndep (`.dd`) file.
     pub dyndep: BString,
-    /// Module map files, with paths and contents.
+    /// Auxiliary files, with paths and contents. This includes module maps and the BMI install script.
     pub modmaps: Vec<(BString, BString)>,
     /// Module table for dependent targets.
     pub modules: CxxModulesJson,
@@ -74,6 +74,14 @@ pub fn collate(input: &CollationInput) -> Result<CollationOutput, ModulesError> 
         ..CollationOutput::default()
     };
     let local = collect_providers(input, &scans, &mut output)?;
+    if let Some(install) = &input.tdi.bmi_installation
+        && !install.script_location.is_empty()
+    {
+        output.modmaps.push((
+            install.script_location.clone(),
+            bmi_install_script(install, &output.modules),
+        ));
+    }
     let mut available = CxxModulesJson::default();
     for linked in &input.linked {
         available.modules.extend(linked.modules.clone());
@@ -153,6 +161,78 @@ pub fn collate(input: &CollationInput) -> Result<CollationOutput, ModulesError> 
     }
     collect_interface_objects(input, &scans, &mut output.modules);
     Ok(output)
+}
+
+fn bmi_install_script(install: &crate::BmiInstallInfo, modules: &CxxModulesJson) -> BString {
+    let mut script = BString::default();
+    let mut files = modules
+        .modules
+        .values()
+        .filter(|module| !module.is_private)
+        .peekable();
+    if files.peek().is_none() {
+        return script;
+    }
+    script.extend_from_slice(b"file(INSTALL DESTINATION \"");
+    if !Lexical::new(&install.destination).absolute() {
+        script.extend_from_slice(b"${CMAKE_INSTALL_PREFIX}/");
+    }
+    escape_cmake(&mut script, &install.destination);
+    script.extend_from_slice(b"\" TYPE FILE");
+    if install.optional {
+        script.extend_from_slice(b" OPTIONAL");
+    }
+    if matches!(
+        install.message_level.as_slice(),
+        b"MESSAGE_ALWAYS" | b"MESSAGE_LAZY" | b"MESSAGE_NEVER"
+    ) {
+        script.push(b' ');
+        script.extend_from_slice(&install.message_level);
+    }
+    let mut permissions = install
+        .permissions
+        .split(|byte| byte.is_ascii_whitespace())
+        .filter(|word| {
+            matches!(
+                *word,
+                b"OWNER_READ"
+                    | b"OWNER_WRITE"
+                    | b"OWNER_EXECUTE"
+                    | b"GROUP_READ"
+                    | b"GROUP_WRITE"
+                    | b"GROUP_EXECUTE"
+                    | b"WORLD_READ"
+                    | b"WORLD_WRITE"
+                    | b"WORLD_EXECUTE"
+                    | b"SETUID"
+                    | b"SETGID"
+            )
+        })
+        .peekable();
+    if permissions.peek().is_some() {
+        script.extend_from_slice(b" PERMISSIONS");
+        for permission in permissions {
+            script.push(b' ');
+            script.extend_from_slice(permission);
+        }
+    }
+    script.extend_from_slice(b" FILES");
+    for module in files {
+        script.extend_from_slice(b" \"");
+        escape_cmake(&mut script, &module.bmi);
+        script.push(b'"');
+    }
+    script.extend_from_slice(b")\n");
+    script
+}
+
+fn escape_cmake(out: &mut BString, value: &[u8]) {
+    for &byte in value {
+        if matches!(byte, b'\\' | b'"' | b'$') {
+            out.push(b'\\');
+        }
+        out.push(byte);
+    }
 }
 
 type Providers<'a> = BTreeMap<&'a BString, &'a P1689Rule>;

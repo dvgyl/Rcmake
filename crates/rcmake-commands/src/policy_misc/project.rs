@@ -111,6 +111,15 @@ pub(super) fn project(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
         }
     }
 
+    if cx.running_deferred() {
+        cx.issue(
+            MessageKind::Error,
+            Effect::SetError,
+            None,
+            "Languages may not be enabled during deferred execution.".into(),
+        );
+        return Err(CmdError::Reported);
+    }
     for group in language_groups(&unparsed, languages.as_deref()) {
         crate::configure::enable_languages(cx, &group, false)?;
     }

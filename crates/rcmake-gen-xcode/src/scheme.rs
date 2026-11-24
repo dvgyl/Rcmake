@@ -25,10 +25,19 @@ pub(crate) fn write(
     upgrade: &str,
 ) -> Result<(), GenError> {
     let property = |key: &str| target.props.get(format!("XCODE_SCHEME_{key}").as_bytes());
-    let cfg = |key| escape(&property(key).map_or_else(|| config.to_owned(), |value| text(value)));
-    let container = project
-        .file_name()
-        .map_or_else(String::new, |s| escape(&s.to_string_lossy()));
+    let cfg = |key| {
+        escape(
+            &property(key)
+                .filter(|value| !value.is_empty())
+                .map_or_else(|| config.to_owned(), |value| text(value)),
+        )
+    };
+    let lldb = property("LLDB_INIT_FILE")
+        .filter(|value| !value.is_empty())
+        .map_or_else(String::new, |value| {
+            format!(" customLLDBInitFile=\"{}\"", escape(&text(value)))
+        });
+    let container = escape(&project.to_string_lossy());
     let blueprint = escape(&reference.comment);
     let product = escape(product);
     let id = &reference.id;
@@ -42,7 +51,7 @@ pub(crate) fn write(
     let launch_config = cfg("LAUNCH_CONFIGURATION");
     let _ = writeln!(
         out,
-        "  <TestAction buildConfiguration=\"{test_config}\" selectedDebuggerIdentifier=\"Xcode.DebuggerFoundation.Debugger.LLDB\" selectedLauncherIdentifier=\"Xcode.DebuggerFoundation.Launcher.LLDB\" shouldUseLaunchSchemeArgsEnv=\"YES\">\n    <Testables></Testables>\n  </TestAction>"
+        "  <TestAction buildConfiguration=\"{test_config}\" selectedDebuggerIdentifier=\"Xcode.DebuggerFoundation.Debugger.LLDB\" selectedLauncherIdentifier=\"Xcode.DebuggerFoundation.Launcher.LLDB\" shouldUseLaunchSchemeArgsEnv=\"YES\"{lldb}>\n    <Testables></Testables>\n  </TestAction>"
     );
     let _ = write!(
         out,
@@ -103,9 +112,7 @@ pub(crate) fn write(
     if tsan {
         out.push_str(" enableThreadSanitizer=\"YES\"");
     }
-    if let Some(value) = property("LLDB_INIT_FILE") {
-        let _ = write!(out, " customLLDBInitFile=\"{}\"", escape(&text(value)));
-    }
+    out.push_str(&lldb);
     if let Some(value) = property("ENABLE_GPU_FRAME_CAPTURE_MODE") {
         let value = if value.eq_ignore_ascii_case(b"Metal") {
             "1".into()
@@ -126,18 +133,19 @@ pub(crate) fn write(
         out.push_str(" useCustomWorkingDirectory=\"NO\"");
     }
     out.push_str(">\n");
-    if let Some(path) = property("EXECUTABLE").filter(|path| !path.is_empty()) {
-        let _ = writeln!(
-            out,
-            "    <PathRunnable runnableDebuggingMode=\"0\" FilePath=\"{}\"></PathRunnable>",
+    let runnable = if let Some(path) = property("EXECUTABLE").filter(|path| !path.is_empty()) {
+        format!(
+            "    <PathRunnable runnableDebuggingMode=\"0\" FilePath=\"{}\"></PathRunnable>\n",
             escape(&text(path))
-        );
+        )
     } else if target.kind == rcmake_model::TargetKind::Executable {
-        let _ = writeln!(
-            out,
-            "    <BuildableProductRunnable runnableDebuggingMode=\"0\">{build_ref}</BuildableProductRunnable>"
-        );
-    }
+        format!(
+            "    <BuildableProductRunnable runnableDebuggingMode=\"0\">{build_ref}</BuildableProductRunnable>\n"
+        )
+    } else {
+        String::new()
+    };
+    out.push_str(&runnable);
     if let Some(values) = property("ARGUMENTS") {
         out.push_str("    <CommandLineArguments>\n");
         for arg in strings(values) {
@@ -190,7 +198,7 @@ pub(crate) fn write(
     let default = escape(config);
     let _ = writeln!(
         out,
-        "  <ProfileAction buildConfiguration=\"{launch_config}\" shouldUseLaunchSchemeArgsEnv=\"YES\"></ProfileAction>\n  <AnalyzeAction buildConfiguration=\"{default}\"></AnalyzeAction>\n  <ArchiveAction buildConfiguration=\"Release\" revealArchiveInOrganizer=\"YES\"></ArchiveAction>\n</Scheme>"
+        "  <ProfileAction buildConfiguration=\"{launch_config}\" shouldUseLaunchSchemeArgsEnv=\"YES\">\n{runnable}  </ProfileAction>\n  <AnalyzeAction buildConfiguration=\"{default}\"></AnalyzeAction>\n  <ArchiveAction buildConfiguration=\"Release\" revealArchiveInOrganizer=\"YES\"></ArchiveAction>\n</Scheme>"
     );
     let name = text(&target.name);
     write_file(

@@ -45,6 +45,12 @@ pub fn generate(
     host: &dyn Host,
     bin: &Path,
 ) -> Result<(), GenError> {
+    for (dir, _) in model.dirs() {
+        validate_link_phase_mode(model.definition(dir, b"CMAKE_XCODE_LINK_BUILD_PHASE_MODE"))?;
+    }
+    for (_, target) in model.targets() {
+        validate_link_phase_mode(target.props.get(b"XCODE_LINK_BUILD_PHASE_MODE"))?;
+    }
     let utilities = utility_targets(GeneratorKind::Xcode, model, host);
     let projects = project_roots(GeneratorKind::Xcode, model);
     for root in &projects {
@@ -67,6 +73,17 @@ pub fn generate(
             &result.metadata,
             &project::cmake(result, model),
         )?;
+    }
+    Ok(())
+}
+
+fn validate_link_phase_mode(mode: Option<&rcmake_base::BString>) -> Result<(), GenError> {
+    if let Some(mode) = mode
+        && !matches!(mode.as_slice(), b"NONE" | b"BUILT_ONLY" | b"KNOWN_LOCATION")
+    {
+        return Err(GenError::Invalid(
+            format!("Invalid value for XCODE_LINK_BUILD_PHASE_MODE: {mode}").into(),
+        ));
     }
     Ok(())
 }

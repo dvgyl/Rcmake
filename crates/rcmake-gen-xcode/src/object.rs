@@ -47,8 +47,10 @@ pub(crate) struct Reference {
 #[derive(Clone, Debug)]
 pub(crate) enum Value {
     Text(String),
+    QuotedText(String),
     Ref(Reference),
     List(Vec<Value>),
+    ListRow(Vec<String>),
     Dict(Attrs),
 }
 

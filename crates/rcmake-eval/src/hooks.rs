@@ -6,8 +6,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use rcmake_base::BString;
-use rcmake_diag::{Effect, Frame, FrameKind, MessageKind, PolicyStatus};
+use rcmake_diag::{Backtrace, Effect, Frame, FrameKind, MessageKind, PolicyStatus};
 use rcmake_host::{Stream, WriteMode};
+use rcmake_model::DirId;
 use rcmake_syntax::{ArgKind, Argument, CommandInvocation};
 
 use crate::Interp;
@@ -108,7 +109,7 @@ pub(crate) struct DeferredCall {
 
 /// Append `s` to `out` as a JSON string (JsonCpp escapes: no raw control or non-ASCII
 /// bytes).
-fn json_string(out: &mut Vec<u8>, s: &[u8]) {
+pub(crate) fn json_string(out: &mut Vec<u8>, s: &[u8]) {
     out.push(b'"');
     for ch in String::from_utf8_lossy(s).chars() {
         match ch {
@@ -366,10 +367,13 @@ impl Interp {
     }
 
     fn write_trace_line(&self, line: &[u8]) {
-        let Some(trace) = &self.trace else { return };
         let mut bytes = line.to_vec();
         bytes.push(b'\n');
-        match &trace.redirect {
+        match self
+            .trace
+            .as_ref()
+            .and_then(|trace| trace.redirect.as_ref())
+        {
             Some(path) => {
                 let _ = self.config.host.write(path, &bytes, WriteMode::Append);
             }
@@ -380,12 +384,17 @@ impl Interp {
     /// `cmMakefile::PrintCommandTrace` for `cmd` in `file`. `missing` adds one frame
     /// for end commands, which are not on the call stack (`CommandMissingFromStack`).
     pub(crate) fn trace_command(&mut self, cmd: &CommandInvocation, file: &[u8], missing: bool) {
-        let Some(trace) = &self.trace else { return };
+        let local = self.trace_stack.last().copied();
+        if self.trace.is_none() && local.is_none() {
+            return;
+        }
+        let default = TraceConfig::default();
+        let trace = self.trace.as_ref().unwrap_or(&default);
         if !trace.sources.is_empty() && !trace.sources.iter().any(|s| trace_source_matches(file, s))
         {
             return;
         }
-        let (format, expand) = (trace.format, trace.expand);
+        let (format, expand) = (trace.format, trace.expand || local == Some(true));
         let mut args: Vec<BString> = Vec::with_capacity(cmd.args.len());
         for arg in &cmd.args {
             if expand && arg.kind != ArgKind::Bracket {
@@ -472,6 +481,7 @@ impl Interp {
     /// active.
     pub(crate) fn queue_deferred(
         &mut self,
+        dir: DirId,
         id: BString,
         command: &[u8],
         args: &[Argument],
@@ -481,7 +491,7 @@ impl Interp {
             .bt
             .top()
             .map_or_else(|| Arc::from(&b""[..]), |f| Arc::clone(&f.file));
-        let Some(queue) = self.dir_frame_mut().defer.as_mut() else {
+        let Some(queue) = self.deferred_queue_mut(dir) else {
             return false;
         };
         let args = args
@@ -501,8 +511,8 @@ impl Interp {
     }
 
     /// `cmMakefile::DeferCancelCall`.
-    pub(crate) fn cancel_deferred(&mut self, id: &[u8]) -> bool {
-        let Some(queue) = self.dir_frame_mut().defer.as_mut() else {
+    pub(crate) fn cancel_deferred(&mut self, dir: DirId, id: &[u8]) -> bool {
+        let Some(queue) = self.deferred_queue_mut(dir) else {
             return false;
         };
         for call in queue.iter_mut().filter(|c| c.id.as_slice() == id) {
@@ -512,8 +522,8 @@ impl Interp {
     }
 
     /// `cmMakefile::DeferGetCallIds`.
-    pub(crate) fn deferred_ids(&self) -> Option<Vec<BString>> {
-        self.dir_frame().defer.as_ref().map(|queue| {
+    pub(crate) fn deferred_ids(&self, dir: DirId) -> Option<Vec<BString>> {
+        self.deferred_queue(dir).map(|queue| {
             queue
                 .iter()
                 .filter(|c| !c.id.is_empty())
@@ -524,8 +534,8 @@ impl Interp {
 
     /// `cmMakefile::DeferGetCall`: `[command, args...]`, or an empty list for an unknown
     /// identifier. `None` when no deferred-call queue is active.
-    pub(crate) fn deferred_call(&self, id: &[u8]) -> Option<Vec<BString>> {
-        let queue = self.dir_frame().defer.as_ref()?;
+    pub(crate) fn deferred_call(&self, dir: DirId, id: &[u8]) -> Option<Vec<BString>> {
+        let queue = self.deferred_queue(dir)?;
         let Some(call) = queue
             .iter()
             .find(|c| !id.is_empty() && c.id.as_slice() == id)
@@ -537,18 +547,40 @@ impl Interp {
         Some(out)
     }
 
+    fn deferred_queue(&self, dir: DirId) -> Option<&[DeferredCall]> {
+        std::iter::once(&self.root_frame)
+            .chain(&self.dir_stack)
+            .find(|frame| frame.id == dir)?
+            .defer
+            .as_deref()
+    }
+
+    fn deferred_queue_mut(&mut self, dir: DirId) -> Option<&mut Vec<DeferredCall>> {
+        std::iter::once(&mut self.root_frame)
+            .chain(&mut self.dir_stack)
+            .find(|frame| frame.id == dir)?
+            .defer
+            .as_mut()
+    }
+
+    pub(crate) fn trace_enabled(&self) -> bool {
+        self.trace.is_some() || !self.trace_stack.is_empty()
+    }
+
     /// Run the queued deferred calls at the end of the directory listfile `dir_file`
     /// (`RunListFile`). A deferred call can queue more calls.
     pub(crate) fn run_deferred(&mut self, dir_file: &[u8]) {
         let saved_bt = self.bt.clone();
-        self.bt = self.bt.push(Frame {
+        self.bt = Backtrace::default().push(Frame {
             file: Arc::from(dir_file),
             line: 0,
             name: None,
             kind: FrameKind::Deferred,
         });
+        self.running_deferred = true;
+        self.push_snapshot();
         let mut i = 0;
-        while !self.fatal && self.exit_override.is_none() {
+        while !self.fatal && self.exit_override.is_none() && !self.over_budget() {
             let Some(call) = self
                 .dir_frame_mut()
                 .defer
@@ -565,6 +597,8 @@ impl Interp {
             let code = Code::new(Arc::from(vec![call.cmd.clone()]), Arc::clone(&call.file));
             self.exec_deferred(&code, id);
         }
+        self.pop_snapshot(!self.fatal);
+        self.running_deferred = false;
         self.bt = saved_bt;
     }
 }

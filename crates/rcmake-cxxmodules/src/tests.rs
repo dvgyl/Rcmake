@@ -221,3 +221,52 @@ fn cycles_and_duplicate_providers_are_errors() -> Result<(), ModulesError> {
     );
     Ok(())
 }
+
+#[test]
+fn bmi_install_script_contains_only_public_modules_of_the_target() -> Result<(), ModulesError> {
+    let tdi = tdi::read_tdi(
+        br#"{
+          "module-dir": "/build/modules",
+          "cxx-modules": {
+            "public.o": {"visibility": "PUBLIC"},
+            "private.o": {"visibility": "PRIVATE"}
+          },
+          "bmi-installation": {
+            "destination": "lib/bmi",
+            "script-location": "/build/install-bmi.cmake",
+            "permissions": "OWNER_READ GROUP_READ",
+            "message-level": "MESSAGE_LAZY"
+          }
+        }"#,
+    )?;
+    let ddis = [("public.o", "Public"), ("private.o", "Private")]
+    .into_iter()
+    .map(|(object, module)| {
+        p1689::parse_ddi(
+            format!(
+                r#"{{"version":1,"rules":[{{"primary-output":"{object}","provides":[{{"logical-name":"{module}"}}]}}]}}"#
+            )
+            .as_bytes(),
+            b"unit.ddi",
+        )
+    })
+    .collect::<Result<Vec<_>, _>>()?;
+    let forwarded = read_modules_json(
+        br#"{"modules":{"External":{"bmi":"/other/External.pcm","is-private":false}}}"#,
+    )?;
+    let output = collate(&CollationInput {
+        tdi,
+        ddis,
+        forwarded: vec![forwarded],
+        modmap_format: Some(ModmapFormat::Clang),
+        ..CollationInput::default()
+    })?;
+    let actual = output
+        .modmaps
+        .iter()
+        .find(|(path, _)| path == b"/build/install-bmi.cmake")
+        .map(|(_, script)| script.as_slice());
+    let expected = b"file(INSTALL DESTINATION \"${CMAKE_INSTALL_PREFIX}/lib/bmi\" TYPE FILE MESSAGE_LAZY PERMISSIONS OWNER_READ GROUP_READ FILES \"/build/modules/Public.pcm\")\n";
+    assert_eq!(actual, Some(expected.as_slice()));
+    Ok(())
+}

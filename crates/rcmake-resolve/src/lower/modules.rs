@@ -1,17 +1,33 @@
 //! Lower C++ named module scans and collation.
 
-use indexmap::IndexSet;
+use indexmap::{IndexMap, IndexSet};
 use rcmake_base::{BString, path_lex::Lexical};
 use rcmake_cxxmodules::{
     BmiInstallInfo, ModmapFormat, ModuleSourceInfo, ScannedSourceInfo, TargetDependInfo,
 };
-use rcmake_model::{DirId, ProjectModel, Target};
+use rcmake_model::{DirId, GeneratorKind, ProjectModel, Target};
 
 use super::compile::compile_arguments;
 use super::launcher;
 use super::shell::{command, join_words, quote, rule_invocations};
 use super::{definition, expand_rule};
-use crate::{BuildStep, CompileUnit, ResolveError, ResolvedTarget};
+use crate::{BuildStep, CompileUnit, ResolveError, ResolvedTarget, ScanResponse};
+
+/// Return the generated BMI install script path for a target and configuration.
+#[must_use]
+pub fn bmi_script_path(build_dir: &[u8], tdi: &[u8], config: &[u8], multi_config: bool) -> BString {
+    let mut dir = Lexical::new(tdi).parent();
+    if multi_config {
+        dir = Lexical::new(dir).parent();
+    }
+    let dir = Lexical::new(build_dir).append(dir);
+    let config = if config.is_empty() {
+        b"noconfig"
+    } else {
+        config
+    };
+    Lexical::new(&dir).append(&[b"install-cxx-module-bmi-", config, b".cmake"].concat())
+}
 
 pub(super) fn modmap_path(object: &[u8]) -> BString {
     [object, b".modmap"].concat().into()
@@ -89,6 +105,16 @@ pub(super) fn lower_modules_with_standard(
     };
     let template = compiler(b"SCANDEP_SOURCE");
     let module_map_format = module_map_format(model, target)?;
+    let destination = |value: &BString| -> Result<BString, ResolveError> {
+        let ctx = rcmake_genex::EvalContext {
+            config: resolved.config.clone(),
+            head: Some(crate::usage::handle(resolved.id)),
+            ..rcmake_genex::EvalContext::default()
+        };
+        let mut usage = crate::usage::UsageResolver::new(model);
+        let ast = rcmake_genex::parse(value)?;
+        Ok(rcmake_genex::evaluate(&ast, &ctx, &mut usage.host(dir))?.0)
+    };
     let mut info = TargetDependInfo {
         compiler_id: compiler(b"COMPILER_ID"),
         compiler_frontend_variant: compiler(b"COMPILER_FRONTEND_VARIANT"),
@@ -102,16 +128,30 @@ pub(super) fn lower_modules_with_standard(
         dir_top_src: root.source_dir.clone(),
         linked_target_dirs: module_info.linked_target_dirs.clone(),
         forward_modules_from_target_dirs: module_info.forward_from.clone(),
-        bmi_installation: module_info.bmi_install.as_ref().map(|rule| BmiInstallInfo {
-            destination: rule.destination.clone(),
-            component: rule.component.clone(),
-            permissions: join_words(rule.permissions.iter().cloned()),
-            optional: rule.optional,
-            exclude_from_all: rule.exclude_from_all,
-            ..BmiInstallInfo::default()
-        }),
         ..TargetDependInfo::default()
     };
+    if let Some(rule) = &module_info.bmi_install {
+        let destination = destination(&rule.destination)?;
+        info.bmi_installation = (!destination.is_empty()).then(|| BmiInstallInfo {
+            destination,
+            message_level: match rule.message.as_slice() {
+                b"ALWAYS" => "MESSAGE_ALWAYS",
+                b"LAZY" => "MESSAGE_LAZY",
+                b"NEVER" => "MESSAGE_NEVER",
+                _ => "",
+            }
+            .into(),
+            permissions: join_words(rule.permissions.iter().cloned()),
+            optional: rule.optional,
+            script_location: bmi_script_path(
+                &root.binary_dir,
+                &module_info.tdi,
+                &resolved.config.0,
+                model.generator == Some(GeneratorKind::NinjaMultiConfig),
+            ),
+            ..BmiInstallInfo::default()
+        });
+    }
     let mut steps = Vec::new();
     let mut ddis = Vec::new();
     let mut modmaps = Vec::new();
@@ -145,7 +185,7 @@ pub(super) fn lower_modules_with_standard(
                     visibility: member.visibility,
                     bmi_only: member.bmi_only,
                     relative_directory: member.relative_directory.clone(),
-                    destination: member.destination.clone(),
+                    destination: member.destination.as_ref().map(destination).transpose()?,
                     compile_features: standard
                         .map(|version| [b"cxx_std_".as_slice(), version].concat().into())
                         .into_iter()
@@ -221,6 +261,68 @@ pub(super) fn lower_modules_with_standard(
         implicit_inputs,
     });
     Ok(steps)
+}
+
+pub(crate) fn scan_responses(
+    model: &ProjectModel,
+    target: &Target,
+    resolved: &ResolvedTarget,
+    standard: Option<&[u8]>,
+) -> Result<IndexMap<BString, ScanResponse>, ResolveError> {
+    let mut responses = IndexMap::new();
+    if !matches!(
+        model.generator,
+        Some(GeneratorKind::Ninja | GeneratorKind::NinjaMultiConfig)
+    ) || definition(model, target.dir, b"CMAKE_NINJA_FORCE_RESPONSE_FILE").is_none()
+    {
+        return Ok(responses);
+    }
+    let Some(template) = definition(model, target.dir, b"CMAKE_CXX_SCANDEP_SOURCE") else {
+        return Ok(responses);
+    };
+    let prefix = definition(model, target.dir, b"CMAKE_CXX_RESPONSE_FILE_FLAG")
+        .map_or(b"@".as_slice(), |value| value.as_slice());
+    for unit in resolved.compile_units.iter().filter(|unit| unit.scan) {
+        let Some(group) = resolved.compile_groups.get(unit.group) else {
+            continue;
+        };
+        let (flags, defines, includes) = compile_arguments(
+            model,
+            target,
+            &resolved.config,
+            group,
+            standard,
+            &unit.source.value,
+        );
+        let arguments = [defines, includes, join_words(flags)]
+            .iter()
+            .filter(|part| !part.is_empty())
+            .map(|value| value.as_slice())
+            .collect::<Vec<_>>()
+            .join(b" ".as_slice())
+            .into();
+        let rsp = quote(&[unit.object.as_slice(), b".ddi.rsp"].concat());
+        let flag = [prefix, &rsp].concat().into();
+        if let BuildStep::Scan {
+            ddi, invocation, ..
+        } = scan(
+            model,
+            target,
+            &resolved.config,
+            unit,
+            template,
+            (flag, BString::default(), BString::default()),
+        )? {
+            responses.insert(
+                ddi,
+                ScanResponse {
+                    invocation,
+                    arguments,
+                },
+            );
+        }
+    }
+    Ok(responses)
 }
 
 fn scan(

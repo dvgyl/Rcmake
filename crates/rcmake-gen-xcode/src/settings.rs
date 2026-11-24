@@ -1,9 +1,8 @@
 //! Project and target build settings for each configuration.
 
-use std::{
-    collections::BTreeMap,
-    path::{Path, PathBuf},
-};
+use std::path::{Path, PathBuf};
+
+use rcmake_gen_common::GenError;
 
 use rcmake_base::{list as cmake_list, truth};
 use rcmake_model::{DirId, ParsedToolset, ProjectModel, Target, TargetKind};
@@ -13,7 +12,7 @@ use rcmake_resolve::{
 };
 
 use crate::{
-    object::{Attrs, attrs, list},
+    object::{Attrs, Value, attrs, list},
     text,
 };
 
@@ -101,7 +100,7 @@ impl Product {
             dir = dir.join(text(value));
         }
         if kind == TargetKind::ObjectLibrary {
-            dir = target_temp_dir(bin, &model.dir(raw.dir).binary_dir, &raw.name);
+            dir = target_temp_dir(bin, &raw.name);
         } else if let Some(resolved_dir) = target
             .and_then(|target| target.artifacts.file.as_ref())
             .filter(|path| !path.windows(2).any(|pair| pair == b"$<"))
@@ -218,12 +217,29 @@ pub(crate) fn on(target: &Target, key: &[u8]) -> bool {
     target.props.get(key).is_some_and(|v| truth::is_on(v))
 }
 
-fn target_temp_dir(bin: &Path, binary_dir: &[u8], name: &[u8]) -> PathBuf {
-    bin.join(text(binary_dir))
-        .join(format!("build/{}.build/{CONFIG_DIR}", text(name)))
+fn target_temp_dir(bin: &Path, name: &[u8]) -> PathBuf {
+    bin.join(format!("build/{}.build/{CONFIG_DIR}", text(name)))
 }
 
 pub(crate) fn project(
+    model: &ProjectModel,
+    root: DirId,
+    bin: &Path,
+    arch: &str,
+    config: &str,
+) -> Result<Attrs, GenError> {
+    let mut settings = project_defaults(model, root, bin, arch, config);
+    let attributes = rcmake_resolve::ide::xcode_project_attributes(model, root, config.as_bytes())
+        .map_err(|error| GenError::Invalid(error.to_string().into()))?;
+    settings.extend(
+        attributes
+            .into_iter()
+            .map(|(key, value)| (text(&key), attribute_value(&value))),
+    );
+    Ok(settings)
+}
+
+fn project_defaults(
     model: &ProjectModel,
     root: DirId,
     bin: &Path,
@@ -266,17 +282,6 @@ pub(crate) fn project(
     {
         settings.insert("GCC_VERSION".into(), text(toolset).into());
     }
-    let mut attributes = BTreeMap::new();
-    attributes.extend(model.cache.iter().map(|(key, entry)| (key, &entry.value)));
-    attributes.extend(&model.dir(root).vars);
-    for (key, value) in attributes {
-        if !matches!(
-            key.as_slice(),
-            b"CMAKE_XCODE_ATTRIBUTE_knownRegions" | b"CMAKE_XCODE_ATTRIBUTE_developmentRegion"
-        ) {
-            attribute(&mut settings, key, value, "CMAKE_XCODE_ATTRIBUTE_", config);
-        }
-    }
     settings
 }
 
@@ -298,7 +303,15 @@ fn attribute(out: &mut Attrs, key: &[u8], value: &[u8], prefix: &str, config: &s
     } else {
         key.into()
     };
-    out.insert(name, text(value).into());
+    out.insert(name, attribute_value(value));
+}
+
+fn attribute_value(value: &[u8]) -> Value {
+    if value.starts_with(b"/") {
+        Value::QuotedText(text(value))
+    } else {
+        text(value).into()
+    }
 }
 
 pub(crate) struct TargetSettings<'a> {
@@ -322,7 +335,7 @@ impl TargetSettings<'_> {
             raw,
             target,
         } = *self;
-        let mut settings = project(model, raw.dir, bin, arch, config);
+        let mut settings = project_defaults(model, raw.dir, bin, arch, config);
         settings.extend(attrs([
             ("ALWAYS_SEARCH_USER_PATHS", "NO".into()),
             ("COMBINE_HIDPI_IMAGES", "YES".into()),
@@ -358,7 +371,7 @@ impl TargetSettings<'_> {
             ),
             (
                 "TARGET_TEMP_DIR",
-                target_temp_dir(bin, &model.dir(raw.dir).binary_dir, &raw.name)
+                target_temp_dir(bin, &raw.name)
                     .to_string_lossy()
                     .into_owned()
                     .into(),
@@ -673,7 +686,7 @@ impl TargetSettings<'_> {
                     .to_str()?
                     .to_owned();
                 let name = text(&dep.metadata.name);
-                let path = target_temp_dir(self.bin, &dep.metadata.binary_dir, &dep.metadata.name)
+                let path = target_temp_dir(self.bin, &dep.metadata.name)
                     .join(format!("Objects-normal/$(CURRENT_ARCH)/{stem}.o"));
                 return Some((
                     format!("{name}/{stem}"),

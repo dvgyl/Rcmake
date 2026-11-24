@@ -1,4 +1,4 @@
-use rcmake_base::{BString, list};
+use rcmake_base::{BString, list, truth};
 use rcmake_eval::{CmdError, CmdResult, Cx, Flow, LogLevel, RunMode};
 use rcmake_expr::ExpandedArg;
 use rcmake_host::path;
@@ -62,6 +62,7 @@ fn language_operation(cx: &mut Cx<'_>, args: &mut LanguageArgs<'_>) -> CmdResult
             cx.call_command(&command, expanded)
         }
         b"DEFER" => defer(cx, args),
+        b"TRACE" => trace(cx, args),
         b"PRINT_TARGETS" | b"PRINT_VARIABLES" | b"PRINT_PROPERTIES" => {
             let args = args.finish(cx)?;
             let args = super::values(&args);
@@ -93,6 +94,36 @@ fn language_operation(cx: &mut Cx<'_>, args: &mut LanguageArgs<'_>) -> CmdResult
         }
         _ => Err(status("called with unknown meta-operation")),
     }
+}
+
+fn trace(cx: &mut Cx<'_>, args: &mut LanguageArgs<'_>) -> CmdResult {
+    let mode = args.required(cx, "TRACE missing a boolean value")?;
+    if truth::is_on(&mode) {
+        let expand = if let Some(arg) = args.next(cx)? {
+            if arg != b"EXPAND" {
+                return Err(status(quoted(
+                    "TRACE ON given an invalid argument ",
+                    &arg,
+                    "",
+                )));
+            }
+            if args.next(cx)?.is_some() {
+                return Err(status("TRACE ON given too many arguments"));
+            }
+            true
+        } else {
+            false
+        };
+        cx.push_trace(expand);
+    } else {
+        if args.next(cx)?.is_some() {
+            return Err(status("TRACE OFF given too many arguments"));
+        }
+        if !cx.pop_trace() {
+            return Err(status("TRACE OFF request without a corresponding TRACE ON"));
+        }
+    }
+    Ok(Flow::Normal)
 }
 
 fn call_name(
@@ -347,7 +378,12 @@ fn defer_call(
     if let Some(var) = id_var {
         cx.set_var(&var, id.clone());
     }
-    if other_directory(cx, directory) || !cx.defer_call(id, &command, args.raw) {
+    if !cx.defer_call(
+        directory.unwrap_or_else(|| cx.current_dir_id()),
+        id,
+        &command,
+        args.raw,
+    ) {
         return Err(defer_directory_error(
             cx,
             directory,
@@ -365,7 +401,7 @@ fn defer_queue_operation(
 ) -> CmdResult {
     let args = args.finish(cx)?;
     let values: Vec<_> = args.iter().map(|arg| arg.value.as_slice()).collect();
-    let other = other_directory(cx, directory);
+    let dir = directory.unwrap_or_else(|| cx.current_dir_id());
     if op == b"CANCEL_CALL" {
         for id in values {
             if starts_uppercase(id) {
@@ -375,7 +411,7 @@ fn defer_queue_operation(
                     "",
                 )));
             }
-            if other || !cx.defer_cancel_call(id) {
+            if !cx.defer_cancel_call(dir, id) {
                 return Err(defer_directory_error(
                     cx,
                     directory,
@@ -396,7 +432,7 @@ fn defer_queue_operation(
         };
         (
             *var,
-            cx.defer_get_call_ids(),
+            cx.defer_get_call_ids(dir),
             "DEFER GET_CALL_IDS may not access directory:\n  ",
         )
     } else {
@@ -418,19 +454,15 @@ fn defer_queue_operation(
         }
         (
             var,
-            cx.defer_get_call(id),
+            cx.defer_get_call(dir, id),
             "DEFER GET_CALL may not access directory:\n  ",
         )
     };
-    let Some(result) = result.filter(|_| !other) else {
+    let Some(result) = result else {
         return Err(defer_directory_error(cx, directory, message));
     };
     cx.set_var(var, list::join(result.iter()));
     Ok(Flow::Normal)
-}
-
-fn other_directory(cx: &Cx<'_>, directory: Option<DirId>) -> bool {
-    directory.is_some_and(|id| id != cx.current_dir_id())
 }
 
 fn defer_directory_error(cx: &mut Cx<'_>, directory: Option<DirId>, message: &str) -> CmdError {
