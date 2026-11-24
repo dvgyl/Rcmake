@@ -175,8 +175,16 @@ pub(crate) fn instrument_lifecycle(
         return 1;
     }
     let step = InstrumentationStep::start(host, sample_instrumentation(&queries));
-    let exit = run();
-    let code = exit.code();
+    let injected = rcmake_instrument::injected_interrupt(host);
+    let (exit, code) = match (injected, role) {
+        (Some(signal), SnippetRole::CMakeInstall) => (CommandExit::Signal(signal), 1),
+        (Some(signal), SnippetRole::CMakeBuild) => (CommandExit::Signal(signal), run().code()),
+        _ => {
+            let exit = run();
+            let code = exit.code();
+            (exit, code)
+        }
+    };
     if let Err(err) = step
         .record(host, build_dir, argv, role, &exit)
         .and_then(|()| {

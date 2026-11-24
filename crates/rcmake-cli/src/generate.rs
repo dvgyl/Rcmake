@@ -20,6 +20,7 @@ use rcmake_resolve::ide::IdeFlavor;
 use rcmake_resolve::{GenerationResult, InstallActionKind, InstallManifest, ResolveOptions};
 
 mod file_generate;
+mod install_index;
 mod instrument;
 
 pub(crate) fn run(
@@ -245,20 +246,26 @@ fn write_common(
             host.write_out(Stream::Stderr, &render(&warning, &RenderOptions::default()));
         }
     } else {
+        let options = common::install_script::InstallScriptOptions {
+            prefix,
+            configuration,
+            export_files: &export_files,
+            ..Default::default()
+        };
         write(
             host,
             &bin.join("cmake_install.cmake"),
-            common::install_script::render_with_options(
-                &manifest,
-                &binary_dir,
-                &common::install_script::InstallScriptOptions {
-                    prefix,
-                    configuration,
-                    export_files: &export_files,
-                    ..Default::default()
-                },
-            ),
+            common::install_script::render_with_options(&manifest, &binary_dir, &options),
         )?;
+        let mut cx = interp.cx();
+        let model = cx.project();
+        let parallel = model.dirs().count() == 1
+            && model
+                .global
+                .props
+                .get(b"INSTALL_PARALLEL")
+                .is_some_and(|value| rcmake_base::truth::is_on(value));
+        install_index::write(host, bin, &manifest, options, parallel)?;
     }
     let cmake_files = bin.join("CMakeFiles");
     let log_path = cmake_files.join("CMakeConfigureLog.yaml");

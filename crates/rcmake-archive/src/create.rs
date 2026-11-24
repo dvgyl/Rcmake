@@ -11,7 +11,7 @@ use crate::{
     ArchiveError, ArchiveFormat, CreateOptions, MAX_ENTRIES, absolute, archive_error, archive_name,
     checked_name, emit_names, read_bytes, relative_path, size_limit,
 };
-use crate::{TarCompression, codec::Encoder, timestamp};
+use crate::{TarCompression, ZipCompression, codec::Encoder, timestamp, zip_codec};
 
 pub(super) fn run(
     host: &dyn Host,
@@ -179,6 +179,8 @@ enum Writer {
         writer: Box<ZipWriter<Cursor<Vec<u8>>>>,
         method: CompressionMethod,
         level: Option<i64>,
+        codec: Option<(ZipCompression, Option<u32>)>,
+        compressed: HashMap<String, zip_codec::Entry>,
     },
 }
 
@@ -197,7 +199,7 @@ impl Writer {
             GnuTar => (true, None),
             GnuTarGz => (true, Some(TarCompression::Gzip)),
             GnuTarCompressed(filter) => (true, Some(filter)),
-            Zip | ZipStored => (false, None),
+            Zip | ZipStored | ZipCompressed(_) => (false, None),
         };
         let max_level = if filter == Some(TarCompression::Zstd) {
             19
@@ -209,7 +211,7 @@ impl Writer {
                 "The compression level must be between 0 and {max_level}"
             )));
         }
-        if matches!(options.format, Zip | ZipStored) {
+        if matches!(options.format, Zip | ZipStored | ZipCompressed(_)) {
             let deflate = options.format == Zip;
             return Ok(Self::Zip {
                 writer: Box::new(ZipWriter::new(Cursor::new(Vec::new()))),
@@ -219,6 +221,11 @@ impl Writer {
                     CompressionMethod::Stored
                 },
                 level: deflate.then(|| i64::from(level.unwrap_or(6).clamp(0, 9))),
+                codec: match options.format {
+                    ZipCompressed(codec) => Some((codec, level)),
+                    _ => None,
+                },
+                compressed: HashMap::new(),
             });
         }
         let encoder = Encoder::new(filter, level)?;
@@ -255,6 +262,8 @@ impl Writer {
                 writer,
                 method,
                 level,
+                codec,
+                compressed,
             } => {
                 if name.contains(&b'\\') {
                     return Err(ArchiveError::new(
@@ -277,8 +286,16 @@ impl Writer {
                             .map_err(archive_error)
                     }
                     _ => {
-                        writer.start_file(name, options).map_err(archive_error)?;
-                        writer.write_all(contents).map_err(archive_error)
+                        if let Some((method, level)) = *codec {
+                            let (entry, payload) = zip_codec::encode(method, level, contents)?;
+                            writer.start_file(name, options).map_err(archive_error)?;
+                            writer.write_all(&payload).map_err(archive_error)?;
+                            compressed.insert(name.to_owned(), entry);
+                            Ok(())
+                        } else {
+                            writer.start_file(name, options).map_err(archive_error)?;
+                            writer.write_all(contents).map_err(archive_error)
+                        }
                     }
                 }
             }
@@ -291,10 +308,16 @@ impl Writer {
                 .into_inner()
                 .and_then(Encoder::finish)
                 .map_err(archive_error),
-            Self::Zip { writer, .. } => writer
-                .finish()
-                .map(Cursor::into_inner)
-                .map_err(archive_error),
+            Self::Zip {
+                writer, compressed, ..
+            } => {
+                let mut bytes = writer
+                    .finish()
+                    .map(Cursor::into_inner)
+                    .map_err(archive_error)?;
+                zip_codec::update_headers(&mut bytes, &compressed)?;
+                Ok(bytes)
+            }
         }
     }
 }

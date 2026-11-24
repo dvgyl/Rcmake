@@ -40,18 +40,29 @@ pub(super) fn parse<'a>(
         }
         b"--debug-find-pkg" | b"--debug-find-var" => {
             let list = arg.required("No names specified for debug find")?;
-            let category = if arg.flag == b"--debug-find-pkg" {
-                "package(s)"
+            let (target, category) = if arg.flag == b"--debug-find-pkg" {
+                (
+                    &mut opts.debug_find_packages,
+                    "the 'find' commands for package(s)",
+                )
             } else {
-                "variable(s)"
+                (&mut opts.debug_find_variables, "the variable(s)")
             };
-            let names = String::from_utf8_lossy(list).replace(',', " ");
+            let names: Vec<rcmake_base::BString> = list
+                .split(|&byte| byte == b',')
+                .filter(|name| !name.is_empty())
+                .map(rcmake_base::BString::from)
+                .collect();
+            let body = names
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(" ");
             out(
                 host,
-                &format!(
-                    "Running with debug output on for the 'find' commands for {category} {names}.\n"
-                ),
+                &format!("Running with debug output on for {category} {body}.\n"),
             );
+            target.extend(names);
         }
         b"--profiling-format" => {
             let format = profile_value(arg, "No format specified for --profiling-format")?;

@@ -57,12 +57,13 @@ impl<'a> Recorder<'a> {
         elapsed: Duration,
         code: i32,
         show_only: bool,
+        interrupt_signal: Option<i32>,
     ) {
         let snippet = Snippet {
             role: SnippetRole::CTest,
             command: command_line(command),
             working_dir: path::from_native(&self.build),
-            result: Some(i64::from(code)),
+            result: interrupt_signal.is_none().then_some(i64::from(code)),
             time_start: millis(sample.time),
             duration: elapsed.as_millis().try_into().unwrap_or(u64::MAX),
             target: None,
@@ -83,6 +84,7 @@ impl<'a> Recorder<'a> {
                     .system
                     .map(|before| (before, SystemSample::collect(self.host))),
                 show_only,
+                interrupt_signal,
                 ..SnippetDetails::default()
             },
         ) {
@@ -149,6 +151,7 @@ impl<'a> Recorder<'a> {
             stderr: self.capture.then(|| run.stderr.clone().into()),
         };
         let details = SnippetDetails {
+            test_index: Some(test.number),
             interrupt_signal,
             dynamic: sample
                 .system

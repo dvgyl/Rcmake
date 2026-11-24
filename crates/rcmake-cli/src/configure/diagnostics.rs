@@ -15,6 +15,9 @@ pub(crate) fn initialize_diagnostics(
     configure: bool,
 ) -> DiagState {
     let mut state = DiagState::default();
+    if configure {
+        state.set(DiagCategory::UnusedCli, DiagAction::Warn, false);
+    }
     if let Some(entry) = cache.get(DIAG_INIT) {
         for part in rcmake_base::list::split(&entry.value, rcmake_base::list::Empty::Drop) {
             let Some(eq) = part.iter().position(|b| *b == b'=') else {

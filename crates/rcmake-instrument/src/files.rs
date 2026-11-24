@@ -73,10 +73,14 @@ pub(crate) fn epoch_millis(host: &dyn Host) -> u64 {
         .saturating_add(u64::from(time.nanos / 1_000_000))
 }
 
-pub(crate) fn command_hash(host: &dyn Host, command: &[u8]) -> String {
+pub(crate) fn command_hash(host: &dyn Host, command: &[u8], test_index: Option<usize>) -> String {
     let mut hasher = HashAlgo::Sha3_256.hasher();
     hasher.update(command);
     hasher.update(host.system().pid.to_string().as_bytes());
+    if let Some(index) = test_index {
+        hasher.update(b"\0");
+        hasher.update(index.to_string().as_bytes());
+    }
     let mut digest = hasher.finish_hex();
     digest.truncate(20);
     digest

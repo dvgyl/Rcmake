@@ -219,7 +219,10 @@ pub(crate) fn execute(
     }
     let sample = instrument.map(crate::instrumentation::Recorder::start_test);
     let started = host.monotonic();
-    let run = if let Some(instrument) = instrument {
+    let run = if let Some(timeout) = test.timeout.graceful() {
+        host.run_with_timeout_signal(request, timeout, &mut |_, _| {})
+            .map(|output| (output, None))
+    } else if let Some(instrument) = instrument {
         instrument.run_test(request)
     } else {
         host.run(request, &mut |_, _| {})

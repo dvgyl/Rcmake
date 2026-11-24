@@ -145,6 +145,30 @@ pub enum Input {
     Bytes(Vec<u8>),
 }
 
+/// Signals that a test can receive when it reaches its time limit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TimeoutSignal {
+    /// SIGINT.
+    Interrupt,
+    /// SIGQUIT.
+    Quit,
+    /// SIGTERM.
+    Terminate,
+    /// SIGUSR1.
+    User1,
+    /// SIGUSR2.
+    User2,
+}
+
+/// A signal to send before forcibly terminating a timed-out process.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GracefulTimeout {
+    /// Signal to send when the time limit expires.
+    pub signal: TimeoutSignal,
+    /// Additional time before forceful termination.
+    pub grace: Duration,
+}
+
 /// Standard output/error configuration for a child process or pipeline.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Output {
@@ -380,6 +404,28 @@ pub trait Host: Send + Sync {
         req: &RunRequest,
         on_output: &mut dyn FnMut(Stream, &[u8]),
     ) -> HostResult<RunOutput>;
+
+    /// Run a process and allow it time to handle its timeout signal.
+    fn run_with_timeout_signal(
+        &self,
+        req: &RunRequest,
+        timeout: GracefulTimeout,
+        on_output: &mut dyn FnMut(Stream, &[u8]),
+    ) -> HostResult<RunOutput> {
+        let _ = timeout;
+        self.run(req, on_output)
+    }
+
+    /// Run a process with a byte limit for all captured output.
+    fn run_bounded(&self, req: &RunRequest, limit: usize) -> HostResult<RunOutput> {
+        let output = self.run(req, &mut |_, _| {})?;
+        if output.stdout.len().saturating_add(output.stderr.len()) > limit {
+            return Err(HostError::unsupported(
+                "Process output exceeds the size limit",
+            ));
+        }
+        Ok(output)
+    }
 
     /// Write bytes directly to stdout or stderr.
     fn write_out(&self, stream: Stream, bytes: &[u8]);

@@ -14,7 +14,7 @@ use crate::{
     ArchiveError, ExtractOptions, MAX_ENTRIES, absolute, archive_error, checked_name, emit_names,
     read_bounded, read_bytes, relative_path, size_limit,
 };
-use crate::{codec, timestamp};
+use crate::{codec, external_filter, timestamp, zip_codec};
 
 #[derive(Clone, Copy)]
 pub(super) enum Listing<'a> {
@@ -66,6 +66,13 @@ pub(super) fn run(
                 unpack.entry(entry, &payload)?;
             }
             unpack.finish()?;
+        }
+    } else if let Some(program) = external_filter::detect(&prefix) {
+        let bytes = external_filter::decompress(host, archive_path, program)?;
+        let entries = scan.tar_headers(bytes.as_slice())?;
+        scan.patterns.finish()?;
+        if !entries.is_empty() {
+            Unpack::new(host, &options.destination)?.tar(bytes.as_slice(), entries)?;
         }
     } else if let Some(filter) = codec::detect(&prefix) {
         let bytes = read_bytes(host, archive_path, size_limit())?;
@@ -259,11 +266,17 @@ impl Scan<'_> {
                     &name,
                 );
                 if is_link {
-                    let mut link = archive.by_index(index).map_err(archive_error)?;
+                    let link = archive.by_index_raw(index).map_err(archive_error)?;
                     let size = link.size();
+                    drop(link);
+                    if size > crate::MAX_NAME_BYTES as u64 {
+                        return Err(ArchiveError::new(
+                            "The ZIP symbolic link target is too long",
+                        ));
+                    }
                     self.reserve_payload(size)?;
                     line.extend_from_slice(b" -> ");
-                    line.extend_from_slice(&read_bounded(&mut link, crate::MAX_NAME_BYTES as u64)?);
+                    line.extend_from_slice(&zip_codec::payload(&mut archive, index)?);
                 }
                 line
             } else {
@@ -274,29 +287,31 @@ impl Scan<'_> {
             if self.list_only {
                 continue;
             }
-            let mut item = archive.by_index(index).map_err(archive_error)?;
+            let item = archive.by_index_raw(index).map_err(archive_error)?;
             let mode = item.unix_mode();
+            let is_link = item.is_symlink();
+            let is_dir = item.is_dir();
+            let size = item.size();
             let mtime = if self.touch {
                 None
             } else {
                 timestamp::zip_time(&item)
             };
-            let (data, payload) = if item.is_symlink() {
-                let size = item.size();
+            drop(item);
+            let (data, payload) = if is_link {
                 if size > crate::MAX_NAME_BYTES as u64 {
                     return Err(ArchiveError::new(
                         "The ZIP symbolic link target is too long",
                     ));
                 }
                 self.reserve_payload(size)?;
-                let target = symlink_target(&path, &read_payload(&mut item, size)?)?;
+                let target = symlink_target(&path, &zip_codec::payload(&mut archive, index)?)?;
                 (Data::Symlink(target), Vec::new())
-            } else if item.is_dir() || mode.is_some_and(|mode| mode & 0o170000 == 0o40000) {
+            } else if is_dir || mode.is_some_and(|mode| mode & 0o170000 == 0o40000) {
                 (Data::Directory, Vec::new())
             } else {
-                let size = item.size();
                 self.reserve_payload(size)?;
-                (Data::File, read_payload(&mut item, size)?)
+                (Data::File, zip_codec::payload(&mut archive, index)?)
             };
             entries.push((
                 Entry {
@@ -445,7 +460,7 @@ fn symlink_target(link: &Path, target: &[u8]) -> Result<PathBuf, ArchiveError> {
     Ok(to_native(target))
 }
 
-fn read_payload(reader: impl Read, size: u64) -> Result<Vec<u8>, ArchiveError> {
+pub(super) fn read_payload(reader: impl Read, size: u64) -> Result<Vec<u8>, ArchiveError> {
     let data = read_bounded(reader, size)?;
     check_payload_size(&data, size)?;
     Ok(data)

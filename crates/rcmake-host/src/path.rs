@@ -53,3 +53,25 @@ pub(crate) fn directory_removal_path(p: &Path) -> crate::HostResult<PathBuf> {
     }
     Ok(to_native(trimmed))
 }
+
+/// Find an executable in an absolute directory from the host's PATH.
+#[must_use]
+pub fn executable_on_absolute_path(host: &dyn crate::Host, name: &str) -> Option<PathBuf> {
+    let mut components = Path::new(name).components();
+    if !matches!(
+        (components.next(), components.next()),
+        (Some(std::path::Component::Normal(_)), None)
+    ) {
+        return None;
+    }
+    let name = format!("{name}{}", std::env::consts::EXE_SUFFIX);
+    let value = to_native(&host.env_get(b"PATH")?);
+    std::env::split_paths(&value)
+        .filter(|dir| dir.is_absolute())
+        .map(|dir| dir.join(&name))
+        .find(|file| {
+            host.metadata(file, crate::Follow::Yes).is_ok_and(|meta| {
+                meta.kind == crate::FileKind::File && (cfg!(windows) || meta.mode & 0o111 != 0)
+            })
+        })
+}

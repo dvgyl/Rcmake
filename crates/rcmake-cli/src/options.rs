@@ -40,6 +40,8 @@ pub(crate) struct Options {
     pub debug_trycompile: bool,
     pub debug_output: bool,
     pub debug_find: bool,
+    pub debug_find_variables: Vec<BString>,
+    pub debug_find_packages: Vec<BString>,
     pub sarif: Option<PathBuf>,
     pub script: Option<PathBuf>,
     pub preset: Option<BString>,

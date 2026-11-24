@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use rcmake_base::{BString, list, truth};
 use rcmake_host::{Follow, Host, path};
-use rcmake_json::{ReadOptions, Value, parse};
+use rcmake_json::{ReadOptions, Value, parse, write_compact};
 
 use crate::files::{
     absolute, api_dir, command_hash, newest_content, publish_at, read_json, timestamp,
@@ -57,6 +57,8 @@ pub struct SnippetDetails {
     pub target_labels: Option<Vec<BString>>,
     /// Whether CTest ran in show-only mode.
     pub show_only: bool,
+    /// Original one-based test index for test snippet identity.
+    pub test_index: Option<usize>,
 }
 
 pub(crate) fn snippet_value(
@@ -194,7 +196,7 @@ pub fn write_snippet_with_details(
             )
         })
         .collect();
-    let hash = command_hash(host, &snippet.command);
+    let hash = command_hash(host, &snippet.command, details.test_index);
     let stem = format!("{}-{hash}-{}", snippet.role.as_str(), timestamp(host));
     publish_at(
         host,
@@ -273,7 +275,8 @@ pub fn write_content(
     let value = Value::Object(value);
     if let Some(previous) = newest_content(host, &data)? {
         let previous = data.join(path::to_native(&previous));
-        if read_json(host, &previous).is_ok_and(|old| old == value) {
+        if read_json(host, &previous).is_ok_and(|old| write_compact(&old) == write_compact(&value))
+        {
             return Ok(previous);
         }
     }

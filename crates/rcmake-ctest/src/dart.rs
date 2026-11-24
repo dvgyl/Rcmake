@@ -23,6 +23,15 @@ pub(crate) struct Configuration {
     pub(crate) build_directory: BString,
     pub(crate) coverage_tool: BString,
     pub(crate) change_id: BString,
+    pub(crate) submit_url: BString,
+    pub(crate) drop_method: BString,
+    pub(crate) drop_site: BString,
+    pub(crate) drop_location: BString,
+    pub(crate) tls_version: Option<BString>,
+    pub(crate) tls_verify: Option<BString>,
+    pub(crate) update_command: BString,
+    pub(crate) memory_check_type: BString,
+    pub(crate) memory_check_options: BString,
 }
 
 impl Configuration {
@@ -104,6 +113,15 @@ impl Configuration {
             b"SourceDirectory" => self.source_directory = value.into(),
             b"BuildDirectory" => self.build_directory = value.into(),
             b"CTestTestCoverageTool" => self.coverage_tool = value.into(),
+            b"SubmitURL" => self.submit_url = value.into(),
+            b"DropMethod" => self.drop_method = value.into(),
+            b"DropSite" => self.drop_site = value.into(),
+            b"DropLocation" => self.drop_location = value.into(),
+            b"TLSVersion" if !value.is_empty() => self.tls_version = Some(value.into()),
+            b"TLSVerify" if !value.is_empty() => self.tls_verify = Some(value.into()),
+            b"UpdateCommand" => self.update_command = value.into(),
+            b"MemoryCheckType" => self.memory_check_type = value.into(),
+            b"MemoryCheckSanitizerOptions" => self.memory_check_options = value.into(),
             _ => {}
         }
     }

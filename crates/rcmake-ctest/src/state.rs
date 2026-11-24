@@ -1,6 +1,6 @@
 //! State files in the build directory.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -13,6 +13,7 @@ use crate::CtestError;
 const TEMPORARY: &str = "Testing/Temporary";
 const FAILURES: &str = "LastTestsFailed.log";
 const LOG: &str = "LastTest.log";
+const CHECKPOINT: &str = "CTestCheckpoint.txt";
 const COSTS: &str = "CTestCostData.txt";
 static NEXT_WRITE: AtomicU64 = AtomicU64::new(0);
 
@@ -49,6 +50,50 @@ fn access(path: &Path, source: HostError) -> CtestError {
     CtestError::Access {
         path: path.to_path_buf(),
         source,
+    }
+}
+
+pub(crate) fn resume(
+    host: &dyn Host,
+    dir: &Path,
+    enabled: bool,
+) -> Result<BTreeSet<usize>, CtestError> {
+    if !enabled {
+        clear_checkpoint(host, dir)?;
+        return Ok(BTreeSet::new());
+    }
+    let path = dir.join(TEMPORARY).join(CHECKPOINT);
+    let data = read_optional(host, &path)?.unwrap_or_default();
+    Ok(data
+        .split(|&byte| byte == b'\n')
+        .filter_map(|line| std::str::from_utf8(line.trim_ascii()).ok()?.parse().ok())
+        .collect())
+}
+
+pub(crate) fn checkpoint(
+    host: &dyn Host,
+    dir: &Path,
+    numbers: impl IntoIterator<Item = usize>,
+) -> Result<(), CtestError> {
+    use std::fmt::Write as _;
+    let mut data = String::new();
+    for number in numbers {
+        let _ = writeln!(data, "{number}");
+    }
+    let parent = dir.join(TEMPORARY);
+    let path = parent.join(CHECKPOINT);
+    host.create_dir_all(&parent)
+        .map_err(|error| access(&parent, error))?;
+    host.write(&path, data.as_bytes(), WriteMode::Append)
+        .map_err(|error| access(&path, error))
+}
+
+pub(crate) fn clear_checkpoint(host: &dyn Host, dir: &Path) -> Result<(), CtestError> {
+    let path = dir.join(TEMPORARY).join(CHECKPOINT);
+    match host.remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind == ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(access(&path, error)),
     }
 }
 

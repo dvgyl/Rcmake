@@ -71,7 +71,7 @@ pub(crate) fn run_tests_with_dashboard(
         .as_ref()
         .map(instrumentation::Recorder::start_test);
     let run_start = host.monotonic();
-    let record_run = |exit_code, show_only| {
+    let record_run = |exit_code, show_only, interrupt_signal| {
         if let Some((instrument, sample)) = instrument.as_ref().zip(run_sample)
             && !invocation.command.is_empty()
         {
@@ -81,6 +81,7 @@ pub(crate) fn run_tests_with_dashboard(
                 host.monotonic().saturating_sub(run_start),
                 exit_code,
                 show_only,
+                interrupt_signal,
             );
         }
     };
@@ -89,7 +90,7 @@ pub(crate) fn run_tests_with_dashboard(
         if !options.quiet {
             reporting::show_json(host.as_ref(), &plan, options, format == ShowOnly::JsonV1Raw);
         }
-        record_run(0, true);
+        record_run(0, true, None);
         return Ok(TestRunOutcome::default());
     }
     if show_project {
@@ -103,7 +104,7 @@ pub(crate) fn run_tests_with_dashboard(
     }
     if options.show_only {
         report.list(&plan);
-        record_run(0, true);
+        record_run(0, true, None);
         return Ok(TestRunOutcome::default());
     }
     if let Some(name) = plan.dependency_cycle() {
@@ -123,6 +124,19 @@ pub(crate) fn run_tests_with_dashboard(
         });
     }
 
+    if let Some(signal) = instrument
+        .as_ref()
+        .and_then(|_| rcmake_instrument::injected_interrupt(host.as_ref()))
+    {
+        record_run(8, false, Some(signal));
+        return Ok(TestRunOutcome {
+            outcome: CtestOutcome {
+                exit_code: 8,
+                ..CtestOutcome::default()
+            },
+            ..TestRunOutcome::default()
+        });
+    }
     run.execute(&plan, &report, deadline, dashboard, junit, record_run)
 }
 
@@ -143,7 +157,12 @@ impl<'a> DashboardTarget<'a> {
                 .find(|&model| matches!(definition.strip_prefix(model), Some(b"" | b"Test")))?;
             dart::Model::parse(model)
         });
-        if model.is_some() || invocation.actions.iter().any(|action| action == "test") {
+        if model.is_some()
+            || invocation
+                .actions
+                .iter()
+                .any(|action| matches!(action.as_slice(), b"test" | b"memcheck"))
+        {
             Self::Create(invocation.dashboard_model.or(model))
         } else {
             Self::Disabled
@@ -214,7 +233,7 @@ impl TestRun<'_> {
         deadline: Option<Duration>,
         dashboard: DashboardTarget<'_>,
         junit: Option<&BString>,
-        record_run: impl FnOnce(i32, bool),
+        record_run: impl FnOnce(i32, bool, Option<i32>),
     ) -> Result<TestRunOutcome, CtestError> {
         let host = self.host.as_ref();
         let dir = &self.dir;
@@ -259,7 +278,7 @@ impl TestRun<'_> {
             output: &invocation.output,
         };
         let outcome = self.finish(&reports, dashboard, junit)?;
-        record_run(outcome.outcome.exit_code, false);
+        record_run(outcome.outcome.exit_code, false, None);
         if let Err(error) =
             rcmake_instrument::hooks::run_hook(host, dir, rcmake_instrument::Hook::PostCTest)
         {
@@ -348,7 +367,9 @@ impl TestRun<'_> {
         junit: Option<&BString>,
     ) -> Result<TestRunOutcome, CtestError> {
         let junit_failed = self.write_junit(report, dashboard, junit)?;
-        if let Some(dashboard) = dashboard {
+        if let Some(dashboard) = dashboard
+            && !crate::memcheck::requested(self.invocation)
+        {
             dart::write_test_xml(self.host.as_ref(), dashboard, report).map_err(|source| {
                 CtestError::Access {
                     path: dashboard.directory.join("Testing"),

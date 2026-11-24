@@ -110,6 +110,7 @@ pub(crate) fn run(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
         },
         directory: cx.current_binary_dir(),
         properties: properties("DISCOVERY_PROPERTIES", values(b"DISCOVERY_PROPERTIES"))?,
+        timeout: Default::default(),
     };
     let mut command = discovery.command.clone();
     command.args.extend_from_slice(values(b"DISCOVERY_ARGS"));
@@ -207,6 +208,7 @@ pub(crate) fn run(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
             name,
             command,
             properties: props,
+            timeout: Default::default(),
             directory: discovery.directory.clone(),
         });
     }

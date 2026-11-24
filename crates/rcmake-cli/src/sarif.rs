@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use rcmake_base::BString;
-use rcmake_diag::DiagCategory;
+use rcmake_diag::{DiagCategory, DiagEngine};
 use rcmake_eval::Interp;
 use rcmake_host::{FileTime, Host, WriteMode, path};
 use rcmake_json::Value;
@@ -17,7 +17,11 @@ pub(crate) struct Invocation<'a> {
 }
 
 pub(crate) fn take_results(interp: &Interp) -> Vec<Value> {
-    let mut document = interp.diag_engine().sarif_json();
+    results_from_engine(interp.diag_engine())
+}
+
+pub(crate) fn results_from_engine(engine: &DiagEngine) -> Vec<Value> {
+    let mut document = engine.sarif_json();
     run(&mut document)
         .and_then(|run| run.remove(b"results".as_slice()))
         .and_then(|results| match results {

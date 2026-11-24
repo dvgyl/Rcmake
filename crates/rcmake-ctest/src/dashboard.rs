@@ -4,11 +4,14 @@ use std::io::ErrorKind;
 use std::path::Path;
 
 use rcmake_base::BString;
-use rcmake_host::{FileKind, Follow, Host, ProcessResult, Stream, path};
+use rcmake_host::{FileKind, Follow, Host, Input, Output, ProcessResult, RunRequest, Stream, path};
 use rcmake_presets::{EnvSnapshot, PresetKind};
 
 use crate::cli::Invocation;
 use crate::dart::{self, Configuration, Model, Tag};
+
+mod submit;
+mod update;
 
 pub(crate) fn run(host: &dyn Host, invocation: &Invocation) -> Result<Option<i32>, String> {
     let configure = invocation
@@ -23,16 +26,34 @@ pub(crate) fn run(host: &dyn Host, invocation: &Invocation) -> Result<Option<i32
         });
     let start =
         invocation.actions.len() == 1 && invocation.actions.iter().any(|action| action == "start");
-    if !configure && !start {
-        return Ok(None);
+    let action = |name: &[u8]| {
+        invocation
+            .actions
+            .iter()
+            .any(|action| action.as_slice() == name)
+    };
+    if !configure {
+        if action(b"update") {
+            return update::run(host, invocation).map(Some);
+        }
+        if action(b"submit") {
+            return submit::run(host, invocation).map(Some);
+        }
+        if action(b"coverage") && !action(b"test") {
+            let dir = &invocation.options.test_dir;
+            missing_configuration(host, dir);
+            host.write_out(
+                Stream::Stderr,
+                b" Cannot find any coverage files. Ignoring Coverage request.\n",
+            );
+            return Ok(Some(0));
+        }
+        if !start {
+            return Ok(None);
+        }
     }
 
-    let definition = |name: &[u8]| {
-        invocation.definitions.iter().rev().find_map(|value| {
-            let (key, value) = dart::split(value, b'=')?;
-            (key == name).then_some(value)
-        })
-    };
+    let definition = |name: &[u8]| definition(invocation, name);
     let cwd = host.initial_cwd();
     let initial_build = &invocation.options.test_dir;
     let mut config = Configuration::load(
@@ -84,14 +105,7 @@ pub(crate) fn run(host: &dyn Host, invocation: &Invocation) -> Result<Option<i32
         return Ok(Some(2));
     }
 
-    let config_file = initial_build.join("DartConfiguration.tcl");
-    let has_config = host.metadata(&config_file, Follow::Yes).is_ok();
-    if !has_config {
-        host.write_out(
-            Stream::Stderr,
-            format!("Cannot find file: {}\n", config_file.display()).as_bytes(),
-        );
-    }
+    missing_configuration(host, initial_build);
     let preset = definition(b"CTEST_CONFIGURE_PRESET").or_else(|| definition(b"CTEST_PRESET"));
     let mut build = if invocation.build_dir.is_none() && !config.build_directory.is_empty() {
         cwd.join(path::to_native(&config.build_directory))
@@ -153,15 +167,21 @@ pub(crate) fn run(host: &dyn Host, invocation: &Invocation) -> Result<Option<i32
     }
     let program = path::from_native(&crate::script::cmake_executable(host));
     let command = rcmake_host::CommandSpec { program, args };
-    let output = crate::script::run_process(
-        host,
-        source.clone(),
-        command.program.clone(),
-        command.args.clone(),
-        host.env_all(),
-        invocation.options.verbose && !invocation.options.quiet,
-    )
-    .map_err(|error| error.to_string())?;
+    let output = host
+        .run(
+            &RunRequest {
+                pipeline: vec![command.clone()],
+                cwd: source.clone(),
+                env: host.env_all(),
+                stdin: Input::Null,
+                stdout: Output::Capture,
+                stderr: Output::SharedWithStdout,
+                timeout: Some(std::time::Duration::from_secs(600)),
+                tee: invocation.options.verbose && !invocation.options.quiet,
+            },
+            &mut |stream, data| host.write_out(stream, data),
+        )
+        .map_err(|error| error.to_string())?;
     let code = match output.results.last() {
         Some(ProcessResult::Exited(code)) => *code,
         Some(ProcessResult::SpawnFailed(error)) if error.kind == ErrorKind::NotFound => {
@@ -189,6 +209,29 @@ pub(crate) fn run(host: &dyn Host, invocation: &Invocation) -> Result<Option<i32
         .join("Configure.xml");
     write_configure_report(host, &file, &command, &output, code)?;
     Ok(Some(if code == 0 { 0 } else { 2 }))
+}
+
+fn definition<'a>(invocation: &'a Invocation, name: &[u8]) -> Option<&'a [u8]> {
+    invocation.definitions.iter().rev().find_map(|value| {
+        let (key, value) = dart::split(value, b'=')?;
+        (key == name).then_some(value)
+    })
+}
+
+fn missing_configuration(host: &dyn Host, dir: &Path) {
+    if ["DartConfiguration.tcl", "CTestConfiguration.ini"]
+        .iter()
+        .all(|name| host.metadata(&dir.join(name), Follow::Yes).is_err())
+    {
+        host.write_out(
+            Stream::Stderr,
+            format!(
+                "Cannot find file: {}\n",
+                dir.join("DartConfiguration.tcl").display()
+            )
+            .as_bytes(),
+        );
+    }
 }
 
 fn write_configure_report(

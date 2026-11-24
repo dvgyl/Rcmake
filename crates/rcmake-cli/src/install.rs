@@ -39,10 +39,13 @@ const FLAGS: &[&[u8]] = &[
     b"-v",
 ];
 
+mod parallel;
+
 struct Options {
     dir: PathBuf,
     vars: BTreeMap<&'static [u8], BString>,
     components: Vec<BString>,
+    jobs: Option<u32>,
 }
 
 enum ParseError {
@@ -59,6 +62,7 @@ fn parse(args: &[BString], host: &dyn Host) -> Result<Options, ParseError> {
         dir: resolve_cli_path(host, dir),
         vars: BTreeMap::new(),
         components: Vec::new(),
+        jobs: None,
     };
 
     while let Some(arg) = args.next() {
@@ -96,7 +100,7 @@ fn parse(args: &[BString], host: &dyn Host) -> Result<Options, ParseError> {
                     })
                     .filter(|value| !value.is_empty())
                     .ok_or_else(|| ParseError::Usage(invalid_value(flag)))?;
-                job_count(count).map_err(|err| {
+                opts.jobs = Some(job_count(count).map_err(|err| {
                     let message = if err == "invalid" {
                         format!(
                             "'{}' invalid number '{}' given.",
@@ -107,7 +111,7 @@ fn parse(args: &[BString], host: &dyn Host) -> Result<Options, ParseError> {
                         err.to_owned()
                     };
                     ParseError::Usage(format!("{message}\n"))
-                })?;
+                })?);
                 continue;
             }
             b"-v" | b"--verbose" if inline.is_none() => {
@@ -176,6 +180,19 @@ pub(crate) fn run(argv: &[BString], args: &[BString], host: Arc<dyn Host>) -> i3
 }
 
 fn install(argv: &[BString], opts: Options, host: Arc<dyn Host>) -> i32 {
+    match parallel::Index::load(host.as_ref(), &opts.dir) {
+        Ok(Some(index)) => {
+            return parallel::run(argv, &opts, host.as_ref(), index).unwrap_or_else(|error| {
+                crate::emit_cli_error(host.as_ref(), error);
+                1
+            });
+        }
+        Ok(None) => {}
+        Err(error) => {
+            crate::emit_cli_error(host.as_ref(), error);
+            return 1;
+        }
+    }
     let script = opts.dir.join("cmake_install.cmake");
     let components = if opts.components.is_empty() {
         vec![None]

@@ -16,9 +16,11 @@ use thiserror::Error;
 mod codec;
 mod compress;
 mod create;
+mod external_filter;
 mod extract;
 mod pattern;
 mod timestamp;
+mod zip_codec;
 
 #[cfg(test)]
 mod tests;
@@ -54,6 +56,21 @@ pub enum ArchiveFormat {
     Zip,
     /// ZIP archive with stored entries.
     ZipStored,
+    /// ZIP archive with a codec supplied by the archive engine.
+    ZipCompressed(ZipCompression),
+}
+
+/// Compression method for ZIP file entries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ZipCompression {
+    /// Bzip2.
+    Bzip2,
+    /// LZMA.
+    Lzma,
+    /// XZ.
+    Xz,
+    /// Zstandard.
+    Zstd,
 }
 
 /// Compression filter for a tar archive.

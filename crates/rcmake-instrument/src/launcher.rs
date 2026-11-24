@@ -93,6 +93,7 @@ struct Metadata {
     language: Option<BString>,
     labels: Vec<BString>,
     test_name: Option<BString>,
+    timeout: Option<Duration>,
 }
 
 fn compile_trace_path(
@@ -194,7 +195,7 @@ fn copy_compile_trace(
     let (stem, extension) = name.split_at(extension);
     let suffix = format!(
         "-{}-{}",
-        command_hash(host, command),
+        command_hash(host, command, None),
         trace_suffix(end_millis)
     );
     let name = [stem, suffix.as_bytes(), extension].concat();
@@ -252,7 +253,7 @@ fn run(
                 | SnippetRole::Install
                 | SnippetRole::Test
         );
-    let request = request(host, cwd.to_path_buf(), command, capture, None)?;
+    let request = request(host, cwd.to_path_buf(), command, capture, metadata.timeout)?;
     let (output, metrics) = crate::metrics::run(
         host,
         &request,
@@ -321,6 +322,7 @@ fn run(
                 .then_some(saved_trace),
             target_labels: Some(metadata.labels),
             show_only: false,
+            test_index: None,
         };
         write_snippet_with_details(host, &data, &snippet, &details)
     });
@@ -352,6 +354,31 @@ pub fn run_instrumented(
 ) -> Result<i32, InstrumentError> {
     let build = absolute(host, build_dir);
     run(host, &build, &build, role, command, Metadata::default())
+}
+
+/// Run an install script with its configuration and record its process result.
+///
+/// # Errors
+///
+/// Returns an error if the command cannot start.
+pub fn run_install(
+    host: &dyn Host,
+    build_dir: &Path,
+    command: &[BString],
+    config: Option<BString>,
+) -> Result<i32, InstrumentError> {
+    run(
+        host,
+        build_dir,
+        &host.initial_cwd(),
+        SnippetRole::Install,
+        command,
+        Metadata {
+            config,
+            timeout: Some(Duration::from_secs(600)),
+            ..Metadata::default()
+        },
+    )
 }
 
 /// Run the arguments of `ctest --instrument`, with or without the leading flag.

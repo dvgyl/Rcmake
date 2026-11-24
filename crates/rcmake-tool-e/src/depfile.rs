@@ -199,7 +199,7 @@ fn parse(contents: &[u8]) -> Option<Vec<Rule>> {
     Some(rules)
 }
 
-fn escape(path: &[u8], output: &mut Vec<u8>) {
+pub(super) fn escape(path: &[u8], output: &mut Vec<u8>) {
     for &byte in path {
         match byte {
             b' ' | b'#' => output.push(b'\\'),

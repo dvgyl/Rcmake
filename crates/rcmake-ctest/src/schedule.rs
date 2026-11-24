@@ -550,6 +550,37 @@ struct Scheduler<'a> {
 impl Scheduler<'_> {
     #[allow(
         clippy::indexing_slicing,
+        reason = "The plan supplies all test indices"
+    )]
+    fn resume(&mut self, completed: &BTreeSet<usize>) -> Result<Vec<usize>, CtestError> {
+        let mut resumed = Vec::new();
+        for (id, test) in self.plan.tests.iter().enumerate() {
+            if !completed.contains(&test.number) {
+                continue;
+            }
+            if let Some(group) = self.repetition.group_of[id] {
+                if !self.repetition.groups[group]
+                    .members
+                    .iter()
+                    .all(|&member| completed.contains(&self.plan.tests[member].number))
+                {
+                    continue;
+                }
+                self.repetition.groups[group].runs_left = 0;
+            }
+            self.statuses[id] = Some(Status::Passed);
+            self.completed += 1;
+            self.advance(id)?;
+            resumed.push(id);
+        }
+        for &id in &resumed {
+            self.ready.ordered.remove(&(self.ready.rank[id], id));
+        }
+        Ok(resumed)
+    }
+
+    #[allow(
+        clippy::indexing_slicing,
         reason = "The plan supplies test indices, and Repetition assigns group indices"
     )]
     fn advance(&mut self, id: usize) -> Result<(), CtestError> {
@@ -620,6 +651,12 @@ pub(crate) fn run(
         completed: 0,
         stopped: false,
     };
+    let completed = state::resume(
+        host,
+        dir,
+        invocation.execution.enable_failover == Some(true),
+    )?;
+    let resumed = scheduler.resume(&completed)?;
     let mut state = RunState::new(host, dir)?;
     let resources: Vec<_> = plan
         .tests
@@ -635,6 +672,7 @@ pub(crate) fn run(
     let mut load = 0;
     let mut runs = vec![0; plan.tests.len()];
 
+    let memcheck = crate::memcheck::Session::start(host, dir, invocation)?;
     let instrument = crate::instrumentation::Recorder::open(host, dir, options.config.as_ref())?;
     let instrument = instrument.as_ref();
     thread::scope(|scope| -> Result<(), CtestError> {
@@ -674,6 +712,9 @@ pub(crate) fn run(
                     let run = scheduler.repetition.numbered_run(id, runs[id]);
                     let result = match prepare(host, options, plan, &scheduler.statuses, test) {
                         Ok(mut request) => {
+                            if let Some(memcheck) = &memcheck {
+                                memcheck.apply(&mut request, test.number);
+                            }
                             if coverage_tool == b"LLVM-COV" {
                                 let name = test.name.to_string().replace(['/', '\\'], "_");
                                 let profile = from_native(&dir.join(format!("{name}_%p.profraw")));
@@ -801,10 +842,31 @@ pub(crate) fn run(
             scheduler.stopped |=
                 remaining_time(host, deadline).is_some_and(|remaining| remaining.is_zero());
             scheduler.advance(id)?;
+            match scheduler.repetition.group_of[id] {
+                None => state::checkpoint(host, dir, [test.number])?,
+                Some(group) if scheduler.repetition.groups[group].pending == 0 => {
+                    state::checkpoint(
+                        host,
+                        dir,
+                        scheduler.repetition.groups[group]
+                            .members
+                            .iter()
+                            .map(|&member| plan.tests[member].number),
+                    )?;
+                }
+                Some(_) => {}
+            }
         }
         Ok(())
     })?;
+    for id in resumed {
+        scheduler.statuses[id] = None;
+    }
     state.finish(plan, &scheduler.statuses)?;
+    state::clear_checkpoint(host, dir)?;
+    if let Some(memcheck) = memcheck {
+        memcheck.finish(host, dir, options.quiet)?;
+    }
     Ok(scheduler.statuses)
 }
 
@@ -821,6 +883,9 @@ fn prepare(
 ) -> Result<RunRequest, ResultLine> {
     if truth::is_on(test.property(b"DISABLED")) {
         return Err(ResultLine::new(Status::Disabled));
+    }
+    if !test.timeout.errors.is_empty() {
+        return Err(ResultLine::not_run(test.timeout.errors.join("\n")));
     }
     let failed_setups: Vec<_> = test
         .required_setups

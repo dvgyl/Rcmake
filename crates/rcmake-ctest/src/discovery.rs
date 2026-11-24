@@ -24,6 +24,7 @@ pub(crate) struct Test {
     pub(crate) command: CommandSpec,
     pub(crate) directory: PathBuf,
     pub(crate) properties: BTreeMap<BString, BString>,
+    pub(crate) timeout: crate::timeout::Settings,
 }
 
 impl Test {
@@ -84,17 +85,7 @@ pub(crate) fn load(
     if interp.run_script(&path).exit_code != 0 {
         return Err(CtestError::Load(path));
     }
-    let labels = interp.cx().directory_props().get(b"LABELS").cloned();
-    let mut tests = COLLECTOR.take().tests;
-    if let Some(labels) = labels.filter(|labels| !labels.is_empty()) {
-        for test in tests.iter_mut().filter(|test| test.directory == dir) {
-            let property = test.properties.entry("LABELS".into()).or_default();
-            let mut all = list::split(&labels, list::Empty::Drop);
-            all.extend(list::split(property, list::Empty::Drop));
-            *property = list::join(&all);
-        }
-    }
-    Ok(tests)
+    Ok(COLLECTOR.take().tests)
 }
 
 fn interpreter(host: Arc<dyn Host>, dir: &Path, commands: fn(&mut Registry)) -> Interp {
@@ -171,6 +162,11 @@ fn register(registry: &mut Registry) {
     rcmake_commands::register_all(registry);
     registry.add("add_test", add_test, SCRIPTABLE);
     registry.add("set_tests_properties", set_properties, SCRIPTABLE);
+    registry.add(
+        "set_directory_properties",
+        set_directory_properties,
+        SCRIPTABLE,
+    );
     registry.add("subdirs", subdirs, SCRIPTABLE);
     registry.add("add_subdirectory", add_subdirectory, SCRIPTABLE);
     registry.add("discover_tests", crate::discover::run, SCRIPTABLE);
@@ -188,6 +184,7 @@ fn add_test(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
         },
         directory: cx.current_binary_dir(),
         properties: BTreeMap::new(),
+        timeout: Default::default(),
     };
     register_test(test);
     Ok(Flow::Normal)
@@ -221,12 +218,11 @@ fn set_properties(_: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
                 for &id in ids {
                     if let Some(test) = state.tests.get_mut(id) {
                         for [key, value] in pairs {
-                            if key.value == "REQUIRED_FILES" {
-                                let current = test.properties.entry(key.value.clone()).or_default();
-                                if !current.is_empty() && !value.value.is_empty() {
-                                    current.push(b';');
-                                }
-                                current.extend_from_slice(&value.value);
+                            test.timeout.apply(&key.value, &value.value);
+                            if matches!(key.value.as_slice(), b"REQUIRED_FILES" | b"LABELS") {
+                                let property =
+                                    test.properties.entry(key.value.clone()).or_default();
+                                append_property(property, &value.value);
                             } else {
                                 test.properties
                                     .insert(key.value.clone(), value.value.clone());
@@ -234,6 +230,39 @@ fn set_properties(_: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
                         }
                     }
                 }
+            }
+        }
+    });
+    Ok(Flow::Normal)
+}
+
+fn append_property(property: &mut BString, value: &[u8]) {
+    if !property.is_empty() && !value.is_empty() {
+        property.push(b';');
+    }
+    property.extend_from_slice(value);
+}
+
+fn set_directory_properties(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
+    let [keyword, properties @ ..] = args else {
+        return Ok(Flow::Normal);
+    };
+    let (pairs, _) = properties.as_chunks::<2>();
+    if keyword.value != "PROPERTIES" {
+        return Ok(Flow::Normal);
+    }
+    let directory = cx.current_binary_dir();
+    COLLECTOR.with_borrow_mut(|state| {
+        for test in state
+            .tests
+            .iter_mut()
+            .filter(|test| test.directory == directory)
+        {
+            for [key, value] in pairs.iter().filter(|[key, _]| key.value == "LABELS") {
+                append_property(
+                    test.properties.entry(key.value.clone()).or_default(),
+                    &value.value,
+                );
             }
         }
     });

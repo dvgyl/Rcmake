@@ -10,6 +10,7 @@ mod depfile;
 mod dyndep;
 mod files;
 mod generator;
+pub mod make_depends;
 mod process;
 
 #[cfg(test)]

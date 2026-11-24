@@ -6,8 +6,8 @@ use jiff::{
     tz::{Offset, TimeZone},
 };
 use rcmake_archive::{
-    ArchiveFormat, CreateOptions, ExtractOptions, TarCompression, create_command_archive,
-    extract_archive, list_command_archive,
+    ArchiveFormat, CreateOptions, ExtractOptions, TarCompression, ZipCompression,
+    create_command_archive, extract_archive, list_command_archive,
 };
 use rcmake_base::BString;
 use rcmake_host::{Follow, Stream, path::to_native};
@@ -388,6 +388,10 @@ fn archive_format(opts: &TarOptions<'_>) -> Result<ArchiveFormat, String> {
         return match compression {
             Compression::None if opts.compression.is_some() => Ok(ArchiveFormat::ZipStored),
             Compression::None | Compression::Gzip => Ok(ArchiveFormat::Zip),
+            Compression::Bzip2 => Ok(ArchiveFormat::ZipCompressed(ZipCompression::Bzip2)),
+            Compression::Lzma => Ok(ArchiveFormat::ZipCompressed(ZipCompression::Lzma)),
+            Compression::Xz => Ok(ArchiveFormat::ZipCompressed(ZipCompression::Xz)),
+            Compression::Zstd => Ok(ArchiveFormat::ZipCompressed(ZipCompression::Zstd)),
             _ => Err(String::from(
                 "CMake Error: The archive backend does not support the requested ZIP compression method\n",
             )),

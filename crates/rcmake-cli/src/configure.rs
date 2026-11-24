@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
@@ -14,6 +15,7 @@ use crate::options::{self, CacheEdit, DirectoryArg, Options};
 use crate::{cache, emit_cli_error, new_interp, new_interp_with_paths, presets, resolve_cli_path};
 
 mod diagnostics;
+mod unused_cli;
 
 pub(crate) use diagnostics::initialize_diagnostics;
 
@@ -89,6 +91,7 @@ struct ConfigureSession<'a> {
     src: PathBuf,
     bin: PathBuf,
     preset: presets::Application,
+    profiler: Option<Arc<crate::profile::Recorder>>,
 }
 
 struct Configured {
@@ -108,7 +111,7 @@ fn configure_project(
     let start = session.host.monotonic();
     let time = session.host.now();
     let mut preloads = session.apply_cache_edits(&mut interp);
-    let results = std::mem::take(&mut preloads.results);
+    let mut results = std::mem::take(&mut preloads.results);
     let outcome = (|| {
         if session.opts.view {
             session.list_cache(&mut interp);
@@ -122,13 +125,22 @@ fn configure_project(
             return Err(Exit::Code(1));
         }
         let configured = session.configure(&mut interp, has_cache, start, preloads)?;
-        session.generate(&mut interp, configured)
+        session.generate(&mut interp, configured, &mut results)
     })();
     let code = match &outcome {
         Ok(()) => 0,
         Err(Exit::Code(code)) => *code,
         Err(Exit::Message(_)) => 1,
     };
+    if let Some((profiler, path)) = session
+        .profiler
+        .as_ref()
+        .zip(session.opts.profile_output.as_deref())
+    {
+        profiler
+            .write(session.host.as_ref(), path)
+            .map_err(|error| Exit::Message(format!("Could not write profiling output: {error}")))?;
+    }
     session.write_sarif(&mut interp, results, time, code)?;
     outcome
 }
@@ -202,6 +214,10 @@ impl<'a> ConfigureSession<'a> {
             })?;
             saved = Cache::default();
         }
+        let profiler = opts
+            .profile_output
+            .as_ref()
+            .map(|_| Arc::new(crate::profile::Recorder::new(host.as_ref())));
         Ok((
             Self {
                 argv,
@@ -210,6 +226,7 @@ impl<'a> ConfigureSession<'a> {
                 src,
                 bin,
                 preset,
+                profiler,
             },
             saved,
         ))
@@ -279,6 +296,9 @@ impl<'a> ConfigureSession<'a> {
             cmake_root,
             self.argv,
         );
+        if let Some(profiler) = &self.profiler {
+            profiler.attach(&mut interp);
+        }
         *interp.cx().cache() = saved;
         interp.cx().project().generator = generator_kind;
         interp.cx().project().generator_spec = generator_spec;
@@ -304,8 +324,17 @@ impl<'a> ConfigureSession<'a> {
         let mut configured_diagnostics = false;
         for edit in std::mem::take(&mut self.opts.cache_edits) {
             match edit {
-                CacheEdit::Define(def) => cache::apply(interp.cx().cache(), def),
-                CacheEdit::Remove(pattern) => remove_entries(interp, &pattern),
+                CacheEdit::Define(def) => {
+                    let name = def.name.clone();
+                    if unused_cli::apply_define(interp.cx().cache(), def)
+                        && preloads.tracked.insert(name.clone())
+                    {
+                        interp.track_variable_reads([name]);
+                    }
+                }
+                CacheEdit::Remove(pattern) => {
+                    remove_entries(interp, &pattern, &mut preloads.tracked)
+                }
                 CacheEdit::Preload(script) => {
                     if !configured_diagnostics {
                         self.apply_diagnostics(interp);
@@ -365,14 +394,27 @@ impl<'a> ConfigureSession<'a> {
             RunMode::Configure,
             Arc::clone(&self.host),
         );
+        if let Some(profiler) = &self.profiler {
+            profiler.attach(&mut interp);
+        }
         *interp.cx().diag_state_mut() = *configure.cx().diag_state();
         *interp.cx().cache() = std::mem::take(configure.cx().cache());
         set_directory_vars(&mut interp, &self.src, &self.bin);
+        let pending = configure
+            .unread_variables()
+            .map(BString::from)
+            .collect::<BTreeSet<_>>();
+        interp.track_variable_reads(pending.iter().cloned());
         if initial_cache {
             let _ = interp.run_preload_script(script);
         } else {
             let _ = interp.cx().include_file(script, IncludeOptions::default());
         }
+        let unread = interp
+            .unread_variables()
+            .map(BString::from)
+            .collect::<BTreeSet<_>>();
+        configure.untrack_variable_reads(pending.difference(&unread).cloned());
         *configure.cx().cache() = std::mem::take(interp.cx().cache());
         let code = interp.exit_code();
         if code != 0 {
@@ -455,16 +497,6 @@ impl<'a> ConfigureSession<'a> {
                 &format!("-- Configuring done ({:.1}s)\n", elapsed.as_secs_f64()),
             );
         }
-        if let Some(path) = &self.opts.profile_output {
-            let elapsed = host.monotonic().saturating_sub(start);
-            let profile = format!(
-                "[{{\"name\":\"configure\",\"ph\":\"X\",\"ts\":0,\"dur\":{},\"pid\":{},\"tid\":0}}]",
-                elapsed.as_micros(),
-                std::process::id()
-            );
-            host.write(path, profile.as_bytes(), WriteMode::Truncate)
-                .map_err(|err| Exit::Message(format!("Could not write profiling output: {err}")))?;
-        }
         let exit_code = if result.exit_code == 0 {
             preloads.exit_code
         } else {
@@ -477,7 +509,12 @@ impl<'a> ConfigureSession<'a> {
         Ok(Configured { queries, sample })
     }
 
-    fn generate(&self, interp: &mut Interp, configured: Configured) -> Result<(), Exit> {
+    fn generate(
+        &self,
+        interp: &mut Interp,
+        configured: Configured,
+        results: &mut Vec<Value>,
+    ) -> Result<(), Exit> {
         let host = self.host.as_ref();
         let Configured { queries, sample } = configured;
         if let Some(graph) = &self.opts.graphviz {
@@ -517,6 +554,13 @@ impl<'a> ConfigureSession<'a> {
                 host,
                 &format!("-- Generating done ({:.1}s)\n", elapsed.as_secs_f64()),
             );
+        }
+        if unused_cli::report(host, interp, results) {
+            host.write_out(
+                Stream::Stderr,
+                b"CMake Generate step failed.  Build files cannot be regenerated correctly.\n",
+            );
+            return Err(Exit::Code(1));
         }
         if generated && !queries.is_empty() {
             rcmake_instrument::hooks::run_hook(
@@ -575,7 +619,12 @@ impl<'a> ConfigureSession<'a> {
             }
             None => return Ok(()),
         };
-        let command = interp.cx().var_or_empty(b"CMAKE_COMMAND");
+        let command = self
+            .argv
+            .first()
+            .filter(|argument| path::to_native(argument).is_absolute())
+            .cloned()
+            .unwrap_or_else(|| interp.cx().var_or_empty(b"CMAKE_COMMAND"));
         let invocation = crate::sarif::Invocation {
             command: &command,
             start,
@@ -592,6 +641,7 @@ impl<'a> ConfigureSession<'a> {
 
 #[derive(Default)]
 struct Preloads {
+    tracked: BTreeSet<BString>,
     results: Vec<Value>,
     exit_code: i32,
     fatal: bool,
@@ -759,7 +809,7 @@ fn apply_environment_defaults(
     Some(absolute)
 }
 
-fn remove_entries(interp: &mut Interp, pattern: &[u8]) {
+fn remove_entries(interp: &mut Interp, pattern: &[u8], tracked: &mut BTreeSet<BString>) {
     let mut cx = interp.cx();
     let names: Vec<_> = cx
         .cache()
@@ -767,9 +817,11 @@ fn remove_entries(interp: &mut Interp, pattern: &[u8]) {
         .filter(|(name, entry)| entry.ty != CacheType::Static && matches_glob(pattern, name))
         .map(|(name, _)| name.clone())
         .collect();
-    for name in names {
-        cx.cache().remove(&name);
+    for name in &names {
+        cx.cache().remove(name);
+        tracked.remove(name);
     }
+    interp.untrack_variable_reads(names);
 }
 
 pub(crate) fn matches_glob(mut pattern: &[u8], mut name: &[u8]) -> bool {

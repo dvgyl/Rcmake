@@ -208,9 +208,14 @@ fn manual_index_preserves_data_covered_by_an_existing_index() {
         br#"{"version":1,"options":["trace"]}"#,
     )
     .expect("write trace query");
-    for _ in 0..2 {
+    let original =
         snippet::write_content(&host, build, b"example", &[], &[], false).expect("write content");
-    }
+    assert_eq!(
+        snippet::write_content(&host, build, b"example", &[], &[], false).expect("reuse content"),
+        original
+    );
+    snippet::write_content(&host, build, b"updated", &[], &[], false)
+        .expect("write changed content");
     let run = || {
         launcher::run_instrumented(&host, build, crate::SnippetRole::Custom, &["work".into()])
             .expect("record command");
@@ -448,7 +453,7 @@ fn launcher_copies_invalid_json_trace_bytes() -> Result<(), InstrumentError> {
         0
     );
     let value = read_json(&host, &only_file(&host, &data))?;
-    let hash = command_hash(&host, &launcher::command_line(&command));
+    let hash = command_hash(&host, &launcher::command_line(&command), None);
     let trace = format!("compile-trace/main.trace-{hash}-2024-02-29T00-00-00-0125.json");
     assert_eq!(*field(&value, "traceFile"), Value::string(trace.as_str()));
     assert_eq!(read_bytes(&host, &data.join(trace))?, bytes);

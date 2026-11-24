@@ -11,8 +11,10 @@ mod generate;
 mod help;
 mod install;
 mod instrumentation;
+mod make_depends;
 mod options;
 mod presets;
+mod profile;
 mod resource;
 mod sarif;
 mod system_information;
@@ -207,6 +209,7 @@ fn run_cmake(argv: &[BString], rest: &[BString], host: Arc<dyn Host>) -> i32 {
     if let Some(sub_args) = rest.strip_prefix(&[BString::from("-E")]) {
         if let [command, args @ ..] = sub_args {
             match command.as_slice() {
+                b"cmake_depends" if args.len() >= 4 => return make_depends::run(args, host),
                 b"cmake_llvm_rc" => return resource::run(args, host.as_ref()),
                 b"__instrument" => {
                     return match rcmake_instrument::launcher::run_launcher(host.as_ref(), args) {
@@ -265,6 +268,13 @@ fn run_cmake(argv: &[BString], rest: &[BString], host: Arc<dyn Host>) -> i32 {
     };
     if let Some(script) = opts.script.take() {
         let mut interp = new_interp(argv, &opts, RunMode::Script, Arc::clone(&host));
+        let profiler = opts
+            .profile_output
+            .as_ref()
+            .map(|_| Arc::new(profile::Recorder::new(host.as_ref())));
+        if let Some(profiler) = &profiler {
+            profiler.attach(&mut interp);
+        }
         for edit in opts.cache_edits {
             if let options::CacheEdit::Define(def) = edit {
                 cache::apply(interp.cx().cache(), def);
@@ -280,6 +290,15 @@ fn run_cmake(argv: &[BString], rest: &[BString], host: Arc<dyn Host>) -> i32 {
         *interp.cx().diag_state_mut() = state;
         let start = host.now();
         let outcome = interp.run_script(&script);
+        if let Some((profiler, path)) = profiler.as_ref().zip(opts.profile_output.as_deref())
+            && let Err(error) = profiler.write(host.as_ref(), path)
+        {
+            emit_cli_error(
+                host.as_ref(),
+                format!("Could not write profiling output: {error}"),
+            );
+            return 1;
+        }
         if let Some(output) = opts.sarif.as_deref() {
             let command = interp.cx().var_or_empty(b"CMAKE_COMMAND");
             let invocation = sarif::Invocation {
@@ -341,6 +360,10 @@ fn new_interp_with_paths(
     interp.set_log_level(opts.log_level);
     interp.set_log_context(opts.log_context);
     interp.set_trace_config(opts.trace.clone());
+    interp.set_find_debug_filters(
+        opts.debug_find_variables.clone(),
+        opts.debug_find_packages.clone(),
+    );
     interp
 }
 

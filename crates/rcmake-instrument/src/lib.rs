@@ -28,6 +28,16 @@ pub mod query;
 pub mod snippet;
 pub mod trace;
 
+/// Return the signal from the internal instrumentation test environment.
+#[doc(hidden)]
+pub fn injected_interrupt(host: &dyn rcmake_host::Host) -> Option<i32> {
+    host.env_get(b"__CMAKE_INSTRUMENTATION_TEST_INTERRUPT")?
+        .to_string()
+        .parse::<i32>()
+        .ok()
+        .filter(|&signal| signal > 0)
+}
+
 #[cfg(test)]
 mod tests;
 

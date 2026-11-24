@@ -23,12 +23,14 @@ mod execution;
 mod instrumentation;
 mod junit;
 mod measurements;
+mod memcheck;
 mod reporting;
 mod runner;
 mod schedule;
 mod script;
 mod selection;
 mod state;
+mod timeout;
 
 #[cfg(test)]
 mod tests;
