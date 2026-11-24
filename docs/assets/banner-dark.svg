@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 148" width="640" height="148" role="img" aria-label="Rcmake — Native Rust drop-in replacement for CMake 4.5.1">
+  <title>Rcmake</title>
+  <g transform="translate(24, 14) scale(0.94)">
+    <path d="M61.5 14 L14 98 L51.5 76.5 L51.5 57.5 L61.5 51.7 Z" fill="#E35D34"/>
+    <path d="M66.5 14 L114 98 L76.5 76.5 L76.5 57.5 L66.5 51.7 Z" fill="#5393F8"/>
+    <path d="M18.5 103 L54 82.5 L64 88.3 L74 82.5 L109.5 103 L106.5 107 L21.5 107 Z" fill="#586375"/>
+  </g>
+  <text x="164" y="82" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Inter, Helvetica, Arial, sans-serif" font-size="60" font-weight="750" letter-spacing="-0.03em" fill="#F8FAFC">Rcmake</text>
+  <text x="166" y="114" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Inter, Helvetica, Arial, sans-serif" font-size="18" font-weight="400" fill="#94A3B8">Native Rust drop-in replacement for CMake 4.5.1</text>
+</svg>
