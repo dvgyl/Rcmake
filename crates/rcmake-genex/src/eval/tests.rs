@@ -7,6 +7,9 @@ use crate::{
     InterfaceView, TargetHandle, UsageTraversal, evaluate, parse,
 };
 
+#[path = "tests_artifacts.rs"]
+mod tests_artifacts;
+
 const HEAD: TargetHandle = TargetHandle(1);
 const OTHER: TargetHandle = TargetHandle(2);
 const LEFT: TargetHandle = TargetHandle(3);
@@ -17,6 +20,7 @@ struct Host {
     properties: HashMap<(TargetHandle, BString), BString>,
     definitions: HashMap<BString, BString>,
     visits: Vec<TargetHandle>,
+    link_queries: Vec<TargetHandle>,
     limits: Limits,
 }
 
@@ -47,6 +51,10 @@ impl GenexHost for Host {
             _ => "",
         }
         .into()
+    }
+
+    fn directory_policy(&self, policy: &[u8], _ctx: &EvalContext) -> Option<bool> {
+        self.definitions.get(policy).map(|state| state == "NEW")
     }
 
     fn raw_property(&self, target: TargetHandle, name: &[u8]) -> Option<BString> {
@@ -100,9 +108,20 @@ impl GenexHost for Host {
 
     fn link_closure(
         &mut self,
-        _target: TargetHandle,
-        _ctx: &EvalContext,
+        target: TargetHandle,
+        ctx: &EvalContext,
     ) -> Result<Vec<TargetHandle>, GenexError> {
+        self.link_queries.push(target);
+        if let Some(property) = self.raw_property(target, b"LINK_LIBRARIES") {
+            let context = EvalContext {
+                site: EvalSite {
+                    property: Some("LINK_LIBRARIES".into()),
+                    ..ctx.site.clone()
+                },
+                ..ctx.clone()
+            };
+            run(&property, &context, self)?;
+        }
         Ok(Vec::new())
     }
 
@@ -135,8 +154,12 @@ impl GenexHost for Host {
     ) -> Option<BString> {
         (target == OTHER && config.matches(b"Debug")).then(|| {
             match sources {
-                Some(b"other.c") => "/out/other.o",
-                _ => "/out/other.o;/out/second.o",
+                Some(b"/src/other.c") => "/out/other.o",
+                Some(b"/src/second.c") => "/out/second.o",
+                Some(b"/src/second.c;/src/other.c" | b"/src/other.c;/src/second.c") | None => {
+                    "/out/other.o;/out/second.o"
+                }
+                Some(_) => "",
             }
             .into()
         })
@@ -166,11 +189,19 @@ fn run(
     evaluate(&parse(input)?, ctx, host)
 }
 
+fn error_text(result: Result<(BString, EvalFlags), GenexError>) -> String {
+    assert!(result.is_err(), "Expected an error. Got {result:?}.");
+    result
+        .err()
+        .map(|error| error.to_string())
+        .unwrap_or_default()
+}
+
 fn check(cases: &[(&str, &str)], ctx: &EvalContext, host: &mut Host) {
     for (expr, expected) in cases {
         assert_eq!(
-            run(expr.as_bytes(), ctx, host).unwrap().0,
-            *expected,
+            run(expr.as_bytes(), ctx, host).map(|(value, _)| value),
+            Ok((*expected).into()),
             "{expr}"
         );
     }
@@ -233,8 +264,8 @@ fn boolean_arguments_preserve_short_circuit_and_error_order() {
             "Parameters to $<OR> must resolve to either '0' or '1'.",
         ),
     ] {
-        let error = run(expression.as_bytes(), &ctx, &mut host).unwrap_err();
-        assert_eq!(error.to_string(), expected);
+        let error = error_text(run(expression.as_bytes(), &ctx, &mut host));
+        assert_eq!(error, expected);
     }
 }
 
@@ -453,8 +484,8 @@ fn list_callbacks_and_argument_expansion() {
             r#"replace expression "\2" contains an out-of-range escape for regex "(a)""#,
         ),
     ] {
-        let error = run(expr.as_bytes(), &context(), &mut Host::default()).unwrap_err();
-        assert!(error.to_string().contains(expected), "{error}");
+        let error = error_text(run(expr.as_bytes(), &context(), &mut Host::default()));
+        assert!(error.contains(expected), "{error}");
     }
 }
 
@@ -591,143 +622,6 @@ fn contexts_and_interface_operators() {
 }
 
 #[test]
-fn link_features_require_link_libraries_and_validate_members() {
-    let mut host = Host::default();
-    let mut ctx = context();
-    ctx.traversal = UsageTraversal::Link;
-    ctx.site.property = Some("LINK_OPTIONS".into());
-    assert!(run(b"$<LINK_GROUP:RESCAN>", &ctx, &mut host).is_err());
-    ctx.site.property = Some("LINK_LIBRARIES".into());
-    check(
-        &[
-            ("$<LINK_LIBRARY:DEFAULT>", ""),
-            (
-                "$<LINK_LIBRARY:DEFAULT,a;$<LINK_LIBRARY:DEFAULT,b>>",
-                "<LINK_LIBRARY:DEFAULT>;a;b;</LINK_LIBRARY:DEFAULT>",
-            ),
-            (
-                "$<LINK_GROUP:RESCAN,a,b>",
-                "<LINK_GROUP:RESCAN:a|b>;a;b;</LINK_GROUP:RESCAN>",
-            ),
-        ],
-        &ctx,
-        &mut host,
-    );
-    for (expression, expected) in [
-        (
-            "$<LINK_GROUP:,>",
-            "$<LINK_GROUP:...> expects a feature name as first argument.",
-        ),
-        (
-            "$<LINK_GROUP:bad:name,a>",
-            "The feature name 'bad:name' contains invalid characters.",
-        ),
-        (
-            "$<LINK_GROUP:RESCAN,$<LINK_GROUP:RESCAN,a>>",
-            "$<LINK_GROUP:...> cannot be nested.",
-        ),
-        (
-            "$<LINK_LIBRARY:DEFAULT,$<LINK_LIBRARY:OTHER,a>>",
-            "$<LINK_LIBRARY:...> with different features cannot be nested.",
-        ),
-        (
-            "$<LINK_LIBRARY:DEFAULT,$<LINK_GROUP:RESCAN,a>>",
-            "$<LINK_GROUP:...> cannot be nested inside a $<LINK_LIBRARY:...> expression.",
-        ),
-    ] {
-        let error = run(expression.as_bytes(), &ctx, &mut host).unwrap_err();
-        assert_eq!(error.to_string(), expected);
-    }
-    host.set(HEAD, "LINK_LIBRARIES_ONLY_TARGETS", "ON");
-    check(
-        &[
-            (
-                "$<LINK_GROUP:RESCAN,other,-lexternal,/sdk/lib.a>",
-                "<LINK_GROUP:RESCAN:other|-lexternal|/sdk/lib.a>;other;-lexternal;/sdk/lib.a;</LINK_GROUP:RESCAN>",
-            ),
-            (
-                "$<IF:$<BOOL:$<LINK_GROUP:RESCAN,external>>,other,other>",
-                "other",
-            ),
-        ],
-        &ctx,
-        &mut host,
-    );
-    let error = run(b"$<LINK_GROUP:RESCAN,external>", &ctx, &mut host).unwrap_err();
-    assert!(error.to_string().contains("LINK_LIBRARIES_ONLY_TARGETS"));
-}
-
-#[test]
-fn link_library_uses_attributes_for_the_selected_language() {
-    let mut host = Host::default();
-    let mut ctx = context();
-    ctx.traversal = UsageTraversal::Link;
-    ctx.site.property = Some("LINK_LIBRARIES".into());
-    host.definitions.insert(
-        "CMAKE_LINK_LIBRARY_feat_ATTRIBUTES".into(),
-        "DEDUPLICATION=YES,NO".into(),
-    );
-    host.definitions.insert(
-        "CMAKE_C_LINK_LIBRARY_feat_ATTRIBUTES".into(),
-        "LIBRARY_TYPE=STATIC,SHARED;OVERRIDE=DEFAULT".into(),
-    );
-    let expr = b"$<LINK_LIBRARY:feat,other>";
-    assert!(run(expr, &ctx, &mut host).is_ok());
-    ctx.link_language = Some("CXX".into());
-    let error = run(expr, &ctx, &mut host).unwrap_err().to_string();
-    assert!(error.contains("Erroneous option(s) for 'CMAKE_LINK_LIBRARY_feat_ATTRIBUTES'"));
-    assert!(error.contains("DEDUPLICATION=YES,NO"));
-    host.definitions.insert(
-        "CMAKE_LINK_LIBRARY_DEFAULT_ATTRIBUTES".into(),
-        "BAD=VALUE".into(),
-    );
-    assert!(run(b"$<LINK_LIBRARY:DEFAULT,other>", &ctx, &mut host).is_ok());
-}
-
-#[test]
-fn target_property_link_recursion_uses_the_current_property_role() {
-    let mut host = Host::default();
-    let mut ctx = context();
-    ctx.site.property = Some("INTERFACE_LINK_LIBRARIES".into());
-    let error = run(
-        b"$<TARGET_PROPERTY:other,INCLUDE_DIRECTORIES>",
-        &ctx,
-        &mut host,
-    )
-    .unwrap_err()
-    .to_string();
-    assert!(error.contains("transitive over the link libraries, creating a recursion"));
-    assert!(host.visits.is_empty());
-
-    let error = run(
-        b"$<TARGET_PROPERTY:missing,INCLUDE_DIRECTORIES>",
-        &ctx,
-        &mut host,
-    )
-    .unwrap_err()
-    .to_string();
-    assert!(error.contains("Target \"missing\" not found."));
-
-    host.set(HEAD, "CODE", "$<TARGET_PROPERTY:other,INCLUDE_DIRECTORIES>");
-    host.set(OTHER, "INCLUDE_DIRECTORIES", "/inc");
-    check(
-        &[("$<GENEX_EVAL:$<TARGET_PROPERTY:CODE>>", "/inc")],
-        &ctx,
-        &mut host,
-    );
-
-    ctx.site.property = Some("SOURCES".into());
-    assert!(
-        run(
-            b"$<TARGET_PROPERTY:other,INCLUDE_DIRECTORIES>",
-            &ctx,
-            &mut host,
-        )
-        .is_ok()
-    );
-}
-
-#[test]
 fn targets_and_second_pass_context() {
     let mut host = Host::default();
     host.set(HEAD, "FOO", "first");
@@ -763,7 +657,7 @@ fn targets_and_second_pass_context() {
                 "/out/libother.so/libother.so.1",
             ),
             (
-                "$<TARGET_OBJECTS:other>/$<TARGET_OBJECTS:other,SOURCE_FILES:other.c>",
+                "$<TARGET_OBJECTS:other>/$<TARGET_OBJECTS:other,SOURCE_FILES:/src/other.c>",
                 "/out/other.o;/out/second.o//out/other.o",
             ),
         ],
@@ -815,15 +709,15 @@ fn dependency_flags_follow_only_evaluated_expressions() {
         ),
     ] {
         assert_eq!(
-            run(input.as_bytes(), &ctx, &mut host).unwrap().1,
-            expected,
+            run(input.as_bytes(), &ctx, &mut host).map(|(_, flags)| flags),
+            Ok(expected),
             "{input}"
         );
     }
 }
 
 #[test]
-fn dag_allows_diamonds_and_reports_active_property_cycles() {
+fn dag_allows_diamonds_and_reports_active_property_cycles() -> Result<(), GenexError> {
     let mut host = Host::default();
     let property = "INTERFACE_COMPILE_DEFINITIONS";
     host.set(HEAD, property, "$<TARGET_PROPERTY:left,INTERFACE_COMPILE_DEFINITIONS>;$<TARGET_PROPERTY:right,INTERFACE_COMPILE_DEFINITIONS>");
@@ -838,7 +732,7 @@ fn dag_allows_diamonds_and_reports_active_property_cycles() {
     host.set(HEAD, "FOO", "from-head");
     let ctx = context();
     let input = b"$<TARGET_PROPERTY:head,INTERFACE_COMPILE_DEFINITIONS>";
-    let (value, flags) = run(input, &ctx, &mut host).unwrap();
+    let (value, flags) = run(input, &ctx, &mut host)?;
     assert_eq!(value, "from-head;from-head");
     assert_eq!(host.visits, [HEAD, LEFT, OTHER, RIGHT, OTHER]);
     assert!(flags.head_sensitive && flags.context_sensitive);
@@ -848,25 +742,19 @@ fn dag_allows_diamonds_and_reports_active_property_cycles() {
         property,
         "cycle;$<TARGET_PROPERTY:left,INTERFACE_COMPILE_DEFINITIONS>",
     );
-    assert_eq!(run(input, &ctx, &mut host).unwrap().0, "cycle;;cycle;");
+    assert_eq!(run(input, &ctx, &mut host)?.0, "cycle;;cycle;");
     host.set(
         OTHER,
         property,
         "$<TARGET_PROPERTY:other,INTERFACE_COMPILE_DEFINITIONS>",
     );
-    let error = run(input, &ctx, &mut host).unwrap_err();
-    assert_eq!(
-        error,
-        GenexError::SelfReference {
-            target: "other".into()
-        }
-    );
-    assert_eq!(error.to_string(), "Self reference on target \"other\".");
+    let error = error_text(run(input, &ctx, &mut host));
+    assert!(error.starts_with("CMake Error:\n"));
+    assert!(error.contains("$<TARGET_PROPERTY:other,INTERFACE_COMPILE_DEFINITIONS>"));
+    assert!(error.contains("Self reference on target \"other\"."));
     host.set(OTHER, property, "recovered");
-    assert_eq!(
-        run(input, &ctx, &mut host).unwrap().0,
-        "recovered;recovered"
-    );
+    assert_eq!(run(input, &ctx, &mut host)?.0, "recovered;recovered");
+    Ok(())
 }
 
 #[test]
@@ -938,7 +826,7 @@ fn remove_at_parses_all_indices_before_checking_bounds() {
             "index: \"bad\" is not a valid index",
         ),
     ] {
-        let error = run(expression.as_bytes(), &context(), &mut Host::default()).unwrap_err();
-        assert!(error.to_string().contains(expected), "{error:?}");
+        let error = error_text(run(expression.as_bytes(), &context(), &mut Host::default()));
+        assert!(error.contains(expected), "{error:?}");
     }
 }

@@ -7,18 +7,18 @@ use super::{
 };
 use crate::{EvalContext, GenexError, TargetHandle, parse};
 
+const HEAD_PROPERTY_REQUIRED: &str = "$<TARGET_PROPERTY:prop> may only be used with binary targets.  It may not be used with add_custom_command or add_custom_target.  Specify the target to read a property from using the $<TARGET_PROPERTY:tgt,prop> signature instead.";
+
 impl Evaluator<'_> {
     /// Check target property arguments before the evaluator reads the property.
     pub(super) fn validate_target_property_arguments(
-        &mut self,
+        &self,
         call: Call<'_>,
         arguments: &[BString],
     ) -> Result<(), GenexError> {
         let message = match arguments {
             [] => "$<TARGET_PROPERTY> expression requires at least one parameter.",
-            [_] if call.ctx.head.is_none() => {
-                "$<TARGET_PROPERTY:prop> may only be used with binary targets.  It may not be used with add_custom_command or add_custom_target.  Specify the target to read a property from using the $<TARGET_PROPERTY:tgt,prop> signature instead."
-            }
+            [_] if call.ctx.head.is_none() => HEAD_PROPERTY_REQUIRED,
             [target, property] if target.is_empty() => {
                 if property.is_empty() {
                     "$<TARGET_PROPERTY:tgt,prop> expression requires a non-empty target name and property name."
@@ -26,46 +26,132 @@ impl Evaluator<'_> {
                     "$<TARGET_PROPERTY:tgt,prop> expression requires a non-empty target name."
                 }
             }
-            [target, property]
-                if !valid_target(target) && (property.is_empty() || !valid_property(property)) =>
-            {
-                "Target name and property name not supported."
-            }
-            [property] | [_, property] => {
-                return self.check_target_property_link_recursion(call, arguments, property);
-            }
+            [_] | [_, _] => return Ok(()),
             _ => "$<TARGET_PROPERTY:...> expression requires one or two parameters",
         };
         Err(call.error(message))
     }
 
-    fn check_target_property_link_recursion(
-        &mut self,
-        call: Call<'_>,
-        arguments: &[BString],
-        property: &[u8],
-    ) -> Result<(), GenexError> {
-        // The site names the link entry when a usage walk evaluates its links.
-        if self.in_target_expression
-            || !call
+    pub(super) fn property(&mut self, call: Call<'_>) -> Value {
+        let arguments = self.arguments(call)?;
+        let (target, property) = match arguments.as_slice() {
+            [property] => {
+                self.flags.head_sensitive = true;
+                let Some(target) = call.ctx.head else {
+                    return Err(call.error(HEAD_PROPERTY_REQUIRED));
+                };
+                if call
+                    .ctx
+                    .site
+                    .backtrace
+                    .top()
+                    .and_then(|frame| frame.name.as_deref())
+                    .is_some_and(|name| name.eq_ignore_ascii_case(b"add_custom_target"))
+                    && self
+                        .host
+                        .raw_property(target, b"TYPE")
+                        .is_some_and(|kind| kind == "UTILITY")
+                {
+                    return Err(call.error(HEAD_PROPERTY_REQUIRED));
+                }
+                (target, property)
+            }
+            [name, property] => {
+                if !valid_target(name) {
+                    let message = if property.is_empty() || !valid_property(property) {
+                        "Target name and property name not supported."
+                    } else {
+                        "Target name not supported."
+                    };
+                    return Err(call.error(message));
+                }
+                let target = self.require_target(call, name)?;
+                if let Some(value) = self.host.alias_property(name, property, call.ctx) {
+                    return Ok(value);
+                }
+                (target, property)
+            }
+            _ => {
+                return Err(
+                    call.error("$<TARGET_PROPERTY:...> expression requires one or two parameters")
+                );
+            }
+        };
+        if property.is_empty() {
+            return Err(
+                call.error("$<TARGET_PROPERTY:...> expression requires a non-empty property name.")
+            );
+        }
+        validate_property(call, property)?;
+
+        let link_evaluation = !self.in_target_expression
+            && call
                 .ctx
                 .site
                 .property
                 .as_ref()
-                .is_some_and(|property| is_link_libraries_property(property))
-            || !requires_link_closure(property)
-        {
-            return Ok(());
+                .is_some_and(|name| is_link_libraries_property(name));
+        let built_in = requires_link_closure(property);
+        if link_evaluation && built_in {
+            return Err(call.error(
+                "$<TARGET_PROPERTY:...> expression in link libraries evaluation depends on target property which is transitive over the link libraries, creating a recursion.",
+            ));
         }
-        if let [name, _] = arguments {
-            if !valid_target(name) {
-                return Ok(());
+        let link_list = matches!(
+            property.as_slice(),
+            b"LINK_LIBRARIES" | b"INTERFACE_LINK_LIBRARIES"
+        );
+        let transitive = if link_list {
+            self.host.directory_policy(b"CMP0189", call.ctx) != Some(false)
+        } else {
+            built_in || (!link_evaluation && self.custom_transitive(target, property))
+        };
+        if !transitive {
+            let view = self.host.scalar_property(target, property, call.ctx)?;
+            self.flags = self.flags.union(view.flags);
+            return Ok(view.value);
+        }
+
+        let _active = match DAGChecker::enter(
+            Some(target),
+            FrameKind::Property,
+            property,
+            self.limits.max_recursion,
+        )? {
+            DAGEntry::Entered(active) => active,
+            DAGEntry::SelfReference
+                if call.ctx.site.property.is_none()
+                    || (call.ctx.current == Some(target)
+                        && call.ctx.site.property.as_ref() == Some(property)) =>
+            {
+                let error = call.error(self.self_reference(Some(target)).to_string());
+                return Err(if link_list {
+                    error
+                } else {
+                    error.without_location()
+                });
             }
-            self.require_target(call, name)?;
-        }
-        Err(call.error(
-            "$<TARGET_PROPERTY:...> expression in link libraries evaluation depends on target property which is transitive over the link libraries, creating a recursion.",
-        ))
+            DAGEntry::SelfReference | DAGEntry::CyclicReference => return Ok(BString::default()),
+        };
+        let context = EvalContext {
+            head: call.ctx.head.or(Some(target)),
+            current: Some(target),
+            ..call.ctx.clone()
+        };
+        let view = self.host.transitive_property(target, property, &context)?;
+        self.flags = self.flags.union(view.flags);
+        Ok(view.value)
+    }
+
+    fn custom_transitive(&self, target: TargetHandle, property: &[u8]) -> bool {
+        let base = property.strip_prefix(b"INTERFACE_").unwrap_or(property);
+        [
+            b"TRANSITIVE_COMPILE_PROPERTIES".as_slice(),
+            b"TRANSITIVE_LINK_PROPERTIES",
+        ]
+        .iter()
+        .filter_map(|key| self.host.raw_property(target, key))
+        .any(|names| list::iter(&names, list::Empty::Drop).any(|name| name.as_ref() == base))
     }
 
     pub(super) fn scoped_property(&mut self, call: Call<'_>) -> Value {

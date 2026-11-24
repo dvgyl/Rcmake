@@ -1,14 +1,15 @@
-use std::{cell::RefCell, rc::Rc};
+use std::{cell::RefCell, collections::HashSet, rc::Rc};
 
-use rcmake_base::{BString, list};
+use rcmake_base::{BString, list, path_lex::Lexical, truth};
 
 use super::{Call, Evaluator, Value, boolean, unknown};
-use crate::{ArtifactKind, ArtifactPart, EvalContext, GenexError, TargetHandle};
+use crate::{ArtifactKind, ArtifactPart, EvalContext, GenexError, TargetHandle, UsageTraversal};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum FrameKind {
     Property,
     Expression,
+    RuntimeDlls,
 }
 
 struct PropertyFrame {
@@ -39,7 +40,10 @@ impl DAGChecker {
         let property = ctx.site.property.as_ref()?;
         ACTIVE.with(|active| {
             let parent = active.borrow().clone();
-            if parent.is_some() {
+            if parent
+                .as_ref()
+                .is_some_and(|frame| frame.kind != FrameKind::RuntimeDlls)
+            {
                 return None;
             }
             active.replace(Some(Rc::new(PropertyFrame {
@@ -47,8 +51,8 @@ impl DAGChecker {
                 kind: FrameKind::Property,
                 key: property.clone(),
                 expression: None,
-                depth: 1,
-                parent: None,
+                depth: parent.as_ref().map_or(1, |frame| frame.depth + 1),
+                parent: parent.clone(),
             })));
             Some(Self(parent))
         })
@@ -119,11 +123,15 @@ impl DAGChecker {
     pub(super) fn root_property() -> Option<BString> {
         ACTIVE.with(|active| {
             let active = active.borrow();
-            let mut frame = active.as_deref()?;
-            while let Some(parent) = frame.parent.as_deref() {
-                frame = parent;
+            let mut frame = active.as_deref();
+            let mut property = None;
+            while let Some(entry) = frame {
+                if entry.kind == FrameKind::Property {
+                    property = Some(&entry.key);
+                }
+                frame = entry.parent.as_deref();
             }
-            (frame.kind == FrameKind::Property).then(|| frame.key.clone())
+            property.cloned()
         })
     }
 
@@ -183,6 +191,7 @@ impl Evaluator<'_> {
             b"TARGET_POLICY" => self.policy(call),
             b"TARGET_PROPERTY" => self.property(call),
             b"TARGET_OBJECTS" => self.objects(call),
+            b"TARGET_RUNTIME_DLLS" | b"TARGET_RUNTIME_DLL_DIRS" => self.runtime_dlls(call),
             b"TARGET_INTERMEDIATE_DIR" => {
                 let [name] = self.fixed(call)?;
                 if !valid_target(&name) {
@@ -211,9 +220,11 @@ impl Evaluator<'_> {
                     b"TARGET_PROPERTY" | b"TARGET_INTERMEDIATE_DIR" => {
                         format!("Target \"{name}\" not found.")
                     }
-                    b"TARGET_OBJECTS" => format!(
-                        "Objects of target \"{name}\" referenced but no such target exists."
-                    ),
+                    b"TARGET_OBJECTS" | b"TARGET_RUNTIME_DLLS" | b"TARGET_RUNTIME_DLL_DIRS" => {
+                        format!(
+                            "Objects of target \"{name}\" referenced but no such target exists."
+                        )
+                    }
                     _ => format!("No target \"{name}\""),
                 })
             })
@@ -302,165 +313,386 @@ impl Evaluator<'_> {
         Ok(list::join(list::split(&evaluated, list::Empty::Drop)))
     }
 
-    fn property(&mut self, call: Call<'_>) -> Value {
-        let arguments = self.arguments(call)?;
-        let (target, property) = match arguments.as_slice() {
-            [property] => {
-                self.flags.head_sensitive = true;
-                let target = call.ctx.head.ok_or_else(|| call.error(
-                    "$<TARGET_PROPERTY:prop> may only be used with binary targets. It may not be used with add_custom_command or add_custom_target. Specify the target to read a property from using the $<TARGET_PROPERTY:tgt,prop> signature instead.",
-                ))?;
-                (target, property)
-            }
-            [name, property] => {
-                if name.is_empty() {
-                    return Err(call.error(
-                        "$<TARGET_PROPERTY:...> expression requires a non-empty target name.",
-                    ));
-                }
-                if !valid_target(name) {
-                    return Err(call.error("Target name not supported."));
-                }
-                if let Some(value) = self.host.alias_property(name, property, call.ctx) {
-                    self.flags.context_sensitive = true;
-                    return Ok(value);
-                }
-                (self.require_target(call, name)?, property)
-            }
-            _ => {
-                return Err(
-                    call.error("$<TARGET_PROPERTY> expression requires one or two parameters.")
-                );
-            }
-        };
-        if property.is_empty() {
-            return Err(
-                call.error("$<TARGET_PROPERTY:...> expression requires a non-empty property name.")
-            );
-        }
-        if !property
-            .iter()
-            .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
-        {
-            return Err(call.error("Property name not supported."));
-        }
-        if !self.transitive(target, property) {
-            let view = self.host.scalar_property(target, property, call.ctx)?;
-            self.flags = self.flags.union(view.flags);
-            return Ok(view.value);
-        }
-
-        let limit = self.limits.max_recursion;
-        let _active = match DAGChecker::enter(Some(target), FrameKind::Property, property, limit)? {
-            DAGEntry::Entered(active) => active,
-            DAGEntry::SelfReference
-                if call.ctx.site.property.is_none()
-                    || (call.ctx.current == Some(target)
-                        && call.ctx.site.property.as_ref() == Some(property)) =>
-            {
-                let error = self.self_reference(Some(target));
-                return Err(if call.ctx.site.backtrace.is_empty() {
-                    error
-                } else {
-                    call.error(error.to_string())
-                });
-            }
-            DAGEntry::SelfReference | DAGEntry::CyclicReference => return Ok(BString::default()),
-        };
-        let view = self.host.transitive_property(target, property, call.ctx)?;
-        self.flags = self.flags.union(view.flags);
-        Ok(view.value)
-    }
-
     pub(super) fn self_reference(&self, target: Option<TargetHandle>) -> GenexError {
         GenexError::SelfReference {
             target: target.map_or_else(BString::default, |target| self.host.target_name(target)),
         }
     }
 
-    fn transitive(&self, target: TargetHandle, property: &[u8]) -> bool {
-        let base = property.strip_prefix(b"INTERFACE_").unwrap_or(property);
-        matches!(
-            base,
-            b"AUTOMOC_MACRO_NAMES"
-                | b"AUTOUIC_OPTIONS"
-                | b"COMPILE_DEFINITIONS"
-                | b"COMPILE_FEATURES"
-                | b"COMPILE_OPTIONS"
-                | b"INCLUDE_DIRECTORIES"
-                | b"LINK_DEPENDS"
-                | b"LINK_DIRECTORIES"
-                | b"LINK_LIBRARIES"
-                | b"LINK_LIBRARIES_DIRECT"
-                | b"LINK_LIBRARIES_DIRECT_EXCLUDE"
-                | b"LINK_OPTIONS"
-                | b"LINK_WRAPPER"
-                | b"PRECOMPILE_HEADERS"
-                | b"SOURCES"
-                | b"SYSTEM_INCLUDE_DIRECTORIES"
-        ) || [
-            b"TRANSITIVE_COMPILE_PROPERTIES".as_slice(),
-            b"TRANSITIVE_LINK_PROPERTIES",
-        ]
-        .iter()
-        .filter_map(|key| self.host.raw_property(target, key))
-        .any(|names| {
-            list::split(&names, list::Empty::Drop)
-                .iter()
-                .any(|name| name == base)
-        })
-    }
-
     fn artifact(&mut self, call: Call<'_>) -> Value {
         let Some((kind, part)) = artifact_operator(call.name) else {
             return Err(unknown(call));
         };
+        let operator = BString::from(call.name);
         let args = self.arguments(call)?;
-        let (name, exclude_postfix) = match args.as_slice() {
-            [name] => (name, false),
-            [name, postfix] if part == ArtifactPart::BaseName => match postfix.as_slice() {
-                b"POSTFIX:INCLUDE" => (name, false),
-                b"POSTFIX:EXCLUDE" => (name, true),
-                _ => return Err(call.error("The POSTFIX option must be INCLUDE or EXCLUDE.")),
-            },
+        let (name, postfix) = match (part, args.as_slice()) {
+            (_, [name]) => (name, None),
+            (ArtifactPart::BaseName, [name, postfix]) => (name, Some(postfix)),
+            (ArtifactPart::BaseName, []) => {
+                return Err(call.error(format!(
+                    "$<{operator}> expression requires at least one parameter."
+                )));
+            }
+            (ArtifactPart::BaseName, _) => {
+                return Err(call.error("Unexpected parameters, require one or two parameters."));
+            }
             _ => return Err(call.arity(1)),
         };
+        if !valid_target(name) {
+            return Err(call.error("Expression syntax not recognized."));
+        }
         let target = self.require_target(call, name)?;
-        let config = &call.ctx.config;
-        let value = if exclude_postfix {
-            self.host
-                .artifact_base_name_without_postfix(target, kind, config)
-        } else {
-            self.host.checked_artifact(target, kind, part, config)?
+        let target_type = self.host.raw_property(target, b"TYPE");
+        let target_type = target_type.as_ref().map(|kind| kind.as_slice());
+        let diagnostic_operator = artifact_diagnostic_operator(call.name, kind, part);
+        self.validate_artifact(call, name, target, target_type, kind, &diagnostic_operator)?;
+
+        let exclude_postfix = match postfix.map(|value| value.as_slice()) {
+            None | Some(b"POSTFIX:INCLUDE") => false,
+            Some(b"POSTFIX:EXCLUDE") => true,
+            Some(_) => {
+                return Err(call.error(
+                    "Wrong second parameter: \"POSTFIX:INCLUDE\" or \"POSTFIX:EXCLUDE\" is expected",
+                ));
+            }
         };
-        value.ok_or_else(|| {
-            call.error(format!(
-                "Target \"{name}\" has no artifact for $<{}>.",
-                BString::from(call.name)
-            ))
-        })
+        let config = &call.ctx.config;
+        let read_part = |kind| {
+            if exclude_postfix {
+                // Check evaluation errors before stripping the postfix.
+                self.host.checked_artifact(target, kind, part, config)?;
+                Ok(self
+                    .host
+                    .artifact_base_name_without_postfix(target, kind, config))
+            } else {
+                self.host.checked_artifact(target, kind, part, config)
+            }
+        };
+        let mut value = read_part(kind)?;
+        if value.is_none()
+            && ((matches!(
+                kind,
+                ArtifactKind::LinkerFile | ArtifactKind::LinkerLibraryFile
+            ) && target_type == Some(b"MODULE_LIBRARY"))
+                || (kind == ArtifactKind::SonameFile && self.target_option(target, b"NO_SONAME")))
+        {
+            value = read_part(ArtifactKind::File)?;
+        }
+        if value.is_none()
+            && kind == ArtifactKind::SonameFile
+            && self.target_option(target, b"IMPORTED")
+            && let Some(dir) =
+                self.host
+                    .checked_artifact(target, ArtifactKind::File, ArtifactPart::Dir, config)?
+        {
+            return Ok(match part {
+                ArtifactPart::Full => [dir.as_slice(), b"/"].concat().into(),
+                ArtifactPart::Name => BString::default(),
+                ArtifactPart::Dir => Lexical::new(&dir).parent().into(),
+                _ => BString::default(),
+            });
+        }
+        if let Some(value) = value {
+            return Ok(value);
+        }
+        match kind {
+            ArtifactKind::ImportFile
+            | ArtifactKind::LinkerImportFile
+            | ArtifactKind::SonameImportFile => Ok(BString::default()),
+            ArtifactKind::PdbFile => Err(call.error(format!(
+                "{diagnostic_operator} is not supported by the target linker."
+            ))),
+            ArtifactKind::BundleDir | ArtifactKind::BundleContentDir => {
+                Err(call.error(format!("{operator} is allowed only for Bundle targets.")))
+            }
+            _ => Err(call.error(format!(
+                "Target \"{name}\" has no artifact for $<{operator}>."
+            ))),
+        }
+    }
+
+    fn validate_artifact(
+        &self,
+        call: Call<'_>,
+        name: &BString,
+        target: TargetHandle,
+        target_type: Option<&[u8]>,
+        kind: ArtifactKind,
+        operator: &BString,
+    ) -> Result<(), GenexError> {
+        use ArtifactKind::*;
+        if target_type.is_some_and(|kind| {
+            !matches!(
+                kind,
+                b"EXECUTABLE"
+                    | b"STATIC_LIBRARY"
+                    | b"SHARED_LIBRARY"
+                    | b"MODULE_LIBRARY"
+                    | b"UNKNOWN_LIBRARY"
+            )
+        }) {
+            return Err(call.error(format!(
+                "Target \"{name}\" is not an executable or library."
+            )));
+        }
+        let message = match kind {
+            PdbFile | BundleDir | BundleContentDir if self.target_option(target, b"IMPORTED") => {
+                "not allowed for IMPORTED targets."
+            }
+            LinkerFile | LinkerImportFile
+                if target_type == Some(b"EXECUTABLE")
+                    && !self.target_option(target, b"ENABLE_EXPORTS") =>
+            {
+                "is allowed only for libraries and executables with ENABLE_EXPORTS."
+            }
+            LinkerLibraryFile if target_type == Some(b"EXECUTABLE") => {
+                "is allowed only for libraries with ENABLE_EXPORTS."
+            }
+            SonameFile | SonameImportFile
+                if target_type.is_some_and(|kind| kind != b"SHARED_LIBRARY") =>
+            {
+                "is allowed only for SHARED libraries."
+            }
+            PdbFile => {
+                let language = self
+                    .host
+                    .raw_property(target, b"LINKER_LANGUAGE")
+                    .or_else(|| {
+                        call.ctx
+                            .link_language
+                            .clone()
+                            .filter(|_| call.ctx.current == Some(target))
+                    });
+                let supported = language.as_ref().and_then(|language| {
+                    self.host
+                        .definition(format!("CMAKE_{language}_LINKER_SUPPORTS_PDB").as_bytes())
+                });
+                if supported
+                    .as_ref()
+                    .map_or_else(|| !self.dll_platform(), |value| !truth::is_on(value))
+                {
+                    "is not supported by the target linker."
+                } else if target_type == Some(b"STATIC_LIBRARY") {
+                    "is allowed only for targets with linker created artifacts."
+                } else {
+                    return Ok(());
+                }
+            }
+            _ => return Ok(()),
+        };
+        Err(call.error(format!("{operator} {message}")))
+    }
+
+    fn target_option(&self, target: TargetHandle, name: &[u8]) -> bool {
+        self.host
+            .raw_property(target, name)
+            .is_some_and(|value| truth::is_on(&value))
+    }
+
+    fn dll_platform(&self) -> bool {
+        self.host
+            .definition(b"CMAKE_SYSTEM_NAME")
+            .is_some_and(|system| {
+                system.starts_with(b"Windows") || matches!(system.as_slice(), b"CYGWIN" | b"MSYS")
+            })
+    }
+
+    fn runtime_dlls(&mut self, call: Call<'_>) -> Value {
+        let [name] = self.fixed(call)?;
+        let target = self.require_target(call, &name)?;
+        if self.host.raw_property(target, b"TYPE").is_some_and(|kind| {
+            !matches!(
+                kind.as_slice(),
+                b"EXECUTABLE" | b"SHARED_LIBRARY" | b"MODULE_LIBRARY"
+            )
+        }) {
+            return Err(call.error(format!(
+                "Objects of target \"{name}\" referenced but is not one of the allowed target types (EXECUTABLE, SHARED, MODULE)."
+            )));
+        }
+        let _active = match DAGChecker::enter(
+            Some(target),
+            FrameKind::RuntimeDlls,
+            b"",
+            self.limits.max_recursion,
+        )? {
+            DAGEntry::Entered(active) => active,
+            DAGEntry::SelfReference | DAGEntry::CyclicReference => {
+                return Err(GenexError::Message {
+                    expression: BString::default(),
+                    message: format!("The SOURCES of \"{name}\" use a generator expression that depends on the SOURCES themselves.").into(),
+                });
+            }
+        };
+        let ctx = EvalContext {
+            head: Some(target),
+            current: Some(target),
+            traversal: UsageTraversal::Link,
+            ..call.ctx.clone()
+        };
+        // CMake checks link dependencies even when the platform has no DLLs.
+        let targets = self.host.link_closure(target, &ctx)?;
+        if !self.dll_platform() {
+            return Ok(BString::default());
+        }
+        let mut seen = HashSet::new();
+        let mut paths = BString::default();
+        let part = if call.name == b"TARGET_RUNTIME_DLL_DIRS" {
+            ArtifactPart::Dir
+        } else {
+            ArtifactPart::Full
+        };
+        for dependency in targets {
+            if !self
+                .host
+                .raw_property(dependency, b"TYPE")
+                .is_some_and(|kind| kind == "SHARED_LIBRARY")
+            {
+                continue;
+            }
+            let Some(path) =
+                self.host
+                    .checked_artifact(dependency, ArtifactKind::File, part, &ctx.config)?
+            else {
+                continue;
+            };
+            self.charge(path.len().max(1))?;
+            if !path.is_empty() && seen.insert(path.clone()) {
+                if !paths.is_empty() {
+                    self.append(&mut paths, b";")?;
+                }
+                self.append(&mut paths, &path)?;
+            }
+        }
+        Ok(paths)
     }
 
     fn objects(&mut self, call: Call<'_>) -> Value {
         let args = self.arguments(call)?;
-        let (name, sources) = match args.as_slice() {
-            [name] => (name, None),
-            [name, filter] => {
-                let sources = filter
-                    .strip_prefix(b"SOURCE_FILES:")
-                    .ok_or_else(|| call.error("Expected the SOURCE_FILES option."))?;
-                (name, Some(sources))
-            }
-            _ => return Err(call.arity(1)),
+        let [name, options @ ..] = args.as_slice() else {
+            return Err(call.error("$<TARGET_OBJECTS> expression requires at least one parameter."));
         };
         let target = self.require_target(call, name)?;
+        let invalid_type = || {
+            call.error(format!(
+                "Objects of target \"{name}\" referenced but is not one of the allowed target types (EXECUTABLE, STATIC, SHARED, MODULE, OBJECT)."
+            ))
+        };
+        let target_type = self.host.raw_property(target, b"TYPE");
+        if target_type.as_ref().is_some_and(|kind| {
+            !matches!(
+                kind.as_slice(),
+                b"EXECUTABLE"
+                    | b"STATIC_LIBRARY"
+                    | b"SHARED_LIBRARY"
+                    | b"MODULE_LIBRARY"
+                    | b"OBJECT_LIBRARY"
+            )
+        }) {
+            return Err(invalid_type());
+        }
+        let config = &call.ctx.config;
+        let imported = self.target_option(target, b"IMPORTED");
+        if options.is_empty() {
+            if imported
+                && target_type
+                    .as_ref()
+                    .is_some_and(|kind| kind != "OBJECT_LIBRARY")
+            {
+                return Ok(self
+                    .host
+                    .checked_artifact(target, ArtifactKind::File, ArtifactPart::Full, config)?
+                    .unwrap_or_default());
+            }
+            return self
+                .host
+                .target_objects(target, config, None)
+                .ok_or_else(invalid_type);
+        }
+
+        let mut sources = BString::default();
+        for (index, option) in options.iter().enumerate() {
+            let filter = option
+                .strip_prefix(b"SOURCE_FILES:")
+                .ok_or_else(|| call.error(format!("Unrecognized argument:\n\n  {option}")))?;
+            if index != 0 {
+                self.append(&mut sources, b";")?;
+            }
+            self.append(&mut sources, filter)?;
+        }
+        if imported {
+            return Err(call.error(format!(
+                "Cannot use SOURCE_FILES argument on imported target \"{name}\""
+            )));
+        }
+        self.validate_object_sources(call, target, name, &sources)?;
         self.host
-            .target_objects(target, &call.ctx.config, sources)
-            .ok_or_else(|| {
-                call.error(format!(
-                    "Objects of target \"{name}\" referenced but is not one of the allowed target types (EXECUTABLE, STATIC, SHARED, MODULE, OBJECT)."
-                ))
-            })
+            .target_objects(target, config, Some(&sources))
+            .ok_or_else(invalid_type)
+    }
+
+    fn validate_object_sources(
+        &mut self,
+        call: Call<'_>,
+        target: TargetHandle,
+        name: &BString,
+        sources: &[u8],
+    ) -> Result<(), GenexError> {
+        let ctx = EvalContext {
+            head: Some(target),
+            current: Some(target),
+            ..call.ctx.clone()
+        };
+        let invalid_source = |source: &[u8], message: &str| {
+            call.error(format!(
+                "Source file:\n\n  {}\n\n{message}",
+                BString::from(source)
+            ))
+        };
+        let mut filters = Vec::new();
+        list::split_with_empty_input(
+            sources,
+            list::Empty::Keep,
+            list::EmptyInput::OneEmptyElement,
+            &mut filters,
+        );
+        for path in &filters {
+            if !Lexical::new(path).absolute() {
+                return Err(invalid_source(path, "is not an absolute path"));
+            }
+        }
+        let source_dir = self
+            .host
+            .raw_property(target, b"SOURCE_DIR")
+            .unwrap_or_default();
+        let binary_dir = self
+            .host
+            .raw_property(target, b"BINARY_DIR")
+            .unwrap_or_default();
+        let view = self.host.transitive_property(target, b"SOURCES", &ctx)?;
+        self.flags = self.flags.union(view.flags);
+        self.charge(view.value.len())?;
+        let mut known = HashSet::new();
+        for path in list::iter(&view.value, list::Empty::Drop) {
+            for dir in [&source_dir, &binary_dir] {
+                let path = Lexical::new(dir).append(&path);
+                known.insert(Lexical::new(&path).normalize());
+            }
+        }
+        for path in filters {
+            if known.contains(&Lexical::new(&path).normalize()) {
+                continue;
+            }
+            // The host can also supply objects from file sets and generated sources.
+            let value = self.host.target_objects(target, &ctx.config, Some(&path));
+            if value.is_none_or(|objects| objects.is_empty()) {
+                return Err(invalid_source(
+                    &path,
+                    &format!("does not exist for target \"{name}\""),
+                ));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -521,6 +753,20 @@ fn artifact_operator(name: &[u8]) -> Option<(ArtifactKind, ArtifactPart)> {
         };
         Some((kind, part))
     })
+}
+
+fn artifact_diagnostic_operator(name: &[u8], kind: ArtifactKind, part: ArtifactPart) -> BString {
+    if !matches!(
+        kind,
+        ArtifactKind::BundleDir | ArtifactKind::BundleContentDir
+    ) {
+        match part {
+            ArtifactPart::Dir => return name.strip_suffix(b"_DIR").unwrap_or(name).into(),
+            ArtifactPart::Name => return name.strip_suffix(b"_NAME").unwrap_or(name).into(),
+            _ => {}
+        }
+    }
+    name.into()
 }
 
 const TARGET_POLICIES: &[&[u8]] = &[

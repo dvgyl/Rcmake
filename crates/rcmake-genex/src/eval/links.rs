@@ -1,6 +1,9 @@
 use rcmake_base::{BString, list, truth};
 
-use super::{Call, Evaluator, Value, context::link_features_allowed};
+use super::{
+    Call, Evaluator, Value,
+    context::{is_link_libraries_property, link_features_allowed},
+};
 use crate::{EvalContext, GenexError, UsageTraversal};
 
 impl Evaluator<'_> {
@@ -13,7 +16,7 @@ impl Evaluator<'_> {
             )));
         }
         let group = call.name == b"LINK_GROUP";
-        if !link_features_allowed(call.ctx) {
+        if !link_feature_site(call.ctx) {
             let items = if group {
                 "group of link libraries"
             } else {
@@ -96,7 +99,7 @@ impl Evaluator<'_> {
         ctx: &EvalContext,
         value: &[u8],
     ) -> Result<(), GenexError> {
-        if !self.emitted_link_feature || !link_features_allowed(ctx) {
+        if !self.emitted_link_feature || !link_feature_site(ctx) {
             return Ok(());
         }
         let Some(owner) = ctx.current.or(ctx.head) else {
@@ -200,6 +203,16 @@ impl Evaluator<'_> {
         }
         .without_location())
     }
+}
+
+fn link_feature_site(ctx: &EvalContext) -> bool {
+    // A property read can evaluate a link list beneath a different root property.
+    if let Some(property) = &ctx.site.property {
+        return ctx.head.is_some()
+            && property != "INTERFACE_LINK_LIBRARIES_DIRECT_EXCLUDE"
+            && is_link_libraries_property(property);
+    }
+    link_features_allowed(ctx)
 }
 
 fn possible_target_name(name: &[u8]) -> bool {
