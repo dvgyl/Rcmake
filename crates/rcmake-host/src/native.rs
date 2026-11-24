@@ -22,8 +22,8 @@ use rustix::process::{Pid, Signal, WaitId, WaitIdOptions, kill_process_group, wa
 
 use crate::error::{HostError, HostResult, from_errno};
 use crate::{
-    CopyOptions, DirEntry, FileKind, FileTime, Follow, Host, Input, Metadata, Output,
-    ProcessResult, ReadRange, RunOutput, RunRequest, Stream, SystemInfo, WriteMode,
+    CopyOptions, DirEntry, FileKind, FileLockGuard, FileTime, Follow, Host, Input, Metadata,
+    Output, ProcessResult, ReadRange, RunOutput, RunRequest, Stream, SystemInfo, WriteMode,
     require_absolute, validate_run,
 };
 
@@ -111,6 +111,64 @@ fn open_output(path: &Path, mode: WriteMode) -> HostResult<File> {
         WriteMode::CreateNew => options.create_new(true),
     };
     io_at(options.open(path), path)
+}
+
+/// Interval between two lock attempts while [`Host::lock_file`] waits with a timeout.
+const LOCK_POLL_INTERVAL: Duration = Duration::from_millis(20);
+
+/// Exclusive lock held by [`NativeHost::lock_file`]. Drop releases the lock.
+#[derive(Debug)]
+struct NativeFileLock {
+    file: File,
+    path: PathBuf,
+}
+
+impl FileLockGuard for NativeFileLock {
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for NativeFileLock {
+    fn drop(&mut self) {
+        // Closing the file also releases the lock. The explicit unlock releases it
+        // at once, also when another handle to the same open file exists.
+        let _ = self.file.unlock();
+    }
+}
+
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "linux",
+    target_os = "android"
+))]
+fn rename_noreplace_native(from: &Path, to: &Path) -> HostResult<()> {
+    use rustix::fs::{RenameFlags, renameat_with};
+    match renameat_with(CWD, from, CWD, to, RenameFlags::NOREPLACE) {
+        Ok(()) => Ok(()),
+        Err(errno)
+            if errno == Errno::NOSYS || errno == Errno::NOTSUP || errno == Errno::OPNOTSUPP =>
+        {
+            Err(HostError::unsupported(
+                "atomic no-replace rename is not supported on this filesystem",
+            ))
+        }
+        Err(errno) if errno == Errno::EXIST => Err(from_errno(errno, Some(to))),
+        Err(errno) => Err(from_errno(errno, Some(from))),
+    }
+}
+
+#[cfg(not(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "linux",
+    target_os = "android"
+)))]
+fn rename_noreplace_native(_from: &Path, _to: &Path) -> HostResult<()> {
+    Err(HostError::unsupported(
+        "atomic no-replace rename is not supported on this host",
+    ))
 }
 
 impl Host for NativeHost {
@@ -229,6 +287,58 @@ impl Host for NativeHost {
         require_absolute(from)?;
         require_absolute(to)?;
         io_at(fs::rename(from, to), from)
+    }
+
+    fn rename_noreplace(&self, from: &Path, to: &Path) -> HostResult<()> {
+        require_absolute(from)?;
+        require_absolute(to)?;
+        rename_noreplace_native(from, to)
+    }
+
+    fn lock_file(
+        &self,
+        path: &Path,
+        timeout: Option<Duration>,
+    ) -> HostResult<Box<dyn FileLockGuard>> {
+        require_absolute(path)?;
+        let file = io_at(
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(path),
+            path,
+        )?;
+        match timeout {
+            None => io_at(file.lock(), path)?,
+            Some(limit) => {
+                let deadline = Instant::now().checked_add(limit);
+                loop {
+                    match file.try_lock() {
+                        Ok(()) => break,
+                        Err(fs::TryLockError::Error(err)) => return io_at(Err(err), path),
+                        Err(fs::TryLockError::WouldBlock) => {}
+                    }
+                    let now = Instant::now();
+                    let remaining = match deadline {
+                        Some(deadline) if now < deadline => deadline.duration_since(now),
+                        Some(_) => {
+                            return Err(HostError::timed_out(
+                                "Timeout reached",
+                                Some(path.to_path_buf()),
+                            ));
+                        }
+                        None => LOCK_POLL_INTERVAL,
+                    };
+                    std::thread::sleep(remaining.min(LOCK_POLL_INTERVAL));
+                }
+            }
+        }
+        Ok(Box::new(NativeFileLock {
+            file,
+            path: path.to_path_buf(),
+        }))
     }
 
     fn copy_file(&self, from: &Path, to: &Path, opts: CopyOptions) -> HostResult<()> {

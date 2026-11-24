@@ -123,12 +123,7 @@ pub(crate) fn enable_languages(
     optional: bool,
 ) -> Result<(), CmdError> {
     let generator = generator(cx);
-    let cfg_int_dir = if generator.multi_config() {
-        "${CONFIGURATION}"
-    } else {
-        "."
-    };
-    cx.set_var(b"CMAKE_CFG_INTDIR", cfg_int_dir.into());
+    cx.set_var(b"CMAKE_CFG_INTDIR", generator.cfg_int_dir().into());
 
     let mut unique: Vec<BString> = Vec::new();
     let mut duplicates: Vec<BString> = Vec::new();
@@ -362,8 +357,13 @@ impl Bootstrap {
 
     /// `cmGlobalGenerator::FindMakeProgram`.
     fn find_make_program(&self, cx: &mut Cx<'_>) -> Result<(), CmdError> {
-        let module = format!("{}.cmake", self.generator.find_make_module());
+        // Visual Studio has no module: the generator finds MSBuild itself (Wave 2).
+        let module = self
+            .generator
+            .find_make_module()
+            .map(|module| format!("{module}.cmake"));
         if is_off(&cx.var_or_empty(b"CMAKE_MAKE_PROGRAM"))
+            && let Some(module) = module
             && let Some(file) = modules_file(cx, module.as_bytes())
         {
             read_list_file(cx, &file)?;

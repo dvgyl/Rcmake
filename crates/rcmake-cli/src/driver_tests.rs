@@ -527,3 +527,51 @@ fn capabilities_advertises_supported_generators_and_file_api() {
         );
     }
 }
+
+#[test]
+fn generator_host_gate_and_help_list_follow_generator_kind() {
+    let host = Arc::new(PureHost::default());
+    host.seed_file(Path::new("/work/src/CMakeLists.txt"), b"")
+        .expect("seed");
+    let code = invoke(
+        &host,
+        &[
+            "cmake",
+            "-G",
+            "Visual Studio 17 2022",
+            "-S",
+            "/work/src",
+            "-B",
+            "/work/vs",
+        ],
+    );
+    let stderr = host.stream_bytes(Stream::Stderr);
+    let contains = |needle: &str| {
+        stderr
+            .windows(needle.len())
+            .any(|window| window == needle.as_bytes())
+    };
+    if cfg!(any(windows, feature = "vs-cross")) {
+        assert!(!contains("Could not create named generator"));
+    } else {
+        assert_eq!(code, 1);
+        assert!(contains(
+            "CMake Error: Could not create named generator Visual Studio 17 2022"
+        ));
+        assert!(!contains("Visual Studio 18 2026"));
+    }
+    // The generator list after the error has the oracle order.
+    let order = ["Unix Makefiles", "Ninja", "Ninja Multi-Config"];
+    let positions: Vec<usize> = order
+        .iter()
+        .filter_map(|name| {
+            let needle = format!(" {name} ");
+            stderr
+                .windows(needle.len())
+                .position(|window| window == needle.as_bytes())
+        })
+        .collect();
+    assert_eq!(positions.len(), order.len());
+    assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));
+    assert_eq!(contains(" Xcode "), cfg!(target_os = "macos"));
+}

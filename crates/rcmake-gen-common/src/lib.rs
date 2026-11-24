@@ -16,6 +16,7 @@ pub mod cpack_properties;
 pub mod ctest_file;
 pub mod export;
 pub mod fileapi;
+pub mod ide;
 pub mod install_script;
 pub mod sbom;
 

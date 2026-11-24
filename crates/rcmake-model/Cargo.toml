@@ -13,5 +13,10 @@ rcmake-base.workspace = true
 rcmake-diag.workspace = true
 thiserror.workspace = true
 
+[features]
+# Make the Visual Studio generators available on every host. Only the structural
+# test build enables this feature (ADR-015). Release binaries never enable it.
+vs-cross = []
+
 [lints]
 workspace = true

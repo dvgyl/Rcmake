@@ -598,6 +598,7 @@ fn module_pipeline_writes_edges_and_target_metadata() -> Result<(), Box<dyn std:
                 }),
                 ..CxxModuleInfo::default()
             }),
+            ide: None,
         });
     }
     super::generate_multi_config_with_model(&result, &host, dir, &model)?;

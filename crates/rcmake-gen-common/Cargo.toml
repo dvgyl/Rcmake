@@ -8,6 +8,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+indexmap.workspace = true
 jiff.workspace = true
 rcmake-base.workspace = true
 rcmake-cps.workspace = true

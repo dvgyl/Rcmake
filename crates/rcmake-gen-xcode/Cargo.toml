@@ -1,0 +1,20 @@
+[package]
+name = "rcmake-gen-xcode"
+description = "Native Xcode project generator (project.pbxproj, schemes, workspace settings) for Rcmake."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+rcmake-base.workspace = true
+rcmake-diag.workspace = true
+rcmake-gen-common.workspace = true
+rcmake-host.workspace = true
+rcmake-model.workspace = true
+rcmake-resolve.workspace = true
+sha2.workspace = true
+
+[lints]
+workspace = true

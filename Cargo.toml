@@ -25,8 +25,11 @@ members = [
     "crates/rcmake-instrument",
     "crates/rcmake-cpack",
     "crates/rcmake-tool-e",
+    "crates/rcmake-gen-xcode",
+    "crates/rcmake-gen-vs",
     "crates/rcmake-cli",
     "crates/rcmake-harness",
+    "crates/rcmake-fuzz",
 ]
 
 [workspace.package]
@@ -80,6 +83,8 @@ rcmake-build = { path = "crates/rcmake-build" }
 rcmake-gen-common = { path = "crates/rcmake-gen-common" }
 rcmake-gen-ninja = { path = "crates/rcmake-gen-ninja" }
 rcmake-gen-make = { path = "crates/rcmake-gen-make" }
+rcmake-gen-xcode = { path = "crates/rcmake-gen-xcode" }
+rcmake-gen-vs = { path = "crates/rcmake-gen-vs" }
 rcmake-ctest = { path = "crates/rcmake-ctest" }
 rcmake-cps = { path = "crates/rcmake-cps" }
 rcmake-cxxmodules = { path = "crates/rcmake-cxxmodules" }

@@ -21,6 +21,8 @@ rcmake-eval.workspace = true
 rcmake-gen-common.workspace = true
 rcmake-gen-make.workspace = true
 rcmake-gen-ninja.workspace = true
+rcmake-gen-vs.workspace = true
+rcmake-gen-xcode.workspace = true
 rcmake-genex.workspace = true
 rcmake-host.workspace = true
 rcmake-instrument.workspace = true
@@ -30,6 +32,11 @@ rcmake-presets.workspace = true
 rcmake-resolve.workspace = true
 rcmake-syntax.workspace = true
 rcmake-tool-e.workspace = true
+
+[features]
+# Make the Visual Studio generators available on every host (structural tests only,
+# ADR-015). The release binary never enables this feature.
+vs-cross = ["rcmake-model/vs-cross"]
 
 [lints]
 workspace = true

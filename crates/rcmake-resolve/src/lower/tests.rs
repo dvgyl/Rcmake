@@ -92,6 +92,7 @@ fn resolve_target(
         link: None,
         dependencies: Vec::new(),
         cxx_modules: None,
+        ide: None,
     })
 }
 

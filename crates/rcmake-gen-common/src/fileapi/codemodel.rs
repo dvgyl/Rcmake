@@ -70,6 +70,7 @@ impl FileApi<'_, '_> {
                     link: None,
                     dependencies: Vec::new(),
                     cxx_modules: None,
+                    ide: None,
                 };
                 target.config.0 = config.into();
                 target

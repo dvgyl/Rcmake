@@ -9,9 +9,9 @@ use rcmake_diag::Backtrace;
 use crate::target::join_entries;
 use crate::{
     AppendMode, BT, BuildExport, Cache, CacheEntry, CacheType, CommandId, CustomCommand, DirId,
-    Directory, ExportSet, FileSet, FileSetId, GeneratorKind, GlobalState, ImportedVisibility,
-    InstallRule, LinkItem, PropOrigin, PropScope, Target, TargetBinding, TargetId, TargetOrigin,
-    TestEntry, TestId, UsageField, UsageProps,
+    Directory, ExportSet, FileSet, FileSetId, GeneratorKind, GeneratorSpec, GlobalState,
+    ImportedVisibility, InstallRule, LinkItem, PropOrigin, PropScope, Target, TargetBinding,
+    TargetId, TargetOrigin, TestEntry, TestId, UsageField, UsageProps,
 };
 
 /// Error of a [`ProjectModel`] operation.
@@ -50,6 +50,8 @@ pub struct ProjectModel {
     pub global: GlobalState,
     /// Selected generator (`None` in script mode).
     pub generator: Option<GeneratorKind>,
+    /// Raw and parsed `-T`, `-A`, and instance values of [`ProjectModel::generator`].
+    pub generator_spec: GeneratorSpec,
     /// Install rules in call order.
     pub installs: Vec<InstallRule>,
     /// Export sets by name.

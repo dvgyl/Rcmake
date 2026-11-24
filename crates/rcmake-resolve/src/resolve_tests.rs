@@ -1565,3 +1565,21 @@ fn synthesizes_std_module_target_and_bmi_install_metadata() -> TestResult {
     assert!(!result.graphs[0].targets[1].in_all);
     Ok(())
 }
+
+#[test]
+fn ide_options_keep_wave_zero_result_unchanged() -> TestResult {
+    let mut model = project();
+    model.add_target(target("app", TargetKind::Executable, &["a.cpp"]))?;
+    let host = PureHost::default();
+    host.seed_file(Path::new("/src/a.cpp"), b"")?;
+    let configs = [ConfigId("Debug".into()), ConfigId("Release".into())];
+    let plain = resolve(&model, &host, &configs)?;
+    for flavor in [ide::IdeFlavor::Xcode, ide::IdeFlavor::VisualStudio] {
+        let options = ResolveOptions { ide: Some(flavor) };
+        let with_ide = resolve_with_options(&model, &host, &configs, &options)?;
+        assert!(with_ide.targets.iter().all(|target| target.ide.is_none()));
+        assert_eq!(with_ide.graphs, plain.graphs);
+        assert_eq!(with_ide.targets.len(), plain.targets.len());
+    }
+    Ok(())
+}

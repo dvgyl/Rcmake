@@ -4,7 +4,7 @@ use rcmake_base::BString;
 use rcmake_diag::DiagState;
 use rcmake_eval::{CacheDefine, LogLevel, TraceConfig, TraceFormat};
 use rcmake_host::{Host, Stream, WriteMode};
-use rcmake_model::CacheType;
+use rcmake_model::{CacheType, GeneratorKind};
 
 use crate::presets::Listing;
 use crate::{apply_warning_flag, parse_define, resolve_cli_path};
@@ -617,34 +617,13 @@ pub(crate) fn warn(host: &dyn Host, text: &str) {
     );
 }
 
-const GENERATORS: &[(&str, &str)] = &[
-    ("Unix Makefiles", "Generates standard UNIX makefiles."),
-    ("Ninja", "Generates build.ninja files."),
-    (
-        "Ninja Multi-Config",
-        "Generates build-<Config>.ninja files.",
-    ),
-    ("Xcode", "Generate Xcode project files."),
-    (
-        "Visual Studio 17 2022",
-        "Generates Visual Studio 2022 project files.",
-    ),
-    (
-        "Visual Studio 18 2026",
-        "Generates Visual Studio 2026 project files.",
-    ),
-];
-
-fn generators() -> impl Iterator<Item = &'static (&'static str, &'static str)> {
-    GENERATORS.iter().filter(|(name, _)| match *name {
-        "Xcode" => cfg!(target_os = "macos"),
-        name if name.starts_with("Visual Studio") => cfg!(windows),
-        _ => true,
-    })
-}
-
+/// `true` if `name` is a generator that this host can create (`-G` host gate).
+///
+/// A Visual Studio name passes only on Windows, or in a build with the `vs-cross`
+/// feature. Every other known name gets the CMake "Could not create named generator"
+/// error.
 pub(crate) fn is_generator(name: &[u8]) -> bool {
-    generators().any(|(g, _)| name == g.as_bytes())
+    GeneratorKind::from_name(name).is_some_and(GeneratorKind::host_available)
 }
 
 pub(crate) fn default_generator(host: &dyn Host) -> BString {
@@ -663,7 +642,8 @@ fn print_generators(host: &dyn Host, stream: Stream) {
         invalid_generator_env(host);
     }
     let mut text = String::from("Generators\n");
-    for (name, desc) in generators() {
+    for kind in GeneratorKind::available() {
+        let (name, desc) = (kind.name(), kind.description());
         let marker = if name.as_bytes() == default.as_slice() {
             '*'
         } else {

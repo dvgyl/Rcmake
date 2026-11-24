@@ -2,7 +2,10 @@
 
 #![forbid(unsafe_code)]
 
+mod build;
 mod prep;
+
+pub use build::build_commands;
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::Path;

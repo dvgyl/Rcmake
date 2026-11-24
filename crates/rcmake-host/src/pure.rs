@@ -3,19 +3,19 @@
 mod fs;
 
 use core::time::Duration;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
 use jiff::tz::TimeZone;
 use rcmake_base::BString;
 
 use self::fs::FileSystem;
-use crate::error::{HostError, HostResult};
+use crate::error::{HostError, HostResult, from_errno};
 use crate::{
-    CopyOptions, DirEntry, FileTime, Follow, Host, Metadata, ReadRange, RunOutput, RunRequest,
-    Stream, SystemInfo, WriteMode, validate_run,
+    CopyOptions, DirEntry, FileLockGuard, FileTime, Follow, Host, Metadata, ReadRange, RunOutput,
+    RunRequest, Stream, SystemInfo, WriteMode, validate_run,
 };
 
 /// An ordered stdio output event recorded by [`PureHost`].
@@ -41,9 +41,39 @@ struct PureState {
     handler: Option<Arc<CommandHandler>>,
 }
 
+/// Table of the files that [`PureHost::lock_file`] holds locks on.
+#[derive(Debug, Default)]
+struct LockTable {
+    held: Mutex<BTreeSet<PathBuf>>,
+    released: Condvar,
+}
+
+/// Exclusive lock held by [`PureHost::lock_file`]. Drop releases the lock.
+#[derive(Debug)]
+struct PureFileLock {
+    table: Arc<LockTable>,
+    path: PathBuf,
+}
+
+impl FileLockGuard for PureFileLock {
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for PureFileLock {
+    fn drop(&mut self) {
+        if let Ok(mut held) = self.table.held.lock() {
+            held.remove(&self.path);
+        }
+        self.table.released.notify_all();
+    }
+}
+
 /// In-memory deterministic [`Host`] with recorded stdio event log and virtual clock.
 pub struct PureHost {
     state: Mutex<PureState>,
+    locks: Arc<LockTable>,
 }
 
 impl fmt::Debug for PureHost {
@@ -75,6 +105,7 @@ impl PureHost {
                 stdin: VecDeque::new(),
                 handler: None,
             }),
+            locks: Arc::default(),
         }
     }
 
@@ -174,6 +205,58 @@ impl Host for PureHost {
 
     fn rename(&self, from: &Path, to: &Path) -> HostResult<()> {
         self.lock()?.fs.rename(from, to)
+    }
+
+    fn rename_noreplace(&self, from: &Path, to: &Path) -> HostResult<()> {
+        crate::require_absolute(from)?;
+        crate::require_absolute(to)?;
+        let mut state = self.lock()?;
+        if state.fs.metadata(to, Follow::No).is_ok() {
+            return Err(from_errno(rustix::io::Errno::EXIST, Some(to)));
+        }
+        state.fs.rename(from, to)
+    }
+
+    fn lock_file(
+        &self,
+        path: &Path,
+        timeout: Option<Duration>,
+    ) -> HostResult<Box<dyn FileLockGuard>> {
+        crate::require_absolute(path)?;
+        let key = {
+            let mut state = self.lock()?;
+            // Create the file if it is missing. An empty append keeps the content.
+            state.fs.write(path, b"", WriteMode::Append)?;
+            state.fs.canonicalize(path)?
+        };
+        let poisoned = || HostError::unsupported("PureHost lock table poisoned");
+        let mut held = self.locks.held.lock().map_err(|_| poisoned())?;
+        match timeout {
+            None => {
+                while held.contains(&key) {
+                    held = self.locks.released.wait(held).map_err(|_| poisoned())?;
+                }
+            }
+            Some(limit) => {
+                let (guard, result) = self
+                    .locks
+                    .released
+                    .wait_timeout_while(held, limit, |held| held.contains(&key))
+                    .map_err(|_| poisoned())?;
+                held = guard;
+                if result.timed_out() && held.contains(&key) {
+                    return Err(HostError::timed_out(
+                        "Timeout reached",
+                        Some(path.to_path_buf()),
+                    ));
+                }
+            }
+        }
+        held.insert(key.clone());
+        Ok(Box::new(PureFileLock {
+            table: Arc::clone(&self.locks),
+            path: key,
+        }))
     }
 
     fn copy_file(&self, from: &Path, to: &Path, opts: CopyOptions) -> HostResult<()> {

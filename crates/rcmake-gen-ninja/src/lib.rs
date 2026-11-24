@@ -2,10 +2,13 @@
 
 #![forbid(unsafe_code)]
 
+mod build;
 mod graph;
 mod modules;
 mod prep;
 mod syntax;
+
+pub use build::build_commands;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};

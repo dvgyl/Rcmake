@@ -64,13 +64,12 @@ pub(super) fn initialize(cx: &mut Cx<'_>, target: &mut Target) {
 }
 
 fn initialize_from_variables(cx: &mut Cx<'_>, target: &mut Target, builds: bool) {
-    let generator = cx.project().generator.map_or_else(
-        || cx.var_or_empty(b"CMAKE_GENERATOR"),
-        |kind| kind.name().into(),
-    );
-    let xcode = generator.as_slice() == b"Xcode";
-    let multi_config =
-        xcode || GeneratorKind::from_name(&generator).is_some_and(GeneratorKind::multi_config);
+    let generator = cx
+        .project()
+        .generator
+        .or_else(|| GeneratorKind::from_name(&cx.var_or_empty(b"CMAKE_GENERATOR")));
+    let xcode = generator == Some(GeneratorKind::Xcode);
+    let multi_config = generator.is_some_and(GeneratorKind::multi_config);
     let mut configs = active_configurations(cx, multi_config);
     for config in &mut configs {
         config.make_ascii_uppercase();

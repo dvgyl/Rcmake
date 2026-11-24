@@ -604,6 +604,7 @@ mod tests {
                 link: None,
                 dependencies: Vec::new(),
                 cxx_modules: None,
+                ide: None,
             });
         }
         let script = render_resolved(&model, dir, &result).unwrap().to_string();

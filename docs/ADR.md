@@ -258,3 +258,96 @@ All major architectural and contract decisions for Rcmake are recorded here by t
 3. **Instrumentation API v1 (`rcmake-instrument`):**
    - Add leaf crate `crates/rcmake-instrument` (`base`, `json`, `host`) implementing API v1 / data v1.2 query parsing (`<build>/.cmake/instrumentation/v1/query[/generated]/`), snippet/index/content JSON writers, hook triggers (`postGenerate`, `preBuild`, `postBuild`, `preCMakeBuild`, `postCMakeBuild`, `postCMakeInstall`, `postCMakeWorkflow`, `postCTest`), callback dispatch via `Host`, Google trace output, and the `ctest --instrument` command launcher.
    - Register `cmake_instrumentation(...)` in `rcmake-commands`, wire compile/link launcher wrapping in `rcmake-resolve`, invoke lifecycle hooks from `rcmake-cli`, and expose `"instrumentation":{"apiVersion":1,"dataVersion":{"major":1,"minor":2}}` in `cmake -E capabilities`.
+
+---
+
+## ADR-014: Native Xcode Generator (`rcmake-gen-xcode`)
+
+- **Status:** Accepted
+- **Date:** 2026-11-24
+- **Source:** `docs/M4_DESIGN.md` sections 1.3–1.7, 2, and 3.
+
+### Context
+
+Xcode is the only IDE (integrated development environment) generator that this macOS machine can verify end to end with the real build tool (`xcodebuild`). The CMake 4.5.1 Xcode output is not deterministic: a second `cmake .` changed 737 lines of `project.pbxproj`. ADR-009 already chose behavioral equivalence over byte-identical build files.
+
+### Decision
+
+1. **Two IDE crates, not one.** `docs/ARCHITECTURE.md` names one `rcmake-gen-ide` crate. Milestone 4 uses `crates/rcmake-gen-xcode` and `crates/rcmake-gen-vs` instead, so that two workers can work in parallel without conflicts. `rcmake-gen-xcode` depends on `base`, `diag`, `model`, `resolve`, `gen-common`, `host`, and `sha2`.
+2. **Module layout (frozen in Wave 0).** `plist.rs` (OpenStep writer), `ids.rs` (object IDs), `object.rs` (object graph), `scheme.rs`, `workspace.rs`, `rerun.rs` (`ReRunCMake.make`), `project.rs`, `settings.rs`, `phases.rs`, `build.rs` (`build_commands()`), and `lib.rs` (`generate()`).
+3. **Shared contracts (frozen in Wave 0).**
+   - `GeneratorKind::{Ninja, NinjaMultiConfig, UnixMakefiles, Xcode, VisualStudio(VsVersion)}` in `rcmake-model`. `Xcode` is multi-config. Its default `CMAKE_CONFIGURATION_TYPES` is `Debug;Release;MinSizeRel;RelWithDebInfo`. `CMAKE_CFG_INTDIR` is `$(CONFIGURATION)$(EFFECTIVE_PLATFORM_NAME)`. `-G Xcode` is available only on macOS.
+   - `GeneratorSpec` and the pure parsers `parse_xcode_toolset`, `parse_vs_toolset`, and `parse_vs_platform` in `rcmake-model`. The `Display` text of `GeneratorSpecError` is the CMake 4.5.1 message text. The configure commands report the error at the first `project()` call.
+   - `ResolveOptions`, `resolve_with_options`, and `ResolvedTarget::ide` (`IdeFacts` in `rcmake-resolve/src/ide.rs`). `IdeFacts` holds raw, unescaped values. In Wave 0, `ide` is always `None`, so the Ninja and Makefile output does not change.
+   - `rcmake-gen-common/src/ide.rs`: `utility_targets`, `project_roots`, `targets_for_root`, `rerun_inputs`, and the pure `cmake --build` description `BuildRequest` / `BuildCommand`. Every generator crate exports `build_commands(&BuildRequest) -> Result<Vec<BuildCommand>, GenError>`. The CLI runs the commands in order and stops at the first failure.
+4. **Deterministic object IDs.** ID = the first 24 uppercase hexadecimal digits of SHA-256(4-byte little-endian `PBXType` ordinal ‖ semantic key). The key never contains the build directory. Cached `<target>_GUID_CMAKE` and `PROJECT_<Name>_GUID_CMAKE` entries have priority, so a build tree that the oracle made keeps its IDs. An ID collision is a `GenError`.
+5. **`try_compile` under Xcode** uses the in-process `rcmake-build` executor (ADR-008). Rcmake does not write an Xcode project for each `try_compile`.
+6. **Verification.** Tier X0 (unit golden strings), X1 (structural diff of canonical forms made by `tools/measure/pbxproj_canon.py`), X2 (live `xcodebuild` build, `ctest`, and install), X3 (upstream `Tests/RunCMake/XcodeProject*`, at least 85%), and X4 (Tier-1 and Tier-2 corpus, 9/9).
+
+### Consequences
+
+- Rcmake Xcode projects are reproducible. A repeated configure does not change `project.pbxproj`, so Xcode does not reload the project without a reason.
+- Oracle comparison uses the canonical-form tool. Byte-for-byte diffs are not used.
+- One `IdeFacts` contract serves both IDE generators.
+- `cmake -E capabilities` lists `Xcode` only after Wave 2, when the generator writes projects.
+
+---
+
+## ADR-015: Native Visual Studio Generator (`rcmake-gen-vs`)
+
+- **Status:** Accepted
+- **Date:** 2026-11-24
+- **Source:** `docs/M4_DESIGN.md` sections 1.2, 1.8, and 4.
+
+### Context
+
+The CMake 4.5.1 oracle cannot create a Visual Studio generator on macOS. This machine has no MSBuild. Verification on macOS must be structural.
+
+### Decision
+
+1. **Scope.** Milestone 4 implements `Visual Studio 17 2022` (`.sln`, toolset `v143`, `ToolsVersion` `17.0`) and `Visual Studio 18 2026` (`.slnx`, toolset `v145`, `ToolsVersion` `18.0`). `VsVersion::{Vs17, Vs18}` is an enum, so older versions can be added later. `Visual Studio 15 2017` and `16 2019` wait for a later milestone.
+2. **Crate.** `crates/rcmake-gen-vs` depends on `base`, `diag`, `model`, `resolve`, `gen-common`, `host`, and `md-5`. Modules (frozen in Wave 0): `guid.rs`, `xml.rs`, `sln.rs`, `slnx.rs`, `filters.rs`, `vcxproj.rs`, `rules.rs`, `flags_table.rs`, `build.rs`, and `lib.rs`.
+3. **Host gate.** On Windows, both generators are available. On other hosts, `-G "Visual Studio 17 2022"` gives the oracle error `Could not create named generator <name>` and exit code 1. The `vs-cross` Cargo feature of `rcmake-model` (forwarded by `rcmake-cli/vs-cross`) makes the generators available on every host. Only the structural-test build enables this feature. The default build and the staged release binary never enable it. No environment variable changes this behavior.
+4. **Deterministic GUIDs.** A cached `<name>_GUID_CMAKE` entry has priority. Otherwise the GUID is the RFC 4122 version-3 (MD5) UUID with namespace `ee30c4be-5192-4fb0-b335-722a2dffe760` over `"<CMAKE_BINARY_DIR>|<name>"`, in uppercase. This is the same rule as CMake 4.5.1, so Rcmake can match oracle GUIDs exactly.
+5. **Clean-room MSVC flag table (locked).** `flags_table.rs` is hand-authored from the documented MSVC command-line options. Rcmake does not read, copy, or generate from the Microsoft MSBuild rule files (`CL.xml`, `Link.xml`, `LIB.xml`), and it does not copy the CMake `cmVS*FlagTable` tables. A flag that the table does not know goes to `<AdditionalOptions>` with `%(AdditionalOptions)`. This is valid MSBuild, and the build behavior is the same.
+6. **Verification: structural only on macOS (locked).** There is no `.github/workflows/windows.yml` in Milestone 4.
+   - Tier V0: unit golden strings (`guid.rs` UUID-v3 vectors, `sln.rs`, `slnx.rs`, `xml.rs`, `filters.rs`, `build_commands()`).
+   - Tier V1: XML well-formedness, element order, and `ProjectReference` GUID checks with `tools/measure/vs_canon.py`.
+   - Tier V2: the upstream `Tests/RunCMake/VSSolution` and `VS10Project` check scripts run with oracle `cmake -P` against the `vs-cross` output (at least 80% of the cases that do not need MSBuild).
+   - Tier V3: seeded configure from hand-written `conformance/vs/seed/msvc-x64/` compiler files.
+
+### Consequences
+
+- Windows parity is "structural only" in Milestone 4. A live Windows tier (byte-level `.sln`/`.vcxproj` parity, MSBuild builds) needs a later decision.
+- The release binary on non-Windows hosts behaves the same as the oracle: it cannot create a Visual Studio generator.
+- The flag table has no Microsoft-licensed input, so the licence position of the crate stays `MIT OR Apache-2.0`.
+
+---
+
+## ADR-016: Benchmarks, Safe-Rust Fuzzing & Release Hardening
+
+- **Status:** Accepted
+- **Date:** 2026-11-24
+- **Source:** `docs/M4_DESIGN.md` sections 1.9 and 5.
+
+### Decision
+
+1. **Benchmarks.** `tools/bench/bench.py` (Python standard library only) runs each case with the oracle and with the staged Rcmake binary: 2 warm-up runs, then 7 measured runs (median and 90th percentile). In exclusive mode, wall time is the primary metric. In shared mode (other agents run), CPU time and peak RSS (resident set size) are the primary metrics. Cases B1–B9 and their gates are in `docs/M4_DESIGN.md` section 5.1. The first known performance task is B2: the `-P` loop uses 2.1× the oracle CPU time.
+2. **Safe-Rust fuzzing only (locked).** `crates/rcmake-fuzz` is the only fuzzer. It uses the stable toolchain, safe Rust (`#![forbid(unsafe_code)]`), and no new dependencies. Rcmake does not use `libfuzzer-sys` or `cargo-fuzz`, and has no out-of-workspace `fuzz/` directory, so the repository has no `NCSA`-licensed dependency.
+   - Harness contract (frozen in Wave 0): each input runs on its own thread with an 8 MiB stack, inside `catch_unwind`, with a wall-clock budget (default 2 s). A caught panic or a timeout is a failure. The SplitMix64 generator `rcmake_fuzz::Rng` makes each failure replayable from its seed.
+   - Binary: `rcmake-fuzz <surface> [--seed <s>] [--iterations <n>] [--budget-ms <ms>]`. Surfaces: `syntax`, `expr`, `regex`, `genex`, `json`, `presets`, `cps`, `archive`, `path`.
+   - `rcmake_base::Limits::fuzz()` gives stricter caps for the harness only (16 MiB values and file reads, 1,000,000 regex steps, 2 s per input). Production code always uses `Limits::default()`, which never rejects input that CMake 4.5.1 accepts.
+   - Gates: Wave 2 runs 1,000,000 iterations per surface with zero failures. `scripts/gate.sh` gets a 10,000-iteration smoke mode. Each crash becomes a regression test in the owning crate before the fix lands.
+   - The `adversarial_fuzz.rs` integration suite stays as the in-tree regression net.
+3. **Host primitives for the Milestone 3 P1 audit fixes.**
+   - `Host::lock_file(path, timeout) -> Box<dyn FileLockGuard>`: `NativeHost` uses the safe, stable `std::fs::File::lock` / `try_lock` (Rust 1.89+), with no new dependency. `PureHost` uses an in-memory lock table. A lock that is not free before the timeout gives `ErrorKind::TimedOut`.
+   - `Host::rename_noreplace(from, to)`: `NativeHost` uses `rustix::fs::renameat_with` with `RenameFlags::NOREPLACE` (macOS `renameatx_np(RENAME_EXCL)`, Linux `renameat2`). A filesystem without support gives `ErrorKind::Unsupported`. `PureHost` checks and renames atomically under its state lock.
+   - Both methods have default bodies that return `ErrorKind::Unsupported`, so a host wrapper does not break. The shared conformance suite checks both hosts.
+   - `rcmake_base::hash::IncrementalHasher` (`HashAlgo::hasher()`, `update`, `finish_hex`) gives streaming digests for CPack checksums and `cmake -E sha256sum`. The result is equal to `HashAlgo::hex_digest` over the same bytes.
+4. **Worktree oracle path (locked).** `env/env.sh` exports `RCMAKE_ORACLE_DIR`. When the local `env/oracle/bin` is missing (a git worktree), it uses `env/oracle` of the main checkout: the parent directory of `git rev-parse --git-common-dir`.
+5. **Release hardening.** A panic hook in `rcmake-cli/src/main.rs` prints one `rcmake: internal error: ...` line and exits with code 1. The release profile keeps `panic = "unwind"`. Two clean `scripts/stage.sh` runs must give byte-identical binaries. `tools/measure/determinism.py` checks that each generator writes the same files into two build directories after `<B>` replacement. `tools/measure/licence_scan.py` must pass.
+
+### Consequences
+
+- Fuzzing finds panics, stack overflows, and hangs on the stable toolchain without coverage guidance. Coverage-guided fuzzing needs a new ADR.
+- Milestone 4 adds no external crate. `Cargo.lock` changes only by the three new workspace packages.

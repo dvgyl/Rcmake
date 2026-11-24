@@ -30,6 +30,7 @@ use usage::{ResolvedLinkItem, ResolvedLinkKind, UsageResolver};
 mod sources;
 mod unity;
 
+pub mod ide;
 pub mod lower;
 pub mod usage;
 
@@ -130,6 +131,15 @@ pub struct ResolvedTarget {
     pub dependencies: Vec<TargetId>,
     /// C++20 module facts (`None` when no source of the target is scanned).
     pub cxx_modules: Option<CxxModuleInfo>,
+    /// IDE facts. `None` unless [`ResolveOptions::ide`] is set.
+    pub ide: Option<Box<ide::IdeFacts>>,
+}
+
+/// Options of [`resolve_with_options`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ResolveOptions {
+    /// Compute [`ResolvedTarget::ide`] for this IDE flavor.
+    pub ide: Option<ide::IdeFlavor>,
 }
 
 /// C++20 module facts of one target and configuration (ADR-012).
@@ -513,11 +523,30 @@ pub struct ExportPlan {
 
 /// Resolve and lower the project in configuration order.
 /// Use `CMAKE_BUILD_TYPE` if `configs` is empty.
+///
+/// This is [`resolve_with_options`] with the default [`ResolveOptions`].
 pub fn resolve(
     model: &ProjectModel,
     host: &dyn Host,
     configs: &[ConfigId],
 ) -> Result<GenerationResult, ResolveError> {
+    resolve_with_options(model, host, configs, &ResolveOptions::default())
+}
+
+/// Resolve and lower the project in configuration order, with `options`.
+/// Use `CMAKE_BUILD_TYPE` if `configs` is empty.
+///
+/// With [`ResolveOptions::ide`] set, the IDE generators get [`ResolvedTarget::ide`].
+/// Milestone 4 Wave 0 freezes only the contract: the field stays `None`, and the
+/// result is the same as the result of [`resolve`].
+pub fn resolve_with_options(
+    model: &ProjectModel,
+    host: &dyn Host,
+    configs: &[ConfigId],
+    options: &ResolveOptions,
+) -> Result<GenerationResult, ResolveError> {
+    // Wave 1 (worker C) computes the IDE facts here.
+    let _ = options.ide;
     let configs = if configs.is_empty() {
         vec![ConfigId(
             lower::definition(model, DirId::ROOT, b"CMAKE_BUILD_TYPE")
@@ -749,6 +778,7 @@ fn resolve_target<'a>(
         link: None,
         dependencies: Vec::new(),
         cxx_modules: None,
+        ide: None,
     };
 
     let export_symbol = export_symbol(target);

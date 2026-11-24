@@ -14,7 +14,10 @@ use rcmake_instrument::{
     CustomContent, CustomContentType, InstrumentError, InstrumentOption, Query,
 };
 use rcmake_model::{GeneratorKind, ProjectModel, TargetOrigin};
-use rcmake_resolve::{GenerationResult, InstallActionKind, InstallManifest, ResolveError};
+use rcmake_resolve::ide::IdeFlavor;
+use rcmake_resolve::{
+    GenerationResult, InstallActionKind, InstallManifest, ResolveError, ResolveOptions,
+};
 
 mod file_generate;
 
@@ -33,24 +36,34 @@ pub(crate) fn run(
                 .into_iter()
                 .map(ConfigId)
                 .collect(),
-            None => ["Debug", "Release", "RelWithDebInfo"]
-                .into_iter()
-                .map(|name| ConfigId(name.into()))
+            None => kind
+                .default_configuration_types()
+                .iter()
+                .map(|name| ConfigId((*name).into()))
                 .collect(),
         }
     } else {
         vec![ConfigId(interp.cx().var_or_empty(b"CMAKE_BUILD_TYPE"))]
+    };
+    let options = ResolveOptions {
+        ide: match kind {
+            GeneratorKind::Xcode => Some(IdeFlavor::Xcode),
+            GeneratorKind::VisualStudio(_) => Some(IdeFlavor::VisualStudio),
+            GeneratorKind::Ninja
+            | GeneratorKind::NinjaMultiConfig
+            | GeneratorKind::UnixMakefiles => None,
+        },
     };
     let resolved = {
         let mut cx = interp.cx();
         let model = cx.project();
         let key = b"_RCMAKE_INSTRUMENTATION_QUERIES";
         if queries.is_empty() || !model.global.instrumentation.is_empty() {
-            rcmake_resolve::resolve(model, host, &configs)
+            rcmake_resolve::resolve_with_options(model, host, &configs, &options)
         } else {
             let previous = model.global.props.get(key).cloned();
             model.global.props.set(key.as_slice().into(), "1".into());
-            let resolved = rcmake_resolve::resolve(model, host, &configs);
+            let resolved = rcmake_resolve::resolve_with_options(model, host, &configs, &options);
             if let Some(previous) = previous {
                 model.global.props.set(key.as_slice().into(), previous);
             } else {
@@ -64,6 +77,31 @@ pub(crate) fn run(
         Err(ResolveError::Unimplemented(_)) => return Ok(false),
         Err(err) => return Err(err.to_string()),
     };
+    // An IDE generator writes its project files first, so that a generator that is not
+    // implemented yet leaves no partial output.
+    let ide_result = match kind {
+        GeneratorKind::Xcode => Some(rcmake_gen_xcode::generate(
+            &result,
+            interp.cx().project(),
+            host,
+            bin,
+        )),
+        GeneratorKind::VisualStudio(version) => Some(rcmake_gen_vs::generate(
+            version,
+            &result,
+            interp.cx().project(),
+            host,
+            bin,
+        )),
+        GeneratorKind::Ninja | GeneratorKind::NinjaMultiConfig | GeneratorKind::UnixMakefiles => {
+            None
+        }
+    };
+    match ide_result {
+        Some(Err(GenError::Unimplemented(_))) => return Ok(false),
+        Some(Err(err)) => return Err(err.to_string()),
+        Some(Ok(())) | None => {}
+    }
     write_common(interp, host, bin, &result, kind).map_err(|err| err.to_string())?;
     let result = match kind {
         GeneratorKind::Ninja => rcmake_gen_ninja::generate_single_config_with_model(
@@ -81,6 +119,7 @@ pub(crate) fn run(
         GeneratorKind::UnixMakefiles => {
             rcmake_gen_make::generate_with_model(&result, host, bin, interp.cx().project())
         }
+        GeneratorKind::Xcode | GeneratorKind::VisualStudio(_) => Ok(()),
     };
     match result {
         Ok(()) => {
@@ -212,7 +251,10 @@ fn write_common(
     }
 
     let export_commands = interp.cx().var_is_on(b"CMAKE_EXPORT_COMPILE_COMMANDS");
-    if export_commands && let Some(graph) = result.graphs.first() {
+    if export_commands
+        && !generator.is_ide()
+        && let Some(graph) = result.graphs.first()
+    {
         write(
             host,
             &bin.join("compile_commands.json"),

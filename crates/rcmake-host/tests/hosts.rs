@@ -264,3 +264,39 @@ fn pure_symlink_hop_limit() {
         Some(Errno::LOOP.raw_os_error())
     );
 }
+
+/// Hold a lock in a second thread. The waiting thread must get the lock after the
+/// release, both without a timeout and with a timeout that is long enough.
+fn check_lock_wait(host: &(dyn Host + Sync), path: &Path) -> Result<(), String> {
+    for timeout in [None, Some(Duration::from_secs(30))] {
+        let guard = host
+            .lock_file(path, Some(Duration::ZERO))
+            .map_err(|err| format!("first lock: {err}"))?;
+        std::thread::scope(|scope| {
+            let waiter = scope.spawn(|| host.lock_file(path, timeout).map(|_| ()));
+            std::thread::sleep(Duration::from_millis(50));
+            drop(guard);
+            match waiter.join() {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(err)) => Err(format!("waiting lock: {err}")),
+                Err(_) => Err("the waiting thread panicked".to_owned()),
+            }
+        })?;
+    }
+    Ok(())
+}
+
+#[test]
+fn native_lock_waits_for_release() {
+    let host = NativeHost::new().expect("native host");
+    let temp = TempDir::new(&host).expect("temporary directory");
+    assert_eq!(check_lock_wait(&host, &temp.path.join("wait.lock")), Ok(()));
+}
+
+#[test]
+fn pure_lock_waits_for_release() {
+    let host = PureHost::default();
+    host.create_dir_all(Path::new("/work"))
+        .expect("work directory");
+    assert_eq!(check_lock_wait(&host, Path::new("/work/wait.lock")), Ok(()));
+}

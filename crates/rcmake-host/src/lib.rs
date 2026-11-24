@@ -236,6 +236,14 @@ pub struct SystemInfo {
     pub pid: u32,
 }
 
+/// An exclusive advisory lock on a file, returned by [`Host::lock_file`].
+///
+/// The lock stays held while the guard exists. Drop the guard to release the lock.
+pub trait FileLockGuard: Send + core::fmt::Debug {
+    /// Absolute path of the locked file.
+    fn path(&self) -> &Path;
+}
+
 /// Core OS abstraction trait for Rcmake (ADR-004).
 ///
 /// Every filesystem path argument MUST be absolute; relative paths return
@@ -267,6 +275,42 @@ pub trait Host: Send + Sync {
 
     /// Rename/move a filesystem entry.
     fn rename(&self, from: &Path, to: &Path) -> HostResult<()>;
+
+    /// Rename `from` to `to` atomically, but only if `to` does not exist.
+    ///
+    /// If `to` exists, the operation fails with [`std::io::ErrorKind::AlreadyExists`].
+    /// If the host or the filesystem cannot do an atomic no-replace rename, the
+    /// operation fails with [`std::io::ErrorKind::Unsupported`]
+    /// ([`HostError::unsupported`]). The default implementation always fails with
+    /// [`std::io::ErrorKind::Unsupported`].
+    fn rename_noreplace(&self, from: &Path, to: &Path) -> HostResult<()> {
+        require_absolute(from)?;
+        require_absolute(to)?;
+        Err(HostError::unsupported(
+            "atomic no-replace rename is not supported",
+        ))
+    }
+
+    /// Get an exclusive advisory lock on the file `path` (`file(LOCK)`).
+    ///
+    /// The file is created if it does not exist. Its content does not change.
+    ///
+    /// - `timeout` = `None`: wait until the lock is free.
+    /// - `timeout` = `Some(Duration::ZERO)`: try one time and do not wait.
+    /// - `timeout` = `Some(d)`: wait at most `d`.
+    ///
+    /// If the lock is not free before the timeout, the operation fails with
+    /// [`std::io::ErrorKind::TimedOut`]. The default implementation always fails with
+    /// [`std::io::ErrorKind::Unsupported`].
+    fn lock_file(
+        &self,
+        path: &Path,
+        timeout: Option<Duration>,
+    ) -> HostResult<Box<dyn FileLockGuard>> {
+        require_absolute(path)?;
+        let _ = timeout;
+        Err(HostError::unsupported("file locks are not supported"))
+    }
 
     /// Copy a file with optional permission and mtime preservation.
     fn copy_file(&self, from: &Path, to: &Path, opts: CopyOptions) -> HostResult<()>;

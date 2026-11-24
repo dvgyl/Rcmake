@@ -23,7 +23,11 @@ mod target;
 
 pub use command::{CustomCommand, CustomCommandKind, TargetEvent};
 pub use directory::Directory;
-pub use generator::GeneratorKind;
+pub use generator::{
+    GeneratorKind, GeneratorSpec, GeneratorSpecError, ParsedToolset, SpecField, ToolsetSupport,
+    VsPlatform, VsToolset, VsVersion, XcodeBuildSystem, XcodeVersion, parse_vs_platform,
+    parse_vs_toolset, parse_xcode_toolset,
+};
 pub use ids::{BT, CommandId, DirId, FileSetId, TargetId, TestId};
 pub use install::{
     BuildExport, DiscoverySpec, ExportKind, ExportSet, InstallKind, InstallOptions, InstallRule,

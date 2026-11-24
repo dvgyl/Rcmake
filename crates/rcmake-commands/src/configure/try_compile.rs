@@ -1549,7 +1549,8 @@ fn log_output(text: &mut String, key: &str, output: &[u8]) {
 }
 
 use rcmake_host::{
-    DirEntry, FileTime, Follow, HostResult, Metadata, ReadRange, RunOutput, Stream, SystemInfo,
+    DirEntry, FileLockGuard, FileTime, Follow, HostResult, Metadata, ReadRange, RunOutput, Stream,
+    SystemInfo,
 };
 
 type HostCall = Box<dyn FnOnce(&dyn Host) + Send>;
@@ -1635,6 +1636,7 @@ impl Host for CapturingHost {
     forward_host!(remove_dir(p: &Path) -> (); p);
     forward_host!(remove_dir_all(p: &Path) -> (); p);
     forward_host!(rename(from: &Path, to: &Path) -> (); from, to);
+    forward_host!(rename_noreplace(from: &Path, to: &Path) -> (); from, to);
     forward_host!(symlink(target: &Path, link: &Path) -> (); target, link);
     forward_host!(hard_link(src: &Path, dst: &Path) -> (); src, dst);
     forward_host!(read_link(p: &Path) -> PathBuf; p);
@@ -1665,6 +1667,15 @@ impl Host for CapturingHost {
         }
         let p = p.to_owned();
         self.forward(move |host| host.write(&p, &data, mode))?
+    }
+
+    fn lock_file(
+        &self,
+        path: &Path,
+        timeout: Option<Duration>,
+    ) -> HostResult<Box<dyn FileLockGuard>> {
+        let path = path.to_owned();
+        self.forward(move |host| host.lock_file(&path, timeout))?
     }
 
     fn copy_file(&self, from: &Path, to: &Path, opts: CopyOptions) -> HostResult<()> {

@@ -50,6 +50,17 @@ impl HostError {
         }
     }
 
+    /// Construct a timeout error for the operation on `path`.
+    #[must_use]
+    pub fn timed_out(msg: impl Into<String>, path: Option<PathBuf>) -> Self {
+        Self {
+            kind: ErrorKind::TimedOut,
+            errno: None,
+            os_message: msg.into(),
+            path,
+        }
+    }
+
     /// Construct an unsupported-operation error.
     #[must_use]
     pub fn unsupported(msg: impl Into<String>) -> Self {

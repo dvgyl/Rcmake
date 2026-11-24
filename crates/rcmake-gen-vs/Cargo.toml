@@ -1,0 +1,20 @@
+[package]
+name = "rcmake-gen-vs"
+description = "Native Visual Studio 17 2022 and 18 2026 project generator (.sln, .slnx, .vcxproj) for Rcmake."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+md-5.workspace = true
+rcmake-base.workspace = true
+rcmake-diag.workspace = true
+rcmake-gen-common.workspace = true
+rcmake-host.workspace = true
+rcmake-model.workspace = true
+rcmake-resolve.workspace = true
+
+[lints]
+workspace = true

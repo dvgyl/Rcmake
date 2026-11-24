@@ -643,12 +643,25 @@ fn build_capabilities_json() -> Value {
         "fileApi".into(),
         object([("requests", Value::Array(requests.into()))]),
     );
-    let generators = rcmake_model::GeneratorKind::ALL.map(|generator| {
+    // Only generators that generate today. Xcode joins in Milestone 4 Wave 2
+    // (ADR-016 section 5.3, item 6).
+    let generators = [
+        rcmake_model::GeneratorKind::Ninja,
+        rcmake_model::GeneratorKind::NinjaMultiConfig,
+        rcmake_model::GeneratorKind::UnixMakefiles,
+    ]
+    .map(|generator| {
         object([
             ("name", Value::string(generator.name())),
             ("extraGenerators", Value::Array(Vec::new())),
-            ("platformSupport", Value::Bool(false)),
-            ("toolsetSupport", Value::Bool(false)),
+            (
+                "platformSupport",
+                Value::Bool(generator.supports_platform()),
+            ),
+            (
+                "toolsetSupport",
+                Value::Bool(generator.toolset_support() != rcmake_model::ToolsetSupport::None),
+            ),
         ])
     });
     root.insert("generators".into(), Value::Array(generators.into()));

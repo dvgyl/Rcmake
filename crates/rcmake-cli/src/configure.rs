@@ -136,9 +136,24 @@ pub(crate) fn run(argv: &[BString], mut opts: Options, host: Arc<dyn Host>) -> i
 
     let generator_kind = GeneratorKind::from_name(&generator);
     let has_cache = saved.contains(HOME_DIR);
+    // Raw `-T`, `-A`, and instance values. The configure commands parse them at the
+    // first `project()` call (Milestone 4 Wave 1).
+    let spec_value = |given: Option<&BString>, key: &[u8]| {
+        given
+            .or_else(|| saved.get(key).map(|entry| &entry.value))
+            .cloned()
+            .unwrap_or_default()
+    };
+    let generator_spec = rcmake_model::GeneratorSpec {
+        toolset: spec_value(opts.toolset.as_ref(), b"CMAKE_GENERATOR_TOOLSET"),
+        platform: spec_value(opts.architecture.as_ref(), b"CMAKE_GENERATOR_PLATFORM"),
+        instance: spec_value(None, b"CMAKE_GENERATOR_INSTANCE"),
+        ..rcmake_model::GeneratorSpec::default()
+    };
     let mut interp = new_interp(argv, &opts, RunMode::Configure, Arc::clone(&host));
     *interp.cx().cache() = saved;
     interp.cx().project().generator = generator_kind;
+    interp.cx().project().generator_spec = generator_spec;
     cache::insert(
         interp.cx().cache(),
         GENERATOR,

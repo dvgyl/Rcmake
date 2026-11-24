@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use rcmake_base::BString;
+use rcmake_gen_common::ide::{BuildRequest, Jobs as BuildJobs};
 use rcmake_host::{
     CommandSpec, FileKind, Follow, Host, Input, Output, ProcessResult, RunRequest, Stream, path,
 };
@@ -333,58 +334,72 @@ fn dispatch(
             &format!("could not create CMAKE_GENERATOR \"{}\"", generator.value),
         );
     };
-    let make = kind == GeneratorKind::UnixMakefiles;
-    let program = cache
-        .get(b"CMAKE_MAKE_PROGRAM")
-        .map(|entry| entry.value.clone())
-        .unwrap_or_else(|| if make { "make".into() } else { "ninja".into() });
-    let mut args = vec!["-C".into(), path::from_native(dir)];
-    if kind.multi_config()
-        && let Some(config) = &opts.config
-    {
-        let mut file = BString::from("build-");
-        file.extend_from_slice(config);
-        file.extend_from_slice(b".ninja");
-        args.extend(["-f".into(), file]);
-    }
-    if let Some(Jobs::Count(count)) = opts.jobs {
-        args.extend(["-j".into(), count.to_string().into()]);
-    } else if make && matches!(opts.jobs, Some(Jobs::Default)) {
-        args.push("-j".into());
-    }
-    if opts.verbose {
-        args.push(if make {
-            "VERBOSE=1".into()
-        } else {
-            "-v".into()
-        });
-    }
-    let request = |targets: &[BString]| {
-        let mut args = args.clone();
-        args.extend(targets.iter().cloned());
-        args.extend(opts.native.iter().cloned());
-        RunRequest {
-            pipeline: vec![CommandSpec {
-                program: program.clone(),
-                args,
-            }],
-            cwd: dir.to_owned(),
-            env: env.clone(),
-            stdin: Input::Inherit,
-            stdout: Output::Capture,
-            stderr: Output::Capture,
-            timeout: None,
-            tee: true,
-        }
+    let cached = |key: &[u8]| {
+        cache
+            .get(key)
+            .map(|entry| entry.value.clone())
+            .unwrap_or_default()
     };
-    let clean = [BString::from("clean")];
-    if opts.clean_first && opts.targets.as_slice() != clean {
-        let exit = run_native(host, &request(&clean));
+    let make_program = cached(b"CMAKE_MAKE_PROGRAM");
+    let project_name = cached(b"CMAKE_PROJECT_NAME");
+    let platform = cached(b"CMAKE_VS_PLATFORM_NAME");
+    let build_dir = path::from_native(dir);
+    let request = BuildRequest {
+        generator: kind,
+        build_dir: &build_dir,
+        project_name: &project_name,
+        make_program: &make_program,
+        config: opts.config.as_ref().map(|config| config.as_slice()),
+        targets: &opts.targets,
+        jobs: match opts.jobs {
+            None => BuildJobs::None,
+            Some(Jobs::Default) => BuildJobs::Default,
+            Some(Jobs::Count(count)) => BuildJobs::Count(count),
+        },
+        clean_first: opts.clean_first,
+        verbose: opts.verbose,
+        native_args: &opts.native,
+        platform: &platform,
+    };
+    let planned = match kind {
+        GeneratorKind::Ninja | GeneratorKind::NinjaMultiConfig => {
+            rcmake_gen_ninja::build_commands(&request)
+        }
+        GeneratorKind::UnixMakefiles => rcmake_gen_make::build_commands(&request),
+        GeneratorKind::Xcode => rcmake_gen_xcode::build_commands(&request),
+        GeneratorKind::VisualStudio(_) => rcmake_gen_vs::build_commands(&request),
+    };
+    let commands = match planned {
+        Ok(commands) => commands,
+        Err(err) => return error(host, &err.to_string()),
+    };
+    // Run the commands in order. Stop at the first command that fails.
+    let mut exit = CommandExit::Code(0);
+    for command in commands {
+        let Some((program, args)) = command.argv.split_first() else {
+            continue;
+        };
+        exit = run_native(
+            host,
+            &RunRequest {
+                pipeline: vec![CommandSpec {
+                    program: program.clone(),
+                    args: args.to_vec(),
+                }],
+                cwd: path::to_native(&command.working_dir),
+                env: env.clone(),
+                stdin: Input::Inherit,
+                stdout: Output::Capture,
+                stderr: Output::Capture,
+                timeout: None,
+                tee: true,
+            },
+        );
         if exit.code() != 0 {
             return exit;
         }
     }
-    run_native(host, &request(&opts.targets))
+    exit
 }
 
 fn run_native(host: &dyn Host, request: &RunRequest) -> CommandExit {

@@ -269,6 +269,7 @@ fn fixture(source: &Path, build: &Path) -> (ProjectModel, GenerationResult) {
             }),
             dependencies: library.into_iter().collect(),
             cxx_modules: None,
+            ide: None,
         });
         library = Some(id);
     }

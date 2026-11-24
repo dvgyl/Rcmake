@@ -261,6 +261,7 @@ fn fixture(source: &Path, build: &Path, configs: &[&str]) -> (ProjectModel, Gene
             link: None,
             dependencies: Vec::new(),
             cxx_modules: None,
+            ide: None,
         });
     }
     result.install = rcmake_resolve::lower::lower_install_manifest(&model, &result.targets);

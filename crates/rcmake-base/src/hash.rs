@@ -66,6 +66,88 @@ impl HashAlgo {
     }
 }
 
+impl HashAlgo {
+    /// Start a streaming hash computation for this algorithm.
+    ///
+    /// Use the streaming form for large inputs, for example a package file or
+    /// `cmake -E sha256sum` on a large file. The result is the same as
+    /// [`HashAlgo::hex_digest`] over the concatenation of all chunks.
+    #[must_use]
+    pub fn hasher(self) -> IncrementalHasher {
+        let state = match self {
+            Self::Md5 => HasherState::Md5(md5::Md5::new()),
+            Self::Sha1 => HasherState::Sha1(sha1::Sha1::new()),
+            Self::Sha224 => HasherState::Sha224(sha2::Sha224::new()),
+            Self::Sha256 => HasherState::Sha256(sha2::Sha256::new()),
+            Self::Sha384 => HasherState::Sha384(sha2::Sha384::new()),
+            Self::Sha512 => HasherState::Sha512(sha2::Sha512::new()),
+            Self::Sha3_224 => HasherState::Sha3_224(sha3::Sha3_224::new()),
+            Self::Sha3_256 => HasherState::Sha3_256(sha3::Sha3_256::new()),
+            Self::Sha3_384 => HasherState::Sha3_384(sha3::Sha3_384::new()),
+            Self::Sha3_512 => HasherState::Sha3_512(sha3::Sha3_512::new()),
+        };
+        IncrementalHasher { state }
+    }
+}
+
+/// Streaming hash state created by [`HashAlgo::hasher`].
+///
+/// Call [`IncrementalHasher::update`] once for each chunk of input. Then call
+/// [`IncrementalHasher::finish_hex`] to get the lowercase hexadecimal digest.
+#[derive(Clone, Debug)]
+pub struct IncrementalHasher {
+    state: HasherState,
+}
+
+#[derive(Clone, Debug)]
+enum HasherState {
+    Md5(md5::Md5),
+    Sha1(sha1::Sha1),
+    Sha224(sha2::Sha224),
+    Sha256(sha2::Sha256),
+    Sha384(sha2::Sha384),
+    Sha512(sha2::Sha512),
+    Sha3_224(sha3::Sha3_224),
+    Sha3_256(sha3::Sha3_256),
+    Sha3_384(sha3::Sha3_384),
+    Sha3_512(sha3::Sha3_512),
+}
+
+impl IncrementalHasher {
+    /// Add the bytes in `data` to the hash input.
+    pub fn update(&mut self, data: &[u8]) {
+        match &mut self.state {
+            HasherState::Md5(h) => h.update(data),
+            HasherState::Sha1(h) => h.update(data),
+            HasherState::Sha224(h) => h.update(data),
+            HasherState::Sha256(h) => h.update(data),
+            HasherState::Sha384(h) => h.update(data),
+            HasherState::Sha512(h) => h.update(data),
+            HasherState::Sha3_224(h) => h.update(data),
+            HasherState::Sha3_256(h) => h.update(data),
+            HasherState::Sha3_384(h) => h.update(data),
+            HasherState::Sha3_512(h) => h.update(data),
+        }
+    }
+
+    /// Finish the computation and return the lowercase hexadecimal digest.
+    #[must_use]
+    pub fn finish_hex(self) -> String {
+        match self.state {
+            HasherState::Md5(h) => hex_encode(&h.finalize()),
+            HasherState::Sha1(h) => hex_encode(&h.finalize()),
+            HasherState::Sha224(h) => hex_encode(&h.finalize()),
+            HasherState::Sha256(h) => hex_encode(&h.finalize()),
+            HasherState::Sha384(h) => hex_encode(&h.finalize()),
+            HasherState::Sha512(h) => hex_encode(&h.finalize()),
+            HasherState::Sha3_224(h) => hex_encode(&h.finalize()),
+            HasherState::Sha3_256(h) => hex_encode(&h.finalize()),
+            HasherState::Sha3_384(h) => hex_encode(&h.finalize()),
+            HasherState::Sha3_512(h) => hex_encode(&h.finalize()),
+        }
+    }
+}
+
 mod rcmake_base_internal {
     pub(super) fn hex_encode(bytes: &[u8]) -> String {
         const HEX: &[u8; 16] = b"0123456789abcdef";
@@ -99,6 +181,37 @@ mod tests {
         assert_eq!(
             HashAlgo::Sha3_256.hex_digest(b"abc"),
             "3a985da74fe225b2045c172d6bd390bd855f086e3e9d525b46bfe24511431532"
+        );
+    }
+
+    #[test]
+    fn streaming_digest_equals_one_shot_digest_for_every_algorithm() {
+        let data: Vec<u8> = (0..10_000u32).map(|i| (i % 251) as u8).collect();
+        for algo in [
+            HashAlgo::Md5,
+            HashAlgo::Sha1,
+            HashAlgo::Sha224,
+            HashAlgo::Sha256,
+            HashAlgo::Sha384,
+            HashAlgo::Sha512,
+            HashAlgo::Sha3_224,
+            HashAlgo::Sha3_256,
+            HashAlgo::Sha3_384,
+            HashAlgo::Sha3_512,
+        ] {
+            let mut hasher = algo.hasher();
+            for chunk in data.chunks(997) {
+                hasher.update(chunk);
+            }
+            assert_eq!(hasher.finish_hex(), algo.hex_digest(&data), "{algo:?}");
+        }
+    }
+
+    #[test]
+    fn streaming_digest_of_no_input_is_empty_digest() {
+        assert_eq!(
+            HashAlgo::Sha256.hasher().finish_hex(),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
         );
     }
 }

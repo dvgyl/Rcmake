@@ -31,7 +31,60 @@ fn check_fs(host: &dyn Host, root: &Path) -> HostResult<()> {
     check_files(host, &root)?;
     check_links(host, &root)?;
     check_directories(host, &root)?;
+    check_rename_noreplace(host, &root)?;
+    check_file_locks(host, &root)?;
     check_relative_paths(host, &root);
+    Ok(())
+}
+
+fn check_rename_noreplace(host: &dyn Host, root: &Path) -> HostResult<()> {
+    let from = root.join("noreplace-from");
+    let to = root.join("noreplace-to");
+    host.write(&from, b"new", WriteMode::Truncate)?;
+    host.write(&to, b"old", WriteMode::Truncate)?;
+    match host.rename_noreplace(&from, &to) {
+        // The filesystem cannot do it. The files must not change.
+        Err(err) if err.kind == ErrorKind::Unsupported => {}
+        result => {
+            assert_kind(result, ErrorKind::AlreadyExists);
+            host.remove_file(&to)?;
+            host.rename_noreplace(&from, &to)?;
+            assert!(host.metadata(&from, Follow::No).is_err());
+        }
+    }
+    let expected: &[u8] = if host.metadata(&from, Follow::No).is_ok() {
+        b"old"
+    } else {
+        b"new"
+    };
+    assert_eq!(host.read(&to, ALL)?, expected);
+    assert_kind(
+        host.rename_noreplace(Path::new("relative"), &to),
+        ErrorKind::InvalidInput,
+    );
+    Ok(())
+}
+
+fn check_file_locks(host: &dyn Host, root: &Path) -> HostResult<()> {
+    let path = root.join("lock-file");
+    let guard = host.lock_file(&path, Some(Duration::ZERO))?;
+    assert_eq!(guard.path().file_name(), path.file_name());
+    assert_eq!(host.read(&path, ALL)?, b"");
+    assert_kind(
+        host.lock_file(&path, Some(Duration::ZERO)),
+        ErrorKind::TimedOut,
+    );
+    assert_kind(
+        host.lock_file(&path, Some(Duration::from_millis(30))),
+        ErrorKind::TimedOut,
+    );
+    drop(guard);
+    let again = host.lock_file(&path, None)?;
+    drop(again);
+    assert_kind(
+        host.lock_file(Path::new("relative.lock"), None),
+        ErrorKind::InvalidInput,
+    );
     Ok(())
 }
 

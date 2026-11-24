@@ -466,6 +466,8 @@ dependencies = [
  "rcmake-gen-common",
  "rcmake-gen-make",
  "rcmake-gen-ninja",
+ "rcmake-gen-vs",
+ "rcmake-gen-xcode",
  "rcmake-genex",
  "rcmake-host",
  "rcmake-instrument",
@@ -588,9 +590,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "rcmake-fuzz"
+version = "0.1.0"
+dependencies = [
+ "rcmake-archive",
+ "rcmake-base",
+ "rcmake-cps",
+ "rcmake-expr",
+ "rcmake-genex",
+ "rcmake-host",
+ "rcmake-json",
+ "rcmake-presets",
+ "rcmake-regex",
+ "rcmake-syntax",
+]
+
+[[package]]
 name = "rcmake-gen-common"
 version = "0.1.0"
 dependencies = [
+ "indexmap",
  "jiff",
  "rcmake-base",
  "rcmake-cps",
@@ -628,6 +647,32 @@ dependencies = [
  "rcmake-host",
  "rcmake-model",
  "rcmake-resolve",
+]
+
+[[package]]
+name = "rcmake-gen-vs"
+version = "0.1.0"
+dependencies = [
+ "md-5",
+ "rcmake-base",
+ "rcmake-diag",
+ "rcmake-gen-common",
+ "rcmake-host",
+ "rcmake-model",
+ "rcmake-resolve",
+]
+
+[[package]]
+name = "rcmake-gen-xcode"
+version = "0.1.0"
+dependencies = [
+ "rcmake-base",
+ "rcmake-diag",
+ "rcmake-gen-common",
+ "rcmake-host",
+ "rcmake-model",
+ "rcmake-resolve",
+ "sha2",
 ]
 
 [[package]]
