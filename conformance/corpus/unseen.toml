@@ -1,0 +1,2107 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+# Frozen sample from the GitHub pool. See tools/corpus/unseen_select.py.
+# The first fifth of the seeded order is the development split.
+schema_version = 1
+seed = 20261124
+pool_size = 595
+pool_sha256 = "24c240e838e59282aba554ae73880745927ad6452d6a227efad3dfd046d1b033"
+
+[[project]]
+name = "dusty-nv/jetson-inference"
+url = "https://github.com/dusty-nv/jetson-inference"
+commit = "45da40a8f3c180191b269f57f736caaa025b8a69"
+split = "dev"
+category = "science"
+
+[[project]]
+name = "ClickHouse/ClickHouse"
+url = "https://github.com/ClickHouse/ClickHouse"
+commit = "c2937c8dbb77c73fa8034879ce6a8573b8625d78"
+split = "dev"
+category = "other"
+
+[[project]]
+name = "ceres-solver/ceres-solver"
+url = "https://github.com/ceres-solver/ceres-solver"
+commit = "c39d3cdced6051690c7992ade0f6566fa822ccd2"
+split = "dev"
+category = "other"
+
+[[project]]
+name = "SteamClientHomebrew/Millennium"
+url = "https://github.com/SteamClientHomebrew/Millennium"
+commit = "3b3702aa4838a22dbf7277dbd535d40499f26e4a"
+split = "dev"
+category = "other"
+
+[[project]]
+name = "akheron/jansson"
+url = "https://github.com/akheron/jansson"
+commit = "e972497b965c165f0f4db29d6f2aab43fde43553"
+split = "dev"
+category = "data"
+
+[[project]]
+name = "google/tcmalloc"
+url = "https://github.com/google/tcmalloc"
+commit = "afcf25e3c76f099ca410b994c3621312d438ed10"
+split = "dev"
+category = "other"
+
+[[project]]
+name = "Oneflow-Inc/oneflow"
+url = "https://github.com/Oneflow-Inc/oneflow"
+commit = "25c8978c1c8b1371ef6aa4187dae4495bd233c35"
+split = "dev"
+category = "science"
+
+[[project]]
+name = "kvcache-ai/Mooncake"
+url = "https://github.com/kvcache-ai/Mooncake"
+commit = "bf3b95a9c9311c479e6e296046c5f8e194a80d78"
+split = "dev"
+category = "other"
+
+[[project]]
+name = "zeromq/libzmq"
+url = "https://github.com/zeromq/libzmq"
+commit = "46493370217ac135246617fa2f6ac819d8b61bfc"
+split = "dev"
+category = "network"
+
+[[project]]
+name = "RPCS3/rpcs3"
+url = "https://github.com/RPCS3/rpcs3"
+commit = "34ce3f70eb4fa84bd3d4a39ef6af3d0bd1d869f8"
+split = "dev"
+category = "graphics"
+
+[[project]]
+name = "realsenseai/librealsense"
+url = "https://github.com/realsenseai/librealsense"
+commit = "50d06ec64d2c9b3d857ba0a1cb9cd04a38ef2160"
+split = "dev"
+category = "science"
+
+[[project]]
+name = "transmission/transmission"
+url = "https://github.com/transmission/transmission"
+commit = "e024d47a5004152739e0e714cde4d9d3eba907bf"
+split = "dev"
+category = "other"
+
+[[project]]
+name = "plasma-umass/coz"
+url = "https://github.com/plasma-umass/coz"
+commit = "63f83f4f053bbea30009fab970e8000215299047"
+split = "dev"
+category = "other"
+
+[[project]]
+name = "skywind3000/kcp"
+url = "https://github.com/skywind3000/kcp"
+commit = "b1a7a2101dcbb96017681a500d6b82bbe5a88766"
+split = "dev"
+category = "other"
+
+[[project]]
+name = "sogou/workflow"
+url = "https://github.com/sogou/workflow"
+commit = "496eec54070cc0145bc6e427f7d078c0670efc3d"
+split = "dev"
+category = "network"
+
+[[project]]
+name = "tindy2013/subconverter"
+url = "https://github.com/tindy2013/subconverter"
+commit = "a0d4eab28cb8b6c782d4ce5c3a918de4829b4a72"
+split = "dev"
+category = "other"
+
+[[project]]
+name = "espressif/ESP8266_RTOS_SDK"
+url = "https://github.com/espressif/ESP8266_RTOS_SDK"
+commit = "858c7c2eb9004691f2c736c64a23715f6ea900c4"
+split = "dev"
+category = "other"
+
+[[project]]
+name = "prusa3d/PrusaSlicer"
+url = "https://github.com/prusa3d/PrusaSlicer"
+commit = "e6c85c50dcc56f9968a61dfdd7a3b695e1004037"
+split = "dev"
+category = "other"
+
+[[project]]
+name = "iovisor/bcc"
+url = "https://github.com/iovisor/bcc"
+commit = "87e9ef9670eb6bcadb15474d64d7bdba6f25d675"
+split = "dev"
+category = "other"
+
+[[project]]
+name = "ClassicOldSong/Apollo"
+url = "https://github.com/ClassicOldSong/Apollo"
+commit = "adc5c5a0bd80831ce495434bb16aee2cd4175fb8"
+split = "dev"
+category = "other"
+
+[[project]]
+name = "mlpack/mlpack"
+url = "https://github.com/mlpack/mlpack"
+commit = "c032dba143b76468e7551b8810a0f6bf31fc35bb"
+split = "dev"
+category = "science"
+
+[[project]]
+name = "throneproj/Throne"
+url = "https://github.com/throneproj/Throne"
+commit = "966e1a002f3e52f5adfe2ce063e52cc81e16ed3a"
+split = "dev"
+category = "other"
+
+[[project]]
+name = "TheAlgorithms/C-Plus-Plus"
+url = "https://github.com/TheAlgorithms/C-Plus-Plus"
+commit = "fdcc29b0ac2848e9d1a8d926e171cc5b39f97759"
+split = "dev"
+category = "other"
+
+[[project]]
+name = "halide/Halide"
+url = "https://github.com/halide/Halide"
+commit = "05113e0426c026dd06fdea90d94504854ae03123"
+split = "dev"
+category = "graphics"
+
+[[project]]
+name = "SFML/SFML"
+url = "https://github.com/SFML/SFML"
+commit = "f5887b46307bdacb451ee6fd79349bbb8a79eaeb"
+split = "dev"
+category = "graphics"
+
+[[project]]
+name = "capnproto/capnproto"
+url = "https://github.com/capnproto/capnproto"
+commit = "ee05f52b62c319dfba3bfc62bd3094d35b18bc3f"
+split = "dev"
+category = "other"
+
+[[project]]
+name = "CLIUtils/CLI11"
+url = "https://github.com/CLIUtils/CLI11"
+commit = "4fa080f70b6768d30e2fcf58ab5a9de162d5f8fd"
+split = "dev"
+category = "other"
+
+[[project]]
+name = "ztxz16/fastllm"
+url = "https://github.com/ztxz16/fastllm"
+commit = "7f83217c8ff76cae7ae0f58ee4facf3a954825c3"
+split = "dev"
+category = "other"
+
+[[project]]
+name = "WerWolv/ImHex"
+url = "https://github.com/WerWolv/ImHex"
+commit = "53621e7c5f40f7d4dd6df3a9c3547e9884dbde6b"
+split = "dev"
+category = "other"
+
+[[project]]
+name = "harfbuzz/harfbuzz"
+url = "https://github.com/harfbuzz/harfbuzz"
+commit = "fda3b122dbfd86aa57f53c4318254034a1c62b2f"
+split = "dev"
+category = "other"
+
+[[project]]
+name = "SerenityOS/serenity"
+url = "https://github.com/SerenityOS/serenity"
+commit = "12623e403e0c3ae5e86bcc5821fa9cef4dee7fec"
+split = "dev"
+category = "systems"
+
+[[project]]
+name = "alibaba/zvec"
+url = "https://github.com/alibaba/zvec"
+commit = "fe49e5481950c85723b5f5ce75afea5ff7b5082a"
+split = "dev"
+category = "systems"
+
+[[project]]
+name = "PCSX2/pcsx2"
+url = "https://github.com/PCSX2/pcsx2"
+commit = "4e56d430595164106eab9606cb46c94c902802cd"
+split = "dev"
+category = "games"
+
+[[project]]
+name = "saghul/txiki.js"
+url = "https://github.com/saghul/txiki.js"
+commit = "c13adc667e3e7761ff4d0c12a6ea34efceb4e1ea"
+split = "dev"
+category = "other"
+
+[[project]]
+name = "zealdocs/zeal"
+url = "https://github.com/zealdocs/zeal"
+commit = "1b45004ac0c0375319c88f0acfc2db8536259326"
+split = "dev"
+category = "other"
+
+[[project]]
+name = "turanszkij/WickedEngine"
+url = "https://github.com/turanszkij/WickedEngine"
+commit = "ee910b010a808511160ddc46b809f8c2b5bf0b95"
+split = "dev"
+category = "graphics"
+
+[[project]]
+name = "microsoft/ProcMon-Linux"
+url = "https://github.com/microsoft/ProcMon-Linux"
+commit = "dad42e7c646e4d2f5d3601d4d0d824d445166c82"
+split = "dev"
+category = "other"
+
+[[project]]
+name = "ValveSoftware/GameNetworkingSockets"
+url = "https://github.com/ValveSoftware/GameNetworkingSockets"
+commit = "55f5bc40c180f983f9598184bab3f3ffa7d51f88"
+split = "dev"
+category = "network"
+
+[[project]]
+name = "liuruoze/EasyPR"
+url = "https://github.com/liuruoze/EasyPR"
+commit = "c32d69c50439f02b3ab9b4230048b2895d876d16"
+split = "dev"
+category = "science"
+
+[[project]]
+name = "aristocratos/btop"
+url = "https://github.com/aristocratos/btop"
+commit = "5d03929a45e0720a4c8e2d189360ff1eb9ce1731"
+split = "dev"
+category = "other"
+
+[[project]]
+name = "Almamu/linux-wallpaperengine"
+url = "https://github.com/Almamu/linux-wallpaperengine"
+commit = "a0ddce586e9ff12e9d31ca6b103f6036cc1b68fe"
+split = "dev"
+category = "graphics"
+
+[[project]]
+name = "alibaba/MNN"
+url = "https://github.com/alibaba/MNN"
+commit = "28b8cfac4ca959f60dd63a2b423b55005449f4f5"
+split = "dev"
+category = "graphics"
+
+[[project]]
+name = "fastfetch-cli/fastfetch"
+url = "https://github.com/fastfetch-cli/fastfetch"
+commit = "e09925d303dfc1d3cb35b977017d65c9c1704366"
+split = "dev"
+category = "other"
+
+[[project]]
+name = "lemonade-sdk/lemonade"
+url = "https://github.com/lemonade-sdk/lemonade"
+commit = "be70f8764e859e1e371bc4297a9e1ab068d5d478"
+split = "dev"
+category = "other"
+
+[[project]]
+name = "fontforge/fontforge"
+url = "https://github.com/fontforge/fontforge"
+commit = "bf2dd561ae78f1ebfc5eb262167c7164d8d2de4c"
+split = "dev"
+category = "other"
+
+[[project]]
+name = "mumble-voip/mumble"
+url = "https://github.com/mumble-voip/mumble"
+commit = "28c1373f69745ec5c474510e80802b9ba5595218"
+split = "dev"
+category = "other"
+
+[[project]]
+name = "ahrm/sioyek"
+url = "https://github.com/ahrm/sioyek"
+commit = "1e2f8037353724a83ccb10a697e28e295383e017"
+split = "dev"
+category = "other"
+
+[[project]]
+name = "hoffstadt/DearPyGui"
+url = "https://github.com/hoffstadt/DearPyGui"
+commit = "28aa4cc4641909b6d9f19d6fdea7cccdc9f552af"
+split = "dev"
+category = "graphics"
+
+[[project]]
+name = "rr-debugger/rr"
+url = "https://github.com/rr-debugger/rr"
+commit = "b3e8e725184ef81e6f0a5e3eb9d5a598d419ccde"
+split = "dev"
+category = "other"
+
+[[project]]
+name = "unum-cloud/USearch"
+url = "https://github.com/unum-cloud/USearch"
+commit = "840374af1a1dd5d411826bc62fdfe5ef6e41e1de"
+split = "dev"
+category = "data"
+
+[[project]]
+name = "cameron314/readerwriterqueue"
+url = "https://github.com/cameron314/readerwriterqueue"
+commit = "87b1df19256d68a9e093ca1540a5ef96b69145e8"
+split = "dev"
+category = "other"
+
+[[project]]
+name = "audacity/audacity"
+url = "https://github.com/audacity/audacity"
+commit = "9e971fa37f328a1ea1156acf80d3b8f8cd95c7de"
+split = "dev"
+category = "other"
+
+[[project]]
+name = "google/oboe"
+url = "https://github.com/google/oboe"
+commit = "a36d098e379bf09ed1d36611da76706a1e6dc43c"
+split = "dev"
+category = "other"
+
+[[project]]
+name = "mltframework/shotcut"
+url = "https://github.com/mltframework/shotcut"
+commit = "2eba56a72af3b7806876f2a2956cfff789db1468"
+split = "dev"
+category = "other"
+
+[[project]]
+name = "shadowsocks/shadowsocks-c"
+url = "https://github.com/shadowsocks/shadowsocks-c"
+commit = "50f1ae54f737aa66f8edba05bdbf7250ff7f8a60"
+split = "dev"
+category = "other"
+
+[[project]]
+name = "zeek/zeek"
+url = "https://github.com/zeek/zeek"
+commit = "661ba0540c799d6a8a32135a7a114a390e2e8cdb"
+split = "dev"
+category = "other"
+
+[[project]]
+name = "JoseExposito/touchegg"
+url = "https://github.com/JoseExposito/touchegg"
+commit = "93f8a28e37b87568f439f6c4c616c907fbbf4a33"
+split = "dev"
+category = "other"
+
+[[project]]
+name = "mackron/miniaudio"
+url = "https://github.com/mackron/miniaudio"
+commit = "877ea4a7c2601c7b0f2a44e83dfac42e6470fea6"
+split = "dev"
+category = "other"
+
+[[project]]
+name = "juce-framework/JUCE"
+url = "https://github.com/juce-framework/JUCE"
+commit = "654bdbc7a9db0dae90849b44abe91f339e9f0768"
+split = "dev"
+category = "other"
+
+[[project]]
+name = "bvschaik/julius"
+url = "https://github.com/bvschaik/julius"
+commit = "6746d82c1261aafd17837533ac0f18b99744b3d3"
+split = "dev"
+category = "games"
+
+[[project]]
+name = "emcrisostomo/fswatch"
+url = "https://github.com/emcrisostomo/fswatch"
+commit = "40dfff9938210059e08e318acc493aa19572a6a7"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "webui-dev/webui"
+url = "https://github.com/webui-dev/webui"
+commit = "24c7d196edc63f5b777d465063c3d26731f52dea"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "mapnik/mapnik"
+url = "https://github.com/mapnik/mapnik"
+commit = "7a1a0761f8fd97f7e22605175758eaaaa2dae1fa"
+split = "holdout"
+category = "graphics"
+
+[[project]]
+name = "arrayfire/arrayfire"
+url = "https://github.com/arrayfire/arrayfire"
+commit = "b11d7007980bee208f8e1c89dfbd9131790110f8"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "scylladb/seastar"
+url = "https://github.com/scylladb/seastar"
+commit = "d469b147bf501137157e7c73e0b6e97c966c229e"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "Likely7/Veyra-NRVideo"
+url = "https://github.com/Likely7/Veyra-NRVideo"
+commit = "bc59d457ce0b87141f3db2ebafb0f4812b1cea39"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "3proxy/3proxy"
+url = "https://github.com/3proxy/3proxy"
+commit = "d323ab2d5a75a89d858f12d445b980484fea5e72"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "hyprwm/Hyprland"
+url = "https://github.com/hyprwm/Hyprland"
+commit = "60a66a14d13788fc07293eccb697eb0bdcebd5be"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "libarchive/libarchive"
+url = "https://github.com/libarchive/libarchive"
+commit = "dff9063983f7c8e1fe55deb83f33f2edd8f48134"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "azahar-emu/azahar"
+url = "https://github.com/azahar-emu/azahar"
+commit = "4a147c509571a3d16a06abe679fe1339dbbdbfd7"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "hluk/CopyQ"
+url = "https://github.com/hluk/CopyQ"
+commit = "8661ce26313a051b1f7f96de96898c1695477f98"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "BehaviorTree/BehaviorTree.CPP"
+url = "https://github.com/BehaviorTree/BehaviorTree.CPP"
+commit = "365b2e499d34ba1220588188a7aa045158909b0f"
+split = "holdout"
+category = "science"
+
+[[project]]
+name = "microsoft/GSL"
+url = "https://github.com/microsoft/GSL"
+commit = "a4651c0f995d3309432f78e977058d9d4760f9fa"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "microsoft/SEAL"
+url = "https://github.com/microsoft/SEAL"
+commit = "ce53aa40969364f79599009bc8882f71fce0c13d"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "PX4/PX4-Autopilot"
+url = "https://github.com/PX4/PX4-Autopilot"
+commit = "f01b37551281ea7ee39c95f3ad7fa5aaf3238bba"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "cxasm/notepad--"
+url = "https://github.com/cxasm/notepad--"
+commit = "4510896f716e71db9f4b25ed8559b9c39a4f23d4"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "SoftEtherVPN/SoftEtherVPN"
+url = "https://github.com/SoftEtherVPN/SoftEtherVPN"
+commit = "790cad92bf05e2165b8356071698e3e87e0ecff2"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "zaphoyd/websocketpp"
+url = "https://github.com/zaphoyd/websocketpp"
+commit = "4dfe1be74e684acca19ac1cf96cce0df9eac2a2d"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "x64dbg/x64dbg"
+url = "https://github.com/x64dbg/x64dbg"
+commit = "85590fbac9bdfe3600355c04c9f05dc5d36d4973"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "shadps4-emu/shadPS4"
+url = "https://github.com/shadps4-emu/shadPS4"
+commit = "5c3b6910b99ea4e4d019533490137fe80e400306"
+split = "holdout"
+category = "graphics"
+
+[[project]]
+name = "SunshineStream/Sunshine"
+url = "https://github.com/SunshineStream/Sunshine"
+commit = "433c876056c36f762428921a8b0a7760afe3911f"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "olive-editor/olive"
+url = "https://github.com/olive-editor/olive"
+commit = "7e0e94abf6610026aebb9ddce8564c39522fac6e"
+split = "holdout"
+category = "graphics"
+
+[[project]]
+name = "merbanan/rtl_433"
+url = "https://github.com/merbanan/rtl_433"
+commit = "199bf3fa39175df6a2c0b2324d07fa28bb461ba6"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "wisdompeak/LeetCode"
+url = "https://github.com/wisdompeak/LeetCode"
+commit = "9ad43c8952fa474f76597738a599774d081103fc"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "KDE/ghostwriter"
+url = "https://github.com/KDE/ghostwriter"
+commit = "c59b94a5352a3045fff7cecbb720b5af1f6eb1bc"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "LibreCAD/LibreCAD"
+url = "https://github.com/LibreCAD/LibreCAD"
+commit = "954217a719f7fff1f54bdf4ee894a0e462e21934"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "ZLMediaKit/ZLMediaKit"
+url = "https://github.com/ZLMediaKit/ZLMediaKit"
+commit = "117ab934d48e256689318484bbf7f24e103ed25e"
+split = "holdout"
+category = "network"
+
+[[project]]
+name = "Gnucash/gnucash"
+url = "https://github.com/Gnucash/gnucash"
+commit = "52ae07ed1bcaa61c943548036ecaf9e893e38208"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "google/gemma.cpp"
+url = "https://github.com/google/gemma.cpp"
+commit = "3ed403e28707c0e3eb5f48b0e487b63a446d8e2e"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "mosra/magnum"
+url = "https://github.com/mosra/magnum"
+commit = "f0907f1c1d1247e6b9e2120ccf42971430edf5e0"
+split = "holdout"
+category = "graphics"
+
+[[project]]
+name = "grpc/grpc"
+url = "https://github.com/grpc/grpc"
+commit = "163eab02a839eddfa6a836a92bf3a11c80b18b39"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "microsoft/msquic"
+url = "https://github.com/microsoft/msquic"
+commit = "d9c912419f6e80f2ace5e8aa64ac2fd7fd831e9d"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "stlink-org/stlink"
+url = "https://github.com/stlink-org/stlink"
+commit = "34de09cf71cb97814a5106ef29570c5aa912c5d6"
+split = "holdout"
+category = "systems"
+
+[[project]]
+name = "jerryscript-project/jerryscript"
+url = "https://github.com/jerryscript-project/jerryscript"
+commit = "b7069350c2e52e7dc721dfb75f067147bd79b39b"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "o3de/o3de"
+url = "https://github.com/o3de/o3de"
+commit = "79ff3b09b4f239f5e084f81fea5c77fbb6f747bc"
+split = "holdout"
+category = "games"
+
+[[project]]
+name = "FEX-Emu/FEX"
+url = "https://github.com/FEX-Emu/FEX"
+commit = "63b8e0b76677d073dd278695fccc1e94f0c984f8"
+split = "holdout"
+category = "games"
+
+[[project]]
+name = "includeos/IncludeOS"
+url = "https://github.com/includeos/IncludeOS"
+commit = "6fd33d32631b7ad138f775f5dbd6b6c83b47b659"
+split = "holdout"
+category = "systems"
+
+[[project]]
+name = "bombela/backward-cpp"
+url = "https://github.com/bombela/backward-cpp"
+commit = "78b2541c9d3c44bc81e2c5f4f34aa3503ac985de"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "musescore/MuseScore"
+url = "https://github.com/musescore/MuseScore"
+commit = "2bcb3ab8928f12d7dbc01f4809338d5ffee382a3"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "the-tcpdump-group/tcpdump"
+url = "https://github.com/the-tcpdump-group/tcpdump"
+commit = "3541bd5d38635e208d7dd47cc6ea2af00dd7ef0c"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "k2-fsa/sherpa-onnx"
+url = "https://github.com/k2-fsa/sherpa-onnx"
+commit = "17d5f144035fb35e13b787445fd3a0100998aa5a"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "FFTW/fftw3"
+url = "https://github.com/FFTW/fftw3"
+commit = "a7b679c528330cf6258253d6dcf5ec90552e6c93"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "electronicarts/EASTL"
+url = "https://github.com/electronicarts/EASTL"
+commit = "e323f67e5d93fdadcd44f7998069d804697b1945"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "DynamoRIO/drmemory"
+url = "https://github.com/DynamoRIO/drmemory"
+commit = "3d2b5f9b055dba86c41a75e58c53b59760cc2a6e"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "isl-org/Open3D"
+url = "https://github.com/isl-org/Open3D"
+commit = "2ce4f7e0270a53694e2be651496313256e453c89"
+split = "holdout"
+category = "graphics"
+
+[[project]]
+name = "zortos293/Lichii"
+url = "https://github.com/zortos293/Lichii"
+commit = "97e9eecc48b09552b77ee0752d960f7cddf689b5"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "libcpr/cpr"
+url = "https://github.com/libcpr/cpr"
+commit = "90a0cf433e97f56496bac757dca2b8ba3cfec273"
+split = "holdout"
+category = "network"
+
+[[project]]
+name = "yugabyte/yugabyte-db"
+url = "https://github.com/yugabyte/yugabyte-db"
+commit = "fd5bdcfd10468274da1ba0a8a58a4d24ecee80a8"
+split = "holdout"
+category = "data"
+
+[[project]]
+name = "jbeder/yaml-cpp"
+url = "https://github.com/jbeder/yaml-cpp"
+commit = "f473f3bdfed25271ebd3d268caedc1b0b7f5ff50"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "werman/noise-suppression-for-voice"
+url = "https://github.com/werman/noise-suppression-for-voice"
+commit = "9c4e5c28d8950e2cef837d8a0abd36c2fd9b5c2d"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "vnmakarov/mir"
+url = "https://github.com/vnmakarov/mir"
+commit = "dc2c763f1c8bc746102ce87933d866335f9e6c06"
+split = "holdout"
+category = "systems"
+
+[[project]]
+name = "XRPLF/rippled"
+url = "https://github.com/XRPLF/rippled"
+commit = "2039a45119eb0a31e4f14380a4d2886b74da4650"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "mikke89/RmlUi"
+url = "https://github.com/mikke89/RmlUi"
+commit = "92f0143424a417d6566a2cd037b747b636c6ca8a"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "royshil/obs-backgroundremoval"
+url = "https://github.com/royshil/obs-backgroundremoval"
+commit = "d177d33197099dbeb5ccd430923de39fb941ea19"
+split = "holdout"
+category = "science"
+
+[[project]]
+name = "blechschmidt/massdns"
+url = "https://github.com/blechschmidt/massdns"
+commit = "30c380908b4f9afd0931d3d83f85884844831846"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "bpftrace/bpftrace"
+url = "https://github.com/bpftrace/bpftrace"
+commit = "8ebc73721a582d1082816f5b376d831af47e64c3"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "luanti-org/luanti"
+url = "https://github.com/luanti-org/luanti"
+commit = "84bd3cc0115dbdd259ef9a876cb1b0bd230e3cf6"
+split = "holdout"
+category = "games"
+
+[[project]]
+name = "Stellarium/stellarium"
+url = "https://github.com/Stellarium/stellarium"
+commit = "3863ab071ae08737c00832bfdd00c40279ad055a"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "WebAssembly/wabt"
+url = "https://github.com/WebAssembly/wabt"
+commit = "ce4ebe806b2dc9bba8544db3e5c0bb3c5f4e156f"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "seL4/seL4"
+url = "https://github.com/seL4/seL4"
+commit = "78b0c34efe12ddfe6e7dd616e8538ce49ebf2890"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "patriciogonzalezvivo/glslViewer"
+url = "https://github.com/patriciogonzalezvivo/glslViewer"
+commit = "909abb1aad729e2488de9d8c8358a4d81b564478"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "OpenAtomFoundation/pikiwidb"
+url = "https://github.com/OpenAtomFoundation/pikiwidb"
+commit = "e5887a5bc3a4d60511b1304fe1dc506d053e6529"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "OpenTTD/OpenTTD"
+url = "https://github.com/OpenTTD/OpenTTD"
+commit = "da9851c6b6b2b441f51849ee4dab02b07e22080f"
+split = "holdout"
+category = "games"
+
+[[project]]
+name = "open62541/open62541"
+url = "https://github.com/open62541/open62541"
+commit = "59f556e9920d76e8ecc6567b890003b54561d447"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "HeyWillow/willow"
+url = "https://github.com/HeyWillow/willow"
+commit = "415ba07007f49873649d36e0b384d72640f1cfac"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "hyperion-project/hyperion.ng"
+url = "https://github.com/hyperion-project/hyperion.ng"
+commit = "3aa870386b0fb5de3040b94c7e74ecc485099707"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "Vita3K/Vita3K"
+url = "https://github.com/Vita3K/Vita3K"
+commit = "73ddf822b90087fed39c1dfe3bcd1788ad4ee9fb"
+split = "holdout"
+category = "games"
+
+[[project]]
+name = "nmslib/hnswlib"
+url = "https://github.com/nmslib/hnswlib"
+commit = "ca426729609b3221563047ceb269cc1213e0d376"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "colmap/colmap"
+url = "https://github.com/colmap/colmap"
+commit = "c0e326d5c99539ecaaf7945a5d76006b4b4bbdce"
+split = "holdout"
+category = "science"
+
+[[project]]
+name = "skypjack/entt"
+url = "https://github.com/skypjack/entt"
+commit = "1dcd7aab6548786f7672ff578639188bd2f0d837"
+split = "holdout"
+category = "games"
+
+[[project]]
+name = "winsiderss/systeminformer"
+url = "https://github.com/winsiderss/systeminformer"
+commit = "b365d1a89e104abe014ff2d853e8b91807d0defd"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "FastLED/FastLED"
+url = "https://github.com/FastLED/FastLED"
+commit = "6e37141d0f70d56e7ab73bb45ad51e859e8d4256"
+split = "holdout"
+category = "systems"
+
+[[project]]
+name = "OrcaSlicer/OrcaSlicer"
+url = "https://github.com/OrcaSlicer/OrcaSlicer"
+commit = "cd9218c1d6339018b2c3e218564662d3d5fb12c5"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "spotify/annoy"
+url = "https://github.com/spotify/annoy"
+commit = "379f744667aba6b40ba3db8a07678df173a88f74"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "libgit2/libgit2"
+url = "https://github.com/libgit2/libgit2"
+commit = "6f7d8484366d8b23ec4ca0509fcfcb8f13aabc8b"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "adafruit/Adafruit-GFX-Library"
+url = "https://github.com/adafruit/Adafruit-GFX-Library"
+commit = "249bc2b105bdeb0022f7e4762e77a38e94aa0d7b"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "rime/librime"
+url = "https://github.com/rime/librime"
+commit = "f70ae3c0b2dab61553cc74516268c0633a93dba0"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "solvespace/solvespace"
+url = "https://github.com/solvespace/solvespace"
+commit = "5553e843a9c33f79aca175f329c9c0d38d85bd11"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "meta/redex"
+url = "https://github.com/meta/redex"
+commit = "598d50eec4f46e10f44b2dc22943530652e5126b"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "sz3/libcimbar"
+url = "https://github.com/sz3/libcimbar"
+commit = "0eee8920f9c35188b29e81ec995bb7cac2216de1"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "Tencent/ncnn"
+url = "https://github.com/Tencent/ncnn"
+commit = "211cd397b21df663d9fdc9c837c0c8fc23343de3"
+split = "holdout"
+category = "graphics"
+
+[[project]]
+name = "avast/retdec"
+url = "https://github.com/avast/retdec"
+commit = "9450585772e6f1c18e5f0b2ad5518a18d6bce71e"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "paolo-projects/auto-unlocker"
+url = "https://github.com/paolo-projects/auto-unlocker"
+commit = "ddc03aa4a5609cc59922e760834496c76fe1a700"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "tporadowski/redis"
+url = "https://github.com/tporadowski/redis"
+commit = "f4894a6a4d665171f776bfdb48081f5695b61d9c"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "doxygen/doxygen"
+url = "https://github.com/doxygen/doxygen"
+commit = "482a3b7aa4097bf81b213671367fa339312c25bb"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "ibireme/yyjson"
+url = "https://github.com/ibireme/yyjson"
+commit = "be9bd74bb3c96e00006c2075c330a6b8b90123dc"
+split = "holdout"
+category = "data"
+
+[[project]]
+name = "pocoproject/poco"
+url = "https://github.com/pocoproject/poco"
+commit = "bec8910a2b777ca04d01694bbe99028a0164fcd2"
+split = "holdout"
+category = "data"
+
+[[project]]
+name = "brndnmtthws/conky"
+url = "https://github.com/brndnmtthws/conky"
+commit = "f2f88b26ae309bb8bce7357820af6a086ba41a13"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "flashlight/flashlight"
+url = "https://github.com/flashlight/flashlight"
+commit = "1bb22bba16992becfba721ca4a7385fbd3c81eab"
+split = "holdout"
+category = "science"
+
+[[project]]
+name = "apache/brpc"
+url = "https://github.com/apache/brpc"
+commit = "d39ac64c664b5b71e612362f467085349ff8a77e"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "react/yoga"
+url = "https://github.com/react/yoga"
+commit = "8d20739cf68e4fbb31139ccc1823b3ee002443b9"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "timescale/timescaledb"
+url = "https://github.com/timescale/timescaledb"
+commit = "3399070330ddca14006b6c153663b4251a4afd48"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "DynamoRIO/dynamorio"
+url = "https://github.com/DynamoRIO/dynamorio"
+commit = "28e7fbbbb10b8c0ef52c34d86bfaa99841b00a0e"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "ptitSeb/box86"
+url = "https://github.com/ptitSeb/box86"
+commit = "bb716a2a6576cc06da811bf55e31e2f6f03b7596"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "HarbourMasters/Shipwright"
+url = "https://github.com/HarbourMasters/Shipwright"
+commit = "64df9cb8e3cd1ad0bcae17d6db2cf98b5d3027eb"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "lastpass/lastpass-cli"
+url = "https://github.com/lastpass/lastpass-cli"
+commit = "949bad64e9db1bed89606cba78f32f6708cef3f0"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "recp/cglm"
+url = "https://github.com/recp/cglm"
+commit = "b9b570b78d58ceecc704f7a4e19b84dc45937ef4"
+split = "holdout"
+category = "graphics"
+
+[[project]]
+name = "ssloy/tinyrenderer"
+url = "https://github.com/ssloy/tinyrenderer"
+commit = "97eb7a480e762285899a93c5d21e70a79e60782e"
+split = "holdout"
+category = "graphics"
+
+[[project]]
+name = "draios/sysdig"
+url = "https://github.com/draios/sysdig"
+commit = "e91d29b401b98bbda580f11e1ef092dc55a5fbaa"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "MaskRay/ccls"
+url = "https://github.com/MaskRay/ccls"
+commit = "626805aedfac50618ef15cada762a4b0ee283bfa"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "manticoresoftware/manticoresearch"
+url = "https://github.com/manticoresoftware/manticoresearch"
+commit = "e9bd16c5c583676cbeb99f4ac9b7887cdbad6451"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "coturn/coturn"
+url = "https://github.com/coturn/coturn"
+commit = "04fad0c85e0c03acc16dbd56ee0134c6a57b45a3"
+split = "holdout"
+category = "network"
+
+[[project]]
+name = "PlotJuggler/PlotJuggler"
+url = "https://github.com/PlotJuggler/PlotJuggler"
+commit = "a06d77886cb6a10cd09fcf1aac5571a66a51fb76"
+split = "holdout"
+category = "network"
+
+[[project]]
+name = "clementine-player/Clementine"
+url = "https://github.com/clementine-player/Clementine"
+commit = "656d3d70368aca9619665bf850baf2e7853a06da"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "google/or-tools"
+url = "https://github.com/google/or-tools"
+commit = "ffea732ce3b6f928e117914521b1f4be67ebcad9"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "Vhonowslend/StreamFX-Public"
+url = "https://github.com/Vhonowslend/StreamFX-Public"
+commit = "99352c80405a64693ca8c967fafabe141e768e57"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "alandefreitas/matplotplusplus"
+url = "https://github.com/alandefreitas/matplotplusplus"
+commit = "2ccbb7ff86295bb4d3aca2938dce09ca3accb1ef"
+split = "holdout"
+category = "graphics"
+
+[[project]]
+name = "espressif/esp-idf"
+url = "https://github.com/espressif/esp-idf"
+commit = "ad20ded62a2d67a26e501fdc1905f43ba7ad6c81"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "OGRECave/ogre"
+url = "https://github.com/OGRECave/ogre"
+commit = "30120c0de562f0ad11d429b584b3862462f9a6f9"
+split = "holdout"
+category = "graphics"
+
+[[project]]
+name = "hasherezade/pe-bear"
+url = "https://github.com/hasherezade/pe-bear"
+commit = "4bc892d560b1ec457bd6e4c82b83d106bf93a0a1"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "MultiMC/Launcher"
+url = "https://github.com/MultiMC/Launcher"
+commit = "b56ab2ebed03c8e33ed8829b3fc1d24b8df332b5"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "karlstav/cava"
+url = "https://github.com/karlstav/cava"
+commit = "505cbf6dc19be0e0aaf082b5b35f1031102c5e97"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "ShadowsocksR-Live/shadowsocksr-native"
+url = "https://github.com/ShadowsocksR-Live/shadowsocksr-native"
+commit = "17677abc3c3c0992244b732c7b62397022dbbe79"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "supercollider/supercollider"
+url = "https://github.com/supercollider/supercollider"
+commit = "9254ec807aaeaf078e18abf61f6a4dad64753fb2"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "diasurgical/DevilutionX"
+url = "https://github.com/diasurgical/DevilutionX"
+commit = "e1c377775a206274f73b5f01c84a967d06e74d54"
+split = "holdout"
+category = "games"
+
+[[project]]
+name = "olikraus/u8g2"
+url = "https://github.com/olikraus/u8g2"
+commit = "8d8be1800732fecaa37c0dd02774396ae18c4ec8"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "jarro2783/cxxopts"
+url = "https://github.com/jarro2783/cxxopts"
+commit = "f81e75772c5819be02326665728536c0d96fcd70"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "SpriteOvO/AirPodsDesktop"
+url = "https://github.com/SpriteOvO/AirPodsDesktop"
+commit = "593c8c05aa82ded42d372a4e2453ee1bb624b896"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "google/bloaty"
+url = "https://github.com/google/bloaty"
+commit = "ccb49b0be3d5bc0dd156bcf16f1515726c395ec5"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "pybind/pybind11"
+url = "https://github.com/pybind/pybind11"
+commit = "8862f60cbc805a6e916f17d0230bcf58dfc4b13a"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "BYVoid/OpenCC"
+url = "https://github.com/BYVoid/OpenCC"
+commit = "fae2a0a911c30764e669a7d8b0591cd8e852934a"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "deskflow/deskflow"
+url = "https://github.com/deskflow/deskflow"
+commit = "80221f0f7b7ebd807fb1ffdf00906bbcfe561011"
+split = "holdout"
+category = "network"
+
+[[project]]
+name = "RawTherapee/RawTherapee"
+url = "https://github.com/RawTherapee/RawTherapee"
+commit = "3458b9a1813f26b99c8dcf22aad7cc24deffdbae"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "barry-ran/QtScrcpy"
+url = "https://github.com/barry-ran/QtScrcpy"
+commit = "b018bec82cc32113cfd13e4ca7e0f198d71c69ef"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "MaaXYZ/MaaFramework"
+url = "https://github.com/MaaXYZ/MaaFramework"
+commit = "366b5535a636283bba474afca0db974e4d91432e"
+split = "holdout"
+category = "science"
+
+[[project]]
+name = "amnezia-vpn/amnezia-client"
+url = "https://github.com/amnezia-vpn/amnezia-client"
+commit = "4f0fa34449439428619aeb89d6d8622671dffbbb"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "vesoft-inc/nebula"
+url = "https://github.com/vesoft-inc/nebula"
+commit = "426266b5c3df856d27f747b55b916dec542b7b59"
+split = "holdout"
+category = "data"
+
+[[project]]
+name = "andreasfertig/cppinsights"
+url = "https://github.com/andreasfertig/cppinsights"
+commit = "5374b54f704de8610a2c9150df748577c22eb8cc"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "NixOS/patchelf"
+url = "https://github.com/NixOS/patchelf"
+commit = "2b4b49d36b62690860414dd127f567be4f1f3208"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "Zuhaitz-dev/zenc-lang"
+url = "https://github.com/Zuhaitz-dev/zenc-lang"
+commit = "b3f550e938be3fd395e9ebf657669f89dbb3453b"
+split = "holdout"
+category = "systems"
+
+[[project]]
+name = "wxWidgets/wxWidgets"
+url = "https://github.com/wxWidgets/wxWidgets"
+commit = "3a78644c8969d63160dfa95302eb0cac903471fe"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "polybar/polybar"
+url = "https://github.com/polybar/polybar"
+commit = "f99e0b1c7a5b094f5a04b14101899d0cb4ece69d"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "vladelaina/BongoCat"
+url = "https://github.com/vladelaina/BongoCat"
+commit = "29ccda67802e6b6727acae0bdf42f50277f9aade"
+split = "holdout"
+category = "graphics"
+
+[[project]]
+name = "uxlfoundation/oneTBB"
+url = "https://github.com/uxlfoundation/oneTBB"
+commit = "d61a637efe543f91f606f7f4c90fe7450db22117"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "Qv2ray/Qv2ray"
+url = "https://github.com/Qv2ray/Qv2ray"
+commit = "9880c8d3ec4057952849905c5cbcd95edc042bfa"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "OpenMW/openmw"
+url = "https://github.com/OpenMW/openmw"
+commit = "2e8e9c220e59976e44cdb3b5a4b4be20895bb041"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "MariaDB/server"
+url = "https://github.com/MariaDB/server"
+commit = "820699c7e88c8858dbcab16caf9af587333559e9"
+split = "holdout"
+category = "data"
+
+[[project]]
+name = "wangyu-/udp2raw"
+url = "https://github.com/wangyu-/udp2raw"
+commit = "4208db6e27c46f3ccec8b98722af7ec23bc62e73"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "taurusxin/ncmdump"
+url = "https://github.com/taurusxin/ncmdump"
+commit = "4ede4cee1bad35bbf28a7b5524feeca0422a4feb"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "wireshark/wireshark"
+url = "https://github.com/wireshark/wireshark"
+commit = "de881a2a862b9c16372458287f05dfd4b4b8c762"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "qpdf/qpdf"
+url = "https://github.com/qpdf/qpdf"
+commit = "4eba95899886e851cc41d76886483b347612f2a8"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "zhaojh329/rtty"
+url = "https://github.com/zhaojh329/rtty"
+commit = "b0429e7cb3531a143993af31f9da16ff16492409"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "defold/defold"
+url = "https://github.com/defold/defold"
+commit = "a5879cb3b3fa54534317065bd5aeb895a1c9b883"
+split = "holdout"
+category = "games"
+
+[[project]]
+name = "ThrowTheSwitch/Unity"
+url = "https://github.com/ThrowTheSwitch/Unity"
+commit = "54f864cf6027a50f4cc5424616e9e01e1bb729da"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "melonDS-emu/melonDS"
+url = "https://github.com/melonDS-emu/melonDS"
+commit = "ff972523f8a70e877dd054439876c3c8c6b79197"
+split = "holdout"
+category = "games"
+
+[[project]]
+name = "KytyPS5/KytyPS5"
+url = "https://github.com/KytyPS5/KytyPS5"
+commit = "30781dcda029cbd669aa81337ac2902c9c3015d8"
+split = "holdout"
+category = "graphics"
+
+[[project]]
+name = "albertlauncher/albert"
+url = "https://github.com/albertlauncher/albert"
+commit = "c703546832dd8e7c961b74895d43b8d0cdadf7c8"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "valkey-io/valkey"
+url = "https://github.com/valkey-io/valkey"
+commit = "38e5b3aefdc0cea0bd2ff855360ff452a647997a"
+split = "holdout"
+category = "data"
+
+[[project]]
+name = "lava/matplotlib-cpp"
+url = "https://github.com/lava/matplotlib-cpp"
+commit = "c0249394d4b94c37e2cbc349923b0c0fa083570d"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "leandromoreira/ffmpeg-libav-tutorial"
+url = "https://github.com/leandromoreira/ffmpeg-libav-tutorial"
+commit = "82df59dffa161ef1cf47b86f6b958e7b2f78bb8a"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "zmap/zmap"
+url = "https://github.com/zmap/zmap"
+commit = "a1ba2bfbfbf8ea6d249a25b6d400d5418927d502"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "xournalpp/xournalpp"
+url = "https://github.com/xournalpp/xournalpp"
+commit = "0d992b5cbabb9d975188c164b0e38c2ab33f1ff6"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "AnswerDotAI/gpu.cpp"
+url = "https://github.com/AnswerDotAI/gpu.cpp"
+commit = "09bdeaa7a0c6715ed7624ee90eda53aa2d8c4cbc"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "xbmc/xbmc"
+url = "https://github.com/xbmc/xbmc"
+commit = "bef396dca56764e7c50ccf52375c8ec60a1263c3"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "gperftools/gperftools"
+url = "https://github.com/gperftools/gperftools"
+commit = "4c04245f9f943e09748a607251f715fa78251fc7"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "google/highway"
+url = "https://github.com/google/highway"
+commit = "7224de78ddb7de49ce4b01c1795e43e33b1f153f"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "LibreSprite/LibreSprite"
+url = "https://github.com/LibreSprite/LibreSprite"
+commit = "5f8c7ed908245d0663bb2715f1730d76273c032e"
+split = "holdout"
+category = "graphics"
+
+[[project]]
+name = "N64Recomp/N64Recomp"
+url = "https://github.com/N64Recomp/N64Recomp"
+commit = "598ce2080004a5672d604dceadbda436045307b7"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "Tiiny-AI/PowerInfer"
+url = "https://github.com/Tiiny-AI/PowerInfer"
+commit = "8bd56d69906c9d2dba4d3bf6899763401e01a9a4"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "Kitware/CMake"
+url = "https://github.com/Kitware/CMake"
+commit = "4207edd6abcaa33719037ec1095d7767f4c684b4"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "lief-project/LIEF"
+url = "https://github.com/lief-project/LIEF"
+commit = "2a6fdbc5a3af9b7ac797514ca38b1175c78f3fcf"
+split = "holdout"
+category = "data"
+
+[[project]]
+name = "catboost/catboost"
+url = "https://github.com/catboost/catboost"
+commit = "e71944ebf531711df5246d9b150ea9117ee531a9"
+split = "holdout"
+category = "science"
+
+[[project]]
+name = "QuipNetwork/cpp-sdk"
+url = "https://github.com/QuipNetwork/cpp-sdk"
+commit = "3b8bb29860794ae0f24587fca7a6e4015ebe7253"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "mydumper/mydumper"
+url = "https://github.com/mydumper/mydumper"
+commit = "2069f7b6c315234f927ecea6828fa6e98054d8fb"
+split = "holdout"
+category = "data"
+
+[[project]]
+name = "TixiaoShan/LIO-SAM"
+url = "https://github.com/TixiaoShan/LIO-SAM"
+commit = "0be1fbe6275fb8366d5b800af4fc8c76a885c869"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "nanopb/nanopb"
+url = "https://github.com/nanopb/nanopb"
+commit = "2de40e37c89e5bef88f92639e309860f0239ac26"
+split = "holdout"
+category = "systems"
+
+[[project]]
+name = "reactos/reactos"
+url = "https://github.com/reactos/reactos"
+commit = "a3772c9df2a1a6f486cf957721956b18ebb19776"
+split = "holdout"
+category = "systems"
+
+[[project]]
+name = "dragonflydb/dragonfly"
+url = "https://github.com/dragonflydb/dragonfly"
+commit = "4caf7a2111e303f48630675db0091c12a27be545"
+split = "holdout"
+category = "data"
+
+[[project]]
+name = "duilib/duilib"
+url = "https://github.com/duilib/duilib"
+commit = "85658d47036445626f5a24d5287f348fff871604"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "danielkrupinski/Osiris"
+url = "https://github.com/danielkrupinski/Osiris"
+commit = "12aa94bb4d77753fa91e37915d69e4c2053d8ede"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "apache/mesos"
+url = "https://github.com/apache/mesos"
+commit = "c1b42f79d157aa900be5cbb0c1023f1479962aa7"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "panda3d/panda3d"
+url = "https://github.com/panda3d/panda3d"
+commit = "ec9ea0a93a7de249efea3f41b4fdf878f5e1650b"
+split = "holdout"
+category = "graphics"
+
+[[project]]
+name = "the-tcpdump-group/libpcap"
+url = "https://github.com/the-tcpdump-group/libpcap"
+commit = "1213ba8d382f376aa5ac02941238848101340997"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "ithewei/libhv"
+url = "https://github.com/ithewei/libhv"
+commit = "060a4b6c0cf8ae252741d0a58976376eac02e8c5"
+split = "holdout"
+category = "network"
+
+[[project]]
+name = "uxlfoundation/oneDNN"
+url = "https://github.com/uxlfoundation/oneDNN"
+commit = "9c7a3b6d6cf4e4068a16a30f65e4c5f7b0539c78"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "Tencent/TNN"
+url = "https://github.com/Tencent/TNN"
+commit = "f0cb08129a05c5b60f08e4ef66042a54a883a56a"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "bdwgc/bdwgc"
+url = "https://github.com/bdwgc/bdwgc"
+commit = "ca243c4c6f1f426ccb0602bbc85caa1505749cfa"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "Project-OSRM/osrm-backend"
+url = "https://github.com/Project-OSRM/osrm-backend"
+commit = "cc70f4b3ec5be228048932a49065655d05c690ec"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "firebase/firebase-ios-sdk"
+url = "https://github.com/firebase/firebase-ios-sdk"
+commit = "3100a6c36f1e2268114c363e3426293b1475c8db"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "jedisct1/minisign"
+url = "https://github.com/jedisct1/minisign"
+commit = "b6de4fe31b4c519887cef8b080eb1816b18795ae"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "AlkaidLab/foundation-sunshine"
+url = "https://github.com/AlkaidLab/foundation-sunshine"
+commit = "feb13a39e29de5c2b91d777039ddd3f5614a4cc2"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "facebookincubator/velox"
+url = "https://github.com/facebookincubator/velox"
+commit = "24bd2c634abcab5742a425cc35b0120715a5b62c"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "apache/httpd"
+url = "https://github.com/apache/httpd"
+commit = "477078fb3b3bd3794c710db29d08eba32cf2ed00"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "dpilger26/NumCpp"
+url = "https://github.com/dpilger26/NumCpp"
+commit = "ffbb16380efe7e268039061c1de9e4ce7c9018cc"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "microsoft/mimalloc"
+url = "https://github.com/microsoft/mimalloc"
+commit = "1d8fd85aa3abe719cd9c42c855f1fc27dbccf84d"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "marcobambini/gravity"
+url = "https://github.com/marcobambini/gravity"
+commit = "fd28a7383e996c083b85774c3858d7ab4d6b3070"
+split = "holdout"
+category = "data"
+
+[[project]]
+name = "mgba-emu/mgba"
+url = "https://github.com/mgba-emu/mgba"
+commit = "431935616c0e216d650b25b2ea0c0acccd359038"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "falcosecurity/falco"
+url = "https://github.com/falcosecurity/falco"
+commit = "74ccf76b7b2d85ff42c97da6bd6a716b0d1d17b9"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "albfan/miraclecast"
+url = "https://github.com/albfan/miraclecast"
+commit = "0b7f1f1f6586dc65ff480f3cda5c2170a70aa020"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "google-ai-edge/LiteRT-LM"
+url = "https://github.com/google-ai-edge/LiteRT-LM"
+commit = "efdf08dd30bc72b1c7f60d1fdd087e3e4c25e6b1"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "yhirose/cpp-httplib"
+url = "https://github.com/yhirose/cpp-httplib"
+commit = "baf27c59933f0a96072dd124e616a1cc973b4995"
+split = "holdout"
+category = "network"
+
+[[project]]
+name = "hzeller/rpi-rgb-led-matrix"
+url = "https://github.com/hzeller/rpi-rgb-led-matrix"
+commit = "a8dd6854580b7e2b18d0f697cec94415dd8824cd"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "KDE/kdeconnect-kde"
+url = "https://github.com/KDE/kdeconnect-kde"
+commit = "110ab2f490c875c4bc4c781ec0100b2d70743c84"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "oceanbase/miniob"
+url = "https://github.com/oceanbase/miniob"
+commit = "3259c37c8ddd8900ab045c8ce1fa1f5bf4d1e67d"
+split = "holdout"
+category = "data"
+
+[[project]]
+name = "RfidResearchGroup/proxmark3"
+url = "https://github.com/RfidResearchGroup/proxmark3"
+commit = "eaa444e842ee0ec74c7a17a765e3f1046abe2559"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "apache/thrift"
+url = "https://github.com/apache/thrift"
+commit = "8d8d282177a8bc8cfa156341ff082a7e47dd5b55"
+split = "holdout"
+category = "network"
+
+[[project]]
+name = "PointCloudLibrary/pcl"
+url = "https://github.com/PointCloudLibrary/pcl"
+commit = "fd39f32af932d50e033dba17b29e6d5fa4f64255"
+split = "holdout"
+category = "science"
+
+[[project]]
+name = "OSGeo/gdal"
+url = "https://github.com/OSGeo/gdal"
+commit = "6d7a6388745ef760b68d3ea460d700f4be5479c4"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "wangyu-/UDPspeeder"
+url = "https://github.com/wangyu-/UDPspeeder"
+commit = "b6a1b5941d9ebb6ef4f6866abdf1e03a47b99b2d"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "jellyfin/jellyfin-desktop"
+url = "https://github.com/jellyfin/jellyfin-desktop"
+commit = "70930139f7ef0c59b6ac98e8d0be436953c79083"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "chiaki-ng/chiaki-ng"
+url = "https://github.com/chiaki-ng/chiaki-ng"
+commit = "43728af2e639fecb8a7af1cd68c29820a40de973"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "root-project/cling"
+url = "https://github.com/root-project/cling"
+commit = "996f0bc2675d6a0751008199e01151b031dfdade"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "zhuzichu520/FluentUI"
+url = "https://github.com/zhuzichu520/FluentUI"
+commit = "7e33a2f672d18239ef49ab960075b1137a1d18e7"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "gnuradio/gnuradio"
+url = "https://github.com/gnuradio/gnuradio"
+commit = "3d33e04a249b31ef32106d275b927a7c4cf86425"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "PrismLauncher/PrismLauncher"
+url = "https://github.com/PrismLauncher/PrismLauncher"
+commit = "9b2353e2e8265c50b97d236282e10562bcc01493"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "mindspore-ai/mindspore"
+url = "https://github.com/mindspore-ai/mindspore"
+commit = "16873579685a1662f10ebd1df068bf512f211869"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "f4exb/sdrangel"
+url = "https://github.com/f4exb/sdrangel"
+commit = "f9b12c954b21b5e236db5488b1c1d1a2c92abf4d"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "TigerVNC/tigervnc"
+url = "https://github.com/TigerVNC/tigervnc"
+commit = "d07907c8a1541350fe9a3e564f3d78f006e9825c"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "openvinotoolkit/openvino"
+url = "https://github.com/openvinotoolkit/openvino"
+commit = "7e922df4fb08c8513f956b6007ae043a5020bd6c"
+split = "holdout"
+category = "science"
+
+[[project]]
+name = "keepassxreboot/keepassxc"
+url = "https://github.com/keepassxreboot/keepassxc"
+commit = "cd42236540c1cfca332c0f051d981acfdacf7b4e"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "rizinorg/cutter"
+url = "https://github.com/rizinorg/cutter"
+commit = "2001163c9228bb4fd1efa998058aae8bc8f0ccd2"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "drogonframework/drogon"
+url = "https://github.com/drogonframework/drogon"
+commit = "6822c1e03ff97948833b2aaa0837902db7c445a4"
+split = "holdout"
+category = "network"
+
+[[project]]
+name = "flashlight/wav2letter"
+url = "https://github.com/flashlight/wav2letter"
+commit = "b1e19bad8bdb64eeaadd6fc1b929b94740c42d7d"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "boykopovar/AnyPS5"
+url = "https://github.com/boykopovar/AnyPS5"
+commit = "aae1ec14243ada09434e85cd329e7d1edd718fab"
+split = "holdout"
+category = "graphics"
+
+[[project]]
+name = "phoboslab/wipeout-rewrite"
+url = "https://github.com/phoboslab/wipeout-rewrite"
+commit = "b425ecb3b3250e4fdcb4462b72c3fb9679a1eb59"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "wolfSSL/wolfssl"
+url = "https://github.com/wolfSSL/wolfssl"
+commit = "f3af02b569a8176b63dadaaeb9a0de0347b6c733"
+split = "holdout"
+category = "network"
+
+[[project]]
+name = "nextcloud/desktop"
+url = "https://github.com/nextcloud/desktop"
+commit = "a803d53084029d3a3abb42ebc43ac73153339b7a"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "zerotier/ZeroTierOne"
+url = "https://github.com/zerotier/ZeroTierOne"
+commit = "899352e38405968516bb12a770f0ac02f6058fa8"
+split = "holdout"
+category = "network"
+
+[[project]]
+name = "vaibhavpandeyvpz/apkstudio"
+url = "https://github.com/vaibhavpandeyvpz/apkstudio"
+commit = "8fdd3815e915399fc193e2b16ad74b513993f24b"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "praydog/REFramework"
+url = "https://github.com/praydog/REFramework"
+commit = "22c713cef9372b918c08d3c0550fcec0ea6714e4"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "univrsal/input-overlay"
+url = "https://github.com/univrsal/input-overlay"
+commit = "7d97ae9e66d9e4dd968f759fcafd447969510f23"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "iNavFlight/inav"
+url = "https://github.com/iNavFlight/inav"
+commit = "2527f7764f6394ee344a3edafb5a98f3b222e03a"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "strawberrymusicplayer/strawberry"
+url = "https://github.com/strawberrymusicplayer/strawberry"
+commit = "757afa355f193d9ef229e1bd8cf124d3bd03e09f"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "stenzek/duckstation"
+url = "https://github.com/stenzek/duckstation"
+commit = "0403d3c45a33c7a7e2b3d5c27db364e6c2e08da0"
+split = "holdout"
+category = "graphics"
+
+[[project]]
+name = "taichi-dev/taichi"
+url = "https://github.com/taichi-dev/taichi"
+commit = "ba0e81dce559fb63a5958bf82feb1d00c55c02fe"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "Tencent/rapidjson"
+url = "https://github.com/Tencent/rapidjson"
+commit = "297637bc0a0f00dc504dbc1a47ebdaa577f8ae19"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "unicorn-engine/unicorn"
+url = "https://github.com/unicorn-engine/unicorn"
+commit = "7c5db94191defc1e04a4f66f4eb1220903cba837"
+split = "holdout"
+category = "games"
+
+[[project]]
+name = "bulletphysics/bullet3"
+url = "https://github.com/bulletphysics/bullet3"
+commit = "d3afe76132fc76b0f9b2359cbaef47a3766e7fbb"
+split = "holdout"
+category = "science"
+
+[[project]]
+name = "supertuxkart/stk-code"
+url = "https://github.com/supertuxkart/stk-code"
+commit = "b2a9f223326422aa2dd4eea28319b0c5115fde03"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "uber/h3"
+url = "https://github.com/uber/h3"
+commit = "33ec62807261311a26eb59f8a1c95163c988efff"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "bblanchon/ArduinoJson"
+url = "https://github.com/bblanchon/ArduinoJson"
+commit = "1f6e62f63eeb3fcfdb9f7c131eba294bfef76390"
+split = "holdout"
+category = "data"
+
+[[project]]
+name = "KDE/heaptrack"
+url = "https://github.com/KDE/heaptrack"
+commit = "a9495a8bd58c727c106d8cd86a7c6ac84285b140"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "davisking/dlib"
+url = "https://github.com/davisking/dlib"
+commit = "a7b38a1f12fda2e99f207d501ff9c8a5d040b90f"
+split = "holdout"
+category = "science"
+
+[[project]]
+name = "tzapu/WiFiManager"
+url = "https://github.com/tzapu/WiFiManager"
+commit = "4131fe617d01d746677e8b909379597162c2ca58"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "oceanbase/oceanbase"
+url = "https://github.com/oceanbase/oceanbase"
+commit = "d375c6d70e8dd81c0d153496c85a1a22dfbc81f2"
+split = "holdout"
+category = "data"
+
+[[project]]
+name = "f3d-app/f3d"
+url = "https://github.com/f3d-app/f3d"
+commit = "2604aaa49c30c9693cd01eb97af3b0a82bd1e144"
+split = "holdout"
+category = "graphics"
+
+[[project]]
+name = "apache/kvrocks"
+url = "https://github.com/apache/kvrocks"
+commit = "d5e0ce4a71441d1e0f5b528b6b8296c745d5dc33"
+split = "holdout"
+category = "data"
+
+[[project]]
+name = "webview/webview"
+url = "https://github.com/webview/webview"
+commit = "f244320ab0d82fdab98a094e02996fc26d0ffd0c"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "FULU-Foundation/OrcaSlicer-bambulab"
+url = "https://github.com/FULU-Foundation/OrcaSlicer-bambulab"
+commit = "1b556d73f80e69f512881eab3331e6e9f70e5bf5"
+split = "holdout"
+category = "other"
+
+[[project]]
+name = "GothenburgBitFactory/taskwarrior"
+url = "https://github.com/GothenburgBitFactory/taskwarrior"
+commit = "f4dbc9ef4e9edc7c7dcb6ffbcf6176f30085843a"
+split = "holdout"
+category = "other"
