@@ -310,9 +310,23 @@ impl<'a> Search<'a> {
             .decoration
             .iter()
             .flat_map(|library| library.paths(dir, name));
-        for path in try_direct
-            .then(|| direct.clone())
+        let windows_program = cfg!(windows) && matches!(self.kind, Kind::Program);
+        let programs = [".com", ".exe"]
             .into_iter()
+            .filter(|suffix| {
+                windows_program
+                    && !name
+                        .as_os_str()
+                        .as_encoded_bytes()
+                        .ends_with(suffix.as_bytes())
+            })
+            .map(|suffix| {
+                let mut path = direct.as_os_str().to_os_string();
+                path.push(suffix);
+                PathBuf::from(path)
+            });
+        for path in programs
+            .chain(try_direct.then(|| direct.clone()))
             .chain(alternatives)
         {
             if let Some(found) = self.accept(cx, &path, dir)? {

@@ -528,6 +528,26 @@ find_program(ABSOLUTE {absolute} NO_DEFAULT_PATH)
 }
 
 #[test]
+#[cfg(windows)]
+fn find_program_tries_windows_executable_suffixes() -> HostResult<()> {
+    let (host, mut interp) = setup();
+    host.env_set(b"PATH", Some(b"C:/tools"));
+    for name in ["ninja.exe", "tool.com", "tool.exe", "tool", "plain"] {
+        host.seed_file(&Path::new("C:/tools").join(name), b"")?;
+    }
+    let script = "
+find_program(NINJA ninja NAMES_PER_DIR)
+find_program(TOOL tool)
+find_program(PLAIN plain)
+";
+    assert_eq!(run(&host, &mut interp, script)?, 0);
+    assert_eq!(var(&mut interp, b"NINJA"), "C:/tools/ninja.exe");
+    assert_eq!(var(&mut interp, b"TOOL"), "C:/tools/tool.com");
+    assert_eq!(var(&mut interp, b"PLAIN"), "C:/tools/plain");
+    Ok(())
+}
+
+#[test]
 fn find_search_order_and_disable_options() -> HostResult<()> {
     let (host, mut interp) = setup();
     for file in [
