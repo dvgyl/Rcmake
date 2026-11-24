@@ -294,6 +294,10 @@ impl<H: Host + ?Sized> NoProcessHost<H> {
 }
 
 impl<H: Host + ?Sized> Host for NoProcessHost<H> {
+    fn supports_process_execution(&self) -> bool {
+        false
+    }
+
     fn run(
         &self,
         req: &RunRequest,
@@ -398,6 +402,15 @@ impl<H: Host + ?Sized> Host for NoProcessHost<H> {
         mtime: Option<FileTime>,
     ) -> HostResult<()> {
         self.base.set_times(p, atime, mtime)
+    }
+
+    fn set_symlink_times(
+        &self,
+        p: &Path,
+        atime: Option<FileTime>,
+        mtime: Option<FileTime>,
+    ) -> HostResult<()> {
+        self.base.set_symlink_times(p, atime, mtime)
     }
 
     fn env_get(&self, key: &[u8]) -> Option<BString> {

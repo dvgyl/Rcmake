@@ -212,6 +212,23 @@ fn updates_file_and_parent_times_and_preserves_explicit_times() -> HostResult<()
 }
 
 #[test]
+fn stores_link_times_in_the_overlay() -> HostResult<()> {
+    let base = Arc::new(PureHost::default());
+    let link = Path::new("/work/link");
+    base.symlink(Path::new("missing"), link)?;
+    let original = base.metadata(link, Follow::No)?;
+    let host = OverlayHost::from_shared(Arc::clone(&base));
+
+    let mtime = FileTime { secs: 11, nanos: 5 };
+    host.set_symlink_times(link, None, Some(mtime))?;
+    let updated = host.metadata(link, Follow::No)?;
+    assert_eq!(updated.mtime, mtime);
+    assert_eq!(updated.atime, original.atime);
+    assert_eq!(base.metadata(link, Follow::No)?, original);
+    Ok(())
+}
+
+#[test]
 fn streaming_uses_one_version_for_overlay_and_base_files() -> HostResult<()> {
     let original = vec![5; FILE_CHUNK_SIZE + 16];
     for base_backed in [false, true] {

@@ -112,10 +112,12 @@ pub(super) fn preserve_mtime(dst: &File, metadata: &fs::Metadata) -> io::Result<
     dst.set_times(FileTimes::new().set_modified(metadata.modified()?))
 }
 
+/// Set each supplied timestamp using the requested link behavior.
 pub(super) fn set_times(
     path: &Path,
     atime: Option<FileTime>,
     mtime: Option<FileTime>,
+    follow: Follow,
 ) -> io::Result<()> {
     let mut times = FileTimes::new();
     if let Some(atime) = atime {
@@ -124,7 +126,7 @@ pub(super) fn set_times(
     if let Some(mtime) = mtime {
         times = times.set_modified(to_system_time(mtime)?);
     }
-    open_attributes(path, FILE_WRITE_ATTRIBUTES, Follow::Yes)?.set_times(times)
+    open_attributes(path, FILE_WRITE_ATTRIBUTES, follow)?.set_times(times)
 }
 
 pub(super) fn set_permissions(path: &Path, mode: u32) -> io::Result<()> {

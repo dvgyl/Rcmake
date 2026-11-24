@@ -60,6 +60,27 @@ impl NativeHost {
             start: Instant::now(),
         })
     }
+
+    fn set_entry_times(
+        &self,
+        p: &Path,
+        atime: Option<FileTime>,
+        mtime: Option<FileTime>,
+        follow: Follow,
+    ) -> HostResult<()> {
+        require_absolute(p)?;
+        if atime
+            .into_iter()
+            .chain(mtime)
+            .any(|time| time.nanos >= 1_000_000_000)
+        {
+            return Err(SyntheticError::InvalidInput.at(Some(p)));
+        }
+        if atime.is_none() && mtime.is_none() {
+            return self.metadata(p, follow).map(|_| ());
+        }
+        io_at(platform::set_times(p, atime, mtime, follow), p)
+    }
 }
 
 fn env_key(key: &[u8]) -> BString {
@@ -404,18 +425,16 @@ impl Host for NativeHost {
         atime: Option<FileTime>,
         mtime: Option<FileTime>,
     ) -> HostResult<()> {
-        require_absolute(p)?;
-        if atime
-            .into_iter()
-            .chain(mtime)
-            .any(|time| time.nanos >= 1_000_000_000)
-        {
-            return Err(SyntheticError::InvalidInput.at(Some(p)));
-        }
-        if atime.is_none() && mtime.is_none() {
-            return self.metadata(p, Follow::Yes).map(|_| ());
-        }
-        io_at(platform::set_times(p, atime, mtime), p)
+        self.set_entry_times(p, atime, mtime, Follow::Yes)
+    }
+
+    fn set_symlink_times(
+        &self,
+        p: &Path,
+        atime: Option<FileTime>,
+        mtime: Option<FileTime>,
+    ) -> HostResult<()> {
+        self.set_entry_times(p, atime, mtime, Follow::No)
     }
 
     fn env_get(&self, key: &[u8]) -> Option<BString> {
@@ -541,6 +560,41 @@ impl Host for NativeHost {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sets_link_times_without_changing_the_target() -> HostResult<()> {
+        #[cfg(windows)]
+        const ERROR_PRIVILEGE_NOT_HELD: i32 = 1314;
+
+        let dir = tempfile::tempdir().map_err(|err| HostError::from_io(err, None))?;
+        let target = dir.path().join("target");
+        let link = dir.path().join("link");
+        let host = NativeHost::new()?;
+        host.write(&target, b"file", WriteMode::CreateNew)?;
+        match host.symlink(&target, &link) {
+            #[cfg(windows)]
+            Err(err) if err.errno == Some(ERROR_PRIVILEGE_NOT_HELD) => return Ok(()),
+            result => result?,
+        }
+        let target_before = host.metadata(&target, Follow::No)?;
+        let link_before = host.metadata(&link, Follow::No)?;
+
+        let mtime = FileTime {
+            secs: 1_700_000_000,
+            nanos: 0,
+        };
+        host.set_symlink_times(&link, None, Some(mtime))?;
+        let updated = host.metadata(&link, Follow::No)?;
+        assert_eq!(updated.mtime, mtime);
+        assert_eq!(updated.atime, link_before.atime);
+        assert_eq!(host.metadata(&target, Follow::No)?, target_before);
+
+        host.remove_file(&target)?;
+        host.set_symlink_times(&link, Some(mtime), None)?;
+        assert_eq!(host.metadata(&link, Follow::No)?.atime, mtime);
+        assert_eq!(host.metadata(&link, Follow::No)?.mtime, mtime);
+        Ok(())
+    }
 
     #[test]
     fn hard_link_rename_preserves_an_existing_destination() -> io::Result<()> {

@@ -664,11 +664,13 @@ impl FileSystem {
         Ok(())
     }
 
+    /// Set each supplied timestamp using the requested link behavior.
     pub(super) fn set_times(
         &mut self,
         path: &Path,
         atime: Option<FileTime>,
         mtime: Option<FileTime>,
+        follow: Follow,
     ) -> HostResult<()> {
         require_absolute(path)?;
         if atime
@@ -678,7 +680,7 @@ impl FileSystem {
         {
             return Err(SyntheticError::InvalidInput.at(Some(path)));
         }
-        let (_, ino) = self.existing(path, Follow::Yes)?;
+        let (_, ino) = self.existing(path, follow)?;
         let inode = self.inode_mut(ino, path)?;
         if let Some(atime) = atime {
             inode.atime = atime;

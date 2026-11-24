@@ -400,6 +400,23 @@ pub trait Host: Send + Sync {
         mtime: Option<FileTime>,
     ) -> HostResult<()>;
 
+    /// Set access and modification times on the entry at `path`.
+    ///
+    /// Set the times on the link itself if the final path component is a symbolic link.
+    /// Each `None` value preserves the corresponding timestamp.
+    /// The default returns [`std::io::ErrorKind::Unsupported`] for absolute paths.
+    fn set_symlink_times(
+        &self,
+        path: &Path,
+        _atime: Option<FileTime>,
+        _mtime: Option<FileTime>,
+    ) -> HostResult<()> {
+        require_absolute(path)?;
+        Err(HostError::unsupported(
+            "This host cannot set symbolic link timestamps",
+        ))
+    }
+
     /// Read an environment variable from the host snapshot + overlay.
     fn env_get(&self, key: &[u8]) -> Option<BString>;
 
@@ -408,6 +425,13 @@ pub trait Host: Send + Sync {
 
     /// Return all active environment variables as sorted `(key, value)` pairs.
     fn env_all(&self) -> Vec<(BString, BString)>;
+
+    /// Return `false` if the host always rejects process requests.
+    ///
+    /// This query does not run a command. The default returns `true`.
+    fn supports_process_execution(&self) -> bool {
+        true
+    }
 
     /// Run a command or pipeline with explicit cwd, env, stdio, and optional timeout.
     fn run(
@@ -491,4 +515,22 @@ fn validate_run(req: &RunRequest, require_absolute: fn(&Path) -> HostResult<()>)
         return Err(error::SyntheticError::InvalidInput.at(None));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn process_capability_reports_the_host_policy_without_logging_a_denial() {
+        assert!(PureHost::default().supports_process_execution());
+        assert!(MemoHost::new(PureHost::default()).supports_process_execution());
+        assert!(!OverlayHost::new(PureHost::default()).supports_process_execution());
+
+        let disabled = std::sync::Arc::new(NoProcessHost::new(PureHost::default()));
+        assert!(!disabled.supports_process_execution());
+        let memo = MemoHost::from_shared(std::sync::Arc::clone(&disabled));
+        assert!(!memo.supports_process_execution());
+        assert!(disabled.denied_commands().is_empty());
+    }
 }

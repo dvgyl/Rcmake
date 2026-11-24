@@ -318,6 +318,16 @@ impl<H: Host + ?Sized> Host for MemoHost<H> {
         self.base.set_times(p, atime, mtime)
     }
 
+    fn set_symlink_times(
+        &self,
+        p: &Path,
+        atime: Option<FileTime>,
+        mtime: Option<FileTime>,
+    ) -> HostResult<()> {
+        let _change = self.begin_change();
+        self.base.set_symlink_times(p, atime, mtime)
+    }
+
     fn env_get(&self, key: &[u8]) -> Option<BString> {
         self.base.env_get(key)
     }
@@ -328,6 +338,10 @@ impl<H: Host + ?Sized> Host for MemoHost<H> {
 
     fn env_all(&self) -> Vec<(BString, BString)> {
         self.base.env_all()
+    }
+
+    fn supports_process_execution(&self) -> bool {
+        self.base.supports_process_execution()
     }
 
     fn run(
@@ -384,6 +398,10 @@ mod tests {
     }
 
     impl Host for ProbeHost {
+        fn supports_process_execution(&self) -> bool {
+            self.base.supports_process_execution()
+        }
+
         fn run(
             &self,
             req: &RunRequest,
@@ -495,6 +513,15 @@ mod tests {
             mtime: Option<FileTime>,
         ) -> HostResult<()> {
             self.base.set_times(p, atime, mtime)
+        }
+
+        fn set_symlink_times(
+            &self,
+            p: &Path,
+            atime: Option<FileTime>,
+            mtime: Option<FileTime>,
+        ) -> HostResult<()> {
+            self.base.set_symlink_times(p, atime, mtime)
         }
 
         fn env_get(&self, key: &[u8]) -> Option<BString> {
@@ -612,6 +639,22 @@ mod tests {
                 invalidations: 0
             }
         );
+        Ok(())
+    }
+
+    #[test]
+    fn refreshes_cached_link_times_after_a_forwarded_update() -> HostResult<()> {
+        let base = PureHost::default();
+        let link = Path::new("/work/link");
+        base.symlink(Path::new("missing"), link)?;
+        let host = MemoHost::new(crate::NoProcessHost::new(base));
+        let before = host.metadata(link, Follow::No)?;
+
+        let mtime = FileTime { secs: 11, nanos: 5 };
+        host.set_symlink_times(link, None, Some(mtime))?;
+        let updated = host.metadata(link, Follow::No)?;
+        assert_eq!(updated.mtime, mtime);
+        assert_eq!(updated.atime, before.atime);
         Ok(())
     }
 

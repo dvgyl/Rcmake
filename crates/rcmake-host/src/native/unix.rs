@@ -85,11 +85,17 @@ pub(super) fn set_permissions(path: &Path, mode: u32) -> io::Result<()> {
     fs::set_permissions(path, fs::Permissions::from_mode(mode & 0o7777))
 }
 
+/// Set each supplied timestamp using the requested link behavior.
 pub(super) fn set_times(
     p: &Path,
     atime: Option<FileTime>,
     mtime: Option<FileTime>,
+    follow: Follow,
 ) -> io::Result<()> {
+    let flags = match follow {
+        Follow::Yes => AtFlags::empty(),
+        Follow::No => AtFlags::SYMLINK_NOFOLLOW,
+    };
     rustix::fs::utimensat(
         CWD,
         p,
@@ -97,7 +103,7 @@ pub(super) fn set_times(
             last_access: timestamp(atime),
             last_modification: timestamp(mtime),
         },
-        AtFlags::empty(),
+        flags,
     )
     .map_err(Into::into)
 }

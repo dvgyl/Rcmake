@@ -286,7 +286,16 @@ impl Host for PureHost {
         atime: Option<FileTime>,
         mtime: Option<FileTime>,
     ) -> HostResult<()> {
-        self.lock()?.fs.set_times(p, atime, mtime)
+        self.lock()?.fs.set_times(p, atime, mtime, Follow::Yes)
+    }
+
+    fn set_symlink_times(
+        &self,
+        p: &Path,
+        atime: Option<FileTime>,
+        mtime: Option<FileTime>,
+    ) -> HostResult<()> {
+        self.lock()?.fs.set_times(p, atime, mtime, Follow::No)
     }
 
     fn env_get(&self, key: &[u8]) -> Option<BString> {
@@ -403,5 +412,36 @@ fn require_absolute(path: &Path) -> HostResult<()> {
         Ok(())
     } else {
         Err(HostError::not_absolute(path.to_path_buf()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sets_times_on_the_link_and_preserves_omitted_values() -> HostResult<()> {
+        let host = PureHost::default();
+        let target = Path::new("/work/target");
+        let link = Path::new("/work/link");
+        host.seed_file(target, b"file")?;
+        host.symlink(target, link)?;
+        let target_before = host.metadata(target, Follow::No)?;
+        let link_before = host.metadata(link, Follow::No)?;
+
+        let mtime = FileTime { secs: 42, nanos: 7 };
+        host.set_symlink_times(link, None, Some(mtime))?;
+        let updated = host.metadata(link, Follow::No)?;
+        assert_eq!(updated.mtime, mtime);
+        assert_eq!(updated.atime, link_before.atime);
+        assert_eq!(host.metadata(target, Follow::No)?, target_before);
+
+        host.remove_file(target)?;
+        let atime = FileTime { secs: 55, nanos: 9 };
+        host.set_symlink_times(link, Some(atime), None)?;
+        let updated = host.metadata(link, Follow::No)?;
+        assert_eq!(updated.atime, atime);
+        assert_eq!(updated.mtime, mtime);
+        Ok(())
     }
 }

@@ -208,6 +208,35 @@ impl<H: Host + ?Sized> OverlayHost<H> {
         self.state.write().map_err(|_| poisoned())
     }
 
+    fn set_entry_times(
+        &self,
+        p: &Path,
+        atime: Option<FileTime>,
+        mtime: Option<FileTime>,
+        follow: Follow,
+    ) -> HostResult<()> {
+        if atime
+            .into_iter()
+            .chain(mtime)
+            .any(|time| time.nanos >= 1_000_000_000)
+        {
+            return Err(SyntheticError::InvalidInput.at(Some(p)));
+        }
+        let mut state = self.write_state()?;
+        let resolved = state.existing(p, follow)?;
+        if atime.is_some() || mtime.is_some() {
+            let node = resolved.existing(p)?.clone();
+            let mut edit = Edit::default();
+            let change = edit.change(&state, &node);
+            change.atime = atime.or(change.atime);
+            change.mtime = mtime.or(change.mtime);
+            edit.store(resolved, node);
+            state.check(&edit, 0, p)?;
+            state.commit(edit);
+        }
+        Ok(())
+    }
+
     fn rename_entry(&self, from: &Path, to: &Path, replace: bool) -> HostResult<()> {
         let mut state = self.write_state()?;
         let trailing_from = state
@@ -742,26 +771,16 @@ impl<H: Host + ?Sized> Host for OverlayHost<H> {
         atime: Option<FileTime>,
         mtime: Option<FileTime>,
     ) -> HostResult<()> {
-        if atime
-            .into_iter()
-            .chain(mtime)
-            .any(|time| time.nanos >= 1_000_000_000)
-        {
-            return Err(SyntheticError::InvalidInput.at(Some(p)));
-        }
-        let mut state = self.write_state()?;
-        let resolved = state.existing(p, Follow::Yes)?;
-        if atime.is_some() || mtime.is_some() {
-            let node = resolved.existing(p)?.clone();
-            let mut edit = Edit::default();
-            let change = edit.change(&state, &node);
-            change.atime = atime.or(change.atime);
-            change.mtime = mtime.or(change.mtime);
-            edit.store(resolved, node);
-            state.check(&edit, 0, p)?;
-            state.commit(edit);
-        }
-        Ok(())
+        self.set_entry_times(p, atime, mtime, Follow::Yes)
+    }
+
+    fn set_symlink_times(
+        &self,
+        p: &Path,
+        atime: Option<FileTime>,
+        mtime: Option<FileTime>,
+    ) -> HostResult<()> {
+        self.set_entry_times(p, atime, mtime, Follow::No)
     }
 
     fn env_get(&self, key: &[u8]) -> Option<BString> {
@@ -796,6 +815,10 @@ impl<H: Host + ?Sized> Host for OverlayHost<H> {
             }
         }
         values.into_iter().collect()
+    }
+
+    fn supports_process_execution(&self) -> bool {
+        false
     }
 
     fn run(
