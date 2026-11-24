@@ -1,6 +1,6 @@
 use std::io::Cursor;
 
-use sevenz_rust2::{Archive, BlockDecoder, Password};
+use sevenz_rust2::{Archive, Block, BlockDecoder, EncoderMethod as Method, Password};
 
 use super::{MAGIC, MAX_HEADER_MEMORY_KIB};
 use crate::{ArchiveError, MAX_ENTRIES, archive_error, read_bounded};
@@ -47,11 +47,11 @@ pub(super) fn open(bytes: &[u8]) -> Result<Archive, ArchiveError> {
     }
 
     if let [ENCODED_HEADER, stream_info @ ..] = header {
-        let decoded = decode_header(bytes, packed.len(), stream_info)?;
-        validate_raw(&decoded)?;
+        let decoded = decode_header(bytes, packed, stream_info)?;
+        validate_raw(&decoded, packed)?;
         read_raw(&decoded)
     } else {
-        validate_raw(header)?;
+        validate_raw(header, packed)?;
         Archive::read_with_memory_limit(
             &mut Cursor::new(bytes),
             &Password::empty(),
@@ -61,7 +61,7 @@ pub(super) fn open(bytes: &[u8]) -> Result<Archive, ArchiveError> {
     }
 }
 
-fn validate_raw(header: &[u8]) -> Result<(), ArchiveError> {
+fn validate_raw(header: &[u8], packed: &[u8]) -> Result<(), ArchiveError> {
     let mut input = Header(header);
     input.marker(HEADER)?;
     let mut field = input.byte()?;
@@ -73,7 +73,7 @@ fn validate_raw(header: &[u8]) -> Result<(), ArchiveError> {
         field = input.byte()?;
     }
     if field == MAIN_STREAMS {
-        input.streams(false)?;
+        input.streams(false)?.packed_bytes(packed)?;
         field = input.byte()?;
     }
     match field {
@@ -86,21 +86,13 @@ fn validate_raw(header: &[u8]) -> Result<(), ArchiveError> {
     }
 }
 
-fn decode_header(
-    bytes: &[u8],
-    packed_size: usize,
-    streams: &[u8],
-) -> Result<Vec<u8>, ArchiveError> {
+fn decode_header(bytes: &[u8], packed: &[u8], streams: &[u8]) -> Result<Vec<u8>, ArchiveError> {
     let mut input = Header(streams);
     let info = input.streams(true)?;
-    if !input.0.is_empty()
-        || info.folders != 1
-        || info.pack_streams != 1
-        || info.substreams != 1
-        || info.pack_position.saturating_add(info.pack_size) > packed_size as u64
-    {
+    if !input.0.is_empty() || info.folders != 1 || info.pack_streams != 1 || info.substreams != 1 {
         return Err(invalid());
     }
+    let stream = info.packed_bytes(packed)?;
 
     // Present the validated header stream as one file. This reuses the bounded
     // decoder without letting it parse the decoded header as archive metadata.
@@ -120,6 +112,10 @@ fn decode_header(
     if file.size > MAX_HEADER_BYTES as u64 {
         return Err(limit());
     }
+    let [block] = archive.blocks.as_slice() else {
+        return Err(invalid());
+    };
+    check_decoder_memory(block, stream)?;
 
     let mut source = Cursor::new(bytes);
     let mut decoded = None;
@@ -141,6 +137,99 @@ fn decode_header(
         return Err(invalid());
     }
     Ok(decoded)
+}
+
+fn check_decoder_memory(block: &Block, stream: &[u8]) -> Result<(), ArchiveError> {
+    let mut remaining = MAX_HEADER_BYTES as u64;
+    let mut packed_input = Some(stream);
+    let mut count = 0;
+    for (_, coder) in block.ordered_coder_iter() {
+        count += 1;
+        let method = coder.encoder_method_id();
+        let work = match method {
+            Method::ID_COPY | Method::ID_DELTA => 0,
+            Method::ID_BCJ_X86
+            | Method::ID_BCJ_ARM
+            | Method::ID_BCJ_ARM_THUMB
+            | Method::ID_BCJ_ARM64
+            | Method::ID_BCJ_PPC
+            | Method::ID_BCJ_IA64
+            | Method::ID_BCJ_SPARC
+            | Method::ID_BCJ_RISCV => 4 * 1024,
+            Method::ID_LZMA => {
+                let [props, a, b, c, d, ..] = coder.properties() else {
+                    return Err(invalid());
+                };
+                if *props > 224 {
+                    return Err(invalid());
+                }
+                let bytes = u64::from(u32::from_le_bytes([*a, *b, *c, *d])).max(4096);
+                let literal_bits = (*props % 45) / 9 + *props % 9;
+                // Include the literal probability tables as well as the dictionary.
+                bytes.next_multiple_of(16) + (1536 << literal_bits) + 16 * 1024
+            }
+            Method::ID_LZMA2 => {
+                let bits = u32::from(*coder.properties().first().ok_or_else(invalid)?);
+                if bits >= 40 {
+                    return Err(if bits == 40 { limit() } else { invalid() });
+                }
+                let dictionary = u64::from(2 | (bits & 1)) << (bits / 2 + 11);
+                // Include the 64 KiB input buffer and the probability tables.
+                dictionary + 104 * 1024
+            }
+            Method::ID_BZIP2 => 4 * 1024 * 1024,
+            Method::ID_DEFLATE => 512 * 1024,
+            Method::ID_ZSTD => {
+                // A preceding transform can hide the frame from preflight.
+                let input = packed_input.ok_or_else(|| {
+                    ArchiveError::new("Zstandard must read packed bytes in a 7-Zip header")
+                })?;
+                zstd_window(input)? + 1024 * 1024
+            }
+            _ => return Err(ArchiveError::new("Unsupported 7-Zip header coder")),
+        };
+        // Include the reader and its fixed state in addition to codec workspace.
+        remaining = remaining.checked_sub(work + 4096).ok_or_else(limit)?;
+        if method != Method::ID_COPY {
+            packed_input = None;
+        }
+    }
+    if count != block.coders.len() {
+        return Err(invalid());
+    }
+    Ok(())
+}
+
+fn zstd_window(mut stream: &[u8]) -> Result<u64, ArchiveError> {
+    let mut largest = 0;
+    while !stream.is_empty() {
+        let mut frame = Header(stream);
+        let magic = u32::from_le_bytes(frame.fixed()?);
+        match magic {
+            0xfd2f_b528 => {
+                let descriptor = frame.byte()?;
+                let window = if descriptor & 0x20 == 0 {
+                    let window = frame.byte()?;
+                    let base = 1_u64 << (10 + (window >> 3));
+                    base + (base / 8) * u64::from(window & 7)
+                } else {
+                    // A single-segment frame uses its content size as its window.
+                    zstd::zstd_safe::get_frame_content_size(stream)
+                        .map_err(|_| invalid())?
+                        .ok_or_else(invalid)?
+                };
+                if window > MAX_HEADER_BYTES as u64 {
+                    return Err(limit());
+                }
+                largest = largest.max(window);
+            }
+            0x184d_2a50..=0x184d_2a5f => {}
+            _ => return Err(invalid()),
+        }
+        let size = zstd::zstd_safe::find_frame_compressed_size(stream).map_err(|_| invalid())?;
+        stream = stream.get(size..).ok_or_else(invalid)?;
+    }
+    Ok(largest)
 }
 
 fn read_raw(header: &[u8]) -> Result<Archive, ArchiveError> {
@@ -170,6 +259,15 @@ struct Streams {
     folders: usize,
     substreams: usize,
     has_substreams: bool,
+}
+
+impl Streams {
+    fn packed_bytes<'a>(&self, packed: &'a [u8]) -> Result<&'a [u8], ArchiveError> {
+        let start = usize::try_from(self.pack_position).map_err(|_| invalid())?;
+        let size = usize::try_from(self.pack_size).map_err(|_| invalid())?;
+        let end = start.checked_add(size).ok_or_else(invalid)?;
+        packed.get(start..end).ok_or_else(invalid)
+    }
 }
 
 #[derive(Default)]

@@ -76,9 +76,9 @@ impl Elf {
             if !matches!(kind, PT_LOAD | PT_DYNAMIC) {
                 continue;
             }
-            let (file_at, address_at, size_at) = match self.class {
-                Class::Elf32 => (4, 8, 16),
-                Class::Elf64 => (8, 16, 32),
+            let (file_at, address_at, size_at, align_at) = match self.class {
+                Class::Elf32 => (4, 8, 16, 28),
+                Class::Elf64 => (8, 16, 32, 48),
             };
             let offset = self.word(entry, file_at, field)?;
             let size = self.word(entry, size_at, field)?;
@@ -97,6 +97,10 @@ impl Elf {
             let end = self.address_end(address, memory_size, field)?;
             if size > memory_size {
                 return Err(BinfmtError::Invalid(field));
+            }
+            let align = self.word(entry, align_at, "ELF load segment alignment")?;
+            if align > 1 && (!align.is_power_of_two() || offset % align != address % align) {
+                return Err(BinfmtError::Invalid("ELF load segment alignment"));
             }
             if memory_size != 0 {
                 let data = if size == 0 {
@@ -540,6 +544,31 @@ mod tests {
     }
 
     #[test]
+    fn checks_load_alignment_in_both_elf_classes() {
+        for (class, format, offset_at, align_at) in [
+            (Class::Elf32, BinFormat::Elf32, 52 + 4, 52 + 28),
+            (Class::Elf64, BinFormat::Elf64, 64 + 8, 64 + 48),
+        ] {
+            let elf = Elf {
+                class,
+                endian: Endian::Big,
+            };
+            let mut bytes = fixture(elf);
+            for alignment in [0, 1, 4096] {
+                word(elf, &mut bytes, align_at, alignment);
+                assert_eq!(inspect_binary_deps(&bytes), Ok(Some(expected(format))));
+            }
+            word(elf, &mut bytes, align_at, 3);
+            let error = Err(BinfmtError::Invalid("ELF load segment alignment"));
+            assert_eq!(inspect_binary_deps(&bytes), error);
+
+            word(elf, &mut bytes, align_at, 4096);
+            word(elf, &mut bytes, offset_at, 1);
+            assert_eq!(inspect_binary_deps(&bytes), error);
+        }
+    }
+
+    #[test]
     fn maps_string_table_through_a_nonzero_segment_file_offset() {
         let elf = ELF64_LE;
         let mut bytes = fixture(elf);
@@ -550,6 +579,7 @@ mod tests {
         word(elf, &mut bytes, load + 16, BASE + offset);
         word(elf, &mut bytes, load + 32, length);
         word(elf, &mut bytes, load + 40, length);
+        word(elf, &mut bytes, load + 48, 4096);
         assert_eq!(
             inspect_binary_deps(&bytes),
             Ok(Some(expected(BinFormat::Elf64)))

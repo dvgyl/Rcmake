@@ -19,6 +19,8 @@ const CENTRAL: &[u8; 4] = b"PK\x01\x02";
 const END: &[u8; 4] = b"PK\x05\x06";
 const ZIP64_END: &[u8; 4] = b"PK\x06\x06";
 const ZIP64_LOCATOR: &[u8; 4] = b"PK\x06\x07";
+const CENTRAL_HEADER_SIZE: usize = 46;
+const END_RECORD_SIZE: usize = 22;
 
 pub(super) struct Directory<'a> {
     records: &'a [u8],
@@ -28,7 +30,41 @@ pub(super) struct Directory<'a> {
 }
 
 pub(super) fn open(bytes: &[u8]) -> Result<Directory<'_>, ArchiveError> {
-    let footer = footer(bytes).ok_or_else(invalid_header)?;
+    let mut selected = None;
+    let mut error = None;
+    // ZIP permits trailing bytes after the end record and its comment.
+    for (position, magic) in bytes.windows(END.len()).enumerate().rev() {
+        let comment_start = position + END_RECORD_SIZE;
+        if let Some((selected, _)) = &selected
+            && comment_start + usize::from(u16::MAX) <= *selected
+        {
+            break;
+        }
+        if magic != END {
+            continue;
+        }
+        let Some(footer) = footer_at(bytes, position) else {
+            continue;
+        };
+        // A valid end record can still be part of an earlier record's comment.
+        if let Some((selected, _)) = &selected
+            && !(comment_start..footer.comment_end).contains(selected)
+        {
+            continue;
+        }
+        match open_directory(bytes, footer) {
+            Ok(directory) => selected = Some((position, directory)),
+            Err(failure) => {
+                error.get_or_insert(failure);
+            }
+        }
+    }
+    selected
+        .map(|(_, directory)| directory)
+        .ok_or_else(|| error.unwrap_or_else(invalid_header))
+}
+
+fn open_directory<'a>(bytes: &'a [u8], footer: Footer<'a>) -> Result<Directory<'a>, ArchiveError> {
     let layout = if let Some(locator) = footer.locator {
         zip64_layout(bytes, locator)?
     } else {
@@ -52,44 +88,39 @@ pub(super) fn open(bytes: &[u8]) -> Result<Directory<'_>, ArchiveError> {
     {
         return Err(invalid_header());
     }
-    Ok(Directory {
+    let directory = Directory {
         records,
         count: layout.count as usize,
         offset: layout.offset,
         local,
-    })
+    };
+    directory.preflight()?;
+    Ok(directory)
 }
 
 struct Footer<'a> {
     position: usize,
+    comment_end: usize,
     fields: &'a [u8],
     locator: Option<(usize, &'a [u8])>,
 }
 
-fn footer(bytes: &[u8]) -> Option<Footer<'_>> {
-    // ZIP permits trailing bytes after the end record and its comment.
-    bytes
-        .windows(END.len())
-        .enumerate()
-        .rev()
-        .find_map(|(position, magic)| {
-            if magic != END {
-                return None;
-            }
-            let fields = bytes.get(position + 4..position + 22)?;
-            let comment_size = usize::from(word(fields, 16).ok()?);
-            bytes.get(position + 22..position + 22 + comment_size)?;
-            let locator = position.checked_sub(20).and_then(|offset| {
-                let locator = bytes.get(offset..position)?.strip_prefix(ZIP64_LOCATOR)?;
-                (word(fields, 6).ok()? == u16::MAX || dword(fields, 12).ok()? == u32::MAX)
-                    .then_some((offset, locator))
-            });
-            Some(Footer {
-                position,
-                fields,
-                locator,
-            })
-        })
+fn footer_at(bytes: &[u8], position: usize) -> Option<Footer<'_>> {
+    let fields = bytes.get(position + END.len()..position + END_RECORD_SIZE)?;
+    let comment_size = usize::from(word(fields, 16).ok()?);
+    let comment_end = position + END_RECORD_SIZE + comment_size;
+    bytes.get(..comment_end)?;
+    let locator = position.checked_sub(20).and_then(|offset| {
+        let locator = bytes.get(offset..position)?.strip_prefix(ZIP64_LOCATOR)?;
+        (word(fields, 6).ok()? == u16::MAX || dword(fields, 12).ok()? == u32::MAX)
+            .then_some((offset, locator))
+    });
+    Some(Footer {
+        position,
+        comment_end,
+        fields,
+        locator,
+    })
 }
 
 struct Layout {
@@ -108,15 +139,20 @@ fn zip32_layout(bytes: &[u8], footer: Footer<'_>) -> Result<Layout, ArchiveError
     }
     let relative = dword(fields, 12)? as usize;
     let size = dword(fields, 8)? as usize;
+    // Check the declared offset even when the directory is empty.
+    let available = bytes
+        .get(relative..footer.position)
+        .ok_or_else(invalid_header)?;
+    if size > available.len() || size < usize::from(count) * CENTRAL_HEADER_SIZE {
+        return Err(invalid_header());
+    }
     let start = if count == 0 && size == 0 {
         footer.position
     } else {
-        let search = bytes
-            .get(relative..footer.position)
-            .ok_or_else(invalid_header)?;
         relative
-            + search
+            + available
                 .windows(CENTRAL.len())
+                .take(available.len() - size + 1)
                 .position(|magic| magic == CENTRAL)
                 .ok_or_else(invalid_header)?
     };
@@ -207,7 +243,7 @@ impl<'a> Directory<'a> {
 
     fn next(&self, records: &mut &'a [u8]) -> Result<Entry<'a>, ArchiveError> {
         let mut reader = Fields(records.strip_prefix(CENTRAL).ok_or_else(invalid_header)?);
-        let header = reader.take(42)?;
+        let header = reader.take(CENTRAL_HEADER_SIZE - CENTRAL.len())?;
         let name = reader.take(usize::from(word(header, 24)?))?;
         let extra = reader.take(usize::from(word(header, 26)?))?;
         reader.take(usize::from(word(header, 28)?))?;

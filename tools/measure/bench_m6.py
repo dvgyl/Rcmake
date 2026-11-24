@@ -345,11 +345,13 @@ def configure_runs(binary, project, work, generator, env, timeout, *, synthetic,
         env = observe_compilers(work, {**env, "RCMAKE_PROBE_JOBS": "1"}, intervals=False)
         log = Path(env["RCMAKE_M6_PROBE_LOG"])
     trace = work / "leaf-trace.jsonl"
+    trace_args = []
     if leaf_pair:
         leaf, control = leaf_pair
         query_codemodel(cold)
-        trace_args = ["--trace-format=json-v1", f"--trace-redirect={trace}",
-                      f"--trace-source={source / leaf}", f"--trace-source={source / control}"]
+        if not timed:
+            trace_args = ["--trace-format=json-v1", f"--trace-redirect={trace}",
+                          f"--trace-source={source / leaf}", f"--trace-source={source / control}"]
     steady = cold if WARM_PROBE in unavailable else warm
     cold_inputs = Counter()
     replay_record = False
@@ -387,8 +389,10 @@ def configure_runs(binary, project, work, generator, env, timeout, *, synthetic,
                 continue
         if log:
             log.unlink(missing_ok=True)
-        trace.unlink(missing_ok=True)
-        args = [*configure_args, *trace_args] if leaf_pair and build == cold else configure_args
+        args = configure_args
+        if trace_args and phase in (COLD, INCREMENTAL_LEAF):
+            trace.unlink(missing_ok=True)
+            args = [*configure_args, *trace_args]
         sample = configure_sample(binary, source, build, args, work, generator, env, timeout,
                                   timed=timed)
         if not sample.error and synthetic:
@@ -413,24 +417,29 @@ def configure_runs(binary, project, work, generator, env, timeout, *, synthetic,
                 if (control_sample.error or control_inputs != cold_inputs
                         or control_sample.toolchain != sample.toolchain):
                     sample.probe_hits = 0
-        if not sample.error and leaf_pair and phase in (COLD, INCREMENTAL_LEAF):
+        if not sample.error and trace_args and phase == COLD:
             try:
-                executed, controls, marker = leaf_trace(trace, source, leaf, control)
-                if phase == COLD and not (executed and controls):
+                executed, controls, _ = leaf_trace(trace, source, leaf, control)
+                if not (executed and controls):
                     raise ValueError("The cold trace must show commands from the leaf and its control.")
-                if phase == INCREMENTAL_LEAF:
-                    sample.edited_leaf = str(leaf)
+            except (OSError, ValueError) as error:
+                sample.error = f"Could not verify the configure trace. {error}"
+        if not sample.error and phase == INCREMENTAL_LEAF:
+            try:
+                sample.edited_leaf = str(leaf)
+                active_leaves = shared_leaves(source, build)
+                if leaf not in active_leaves:
+                    raise ValueError(f"{leaf} is absent from the updated codemodel.")
+                if trace_args:
+                    _, controls, marker = leaf_trace(trace, source, leaf, control)
                     sample.edited_leaf_executed = marker
                     sample.control_executed = controls
-                    active_leaves = shared_leaves(source, build)
                     control_present = control == Path("CMakeLists.txt") or (
                         control in active_leaves and active_leaves[control].targets == control_targets
                     )
                     sample.replayed_regions = int(replay_record and not controls and control_present)
-                    if leaf not in active_leaves:
-                        raise ValueError(f"{leaf} is absent from the updated codemodel.")
             except (OSError, ValueError, KeyError, TypeError, StopIteration) as error:
-                sample.error = f"Could not verify the configure trace. {error}"
+                sample.error = f"Could not verify the leaf configure. {error}"
         results[phase] = sample
     return results
 
@@ -691,7 +700,7 @@ def markdown(report):
         "",
         "Cold configure starts with an empty build directory and probe cache. "
         "Warm probe and FetchContent runs use a fresh build directory and the same store. "
-        "Both tools trace the same edited leaf and unchanged control during leaf timings. "
+        "Both tools trace the edited leaf and unchanged control in separate, untimed runs. "
         "Both tools record compiler calls during probe timings. "
         "The operating system keeps its file cache across runs.",
         "Each tool and trial uses a private home and XDG cache. "
@@ -836,6 +845,19 @@ def main():
                         samples = configure_runs(binaries[tool], project, work, generator, env,
                                                  timeout, synthetic=name == "synthetic", cases=cases,
                                                  leaf_pair=leaf_pair, unavailable=unavailable)
+                        if leaf_pair and not samples[INCREMENTAL_LEAF].error:
+                            verify = work / "verify-leaf"
+                            verify.mkdir()
+                            evidence = configure_runs(
+                                binaries[tool], project, verify, generator, env, timeout,
+                                synthetic=name == "synthetic", cases=(COLD, INCREMENTAL_LEAF),
+                                leaf_pair=leaf_pair, timed=False,
+                            )[INCREMENTAL_LEAF]
+                            leaf_sample = samples[INCREMENTAL_LEAF]
+                            leaf_sample.error = evidence.error
+                            leaf_sample.edited_leaf_executed = evidence.edited_leaf_executed
+                            leaf_sample.control_executed = evidence.control_executed
+                            leaf_sample.replayed_regions = evidence.replayed_regions
                     for case, sample in samples.items():
                         by_tool[tool][case].append(sample)
                     shutil.rmtree(work)

@@ -27,6 +27,29 @@ fn rejects_tar_metadata_before_reading_its_payload() -> TestResult {
 }
 
 #[test]
+fn tar_creation_rejects_metadata_over_its_reader_limit() -> TestResult {
+    let host = test_host();
+    let source = Path::new("/source");
+    let input = source.join("value");
+    host.seed_file(&input, b"")?;
+    host.set_times(&input, None, Some(FileTime { secs: 1, nanos: 1 }))?;
+    // Each fractional timestamp adds a 1 KiB PAX record.
+    let inputs = vec![PathBuf::from("value"); 16 * 1024 + 1];
+    let result = create_archive(
+        &host,
+        Path::new("/archive"),
+        source,
+        &inputs,
+        &create_options(ArchiveFormat::Tar),
+    );
+    assert!(
+        result.is_err_and(|error| error.message == "Tar metadata exceeds the record or size limit")
+    );
+    assert!(absent(&host, "/archive"));
+    Ok(())
+}
+
+#[test]
 fn uses_pax_size_to_find_the_next_tar_header() -> TestResult {
     let host = test_host();
     let archive = Path::new("/archive");
@@ -133,6 +156,45 @@ fn zip64_footer_with_a_gap_uses_its_central_directory() -> TestResult {
 }
 
 #[test]
+fn ignores_zip_end_records_inside_the_comment() -> TestResult {
+    let host = test_host();
+    let archive = Path::new("/archive");
+    let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
+    writer.start_file("value", SimpleFileOptions::default())?;
+    writer.write_all(b"x")?;
+    let bytes = writer.finish()?.into_inner();
+    let zip = ZipArchive::new(Cursor::new(&bytes))?;
+    let start = u32::try_from(zip.central_directory_start())?;
+    let end = bytes.len() - 22;
+
+    for (count, size, offset) in [(1_u16, 46_u32, start), (0, 0, u32::MAX), (0, 0, 0)] {
+        let mut commented = bytes.clone();
+        commented
+            .get_mut(end + 20..end + 22)
+            .ok_or("Missing ZIP comment length")?
+            .copy_from_slice(&22_u16.to_le_bytes());
+        commented.extend_from_slice(b"PK\x05\x06\0\0\0\0");
+        commented.extend_from_slice(&count.to_le_bytes());
+        commented.extend_from_slice(&count.to_le_bytes());
+        commented.extend_from_slice(&size.to_le_bytes());
+        commented.extend_from_slice(&offset.to_le_bytes());
+        commented.extend_from_slice(&[0, 0]);
+        if offset == u32::MAX {
+            assert!(
+                crate::zip_codec::open(commented.get(end + 22..).ok_or("Missing comment")?)
+                    .is_err()
+            );
+        }
+        host.write(archive, &commented, WriteMode::Truncate)?;
+        assert_eq!(
+            list_command_archive(&host, archive, Vec::new(), None)?,
+            names(&["value"])
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn rejects_excessive_7zip_counts_in_raw_and_encoded_headers() -> TestResult {
     let too_many = [0xc1, 0xa1, 0x86]; // 100,001 in the 7-Zip integer format.
     let raw_files = [[1, 5].as_slice(), too_many.as_slice()].concat();
@@ -156,6 +218,98 @@ fn rejects_excessive_7zip_counts_in_raw_and_encoded_headers() -> TestResult {
             .is_err_and(|error| error.message == "7-Zip header exceeds the entry or size limit"));
     }
     Ok(())
+}
+
+#[test]
+fn rejects_7zip_main_streams_outside_the_packed_region() -> TestResult {
+    let host = test_host();
+    let archive = Path::new("/archive");
+    for (start, size) in [(0, 1), (127, 1), (0, 127)] {
+        let raw = [
+            1, 4, 6, start, 1, 9, size, 0, 7, 0x0b, 1, 0, 1, 1, 0, 0x0c, 1, 0, 8, 0, 0, 5, 1, 0x11,
+            5, 0, b'x', 0, 0, 0, 0, 0,
+        ];
+        let encoded =
+            seven_zip_encoded_header(1, raw.len(), 1, &[1, 0], &[u8::try_from(raw.len())?])?;
+        let packed = [b"x".as_slice(), raw.as_slice()].concat();
+        for bytes in [
+            seven_zip_bytes(b"x", &raw),
+            seven_zip_bytes(&packed, &encoded),
+        ] {
+            host.write(archive, &bytes, WriteMode::Truncate)?;
+            let result = list_command_archive(&host, archive, Vec::new(), None);
+            if (start, size) == (0, 1) {
+                assert_eq!(result?, names(&["x"]));
+            } else {
+                assert!(result.is_err_and(|error| error.message == "Invalid 7-Zip header"));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn limits_total_7zip_header_decoder_memory() -> TestResult {
+    // LZMA and LZMA2 each request an 8 MiB dictionary.
+    let coders_and_bindings = [
+        0x23, 3, 1, 1, 5, 0x5d, 0, 0, 0x80, 0, 0x21, 0x21, 1, 22, 1, 0,
+    ];
+    let header = seven_zip_encoded_header(0, 1, 2, &coders_and_bindings, &[2, 2])?;
+    assert!(
+        seven_zip::open(&seven_zip_bytes(b"x", &header))
+            .is_err_and(|error| error.message == "7-Zip header exceeds the entry or size limit")
+    );
+    Ok(())
+}
+
+#[test]
+fn checks_every_zstandard_frame_window_in_a_7zip_header() -> TestResult {
+    let raw = [1, 5, 0, 0, 0];
+    let mut packed = zstd::stream::encode_all(raw.as_slice(), 1)?;
+    let coders = [4, 4, 0xf7, 0x11, 1];
+    let sizes = [u8::try_from(raw.len())?];
+    let header = seven_zip_encoded_header(0, packed.len(), 1, &coders, &sizes)?;
+    assert!(
+        seven_zip::open(&seven_zip_bytes(&packed, &header))?
+            .files
+            .is_empty()
+    );
+    // This empty frame declares a 32 MiB window.
+    packed.extend_from_slice(b"\x28\xb5\x2f\xfd\x00\x78\x01\0\0");
+    let header = seven_zip_encoded_header(0, packed.len(), 1, &coders, &sizes)?;
+    assert!(
+        seven_zip::open(&seven_zip_bytes(&packed, &header))
+            .is_err_and(|error| error.message == "7-Zip header exceeds the entry or size limit")
+    );
+    Ok(())
+}
+
+fn seven_zip_encoded_header(
+    start: u8,
+    packed: usize,
+    count: u8,
+    coders_and_bindings: &[u8],
+    sizes: &[u8],
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    let mut header = vec![
+        0x17,
+        6,
+        start,
+        1,
+        9,
+        u8::try_from(packed)?,
+        0,
+        7,
+        0x0b,
+        1,
+        0,
+        count,
+    ];
+    header.extend_from_slice(coders_and_bindings);
+    header.push(0x0c);
+    header.extend_from_slice(sizes);
+    header.extend_from_slice(&[0, 0]);
+    Ok(header)
 }
 
 fn seven_zip_bytes(packed: &[u8], header: &[u8]) -> Vec<u8> {

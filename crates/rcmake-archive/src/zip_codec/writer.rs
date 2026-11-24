@@ -4,10 +4,19 @@ use flate2::{Compression, write::DeflateEncoder};
 use jiff::tz::TimeZone;
 use rcmake_host::{FileKind, FileTime, Metadata};
 
-use super::{CENTRAL, END, LOCAL, ZIP64_END, ZIP64_LOCATOR, invalid_header};
-use crate::{
-    ArchiveError, ArchiveFormat, ZipCompression, archive_error, codec::Encoder, timestamp,
+use super::{
+    CENTRAL, CENTRAL_HEADER_SIZE, END, END_RECORD_SIZE, LOCAL, ZIP64_END, ZIP64_LOCATOR,
+    invalid_header,
 };
+use crate::{
+    ArchiveError, ArchiveFormat, ZipCompression, archive_error, codec::Encoder, size_limit,
+    timestamp,
+};
+
+const LOCAL_SIZE: u64 = 30;
+const ZIP64_END_SIZE: u64 = 56;
+const ZIP64_LOCATOR_SIZE: u64 = 20;
+const ZIP64_COUNT: u64 = u16::MAX as u64;
 
 pub(crate) struct Writer {
     format: ArchiveFormat,
@@ -74,6 +83,17 @@ impl Writer {
         let offset = u32::try_from(self.data.len()).map_err(archive_error)?;
         let size = u32::try_from(contents.len()).map_err(archive_error)?;
         let compressed_size = u32::try_from(compressed.len()).map_err(archive_error)?;
+        let header_bytes = LOCAL_SIZE
+            + CENTRAL_HEADER_SIZE as u64
+            + 2 * (u64::from(name_len) + u64::from(extra_len));
+        let total = u64::from(offset)
+            + self.directory.len() as u64
+            + header_bytes
+            + u64::from(compressed_size)
+            + end_size(self.count + 1);
+        if total > size_limit() {
+            return Err(ArchiveError::new("Archive exceeds the size limit"));
+        }
 
         let mut fields = Vec::with_capacity(26);
         words(
@@ -120,7 +140,7 @@ impl Writer {
         let offset = u32::try_from(self.data.len()).map_err(archive_error)?;
         let size = u32::try_from(self.directory.len()).map_err(archive_error)?;
         self.data.append(&mut self.directory);
-        if self.count >= u64::from(u16::MAX) {
+        if self.count >= ZIP64_COUNT {
             let end_offset = self.data.len() as u64;
             self.data.extend_from_slice(ZIP64_END);
             qwords(&mut self.data, &[44]);
@@ -141,6 +161,14 @@ impl Writer {
         dwords(&mut self.data, &[size, offset]);
         words(&mut self.data, &[0]);
         Ok(self.data)
+    }
+}
+
+fn end_size(count: u64) -> u64 {
+    if count >= ZIP64_COUNT {
+        END_RECORD_SIZE as u64 + ZIP64_END_SIZE + ZIP64_LOCATOR_SIZE
+    } else {
+        END_RECORD_SIZE as u64
     }
 }
 

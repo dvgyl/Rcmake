@@ -31,6 +31,7 @@ impl<'a> Image<'a> {
         base: u64,
         headers_size: u64,
         image_size: u64,
+        section_alignment: u64,
         low_alignment: bool,
         table: &[u8],
     ) -> Result<Self, BinfmtError> {
@@ -43,6 +44,9 @@ impl<'a> Image<'a> {
         for row in table.chunks_exact(SECTION_HEADER_SIZE as usize) {
             let virtual_size = u64::from(LE.u32(row, 8, field)?);
             let start = u64::from(LE.u32(row, 12, field)?);
+            if !start.is_multiple_of(section_alignment) {
+                return Err(BinfmtError::Invalid("PE section address alignment"));
+            }
             let raw_size = u64::from(LE.u32(row, 16, field)?);
             let raw_offset = u64::from(LE.u32(row, 20, field)?);
             let virtual_size = if virtual_size == 0 {
@@ -223,8 +227,8 @@ pub(super) fn inspect(bytes: &[u8]) -> Result<Option<PeDeps>, BinfmtError> {
     if headers_size < table_start + table_size || headers_size > image_size {
         return Err(BinfmtError::Invalid("PE image headers size"));
     }
-    let section_alignment = LE.u32(optional, 32, field)?;
-    let file_alignment = LE.u32(optional, 36, field)?;
+    let section_alignment = u64::from(LE.u32(optional, 32, field)?);
+    let file_alignment = u64::from(LE.u32(optional, 36, field)?);
     let page_size = if machine == MACHINE_ITANIUM {
         8192
     } else {
@@ -234,10 +238,19 @@ pub(super) fn inspect(bytes: &[u8]) -> Result<Option<PeDeps>, BinfmtError> {
     if file_alignment == 0
         || section_alignment < file_alignment
         || (low_alignment && file_alignment != section_alignment)
+        || !image_size.is_multiple_of(section_alignment)
     {
         return Err(BinfmtError::Invalid("PE image alignment"));
     }
-    let image = Image::read(bytes, base, headers_size, image_size, low_alignment, table)?;
+    let image = Image::read(
+        bytes,
+        base,
+        headers_size,
+        image_size,
+        section_alignment,
+        low_alignment,
+        table,
+    )?;
     let mut budget = OutputBudget::default();
     Ok(Some(PeDeps {
         format,
@@ -440,13 +453,13 @@ mod tests {
     fn rejects_sections_that_overlap_or_exceed_the_address_space() {
         let mut bytes = fixture(false);
         let section = directories_at(false) + 16 * DIRECTORY_SIZE as usize;
-        dword(&mut bytes, section + 12, 0x100);
+        dword(&mut bytes, section + 12, 0);
         assert_eq!(
             inspect_binary_deps(&bytes),
             Err(BinfmtError::Invalid("PE overlapping section addresses"))
         );
 
-        dword(&mut bytes, section + 12, u32::MAX);
+        dword(&mut bytes, section + 12, 0xffff_f000);
         assert_eq!(
             inspect_binary_deps(&bytes),
             Err(BinfmtError::Invalid("PE section address range"))
@@ -465,10 +478,31 @@ mod tests {
         for virtual_size in [0, RAW_LEN as u32] {
             let section = directories_at(false) + 16 * DIRECTORY_SIZE as usize;
             dword(&mut bytes, section + 8, virtual_size);
-            dword(&mut bytes, OPTIONAL_AT + 56, RVA + RAW_LEN as u32 - 1);
+            dword(&mut bytes, OPTIONAL_AT + 56, RVA);
             assert_eq!(
                 inspect_binary_deps(&bytes),
                 Err(BinfmtError::Invalid("PE section address range"))
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_unaligned_image_sizes_and_section_addresses() {
+        let section = directories_at(false) + 16 * DIRECTORY_SIZE as usize;
+        for (alignment, address) in [(0x1000, RVA), (RAW_AT as u32, RAW_AT as u32)] {
+            let mut bytes = fixture(false);
+            dword(&mut bytes, OPTIONAL_AT + 32, alignment);
+            dword(&mut bytes, OPTIONAL_AT + 56, 0x2001);
+            assert_eq!(
+                inspect_binary_deps(&bytes),
+                Err(BinfmtError::Invalid("PE image alignment"))
+            );
+
+            dword(&mut bytes, OPTIONAL_AT + 56, 0x2000);
+            dword(&mut bytes, section + 12, address + 1);
+            assert_eq!(
+                inspect_binary_deps(&bytes),
+                Err(BinfmtError::Invalid("PE section address alignment"))
             );
         }
     }

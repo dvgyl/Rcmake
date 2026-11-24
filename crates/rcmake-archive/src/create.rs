@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::io::{Read, Write};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use rcmake_base::BString;
@@ -156,6 +156,7 @@ impl Creation<'_> {
         if directory {
             name.push(b'/');
         }
+        // Match the reader's expanded-size budget. Writers check their format limits separately.
         self.bytes_left = self
             .bytes_left
             .checked_sub(name.len() as u64 + 512)
@@ -164,7 +165,7 @@ impl Creation<'_> {
 
         let identity = (metadata.dev, metadata.ino);
         let link_name = if !self.command
-            && matches!(self.writer, Writer::Tar(..))
+            && matches!(self.writer, Writer::Tar(_))
             && metadata.kind == FileKind::File
             && metadata.nlink > 1
             && let Ok(relative) = relative_path(&name)
@@ -282,7 +283,7 @@ fn is_apple_double(
 }
 
 enum Writer {
-    Tar(Box<Builder<Encoder>>, bool),
+    Tar(TarWriter),
     SevenZip(Box<seven_zip::Writer>),
     Zip(zip_codec::writer::Writer),
 }
@@ -342,7 +343,11 @@ impl Writer {
             )));
         }
         let encoder = Encoder::new(filter, level, threads)?;
-        Ok(Self::Tar(Box::new(Builder::new(encoder)), gnu))
+        Ok(Self::Tar(TarWriter {
+            builder: Box::new(Builder::new(encoder)),
+            gnu,
+            metadata_left: 16 * 1024 * 1024,
+        }))
     }
 
     fn add(
@@ -355,16 +360,14 @@ impl Writer {
         zone: &jiff::tz::TimeZone,
     ) -> Result<(), ArchiveError> {
         match self {
-            Self::Tar(writer, gnu) => {
+            Self::Tar(writer) => {
                 let kind = match (metadata.kind, link_name) {
                     (_, Some(_)) => EntryType::Link,
                     (FileKind::Dir, None) => EntryType::Directory,
                     (FileKind::Symlink, None) => EntryType::Symlink,
                     _ => EntryType::Regular,
                 };
-                add_tar(
-                    writer,
-                    *gnu,
+                writer.add(
                     name,
                     kind,
                     metadata.mode,
@@ -379,7 +382,8 @@ impl Writer {
 
     fn finish(self) -> Result<Vec<u8>, ArchiveError> {
         match self {
-            Self::Tar(writer, _) => writer
+            Self::Tar(writer) => writer
+                .builder
                 .into_inner()
                 .and_then(Encoder::finish)
                 .map_err(archive_error),
@@ -389,68 +393,109 @@ impl Writer {
     }
 }
 
-fn add_tar(
-    writer: &mut Builder<impl Write>,
+struct TarWriter {
+    builder: Box<Builder<Encoder>>,
     gnu: bool,
-    name: &[u8],
-    kind: EntryType,
-    mode: u32,
-    mtime: FileTime,
-    contents: &[u8],
-) -> Result<(), ArchiveError> {
-    let mut header = if gnu {
-        Header::new_gnu()
-    } else {
-        Header::new_ustar()
-    };
-    header.set_mode(mode);
-    header.set_uid(0);
-    header.set_gid(0);
-    header.set_mtime(u64::try_from(mtime.secs).unwrap_or_default());
-    header.set_entry_type(kind);
-    header.set_size(if kind == EntryType::Regular {
-        contents.len() as u64
-    } else {
-        0
-    });
+    metadata_left: u64,
+}
 
-    let long_link = matches!(kind, EntryType::Link | EntryType::Symlink)
-        && header.set_link_name_literal(contents).is_err();
-    if gnu {
-        if !copy_name(&mut header, name) {
-            gnu_long(writer, EntryType::GNULongName, name)?;
-            let field = &mut header.as_old_mut().name;
-            for (byte, &value) in field.iter_mut().zip(name) {
-                *byte = value;
+impl TarWriter {
+    fn charge_metadata(&mut self, size: u64) -> Result<(), ArchiveError> {
+        // Each extension uses a header block and at least one data block.
+        // The byte limit also keeps the record count below the reader's limit.
+        let error = || ArchiveError::new("Tar metadata exceeds the record or size limit");
+        if size > 1024 * 1024 {
+            return Err(error());
+        }
+        let charge = size.next_multiple_of(512) + 512;
+        self.metadata_left = self.metadata_left.checked_sub(charge).ok_or_else(error)?;
+        Ok(())
+    }
+
+    fn add(
+        &mut self,
+        name: &[u8],
+        kind: EntryType,
+        mode: u32,
+        mtime: FileTime,
+        contents: &[u8],
+    ) -> Result<(), ArchiveError> {
+        let mut header = if self.gnu {
+            Header::new_gnu()
+        } else {
+            Header::new_ustar()
+        };
+        header.set_mode(mode);
+        header.set_uid(0);
+        header.set_gid(0);
+        header.set_mtime(u64::try_from(mtime.secs).unwrap_or_default());
+        header.set_entry_type(kind);
+        header.set_size(if kind == EntryType::Regular {
+            contents.len() as u64
+        } else {
+            0
+        });
+
+        let long_link = matches!(kind, EntryType::Link | EntryType::Symlink)
+            && header.set_link_name_literal(contents).is_err();
+        if self.gnu {
+            if !copy_name(&mut header, name) {
+                self.gnu_long(EntryType::GNULongName, name)?;
+                let field = &mut header.as_old_mut().name;
+                for (byte, &value) in field.iter_mut().zip(name) {
+                    *byte = value;
+                }
+            }
+            if long_link {
+                self.gnu_long(EntryType::GNULongLink, contents)?;
+            }
+        } else {
+            let mut pax = Vec::new();
+            let time = timestamp::pax_time(mtime);
+            if let Some(time) = &time {
+                pax.push(("mtime", time.as_bytes()));
+            }
+            if !copy_name(&mut header, name)
+                && (header.set_path(crate::to_native(name)).is_err() || header.path_bytes() != name)
+            {
+                header.set_path("PaxEntry").map_err(archive_error)?;
+                pax.push(("path", name));
+            }
+            if long_link {
+                pax.push(("linkpath", contents));
+            }
+            if !pax.is_empty() {
+                let size = pax
+                    .iter()
+                    .map(|(key, value)| pax_field_size(key, value))
+                    .sum();
+                self.charge_metadata(size)?;
+                self.builder
+                    .append_pax_extensions(pax)
+                    .map_err(archive_error)?;
             }
         }
-        if long_link {
-            gnu_long(writer, EntryType::GNULongLink, contents)?;
-        }
-    } else {
-        let mut pax = Vec::new();
-        let time = timestamp::pax_time(mtime);
-        if let Some(time) = &time {
-            pax.push(("mtime", time.as_bytes()));
-        }
-        if !copy_name(&mut header, name)
-            && (header.set_path(crate::to_native(name)).is_err() || header.path_bytes() != name)
-        {
-            header.set_path("PaxEntry").map_err(archive_error)?;
-            pax.push(("path", name));
-        }
-        if long_link {
-            pax.push(("linkpath", contents));
-        }
-        writer.append_pax_extensions(pax).map_err(archive_error)?;
+        let data = if kind == EntryType::Regular {
+            contents
+        } else {
+            &[]
+        };
+        header.set_cksum();
+        self.builder.append(&header, data).map_err(archive_error)
     }
-    let data = if kind == EntryType::Regular {
-        contents
-    } else {
-        &[]
-    };
-    header.set_cksum();
-    writer.append(&header, data).map_err(archive_error)
+
+    fn gnu_long(&mut self, kind: EntryType, value: &[u8]) -> Result<(), ArchiveError> {
+        let size = value.len() as u64 + 1;
+        self.charge_metadata(size)?;
+        let mut header = Header::new_gnu();
+        header.set_entry_type(kind);
+        header.set_size(size);
+        header.set_path("././@LongLink").map_err(archive_error)?;
+        header.set_cksum();
+        self.builder
+            .append(&header, value.chain(b"\0".as_slice()))
+            .map_err(archive_error)
+    }
 }
 
 fn copy_name(header: &mut Header, name: &[u8]) -> bool {
@@ -461,17 +506,15 @@ fn copy_name(header: &mut Header, name: &[u8]) -> bool {
     true
 }
 
-fn gnu_long(
-    writer: &mut Builder<impl Write>,
-    kind: EntryType,
-    value: &[u8],
-) -> Result<(), ArchiveError> {
-    let mut header = Header::new_gnu();
-    header.set_entry_type(kind);
-    header.set_size(value.len() as u64 + 1);
-    header.set_path("././@LongLink").map_err(archive_error)?;
-    header.set_cksum();
-    writer
-        .append(&header, value.chain(b"\0".as_slice()))
-        .map_err(archive_error)
+fn pax_field_size(key: &str, value: &[u8]) -> u64 {
+    // PAX records include their decimal length, a space, an equals sign and a newline.
+    let body = key.len() as u64 + value.len() as u64 + 3;
+    let mut size = body + 1;
+    loop {
+        let next = body + u64::from(size.ilog10()) + 1;
+        if next == size {
+            return size;
+        }
+        size = next;
+    }
 }
