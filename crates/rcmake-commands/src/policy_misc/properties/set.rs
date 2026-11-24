@@ -6,7 +6,7 @@ use rcmake_model::{AppendMode, CacheType, ModelError, PropOrigin, PropScope, Tar
 
 use super::file_set::{file_set_id, file_set_selection, file_set_target, set_file_set};
 use super::scope::{
-    SourceSelection, check_directory, source_scope, source_scopes, test_names, writable_target,
+    SourceSelection, check_directory, select_source, source_scopes, test_names, writable_target,
 };
 use super::{known_features, quoted, values};
 
@@ -125,11 +125,25 @@ pub(in crate::policy_misc) fn set(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdR
                 .map(|target| writable_target(cx, target, name))
                 .collect::<Result<Vec<_>, _>>()?;
             for target in targets {
+                if crate::targets::check_target_property(cx, target, name)
+                    || !crate::targets::validate_target_property_value(
+                        cx,
+                        target,
+                        name,
+                        value
+                            .as_ref()
+                            .map_or(b"".as_slice(), |value| value.as_slice()),
+                        !matches!(update, Update::Set),
+                    )
+                {
+                    continue;
+                }
                 if *name == b"IMPORTED_GLOBAL" {
                     set_imported_global(cx, target, value.as_ref(), update)?;
                 } else {
                     let scope = PropScope::Target(target);
                     update_scoped(cx, &scope, name, value.clone(), update)?;
+                    crate::targets::schedule_target_property_validation(cx, name);
                 }
             }
         }
@@ -244,8 +258,11 @@ fn update_source(
     {
         return Ok(());
     }
-    let scope = source_scope(cx, selection.dir, selection.source);
-    update_scoped(cx, &scope, name, value, update)
+    if let Some(scope) = select_source(cx, selection.dir, selection.source, selection.scoped, true)
+    {
+        update_scoped(cx, &scope, name, value, update)?;
+    }
+    Ok(())
 }
 
 /// Apply `update` to a model-owned property scope.
@@ -269,6 +286,23 @@ pub(super) fn update_scoped(
                 | b"TESTS"
         )
     {
+        return Ok(());
+    }
+    if let PropScope::Target(id) = scope
+        && matches!(name, b"BINARY_DIR" | b"IMPORTED" | b"SOURCE_DIR")
+        && let Some(target) = cx.project().target_mut(*id)
+    {
+        if let Some(value) = value {
+            let previous = target
+                .props
+                .get(name)
+                .map_or(b"".as_slice(), |value| value.as_slice());
+            target
+                .props
+                .set(name.into(), update.value(previous, &value));
+        } else if matches!(update, Update::Set) {
+            target.props.unset(name);
+        }
         return Ok(());
     }
     let value = if matches!(scope, PropScope::Target(_))

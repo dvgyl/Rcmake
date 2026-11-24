@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use rcmake_base::{BString, list};
+use rcmake_base::{BString, list, truth};
 use rcmake_diag::{PolicyId, PolicyStatus};
 use rcmake_eval::{CacheDefine, Cx};
 use rcmake_model::{CacheType, DirId, Target, TargetKind};
@@ -8,9 +8,44 @@ use rcmake_model::{CacheType, DirId, Target, TargetKind};
 use super::args::{Options, STANDARD_OPTIONS};
 use super::{probe_error, split_byte};
 
-const PROBE_LANGUAGES: &[&str] = &["C", "CXX", "OBJC", "OBJCXX"];
+const PROBE_LANGUAGES: &[&str] = &[
+    "C", "CXX", "CUDA", "HIP", "OBJC", "OBJCXX", "SYCL", "Fortran", "ASM", "ISPC", "Swift",
+];
+const CMP0066: PolicyId = PolicyId::new(66);
+const CMP0067: PolicyId = PolicyId::new(67);
 const CMP0137: PolicyId = PolicyId::new(137);
 const CMP0210: PolicyId = PolicyId::new(210);
+
+const PLATFORM_VARIABLES: &[&[u8]] = &[
+    b"CMAKE_APPLE_ARCH_SYSROOTS",
+    b"CMAKE_CUDA_ARCHITECTURES",
+    b"CMAKE_CUDA_RUNTIME_LIBRARY",
+    b"CMAKE_CXX_SCAN_FOR_MODULES",
+    b"CMAKE_ENABLE_EXPORTS",
+    b"CMAKE_EXECUTABLE_ENABLE_EXPORTS",
+    b"CMAKE_SHARED_LIBRARY_ENABLE_EXPORTS",
+    b"CMAKE_HIP_ARCHITECTURES",
+    b"CMAKE_HIP_PLATFORM",
+    b"CMAKE_HIP_RUNTIME_LIBRARY",
+    b"CMAKE_ISPC_INSTRUCTION_SETS",
+    b"CMAKE_ISPC_HEADER_SUFFIX",
+    b"CMAKE_LINK_SEARCH_END_STATIC",
+    b"CMAKE_LINK_SEARCH_START_STATIC",
+    b"CMAKE_LINKER_TYPE",
+    b"CMAKE_MSVC_DEBUG_INFORMATION_FORMAT",
+    b"CMAKE_MSVC_RUNTIME_CHECKS",
+    b"CMAKE_MSVC_RUNTIME_LIBRARY",
+    b"CMAKE_OSX_ARCHITECTURES",
+    b"CMAKE_OSX_DEPLOYMENT_TARGET",
+    b"CMAKE_OSX_SYSROOT",
+    b"CMAKE_POSITION_INDEPENDENT_CODE",
+    b"CMAKE_SYCL_DEVICE_TARGETS",
+    b"CMAKE_SYSROOT",
+    b"CMAKE_SYSROOT_COMPILE",
+    b"CMAKE_SYSROOT_LINK",
+    b"CMAKE_VS_USE_DEBUG_LIBRARIES",
+    b"CMAKE_WATCOM_RUNTIME_LIBRARY",
+];
 
 pub(super) struct TryCompileSeed {
     pub(super) defines: Vec<CacheDefine>,
@@ -24,6 +59,13 @@ pub(super) fn toolchain_variable(name: &[u8]) -> bool {
     [
         b"CMAKE_C_".as_slice(),
         b"CMAKE_CUDA_",
+        b"_CMAKE_CUDA_",
+        b"CMAKE_Fortran_",
+        b"CMAKE_ASM",
+        b"CMAKE_HIP_",
+        b"CMAKE_ISPC_",
+        b"CMAKE_Swift_",
+        b"CMAKE_SYCL_",
         b"CMAKE_RC_",
         b"CMAKE_DEPFILE_FLAGS_",
         b"CMAKE_CXX_",
@@ -75,19 +117,42 @@ impl TryCompileSeed {
     pub(super) fn new(cx: &mut Cx<'_>, options: &Options<'_>, source_signature: bool) -> Self {
         let config = cx.var_or_empty(b"CMAKE_TRY_COMPILE_CONFIGURATION");
         let honor_link_flags = !source_signature || cx.policy(CMP0210) == PolicyStatus::New;
+        let honor_config_flags = cx.policy(CMP0066) == PolicyStatus::New;
+        let forward_platform = (source_signature || cx.policy(CMP0137) == PolicyStatus::New)
+            && !cx.var_is_on(b"CMAKE_TRY_COMPILE_NO_PLATFORM_VARIABLES");
+        let selected_config = if config.is_empty() {
+            b"DEBUG".to_vec()
+        } else {
+            config.to_ascii_uppercase()
+        };
         let mut defines = Vec::new();
         for name in cx
             .variable_names()
             .iter()
             .filter(|name| toolchain_variable(name))
         {
-            if !honor_link_flags
-                && PROBE_LANGUAGES.iter().any(|lang| {
-                    let key = format!("CMAKE_{lang}_LINK_FLAGS");
-                    name.strip_prefix(key.as_bytes())
-                        .is_some_and(|suffix| suffix.is_empty() || suffix.starts_with(b"_"))
-                })
-            {
+            if is_platform_variable(name) && !forward_platform {
+                continue;
+            }
+            if PROBE_LANGUAGES.iter().any(|lang| {
+                let Some(suffix) = name.strip_prefix(format!("CMAKE_{lang}_").as_bytes()) else {
+                    return false;
+                };
+                if !source_signature {
+                    return suffix == b"FLAGS"
+                        || suffix.strip_prefix(b"FLAGS_").is_some_and(|flag_config| {
+                            flag_config != b"INIT" && !flag_config.ends_with(b"_INIT")
+                        });
+                }
+                matches!(suffix, b"STANDARD" | b"STANDARD_REQUIRED" | b"EXTENSIONS")
+                    || suffix.strip_prefix(b"FLAGS_").is_some_and(|flag_config| {
+                        flag_config != b"INIT"
+                            && !flag_config.ends_with(b"_INIT")
+                            && (!honor_config_flags || flag_config != selected_config.as_slice())
+                    })
+                    || (suffix == b"LINK_FLAGS" || suffix.starts_with(b"LINK_FLAGS_"))
+                        && !honor_link_flags
+            }) {
                 continue;
             }
             seed_var(cx, &mut defines, name);
@@ -98,10 +163,12 @@ impl TryCompileSeed {
             "CMAKE_TRY_COMPILE_CONFIGURATION",
             "CMAKE_DEBUG_TRY_COMPILE",
             "CMAKE_GENERATOR",
+            "CMAKE_EXPERIMENTAL_SYCL",
+            "CMAKE_TRY_COMPILE_NO_PLATFORM_VARIABLES",
         ] {
             seed_var(cx, &mut defines, name.as_bytes());
         }
-        if let Some(archs) = cx.var(b"CMAKE_TRY_COMPILE_OSX_ARCHITECTURES") {
+        if forward_platform && let Some(archs) = cx.var(b"CMAKE_TRY_COMPILE_OSX_ARCHITECTURES") {
             defines.push(CacheDefine {
                 name: "CMAKE_OSX_ARCHITECTURES".into(),
                 ty: Some(CacheType::String),
@@ -115,14 +182,11 @@ impl TryCompileSeed {
                 value: "1".into(),
             });
         }
-        if (source_signature || cx.policy(CMP0137) == PolicyStatus::New)
-            && !cx.var_is_on(b"CMAKE_TRY_COMPILE_NO_PLATFORM_VARIABLES")
-        {
-            for name in [
-                b"CMAKE_ENABLE_EXPORTS".as_slice(),
-                b"CMAKE_CUDA_ARCHITECTURES",
-            ] {
-                seed_var(cx, &mut defines, name);
+        if forward_platform {
+            for &name in PLATFORM_VARIABLES {
+                if !toolchain_variable(name) {
+                    seed_var(cx, &mut defines, name);
+                }
             }
             for name in list::split(
                 &cx.var_or_empty(b"CMAKE_TRY_COMPILE_PLATFORM_VARIABLES"),
@@ -130,6 +194,15 @@ impl TryCompileSeed {
             ) {
                 seed_var(cx, &mut defines, &name);
             }
+        }
+        if !source_signature
+            && cx
+                .global()
+                .props
+                .get(b"PROPAGATE_TOP_LEVEL_INCLUDES_TO_TRY_COMPILE")
+                .is_some_and(|value| truth::is_on(value))
+        {
+            seed_var(cx, &mut defines, b"CMAKE_PROJECT_TOP_LEVEL_INCLUDES");
         }
         if !config.is_empty() {
             defines.push(CacheDefine {
@@ -157,20 +230,52 @@ impl TryCompileSeed {
                 });
             }
         }
-        for name in STANDARD_OPTIONS {
-            if let Some(value) = options.one(name) {
-                defines.push(CacheDefine {
-                    name: [b"CMAKE_".as_slice(), name].concat().into(),
-                    ty: Some(CacheType::String),
-                    value: value.into(),
-                });
-            }
-        }
         Self {
             defines,
             enabled_languages: list::join(enabled_languages(cx)),
         }
     }
+}
+
+fn is_platform_variable(name: &[u8]) -> bool {
+    PLATFORM_VARIABLES.contains(&name)
+        || name.ends_with(b"_COMPILER_TARGET")
+        || name.ends_with(b"_COMPILER_EXTERNAL_TOOLCHAIN")
+        || name
+            .windows(b"_USING_LINKER_".len())
+            .any(|word| word == b"_USING_LINKER_")
+}
+
+pub(super) fn language_properties(
+    cx: &mut Cx<'_>,
+    options: &Options<'_>,
+    languages: &[&[u8]],
+) -> Vec<(BString, BString)> {
+    let honor = cx.policy(CMP0067) == PolicyStatus::New
+        || STANDARD_OPTIONS.iter().any(|name| options.has(name));
+    let mut properties = Vec::new();
+    for &lang in languages {
+        for suffix in [
+            b"_STANDARD".as_slice(),
+            b"_STANDARD_REQUIRED",
+            b"_EXTENSIONS",
+        ] {
+            let lang = if lang == b"SYCL" && suffix != b"_EXTENSIONS" {
+                b"SYCL_CXX"
+            } else {
+                lang
+            };
+            let key = [lang, suffix].concat();
+            let value = options
+                .one(&key)
+                .map(BString::from)
+                .or_else(|| honor.then(|| cx.var_or_empty(&[b"CMAKE_", key.as_slice()].concat())));
+            if let Some(value) = value.filter(|value| !value.is_empty()) {
+                properties.push((key.into(), value));
+            }
+        }
+    }
+    properties
 }
 
 fn seed_var(cx: &Cx<'_>, defines: &mut Vec<CacheDefine>, name: &[u8]) {

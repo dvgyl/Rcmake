@@ -25,51 +25,15 @@ use rcmake_model::{CacheEntry, CacheType, GeneratorKind};
 
 const CMP0132: PolicyId = PolicyId::new(132);
 const CMP0165: PolicyId = PolicyId::new(165);
+const CMP0220: PolicyId = PolicyId::new(220);
 
 const ENABLED_LANGUAGES: &[u8] = b"ENABLED_LANGUAGES";
 const IN_TRY_COMPILE: &[u8] = b"IN_TRY_COMPILE";
 const PLATFORM_INFO_DIR: &[u8] = b"CMAKE_PLATFORM_INFO_DIR";
 const PLATFORM_INFO_INITIALIZED: &[u8] = b"CMAKE_PLATFORM_INFO_INITIALIZED";
 
-/// `CMAKE_<LANG>_KNOWN_FEATURES` global properties of CMake 4.5.1.
-const KNOWN_FEATURES: [(&str, &str); 4] = [
-    (
-        "CMAKE_C_KNOWN_FEATURES",
-        "c_std_90;c_std_99;c_std_11;c_std_17;c_std_23;c_function_prototypes;c_restrict;\
-         c_variadic_macros;c_static_assert",
-    ),
-    (
-        "CMAKE_CXX_KNOWN_FEATURES",
-        "cxx_std_98;cxx_std_11;cxx_std_14;cxx_std_17;cxx_std_20;cxx_std_23;cxx_std_26;\
-         cxx_template_template_parameters;cxx_alias_templates;cxx_alignas;cxx_alignof;\
-         cxx_attributes;cxx_auto_type;cxx_constexpr;cxx_decltype;\
-         cxx_decltype_incomplete_return_types;cxx_default_function_template_args;\
-         cxx_defaulted_functions;cxx_defaulted_move_initializers;cxx_delegating_constructors;\
-         cxx_deleted_functions;cxx_enum_forward_declarations;cxx_explicit_conversions;\
-         cxx_extended_friend_declarations;cxx_extern_templates;cxx_final;\
-         cxx_func_identifier;cxx_generalized_initializers;cxx_inheriting_constructors;\
-         cxx_inline_namespaces;cxx_lambdas;cxx_local_type_template_args;\
-         cxx_long_long_type;cxx_noexcept;cxx_nonstatic_member_init;cxx_nullptr;\
-         cxx_override;cxx_range_for;cxx_raw_string_literals;\
-         cxx_reference_qualified_functions;cxx_right_angle_brackets;\
-         cxx_rvalue_references;cxx_sizeof_member;cxx_static_assert;cxx_strong_enums;\
-         cxx_thread_local;cxx_trailing_return_types;cxx_unicode_literals;\
-         cxx_uniform_initialization;cxx_unrestricted_unions;cxx_user_literals;\
-         cxx_variadic_macros;cxx_variadic_templates;cxx_aggregate_default_initializers;\
-         cxx_attribute_deprecated;cxx_binary_literals;cxx_contextual_conversions;\
-         cxx_decltype_auto;cxx_digit_separators;cxx_generic_lambdas;\
-         cxx_lambda_init_captures;cxx_relaxed_constexpr;cxx_return_type_deduction;\
-         cxx_variable_templates",
-    ),
-    (
-        "CMAKE_CUDA_KNOWN_FEATURES",
-        "cuda_std_03;cuda_std_11;cuda_std_14;cuda_std_17;cuda_std_20;cuda_std_23;cuda_std_26",
-    ),
-    (
-        "CMAKE_HIP_KNOWN_FEATURES",
-        "hip_std_98;hip_std_11;hip_std_14;hip_std_17;hip_std_20;hip_std_23;hip_std_26",
-    ),
-];
+#[path = "../policy_misc/properties/known_features.rs"]
+mod known_features;
 
 /// `enable_language(<lang>... [OPTIONAL])`.
 pub(super) fn enable_language(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
@@ -104,7 +68,37 @@ pub(super) fn enable_language(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResul
         .filter(|arg| arg.value != b"OPTIONAL")
         .map(|arg| arg.value.clone())
         .collect();
+    let nested = cx.current_dir_id() != rcmake_model::DirId::ROOT
+        || cx.var_normal_only(b"CMAKE_CURRENT_FUNCTION").is_some();
+    let status = cx.policy(CMP0220);
+    let saved: Vec<_> = if nested && status == PolicyStatus::New {
+        cx.variable_names()
+            .into_iter()
+            .filter_map(|name| cx.var_normal_only(&name).map(|value| (name, value)))
+            .collect()
+    } else {
+        Vec::new()
+    };
     enable_languages(cx, &languages, optional)?;
+    if nested && status == PolicyStatus::New {
+        let changed: Vec<_> = cx
+            .variable_names()
+            .into_iter()
+            .filter(|name| {
+                let Some(value) = cx.var_normal_only(name) else {
+                    return false;
+                };
+                let index = saved.binary_search_by(|(key, _)| key.cmp(name));
+                index.is_err() || index.is_ok_and(|index| saved[index].1 != value)
+            })
+            .collect();
+        cx.raise_scope(&changed);
+    } else if nested
+        && status == PolicyStatus::Warn
+        && cx.var_is_on(b"CMAKE_POLICY_WARNING_CMP0220")
+    {
+        cx.issue_policy_warning(CMP0220, b"", b"For compatibility with older versions of CMake, the language configuration set by this call is not propagated to the enclosing variable scopes.");
+    }
     Ok(Flow::Normal)
 }
 
@@ -489,6 +483,17 @@ impl Bootstrap {
             }
         }
 
+        let target_option = lang_var(&lang, b"_COMPILE_OPTIONS_TARGET");
+        if cx.var_or_empty(b"CMAKE_HOST_SYSTEM_NAME") == "Darwin"
+            && cx.var_or_empty(&lang_var(&lang, b"_COMPILER_ID")) == "AppleClang"
+            && !cx
+                .var_or_empty(&lang_var(&lang, b"_COMPILER_TARGET"))
+                .is_empty()
+            && !cx.var_defined(&target_option)
+        {
+            cx.set_var(&target_option, "--target=".into());
+        }
+
         let works = lang_var(&lang, b"_COMPILER_WORKS");
         if state.need_test && !self.in_try_compile {
             let test = cat(&[b"CMakeTest", &lang, b"Compiler.cmake"]);
@@ -567,13 +572,31 @@ impl Bootstrap {
 
 /// Seed the global properties that the bootstrap modules and projects read.
 fn seed_global_properties(cx: &mut Cx<'_>) {
+    let languages = enabled_languages(cx);
     let props = &mut cx.global().props;
     if props.get(IN_TRY_COMPILE).is_none() {
         props.set(IN_TRY_COMPILE.into(), "0".into());
     }
-    for (name, features) in KNOWN_FEATURES {
-        if props.get(name.as_bytes()).is_none() {
+    let names = known_features::LANGUAGES.iter().copied().chain(
+        known_features::STANDARD_FEATURES
+            .iter()
+            .map(|&(name, _)| name),
+    );
+    for name in names {
+        if props.get(name.as_bytes()).is_none()
+            && let Some(features) = known_features::known_features(name.as_bytes())
+        {
             props.set(name.into(), features.into());
+        }
+    }
+    // The resolver uses the known feature list until this language is enabled.
+    // Keep this fallback out of the interpreter's compiler variables.
+    for lang in [b"C".as_slice(), b"CXX", b"CUDA", b"HIP"] {
+        if !languages.iter().any(|enabled| enabled.as_slice() == lang)
+            && let Some(features) =
+                known_features::known_features(&lang_var(lang, b"_KNOWN_FEATURES"))
+        {
+            props.set(lang_var(lang, b"_COMPILE_FEATURES"), features.into());
         }
     }
 }
@@ -594,6 +617,9 @@ fn enabled_languages(cx: &mut Cx<'_>) -> Vec<BString> {
 /// Add `lang` to the sorted `ENABLED_LANGUAGES` global property
 /// (`cmState::SetLanguageEnabled`).
 fn set_language_enabled(cx: &mut Cx<'_>, lang: &[u8]) {
+    cx.global()
+        .props
+        .unset(&lang_var(lang, b"_COMPILE_FEATURES"));
     let mut languages = enabled_languages(cx);
     if let Err(index) = languages.binary_search_by(|probe| probe.as_slice().cmp(lang)) {
         languages.insert(index, lang.into());

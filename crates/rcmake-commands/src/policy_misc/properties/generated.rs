@@ -1,12 +1,11 @@
 use rcmake_base::truth;
 use rcmake_diag::{DiagCategory, Effect, MessageKind, PolicyId, PolicyStatus};
 use rcmake_eval::Cx;
-use rcmake_host::path;
 use rcmake_model::DirId;
 
 use super::computed::boolean;
+use super::scope::{select_source, source_paths};
 use super::set::Update;
-use crate::dirs::normalized_path;
 
 const CMP0118: PolicyId = PolicyId::new(118);
 const CMP0163: PolicyId = PolicyId::new(163);
@@ -28,9 +27,7 @@ pub(super) fn global_value(
     if policy(cx, dir, CMP0163) != PolicyStatus::New {
         return None;
     }
-    let relative = path::to_native(source);
-    let paths = [cx.current_binary_dir(), cx.current_source_dir()]
-        .map(|base| path::from_native(&normalized_path(&base.join(&relative))));
+    let paths = source_paths(cx, source);
     Some(boolean(
         paths
             .iter()
@@ -94,21 +91,51 @@ pub(super) fn set(
             "Policy {policy_id} is set to NEW and appending to the 'GENERATED' property is therefore not allowed. Only setting it to \"1\" is allowed!\n"
         )
     } else {
-        let base = if scoped {
-            cx.current_source_dir()
+        let [source_path, binary_path] = source_paths(cx, source);
+        let path = if let Some(rcmake_model::PropScope::Source { path, .. }) =
+            select_source(cx, dir, source, scoped, false)
+            && cx.project().dir(dir).source_props.contains_key(&path)
+        {
+            // An unscoped relative source with no resolved file uses the binary directory.
+            if !scoped
+                && path == source_path
+                && !rcmake_host::path::to_native(source).is_absolute()
+                && cx
+                    .host()
+                    .metadata(
+                        &rcmake_host::path::to_native(&path),
+                        rcmake_host::Follow::Yes,
+                    )
+                    .is_err()
+            {
+                binary_path
+            } else {
+                path
+            }
+        } else if scoped {
+            source_path
         } else {
-            cx.current_binary_dir()
+            binary_path
         };
-        let path = path::from_native(&normalized_path(&base.join(path::to_native(source))));
         cx.project().mark_generated(dir, path);
         return true;
     };
-    cx.issue(
-        MessageKind::AuthorWarning,
-        Effect::None,
-        Some(DiagCategory::Author),
-        diagnostic.into(),
-    );
+    let _ = select_source(cx, dir, source, scoped, true);
+    if dir == cx.current_dir_id() {
+        cx.issue(
+            MessageKind::AuthorWarning,
+            Effect::None,
+            Some(DiagCategory::Author),
+            diagnostic.into(),
+        );
+    } else {
+        cx.issue_in_directory(
+            MessageKind::AuthorWarning,
+            Effect::None,
+            Some(DiagCategory::Author),
+            diagnostic.into(),
+        );
+    }
     true
 }
 

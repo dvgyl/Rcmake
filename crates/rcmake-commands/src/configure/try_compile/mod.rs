@@ -7,7 +7,7 @@ use rcmake_build::BuildOutcome;
 use rcmake_diag::{DiagCategory, Effect, MessageKind};
 use rcmake_eval::{CmdError, CmdResult, Cx, Flow, Interp, InterpConfig, RunMode};
 use rcmake_expr::ExpandedArg;
-use rcmake_host::{CopyOptions, Host, HostError, path};
+use rcmake_host::{CopyOptions, Host, HostError, Input, Output, RunRequest, WriteMode, path};
 use rcmake_model::{CacheEntry, CacheType, DirId};
 
 use args::{Options, Signature, parse};
@@ -187,6 +187,23 @@ fn probe(cx: &mut Cx<'_>, args: &[ExpandedArg], run: bool) -> CmdResult {
             message,
         );
     }
+    if let Some(denial) = process_denial(cx.host()) {
+        cx.set_var(build_var, "FALSE".into());
+        if let Some(var) = options
+            .one(b"COMPILE_OUTPUT_VARIABLE")
+            .or_else(|| options.one(b"OUTPUT_VARIABLE"))
+        {
+            cx.set_var(var, denial.clone());
+        }
+        let command = if run { "try_run" } else { "try_compile" };
+        cx.issue(
+            MessageKind::Warning,
+            Effect::None,
+            None,
+            format!("{command} skipped the test build. {denial}").into(),
+        );
+        return Ok(Flow::Normal);
+    }
     let dirs = ProbeDirs::create(cx, &signature)?;
     if cx.var_is_on(b"CMAKE_DEBUG_TRY_COMPILE") {
         let command = if run { "try_run" } else { "try_compile" };
@@ -213,6 +230,30 @@ fn probe(cx: &mut Cx<'_>, args: &[ExpandedArg], run: bool) -> CmdResult {
         result?;
     }
     Ok(Flow::Normal)
+}
+
+fn process_denial(host: &dyn Host) -> Option<BString> {
+    // An empty pipeline cannot start a process. Denying hosts reject the request
+    // before pipeline validation.
+    let request = RunRequest {
+        pipeline: Vec::new(),
+        cwd: host.initial_cwd(),
+        env: Vec::new(),
+        stdin: Input::Null,
+        stdout: Output::Null,
+        stderr: Output::Null,
+        timeout: None,
+        tee: false,
+    };
+    if let Err(error) = host.run_bounded(&request, 0)
+        && error.kind == std::io::ErrorKind::Unsupported
+    {
+        return Some(error.os_message.into());
+    }
+    if cfg!(target_family = "wasm") {
+        return Some("The host does not support the test build.".into());
+    }
+    None
 }
 
 fn build_probe(
@@ -268,6 +309,7 @@ fn build_probe(
     let trace = cx.trace_config().cloned();
     let generator = cx.project().generator;
     let generator_spec = cx.project().generator_spec.clone();
+    let save_cache = dirs.scratch.is_none() || cx.var_is_on(b"CMAKE_DEBUG_TRY_COMPILE");
     let mut recursion_exceeded = false;
     let (build, mut output) = CapturingHost::capture(cx.host(), &dirs.binary, |host| {
         let mut child = Interp::new(
@@ -312,6 +354,15 @@ fn build_probe(
             }
         }
         let configure = child.run_configure(&dirs.source, &dirs.binary, &[]);
+        if save_cache {
+            let data = probe_cache(&mut child.cx());
+            host.write(
+                &dirs.binary.join("CMakeCache.txt"),
+                &data,
+                WriteMode::Truncate,
+            )
+            .map_err(|error| error.to_string())?;
+        }
         if configure.exit_code != 0 {
             recursion_exceeded = child.recursion_exceeded();
             return Ok((
@@ -404,6 +455,42 @@ fn build_probe(
         }
     }
     Ok(())
+}
+
+fn probe_cache(child: &mut Cx<'_>) -> BString {
+    let mut data = BString::default();
+    let entries: std::collections::BTreeMap<_, _> = child.cache().iter().collect();
+    for (name, entry) in entries {
+        if name.iter().any(|byte| matches!(byte, b'\n' | b'\r' | b'"')) {
+            continue;
+        }
+        let quote_name = name.contains(&b':') || name.starts_with(b"#") || name.starts_with(b"//");
+        if quote_name {
+            data.push(b'"');
+        }
+        data.extend_from_slice(name);
+        if quote_name {
+            data.push(b'"');
+        }
+        data.push(b':');
+        data.extend_from_slice(entry.ty.as_str().as_bytes());
+        data.push(b'=');
+        let value = entry
+            .value
+            .split(|&byte| byte == b'\n')
+            .next()
+            .unwrap_or_default();
+        let quote_value = value.starts_with(b"'") || value != value.trim_ascii_end();
+        if quote_value {
+            data.push(b'\'');
+        }
+        data.extend_from_slice(value);
+        if quote_value {
+            data.push(b'\'');
+        }
+        data.push(b'\n');
+    }
+    data
 }
 
 fn copy_artifact(

@@ -9,8 +9,8 @@ use rcmake_resolve::usage::UsageResolver;
 use super::computed::{boolean, directory_value, global_value, source_value};
 use super::file_set::{file_set_id, file_set_selection, file_set_target, file_set_value};
 use super::scope::{
-    SourceSelection, alias_value, check_directory, find_target, single_name, source_directory,
-    source_scope, source_scopes, test_names,
+    SOURCE_EXTENSIONS, SourceSelection, alias_value, check_directory, find_target, select_source,
+    single_name, source_directory, source_paths, source_scopes, test_names,
 };
 use super::{is_inherited, model_value, quoted, values};
 
@@ -103,11 +103,11 @@ pub(in crate::policy_misc) fn get_source(cx: &mut Cx<'_>, args: &[ExpandedArg]) 
             "called with incorrect number of arguments",
         ));
     };
-    let (dir, name) = match options {
+    let (dir, name, scoped) = match options {
         [option @ (b"DIRECTORY" | b"TARGET_DIRECTORY"), value, name] => {
-            (source_directory(cx, option, value)?, *name)
+            (source_directory(cx, option, value)?, *name, true)
         }
-        [name] => (cx.current_dir_id(), *name),
+        [name] => (cx.current_dir_id(), *name, false),
         _ => {
             return Err(CmdError::status(
                 "called with incorrect number of arguments",
@@ -115,64 +115,42 @@ pub(in crate::policy_misc) fn get_source(cx: &mut Cx<'_>, args: &[ExpandedArg]) 
         }
     };
     let inherited = is_inherited(cx, b"SOURCE", name);
-    let value =
-        query_source(cx, dir, source, name, inherited, false).unwrap_or_else(|| "NOTFOUND".into());
+    let value = query_source(
+        cx,
+        SourceSelection {
+            dir,
+            source,
+            scoped,
+        },
+        name,
+        inherited,
+        false,
+    )
+    .unwrap_or_else(|| "NOTFOUND".into());
     cx.set_var(out, value);
     Ok(Flow::Normal)
 }
 
 fn query_source(
     cx: &mut Cx<'_>,
-    dir: rcmake_model::DirId,
-    source: &[u8],
+    selection: SourceSelection<'_>,
     name: &[u8],
     inherited: bool,
     create: bool,
 ) -> Option<BString> {
+    let SourceSelection {
+        dir,
+        source,
+        scoped,
+    } = selection;
     if name == b"GENERATED"
         && let Some(value) = super::generated::global_value(cx, dir, source)
     {
         return Some(value);
     }
-    if !create && name != b"LOCATION" {
-        let source_path = crate::dirs::normalized_path(&cx.resolve_path(source));
-        let binary_path = crate::dirs::normalized_path(
-            &cx.current_binary_dir()
-                .join(rcmake_host::path::to_native(source)),
-        );
-        let source_path = rcmake_host::path::from_native(&source_path);
-        let binary_path = rcmake_host::path::from_native(&binary_path);
-        let project = cx.project();
-        let directory = project.dir(dir);
-        let known = [source_path.as_slice(), binary_path.as_slice()];
-        if !known
-            .iter()
-            .any(|path| directory.source_props.contains_key(*path))
-            && (name == b"GENERATED"
-                || !project
-                    .targets()
-                    .filter(|(_, target)| target.dir == dir)
-                    .any(|(_, target)| {
-                        target.sources.iter().any(|source| {
-                            let path = rcmake_base::path_lex::Lexical::new(&directory.source_dir)
-                                .append(&source.value);
-                            known.contains(&path.as_slice())
-                        })
-                    }))
-        {
-            return None;
-        }
-    }
-    let scope = source_scope(cx, dir, source);
+    let scope = select_source(cx, dir, source, scoped, create || name == b"LOCATION")?;
     if name == b"LOCATION" {
-        return source_location(cx, dir, source, &scope);
-    }
-    if create && let PropScope::Source { path, .. } = &scope {
-        cx.project()
-            .dir_mut(dir)
-            .source_props
-            .entry(path.clone())
-            .or_default();
+        return source_location(cx, dir, source, &scope, scoped);
     }
     if name == b"GENERATED"
         && super::generated::is_strict(cx, dir)
@@ -190,25 +168,25 @@ fn source_location(
     dir: DirId,
     source: &[u8],
     scope: &PropScope,
+    scoped: bool,
 ) -> Option<BString> {
-    const EXTENSIONS: &str = "c C c++ cc cpp cxx cu mpp m M mm ixx cppm ccm cxxm c++m h hh h++ hm hpp hxx in txx f F for f77 f90 f95 f03 hip ispc";
     let PropScope::Source { path: known, .. } = scope else {
         return None;
     };
-    let relative = path::to_native(source);
-    let source_path = crate::dirs::normalized_path(&cx.resolve_path(source));
-    let binary_path = crate::dirs::normalized_path(&cx.current_binary_dir().join(&relative));
-    let paths = [source_path, binary_path].map(|value| path::from_native_cmake(&value));
+    let paths = source_paths(cx, source);
+    let paths = if scoped { &paths[..1] } else { &paths[..] };
+    let is_global = super::generated::is_strict(cx, dir);
     let is_generated = |cx: &mut Cx<'_>, path: &BString| {
         let model = cx.project();
-        model.is_globally_generated(path) || model.dir(dir).generated_sources.contains(path)
+        model.dir(dir).generated_sources.contains(path)
+            || is_global && model.is_globally_generated(path)
     };
     let source_props = cx.project().dir(dir).source_props.get(known);
     if source_props
         .and_then(|props| props.get(b"GENERATED"))
         .is_some_and(|value| truth::is_on(value))
     {
-        return paths.get(1).cloned();
+        return paths.last().cloned();
     }
     let policy = PolicyId::new(115);
     let status = super::generated::policy(cx, dir, policy);
@@ -220,11 +198,11 @@ fn source_location(
                 .is_ok()
     };
     for path in paths {
-        if accept(cx, &path) {
-            return Some(path);
+        if accept(cx, path) {
+            return Some(path.clone());
         }
         if status != PolicyStatus::New {
-            for extension in EXTENSIONS.split_ascii_whitespace() {
+            for extension in SOURCE_EXTENSIONS.split_ascii_whitespace() {
                 let candidate: BString = [path.as_slice(), b".", extension.as_bytes()]
                     .concat()
                     .into();
@@ -241,7 +219,7 @@ fn source_location(
     let mut body: BString = [b"Cannot find source file:\n\n  ", source].concat().into();
     if status != PolicyStatus::New {
         body.extend_from_slice(b"\n\nTried extensions");
-        for extension in EXTENSIONS.split_ascii_whitespace() {
+        for extension in SOURCE_EXTENSIONS.split_ascii_whitespace() {
             body.extend_from_slice(b" .");
             body.extend_from_slice(extension.as_bytes());
         }
@@ -449,8 +427,9 @@ impl<'a> PropertyOwner<'a> {
                 let id = file_set_id(cx, target_id, target, set)?;
                 file_set_value(cx, id, name, inherited)
             }
-            Self::Source(scope) => scope
-                .and_then(|scope| query_source(cx, scope.dir, scope.source, name, inherited, true)),
+            Self::Source(scope) => {
+                scope.and_then(|scope| query_source(cx, scope, name, inherited, true))
+            }
             Self::Model(PropScope::Directory(dir)) => directory_value(cx, dir, name, inherited),
             Self::Model(scope @ PropScope::Test { .. }) => {
                 if let PropScope::Test { dir, name: test } = &scope

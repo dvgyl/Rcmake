@@ -114,6 +114,12 @@ fn add(cx: &mut Cx<'_>, args: &[ExpandedArg], own: Field, interface: Field) -> C
         ]
         .map(|key| (key, cx.var(key)))
     });
+    let enabled_languages = feature_tables.as_ref().map(|_| {
+        cx.global()
+            .props
+            .get(b"ENABLED_LANGUAGES")
+            .map_or_else(Vec::new, |value| list::split(value, list::Empty::Drop))
+    });
     while let Some((keyword, tail)) = rest.split_first() {
         let scope = scope(bytes(keyword))
             .ok_or_else(|| CmdError::status("called with invalid arguments"))?;
@@ -123,17 +129,36 @@ fn add(cx: &mut Cx<'_>, args: &[ExpandedArg], own: Field, interface: Field) -> C
             .unwrap_or(tail.len());
         let (items, next) = tail.split_at(end);
         rest = next;
+        let target = cx
+            .project()
+            .target(id)
+            .ok_or_else(|| model_error(ModelError::UnknownObject))?;
+        validate_scope(target, scope, false)?;
         if items.is_empty() {
             continue;
         }
-        if let Some(tables) = &feature_tables
+        if let (Some(tables), Some(enabled)) = (&feature_tables, &enabled_languages)
             && scope != UsageScope::Interface
         {
             for feature in items
                 .iter()
                 .flat_map(|arg| list::split(bytes(arg), list::Empty::Drop))
             {
-                if !feature.windows(2).any(|pair| pair == b"$<")
+                let deferred = [b"C".as_slice(), b"CXX", b"CUDA", b"HIP"]
+                    .iter()
+                    .any(|&lang| {
+                        !enabled.iter().any(|value| value == lang)
+                            && cx
+                                .global()
+                                .props
+                                .get(&[b"CMAKE_", lang, b"_KNOWN_FEATURES"].concat())
+                                .is_some_and(|table| {
+                                    list::iter(table, list::Empty::Drop)
+                                        .any(|known| feature.as_slice() == known.as_ref())
+                                })
+                    });
+                if !deferred
+                    && !feature.windows(2).any(|pair| pair == b"$<")
                     && let Err(message) = cx.project().validate_compile_feature(&feature, |key| {
                         tables
                             .iter()
@@ -155,7 +180,6 @@ fn add(cx: &mut Cx<'_>, args: &[ExpandedArg], own: Field, interface: Field) -> C
             .project()
             .target_mut(id)
             .ok_or_else(|| model_error(ModelError::UnknownObject))?;
-        validate_scope(target, scope, false)?;
         let value = list::join(items.iter().map(|arg| {
             let value = bytes(arg);
             if paths {
@@ -168,6 +192,11 @@ fn add(cx: &mut Cx<'_>, args: &[ExpandedArg], own: Field, interface: Field) -> C
         }));
         if scope != UsageScope::Interface {
             record(target, own, BT::new(value.clone(), bt.clone()), before);
+            if system && scope == UsageScope::Private && !value.is_empty() {
+                target
+                    .props
+                    .append("SYSTEM_INCLUDE_DIRECTORIES".into(), &value);
+            }
         }
         if scope != UsageScope::Private {
             let entry = BT::new(value, bt.clone());

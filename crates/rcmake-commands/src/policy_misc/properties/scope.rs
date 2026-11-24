@@ -1,4 +1,4 @@
-use rcmake_base::BString;
+use rcmake_base::{BString, list};
 use rcmake_eval::{CmdError, Cx, RunMode};
 use rcmake_host::path;
 use rcmake_model::{DirId, PropScope, TargetBinding, TargetId};
@@ -10,28 +10,80 @@ use super::quoted;
 const DIRECTORY_ERROR: &str = "DIRECTORY scope provided but requested directory was not found.  This could be because the directory argument was invalid or, it is valid but has not been processed yet.";
 
 pub(super) fn source_scope(cx: &mut Cx<'_>, dir: DirId, source: &[u8]) -> PropScope {
-    let resolved = normalized_path(&cx.resolve_path(source));
-    let mut key = path::from_native(&resolved);
-    let binary = normalized_path(&cx.current_binary_dir().join(path::to_native(source)));
-    let binary = path::from_native(&binary);
-    let known = &mut cx.project().dir_mut(dir).source_props;
-    if !known.contains_key(&key) {
-        if known.contains_key(&binary) {
-            key = binary;
-        } else if resolved.extension().is_none()
-            && let Some(existing) = known.keys().find(|candidate| {
-                [key.as_slice(), binary.as_slice()].iter().any(|prefix| {
-                    candidate
-                        .strip_prefix(*prefix)
-                        .is_some_and(|suffix| suffix.starts_with(b".") && !suffix.contains(&b'/'))
+    select_source(cx, dir, source, false, true).unwrap_or_else(|| PropScope::Source {
+        dir,
+        path: source.into(),
+    })
+}
+
+pub(super) fn select_source(
+    cx: &mut Cx<'_>,
+    dir: DirId,
+    source: &[u8],
+    scoped: bool,
+    create: bool,
+) -> Option<PropScope> {
+    let paths = source_paths(cx, source);
+    let relative = !scoped && !path::to_native(source).is_absolute();
+    let paths = if relative { &paths[..] } else { &paths[..1] };
+    let exact_extension = [115, 187].into_iter().all(|id| {
+        super::generated::policy(cx, dir, rcmake_diag::PolicyId::new(id))
+            == rcmake_diag::PolicyStatus::New
+    });
+    let matches = |candidate: &[u8]| {
+        paths.iter().any(|prefix| {
+            candidate == prefix.as_slice()
+                || !exact_extension
+                    && candidate
+                        .strip_prefix(prefix.as_slice())
+                        .and_then(|suffix| suffix.strip_prefix(b"."))
+                        .is_some_and(|ext| {
+                            SOURCE_EXTENSIONS
+                                .split_ascii_whitespace()
+                                .any(|known| ext == known.as_bytes())
+                        })
+        })
+    };
+    let model = cx.project();
+    let directory = model.dir(dir);
+    let known = directory
+        .source_props
+        .keys()
+        .find(|key| matches(key))
+        .cloned();
+    let key = known.or_else(|| {
+        model
+            .targets()
+            .filter(|(_, target)| target.dir == dir)
+            .flat_map(|(_, target)| &target.sources)
+            .flat_map(|entry| list::iter(&entry.value, list::Empty::Drop))
+            .filter(|entry| !entry.starts_with(b"$<"))
+            .flat_map(|entry| {
+                let entry = path::to_native(&entry);
+                [&directory.source_dir, &directory.binary_dir].map(|base| {
+                    path::from_native_cmake(&normalized_path(&path::to_native(base).join(&entry)))
                 })
             })
-        {
-            key = existing.clone();
-        }
+            .find(|key| matches(key))
+    });
+    if !create {
+        return key.map(|path| PropScope::Source { dir, path });
     }
-    known.entry(key.clone()).or_default();
-    PropScope::Source { dir, path: key }
+    let key = key.unwrap_or_else(|| paths[0].clone());
+    cx.project()
+        .dir_mut(dir)
+        .source_props
+        .entry(key.clone())
+        .or_default();
+    Some(PropScope::Source { dir, path: key })
+}
+
+pub(super) const SOURCE_EXTENSIONS: &str = "c C c++ cc cpp cxx cu mpp m M mm ixx cppm ccm cxxm c++m h hh h++ hm hpp hxx in txx f F for f77 f90 f95 f03 hip ispc";
+
+pub(super) fn source_paths(cx: &Cx<'_>, source: &[u8]) -> [BString; 2] {
+    let file = path::to_native(source);
+    [cx.current_source_dir(), cx.current_binary_dir()]
+        .map(|base| path::from_native_cmake(&normalized_path(&base.join(&file))))
 }
 
 pub(super) fn single_name<'a>(scope: &[u8], names: &[&'a [u8]]) -> Result<&'a [u8], CmdError> {

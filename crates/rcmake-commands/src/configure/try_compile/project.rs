@@ -1,12 +1,16 @@
 use std::path::{Path, PathBuf};
 
 use rcmake_base::{BString, list};
+use rcmake_diag::{
+    Backtrace, Diagnostic, Effect, Frame, FrameKind, Location, MessageKind, PolicyId, PolicyStatus,
+    RenderOptions,
+};
 use rcmake_eval::{CmdError, Cx};
 use rcmake_expr::ExpandedArg;
 use rcmake_host::{Host, WriteMode, path};
 
 use super::args::{Options, Source};
-use super::seed::enabled_languages;
+use super::seed::{enabled_languages, language_properties};
 use super::{absolute, error_text, probe_error, split_byte};
 
 pub(super) fn write_project(
@@ -33,7 +37,7 @@ pub(super) fn write_project(
     let enabled = enabled_languages(cx);
     for &source in sources {
         let file = match source {
-            Source::File(file) => absolute(directory, file),
+            Source::File(file) => absolute(&cx.current_source_dir(), file),
             Source::Content(name, value) => write_source(cx.host(), directory, name, value)?,
             Source::Variable(name, var) => {
                 write_source(cx.host(), directory, name, &cx.var_or_empty(var))?
@@ -108,6 +112,8 @@ pub(super) fn write_project(
         .flat_map(|arg| list::iter(arg, list::Empty::Drop))
         .flat_map(|arg| compile_definition_words(cx, &arg))
         .collect();
+    let properties = language_properties(cx, options, &languages);
+    let extensions_policy = cx.policy(PolicyId::new(128));
     let code = render_project(
         ProjectInputs {
             archive,
@@ -115,17 +121,76 @@ pub(super) fn write_project(
             languages,
             compile_flags,
             language,
+            extensions_policy,
+            properties: &properties,
         },
         options,
         target,
     );
+    let lists = directory.join("CMakeLists.txt");
     cx.host()
-        .write(
-            &directory.join("CMakeLists.txt"),
-            &code,
-            WriteMode::CreateNew,
-        )
-        .map_err(error_text)
+        .write(&lists, &code, WriteMode::CreateNew)
+        .map_err(error_text)?;
+    for (key, value) in &properties {
+        let Some(lang) = key.strip_suffix(b"_STANDARD") else {
+            continue;
+        };
+        let default = [b"CMAKE_", lang, b"_STANDARD_DEFAULT"].concat();
+        if valid_standard(lang, value) || cx.var_or_empty(&default).is_empty() {
+            continue;
+        }
+        let command = if archive {
+            b"add_library".as_slice()
+        } else {
+            b"add_executable"
+        };
+        let line = code
+            .as_slice()
+            .split(|&byte| byte == b'\n')
+            .position(|line| line.starts_with(command))
+            .and_then(|index| u32::try_from(index + 1).ok())
+            .unwrap_or(1);
+        let file = path::from_native_cmake(&lists);
+        let trace = Backtrace::default().push(Frame {
+            file: file.as_slice().into(),
+            line,
+            name: Some(command.into()),
+            kind: FrameKind::Command,
+        });
+        let diagnostic = Diagnostic {
+            kind: MessageKind::Error,
+            effect: Effect::Fatal,
+            category: None,
+            policy: None,
+            location: Location::Backtrace(trace),
+            body: format!("{key} is set to invalid value '{value}'").into(),
+        };
+        cx.host().write_out(
+            rcmake_host::Stream::Stderr,
+            &rcmake_diag::render(&diagnostic, &RenderOptions::default()),
+        );
+        let error = probe_error(cx, "Failed to generate test project build system.");
+        cx.set_fatal();
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn valid_standard(language: &[u8], value: &[u8]) -> bool {
+    let Ok(value) = std::str::from_utf8(value) else {
+        return false;
+    };
+    let Ok(level) = value.parse::<u32>() else {
+        return false;
+    };
+    match language {
+        b"C" | b"OBJC" => matches!(level, 90 | 99 | 11 | 17 | 23),
+        b"CUDA" => matches!(level, 3 | 98 | 11 | 14 | 17 | 20 | 23 | 26),
+        b"CXX" | b"OBJCXX" | b"HIP" | b"SYCL_CXX" => {
+            matches!(level, 98 | 11 | 14 | 17 | 20 | 23 | 26)
+        }
+        _ => true,
+    }
 }
 
 fn source_copy_error(cx: &mut Cx<'_>, file: &[u8], error: &rcmake_host::HostError) -> CmdError {
@@ -147,6 +212,8 @@ struct ProjectInputs<'a> {
     languages: Vec<&'a [u8]>,
     compile_flags: Vec<BString>,
     language: Option<&'a [u8]>,
+    extensions_policy: PolicyStatus,
+    properties: &'a [(BString, BString)],
 }
 
 fn render_project(inputs: ProjectInputs<'_>, options: &Options<'_>, target: &str) -> BString {
@@ -156,10 +223,14 @@ fn render_project(inputs: ProjectInputs<'_>, options: &Options<'_>, target: &str
         languages,
         compile_flags,
         language,
+        extensions_policy,
+        properties,
     } = inputs;
-    let mut code = BString::from(
-        b"cmake_minimum_required(VERSION 4.5)\nproject(CMAKE_TRY_COMPILE LANGUAGES".as_slice(),
-    );
+    let mut code = BString::from("cmake_minimum_required(VERSION 4.5)\n");
+    if extensions_policy != PolicyStatus::New {
+        code.extend_from_slice(b"cmake_policy(SET CMP0128 OLD)\n");
+    }
+    code.extend_from_slice(b"project(CMAKE_TRY_COMPILE LANGUAGES");
     for &lang in &languages {
         code.push(b' ');
         code.extend_from_slice(lang);
@@ -167,6 +238,11 @@ fn render_project(inputs: ProjectInputs<'_>, options: &Options<'_>, target: &str
     code.extend_from_slice(
         b")\ninclude_directories(${INCLUDE_DIRECTORIES})\nlink_directories(${LINK_DIRECTORIES})\n",
     );
+    if languages.contains(&b"CUDA".as_slice()) {
+        code.extend_from_slice(
+            b"string(REPLACE \"<CUDA_COMPILE_MODE>\" \"${_CMAKE_CUDA_WHOLE_FLAG}\" CMAKE_CUDA_COMPILE_OBJECT \"${CMAKE_CUDA_COMPILE_OBJECT}\")\n",
+        );
+    }
     code.extend_from_slice(b"if(NOT \"${COMPILE_DEFINITIONS}\" STREQUAL \"\")\n");
     for lang in languages {
         let flags = BString::from([b"CMAKE_", lang, b"_FLAGS"].concat());
@@ -185,6 +261,13 @@ fn render_project(inputs: ProjectInputs<'_>, options: &Options<'_>, target: &str
         &prefix,
         files.iter().map(|value| value.as_slice()),
     );
+    for (name, value) in properties {
+        cmake_command(
+            &mut code,
+            &format!("set_property(TARGET {target} PROPERTY {name}"),
+            [value.as_slice()],
+        );
+    }
     for (command, definitions) in [
         ("target_compile_definitions", true),
         ("target_compile_options", false),
