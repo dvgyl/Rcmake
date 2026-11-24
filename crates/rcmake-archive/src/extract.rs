@@ -1,9 +1,11 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::io::{self, Cursor, ErrorKind, Read};
 use std::path::{Path, PathBuf};
 
 use rcmake_base::BString;
-use rcmake_host::{FileKind, FileTime, Follow, Host, Metadata, WriteMode, path::to_native};
+use rcmake_host::{
+    FileKind, FileTime, Follow, Host, Metadata, ReadRange, WriteMode, path::to_native,
+};
 use tar::{Archive, EntryType};
 use zip::ZipArchive;
 
@@ -31,13 +33,20 @@ pub(super) fn run(
     if !options.list_only {
         absolute(&options.destination)?;
     }
-    if host.metadata(archive_path, Follow::Yes)?.kind != FileKind::File {
+    let metadata = host.metadata(archive_path, Follow::Yes)?;
+    if metadata.kind != FileKind::File {
         return Err(ArchiveError::new(format!(
             "The archive path must point to a regular file: {}",
             archive_path.display()
         )));
     }
-    let bytes = read_bytes(host, archive_path, size_limit())?;
+    let prefix = host.read(
+        archive_path,
+        ReadRange::Slice {
+            offset: 0,
+            len: Some(16),
+        },
+    )?;
     let mut scan = Scan {
         patterns: Patterns::new(&options.patterns)?,
         list_only: options.list_only,
@@ -47,7 +56,8 @@ pub(super) fn run(
         count: 0,
         bytes_left: size_limit(),
     };
-    if bytes.starts_with(b"PK\x03\x04") || bytes.starts_with(b"PK\x05\x06") {
+    if prefix.starts_with(b"PK\x03\x04") || prefix.starts_with(b"PK\x05\x06") {
+        let bytes = read_bytes(host, archive_path, size_limit())?;
         let entries = scan.zip(&bytes)?;
         scan.patterns.finish()?;
         if !entries.is_empty() {
@@ -57,12 +67,34 @@ pub(super) fn run(
             }
             unpack.finish()?;
         }
-    } else if let Some(filter) = codec::detect(&bytes) {
-        scan.tar(host, &options.destination, || {
-            codec::decoder(filter, &bytes)
-        })?;
+    } else if let Some(filter) = codec::detect(&prefix) {
+        let bytes = read_bytes(host, archive_path, size_limit())?;
+        let entries = scan.tar_headers(codec::decoder(filter, &bytes)?)?;
+        scan.patterns.finish()?;
+        if !entries.is_empty() {
+            let unpack = Unpack::new(host, &options.destination)?;
+            unpack.tar(codec::decoder(filter, &bytes)?, entries)?;
+        }
     } else {
-        scan.tar(host, &options.destination, || Ok(bytes.as_slice()))?;
+        if metadata.len > size_limit() {
+            return Err(ArchiveError::new(format!(
+                "{}: File too large",
+                archive_path.display()
+            )));
+        }
+        let source = host.canonicalize(archive_path)?;
+        let reader = || codec::FileReader::new(host, &source, &prefix);
+        let entries = scan.tar_headers(reader())?;
+        scan.patterns.finish()?;
+        if !entries.is_empty() {
+            let unpack = Unpack::new(host, &options.destination)?;
+            if unpack.replaces_source(&source, &metadata, &entries) {
+                let bytes = read_bytes(host, &source, size_limit())?;
+                unpack.tar(bytes.as_slice(), entries)?;
+            } else {
+                unpack.tar(reader(), entries)?;
+            }
+        }
     }
     emit_names(host, &scan.names, options.verbose);
     Ok(scan.names)
@@ -102,40 +134,6 @@ impl Scan<'_> {
             .checked_sub(size)
             .ok_or_else(|| ArchiveError::new("Archive exceeds the size limit"))?;
         Ok(())
-    }
-
-    fn tar<R: Read>(
-        &mut self,
-        host: &dyn Host,
-        destination: &Path,
-        reader: impl Fn() -> Result<R, ArchiveError>,
-    ) -> Result<(), ArchiveError> {
-        let entries = self.tar_headers(reader()?)?;
-        self.patterns.finish()?;
-        if entries.is_empty() {
-            return Ok(());
-        }
-
-        let mut unpack = Unpack::new(host, destination)?;
-        let mut entries = entries.into_iter().peekable();
-        let mut archive = Archive::new(reader()?.take(size_limit() + 1));
-        for (index, item) in archive.entries().map_err(archive_error)?.enumerate() {
-            let mut item = item.map_err(archive_error)?;
-            let Some((_, entry)) = entries.next_if(|(selected, _)| *selected == index) else {
-                continue;
-            };
-            let payload = if matches!(entry.data, Data::File) {
-                let size = item.size();
-                read_payload(&mut item, size)?
-            } else {
-                Vec::new()
-            };
-            unpack.entry(entry, &payload)?;
-            if entries.peek().is_none() {
-                break;
-            }
-        }
-        unpack.finish()
     }
 
     fn tar_headers(&mut self, reader: impl Read) -> Result<Vec<(usize, Entry)>, ArchiveError> {
@@ -449,18 +447,24 @@ fn symlink_target(link: &Path, target: &[u8]) -> Result<PathBuf, ArchiveError> {
 
 fn read_payload(reader: impl Read, size: u64) -> Result<Vec<u8>, ArchiveError> {
     let data = read_bounded(reader, size)?;
+    check_payload_size(&data, size)?;
+    Ok(data)
+}
+
+fn check_payload_size(data: &[u8], size: u64) -> Result<(), ArchiveError> {
     if data.len() as u64 != size {
         return Err(ArchiveError::new(
             "Archive entry size does not match its header",
         ));
     }
-    Ok(data)
+    Ok(())
 }
 
 struct Unpack<'a> {
     host: &'a dyn Host,
     root: PathBuf,
     directories: BTreeMap<PathBuf, (Option<u32>, Option<FileTime>)>,
+    verified: HashSet<PathBuf>,
 }
 
 impl<'a> Unpack<'a> {
@@ -470,17 +474,100 @@ impl<'a> Unpack<'a> {
             host,
             root: host.canonicalize(destination)?,
             directories: BTreeMap::new(),
+            verified: HashSet::new(),
         })
     }
 
-    fn checked_path(&self, relative: &Path, create_parents: bool) -> Result<PathBuf, ArchiveError> {
+    fn replaces_source(
+        &self,
+        source: &Path,
+        metadata: &Metadata,
+        entries: &[(usize, Entry)],
+    ) -> bool {
+        // The reader opens the input again for each chunk. Keep a snapshot if
+        // an entry can replace the input before the reader reaches the end.
+        let root_metadata = self.host.metadata(&self.root, Follow::Yes).ok();
+        let Some(depth) = source
+            .ancestors()
+            .skip(1)
+            .position(|parent| {
+                parent == self.root
+                    || root_metadata.as_ref().is_some_and(|root| {
+                        self.host
+                            .metadata(parent, Follow::Yes)
+                            .is_ok_and(|candidate| {
+                                (root.dev, root.ino) == (candidate.dev, candidate.ino)
+                            })
+                    })
+            })
+            .map(|depth| depth + 1)
+        else {
+            return false;
+        };
+        entries.iter().any(|(_, entry)| {
+            !matches!(entry.data, Data::Directory)
+                && entry.path.components().count() == depth
+                && self
+                    .host
+                    .metadata(&self.root.join(&entry.path), Follow::No)
+                    .is_ok_and(|target| (target.dev, target.ino) == (metadata.dev, metadata.ino))
+        })
+    }
+
+    fn tar(mut self, reader: impl Read, entries: Vec<(usize, Entry)>) -> Result<(), ArchiveError> {
+        let mut payload = Vec::with_capacity(64 * 1024);
+        let mut entries = entries.into_iter().peekable();
+        let mut archive = Archive::new(reader.take(size_limit() + 1));
+        for (index, item) in archive.entries().map_err(archive_error)?.enumerate() {
+            let mut item = item.map_err(archive_error)?;
+            let Some((_, entry)) = entries.next_if(|(selected, _)| *selected == index) else {
+                continue;
+            };
+            payload.clear();
+            if matches!(entry.data, Data::File) {
+                let size = item.size();
+                (&mut item)
+                    .take(size.saturating_add(1))
+                    .read_to_end(&mut payload)
+                    .map_err(archive_error)?;
+                check_payload_size(&payload, size)?;
+            }
+            self.entry(entry, &payload)?;
+            if entries.peek().is_none() {
+                break;
+            }
+        }
+        self.finish()
+    }
+
+    fn checked_path(
+        &mut self,
+        relative: &Path,
+        create_parents: bool,
+    ) -> Result<PathBuf, ArchiveError> {
         let relative_parent = relative.parent().unwrap_or(Path::new(""));
         let mut parent = self.root.clone();
+        parent.push(relative_parent);
+        if self.verified.contains(&parent) {
+            return Ok(self.root.join(relative));
+        }
+        parent.clone_from(&self.root);
         for part in relative_parent {
             parent.push(part);
-            ensure_directory(self.host, &parent, create_parents)?;
+            self.verify_directory(&parent, create_parents)?;
         }
         Ok(self.root.join(relative))
+    }
+
+    fn verify_directory(&mut self, path: &Path, create: bool) -> Result<(), ArchiveError> {
+        if !self.verified.contains(path) {
+            ensure_directory(self.host, path, create)?;
+            if self.verified.len() >= 4096 {
+                self.verified.clear();
+            }
+            self.verified.insert(path.to_owned());
+        }
+        Ok(())
     }
 
     fn entry(&mut self, entry: Entry, payload: &[u8]) -> Result<(), ArchiveError> {
@@ -488,7 +575,7 @@ impl<'a> Unpack<'a> {
         let path = self.checked_path(&entry.path, true)?;
         match entry.data {
             Data::Directory => {
-                ensure_directory(host, &path, true)?;
+                self.verify_directory(&path, true)?;
                 self.directories.insert(path, (entry.mode, entry.mtime));
             }
             Data::File => {
@@ -499,6 +586,7 @@ impl<'a> Unpack<'a> {
             Data::Symlink(target) => {
                 remove_existing_file(host, &path)?;
                 host.symlink(&target, &path)?;
+                self.verified.clear();
             }
             Data::HardLink(target) => {
                 let target = self.checked_path(&target, false)?;

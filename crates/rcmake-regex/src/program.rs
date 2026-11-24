@@ -104,6 +104,7 @@ pub(crate) fn find(
     start: usize,
     options: MatchOptions,
     budget: &mut u64,
+    scratch: &mut Scratch,
 ) -> Result<Option<Captures>, RegexLimit> {
     let mut vm = Vm {
         program,
@@ -111,8 +112,7 @@ pub(crate) fn find(
         bol: if options.bol_at_start { start } else { 0 },
         skip_empty_at: (!options.allow_empty_at_start).then_some(start),
         budget,
-        choices: Vec::new(),
-        changes: Vec::new(),
+        scratch,
     };
     for attempt in start..=hay.len() {
         if let Some(captures) = vm.run(attempt)? {
@@ -120,6 +120,12 @@ pub(crate) fn find(
         }
     }
     Ok(None)
+}
+
+#[derive(Default)]
+pub(crate) struct Scratch {
+    choices: Vec<Choice>,
+    changes: Vec<(usize, Span)>,
 }
 
 struct Choice {
@@ -134,12 +140,13 @@ struct Vm<'a> {
     bol: usize,
     skip_empty_at: Option<usize>,
     budget: &'a mut u64,
-    choices: Vec<Choice>,
-    changes: Vec<(usize, Span)>,
+    scratch: &'a mut Scratch,
 }
 
 impl Vm<'_> {
     fn run(&mut self, start: usize) -> Result<Option<Captures>, RegexLimit> {
+        self.scratch.choices.clear();
+        self.scratch.changes.clear();
         let mut groups = [None; MAX_CAPTURE_SLOTS];
         let mut pc = 0;
         let mut pos = start;
@@ -177,10 +184,10 @@ impl Vm<'_> {
                 }
                 Instruction::Split(alternative) => {
                     // Try the next instruction first. Save the other path for backtracking.
-                    self.choices.push(Choice {
+                    self.scratch.choices.push(Choice {
                         pc: alternative,
                         pos,
-                        changes: self.changes.len(),
+                        changes: self.scratch.changes.len(),
                     });
                     continue;
                 }
@@ -196,10 +203,10 @@ impl Vm<'_> {
                 }
                 Instruction::Any | Instruction::Start | Instruction::End | Instruction::Accept => {}
             }
-            let Some(choice) = self.choices.pop() else {
+            let Some(choice) = self.scratch.choices.pop() else {
                 return Ok(None);
             };
-            for (slot, old) in self.changes.drain(choice.changes..).rev() {
+            for (slot, old) in self.scratch.changes.drain(choice.changes..).rev() {
                 if let Some(capture) = groups.get_mut(slot) {
                     *capture = old;
                 }
@@ -218,8 +225,8 @@ impl Vm<'_> {
     ) {
         if let Some(capture) = groups.get_mut(slot) {
             // Save only changes that a pending alternative can undo.
-            if !self.choices.is_empty() {
-                self.changes.push((slot, *capture));
+            if !self.scratch.choices.is_empty() {
+                self.scratch.changes.push((slot, *capture));
             }
             *capture = Some(span);
         }

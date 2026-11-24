@@ -162,7 +162,7 @@ pub(super) fn copy(command: &[u8], args: &[BString], cx: &ToolCtx<'_>) -> i32 {
         );
     }
     let dest_path = path(cx, destination);
-    let dest_is_dir = !destination.is_empty() && is_dir(cx, &dest_path);
+    let dest_is_dir = !directory && !destination.is_empty() && is_dir(cx, &dest_path);
     if !directory && (target_option || sources.len() > 1) && !dest_is_dir {
         return error(
             cx,
@@ -183,21 +183,24 @@ pub(super) fn copy(command: &[u8], args: &[BString], cx: &ToolCtx<'_>) -> i32 {
             Err(fs_error(ErrorKind::NotFound, NO_FILE))
         } else if directory {
             copy_tree(&src_path, &dest_path, when, cx)
-        } else if is_dir(cx, &src_path) {
-            if dest_is_dir {
-                Ok(())
-            } else {
-                create_copy_directory(&dest_path, cx)
-            }
         } else {
-            let target = if dest_is_dir {
-                src_path
-                    .file_name()
-                    .map_or_else(|| dest_path.clone(), |name| dest_path.join(name))
+            let source = cx.host.metadata(&src_path, Follow::Yes);
+            if source.as_ref().is_ok_and(|meta| meta.kind == FileKind::Dir) {
+                if dest_is_dir {
+                    Ok(())
+                } else {
+                    create_copy_directory(&dest_path, cx)
+                }
             } else {
-                dest_path.clone()
-            };
-            copy_entry(&src_path, &target, when, cx)
+                let target = if dest_is_dir {
+                    src_path
+                        .file_name()
+                        .map_or_else(|| dest_path.clone(), |name| dest_path.join(name))
+                } else {
+                    dest_path.clone()
+                };
+                copy_entry(&src_path, &target, when, cx, source, dest_is_dir)
+            }
         };
         if let Err(err) = result {
             let action: &[u8] = match (directory, when) {
@@ -278,7 +281,8 @@ fn copy_tree_entries(
             "Too many levels of symbolic links",
         ));
     }
-    if let Ok(target) = cx.host.metadata(dst, Follow::Yes) {
+    let target = cx.host.metadata(dst, Follow::Yes);
+    if let Ok(target) = &target {
         if target.kind != FileKind::Dir {
             return Err(fs_error(ErrorKind::AlreadyExists, "File exists"));
         }
@@ -288,7 +292,9 @@ fn copy_tree_entries(
     }
     let mut entries = cx.host.read_dir(src)?;
     entries.sort_unstable_by(|a, b| a.name.cmp(&b.name));
-    create_copy_directory(dst, cx)?;
+    if target.is_err() {
+        cx.host.create_dir_all(dst)?;
+    }
     ancestors.push(identity);
     let result = entries.iter().try_for_each(|entry| {
         let name = to_native(&entry.name);
@@ -298,7 +304,7 @@ fn copy_tree_entries(
         if meta.kind == FileKind::Dir {
             copy_tree_entries(&from, &to, when, cx, ancestors, meta)
         } else {
-            copy_entry(&from, &to, when, cx)
+            copy_entry(&from, &to, when, cx, Ok(meta), true)
         }
     });
     ancestors.pop();
@@ -316,13 +322,35 @@ fn create_copy_directory(dst: &Path, cx: &ToolCtx<'_>) -> HostResult<()> {
     cx.host.create_dir_all(dst)
 }
 
-fn copy_entry(src: &Path, dst: &Path, when: CopyWhen, cx: &ToolCtx<'_>) -> HostResult<()> {
-    let source = cx.host.metadata(src, Follow::Yes);
+fn copy_entry(
+    src: &Path,
+    dst: &Path,
+    when: CopyWhen,
+    cx: &ToolCtx<'_>,
+    source: HostResult<Metadata>,
+    parent_ready: bool,
+) -> HostResult<()> {
+    if source
+        .as_ref()
+        .is_ok_and(|source| source.kind != FileKind::File)
+    {
+        return Err(fs_error(ErrorKind::InvalidInput, "Invalid argument"));
+    }
+    if source.is_err() && when == CopyWhen::Newer {
+        return source.map(|_| ());
+    }
+    let existing = cx.host.metadata(dst, Follow::No);
     if let Ok(source) = &source {
-        if source.kind != FileKind::File {
-            return Err(fs_error(ErrorKind::InvalidInput, "Invalid argument"));
-        }
-        if let Ok(target) = cx.host.metadata(dst, Follow::Yes) {
+        let followed;
+        let target = match &existing {
+            Ok(target) if target.kind == FileKind::Symlink => {
+                followed = cx.host.metadata(dst, Follow::Yes);
+                followed.as_ref().ok()
+            }
+            Ok(target) => Some(target),
+            Err(_) => None,
+        };
+        if let Some(target) = target {
             if (source.dev, source.ino) == (target.dev, target.ino) {
                 return Ok(());
             }
@@ -339,8 +367,6 @@ fn copy_entry(src: &Path, dst: &Path, when: CopyWhen, cx: &ToolCtx<'_>) -> HostR
                 }
             }
         }
-    } else if when == CopyWhen::Newer {
-        return source.map(|_| ());
     }
 
     if dst
@@ -351,11 +377,16 @@ fn copy_entry(src: &Path, dst: &Path, when: CopyWhen, cx: &ToolCtx<'_>) -> HostR
     {
         return Err(fs_error(ErrorKind::NotFound, NO_FILE));
     }
-    if let Some(parent) = dst.parent() {
+    if !parent_ready && let Some(parent) = dst.parent() {
         create_copy_directory(parent, cx)?;
     }
     // CMake replaces the destination entry before it opens the source.
-    match cx.host.metadata(dst, Follow::No) {
+    let existing = if parent_ready {
+        existing
+    } else {
+        cx.host.metadata(dst, Follow::No)
+    };
+    match existing {
         Ok(meta) if meta.kind == FileKind::Dir => cx.host.remove_dir(dst)?,
         Ok(_) => cx.host.remove_file(dst)?,
         Err(err) if err.kind == ErrorKind::NotFound => {}

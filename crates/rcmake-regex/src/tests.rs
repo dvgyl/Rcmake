@@ -306,3 +306,28 @@ fn converts_cmake_glob_patterns() {
     assert!(capture(&glob::to_regex(b"*"), b"").is_some());
     assert!(Regex::new(&glob::to_regex(b"[z-a]")).is_err());
 }
+
+#[test]
+fn matcher_reuses_scratch_after_success_and_budget_exhaustion() -> Result<(), RegexError> {
+    let re = Regex::new(b"(a+)(b)|c")?;
+    let mut scratch = Scratch::default();
+    let options = MatchOptions::default();
+    let input = b"aabc";
+    let first = re.find_at_with_scratch(input, 0, options, &mut 100, &mut scratch);
+    assert!(
+        first.is_ok_and(|caps| {
+            caps.is_some_and(|caps| caps.groups.get(2) == Some(&Some((2, 3))))
+        })
+    );
+    assert_eq!(
+        re.find_at_with_scratch(input, 0, options, &mut 4, &mut scratch),
+        Err(RegexLimit)
+    );
+    let expected = re.find_at(input, 3, options, &mut 100);
+    assert!(expected.as_ref().is_ok_and(|caps| caps.is_some()));
+    assert_eq!(
+        re.find_at_with_scratch(input, 3, options, &mut 100, &mut scratch),
+        expected
+    );
+    Ok(())
+}

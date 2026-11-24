@@ -470,6 +470,49 @@ fn rejects_writes_through_an_extracted_symlink() -> TestResult {
 }
 
 #[test]
+fn cached_tar_directories_cannot_be_replaced_by_symlinks() -> TestResult {
+    let host = test_host();
+    let archive = Path::new("/archive");
+    let mut builder = Builder::new(Vec::new());
+    add_test_tar_file(&mut builder, "tree/first")?;
+    add_test_tar_link(&mut builder, "tree", EntryType::Symlink, b"/outside")?;
+    add_test_tar_file(&mut builder, "tree/second")?;
+    host.seed_file(archive, &builder.into_inner()?)?;
+    let result = extract_archive(&host, archive, &extract_options());
+    assert!(result.is_err_and(
+        |error| error.message == "Cannot extract over this filesystem entry: /extract/tree"
+    ));
+    assert!(absent(&host, "/outside/second"));
+    assert_eq!(
+        read_bytes(&host, Path::new("/extract/tree/first"), 1)?,
+        b"x"
+    );
+    Ok(())
+}
+
+#[test]
+fn chunked_tar_extraction_can_replace_the_archive_it_reads() -> TestResult {
+    let host = test_host();
+    let archive = Path::new("/extract/archive.tar");
+    let mut builder = Builder::new(Vec::new());
+    add_test_tar_file(&mut builder, "archive.tar")?;
+    let contents = vec![b'z'; 300 * 1024];
+    let mut header = Header::new_gnu();
+    header.set_size(contents.len() as u64);
+    header.set_mode(0o644);
+    header.set_mtime(0);
+    builder.append_data(&mut header, "large", contents.as_slice())?;
+    host.seed_file(archive, &builder.into_inner()?)?;
+    extract_archive(&host, archive, &extract_options())?;
+    assert_eq!(read_bytes(&host, archive, 1)?, b"x");
+    assert_eq!(
+        read_bytes(&host, Path::new("/extract/large"), size_limit())?,
+        contents
+    );
+    Ok(())
+}
+
+#[test]
 fn extracts_tar_hard_links_twice() -> TestResult {
     let host = test_host();
     let archive = Path::new("/archive");

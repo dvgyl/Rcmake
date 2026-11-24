@@ -218,7 +218,7 @@ impl Writer {
                 } else {
                     CompressionMethod::Stored
                 },
-                level: level.filter(|_| deflate).map(i64::from),
+                level: deflate.then(|| i64::from(level.unwrap_or(6).clamp(0, 9))),
             });
         }
         let encoder = Encoder::new(filter, level)?;

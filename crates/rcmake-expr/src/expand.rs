@@ -96,7 +96,11 @@ impl<'a> Scanner<'a, '_> {
             return Err(error("Variable expansion exceeded the nesting limit."));
         }
 
-        let mut output = Vec::new();
+        let mut output = if reference.is_none() {
+            Vec::with_capacity(self.remaining.len().min(self.remaining_bytes))
+        } else {
+            Vec::new()
+        };
         while let Some((&byte, rest)) = self.remaining.split_first() {
             self.remaining = rest;
             match byte {
@@ -119,8 +123,17 @@ impl<'a> Scanner<'a, '_> {
                     if let Some((reference, rest)) = self.reference_start(rest)? {
                         self.remaining = rest;
                         let line = self.line;
-                        let name = self.scan(Some(reference), depth + 1)?;
-                        let value = self.lookup(reference, &name, line);
+                        let value = if depth < MAX_DEPTH
+                            && let Some((name, rest)) = delimited_name(rest, b'}')
+                            && name.len() <= self.remaining_bytes
+                        {
+                            self.remaining = rest;
+                            self.remaining_bytes -= name.len();
+                            self.lookup(reference, name, line)
+                        } else {
+                            let name = self.scan(Some(reference), depth + 1)?;
+                            self.lookup(reference, &name, line)
+                        };
                         self.append_value(&mut output, &value)?;
                     } else {
                         self.append(&mut output, b"$")?;

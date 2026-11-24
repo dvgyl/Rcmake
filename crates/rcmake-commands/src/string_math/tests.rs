@@ -185,6 +185,31 @@ fn regex_captures_replacements_and_empty_matches() {
 }
 
 #[test]
+fn regex_matchall_clears_intermediate_captures_and_notifies_watches() {
+    let (mut interp, host) = setup(
+        r#"
+        string(REGEX MATCHALL "(a)?b" plain abb)
+        set(cleared "${CMAKE_MATCH_1}")
+        variable_watch(CMAKE_MATCH_1)
+        string(REGEX MATCHALL "(a)?b" watched abb)
+        "#,
+    );
+    run(&mut interp, &host);
+    check(
+        &mut interp,
+        &[
+            ("plain", b"ab;b"),
+            ("watched", b"ab;b"),
+            ("cleared", b""),
+            ("CMAKE_MATCH_1", b""),
+            ("CMAKE_MATCH_0", b"b"),
+        ],
+    );
+    let log = host.stream_bytes(Stream::Stderr);
+    assert_eq!(log.to_str_lossy().matches("MODIFIED_ACCESS").count(), 2);
+}
+
+#[test]
 fn regex_anchor_policy() {
     for (policy, expected) in [
         (PolicyStatus::Old, b"a;b;c".as_slice()),
@@ -271,6 +296,29 @@ end
             "now",
             format!("{}.{:06}", now.secs, now.nanos / 1000).as_bytes(),
         )],
+    );
+}
+
+#[test]
+fn timestamp_accepts_negative_epoch_values() {
+    let (mut interp, host) = setup(
+        r#"
+        set(ENV{SOURCE_DATE_EPOCH} -86400)
+        string(TIMESTAMP prior "%Y-%m-%dT%H:%M:%SZ %s" UTC)
+        set(ENV{SOURCE_DATE_EPOCH} -1)
+        string(TIMESTAMP sentinel UTC)
+        set(ENV{SOURCE_DATE_EPOCH} 9223372036854775807)
+        string(TIMESTAMP too_large UTC)
+        "#,
+    );
+    run(&mut interp, &host);
+    check(
+        &mut interp,
+        &[
+            ("prior", b"1969-12-31T00:00:00Z -86400"),
+            ("sentinel", b""),
+            ("too_large", b""),
+        ],
     );
 }
 

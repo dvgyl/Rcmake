@@ -8,7 +8,7 @@ use rcmake_expr::{
     configure::{ConfigureOptions, configure as expand_template},
 };
 
-use super::{append, check_size, decimal_prefix, set, status, trim_start};
+use super::{append, check_size, decimal_prefix, set, status};
 
 pub(super) fn ascii(cx: &mut Cx<'_>, args: &[&[u8]]) -> CmdResult {
     let [codes @ .., out] = args else {
@@ -195,13 +195,10 @@ pub(super) fn timestamp(cx: &mut Cx<'_>, args: &[&[u8]]) -> CmdResult {
         .env_get(b"SOURCE_DATE_EPOCH")
         .filter(|epoch| !epoch.is_empty())
     {
-        let secs = std::str::from_utf8(trim_start(&epoch))
-            .ok()
-            .and_then(|epoch| epoch.parse::<i64>().ok())
-            .ok_or_else(|| {
-                crate::exit_with_error(cx, 27, b"Cannot parse SOURCE_DATE_EPOCH as integer")
-            })?;
-        if secs < 0 {
+        let secs = rcmake_base::parse_source_date_epoch(&epoch).ok_or_else(|| {
+            crate::exit_with_error(cx, 27, b"Cannot parse SOURCE_DATE_EPOCH as integer")
+        })?;
+        if secs == -1 {
             return set(cx, out, "");
         }
         (secs, 0)

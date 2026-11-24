@@ -341,6 +341,33 @@ list(POP_BACK created picked missing_output)
 }
 
 #[test]
+fn list_get_streams_indices_in_argument_order() {
+    let mut state = Script::new(Vec::new());
+    state.success(
+        r"
+set(xs [=[zero;;[two;inner];x\;y;last]=])
+list(GET xs 3 0 3 1 selected)
+list(GET xs -1 -4 -5 negative)
+list(GET xs 2 single)
+",
+    );
+    state.var("selected", b"x;y;zero;x;y;");
+    state.var("negative", b"last;;zero");
+    state.var("single", b"[two;inner]");
+
+    for (indices, diagnostic) in [
+        ("10 5", "index: 10 out of range (-5, 4)"),
+        ("-6", "index: -6 out of range (-5, 4)"),
+        ("5 invalid", "index: 5 out of range (-5, 4)"),
+    ] {
+        let mut state = Script::new(Vec::new());
+        let exit = state.run(&format!("set(xs a;b;c;d;e)\nlist(GET xs {indices} result)"));
+        assert_eq!(exit, 1);
+        assert!(state.stderr().contains(diagnostic), "{}", state.stderr());
+    }
+}
+
+#[test]
 fn filter_regex_and_predicate() {
     let mut state = Script::new(Vec::new());
     state.success(

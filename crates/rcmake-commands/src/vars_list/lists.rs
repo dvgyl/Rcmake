@@ -19,45 +19,40 @@ pub(super) fn list(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
     if matches!(command, b"APPEND" | b"PREPEND") {
         if !rest.is_empty() {
             let items = rest.iter().map(bytes);
-            let existing = raw
-                .as_deref()
-                .map(Vec::as_slice)
-                .filter(|value| !value.is_empty());
+            let mut existing = raw.unwrap_or_default();
+            let has_value = !existing.is_empty();
             let value = if command == b"APPEND" {
-                list::join(existing.into_iter().chain(items))
+                for (i, item) in items.enumerate() {
+                    if has_value || i != 0 {
+                        existing.push(b';');
+                    }
+                    existing.extend_from_slice(item);
+                }
+                existing
             } else {
-                list::join(items.chain(existing))
+                list::join(items.chain(has_value.then_some(existing.as_slice())))
             };
             cx.set_var(name, value);
         }
         return Ok(Flow::Normal);
     }
-    let mut items = raw
-        .as_ref()
-        .map_or_else(Vec::new, |raw| list::split(raw, list::Empty::Keep));
+    let raw_bytes = raw.as_ref().map_or(b"".as_slice(), |raw| raw.as_slice());
+    let elements = || list::iter(raw_bytes, list::Empty::Keep);
     match (command, rest) {
-        (b"LENGTH", [out]) => cx.set_var(bytes(out), items.len().to_string().into()),
+        (b"LENGTH", [out]) => cx.set_var(bytes(out), elements().count().to_string().into()),
         (b"LENGTH", _) => return Err(status("sub-command LENGTH requires two arguments.")),
         (b"GET", [indices @ .., out]) if !indices.is_empty() => {
             let value = if raw.is_none() {
                 BString::from("NOTFOUND")
-            } else if items.is_empty() {
-                return Err(status("GET given empty list"));
             } else {
-                let indices = indices
-                    .iter()
-                    .map(|arg| index(bytes(arg), items.len(), false));
-                let values = indices
-                    .map(|index| index.map(|index| items.get(index)))
-                    .collect::<Result<Vec<_>, _>>()?;
-                list::join(values.into_iter().flatten())
+                get_elements(raw_bytes, indices)?
             };
             cx.set_var(bytes(out), value);
         }
         (b"GET", _) => return Err(status("sub-command GET requires at least three arguments.")),
         (b"JOIN", [glue, out]) => cx.set_var(
             bytes(out),
-            join_with(&items, bytes(glue), cx.limits().max_value_bytes)?,
+            join_with(elements(), bytes(glue), cx.limits().max_value_bytes)?,
         ),
         (b"JOIN", _) => {
             return Err(status(format!(
@@ -66,7 +61,7 @@ pub(super) fn list(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
             )));
         }
         (b"SUBLIST", [begin, length, out]) => {
-            cx.set_var(bytes(out), sublist(&items, bytes(begin), bytes(length))?)
+            cx.set_var(bytes(out), sublist(raw_bytes, bytes(begin), bytes(length))?)
         }
         (b"SUBLIST", _) => {
             return Err(status(format!(
@@ -75,9 +70,7 @@ pub(super) fn list(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
             )));
         }
         (b"FIND", [needle, out]) => {
-            let found = items
-                .iter()
-                .position(|item| item.as_slice() == bytes(needle));
+            let found = elements().position(|item| item.as_ref() == bytes(needle));
             cx.set_var(
                 bytes(out),
                 found
@@ -86,6 +79,20 @@ pub(super) fn list(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
             );
         }
         (b"FIND", _) => return Err(status("sub-command FIND requires three arguments.")),
+        _ => return change_list(cx, command, name, rest, raw.as_ref()),
+    }
+    Ok(Flow::Normal)
+}
+
+fn change_list(
+    cx: &mut Cx<'_>,
+    command: &[u8],
+    name: &[u8],
+    rest: &[ExpandedArg],
+    raw: Option<&BString>,
+) -> CmdResult {
+    let mut items = raw.map_or_else(Vec::new, |raw| list::split(raw, list::Empty::Keep));
+    match (command, rest) {
         (b"INSERT", [at, values @ ..]) if !values.is_empty() => {
             let at = index(bytes(at), items.len(), true)?;
             items.splice(at..at, values.iter().map(|arg| arg.value.clone()));
@@ -146,22 +153,86 @@ fn save(cx: &mut Cx<'_>, name: &[u8], items: &[BString]) {
     cx.set_var(name, list::join(items));
 }
 
-fn join_with(items: &[BString], glue: &[u8], limit: usize) -> Result<BString, CmdError> {
-    let bytes = glue.len().saturating_mul(items.len().saturating_sub(1));
-    let size = items
-        .iter()
-        .fold(bytes, |size, item| size.saturating_add(item.len()));
-    if size > limit {
-        return Err(status("result exceeds the value size limit"));
-    }
-    let mut value = Vec::with_capacity(size);
-    for (i, item) in items.iter().enumerate() {
-        if i > 0 {
-            value.extend_from_slice(glue);
+fn join_with(items: list::Elements<'_>, glue: &[u8], limit: usize) -> Result<BString, CmdError> {
+    let mut value = Vec::new();
+    for (i, item) in items.enumerate() {
+        let separator = if i == 0 { b"".as_slice() } else { glue };
+        if item.len().saturating_add(separator.len()) > limit - value.len() {
+            return Err(status("result exceeds the value size limit"));
         }
-        value.extend_from_slice(item);
+        value.extend_from_slice(separator);
+        value.extend_from_slice(&item);
     }
     Ok(value.into())
+}
+
+fn get_elements(raw: &[u8], args: &[ExpandedArg]) -> Result<BString, CmdError> {
+    let elements = || list::iter(raw, list::Empty::Keep);
+    if raw.is_empty() {
+        return Err(status("GET given empty list"));
+    }
+    if let [arg] = args {
+        let parsed = list_number(bytes(arg))?;
+        let selected = match usize::try_from(parsed) {
+            Ok(at) => elements().nth(at),
+            Err(_) => {
+                let at = checked_index(parsed, elements().count(), false)?;
+                elements().nth(at)
+            }
+        };
+        return match selected {
+            Some(value) => Ok(value.into_owned().into()),
+            None => Err(index_range(parsed, elements().count(), false)),
+        };
+    }
+
+    let indices = args.iter().map(|arg| list_number(bytes(arg)));
+    let mut order = indices
+        .clone()
+        .enumerate()
+        .map(|(slot, at)| at.map(|at| (at, slot)))
+        .collect::<Result<Vec<_>, _>>();
+    if !order
+        .as_ref()
+        .is_ok_and(|order| order.iter().all(|(at, _)| *at >= 0))
+    {
+        let len = elements().count();
+        order = indices
+            .enumerate()
+            .map(|(slot, at)| Ok((checked_index(at?, len, false)? as i64, slot)))
+            .collect();
+    }
+    let mut order = order?;
+    order.sort_unstable();
+    let mut selected = vec![None; args.len()];
+    let mut scan = elements();
+    let mut previous = None;
+    let mut next = 0;
+    for (at, slot) in order {
+        let at = usize::try_from(at).map_err(|err| status(err.to_string()))?;
+        if at >= next {
+            let Some(value) = scan.nth(at - next) else {
+                let len = elements().count();
+                // Report the first invalid index in argument order.
+                for arg in args {
+                    index(bytes(arg), len, false)?;
+                }
+                return Err(index_range(at as i64, len, false));
+            };
+            previous = Some(slot);
+            if let Some(element) = selected.get_mut(slot) {
+                *element = Some(value);
+            }
+            next = at + 1;
+        } else if let Some(value) = previous
+            .and_then(|previous| selected.get(previous))
+            .cloned()
+            && let Some(element) = selected.get_mut(slot)
+        {
+            *element = value;
+        }
+    }
+    Ok(list::join(selected.into_iter().flatten()))
 }
 
 fn list_number(arg: &[u8]) -> Result<i64, CmdError> {
@@ -175,34 +246,47 @@ fn signed_len(len: usize) -> i64 {
 }
 
 fn index(arg: &[u8], len: usize, insert: bool) -> Result<usize, CmdError> {
-    let parsed = list_number(arg)?;
+    checked_index(list_number(arg)?, len, insert)
+}
+
+fn checked_index(parsed: i64, len: usize, insert: bool) -> Result<usize, CmdError> {
     let last = signed_len(len) - i64::from(!insert);
     let relative = list_ops::normalize_index(parsed, len);
     if !(0..=last).contains(&relative) {
-        return Err(status(format!(
-            "index: {parsed} out of range ({}, {last})",
-            -signed_len(len)
-        )));
+        return Err(index_range(parsed, len, insert));
     }
     usize::try_from(relative).map_err(|err| status(err.to_string()))
 }
 
-fn sublist(items: &[BString], begin: &[u8], length: &[u8]) -> Result<BString, CmdError> {
-    if items.is_empty() {
+fn index_range(parsed: i64, len: usize, insert: bool) -> CmdError {
+    let last = signed_len(len) - i64::from(!insert);
+    status(format!(
+        "index: {parsed} out of range ({}, {last})",
+        -signed_len(len)
+    ))
+}
+
+fn sublist(raw: &[u8], begin: &[u8], length: &[u8]) -> Result<BString, CmdError> {
+    if raw.is_empty() {
         return Ok(BString::default());
     }
     let begin = list_number(begin)?;
     let length = list_number(length)?;
-    let last = signed_len(items.len()) - 1;
-    let start = usize::try_from(begin)
+    let mut items = list::iter(raw, list::Empty::Keep);
+    let Some(first) = usize::try_from(begin)
         .ok()
-        .filter(|&start| start < items.len())
-        .ok_or_else(|| status(format!("begin index: {begin} is out of range 0 - {last}")))?;
+        .and_then(|start| items.nth(start))
+    else {
+        let last = signed_len(list::iter(raw, list::Empty::Keep).count()) - 1;
+        return Err(status(format!(
+            "begin index: {begin} is out of range 0 - {last}"
+        )));
+    };
     if length < -1 {
         return Err(status(format!("length: {length} should be -1 or greater")));
     }
     let count = usize::try_from(length).unwrap_or(usize::MAX);
-    Ok(list::join(items.iter().skip(start).take(count)))
+    Ok(list::join(std::iter::once(first).chain(items).take(count)))
 }
 
 fn pop(cx: &mut Cx<'_>, command: &[u8], name: &[u8], outputs: &[ExpandedArg], items: &[BString]) {

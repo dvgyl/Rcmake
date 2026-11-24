@@ -12,11 +12,13 @@ pub mod limits;
 pub mod list;
 pub mod list_ops;
 pub mod path_lex;
+mod source_date_epoch;
 pub mod truth;
 pub mod version;
 
 pub use bstr::{BStr, BString, ByteSlice, ByteVec};
 pub use limits::Limits;
+pub use source_date_epoch::parse_source_date_epoch;
 
 /// Target CMake version implemented by Rcmake (`4.5.1`).
 pub const CMAKE_VERSION_STR: &str = "4.5.1";

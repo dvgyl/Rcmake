@@ -92,6 +92,10 @@ impl Captures {
     }
 }
 
+/// Reusable storage for backtracking and capture changes during a regex search.
+#[derive(Default)]
+pub struct Scratch(program::Scratch);
+
 /// Compiled CMake 4.5.1 regular expression.
 #[derive(Clone, Debug)]
 pub struct Regex {
@@ -125,7 +129,19 @@ impl Regex {
         options: MatchOptions,
         budget: &mut u64,
     ) -> Result<Option<Captures>, RegexLimit> {
-        program::find(&self.program, hay, start, options, budget)
+        self.find_at_with_scratch(hay, start, options, budget, &mut Scratch::default())
+    }
+
+    /// Search like [`Self::find_at`] and reuse the storage in `scratch`.
+    pub fn find_at_with_scratch(
+        &self,
+        hay: &[u8],
+        start: usize,
+        options: MatchOptions,
+        budget: &mut u64,
+        scratch: &mut Scratch,
+    ) -> Result<Option<Captures>, RegexLimit> {
+        program::find(&self.program, hay, start, options, budget, &mut scratch.0)
     }
 }
 
@@ -164,49 +180,137 @@ pub fn expand_replacement(
     group_count: usize,
 ) -> Result<BString, RegexError> {
     let mut out = Vec::new();
-    let mut remaining = template.iter().copied();
+    expand_parts(
+        template,
+        replacement_parts(template),
+        hay,
+        caps,
+        group_count,
+        &mut out,
+    )?;
+    Ok(BString::from(out))
+}
+
+#[derive(Clone, Copy)]
+enum Part<'a> {
+    Literal(&'a [u8]),
+    Group(usize),
+}
+
+fn replacement_parts(mut remaining: &[u8]) -> impl Iterator<Item = Result<Part<'_>, RegexError>> {
+    std::iter::from_fn(move || {
+        if remaining.is_empty() {
+            return None;
+        }
+        let literal_end = remaining
+            .iter()
+            .position(|&byte| byte == b'\\')
+            .unwrap_or(remaining.len());
+        if literal_end != 0 {
+            let (literal, tail) = remaining.split_at(literal_end);
+            remaining = tail;
+            return Some(Ok(Part::Literal(literal)));
+        }
+        let [_, escape, rest @ ..] = remaining else {
+            remaining = b"";
+            return Some(Err(replacement_error(format_args!(
+                "replace-expression ends in a backslash."
+            ))));
+        };
+        remaining = rest;
+        Some(match escape {
+            b'0'..=b'9' => Ok(Part::Group(usize::from(*escape - b'0'))),
+            b'\\' => Ok(Part::Literal(b"\\")),
+            b'n' => Ok(Part::Literal(b"\n")),
+            escape => Err(replacement_error(format_args!(
+                "Unknown escape \"\\{}\" in replace-expression.",
+                String::from_utf8_lossy(std::slice::from_ref(escape))
+            ))),
+        })
+    })
+}
+
+/// A parsed CMake regex replacement template. Its literals borrow the template.
+pub struct Replacement<'a> {
+    template: &'a [u8],
+    parts: Vec<Part<'a>>,
+}
+
+impl<'a> Replacement<'a> {
+    /// Parse literals and escapes. Check capture group numbers during expansion.
+    pub fn parse(template: &'a [u8]) -> Result<Self, RegexError> {
+        let mut parts = Vec::new();
+        let mut literal_size = 0;
+        for part in replacement_parts(template) {
+            let part = part?;
+            if let Part::Literal(bytes) = part {
+                literal_size += bytes.len();
+                if literal_size > Limits::default().max_value_bytes {
+                    return Err(replacement_size_error());
+                }
+            }
+            parts.push(part);
+        }
+        Ok(Self { template, parts })
+    }
+
+    /// Clear `out` and write the replacement for a match. Return an error if a
+    /// group number is invalid or the result exceeds the default value limit.
+    pub fn expand_into(
+        &self,
+        hay: &[u8],
+        caps: &Captures,
+        group_count: usize,
+        out: &mut Vec<u8>,
+    ) -> Result<(), RegexError> {
+        out.clear();
+        expand_parts(
+            self.template,
+            self.parts.iter().copied().map(Ok),
+            hay,
+            caps,
+            group_count,
+            out,
+        )
+    }
+}
+
+fn expand_parts<'a>(
+    template: &[u8],
+    parts: impl Iterator<Item = Result<Part<'a>, RegexError>>,
+    hay: &[u8],
+    caps: &Captures,
+    group_count: usize,
+    out: &mut Vec<u8>,
+) -> Result<(), RegexError> {
     let limit = Limits::default().max_value_bytes;
-    while let Some(byte) = remaining.next() {
-        let bytes = match byte {
-            b'\\' => match remaining.next() {
-                Some(digit @ b'0'..=b'9') => {
-                    let group = usize::from(digit - b'0');
-                    if group > group_count {
-                        return Err(replacement_error(format_args!(
-                            "replace expression \"{}\" contains an out-of-range escape for group {group}.",
-                            String::from_utf8_lossy(template)
-                        )));
-                    }
-                    caps.groups
-                        .get(group)
-                        .and_then(|&span| span)
-                        .and_then(|(start, end)| hay.get(start..end))
-                        .unwrap_or_default()
-                }
-                Some(b'\\') => b"\\",
-                Some(b'n') => b"\n",
-                Some(escape) => {
+    for part in parts {
+        let bytes = match part? {
+            Part::Literal(bytes) => bytes,
+            Part::Group(group) => {
+                if group > group_count {
                     return Err(replacement_error(format_args!(
-                        "Unknown escape \"\\{}\" in replace-expression.",
-                        String::from_utf8_lossy(std::slice::from_ref(&escape))
+                        "replace expression \"{}\" contains an out-of-range escape for group {group}.",
+                        String::from_utf8_lossy(template)
                     )));
                 }
-                None => {
-                    return Err(replacement_error(format_args!(
-                        "replace-expression ends in a backslash."
-                    )));
-                }
-            },
-            _ => std::slice::from_ref(&byte),
+                caps.groups
+                    .get(group)
+                    .and_then(|&span| span)
+                    .and_then(|(start, end)| hay.get(start..end))
+                    .unwrap_or_default()
+            }
         };
         if bytes.len() > limit - out.len() {
-            return Err(replacement_error(format_args!(
-                "Replacement exceeds the value size limit."
-            )));
+            return Err(replacement_size_error());
         }
         out.extend_from_slice(bytes);
     }
-    Ok(BString::from(out))
+    Ok(())
+}
+
+fn replacement_size_error() -> RegexError {
+    replacement_error(format_args!("Replacement exceeds the value size limit."))
 }
 
 fn replacement_error(detail: std::fmt::Arguments<'_>) -> RegexError {

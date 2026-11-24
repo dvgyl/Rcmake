@@ -11,6 +11,8 @@
 //!   `list()`, `foreach(IN LISTS)`, unquoted argument expansion, and `if(IN_LIST)`
 //!   all match CMake 4.5.1 byte-for-byte.
 
+use std::borrow::Cow;
+
 use bstr::BString;
 
 /// Controls whether empty elements between/around semicolons are kept or dropped.
@@ -47,48 +49,91 @@ pub fn split_with_empty_input(
     empty_input: EmptyInput,
     out: &mut Vec<BString>,
 ) {
-    if v.is_empty() {
-        if empty == Empty::Keep && empty_input == EmptyInput::OneEmptyElement {
-            out.push(BString::default());
-        }
-        return;
+    let mut elements = iter(v, empty);
+    if empty == Empty::Keep && empty_input == EmptyInput::OneEmptyElement {
+        elements.remaining = Some(v);
     }
+    out.extend(elements.map(|element| BString::from(element.into_owned())));
+}
 
-    let mut current = Vec::new();
-    let mut bracket_depth: isize = 0;
-    let mut i = 0;
+/// Iterate over list elements. Borrow each element unless it contains an escaped
+/// semicolon. A completely empty input produces zero elements.
+#[must_use]
+pub fn iter(v: &[u8], empty: Empty) -> Elements<'_> {
+    Elements {
+        remaining: (!v.is_empty()).then_some(v),
+        empty,
+    }
+}
 
-    while let Some(&b) = v.get(i) {
-        if b == b'\\' && v.get(i + 1) == Some(&b';') {
-            current.push(b';');
-            i += 2;
-            continue;
-        }
-        if b == b'[' {
-            bracket_depth = bracket_depth.saturating_add(1);
-            current.push(b);
-            i += 1;
-            continue;
-        }
-        if b == b']' {
-            bracket_depth = bracket_depth.saturating_sub(1);
-            current.push(b);
-            i += 1;
-            continue;
-        }
-        if b == b';' && bracket_depth == 0 {
-            if empty == Empty::Keep || !current.is_empty() {
-                out.push(BString::from(core::mem::take(&mut current)));
+/// An iterator over the elements of a CMake list.
+pub struct Elements<'a> {
+    remaining: Option<&'a [u8]>,
+    empty: Empty,
+}
+
+impl<'a> Elements<'a> {
+    fn next_raw(&mut self) -> Option<(&'a [u8], Option<usize>)> {
+        while let Some(bytes) = self.remaining.take() {
+            let mut depth = 0_isize;
+            let mut escape = None;
+            let mut i = 0;
+            while let Some(&byte) = bytes.get(i) {
+                match byte {
+                    b'\\' if bytes.get(i + 1) == Some(&b';') => {
+                        escape.get_or_insert(i);
+                        i += 1;
+                    }
+                    b'[' => depth = depth.saturating_add(1),
+                    b']' => depth = depth.saturating_sub(1),
+                    b';' if depth == 0 => {
+                        self.remaining = bytes.get(i + 1..);
+                        break;
+                    }
+                    _ => {}
+                }
+                i += 1;
             }
-            i += 1;
-            continue;
+            if i != 0 || self.empty == Empty::Keep {
+                return Some((bytes.get(..i)?, escape));
+            }
         }
-        current.push(b);
-        i += 1;
+        None
+    }
+}
+
+impl<'a> Iterator for Elements<'a> {
+    type Item = Cow<'a, [u8]>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let (bytes, escape) = self.next_raw()?;
+        let Some(start) = escape else {
+            return Some(Cow::Borrowed(bytes));
+        };
+        let mut value = Vec::with_capacity(bytes.len() - 1);
+        value.extend_from_slice(bytes.get(..start)?);
+        let mut i = start;
+        while let Some(&byte) = bytes.get(i) {
+            if byte == b'\\' && bytes.get(i + 1) == Some(&b';') {
+                value.push(b';');
+                i += 2;
+            } else {
+                value.push(byte);
+                i += 1;
+            }
+        }
+        Some(Cow::Owned(value))
     }
 
-    if empty == Empty::Keep || !current.is_empty() {
-        out.push(BString::from(current));
+    fn nth(&mut self, n: usize) -> Option<Self::Item> {
+        for _ in 0..n {
+            self.next_raw()?;
+        }
+        self.next()
+    }
+
+    fn count(mut self) -> usize {
+        std::iter::from_fn(|| self.next_raw()).count()
     }
 }
 
@@ -168,6 +213,23 @@ mod tests {
                 BString::from(""),
                 BString::from(""),
             ]
+        );
+    }
+
+    #[test]
+    fn iterator_borrows_plain_elements_and_unescapes_only_when_needed() {
+        let raw = br";plain;[a;b];a\;b\;c;]";
+        let mut kept = iter(raw, Empty::Keep);
+        assert_eq!(kept.next(), Some(Cow::Borrowed(b"".as_slice())));
+        assert!(matches!(kept.next(), Some(Cow::Borrowed(b"plain"))));
+        assert!(matches!(kept.next(), Some(Cow::Borrowed(b"[a;b]"))));
+        assert!(matches!(kept.next(), Some(Cow::Owned(bytes)) if bytes == b"a;b;c"));
+        assert!(matches!(kept.next(), Some(Cow::Borrowed(b"]"))));
+        assert_eq!(kept.next(), None);
+        assert_eq!(iter(raw, Empty::Drop).count(), 4);
+        assert_eq!(
+            iter(raw, Empty::Keep).nth(3).as_deref(),
+            Some(b"a;b;c".as_slice())
         );
     }
 
