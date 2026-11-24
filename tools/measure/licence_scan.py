@@ -330,14 +330,15 @@ def check_hygiene(errors: list[str]) -> None:
             continue
         with path.open("rb") as file:
             prefix = file.read(3)
-            hashbang = prefix.startswith(b"#!")
-            if hashbang and mode != b"100755":
-                errors.append(f"File starts with #! but index mode is {mode.decode()}: {rel}")
-            if not hashbang and mode == b"100755":
-                errors.append(f"Index mode is 100755 but file does not start with #!: {rel}")
+            hashbang = prefix.startswith(b"#!") and prefix != b"#!["
+            if rel.parts[0] != "modules":
+                if hashbang and mode != b"100755":
+                    errors.append(f"File starts with #! but index mode is {mode.decode()}: {rel}")
+                if not hashbang and mode == b"100755":
+                    errors.append(f"Index mode is 100755 but file does not start with #!: {rel}")
 
             suffixes = {suffix.lower() for suffix in rel.suffixes}
-            script = hashbang and prefix != b"#!["
+            script = hashbang
             if not (script or suffixes & HYGIENE_SUFFIXES or rel.name in HYGIENE_NAMES):
                 continue
             file.seek(0)

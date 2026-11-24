@@ -1,7 +1,10 @@
-# Build artifacts & local oracle downloads
+# Build artifacts, local oracle & corpus caches, release archives
 /target/
+/dist/
 /env/oracle/
+/env/corpus/
 *.rs.bk
+*.profraw
 
 # macOS & exFAT junk
 .DS_Store
