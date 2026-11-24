@@ -31,7 +31,6 @@ thread_local! {
     static PROBE_DEPTH: Cell<u8> = const { Cell::new(0) };
 }
 
-const PROBE_TARGET: &str = "cmTryCompile";
 const TIMEOUT: Duration = Duration::from_secs(120);
 
 pub(super) fn try_compile(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
@@ -198,6 +197,20 @@ fn probe(cx: &mut Cx<'_>, args: &[ExpandedArg], run: bool) -> CmdResult {
         return Err(CmdError::status("The try_compile nesting limit is two."));
     }
     let dirs = ProbeDirs::create(cx, &signature)?;
+    if cx.var_is_on(b"CMAKE_DEBUG_TRY_COMPILE") {
+        let command = if run { "try_run" } else { "try_compile" };
+        cx.issue(
+            MessageKind::Log,
+            Effect::None,
+            None,
+            format!(
+                "Executing {command} ({}) in:\n\n  {}",
+                BString::from(build_var),
+                dirs.binary.display()
+            )
+            .into(),
+        );
+    }
     PROBE_DEPTH.set(depth + 1);
     let result = build_probe(cx, &signature, &options, &dirs, build_var, run_var);
     PROBE_DEPTH.set(depth);
@@ -227,10 +240,21 @@ fn build_probe(
     } else {
         Vec::new()
     };
+    let probe_target;
     let target = match signature {
         Signature::Sources { sources, .. } => {
-            write_project(cx, options, sources, &dirs.source, run_var.is_some())?;
-            Some(PROBE_TARGET.as_bytes())
+            static NEXT_TARGET: AtomicU64 = AtomicU64::new(0);
+            let suffix = NEXT_TARGET.fetch_add(1, Ordering::Relaxed);
+            probe_target = format!("cmTC_{suffix:05x}");
+            write_project(
+                cx,
+                options,
+                sources,
+                &dirs.source,
+                &probe_target,
+                run_var.is_some(),
+            )?;
+            Some(probe_target.as_bytes())
         }
         Signature::Project { target, .. } => *target,
     };

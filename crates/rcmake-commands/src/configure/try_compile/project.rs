@@ -14,6 +14,7 @@ pub(super) fn write_project(
     options: &Options<'_>,
     sources: &[Source<'_>],
     directory: &Path,
+    target: &str,
     run: bool,
 ) -> Result<(), CmdError> {
     let target_type = cx.var_or_empty(b"CMAKE_TRY_COMPILE_TARGET_TYPE");
@@ -115,6 +116,7 @@ pub(super) fn write_project(
             language,
         },
         options,
+        target,
     );
     cx.host()
         .write(
@@ -146,7 +148,7 @@ struct ProjectInputs<'a> {
     language: Option<&'a [u8]>,
 }
 
-fn render_project(inputs: ProjectInputs<'_>, options: &Options<'_>) -> BString {
+fn render_project(inputs: ProjectInputs<'_>, options: &Options<'_>, target: &str) -> BString {
     let ProjectInputs {
         archive,
         files,
@@ -169,13 +171,13 @@ fn render_project(inputs: ProjectInputs<'_>, options: &Options<'_>) -> BString {
           add_compile_options(${_probe_compile_flags})\n",
     );
     let prefix = if archive {
-        "add_library(cmTryCompile STATIC"
+        format!("add_library({target} STATIC")
     } else {
-        "add_executable(cmTryCompile"
+        format!("add_executable({target}")
     };
     cmake_command(
         &mut code,
-        prefix,
+        &prefix,
         files.iter().map(|value| value.as_slice()),
     );
     for (command, definitions) in [
@@ -195,17 +197,15 @@ fn render_project(inputs: ProjectInputs<'_>, options: &Options<'_>) -> BString {
             })
             .collect();
         if !values.is_empty() {
-            cmake_command(
-                &mut code,
-                &format!("{command}(cmTryCompile PRIVATE"),
-                values,
-            );
+            cmake_command(&mut code, &format!("{command}({target} PRIVATE"), values);
         }
     }
     if !archive {
         code.extend_from_slice(
-            b"separate_arguments(_probe_link_flags UNIX_COMMAND \"${EXE_LINKER_FLAGS}\")\n\
-              target_link_options(cmTryCompile PRIVATE ${_probe_link_flags})\n",
+            b"separate_arguments(_probe_link_flags UNIX_COMMAND \"${EXE_LINKER_FLAGS}\")\n",
+        );
+        code.extend_from_slice(
+            format!("target_link_options({target} PRIVATE ${{_probe_link_flags}})\n").as_bytes(),
         );
     }
     let link_options = options.many(b"LINK_OPTIONS");
@@ -214,13 +214,13 @@ fn render_project(inputs: ProjectInputs<'_>, options: &Options<'_>) -> BString {
             let flags = list::join(link_options);
             cmake_command(
                 &mut code,
-                "set_property(TARGET cmTryCompile PROPERTY STATIC_LIBRARY_OPTIONS",
+                &format!("set_property(TARGET {target} PROPERTY STATIC_LIBRARY_OPTIONS"),
                 [flags.as_slice()],
             );
         } else {
             cmake_command(
                 &mut code,
-                "target_link_options(cmTryCompile PRIVATE",
+                &format!("target_link_options({target} PRIVATE"),
                 link_options.iter().copied(),
             );
         }
@@ -228,16 +228,18 @@ fn render_project(inputs: ProjectInputs<'_>, options: &Options<'_>) -> BString {
     if options.has(b"LINK_LIBRARIES") {
         cmake_command(
             &mut code,
-            "target_link_libraries(cmTryCompile PRIVATE",
+            &format!("target_link_libraries({target} PRIVATE"),
             options.many(b"LINK_LIBRARIES").iter().copied(),
         );
     } else {
-        code.extend_from_slice(b"target_link_libraries(cmTryCompile PRIVATE ${LINK_LIBRARIES})\n");
+        code.extend_from_slice(
+            format!("target_link_libraries({target} PRIVATE ${{LINK_LIBRARIES}})\n").as_bytes(),
+        );
     }
     if let Some(language) = language {
         cmake_command(
             &mut code,
-            "set_property(TARGET cmTryCompile PROPERTY LINKER_LANGUAGE",
+            &format!("set_property(TARGET {target} PROPERTY LINKER_LANGUAGE"),
             [language],
         );
     }
