@@ -143,6 +143,12 @@ impl Interp {
         let result = if self.depth > limit {
             self.fatal_here(format!("Maximum recursion depth of {limit} exceeded").into());
             Err(CmdError::Reported)
+        } else if let Some(profiler) = self.command_profiler.clone() {
+            let start = self.config.host.monotonic();
+            let result = f(self);
+            let elapsed = self.config.host.monotonic().saturating_sub(start);
+            profiler(&fold_command_name(name), file, line, start, elapsed);
+            result
         } else {
             f(self)
         };

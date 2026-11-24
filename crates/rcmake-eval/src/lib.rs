@@ -43,6 +43,7 @@ mod flow;
 mod hooks;
 mod interp;
 mod md5;
+mod profiler;
 mod scope;
 mod stack;
 mod util;
@@ -53,6 +54,7 @@ mod tests;
 pub use cx::Cx;
 pub use file_lock::FileLockScope;
 pub use hooks::{TraceConfig, TraceFormat, WatchAccess};
+pub use profiler::CommandProfiler;
 pub use scope::Binding;
 
 use code::Code;
@@ -425,6 +427,7 @@ pub struct Interp {
     next_watch_id: u64,
     /// Command tracing configuration (`--trace*`).
     trace: Option<TraceConfig>,
+    command_profiler: Option<Arc<CommandProfiler>>,
     /// Configure log events for this run.
     configure_log: Vec<u8>,
     /// Expansion settings for nested `cmake_language(TRACE ON)` calls.
@@ -516,6 +519,7 @@ impl Interp {
             variable_access: BTreeMap::new(),
             next_watch_id: 0,
             trace: None,
+            command_profiler: None,
             configure_log: Vec::new(),
             trace_stack: Vec::new(),
             find_debug_variables: Vec::new(),
