@@ -1,18 +1,19 @@
 //! Synchronous language server and the interface for semantic analysis.
 
-use std::{cell::RefCell, collections::BTreeMap, path::PathBuf};
+use std::{cell::RefCell, collections::BTreeMap, ops::Range, path::PathBuf, sync::Arc};
 
 use rcmake_host::{Host, discover_cmake_root};
 use rcmake_json::Value;
 
 use crate::{
-    analysis::Document,
+    analysis::{self, Document},
+    catalog::{code_block, code_span, escape_markdown},
     features,
     json::{array, get, int, object, string},
     position::{Lines, Position, PositionEncoding, range},
-    rpc::{MAX_MESSAGE_BYTES, RpcMessage},
+    rpc::{MAX_MESSAGE_BYTES, RequestId, RpcMessage},
     uri,
-    workspace::{DiskCache, Workspace},
+    workspace::{Workspace, WorkspaceCache},
 };
 
 const MAX_DOCUMENTS: usize = 512;
@@ -22,73 +23,10 @@ const MAX_CHANGES: usize = 1024;
 // Limit the estimated bytes that a batch scans or moves.
 const MAX_CHANGE_WORK: usize = 2 * 1024 * 1024 * 1024;
 
-/// Current in-memory document and cursor information for a semantic provider.
-pub struct SemanticContext<'a> {
-    /// Document URI.
-    pub uri: &'a str,
-    /// Current document text.
-    pub text: &'a str,
-    /// Document version.
-    pub version: i64,
-    /// Cursor position in the negotiated encoding.
-    pub position: Position,
-    /// Cursor byte offset into the text.
-    pub offset: usize,
-    /// Encoding for the request and response positions.
-    pub encoding: PositionEncoding,
-}
-
-/// A definition returned by a semantic provider.
-pub struct SemanticLocation {
-    /// URI of the definition document.
-    pub uri: String,
-    /// Start position in the negotiated encoding.
-    pub start: Position,
-    /// End position in the negotiated encoding.
-    pub end: Position,
-}
-
-/// A change to the documents available to a semantic provider.
-pub enum SemanticUpdate<'a> {
-    /// A new or changed in-memory document.
-    Changed {
-        /// Document URI.
-        uri: &'a str,
-        /// Current document text.
-        text: &'a str,
-        /// Current document version.
-        version: i64,
-    },
-    /// A document that is no longer open.
-    Closed {
-        /// Document URI.
-        uri: &'a str,
-    },
-}
-
-/// An optional source of evaluated hover and definition results.
-///
-/// Return `None` when no result is available. The server then uses lexical
-/// analysis. Supply the snapshot version if hover can use an earlier document version.
-pub trait SemanticProvider {
-    /// Update the provider's document snapshot after the server accepts a change.
-    fn update(&self, _update: SemanticUpdate<'_>) {}
-
-    /// Return hover text for the current site.
-    fn hover(&self, _context: &SemanticContext<'_>) -> Option<String> {
-        None
-    }
-
-    /// Return hover text and the document version that supplied the result, if known.
-    fn hover_with_version(&self, context: &SemanticContext<'_>) -> Option<(String, Option<i64>)> {
-        self.hover(context).map(|text| (text, None))
-    }
-
-    /// Return the evaluated definition of the current site.
-    fn definition(&self, _context: &SemanticContext<'_>) -> Option<SemanticLocation> {
-        None
-    }
-}
+pub use crate::{
+    HoverDoc, SemanticContext, SemanticDefinition, SemanticDiagnostic, SemanticDocument,
+    SemanticLocation, SemanticProvider, SemanticResult, SemanticSource, SemanticUpdate,
+};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum State {
@@ -100,7 +38,10 @@ enum State {
 }
 
 enum OpenDocument {
-    Synced(Document),
+    Synced {
+        doc: Arc<Document>,
+        show_parse_error: bool,
+    },
     Desynced(i64),
 }
 
@@ -136,16 +77,16 @@ impl SyncFailure {
 }
 
 impl OpenDocument {
-    fn current(&self) -> Option<&Document> {
+    fn current(&self) -> Option<&Arc<Document>> {
         match self {
-            Self::Synced(doc) => Some(doc),
+            Self::Synced { doc, .. } => Some(doc),
             Self::Desynced(_) => None,
         }
     }
 
     fn version(&self) -> i64 {
         match self {
-            Self::Synced(doc) => doc.version,
+            Self::Synced { doc, .. } => doc.version,
             Self::Desynced(version) => *version,
         }
     }
@@ -162,11 +103,14 @@ pub struct Server<'a> {
     state: State,
     encoding: PositionEncoding,
     markdown_hover: bool,
-    workspace_roots: Vec<PathBuf>,
+    workspace_roots: Vec<uri::Root>,
+    watch_files: bool,
+    versioned_edits: bool,
     bundled_modules: Option<PathBuf>,
-    disk_cache: RefCell<DiskCache>,
+    workspace_cache: RefCell<WorkspaceCache>,
     documents: BTreeMap<String, OpenDocument>,
     open_bytes: usize,
+    open_limit_reported: bool,
 }
 
 impl<'a> Server<'a> {
@@ -179,10 +123,13 @@ impl<'a> Server<'a> {
             encoding: PositionEncoding::Utf16,
             markdown_hover: false,
             workspace_roots: Vec::new(),
+            watch_files: false,
+            versioned_edits: false,
             bundled_modules: None,
-            disk_cache: RefCell::default(),
+            workspace_cache: RefCell::default(),
             documents: BTreeMap::new(),
             open_bytes: 0,
+            open_limit_reported: false,
         }
     }
 
@@ -248,6 +195,15 @@ impl<'a> Server<'a> {
                 .filter_map(string)
                 .find(|format| matches!(*format, "markdown" | "plaintext"))
                 == Some("markdown");
+            let workspace = get(params, "capabilities").and_then(|caps| get(caps, "workspace"));
+            self.watch_files = workspace
+                .and_then(|caps| get(caps, "didChangeWatchedFiles"))
+                .and_then(|caps| get(caps, "dynamicRegistration"))
+                == Some(&Value::Bool(true));
+            self.versioned_edits = workspace
+                .and_then(|caps| get(caps, "workspaceEdit"))
+                .and_then(|caps| get(caps, "documentChanges"))
+                == Some(&Value::Bool(true));
             self.workspace_roots = workspace_roots(params);
             self.bundled_modules = discover_cmake_root(self.host, None)
                 .1
@@ -274,7 +230,7 @@ impl<'a> Server<'a> {
                 Ok(if method == "textDocument/documentSymbol" {
                     features::symbols(doc, self.encoding)
                 } else {
-                    features::semantic_tokens(doc, self.encoding)
+                    analysis::semantic_tokens(doc, self.encoding)
                 })
             }
             "textDocument/formatting" => {
@@ -297,6 +253,7 @@ impl<'a> Server<'a> {
                     "Formatting exceeds the 16 MiB response limit. Format a smaller file.",
                 ))
             }
+            "textDocument/codeAction" => self.code_actions(params),
             "textDocument/hover" | "textDocument/definition" | "textDocument/completion" => {
                 let uri = document_uri(params).ok_or(INVALID_PARAMS)?;
                 let position = get(params, "position")
@@ -320,7 +277,21 @@ impl<'a> Server<'a> {
                 Ok(match method {
                     "textDocument/hover" => self.hover(doc, &context),
                     "textDocument/definition" => self.definition(doc, &context),
-                    _ => features::completion(doc, || self.workspace(uri), offset, self.encoding),
+                    _ => self
+                        .semantic
+                        .and_then(|provider| provider.completions(&context))
+                        .filter(|result| self.current_result(result, uri, doc.version))
+                        .map_or_else(
+                            || {
+                                features::completion(
+                                    doc,
+                                    || self.workspace(uri),
+                                    offset,
+                                    self.encoding,
+                                )
+                            },
+                            |result| features::completion_items(result.value),
+                        ),
                 })
             }
             _ => Err((-32601, "Method not found.")),
@@ -334,7 +305,7 @@ impl<'a> Server<'a> {
         }
         if self.state == State::AwaitInitialized && method == "initialized" {
             self.state = State::Running;
-            return None;
+            return self.watch_files.then(|| vec![register_watchers()]);
         }
         if self.state != State::Running {
             return None;
@@ -349,11 +320,18 @@ impl<'a> Server<'a> {
                     return None;
                 }
                 match self.documents.get(uri) {
-                    Some(OpenDocument::Synced(_)) => return None,
-                    None if self.documents.len() >= MAX_DOCUMENTS => return None,
+                    Some(OpenDocument::Synced { .. }) => return None,
+                    None if self.documents.len() >= MAX_DOCUMENTS => {
+                        if std::mem::replace(&mut self.open_limit_reported, true) {
+                            return None;
+                        }
+                        return Some(vec![show_warning(format!(
+                            "Rcmake supports up to {MAX_DOCUMENTS} open files. Close other files, then reopen this file."
+                        ))]);
+                    }
                     _ => {}
                 }
-                Some(self.accept_text(uri, Ok(text.to_owned()), version))
+                Some(self.accept_text(uri, Ok(text.to_owned()), version, true))
             }
             "textDocument/didChange" => {
                 let uri = document_uri(params)?;
@@ -365,21 +343,31 @@ impl<'a> Server<'a> {
                 if version <= doc.version() {
                     return None;
                 }
-                let text = get(params, "contentChanges")
-                    .and_then(array)
+                let changes = get(params, "contentChanges").and_then(array);
+                let full_text = changes.is_some_and(|changes| {
+                    changes.iter().any(|change| get(change, "range").is_none())
+                });
+                let text = changes
                     .ok_or(SyncFailure::InvalidChange)
                     .and_then(|changes| self.apply_changes(doc, changes));
-                Some(self.accept_text(uri, text, version))
+                Some(self.accept_text(uri, text, version, full_text))
             }
             "textDocument/didSave" => {
                 let uri = document_uri(params)?;
-                let doc = self.documents.get(uri)?;
+                let doc = self.documents.get_mut(uri)?;
                 if let Some(text) = get(params, "text") {
                     let text = string(text)
                         .map(str::to_owned)
                         .ok_or(SyncFailure::InvalidChange);
-                    Some(self.accept_text(uri, text, doc.version()))
+                    let version = doc.version();
+                    Some(self.accept_text(uri, text, version, true))
                 } else {
+                    if let OpenDocument::Synced {
+                        show_parse_error, ..
+                    } = doc
+                    {
+                        *show_parse_error = true;
+                    }
                     Some(vec![self.publish(uri)])
                 }
             }
@@ -387,12 +375,26 @@ impl<'a> Server<'a> {
                 let uri = document_uri(params)?;
                 let doc = self.documents.remove(uri)?;
                 self.open_bytes -= doc.len();
+                self.workspace_cache.get_mut().invalidate_documents();
                 if doc.current().is_some()
                     && let Some(provider) = self.semantic
                 {
                     provider.update(SemanticUpdate::Closed { uri });
                 }
                 Some(vec![self.publish(uri)])
+            }
+            "workspace/didChangeWatchedFiles" => {
+                for path in get(params, "changes")
+                    .and_then(array)?
+                    .iter()
+                    .take(4096)
+                    .filter_map(|change| get(change, "uri").and_then(string).and_then(uri::path))
+                {
+                    self.workspace_cache
+                        .get_mut()
+                        .invalidate_file(self.host, &path);
+                }
+                None
             }
             "$/cancelRequest" => {
                 // Each synchronous request is complete before this notification arrives.
@@ -407,26 +409,18 @@ impl<'a> Server<'a> {
             .documents
             .insert(uri.to_owned(), OpenDocument::Desynced(version));
         self.open_bytes -= previous.as_ref().map_or(0, OpenDocument::len);
-        if matches!(previous, Some(OpenDocument::Synced(_)))
+        self.workspace_cache.get_mut().invalidate_documents();
+        if matches!(previous, Some(OpenDocument::Synced { .. }))
             && let Some(provider) = self.semantic
         {
             provider.update(SemanticUpdate::Closed { uri });
         }
         let mut messages = vec![self.publish(uri)];
         if !matches!(previous, Some(OpenDocument::Desynced(_))) {
-            messages.push(RpcMessage::notification(
-                "window/showMessage",
-                object([
-                    ("type", Value::Int(2)),
-                    (
-                        "message",
-                        Value::string(format!(
-                            "Rcmake lost synchronization with {uri}. {}",
-                            failure.recovery()
-                        )),
-                    ),
-                ]),
-            ));
+            messages.push(show_warning(format!(
+                "Rcmake lost synchronization with {uri}. {}",
+                failure.recovery()
+            )));
         }
         messages
     }
@@ -502,9 +496,10 @@ impl<'a> Server<'a> {
         uri: &str,
         text: Result<String, SyncFailure>,
         version: i64,
+        show_parse_error: bool,
     ) -> Vec<RpcMessage> {
-        match text.and_then(|text| self.replace(uri, text, version)) {
-            Ok(message) => vec![message],
+        match text.and_then(|text| self.replace(uri, text, version, show_parse_error)) {
+            Ok(()) => vec![self.publish(uri)],
             Err(failure) => self.desync(uri, version, failure),
         }
     }
@@ -514,12 +509,13 @@ impl<'a> Server<'a> {
         uri: &str,
         text: String,
         version: i64,
-    ) -> Result<RpcMessage, SyncFailure> {
+        show_parse_error: bool,
+    ) -> Result<(), SyncFailure> {
         let old_len = self.documents.get(uri).map_or(0, OpenDocument::len);
         let other_bytes = self.open_bytes - old_len;
         check_buffer_size(text.len(), other_bytes)?;
         self.open_bytes = other_bytes + text.len();
-        let doc = Document::new(text, version);
+        let doc = Arc::new(Document::new(text, version));
         if let Some(provider) = self.semantic {
             provider.update(SemanticUpdate::Changed {
                 uri,
@@ -527,53 +523,169 @@ impl<'a> Server<'a> {
                 version,
             });
         }
-        self.documents
-            .insert(uri.to_owned(), OpenDocument::Synced(doc));
-        Ok(self.publish(uri))
+        self.documents.insert(
+            uri.to_owned(),
+            OpenDocument::Synced {
+                doc,
+                show_parse_error,
+            },
+        );
+        self.workspace_cache.get_mut().invalidate_documents();
+        Ok(())
+    }
+
+    /// Publish updated diagnostics for an open document after a snapshot becomes available.
+    ///
+    /// A caller can use this method when its semantic worker finishes.
+    pub fn refresh_diagnostics(&self, uri: &str) -> Option<RpcMessage> {
+        self.documents.get(uri)?.current()?;
+        Some(self.publish(uri))
     }
 
     fn publish(&self, uri: &str) -> RpcMessage {
         let mut params = vec![("uri", Value::string(uri))];
+        let mut diagnostics = Vec::new();
         if let Some(doc) = self.documents.get(uri) {
             params.push(("version", Value::Int(doc.version())));
-            let diagnostics = doc
-                .current()
-                .map_or_else(Vec::new, |doc| doc.diagnostics(self.encoding));
-            params.push(("diagnostics", Value::Array(diagnostics)));
-        } else {
-            params.push(("diagnostics", Value::Array(Vec::new())));
+            if let OpenDocument::Synced {
+                doc,
+                show_parse_error,
+            } = doc
+            {
+                let semantic = self.semantic_diagnostics(&self.semantic_document(uri, doc));
+                diagnostics = doc.diagnostics(self.encoding, *show_parse_error, &semantic);
+            }
         }
+        params.push(("diagnostics", Value::Array(diagnostics)));
         RpcMessage::notification("textDocument/publishDiagnostics", object(params))
     }
 
-    fn hover(&self, doc: &Document, context: &SemanticContext<'_>) -> Value {
-        if let Some((text, version)) = self
+    fn semantic_document<'b>(&self, uri: &'b str, doc: &'b Document) -> SemanticDocument<'b> {
+        SemanticDocument {
+            uri,
+            text: &doc.text,
+            version: doc.version,
+            encoding: self.encoding,
+        }
+    }
+
+    fn semantic_diagnostics(&self, document: &SemanticDocument<'_>) -> Vec<SemanticDiagnostic> {
+        self.semantic
+            .and_then(|provider| provider.diagnostics(document))
+            .filter(|result| self.current_result(result, document.uri, document.version))
+            .map_or_else(Vec::new, |result| result.value)
+    }
+
+    fn code_actions(&self, params: &Value) -> Result<Value, (i64, &'static str)> {
+        let uri = document_uri(params).ok_or(INVALID_PARAMS)?;
+        let span = get(params, "range").ok_or(INVALID_PARAMS)?;
+        let start = edit_position(span, "start").map_err(|_| INVALID_PARAMS)?;
+        let end = edit_position(span, "end").map_err(|_| INVALID_PARAMS)?;
+        if (start.line, start.character) > (end.line, end.character) {
+            return Err(INVALID_PARAMS);
+        }
+        let Some(doc) = self.documents.get(uri).and_then(OpenDocument::current) else {
+            return Ok(Value::Array(Vec::new()));
+        };
+        let document = self.semantic_document(uri, doc);
+        let only = get(params, "context")
+            .and_then(|context| get(context, "only"))
+            .and_then(array);
+        let allows = |kind: &str| {
+            only.is_none_or(|only| {
+                only.iter().filter_map(string).any(|prefix| {
+                    kind == prefix
+                        || kind
+                            .strip_prefix(prefix)
+                            .is_some_and(|tail| tail.starts_with('.'))
+                })
+            })
+        };
+        let selection: Range<Position> = start..end;
+        let mut actions = if allows("quickfix") {
+            doc.quick_fixes(
+                uri,
+                selection.clone(),
+                self.encoding,
+                self.versioned_edits,
+                &self.semantic_diagnostics(&document),
+                |uri, version| {
+                    let doc = self.documents.get(uri)?.current()?;
+                    (doc.version == version).then_some(doc.as_ref())
+                },
+            )
+        } else {
+            Vec::new()
+        };
+        if let Some(result) = self
             .semantic
-            .and_then(|provider| provider.hover_with_version(context))
+            .and_then(|provider| provider.code_actions(&document, selection))
+            .filter(|result| self.current_result(result, uri, doc.version))
         {
-            let mut text =
-                if let Some(version) = version.filter(|&version| version < context.version) {
+            actions.extend(
+                result
+                    .value
+                    .into_iter()
+                    .filter(|action| {
+                        get(action, "kind")
+                            .and_then(string)
+                            .map_or(only.is_none(), allows)
+                    })
+                    .take(256 - actions.len()),
+            );
+        }
+        Ok(Value::Array(actions))
+    }
+
+    fn hover(&self, doc: &Document, context: &SemanticContext<'_>) -> Value {
+        if let Some(provider) = self.semantic {
+            let content = match provider.hover_doc(context) {
+                Some(result)
+                    if result.version <= context.version
+                        && self.same_uri(&result.uri, context.uri) =>
+                {
+                    Some((
+                        render_hover_doc(result.value, self.markdown_hover),
+                        Some(result.version),
+                    ))
+                }
+                Some(_) => None,
+                None => provider.hover_with_version(context).map(|(text, version)| {
+                    (
+                        if self.markdown_hover {
+                            escape_markdown(&text)
+                        } else {
+                            text
+                        },
+                        version,
+                    )
+                }),
+            };
+            if let Some((text, version)) = content
+                && version.is_none_or(|version| version <= context.version)
+            {
+                let text = if let Some(version) =
+                    version.filter(|&version| version < context.version)
+                {
                     format!("Provisional. This result uses document version {version}.\n\n{text}")
                 } else {
                     text
                 };
-            if self.markdown_hover {
-                text = features::escape_markdown(&text);
+                return object([(
+                    "contents",
+                    object([
+                        (
+                            "kind",
+                            Value::string(if self.markdown_hover {
+                                "markdown"
+                            } else {
+                                "plaintext"
+                            }),
+                        ),
+                        ("value", Value::string(text)),
+                    ]),
+                )]);
             }
-            return object([(
-                "contents",
-                object([
-                    (
-                        "kind",
-                        Value::string(if self.markdown_hover {
-                            "markdown"
-                        } else {
-                            "plaintext"
-                        }),
-                    ),
-                    ("value", Value::string(text)),
-                ]),
-            )]);
         }
         features::hover(
             doc,
@@ -586,16 +698,20 @@ impl<'a> Server<'a> {
     }
 
     fn definition(&self, doc: &Document, context: &SemanticContext<'_>) -> Value {
-        if let Some(target) = self
-            .semantic
-            .and_then(|provider| provider.definition(context))
-            .filter(|target| {
-                self.documents
-                    .get(&target.uri)
-                    .is_none_or(|doc| doc.current().is_some())
-            })
-        {
-            return features::location(&target.uri, range(target.start, target.end));
+        if let Some(provider) = self.semantic {
+            let target = match provider.definition_result(context) {
+                Some(result) if self.current_result(&result, context.uri, doc.version) => {
+                    let definition = result.value;
+                    self.semantic_location(&definition.location, Some(definition.target_version))
+                }
+                Some(_) => None,
+                None => provider
+                    .definition(context)
+                    .and_then(|location| self.semantic_location(&location, None)),
+            };
+            if let Some(target) = target {
+                return target;
+            }
         }
         features::definition(
             doc,
@@ -606,8 +722,55 @@ impl<'a> Server<'a> {
         )
     }
 
-    fn workspace<'b>(&'b self, current: &'b str) -> Workspace<'b> {
-        Workspace::new(
+    fn semantic_location(
+        &self,
+        target: &SemanticLocation,
+        version: Option<Option<i64>>,
+    ) -> Option<Value> {
+        let open = self.documents.get_key_value(&target.uri).or_else(|| {
+            self.documents
+                .iter()
+                .find(|(uri, _)| self.same_uri(uri, &target.uri))
+        });
+        let uri = if let Some((uri, doc)) = open {
+            let doc = doc.current()?;
+            if version.is_some_and(|version| version != Some(doc.version)) {
+                return None;
+            }
+            uri.clone()
+        } else {
+            if matches!(version, Some(Some(_))) {
+                return None;
+            }
+            uri::path(&target.uri).map_or_else(
+                || target.uri.clone(),
+                |path| uri::client_file(&path, &self.workspace_roots),
+            )
+        };
+        Some(features::location(&uri, range(target.start, target.end)))
+    }
+
+    fn same_uri(&self, left: &str, right: &str) -> bool {
+        if left == right {
+            return true;
+        }
+        let (Some(left), Some(right)) = (uri::path(left), uri::path(right)) else {
+            return false;
+        };
+        uri::file(&left) == uri::file(&right)
+            || self.host.canonicalize(&left).ok().is_some_and(|left| {
+                self.host
+                    .canonicalize(&right)
+                    .is_ok_and(|right| left == right)
+            })
+    }
+
+    fn current_result<T>(&self, result: &SemanticResult<T>, uri: &str, version: i64) -> bool {
+        result.version == version && self.same_uri(&result.uri, uri)
+    }
+
+    fn workspace(&self, current: &str) -> Workspace {
+        self.workspace_cache.borrow_mut().workspace(
             self.host,
             current,
             &self.workspace_roots,
@@ -615,7 +778,6 @@ impl<'a> Server<'a> {
             self.documents
                 .iter()
                 .map(|(uri, doc)| (uri.as_str(), doc.current())),
-            &mut self.disk_cache.borrow_mut(),
         )
     }
 }
@@ -626,18 +788,71 @@ fn document_uri(params: &Value) -> Option<&str> {
     string(get(get(params, "textDocument")?, "uri")?)
 }
 
-fn workspace_roots(params: &Value) -> Vec<PathBuf> {
+fn workspace_roots(params: &Value) -> Vec<uri::Root> {
     let mut roots: Vec<_> = get(params, "workspaceFolders")
         .and_then(array)
         .into_iter()
         .flatten()
-        .filter_map(|folder| get(folder, "uri").and_then(string).and_then(uri::path))
+        .filter_map(|folder| get(folder, "uri").and_then(string).and_then(uri::Root::new))
         .take(MAX_DOCUMENTS)
         .collect();
     if roots.is_empty() {
-        roots.extend(get(params, "rootUri").and_then(string).and_then(uri::path));
+        roots.extend(
+            get(params, "rootUri")
+                .and_then(string)
+                .and_then(uri::Root::new),
+        );
     }
     roots
+}
+
+fn show_warning(message: String) -> RpcMessage {
+    RpcMessage::notification(
+        "window/showMessage",
+        object([("type", Value::Int(2)), ("message", Value::string(message))]),
+    )
+}
+
+fn register_watchers() -> RpcMessage {
+    let watchers = ["**/CMakeLists.txt", "**/*.cmake"]
+        .map(|pattern| object([("globPattern", Value::string(pattern))]));
+    RpcMessage::request(
+        RequestId::String("rcmake-watch-listfiles".into()),
+        "client/registerCapability",
+        object([(
+            "registrations",
+            Value::Array(vec![object([
+                ("id", Value::string("rcmake-watch-listfiles")),
+                ("method", Value::string("workspace/didChangeWatchedFiles")),
+                (
+                    "registerOptions",
+                    object([("watchers", Value::Array(watchers.into()))]),
+                ),
+            ])]),
+        )]),
+    )
+}
+
+fn render_hover_doc(doc: HoverDoc, markdown: bool) -> String {
+    let mut parts = Vec::new();
+    if !doc.title.is_empty() {
+        parts.push(if markdown {
+            code_span(&doc.title)
+        } else {
+            doc.title
+        });
+    }
+    if !doc.body_md.is_empty() {
+        parts.push(doc.body_md);
+    }
+    if let Some(code) = doc.code {
+        parts.push(if markdown { code_block(&code) } else { code });
+    }
+    parts.join(
+        "
+
+",
+    )
 }
 
 fn check_buffer_size(bytes: usize, other_bytes: usize) -> Result<(), SyncFailure> {
@@ -687,7 +902,14 @@ fn capabilities(encoding: PositionEncoding) -> Value {
                 ("documentFormattingProvider", Value::Bool(true)),
                 ("definitionProvider", Value::Bool(true)),
                 ("hoverProvider", Value::Bool(true)),
-                ("completionProvider", object([])),
+                ("codeActionProvider", Value::Bool(true)),
+                (
+                    "completionProvider",
+                    object([(
+                        "triggerCharacters",
+                        Value::Array(["$", "{", "<", ":"].map(Value::string).into()),
+                    )]),
+                ),
                 (
                     "semanticTokensProvider",
                     object([
@@ -697,9 +919,14 @@ fn capabilities(encoding: PositionEncoding) -> Value {
                             object([
                                 (
                                     "tokenTypes",
-                                    Value::Array(features::TOKEN_TYPES.map(Value::string).into()),
+                                    Value::Array(analysis::TOKEN_TYPES.map(Value::string).into()),
                                 ),
-                                ("tokenModifiers", Value::Array(Vec::new())),
+                                (
+                                    "tokenModifiers",
+                                    Value::Array(
+                                        analysis::TOKEN_MODIFIERS.map(Value::string).into(),
+                                    ),
+                                ),
                             ]),
                         ),
                     ]),

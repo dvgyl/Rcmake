@@ -2,17 +2,102 @@ use std::path::{Component, Path, PathBuf};
 
 use rcmake_host::path::{from_native_cmake, to_native};
 
+pub(crate) struct Root {
+    pub(crate) path: PathBuf,
+    drive: Option<Drive>,
+}
+
+#[derive(Clone, Copy)]
+struct Drive {
+    letter: u8,
+    colon: &'static str,
+}
+
+impl Root {
+    pub(crate) fn new(uri: &str) -> Option<Self> {
+        let file = uri.strip_prefix("file://")?;
+        let drive = match local_path(file).and_then(|path| path.strip_prefix('/')) {
+            Some(tail) => match tail.as_bytes() {
+                [letter, b':', b'/', ..] => Some(Drive {
+                    letter: *letter,
+                    colon: ":",
+                }),
+                [letter, b'%', b'3', b'A', b'/', ..] => Some(Drive {
+                    letter: *letter,
+                    colon: "%3A",
+                }),
+                [letter, b'%', b'3', b'a', b'/', ..] => Some(Drive {
+                    letter: *letter,
+                    colon: "%3a",
+                }),
+                _ => None,
+            },
+            None => None,
+        };
+        let root = path(uri)?;
+        Some(Self {
+            path: path(&self::file(&root))?,
+            drive,
+        })
+    }
+}
+
+fn local_path(file: &str) -> Option<&str> {
+    if file.starts_with('/') {
+        return Some(file);
+    }
+    let (authority, _) = file.split_once('/')?;
+    authority.eq_ignore_ascii_case("localhost").then_some(())?;
+    file.get(authority.len()..)
+}
+
 pub(crate) fn path(uri: &str) -> Option<PathBuf> {
     let file = uri.strip_prefix("file://")?;
-    let file = file
-        .strip_prefix("localhost/")
-        .and_then(|_| file.get(9..))
-        .unwrap_or(file);
-    if !file.starts_with('/') || file.contains(['?', '#']) {
+    if file.contains(['?', '#']) {
         return None;
     }
-    let mut bytes = file.bytes();
-    let mut decoded = Vec::with_capacity(file.len());
+    let mut decoded = if let Some(local) = local_path(file) {
+        decode(local)?
+    } else {
+        #[cfg(not(windows))]
+        return None;
+        #[cfg(windows)]
+        {
+            let (authority, share) = file.split_once('/')?;
+            let authority = decode(authority)?;
+            let share = decode(share)?;
+            if authority.is_empty()
+                || authority.iter().any(|byte| b"/\\:@".contains(byte))
+                || share.is_empty()
+                || matches!(share.first(), Some(b'/' | b'\\'))
+            {
+                return None;
+            }
+            let mut bytes = b"//".to_vec();
+            bytes.extend(authority);
+            bytes.push(b'/');
+            bytes.extend(share);
+            bytes
+        }
+    };
+    if cfg!(windows) {
+        if matches!(decoded.as_slice(), [b'/', drive, b':', b'/', ..] if drive.is_ascii_alphabetic())
+        {
+            decoded.remove(0);
+        }
+        for byte in &mut decoded {
+            if *byte == b'/' {
+                *byte = b'\\';
+            }
+        }
+    }
+    let path = to_native(&decoded);
+    path.is_absolute().then_some(path)
+}
+
+fn decode(text: &str) -> Option<Vec<u8>> {
+    let mut bytes = text.bytes();
+    let mut decoded = Vec::with_capacity(text.len());
     while let Some(byte) = bytes.next() {
         let byte = if byte == b'%' {
             let hi = char::from(bytes.next()?).to_digit(16)?;
@@ -26,16 +111,18 @@ pub(crate) fn path(uri: &str) -> Option<PathBuf> {
         }
         decoded.push(byte);
     }
-    #[cfg(windows)]
-    let decoded = match decoded.as_slice() {
-        [b'/', drive, b':', b'/', ..] if drive.is_ascii_alphabetic() => decoded.get(1..)?,
-        _ => &decoded,
-    };
-    let path = to_native(decoded.as_ref());
-    path.is_absolute().then_some(path)
+    Some(decoded)
 }
 
 pub(crate) fn file(path: &Path) -> String {
+    encode_file(path, &[])
+}
+
+pub(crate) fn client_file(path: &Path, roots: &[Root]) -> String {
+    encode_file(path, roots)
+}
+
+fn encode_file(path: &Path, roots: &[Root]) -> String {
     let mut normalized = PathBuf::new();
     for part in path.components() {
         match part {
@@ -49,10 +136,38 @@ pub(crate) fn file(path: &Path) -> String {
     }
     let bytes = from_native_cmake(&normalized);
     let mut uri = "file://".to_owned();
-    if !bytes.starts_with(b"/") {
+    let mut remainder = bytes.as_slice();
+    if cfg!(windows) {
+        match remainder {
+            [b'/', b'/', tail @ ..] => remainder = tail,
+            [letter, b':', tail @ ..] => {
+                let default = Drive {
+                    letter: letter.to_ascii_uppercase(),
+                    colon: ":",
+                };
+                let style = roots
+                    .iter()
+                    .filter_map(|root| root.drive.map(|drive| (root, drive)))
+                    .filter(|(_, drive)| drive.letter.eq_ignore_ascii_case(letter))
+                    .max_by_key(|(root, _)| {
+                        normalized
+                            .starts_with(&root.path)
+                            .then(|| root.path.components().count())
+                            .unwrap_or_default()
+                    })
+                    .map_or(default, |(_, drive)| drive);
+                uri.push('/');
+                uri.push(char::from(style.letter));
+                uri.push_str(style.colon);
+                remainder = tail;
+            }
+            _ if !remainder.starts_with(b"/") => uri.push('/'),
+            _ => {}
+        }
+    } else if !remainder.starts_with(b"/") {
         uri.push('/');
     }
-    for &byte in bytes.as_slice() {
+    for &byte in remainder {
         if byte.is_ascii_alphanumeric() || b"/-._~:".contains(&byte) {
             uri.push(char::from(byte));
         } else {
@@ -68,4 +183,25 @@ pub(crate) fn file(path: &Path) -> String {
         }
     }
     uri
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn windows_uris_use_client_drive_style_and_keep_unc_authority() -> Result<(), &'static str> {
+        let roots = [Root::new("file:///c%3A/work").ok_or("Cannot read the workspace URI.")?];
+        let target = path("file:///C:/work/Sub%20Dir/CMakeLists.txt")
+            .ok_or("Cannot read the definition URI.")?;
+        assert_eq!(
+            client_file(&target, &roots),
+            "file:///c%3A/work/Sub%20Dir/CMakeLists.txt",
+        );
+
+        let unc = "file://server/share/work/CMakeLists.txt";
+        let target = path(unc).ok_or("Cannot read the UNC URI.")?;
+        assert_eq!(client_file(&target, &roots), unc);
+        Ok(())
+    }
 }

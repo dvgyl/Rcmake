@@ -1,12 +1,13 @@
 use std::{collections::BTreeMap, ops::Range};
 
-use rcmake_diag::policy::PolicyId;
 use rcmake_json::Value;
 use rcmake_syntax::{ArgKind, Argument, CommandInvocation};
 
 use crate::{
     analysis::Document,
-    catalog::{COMMANDS, MODULE_COMMANDS, VARIABLES, signature},
+    catalog::{
+        self, DOCS, Entry, MODULE_COMMANDS, Topic, code_block, code_span, signature_override,
+    },
     expression::{self, Kind as ExpressionKind},
     json::{object, uint},
     lexical,
@@ -15,19 +16,8 @@ use crate::{
     workspace::Workspace,
 };
 
-const DOCS: &str = "https://cmake.org/cmake/help/latest";
-const MAX_COMPLETIONS: usize = 256;
+pub(crate) const MAX_COMPLETIONS: usize = 256;
 const MAX_DEFINITIONS: usize = 32;
-pub(crate) const TOKEN_TYPES: [&str; 7] = [
-    "function", "keyword", "variable", "string", "comment", "class", "operator",
-];
-const COMMAND: usize = 0;
-const KEYWORD: usize = 1;
-const VARIABLE: usize = 2;
-const STRING: usize = 3;
-const COMMENT: usize = 4;
-const TARGET: usize = 5;
-const GENERATOR: usize = 6;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Kind {
@@ -141,7 +131,7 @@ fn variable_spelling(kind: Kind, name: &str) -> (&str, usize) {
         .map_or((name, 0), |name| (name, prefix.len()))
 }
 
-fn payload(document: &Document, arg: &Argument) -> Option<Range<usize>> {
+pub(crate) fn payload(document: &Document, arg: &Argument) -> Option<Range<usize>> {
     let bytes = document.text.as_bytes().get(arg.span.clone())?;
     match arg.kind {
         ArgKind::Unquoted => Some(arg.span.clone()),
@@ -190,7 +180,7 @@ fn word_at(text: &str, offset: usize) -> Range<usize> {
     offset - start..offset + end
 }
 
-fn command_name(command: &CommandInvocation) -> Range<usize> {
+pub(crate) fn command_name(command: &CommandInvocation) -> Range<usize> {
     command.span.start..command.span.start + command.name.len()
 }
 
@@ -198,7 +188,8 @@ fn command_name(command: &CommandInvocation) -> Range<usize> {
 enum SubjectKind {
     Name(Kind),
     Keyword(roles::Keyword, &'static str),
-    Policy,
+    Catalog(Topic),
+    Package,
     Generator,
 }
 
@@ -255,14 +246,17 @@ fn argument_subject<'a>(
             kind: SubjectKind::Keyword(keyword, info.name),
         });
     }
-    let kind = match arguments.role(index) {
-        Role::Target | Role::TargetDeclaration if expression::target_name(raw) => {
-            SubjectKind::Name(Kind::Target)
+    let kind = if let Some(kind) = catalog_argument(command, index) {
+        kind
+    } else {
+        match arguments.role(index) {
+            Role::Target | Role::TargetDeclaration if expression::target_name(raw) => {
+                SubjectKind::Name(Kind::Target)
+            }
+            Role::CommandDeclaration => SubjectKind::Name(Kind::Function),
+            Role::Variable(namespace) => SubjectKind::Name(Kind::Variable(namespace)),
+            _ => return None,
         }
-        Role::CommandDeclaration => SubjectKind::Name(Kind::Function),
-        Role::Variable(namespace) => SubjectKind::Name(Kind::Variable(namespace)),
-        Role::Policy => SubjectKind::Policy,
-        _ => return None,
     };
     let (name, skip) = match kind {
         SubjectKind::Name(kind) => variable_spelling(kind, raw),
@@ -273,6 +267,41 @@ fn argument_subject<'a>(
         span: payload.start + skip..payload.start + skip + name.len(),
         kind,
     })
+}
+
+fn catalog_argument(command: &CommandInvocation, index: usize) -> Option<SubjectKind> {
+    let arg = |index| {
+        command
+            .args
+            .get(index)
+            .map(|arg: &Argument| arg.text.as_slice())
+    };
+    let after = |marker: &[u8]| {
+        command
+            .args
+            .iter()
+            .position(|arg| arg.text.as_slice() == marker)
+            .and_then(|marker| index.checked_sub(marker + 1))
+    };
+    let topic = match (command.lower.as_slice(), index) {
+        (b"include", 0) => Topic::Module,
+        (b"find_package", 0) => return Some(SubjectKind::Package),
+        (b"cmake_policy", 1) if Arguments::new(command).role(index) == Role::Policy => {
+            Topic::Policy
+        }
+        (b"get_target_property", 2) => Topic::TargetProperty,
+        (b"set_target_properties", _) if after(b"PROPERTIES").is_some_and(|n| n % 2 == 0) => {
+            Topic::TargetProperty
+        }
+        (b"set_property", _) if arg(0) == Some(b"TARGET") && after(b"PROPERTY") == Some(0) => {
+            Topic::TargetProperty
+        }
+        (b"get_property", _) if arg(1) == Some(b"TARGET") && after(b"PROPERTY") == Some(0) => {
+            Topic::TargetProperty
+        }
+        _ => return None,
+    };
+    Some(SubjectKind::Catalog(topic))
 }
 
 fn subject(doc: &Document, offset: usize) -> Option<Subject<'_>> {
@@ -298,7 +327,7 @@ fn scope_at(doc: &Document, offset: usize) -> Option<usize> {
 fn matching_declarations<'a>(
     doc: &'a Document,
     doc_uri: &'a str,
-    workspace: &'a Workspace<'_>,
+    workspace: &'a Workspace,
     subject: &Subject<'_>,
 ) -> Vec<(&'a str, &'a Document, Declaration<'a>)> {
     let SubjectKind::Name(kind) = subject.kind else {
@@ -396,13 +425,11 @@ impl CommandInfo {
 }
 
 fn command_info(lookup: &str) -> Option<CommandInfo> {
-    COMMANDS
-        .iter()
-        .find(|(name, _)| name.eq_ignore_ascii_case(lookup))
-        .map(|(name, summary)| CommandInfo {
-            name,
-            summary,
-            signature: signature(name),
+    catalog::command(lookup)
+        .map(|entry| CommandInfo {
+            name: entry.0,
+            summary: entry.1,
+            signature: signature_override(entry.0).or(Some(entry.2)),
             module: None,
         })
         .or_else(|| {
@@ -423,7 +450,11 @@ fn command_hover(
     command: Option<&CommandInvocation>,
     markdown: bool,
 ) -> String {
-    let mut text = format!("{}\n\n{}", info.name, info.summary);
+    let mut text = if markdown {
+        format!("{}\n\n{}", code_span(info.name), info.summary)
+    } else {
+        format!("{}\n\n{}", info.name, info.summary.replace("``", ""))
+    };
     if let Some(signature) = info.signature {
         text.push_str("\n\n");
         if markdown {
@@ -452,31 +483,35 @@ fn command_hover(
     text
 }
 
-fn code_block(text: &str) -> String {
-    let backticks = text
-        .split(|c| c != '`')
-        .map(str::len)
-        .max()
-        .unwrap_or_default();
-    let fence = "`".repeat((backticks + 1).max(3));
-    format!("{fence}cmake\n{text}\n{fence}")
+fn catalog_hover(topic: Topic, entry: &Entry, markdown: bool) -> String {
+    let mut text = if markdown {
+        format!("{}\n\n{}", code_span(entry.0), entry.1)
+    } else {
+        format!("{}\n\n{}", entry.0, entry.1.replace("``", ""))
+    };
+    if !entry.2.is_empty() {
+        text.push_str("\n\n");
+        if markdown {
+            text.push_str(&code_block(entry.2));
+        } else {
+            text.push_str(entry.2);
+        }
+    }
+    if markdown {
+        text.push_str(&format!("\n\n[CMake documentation]({})", topic.link(entry)));
+    }
+    text
 }
 
-pub(crate) fn escape_markdown(text: &str) -> String {
-    let mut escaped = String::with_capacity(text.len());
-    for character in text.chars() {
-        if "\\`*_[]{}<>()#+-.!|&~".contains(character) {
-            escaped.push('\\');
-        }
-        escaped.push(character);
-    }
-    escaped
+fn display_path(uri: &str, markdown: bool) -> String {
+    let path = crate::uri::path(uri).map_or_else(|| uri.into(), |path| path.display().to_string());
+    if markdown { code_span(&path) } else { path }
 }
 
 pub(crate) fn hover<'a>(
     doc: &'a Document,
     uri: &'a str,
-    workspace: impl FnOnce() -> Workspace<'a>,
+    workspace: impl FnOnce() -> Workspace,
     offset: usize,
     encoding: PositionEncoding,
     markdown: bool,
@@ -507,14 +542,8 @@ pub(crate) fn hover<'a>(
         let place = if *destination == uri {
             format!("Defined on line {}.", decl.command.line)
         } else {
-            let path = crate::uri::path(destination)
-                .map_or_else(|| (*destination).into(), |path| path.display().to_string());
+            let path = display_path(destination, markdown);
             format!("Defined in {path} on line {}.", decl.command.line)
-        };
-        let place = if markdown {
-            escape_markdown(&place)
-        } else {
-            place
         };
         let snippet = if markdown {
             code_block(snippet)
@@ -523,7 +552,14 @@ pub(crate) fn hover<'a>(
         };
         Some(format!("{place}\n\n{snippet}"))
     } else if !matches.is_empty() {
-        Some(format!("{} possible definitions.", matches.len()))
+        let mut text = format!("{} possible definitions.", matches.len());
+        for (destination, _, decl) in matches.iter().take(5) {
+            let path = display_path(destination, false);
+            let site = format!("{path}:{}", decl.command.line);
+            let site = if markdown { code_span(&site) } else { site };
+            text.push_str(&format!("\n\n- {site}"));
+        }
+        Some(text)
     } else {
         match subject.kind {
             SubjectKind::Keyword((name, text), command) => Some(if markdown {
@@ -531,21 +567,13 @@ pub(crate) fn hover<'a>(
             } else {
                 format!("{name}\n\n{text}")
             }),
-            SubjectKind::Policy => PolicyId::parse(subject.text.as_bytes())
-                .and_then(PolicyId::info)
-                .map(|policy| if markdown {
-                    format!("`{}`\n\n{}\n\n[CMake documentation]({DOCS}/policy/{}.html)", subject.text, policy.summary, subject.text)
-                } else {
-                    policy.summary.to_owned()
-                }),
-            SubjectKind::Name(Kind::Variable(Variable::Normal)) => VARIABLES
-                .iter()
-                .find(|(name, _)| *name == subject.text)
-                .map(|(name, summary)| if markdown {
-                    format!("`{name}`\n\n{summary}\n\n[CMake documentation]({DOCS}/variable/{name}.html)")
-                } else {
-                    format!("{name}\n\n{summary}")
-                }),
+            SubjectKind::Catalog(topic) => topic.lookup(subject.text)
+                .map(|entry| catalog_hover(topic, entry, markdown)),
+            SubjectKind::Package => Topic::Module.lookup(&format!("Find{}", subject.text))
+                .map(|entry| catalog_hover(Topic::Module, entry, markdown)),
+            SubjectKind::Name(Kind::Variable(Variable::Normal | Variable::Cache)) => Topic::Variable
+                .lookup(subject.text)
+                .map(|entry| catalog_hover(Topic::Variable, entry, markdown)),
             SubjectKind::Generator => expression::description(subject.text).map(|summary| {
                 if markdown {
                     format!("`$<{}>`\n\n{summary}\n\n[Generator expressions]({DOCS}/manual/cmake-generator-expressions.7.html)", subject.text)
@@ -576,7 +604,7 @@ pub(crate) fn hover<'a>(
 pub(crate) fn definition<'a>(
     doc: &'a Document,
     uri: &'a str,
-    workspace: impl FnOnce() -> Workspace<'a>,
+    workspace: impl FnOnce() -> Workspace,
     offset: usize,
     encoding: PositionEncoding,
 ) -> Value {
@@ -628,7 +656,7 @@ pub(crate) fn location(uri: &str, range: Value) -> Value {
 
 pub(crate) fn completion<'a>(
     doc: &'a Document,
-    workspace: impl FnOnce() -> Workspace<'a>,
+    workspace: impl FnOnce() -> Workspace,
     offset: usize,
     encoding: PositionEncoding,
 ) -> Value {
@@ -648,6 +676,7 @@ pub(crate) fn completion<'a>(
     let mut kinds = Vec::new();
     let mut keywords: &[roles::Keyword] = &[];
     let mut prefer_targets = false;
+    let mut topic = None;
     if let Some(command) = doc.command_at(offset) {
         let name = command_name(command);
         if offset <= name.end {
@@ -684,6 +713,7 @@ pub(crate) fn completion<'a>(
             } else {
                 let arguments = Arguments::new(command);
                 keywords = arguments.keywords(index);
+                topic = catalog_argument(command, index);
                 if arguments.role(index) == Role::Target {
                     kinds.push(Kind::Target);
                     prefer_targets = index != 1;
@@ -787,19 +817,46 @@ pub(crate) fn completion<'a>(
         }
     }
     if kinds.contains(&Kind::Function) {
-        for (name, summary) in COMMANDS {
-            add(name, 3, signature(name).or(Some(summary)));
+        for entry in Topic::Command.entries() {
+            add(entry.0, 3, signature_override(entry.0).or(Some(entry.2)));
         }
         for (name, _, signature, _) in MODULE_COMMANDS {
             add(name, 3, Some(signature));
         }
     }
-    if kinds.contains(&Kind::Variable(Variable::Normal)) {
-        for (name, summary) in VARIABLES {
-            add(name, 6, Some(summary));
-        }
+    if kinds
+        .iter()
+        .any(|kind| matches!(kind, Kind::Variable(Variable::Normal | Variable::Cache)))
+    {
+        topic = Some(SubjectKind::Catalog(Topic::Variable));
     }
-    Value::Array(entries.into_values().collect())
+    match topic {
+        Some(SubjectKind::Catalog(topic)) => {
+            for entry in topic.entries() {
+                add(entry.0, 6, Some(entry.1));
+            }
+        }
+        Some(SubjectKind::Package) => {
+            for entry in Topic::Module.entries() {
+                if let Some(package) = entry.0.strip_prefix("Find") {
+                    add(package, 9, Some(entry.1));
+                }
+            }
+        }
+        _ => {}
+    }
+    completion_items(entries.into_values().collect())
+}
+
+pub(crate) fn completion_items(mut items: Vec<Value>) -> Value {
+    if items.len() < MAX_COMPLETIONS {
+        return Value::Array(items);
+    }
+    items.truncate(MAX_COMPLETIONS);
+    object([
+        ("isIncomplete", Value::Bool(true)),
+        ("items", Value::Array(items)),
+    ])
 }
 
 fn completion_kind(kinds: &[Kind], kind: Kind) -> bool {
@@ -814,157 +871,5 @@ fn declaration_detail<'a>(doc: &'a Document, decl: &Declaration<'a>) -> Option<&
         doc.text.get(span)
     } else {
         None
-    }
-}
-
-pub(crate) fn semantic_tokens(doc: &Document, encoding: PositionEncoding) -> Value {
-    let mut comments = doc.comments().into_iter().peekable();
-    let mut tokens = Tokens {
-        doc,
-        encoding,
-        data: Vec::new(),
-        last: Position::default(),
-        last_offset: 0,
-    };
-    for command in doc.commands.iter() {
-        let name = command_name(command);
-        tokens.comments_before(&mut comments, name.start);
-        tokens.push(name, COMMAND);
-        let arguments = Arguments::new(command);
-        for (index, arg) in command.args.iter().enumerate() {
-            tokens.comments_before(&mut comments, arg.span.start);
-            if arg.kind == ArgKind::Bracket {
-                tokens.push(arg.span.clone(), STRING);
-                continue;
-            }
-            let Some(payload) = payload(doc, arg) else {
-                continue;
-            };
-            let Some(text) = doc.text.get(payload.clone()) else {
-                continue;
-            };
-            let style = if arguments.keyword(index, arg).is_some() {
-                Some(KEYWORD)
-            } else {
-                match arguments.role(index) {
-                    Role::Variable(_) => Some(VARIABLE),
-                    Role::CommandDeclaration => Some(COMMAND),
-                    Role::Target | Role::TargetDeclaration if expression::target_name(text) => {
-                        Some(TARGET)
-                    }
-                    _ => None,
-                }
-            };
-            let background = (arg.kind == ArgKind::Quoted).then_some(STRING);
-            let styled_payload = style.is_some() && background.is_some();
-            if styled_payload {
-                tokens.push(arg.span.start..payload.start, STRING);
-            }
-            let body = if styled_payload {
-                payload.clone()
-            } else {
-                arg.span.clone()
-            };
-            let mut start = body.start;
-            for expr in expression::expressions(text) {
-                let span = payload.start + expr.span.start..payload.start + expr.span.end;
-                if let Some(style) = style.or(background) {
-                    tokens.push(start..span.start, style);
-                }
-                start = span.end;
-                tokens.push(
-                    span,
-                    match expr.kind {
-                        ExpressionKind::Reference(_) => VARIABLE,
-                        ExpressionKind::Generator => GENERATOR,
-                        ExpressionKind::Target => TARGET,
-                    },
-                );
-            }
-            if let Some(style) = style.or(background) {
-                tokens.push(start..body.end, style);
-            }
-            if styled_payload {
-                tokens.push(payload.end..arg.span.end, STRING);
-            }
-        }
-    }
-    tokens.comments_before(&mut comments, usize::MAX);
-    object([("data", Value::Array(tokens.data))])
-}
-
-struct Tokens<'a> {
-    doc: &'a Document,
-    encoding: PositionEncoding,
-    data: Vec<Value>,
-    last: Position,
-    last_offset: usize,
-}
-
-impl Tokens<'_> {
-    fn comments_before(
-        &mut self,
-        comments: &mut std::iter::Peekable<impl Iterator<Item = Range<usize>>>,
-        offset: usize,
-    ) {
-        while let Some(comment) = comments.next_if(|comment| comment.start < offset) {
-            self.push(comment, COMMENT);
-        }
-    }
-
-    fn push(&mut self, span: Range<usize>, kind: usize) {
-        let mut cursor = span.start;
-        while cursor < span.end && self.data.len() < 500_000 {
-            let line = self.doc.lines.line_at(cursor);
-            let start = self.doc.lines.start(line).unwrap_or(0);
-            let line_end = start
-                + self
-                    .doc
-                    .lines
-                    .text(&self.doc.text, line)
-                    .map_or(0, str::len);
-            let end = span.end.min(line_end);
-            if let Some(text) = self
-                .doc
-                .text
-                .get(cursor..end)
-                .filter(|text| !text.is_empty())
-            {
-                let (prior_offset, prior_character) = if self.last.line == line {
-                    (self.last_offset, self.last.character)
-                } else {
-                    (start, 0)
-                };
-                let character = self
-                    .doc
-                    .text
-                    .get(prior_offset..cursor)
-                    .map_or(prior_character, |prefix| {
-                        prior_character + self.encoding.width(prefix)
-                    });
-                let delta_line = line - self.last.line;
-                let delta_character = if delta_line == 0 {
-                    character.saturating_sub(self.last.character)
-                } else {
-                    character
-                };
-                self.data.extend(
-                    [
-                        delta_line,
-                        delta_character,
-                        self.encoding.width(text),
-                        kind,
-                        0,
-                    ]
-                    .map(uint),
-                );
-                self.last = Position { line, character };
-                self.last_offset = cursor;
-            }
-            let Some(next) = self.doc.lines.start(line + 1) else {
-                break;
-            };
-            cursor = next;
-        }
     }
 }
