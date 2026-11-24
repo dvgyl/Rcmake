@@ -23,7 +23,7 @@ pub fn stage_sources(
     staging_dir: &Path,
 ) -> Result<(), CpackError> {
     let cwd = host.initial_cwd();
-    let mut interp = interpreter(host, &cwd, &Default::default())?;
+    let mut interp = interpreter(host, &cwd, &Default::default(), None)?;
     host.create_dir_all(staging_dir)?;
     copy_directories(host.as_ref(), config, &cwd, staging_dir, &mut interp)
 }

@@ -7,6 +7,7 @@
 
 #![forbid(unsafe_code)]
 
+mod cmake_root;
 pub mod conformance;
 pub mod error;
 pub mod native;
@@ -19,6 +20,7 @@ use std::path::{Path, PathBuf};
 use jiff::tz::TimeZone;
 use rcmake_base::BString;
 
+pub use cmake_root::discover_cmake_root;
 pub use error::{HostError, HostResult};
 pub use native::NativeHost;
 pub use pure::PureHost;

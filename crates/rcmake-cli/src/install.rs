@@ -4,11 +4,11 @@ use std::sync::Arc;
 
 use rcmake_base::BString;
 use rcmake_eval::RunMode;
-use rcmake_host::{Host, Stream, path};
+use rcmake_host::{Host, Stream, discover_cmake_root, path};
 
 use crate::build::{invalid_value, job_count};
 use crate::options::{Options as ConfigureOptions, split_flag, take_value, unknown_mode_option};
-use crate::{cache, discover_cmake_paths, new_interp, resolve_cli_path};
+use crate::{cache, new_interp, resolve_cli_path};
 
 const USAGE: &str = "Usage: cmake --install <dir> [options]
 Options:
@@ -182,7 +182,7 @@ fn install(argv: &[BString], opts: Options, host: Arc<dyn Host>) -> i32 {
     } else {
         opts.components.into_iter().map(Some).collect()
     };
-    let command = path::from_native(&discover_cmake_paths(host.as_ref(), argv.first()).0);
+    let command = path::from_native(&discover_cmake_root(host.as_ref(), argv.first()).0);
     for component in components {
         let defines = [
             (

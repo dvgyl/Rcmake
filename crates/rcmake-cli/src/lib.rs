@@ -94,13 +94,13 @@ pub fn run(argv: &[BString], host: Arc<dyn Host>) -> i32 {
     let rest = argv.get(1..).unwrap_or(&[]);
     if let Some(first) = rest.first() {
         let fb = first.as_slice();
+        let output = rest.get(1).filter(|arg| !arg.starts_with(b"-"));
         if fb == b"--version" || fb == b"-version" || fb == b"/V" || fb == b"/version" {
             let banner = format!(
                 "{} version {CMAKE_VERSION_STR}\n\nRcmake native Rust drop-in replacement for CMake {CMAKE_VERSION_STR}.\n",
                 tool.name()
             );
-            host.write_out(Stream::Stdout, banner.as_bytes());
-            return 0;
+            return write_version(host.as_ref(), output, banner.as_bytes());
         }
         if let Some(fmt) = fb
             .strip_prefix(b"--version=")
@@ -108,7 +108,7 @@ pub fn run(argv: &[BString], host: Arc<dyn Host>) -> i32 {
             .or_else(|| fb.strip_prefix(b"/V="))
             .or_else(|| fb.strip_prefix(b"/version="))
         {
-            return run_version_format(tool, fmt, host.as_ref());
+            return run_version_format(tool, fmt, host.as_ref(), output);
         }
     }
 
@@ -146,7 +146,20 @@ fn run_ctest(argv: &[BString], args: &[BString], host: Arc<dyn Host>) -> i32 {
     rcmake_ctest::main(&argv, host)
 }
 
-fn run_version_format(tool: Tool, fmt: &[u8], host: &dyn Host) -> i32 {
+fn write_version(host: &dyn Host, output: Option<&BString>, contents: &[u8]) -> i32 {
+    if let Some(output) = output {
+        let path = resolve_cli_path(host, output);
+        if let Err(err) = host.write(&path, contents, WriteMode::Truncate) {
+            emit_cli_error(host, format!("Cannot write {}: {err}", path.display()));
+            return 1;
+        }
+    } else {
+        host.write_out(Stream::Stdout, contents);
+    }
+    0
+}
+
+fn run_version_format(tool: Tool, fmt: &[u8], host: &dyn Host, output: Option<&BString>) -> i32 {
     if fmt != b"json-v1" {
         emit_cli_error(
             host,
@@ -184,8 +197,7 @@ fn run_version_format(tool: Tool, fmt: &[u8], host: &dyn Host) -> i32 {
 
     let mut text = rcmake_json::write_styled(&Value::Object(root), "  ");
     text.push(b'\n');
-    host.write_out(Stream::Stdout, text.as_slice());
-    0
+    write_version(host, output, text.as_slice())
 }
 
 fn run_cmake(argv: &[BString], rest: &[BString], host: Arc<dyn Host>) -> i32 {
@@ -438,12 +450,12 @@ fn instrument_lifecycle(
 }
 
 fn new_interp(argv: &[BString], opts: &Options, mode: RunMode, host: Arc<dyn Host>) -> Interp {
-    let (cmake_command, cmake_root) = discover_cmake_paths(host.as_ref(), argv.first());
+    let (cmake_command, cmake_root) = rcmake_host::discover_cmake_root(host.as_ref(), argv.first());
     let cfg = InterpConfig {
         cwd: host.initial_cwd(),
         host,
         mode,
-        cmake_root,
+        cmake_root: cmake_root.unwrap_or_default(),
         cmake_command,
         limits: Limits::default(),
         diag: DiagOptions {
@@ -576,28 +588,6 @@ fn resolve_cli_path(host: &dyn Host, arg: &[u8]) -> PathBuf {
         }
     }
     path
-}
-
-fn discover_cmake_paths(host: &dyn Host, argv0: Option<&BString>) -> (PathBuf, PathBuf) {
-    let exe = host
-        .current_exe()
-        .unwrap_or_else(|_| PathBuf::from("/usr/local/bin/cmake"));
-    let argv_path = argv0.map(|arg| resolve_cli_path(host, arg));
-    for executable in argv_path.iter().chain(std::iter::once(&exe)) {
-        if let Some(bin) = executable.parent()
-            && let Some(prefix) = bin.parent()
-        {
-            let root = prefix.join("share/cmake-4.5");
-            if configure::is_dir(host, &root.join("Modules")) {
-                return (executable.clone(), root);
-            }
-        }
-    }
-    let root = exe.parent().and_then(Path::parent).map_or_else(
-        || PathBuf::from("/usr/local/share/cmake-4.5"),
-        |prefix| prefix.join("share/cmake-4.5"),
-    );
-    (exe, root)
 }
 
 fn build_capabilities_json() -> Value {

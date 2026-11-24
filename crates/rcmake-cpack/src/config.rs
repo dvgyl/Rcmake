@@ -45,7 +45,7 @@ impl CpackConfig {
 pub fn load(host: &Arc<dyn Host>, options: &CPackOptions) -> Result<CpackConfig, CpackError> {
     let options = resolve_options(host.as_ref(), options.clone())?;
     let _environment = Environment::apply(host.as_ref(), &options.environment);
-    let mut interp = load_base(host, &options.cwd, &options.cli)?;
+    let mut interp = load_base(host, &options.cwd, &options.cli, None)?;
     Ok(snapshot(&mut interp))
 }
 
@@ -234,20 +234,15 @@ pub(crate) fn interpreter(
     host: &Arc<dyn Host>,
     cwd: &Path,
     options: &CPackOptions,
+    argv0: Option<&BString>,
 ) -> Result<Interp, CpackError> {
     let cmake_command = cmake_executable(host.as_ref())?;
-    let root = cmake_command.with_file_name("../share/cmake-4.5");
-    let cmake_root = if host.metadata(&root.join("Modules"), Follow::Yes).is_ok() {
-        root
-    } else {
-        host.env_get(b"RCMAKE_VENDORED_DATA_ROOT")
-            .map_or(root, |path| absolute(cwd, &path))
-    };
+    let (_, cmake_root) = rcmake_host::discover_cmake_root(host.as_ref(), argv0);
     let mut interp = Interp::new(
         InterpConfig {
             host: Arc::clone(host),
             mode: RunMode::Script,
-            cmake_root,
+            cmake_root: cmake_root.unwrap_or_default(),
             cmake_command,
             cwd: cwd.to_owned(),
             limits: Limits::default(),
@@ -316,8 +311,9 @@ pub(crate) fn load_base(
     host: &Arc<dyn Host>,
     cwd: &Path,
     options: &CPackOptions,
+    argv0: Option<&BString>,
 ) -> Result<Interp, CpackError> {
-    let mut interp = interpreter(host, cwd, options)?;
+    let mut interp = interpreter(host, cwd, options, argv0)?;
     if let Some(value) = &options.build_config {
         interp.cx().set_var(b"CPACK_BUILD_CONFIG", value.clone());
     }

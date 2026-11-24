@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 
 use rcmake_archive::{ArchiveFormat, CreateOptions, create_archive};
 use rcmake_base::BString;
+use rcmake_base::parse_source_date_epoch;
 use rcmake_host::path::to_native;
 use rcmake_host::{Follow, Host};
 
@@ -137,10 +138,12 @@ impl PackageGenerator for ArchiveGenerator {
         {
             level_number::<i32>(value, "CPACK_ARCHIVE_THREADS")?;
         }
+        // CPack uses zero for times before the Unix epoch.
         let mtime = cx
             .host
             .env_get(b"SOURCE_DATE_EPOCH")
-            .and_then(|value| source_date_epoch(&value));
+            .and_then(|value| parse_source_date_epoch(&value))
+            .map(|epoch| u64::try_from(epoch).unwrap_or_default());
         let options = CreateOptions {
             format: self.kind.format(),
             mtime,
@@ -272,15 +275,6 @@ fn write_component_archive(
         children(cx.host, root)?
     };
     write_archive(cx, path, root, &inputs, options)
-}
-
-fn source_date_epoch(value: &[u8]) -> Option<u64> {
-    let epoch: i64 = std::str::from_utf8(value)
-        .ok()?
-        .trim_start_matches(|ch: char| ch.is_ascii_whitespace() || ch == '\u{b}')
-        .parse()
-        .ok()?;
-    u64::try_from(epoch).ok()
 }
 
 fn level_number<T: std::str::FromStr>(value: &[u8], variable: &str) -> Result<T, CpackError> {

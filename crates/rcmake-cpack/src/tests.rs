@@ -220,6 +220,7 @@ fn archive_applies_only_valid_source_date_epochs() -> Result<(), Box<dyn std::er
         ("9223372036854775808", original_mtime.secs),
         (" \t+123", 123),
         ("-0", 0),
+        ("-86400", 0),
     ] {
         let host = memory_host();
         let input = Path::new("/work/source/file");

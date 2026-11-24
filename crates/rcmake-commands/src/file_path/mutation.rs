@@ -133,7 +133,12 @@ fn remove(cx: &mut Cx<'_>, command: &[u8], args: &[&[u8]]) -> Result {
             );
             continue;
         }
-        let path = cx.resolve_path(input);
+        // A trailing separator makes lstat follow a symbolic link.
+        let end = input
+            .iter()
+            .rposition(|&byte| byte != b'/')
+            .map_or(input.len(), |index| index + 1);
+        let path = cx.resolve_path(input.get(..end).unwrap_or(input));
         if let Ok(meta) = cx.host().metadata(&path, Follow::No) {
             if meta.kind != FileKind::Dir {
                 let _ = cx.host().remove_file(&path);

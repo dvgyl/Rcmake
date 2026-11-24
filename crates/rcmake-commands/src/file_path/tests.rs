@@ -1486,3 +1486,72 @@ fn file_lock_contends_with_host_locks_and_can_reacquire() -> TestResult {
     assert_eq!(lock.path(), path);
     Ok(())
 }
+
+#[test]
+fn scoped_locks_are_released_before_the_next_lock_command() -> TestResult {
+    use std::time::Duration;
+
+    for (command, exit_code) in [
+        ("", 0),
+        ("return()", 0),
+        ("message(FATAL_ERROR stop)", 1),
+        ("cmake_language(EXIT 42)", 42),
+    ] {
+        let host = Arc::new(PureHost::default());
+        let mut interp = Interp::new(
+            InterpConfig {
+                host: host.clone(),
+                mode: RunMode::Script,
+                cmake_root: "/cmake".into(),
+                cmake_command: "/cmake/bin/cmake".into(),
+                cwd: "/work".into(),
+                limits: Default::default(),
+                diag: Default::default(),
+                defines: Vec::new(),
+                script_args: Vec::new(),
+            },
+            crate::register_all,
+        );
+        let main = Path::new("/work/main.cmake");
+        host.seed_file(main, b"include(child.cmake)\n")?;
+        host.seed_file(
+            Path::new("/work/child.cmake"),
+            format!(
+                "file(LOCK file.lk GUARD FILE)\n\
+                 function(lock_once)\n\
+                   file(LOCK function.lk GUARD FUNCTION)\n\
+                   {command}\n\
+                 endfunction()\n\
+                 lock_once()\n"
+            )
+            .as_bytes(),
+        )?;
+        assert_eq!(interp.run_script(main).exit_code, exit_code, "{command}");
+
+        for path in ["/work/file.lk", "/work/function.lk"] {
+            let _guard = host.lock_file(Path::new(path), Some(Duration::ZERO))?;
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn a_released_scope_does_not_remove_a_new_process_lock() -> TestResult {
+    let (host, mut interp) = interpreter();
+    script(
+        &host,
+        &mut interp,
+        r#"
+function(lock_again)
+  file(LOCK lock GUARD FUNCTION)
+  file(LOCK lock RELEASE)
+  file(LOCK lock GUARD PROCESS)
+endfunction()
+lock_again()
+file(LOCK lock TIMEOUT 0 RESULT_VARIABLE still_locked)
+file(LOCK lock RELEASE)
+"#,
+    )?;
+    vars(&mut interp, &[("still_locked", "File already locked")]);
+    Ok(())
+}

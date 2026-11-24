@@ -27,7 +27,7 @@ pub fn stage(
 ) -> Result<(), CpackError> {
     let cwd = host.initial_cwd();
     let options = CPackOptions::default();
-    let mut interp = interpreter(host, &cwd, &options)?;
+    let mut interp = interpreter(host, &cwd, &options, None)?;
     for (name, value) in &config.vars {
         interp.cx().set_var(name, value.clone());
     }
@@ -184,7 +184,7 @@ fn install_project(
     component: &[u8],
     destination: &Path,
 ) -> Result<(), CpackError> {
-    let mut interp = interpreter(host, build, options)?;
+    let mut interp = interpreter(host, build, options, None)?;
     let destdir = cfg.on(b"CPACK_SET_DESTDIR");
     let prefix = if destdir {
         cfg.get(b"CPACK_INSTALL_PREFIX").unwrap_or(b"/").into()

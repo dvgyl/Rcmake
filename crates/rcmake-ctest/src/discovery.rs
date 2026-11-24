@@ -99,16 +99,12 @@ pub(crate) fn load(
 
 fn interpreter(host: Arc<dyn Host>, dir: &Path, commands: fn(&mut Registry)) -> Interp {
     let cmake_command = crate::script::cmake_executable(host.as_ref());
-    let cmake_root = host
-        .env_get(b"RCMAKE_VENDORED_DATA_ROOT")
-        .map(|root| dir.join(to_native(&root)))
-        .or_else(|| Some(cmake_command.parent()?.parent()?.join("share/cmake-4.5")))
-        .unwrap_or_default();
+    let (_, cmake_root) = rcmake_host::discover_cmake_root(host.as_ref(), None);
     let mut interp = Interp::new(
         InterpConfig {
             host,
             mode: RunMode::Script,
-            cmake_root,
+            cmake_root: cmake_root.unwrap_or_default(),
             cmake_command,
             cwd: dir.to_path_buf(),
             limits: Limits {

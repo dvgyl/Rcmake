@@ -3,6 +3,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use rcmake_base::parse_source_date_epoch;
 use rcmake_base::{BString, hash::HashAlgo, list, path_lex::Lexical};
 use rcmake_cps::{naming, writer};
 use rcmake_genex::{EvalContext, PreprocessMode};
@@ -53,7 +54,7 @@ pub fn write_supplementary_outputs(
     }
     let now = host
         .env_get(b"SOURCE_DATE_EPOCH")
-        .and_then(|value| std::str::from_utf8(&value).ok()?.parse().ok())
+        .and_then(|value| parse_source_date_epoch(&value))
         .unwrap_or_else(|| host.now().secs);
     for export in &model.build_exports {
         let directory = &model.dir(export.dir).binary_dir;

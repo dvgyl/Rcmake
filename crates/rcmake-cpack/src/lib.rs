@@ -147,7 +147,7 @@ pub trait PackageGenerator {
 #[must_use]
 pub fn main(argv: &[BString], host: Arc<dyn Host>) -> i32 {
     let args = argv.get(1..).unwrap_or_default();
-    match cli::parse(args).and_then(|options| run(&host, options)) {
+    match cli::parse(args).and_then(|options| run(&host, options, argv.first())) {
         Ok(()) => 0,
         Err(err) => {
             let label = if matches!(err, CpackError::Argument(_)) {
@@ -161,7 +161,7 @@ pub fn main(argv: &[BString], host: Arc<dyn Host>) -> i32 {
     }
 }
 
-fn run(host: &Arc<dyn Host>, cli: CPackOptions) -> Result<(), CpackError> {
+fn run(host: &Arc<dyn Host>, cli: CPackOptions, argv0: Option<&BString>) -> Result<(), CpackError> {
     if cli::print_information(host.as_ref(), &cli) {
         return Ok(());
     }
@@ -179,7 +179,7 @@ fn run(host: &Arc<dyn Host>, cli: CPackOptions) -> Result<(), CpackError> {
         log(host.as_ref(), "Enable Verbose");
     }
     let _environment = Environment::apply(host.as_ref(), &options.environment);
-    let mut interp = config::load_base(host, &options.cwd, &options.cli)?;
+    let mut interp = config::load_base(host, &options.cwd, &options.cli, argv0)?;
     let base = snapshot(&mut interp);
     let generators = base.list(b"CPACK_GENERATOR");
     if generators.is_empty() {

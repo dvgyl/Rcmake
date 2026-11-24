@@ -168,16 +168,12 @@ fn execute_script(
         return Ok(1);
     }
     let cmake_command = cmake_executable(host.as_ref());
-    let cmake_root = host
-        .env_get(b"RCMAKE_VENDORED_DATA_ROOT")
-        .map(|root| absolute(&cwd, &root))
-        .or_else(|| Some(cmake_command.parent()?.parent()?.join("share/cmake-4.5")))
-        .unwrap_or_default();
+    let (_, cmake_root) = rcmake_host::discover_cmake_root(host.as_ref(), None);
     let mut interp = Interp::new(
         InterpConfig {
             host: Arc::clone(host),
             mode: RunMode::Script,
-            cmake_root,
+            cmake_root: cmake_root.unwrap_or_default(),
             cmake_command,
             cwd,
             limits: Limits {
@@ -221,18 +217,21 @@ fn execute_script(
         failed: false,
     })));
     let code = interp.run_script(&file).exit_code;
+    if let Some(code) = interp.requested_exit_code() {
+        // Match the exit status from a CTest script that runs in a child process.
+        #[cfg(unix)]
+        let code = code & 0xff;
+        return Ok(code);
+    }
     let failed =
         SESSION.with_borrow(|session| session.as_ref().is_some_and(|session| session.failed));
     if code == 0 && failed {
         return Ok(255);
     }
-    Ok(
-        if code == 1 && (interp.diag_engine().error_occurred() || interp.fatal_occurred()) {
-            255
-        } else {
-            code
-        },
-    )
+    if code == 1 && (interp.diag_engine().error_occurred() || interp.fatal_occurred()) {
+        return Ok(255);
+    }
+    Ok(code)
 }
 
 pub(crate) fn cmake_executable(host: &dyn Host) -> PathBuf {

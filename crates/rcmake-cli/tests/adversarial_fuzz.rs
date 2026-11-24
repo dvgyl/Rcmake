@@ -1461,14 +1461,7 @@ fn script_wall_budget_stops_infinite_loops() {
     });
 }
 
-/// KNOWN GAP: a loop with an empty body never checks the wall-clock budget.
-///
-/// `Interp::run_code` checks the budget once for each command. An empty
-/// `while(TRUE)` body runs no commands, so the loop never stops. CMake 4.5.1 has no
-/// budget and also loops forever, so this is a robustness gap, not a conformance bug.
-/// TODO(rcmake-eval): check `over_budget()` in `run_while` and the `foreach` loops.
 #[test]
-#[ignore = "known gap: empty loop bodies skip the wall-clock budget check (rcmake-eval)"]
 fn script_wall_budget_empty_loop_body() {
     guarded("cli/wall-budget-empty", Duration::from_secs(30), |c| {
         let limits = Limits {

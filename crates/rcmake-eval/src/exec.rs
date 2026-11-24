@@ -573,6 +573,7 @@ impl Interp {
         let saved = self.bt.clone();
         let file: Arc<[u8]> = Arc::from(abs);
         self.listfiles.push(Arc::clone(&file));
+        self.file_locks.push(Default::default());
         self.bt = self.bt.push(Frame {
             file,
             line: 0,
@@ -584,6 +585,7 @@ impl Interp {
 
     /// Undo [`Self::push_file_frame`].
     pub(crate) fn pop_file_frame(&mut self, saved: Backtrace) {
+        self.file_locks.pop();
         self.listfiles.pop();
         self.bt = saved;
     }
@@ -1505,6 +1507,7 @@ impl Interp {
             self.vars.push();
             self.loop_blocks.push(0);
             self.listfiles.push(Arc::clone(&u.body.file));
+            self.function_locks.push(Default::default());
         }
         self.policies.push_weak(u.policies);
         self.diags.push_weak(u.diags);
@@ -1518,6 +1521,7 @@ impl Interp {
         if function {
             self.vars.pop();
             self.loop_blocks.pop();
+            self.function_locks.pop();
             self.listfiles.pop();
         }
     }

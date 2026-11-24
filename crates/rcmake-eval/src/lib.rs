@@ -37,6 +37,7 @@ mod builtins;
 mod code;
 mod env;
 mod exec;
+mod file_lock;
 mod flow;
 mod hooks;
 mod md5;
@@ -47,6 +48,7 @@ mod util;
 #[cfg(test)]
 mod tests;
 
+pub use file_lock::FileLockScope;
 pub use hooks::{TraceConfig, TraceFormat, WatchAccess};
 pub use scope::Binding;
 
@@ -421,6 +423,8 @@ pub struct Interp {
     trace_expanding: bool,
     /// Listfile of each file and function call scope (`LISTFILE_STACK`).
     listfiles: Vec<Arc<[u8]>>,
+    file_locks: Vec<file_lock::ScopeLocks>,
+    function_locks: Vec<file_lock::ScopeLocks>,
 }
 
 impl Interp {
@@ -498,6 +502,8 @@ impl Interp {
             cur_cmd: None,
             trace_expanding: false,
             listfiles: Vec::new(),
+            file_locks: Vec::new(),
+            function_locks: Vec::new(),
         };
         interp.init_default_vars();
         interp
@@ -567,6 +573,12 @@ impl Interp {
     #[must_use]
     pub fn fatal_occurred(&self) -> bool {
         self.fatal
+    }
+
+    /// Explicit exit code from `cmake_language(EXIT)`, if the script requested one.
+    #[must_use]
+    pub fn requested_exit_code(&self) -> Option<i32> {
+        self.exit_override
     }
 
     /// Exit code for the current state (`1` if any error was issued, or explicit `cmake_language(EXIT)` code).

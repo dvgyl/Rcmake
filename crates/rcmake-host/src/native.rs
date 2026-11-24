@@ -137,12 +137,7 @@ impl Drop for NativeFileLock {
     }
 }
 
-#[cfg(any(
-    target_os = "macos",
-    target_os = "ios",
-    target_os = "linux",
-    target_os = "android"
-))]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn rename_noreplace_native(from: &Path, to: &Path) -> HostResult<()> {
     use rustix::fs::{RenameFlags, renameat_with};
     match renameat_with(CWD, from, CWD, to, RenameFlags::NOREPLACE) {
@@ -159,16 +154,34 @@ fn rename_noreplace_native(from: &Path, to: &Path) -> HostResult<()> {
     }
 }
 
-#[cfg(not(any(
-    target_os = "macos",
-    target_os = "ios",
-    target_os = "linux",
-    target_os = "android"
-)))]
-fn rename_noreplace_native(_from: &Path, _to: &Path) -> HostResult<()> {
-    Err(HostError::unsupported(
-        "atomic no-replace rename is not supported on this host",
-    ))
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn rename_noreplace_native(from: &Path, to: &Path) -> HostResult<()> {
+    rename_noreplace_with_link(from, to)
+}
+
+#[cfg(any(test, not(any(target_os = "macos", target_os = "linux"))))]
+fn rename_noreplace_with_link(from: &Path, to: &Path) -> HostResult<()> {
+    const ERROR_INVALID_FUNCTION: i32 = 1;
+    const ERROR_NOT_SUPPORTED: i32 = 50;
+    match fs::hard_link(from, to) {
+        Ok(()) => io_at(fs::remove_file(from), from),
+        Err(err)
+            if matches!(
+                err.kind(),
+                ErrorKind::Unsupported | ErrorKind::CrossesDevices
+            ) || cfg!(windows)
+                && matches!(
+                    err.raw_os_error(),
+                    Some(ERROR_INVALID_FUNCTION | ERROR_NOT_SUPPORTED)
+                ) =>
+        {
+            Err(HostError::unsupported(
+                "hard links are not supported for these paths",
+            ))
+        }
+        Err(err) if err.kind() == ErrorKind::AlreadyExists => io_at(Err(err), to),
+        Err(err) => io_at(Err(err), from),
+    }
 }
 
 impl Host for NativeHost {
@@ -901,4 +914,33 @@ fn run_pipeline(
         .map(|stage| stage.result.unwrap_or(ProcessResult::TimedOut))
         .collect();
     Ok(output)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hard_link_rename_preserves_an_existing_destination() -> io::Result<()> {
+        let dir = std::env::temp_dir().join(format!("rcmake-link-rename-{}", std::process::id()));
+        fs::create_dir(&dir)?;
+        let result = (|| -> io::Result<()> {
+            let from = dir.join("from");
+            let to = dir.join("to");
+            fs::write(&from, b"source")?;
+            fs::write(&to, b"destination")?;
+            let result = rename_noreplace_with_link(&from, &to);
+            assert!(matches!(result, Err(err) if err.kind == ErrorKind::AlreadyExists));
+            assert_eq!(fs::read(&from)?, b"source");
+            assert_eq!(fs::read(&to)?, b"destination");
+
+            fs::remove_file(&to)?;
+            assert!(rename_noreplace_with_link(&from, &to).is_ok());
+            assert!(!from.exists());
+            assert_eq!(fs::read(&to)?, b"source");
+            Ok(())
+        })();
+        let cleanup = fs::remove_dir_all(&dir);
+        result.and(cleanup)
+    }
 }

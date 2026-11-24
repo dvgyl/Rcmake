@@ -73,7 +73,10 @@ fn main() -> ExitCode {
     };
 
     match result {
-        Ok(code) => ExitCode::from(u8::try_from(code.clamp(0, 255)).unwrap_or(1)),
+        #[cfg(windows)]
+        Ok(code) => std::process::exit(code),
+        #[cfg(not(windows))]
+        Ok(code) => ExitCode::from((code & 0xff) as u8),
         Err(_) => {
             host_for_panic.write_out(
                 Stream::Stderr,
