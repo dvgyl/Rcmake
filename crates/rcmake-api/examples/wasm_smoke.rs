@@ -28,13 +28,12 @@ add_library(util INTERFACE)
 add_executable(app app.cpp)
 target_link_libraries(app PRIVATE core util)
 file(WRITE "${CMAKE_BINARY_DIR}/overlay.txt" "only in the overlay")
-execute_process(COMMAND forbidden-tool RESULT_VARIABLE process_result)
 "#;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let result = verify();
     let report = match &result {
-        Ok(()) => object([
+        Ok(denials) => object([
             ("schema", Value::string("rcmake-wasm-smoke-v1")),
             ("ok", Value::Bool(true)),
             (
@@ -42,7 +41,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Value::Array(TARGETS.into_iter().map(Value::string).collect()),
             ),
             ("provenance", Value::string("-DCORE_API=1")),
-            ("denied_processes", Value::UInt(1)),
+            ("complete", Value::Bool(true)),
+            ("provisional", Value::Bool(true)),
+            ("denied_processes", Value::UInt(*denials)),
+            (
+                "try_compile",
+                Value::string("skipped: child configure uses a scoped thread"),
+            ),
             ("cancelled", Value::Bool(true)),
         ]),
         Err(error) => object([
@@ -55,7 +60,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     stdout.write_all(&write_compact(&report))?;
     stdout.write_all(b"\n")?;
     stdout.flush()?;
-    result
+    result.map(|_| ())
 }
 
 fn object<const N: usize>(fields: [(&str, Value); N]) -> Value {
@@ -67,7 +72,7 @@ fn object<const N: usize>(fields: [(&str, Value); N]) -> Value {
     )
 }
 
-fn verify() -> Result<(), Box<dyn std::error::Error>> {
+fn verify() -> Result<u64, Box<dyn std::error::Error>> {
     let root = Path::new(if cfg!(windows) { "C:/" } else { "/" });
     let host = Arc::new(PureHost::new(root.to_owned(), root.join("bin/rcmake")));
     host.seed_file(&root.join("src/CMakeLists.txt"), PROJECT)?;
@@ -95,23 +100,17 @@ fn verify() -> Result<(), Box<dyn std::error::Error>> {
         "Configure did not create three targets.",
     )?;
     require(
+        result.completion == CompletionState::Complete && result.generation.is_some(),
+        "Configure did not complete resolution.",
+    )?;
+    require(
         result.index.as_ref().is_some_and(|index| {
-            index.is_provisional()
+            !index.is_provisional()
                 && TARGETS
                     .iter()
                     .all(|name| index.lookup_target(DirId::ROOT, name.as_bytes()).is_some())
         }),
-        "The partial workspace index is missing a target.",
-    )?;
-    require(
-        matches!(
-            &result.completion,
-            CompletionState::Partial { denied_processes, omitted_denials: 0, cancelled: false, .. }
-                if denied_processes.len() == 1
-                    && denied_processes.first().and_then(|denied| denied.pipeline.first())
-                        .is_some_and(|command| command.program == b"forbidden-tool")
-        ),
-        "The result does not contain the expected subprocess denial.",
+        "The workspace index is missing a target.",
     )?;
     let ExplainReport::Target(app) = result.explain_filtered(
         &ExplainQuery::Target("app".into()),
@@ -152,6 +151,34 @@ fn verify() -> Result<(), Box<dyn std::error::Error>> {
         "The configure write reached the base host.",
     )?;
 
+    let mut script = PROJECT.to_vec();
+    script.extend_from_slice(
+        b"execute_process(COMMAND forbidden-tool RESULT_VARIABLE process_result)\n",
+    );
+    host.seed_file(&root.join("src/CMakeLists.txt"), &script)?;
+    let denied = run_configure(request.clone())?;
+    let CompletionState::Partial {
+        denied_processes,
+        omitted_denials,
+        cancelled: false,
+        ..
+    } = denied.completion
+    else {
+        return Err("Configure did not return a partial result after the denial.".into());
+    };
+    require(
+        denied.model.targets().count() == TARGETS.len()
+            && denied
+                .index
+                .as_ref()
+                .is_some_and(|index| index.is_provisional())
+            && denied_processes
+                .first()
+                .and_then(|denial| denial.pipeline.first())
+                .is_some_and(|command| command.program == b"forbidden-tool"),
+        "The partial result is missing configured targets or the process denial.",
+    )?;
+
     let cancel = CancelToken::default();
     cancel.cancel();
     require(
@@ -161,7 +188,9 @@ fn verify() -> Result<(), Box<dyn std::error::Error>> {
         ),
         "The cancelled request did not stop at preparation.",
     )?;
-    Ok(())
+    Ok(u64::try_from(
+        denied_processes.len().saturating_add(omitted_denials),
+    )?)
 }
 
 fn cache_entry(name: &str, value: impl Into<rcmake_base::BString>) -> CacheDefine {

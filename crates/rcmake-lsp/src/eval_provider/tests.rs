@@ -14,8 +14,12 @@ use rcmake_diag::{
     Backtrace, Diagnostic, Effect, Location, MessageKind, PolicyMap, SourceMap, source::SourceKind,
 };
 use rcmake_eval::UserCommandKind;
-use rcmake_host::{CommandSpec, Follow, Input, Output, PureHost, ReadRange, RunRequest};
-use rcmake_model::{BT, DirId, LinkItem, Target, TargetKind, TargetOrigin, UsageField};
+use rcmake_host::{
+    CommandSpec, Follow, Input, Output, PureHost, ReadRange, RunRequest, path::from_native_cmake,
+};
+use rcmake_model::{
+    BT, CacheEntry, CacheType, DirId, LinkItem, Target, TargetKind, TargetOrigin, UsageField,
+};
 
 use crate::{
     PositionEncoding,
@@ -235,6 +239,25 @@ fn defines_unopened_functions_targets_and_aliases() -> TestResult {
             .definition(&cursor(&root_uri, root, 1, "PRIVATE"))
             .is_none()
     );
+    let reply = provider
+        .definitions_reply(&context)
+        .ok_or("Missing reply")?;
+    open(&provider, &root_uri, root, 2);
+    let published = AtomicBool::new(false);
+    assert!(!reply.publish(provider.snapshots(), |_| {
+        published.store(true, Ordering::Relaxed)
+    }));
+    assert!(!published.load(Ordering::Relaxed));
+
+    provider.snapshots().refresh()?;
+    project.file("defs.cmake", &format!("# Insert a line.\n{defs}"))?;
+    for word in ["MY_HELPER", "tools tools_alias", "tools_alias"] {
+        assert!(
+            provider
+                .definitions(&cursor(&root_uri, root, 2, word))
+                .is_empty()
+        );
+    }
     Ok(())
 }
 
@@ -357,6 +380,7 @@ fn follows_all_evaluated_include_and_subdirectory_destinations() -> TestResult {
     let provider = project.provider(|session| {
         let mut result = model_at(session);
         let path = session.source_dir.join("cmake/setup.cmake");
+        read(session.host().as_ref(), &path)?;
         result
             .model
             .dir_mut(DirId::ROOT)
@@ -435,39 +459,44 @@ fn cancels_a_run_when_a_later_edit_arrives() -> TestResult {
     let interrupt = Arc::new(AtomicBool::new(false));
     let interrupt_run = Arc::clone(&interrupt);
     let edit_uri = uri.clone();
-    let provider = Arc::new(project.provider(move |session| {
-        assert_eq!(
-            session.services.step_budget,
-            Some(super::DEFAULT_STEP_BUDGET)
-        );
-        let token = session
-            .services
-            .cancel
-            .as_ref()
-            .ok_or_else(invalid_fixture)?;
-        if interrupt_run.swap(false, Ordering::AcqRel) {
-            let provider = weak
-                .get()
-                .and_then(Weak::upgrade)
-                .ok_or_else(invalid_fixture)?;
-            open(&provider, &edit_uri, THIRD, 3);
-            assert!(token.is_cancelled());
-            let context = cursor(&edit_uri, THIRD, 3, "${VALUE}");
-            let (hover, version) = provider
-                .hover_markdown(&context)
-                .ok_or_else(invalid_fixture)?;
-            assert!(hover.contains("*(provisional snapshot)*"));
-            assert_eq!(version, Some(1));
-            assert!(provider.definitions(&context).is_empty());
-        }
-        let mut result = model_at(session);
-        result
-            .model
-            .dir_mut(DirId::ROOT)
-            .vars
-            .insert("VALUE".into(), "visible".into());
-        Ok(result)
-    }));
+    let provider = Arc::new(
+        project
+            .provider(move |session| {
+                assert_eq!(
+                    session.services.step_budget,
+                    Some(super::DEFAULT_STEP_BUDGET)
+                );
+                let token = session
+                    .services
+                    .cancel
+                    .as_ref()
+                    .ok_or_else(invalid_fixture)?;
+                if interrupt_run.swap(false, Ordering::AcqRel) {
+                    let provider = weak
+                        .get()
+                        .and_then(Weak::upgrade)
+                        .ok_or_else(invalid_fixture)?;
+                    open(&provider, &edit_uri, THIRD, 3);
+                    assert!(token.is_cancelled());
+                    assert_eq!(provider.snapshots().refresh()?, RefreshStatus::Busy);
+                    let context = cursor(&edit_uri, THIRD, 3, "${VALUE}");
+                    let (hover, version) = provider
+                        .hover_markdown(&context)
+                        .ok_or_else(invalid_fixture)?;
+                    assert!(hover.contains("*(provisional snapshot)*"));
+                    assert_eq!(version, Some(1));
+                    assert!(provider.definitions(&context).is_empty());
+                }
+                let mut result = model_at(session);
+                result
+                    .model
+                    .dir_mut(DirId::ROOT)
+                    .vars
+                    .insert("VALUE".into(), "visible".into());
+                Ok(result)
+            })
+            .with_explicit_refresh(),
+    );
     handle
         .set(Arc::downgrade(&provider))
         .map_err(|_| "Provider already set")?;
@@ -475,10 +504,7 @@ fn cancels_a_run_when_a_later_edit_arrives() -> TestResult {
     provider.snapshots().refresh()?;
     interrupt.store(true, Ordering::Release);
     open(&provider, &uri, SECOND, 2);
-    assert!(matches!(
-        provider.snapshots().refresh(),
-        Err(ApiError::Cancelled)
-    ));
+    assert_eq!(provider.snapshots().refresh()?, RefreshStatus::Completed);
     assert_eq!(
         provider
             .hover_markdown(&cursor(&uri, THIRD, 3, "${VALUE}"))
@@ -493,6 +519,7 @@ fn publishes_a_denial_hint_with_configure_diagnostics() -> TestResult {
     let project = Project::new();
     let provider = project.provider(|session| {
         let host = session.host();
+        host.write_out(Stream::Stdout, b"-- Configure message\n");
         let run = RunRequest {
             pipeline: vec![CommandSpec {
                 program: "cc".into(),
@@ -520,11 +547,13 @@ fn publishes_a_denial_hint_with_configure_diagnostics() -> TestResult {
                 policy: None,
                 body: "A configure warning.".into(),
                 location: Location::None,
+                annotations: None,
             }],
             ..model_at(session)
         })
     });
     let results = provider.diagnostics(&project.uri("CMakeLists.txt"));
+    assert!(project.host.stream_bytes(Stream::Stdout).is_empty());
     let messages: Vec<_> = results
         .iter()
         .map(|item| {
@@ -568,5 +597,86 @@ fn uses_the_same_buffer_for_symlink_and_encoded_uris() -> TestResult {
     overlay.set_buffer(&project.uri("source file.cmake"), "new text")?;
     assert_eq!(read(overlay.host().as_ref(), &alias)?, b"new text");
     assert_eq!(read(project.host.as_ref(), &source)?, b"on disk");
+
+    let inputs = Arc::new(Mutex::new(Vec::new()));
+    let reads = Arc::clone(&inputs);
+    let provider = project
+        .provider(move |session| {
+            let text = read(session.host().as_ref(), &source)?;
+            reads
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(text);
+            Ok(model_at(session))
+        })
+        .with_explicit_refresh();
+    let source = project.uri("source file.cmake");
+    let alias = project.uri("alias.cmake");
+    open(&provider, &source, "unsaved first", 20);
+    open(&provider, &alias, "unsaved second", 1);
+    provider.snapshots().refresh()?;
+    provider.update(SemanticUpdate::Closed { uri: &alias });
+    provider.snapshots().refresh()?;
+    assert_eq!(
+        *inputs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+        [b"unsaved second".to_vec(), b"unsaved first".to_vec()],
+    );
+    Ok(())
+}
+
+#[test]
+fn undefined_cache_reference_does_not_use_the_final_cache_value() -> TestResult {
+    let project = Project::new();
+    let text =
+        "message($CACHE{VALUE})\nset(VALUE later CACHE STRING Help)\nmessage($CACHE{VALUE})\n";
+    let provider = project.provider(|session| {
+        let mut result = model_at(session);
+        let path = session.source_dir.join("CMakeLists.txt");
+        read(session.host().as_ref(), &path)?;
+        result.model.cache.insert(
+            "VALUE".into(),
+            CacheEntry {
+                value: "later".into(),
+                ty: CacheType::String,
+                help: "".into(),
+                advanced: false,
+                props: Default::default(),
+            },
+        );
+        assert!(
+            Arc::make_mut(&mut result.facts.executed_sites).record(ExecutedSite {
+                dir: DirId::ROOT,
+                site: SourceLocation {
+                    range: Some(SourceRange { start: 8, end: 21 }),
+                    ..location(&path, 1)
+                },
+                symbol: ExecutedSymbol::Variable {
+                    name: "VALUE".into(),
+                    definition: None
+                },
+            })
+        );
+        Ok(result)
+    });
+    let uri = project.uri("CMakeLists.txt");
+    open(&provider, &uri, text, 1);
+    let mut earlier = cursor(&uri, text, 1, "$CACHE{VALUE}");
+    earlier.offset += 8;
+    assert!(provider.hover(&earlier).is_none());
+    let later_offset = text
+        .rfind("$CACHE{VALUE}")
+        .ok_or("Missing later reference")?
+        + 8;
+    let later = SemanticContext {
+        offset: later_offset,
+        ..earlier
+    };
+    assert!(
+        provider
+            .hover(&later)
+            .is_some_and(|hover| hover.contains("VALUE = later"))
+    );
     Ok(())
 }

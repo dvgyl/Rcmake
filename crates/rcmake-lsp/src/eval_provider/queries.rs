@@ -2,14 +2,14 @@ use std::{
     cell::RefCell,
     collections::{BTreeMap, BTreeSet},
     ops::Range,
-    path::{Path, PathBuf},
+    path::Path,
 };
 
 use rcmake_api::{CompletionKind, ExecutedSymbol, SourceLocation, WorkspaceIndex};
 use rcmake_base::BString;
 use rcmake_diag::{SourceId, source::SourceKind};
 use rcmake_host::{
-    Host, ReadRange,
+    Host,
     path::{from_native_cmake, to_native},
 };
 use rcmake_json::Value;
@@ -26,10 +26,14 @@ use crate::{
     uri,
 };
 
-use super::{Buffers, EvalSemanticProvider, Snapshot, buffer_path, presentation::Binding};
+use super::{
+    Buffers, EvalSemanticProvider, Snapshot, SnapshotReply, buffer_path, presentation::Binding,
+    read_file,
+};
 
 const MAX_DEFINITIONS: usize = 32;
 const MAX_COMPLETIONS: usize = 256;
+const MAX_HOVER_BYTES: usize = 8192;
 
 impl EvalSemanticProvider {
     /// Get a Markdown hover and the version of the buffer that supplied it.
@@ -45,43 +49,62 @@ impl EvalSemanticProvider {
         context: &SemanticContext<'_>,
         markdown: bool,
     ) -> Option<(String, Option<i64>)> {
-        let (snapshot, buffers) = self.snapshots.view()?;
-        let query = Query::new(self.host(), &snapshot, &buffers, context)?;
-        let (kind, name) = query.subject()?;
-        let mut sections = Vec::new();
-        for binding in query.bindings(kind, name) {
-            let section = binding.hover(&snapshot.result, markdown);
-            if !sections.contains(&section) {
+        self.hover_reply(context, markdown)?
+            .current(&self.snapshots)?
+    }
+
+    /// Compute a hover that can be delivered on another thread.
+    #[must_use]
+    pub fn hover_reply(
+        &self,
+        context: &SemanticContext<'_>,
+        markdown: bool,
+    ) -> Option<SnapshotReply<Option<(String, Option<i64>)>>> {
+        self.snapshots.query(|snapshot, buffers| {
+            let query = Query::new(self.host(), snapshot, buffers, context)?;
+            let (kind, name) = query.subject()?;
+            let label = if !query.fresh || query.index.is_provisional() {
+                if markdown {
+                    "*(provisional snapshot)*\n\n"
+                } else {
+                    "Provisional snapshot.\n\n"
+                }
+            } else {
+                ""
+            };
+            let separator = if markdown { "\n\n---\n\n" } else { "\n\n" };
+            let mut sections = Vec::new();
+            let mut used = label.len();
+            for binding in query.bindings(kind, name) {
+                let section = binding.hover(&snapshot.result, markdown);
+                if sections.contains(&section) {
+                    continue;
+                }
+                let gap = if sections.is_empty() {
+                    0
+                } else {
+                    separator.len()
+                };
+                let next = used + gap + section.len();
+                if next > MAX_HOVER_BYTES {
+                    break;
+                }
                 sections.push(section);
+                used = next;
                 if sections.len() == 8 {
                     break;
                 }
             }
-        }
-        if sections.is_empty() {
-            return None;
-        }
-        let text = sections.join(if markdown { "\n\n---\n\n" } else { "\n\n" });
-        let text = if !query.fresh || query.index.is_provisional() {
-            format!(
-                "{}\n\n{text}",
-                if markdown {
-                    "*(provisional snapshot)*"
-                } else {
-                    "Provisional snapshot."
-                }
-            )
-        } else {
-            text
-        };
-        Some((
-            text,
-            snapshot
-                .document_versions
-                .get(&query.path)
-                .copied()
-                .map(i64::from),
-        ))
+            if sections.is_empty() {
+                return None;
+            }
+            let version = snapshot
+                .inputs
+                .by_uri
+                .get(context.uri)
+                .map(|buffer| buffer.document.version);
+            Some((format!("{label}{}", sections.join(separator)), version))
+        })
     }
 
     /// Get evaluated definitions or file destinations in execution order.
@@ -90,14 +113,28 @@ impl EvalSemanticProvider {
     /// once. An empty array lets the server use its lexical resolver.
     #[must_use]
     pub fn definitions(&self, context: &SemanticContext<'_>) -> Vec<SemanticLocation> {
-        let Some((snapshot, buffers)) = self.snapshots.view() else {
-            return Vec::new();
-        };
-        let Some(query) =
-            Query::new(self.host(), &snapshot, &buffers, context).filter(|query| query.fresh)
-        else {
-            return Vec::new();
-        };
+        self.definitions_reply(context)
+            .and_then(|reply| reply.current(&self.snapshots))
+            .unwrap_or_default()
+    }
+
+    /// Compute definitions that can be delivered on another thread.
+    #[must_use]
+    pub fn definitions_reply(
+        &self,
+        context: &SemanticContext<'_>,
+    ) -> Option<SnapshotReply<Vec<SemanticLocation>>> {
+        self.snapshots.query(|snapshot, buffers| {
+            let Some(query) =
+                Query::new(self.host(), snapshot, buffers, context).filter(|query| query.fresh)
+            else {
+                return Vec::new();
+            };
+            Self::query_definitions(&query)
+        })
+    }
+
+    fn query_definitions(query: &Query<'_>) -> Vec<SemanticLocation> {
         let mut locations = Vec::new();
         if query.on_path_argument() {
             for path in &query.spellings {
@@ -150,14 +187,28 @@ impl EvalSemanticProvider {
     /// An empty array lets the server use its lexical completion items.
     #[must_use]
     pub fn completions(&self, context: &SemanticContext<'_>) -> Vec<Value> {
-        let Some((snapshot, buffers)) = self.snapshots.view() else {
-            return Vec::new();
-        };
-        let Some(query) =
-            Query::new(self.host(), &snapshot, &buffers, context).filter(|query| query.fresh)
-        else {
-            return Vec::new();
-        };
+        self.completions_reply(context)
+            .and_then(|reply| reply.current(&self.snapshots))
+            .unwrap_or_default()
+    }
+
+    /// Compute completions that can be delivered on another thread.
+    #[must_use]
+    pub fn completions_reply(
+        &self,
+        context: &SemanticContext<'_>,
+    ) -> Option<SnapshotReply<Vec<Value>>> {
+        self.snapshots.query(|snapshot, buffers| {
+            let Some(query) =
+                Query::new(self.host(), snapshot, buffers, context).filter(|query| query.fresh)
+            else {
+                return Vec::new();
+            };
+            Self::query_completions(&query)
+        })
+    }
+
+    fn query_completions(query: &Query<'_>) -> Vec<Value> {
         let Some((kind, span)) = query.completion_site() else {
             return Vec::new();
         };
@@ -248,7 +299,6 @@ struct Query<'a> {
     snapshot: &'a Snapshot,
     index: &'a WorkspaceIndex,
     buffers: &'a Buffers,
-    path: PathBuf,
     spellings: Vec<BString>,
     doc: &'a Document,
     offset: usize,
@@ -266,33 +316,36 @@ impl<'a> Query<'a> {
         context: &SemanticContext<'_>,
     ) -> Option<Self> {
         let uri_path = uri::path(context.uri)?;
-        let path = buffer_path(host, &uri_path);
-        let doc = &buffers.get(&path)?.document;
-        if doc.version != context.version
+        let buffer = buffers.by_uri.get(context.uri)?;
+        let path = &buffer.path;
+        let doc = &buffer.document;
+        if buffer_path(host, &uri_path) != *path
+            || doc.version != context.version
             || doc.text != context.text
             || !doc.text.is_char_boundary(context.offset)
         {
             return None;
         }
-        let spellings = snapshot.paths.get(&path).map_or_else(
+        let spellings = snapshot.paths.get(path).map_or_else(
             || vec![from_native_cmake(&uri_path)],
             |paths| paths.iter().cloned().collect(),
         );
+        let same_buffer = snapshot
+            .inputs
+            .selected
+            .get(path)
+            .is_some_and(|buffer| buffer.document.text == doc.text);
         Some(Self {
             host,
             snapshot,
             index: snapshot.result.index.as_ref()?,
             buffers,
-            same_buffer: snapshot
-                .inputs
-                .get(&path)
-                .is_some_and(|buffer| buffer.document.text == doc.text),
-            path,
+            same_buffer,
             spellings,
             doc,
             offset: context.offset,
             encoding: context.encoding,
-            fresh: std::ptr::eq(buffers, snapshot.inputs.as_ref()),
+            fresh: same_buffer && std::ptr::eq(buffers, snapshot.inputs.as_ref()),
             checked_sources: RefCell::default(),
         })
     }
@@ -309,20 +362,26 @@ impl<'a> Query<'a> {
     }
 
     fn source_matches(&self, site: &SourceLocation) -> bool {
-        // The file lexer normalizes CRLF in tokens, but retains raw byte spans.
-        site.source_id.is_none_or(|id| {
-            self.index.source(id).is_some_and(|source| {
-                source.path == site.path
-                    && *self
-                        .checked_sources
-                        .borrow_mut()
-                        .entry(id)
-                        .or_insert_with(|| {
-                            source.kind == SourceKind::File
-                                && source.text.as_ref() == self.doc.text.as_bytes()
-                        })
-            })
-        })
+        // Byte offsets refer to raw file bytes, including CRLF line endings.
+        let text = self.doc.text.as_bytes();
+        if let Some(id) = site.source_id {
+            return *self
+                .checked_sources
+                .borrow_mut()
+                .entry(id)
+                .or_insert_with(|| {
+                    self.index.source(id).is_some_and(|source| {
+                        source.path == site.path
+                            && source.kind == SourceKind::File
+                            && source.text.as_ref() == text
+                    })
+                })
+                && self
+                    .index
+                    .source(id)
+                    .is_some_and(|source| source.path == site.path);
+        }
+        self.snapshot.matches(&to_native(&site.path), text)
     }
 
     fn on_path_argument(&self) -> bool {
@@ -408,15 +467,14 @@ impl<'a> Query<'a> {
                         Some(definition.as_ref().map(Binding::Target))
                     }
                     (
-                        Kind::Variable(namespace),
+                        Kind::Variable(_),
                         ExecutedSymbol::Variable {
                             name: actual,
                             definition,
                         },
-                    ) if actual.as_slice() == name
-                        && (namespace == Variable::Normal
-                            || definition.as_ref().is_some_and(|value| value.cached)) =>
-                    {
+                    ) if actual.as_slice() == name => {
+                        // The verified cursor syntax supplies the namespace.
+                        // An undefined reference still counts as an observation.
                         Some(
                             definition
                                 .as_ref()
@@ -469,7 +527,7 @@ impl<'a> Query<'a> {
 
     fn cache(&self, name: &'a [u8]) -> Option<Binding<'a>> {
         let result = &self.snapshot.result;
-        let entry = result.model.cache.get(name)?;
+        let entry = result.model.cache().get(name)?;
         Some(Binding::Variable {
             name,
             value: &entry.value,
@@ -480,13 +538,16 @@ impl<'a> Query<'a> {
 
     fn file_uri(&self, path: &[u8]) -> Option<String> {
         let path = to_native(path);
-        path.is_absolute().then(|| self.display_uri(&path))
-    }
-
-    fn display_uri(&self, path: &Path) -> String {
-        self.buffers
-            .get(&buffer_path(self.host, path))
-            .map_or_else(|| uri::file(path), |buffer| buffer.uri.clone())
+        if !path.is_absolute() {
+            return None;
+        }
+        let disk = read_file(self.host, &path).ok()?;
+        let buffer = self.buffers.at(self.host, &path);
+        let text = buffer.map_or(disk.as_slice(), |buffer| buffer.document.text.as_bytes());
+        if self.snapshot.reads.files.contains_key(&path) && !self.snapshot.matches(&path, text) {
+            return None;
+        }
+        Some(buffer.map_or_else(|| uri::file(&path), |buffer| buffer.uri.clone()))
     }
 
     fn location(&self, site: &SourceLocation) -> Option<SemanticLocation> {
@@ -494,22 +555,13 @@ impl<'a> Query<'a> {
         if !path.is_absolute() {
             return None;
         }
-        let key = buffer_path(self.host, &path);
-        let buffer = self.buffers.get(&key);
+        let buffer = self.buffers.at(self.host, &path);
         let owned;
         let disk_lines;
         let (text, lines) = if let Some(buffer) = buffer {
             (buffer.document.text.as_str(), &buffer.document.lines)
         } else {
-            owned = self
-                .host
-                .read(
-                    &path,
-                    ReadRange::All {
-                        limit: crate::rpc::MAX_MESSAGE_BYTES as u64,
-                    },
-                )
-                .ok()?;
+            owned = read_file(self.host, &path).ok()?;
             let text = std::str::from_utf8(&owned).ok()?;
             disk_lines = Lines::new(text);
             (text, &disk_lines)
@@ -522,14 +574,13 @@ impl<'a> Query<'a> {
             {
                 return None;
             }
+        } else if !self.snapshot.matches(&path, text.as_bytes()) {
+            return None;
         }
-        let offsets = (site.source_id.is_some() || self.snapshot.inputs.contains_key(&key))
-            .then(|| {
-                site.range
-                    .map(|span| (span.start, span.end))
-                    .or_else(|| site.byte_offset.map(|offset| (offset, offset)))
-            })
-            .flatten();
+        let offsets = site
+            .range
+            .map(|span| (span.start, span.end))
+            .or_else(|| site.byte_offset.map(|offset| (offset, offset)));
         let (start, end) = if let Some((start, end)) = offsets {
             let (start, end) = (usize::try_from(start).ok()?, usize::try_from(end).ok()?);
             text.get(start..end)?;
@@ -544,7 +595,7 @@ impl<'a> Query<'a> {
             (position, position)
         };
         Some(SemanticLocation {
-            uri: self.display_uri(&path),
+            uri: buffer.map_or_else(|| uri::file(&path), |buffer| buffer.uri.clone()),
             start,
             end,
         })

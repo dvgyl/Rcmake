@@ -14,9 +14,10 @@ use crate::{
     uri,
 };
 
-use super::{EvalSemanticProvider, buffer_path};
+use super::{Buffers, EvalSemanticProvider, Snapshot, SnapshotReply, buffer_path, read_file};
 
 const MAX_DIAGNOSTICS: usize = 256;
+const MAX_HOVER_SECTION: usize = 4096;
 const DENIED_HINT: &str =
     "The editor cannot run this command. Run a local configure to get the result.";
 
@@ -27,16 +28,31 @@ impl EvalSemanticProvider {
     /// top-level CMakeLists.txt. Diagnostics from a previous edit are omitted.
     #[must_use]
     pub fn diagnostics(&self, document_uri: &str) -> Vec<Value> {
-        let Some(path) = uri::path(document_uri) else {
-            return Vec::new();
-        };
-        let Some((snapshot, buffers)) = self.snapshots.view() else {
-            return Vec::new();
-        };
-        if !std::sync::Arc::ptr_eq(&snapshot.inputs, &buffers) {
-            return Vec::new();
-        }
-        let path = buffer_path(self.host(), &path);
+        self.diagnostics_reply(document_uri)
+            .and_then(|reply| reply.current(&self.snapshots))
+            .unwrap_or_default()
+    }
+
+    /// Compute configure diagnostics that can be delivered on another thread.
+    #[must_use]
+    pub fn diagnostics_reply(&self, document_uri: &str) -> Option<SnapshotReply<Vec<Value>>> {
+        let path = uri::path(document_uri)?;
+        self.snapshots.query(|snapshot, buffers| {
+            if !std::ptr::eq(snapshot.inputs.as_ref(), buffers) {
+                return Vec::new();
+            }
+            self.query_diagnostics(document_uri, &path, snapshot, buffers)
+        })
+    }
+
+    fn query_diagnostics(
+        &self,
+        document_uri: &str,
+        path: &std::path::Path,
+        snapshot: &Snapshot,
+        buffers: &Buffers,
+    ) -> Vec<Value> {
+        let path = buffer_path(self.host(), path);
         let root = buffer_path(
             self.host(),
             &self.snapshots.project_root().join("CMakeLists.txt"),
@@ -63,6 +79,16 @@ impl EvalSemanticProvider {
                 if buffer_path(self.host(), &file) != path {
                     continue;
                 }
+                let matches = buffers.by_uri.get(document_uri).map_or_else(
+                    || {
+                        read_file(self.host(), &file)
+                            .is_ok_and(|text| snapshot.matches(&file, &text))
+                    },
+                    |buffer| snapshot.matches(&file, buffer.document.text.as_bytes()),
+                );
+                if !matches {
+                    continue;
+                }
                 line.saturating_sub(1) as usize
             } else if path == root {
                 0
@@ -70,7 +96,8 @@ impl EvalSemanticProvider {
                 continue;
             };
             if buffers
-                .get(&path)
+                .by_uri
+                .get(document_uri)
                 .is_some_and(|buffer| buffer.document.lines.start(line).is_none())
             {
                 continue;
@@ -166,10 +193,10 @@ impl<'a> Binding<'a> {
                     prose(&self.detail(), markdown),
                 );
                 if let Some(real) = result.model.target(target.id) {
-                    for (label, properties) in [
+                    let groups: [(&str, &[&str]); 2] = [
                         (
                             "Compile definitions",
-                            &["COMPILE_DEFINITIONS", "INTERFACE_COMPILE_DEFINITIONS"][..],
+                            &["COMPILE_DEFINITIONS", "INTERFACE_COMPILE_DEFINITIONS"],
                         ),
                         (
                             "Include directories",
@@ -177,9 +204,10 @@ impl<'a> Binding<'a> {
                                 "INCLUDE_DIRECTORIES",
                                 "INTERFACE_INCLUDE_DIRECTORIES",
                                 "INTERFACE_SYSTEM_INCLUDE_DIRECTORIES",
-                            ][..],
+                            ],
                         ),
-                    ] {
+                    ];
+                    for (label, properties) in groups {
                         let values = real
                             .usage
                             .fields
@@ -246,6 +274,9 @@ impl<'a> Binding<'a> {
             text.push_str("\n\nDefined at ");
             text.push_str(&prose(&location, markdown));
         }
+        // Each section opens with its only code fence. The snippet and both
+        // fence markers fit before this limit, even for an all-backtick value.
+        clip(&mut text, MAX_HOVER_SECTION);
         text
     }
 }
@@ -261,6 +292,7 @@ fn signature(command: &CallableDefinition) -> String {
     if command.parameters.len() > 16 {
         text.push_str(" …");
     }
+    clip(&mut text, 1023);
     text.push(')');
     text
 }
@@ -316,10 +348,15 @@ fn single_line(bytes: &[u8]) -> String {
 }
 
 fn preview(bytes: &[u8], limit: usize) -> String {
-    let clipped = bytes.get(..limit).unwrap_or(bytes);
-    let mut text = String::from_utf8_lossy(clipped).into_owned();
-    if clipped.len() < bytes.len() {
+    let prefix = bytes.get(..limit.saturating_add(3)).unwrap_or(bytes);
+    let mut text = String::from_utf8_lossy(prefix).into_owned();
+    clip(&mut text, limit);
+    text
+}
+
+fn clip(text: &mut String, limit: usize) {
+    if text.len() > limit {
+        text.truncate(text.floor_char_boundary(limit - '…'.len_utf8()));
         text.push('…');
     }
-    text
 }

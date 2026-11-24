@@ -8,9 +8,9 @@ use std::time::Duration;
 
 use jiff::tz::TimeZone;
 use rcmake_api::{
-    ApiError, CacheDefine, CompletionState, ConfigureRequest, ExplainQuery, ExplainRenderOptions,
-    ExplainReport, LedgerLevel, ProcessPolicy, Services, WriteMode, render_explain_json,
-    render_explain_terminal, run_configure,
+    ApiError, CompletionState, ConfigureRequest, ExplainQuery, ExplainRenderOptions, ExplainReport,
+    LedgerLevel, ProcessPolicy, Services, WriteMode, render_explain_json, render_explain_terminal,
+    run_configure,
 };
 use rcmake_base::BString;
 use rcmake_diag::DiagOptions;
@@ -33,8 +33,8 @@ Show where a target gets its build settings or where a variable gets its value.
   -B <build-dir>  Read CMakeCache.txt from this directory. Default: current directory.
   --target        Look up a target or alias.
   --var           Look up a variable.
-  --config <CFG>  Show one target configuration.
-  --filter <VAL>  Show the exact target value or compiler flag.
+  --config <CFG>  Select a target configuration. Implies --target.
+  --filter <VAL>  Select an exact target value or compiler flag. Implies --target.
   --json          Write one JSON report to standard output.
   --verbose       Show full values and call stacks in terminal output.
   --color=<mode>  Set terminal color. Default: auto.
@@ -46,7 +46,9 @@ Examples
   rcmake explain CMAKE_CXX_FLAGS --json
 
 Exit status
-  0  Found the item.
+  0  Found the item. A target selection can be empty.
+     Check the configuration and entry lists in JSON or the selection message
+     in terminal output.
   1  The query failed, found no item, or matched both a target and a variable.
   2  Invalid arguments or an unavailable configured build directory.
 ";
@@ -146,15 +148,6 @@ pub(crate) fn run(argv0: Option<&BString>, args: &[BString], host: Arc<dyn Host>
         );
     }
     let report = result.explain_filtered(&query, options.filter.clone());
-    if matches!(report, ExplainReport::Variable(_))
-        && (options.filter.is_some() || options.config.is_some())
-    {
-        return error(
-            host.as_ref(),
-            "--config and --filter apply to targets. Use --target to select a target.",
-            2,
-        );
-    }
     write_report(host.as_ref(), &options, &report)
 }
 
@@ -216,27 +209,21 @@ fn request(
         base: Arc::clone(host),
         exe,
     });
-    let mut request = ConfigureRequest::new(source, build, cmake_root, configure_host)
-        .generator(kind)
-        .write_mode(WriteMode::Overlay)
-        .process_policy(ProcessPolicy::Deny)
-        .services(Services {
-            provenance: LedgerLevel::Full { per_name_cap: 64 },
-            ..Services::default()
-        })
-        .diag(DiagOptions {
-            initial_state: diagnostics,
-            ..DiagOptions::default()
-        });
-    request.defines = cache::sorted(&saved)
-        .into_iter()
-        .map(|(name, entry)| CacheDefine {
-            name: name.clone(),
-            ty: Some(entry.ty),
-            value: entry.value.clone(),
-        })
-        .collect();
-    Ok(request)
+    Ok(
+        ConfigureRequest::new(source, build, cmake_root, configure_host)
+            .initial_cache(saved)
+            .generator(kind)
+            .write_mode(WriteMode::Overlay)
+            .process_policy(ProcessPolicy::Deny)
+            .services(Services {
+                provenance: LedgerLevel::Full { per_name_cap: 64 },
+                ..Services::default()
+            })
+            .diag(DiagOptions {
+                initial_state: diagnostics,
+                ..DiagOptions::default()
+            }),
+    )
 }
 
 fn write_report(host: &dyn Host, options: &Options, report: &ExplainReport) -> i32 {
@@ -328,10 +315,13 @@ fn parse(args: &[BString]) -> Result<Invocation, String> {
     if options.name.is_empty() {
         return Err("Specify the name of a target or variable.".into());
     }
-    if options.kind == Kind::Variable && (options.filter.is_some() || options.config.is_some()) {
-        return Err(
-            "--config and --filter apply to targets. Omit --var to use either option.".into(),
-        );
+    if options.filter.is_some() || options.config.is_some() {
+        if options.kind == Kind::Variable {
+            return Err(
+                "--config and --filter apply to targets. Omit --var to use either option.".into(),
+            );
+        }
+        options.kind = Kind::Target;
     }
     Ok(Invocation::Query(options))
 }
@@ -591,19 +581,20 @@ mod tests {
 
     #[test]
     fn rejects_invalid_argument_combinations() {
-        for args in [
-            &[][..],
-            &[""][..],
-            &["app", "util"][..],
-            &["app", "--unknown"][..],
-            &["app", "--target", "--var"][..],
-            &["app", "--var", "--filter=FOO=1"][..],
-            &["app", "-B"][..],
-            &["app", "--config", "--json"][..],
-            &["app", "--filter="][..],
-            &["app", "--color=other"][..],
-            &["app", "--json=yes"][..],
-        ] {
+        let cases: &[&[&str]] = &[
+            &[],
+            &[""],
+            &["app", "util"],
+            &["app", "--unknown"],
+            &["app", "--target", "--var"],
+            &["app", "--var", "--filter=FOO=1"],
+            &["app", "-B"],
+            &["app", "--config", "--json"],
+            &["app", "--filter="],
+            &["app", "--color=other"],
+            &["app", "--json=yes"],
+        ];
+        for args in cases {
             assert!(parse_args(args).is_err(), "{args:?}");
         }
     }
@@ -640,9 +631,7 @@ mod tests {
         let root = Path::new(if cfg!(windows) { "C:/" } else { "/" });
         let host = Arc::new(PureHost::new(root.to_owned(), root.join("bin/rcmake")));
         let source = root.join("src");
-        host.seed_file(
-            &source.join("CMakeLists.txt"),
-            br#"
+        let lists = br#"
 cmake_minimum_required(VERSION 4.5)
 set(CMAKE_SYSTEM Generic)
 set(CMAKE_SYSTEM_LOADED 1)
@@ -651,16 +640,33 @@ set(CMAKE_SYSTEM_SPECIFIC_INFORMATION_LOADED 1)
 project(ExplainTest LANGUAGES NONE)
 add_library(app INTERFACE)
 set(app variable)
+set(removed active)
+unset(removed)
+add_subdirectory(child)
+if(DEFINED preload_only OR NOT preload_cache STREQUAL "kept")
+  message(FATAL_ERROR "PreLoad variables were not isolated.")
+endif()
+get_property(mode_options CACHE MODE PROPERTY STRINGS)
+if(NOT mode_options STREQUAL "fast;safe")
+  message(FATAL_ERROR "Missing saved MODE options.")
+endif()
 message(STATUS "Configure message")
 execute_process(COMMAND skipped RESULT_VARIABLE status)
-"#,
-        )
-        .map_err(|error| error.to_string())?;
+"#;
+        for (path, text) in [
+            ("src/CMakeLists.txt", lists.as_slice()),
+            ("src/PreLoad.cmake", b"set(preload_only hidden)\nset(preload_cache kept CACHE STRING Preload)\n"),
+            ("out/PreLoad.cmake", b"if(DEFINED preload_only)\nmessage(FATAL_ERROR \"Leaked preload variable.\")\nendif()\n"),
+            ("src/child/CMakeLists.txt", b"add_library(child INTERFACE)\n"),
+        ] {
+            host.seed_file(&root.join(path), text)
+                .map_err(|error| error.to_string())?;
+        }
         host.seed_file(&root.join("data/Modules/CMakeDetermineSystem.cmake"), b"")
             .map_err(|error| error.to_string())?;
         let source = path::from_native_cmake(&source);
         let contents = format!(
-            "CMAKE_HOME_DIRECTORY:INTERNAL={source}\nCMAKE_GENERATOR:INTERNAL=Ninja\n             CMAKE_CXX_FLAGS:STRING=-O2\n"
+            "CMAKE_HOME_DIRECTORY:INTERNAL={source}\nCMAKE_GENERATOR:INTERNAL=Ninja\nCMAKE_CXX_FLAGS:STRING=-O2\n//Build mode\nMODE:STRING=fast\nMODE-ADVANCED:INTERNAL=1\nMODE-STRINGS:INTERNAL=fast;safe\n"
         );
         host.seed_file(&root.join("out/CMakeCache.txt"), contents.as_bytes())
             .map_err(|error| error.to_string())?;
@@ -677,15 +683,40 @@ execute_process(COMMAND skipped RESULT_VARIABLE status)
         assert_eq!(req.write_mode, WriteMode::Overlay);
         assert_eq!(req.process_policy, ProcessPolicy::Deny);
         assert!(
-            req.defines
-                .iter()
-                .any(|def| def.name == b"CMAKE_CXX_FLAGS" && def.value == b"-O2")
+            req.initial_cache
+                .as_ref()
+                .and_then(|cache| cache.get(b"CMAKE_CXX_FLAGS"))
+                .is_some_and(|entry| entry.value == b"-O2")
         );
+        let result = run_configure(req.collect_index(true)).map_err(|error| error.to_string())?;
+        let index = result.index.as_ref().ok_or("Missing index")?;
+        let offset = lists
+            .windows(b"child)".len())
+            .position(|window| window == b"child)")
+            .ok_or("Missing child listfile reference")?;
+        let site = rcmake_api::SourceLocation {
+            path: path::from_native_cmake(&root.join("src/CMakeLists.txt")),
+            line: 0,
+            byte_offset: u32::try_from(offset).ok(),
+            source_id: None,
+            range: None,
+        };
+        assert_eq!(index.resolve_file_edges(None, &site).count(), 1);
+        let ExplainReport::Variable(removed) =
+            result.explain(&ExplainQuery::Variable("removed".into()))
+        else {
+            return Err("Missing unset variable history".into());
+        };
+        assert!(!removed.normal_binding);
+        assert!(removed.writes.last().is_some_and(|write| {
+            write.command.as_ref().is_some_and(|name| name == b"unset") && write.value.is_none()
+        }));
+
         assert_eq!(
             run(
                 None,
                 &["app".into(), "-B".into(), "out".into(), "--json".into()],
-                shared
+                shared.clone()
             ),
             1
         );
@@ -696,6 +727,19 @@ execute_process(COMMAND skipped RESULT_VARIABLE status)
         let stderr = host.stream_bytes(Stream::Stderr);
         assert!(stderr.contains_str("Configure message"));
         assert!(stderr.contains_str("Partial configure."));
+        assert_eq!(
+            run(
+                None,
+                &[
+                    "app".into(),
+                    "-B".into(),
+                    "out".into(),
+                    "--filter=FOO".into()
+                ],
+                shared,
+            ),
+            0
+        );
         Ok(())
     }
 

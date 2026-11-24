@@ -1,16 +1,21 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
-use rcmake_base::Limits;
+use jiff::tz::TimeZone;
+
+use rcmake_base::{BString, Limits};
 use rcmake_diag::{DiagOptions, Diagnostic};
 use rcmake_eval::{CacheDefine, CancelToken, LedgerLevel, Services};
 use rcmake_host::{
-    Host, HostError,
+    CopyOptions, DirEntry, FileLockGuard, FileTime, Follow, GracefulTimeout, Host, HostError,
+    HostResult, Metadata, ReadRange, RunOutput, RunRequest, Stream, SystemInfo,
+    WriteMode as HostWriteMode,
     no_process::{DeniedCommand, NoProcessHost},
     overlay::OverlayHost,
     path,
 };
-use rcmake_model::GeneratorKind;
+use rcmake_model::{Cache, GeneratorKind};
 
 use crate::{CompletionState, ConfigureResult, OverlayDiff};
 
@@ -90,6 +95,8 @@ pub struct ConfigureRequest {
     pub build_dir: PathBuf,
     /// Generator selected by the caller. An absent value permits automatic selection.
     pub generator: Option<GeneratorKind>,
+    /// Saved cache entries, with their help text and properties.
+    pub initial_cache: Option<Cache>,
     /// Cache definitions in application order.
     pub defines: Vec<CacheDefine>,
     /// Directory that contains the CMake Modules and Templates directories.
@@ -126,6 +133,7 @@ impl ConfigureRequest {
             source_dir: source_dir.into(),
             build_dir: build_dir.into(),
             generator: None,
+            initial_cache: None,
             defines: Vec::new(),
             cmake_root: cmake_root.into(),
             host,
@@ -144,6 +152,13 @@ impl ConfigureRequest {
     #[must_use]
     pub fn generator(mut self, generator: GeneratorKind) -> Self {
         self.generator = Some(generator);
+        self
+    }
+
+    /// Seed the saved cache before applying caller definitions.
+    #[must_use]
+    pub fn initial_cache(mut self, cache: Cache) -> Self {
+        self.initial_cache = Some(cache);
         self
     }
 
@@ -312,6 +327,7 @@ impl ConfigureRequest {
             cmake_root,
             cwd,
             generator: self.generator,
+            initial_cache: self.initial_cache.clone(),
             defines: self.defines.clone(),
             limits: self.limits.clone(),
             diag: self.diag.clone(),
@@ -337,6 +353,8 @@ pub struct PreparedConfigure {
     pub cwd: PathBuf,
     /// Generator selected by the caller, if specified.
     pub generator: Option<GeneratorKind>,
+    /// Saved cache entries, with their help text and properties.
+    pub initial_cache: Option<Cache>,
     /// Cache definitions in application order.
     pub defines: Vec<CacheDefine>,
     /// Evaluator safety limits.
@@ -353,10 +371,40 @@ pub struct PreparedConfigure {
 }
 
 impl PreparedConfigure {
+    pub(crate) fn wants_index(&self) -> bool {
+        self.collect_index
+    }
+
     /// Get the host to use for evaluation, resolution, and generation.
     #[must_use]
     pub fn host(&self) -> Arc<dyn Host> {
         Arc::clone(&self.host)
+    }
+
+    /// Return a session host that reports complete file reads and can capture output.
+    ///
+    /// The read callback sees the bytes returned to the evaluator, including
+    /// overlay reads. Return true from the output callback to consume a write.
+    #[must_use]
+    pub fn observed_host(
+        &self,
+        read: impl Fn(&Path, &[u8]) + Send + Sync + 'static,
+        output: impl Fn(Stream, &[u8]) -> bool + Send + Sync + 'static,
+    ) -> Arc<dyn Host> {
+        Arc::new(ObservedHost {
+            base: self.host(),
+            read,
+            output,
+        })
+    }
+
+    /// Observe the host used by this session without changing its policies.
+    pub fn observe_host(
+        &mut self,
+        read: impl Fn(&Path, &[u8]) + Send + Sync + 'static,
+        output: impl Fn(Stream, &[u8]) -> bool + Send + Sync + 'static,
+    ) {
+        self.host = self.observed_host(read, output);
     }
 
     /// Get the retained subprocess requests denied during this session.
@@ -406,6 +454,178 @@ impl PreparedConfigure {
             result.build_index();
         }
         result
+    }
+}
+
+struct ObservedHost<R, O> {
+    base: Arc<dyn Host>,
+    read: R,
+    output: O,
+}
+
+impl<R, O> Host for ObservedHost<R, O>
+where
+    R: Fn(&Path, &[u8]) + Send + Sync,
+    O: Fn(Stream, &[u8]) -> bool + Send + Sync,
+{
+    fn metadata(&self, p: &Path, follow: Follow) -> HostResult<Metadata> {
+        self.base.metadata(p, follow)
+    }
+
+    fn read(&self, p: &Path, range: ReadRange) -> HostResult<Vec<u8>> {
+        let bytes = self.base.read(p, range)?;
+        if matches!(range, ReadRange::All { .. }) {
+            (self.read)(p, &bytes);
+        }
+        Ok(bytes)
+    }
+
+    fn read_chunks(&self, p: &Path, consume: &mut dyn FnMut(&[u8])) -> HostResult<()> {
+        self.base.read_chunks(p, consume)
+    }
+
+    fn write(&self, p: &Path, data: &[u8], mode: HostWriteMode) -> HostResult<()> {
+        self.base.write(p, data, mode)
+    }
+
+    fn read_dir(&self, p: &Path) -> HostResult<Vec<DirEntry>> {
+        self.base.read_dir(p)
+    }
+
+    fn create_dir_all(&self, p: &Path) -> HostResult<()> {
+        self.base.create_dir_all(p)
+    }
+
+    fn remove_file(&self, p: &Path) -> HostResult<()> {
+        self.base.remove_file(p)
+    }
+
+    fn remove_dir(&self, p: &Path) -> HostResult<()> {
+        self.base.remove_dir(p)
+    }
+
+    fn remove_dir_all(&self, p: &Path) -> HostResult<()> {
+        self.base.remove_dir_all(p)
+    }
+
+    fn rename(&self, from: &Path, to: &Path) -> HostResult<()> {
+        self.base.rename(from, to)
+    }
+
+    fn rename_noreplace(&self, from: &Path, to: &Path) -> HostResult<()> {
+        self.base.rename_noreplace(from, to)
+    }
+
+    fn lock_file(&self, p: &Path, timeout: Option<Duration>) -> HostResult<Box<dyn FileLockGuard>> {
+        self.base.lock_file(p, timeout)
+    }
+
+    fn copy_file(&self, from: &Path, to: &Path, opts: CopyOptions) -> HostResult<()> {
+        self.base.copy_file(from, to, opts)
+    }
+
+    fn symlink(&self, target: &Path, link: &Path) -> HostResult<()> {
+        self.base.symlink(target, link)
+    }
+
+    fn hard_link(&self, src: &Path, dst: &Path) -> HostResult<()> {
+        self.base.hard_link(src, dst)
+    }
+
+    fn read_link(&self, p: &Path) -> HostResult<PathBuf> {
+        self.base.read_link(p)
+    }
+
+    fn canonicalize(&self, p: &Path) -> HostResult<PathBuf> {
+        self.base.canonicalize(p)
+    }
+
+    fn set_permissions(&self, p: &Path, mode: u32) -> HostResult<()> {
+        self.base.set_permissions(p, mode)
+    }
+
+    fn set_times(
+        &self,
+        p: &Path,
+        atime: Option<FileTime>,
+        mtime: Option<FileTime>,
+    ) -> HostResult<()> {
+        self.base.set_times(p, atime, mtime)
+    }
+
+    fn env_get(&self, key: &[u8]) -> Option<BString> {
+        self.base.env_get(key)
+    }
+
+    fn env_set(&self, key: &[u8], value: Option<&[u8]>) {
+        self.base.env_set(key, value);
+    }
+
+    fn env_all(&self) -> Vec<(BString, BString)> {
+        self.base.env_all()
+    }
+
+    fn run(
+        &self,
+        req: &RunRequest,
+        on_output: &mut dyn FnMut(Stream, &[u8]),
+    ) -> HostResult<RunOutput> {
+        self.base.run(req, on_output)
+    }
+
+    fn run_with_timeout_signal(
+        &self,
+        req: &RunRequest,
+        timeout: GracefulTimeout,
+        on_output: &mut dyn FnMut(Stream, &[u8]),
+    ) -> HostResult<RunOutput> {
+        self.base.run_with_timeout_signal(req, timeout, on_output)
+    }
+
+    fn run_bounded(&self, req: &RunRequest, limit: usize) -> HostResult<RunOutput> {
+        self.base.run_bounded(req, limit)
+    }
+
+    fn write_out(&self, stream: Stream, bytes: &[u8]) {
+        if !(self.output)(stream, bytes) {
+            self.base.write_out(stream, bytes);
+        }
+    }
+
+    fn read_stdin(&self, limit: u64) -> HostResult<Vec<u8>> {
+        self.base.read_stdin(limit)
+    }
+
+    fn is_terminal(&self, stream: Stream) -> bool {
+        self.base.is_terminal(stream)
+    }
+
+    fn now(&self) -> FileTime {
+        self.base.now()
+    }
+
+    fn monotonic(&self) -> Duration {
+        self.base.monotonic()
+    }
+
+    fn sleep(&self, duration: Duration) {
+        self.base.sleep(duration);
+    }
+
+    fn time_zone(&self) -> TimeZone {
+        self.base.time_zone()
+    }
+
+    fn current_exe(&self) -> HostResult<PathBuf> {
+        self.base.current_exe()
+    }
+
+    fn initial_cwd(&self) -> PathBuf {
+        self.base.initial_cwd()
+    }
+
+    fn system(&self) -> SystemInfo {
+        self.base.system()
     }
 }
 
