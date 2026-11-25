@@ -42,8 +42,9 @@ export function speedupBars({ label, value, unit = "x", status, testId } = {}) {
   }
   const st = normalizeStatus(status === "pending" ? "pass" : status);
   const scale = String(Number(Math.min(1, Math.max(0.02, 1 / value)).toFixed(4)));
-  const u = unit === "x" ? "\u00d7" : safeText(unit) ? ` ${safeText(unit)}` : "";
-  const spd = `${formatSpeed(value)}${u}`;
+  const isRatio = unit === "x";
+  const u = isRatio ? "\u00d7" : safeText(unit) ? ` ${safeText(unit)}` : "";
+  const spd = isRatio ? `${formatSpeed(value)}\u00d7 faster` : `${formatSpeed(value)}${u}`;
   return `<figure class="speed-group" aria-label="${lbl}. CMake 4.5.1 is 1.00 times, rcmake is ${formatSpeed(value)} times faster." data-status="${st}"${attrs}><div class="speed-name">${lbl}</div><div class="speed-lanes"><div class="speed-lane"><span class="speed-bin">cmake 4.5.1</span><div class="bar-track"><div class="bar-fill is-cmake" style="--v:1" data-scale="1"></div></div><span class="speed-val dim" data-value>1.00${u}</span></div><div class="speed-lane"><span class="speed-bin is-rcmake">rcmake</span><div class="bar-track"><div class="bar-fill is-rcmake" style="--v:${scale}" data-scale="${scale}" data-test="speed-bar-rcmake"></div></div><span class="speed-val" data-value>${spd}</span></div></div></figure>`;
 }
 
@@ -112,7 +113,7 @@ export function segmentRing({ passed, total, status, size = 88, stroke = 6, gapD
   }
   const center = ok
     ? `<text class="ring-val" x="${c}" y="${(c + 6).toFixed(1)}" text-anchor="middle" data-value>${hit}/${n}</text>`
-    : `<text class="ring-val is-pending" x="${c}" y="${(c + 2).toFixed(1)}" text-anchor="middle">/ ${n}</text><text class="ring-sub" x="${c}" y="${(c + 16).toFixed(1)}" text-anchor="middle">pending</text>`;
+    : `<text class="ring-val is-pending" x="${c}" y="${(c + 2).toFixed(1)}" text-anchor="middle">${n}</text><text class="ring-sub" x="${c}" y="${(c + 16).toFixed(1)}" text-anchor="middle">pending</text>`;
   return `<svg class="ring-svg" width="${sz}" height="${sz}" viewBox="0 0 ${sz} ${sz}" data-status="${st}" aria-hidden="true">${paths}${center}</svg>`;
 }
 
@@ -156,8 +157,12 @@ export function waffleRowsHtml(platforms, { cell = 7, gap = 2, testPrefix = "waf
     const ok = isMeasured(p.suitesPassed);
     const st = ok ? normalizeStatus(p.status) : "pending";
     const aria = ok ? `${p.name}. ${p.suitesPassed} of ${p.suitesTotal} Tests/RunCMake suites pass.` : `${p.name}. ${p.suitesTotal} Tests/RunCMake suites, pending.`;
-    const foot = ok ? `${formatNumber(p.suitesPassed)} of ${formatNumber(p.suitesTotal)} suites pass` : `${formatNumber(p.suitesTotal)} suites`;
-    return `<figure class="waffle-row" aria-label="${escapeHtml(aria)}" data-status="${st}" data-test="${escapeHtml(testPrefix)}-${escapeHtml(p.id)}"><div class="waffle-head"><div class="waffle-os"><span class="waffle-name">${escapeHtml(p.name)}</span><span class="waffle-tc">${escapeHtml(p.toolchain)}</span></div>${statusHtml(st)}</div>${waffle({ passed: p.suitesPassed, total: p.suitesTotal, cols: 53, rows: 7, status: st, cell, gap })}<div class="waffle-foot"><span>${escapeHtml(foot)}</span><span>One square per suite.</span></div></figure>`;
+    const visual = ok
+      ? waffle({ passed: p.suitesPassed, total: p.suitesTotal, cols: 53, rows: 7, status: st, cell, gap })
+      : '<div class="bar-track waffle-pending-bar is-pending" data-loop data-status="pending" aria-hidden="true"></div>';
+    const footLeft = ok ? `${formatNumber(p.suitesPassed)} of ${formatNumber(p.suitesTotal)} suites pass` : `${formatNumber(p.suitesTotal)} OS-applicable suites`;
+    const footRight = ok ? "One square per suite." : "v0.1.0 release verification run";
+    return `<figure class="waffle-row${ok ? "" : " is-pending-row"}" aria-label="${escapeHtml(aria)}" data-status="${st}" data-test="${escapeHtml(testPrefix)}-${escapeHtml(p.id)}"><div class="waffle-head"><div class="waffle-os"><span class="waffle-name">${escapeHtml(p.name)}</span><span class="waffle-tc">${escapeHtml(p.toolchain)}</span></div>${statusHtml(st)}</div>${visual}<div class="waffle-foot"><span>${escapeHtml(footLeft)}</span><span>${escapeHtml(footRight)}</span></div></figure>`;
   }).join("");
 }
 

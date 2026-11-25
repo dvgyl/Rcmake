@@ -6,8 +6,8 @@
   <title>Compatibility · rcmake</title>
   <meta name="description" content="rcmake compared with CMake 4.5.1 across Tests/RunCMake on three operating systems, large projects, a blind holdout, vcpkg ports, and speed.">
   <link rel="canonical" href="https://dvgyl.github.io/rcmake/dashboard.html">
-  <meta property="og:title" content="rcmake">
-  <meta property="og:description" content="Drop-in CMake 4.5.1 in safe Rust.">
+  <meta property="og:title" content="Compatibility · rcmake">
+  <meta property="og:description" content="rcmake compared with CMake 4.5.1 across Tests/RunCMake on three operating systems, large projects, a blind holdout, vcpkg ports, and speed.">
   <meta property="og:type" content="website">
   <meta property="og:url" content="https://dvgyl.github.io/rcmake/dashboard.html">
   <meta property="og:image" content="https://dvgyl.github.io/rcmake/assets/og-card.png">
@@ -24,6 +24,7 @@
   </script>
 </head>
 <body>
+  <a class="skip-link" href="#main-content">Skip to content</a>
   <svg hidden class="icon-sprite" aria-hidden="true">
     <symbol id="i-check" viewBox="0 0 20 20"><path d="M4.5 10.5l3.5 3.5 7.5-8"/></symbol>
     <symbol id="i-cross" viewBox="0 0 20 20"><path d="M6 6l8 8M14 6l-8 8"/></symbol>
@@ -77,7 +78,7 @@
     </div>
   </header>
 
-  <main class="container">
+  <main id="main-content" class="container">
     <div class="report-layout">
       <aside class="rail" id="report-rail" aria-label="Report sections" data-test="report-rail"></aside>
       <div class="report-main">
@@ -85,11 +86,9 @@
           <h1>Compatibility report</h1>
           <div class="report-meta">
             <span id="report-meta">commit pending · CMake 4.5.1 · not yet generated</span>
-            <span>·</span>
-            <a href="./data/latest.json">latest.json<svg class="i" aria-hidden="true"><use href="#i-external"/></svg></a>
+            <a class="report-json-link" href="./data/latest.json"><svg class="i" aria-hidden="true"><use href="#i-file"/></svg><span>latest.json</span></a>
           </div>
           <p class="report-note" id="report-note"></p>
-          <div class="report-pending" id="report-pending" hidden>Pending values fill in after the frozen release run.</div>
         </header>
         <nav class="rail-mobile" id="report-rail-mobile" aria-label="Report sections"></nav>
         <div id="report" data-test="report-body" style="min-height: 1200px;"></div>
@@ -100,11 +99,12 @@
   <footer class="footer">
     <div class="container footer-inner">
       <div class="footer-copy">
-        <span>rcmake · MIT OR Apache-2.0 · Bundles CMake 4.5.1 Modules/ and Templates/ under BSD-3-Clause.</span>
+        <span>rcmake · MIT OR Apache-2.0 · Bundles CMake 4.5.1 Modules/, Templates/, and Help/ under BSD-3-Clause.</span>
         <span>rcmake is an independent project and is not affiliated with Kitware. CMake is a trademark of Kitware, Inc.</span>
       </div>
       <nav class="footer-nav" aria-label="Footer">
         <a href="https://github.com/dvgyl/rcmake">GitHub</a>
+        <a href="https://github.com/dvgyl/rcmake/tree/main/docs">Docs</a>
         <a href="./index.html">Overview</a>
         <a href="./playground.html">Playground</a>
       </nav>

@@ -11,9 +11,16 @@ const RACE_MODES = {
   cold: { cmd: '<span class="term-prompt">$ </span>rm -rf build &amp;&amp; cmake -S . -B build -G Ninja', key: "coldConfigureSpeedup", kind: "ratio" }
 };
 
-const TRANSCRIPT = [
+const TRANSCRIPT_FULL = [
   "-- The CXX compiler identification is AppleClang",
   "-- Detecting CXX compiler ABI info - done",
+  "-- Configuring done",
+  "-- Generating done",
+  "-- Build files have been written to: build"
+];
+
+const TRANSCRIPT_LEAF = [
+  "-- Re-running configure after editing src/net/CMakeLists.txt",
   "-- Configuring done",
   "-- Generating done",
   "-- Build files have been written to: build"
@@ -59,7 +66,9 @@ function initRace(doc, motion) {
   let timer = null;
 
   const drawLines = (win) => {
-    const mk = (w) => TRANSCRIPT.map((l, i) => `<li style="--line-idx:${i}">${escapeHtml(l)}${w && i === 4 ? '<span class="race-cursor" aria-hidden="true"></span>' : ""}</li>`).join("");
+    const lines = mode === "leaf" ? TRANSCRIPT_LEAF : TRANSCRIPT_FULL;
+    const lastIdx = lines.length - 1;
+    const mk = (w) => lines.map((l, i) => `<li style="--line-idx:${i}">${escapeHtml(l)}${w && i === lastIdx ? '<span class="race-cursor" aria-hidden="true"></span>' : ""}</li>`).join("");
     cmLines.innerHTML = mk(win === "cmake");
     rcLines.innerHTML = mk(win === "rcmake");
   };
@@ -74,7 +83,7 @@ function initRace(doc, motion) {
       cmBar.dataset.status = rcBar.dataset.status = "pending";
       cmBar.innerHTML = '<div class="bar-track is-pending" data-loop></div><div class="race-bar-meta"><span class="dim">cmake 4.5.1</span><span class="dim"><span data-value></span>pending</span></div>';
       rcBar.innerHTML = '<div class="bar-track is-pending" data-loop></div><div class="race-bar-meta"><span class="muted">rcmake</span><span class="dim"><span data-value></span>pending</span></div>';
-      caption.textContent = "Timings appear after the frozen release run.";
+      caption.textContent = "Timings appear after the v0.1.0 release verification run.";
       motion.scan(widget);
       return;
     }
@@ -105,7 +114,7 @@ function initRace(doc, motion) {
 
   initRovingGroup(modeTabs, "[data-race-mode]", (b) => {
     mode = b.dataset.raceMode;
-    modeTabs.querySelectorAll("[data-race-mode]").forEach((x) => x.setAttribute("aria-selected", String(x.dataset.raceMode === mode)));
+    modeTabs.querySelectorAll("[data-race-mode]").forEach((x) => x.setAttribute("aria-pressed", String(x.dataset.raceMode === mode)));
     play();
   });
   replayBtn?.addEventListener("click", play);
@@ -175,7 +184,7 @@ function initCompareAndLangs(doc) {
   const rows = Array.from(doc.querySelectorAll("#cmp-body tr[data-group]"));
   initRovingGroup(filter, "[data-cmp-group]", (btn) => {
     const grp = btn.dataset.cmpGroup;
-    filter.querySelectorAll("[data-cmp-group]").forEach((b) => b.setAttribute("aria-selected", String(b.dataset.cmpGroup === grp)));
+    filter.querySelectorAll("[data-cmp-group]").forEach((b) => b.setAttribute("aria-pressed", String(b.dataset.cmpGroup === grp)));
     rows.forEach((row) => {
       const show = grp === "all" || row.dataset.group === grp;
       row.classList.toggle("is-hidden", !show);

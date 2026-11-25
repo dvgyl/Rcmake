@@ -3,11 +3,11 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>rcmake</title>
+  <title>rcmake: drop-in CMake 4.5.1 in safe Rust</title>
   <meta name="description" content="Drop-in CMake 4.5.1 in safe Rust. One binary runs as cmake, ctest, and cpack.">
   <link rel="canonical" href="https://dvgyl.github.io/rcmake/">
-  <meta property="og:title" content="rcmake">
-  <meta property="og:description" content="Drop-in CMake 4.5.1 in safe Rust.">
+  <meta property="og:title" content="rcmake: drop-in CMake 4.5.1 in safe Rust">
+  <meta property="og:description" content="Drop-in CMake 4.5.1 in safe Rust. One binary runs as cmake, ctest, and cpack.">
   <meta property="og:type" content="website">
   <meta property="og:url" content="https://dvgyl.github.io/rcmake/">
   <meta property="og:image" content="https://dvgyl.github.io/rcmake/assets/og-card.png">
@@ -24,6 +24,7 @@
   </script>
 </head>
 <body>
+  <a class="skip-link" href="#main-content">Skip to content</a>
   <svg hidden class="icon-sprite" aria-hidden="true">
     <symbol id="i-check" viewBox="0 0 20 20"><path d="M4.5 10.5l3.5 3.5 7.5-8"/></symbol>
     <symbol id="i-cross" viewBox="0 0 20 20"><path d="M6 6l8 8M14 6l-8 8"/></symbol>
@@ -77,19 +78,24 @@
     </div>
   </header>
 
-  <main>
+  <main id="main-content">
     <section class="hero-wrap dot-surface">
       <div class="container">
         <div class="hero-top">
           <div class="hero-left">
-            <svg class="hero-mark" viewBox="0 0 128 128" width="52" height="52" aria-hidden="true">
-              <polygon class="tri-r" points="64,8 20.70,33 107.30,33"/>
-              <polygon class="tri-g" points="15.50,42 15.50,92 58.80,117"/>
-              <polygon class="tri-b" points="112.50,42 112.50,92 69.20,117"/>
-            </svg>
             <div class="hero-copy">
               <h1>Drop-in CMake&nbsp;4.5.1 in safe&nbsp;Rust.</h1>
               <p class="hero-sub">One binary runs as <code>cmake</code>, <code>ctest</code>, and <code>cpack</code>. Your <code>CMakeLists.txt</code> files stay the same.</p>
+              <div class="hero-actions">
+                <a class="ctrl-btn primary hero-cta" href="./playground.html" data-test="hero-try-cta">
+                  <svg class="i" aria-hidden="true"><use href="#i-play"/></svg>
+                  <span>Try in browser</span>
+                </a>
+                <a class="hero-link" href="./playground.html?tab=explain" data-test="hero-explain-cta">
+                  <span>Inspect with explain</span>
+                  <svg class="i" aria-hidden="true"><use href="#i-arrow-right"/></svg>
+                </a>
+              </div>
             </div>
           </div>
 
@@ -110,13 +116,11 @@
                 <pre class="term-panel" id="panel-install" role="tabpanel" aria-labelledby="tab-install"><span class="term-prompt">$ </span><span data-line>git clone https://github.com/dvgyl/rcmake</span>
 <span class="term-prompt">$ </span><span data-line>rcmake/scripts/install.sh</span></pre>
                 <pre class="term-panel" id="panel-source" role="tabpanel" aria-labelledby="tab-source" hidden><span class="term-prompt">$ </span><span data-line>git clone https://github.com/dvgyl/rcmake</span>
-<span class="term-prompt">$ </span><span data-line>cd rcmake &amp;&amp; cargo build --release</span>
-<span class="term-prompt">$ </span><span data-line>./target/release/rcmake --version</span></pre>
+<span class="term-prompt">$ </span><span data-line>cd rcmake &amp;&amp; RCMAKE_STAGE_PROFILE=release scripts/stage.sh</span>
+<span class="term-prompt">$ </span><span data-line>./target/stage/bin/rcmake --version</span></pre>
                 <pre class="term-panel" id="panel-alias" role="tabpanel" aria-labelledby="tab-alias" hidden><span class="term-prompt">$ </span><span data-line>rcmake/scripts/install.sh --alias-cmake</span>
-<span class="term-prompt">$ </span><span data-line>ls -l ~/.local/bin</span>
-<span class="term-out">cmake -&gt; rcmake</span>
-<span class="term-out">ctest -&gt; rcmake</span>
-<span class="term-out">cpack -&gt; rcmake</span></pre>
+<span class="term-prompt">$ </span><span data-line>export PATH="$HOME/.local/bin:$PATH"</span>
+<span class="term-out"># symlinks cmake, ctest, cpack -> rcmake; keep ~/.local/bin first on PATH</span></pre>
               </div>
             </div>
           </div>
@@ -126,16 +130,16 @@
           <figure class="race" id="race-widget" data-animate data-test="race-widget" aria-label="Same command, two binaries. Configure comparison between CMake 4.5.1 and rcmake.">
             <div class="race-head">
               <span class="race-title"><svg class="i" aria-hidden="true"><use href="#i-parity"/></svg>Same command, two binaries</span>
-              <div class="seg" role="tablist" aria-label="Comparison modes" id="race-modes" data-test="race-modes">
-                <button type="button" role="tab" aria-selected="true" data-race-mode="warm">Warm configure</button>
-                <button type="button" role="tab" aria-selected="false" data-race-mode="leaf">Leaf edit</button>
-                <button type="button" role="tab" aria-selected="false" data-race-mode="cold">Cold, 500 targets</button>
+              <div class="seg" role="group" aria-label="Comparison modes" id="race-modes" data-test="race-modes">
+                <button type="button" aria-pressed="true" data-race-mode="warm">Warm configure</button>
+                <button type="button" aria-pressed="false" data-race-mode="leaf">Leaf edit</button>
+                <button type="button" aria-pressed="false" data-race-mode="cold">Cold, 500 targets</button>
               </div>
             </div>
             <div class="race-cmd" id="race-cmd" data-test="race-cmd"><span class="term-prompt">$ </span>cmake -S . -B build -G Ninja</div>
             <div class="race-lanes">
               <div class="race-lane" data-test="race-lane-cmake">
-                <div class="race-lane-head"><span>cmake 4.5.1</span><span class="dim" id="race-cmake-tag"></span></div>
+                <div class="race-lane-head"><span>cmake 4.5.1</span><span class="dim" id="race-cmake-tag">reference</span></div>
                 <ol class="race-lines" id="race-lines-cmake">
                   <li style="--line-idx:0">-- The CXX compiler identification is AppleClang</li>
                   <li style="--line-idx:1">-- Detecting CXX compiler ABI info - done</li>
@@ -149,7 +153,7 @@
                 </div>
               </div>
               <div class="race-lane" data-test="race-lane-rcmake">
-                <div class="race-lane-head"><span class="lane-rcmake">rcmake</span><span class="dim" id="race-rcmake-tag"></span></div>
+                <div class="race-lane-head"><span class="lane-rcmake">rcmake</span><span class="dim" id="race-rcmake-tag">identical output</span></div>
                 <ol class="race-lines" id="race-lines-rcmake">
                   <li style="--line-idx:0">-- The CXX compiler identification is AppleClang</li>
                   <li style="--line-idx:1">-- Detecting CXX compiler ABI info - done</li>
@@ -164,7 +168,7 @@
               </div>
             </div>
             <div class="race-foot">
-              <span id="race-caption" data-test="race-caption">Timings appear after the frozen release run.</span>
+              <span id="race-caption" data-test="race-caption">Timings appear after the v0.1.0 release verification run.</span>
               <button type="button" class="ctrl-btn" id="race-replay" aria-label="Replay comparison" data-test="race-replay">
                 <svg class="i" aria-hidden="true"><use href="#i-replay"/></svg>
                 <span>Replay</span>
@@ -183,12 +187,12 @@
       </div>
       <div class="instrument-grid">
         <div class="panel waffle-panel" id="waffle-panel" data-animate data-test="runcmake-waffles">
-          <div class="waffle-row" style="min-height: 122px;"></div>
-          <div class="waffle-row" style="min-height: 122px;"></div>
-          <div class="waffle-row" style="min-height: 122px;"></div>
+          <div class="waffle-row is-pending-row"></div>
+          <div class="waffle-row is-pending-row"></div>
+          <div class="waffle-row is-pending-row"></div>
         </div>
         <div class="panel gauge-shell">
-          <div class="gauge-grid" id="gauge-grid" data-animate data-test="soundness-gauges" style="min-height: 320px;"></div>
+          <div class="gauge-grid" id="gauge-grid" data-animate data-test="soundness-gauges" style="min-height: 296px;"></div>
           <a class="section-link-bar" href="./dashboard.html" data-test="full-report-link">
             <span>Full compatibility report</span>
             <svg class="i" aria-hidden="true"><use href="#i-arrow-right"/></svg>
@@ -202,18 +206,18 @@
         <h2>Speed</h2>
         <p class="band-lead">Each bar shows configure time relative to CMake 4.5.1. Shorter is faster.</p>
       </div>
-      <div class="panel speed-panel" id="speed-panel" data-animate data-test="speed-chart" style="min-height: 274px;"></div>
+      <div class="panel speed-panel" id="speed-panel" data-animate data-test="speed-chart" style="min-height: 254px;"></div>
     </section>
 
     <section class="container band" id="compare">
       <div class="cmp-head">
         <h2>rcmake and CMake 4.5.1</h2>
-        <div class="seg" role="tablist" aria-label="Filter comparison rows" id="cmp-filter" data-test="cmp-filter">
-          <button type="button" role="tab" aria-selected="true" data-cmp-group="all">All</button>
-          <button type="button" role="tab" aria-selected="false" data-cmp-group="same">Same</button>
-          <button type="button" role="tab" aria-selected="false" data-cmp-group="different">Different</button>
-          <button type="button" role="tab" aria-selected="false" data-cmp-group="rcmake-only">rcmake only</button>
-          <button type="button" role="tab" aria-selected="false" data-cmp-group="not-in-rcmake">Not in rcmake</button>
+        <div class="seg" role="group" aria-label="Filter comparison rows" id="cmp-filter" data-test="cmp-filter">
+          <button type="button" aria-pressed="true" data-cmp-group="all">All</button>
+          <button type="button" aria-pressed="false" data-cmp-group="same">Same</button>
+          <button type="button" aria-pressed="false" data-cmp-group="different">Different</button>
+          <button type="button" aria-pressed="false" data-cmp-group="rcmake-only">rcmake only</button>
+          <button type="button" aria-pressed="false" data-cmp-group="not-in-rcmake">Not in rcmake</button>
         </div>
       </div>
       <div class="table-panel" data-animate data-test="cmp-table">
@@ -247,7 +251,7 @@
               <td class="cmp-cell st-pass"><svg class="i" aria-hidden="true"><use href="#i-check"/></svg><span class="visually-hidden">yes</span></td>
             </tr>
             <tr class="cmp-row" data-group="same" style="--row-i:4">
-              <td>Policies <code data-policy-range>CMP0066-CMP0220+</code></td>
+              <td>Policies <code data-policy-range>CMP0066-CMP0226</code></td>
               <td class="cmp-cell st-pass"><svg class="i" aria-hidden="true"><use href="#i-check"/></svg><span class="visually-hidden">yes</span></td>
               <td class="cmp-cell st-pass"><svg class="i" aria-hidden="true"><use href="#i-check"/></svg><span class="visually-hidden">yes</span></td>
             </tr>
@@ -345,7 +349,7 @@
     <section class="container band" id="pipeline">
       <div class="band-head">
         <h2>Inside a configure run</h2>
-        <p class="band-lead">Select a stage to see its crates. Every crate forbids unsafe code.</p>
+        <p class="band-lead">Select a stage to see its crates. All 35 crates forbid unsafe code.</p>
       </div>
       <div class="pipe-wrap" id="pipeline-widget" data-test="pipeline-widget" aria-describedby="pipeline-fallback">
         <div class="pipe-controls">
@@ -390,9 +394,9 @@
               <th>Generator</th>
               <th>Files it writes</th>
               <th>Details</th>
-              <th>macOS</th>
-              <th>Linux</th>
-              <th>Windows</th>
+              <th class="os-cell">macOS</th>
+              <th class="os-cell">Linux</th>
+              <th class="os-cell">Windows</th>
             </tr>
           </thead>
           <tbody>
@@ -400,41 +404,41 @@
               <td class="nowrap"><span class="cmp-feat"><svg class="i" aria-hidden="true"><use href="#i-graph"/></svg><code>Ninja</code></span></td>
               <td><div class="gen-files"><span class="token-inline"><svg class="i" aria-hidden="true"><use href="#i-file"/></svg>build.ninja</span></div></td>
               <td class="muted">Response files, depfiles, and dyndep for C++20 modules</td>
-              <td><span class="os-flag is-on">macOS<span class="visually-hidden"> supported</span></span></td>
-              <td><span class="os-flag is-on">Linux<span class="visually-hidden"> supported</span></span></td>
-              <td><span class="os-flag is-on">Windows<span class="visually-hidden"> supported</span></span></td>
+              <td class="os-cell st-pass"><svg class="i" aria-hidden="true"><use href="#i-check"/></svg><span class="visually-hidden">macOS supported</span></td>
+              <td class="os-cell st-pass"><svg class="i" aria-hidden="true"><use href="#i-check"/></svg><span class="visually-hidden">Linux supported</span></td>
+              <td class="os-cell st-pass"><svg class="i" aria-hidden="true"><use href="#i-check"/></svg><span class="visually-hidden">Windows supported</span></td>
             </tr>
             <tr>
               <td class="nowrap"><span class="cmp-feat"><svg class="i" aria-hidden="true"><use href="#i-multi"/></svg><code>Ninja Multi-Config</code></span></td>
-              <td><div class="gen-files"><span class="token-inline"><svg class="i" aria-hidden="true"><use href="#i-file"/></svg>build-&lt;Config&gt;.ninja</span><span class="token-inline"><svg class="i" aria-hidden="true"><use href="#i-file"/></svg>compile_commands.json</span></div></td>
+              <td><div class="gen-files"><span class="token-inline"><svg class="i" aria-hidden="true"><use href="#i-file"/></svg>build.ninja</span><span class="token-inline"><svg class="i" aria-hidden="true"><use href="#i-file"/></svg>build-&lt;Config&gt;.ninja</span></div></td>
               <td class="muted">One file per configuration, CMAKE_INTDIR rules</td>
-              <td><span class="os-flag is-on">macOS<span class="visually-hidden"> supported</span></span></td>
-              <td><span class="os-flag is-on">Linux<span class="visually-hidden"> supported</span></span></td>
-              <td><span class="os-flag is-on">Windows<span class="visually-hidden"> supported</span></span></td>
+              <td class="os-cell st-pass"><svg class="i" aria-hidden="true"><use href="#i-check"/></svg><span class="visually-hidden">macOS supported</span></td>
+              <td class="os-cell st-pass"><svg class="i" aria-hidden="true"><use href="#i-check"/></svg><span class="visually-hidden">Linux supported</span></td>
+              <td class="os-cell st-pass"><svg class="i" aria-hidden="true"><use href="#i-check"/></svg><span class="visually-hidden">Windows supported</span></td>
             </tr>
             <tr>
               <td class="nowrap"><span class="cmp-feat"><svg class="i" aria-hidden="true"><use href="#i-layers"/></svg><code>Unix Makefiles</code></span></td>
               <td><div class="gen-files"><span class="token-inline"><svg class="i" aria-hidden="true"><use href="#i-file"/></svg>Makefile</span></div></td>
               <td class="muted">Recursive Makefiles, header scanning, --output-sync</td>
-              <td><span class="os-flag is-on">macOS<span class="visually-hidden"> supported</span></span></td>
-              <td><span class="os-flag is-on">Linux<span class="visually-hidden"> supported</span></span></td>
-              <td><span class="os-flag is-off">Windows<span class="visually-hidden"> not applicable</span></span></td>
+              <td class="os-cell st-pass"><svg class="i" aria-hidden="true"><use href="#i-check"/></svg><span class="visually-hidden">macOS supported</span></td>
+              <td class="os-cell st-pass"><svg class="i" aria-hidden="true"><use href="#i-check"/></svg><span class="visually-hidden">Linux supported</span></td>
+              <td class="os-cell dim"><svg class="i" aria-hidden="true"><use href="#i-gap"/></svg><span class="visually-hidden">Windows not applicable</span></td>
             </tr>
             <tr>
               <td class="nowrap"><span class="cmp-feat"><svg class="i" aria-hidden="true"><use href="#i-bundle"/></svg><code>Xcode</code></span></td>
               <td><div class="gen-files"><span class="token-inline"><svg class="i" aria-hidden="true"><use href="#i-file"/></svg>project.pbxproj</span></div></td>
               <td class="muted">Schemes and XCFramework rules</td>
-              <td><span class="os-flag is-on">macOS<span class="visually-hidden"> supported</span></span></td>
-              <td><span class="os-flag is-off">Linux<span class="visually-hidden"> not applicable</span></span></td>
-              <td><span class="os-flag is-off">Windows<span class="visually-hidden"> not applicable</span></span></td>
+              <td class="os-cell st-pass"><svg class="i" aria-hidden="true"><use href="#i-check"/></svg><span class="visually-hidden">macOS supported</span></td>
+              <td class="os-cell dim"><svg class="i" aria-hidden="true"><use href="#i-gap"/></svg><span class="visually-hidden">Linux not applicable</span></td>
+              <td class="os-cell dim"><svg class="i" aria-hidden="true"><use href="#i-gap"/></svg><span class="visually-hidden">Windows not applicable</span></td>
             </tr>
             <tr>
-              <td class="nowrap"><span class="cmp-feat"><svg class="i" aria-hidden="true"><use href="#i-solution"/></svg><span><code>Visual Studio 17 2022</code><br><code>Visual Studio 18 2026</code></span></span></td>
+              <td class="nowrap"><span class="cmp-feat"><svg class="i" aria-hidden="true"><use href="#i-solution"/></svg><span class="gen-stack"><code>Visual Studio 17 2022</code><code>Visual Studio 18 2026</code></span></span></td>
               <td><div class="gen-files"><span class="token-inline"><svg class="i" aria-hidden="true"><use href="#i-file"/></svg>.sln</span><span class="token-inline"><svg class="i" aria-hidden="true"><use href="#i-file"/></svg>.slnx</span><span class="token-inline"><svg class="i" aria-hidden="true"><use href="#i-file"/></svg>.vcxproj</span></div></td>
               <td class="muted">Filter files and stable GUIDs</td>
-              <td><span class="os-flag is-off">macOS<span class="visually-hidden"> not applicable</span></span></td>
-              <td><span class="os-flag is-off">Linux<span class="visually-hidden"> not applicable</span></span></td>
-              <td><span class="os-flag is-on">Windows<span class="visually-hidden"> supported</span></span></td>
+              <td class="os-cell dim"><svg class="i" aria-hidden="true"><use href="#i-gap"/></svg><span class="visually-hidden">macOS not applicable</span></td>
+              <td class="os-cell dim"><svg class="i" aria-hidden="true"><use href="#i-gap"/></svg><span class="visually-hidden">Linux not applicable</span></td>
+              <td class="os-cell st-pass"><svg class="i" aria-hidden="true"><use href="#i-check"/></svg><span class="visually-hidden">Windows supported</span></td>
             </tr>
           </tbody>
         </table>
@@ -447,34 +451,34 @@
       </div>
       <div class="panel lang-panel">
         <div class="lang-grid" id="lang-grid" data-test="lang-grid" role="group" aria-label="Supported languages">
-          <button type="button" class="lang-chip" aria-pressed="true" data-lang-detail="C90, C99, C11, C17, C23"><span class="lang-badge">c</span>C</button>
-          <button type="button" class="lang-chip" aria-pressed="false" data-lang-detail="C++20 and C++23 named modules, CXX_MODULES file sets"><span class="lang-badge">c++</span>C++</button>
-          <button type="button" class="lang-chip" aria-pressed="false" data-lang-detail="Apple frameworks and Mach-O RPATH"><span class="lang-badge">.m</span>Objective-C</button>
-          <button type="button" class="lang-chip" aria-pressed="false" data-lang-detail="Apple frameworks and Mach-O RPATH"><span class="lang-badge">.mm</span>Objective-C++</button>
-          <button type="button" class="lang-chip" aria-pressed="false" data-lang-detail="Scans .mod files and orders compilation by module"><span class="lang-badge">f90</span>Fortran</button>
-          <button type="button" class="lang-chip" aria-pressed="false" data-lang-detail="Target architectures, separable compilation, device linking"><span class="lang-badge">cu</span>CUDA</button>
-          <button type="button" class="lang-chip" aria-pressed="false" data-lang-detail="Target architectures, separable compilation, device linking"><span class="lang-badge">hip</span>HIP</button>
-          <button type="button" class="lang-chip" aria-pressed="false" data-lang-detail="Assembler languages"><span class="lang-badge">asm</span>ASM, MASM, NASM</button>
-          <button type="button" class="lang-chip" aria-pressed="false" data-lang-detail="Windows resource files"><span class="lang-badge">rc</span>RC</button>
-          <button type="button" class="lang-chip" aria-pressed="false" data-lang-detail="AUTOMOC, AUTOUIC, AUTORCC"><span class="lang-badge">moc</span>Qt</button>
-          <button type="button" class="lang-chip" aria-pressed="false" data-lang-partial="true" data-lang-detail="Parsed. Builds are not yet verified."><span class="lang-badge">swift</span>Swift</button>
+          <button type="button" class="lang-chip" aria-pressed="true" data-lang-detail="C90, C99, C11, C17, C23"><span class="lang-badge">c</span><span>C</span></button>
+          <button type="button" class="lang-chip" aria-pressed="false" data-lang-detail="C++20 and C++23 named modules, CXX_MODULES file sets"><span class="lang-badge">c++</span><span>C++</span></button>
+          <button type="button" class="lang-chip" aria-pressed="false" data-lang-detail="Apple frameworks and Mach-O RPATH"><span class="lang-badge">.m</span><span>Objective-C</span></button>
+          <button type="button" class="lang-chip" aria-pressed="false" data-lang-detail="Apple frameworks and Mach-O RPATH"><span class="lang-badge">.mm</span><span>Objective-C++</span></button>
+          <button type="button" class="lang-chip" aria-pressed="false" data-lang-detail="Scans .mod files and orders compilation by module"><span class="lang-badge">f90</span><span>Fortran</span></button>
+          <button type="button" class="lang-chip" aria-pressed="false" data-lang-detail="Target architectures, separable compilation, device linking"><span class="lang-badge">cu</span><span>CUDA</span></button>
+          <button type="button" class="lang-chip" aria-pressed="false" data-lang-detail="Target architectures, separable compilation, device linking"><span class="lang-badge">hip</span><span>HIP</span></button>
+          <button type="button" class="lang-chip" aria-pressed="false" data-lang-detail="Assembler languages"><span class="lang-badge">asm</span><span>ASM, MASM, NASM</span></button>
+          <button type="button" class="lang-chip" aria-pressed="false" data-lang-detail="Windows resource files"><span class="lang-badge">rc</span><span>RC</span></button>
+          <button type="button" class="lang-chip" aria-pressed="false" data-lang-detail="AUTOMOC, AUTOUIC, AUTORCC"><span class="lang-badge">moc</span><span>Qt</span></button>
+          <button type="button" class="lang-chip" aria-pressed="false" data-lang-partial="true" data-lang-detail="Parsed. Builds are not yet verified."><span class="lang-badge">swift</span><span>Swift</span><svg class="i st-partial" aria-hidden="true"><use href="#i-differs"/></svg><span class="visually-hidden">partial</span></button>
         </div>
         <div class="lang-detail" id="lang-detail" data-test="lang-detail" aria-live="polite">C90, C99, C11, C17, C23</div>
-        <div class="tool-chips" data-test="tool-chips">
-          <span class="token-inline">cmake -P</span>
-          <span class="token-inline">cmake -E</span>
-          <span class="token-inline">--build</span>
-          <span class="token-inline">--install</span>
-          <span class="token-inline">--workflow</span>
-          <span class="token-inline">ctest</span>
-          <span class="token-inline">cpack</span>
-          <span class="token-inline">Presets v13</span>
-          <span class="token-inline">File API v2.12</span>
-          <span class="token-inline">SARIF</span>
-          <span class="token-inline">CPS</span>
-          <span class="token-inline">SPDX SBOM</span>
-          <span class="token-inline">Instrumentation API</span>
-          <span class="token-inline" data-policy-range>CMP0066-CMP0220+</span>
+        <div class="tool-list" data-test="tool-chips">
+          <span>cmake -P</span><span class="dim" aria-hidden="true">·</span>
+          <span>cmake -E</span><span class="dim" aria-hidden="true">·</span>
+          <span>--build</span><span class="dim" aria-hidden="true">·</span>
+          <span>--install</span><span class="dim" aria-hidden="true">·</span>
+          <span>--workflow</span><span class="dim" aria-hidden="true">·</span>
+          <span>ctest</span><span class="dim" aria-hidden="true">·</span>
+          <span>cpack</span><span class="dim" aria-hidden="true">·</span>
+          <span>Presets v13</span><span class="dim" aria-hidden="true">·</span>
+          <span>File API v2.12</span><span class="dim" aria-hidden="true">·</span>
+          <span>SARIF</span><span class="dim" aria-hidden="true">·</span>
+          <span>CPS</span><span class="dim" aria-hidden="true">·</span>
+          <span>SPDX SBOM</span><span class="dim" aria-hidden="true">·</span>
+          <span>Instrumentation API</span><span class="dim" aria-hidden="true">·</span>
+          <span data-policy-range>CMP0066-CMP0226</span>
         </div>
       </div>
     </section>
@@ -483,11 +487,12 @@
   <footer class="footer">
     <div class="container footer-inner">
       <div class="footer-copy">
-        <span>rcmake · MIT OR Apache-2.0 · Bundles CMake 4.5.1 Modules/ and Templates/ under BSD-3-Clause.</span>
+        <span>rcmake · MIT OR Apache-2.0 · Bundles CMake 4.5.1 Modules/, Templates/, and Help/ under BSD-3-Clause.</span>
         <span>rcmake is an independent project and is not affiliated with Kitware. CMake is a trademark of Kitware, Inc.</span>
       </div>
       <nav class="footer-nav" aria-label="Footer">
         <a href="https://github.com/dvgyl/rcmake">GitHub</a>
+        <a href="https://github.com/dvgyl/rcmake/tree/main/docs">Docs</a>
         <a href="./dashboard.html">Compatibility</a>
         <a href="./playground.html">Playground</a>
       </nav>

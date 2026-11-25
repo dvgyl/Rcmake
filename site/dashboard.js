@@ -6,7 +6,7 @@ import { animateCountUp, createMotionController } from "./motion.js";
 
 export function renderSummary(data) {
   const body = overviewRows(data).map((r) => `<tr data-status="${r.status}"><td><a href="#${escapeHtml(r.id)}">${escapeHtml(r.check)}</a></td><td>${r.result ? `<span data-value>${escapeHtml(r.result)}</span>` : `<span class="dim"><span data-value></span>${escapeHtml(r.scope)}</span>`}</td><td class="inline-bar-cell">${inlineBar(r.ratio, r.status)}</td><td>${statusHtml(r.status)}</td></tr>`).join("");
-  return `<section id="summary" class="report-section" data-animate data-test="section-summary"><h2>Summary</h2><div class="table-panel"><table class="runner-table"><thead><tr><th>Check</th><th>Result</th><th></th><th>Status</th></tr></thead><tbody>${body}</tbody></table></div></section>`;
+  return `<section id="summary" class="report-section" data-animate data-test="section-summary"><h2>Summary</h2><div class="table-panel"><table class="runner-table"><thead><tr><th>Check</th><th>Result</th><th class="inline-bar-cell" aria-hidden="true"></th><th>Status</th></tr></thead><tbody>${body}</tbody></table></div></section>`;
 }
 
 export function renderRunCmake(track) {
@@ -33,7 +33,7 @@ export function projectRowHtml(p) {
 
 export function renderProjects(track) {
   const rows = (track?.projects || []).map(projectRowHtml).join("");
-  return `<section id="projects" class="report-section" data-test="section-projects"><h2>Large projects</h2><div class="filter-bar"><div class="seg" role="tablist" aria-label="Filter by tier" id="proj-tier" data-test="proj-tier"><button type="button" role="tab" aria-selected="true" data-tier-val="all">All</button><button type="button" role="tab" aria-selected="false" data-tier-val="standard">Standard</button><button type="button" role="tab" aria-selected="false" data-tier-val="large">Large</button></div><div class="seg" role="tablist" aria-label="Filter by status" id="proj-status" data-test="proj-status"><button type="button" role="tab" aria-selected="true" data-status-val="all">All</button><button type="button" role="tab" aria-selected="false" data-status-val="l1">L1 pass</button><button type="button" role="tab" aria-selected="false" data-status-val="l2">L2 pass</button><button type="button" role="tab" aria-selected="false" data-status-val="pending">Pending</button></div><input id="proj-search" class="search-input" type="search" placeholder="Filter projects" aria-label="Filter projects" data-test="proj-search"></div><div class="table-panel"><table class="bench-table" id="proj-table" data-test="proj-table"><thead><tr><th>Project</th><th>Version</th><th>Targets</th><th>L1</th><th>L2</th></tr></thead><tbody>${rows}<tr id="proj-empty" hidden><td colspan="5" class="dim">No projects match.</td></tr></tbody></table></div></section>`;
+  return `<section id="projects" class="report-section" data-test="section-projects"><h2>Large projects</h2><p class="section-lead">L1 checks configure output, cache, and stderr parity with CMake 4.5.1. L2 checks Ninja build-graph dry-run and File API parity.</p><div class="filter-bar"><div class="seg" role="group" aria-label="Filter by tier" id="proj-tier" data-test="proj-tier"><button type="button" aria-pressed="true" data-tier-val="all">All</button><button type="button" aria-pressed="false" data-tier-val="standard">Standard</button><button type="button" aria-pressed="false" data-tier-val="large">Large</button></div><div class="seg" role="group" aria-label="Filter by status" id="proj-status" data-test="proj-status"><button type="button" aria-pressed="true" data-status-val="all">All</button><button type="button" aria-pressed="false" data-status-val="l1">L1 pass</button><button type="button" aria-pressed="false" data-status-val="l2">L2 pass</button><button type="button" aria-pressed="false" data-status-val="pending">Pending</button></div><input id="proj-search" class="search-input" type="search" placeholder="Filter projects" aria-label="Filter projects" data-test="proj-search"></div><div class="table-panel"><table class="bench-table" id="proj-table" data-test="proj-table"><thead><tr><th>Project</th><th>Version</th><th>Targets</th><th>L1</th><th>L2</th></tr></thead><tbody>${rows}<tr id="proj-empty" hidden><td colspan="5" class="dim">No projects match.</td></tr></tbody></table></div></section>`;
 }
 
 export function renderHoldout(track) {
@@ -98,7 +98,8 @@ export function renderGiantsBench(giants) {
     const incP95 = isMeasured(s.incrementalLeafMaxP95Ms) ? ` (${formatNumber(s.incrementalLeafMaxP95Ms)} ms max p95)` : "";
     const incTxt = formatSpeed(s.incrementalLeafSpeedupGeomean) ? `${formatSpeed(s.incrementalLeafSpeedupGeomean)}\u00d7${incP95}` : (incP95 ? incP95.slice(2, -1) : "-");
     const scope = isMeasured(s.projectsPassed) && isMeasured(s.projectsTotal) ? `${formatNumber(s.projectsPassed)} / ${formatNumber(s.projectsTotal)} passed` : "";
-    summaryRow = `<tr class="cmp-group-note" data-status="${st}" data-test="dash-giants-summary"><td><span>Geomean</span>${scope ? `<span class="proj-repo">${escapeHtml(scope)}</span>` : ""}</td><td class="mono nowrap">${escapeHtml(fmtG(s.coldSpeedupGeomean))}</td><td class="mono nowrap">${escapeHtml(fmtG(s.warmProbeSpeedupGeomean))}</td><td class="mono nowrap">${escapeHtml(incTxt)}</td><td class="mono nowrap">${escapeHtml(formatRssPair(s.rcmakeMaxPeakRssMiB, s.cmakeMaxPeakRssMiB))}</td><td>${statusHtml(st)}</td></tr>`;
+    const metaSub = scope ? `${scope} \u00b7 geomean speedup, max p95 & RSS` : "geomean speedup, max p95 & RSS";
+    summaryRow = `<tr class="cmp-group-note" data-status="${st}" data-test="dash-giants-summary"><td><span>Summary</span><span class="proj-repo">${escapeHtml(metaSub)}</span></td><td class="mono nowrap">${escapeHtml(fmtG(s.coldSpeedupGeomean))}</td><td class="mono nowrap">${escapeHtml(fmtG(s.warmProbeSpeedupGeomean))}</td><td class="mono nowrap">${escapeHtml(incTxt)}</td><td class="mono nowrap">${escapeHtml(formatRssPair(s.rcmakeMaxPeakRssMiB, s.cmakeMaxPeakRssMiB))}</td><td>${statusHtml(st)}</td></tr>`;
   }
   return `<div class="table-panel" style="margin-top:16px" data-test="dash-giants-bench"><table class="bench-table"><thead><tr><th>Real-world project</th><th>Cold</th><th>Warm probe</th><th>Incremental leaf</th><th>Peak RSS (rcmake / CMake)</th><th>Status</th></tr></thead><tbody>${rows}${summaryRow}</tbody></table></div>`;
 }
@@ -153,7 +154,7 @@ function buildRail(doc, data) {
     ...Object.values(t.benchmarksAndGates?.benchmarks || {}),
     ...(giants && Array.isArray(giants.projects) && giants.projects.some((p) => normalizeStatus(p?.status) !== "pending") ? [giants] : [])
   ];
-  const fold = (arr) => arr.every((x) => x.status === "pass") ? "pass" : arr.some((x) => x.status === "fail") ? "fail" : arr.some((x) => x.status === "pass") ? "partial" : "pending";
+  const fold = (arr) => arr.every((x) => x.status === "pass") ? "pass" : arr.some((x) => x.status === "fail") ? "fail" : arr.some((x) => x.status === "pass" || x.status === "partial") ? "partial" : "pending";
   const items = [
     { id: "summary", label: "Summary", status: "pending" },
     { id: "runcmake", label: "Tests/RunCMake", status: t.runCmakeOs.status },
@@ -188,8 +189,8 @@ function wireProjectFilter(doc) {
   if (search) search.value = state.q;
 
   const apply = (writeHash = false) => {
-    tierEl.querySelectorAll("[data-tier-val]").forEach((b) => b.setAttribute("aria-selected", String(b.dataset.tierVal === state.tier)));
-    statEl.querySelectorAll("[data-status-val]").forEach((b) => b.setAttribute("aria-selected", String(b.dataset.statusVal === state.status)));
+    tierEl.querySelectorAll("[data-tier-val]").forEach((b) => b.setAttribute("aria-pressed", String(b.dataset.tierVal === state.tier)));
+    statEl.querySelectorAll("[data-status-val]").forEach((b) => b.setAttribute("aria-pressed", String(b.dataset.statusVal === state.status)));
     const q = state.q.trim().toLowerCase();
     let shown = 0;
     rows.forEach((row) => {
@@ -256,9 +257,9 @@ async function init(doc) {
   try {
     const data = await loadLatestData();
     doc.getElementById("report-meta").textContent = snapshotMeta(data);
-    doc.getElementById("report-note").textContent = cleanNote(data.statusNote);
-    const pendingEl = doc.getElementById("report-pending");
-    if (pendingEl) pendingEl.hidden = !overviewRows(data).some((r) => r.status === "pending");
+    const noteText = cleanNote(data.statusNote);
+    const hasPending = overviewRows(data).some((r) => r.status === "pending");
+    doc.getElementById("report-note").textContent = noteText || (hasPending ? "Pending values populate after the v0.1.0 release verification run." : "");
     root.innerHTML = renderReport(data);
     buildRail(doc, data);
     wireProjectFilter(doc);

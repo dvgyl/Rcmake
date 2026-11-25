@@ -1,4 +1,4 @@
-/* rcmake configure pipeline diagram and 34-crate map. MIT OR Apache-2.0. */
+/* rcmake configure pipeline diagram and 35-crate map. MIT OR Apache-2.0. */
 
 import { escapeHtml, initRovingGroup } from "./app.js";
 import { prefersReducedMotion } from "./motion.js";
@@ -7,20 +7,20 @@ export const PIPELINE_MODEL = {
   stages: [
     { id: "syntax", label: "syntax", colorVar: "var(--ch-r)", icon: "i-code", sentence: "Lexes and parses CMake language files.", crates: ["syntax"] },
     { id: "eval", label: "eval", colorVar: "var(--ch-r)", icon: "i-terminal", sentence: "Runs commands and tracks variables, policies, and generator expressions.", crates: ["eval", "commands", "expr", "genex", "model", "presets"] },
-    { id: "resolve", label: "resolve", colorVar: "var(--ch-g)", icon: "i-target", sentence: "Builds the target graph, usage requirements, and link order.", crates: ["resolve", "build", "cxxmodules", "fortran"] },
+    { id: "resolve", label: "resolve", colorVar: "var(--ch-g)", icon: "i-target", sentence: "Builds the target graph, usage requirements, and link order.", crates: ["resolve", "build", "cxxmodules", "fortran", "cps"] },
     { id: "gen", label: "gen", colorVar: "var(--ch-b)", icon: "i-graph", sentence: "Writes build.ninja, Makefiles, project.pbxproj, and .vcxproj files.", crates: ["gen-common", "gen-ninja", "gen-make", "gen-xcode", "gen-vs"] }
   ],
   outputs: ["build.ninja", "Makefile", "project.pbxproj", ".sln .vcxproj"],
   hosts: {
     native: { label: "NativeHost", sentence: "NativeHost reads the real disk, environment, processes, and clock.", chips: ["disk", "env", "processes", "clock"], crates: ["host"] },
-    pure: { label: "PureHost", sentence: "PureHost keeps files in memory and gives the same result every run. Tests, editors, and the wasm32 playground use it.", chips: ["in-memory files", "tests", "editors", "wasm32"], crates: ["host"] }
+    pure: { label: "PureHost", sentence: "PureHost keeps files in memory and gives the same result every run. Tests, editors, and the wasm32 playground use it.", chips: ["in-memory files", "tests", "editors", "wasm32"], crates: ["host", "wasm"] }
   },
   crateGroups: [
     { name: "Base", crates: ["base", "json", "diag", "host", "regex", "archive"] },
     { name: "Language", crates: ["syntax", "expr", "genex", "model", "eval", "commands", "presets"] },
-    { name: "Build", crates: ["resolve", "build", "cxxmodules", "fortran", "gen-common", "gen-ninja", "gen-make", "gen-xcode", "gen-vs"] },
-    { name: "Drivers", crates: ["cli", "api", "lsp", "ctest", "cpack", "tool-e", "store", "fetch", "instrument"] },
-    { name: "Verification", crates: ["cps", "harness", "fuzz"] }
+    { name: "Build", crates: ["resolve", "build", "cxxmodules", "fortran", "cps", "gen-common", "gen-ninja", "gen-make", "gen-xcode", "gen-vs"] },
+    { name: "Drivers", crates: ["cli", "api", "lsp", "wasm", "ctest", "cpack", "tool-e", "store", "fetch", "instrument"] },
+    { name: "Verification", crates: ["harness", "fuzz"] }
   ]
 };
 
@@ -38,18 +38,18 @@ export function renderPipeline(model = PIPELINE_MODEL, orientation = "horizontal
       { id: "syntax", y: 90, ch: "var(--ch-r)" }, { id: "eval", y: 170, ch: "var(--ch-r)" },
       { id: "resolve", y: 250, ch: "var(--ch-g)" }, { id: "gen", y: 330, ch: "var(--ch-b)" }
     ];
-    const outs = model.outputs.map((label, i) => ({ label, x: i % 2 ? 186 : 20, y: i < 2 ? 418 : 462 }));
+    const outs = model.outputs.map((label, i) => ({ label, y: 396 + i * 40 }));
     const edges = [
       edge("M 130 56 L 130 88", "var(--ch-r)", 0, -120, arrowD(130, 90)),
       edge("M 130 134 L 130 168", "var(--ch-r)", 150, -120, arrowD(130, 170)),
       edge("M 130 214 L 130 248", "var(--ch-r)", 300, -120, arrowD(130, 250)),
       edge("M 130 294 L 130 328", "var(--ch-g)", 450, -120, arrowD(130, 330)),
-      ...outs.map((o) => edge(`M 130 374 C 130 398, ${o.x + 76} 398, ${o.x + 76} ${o.y}`, "var(--ch-b)", 600, -120))
+      ...outs.map((o) => edge(`M 54 374 L 54 ${o.y + 7} Q 54 ${o.y + 15} 62 ${o.y + 15} L 86 ${o.y + 15}`, "var(--ch-b)", 600, -240, arrowR(88, o.y + 15)))
     ].join("");
     const taps = ns.map((n, i) => tap(`M 230 ${n.y + 22} L 272 ${n.y + 22}`, i)).join("");
     const boxes = ns.map((n) => `<g class="pipe-node-group${sel === n.id ? " is-selected" : ""}" data-pipe-stage="${n.id}" style="--node-ch:${n.ch}"><rect class="pipe-node-bg" x="30" y="${n.y}" width="200" height="44" rx="6"/><rect x="31" y="${n.y}" width="198" height="2.5" rx="1" fill="${n.ch}"/><text class="pipe-label" x="130" y="${n.y + 27}" text-anchor="middle">${escapeHtml(n.id)}</text></g>`).join("");
-    const outBoxes = outs.map((o) => `<g><rect class="pipe-node-bg" x="${o.x}" y="${o.y}" width="154" height="32" rx="5"/><rect x="${o.x + 1}" y="${o.y}" width="152" height="2" rx="1" fill="var(--ch-b)"/><text class="pipe-label-muted" x="${o.x + 77}" y="${o.y + 20}" text-anchor="middle">${escapeHtml(o.label)}</text></g>`).join("");
-    return `<svg class="pipe-svg" viewBox="0 0 360 512" role="img" aria-label="Configure pipeline from CMakeLists.txt through syntax, eval, resolve, and gen to build files over Host">${edges}${taps}<g><rect class="pipe-node-bg" x="30" y="12" width="200" height="44" rx="6"/><text class="pipe-label" x="130" y="39" text-anchor="middle">CMakeLists.txt</text></g>${boxes}${outBoxes}<g class="pipe-node-group${sel === "host" ? " is-selected" : ""}" data-pipe-stage="host" style="--node-ch:var(--ink)"><rect class="pipe-node-bg" x="272" y="90" width="68" height="284" rx="6"/><text class="pipe-label" x="306" y="220" text-anchor="middle" transform="rotate(-90 306 220)">${escapeHtml(host.label)}</text></g></svg>`;
+    const outBoxes = outs.map((o) => `<g><rect class="pipe-node-bg" x="88" y="${o.y}" width="204" height="30" rx="5"/><rect x="89" y="${o.y}" width="202" height="2" rx="1" fill="var(--ch-b)"/><text class="pipe-label-muted" x="190" y="${o.y + 19}" text-anchor="middle">${escapeHtml(o.label)}</text></g>`).join("");
+    return `<svg class="pipe-svg" viewBox="0 0 360 562" role="img" aria-label="Configure pipeline from CMakeLists.txt through syntax, eval, resolve, and gen to build files over Host">${edges}${taps}<g><rect class="pipe-node-bg" x="30" y="12" width="200" height="44" rx="6"/><text class="pipe-label" x="130" y="39" text-anchor="middle">CMakeLists.txt</text></g>${boxes}${outBoxes}<g class="pipe-node-group${sel === "host" ? " is-selected" : ""}" data-pipe-stage="host" style="--node-ch:var(--ink)"><rect class="pipe-node-bg" x="272" y="90" width="68" height="284" rx="6"/><text class="pipe-label" x="306" y="232" text-anchor="middle" transform="rotate(-90 306 232)">${escapeHtml(host.label)}</text></g></svg>`;
   }
 
   const ns = [
@@ -66,8 +66,8 @@ export function renderPipeline(model = PIPELINE_MODEL, orientation = "horizontal
   ].join("");
   const taps = ns.map((n, i) => tap(`M ${n.x + n.w / 2} 160 L ${n.x + n.w / 2} 274`, i)).join("");
   const boxes = ns.map((n) => `<g class="pipe-node-group${sel === n.id ? " is-selected" : ""}" data-pipe-stage="${n.id}" style="--node-ch:${n.ch}"><rect class="pipe-node-bg" x="${n.x}" y="116" width="${n.w}" height="44" rx="6"/><rect x="${n.x + 1}" y="116" width="${n.w - 2}" height="2.5" rx="1" fill="${n.ch}"/><text class="pipe-label" x="${n.x + n.w / 2}" y="143" text-anchor="middle">${escapeHtml(n.id)}</text></g>`).join("");
-  const outBoxes = outs.map((o) => `<g><rect class="pipe-node-bg" x="918" y="${o.y}" width="114" height="32" rx="5"/><rect x="919" y="${o.y}" width="112" height="2" rx="1" fill="var(--ch-b)"/><text class="pipe-label-muted" x="975" y="${o.y + 20}" text-anchor="middle">${escapeHtml(o.label)}</text></g>`).join("");
-  return `<svg class="pipe-svg" viewBox="0 0 1052 336" role="img" aria-label="Configure pipeline from CMakeLists.txt through syntax, eval, resolve, and gen to build files over Host">${edges}${taps}<g><rect class="pipe-node-bg" x="16" y="116" width="160" height="44" rx="6"/><use href="#i-file" x="28" y="130" width="16" height="16" stroke="var(--ink-2)" fill="none" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/><text class="pipe-label" x="106" y="143" text-anchor="middle">CMakeLists.txt</text></g>${boxes}${outBoxes}<g class="pipe-node-group${sel === "host" ? " is-selected" : ""}" data-pipe-stage="host" style="--node-ch:var(--ink)"><rect class="pipe-node-bg" x="16" y="274" width="1016" height="46" rx="6"/><use href="#i-host" x="32" y="289" width="16" height="16" stroke="var(--ink-2)" fill="none" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/><text class="pipe-label" x="58" y="302">Host</text><text class="pipe-label-muted" x="114" y="302">${escapeHtml(host.label)}</text><text class="pipe-label-muted" x="1010" y="302" text-anchor="end">${escapeHtml(host.chips.join("  \u00b7  "))}</text></g></svg>`;
+  const outBoxes = outs.map((o) => `<g><rect class="pipe-node-bg" x="918" y="${o.y}" width="142" height="32" rx="5"/><rect x="919" y="${o.y}" width="140" height="2" rx="1" fill="var(--ch-b)"/><text class="pipe-label-muted" x="989" y="${o.y + 20}" text-anchor="middle">${escapeHtml(o.label)}</text></g>`).join("");
+  return `<svg class="pipe-svg" viewBox="0 0 1076 336" role="img" aria-label="Configure pipeline from CMakeLists.txt through syntax, eval, resolve, and gen to build files over Host">${edges}${taps}<g><rect class="pipe-node-bg" x="16" y="116" width="160" height="44" rx="6"/><use href="#i-file" x="28" y="130" width="16" height="16" stroke="var(--ink-2)" fill="none" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/><text class="pipe-label" x="106" y="143" text-anchor="middle">CMakeLists.txt</text></g>${boxes}${outBoxes}<g class="pipe-node-group${sel === "host" ? " is-selected" : ""}" data-pipe-stage="host" style="--node-ch:var(--ink)"><rect class="pipe-node-bg" x="16" y="274" width="1044" height="46" rx="6"/><use href="#i-host" x="32" y="289" width="16" height="16" stroke="var(--ink-2)" fill="none" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/><text class="pipe-label" x="58" y="302">Host</text><text class="pipe-label-muted" x="114" y="302">${escapeHtml(host.label)}</text><text class="pipe-label-muted" x="1038" y="302" text-anchor="end">${escapeHtml(host.chips.join("  \u00b7  "))}</text></g></svg>`;
 }
 
 export function initPipeline(root, motion) {
@@ -95,7 +95,7 @@ export function initPipeline(root, motion) {
     const isHost = state.selected === "host";
     const info = isHost ? host : PIPELINE_MODEL.stages.find((s) => s.id === state.selected) || PIPELINE_MODEL.stages[1];
     const ch = isHost ? "var(--ink)" : info.colorVar;
-    inspector.innerHTML = `<span class="pipe-insp-name" style="color:${ch}"><svg class="i" aria-hidden="true"><use href="#${isHost ? "i-host" : info.icon}"/></svg>${escapeHtml(isHost ? host.label : info.label)}</span><span class="pipe-insp-text">${escapeHtml(info.sentence)}</span><div class="pipe-insp-crates">${info.crates.map((c) => `<span class="chip is-lit" style="--chip-ch:${ch}">rcmake-${escapeHtml(c)}</span>`).join("")}</div>`;
+    inspector.innerHTML = `<div class="pipe-insp-head"><span class="pipe-insp-name" style="color:${ch}"><svg class="i" aria-hidden="true"><use href="#${isHost ? "i-host" : info.icon}"/></svg>${escapeHtml(isHost ? host.label : info.label)}</span><span class="pipe-insp-text">${escapeHtml(info.sentence)}</span></div><div class="pipe-insp-crates">${info.crates.map((c) => `<span class="chip is-lit" style="--chip-ch:${ch}">rcmake-${escapeHtml(c)}</span>`).join("")}</div>`;
 
     const active = new Set(info.crates);
     crateMap.innerHTML = PIPELINE_MODEL.crateGroups.map((g) => `<div class="crate-group"><span class="crate-group-label">${escapeHtml(g.name)} <span class="dim">rcmake-</span></span><div class="crate-chips">${g.crates.map((c) => `<span class="chip${active.has(c) ? " is-lit" : ""}" style="--chip-ch:${ch}">${escapeHtml(c)}</span>`).join("")}</div></div>`).join("");

@@ -49,7 +49,8 @@ const state = {
   explainSymbol: "",
   explainReport: null,
   showRawJson: false,
-  showAllSymbols: false
+  showAllSymbols: false,
+  wrapOutput: false
 };
 
 const $ = (id) => document.getElementById(id);
@@ -74,6 +75,7 @@ const els = {
   cursor: $("editor-cursor"),
   dirty: $("dirty-indicator"),
   outputTabs: $("output-tabs"),
+  outputActions: $("output-actions"),
   runLine: $("run-line"),
   body: $("inspector-body"),
   copyBtn: $("copy-file-btn"),
@@ -220,6 +222,8 @@ function loadExample(id) {
   state.showAllSymbols = false;
   state.activeGenFile = "build.ninja";
   state.generator = ex.id === "presets-v13" ? "Ninja Multi-Config" : "Ninja";
+  state.buildType = "Debug";
+  els.configSelect.value = "Debug";
   syncGen();
   els.exampleSelect.value = ex.id;
   els.exampleSelect.title = ex.description || "";
@@ -330,10 +334,12 @@ function renderGenerated(res) {
   const f = currentGenFile(res);
   if (!f) return '<p class="dim">No generated files.</p>';
   const lines = String(f.text || "").split("\n");
-  const bar = f.all.length > 1
-    ? `<div class="gen-file-bar"><label class="gen-file-label">File <select id="gen-file-select" data-test="gen-file-select">${f.all.map((n) => `<option value="${escapeHtml(n)}"${n === f.name ? " selected" : ""}>${escapeHtml(n)}</option>`).join("")}</select></label><span class="dim">${lines.length} lines \u00b7 ${f.all.length} files</span></div>`
-    : "";
-  const code = `<div class="code-table" data-test="generated-code">${lines.map((l, i) => `<div class="code-line"><span class="code-ln">${i + 1}</span><span>${hlLine(l, f.name)}</span></div>`).join("")}</div>`;
+  const filePicker = f.all.length > 1
+    ? `<label class="gen-file-label">File <select id="gen-file-select" data-test="gen-file-select">${f.all.map((n) => `<option value="${escapeHtml(n)}"${n === f.name ? " selected" : ""}>${escapeHtml(n)}</option>`).join("")}</select></label>`
+    : `<span class="gen-file-label">${escapeHtml(f.name)}</span>`;
+  const countText = f.all.length > 1 ? `${lines.length} lines \u00b7 ${f.all.length} files` : `${lines.length} lines`;
+  const bar = `<div class="gen-file-bar">${filePicker}<div class="gen-file-tools"><span class="dim">${escapeHtml(countText)}</span><button id="toggle-wrap-btn" type="button" class="ctrl-btn gen-wrap-btn" aria-pressed="${state.wrapOutput}" data-test="toggle-wrap-btn">Wrap</button></div></div>`;
+  const code = `<div class="code-table${state.wrapOutput ? " is-wrapped" : ""}" data-test="generated-code">${lines.map((l, i) => `<div class="code-line"><span class="code-ln">${i + 1}</span><span>${hlLine(l, f.name)}</span></div>`).join("")}</div>`;
   return `${bar}${code}`;
 }
 
@@ -403,8 +409,15 @@ function renderExplainReport(rep) {
     const rootLoc = (d.location && Number(d.location.line || 0) >= 1)
       ? d.location
       : (writesList.length ? writesList[writesList.length - 1].origin || writesList[writesList.length - 1].location : d.location);
-    const cacheMeta = d.cache
-      ? `<div class="ex-meta-row"><span class="dim">cache ${escapeHtml(d.cache.type || "STRING")}</span>${d.cache.help ? `<span class="dim">${escapeHtml(d.cache.help)}</span>` : ""}${d.history ? `<span class="dim">history: ${escapeHtml(d.history)}</span>` : ""}</div>`
+    const metaParts = d.cache
+      ? [
+          `cache ${d.cache.type || "STRING"}`,
+          d.cache.help || "",
+          d.history ? `history: ${d.history}` : ""
+        ].filter(Boolean)
+      : [];
+    const cacheMeta = metaParts.length
+      ? `<div class="ex-meta-row">${metaParts.map((part) => `<span class="dim">${escapeHtml(part)}</span>`).join('<span class="dim" aria-hidden="true">\u00b7</span>')}</div>`
       : "";
     const writes = writesList.map((w) => {
       const op = w.operation || w.op || w.command || "set";
@@ -423,14 +436,19 @@ function renderExplainReport(rep) {
   const srcs = renderExplainSources(cfg?.sources?.length ? cfg.sources : d.sources);
   const entries = (cfg?.entries || []).map((e) => {
     const prop = e.kind || e.property || "";
-    const scopeText = e.scope || e.link_role || e.input?.name || "";
-    const scopeChip = scopeText ? `<span class="chip">${escapeHtml(scopeText)}</span>` : "";
+    const explicitScope = e.scope || e.link_role || "";
+    const inputName = !explicitScope && e.input?.name ? String(e.input.name) : "";
+    const scopeChip = explicitScope
+      ? `<span class="chip">${escapeHtml(explicitScope)}</span>`
+      : inputName
+        ? `<button type="button" class="chip chip-btn" data-explain-sym="${escapeHtml(inputName)}" title="Explain ${escapeHtml(inputName)}">${escapeHtml(inputName)}</button>`
+        : "";
     const originLoc = (Array.isArray(e.origin) ? e.origin.length > 0 : Boolean(e.origin)) ? e.origin : e.input?.location;
     const chain = renderExplainChain(e.chain);
-    return `<div class="ex-entry"><div class="ex-entry-row"><span class="ex-prop">${escapeHtml(prop)}</span>${chips(e.value)}${scopeChip}${locBtn(originLoc)}</div>${chain}</div>`;
+    return `<div class="ex-entry"><div class="ex-entry-row"><span class="ex-prop">${escapeHtml(prop)}</span><div class="ex-vals">${chips(e.value)}${scopeChip}${locBtn(originLoc)}</div></div>${chain}</div>`;
   }).join("");
   const aliasLoc = d.alias_definition ? `<span class="chip">alias</span>${locBtn(d.alias_definition)}` : "";
-  return `<div class="explain-tree" data-test="explain-tree"><div class="ex-root"><svg class="i" aria-hidden="true"><use href="#i-target"/></svg><span class="target-name">${escapeHtml(d.target || rep.name)}</span><span class="chip is-ink">${escapeHtml(d.target_kind || "TARGET")}</span>${locBtn(d.definition)}${aliasLoc}</div><div class="ex-branch"><div class="ex-entry"><div class="ex-entry-row"><span class="ex-prop">${escapeHtml(cfg?.name || state.buildType)}</span><span class="dim">${escapeHtml(d.configuration_selection?.status || "matched")}</span></div></div><div class="ex-branch">${srcs ? `<div class="ex-entry"><div class="ex-entry-row"><span class="ex-prop">SOURCES</span>${srcs}</div></div>` : ""}${entries || '<div class="ex-entry"><span class="dim">No resolved compile or link entries.</span></div>'}</div></div></div>`;
+  return `<div class="explain-tree" data-test="explain-tree"><div class="ex-root"><svg class="i" aria-hidden="true"><use href="#i-target"/></svg><span class="target-name">${escapeHtml(d.target || rep.name)}</span><span class="chip is-ink">${escapeHtml(d.target_kind || "TARGET")}</span>${locBtn(d.definition)}${aliasLoc}</div><div class="ex-branch"><div class="ex-entry"><div class="ex-entry-row"><span class="ex-prop">CONFIGURATION</span><div class="ex-vals"><span class="chip is-ink">${escapeHtml(cfg?.name || state.buildType)}</span><span class="dim">${escapeHtml(d.configuration_selection?.status || "matched")}</span></div></div></div><div class="ex-branch">${srcs ? `<div class="ex-entry"><div class="ex-entry-row"><span class="ex-prop">SOURCES</span><div class="ex-vals">${srcs}</div></div></div>` : ""}${entries || '<div class="ex-entry"><span class="dim">No resolved compile or link entries.</span></div>'}</div></div></div>`;
 }
 
 function renderExplainTab(res) {
@@ -441,7 +459,7 @@ function renderExplainTab(res) {
     .map((s) => `<button type="button" class="ctrl-btn sym-btn${s === state.explainSymbol ? " is-active" : ""}" data-explain-sym="${escapeHtml(s)}" aria-pressed="${s === state.explainSymbol}">${escapeHtml(s)}</button>`)
     .join("");
   const moreBtn = hiddenCount > 0
-    ? `<button id="toggle-all-syms" type="button" class="ctrl-btn sym-more-btn" data-test="toggle-all-syms">${state.showAllSymbols ? "Fewer" : `+${hiddenCount} more`}</button>`
+    ? `<button id="toggle-all-syms" type="button" class="ctrl-btn sym-more-btn" data-test="toggle-all-syms">${state.showAllSymbols ? "Fewer symbols" : `+${hiddenCount} more symbols`}</button>`
     : "";
   const datalist = `<datalist id="explain-datalist">${all.map((s) => `<option value="${escapeHtml(s)}"></option>`).join("")}</datalist>`;
   return `<form id="explain-form" class="explain-bar"><input id="explain-input" class="search-input" type="text" list="explain-datalist" value="${escapeHtml(state.explainSymbol)}" placeholder="Target or variable" aria-label="Symbol to explain" data-test="explain-input">${datalist}<button class="ctrl-btn" type="submit" data-test="explain-submit">Explain</button><button id="toggle-explain-json" class="ctrl-btn" type="button" data-test="toggle-explain-json">${state.showRawJson ? "Structured" : "Raw JSON"}</button></form><div class="explain-syms" data-test="explain-symbols">${syms}${moreBtn}</div>${renderExplainReport(state.explainReport)}`;
@@ -460,7 +478,9 @@ function renderInspector(fade = false) {
   const genFiles = orderedGenFiles(res);
   els.fileTabName.textContent = genFiles.includes("build.ninja") ? "build.ninja" : (f?.name || "build.ninja");
   if (els.fileCount) els.fileCount.textContent = genFiles.length > 1 ? String(genFiles.length) : "";
-  els.copyBtn.hidden = !((state.activeTab === "ninja" && f) || (state.activeTab === "explain" && state.showRawJson && state.explainReport));
+  const showCopy = (state.activeTab === "ninja" && Boolean(f)) || (state.activeTab === "explain" && state.showRawJson && Boolean(state.explainReport));
+  els.copyBtn.hidden = !showCopy;
+  if (els.outputActions) els.outputActions.hidden = !showCopy;
   const diags = res?.diagnostics || [];
   const errCount = diags.filter((d) => d.severity === "error").length;
   els.diagCount.textContent = res ? String(diags.length) : "";
@@ -483,6 +503,10 @@ function renderInspector(fade = false) {
   if (state.activeTab === "ninja") {
     $("gen-file-select")?.addEventListener("change", (e) => {
       state.activeGenFile = e.target.value;
+      renderInspector(false);
+    });
+    $("toggle-wrap-btn")?.addEventListener("click", () => {
+      state.wrapOutput = !state.wrapOutput;
       renderInspector(false);
     });
   }
@@ -591,15 +615,32 @@ function initSplit() {
 }
 
 async function init() {
-  const isMac = typeof navigator !== "undefined" && /Mac|iPhone|iPad/i.test(navigator.platform || navigator.userAgent || "");
+  const isMac = typeof navigator !== "undefined" && /Mac/i.test(navigator.platform || navigator.userAgent || "") && !/iPhone|iPad|iPod/i.test(navigator.userAgent || "");
   if (els.runKbd) els.runKbd.textContent = isMac ? "\u2318\u21b5" : "Ctrl+Enter";
   els.runBtn.title = isMac ? "Run configure (Cmd+Enter)" : "Run configure (Ctrl+Enter)";
   els.exampleSelect.innerHTML = Object.values(PLAYGROUND_EXAMPLES).map((ex) => `<option value="${escapeHtml(ex.id)}">${escapeHtml(ex.title)}</option>`).join("");
+
+  const params = typeof window !== "undefined" ? new URLSearchParams(window.location.search) : new URLSearchParams();
+  const reqExample = params.get("example");
+  if (reqExample && reqExample in PLAYGROUND_EXAMPLES) state.exampleId = reqExample;
   loadExample(state.exampleId);
+  const reqTab = params.get("tab");
+  if (["ninja", "targets", "diagnostics", "explain"].includes(reqTab)) {
+    state.activeTab = reqTab;
+    state.lastManualTab = reqTab;
+  }
+  const reqSymbol = params.get("symbol");
+  if (reqSymbol) state.explainSymbol = reqSymbol.trim();
 
   els.exampleSelect.addEventListener("change", () => { loadExample(els.exampleSelect.value); runConfigure(); });
   initRovingGroup(els.genGroup, "[data-gen]", (b) => { state.generator = b.dataset.gen; syncGen(); runConfigure(); });
-  els.configSelect.addEventListener("change", () => { state.buildType = els.configSelect.value; runConfigure(); });
+  els.configSelect.addEventListener("change", () => {
+    state.buildType = els.configSelect.value;
+    if (state.generator === "Ninja Multi-Config" && (state.activeGenFile === "build.ninja" || /^build-.*\.ninja$/.test(state.activeGenFile))) {
+      state.activeGenFile = `build-${state.buildType}.ninja`;
+    }
+    runConfigure();
+  });
   els.resetBtn.addEventListener("click", () => { loadExample(state.exampleId); runConfigure(); });
   els.runBtn.addEventListener("click", runConfigure);
   initRovingGroup(els.fileTabs, "[data-file-tab]", (b) => {
@@ -615,16 +656,54 @@ async function init() {
     state.autoSwitchedToDiag = false;
     renderInspector(false);
   });
+  document.addEventListener("keydown", (e) => {
+    if ((e.metaKey || e.ctrlKey) && e.key === "Enter" && e.target !== $("explain-input")) {
+      e.preventDefault();
+      runConfigure();
+    }
+  });
   els.textarea.addEventListener("input", () => { state.files[state.activeFile] = els.textarea.value; renderFileTabs(); syncEditor(); });
   els.textarea.addEventListener("scroll", () => { els.gutter.scrollTop = els.textarea.scrollTop; });
   ["click", "keyup"].forEach((ev) => els.textarea.addEventListener(ev, syncEditor));
   els.textarea.addEventListener("keydown", (e) => {
-    if ((e.metaKey || e.ctrlKey) && e.key === "Enter") { e.preventDefault(); runConfigure(); }
-    else if (e.key === "Tab" && !e.shiftKey) {
+    if (e.key === "Escape") {
+      e.preventDefault();
+      els.textarea.blur();
+      return;
+    }
+    if (e.key === "Tab") {
       e.preventDefault();
       const { selectionStart: s, selectionEnd: end, value: v } = els.textarea;
-      els.textarea.value = `${v.slice(0, s)}  ${v.slice(end)}`;
-      els.textarea.selectionStart = els.textarea.selectionEnd = s + 2;
+      if (!e.shiftKey) {
+        let inserted = false;
+        try {
+          if (typeof document.execCommand === "function") inserted = document.execCommand("insertText", false, "  ");
+        } catch (_) {}
+        if (!inserted) {
+          if (typeof els.textarea.setRangeText === "function") els.textarea.setRangeText("  ", s, end, "end");
+          else {
+            els.textarea.value = `${v.slice(0, s)}  ${v.slice(end)}`;
+            els.textarea.selectionStart = els.textarea.selectionEnd = s + 2;
+          }
+        }
+      } else {
+        const lineStart = v.lastIndexOf("\n", Math.max(0, s - 1)) + 1;
+        const prefix = v.slice(lineStart, lineStart + 2);
+        const drop = prefix === "  " ? 2 : prefix.startsWith(" ") || prefix.startsWith("\t") ? 1 : 0;
+        if (drop > 0) {
+          els.textarea.setSelectionRange(lineStart, lineStart + drop);
+          let removed = false;
+          try {
+            if (typeof document.execCommand === "function") removed = document.execCommand("delete");
+          } catch (_) {}
+          if (!removed) {
+            if (typeof els.textarea.setRangeText === "function") els.textarea.setRangeText("", lineStart, lineStart + drop, "start");
+            else els.textarea.value = `${v.slice(0, lineStart)}${v.slice(lineStart + drop)}`;
+          }
+          const nextStart = Math.max(lineStart, s - drop);
+          els.textarea.setSelectionRange(nextStart, Math.max(nextStart, end - drop));
+        }
+      }
       state.files[state.activeFile] = els.textarea.value;
       renderFileTabs();
       syncEditor();

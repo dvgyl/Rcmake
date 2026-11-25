@@ -12,7 +12,7 @@ async function compile(url) {
   }
   const response = await fetch(url);
   if (!response.ok) {
-    throw new Error(`Could not load the Rcmake runtime (HTTP ${response.status}).`);
+    throw new Error(`Could not load the rcmake runtime (HTTP ${response.status}).`);
   }
   if (typeof WebAssembly.compileStreaming === "function") {
     try {
@@ -53,7 +53,7 @@ const RIGHTS_POLL = 1n << 27n;
 // the environment, and process operations.
 function run(op, requestJson) {
   if (!compiledModule) {
-    throw new Error("Initialize the Rcmake runtime before sending a request.");
+    throw new Error("Initialize the rcmake runtime before sending a request.");
   }
   const input = encoder.encode(JSON.stringify({ ...JSON.parse(requestJson), op }));
   const outputs = { 1: [], 2: [] };
@@ -192,7 +192,7 @@ function run(op, requestJson) {
   }
   if (exitCode !== 0) {
     const stderr = decode(outputs[2]).trim();
-    throw new Error(stderr || `The Rcmake runtime exited with code ${exitCode}.`);
+    throw new Error(stderr || `The rcmake runtime exited with code ${exitCode}.`);
   }
   return decode(outputs[1]);
 }

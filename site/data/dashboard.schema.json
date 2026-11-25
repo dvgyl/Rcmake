@@ -1,8 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://dvgyl.github.io/rcmake/data/dashboard.schema.json",
-  "title": "Rcmake Nightly Compatibility Dashboard Snapshot",
-  "description": "Schema for site/data/latest.json driving the Rcmake landing proof strip and 7-track compatibility dashboard.",
+  "title": "rcmake Nightly Compatibility Dashboard Snapshot",
+  "description": "Schema for site/data/latest.json driving the rcmake landing proof strip and 7-track compatibility dashboard.",
   "type": "object",
   "required": [
     "schemaVersion",
@@ -298,6 +298,10 @@
               "description": "Optional per-project benchmark measurements across real-world large C++ projects.",
               "items": { "$ref": "#/$defs/realGiantBenchmark" }
             },
+            "giantsBenchmark": {
+              "$ref": "#/$defs/giantsBenchmarkReport",
+              "description": "Optional real-world large-project configure benchmark report from bench_giants.py."
+            },
             "differentialFuzz": {
               "$ref": "#/$defs/differentialFuzzReport",
               "description": "Optional seeded differential property-testing summary from oracle_prop_test.py."
@@ -391,6 +395,73 @@
         "note": { "type": "string" }
       }
     },
+    "giantsBenchmarkPhase": {
+      "type": "object",
+      "properties": {
+        "cmakeMedianMs": { "type": ["number", "null"], "minimum": 0 },
+        "rcmakeMedianMs": { "type": ["number", "null"], "minimum": 0 },
+        "rcmakeP95Ms": { "type": ["number", "null"], "minimum": 0 },
+        "speedup": { "type": ["number", "null"], "minimum": 0 },
+        "cmakePeakRssMiB": { "type": ["number", "null"], "minimum": 0 },
+        "rcmakePeakRssMiB": { "type": ["number", "null"], "minimum": 0 },
+        "probeCacheHits": { "type": ["integer", "null"], "minimum": 0 },
+        "probeCacheMisses": { "type": ["integer", "null"], "minimum": 0 },
+        "leafFile": { "type": ["string", "null"] }
+      }
+    },
+    "giantsBenchmarkProject": {
+      "type": "object",
+      "required": ["name", "status"],
+      "properties": {
+        "name": { "type": "string" },
+        "repository": { "type": "string" },
+        "version": { "type": "string" },
+        "status": { "$ref": "#/$defs/status" },
+        "note": { "type": "string" },
+        "cold": { "$ref": "#/$defs/giantsBenchmarkPhase" },
+        "warmProbe": { "$ref": "#/$defs/giantsBenchmarkPhase" },
+        "incrementalLeaf": { "$ref": "#/$defs/giantsBenchmarkPhase" },
+        "buildVerify": {
+          "type": "object",
+          "properties": {
+            "status": { "$ref": "#/$defs/status" },
+            "dryRunStepCountMatch": { "type": ["boolean", "null"] },
+            "target": { "type": ["string", "null"] },
+            "cmakeBuildMs": { "type": ["number", "null"], "minimum": 0 },
+            "rcmakeBuildMs": { "type": ["number", "null"], "minimum": 0 },
+            "buildSpeedup": { "type": ["number", "null"], "minimum": 0 }
+          }
+        }
+      }
+    },
+    "giantsBenchmarkReport": {
+      "type": "object",
+      "required": ["status", "projects"],
+      "properties": {
+        "label": { "type": "string" },
+        "status": { "$ref": "#/$defs/status" },
+        "runs": { "type": "integer", "minimum": 1 },
+        "reproducer": { "type": "string" },
+        "generatedAt": { "type": ["string", "null"] },
+        "summary": {
+          "type": "object",
+          "properties": {
+            "projectsTotal": { "type": "integer", "minimum": 0 },
+            "projectsPassed": { "type": "integer", "minimum": 0 },
+            "coldSpeedupGeomean": { "type": ["number", "null"], "minimum": 0 },
+            "warmProbeSpeedupGeomean": { "type": ["number", "null"], "minimum": 0 },
+            "incrementalLeafSpeedupGeomean": { "type": ["number", "null"], "minimum": 0 },
+            "incrementalLeafMaxP95Ms": { "type": ["number", "null"], "minimum": 0 },
+            "rcmakeMaxPeakRssMiB": { "type": ["number", "null"], "minimum": 0 },
+            "cmakeMaxPeakRssMiB": { "type": ["number", "null"], "minimum": 0 }
+          }
+        },
+        "projects": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/giantsBenchmarkProject" }
+        }
+      }
+    },
     "differentialFuzzReport": {
       "type": "object",
       "required": ["status", "oracleErrors"],
@@ -409,9 +480,12 @@
         "casesPassed": { "type": ["integer", "null"], "minimum": 0 },
         "mismatches": { "type": ["integer", "null"], "minimum": 0 },
         "oracleErrors": { "type": ["integer", "null"], "minimum": 0 },
+        "passRate": { "$ref": "#/$defs/rate" },
+        "reportsCount": { "type": ["integer", "null"], "minimum": 0 },
         "scriptCases": { "type": ["integer", "null"], "minimum": 0 },
         "configureCases": { "type": ["integer", "null"], "minimum": 0 },
         "families": { "type": ["integer", "null"], "minimum": 0 },
+        "summary": { "type": "string" },
         "binarySha256": { "$ref": "#/$defs/sha256" },
         "note": { "type": "string" }
       }

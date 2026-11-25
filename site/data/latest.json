@@ -5,7 +5,7 @@
   "commit": null,
   "rcmakeVersion": "0.1.0",
   "targetCmakeVersion": "4.5.1",
-  "statusNote": "[FINAL_METRIC] Verified soundness gates (fuzzing and WASI) are recorded. Remaining frozen-binary metrics populate automatically on the final release verification run.",
+  "statusNote": "[FINAL_METRIC] Verified soundness gates (fuzzing and WASI) are recorded. Remaining metrics populate automatically on the v0.1.0 release verification run.",
   "tracks": {
     "coreConformance": {
       "label": "Core-62 Conformance",
@@ -30,16 +30,16 @@
       ]
     },
     "policies": {
-      "label": "Policies (CMP0066-CMP0220+)",
+      "label": "Policies (CMP0066-CMP0226)",
       "status": "pending",
       "baselineAlwaysNew": "CMP0000-CMP0065",
-      "activeRange": "CMP0066-CMP0220+",
+      "activeRange": "CMP0066-CMP0226",
       "suitesTotal": 56,
       "suitesPassed": null,
       "casesPassed": null,
       "casesTotal": null,
       "passRate": null,
-      "note": "[FINAL_METRIC] Full CMP0066-CMP0220+ policy suite replay pending final frozen binary."
+      "note": "[FINAL_METRIC] Full CMP0066-CMP0226 policy suite replay pending v0.1.0 release verification run."
     },
     "runCmakeOs": {
       "label": "Full OS-Applicable Tests/RunCMake",
@@ -328,54 +328,54 @@
       "gates": [
         {
           "id": "fuzz",
-          "label": "Adversarial Fuzzing",
+          "label": "Adversarial fuzzing",
           "status": "pass",
           "passed": 14000000,
           "total": 14000000,
           "failures": 0,
-          "summary": "14,000,000 inputs / 0 failures",
-          "detail": "Safe-Rust property and adversarial corpus across 9 parser and format surfaces with zero panics or crashes."
+          "summary": "14 parser and format targets",
+          "detail": "Safe-Rust property and adversarial corpus across 14 parser and format surfaces with zero panics or crashes."
         },
         {
           "id": "wasi",
-          "label": "WebAssembly & WASI Gate",
+          "label": "WebAssembly and WASI gate",
           "status": "pass",
           "passed": 6,
           "total": 6,
           "failures": 0,
-          "summary": "6 / 6 checks passed",
+          "summary": "wasm32 and WASI checks",
           "detail": "Verified wasm32-unknown-unknown and wasm32-wasip1 dependency audits, compilation, and Wasmtime PureHost execution."
         },
         {
           "id": "probe-cache",
-          "label": "Persistent Probe Cache",
+          "label": "Persistent probe cache",
           "status": "pending",
           "passed": null,
           "total": 16,
           "failures": null,
-          "summary": "16 soundness checks (pending final run)",
+          "summary": "16 invalidation checks",
           "detail": "[FINAL_METRIC] Cross-project probe cache invalidation, compiler fingerprint, and negative-cache checks."
         },
         {
           "id": "mutation-replay",
-          "label": "Mutation Replay Soundness",
+          "label": "Mutation replay soundness",
           "status": "pending",
           "passed": null,
           "total": 20,
           "failures": null,
-          "summary": "20 mutation checks (pending final run)",
+          "summary": "20 incremental edit checks",
           "detail": "[FINAL_METRIC] Incremental graph mutation replay verified byte-equivalent to clean configures."
         },
         {
           "id": "blackbox",
-          "label": "Black-Box Scenario Suite",
+          "label": "Black-box scenario suite",
           "status": "pending",
           "passed": null,
           "total": 679,
           "scenariosPassed": null,
           "scenariosTotal": 20,
           "failures": null,
-          "summary": "20 scenarios / 679 checks (pending final run)",
+          "summary": "20 scenarios, 679 checks",
           "detail": "[FINAL_METRIC] Independent drop-in CLI, multi-generator, install, ctest, and cpack scenarios."
         }
       ]

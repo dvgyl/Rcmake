@@ -6,16 +6,16 @@
     </pattern>
   </defs>
   <rect width="1200" height="630" fill="#0a0b0d"/>
-  <rect width="1200" height="530" fill="url(#bench-dots)"/>
-  <g transform="translate(96 135) scale(2.5)">
+  <rect width="1200" height="512" fill="url(#bench-dots)"/>
+  <g transform="translate(76 116) scale(2.35)">
     <polygon points="64,8 20.70,33 107.30,33" fill="#EF4444"/>
     <polygon points="15.50,42 15.50,92 58.80,117" fill="#22B55A"/>
     <polygon points="112.50,42 112.50,92 69.20,117" fill="#3B82F6"/>
   </g>
-  <text x="474" y="294" fill="#ecebe6" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="136" font-weight="700" letter-spacing="-4.5">rcmake</text>
-  <text x="478" y="362" fill="#ecebe6" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="30" font-weight="500" letter-spacing="-0.6">Drop-in CMake 4.5.1 in safe Rust.</text>
-  <text x="478" y="402" fill="#85847e" font-family="ui-monospace, 'SF Mono', Menlo, Consolas, monospace" font-size="19">One binary runs as cmake, ctest, and cpack.</text>
-  <line x1="96" y1="530" x2="1104" y2="530" stroke="#25272c" stroke-width="1.5"/>
-  <text x="96" y="574" fill="#a6a59f" font-family="ui-monospace, 'SF Mono', Menlo, Consolas, monospace" font-size="22">github.com/dvgyl/rcmake</text>
-  <text x="1104" y="574" fill="#85847e" font-family="ui-monospace, 'SF Mono', Menlo, Consolas, monospace" font-size="22" text-anchor="end">MIT OR Apache-2.0</text>
+  <text x="404" y="246" fill="#ecebe6" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="140" font-weight="700" letter-spacing="-4.5">rcmake</text>
+  <text x="408" y="330" fill="#ecebe6" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="44" font-weight="600" letter-spacing="-1">Drop-in CMake 4.5.1 in safe Rust.</text>
+  <text x="408" y="388" fill="#b4b3ac" font-family="ui-monospace, 'SF Mono', Menlo, Consolas, monospace" font-size="25">One binary runs as cmake, ctest, and cpack.</text>
+  <line x1="112" y1="512" x2="1088" y2="512" stroke="#25272c" stroke-width="1.5"/>
+  <text x="112" y="572" fill="#c7c6bf" font-family="ui-monospace, 'SF Mono', Menlo, Consolas, monospace" font-size="28">github.com/dvgyl/rcmake</text>
+  <text x="1088" y="572" fill="#9c9b94" font-family="ui-monospace, 'SF Mono', Menlo, Consolas, monospace" font-size="28" text-anchor="end">MIT OR Apache-2.0</text>
 </svg>

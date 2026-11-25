@@ -6,8 +6,8 @@
   <title>Playground · rcmake</title>
   <meta name="description" content="Edit a CMakeLists.txt file and see rcmake diagnostics, targets, build.ninja, and explain output in the browser.">
   <link rel="canonical" href="https://dvgyl.github.io/rcmake/playground.html">
-  <meta property="og:title" content="rcmake">
-  <meta property="og:description" content="Drop-in CMake 4.5.1 in safe Rust.">
+  <meta property="og:title" content="Playground · rcmake">
+  <meta property="og:description" content="Edit a CMakeLists.txt file and see rcmake diagnostics, targets, build.ninja, and explain output in the browser.">
   <meta property="og:type" content="website">
   <meta property="og:url" content="https://dvgyl.github.io/rcmake/playground.html">
   <meta property="og:image" content="https://dvgyl.github.io/rcmake/assets/og-card.png">
@@ -24,6 +24,7 @@
   </script>
 </head>
 <body>
+  <a class="skip-link" href="#main-content">Skip to content</a>
   <svg hidden class="icon-sprite" aria-hidden="true">
     <symbol id="i-check" viewBox="0 0 20 20"><path d="M4.5 10.5l3.5 3.5 7.5-8"/></symbol>
     <symbol id="i-cross" viewBox="0 0 20 20"><path d="M6 6l8 8M14 6l-8 8"/></symbol>
@@ -77,10 +78,10 @@
     </div>
   </header>
 
-  <main class="bench">
+  <main id="main-content" class="bench">
     <h1 class="visually-hidden">rcmake playground</h1>
     <div class="toolbar">
-      <label>Example <select id="example-select" data-test="example-select" style="width:190px"><option value="hello-cpp20">Hello C++20</option></select></label>
+      <label>Example <select id="example-select" data-test="example-select"><option value="hello-cpp20">Hello C++20</option></select></label>
       <div class="seg" role="radiogroup" aria-label="Generator" id="generator-group" data-test="generator-group">
         <button type="button" role="radio" aria-checked="true" data-gen="Ninja"><svg class="i" aria-hidden="true"><use href="#i-graph"/></svg>Ninja</button>
         <button type="button" role="radio" aria-checked="false" data-gen="Ninja Multi-Config"><svg class="i" aria-hidden="true"><use href="#i-multi"/></svg>Ninja Multi-Config</button>
@@ -102,7 +103,7 @@
         <svg class="i" aria-hidden="true"><use href="#i-replay"/></svg>
         <span>Reset</span>
       </button>
-      <span id="mode-badge" class="mode-badge" data-test="mode-badge" aria-live="polite"><span class="mode-dot" aria-hidden="true"></span><span id="mode-badge-text">loading</span></span>
+      <span id="mode-badge" class="mode-badge" data-test="mode-badge" aria-live="polite"><span id="mode-badge-text">loading</span></span>
     </div>
 
     <div class="panes" id="panes">
@@ -126,15 +127,19 @@
       <div id="split-handle" class="split-handle" role="separator" aria-orientation="vertical" aria-label="Resize editor and output panes" aria-valuemin="25" aria-valuemax="75" aria-valuenow="50" tabindex="0" data-test="split-handle"></div>
 
       <section class="pane pane-output" id="pane-output" aria-label="Output">
-        <div class="pane-tabs" role="tablist" aria-label="Output" id="output-tabs" data-test="output-tabs">
-          <button type="button" role="tab" data-inspector-tab="ninja" aria-selected="true"><span id="tab-file-name">build.ninja</span> <span id="tab-count-files" class="tab-count"></span></button>
-          <button type="button" role="tab" data-inspector-tab="targets" aria-selected="false">Targets <span id="tab-count-targets" class="tab-count"></span></button>
-          <button type="button" role="tab" data-inspector-tab="diagnostics" aria-selected="false">Diagnostics <span id="tab-count-diag" class="tab-count"></span></button>
-          <button type="button" role="tab" data-inspector-tab="explain" aria-selected="false">Explain</button>
-          <button id="copy-file-btn" class="ctrl-btn end-btn" type="button" hidden data-test="copy-file-btn">
-            <svg class="i" aria-hidden="true"><use href="#i-copy"/></svg>
-            <span data-copy-label>Copy</span>
-          </button>
+        <div class="pane-tabs-bar">
+          <div class="pane-tabs" role="tablist" aria-label="Output" id="output-tabs" data-test="output-tabs">
+            <button type="button" role="tab" data-inspector-tab="ninja" aria-selected="true"><span id="tab-file-name">build.ninja</span> <span id="tab-count-files" class="tab-count"></span></button>
+            <button type="button" role="tab" data-inspector-tab="targets" aria-selected="false">Targets <span id="tab-count-targets" class="tab-count"></span></button>
+            <button type="button" role="tab" data-inspector-tab="diagnostics" aria-selected="false">Diagnostics <span id="tab-count-diag" class="tab-count"></span></button>
+            <button type="button" role="tab" data-inspector-tab="explain" aria-selected="false">Explain</button>
+          </div>
+          <div class="pane-tabs-actions" id="output-actions" hidden>
+            <button id="copy-file-btn" class="ctrl-btn" type="button" hidden data-test="copy-file-btn">
+              <svg class="i" aria-hidden="true"><use href="#i-copy"/></svg>
+              <span data-copy-label>Copy</span>
+            </button>
+          </div>
         </div>
         <div id="run-line" class="run-line" aria-hidden="true"><div class="run-line-bar"></div></div>
         <div id="inspector-body" class="output" role="tabpanel" data-test="inspector-body"></div>
