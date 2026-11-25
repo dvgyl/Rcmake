@@ -242,6 +242,15 @@ fn project_license(cx: &Cx<'_>, project: &[u8]) -> Option<BString> {
     project_field(cx, project, b"SPDX_LICENSE").or_else(|| project_field(cx, project, b"LICENSE"))
 }
 
+pub(super) fn mapped_spec(cx: &mut Cx<'_>, tokens: &[BString]) -> Result<PackageInfoSpec> {
+    let tokens = tokens
+        .iter()
+        .map(|token| token.as_slice())
+        .collect::<Vec<_>>();
+    let args = Arguments::parse(b"PACKAGE_INFO", &tokens, true)?;
+    package_info(cx, &args)
+}
+
 fn package_info(cx: &mut Cx<'_>, args: &Arguments<'_>) -> Result<PackageInfoSpec> {
     let mut spec = PackageInfoSpec {
         package: args.field(b"PACKAGE_INFO").unwrap_or_default(),

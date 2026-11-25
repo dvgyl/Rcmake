@@ -1937,3 +1937,40 @@ fn download_hashes_existing_files_above_the_single_read_limit() -> TestResult {
     );
     Ok(())
 }
+
+#[test]
+fn install_directory_replaces_the_destination_symlink() -> TestResult {
+    let work = if cfg!(windows) { "C:/work" } else { "/work" };
+    let (host, mut interp) = interpreter_in(RunMode::Script, work);
+    let root = Path::new(work);
+    host.seed_file(&root.join("source/contents"), b"input")?;
+    host.seed_file(&root.join("original/marker"), b"original")?;
+    host.create_dir_all(&root.join("destination"))?;
+    host.symlink(Path::new("../original"), &root.join("destination/source"))?;
+
+    script(
+        host.as_ref(),
+        &mut interp,
+        &format!(
+            "file(INSTALL DESTINATION \"{work}/destination\" TYPE DIRECTORY FILES \"{work}/source\")"
+        ),
+    )?;
+    assert_eq!(
+        host.metadata(&root.join("destination/source"), Follow::No)?
+            .kind,
+        FileKind::Dir,
+    );
+    assert!(
+        host.metadata(&root.join("destination/source/contents"), Follow::No)
+            .is_ok()
+    );
+    assert!(
+        host.metadata(&root.join("original/contents"), Follow::No)
+            .is_err()
+    );
+    assert!(
+        host.metadata(&root.join("original/marker"), Follow::No)
+            .is_ok()
+    );
+    Ok(())
+}

@@ -90,6 +90,13 @@ pub(in crate::policy_misc) fn set(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdR
         }
         _ => true,
     });
+    let tail = match (*scope, tail.split_last()) {
+        (b"INSTALL", Some((last, values))) if *last == b"APPEND" => {
+            update = Update::Append;
+            values
+        }
+        _ => tail,
+    };
     let value = (!tail.is_empty()).then(|| list::join(tail));
     match *scope {
         b"GLOBAL" if names.is_empty() => {

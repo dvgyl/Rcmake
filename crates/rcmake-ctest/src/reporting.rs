@@ -356,14 +356,14 @@ impl<'a> Report<'a> {
                 )
                 .as_bytes(),
             );
-        } else if detail.starts_with("Unable to find build dependency:") {
-            self.emit(Stream::Stderr, format!("{detail}\n").as_bytes());
         } else if resolved_command(self.host, test, self.options).is_none() {
             self.missing_command(test);
             self.emit(
                 Stream::Stderr,
                 format!("Unable to find executable: {}\n", test.command.program).as_bytes(),
             );
+        } else if detail.starts_with("Unable to find build dependency:") {
+            self.emit(Stream::Stderr, format!("{detail}\n").as_bytes());
         } else {
             self.emit(Stream::Stdout, format!("{detail}\n").as_bytes());
         }

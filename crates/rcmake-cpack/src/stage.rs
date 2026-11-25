@@ -5,7 +5,7 @@ use std::io::ErrorKind;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
-use rcmake_base::{BString, hash::HashAlgo, truth};
+use rcmake_base::{BString, ByteSlice, hash::HashAlgo, truth};
 use rcmake_eval::Interp;
 use rcmake_host::path::{from_native, to_native};
 use rcmake_host::{CommandSpec, FileKind, Follow, Host, Input, Output, ProcessResult, RunRequest};
@@ -49,6 +49,12 @@ pub(crate) fn install(
     let _env = stage_files.then(|| Environment::apply(host.as_ref(), &clear_destdir));
     let cfg = if stage_files {
         let install_scripts = if cfg.get(b"CPACK_INSTALL_SCRIPTS").is_some() {
+            if cfg.get(b"CPACK_INSTALL_SCRIPT").is_some() {
+                host.write_out(
+                    rcmake_host::Stream::Stderr,
+                    b"CPack Warning: Both CPACK_INSTALL_SCRIPTS and CPACK_INSTALL_SCRIPT are set, the latter will be ignored.\n",
+                );
+            }
             b"CPACK_INSTALL_SCRIPTS".as_slice()
         } else {
             b"CPACK_INSTALL_SCRIPT"
@@ -252,6 +258,12 @@ fn install_project(
     let mut interp = interpreter(host, build, options, None)?;
     let _env = location.environment(host.as_ref());
     let mut cx = interp.cx();
+    for entry in cfg.list(b"CPACK_CUSTOM_INSTALL_VARIABLES") {
+        let (name, value) = entry.split_once_str(b"=").unwrap_or((&entry, b""));
+        if !name.is_empty() {
+            cx.set_var(name, value.into());
+        }
+    }
     cx.set_var(b"CMAKE_INSTALL_PREFIX", location.prefix);
     if !config.is_empty() {
         cx.set_var(b"CMAKE_INSTALL_CONFIG_NAME", config.into());

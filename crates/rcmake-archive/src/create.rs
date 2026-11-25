@@ -21,6 +21,7 @@ pub(super) struct Selection<'a> {
     pub(super) threads: u32,
     pub(super) allow_outside: bool,
     pub(super) command: bool,
+    pub(super) header: &'a [u8],
 }
 
 pub(super) fn run(
@@ -45,6 +46,7 @@ pub(super) fn run(
         writer: Writer::new(options, selection.threads)?,
         zone: host.time_zone(),
         mtime,
+        whole_second_mtime: !selection.header.is_empty(),
         names: Vec::new(),
         links: HashMap::new(),
         bytes_left: size_limit(),
@@ -79,7 +81,10 @@ pub(super) fn run(
         archive.add(&base_dir.join(input), name, None)?;
     }
 
-    let bytes = archive.writer.finish()?;
+    let mut bytes = archive.writer.finish()?;
+    if !selection.header.is_empty() {
+        bytes.splice(..0, selection.header.iter().copied());
+    }
     host.write(output, &bytes, WriteMode::Truncate)?;
     emit_names(host, &archive.names, options.verbose);
     Ok(archive.names)
@@ -116,6 +121,7 @@ struct Creation<'a> {
     writer: Writer,
     zone: jiff::tz::TimeZone,
     mtime: Option<FileTime>,
+    whole_second_mtime: bool,
     names: Vec<BString>,
     links: HashMap<(u64, u64), (BString, PathBuf)>,
     bytes_left: u64,
@@ -195,7 +201,7 @@ impl Creation<'_> {
             .checked_sub(link_name.unwrap_or(&contents).len() as u64)
             .ok_or_else(|| ArchiveError::new("Archive exceeds the size limit"))?;
         let mut mtime = self.mtime.unwrap_or(metadata.mtime);
-        if self.command && !matches!(self.writer, Writer::SevenZip(_)) {
+        if self.whole_second_mtime || self.command && !matches!(self.writer, Writer::SevenZip(_)) {
             mtime.nanos = 0;
         }
         self.writer

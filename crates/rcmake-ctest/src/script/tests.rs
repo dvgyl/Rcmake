@@ -495,29 +495,36 @@ fn runs_dashboard_steps_in_order_and_combines_error_bits() -> Result<(), Box<dyn
 }
 
 #[test]
-fn runs_dashboard_build_presets_from_the_source_directory() -> Result<(), Box<dyn Error>> {
-    let host = Arc::new(PureHost::default());
+fn runs_dashboard_build_presets_from_the_build_directory() -> Result<(), Box<dyn Error>> {
+    let (work, build_text) = if cfg!(windows) {
+        ("C:/work", "C:/work/build")
+    } else {
+        ("/work", "/work/build")
+    };
+    let root = Path::new(work);
+    let build = Path::new(build_text);
+    let host = Arc::new(PureHost::new(root.into(), root.join("bin/ctest")));
     host.seed_file(
-        Path::new("/work/src/CMakePresets.json"),
+        &root.join("src/CMakePresets.json"),
         br#"{
             "version": 3,
-            "configurePresets": [{"name": "setup", "generator": "Ninja", "binaryDir": "/work/build"}],
+            "configurePresets": [{"name": "setup", "generator": "Ninja", "binaryDir": "${sourceDir}/../build"}],
             "buildPresets": [{"name": "compile", "configurePreset": "setup"}]
         }"#,
     )?;
     host.seed_file(
-        Path::new("/work/build/DartConfiguration.tcl"),
-        b"SourceDirectory: /work/src\nMakeCommand: unexpected\n",
+        &build.join("DartConfiguration.tcl"),
+        format!("SourceDirectory: {work}/src\nMakeCommand: unexpected\n").as_bytes(),
     )?;
-    host.set_command_handler(|_, request, _| {
+    host.set_command_handler(move |_, request, _| {
         let command = request
             .pipeline
             .first()
             .ok_or_else(|| HostError::unsupported("Missing build command"))?;
-        assert_eq!(request.cwd, Path::new("/work/src"));
+        assert_eq!(request.cwd, build);
         assert_eq!(
             command.args,
-            ["--build", "--preset", "compile"].map(BString::from)
+            ["--build", ".", "--preset", "compile"].map(BString::from)
         );
         Ok(RunOutput {
             results: vec![ProcessResult::Exited(0)],
@@ -529,7 +536,7 @@ fn runs_dashboard_build_presets_from_the_source_directory() -> Result<(), Box<dy
             host.clone(),
             &[
                 "--build-dir",
-                "/work/build",
+                build_text,
                 "-T",
                 "Build",
                 "-D",
@@ -540,7 +547,6 @@ fn runs_dashboard_build_presets_from_the_source_directory() -> Result<(), Box<dy
         ),
         0
     );
-    let build = Path::new("/work/build");
     let tag = Tag::read(host.as_ref(), build)?;
     assert!(
         host.metadata(

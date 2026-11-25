@@ -11,6 +11,8 @@ mod json;
 mod math;
 mod regex;
 
+pub(crate) use generate::configure_text;
+
 #[cfg(test)]
 mod tests;
 

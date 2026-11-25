@@ -1,16 +1,21 @@
-//! Archive generators: `TGZ`, `TXZ`, `TZST`, `TBZ2`, `TZ`, `TAR`, and `ZIP`.
+//! Generators for tar, ZIP, 7-Zip, and self-extracting archives.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
-use rcmake_archive::{ArchiveFormat, CreateOptions, create_archive};
+use rcmake_archive::{
+    ArchiveFormat, CreateOptions, SevenZipCompression, ZipCompression, create_archive,
+    create_prefixed_gzip_tar,
+};
 use rcmake_base::BString;
 use rcmake_base::parse_source_date_epoch;
 use rcmake_host::path::to_native;
 use rcmake_host::{Follow, Host};
 
 use crate::config::CpackConfig;
+
+mod stgz;
 
 use crate::{ComponentGrouping, CpackError, PackageContext, PackageGenerator, error, safe_name};
 
@@ -35,11 +40,25 @@ pub enum ArchiveKind {
     ZipDeflate,
     /// ZIP without compression.
     ZipStore,
+    /// ZIP with bzip2 compression.
+    ZipBzip2,
+    /// ZIP with LZMA compression.
+    ZipLzma,
+    /// ZIP with LZMA2 compression.
+    ZipLzma2,
+    /// ZIP with Zstandard compression.
+    ZipZstd,
+    /// 7-Zip with the selected compression method.
+    SevenZip(SevenZipCompression),
+    /// The default 7-Zip generator.
+    SevenZipDefault,
+    /// Self-extracting gzip tar.
+    Stgz,
 }
 
 impl ArchiveKind {
     /// All archive generators.
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 22] = [
         Self::Tgz,
         Self::Txz,
         Self::Tzst,
@@ -49,6 +68,19 @@ impl ArchiveKind {
         Self::Zip,
         Self::ZipDeflate,
         Self::ZipStore,
+        Self::ZipBzip2,
+        Self::ZipLzma,
+        Self::ZipLzma2,
+        Self::ZipZstd,
+        Self::SevenZipDefault,
+        Self::SevenZip(SevenZipCompression::Store),
+        Self::SevenZip(SevenZipCompression::Deflate),
+        Self::SevenZip(SevenZipCompression::Bzip2),
+        Self::SevenZip(SevenZipCompression::Lzma),
+        Self::SevenZip(SevenZipCompression::Lzma2),
+        Self::SevenZip(SevenZipCompression::Zstd),
+        Self::SevenZip(SevenZipCompression::Ppmd),
+        Self::Stgz,
     ];
 
     /// Generator name.
@@ -64,6 +96,21 @@ impl ArchiveKind {
             Self::Zip => "ZIP",
             Self::ZipDeflate => "ZIP_DEFLATE",
             Self::ZipStore => "ZIP_STORE",
+            Self::ZipBzip2 => "ZIP_BZ2",
+            Self::ZipLzma => "ZIP_LZMA",
+            Self::ZipLzma2 => "ZIP_LZMA2",
+            Self::ZipZstd => "ZIP_ZSTD",
+            Self::SevenZipDefault => "7Z",
+            Self::SevenZip(compression) => match compression {
+                SevenZipCompression::Store => "7Z_STORE",
+                SevenZipCompression::Deflate => "7Z_DEFLATE",
+                SevenZipCompression::Bzip2 => "7Z_BZ2",
+                SevenZipCompression::Lzma => "7Z_LZMA",
+                SevenZipCompression::Lzma2 => "7Z_LZMA2",
+                SevenZipCompression::Zstd => "7Z_ZSTD",
+                SevenZipCompression::Ppmd => "7Z_PPMD",
+            },
+            Self::Stgz => "STGZ",
         }
     }
 
@@ -77,11 +124,19 @@ impl ArchiveKind {
             Self::Tbz2 => ".tar.bz2",
             Self::Tz => ".tar.Z",
             Self::Tar => ".tar",
-            Self::Zip | Self::ZipDeflate | Self::ZipStore => ".zip",
+            Self::Zip
+            | Self::ZipDeflate
+            | Self::ZipStore
+            | Self::ZipBzip2
+            | Self::ZipLzma
+            | Self::ZipLzma2
+            | Self::ZipZstd => ".zip",
+            Self::SevenZipDefault | Self::SevenZip(_) => ".7z",
+            Self::Stgz => ".sh",
         }
     }
 
-    const fn format(self) -> ArchiveFormat {
+    const fn format(self, threads: u32) -> ArchiveFormat {
         match self {
             Self::Tgz => ArchiveFormat::TarGz,
             Self::Txz => ArchiveFormat::TarXz,
@@ -91,6 +146,19 @@ impl ArchiveKind {
             Self::Tar => ArchiveFormat::Tar,
             Self::Zip | Self::ZipDeflate => ArchiveFormat::Zip,
             Self::ZipStore => ArchiveFormat::ZipStored,
+            Self::ZipBzip2 => ArchiveFormat::ZipCompressed(ZipCompression::Bzip2),
+            Self::ZipLzma => ArchiveFormat::ZipCompressed(ZipCompression::Lzma),
+            Self::ZipLzma2 => ArchiveFormat::ZipCompressed(ZipCompression::Xz),
+            Self::ZipZstd => ArchiveFormat::ZipCompressed(ZipCompression::Zstd),
+            Self::SevenZipDefault => ArchiveFormat::SevenZip {
+                compression: SevenZipCompression::Lzma,
+                threads,
+            },
+            Self::SevenZip(compression) => ArchiveFormat::SevenZip {
+                compression,
+                threads,
+            },
+            Self::Stgz => ArchiveFormat::TarGz,
         }
     }
 }
@@ -137,13 +205,13 @@ impl PackageGenerator for ArchiveGenerator {
             .or_else(|| cfg.get(b"CPACK_COMPRESSION_LEVEL"))
             .map(|level| level_number(level, "CPACK_ARCHIVE_COMPRESSION_LEVEL"))
             .transpose()?;
-        // The archive API writes each archive with one codec worker.
-        if let Some(value) = cfg
+        let threads = cfg
             .get(b"CPACK_ARCHIVE_THREADS")
             .or_else(|| cfg.get(b"CPACK_THREADS"))
-        {
-            level_number::<i32>(value, "CPACK_ARCHIVE_THREADS")?;
-        }
+            .map(|value| level_number::<i32>(value, "CPACK_ARCHIVE_THREADS"))
+            .transpose()?
+            .unwrap_or(1)
+            .unsigned_abs();
         // CPack uses zero for times before the Unix epoch.
         let mtime = cx
             .host
@@ -151,15 +219,20 @@ impl PackageGenerator for ArchiveGenerator {
             .and_then(|value| parse_source_date_epoch(&value))
             .map(|epoch| u64::try_from(epoch).unwrap_or_default());
         let options = CreateOptions {
-            format: self.kind.format(),
+            format: self.kind.format(threads),
             mtime,
             compression_level,
             verbose: false,
         };
+        let header = (self.kind == ArchiveKind::Stgz)
+            .then(|| stgz::header(cx, &cfg))
+            .transpose()?;
+        let header = header.as_ref().map(|header| header.as_slice());
         let archives = component_archives(&cfg, archive_name, self.name())?;
         if archives.is_empty() {
-            let (base, inputs) = if cfg.get(b"CPACK_INCLUDE_TOPLEVEL_DIRECTORY").is_none()
-                || cfg.on(b"CPACK_INCLUDE_TOPLEVEL_DIRECTORY")
+            let (base, inputs) = if header.is_none()
+                && (cfg.get(b"CPACK_INCLUDE_TOPLEVEL_DIRECTORY").is_none()
+                    || cfg.on(b"CPACK_INCLUDE_TOPLEVEL_DIRECTORY"))
             {
                 let parent = cx
                     .staging_dir
@@ -178,7 +251,7 @@ impl PackageGenerator for ArchiveGenerator {
                 )
             };
             let path = archive_path(cx, archive_name, &extension)?;
-            write_archive(cx, &path, &base, &inputs, &options)?;
+            write_archive(cx, &path, &base, &inputs, &options, header)?;
             return Ok(vec![path]);
         }
 
@@ -198,7 +271,7 @@ impl PackageGenerator for ArchiveGenerator {
             .collect::<Result<Vec<_>, _>>()?;
         let prefix = component_prefix(cx, &cfg)?;
         for (archive, path) in archives.iter().zip(&paths) {
-            write_component_archive(cx, path, &prefix, &archive.roots, &options)?;
+            write_component_archive(cx, path, &prefix, &archive.roots, &options, header)?;
         }
         Ok(paths)
     }
@@ -323,6 +396,7 @@ fn write_component_archive(
     prefix: &Path,
     roots: &[PathBuf],
     options: &CreateOptions,
+    header: Option<&[u8]>,
 ) -> Result<(), CpackError> {
     let mut roots = roots.iter().map(|root| cx.staging_dir.join(root));
     let first = roots
@@ -346,7 +420,7 @@ fn write_component_archive(
     };
     if roots.len() == 0 {
         let inputs = component_inputs(&first)?.collect::<Vec<_>>();
-        return write_archive(cx, path, &first, &inputs, options);
+        return write_archive(cx, path, &first, &inputs, options, header);
     }
     let merged = component_workspace(cx)?;
     let result: Result<(), CpackError> = (|| {
@@ -356,7 +430,7 @@ fn write_component_archive(
             inputs.extend(component_inputs(&root)?.filter(|file| seen.insert(file.clone())));
             crate::source::merge_component(cx.host, &root, &merged)?;
         }
-        write_archive(cx, path, &merged, &inputs, options)
+        write_archive(cx, path, &merged, &inputs, options, header)
     })();
     let cleanup = cx.host.remove_dir_all(&merged);
     result?;
@@ -401,8 +475,15 @@ fn write_archive(
     base: &Path,
     inputs: &[PathBuf],
     options: &CreateOptions,
+    header: Option<&[u8]>,
 ) -> Result<(), CpackError> {
     crate::stage::clear_output_file(cx.host, path)?;
-    create_archive(cx.host, path, base, inputs, options).map_err(|err| error(err.message))?;
+    if let Some(header) = header {
+        create_prefixed_gzip_tar(cx.host, path, base, inputs, options, header)
+            .map_err(|err| error(err.message))?;
+        cx.host.set_permissions(path, 0o755)?;
+    } else {
+        create_archive(cx.host, path, base, inputs, options).map_err(|err| error(err.message))?;
+    }
     Ok(())
 }

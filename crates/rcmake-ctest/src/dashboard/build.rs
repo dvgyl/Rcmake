@@ -58,7 +58,7 @@ pub(super) fn run(
     } else {
         dashboard.value(host.as_ref(), invocation, b"MakeCommand")?
     };
-    let cwd = if preset.is_some() { source } else { build };
+    let cwd = build;
     let command = if let Some(custom) = custom_command(preset.is_some(), &custom) {
         split_dashboard_command(host, custom)?
     } else {
@@ -67,7 +67,7 @@ pub(super) fn run(
             "--build".into(),
         ];
         if let Some(preset) = preset {
-            command.extend(["--preset".into(), preset.into()]);
+            command.extend([".".into(), "--preset".into(), preset.into()]);
             if let Some(file) = file {
                 command.extend(["--presets-file".into(), path::from_native(&file)]);
             }
@@ -115,7 +115,8 @@ pub(super) fn run(
         Some(ProcessResult::Exited(code)) => *code,
         _ => -1,
     };
-    let (errors, warnings, abnormal) = diagnostics(&output, code);
+    let launch = crate::launch::diagnostics(host.as_ref(), build, start);
+    let (errors, warnings, abnormal) = diagnostics(&output, code, &launch);
     write_build_report(
         host.as_ref(),
         build,
@@ -130,6 +131,7 @@ pub(super) fn run(
             errors,
             warnings,
             abnormal,
+            launch: &launch,
         },
     )?;
     if !invocation.options.quiet {

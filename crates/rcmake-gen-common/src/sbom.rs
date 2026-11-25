@@ -320,7 +320,7 @@ fn target_links(
     mode: PreprocessMode,
 ) -> Result<Vec<(DirId, BString)>, GenError> {
     let handle = TargetHandle(id.index() as u32);
-    let context = EvalContext {
+    let mut context = EvalContext {
         config: ConfigId(config.into()),
         head: Some(handle),
         current: Some(handle),
@@ -341,6 +341,7 @@ fn target_links(
             b"INTERFACE_LINK_LIBRARIES",
         ),
     ] {
+        context.site.property = Some(property.into());
         let entries: Vec<_> = items.as_ref().map_or_else(
             || {
                 target
@@ -674,3 +675,6 @@ fn object<const N: usize>(fields: [(&str, Value); N]) -> Value {
             .collect(),
     )
 }
+
+#[cfg(test)]
+mod tests;

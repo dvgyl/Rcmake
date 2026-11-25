@@ -164,6 +164,9 @@ pub(crate) fn output<'a>(
     match status {
         Status::Disabled => b"Disabled".as_slice().into(),
         Status::NotRun if !record.output.is_empty() => record.output.as_slice().into(),
+        Status::NotRun if !test.timeout.errors.is_empty() => {
+            test.timeout.errors.join("\n").into_bytes().into()
+        }
         Status::NotRun if test.command.program == "NOT_AVAILABLE" => {
             b"Test not available without configuration.  (Missing \"-C <config>\"?)"
                 .as_slice()

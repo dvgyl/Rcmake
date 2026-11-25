@@ -82,8 +82,17 @@ pub(super) fn configure(cx: &mut Cx<'_>, args: &[&[u8]]) -> CmdResult {
             }
         }
     }
+    let result = configure_text(cx, input, options)?;
+    set(cx, out, result)
+}
+
+pub(crate) fn configure_text(
+    cx: &mut Cx<'_>,
+    input: &[u8],
+    options: ConfigureOptions,
+) -> Result<Vec<u8>, CmdError> {
     let mut result = Vec::new();
-    // The shared file expander always emits a newline and strips CR at the end of a line.
+    // The shared file expander emits a newline and removes a final CR from each line.
     let mut env = TemplateEnv {
         line: cx.current_line(),
         cx,
@@ -105,7 +114,7 @@ pub(super) fn configure(cx: &mut Cx<'_>, args: &[&[u8]]) -> CmdResult {
         )?;
         env.line = env.line.saturating_add(1);
     }
-    set(cx, out, result)
+    Ok(result)
 }
 
 // CMake uses the process-wide C random number generator. This is the sequence

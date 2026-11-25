@@ -500,3 +500,25 @@ fn rejects_a_dependency_cycle_before_starting_any_test() -> TestResult {
 }
 
 mod runner;
+
+#[test]
+fn build_and_test_rejects_ctest_passthrough() -> TestResult {
+    let root = if cfg!(windows) { "C:/work" } else { "/work" };
+    let host = Arc::new(PureHost::new(root.into(), Path::new(root).join("ctest")));
+    let argv = [
+        "ctest",
+        "--build-and-test",
+        "source",
+        "build",
+        "--build-generator",
+        "Ninja",
+        "--",
+    ]
+    .map(rcmake_base::BString::from);
+    assert_eq!(crate::main(&argv, host.clone()), 1);
+    assert_eq!(
+        host.stream_bytes(Stream::Stderr),
+        "CMake Error: The -- option cannot be used with --build-and-test. Use --build-options or --test-command to forward arguments.\n"
+    );
+    Ok(())
+}

@@ -179,11 +179,23 @@ pub(super) fn write(
             }
             return Ok(output);
         }
-        evaluate_value(value, &mut genex_host)
+        let content = evaluate_value(value, &mut genex_host)?;
+        Ok(terminate_content(request, content))
     };
     let generated = write_generated_files(&requests, &contexts, evaluate, host);
     generated.map_err(|error| collision_error(model, request_dir, error))?;
     Ok(())
+}
+
+fn terminate_content(request: &FileGenerateRequest<'_>, mut content: BString) -> BString {
+    if matches!(request.input, FileGenerateInput::Content(_))
+        && !matches!(request.newline, FileGenerateNewline::Native)
+        && !content.is_empty()
+        && !content.ends_with(b"\n")
+    {
+        content.push(b'\n');
+    }
+    content
 }
 
 fn listfile(model: &ProjectModel, dir: DirId) -> BString {
@@ -382,4 +394,31 @@ fn permission(value: &[u8]) -> Option<u32> {
         b"WORLD_EXECUTE" => 0o001,
         _ => return None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use super::*;
+
+    #[test]
+    fn explicit_newlines_terminate_nonempty_generated_content_once() {
+        let work = Path::new(if cfg!(windows) { "C:/work" } else { "/work" });
+        let mut request = FileGenerateRequest {
+            output: b"file",
+            input: FileGenerateInput::Content(b"$<1:value>"),
+            input_base: work,
+            output_base: work,
+            condition: None,
+            target: None,
+            permissions: FileGeneratePermissions::Default,
+            newline: FileGenerateNewline::CrLf,
+        };
+        assert_eq!(terminate_content(&request, "value".into()), "value\n");
+        assert_eq!(terminate_content(&request, "value\n".into()), "value\n");
+        assert!(terminate_content(&request, BString::default()).is_empty());
+        request.newline = FileGenerateNewline::Native;
+        assert_eq!(terminate_content(&request, "value".into()), "value");
+    }
 }

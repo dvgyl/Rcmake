@@ -85,7 +85,7 @@ pub(crate) fn request(
         pipeline: vec![command],
         cwd,
         env: environment(host, test)?.into_iter().collect(),
-        stdin: Input::Null,
+        stdin: Input::Inherit,
         stdout: Output::Capture,
         stderr: Output::SharedWithStdout,
         timeout: Some(

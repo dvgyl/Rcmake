@@ -150,21 +150,8 @@ fn metadata(cfg: &CpackConfig) -> Value {
                 .as_bytes(),
             )
         };
-        for name in &install_types {
-            let index = types.len() as u64 + 1;
-            let options = MemberOptions::new(cfg, "INSTALL_TYPE", name);
-            types.entry(name.clone()).or_insert_with(|| {
-                Value::Object(Object::from([
-                    ("name".into(), Value::string(name.clone())),
-                    (
-                        "displayName".into(),
-                        Value::string(options.get("DISPLAY_NAME").unwrap_or(name)),
-                    ),
-                    ("index".into(), Value::UInt(index)),
-                ]))
-            });
-        }
-        add_components(cfg, &names, &mut components, &mut groups);
+        add_install_types(cfg, &install_types, &mut types);
+        add_components(cfg, &names, &mut components, &mut groups, &mut types);
         projects.push(Value::Object(Object::from([
             ("component".into(), Value::string(selection.clone())),
             ("components".into(), strings(names)),
@@ -181,11 +168,29 @@ fn metadata(cfg: &CpackConfig) -> Value {
     Value::Object(root)
 }
 
+fn add_install_types(cfg: &CpackConfig, names: &[BString], types: &mut Object) {
+    for name in names {
+        let index = types.len() as u64 + 1;
+        let options = MemberOptions::new(cfg, "INSTALL_TYPE", name);
+        types.entry(name.clone()).or_insert_with(|| {
+            Value::Object(Object::from([
+                ("name".into(), Value::string(name.clone())),
+                (
+                    "displayName".into(),
+                    Value::string(options.get("DISPLAY_NAME").unwrap_or(name)),
+                ),
+                ("index".into(), Value::UInt(index)),
+            ]))
+        });
+    }
+}
+
 fn add_components(
     cfg: &CpackConfig,
     names: &[BString],
     components: &mut Object,
     groups: &mut Object,
+    types: &mut Object,
 ) {
     let mut pending = VecDeque::from(names.to_vec());
     let mut queued: BTreeSet<_> = names.iter().cloned().collect();
@@ -202,10 +207,9 @@ fn add_components(
             }
         }
         component.insert("dependencies".into(), strings(dependencies));
-        component.insert(
-            "installationTypes".into(),
-            strings(options.list("INSTALL_TYPES")),
-        );
+        let install_types = options.list("INSTALL_TYPES");
+        add_install_types(cfg, &install_types, types);
+        component.insert("installationTypes".into(), strings(install_types));
         component.insert(
             "archiveFile".into(),
             Value::string(options.get("ARCHIVE_FILE").unwrap_or_default()),
@@ -350,5 +354,41 @@ fn write_metadata(value: &Value, depth: usize, data: &mut BString) {
             data.push(b']');
         }
         value => data.extend_from_slice(&write_compact(value)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lists_installation_types_used_by_components() -> Result<(), Box<dyn std::error::Error>> {
+        let cfg = CpackConfig {
+            vars: [
+                ("CPACK_INSTALL_CMAKE_PROJECTS", "build;package;ALL;/"),
+                ("CPACK_COMPONENTS_ALL", "core;documentation"),
+                ("CPACK_COMPONENT_CORE_INSTALL_TYPES", "full"),
+                ("CPACK_COMPONENT_DOCUMENTATION_INSTALL_TYPES", "full;docs"),
+                ("CPACK_INSTALL_TYPE_DOCS_DISPLAY_NAME", "Documentation"),
+            ]
+            .into_iter()
+            .map(|(name, value)| (name.into(), value.into()))
+            .collect(),
+        };
+        let Value::Object(root) = metadata(&cfg) else {
+            return Err("Expected an external package object.".into());
+        };
+        let Some(Value::Object(types)) = root.get(b"installationTypes".as_slice()) else {
+            return Err("The package has no installation types.".into());
+        };
+        let Some(Value::Object(docs)) = types.get(b"docs".as_slice()) else {
+            return Err("The documentation installation type is missing.".into());
+        };
+        assert_eq!(docs.get(b"index".as_slice()), Some(&Value::UInt(2)));
+        assert_eq!(
+            docs.get(b"displayName".as_slice()),
+            Some(&Value::string("Documentation"))
+        );
+        Ok(())
     }
 }

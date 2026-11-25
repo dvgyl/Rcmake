@@ -1,0 +1,125 @@
+use rcmake_base::{BString, path_lex::Lexical};
+use rcmake_eval::Cx;
+use rcmake_host::{
+    FileKind, Follow,
+    path::{from_native_cmake, to_native},
+};
+use rcmake_model::{BT, InstallKind, InstallOptions};
+
+use super::{Args, Result, common, fail, permissions, type_destination, unknown, value, values};
+
+pub(super) fn parse(
+    cx: &mut Cx<'_>,
+    signature: &[u8],
+    args: &mut Args<'_>,
+    options: &mut InstallOptions,
+) -> Result<InstallKind> {
+    let inputs = values(args);
+    let directory = signature == b"DIRECTORY";
+    let mut install_type = None;
+    let mut rule = false;
+    while let Some(key) = args.next() {
+        match key {
+            b"PATTERN" | b"REGEX" if signature == b"DIRECTORY" => {
+                let expression = value(args, key)?;
+                if key == b"REGEX" {
+                    cx.regex(expression).map_err(|err| fail(err.to_string()))?;
+                }
+                rule = true;
+            }
+            b"EXCLUDE" if rule => {}
+            b"PERMISSIONS" if rule => {
+                permissions(args)?;
+            }
+            b"MESSAGE_NEVER" | b"BUILD_DEPENDS" if rule => {
+                return Err(fail(
+                    [
+                        b"DIRECTORY does not allow \"".as_slice(),
+                        key,
+                        b"\" after PATTERN or REGEX.",
+                    ]
+                    .concat(),
+                ));
+            }
+            _ if rule => return Err(unknown(key)),
+            b"TYPE" => {
+                let value = value(args, key)?;
+                install_type = if value.is_empty() && !directory {
+                    None
+                } else {
+                    Some(type_destination(cx, value)?)
+                };
+            }
+            b"DIRECTORY_PERMISSIONS" if signature == b"DIRECTORY" => {
+                permissions(args)?;
+            }
+            b"USE_SOURCE_PERMISSIONS" | b"MESSAGE_NEVER" | b"FILES_MATCHING"
+                if signature == b"DIRECTORY" => {}
+            _ if common(cx, signature, options, key, args)? => {}
+            _ => return Err(unknown(key)),
+        }
+    }
+    if inputs.is_empty() && (!directory || options.destination.is_none()) {
+        return Ok(match signature {
+            b"FILES" => InstallKind::Files(Vec::new()),
+            b"PROGRAMS" => InstallKind::Programs(Vec::new()),
+            _ => InstallKind::Directory(Vec::new()),
+        });
+    }
+    let has_destination = options
+        .destination
+        .as_ref()
+        .is_some_and(|path| directory || !path.is_empty());
+    if has_destination && install_type.is_some() {
+        return Err(fail(
+            [
+                signature,
+                b" given both TYPE and DESTINATION arguments.  You may only specify one.",
+            ]
+            .concat(),
+        ));
+    }
+    if !has_destination {
+        options.destination = install_type;
+    }
+    if options.destination.is_none() {
+        return Err(fail([signature, b" given no DESTINATION!"].concat()));
+    }
+    if options.rename.is_some() && inputs.len() > 1 {
+        return Err(fail(
+            [signature, b" given RENAME option with more than one file."].concat(),
+        ));
+    }
+    let backtrace = cx.backtrace();
+    let mut paths = Vec::new();
+    for input in inputs.into_iter().filter(|input| !input.is_empty()) {
+        let path = source_path(cx, input);
+        if !directory
+            && !input.windows(2).any(|part| part == b"$<")
+            && cx
+                .host()
+                .metadata(&to_native(&path), Follow::No)
+                .is_ok_and(|entry| entry.kind == FileKind::Dir)
+        {
+            return Err(fail(format!(
+                "{} given directory \"{}\" to install.",
+                BString::from(signature),
+                path,
+            )));
+        }
+        paths.push(BT::new(path, backtrace.clone()));
+    }
+    Ok(match signature {
+        b"FILES" => InstallKind::Files(paths),
+        b"PROGRAMS" => InstallKind::Programs(paths),
+        _ => InstallKind::Directory(paths),
+    })
+}
+
+fn source_path(cx: &Cx<'_>, path: &[u8]) -> BString {
+    if Lexical::new(path).absolute() || path.starts_with(b"$<") {
+        path.into()
+    } else {
+        from_native_cmake(&cx.current_source_dir().join(to_native(path)))
+    }
+}

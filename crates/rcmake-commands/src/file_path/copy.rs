@@ -254,11 +254,24 @@ pub(super) fn copy_entry(
         return Ok(());
     }
     if directory {
-        if depth == 0 && is_descendant(cx, source, target) {
+        let replace_symlink = options.install
+            && existing
+                .as_ref()
+                .is_some_and(|entry| entry.kind == FileKind::Symlink);
+        let destination = if replace_symlink {
+            target.parent().unwrap_or(target)
+        } else {
+            target
+        };
+        if depth == 0 && is_descendant(cx, source, destination) {
             return Err(error(format!(
                 "{command} cannot copy directory \"{}\" into itself.",
                 source.display()
             )));
+        }
+        if replace_symlink {
+            host.remove_file(target)
+                .map_err(|e| copy_error(command, "remove", target, &e))?;
         }
         host.create_dir_all(target)
             .map_err(|e| copy_error(command, "make directory", target, &e))?;
@@ -293,6 +306,17 @@ pub(super) fn copy_entry(
                 .map_err(|e| copy_error(command, "make directory", parent, &e))?;
         }
         if meta.kind == FileKind::Symlink {
+            if options.install
+                && existing
+                    .as_ref()
+                    .is_some_and(|entry| entry.kind == FileKind::Dir)
+            {
+                return Err(error(format!(
+                    "INSTALL cannot duplicate symlink\n\n  {}\n\nat\n\n  {}\n\nbecause: A directory already exists at that location",
+                    source.display(),
+                    target.display(),
+                )));
+            }
             let link = host
                 .read_link(source)
                 .map_err(|e| copy_error(command, "read link", source, &e))?;

@@ -235,6 +235,16 @@ impl<'a> ConfigureSession<'a> {
             })?;
             saved = Cache::default();
         }
+        if !opts.view {
+            cache_setup::apply_environment_identity(host.as_ref(), &bin, &mut saved)?;
+            cache_setup::refresh_toolchain(
+                host.as_ref(),
+                &src,
+                &bin,
+                &opts.cache_edits,
+                &mut saved,
+            )?;
+        }
         let profiling = Profilers::new(host.as_ref(), &opts, &bin);
         Ok((
             Self {
@@ -498,6 +508,13 @@ impl<'a> ConfigureSession<'a> {
             result.exit_code
         };
         if exit_code != 0 {
+            if let Err(error) = rcmake_gen_common::fileapi::write_error_replies(
+                interp.cx().project(),
+                host,
+                &self.bin,
+            ) {
+                emit_cli_error(host, error.to_string());
+            }
             self.list_cache(interp);
             return Err(Exit::Code(exit_code));
         }
@@ -814,4 +831,41 @@ fn generation_failed(host: &dyn Host) {
 fn error(host: &dyn Host, message: String) -> i32 {
     emit_cli_error(host, message);
     1
+}
+
+#[cfg(test)]
+#[test]
+fn failed_configure_publishes_a_file_api_error_index() -> rcmake_host::HostResult<()> {
+    use rcmake_host::{PureHost, WriteMode};
+    use std::sync::Arc;
+
+    let work = Path::new(if cfg!(windows) { "C:/work" } else { "/work" });
+    let host = Arc::new(PureHost::new(work.into(), work.join("bin/cmake")));
+    host.seed_file(
+        &work.join("CMakeLists.txt"),
+        br#"
+cmake_minimum_required(VERSION 4.5)
+project(Failure NONE)
+message(FATAL_ERROR "Cannot configure this project.")
+"#,
+    )?;
+    let root = work.join("data");
+    host.seed_file(&root.join("Modules/CMakeDetermineSystem.cmake"), b"")?;
+    host.env_set(
+        b"RCMAKE_VENDORED_DATA_ROOT",
+        Some(&rcmake_host::path::from_native_cmake(&root)),
+    );
+    let api = work.join("build/.cmake/api/v1");
+    let query = api.join("query");
+    host.create_dir_all(&query)?;
+    host.write(&query.join("configureLog-v1"), b"", WriteMode::CreateNew)?;
+
+    let argv = ["cmake", "-S", ".", "-B", "build", "-G", "Unix Makefiles"].map(BString::from);
+    assert_eq!(crate::run(&argv, host.clone()), 1);
+    assert!(
+        host.read_dir(&api.join("reply"))?
+            .iter()
+            .any(|entry| entry.name.starts_with(b"error-"))
+    );
+    Ok(())
 }

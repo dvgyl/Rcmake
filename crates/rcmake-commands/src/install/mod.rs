@@ -10,13 +10,15 @@ use rcmake_eval::{CmdError, CmdFlags, CmdResult, Cx, Flow, Registry};
 use rcmake_expr::ExpandedArg;
 use rcmake_host::path::{from_native, from_native_cmake, to_native};
 use rcmake_model::{
-    BT, ExportSet, InstallKind, InstallOptions, InstallRule, TargetBinding, TargetId, TargetKind,
+    ExportSet, InstallKind, InstallOptions, InstallRule, TargetBinding, TargetId, TargetKind,
     UsageScope,
 };
 
 mod export_options;
+mod mapped_package;
 mod metadata;
 mod package_dependencies;
+mod paths;
 mod runtime;
 
 type Result<T> = std::result::Result<T, CmdError>;
@@ -200,6 +202,9 @@ fn install(cx: &mut Cx<'_>, input: &[ExpandedArg]) -> CmdResult {
     let [signature, rest @ ..] = input.as_slice() else {
         return Ok(Flow::Normal);
     };
+    if *signature == b"IMPORTED_RUNTIME_ARTIFACTS" {
+        return runtime::imported(cx, rest);
+    }
     if *signature == b"RUNTIME_DEPENDENCY_SET" {
         return runtime::set(cx, rest);
     }
@@ -209,9 +214,17 @@ fn install(cx: &mut Cx<'_>, input: &[ExpandedArg]) -> CmdResult {
     let mut args = rest.iter().copied().peekable();
     let mut options = InstallOptions::default();
     let mut extra_destinations = Vec::new();
+    let mut library_namelink_only = false;
     let kind = match *signature {
-        b"TARGETS" => targets(cx, &mut args, &mut options, &mut extra_destinations)?,
-        b"FILES" | b"PROGRAMS" | b"DIRECTORY" => paths(cx, signature, &mut args, &mut options)?,
+        b"TARGETS" => {
+            let (kind, namelink_only) =
+                targets(cx, &mut args, &mut options, &mut extra_destinations)?;
+            library_namelink_only = namelink_only;
+            kind
+        }
+        b"FILES" | b"PROGRAMS" | b"DIRECTORY" => {
+            paths::parse(cx, signature, &mut args, &mut options)?
+        }
         b"EXPORT" => install_export(cx, &mut args, &mut options)?,
         b"PACKAGE_INFO" | b"SBOM" => metadata::install(cx, signature, rest, &mut options)?,
         _ => {
@@ -246,11 +259,33 @@ fn install(cx: &mut Cx<'_>, input: &[ExpandedArg]) -> CmdResult {
     for path in absolute_destinations {
         warn_absolute_destination(cx, &path);
     }
+    let mapped = if let InstallKind::Export { set, .. } = &kind {
+        mapped_package::rules(cx, set, &options)?
+    } else {
+        Vec::new()
+    };
     let members = match &kind {
         InstallKind::Targets {
             targets,
             export: Some(set),
-        } => Some((set.clone(), targets.clone())),
+        } => {
+            let model = cx.project();
+            let targets = targets
+                .iter()
+                .copied()
+                .filter(|id| {
+                    !library_namelink_only
+                        || model.target(*id).is_some_and(|target| {
+                            target.kind != TargetKind::SharedLibrary
+                                || target
+                                    .props
+                                    .get(b"FRAMEWORK")
+                                    .is_some_and(|value| rcmake_base::truth::is_on(value))
+                        })
+                })
+                .collect::<Vec<_>>();
+            Some((set.clone(), targets))
+        }
         _ => None,
     };
     let snapshots = if let InstallKind::Targets { targets, .. } = &kind {
@@ -274,6 +309,9 @@ fn install(cx: &mut Cx<'_>, input: &[ExpandedArg]) -> CmdResult {
     } else {
         Vec::new()
     };
+    for rule in mapped {
+        cx.project().add_install(rule);
+    }
     let dir = cx.current_dir_id();
     let backtrace = cx.backtrace();
     let index = cx.project().add_install(InstallRule {
@@ -355,15 +393,16 @@ fn targets(
     args: &mut Args<'_>,
     options: &mut InstallOptions,
     destinations: &mut Vec<(usize, BString, bool)>,
-) -> Result<InstallKind> {
+) -> Result<(InstallKind, bool)> {
     let argument_count = args.len() + 1;
-    let targets = target_ids(cx, values(args), b"TARGETS")?;
+    let targets = target_ids(cx, values(args), true)?;
     let mut export = None;
     let mut artifact_options = InstallOptions::default();
     let mut destination_argument = None;
     let mut group: Option<&[u8]> = None;
     let mut dependencies = None;
     let mut namelink = None;
+    let mut library_namelink_only = false;
     let mut file_sets = Vec::new();
     while let Some(key) = args.next() {
         match key {
@@ -398,14 +437,10 @@ fn targets(
             }
             b"NAMELINK_COMPONENT" | b"NAMELINK_ONLY" | b"NAMELINK_SKIP" => {
                 if !matches!(group, Some(b"LIBRARY" | b"ARCHIVE")) {
-                    return Err(fail(
-                        [
-                            b"TARGETS given ",
-                            key,
-                            b" option outside LIBRARY or ARCHIVE.",
-                        ]
-                        .concat(),
-                    ));
+                    return Err(fail(format!(
+                        "TARGETS given {key} option not in LIBRARY or ARCHIVE group.  The {key} option may be specified only following LIBRARY or ARCHIVE.",
+                        key = BString::from(key),
+                    )));
                 }
                 if key == b"NAMELINK_COMPONENT" {
                     value(args, key)?;
@@ -415,6 +450,7 @@ fn targets(
                 {
                     return Err(fail("TARGETS given both NAMELINK_ONLY and NAMELINK_SKIP."));
                 }
+                library_namelink_only |= group == Some(b"LIBRARY") && key == b"NAMELINK_ONLY";
             }
             key if artifact(key) => {
                 destinations.extend(
@@ -461,7 +497,10 @@ fn targets(
     if export.is_some() {
         require_exported_file_sets(cx, &targets, &file_sets)?;
     }
-    Ok(InstallKind::Targets { targets, export })
+    Ok((
+        InstallKind::Targets { targets, export },
+        library_namelink_only,
+    ))
 }
 
 fn require_exported_file_sets(
@@ -492,98 +531,6 @@ fn require_exported_file_sets(
     Ok(())
 }
 
-fn paths(
-    cx: &mut Cx<'_>,
-    signature: &[u8],
-    args: &mut Args<'_>,
-    options: &mut InstallOptions,
-) -> Result<InstallKind> {
-    let inputs = values(args);
-    let directory = signature == b"DIRECTORY";
-    let mut install_type = None;
-    let mut rule = false;
-    while let Some(key) = args.next() {
-        match key {
-            b"PATTERN" | b"REGEX" if signature == b"DIRECTORY" => {
-                let expression = value(args, key)?;
-                if key == b"REGEX" {
-                    cx.regex(expression).map_err(|err| fail(err.to_string()))?;
-                }
-                rule = true;
-            }
-            b"EXCLUDE" if rule => {}
-            b"PERMISSIONS" if rule => {
-                permissions(args)?;
-            }
-            b"MESSAGE_NEVER" if rule => {
-                return Err(fail(
-                    "DIRECTORY does not allow \"MESSAGE_NEVER\" after PATTERN or REGEX.",
-                ));
-            }
-            _ if rule => return Err(unknown(key)),
-            b"TYPE" => {
-                let value = value(args, key)?;
-                install_type = if value.is_empty() && !directory {
-                    None
-                } else {
-                    Some(type_destination(cx, value)?)
-                };
-            }
-            b"DIRECTORY_PERMISSIONS" if signature == b"DIRECTORY" => {
-                permissions(args)?;
-            }
-            b"USE_SOURCE_PERMISSIONS" | b"MESSAGE_NEVER" | b"FILES_MATCHING"
-                if signature == b"DIRECTORY" => {}
-            _ if common(cx, signature, options, key, args)? => {}
-            _ => return Err(unknown(key)),
-        }
-    }
-    if inputs.is_empty() && (!directory || options.destination.is_none()) {
-        return Ok(match signature {
-            b"FILES" => InstallKind::Files(Vec::new()),
-            b"PROGRAMS" => InstallKind::Programs(Vec::new()),
-            _ => InstallKind::Directory(Vec::new()),
-        });
-    }
-    let has_destination = options
-        .destination
-        .as_ref()
-        .is_some_and(|path| directory || !path.is_empty());
-    if has_destination && install_type.is_some() {
-        return Err(fail("TYPE and DESTINATION are mutually exclusive."));
-    }
-    if !has_destination {
-        options.destination = install_type;
-    }
-    if options.destination.is_none() {
-        return Err(fail([signature, b" given no DESTINATION!"].concat()));
-    }
-    if options.rename.is_some() && inputs.len() > 1 {
-        return Err(fail(
-            [signature, b" given RENAME option with more than one file."].concat(),
-        ));
-    }
-    let backtrace = cx.backtrace();
-    let inputs = inputs
-        .into_iter()
-        .filter(|input| !input.is_empty())
-        .map(|input| BT::new(source_path(cx, input), backtrace.clone()))
-        .collect();
-    Ok(match signature {
-        b"FILES" => InstallKind::Files(inputs),
-        b"PROGRAMS" => InstallKind::Programs(inputs),
-        _ => InstallKind::Directory(inputs),
-    })
-}
-
-fn source_path(cx: &Cx<'_>, path: &[u8]) -> BString {
-    if Lexical::new(path).absolute() || path.starts_with(b"$<") {
-        path.into()
-    } else {
-        from_native_cmake(&cx.current_source_dir().join(to_native(path)))
-    }
-}
-
 fn scripts(cx: &mut Cx<'_>, signature: &[u8], rest: &[&[u8]]) -> CmdResult {
     let mut args = rest.iter().copied().peekable();
     let mut options = InstallOptions::default();
@@ -604,9 +551,12 @@ fn scripts(cx: &mut Cx<'_>, signature: &[u8], rest: &[&[u8]]) -> CmdResult {
     loop {
         match key {
             b"SCRIPT" | b"CODE" => {
-                let input = args
-                    .next_if(|token| payload(token))
-                    .ok_or_else(|| fail([key, b" requires an argument."].concat()))?;
+                let input = args.next_if(|token| payload(token)).ok_or_else(|| {
+                    let key = BString::from(key);
+                    fail(format!(
+                        "{key} given invalid argument:\n\n  {key}: missing required value"
+                    ))
+                })?;
                 let kind = if key == b"SCRIPT" {
                     InstallKind::Script(script_path(cx, input)?)
                 } else {
@@ -619,11 +569,10 @@ fn scripts(cx: &mut Cx<'_>, signature: &[u8], rest: &[&[u8]]) -> CmdResult {
                 shared.push(key);
             }
             b"COMPONENT" => {
-                let name = args
-                    .next_if(|token| payload(token))
-                    .ok_or_else(|| fail("option COMPONENT requires a value."))?;
-                options.component = Some(name.into());
-                shared.extend([key, name]);
+                if let Some(name) = args.next_if(|token| payload(token)) {
+                    options.component = Some(name.into());
+                    shared.extend([key, name]);
+                }
             }
             b"EXCLUDE_FROM_ALL" => {
                 options.exclude_from_all = true;
@@ -636,13 +585,19 @@ fn scripts(cx: &mut Cx<'_>, signature: &[u8], rest: &[&[u8]]) -> CmdResult {
                     options.build_depends.push(path.into());
                 }
             }
-            _ => return Err(unknown(key)),
+            _ => {
+                return Err(fail(format!(
+                    "{} given unknown argument: \"{}\".",
+                    BString::from(signature),
+                    BString::from(key),
+                )));
+            }
         }
         let Some(next) = args.next() else { break };
         key = next;
     }
     if options.all_components && options.component.is_some() {
-        return Err(fail("ALL_COMPONENTS and COMPONENT are mutually exclusive."));
+        return Err(fail("ALL_COMPONENTS and COMPONENT are mutually exclusive"));
     }
     options
         .component
@@ -732,43 +687,40 @@ fn install_export(
     })
 }
 
-fn target_ids(cx: &mut Cx<'_>, names: Vec<&[u8]>, signature: &[u8]) -> Result<Vec<TargetId>> {
+fn target_ids(cx: &mut Cx<'_>, names: Vec<&[u8]>, install: bool) -> Result<Vec<TargetId>> {
     let dir = cx.current_dir_id();
     let project = cx.project();
     names
         .into_iter()
         .map(|name| {
-            let Some(binding) = project.lookup_target(dir, name) else {
-                return Err(fail(
-                    [
-                        signature,
-                        b" given target \"",
-                        name,
-                        b"\" which does not exist.",
-                    ]
-                    .concat(),
-                ));
-            };
-            let TargetBinding::Target(id) = binding else {
-                return Err(fail(
-                    [signature, b" given ALIAS target \"", name, b"\"."].concat(),
-                ));
-            };
-            if project.target(id).is_some_and(|target| {
-                target.is_imported()
-                    || matches!(target.kind, TargetKind::Utility | TargetKind::GlobalTarget)
-            }) {
-                return Err(fail(
-                    [
-                        signature,
-                        b" given target \"",
-                        name,
-                        b"\" which is not built by this project.",
-                    ]
-                    .concat(),
-                ));
+            let binding = project.lookup_target(dir, name);
+            if install && matches!(binding, Some(TargetBinding::Alias(_))) {
+                return Err(fail(format!(
+                    "TARGETS given ALIAS target \"{}\".",
+                    BString::from(name)
+                )));
             }
-            Ok(id)
+            if let Some((id, target)) = binding
+                .map(TargetBinding::id)
+                .and_then(|id| project.target(id).map(|target| (id, target)))
+                .filter(|(_, target)| !target.is_imported())
+            {
+                if !matches!(target.kind, TargetKind::Utility | TargetKind::GlobalTarget) {
+                    return Ok(id);
+                }
+                let name = BString::from(name);
+                return Err(fail(if install {
+                    format!("TARGETS given target \"{name}\" which is not built by this project.")
+                } else {
+                    format!("given custom target \"{name}\" which may not be exported.")
+                }));
+            }
+            let name = BString::from(name);
+            Err(fail(if install {
+                format!("TARGETS given target \"{name}\" which does not exist.")
+            } else {
+                format!("given target \"{name}\" which is not built by this project.")
+            }))
         })
         .collect()
 }
@@ -840,7 +792,7 @@ fn export(cx: &mut Cx<'_>, input: &[ExpandedArg]) -> CmdResult {
     let name = match *signature {
         b"EXPORT" => Some(value(&mut args, b"EXPORT")?),
         b"TARGETS" => {
-            target_ids(cx, values(&mut args), b"TARGETS")?;
+            target_ids(cx, values(&mut args), false)?;
             None
         }
         _ => return Err(unknown(signature)),

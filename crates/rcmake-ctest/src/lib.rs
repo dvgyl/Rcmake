@@ -323,7 +323,9 @@ fn run_cli_tests(
             Ok(8)
         }
         Err(CtestError::Load(_)) => {
-            host.write_out(Stream::Stderr, b"Errors while running CTest\n");
+            let log = dir.join("Testing/Temporary/LastTest.log");
+            let _ = junit::write_file(host.as_ref(), &log, b"");
+            reporting::failure_summary(host.as_ref(), dir);
             Ok(8)
         }
         Err(error @ CtestError::Schedule(_)) => {

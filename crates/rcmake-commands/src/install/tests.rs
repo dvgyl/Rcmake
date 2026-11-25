@@ -12,15 +12,23 @@ fn configure(
     code: &str,
     expected: i32,
 ) -> std::result::Result<(Arc<PureHost>, Interp), Box<dyn std::error::Error>> {
-    let host = Arc::new(PureHost::default());
+    configure_in(Path::new("/work"), code, expected)
+}
+
+fn configure_in(
+    work: &Path,
+    code: &str,
+    expected: i32,
+) -> std::result::Result<(Arc<PureHost>, Interp), Box<dyn std::error::Error>> {
+    let host = Arc::new(PureHost::new(work.to_path_buf(), work.join("cmake")));
     let mut interp = Interp::new(
         InterpConfig {
             services: Default::default(),
             host: host.clone(),
             mode: RunMode::Configure,
-            cmake_root: "/cmake".into(),
-            cmake_command: "/cmake/bin/cmake".into(),
-            cwd: "/work".into(),
+            cmake_root: work.join("data"),
+            cmake_command: work.join("cmake"),
+            cwd: work.to_path_buf(),
             limits: Default::default(),
             diag: Default::default(),
             defines: Vec::new(),
@@ -38,14 +46,14 @@ fn configure(
             Default::default(),
         ))?;
     }
-    let source = Path::new("/work/src");
+    let source = work.join("src");
     host.seed_file(&source.join("CMakeLists.txt"), code.as_bytes())?;
     let version =
         rcmake_base::version::Version::parse_strict(b"4.5").ok_or("invalid test version")?;
     interp.cx().set_cmake_minimum_required(b"4.5", &version)?;
     assert_eq!(
         interp
-            .run_configure(source, Path::new("/work/build"), &[])
+            .run_configure(&source, &work.join("build"), &[])
             .exit_code,
         expected,
         "{}",
@@ -193,11 +201,11 @@ fn install_and_export_reject_invalid_argument_sets() -> TestResult {
         ("install(TARGETS absent EXPORT set)", "does not exist"),
         (
             "install(TARGETS core RUNTIME NAMELINK_SKIP)",
-            "outside LIBRARY or ARCHIVE",
+            "not in LIBRARY or ARCHIVE",
         ),
         (
             "install(DIRECTORY data DESTINATION d TYPE DATA)",
-            "mutually exclusive",
+            "given both TYPE and DESTINATION",
         ),
         (
             "install(CODE hi ALL_COMPONENTS COMPONENT x)",
@@ -630,5 +638,124 @@ fn metadata_commands_reject_duplicate_outputs() -> TestResult {
         let stderr = host.stream_bytes(Stream::Stderr).to_string();
         assert!(stderr.contains(expected), "{stderr}");
     }
+    Ok(())
+}
+
+#[test]
+fn records_mapped_package_info_from_install_export() -> TestResult {
+    let work = Path::new(if cfg!(windows) { "C:/work" } else { "/work" });
+    let (_, mut interp) = configure_in(
+        work,
+        r#"
+set(CMAKE_EXPERIMENTAL_MAPPED_PACKAGE_INFO ababa1b5-7099-495f-a9cd-e22d38f274f2)
+set(CMAKE_INSTALL_EXPORTS_AS_PACKAGE_INFO sdk:Example/l/share/cps)
+set(project_version 2.3.4)
+set(sdk_EXPORT_PACKAGE_INFO_VERSION @project_version@)
+install(TARGETS core EXPORT sdk)
+install(EXPORT sdk DESTINATION lib/cmake COMPONENT Development)
+"#,
+        0,
+    )?;
+    let mut cx = interp.cx();
+    let [_, package, export] = cx.project().installs.as_slice() else {
+        return Err("Expected target, package information, and export install rules.".into());
+    };
+    let InstallKind::PackageInfo(spec) = &package.kind else {
+        return Err("The mapped package information rule is missing.".into());
+    };
+    assert_eq!(spec.package, "Example");
+    assert_eq!(spec.export, "sdk");
+    assert_eq!(
+        spec.version.as_deref().map(Vec::as_slice),
+        Some(b"2.3.4".as_slice())
+    );
+    assert!(spec.lower_case_file);
+    assert_eq!(package.options.destination, Some("share/cps".into()));
+    assert_eq!(package.options.component, export.options.component);
+    Ok(())
+}
+
+#[test]
+fn records_imported_runtime_artifact_options_and_build_dependencies() -> TestResult {
+    let work = Path::new(if cfg!(windows) { "C:/work" } else { "/work" });
+    let (_, mut interp) = configure_in(
+        work,
+        r#"
+add_executable(tool IMPORTED)
+set_property(TARGET tool PROPERTY IMPORTED_LOCATION "${CMAKE_CURRENT_BINARY_DIR}/tool")
+add_dependencies(tool core)
+install(IMPORTED_RUNTIME_ARTIFACTS tool RUNTIME_DEPENDENCY_SET relocation
+    RUNTIME DESTINATION tools OPTIONAL COMPONENT Runtime CONFIGURATIONS Debug)
+"#,
+        0,
+    )?;
+    let mut cx = interp.cx();
+    let model = cx.project();
+    let [rule] = model.installs.as_slice() else {
+        return Err("Expected one imported artifact install rule.".into());
+    };
+    let InstallKind::Programs(inputs) = &rule.kind else {
+        return Err("Expected an executable install rule.".into());
+    };
+    let [input] = inputs.as_slice() else {
+        return Err("Expected one imported executable.".into());
+    };
+    assert_eq!(input.value, "$<TARGET_FILE:tool>");
+    assert!(rule.options.optional);
+    assert_eq!(rule.options.configurations, ["Debug"]);
+    assert_eq!(rule.options.component, Some("Runtime".into()));
+    assert_eq!(rule.options.destination, Some("tools".into()));
+    assert_eq!(rule.options.build_depends, ["core"]);
+    assert!(
+        model
+            .global
+            .props
+            .get(b"_RCMAKE_INSTALL_0_ARG3")
+            .is_some_and(|value| value == b"relocation")
+    );
+    Ok(())
+}
+
+#[test]
+fn namelink_only_rules_keep_one_export_member() -> TestResult {
+    let work = Path::new(if cfg!(windows) { "C:/work" } else { "/work" });
+    let (_, mut interp) = configure_in(
+        work,
+        r#"
+add_library(shared SHARED)
+install(TARGETS shared EXPORT sdk LIBRARY DESTINATION lib NAMELINK_SKIP)
+install(TARGETS shared EXPORT sdk LIBRARY DESTINATION lib NAMELINK_ONLY)
+install(EXPORT sdk DESTINATION lib/cmake)
+"#,
+        0,
+    )?;
+    let mut cx = interp.cx();
+    let model = cx.project();
+    let sdk = model
+        .exports
+        .get(b"sdk".as_slice())
+        .ok_or("Missing SDK export.")?;
+    assert_eq!(sdk.targets.len(), 1);
+    assert_eq!(model.installs.len(), 3);
+    Ok(())
+}
+
+#[test]
+fn empty_script_component_uses_the_default_component() -> TestResult {
+    let work = Path::new(if cfg!(windows) { "C:/work" } else { "/work" });
+    let (_, mut interp) = configure_in(
+        work,
+        r#"
+set(CMAKE_INSTALL_DEFAULT_COMPONENT_NAME Development)
+install(CODE "message(STATUS installed)" COMPONENT EXCLUDE_FROM_ALL)
+"#,
+        0,
+    )?;
+    let mut cx = interp.cx();
+    let [rule] = cx.project().installs.as_slice() else {
+        return Err("Expected one install script rule.".into());
+    };
+    assert_eq!(rule.options.component, Some("Development".into()));
+    assert!(rule.options.exclude_from_all);
     Ok(())
 }

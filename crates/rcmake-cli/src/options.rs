@@ -246,7 +246,7 @@ fn parse_project(
         ),
         raw if !raw.starts_with(b"-") => {
             opts.directories.push(DirectoryArg::Positional(
-                resolve_cli_path(host, raw),
+                resolve_project_path(host, raw),
                 raw.ends_with(b"/"),
             ));
         }
@@ -306,7 +306,7 @@ fn parse_directory(
     let is_build = arg.flag == b"-B";
     let label = if is_build { "build" } else { "source" };
     let flag = String::from_utf8_lossy(arg.flag);
-    let path = resolve_cli_path(
+    let path = resolve_project_path(
         host,
         arg.required(format!("No {label} directory specified for {flag}"))?,
     );
@@ -322,6 +322,31 @@ fn parse_directory(
         DirectoryArg::Source(path)
     });
     Ok(())
+}
+
+fn resolve_project_path(host: &dyn Host, raw: &[u8]) -> PathBuf {
+    use rcmake_base::path_lex::Lexical;
+    use rcmake_host::path::{from_native_cmake, to_native};
+
+    let logical = resolve_cli_path(host, raw);
+    let relative = to_native(raw);
+    if relative.is_absolute()
+        || !relative
+            .components()
+            .any(|part| part == std::path::Component::ParentDir)
+    {
+        return logical;
+    }
+    let cwd = host.initial_cwd();
+    let Ok(physical_cwd) = host.canonicalize(&cwd) else {
+        return logical;
+    };
+    let physical = physical_cwd.join(relative);
+    let physical = to_native(&Lexical::new(&from_native_cmake(&physical)).normalize());
+    match host.canonicalize(&physical) {
+        Ok(actual) if host.canonicalize(&logical).ok().as_ref() != Some(&actual) => physical,
+        _ => logical,
+    }
 }
 
 fn validate_script_mode(opts: &Options, host: &dyn Host) -> Result<(), String> {

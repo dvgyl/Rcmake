@@ -254,6 +254,37 @@ pub fn create_archive<'a>(
     )
 }
 
+/// Create a gzip tar archive with a header before its compressed payload.
+/// Store timestamps with whole-second precision for self-extracting installers.
+///
+/// # Errors
+///
+/// Returns the same errors as [`create_archive`].
+pub fn create_prefixed_gzip_tar(
+    host: &dyn Host,
+    output: &Path,
+    base_dir: &Path,
+    inputs: &[PathBuf],
+    options: &CreateOptions,
+    header: &[u8],
+) -> Result<Vec<BString>, ArchiveError> {
+    let options = CreateOptions {
+        format: ArchiveFormat::TarGz,
+        ..options.clone()
+    };
+    create::run(
+        host,
+        output,
+        base_dir,
+        inputs,
+        (&options).into(),
+        create::Selection {
+            header,
+            ..Default::default()
+        },
+    )
+}
+
 /// Create an archive for `cmake -E tar`. The input paths can be outside `base_dir`.
 ///
 /// TAR and ZIP store whole-second modification times. TAR stores each source
@@ -309,7 +340,7 @@ pub fn create_filtered_archive<'a>(
             excludes,
             threads,
             allow_outside: true,
-            command: false,
+            ..Default::default()
         },
     )
 }

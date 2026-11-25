@@ -123,6 +123,33 @@ fn discovers_tests_in_show_only_mode() -> TestResult {
 }
 
 #[test]
+fn reports_missing_executables_before_missing_build_dependencies() -> TestResult {
+    let work = Path::new(if cfg!(windows) { "C:/work" } else { "/work" });
+    let host = Arc::new(PureHost::new(work.into(), work.join("bin/ctest")));
+    host.seed_file(&work.join("present-tool"), b"")?;
+    host.seed_file(
+        &work.join("CTestTestfile.cmake"),
+        br#"
+add_test(missing_executable "./missing-tool")
+add_test(missing_input "./present-tool")
+set_tests_properties(missing_executable missing_input
+    PROPERTIES _CMAKE_TEST_BUILD_DEPENDS "missing-input.txt")
+"#,
+    )?;
+    assert_eq!(invoke(&host, &["-V"]), 8);
+    let stderr = host.stream_bytes(Stream::Stderr);
+    let stderr = std::str::from_utf8(&stderr)?;
+    assert!(stderr.contains("Unable to find executable: ./missing-tool\n"));
+    assert_eq!(
+        stderr
+            .matches("Unable to find build dependency: missing-input.txt\n")
+            .count(),
+        1
+    );
+    Ok(())
+}
+
+#[test]
 fn repeats_until_the_selected_result() -> TestResult {
     for (mode, first, second, code) in [
         (

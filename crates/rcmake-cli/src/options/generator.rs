@@ -23,7 +23,12 @@ pub(super) fn parse(
             } else {
                 (&mut opts.toolset, "No toolset specified for -T")
             };
-            *slot = Some(arg.value().ok_or(missing)?.into());
+            let value = arg.value().ok_or(missing)?;
+            if slot.as_ref().is_some_and(|previous| previous != value) {
+                let flag = BString::from(arg.flag);
+                return Err(format!("Multiple {flag} options not allowed"));
+            }
+            *slot = Some(value.into());
         }
         _ => return Ok(false),
     }

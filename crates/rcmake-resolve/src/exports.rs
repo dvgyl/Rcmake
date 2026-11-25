@@ -65,9 +65,19 @@ pub(crate) fn resolve_exports(
             continue;
         };
         let members = model.exports.get(set).ok_or_else(|| {
-            ResolveError::Message(
-                format!("CMake Error: INSTALL(EXPORT) given unknown export \"{set}\"\n").into(),
-            )
+            let mut message = BString::default();
+            if model.installs.iter().any(|candidate| {
+                candidate.dir == rule.dir
+                    && matches!(&candidate.kind, InstallKind::PackageInfo(spec) if spec.export == *set)
+            }) {
+                message.extend_from_slice(
+                    format!("CMake Error: INSTALL(PACKAGE_INFO) given unknown export \"{set}\"\n").as_bytes()
+                );
+            }
+            message.extend_from_slice(
+                format!("CMake Error: INSTALL(EXPORT) given unknown export \"{set}\"\n").as_bytes(),
+            );
+            ResolveError::Message(message)
         })?;
         let legacy_interface = (2..)
             .map_while(|arg| {

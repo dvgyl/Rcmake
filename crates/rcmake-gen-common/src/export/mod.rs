@@ -320,10 +320,7 @@ fn render_target(
         .iter()
         .filter(|(property, _)| {
             !(symbolic && property.as_slice() == b"SYMBOLIC")
-                && !matches!(
-                    property.as_slice(),
-                    b"INTERFACE_CXX_MODULE_SETS" | b"INTERFACE_FILE_SETS_CXX_MODULES"
-                )
+                && !computed_file_set_property(property)
         })
         .collect::<Vec<_>>();
     if !properties.is_empty() {
@@ -339,6 +336,16 @@ fn render_target(
     }
     out.push(b'\n');
     Ok(())
+}
+
+fn computed_file_set_property(property: &[u8]) -> bool {
+    let name = property.strip_prefix(b"INTERFACE_").unwrap_or(property);
+    matches!(
+        name,
+        b"FILE_SET_TYPES" | b"HEADER_SETS" | b"SOURCE_SETS" | b"CXX_MODULE_SETS"
+    ) || name
+        .strip_prefix(b"FILE_SETS_")
+        .is_some_and(|kind| rcmake_model::FileSetKind::from_name(kind).is_some())
 }
 
 fn render_source_set(
@@ -633,3 +640,49 @@ pub(crate) fn write_output(host: &dyn Host, path: &Path, content: &[u8]) -> Resu
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+#[test]
+fn exports_file_sets_via_target_sources() -> Result<(), Box<dyn std::error::Error>> {
+    let base = if cfg!(windows) { "C:/work" } else { "/work" };
+    let plan = ExportPlan {
+        file: "sdk.cmake".into(),
+        namespace: "sdk::".into(),
+        targets: vec![ExportedTarget {
+            name: "library".into(),
+            kind: "INTERFACE".into(),
+            properties: [
+                ("INTERFACE_HEADER_SETS".into(), "headers".into()),
+                ("INTERFACE_SOURCE_SETS".into(), "source_files".into()),
+                ("INTERFACE_FILE_SETS_HEADERS".into(), "headers".into()),
+                ("INTERFACE_FILE_SETS_SOURCES".into(), "source_files".into()),
+                ("INTERFACE_INCLUDE_DIRECTORIES".into(), base.into()),
+            ]
+            .into(),
+            source_sets: vec![rcmake_resolve::ExportedSourceSet {
+                kind: rcmake_model::FileSetKind::Headers,
+                name: "headers".into(),
+                bases: vec![base.into()],
+                files: vec![format!("{base}/api.h").into()],
+                properties: Default::default(),
+            }],
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+
+    let output = render(&plan)?;
+    assert!(
+        output
+            .windows(b"INTERFACE_INCLUDE_DIRECTORIES".len())
+            .any(|part| part == b"INTERFACE_INCLUDE_DIRECTORIES")
+    );
+    let output = String::from_utf8(output.into())?;
+    assert!(output.contains(&format!(
+        "target_sources(\"sdk::library\" INTERFACE FILE_SET \"headers\" TYPE HEADERS BASE_DIRS \"{base}\" FILES \"{base}/api.h\")"
+    )));
+    assert!(!output.contains("INTERFACE_HEADER_SETS"));
+    assert!(!output.contains("INTERFACE_SOURCE_SETS"));
+    assert!(!output.contains("INTERFACE_FILE_SETS_"));
+    Ok(())
+}

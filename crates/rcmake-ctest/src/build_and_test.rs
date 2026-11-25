@@ -23,6 +23,10 @@ pub(crate) struct BuildAndTest {
     configure_twice: bool,
 }
 
+fn passthrough_error() -> String {
+    "The -- option cannot be used with --build-and-test. Use --build-options or --test-command to forward arguments.".into()
+}
+
 impl BuildAndTest {
     pub(crate) fn parse(args: &[BString], index: usize) -> Result<Self, String> {
         let Some((before, [_, source, build, after @ ..])) = args.split_at_checked(index) else {
@@ -83,6 +87,7 @@ impl BuildAndTest {
                         .map_err(|_| format!("Invalid test timeout '{raw}'."))?;
                     input.test_timeout = Duration::from_secs(value.min(30 * 60));
                 }
+                b"--" => return Err(passthrough_error()),
                 b"--build-options" => {
                     while let Some(option) = args.next_if(|option| {
                         !matches!(

@@ -19,17 +19,22 @@ use super::{
     targets::{TargetIndexes, TargetRef},
 };
 
+type RulesByDir<'a> = BTreeMap<DirId, Vec<(usize, &'a InstallRule)>>;
+
 pub(super) struct InstallRules<'a> {
     pub(super) by_target: BTreeMap<TargetId, Vec<&'a InstallRule>>,
-    pub(super) by_dir: BTreeMap<DirId, Vec<&'a InstallRule>>,
+    pub(super) by_dir: RulesByDir<'a>,
 }
 
 impl<'a> InstallRules<'a> {
     pub(super) fn collect(model: &'a ProjectModel) -> Self {
         let mut rules_by_target: BTreeMap<_, Vec<_>> = BTreeMap::new();
         let mut rules_by_dir: BTreeMap<_, Vec<_>> = BTreeMap::new();
-        for rule in &model.installs {
-            rules_by_dir.entry(rule.dir).or_default().push(rule);
+        for (index, rule) in model.installs.iter().enumerate() {
+            rules_by_dir
+                .entry(rule.dir)
+                .or_default()
+                .push((index, rule));
             if let InstallKind::Targets { targets, .. } = &rule.kind {
                 for id in targets {
                     rules_by_target.entry(*id).or_default().push(rule);
@@ -50,7 +55,7 @@ impl FileApi<'_, '_> {
         directories: &[(DirId, &Directory)],
         project_by_dir: &[usize],
         directory_targets: &[TargetIndexes],
-        rules_by_dir: &BTreeMap<DirId, Vec<&InstallRule>>,
+        rules_by_dir: &RulesByDir<'_>,
         targets: &BTreeMap<TargetId, TargetRef<'_>>,
     ) -> Result<Vec<Value>, GenError> {
         let mut has_install = vec![false; directories.len()];
@@ -154,15 +159,14 @@ impl FileApi<'_, '_> {
         &self,
         dir: &Directory,
         config: &[u8],
-        rules: &[&InstallRule],
+        rules: &[(usize, &InstallRule)],
         targets: &BTreeMap<TargetId, TargetRef<'_>>,
     ) -> Value {
         let mut graph = Backtraces::new(self.source);
         let mut installers = Vec::new();
-        for rule in rules
+        for &(index, rule) in rules
             .iter()
-            .copied()
-            .filter(|rule| applies(&rule.options.configurations, config))
+            .filter(|(_, rule)| applies(&rule.options.configurations, config))
         {
             let mut base = members([(
                 "component",
@@ -202,6 +206,16 @@ impl FileApi<'_, '_> {
                         installers.push(Object(item));
                     }
                     continue;
+                }
+                InstallKind::Files(_) | InstallKind::Programs(_)
+                    if self
+                        .model
+                        .global
+                        .props
+                        .get(format!("_RCMAKE_INSTALL_{index}_ARG0").as_bytes())
+                        .is_some_and(|signature| signature == b"IMPORTED_RUNTIME_ARTIFACTS") =>
+                {
+                    "importedRuntimeArtifacts"
                 }
                 InstallKind::Files(files)
                 | InstallKind::Programs(files)

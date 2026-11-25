@@ -36,7 +36,7 @@ pub(super) fn validate(
             "build"
         } else if source {
             "source"
-        } else if value.windows(2).any(|part| part == b"$<") {
+        } else if rcmake_genex::parse(value).is_ok_and(|ast| !ast.is_plain()) {
             return Err(ResolveError::Message(
                 "Install interface contains a mixed path.".into(),
             ));

@@ -912,8 +912,7 @@ fn prepare(
             .join(rcmake_host::path::to_native(&dependency));
         if host.metadata(&path, rcmake_host::Follow::Yes).is_err() {
             return Err(ResultLine::not_run(format!(
-                "Unable to find build dependency: {}",
-                path.display()
+                "Unable to find build dependency: {dependency}"
             )));
         }
     }
