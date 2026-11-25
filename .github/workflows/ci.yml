@@ -232,10 +232,6 @@ jobs:
           if-no-files-found: error
           retention-days: 3
 
-  # Enable the WASI gate after W0 adds rcmake-api to the workspace.
-  # Build --example wasm_smoke for wasm32-wasip1 and pass its artifact to
-  # wasm_smoke.py --require-wasi --wasi-bin. Keep the wasm32-unknown-unknown
-  # build and dependency checks.
   corpus-smoke:
     name: Corpus smoke on ${{ matrix.os }}
     if: github.event_name == 'workflow_dispatch' || github.event_name == 'push'

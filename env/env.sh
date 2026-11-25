@@ -23,7 +23,7 @@ unset _RCMAKE_ORACLE_DIR
 # Put Rust, Homebrew, and the pinned local tools (ninja) on PATH.
 export PATH="$RCMAKE_ORACLE_DIR/bin:$HOME/.cargo/bin:/opt/homebrew/bin:$PATH"
 
-# 16 GB RAM macOS arm64 concurrency caps (AGENTS.md)
+# Default local concurrency limits.
 export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-2}"
 export RUST_TEST_THREADS="${RUST_TEST_THREADS:-3}"
 export COPYFILE_DISABLE=1
