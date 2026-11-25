@@ -90,3 +90,40 @@ fn logs_distinct_impurity_sites_and_preserves_the_first_reason() -> HostResult<(
     assert_eq!(shared.line(), write.line() + 1);
     Ok(())
 }
+
+#[test]
+fn process_environment_keeps_unknown_variables_and_scalar_reads() -> HostResult<()> {
+    let host = PureHost::default();
+    let scratch = Path::new("/work/scratch");
+    host.create_dir_all(scratch)?;
+    host.env_set(b"PWD", Some(b"/first"));
+    host.env_set(b"SHLVL", Some(b"1"));
+    host.env_set(b"GITHUB_RUN_ID", Some(b"123"));
+    host.env_set(b"CPATH", Some(b"/include"));
+    host.env_set(b"COLUMNS", Some(b"80"));
+    let journal = JournalHost::new(&host, scratch, JournalMode::Observe, None)?;
+    let mut projected = journal.env_all();
+    super::super::plan::process_environment(&mut projected);
+    assert_eq!(
+        projected,
+        vec![
+            ("COLUMNS".into(), "80".into()),
+            ("CPATH".into(), "/include".into())
+        ]
+    );
+    let process_journal = journal.finish();
+    let journal = JournalHost::new(&host, scratch, JournalMode::Observe, None)?;
+    assert_eq!(
+        journal.env_get(b"PWD").as_deref().map(Vec::as_slice),
+        Some(b"/first".as_slice())
+    );
+    let scalar_journal = journal.finish();
+    host.env_set(b"PWD", Some(b"/second"));
+    host.env_set(b"SHLVL", Some(b"2"));
+    host.env_set(b"GITHUB_RUN_ID", Some(b"456"));
+    assert!(process_journal.verified_inputs(&host).is_some());
+    assert!(scalar_journal.verified_inputs(&host).is_none());
+    host.env_set(b"CPATH", Some(b"/other"));
+    assert!(process_journal.verified_inputs(&host).is_none());
+    Ok(())
+}

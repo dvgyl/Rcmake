@@ -1024,3 +1024,62 @@ fn sdk_memo_rechecks_the_graph_after_a_host_write() -> HostResult<()> {
     assert_eq!(memo.sdk_coverage_failures(), 1);
     Ok(())
 }
+
+#[test]
+fn confined_processes_keep_only_disjoint_search_digests() -> HostResult<()> {
+    use rcmake_host::{CommandSpec, Input, Output, RunOutput, RunRequest, WriteScope};
+
+    let base = host();
+    base.set_command_handler(|host, request, _| {
+        let program = &request.pipeline[0];
+        host.seed_file(
+            &request
+                .cwd
+                .join(rcmake_host::path::to_native(&program.args[0])),
+            b"",
+        )?;
+        Ok(RunOutput::default())
+    })?;
+    let base: std::sync::Arc<dyn Host> = std::sync::Arc::new(base);
+    let host = std::sync::Arc::new(rcmake_host::MemoHost::from_shared(base.clone()));
+    let sdk = host.initial_cwd().join("sdk");
+    let scratch = host.initial_cwd().join("scratch");
+    host.create_dir_all(&sdk)?;
+    host.create_dir_all(&scratch)?;
+
+    let memo = TraceMemo::with_generation(host.clone());
+    let sdk_first = memo.sdk_digest(base.as_ref(), &sdk)?;
+    let include_first = memo.tree_digest(base.as_ref(), &sdk)?;
+    let mut request = RunRequest {
+        pipeline: vec![CommandSpec {
+            program: rcmake_host::path::from_native(&host.initial_cwd().join("compiler")),
+            args: vec!["first.h".into()],
+        }],
+        cwd: scratch.clone(),
+        env: Vec::new(),
+        stdin: Input::Null,
+        stdout: Output::Null,
+        stderr: Output::Null,
+        timeout: None,
+        tee: false,
+    };
+    host.run_confined(&request, WriteScope(&[&scratch]), &mut |_, _| {})?;
+    assert_eq!(memo.sdk_digest(base.as_ref(), &sdk)?, sdk_first);
+    assert_eq!(memo.tree_digest(base.as_ref(), &sdk)?, include_first);
+    assert_eq!(memo.sdk_graph_hits(), 1);
+
+    request.cwd.clone_from(&sdk);
+    host.run_bounded_confined(&request, 128, WriteScope(&[&sdk]))?;
+    let sdk_second = memo.sdk_digest(base.as_ref(), &sdk)?;
+    let include_second = memo.tree_digest(base.as_ref(), &sdk)?;
+    assert_ne!(sdk_second, sdk_first);
+    assert_ne!(include_second, include_first);
+    assert_eq!(memo.sdk_graph_hits(), 1);
+
+    request.pipeline[0].args[0] = "second.h".into();
+    host.run(&request, &mut |_, _| {})?;
+    assert_ne!(memo.sdk_digest(base.as_ref(), &sdk)?, sdk_second);
+    assert_ne!(memo.tree_digest(base.as_ref(), &sdk)?, include_second);
+    assert_eq!(memo.sdk_graph_hits(), 1);
+    Ok(())
+}
