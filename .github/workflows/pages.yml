@@ -7,6 +7,8 @@ name: Deploy GitHub Pages
       - 'site/**'
       - 'assets/brand/**'
       - '.github/workflows/pages.yml'
+  schedule:
+    - cron: '30 6 * * *'
   workflow_dispatch:
 
 permissions:
@@ -27,6 +29,30 @@ jobs:
         with:
           persist-credentials: false
       - uses: actions/configure-pages@v5
+      - name: Validate site assets
+        run: |
+          node --check site/*.js site/wasm/rcmake_wasm.js
+          test -s site/wasm/rcmake_wasm.wasm
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          import sys
+
+          wasm = Path("site/wasm/rcmake_wasm.wasm").read_bytes()
+          if wasm[:8] != b"\x00asm\x01\x00\x00\x00":
+              sys.exit("site/wasm/rcmake_wasm.wasm is missing the WebAssembly v1 header.")
+
+          latest = json.loads(Path("site/data/latest.json").read_text(encoding="utf-8"))
+          schema = json.loads(Path("site/data/dashboard.schema.json").read_text(encoding="utf-8"))
+          if not isinstance(latest, dict) or not isinstance(schema, dict):
+              sys.exit("site/data JSON files must contain JSON objects.")
+
+          sys.path.insert(0, "tools/measure")
+          from build_dashboard_json import validate
+
+          validate(latest, schema, schema)
+          print(f"Validated site assets: wasm={len(wasm)} bytes, schemaVersion={latest['schemaVersion']}")
+          PY
       - uses: actions/upload-pages-artifact@v4
         with:
           path: site

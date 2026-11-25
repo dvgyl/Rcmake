@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://dvgyl.github.io/Rcmake/data/dashboard.schema.json",
+  "$id": "https://dvgyl.github.io/rcmake/data/dashboard.schema.json",
   "title": "Rcmake Nightly Compatibility Dashboard Snapshot",
   "description": "Schema for site/data/latest.json driving the Rcmake landing proof strip and 7-track compatibility dashboard.",
   "type": "object",
@@ -23,9 +23,20 @@
       "type": ["string", "null"],
       "description": "Short or full Git commit SHA for the verified binary."
     },
+    "binarySha256": {
+      "type": ["string", "null"],
+      "pattern": "^[0-9a-f]{64}$",
+      "description": "Optional SHA-256 hex digest of the frozen release binary measured across all receipts."
+    },
     "rcmakeVersion": { "type": "string" },
     "targetCmakeVersion": { "type": "string" },
     "statusNote": { "type": "string" },
+    "knownParityGaps": {
+      "type": ["array", "string", "null"],
+      "items": { "type": "string" },
+      "description": "Optional list or summary of known parity gaps from the frozen release verification run."
+    },
+    "receipt": { "$ref": "#/$defs/releaseReceipt" },
     "tracks": {
       "type": "object",
       "required": [
@@ -149,6 +160,8 @@
             "projectsTotal": { "type": "integer", "minimum": 1 },
             "l1Passed": { "type": ["integer", "null"], "minimum": 0 },
             "l2Passed": { "type": ["integer", "null"], "minimum": 0 },
+            "l3Passed": { "type": ["integer", "null"], "minimum": 0 },
+            "l4Passed": { "type": ["integer", "null"], "minimum": 0 },
             "note": { "type": "string" },
             "projects": {
               "type": "array",
@@ -167,6 +180,8 @@
                   },
                   "l1": { "$ref": "#/$defs/status" },
                   "l2": { "$ref": "#/$defs/status" },
+                  "l3": { "$ref": "#/$defs/status" },
+                  "l4": { "$ref": "#/$defs/status" },
                   "note": { "type": "string" }
                 }
               }
@@ -272,8 +287,20 @@
                 "warmProbeSpeedup": { "$ref": "#/$defs/benchmarkMetric" },
                 "incrementalLeafP95Ms": { "$ref": "#/$defs/benchmarkMetric" },
                 "coldConfigureSpeedup": { "$ref": "#/$defs/benchmarkMetric" },
-                "peakRssMiB": { "$ref": "#/$defs/benchmarkMetric" }
+                "peakRssMiB": { "$ref": "#/$defs/benchmarkMetric" },
+                "realGiantWarmSpeedup": { "$ref": "#/$defs/benchmarkMetric" },
+                "realGiantColdSpeedup": { "$ref": "#/$defs/benchmarkMetric" },
+                "realGiantLeafP95Ms": { "$ref": "#/$defs/benchmarkMetric" }
               }
+            },
+            "realGiants": {
+              "type": "array",
+              "description": "Optional per-project benchmark measurements across real-world large C++ projects.",
+              "items": { "$ref": "#/$defs/realGiantBenchmark" }
+            },
+            "differentialFuzz": {
+              "$ref": "#/$defs/differentialFuzzReport",
+              "description": "Optional seeded differential property-testing summary from oracle_prop_test.py."
             },
             "gates": {
               "type": "array",
@@ -289,6 +316,8 @@
                   "failures": { "type": ["integer", "null"], "minimum": 0 },
                   "scenariosPassed": { "type": ["integer", "null"], "minimum": 0 },
                   "scenariosTotal": { "type": ["integer", "null"], "minimum": 0 },
+                  "seed": { "type": ["integer", "null"] },
+                  "oracleErrors": { "type": ["integer", "null"], "minimum": 0 },
                   "summary": { "type": "string" },
                   "detail": { "type": "string" }
                 }
@@ -309,6 +338,29 @@
       "minimum": 0,
       "maximum": 100
     },
+    "sha256": {
+      "type": ["string", "null"],
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "releaseReceipt": {
+      "type": "object",
+      "description": "Provenance metadata linking a dashboard snapshot to one frozen release binary and its verification receipts.",
+      "properties": {
+        "commit": { "type": ["string", "null"] },
+        "binarySha256": { "$ref": "#/$defs/sha256" },
+        "binarySizeBytes": { "type": ["integer", "null"], "minimum": 0 },
+        "manifestSha256": { "$ref": "#/$defs/sha256" },
+        "tarballSha256": { "$ref": "#/$defs/sha256" },
+        "wasmSha256": { "$ref": "#/$defs/sha256" },
+        "oracleVersion": { "type": ["string", "null"] },
+        "generatedAt": { "type": ["string", "null"] },
+        "runId": { "type": ["string", "null"] },
+        "artifactUrls": {
+          "type": "object",
+          "additionalProperties": { "type": "string" }
+        }
+      }
+    },
     "benchmarkMetric": {
       "type": "object",
       "required": ["label", "value", "unit", "baseline", "status"],
@@ -318,6 +370,42 @@
         "unit": { "type": "string" },
         "baseline": { "type": "string" },
         "status": { "$ref": "#/$defs/status" },
+        "note": { "type": "string" }
+      }
+    },
+    "realGiantBenchmark": {
+      "type": "object",
+      "required": ["project", "status"],
+      "properties": {
+        "project": { "type": "string" },
+        "repository": { "type": "string" },
+        "version": { "type": "string" },
+        "coldConfigureSpeedup": { "type": ["number", "null"], "minimum": 0 },
+        "warmProbeSpeedup": { "type": ["number", "null"], "minimum": 0 },
+        "incrementalLeafP95Ms": { "type": ["number", "null"], "minimum": 0 },
+        "rcmakeMedianMs": { "type": ["number", "null"], "minimum": 0 },
+        "oracleMedianMs": { "type": ["number", "null"], "minimum": 0 },
+        "peakRssMiB": { "type": ["number", "null"], "minimum": 0 },
+        "binarySha256": { "$ref": "#/$defs/sha256" },
+        "status": { "$ref": "#/$defs/status" },
+        "note": { "type": "string" }
+      }
+    },
+    "differentialFuzzReport": {
+      "type": "object",
+      "required": ["status", "total", "passed", "failed", "oracleErrors"],
+      "properties": {
+        "label": { "type": "string" },
+        "status": { "$ref": "#/$defs/status" },
+        "seed": { "type": ["integer", "null"] },
+        "total": { "type": ["integer", "null"], "minimum": 0 },
+        "passed": { "type": ["integer", "null"], "minimum": 0 },
+        "failed": { "type": ["integer", "null"], "minimum": 0 },
+        "oracleErrors": { "type": ["integer", "null"], "minimum": 0 },
+        "scriptCases": { "type": ["integer", "null"], "minimum": 0 },
+        "configureCases": { "type": ["integer", "null"], "minimum": 0 },
+        "families": { "type": ["integer", "null"], "minimum": 0 },
+        "binarySha256": { "$ref": "#/$defs/sha256" },
         "note": { "type": "string" }
       }
     }
