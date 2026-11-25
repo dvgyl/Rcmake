@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use super::journal::{ImpureReason, Journal, JournalChecks};
 use super::plan::{
     ArtifactRef, ProbeDiagnostic, ProbeEligibility, ProbeOutcome, ProbeRecipe, ReuseScope,
-    compute_probe_key, environment_fingerprint,
+    compute_probe_key, process_environment_fingerprint,
 };
 use super::template::{Templated, round_trip_verify};
 
@@ -318,7 +318,7 @@ impl ProbeCache {
             || config.mode == StoreMode::Off
             || recipe.eligibility != ProbeEligibility::Eligible
             || (recipe.try_run && recipe.scope != ReuseScope::ExactBindings)
-            || recipe.environment != environment_fingerprint(&host.env_all())
+            || recipe.environment != process_environment_fingerprint(&host.env_all())
         {
             return None;
         }
@@ -382,7 +382,7 @@ impl ProbeCache {
             if cancelled() {
                 return Ok(ProbePublishOutcome::Skipped(SkipReason::Cancelled));
             }
-            if recipe.environment != environment_fingerprint(&host.env_all()) {
+            if recipe.environment != process_environment_fingerprint(&host.env_all()) {
                 return Ok(inputs_changed());
             }
             let bindings = recipe.bindings.clone().with_canonical(host);
@@ -412,7 +412,7 @@ impl ProbeCache {
             use rcmake_store::PublishOutcome;
             let fresh_valid = || {
                 !cancelled()
-                    && recipe.environment == environment_fingerprint(&host.env_all())
+                    && recipe.environment == process_environment_fingerprint(&host.env_all())
                     && checks.verify(host)
             };
             match store.put_entry_checked(
@@ -741,7 +741,7 @@ pub(super) fn rebind_speculation(
     spec: crate::configure::probe_pool::ChildResult,
 ) -> Option<ObservedOutcome> {
     if compute_probe_key(&spec.recipe) != compute_probe_key(recipe)
-        || recipe.environment != environment_fingerprint(&host.env_all())
+        || recipe.environment != process_environment_fingerprint(&host.env_all())
         || spec.journal.verified_inputs(host).is_none()
     {
         return None;

@@ -23,7 +23,7 @@ use rcmake_store::{
 };
 use serde::{Deserialize, Serialize};
 
-use super::plan::{environment_fingerprint, request_digest};
+use super::plan::{process_environment_fingerprint, request_digest};
 use host_impl::SharedOrBorrowed;
 
 #[path = "depfile.rs"]
@@ -258,7 +258,7 @@ impl Check {
                 .canonicalize(path)
                 .ok()
                 .map(|target| path_digest(&target)),
-            Self::Environment => Some(environment_fingerprint(&host.env_all())),
+            Self::Environment => Some(process_environment_fingerprint(&host.env_all())),
             Self::Executable => host.current_exe().ok().map(|exe| path_digest(&exe)),
             Self::WorkingDirectory => Some(path_digest(&host.initial_cwd())),
             Self::System => Some(system_digest(&host.system())),

@@ -237,14 +237,15 @@ impl Host for JournalHost<'_> {
     }
 
     fn env_get(&self, name: &[u8]) -> Option<BString> {
-        if let Some(spec) = &self.speculation {
+        let value = if let Some(spec) = &self.speculation {
             let windows = self.inner.system().sysname == b"Windows";
-            return spec.environment.iter().rev().find_map(|(key, value)| {
+            spec.environment.iter().rev().find_map(|(key, value)| {
                 (key.as_slice() == name || (windows && key.eq_ignore_ascii_case(name)))
                     .then(|| value.clone())
-            });
-        }
-        let value = self.inner.env_get(name);
+            })
+        } else {
+            self.inner.env_get(name)
+        };
         let mut state = self.state();
         if state.can_record() {
             if conflicts(&mut state.environment, name.to_vec(), value.clone()) {
@@ -274,7 +275,10 @@ impl Host for JournalHost<'_> {
         if state.full_environment.is_none() {
             state.full_environment = Some(environment.clone());
         }
-        state.check(Check::Environment, environment_fingerprint(&environment));
+        state.check(
+            Check::Environment,
+            process_environment_fingerprint(&environment),
+        );
         environment
     }
 

@@ -98,7 +98,7 @@ impl CompilerEvidence {
             let key = (
                 self.toolchain.driver.clone(),
                 search.clone(),
-                environment_fingerprint(env),
+                process_environment_fingerprint(env),
             );
             let mut memo = self.searches.lock().ok()?;
             let found = if let Some((paths, present)) = memo.get(&key)

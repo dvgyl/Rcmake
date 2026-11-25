@@ -16,7 +16,7 @@ use super::cache::{Artifact, ObservedOutcome, ProbeCache, VerifyContext};
 use super::journal::{CompileIntervals, Journal, JournalHost};
 use super::plan::{
     Admission, PathBindings, ProbeEligibility, ProbeRecipe, RcmakeBuildId, ReuseScope, Templated,
-    compute_probe_key, environment_fingerprint,
+    compute_probe_key, process_environment_fingerprint,
 };
 use super::seed::TryCompileSeed;
 use super::{ProbeDirs, ProbeResult};
@@ -143,12 +143,14 @@ impl rcmake_resolve::GeneratorFacts for ProbeGeneratorFacts {
         }) {
             return fallback();
         }
+        let mut request = request.clone();
+        super::plan::process_environment(&mut request.env);
         let result = self.facts.ninja_cxx_dyndep(
             self.real.as_ref(),
-            request,
+            &request,
             program.clone(),
             digest,
-            environment_fingerprint(&request.env),
+            process_environment_fingerprint(&request.env),
         );
         if let Some(journal) = &self.journal {
             if result.is_none()
@@ -332,7 +334,7 @@ impl PreparedProbe {
             sysroot: cx.var_or_empty(b"CMAKE_OSX_SYSROOT"),
             seed,
             imports: Templated::capture(format!("{imports:?}").as_bytes(), &bindings)?.digest(),
-            environment: environment_fingerprint(&environment),
+            environment: process_environment_fingerprint(&environment),
             scope: ReuseScope::VerifiedRelocation,
             bindings,
             try_run: false,

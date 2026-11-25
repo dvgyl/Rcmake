@@ -40,7 +40,7 @@ pub(crate) fn recipe(host: &dyn Host, root: &Path) -> HostResult<ProbeRecipe> {
         sysroot: "/sdk".into(),
         seed: digest,
         imports: digest,
-        environment: environment_fingerprint(&host.env_all()),
+        environment: process_environment_fingerprint(&host.env_all()),
         scope: ReuseScope::VerifiedRelocation,
         bindings,
         try_run: false,

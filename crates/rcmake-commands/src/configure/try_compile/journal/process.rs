@@ -53,7 +53,9 @@ impl JournalHost<'_> {
             self.limit_speculative_request(request)?;
         }
         if let Some(verifier) = self.verify_process.as_deref() {
-            verifier.instrument(request.to_mut());
+            let request = request.to_mut();
+            super::super::plan::process_environment(&mut request.env);
+            verifier.instrument(request);
         }
         let preflight = match self.before_process(&request) {
             Ok(trace) => trace,

@@ -148,7 +148,7 @@ pub(crate) struct ProbeRecipe {
     pub(crate) seed: Digest,
     /// Canonical imported target and alias definitions.
     pub(crate) imports: Digest,
-    /// Environment fingerprint from the complete inherited environment.
+    /// Environment fingerprint for certified tool requests.
     pub(crate) environment: Digest,
     /// Path and artifact relocation contract.
     pub(crate) scope: ReuseScope,
@@ -256,6 +256,49 @@ pub(crate) fn environment_fingerprint(environment: &[(BString, BString)]) -> Dig
     let mut key = KeyHasher::new(Domain::ProbeV1);
     key.field(0, b"environment");
     for (name, value) in environment {
+        key.field(1, name);
+        key.field(2, value);
+    }
+    key.finish()
+}
+
+/// Remove shell and job metadata from certified tool requests.
+pub(crate) fn process_environment(environment: &mut Vec<(BString, BString)>) {
+    environment.retain(|(name, _)| keep_process_variable(name));
+}
+
+fn keep_process_variable(name: &[u8]) -> bool {
+    !matches!(
+        name,
+        b"PWD"
+            | b"OLDPWD"
+            | b"SHLVL"
+            | b"_"
+            | b"TERM_SESSION_ID"
+            | b"ITERM_SESSION_ID"
+            | b"XDG_SESSION_ID"
+            | b"GITHUB_RUN_ID"
+            | b"GITHUB_RUN_NUMBER"
+            | b"GITHUB_RUN_ATTEMPT"
+            | b"CI_JOB_ID"
+            | b"CI_PIPELINE_ID"
+            | b"BUILDKITE_BUILD_ID"
+            | b"CIRCLE_BUILD_NUM"
+            | b"RCMAKE_PROBE_PURITY_LOG"
+            | b"RCMAKE_MEASURE_PROBE_INTERVALS"
+            | b"RCMAKE_PROBE_JOBS"
+            | b"RCMAKE_PROBE_CACHE_DIR"
+    )
+}
+
+/// Hash the environment observed by a certified tool.
+pub(crate) fn process_environment_fingerprint(environment: &[(BString, BString)]) -> Digest {
+    let mut key = KeyHasher::new(Domain::ProbeV1);
+    key.field(0, b"environment");
+    for (name, value) in environment
+        .iter()
+        .filter(|(name, _)| keep_process_variable(name))
+    {
         key.field(1, name);
         key.field(2, value);
     }

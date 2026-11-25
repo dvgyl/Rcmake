@@ -384,8 +384,9 @@ pub(super) fn query_in(
     program: &Path,
     args: &[BString],
     cwd: &Path,
-    env: Vec<(BString, BString)>,
+    mut env: Vec<(BString, BString)>,
 ) -> Option<RunOutput> {
+    super::super::super::plan::process_environment(&mut env);
     let output = host
         .run_bounded(
             &RunRequest {

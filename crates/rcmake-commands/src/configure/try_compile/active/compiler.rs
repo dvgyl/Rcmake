@@ -11,7 +11,7 @@ use rcmake_store::{Digest, InputStamp, Trace, TraceMemo, VerifyOutcome};
 use crate::configure::platform_queries::{PlatformQueries, RecordedQueries};
 
 use super::super::journal::{DependencyClosure, ProcessVerifier, SearchObservation, depfile};
-use super::super::plan::environment_fingerprint;
+use super::super::plan::process_environment_fingerprint;
 
 mod flags;
 mod hazards;
@@ -208,7 +208,7 @@ impl CompilerEvidence {
             sdk.clone(),
             id,
             cxx,
-            environment_fingerprint(&host.env_all()),
+            process_environment_fingerprint(&host.env_all()),
         );
         let mut tools = session.tools.lock().ok()?;
         if tools.get(&key).is_some_and(|toolchain| {
@@ -844,8 +844,8 @@ mod tests {
         assert!(admit_environment(&first));
         assert!(admit_environment(&second));
         assert_ne!(
-            environment_fingerprint(&first),
-            environment_fingerprint(&second)
+            process_environment_fingerprint(&first),
+            process_environment_fingerprint(&second)
         );
     }
 }
