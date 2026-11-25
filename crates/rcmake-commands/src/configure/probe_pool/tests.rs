@@ -1,6 +1,8 @@
 use super::*;
 use rcmake_host::PureHost;
 
+const WORK: &str = if cfg!(windows) { "C:/work" } else { "/work" };
+
 #[test]
 fn limits_total_jobs_and_uses_explicit_settings_first() {
     let host = PureHost::default();
@@ -20,15 +22,15 @@ fn limits_total_jobs_and_uses_explicit_settings_first() {
 #[test]
 fn claims_and_cleans_distinct_scratch_directories() -> HostResult<()> {
     let host = PureHost::default();
-    let root = Path::new("/work/spec");
-    host.create_dir_all(root)?;
+    let root = Path::new(WORK).join("spec");
+    host.create_dir_all(&root)?;
     {
-        let first = Scratch::create(&host, root)?;
-        let second = Scratch::create(&host, root)?;
+        let first = Scratch::create(&host, &root)?;
+        let second = Scratch::create(&host, &root)?;
         assert_ne!(first.path, second.path);
-        assert_eq!(host.read_dir(root)?.len(), 4);
+        assert_eq!(host.read_dir(&root)?.len(), 4);
     }
-    assert!(host.read_dir(root)?.is_empty());
+    assert!(host.read_dir(&root)?.is_empty());
     Ok(())
 }
 struct TestCompiler;
@@ -38,7 +40,8 @@ impl ProcessVerifier for TestCompiler {
         let [command] = request.pipeline.as_slice() else {
             return None;
         };
-        (command.program == b"/work/compiler").then(Vec::new)
+        (command.program == path::from_native_cmake(&Path::new(WORK).join("compiler")))
+            .then(Vec::new)
     }
 
     fn dependencies(
@@ -48,7 +51,7 @@ impl ProcessVerifier for TestCompiler {
     ) -> Option<super::super::try_compile::journal::DependencyClosure> {
         use super::super::try_compile::journal::DependencyClosure;
         Some(DependencyClosure {
-            files: [PathBuf::from("/work/header.h")].into(),
+            files: [Path::new(WORK).join("header.h")].into(),
             searches: Vec::new(),
         })
     }
@@ -63,25 +66,27 @@ fn owns_the_request_and_recovers_after_a_worker_panics() -> HostResult<()> {
     use std::sync::mpsc;
 
     let host = PureHost::default();
-    let root = Path::new("/work/spec");
-    host.create_dir_all(root)?;
-    host.seed_file(Path::new("/work/header.h"), b"header")?;
-    host.seed_file(Path::new("/work/compiler"), b"compiler")?;
+    let work = Path::new(WORK);
+    let root = work.join("spec");
+    let compiler = work.join("compiler");
+    host.create_dir_all(&root)?;
+    host.seed_file(&work.join("header.h"), b"header")?;
+    host.seed_file(&compiler, b"compiler")?;
     host.sleep(Duration::from_secs(3));
     host.env_set(b"LANG", Some(b"C"));
     let environment = host.env_all();
-    let config = StoreConfig::new("/work/cache".into());
+    let config = StoreConfig::new(work.join("cache"));
     let cache = ProbeCache::new(rcmake_store::StoreMode::ReadWrite);
     let context = WorkerContext {
         host: &host,
         store: &config,
         cache: &cache,
-        scratch_root: root,
+        scratch_root: &root,
         process_verifier: Some(&TestCompiler),
     };
-    let mut good = recipe(&host, Path::new("/work"))?;
+    let mut good = recipe(&host, work)?;
     good.speculative_run = Some(SpeculativeRun {
-        program: "/work/compiler".into(),
+        program: path::from_native_cmake(&compiler),
         args: Vec::new(),
         artifact: None,
         timeout: Duration::from_secs(4),
@@ -144,9 +149,12 @@ fn owns_the_request_and_recovers_after_a_worker_panics() -> HostResult<()> {
         let hit = cache
             .lookup(&host, &config, &good)
             .ok_or_else(|| HostError::unsupported("Missing worker result."))?;
-        assert_eq!(hit.output, b"/work/scratch/probe.c");
+        assert_eq!(
+            hit.output.as_slice(),
+            path::from_native_cmake(&work.join("scratch/probe.c")).as_slice()
+        );
         Ok(())
     })?;
-    assert!(host.read_dir(root)?.is_empty());
+    assert!(host.read_dir(&root)?.is_empty());
     Ok(())
 }

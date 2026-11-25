@@ -137,12 +137,15 @@ fn updates_the_lock_and_populates_an_offline_archive() -> TestResult {
             return Err(HostError::unsupported("Expected one download process."));
         };
         assert_eq!(curl.program, "curl");
-        let file = curl
+        let destination = curl
             .args
             .windows(2)
-            .find(|args| args[0] == "--output")
+            .find_map(|args| match args {
+                [flag, file] if flag == "--output" => Some(file),
+                _ => None,
+            })
             .ok_or_else(|| HostError::unsupported("Missing download destination."))?;
-        host.seed_file(&path::to_native(&file[1]), b"abc")?;
+        host.seed_file(&path::to_native(destination), b"abc")?;
         Ok(RunOutput {
             results: vec![ProcessResult::Exited(0)],
             ..RunOutput::default()

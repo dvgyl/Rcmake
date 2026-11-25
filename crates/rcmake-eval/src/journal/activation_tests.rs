@@ -189,7 +189,7 @@ fn invalid_late_effect_does_not_change_earlier_variables() -> TestResult {
     let RegionPayload::Complete { effects, .. } = &mut bad.region.payload else {
         return Err("Missing effects.".into());
     };
-    effects[0] = JournalEffect::SetVar {
+    *effects.first_mut().ok_or("Expected at least one effect.")? = JournalEffect::SetVar {
         scope: VariableScope::Current,
         name: b"WRONG".to_vec(),
         value: Some(b"leak".to_vec()),

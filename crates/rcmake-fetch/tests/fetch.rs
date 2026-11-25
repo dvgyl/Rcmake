@@ -786,7 +786,8 @@ fn archive_offline_error_names_the_corrupt_cache_object() -> Result<(), Box<dyn 
     assert!(
         error
             .to_string()
-            .contains(object.to_str().ok_or("The cache path is not UTF-8.")?)
+            .contains(&format!("Cannot use cache path {object:?}.")),
+        "{error}"
     );
     assert!(matches!(error, FetchError::Archive { cause, .. }
         if matches!(cause.as_ref(), FetchError::CacheAndDownload { cache, .. }

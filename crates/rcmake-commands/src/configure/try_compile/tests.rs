@@ -273,33 +273,38 @@ try_compile(result SOURCE_FROM_CONTENT "probe source.c" "int main(void) {{ retur
 fn sends_child_trace_to_the_parent_destination() -> TestResult {
     use rcmake_eval::{TraceConfig, TraceFormat};
 
+    let work = format!("{DRIVE}/work");
+    let root = Path::new(&work);
     for format in [TraceFormat::Human, TraceFormat::JsonV1] {
         let host = Arc::new(PureHost::default());
         host.seed_file(
-            Path::new("/work/CMakeLists.txt"),
-            br#"
+            &root.join("CMakeLists.txt"),
+            format!(
+                r#"
 cmake_minimum_required(VERSION 4.5)
 project(Parent NONE)
-try_compile(CHILD PROJECT Child SOURCE_DIR /work/child OUTPUT_VARIABLE child_output NO_LOG)
+try_compile(CHILD PROJECT Child SOURCE_DIR "{work}/child" OUTPUT_VARIABLE child_output NO_LOG)
 message(STATUS "after probe")
-"#,
+"#
+            )
+            .as_bytes(),
         )?;
         host.seed_file(
-            Path::new("/work/child/CMakeLists.txt"),
+            &root.join("child/CMakeLists.txt"),
             br#"
 cmake_minimum_required(VERSION 4.5)
 project(Child NONE)
 message(STATUS "inside probe")
 "#,
         )?;
-        let redirect = (format == TraceFormat::JsonV1).then(|| PathBuf::from("/work/trace"));
-        let mut interp = interpreter(host.clone(), Path::new("/work"))?;
+        let redirect = (format == TraceFormat::JsonV1).then(|| root.join("trace"));
+        let mut interp = interpreter(host.clone(), root)?;
         interp.set_trace_config(Some(TraceConfig {
             format,
             redirect: redirect.clone(),
             ..TraceConfig::default()
         }));
-        let result = interp.run_configure(Path::new("/work"), Path::new("/work/build"), &[]);
+        let result = interp.run_configure(root, &root.join("build"), &[]);
         assert_eq!(result.exit_code, 0, "{}", host.stream_bytes(Stream::Stderr));
         assert_eq!(
             interp.cx().var_or_empty(b"child_output"),
@@ -511,22 +516,24 @@ int main() { static_assert(Valid<int>); }
 #[test]
 fn try_compile_can_nest_three_projects_with_the_default_recursion_limit() -> TestResult {
     let host = Arc::new(PureHost::default());
+    let work = format!("{DRIVE}/work");
+    let root = Path::new(&work);
     for level in 0..=3 {
         let mut code = format!("cmake_minimum_required(VERSION 4.5)\nproject(Probe{level} NONE)\n");
         if level < 3 {
             let next = level + 1;
             code.push_str(&format!(
-                "try_compile(success PROJECT Probe{next} SOURCE_DIR /work/probe{next} OUTPUT_VARIABLE output NO_LOG)\n\
+                "try_compile(success PROJECT Probe{next} SOURCE_DIR \"{work}/probe{next}\" OUTPUT_VARIABLE output NO_LOG)\n\
                  if(NOT success)\n  message(FATAL_ERROR \"${{output}}\")\nendif()\n"
             ));
         }
         host.seed_file(
-            Path::new(&format!("/work/probe{level}/CMakeLists.txt")),
+            &root.join(format!("probe{level}/CMakeLists.txt")),
             code.as_bytes(),
         )?;
     }
-    let mut interp = interpreter(host.clone(), Path::new("/work"))?;
-    let result = interp.run_configure(Path::new("/work/probe0"), Path::new("/work/build"), &[]);
+    let mut interp = interpreter(host.clone(), root)?;
+    let result = interp.run_configure(&root.join("probe0"), &root.join("build"), &[]);
     assert_eq!(result.exit_code, 0, "{}", host.stream_bytes(Stream::Stderr));
     Ok(())
 }

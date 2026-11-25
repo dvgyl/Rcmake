@@ -71,8 +71,11 @@ fn strict_checks_every_stage_before_starting_a_pipeline() -> HostResult<()> {
     let runs = Arc::clone(&count);
     inner.set_command_handler(move |_, request, _| {
         runs.fetch_add(1, Ordering::Relaxed);
+        let [command] = request.pipeline.as_slice() else {
+            return Err(HostError::unsupported("Expected one approved process."));
+        };
         assert_eq!(
-            request.pipeline[0].program,
+            command.program,
             path::from_native(&absolute("/bin/approved"))
         );
         assert!(!request.env.iter().any(|(key, _)| key == b"TOKEN"));
@@ -93,7 +96,10 @@ fn strict_denies_an_unpinned_upload_through_an_approved_curl_alias() -> HostResu
     let (inner, runtime) = setup(HermeticMode::Strict)?;
     inner.symlink(&absolute("/bin/approved"), &absolute("/bin/curl"))?;
     let mut request = request(inner.as_ref(), &[b"curl"]);
-    request.pipeline[0].args = vec![
+    let [command] = request.pipeline.as_mut_slice() else {
+        return Err(HostError::unsupported("Expected one upload process."));
+    };
+    command.args = vec![
         "--upload-file".into(),
         "CMakeLists.txt".into(),
         "--url".into(),

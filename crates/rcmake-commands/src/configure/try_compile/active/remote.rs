@@ -133,10 +133,10 @@ mod tests {
         assert!(RemoteProbe::new(&host).is_none());
         host.env_set(b"RCMAKE_FETCH_OFFLINE", None);
 
-        let root = Path::new("/work");
+        let root = Path::new(if cfg!(windows) { "C:/work" } else { "/work" });
         let scratch = root.join("build/scratch");
         host.create_dir_all(&scratch)?;
-        let config = StoreConfig::new("/cache".into());
+        let config = StoreConfig::new(root.join("cache"));
         let recipe = recipe(&host, root)?;
         let cache = ProbeCache::new(StoreMode::ReadWrite);
         assert!(enabled.get(&host, &config, &recipe).is_none());
