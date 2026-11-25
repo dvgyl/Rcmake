@@ -20,7 +20,7 @@ pub(in crate::process_find) struct Request {
     pub(super) optional: bool,
     pub(super) module: bool,
     pub(in crate::process_find) global: bool,
-    no_policy_scope: bool,
+    pub(super) no_policy_scope: bool,
     pub(super) bypass_provider: bool,
     pub(super) unwind_include: bool,
     pub(super) registry_view: Option<BString>,
@@ -31,6 +31,9 @@ pub(in crate::process_find) struct Request {
     pub(super) hints: Vec<BString>,
     pub(super) paths: Vec<BString>,
     pub(super) suffixes: Vec<BString>,
+    pub(super) log_hints: Vec<BString>,
+    pub(super) log_paths_args: Vec<BString>,
+    pub(super) log_suffixes: Vec<BString>,
     disabled_sources: BTreeSet<&'static [u8]>,
     no_defaults: bool,
     pub(super) root_mode: RootMode,
@@ -207,21 +210,74 @@ impl Request {
                 } else {
                     &mut self.paths
                 };
+                let raw = if matches!(values, Values::Hints) {
+                    &mut self.log_hints
+                } else {
+                    &mut self.log_paths_args
+                };
+                raw.push(value.clone());
                 if value == b"ENV" {
                     if let Some(key) = args.next() {
+                        raw.push(key.value.clone());
                         dest.extend(host_env_paths(cx, &key.value));
                     }
                 } else {
                     dest.push(value.clone());
                 }
             }
-            Values::Suffixes => self.suffixes.push(value.clone()),
+            Values::Suffixes => {
+                self.suffixes.push(value.clone());
+                let suffix = value.strip_prefix(b"/").unwrap_or(value);
+                let suffix = suffix.strip_suffix(b"/").unwrap_or(suffix);
+                if !suffix.is_empty() {
+                    self.log_suffixes.push(suffix.into());
+                }
+            }
             Values::None if self.version.is_none() => {
                 self.version = Some(VersionRequest::parse(value)?)
             }
             Values::None => return Err(invalid_argument(value)),
         }
         Ok(())
+    }
+
+    pub(super) fn log_paths(&self, cx: &Cx<'_>) -> Vec<(&'static [u8], bool)> {
+        let enabled = |source: &'static [u8]| {
+            !self.disabled_sources.contains(source)
+                && setting_enabled(cx, &text(&[b"CMAKE_FIND_USE_", source]))
+        };
+        let registry = |source: &'static [u8], legacy| {
+            let key = text(&[b"CMAKE_FIND_USE_", source]);
+            enabled(source) && (cx.var_defined(&key) || !cx.var_is_on(legacy))
+        };
+        vec![
+            (b"CMAKE_PATH", !self.no_defaults),
+            (
+                b"CMAKE_ENVIRONMENT_PATH",
+                enabled(b"CMAKE_ENVIRONMENT_PATH"),
+            ),
+            (
+                b"SYSTEM_ENVIRONMENT_PATH",
+                enabled(b"SYSTEM_ENVIRONMENT_PATH"),
+            ),
+            (b"CMAKE_SYSTEM_PATH", enabled(b"CMAKE_SYSTEM_PATH")),
+            (b"INSTALL_PREFIX", enabled(b"INSTALL_PREFIX")),
+            (b"PACKAGE_ROOT_PATH", enabled(b"PACKAGE_ROOT_PATH")),
+            (
+                b"CMAKE_PACKAGE_REGISTRY",
+                registry(
+                    b"PACKAGE_REGISTRY",
+                    b"CMAKE_FIND_PACKAGE_NO_PACKAGE_REGISTRY".as_slice(),
+                ),
+            ),
+            (
+                b"SYSTEM_PACKAGE_REGISTRY",
+                registry(
+                    b"SYSTEM_PACKAGE_REGISTRY",
+                    b"CMAKE_FIND_PACKAGE_NO_SYSTEM_PACKAGE_REGISTRY",
+                ),
+            ),
+        ]
     }
 
     pub(super) fn use_source(&self, cx: &Cx<'_>, source: &[u8]) -> bool {

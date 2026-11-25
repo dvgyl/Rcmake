@@ -837,7 +837,7 @@ impl Interp {
 
         if plan.variables {
             self.push_snapshot();
-            self.vars.push();
+            self.push_variable_boundary(None);
         }
         if plan.policies {
             self.policies.push_copy();

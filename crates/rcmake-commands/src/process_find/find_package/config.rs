@@ -9,9 +9,9 @@ use rcmake_model::{CacheEntry, CacheType};
 
 use super::super::cps_import;
 use super::super::search_paths::{is_file, relative_suffix, resolved_lexical_path};
+use super::log::{Mode, Reason, SearchReport};
 use super::paths::{paths_from_vars, redirects_directory};
 use super::request::include_package_file;
-use super::trace::SearchTrace;
 use super::{Bindings, Request, flag, text, version_bindings};
 
 pub(super) struct ConfigSearch<'a> {
@@ -19,7 +19,9 @@ pub(super) struct ConfigSearch<'a> {
     pub(super) request: &'a Request,
     pub(super) names: Vec<BString>,
     pub(super) configs: Vec<BString>,
+    pub(super) descriptions: Vec<(BString, Mode)>,
     redirect: Option<PathBuf>,
+    direct_search: bool,
     visited: BTreeSet<(PathBuf, bool)>,
     pub(super) considered: Vec<(BString, BString, Option<BString>)>,
     pub(super) rejected_dependency: Option<cps_import::Rejection>,
@@ -28,8 +30,18 @@ pub(super) struct ConfigSearch<'a> {
 
 pub(super) struct ConfigMatch {
     pub(super) file: BString,
-    version: BString,
+    pub(super) version: BString,
     cps: Option<Box<CpsPackage>>,
+}
+
+impl ConfigMatch {
+    pub(super) fn mode(&self) -> Mode {
+        if self.cps.is_some() {
+            Mode::Cps
+        } else {
+            Mode::Config
+        }
+    }
 }
 
 impl<'a> ConfigSearch<'a> {
@@ -39,45 +51,53 @@ impl<'a> ConfigSearch<'a> {
         } else {
             request.names.clone()
         };
-        let configs = if request.configs.is_empty() {
-            names
-                .iter()
-                .flat_map(|name| {
-                    [
-                        text(&[name, b"Config.cmake"]),
-                        text(&[&name.to_ascii_lowercase(), b"-config.cmake"]),
-                    ]
-                })
-                .collect()
-        } else {
-            request.configs.clone()
-        };
-        let cps_names = if request
-            .config_options
-            .iter()
-            .any(|option| option == b"CONFIGS")
-        {
-            Vec::new()
-        } else {
-            names
-                .iter()
-                .flat_map(|name| {
-                    [false, true].into_iter().filter_map(move |lower| {
-                        if lower && !name.iter().any(u8::is_ascii_uppercase) {
-                            return None;
+        let mut descriptions = Vec::new();
+        if request.configs.is_empty() {
+            for name in &names {
+                if !request.module {
+                    for lower in [false, true] {
+                        if (!lower || name.iter().any(u8::is_ascii_uppercase))
+                            && let Ok(file) = naming::package_file_name(name, None, lower)
+                        {
+                            descriptions.push((file, Mode::Cps));
                         }
-                        naming::package_file_name(name, None, lower).ok()
-                    })
-                })
+                    }
+                }
+                descriptions.extend([
+                    (text(&[name, b"Config.cmake"]), Mode::Config),
+                    (
+                        text(&[&name.to_ascii_lowercase(), b"-config.cmake"]),
+                        Mode::Config,
+                    ),
+                ]);
+            }
+        } else {
+            descriptions.extend(
+                request
+                    .configs
+                    .iter()
+                    .cloned()
+                    .map(|file| (file, Mode::Config)),
+            );
+        }
+        let collect = |mode| {
+            descriptions
+                .iter()
+                .filter(|(_, kind)| *kind == mode)
+                .map(|(file, _)| file.clone())
                 .collect()
         };
+        let configs = collect(Mode::Config);
+        let cps_names = collect(Mode::Cps);
         Self {
             name,
             request,
             names,
             cps_names,
             configs,
+            descriptions,
             redirect: None,
+            direct_search: false,
             visited: BTreeSet::new(),
             considered: Vec::new(),
             rejected_dependency: None,
@@ -103,7 +123,7 @@ impl<'a> ConfigSearch<'a> {
         &mut self,
         cx: &mut Cx<'_>,
         package_roots: &[BString],
-        trace: &mut SearchTrace,
+        report: &mut SearchReport,
     ) -> Result<Option<ConfigMatch>, CmdError> {
         let dir = cx.var_or_empty(&text(&[self.name, b"_DIR"]));
         let preferred = self
@@ -111,22 +131,24 @@ impl<'a> ConfigSearch<'a> {
             .clone()
             .or_else(|| (!dir.is_empty() && !truth::is_off(&dir)).then(|| cx.resolve_path(&dir)));
         if let Some(dir) = preferred {
+            self.direct_search = true;
             let found = if self.redirect.is_none() || !self.request.module {
-                self.in_directory(cx, &dir, &dir, true, trace)?
+                self.in_directory(cx, &dir, &dir, true, report)?
             } else {
                 None
             };
             let found = match found {
                 Some(found) => Some(found),
-                None => self.in_directory(cx, &dir, &dir, false, trace)?,
+                None => self.in_directory(cx, &dir, &dir, false, report)?,
             };
-            trace.config(self.name, None, true);
+            self.direct_search = false;
+            report.trace.config(self.name, None, true);
             if let Some(found) = found {
                 return Ok(Some(found));
             }
         }
-        let matched = self.find_in_prefixes(cx, package_roots, trace)?;
-        trace.config(
+        let matched = self.find_in_prefixes(cx, package_roots, report)?;
+        report.trace.config(
             self.name,
             matched.as_ref().map(|found| found.file.as_slice()),
             false,
@@ -138,7 +160,7 @@ impl<'a> ConfigSearch<'a> {
         &mut self,
         cx: &mut Cx<'_>,
         package_roots: &[BString],
-        trace: &mut SearchTrace,
+        report: &mut SearchReport,
     ) -> Result<Option<ConfigMatch>, CmdError> {
         let mode = self
             .request
@@ -159,7 +181,7 @@ impl<'a> ConfigSearch<'a> {
             ),
         );
         let redirects = redirects_directory(cx);
-        for (prefix, spelling) in self.prefixes(cx, package_roots, mode, trace) {
+        for (prefix, spelling) in self.prefixes(cx, package_roots, mode, &mut report.trace) {
             if ignored.contains(&prefix)
                 || ignored_prefixes.contains(&prefix)
                 || Some(&prefix) != redirects.as_ref()
@@ -182,15 +204,20 @@ impl<'a> ConfigSearch<'a> {
                         .as_ref()
                         .zip(dir.strip_prefix(&prefix).ok())
                         .map(|(root, suffix)| root.join(suffix));
-                    if !ignored.contains(&dir)
-                        && let Some(found) = self.in_directory(
-                            cx,
-                            &dir,
-                            display.as_deref().unwrap_or(&dir),
-                            cps,
-                            trace,
-                        )?
-                    {
+                    if ignored.contains(&dir) {
+                        report.log.candidate(
+                            || text(&[&path::from_native_cmake(&dir), b"/"]),
+                            if cps { Mode::Cps } else { Mode::Config },
+                            Reason::Ignored,
+                            BString::default(),
+                        );
+                    } else if let Some(found) = self.in_directory(
+                        cx,
+                        &dir,
+                        display.as_deref().unwrap_or(&dir),
+                        cps,
+                        report,
+                    )? {
                         return Ok(Some(found));
                     }
                 }
@@ -205,19 +232,30 @@ impl<'a> ConfigSearch<'a> {
         dir: &Path,
         display: &Path,
         cps: bool,
-        trace: &mut SearchTrace,
+        report: &mut SearchReport,
     ) -> Result<Option<ConfigMatch>, CmdError> {
         if !self.visited.insert((dir.to_path_buf(), cps)) {
             return Ok(None);
         }
         if cps {
-            return self.in_cps_directory(cx, dir, display, trace);
+            return self.in_cps_directory(cx, dir, display, report);
         }
+        let mode = if self.direct_search {
+            Mode::Any
+        } else {
+            Mode::Config
+        };
         for config in &self.configs {
             let filename = path::to_native(config);
             let file = dir.join(&filename);
-            trace.candidate(display, &filename);
+            report.trace.candidate(display, &filename);
             if !is_file(cx, &file) {
+                report.log.candidate(
+                    || path::from_native_cmake(&display.join(&filename)),
+                    mode,
+                    Reason::NoExist,
+                    BString::default(),
+                );
                 continue;
             }
             let checked = check_version(cx, self.name, &file, self.request)?;
@@ -233,6 +271,14 @@ impl<'a> ConfigSearch<'a> {
                 checked.version.clone()
             };
             let accepted = checked.rejection.is_none();
+            if let Some(message) = &checked.rejection {
+                report.log.candidate(
+                    || file.clone(),
+                    mode,
+                    Reason::InsufficientVersion,
+                    message.clone(),
+                );
+            }
             self.considered
                 .push((file.clone(), version, checked.rejection));
             if accepted {
@@ -251,14 +297,25 @@ impl<'a> ConfigSearch<'a> {
         cx: &mut Cx<'_>,
         dir: &Path,
         display: &Path,
-        trace: &mut SearchTrace,
+        report: &mut SearchReport,
     ) -> Result<Option<ConfigMatch>, CmdError> {
         let mut visited = BTreeSet::new();
+        let mode = if self.direct_search {
+            Mode::Any
+        } else {
+            Mode::Cps
+        };
         for filename in &self.cps_names {
             let native = path::to_native(filename);
             let file = dir.join(&native);
-            trace.candidate(display, &native);
+            report.trace.candidate(display, &native);
             if !is_file(cx, &file) {
+                report.log.candidate(
+                    || path::from_native_cmake(&display.join(&native)),
+                    mode,
+                    Reason::NoExist,
+                    BString::default(),
+                );
                 continue;
             }
             let file = if cx.var_is_on(b"CMAKE_FIND_PACKAGE_RESOLVE_SYMLINKS") {
@@ -279,20 +336,31 @@ impl<'a> ConfigSearch<'a> {
                 continue;
             }
             let mut found_version = BString::default();
+            let mut reason = Reason::Error;
             let result = match cps_import::read_root(cx, &file) {
                 Ok(mut package) if package.name == self.name => {
                     found_version = package.version.clone().unwrap_or_default();
                     match cps_import::check_version(&package, self.request) {
-                        Ok(()) => cps_import::prepare(cx, &file, &mut package, self.request)?
-                            .map(|()| package),
-                        Err(reason) => Err(reason.into()),
+                        Ok(()) => {
+                            reason = Reason::InsufficientComponents;
+                            cps_import::prepare(cx, &file, &mut package, self.request)?
+                                .map(|()| package)
+                        }
+                        Err(message) => {
+                            reason = Reason::InsufficientVersion;
+                            Err(message.into())
+                        }
                     }
                 }
-                Ok(package) => Err(BString::from(format!(
-                    "The file describes the package {:?}, which is not the requested package.",
-                    package.name
-                ))
-                .into()),
+                Ok(package) => {
+                    reason = Reason::Ignored;
+                    Err(text(&[
+                        b"The file describes the package \"",
+                        &package.name,
+                        b"\", which is not the requested package.",
+                    ])
+                    .into())
+                }
                 Err(_) => {
                     Err(BString::from("The package description file could not be read.").into())
                 }
@@ -314,6 +382,9 @@ impl<'a> ConfigSearch<'a> {
                     }));
                 }
                 Err(rejection) => {
+                    report
+                        .log
+                        .candidate(|| file.clone(), mode, reason, rejection.reason.clone());
                     self.considered.push((
                         file,
                         considered_version,

@@ -8,6 +8,8 @@ use rcmake_host::WriteMode;
 
 use crate::{Cx, Interp, RunMode, hooks::json_string, util::cat};
 
+mod find_package;
+
 /// Fields recorded for a configure-time search.
 pub struct FindEvent<'a> {
     /// The search mode, such as `program` or `file`.

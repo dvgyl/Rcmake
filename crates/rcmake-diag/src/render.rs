@@ -4,7 +4,7 @@
 //! - Default line wrap width is **77 bytes** including the 2-space indent.
 //! - Consecutive blank lines collapse to a single paragraph separator; lines starting
 //!   with a space are emitted preformatted without wrapping.
-//! - Double spaces in prose (such as after sentence-ending periods) are preserved.
+//! - Prose uses one space between words and two after a word ending in a period.
 //! - Categorized developer warnings print `(author)`, `(deprecated)`, or `(policy)`
 //!   with the matching suppression footer followed by one blank line; other framed
 //!   diagnostics terminate with two trailing blank lines (`\n\n\n`).
@@ -270,11 +270,9 @@ pub fn format_paragraphs(text: &[u8], indent: usize, width: usize) -> BString {
         let mut prev_ended_sentence = false;
         let mut i = 0usize;
         while i < raw_line.len() {
-            let space_start = i;
             while raw_line.get(i) == Some(&b' ') {
                 i += 1;
             }
-            let raw_spaces = i - space_start;
             if i >= raw_line.len() {
                 break;
             }
@@ -289,11 +287,7 @@ pub fn format_paragraphs(text: &[u8], indent: usize, width: usize) -> BString {
                 col = indent + word.len();
                 line_started = true;
             } else {
-                let sep_len = if prev_ended_sentence || raw_spaces >= 2 {
-                    2
-                } else {
-                    1
-                };
+                let sep_len = if prev_ended_sentence { 2 } else { 1 };
                 if col + sep_len + word.len() <= width {
                     out.extend(core::iter::repeat_n(b' ', sep_len));
                     out.extend_from_slice(word);
@@ -385,6 +379,26 @@ mod tests {
     use super::*;
     use crate::{Backtrace, Frame, FrameKind};
     use std::sync::Arc;
+
+    #[test]
+    fn prose_spacing_and_wrap_preserve_preformatted_lines() {
+        assert_eq!(
+            format_paragraphs(
+                b"alpha  beta. gamma     delta\ttab\n  /path  with spaces",
+                2,
+                80
+            ),
+            BString::from("  alpha beta.  gamma delta\ttab\n\n    /path  with spaces\n")
+        );
+        assert_eq!(
+            format_paragraphs(b"abc  d", 2, 7),
+            BString::from("  abc d\n")
+        );
+        assert_eq!(
+            format_paragraphs(b"ab. d", 2, 7),
+            BString::from("  ab.\n  d\n")
+        );
+    }
 
     #[test]
     fn wrap_width_77_matches_cmake_4_5_1_probe() {

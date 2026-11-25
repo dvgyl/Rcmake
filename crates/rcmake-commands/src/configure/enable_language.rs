@@ -27,7 +27,6 @@ use crate::policy_misc::properties::known_features;
 
 const CMP0132: PolicyId = PolicyId::new(132);
 const CMP0165: PolicyId = PolicyId::new(165);
-const CMP0220: PolicyId = PolicyId::new(220);
 
 const ENABLED_LANGUAGES: &[u8] = b"ENABLED_LANGUAGES";
 const IN_TRY_COMPILE: &[u8] = b"IN_TRY_COMPILE";
@@ -69,40 +68,7 @@ pub(super) fn enable_language(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResul
         .filter(|arg| arg.value != b"OPTIONAL")
         .map(|arg| arg.value.clone())
         .collect();
-    let nested = cx.current_dir_id() != rcmake_model::DirId::ROOT
-        || cx.var_normal_only(b"CMAKE_CURRENT_FUNCTION").is_some();
-    let status = cx.policy(CMP0220);
-    let saved: Vec<_> = if nested && status == PolicyStatus::New {
-        cx.variable_names()
-            .into_iter()
-            .filter_map(|name| cx.var_normal_only(&name).map(|value| (name, value)))
-            .collect()
-    } else {
-        Vec::new()
-    };
     enable_languages(cx, &languages, optional)?;
-    if nested && status == PolicyStatus::New {
-        let changed: Vec<_> = cx
-            .variable_names()
-            .into_iter()
-            .filter(|name| {
-                let Some(value) = cx.var_normal_only(name) else {
-                    return false;
-                };
-                saved
-                    .binary_search_by(|(key, _)| key.cmp(name))
-                    .ok()
-                    .and_then(|index| saved.get(index))
-                    .is_none_or(|(_, previous)| *previous != value)
-            })
-            .collect();
-        cx.raise_scope(&changed);
-    } else if nested
-        && status == PolicyStatus::Warn
-        && cx.var_is_on(b"CMAKE_POLICY_WARNING_CMP0220")
-    {
-        cx.issue_policy_warning(CMP0220, b"", b"For compatibility with older versions of CMake, the language configuration set by this call is not propagated to the enclosing variable scopes.");
-    }
     Ok(Flow::Normal)
 }
 
@@ -120,6 +86,19 @@ pub(crate) fn enable_languages(
     languages: &[BString],
     optional: bool,
 ) -> Result<(), CmdError> {
+    let nested = cx
+        .global()
+        .props
+        .get(LANGUAGES_IN_PROGRESS)
+        .is_some_and(|value| !value.is_empty());
+    if nested {
+        setup_languages(cx, languages, optional)
+    } else {
+        cx.with_language_scope(|cx| setup_languages(cx, languages, optional))
+    }
+}
+
+fn setup_languages(cx: &mut Cx<'_>, languages: &[BString], optional: bool) -> Result<(), CmdError> {
     let generator = generator(cx);
     super::generator_env::initialize(cx, generator)?;
     cx.set_var(b"CMAKE_CFG_INTDIR", generator.cfg_int_dir().into());

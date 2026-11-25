@@ -13,7 +13,7 @@ impl Interp {
     fn push_call_scope(&mut self, u: &UserCommand, function: bool) {
         self.push_snapshot();
         if function {
-            self.vars.push();
+            self.push_variable_boundary(None);
             self.loop_blocks.push(0);
             self.listfiles.push(Arc::clone(&u.body.file));
             self.function_locks.push(Default::default());

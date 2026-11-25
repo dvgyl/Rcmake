@@ -15,6 +15,8 @@ use rcmake_model::{Cache, CacheEntry, CacheType, DirId, GlobalState, ProjectMode
 use rcmake_regex::{Captures, Regex, RegexError};
 use rcmake_syntax::{Argument, CommandInvocation};
 
+mod language_scope;
+
 use crate::{
     Binding, CmdError, CmdResult, Command, IncludeOptions, Interp, LogLevel, RunMode,
     SubdirOptions, TraceConfig, UserCommandKind,
@@ -364,12 +366,6 @@ impl Cx<'_> {
         self.interp.raise_var(name, value);
     }
 
-    /// Raise each name to the parent scope with its current value, or unset it in the
-    /// parent if it is not a normal variable (`cmMakefile::RaiseScope`).
-    pub fn raise_scope(&mut self, names: &[BString]) {
-        self.interp.raise_vars(names);
-    }
-
     /// Mutable access to the [`Cache`].
     pub fn cache(&mut self) -> &mut Cache {
         &mut self.interp.project.cache
@@ -526,7 +522,7 @@ impl Cx<'_> {
     /// `cmake_policy(SET)`: update the top policy entry and the entries of enclosing
     /// function/macro calls up to the first strong entry.
     pub fn set_policy(&mut self, id: PolicyId, status: PolicyStatus) -> Result<(), PolicyError> {
-        self.interp.policies.try_update(|map| map.set(id, status))?;
+        self.interp.update_policies(|map| map.set(id, status))?;
         if id == crate::interp::CMP0198 {
             self.interp.update_parent_list_file_var();
         }
@@ -540,8 +536,7 @@ impl Cx<'_> {
         version: &rcmake_base::version::Version,
     ) -> Result<(), PolicyError> {
         self.interp
-            .policies
-            .try_update(|map| map.apply_version(version))?;
+            .update_policies(|map| map.apply_version(version))?;
         self.interp.update_parent_list_file_var();
         Ok(())
     }

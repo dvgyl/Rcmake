@@ -469,7 +469,7 @@ impl Interp {
             .host
             .create_dir_all(&rcmake_host::path::to_native(&bin_abs));
 
-        self.vars.push_directory(id);
+        self.push_variable_boundary(Some(id));
         self.loop_blocks.push(0);
         self.policies.push_copy();
         self.diags.push_copy();

@@ -2,8 +2,8 @@ use std::sync::Arc;
 
 use rcmake_base::BString;
 use rcmake_diag::{
-    Backtrace, DiagCategory, DiagState, Effect, Frame, FrameKind, MessageKind, PolicyId, PolicyMap,
-    PolicyStatus,
+    Backtrace, DiagCategory, DiagState, Effect, Frame, FrameKind, MessageKind, PolicyError,
+    PolicyId, PolicyMap, PolicyStatus,
 };
 use rcmake_regex::Captures;
 
@@ -18,6 +18,29 @@ pub(super) struct ListFileVars {
 }
 
 impl Interp {
+    pub(crate) fn push_variable_boundary(&mut self, directory: Option<rcmake_model::DirId>) {
+        let parent = self.policy_status(PolicyId::new(220));
+        self.vars
+            .push_boundary(directory, Some((self.policies.len(), parent)));
+    }
+
+    pub(crate) fn update_policies(
+        &mut self,
+        mut update: impl FnMut(&mut PolicyMap) -> Result<(), PolicyError>,
+    ) -> Result<(), PolicyError> {
+        let mut depth = self.policies.len();
+        self.policies.try_update(|map| {
+            let before = map.get(PolicyId::new(220));
+            update(map)?;
+            let after = map.get(PolicyId::new(220));
+            if before != after {
+                self.vars.update_parent_policy(depth, after);
+            }
+            depth -= 1;
+            Ok(())
+        })
+    }
+
     /// Normal binding value, else cache value (`GetDefinition`).
     pub(crate) fn lookup_var(&self, name: &[u8]) -> Option<&BString> {
         self.record_variable_access(name);

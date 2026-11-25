@@ -453,7 +453,18 @@ fn parse_define(raw: &[u8]) -> Option<CacheDefine> {
     if lhs.is_empty() {
         return None;
     }
-    let value = BString::from(raw.get(eq + 1..).unwrap_or(&[]));
+    let value = raw.get(eq + 1..)?;
+    let trimmed = value
+        .iter()
+        .rposition(|byte| !matches!(byte, b' ' | b'\t' | b'\r'))
+        .and_then(|end| value.get(..=end))
+        .unwrap_or(value);
+    let value = BString::from(
+        trimmed
+            .strip_prefix(b"'")
+            .and_then(|inner| inner.strip_suffix(b"'"))
+            .unwrap_or(trimmed),
+    );
     if let Some(colon) = lhs.iter().position(|&b| b == b':') {
         let name = BString::from(lhs.get(..colon)?);
         let ty = CacheType::parse(lhs.get(colon + 1..).unwrap_or(&[]));
@@ -643,6 +654,22 @@ fn missing_cmake_root(host: &dyn Host, exe: &Path, configure: bool) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cache_definitions_remove_suffix_space_and_single_quotes() {
+        for (argument, expected) in [
+            (b"KEY='a,b,c'  ".as_slice(), b"a,b,c".as_slice()),
+            (b"KEY:STRING='a\t' \r", b"a\t"),
+            (b"KEY=''", b""),
+            (b"KEY='", b"'"),
+            (b"KEY= \t\r", b" \t\r"),
+            (b"KEY=\"a  b\"", b"\"a  b\""),
+            (b"KEY= a=b  c \t", b" a=b  c"),
+        ] {
+            let definition = parse_define(argument).expect("valid definition");
+            assert_eq!(definition.value.as_slice(), expected);
+        }
+    }
 
     #[test]
     fn argv0_dispatch_and_version_banner() {

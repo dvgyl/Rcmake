@@ -8,6 +8,7 @@ use rcmake_syntax::ArgKind;
 use super::search_paths::{cmake_paths, is_file};
 use super::{cps_import, diagnostic, text};
 use config::ConfigSearch;
+use log::{Mode, Reason, SearchLog, SearchReport};
 use messages::report_missing;
 use paths::{package_roots, redirects_directory, resolve_package_root};
 use request::VersionRequest;
@@ -16,6 +17,7 @@ use trace::SearchTrace;
 pub(super) use request::{Bindings, Request, version_bindings};
 
 mod config;
+mod log;
 mod messages;
 mod paths;
 mod request;
@@ -107,6 +109,8 @@ fn find_requested_package(
     request.apply_requiredness(cx, name);
 
     let found_var = text(&[name, b"_FOUND"]);
+    let mut log = SearchLog::new(cx, name, &found_var, &request);
+    let outer_roots = cmake_paths(cx, PACKAGE_ROOT_SPELLINGS);
     let disable = text(&[b"CMAKE_DISABLE_FIND_PACKAGE_", name]);
     if cx.var_is_on(&disable) {
         let require = text(&[b"CMAKE_REQUIRE_FIND_PACKAGE_", name]);
@@ -139,6 +143,7 @@ fn find_requested_package(
                 ]),
             );
         }
+        log.emit(cx, name, &request, &outer_roots);
         return Ok(Flow::Normal);
     }
 
@@ -153,16 +158,30 @@ fn find_requested_package(
             line: cx.current_line(),
         });
         call.extend_from_slice(args);
-        cx.call_command(&provider, call)?;
+        if let Err(error) = cx.call_command(&provider, call) {
+            log.emit(cx, name, &request, &outer_roots);
+            return Err(error);
+        }
+        let path = text(&[b"dependency_provider::", &provider]);
         if cx.var_is_on(&found_var) {
+            log.selected(path, Mode::Provider, BString::default());
+            log.emit(cx, name, &request, &outer_roots);
             return finish(cx, name, &request, first_target, true);
         }
+        log.candidate(
+            || path,
+            Mode::Provider,
+            Reason::NotFound,
+            BString::default(),
+        );
     }
 
     let mut vars = Bindings::default();
     vars.add("CMAKE_FIND_PACKAGE_NAME".into(), name.clone());
     vars.add("CMAKE_FIND_REQUIRED".into(), "");
-    let package_roots = package_roots(cx, name);
+    let mut package_roots = package_roots(cx, name);
+    log::bind_root_count(cx, &mut vars, package_roots.len());
+    package_roots.extend(outer_roots.iter().cloned());
     vars.add(
         PACKAGE_ROOTS.into(),
         list::join(
@@ -199,7 +218,10 @@ fn find_requested_package(
         vars.add(find(b"REGISTRY_VIEW"), registry_view.clone());
     }
     let found = vars.scoped(cx, |cx| {
-        let mut trace = SearchTrace::new(cx, name);
+        let mut report = SearchReport {
+            trace: SearchTrace::new(cx, name),
+            log,
+        };
         let result = search(
             cx,
             name,
@@ -207,9 +229,10 @@ fn find_requested_package(
             &request,
             &package_roots,
             dependency,
-            &mut trace,
+            &mut report,
         );
-        trace.emit(cx);
+        report.log.emit(cx, name, &request, &outer_roots);
+        report.trace.emit(cx);
         result
     });
     match found {
@@ -303,7 +326,7 @@ fn search(
     request: &Request,
     package_roots: &[BString],
     mut dependency: Option<&mut Vec<cps_import::PackageDiagnostic>>,
-    trace: &mut SearchTrace,
+    report: &mut SearchReport,
 ) -> Result<bool, CmdError> {
     let lookup_names = if request.names.is_empty() {
         [name].as_slice().to_vec()
@@ -347,7 +370,7 @@ fn search(
     let prefer_config = !request.module && cx.var_is_on(b"CMAKE_FIND_PACKAGE_PREFER_CONFIG");
     let try_module = request.config_options.is_empty() && !redirected;
     if try_module && !prefer_config {
-        if let Some(found) = load_module(cx, name, found_var, request, trace)? {
+        if let Some(found) = load_module(cx, name, found_var, request, report)? {
             return Ok(found);
         }
         if !request.module && cx.var_is_on(b"CMAKE_FIND_PACKAGE_WARN_NO_MODULE") {
@@ -355,14 +378,22 @@ fn search(
         }
     }
 
+    if !request.module || redirected || !cx.var_is_on(b"CMAKE_FIND_PACKAGE_PREFER_CONFIG") {
+        report.log.config_search(&config, redirected);
+    }
     if !request.module || redirected {
-        let matched = config.find(cx, package_roots, trace)?;
+        let matched = config.find(cx, package_roots, report)?;
+        if let Some(found) = &matched {
+            report
+                .log
+                .selected(found.file.clone(), found.mode(), found.version.clone());
+        }
         let config_file = matched.as_ref().map(|found| found.file.clone());
         let found = config.load(cx, found_var, matched)?;
         if !found
             && try_module
             && prefer_config
-            && let Some(found) = load_module(cx, name, found_var, request, trace)?
+            && let Some(found) = load_module(cx, name, found_var, request, report)?
         {
             return Ok(found);
         }
@@ -461,7 +492,7 @@ fn load_module(
     name: &[u8],
     found_var: &[u8],
     request: &Request,
-    trace: &mut SearchTrace,
+    report: &mut SearchReport,
 ) -> Result<Option<bool>, CmdError> {
     let filename = text(&[b"Find", name, b".cmake"]);
     let native_name = path::to_native(&filename);
@@ -496,7 +527,7 @@ fn load_module(
         considered.push(bundled);
         None
     };
-    trace.module(
+    report.trace.module(
         &filename,
         &considered,
         module.as_deref().or(bundled.as_deref()),
@@ -518,11 +549,26 @@ fn load_module(
     };
     let mut vars = Bindings::default();
     vars.add(text(&[name, b"_FIND_MODULE"]), "1");
-    vars.scoped(cx, |cx| request.include_file(cx, &module))?;
+    let result = vars.scoped(cx, |cx| request.include_file(cx, &module));
+    let defined = cx.var_defined(found_var);
+    if defined && !cx.var_is_on(found_var) {
+        report.log.candidate(
+            || path::from_native_cmake(&module),
+            Mode::Module,
+            Reason::NotFound,
+            cx.var_or_empty(&text(&[name, b"_NOT_FOUND_MESSAGE"])),
+        );
+    } else {
+        report.log.selected(
+            path::from_native_cmake(&module),
+            Mode::Module,
+            cx.var_or_empty(&text(&[name, b"_VERSION"])),
+        );
+    }
+    result?;
     if cx.fatal_occurred() {
         return Err(CmdError::Reported);
     }
-    let defined = cx.var_defined(found_var);
     if !defined {
         let uppercase = text(&[&name.to_ascii_uppercase(), b"_FOUND"]);
         let found = cx.var_is_on(&uppercase);
@@ -530,7 +576,7 @@ fn load_module(
     }
     let found = cx.var_is_on(found_var);
     if defined && !found {
-        trace.module_not_found(found_var);
+        report.trace.module_not_found(found_var);
     }
     Ok(Some(found))
 }

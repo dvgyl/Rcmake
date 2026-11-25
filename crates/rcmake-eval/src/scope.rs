@@ -4,6 +4,7 @@
 use std::collections::BTreeMap;
 
 use rcmake_base::BString;
+use rcmake_diag::PolicyStatus;
 use rcmake_model::DirId;
 
 /// One binding in a variable scope.
@@ -23,6 +24,7 @@ struct Scope {
     id: u64,
     directory: Option<DirId>,
     bindings: BTreeMap<BString, Binding>,
+    parent_policy: Option<(usize, PolicyStatus)>,
 }
 
 /// Stack of variable scopes. Index `0` is the outermost (directory) scope.
@@ -39,6 +41,7 @@ impl Default for VarStack {
                 id: 0,
                 directory: Some(DirId::ROOT),
                 bindings: BTreeMap::new(),
+                parent_policy: None,
             }],
             next_id: 1,
         }
@@ -106,18 +109,19 @@ impl VarStack {
 
     /// Push a new empty scope.
     pub(crate) fn push(&mut self) {
-        self.push_scope(None);
+        self.push_boundary(None, None);
     }
 
-    pub(crate) fn push_directory(&mut self, dir: DirId) {
-        self.push_scope(Some(dir));
-    }
-
-    fn push_scope(&mut self, directory: Option<DirId>) {
+    pub(crate) fn push_boundary(
+        &mut self,
+        directory: Option<DirId>,
+        parent_policy: Option<(usize, PolicyStatus)>,
+    ) {
         self.scopes.push(Scope {
             id: self.next_id,
             directory,
             bindings: BTreeMap::new(),
+            parent_policy,
         });
         self.next_id = self.next_id.saturating_add(1);
     }
@@ -127,6 +131,45 @@ impl VarStack {
         if self.scopes.len() > 1 {
             self.scopes.pop();
         }
+    }
+
+    pub(crate) fn update_parent_policy(&mut self, depth: usize, status: PolicyStatus) {
+        for scope in &mut self.scopes {
+            if let Some((level, saved)) = &mut scope.parent_policy
+                && *level == depth
+            {
+                *saved = status;
+            }
+        }
+    }
+
+    /// Install the captured bindings in the caller and its eligible enclosing scopes.
+    pub(crate) fn propagate_capture(&mut self) -> bool {
+        let Some(capture) = self.scopes.pop() else {
+            return false;
+        };
+        let mut bindings = capture.bindings;
+        bindings.retain(|name, _| !name.is_empty());
+        if bindings.is_empty() {
+            return false;
+        }
+        let mut scopes = self.scopes.iter_mut().rev();
+        let Some(caller) = scopes.next() else {
+            return false;
+        };
+        caller.bindings.extend(bindings.clone());
+        let mut policy = caller.parent_policy;
+        for parent in scopes {
+            match policy.map(|(_, status)| status) {
+                Some(PolicyStatus::New) => {
+                    parent.bindings.extend(bindings.clone());
+                    policy = parent.parent_policy;
+                }
+                Some(PolicyStatus::Warn) => return true,
+                Some(PolicyStatus::Old) | None => break,
+            }
+        }
+        false
     }
 
     /// Raise-then-set `PARENT_SCOPE`: copy the current effective binding of `name` into
@@ -204,6 +247,26 @@ mod tests {
         assert_eq!(s.depth(), 1);
         s.pop();
         assert_eq!(s.depth(), 1);
+    }
+
+    #[test]
+    fn capture_keeps_equal_values_and_unsets_at_each_new_boundary() {
+        let mut stack = VarStack::default();
+        stack.set(b"unset", "prior".into());
+        stack.push_boundary(None, Some((1, PolicyStatus::Warn)));
+        stack.set(b"same", "inherited".into());
+        stack.push_boundary(None, Some((2, PolicyStatus::New)));
+        stack.push();
+        stack.set(b"same", "inherited".into());
+        stack.unset(b"unset");
+        assert!(stack.propagate_capture());
+
+        stack.pop();
+        assert_eq!(stack.get(b"same"), Some(&"inherited".into()));
+        assert_eq!(stack.lookup(b"unset"), Some(&Binding::Unset));
+        stack.pop();
+        assert_eq!(stack.get(b"same"), None);
+        assert_eq!(stack.get(b"unset"), Some(&"prior".into()));
     }
 
     #[test]

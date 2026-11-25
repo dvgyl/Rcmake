@@ -12,7 +12,7 @@ use super::super::search_paths::{
     system_prefixes,
 };
 use super::config::ConfigSearch;
-use super::{PACKAGE_ROOT_SPELLINGS, text, trace::SearchTrace};
+use super::{text, trace::SearchTrace};
 
 const FRAMEWORK_VARS_HEADING: &[u8] =
     b"CMAKE_FRAMEWORK_PATH and CMAKE_APPBUNDLE_PATH variables [CMAKE_FIND_USE_CMAKE_PATH].";
@@ -443,7 +443,6 @@ pub(super) fn package_roots(cx: &mut Cx<'_>, name: &[u8]) -> Vec<BString> {
         ),
         PolicyStatus::Old => {}
     }
-    roots.extend(cmake_paths(cx, PACKAGE_ROOT_SPELLINGS));
     roots
 }
 
@@ -537,9 +536,15 @@ fn user_registry(cx: &Cx<'_>, name: &[u8]) -> Vec<BString> {
 fn children(cx: &Cx<'_>, dir: &Path, matches: impl Fn(&[u8]) -> bool) -> Vec<PathBuf> {
     let mut entries = cx.host().read_dir(dir).unwrap_or_default();
     entries.retain(|entry| matches(&entry.name));
-    let order = cx.var_or_empty(b"CMAKE_FIND_PACKAGE_SORT_ORDER");
-    if order != b"NONE" {
-        let ascending = cx.var_or_empty(b"CMAKE_FIND_PACKAGE_SORT_DIRECTION") == b"ASC";
+    let order = cx
+        .var_defined(b"CMAKE_FIND_PACKAGE_SORT_ORDER")
+        .then(|| cx.var_or_empty(b"CMAKE_FIND_PACKAGE_SORT_ORDER"));
+    let order = order
+        .as_ref()
+        .map_or(b"NATURAL".as_slice(), |value| value.as_slice());
+    if matches!(order, b"NAME" | b"NATURAL") {
+        let direction = b"CMAKE_FIND_PACKAGE_SORT_DIRECTION";
+        let ascending = cx.var_defined(direction) && cx.var_or_empty(direction) != b"DEC";
         entries.sort_by(|a, b| {
             let order = if order == b"NAME" {
                 a.name.cmp(&b.name)
