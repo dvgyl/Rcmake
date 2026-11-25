@@ -1,20 +1,19 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" data-theme="dark">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Compatibility · Rcmake</title>
-  <meta name="description" content="Rcmake compatibility with CMake 4.5.1: Core-62, policies, Tests/RunCMake on 3 operating systems, large projects, sealed holdout, vcpkg, and benchmarks.">
-  <meta property="og:title" content="Rcmake compatibility report">
-  <meta property="og:description" content="Rcmake compared with CMake 4.5.1, from data/latest.json.">
+  <title>Compatibility · rcmake</title>
+  <meta name="description" content="rcmake compatibility with CMake 4.5.1 across Core-62, policies, Tests/RunCMake on three operating systems, large projects, a sealed holdout, vcpkg, and benchmarks.">
+  <meta property="og:title" content="rcmake compatibility report">
+  <meta property="og:description" content="rcmake compared against CMake 4.5.1 from data/latest.json.">
   <meta property="og:image" content="./assets/og-card.svg">
   <link rel="icon" type="image/svg+xml" href="./assets/favicon.svg">
   <link rel="stylesheet" href="./styles.css">
   <script>
     try {
       const saved = localStorage.getItem("rcmake-theme");
-      const dark = window.matchMedia("(prefers-color-scheme: dark)").matches;
-      document.documentElement.dataset.theme = saved || (dark ? "dark" : "light");
+      document.documentElement.dataset.theme = saved || "dark";
     } catch (_) {}
   </script>
 </head>
@@ -22,16 +21,16 @@
   <header class="topbar">
     <div class="page topbar-inner">
       <a class="brand" href="./index.html">
-        <img class="mark-light" src="./assets/rcmake-mark.svg" alt="" width="20" height="20">
         <img class="mark-dark" src="./assets/rcmake-mark-dark.svg" alt="" width="20" height="20">
-        Rcmake
+        <img class="mark-light" src="./assets/rcmake-mark.svg" alt="" width="20" height="20">
+        rcmake
       </a>
       <nav class="nav" aria-label="Primary">
         <a class="opt" href="./index.html">Overview</a>
         <a href="./playground.html">Playground</a>
         <a href="./dashboard.html" aria-current="page">Compatibility</a>
         <a href="https://github.com/dvgyl/Rcmake">GitHub</a>
-        <button id="theme-toggle" type="button">Dark</button>
+        <button id="theme-toggle" type="button">Light</button>
       </nav>
     </div>
   </header>
@@ -41,7 +40,7 @@
       <h1>Compatibility report</h1>
       <p class="meta"><span id="report-meta">reading snapshot</span> · <a href="./data/latest.json">latest.json</a></p>
       <p id="report-note"></p>
-      <p class="note">Each track compares Rcmake with the CMake 4.5.1 binary. A dash shows a value that is not yet measured.</p>
+      <p class="note">Each track compares <code>rcmake</code> directly against the CMake 4.5.1 binary. A dash marks a value awaiting measurement.</p>
     </header>
     <div id="report">
       <p class="muted">Reading data/latest.json</p>
@@ -50,7 +49,7 @@
 
   <footer class="footer">
     <div class="page footer-inner">
-      <span>Rcmake · <code>MIT OR Apache-2.0</code></span>
+      <span>rcmake · <code>MIT OR Apache-2.0</code></span>
       <nav aria-label="Footer">
         <a href="https://github.com/dvgyl/Rcmake">GitHub</a>
         <a href="./index.html">Overview</a>

@@ -1,14 +1,39 @@
-/* Rcmake site styles. MIT OR Apache-2.0.
- * One column of text, hairline rules, system fonts.
- * The only color comes from the mark, status words, and code accents.
+/* rcmake site styles. MIT OR Apache-2.0.
+ * Dark mode default, one column, hairline rules, system fonts.
  */
 
 :root {
+  --paper: #0e0f10;
+  --ink: #ecebe6;
+  --ink-2: #a09f99;
+  --rule: #252628;
+  --tint: #16171a;
+  --code-bg: #1b1c20;
+  --code-border: #2a2c30;
+  --link: #ecebe6;
+  --pass: #4ade80;
+  --fail: #f87171;
+  --partial: #fbbf24;
+  --pending: #a09f99;
+  --accent-r: #ef4444;
+  --accent-g: #22b55a;
+  --accent-b: #3b82f6;
+
+  --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", "Helvetica Neue", Arial, sans-serif;
+  --mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, "Liberation Mono", monospace;
+
+  --measure: 760px;
+  color-scheme: dark;
+}
+
+:root[data-theme="light"] {
   --paper: #faf9f6;
   --ink: #171615;
   --ink-2: #5c5a56;
   --rule: #e2dfd8;
   --tint: #f2f0ea;
+  --code-bg: #efede7;
+  --code-border: #e0ddd5;
   --link: #171615;
   --pass: #15803d;
   --fail: #c81e1e;
@@ -17,30 +42,7 @@
   --accent-r: #d92626;
   --accent-g: #15803d;
   --accent-b: #1d4ed8;
-
-  --serif: Charter, "Bitstream Charter", "Sitka Text", Cambria, Georgia, serif;
-  --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", "Helvetica Neue", Arial, sans-serif;
-  --mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, "Liberation Mono", monospace;
-
-  --measure: 820px;
   color-scheme: light;
-}
-
-:root[data-theme="dark"] {
-  --paper: #121211;
-  --ink: #e8e6e0;
-  --ink-2: #9a9790;
-  --rule: #262523;
-  --tint: #1a1a18;
-  --link: #e8e6e0;
-  --pass: #4ade80;
-  --fail: #f87171;
-  --partial: #fbbf24;
-  --pending: #9a9790;
-  --accent-r: #ef4444;
-  --accent-g: #22b55a;
-  --accent-b: #3b82f6;
-  color-scheme: dark;
 }
 
 *,
@@ -58,8 +60,9 @@ body {
   margin: 0;
   background: var(--paper);
   color: var(--ink);
-  font: 17px/1.6 var(--serif);
+  font: 16px/1.65 var(--sans);
   -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
 }
 
 a {
@@ -82,31 +85,32 @@ a:hover {
 h1,
 h2,
 h3 {
-  font-family: var(--serif);
-  font-weight: 700;
-  line-height: 1.2;
+  font-family: var(--sans);
+  font-weight: 600;
+  line-height: 1.25;
+  letter-spacing: -0.02em;
   margin: 0;
 }
 
 h1 {
-  font-size: 2.6rem;
-  letter-spacing: -0.01em;
+  font-size: 2.25rem;
 }
 
 h2 {
-  font-size: 1.35rem;
-  margin: 3.2rem 0 0.9rem;
-  padding-top: 0.9rem;
+  font-size: 1.25rem;
+  margin: 3rem 0 0.85rem;
+  padding-top: 1rem;
   border-top: 1px solid var(--rule);
 }
 
 h3 {
-  font-size: 1.05rem;
-  margin: 1.8rem 0 0.5rem;
+  font-size: 1rem;
+  margin: 1.75rem 0 0.5rem;
 }
 
 p {
   margin: 0 0 1rem;
+  max-width: 66ch;
 }
 
 code,
@@ -114,13 +118,14 @@ pre,
 kbd,
 .mono {
   font-family: var(--mono);
-  font-size: 0.86em;
+  font-size: 0.875em;
 }
 
 :not(pre) > code {
-  background: var(--tint);
-  padding: 0.05em 0.3em;
-  border-radius: 2px;
+  background: var(--code-bg);
+  border: 1px solid var(--code-border);
+  padding: 0.08em 0.34em;
+  border-radius: 3px;
 }
 
 .num,
@@ -189,12 +194,13 @@ th {
   display: block;
 }
 
-.mark-dark,
-:root[data-theme="dark"] .mark-light {
+.mark-light,
+:root[data-theme="light"] .mark-dark {
   display: none !important;
 }
 
-:root[data-theme="dark"] .mark-dark {
+.mark-dark,
+:root[data-theme="light"] .mark-light {
   display: block !important;
 }
 

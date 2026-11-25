@@ -60,24 +60,23 @@ export async function loadLatestData(url = "./data/latest.json") {
   return response.json();
 }
 
-/** Wire the plain-text "Dark" / "Light" toggle in the top bar. */
+/** Wire the plain-text "Light" / "Dark" toggle in the top bar (dark default). */
 export function initThemeToggle(doc = document) {
   const root = doc.documentElement;
   const btn = doc.getElementById("theme-toggle");
   if (!root.dataset.theme) {
-    const dark = typeof matchMedia === "function" && matchMedia("(prefers-color-scheme: dark)").matches;
-    root.dataset.theme = dark ? "dark" : "light";
+    root.dataset.theme = "dark";
   }
   const sync = () => {
     if (btn) {
-      const dark = root.dataset.theme === "dark";
+      const dark = root.dataset.theme !== "light";
       btn.textContent = dark ? "Light" : "Dark";
       btn.setAttribute("aria-label", dark ? "Use light theme" : "Use dark theme");
     }
   };
   sync();
   btn?.addEventListener("click", () => {
-    root.dataset.theme = root.dataset.theme === "dark" ? "light" : "dark";
+    root.dataset.theme = root.dataset.theme === "light" ? "dark" : "light";
     try {
       localStorage.setItem("rcmake-theme", root.dataset.theme);
     } catch (_) {

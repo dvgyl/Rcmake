@@ -1,20 +1,19 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" data-theme="dark">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Playground · Rcmake</title>
-  <meta name="description" content="Edit a CMakeLists.txt and see Rcmake diagnostics, targets, build.ninja, and explain output in the browser.">
-  <meta property="og:title" content="Rcmake playground">
-  <meta property="og:description" content="Configure CMake projects with Rcmake in the browser.">
+  <title>Playground · rcmake</title>
+  <meta name="description" content="Edit a CMakeLists.txt file and inspect rcmake diagnostics, resolved targets, build.ninja output, and explain traces in the browser.">
+  <meta property="og:title" content="rcmake playground">
+  <meta property="og:description" content="Configure CMake projects with rcmake in the browser.">
   <meta property="og:image" content="./assets/og-card.svg">
   <link rel="icon" type="image/svg+xml" href="./assets/favicon.svg">
   <link rel="stylesheet" href="./styles.css">
   <script>
     try {
       const saved = localStorage.getItem("rcmake-theme");
-      const dark = window.matchMedia("(prefers-color-scheme: dark)").matches;
-      document.documentElement.dataset.theme = saved || (dark ? "dark" : "light");
+      document.documentElement.dataset.theme = saved || "dark";
     } catch (_) {}
   </script>
 </head>
@@ -22,22 +21,22 @@
   <header class="topbar">
     <div class="page topbar-inner wide">
       <a class="brand" href="./index.html">
-        <img class="mark-light" src="./assets/rcmake-mark.svg" alt="" width="20" height="20">
         <img class="mark-dark" src="./assets/rcmake-mark-dark.svg" alt="" width="20" height="20">
-        Rcmake
+        <img class="mark-light" src="./assets/rcmake-mark.svg" alt="" width="20" height="20">
+        rcmake
       </a>
       <nav class="nav" aria-label="Primary">
         <a class="opt" href="./index.html">Overview</a>
         <a href="./playground.html" aria-current="page">Playground</a>
         <a href="./dashboard.html">Compatibility</a>
         <a href="https://github.com/dvgyl/Rcmake">GitHub</a>
-        <button id="theme-toggle" type="button">Dark</button>
+        <button id="theme-toggle" type="button">Light</button>
       </nav>
     </div>
   </header>
 
   <main class="bench">
-    <h1 class="visually-hidden">Rcmake playground</h1>
+    <h1 class="visually-hidden">rcmake playground</h1>
     <div class="toolbar">
       <label>Example <select id="example-select"></select></label>
       <label>Generator
