@@ -151,8 +151,8 @@ impl Interp {
         }
     }
 
-    /// Start of a directory listfile: use `CMAKE_POLICY_DEFAULT_CMP0198` when the
-    /// policy is not set, then set `CMAKE_PARENT_LIST_FILE` for `CMP0198`.
+    /// Apply the default for `CMP0198` if the policy is unset.
+    /// Then set `CMAKE_PARENT_LIST_FILE` for this directory listfile.
     fn begin_directory_list_file(&mut self) {
         if self.policy_status(CMP0198) == PolicyStatus::Warn {
             let default = self.read_var(b"CMAKE_POLICY_DEFAULT_CMP0198");

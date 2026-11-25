@@ -4,13 +4,14 @@ use std::sync::Arc;
 
 use rcmake_base::BString;
 use rcmake_base::list::{Empty, split_into};
+use rcmake_base::shell::cmake_quote;
 use rcmake_diag::{Backtrace, DiagCategory, Effect, MessageKind, PolicyId, PolicyStatus};
 use rcmake_expr::ExpandedArg;
 use rcmake_syntax::{Argument, CommandInvocation};
 
 use crate::args::{KeywordParser, Slot};
 use crate::code::Code;
-use crate::util::{IntError, escape_for_cmake, stoi};
+use crate::util::{IntError, stoi};
 use crate::{CmdError, CmdResult, Flow, Interp, UserCommand, UserCommandKind};
 use crate::{interp::BodyMode, util::cat};
 
@@ -195,7 +196,7 @@ impl Interp {
                 msg.extend_from_slice(b"given arguments:\n ");
                 for a in &expanded {
                     msg.push(b' ');
-                    msg.extend_from_slice(&escape_for_cmake(&a.value));
+                    cmake_quote(&mut msg, &a.value);
                 }
                 msg.push(b'\n');
                 msg.extend_from_slice(&e.message);
@@ -204,10 +205,6 @@ impl Interp {
             }
         }
     }
-
-    // ----------------------------------------------------------------------------------
-    // if / elseif / else / endif
-    // ----------------------------------------------------------------------------------
 
     pub(crate) fn exec_if(&mut self, code: &Code, i: usize) -> BlockResult {
         let cmds = Arc::clone(&code.cmds);
@@ -262,10 +259,6 @@ impl Interp {
         }
         Ok(Flow::Normal)
     }
-
-    // ----------------------------------------------------------------------------------
-    // foreach / endforeach
-    // ----------------------------------------------------------------------------------
 
     pub(crate) fn exec_foreach(&mut self, code: &Code, i: usize) -> BlockResult {
         let cmds = Arc::clone(&code.cmds);
@@ -591,10 +584,6 @@ impl Interp {
         Ok(flow.unwrap_or(Flow::Normal))
     }
 
-    // ----------------------------------------------------------------------------------
-    // while / endwhile
-    // ----------------------------------------------------------------------------------
-
     pub(crate) fn exec_while(&mut self, code: &Code, i: usize) -> BlockResult {
         let cmds = Arc::clone(&code.cmds);
         let Some(cmd) = cmds.get(i) else {
@@ -678,7 +667,7 @@ impl Interp {
         let mut err = b"while() given incorrect arguments:\n ".to_vec();
         for a in expanded {
             err.push(b' ');
-            err.extend_from_slice(&escape_for_cmake(&a.value));
+            cmake_quote(&mut err, &a.value);
         }
         err.push(b'\n');
         err.extend_from_slice(message);
@@ -690,10 +679,6 @@ impl Interp {
             }
         });
     }
-
-    // ----------------------------------------------------------------------------------
-    // function / macro definitions
-    // ----------------------------------------------------------------------------------
 
     pub(crate) fn exec_define(
         &mut self,
@@ -760,10 +745,6 @@ impl Interp {
             Ok(Err(CmdError::Reported))
         }
     }
-
-    // ----------------------------------------------------------------------------------
-    // block / endblock
-    // ----------------------------------------------------------------------------------
 
     fn block_plan(&mut self, args: &[ExpandedArg]) -> Result<Option<BlockPlan>, CmdError> {
         let parser = KeywordParser::new()

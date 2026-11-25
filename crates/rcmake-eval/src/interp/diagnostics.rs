@@ -481,7 +481,8 @@ fn argument_span(command: &CommandInvocation, source: &[u8], name: &[u8]) -> Opt
     spans.next().filter(|_| spans.next().is_none())
 }
 
-/// Backtrace as CMake prints it: the top frame, then only command frames. File frames
+/// Format the backtrace in CMake order. Start with the top frame, then include
+/// only command frames. File frames
 /// (`FrameKind::ModuleInclude`) locate file-level diagnostics (`in <file>:`) but do not
 /// appear in the `Call Stack` list.
 pub(crate) fn display_backtrace(bt: &Backtrace) -> Backtrace {

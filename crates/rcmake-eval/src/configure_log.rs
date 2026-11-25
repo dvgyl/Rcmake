@@ -6,7 +6,9 @@ use rcmake_base::BString;
 use rcmake_diag::FrameKind;
 use rcmake_host::WriteMode;
 
-use crate::{Cx, Interp, RunMode, hooks::json_string, util::cat};
+use rcmake_json::write_string;
+
+use crate::{Cx, Interp, RunMode, util::cat};
 
 mod find_package;
 
@@ -103,7 +105,7 @@ impl Cx<'_> {
                 {
                     key.extend_from_slice(name);
                 } else {
-                    json_string(&mut key, name);
+                    write_string(&mut key, name);
                 }
                 yaml_value(out, &key, value);
             }
@@ -257,14 +259,14 @@ impl Interp {
 
 fn yaml_item(out: &mut Vec<u8>, item: &[u8]) {
     out.extend_from_slice(b"      - ");
-    json_string(out, item);
+    write_string(out, item);
     out.push(b'\n');
 }
 
 fn yaml_value(out: &mut Vec<u8>, key: &[u8], value: &[u8]) {
     out.extend_from_slice(key);
     out.extend_from_slice(b": ");
-    json_string(out, value);
+    write_string(out, value);
     out.push(b'\n');
 }
 

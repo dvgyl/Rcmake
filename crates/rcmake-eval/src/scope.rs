@@ -236,9 +236,7 @@ mod tests {
         s.set(b"a", "outer".into());
         s.push();
         assert!(s.set_parent(b"a", Some("new".into())));
-        // The child still sees the value it had before the raise.
         assert_eq!(s.get(b"a").map(|v| v.as_slice()), Some(&b"outer"[..]));
-        // An undefined name is localized as an explicit unset.
         assert!(s.set_parent(b"b", Some("x".into())));
         assert_eq!(s.lookup(b"b"), Some(&Binding::Unset));
         s.pop();

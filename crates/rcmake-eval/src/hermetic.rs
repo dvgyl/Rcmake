@@ -12,6 +12,7 @@ use std::{
 };
 
 use rcmake_base::BString;
+use rcmake_base::unicode::is_unicode_format;
 use rcmake_host::{FileKind, Follow, Host, Stream, path::to_native};
 
 use crate::services::HermeticMode;
@@ -559,7 +560,7 @@ impl HermeticAuditor {
         let directory = directory.map_or_else(|| "<DIR>".into(), |dir| dir.to_string_lossy());
         let directory = if directory
             .chars()
-            .any(|ch| ch.is_control() || is_format(ch) || ch == ';')
+            .any(|ch| ch.is_control() || is_unicode_format(ch) || ch == ';')
         {
             "<DIR>"
         } else {
@@ -768,23 +769,11 @@ fn display_text(value: &str) -> String {
 }
 
 fn write_display_char(writer: &mut impl fmt::Write, ch: char) -> fmt::Result {
-    if is_format(ch) {
+    if is_unicode_format(ch) {
         write!(writer, "<U+{:04X}>", u32::from(ch))
     } else {
         writer.write_char(if ch.is_control() { '?' } else { ch })
     }
-}
-
-fn is_format(ch: char) -> bool {
-    // Unicode 17.0 General_Category=Cf.
-    matches!(ch,
-        '\u{00ad}' | '\u{0600}'..='\u{0605}' | '\u{061c}' | '\u{06dd}' | '\u{070f}' |
-        '\u{0890}'..='\u{0891}' | '\u{08e2}' | '\u{180e}' | '\u{200b}'..='\u{200f}' |
-        '\u{202a}'..='\u{202e}' | '\u{2060}'..='\u{2064}' | '\u{2066}'..='\u{206f}' |
-        '\u{feff}' | '\u{fff9}'..='\u{fffb}' | '\u{110bd}' | '\u{110cd}' |
-        '\u{13430}'..='\u{1343f}' | '\u{1bca0}'..='\u{1bca3}' | '\u{1d173}'..='\u{1d17a}' |
-        '\u{e0001}' | '\u{e0020}'..='\u{e007f}'
-    )
 }
 
 /// Return the scheme and host of a remote destination, without credentials or parameters.

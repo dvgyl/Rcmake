@@ -435,7 +435,7 @@ impl Cx<'_> {
     }
 
     /// Query a policy's active status. Policies whose `OLD` behavior was removed
-    /// (`CMP0000`–`CMP0065`) are always `NEW`.
+    /// (`CMP0000` through `CMP0065`) are always `NEW`.
     #[must_use]
     pub fn policy(&self, id: PolicyId) -> PolicyStatus {
         self.interp.policy_status(id)

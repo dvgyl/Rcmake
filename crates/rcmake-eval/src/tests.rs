@@ -2271,7 +2271,7 @@ fn trace_human_lists_commands_and_end_commands_after_bodies() {
 #[test]
 fn trace_expand_and_json_v1() {
     let o = run_traced(
-        "set(a \"x\\\"y\")\nmessage(\"${a}\")\n",
+        "set(a \"x\\\"y\x7f\")\nmessage(\"${a}\")\n",
         crate::TraceConfig {
             format: crate::TraceFormat::JsonV1,
             expand: true,
@@ -2286,7 +2286,7 @@ fn trace_expand_and_json_v1() {
     let msg = lines.get(2).copied().unwrap_or_default();
     assert!(
         msg.starts_with(
-            "{\"args\":[\"x\\\"y\"],\"cmd\":\"message\",\"file\":\"/work/main.cmake\",\"frame\":1,\"global_frame\":1,\"line\":2,\"time\":"
+            "{\"args\":[\"x\\\"y\x7f\"],\"cmd\":\"message\",\"file\":\"/work/main.cmake\",\"frame\":1,\"global_frame\":1,\"line\":2,\"time\":"
         ),
         "{msg}"
     );

@@ -682,6 +682,7 @@ dependencies = [
  "rcmake-diag",
  "rcmake-expr",
  "rcmake-host",
+ "rcmake-json",
  "rcmake-model",
  "rcmake-regex",
  "rcmake-syntax",

@@ -110,10 +110,8 @@ mod tests {
         s.update(|v| *v = 9);
         assert_eq!(*s.top(), 9);
         assert!(s.pop_above(0));
-        // The strong entry below the weak one received the update.
         assert_eq!(*s.top(), 9);
         assert!(s.pop_above(0));
-        // The root entry is below a strong entry and stays unchanged.
         assert_eq!(*s.top(), 0);
     }
 

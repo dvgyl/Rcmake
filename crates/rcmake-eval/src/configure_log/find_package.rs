@@ -1,7 +1,9 @@
 use rcmake_base::BString;
 
 use super::{yaml_bool, yaml_value};
-use crate::{Cx, RunMode, hooks::json_string};
+use rcmake_json::write_string;
+
+use crate::{Cx, RunMode};
 
 /// Fields for one package search in the configure log.
 #[derive(Default)]
@@ -159,7 +161,7 @@ fn path_list(out: &mut Vec<u8>, indent: &[u8], key: &[u8], values: &[BString]) {
     for value in values {
         out.extend_from_slice(indent);
         out.extend_from_slice(b"  - ");
-        json_string(out, value);
+        write_string(out, value);
         out.push(b'\n');
     }
 }

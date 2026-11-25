@@ -403,7 +403,6 @@ impl Interp {
         if let Some((record, state, checked)) = candidate
             && state.restore(self, &writes)
         {
-            // The candidate passed validation for each variable and cache write.
             checked
                 .replay_into(&mut self.cx())
                 .map_err(|error| crate::CmdError::status(error.to_string()))?;

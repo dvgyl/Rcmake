@@ -377,10 +377,6 @@ fn cmd_include_guard(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
     Ok(Flow::Normal)
 }
 
-// ---------------------------------------------------------------------------------------
-// message()
-// ---------------------------------------------------------------------------------------
-
 /// What `message()` does with its text.
 enum Display {
     /// `cmMakefile::DisplayStatus`: `-- <text>` on stdout.

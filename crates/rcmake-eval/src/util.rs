@@ -82,22 +82,6 @@ pub(crate) fn filename_path(path: &[u8]) -> BString {
     }
 }
 
-/// Quote a value for display in CMake code (`cmOutputConverter::EscapeForCMake`).
-pub(crate) fn escape_for_cmake(value: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(value.len() + 2);
-    out.push(b'"');
-    for &b in value {
-        match b {
-            b'"' => out.extend_from_slice(b"\\\""),
-            b'$' => out.extend_from_slice(b"\\$"),
-            b'\\' => out.extend_from_slice(b"\\\\"),
-            other => out.push(other),
-        }
-    }
-    out.push(b'"');
-    out
-}
-
 /// Replace every non-overlapping occurrence of `needle` in `hay` with `rep`, scanning
 /// left to right (`cmSystemTools::ReplaceString`).
 pub(crate) fn replace_all(hay: &[u8], needle: &[u8], rep: &[u8]) -> Vec<u8> {
@@ -213,8 +197,7 @@ mod tests {
     }
 
     #[test]
-    fn escape_and_replace() {
-        assert_eq!(escape_for_cmake(b"a\"$\\b"), b"\"a\\\"\\$\\\\b\"".to_vec());
+    fn replace_and_escape_backslashes() {
         assert_eq!(replace_all(b"${a}${a}x", b"${a}", b"1"), b"11x".to_vec());
         assert_eq!(replace_all(b"aaa", b"aa", b"b"), b"ba".to_vec());
         assert_eq!(escape_backslashes(b"a\\b"), "a\\\\b");

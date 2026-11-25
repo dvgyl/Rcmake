@@ -8,6 +8,7 @@ use std::sync::Arc;
 use rcmake_base::BString;
 use rcmake_diag::{Backtrace, Effect, Frame, FrameKind, MessageKind, PolicyId, PolicyStatus};
 use rcmake_host::{Stream, WriteMode};
+use rcmake_json::write_string;
 use rcmake_model::DirId;
 use rcmake_syntax::{ArgKind, Argument, CommandInvocation};
 
@@ -107,31 +108,6 @@ pub(crate) struct DeferredCall {
     cmd: CommandInvocation,
 }
 
-/// Append `s` to `out` as a JSON string (JsonCpp escapes: no raw control or non-ASCII
-/// bytes).
-pub(crate) fn json_string(out: &mut Vec<u8>, s: &[u8]) {
-    out.push(b'"');
-    for ch in String::from_utf8_lossy(s).chars() {
-        match ch {
-            '"' => out.extend_from_slice(b"\\\""),
-            '\\' => out.extend_from_slice(b"\\\\"),
-            '\u{8}' => out.extend_from_slice(b"\\b"),
-            '\u{c}' => out.extend_from_slice(b"\\f"),
-            '\n' => out.extend_from_slice(b"\\n"),
-            '\r' => out.extend_from_slice(b"\\r"),
-            '\t' => out.extend_from_slice(b"\\t"),
-            c if c.is_ascii() && !c.is_ascii_control() => out.push(c as u8),
-            c => {
-                let mut units = [0u16; 2];
-                for unit in c.encode_utf16(&mut units) {
-                    out.extend_from_slice(format!("\\u{unit:04x}").as_bytes());
-                }
-            }
-        }
-    }
-    out.push(b'"');
-}
-
 /// Seconds since the epoch with 17 significant digits (JsonCpp `double` output).
 fn json_time(secs: i64, nanos: u32) -> String {
     let int_digits = secs.unsigned_abs().to_string().len();
@@ -156,10 +132,6 @@ fn trace_source_matches(path: &[u8], source: &[u8]) -> bool {
 }
 
 impl Interp {
-    // ----------------------------------------------------------------------------------
-    // Variable watches.
-    // ----------------------------------------------------------------------------------
-
     /// `cmVariableWatch::AddWatch`: every call adds a new watch.
     pub(crate) fn add_watch(&mut self, var: &[u8], command: &[u8]) {
         self.next_watch_id = self.next_watch_id.saturating_add(1);
@@ -296,17 +268,9 @@ impl Interp {
         }
     }
 
-    /// `LISTFILE_STACK`: the listfile of each file and function call scope, outermost
-    /// first.
+    /// Listfiles of active file and function scopes, starting with the outermost.
     pub(crate) fn listfile_stack(&self) -> BString {
-        let mut out = Vec::new();
-        for (i, file) in self.listfiles.iter().enumerate() {
-            if i > 0 {
-                out.push(b';');
-            }
-            out.extend_from_slice(file);
-        }
-        BString::from(out)
+        rcmake_base::list::join(self.listfiles.iter())
     }
 
     /// Define a normal variable and notify its watches (`cmMakefile::AddDefinition`).
@@ -343,10 +307,6 @@ impl Interp {
         self.fire_watches(name, access, value.as_ref().map(|v| v.as_slice()));
         self.lookup_var(name).cloned()
     }
-
-    // ----------------------------------------------------------------------------------
-    // Tracing.
-    // ----------------------------------------------------------------------------------
 
     /// Install or remove the trace configuration. With `--trace-redirect`, truncate the
     /// output file. With JSON output, write the format version line.
@@ -430,16 +390,16 @@ impl Interp {
                     if i > 0 {
                         out.push(b',');
                     }
-                    json_string(&mut out, arg);
+                    write_string(&mut out, arg);
                 }
                 out.extend_from_slice(b"],\"cmd\":");
-                json_string(&mut out, &cmd.name);
+                write_string(&mut out, &cmd.name);
                 if let Some(id) = &defer_id {
                     out.extend_from_slice(b",\"defer\":");
-                    json_string(&mut out, id);
+                    write_string(&mut out, id);
                 }
                 out.extend_from_slice(b",\"file\":");
-                json_string(&mut out, file);
+                write_string(&mut out, file);
                 let now = self.config.host.now();
                 out.extend_from_slice(
                     format!(
@@ -460,10 +420,6 @@ impl Interp {
         }
         self.write_trace_line(&out);
     }
-
-    // ----------------------------------------------------------------------------------
-    // Deferred calls.
-    // ----------------------------------------------------------------------------------
 
     /// `cmGlobalGenerator::NewDeferId`: `__0`, `__1`, and so on.
     pub(crate) fn new_defer_id(&mut self) -> BString {
@@ -630,7 +586,7 @@ mod tests {
     #[test]
     fn json_escapes_match_jsoncpp() {
         let mut out = Vec::new();
-        json_string(&mut out, "a\"b\\c\n\u{1}é".as_bytes());
+        write_string(&mut out, "a\"b\\c\n\u{1}é".as_bytes());
         assert_eq!(out, b"\"a\\\"b\\\\c\\n\\u0001\\u00e9\"".to_vec());
     }
 
