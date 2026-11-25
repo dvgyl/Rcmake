@@ -41,7 +41,7 @@ pub use install::{
     BuildExport, DiscoverySpec, ExportKind, ExportSet, InstallKind, InstallOptions, InstallRule,
     PackageInfoSpec, ProjectMetadata, SbomSpec, TestEntry, TestKind,
 };
-pub use project::{ModelError, ProjectModel};
+pub use project::{ModelError, ProjectModel, replay};
 pub use props::{AppendMode, PropOrigin, PropScope};
 pub use target::{
     FileSet, FileSetKind, ImportedVisibility, LinkItem, Target, TargetBinding, TargetKind,
