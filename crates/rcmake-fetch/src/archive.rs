@@ -49,7 +49,15 @@ impl ContentHash {
 
     /// Compare the hash with archive bytes.
     pub fn verify(&self, bytes: &[u8]) -> Result<(), FetchError> {
-        let actual = self.algorithm.hex_digest(bytes);
+        self.verify_hex(self.algorithm.hex_digest(bytes))
+    }
+
+    /// Verify a regular file without reading it into memory.
+    pub fn verify_file(&self, host: &dyn Host, file: &Path) -> Result<(), FetchError> {
+        self.verify_hex(rcmake_host::path::hash_file(host, file, self.algorithm)?)
+    }
+
+    fn verify_hex(&self, actual: String) -> Result<(), FetchError> {
         if actual == self.hex {
             Ok(())
         } else {
@@ -357,12 +365,22 @@ impl<'a> ArchiveCache<'a> {
             return Err(invalid("Invalid archive destination."));
         }
         let result = self.fetch(url, hash)?;
-        let guard = destination.with_added_extension("rcmake-fetch.guard");
-        let _guard = self
-            .host
-            .lock_file(&guard, Some(DESTINATION_LOCK_TIMEOUT))?;
-        atomic_write(self.host, destination, &result.bytes)?;
+        Self::write_verified(self.host, destination, &result.bytes)?;
         Ok(result)
+    }
+
+    /// Atomically write bytes that the caller verified against the requested pin.
+    pub fn write_verified(
+        host: &dyn Host,
+        destination: &Path,
+        bytes: &[u8],
+    ) -> Result<(), FetchError> {
+        if !destination.is_absolute() || destination.file_name().is_none() {
+            return Err(invalid("Invalid archive destination."));
+        }
+        let guard = destination.with_added_extension("rcmake-fetch.guard");
+        let _guard = host.lock_file(&guard, Some(DESTINATION_LOCK_TIMEOUT))?;
+        atomic_write(host, destination, bytes)
     }
 
     pub(crate) fn download(&self, url: &str) -> Result<Vec<u8>, FetchError> {

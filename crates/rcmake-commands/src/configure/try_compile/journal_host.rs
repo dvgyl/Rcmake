@@ -64,7 +64,7 @@ impl Host for JournalHost<'_> {
         if self.private_path(path) {
             return self.inner.read_chunks(path, consume);
         }
-        if !bounded_file(self.inner, path) {
+        if !bounded_file(&*self.inner, path) {
             self.guard_effect(ImpureReason::UnverifiableInput)?;
             return self.inner.read_chunks(path, consume);
         }
@@ -88,16 +88,7 @@ impl Host for JournalHost<'_> {
     }
 
     fn read_dir(&self, path: &Path) -> HostResult<Vec<DirEntry>> {
-        let mut result = self.inner.read_dir(path);
-        if self.sorted_listings
-            && let Ok(entries) = &mut result
-        {
-            entries.sort_unstable_by(|left, right| {
-                left.name
-                    .cmp(&right.name)
-                    .then_with(|| kind_tag(left.kind).cmp(&kind_tag(right.kind)))
-            });
-        }
+        let result = self.inner.read_dir(path);
         if !self.private_path(path) {
             match &result {
                 Ok(entries) if is_absolute(path) => {
@@ -106,12 +97,10 @@ impl Host for JournalHost<'_> {
                         path: path.to_owned(),
                         digest: listing_digest(entries, true),
                     });
-                    if !self.sorted_listings {
-                        state.check(
-                            Check::DirectoryOrder(path.to_owned()),
-                            listing_digest(entries, false),
-                        );
-                    }
+                    state.check(
+                        Check::DirectoryOrder(path.to_owned()),
+                        listing_digest(entries, false),
+                    );
                 }
                 Err(error) if is_absolute(path) && error.kind == ErrorKind::NotFound => {
                     self.state().check(
@@ -396,5 +385,58 @@ impl Host for JournalHost<'_> {
         let system = self.inner.system();
         self.state().check(Check::System, system_digest(&system));
         system
+    }
+}
+
+pub(super) enum SharedOrBorrowed<'a, T: ?Sized> {
+    Shared(std::sync::Arc<T>),
+    Borrowed(&'a T),
+}
+
+impl<T: ?Sized> std::ops::Deref for SharedOrBorrowed<'_, T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        match self {
+            Self::Shared(value) => value,
+            Self::Borrowed(value) => value,
+        }
+    }
+}
+
+impl JournalHost<'static> {
+    pub(crate) fn from_shared(
+        inner: std::sync::Arc<dyn Host>,
+        scratch: &Path,
+        verify_process: std::sync::Arc<dyn ProcessVerifier>,
+        mode: JournalMode,
+    ) -> HostResult<Self> {
+        Self::from_parts(
+            SharedOrBorrowed::Shared(inner),
+            scratch,
+            mode,
+            Some(SharedOrBorrowed::Shared(verify_process)),
+        )
+    }
+}
+
+impl JournalHost<'_> {
+    /// Complete recording after the child has stopped.
+    pub(crate) fn finish(self) -> Journal {
+        let state = self
+            .state
+            .into_inner()
+            .unwrap_or_else(PoisonError::into_inner);
+        Journal {
+            trace: state.stamps.into_values().collect(),
+            checks: JournalChecks(state.checks.into_iter().collect()),
+            #[cfg(test)]
+            environment: state.environment,
+            #[cfg(test)]
+            full_environment: state.full_environment,
+            processes: state.processes,
+            output: state.output,
+            impure: state.impure,
+        }
     }
 }

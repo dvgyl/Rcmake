@@ -26,9 +26,9 @@ const MAX_DIAGNOSTICS: usize = 16_384;
 static NEXT_ARTIFACT: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Deserialize, Serialize)]
-struct CachedProbe {
-    outcome: ProbeOutcome,
-    checks: JournalChecks,
+pub(super) struct CachedProbe {
+    pub(super) outcome: ProbeOutcome,
+    pub(super) checks: JournalChecks,
 }
 
 /// Compile result for the sequential evaluator, from either execution or lookup.
@@ -95,6 +95,7 @@ impl Artifact {
     }
 
     /// Restore the artifact in private scratch space and copy it to the caller's destination.
+    #[cfg(test)]
     pub(crate) fn copy_to(
         &self,
         host: &dyn Host,
@@ -116,6 +117,7 @@ pub(crate) fn is_relative_artifact(path: &Path) -> bool {
 
 /// Cache events counted across all probes that share this cache.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[cfg(test)]
 pub(crate) struct ProbeCacheStats {
     /// Valid cached outcomes.
     pub(crate) hits: u64,
@@ -146,6 +148,8 @@ pub(crate) enum SkipReason {
     Disabled,
     /// The host cannot lock the store.
     Unsupported,
+    /// The store rejected a stale input trace.
+    Stale,
     /// The job was cancelled before publication.
     Cancelled,
 }
@@ -153,12 +157,20 @@ pub(crate) enum SkipReason {
 /// Result of an optional cache write.
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) enum ProbePublishOutcome {
-    /// The store has a valid result for this key.
+    /// The store published and validated this result.
     Published,
+    /// The store already had a valid result.
+    AlreadyPresent,
     /// The cache skipped the write.
     Skipped(SkipReason),
     /// An error occurred in the store. The probe result is still usable.
     StoreError(String),
+}
+
+impl ProbePublishOutcome {
+    pub(crate) fn available(&self) -> bool {
+        matches!(self, Self::Published | Self::AlreadyPresent)
+    }
 }
 
 /// Site and caller-visible results for a comparison in verify mode.
@@ -394,17 +406,14 @@ impl ProbeCache {
                 Err(error) if error.kind == ErrorKind::TimedOut => {
                     return Ok(ProbePublishOutcome::Skipped(SkipReason::Busy));
                 }
+                Err(error) if error.kind == ErrorKind::Unsupported => {
+                    return Ok(ProbePublishOutcome::Skipped(SkipReason::Unsupported));
+                }
                 Err(error) => return Err(error),
             };
             let existing = store.get_entry::<CachedProbe>(Domain::ProbeV1, key)?;
-            if let Some(entry) = &existing
-                && entry.payload.checks.verify(host)
-                && entry
-                    .blobs
-                    .iter()
-                    .all(|digest| store.get_blob(*digest).is_ok_and(|blob| blob.is_some()))
-            {
-                return Ok(ProbePublishOutcome::Published);
+            if existing.is_some() && read_outcome(host, &store, recipe).is_some() {
+                return Ok(ProbePublishOutcome::AlreadyPresent);
             }
             check_regular_or_missing(host, &marker)?;
             let mut generation = match host.read(&marker, ReadRange::All { limit: 32 }) {
@@ -455,15 +464,18 @@ impl ProbeCache {
             }
             use rcmake_store::PublishOutcome;
             match store.put_entry(Domain::ProbeV1, key, &entry)? {
-                PublishOutcome::Published | PublishOutcome::AlreadyPresent => {
-                    let visible = store.get_entry::<CachedProbe>(Domain::ProbeV1, key)?;
-                    if visible.is_some_and(|entry| entry.payload.checks.verify(host)) {
-                        Ok(ProbePublishOutcome::Published)
+                status @ (PublishOutcome::Published | PublishOutcome::AlreadyPresent) => {
+                    if read_outcome(host, &store, recipe).is_some() {
+                        Ok(if status == PublishOutcome::Published {
+                            ProbePublishOutcome::Published
+                        } else {
+                            ProbePublishOutcome::AlreadyPresent
+                        })
                     } else {
                         Ok(ProbePublishOutcome::Skipped(SkipReason::Busy))
                     }
                 }
-                PublishOutcome::Stale => Ok(inputs_changed()),
+                PublishOutcome::Stale => Ok(ProbePublishOutcome::Skipped(SkipReason::Stale)),
                 PublishOutcome::SkippedBusy => Ok(ProbePublishOutcome::Skipped(SkipReason::Busy)),
                 PublishOutcome::Disabled => Ok(ProbePublishOutcome::Skipped(SkipReason::Disabled)),
                 PublishOutcome::SkippedUnsupported => {
@@ -571,6 +583,7 @@ impl ProbeCache {
     }
 
     /// Read the current cache counters.
+    #[cfg(test)]
     pub(crate) fn stats(&self) -> ProbeCacheStats {
         ProbeCacheStats {
             hits: self.hits.load(Ordering::Relaxed),
@@ -662,6 +675,14 @@ fn normalized_output(bytes: &[u8]) -> Vec<u8> {
 }
 
 fn entry_fits(trace: &[InputStamp], checks: &JournalChecks, outcome: &ProbeOutcome) -> bool {
+    if outcome.compiled != (outcome.exit_code == 0)
+        || outcome
+            .artifact
+            .as_ref()
+            .is_some_and(|artifact| artifact.mode & !0o777 != 0)
+    {
+        return false;
+    }
     let path_size = |path: &Path| path.as_os_str().as_encoded_bytes().len().saturating_mul(6);
     let bytes = trace
         .iter()
@@ -699,6 +720,28 @@ fn entry_fits(trace: &[InputStamp], checks: &JournalChecks, outcome: &ProbeOutco
     bytes <= MAX_ENTRY_BYTES
 }
 
+pub(super) fn verify_remote_payload(
+    host: &dyn Host,
+    recipe: &ProbeRecipe,
+    entry: &Entry<CachedProbe>,
+) -> bool {
+    let outcome = &entry.payload.outcome;
+    let checks = &entry.payload.checks;
+    if !entry_fits(&entry.trace, checks, outcome) || !checks.verify(host) {
+        return false;
+    }
+    let (Some(artifact), [blob]) = (&outcome.artifact, entry.blobs.as_slice()) else {
+        return false;
+    };
+    let bindings = recipe.bindings.clone().with_canonical(host);
+    outcome.compiled
+        && artifact.blob == *blob
+        && artifact
+            .relative_path
+            .render(&bindings)
+            .is_some_and(|bytes| is_relative_artifact(&path::to_native(&bytes)))
+}
+
 fn read_outcome(
     host: &dyn Host,
     store: &Store<'_>,
@@ -707,6 +750,15 @@ fn read_outcome(
     let entry = store
         .get_entry::<CachedProbe>(Domain::ProbeV1, compute_probe_key(recipe))
         .ok()??;
+    decode_outcome(host, store, recipe, entry)
+}
+
+pub(super) fn decode_outcome(
+    host: &dyn Host,
+    store: &Store<'_>,
+    recipe: &ProbeRecipe,
+    entry: Entry<CachedProbe>,
+) -> Option<ObservedOutcome> {
     if !entry.payload.checks.verify(host) {
         return None;
     }

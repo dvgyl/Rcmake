@@ -4,7 +4,17 @@
 
 #![forbid(unsafe_code)]
 
-use std::{collections::BTreeMap, fmt};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt,
+};
+
+mod archive;
+mod git;
+mod runtime;
+pub(crate) use archive::prepare_archive;
+pub(crate) use git::{after_process, before_process};
+pub(crate) use runtime::FetchRuntime;
 
 use rcmake_base::{
     BString,
@@ -16,8 +26,7 @@ use rcmake_expr::ExpandedArg;
 use rcmake_host::Host;
 
 use rcmake_fetch::{
-    ArchiveCache, ArchiveResult, ContentHash, FetchError, FetchPool, GitClone, GitEntry, LockEntry,
-    LockFile, LockMode, LockSession, PrefetchSource, Ticket, UrlEntry, classify_git_checkout,
+    ContentHash, GitClone, GitEntry, LockEntry, LockMode, PrefetchSource, classify_git_checkout,
     classify_git_clone,
 };
 
@@ -201,6 +210,7 @@ fn is_option(value: &[u8]) -> bool {
 /// A configure-local index of FetchContent declarations and requested fetch rules.
 pub(crate) struct FetchSession {
     declarations: BTreeMap<String, DeclaredFetch>,
+    credentials: BTreeSet<String>,
     mode: FetchLockMode,
     offline: bool,
     prefetch: bool,
@@ -220,6 +230,7 @@ impl FetchSession {
     pub(crate) fn new(services: &Services, host: &dyn Host) -> Self {
         Self {
             declarations: BTreeMap::new(),
+            credentials: BTreeSet::new(),
             mode: services.speed.fetch_lock,
             offline: host
                 .env_get(b"RCMAKE_FETCH_OFFLINE")
@@ -232,12 +243,22 @@ impl FetchSession {
         &mut self,
         args: &[ExpandedArg],
     ) -> Result<Option<&DeclaredFetch>, BlockedFetch> {
-        if let Some((name, args)) = args.split_first()
-            && declaration_options(args)
-                .iter()
-                .any(|(&key, values)| values.iter().any(|value| credentialed_option(key, value)))
+        let Some((name, options)) = args.split_first() else {
+            return Ok(None);
+        };
+        let Some(name) = text(&name.value).filter(|name| name.len() <= 256) else {
+            return Ok(None);
+        };
+        let name = name.to_ascii_lowercase();
+        if self.declarations.contains_key(&name) || self.credentials.contains(&name) {
+            return Ok(None);
+        }
+        if declaration_options(options)
+            .iter()
+            .any(|(&key, values)| values.iter().any(|value| credentialed_option(key, value)))
         {
-            return self.unportable(&String::from_utf8_lossy(&name.value));
+            self.credentials.insert(name.clone());
+            return self.unportable(&name);
         }
         let Some(declaration) = parse_fetchcontent_declare(args) else {
             return Ok(None);
@@ -427,7 +448,7 @@ impl fmt::Display for BlockedFetch {
         }
         formatter.write_str(match self.reason {
             BlockReason::Unpinned =>
-                " Set URL_HASH or record a verified pin in rcmake-fetch.lock with --fetch-lock=update.",
+                " Set URL_HASH for an archive, use a full Git commit ID, or record the pin with --fetch-lock=update.",
             BlockReason::Unsupported =>
                 " This transfer cannot enforce a fetch pin. Set FETCHCONTENT_SOURCE_DIR_<NAME> to a pre-populated directory.",
             BlockReason::CredentialedSource =>
@@ -524,58 +545,41 @@ pub(crate) enum GitTransfer<'a> {
     Checkout,
 }
 impl FetchSession {
-    /// Prefetch a pinned source with default options. Pass current population settings.
-    pub(crate) fn prefetch(
-        &self,
-        pool: &FetchPool,
-        declaration: &DeclaredFetch,
-        source_override: bool,
-        disconnected: bool,
-        default_transport: bool,
-        provider_active: bool,
-    ) -> Result<Option<Ticket>, FetchError> {
+    fn prefetch_source(&self, declaration: &DeclaredFetch) -> Option<PrefetchSource> {
         if !self.prefetch
             || self.offline
             || self.mode == FetchLockMode::Frozen
-            || source_override
-            || disconnected
-            || !default_transport
-            || provider_active
             || declaration.package_lookup
             || !declaration.supported()
             || declaration.transfer_settings
         {
-            return Ok(None);
+            return None;
         }
-        let source = match &declaration.source {
+        match &declaration.source {
             DeclaredSource::Archive {
                 urls,
                 hash: Some(hash),
             } => {
-                let Some(url) = urls.first().filter(|url| portable_source(url)).cloned() else {
-                    return Ok(None);
-                };
-                PrefetchSource::Url {
+                let url = urls.first().filter(|url| portable_source(url))?.clone();
+                Some(PrefetchSource::Url {
                     url,
-                    hash: ContentHash::parse(hash)?,
-                }
+                    hash: ContentHash::parse(hash).ok()?,
+                })
             }
             DeclaredSource::Git { repository, .. }
-                if !relative_repo(repository) && portable_source(repository) =>
+                if portable_source(repository)
+                    && (std::path::Path::new(repository).is_absolute()
+                        || repository
+                            .split_once(':')
+                            .is_some_and(|(authority, _)| !authority.contains('/'))) =>
             {
-                let Some(commit) = declaration.git_commit() else {
-                    return Ok(None);
-                };
-                PrefetchSource::Git {
+                Some(PrefetchSource::Git {
                     repository: repository.clone(),
-                    commit: commit.into(),
-                }
+                    commit: declaration.git_commit()?.to_ascii_lowercase(),
+                })
             }
-            _ => return Ok(None),
-        };
-        pool.submit(source)
-            .map(Some)
-            .map_err(|_| FetchError::Invalid("Cannot queue fetch prefetch.".into()))
+            _ => None,
+        }
     }
     /// Match a bundled Git clone or checkout. The hook verifies its working directory.
     pub(crate) fn match_git<'a>(
@@ -619,135 +623,12 @@ impl FetchSession {
                 .then_some(GitTransfer::Checkout)
         })
     }
-    /// Apply cache and lock rules to a download. In Update, record successful results.
-    pub(crate) fn fetch_archive_with(
-        &self,
-        cache: &ArchiveCache<'_>,
-        transfer: &ArchiveTransfer<'_>,
-        snapshot: Option<&LockFile>,
-        download: impl FnOnce(&str, &[&[u8]]) -> Result<Vec<u8>, FetchError>,
-    ) -> Result<(ArchiveResult, Option<FetchError>), FetchError> {
-        let expected = transfer.declared_hash.map(ContentHash::parse).transpose()?;
-        let portable = transfer.is_portable();
-        if !portable && self.persists_or_enforces() {
-            return Err(transfer.failure(self.offline, BlockReason::CredentialedSource));
-        }
-        let lock = match snapshot
-            .filter(|_| portable)
-            .and_then(|file| file.get(transfer.dependency))
-        {
-            Some(LockEntry::Url(entry)) if entry.urls.as_slice() == transfer.urls => Some(entry),
-            _ => None,
-        };
-        if self.mode == FetchLockMode::Frozen && lock.is_none() {
-            return Err(transfer.failure(self.offline, BlockReason::LockMismatch));
-        }
-        let enforced = lock.filter(|_| {
-            self.mode == FetchLockMode::Frozen
-                || (self.offline && self.mode != FetchLockMode::Off && expected.is_none())
-        });
-        let lock_pin = enforced.map(|entry| ContentHash::sha256(entry.sha256));
-        let pin = lock_pin.as_ref().or(expected.as_ref()).filter(|_| portable);
-        if self.offline && pin.is_none() {
-            return Err(transfer.failure(true, BlockReason::Unpinned));
-        }
-        let verify = |bytes: &[u8]| -> Result<(), FetchError> {
-            if let Some(expected) = &expected {
-                expected.verify(bytes)?;
-            }
-            if let Some(entry) = enforced {
-                verify_archive_size(entry, bytes)?;
-            }
-            Ok(())
-        };
-        // A nonportable transfer can still run online, but has no cache identity.
-        let identity = if portable { transfer.url } else { "" };
-        let mut result = cache
-            .fetch_with(identity, pin, || {
-                if self.offline {
-                    return Err(FetchError::Offline);
-                }
-                let bytes = download(transfer.url, transfer.args)?;
-                verify(&bytes)?;
-                Ok(bytes)
-            })
-            .map_err(|error| transfer.transfer_error(self.offline, error))?;
-        if result.cache_hit && enforced.is_some() {
-            verify(&result.bytes).map_err(|error| transfer.transfer_error(self.offline, error))?;
-        }
-        if self.mode == FetchLockMode::Update && expected.is_none() {
-            let entry = UrlEntry::from_bytes(Vec::new(), &result.bytes);
-            result.cache_warning = cache
-                .insert(
-                    transfer.url,
-                    &ContentHash::sha256(entry.sha256),
-                    &result.bytes,
-                )
-                .err();
-        }
-        result.cache_warning = result
-            .cache_warning
-            .map(|_| FetchError::Invalid("Cannot read or write the fetch cache.".into()));
-        let warning = lock
-            .filter(|_| self.mode == FetchLockMode::Auto && expected.is_none())
-            .and_then(|entry| {
-                ContentHash::sha256(entry.sha256)
-                    .verify(&result.bytes)
-                    .and_then(|()| verify_archive_size(entry, &result.bytes))
-                    .err()
-            });
-        Ok((result, warning))
-    }
 }
 impl ArchiveTransfer<'_> {
-    /// Record the full mirror list and content identity in an Update session.
-    pub(crate) fn record(
-        &self,
-        lock: &mut LockSession<'_>,
-        result: &ArchiveResult,
-    ) -> Result<(), FetchError> {
-        if !self.is_portable() {
-            return Err(self.failure(false, BlockReason::CredentialedSource));
-        }
-        let entry = UrlEntry::from_bytes(self.urls.to_vec(), &result.bytes);
-        lock.record(self.dependency, LockEntry::Url(entry))
-    }
     fn is_portable(&self) -> bool {
         self.urls.iter().all(|url| portable_source(url))
             && portable_source(self.url)
             && !credential_options(self.args)
-    }
-    fn failure(&self, offline: bool, reason: BlockReason) -> FetchError {
-        let blocked = BlockedFetch {
-            dependency: safe_name(self.dependency),
-            endpoint: Some(sanitize_url(self.url)),
-            reason,
-            offline,
-        };
-        FetchError::Invalid(blocked.to_string())
-    }
-    fn transfer_error(&self, offline: bool, error: FetchError) -> FetchError {
-        let cause = match error {
-            FetchError::Offline => return self.failure(offline, BlockReason::CacheMiss),
-            FetchError::HashMismatch { .. } => {
-                "The archive hash differs. Check URL_HASH and the mirror."
-            }
-            _ => "Check the transfer settings and the fetch cache.",
-        };
-        FetchError::Invalid(format!(
-            "Cannot retrieve the archive for {} at {}. {cause}",
-            safe_name(self.dependency),
-            sanitize_url(self.url),
-        ))
-    }
-}
-fn verify_archive_size(entry: &UrlEntry, bytes: &[u8]) -> Result<(), FetchError> {
-    if entry.size == bytes.len() as u64 {
-        Ok(())
-    } else {
-        Err(FetchError::Invalid(
-            "Archive size differs from the fetch lock entry.".into(),
-        ))
     }
 }
 #[cfg(test)]
@@ -814,3 +695,6 @@ mod tests {
         assert!(urls.into_iter().all(portable_source));
     }
 }
+
+#[cfg(test)]
+mod activation_tests;

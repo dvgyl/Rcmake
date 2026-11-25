@@ -3,6 +3,7 @@
 #![forbid(unsafe_code)]
 
 use std::collections::BTreeMap;
+#[cfg(test)]
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -164,6 +165,7 @@ impl ProbeRecipe {
     ///
     /// The caller must claim this directory exclusively. Exact cache reuse
     /// requires that the actual child use these same paths and target name.
+    #[cfg(test)]
     pub(crate) fn bind_exact_scratch(&mut self, root: &Path) -> Option<PathBuf> {
         let key = recipe_key(self, false).to_hex();
         let scratch = root.join(format!("TryCompile-{key}"));

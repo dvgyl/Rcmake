@@ -20,18 +20,28 @@ pub(super) struct CapturingHost {
 }
 
 impl CapturingHost {
+    fn new(parent: Arc<dyn Host>, cwd: &Path, system: SystemInfo) -> Arc<Self> {
+        Arc::new(Self {
+            system,
+            parent,
+            output: Mutex::default(),
+            trace_output: OnceLock::new(),
+            cwd: cwd.to_owned(),
+        })
+    }
+
+    #[cfg(all(test, feature = "native", unix))]
+    pub(super) fn for_test(parent: Arc<dyn Host>, cwd: &Path, system: SystemInfo) -> Arc<Self> {
+        Self::new(parent, cwd, system)
+    }
+
     pub(super) fn capture<T>(
         parent: Arc<dyn Host>,
         cwd: &Path,
         configure: impl FnOnce(Arc<Self>) -> T,
     ) -> (T, BString) {
-        let host = Arc::new(Self {
-            system: parent.system(),
-            parent,
-            output: Mutex::default(),
-            trace_output: OnceLock::new(),
-            cwd: cwd.to_owned(),
-        });
+        let system = parent.system();
+        let host = Self::new(parent, cwd, system);
         let outcome = configure(Arc::clone(&host));
         let output = std::mem::take(
             &mut *host

@@ -13,7 +13,7 @@ use rcmake_host::{
 };
 use rcmake_model::{Cache, CacheEntry, CacheType, DirId, GlobalState, ProjectModel, PropertyMap};
 use rcmake_regex::{Captures, Regex, RegexError};
-use rcmake_syntax::Argument;
+use rcmake_syntax::{Argument, CommandInvocation};
 
 use crate::{
     Binding, CmdError, CmdResult, Command, IncludeOptions, Interp, LogLevel, RunMode,
@@ -136,6 +136,53 @@ impl Cx<'_> {
     #[must_use]
     pub fn services(&self) -> &crate::Services {
         &self.interp.config.services
+    }
+
+    /// Get the session data of type `T`.
+    #[must_use]
+    pub fn session_data<T: std::any::Any + Send + Sync>(&self) -> Option<&T> {
+        self.interp.session_data()
+    }
+
+    /// Get the configured path to the bundled modules and templates.
+    #[must_use]
+    pub fn cmake_root(&self) -> &Path {
+        &self.interp.config.cmake_root
+    }
+
+    /// Get the defining listfile of a function or macro.
+    #[must_use]
+    pub fn user_command_file(&self, name: &[u8]) -> Option<&[u8]> {
+        match self.interp.scripted.get(name)? {
+            crate::Command::User(command) => Some(&command.body.file),
+            crate::Command::Builtin(..) => None,
+        }
+    }
+
+    /// Return whether a built-in implements the specified lowercase command.
+    #[must_use]
+    pub fn is_builtin(&self, name: &[u8]) -> bool {
+        matches!(
+            self.interp.lookup_command(name),
+            Some(crate::Command::Builtin(..))
+        )
+    }
+
+    /// Get the current raw command and the rest of its active sequence.
+    #[must_use]
+    pub fn lookahead(&self) -> Option<(&CommandInvocation, &[CommandInvocation])> {
+        let (commands, index) = self.interp.cur_cmd.as_ref()?;
+        let current = commands.get(*index)?;
+        let remaining = commands
+            .get(index.saturating_add(1)..self.interp.command_end)
+            .unwrap_or_default();
+        Some((current, remaining))
+    }
+
+    /// Return whether tracing, profiling, or variable watches are active.
+    #[must_use]
+    pub fn observes_commands(&self) -> bool {
+        self.interp.has_command_observers() || !self.interp.watches.is_empty()
     }
 
     /// Stop after a denied process caused the current command to fail fatally.

@@ -267,7 +267,22 @@ impl Interp {
         let saved_failed = core::mem::replace(&mut self.cmd_failed, false);
 
         let limit = self.recursion_limit();
-        let result = if self.depth > limit {
+        let audit = self
+            .session_data::<crate::hermetic::HermeticContext>()
+            .cloned();
+        let _audit_site = audit.as_ref().map(|audit| {
+            audit.enter(crate::hermetic::HermeticSite::new(
+                &rcmake_host::path::to_native(file),
+                line,
+            ))
+        });
+        let result = if audit
+            .as_ref()
+            .is_some_and(crate::hermetic::HermeticContext::denied)
+        {
+            self.fatal = true;
+            Err(CmdError::Reported)
+        } else if self.depth > limit {
             self.recursion_exceeded = true;
             let local = self.local_command_backtrace();
             let backtrace = core::mem::replace(&mut self.bt, local);
@@ -294,6 +309,12 @@ impl Interp {
         } else {
             f(self)
         };
+        if audit
+            .as_ref()
+            .is_some_and(crate::hermetic::HermeticContext::denied)
+        {
+            self.fatal = true;
+        }
         let result = if self.poll_cancel()
             || matches!(
                 self.stop_reason,
@@ -460,6 +481,13 @@ impl Interp {
             return self.invoke(lower, command, &[]);
         }
         let args = self.expand(&cmd.args)?;
+        if self
+            .session_data::<crate::hermetic::HermeticContext>()
+            .is_some_and(crate::hermetic::HermeticContext::denied)
+        {
+            self.fatal = true;
+            return Err(CmdError::Reported);
+        }
         if self.running_deferred
             && lower == b"enable_language"
             && matches!(command, Command::Builtin(..))
@@ -467,7 +495,7 @@ impl Interp {
             self.error_here("Languages may not be enabled during deferred execution.".into());
             return Err(CmdError::Reported);
         }
-        self.invoke(lower, command, &args)
+        self.invoke_observed(lower, command, &args)
     }
 
     fn unknown_command(&mut self, name: &[u8]) {
@@ -479,6 +507,24 @@ impl Interp {
             msg.extend_from_slice(b"\"?");
         }
         self.fatal_here(msg);
+    }
+
+    fn invoke_observed(
+        &mut self,
+        name: &[u8],
+        command: Command,
+        args: &[ExpandedArg],
+    ) -> CmdResult {
+        if let Some(observer) = &self.expanded_observer
+            && !matches!(command, Command::Builtin(_, _, true))
+            && observer.names.contains(&name)
+        {
+            (observer.notify)(&mut self.cx(), args);
+            if self.fatal {
+                return Err(CmdError::Reported);
+            }
+        }
+        self.invoke(name, command, args)
     }
 
     fn invoke(&mut self, name: &[u8], command: Command, args: &[ExpandedArg]) -> CmdResult {
@@ -621,7 +667,7 @@ impl Interp {
         let args = if raw.is_some() { Vec::new() } else { args };
         let saved = core::mem::replace(&mut self.cur_cmd, raw);
         let result = self.with_command_frame(&file, line, name, |this| {
-            this.invoke(&lower, command, &args)
+            this.invoke_observed(&lower, command, &args)
         });
         self.cur_cmd = saved;
         result
@@ -640,7 +686,9 @@ impl Interp {
             if self.fatal || self.over_budget() {
                 return Err(CmdError::Reported);
             }
+            let saved_end = core::mem::replace(&mut self.command_end, end);
             let (result, next) = self.exec_at(code, i);
+            self.command_end = saved_end;
             i = next;
             if self.fatal {
                 return Err(CmdError::Reported);

@@ -24,6 +24,7 @@ use serde::{Deserialize, Serialize};
 
 use super::plan::{environment_fingerprint, request_digest};
 use depfile::missing_input_diagnostic;
+use host_impl::SharedOrBorrowed;
 
 #[path = "depfile.rs"]
 pub(super) mod depfile;
@@ -103,6 +104,9 @@ pub(crate) struct SearchObservation {
 /// step verifies fresh dependency evidence from the completed request. A depfile
 /// alone cannot certify the complete process tree.
 pub(crate) trait ProcessVerifier: Send + Sync {
+    /// Request dependency evidence from a known tool.
+    fn instrument(&self, _request: &mut RunRequest) {}
+
     /// Check the request before launch and return the tool and config inputs.
     fn preflight(&self, request: &RunRequest) -> Option<Trace>;
 
@@ -353,7 +357,9 @@ impl JournalChecks {
 pub(crate) struct Journal {
     trace: Trace,
     checks: JournalChecks,
+    #[cfg(test)]
     environment: BTreeMap<Vec<u8>, Option<BString>>,
+    #[cfg(test)]
     full_environment: Option<Vec<(BString, BString)>>,
     processes: Vec<RunRequest>,
     output: Vec<(Stream, Vec<u8>)>,
@@ -367,11 +373,13 @@ impl Journal {
     }
 
     /// Return recorded scalar environment reads, including absent values.
+    #[cfg(test)]
     pub(crate) fn environment(&self) -> &BTreeMap<Vec<u8>, Option<BString>> {
         &self.environment
     }
 
     /// Return the exact environment from the first enumeration.
+    #[cfg(test)]
     pub(crate) fn full_environment(&self) -> Option<&[(BString, BString)]> {
         self.full_environment.as_deref()
     }
@@ -400,20 +408,19 @@ impl Journal {
 /// The caller owns a fresh scratch directory and keeps it private for this
 /// adapter's lifetime. External inputs require a stable snapshot through use.
 pub(crate) struct JournalHost<'a> {
-    inner: &'a dyn Host,
+    inner: SharedOrBorrowed<'a, dyn Host + 'a>,
     scratch: PathBuf,
     canonical_scratch: PathBuf,
     mode: JournalMode,
-    verify_process: Option<&'a dyn ProcessVerifier>,
-    speculation: Option<Speculation<'a>>,
-    sorted_listings: bool,
+    verify_process: Option<SharedOrBorrowed<'a, dyn ProcessVerifier + 'a>>,
+    speculation: Option<Speculation>,
     state: Mutex<State>,
 }
 
-struct Speculation<'a> {
-    environment: &'a [(BString, BString)],
-    cancel: &'a CancelToken,
-    shutdown: &'a CancelToken,
+struct Speculation {
+    environment: Vec<(BString, BString)>,
+    cancel: CancelToken,
+    shutdown: CancelToken,
     deadline: std::time::Instant,
 }
 
@@ -424,6 +431,20 @@ impl<'a> JournalHost<'a> {
         scratch: &Path,
         mode: JournalMode,
         verify_process: Option<&'a dyn ProcessVerifier>,
+    ) -> HostResult<Self> {
+        Self::from_parts(
+            SharedOrBorrowed::Borrowed(inner),
+            scratch,
+            mode,
+            verify_process.map(SharedOrBorrowed::Borrowed),
+        )
+    }
+
+    fn from_parts(
+        inner: SharedOrBorrowed<'a, dyn Host + 'a>,
+        scratch: &Path,
+        mode: JournalMode,
+        verify_process: Option<SharedOrBorrowed<'a, dyn ProcessVerifier + 'a>>,
     ) -> HostResult<Self> {
         if !is_absolute(scratch) || scratch.parent().is_none() {
             return Err(HostError::unsupported(
@@ -446,7 +467,6 @@ impl<'a> JournalHost<'a> {
             mode,
             verify_process,
             speculation: None,
-            sorted_listings: false,
             state: Mutex::default(),
         })
     }
@@ -454,9 +474,9 @@ impl<'a> JournalHost<'a> {
     /// Use the owned job environment and the session's speculative deadline.
     pub(crate) fn with_speculation(
         mut self,
-        environment: &'a [(BString, BString)],
-        cancel: &'a CancelToken,
-        shutdown: &'a CancelToken,
+        environment: Vec<(BString, BString)>,
+        cancel: CancelToken,
+        shutdown: CancelToken,
         deadline: std::time::Instant,
     ) -> Self {
         self.speculation = Some(Speculation {
@@ -466,30 +486,6 @@ impl<'a> JournalHost<'a> {
             deadline,
         });
         self
-    }
-
-    /// Return directory entries in name and type order when the caller does not
-    /// depend on the host's enumeration order.
-    pub(crate) fn with_sorted_listings(mut self) -> Self {
-        self.sorted_listings = true;
-        self
-    }
-
-    /// Complete recording after the child has stopped.
-    pub(crate) fn finish(self) -> Journal {
-        let state = self
-            .state
-            .into_inner()
-            .unwrap_or_else(PoisonError::into_inner);
-        Journal {
-            trace: state.stamps.into_values().collect(),
-            checks: JournalChecks(state.checks.into_iter().collect()),
-            environment: state.environment,
-            full_environment: state.full_environment,
-            processes: state.processes,
-            output: state.output,
-            impure: state.impure,
-        }
     }
 
     /// Record a dependency from a verified compiler or linker observation.
@@ -519,7 +515,7 @@ impl<'a> JournalHost<'a> {
         }) {
             self.mark_impure(ImpureReason::ChangedInput);
         }
-        let result = file_digest(self.inner, path);
+        let result = file_digest(&*self.inner, path);
         if let Ok(digest) = result {
             let mut state = self.state();
             state.check(Check::Canonical(path.to_owned()), path_digest(&canonical));
@@ -542,6 +538,7 @@ impl<'a> JournalHost<'a> {
     ///
     /// A miss stamps the deepest existing directory. A missing search root
     /// gets its own stamp, so creating it also invalidates the result.
+    #[cfg(test)]
     pub(crate) fn record_search(&self, root: &Path, relative: &Path) -> HostResult<bool> {
         self.record_search_since(root, relative, None)
     }
@@ -596,7 +593,7 @@ impl<'a> JournalHost<'a> {
     ) -> HostResult<()> {
         let mut directory = match self.inner.metadata(root, Follow::Yes) {
             Ok(metadata) if metadata.kind == FileKind::Dir => root.to_owned(),
-            Err(error) if error.kind == ErrorKind::NotFound && missing(self.inner, root) => {
+            Err(error) if error.kind == ErrorKind::NotFound && missing(&*self.inner, root) => {
                 self.state().stamp(InputStamp::Missing {
                     path: root.to_owned(),
                 });
@@ -613,14 +610,14 @@ impl<'a> JournalHost<'a> {
         };
         for part in relative.components() {
             let next = directory.join(part.as_os_str());
-            if missing(self.inner, &next) {
+            if missing(&*self.inner, &next) {
                 if let Some(cutoff) = cutoff {
                     let metadata = self.inner.metadata(&directory, Follow::Yes)?;
                     if time_nanos(metadata.mtime) >= cutoff {
                         self.mark_impure(ImpureReason::ChangedInput);
                     }
                 }
-                let listing = directory_digest(self.inner, &directory)?;
+                let listing = directory_digest(&*self.inner, &directory)?;
                 self.state().stamp(InputStamp::NegativeLookup {
                     root: root.to_owned(),
                     relative: relative.to_owned(),
@@ -714,7 +711,7 @@ impl<'a> JournalHost<'a> {
     }
 
     fn record_error(&self, path: &Path, error: &HostError) {
-        if error.kind == ErrorKind::NotFound && missing(self.inner, path) {
+        if error.kind == ErrorKind::NotFound && missing(&*self.inner, path) {
             self.state().stamp(InputStamp::Missing {
                 path: path.to_owned(),
             });
@@ -760,8 +757,11 @@ impl<'a> JournalHost<'a> {
         let mut request = Cow::Borrowed(request);
         if let Some(spec) = &self.speculation {
             let request = request.to_mut();
-            request.env = spec.environment.to_vec();
+            request.env.clone_from(&spec.environment);
             self.limit_speculative_request(request)?;
+        }
+        if let Some(verifier) = self.verify_process.as_deref() {
+            verifier.instrument(request.to_mut());
         }
         if let Err(error) = self.before_process(&request) {
             self.record_request(&request);
@@ -803,6 +803,7 @@ impl<'a> JournalHost<'a> {
         }
         let Some(trace) = self
             .verify_process
+            .as_deref()
             .and_then(|verify| verify.preflight(request))
         else {
             return self.guard_effect(ImpureReason::UnverifiedProcess);
@@ -820,7 +821,7 @@ impl<'a> JournalHost<'a> {
         if trace
             .iter()
             .any(|stamp| matches!(stamp, InputStamp::FileStat { .. }))
-            || verify_trace(self.inner, &trace) != VerifyOutcome::Hit
+            || verify_trace(&*self.inner, &trace) != VerifyOutcome::Hit
         {
             return self.guard_effect(ImpureReason::ChangedInput);
         }
@@ -852,7 +853,7 @@ impl<'a> JournalHost<'a> {
             self.mark_impure(ImpureReason::ProcessFailure);
             return;
         }
-        let Some(verifier) = self.verify_process else {
+        let Some(verifier) = self.verify_process.as_deref() else {
             self.mark_impure(ImpureReason::UnverifiedProcess);
             return;
         };

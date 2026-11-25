@@ -14,10 +14,11 @@ use rcmake_base::BString;
 
 use crate::{
     FetchError, GitClone, atomic_write, clone_args::plain, error::sanitized_url, invalid, offline,
-    run, staging_path,
+    staging_path,
 };
 
 mod gc;
+mod seed;
 pub use gc::GitGcReport;
 
 const OUTPUT_LIMIT: usize = 1024 * 1024;
@@ -41,6 +42,8 @@ pub struct GitMirror<'a> {
     timeout: Option<Duration>,
     deadline: Option<Duration>,
     read_only: bool,
+    offline_only: bool,
+    program: BString,
 }
 
 impl<'a> GitMirror<'a> {
@@ -58,7 +61,21 @@ impl<'a> GitMirror<'a> {
                 && host
                     .env_get(b"RCMAKE_FETCH_GIT_READ_ONLY")
                     .is_some_and(|value| value == "1"),
+            offline_only: false,
+            program: "git".into(),
         })
+    }
+
+    /// Select the Git executable already resolved by the caller.
+    pub fn with_program(mut self, program: BString) -> Self {
+        self.program = program;
+        self
+    }
+
+    /// Use local Git operations only even if the host environment changes.
+    pub fn offline_only(mut self) -> Self {
+        self.offline_only = true;
+        self
     }
 
     /// Set the timeout for Git commands and checkout and mirror locks.
@@ -305,7 +322,7 @@ impl<'a> GitMirror<'a> {
         cwd: &Path,
         use_mirror: impl FnOnce(&Path) -> Result<T, FetchError>,
     ) -> Result<T, FetchError> {
-        let offline = self.read_only || offline(self.host);
+        let offline = self.offline_only || self.read_only || offline(self.host);
         if !offline {
             self.host.create_dir_all(&self.root)?;
         } else if pin.is_none() {
@@ -481,27 +498,36 @@ impl<'a> GitMirror<'a> {
             if let Some(commit) = pin {
                 self.prepare_pin(cwd, &stage, repository, config, commit)?;
             }
-            if let Some(kind) = previous {
-                let damaged = staging_path(self.host, mirror);
-                self.host.rename_noreplace(mirror, &damaged)?;
-                if let Err(error) = self.host.rename_noreplace(&stage, mirror) {
-                    self.host.rename_noreplace(&damaged, mirror)?;
-                    return Err(error.into());
-                }
-                if kind == FileKind::Dir {
-                    let _ = self.host.remove_dir_all(&damaged);
-                } else {
-                    let _ = self.host.remove_file(&damaged);
-                }
-            } else {
-                self.host.rename_noreplace(&stage, mirror)?;
-            }
-            Ok(())
+            self.publish_replacement(mirror, &stage, previous)
         });
         if result.is_err() {
             let _ = self.remove_stage(&stage);
         }
         result
+    }
+
+    fn publish_replacement(
+        &self,
+        mirror: &Path,
+        stage: &Path,
+        previous: Option<FileKind>,
+    ) -> Result<(), FetchError> {
+        let Some(kind) = previous else {
+            self.host.rename_noreplace(stage, mirror)?;
+            return Ok(());
+        };
+        let damaged = staging_path(self.host, mirror);
+        self.host.rename_noreplace(mirror, &damaged)?;
+        if let Err(error) = self.host.rename_noreplace(stage, mirror) {
+            self.host.rename_noreplace(&damaged, mirror)?;
+            return Err(error.into());
+        }
+        if kind == FileKind::Dir {
+            let _ = self.host.remove_dir_all(&damaged);
+        } else {
+            let _ = self.host.remove_file(&damaged);
+        }
+        Ok(())
     }
 
     fn clean_cached_remote(&self, mirror: &Path, repository: &BString) -> Result<(), FetchError> {
@@ -693,10 +719,13 @@ impl<'a> GitMirror<'a> {
                 ("GIT_TEMPLATE_DIR".into(), "".into()),
             ]);
         }
-        Ok(run(
+        Ok(crate::run_command(
             self.host,
             "git",
-            args,
+            rcmake_host::CommandSpec {
+                program: self.program.clone(),
+                args,
+            },
             cwd,
             env,
             OUTPUT_LIMIT,

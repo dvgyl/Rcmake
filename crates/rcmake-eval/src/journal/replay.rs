@@ -24,9 +24,9 @@ use super::trace::{
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ConfigureSnapshot<M = ()> {
-    schema: String,
-    region: RegionRecord,
-    model: M,
+    pub(super) schema: String,
+    pub(super) region: RegionRecord,
+    pub(super) model: M,
 }
 
 impl<M> ConfigureSnapshot<M> {
@@ -263,7 +263,7 @@ pub enum ReplayApplyError {
 pub struct VerifiedConfigure<'a, M> {
     /// Checked portable model, including final cache and property state.
     pub model: &'a M,
-    region: VerifiedRegion<'a>,
+    pub(super) region: VerifiedRegion<'a>,
 }
 
 impl<'a, M> VerifiedConfigure<'a, M> {

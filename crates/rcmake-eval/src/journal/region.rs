@@ -21,6 +21,12 @@ pub enum RegionKind {
     Configure,
     /// Evaluation of one `add_subdirectory` call.
     Subdirectory,
+    /// A listfile included by a bootstrap script or by project code.
+    Include {
+        /// Absolute path to the included file.
+        #[serde(with = "path_bytes")]
+        file: PathBuf,
+    },
     /// Cold initialization of one enabled language.
     Bootstrap {
         /// Language name as bytes.
@@ -213,6 +219,10 @@ impl PropertyOrigin {
             binary_dir,
             frames: frames.collect(),
         }
+    }
+
+    pub(super) fn frame_count(&self) -> usize {
+        self.frames.len()
     }
 
     /// Reconstruct the call stack for the project model's property mutation API.

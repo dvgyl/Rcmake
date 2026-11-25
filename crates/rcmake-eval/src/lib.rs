@@ -130,6 +130,7 @@ struct Builtin {
     func: BuiltinFn,
     flags: CmdFlags,
     raw: bool,
+    replay: bool,
 }
 
 impl Registry {
@@ -157,7 +158,12 @@ impl Registry {
     fn insert(&mut self, name: &str, func: BuiltinFn, flags: CmdFlags, raw: bool) {
         self.builtins.insert(
             fold_command_name(name.as_bytes()),
-            Builtin { func, flags, raw },
+            Builtin {
+                func,
+                flags,
+                raw,
+                replay: false,
+            },
         );
     }
 
@@ -462,6 +468,13 @@ pub struct Interp {
     top_defer_id: Option<BString>,
     /// The listfile command being executed (raw arguments for [`Cx::raw_args`]).
     cur_cmd: Option<(Arc<[CommandInvocation]>, usize)>,
+    command_end: usize,
+    session_data: services::SessionData,
+    expanded_observer: Option<services::ExpandedObserver>,
+    parse_cache: Option<code::ParseCache>,
+    replay_session: Option<journal::ReplaySession>,
+    replay_hits: u64,
+    replayed_listfiles: BTreeSet<PathBuf>,
     /// `--trace-expand` is expanding the arguments of a traced command.
     trace_expanding: bool,
     /// Listfile of each file and function call scope (`LISTFILE_STACK`).
@@ -563,6 +576,13 @@ impl Interp {
             running_deferred: false,
             top_defer_id: None,
             cur_cmd: None,
+            command_end: 0,
+            session_data: services::SessionData::default(),
+            expanded_observer: None,
+            parse_cache: None,
+            replay_session: None,
+            replay_hits: 0,
+            replayed_listfiles: BTreeSet::new(),
             trace_expanding: false,
             listfiles: Vec::new(),
             file_locks: Vec::new(),

@@ -9,7 +9,10 @@ const DRIVE: &str = if cfg!(windows) { "C:" } else { "" };
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
-fn interpreter(host: Arc<dyn Host>, cwd: &Path) -> Result<Interp, Box<dyn std::error::Error>> {
+pub(super) fn interpreter(
+    host: Arc<dyn Host>,
+    cwd: &Path,
+) -> Result<Interp, Box<dyn std::error::Error>> {
     let modules = cwd.join("cmake/Modules");
     host.create_dir_all(&modules)?;
     for (name, body) in [
@@ -30,7 +33,10 @@ fn interpreter(host: Arc<dyn Host>, cwd: &Path) -> Result<Interp, Box<dyn std::e
             "probe_initialized()\nset(CMAKE_CXX_INFORMATION_LOADED 1)",
         ),
     ] {
-        host.write(&modules.join(name), body.as_bytes(), WriteMode::CreateNew)?;
+        let file = modules.join(name);
+        if host.metadata(&file, Follow::No).is_err() {
+            host.write(&file, body.as_bytes(), WriteMode::CreateNew)?;
+        }
     }
     let mut interp = Interp::new(
         InterpConfig {

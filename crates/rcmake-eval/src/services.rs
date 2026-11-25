@@ -3,12 +3,56 @@
 #![forbid(unsafe_code)]
 
 use core::num::NonZeroUsize;
-use std::collections::BTreeSet;
+use std::any::{Any, TypeId};
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use rcmake_base::BString;
 use rcmake_diag::SourceId;
+use rcmake_expr::ExpandedArg;
+
+use crate::{Cx, Interp};
+
+pub(crate) struct ExpandedObserver {
+    pub(crate) names: &'static [&'static [u8]],
+    pub(crate) notify: fn(&mut Cx<'_>, &[ExpandedArg]),
+}
+pub(crate) type SessionData = BTreeMap<TypeId, Box<dyn Any + Send + Sync>>;
+
+impl Interp {
+    /// Install data for commands in this interpreter.
+    pub fn add_session_data<T: Any + Send + Sync>(&mut self, value: T) {
+        self.session_data.insert(TypeId::of::<T>(), Box::new(value));
+    }
+
+    /// Get the session data of type `T`.
+    #[must_use]
+    pub fn session_data<T: Any + Send + Sync>(&self) -> Option<&T> {
+        self.session_data.get(&TypeId::of::<T>())?.downcast_ref()
+    }
+
+    /// Install a hook for the listed lowercase command names.
+    /// The hook runs after the command's arguments expand.
+    pub fn set_expanded_observer(
+        &mut self,
+        names: &'static [&'static [u8]],
+        notify: fn(&mut Cx<'_>, &[ExpandedArg]),
+    ) {
+        self.expanded_observer = Some(ExpandedObserver { names, notify });
+    }
+
+    /// Retain parsed listfiles for reuse in this interpreter.
+    pub fn enable_parse_cache(&mut self) {
+        self.parse_cache.get_or_insert_with(Default::default);
+    }
+
+    /// Return whether tracing or command profiling is active.
+    #[must_use]
+    pub fn has_command_observers(&self) -> bool {
+        self.trace.is_some() || self.command_profiler.is_some()
+    }
+}
 
 /// Access mode for the probe cache.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

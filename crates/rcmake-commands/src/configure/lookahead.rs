@@ -4,8 +4,10 @@
 
 use std::collections::BTreeSet;
 
+#[cfg(test)]
 use rcmake_store::Digest;
 use rcmake_syntax::{ArgKind, Argument, CommandInvocation};
+#[cfg(test)]
 use serde::{Deserialize, Serialize};
 
 const MAX_LOOKAHEAD: usize = 64;
@@ -27,6 +29,7 @@ pub(crate) enum ProbeKind {
 
 impl ProbeKind {
     /// Stock module that defines this command. The direct probe is a built-in.
+    #[cfg(test)]
     pub(crate) fn defining_module(self) -> Option<&'static str> {
         match self {
             Self::IncludeFile => Some("CheckIncludeFile.cmake"),
@@ -137,6 +140,7 @@ fn valid_result(name: &[u8]) -> bool {
 
 /// One recipe from the previous configure, in call order.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[cfg(test)]
 pub(crate) struct HistoryProbe {
     /// Probe language as bytes.
     pub(crate) language: Vec<u8>,
@@ -149,11 +153,13 @@ pub(crate) struct HistoryProbe {
 /// The evaluator resolves the recipe digest and recomputes the key with the
 /// current toolchain, seed, and arguments before either use or publication.
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[cfg(test)]
 pub(crate) struct ProbeHistory {
     /// Previous calls in evaluator order.
     pub(crate) probes: Vec<HistoryProbe>,
 }
 
+#[cfg(test)]
 impl ProbeHistory {
     /// Return the previous recipes for one language in call order.
     pub(crate) fn for_language<'a>(

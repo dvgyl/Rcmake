@@ -16,6 +16,10 @@ use rcmake_host::{FileKind, Follow, Host, Stream, path::to_native};
 
 use crate::services::HermeticMode;
 
+mod context;
+
+pub use context::{HermeticContext, HermeticSiteGuard};
+
 const BASE_ENV: &[&[u8]] = &[
     b"PATH",
     b"TMPDIR",
@@ -25,6 +29,13 @@ const BASE_ENV: &[&[u8]] = &[
     b"USERPROFILE",
     b"SYSTEMROOT",
     b"SOURCE_DATE_EPOCH",
+    b"CMAKE_BUILD_TYPE",
+    b"CMAKE_MAXIMUM_RECURSION_DEPTH",
+    b"CMAKE_POLICY_VERSION_MINIMUM",
+    b"CMAKE_TLS_VERIFY",
+    b"CMAKE_TLS_VERSION",
+    b"RCMAKE_FETCH_OFFLINE",
+    b"RCMAKE_FETCH_GIT_READ_ONLY",
 ];
 const DEFAULT_RECORD_LIMIT: usize = 256;
 const MAX_DISPLAY_CHARS: usize = 256;
@@ -45,7 +56,8 @@ impl HermeticPolicy {
     /// Read the baseline and user allowlists through the host.
     ///
     /// Use semicolon-separated names in `RCMAKE_HERMETIC_ALLOW_ENV` and
-    /// semicolon-separated absolute paths in `RCMAKE_HERMETIC_ALLOW_PATHS`.
+    /// semicolon-separated absolute paths in `RCMAKE_HERMETIC_ALLOW_PATHS`
+    /// and `RCMAKE_HERMETIC_ALLOW_PROGRAMS`.
     /// Pass source, build, module, toolchain, sysroot, and staging roots in
     /// `roots`. Use [Self::allow_program] for known tools in those roots or elsewhere.
     pub fn from_host<'a>(host: &dyn Host, roots: impl IntoIterator<Item = &'a Path>) -> Self {
@@ -65,10 +77,15 @@ impl HermeticPolicy {
         for root in roots {
             policy.allow_root(host, root);
         }
-        for (setting, is_env) in [
-            ("RCMAKE_HERMETIC_ALLOW_ENV", true),
-            ("RCMAKE_HERMETIC_ALLOW_PATHS", false),
-        ] {
+        let settings = [
+            ("RCMAKE_HERMETIC_ALLOW_ENV", "a variable name"),
+            ("RCMAKE_HERMETIC_ALLOW_PATHS", "a resolvable absolute path"),
+            (
+                "RCMAKE_HERMETIC_ALLOW_PROGRAMS",
+                "an absolute executable path",
+            ),
+        ];
+        for (setting, expected) in settings {
             let Some(value) = host
                 .env_get(setting.as_bytes())
                 .filter(|value| !value.is_empty())
@@ -76,17 +93,12 @@ impl HermeticPolicy {
                 continue;
             };
             for (index, entry) in value.split(|byte| *byte == b';').enumerate() {
-                let valid = if is_env {
-                    policy.allow_env(entry.trim_ascii())
-                } else {
-                    policy.allow_root(host, &to_native(entry))
+                let valid = match setting {
+                    "RCMAKE_HERMETIC_ALLOW_ENV" => policy.allow_env(entry.trim_ascii()),
+                    "RCMAKE_HERMETIC_ALLOW_PATHS" => policy.allow_root(host, &to_native(entry)),
+                    _ => policy.allow_program(host, &to_native(entry)),
                 };
                 if !valid {
-                    let expected = if is_env {
-                        "a variable name"
-                    } else {
-                        "a resolvable absolute path"
-                    };
                     let warning = format!(
                         "Warning: Ignored entry {} in {setting}. Specify {expected}.\n",
                         index + 1
@@ -133,7 +145,12 @@ impl HermeticPolicy {
 
     /// Allow one existing, absolute executable path. The caller resolves tool names first.
     pub fn allow_program(&mut self, host: &dyn Host, program: &Path) -> bool {
-        if !program.is_absolute() {
+        if !program.is_absolute()
+            || !host.metadata(program, Follow::Yes).is_ok_and(|metadata| {
+                metadata.kind == FileKind::File
+                    && (self.case_insensitive_env || metadata.mode & 0o111 != 0)
+            })
+        {
             return false;
         }
         let Ok(path) = host.canonicalize(program) else {
@@ -172,12 +189,21 @@ impl HermeticPolicy {
         }
     }
 
-    fn allows_path(&self, host: &dyn Host, path: &Path) -> bool {
-        resolve_path(host, path).is_some_and(|path| {
-            self.roots.iter().any(|root| {
+    fn resolve_allowed_path(
+        &self,
+        host: &dyn Host,
+        path: &Path,
+        fetch_cache: Option<&Path>,
+    ) -> Option<PathBuf> {
+        resolve_path(host, path).filter(|path| {
+            let contains = |root: &Path| {
                 path.starts_with(root)
-                    || (self.case_insensitive_roots && same_root(host, &path, root))
-            })
+                    || (self.case_insensitive_roots && same_root(host, path, root))
+            };
+            self.roots.iter().any(|root| contains(root))
+                || fetch_cache
+                    .and_then(|root| resolve_path(host, root))
+                    .is_some_and(|root| contains(&root))
         })
     }
 
@@ -230,6 +256,9 @@ fn resolve_path(host: &dyn Host, path: &Path) -> Option<PathBuf> {
         match host.canonicalize(ancestor) {
             Ok(canonical) => {
                 let suffix = path.strip_prefix(ancestor).ok()?;
+                if suffix.as_os_str().is_empty() {
+                    return Some(canonical);
+                }
                 if suffix
                     .components()
                     .all(|part| matches!(part, Component::Normal(_)))
@@ -444,6 +473,11 @@ impl HermeticAuditor {
         self
     }
 
+    /// Add an input root from the configure request.
+    pub fn allow_root(&mut self, host: &dyn Host, path: &Path) -> bool {
+        self.policy.allow_root(host, path)
+    }
+
     /// Check an environment read. In warning mode the caller supplies an empty value.
     pub fn check_env(&mut self, site: &HermeticSite, name: &[u8]) -> AuditOutcome<'_> {
         if self.mode == HermeticMode::Off || self.policy.allows_env(name) {
@@ -489,8 +523,25 @@ impl HermeticAuditor {
         site: &HermeticSite,
         path: &Path,
     ) -> AuditOutcome<'_> {
-        if self.mode == HermeticMode::Off || self.policy.allows_path(host, path) {
-            return allowed();
+        self.check_read_path(host, site, path, None).0
+    }
+
+    /// Check a read and return the resolved path when the policy allows it.
+    ///
+    /// Use the resolved path for reads that follow symbolic links. The host must
+    /// still constrain lookup if directory entries can change before access.
+    pub fn check_read_path(
+        &mut self,
+        host: &dyn Host,
+        site: &HermeticSite,
+        path: &Path,
+        fetch_cache: Option<&Path>,
+    ) -> (AuditOutcome<'_>, Option<PathBuf>) {
+        if self.mode == HermeticMode::Off {
+            return (allowed(), None);
+        }
+        if let Some(path) = self.policy.resolve_allowed_path(host, path, fetch_cache) {
+            return (allowed(), Some(path));
         }
         let directory = path.parent().filter(|parent| parent.is_absolute());
         let directory = directory.map_or_else(|| "<DIR>".into(), |dir| dir.to_string_lossy());
@@ -502,13 +553,14 @@ impl HermeticAuditor {
         } else {
             &directory
         };
-        self.record(
+        let outcome = self.record(
             site,
             ViolationKind::OutOfTreePathRead,
             InputIdentity::Path(path.into()),
             display_input_path(path),
             format!("Declare the input root or set RCMAKE_HERMETIC_ALLOW_PATHS={directory}."),
-        )
+        );
+        (outcome, None)
     }
 
     /// Check a direct network operation. Set `enforced_pin` only for a verified transfer.
@@ -589,7 +641,7 @@ impl HermeticAuditor {
             ViolationKind::UnapprovedProcess,
             InputIdentity::Path(program.into()),
             identity,
-            "Declare the executable by absolute path or remove the process call.".into(),
+            "Set RCMAKE_HERMETIC_ALLOW_PROGRAMS to the absolute executable path.".into(),
         )
     }
 
@@ -600,6 +652,11 @@ impl HermeticAuditor {
         } else {
             self.policy.filter_process_env(env)
         }
+    }
+
+    /// Return whether a variable may pass to a child process.
+    pub fn allows_process_env(&self, name: &[u8]) -> bool {
+        self.mode == HermeticMode::Off || self.policy.allows_env(name)
     }
 
     /// Return retained diagnostic records in a stable order.
@@ -718,7 +775,8 @@ fn is_format(ch: char) -> bool {
     )
 }
 
-fn display_remote(value: &str) -> String {
+/// Return the scheme and host of a remote destination, without credentials or parameters.
+pub fn display_remote(value: &str) -> String {
     let Some((scheme, rest)) = value.split_once("://") else {
         return "<remote destination>".into();
     };
@@ -739,203 +797,4 @@ fn display_remote(value: &str) -> String {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use rcmake_host::PureHost;
-
-    fn abs(path: &str) -> PathBuf {
-        if cfg!(windows) {
-            PathBuf::from(format!("C:{path}"))
-        } else {
-            PathBuf::from(path)
-        }
-    }
-
-    fn host() -> PureHost {
-        PureHost::new(abs("/src"), abs("/bin/rcmake"))
-    }
-
-    fn site() -> HermeticSite {
-        HermeticSite::new(&abs("/src/CMakeLists.txt"), 19)
-    }
-
-    #[test]
-    fn off_warn_and_strict_apply_to_each_observation() {
-        let host = host();
-        for (mode, expected) in [
-            (HermeticMode::Off, AuditDecision::Allow),
-            (HermeticMode::Warn, AuditDecision::Warn),
-            (HermeticMode::Strict, AuditDecision::Deny),
-        ] {
-            let mut auditor = HermeticAuditor::new(mode, HermeticPolicy::from_host(&host, []));
-            let site = site();
-            let outcome = auditor.check_env(&site, b"TOKEN");
-            assert_eq!(outcome.decision, expected);
-            assert_eq!(outcome.diagnostic.is_some(), mode != HermeticMode::Off);
-            let duplicate = auditor.check_env(&site, b"TOKEN");
-            assert_eq!(duplicate.decision, expected);
-            assert!(duplicate.diagnostic.is_none());
-        }
-    }
-
-    #[test]
-    fn applies_environment_and_process_allowlists() -> Result<(), Box<dyn std::error::Error>> {
-        let host = host();
-        host.env_set(b"RCMAKE_HERMETIC_ALLOW_ENV", Some(b"SDKROOT; CUSTOM"));
-        let compiler = abs("/src/bin/cc");
-        host.seed_file(&compiler, b"")?;
-        let mut policy = HermeticPolicy::from_host(&host, []);
-        assert!(policy.allow_program(&host, &compiler));
-        for name in [
-            b"PATH".as_slice(),
-            b"HOME",
-            b"USERPROFILE",
-            b"TMP",
-            b"SDKROOT",
-            b"CUSTOM",
-        ] {
-            assert!(policy.allows_env(name));
-        }
-        let mut auditor = HermeticAuditor::new(HermeticMode::Strict, policy);
-        let env = vec![
-            ("PATH".into(), "bin".into()),
-            ("TOKEN".into(), "secret".into()),
-        ];
-        assert_eq!(
-            auditor.process_env(env),
-            vec![("PATH".into(), "bin".into())]
-        );
-        assert_eq!(
-            auditor.check_process(&host, &site(), &compiler).decision,
-            AuditDecision::Allow
-        );
-        assert_eq!(
-            auditor
-                .check_process(&host, &site(), Path::new("cc"))
-                .decision,
-            AuditDecision::Deny
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn checks_roots_by_component_and_blocks_symlink_escape()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let host = host();
-        for path in [
-            "/src/nested/input",
-            "/src-other/input",
-            "/sdk/include/input",
-            "/outside/input",
-        ] {
-            host.seed_file(&abs(path), b"")?;
-        }
-        host.symlink(&abs("/outside"), &abs("/src/link"))?;
-        let root = abs("/sdk");
-        host.env_set(
-            b"RCMAKE_HERMETIC_ALLOW_PATHS",
-            Some(&rcmake_host::path::from_native(&root)),
-        );
-        let src = abs("/src");
-        let policy = HermeticPolicy::from_host(&host, [src.as_path()]);
-        assert!(policy.allows_path(&host, &abs("/src/nested/../nested/input")));
-        assert!(policy.allows_path(&host, &abs("/src/new/output")));
-        assert!(policy.allows_path(&host, &abs("/sdk/include/input")));
-        assert!(!policy.allows_path(&host, &abs("/src/../src-other/input")));
-        assert!(!policy.allows_path(&host, &abs("/src-other/input")));
-        assert!(!policy.allows_path(&host, &abs("/src/link/input")));
-        Ok(())
-    }
-
-    #[test]
-    fn keeps_untruncated_paths_for_deduplication() -> Result<(), &'static str> {
-        let host = host();
-        let mut auditor =
-            HermeticAuditor::new(HermeticMode::Strict, HermeticPolicy::from_host(&host, []));
-        let prefix = "a".repeat(200);
-        let path = abs(&format!("/{prefix}/{prefix}/CMakeLists#dev?.txt"));
-        let site = HermeticSite::new(&path, 12);
-        assert_eq!(site.file(), path.as_path());
-        assert!(site.to_string().ends_with("CMakeLists#dev?.txt:12"));
-        for suffix in ["#one", "?two"] {
-            let input = abs(&format!("/{prefix}/{prefix}/{suffix}"));
-            let violation = auditor
-                .check_path(&host, &site, &input)
-                .diagnostic
-                .ok_or("Missing diagnostic.")?;
-            assert_eq!(violation.site, site);
-        }
-        assert_eq!(auditor.records().len(), 2);
-        Ok(())
-    }
-
-    #[test]
-    fn reports_invalid_entries_and_combines_env_names() -> Result<(), &'static str> {
-        let host = host();
-        host.env_set(b"RCMAKE_HERMETIC_ALLOW_ENV", Some(b"OK;BAD=private"));
-        host.env_set(b"RCMAKE_HERMETIC_ALLOW_PATHS", Some(b"relative;another"));
-        let policy = HermeticPolicy::from_host(&host, []);
-        assert_eq!(policy.warnings().len(), 3);
-        assert!(
-            policy
-                .warnings()
-                .iter()
-                .all(|warning| !warning.contains("private"))
-        );
-        let mut auditor = HermeticAuditor::new(HermeticMode::Warn, policy);
-        for name in [b"B", b"A", b"C", b"B"] {
-            auditor.check_env(&site(), name);
-        }
-        let summary = auditor
-            .take_omission_summary()
-            .ok_or("Missing environment rule.")?;
-        assert_eq!(summary.to_string(), "RCMAKE_HERMETIC_ALLOW_ENV=A;B;C");
-        assert!(auditor.take_omission_summary().is_none());
-        assert_eq!(display_text("test\u{202e}"), "test<U+202E>");
-        Ok(())
-    }
-
-    #[test]
-    fn bounds_records_and_formats_clickable_diagnostics() -> Result<(), Box<dyn std::error::Error>>
-    {
-        let host = host();
-        let mut auditor =
-            HermeticAuditor::new(HermeticMode::Strict, HermeticPolicy::from_host(&host, []))
-                .with_record_limit(2);
-        let site = site();
-        let record = auditor
-            .check_env(&site, b"FOO")
-            .diagnostic
-            .ok_or("missing diagnostic")?;
-        assert!(record.to_string().starts_with(&format!("{site}: ")));
-        assert!(record.hint().contains("-DFOO=..."));
-        assert!(record.hint().contains("${FOO}"));
-        let url = "https://user:password@example.org/path?token=secret";
-        assert_eq!(
-            auditor.check_network(&site, url, true).decision,
-            AuditDecision::Allow
-        );
-        let denied = auditor.check_fetch_network(&site, url, false, "widget");
-        assert_eq!(denied.decision, AuditDecision::Deny);
-        let record = denied.diagnostic.ok_or("missing network diagnostic")?;
-        assert_eq!(record.value, "https://example.org");
-        assert!(record.hint().contains("--fetch-lock=update"));
-        assert!(auditor.check_env(&site, b"FOO").diagnostic.is_none());
-        assert_eq!(
-            auditor.check_env(&site, b"BAR").decision,
-            AuditDecision::Deny
-        );
-        assert_eq!(
-            auditor.summary(),
-            AuditSummary {
-                recorded: 2,
-                omitted: 1,
-                allow_env: None,
-            }
-        );
-        assert_eq!(auditor.records().len(), 2);
-        assert!(auditor.take_omission_summary().is_some());
-        assert!(auditor.take_omission_summary().is_none());
-        Ok(())
-    }
-}
+mod tests;

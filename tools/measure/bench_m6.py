@@ -35,7 +35,7 @@ import time
 import tomllib
 
 from determinism import observe_compilers
-from mutation_eval import API, discover_leaves
+from mutation_eval import API, REPLAY_RESULT, discover_leaves, replay_leaves
 from oracle_prop_test import run_command
 
 
@@ -332,7 +332,7 @@ def leaf_trace(trace, source, leaf, control):
 
 
 def configure_runs(binary, project, work, generator, env, timeout, *, synthetic, cases,
-                   leaf_pair=None, unavailable=None, timed=True):
+                   leaf_pair=None, unavailable=None, timed=True, replay_evidence=False):
     """Run the selected configure phases in one isolated trial."""
     original, configure_args = project
     source = copy_source(original, work)
@@ -349,12 +349,13 @@ def configure_runs(binary, project, work, generator, env, timeout, *, synthetic,
     if leaf_pair:
         leaf, control = leaf_pair
         query_codemodel(cold)
-        if not timed:
+        if replay_evidence:
+            env["RCMAKE_MEASURE_REPLAY"] = "1"
+        elif not timed:
             trace_args = ["--trace-format=json-v1", f"--trace-redirect={trace}",
                           f"--trace-source={source / leaf}", f"--trace-source={source / control}"]
     steady = cold if WARM_PROBE in unavailable else warm
     cold_inputs = Counter()
-    replay_record = False
     control_targets = None
     results = {}
     for phase in cases:
@@ -383,12 +384,13 @@ def configure_runs(binary, project, work, generator, env, timeout, *, synthetic,
                     control_targets = cold_leaves[control].targets
                 with (source / leaf).open("ab") as stream:
                     stream.write(f"\nset({LEAF_MARKER} 1)\n".encode())
-                replay_record = (build / "CMakeFiles/rcmake/configure.v1.bin").is_file()
             except (OSError, ValueError, KeyError, TypeError, StopIteration) as error:
                 results[phase] = Sample(error=f"Could not edit a configured leaf. {error}")
                 continue
         if log:
             log.unlink(missing_ok=True)
+        if replay_evidence:
+            (build / REPLAY_RESULT).unlink(missing_ok=True)
         args = configure_args
         if trace_args and phase in (COLD, INCREMENTAL_LEAF):
             trace.unlink(missing_ok=True)
@@ -417,27 +419,36 @@ def configure_runs(binary, project, work, generator, env, timeout, *, synthetic,
                 if (control_sample.error or control_inputs != cold_inputs
                         or control_sample.toolchain != sample.toolchain):
                     sample.probe_hits = 0
-        if not sample.error and trace_args and phase == COLD:
+        if not sample.error and (trace_args or replay_evidence) and phase == COLD:
             try:
-                executed, controls, _ = leaf_trace(trace, source, leaf, control)
-                if not (executed and controls):
-                    raise ValueError("The cold trace must show commands from the leaf and its control.")
+                if replay_evidence:
+                    evaluated, replayed = replay_leaves(source, build)
+                    if replayed or leaf not in evaluated or control not in evaluated:
+                        raise ValueError("The cold run must evaluate the leaf and its control.")
+                else:
+                    executed, controls, _ = leaf_trace(trace, source, leaf, control)
+                    if not (executed and controls):
+                        raise ValueError("The cold trace must show the leaf and its control.")
             except (OSError, ValueError) as error:
-                sample.error = f"Could not verify the configure trace. {error}"
+                sample.error = f"Could not verify the cold configure. {error}"
         if not sample.error and phase == INCREMENTAL_LEAF:
             try:
                 sample.edited_leaf = str(leaf)
                 active_leaves = shared_leaves(source, build)
                 if leaf not in active_leaves:
                     raise ValueError(f"{leaf} is absent from the updated codemodel.")
-                if trace_args:
-                    _, controls, marker = leaf_trace(trace, source, leaf, control)
-                    sample.edited_leaf_executed = marker
-                    sample.control_executed = controls
+                if replay_evidence:
+                    evaluated, replayed = replay_leaves(source, build)
+                    sample.edited_leaf_executed = leaf in evaluated and leaf not in replayed
+                    sample.control_executed = control in evaluated
                     control_present = control == Path("CMakeLists.txt") or (
                         control in active_leaves and active_leaves[control].targets == control_targets
                     )
-                    sample.replayed_regions = int(replay_record and not controls and control_present)
+                    sample.replayed_regions = int(control in replayed and control_present)
+                elif trace_args:
+                    _, controls, marker = leaf_trace(trace, source, leaf, control)
+                    sample.edited_leaf_executed = marker
+                    sample.control_executed = controls
             except (OSError, ValueError, KeyError, TypeError, StopIteration) as error:
                 sample.error = f"Could not verify the leaf configure. {error}"
         results[phase] = sample
@@ -851,7 +862,7 @@ def main():
                             evidence = configure_runs(
                                 binaries[tool], project, verify, generator, env, timeout,
                                 synthetic=name == "synthetic", cases=(COLD, INCREMENTAL_LEAF),
-                                leaf_pair=leaf_pair, timed=False,
+                                leaf_pair=leaf_pair, timed=False, replay_evidence=tool == "rcmake",
                             )[INCREMENTAL_LEAF]
                             leaf_sample = samples[INCREMENTAL_LEAF]
                             leaf_sample.error = evidence.error

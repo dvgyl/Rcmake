@@ -142,12 +142,32 @@ impl FetchPool {
         config: StoreConfig,
         timeout: Option<Duration>,
     ) -> Result<Self, FetchError> {
+        Self::start(host, config, timeout, None)
+    }
+
+    /// Start workers with a caller-provided limit or the host's configured limit.
+    pub fn new_with_jobs(
+        host: Arc<dyn Host>,
+        config: StoreConfig,
+        jobs: Option<usize>,
+    ) -> Result<Self, FetchError> {
+        Self::start(host, config, None, jobs)
+    }
+
+    fn start(
+        host: Arc<dyn Host>,
+        config: StoreConfig,
+        timeout: Option<Duration>,
+        jobs: Option<usize>,
+    ) -> Result<Self, FetchError> {
         let timeout = timeout
             .unwrap_or(DEFAULT_REQUEST_TIMEOUT)
             .min(MAX_REQUEST_TIMEOUT);
-        let count = host
-            .env_get(b"RCMAKE_FETCH_JOBS")
-            .and_then(|value| std::str::from_utf8(&value).ok()?.parse::<usize>().ok())
+        let count = jobs
+            .or_else(|| {
+                host.env_get(b"RCMAKE_FETCH_JOBS")
+                    .and_then(|value| std::str::from_utf8(&value).ok()?.parse::<usize>().ok())
+            })
             .unwrap_or(4)
             .clamp(1, MAX_WORKERS);
         Store::new(host.as_ref(), config.clone())?;

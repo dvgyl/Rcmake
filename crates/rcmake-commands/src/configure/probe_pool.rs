@@ -22,7 +22,9 @@ use rcmake_store::{Digest, StoreConfig};
 
 use super::try_compile::{
     cache::{Artifact, ObservedOutcome, ProbeCache, ProbePublishOutcome, SkipReason},
-    journal::{JournalHost, JournalMode, ProcessVerifier, SPECULATIVE_TIMEOUT, speculative_now},
+    journal::{
+        Journal, JournalHost, JournalMode, ProcessVerifier, SPECULATIVE_TIMEOUT, speculative_now,
+    },
     plan::{
         DiagnosticStream, ProbeDiagnostic, ProbeEligibility, ProbeRecipe, ReuseScope,
         compute_probe_key, environment_fingerprint, request_digest,
@@ -36,6 +38,36 @@ const MAX_RESULT_BYTES: u64 = 4 * 1024 * 1024;
 const CANCEL_POLL: Duration = Duration::from_millis(50);
 const GIB: u64 = 1024 * 1024 * 1024;
 static NEXT_SCRATCH: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn physical_memory(host: &dyn Host) -> u64 {
+    let system = host.system();
+    if system.total_memory != 0 || system.sysname != "Darwin" {
+        return system.total_memory;
+    }
+    let request = RunRequest {
+        pipeline: vec![CommandSpec {
+            program: "/usr/sbin/sysctl".into(),
+            args: vec!["-n".into(), "hw.memsize".into()],
+        }],
+        cwd: host.initial_cwd(),
+        env: Vec::new(),
+        stdin: Input::Null,
+        stdout: Output::Capture,
+        stderr: Output::Null,
+        timeout: Some(Duration::from_secs(1)),
+        tee: false,
+    };
+    host.run_bounded(&request, 64)
+        .ok()
+        .filter(|output| output.results.as_slice() == [ProcessResult::Exited(0)])
+        .and_then(|output| {
+            std::str::from_utf8(output.stdout.trim_ascii())
+                .ok()?
+                .parse()
+                .ok()
+        })
+        .unwrap_or_default()
+}
 
 /// Constraint that reduced the requested probe count.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -104,13 +136,37 @@ struct Job {
     environment: Vec<(BString, BString)>,
     deadline: Instant,
     bytes: usize,
+    child: Option<ChildJob>,
 }
+
+pub(crate) struct ChildBudget {
+    pub(crate) cancel: CancelToken,
+    pub(crate) shutdown: CancelToken,
+    pub(crate) deadline: Instant,
+}
+
+pub(crate) type ChildJob = Box<
+    dyn FnOnce(
+            &Path,
+            &ProbeRecipe,
+            Vec<(BString, BString)>,
+            ChildBudget,
+        ) -> HostResult<(ObservedOutcome, Journal)>
+        + Send,
+>;
 
 #[derive(Default)]
 struct Queue {
     pending: VecDeque<Job>,
     inflight: BTreeMap<Digest, Instant>,
+    complete: BTreeMap<Digest, ChildResult>,
     bytes: usize,
+}
+
+pub(crate) struct ChildResult {
+    pub(crate) recipe: ProbeRecipe,
+    pub(crate) outcome: ObservedOutcome,
+    pub(crate) journal: Journal,
 }
 
 #[derive(Default)]
@@ -175,11 +231,12 @@ pub(crate) struct WorkerContext<'a> {
     /// Existing private parent directory for speculative scratch trees.
     pub(crate) scratch_root: &'a Path,
     /// Verifier for the complete compiler or linker process tree.
-    pub(crate) process_verifier: &'a dyn ProcessVerifier,
+    pub(crate) process_verifier: Option<&'a dyn ProcessVerifier>,
 }
 
 /// Counts for speculative work. These do not change foreground cache counters.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg(all(test, unix))]
 pub(crate) struct WorkerStats {
     /// Jobs rejected by admission, deduplication, or queue limits.
     pub(crate) rejected: u64,
@@ -200,6 +257,13 @@ pub(crate) struct ProbePool {
     shared: Arc<Shared>,
     workers: usize,
     limit: JobLimit,
+}
+
+/// Queue handle that does not own the lifetime of the pool.
+#[derive(Clone)]
+pub(crate) struct ProbeQueue {
+    shared: Arc<Shared>,
+    available: bool,
 }
 
 impl ProbePool {
@@ -254,11 +318,13 @@ impl ProbePool {
     }
 
     /// Return the requested limit and its effective value.
+    #[cfg(all(test, unix))]
     pub(crate) fn limit(&self) -> JobLimit {
         self.limit
     }
 
     /// Read the counts for this pool.
+    #[cfg(all(test, unix))]
     pub(crate) fn stats(&self) -> WorkerStats {
         let counters = &self.shared.counters;
         WorkerStats {
@@ -271,11 +337,49 @@ impl ProbePool {
         }
     }
 
+    pub(crate) fn queue(&self) -> ProbeQueue {
+        ProbeQueue {
+            shared: Arc::clone(&self.shared),
+            available: self.workers != 0,
+        }
+    }
+
+    /// Discard pending jobs and signal the active jobs without cancelling the session.
+    pub(crate) fn cancel(&self) {
+        let mut state = self.shared.state();
+        self.shared.shutdown.cancel();
+        let pending = std::mem::take(&mut state.pending);
+        state.bytes = 0;
+        state.complete.clear();
+        for job in &pending {
+            state.inflight.remove(&job.key);
+        }
+        self.shared
+            .counters
+            .cancelled
+            .fetch_add(pending.len() as u64, Ordering::Relaxed);
+        self.shared.changed.notify_all();
+        drop(state);
+        drop(pending);
+    }
+}
+
+impl ProbeQueue {
+    pub(crate) fn available(&self) -> bool {
+        self.available && !self.shared.cancelled()
+    }
+
     /// Queue an owned execution plan and a snapshot of its complete child environment.
     ///
     /// Use the same plan to compute the key when the original call consumes
     /// the result. The worker only executes source writes and the declared process.
-    pub(crate) fn submit(&self, recipe: ProbeRecipe, environment: Vec<(BString, BString)>) -> bool {
+    pub(crate) fn submit(
+        &self,
+        recipe: ProbeRecipe,
+        environment: Vec<(BString, BString)>,
+        child: Option<ChildJob>,
+        child_bytes: usize,
+    ) -> bool {
         let reject = || {
             self.shared
                 .counters
@@ -283,22 +387,23 @@ impl ProbePool {
                 .fetch_add(1, Ordering::Relaxed);
             false
         };
-        if self.workers == 0
+        if !self.available()
             || recipe.eligibility != ProbeEligibility::Eligible
             || recipe.scope != ReuseScope::VerifiedRelocation
             || recipe.try_run
-            || recipe.speculative_run.is_none()
+            || (recipe.speculative_run.is_none() && child.is_none())
         {
             return reject();
         }
-        let bytes = environment
-            .iter()
-            .fold(recipe.queued_bytes(), |bytes, (key, value)| {
+        let bytes = environment.iter().fold(
+            recipe.queued_bytes().saturating_add(child_bytes),
+            |bytes, (key, value)| {
                 bytes
                     .saturating_add(64)
                     .saturating_add(key.len())
                     .saturating_add(value.len())
-            });
+            },
+        );
         if bytes > MAX_QUEUE_BYTES || recipe.environment != environment_fingerprint(&environment) {
             return reject();
         }
@@ -308,6 +413,7 @@ impl ProbePool {
             || state.pending.len() >= MAX_QUEUE
             || state.bytes.saturating_add(bytes) > MAX_QUEUE_BYTES
             || state.inflight.contains_key(&key)
+            || state.complete.contains_key(&key)
         {
             return reject();
         }
@@ -320,6 +426,7 @@ impl ProbePool {
             environment,
             deadline,
             bytes,
+            child,
         });
         self.shared.changed.notify_all();
         true
@@ -339,22 +446,9 @@ impl ProbePool {
         }
     }
 
-    /// Discard pending jobs and signal the active jobs without cancelling the session.
-    pub(crate) fn cancel(&self) {
-        let mut state = self.shared.state();
-        self.shared.shutdown.cancel();
-        let pending = std::mem::take(&mut state.pending);
-        state.bytes = 0;
-        for job in &pending {
-            state.inflight.remove(&job.key);
-        }
-        self.shared
-            .counters
-            .cancelled
-            .fetch_add(pending.len() as u64, Ordering::Relaxed);
-        self.shared.changed.notify_all();
-        drop(state);
-        drop(pending);
+    pub(crate) fn take(&self, key: Digest) -> Option<ChildResult> {
+        self.wait_for(key);
+        self.shared.state().complete.remove(&key)
     }
 }
 
@@ -425,6 +519,7 @@ enum JobResult {
     Cached,
     Cancelled,
     Published,
+    Ready,
     Failed,
 }
 
@@ -436,7 +531,7 @@ fn worker(context: &WorkerContext<'_>, shared: &Shared) {
         };
         let result = catch_unwind(AssertUnwindSafe(|| execute(context, job, shared)));
         let counter = match result {
-            Ok(Ok(JobResult::Cached)) => &shared.counters.cached,
+            Ok(Ok(JobResult::Cached | JobResult::Ready)) => &shared.counters.cached,
             Ok(Ok(JobResult::Cancelled)) => &shared.counters.cancelled,
             Ok(Ok(JobResult::Published)) => &shared.counters.published,
             Ok(Err(_)) if shared.cancelled() => &shared.counters.cancelled,
@@ -448,9 +543,11 @@ fn worker(context: &WorkerContext<'_>, shared: &Shared) {
 
 fn execute(context: &WorkerContext<'_>, job: Job, shared: &Shared) -> HostResult<JobResult> {
     let Job {
+        key,
         mut recipe,
         environment,
         deadline,
+        child,
         ..
     } = job;
     let cancelled = || shared.cancelled() || speculative_now() >= deadline;
@@ -471,16 +568,85 @@ fn execute(context: &WorkerContext<'_>, job: Job, shared: &Shared) -> HostResult
         .with_scratch(&scratch.path)
         .ok_or_else(|| HostError::unsupported("Cannot bind speculative scratch."))?
         .with_canonical(context.host);
+    if let Some(child) = child {
+        let (outcome, journal) = child(
+            &scratch.path,
+            &recipe,
+            environment,
+            ChildBudget {
+                cancel: shared.cancel.clone(),
+                shutdown: shared.shutdown.clone(),
+                deadline,
+            },
+        )?;
+        if cancelled() {
+            return Ok(JobResult::Cancelled);
+        }
+        let mut queue = shared.state();
+        if queue.complete.len() >= MAX_JOBS || shared.cancelled() {
+            return Ok(JobResult::Cancelled);
+        }
+        queue.complete.insert(
+            key,
+            ChildResult {
+                recipe,
+                outcome,
+                journal,
+            },
+        );
+        return Ok(JobResult::Ready);
+    }
+    let (outcome, journal) = execute_process_plan(
+        context,
+        shared,
+        &scratch.path,
+        &recipe,
+        environment,
+        deadline,
+    )?;
+    if cancelled() {
+        return Ok(JobResult::Cancelled);
+    }
+    let status = context.cache.publish_uncounted(
+        context.host,
+        context.store,
+        &recipe,
+        &outcome,
+        &journal,
+        cancelled,
+    );
+    Ok(match status {
+        ProbePublishOutcome::Published | ProbePublishOutcome::AlreadyPresent => {
+            JobResult::Published
+        }
+        ProbePublishOutcome::Skipped(SkipReason::Cancelled) => JobResult::Cancelled,
+        ProbePublishOutcome::Skipped(_) | ProbePublishOutcome::StoreError(_) => JobResult::Failed,
+    })
+}
+
+fn execute_process_plan(
+    context: &WorkerContext<'_>,
+    shared: &Shared,
+    scratch: &Path,
+    recipe: &ProbeRecipe,
+    environment: Vec<(BString, BString)>,
+    deadline: Instant,
+) -> HostResult<(ObservedOutcome, Journal)> {
     let journal = JournalHost::new(
         context.host,
-        &scratch.path,
+        scratch,
         JournalMode::Speculate,
-        Some(context.process_verifier),
+        context.process_verifier,
     )?
-    .with_speculation(&environment, &shared.cancel, &shared.shutdown, deadline);
+    .with_speculation(
+        environment.clone(),
+        shared.cancel.clone(),
+        shared.shutdown.clone(),
+        deadline,
+    );
     let remaining = deadline.saturating_duration_since(speculative_now());
-    let plan = prepare(&recipe, &environment, &scratch.path, remaining)?;
-    let mut outcome = run_plan(&journal, &scratch.path, &recipe, &plan)?;
+    let plan = prepare(recipe, &environment, scratch, remaining)?;
+    let mut outcome = run_plan(&journal, scratch, recipe, &plan)?;
     let journal = journal.finish();
     outcome.diagnostics.extend(
         journal
@@ -494,36 +660,27 @@ fn execute(context: &WorkerContext<'_>, job: Job, shared: &Shared) -> HostResult
                 message: message.clone(),
             }),
     );
-    if cancelled() {
-        return Ok(JobResult::Cancelled);
-    }
     let [executed] = journal.processes() else {
-        return Ok(JobResult::Failed);
+        return Err(HostError::unsupported(
+            "The process did not match the planned probe.",
+        ));
     };
     // JournalHost can reduce the timeout to account for setup time.
     let mut expected = plan;
     if executed.timeout.is_none() || executed.timeout > expected.timeout {
-        return Ok(JobResult::Failed);
+        return Err(HostError::unsupported(
+            "The process did not match the planned probe.",
+        ));
     }
     expected.timeout = executed.timeout;
     if environment_fingerprint(&executed.env) != recipe.environment
         || request_digest(executed) != request_digest(&expected)
     {
-        return Ok(JobResult::Failed);
+        return Err(HostError::unsupported(
+            "The process did not match the planned probe.",
+        ));
     }
-    let status = context.cache.publish_uncounted(
-        context.host,
-        context.store,
-        &recipe,
-        &outcome,
-        &journal,
-        cancelled,
-    );
-    Ok(match status {
-        ProbePublishOutcome::Published => JobResult::Published,
-        ProbePublishOutcome::Skipped(SkipReason::Cancelled) => JobResult::Cancelled,
-        ProbePublishOutcome::Skipped(_) | ProbePublishOutcome::StoreError(_) => JobResult::Failed,
-    })
+    Ok((outcome, journal))
 }
 
 fn prepare(
@@ -637,154 +794,4 @@ fn checked_relative(bytes: &[u8]) -> HostResult<PathBuf> {
 }
 
 #[cfg(all(test, unix))]
-mod tests {
-    use super::*;
-    use rcmake_host::PureHost;
-
-    #[test]
-    fn limits_total_jobs_and_uses_explicit_settings_first() {
-        let host = PureHost::default();
-        assert_eq!(job_limit(&host, 0, None).effective, 1);
-        host.env_set(b"RCMAKE_PROBE_JOBS", Some(b"100"));
-        assert_eq!(job_limit(&host, 4 * GIB, None).effective, 2);
-        assert_eq!(
-            job_limit(&host, 4 * GIB, None).clamp,
-            Some(JobClamp::Memory)
-        );
-        let limit = job_limit(&host, 16 * GIB, NonZeroUsize::new(1));
-        assert_eq!(limit.requested, 1);
-        assert_eq!(limit.effective, 1);
-        assert_eq!(limit.clamp, None);
-    }
-
-    #[test]
-    fn claims_and_cleans_distinct_scratch_directories() -> HostResult<()> {
-        let host = PureHost::default();
-        let root = Path::new("/work/spec");
-        host.create_dir_all(root)?;
-        {
-            let first = Scratch::create(&host, root)?;
-            let second = Scratch::create(&host, root)?;
-            assert_ne!(first.path, second.path);
-            assert_eq!(host.read_dir(root)?.len(), 4);
-        }
-        assert!(host.read_dir(root)?.is_empty());
-        Ok(())
-    }
-    struct TestCompiler;
-
-    impl ProcessVerifier for TestCompiler {
-        fn preflight(&self, request: &RunRequest) -> Option<rcmake_store::Trace> {
-            let [command] = request.pipeline.as_slice() else {
-                return None;
-            };
-            (command.program == b"/work/compiler").then(Vec::new)
-        }
-
-        fn dependencies(
-            &self,
-            _: &RunRequest,
-            _: &rcmake_host::RunOutput,
-        ) -> Option<super::super::try_compile::journal::DependencyClosure> {
-            use super::super::try_compile::journal::DependencyClosure;
-            Some(DependencyClosure {
-                files: [PathBuf::from("/work/header.h")].into(),
-                searches: Vec::new(),
-            })
-        }
-    }
-
-    #[test]
-    fn owns_the_request_and_recovers_after_a_worker_panics() -> HostResult<()> {
-        use super::super::try_compile::{
-            cache::tests::recipe,
-            plan::{SpeculativeRun, Templated},
-        };
-        use std::sync::mpsc;
-
-        let host = PureHost::default();
-        let root = Path::new("/work/spec");
-        host.create_dir_all(root)?;
-        host.seed_file(Path::new("/work/header.h"), b"header")?;
-        host.seed_file(Path::new("/work/compiler"), b"compiler")?;
-        host.sleep(Duration::from_secs(3));
-        host.env_set(b"LANG", Some(b"C"));
-        let environment = host.env_all();
-        let config = StoreConfig::new("/work/cache".into());
-        let cache = ProbeCache::new(rcmake_store::StoreMode::ReadWrite);
-        let context = WorkerContext {
-            host: &host,
-            store: &config,
-            cache: &cache,
-            scratch_root: root,
-            process_verifier: &TestCompiler,
-        };
-        let mut good = recipe(&host, Path::new("/work"))?;
-        good.speculative_run = Some(SpeculativeRun {
-            program: "/work/compiler".into(),
-            args: Vec::new(),
-            artifact: None,
-            timeout: Duration::from_secs(4),
-        });
-        let mut panicking = good.clone();
-        let arg = Templated::literal(b"panic fixture")
-            .ok_or_else(|| HostError::unsupported("Invalid test argument."))?;
-        if let Some(run) = &mut panicking.speculative_run {
-            run.args.push(arg);
-        }
-        let (started, jobs) = mpsc::channel();
-        let (release, released) = mpsc::channel();
-        let released = Mutex::new(released);
-        host.set_command_handler(move |_, request, _| {
-            assert_eq!(request.env, [(BString::from("LANG"), BString::from("C"))]);
-            let [program] = request.pipeline.as_slice() else {
-                return Err(HostError::unsupported("Missing test process."));
-            };
-            let _ = started.send(());
-            if !released
-                .lock()
-                .is_ok_and(|rx| rx.recv_timeout(Duration::from_secs(2)).is_ok())
-            {
-                return Err(HostError::unsupported("Test process did not resume."));
-            }
-            assert!(program.args.is_empty(), "Panicking worker fixture.");
-            Ok(rcmake_host::RunOutput {
-                results: vec![ProcessResult::Exited(0)],
-                stdout: path::from_native_cmake(&request.cwd.join("probe.c")).to_vec(),
-                stderr: Vec::new(),
-            })
-        })?;
-
-        ProbePool::scoped(&context, 4 * GIB, None, CancelToken::default(), |pool| {
-            assert_eq!(pool.limit().effective, 2);
-            let failure_key = compute_probe_key(&panicking);
-            assert!(pool.submit(panicking.clone(), environment.clone()));
-            jobs.recv_timeout(Duration::from_secs(2))
-                .map_err(|e| HostError::unsupported(e.to_string()))?;
-            assert!(!pool.submit(panicking, environment.clone()));
-            release
-                .send(())
-                .map_err(|e| HostError::unsupported(e.to_string()))?;
-            pool.wait_for(failure_key);
-            assert_eq!(pool.stats().failures, 1);
-
-            assert!(!pool.submit(good.clone(), Vec::new()));
-            assert!(pool.submit(good.clone(), environment));
-            jobs.recv_timeout(Duration::from_secs(2))
-                .map_err(|e| HostError::unsupported(e.to_string()))?;
-            release
-                .send(())
-                .map_err(|e| HostError::unsupported(e.to_string()))?;
-            pool.wait_for(compute_probe_key(&good));
-            assert_eq!(pool.stats().published, 1);
-            assert_eq!(cache.stats(), Default::default());
-            let hit = cache
-                .lookup(&host, &config, &good)
-                .ok_or_else(|| HostError::unsupported("Missing worker result."))?;
-            assert_eq!(hit.output, b"/work/scratch/probe.c");
-            Ok(())
-        })?;
-        assert!(host.read_dir(root)?.is_empty());
-        Ok(())
-    }
-}
+mod tests;

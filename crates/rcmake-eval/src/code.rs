@@ -2,7 +2,77 @@
 
 use std::sync::Arc;
 
-use rcmake_syntax::CommandInvocation;
+use rcmake_base::Limits;
+use rcmake_diag::{Diagnostic, SourceId, source::SourceKind};
+use rcmake_syntax::{CommandInvocation, ParseError};
+
+#[derive(Clone)]
+pub(crate) struct ParsedSource {
+    pub(crate) code: Result<Code, ParseError>,
+    pub(crate) warnings: Vec<Diagnostic>,
+}
+
+impl ParsedSource {
+    pub(crate) fn parse(text: &[u8], id: SourceId, kind: SourceKind, limits: &Limits) -> Self {
+        match rcmake_syntax::parse_list_file_with_warnings(text, id, kind, limits) {
+            Ok(list) => Self {
+                code: Ok(Code::new(list.commands, Arc::from([]))),
+                warnings: list.warnings,
+            },
+            Err((error, warnings)) => Self {
+                code: Err(error),
+                warnings,
+            },
+        }
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct ParseCache {
+    entries: Vec<ParseEntry>,
+    bytes: usize,
+}
+
+struct ParseEntry {
+    text: Arc<[u8]>,
+    kind: SourceKind,
+    limits: Limits,
+    parsed: ParsedSource,
+}
+
+impl ParseCache {
+    pub(crate) fn parse(
+        &mut self,
+        text: Arc<[u8]>,
+        id: SourceId,
+        kind: SourceKind,
+        limits: &Limits,
+    ) -> ParsedSource {
+        if let Some(entry) = self
+            .entries
+            .iter()
+            .find(|entry| entry.text == text && entry.kind == kind && &entry.limits == limits)
+        {
+            return entry.parsed.clone();
+        }
+        let parsed = ParsedSource::parse(&text, id, kind, limits);
+        let size = text.len();
+        if self.entries.len() < 256
+            && size <= (1024 * 1024 - self.bytes)
+            && parsed.code.as_ref().map_or(0, Code::len) <= 4096
+            && parsed.warnings.len() <= 1024
+        {
+            self.bytes += size;
+            self.entries.push(ParseEntry {
+                text,
+                kind,
+                limits: limits.clone(),
+                parsed: parsed.clone(),
+            });
+        }
+        parsed
+    }
+}
 
 /// A flat command sequence from one listfile (or a function/macro body) together with
 /// the index of the matching end command for every block opener.

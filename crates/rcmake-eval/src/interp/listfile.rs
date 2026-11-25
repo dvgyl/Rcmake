@@ -7,7 +7,6 @@ use rcmake_diag::{DiagCategory, Effect, Location, MessageKind, PolicyId, PolicyS
 use rcmake_host::{FileKind, Follow, HostResult, Stream, path};
 use rcmake_model::{CacheEntry, CacheType, DirId};
 
-use super::BodyMode;
 use crate::util::{cat, collapse_full_path};
 use crate::{CmdError, DirFrame, Flow, Interp, RunMode, RunOutcome, SubdirOptions};
 
@@ -77,7 +76,7 @@ impl Interp {
         };
         let read = match self.parse_file(abs) {
             Some(code) => {
-                let r = self.run_code(&code, 0, code.len(), BodyMode::File);
+                let r = self.run_listfile_body(&code, abs, directory);
                 if let Ok(Flow::Return {
                     propagate: Some(names),
                 }) = &r

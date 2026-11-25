@@ -67,7 +67,7 @@ impl GitMirror<'_> {
             ..GitGcReport::default()
         };
         report.bytes_after = report.bytes_before;
-        if self.read_only || offline(self.host) {
+        if self.read_only || self.offline_only || offline(self.host) {
             return Ok(report);
         }
 

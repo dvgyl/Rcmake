@@ -235,12 +235,33 @@ fn run(
     limit: usize,
     timeout: Option<Duration>,
 ) -> Result<RunOutput, FetchError> {
+    run_command(
+        host,
+        program,
+        CommandSpec {
+            program: program.into(),
+            args,
+        },
+        cwd,
+        env,
+        limit,
+        timeout,
+    )
+}
+
+#[cfg(all(feature = "native", any(unix, windows)))]
+fn run_command(
+    host: &dyn Host,
+    program: &'static str,
+    command: CommandSpec,
+    cwd: &Path,
+    env: Vec<(BString, BString)>,
+    limit: usize,
+    timeout: Option<Duration>,
+) -> Result<RunOutput, FetchError> {
     let result = host.run_bounded(
         &RunRequest {
-            pipeline: vec![CommandSpec {
-                program: program.into(),
-                args,
-            }],
+            pipeline: vec![command],
             cwd: cwd.to_owned(),
             env,
             stdin: Input::Null,

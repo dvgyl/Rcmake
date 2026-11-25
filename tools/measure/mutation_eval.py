@@ -36,7 +36,7 @@ DURATION = re.compile(rb"(?m)^(-- (?:Configuring|Generating) done) \([0-9.]+s\)$
 REPLAY_RECORD = Path("CMakeFiles/rcmake/configure.v1.bin")
 REPLAY_MAGIC = b"RCMAKE-CONFIGURE\0\x01"
 REPLAY_LIMIT = 16 * 1024 * 1024
-TRACE = Path("mutation-trace.jsonl")
+REPLAY_RESULT = Path("CMakeFiles/rcmake/replay-result.v1.json")
 EDIT_GROUPS = (("comment",), ("directory definition",), ("add source", "remove source"),
                ("set target definition", "toggle definition"), ("target property",))
 CYCLE_SIZE = sum(map(len, EDIT_GROUPS))
@@ -226,14 +226,12 @@ def configure(args, source: Path, build: Path, env: dict[str, str]) -> dict:
         shutil.rmtree(reply)
     if args.model_dump:
         (build / args.model_dump).unlink(missing_ok=True)
-    trace_args = []
     if not args.smoke:
-        trace = build / TRACE
-        trace.unlink(missing_ok=True)
-        trace_args = ["--trace", "--trace-format=json-v1", f"--trace-redirect={trace}"]
+        (build / REPLAY_RESULT).unlink(missing_ok=True)
+        env = {**env, "RCMAKE_MEASURE_REPLAY": "1"}
     return run_command(
         [args.rcmake, "-S", source, "-B", build, "-G", "Ninja",
-         "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON", *args.cmake_arg, *trace_args],
+         "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON", *args.cmake_arg],
         source, args.timeout, env,
     )
 
@@ -296,19 +294,16 @@ def verify_effects(edit: Edit, before: dict[str, bytes], after: dict[str, bytes]
             raise ValueError(f"Target {target} did not show the {action} of {effect.value}.")
 
 
-def executed_leaves(source: Path, build: Path) -> set[Path]:
-    """Read the JSON command trace and return the listfiles that executed."""
-    executed = set()
-    with (build / TRACE).open(encoding="utf-8") as stream:
-        header = json.loads(stream.readline())
-        if header.get("version", {}).get("major") != 1:
-            raise ValueError(f"Invalid command trace in {build / TRACE}.")
-        for line in stream:
-            event = json.loads(line)
-            path = Path(event["file"])
-            if event["cmd"] and path.name == "CMakeLists.txt" and path.is_relative_to(source):
-                executed.add(path.relative_to(source))
-    return executed
+def replay_leaves(source: Path, build: Path) -> tuple[set[Path], set[Path]]:
+    """Read the listfiles evaluated and replayed in this run."""
+    record = json.loads((build / REPLAY_RESULT).read_bytes())
+    if record.get("version") != 1:
+        raise ValueError(f"Invalid replay result in {build / REPLAY_RESULT}.")
+    def leaves(key: str) -> set[Path]:
+        paths = (Path(name) for name in record[key])
+        return {path.relative_to(source) for path in paths
+                if path.name == "CMakeLists.txt" and path.is_relative_to(source)}
+    return leaves("executed"), leaves("replayed")
 
 
 def require_replay_record(source: Path, build: Path) -> None:
@@ -330,8 +325,13 @@ def require_replay_record(source: Path, build: Path) -> None:
     key = region.get("key", {})
     paths = [str(p).encode("utf-16-le", errors="surrogatepass") if os.name == "nt" else os.fsencode(p)
              for p in (source, build)]
+    complete = "Complete" in region.get("payload", {})
+    nested = payload.get("model", {}).get("nested", [])
+    has_nested = any(isinstance(item, list) and len(item) == 2
+                     and isinstance(item[0], dict) and "Complete" in item[0].get("payload", {})
+                     for item in nested)
     if (payload.get("schema") != "configure.v1" or "model" not in payload
-            or "Complete" not in region.get("payload", {}) or key.get("kind") != "Configure"
+            or not (complete or has_nested) or key.get("kind") != "Configure"
             or [key.get("source_dir"), key.get("binary_dir")] != [list(p) for p in paths]):
         raise ValueError(f"Configure replay record does not match the configure in {path}.")
 
@@ -367,10 +367,10 @@ def observe(args, result: dict, source: Path, build: Path) -> Observation:
     outputs = snapshot(result, source, build, args)
     if args.smoke:
         return Observation(outputs, set(), {})
-    executed = executed_leaves(source, build)
+    executed, replayed = replay_leaves(source, build)
     digests = {leaf.lists: hashlib.sha256((source / leaf.lists).read_bytes()).hexdigest()
                for leaf in discover_leaves(source, build)}
-    return Observation(outputs, executed, digests)
+    return Observation(outputs, executed, digests, replayed)
 
 
 def verify_replay(row: dict, sources, builds, current: list[Observation],
@@ -383,21 +383,20 @@ def verify_replay(row: dict, sources, builds, current: list[Observation],
     left, right = current[:2]
     if edit is None:
         if len(left.executed & right.executed & left.leaf_digests.keys()) < 2:
-            raise ValueError("The initial traces must show two configured leaf directories.")
+            raise ValueError("The initial runs must evaluate two configured leaf directories.")
         return
     changed = edit.leaf
     if changed not in left.executed or changed not in right.executed:
-        raise ValueError(f"The command traces must show execution of the changed leaf {changed}.")
+        raise ValueError(f"Both runs must evaluate the changed leaf {changed}.")
     row["changed_leaf_executed"] = str(changed)
     demonstrated = previous[0].executed | previous[0].replayed
     controls = right.executed & previous[1].executed & demonstrated
-    controls -= left.executed | {changed}
+    controls = (controls & left.replayed) - {changed}
     replayed = sorted(path for path in controls if path in left.leaf_digests
                       and left.leaf_digests[path] == previous[0].leaf_digests.get(path)
                       == right.leaf_digests.get(path) == previous[1].leaf_digests.get(path))
     if not replayed:
-        raise ValueError("The command traces show no replay of an unchanged configured leaf.")
-    left.replayed.update(replayed)
+        raise ValueError("The replay result shows no reuse of an unchanged configured leaf.")
     row["replayed_leaves"] = [str(path) for path in replayed]
 
 

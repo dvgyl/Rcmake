@@ -4,6 +4,7 @@ use std::{
     fmt,
     io::ErrorKind,
     path::{Path, PathBuf},
+    sync::Arc,
     time::Duration,
 };
 
@@ -54,11 +55,16 @@ pub struct UrlEntry {
 impl UrlEntry {
     /// Record the identity of downloaded archive bytes.
     pub fn from_bytes(urls: Vec<String>, bytes: &[u8]) -> Self {
+        Self::from_digest(urls, Digest::hash(bytes), bytes.len() as u64)
+    }
+
+    /// Record the SHA-256 digest and length of a verified archive.
+    pub fn from_digest(urls: Vec<String>, sha256: Digest, size: u64) -> Self {
         Self {
             urls,
-            sha256: Digest::hash(bytes),
+            sha256,
             algo: sha256_name(),
-            size: bytes.len() as u64,
+            size,
         }
     }
 }
@@ -420,29 +426,63 @@ fn read_entries<'de, D: Deserializer<'de>>(
 
 /// Lockfile state for one configure. Call [Self::commit] after a successful configure.
 pub struct LockSession<'a> {
-    host: &'a dyn Host,
+    host: LockHost<'a>,
     mode: LockMode,
     path: PathBuf,
     original: LockFile,
     updates: LockFile,
 }
 
+enum LockHost<'a> {
+    Borrowed(&'a dyn Host),
+    Shared(Arc<dyn Host>),
+}
+
+impl LockHost<'_> {
+    fn host(&self) -> &dyn Host {
+        match self {
+            Self::Borrowed(host) => *host,
+            Self::Shared(host) => host.as_ref(),
+        }
+    }
+}
+
+impl LockSession<'static> {
+    /// Keep the host and lockfile snapshot for the duration of a configure.
+    pub fn open_shared(
+        host: Arc<dyn Host>,
+        source_dir: &Path,
+        mode: LockMode,
+    ) -> Result<Self, FetchError> {
+        Self::open_with(LockHost::Shared(host), source_dir, mode)
+    }
+}
+
 impl<'a> LockSession<'a> {
     /// Read the lockfile at a project path or the host's `RCMAKE_FETCH_LOCK_FILE` override.
     pub fn open(host: &'a dyn Host, source_dir: &Path, mode: LockMode) -> Result<Self, FetchError> {
+        Self::open_with(LockHost::Borrowed(host), source_dir, mode)
+    }
+
+    fn open_with(
+        host: LockHost<'a>,
+        source_dir: &Path,
+        mode: LockMode,
+    ) -> Result<Self, FetchError> {
+        let fs = host.host();
         let path = source_dir.join(
-            host.env_get(b"RCMAKE_FETCH_LOCK_FILE")
+            fs.env_get(b"RCMAKE_FETCH_LOCK_FILE")
                 .filter(|value| !value.is_empty())
                 .map_or_else(|| PathBuf::from(FILE_NAME), |value| to_native(&value)),
         );
         let original = match mode {
             LockMode::Off => LockFile::default(),
-            LockMode::Frozen => read(host, &path)?.ok_or_else(|| FetchError::Lock {
+            LockMode::Frozen => read(fs, &path)?.ok_or_else(|| FetchError::Lock {
                 path: path.clone(),
                 dependency: None,
                 detail: "Frozen mode requires this file.".into(),
             })?,
-            _ => read(host, &path)?.unwrap_or_default(),
+            _ => read(fs, &path)?.unwrap_or_default(),
         };
         Ok(Self {
             host,
@@ -451,6 +491,11 @@ impl<'a> LockSession<'a> {
             original,
             updates: LockFile::default(),
         })
+    }
+
+    /// Return the lockfile as read at the start of the configure.
+    pub fn snapshot(&self) -> &LockFile {
+        &self.original
     }
 
     /// Return the pinned commit for a matching declaration in frozen mode.
@@ -498,6 +543,20 @@ impl<'a> LockSession<'a> {
         tag: Option<&str>,
         source_dir: &Path,
     ) -> Result<(), FetchError> {
+        if self.mode != LockMode::Update {
+            return Ok(());
+        }
+        self.record_git_commit(name, repository, tag, &mirror.head(source_dir)?)
+    }
+
+    /// Record a commit that the caller verified in the configured checkout.
+    pub fn record_git_commit(
+        &mut self,
+        name: &str,
+        repository: &str,
+        tag: Option<&str>,
+        commit: &str,
+    ) -> Result<(), FetchError> {
         if self.mode == LockMode::Update {
             let identity = transport_identity(repository);
             if !valid_text(repository)
@@ -514,7 +573,7 @@ impl<'a> LockSession<'a> {
                 LockEntry::Git(GitEntry {
                     repository: identity,
                     tag: tag.map(str::to_owned),
-                    commit: mirror.head(source_dir)?,
+                    commit: commit.to_ascii_lowercase(),
                 }),
             )?;
         }
@@ -689,8 +748,9 @@ impl<'a> LockSession<'a> {
             return Ok(());
         }
         let lock = self.path.with_added_extension("guard");
-        let _guard = self.host.lock_file(&lock, Some(Duration::from_secs(10)))?;
-        let mut current = read(self.host, &self.path)?.unwrap_or_default();
+        let host = self.host.host();
+        let _guard = host.lock_file(&lock, Some(Duration::from_secs(10)))?;
+        let mut current = read(host, &self.path)?.unwrap_or_default();
         let mut changed = false;
         for (name, entry) in self.updates.entries {
             let committed = current.get(&name);
@@ -707,7 +767,7 @@ impl<'a> LockSession<'a> {
             changed = true;
         }
         if changed {
-            atomic_write(self.host, &self.path, &current.to_json()?)?;
+            atomic_write(host, &self.path, &current.to_json()?)?;
         }
         Ok(())
     }

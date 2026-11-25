@@ -89,6 +89,9 @@ pub(super) fn execute_process(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResul
         tee: echo_stdout || echo_stderr,
     };
 
+    #[cfg(all(feature = "native", any(unix, windows)))]
+    let mut fetch = crate::fetch_observe::before_process(cx, &request)?;
+
     let host = cx.host();
     if let Some(stream) = echo {
         for command in &request.pipeline {
@@ -105,15 +108,21 @@ pub(super) fn execute_process(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResul
             host.write_out(stream, &line);
         }
     }
-    let run = host.run(&request, &mut |stream, bytes| {
-        let echo = match stream {
-            Stream::Stdout => echo_stdout,
-            Stream::Stderr => echo_stderr,
-        };
-        if echo {
-            host.write_out(stream, bytes);
-        }
-    });
+    let execute = || {
+        host.run(&request, &mut |stream, bytes| {
+            let echo = match stream {
+                Stream::Stdout => echo_stdout,
+                Stream::Stderr => echo_stderr,
+            };
+            if echo {
+                host.write_out(stream, bytes);
+            }
+        })
+    };
+    #[cfg(all(feature = "native", any(unix, windows)))]
+    let run = fetch.result.take().map_or_else(execute, Ok);
+    #[cfg(not(all(feature = "native", any(unix, windows))))]
+    let run = execute();
     let run = run.unwrap_or_else(|error| RunOutput {
         results: vec![ProcessResult::SpawnFailed(error); request.pipeline.len()],
         ..RunOutput::default()
@@ -149,6 +158,9 @@ pub(super) fn execute_process(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResul
     if let Some(var) = value(&parsed, "RESULTS_VARIABLE") {
         cx.set_var(var, list::join(&results));
     }
+
+    #[cfg(all(feature = "native", any(unix, windows)))]
+    crate::fetch_observe::after_process(cx, fetch, &run)?;
 
     match fatal_error(fatal, &run.results, &results) {
         Some(error) => {

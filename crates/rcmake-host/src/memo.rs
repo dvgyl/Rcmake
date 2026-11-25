@@ -108,6 +108,11 @@ impl<H: Host + ?Sized> MemoHost<H> {
         }
     }
 
+    /// Invalidate queries after changes made through another host handle.
+    pub fn clear(&self) {
+        drop(self.begin_change());
+    }
+
     fn read_cache(&self) -> RwLockReadGuard<'_, Cache> {
         self.cache
             .read()

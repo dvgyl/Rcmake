@@ -2,11 +2,16 @@
 
 #![forbid(unsafe_code)]
 
+mod activate;
 mod frame;
+mod leaf;
 mod path_bytes;
 mod region;
 mod replay;
 mod trace;
+
+pub use activate::ReplayHost;
+pub(crate) use activate::ReplaySession;
 
 pub use region::{
     CacheValue, ChildScope, CommandClass, EntryContext, Journal, JournalEffect, OpaqueOperation,

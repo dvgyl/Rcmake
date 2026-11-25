@@ -56,6 +56,37 @@ pub(super) fn run(cx: &mut Cx<'_>, args: &[&[u8]]) -> Result {
             return Ok(Flow::Normal);
         }
     }
+    let transfer_url = std::str::from_utf8(url).unwrap_or("<invalid URL>");
+    #[cfg(all(feature = "native", any(unix, windows)))]
+    let fetch = if cx.host().supports_process_execution() {
+        crate::fetch_observe::prepare_archive(cx, transfer_url, options)?
+    } else {
+        None
+    };
+    #[cfg(all(feature = "native", any(unix, windows)))]
+    if let (Some(fetch), Some(file)) = (&fetch, &destination)
+        && fetch.restore(cx, file)?
+    {
+        set_status(cx, download.status, 0, "No error");
+        if let Some(log) = download.log {
+            cx.set_var(log, BString::default());
+        }
+        if download.progress {
+            cx.host()
+                .write_out(Stream::Stdout, b"-- [download 100% complete]\n");
+        }
+        return Ok(Flow::Normal);
+    }
+    if cx.host().supports_process_execution() {
+        #[cfg(all(feature = "native", any(unix, windows)))]
+        if let Some(fetch) = &fetch {
+            fetch.check_network(cx)?;
+        } else {
+            crate::hermetic::check_network(cx, transfer_url, download.expected.is_some())?;
+        }
+        #[cfg(not(all(feature = "native", any(unix, windows))))]
+        crate::hermetic::check_network(cx, transfer_url, download.expected.is_some())?;
+    }
     if let Some(file) = &destination {
         if let Some(parent) = file.parent() {
             cx.host().create_dir_all(parent).map_err(|_| error(format!(
@@ -120,7 +151,25 @@ pub(super) fn run(cx: &mut Cx<'_>, args: &[&[u8]]) -> Result {
         }
         _ => 2,
     };
-    let message = status_message(code, &result.stderr, download.default_verify);
+    #[cfg(all(feature = "native", any(unix, windows)))]
+    let fetch_mismatch = if let (0, Some(fetch), Some(file)) = (code, &fetch, &destination) {
+        !fetch.complete(cx, file)?
+    } else {
+        false
+    };
+    #[cfg(not(all(feature = "native", any(unix, windows))))]
+    let fetch_mismatch = false;
+    let (code, message) = if fetch_mismatch {
+        (
+            1,
+            "Downloaded archive does not match the required content.".into(),
+        )
+    } else {
+        (
+            code,
+            status_message(code, &result.stderr, download.default_verify),
+        )
+    };
     set_status(cx, download.status, code, &message);
     if let Some(log) = download.log {
         cx.set_var(log, result.stderr.into());

@@ -6,6 +6,7 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use rcmake_host::{RunOutput, path};
+#[cfg(test)]
 use rcmake_json::{ReadOptions, Value};
 
 const MAX_TRACE_BYTES: usize = 4 * 1024 * 1024;
@@ -105,6 +106,7 @@ pub(crate) fn make_dependencies(bytes: &[u8], cwd: &Path) -> Option<BTreeSet<Pat
 
 /// Read MSVC source and include paths from a UTF-8 source dependency document.
 /// Imported modules and header units require additional evidence.
+#[cfg(test)]
 pub(crate) fn msvc_dependencies(bytes: &[u8], cwd: &Path) -> Option<BTreeSet<PathBuf>> {
     let bytes = bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(bytes);
     if bytes.len() > MAX_TRACE_BYTES || std::str::from_utf8(bytes).is_err() {
@@ -154,6 +156,7 @@ pub(crate) fn msvc_dependencies(bytes: &[u8], cwd: &Path) -> Option<BTreeSet<Pat
 
 /// Read localized include lines after the caller decodes the compiler output.
 /// The caller supplies the detected prefix, including its punctuation.
+#[cfg(test)]
 pub(crate) fn msvc_show_includes(
     bytes: &[u8],
     prefix: &[u8],

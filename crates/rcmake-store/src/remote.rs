@@ -49,6 +49,7 @@ pub enum RemoteAccess {
     ReadWrite,
 }
 /// Authentication settings. Values are read from the host for each request.
+#[derive(Clone)]
 pub enum RemoteAuth {
     /// Send no credentials.
     Anonymous,
@@ -60,6 +61,7 @@ pub enum RemoteAuth {
     S3(String),
 }
 /// Address and limits for an optional remote probe cache.
+#[derive(Clone)]
 pub struct RemoteCacheConfig {
     endpoint: String,
     /// Whether publication is enabled.
@@ -123,6 +125,9 @@ impl RemoteCacheConfig {
         };
         let url = std::str::from_utf8(&endpoint)
             .map_err(|_| RemoteError::Setting("RCMAKE_CACHE_REMOTE"))?;
+        if !url.starts_with("https://") {
+            return Err(RemoteError::Setting("RCMAKE_CACHE_REMOTE (HTTPS required)"));
+        }
         let mut config = Self::new(url)?;
         if enabled(b"RCMAKE_CACHE_REMOTE_WRITE") {
             config.access = RemoteAccess::ReadWrite;
@@ -152,6 +157,21 @@ impl RemoteCacheConfig {
         };
         Ok(Some(config))
     }
+}
+
+/// Read the local pin and validate its trace before requesting a missing remote blob.
+pub fn local_probe_pin<T: DeserializeOwned>(
+    store: &Store<'_>,
+    key: Digest,
+) -> Result<Option<(ManifestEntry, Entry<T>)>, RemoteError> {
+    let Some((pin, frame)) = export_entry(store, CacheEntryKind::Probe, key)? else {
+        return Ok(None);
+    };
+    let entry = decode_entry(CacheEntryKind::Probe, key, &frame, Some(&pin))?;
+    if crate::verify_trace(store.host, &entry.trace) != crate::VerifyOutcome::Hit {
+        return Ok(None);
+    }
+    Ok(Some((pin, entry)))
 }
 fn resolve(
     host: &dyn Host,

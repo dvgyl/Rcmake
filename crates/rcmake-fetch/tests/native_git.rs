@@ -135,7 +135,17 @@ fn mirror_clones_updates_and_checks_out_old_pins() -> Result<(), Box<dyn std::er
         "frozen".into(),
     ];
     let frozen_clone = classify_git_clone(&frozen_args).ok_or("Invalid Git clone arguments.")?;
+    let seeded =
+        GitMirror::new(&host, &root.join("seeded-cache"))?.with_timeout(Duration::from_secs(10));
+    let unavailable = root.join("unavailable-upstream");
+    let unavailable = unavailable
+        .to_str()
+        .ok_or("The repository path is not UTF-8.")?;
+    seeded.seed_checkout(unavailable, &latest, &second)?;
     host.env_set(b"RCMAKE_FETCH_OFFLINE", Some(b"1"));
+    let seeded_checkout = root.join("seeded-checkout");
+    seeded.checkout(unavailable, &second, &seeded_checkout)?;
+    assert_eq!(seeded.head(&seeded_checkout)?, second);
     mirrors.clone_template(&frozen_clone, root, Some(&first))?;
     let frozen = root.join("frozen");
     mirrors.checkout_commit(&frozen, &first)?;

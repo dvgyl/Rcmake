@@ -7,7 +7,7 @@ use rcmake_host::{FileKind, Follow, ReadRange};
 use rcmake_syntax::ParseError;
 
 use super::BodyMode;
-use crate::code::Code;
+use crate::code::{Code, ParsedSource};
 use crate::util::{cat, collapse_full_path};
 use crate::{CmdError, CmdResult, Flow, IncludeOptions, Interp};
 
@@ -51,22 +51,20 @@ impl Interp {
             );
             return None;
         };
+        self.note_replay_source(abs, &data);
         self.parse_source(abs, &data, SourceKind::File)
     }
 
     fn parse_source(&mut self, path: &[u8], data: &[u8], kind: SourceKind) -> Option<Code> {
         let text: Arc<[u8]> = Arc::from(data);
-        let id = self.sources.add(BString::from(path), kind, text)?;
+        let id = self
+            .sources
+            .add(BString::from(path), kind, Arc::clone(&text))?;
         let file: Arc<[u8]> = Arc::from(path);
-        let (parsed, warnings) =
-            match rcmake_syntax::parse_list_file_with_warnings(data, id, kind, &self.config.limits)
-            {
-                Ok(mut list) => {
-                    let warnings = std::mem::take(&mut list.warnings);
-                    (Ok(list), warnings)
-                }
-                Err((err, warnings)) => (Err(err), warnings),
-            };
+        let ParsedSource { code, warnings } = match &mut self.parse_cache {
+            Some(cache) => cache.parse(text, id, kind, &self.config.limits),
+            None => ParsedSource::parse(data, id, kind, &self.config.limits),
+        };
         for mut warning in warnings {
             let line = match &warning.location {
                 Location::FileLine { line, .. } => *line,
@@ -81,8 +79,11 @@ impl Interp {
             let state = *self.diag_top();
             self.emit(&warning, &state);
         }
-        match parsed {
-            Ok(list) => Some(Code::new(list.commands, file)),
+        match code {
+            Ok(mut code) => {
+                code.file = file;
+                Some(code)
+            }
             Err(err) => {
                 self.report_parse_error(&file, &err);
                 None
@@ -146,7 +147,7 @@ impl Interp {
         let vars = self.push_list_file_vars(abs);
         let read = match self.parse_file(abs) {
             Some(code) => {
-                let r = self.run_code(&code, 0, code.len(), BodyMode::File);
+                let r = self.run_replayable_listfile(&code, abs);
                 if let Ok(Flow::Return {
                     propagate: Some(names),
                 }) = &r

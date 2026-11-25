@@ -5,35 +5,34 @@ use std::time::Duration;
 use rcmake_base::BString;
 use rcmake_build::BuildOutcome;
 use rcmake_diag::{DiagCategory, Effect, MessageKind};
-use rcmake_eval::{CmdError, CmdResult, Cx, Flow, Interp, InterpConfig, RunMode};
+use rcmake_eval::{CmdError, CmdResult, Cx, Flow};
 use rcmake_expr::ExpandedArg;
-use rcmake_host::{CopyOptions, Host, HostError, Input, Output, RunRequest, WriteMode, path};
-use rcmake_model::{CacheEntry, CacheType, DirId};
+use rcmake_host::{CopyOptions, Host, HostError, Input, Output, RunRequest, path};
+use rcmake_model::{CacheEntry, CacheType};
 
 use args::{Options, Signature, parse};
-use capture::CapturingHost;
+use child::{ChildBuild, ChildConfig};
 use log::log_probe;
 use project::write_project;
-use run::{build_child, run_executable};
+use run::run_executable;
 use seed::{TryCompileSeed, probe_imports};
 
+#[cfg(all(feature = "native", any(unix, windows)))]
+pub(in crate::configure) mod active;
 mod args;
 #[cfg(all(feature = "native", any(unix, windows)))]
-#[allow(dead_code, reason = "Wave 1A connects this module to configure")]
 pub(super) mod cache;
 mod capture;
+mod child;
 #[cfg(all(feature = "native", any(unix, windows)))]
-#[allow(dead_code, reason = "Wave 1A connects this module to configure")]
 pub(super) mod journal;
 mod log;
 #[cfg(all(feature = "native", any(unix, windows)))]
-#[allow(dead_code, reason = "Wave 1A connects this module to configure")]
 pub(super) mod plan;
 mod project;
 mod run;
 mod seed;
 #[cfg(all(feature = "native", any(unix, windows)))]
-#[allow(dead_code, reason = "Wave 1A connects this module to configure")]
 mod template;
 #[cfg(test)]
 mod tests;
@@ -301,7 +300,6 @@ fn build_probe(
         Signature::Project { target, .. } => *target,
     };
     let mut seed = TryCompileSeed::new(cx, options, source_signature);
-    let depth = cx.recursion_depth();
     let limit = b"CMAKE_MAXIMUM_RECURSION_DEPTH";
     if let Some(value) = cx.var(limit)
         && !seed
@@ -315,100 +313,78 @@ fn build_probe(
             value,
         });
     }
-    let cmake_root = path::to_native(&cx.var_or_empty(b"CMAKE_ROOT"));
-    let cmake_command = path::to_native(&cx.var_or_empty(b"CMAKE_COMMAND"));
-    let limits = cx.limits().clone();
-    let trace = cx.trace_config().cloned();
-    let generator = cx.project().generator;
-    let generator_spec = cx.project().generator_spec.clone();
     let save_cache = dirs.scratch.is_none() || cx.var_is_on(b"CMAKE_DEBUG_TRY_COMPILE");
-    let mut recursion_exceeded = false;
-    let services = std::sync::Arc::new(rcmake_eval::Services {
-        cancel: cx.services().cancel.clone(),
-        ..Default::default()
+    #[cfg(all(feature = "native", any(unix, windows)))]
+    let mut cached_probe = if run_var.is_none() {
+        active::PreparedProbe::prepare(cx, signature, options, dirs, target, &seed)
+    } else {
+        None
+    };
+    let child = ChildConfig::new(cx, dirs, seed);
+    #[cfg(all(feature = "native", any(unix, windows)))]
+    if let Some(probe) = &cached_probe {
+        probe.queue(cx, signature, target, &child);
+    }
+    #[cfg(all(feature = "native", any(unix, windows)))]
+    if let Some(probe) = &mut cached_probe
+        && let Some(hit) = probe.hit(cx, dirs, options)
+    {
+        return apply_probe(cx, options, dirs, build_var, run_var, hit);
+    }
+
+    let parent = cx.host_arc();
+    #[cfg(all(feature = "native", any(unix, windows)))]
+    let journal = cached_probe.as_ref().and_then(|probe| probe.journal(dirs));
+    #[cfg(all(feature = "native", any(unix, windows)))]
+    let parent = journal.as_ref().map_or(parent, |host| {
+        std::sync::Arc::clone(host) as std::sync::Arc<dyn Host>
     });
-    let (build, mut output) = CapturingHost::capture(cx.host_arc(), &dirs.binary, |host| {
-        let mut child = Interp::new(
-            InterpConfig {
-                services,
-                host: host.clone(),
-                mode: RunMode::Configure,
-                cmake_root,
-                cmake_command,
-                cwd: dirs.binary.clone(),
-                limits,
-                diag: Default::default(),
-                defines: seed.defines,
-                script_args: Vec::new(),
-            },
-            crate::register_all,
-        );
-        child.inherit_recursion_depth(depth);
-        if let Some(mut trace) = trace {
-            let redirect = trace.redirect.replace(PathBuf::new());
-            child.set_trace_config(Some(trace));
-            let _ = host.trace_output.set(redirect);
-        }
-        let mut child_context = child.cx();
-        let model = child_context.project();
-        model.generator = generator;
-        model.generator_spec = generator_spec;
-        model.global.props.set("IN_TRY_COMPILE".into(), "1".into());
-        if !seed.enabled_languages.is_empty() {
-            model
-                .global
-                .props
-                .set("ENABLED_LANGUAGES".into(), seed.enabled_languages);
-        }
-        for (imported, aliases) in imports {
-            let id = model
-                .add_target(imported)
-                .map_err(|error| error.to_string())?;
-            for alias in aliases {
-                model
-                    .add_alias(DirId::ROOT, alias, id)
-                    .map_err(|error| error.to_string())?;
-            }
-        }
-        let configure = child.run_configure(&dirs.source, &dirs.binary, &[]);
-        if save_cache {
-            let data = probe_cache(&mut child.cx());
-            host.write(
-                &dirs.binary.join("CMakeCache.txt"),
-                &data,
-                WriteMode::Truncate,
-            )
-            .map_err(|error| error.to_string())?;
-        }
-        if configure.exit_code != 0 {
-            recursion_exceeded = child.recursion_exceeded();
-            return Ok((
-                BuildOutcome {
-                    exit_code: configure.exit_code,
-                    ..BuildOutcome::default()
-                },
-                None,
-            ));
-        }
-        build_child(&mut child.cx(), &dirs.binary, target, source_signature)
-    });
+
+    let (result, recursion_exceeded) = child.run(
+        parent,
+        dirs,
+        ChildBuild {
+            target,
+            imports,
+            save_cache,
+            source_signature,
+        },
+        |child| crate::hermetic::inherit(cx, child),
+    );
     if recursion_exceeded {
-        cx.host().write_out(rcmake_host::Stream::Stderr, &output);
+        cx.host()
+            .write_out(rcmake_host::Stream::Stderr, &result.output);
         cx.fail_nested_recursion();
         return Err(CmdError::Reported);
     }
-    let (outcome, artifact) = match build {
-        Ok(values) => values,
-        Err(error) => (
-            BuildOutcome {
-                exit_code: 1,
-                output: error.into(),
-                ..BuildOutcome::default()
-            },
-            None,
-        ),
-    };
-    output.extend_from_slice(&outcome.output);
+    #[cfg(all(feature = "native", any(unix, windows)))]
+    if let Some(probe) = cached_probe
+        && let Some(journal) = journal.and_then(|host| std::sync::Arc::try_unwrap(host).ok())
+    {
+        probe.record(cx, dirs, build_var, &result, journal.finish());
+    }
+    apply_probe(cx, options, dirs, build_var, run_var, result)
+}
+
+struct ProbeResult {
+    outcome: BuildOutcome,
+    output: BString,
+    artifact: Option<PathBuf>,
+}
+
+fn apply_probe(
+    cx: &mut Cx<'_>,
+    options: &Options<'_>,
+    dirs: &ProbeDirs,
+    build_var: &[u8],
+    run_var: Option<&[u8]>,
+    result: ProbeResult,
+) -> Result<(), CmdError> {
+    let ProbeResult {
+        outcome,
+        output,
+        artifact,
+    } = result;
     set_build_result(cx, build_var, options, outcome.success, &output);
     let run_result = if outcome.success
         && let Some(var) = run_var

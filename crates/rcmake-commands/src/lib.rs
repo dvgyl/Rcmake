@@ -12,9 +12,9 @@ pub use configure::ConfigureRuntime;
 mod custom;
 mod dirs;
 #[cfg(all(feature = "native", any(unix, windows)))]
-#[allow(dead_code, reason = "Wave 1A connects this module to configure")]
 mod fetch_observe;
 mod file_path;
+mod hermetic;
 mod install;
 mod instrumentation;
 mod policy_misc;
@@ -42,6 +42,7 @@ pub fn register_all(registry: &mut Registry) {
     instrumentation::register(registry);
     active::register(registry);
     compat::register(registry);
+    registry.mark_replay_commands();
 }
 
 fn command_error(
