@@ -1,5 +1,6 @@
 use super::{
-    EvalContext, HEAD, Host, LEFT, OTHER, RIGHT, UsageTraversal, check, context, error_text, run,
+    EvalContext, HEAD, Host, LEFT, OBJECT_ROOTS, OTHER, RIGHT, UsageTraversal, check, context,
+    error_text, run,
 };
 use rcmake_diag::{Frame, FrameKind};
 
@@ -278,16 +279,26 @@ fn artifact_queries_validate_the_target_before_naming_options() {
 fn object_query_filters_require_absolute_sources_from_the_target() {
     let mut host = Host::default();
     let ctx = context();
+    let (source_root, build_root) = OBJECT_ROOTS;
     host.set(OTHER, "TYPE", "OBJECT_LIBRARY");
-    host.set(OTHER, "SOURCE_DIR", "/src");
-    host.set(OTHER, "SOURCES", "other.c;second.c;/src/header.h");
+    host.set(OTHER, "SOURCE_DIR", source_root);
+    host.set(
+        OTHER,
+        "SOURCES",
+        &format!("other.c;second.c;{source_root}/header.h"),
+    );
     check(
         &[
             (
-                "$<TARGET_OBJECTS:other,SOURCE_FILES:/src/second.c,SOURCE_FILES:/src/other.c>",
-                "/out/other.o;/out/second.o",
+                &format!(
+                    "$<TARGET_OBJECTS:other,SOURCE_FILES:{source_root}/second.c,SOURCE_FILES:{source_root}/other.c>"
+                ),
+                &format!("{build_root}/other.o;{build_root}/second.o"),
             ),
-            ("$<TARGET_OBJECTS:other,SOURCE_FILES:/src/header.h>", ""),
+            (
+                &format!("$<TARGET_OBJECTS:other,SOURCE_FILES:{source_root}/header.h>"),
+                "",
+            ),
         ],
         &ctx,
         &mut host,
@@ -302,8 +313,10 @@ fn object_query_filters_require_absolute_sources_from_the_target() {
             "Source file:\n\n  other.c\n\nis not an absolute path",
         ),
         (
-            "$<TARGET_OBJECTS:other,SOURCE_FILES:/src/missing.c>",
-            "Source file:\n\n  /src/missing.c\n\ndoes not exist for target \"other\"",
+            &format!("$<TARGET_OBJECTS:other,SOURCE_FILES:{source_root}/missing.c>"),
+            &format!(
+                "Source file:\n\n  {source_root}/missing.c\n\ndoes not exist for target \"other\""
+            ),
         ),
     ] {
         assert_eq!(

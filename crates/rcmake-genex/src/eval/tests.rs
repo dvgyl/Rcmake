@@ -15,6 +15,11 @@ const OTHER: TargetHandle = TargetHandle(2);
 const LEFT: TargetHandle = TargetHandle(3);
 const RIGHT: TargetHandle = TargetHandle(4);
 
+#[cfg(windows)]
+const OBJECT_ROOTS: (&str, &str) = ("C:/src", "C:/build");
+#[cfg(not(windows))]
+const OBJECT_ROOTS: (&str, &str) = ("/src", "/out");
+
 #[derive(Default)]
 struct Host {
     properties: HashMap<(TargetHandle, BString), BString>,
@@ -153,13 +158,19 @@ impl GenexHost for Host {
         sources: Option<&[u8]>,
     ) -> Option<BString> {
         (target == OTHER && config.matches(b"Debug")).then(|| {
+            let (source_root, build_root) = OBJECT_ROOTS;
+            let other = format!("{source_root}/other.c");
+            let second = format!("{source_root}/second.c");
             match sources {
-                Some(b"/src/other.c") => "/out/other.o",
-                Some(b"/src/second.c") => "/out/second.o",
-                Some(b"/src/second.c;/src/other.c" | b"/src/other.c;/src/second.c") | None => {
-                    "/out/other.o;/out/second.o"
+                Some(path) if path == other.as_bytes() => format!("{build_root}/other.o"),
+                Some(path) if path == second.as_bytes() => format!("{build_root}/second.o"),
+                Some(paths)
+                    if paths != format!("{second};{other}").as_bytes()
+                        && paths != format!("{other};{second}").as_bytes() =>
+                {
+                    String::new()
                 }
-                Some(_) => "",
+                _ => format!("{build_root}/other.o;{build_root}/second.o"),
             }
             .into()
         })
@@ -623,6 +634,7 @@ fn contexts_and_interface_operators() {
 
 #[test]
 fn targets_and_second_pass_context() {
+    let (source_root, build_root) = OBJECT_ROOTS;
     let mut host = Host::default();
     host.set(HEAD, "FOO", "first");
     host.set(HEAD, "CODE", "$<TARGET_PROPERTY:FOO>");
@@ -657,8 +669,10 @@ fn targets_and_second_pass_context() {
                 "/out/libother.so/libother.so.1",
             ),
             (
-                "$<TARGET_OBJECTS:other>/$<TARGET_OBJECTS:other,SOURCE_FILES:/src/other.c>",
-                "/out/other.o;/out/second.o//out/other.o",
+                &format!(
+                    "$<TARGET_OBJECTS:other>/$<TARGET_OBJECTS:other,SOURCE_FILES:{source_root}/other.c>"
+                ),
+                &format!("{build_root}/other.o;{build_root}/second.o/{build_root}/other.o"),
             ),
         ],
         &context(),

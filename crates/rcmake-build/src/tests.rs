@@ -142,35 +142,37 @@ fn rejects_bad_indices_and_cycles_before_running_steps() {
 }
 
 #[test]
-fn uses_argv_and_shell_fallback_and_stops_at_first_failed_invocation() {
-    let (shell_program, shell_flag) = if cfg!(windows) {
-        ("cmd.exe", "/C")
-    } else {
-        ("/bin/sh", "-c")
-    };
+fn uses_argv_and_shell_fallback_and_stops_at_first_failed_invocation() -> Result<(), BuildError> {
+    #[cfg(windows)]
+    let build_dir = Path::new("C:/work/build");
+    #[cfg(not(windows))]
+    let build_dir = Path::new("/work/build");
     let host = PureHost::default();
     let calls = Arc::new(Mutex::new(Vec::new()));
     let observed = calls.clone();
     host.set_command_handler(move |host, request, _| {
-        let command = request.pipeline[0].clone();
-        let shell = command.program == shell_program;
+        let [command] = request.pipeline.as_slice() else {
+            return Err(HostError::unsupported("Expected one command."));
+        };
+        let shell = command.program == "/bin/sh";
         if shell {
-            assert_eq!(command.args, [shell_flag, "first link"]);
-            assert_eq!(request.cwd, Path::new("/work/build/obj"));
+            assert_eq!(command.args, ["-c", "first link"]);
+            assert_eq!(request.cwd, build_dir.join("obj"));
             assert_eq!(
-                host.metadata(Path::new("/work/build/bin"), Follow::No)?
-                    .kind,
+                host.metadata(&build_dir.join("bin"), Follow::No)?.kind,
                 FileKind::Dir
             );
         } else {
             assert_eq!(command.args, ["arg with spaces"]);
             assert_eq!(
-                host.metadata(Path::new("/work/build/obj"), Follow::No)?
-                    .kind,
+                host.metadata(&build_dir.join("obj"), Follow::No)?.kind,
                 FileKind::Dir
             );
         }
-        observed.lock().unwrap().push(command.program.clone());
+        observed
+            .lock()
+            .map_err(|_| HostError::unsupported("The command log lock is poisoned."))?
+            .push(command.program.clone());
         Ok(RunOutput {
             stdout: if shell {
                 b"link failed\n".to_vec()
@@ -180,8 +182,7 @@ fn uses_argv_and_shell_fallback_and_stops_at_first_failed_invocation() {
             results: vec![ProcessResult::Exited(if shell { 7 } else { 0 })],
             ..RunOutput::default()
         })
-    })
-    .unwrap();
+    })?;
     let graph = BuildGraph {
         steps: vec![
             BuildStep::Compile {
@@ -212,16 +213,21 @@ fn uses_argv_and_shell_fallback_and_stops_at_first_failed_invocation() {
         &graph,
         &host,
         &BuildOptions {
-            build_dir: "/work/build".into(),
+            build_dir: build_dir.into(),
             ..BuildOptions::default()
         },
-    )
-    .unwrap();
-    assert_eq!(*calls.lock().unwrap(), ["compiler", shell_program]);
+    )?;
+    assert_eq!(
+        *calls
+            .lock()
+            .map_err(|_| HostError::unsupported("The command log lock is poisoned."))?,
+        ["compiler", "/bin/sh"]
+    );
     assert!(!result.success);
     assert_eq!(result.exit_code, 7);
     assert_eq!(result.steps_run, 2);
     assert_eq!(result.output, "compile output\nlink failed\n");
+    Ok(())
 }
 
 #[cfg(unix)]

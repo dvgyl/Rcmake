@@ -417,9 +417,11 @@ mod tests {
     }
 
     #[test]
-    fn compile_and_link_select_their_sysroots_and_preserve_tool_arguments() {
+    fn compile_and_link_select_their_sysroots_and_preserve_tool_arguments()
+    -> Result<(), &'static str> {
         let mut model = ProjectModel::default();
         for (key, value) in [
+            ("CMAKE_HOST_SYSTEM_NAME", "Linux"),
             ("CMAKE_C_COMPILER", "/cc tools/cc"),
             ("CMAKE_C_COMPILER_ARG1", "-mthumb -DARG='two words'"),
             ("CMAKE_C_COMPILER_TARGET", "arm-none-eabi"),
@@ -451,8 +453,11 @@ mod tests {
                 b"<CMAKE_C_COMPILER> <CMAKE_LINKER> <CMAKE_MT>",
                 |key| (source && key == b"SOURCE").then(BString::default),
             );
+            let [rule] = rules.as_slice() else {
+                return Err("Expected one compiler invocation.");
+            };
             assert_eq!(
-                rules[0].argv,
+                rule.argv,
                 [
                     "/cc tools/cc",
                     "-mthumb",
@@ -465,5 +470,6 @@ mod tests {
                 ]
             );
         }
+        Ok(())
     }
 }

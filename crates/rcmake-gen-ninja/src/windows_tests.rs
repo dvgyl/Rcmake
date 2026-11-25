@@ -435,7 +435,10 @@ else:
     assert!(host.metadata(&marker, Follow::Yes).is_ok());
     host.remove_file(&marker)?;
     let failed = run("ninja.exe", &["fail"])?;
-    assert_eq!(failed.results, [ProcessResult::Exited(1)], "{failed:?}");
+    assert!(
+        matches!(failed.results.as_slice(), [ProcessResult::Exited(code)] if *code != 0),
+        "{failed:?}"
+    );
     assert!(host.metadata(&marker, Follow::Yes).is_err());
     Ok(())
 }

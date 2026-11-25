@@ -10,10 +10,22 @@ use rcmake_lsp::{
     RequestId, RpcMessage, SemanticContext, SemanticLocation, SemanticProvider, Server,
 };
 
+#[cfg(windows)]
+const WORK_DIR: &str = "C:/work";
+#[cfg(not(windows))]
+const WORK_DIR: &str = "/work";
+#[cfg(windows)]
+const WORK_URI: &str = "file:///C:/work";
+#[cfg(not(windows))]
+const WORK_URI: &str = "file:///work";
+#[cfg(windows)]
+const URI: &str = "file:///C:/work/CMakeLists.txt";
+#[cfg(not(windows))]
 const URI: &str = "file:///work/CMakeLists.txt";
 
 fn host() -> PureHost {
-    PureHost::new("/work".into(), "/bin/rcmake-lsp".into())
+    let work = Path::new(WORK_DIR);
+    PureHost::new(work.into(), work.join("bin/rcmake-lsp"))
 }
 
 fn decode(json: &str) -> RpcMessage {
@@ -126,13 +138,11 @@ fn at(server: &mut Server<'_>, method: &str, line: i64, character: i64) -> Value
 }
 
 #[test]
-fn scripted_editing_session() {
+fn scripted_editing_session() -> Result<(), Box<dyn std::error::Error>> {
     let host = host();
-    host.seed_file(Path::new("/work/helpers space.cmake"), b"set(HELPER ON)\n")
-        .unwrap();
-    host.create_dir_all(Path::new("/work/sub")).unwrap();
-    host.seed_file(Path::new("/work/sub/CMakeLists.txt"), b"project(Sub)\n")
-        .unwrap();
+    let work = Path::new(WORK_DIR);
+    host.seed_file(&work.join("helpers space.cmake"), b"set(HELPER ON)\n")?;
+    host.seed_file(&work.join("sub/CMakeLists.txt"), b"project(Sub)\n")?;
     let mut server = initialized(&host, false);
     let text = concat!(
         "project(Example)\n",
@@ -188,12 +198,12 @@ fn scripted_editing_session() {
     let include = at(&mut server, "textDocument/definition", 8, 15);
     assert_eq!(
         get(&include, "uri"),
-        &Value::string("file:///work/helpers%20space.cmake")
+        &Value::string(format!("{WORK_URI}/helpers%20space.cmake"))
     );
     let subdir = at(&mut server, "textDocument/definition", 9, 18);
     assert_eq!(
         get(&subdir, "uri"),
-        &Value::string("file:///work/sub/CMakeLists.txt")
+        &Value::string(format!("{WORK_URI}/sub/CMakeLists.txt"))
     );
     let items = at(&mut server, "textDocument/completion", 10, 2);
     assert!(
@@ -224,23 +234,23 @@ fn scripted_editing_session() {
     );
     assert_indent_edits(&formatted, &[3, 4], "  ");
 
-    let change = decode(
-        r#"{"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":"file:///work/CMakeLists.txt","version":2},"contentChanges":[{"text":"project(Example)\nmessage(\"unfinished"}]}}"#,
-    );
+    let change = change(2, r#"[{"text":"project(Example)\nmessage(\"unfinished"}]"#);
     let diagnostics = published(server.handle(change));
-    let diagnostic = array(get(&diagnostics, "diagnostics")).first().unwrap();
+    let diagnostic = array(get(&diagnostics, "diagnostics"))
+        .first()
+        .ok_or("Expected a diagnostic for the unfinished call.")?;
     assert_eq!(get(diagnostic, "severity"), &Value::UInt(1));
     assert_eq!(
         get(get(get(diagnostic, "range"), "start"), "line"),
         &Value::UInt(1)
     );
-    let save = decode(
-        r#"{"jsonrpc":"2.0","method":"textDocument/didSave","params":{"textDocument":{"uri":"file:///work/CMakeLists.txt"}}}"#,
-    );
+    let save = decode(&format!(
+        r#"{{"jsonrpc":"2.0","method":"textDocument/didSave","params":{{"textDocument":{{"uri":"{URI}"}}}}}}"#,
+    ));
     assert_eq!(published(server.handle(save)), diagnostics);
-    let close = decode(
-        r#"{"jsonrpc":"2.0","method":"textDocument/didClose","params":{"textDocument":{"uri":"file:///work/CMakeLists.txt"}}}"#,
-    );
+    let close = decode(&format!(
+        r#"{{"jsonrpc":"2.0","method":"textDocument/didClose","params":{{"textDocument":{{"uri":"{URI}"}}}}}}"#,
+    ));
     assert!(array(get(&published(server.handle(close)), "diagnostics")).is_empty());
     assert!(
         server
@@ -261,6 +271,7 @@ fn scripted_editing_session() {
             .is_empty()
     );
     assert_eq!(server.exit_code(), Some(0));
+    Ok(())
 }
 
 fn change(version: i64, changes: &str) -> RpcMessage {

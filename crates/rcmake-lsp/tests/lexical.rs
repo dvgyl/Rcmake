@@ -9,10 +9,21 @@
 
 use std::path::Path;
 
-use rcmake_host::{Host, PureHost};
+use rcmake_host::{Host, HostResult, PureHost};
 use rcmake_json::Value;
 use rcmake_lsp::{RequestId, RpcMessage, SemanticContext, SemanticProvider, Server};
 
+#[cfg(windows)]
+const WORK_DIR: &str = "C:/work";
+#[cfg(not(windows))]
+const WORK_DIR: &str = "/work";
+#[cfg(windows)]
+const WORK_URI: &str = "file:///C:/work";
+#[cfg(not(windows))]
+const WORK_URI: &str = "file:///work";
+#[cfg(windows)]
+const ROOT: &str = "file:///C:/work/CMakeLists.txt";
+#[cfg(not(windows))]
 const ROOT: &str = "file:///work/CMakeLists.txt";
 
 fn object(fields: impl IntoIterator<Item = (&'static str, Value)>) -> Value {
@@ -70,7 +81,7 @@ fn server<'a>(host: &'a dyn Host, formats: &[&str]) -> Server<'a> {
         &mut server,
         "initialize",
         object([
-            ("rootUri", Value::string("file:///work")),
+            ("rootUri", Value::string(WORK_URI)),
             (
                 "capabilities",
                 object([(
@@ -137,14 +148,17 @@ fn site(
     at(server, method, uri, line, character)
 }
 
-fn file(host: &PureHost, path: &str, text: &str) {
-    let path = Path::new(path);
-    host.create_dir_all(path.parent().unwrap()).unwrap();
-    host.seed_file(path, text.as_bytes()).unwrap();
+fn file(host: &PureHost, path: &str, text: &str) -> HostResult<()> {
+    host.seed_file(&Path::new(WORK_DIR).join(path), text.as_bytes())
+}
+
+fn workspace_uri(path: &str) -> String {
+    format!("{WORK_URI}/{path}")
 }
 
 fn host() -> PureHost {
-    PureHost::new("/work".into(), "/bin/rcmake-lsp".into())
+    let work = Path::new(WORK_DIR);
+    PureHost::new(work.into(), work.join("bin/rcmake-lsp"))
 }
 
 fn assert_location(value: &Value, uri: &str, line: usize) {
@@ -229,7 +243,7 @@ fn unfinished_call_preserves_outline_tokens_and_completion() {
 }
 
 #[test]
-fn project_definitions_use_source_context_and_open_edits() {
+fn project_definitions_use_source_context_and_open_edits() -> HostResult<()> {
     let host = host();
     let setup = concat!(
         "include(Extras.cmake)\n",
@@ -238,37 +252,37 @@ fn project_definitions_use_source_context_and_open_edits() {
         "list(APPEND CMAKE_MODULE_PATH \"${CMAKE_CURRENT_LIST_DIR}/modules\")\n",
         "include(LocalModule)\n",
     );
-    file(&host, "/work/cmake/Setup.cmake", setup);
+    file(&host, "cmake/Setup.cmake", setup)?;
     file(
         &host,
-        "/work/Extras.cmake",
+        "Extras.cmake",
         "function(my_helper)\nendfunction()\n",
-    );
+    )?;
     file(
         &host,
-        "/work/cmake/Extras.cmake",
+        "cmake/Extras.cmake",
         "function(decoy)\nendfunction()\n",
-    );
+    )?;
     file(
         &host,
-        "/work/cmake/Helpers.cmake",
+        "cmake/Helpers.cmake",
         "macro(My_Macro)\nendmacro()\n",
-    );
+    )?;
     file(
         &host,
-        "/work/src/CMakeLists.txt",
+        "src/CMakeLists.txt",
         "add_library(child_lib INTERFACE)\n",
-    );
+    )?;
     file(
         &host,
-        "/work/cmake/src/CMakeLists.txt",
+        "cmake/src/CMakeLists.txt",
         "add_library(decoy INTERFACE)\n",
-    );
+    )?;
     file(
         &host,
-        "/work/cmake/modules/LocalModule.cmake",
+        "cmake/modules/LocalModule.cmake",
         "add_library(tools INTERFACE)\nadd_library(tools_alias ALIAS tools)\n",
-    );
+    )?;
     let root = concat!(
         "include(cmake/Setup.cmake)\n",
         "add_executable(app main.c)\n",
@@ -280,36 +294,37 @@ fn project_definitions_use_source_context_and_open_edits() {
     open(&mut server, ROOT, root);
 
     let go = "textDocument/definition";
-    let extras = "file:///work/Extras.cmake";
-    let setup_uri = "file:///work/cmake/Setup.cmake";
-    for (mark, uri, line) in [
-        ("MY_HELPER", extras, 0),
-        ("my_macro", "file:///work/cmake/Helpers.cmake", 0),
-        (
-            "tools_alias",
-            "file:///work/cmake/modules/LocalModule.cmake",
-            1,
-        ),
-        ("child_lib", "file:///work/src/CMakeLists.txt", 0),
+    let extras = workspace_uri("Extras.cmake");
+    let setup_uri = workspace_uri("cmake/Setup.cmake");
+    for (mark, path, line) in [
+        ("MY_HELPER", "Extras.cmake", 0),
+        ("my_macro", "cmake/Helpers.cmake", 0),
+        ("tools_alias", "cmake/modules/LocalModule.cmake", 1),
+        ("child_lib", "src/CMakeLists.txt", 0),
     ] {
-        assert_location(&site(&mut server, go, ROOT, root, mark, 1), uri, line);
+        assert_location(
+            &site(&mut server, go, ROOT, root, mark, 1),
+            &workspace_uri(path),
+            line,
+        );
     }
 
-    open(&mut server, setup_uri, setup);
-    for (mark, uri) in [
-        ("Extras.cmake", extras),
-        ("Helpers.cmake", "file:///work/cmake/Helpers.cmake"),
-        ("(src)", "file:///work/src/CMakeLists.txt"),
-        (
-            "(LocalModule)",
-            "file:///work/cmake/modules/LocalModule.cmake",
-        ),
+    open(&mut server, &setup_uri, setup);
+    for (mark, path) in [
+        ("Extras.cmake", "Extras.cmake"),
+        ("Helpers.cmake", "cmake/Helpers.cmake"),
+        ("(src)", "src/CMakeLists.txt"),
+        ("(LocalModule)", "cmake/modules/LocalModule.cmake"),
     ] {
-        assert_location(&site(&mut server, go, setup_uri, setup, mark, 1), uri, 0);
+        assert_location(
+            &site(&mut server, go, &setup_uri, setup, mark, 1),
+            &workspace_uri(path),
+            0,
+        );
     }
     open(
         &mut server,
-        extras,
+        &extras,
         "\nfunction(my_helper)\nendfunction()\n",
     );
     notify(
@@ -318,7 +333,10 @@ fn project_definitions_use_source_context_and_open_edits() {
         object([
             (
                 "textDocument",
-                object([("uri", Value::string(extras)), ("version", Value::Int(2))]),
+                object([
+                    ("uri", Value::string(extras.as_str())),
+                    ("version", Value::Int(2)),
+                ]),
             ),
             (
                 "contentChanges",
@@ -331,26 +349,30 @@ fn project_definitions_use_source_context_and_open_edits() {
     );
     assert_location(
         &site(&mut server, go, ROOT, root, "MY_HELPER", 1),
-        extras,
+        &extras,
         2,
     );
     notify(
         &mut server,
         "textDocument/didClose",
-        object([("textDocument", object([("uri", Value::string(extras))]))]),
+        object([(
+            "textDocument",
+            object([("uri", Value::string(extras.as_str()))]),
+        )]),
     );
     assert_location(
         &site(&mut server, go, ROOT, root, "MY_HELPER", 1),
-        extras,
+        &extras,
         0,
     );
+    Ok(())
 }
 
 #[test]
-fn conditional_module_paths_return_both_candidates() {
+fn conditional_module_paths_return_both_candidates() -> Result<(), Box<dyn std::error::Error>> {
     let host = host();
-    file(&host, "/work/a/Choices.cmake", "message(STATUS a)\n");
-    file(&host, "/work/b/Choices.cmake", "message(STATUS b)\n");
+    file(&host, "a/Choices.cmake", "message(STATUS a)\n")?;
+    file(&host, "b/Choices.cmake", "message(STATUS b)\n")?;
     let text = "if(FLAG)\n  set(CMAKE_MODULE_PATH a)\nelse()\n  set(CMAKE_MODULE_PATH b)\nendif()\ninclude(Choices)\n";
     let mut server = server(&host, &[]);
     open(&mut server, ROOT, text);
@@ -363,9 +385,12 @@ fn conditional_module_paths_return_both_candidates() {
         2,
     );
     let candidates = array(&definition);
-    assert_eq!(candidates.len(), 2);
-    assert_location(&candidates[0], "file:///work/a/Choices.cmake", 0);
-    assert_location(&candidates[1], "file:///work/b/Choices.cmake", 0);
+    let [a, b] = candidates else {
+        return Err(format!("Expected two module definitions. Got {definition:?}.").into());
+    };
+    assert_location(a, &workspace_uri("a/Choices.cmake"), 0);
+    assert_location(b, &workspace_uri("b/Choices.cmake"), 0);
+    Ok(())
 }
 
 #[test]

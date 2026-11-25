@@ -374,11 +374,20 @@ fn generates_multiconfig_projects_from_ide_facts() {
     );
 }
 
+fn source_property_roots() -> (&'static str, &'static str) {
+    #[cfg(windows)]
+    let roots = ("C:/src", "C:/build");
+    #[cfg(not(windows))]
+    let roots = ("/src", "/out");
+    roots
+}
+
 #[test]
 fn writes_flags_only_on_the_source_that_uses_them() {
     let host = PureHost::default();
-    let source = Path::new("/src");
-    let out = Path::new("/out");
+    let (source_root, build_root) = source_property_roots();
+    let source = Path::new(source_root);
+    let out = Path::new(build_root);
     let mut model = model(source, out);
     add(
         &mut model,
@@ -393,23 +402,25 @@ fn writes_flags_only_on_the_source_that_uses_them() {
     let properties = model
         .dir_mut(DirId::ROOT)
         .source_props
-        .entry("/src/main.c".into())
+        .entry(format!("{source_root}/main.c").into())
         .or_default();
+    let include = format!("{source_root}/include dir");
     for (name, value) in [
         ("COMPILE_FLAGS", "-Wall -Wextra"),
         ("COMPILE_OPTIONS", "-fno-common"),
         ("COMPILE_DEFINITIONS", "-DMAIN_ONLY=1"),
-        ("INCLUDE_DIRECTORIES", "/src/include dir"),
+        ("INCLUDE_DIRECTORIES", include.as_str()),
     ] {
         properties.set(name.into(), value.into());
     }
     let result = resolved(&model, &host);
     generate(&result, &model, &host, out).expect("generate");
     let pbx = read(&host, &out.join("Demo.xcodeproj/project.pbxproj"));
+    let flags = format!("-Wall -Wextra -fno-common '-DMAIN_ONLY=1' '-I{include}'");
     assert!(
         pbx.lines().any(|line| line.contains("main.c in Sources")
             && line.contains("COMPILER_FLAGS")
-            && line.contains("-Wall -Wextra -fno-common '-DMAIN_ONLY=1' '-I/src/include dir'")),
+            && line.contains(&flags)),
         "{pbx}"
     );
     assert_eq!(pbx.matches("MAIN_ONLY").count(), 1);
@@ -419,15 +430,18 @@ fn writes_flags_only_on_the_source_that_uses_them() {
 #[test]
 fn rejects_per_configuration_source_properties() {
     let host = PureHost::default();
-    let source = Path::new("/src");
-    let out = Path::new("/out");
+    let (source_root, build_root) = source_property_roots();
+    let source = Path::new(source_root);
+    let out = Path::new(build_root);
+    let main = format!("{source_root}/main.c");
+    let debug_include = format!("$<$<CONFIG:Debug>:{source_root}/debug>");
     host.seed_file(&source.join("main.c"), b"")
         .expect("seed source");
     for (name, value) in [
         ("COMPILE_FLAGS", "$<$<CONFIG:Debug>:-DMYDEBUG>"),
         ("COMPILE_OPTIONS", "$<$<CONFIG:Debug>:-Wall>"),
         ("COMPILE_DEFINITIONS", "$<$<CONFIG:Debug>:MYDEBUG>"),
-        ("INCLUDE_DIRECTORIES", "$<$<CONFIG:Debug>:/src/debug>"),
+        ("INCLUDE_DIRECTORIES", debug_include.as_str()),
         ("COMPILE_DEFINITIONS", "$<IF:$<CONFIG:Debug>,SAME,SAME>"),
     ] {
         let mut model = model(source, out);
@@ -435,7 +449,7 @@ fn rejects_per_configuration_source_properties() {
         model
             .dir_mut(DirId::ROOT)
             .source_props
-            .entry("/src/main.c".into())
+            .entry(main.as_str().into())
             .or_default()
             .set(name.into(), value.into());
         let result = resolved(&model, &host);
@@ -443,7 +457,7 @@ fn rejects_per_configuration_source_properties() {
         assert_eq!(
             error.to_string(),
             format!(
-                "CMake Error in CMakeLists.txt:\n  Xcode does not support per-config per-source {name}:\n\n    {value}\n\n  specified for source:\n\n    /src/main.c\n\n\n"
+                "CMake Error in CMakeLists.txt:\n  Xcode does not support per-config per-source {name}:\n\n    {value}\n\n  specified for source:\n\n    {main}\n\n\n"
             )
         );
     }

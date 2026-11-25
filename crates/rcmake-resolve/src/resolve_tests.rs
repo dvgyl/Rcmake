@@ -18,24 +18,24 @@ use crate::{cxx_modules::STD_MODULE_TARGET, sources::absolute_path, usage::Usage
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
 fn project() -> ProjectModel {
+    project_with_roots("/src", "/out")
+}
+
+fn project_with_roots(source: &str, build: &str) -> ProjectModel {
     let mut model = ProjectModel::default();
-    model.set_root_dirs("/src".into(), "/out".into());
+    model.set_root_dirs(source.into(), build.into());
+    let configure_log = format!("{build}/CMakeFiles/CMakeConfigureLog.yaml");
     for (name, value) in [
         ("CMAKE_SYSTEM_NAME", "Darwin"),
         ("CMAKE_C_COMPILER", "/toolchain/cc"),
         ("CMAKE_C_COMPILER_ID", "AppleClang"),
         ("CMAKE_CXX_COMPILER", "/toolchain/c++"),
-        (
-            "CMAKE_CONFIGURE_LOG",
-            "/out/CMakeFiles/CMakeConfigureLog.yaml",
-        ),
+        ("CMAKE_CONFIGURE_LOG", configure_log.as_str()),
     ] {
         model.global.props.set(name.into(), value.into());
     }
-    model
-        .dir_mut(DirId::ROOT)
-        .listfiles
-        .push("/src/CMakeLists.txt".into());
+    let listfile = format!("{source}/CMakeLists.txt");
+    model.dir_mut(DirId::ROOT).listfiles.push(listfile.into());
     model
 }
 
@@ -199,7 +199,17 @@ fn darwin_framework_items_keep_linker_argument_boundaries() -> TestResult {
 
 #[test]
 fn resolves_build_install_and_export_for_each_config() -> TestResult {
-    let mut model = project();
+    #[cfg(windows)]
+    let (source_root, build_root, drive) = ("C:/src", "C:/build", "C:");
+    #[cfg(not(windows))]
+    let (source_root, build_root, drive) = ("/src", "/out", "");
+    let include_dir = format!("{source_root}/include");
+    let library_dir = format!("{build_root}/lib path");
+    let framework_dir = format!("{drive}/SDK/Frameworks");
+    let sdk_dir = format!("{drive}/opt/sdk");
+    let archive_path = BString::from(format!("{build_root}/libmath.a"));
+    let configure_log = BString::from(format!("{build_root}/CMakeFiles/CMakeConfigureLog.yaml"));
+    let mut model = project_with_roots(source_root, build_root);
     model.cache.insert(
         "CMAKE_BUILD_TYPE".into(),
         CacheEntry {
@@ -219,11 +229,11 @@ fn resolves_build_install_and_export_for_each_config() -> TestResult {
     math.props.set("PREFIX".into(), "".into());
     math.props.set("FOLDER".into(), "Libraries".into());
     math.props.set("EXPORT_NAME".into(), "math".into());
-    let build_include = "$<BUILD_INTERFACE:/src/include>";
+    let build_include = format!("$<BUILD_INTERFACE:{include_dir}>");
     math.usage
-        .push(UsageField::IncludeDirectories, entry(build_include));
+        .push(UsageField::IncludeDirectories, entry(&build_include));
     math.usage.push(UsageField::InterfaceIncludeDirectories, entry(
-        "$<BUILD_INTERFACE:/src/include>;$<INSTALL_INTERFACE:include>;$<INSTALL_INTERFACE:$<INSTALL_PREFIX>/extra>",
+        &format!("{build_include};$<INSTALL_INTERFACE:include>;$<INSTALL_INTERFACE:$<INSTALL_PREFIX>/extra>"),
     ));
     math.usage.push(
         UsageField::CompileDefinitions,
@@ -240,14 +250,14 @@ fn resolves_build_install_and_export_for_each_config() -> TestResult {
     app.usage.link_libraries = Some(vec![
         link_item("local::math"),
         link_item("m"),
-        link_item("/SDK/Frameworks/Foo.framework"),
+        link_item(&format!("{framework_dir}/Foo.framework")),
     ]);
     app.usage.push(
         UsageField::LinkOptions,
         entry("$<$<LINK_LANG_AND_ID:C,AppleClang>:-v>"),
     );
     app.usage
-        .push(UsageField::LinkDirectories, entry("/out/lib path"));
+        .push(UsageField::LinkDirectories, entry(&library_dir));
     let app_id = model.add_target(app)?;
     for (id, destination) in [(math_id, "lib"), (app_id, "bin")] {
         model.add_install(InstallRule {
@@ -262,7 +272,7 @@ fn resolves_build_install_and_export_for_each_config() -> TestResult {
                 includes_destination: if id == math_id {
                     [
                         "./sdk",
-                        "/opt/sdk",
+                        sdk_dir.as_str(),
                         "$<INSTALL_PREFIX>/extra2",
                         "$<1:more;paths>",
                     ]
@@ -312,7 +322,7 @@ fn resolves_build_install_and_export_for_each_config() -> TestResult {
     }
     let host = PureHost::default();
     for source in ["math.c", "trace.c", "math.h", "main.c"] {
-        host.seed_file(&Path::new("/src").join(source), b"")?;
+        host.seed_file(&Path::new(source_root).join(source), b"")?;
     }
 
     let debug = ConfigId("Debug".into());
@@ -327,7 +337,7 @@ fn resolves_build_install_and_export_for_each_config() -> TestResult {
         math.metadata.backtrace.top().map(|frame| frame.line),
         Some(3)
     );
-    assert_eq!(math.artifacts.file, Some("/out/libmath.a".into()));
+    assert_eq!(math.artifacts.file.as_ref(), Some(&archive_path));
     let [math_group] = math.compile_groups.as_slice() else {
         return Err("Expected one compile group for the library.".into());
     };
@@ -338,7 +348,11 @@ fn resolves_build_install_and_export_for_each_config() -> TestResult {
         [entry("MATH_PRIVATE"), entry("MATH_TRACE")]
     );
     assert_eq!(math_group.flags, [entry("-Wall")]);
-    assert_eq!(math.compile_units[1].source, entry("/src/trace.c"));
+    let trace = math
+        .compile_units
+        .get(1)
+        .ok_or("Expected the trace compile unit.")?;
+    assert_eq!(trace.source, entry(&format!("{source_root}/trace.c")));
     assert_eq!(
         math.link.as_ref().map(|link| link.kind),
         Some(LinkKind::StaticArchive)
@@ -350,7 +364,7 @@ fn resolves_build_install_and_export_for_each_config() -> TestResult {
     assert_eq!(
         app_group.includes,
         [InterfaceInclude {
-            path: entry("/src/include"),
+            path: entry(&include_dir),
             system: false
         }]
     );
@@ -366,9 +380,15 @@ fn resolves_build_install_and_export_for_each_config() -> TestResult {
             .collect::<Vec<_>>(),
         [
             (b"-v".as_slice(), LinkFragmentRole::Flags),
-            (b"'-L/out/lib path'", LinkFragmentRole::LibraryPath),
-            (b"-F/SDK/Frameworks", LinkFragmentRole::FrameworkPath),
-            (b"/out/libmath.a", LinkFragmentRole::Libraries),
+            (
+                format!("'-L{library_dir}'").as_bytes(),
+                LinkFragmentRole::LibraryPath
+            ),
+            (
+                format!("-F{framework_dir}").as_bytes(),
+                LinkFragmentRole::FrameworkPath
+            ),
+            (archive_path.as_slice(), LinkFragmentRole::Libraries),
             (b"-lm", LinkFragmentRole::Libraries),
             (b"-framework Foo", LinkFragmentRole::Libraries),
         ],
@@ -378,25 +398,30 @@ fn resolves_build_install_and_export_for_each_config() -> TestResult {
         return Err("Expected one build graph.".into());
     };
     assert_eq!(graph.config, debug);
-    assert_eq!(graph.targets[1].depends, [0]);
+    let [math_target, app_target, ..] = graph.targets.as_slice() else {
+        return Err("Expected the library and executable build targets.".into());
+    };
+    assert_eq!(app_target.depends, [0]);
+    let include_arg = BString::from(format!("-I{include_dir}"));
     assert!(matches!(
-        &graph.steps[graph.targets[0].steps[0]],
-        BuildStep::Compile { invocation, .. }
+        math_target.steps.first().and_then(|&step| graph.steps.get(step)),
+        Some(BuildStep::Compile { invocation, .. })
             if invocation.argv.contains(&"-DMATH_TRACE".into())
-                && invocation.argv.contains(&"-I/src/include".into())
+                && invocation.argv.contains(&include_arg)
     ));
+    let library_arg = BString::from(format!("-L{library_dir}"));
     assert!(matches!(
-        &graph.steps[graph.targets[1].steps[1]],
+        link_build_step(graph, "app")?,
         BuildStep::Link { inputs, invocations, .. }
-            if inputs.contains(&"/out/libmath.a".into())
-                && invocations.iter().any(|invocation| invocation.argv.contains(&"-L/out/lib path".into()))
+            if inputs.contains(&archive_path)
+                && invocations.iter().any(|invocation| invocation.argv.contains(&library_arg))
     ));
     let [archive, executable, export] = result.install.actions.as_slice() else {
         return Err("Expected three install actions.".into());
     };
     assert!(
         matches!(&archive.kind, InstallActionKind::Files { file_type, files, .. }
-        if file_type == "STATIC_LIBRARY" && files == &[BString::from("/out/libmath.a")])
+        if file_type == "STATIC_LIBRARY" && files == std::slice::from_ref(&archive_path))
     );
     assert_eq!(archive.destination, "lib");
     assert_eq!(executable.destination, "bin");
@@ -411,60 +436,104 @@ fn resolves_build_install_and_export_for_each_config() -> TestResult {
     assert!(install.install);
     assert_eq!(install.file, "sdk.cmake");
     assert_eq!(install.namespace, "sdk::");
-    assert_eq!(install.targets[0].name, "math");
-    assert_eq!(
-        install.targets[0].properties[includes],
-        concat!(
-            "${_IMPORT_PREFIX}/include;${_IMPORT_PREFIX}/extra;",
-            "${_IMPORT_PREFIX}/./sdk;/opt/sdk;${_IMPORT_PREFIX}/extra2;",
-            "${_IMPORT_PREFIX}/more;${_IMPORT_PREFIX}/paths"
-        )
+    let [installed_math, installed_app, ..] = install.targets.as_slice() else {
+        return Err("Expected two installed targets.".into());
+    };
+    assert_eq!(installed_math.name, "math");
+    let installed_includes = format!(
+        "${{_IMPORT_PREFIX}}/include;${{_IMPORT_PREFIX}}/extra;\
+         ${{_IMPORT_PREFIX}}/./sdk;{sdk_dir};${{_IMPORT_PREFIX}}/extra2;\
+         ${{_IMPORT_PREFIX}}/more;${{_IMPORT_PREFIX}}/paths"
     );
     assert_eq!(
-        install.targets[1].properties[includes],
-        "${_IMPORT_PREFIX}/app/include"
+        installed_math
+            .properties
+            .get(includes)
+            .map(|value| value.as_slice()),
+        Some(installed_includes.as_bytes())
     );
     assert_eq!(
-        install.targets[0].config_properties[&debug.0][location],
-        "lib/libmath.a"
+        installed_app
+            .properties
+            .get(includes)
+            .map(|value| value.as_slice()),
+        Some(b"${_IMPORT_PREFIX}/app/include".as_slice())
     );
     assert_eq!(
-        install.targets[1].config_properties[&debug.0][location],
-        "bin/app"
+        installed_math
+            .config_properties
+            .get(&debug.0)
+            .and_then(|p| p.get(location))
+            .map(|value| value.as_slice()),
+        Some(b"lib/libmath.a".as_slice())
+    );
+    assert_eq!(
+        installed_app
+            .config_properties
+            .get(&debug.0)
+            .and_then(|p| p.get(location))
+            .map(|value| value.as_slice()),
+        Some(b"bin/app".as_slice())
     );
     assert!(!build.install);
-    assert_eq!(build.file, "/out/SdkBuild.cmake");
-    assert_eq!(build.targets[0].properties[includes], "/src/include");
     assert_eq!(
-        build.targets[0].config_properties[&debug.0][location],
-        "/out/libmath.a"
+        build.file.as_slice(),
+        format!("{build_root}/SdkBuild.cmake").as_bytes()
+    );
+    let built_math = build
+        .targets
+        .first()
+        .ok_or("Expected the exported library.")?;
+    assert_eq!(
+        built_math
+            .properties
+            .get(includes)
+            .map(|value| value.as_slice()),
+        Some(include_dir.as_bytes())
+    );
+    assert_eq!(
+        built_math
+            .config_properties
+            .get(&debug.0)
+            .and_then(|p| p.get(location)),
+        Some(&archive_path)
     );
 
     assert_eq!(
         result.metadata.listfiles,
-        [BString::from("/src/CMakeLists.txt")]
+        [BString::from(format!("{source_root}/CMakeLists.txt"))]
     );
-    assert_eq!(
-        result.metadata.toolchains[b"C".as_slice()].compiler_path,
-        "/toolchain/cc"
-    );
-    assert_eq!(
-        result.metadata.configure_log,
-        Some("/out/CMakeFiles/CMakeConfigureLog.yaml".into())
-    );
+    let toolchain = result
+        .metadata
+        .toolchains
+        .get(b"C".as_slice())
+        .ok_or("Expected a C toolchain.")?;
+    assert_eq!(toolchain.compiler_path, "/toolchain/cc");
+    assert_eq!(result.metadata.configure_log, Some(configure_log));
 
     let release = ConfigId("Release".into());
     let multi = resolve(&model, &host, &[debug, release.clone()])?;
     assert_eq!(multi.graphs.len(), 2);
-    let math_release = &multi.targets[2];
+    let math_release = multi.targets.get(2).ok_or("Expected a Release library.")?;
     assert_eq!(math_release.config, release);
     assert_eq!(math_release.compile_units.len(), 1);
-    assert_eq!(
-        math_release.compile_groups[0].defines,
-        [entry("MATH_PRIVATE")]
-    );
-    assert_eq!(multi.exports[0].targets[0].config_properties.len(), 2);
-    assert_eq!(multi.install.actions[1].configurations, [release.0]);
+    let release_group = math_release
+        .compile_groups
+        .first()
+        .ok_or("Expected a Release compile group.")?;
+    assert_eq!(release_group.defines, [entry("MATH_PRIVATE")]);
+    let multi_math = multi
+        .exports
+        .first()
+        .and_then(|export| export.targets.first())
+        .ok_or("Expected a library export for both configurations.")?;
+    assert_eq!(multi_math.config_properties.len(), 2);
+    let multi_executable = multi
+        .install
+        .actions
+        .get(1)
+        .ok_or("Expected an executable install action.")?;
+    assert_eq!(multi_executable.configurations, [release.0]);
     Ok(())
 }
 
