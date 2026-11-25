@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 from dataclasses import dataclass
 import json
 import os
@@ -17,7 +18,7 @@ import tempfile
 from normalize import compare
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "measure"))
-from ninja_canon import Normalizer, PROGRESS
+from ninja_canon import Normalizer, normalized_commands
 from oracle_prop_test import clean_environment, executable, run_command, write_json
 from path_swap_eval import TOOLS, succeeded, support_path, verify_path
 
@@ -139,15 +140,12 @@ def tool_paths(directory: Path) -> dict[str, set[str]]:
     }
 
 
-def dry_run_commands(stage: dict, project: Path, bin_dir: Path) -> set[str]:
-    """Read the command set from verbose Ninja dry-run output."""
+def dry_run_commands(stage: dict, project: Path, bin_dir: Path) -> Counter[str]:
+    """Count commands from verbose Ninja dry-run output."""
     normalizer = Normalizer(project, replacements={
         bin_dir / name: f"<{name}>" for name in TOOLS
     })
-    return {
-        normalizer.text(command.removesuffix("\n"))
-        for command in PROGRESS.split(stage["stdout"])[1:]
-    }
+    return Counter(normalized_commands(stage["stdout"], normalizer))
 
 
 def compare_runs(source: Path, stages: list[Stage], binary: Path, oracle: Path,
@@ -178,7 +176,8 @@ def compare_runs(source: Path, stages: list[Stage], binary: Path, oracle: Path,
                 left = dry_run_commands(first, project, oracle.parent)
                 right = dry_run_commands(second, project, shim)
                 dry_runs[stage.name] = {
-                    "oracle_only": sorted(left - right), "rcmake_only": sorted(right - left),
+                    "oracle_only": sorted((left - right).elements()),
+                    "rcmake_only": sorted((right - left).elements()),
                 }
     oracles_ok = "path_error" not in before and all(
         stage["status"] == "pass" for stage in before["stages"]

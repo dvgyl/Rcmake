@@ -233,9 +233,15 @@ def canonicalize(normalize: Normalizer, manifest: str = "build.ninja") -> list[d
     return sorted(rows, key=lambda row: (row["outputs"], row["implicit_outputs"], row_key(row)))
 
 
+def normalized_commands(stdout: str, normalize: Normalizer) -> list[str]:
+    """Return sorted Ninja commands with every occurrence retained."""
+    return sorted(normalize.text(command.removesuffix("\n"))
+                  for command in PROGRESS.split(stdout)[1:])
+
+
 def dry_run(normalize: Normalizer, targets: Iterable[str] = (), timeout: int = 120,
             manifest: str = "build.ninja") -> list[str]:
-    """Return the normalized command set from a verbose Ninja dry run."""
+    """Return the normalized commands from a verbose Ninja dry run."""
     result = subprocess.run(
         ["ninja", "-f", manifest, "-n", "-v", "--", *targets],
         cwd=normalize.build, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -244,8 +250,7 @@ def dry_run(normalize: Normalizer, targets: Iterable[str] = (), timeout: int = 1
     )
     if result.returncode:
         raise ValueError(result.stderr.strip() or result.stdout.strip())
-    commands = PROGRESS.split(result.stdout)[1:]
-    return sorted({normalize.text(command.removesuffix("\n")) for command in commands})
+    return normalized_commands(result.stdout, normalize)
 
 
 def differences(left: list, right: list) -> Iterator[str]:
