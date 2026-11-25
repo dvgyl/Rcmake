@@ -127,6 +127,10 @@ pub struct UsageResolver<'a> {
     has_injections: bool,
     compatible: compatible::Properties,
     pub(crate) provenance: Option<provenance::Provenance>,
+    /// Number of active `$<TARGET_PROPERTY>` reads. CMake checks for relative
+    /// interface paths only when it collects the usage requirements of a
+    /// consumer, not when an expression reads the property.
+    property_reads: usize,
 }
 
 impl<'a> UsageResolver<'a> {
@@ -150,6 +154,7 @@ impl<'a> UsageResolver<'a> {
             cycle_count: 0,
             compatible: compatible::Properties::default(),
             provenance: None,
+            property_reads: 0,
             has_injections: model.targets().any(|(_, target)| {
                 target.props.get(link::DIRECT).is_some()
                     || target.props.get(link::EXCLUDE).is_some()
@@ -179,6 +184,7 @@ impl<'a> UsageResolver<'a> {
             cycle_count: 0,
             compatible: compatible::Properties::default(),
             provenance: None,
+            property_reads: 0,
             has_injections: self.has_injections,
         }
     }
@@ -320,6 +326,18 @@ impl<'a> UsageResolver<'a> {
         name: &[u8],
         ctx: &EvalContext,
     ) -> Result<UsageValue, ResolveError> {
+        self.collect_property_with(target, name, ctx, None)
+    }
+
+    /// Collect a usage property with an optional traversal in place of the
+    /// traversal that the property name selects.
+    pub(crate) fn collect_property_with(
+        &mut self,
+        target: TargetId,
+        name: &[u8],
+        ctx: &EvalContext,
+        traversal: Option<UsageTraversal>,
+    ) -> Result<UsageValue, ResolveError> {
         if self
             .active
             .last()
@@ -332,7 +350,10 @@ impl<'a> UsageResolver<'a> {
             self.cycle_count += 1;
             return Ok(UsageValue::default());
         }
-        let ctx = self.property_context(target, name, ctx)?;
+        let mut ctx = self.property_context(target, name, ctx)?;
+        if let Some(traversal) = traversal {
+            ctx.traversal = traversal;
+        }
         if matches!(name, b"LINK_LIBRARIES" | b"INTERFACE_LINK_LIBRARIES") {
             return self.link_property(target, name, &ctx);
         }
@@ -453,18 +474,19 @@ impl<'a> UsageResolver<'a> {
                 .as_ref()
                 .map(|value| Cow::Borrowed(value.0.as_slice())),
         };
-        if let Some(value) = self.memo.get(&key) {
+        let cached = self.property_reads == 0;
+        if cached && let Some(value) = self.memo.get(&key) {
             return Ok(Arc::clone(value));
         }
         key.head = ctx.head.and_then(|id| self.ids.get(id.0 as usize).copied());
-        if let Some(value) = self.memo.get(&key) {
+        if cached && let Some(value) = self.memo.get(&key) {
             return Ok(Arc::clone(value));
         }
         let cycle_count = self.cycle_count;
         let value = Arc::new(
             self.with_property(target, name, |this| this.walk_uncached(target, name, ctx))?,
         );
-        if self.cycle_count == cycle_count {
+        if cached && self.cycle_count == cycle_count {
             if !value.flags.head_sensitive {
                 key.head = None;
             }
@@ -644,7 +666,8 @@ impl<'a> UsageResolver<'a> {
             if matches!(
                 property,
                 b"INTERFACE_INCLUDE_DIRECTORIES" | b"INTERFACE_SOURCES"
-            ) && let Some(paths) = self.source_paths()
+            ) && self.property_reads == 0
+                && let Some(paths) = self.source_paths()
                 && let Some(path) = values.iter().find(|value| !Lexical::new(value).absolute())
             {
                 result.flags.head_sensitive = true;
@@ -672,6 +695,31 @@ impl<'a> UsageResolver<'a> {
                     );
                     return Err(ResolveError::Reported(body));
                 }
+            }
+            if property == b"INCLUDE_DIRECTORIES"
+                && self.property_reads == 0
+                && ctx.head.is_none_or(|head| head == handle(target))
+                && let Some(paths) = self.source_paths()
+                && let Some(path) = values.iter().find(|value| !Lexical::new(value).absolute())
+            {
+                let owner = self.target(target)?;
+                let body: BString = format!(
+                    "Found relative path while evaluating include directories of \"{}\":\n\n  \"{path}\"\n",
+                    owner.name
+                )
+                .into();
+                let file =
+                    Lexical::new(&self.model.dir(owner.dir).source_dir).append(b"CMakeLists.txt");
+                paths.emit(
+                    self.model,
+                    MessageKind::Error,
+                    Location::FileLine {
+                        file: file.as_slice().into(),
+                        line: 0,
+                    },
+                    body.clone(),
+                );
+                return Err(ResolveError::Reported(body));
             }
             result.entries.extend(
                 values

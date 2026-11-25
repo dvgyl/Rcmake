@@ -234,7 +234,9 @@ impl Evaluator<'_> {
         let [policy] = self.fixed(call)?;
         self.flags.head_sensitive = true;
         let Some(head) = call.ctx.head else {
-            return Err(call.error("$<TARGET_POLICY:prop> may only be used with binary targets."));
+            return Err(call.error(
+                "$<TARGET_POLICY:prop> may only be used with binary targets.  It may not be used with add_custom_command or add_custom_target.",
+            ));
         };
         if !TARGET_POLICIES.contains(&policy.as_slice()) {
             let mut message = String::from(

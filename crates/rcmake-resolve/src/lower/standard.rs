@@ -1,8 +1,10 @@
 //! Language standards and compile feature requirements.
 
 use rcmake_base::{BString, list, shell::quote, truth};
-use rcmake_diag::{PolicyId, PolicyStatus};
-use rcmake_model::{BT, ProjectModel, Target};
+use rcmake_diag::{
+    Diagnostic, Effect, Location, MessageKind, PolicyId, PolicyStatus, RenderOptions, render,
+};
+use rcmake_model::{BT, DirId, ProjectModel, Target};
 
 use super::shell::join_words;
 use super::{definition, target_property};
@@ -132,7 +134,7 @@ pub(super) fn standard_flag(
         .flatten()
 }
 
-/// Select the standard flag and report invalid CUDA settings.
+/// Select the standard flag and report invalid standard settings.
 pub(super) fn checked_standard_flag(
     model: &ProjectModel,
     target: &Target,
@@ -143,9 +145,42 @@ pub(super) fn checked_standard_flag(
     if language == b"CUDA" {
         return cuda_standard_flag(model, target, required, new_policy);
     }
+    validate_standard(model, target, language)?;
     Ok(other_standard_flag(
         model, target, language, required, new_policy,
     ))
+}
+
+/// Reject a `<LANG>_STANDARD` value that is not a standard level.
+fn validate_standard(
+    model: &ProjectModel,
+    target: &Target,
+    language: &[u8],
+) -> Result<(), ResolveError> {
+    let name = [language, b"_STANDARD"].concat();
+    let Some(value) = target_property(model, target, &name) else {
+        return Ok(());
+    };
+    if value.is_empty() || value.iter().all(u8::is_ascii_digit) {
+        return Ok(());
+    }
+    let diagnostic = Diagnostic {
+        annotations: None,
+        kind: MessageKind::Error,
+        effect: Effect::None,
+        category: None,
+        policy: None,
+        location: Location::Backtrace(target.backtrace.clone()),
+        body: format!("{} is set to invalid value '{value}'", BString::from(name)).into(),
+    };
+    let text = render(
+        &diagnostic,
+        &RenderOptions {
+            relative_base: Some(model.dir(DirId::ROOT).source_dir.clone()),
+            ..RenderOptions::default()
+        },
+    );
+    Err(ResolveError::Message(text))
 }
 
 fn other_standard_flag(

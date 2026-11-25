@@ -4,7 +4,7 @@ use rcmake_diag::{Backtrace, Location, MessageKind};
 use rcmake_genex::EvalContext;
 use rcmake_model::{
     BT, CustomCommand, CustomCommandKind, DirId, FileSet, FileSetId, FileSetKind, ProjectModel,
-    Target, TargetId, TargetKind, UsageField,
+    PropertyMap, Target, TargetId, TargetKind, UsageField,
 };
 
 use crate::{
@@ -216,7 +216,7 @@ pub(crate) fn resolve_target<'a>(
                                 MessageKind::Log,
                                 Location::Backtrace(feature.backtrace.clone()),
                                 format!(
-                                    "Used compile features for target {}:\n\n * {}",
+                                    "Used compile features for target {}:\n\n * {}\n",
                                     target.name, feature.value
                                 )
                                 .into(),
@@ -538,6 +538,7 @@ pub(crate) fn instantiate_rules(
     }
     let mut prepared = model.clone();
     let diagnostics = SourcePaths::new(host);
+    let mut instances = 0_usize;
     for (id, target, set, name, dir, rule) in selected {
         let directory = model.dir(dir);
         let mut replacements = IndexMap::from_iter([
@@ -671,7 +672,28 @@ pub(crate) fn instantiate_rules(
                     replacements.insert(key.into(), value.into());
                 }
             }
-            let expand = |value: &[u8]| expand_rule_patterns(value, &replacements, false);
+            // `$<RULE_PROPERTY:<RULE>,prop>` reads the properties of this
+            // instance of the rule, with its patterns expanded.
+            instances = instances.saturating_add(1);
+            let instance: BString = format!("{name}_{instances}").into();
+            for value in replacements.values_mut() {
+                *value = bind_rule_instance(value, &instance);
+            }
+            let expand = |value: &[u8]| {
+                expand_rule_patterns(&bind_rule_instance(value, &instance), &replacements, false)
+            };
+            let mut instance_props = PropertyMap::default();
+            for key in rule.names() {
+                if let Some(value) = rule.get(&key) {
+                    let value = if key == b"NAME" {
+                        value.clone()
+                    } else {
+                        expand(value)
+                    };
+                    instance_props.set(key, value);
+                }
+            }
+            prepared.store_custom_rule(None, instance.clone(), instance_props);
             let words = |key: &[u8]| {
                 rule.get(key)
                     .map_or_else(Vec::new, |value| list::split(value, list::Empty::Drop))
@@ -750,6 +772,17 @@ pub(crate) fn instantiate_rules(
     Ok(Some(prepared))
 }
 
+/// Replace the `<RULE>` pattern in a `$<RULE_PROPERTY:<RULE>,prop>`
+/// expression with the name of a rule instance.
+fn bind_rule_instance(value: &[u8], instance: &[u8]) -> BString {
+    const PATTERN: &[u8] = b"$<RULE_PROPERTY:<RULE>,";
+    if value.find(PATTERN).is_none() {
+        return value.into();
+    }
+    let replacement = [b"$<RULE_PROPERTY:".as_slice(), instance, b","].concat();
+    value.replace(PATTERN, &replacement).into()
+}
+
 fn expand_rule_patterns(
     value: &[u8],
     patterns: &IndexMap<BString, BString>,
@@ -798,4 +831,18 @@ fn expand_rule_patterns(
     }
     expanded.extend_from_slice(remaining);
     expanded
+}
+
+#[cfg(test)]
+mod tests {
+    use super::bind_rule_instance;
+
+    #[test]
+    fn rule_property_expressions_bind_to_the_rule_instance() {
+        assert_eq!(
+            bind_rule_instance(b"NAME=$<RULE_PROPERTY:<RULE>,NAME>;<RULE>", b"gen_3"),
+            "NAME=$<RULE_PROPERTY:gen_3,NAME>;<RULE>"
+        );
+        assert_eq!(bind_rule_instance(b"<RULE>.txt", b"gen_3"), "<RULE>.txt");
+    }
 }

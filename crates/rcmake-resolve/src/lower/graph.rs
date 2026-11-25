@@ -214,7 +214,10 @@ fn add_codegen_target(
     commands: &Commands<'_>,
     graph: &mut BuildGraph,
 ) -> Result<(), ResolveError> {
-    let mut reachable: IndexSet<_> = local
+    // Each entry is a target and the directory of the target that reached it.
+    // The codegen target of that directory also runs the reached commands,
+    // because a dependency can be in an excluded directory.
+    let mut reachable: IndexSet<(usize, DirId)> = local
         .iter()
         .enumerate()
         .filter_map(|(index, (target, _))| {
@@ -222,13 +225,13 @@ fn add_codegen_target(
                 .props
                 .get(b"EXCLUDE_FROM_ALL")
                 .is_some_and(|value| truth::is_on(value));
-            (!excluded).then_some(index)
+            (!excluded).then_some((index, target.dir))
         })
         .collect();
     let mut pending: Vec<_> = reachable.iter().rev().copied().collect();
     let mut roots = BTreeMap::<DirId, IndexSet<usize>>::new();
     let mut requirements = IndexMap::<usize, IndexSet<usize>>::new();
-    while let Some(index) = pending.pop() {
+    while let Some((index, origin)) = pending.pop() {
         let Some(((target, _), owner)) = local.get(index).zip(graph.targets.get(index)) else {
             continue;
         };
@@ -237,13 +240,14 @@ fn add_codegen_target(
             indices.get(&id).copied()
         });
         for dependency in explicit.clone() {
-            if reachable.insert(dependency) {
-                pending.push(dependency);
+            if reachable.insert((dependency, origin)) {
+                pending.push((dependency, origin));
             }
         }
         for &step in &owner.steps {
             if commands.codegen.contains(&step) {
                 roots.entry(target.dir).or_default().insert(step);
+                roots.entry(origin).or_default().insert(step);
                 let owner_deps: IndexSet<_> = explicit
                     .clone()
                     .filter(|&dep| {

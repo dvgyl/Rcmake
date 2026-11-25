@@ -2,7 +2,7 @@ use std::path::Path;
 
 use rcmake_base::BString;
 use rcmake_gen_common::GenError;
-use rcmake_resolve::{BuildStep, GenerationResult};
+use rcmake_resolve::{BuildStep, CustomStep, GenerationResult};
 
 use super::{Step, build_path};
 
@@ -32,6 +32,7 @@ pub(super) fn plan_step<'a>(
             always: false,
             progress: None,
             jobserver_aware: result.metadata.jobserver_steps.contains(&step_index),
+            default_comment: None,
         },
         BuildStep::Link {
             step,
@@ -51,6 +52,7 @@ pub(super) fn plan_step<'a>(
             always: false,
             progress: None,
             jobserver_aware: result.metadata.jobserver_steps.contains(&step_index),
+            default_comment: None,
         },
         BuildStep::Custom(custom) => Step {
             action,
@@ -69,6 +71,7 @@ pub(super) fn plan_step<'a>(
             always: custom.outputs.is_empty() || custom.symbolic,
             progress: None,
             jobserver_aware: result.metadata.jobserver_steps.contains(&step_index),
+            default_comment: default_comment(custom, build_dir),
         },
         BuildStep::DeviceLink { output, inputs, .. } => Step {
             action,
@@ -79,6 +82,7 @@ pub(super) fn plan_step<'a>(
             always: false,
             progress: None,
             jobserver_aware: false,
+            default_comment: None,
         },
         BuildStep::Scan { .. } | BuildStep::Collate { .. } => {
             return Err(GenError::Unimplemented(
@@ -87,4 +91,20 @@ pub(super) fn plan_step<'a>(
         }
     };
     Ok(step)
+}
+
+/// Build the comment of a custom command that has outputs and no `COMMENT`,
+/// as CMake does: `Generating <output>, <output>`.
+pub(super) fn default_comment(custom: &CustomStep, build_dir: &Path) -> Option<BString> {
+    if custom.comment.is_some() || custom.symbolic || custom.outputs.is_empty() {
+        return None;
+    }
+    let mut comment = BString::from("Generating ");
+    for (index, output) in custom.outputs.iter().enumerate() {
+        if index > 0 {
+            comment.extend_from_slice(b", ");
+        }
+        comment.extend_from_slice(&build_path(output, build_dir));
+    }
+    Some(comment)
 }

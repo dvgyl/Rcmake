@@ -32,6 +32,7 @@ impl PrepTargets {
             collect_install(graph, result, model, &mut targets);
             if let Some(model) = model {
                 collect_install_inputs(graph, model, host, &mut targets)?;
+                collect_file_set_installs(graph, model, &mut targets);
             }
         }
         if !skip(model, b"CMAKE_SKIP_TEST_PREP_TARGETS") {
@@ -208,6 +209,174 @@ fn collect_install_inputs(
         }
     }
     Ok(())
+}
+
+/// Return each component that an install rule names after `COMPONENT` or
+/// `NAMELINK_COMPONENT`, including the components of artifact groups.
+fn rule_components(model: &ProjectModel, index: usize) -> Vec<BString> {
+    rule_args(model, index)
+        .windows(2)
+        .filter(|pair| {
+            matches!(
+                pair.first().map(|key| key.as_slice()),
+                Some(b"COMPONENT" | b"NAMELINK_COMPONENT")
+            )
+        })
+        .filter_map(|pair| pair.get(1).map(|value| (*value).clone()))
+        .collect()
+}
+
+/// Return the recorded arguments of an install rule.
+fn rule_args(model: &ProjectModel, index: usize) -> Vec<&BString> {
+    let prefix = format!("_RCMAKE_INSTALL_{index}_ARG");
+    (0..)
+        .map_while(|i| model.global.props.get(format!("{prefix}{i}").as_bytes()))
+        .collect()
+}
+
+/// The targets that an install step scans for runtime dependencies.
+enum Scanned {
+    /// The build dependencies of the targets of the rule.
+    Targets(BTreeSet<BString>),
+    /// The targets of a named runtime dependency set.
+    Set(BString),
+}
+
+/// Make the components that install runtime dependencies build the targets
+/// that the install step scans.
+fn collect_runtime_dependency_inputs(
+    graph: &Graph<'_>,
+    model: &ProjectModel,
+    targets: &mut Targets,
+) {
+    let mut sets = BTreeMap::<BString, BTreeSet<BString>>::new();
+    let mut requests = Vec::new();
+    for (index, rule) in model.installs.iter().enumerate() {
+        let args = rule_args(model, index);
+        let named_set = |keyword: &[u8]| {
+            args.windows(2)
+                .find(|pair| pair.first().is_some_and(|key| key.as_slice() == keyword))
+                .and_then(|pair| pair.get(1).map(|value| (*value).clone()))
+        };
+        let components = || {
+            let mut components = rule_components(model, index);
+            if components.is_empty() {
+                components.push(
+                    model
+                        .definition(rule.dir, b"CMAKE_INSTALL_DEFAULT_COMPONENT_NAME")
+                        .filter(|value| !value.is_empty())
+                        .cloned()
+                        .unwrap_or_else(|| "Unspecified".into()),
+                );
+            }
+            components
+        };
+        if let InstallKind::Targets {
+            targets: installed, ..
+        } = &rule.kind
+        {
+            let deps: BTreeSet<_> = installed
+                .iter()
+                .filter_map(|id| model.target(*id))
+                .filter_map(|target| graph.target_dependency(&target.name))
+                .collect();
+            if args
+                .iter()
+                .any(|arg| arg.as_slice() == b"RUNTIME_DEPENDENCIES")
+            {
+                requests.push((components(), Scanned::Targets(deps.clone())));
+            }
+            if let Some(set) = named_set(b"RUNTIME_DEPENDENCY_SET") {
+                sets.entry(set).or_default().extend(deps);
+            }
+        } else if args
+            .first()
+            .is_some_and(|arg| arg.as_slice() == b"RUNTIME_DEPENDENCY_SET")
+            && let Some(set) = args.get(1)
+        {
+            requests.push((components(), Scanned::Set((*set).clone())));
+        }
+    }
+    // A set can receive targets from rules after the rule that installs it.
+    for (components, request) in requests {
+        let deps = match request {
+            Scanned::Set(set) => sets.get(&set).cloned().unwrap_or_default(),
+            Scanned::Targets(deps) => deps,
+        };
+        for component in components {
+            if let Some(inputs) = add_component(graph, targets, &component) {
+                inputs.extend(deps.iter().cloned());
+            }
+        }
+    }
+}
+
+/// Add the components and generated inputs of installed file sets. The
+/// install script installs file sets outside of the install manifest.
+fn collect_file_set_installs(graph: &Graph<'_>, model: &ProjectModel, targets: &mut Targets) {
+    collect_runtime_dependency_inputs(graph, model, targets);
+    let mut usage = UsageResolver::new(model);
+    let all = BString::from("install_prep/all");
+    for (index, rule) in model.installs.iter().enumerate() {
+        for component in rule_components(model, index) {
+            add_component(graph, targets, &component);
+        }
+        let InstallKind::Targets {
+            targets: installed, ..
+        } = &rule.kind
+        else {
+            continue;
+        };
+        for target in installed.iter().filter_map(|id| model.target(*id)) {
+            for set in target.file_sets.iter().filter_map(|id| model.file_set(*id)) {
+                let Some(options) =
+                    rcmake_resolve::file_sets::options_for_set(model, index, &set.name)
+                else {
+                    continue;
+                };
+                if !options.configurations.is_empty()
+                    && !options
+                        .configurations
+                        .iter()
+                        .any(|config| graph.input.config.matches(config))
+                {
+                    continue;
+                }
+                let Ok(files) = rcmake_resolve::file_sets::set_files(
+                    model,
+                    &mut usage,
+                    target,
+                    set,
+                    &graph.input.config,
+                ) else {
+                    continue;
+                };
+                let deps: BTreeSet<_> = files
+                    .values()
+                    .flatten()
+                    .filter_map(|(file, _)| graph.file_dependency(file))
+                    .collect();
+                let component = options
+                    .component
+                    .as_ref()
+                    .or_else(|| {
+                        model
+                            .definition(rule.dir, b"CMAKE_INSTALL_DEFAULT_COMPONENT_NAME")
+                            .filter(|value| !value.is_empty())
+                    })
+                    .map_or(b"Unspecified".as_slice(), |value| value.as_slice());
+                if !options.exclude_from_all && available(graph, &all) {
+                    targets
+                        .entry(all.clone())
+                        .or_default()
+                        .extend(deps.iter().cloned());
+                }
+                if let Some(inputs) = add_component(graph, targets, component) {
+                    inputs.extend(deps);
+                }
+            }
+        }
+    }
 }
 
 fn install_dependency(
@@ -397,4 +566,43 @@ fn test_dependency(
         let source = Lexical::new(&directory.source_dir).append(input);
         Some(graph.node(&source))
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use rcmake_model::ProjectModel;
+
+    use super::rule_components;
+
+    #[test]
+    fn rule_components_include_artifact_group_components() {
+        let mut model = ProjectModel::default();
+        for (index, value) in [
+            "TARGETS",
+            "lib",
+            "ARCHIVE",
+            "DESTINATION",
+            "lib",
+            "COMPONENT",
+            "Archive",
+            "FILE_SET",
+            "HEADERS",
+            "COMPONENT",
+            "Headers",
+            "LIBRARY",
+            "NAMELINK_COMPONENT",
+            "Development",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            model
+                .global
+                .props
+                .set(format!("_RCMAKE_INSTALL_0_ARG{index}").into(), value.into());
+        }
+        let components = rule_components(&model, 0);
+        assert_eq!(components, ["Archive", "Headers", "Development"]);
+        assert!(rule_components(&model, 1).is_empty());
+    }
 }

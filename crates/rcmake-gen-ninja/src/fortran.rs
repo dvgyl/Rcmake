@@ -386,12 +386,8 @@ mod tests {
         let text = String::from_utf8_lossy(&ninja.0);
         assert!(text.contains("build obj/Fortran.dd | obj/FortranModules.json: Fortran_DYNDEP obj/a$ $$.ddi | obj/FortranDependInfo.json lib/FortranModules.json"));
         assert!(text.contains("cmake_ninja_dyndep --tdi=obj/FortranDependInfo.json --lang=Fortran --dd=obj/Fortran.dd @obj/Fortran.dd.rsp"));
-        let quoted = if cfg!(windows) {
-            "  RSP_ARGS = \"obj/a $$.ddi\"\n"
-        } else {
-            "  RSP_ARGS = 'obj/a $$.ddi'\n"
-        };
-        assert!(text.contains(quoted), "{text}");
+        // The graph targets a POSIX system on every host.
+        assert!(text.contains("  RSP_ARGS = 'obj/a $$.ddi'\n"), "{text}");
         assert!(RULES.contains("restat = 1"));
         Ok(())
     }

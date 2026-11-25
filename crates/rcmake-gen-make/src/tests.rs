@@ -141,3 +141,47 @@ fn rejects_invalid_dependency_before_writing_files() {
     assert!(generate_unix_makefiles(&result, &host, root).is_err());
     assert!(host.metadata(&root.join("Makefile"), Follow::Yes).is_err());
 }
+
+#[test]
+fn custom_commands_without_a_comment_report_their_outputs() {
+    let build = if cfg!(windows) { "C:/build" } else { "/build" };
+    let step = CustomStep {
+        outputs: vec![
+            format!("{build}/out/a.h").into(),
+            format!("{build}/b.h").into(),
+        ],
+        ..CustomStep::default()
+    };
+    assert_eq!(
+        plan_step::default_comment(&step, Path::new(build)),
+        Some("Generating out/a.h, b.h".into())
+    );
+    let commented = CustomStep {
+        comment: Some(String::new().into()),
+        ..step.clone()
+    };
+    assert_eq!(
+        plan_step::default_comment(&commented, Path::new(build)),
+        None
+    );
+    let symbolic = CustomStep {
+        symbolic: true,
+        ..step
+    };
+    assert_eq!(
+        plan_step::default_comment(&symbolic, Path::new(build)),
+        None
+    );
+}
+
+#[test]
+fn target_messages_follow_the_global_property_and_variable() {
+    assert!(target_messages(None));
+    let mut model = ProjectModel::default();
+    assert!(target_messages(Some(&model)));
+    model
+        .global
+        .props
+        .set("TARGET_MESSAGES".into(), "OFF".into());
+    assert!(!target_messages(Some(&model)));
+}

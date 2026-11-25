@@ -1,6 +1,7 @@
 mod app_bundle;
 mod excluded_export;
 mod languages;
+mod parity;
 
 use std::path::Path;
 use std::sync::Arc;

@@ -9,6 +9,8 @@ use crate::{
 
 #[path = "tests_artifacts.rs"]
 mod tests_artifacts;
+#[path = "tests_rules.rs"]
+mod tests_rules;
 
 const HEAD: TargetHandle = TargetHandle(1);
 const OTHER: TargetHandle = TargetHandle(2);

@@ -55,9 +55,20 @@ impl Evaluator<'_> {
         match call.name {
             b"IN_LIST" => {
                 let [value, input] = self.fixed(call)?;
-                return Ok(boolean(
-                    list::split(&input, list::Empty::Keep).contains(&value),
-                ));
+                // CMP0085: the OLD behavior never finds an empty item. The NEW
+                // behavior keeps empty items, so an empty list has one item.
+                if self.host.directory_policy(b"CMP0085", call.ctx) == Some(false) {
+                    return Ok(boolean(
+                        !value.is_empty()
+                            && list::split(&input, list::Empty::Keep).contains(&value),
+                    ));
+                }
+                let found = if input.is_empty() {
+                    value.is_empty()
+                } else {
+                    list::split(&input, list::Empty::Keep).contains(&value)
+                };
+                return Ok(boolean(found));
             }
             b"JOIN" => {
                 let [input, glue] = self.fixed(call)?;
@@ -216,7 +227,12 @@ impl Evaluator<'_> {
                 "sub-command FILTER does not recognize operator \"{}\". It must be either INCLUDE or EXCLUDE.",
                 BString::from(mode),
             ))),
-            _ => return Err(call.error("The filter mode must be INCLUDE or EXCLUDE.")),
+            _ => {
+                return Err(call.error(format!(
+                    "$<{}:...> second parameter must be either INCLUDE or EXCLUDE",
+                    BString::from(call.name)
+                )));
+            }
         };
         let regex = if body.is_none() {
             Some(if call.name == b"LIST" {

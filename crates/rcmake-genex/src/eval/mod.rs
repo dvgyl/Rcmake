@@ -10,6 +10,7 @@ mod lists;
 mod operations;
 mod paths;
 mod properties;
+mod rules;
 mod strings;
 mod targets;
 
@@ -85,6 +86,7 @@ struct Evaluator<'a> {
     bindings: Vec<Vec<BString>>,
     in_target_expression: bool,
     emitted_link_feature: bool,
+    active_rules: Vec<(BString, BString)>,
 }
 
 thread_local! {
@@ -158,6 +160,7 @@ impl<'a> Evaluator<'a> {
             bindings: Vec::new(),
             in_target_expression: false,
             emitted_link_feature: false,
+            active_rules: Vec::new(),
         }
     }
 
@@ -325,6 +328,7 @@ impl<'a> Evaluator<'a> {
             b"LINK_LIBRARY" | b"LINK_GROUP" => self.link_feature(call),
             _ if context::compiler_operator(&name) => self.compiler(call),
             b"SOURCE_PROPERTY" => self.source_property(call),
+            b"RULE_PROPERTY" => self.rule_property(call),
             b"SOURCE_EXISTS"
             | b"FILE_SET_EXISTS"
             | b"FILE_SET_PROPERTY"

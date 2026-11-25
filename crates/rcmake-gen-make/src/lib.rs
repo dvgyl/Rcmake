@@ -8,6 +8,7 @@ mod build;
     reason = "The language activation wave uses this emitter or planner"
 )]
 mod cuda;
+mod directory_info;
 #[allow(
     dead_code,
     reason = "The language activation wave uses this emitter or planner"
@@ -112,7 +113,7 @@ fn generate_impl(
         graph,
         &targets,
         &prep,
-        report_progress,
+        report_progress && target_messages(model),
         &result.metadata.clean_files,
     )?;
     let languages = rcmake_resolve::progress::compile_languages(result, graph);
@@ -129,6 +130,9 @@ fn generate_impl(
     }
     write_makefile(host, &build_dir, MAKEFILE2, &dispatch)?;
     write_makefile(host, &build_dir, b"Makefile", &top)?;
+    if let Some(model) = model {
+        directory_info::write(host, model)?;
+    }
     if !result.metadata.listfiles.is_empty() {
         let stamp = build_dir.join(path::to_native(REGEN_STAMP));
         host.write(&stamp, b"", WriteMode::Truncate)
@@ -160,6 +164,8 @@ struct Step<'a> {
     always: bool,
     progress: Option<usize>,
     jobserver_aware: bool,
+    /// Comment of a custom command with outputs and no `COMMENT`.
+    default_comment: Option<BString>,
 }
 
 fn invalid_graph(message: impl Into<BString>) -> GenError {
@@ -430,6 +436,20 @@ fn makefile() -> Vec<u8> {
 SILENT = $(SILENT_$(VERBOSE))\nSILENT_ = @\n\
 MAKE_SILENT = $(MAKE_SILENT_$(VERBOSE))\nMAKE_SILENT_ = -s\n\n"
         .to_vec()
+}
+
+/// Return whether each target reports its completion. The `TARGET_MESSAGES`
+/// global property has priority over the `CMAKE_TARGET_MESSAGES` variable.
+fn target_messages(model: Option<&ProjectModel>) -> bool {
+    let Some(model) = model else {
+        return true;
+    };
+    model
+        .global
+        .props
+        .get(b"TARGET_MESSAGES")
+        .or_else(|| model.definition(DirId::ROOT, b"CMAKE_TARGET_MESSAGES"))
+        .is_none_or(|value| !rcmake_base::truth::is_off(value))
 }
 
 fn top_level(
@@ -728,6 +748,7 @@ fn write_step(
             custom
                 .comment
                 .as_ref()
+                .or(step.default_comment.as_ref())
                 .map_or_else(Vec::new, |comment| comment.to_vec()),
             custom.invocations.as_slice(),
         ),

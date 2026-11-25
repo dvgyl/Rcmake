@@ -542,6 +542,11 @@ impl<'a> SourcePaths<'a> {
                 body.extend_from_slice(extension.as_bytes());
             }
         }
+        if source.value == "FILE_SET" {
+            body.extend_from_slice(
+                b"\nHint: the FILE_SET keyword may only appear after a visibility specifier or another FILE_SET within the target_sources() command.",
+            );
+        }
         if !self.collect_source_errors {
             return Err(ResolveError::Message(body));
         }

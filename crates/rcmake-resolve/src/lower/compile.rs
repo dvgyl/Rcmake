@@ -12,7 +12,7 @@ use super::launcher;
 use super::pch::PchFlags;
 use super::policy_flags::Flags;
 use super::shell::{command, join_words, raw_flags, rule_invocations};
-use super::standard::{checked_standard_flag, standard_flag};
+use super::standard::checked_standard_flag;
 use super::{
     definition, expand_rule, join, object_path, target_property, without_trailing_slashes,
 };
@@ -149,11 +149,7 @@ fn compile_flags(
 ) -> Result<Vec<BString>, ResolveError> {
     let language = group.language.as_slice();
     let mut flags = language_flags(model, target, config, language);
-    let standard = if language == b"CUDA" {
-        checked_standard_flag(model, target, language, required_standard)?
-    } else {
-        standard_flag(model, target, language, required_standard)
-    };
+    let standard = checked_standard_flag(model, target, language, required_standard)?;
     flags.extend(standard);
     flags.extend(apple_flags(model, target, config, language));
     let policy = Flags::new(model, target, language);

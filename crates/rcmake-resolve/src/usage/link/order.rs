@@ -306,6 +306,36 @@ impl LinkGraph {
                         ).into()));
                     }
                 }
+                if let (Some(group), Some(paths)) = (group, paths)
+                    && let Some(member) = match item.kind {
+                        ResolvedLinkKind::Interface(id) | ResolvedLinkKind::Objects(id) => {
+                            model.target(id)
+                        }
+                        _ => None,
+                    }
+                    && matches!(
+                        member.kind,
+                        TargetKind::InterfaceLibrary | TargetKind::ObjectLibrary
+                    )
+                    && warned.insert((
+                        key.clone(),
+                        [b"<LINK_GROUP>", group.as_slice()].concat().into(),
+                    ))
+                    && !definition(model, target.dir, b"CMAKE_SUPPRESS_DEVELOPER_WARNINGS")
+                        .is_some_and(|value| truth::is_on(value))
+                {
+                    paths.emit(
+                        model,
+                        rcmake_diag::MessageKind::AuthorWarning,
+                        rcmake_diag::Location::Backtrace(target.backtrace.clone()),
+                        format!(
+                            "The feature '{group}', specified as part of a generator-expression '$<LINK_GROUP:{group}>', will not be applied to the {} library '{}'.",
+                            if member.kind == TargetKind::InterfaceLibrary { "INTERFACE" } else { "OBJECT" },
+                            item.text.value
+                        )
+                        .into(),
+                    );
+                }
                 let requested = overrides.get(&item.text.value).or(item.feature.as_ref());
                 let feature = requested.map_or(b"DEFAULT".as_slice(), |value| value.as_slice());
                 if !attributes.contains_key(feature) {

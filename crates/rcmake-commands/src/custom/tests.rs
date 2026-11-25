@@ -386,3 +386,19 @@ fn build_events_reject_targets_from_other_directories() -> TestResult {
     );
     Ok(())
 }
+
+#[test]
+fn append_to_a_plain_missing_output_fails_at_the_call() -> TestResult {
+    let mut f = Fixture::new();
+    f.configure(
+        "function(f)\n  add_custom_command(OUTPUT missing APPEND COMMAND tool)\nendfunction()\nf()",
+        1,
+    )?;
+    let text = f.host.stream_bytes(Stream::Stderr).to_string();
+    assert!(
+        text.contains("not already a custom command output"),
+        "{text}"
+    );
+    assert!(!text.contains("DEFERRED"), "{text}");
+    Ok(())
+}

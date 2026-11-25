@@ -3,7 +3,7 @@
 use std::cell::RefCell;
 
 use indexmap::{IndexMap, IndexSet};
-use rcmake_base::{BString, hash::HashAlgo, list, path_lex::Lexical, truth};
+use rcmake_base::{BString, ByteSlice, hash::HashAlgo, list, path_lex::Lexical, truth};
 use rcmake_diag::{PolicyId, PolicyStatus};
 use rcmake_genex::{ConfigId, EvalContext, EvalSite, evaluate_diagnostics, parse};
 use rcmake_model::{
@@ -161,13 +161,17 @@ impl<'a> Commands<'a> {
                     argument_config
                 }
                 .clone();
-                let value = match eval.value(arg) {
+                let mut value = match eval.value(arg) {
                     Ok(value) => value,
                     Err(error) => {
                         errors.push(error);
                         continue;
                     }
                 };
+                if self.model.generator == Some(GeneratorKind::NinjaMultiConfig) {
+                    // `CMAKE_CFG_INTDIR` is `${CONFIGURATION}` with this generator.
+                    value = expand_cfg_intdir(&value, &eval.context.config);
+                }
                 if command.command_expand_lists {
                     argv.extend(list::split(&value, list::Empty::Drop));
                 } else {
@@ -586,6 +590,85 @@ pub(super) fn ide_custom_step(
     }
 }
 
+/// Warn about `DEPFILE` custom commands that depend on policy CMP0116.
+///
+/// The Ninja generators warn when the policy is not set and the command is in
+/// a subdirectory, where the transformation changes the paths, or when
+/// `CMAKE_POLICY_WARNING_CMP0116` is on.
+pub(crate) fn warn_depfile_policy(model: &ProjectModel, host: &dyn rcmake_host::Host) {
+    if !matches!(
+        model.generator,
+        Some(GeneratorKind::Ninja | GeneratorKind::NinjaMultiConfig)
+    ) {
+        return;
+    }
+    let policy = PolicyId::new(116);
+    for (_, command) in model.commands() {
+        if command
+            .depfile
+            .as_ref()
+            .is_none_or(|depfile| depfile.is_empty())
+            || command.policies.get(policy) != PolicyStatus::Warn
+            || definition(model, command.dir, b"CMAKE_SUPPRESS_DEVELOPER_WARNINGS")
+                .is_some_and(|value| truth::is_on(value))
+        {
+            continue;
+        }
+        let enabled = definition(model, command.dir, b"CMAKE_POLICY_WARNING_CMP0116")
+            .is_some_and(|value| truth::is_on(value));
+        if command.dir == DirId::ROOT && !enabled {
+            continue;
+        }
+        // A call stack ends at the `CMakeLists.txt` file of the directory.
+        let frames: Vec<_> = command
+            .backtrace
+            .frames()
+            .take_while(|frame| {
+                !frame
+                    .name
+                    .as_deref()
+                    .is_some_and(|name| name.eq_ignore_ascii_case(b"add_subdirectory"))
+            })
+            .cloned()
+            .collect();
+        let backtrace = frames
+            .into_iter()
+            .rev()
+            .fold(rcmake_diag::Backtrace::default(), |trace, frame| {
+                trace.push(frame)
+            });
+        let warning = rcmake_diag::Diagnostic {
+            annotations: None,
+            kind: rcmake_diag::MessageKind::AuthorWarning,
+            effect: rcmake_diag::Effect::None,
+            category: Some(rcmake_diag::DiagCategory::Policy),
+            policy: Some(policy),
+            location: rcmake_diag::Location::Backtrace(backtrace),
+            body: "Policy CMP0116 is not set: Ninja generators transform DEPFILEs from add_custom_command().  Run \"cmake --help-policy CMP0116\" for policy details.  Use the cmake_policy command to set the policy and suppress this warning.".into(),
+        };
+        host.write_out(
+            rcmake_host::Stream::Stderr,
+            &rcmake_diag::render(
+                &warning,
+                &rcmake_diag::RenderOptions {
+                    relative_base: Some(model.dir(DirId::ROOT).source_dir.clone()),
+                    ..rcmake_diag::RenderOptions::default()
+                },
+            ),
+        );
+    }
+}
+
+/// Replace the `${CONFIGURATION}` value of `CMAKE_CFG_INTDIR` with a
+/// configuration name.
+fn expand_cfg_intdir(value: &[u8], config: &ConfigId) -> BString {
+    const INTDIR: &[u8] = b"${CONFIGURATION}";
+    if value.find(INTDIR).is_none() {
+        return value.into();
+    }
+    value.replace(INTDIR, &config.0).into()
+}
+
 fn command_target(command: &CustomCommand) -> Option<TargetId> {
     match command.kind {
         CustomCommandKind::Output => None,
@@ -705,4 +788,21 @@ pub(super) fn attach_link_events(
     );
     remove_own_outputs(&mut before);
     BuildStep::Custom(before)
+}
+
+#[cfg(test)]
+mod tests {
+    use rcmake_genex::ConfigId;
+
+    use super::expand_cfg_intdir;
+
+    #[test]
+    fn cfg_intdir_expands_to_the_configuration() {
+        let config = ConfigId("Release".into());
+        assert_eq!(
+            expand_cfg_intdir(b"-DINTDIR=${CONFIGURATION}/x", &config),
+            "-DINTDIR=Release/x"
+        );
+        assert_eq!(expand_cfg_intdir(b"plain", &config), "plain");
+    }
 }

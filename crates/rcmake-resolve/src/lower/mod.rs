@@ -20,7 +20,7 @@ pub use cuda::ide_flags as cuda_ide_flags;
 )]
 pub(crate) mod fortran;
 pub use fortran::{fortran_depend_info_json, fortran_make_depend_info};
-mod custom;
+pub(crate) mod custom;
 pub(crate) mod framework;
 mod graph;
 mod install;

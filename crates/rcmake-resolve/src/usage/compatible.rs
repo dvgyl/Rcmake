@@ -219,33 +219,7 @@ impl UsageResolver<'_> {
             return Ok(None);
         }
         let deps = self.compatibility_targets(id, ctx)?;
-        let mut rules = Requirements::new();
-        for &owner in &deps {
-            for (kind, name) in declarations(self.target(owner)?) {
-                if builtin::contains(&name) {
-                    let owner = self.target(owner)?;
-                    let declaration = kind.declaration();
-                    return Err(self.compatibility_diagnostic(target, paths, format!(
-                        "Target \"{}\" has property \"{name}\" listed in its {declaration} property.  This is not allowed.  Only user-defined properties may appear listed in the {declaration} property.",
-                        owner.name,
-                    )));
-                }
-                rules.entry(name).or_default().insert(kind);
-            }
-        }
-        for (name, kinds) in &rules {
-            if kinds.len() > 1 {
-                let mut declarations: Vec<_> =
-                    kinds.iter().map(|kind| kind.declaration()).collect();
-                declarations.sort_unstable();
-                let last = declarations.pop().unwrap_or_default();
-                let first = declarations.join(", ");
-                return Err(self.compatibility_diagnostic(target, paths, format!(
-                    "Property \"{name}\" appears in both the {first} and the {last} property in the dependencies of target \"{}\".  This is not allowed.  A property may only require compatibility in a boolean interpretation, a numeric minimum, a numeric maximum or a string interpretation, but not a mixture.",
-                    target.name,
-                )));
-            }
-        }
+        let mut rules = self.declared_rules(target, &deps, paths)?;
         rules.entry(PIC.into()).or_default().insert(Kind::Bool);
         let mut ctx = ctx.clone();
         ctx.head = Some(handle(id));
@@ -288,6 +262,66 @@ impl UsageResolver<'_> {
             }
         }
         Ok(pic)
+    }
+
+    /// Check that the dependencies of a target declare only user-defined
+    /// compatible properties, each with one kind of compatibility.
+    ///
+    /// CMake does this check before it evaluates the usage requirements of
+    /// the target. A failure in this check therefore hides a failure in the
+    /// usage requirements.
+    pub(crate) fn validate_compatible_declarations(
+        &mut self,
+        id: TargetId,
+        ctx: &EvalContext,
+        paths: &SourcePaths<'_>,
+    ) -> Result<(), ResolveError> {
+        let target = self.target(id)?;
+        if target.kind == TargetKind::InterfaceLibrary {
+            return Ok(());
+        }
+        // The link language is not known yet. A failure to find the
+        // dependencies is reported later, when the link step is resolved.
+        let Ok(deps) = self.compatibility_targets(id, ctx) else {
+            return Ok(());
+        };
+        self.declared_rules(target, &deps, paths).map(|_| ())
+    }
+
+    fn declared_rules(
+        &self,
+        target: &Target,
+        deps: &[TargetId],
+        paths: &SourcePaths<'_>,
+    ) -> Result<Requirements, ResolveError> {
+        let mut rules = Requirements::new();
+        for &owner in deps {
+            for (kind, name) in declarations(self.target(owner)?) {
+                if builtin::contains(&name) {
+                    let owner = self.target(owner)?;
+                    let declaration = kind.declaration();
+                    return Err(self.compatibility_diagnostic(target, paths, format!(
+                        "Target \"{}\" has property \"{name}\" listed in its {declaration} property.  This is not allowed.  Only user-defined properties may appear listed in the {declaration} property.",
+                        owner.name,
+                    )));
+                }
+                rules.entry(name).or_default().insert(kind);
+            }
+        }
+        for (name, kinds) in &rules {
+            if kinds.len() > 1 {
+                let mut declarations: Vec<_> =
+                    kinds.iter().map(|kind| kind.declaration()).collect();
+                declarations.sort_unstable();
+                let last = declarations.pop().unwrap_or_default();
+                let first = declarations.join(", ");
+                return Err(self.compatibility_diagnostic(target, paths, format!(
+                    "Property \"{name}\" appears in both the {first} and the {last} property in the dependencies of target \"{}\".  This is not allowed.  A property may only require compatibility in a boolean interpretation, a numeric minimum, a numeric maximum or a string interpretation, but not a mixture.",
+                    target.name,
+                )));
+            }
+        }
+        Ok(rules)
     }
 
     fn merge_compatible(
@@ -361,8 +395,9 @@ impl UsageResolver<'_> {
                     file: file.as_slice().into(),
                     line: 0,
                 });
-        paths.emit(self.model, MessageKind::Error, location, message.into());
-        ResolveError::Message("Compatible interface property requirements are invalid.".into())
+        let message = BString::from(message);
+        paths.emit(self.model, MessageKind::Error, location, message.clone());
+        ResolveError::Reported(message)
     }
 }
 

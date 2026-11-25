@@ -63,6 +63,16 @@ fn generate(
     if matches!(kind, GeneratorKind::Ninja | GeneratorKind::NinjaMultiConfig) {
         interp.cx().var(b"CMAKE_NINJA_OUTPUT_PATH_PREFIX");
     }
+    if kind == GeneratorKind::NinjaMultiConfig {
+        // The generator reads these variables, so they are used.
+        for name in [
+            b"CMAKE_CROSS_CONFIGS".as_slice(),
+            b"CMAKE_DEFAULT_BUILD_TYPE",
+            b"CMAKE_DEFAULT_CONFIGS",
+        ] {
+            interp.cx().var(name);
+        }
+    }
     let configs = if kind.multi_config() {
         match interp.cx().var(b"CMAKE_CONFIGURATION_TYPES") {
             Some(value) => {

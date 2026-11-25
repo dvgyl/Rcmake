@@ -484,6 +484,7 @@ fn append(
     }
     if let Some(args) = args
         && cx.defer_active()
+        && (matched.is_err() || append_uses_genex(cx.project(), body.dir, output, count))
     {
         // Retry after configuration. Only commands that preceded APPEND can match.
         // Move this retry to an internal post-directory hook after W11B.
@@ -511,6 +512,30 @@ fn append(
             output.value
         ),
     ))
+}
+
+/// Return whether the match for an APPEND output can change later.
+///
+/// A generator expression in the output, or in the output of a command that
+/// can match, can depend on targets that the project creates later. Plain
+/// outputs give the final result immediately.
+fn append_uses_genex(
+    project: &ProjectModel,
+    dir: DirId,
+    output: &BT<BString>,
+    count: usize,
+) -> bool {
+    find_genex(&output.value).is_some()
+        || project
+            .commands()
+            .take(count)
+            .filter(|(_, command)| command.dir == dir && command.kind == CustomCommandKind::Output)
+            .any(|(_, command)| {
+                command
+                    .outputs
+                    .iter()
+                    .any(|output| find_genex(&output.value).is_some())
+            })
 }
 
 fn find_append_command(

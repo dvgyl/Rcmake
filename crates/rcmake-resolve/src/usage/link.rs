@@ -418,6 +418,8 @@ impl<'a> UsageResolver<'a> {
         let mut output = EvaluatedLinks::default();
         let debug = self.debug_config(ctx);
         let mut take_next = true;
+        // CMake reports a located error for each entry that fails.
+        let mut failures = Vec::new();
         for entry in entries {
             match entry.text.value.as_slice() {
                 b"debug" => take_next = debug,
@@ -425,8 +427,17 @@ impl<'a> UsageResolver<'a> {
                 b"general" => take_next = true,
                 _ => {
                     if take_next {
-                        let (value, deps) =
-                            self.eval_entry(owner, entry.lookup_dir, name, &entry.text, ctx, true)?;
+                        let evaluated =
+                            self.eval_entry(owner, entry.lookup_dir, name, &entry.text, ctx, true);
+                        let (value, deps) = match evaluated {
+                            Ok(evaluated) => evaluated,
+                            Err(error) if located(&error) => {
+                                failures.push(error);
+                                take_next = true;
+                                continue;
+                            }
+                            Err(error) => return Err(error),
+                        };
                         output.value.flags = output.value.flags.union(deps);
                         let values = list::split(&value, list::Empty::Drop);
                         let scope = entry.scope.unwrap_or(if name.starts_with(b"INTERFACE_") {
@@ -449,7 +460,7 @@ impl<'a> UsageResolver<'a> {
                 }
             }
         }
-        Ok(output)
+        combine_failures(failures).map_or(Ok(output), Err)
     }
 
     fn debug_config(&self, ctx: &EvalContext) -> bool {
@@ -599,6 +610,25 @@ impl<'a> UsageResolver<'a> {
             Ok(result)
         })
     }
+}
+
+/// Return whether an error has a source location in its text.
+fn located(error: &ResolveError) -> bool {
+    matches!(error, ResolveError::Genex(_)) && error.to_string().starts_with("CMake Error at ")
+}
+
+/// Join the located errors of several link entries into one error.
+fn combine_failures(mut failures: Vec<ResolveError>) -> Option<ResolveError> {
+    if failures.len() < 2 {
+        return failures.pop();
+    }
+    let mut text = String::new();
+    for failure in &failures {
+        let message = failure.to_string();
+        text.push_str(message.trim_end_matches('\n'));
+        text.push_str("\n\n\n");
+    }
+    Some(ResolveError::Message(text.into()))
 }
 
 fn link_context(owner: TargetId, ctx: &EvalContext) -> EvalContext {

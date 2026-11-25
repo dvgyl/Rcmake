@@ -160,6 +160,16 @@ pub enum ArtifactPart {
     Suffix,
 }
 
+/// A property of a custom rule, read by `$<RULE_PROPERTY:rule,prop>`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RuleProperty {
+    /// The `NAME` property of the rule, for diagnostics.
+    pub rule_name: BString,
+    /// The raw value of the property. The value can contain generator
+    /// expressions.
+    pub value: Option<BString>,
+}
+
 /// Target and build-system data that evaluation needs (implemented by
 /// `rcmake-resolve`).
 pub trait GenexHost {
@@ -233,6 +243,12 @@ pub trait GenexHost {
         _ctx: &EvalContext,
     ) -> Result<Option<BString>, BString> {
         Ok(None)
+    }
+
+    /// Read a property of a custom rule that is visible in the evaluation
+    /// directory. Return `None` if the rule is unknown.
+    fn rule_property(&self, _rule: &[u8], _property: &[u8]) -> Option<RuleProperty> {
+        None
     }
 
     /// Return the policy state in the evaluation directory, if known.
@@ -517,6 +533,24 @@ impl std::fmt::Display for GenexDiagnostic {
     }
 }
 
+/// Return the frames of a backtrace inside the directory of its first frame.
+///
+/// A CMake call stack ends at the `CMakeLists.txt` file of the directory.
+/// It does not show the `add_subdirectory` call of the parent directory.
+fn directory_frames(backtrace: &Backtrace) -> Vec<Frame> {
+    backtrace
+        .frames()
+        .filter(|frame| frame.line != 0 || frame.name.is_some())
+        .take_while(|frame| {
+            !frame
+                .name
+                .as_deref()
+                .is_some_and(|name| name.eq_ignore_ascii_case(b"add_subdirectory"))
+        })
+        .cloned()
+        .collect()
+}
+
 impl GenexError {
     /// Add source context to an error that does not already have it.
     #[must_use]
@@ -556,11 +590,7 @@ impl GenexError {
             _ => Vec::new(),
         };
         Self::Located(Box::new(GenexDiagnostic {
-            frames: backtrace
-                .frames()
-                .filter(|frame| frame.line != 0 || frame.name.is_some())
-                .cloned()
-                .collect(),
+            frames: directory_frames(backtrace),
             body,
             steps,
             source_root: source_root.into(),

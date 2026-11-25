@@ -6,7 +6,7 @@ use rcmake_base::{BString, list, path_lex::Lexical};
 use rcmake_diag::{PolicyId, PolicyStatus};
 use rcmake_genex::{
     ArtifactKind, ArtifactPart, ConfigId, EvalContext, GenexError, GenexHost, InterfaceView,
-    TargetHandle,
+    RuleProperty, TargetHandle, UsageTraversal,
 };
 use rcmake_host::Host;
 use rcmake_model::{DirId, FileSetId, PropScope, TargetBinding, TargetId, UsageScope};
@@ -322,6 +322,14 @@ impl GenexHost for ModelGenexHost<'_, '_> {
         }
     }
 
+    fn rule_property(&self, rule: &[u8], property: &[u8]) -> Option<RuleProperty> {
+        let props = self.resolver.model.custom_rule(self.lookup_dir, rule)?;
+        Some(RuleProperty {
+            rule_name: props.get(b"NAME").cloned().unwrap_or_else(|| rule.into()),
+            value: props.get(property).cloned(),
+        })
+    }
+
     fn directory_policy(&self, policy: &[u8], _ctx: &EvalContext) -> Option<bool> {
         let policies = self
             .resolver
@@ -407,10 +415,20 @@ impl GenexHost for ModelGenexHost<'_, '_> {
         ctx: &EvalContext,
     ) -> Result<InterfaceView, GenexError> {
         let id = self.id(target).ok_or_else(missing_target)?;
+        // CMP0166: before CMake 3.30, these link properties did not follow
+        // the private dependencies of static libraries.
+        let base = name.strip_prefix(b"INTERFACE_").unwrap_or(name);
+        let traversal = (matches!(
+            base,
+            b"LINK_OPTIONS" | b"LINK_DIRECTORIES" | b"LINK_DEPENDS"
+        ) && self.directory_policy(b"CMP0166", ctx) != Some(true))
+        .then_some(UsageTraversal::Compile);
+        self.resolver.property_reads = self.resolver.property_reads.saturating_add(1);
         let value = self
             .resolver
-            .collect_property(id, name, ctx)
-            .map_err(genex_error)?;
+            .collect_property_with(id, name, ctx, traversal);
+        self.resolver.property_reads = self.resolver.property_reads.saturating_sub(1);
+        let value = value.map_err(genex_error)?;
         Ok(InterfaceView {
             value: list::join(value.entries.into_iter().map(|entry| entry.value)),
             flags: value.flags,

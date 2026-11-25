@@ -210,8 +210,16 @@ fn add_file_set<'a>(
     set.base_dirs.extend(bases);
     let first_new_file = set.files.len();
     set.files.extend(args.files);
-    if kind != FileSetKind::Headers || scope != UsageScope::Interface {
-        validate_file_set_paths(cx.project(), &set)?;
+    if (kind != FileSetKind::Headers || scope != UsageScope::Interface)
+        && let Err(error) = validate_file_set_paths(cx.project(), &set)
+    {
+        return Err(match error {
+            PathError::Status(error) => error,
+            PathError::Plain(message) => {
+                cx.issue(MessageKind::Error, Effect::SetError, None, message);
+                CmdError::Reported
+            }
+        });
     }
     validate_file_set_membership(cx, &set, first_new_file)?;
     let model = cx.project();
@@ -322,8 +330,13 @@ fn file_set_kind<'a>(
         Some(value) => resolve(value).ok_or_else(|| {
             CmdError::status("File set TYPE may only be one of the built-in types \"HEADERS\", \"SOURCES\", \"SYCL\", \"SYCL_HEADERS\", \"CXX_MODULES\" or a RULE visible from the current directory.")
         })?,
-        None => existing.map(|set| set.kind).or_else(|| resolve(name))
-            .ok_or_else(|| CmdError::status("Must specify a TYPE when creating file set."))?,
+        None => existing.map(|set| set.kind).or_else(|| resolve(name)).ok_or_else(|| {
+            if name.first().is_some_and(u8::is_ascii_uppercase) {
+                CmdError::status("FILE_SET names starting with a capital letter are reserved for built-in file sets and may only be \"HEADERS\", \"SOURCES\", \"SYCL\", \"SYCL_HEADERS\", \"CXX_MODULES\".")
+            } else {
+                CmdError::status("Must specify a TYPE when creating file set.")
+            }
+        })?,
     };
     if let Some(set) = existing.filter(|set| set.kind != kind_value) {
         return Err(CmdError::status(format!(
@@ -440,7 +453,21 @@ fn path_key(path: &[u8]) -> BString {
 }
 
 /// Validate literal paths. Generation resolves paths that contain generator expressions.
-fn validate_file_set_paths(model: &ProjectModel, set: &FileSet) -> Result<(), CmdError> {
+/// Error of a file set path check.
+enum PathError {
+    /// An error that the evaluator reports with the command name.
+    Status(CmdError),
+    /// An error that CMake reports without the command name.
+    Plain(BString),
+}
+
+impl From<CmdError> for PathError {
+    fn from(error: CmdError) -> Self {
+        Self::Status(error)
+    }
+}
+
+fn validate_file_set_paths(model: &ProjectModel, set: &FileSet) -> Result<(), PathError> {
     let target = model
         .target(set.target)
         .ok_or_else(|| model_error(ModelError::UnknownObject))?;
@@ -455,7 +482,7 @@ fn validate_file_set_paths(model: &ProjectModel, set: &FileSet) -> Result<(), Cm
         {
             return Err(CmdError::status(format!(
                 "Base directories in file set cannot be subdirectories of each other:\n  {first}\n  {second}"
-            )));
+            )).into());
         }
     }
     if !set.base_dirs.iter().any(|base| contains_genex(&base.value)) {
@@ -469,9 +496,12 @@ fn validate_file_set_paths(model: &ProjectModel, set: &FileSet) -> Result<(), Cm
                     .iter()
                     .map(|base| format!("\n  {base}"))
                     .collect::<String>();
-                return Err(CmdError::status(format!(
-                    "File:\n  {file}\nmust be in one of the file set's base directories:{bases}"
-                )));
+                return Err(PathError::Plain(
+                    format!(
+                        "File:\n  {file}\nmust be in one of the file set's base directories:{bases}"
+                    )
+                    .into(),
+                ));
             }
         }
     }

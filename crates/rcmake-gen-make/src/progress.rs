@@ -13,7 +13,10 @@ pub(super) fn assign(targets: &mut [Target<'_>]) {
     for step in targets.iter_mut().flat_map(|target| &mut target.rules) {
         let reports = match step.action {
             BuildStep::Compile { .. } | BuildStep::Link { .. } => true,
-            BuildStep::Custom(step) => step.comment.as_ref().is_some_and(|text| !text.is_empty()),
+            BuildStep::Custom(custom) => {
+                custom.comment.as_ref().is_some_and(|text| !text.is_empty())
+                    || step.default_comment.is_some()
+            }
             _ => false,
         };
         if reports {

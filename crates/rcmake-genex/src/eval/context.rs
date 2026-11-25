@@ -230,8 +230,16 @@ impl Evaluator<'_> {
 
     fn compile_features(&mut self, call: Call<'_>) -> Value {
         self.flags.head_sensitive = true;
-        if call.ctx.head.is_none() {
-            return Err(call.error("$<COMPILE_FEATURES:...> may only be used with binary targets."));
+        let binary = call.ctx.head.is_some_and(|head| {
+            !self
+                .host
+                .raw_property(head, b"TYPE")
+                .is_some_and(|kind| matches!(kind.as_slice(), b"UTILITY" | b"GLOBAL_TARGET"))
+        });
+        if !binary {
+            return Err(call.error(
+                "$<COMPILE_FEATURE> may only be used with binary targets.  It may not be used with add_custom_command or add_custom_target.",
+            ));
         }
         if call.params() == 0 {
             return Err(call.arity(1));
@@ -456,14 +464,16 @@ impl EvaluationRole {
             | b"INTERFACE_COMPILE_DEFINITIONS"
             | b"COMPILE_OPTIONS"
             | b"INTERFACE_COMPILE_OPTIONS"
-            | b"COMPILE_WRAPPERS" => Self::Compile,
+            | b"COMPILE_WRAPPERS"
+            | b"INTERFACE_COMPILE_WRAPPERS" => Self::Compile,
             b"LINK_OPTIONS" | b"INTERFACE_LINK_OPTIONS" | b"LINKER_TYPE" => Self::LinkOptions,
             b"LINK_DIRECTORIES"
             | b"INTERFACE_LINK_DIRECTORIES"
             | b"LINK_DEPENDS"
             | b"INTERFACE_LINK_DEPENDS"
             | b"LINK_LIBRARY_OVERRIDE"
-            | b"LINK_WRAPPERS" => Self::Link,
+            | b"LINK_WRAPPERS"
+            | b"INTERFACE_LINK_WRAPPERS" => Self::Link,
             b"LINK_LIBRARIES"
             | b"INTERFACE_LINK_LIBRARIES"
             | b"INTERFACE_LINK_LIBRARIES_DIRECT"

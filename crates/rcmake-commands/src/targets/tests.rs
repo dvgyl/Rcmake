@@ -1028,3 +1028,27 @@ fn discover_tests_validates_keyword_arguments() -> TestResult {
     }
     Ok(())
 }
+
+#[test]
+fn file_set_diagnostics_follow_cmake_text() -> TestResult {
+    let (host, _) = configure(
+        "add_library(lib STATIC)\ntarget_sources(lib PRIVATE FILE_SET UNKNOWN)",
+        &[],
+        1,
+    )?;
+    let text = host.stream_bytes(Stream::Stderr).to_string();
+    assert!(
+        text.contains("FILE_SET names starting with a capital letter are reserved"),
+        "{text}"
+    );
+
+    let (host, _) = configure(
+        "add_library(lib STATIC)\ntarget_sources(lib PRIVATE FILE_SET SOURCES BASE_DIRS src FILES src-other/a.c)",
+        &[],
+        1,
+    )?;
+    let text = host.stream_bytes(Stream::Stderr).to_string();
+    assert!(text.contains("\n  File:\n"), "{text}");
+    assert!(!text.contains("target_sources File:"), "{text}");
+    Ok(())
+}

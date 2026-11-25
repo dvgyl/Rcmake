@@ -146,7 +146,7 @@ fn depend_info(info: &DependInfo, files: &DependencyFiles<'_>) -> Result<Vec<u8>
     Ok(out)
 }
 
-fn cmake_argument(out: &mut Vec<u8>, word: &[u8], list_element: bool) {
+pub(crate) fn cmake_argument(out: &mut Vec<u8>, word: &[u8], list_element: bool) {
     out.push(b'"');
     for &byte in word {
         match byte {

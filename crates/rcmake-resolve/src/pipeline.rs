@@ -77,6 +77,7 @@ fn resolve_project(
     let model = rules.as_ref().unwrap_or(model);
     crate::exports::source_sets::validate(model)?;
     lower::warn_about_wrappers(model, host);
+    lower::custom::warn_depfile_policy(model, host);
     let configs = if configs.is_empty() {
         vec![ConfigId(
             lower::definition(model, DirId::ROOT, b"CMAKE_BUILD_TYPE")
@@ -298,6 +299,30 @@ struct ConfigTargets {
     linked_object_sources: IndexSet<TargetId>,
 }
 
+/// Print a target evaluation error that permits the next target to resolve.
+///
+/// Return the error that ends generation after the last target. Return any
+/// other error as the failure.
+fn report_target_error(
+    paths: &SourcePaths<'_>,
+    error: ResolveError,
+) -> Result<ResolveError, ResolveError> {
+    let text = match &error {
+        ResolveError::Reported(text) => return Ok(ResolveError::Reported(text.clone())),
+        ResolveError::Genex(_) => error.to_string(),
+        ResolveError::Message(_) => return Err(error),
+    };
+    if !text.starts_with("CMake Error") {
+        return Err(error);
+    }
+    let mut bytes = text.into_bytes();
+    if !bytes.ends_with(b"\n") {
+        bytes.push(b'\n');
+    }
+    paths.host.write_out(rcmake_host::Stream::Stderr, &bytes);
+    Ok(ResolveError::Reported(bytes.into()))
+}
+
 fn resolve_targets(
     model: &ProjectModel,
     paths: &mut SourcePaths<'_>,
@@ -314,9 +339,19 @@ fn resolve_targets(
         ..EvalContext::default()
     };
     let mut configured = ConfigTargets::default();
+    // CMake reports the evaluation errors of each target and then fails.
+    let mut failed = None;
     for (id, target) in model.targets().filter(|(_, target)| !target.is_imported()) {
-        let (mut facts, target_inputs) =
-            resolve_target(model, paths, &mut usage, id, target, &ctx)?;
+        let resolved = usage
+            .validate_compatible_declarations(id, &ctx, paths)
+            .and_then(|()| resolve_target(model, paths, &mut usage, id, target, &ctx));
+        let (mut facts, target_inputs) = match resolved {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                failed = Some(report_target_error(paths, error)?);
+                continue;
+            }
+        };
         validate_object_sources(
             model,
             paths,
@@ -329,6 +364,9 @@ fn resolve_targets(
         assign_file_set_source_groups(model, target, &mut facts);
         configured.targets.insert(id, facts);
         configured.inputs.insert(id, target_inputs);
+    }
+    if let Some(error) = failed {
+        return Err(error);
     }
     for (&id, inputs) in &configured.inputs {
         if !inputs.sources.is_empty()
