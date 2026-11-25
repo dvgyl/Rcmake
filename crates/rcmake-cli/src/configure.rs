@@ -317,7 +317,7 @@ impl<'a> ConfigureSession<'a> {
         cache::insert(
             interp.cx().cache(),
             HOME_DIR,
-            path::from_native(&self.src),
+            path::from_native_cmake(&self.src),
             Some(CacheType::Internal),
         );
         for key in [
@@ -329,7 +329,7 @@ impl<'a> ConfigureSession<'a> {
             let value = interp.cx().var_or_empty(key);
             cache::insert(interp.cx().cache(), key, value, Some(CacheType::Internal));
         }
-        let directory = path::from_native(&self.bin);
+        let directory = path::from_native_cmake(&self.bin);
         for (key, value) in [
             (b"CMAKE_CACHEFILE_DIR".as_slice(), directory),
             (b"CMAKE_CACHE_MAJOR_VERSION", "4".into()),

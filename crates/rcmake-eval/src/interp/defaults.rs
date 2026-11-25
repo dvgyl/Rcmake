@@ -80,12 +80,23 @@ impl Interp {
         defs.push((b"CMAKE_VERSION", CMAKE_VERSION_STR.into()));
         defs.push((b"CMAKE_FILES_DIRECTORY", "/CMakeFiles".into()));
 
-        let to_b = rcmake_host::path::from_native;
+        let to_b = rcmake_host::path::from_native_cmake;
         let command = to_b(&self.config.cmake_command);
         let bin_dir = filename_path(&command);
+        let exe_suffix: &[u8] = if name.as_slice() == b"Windows" {
+            b".exe"
+        } else {
+            b""
+        };
         defs.push((b"CMAKE_COMMAND", command));
-        defs.push((b"CMAKE_CTEST_COMMAND", cat(&[&bin_dir, b"/ctest"])));
-        defs.push((b"CMAKE_CPACK_COMMAND", cat(&[&bin_dir, b"/cpack"])));
+        defs.push((
+            b"CMAKE_CTEST_COMMAND",
+            cat(&[&bin_dir, b"/ctest", exe_suffix]),
+        ));
+        defs.push((
+            b"CMAKE_CPACK_COMMAND",
+            cat(&[&bin_dir, b"/cpack", exe_suffix]),
+        ));
         defs.push((b"CMAKE_ROOT", to_b(&self.config.cmake_root)));
         let cwd = to_b(&self.config.cwd);
         for var in [

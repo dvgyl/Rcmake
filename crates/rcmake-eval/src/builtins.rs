@@ -145,7 +145,7 @@ impl Interp {
     /// `cmMakefile::GetModulesFile`: returns `(path, system)`; `path` is empty when the
     /// module is not found.
     pub(crate) fn modules_file(&self, file: &[u8]) -> (BString, bool) {
-        let cwd = rcmake_host::path::from_native(&self.config.cwd);
+        let cwd = rcmake_host::path::from_native_cmake(&self.config.cwd);
         let mut in_module_path = None;
         if let Some(paths) = self.lookup_var(b"CMAKE_MODULE_PATH") {
             let mut dirs = Vec::new();
@@ -161,7 +161,7 @@ impl Interp {
                 }
             }
         }
-        let root = rcmake_host::path::from_native(&self.config.cmake_root);
+        let root = rcmake_host::path::from_native_cmake(&self.config.cmake_root);
         let mods = cat(&[&root, b"/Modules/"]);
         let in_root = Some(cat(&[&mods, file])).filter(|p| self.exists(p));
         match (in_module_path, in_root) {
