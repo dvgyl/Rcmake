@@ -16,18 +16,13 @@ fn while_checks_cmp0218_and_deprecation_uses_the_set_value() {
     ] {
         let host = Arc::new(PureHost::default());
         let mut interp = Interp::new(
-            InterpConfig {
-                services: Default::default(),
-                host: host.clone(),
-                mode: RunMode::Script,
-                cmake_root: PathBuf::new(),
-                cmake_command: PathBuf::from("/usr/local/bin/cmake"),
-                cwd: PathBuf::from("/work"),
-                limits: Default::default(),
-                diag: Default::default(),
-                defines: Vec::new(),
-                script_args: Vec::new(),
-            },
+            InterpConfig::new(
+                host.clone(),
+                RunMode::Script,
+                PathBuf::new(),
+                "/usr/local/bin/cmake",
+                "/work",
+            ),
             |_| {},
         );
         if let Some(value) = value {

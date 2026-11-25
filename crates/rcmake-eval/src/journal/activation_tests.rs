@@ -7,7 +7,7 @@ use rcmake_host::{Host, PureHost};
 use rcmake_model::{CacheEntry, CacheType, DirId};
 
 use super::*;
-use crate::{CmdError, CmdFlags, Cx, InterpConfig, Registry, Services, SubdirOptions};
+use crate::{CmdError, CmdFlags, Cx, InterpConfig, Registry, SubdirOptions};
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -80,18 +80,13 @@ impl Fixture {
 
     fn interp(&self) -> Interp {
         Interp::new(
-            InterpConfig {
-                host: self.host.clone(),
-                cwd: self.root.clone(),
-                cmake_command: self.root.join("rcmake"),
-                cmake_root: self.root.join("share"),
-                mode: RunMode::Configure,
-                defines: Vec::new(),
-                limits: Default::default(),
-                diag: Default::default(),
-                services: Arc::new(Services::default()),
-                script_args: Vec::new(),
-            },
+            InterpConfig::new(
+                self.host.clone(),
+                RunMode::Configure,
+                self.root.join("share"),
+                self.root.join("rcmake"),
+                &self.root,
+            ),
             register,
         )
     }
@@ -305,19 +300,19 @@ fn invalid_late_effect_does_not_change_earlier_variables() -> TestResult {
     };
     *effects.first_mut().ok_or("Expected at least one effect.")? = JournalEffect::SetVar {
         scope: VariableScope::Current,
-        name: b"WRONG".to_vec(),
+        name: b"A".to_vec(),
         value: Some(b"leak".to_vec()),
     };
-    effects.push(JournalEffect::SetVar {
+    *effects.last_mut().ok_or("Expected a late effect.")? = JournalEffect::SetVar {
         scope: VariableScope::Current,
-        name: b"INVALID".to_vec(),
+        name: b"B".to_vec(),
         value: Some(vec![b'x'; 16]),
-    });
+    };
     let mut next = f.interp();
     next.config.limits.max_value_bytes = 8;
     f.run(&mut next, Some(&bad.encode()?));
     assert_eq!(next.replay_hits(), 0);
-    assert!(next.cx().var(b"WRONG").is_none());
+    assert_eq!(next.cx().var(b"A"), Some("expected".into()));
     assert_eq!(next.cx().var(b"B"), Some("second".into()));
     Ok(())
 }

@@ -751,5 +751,4 @@ fn unclosed_blocks(commands: &[CommandInvocation]) -> Result<Vec<usize>, ParseEr
 }
 
 #[cfg(test)]
-#[path = "tolerant_tests.rs"]
 mod tests;
