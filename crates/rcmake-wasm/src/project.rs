@@ -12,7 +12,7 @@ use crate::{response, strings};
 
 mod toolchain;
 
-const SOURCE: &str = "/src";
+pub(super) const SOURCE: &str = if cfg!(windows) { "C:/src" } else { "/src" };
 const CMAKE_ROOT: &str = "/cmake";
 const PLACEHOLDER_RETRIES: usize = 32;
 
@@ -109,7 +109,10 @@ impl<'a> Project<'a> {
         placeholders: &BTreeSet<PathBuf>,
     ) -> Result<(ConfigureRequest, Arc<PureHost>, GeneratorKind, String), Value> {
         let source = Path::new(SOURCE);
-        let host = Arc::new(PureHost::new(source.into(), "/usr/bin/rcmake".into()));
+        let host = Arc::new(PureHost::new(
+            source.into(),
+            virtual_path("/usr/bin/rcmake"),
+        ));
         let host_error =
             |error: rcmake_host::HostError| response::failure("FILESYSTEM", &error.to_string());
         for file in placeholders {
@@ -147,20 +150,21 @@ impl<'a> Project<'a> {
             .as_ref()
             .and_then(|preset| preset.binary_dir.as_ref())
             .map_or_else(
-                || PathBuf::from("/build"),
+                || virtual_path("/build"),
                 |path| source.join(path::to_native(path)),
             );
         let build = normalize(&build);
-        if build == source || build == Path::new("/") {
+        if build == source || build == virtual_path("/") {
             return Err(response::failure(
                 "PRESET",
                 "Select a separate build directory.",
             ));
         }
         host.create_dir_all(&build).map_err(host_error)?;
-        toolchain::seed(&host, &build).map_err(host_error)?;
+        let cmake_root = virtual_path(CMAKE_ROOT);
+        toolchain::seed(&host, &build, &cmake_root).map_err(host_error)?;
 
-        let mut request = ConfigureRequest::new(source, &build, CMAKE_ROOT, host.clone())
+        let mut request = ConfigureRequest::new(source, &build, cmake_root, host.clone())
             .generator(generator)
             .step_budget(100_000)
             .collect_index(true)
@@ -277,6 +281,14 @@ impl<'a> Project<'a> {
     }
 }
 
+fn virtual_path(path: &str) -> PathBuf {
+    if cfg!(windows) {
+        format!("C:{path}").into()
+    } else {
+        path.into()
+    }
+}
+
 fn normalize(path: &Path) -> PathBuf {
     let mut result = PathBuf::new();
     for part in path.components() {
@@ -302,7 +314,8 @@ fn missing_source(event: &[u8]) -> Option<PathBuf> {
     } else {
         let directory = header
             .strip_prefix("CMake Error at ")
-            .and_then(|header| header.split_once(':'))
+            .and_then(|header| header.split_once(" ("))
+            .and_then(|(site, _)| site.rsplit_once(':'))
             .map(|(listfile, _)| source.join(listfile))
             .and_then(|listfile| listfile.parent().map(Path::to_owned))
             .unwrap_or_else(|| source.to_owned());

@@ -80,7 +80,12 @@ fn text(value: &[u8]) -> String {
 }
 
 fn display_source(value: &[u8]) -> String {
-    text(value.strip_prefix(b"/src/").unwrap_or(value))
+    text(
+        value
+            .strip_prefix(project::SOURCE.as_bytes())
+            .and_then(|file| file.strip_prefix(b"/"))
+            .unwrap_or(value),
+    )
 }
 
 #[cfg(test)]

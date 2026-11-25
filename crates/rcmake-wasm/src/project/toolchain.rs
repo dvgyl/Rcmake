@@ -3,11 +3,11 @@ use std::path::Path;
 use rcmake_base::CMAKE_VERSION_STR;
 use rcmake_host::{HostResult, PureHost};
 
-use super::CMAKE_ROOT;
+use super::virtual_path;
 
-pub(super) fn seed(host: &PureHost, build: &Path) -> HostResult<()> {
+pub(super) fn seed(host: &PureHost, build: &Path, cmake_root: &Path) -> HostResult<()> {
     let platform = build.join("CMakeFiles").join(CMAKE_VERSION_STR);
-    let modules = Path::new(CMAKE_ROOT).join("Modules");
+    let modules = cmake_root.join("Modules");
     host.seed_file(
         &platform.join("CMakeSystem.cmake"),
         br#"
@@ -63,8 +63,9 @@ set(CMAKE_RANLIB /usr/bin/llvm-ranlib)
         ),
     ] {
         let prefix = format!("CMAKE_{lang}");
-        let executable = format!("/usr/bin/{compiler}");
-        host.seed_file(Path::new(&executable), b"")?;
+        let executable = virtual_path(&format!("/usr/bin/{compiler}"));
+        host.seed_file(&executable, b"")?;
+        let executable = executable.display();
         let features = standards
             .iter()
             .map(|standard| format!("{}_std_{standard}", lang.to_ascii_lowercase()))

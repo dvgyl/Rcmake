@@ -160,3 +160,22 @@ fn reject_paths_outside_the_project() -> TestResult {
     assert_eq!(response["diagnostics"][0]["category"], "INPUT");
     Ok(())
 }
+
+#[test]
+fn configure_nested_file_with_posix_preset_paths() -> TestResult {
+    let response = call(json!({
+        "op": "configure",
+        "preset": "virtual",
+        "files": {
+            "CMakeLists.txt": "cmake_minimum_required(VERSION 4.5)\nproject(Virtual NONE)\nadd_subdirectory(nested)",
+            "nested/CMakeLists.txt": "add_custom_target(virtual)",
+            "CMakePresets.json": r#"{"version": 3, "configurePresets": [
+                {"name": "virtual", "generator": "Ninja", "binaryDir": "/output/build"}
+            ]}"#,
+        },
+    }))?;
+    assert_eq!(response["ok"], true, "{}", response["diagnostics"]);
+    assert!(response["files"]["build.ninja"].is_string());
+    assert_eq!(response["targets"][0]["name"], "virtual");
+    Ok(())
+}
