@@ -961,6 +961,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "rcmake-wasm"
+version = "0.1.0"
+dependencies = [
+ "rcmake-api",
+ "rcmake-base",
+ "rcmake-diag",
+ "rcmake-gen-common",
+ "rcmake-gen-ninja",
+ "rcmake-host",
+ "rcmake-model",
+ "rcmake-presets",
+ "rcmake-resolve",
+ "serde_json",
+]
+
+[[package]]
 name = "rustix"
 version = "1.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"

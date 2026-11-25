@@ -1,0 +1,24 @@
+[package]
+name = "rcmake-wasm"
+description = "Rcmake configure and explain runtime for the browser playground."
+version.workspace = true
+publish.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+rcmake-api.workspace = true
+rcmake-base.workspace = true
+rcmake-diag.workspace = true
+rcmake-gen-common.workspace = true
+rcmake-gen-ninja.workspace = true
+rcmake-host.workspace = true
+rcmake-model.workspace = true
+rcmake-presets.workspace = true
+rcmake-resolve.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

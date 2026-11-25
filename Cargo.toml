@@ -35,6 +35,7 @@ members = [
     "crates/rcmake-harness",
     "crates/rcmake-fuzz",
     "crates/rcmake-api",
+    "crates/rcmake-wasm",
 ]
 
 [workspace.package]
@@ -147,3 +148,11 @@ inherits = "release"
 lto = "thin"
 codegen-units = 16
 strip = false
+
+[profile.wasm-release]
+inherits = "release"
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
