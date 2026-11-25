@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: MIT OR Apache-2.0
-"""Compare five pinned Boss-Fight projects on macOS arm64.
+"""Compare results for five large projects on macOS arm64.
 
 Source env/env.sh in Bash before running this script. Use a release stage
 with bin/rcmake, the three CMake tool links, and share/cmake-4.5. Use a fresh
@@ -35,7 +35,7 @@ from path_swap_eval import (
 )
 
 ROOT = Path(__file__).resolve().parents[2]
-MANIFEST = ROOT / "conformance/corpus/boss_fight.toml"
+MANIFEST = ROOT / "conformance/corpus/large_projects.toml"
 GIB = 1024**3
 PROJECT_SPACE = {"duckdb": 27, "opencv": 27, "vtk": 34, "qtbase": 32, "llvm-project": 48}
 MIN_FREE = 15 * GIB
@@ -97,7 +97,7 @@ def load_projects(selection: str, manifest: Path = MANIFEST) -> list[dict]:
     with manifest.open("rb") as stream:
         data = tomllib.load(stream)
     if data.get("schema_version") != 1:
-        raise ValueError("Expected Boss-Fight manifest schema version 1.")
+        raise ValueError("The large-project manifest must use schema version 1.")
     pins = {pin["name"]: pin for pin in data["project"]}
     return [pins[name] for name in (PROJECT_SPACE if selection == "all" else (selection,))]
 
@@ -210,7 +210,7 @@ def installations(stage: Path, oracle: Path) -> dict[str, Path]:
 def preflight(log: Path, engines: dict[str, Path]) -> Toolchain:
     """Pin the selected Xcode tools and record the host and binary identities."""
     if platform.system() != "Darwin" or platform.machine() != "arm64":
-        raise ValueError("Run Boss-Fight with native Python on macOS arm64.")
+        raise ValueError("Use native Python on macOS arm64 for the large-project suite.")
     env = dict(os.environ)
 
     def probe(label, *argv):
@@ -692,10 +692,10 @@ def main(argv: list[str] | None = None) -> int:
             print(f"[{pin['name']}] {result['status']}", flush=True)
         return 0 if all(result["status"] == "pass" for result in results) else 1
     except RUN_ERRORS as error:
-        print(f"Boss-Fight could not complete. {error}", file=sys.stderr)
+        print(f"The large-project suite could not complete. {error}", file=sys.stderr)
         return 2
     except KeyboardInterrupt:
-        print(f"Boss-Fight stopped. Reports are in {run / 'reports'}.", file=sys.stderr)
+        print(f"The large-project suite stopped. Reports are in {run / 'reports'}.", file=sys.stderr)
         return 130
 
 

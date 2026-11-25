@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: MIT OR Apache-2.0
-"""Run the Milestone 6 WebAssembly acceptance checks.
+"""Run the WebAssembly acceptance checks.
 
 Source env/env.sh before use. The rcmake-api wasm_smoke example checks three
 generated targets, provenance, cancellation, try_compile, and a partial result
@@ -146,7 +146,7 @@ def check_wasi(args, report: dict, env: dict[str, str], prerequisite: str | None
 
 def markdown(report: dict) -> str:
     """Render the gate status and any command failure output."""
-    lines = ["# Milestone 6 WebAssembly checks", "", f"Result **{report['status']}**.", "",
+    lines = ["# WebAssembly checks", "", f"Result **{report['status']}**.", "",
              "| Check | Status | Detail |", "| --- | --- | --- |"]
     for row in report["checks"]:
         detail = row.get("detail", "").replace("|", r"\|")

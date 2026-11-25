@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
 """Test dashboard generation with reports that contain synthetic results."""
 
 from contextlib import redirect_stderr
@@ -130,7 +131,7 @@ class DashboardTests(unittest.TestCase):
                 self.assertEqual(row["failures"], row["total"] - row["passed"])
 
     def test_repeat_bench_for_both_report_formats(self):
-        m6 = self.report("bench-m6.json", {"results": [
+        configure = self.report("bench-configure.json", {"results": [
             {"case": "warm probe-cache configure", "project": "a", "speedup": 4,
              "gate": {"status": "fail"}},
             {"case": "warm probe-cache configure", "project": "b", "speedup": 9,
@@ -144,24 +145,25 @@ class DashboardTests(unittest.TestCase):
             {"name": "configure 500 targets (cold)", "speedup": 1.5,
              "rcmake": {"ok": True, "peak_rss_mib": 88.2}},
         ]})
-        section = self.build("--bench", m6, "--bench", legacy)["tracks"]["benchmarksAndGates"]
+        section = self.build("--bench", configure, "--bench", legacy)["tracks"]["benchmarksAndGates"]
         self.assertEqual({key: (row["value"], row["status"]) for key, row in section["benchmarks"].items()},
                          {"warmProbeSpeedup": (6, "fail"), "incrementalLeafP95Ms": (63, "pass"),
                           "coldConfigureSpeedup": (1.5, "pass"), "peakRssMiB": (88.2, "pass")})
-        partial = self.build("--bench", m6)["tracks"]["benchmarksAndGates"]["benchmarks"]
+        partial = self.build("--bench", configure)["tracks"]["benchmarksAndGates"]["benchmarks"]
         self.assertEqual(partial["peakRssMiB"]["status"], "pending")
 
-    def test_boss_reads_summary_and_project_reports_without_double_counting(self):
-        self.report("boss/reports/result.json", {"projects": [
+    def test_large_projects_reads_summary_and_project_reports_without_double_counting(self):
+        self.report("large-projects/reports/result.json", {"projects": [
             {"project": "duckdb", "l1": {"cache.json": "equal"}, "l2": "equal"},
         ]})
-        self.report("boss/reports/duckdb/result.json", {
+        self.report("large-projects/reports/duckdb/result.json", {
             "project": "duckdb", "l1": {"cache.json": "equal"}, "l2": "equal",
         })
-        self.report("boss/reports/opencv/result.json", {
+        self.report("large-projects/reports/opencv/result.json", {
             "project": "opencv", "l1": {"cache.json": "different"}, "l2": "equal",
         })
-        track = self.build("--boss-dir", str(self.root / "boss"))["tracks"]["bossFight"]
+        snapshot = self.build("--large-projects-dir", str(self.root / "large-projects"))
+        track = snapshot["tracks"]["bossFight"]
         self.assertEqual((track["status"], track["projectsTotal"], track["l1Passed"], track["l2Passed"]),
                          ("fail", 10, 1, 2))
         self.assertEqual([(row["l1"], row["l2"]) for row in track["projects"][:3]],

@@ -453,7 +453,7 @@ def main():
         env["RCMAKE_VENDORED_DATA_ROOT"] = str(
             args.rcmake.parent.parent / "share" / "cmake-4.5"
         )
-    with tempfile.TemporaryDirectory(prefix="rcmake-m6-ux-") as temporary:
+    with tempfile.TemporaryDirectory(prefix="rcmake-cli-ux-") as temporary:
         root = Path(temporary).resolve()
         source = root / "src"
         source.mkdir()

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: MIT OR Apache-2.0
 """Build and check the language activation fixtures."""
 
 import argparse
@@ -149,7 +150,7 @@ def main():
         args.fortran = args.fortran.resolve(strict=True)
     if args.qt:
         args.qt = args.qt.resolve(strict=True)
-    with tempfile.TemporaryDirectory(prefix="rcmake-m6-langs-") as temporary:
+    with tempfile.TemporaryDirectory(prefix="rcmake-langs-") as temporary:
         work = Path(temporary).resolve()
         if args.case == "cross":
             cross(work, cmake, args.generator)

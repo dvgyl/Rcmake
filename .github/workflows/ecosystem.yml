@@ -9,7 +9,7 @@ name: Ecosystem parity
       lane:
         description: "Select the tests to run."
         type: choice
-        options: [all, vcpkg, conan, boss-fight, toolchains, qt]
+        options: [all, vcpkg, conan, large-projects, toolchains, qt]
         default: all
       vcpkg_shard_count:
         description: "Number of vcpkg shards (1 to 128)."
@@ -49,7 +49,7 @@ jobs:
     outputs:
       run_id: ${{ steps.binary.outputs.run_id }}
       shards: ${{ steps.matrix.outputs.shards }}
-      bosses: ${{ steps.matrix.outputs.bosses }}
+      large_projects: ${{ steps.matrix.outputs.large_projects }}
     steps:
       - &checkout
         uses: actions/checkout@v6
@@ -71,12 +71,12 @@ jobs:
           index = int(os.environ["SHARD_INDEX"] or "-1")
           if not 1 <= count <= 128 or not -1 <= index < count:
               raise SystemExit("Select 1 to 128 shards and a shard index from -1 to count minus one.")
-          with open("conformance/corpus/boss_fight.toml", "rb") as stream:
+          with open("conformance/corpus/large_projects.toml", "rb") as stream:
               projects = tomllib.load(stream)["project"]
+          large_projects = [project["name"] for project in projects if project["l1"]]
           with open(os.environ["GITHUB_OUTPUT"], "a") as output:
               print("shards=" + json.dumps(list(range(count)) if index == -1 else [index]), file=output)
-              print("bosses=" + json.dumps([project["name"] for project in projects if project["l1"]]),
-                    file=output)
+              print("large_projects=" + json.dumps(large_projects), file=output)
           PY
       - name: Find the CI binary for this commit
         id: binary
@@ -496,9 +496,9 @@ jobs:
           raise SystemExit(results != {"oracle": "42\n", "rcmake": "42\n"})
           PY
 
-  boss-fight:
-    name: Boss-fight L1 and L2 / ${{ matrix.project }}
-    if: github.event_name == 'schedule' || inputs.lane == 'all' || inputs.lane == 'boss-fight'
+  large-projects:
+    name: Large-project L1 and L2 / ${{ matrix.project }}
+    if: github.event_name == 'schedule' || inputs.lane == 'all' || inputs.lane == 'large-projects'
     needs: prepare
     runs-on: ubuntu-24.04
     timeout-minutes: 75
@@ -506,7 +506,7 @@ jobs:
       fail-fast: false
       max-parallel: 5
       matrix:
-        project: ${{ fromJSON(needs.prepare.outputs.bosses) }}
+        project: ${{ fromJSON(needs.prepare.outputs.large_projects) }}
     env:
       CORPUS_PROJECT: ${{ matrix.project }}
     steps:
@@ -537,7 +537,7 @@ jobs:
           import sys
           import tomllib
 
-          with open("conformance/corpus/boss_fight.toml", "rb") as stream:
+          with open("conformance/corpus/large_projects.toml", "rb") as stream:
               pin = next(row for row in tomllib.load(stream)["project"]
                          if row["name"] == os.environ["CORPUS_PROJECT"])
           apt = ["ninja-build", "g++", "pkg-config", *pin.get("apt", [])]
@@ -582,10 +582,10 @@ jobs:
           NONDETERMINISTIC_CACHE_KEYS = ("OPENCV_TIMESTAMP",)
           DIFF_LINES = 2000
 
-          with open("conformance/corpus/boss_fight.toml", "rb") as stream:
+          with open("conformance/corpus/large_projects.toml", "rb") as stream:
               pin = next(row for row in tomllib.load(stream)["project"]
                          if row["name"] == os.environ["CORPUS_PROJECT"])
-          work = Path(os.environ["RUNNER_TEMP"]) / "boss"
+          work = Path(os.environ["RUNNER_TEMP"]) / "large-projects"
           work.mkdir()
           report = work / "report"
           report.mkdir()
@@ -726,8 +726,8 @@ jobs:
       - uses: actions/upload-artifact@v6
         if: always()
         with:
-          name: boss-${{ matrix.project }}
-          path: ${{ runner.temp }}/boss/report
+          name: large-projects-${{ matrix.project }}
+          path: ${{ runner.temp }}/large-projects/report
           if-no-files-found: ignore
 
   linux-extended:

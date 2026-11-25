@@ -588,7 +588,7 @@ def main() -> int:
         print(error, file=sys.stderr)
     report["passed"] = "error" not in report
     write_json(args.out_json, report)
-    rows = ["# M6 leaf-edit comparison", "", f"Seed {args.seed}. Mode {report['mode']}.",
+    rows = ["# Leaf-edit comparison", "", f"Seed {args.seed}. Mode {report['mode']}.",
             f"Verified edits {report['effective_edits']} of {args.edits}. "
             f"Semantic edits {report['semantic_edits']}.",
             "", "| Step | Edit | Result |", "| --- | --- | --- |"]

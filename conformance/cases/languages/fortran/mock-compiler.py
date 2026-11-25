@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: MIT OR Apache-2.0
 """Build fixture objects and check that the required module exists."""
 
 from pathlib import Path

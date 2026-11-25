@@ -344,7 +344,7 @@ def main():
     parser.add_argument("--timeout", type=int, default=120, help="Set the time limit per command in seconds.")
     parser.add_argument("--out-json", type=Path, required=True)
     parser.add_argument("--out-md", type=Path, required=True)
-    parser.add_argument("--coordinator-details", action="store_true", help="Include holdout project details.")
+    parser.add_argument("--show-holdout-details", action="store_true", help="Include holdout project details.")
     args = parser.parse_args()
     if args.timeout <= 0 or (args.limit is not None and args.limit <= 0):
         parser.error("Use positive values for --timeout and --limit.")
@@ -360,7 +360,7 @@ def main():
             envs, tool_paths = setup_paths(Path(directory).resolve(), args)
             for project in projects:
                 split = project["split"]
-                details = split == "dev" or args.coordinator_details
+                details = split == "dev" or args.show_holdout_details
                 if details:
                     print(f'Evaluate {project["name"]}.', flush=True)
                 with tempfile.TemporaryDirectory(prefix="rcmake-unseen-project-", dir="/tmp") as work:
@@ -375,7 +375,7 @@ def main():
 
         report = {split: summary(rows, args.level) for split, rows in results.items()}
         for split, rows in results.items():
-            if split == "dev" or args.coordinator_details:
+            if split == "dev" or args.show_holdout_details:
                 report[split]["projects"] = rows
         write_json(args.out_json, report)
         args.out_md.parent.mkdir(parents=True, exist_ok=True)

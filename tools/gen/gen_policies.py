@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: MIT OR Apache-2.0
 """Generate exact CMake 4.5.1 policy table (CMP0000..CMP0226) from the pinned oracle.
 
 Reads `$RCMAKE_ORACLE_CMAKE --help-policy-list` and `--help-policy <CMP>` and writes

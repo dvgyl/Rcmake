@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: MIT OR Apache-2.0
 """Compare the staged Rcmake binary with CMake 4.5.1 using upstream RunCMake.
 
 Source env/env.sh before use. The upstream driver runs all assertions on each

@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: MIT OR Apache-2.0
 """Check configure output across probe worker counts and CLI modes.
 
-Source env/env.sh before use. Use --rcmake for the Milestone 6 Ninja gate.
+Source env/env.sh before use. Use --rcmake for the Ninja determinism gate.
 Its default fixture has two C/C++ targets and emits a warning. Pass project
 directories to check other inputs. Use --rcmake-bin for the generator suite.
 """
@@ -48,12 +48,12 @@ try_compile(M6_CXX_PROBE SOURCE_FROM_CONTENT probe.cpp "int main() { return 0; }
 try_compile(M6_OTHER_PROBE SOURCE_FROM_CONTENT other.c "int main(void) { return 1; }")
 try_compile(M6_LAST_PROBE SOURCE_FROM_CONTENT last.cpp "int main() { return 1; }")
 if(NOT M6_C_PROBE OR NOT M6_CXX_PROBE OR NOT M6_OTHER_PROBE OR NOT M6_LAST_PROBE)
-  message(FATAL_ERROR "A Milestone 6 compiler probe failed.")
+  message(FATAL_ERROR "A compiler probe for the determinism test failed.")
 endif()
 add_library(c_part STATIC part.c)
 add_executable(cxx_app main.cpp)
 target_link_libraries(cxx_app PRIVATE c_part)
-message(WARNING "Milestone 6 diagnostic sample.")
+message(WARNING "Determinism diagnostic sample.")
 """,
     "part.c": "int part(void) { return 0; }\n",
     "main.cpp": 'extern "C" int part(void);\nint main() { return part(); }\n',
@@ -450,7 +450,7 @@ def check_project(args, source: Path, work: Path, compat: Path, native: Path,
             check_profile(build)
         elif not args.projects:
             rich = streams["stderr"]
-            warning = b"Milestone 6 diagnostic sample."
+            warning = b"Determinism diagnostic sample."
             if warning not in rich or warning not in baseline_streams["stderr"] or rich == baseline_streams["stderr"]:
                 raise ValueError("The rich diagnostics flag did not change the fixture warning.")
 
@@ -685,7 +685,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("projects", type=Path, nargs="*", help="Directories with a CMakeLists.txt.")
     binaries = parser.add_mutually_exclusive_group()
-    binaries.add_argument("--rcmake", type=Path, help="Staged executable for the Milestone 6 gate.")
+    binaries.add_argument("--rcmake", type=Path, help="Staged executable for the determinism gate.")
     binaries.add_argument("--rcmake-bin", type=Path, help="Staged executable for the generator suite.")
     parser.add_argument("--baseline", "--oracle", default=os.environ.get("RCMAKE_ORACLE_CMAKE"),
                         help="Reference CMake executable for exact Compat stderr comparison.")
@@ -701,7 +701,7 @@ def main() -> int:
     if args.timeout < 1:
         parser.error("Use a positive timeout.")
     if not args.rcmake and (args.projects or args.cmake_arg or args.require_native or args.require_workers):
-        parser.error("Use --rcmake to select the Milestone 6 gate.")
+        parser.error("Use --rcmake to select the determinism gate.")
     if not args.rcmake:
         binary = args.rcmake_bin or Path(os.environ.get("RCMAKE_BIN", ROOT / "target/stage/bin/rcmake"))
         if args.dry_run:

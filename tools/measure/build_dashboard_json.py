@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: MIT OR Apache-2.0
 """Merge verification reports into the public compatibility dashboard.
 
 Use RunCMake evaluator reports for each OS. The core and policy tracks use
 the matching suites from those reports. Use independent_verify.py,
 probe_cache_eval.py, mutation_eval.py, path_swap_eval.py, and wasm_smoke.py
-JSON for their respective gates. Repeat --bench to combine bench_m6.py and
-bench_eval.py reports.
+JSON for their respective gates. Repeat --bench to combine reports from
+bench_configure.py and bench_eval.py.
 
-Use a boss_fight_local.py run directory for --boss-dir. Use downloaded
-64-shard workflow artifacts with shard.json and results.jsonl for --vcpkg-dir.
+Use a large_projects_local.py run directory for --large-projects-dir.
+Use downloaded 64-shard workflow artifacts with shard.json and results.jsonl
+for --vcpkg-dir.
 For --fuzz-dir, supply JSON files with iterations and failures per run.
 Failures can be a count or a list. For --unseen-holdout, supply an aggregate
 object and a categories array. Use reposTotal and reposPassed for the counts
@@ -311,13 +313,13 @@ def merge_fuzz(section, directory):
          "Counts include all inputs in the supplied fuzz reports.")
 
 
-def boss_level(values):
+def large_project_level(values):
     states = {"equal": "pass", "different": "fail", "incomplete": "partial",
               "pass": "pass", "fail": "fail"}
     return combined_status(states[value] for value in values)
 
 
-def merge_boss(track, directory):
+def merge_large_projects(track, directory):
     projects = {row["name"]: row for row in track["projects"]}
     # A local run stores the same project results in the summary and per-project files.
     summaries = {}
@@ -331,12 +333,12 @@ def merge_boss(track, directory):
             individuals[report["project"]] = report
     results = {**summaries, **individuals}
     if not results or results.keys() - projects.keys():
-        raise ValueError("Boss reports must match the published project list.")
+        raise ValueError("Large-project reports must match the published project list.")
     for name, result in results.items():
         levels = result.get("l1", {})
         checks = levels.values() if isinstance(levels, dict) else [levels]
-        l1 = boss_level(checks)
-        l2 = boss_level([result.get("l2", "incomplete")])
+        l1 = large_project_level(checks)
+        l2 = large_project_level([result.get("l2", "incomplete")])
         if result.get("status") in {"fail", "oracle_error"} or result.get("error"):
             l1 = "fail" if l1 == "partial" else l1
             l2 = "fail" if l2 == "partial" else l2
@@ -451,8 +453,8 @@ def main(argv=None):
     parser.add_argument("--version", help="Version of the verified Rcmake binary.")
     for name in (
         "runcmake-macos", "runcmake-linux", "runcmake-windows", "independent", "probe-cache",
-        "mutation", "determinism", "wasm", "boss-dir", "unseen-holdout", "fuzz-dir", "vcpkg-dir",
-        "ci-status-json",
+        "mutation", "determinism", "wasm", "large-projects-dir", "unseen-holdout", "fuzz-dir",
+        "vcpkg-dir", "ci-status-json",
     ):
         parser.add_argument(f"--{name}", type=Path)
     parser.add_argument("--bench", type=Path, action="append", default=[])
@@ -477,8 +479,8 @@ def main(argv=None):
         section = tracks["benchmarksAndGates"]
         merge_benchmarks(section["benchmarks"], args.bench)
         merge_soundness(section, args)
-        if args.boss_dir:
-            merge_boss(tracks["bossFight"], args.boss_dir)
+        if args.large_projects_dir:
+            merge_large_projects(tracks["bossFight"], args.large_projects_dir)
         if args.unseen_holdout:
             merge_holdout(tracks["unseenHoldout"], args.unseen_holdout)
         if args.fuzz_dir:

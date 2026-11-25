@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: MIT OR Apache-2.0
-"""Compare staged Rcmake with CMake 4.5.1 for Milestone 6.
+"""Compare configure performance of staged Rcmake and CMake 4.5.1.
 
 Source env/env.sh, then run this script with --rcmake and --oracle.
 Use --projects synthetic zlib to include a local conformance/corpus/zlib
 checkout. Each run uses a private source copy and build directory.
-Use --scenario all to run the Milestone 6 configure scenarios.
+Use --scenario all to run all configure scenarios.
 Use --require-gates to enforce the acceptance thresholds.
 """
 
@@ -472,7 +472,7 @@ def fetch_fixture(root, env, timeout):
     (git / "CMakeLists.txt").write_text("add_library(git_dep INTERFACE)\n")
     for args in (["init", "--quiet", "--template=", "--object-format=sha1"],
                  ["add", "CMakeLists.txt"],
-                 ["-c", "user.name=M6 Benchmark", "-c", "user.email=m6@example.invalid",
+                 ["-c", "user.name=Rcmake benchmark", "-c", "user.email=benchmark@example.invalid",
                   "commit", "--quiet", "--no-gpg-sign", "-m", "Add fixture"],
                  ["rev-parse", "HEAD"]):
         result = run_command(["git", *args], git, timeout, env)
@@ -570,7 +570,7 @@ def utility_inputs(scratch, quick):
         f"foreach(i RANGE 1 {iterations})\n"
         '  math(EXPR total "${total}+1")\n'
         "endforeach()\n"
-        'message(STATUS "M6 result=${total}")\n'
+        'message(STATUS "bench result=${total}")\n'
     )
     payload = scratch / "payload.bin"
     payload.write_bytes(bytes(range(256)) * (256 if quick else 16384))
@@ -601,7 +601,7 @@ def utility_runs(binary, ctest, inputs, work, env, timeout):
         if not sample.error:
             try:
                 if name == "-P script":
-                    valid = f"-- M6 result={iterations}" in output.splitlines()
+                    valid = f"-- bench result={iterations}" in output.splitlines()
                 elif name == "-E tar":
                     with tarfile.open(work / "payload.tar") as archive:
                         member = archive.extractfile(target.name)
@@ -703,7 +703,7 @@ def markdown(report):
     toolchain_paths = ", ".join(f"{name}={path}" for name, path in meta["toolchain_defaults"].items() if path)
     toolchain_env = ", ".join(f"{key}={value}" for key, value in meta["toolchain_env"].items())
     lines = [
-        "# Milestone 6 benchmark", "",
+        "# Configure benchmark", "",
         f"Runs per tool {meta['runs']} on {meta['system']} {meta['machine']}. "
         f"Generator {meta['generator']}. Timeout {meta['timeout_seconds']:g} s per command.",
         f"Rcmake profile {meta['rcmake_profile']}. Load average {meta['load_average'][0]:.2f} "
@@ -807,7 +807,7 @@ def main():
     probes = 24 if not args.quick and WARM_PROBE in phases else 1
     fetch_env = {**env, "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull}
     rows = []
-    with tempfile.TemporaryDirectory(prefix="rcmake-bench-m6-", dir="/tmp") as temp:
+    with tempfile.TemporaryDirectory(prefix="rcmake-bench-configure-", dir="/tmp") as temp:
         scratch = Path(temp).resolve()
         sample, version = measure([binaries["oracle"], "--version"], scratch, env, timeout)
         if sample.error:

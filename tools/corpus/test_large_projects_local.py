@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: MIT OR Apache-2.0
-"""Test local Boss-Fight scoring, process limits, and saved evidence."""
+"""Test local large-project scoring, process limits, and saved evidence."""
 
 import contextlib
 import io
@@ -13,7 +13,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-import boss_fight_local as boss
+import large_projects_local as runner
 from ninja_canon import Normalizer, dry_run
 from pathswap import Stage, compare_runs
 
@@ -73,7 +73,7 @@ if "-n" in sys.argv:
 """
 
 
-class BossFightTests(unittest.TestCase):
+class LargeProjectTests(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
@@ -86,8 +86,8 @@ class BossFightTests(unittest.TestCase):
 
     def test_cli_and_manifest(self):
         options = ["--rcmake-stage", "stage", "--oracle", "oracle/bin/cmake", "--run-dir", "run"]
-        args = boss.parse_args(["--project", "all", "--mode", "full", "--keep-builds", *options])
-        pins = boss.load_projects(args.project)
+        args = runner.parse_args(["--project", "all", "--mode", "full", "--keep-builds", *options])
+        pins = runner.load_projects(args.project)
         self.assertEqual([row["name"] for row in pins],
                          ["duckdb", "opencv", "vtk", "qtbase", "llvm-project"])
         self.assertEqual(args.rcmake_stage, Path("stage"))
@@ -95,10 +95,10 @@ class BossFightTests(unittest.TestCase):
         self.assertEqual(args.run_dir, Path("run"))
         self.assertEqual(args.mode, "full")
         self.assertTrue(args.keep_builds)
-        default = boss.parse_args(["--project", "llvm-project", *options])
+        default = runner.parse_args(["--project", "llvm-project", *options])
         self.assertEqual(default.mode, "parity")
         self.assertFalse(default.keep_builds)
-        llvm, = boss.load_projects(default.project)
+        llvm, = runner.load_projects(default.project)
         self.assertEqual(llvm["source_subdir"], "llvm")
         self.assertEqual(llvm["l2_targets"], ["clang"])
         self.assertEqual(llvm["l4"]["ninja"], ["check-clang"])
@@ -109,15 +109,15 @@ class BossFightTests(unittest.TestCase):
                 "--run-dir", "run"]
         with contextlib.redirect_stderr(io.StringIO()):
             with self.assertRaises(SystemExit):
-                boss.parse_args([*args, "--project", "boost"])
+                runner.parse_args([*args, "--project", "boost"])
             with self.assertRaises(SystemExit):
-                boss.parse_args([*args, "--mode", "quick"])
+                runner.parse_args([*args, "--mode", "quick"])
 
     def test_manifest_rejects_unknown_schema(self):
         path = self.root / "invalid.toml"
         path.write_text("schema_version = 9\n")
         with self.assertRaisesRegex(ValueError, "schema version"):
-            boss.load_projects("all", path)
+            runner.load_projects("all", path)
 
     def test_model_data_drops_backtrace_indexes(self):
         reply = self.root / "reply"
@@ -128,7 +128,7 @@ class BossFightTests(unittest.TestCase):
                   "dependencies": [{"id": "b", "backtrace": 4}, {"id": "a", "backtrace": 5}]}
         (reply / "t.json").write_text(json.dumps(target))
         (reply / "m.json").write_text(json.dumps({"targets": [{"name": "app", "jsonFile": "t.json"}]}))
-        self.assertEqual(boss.model_data(reply, Normalizer(self.root)), {"targets": [{"name": "app", "data": {
+        self.assertEqual(runner.model_data(reply, Normalizer(self.root)), {"targets": [{"name": "app", "data": {
             "name": "app", "sources": [{"path": "a.c"}], "dependencies": [{"id": "a"}, {"id": "b"}]}}]})
 
     def test_save_l1_hides_only_the_value_of_nondeterministic_cache_entries(self):
@@ -137,10 +137,10 @@ class BossFightTests(unittest.TestCase):
         (log / "CMakeCache.txt").write_text(
             "// comment\nOPENCV_TIMESTAMP:INTERNAL=2026-11-25T10:00:00Z\nOTHER:STRING=x\n")
         (log / "configure.stderr").write_text("")
-        tc = boss.Toolchain(self.root, self.root, Path("/usr/bin/cc"), Path("/usr/bin/c++"),
+        tc = runner.Toolchain(self.root, self.root, Path("/usr/bin/cc"), Path("/usr/bin/c++"),
                             Path("ninja"), Path(sys.executable))
-        with patch("boss_fight_local.run_command"):
-            boss.save_l1(log, Normalizer(self.root), tc, {})
+        with patch("large_projects_local.run_command"):
+            runner.save_l1(log, Normalizer(self.root), tc, {})
         self.assertEqual(json.loads((log / "cache.json").read_text()), {
             "OPENCV_TIMESTAMP:INTERNAL": "<nondeterministic>", "OTHER:STRING": "x"})
 
@@ -154,7 +154,7 @@ class BossFightTests(unittest.TestCase):
     def test_pathswap_reports_each_excess_occurrence(self):
         tools = self.root / "bin"
         tools.mkdir()
-        for tool in boss.TOOLS:
+        for tool in runner.TOOLS:
             self.script(tools / tool, "")
         old = "[1/3] cc -Ia -Ib\n[2/3] cc -Ia -Ib\n[3/3] cc -Ia -Ib\n"
         new = "[1/1] cc -Ia -Ib\n"
@@ -178,8 +178,8 @@ class BossFightTests(unittest.TestCase):
         for engine, commands in (("oracle", ["cc", "cc", "cc"]), ("rcmake", ["cc"])):
             path = self.root / engine
             path.mkdir()
-            boss.write_json(path / "commands.json", commands)
-        l1, l2 = boss.compare_lanes(self.root)
+            runner.write_json(path / "commands.json", commands)
+        l1, l2 = runner.compare_lanes(self.root)
         self.assertEqual(l2, "different")
         self.assertTrue(all(value == "incomplete" for value in l1.values()))
         self.assertEqual(json.loads((self.root / "command-count-diff.json").read_text()),
@@ -197,24 +197,24 @@ class BossFightTests(unittest.TestCase):
             engines[name] = bin_dir
             if name == "rcmake":
                 self.script(bin_dir / "rcmake", FAKE_CMAKE)
-                for tool in boss.TOOLS:
+                for tool in runner.TOOLS:
                     (bin_dir / tool).symlink_to("rcmake")
             else:
-                for tool in boss.TOOLS:
+                for tool in runner.TOOLS:
                     self.script(bin_dir / tool, FAKE_CMAKE)
         return engines
 
     def test_configure_evidence_survives_ninja_failure_and_cleanup(self):
         engines = self.fake_engines()
         ninja = self.script(self.root / "fail-ninja", FAKE_NINJA)
-        tc = boss.Toolchain(self.root, self.root, Path("/usr/bin/cc"), Path("/usr/bin/c++"),
+        tc = runner.Toolchain(self.root, self.root, Path("/usr/bin/cc"), Path("/usr/bin/c++"),
                             ninja, Path(sys.executable))
         run = self.root / "run"
         (run / "reports").mkdir(parents=True)
-        pin, = boss.load_projects("duckdb")
-        args = boss.parse_args(["--project", "duckdb", "--rcmake-stage", str(self.root / "rcmake"),
+        pin, = runner.load_projects("duckdb")
+        args = runner.parse_args(["--project", "duckdb", "--rcmake-stage", str(self.root / "rcmake"),
                                 "--oracle", str(engines["oracle"] / "cmake"), "--run-dir", str(run)])
-        run_command = boss.run_command
+        run_command = runner.run_command
 
         def checkout(log, work, source, repository, revision, env, **kwargs):
             source.mkdir()
@@ -225,16 +225,16 @@ class BossFightTests(unittest.TestCase):
                 return None
             return run_command(log, label, argv, timeout, env, cwd)
 
-        disk = type("Disk", (), {"free": 100 * boss.GIB})()
-        with patch("boss_fight_local.checkout", side_effect=checkout), \
-                patch("boss_fight_local.run_command", side_effect=command), \
-                patch("boss_fight_local.shutil.disk_usage", return_value=disk), \
+        disk = type("Disk", (), {"free": 100 * runner.GIB})()
+        with patch("large_projects_local.checkout", side_effect=checkout), \
+                patch("large_projects_local.run_command", side_effect=command), \
+                patch("large_projects_local.shutil.disk_usage", return_value=disk), \
                 contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-            result = boss.run_project(pin, run, engines, tc, args)
+            result = runner.run_project(pin, run, engines, tc, args)
         report = run / "reports/duckdb"
         self.assertEqual(result["status"], "fail")
         self.assertEqual(result["l2"], "incomplete")
-        self.assertEqual(result["l1"], dict.fromkeys(boss.L1_FILES, "equal"))
+        self.assertEqual(result["l1"], dict.fromkeys(runner.L1_FILES, "equal"))
         self.assertEqual(result["lanes"]["rcmake"]["configure"], "pass")
         self.assertEqual(result["lanes"]["rcmake"]["dry_run"], "fail")
         self.assertFalse((run / "duckdb").exists())
@@ -254,15 +254,15 @@ class BossFightTests(unittest.TestCase):
     def test_opencv_full_uses_the_test_graph_and_installs_the_manifest_graph(self):
         engines = self.fake_engines()
         ninja = self.script(self.root / "ninja", FAKE_NINJA)
-        tc = boss.Toolchain(self.root, self.root, Path("/usr/bin/cc"), Path("/usr/bin/c++"),
+        tc = runner.Toolchain(self.root, self.root, Path("/usr/bin/cc"), Path("/usr/bin/c++"),
                             ninja, Path(sys.executable))
         log, lane, source = (self.root / name for name in ("logs", "lane", "source"))
         log.mkdir()
         source.mkdir()
-        pin, = boss.load_projects("opencv")
+        pin, = runner.load_projects("opencv")
         result = {}
-        with patch("boss_fight_local.MIN_FREE", 0), contextlib.redirect_stdout(io.StringIO()):
-            boss.run_lane("rcmake", engines, pin, lane, log, source, [], tc, "full", source, result)
+        with patch("large_projects_local.MIN_FREE", 0), contextlib.redirect_stdout(io.StringIO()):
+            runner.run_lane("rcmake", engines, pin, lane, log, source, [], tc, "full", source, result)
 
         def command(label):
             return json.loads((log / f"{label}.json").read_text())["argv"]
@@ -280,7 +280,7 @@ class BossFightTests(unittest.TestCase):
         argv = [sys.executable, "-c", "import time; time.sleep(10)"]
         with contextlib.redirect_stdout(io.StringIO()):
             with self.assertRaisesRegex(RuntimeError, "timeout"):
-                boss.run_command(self.root, "timeout", argv, 0.1, os.environ.copy(), self.root)
+                runner.run_command(self.root, "timeout", argv, 0.1, os.environ.copy(), self.root)
         status = json.loads((self.root / "timeout.json").read_text())
         self.assertEqual(status["stop"], "timeout")
         self.assertLess(status["returncode"], 0)
@@ -288,9 +288,9 @@ class BossFightTests(unittest.TestCase):
 
     def test_disk_limit_stops_before_launch(self):
         argv = [sys.executable, "-c", "print('started')"]
-        with patch("boss_fight_local.MIN_FREE", sys.maxsize), contextlib.redirect_stdout(io.StringIO()):
+        with patch("large_projects_local.MIN_FREE", sys.maxsize), contextlib.redirect_stdout(io.StringIO()):
             with self.assertRaisesRegex(RuntimeError, "disk limit"):
-                boss.run_command(self.root, "disk", argv, 30, os.environ.copy(), self.root)
+                runner.run_command(self.root, "disk", argv, 30, os.environ.copy(), self.root)
         status = json.loads((self.root / "disk.json").read_text())
         self.assertEqual(status["stop"], "disk limit")
         self.assertIsNone(status["returncode"])
@@ -298,9 +298,9 @@ class BossFightTests(unittest.TestCase):
 
     def test_memory_limit_stops_process(self):
         argv = [sys.executable, "-c", "import time; time.sleep(10)"]
-        with patch("boss_fight_local.MAX_RSS", 0), contextlib.redirect_stdout(io.StringIO()):
+        with patch("large_projects_local.MAX_RSS", 0), contextlib.redirect_stdout(io.StringIO()):
             with self.assertRaisesRegex(RuntimeError, "memory limit"):
-                boss.run_command(self.root, "memory", argv, 5, os.environ.copy(), self.root)
+                runner.run_command(self.root, "memory", argv, 5, os.environ.copy(), self.root)
         status = json.loads((self.root / "memory.json").read_text())
         self.assertEqual(status["stop"], "memory limit")
         self.assertGreater(status["peak_group_rss_bytes_sampled"], 0)

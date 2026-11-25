@@ -65,7 +65,7 @@ def tables(data):
 
 def exclusions():
     names, repos = set(), set()
-    for filename in ("manifest.toml", "boss_fight.toml"):
+    for filename in ("manifest.toml", "large_projects.toml"):
         with (CORPUS / filename).open("rb") as file:
             data = tomllib.load(file)
         names.update(project["name"].lower() for project in data["project"])

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: MIT OR Apache-2.0
 """Render CMake 4.5.1 help for the standalone Rcmake binary."""
 
 import argparse

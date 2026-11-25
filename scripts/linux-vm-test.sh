@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MIT OR Apache-2.0
 set -euo pipefail
 
 root="$(cd "$(dirname "$0")/.." && pwd -P)"
@@ -277,7 +278,7 @@ linux_qt() (
   local bin="$1" work test_name
   work="$(mktemp -d)"
   trap 'rm -rf "$work"' EXIT
-  timeout --kill-after=10s 120s "$bin/cmake" -S "$root/conformance/cases/m6-langs/autogen" -B "$work" -G Ninja
+  timeout --kill-after=10s 120s "$bin/cmake" -S "$root/conformance/cases/languages/autogen" -B "$work" -G Ninja
   timeout --kill-after=10s 180s "$bin/cmake" --build "$work" --parallel 2
   for test_name in autogen_app autogen_other; do
     QT_QPA_PLATFORM=offscreen timeout --kill-after=10s 60s \

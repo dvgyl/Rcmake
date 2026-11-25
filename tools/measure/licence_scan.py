@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: MIT OR Apache-2.0
 """Check source licences, clean-room rules, and locked Cargo dependencies."""
 
 from __future__ import annotations
