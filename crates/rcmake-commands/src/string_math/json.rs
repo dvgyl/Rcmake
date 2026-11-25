@@ -120,7 +120,8 @@ fn evaluate<'a>(cx: &Cx<'_>, args: &'a [&'a [u8]]) -> Result<'a, BString> {
                     map.insert(BString::from(*key), new);
                 }
                 Value::Array(items) => {
-                    let pos = index(key, None).map_err(|error| error.at(path))?;
+                    let pos =
+                        index(key, Some(u32::MAX as usize)).map_err(|error| error.at(path))?;
                     if let Some(item) = items.get_mut(pos) {
                         *item = new;
                     } else {
@@ -363,7 +364,11 @@ fn lookup<'a, 'v>(mut value: &'v mut Value, path: &'a [&'a [u8]]) -> Result<'a, 
         value =
             match value {
                 Value::Object(map) => map.get_mut(*key).ok_or_else(|| {
-                    Failure::new(format!("member '{}' not found", key.to_str_lossy())).at(traversed)
+                    Failure::new(format!(
+                        "member '{}' not found",
+                        traversed.join(&b' ').to_str_lossy()
+                    ))
+                    .at(traversed)
                 })?,
                 Value::Array(items) => {
                     let i = index(key, Some(items.len())).map_err(|error| error.at(traversed))?;

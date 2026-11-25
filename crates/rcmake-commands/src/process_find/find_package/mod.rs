@@ -28,12 +28,23 @@ pub(super) const PACKAGE_ROOTS: &[u8] = b"_RCMAKE_FIND_PACKAGE_ROOTS";
 const PACKAGE_ROOT_SPELLINGS: &[u8] = b"_RCMAKE_FIND_PACKAGE_ROOT_SPELLINGS";
 
 pub(super) fn find_package(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
-    find_package_with_diagnostics(cx, args, None)
+    find_package_with_options(cx, args, None, None)
 }
 
-pub(super) fn find_package_with_diagnostics(
+pub(super) fn find_package_dependency(
     cx: &mut Cx<'_>,
     args: &[ExpandedArg],
+    parent: &Request,
+    needed: bool,
+    diagnostics: &mut Vec<cps_import::PackageDiagnostic>,
+) -> CmdResult {
+    find_package_with_options(cx, args, Some((parent, needed)), Some(diagnostics))
+}
+
+fn find_package_with_options(
+    cx: &mut Cx<'_>,
+    args: &[ExpandedArg],
+    parent: Option<(&Request, bool)>,
     dependency: Option<&mut Vec<cps_import::PackageDiagnostic>>,
 ) -> CmdResult {
     cx.check_package_find(false)?;
@@ -43,7 +54,12 @@ pub(super) fn find_package_with_diagnostics(
         ));
     };
     let name = &package.value;
-    let request = Request::parse(cx, parameters)?;
+    let mut request = Request::parse(parameters)?;
+    if let Some((parent, needed)) = parent {
+        request.inherit(cx, parent, needed);
+    } else {
+        request.snapshot_search(cx);
+    }
     let unwind = request.unwind_include;
     cx.check_package_find(unwind)?;
     cx.project().package_lookups.insert(name.clone());
@@ -238,7 +254,7 @@ fn find_requested_package(
     match found {
         Ok(found) => finish(cx, name, &request, first_target, found),
         Err(err) => {
-            record_result(cx, name, request.quiet, cx.var_is_on(&found_var));
+            record_result(cx, name, &request, cx.var_is_on(&found_var));
             Err(err)
         }
     }
@@ -255,7 +271,7 @@ fn finish(
     first_target: usize,
     found: bool,
 ) -> CmdResult {
-    record_result(cx, name, request.quiet, found);
+    record_result(cx, name, request, found);
     let version = cx.var(&text(&[name, b"_VERSION"]));
     let global = request.global || cx.var_is_on(b"CMAKE_FIND_PACKAGE_TARGETS_GLOBAL");
     let dir = cx.current_dir_id();
@@ -295,11 +311,30 @@ fn finish(
     Ok(Flow::Normal)
 }
 
-fn record_result(cx: &mut Cx<'_>, name: &[u8], quiet: bool, found: bool) {
-    cx.global().props.set(
+fn record_result(cx: &mut Cx<'_>, name: &[u8], request: &Request, found: bool) {
+    let properties = &mut cx.global().props;
+    properties.set(
         text(&[b"_CMAKE_", name, b"_QUIET"]),
-        if quiet { "TRUE" } else { "FALSE" }.into(),
+        if request.quiet { "TRUE" } else { "FALSE" }.into(),
     );
+    properties.set(
+        text(&[b"_CMAKE_", name, b"_TRANSITIVE_DEPENDENCY"]),
+        "False".into(),
+    );
+    let version = request
+        .version
+        .as_ref()
+        .map_or_else(BString::default, |version| {
+            if version.full.windows(3).any(|part| part == b"...") {
+                version.full.clone()
+            } else {
+                text(&[if request.exact { b"== " } else { b">= " }, &version.full])
+            }
+        });
+    properties.set(text(&[b"_CMAKE_", name, b"_REQUIRED_VERSION"]), version);
+    if request.required {
+        properties.set(text(&[b"_CMAKE_", name, b"_TYPE"]), "REQUIRED".into());
+    }
     for (property, include) in [
         (b"PACKAGES_FOUND".as_slice(), found),
         (b"PACKAGES_NOT_FOUND", !found),
@@ -451,20 +486,7 @@ fn search(
     } else {
         config.missing_message(try_module)
     };
-    if let Some(diagnostics) = dependency {
-        if let Some(rejection) = config.rejected_dependency {
-            diagnostics.extend(rejection.diagnostics);
-        } else {
-            diagnostics.push(cps_import::PackageDiagnostic::new(message));
-        }
-    } else if request.required
-        && let Some(rejection) = config.rejected_dependency
-    {
-        for diagnostic in rejection.diagnostics {
-            diagnostic.emit(cx);
-        }
-        report_missing(cx, request, rejection.reason)?;
-    } else if !try_module && !request.module && !request.required && config.considered.is_empty() {
+    if !try_module && !request.module && !request.required && config.considered.is_empty() {
         if !request.quiet && cx.log_level() >= LogLevel::Status {
             cx.host().write_out(
                 Stream::Stdout,
@@ -477,6 +499,8 @@ fn search(
                 ]),
             );
         }
+    } else if let Some(diagnostics) = dependency {
+        diagnostics.push(cps_import::PackageDiagnostic::new(message));
     } else {
         let result = report_missing(cx, request, message);
         if request.module && (request.required || !request.quiet && !request.optional) {

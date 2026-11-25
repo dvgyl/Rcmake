@@ -98,9 +98,10 @@ impl Write for Encoder {
     }
 }
 
-pub(super) struct Decoder<'a> {
-    groups: &'a [u8],
-    group: &'a [u8],
+pub(super) struct Decoder<R> {
+    groups: R,
+    group: [u8; MAX_WIDTH],
+    len: usize,
     bits: usize,
     width: usize,
     max_width: usize,
@@ -110,9 +111,11 @@ pub(super) struct Decoder<'a> {
     phrase: Vec<u8>,
 }
 
-impl<'a> Decoder<'a> {
-    pub(super) fn new(bytes: &'a [u8]) -> io::Result<Self> {
-        let &[0x1f, 0x9d, flags, ref groups @ ..] = bytes else {
+impl<R: Read> Decoder<R> {
+    pub(super) fn new(mut groups: R) -> io::Result<Self> {
+        let mut header = [0; 3];
+        groups.read_exact(&mut header)?;
+        let [0x1f, 0x9d, flags] = header else {
             return Err(invalid_stream());
         };
         let max_width = usize::from(flags & 0x1f);
@@ -121,7 +124,8 @@ impl<'a> Decoder<'a> {
         }
         Ok(Self {
             groups,
-            group: &[],
+            group: [0; MAX_WIDTH],
+            len: 0,
             bits: 0,
             width: START_WIDTH,
             max_width,
@@ -133,20 +137,36 @@ impl<'a> Decoder<'a> {
     }
 
     fn next_code(&mut self) -> io::Result<Option<u16>> {
-        if self.bits + self.width > self.group.len() * 8 {
-            if self.groups.is_empty() {
+        if self.bits + self.width > self.len * 8 {
+            self.len = 0;
+            while self.len < self.width {
+                match self.groups.read(
+                    self.group
+                        .get_mut(self.len..self.width)
+                        .ok_or_else(invalid_stream)?,
+                ) {
+                    Ok(0) => break,
+                    Ok(n) => self.len += n,
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            if self.len == 0 {
                 return Ok(None);
             }
-            if self.groups.len() * 8 < self.width {
+            if self.len * 8 < self.width {
                 return Err(invalid_stream());
             }
-            let (group, remaining) = self.groups.split_at(self.width.min(self.groups.len()));
-            self.group = group;
-            self.groups = remaining;
             self.bits = 0;
         }
         let mut packed = [0; 4];
-        for (dest, &src) in packed.iter_mut().zip(self.group.iter().skip(self.bits / 8)) {
+        for (dest, &src) in packed.iter_mut().zip(
+            self.group
+                .get(..self.len)
+                .ok_or_else(invalid_stream)?
+                .iter()
+                .skip(self.bits / 8),
+        ) {
             *dest = src;
         }
         let code = (u32::from_le_bytes(packed) >> (self.bits % 8)) & ((1 << self.width) - 1);
@@ -159,7 +179,7 @@ impl<'a> Decoder<'a> {
         loop {
             let next = first_free + self.dictionary.len();
             if self.width < self.max_width && next == 1 << self.width {
-                self.group = &[];
+                self.len = 0;
                 self.width += 1;
             }
             let Some(code) = self.next_code()? else {
@@ -169,7 +189,7 @@ impl<'a> Decoder<'a> {
                 if self.previous.is_none() || self.group.len() != self.width {
                     return Err(invalid_stream());
                 }
-                self.group = &[];
+                self.len = 0;
                 self.width = START_WIDTH;
                 self.dictionary.clear();
                 self.previous = None;
@@ -205,7 +225,7 @@ impl<'a> Decoder<'a> {
     }
 }
 
-impl Read for Decoder<'_> {
+impl<R: Read> Read for Decoder<R> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         // Return bytes already decoded before examining the next phrase.
         if buf.is_empty() || (self.phrase.is_empty() && !self.decode_phrase()?) {

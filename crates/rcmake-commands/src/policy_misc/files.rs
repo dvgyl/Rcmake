@@ -272,6 +272,12 @@ pub(crate) fn configure_file(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult
     } else {
         write_configured(cx, &dest, &content, mode)?;
     }
+    let template = path::from_native_cmake(&source);
+    let dir = cx.current_dir_id();
+    let dir = cx.project().dir_mut(dir);
+    if !dir.listfiles.contains(&template) {
+        dir.listfiles.push(template);
+    }
     Ok(Flow::Normal)
 }
 

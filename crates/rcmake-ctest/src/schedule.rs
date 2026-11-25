@@ -686,7 +686,11 @@ pub(crate) fn run(
             let attempt = if let Some(completion) = completion {
                 budget = None;
                 completion
-            } else if !expired && !scheduler.ready.ordered.is_empty() && running.slots < jobs {
+            } else if !expired
+                && !scheduler.stopped
+                && !scheduler.ready.ordered.is_empty()
+                && running.slots < jobs
+            {
                 let spare = *budget.get_or_insert_with(|| {
                     limit.map_or(jobs, |limit| {
                         load = simulated_load.unwrap_or_else(|| system_load(host));
@@ -705,10 +709,6 @@ pub(crate) fn run(
                 {
                     scheduler.ready.ordered.remove(&(rank, id));
                     let test = &plan.tests[id];
-                    if scheduler.stopped && !test.cleanup {
-                        scheduler.advance(id)?;
-                        continue;
-                    }
                     runs[id] += 1;
                     let run = scheduler.repetition.numbered_run(id, runs[id]);
                     let result = match prepare(host, options, plan, &scheduler.statuses, test) {

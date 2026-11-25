@@ -182,7 +182,7 @@ impl Evaluator<'_> {
                     )));
                 }
                 self.flags.context_sensitive = true;
-                let exists = self.host.find_target_in_context(&name, call.ctx).is_some();
+                let exists = self.named_target(&name, call.ctx).is_some();
                 if call.name == b"TARGET_EXISTS" {
                     return Ok(boolean(exists));
                 }
@@ -212,22 +212,18 @@ impl Evaluator<'_> {
         name: &[u8],
     ) -> Result<TargetHandle, GenexError> {
         self.flags.context_sensitive = true;
-        self.host
-            .find_target_in_context(name, call.ctx)
-            .ok_or_else(|| {
-                let name = BString::from(name);
-                call.error(match call.name {
-                    b"TARGET_PROPERTY" | b"TARGET_INTERMEDIATE_DIR" => {
-                        format!("Target \"{name}\" not found.")
-                    }
-                    b"TARGET_OBJECTS" | b"TARGET_RUNTIME_DLLS" | b"TARGET_RUNTIME_DLL_DIRS" => {
-                        format!(
-                            "Objects of target \"{name}\" referenced but no such target exists."
-                        )
-                    }
-                    _ => format!("No target \"{name}\""),
-                })
+        self.named_target(name, call.ctx).ok_or_else(|| {
+            let name = BString::from(name);
+            call.error(match call.name {
+                b"TARGET_PROPERTY" | b"TARGET_INTERMEDIATE_DIR" => {
+                    format!("Target \"{name}\" not found.")
+                }
+                b"TARGET_OBJECTS" | b"TARGET_RUNTIME_DLLS" | b"TARGET_RUNTIME_DLL_DIRS" => {
+                    format!("Objects of target \"{name}\" referenced but no such target exists.")
+                }
+                _ => format!("No target \"{name}\""),
             })
+        })
     }
 
     fn policy(&mut self, call: Call<'_>) -> Value {

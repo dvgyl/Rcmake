@@ -300,8 +300,7 @@ impl Evaluator<'_> {
         if name.is_empty() {
             return Err(call.error("No value provided for the TARGET: option."));
         }
-        self.host
-            .find_target_in_context(name, call.ctx)
+        self.named_target(name, call.ctx)
             .ok_or_else(|| call.error(format!("Non-existent target: {}", BString::from(name))))
     }
 }

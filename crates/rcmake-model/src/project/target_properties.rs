@@ -117,7 +117,7 @@ impl ProjectModel {
             return Vec::new();
         }
         if !value.windows(3).any(|bytes| bytes == b"::@") {
-            return vec![item(value, origin.dir)];
+            return vec![item(value, owner)];
         }
         let marker = |text: &[u8]| -> Option<DirId> {
             let digits = text.strip_prefix(b"::@(0x")?.strip_suffix(b")")?;
@@ -131,9 +131,9 @@ impl ProjectModel {
             .iter()
             .any(|text| *text == b"::@" || marker(text).is_some())
         {
-            return vec![item(value, origin.dir)];
+            return vec![item(value, owner)];
         }
-        let mut dir = origin.dir;
+        let mut dir = owner;
         split
             .into_iter()
             .map(|text| {
@@ -185,4 +185,61 @@ fn link_elements(value: &[u8]) -> Vec<&[u8]> {
     }
     elements.extend(value.get(start..));
     elements
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{AppendMode, ImportedVisibility, PropScope, TargetKind, TargetOrigin};
+
+    #[test]
+    fn unmarked_links_use_the_target_directory() -> Result<(), ModelError> {
+        let mut model = ProjectModel::default();
+        let trace = Backtrace::default();
+        let child = model.add_directory(
+            DirId::ROOT,
+            "/source/sub".into(),
+            "/build/sub".into(),
+            trace.clone(),
+        )?;
+        let create = |name: &str, dir, origin| {
+            Target::new(
+                name.into(),
+                TargetKind::InterfaceLibrary,
+                origin,
+                dir,
+                trace.clone(),
+                Default::default(),
+            )
+        };
+        let owner = model.add_target(create("owner", DirId::ROOT, TargetOrigin::Normal))?;
+        let dep = model.add_target(create(
+            "dep",
+            child,
+            TargetOrigin::Imported(ImportedVisibility::Local),
+        ))?;
+        assert_eq!(model.find_target(child, b"dep"), Some(dep));
+        model.append_prop(
+            &PropScope::Target(owner),
+            b"INTERFACE_LINK_LIBRARIES",
+            b"dep",
+            AppendMode::List,
+            PropOrigin {
+                dir: child,
+                backtrace: &trace,
+            },
+        )?;
+        let target = model.target(owner).ok_or(ModelError::UnknownObject)?;
+        let items = target
+            .usage
+            .interface_link_libraries
+            .as_deref()
+            .unwrap_or_default();
+        let [item] = items else {
+            return Err(ModelError::UnknownObject);
+        };
+        assert_eq!(item.lookup_dir, DirId::ROOT);
+        assert!(model.find_target(item.lookup_dir, b"dep").is_none());
+        Ok(())
+    }
 }

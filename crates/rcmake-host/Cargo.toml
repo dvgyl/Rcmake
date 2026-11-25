@@ -18,6 +18,7 @@ workspace = true
 
 [target.'cfg(any(unix, windows))'.dependencies]
 jiff = { workspace = true, features = ["tz-system", "tzdb-zoneinfo", "tzdb-bundle-platform"] }
+tempfile.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 rustix.workspace = true
@@ -26,9 +27,6 @@ rustix.workspace = true
 process-wrap = { version = "10.0.0", default-features = false, features = ["std", "job-object"] }
 winapi-util = "0.1.11"
 winreg = { version = "0.56.0", default-features = false }
-
-[dev-dependencies]
-tempfile.workspace = true
 
 [[test]]
 name = "native_process"

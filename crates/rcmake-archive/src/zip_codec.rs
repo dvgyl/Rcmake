@@ -1,18 +1,21 @@
-use flate2::read::DeflateDecoder;
+use std::io::{BufRead, BufReader, Read, SeekFrom, Write};
+
+use flate2::bufread::DeflateDecoder;
 use jiff::tz::TimeZone;
-use rcmake_host::FileTime;
+use rcmake_host::{FileTime, ReadSeek};
 use zip::{
     DateTime,
     extra_fields::{ExtendedTimestamp, Ntfs},
 };
 
 use crate::codec;
-use crate::extract::read_payload;
-use crate::{
-    ArchiveError, MAX_ENTRIES, TarCompression, ZipCompression, archive_error, size_limit, timestamp,
-};
+use crate::extract::stage;
+use crate::{ArchiveError, TarCompression, ZipCompression, archive_error, timestamp};
 
+mod directory;
 pub(super) mod writer;
+
+pub(super) use directory::open;
 
 const LOCAL: &[u8; 4] = b"PK\x03\x04";
 const CENTRAL: &[u8; 4] = b"PK\x01\x02";
@@ -22,208 +25,25 @@ const ZIP64_LOCATOR: &[u8; 4] = b"PK\x06\x07";
 const CENTRAL_HEADER_SIZE: usize = 46;
 const END_RECORD_SIZE: usize = 22;
 
-pub(super) struct Directory<'a> {
-    records: &'a [u8],
+pub(super) struct Directory {
+    records: Vec<u8>,
+    pub(super) bytes_left: u64,
     count: usize,
-    offset: usize,
-    local: &'a [u8],
+    offset: u64,
+    local_end: u64,
 }
 
-pub(super) fn open(bytes: &[u8]) -> Result<Directory<'_>, ArchiveError> {
-    let mut selected = None;
-    let mut error = None;
-    // ZIP permits trailing bytes after the end record and its comment.
-    for (position, magic) in bytes.windows(END.len()).enumerate().rev() {
-        let comment_start = position + END_RECORD_SIZE;
-        if let Some((selected, _)) = &selected
-            && comment_start + usize::from(u16::MAX) <= *selected
-        {
-            break;
-        }
-        if magic != END {
-            continue;
-        }
-        let Some(footer) = footer_at(bytes, position) else {
-            continue;
-        };
-        // A valid end record can still be part of an earlier record's comment.
-        if let Some((selected, _)) = &selected
-            && !(comment_start..footer.comment_end).contains(selected)
-        {
-            continue;
-        }
-        match open_directory(bytes, footer) {
-            Ok(directory) => selected = Some((position, directory)),
-            Err(failure) => {
-                error.get_or_insert(failure);
-            }
-        }
-    }
-    selected
-        .map(|(_, directory)| directory)
-        .ok_or_else(|| error.unwrap_or_else(invalid_header))
-}
-
-fn open_directory<'a>(bytes: &'a [u8], footer: Footer<'a>) -> Result<Directory<'a>, ArchiveError> {
-    let layout = if let Some(locator) = footer.locator {
-        zip64_layout(bytes, locator)?
-    } else {
-        zip32_layout(bytes, footer)?
-    };
-    if layout.count > MAX_ENTRIES as u64 {
-        return Err(entry_limit());
-    }
-    let end = layout
-        .start
-        .checked_add(layout.size)
-        .ok_or_else(invalid_header)?;
-    if end > layout.footer {
-        return Err(invalid_header());
-    }
-    let records = bytes.get(layout.start..end).ok_or_else(invalid_header)?;
-    let local = bytes.get(..layout.start).ok_or_else(invalid_header)?;
-    if bytes
-        .get(end..layout.footer)
-        .is_some_and(|tail| tail.starts_with(CENTRAL))
-    {
-        return Err(invalid_header());
-    }
-    let directory = Directory {
-        records,
-        count: layout.count as usize,
-        offset: layout.offset,
-        local,
-    };
-    directory.preflight()?;
-    Ok(directory)
-}
-
-struct Footer<'a> {
-    position: usize,
-    comment_end: usize,
-    fields: &'a [u8],
-    locator: Option<(usize, &'a [u8])>,
-}
-
-fn footer_at(bytes: &[u8], position: usize) -> Option<Footer<'_>> {
-    let fields = bytes.get(position + END.len()..position + END_RECORD_SIZE)?;
-    let comment_size = usize::from(word(fields, 16).ok()?);
-    let comment_end = position + END_RECORD_SIZE + comment_size;
-    bytes.get(..comment_end)?;
-    let locator = position.checked_sub(20).and_then(|offset| {
-        let locator = bytes.get(offset..position)?.strip_prefix(ZIP64_LOCATOR)?;
-        (word(fields, 6).ok()? == u16::MAX || dword(fields, 12).ok()? == u32::MAX)
-            .then_some((offset, locator))
-    });
-    Some(Footer {
-        position,
-        comment_end,
-        fields,
-        locator,
-    })
-}
-
-struct Layout {
-    start: usize,
-    size: usize,
-    offset: usize,
-    count: u64,
-    footer: usize,
-}
-
-fn zip32_layout(bytes: &[u8], footer: Footer<'_>) -> Result<Layout, ArchiveError> {
-    let fields = footer.fields;
-    let count = word(fields, 6)?;
-    if word(fields, 0)? != 0 || word(fields, 2)? != 0 || word(fields, 4)? != count {
-        return Err(invalid_header());
-    }
-    let relative = dword(fields, 12)? as usize;
-    let size = dword(fields, 8)? as usize;
-    // Check the declared offset even when the directory is empty.
-    let available = bytes
-        .get(relative..footer.position)
-        .ok_or_else(invalid_header)?;
-    if size > available.len() || size < usize::from(count) * CENTRAL_HEADER_SIZE {
-        return Err(invalid_header());
-    }
-    let start = if count == 0 && size == 0 {
-        footer.position
-    } else {
-        relative
-            + available
-                .windows(CENTRAL.len())
-                .take(available.len() - size + 1)
-                .position(|magic| magic == CENTRAL)
-                .ok_or_else(invalid_header)?
-    };
-    let offset = start.checked_sub(relative).ok_or_else(invalid_header)?;
-    Ok(Layout {
-        start,
-        size,
-        offset,
-        count: u64::from(count),
-        footer: footer.position,
-    })
-}
-
-fn zip64_layout(bytes: &[u8], locator: (usize, &[u8])) -> Result<Layout, ArchiveError> {
-    let (position, fields) = locator;
-    let relative = usize::try_from(qword(fields, 4)?).map_err(archive_error)?;
-    if dword(fields, 0)? != 0 || dword(fields, 12)? > 1 {
-        return Err(invalid_header());
-    }
-    let search = bytes.get(relative..position).ok_or_else(invalid_header)?;
-    for (offset, signature) in search.windows(ZIP64_END.len()).enumerate() {
-        if signature != ZIP64_END {
-            continue;
-        }
-        let Some(tail) = search.get(offset + 4..) else {
-            continue;
-        };
-        let Ok(record_size) = qword(tail, 0) else {
-            continue;
-        };
-        // The locator can follow a gap after the ZIP64 end record.
-        if record_size < 44 || record_size.saturating_add(8) > tail.len() as u64 {
-            continue;
-        }
-        if dword(tail, 12)? != 0 || dword(tail, 16)? != 0 || word(tail, 10)? > word(tail, 8)? {
-            continue;
-        }
-        let count = qword(tail, 28)?;
-        if qword(tail, 20)? != count {
-            continue;
-        }
-        if count > MAX_ENTRIES as u64 {
-            return Err(entry_limit());
-        }
-        let start = usize::try_from(qword(tail, 44)?)
-            .map_err(archive_error)?
-            .checked_add(offset)
-            .ok_or_else(invalid_header)?;
-        let size = usize::try_from(qword(tail, 36)?).map_err(archive_error)?;
-        return Ok(Layout {
-            start,
-            size,
-            offset,
-            count,
-            footer: relative + offset,
-        });
-    }
-    Err(invalid_header())
-}
-
-impl<'a> Directory<'a> {
-    pub(super) fn preflight(&self) -> Result<u64, ArchiveError> {
-        let mut bytes_left = size_limit();
-        let mut records = self.records;
+impl Directory {
+    fn preflight(
+        &self,
+        input: &mut dyn ReadSeek,
+        mut bytes_left: u64,
+    ) -> Result<u64, ArchiveError> {
+        let mut records = self.records.as_slice();
         for _ in 0..self.count {
             let entry = self.next(&mut records)?;
-            bytes_left = bytes_left
-                .checked_sub(entry.name.len() as u64 + 512)
-                .ok_or_else(entry_limit)?
-                .checked_sub(entry.size)
-                .ok_or_else(size_error)?;
+            entry.payload_start(input)?;
+            bytes_left = bytes_left.checked_sub(entry.size).ok_or_else(size_error)?;
         }
         // A digital signature can follow the central directory entries.
         if let Some(signature) = records.strip_prefix(b"PK\x05\x05") {
@@ -236,12 +56,16 @@ impl<'a> Directory<'a> {
         Ok(bytes_left)
     }
 
-    pub(super) fn entries(&self) -> impl Iterator<Item = Result<Entry<'a>, ArchiveError>> + '_ {
-        let mut records = self.records;
+    pub(super) fn metadata_bytes(&self) -> usize {
+        self.records.len()
+    }
+
+    pub(super) fn entries(&self) -> impl Iterator<Item = Result<Entry<'_>, ArchiveError>> + '_ {
+        let mut records = self.records.as_slice();
         (0..self.count).map(move |_| self.next(&mut records))
     }
 
-    fn next(&self, records: &mut &'a [u8]) -> Result<Entry<'a>, ArchiveError> {
+    fn next<'a>(&self, records: &mut &'a [u8]) -> Result<Entry<'a>, ArchiveError> {
         let mut reader = Fields(records.strip_prefix(CENTRAL).ok_or_else(invalid_header)?);
         let header = reader.take(CENTRAL_HEADER_SIZE - CENTRAL.len())?;
         let name = reader.take(usize::from(word(header, 24)?))?;
@@ -261,7 +85,7 @@ impl<'a> Directory<'a> {
             size: u64::from(dword(header, 20)?),
             local_offset: u64::from(dword(header, 38)?),
             mode: unix_mode(word(header, 0)? >> 8, dword(header, 34)?),
-            local: self.local,
+            local_end: self.local_end,
         };
         if word(header, 30)? != 0 && word(header, 30)? != u16::MAX {
             return Err(invalid_header());
@@ -286,7 +110,7 @@ impl<'a> Directory<'a> {
         }
         entry.local_offset = entry
             .local_offset
-            .checked_add(self.offset as u64)
+            .checked_add(self.offset)
             .ok_or_else(invalid_header)?;
         Ok(entry)
     }
@@ -296,7 +120,7 @@ pub(super) struct Entry<'a> {
     pub(super) name: &'a [u8],
     pub(super) size: u64,
     pub(super) mode: Option<u32>,
-    local: &'a [u8],
+    local_end: u64,
     extra: &'a [u8],
     method: u16,
     flags: u16,
@@ -346,30 +170,61 @@ impl Entry<'_> {
         }))
     }
 
-    pub(super) fn payload(&self) -> Result<Vec<u8>, ArchiveError> {
+    fn payload_start(&self, input: &mut dyn ReadSeek) -> Result<u64, ArchiveError> {
+        let header_end = self
+            .local_offset
+            .checked_add(30)
+            .filter(|&end| end <= self.local_end)
+            .ok_or_else(invalid_header)?;
+        let header = directory::read_at::<30>(input, self.local_offset)?;
+        if !header.starts_with(LOCAL) {
+            return Err(invalid_header());
+        }
+        let start = header_end + u64::from(word(&header, 26)?) + u64::from(word(&header, 28)?);
+        if start
+            .checked_add(self.compressed)
+            .is_none_or(|end| end > self.local_end)
+        {
+            return Err(invalid_header());
+        }
+        Ok(start)
+    }
+
+    pub(super) fn payload(
+        &self,
+        input: &mut dyn ReadSeek,
+        output: &mut dyn Write,
+    ) -> Result<(), ArchiveError> {
         if self.flags & 1 != 0 {
             return Err(ArchiveError::new("Encrypted ZIP entries are not supported"));
         }
-        let offset = usize::try_from(self.local_offset).map_err(archive_error)?;
-        let local = self
-            .local
-            .get(offset..)
-            .and_then(|bytes| bytes.strip_prefix(LOCAL))
-            .ok_or_else(invalid_header)?;
-        let start = 26 + usize::from(word(local, 22)?) + usize::from(word(local, 24)?);
-        let mut local = Fields(local.get(start..).ok_or_else(invalid_header)?);
-        let compressed = local.take(usize::try_from(self.compressed).map_err(archive_error)?)?;
-
-        let data = match self.method {
-            0 => read_payload(compressed, self.size)?,
-            8 => read_payload(DeflateDecoder::new(compressed), self.size)?,
+        let start = self.payload_start(input)?;
+        input.seek(SeekFrom::Start(start)).map_err(archive_error)?;
+        let mut packed = BufReader::with_capacity(stage::BUFFER, input.take(self.compressed));
+        let mut checksum = Checksum {
+            output,
+            crc: crc32fast::Hasher::new(),
+        };
+        let size = self.size;
+        match self.method {
+            0 => stage::copy(&mut packed, &mut checksum, size)?,
+            8 => stage::copy(DeflateDecoder::new(&mut packed), &mut checksum, size)?,
             14 => {
-                let Some([_, _, 5, 0, properties @ ..]) = compressed.get(..9) else {
+                let mut header = [0; 9];
+                packed.read_exact(&mut header).map_err(archive_error)?;
+                let [_, _, 5, 0, properties @ ..] = header else {
                     return Err(invalid_header());
                 };
-                let tail = compressed.get(9..).ok_or_else(invalid_header)?;
-                let lzma = [properties, &self.size.to_le_bytes(), tail].concat();
-                read_payload(codec::decoder(TarCompression::Lzma, &lzma)?, self.size)?
+                let len = size.to_le_bytes();
+                let stream = properties
+                    .as_slice()
+                    .chain(len.as_slice())
+                    .chain(&mut packed);
+                stage::copy(
+                    codec::decoder(TarCompression::Lzma, stream)?,
+                    &mut checksum,
+                    size,
+                )?;
             }
             method => {
                 let filter = match method {
@@ -382,13 +237,37 @@ impl Entry<'_> {
                         )));
                     }
                 };
-                read_payload(codec::decoder(filter, compressed)?, self.size)?
+                stage::copy(codec::decoder(filter, &mut packed)?, &mut checksum, size)?;
             }
-        };
-        if crc32fast::hash(&data) != self.crc {
+        }
+        if checksum.crc.finalize() != self.crc {
             return Err(ArchiveError::new("ZIP entry checksum does not match"));
         }
-        Ok(data)
+        if !packed.fill_buf().map_err(archive_error)?.is_empty() || packed.get_ref().limit() != 0 {
+            return Err(invalid_header());
+        }
+        Ok(())
+    }
+}
+
+struct Checksum<'a> {
+    output: &'a mut dyn Write,
+    crc: crc32fast::Hasher,
+}
+
+impl Write for Checksum<'_> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let written = self.output.write(bytes)?;
+        self.crc.update(
+            bytes
+                .get(..written)
+                .ok_or_else(|| std::io::Error::other("Invalid ZIP output length"))?,
+        );
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.output.flush()
     }
 }
 

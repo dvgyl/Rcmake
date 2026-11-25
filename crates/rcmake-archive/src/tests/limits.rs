@@ -80,27 +80,29 @@ fn charges_duplicate_zip_records_before_selection() -> TestResult {
     let host = test_host();
     let archive = Path::new("/archive");
     let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
-    for name in ["first", "other"] {
-        writer.start_file(name, SimpleFileOptions::default())?;
+    for index in 0..17 {
+        writer.start_file(format!("{index:05}"), SimpleFileOptions::default())?;
         writer.write_all(b"x")?;
     }
     let mut bytes = writer.finish()?.into_inner();
-    let zip = ZipArchive::new(Cursor::new(&bytes))?;
-    let start = usize::try_from(zip.central_directory_start())?;
-    let mut zip = zip;
-    let second = usize::try_from(zip.by_index_raw(1)?.central_header_start())?;
+    let mut zip = ZipArchive::new(Cursor::new(&bytes))?;
+    let mut offsets = Vec::new();
+    for index in 0..17 {
+        offsets.push(usize::try_from(
+            zip.by_index_raw(index)?.central_header_start(),
+        )?);
+    }
     drop(zip);
-    let size = u32::try_from(size_limit() / 2)?;
-    for offset in [start, second] {
+    for offset in offsets {
         bytes
             .get_mut(offset + 24..offset + 28)
             .ok_or("Missing central directory size field")?
-            .copy_from_slice(&size.to_le_bytes());
+            .copy_from_slice(&(u32::MAX - 1).to_le_bytes());
+        bytes
+            .get_mut(offset + 46..offset + 51)
+            .ok_or("Missing central directory name")?
+            .copy_from_slice(b"first");
     }
-    bytes
-        .get_mut(second + 46..second + 51)
-        .ok_or("Missing central directory name")?
-        .copy_from_slice(b"first");
     host.seed_file(archive, &bytes)?;
     assert!(
         list_command_archive(&host, archive, names(&["missing"]), None)
@@ -181,8 +183,11 @@ fn ignores_zip_end_records_inside_the_comment() -> TestResult {
         commented.extend_from_slice(&[0, 0]);
         if offset == u32::MAX {
             assert!(
-                crate::zip_codec::open(commented.get(end + 22..).ok_or("Missing comment")?)
-                    .is_err()
+                {
+                    let comment = commented.get(end + 22..).ok_or("Missing comment")?;
+                    crate::zip_codec::open(&mut Cursor::new(comment), comment.len() as u64, 128)
+                }
+                .is_err()
             );
         }
         host.write(archive, &commented, WriteMode::Truncate)?;
@@ -214,7 +219,7 @@ fn rejects_excessive_7zip_counts_in_raw_and_encoded_headers() -> TestResult {
         (raw_files.as_slice(), copy.as_slice()),
     ] {
         let bytes = seven_zip_bytes(packed, header);
-        assert!(seven_zip::open(&bytes)
+        assert!(open_seven_zip(&bytes)
             .is_err_and(|error| error.message == "7-Zip header exceeds the entry or size limit"));
     }
     Ok(())
@@ -256,7 +261,7 @@ fn limits_total_7zip_header_decoder_memory() -> TestResult {
     ];
     let header = seven_zip_encoded_header(0, 1, 2, &coders_and_bindings, &[2, 2])?;
     assert!(
-        seven_zip::open(&seven_zip_bytes(b"x", &header))
+        open_seven_zip(&seven_zip_bytes(b"x", &header))
             .is_err_and(|error| error.message == "7-Zip header exceeds the entry or size limit")
     );
     Ok(())
@@ -270,7 +275,7 @@ fn checks_every_zstandard_frame_window_in_a_7zip_header() -> TestResult {
     let sizes = [u8::try_from(raw.len())?];
     let header = seven_zip_encoded_header(0, packed.len(), 1, &coders, &sizes)?;
     assert!(
-        seven_zip::open(&seven_zip_bytes(&packed, &header))?
+        open_seven_zip(&seven_zip_bytes(&packed, &header))?
             .files
             .is_empty()
     );
@@ -278,7 +283,7 @@ fn checks_every_zstandard_frame_window_in_a_7zip_header() -> TestResult {
     packed.extend_from_slice(b"\x28\xb5\x2f\xfd\x00\x78\x01\0\0");
     let header = seven_zip_encoded_header(0, packed.len(), 1, &coders, &sizes)?;
     assert!(
-        seven_zip::open(&seven_zip_bytes(&packed, &header))
+        open_seven_zip(&seven_zip_bytes(&packed, &header))
             .is_err_and(|error| error.message == "7-Zip header exceeds the entry or size limit")
     );
     Ok(())
@@ -325,4 +330,8 @@ fn seven_zip_bytes(packed: &[u8], header: &[u8]) -> Vec<u8> {
     bytes.extend_from_slice(packed);
     bytes.extend_from_slice(header);
     bytes
+}
+
+fn open_seven_zip(bytes: &[u8]) -> Result<sevenz_rust2::Archive, ArchiveError> {
+    seven_zip::open(&mut Cursor::new(bytes), bytes.len() as u64)
 }

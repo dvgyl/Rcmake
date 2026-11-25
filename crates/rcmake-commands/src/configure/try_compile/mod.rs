@@ -15,7 +15,7 @@ use child::{ChildBuild, ChildConfig};
 use log::log_probe;
 use project::write_project;
 use run::run_executable;
-use seed::{TryCompileSeed, probe_imports};
+use seed::TryCompileSeed;
 
 #[cfg(all(feature = "native", any(unix, windows)))]
 pub(in crate::configure) mod active;
@@ -24,6 +24,7 @@ mod args;
 pub(super) mod cache;
 mod capture;
 mod child;
+mod imports;
 #[cfg(all(feature = "native", any(unix, windows)))]
 pub(super) mod journal;
 mod log;
@@ -276,11 +277,9 @@ fn build_probe(
     run_var: Option<&[u8]>,
 ) -> Result<(), CmdError> {
     let source_signature = matches!(signature, Signature::Sources { .. });
-    let imports = if source_signature {
-        probe_imports(cx, options)?
-    } else {
-        Vec::new()
-    };
+    if source_signature {
+        imports::validate_direct_links(cx, options)?;
+    }
     let probe_target;
     let mut probe_languages = None;
     let target = match signature {
@@ -301,6 +300,12 @@ fn build_probe(
         Signature::Project { target, .. } => *target,
     };
     let mut seed = TryCompileSeed::new(cx, options, source_signature);
+    let imports = match (probe_languages.as_deref(), target) {
+        (Some(languages), Some(target)) => {
+            imports::discover(cx, options, &seed, languages, target, run_var.is_some())?
+        }
+        _ => Vec::new(),
+    };
     let variables = seed::logged_variables(cx, probe_languages.as_deref());
     let limit = b"CMAKE_MAXIMUM_RECURSION_DEPTH";
     if let Some(value) = cx.var(limit)
@@ -333,7 +338,14 @@ fn build_probe(
     if let Some(probe) = &mut cached_probe
         && let Some(hit) = probe.hit(cx, dirs, options)
     {
-        return apply_probe(cx, options, dirs, (build_var, run_var), &variables, hit);
+        return apply_probe(
+            cx,
+            options,
+            dirs,
+            (build_var, run_var),
+            (&variables, None),
+            hit,
+        );
     }
 
     let parent = cx.host_arc();
@@ -371,7 +383,23 @@ fn build_probe(
     {
         probe.record(cx, dirs, build_var, &result, journal.finish());
     }
-    apply_probe(cx, options, dirs, (build_var, run_var), &variables, result)
+    let source = match signature {
+        Signature::Sources { sources, .. } => sources.first().map(|source| match source {
+            args::Source::File(file)
+            | args::Source::Content(file, _)
+            | args::Source::Variable(file, _)
+            | args::Source::Copy(file, _) => *file,
+        }),
+        Signature::Project { .. } => None,
+    };
+    apply_probe(
+        cx,
+        options,
+        dirs,
+        (build_var, run_var),
+        (&variables, source),
+        result,
+    )
 }
 
 struct ProbeResult {
@@ -387,7 +415,7 @@ fn apply_probe(
     options: &Options<'_>,
     dirs: &ProbeDirs,
     (build_var, run_var): (&[u8], Option<&[u8]>),
-    variables: &[(BString, BString)],
+    (variables, source): (&[(BString, BString)], Option<&[u8]>),
     result: ProbeResult,
 ) -> Result<(), CmdError> {
     let ProbeResult {
@@ -397,16 +425,27 @@ fn apply_probe(
         ..
     } = result;
     set_build_result(cx, build_var, options, outcome.success, &output);
+    let mut missing = None;
     let run_result = if outcome.success
         && let Some(var) = run_var
     {
-        Some(run_executable(
-            cx,
-            options,
-            artifact.as_deref(),
-            var,
-            &output,
-        ))
+        if let Some(artifact) = artifact.as_deref()
+            && cx.var_is_on(b"CMAKE_CROSSCOMPILING")
+            && !cx.var_defined(b"CMAKE_CROSSCOMPILING_EMULATOR")
+        {
+            let cross =
+                run::cross::resolve(cx, options, artifact, (build_var, var), source, &output)?;
+            missing = cross.missing;
+            Some(cross.result)
+        } else {
+            Some(run_executable(
+                cx,
+                options,
+                artifact.as_deref(),
+                var,
+                &output,
+            ))
+        }
     } else {
         None
     };
@@ -421,6 +460,9 @@ fn apply_probe(
             &output,
             run_var.map(|var| (var, run_result.as_ref())),
         )?;
+    }
+    if let Some(message) = missing {
+        cx.issue(MessageKind::Error, Effect::SetError, None, message);
     }
     if let Some(destination) = options.one(b"COPY_FILE") {
         let destination = absolute(&cx.host().initial_cwd(), destination);

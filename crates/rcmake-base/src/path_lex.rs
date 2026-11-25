@@ -205,12 +205,24 @@ impl<'a> Lexical<'a> {
 
     /// Relative path from `base` to `self` (`RELATIVE_PATH`). `None` when the roots differ.
     pub fn relative(self, base: Self) -> Option<BString> {
-        if !self.same_root(base) {
+        self.relative_with_case(base, false)
+    }
+
+    /// Compute a relative path, optionally folding ASCII case in path components.
+    pub fn relative_with_case(self, base: Self, ignore_case: bool) -> Option<BString> {
+        let equal = |a: &[u8], b: &[u8]| a == b || (ignore_case && a.eq_ignore_ascii_case(b));
+        if !equal(self.root_name(), base.root_name())
+            || self.root_directory() != base.root_directory()
+        {
             return None;
         }
         let mut target = self.components().peekable();
         let mut base_parts = base.components().peekable();
-        while target.peek().is_some() && target.peek() == base_parts.peek() {
+        while target
+            .peek()
+            .zip(base_parts.peek())
+            .is_some_and(|(a, b)| equal(a, b))
+        {
             target.next();
             base_parts.next();
         }

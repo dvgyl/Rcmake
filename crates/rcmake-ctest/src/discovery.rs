@@ -253,7 +253,21 @@ fn set_properties(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
                                         .write_out(rcmake_host::Stream::Stdout, message.as_bytes());
                                 }
                             }
-                            if matches!(key.value.as_slice(), b"REQUIRED_FILES" | b"LABELS") {
+                            if matches!(
+                                key.value.as_slice(),
+                                b"REQUIRED_FILES"
+                                    | b"LABELS"
+                                    | b"ENVIRONMENT"
+                                    | b"ENVIRONMENT_MODIFICATION"
+                                    | b"RESOURCE_LOCK"
+                                    | b"FIXTURES_SETUP"
+                                    | b"FIXTURES_REQUIRED"
+                                    | b"FIXTURES_CLEANUP"
+                                    | b"DEPENDS"
+                                    | b"PASS_REGULAR_EXPRESSION"
+                                    | b"FAIL_REGULAR_EXPRESSION"
+                                    | b"SKIP_REGULAR_EXPRESSION"
+                            ) {
                                 let property =
                                     test.properties.entry(key.value.clone()).or_default();
                                 append_property(property, &value.value);

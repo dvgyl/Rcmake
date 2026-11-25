@@ -142,10 +142,10 @@ fn lzma_header(bytes: &[u8]) -> bool {
         && (size.is_power_of_two() || (size.is_multiple_of(3) && (size / 3).is_power_of_two()))
 }
 
-pub(super) fn decoder(
+pub(super) fn decoder<'a>(
     filter: TarCompression,
-    bytes: &[u8],
-) -> Result<Box<dyn Read + '_>, ArchiveError> {
+    bytes: impl std::io::BufRead + 'a,
+) -> Result<Box<dyn Read + 'a>, ArchiveError> {
     Ok(match filter {
         TarCompression::Gzip => Box::new(MultiGzDecoder::new(bytes)),
         TarCompression::Bzip2 => Box::new(MultiBzDecoder::new(bytes)),

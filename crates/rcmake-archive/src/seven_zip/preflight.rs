@@ -1,4 +1,6 @@
-use std::io::Cursor;
+use std::io::{Cursor, SeekFrom};
+
+use rcmake_host::ReadSeek;
 
 use sevenz_rust2::{Archive, Block, BlockDecoder, EncoderMethod as Method, Password};
 
@@ -23,8 +25,9 @@ const CODER_SIZES: u8 = 0x0c;
 const SUBSTREAM_COUNT: u8 = 0x0d;
 const ENCODED_HEADER: u8 = 0x17;
 
-pub(super) fn open(bytes: &[u8]) -> Result<Archive, ArchiveError> {
-    let (prefix, rest) = bytes.split_at_checked(START_SIZE).ok_or_else(invalid)?;
+pub(super) fn open(input: &mut dyn ReadSeek, len: u64) -> Result<Archive, ArchiveError> {
+    let mut prefix = [0; START_SIZE];
+    read_at(input, 0, &mut prefix)?;
     if !prefix.starts_with(MAGIC) || prefix.get(6) != Some(&0) {
         return Err(invalid());
     }
@@ -33,35 +36,43 @@ pub(super) fn open(bytes: &[u8]) -> Result<Archive, ArchiveError> {
     if crc32fast::hash(start.0) != crc {
         return Err(invalid());
     }
-    let offset = usize::try_from(u64::from_le_bytes(start.fixed()?)).map_err(archive_error)?;
-    let size = usize::try_from(u64::from_le_bytes(start.fixed()?)).map_err(archive_error)?;
-    if size > MAX_HEADER_BYTES {
+    let offset = u64::from_le_bytes(start.fixed()?);
+    let size = u64::from_le_bytes(start.fixed()?);
+    if size > MAX_HEADER_BYTES as u64 {
         return Err(limit());
     }
     let crc = u32::from_le_bytes(start.fixed()?);
-    let packed = rest.get(..offset).ok_or_else(invalid)?;
-    let mut tail = Header(rest.get(offset..).ok_or_else(invalid)?);
-    let header = tail.take(size)?;
-    if crc32fast::hash(header) != crc {
+    let position = offset.checked_add(START_SIZE as u64).ok_or_else(invalid)?;
+    if position.checked_add(size).is_none_or(|end| end > len) {
+        return Err(invalid());
+    }
+    let mut header = vec![0; size as usize];
+    read_at(input, position, &mut header)?;
+    if crc32fast::hash(&header) != crc {
         return Err(invalid());
     }
 
-    if let [ENCODED_HEADER, stream_info @ ..] = header {
-        let decoded = decode_header(bytes, packed, stream_info)?;
-        validate_raw(&decoded, packed)?;
+    if let [ENCODED_HEADER, stream_info @ ..] = header.as_slice() {
+        let decoded = decode_header(input, offset, stream_info)?;
+        validate_raw(&decoded, offset)?;
         read_raw(&decoded)
     } else {
-        validate_raw(header, packed)?;
-        Archive::read_with_memory_limit(
-            &mut Cursor::new(bytes),
-            &Password::empty(),
-            MAX_HEADER_MEMORY_KIB,
-        )
-        .map_err(archive_error)
+        validate_raw(&header, offset)?;
+        read_raw(&header)
     }
 }
 
-fn validate_raw(header: &[u8], packed: &[u8]) -> Result<(), ArchiveError> {
+fn read_at(input: &mut dyn ReadSeek, position: u64, bytes: &mut [u8]) -> Result<(), ArchiveError> {
+    input
+        .seek(SeekFrom::Start(position))
+        .map_err(archive_error)?;
+    for chunk in bytes.chunks_mut(64 * 1024) {
+        input.read_exact(chunk).map_err(archive_error)?;
+    }
+    Ok(())
+}
+
+fn validate_raw(header: &[u8], packed: u64) -> Result<(), ArchiveError> {
     let mut input = Header(header);
     input.marker(HEADER)?;
     let mut field = input.byte()?;
@@ -73,7 +84,7 @@ fn validate_raw(header: &[u8], packed: &[u8]) -> Result<(), ArchiveError> {
         field = input.byte()?;
     }
     if field == MAIN_STREAMS {
-        input.streams(false)?.packed_bytes(packed)?;
+        input.streams(false)?.packed_span(packed)?;
         field = input.byte()?;
     }
     match field {
@@ -86,13 +97,17 @@ fn validate_raw(header: &[u8], packed: &[u8]) -> Result<(), ArchiveError> {
     }
 }
 
-fn decode_header(bytes: &[u8], packed: &[u8], streams: &[u8]) -> Result<Vec<u8>, ArchiveError> {
+fn decode_header(
+    mut source: &mut dyn ReadSeek,
+    packed: u64,
+    streams: &[u8],
+) -> Result<Vec<u8>, ArchiveError> {
     let mut input = Header(streams);
     let info = input.streams(true)?;
     if !input.0.is_empty() || info.folders != 1 || info.pack_streams != 1 || info.substreams != 1 {
         return Err(invalid());
     }
-    let stream = info.packed_bytes(packed)?;
+    let stream = info.packed_span(packed)?;
 
     // Present the validated header stream as one file. This reuses the bounded
     // decoder without letting it parse the decoded header as archive metadata.
@@ -115,9 +130,9 @@ fn decode_header(bytes: &[u8], packed: &[u8], streams: &[u8]) -> Result<Vec<u8>,
     let [block] = archive.blocks.as_slice() else {
         return Err(invalid());
     };
-    check_decoder_memory(block, stream)?;
+    check_decoder_memory(block, source, stream)?;
 
-    let mut source = Cursor::new(bytes);
+    source.seek(SeekFrom::Start(0)).map_err(archive_error)?;
     let mut decoded = None;
     BlockDecoder::new_with_memory_limit(
         1,
@@ -139,7 +154,11 @@ fn decode_header(bytes: &[u8], packed: &[u8], streams: &[u8]) -> Result<Vec<u8>,
     Ok(decoded)
 }
 
-fn check_decoder_memory(block: &Block, stream: &[u8]) -> Result<(), ArchiveError> {
+fn check_decoder_memory(
+    block: &Block,
+    input: &mut dyn ReadSeek,
+    stream: (u64, u64),
+) -> Result<(), ArchiveError> {
     let mut remaining = MAX_HEADER_BYTES as u64;
     let mut packed_input = Some(stream);
     let mut count = 0;
@@ -181,10 +200,10 @@ fn check_decoder_memory(block: &Block, stream: &[u8]) -> Result<(), ArchiveError
             Method::ID_DEFLATE => 512 * 1024,
             Method::ID_ZSTD => {
                 // A preceding transform can hide the frame from preflight.
-                let input = packed_input.ok_or_else(|| {
+                let span = packed_input.ok_or_else(|| {
                     ArchiveError::new("Zstandard must read packed bytes in a 7-Zip header")
                 })?;
-                zstd_window(input)? + 1024 * 1024
+                zstd_window(input, span)? + 1024 * 1024
             }
             _ => return Err(ArchiveError::new("Unsupported 7-Zip header coder")),
         };
@@ -200,36 +219,84 @@ fn check_decoder_memory(block: &Block, stream: &[u8]) -> Result<(), ArchiveError
     Ok(())
 }
 
-fn zstd_window(mut stream: &[u8]) -> Result<u64, ArchiveError> {
+fn zstd_window(
+    input: &mut dyn ReadSeek,
+    (mut offset, end): (u64, u64),
+) -> Result<u64, ArchiveError> {
     let mut largest = 0;
-    while !stream.is_empty() {
-        let mut frame = Header(stream);
-        let magic = u32::from_le_bytes(frame.fixed()?);
-        match magic {
-            0xfd2f_b528 => {
-                let descriptor = frame.byte()?;
-                let window = if descriptor & 0x20 == 0 {
-                    let window = frame.byte()?;
-                    let base = 1_u64 << (10 + (window >> 3));
-                    base + (base / 8) * u64::from(window & 7)
-                } else {
-                    // A single-segment frame uses its content size as its window.
-                    zstd::zstd_safe::get_frame_content_size(stream)
-                        .map_err(|_| invalid())?
-                        .ok_or_else(invalid)?
-                };
-                if window > MAX_HEADER_BYTES as u64 {
-                    return Err(limit());
-                }
-                largest = largest.max(window);
-            }
-            0x184d_2a50..=0x184d_2a5f => {}
-            _ => return Err(invalid()),
+    while offset < end {
+        let mut bytes = [0; 18];
+        let len = (end - offset).min(bytes.len() as u64) as usize;
+        let bytes = bytes.get_mut(..len).ok_or_else(invalid)?;
+        read_at(input, offset, bytes)?;
+        let mut header = Header(bytes);
+        let magic = u32::from_le_bytes(header.fixed()?);
+        if (0x184d_2a50..=0x184d_2a5f).contains(&magic) {
+            let size = u32::from_le_bytes(header.fixed()?);
+            offset = advance(offset, 8 + u64::from(size), end)?;
+            continue;
         }
-        let size = zstd::zstd_safe::find_frame_compressed_size(stream).map_err(|_| invalid())?;
-        stream = stream.get(size..).ok_or_else(invalid)?;
+        if magic != 0xfd2f_b528 {
+            return Err(invalid());
+        }
+        let descriptor = header.byte()?;
+        if descriptor & 0x08 != 0 {
+            return Err(invalid());
+        }
+        let single = descriptor & 0x20 != 0;
+        let window = if single {
+            zstd::zstd_safe::get_frame_content_size(bytes)
+                .map_err(|_| invalid())?
+                .ok_or_else(invalid)?
+        } else {
+            let window = header.byte()?;
+            let base = 1_u64 << (10 + (window >> 3));
+            base + (base / 8) * u64::from(window & 7)
+        };
+        if window > MAX_HEADER_BYTES as u64 {
+            return Err(limit());
+        }
+        largest = largest.max(window);
+        let dictionary = [0, 1, 2, 4]
+            .get(usize::from(descriptor & 3))
+            .copied()
+            .ok_or_else(invalid)?;
+        let size = [usize::from(single), 2, 4, 8]
+            .get(usize::from(descriptor >> 6))
+            .copied()
+            .ok_or_else(invalid)?;
+        header.take(dictionary + size)?;
+        offset = advance(offset, (len - header.0.len()) as u64, end)?;
+        loop {
+            if end - offset < 3 {
+                return Err(invalid());
+            }
+            let mut block = [0; 3];
+            read_at(input, offset, &mut block)?;
+            let [a, b, c] = block;
+            let block = u32::from_le_bytes([a, b, c, 0]);
+            let bytes = match (block >> 1) & 3 {
+                0 | 2 => u64::from(block >> 3),
+                1 => 1,
+                _ => return Err(invalid()),
+            };
+            offset = advance(offset, 3 + bytes, end)?;
+            if block & 1 != 0 {
+                break;
+            }
+        }
+        if descriptor & 4 != 0 {
+            offset = advance(offset, 4, end)?;
+        }
     }
     Ok(largest)
+}
+
+fn advance(offset: u64, size: u64, end: u64) -> Result<u64, ArchiveError> {
+    offset
+        .checked_add(size)
+        .filter(|&offset| offset <= end)
+        .ok_or_else(invalid)
 }
 
 fn read_raw(header: &[u8]) -> Result<Archive, ArchiveError> {
@@ -262,11 +329,12 @@ struct Streams {
 }
 
 impl Streams {
-    fn packed_bytes<'a>(&self, packed: &'a [u8]) -> Result<&'a [u8], ArchiveError> {
-        let start = usize::try_from(self.pack_position).map_err(|_| invalid())?;
-        let size = usize::try_from(self.pack_size).map_err(|_| invalid())?;
-        let end = start.checked_add(size).ok_or_else(invalid)?;
-        packed.get(start..end).ok_or_else(invalid)
+    fn packed_span(&self, packed: u64) -> Result<(u64, u64), ArchiveError> {
+        let end = advance(self.pack_position, self.pack_size, packed)?;
+        Ok((
+            START_SIZE as u64 + self.pack_position,
+            START_SIZE as u64 + end,
+        ))
     }
 }
 

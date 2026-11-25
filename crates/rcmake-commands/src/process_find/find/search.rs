@@ -131,6 +131,9 @@ impl<'a> Search<'a> {
             .root_mode
             .resolve(cx, self.kind.root_mode_setting())
             .reroot(cx, dirs);
+        if matches!(self.kind, Kind::Library) {
+            dirs = super::architecture::rewrite(cx, dirs)?;
+        }
         let mut seen = BTreeSet::new();
         dirs.retain(|dir| seen.insert(dir.clone()));
         if let Some(event) = &mut self.event {

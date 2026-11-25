@@ -21,6 +21,7 @@ mod install_manifest;
 mod model;
 mod pipeline;
 mod resolve_link;
+mod scoped_usage_host;
 mod sources;
 mod target;
 mod unity;

@@ -243,7 +243,8 @@ const fn is_error_kind(kind: MessageKind) -> bool {
 /// wrapping non-preformatted paragraphs to at most `width` bytes per line).
 #[must_use]
 pub fn format_paragraphs(text: &[u8], indent: usize, width: usize) -> BString {
-    let mut out = Vec::new();
+    let leading = text.iter().take_while(|&&byte| byte == b'\n').count();
+    let mut out = vec![b'\n'; leading.saturating_mul(2)];
     let mut wrote_any = false;
     let mut prev_preformatted = false;
 

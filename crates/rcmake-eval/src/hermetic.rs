@@ -342,6 +342,8 @@ impl fmt::Display for SourceLocation {
 pub enum ViolationKind {
     /// A read of an environment variable outside the allowlist.
     UndeclaredEnvRead,
+    /// A read of the Windows registry.
+    RegistryRead,
     /// A filesystem read outside the allowed roots.
     OutOfTreePathRead,
     /// Network access without an enforced fetch pin or policy permission.
@@ -355,6 +357,7 @@ impl ViolationKind {
     pub const fn code(self) -> &'static str {
         match self {
             Self::UndeclaredEnvRead => "RCMAKE_HERMETIC_ENV",
+            Self::RegistryRead => "RCMAKE_HERMETIC_REGISTRY",
             Self::OutOfTreePathRead => "RCMAKE_HERMETIC_READ",
             Self::NetworkAccess => "RCMAKE_HERMETIC_NETWORK",
             Self::UnapprovedProcess => "RCMAKE_HERMETIC_PROCESS",
@@ -364,6 +367,7 @@ impl ViolationKind {
     const fn description(self) -> &'static str {
         match self {
             Self::UndeclaredEnvRead => "Read of an undeclared environment variable",
+            Self::RegistryRead => "Read of the Windows registry",
             Self::OutOfTreePathRead => "Read outside the allowed roots",
             Self::NetworkAccess => "Network access outside the fetch policy",
             Self::UnapprovedProcess => "Use of an unapproved executable",
@@ -456,6 +460,7 @@ impl fmt::Display for AuditSummary {
 
 #[derive(Eq, Ord, PartialEq, PartialOrd)]
 enum InputIdentity {
+    Registry,
     Env(BString),
     Path(PathBuf),
     Remote(String, Option<String>),
@@ -493,6 +498,17 @@ impl HermeticAuditor {
     /// Add an input root from the configure request.
     pub fn allow_root(&mut self, host: &dyn Host, path: &Path) -> bool {
         self.policy.allow_root(host, path)
+    }
+
+    /// Record a registry read as an external input.
+    pub fn check_registry(&mut self, site: &HermeticSite) -> AuditOutcome<'_> {
+        self.record(
+            site,
+            ViolationKind::RegistryRead,
+            InputIdentity::Registry,
+            "Windows registry".into(),
+            "Pass the path as a configure input.".into(),
+        )
     }
 
     /// Check an environment read. In warning mode the caller supplies an empty value.

@@ -85,6 +85,11 @@ pub(super) fn sdk_root_digest(host: &dyn Host, root: &Path, graph: Digest) -> Ho
 }
 
 pub(super) fn sdk_graph_digest(host: &dyn Host, canonical: &Path) -> HostResult<Digest> {
+    sdk_graph(host, canonical).map(|(digest, _)| digest)
+}
+
+pub(super) fn sdk_graph(host: &dyn Host, canonical: &Path) -> HostResult<(Digest, bool)> {
+    let mut confined = true;
     let mut key = KeyHasher::new(Domain::BlobV1);
     key.field(0, b"sdk-tree-graph");
     key.field(1, canonical.as_os_str().as_encoded_bytes());
@@ -125,11 +130,13 @@ pub(super) fn sdk_graph_digest(host: &dyn Host, canonical: &Path) -> HostResult<
                         Ok(stat) => stat.kind,
                         Err(error) if error.kind == ErrorKind::NotFound => {
                             key.field(8, b"missing");
+                            confined = false;
                             continue;
                         }
                         Err(error) => return Err(error),
                     };
                     let resolved = host.canonicalize(&child)?;
+                    confined &= resolved.starts_with(canonical);
                     match kind {
                         FileKind::Dir => {
                             key.field(8, b"directory");
@@ -146,5 +153,5 @@ pub(super) fn sdk_graph_digest(host: &dyn Host, canonical: &Path) -> HostResult<
             }
         }
     }
-    Ok(key.finish())
+    Ok((key.finish(), confined))
 }

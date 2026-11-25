@@ -24,6 +24,7 @@ pub(super) struct Options {
     pub(super) no_system: bool,
     pub(super) no_install: bool,
     pub(super) root_mode: RootMode,
+    pub(super) registry_view: Option<BString>,
     pub(super) validator: Option<BString>,
 }
 
@@ -59,15 +60,13 @@ impl Options {
                 b"DOC" => options.doc = args.next().map(|arg| arg.value.clone()),
                 b"REGISTRY_VIEW" => {
                     let view = option_value(&mut args, "REGISTRY_VIEW")?;
-                    if !matches!(
-                        view,
-                        b"64" | b"32" | b"64_32" | b"32_64" | b"HOST" | b"TARGET" | b"BOTH"
-                    ) {
+                    if !super::super::registry_path::valid_view(view) {
                         return Err(CmdError::status(text(&[
                             b"given invalid value for REGISTRY_VIEW: ",
                             view,
                         ])));
                     }
+                    options.registry_view = Some(view.into());
                 }
                 b"VALIDATOR" => {
                     let name = option_value(&mut args, "VALIDATOR")?;

@@ -14,8 +14,8 @@ use rcmake_base::BString;
 use self::fs::{FileSystem, VirtualPath, root};
 use crate::error::{HostError, HostResult, SyntheticError};
 use crate::{
-    CopyOptions, DirEntry, FileLockGuard, FileTime, Follow, Host, Metadata, ReadRange, RunOutput,
-    RunRequest, Stream, SystemInfo, WriteMode, validate_run,
+    CopyOptions, DirEntry, FileLockGuard, FileTime, Follow, Host, Metadata, ReadRange,
+    RegistryRoot, RegistryView, RunOutput, RunRequest, Stream, SystemInfo, WriteMode, validate_run,
 };
 
 /// An ordered stdio output event recorded by [`PureHost`].
@@ -31,6 +31,8 @@ type CommandHandler = dyn Fn(&PureHost, &RunRequest, &mut dyn FnMut(Stream, &[u8
     + Send
     + Sync;
 
+type RegistryKey = (RegistryRoot, BString, Option<BString>, RegistryView);
+
 struct PureState {
     env: BTreeMap<BString, BString>,
     events: Vec<IoEvent>,
@@ -39,6 +41,8 @@ struct PureState {
     fs: FileSystem,
     stdin: VecDeque<u8>,
     handler: Option<Arc<CommandHandler>>,
+    registry_view: Option<RegistryView>,
+    registry: BTreeMap<RegistryKey, BString>,
 }
 
 /// Table of the files that [`PureHost::lock_file`] holds locks on.
@@ -105,9 +109,32 @@ impl PureHost {
                 exe,
                 stdin: VecDeque::new(),
                 handler: None,
+                registry_view: None,
+                registry: BTreeMap::new(),
             }),
             locks: Arc::default(),
         }
+    }
+
+    /// Set the simulated Windows registry host view for tests.
+    pub fn set_registry_host_view(&self, view: RegistryView) -> HostResult<()> {
+        self.lock()?.registry_view = Some(view);
+        Ok(())
+    }
+
+    /// Add a value to the simulated Windows registry.
+    pub fn seed_registry_value(
+        &self,
+        root: RegistryRoot,
+        subkey: &[u8],
+        name: Option<&[u8]>,
+        view: RegistryView,
+        value: &[u8],
+    ) -> HostResult<()> {
+        self.lock()?
+            .registry
+            .insert(registry_key(root, subkey, name, view), value.into());
+        Ok(())
     }
 
     fn lock(&self) -> HostResult<MutexGuard<'_, PureState>> {
@@ -164,6 +191,31 @@ impl PureHost {
         }
         BString::from(out)
     }
+}
+
+fn registry_key(
+    root: RegistryRoot,
+    key: &[u8],
+    name: Option<&[u8]>,
+    view: RegistryView,
+) -> RegistryKey {
+    let key: BString = key
+        .iter()
+        .map(|byte| {
+            if *byte == b'/' {
+                b'\\'
+            } else {
+                byte.to_ascii_lowercase()
+            }
+        })
+        .collect::<Vec<u8>>()
+        .into();
+    (
+        root,
+        key,
+        name.map(|name| name.to_ascii_lowercase().into()),
+        view,
+    )
 }
 
 impl Host for PureHost {
@@ -296,6 +348,27 @@ impl Host for PureHost {
         mtime: Option<FileTime>,
     ) -> HostResult<()> {
         self.lock()?.fs.set_times(p, atime, mtime, Follow::No)
+    }
+
+    fn registry_host_view(&self) -> Option<RegistryView> {
+        self.lock().ok()?.registry_view
+    }
+
+    fn registry_value(
+        &self,
+        root: RegistryRoot,
+        key: &[u8],
+        name: Option<&[u8]>,
+        view: RegistryView,
+    ) -> HostResult<Option<BString>> {
+        let state = self.lock()?;
+        if state.registry_view == Some(RegistryView::Bits32) && view == RegistryView::Bits64 {
+            return Ok(None);
+        }
+        Ok(state
+            .registry
+            .get(&registry_key(root, key, name, view))
+            .cloned())
     }
 
     fn env_get(&self, key: &[u8]) -> Option<BString> {

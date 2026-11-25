@@ -175,17 +175,25 @@ fn relative_path(cx: &mut Cx<'_>, args: &[&[u8]]) -> Result {
             ));
         }
     }
-    set(cx, out, relative_absolute(base, input))
+    set(
+        cx,
+        out,
+        relative_absolute_with_case(base, input, cfg!(any(windows, target_vendor = "apple"))),
+    )
 }
 
 pub(super) fn relative_absolute(base: &[u8], input: &[u8]) -> BString {
+    relative_absolute_with_case(base, input, false)
+}
+
+fn relative_absolute_with_case(base: &[u8], input: &[u8], ignore_case: bool) -> BString {
     let target = Lexical::new(input).normalize();
     let base = Lexical::new(base).normalize();
     let target = target
         .strip_suffix(b"/")
         .filter(|s| !s.is_empty())
         .unwrap_or(&target);
-    let value = Lexical::new(target).relative(Lexical::new(&base));
+    let value = Lexical::new(target).relative_with_case(Lexical::new(&base), ignore_case);
     match value.as_deref() {
         Some(value) if value == b"." => BString::default(),
         Some(value) if value.split(|&byte| byte == b'/').all(|part| part == b"..") => {

@@ -1,0 +1,194 @@
+use std::path::{Component, Path};
+
+use rcmake_base::BString;
+use rcmake_eval::{CmdError, Cx};
+use rcmake_host::path;
+use rcmake_model::{CacheEntry, CacheType, DirId};
+
+use super::{Options, RunResult, apply_output};
+use crate::configure::try_compile::{copy_artifact, project::write_bracket_arg};
+
+pub(in crate::configure::try_compile) struct CrossRun {
+    pub(in crate::configure::try_compile) result: RunResult,
+    pub(in crate::configure::try_compile) missing: Option<BString>,
+}
+
+pub(in crate::configure::try_compile) fn resolve(
+    cx: &mut Cx<'_>,
+    options: &Options<'_>,
+    artifact: &Path,
+    (build_var, run_var): (&[u8], &[u8]),
+    source: Option<&[u8]>,
+    build_output: &[u8],
+) -> Result<CrossRun, CmdError> {
+    let root = path::to_native(&cx.project().dir(DirId::ROOT).binary_dir);
+    let result_file = root.join("TryRunResults.cmake");
+    let details = format!("For details see {}", result_file.display());
+    let mut name = artifact.file_stem().unwrap_or_default().to_os_string();
+    name.push("-");
+    name.push(path::to_native(run_var));
+    if let Some(extension) = artifact.extension() {
+        name.push(".");
+        name.push(extension);
+    }
+    let path = Path::new(&name);
+    if !matches!(
+        path.components().collect::<Vec<_>>().as_slice(),
+        [Component::Normal(_)]
+    ) || path.file_name() != Some(name.as_os_str())
+        || run_var.is_empty()
+        || run_var.contains(&0)
+        || cfg!(windows)
+            && run_var
+                .iter()
+                .any(|byte| matches!(byte, b':' | b'<' | b'>' | b'"' | b'|' | b'?' | b'*'))
+    {
+        return Err(CmdError::status(
+            "Invalid try_run result variable name for the executable path.",
+        ));
+    }
+    let saved = root.join("CMakeFiles").join(path);
+    copy_artifact(cx.host(), Some(artifact), &saved)
+        .map_err(|error| CmdError::status(error.to_string()))?;
+
+    let mut missing = Vec::new();
+    let value = lookup(cx, run_var, true, &details, &mut missing);
+    let combined = options.has(b"RUN_OUTPUT_VARIABLE") || options.has(b"OUTPUT_VARIABLE");
+    let split =
+        options.has(b"RUN_OUTPUT_STDOUT_VARIABLE") || options.has(b"RUN_OUTPUT_STDERR_VARIABLE");
+    let key = |suffix: &[u8]| BString::from([run_var, suffix].concat());
+    let combined_name = key(b"__TRYRUN_OUTPUT");
+    let stdout_name = key(b"__TRYRUN_OUTPUT_STDOUT");
+    let stderr_name = key(b"__TRYRUN_OUTPUT_STDERR");
+    let (stdout, stderr) = if split {
+        (
+            lookup(cx, &stdout_name, false, &details, &mut missing),
+            lookup(cx, &stderr_name, false, &details, &mut missing),
+        )
+    } else if combined {
+        (
+            lookup(cx, &combined_name, false, &details, &mut missing),
+            BString::default(),
+        )
+    } else {
+        (BString::default(), BString::default())
+    };
+
+    let diagnostic = if missing.is_empty() {
+        None
+    } else {
+        let trace = cx.backtrace();
+        let site = trace.top();
+        let mut block = BString::from(
+            "# Run the saved executable on its target platform.\n# Set the cache entries to the results and load this file with -C.\n",
+        );
+        // Put each line of user-supplied text in a comment.
+        for (label, text) in [
+            (b"Build result".as_slice(), build_var),
+            (b"Source file", source.unwrap_or_default()),
+            (b"Executable", &path::from_native_cmake(&saved)),
+            (
+                b"Call file",
+                site.map_or(b"".as_slice(), |frame| frame.file.as_ref()),
+            ),
+        ] {
+            comment(&mut block, label, text);
+        }
+        if let Some(site) = site {
+            comment(&mut block, b"Call line", site.line.to_string().as_bytes());
+        }
+        for arg in options.many(b"ARGS") {
+            comment(&mut block, b"Run argument", arg);
+        }
+        if split {
+            comment(&mut block, b"Standard output", &stdout_name);
+            comment(&mut block, b"Standard error", &stderr_name);
+        }
+        assignment(&mut block, run_var, &value, b"Result from try_run");
+        if combined && !split {
+            assignment(&mut block, &combined_name, &stdout, b"Output from try_run");
+        }
+        cx.write_try_run_result(&result_file, &block)?;
+        let mut message = BString::from(
+            "try_run() invoked in cross-compiling mode, please set the following cache variables appropriately:\n",
+        );
+        for name in missing {
+            message.extend_from_slice(b"   ");
+            message.extend_from_slice(&name);
+            message.extend_from_slice(b" (advanced)\n");
+        }
+        message.extend_from_slice(details.as_bytes());
+        Some(message)
+    };
+    let result = RunResult {
+        value,
+        stdout: if diagnostic.is_none() {
+            stdout.into()
+        } else {
+            Vec::new()
+        },
+        stderr: if diagnostic.is_none() {
+            stderr.into()
+        } else {
+            Vec::new()
+        },
+    };
+    apply_output(cx, options, build_output, &result);
+    Ok(CrossRun {
+        result,
+        missing: diagnostic,
+    })
+}
+
+fn lookup(
+    cx: &mut Cx<'_>,
+    key: &[u8],
+    exit: bool,
+    details: &str,
+    missing: &mut Vec<BString>,
+) -> BString {
+    if let Some(value) = cx.var(key) {
+        return value;
+    }
+    let (value, description) = if exit {
+        ("PLEASE_FILL_OUT-FAILED_TO_RUN", "Run result of try_run().")
+    } else {
+        ("PLEASE_FILL_OUT-NOTFOUND", "Output of try_run().")
+    };
+    missing.push(key.into());
+    cx.cache().insert(
+        key.into(),
+        CacheEntry {
+            value: value.into(),
+            ty: CacheType::String,
+            help: format!("{description}\n{details}").into(),
+            advanced: true,
+            props: Default::default(),
+        },
+    );
+    value.into()
+}
+
+fn assignment(block: &mut BString, name: &[u8], value: &[u8], help: &[u8]) {
+    block.extend_from_slice(b"set(");
+    write_bracket_arg(block, name);
+    block.push(b' ');
+    write_bracket_arg(block, value);
+    block.extend_from_slice(b" CACHE STRING ");
+    write_bracket_arg(block, help);
+    block.extend_from_slice(b" FORCE)\n");
+}
+
+fn comment(block: &mut BString, label: &[u8], bytes: &[u8]) {
+    block.extend_from_slice(b"# ");
+    block.extend_from_slice(label);
+    block.extend_from_slice(b": ");
+    for byte in bytes {
+        if matches!(byte, b'\n' | b'\r' | 0) {
+            block.extend_from_slice(b" ");
+        } else {
+            block.push(*byte);
+        }
+    }
+    block.push(b'\n');
+}

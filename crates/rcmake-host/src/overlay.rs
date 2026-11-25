@@ -825,6 +825,16 @@ impl<H: Host + ?Sized> Host for OverlayHost<H> {
         false
     }
 
+    fn run_controlled(
+        &self,
+        _req: &RunRequest,
+        _graceful: Option<crate::GracefulTimeout>,
+        _hard_limit: Option<std::time::Duration>,
+        _update: &mut crate::DeadlineUpdate<'_>,
+    ) -> HostResult<crate::ControlledOutput> {
+        Err(HostError::unsupported(crate::no_process::DENIED_MESSAGE))
+    }
+
     fn run(
         &self,
         _req: &RunRequest,

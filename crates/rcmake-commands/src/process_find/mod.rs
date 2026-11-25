@@ -15,9 +15,11 @@ mod execute;
 mod find;
 mod find_package;
 mod pkg_config;
+mod registry_path;
 mod search_paths;
 #[cfg(test)]
 mod tests;
+mod user_paths;
 
 pub(crate) fn register(registry: &mut Registry) {
     let flags = CmdFlags { scriptable: true };
@@ -112,4 +114,8 @@ impl RootMode {
         }
         dirs
     }
+}
+
+fn is_elf_x32(cx: &Cx<'_>) -> bool {
+    cx.var_or_empty(b"CMAKE_INTERNAL_PLATFORM_ABI") == b"ELF X32"
 }

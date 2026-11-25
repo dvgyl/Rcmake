@@ -1,4 +1,5 @@
-use rcmake_base::list;
+use rcmake_base::{ByteSlice as _, list};
+use rcmake_commands::GeneratorKind;
 use rcmake_eval::{CmdResult, Cx};
 use rcmake_expr::ExpandedArg;
 use rcmake_host::{FileKind, Follow, Stream, path};
@@ -66,7 +67,8 @@ pub(super) fn ctest_configure(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResul
                 } else {
                     command.push([b"-G", generator.as_slice()].concat().into());
                 }
-                if let Some(options) = args.value(b"OPTIONS") {
+                let options = args.value(b"OPTIONS");
+                if let Some(options) = options {
                     command.extend(list::split(options, list::Empty::Drop));
                 }
                 for (option, var) in [
@@ -77,6 +79,21 @@ pub(super) fn ctest_configure(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResul
                     if !value.is_empty() {
                         command.extend([option.into(), value]);
                     }
+                }
+                let config = cx.var_or_empty(b"CTEST_CONFIGURATION_TYPE");
+                if !config.is_empty()
+                    && !GeneratorKind::from_name(&generator)
+                        .is_some_and(GeneratorKind::multi_config)
+                    && !options.is_some_and(|options| {
+                        options.contains_str(b"CMAKE_BUILD_TYPE=")
+                            || options.contains_str(b"CMAKE_BUILD_TYPE:STRING=")
+                    })
+                {
+                    command.push(
+                        [b"-DCMAKE_BUILD_TYPE:STRING=".as_slice(), &config]
+                            .concat()
+                            .into(),
+                    );
                 }
                 command
             } else {

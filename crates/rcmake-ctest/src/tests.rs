@@ -308,15 +308,15 @@ fn adds_fixture_tests_and_cleans_up_after_setup_failure() -> TestResult {
             ..CtestOptions::default()
         };
         let outcome = run(host.clone(), &options)?;
-        assert_eq!(
-            *seen.lock().map_err(|_| "Cannot read commands.")?,
-            ["setup", "clean"]
-        );
+        let seen = seen.lock().map_err(|_| "Cannot read commands.")?;
         assert_eq!(outcome.exit_code, 8);
-        assert_eq!(outcome.passed, ["teardown"]);
         if stop_on_failure {
+            assert_eq!(*seen, ["setup"]);
+            assert!(outcome.passed.is_empty());
             assert_eq!(outcome.failed, ["setup"]);
         } else {
+            assert_eq!(*seen, ["setup", "clean"]);
+            assert_eq!(outcome.passed, ["teardown"]);
             assert_eq!(outcome.failed, ["use-db", "setup"]);
             assert!(
                 host.stream_bytes(Stream::Stdout)

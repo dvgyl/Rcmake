@@ -400,7 +400,7 @@ fn cmake_command<'a>(code: &mut BString, prefix: &str, args: impl IntoIterator<I
     code.extend_from_slice(b")\n");
 }
 
-fn write_bracket_arg(code: &mut BString, arg: &[u8]) {
+pub(super) fn write_bracket_arg(code: &mut BString, arg: &[u8]) {
     let mut delimiter = vec![b']', b']'];
     while arg
         .windows(delimiter.len())

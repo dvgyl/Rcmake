@@ -169,6 +169,66 @@ impl Host for CapturingHost {
         self.parent.write(p, data, mode)
     }
 
+    fn registry_host_view(&self) -> Option<rcmake_host::RegistryView> {
+        self.parent.registry_host_view()
+    }
+
+    fn registry_value(
+        &self,
+        root: rcmake_host::RegistryRoot,
+        subkey: &[u8],
+        name: Option<&[u8]>,
+        view: rcmake_host::RegistryView,
+    ) -> HostResult<Option<BString>> {
+        self.parent.registry_value(root, subkey, name, view)
+    }
+
+    fn open_read(&self, p: &Path) -> HostResult<Box<dyn rcmake_host::ReadSeek + '_>> {
+        self.parent.open_read(p)
+    }
+
+    fn scratch_file(&self) -> HostResult<Box<dyn rcmake_host::ScratchFile + '_>> {
+        self.parent.scratch_file()
+    }
+
+    fn write_from(
+        &self,
+        p: &Path,
+        mode: WriteMode,
+        input: &mut dyn std::io::Read,
+        len: u64,
+    ) -> HostResult<()> {
+        self.parent.write_from(p, mode, input, len)
+    }
+
+    fn run_controlled(
+        &self,
+        req: &RunRequest,
+        graceful: Option<GracefulTimeout>,
+        hard_limit: Option<std::time::Duration>,
+        update: &mut rcmake_host::DeadlineUpdate<'_>,
+    ) -> HostResult<rcmake_host::ControlledOutput> {
+        let (req, stdout, stderr) = capture_request(req);
+        let mut result = self.parent.run_controlled(
+            &req,
+            graceful,
+            Some(hard_limit.map_or(TIMEOUT, |limit| limit.min(TIMEOUT))),
+            &mut |stream, bytes| {
+                if (stream == Stream::Stdout && stdout) || (stream == Stream::Stderr && stderr) {
+                    self.capture_process_output(bytes);
+                }
+                update(stream, bytes)
+            },
+        )?;
+        if stdout {
+            result.output.stdout.clear();
+        }
+        if stderr {
+            result.output.stderr.clear();
+        }
+        Ok(result)
+    }
+
     fn run(
         &self,
         req: &RunRequest,

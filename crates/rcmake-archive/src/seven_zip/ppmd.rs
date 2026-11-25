@@ -1,8 +1,11 @@
+use std::io::{self, Read, SeekFrom};
+
 use ppmd_turbo::{Params, SevenZDecoder, SevenZEncoder, SevenZStatus};
+use rcmake_host::ReadSeek;
 use sevenz_rust2::{Archive, ArchiveEntry, EncoderMethod};
 
 use super::{MAGIC, MAX_DECODE_MEMORY_KIB};
-use crate::{ArchiveError, archive_error, size_limit};
+use crate::{ArchiveError, archive_error};
 
 const SIGNATURE_SIZE: usize = 32;
 const END: u8 = 0x00;
@@ -196,12 +199,14 @@ fn number(header: &mut Vec<u8>, value: u64) {
     header.extend(value.to_le_bytes().into_iter().take(extra));
 }
 
-pub(super) fn decode(
-    bytes: &[u8],
+pub(super) fn read_entries(
+    source: &mut dyn ReadSeek,
     archive: &Archive,
     block_index: usize,
     props: &[u8],
-) -> Result<Vec<u8>, ArchiveError> {
+    entries: &[ArchiveEntry],
+    mut read: impl FnMut(usize, &ArchiveEntry, &mut dyn Read) -> Result<(), ArchiveError>,
+) -> Result<(), ArchiveError> {
     let invalid = || ArchiveError::new("Invalid 7-Zip PPMd block");
     let params = Params::from_7z_props(props).map_err(archive_error)?;
     if params.mem_size() as usize / 1024 > MAX_DECODE_MEMORY_KIB {
@@ -209,9 +214,6 @@ pub(super) fn decode(
     }
     let block = archive.blocks.get(block_index).ok_or_else(invalid)?;
     let size = block.get_unpack_size();
-    if size > size_limit() {
-        return Err(ArchiveError::new("Archive exceeds the size limit"));
-    }
     let map = &archive.stream_map;
     let pack = *map
         .block_first_pack_stream_index()
@@ -221,41 +223,118 @@ pub(super) fn decode(
         .checked_add(archive.pack_pos())
         .and_then(|base| base.checked_add(*map.pack_stream_offsets().get(pack)?))
         .ok_or_else(invalid)?;
-    let end = offset
-        .checked_add(*archive.pack_sizes().get(pack).ok_or_else(invalid)?)
-        .ok_or_else(invalid)?;
-    let start = usize::try_from(offset).map_err(archive_error)?;
-    let end = usize::try_from(end).map_err(archive_error)?;
-    let data = bytes.get(start..end).ok_or_else(invalid)?;
-    const CHUNK: usize = 64 * 1024;
-    let size_usize = usize::try_from(size).map_err(archive_error)?;
-    let mut output = Vec::with_capacity(size_usize.min(CHUNK));
-    let mut decoder = SevenZDecoder::new(params, Some(size)).map_err(archive_error)?;
-    let mut input = data;
-    let mut chunk = vec![0; size_usize.min(CHUNK)];
-    loop {
-        let remaining = size_usize - output.len();
-        let limit = remaining.min(chunk.len());
-        let target = chunk.get_mut(..limit).ok_or_else(invalid)?;
-        let step = decoder.decode(input, true, target).map_err(archive_error)?;
-        output.extend_from_slice(target.get(..step.produced).ok_or_else(invalid)?);
-        if output.len() == size_usize
-            && matches!(
-                step.status,
-                SevenZStatus::ReachedSize | SevenZStatus::OutputFull
-            )
-        {
-            break;
+    let len = *archive.pack_sizes().get(pack).ok_or_else(invalid)?;
+    source
+        .seek(SeekFrom::Start(offset))
+        .map_err(archive_error)?;
+    let decoder = Decoder {
+        source: source.take(len),
+        buffer: vec![0; 64 * 1024],
+        start: 0,
+        end: 0,
+        decoder: SevenZDecoder::new(params, Some(size)).map_err(archive_error)?,
+        remaining: size,
+    };
+    let mut block_input = Checked::new(decoder);
+    for (index, entry) in entries.iter().enumerate() {
+        let mut member = Checked::new((&mut block_input).take(entry.size));
+        read(index, entry, &mut member)?;
+        let left = member.input.limit();
+        crate::extract::stage::copy(&mut member, &mut io::sink(), left)?;
+        if entry.has_crc && u64::from(member.crc.finalize()) != entry.crc {
+            return Err(ArchiveError::new("7-Zip PPMd entry checksum mismatch"));
         }
-        if step.produced == 0 || step.status != SevenZStatus::OutputFull {
-            return Err(invalid());
-        }
-        input = input.get(step.consumed..).ok_or_else(invalid)?;
     }
-    if block.has_crc && u64::from(crc32fast::hash(&output)) != block.crc {
+    if block_input.input.remaining != 0 {
+        return Err(invalid());
+    }
+    if block.has_crc && u64::from(block_input.crc.finalize()) != block.crc {
         return Err(ArchiveError::new("7-Zip PPMd block checksum mismatch"));
     }
-    Ok(output)
+    Ok(())
+}
+
+struct Decoder<R> {
+    source: io::Take<R>,
+    buffer: Vec<u8>,
+    start: usize,
+    end: usize,
+    decoder: SevenZDecoder,
+    remaining: u64,
+}
+
+impl<R: Read> Read for Decoder<R> {
+    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        let capacity = self.remaining.min(output.len().min(64 * 1024) as u64) as usize;
+        if capacity == 0 {
+            return Ok(0);
+        }
+        let invalid =
+            || io::Error::new(io::ErrorKind::InvalidData, "Invalid 7-Zip PPMd stream size");
+        loop {
+            let step = self
+                .decoder
+                .decode(
+                    self.buffer.get(self.start..self.end).ok_or_else(invalid)?,
+                    self.source.limit() == 0,
+                    output.get_mut(..capacity).ok_or_else(invalid)?,
+                )
+                .map_err(io::Error::other)?;
+            self.start += step.consumed;
+            self.remaining -= step.produced as u64;
+            if step.status == SevenZStatus::EndMarker && self.remaining != 0 {
+                return Err(invalid());
+            }
+            if step.produced != 0 {
+                return Ok(step.produced);
+            }
+            if step.status != SevenZStatus::NeedInput || self.source.limit() == 0 {
+                return Err(invalid());
+            }
+            self.buffer.copy_within(self.start..self.end, 0);
+            self.end -= self.start;
+            self.start = 0;
+            let count = self
+                .source
+                .limit()
+                .min((self.buffer.len() - self.end) as u64) as usize;
+            if count == 0 {
+                return Err(invalid());
+            }
+            self.source.read_exact(
+                self.buffer
+                    .get_mut(self.end..self.end + count)
+                    .ok_or_else(invalid)?,
+            )?;
+            self.end += count;
+        }
+    }
+}
+
+struct Checked<R> {
+    input: R,
+    crc: crc32fast::Hasher,
+}
+
+impl<R> Checked<R> {
+    fn new(input: R) -> Self {
+        Self {
+            input,
+            crc: crc32fast::Hasher::new(),
+        }
+    }
+}
+
+impl<R: Read> Read for Checked<R> {
+    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        let count = self.input.read(output)?;
+        self.crc.update(
+            output
+                .get(..count)
+                .ok_or_else(|| io::Error::other("Invalid 7-Zip output length"))?,
+        );
+        Ok(count)
+    }
 }
 
 #[cfg(test)]
@@ -275,18 +354,40 @@ mod tests {
         let props = writer.params.to_7z_props();
         let bytes = writer.finish();
         let archive = Archive::read(&mut Cursor::new(&bytes), &Password::empty())?;
-        assert_eq!(decode(&bytes, &archive, 0, &props)?, data);
+        let mut result = Vec::new();
+        read_entries(
+            &mut Cursor::new(&bytes),
+            &archive,
+            0,
+            &props,
+            &archive.files,
+            |_, _, reader| {
+                reader.read_to_end(&mut result).map_err(archive_error)?;
+                Ok(())
+            },
+        )?;
+        assert_eq!(result, data);
 
         let mut writer = Writer::new(Some(1))?;
         writer.add(ArchiveEntry::new_file("payload"), b"abc")?;
         let [entry] = writer.files.as_mut_slice() else {
             return Err("Expected one file".into());
         };
-        entry.size = size_limit();
+        entry.size = 1024;
         let bytes = writer.finish();
         let archive = Archive::read(&mut Cursor::new(&bytes), &Password::empty())?;
         assert!(bytes.len() < 512);
-        assert!(decode(&bytes, &archive, 0, &props).is_err());
+        assert!(
+            read_entries(
+                &mut Cursor::new(&bytes),
+                &archive,
+                0,
+                &props,
+                &archive.files,
+                |_, _, _| Ok(())
+            )
+            .is_err()
+        );
         Ok(())
     }
 }

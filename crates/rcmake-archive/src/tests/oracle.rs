@@ -235,7 +235,9 @@ fn interops_with_cmake_archives() -> TestResult {
                 assert_eq!(
                     system_tar,
                     read_bounded(
-                        compress::Decoder::new(&read_bytes(&host, &rcmake_archive, size_limit())?)?,
+                        compress::Decoder::new(
+                            read_bytes(&host, &rcmake_archive, size_limit())?.as_slice()
+                        )?,
                         size_limit(),
                     )?
                 );

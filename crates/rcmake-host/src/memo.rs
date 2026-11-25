@@ -47,6 +47,7 @@ struct Cache {
     bytes: usize,
     generation: u64,
     active_changes: usize,
+    tracked: BTreeMap<PathBuf, u64>,
 }
 
 fn path_bytes(path: &Path) -> usize {
@@ -113,6 +114,29 @@ impl<H: Host + ?Sized> MemoHost<H> {
     pub fn stable_generation(&self) -> Option<u64> {
         let cache = self.read_cache();
         (cache.active_changes == 0).then_some(cache.generation)
+    }
+
+    /// Return the generation for a canonical path while no change is active.
+    ///
+    /// Changes to intersecting paths and calls that can change any path invalidate
+    /// the generation. The bounded table returns no generation when full.
+    pub fn stable_generation_for(&self, path: &Path) -> Option<u64> {
+        if !path.is_absolute() || path_bytes(path) > 4096 {
+            return None;
+        }
+        let mut cache = self.write_cache();
+        if cache.active_changes != 0 {
+            return None;
+        }
+        if let Some(&generation) = cache.tracked.get(path) {
+            return Some(generation);
+        }
+        if cache.tracked.len() >= 2048 {
+            return None;
+        }
+        let generation = cache.generation;
+        cache.tracked.insert(path.to_owned(), generation);
+        Some(generation)
     }
 
     /// Invalidate queries after changes made through another host handle.
@@ -184,13 +208,44 @@ impl<H: Host + ?Sized> MemoHost<H> {
     }
 
     fn begin_change(&self) -> ActiveChange<'_, H> {
+        self.begin_change_for(&[])
+    }
+
+    fn begin_change_for(&self, paths: &[&Path]) -> ActiveChange<'_, H> {
         let mut cache = self.write_cache();
         cache.generation = cache.generation.wrapping_add(1);
+        let generation = cache.generation;
+        if !cache.tracked.is_empty() {
+            let canonical: Option<Vec<_>> =
+                paths.iter().map(|path| self.change_path(path)).collect();
+            for (root, revision) in &mut cache.tracked {
+                let overlaps = |path: &Path| path.starts_with(root) || root.starts_with(path);
+                if paths.is_empty()
+                    || paths.iter().any(|path| overlaps(path))
+                    || canonical
+                        .as_ref()
+                        .is_none_or(|paths| paths.iter().any(|path| overlaps(path)))
+                {
+                    *revision = generation;
+                }
+            }
+        }
         cache.active_changes += 1;
         cache.paths.clear();
         cache.entries = 0;
         cache.bytes = 0;
         ActiveChange { host: self }
+    }
+
+    fn change_path(&self, path: &Path) -> Option<PathBuf> {
+        for parent in path.ancestors().take(64) {
+            match self.base.canonicalize(parent) {
+                Ok(root) => return Some(root.join(path.strip_prefix(parent).ok()?)),
+                Err(error) if error.kind == ErrorKind::NotFound => {}
+                Err(_) => return None,
+            }
+        }
+        None
     }
 }
 
@@ -233,7 +288,7 @@ impl<H: Host + ?Sized> Host for MemoHost<H> {
     }
 
     fn write(&self, p: &Path, data: &[u8], mode: WriteMode) -> HostResult<()> {
-        let _change = self.begin_change();
+        let _change = self.begin_change_for(&[p]);
         self.base.write(p, data, mode)
     }
 
@@ -248,32 +303,32 @@ impl<H: Host + ?Sized> Host for MemoHost<H> {
     }
 
     fn create_dir_all(&self, p: &Path) -> HostResult<()> {
-        let _change = self.begin_change();
+        let _change = self.begin_change_for(&[p]);
         self.base.create_dir_all(p)
     }
 
     fn remove_file(&self, p: &Path) -> HostResult<()> {
-        let _change = self.begin_change();
+        let _change = self.begin_change_for(&[p]);
         self.base.remove_file(p)
     }
 
     fn remove_dir(&self, p: &Path) -> HostResult<()> {
-        let _change = self.begin_change();
+        let _change = self.begin_change_for(&[p]);
         self.base.remove_dir(p)
     }
 
     fn remove_dir_all(&self, p: &Path) -> HostResult<()> {
-        let _change = self.begin_change();
+        let _change = self.begin_change_for(&[p]);
         self.base.remove_dir_all(p)
     }
 
     fn rename(&self, from: &Path, to: &Path) -> HostResult<()> {
-        let _change = self.begin_change();
+        let _change = self.begin_change_for(&[from, to]);
         self.base.rename(from, to)
     }
 
     fn rename_noreplace(&self, from: &Path, to: &Path) -> HostResult<()> {
-        let _change = self.begin_change();
+        let _change = self.begin_change_for(&[from, to]);
         self.base.rename_noreplace(from, to)
     }
 
@@ -282,22 +337,22 @@ impl<H: Host + ?Sized> Host for MemoHost<H> {
         path: &Path,
         timeout: Option<Duration>,
     ) -> HostResult<Box<dyn FileLockGuard>> {
-        let _change = self.begin_change();
+        let _change = self.begin_change_for(&[path]);
         self.base.lock_file(path, timeout)
     }
 
     fn copy_file(&self, from: &Path, to: &Path, opts: CopyOptions) -> HostResult<()> {
-        let _change = self.begin_change();
+        let _change = self.begin_change_for(&[to]);
         self.base.copy_file(from, to, opts)
     }
 
     fn symlink(&self, target: &Path, link: &Path) -> HostResult<()> {
-        let _change = self.begin_change();
+        let _change = self.begin_change_for(&[link]);
         self.base.symlink(target, link)
     }
 
     fn hard_link(&self, src: &Path, dst: &Path) -> HostResult<()> {
-        let _change = self.begin_change();
+        let _change = self.begin_change_for(&[dst]);
         self.base.hard_link(src, dst)
     }
 
@@ -316,7 +371,7 @@ impl<H: Host + ?Sized> Host for MemoHost<H> {
     }
 
     fn set_permissions(&self, p: &Path, mode: u32) -> HostResult<()> {
-        let _change = self.begin_change();
+        let _change = self.begin_change_for(&[p]);
         self.base.set_permissions(p, mode)
     }
 
@@ -326,7 +381,7 @@ impl<H: Host + ?Sized> Host for MemoHost<H> {
         atime: Option<FileTime>,
         mtime: Option<FileTime>,
     ) -> HostResult<()> {
-        let _change = self.begin_change();
+        let _change = self.begin_change_for(&[p]);
         self.base.set_times(p, atime, mtime)
     }
 
@@ -336,7 +391,7 @@ impl<H: Host + ?Sized> Host for MemoHost<H> {
         atime: Option<FileTime>,
         mtime: Option<FileTime>,
     ) -> HostResult<()> {
-        let _change = self.begin_change();
+        let _change = self.begin_change_for(&[p]);
         self.base.set_symlink_times(p, atime, mtime)
     }
 
@@ -373,6 +428,25 @@ impl<H: Host + ?Sized> Host for MemoHost<H> {
     ) -> HostResult<RunOutput> {
         let _change = self.begin_change();
         self.base.run_with_timeout_signal(req, timeout, on_output)
+    }
+
+    fn open_read(&self, p: &Path) -> HostResult<Box<dyn crate::ReadSeek + '_>> {
+        self.base.open_read(p)
+    }
+
+    fn scratch_file(&self) -> HostResult<Box<dyn crate::ScratchFile + '_>> {
+        self.base.scratch_file()
+    }
+
+    fn write_from(
+        &self,
+        p: &Path,
+        mode: WriteMode,
+        input: &mut dyn std::io::Read,
+        len: u64,
+    ) -> HostResult<()> {
+        let _change = self.begin_change_for(&[p]);
+        self.base.write_from(p, mode, input, len)
     }
 
     fn run_controlled(

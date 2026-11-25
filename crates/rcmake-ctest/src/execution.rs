@@ -125,7 +125,7 @@ pub(crate) fn resolve_program_at(
     let program = to_native(command);
     let local = directory.join(&program);
     let windows = host.system().sysname.starts_with(b"Windows");
-    if let Some(path) = find_local_program(host, &local, config, windows) {
+    if let Some(path) = find_local_program(host, &program, directory, config, windows) {
         *command = from_native(&path);
     } else if program.components().count() > 1 {
         *command = from_native(&local);
@@ -134,23 +134,45 @@ pub(crate) fn resolve_program_at(
 
 fn find_local_program(
     host: &dyn Host,
-    local: &std::path::Path,
+    original: &std::path::Path,
+    directory: &std::path::Path,
     config: Option<&BString>,
     windows: bool,
 ) -> Option<std::path::PathBuf> {
-    let config_path = config.and_then(|config| {
-        Some(
-            local
-                .parent()?
-                .join(to_native(config))
-                .join(local.file_name()?),
-        )
-    });
+    let spelling = rcmake_host::path::from_native_cmake(original);
+    let mut candidates = Vec::new();
+    let config = config.filter(|value| !value.is_empty());
+    for spelling in [Some(spelling.as_slice()), spelling.strip_prefix(b"/")]
+        .into_iter()
+        .flatten()
+    {
+        let path = to_native(spelling);
+        candidates.push(directory.join(&path));
+        let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+            continue;
+        };
+        if let Some(config) = config {
+            candidates.push(directory.join(parent).join(to_native(config)).join(name));
+            candidates
+                .push(directory.join(to_native(&[config.as_slice(), b"/", spelling].concat())));
+        } else {
+            for config in [
+                "Release",
+                "Debug",
+                "MinSizeRel",
+                "RelWithDebInfo",
+                "Deployment",
+                "Development",
+            ] {
+                candidates.push(directory.join(parent).join(config).join(name));
+            }
+        }
+    }
     let is_file = |path: &std::path::Path| {
         host.metadata(path, Follow::Yes)
             .is_ok_and(|metadata| metadata.kind == FileKind::File)
     };
-    for path in std::iter::once(local).chain(config_path.as_deref()) {
+    for path in &candidates {
         if is_file(path) {
             return Some(path.to_path_buf());
         }
@@ -200,6 +222,8 @@ fn environment_for_system(
     for assignment in test.list(b"ENVIRONMENT") {
         if let Some((name, value)) = split(&assignment, b'=') {
             env.insert(key(name), value.into());
+        } else {
+            env.remove(&key(&assignment));
         }
     }
     let modifications = test.list(b"ENVIRONMENT_MODIFICATION");
@@ -473,23 +497,50 @@ mod tests {
         let release = "Release".into();
         host.seed_file(configured, b"")?;
         assert_eq!(
-            find_local_program(&host, program, Some(&release), false),
+            find_local_program(
+                &host,
+                program,
+                std::path::Path::new("/work"),
+                Some(&release),
+                false
+            ),
             None
         );
         assert_eq!(
-            find_local_program(&host, program, Some(&release), true).as_deref(),
+            find_local_program(
+                &host,
+                program,
+                std::path::Path::new("/work"),
+                Some(&release),
+                true
+            )
+            .as_deref(),
             Some(configured)
         );
 
         host.seed_file(local, b"")?;
         assert_eq!(
-            find_local_program(&host, program, Some(&release), true).as_deref(),
+            find_local_program(
+                &host,
+                program,
+                std::path::Path::new("/work"),
+                Some(&release),
+                true
+            )
+            .as_deref(),
             Some(local)
         );
 
         host.seed_file(program, b"")?;
         assert_eq!(
-            find_local_program(&host, program, Some(&release), true).as_deref(),
+            find_local_program(
+                &host,
+                program,
+                std::path::Path::new("/work"),
+                Some(&release),
+                true
+            )
+            .as_deref(),
             Some(program)
         );
         Ok(())

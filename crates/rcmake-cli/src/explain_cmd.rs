@@ -458,6 +458,48 @@ impl Host for ReportHost {
         self.base.env_all()
     }
 
+    fn registry_host_view(&self) -> Option<rcmake_host::RegistryView> {
+        self.base.registry_host_view()
+    }
+
+    fn registry_value(
+        &self,
+        root: rcmake_host::RegistryRoot,
+        subkey: &[u8],
+        name: Option<&[u8]>,
+        view: rcmake_host::RegistryView,
+    ) -> HostResult<Option<BString>> {
+        self.base.registry_value(root, subkey, name, view)
+    }
+
+    fn open_read(&self, p: &Path) -> HostResult<Box<dyn rcmake_host::ReadSeek + '_>> {
+        self.base.open_read(p)
+    }
+
+    fn scratch_file(&self) -> HostResult<Box<dyn rcmake_host::ScratchFile + '_>> {
+        self.base.scratch_file()
+    }
+
+    fn write_from(
+        &self,
+        p: &Path,
+        mode: HostWriteMode,
+        input: &mut dyn std::io::Read,
+        len: u64,
+    ) -> HostResult<()> {
+        self.base.write_from(p, mode, input, len)
+    }
+
+    fn run_controlled(
+        &self,
+        req: &RunRequest,
+        graceful: Option<GracefulTimeout>,
+        hard_limit: Option<std::time::Duration>,
+        update: &mut rcmake_host::DeadlineUpdate<'_>,
+    ) -> HostResult<rcmake_host::ControlledOutput> {
+        self.base.run_controlled(req, graceful, hard_limit, update)
+    }
+
     fn run(
         &self,
         req: &RunRequest,

@@ -1,3 +1,4 @@
+use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -496,6 +497,45 @@ struct ObservedHost<R, O> {
     output: O,
 }
 
+struct ObservedRead<'a, R> {
+    inner: Box<dyn rcmake_host::ReadSeek + 'a>,
+    observe: &'a R,
+    path: PathBuf,
+    pos: u64,
+}
+
+impl<R> Read for ObservedRead<'_, R>
+where
+    R: Fn(&Path, &Path, ReadRange, &HostResult<Vec<u8>>),
+{
+    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        let capacity = output.len().min(64 * 1024);
+        let chunk = output
+            .get_mut(..capacity)
+            .ok_or_else(|| io::Error::other("Invalid stream read length."))?;
+        let size = self.inner.read(chunk)?;
+        if size != 0 {
+            let bytes = chunk
+                .get(..size)
+                .ok_or_else(|| io::Error::other("Invalid host read length."))?;
+            let range = ReadRange::Slice {
+                offset: self.pos,
+                len: Some(size as u64),
+            };
+            (self.observe)(&self.path, &self.path, range, &Ok(bytes.to_vec()));
+            self.pos = self.pos.saturating_add(size as u64);
+        }
+        Ok(size)
+    }
+}
+
+impl<R> Seek for ObservedRead<'_, R> {
+    fn seek(&mut self, from: SeekFrom) -> io::Result<u64> {
+        self.pos = self.inner.seek(from)?;
+        Ok(self.pos)
+    }
+}
+
 impl<R, O> Host for ObservedHost<R, O>
 where
     R: Fn(&Path, &Path, ReadRange, &HostResult<Vec<u8>>) + Send + Sync,
@@ -628,6 +668,43 @@ where
         on_output: &mut dyn FnMut(Stream, &[u8]),
     ) -> HostResult<RunOutput> {
         self.base.run_with_timeout_signal(req, timeout, on_output)
+    }
+
+    fn registry_host_view(&self) -> Option<rcmake_host::RegistryView> {
+        self.base.registry_host_view()
+    }
+
+    fn registry_value(
+        &self,
+        root: rcmake_host::RegistryRoot,
+        subkey: &[u8],
+        name: Option<&[u8]>,
+        view: rcmake_host::RegistryView,
+    ) -> HostResult<Option<BString>> {
+        self.base.registry_value(root, subkey, name, view)
+    }
+
+    fn open_read(&self, p: &Path) -> HostResult<Box<dyn rcmake_host::ReadSeek + '_>> {
+        Ok(Box::new(ObservedRead {
+            inner: self.base.open_read(p)?,
+            observe: &self.read,
+            path: p.to_owned(),
+            pos: 0,
+        }))
+    }
+
+    fn scratch_file(&self) -> HostResult<Box<dyn rcmake_host::ScratchFile + '_>> {
+        self.base.scratch_file()
+    }
+
+    fn write_from(
+        &self,
+        p: &Path,
+        mode: HostWriteMode,
+        input: &mut dyn std::io::Read,
+        len: u64,
+    ) -> HostResult<()> {
+        self.base.write_from(p, mode, input, len)
     }
 
     fn run_controlled(

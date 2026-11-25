@@ -83,3 +83,18 @@ fn status(cx: &Cx<'_>, message: &[u8]) {
         );
     }
 }
+
+fn curl_compat_file_url(url: &[u8]) -> BString {
+    if !url.starts_with(b"file://") {
+        return url.into();
+    }
+    let mut encoded = BString::default();
+    for &byte in url {
+        if byte == b' ' {
+            encoded.extend_from_slice(b"%20");
+        } else {
+            encoded.push(byte);
+        }
+    }
+    encoded
+}

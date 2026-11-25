@@ -373,7 +373,10 @@ impl SnapshotProvider {
                         .disk
                         .retain_missing(self.request.host.as_ref(), &previous.disk);
                 }
-                let changed = evaluation.snapshot.disk.changed(self.request.host.as_ref());
+                let changed = evaluation
+                    .snapshot
+                    .disk
+                    .changed(self.request.host.as_ref(), true);
                 (evaluation, changed)
             });
             state = self.lock();
@@ -385,12 +388,11 @@ impl SnapshotProvider {
                 return Err(ApiError::Cancelled);
             }
             let (evaluation, changed) = result?;
-            if changed {
-                Self::invalidate_state(&mut state);
-                return Err(ApiError::Cancelled);
-            }
             state.revision = Arc::new(());
             state.snapshot = Some(Arc::new(evaluation.snapshot));
+            if changed {
+                Self::invalidate_state(&mut state);
+            }
             return match evaluation.error {
                 None => Ok(RefreshStatus::Completed),
                 Some(ApiError::StepBudgetExceeded { limit }) => {
@@ -426,7 +428,9 @@ impl SnapshotProvider {
             }
             (state.snapshot.clone(), Arc::clone(&state.revision))
         };
-        if !snapshot.is_some_and(|snapshot| snapshot.disk.changed(self.request.host.as_ref())) {
+        if !snapshot
+            .is_some_and(|snapshot| snapshot.disk.changed(self.request.host.as_ref(), false))
+        {
             return false;
         }
         let mut state = self.lock();

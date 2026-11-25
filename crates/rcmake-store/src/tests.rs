@@ -1010,10 +1010,17 @@ fn sdk_memo_rechecks_the_graph_after_a_host_write() -> HostResult<()> {
     host.create_dir_all(&sdk)?;
     let memo = TraceMemo::with_generation(host.clone());
     let old = memo.sdk_digest(base.as_ref(), &sdk)?;
+    let scratch = host.initial_cwd().join("build/CMakeFiles/CMakeScratch");
+    host.create_dir_all(&scratch)?;
+    host.write(&scratch.join("probe.c"), b"int x;", WriteMode::CreateNew)?;
     assert_eq!(old, memo.sdk_digest(base.as_ref(), &sdk)?);
+    assert_eq!(memo.sdk_graph_hits(), 1);
     host.write(&sdk.join("new.h"), b"header", WriteMode::CreateNew)?;
     let fresh = memo.sdk_digest(base.as_ref(), &sdk)?;
     assert_ne!(old, fresh);
     assert_eq!(fresh, sdk_tree_listing_digest(base.as_ref(), &sdk)?);
+    assert_eq!(memo.sdk_graph_hits(), 1);
+    assert!(memo.sdk_digest(base.as_ref(), &sdk.join("absent")).is_err());
+    assert_eq!(memo.sdk_coverage_failures(), 1);
     Ok(())
 }

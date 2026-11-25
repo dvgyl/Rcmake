@@ -231,13 +231,43 @@ fn apply_usage(target: &mut Target, package: &[u8], usage: &CpsUsage, config: &[
             );
         }
     }
-    for entry in &usage.link_libraries {
-        add_link(target, condition(entry.clone(), b"CONFIG", config));
+    for feature in &usage.compile_features {
+        let standard = match feature.as_slice() {
+            [b'c' | b'C', a, b] if a.is_ascii_digit() && b.is_ascii_digit() => {
+                Some(text(&[b"c_std_", &[*a, *b]]))
+            }
+            [b'c' | b'C', b'+', b'+', a, b] if a.is_ascii_digit() && b.is_ascii_digit() => {
+                Some(text(&[b"cxx_std_", &[*a, *b]]))
+            }
+            _ => None,
+        };
+        if let Some(standard) = standard {
+            add_usage(
+                target,
+                UsageField::InterfaceCompileFeatures,
+                standard,
+                config,
+                b"*",
+            );
+        } else if feature.eq_ignore_ascii_case(b"threads") {
+            add_link(
+                target,
+                condition("Threads::Threads".into(), b"CONFIG", config),
+            );
+        }
+    }
+    for feature in &usage.link_features {
+        if feature.eq_ignore_ascii_case(b"thread") {
+            add_link(
+                target,
+                condition("Threads::Threads".into(), b"CONFIG", config),
+            );
+        }
     }
     for (entries, scope) in [
         (&usage.requires, b"".as_slice()),
-        (&usage.link_requires, b"LINK_ONLY"),
         (&usage.compile_requires, b"COMPILE_ONLY"),
+        (&usage.link_requires, b"LINK_ONLY"),
     ] {
         for entry in entries {
             let name = reference(package, entry);
@@ -248,6 +278,9 @@ fn apply_usage(target: &mut Target, package: &[u8], usage: &CpsUsage, config: &[
             };
             add_link(target, condition(link, b"CONFIG", config));
         }
+    }
+    for entry in &usage.link_libraries {
+        add_link(target, condition(entry.clone(), b"CONFIG", config));
     }
 }
 

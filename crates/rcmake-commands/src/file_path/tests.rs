@@ -1939,7 +1939,7 @@ fn download_hashes_existing_files_above_the_single_read_limit() -> TestResult {
 }
 
 #[test]
-fn install_directory_replaces_the_destination_symlink() -> TestResult {
+fn install_directory_preserves_the_destination_symlink() -> TestResult {
     let work = if cfg!(windows) { "C:/work" } else { "/work" };
     let (host, mut interp) = interpreter_in(RunMode::Script, work);
     let root = Path::new(work);
@@ -1958,7 +1958,7 @@ fn install_directory_replaces_the_destination_symlink() -> TestResult {
     assert_eq!(
         host.metadata(&root.join("destination/source"), Follow::No)?
             .kind,
-        FileKind::Dir,
+        FileKind::Symlink,
     );
     assert!(
         host.metadata(&root.join("destination/source/contents"), Follow::No)
@@ -1966,7 +1966,7 @@ fn install_directory_replaces_the_destination_symlink() -> TestResult {
     );
     assert!(
         host.metadata(&root.join("original/contents"), Follow::No)
-            .is_err()
+            .is_ok()
     );
     assert!(
         host.metadata(&root.join("original/marker"), Follow::No)

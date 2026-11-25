@@ -49,11 +49,15 @@ fn run_test(cx: &mut Cx<'_>, args: &Arguments<'_>) -> Result<HandlerResult, CmdE
         b"CTEST_BINARY_DIRECTORY",
         previous.as_ref().map(|start| start.build.as_path()),
     )?;
+    let config = cx.var(b"CTEST_CONFIGURATION_TYPE");
     let (host, settings) = SESSION
-        .with_borrow(|session| {
-            session
-                .as_ref()
-                .map(|session| (Arc::clone(&session.host), session.settings.clone()))
+        .with_borrow_mut(|session| {
+            session.as_mut().map(|session| {
+                if let Some(config) = config {
+                    session.settings.config = Some(config);
+                }
+                (Arc::clone(&session.host), session.settings.clone())
+            })
         })
         .ok_or_else(|| error("requires a dashboard script session"))?;
     let invocation = test_invocation(cx, args, host.as_ref(), settings, previous.as_ref(), &build)?;
@@ -101,14 +105,7 @@ fn test_invocation(
     previous: Option<&Start>,
     build: &Path,
 ) -> Result<Invocation, CmdError> {
-    let config = [
-        b"CTEST_CONFIGURATION_TYPE".as_slice(),
-        b"CTEST_BUILD_CONFIGURATION",
-    ]
-    .into_iter()
-    .map(|var| cx.var_or_empty(var))
-    .find(|value| !value.is_empty())
-    .or(settings.config);
+    let config = settings.config.filter(|value| !value.is_empty());
     let timeout = settings
         .timeout
         .map(|timeout| timeout.as_secs_f64())

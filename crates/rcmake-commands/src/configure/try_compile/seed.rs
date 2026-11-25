@@ -3,10 +3,10 @@ use std::collections::BTreeMap;
 use rcmake_base::{BString, list, truth};
 use rcmake_diag::{PolicyId, PolicyStatus};
 use rcmake_eval::{CacheDefine, Cx};
-use rcmake_model::{CacheType, DirId, Target, TargetKind};
+use rcmake_model::CacheType;
 
 use super::args::{Options, STANDARD_OPTIONS};
-use super::{probe_error, split_byte};
+use super::split_byte;
 
 const PROBE_LANGUAGES: &[&str] = &[
     "C", "CXX", "CUDA", "HIP", "OBJC", "OBJCXX", "SYCL", "Fortran", "ASM", "ISPC", "Swift",
@@ -395,67 +395,4 @@ fn seed_var(cx: &Cx<'_>, defines: &mut Vec<CacheDefine>, name: &[u8]) {
             value: cx.var_or_empty(name),
         });
     }
-}
-
-pub(super) fn probe_imports(
-    cx: &mut Cx<'_>,
-    options: &Options<'_>,
-) -> Result<Vec<(Target, Vec<BString>)>, rcmake_eval::CmdError> {
-    let dir = cx.current_dir_id();
-    let model = cx.project();
-    let libraries = options.many(b"LINK_LIBRARIES");
-    for &name in libraries {
-        let Some(target) = model.find_target(dir, name).and_then(|id| model.target(id)) else {
-            continue;
-        };
-        let valid = match target.kind {
-            TargetKind::StaticLibrary
-            | TargetKind::SharedLibrary
-            | TargetKind::InterfaceLibrary
-            | TargetKind::UnknownLibrary => true,
-            TargetKind::Executable => target
-                .props
-                .get(b"ENABLE_EXPORTS")
-                .is_some_and(|value| rcmake_base::truth::is_on(value)),
-            _ => false,
-        };
-        if !valid {
-            let kind = target.kind.as_str();
-            return Err(probe_error(
-                cx,
-                format!(
-                    "Only libraries may be used as try_compile or try_run IMPORTED LINK_LIBRARIES.  Got {} of type {kind}.",
-                    String::from_utf8_lossy(name)
-                ),
-            ));
-        }
-    }
-    let mut targets: Vec<(Target, Vec<BString>)> = Vec::new();
-    let mut imported = BTreeMap::new();
-    let mut pending: Vec<BString> = libraries.iter().map(|&name| name.into()).collect();
-    while let Some(name) = pending.pop() {
-        let Some(id) = model.find_target(dir, &name) else {
-            continue;
-        };
-        let Some(target) = model.target(id).filter(|target| target.is_imported()) else {
-            continue;
-        };
-        let idx = *imported.entry(id.index()).or_insert_with(|| {
-            let mut target = target.clone();
-            target.dir = DirId::ROOT;
-            for item in target.usage.interface_link_libraries.iter_mut().flatten() {
-                item.lookup_dir = DirId::ROOT;
-                pending.push(item.text.value.clone());
-            }
-            targets.push((target, Vec::new()));
-            targets.len() - 1
-        });
-        if name != target.name
-            && let Some((_, aliases)) = targets.get_mut(idx)
-            && !aliases.contains(&name)
-        {
-            aliases.push(name);
-        }
-    }
-    Ok(targets)
 }

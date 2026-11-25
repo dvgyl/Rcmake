@@ -2,7 +2,9 @@ use std::{cell::Cell, cmp::Ordering};
 
 use rcmake_base::{BString, Limits, list, path_lex::Lexical, truth, version};
 
-use crate::{EvalContext, EvalFlags, GenexAst, GenexError, GenexExpr, GenexHost, GenexNode};
+use crate::{
+    EvalContext, EvalFlags, GenexAst, GenexError, GenexExpr, GenexHost, GenexNode, TargetHandle,
+};
 
 mod context;
 mod links;
@@ -27,6 +29,21 @@ pub fn evaluate(
 ) -> Result<(BString, EvalFlags), GenexError> {
     let _root = targets::DAGChecker::root(ctx);
     let mut evaluator = Evaluator::new(host);
+    let value = evaluator.nodes(&ast.nodes, ctx)?;
+    evaluator.validate_link_feature_output(ctx, &value)?;
+    Ok((value, evaluator.flags))
+}
+
+/// Evaluate an expression and record successful named target lookups in evaluated branches.
+pub fn evaluate_with_target_lookups(
+    ast: &GenexAst,
+    ctx: &EvalContext,
+    host: &mut dyn GenexHost,
+    seen: &mut Vec<(BString, TargetHandle)>,
+) -> Result<(BString, EvalFlags), GenexError> {
+    let _root = targets::DAGChecker::root(ctx);
+    let mut evaluator = Evaluator::new(host);
+    evaluator.lookups = Some(seen);
     let value = evaluator.nodes(&ast.nodes, ctx)?;
     evaluator.validate_link_feature_output(ctx, &value)?;
     Ok((value, evaluator.flags))
@@ -78,6 +95,7 @@ pub fn evaluate_diagnostics(
 
 struct Evaluator<'a> {
     host: &'a mut dyn GenexHost,
+    lookups: Option<&'a mut Vec<(BString, TargetHandle)>>,
     flags: EvalFlags,
     depth: u32,
     work: usize,
@@ -152,6 +170,7 @@ impl<'a> Evaluator<'a> {
         let limits = host.limits();
         Self {
             host,
+            lookups: None,
             flags: EvalFlags::default(),
             depth: 0,
             work: limits.max_value_bytes,
@@ -161,6 +180,20 @@ impl<'a> Evaluator<'a> {
             in_target_expression: false,
             emitted_link_feature: false,
             active_rules: Vec::new(),
+        }
+    }
+
+    fn named_target(&mut self, name: &[u8], ctx: &EvalContext) -> Option<TargetHandle> {
+        let target = self.host.find_target_in_context(name, ctx)?;
+        self.record_lookup(name, target);
+        Some(target)
+    }
+
+    fn record_lookup(&mut self, name: &[u8], target: TargetHandle) {
+        if let Some(seen) = &mut self.lookups
+            && seen.len() < 100_000
+        {
+            seen.push((name.into(), target));
         }
     }
 

@@ -1,17 +1,23 @@
 use std::collections::BTreeMap;
-use std::io::{self, ErrorKind, Read};
+use std::io::{self, BufReader, ErrorKind, Read, SeekFrom};
 use std::path::{Component, Path, PathBuf};
 
 use rcmake_base::BString;
-use rcmake_host::{FileKind, FileTime, Follow, Host, Metadata, WriteMode, path::to_native};
+use rcmake_host::{
+    FileKind, FileTime, Follow, Host, Metadata, ReadSeek, WriteMode, path::to_native,
+};
 use tar::{Archive, EntryType};
 
 use crate::pattern::Patterns;
 use crate::{
     ArchiveError, ExtractRequest, MAX_ENTRIES, absolute, archive_error, checked_name, emit_names,
-    read_bounded, read_bytes, relative_path, size_limit,
+    read_bounded, relative_path,
 };
 use crate::{codec, external_filter, seven_zip, tar_budget, timestamp, zip_codec};
+
+pub(super) mod stage;
+
+use stage::{Interval, Stage};
 
 #[derive(Clone, Copy)]
 pub(super) enum Listing<'a> {
@@ -36,6 +42,16 @@ pub(super) fn run(
     request: ExtractRequest<'_>,
     listing: Listing<'_>,
 ) -> Result<Vec<BString>, ArchiveError> {
+    run_with_output_limit(host, archive_path, request, listing, stage::MAX_BYTES)
+}
+
+pub(super) fn run_with_output_limit(
+    host: &dyn Host,
+    archive_path: &Path,
+    request: ExtractRequest<'_>,
+    listing: Listing<'_>,
+    limit: u64,
+) -> Result<Vec<BString>, ArchiveError> {
     let options = request.options;
     absolute(archive_path)?;
     if !options.list_only {
@@ -48,17 +64,25 @@ pub(super) fn run(
             archive_path.display()
         )));
     }
-    if metadata.len > size_limit() {
+    if options.excludes.iter().any(|pattern| pattern.is_empty()) {
+        return Err(ArchiveError::new("Failed to add to exclusion list: "));
+    }
+    let mut source = host.open_read(archive_path)?;
+    let len = source.seek(SeekFrom::End(0)).map_err(archive_error)?;
+    if len > stage::MAX_BYTES {
         return Err(ArchiveError::new(format!(
             "{}: File too large",
             archive_path.display()
         )));
     }
-    // Validate and extract from the same bytes, even if a member replaces the archive.
-    let bytes = read_bytes(host, archive_path, size_limit())?;
-    if options.excludes.iter().any(|pattern| pattern.is_empty()) {
-        return Err(ArchiveError::new("Failed to add to exclusion list: "));
-    }
+    source.seek(SeekFrom::Start(0)).map_err(archive_error)?;
+    let mut prefix = [0; 16];
+    let prefix = prefix
+        .get_mut(..len.min(16) as usize)
+        .ok_or_else(|| ArchiveError::new("Invalid archive prefix length"))?;
+    source.read_exact(prefix).map_err(archive_error)?;
+    source.seek(SeekFrom::Start(0)).map_err(archive_error)?;
+    let mut staged = Stage::new(host);
     let mut scan = Scan {
         excludes: Patterns::new(&options.excludes)?,
         patterns: Patterns::new(&options.patterns)?,
@@ -68,59 +92,40 @@ pub(super) fn run(
         confined_links: request.confined_links,
         names: Vec::new(),
         count: 0,
-        bytes_left: size_limit(),
+        bytes_left: limit,
+        metadata_left: stage::METADATA_BYTES,
     };
-    if bytes.starts_with(b"PK\x03\x04")
-        || bytes.starts_with(b"PK\x05\x06")
-        || bytes.starts_with(b"PK\x06\x06")
-        || bytes.starts_with(seven_zip::MAGIC)
+    let entries = if prefix.starts_with(seven_zip::MAGIC) {
+        scan.seven_zip(&mut source, len, &mut staged)?
+    } else if [b"PK\x03\x04", b"PK\x05\x06", b"PK\x06\x06"]
+        .iter()
+        .any(|magic| prefix.starts_with(*magic))
     {
-        let entries = if bytes.starts_with(seven_zip::MAGIC) {
-            scan.seven_zip(&bytes)?
-        } else {
-            scan.zip(&bytes, &host.time_zone())?
-        };
-        scan.patterns.finish()?;
-        if !entries.is_empty() {
-            let mut unpack = Unpack::new(
-                host,
-                &options.destination,
-                scan.bytes_left,
-                request.confined_links,
-            )?;
-            for (entry, payload) in entries {
-                unpack.entry(entry, &payload)?;
-            }
-            unpack.finish()?;
-        }
+        scan.zip(&mut source, len, &host.time_zone(), &mut staged)?
+    } else if let Some(program) = external_filter::detect(prefix) {
+        let bytes = external_filter::decompress(host, archive_path, program)?;
+        scan.tar_headers(bytes.as_slice(), &mut staged)?
     } else {
-        let (bytes, filter) = if let Some(program) = external_filter::detect(&bytes) {
-            drop(bytes);
-            (
-                external_filter::decompress(host, archive_path, program)?,
-                None,
-            )
-        } else {
-            let filter = codec::detect(&bytes);
-            (bytes, filter)
-        };
-        let reader = || -> Result<Box<dyn Read + '_>, ArchiveError> {
-            match filter {
-                Some(filter) => codec::decoder(filter, &bytes),
-                None => Ok(Box::new(bytes.as_slice())),
-            }
-        };
-        let entries = scan.tar_headers(reader()?)?;
-        scan.patterns.finish()?;
-        if !entries.is_empty() {
-            Unpack::new(
-                host,
-                &options.destination,
-                scan.bytes_left,
-                request.confined_links,
-            )?
-            .tar(reader()?, entries)?;
+        let input =
+            BufReader::with_capacity(stage::BUFFER, (&mut source).take(stage::MAX_BYTES + 1));
+        match codec::detect(prefix) {
+            Some(filter) => scan.tar_headers(codec::decoder(filter, input)?, &mut staged)?,
+            None => scan.tar_headers(input, &mut staged)?,
         }
+    };
+    drop(source);
+    scan.patterns.finish()?;
+    if !entries.is_empty() {
+        let mut unpack = Unpack::new(
+            host,
+            &options.destination,
+            scan.bytes_left,
+            request.confined_links,
+        )?;
+        for (entry, payload) in entries {
+            unpack.entry(entry, payload, &mut staged)?;
+        }
+        unpack.finish()?;
     }
     emit_names(host, &scan.names, options.verbose);
     Ok(scan.names)
@@ -136,16 +141,25 @@ struct Scan<'a> {
     names: Vec<BString>,
     count: usize,
     bytes_left: u64,
+    metadata_left: usize,
 }
+
+type StagedEntry = (Entry, Option<Interval>);
 
 impl Scan<'_> {
     fn count_entry(&mut self, name_size: usize) -> Result<(), ArchiveError> {
         self.count += 1;
-        self.bytes_left = self
-            .bytes_left
-            .checked_sub(name_size as u64 + 512)
-            .filter(|_| self.count <= MAX_ENTRIES)
-            .ok_or_else(|| ArchiveError::new("Archive exceeds the entry or size limit"))?;
+        if self.count > MAX_ENTRIES {
+            return Err(ArchiveError::new("Archive exceeds the entry or size limit"));
+        }
+        self.reserve_metadata(name_size.saturating_mul(2).saturating_add(512))
+    }
+
+    fn reserve_metadata(&mut self, bytes: usize) -> Result<(), ArchiveError> {
+        self.metadata_left = self
+            .metadata_left
+            .checked_sub(bytes)
+            .ok_or_else(|| ArchiveError::new("Archive exceeds the metadata size limit"))?;
         Ok(())
     }
 
@@ -170,10 +184,14 @@ impl Scan<'_> {
         Ok(())
     }
 
-    fn tar_headers(&mut self, reader: impl Read) -> Result<Vec<(usize, Entry)>, ArchiveError> {
-        let mut archive = Archive::new(tar_budget::Reader::new(reader.take(size_limit() + 1)));
+    fn tar_headers(
+        &mut self,
+        reader: impl Read,
+        stage: &mut Stage<'_>,
+    ) -> Result<Vec<StagedEntry>, ArchiveError> {
+        let mut archive = Archive::new(tar_budget::Reader::new(reader.take(stage::MAX_BYTES + 1)));
         let mut entries = Vec::new();
-        for (index, item) in archive.entries().map_err(archive_error)?.enumerate() {
+        for item in archive.entries().map_err(archive_error)? {
             let mut item = item.map_err(archive_error)?;
             let kind = item.header().entry_type();
             self.reserve_payload(item.size())?;
@@ -189,7 +207,7 @@ impl Scan<'_> {
             let entry_name = if let Some(format_time) = self.listing.time_formatter() {
                 let name = name.into_owned();
                 let line = tar_listing(&mut item, &name, format_time)?;
-                self.reserve_payload(line.len().saturating_sub(name.len() + 512) as u64)?;
+                self.reserve_metadata(line.len().saturating_sub(name.len()))?;
                 line
             } else {
                 BString::from(name.into_owned())
@@ -204,12 +222,14 @@ impl Scan<'_> {
                     let target = item
                         .link_name_bytes()
                         .ok_or_else(|| ArchiveError::new("The tar symbolic link has no target"))?;
+                    self.reserve_metadata(target.len())?;
                     Data::Symlink(symlink_target(&path, &target, self.confined_links)?)
                 }
                 EntryType::Link => {
                     let target = item
                         .link_name_bytes()
                         .ok_or_else(|| ArchiveError::new("The tar hard link has no target"))?;
+                    self.reserve_metadata(target.len())?;
                     let target = relative_path(&target)?;
                     if target.as_os_str().is_empty() || target == path {
                         return Err(ArchiveError::new(format!(
@@ -238,14 +258,19 @@ impl Scan<'_> {
             } else {
                 Some(timestamp::tar_time(&mut item)?)
             };
+            let payload = if let Data::File(size) = data {
+                Some(stage.payload(size, |output| stage::copy(&mut item, output, size))?)
+            } else {
+                None
+            };
             entries.push((
-                index,
                 Entry {
                     path,
                     data,
                     mode,
                     mtime,
                 },
+                payload,
             ));
         }
         // Read past the tar end marker to check the compression trailer and size limit.
@@ -254,14 +279,19 @@ impl Scan<'_> {
         if remaining.limit() == 0 {
             return Err(ArchiveError::new("Archive exceeds the size limit"));
         }
-        if size_limit() + 1 - remaining.limit() < 512 {
+        if stage::MAX_BYTES + 1 - remaining.limit() < 512 {
             return Err(ArchiveError::new("Invalid tar archive"));
         }
         Ok(entries)
     }
 
-    fn seven_zip(&mut self, bytes: &[u8]) -> Result<Vec<(Entry, Vec<u8>)>, ArchiveError> {
-        let archive = seven_zip::open(bytes)?;
+    fn seven_zip(
+        &mut self,
+        source: &mut dyn ReadSeek,
+        len: u64,
+        stage: &mut Stage<'_>,
+    ) -> Result<Vec<StagedEntry>, ArchiveError> {
+        let archive = seven_zip::open(source, len)?;
         let mut entries = Vec::new();
         let mut selected_entries = Vec::new();
         for item in &archive.files {
@@ -320,26 +350,31 @@ impl Scan<'_> {
         if !selected_entries.iter().any(Option::is_some) {
             return Ok(Vec::new());
         }
-        seven_zip::read_entries(bytes, &archive, |item_index, item, reader| {
+        seven_zip::read_entries(source, &archive, |item_index, item, reader| {
             let Some((index, mut entry, is_link)) =
                 selected_entries.get_mut(item_index).and_then(Option::take)
             else {
-                return Ok(());
+                return stage::copy(reader, &mut io::sink(), item.size);
             };
-            let mut payload = read_payload(reader, item.size)?;
-            if is_link {
+            let payload = if is_link {
+                let target = read_payload(reader, item.size)?;
+                self.reserve_metadata(target.len().saturating_mul(2) + 4)?;
                 if self.listing.time_formatter().is_some()
                     && let Some(name) = self.names.get_mut(index)
                 {
                     name.extend_from_slice(b" -> ");
-                    name.extend_from_slice(&payload);
+                    name.extend_from_slice(&target);
                 }
                 if !self.list_only {
                     entry.data =
-                        Data::Symlink(symlink_target(&entry.path, &payload, self.confined_links)?);
+                        Data::Symlink(symlink_target(&entry.path, &target, self.confined_links)?);
                 }
-                payload.clear();
-            }
+                None
+            } else if let Data::File(size) = entry.data {
+                Some(stage.payload(size, |output| stage::copy(reader, output, size))?)
+            } else {
+                None
+            };
             if !self.list_only {
                 entries.push((index, (entry, payload)));
             }
@@ -354,11 +389,14 @@ impl Scan<'_> {
 
     fn zip(
         &mut self,
-        bytes: &[u8],
+        source: &mut dyn ReadSeek,
+        len: u64,
         zone: &jiff::tz::TimeZone,
-    ) -> Result<Vec<(Entry, Vec<u8>)>, ArchiveError> {
-        let archive = zip_codec::open(bytes)?;
-        self.bytes_left = archive.preflight()?;
+        stage: &mut Stage<'_>,
+    ) -> Result<Vec<StagedEntry>, ArchiveError> {
+        let archive = zip_codec::open(source, len, self.bytes_left)?;
+        self.bytes_left = archive.bytes_left;
+        self.reserve_metadata(archive.metadata_bytes())?;
         let mut entries = Vec::new();
         for item in archive.entries() {
             let item = item?;
@@ -367,6 +405,7 @@ impl Scan<'_> {
                 .iter()
                 .map(|&byte| if byte == b'\\' { b'/' } else { byte })
                 .collect();
+            self.count_entry(name.len())?;
             let path = self.path(&name)?;
             if !self.select(&name, &path)? {
                 continue;
@@ -388,7 +427,10 @@ impl Scan<'_> {
                         "The ZIP symbolic link target is too long",
                     ));
                 }
-                item.payload()?
+                let mut bytes = Vec::new();
+                item.payload(source, &mut bytes)?;
+                self.reserve_metadata(bytes.len().saturating_mul(2) + 4)?;
+                bytes
             } else {
                 Vec::new()
             };
@@ -404,7 +446,6 @@ impl Scan<'_> {
                     &name,
                 );
                 if is_link {
-                    self.reserve_payload(link.len() as u64)?;
                     line.extend_from_slice(b" -> ");
                     line.extend_from_slice(&link);
                 }
@@ -412,17 +453,19 @@ impl Scan<'_> {
             } else {
                 BString::from(name)
             };
+            self.reserve_metadata(display.len())?;
             self.names.push(display);
             if self.list_only {
                 continue;
             }
             let (data, payload) = if is_link {
                 let target = symlink_target(&path, &link, self.confined_links)?;
-                (Data::Symlink(target), Vec::new())
+                (Data::Symlink(target), None)
             } else if is_dir {
-                (Data::Directory, Vec::new())
+                (Data::Directory, None)
             } else {
-                (Data::File(item.size), item.payload()?)
+                let interval = stage.payload(item.size, |output| item.payload(source, output))?;
+                (Data::File(item.size), Some(interval))
             };
             entries.push((
                 Entry {
@@ -640,37 +683,6 @@ impl<'a> Unpack<'a> {
         })
     }
 
-    fn tar(mut self, reader: impl Read, entries: Vec<(usize, Entry)>) -> Result<(), ArchiveError> {
-        let mut payload = Vec::with_capacity(64 * 1024);
-        let mut entries = entries.into_iter().peekable();
-        let mut archive = Archive::new(reader.take(size_limit() + 1));
-        for (index, item) in archive.entries().map_err(archive_error)?.enumerate() {
-            let mut item = item.map_err(archive_error)?;
-            let Some((_, entry)) = entries.next_if(|(selected, _)| *selected == index) else {
-                continue;
-            };
-            payload.clear();
-            if let Data::File(size) = entry.data {
-                if item.size() != size {
-                    return Err(ArchiveError::new("The archive changed during extraction"));
-                }
-                (&mut item)
-                    .take(size.saturating_add(1))
-                    .read_to_end(&mut payload)
-                    .map_err(archive_error)?;
-                check_payload_size(&payload, size)?;
-            }
-            self.entry(entry, &payload)?;
-            if entries.peek().is_none() {
-                break;
-            }
-        }
-        if entries.peek().is_some() {
-            return Err(ArchiveError::new("The archive changed during extraction"));
-        }
-        self.finish()
-    }
-
     fn checked_path(&self, relative: &Path, create_parents: bool) -> Result<PathBuf, ArchiveError> {
         let relative_parent = relative.parent().unwrap_or(Path::new(""));
         let mut parent = self.root.clone();
@@ -682,7 +694,12 @@ impl<'a> Unpack<'a> {
         Ok(self.root.join(relative))
     }
 
-    fn entry(&mut self, entry: Entry, payload: &[u8]) -> Result<(), ArchiveError> {
+    fn entry(
+        &mut self,
+        entry: Entry,
+        payload: Option<Interval>,
+        stage: &mut Stage<'_>,
+    ) -> Result<(), ArchiveError> {
         let host = self.host;
         let path = self.checked_path(&entry.path, true)?;
         match entry.data {
@@ -693,7 +710,10 @@ impl<'a> Unpack<'a> {
             }
             Data::File(_) => {
                 remove_existing_file(host, &path)?;
-                host.write(&path, payload, WriteMode::CreateNew)?;
+                stage.publish(
+                    payload.ok_or_else(|| ArchiveError::new("Missing staged archive entry"))?,
+                    &path,
+                )?;
                 restore(host, &path, entry.mode, entry.mtime)?;
                 if let Some(members) = &mut self.regular_members {
                     let metadata = host.metadata(&path, Follow::No)?;
@@ -744,12 +764,12 @@ impl<'a> Unpack<'a> {
                 }
                 remove_existing_file(host, &path)?;
                 if host.hard_link(&source, &path).is_err() {
-                    let contents = read_bytes(host, &source, self.bytes_left)?;
                     self.bytes_left = self
                         .bytes_left
-                        .checked_sub(contents.len() as u64)
+                        .checked_sub(metadata.len)
                         .ok_or_else(|| ArchiveError::new("Archive exceeds the size limit"))?;
-                    host.write(&path, &contents, WriteMode::CreateNew)?;
+                    let mut contents = host.open_read(&source)?;
+                    host.write_from(&path, WriteMode::CreateNew, &mut contents, metadata.len)?;
                     restore(host, &path, Some(metadata.mode), Some(metadata.mtime))?;
                 }
             }

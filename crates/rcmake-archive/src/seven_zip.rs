@@ -1,7 +1,7 @@
 use std::cmp::Reverse;
 use std::io::{Cursor, Read};
 
-use rcmake_host::{FileKind, FileTime, Metadata};
+use rcmake_host::{FileKind, FileTime, Metadata, ReadSeek};
 use sevenz_rust2::encoder_options::{
     Bzip2Options, DeflateOptions, EncoderOptions, Lzma2Options, LzmaOptions, ZstandardOptions,
 };
@@ -10,7 +10,7 @@ use sevenz_rust2::{
     NtTime, Password,
 };
 
-use crate::{ArchiveError, MAX_ENTRIES, SevenZipCompression, archive_error, size_limit};
+use crate::{ArchiveError, MAX_ENTRIES, SevenZipCompression, archive_error};
 
 pub(super) const MAGIC: &[u8] = b"\x37\x7a\xbc\xaf\x27\x1c";
 
@@ -157,23 +157,20 @@ pub(super) fn add(
     }
 }
 
-pub(super) fn open(bytes: &[u8]) -> Result<Archive, ArchiveError> {
-    let archive = preflight::open(bytes)?;
+pub(super) fn open(input: &mut dyn ReadSeek, len: u64) -> Result<Archive, ArchiveError> {
+    let archive = preflight::open(input, len)?;
     let limit_error = || ArchiveError::new("Archive exceeds the entry or size limit");
     if archive.files.len() > MAX_ENTRIES || archive.blocks.len() > MAX_ENTRIES {
         return Err(limit_error());
     }
-    let mut bytes_left = size_limit();
+    let mut bytes_left = crate::extract::stage::MAX_BYTES;
     for block in &archive.blocks {
         bytes_left = bytes_left
             .checked_sub(block.get_unpack_size())
             .ok_or_else(limit_error)?;
-        if block
-            .coders
-            .iter()
-            .enumerate()
-            .any(|(index, _)| block.get_unpack_size_at_index(index) > size_limit())
-        {
+        if block.coders.iter().enumerate().any(|(index, _)| {
+            block.get_unpack_size_at_index(index) > crate::extract::stage::MAX_BYTES
+        }) {
             return Err(limit_error());
         }
     }
@@ -181,11 +178,10 @@ pub(super) fn open(bytes: &[u8]) -> Result<Archive, ArchiveError> {
 }
 
 pub(super) fn read_entries(
-    bytes: &[u8],
+    mut source: &mut dyn ReadSeek,
     archive: &Archive,
     mut read: impl FnMut(usize, &ArchiveEntry, &mut dyn Read) -> Result<(), ArchiveError>,
 ) -> Result<(), ArchiveError> {
-    let mut source = Cursor::new(bytes);
     let password = Password::empty();
     for (block_index, block) in archive.blocks.iter().enumerate() {
         let first = archive
@@ -197,23 +193,20 @@ pub(super) fn read_entries(
         if let [coder] = block.coders.as_slice()
             && coder.encoder_method_id() == EncoderMethod::ID_PPMD
         {
-            let data = ppmd::decode(bytes, archive, block_index, coder.properties())?;
             let decoder = BlockDecoder::new(1, block_index, archive, &password, &mut source);
-            let mut remaining = data.as_slice();
-            for (index, entry) in decoder.entries().iter().enumerate() {
-                let size = usize::try_from(entry.size).map_err(archive_error)?;
-                let (payload, rest) = remaining
-                    .split_at_checked(size)
-                    .ok_or_else(|| ArchiveError::new("Invalid 7-Zip PPMd stream size"))?;
-                remaining = rest;
-                if entry.has_crc && u64::from(crc32fast::hash(payload)) != entry.crc {
-                    return Err(ArchiveError::new("7-Zip PPMd entry checksum mismatch"));
-                }
-                read(first + index, entry, &mut &*payload)?;
-            }
-            if !remaining.is_empty() {
-                return Err(ArchiveError::new("Invalid 7-Zip PPMd block size"));
-            }
+            let count = decoder.entries().len();
+            let entries = archive
+                .files
+                .get(first..first + count)
+                .ok_or_else(|| ArchiveError::new("Invalid 7-Zip block index"))?;
+            ppmd::read_entries(
+                source,
+                archive,
+                block_index,
+                coder.properties(),
+                entries,
+                |index, entry, input| read(first + index, entry, input),
+            )?;
         } else {
             let mut index = first;
             let mut error = None;

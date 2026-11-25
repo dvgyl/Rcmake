@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use rcmake_base::{BString, list, truth};
-use rcmake_cps::{CpsPackage, naming};
+use rcmake_cps::naming;
 use rcmake_eval::{CmdError, Cx};
 use rcmake_host::{FileKind, Follow, path};
 use rcmake_model::{CacheEntry, CacheType};
@@ -24,14 +24,13 @@ pub(super) struct ConfigSearch<'a> {
     direct_search: bool,
     visited: BTreeSet<(PathBuf, bool)>,
     pub(super) considered: Vec<(BString, BString, Option<BString>)>,
-    pub(super) rejected_dependency: Option<cps_import::Rejection>,
     pub(super) cps_names: Vec<BString>,
 }
 
 pub(super) struct ConfigMatch {
     pub(super) file: BString,
     pub(super) version: BString,
-    cps: Option<Box<CpsPackage>>,
+    cps: Option<Box<cps_import::Candidate>>,
 }
 
 impl ConfigMatch {
@@ -100,7 +99,6 @@ impl<'a> ConfigSearch<'a> {
             direct_search: false,
             visited: BTreeSet::new(),
             considered: Vec::new(),
-            rejected_dependency: None,
         }
     }
 
@@ -181,7 +179,7 @@ impl<'a> ConfigSearch<'a> {
             ),
         );
         let redirects = redirects_directory(cx);
-        for (prefix, spelling) in self.prefixes(cx, package_roots, mode, &mut report.trace) {
+        for (prefix, spelling) in self.prefixes(cx, package_roots, mode, &mut report.trace)? {
             if ignored.contains(&prefix)
                 || ignored_prefixes.contains(&prefix)
                 || Some(&prefix) != redirects.as_ref()
@@ -338,17 +336,16 @@ impl<'a> ConfigSearch<'a> {
             let mut found_version = BString::default();
             let mut reason = Reason::Error;
             let result = match cps_import::read_root(cx, &file) {
-                Ok(mut package) if package.name == self.name => {
+                Ok(package) if package.name == self.name => {
                     found_version = package.version.clone().unwrap_or_default();
                     match cps_import::check_version(&package, self.request) {
                         Ok(()) => {
                             reason = Reason::InsufficientComponents;
-                            cps_import::prepare(cx, &file, &mut package, self.request)?
-                                .map(|()| package)
+                            cps_import::inspect(cx, &file, package, self.request)
                         }
                         Err(message) => {
                             reason = Reason::InsufficientVersion;
-                            Err(message.into())
+                            Err(message)
                         }
                     }
                 }
@@ -358,12 +355,11 @@ impl<'a> ConfigSearch<'a> {
                         b"The file describes the package \"",
                         &package.name,
                         b"\", which is not the requested package.",
-                    ])
-                    .into())
+                    ]))
                 }
-                Err(_) => {
-                    Err(BString::from("The package description file could not be read.").into())
-                }
+                Err(_) => Err(BString::from(
+                    "The package description file could not be read.",
+                )),
             };
             let file = path::from_native_cmake(&file);
             let considered_version = if found_version.is_empty() {
@@ -384,15 +380,9 @@ impl<'a> ConfigSearch<'a> {
                 Err(rejection) => {
                     report
                         .log
-                        .candidate(|| file.clone(), mode, reason, rejection.reason.clone());
-                    self.considered.push((
-                        file,
-                        considered_version,
-                        Some(rejection.reason.clone()),
-                    ));
-                    if !rejection.diagnostics.is_empty() && self.rejected_dependency.is_none() {
-                        self.rejected_dependency = Some(rejection);
-                    }
+                        .candidate(|| file.clone(), mode, reason, rejection.clone());
+                    self.considered
+                        .push((file, considered_version, Some(rejection)));
                 }
             }
         }
@@ -445,7 +435,7 @@ impl<'a> ConfigSearch<'a> {
                 cx.set_var(&text(&[&prefix, b"_COUNT"]), "0".into());
             } else {
                 if let Some(package) = &found.cps {
-                    cps_import::version_bindings(package, &prefix, &mut vars);
+                    cps_import::version_bindings(&package.root, &prefix, &mut vars);
                 } else {
                     version_bindings(&prefix, &found.version, &mut vars);
                 }
@@ -453,7 +443,11 @@ impl<'a> ConfigSearch<'a> {
             }
             cx.unset_var(found_var);
             cx.unset_var(&message);
-            if let Some(package) = found.cps {
+            if let Some(candidate) = found.cps {
+                cx.set_var(found_var, "1".into());
+                cx.set_var(&config, found.file.clone());
+                let package =
+                    cps_import::load(cx, &path::to_native(&found.file), *candidate, self.request)?;
                 cps_import::import(cx, &package, &found.file)?;
                 for (component, entry) in &package.components {
                     let supported = cps_import::target_kind(&entry.ty).is_some();

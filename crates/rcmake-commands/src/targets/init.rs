@@ -133,7 +133,6 @@ fn applies_to_target(
             "FOLDER"
                 | "VERIFY_INTERFACE_HEADER_SETS"
                 | "VERIFY_PRIVATE_HEADER_SETS"
-                | "EXPORT_FIND_PACKAGE_NAME"
                 | "DOTNET_SDK"
                 | "DOTNET_TARGET_FRAMEWORK"
                 | "DOTNET_TARGET_FRAMEWORK_VERSION"

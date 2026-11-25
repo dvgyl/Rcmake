@@ -7,7 +7,7 @@ use rcmake_eval::{CmdError, CmdResult, Cx, IncludeOptions};
 use rcmake_expr::ExpandedArg;
 use rcmake_host::path;
 
-use super::super::search_paths::{host_env_paths, setting_enabled};
+use super::super::search_paths::setting_enabled;
 use super::super::{RootMode, text};
 
 #[derive(Default)]
@@ -37,6 +37,8 @@ pub(in crate::process_find) struct Request {
     disabled_sources: BTreeSet<&'static [u8]>,
     no_defaults: bool,
     pub(super) root_mode: RootMode,
+    pub(super) sort_order: BString,
+    pub(super) sort_ascending: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -51,7 +53,7 @@ enum Values {
 }
 
 impl Request {
-    pub(super) fn parse(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> Result<Self, CmdError> {
+    pub(super) fn parse(args: &[ExpandedArg]) -> Result<Self, CmdError> {
         let mut request = Self::default();
         let mut values = Values::None;
         let mut args = args.iter();
@@ -81,10 +83,7 @@ impl Request {
                             "missing required argument for REGISTRY_VIEW",
                         ));
                     };
-                    if !matches!(
-                        view.as_slice(),
-                        b"64" | b"32" | b"64_32" | b"32_64" | b"HOST" | b"TARGET" | b"BOTH"
-                    ) {
+                    if !super::super::registry_path::valid_view(view) {
                         return Err(CmdError::status(text(&[
                             b"given invalid value for REGISTRY_VIEW: ",
                             view,
@@ -119,7 +118,7 @@ impl Request {
                         request.config_options.push(value.clone());
                         request.disabled_sources.insert(source);
                     } else {
-                        request.add_value(cx, values, value, &mut args)?;
+                        request.add_value(values, value)?;
                         continue;
                     }
                 }
@@ -156,6 +155,34 @@ impl Request {
         Ok(request)
     }
 
+    pub(super) fn snapshot_search(&mut self, cx: &Cx<'_>) {
+        self.root_mode = self
+            .root_mode
+            .resolve(cx, b"CMAKE_FIND_ROOT_PATH_MODE_PACKAGE");
+        let order = b"CMAKE_FIND_PACKAGE_SORT_ORDER";
+        self.sort_order = if cx.var_defined(order) {
+            cx.var_or_empty(order)
+        } else {
+            "NATURAL".into()
+        };
+        let direction = b"CMAKE_FIND_PACKAGE_SORT_DIRECTION";
+        self.sort_ascending = cx.var_defined(direction) && cx.var_or_empty(direction) != b"DEC";
+    }
+
+    pub(super) fn inherit(&mut self, cx: &Cx<'_>, parent: &Self, needed: bool) {
+        self.no_defaults = parent.no_defaults;
+        self.disabled_sources.clone_from(&parent.disabled_sources);
+        self.suffixes.clone_from(&parent.suffixes);
+        self.root_mode = parent.root_mode;
+        self.registry_view.clone_from(&parent.registry_view);
+        self.sort_order.clone_from(&parent.sort_order);
+        self.sort_ascending = parent.sort_ascending;
+        self.global = parent.global || cx.var_is_on(b"CMAKE_FIND_PACKAGE_TARGETS_GLOBAL");
+        self.quiet = parent.quiet;
+        self.required = needed && parent.required;
+        self.optional = !self.required;
+    }
+
     pub(super) fn apply_requiredness(&mut self, cx: &mut Cx<'_>, name: &[u8]) {
         if !self.required && !self.optional && cx.var_is_on(b"CMAKE_FIND_REQUIRED") {
             self.required = true;
@@ -183,13 +210,7 @@ impl Request {
         }
     }
 
-    fn add_value<'a>(
-        &mut self,
-        cx: &Cx<'_>,
-        values: Values,
-        value: &BString,
-        args: &mut impl Iterator<Item = &'a ExpandedArg>,
-    ) -> Result<(), CmdError> {
+    fn add_value(&mut self, values: Values, value: &BString) -> Result<(), CmdError> {
         match values {
             Values::Components(required) => self.components.push((value.clone(), required)),
             Values::Names => self.names.push(value.clone()),
@@ -216,14 +237,7 @@ impl Request {
                     &mut self.log_paths_args
                 };
                 raw.push(value.clone());
-                if value == b"ENV" {
-                    if let Some(key) = args.next() {
-                        raw.push(key.value.clone());
-                        dest.extend(host_env_paths(cx, &key.value));
-                    }
-                } else {
-                    dest.push(value.clone());
-                }
+                dest.push(value.clone());
             }
             Values::Suffixes => {
                 self.suffixes.push(value.clone());

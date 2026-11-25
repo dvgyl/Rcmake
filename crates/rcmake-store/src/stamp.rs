@@ -5,6 +5,7 @@ pub use tree::{sdk_tree_listing_digest, tree_listing_digest};
 use std::collections::BTreeMap;
 use std::io::ErrorKind;
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -193,6 +194,8 @@ pub struct TraceMemo {
     generation_host: Option<Arc<rcmake_host::MemoHost<dyn Host>>>,
     tools: Mutex<BTreeMap<PathBuf, (u64, FastStat, Digest)>>,
     sdk: Mutex<BTreeMap<PathBuf, (u64, Digest)>>,
+    sdk_coverage_failures: AtomicU64,
+    sdk_graph_hits: AtomicU64,
 }
 
 impl TraceMemo {
@@ -205,8 +208,20 @@ impl TraceMemo {
         }
     }
 
-    fn generation(&self) -> Option<u64> {
-        self.generation_host.as_ref()?.stable_generation()
+    fn generation(&self, path: &Path) -> Option<u64> {
+        self.generation_host.as_ref()?.stable_generation_for(path)
+    }
+
+    /// Return the number of SDK graphs that could not supply input coverage.
+    #[must_use]
+    pub fn sdk_coverage_failures(&self) -> u64 {
+        self.sdk_coverage_failures.load(Ordering::Relaxed)
+    }
+
+    /// Return the number of SDK searches that reused a graph.
+    #[must_use]
+    pub fn sdk_graph_hits(&self) -> u64 {
+        self.sdk_graph_hits.load(Ordering::Relaxed)
     }
 
     /// Hash a compiler executable or compiler library.
@@ -228,10 +243,14 @@ impl TraceMemo {
         path: &Path,
         metadata: &Metadata,
     ) -> HostResult<Digest> {
-        let Some(generation) = self
-            .generation()
+        let Some(canonical) = host
+            .canonicalize(path)
+            .ok()
             .filter(|_| metadata.ino != 0 && metadata.kind == FileKind::File)
         else {
+            return hash_file(host, path, metadata);
+        };
+        let Some(generation) = self.generation(&canonical) else {
             return hash_file(host, path, metadata);
         };
         let stat = FastStat::from(metadata);
@@ -243,7 +262,7 @@ impl TraceMemo {
             return Ok(digest);
         }
         let digest = hash_file(host, path, metadata)?;
-        if self.generation() == Some(generation)
+        if self.generation(&canonical) == Some(generation)
             && let Ok(mut tools) = self.tools.lock()
             && (tools.len() < 1024 || tools.contains_key(path))
         {
@@ -254,26 +273,37 @@ impl TraceMemo {
 
     /// Hash a bounded SDK search graph and retain it for the current host generation.
     pub fn sdk_digest(&self, host: &dyn Host, root: &Path) -> HostResult<Digest> {
-        let Some(generation) = self.generation() else {
-            return sdk_tree_listing_digest(host, root);
-        };
+        self.sdk_digest_inner(host, root).inspect_err(|_| {
+            self.sdk_coverage_failures.fetch_add(1, Ordering::Relaxed);
+        })
+    }
+
+    fn sdk_digest_inner(&self, host: &dyn Host, root: &Path) -> HostResult<Digest> {
         let canonical = host.canonicalize(root)?;
+        let Some(generation) = self.generation(&canonical) else {
+            let graph = tree::sdk_graph_digest(host, &canonical)?;
+            return tree::sdk_root_digest(host, root, graph);
+        };
         let cached = self.sdk.lock().ok().and_then(|sdk| {
             sdk.get(&canonical)
                 .filter(|(revision, _)| *revision == generation)
                 .map(|(_, digest)| *digest)
         });
-        let graph = match cached {
-            Some(graph) => graph,
-            None => tree::sdk_graph_digest(host, &canonical)?,
+        let (graph, confined) = match cached {
+            Some(graph) => {
+                self.sdk_graph_hits.fetch_add(1, Ordering::Relaxed);
+                (graph, true)
+            }
+            None => tree::sdk_graph(host, &canonical)?,
         };
         let digest = tree::sdk_root_digest(host, root, graph)?;
-        if self.generation() != Some(generation) {
+        if self.generation(&canonical) != Some(generation) {
             return Err(HostError::unsupported(
                 "The host changed during the SDK listing.",
             ));
         }
-        if cached.is_none()
+        if confined
+            && cached.is_none()
             && let Ok(mut sdk) = self.sdk.lock()
             && (sdk.len() < 128 || sdk.contains_key(&canonical))
         {

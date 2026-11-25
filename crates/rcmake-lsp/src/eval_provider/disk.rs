@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
-use rcmake_host::{Follow, Host, HostResult, ReadRange};
+use rcmake_host::{FileKind, Follow, Host, HostResult, Metadata, ReadRange};
 
 use super::{MAX_TRACKED_BYTES, MAX_TRACKED_FILES};
 
@@ -15,6 +15,7 @@ struct Read {
 
 struct Input {
     resolved: PathBuf,
+    stat: Metadata,
     reads: Vec<Read>,
 }
 
@@ -40,10 +41,23 @@ impl DiskReads {
         let Ok(bytes) = result else {
             return;
         };
+        if volatile(path) || volatile(origin) {
+            return;
+        }
+        let Ok(stat) = host.metadata(path, Follow::Yes) else {
+            self.incomplete = true;
+            return;
+        };
+        if stat.kind != FileKind::File {
+            return;
+        }
         let Ok(resolved) = host.canonicalize(path) else {
             self.incomplete = true;
             return;
         };
+        if volatile(&resolved) {
+            return;
+        }
         if path != origin && host.canonicalize(origin).as_ref() == Ok(&resolved) {
             if self.aliases.len() < MAX_TRACKED_FILES || self.aliases.contains_key(origin) {
                 if self
@@ -78,6 +92,7 @@ impl DiskReads {
             .entry(path.to_owned())
             .or_insert_with(|| Input {
                 resolved,
+                stat,
                 reads: Vec::new(),
             })
             .reads
@@ -113,13 +128,33 @@ impl DiskReads {
         !self.incomplete
     }
 
-    pub(super) fn changed(&self, host: &dyn Host) -> bool {
+    pub(super) fn changed(&self, host: &dyn Host, verify_bytes: bool) -> bool {
         self.missing.iter().any(|path| !missing(host, path))
             || self
                 .aliases
                 .iter()
                 .any(|(path, resolved)| host.canonicalize(path).as_ref() != Ok(resolved))
             || self.files.iter().any(|(path, input)| {
+                let Ok(stat) = host.metadata(path, Follow::Yes) else {
+                    return true;
+                };
+                if stat.kind != FileKind::File {
+                    return true;
+                }
+                let before = &input.stat;
+                if !verify_bytes
+                    && stat.ino != 0
+                    && (stat.dev, stat.ino, stat.len, stat.mtime, stat.ctime)
+                        == (
+                            before.dev,
+                            before.ino,
+                            before.len,
+                            before.mtime,
+                            before.ctime,
+                        )
+                {
+                    return false;
+                }
                 host.canonicalize(path).as_ref() != Ok(&input.resolved)
                     || input.reads.iter().any(|read| {
                         // One extra byte detects growth without an unbounded read.
@@ -142,4 +177,29 @@ impl DiskReads {
 fn missing(host: &dyn Host, path: &Path) -> bool {
     host.metadata(path, Follow::Yes)
         .is_err_and(|error| error.kind == ErrorKind::NotFound)
+}
+
+fn volatile(path: &Path) -> bool {
+    ["/proc", "/sys", "/dev"]
+        .iter()
+        .any(|root| path.starts_with(root))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn does_not_invalidate_on_proc_reads() -> HostResult<()> {
+        let host = rcmake_host::PureHost::default();
+        let path = Path::new("/proc/cpuinfo");
+        let range = ReadRange::All { limit: 16 };
+        host.seed_file(path, b"first")?;
+        let mut disk = DiskReads::default();
+        disk.record(&host, path, path, range, &host.read(path, range));
+        host.write(path, b"second", rcmake_host::WriteMode::Truncate)?;
+        assert_eq!(disk.paths().count(), 0);
+        assert!(!disk.changed(&host, true));
+        Ok(())
+    }
 }

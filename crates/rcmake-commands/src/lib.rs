@@ -5,6 +5,8 @@
 
 use rcmake_eval::Registry;
 
+pub use rcmake_model::GeneratorKind;
+
 mod active;
 mod compat;
 mod configure;

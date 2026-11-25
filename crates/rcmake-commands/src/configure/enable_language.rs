@@ -324,11 +324,11 @@ impl Bootstrap {
         let system_file = cat(&[&self.root_bin, b"/CMakeSystem.cmake"]);
         let read_system = !cx.var_defined(b"CMAKE_SYSTEM_LOADED");
         if read_system && exists(cx, &path::to_native(&system_file)) {
+            read_list_file(cx, &system_file)?;
             if !self.in_try_compile && super::selection_change::toolchain_changed(cx) {
                 cx.request_exit(0);
                 return Err(CmdError::Reported);
             }
-            read_list_file(cx, &system_file)?;
         }
         if !cx.var_defined(b"CMAKE_SYSTEM") {
             if let Some(module) = modules_file(cx, b"CMakeDetermineSystem.cmake") {

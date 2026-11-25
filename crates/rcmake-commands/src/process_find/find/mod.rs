@@ -11,6 +11,7 @@ use directories::{directories, normalize};
 use options::Options;
 use search::Search;
 
+mod architecture;
 mod directories;
 mod options;
 mod search;
@@ -128,7 +129,7 @@ fn find(cx: &mut Cx<'_>, args: &[ExpandedArg], kind: Kind) -> CmdResult {
         ));
     }
 
-    let directories = directories(cx, kind, &options);
+    let directories = directories(cx, kind, &options)?;
     let mut search = Search::new(cx, kind, &options, var);
     let found = search.run(cx, directories)?;
     search.log(cx, var);

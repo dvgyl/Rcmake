@@ -5,22 +5,20 @@ use std::sync::Mutex;
 
 use rcmake_base::{BString, list, path_lex::Lexical};
 use rcmake_eval::Cx;
-use rcmake_host::{FileKind, Follow, path};
+use rcmake_host::path;
 
 const TOOLCHAIN_FILE: &[u8] = b"CMAKE_TOOLCHAIN_FILE";
 
 /// Platform selections that changed during a warm configure.
 pub struct ConfigureSelection {
-    previous_toolchain: BString,
     changes: Mutex<BTreeMap<BString, BString>>,
 }
 
 impl ConfigureSelection {
-    /// Start tracking changes from the toolchain recorded in the saved cache.
+    /// Start tracking changes to the configure selections.
     #[must_use]
-    pub fn new(previous_toolchain: BString) -> Self {
+    pub fn new(_previous_toolchain: BString) -> Self {
         Self {
-            previous_toolchain,
             changes: Mutex::default(),
         }
     }
@@ -60,32 +58,16 @@ pub(super) fn toolchain_changed(cx: &mut Cx<'_>) -> bool {
     else {
         return false;
     };
-    let selected = cx.var_or_empty(TOOLCHAIN_FILE);
-    let build = cx.var_or_empty(b"CMAKE_BINARY_DIR");
-    let source = cx.var_or_empty(b"CMAKE_SOURCE_DIR");
-    let resolve = |value: &[u8]| {
-        if value.is_empty() {
-            return BString::default();
-        }
-        let file = path::to_native(value);
-        let absolute = if file.is_absolute() {
-            file
-        } else {
-            let candidate = path::to_native(&build).join(&file);
-            if cx
-                .host()
-                .metadata(&candidate, Follow::Yes)
-                .is_ok_and(|m| m.kind == FileKind::File)
-            {
-                candidate
-            } else {
-                path::to_native(&source).join(file)
-            }
-        };
-        Lexical::new(&path::from_native_cmake(&absolute)).normalize()
+    let Some(selected) = cx.var(TOOLCHAIN_FILE) else {
+        return false;
     };
-    let selected = resolve(&selected);
-    if selected == resolve(&selection.previous_toolchain) {
+    if [
+        b"_CMAKE_INPUT_TOOLCHAIN_FILE".as_slice(),
+        b"_CMAKE_SYSTEM_TOOLCHAIN_FILE",
+    ]
+    .iter()
+    .any(|name| cx.var(name).as_ref() == Some(&selected))
+    {
         return false;
     }
     selection.record(TOOLCHAIN_FILE, selected);

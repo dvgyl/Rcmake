@@ -150,6 +150,52 @@ impl Host for HermeticHost {
         self.inner.supports_process_execution()
     }
 
+    fn registry_host_view(&self) -> Option<rcmake_host::RegistryView> {
+        self.inner.registry_host_view()
+    }
+
+    fn registry_value(
+        &self,
+        root: rcmake_host::RegistryRoot,
+        subkey: &[u8],
+        name: Option<&[u8]>,
+        view: rcmake_host::RegistryView,
+    ) -> HostResult<Option<BString>> {
+        let site = self.context.site();
+        let decision = self.audit(|audit| audit.check_registry(&site));
+        require_allowed(decision, ViolationKind::RegistryRead)?;
+        self.inner.registry_value(root, subkey, name, view)
+    }
+
+    fn open_read(&self, p: &Path) -> HostResult<Box<dyn rcmake_host::ReadSeek + '_>> {
+        self.inner.open_read(&self.guard_path(p)?)
+    }
+
+    fn scratch_file(&self) -> HostResult<Box<dyn rcmake_host::ScratchFile + '_>> {
+        self.inner.scratch_file()
+    }
+
+    fn write_from(
+        &self,
+        p: &Path,
+        mode: WriteMode,
+        input: &mut dyn std::io::Read,
+        len: u64,
+    ) -> HostResult<()> {
+        self.inner.write_from(p, mode, input, len)
+    }
+
+    fn run_controlled(
+        &self,
+        req: &RunRequest,
+        graceful: Option<GracefulTimeout>,
+        hard_limit: Option<std::time::Duration>,
+        update: &mut rcmake_host::DeadlineUpdate<'_>,
+    ) -> HostResult<rcmake_host::ControlledOutput> {
+        self.inner
+            .run_controlled(&self.process_request(req)?, graceful, hard_limit, update)
+    }
+
     fn run(
         &self,
         request: &RunRequest,

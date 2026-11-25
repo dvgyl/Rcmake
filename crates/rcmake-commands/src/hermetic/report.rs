@@ -173,6 +173,7 @@ pub(super) fn render(state: &AuditState, mode: HermeticMode, denied: bool) -> Ve
                 ViolationKind::UndeclaredEnvRead | ViolationKind::NetworkAccess => &record.value,
                 ViolationKind::OutOfTreePathRead => "<external path>",
                 ViolationKind::UnapprovedProcess => "<unapproved executable>",
+                ViolationKind::RegistryRead => "Windows registry",
             };
             (file, record.site.line(), record.kind.code(), value)
         })

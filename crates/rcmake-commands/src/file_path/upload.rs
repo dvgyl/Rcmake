@@ -45,7 +45,7 @@ pub(super) fn run(cx: &mut Cx<'_>, args: &[&[u8]]) -> Result {
         "--upload-file".into(),
         path::from_native(&source),
         "--url".into(),
-        BString::from(*url),
+        super::curl_compat_file_url(url),
     ]);
     let request = RunRequest {
         pipeline: vec![CommandSpec {

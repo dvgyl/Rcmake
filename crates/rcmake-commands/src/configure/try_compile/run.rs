@@ -9,6 +9,7 @@ use rcmake_model::DirId;
 use rcmake_resolve::BuildStep;
 
 mod apple;
+pub(super) mod cross;
 
 use super::args::Options;
 use super::seed::toolchain_variable;
@@ -92,9 +93,7 @@ pub(super) fn run_executable(
             list::Empty::Drop,
         );
     }
-    let result = if let Some(artifact) = artifact
-        && (!cross || !command.is_empty())
-    {
+    let result = if let Some(artifact) = artifact {
         command.push(path::from_native(artifact));
         command.extend(options.many(b"ARGS").iter().copied().map(BString::from));
         command.split_first().and_then(|(program, args)| {
@@ -134,6 +133,16 @@ pub(super) fn run_executable(
         _ => "FAILED_TO_RUN".into(),
     };
     set_result(cx, variable, value.clone(), options.has(b"NO_CACHE"));
+    let result = RunResult {
+        value,
+        stdout: result.stdout,
+        stderr: result.stderr,
+    };
+    apply_output(cx, options, build_output, &result);
+    result
+}
+
+fn apply_output(cx: &mut Cx<'_>, options: &Options<'_>, build_output: &[u8], result: &RunResult) {
     for (key, output) in [
         (b"RUN_OUTPUT_VARIABLE".as_slice(), result.stdout.as_slice()),
         (b"RUN_OUTPUT_STDOUT_VARIABLE", result.stdout.as_slice()),
@@ -154,10 +163,5 @@ pub(super) fn run_executable(
             .concat()
             .into(),
         );
-    }
-    RunResult {
-        value,
-        stdout: result.stdout,
-        stderr: result.stderr,
     }
 }

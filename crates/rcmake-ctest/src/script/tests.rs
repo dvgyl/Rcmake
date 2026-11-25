@@ -78,6 +78,7 @@ fn configures_from_a_ctest_link_outside_the_install_directory() -> Result<(), Bo
         set(CTEST_SOURCE_DIRECTORY "/work/src")
         set(CTEST_BINARY_DIRECTORY "/work/build")
         set(CTEST_CMAKE_GENERATOR Ninja)
+        set(CTEST_CONFIGURATION_TYPE Debug)
         ctest_start(Experimental)
         ctest_configure()
     "#,
@@ -88,6 +89,12 @@ fn configures_from_a_ctest_link_outside_the_install_directory() -> Result<(), Bo
             .first()
             .ok_or_else(|| HostError::unsupported("Missing configure command"))?;
         assert_eq!(path::to_native(&command.program), cmake);
+        assert!(
+            command
+                .args
+                .iter()
+                .any(|arg| arg == b"-DCMAKE_BUILD_TYPE:STRING=Debug")
+        );
         Ok(RunOutput {
             results: vec![ProcessResult::Exited(0)],
             ..RunOutput::default()
@@ -554,6 +561,50 @@ fn runs_dashboard_build_presets_from_the_build_directory() -> Result<(), Box<dyn
             Follow::Yes
         )
         .is_ok()
+    );
+    Ok(())
+}
+
+#[test]
+fn dashboard_start_runs_checkout_before_source_validation() -> Result<(), Box<dyn Error>> {
+    let host = Arc::new(PureHost::default());
+    host.seed_file(
+        Path::new("/work/dashboard.cmake"),
+        br#"
+        set(CTEST_SOURCE_DIRECTORY "/work/checkout/src")
+        set(CTEST_BINARY_DIRECTORY "/work/build")
+        set(CTEST_CHECKOUT_COMMAND [=[checkout "new tree"]=])
+        set(CTEST_CVS_CHECKOUT ignored)
+        ctest_start(Experimental QUIET)
+    "#,
+    )?;
+    host.set_command_handler(|host, request, _| {
+        assert_eq!(request.cwd, Path::new("/work/checkout"));
+        let checkout = request
+            .pipeline
+            .first()
+            .ok_or_else(|| HostError::unsupported("Missing checkout command."))?;
+        assert_eq!(checkout.program, "checkout");
+        assert_eq!(checkout.args, ["new tree"]);
+        host.create_dir_all(&request.cwd.join("src"))?;
+        Ok(RunOutput {
+            results: vec![ProcessResult::Exited(0)],
+            stdout: b"finished\n".to_vec(),
+            stderr: b"notice\n".to_vec(),
+        })
+    })?;
+    assert_eq!(invoke(host.clone(), &["-S", "dashboard.cmake"]), 0);
+    let contents = host.read(
+        Path::new("/work/build/Testing/Temporary/LastStart.log"),
+        ReadRange::All { limit: 4096 },
+    )?;
+    let contents = std::str::from_utf8(&contents)?;
+    assert!(contents.contains("--- Begin Initial Checkout ---"));
+    assert!(contents.contains("co-out> finished\nco-err> notice\n"));
+    assert!(contents.contains("--- End Initial Checkout ---"));
+    assert!(
+        host.metadata(Path::new("/work/build/Testing/TAG"), Follow::Yes)
+            .is_ok()
     );
     Ok(())
 }

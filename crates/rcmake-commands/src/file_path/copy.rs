@@ -254,33 +254,38 @@ pub(super) fn copy_entry(
         return Ok(());
     }
     if directory {
-        let replace_symlink = options.install
+        let linked_dir = options.install
             && existing
                 .as_ref()
                 .is_some_and(|entry| entry.kind == FileKind::Symlink);
-        let destination = if replace_symlink {
-            target.parent().unwrap_or(target)
-        } else {
-            target
-        };
-        if depth == 0 && is_descendant(cx, source, destination) {
+        if linked_dir {
+            let referent = host
+                .metadata(target, Follow::Yes)
+                .map_err(|e| copy_error(command, "make directory", target, &e))?;
+            if referent.kind != FileKind::Dir {
+                return Err(error(format!(
+                    "{command} cannot make directory \"{}\": Not a directory.",
+                    target.display()
+                )));
+            }
+        }
+        if depth == 0 && is_descendant(cx, source, target) {
             return Err(error(format!(
                 "{command} cannot copy directory \"{}\" into itself.",
                 source.display()
             )));
         }
-        if replace_symlink {
-            host.remove_file(target)
-                .map_err(|e| copy_error(command, "remove", target, &e))?;
+        if !linked_dir {
+            host.create_dir_all(target)
+                .map_err(|e| copy_error(command, "make directory", target, &e))?;
         }
-        host.create_dir_all(target)
-            .map_err(|e| copy_error(command, "make directory", target, &e))?;
         observe(
             target,
             true,
-            existing
-                .as_ref()
-                .is_some_and(|meta| meta.kind == FileKind::Dir),
+            linked_dir
+                || existing
+                    .as_ref()
+                    .is_some_and(|meta| meta.kind == FileKind::Dir),
         );
         let mut children = host
             .read_dir(source)

@@ -1,9 +1,14 @@
+use std::path::Path;
+
 use rcmake_base::BString;
 use rcmake_eval::{CmdError, CmdResult, Cx, Flow, IncludeOptions, args::ArgCursor};
 use rcmake_expr::ExpandedArg;
-use rcmake_host::{FileKind, Follow, Stream};
+use rcmake_host::{FileKind, Follow, Stream, WriteMode};
 
-use super::{SESSION, Start, configuration, directory, error, prior_start, verbose};
+use super::{
+    SESSION, Start, configuration, directory, error, prior_start, process_code, run_process,
+    split_command, verbose,
+};
 use crate::dart::{self, Model, Tag};
 
 pub(super) fn ctest_start(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
@@ -28,13 +33,22 @@ pub(super) fn ctest_start(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
         b"CTEST_BINARY_DIRECTORY",
         previous.as_ref().map(|start| start.build.as_path()),
     )?;
+    let temporary = build.join("Testing/Temporary");
+    let log = temporary.join("LastStart.log");
+    cx.host()
+        .create_dir_all(&temporary)
+        .map_err(|err| error(err.to_string()))?;
+    cx.host()
+        .write(&log, b"", WriteMode::Truncate)
+        .map_err(|err| error(err.to_string()))?;
+    checkout(cx, &source, &log)?;
     if !cx
         .host()
         .metadata(&source, Follow::Yes)
         .is_ok_and(|meta| meta.kind == FileKind::Dir)
     {
         return Err(error(format!(
-            "given source path \n\n  {}\n\nwhich is not an existing directory.",
+            "given source path \n\n  {}\n\nwhich is not an existing directory.  Set CTEST_CHECKOUT_COMMAND to a command line to create it.",
             source.display()
         )));
     }
@@ -124,6 +138,59 @@ pub(super) fn ctest_start(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
         }
     });
     Ok(Flow::Normal)
+}
+
+fn checkout(cx: &mut Cx<'_>, source: &Path, log: &Path) -> Result<(), CmdError> {
+    let Some(command) = cx
+        .var(b"CTEST_CHECKOUT_COMMAND")
+        .or_else(|| cx.var(b"CTEST_CVS_CHECKOUT"))
+    else {
+        return Ok(());
+    };
+    let mut record = BString::from("--- Begin Initial Checkout ---\n");
+    record.extend_from_slice(&command);
+    record.push(b'\n');
+    let result = (|| {
+        let argv = split_command(cx, &command)?;
+        let (program, args) = argv
+            .split_first()
+            .ok_or_else(|| error("Initial checkout failed!"))?;
+        let cwd = source.parent().unwrap_or(source);
+        let host = cx.host();
+        host.create_dir_all(cwd)
+            .map_err(|err| error(err.to_string()))?;
+        let output = run_process(
+            host,
+            cwd.to_owned(),
+            program.clone(),
+            args.to_vec(),
+            host.env_all(),
+            false,
+        )
+        .map_err(|err| error(err.to_string()))?;
+        for (prefix, bytes) in [(b"co-out> ", &output.stdout), (b"co-err> ", &output.stderr)] {
+            for line in bytes.split_inclusive(|&byte| byte == b'\n') {
+                record.extend_from_slice(prefix);
+                record.extend_from_slice(line);
+                if !line.ends_with(b"\n") {
+                    record.push(b'\n');
+                }
+            }
+        }
+        if process_code(&output) != Some(0) {
+            return Err(error("Initial checkout failed!"));
+        }
+        Ok(())
+    })();
+    if let Err(CmdError::Status(message)) = &result {
+        record.extend_from_slice(message);
+        record.push(b'\n');
+    }
+    record.extend_from_slice(b"--- End Initial Checkout ---\n");
+    cx.host()
+        .write(log, &record, WriteMode::Truncate)
+        .map_err(|err| error(err.to_string()))?;
+    result
 }
 
 struct StartArgs<'a> {

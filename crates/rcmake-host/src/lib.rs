@@ -30,9 +30,13 @@ pub use error::{HostError, HostResult};
 pub use memo::{MemoHost, MemoStats};
 #[cfg(any(unix, windows))]
 pub use native::NativeHost;
+mod stream;
+pub use stream::{ReadSeek, ScratchFile};
+mod registry;
 pub use no_process::{DeniedCommand, DeniedLog, DeniedMethod, NoProcessHost};
 pub use overlay::{OverlayAudit, OverlayHost, OverlayPathPolicy, OverlayPathStyle};
 pub use pure::PureHost;
+pub use registry::{RegistryRoot, RegistryView};
 
 /// Whether a metadata query follows symbolic links (`stat` vs `lstat`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -450,6 +454,43 @@ pub trait Host: Send + Sync {
     /// This query does not run a command. The default returns `true`.
     fn supports_process_execution(&self) -> bool {
         true
+    }
+
+    /// Open a regular file for bounded streaming reads.
+    fn open_read(&self, path: &Path) -> HostResult<Box<dyn ReadSeek + '_>> {
+        stream::open_read(self, path)
+    }
+
+    /// Create an anonymous temporary file for internal data.
+    fn scratch_file(&self) -> HostResult<Box<dyn ScratchFile + '_>> {
+        Ok(stream::scratch())
+    }
+
+    /// Write exactly `len` bytes from a stream.
+    fn write_from(
+        &self,
+        path: &Path,
+        mode: WriteMode,
+        input: &mut dyn std::io::Read,
+        len: u64,
+    ) -> HostResult<()> {
+        stream::write_from(self, path, mode, input, len)
+    }
+
+    /// Return the native Windows registry view, if available.
+    fn registry_host_view(&self) -> Option<RegistryView> {
+        None
+    }
+
+    /// Read a Windows registry value. An absent or unsupported value is a miss.
+    fn registry_value(
+        &self,
+        _root: RegistryRoot,
+        _subkey: &[u8],
+        _name: Option<&[u8]>,
+        _view: RegistryView,
+    ) -> HostResult<Option<BString>> {
+        Ok(None)
     }
 
     /// Run a command or pipeline with explicit cwd, env, stdio, and optional timeout.

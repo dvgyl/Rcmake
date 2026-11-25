@@ -78,7 +78,7 @@ fn caps_sparse_tar_size_even_when_the_entry_is_excluded() -> TestResult {
     let mut header = Header::new_gnu();
     header.set_entry_type(EntryType::GNUSparse);
     header.set_size(0);
-    let size = size_limit() + 1;
+    let size = 129;
     let gnu = header.as_gnu_mut().ok_or("Expected a GNU tar header")?;
     gnu.set_real_size(size);
     let block = gnu.sparse.first_mut().ok_or("Expected a sparse block")?;
@@ -91,8 +91,14 @@ fn caps_sparse_tar_size_even_when_the_entry_is_excluded() -> TestResult {
         ..extract_options()
     };
     assert!(
-        extract_archive(&host, archive, &options)
-            .is_err_and(|error| error.message == "Archive exceeds the size limit")
+        crate::extract::run_with_output_limit(
+            &host,
+            archive,
+            (&options).into(),
+            crate::extract::Listing::Shared,
+            128
+        )
+        .is_err_and(|error| error.message == "Archive exceeds the size limit")
     );
     assert!(absent(&host, "/extract"));
     Ok(())
@@ -111,7 +117,7 @@ fn caps_zip_size_even_when_the_entry_is_excluded() -> TestResult {
     let mut zip = ZipArchive::new(Cursor::new(&bytes))?;
     let offset = usize::try_from(zip.by_index_raw(1)?.central_header_start())? + 24;
     drop(zip);
-    let oversized = u32::try_from(size_limit() + 1)?;
+    let oversized = 129_u32;
     bytes
         .get_mut(offset..offset + 4)
         .ok_or("Missing central directory size field")?
@@ -122,8 +128,14 @@ fn caps_zip_size_even_when_the_entry_is_excluded() -> TestResult {
         ..extract_options()
     };
     assert!(
-        extract_archive(&host, archive, &options)
-            .is_err_and(|error| error.message == "Archive exceeds the size limit")
+        crate::extract::run_with_output_limit(
+            &host,
+            archive,
+            (&options).into(),
+            crate::extract::Listing::Shared,
+            128
+        )
+        .is_err_and(|error| error.message == "Archive exceeds the size limit")
     );
     assert!(absent(&host, "/extract"));
     Ok(())

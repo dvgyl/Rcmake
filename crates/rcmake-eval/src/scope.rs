@@ -149,7 +149,13 @@ impl VarStack {
             return false;
         };
         let mut bindings = capture.bindings;
-        bindings.retain(|name, _| !name.is_empty());
+        bindings.retain(|name, binding| {
+            let value = match binding {
+                Binding::Set(value) => Some(&*value),
+                Binding::Unset => None,
+            };
+            !name.is_empty() && self.get(name) != value
+        });
         if bindings.is_empty() {
             return false;
         }
@@ -250,7 +256,7 @@ mod tests {
     }
 
     #[test]
-    fn capture_keeps_equal_values_and_unsets_at_each_new_boundary() {
+    fn capture_propagates_only_changed_values_and_unsets() {
         let mut stack = VarStack::default();
         stack.set(b"unset", "prior".into());
         stack.push_boundary(None, Some((1, PolicyStatus::Warn)));
@@ -261,12 +267,34 @@ mod tests {
         stack.unset(b"unset");
         assert!(stack.propagate_capture());
 
+        assert!(
+            !stack
+                .scopes
+                .last()
+                .is_some_and(|scope| scope.bindings.contains_key(b"same".as_slice()))
+        );
         stack.pop();
-        assert_eq!(stack.get(b"same"), Some(&"inherited".into()));
         assert_eq!(stack.lookup(b"unset"), Some(&Binding::Unset));
         stack.pop();
         assert_eq!(stack.get(b"same"), None);
         assert_eq!(stack.get(b"unset"), Some(&"prior".into()));
+    }
+
+    #[test]
+    fn capture_keeps_function_local_changes_out_of_the_root() {
+        let mut stack = VarStack::default();
+        stack.set(b"E", "rootE".into());
+        stack.set(b"U", "rootU".into());
+        stack.push_boundary(None, Some((1, PolicyStatus::New)));
+        stack.set(b"E", "fval".into());
+        stack.unset(b"U");
+        stack.push();
+        stack.set(b"E", "fval".into());
+        stack.unset(b"U");
+        assert!(!stack.propagate_capture());
+        stack.pop();
+        assert_eq!(stack.get(b"E"), Some(&"rootE".into()));
+        assert_eq!(stack.get(b"U"), Some(&"rootU".into()));
     }
 
     #[test]

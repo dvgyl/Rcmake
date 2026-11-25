@@ -1,3 +1,6 @@
+#[path = "windows/registry.rs"]
+pub(super) mod registry;
+
 use std::fs::{self, File, FileTimes, OpenOptions};
 use std::io::{self, ErrorKind};
 use std::os::windows::fs::{FileTypeExt, OpenOptionsExt, symlink_dir, symlink_file};

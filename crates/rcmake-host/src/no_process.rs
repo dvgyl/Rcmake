@@ -17,6 +17,20 @@ use crate::{
 // Forward services that these adapters do not change.
 macro_rules! forward_host_services {
     ($base:ident) => {
+        fn registry_host_view(&self) -> Option<crate::RegistryView> {
+            self.$base.registry_host_view()
+        }
+
+        fn registry_value(
+            &self,
+            root: crate::RegistryRoot,
+            subkey: &[u8],
+            name: Option<&[u8]>,
+            view: crate::RegistryView,
+        ) -> HostResult<Option<BString>> {
+            self.$base.registry_value(root, subkey, name, view)
+        }
+
         fn write_out(&self, stream: Stream, bytes: &[u8]) {
             self.$base.write_out(stream, bytes);
         }
@@ -83,6 +97,8 @@ pub enum DeniedMethod {
     RunWithTimeout,
     /// The request used [`Host::run_bounded`].
     RunBounded,
+    /// The request used [`Host::run_controlled`].
+    RunControlled,
 }
 
 /// A process request that this host denied.
@@ -227,7 +243,7 @@ impl<H: Host + ?Sized> NoProcessHost<H> {
         std::mem::take(&mut *state).log
     }
 
-    fn deny(&self, req: &RunRequest, method: DeniedMethod) -> HostResult<RunOutput> {
+    fn deny<T>(&self, req: &RunRequest, method: DeniedMethod) -> HostResult<T> {
         let cwd_bytes = req.cwd.as_os_str().as_encoded_bytes().len();
         let (request_bytes, args) =
             req.pipeline
@@ -312,6 +328,34 @@ impl<H: Host + ?Sized> NoProcessHost<H> {
 impl<H: Host + ?Sized> Host for NoProcessHost<H> {
     fn supports_process_execution(&self) -> bool {
         false
+    }
+
+    fn open_read(&self, p: &Path) -> HostResult<Box<dyn crate::ReadSeek + '_>> {
+        self.base.open_read(p)
+    }
+
+    fn scratch_file(&self) -> HostResult<Box<dyn crate::ScratchFile + '_>> {
+        self.base.scratch_file()
+    }
+
+    fn write_from(
+        &self,
+        p: &Path,
+        mode: WriteMode,
+        input: &mut dyn std::io::Read,
+        len: u64,
+    ) -> HostResult<()> {
+        self.base.write_from(p, mode, input, len)
+    }
+
+    fn run_controlled(
+        &self,
+        req: &RunRequest,
+        _graceful: Option<GracefulTimeout>,
+        _hard_limit: Option<std::time::Duration>,
+        _update: &mut crate::DeadlineUpdate<'_>,
+    ) -> HostResult<crate::ControlledOutput> {
+        self.deny(req, DeniedMethod::RunControlled)
     }
 
     fn run(

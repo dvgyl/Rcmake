@@ -38,6 +38,7 @@ mod code;
 mod configure_log;
 mod cx;
 mod cx_messages;
+mod cx_try_run;
 mod env;
 mod file_lock;
 mod flow;
@@ -450,6 +451,7 @@ pub struct Interp {
     steps: u64,
     var_ledger: Option<VarLedger>,
     write_seq: u64,
+    try_run_results_started: bool,
     /// The command being executed issued an error (`SetNestedError`).
     cmd_failed: bool,
     cur_line: u32,
@@ -543,6 +545,7 @@ impl Interp {
         let mut interp = Self {
             var_ledger,
             write_seq: 0,
+            try_run_results_started: false,
             stop_reason: None,
             steps: 0,
             config,

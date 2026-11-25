@@ -384,7 +384,7 @@ fn json_error_paths() {
     );
     run(&mut interp, &host);
     check(&mut interp, &[
-        ("missing", b"root-item-NOTFOUND"), ("missing_err", b"member 'item' not found"),
+        ("missing", b"root-item-NOTFOUND"), ("missing_err", b"member 'root item' not found"),
         ("index", b"root-1-NOTFOUND"), ("index_err", b"expected an index less than 0 got '1'"),
         ("scalar", b"root-item-NOTFOUND"),
         ("scalar_err", b"invalid path 'root item', need element of OBJECT or ARRAY type to lookup 'item' got NUMBER"),
@@ -486,4 +486,30 @@ fn configure_tracks_template_lines() {
     );
     run(&mut interp, &host);
     check(&mut interp, &[("lines", b"1\n2")]);
+}
+
+#[test]
+fn json_set_rejects_the_maximum_unsigned_array_index() {
+    let (mut interp, host) = setup(
+        r#"
+        string(JSON rejected ERROR_VARIABLE error SET "[]" 4294967295 true)
+        string(JSON appended SET "[]" 4294967294 true)
+        string(JSON appended_value GET "${appended}" 0)
+        string(JSON object SET "{}" 4294967295 true)
+        string(JSON object_value GET "${object}" 4294967295)
+        "#,
+    );
+    run(&mut interp, &host);
+    check(
+        &mut interp,
+        &[
+            ("rejected", b"4294967295-NOTFOUND"),
+            (
+                "error",
+                b"expected an index less than 4294967295 got '4294967295'",
+            ),
+            ("appended_value", b"ON"),
+            ("object_value", b"ON"),
+        ],
+    );
 }

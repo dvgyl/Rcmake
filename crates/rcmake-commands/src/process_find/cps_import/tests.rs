@@ -305,3 +305,93 @@ endif()
     );
     Ok(())
 }
+
+#[test]
+fn selected_cps_missing_dependency_fails_without_fallback() -> TestResult {
+    let host = Arc::new(PureHost::default());
+    host.seed_file(
+        Path::new("/work/first/lib/cps/Foo/Foo.cps"),
+        br#"{
+        "cps_version":"0.15.0", "name":"Foo", "cps_path":"@prefix@/lib/cps/Foo",
+        "requires":{"Bar":null}, "components":{"core":{"type":"interface"}}
+    }"#,
+    )?;
+    host.seed_file(Path::new("/work/later/FooConfig.cmake"), b"set(FALLBACK 1)")?;
+    host.seed_file(
+        Path::new("/work/CMakeLists.txt"),
+        br#"
+        cmake_minimum_required(VERSION 4.5)
+        project(Consumer NONE)
+        find_package(Foo CONFIG QUIET NO_DEFAULT_PATH PATHS /work/first /work/later)
+    "#,
+    )?;
+    let mut interp = interpreter(host.clone(), Path::new("/work"));
+    let outcome = interp.run_configure(Path::new("/work"), Path::new("/work/build"), &[]);
+    let mut cx = interp.cx();
+    assert_eq!(
+        outcome.exit_code,
+        1,
+        "{}",
+        host.stream_bytes(Stream::Stderr)
+    );
+    assert!(cx.var_is_on(b"Foo_FOUND"));
+    assert!(!cx.var_defined(b"FALLBACK"));
+    assert!(
+        cx.project()
+            .find_target(DirId::ROOT, b"Foo::core")
+            .is_none()
+    );
+    assert!(
+        !host
+            .stream_bytes(Stream::Stderr)
+            .contains_str("find_package find_package")
+    );
+    assert!(
+        host.stream_bytes(Stream::Stderr)
+            .contains_str("find_package could not find Bar, required by Foo.")
+    );
+    Ok(())
+}
+
+#[test]
+fn imports_cps_features_and_link_requirements_in_order() -> TestResult {
+    let host = Arc::new(PureHost::default());
+    host.seed_file(Path::new("/work/prefix/lib/cps/Foo/Foo.cps"), br#"{
+        "cps_version":"0.15.0", "name":"Foo", "cps_path":"@prefix@/lib/cps/Foo",
+        "components":{
+            "api":{"type":"interface", "compile_features":["c11","C++20","C99","gnu","c++2","THREADS"],
+                   "link_features":["THREAD","unknown"], "requires":[":core"],
+                   "compile_requires":[":headers"], "link_requires":[":runtime"],
+                   "link_libraries":["m","z"]},
+            "core":{"type":"interface"},
+            "headers":{"type":"interface"},
+            "runtime":{"type":"interface"}
+        }
+    }"#)?;
+    let source = Path::new("/work/src");
+    host.seed_file(
+        &source.join("CMakeLists.txt"),
+        br#"
+        cmake_minimum_required(VERSION 4.5)
+        add_library(Threads::Threads INTERFACE IMPORTED)
+        find_package(Foo CONFIG REQUIRED COMPONENTS api NO_DEFAULT_PATH PATHS /work/prefix)
+        get_target_property(features Foo::api INTERFACE_COMPILE_FEATURES)
+        get_target_property(links Foo::api INTERFACE_LINK_LIBRARIES)
+    "#,
+    )?;
+    let mut interp = interpreter(host.clone(), Path::new("/work"));
+    let outcome = interp.run_configure(source, Path::new("/work/build"), &[]);
+    assert_eq!(
+        outcome.exit_code,
+        0,
+        "{}",
+        host.stream_bytes(Stream::Stderr)
+    );
+    let cx = interp.cx();
+    assert_eq!(cx.var_or_empty(b"features"), "c_std_11;cxx_std_20;c_std_99");
+    assert_eq!(
+        cx.var_or_empty(b"links"),
+        "Threads::Threads;Threads::Threads;Foo::core;$<COMPILE_ONLY:Foo::headers>;$<LINK_ONLY:Foo::runtime>;m;z"
+    );
+    Ok(())
+}

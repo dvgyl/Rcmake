@@ -116,7 +116,9 @@ pub(super) fn run(cx: &mut Cx<'_>, args: &[&[u8]]) -> Result {
     if download.log.is_some() {
         download.flags.push("--verbose".into());
     }
-    download.flags.extend(["--url".into(), BString::from(*url)]);
+    download
+        .flags
+        .extend(["--url".into(), super::curl_compat_file_url(url)]);
     let timeout = match (download.timeout, cx.limits().wall_budget) {
         (Some(timeout), Some(budget)) => Some(timeout.min(budget)),
         (timeout, budget) => timeout.or(budget),
@@ -184,7 +186,7 @@ pub(super) fn run(cx: &mut Cx<'_>, args: &[&[u8]]) -> Result {
         if code != 0 {
             return Err(error(format!(
                 "DOWNLOAD cannot compute hash on failed download\n  from url: \"{}\"\n  status: [{code};\"{message}\"]",
-                BString::from(*url),
+                super::curl_compat_file_url(url),
             )));
         }
         let actual = path::hash_file(cx.host(), &file, expected.algorithm).map_err(|_| {

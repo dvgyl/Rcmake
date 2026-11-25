@@ -13,6 +13,7 @@ pub mod policy;
 mod policy_warnings;
 pub mod render;
 pub mod rich;
+mod sarif_location;
 pub mod source;
 pub mod suggest;
 
@@ -271,6 +272,7 @@ impl DiagEngine {
         entry.insert(BString::from("message"), Value::Object(msg));
         entry.insert(BString::from("ruleId"), Value::string(rule_id));
 
+        sarif_location::record(&mut entry, &diag.location);
         self.sarif_results.push(Value::Object(entry));
     }
 }

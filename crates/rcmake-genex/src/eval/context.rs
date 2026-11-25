@@ -302,6 +302,7 @@ impl Evaluator<'_> {
                 "$<TARGET_GENEX_EVAL:tgt, ...> target \"{name}\" not found."
             ))
         })?;
+        self.record_lookup(&name, target);
         let parent_flags = self.flags;
         self.flags = Default::default();
         let ctx = EvalContext {

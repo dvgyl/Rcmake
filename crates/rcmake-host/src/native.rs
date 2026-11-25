@@ -173,6 +173,39 @@ impl Host for NativeHost {
         platform::metadata(p, follow)
     }
 
+    fn open_read(&self, p: &Path) -> HostResult<Box<dyn crate::ReadSeek + '_>> {
+        require_absolute(p)?;
+        let file = io_at(platform::open_input(p), p)?;
+        if !io_at(file.metadata(), p)?.is_file() {
+            return Err(HostError::unsupported(
+                "Streaming reads require a regular file.",
+            ));
+        }
+        Ok(Box::new(file))
+    }
+
+    fn scratch_file(&self) -> HostResult<Box<dyn crate::ScratchFile + '_>> {
+        let file = tempfile::tempfile().map_err(|error| HostError::from_io(error, None))?;
+        Ok(Box::new(file))
+    }
+
+    fn write_from(
+        &self,
+        p: &Path,
+        mode: WriteMode,
+        input: &mut dyn Read,
+        len: u64,
+    ) -> HostResult<()> {
+        require_absolute(p)?;
+        let mut file = open_output(p, mode)?;
+        let result = io_at(crate::stream::copy_exact(input, &mut file, len), p);
+        drop(file);
+        if result.is_err() && mode == WriteMode::CreateNew {
+            let _ = self.remove_file(p);
+        }
+        result
+    }
+
     fn read(&self, p: &Path, range: ReadRange) -> HostResult<Vec<u8>> {
         require_absolute(p)?;
         let mut file = io_at(platform::open_input(p), p)?;
@@ -437,6 +470,22 @@ impl Host for NativeHost {
         mtime: Option<FileTime>,
     ) -> HostResult<()> {
         self.set_entry_times(p, atime, mtime, Follow::No)
+    }
+
+    #[cfg(windows)]
+    fn registry_host_view(&self) -> Option<crate::RegistryView> {
+        Some(platform::registry::host_view(self))
+    }
+
+    #[cfg(windows)]
+    fn registry_value(
+        &self,
+        root: crate::RegistryRoot,
+        subkey: &[u8],
+        name: Option<&[u8]>,
+        view: crate::RegistryView,
+    ) -> HostResult<Option<BString>> {
+        Ok(platform::registry::value(self, root, subkey, name, view))
     }
 
     fn env_get(&self, key: &[u8]) -> Option<BString> {

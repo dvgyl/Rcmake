@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 use std::path::{Component, Path, PathBuf};
 
 use rcmake_base::BString;
-use rcmake_eval::Cx;
+use rcmake_eval::{CmdError, Cx};
 use rcmake_host::path;
 
 use super::super::{
@@ -43,7 +43,11 @@ struct SearchVariables {
     prefix_subdirs: &'static [&'static str],
 }
 
-pub(super) fn directories(cx: &Cx<'_>, kind: Kind, options: &Options) -> Vec<PathBuf> {
+pub(super) fn directories(
+    cx: &Cx<'_>,
+    kind: Kind,
+    options: &Options,
+) -> Result<Vec<PathBuf>, CmdError> {
     let variables = kind.paths();
     let mut paths = Vec::new();
     let framework = !matches!(kind, Kind::Program);
@@ -107,7 +111,19 @@ pub(super) fn directories(cx: &Cx<'_>, kind: Kind, options: &Options) -> Vec<Pat
             );
         }
     }
-    paths.extend(options.hints.iter().map(|dir| cx.resolve_path(dir)));
+    let expand = |inputs| {
+        super::super::user_paths::expand(
+            cx,
+            inputs,
+            options.registry_view.as_ref(),
+            matches!(kind, Kind::Program),
+        )
+    };
+    paths.extend(
+        expand(&options.hints)?
+            .iter()
+            .map(|dir| cx.resolve_path(dir)),
+    );
     if use_default(
         cx,
         options.no_defaults || options.no_system_env,
@@ -154,8 +170,12 @@ pub(super) fn directories(cx: &Cx<'_>, kind: Kind, options: &Options) -> Vec<Pat
             );
         }
     }
-    paths.extend(options.paths.iter().map(|dir| cx.resolve_path(dir)));
-    with_suffixes(paths, &options.suffixes)
+    paths.extend(
+        expand(&options.paths)?
+            .iter()
+            .map(|dir| cx.resolve_path(dir)),
+    );
+    Ok(with_suffixes(paths, &options.suffixes))
 }
 
 fn add_framework_dirs(cx: &Cx<'_>, paths: &mut Vec<PathBuf>, values: Vec<BString>) {

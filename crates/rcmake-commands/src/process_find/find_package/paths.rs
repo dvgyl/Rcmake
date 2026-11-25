@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use rcmake_base::{BString, list, list_ops, truth};
 use rcmake_diag::{PolicyId, PolicyStatus};
-use rcmake_eval::{Cx, RunMode};
+use rcmake_eval::{CmdError, Cx, RunMode};
 use rcmake_host::{FileKind, Follow, path};
 
 use super::super::RootMode;
@@ -26,7 +26,7 @@ impl ConfigSearch<'_> {
         package_roots: &[BString],
         mode: RootMode,
         trace: &mut SearchTrace,
-    ) -> Vec<(PathBuf, Option<PathBuf>)> {
+    ) -> Result<Vec<(PathBuf, Option<PathBuf>)>, CmdError> {
         let request = self.request;
         let mut groups = Vec::new();
         groups.push(vec![(
@@ -79,7 +79,12 @@ impl ConfigSearch<'_> {
         }
         groups.push(vec![(
             "Paths specified by the find_package HINTS option.".into(),
-            request.hints.clone(),
+            super::super::user_paths::expand(
+                cx,
+                &request.hints,
+                request.registry_view.as_ref(),
+                false,
+            )?,
         )]);
         if request.use_source(cx, b"SYSTEM_ENVIRONMENT_PATH") {
             let paths = host_env_paths(cx, b"PATH").into_iter().map(|value| {
@@ -125,7 +130,12 @@ impl ConfigSearch<'_> {
         }
         groups.push(vec![(
             "Paths specified by the find_package PATHS option.".into(),
-            request.paths.clone(),
+            super::super::user_paths::expand(
+                cx,
+                &request.paths,
+                request.registry_view.as_ref(),
+                false,
+            )?,
         )]);
 
         let mut seen = BTreeSet::new();
@@ -136,7 +146,7 @@ impl ConfigSearch<'_> {
             for (heading, values) in group {
                 let paths: Vec<_> = values
                     .into_iter()
-                    .filter(|value| !value.is_empty() && !value.starts_with(b"[HKEY_"))
+                    .filter(|value| !value.is_empty())
                     .filter_map(|value| {
                         let path = if heading == PACKAGE_ROOT_HEADING {
                             resolve_package_root(cx, &value)
@@ -179,13 +189,14 @@ impl ConfigSearch<'_> {
                 }
             }
         }
-        mode.reroot(cx, prefixes)
+        Ok(mode
+            .reroot(cx, prefixes)
             .into_iter()
             .map(|path| {
                 let spelling = spellings.get(&path).cloned();
                 (path, spelling)
             })
-            .collect()
+            .collect())
     }
 
     fn system_prefixes(&self, cx: &Cx<'_>) -> Vec<BString> {
@@ -211,37 +222,41 @@ impl ConfigSearch<'_> {
             if !self.cps_names.is_empty() {
                 let packages = self.cps_packages(cx, prefix);
                 for package in &packages {
-                    dirs.extend(cps_children(cx, package).into_iter().map(|dir| (dir, true)));
+                    dirs.extend(
+                        cps_children(cx, self.request, package)
+                            .into_iter()
+                            .map(|dir| (dir, true)),
+                    );
                 }
                 for package in &packages {
-                    for version in children(cx, package, |_| true) {
+                    for version in children(cx, self.request, package, |_| true) {
                         dirs.extend(
-                            cps_children(cx, &version)
+                            cps_children(cx, self.request, &version)
                                 .into_iter()
                                 .map(|dir| (dir, true)),
                         );
                     }
                 }
-                self.cps_layout(cx, &cps_children(cx, prefix), &mut dirs);
+                self.cps_layout(cx, &cps_children(cx, self.request, prefix), &mut dirs);
             }
 
             let packages = self.children(cx, prefix);
             dirs.push((prefix.to_path_buf(), false));
             dirs.extend(
-                cmake_children(cx, prefix)
+                cmake_children(cx, self.request, prefix)
                     .into_iter()
                     .map(|dir| (dir, false)),
             );
             dirs.extend(packages.iter().cloned().map(|dir| (dir, false)));
             for package in &packages {
                 dirs.extend(
-                    cmake_children(cx, package)
+                    cmake_children(cx, self.request, package)
                         .into_iter()
                         .map(|dir| (dir, false)),
                 );
             }
             for package in &packages {
-                for cmake in cmake_children(cx, package) {
+                for cmake in cmake_children(cx, self.request, package) {
                     dirs.extend(
                         self.children(cx, &cmake)
                             .into_iter()
@@ -275,7 +290,7 @@ impl ConfigSearch<'_> {
     }
 
     fn cps_packages(&self, cx: &Cx<'_>, dir: &Path) -> Vec<PathBuf> {
-        children(cx, dir, |entry| {
+        children(cx, self.request, dir, |entry| {
             self.names
                 .iter()
                 .any(|name| name.eq_ignore_ascii_case(entry))
@@ -290,7 +305,7 @@ impl ConfigSearch<'_> {
         dirs.extend(packages.iter().cloned().map(|dir| (dir, true)));
         for package in packages {
             dirs.extend(
-                children(cx, &package, |_| true)
+                children(cx, self.request, &package, |_| true)
                     .into_iter()
                     .map(|dir| (dir, true)),
             );
@@ -307,14 +322,14 @@ impl ConfigSearch<'_> {
     ) {
         for lib in lib_dirs {
             let dir = prefix.join(lib);
-            for cmake in cmake_children(cx, &dir) {
+            for cmake in cmake_children(cx, self.request, &dir) {
                 dirs.extend(self.children(cx, &cmake));
             }
         }
         for lib in lib_dirs {
             let dir = prefix.join(lib);
             for package in self.children(cx, &dir) {
-                dirs.extend(cmake_children(cx, &package));
+                dirs.extend(cmake_children(cx, self.request, &package));
                 dirs.push(package);
             }
         }
@@ -326,7 +341,7 @@ impl ConfigSearch<'_> {
             .iter()
             .map(|name| name.to_ascii_lowercase())
             .collect();
-        children(cx, dir, |name| {
+        children(cx, self.request, dir, |name| {
             let lowercase = name.to_ascii_lowercase();
             names.iter().any(|name| lowercase.starts_with(name))
         })
@@ -336,14 +351,14 @@ impl ConfigSearch<'_> {
         let frameworks = self.apple_children(cx, prefix, b".framework");
         for framework in &frameworks {
             if !self.cps_names.is_empty() {
-                for version in children(cx, &framework.join("Versions"), |_| true) {
+                for version in children(cx, self.request, &framework.join("Versions"), |_| true) {
                     dirs.push((version.join("Resources/CPS"), true));
                 }
                 dirs.push((framework.join("Resources/CPS"), true));
             }
             let root = framework.join("Resources");
             dirs.extend([(root.clone(), false), (root.join("CMake"), false)]);
-            for version in children(cx, &framework.join("Versions"), |_| true) {
+            for version in children(cx, self.request, &framework.join("Versions"), |_| true) {
                 let root = version.join("Resources");
                 dirs.extend([(root.clone(), false), (root.join("CMake"), false)]);
             }
@@ -361,7 +376,7 @@ impl ConfigSearch<'_> {
     }
 
     fn apple_children(&self, cx: &Cx<'_>, prefix: &Path, suffix: &[u8]) -> Vec<PathBuf> {
-        children(cx, prefix, |name| {
+        children(cx, self.request, prefix, |name| {
             name.strip_suffix(suffix).is_some_and(|stem| {
                 self.names
                     .iter()
@@ -533,18 +548,17 @@ fn user_registry(cx: &Cx<'_>, name: &[u8]) -> Vec<BString> {
         .collect()
 }
 
-fn children(cx: &Cx<'_>, dir: &Path, matches: impl Fn(&[u8]) -> bool) -> Vec<PathBuf> {
+fn children(
+    cx: &Cx<'_>,
+    request: &super::Request,
+    dir: &Path,
+    matches: impl Fn(&[u8]) -> bool,
+) -> Vec<PathBuf> {
     let mut entries = cx.host().read_dir(dir).unwrap_or_default();
     entries.retain(|entry| matches(&entry.name));
-    let order = cx
-        .var_defined(b"CMAKE_FIND_PACKAGE_SORT_ORDER")
-        .then(|| cx.var_or_empty(b"CMAKE_FIND_PACKAGE_SORT_ORDER"));
-    let order = order
-        .as_ref()
-        .map_or(b"NATURAL".as_slice(), |value| value.as_slice());
+    let order = request.sort_order.as_slice();
     if matches!(order, b"NAME" | b"NATURAL") {
-        let direction = b"CMAKE_FIND_PACKAGE_SORT_DIRECTION";
-        let ascending = cx.var_defined(direction) && cx.var_or_empty(direction) != b"DEC";
+        let ascending = request.sort_ascending;
         entries.sort_by(|a, b| {
             let order = if order == b"NAME" {
                 a.name.cmp(&b.name)
@@ -568,12 +582,12 @@ fn children(cx: &Cx<'_>, dir: &Path, matches: impl Fn(&[u8]) -> bool) -> Vec<Pat
         .collect()
 }
 
-fn cps_children(cx: &Cx<'_>, dir: &Path) -> Vec<PathBuf> {
-    children(cx, dir, |name| name.eq_ignore_ascii_case(b"cps"))
+fn cps_children(cx: &Cx<'_>, request: &super::Request, dir: &Path) -> Vec<PathBuf> {
+    children(cx, request, dir, |name| name.eq_ignore_ascii_case(b"cps"))
 }
 
-fn cmake_children(cx: &Cx<'_>, dir: &Path) -> Vec<PathBuf> {
-    children(cx, dir, |name| name.eq_ignore_ascii_case(b"cmake"))
+fn cmake_children(cx: &Cx<'_>, request: &super::Request, dir: &Path) -> Vec<PathBuf> {
+    children(cx, request, dir, |name| name.eq_ignore_ascii_case(b"cmake"))
 }
 
 fn library_dirs(cx: &mut Cx<'_>) -> Vec<PathBuf> {
@@ -583,7 +597,7 @@ fn library_dirs(cx: &mut Cx<'_>) -> Vec<PathBuf> {
         dirs.push(Path::new("lib").join(path::to_native(&arch)));
     }
     let pointer_size = cx.var_or_empty(b"CMAKE_SIZEOF_VOID_P");
-    let x32 = cx.var_is_on(b"CMAKE_INTERNAL_PLATFORM_ABI_X32");
+    let x32 = super::super::is_elf_x32(cx);
     let props = &cx.global().props;
     for (enabled, prop, dir) in [
         (

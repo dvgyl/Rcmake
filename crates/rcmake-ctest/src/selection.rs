@@ -38,7 +38,6 @@ pub(crate) struct PlannedTest {
     pub(crate) number: usize,
     pub(crate) test: Test,
     pub(crate) checks: OutputChecks,
-    pub(crate) cleanup: bool,
     pub(crate) required_setups: Vec<usize>,
 }
 
@@ -335,8 +334,10 @@ fn build_graph(mut tests: Vec<PlannedTest>) -> Plan {
         for name in test.list(b"FIXTURES_SETUP") {
             fixtures.entry(name).or_default().setups.push(id);
         }
-        for name in test.list(b"FIXTURES_REQUIRED") {
-            fixtures.entry(name).or_default().users.push(id);
+        if !truth::is_on(test.property(b"DISABLED")) {
+            for name in test.list(b"FIXTURES_REQUIRED") {
+                fixtures.entry(name).or_default().users.push(id);
+            }
         }
         for name in test.list(b"FIXTURES_CLEANUP") {
             fixtures.entry(name).or_default().cleanups.push(id);
@@ -347,7 +348,12 @@ fn build_graph(mut tests: Vec<PlannedTest>) -> Plan {
     for fixture in fixtures.values() {
         for &cleanup in &fixture.cleanups {
             if let Some(deps) = cleanup_dependencies.get_mut(cleanup) {
-                deps.extend(fixture.setups.iter().chain(&fixture.users).copied());
+                deps.extend(fixture.setups.iter().copied().filter(|&id| {
+                    tests
+                        .get(id)
+                        .is_some_and(|test| !truth::is_on(test.property(b"DISABLED")))
+                }));
+                deps.extend(&fixture.users);
             }
         }
     }
@@ -358,9 +364,11 @@ fn build_graph(mut tests: Vec<PlannedTest>) -> Plan {
             deps.extend(names.get(&name).into_iter().flatten().copied());
         }
         let mut setups = Vec::new();
-        for name in test.list(b"FIXTURES_REQUIRED") {
-            if let Some(fixture) = fixtures.get(&name) {
-                setups.extend(fixture.setups.iter().copied());
+        if !truth::is_on(test.property(b"DISABLED")) {
+            for name in test.list(b"FIXTURES_REQUIRED") {
+                if let Some(fixture) = fixtures.get(&name) {
+                    setups.extend(fixture.setups.iter().copied());
+                }
             }
         }
         setups.sort_unstable();
@@ -443,7 +451,6 @@ fn finish_plan(
             Ok(PlannedTest {
                 number,
                 checks: OutputChecks::new(&test)?,
-                cleanup: !test.list(b"FIXTURES_CLEANUP").is_empty(),
                 test,
                 required_setups: Vec::new(),
             })

@@ -16,6 +16,10 @@ use super::register;
 const SCRIPT: &str = "/work/check.cmake";
 
 fn setup() -> (Arc<PureHost>, Interp) {
+    setup_with(register)
+}
+
+fn setup_with(register: fn(&mut rcmake_eval::Registry)) -> (Arc<PureHost>, Interp) {
     let host = Arc::new(PureHost::default());
     let interp = Interp::new(
         InterpConfig {
@@ -1251,5 +1255,55 @@ cmake_pkg_config(IMPORT demo REQUIRED NAME renamed)
             .is_some()
     );
     assert!(host.stream_bytes(Stream::Stderr).is_empty());
+    Ok(())
+}
+
+#[test]
+fn find_registry_paths_expand_each_view_before_globbing() -> HostResult<()> {
+    use rcmake_host::{RegistryRoot::CurrentUser, RegistryView::*};
+
+    let (host, mut interp) = setup_with(crate::register_all);
+    host.set_registry_host_view(Bits64)?;
+    for (view, root) in [(Bits32, "/work/sdk32"), (Bits64, "/work/sdk64")] {
+        host.seed_registry_value(CurrentUser, b"Software/Tools", None, view, root.as_bytes())?;
+        host.seed_registry_value(CurrentUser, b"Software/Tools", Some(b"bin"), view, b"bin")?;
+        host.seed_file(&Path::new(root).join("v1/bin/probe"), b"")?;
+    }
+    let script = r#"
+cmake_policy(SET CMP0134 NEW)
+set(CMAKE_SIZEOF_VOID_P 4)
+find_file(first NAMES probe NO_DEFAULT_PATH
+  HINTS "[HKCU/Software/Tools;(default)]/*/[{!}HKEY_CURRENT_USER/Software/Tools!bin]"
+  REGISTRY_VIEW BOTH)
+find_file(second NAMES probe NO_DEFAULT_PATH
+  PATHS "[HKCU/Software/Tools]/*/bin" REGISTRY_VIEW HOST)
+"#;
+    assert_eq!(run(&host, &mut interp, script)?, 0);
+    assert_eq!(var(&mut interp, b"first"), "/work/sdk32/v1/bin/probe");
+    assert_eq!(var(&mut interp, b"second"), "/work/sdk64/v1/bin/probe");
+    Ok(())
+}
+
+#[test]
+fn library_search_checks_architecture_paths_in_order() -> HostResult<()> {
+    let (host, mut interp) = setup_with(crate::register_all);
+    for dir in ["mylib", "mylib64", "mylib64/custom"] {
+        host.seed_file(&Path::new("/work").join(dir).join("libtest.a"), b"")?;
+    }
+    let script = r#"
+set(CMAKE_FIND_LIBRARY_PREFIXES lib)
+set(CMAKE_FIND_LIBRARY_SUFFIXES .a)
+set(CMAKE_SIZEOF_VOID_P 8)
+set_property(GLOBAL PROPERTY FIND_LIBRARY_USE_LIB64_PATHS ON)
+find_library(first NAMES test NO_DEFAULT_PATH PATHS /work/mylib)
+set(CMAKE_FIND_LIBRARY_CUSTOM_LIB_SUFFIX custom)
+find_library(second NAMES test NO_DEFAULT_PATH PATHS /work/mylib64)
+"#;
+    assert_eq!(run(&host, &mut interp, script)?, 0);
+    assert_eq!(var(&mut interp, b"first"), "/work/mylib64/libtest.a");
+    assert_eq!(
+        var(&mut interp, b"second"),
+        "/work/mylib64/custom/libtest.a"
+    );
     Ok(())
 }
