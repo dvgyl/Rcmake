@@ -109,6 +109,11 @@ impl Cx<'_> {
         self.interp.depth
     }
 
+    /// Account for recursion in a nested configure called at the current depth.
+    pub fn note_nested_recursion_limit(&mut self, max_start_depth: u32) {
+        self.interp.note_recursion_limit(max_start_depth);
+    }
+
     /// Active command recursion limit.
     pub fn recursion_limit(&self) -> u32 {
         self.interp.recursion_limit()

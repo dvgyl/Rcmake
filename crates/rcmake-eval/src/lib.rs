@@ -464,6 +464,7 @@ pub struct Interp {
     list_file_name: BString,
     depth: u32,
     recursion_exceeded: bool,
+    inherited_recursion: Option<(u32, u32)>,
     check_system_vars: bool,
     package_file_depth: usize,
     unwinding_package: bool,
@@ -584,6 +585,7 @@ impl Interp {
             list_file_name: BString::from(DEFAULT_LIST_FILE_NAME),
             depth: 0,
             recursion_exceeded: false,
+            inherited_recursion: None,
             check_system_vars: false,
             package_file_depth: 0,
             unwinding_package: false,
@@ -708,6 +710,21 @@ impl Interp {
     /// Start a nested configure with the caller's command recursion depth.
     pub fn inherit_recursion_depth(&mut self, depth: u32) {
         self.depth = depth;
+        self.inherited_recursion = Some((depth, u32::MAX));
         self.root_frame.trace_base = depth;
+    }
+
+    /// Return the largest starting depth that permits all observed commands.
+    #[must_use]
+    pub fn max_inherited_recursion_depth(&self) -> u32 {
+        self.inherited_recursion
+            .map_or(u32::MAX, |(_, maximum)| maximum)
+    }
+
+    pub(crate) fn note_recursion_limit(&mut self, limit: u32) {
+        if let Some((start, maximum)) = &mut self.inherited_recursion {
+            let relative = self.depth.saturating_sub(*start);
+            *maximum = (*maximum).min(limit.saturating_sub(relative));
+        }
     }
 }

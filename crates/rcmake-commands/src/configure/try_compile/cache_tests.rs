@@ -16,6 +16,7 @@ use super::*;
 /// Return an example successful test probe.
 pub(crate) fn success() -> ObservedOutcome {
     ObservedOutcome {
+        max_start_depth: u32::MAX,
         compiled: true,
         exit_code: 0,
         output: b"/work/scratch/cmTC_1".to_vec(),
@@ -282,6 +283,7 @@ fn run_compiler(
         return Err(HostError::unsupported("Compiler process did not complete."));
     };
     let outcome = ObservedOutcome {
+        max_start_depth: u32::MAX,
         compiled: *exit_code == 0,
         exit_code: *exit_code,
         output: result.stderr,

@@ -35,6 +35,8 @@ pub(super) struct CachedProbe {
 /// Compile result for the sequential evaluator, from either execution or lookup.
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) struct ObservedOutcome {
+    /// Largest caller depth allowed by all recursion checks during the child configure.
+    pub(crate) max_start_depth: u32,
     /// Whether the build succeeded.
     pub(crate) compiled: bool,
     /// Build exit status for the configure log.
@@ -782,6 +784,7 @@ fn render_outcome(
         });
     }
     Some(ObservedOutcome {
+        max_start_depth: outcome.max_start_depth,
         compiled: outcome.compiled,
         exit_code: outcome.exit_code,
         output,
@@ -851,6 +854,7 @@ fn template_outcome(
         Some(_) => return None,
     };
     Some(ProbeOutcome {
+        max_start_depth: outcome.max_start_depth,
         compiled: outcome.compiled,
         exit_code: outcome.exit_code,
         output,

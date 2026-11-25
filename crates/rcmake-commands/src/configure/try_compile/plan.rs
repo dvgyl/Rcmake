@@ -323,7 +323,7 @@ pub(crate) fn compute_probe_key(recipe: &ProbeRecipe) -> Digest {
 
 fn recipe_key(recipe: &ProbeRecipe, bind_exact: bool) -> Digest {
     let mut key = KeyHasher::new(Domain::ProbeV1);
-    key.field(1, &3_u16.to_le_bytes());
+    key.field(1, &4_u16.to_le_bytes());
     key.field(2, recipe.rcmake.0.as_bytes());
     key.field(3, recipe.cmake_root.as_bytes());
     key.field(4, recipe.host.as_bytes());
@@ -400,6 +400,8 @@ pub(crate) struct ArtifactRef {
 /// Cached compile outcome. The run phase of `try_run` executes at the call site.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(crate) struct ProbeOutcome {
+    /// Largest caller depth allowed by all recursion checks during the child configure.
+    pub(crate) max_start_depth: u32,
     /// Whether the compile and optional link succeeded.
     pub(crate) compiled: bool,
     /// Build exit status for the configure log.

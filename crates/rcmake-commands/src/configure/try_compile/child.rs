@@ -92,6 +92,7 @@ impl ChildConfig {
         } = build;
         let mut recursion_exceeded = false;
         let mut failure = None;
+        let mut max_start_depth = u32::MAX;
         let (built, stdout, diagnostics) = CapturingHost::capture(host, &dirs.binary, |host| {
             let mut config = self.config;
             config.cwd = dirs.binary.clone();
@@ -127,6 +128,7 @@ impl ChildConfig {
                 }
             }
             let configure = child.run_configure(&dirs.source, &dirs.binary, &[]);
+            max_start_depth = child.max_inherited_recursion_depth();
             if save_cache {
                 let data = probe_cache(&mut child.cx());
                 host.write(
@@ -186,6 +188,7 @@ impl ChildConfig {
         }
         (
             ProbeResult {
+                max_start_depth,
                 output,
                 diagnostics,
                 outcome,

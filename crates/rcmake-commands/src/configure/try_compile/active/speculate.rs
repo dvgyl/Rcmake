@@ -277,6 +277,7 @@ fn read_speculative(
 ) -> Option<ObservedOutcome> {
     let artifact = super::read_artifact(host, dirs, result.artifact.as_deref()?)?;
     (result.outcome.success && result.output.len() <= 4 * 1024 * 1024).then(|| ObservedOutcome {
+        max_start_depth: result.max_start_depth,
         compiled: true,
         exit_code: result.outcome.exit_code,
         output: result.output.to_vec(),

@@ -843,6 +843,7 @@ fn run_plan(
     };
     output.stdout.extend_from_slice(&output.stderr);
     Ok(ObservedOutcome {
+        max_start_depth: u32::MAX,
         compiled: *exit_code == 0,
         exit_code: *exit_code,
         output: output.stdout,

@@ -383,6 +383,7 @@ fn build_probe(
         },
         |child| crate::hermetic::inherit(cx, child),
     );
+    cx.note_nested_recursion_limit(result.max_start_depth);
     if recursion_exceeded {
         cx.host()
             .write_out(rcmake_host::Stream::Stderr, &result.output);
@@ -425,6 +426,7 @@ fn build_probe(
 }
 
 struct ProbeResult {
+    max_start_depth: u32,
     outcome: BuildOutcome,
     output: BString,
     /// Standard error of the test project configure, which CMake shows to the user.

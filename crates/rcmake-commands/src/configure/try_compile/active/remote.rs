@@ -151,6 +151,7 @@ mod tests {
         assert!(enabled.get(&host, &config, &recipe).is_none());
         let journal = JournalHost::new(&host, &scratch, JournalMode::Observe, None)?.finish();
         let outcome = ObservedOutcome {
+            max_start_depth: u32::MAX,
             compiled: true,
             exit_code: 0,
             output: b"probe output".to_vec(),

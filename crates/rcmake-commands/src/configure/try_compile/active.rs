@@ -396,6 +396,9 @@ impl PreparedProbe {
                     .as_ref()?
                     .get(host, &runtime.store, &self.recipe)
             })?;
+        if cx.recursion_depth() > result.max_start_depth {
+            return None;
+        }
         if runtime.mode == ProbeCacheMode::Verify {
             self.verified = Some(result);
             return None;
@@ -411,7 +414,9 @@ impl PreparedProbe {
         } else {
             None
         };
+        cx.note_nested_recursion_limit(result.max_start_depth);
         Some(ProbeResult {
+            max_start_depth: result.max_start_depth,
             outcome: BuildOutcome {
                 success: result.compiled,
                 exit_code: result.exit_code,
@@ -478,6 +483,7 @@ impl PreparedProbe {
             .as_deref()
             .and_then(|file| read_artifact(host, dirs, file));
         let fresh = ObservedOutcome {
+            max_start_depth: built.max_start_depth,
             compiled: built.outcome.success,
             exit_code: built.outcome.exit_code,
             output: built.output.to_vec(),
@@ -559,7 +565,6 @@ fn seed_digest(
 ) -> Option<(Digest, std::collections::BTreeSet<PathBuf>)> {
     let mut bound = std::collections::BTreeSet::new();
     let mut key = KeyHasher::new(Domain::ProbeV1);
-    key.field(5, &cx.recursion_depth().to_le_bytes());
     key.field(6, format!("{:?}", cx.limits()).as_bytes());
     key.field(7, &cx.var_or_empty(b"CMAKE_COMMAND"));
     for define in &seed.defines {

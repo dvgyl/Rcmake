@@ -273,6 +273,7 @@ impl Interp {
         let saved_failed = core::mem::replace(&mut self.cmd_failed, false);
 
         let limit = self.recursion_limit();
+        self.note_recursion_limit(limit);
         let audit = self
             .session_data::<crate::hermetic::HermeticContext>()
             .cloned();
