@@ -53,6 +53,11 @@ impl ChildConfig {
     }
 
     #[cfg(all(feature = "native", any(unix, windows)))]
+    pub(super) fn seed_inputs(&self) -> (&[rcmake_eval::CacheDefine], &[u8]) {
+        (&self.config.defines, &self.enabled_languages)
+    }
+
+    #[cfg(all(feature = "native", any(unix, windows)))]
     pub(super) fn retained_bytes(&self) -> usize {
         self.config.defines.iter().fold(4096, |size, define| {
             size.saturating_add(96)

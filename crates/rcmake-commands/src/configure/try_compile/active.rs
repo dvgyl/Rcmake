@@ -306,7 +306,14 @@ impl PreparedProbe {
             ),
             (name, Templated::literal(&contents)?),
         ]);
-        let (seed, bound) = seed_digest(cx, seed, &bindings, host)?;
+        let (seed, bound) = seed_digest(
+            cx,
+            &seed.defines,
+            &seed.enabled_languages,
+            &seed.probe_languages,
+            &bindings,
+            host,
+        )?;
         let system = host.system();
         let model = cx.project();
 
@@ -558,7 +565,9 @@ impl PreparedProbe {
 
 fn seed_digest(
     cx: &Cx<'_>,
-    seed: &TryCompileSeed,
+    defines: &[rcmake_eval::CacheDefine],
+    enabled_languages: &[u8],
+    probe_languages: &[BString],
     bindings: &PathBindings,
     host: &dyn Host,
 ) -> Option<(Digest, std::collections::BTreeSet<PathBuf>)> {
@@ -566,7 +575,7 @@ fn seed_digest(
     let mut key = KeyHasher::new(Domain::ProbeV1);
     key.field(6, format!("{:?}", cx.limits()).as_bytes());
     key.field(7, &cx.var_or_empty(b"CMAKE_COMMAND"));
-    for define in &seed.defines {
+    for define in defines {
         key.field(8, &define.name);
         key.field(
             9,
@@ -582,7 +591,7 @@ fn seed_digest(
                 .as_bytes(),
         );
     }
-    key.field(11, &seed.enabled_languages);
+    key.field(11, enabled_languages);
     let platform = path::to_native(&cx.var_or_empty(b"CMAKE_PLATFORM_INFO_DIR"));
     if platform.is_absolute() {
         if host.metadata(&platform, Follow::Yes).ok()?.kind != FileKind::Dir {
@@ -590,7 +599,7 @@ fn seed_digest(
         }
         bound.insert(platform.clone());
         let mut files = vec![BString::from("CMakeSystem.cmake")];
-        for language in &seed.probe_languages {
+        for language in probe_languages {
             if !language.iter().all(u8::is_ascii_alphanumeric) {
                 return None;
             }

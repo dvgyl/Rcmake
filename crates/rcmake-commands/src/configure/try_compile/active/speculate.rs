@@ -120,12 +120,25 @@ impl PreparedProbe {
         };
         let environment = self.runtime.host.env_all();
         for (name, content) in candidates {
-            let Some(project) = super::super::project::render_literal_probe(
+            let Some((project, language)) = super::super::project::render_literal_probe(
                 cx,
                 &directory.join(path::to_native(&name)),
                 target,
-            )
-            .and_then(|project| Templated::capture(&project, &self.recipe.bindings)) else {
+            ) else {
+                continue;
+            };
+            let Some(project) = Templated::capture(&project, &self.recipe.bindings) else {
+                continue;
+            };
+            let (defines, enabled_languages) = child.seed_inputs();
+            let Some((seed, bound)) = super::seed_digest(
+                cx,
+                defines,
+                enabled_languages,
+                &[language],
+                &self.recipe.bindings,
+                self.runtime.host.as_ref(),
+            ) else {
                 continue;
             };
             let Some(source) = Templated::literal(&content) else {
@@ -144,6 +157,7 @@ impl PreparedProbe {
             let mut recipe = self.recipe.clone();
             recipe.files = [(BString::from("CMakeLists.txt"), project), (name, source)].into();
             recipe.tools = compiler.identity;
+            recipe.seed = seed;
             if compute_probe_key(&recipe) == compute_probe_key(&self.recipe) {
                 continue;
             }
@@ -153,7 +167,6 @@ impl PreparedProbe {
             let target = BString::from(target);
             let child_bytes = child.retained_bytes();
             let child = child.clone();
-            let bound = self.bound.clone();
             let intervals = self.runtime.intervals.clone();
             let facts = cx
                 .session_data::<Arc<crate::configure::build_tool_facts::BuildToolFacts>>()

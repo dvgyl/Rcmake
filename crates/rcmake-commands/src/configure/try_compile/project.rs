@@ -187,12 +187,17 @@ fn compile_flags(cx: &mut Cx<'_>, options: &Options<'_>) -> Vec<BString> {
 }
 
 #[cfg(all(feature = "native", any(unix, windows)))]
-pub(super) fn render_literal_probe(cx: &mut Cx<'_>, file: &Path, target: &str) -> Option<BString> {
+pub(super) fn render_literal_probe(
+    cx: &mut Cx<'_>,
+    file: &Path,
+    target: &str,
+) -> Option<(BString, BString)> {
     let enabled = enabled_languages(cx);
-    let languages = vec![source_language(cx, file, &enabled)?];
+    let language = source_language(cx, file, &enabled)?;
+    let languages = vec![language];
     let options = Options::default();
     let properties = language_properties(cx, &options, &languages);
-    Some(render_project(
+    let project = render_project(
         ProjectInputs {
             archive: cx.var_or_empty(b"CMAKE_TRY_COMPILE_TARGET_TYPE") == "STATIC_LIBRARY",
             files: vec![path::from_native_cmake(file)],
@@ -204,7 +209,8 @@ pub(super) fn render_literal_probe(cx: &mut Cx<'_>, file: &Path, target: &str) -
         },
         &options,
         target,
-    ))
+    );
+    Some((project, language.into()))
 }
 
 fn valid_standard(language: &[u8], value: &[u8]) -> bool {
