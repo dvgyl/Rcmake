@@ -21,6 +21,7 @@ pub(super) fn run(argv: &[BString], opts: Options, host: Arc<dyn Host>) -> i32 {
     let mut interp = new_interp(argv, &opts, RunMode::Configure, Arc::clone(&host));
     for edit in opts.cache_edits {
         if let options::CacheEdit::Define(def) = edit {
+            let def = cache::normalize_definition(host.as_ref(), def);
             cache::apply(interp.cx().cache(), def);
         }
     }
