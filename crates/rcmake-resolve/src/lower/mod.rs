@@ -77,6 +77,31 @@ pub(crate) fn definition<'a>(
         .or_else(|| model.global.props.get(key))
 }
 
+/// Return the frames of a backtrace that a CMake call stack shows.
+///
+/// Frames of included files have no line and no command. A call stack also
+/// ends at the `CMakeLists.txt` file of the directory, so it omits the
+/// `add_subdirectory` call of the parent directory.
+pub(crate) fn listed_backtrace(backtrace: &rcmake_diag::Backtrace) -> rcmake_diag::Backtrace {
+    let frames: Vec<_> = backtrace
+        .frames()
+        .filter(|frame| frame.line != 0 || frame.name.is_some())
+        .take_while(|frame| {
+            !frame
+                .name
+                .as_deref()
+                .is_some_and(|name| name.eq_ignore_ascii_case(b"add_subdirectory"))
+        })
+        .cloned()
+        .collect();
+    frames
+        .into_iter()
+        .rev()
+        .fold(rcmake_diag::Backtrace::default(), |trace, frame| {
+            trace.push(frame)
+        })
+}
+
 fn target_property<'a>(
     model: &'a ProjectModel,
     target: &'a Target,

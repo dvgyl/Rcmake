@@ -619,25 +619,7 @@ pub(crate) fn warn_depfile_policy(model: &ProjectModel, host: &dyn rcmake_host::
         if command.dir == DirId::ROOT && !enabled {
             continue;
         }
-        // A call stack ends at the `CMakeLists.txt` file of the directory.
-        let frames: Vec<_> = command
-            .backtrace
-            .frames()
-            .filter(|frame| frame.line != 0 || frame.name.is_some())
-            .take_while(|frame| {
-                !frame
-                    .name
-                    .as_deref()
-                    .is_some_and(|name| name.eq_ignore_ascii_case(b"add_subdirectory"))
-            })
-            .cloned()
-            .collect();
-        let backtrace = frames
-            .into_iter()
-            .rev()
-            .fold(rcmake_diag::Backtrace::default(), |trace, frame| {
-                trace.push(frame)
-            });
+        let backtrace = super::listed_backtrace(&command.backtrace);
         let warning = rcmake_diag::Diagnostic {
             annotations: None,
             kind: rcmake_diag::MessageKind::AuthorWarning,

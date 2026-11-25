@@ -170,7 +170,7 @@ fn validate_standard(
         effect: Effect::None,
         category: None,
         policy: None,
-        location: Location::Backtrace(target.backtrace.clone()),
+        location: Location::Backtrace(super::listed_backtrace(&target.backtrace)),
         body: format!("{} is set to invalid value '{value}'", BString::from(name)).into(),
     };
     let text = render(
