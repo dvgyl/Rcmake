@@ -10,6 +10,7 @@ that accepts a native dynamic-loader hook.
 from __future__ import annotations
 
 import argparse
+from collections.abc import Callable
 from contextlib import ExitStack
 import ctypes
 from ctypes.util import find_library
@@ -31,10 +32,12 @@ import time
 
 try:
     from ._proc import kill_group
+    from .mutation_eval import diff_bytes, normalize
+    from .oracle_prop_test import clean_environment, executable, run_command, write_json
 except ImportError:
     from _proc import kill_group
-from mutation_eval import diff_bytes, normalize
-from oracle_prop_test import clean_environment, executable, run_command, write_json
+    from mutation_eval import diff_bytes, normalize
+    from oracle_prop_test import clean_environment, executable, run_command, write_json
 
 
 WORKERS = 8
@@ -191,10 +194,11 @@ def environment(case: Fixture, store: Path) -> dict[str, str]:
     return env
 
 
-def command(binary: Path, case: Fixture, build: Path, no_cache: bool = False) -> list:
-    """Make a configure command for an empty Ninja build directory."""
+def command(binary: Path, case: Fixture, build: Path, no_cache: bool = False,
+            generator: str = "Ninja") -> list:
+    """Make a configure command for an empty build directory."""
     flags = ["--no-probe-cache"] if no_cache else []
-    return [binary, *flags, "-S", case.source, "-B", build, "-G", "Ninja",
+    return [binary, *flags, "-S", case.source, "-B", build, "-G", generator,
             f"-DCMAKE_TOOLCHAIN_FILE={case.root / 'toolchain.cmake'}"]
 
 
@@ -259,12 +263,15 @@ def check_result(data: dict, expected: bool, count: int = 1) -> None:
 
 
 def configure(args, case: Fixture, name: str, env: dict, *, oracle: bool = False,
-              no_cache: bool = False) -> tuple[dict, int]:
+              no_cache: bool = False, generator: str | None = None,
+              cwd: Path | None = None) -> tuple[dict, int]:
     """Configure and count actual compiler calls attributable to the probe."""
     build = case.root / name
     binary = args.oracle if oracle else args.rcmake
+    selected_generator = generator or getattr(args, "generator", "Ninja")
     before = len(case.invocations())
-    result = run_command(command(binary, case, build, no_cache), case.root, args.timeout, env)
+    result = run_command(command(binary, case, build, no_cache, generator=selected_generator),
+                         cwd or case.root, args.timeout, env)
     return output(result, case, build, args, env), len(case.invocations()) - before
 
 
@@ -568,8 +575,9 @@ def parallel(args, case: Fixture, env: dict) -> list[dict]:
                 stdout = stack.enter_context(tempfile.TemporaryFile())
                 stderr = stack.enter_context(tempfile.TemporaryFile())
                 process = subprocess.Popen(
-                    command(args.rcmake, case, build), cwd=case.root, env=env,
-                    stdin=subprocess.DEVNULL, stdout=stdout, stderr=stderr, start_new_session=True,
+                    command(args.rcmake, case, build, generator=getattr(args, "generator", "Ninja")),
+                    cwd=case.root, env=env, stdin=subprocess.DEVNULL, stdout=stdout, stderr=stderr,
+                    start_new_session=True,
                 )
                 workers.append((process, build, stdout, stderr))
             outputs = []
@@ -628,8 +636,10 @@ def interrupt(args, case: Fixture, env: dict, checkpoint: Path) -> int:
     """Kill one configure after its checkpoint and wait for SIGKILL."""
     with tempfile.TemporaryFile() as streams:
         process = subprocess.Popen(
-            command(args.rcmake, case, case.root / "interrupted"), cwd=case.root, env=env,
-            stdin=subprocess.DEVNULL, stdout=streams, stderr=streams, start_new_session=True,
+            command(args.rcmake, case, case.root / "interrupted",
+                    generator=getattr(args, "generator", "Ninja")),
+            cwd=case.root, env=env, stdin=subprocess.DEVNULL, stdout=streams, stderr=streams,
+            start_new_session=True,
         )
         try:
             deadline = time.monotonic() + args.timeout
@@ -750,6 +760,217 @@ def developer_dirs(root: Path, timeout: int) -> tuple[str, str] | None:
     return None
 
 
+def resolve_ninja(args) -> Path:
+    """Locate a real ninja executable for Ninja-generator soundness lanes."""
+    configured = getattr(args, "ninja", None)
+    if configured:
+        return executable(configured)
+    found = shutil.which("ninja")
+    if found:
+        return executable(found)
+    oracle_dir = os.environ.get("RCMAKE_ORACLE_DIR")
+    if oracle_dir:
+        candidate = Path(oracle_dir) / "bin" / "ninja"
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return executable(candidate)
+    raise ValueError("The ninja case requires a real ninja executable on PATH or via --ninja.")
+
+
+def ninja_version(ninja: Path, cwd: Path, timeout: int, env: dict[str, str]) -> str:
+    """Read and validate the reported version string of a ninja executable."""
+    result = run_command([ninja, "--version"], cwd, timeout, env)
+    lines = result["stdout"].splitlines() if result["stdout"] else []
+    if result["error"] or result["returncode"] != 0 or not lines or not lines[0].strip():
+        raise ValueError(f"Could not query ninja version from {ninja}. {result}")
+    return lines[0].strip()
+
+
+def stage_ninja(real_ninja: Path, directory: Path, timeout: int, env: dict[str, str]) -> Path:
+    """Place a real ninja executable inside a dedicated bin directory."""
+    directory.mkdir(parents=True, exist_ok=True)
+    staged = directory / "ninja"
+    staged.unlink(missing_ok=True)
+    shutil.copy2(real_ninja, staged)
+    staged.chmod(0o755)
+    check = run_command([staged, "--version"], directory, timeout, env)
+    if check["error"] or check["returncode"] != 0 or not check["stdout"].strip():
+        staged.unlink(missing_ok=True)
+        staged.symlink_to(real_ninja)
+        ninja_version(staged, directory, timeout, env)
+    backdate(staged, directory)
+    return staged
+
+
+def prepend_path(env: dict[str, str], directory: Path) -> dict[str, str]:
+    """Return a copy of env with directory placed first on PATH."""
+    updated = dict(env)
+    existing = updated.get("PATH", "")
+    updated["PATH"] = f"{directory}{os.pathsep}{existing}" if existing else str(directory)
+    return updated
+
+
+def cache_entry_value(build: Path, name: str) -> str | None:
+    """Read one typed entry from CMakeCache.txt."""
+    cache_file = build / "CMakeCache.txt"
+    if not cache_file.is_file():
+        return None
+    prefix = f"{name}:"
+    for line in cache_file.read_text(encoding="utf-8", errors="replace").splitlines():
+        if line.startswith(prefix) and "=" in line:
+            return line.split("=", 1)[1]
+    return None
+
+
+def require_ninja_make_program(build: Path, staged_ninja: Path) -> str:
+    """Verify CMake resolved CMAKE_MAKE_PROGRAM to the staged ninja binary."""
+    value = cache_entry_value(build, "CMAKE_MAKE_PROGRAM")
+    if not value or value.endswith("-NOTFOUND"):
+        raise ValueError(f"CMAKE_MAKE_PROGRAM did not resolve to ninja in {build}: {value!r}.")
+    resolved_value = Path(value).resolve()
+    if Path(value) != staged_ninja and resolved_value != staged_ninja.resolve():
+        raise ValueError(
+            f"CMAKE_MAKE_PROGRAM resolved to {value!r} instead of staged ninja {staged_ninja}."
+        )
+    return value
+
+
+def ninja_present(args, root: Path, row: dict) -> None:
+    """Require probe publication and warm reuse with real ninja first on PATH."""
+    real_ninja = resolve_ninja(args)
+    case = fixture(root, args.compiler)
+    store = root / "store"
+    base_env = environment(case, store)
+    staged = stage_ninja(real_ninja, root / "ninja-bin", args.timeout, base_env)
+    env = prepend_path(base_env, staged.parent)
+    row["ninja"] = str(real_ninja)
+    row["ninja_version"] = ninja_version(staged, root, args.timeout, env)
+    calls = row["compiler_calls"] = {}
+    cold, calls["cold"] = configure(args, case, "cold", env, generator="Ninja")
+    row["make_program"] = require_ninja_make_program(case.root / "cold", staged)
+    check_result(cold, True)
+    require_calls(calls, "cold", 1)
+    oracle, calls["oracle"] = configure(args, case, "oracle", env, oracle=True, generator="Ninja")
+    require_calls(calls, "oracle", 1)
+    compare(cold, oracle, PARITY_KEYS, "Ninja-present cold CMake parity")
+    if args.smoke:
+        return
+
+    errors = []
+    entries = {}
+    try:
+        entries = audit_store(store)
+        row["published"] = len(entries)
+        require_artifacts(entries, set(cold["copies"]), exact=True)
+    except (OSError, ValueError) as error:
+        errors.append(str(error))
+    try:
+        warm, calls["warm"] = configure(args, case, "warm", env, generator="Ninja")
+        require_calls(calls, "warm", 0)
+        compare(warm, cold, cold.keys(), "Ninja-present warm configure")
+    except (OSError, ValueError, subprocess.SubprocessError) as error:
+        errors.append(str(error))
+    try:
+        disabled, calls["cache_off"] = configure(args, case, "cache-off", env, no_cache=True,
+                                                 generator="Ninja")
+        compare(disabled, oracle, PARITY_KEYS, "Ninja-present cache-off CMake parity")
+        require_calls(calls, "cache_off", 1)
+        if audit_store(store) != entries:
+            raise ValueError("The cache-off lane changed the seeded probe entries.")
+    except (OSError, ValueError, subprocess.SubprocessError) as error:
+        errors.append(str(error))
+    if errors:
+        raise ValueError("Ninja-present probe cache failed. " + "\n".join(errors))
+
+
+@dataclass(frozen=True)
+class CaseSpec:
+    """Describe one selectable probe-cache evaluation case."""
+
+    name: str
+    gate: str
+    group: str
+    description: str
+    runner: Callable | None = None
+
+
+BASELINE_CASES: tuple[CaseSpec, ...] = (
+    CaseSpec("cache-control", "G3/G4", "baseline",
+             "Seed, reuse, and bypass the persistent probe cache.", cache_control),
+    *(CaseSpec(name, "G3", "baseline", f"Invalidate probe cache when {name} input changes.", None)
+      for name in TRIGGERS),
+    CaseSpec("parallel", "G4", "baseline",
+             "Run eight concurrent configures sharing one probe store.", concurrency),
+    CaseSpec("crash", "G4", "baseline",
+             "Recover intact probe entries after a SIGKILL during publication.", crash_recovery),
+    CaseSpec("corrupt-entry", "G4", "baseline",
+             "Recompile only the probe whose published entry was corrupted.", corrupt_entry),
+)
+
+EXTENDED_CASES: tuple[CaseSpec, ...] = (
+    CaseSpec("ninja-present", "G3/G4", "extended",
+             "Publish and reuse a probe with real ninja first on PATH and -G Ninja.",
+             ninja_present),
+)
+
+ALL_CASES: tuple[CaseSpec, ...] = BASELINE_CASES + EXTENDED_CASES
+CASE_INDEX: dict[str, CaseSpec] = {spec.name: spec for spec in ALL_CASES}
+
+
+def select_cases(
+    *,
+    smoke: bool = False,
+    cases: list[str] | None = None,
+    extended: bool = False,
+    all_cases: bool = False,
+) -> list[CaseSpec]:
+    """Resolve the requested evaluation cases without duplicating entries."""
+    if extended and all_cases:
+        raise ValueError("Use either --extended or --all-cases, not both.")
+    if cases:
+        if extended or all_cases:
+            raise ValueError("Do not combine --case with --extended or --all-cases.")
+        requested: list[str] = []
+        for item in cases:
+            for part in item.split(","):
+                name = part.strip()
+                if name:
+                    requested.append(name)
+        if not requested:
+            raise ValueError("Specify at least one case name with --case.")
+        unknown = [name for name in requested if name not in CASE_INDEX]
+        if unknown:
+            valid = ", ".join(spec.name for spec in ALL_CASES)
+            raise ValueError(f"Unknown case(s): {', '.join(unknown)}. Valid cases: {valid}.")
+        seen: set[str] = set()
+        selected: list[CaseSpec] = []
+        for name in requested:
+            if name not in seen:
+                seen.add(name)
+                selected.append(CASE_INDEX[name])
+        return selected
+    if smoke:
+        if extended or all_cases:
+            raise ValueError("--smoke cannot be combined with --extended or --all-cases.")
+        return [CASE_INDEX["cache-control"], CASE_INDEX["transitive"]]
+    if extended:
+        return list(EXTENDED_CASES)
+    if all_cases:
+        return list(ALL_CASES)
+    return list(BASELINE_CASES)
+
+
+def format_case_list() -> str:
+    """Format registered baseline and extended cases for CLI discovery."""
+    lines = ["Baseline cases:"]
+    for spec in BASELINE_CASES:
+        lines.append(f"  {spec.name:<22s} [{spec.gate}] {spec.description}")
+    lines.append("")
+    lines.append("Extended cases:")
+    for spec in EXTENDED_CASES:
+        lines.append(f"  {spec.name:<22s} [{spec.gate}] {spec.description}")
+    return "\n".join(lines)
+
+
 def evaluate(args, root: Path, report: dict) -> None:
     """Check the fixture and run the selected cache cases."""
     if sys.platform not in ("darwin", "linux"):
@@ -760,21 +981,21 @@ def evaluate(args, root: Path, report: dict) -> None:
     candidate = run_command([args.rcmake, "--version"], root, args.timeout, clean_environment())
     if candidate["returncode"] or candidate["error"] or "Rcmake" not in candidate["stdout"]:
         raise ValueError(f"Expected a staged Rcmake executable. {candidate}")
-    cases = ("transitive",) if args.smoke else TRIGGERS
-    rows = [("cache-control", "G3/G4", cache_control)]
-    rows.extend((name, "G3", None) for name in cases)
-    if not args.smoke:
-        rows.extend((("parallel", "G4", concurrency), ("crash", "G4", crash_recovery),
-                     ("corrupt-entry", "G4", corrupt_entry)))
+    selected = select_cases(
+        smoke=args.smoke,
+        cases=getattr(args, "case", None),
+        extended=getattr(args, "extended", False),
+        all_cases=getattr(args, "all_cases", False),
+    )
     control_ready = True
-    for name, gate, run in rows:
-        row = {"case": name, "gate": "Smoke" if args.smoke else gate, "status": "passed"}
+    for spec in selected:
+        row = {"case": spec.name, "gate": "Smoke" if args.smoke else spec.gate, "status": "passed"}
         report["cases"].append(row)
         if not control_ready:
             row.update(status="blocked", reason="The probe cache control failed.", passed=False)
             continue
         try:
-            if name == "developer-dir":
+            if spec.name == "developer-dir":
                 args.developer_dirs = developer_dirs(root, args.timeout)
                 if not args.developer_dirs:
                     reason = "The case requires two macOS developer directories with usable SDKs."
@@ -783,37 +1004,94 @@ def evaluate(args, root: Path, report: dict) -> None:
                     row.update(status="skipped", reason=reason, passed=None)
                     continue
                 row["developer_dirs"] = list(args.developer_dirs)
-            if run is None:
-                invalidation(args, root / name, name, row)
+            if spec.runner is None:
+                invalidation(args, root / spec.name, spec.name, row)
             else:
-                run(args, root / name, row)
+                spec.runner(args, root / spec.name, row)
         except (OSError, ValueError, subprocess.SubprocessError) as error:
             row["status"] = "failed"
             row["error"] = str(error)
-            print(f"{name}. {error}", file=sys.stderr)
-            if name == "cache-control" and not args.smoke:
+            print(f"{spec.name}. {error}", file=sys.stderr)
+            if spec.name == "cache-control" and not args.smoke:
                 control_ready = False
         row["passed"] = row["status"] == "passed"
 
 
-def main() -> int:
-    """Write JSON and Markdown results for the requested mode."""
+def render_markdown(report: dict) -> str:
+    """Render the Markdown summary table and per-case diagnostics."""
+    lines = ["# Compiler probe cache", "", f"Mode {report['mode']}. Seed {report['seed']}."]
+    if report["mode"] == "smoke":
+        lines.extend(("", "Smoke mode checks compiler success, compiler failure, output and copied executables.",
+                      "G3 and G4 require gate mode."))
+    lines.extend(("", "| Gate | Case | Result |", "| --- | --- | --- |"))
+    for row in report["cases"]:
+        lines.append(f"| {row['gate']} | {row['case']} | {row['status'].capitalize()} |")
+    for row in report["cases"]:
+        if "error" in row or "reason" in row:
+            lines.extend(("", f"## {row['case']}", "", row.get("error", row.get("reason"))))
+    available = report.get("available_extended_cases")
+    if available:
+        lines.extend((
+            "",
+            f"Extended cases available via `--extended`, `--all-cases`, or `--case`: {', '.join(available)}.",
+        ))
+    if "error" in report:
+        lines.extend(("", report["error"]))
+    return "\n".join(lines) + "\n"
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """Build the command-line parser for probe cache evaluation."""
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--rcmake", required=True)
+    parser.add_argument("--rcmake")
     parser.add_argument("--oracle", default=os.environ.get("RCMAKE_ORACLE_CMAKE"))
     parser.add_argument("--cc", default=shutil.which("cc"))
+    parser.add_argument("--ninja", default=None,
+                        help="Path to the real ninja executable for Ninja-present lanes.")
+    parser.add_argument("--generator", default="Ninja",
+                        help="CMake generator for baseline cases (default: Ninja). Ninja lanes always use Ninja.")
     parser.add_argument("--smoke", action="store_true")
+    parser.add_argument("--case", action="append", default=None,
+                        help="Run only the named case(s). Repeat or comma-separate names.")
+    parser.add_argument("--extended", action="store_true",
+                        help="Run only the extended soundness and runahead cases.")
+    parser.add_argument("--all-cases", "--include-extended", dest="all_cases", action="store_true",
+                        help="Run all baseline and extended cases.")
+    parser.add_argument("--list-cases", action="store_true",
+                        help="Print all registered baseline and extended cases and exit.")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--timeout", type=int, default=120)
-    parser.add_argument("--out-json", type=Path, required=True)
-    parser.add_argument("--out-md", type=Path, required=True)
-    args = parser.parse_args()
+    parser.add_argument("--out-json", type=Path)
+    parser.add_argument("--out-md", type=Path)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Write JSON and Markdown results for the requested mode."""
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if args.list_cases:
+        print(format_case_list())
+        return 0
+    if not args.rcmake or not args.out_json or not args.out_md:
+        parser.error("--rcmake, --out-json, and --out-md are required unless --list-cases is used.")
     if args.out_json.resolve() == args.out_md.resolve():
         parser.error("Use different paths for the JSON and Markdown reports.")
     if args.timeout < 1 or not args.oracle or not args.cc:
         parser.error("Set a positive timeout and specify or install the CMake oracle and C compiler.")
+    try:
+        select_cases(
+            smoke=args.smoke,
+            cases=args.case,
+            extended=args.extended,
+            all_cases=args.all_cases,
+        )
+    except ValueError as error:
+        parser.error(str(error))
     report = {"mode": "smoke" if args.smoke else "gate", "seed": args.seed,
               "rcmake": args.rcmake, "oracle": args.oracle, "cases": []}
+    if not args.smoke and not args.case and not args.extended and not args.all_cases:
+        report["available_extended_cases"] = [spec.name for spec in EXTENDED_CASES]
     try:
         args.rcmake = executable(args.rcmake)
         args.oracle = executable(args.oracle)
@@ -826,20 +1104,8 @@ def main() -> int:
     report["passed"] = ("error" not in report and any(row["passed"] for row in report["cases"])
                         and all(row["status"] in ("passed", "skipped") for row in report["cases"]))
     write_json(args.out_json, report)
-    lines = ["# Compiler probe cache", "", f"Mode {report['mode']}. Seed {args.seed}."]
-    if args.smoke:
-        lines.extend(("", "Smoke mode checks compiler success, compiler failure, output and copied executables.",
-                      "G3 and G4 require gate mode."))
-    lines.extend(("", "| Gate | Case | Result |", "| --- | --- | --- |"))
-    for row in report["cases"]:
-        lines.append(f"| {row['gate']} | {row['case']} | {row['status'].capitalize()} |")
-    for row in report["cases"]:
-        if "error" in row or "reason" in row:
-            lines.extend(("", f"## {row['case']}", "", row.get("error", row.get("reason"))))
-    if "error" in report:
-        lines.extend(("", report["error"]))
     args.out_md.parent.mkdir(parents=True, exist_ok=True)
-    args.out_md.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    args.out_md.write_text(render_markdown(report), encoding="utf-8")
     return 0 if report["passed"] else 1
 
 
