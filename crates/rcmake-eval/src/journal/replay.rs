@@ -1,8 +1,8 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::fmt;
 use std::path::Path;
 
-use rcmake_host::{Host, HostError, path};
+use rcmake_host::{Host, path};
 use rcmake_model::{AppendMode, DirId, ModelError, ProjectModel, PropOrigin, PropScope};
 use serde::{Deserialize, Serialize};
 
@@ -15,7 +15,6 @@ use super::region::{
 };
 use super::trace::{
     JournalDigest, JournalInput, JournalStamp, PropertyOwner, StateKey, StateLookup, VariableScope,
-    file_digest,
 };
 
 /// Versioned manifest of a successful whole configure.
@@ -182,13 +181,6 @@ pub enum ReplayMissReason {
         /// Path, environment key, or evaluator state that failed validation.
         description: String,
     },
-    /// A generated file changed or went missing.
-    GeneratedFile {
-        /// Zero-based effect index.
-        index: usize,
-        /// Output file that failed validation.
-        path: std::path::PathBuf,
-    },
 }
 
 impl ReplayMiss {
@@ -242,11 +234,6 @@ impl fmt::Display for ReplayMiss {
             ReplayMissReason::Input { description, .. } => {
                 write!(f, "Input validation failed for {description}.")?
             }
-            ReplayMissReason::GeneratedFile { path, .. } => write!(
-                f,
-                "Generated file {} changed or went missing.",
-                path.display()
-            )?,
         }
         write!(f, " {}", self.action())
     }
@@ -269,12 +256,9 @@ pub enum ReplayApplyError {
     /// The model rejected the effect.
     #[error(transparent)]
     Model(#[from] ModelError),
-    /// The output handler could not stage the effect.
-    #[error(transparent)]
-    Output(#[from] HostError),
 }
 
-/// A configure manifest whose region inputs and outputs matched.
+/// A configure manifest whose region inputs matched.
 #[derive(Debug)]
 pub struct VerifiedConfigure<'a, M> {
     /// Checked portable model, including final cache and property state.
@@ -291,7 +275,7 @@ impl<'a, M> VerifiedConfigure<'a, M> {
 
     /// Apply effects outside the model after restoring its final state.
     ///
-    /// Stage variables, diagnostics, and log output until this operation succeeds.
+    /// Stage variable changes until this operation succeeds.
     /// The restored model supplies cache entries and properties.
     pub fn replay<E>(
         self,
@@ -304,7 +288,7 @@ impl<'a, M> VerifiedConfigure<'a, M> {
     }
 }
 
-/// A region whose entry context, inputs, and output files matched.
+/// A region whose entry context and inputs matched.
 #[derive(Debug)]
 pub struct VerifiedRegion<'a> {
     inputs: &'a [JournalInput],
@@ -321,9 +305,7 @@ impl<'a> VerifiedRegion<'a> {
 
     /// Replay effects in order through the evaluator's normal mutation APIs.
     ///
-    /// The caller must stage mutations and output until every effect succeeds.
-    /// Resolve persistent property owners in the current model. A generated file
-    /// effect records a completed write for any enclosing region.
+    /// The caller must stage mutations until every effect succeeds.
     pub fn replay<E>(
         self,
         mut apply: impl FnMut(&JournalEffect) -> Result<(), E>,
@@ -336,14 +318,8 @@ impl<'a> VerifiedRegion<'a> {
 
     /// Apply variables, cache entries, and properties through the evaluation APIs.
     ///
-    /// Supply a staged evaluation context and a handler for diagnostics, configure
-    /// log chunks, and checked generated files. Publish staged state and output only
-    /// after success. Enclosing recorders receive generated files through the handler.
-    pub fn replay_into(
-        self,
-        cx: &mut Cx<'_>,
-        mut stage_output: impl FnMut(&JournalEffect) -> Result<(), ReplayApplyError>,
-    ) -> Result<(), ReplayApplyError> {
+    /// Supply a staged evaluation context. Publish it after all effects succeed.
+    pub fn replay_into(self, cx: &mut Cx<'_>) -> Result<(), ReplayApplyError> {
         self.replay(|effect| {
             match effect {
                 JournalEffect::SetVar { scope, name, value } => {
@@ -414,9 +390,6 @@ impl<'a> VerifiedRegion<'a> {
                         )?,
                     }
                 }
-                JournalEffect::Diagnostic { .. }
-                | JournalEffect::ConfigureLog(_)
-                | JournalEffect::GeneratedFile { .. } => stage_output(effect)?,
             }
             Ok(())
         })
@@ -472,31 +445,12 @@ pub fn verify_region<'a>(
     {
         return Err(miss(ReplayMissReason::InvalidRecord));
     }
-    let outputs: BTreeMap<_, _> = effects
-        .iter()
-        .enumerate()
-        .filter_map(|(index, effect)| {
-            if let JournalEffect::GeneratedFile { path, digest } = effect {
-                Some((path.as_path(), (index, *digest)))
-            } else {
-                None
-            }
-        })
-        .collect();
     let mut entry_keys = BTreeSet::new();
     for (index, input) in inputs.iter().enumerate() {
         if let JournalInput::State { key, .. } = input
             && !entry_keys.insert(key)
         {
             return Err(miss(ReplayMissReason::InvalidRecord));
-        }
-        // The final output check already covers content with the same digest.
-        // An earlier read of different contents is still an entry dependency.
-        if let JournalInput::Host(stamp) = input
-            && let Some((_, digest)) = stamp.path().and_then(|path| outputs.get(path))
-            && stamp.matches_written_file(*digest)
-        {
-            continue;
         }
         if !input.matches(host, &mut lookup) {
             return Err(miss(ReplayMissReason::Input {
@@ -518,16 +472,6 @@ pub fn verify_region<'a>(
             return Err(miss(ReplayMissReason::InvalidRecord));
         }
         written.extend(effect.written_states());
-    }
-    let mut final_outputs: Vec<_> = outputs.into_iter().collect();
-    final_outputs.sort_unstable_by_key(|(_, (index, _))| *index);
-    for (path, (index, digest)) in final_outputs {
-        if file_digest(host, path) != Ok(digest) {
-            return Err(miss(ReplayMissReason::GeneratedFile {
-                index,
-                path: path.to_owned(),
-            }));
-        }
     }
     Ok(VerifiedRegion { inputs, effects })
 }

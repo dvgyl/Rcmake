@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use rcmake_diag::{Backtrace, Frame, FrameKind};
 use rcmake_model::{CacheEntry, CacheType, PropertyMap};
@@ -74,8 +74,6 @@ pub enum OpaqueReason {
     RandomOrTimestamp,
     /// The operation changed state outside the recorded mutation APIs.
     ExternalMutation,
-    /// A file glob has no verified input trace.
-    FileGlobUncached,
     /// The input or effect count exceeded the journal limit.
     LimitExceeded,
 }
@@ -92,27 +90,6 @@ pub struct OpaqueOperation {
     pub file: PathBuf,
     /// One-based source line. Zero means unknown.
     pub line: u32,
-}
-
-/// Scope relationship between a child region and its enclosing region.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ChildScope {
-    /// Both regions use the same variable scope, as in an include.
-    Shared,
-    /// The child starts with an empty variable scope directly inside the caller.
-    EmptyChild,
-}
-
-/// Whether the evaluator tracks the inputs and effects of an operation.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum CommandClass {
-    /// The evaluator could not classify the operation.
-    #[default]
-    Unknown,
-    /// The evaluator tracks all inputs and observable effects of the operation.
-    Tracked,
-    /// The evaluator knows why the operation cannot be replayed.
-    Opaque(OpaqueReason),
 }
 
 /// Byte-preserving snapshot of a CMake cache entry.
@@ -257,15 +234,6 @@ pub enum PropertyEdit {
     AppendString(Vec<u8>),
 }
 
-/// Output stream of a configure message.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum OutputStream {
-    /// Standard output.
-    Stdout,
-    /// Standard error.
-    Stderr,
-}
-
 /// One observable effect in execution order.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum JournalEffect {
@@ -293,23 +261,6 @@ pub enum JournalEffect {
         edit: PropertyEdit,
         /// Caller directory and backtrace for the write.
         origin: PropertyOrigin,
-    },
-    /// Rendered diagnostic or message that passed the recorder's diagnostic policy.
-    Diagnostic {
-        /// Stream that received the message.
-        stream: OutputStream,
-        /// Exact bytes written to the stream.
-        bytes: Vec<u8>,
-    },
-    /// Bytes appended to the configure log.
-    ConfigureLog(Vec<u8>),
-    /// A written file whose final contents must still be present before replay.
-    GeneratedFile {
-        /// Absolute path of the written file.
-        #[serde(with = "path_bytes")]
-        path: PathBuf,
-        /// Digest of its contents after the write.
-        digest: JournalDigest,
     },
 }
 
@@ -341,9 +292,6 @@ impl JournalEffect {
             ),
             Self::SetCache { name, .. } => (Some(StateKey::Cache(name.clone())), None),
             Self::Property { key, .. } => (Some(StateKey::Property(key.clone())), None),
-            Self::Diagnostic { .. } | Self::ConfigureLog(_) | Self::GeneratedFile { .. } => {
-                (None, None)
-            }
         };
         first.into_iter().chain(second).chain(match self {
             Self::SetVar {
@@ -368,7 +316,6 @@ impl JournalEffect {
                         PropertyOwner::Target(target) => target.binary_dir.is_absolute(),
                     }
             }
-            Self::GeneratedFile { path, .. } => path.is_absolute(),
             _ => true,
         }
     }
@@ -381,7 +328,6 @@ pub struct Journal {
     effects: Vec<JournalEffect>,
     read: BTreeMap<StateKey, Option<JournalDigest>>,
     written: BTreeSet<StateKey>,
-    generated: BTreeMap<PathBuf, JournalDigest>,
     bytes: usize,
 }
 
@@ -398,12 +344,6 @@ impl Journal {
                     Err(OpaqueReason::ExternalMutation)
                 };
             }
-        }
-        if let JournalInput::Host(stamp) = &input
-            && let Some(digest) = stamp.path().and_then(|path| self.generated.get(path))
-            && stamp.matches_written_file(*digest)
-        {
-            return Ok(());
         }
         if self.inputs.len() == MAX_INPUTS {
             return Err(OpaqueReason::LimitExceeded);
@@ -431,9 +371,6 @@ impl Journal {
         }
         self.account(&effect)?;
         self.written.extend(effect.written_states());
-        if let JournalEffect::GeneratedFile { path, digest } = &effect {
-            self.generated.insert(path.clone(), *digest);
-        }
         self.effects.push(effect);
         Ok(())
     }
@@ -464,16 +401,6 @@ impl Default for RegionState {
 }
 
 impl RegionState {
-    /// Record an operation that has no named classification.
-    pub fn record_command(&mut self, class: CommandClass) {
-        match class {
-            CommandClass::Opaque(reason) => self.mark_opaque(reason),
-            CommandClass::Unknown | CommandClass::Tracked => {
-                self.mark_opaque(OpaqueReason::UnclassifiedCommand);
-            }
-        }
-    }
-
     /// Stop recording and retain the first reason replay is unsafe.
     pub fn mark_opaque(&mut self, reason: OpaqueReason) {
         if matches!(self, Self::Recording(_)) {
@@ -483,109 +410,6 @@ impl RegionState {
                 file: PathBuf::new(),
                 line: 0,
             });
-        }
-    }
-
-    /// Record a command at its source site. Require a tracked built-in contract.
-    ///
-    /// Pass `Unknown` for scripted or replaced commands. A caller can only
-    /// claim `Tracked` when its recorder covers the specific arguments.
-    pub fn record_named_command(
-        &mut self,
-        file: &Path,
-        line: u32,
-        command: &[u8],
-        args: &[&[u8]],
-        class: CommandClass,
-    ) {
-        let reason = match class {
-            CommandClass::Unknown => OpaqueReason::UnclassifiedCommand,
-            CommandClass::Opaque(reason) => reason,
-            CommandClass::Tracked => match command.to_ascii_lowercase().as_slice() {
-                b"set" | b"unset"
-                    if args.first().is_some_and(|name| !name.starts_with(b"ENV{")) =>
-                {
-                    return;
-                }
-                b"get_property" if args.get(1).is_some_and(|scope| tracked_owner(scope)) => return,
-                b"set_property" if args.first().is_some_and(|scope| tracked_owner(scope)) => return,
-                b"execute_process" => OpaqueReason::ExecuteProcess,
-                b"file" | b"if" => OpaqueReason::RandomOrTimestamp,
-                _ => OpaqueReason::UnclassifiedCommand,
-            },
-        };
-        if matches!(self, Self::Recording(_)) {
-            *self = Self::Opaque(OpaqueOperation {
-                reason,
-                command: Some(command.to_vec()),
-                file: file.to_owned(),
-                line,
-            });
-        }
-    }
-
-    /// Record the effective normal variable read that precedes a parent write.
-    ///
-    /// The evaluator supplies the value from its normal scope stack before the
-    /// write. Pass `None` for an undefined binding.
-    pub fn record_parent_write(
-        &mut self,
-        name: &[u8],
-        previous: Option<&[u8]>,
-        value: Option<Vec<u8>>,
-    ) {
-        self.record_input(JournalInput::State {
-            key: StateKey::EffectiveVariable(name.to_vec()),
-            value: previous.map(JournalDigest::hash),
-        });
-        self.record_effect(JournalEffect::SetVar {
-            scope: VariableScope::Parent,
-            name: name.to_vec(),
-            value,
-        });
-    }
-
-    /// Merge a child journal at its call site with scopes relative to this region.
-    ///
-    /// Provide the scope relationship from the evaluator. Child-local writes
-    /// disappear when its scope closes. Parent writes affect this region's
-    /// current scope and must not repeat the child's raise operation.
-    pub fn merge_child(&mut self, child: RegionRecord, scopes: ChildScope) {
-        let (inputs, effects) = match child.payload {
-            RegionPayload::Complete { inputs, effects } => (inputs, effects),
-            RegionPayload::Opaque(operation) => {
-                if matches!(self, Self::Recording(_)) {
-                    *self = Self::Opaque(operation);
-                }
-                return;
-            }
-        };
-        for mut input in inputs {
-            if scopes == ChildScope::EmptyChild
-                && let JournalInput::State { key, value } = &mut input
-                && let StateKey::Variable { scope, .. } = key
-            {
-                match scope {
-                    VariableScope::Current if value.is_none() => continue,
-                    VariableScope::Current => {
-                        self.mark_opaque(OpaqueReason::ExternalMutation);
-                        return;
-                    }
-                    VariableScope::Parent => *scope = VariableScope::Current,
-                }
-            }
-            self.record_input(input);
-        }
-        for mut effect in effects {
-            if scopes == ChildScope::EmptyChild
-                && let JournalEffect::SetVar { scope, .. } = &mut effect
-            {
-                match scope {
-                    VariableScope::Current => continue,
-                    VariableScope::Parent => *scope = VariableScope::Current,
-                }
-            }
-            self.record_effect(effect);
         }
     }
 
@@ -623,10 +447,6 @@ impl RegionState {
             payload,
         }
     }
-}
-
-fn tracked_owner(scope: &[u8]) -> bool {
-    matches!(scope, b"GLOBAL" | b"DIRECTORY" | b"TARGET")
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

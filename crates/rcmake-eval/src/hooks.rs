@@ -174,21 +174,6 @@ impl Interp {
             .push(watch);
     }
 
-    /// Remove the watches of `var` whose callback is `command` (all watches of `var` when
-    /// `command` is `None`). Returns `true` if a watch was removed.
-    pub(crate) fn remove_watch(&mut self, var: &[u8], command: Option<&[u8]>) -> bool {
-        let Some(list) = self.watches.get_mut(var) else {
-            return false;
-        };
-        let before = list.len();
-        list.retain(|w| command.is_some_and(|c| w.command.as_slice() != c));
-        let removed = list.len() != before;
-        if list.is_empty() {
-            self.watches.remove(var);
-        }
-        removed
-    }
-
     /// Callback commands of the watches of `var` (an empty name means the default log
     /// message), in registration order.
     pub(crate) fn watch_commands(&self, var: &[u8]) -> Vec<BString> {

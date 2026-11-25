@@ -105,12 +105,6 @@ impl ArgBytes for &[u8] {
     }
 }
 
-impl ArgBytes for Vec<u8> {
-    fn arg_bytes(&self) -> &[u8] {
-        self.as_slice()
-    }
-}
-
 /// How a keyword consumes the arguments that follow it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Slot {

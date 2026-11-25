@@ -1,14 +1,9 @@
-use rcmake_base::{BString, truth};
+use rcmake_base::truth;
 use rcmake_diag::PolicyId;
 
 use crate::{CmdError, Cx};
 
 impl Cx<'_> {
-    /// Raise each binding to the immediate parent scope.
-    pub fn raise_scope(&mut self, names: &[BString]) {
-        self.interp.raise_vars(names);
-    }
-
     /// Capture language setup bindings and propagate them according to CMP0220.
     ///
     /// # Errors

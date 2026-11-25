@@ -19,9 +19,8 @@ pub(crate) use activate::ReplaySession;
 pub use receipts::ReplayReceipts;
 
 pub use region::{
-    CacheValue, ChildScope, CommandClass, EntryContext, Journal, JournalEffect, OpaqueOperation,
-    OpaqueReason, OutputStream, PropertyEdit, PropertyOrigin, RegionKey, RegionKind, RegionRecord,
-    RegionState,
+    CacheValue, EntryContext, Journal, JournalEffect, OpaqueOperation, OpaqueReason, PropertyEdit,
+    PropertyOrigin, RegionKey, RegionKind, RegionRecord, RegionState,
 };
 pub use replay::{
     ConfigureSnapshot, ReplayApplyError, ReplayCodecError, ReplayMiss, ReplayMissReason,

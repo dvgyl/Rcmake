@@ -210,10 +210,6 @@ impl JournalStamp {
         }
     }
 
-    pub(super) fn matches_written_file(&self, digest: JournalDigest) -> bool {
-        matches!(self, Self::FileHash { digest: expected, .. } if *expected == digest)
-    }
-
     fn matches(&self, host: &dyn Host) -> bool {
         match self {
             Self::FileStat { path, stat, digest } => {

@@ -405,7 +405,7 @@ impl Interp {
         {
             // The candidate passed validation for each variable and cache write.
             checked
-                .replay_into(&mut self.cx(), |_| Ok(()))
+                .replay_into(&mut self.cx())
                 .map_err(|error| crate::CmdError::status(error.to_string()))?;
             self.replay_hits += 1;
             self.replayed_listfiles.insert(source);

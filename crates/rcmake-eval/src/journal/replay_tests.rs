@@ -1,7 +1,7 @@
 use super::*;
 use crate::journal::{
-    CacheValue, CommandClass, JournalFileStat, JournalStamp, OpaqueReason, OutputStream,
-    PropertyKey, PropertyOrigin, RegionState, VariableScope, directory_digest, policy_digest,
+    CacheValue, JournalFileStat, JournalStamp, OpaqueReason, PropertyKey, PropertyOrigin,
+    RegionState, VariableScope, directory_digest, policy_digest,
 };
 use rcmake_diag::{Backtrace, Frame, FrameKind, PolicyStatus};
 use rcmake_host::{FileTime, HostResult, PureHost};
@@ -52,7 +52,16 @@ fn only_first_read_before_write_constrains_replay() -> Result<(), ReplayMiss> {
     let current = variable(VariableScope::Current, b"X");
     read(&mut state, parent.clone(), Some(b"old"));
     read(&mut state, parent.clone(), Some(b"old"));
-    state.record_parent_write(b"X", Some(b"old"), Some(b"write".to_vec()));
+    read(
+        &mut state,
+        StateKey::EffectiveVariable(b"X".to_vec()),
+        Some(b"old"),
+    );
+    state.record_effect(JournalEffect::SetVar {
+        scope: VariableScope::Parent,
+        name: b"X".to_vec(),
+        value: Some(b"write".to_vec()),
+    });
     read(&mut state, parent.clone(), Some(b"write"));
     state.record_effect(JournalEffect::SetVar {
         scope: VariableScope::Current,
@@ -224,35 +233,6 @@ fn policy_input_and_region_context_are_checked() {
 }
 
 #[test]
-fn unknown_command_makes_the_region_opaque() {
-    let (host, key, context) = fixture(RegionKind::Configure);
-    let mut state = RegionState::default();
-    state.record_command(CommandClass::default());
-    state.record_command(CommandClass::Opaque(OpaqueReason::ExecuteProcess));
-    let record = state.finish(key.clone(), context.clone());
-    assert!(matches!(
-        verify_region(&host, &record, &key, &context, unavailable),
-        Err(ReplayMiss {
-            reason: ReplayMissReason::Opaque(OpaqueOperation {
-                reason: OpaqueReason::UnclassifiedCommand,
-                ..
-            }),
-            ..
-        })
-    ));
-    assert!(matches!(
-        ConfigureSnapshot::new(record, ()),
-        Err(ReplayMiss {
-            reason: ReplayMissReason::Opaque(OpaqueOperation {
-                reason: OpaqueReason::UnclassifiedCommand,
-                ..
-            }),
-            ..
-        })
-    ));
-}
-
-#[test]
 fn changed_shared_value_without_a_tracked_write_makes_region_opaque() {
     let (_, key, context) = fixture(RegionKind::Subdirectory);
     let mut state = RegionState::default();
@@ -366,140 +346,6 @@ fn file_stat_trace_accepts_a_touch_and_detects_changed_contents() -> HostResult<
 }
 
 #[test]
-fn configure_checks_final_generated_contents() -> HostResult<()> {
-    fn requires_serde<T: Serialize + serde::de::DeserializeOwned>() {}
-    requires_serde::<ConfigureSnapshot<Vec<u8>>>();
-    let (host, key, context) = fixture(RegionKind::Configure);
-    let generated = key.binary_dir.join("generated.h");
-    host.seed_file(&generated, b"finish")?;
-    let mut state = RegionState::default();
-    state.record_effect(JournalEffect::GeneratedFile {
-        path: generated.clone(),
-        digest: JournalDigest::hash(b"start"),
-    });
-    state.record_effect(JournalEffect::Diagnostic {
-        stream: OutputStream::Stdout,
-        bytes: vec![0xff],
-    });
-    state.record_effect(JournalEffect::GeneratedFile {
-        path: generated.clone(),
-        digest: JournalDigest::hash(b"finish"),
-    });
-    state.record_effect(JournalEffect::SetCache {
-        name: b"RESTORED_CACHE".to_vec(),
-        entry: None,
-    });
-    let snapshot =
-        ConfigureSnapshot::new(state.finish(key.clone(), context.clone()), vec![0xff_u8]);
-    assert!(snapshot.is_ok());
-    let Ok(snapshot) = snapshot else {
-        return Ok(());
-    };
-    let checked = verify_configure(&host, &snapshot, &key, &context, unavailable);
-    assert!(checked.is_ok());
-    if let Ok(checked) = checked {
-        assert_eq!(checked.model, &[0xff]);
-        let mut seen = Vec::new();
-        checked.replay(|effect| {
-            seen.push(
-                matches!(effect, JournalEffect::Diagnostic { bytes, .. } if bytes == &[0xff]),
-            );
-            Ok::<(), rcmake_host::HostError>(())
-        })?;
-        assert_eq!(seen, [false, true, false]);
-    }
-    let mut future_snapshot = snapshot.clone();
-    future_snapshot.schema = "configure.future".into();
-    assert!(matches!(
-        verify_configure(&host, &future_snapshot, &key, &context, unavailable),
-        Err(ReplayMiss {
-            reason: ReplayMissReason::Schema,
-            ..
-        })
-    ));
-    host.remove_file(&generated)?;
-    assert!(matches!(
-        verify_configure(&host, &snapshot, &key, &context, unavailable),
-        Err(ReplayMiss {
-            reason: ReplayMissReason::GeneratedFile { index: 2, .. },
-            ..
-        })
-    ));
-    Ok(())
-}
-
-#[test]
-fn untracked_commands_report_the_first_source_site() {
-    let (host, key, context) = fixture(RegionKind::Subdirectory);
-    let file = key.source_dir.join("CMakeLists.txt");
-    let mut state = RegionState::default();
-    state.record_named_command(&file, 4, b"function", &[b"f"], CommandClass::Tracked);
-    state.record_named_command(&file, 8, b"add_library", &[b"lib"], CommandClass::Tracked);
-    let record = state.finish(key.clone(), context.clone());
-    assert!(matches!(
-        verify_region(&host, &record, &key, &context, unavailable),
-        Err(ReplayMiss {
-            reason: ReplayMissReason::Opaque(OpaqueOperation { command: Some(command), line: 4, .. }),
-            ..
-        }) if command == b"function"
-    ));
-}
-
-#[test]
-fn rebases_child_parent_writes_and_keeps_shared_include_effects() -> Result<(), ReplayMiss> {
-    use crate::journal::ChildScope;
-
-    let (host, key, context) = fixture(RegionKind::Configure);
-    let mut child_key = key.clone();
-    child_key.kind = RegionKind::Subdirectory;
-    let mut child = RegionState::default();
-    child.record_parent_write(b"X", Some(b"prior"), Some(b"parent".to_vec()));
-    child.record_effect(JournalEffect::SetVar {
-        scope: VariableScope::Current,
-        name: b"LOCAL".to_vec(),
-        value: Some(b"temporary".to_vec()),
-    });
-    let mut include = RegionState::default();
-    include.record_effect(JournalEffect::SetCache {
-        name: b"FROM_INCLUDE".to_vec(),
-        entry: None,
-    });
-    child.merge_child(
-        include.finish(child_key.clone(), context.clone()),
-        ChildScope::Shared,
-    );
-
-    let mut outer = RegionState::default();
-    outer.merge_child(
-        child.finish(child_key, context.clone()),
-        ChildScope::EmptyChild,
-    );
-    read(
-        &mut outer,
-        variable(VariableScope::Current, b"X"),
-        Some(b"parent"),
-    );
-    let record = outer.finish(key.clone(), context.clone());
-    let verified = verify_region(&host, &record, &key, &context, |key| {
-        assert_eq!(key, &StateKey::EffectiveVariable(b"X".to_vec()));
-        StateLookup::Observed(Some(JournalDigest::hash(b"prior")))
-    })?;
-    let mut effects = Vec::new();
-    verified.replay(|effect| {
-        effects.push(effect.clone());
-        Ok::<(), ReplayMiss>(())
-    })?;
-    assert!(matches!(
-        effects.as_slice(),
-        [
-            JournalEffect::SetVar { scope: VariableScope::Current, name, value: Some(value) },
-            JournalEffect::SetCache { name: cache, entry: None }
-        ] if name == b"X" && value == b"parent" && cache == b"FROM_INCLUDE"
-    ));
-    Ok(())
-}
-
-#[test]
 fn exact_link_canonical_and_timestamp_inputs_detect_changes() -> HostResult<()> {
     let (host, key, context) = fixture(RegionKind::Configure);
     let first = key.source_dir.join("first");
@@ -595,38 +441,5 @@ fn snapshot_codec_rejects_truncation_and_bit_changes() -> Result<(), Box<dyn std
     let mut previous = snapshot;
     previous.schema = "configure.v1".into();
     assert!(ConfigureSnapshot::<Vec<u8>>::decode(&previous.encode()?).is_err());
-    Ok(())
-}
-
-#[test]
-fn intermediate_generated_content_is_not_an_entry_input() -> HostResult<()> {
-    let (host, key, context) = fixture(RegionKind::Configure);
-    let path = key.binary_dir.join("output");
-    let initial = JournalDigest::hash(b"initial");
-    let final_digest = JournalDigest::hash(b"final");
-    host.seed_file(&path, b"final")?;
-    let mut state = RegionState::default();
-    state.record_effect(JournalEffect::GeneratedFile {
-        path: path.clone(),
-        digest: initial,
-    });
-    state.record_input(JournalInput::Host(JournalStamp::FileHash {
-        path: path.clone(),
-        digest: initial,
-    }));
-    state.record_effect(JournalEffect::GeneratedFile {
-        path: path.clone(),
-        digest: final_digest,
-    });
-    let record = state.finish(key.clone(), context.clone());
-    assert!(verify_region(&host, &record, &key, &context, unavailable).is_ok());
-    host.remove_file(&path)?;
-    assert!(matches!(
-        verify_region(&host, &record, &key, &context, unavailable),
-        Err(ReplayMiss {
-            reason: ReplayMissReason::GeneratedFile { index: 1, .. },
-            ..
-        })
-    ));
     Ok(())
 }

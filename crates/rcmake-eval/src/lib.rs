@@ -46,7 +46,6 @@ pub mod hermetic;
 mod hooks;
 mod interp;
 pub mod journal;
-mod md5;
 mod profiler;
 mod provenance;
 mod scope;

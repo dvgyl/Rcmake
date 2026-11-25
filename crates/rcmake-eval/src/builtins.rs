@@ -109,10 +109,6 @@ fn is_full_path(p: &[u8]) -> bool {
     matches!(p.first(), Some(b'/' | b'\\')) || (p.len() >= 2 && p.get(1) == Some(&b':'))
 }
 
-fn is_sub_path(path: &[u8], dir: &[u8]) -> bool {
-    path.starts_with(dir)
-}
-
 impl Interp {
     pub(crate) fn warn_deprecated_variable(&mut self, name: &[u8]) {
         let id = PolicyId::new(218);
@@ -170,7 +166,7 @@ impl Interp {
                     .lookup_var(b"CMAKE_CURRENT_LIST_FILE")
                     .cloned()
                     .unwrap_or_default();
-                if is_sub_path(&current, &mods) {
+                if current.starts_with(&mods) {
                     (system, true)
                 } else {
                     (user, false)
@@ -348,7 +344,10 @@ fn cmd_include_guard(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
         }
     };
     let file = cx.current_list_file();
-    let var = BString::from(format!("__INCGUARD_{}__", crate::md5::md5_hex(&file)));
+    let var = BString::from(format!(
+        "__INCGUARD_{}__",
+        rcmake_base::hash::HashAlgo::Md5.hex_digest(&file)
+    ));
     let done = Ok(Flow::Return { propagate: None });
     match scope {
         Scope::Variable => {

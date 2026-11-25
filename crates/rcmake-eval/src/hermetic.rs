@@ -48,7 +48,6 @@ pub struct HermeticPolicy {
     case_insensitive_roots: bool,
     roots: BTreeSet<PathBuf>,
     programs: BTreeSet<PathBuf>,
-    pinned_network: bool,
     warnings: Vec<String>,
 }
 
@@ -68,7 +67,6 @@ impl HermeticPolicy {
             case_insensitive_roots: matches!(system.sysname.as_slice(), b"Darwin" | b"Windows"),
             roots: BTreeSet::new(),
             programs: BTreeSet::new(),
-            pinned_network: true,
             warnings: Vec::new(),
         };
         for name in BASE_ENV {
@@ -134,15 +132,6 @@ impl HermeticPolicy {
         true
     }
 
-    /// Permit path aliases on hosts with case-insensitive filesystems.
-    ///
-    /// This still requires the host to report the same directory identity for
-    /// an alias. A distinct directory on a case-sensitive volume stays outside
-    /// the allowed root even when the names differ only by case.
-    pub fn allow_case_insensitive_roots(&mut self, allow: bool) {
-        self.case_insensitive_roots = allow;
-    }
-
     /// Allow one existing, absolute executable path. The caller resolves tool names first.
     pub fn allow_program(&mut self, host: &dyn Host, program: &Path) -> bool {
         if !program.is_absolute()
@@ -158,11 +147,6 @@ impl HermeticPolicy {
         };
         self.programs.insert(path);
         true
-    }
-
-    /// Set whether a transfer may use network access when its fetch pin is enforced.
-    pub fn allow_pinned_network(&mut self, allow: bool) {
-        self.pinned_network = allow;
     }
 
     /// Return whether the variable can be read from the environment.
@@ -540,11 +524,6 @@ impl HermeticAuditor {
         )
     }
 
-    /// Check `DEFINED ENV{...}`. In warning mode the caller treats the variable as undefined.
-    pub fn check_env_defined(&mut self, site: &HermeticSite, name: &[u8]) -> AuditOutcome<'_> {
-        self.check_env(site, name)
-    }
-
     /// Check an absolute path, including symlink traversal and parent components.
     ///
     /// The caller must enforce containment at open time if the filesystem can
@@ -624,7 +603,7 @@ impl HermeticAuditor {
         enforced_pin: bool,
         dependency: Option<&str>,
     ) -> AuditOutcome<'_> {
-        if self.mode == HermeticMode::Off || (enforced_pin && self.policy.pinned_network) {
+        if self.mode == HermeticMode::Off || enforced_pin {
             return allowed();
         }
         let hint = match dependency {

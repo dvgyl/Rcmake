@@ -415,12 +415,6 @@ impl Cx<'_> {
         self.var_or_empty(b"CMAKE_CURRENT_LIST_FILE")
     }
 
-    /// `CMAKE_CURRENT_LIST_DIR`.
-    #[must_use]
-    pub fn current_list_dir(&self) -> BString {
-        self.var_or_empty(b"CMAKE_CURRENT_LIST_DIR")
-    }
-
     /// `CMAKE_CURRENT_SOURCE_DIR` as a native path.
     #[must_use]
     pub fn current_source_dir(&self) -> PathBuf {
@@ -894,12 +888,6 @@ impl Cx<'_> {
     /// the callback arguments. The command checks `CMAKE_CURRENT_LIST_FILE` itself.
     pub fn add_variable_watch(&mut self, var: &[u8], command: Option<&[u8]>) {
         self.interp.add_watch(var, command.unwrap_or_default());
-    }
-
-    /// Remove the watches of `var` that call `command` (all watches of `var` when
-    /// `command` is `None`). Returns `true` if a watch was removed.
-    pub fn remove_variable_watch(&mut self, var: &[u8], command: Option<&[u8]>) -> bool {
-        self.interp.remove_watch(var, command)
     }
 
     /// Callback commands of the watches of `var` in registration order. An empty entry

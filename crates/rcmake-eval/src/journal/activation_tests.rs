@@ -308,8 +308,13 @@ fn invalid_late_effect_does_not_change_earlier_variables() -> TestResult {
         name: b"WRONG".to_vec(),
         value: Some(b"leak".to_vec()),
     };
-    effects.push(JournalEffect::ConfigureLog(b"invalid".to_vec()));
+    effects.push(JournalEffect::SetVar {
+        scope: VariableScope::Current,
+        name: b"INVALID".to_vec(),
+        value: Some(vec![b'x'; 16]),
+    });
     let mut next = f.interp();
+    next.config.limits.max_value_bytes = 8;
     f.run(&mut next, Some(&bad.encode()?));
     assert_eq!(next.replay_hits(), 0);
     assert!(next.cx().var(b"WRONG").is_none());
