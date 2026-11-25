@@ -373,7 +373,7 @@ fn render_source_set(
         out.extend_from_slice(key);
         for value in entries {
             out.extend_from_slice(b" \"");
-            quote_export_content(out, value, install, true);
+            quote_export_content(out, value, install, true, false);
             out.push(b'"');
         }
     }
@@ -386,7 +386,7 @@ fn render_source_set(
         out.extend_from_slice(b" PROPERTY ");
         quote(out, key);
         out.extend_from_slice(b" \"");
-        quote_export_content(out, value, install, false);
+        quote_export_content(out, value, install, false, false);
         out.extend_from_slice(b"\")\n");
     }
     out.extend_from_slice(b"endif()\n");
@@ -588,7 +588,8 @@ fn render_property(out: &mut BString, key: &[u8], value: &[u8], install: bool) {
     } else {
         start_property(out, key);
     }
-    quote_export_content(out, value, install, false);
+    // `cmExportFileGeneratorEscape` escapes every `$`, also in `$<...>`.
+    quote_export_content(out, value, install, false, true);
     out.extend_from_slice(b"\"\n");
 }
 
@@ -601,10 +602,16 @@ fn render_relative_path(out: &mut BString, path: &[u8], list_element: bool) {
         out.extend_from_slice(IMPORT_PREFIX);
         out.push(b'/');
     }
-    quote_export_content(out, path, true, list_element);
+    quote_export_content(out, path, true, list_element, false);
 }
 
-fn quote_export_content(out: &mut BString, mut value: &[u8], install: bool, list_element: bool) {
+fn quote_export_content(
+    out: &mut BString,
+    mut value: &[u8],
+    install: bool,
+    list_element: bool,
+    escape_genex: bool,
+) {
     while let Some((byte, rest)) = value.split_first() {
         if install
             && let Some(after_prefix) = value
@@ -615,7 +622,7 @@ fn quote_export_content(out: &mut BString, mut value: &[u8], install: bool, list
             value = after_prefix;
             continue;
         }
-        if *byte == b'$' && rest.starts_with(b"<") {
+        if *byte == b'$' && rest.starts_with(b"<") && !escape_genex {
             out.push(*byte);
         } else {
             if *byte == b';' && list_element {

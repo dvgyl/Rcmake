@@ -80,12 +80,19 @@ fn listfile_stack(cx: &mut Cx<'_>, dir: DirId) -> BString {
 
 pub(super) fn global_value(cx: &mut Cx<'_>, name: &[u8]) -> Option<BString> {
     match name {
+        // A host program (`ctest -S`) records its role. Otherwise the mode decides.
         b"CMAKE_ROLE" => Some(
-            match cx.mode() {
-                RunMode::Script => "SCRIPT",
-                RunMode::Configure => "PROJECT",
-            }
-            .into(),
+            cx.global()
+                .props
+                .get(b"_RCMAKE_CMAKE_ROLE")
+                .cloned()
+                .unwrap_or_else(|| {
+                    match cx.mode() {
+                        RunMode::Script => "SCRIPT",
+                        RunMode::Configure => "PROJECT",
+                    }
+                    .into()
+                }),
         ),
         b"GENERATOR_IS_MULTI_CONFIG" => Some(boolean(generator_is_multi_config(cx))),
         b"IN_TRY_COMPILE" => Some(boolean(

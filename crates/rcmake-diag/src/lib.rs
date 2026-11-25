@@ -10,6 +10,7 @@ pub mod category;
 pub mod generated_policies;
 mod history;
 pub mod policy;
+mod policy_warnings;
 pub mod render;
 pub mod rich;
 pub mod source;

@@ -97,7 +97,7 @@ fn renders_namespace_qualified_sibling_links() -> Result<(), Box<dyn std::error:
         let name = format!("{prefix}renamed");
         let main = render_main(plan, b"lib/cmake", None, b"")?;
         let expected = format!(
-            "INTERFACE_LINK_LIBRARIES \"{name};$<LINK_ONLY:{name}>;$<$<CONFIG:Debug>:{name}>;$<$<CONFIG:Debug>:dep>;pthread\""
+            "INTERFACE_LINK_LIBRARIES \"{name};\\$<LINK_ONLY:{name}>;\\$<\\$<CONFIG:Debug>:{name}>;\\$<\\$<CONFIG:Debug>:dep>;pthread\""
         );
         assert!(String::from_utf8_lossy(&main).contains(&expected), "{main}");
     }
@@ -207,7 +207,8 @@ fn install_export_writes_relocatable_configuration_files() {
     assert!(main.contains("add_library(\"fmt::headers\" INTERFACE IMPORTED)"));
     assert!(main.contains("add_executable(\"fmt::tool\" IMPORTED)"));
     assert!(main.contains("${_IMPORT_PREFIX}/include;${_IMPORT_PREFIX}/include"));
-    assert!(main.contains("$<$<CONFIG:Release>:fmt::headers>"));
+    // `cmExportFileGeneratorEscape` escapes every `$` of a generator expression.
+    assert!(main.contains(r"\$<\$<CONFIG:Release>:fmt::headers>"));
     assert!(main.contains("${CMAKE_CURRENT_LIST_DIR}/fmt-targets-*.cmake"));
     let no_config = read_text(&host, &out.join("fmt-targets-noconfig.cmake"));
     assert!(

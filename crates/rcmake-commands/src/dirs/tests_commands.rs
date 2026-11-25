@@ -68,6 +68,22 @@ fn add_test(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
     } else {
         parse_test_options(&mut test, args)?;
     }
+    // A test with build dependencies gets a build target, so its name must be a valid
+    // target name (`cmGeneratorExpression::IsValidTargetName`).
+    if !test.build_depends.is_empty()
+        && !name
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"_.:+-".contains(byte))
+    {
+        return Err(CmdError::status(
+            [
+                b"Cannot set build dependencies for a test with NAME \"".as_slice(),
+                name,
+                b"\" which is not a valid target name.",
+            ]
+            .concat(),
+        ));
+    }
     let model = cx.project();
     if let Some(id) = model.find_test(test.dir, name) {
         if let Some(existing) = model.test_mut(id).filter(|t| t.old_style && old_style) {
@@ -207,7 +223,7 @@ fn set_tests_properties(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
                 MessageKind::Error,
                 Effect::SetError,
                 None,
-                "Error after keyword \"DIRECTORY\":\n  missing required value".into(),
+                "Error after keyword \"DIRECTORY\":\n  missing required value\n".into(),
             );
             return Ok(Flow::Normal);
         }

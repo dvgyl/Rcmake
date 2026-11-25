@@ -12,7 +12,7 @@
 
 use rcmake_base::BString;
 
-use crate::{DiagCategory, Diagnostic, FrameKind, Location, MessageKind};
+use crate::{DiagCategory, Diagnostic, Frame, FrameKind, Location, MessageKind};
 
 /// Options controlling terminal rendering of a [`Diagnostic`].
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -112,7 +112,7 @@ pub fn render(diag: &Diagnostic, opts: &RenderOptions) -> BString {
                 format_paragraphs(diag.body.as_slice(), 2, opts.wrap_width).as_slice(),
             );
 
-            let callers: Vec<_> = frames.collect();
+            let callers = printed_callers(top, frames);
             if !callers.is_empty() {
                 out.extend_from_slice(b"Call Stack (most recent call first):\n");
                 for frame in callers {
@@ -139,6 +139,25 @@ pub fn render(diag: &Diagnostic, opts: &RenderOptions) -> BString {
     }
 
     BString::from(out)
+}
+
+/// Select the caller frames that `cmMessenger::PrintCallStack` prints. A frame
+/// without a command name (a file frame) is skipped when the frame printed before
+/// it is in the same file, because that frame already gives a more specific line.
+fn printed_callers<'a>(top: &'a Frame, frames: impl Iterator<Item = &'a Frame>) -> Vec<&'a Frame> {
+    let mut last_file: &[u8] = top.file.as_ref();
+    let mut callers = Vec::new();
+    for frame in frames {
+        if frame.name.is_none()
+            && frame.kind != FrameKind::Deferred
+            && frame.file.as_ref() == last_file
+        {
+            continue;
+        }
+        last_file = frame.file.as_ref();
+        callers.push(frame);
+    }
+    callers
 }
 
 fn append_footer_and_trailer(diag: &Diagnostic, out: &mut Vec<u8>) {
@@ -451,6 +470,68 @@ mod tests {
         assert_eq!(
             render(&d, &RenderOptions::default()),
             BString::from("CMake Error: Not a file: /tmp/missing.cmake\n")
+        );
+    }
+
+    fn frame(file: &str, line: u32, name: Option<&str>, kind: FrameKind) -> Frame {
+        Frame {
+            file: Arc::from(file.as_bytes()),
+            line,
+            name: name.map(|n| Arc::from(n.as_bytes())),
+            kind,
+        }
+    }
+
+    #[test]
+    fn call_stack_skips_file_frames_like_cmake_print_call_stack() {
+        let root = if cfg!(windows) { "C:/work" } else { "/work" };
+        let lists = format!("{root}/CMakeLists.txt");
+        let inc = format!("{root}/inc.cmake");
+        let other = format!("{root}/other.cmake");
+        let opts = RenderOptions {
+            relative_base: Some(BString::from(root)),
+            ..RenderOptions::default()
+        };
+        let diag = |bt: Backtrace| Diagnostic {
+            annotations: None,
+            kind: MessageKind::Error,
+            effect: crate::Effect::None,
+            category: None,
+            policy: None,
+            location: Location::Backtrace(bt),
+            body: BString::from("Body."),
+        };
+        // The file frame below a command in the same file adds nothing.
+        let included = Backtrace::default()
+            .push(frame(&lists, 0, None, FrameKind::ModuleInclude))
+            .push(frame(&lists, 3, Some("include"), FrameKind::Command))
+            .push(frame(&inc, 0, None, FrameKind::ModuleInclude))
+            .push(frame(
+                &inc,
+                2,
+                Some("add_custom_target"),
+                FrameKind::Command,
+            ));
+        assert_eq!(
+            render(&diag(included), &opts),
+            BString::from(
+                "CMake Error at inc.cmake:2 (add_custom_target):\n  Body.\nCall Stack (most recent call first):\n  CMakeLists.txt:3 (include)\n\n\n"
+            )
+        );
+        // A file frame of another file is printed.
+        let foreign = Backtrace::default()
+            .push(frame(&other, 0, None, FrameKind::ModuleInclude))
+            .push(frame(
+                &inc,
+                2,
+                Some("add_custom_target"),
+                FrameKind::Command,
+            ));
+        assert_eq!(
+            render(&diag(foreign), &opts),
+            BString::from(
+                "CMake Error at inc.cmake:2 (add_custom_target):\n  Body.\nCall Stack (most recent call first):\n  other.cmake\n\n\n"
+            )
         );
     }
 }

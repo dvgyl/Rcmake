@@ -19,6 +19,13 @@ pub(super) fn parse(
             );
             opts.ignore_link_warning_as_error = true;
         }
+        b"--compile-no-warning-as-error" if arg.inline.is_none() => {
+            out(
+                host,
+                "Ignoring COMPILE_WARNING_AS_ERROR target property and CMAKE_COMPILE_WARNING_AS_ERROR variable.\n",
+            );
+            opts.ignore_compile_warning_as_error = true;
+        }
         b"--log-context" => opts.log_context = true,
         b"--log-level" | b"--loglevel" => {
             let invalid = format!(

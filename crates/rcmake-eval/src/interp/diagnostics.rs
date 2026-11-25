@@ -13,7 +13,6 @@ use rcmake_host::{Stream, path::to_native};
 use rcmake_model::DirId;
 use rcmake_syntax::CommandInvocation;
 
-use crate::util::cat;
 use crate::{Interp, LogLevel};
 
 struct EditSuggestions {
@@ -301,25 +300,7 @@ impl Interp {
 
     /// `cmPolicies::GetPolicyWarning`.
     pub(crate) fn policy_warning_text(id: PolicyId) -> BString {
-        let summary = if id == PolicyId::new(82) {
-            b"Install rules from add_subdirectory() are interleaved with those in caller.".to_vec()
-        } else if id == PolicyId::new(218) {
-            b"The CMAKE_WARN_DEPRECATED and CMAKE_ERROR_DEPRECATED variables are ignored.".to_vec()
-        } else {
-            id.info()
-                .map(|i| crate::util::replace_all(i.summary.as_bytes(), b"``", b""))
-                .unwrap_or_default()
-        };
-        let name = id.to_string();
-        cat(&[
-            b"Policy ",
-            name.as_bytes(),
-            b" is not set: ",
-            &summary,
-            b"  Run \"cmake --help-policy ",
-            name.as_bytes(),
-            b"\" for policy details.  Use the cmake_policy command to set the policy and suppress this warning.",
-        ])
+        BString::from(id.warning_text())
     }
 
     pub(crate) fn issue_policy_warning(&mut self, id: PolicyId, preface: &[u8], postface: &[u8]) {

@@ -1,12 +1,9 @@
 use std::collections::BTreeMap;
-use std::io::ErrorKind;
 
-use rcmake_base::BString;
+use rcmake_base::{BString, list};
 use rcmake_diag::{Effect, MessageKind};
 use rcmake_eval::{CmdError, CmdResult, Cx, Flow};
 use rcmake_expr::ExpandedArg;
-use rcmake_host::{WriteMode, path};
-use rcmake_model::DirId;
 
 use super::values;
 
@@ -80,20 +77,27 @@ pub(super) fn query(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
     if files.is_empty() {
         return Ok(Flow::Normal);
     }
-    let root = &cx.project().dir(DirId::ROOT).binary_dir;
-    let directory = path::to_native(root).join(".cmake/api/v1/query/client-rcmake");
-    let host = cx.host();
-    host.create_dir_all(&directory)
-        .map_err(|error| CmdError::status(error.to_string()))?;
+    // CMake keeps project queries in memory (`cmFileAPI::AddProjectQuery`). The File
+    // API writer answers them as shared queries without query files on disk.
+    let props = &mut cx.global().props;
+    let mut queries = props
+        .get(PROJECT_QUERIES)
+        .map(|value| list::split(value, list::Empty::Drop))
+        .unwrap_or_default();
     for name in files {
-        if let Err(error) = host.write(&directory.join(name), b"", WriteMode::CreateNew)
-            && error.kind != ErrorKind::AlreadyExists
+        if !queries
+            .iter()
+            .any(|query| query.as_slice() == name.as_bytes())
         {
-            return Err(CmdError::status(error.to_string()));
+            queries.push(name.into());
         }
     }
+    props.set(PROJECT_QUERIES.into(), list::join(queries));
     Ok(Flow::Normal)
 }
+
+/// Global property that lists the `cmake_file_api(QUERY)` object names.
+const PROJECT_QUERIES: &[u8] = b"_RCMAKE_FILE_API_PROJECT_QUERIES";
 
 fn query_files(cx: &mut Cx<'_>, mut args: &[&[u8]]) -> Result<Vec<&'static str>, CmdError> {
     let mut version = b"".as_slice();

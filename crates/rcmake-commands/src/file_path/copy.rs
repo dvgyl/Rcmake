@@ -311,6 +311,8 @@ pub(super) fn copy_entry(
                     .as_ref()
                     .is_some_and(|entry| entry.kind == FileKind::Dir)
             {
+                // `cmFileCopier::InstallSymlink` reports the copy before it fails.
+                observe(target, false, false);
                 return Err(error(format!(
                     "INSTALL cannot duplicate symlink\n\n  {}\n\nat\n\n  {}\n\nbecause: A directory already exists at that location",
                     source.display(),

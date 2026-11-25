@@ -76,6 +76,9 @@ impl Interp {
         };
         let read = match self.parse_file(abs) {
             Some(code) => {
+                if directory {
+                    self.inject_project_command(&code, abs);
+                }
                 let r = self.run_listfile_body(&code, abs, directory);
                 if let Ok(Flow::Return {
                     propagate: Some(names),
@@ -85,6 +88,7 @@ impl Interp {
                 }
                 if directory {
                     self.run_deferred(abs);
+                    self.add_user_configure_depends();
                 }
                 true
             }
@@ -101,6 +105,38 @@ impl Interp {
         self.pop_snapshot(report);
         self.pop_file_frame(saved_bt);
         read
+    }
+
+    /// `cmMakefile::Configure`: when the top-level `CMakeLists.txt` has no `project()`
+    /// call at all, warn and run `project(Project)` before its first command.
+    fn inject_project_command(&mut self, code: &crate::code::Code, abs: &[u8]) {
+        if !self.inject_project
+            || self.current_dir_id() != DirId::ROOT
+            || code
+                .cmds
+                .iter()
+                .any(|cmd| cmd.lower.as_slice() == b"project")
+        {
+            return;
+        }
+        self.issue_at(
+            MessageKind::AuthorWarning,
+            Effect::None,
+            Some(DiagCategory::Author),
+            None,
+            Location::FileLine {
+                file: abs.into(),
+                line: 0,
+            },
+            "No project() command is present.  The top-level CMakeLists.txt file must contain a literal, direct call to the project() command.  Add a line of code such as\n  project(ProjectName)\nnear the top of the file, but after cmake_minimum_required().\nCMake is pretending there is a \"project(Project)\" command on the first line.".into(),
+            false,
+        );
+        let injected = b"project(Project __CMAKE_INJECTED_PROJECT_COMMAND__)\n";
+        if let Some(injected) =
+            self.parse_source(abs, injected, rcmake_diag::source::SourceKind::VirtualEval)
+        {
+            let _ = self.run_code(&injected, 0, injected.len(), super::BodyMode::File);
+        }
     }
 
     /// Start of a directory listfile: use `CMAKE_POLICY_DEFAULT_CMP0198` when the
@@ -343,6 +379,26 @@ impl Interp {
     }
 
     /// Record a listfile read in the current directory (`cmMakefile::ListFiles`).
+    /// `cmMakefile::AddCMakeDependFilesFromUser`: the `CMAKE_CONFIGURE_DEPENDS` directory
+    /// property names more files whose change makes the build system re-run CMake.
+    fn add_user_configure_depends(&mut self) {
+        let id = self.current_dir_id();
+        let Some(value) = self
+            .project
+            .dir(id)
+            .props
+            .get(b"CMAKE_CONFIGURE_DEPENDS")
+            .cloned()
+        else {
+            return;
+        };
+        let base = self.current_source_dir_bytes();
+        for dep in rcmake_base::list::split(&value, rcmake_base::list::Empty::Drop) {
+            let abs = collapse_full_path(&dep, &base);
+            self.record_list_file(&abs);
+        }
+    }
+
     pub(super) fn record_list_file(&mut self, abs: &[u8]) {
         let id = self.current_dir_id();
         let files = &mut self.project.dir_mut(id).listfiles;

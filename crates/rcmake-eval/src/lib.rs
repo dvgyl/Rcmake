@@ -37,6 +37,7 @@ mod builtins;
 mod code;
 mod configure_log;
 mod cx;
+mod cx_messages;
 mod env;
 mod file_lock;
 mod flow;
@@ -452,6 +453,8 @@ pub struct Interp {
     /// The command being executed issued an error (`SetNestedError`).
     cmd_failed: bool,
     cur_line: u32,
+    /// Inject `project(Project)` into a top-level listfile without `project()`.
+    inject_project: bool,
     sources: SourceMap,
     regex_cache: RegexCache,
     checks: Vec<BString>,
@@ -572,6 +575,7 @@ impl Interp {
             fatal: false,
             cmd_failed: false,
             cur_line: 0,
+            inject_project: false,
             sources: SourceMap::default(),
             regex_cache: RegexCache::default(),
             checks: Vec::new(),
@@ -615,6 +619,12 @@ impl Interp {
     /// Execution context for embedding code (CLI setup, presets, tests).
     pub fn cx(&mut self) -> Cx<'_> {
         Cx { interp: self }
+    }
+
+    /// Make a top-level `CMakeLists.txt` without `project()` warn and run an implicit
+    /// `project(Project)` first, as the `cmake` tool does (`cmMakefile::Configure`).
+    pub fn set_project_injection(&mut self, inject: bool) {
+        self.inject_project = inject;
     }
 
     /// Set the `--log-level` override (`None` uses `CMAKE_MESSAGE_LOG_LEVEL`).

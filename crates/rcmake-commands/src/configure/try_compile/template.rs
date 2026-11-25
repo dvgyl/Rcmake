@@ -239,11 +239,7 @@ fn canonical_with_missing_tail(host: &dyn Host, path: &Path) -> Option<std::path
         match host.canonicalize(ancestor) {
             Ok(resolved) => {
                 let suffix = path.strip_prefix(ancestor).ok()?;
-                return Some(if suffix.as_os_str().is_empty() {
-                    resolved
-                } else {
-                    resolved.join(suffix)
-                });
+                return Some(join_like(&resolved, suffix));
             }
             Err(error) if error.kind == ErrorKind::NotFound => {
                 // A dangling link can resolve outside its spelling, so do not
@@ -259,6 +255,25 @@ fn canonical_with_missing_tail(host: &dyn Host, path: &Path) -> Option<std::path
         }
     }
     None
+}
+
+/// Append `suffix` to `base` with the separator that `base` uses. `Path::join`
+/// adds `\` on Windows, so a `/`-form canonical path would get mixed separators
+/// and stop matching the spelling of an existing directory.
+fn join_like(base: &Path, suffix: &Path) -> std::path::PathBuf {
+    let mut bytes = path::from_native(base).to_vec();
+    let separator = if cfg!(windows) && bytes.contains(&b'\\') {
+        b'\\'
+    } else {
+        b'/'
+    };
+    for part in suffix.components() {
+        if !bytes.ends_with(b"/") && !bytes.ends_with(b"\\") {
+            bytes.push(separator);
+        }
+        bytes.extend_from_slice(&path::from_native(Path::new(part.as_os_str())));
+    }
+    path::to_native(&bytes)
 }
 
 fn valid_binding(path: &Path) -> bool {
@@ -780,6 +795,37 @@ mod windows_tests {
         let template = Templated::capture(input, &bindings).ok_or("Cannot capture output.")?;
         assert!(round_trip_verify(&template, &bindings, input));
         assert!(template.has_leak(&bindings));
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod canonical_tests {
+    use super::*;
+    use rcmake_host::PureHost;
+
+    #[test]
+    fn missing_scratch_keeps_the_canonical_separator_style() -> Result<(), String> {
+        let root = Path::new(if cfg!(windows) { "C:/work" } else { "/work" });
+        let host = PureHost::default();
+        host.create_dir_all(root).map_err(|e| e.to_string())?;
+        let bindings = PathBindings::new(
+            &root.join("scratch"),
+            &root.join("build"),
+            &root.join("source"),
+            &root.join("cmake"),
+        )
+        .ok_or("Missing bindings.")?
+        .with_canonical(&host);
+        let expected = format!("{}/scratch", root.display());
+        assert_eq!(
+            bindings.0.get(&Token::CanonicalScratch).map(Vec::as_slice),
+            Some(expected.as_bytes())
+        );
+        assert_eq!(
+            bindings.0.get(&Token::Scratch).map(Vec::as_slice),
+            Some(expected.as_bytes())
+        );
         Ok(())
     }
 }

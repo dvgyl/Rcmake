@@ -24,6 +24,11 @@ pub(super) fn project(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
             "PROJECT called with incorrect number of arguments",
         ));
     };
+    // `cmMakefile::Configure` adds this marker to the `project()` call that it injects.
+    let tail = match tail {
+        [b"__CMAKE_INJECTED_PROJECT_COMMAND__", rest @ ..] => rest,
+        _ => tail,
+    };
     let top_level = cx.current_dir_id() == DirId::ROOT;
     if name == &b"LANGUAGES".as_slice() || is_metadata(name) {
         author_warning(

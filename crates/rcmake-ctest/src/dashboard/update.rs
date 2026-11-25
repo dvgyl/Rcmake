@@ -163,11 +163,9 @@ fn collect(
             Err("Update command failed.".to_owned())
         }
     };
+    // An unrecognized source tree uses the generic `cmCTestVC`, which does not run the
+    // update command (`* Unknown VCS tool, not updating!`).
     if !is_git {
-        if !version_only {
-            report.command = program.into();
-            run(Vec::new())?;
-        }
         return Ok(());
     }
     let revision = || -> Result<BString, String> {

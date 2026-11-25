@@ -305,6 +305,9 @@ fn run_cmake(
         ParseResult::Run(opts) => *opts,
         ParseResult::Exit(code) => return code,
     };
+    if opts.find_package && opts.script.is_none() {
+        return run_find_package(argv, opts, host);
+    }
     if let Some(script) = opts.script.take() {
         let mut interp = new_interp(argv, &opts, RunMode::Script, Arc::clone(&host));
         let profiler = opts
@@ -352,19 +355,99 @@ fn run_cmake(
         }
         return outcome.exit_code;
     }
-    let ignore_key = "_RCMAKE_IGNORE_LINK_WARNING_AS_ERROR";
-    if opts.ignore_link_warning_as_error {
-        opts.cache_edits
-            .push(options::CacheEdit::Define(rcmake_eval::CacheDefine {
-                name: ignore_key.into(),
-                ty: Some(CacheType::Internal),
-                value: "ON".into(),
-            }));
-    } else if !opts.regenerate_during_build {
-        opts.cache_edits
-            .push(options::CacheEdit::Remove(ignore_key.into()));
+    for (ignore_key, ignore) in [
+        (
+            "_RCMAKE_IGNORE_LINK_WARNING_AS_ERROR",
+            opts.ignore_link_warning_as_error,
+        ),
+        (
+            "_RCMAKE_NO_WARNING_AS_ERROR",
+            opts.ignore_compile_warning_as_error,
+        ),
+    ] {
+        if ignore {
+            opts.cache_edits
+                .push(options::CacheEdit::Define(rcmake_eval::CacheDefine {
+                    name: ignore_key.into(),
+                    ty: Some(CacheType::Internal),
+                    value: "ON".into(),
+                }));
+        } else if !opts.regenerate_during_build {
+            opts.cache_edits
+                .push(options::CacheEdit::Remove(ignore_key.into()));
+        }
     }
     configure::run(argv, opts, host)
+}
+
+/// `cmake --find-package` (`cmake::FindPackage`): run `CMakeFindPackageMode.cmake`
+/// with the `FIND_PACKAGE` role and print the result for the requested `MODE`.
+fn run_find_package(argv: &[BString], opts: Options, host: Arc<dyn Host>) -> i32 {
+    let (_, cmake_root) = rcmake_host::discover_cmake_root(host.as_ref(), argv.first());
+    let script = cmake_root
+        .unwrap_or_default()
+        .join("Modules")
+        .join("CMakeFindPackageMode.cmake");
+    let mut interp = new_interp(argv, &opts, RunMode::Script, Arc::clone(&host));
+    for edit in opts.cache_edits {
+        if let options::CacheEdit::Define(def) = edit {
+            cache::apply(interp.cx().cache(), def);
+        }
+    }
+    interp
+        .cx()
+        .global()
+        .props
+        .set("_RCMAKE_CMAKE_ROLE".into(), "FIND_PACKAGE".into());
+    let outcome = interp.run_script(&script);
+    if outcome.exit_code != 0 {
+        return outcome.exit_code;
+    }
+    let cx = interp.cx();
+    let name = cx.var_or_empty(b"NAME");
+    let mode = cx.var_or_empty(b"MODE");
+    let found = rcmake_base::truth::is_on(&cx.var_or_empty(b"PACKAGE_FOUND"));
+    let quiet = rcmake_base::truth::is_on(&cx.var_or_empty(b"PACKAGE_QUIET"));
+    let mut report = BString::default();
+    if !found {
+        if !quiet {
+            report = [name.as_slice(), b" not found.\n"].concat().into();
+        }
+    } else if mode.as_slice() == b"EXIST" {
+        if !quiet {
+            report = [name.as_slice(), b" found.\n"].concat().into();
+        }
+    } else if mode.as_slice() == b"COMPILE" {
+        let includes = cx.var_or_empty(b"PACKAGE_INCLUDE_DIRS");
+        let mut flags = rcmake_base::list::split(&includes, rcmake_base::list::Empty::Drop)
+            .into_iter()
+            .map(|dir| [b"-I".as_slice(), dir.as_slice()].concat())
+            .collect::<Vec<_>>()
+            .join(&b' ');
+        flags.push(b' ');
+        flags.extend_from_slice(&cx.var_or_empty(b"PACKAGE_DEFINITIONS"));
+        flags.push(b'\n');
+        report = flags.into();
+    } else if mode.as_slice() == b"LINK" {
+        let libraries = cx.var_or_empty(b"PACKAGE_LIBRARIES");
+        let mut flags = rcmake_base::list::split(&libraries, rcmake_base::list::Empty::Drop)
+            .into_iter()
+            .map(|library| library.to_vec())
+            .collect::<Vec<_>>()
+            .join(&b' ');
+        flags.push(b'\n');
+        report = flags.into();
+    }
+    host.write_out(rcmake_host::Stream::Stdout, &report);
+    if found {
+        0
+    } else {
+        emit_cli_error(
+            host.as_ref(),
+            "Run 'cmake --help' for all supported options.",
+        );
+        1
+    }
 }
 
 fn new_interp(argv: &[BString], opts: &Options, mode: RunMode, host: Arc<dyn Host>) -> Interp {
@@ -705,7 +788,7 @@ mod tests {
         let host = crate::driver_tests::project_host();
         host.seed_file(
             Path::new("/work/CMakeLists.txt"),
-            b"message(STATUS \"value=${VALUE}\")\n",
+            b"cmake_minimum_required(VERSION 3.10)\nproject(P NONE)\nmessage(STATUS \"value=${VALUE}\")\n",
         )
         .unwrap();
         let invoke = |args: &[&str]| {

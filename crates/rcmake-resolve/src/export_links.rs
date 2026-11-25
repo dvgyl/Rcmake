@@ -22,15 +22,25 @@ pub(crate) struct ExportPlacement {
 
 pub(crate) type ExportCatalog = BTreeMap<TargetId, Vec<ExportPlacement>>;
 
+/// The export that [`qualify`] writes: its set name, namespace, and mode.
+#[derive(Clone, Copy)]
+pub(crate) struct ExportScope<'a> {
+    pub(crate) set: &'a [u8],
+    pub(crate) namespace: &'a [u8],
+    pub(crate) mode: PreprocessMode,
+}
+
 pub(crate) fn qualify(
     model: &ProjectModel,
     id: TargetId,
     members: &[TargetId],
-    namespace: &[u8],
-    mode: PreprocessMode,
+    scope: ExportScope<'_>,
     catalog: &ExportCatalog,
     exported: &mut ExportedTarget,
 ) -> Result<IndexSet<BString>, ResolveError> {
+    let ExportScope {
+        namespace, mode, ..
+    } = scope;
     let mut packages = IndexSet::new();
     let Some(target) = model.target(id) else {
         return Ok(packages);
@@ -100,7 +110,7 @@ pub(crate) fn qualify(
                         model,
                         target,
                         dependency,
-                        mode,
+                        scope,
                         "that is not in any export set.".into(),
                     ));
                 };
@@ -134,7 +144,7 @@ pub(crate) fn qualify(
                         model,
                         target,
                         dependency,
-                        mode,
+                        scope,
                         format!(
                             "that is not in this export set, but {scenario}: {files}.\n\nAn exported target cannot depend upon another target which is exported in more than one export set or with more than one namespace.  Consider consolidating the exports of the \"{}\" target to a single export.",
                             dependency.name
@@ -214,13 +224,16 @@ fn closure_error(
     model: &ProjectModel,
     target: &Target,
     dependency: &Target,
-    mode: PreprocessMode,
+    scope: ExportScope<'_>,
     reason: String,
 ) -> ResolveError {
-    let command = if mode == PreprocessMode::Install {
-        "install(EXPORT)"
+    let command = if scope.mode == PreprocessMode::Install {
+        format!(
+            "install(EXPORT \"{}\" ...) includes",
+            String::from_utf8_lossy(scope.set)
+        )
     } else {
-        "export"
+        "export called with".to_owned()
     };
     let diagnostic = rcmake_diag::Diagnostic {
         annotations: None,
@@ -230,7 +243,7 @@ fn closure_error(
         policy: None,
         location: crate::cxx_modules::generation_location(model, target),
         body: format!(
-            "{command} called with target \"{}\" which requires target \"{}\" {reason}",
+            "{command} target \"{}\" which requires target \"{}\" {reason}",
             target.name, dependency.name
         )
         .into(),
@@ -338,8 +351,11 @@ fn expands_plain_cps_package_links_in_cmake_exports() -> Result<(), Box<dyn std:
             &model,
             id,
             &[id],
-            b"",
-            mode,
+            ExportScope {
+                set: b"",
+                namespace: b"",
+                mode,
+            },
             &ExportCatalog::new(),
             &mut exported,
         )?;

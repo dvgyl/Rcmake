@@ -55,7 +55,12 @@ impl Interp {
         self.parse_source(abs, &data, SourceKind::File)
     }
 
-    fn parse_source(&mut self, path: &[u8], data: &[u8], kind: SourceKind) -> Option<Code> {
+    pub(crate) fn parse_source(
+        &mut self,
+        path: &[u8],
+        data: &[u8],
+        kind: SourceKind,
+    ) -> Option<Code> {
         let text: Arc<[u8]> = Arc::from(data);
         let id = self
             .sources
@@ -206,16 +211,18 @@ impl Interp {
     /// `cmake_language(EVAL CODE ...)`: parse `src` as a virtual listfile named
     /// `<file>:<line>:EVAL` and run it in the current scope.
     pub(crate) fn eval_code(&mut self, src: &[u8]) -> CmdResult {
-        let current = self
-            .lookup_var(b"CMAKE_CURRENT_LIST_FILE")
-            .cloned()
-            .unwrap_or_default();
-        let name = cat(&[
-            &current,
-            b":",
-            self.cur_line.to_string().as_bytes(),
-            b":EVAL",
-        ]);
+        // `cmMakefile::GetBacktrace().Top()` names the file that holds the call. Inside a
+        // function this differs from `CMAKE_CURRENT_LIST_FILE` (the caller's file).
+        let (current, line) = match self.bt.top() {
+            Some(frame) => (frame.file.to_vec(), frame.line),
+            None => (
+                self.lookup_var(b"CMAKE_CURRENT_LIST_FILE")
+                    .map(|value| value.to_vec())
+                    .unwrap_or_default(),
+                self.cur_line,
+            ),
+        };
+        let name = cat(&[&current, b":", line.to_string().as_bytes(), b":EVAL"]);
         let base = self.current_source_dir_bytes();
         let abs = collapse_full_path(&name, &base);
         let saved_bt = self.push_file_frame(&abs);

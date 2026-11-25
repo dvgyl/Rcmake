@@ -308,9 +308,9 @@ fn offline_local_archive_uses_verified_bytes_when_the_origin_is_missing() -> Tes
     let origin = absolute("origin/payload");
     host.seed_file(&origin, b"abc")?;
     host.set_command_handler(|_, _, _| Err(HostError::unsupported("Unexpected process.")))?;
-    // A drive-letter path needs a third slash: `file:///C:/...`.
-    let slash = if cfg!(windows) { "/" } else { "" };
-    let url = format!("file://{slash}{}", path::from_native_cmake(&origin));
+    // `ExternalProject` removes the `file://` prefix and uses the rest as the path.
+    // A Windows path therefore gives `file://C:/...`, not `file:///C:/...`.
+    let url = format!("file://{}", path::from_native_cmake(&origin));
     let pin = "URL_HASH SHA256=ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
     let script =
         |dir: &str| declaration(&absolute(dir), pin).replace("https://example.org/payload", &url);

@@ -524,7 +524,7 @@ fn regeneration_flag_uses_configure_and_view_skips_generation() {
     let host = project_host();
     host.seed_file(
         Path::new("/work/CMakeLists.txt"),
-        b"message(STATUS \"evaluated\")\n",
+        b"cmake_minimum_required(VERSION 3.10)\nproject(P NONE)\nmessage(STATUS \"evaluated\")\n",
     )
     .unwrap();
     assert_eq!(
@@ -773,4 +773,63 @@ fn strict_hermetic_configure_exits_on_undeclared_read() -> rcmake_host::HostResu
     let output = host.stream_bytes(Stream::Stderr).to_string();
     assert!(output.contains("RCMAKE_HERMETIC_ENV"), "{output}");
     Ok(())
+}
+
+#[test]
+fn find_package_mode_runs_the_module_with_the_find_package_role() {
+    let host = project_host();
+    host.seed_file(
+        Path::new("/usr/local/share/cmake-4.5/Modules/CMakeFindPackageMode.cmake"),
+        b"get_property(role GLOBAL PROPERTY CMAKE_ROLE)\nif(role STREQUAL \"FIND_PACKAGE\" AND NAME STREQUAL \"Found\")\n  set(PACKAGE_FOUND TRUE)\nendif()\n",
+    )
+    .unwrap();
+    let args = ["cmake", "--find-package", "-DNAME=Found", "-DMODE=EXIST"];
+    assert_eq!(invoke(&host, &args), 0);
+    assert_eq!(host.stream_bytes(Stream::Stdout), b"Found found.\n");
+    let host = project_host();
+    host.seed_file(
+        Path::new("/usr/local/share/cmake-4.5/Modules/CMakeFindPackageMode.cmake"),
+        b"set(PACKAGE_FOUND FALSE)\n",
+    )
+    .unwrap();
+    let args = ["cmake", "--find-package", "-DNAME=Missing", "-DMODE=EXIST"];
+    assert_eq!(invoke(&host, &args), 1);
+    assert_eq!(host.stream_bytes(Stream::Stdout), b"Missing not found.\n");
+    assert_eq!(
+        host.stream_bytes(Stream::Stderr),
+        b"CMake Error: Run 'cmake --help' for all supported options.\n"
+    );
+}
+
+#[test]
+fn compile_no_warning_as_error_records_the_ignore_entry() {
+    let host = project_host();
+    host.seed_file(
+        Path::new("/work/CMakeLists.txt"),
+        b"cmake_minimum_required(VERSION 3.10)\nproject(example NONE)\n",
+    )
+    .unwrap();
+    let args = [
+        "cmake",
+        "-S",
+        ".",
+        "-B",
+        "out",
+        "--compile-no-warning-as-error",
+    ];
+    assert_eq!(invoke(&host, &args), 0);
+    assert!(host.stream_bytes(Stream::Stdout).starts_with(
+        b"Ignoring COMPILE_WARNING_AS_ERROR target property and CMAKE_COMPILE_WARNING_AS_ERROR variable.\n"
+    ));
+    let cache = host
+        .read(
+            Path::new("/work/out/CMakeCache.txt"),
+            rcmake_host::ReadRange::All { limit: 1 << 20 },
+        )
+        .unwrap();
+    assert!(
+        cache
+            .windows(b"_RCMAKE_NO_WARNING_AS_ERROR:INTERNAL=ON".len())
+            .any(|window| window == b"_RCMAKE_NO_WARNING_AS_ERROR:INTERNAL=ON")
+    );
 }

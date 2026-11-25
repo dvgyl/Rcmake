@@ -38,6 +38,8 @@ pub(crate) struct Options {
     pub check_system_vars: bool,
     pub warning_flags: Vec<BString>,
     pub ignore_link_warning_as_error: bool,
+    /// `--compile-no-warning-as-error`.
+    pub ignore_compile_warning_as_error: bool,
     pub regenerate_during_build: bool,
     pub generator: Option<BString>,
     pub architecture: Option<BString>,
@@ -51,6 +53,8 @@ pub(crate) struct Options {
     pub debug_find_packages: Vec<BString>,
     pub sarif: Option<PathBuf>,
     pub script: Option<PathBuf>,
+    /// `--find-package`: run `CMakeFindPackageMode.cmake` (find-package tool mode).
+    pub find_package: bool,
     pub preset: Option<BString>,
     pub presets_file: Option<PathBuf>,
     pub list_presets: Option<Listing>,
@@ -86,6 +90,8 @@ const LONG_OPTIONS: &[&[u8]] = &[
     b"--fresh",
     b"--regenerate-during-build",
     b"--link-no-warning-as-error",
+    b"--compile-no-warning-as-error",
+    b"--find-package",
     b"--preset",
     b"--presets-file",
     b"--list-presets",
@@ -188,6 +194,10 @@ fn parse_args(
         }
         let mut arg = Argument::new(raw, &mut iter);
         if opts.script.is_some() && !script_mode_flag(arg.flag) {
+            continue;
+        }
+        if arg.flag == b"--find-package" && arg.inline.is_none() {
+            opts.find_package = true;
             continue;
         }
         if arg.flag == b"--print-config-dir" {

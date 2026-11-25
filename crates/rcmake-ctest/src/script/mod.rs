@@ -223,6 +223,9 @@ fn execute_script(
         interp.set_log_level(Some(LogLevel::Notice));
     }
     let mut cx = interp.cx();
+    cx.global()
+        .props
+        .set(b"_RCMAKE_CMAKE_ROLE".as_slice().into(), "CTEST".into());
     cx.set_var(b"CMAKE_CTEST_COMMAND", settings.ctest.clone());
     cx.set_var(
         b"CTEST_SCRIPT_DIRECTORY",
@@ -727,12 +730,12 @@ fn ctest_empty_binary_directory(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdRes
         .metadata(&dir.join("CMakeCache.txt"), Follow::Yes)
         .is_ok_and(|meta| meta.kind == FileKind::File)
     {
-        cx.issue(
+        cx.issue_and_continue(
             rcmake_diag::MessageKind::Error,
             rcmake_diag::Effect::SetError,
             None,
             format!(
-                "Did not remove the binary directory:\n\n  {}\n\nbecause:\n\n  path does not contain an existing CMakeCache.txt file",
+                "Did not remove the binary directory:\n {}\nbecause:\n path does not contain an existing CMakeCache.txt file",
                 dir.display()
             )
             .into(),

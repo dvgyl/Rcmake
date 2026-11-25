@@ -6,6 +6,7 @@ use rcmake_base::version::Version;
 use thiserror::Error;
 
 use crate::generated_policies::{MAX_POLICY_ID, MAX_REMOVED_OLD_POLICY_ID, POLICIES};
+use crate::policy_warnings::WARNING_SUMMARIES;
 
 /// Identifier for a CMake policy (`CMP0000` through `CMP0226`).
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
@@ -46,6 +47,31 @@ impl PolicyId {
     #[must_use]
     pub fn info(self) -> Option<&'static PolicyInfo> {
         POLICIES.get(usize::from(self.0))
+    }
+
+    /// Summary text that CMake 4.5.1 prints in policy warnings. This is the
+    /// `cmPolicies.h` description, which differs from the help title
+    /// ([`PolicyInfo::summary`]) for many policies.
+    #[must_use]
+    pub fn warning_summary(self) -> Option<&'static str> {
+        WARNING_SUMMARIES
+            .binary_search_by_key(&self.0, |&(number, _)| number)
+            .ok()
+            .and_then(|index| WARNING_SUMMARIES.get(index))
+            .map(|&(_, summary)| summary)
+    }
+
+    /// Full `Policy CMPxxxx is not set: ...` text (`cmPolicies::GetPolicyWarning`).
+    #[must_use]
+    pub fn warning_text(self) -> String {
+        let summary = self
+            .warning_summary()
+            .map(str::to_owned)
+            .or_else(|| self.info().map(|info| info.summary.replace("``", "")))
+            .unwrap_or_default();
+        format!(
+            "Policy {self} is not set: {summary}  Run \"cmake --help-policy {self}\" for policy details.  Use the cmake_policy command to set the policy and suppress this warning."
+        )
     }
 }
 
@@ -184,6 +210,24 @@ fn bit_pos(id: PolicyId) -> Option<(usize, u64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn warning_text_uses_runtime_summary() {
+        assert_eq!(
+            PolicyId::new(76).warning_text(),
+            "Policy CMP0076 is not set: target_sources() command converts relative paths to absolute.  Run \"cmake --help-policy CMP0076\" for policy details.  Use the cmake_policy command to set the policy and suppress this warning."
+        );
+        assert_eq!(
+            PolicyId::new(211).warning_summary(),
+            Some("A file may belong to at most one non-HEADERS file set in a target.")
+        );
+        assert!(
+            WARNING_SUMMARIES
+                .windows(2)
+                .all(|w| matches!(w, [a, b] if a.0 < b.0))
+        );
+        assert_eq!(WARNING_SUMMARIES.len(), usize::from(MAX_POLICY_ID) + 1);
+    }
 
     #[test]
     fn policy_range_and_removed_old() {

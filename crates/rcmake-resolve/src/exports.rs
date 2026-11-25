@@ -137,8 +137,11 @@ pub(crate) fn resolve_exports(
                 model,
                 id,
                 &members.targets,
-                &plan.namespace,
-                PreprocessMode::Install,
+                export_links::ExportScope {
+                    set: &plan.set,
+                    namespace: &plan.namespace,
+                    mode: PreprocessMode::Install,
+                },
                 &install_catalog,
                 &mut target,
             )?);
@@ -193,8 +196,11 @@ pub(crate) fn resolve_exports(
                 model,
                 id,
                 &members,
-                &plan.namespace,
-                PreprocessMode::Build,
+                export_links::ExportScope {
+                    set: &plan.set,
+                    namespace: &plan.namespace,
+                    mode: PreprocessMode::Build,
+                },
                 &build_catalog,
                 &mut target,
             )?);
@@ -824,6 +830,8 @@ fn add_export_property(
                 install_paths.extend(export_property_items(&raw, mode)?);
             }
         }
+        // CMake checks every entry and reports each bad path before it fails.
+        let mut errors = BString::default();
         for item in &mut items {
             if path_property
                 && install_paths.contains(item)
@@ -834,8 +842,15 @@ fn add_export_property(
             }
             *item = rcmake_genex::rewrite_install_prefix(item, b"${_IMPORT_PREFIX}");
             if path_property {
-                interface_paths::validate(model, raw, &key, item)?;
+                match interface_paths::validate(model, raw, &key, item) {
+                    Ok(()) => {}
+                    Err(ResolveError::Message(text)) => errors.extend_from_slice(&text),
+                    Err(error) => return Err(error),
+                }
             }
+        }
+        if !errors.is_empty() {
+            return Err(ResolveError::Message(errors));
         }
     }
     if !items.is_empty() {
@@ -848,7 +863,9 @@ pub(crate) fn export_property_items(
     value: &[u8],
     mode: PreprocessMode,
 ) -> Result<Vec<BString>, ResolveError> {
-    let ast = rcmake_genex::strip(&rcmake_genex::parse(value)?, mode);
+    let mut parsed = rcmake_genex::parse(value)?;
+    drop_build_local(&mut parsed.nodes);
+    let ast = rcmake_genex::strip(&parsed, mode);
     let mut items = Vec::new();
     let mut item = BString::default();
     for node in &ast.nodes {
@@ -874,3 +891,23 @@ pub(crate) fn export_property_items(
     }
     Ok(items)
 }
+
+/// Remove `$<BUILD_LOCAL_INTERFACE:...>` at any depth. Only consumers in the same
+/// build tree see that content, so no export file keeps it.
+fn drop_build_local(nodes: &mut Vec<GenexNode>) {
+    nodes.retain(|node| {
+        !matches!(node, GenexNode::Expr(expr)
+            if render(&expr.identifier).as_slice() == b"BUILD_LOCAL_INTERFACE")
+    });
+    for node in nodes {
+        if let GenexNode::Expr(expr) = node {
+            drop_build_local(&mut expr.identifier);
+            for param in expr.params.iter_mut().flatten() {
+                drop_build_local(param);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests;

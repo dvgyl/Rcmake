@@ -485,9 +485,34 @@ pub(in crate::policy_misc) fn get_cmake(cx: &mut Cx<'_>, args: &[ExpandedArg]) -
         b"VARIABLES" | b"MACROS" | b"CACHE_VARIABLES" => {
             directory_value(cx, dir, &name.value, false)
         }
-        b"COMPONENTS" => Some(list::join(cx.project().install_components())),
+        b"COMPONENTS" => Some(list::join(install_components(cx.project()))),
         _ => global_value(cx, &name.value),
     };
     cx.set_var(&out.value, value.unwrap_or_else(|| "NOTFOUND".into()));
     Ok(Flow::Normal)
+}
+
+/// Components of the install rules that create an install generator. An
+/// `install(TARGETS)` rule that names only `INTERFACE` libraries without file sets
+/// installs nothing, so CMake does not register its component.
+fn install_components(model: &rcmake_model::ProjectModel) -> std::collections::BTreeSet<BString> {
+    model
+        .installs
+        .iter()
+        .filter(|rule| {
+            rule.options.destination.is_some()
+                || !matches!(&rule.kind, rcmake_model::InstallKind::Targets { targets, .. }
+                if targets.iter().all(|&id| model.target(id).is_some_and(|target| {
+                    target.kind == TargetKind::InterfaceLibrary && target.file_sets.is_empty()
+                })))
+        })
+        .map(|rule| match &rule.options.component {
+            Some(component) => component.clone(),
+            None => model
+                .definition(rule.dir, b"CMAKE_INSTALL_DEFAULT_COMPONENT_NAME")
+                .filter(|name| !name.is_empty())
+                .cloned()
+                .unwrap_or_else(|| BString::from("Unspecified")),
+        })
+        .collect()
 }

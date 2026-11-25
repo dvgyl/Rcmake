@@ -140,7 +140,7 @@ fn external_microsoft_project_records_metadata_only_for_visual_studio() -> TestR
 }
 
 #[test]
-fn file_api_writes_client_queries_in_the_root_binary_directory() -> TestResult {
+fn file_api_keeps_project_queries_in_memory() -> TestResult {
     let (host, mut interp) = context(RunMode::Configure);
     host.seed_file(
         Path::new("/work/src/child/CMakeLists.txt"),
@@ -161,10 +161,16 @@ fn file_api_writes_client_queries_in_the_root_binary_directory() -> TestResult {
         0,
     )?;
     let root = "/work/build/.cmake/api/v1/query";
-    for name in ["cache-v2", "codemodel-v2", "cmakeFiles-v1", "toolchains-v1"] {
-        assert!(read(&host, &format!("{root}/client-rcmake/{name}"))?.is_empty());
-    }
+    assert!(read(&host, &format!("{root}/client-rcmake/cache-v2")).is_err());
     assert_eq!(read(&host, &format!("{root}/cache-v2"))?, "existing query");
+    let queries = interp
+        .cx()
+        .global()
+        .props
+        .get(b"_RCMAKE_FILE_API_PROJECT_QUERIES")
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(queries, "codemodel-v2;cache-v2;cmakeFiles-v1;toolchains-v1");
     Ok(())
 }
 

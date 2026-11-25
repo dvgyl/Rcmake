@@ -40,6 +40,7 @@ pub(super) fn apply_environment_defaults(host: &dyn Host, cache: &mut Cache, has
         (b"CMAKE_EXPORT_COMPILE_COMMANDS", CacheType::Bool),
         (b"CMAKE_COLOR_DIAGNOSTICS", CacheType::Bool),
         (b"CMAKE_CROSSCOMPILING_EMULATOR", CacheType::String),
+        (b"CMAKE_DISABLE_PRECOMPILE_HEADERS", CacheType::Bool),
     ] {
         if !has_cache
             && !cache.contains(name)
@@ -51,6 +52,11 @@ pub(super) fn apply_environment_defaults(host: &dyn Host, cache: &mut Cache, has
                 value
             };
             cache::insert(cache, name, value, Some(ty));
+            if name == b"CMAKE_DISABLE_PRECOMPILE_HEADERS"
+                && let Some(entry) = cache.get_mut(name)
+            {
+                entry.help = "Default value for DISABLE_PRECOMPILE_HEADERS of targets.".into();
+            }
         }
         if let Some(entry) = cache.get_mut(name) {
             if entry.ty == CacheType::Uninitialized {

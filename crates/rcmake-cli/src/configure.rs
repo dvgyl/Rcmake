@@ -373,6 +373,7 @@ impl<'a> ConfigureSession<'a> {
             Some(CacheType::Internal),
         );
         interp.set_list_file_name(self.list_file.clone());
+        interp.set_project_injection(true);
         cache::insert(
             interp.cx().cache(),
             HOME_DIR,

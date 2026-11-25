@@ -10,6 +10,9 @@ use crate::{GenError, write_error};
 
 const QUERY_LIMIT: u64 = 4 * 1024 * 1024;
 
+/// Global property that lists the `cmake_file_api(QUERY)` object names.
+const PROJECT_QUERIES: &[u8] = b"_RCMAKE_FILE_API_PROJECT_QUERIES";
+
 impl FileApi<'_, '_> {
     pub(super) fn read_queries(
         &mut self,
@@ -34,6 +37,16 @@ impl FileApi<'_, '_> {
                     self.stateless(&entry.name, &mut tests)?
                 };
                 reply.insert(entry.name, response);
+            }
+        }
+        // `cmake_file_api(QUERY)` project queries have no query files.
+        if let Some(queries) = self.model.global.props.get(PROJECT_QUERIES) {
+            for name in rcmake_base::list::split(queries, rcmake_base::list::Empty::Drop) {
+                query_exists = true;
+                if let std::collections::btree_map::Entry::Vacant(entry) = reply.entry(name) {
+                    let response = self.stateless(entry.key(), &mut tests)?;
+                    entry.insert(response);
+                }
             }
         }
         Ok(query_exists.then_some((reply, tests)))
