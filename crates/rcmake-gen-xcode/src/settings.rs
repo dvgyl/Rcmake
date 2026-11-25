@@ -157,7 +157,8 @@ impl Product {
                 TargetKind::StaticLibrary | TargetKind::ObjectLibrary => {
                     ("library.static", "archive.ar")
                 }
-                TargetKind::ModuleLibrary => ("library.dynamic", "compiled.mach-o.dylib"),
+                // CMake builds a plain module as a tool linked with `-bundle`.
+                TargetKind::ModuleLibrary => ("tool", "compiled.mach-o.executable"),
                 _ => ("library.dynamic", "compiled.mach-o.dylib"),
             },
         }
@@ -478,6 +479,8 @@ impl TargetSettings<'_> {
                     TargetKind::StaticLibrary | TargetKind::ObjectLibrary
                 ) {
                     "STATIC"
+                } else if product.kind == TargetKind::ModuleLibrary {
+                    "BUNDLE"
                 } else {
                     "DYNAMIC"
                 }
@@ -553,7 +556,16 @@ impl TargetSettings<'_> {
                 {
                     unique(&mut frameworks, parent);
                 }
+                if let IdeLinkItem::Target(id) = item
+                    && let Some(product) = self.linked_product(*id)
+                    && matches!(product.bundle, BundleKind::Framework { .. })
+                {
+                    unique(&mut frameworks, product.dir);
+                }
             }
+        }
+        for dir in self.phase_search_paths(true) {
+            unique(&mut frameworks, dir);
         }
         settings.insert(
             "GCC_PREPROCESSOR_DEFINITIONS".into(),
@@ -734,7 +746,18 @@ impl TargetSettings<'_> {
         } else {
             ldflags.splice(0..0, objects.map(|path| xcode_flag(&path)));
         }
-        settings.insert("OTHER_LDFLAGS".into(), flags_with_inherited(&ldflags));
+        // Xcode passes OTHER_LDFLAGS to libtool, which cannot read link libraries.
+        if !matches!(
+            raw.kind,
+            TargetKind::StaticLibrary | TargetKind::ObjectLibrary
+        ) {
+            settings.insert("OTHER_LDFLAGS".into(), flags_with_inherited(&ldflags));
+        }
+        if raw.kind != TargetKind::StaticLibrary {
+            for dir in self.phase_search_paths(false) {
+                unique(&mut libraries, dir);
+            }
+        }
         if !libraries.is_empty() {
             settings.insert("LIBRARY_SEARCH_PATHS".into(), inherited_paths(libraries));
         }

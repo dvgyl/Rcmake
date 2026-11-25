@@ -378,6 +378,13 @@ fn generation_diagnostic(
         }
     }
     let failed = matches!(kind, MessageKind::Error | MessageKind::AuthorError);
+    // A generation call stack has no file frames, as CMake shows it.
+    let location = match location {
+        Location::Backtrace(backtrace) => {
+            Location::Backtrace(rcmake_resolve::lower::listed_backtrace(&backtrace))
+        }
+        location => location,
+    };
     let diagnostic = Diagnostic {
         annotations: None,
         kind,

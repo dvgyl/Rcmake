@@ -43,7 +43,7 @@ pub fn lower(
         &IndexMap::new(),
         &IndexMap::new(),
         &mut UsageResolver::new(model),
-        &mut IndexMap::new(),
+        &mut pch::IdeLowering::default(),
         &mut BTreeMap::new(),
         None,
     )
@@ -60,7 +60,7 @@ pub(crate) fn lower_with_inputs(
     inputs: &IndexMap<TargetId, TargetInputs>,
     fortran: &IndexMap<TargetId, super::fortran::FortranPlan>,
     usage: &mut UsageResolver<'_>,
-    ide_custom: &mut IndexMap<TargetId, Vec<IdeCustomStep>>,
+    ide: &mut pch::IdeLowering,
     compile_inputs: &mut BTreeMap<BString, Vec<BString>>,
     cross: Option<CrossConfiguration<'_>>,
 ) -> Result<BuildGraph, ResolveError> {
@@ -94,6 +94,14 @@ pub(crate) fn lower_with_inputs(
         &mut graph.steps,
     )?;
     let precompiled = pch::Plans::new(model, &resolved_targets, inputs, config, usage)?;
+    if usage.ide().is_some() {
+        for &(_, resolved) in &local {
+            let headers = precompiled.ide(resolved);
+            if !headers.is_empty() {
+                ide.pch.insert(resolved.id, headers);
+            }
+        }
+    }
     let rule_count = graph.steps.len();
     let mut unity_prerequisites = Vec::new();
     let mut strong_edges = Vec::new();
@@ -161,7 +169,8 @@ pub(crate) fn lower_with_inputs(
                     };
                     Some(ide_custom_step(model, step, IdeCustomPhase::Rule, false))
                 });
-            ide_custom.insert(resolved.id, rules.chain(events).collect());
+            ide.custom
+                .insert(resolved.id, rules.chain(events).collect());
         }
 
         strong_edges.push(
@@ -202,7 +211,7 @@ pub(crate) fn lower_with_inputs(
         add_codegen_target(model, &local, &target_indices, &commands, &mut graph)?;
     }
     if usage.ide() == Some(crate::ide::IdeFlavor::Xcode) {
-        remove_inherited_xcode_rules(&graph, &target_indices, rule_count, ide_custom);
+        remove_inherited_xcode_rules(&graph, &target_indices, rule_count, &mut ide.custom);
     }
     Ok(graph)
 }

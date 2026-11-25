@@ -393,7 +393,14 @@ impl<'a> UsageResolver<'a> {
             .flat_map(ResolvedLinkItem::edge_targets)
             .any(|id| id == owner)
         {
-            if interface {
+            // CMP0108 OLD lets a target link to itself through an ALIAS.
+            let alias_self_link = self
+                .target(owner)?
+                .policies
+                .policies
+                .get(rcmake_diag::PolicyId::new(108))
+                == rcmake_diag::PolicyStatus::Old;
+            if interface || alias_self_link {
                 // Interface-only self edges do not contribute another usage value.
                 links.retain(|item| !item.edge_targets().any(|id| id == owner));
             } else {

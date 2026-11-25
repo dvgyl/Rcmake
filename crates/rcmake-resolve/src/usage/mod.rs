@@ -217,6 +217,16 @@ impl<'a> UsageResolver<'a> {
         ctx: &EvalContext,
     ) -> Result<(BString, EvalFlags), ResolveError> {
         let target = self.target(id)?;
+        // CMake reports Xcode attribute errors without a call stack.
+        if property.starts_with(b"XCODE_ATTRIBUTE_") {
+            let entry = BT::new(value.clone(), Default::default());
+            return self
+                .eval_entry(id, target.dir, property, &entry, ctx, false)
+                .map_err(|error| match error {
+                    ResolveError::Genex(error) => ResolveError::Genex(error.without_location()),
+                    error => error,
+                });
+        }
         let entry = BT::new(value.clone(), target.backtrace.clone());
         self.eval_entry(id, target.dir, property, &entry, ctx, false)
     }

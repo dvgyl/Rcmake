@@ -7,9 +7,21 @@ use rcmake_model::{DirId, ProjectModel, Target, TargetId, UsageField};
 
 use super::{definition, expand_rule, join, object_dir, policy_flags::Flags};
 use crate::{
-    CompileUnit, ResolveError, ResolvedTarget, cxx_modules::generation_location, sources,
+    CompileUnit, ResolveError, ResolvedTarget,
+    cxx_modules::generation_location,
+    ide::{IdeCustomStep, IdePch},
+    sources,
     usage::UsageResolver,
 };
+
+/// IDE facts that lowering computes for each target.
+#[derive(Default)]
+pub(crate) struct IdeLowering {
+    /// Custom commands and build events.
+    pub(crate) custom: IndexMap<TargetId, Vec<IdeCustomStep>>,
+    /// Precompiled headers.
+    pub(crate) pch: IndexMap<TargetId, Vec<IdePch>>,
+}
 
 const REUSE: &[u8] = b"PRECOMPILE_HEADERS_REUSE_FROM";
 
@@ -146,6 +158,27 @@ impl Plans {
             }
         }
         Ok(plans)
+    }
+
+    /// Return the precompiled headers of `target` for an IDE generator.
+    pub(super) fn ide(&self, target: &ResolvedTarget) -> Vec<IdePch> {
+        let languages: IndexSet<_> = target
+            .compile_groups
+            .iter()
+            .map(|group| &group.language)
+            .collect();
+        languages
+            .into_iter()
+            .filter_map(|language| {
+                let (owner, plan) = self.find(target.id, language)?;
+                Some(IdePch {
+                    language: language.clone(),
+                    header: plan.header.clone(),
+                    source: plan.source.clone(),
+                    reuse_from: (owner != target.id).then_some(owner),
+                })
+            })
+            .collect()
     }
 
     pub(super) fn find(&self, target: TargetId, language: &BString) -> Option<(TargetId, &Plan)> {

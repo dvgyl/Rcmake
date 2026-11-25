@@ -6,8 +6,9 @@ pub(super) fn emit_utilities(
     entry: &[u8],
     programs: &Programs,
     rebuild: &[u8],
+    scope: Scope<'_, '_>,
 ) {
-    emit_directory_utilities(ninja, graph, programs, rebuild);
+    emit_directory_utilities(ninja, graph, programs, rebuild, scope);
     let mut clean = programs.ninja.clone();
     if entry != b"build.ninja" {
         clean.extend_from_slice(b" -f ");
@@ -75,12 +76,105 @@ pub(super) fn emit_utilities(
     }
 }
 
-fn emit_directory_utilities(
+/// How a manifest writes the utilities that depend on a configuration.
+#[derive(Clone, Copy)]
+pub(super) enum Scope<'a, 'g> {
+    /// A single-configuration manifest writes all utilities.
+    Single,
+    /// A Ninja Multi-Config entry file aliases the configuration utilities.
+    Entry {
+        /// The configurations of the plain names.
+        aliases: &'a [&'a Graph<'g>],
+        /// The configurations of the `:all` names.
+        all: &'a [&'a Graph<'g>],
+    },
+}
+
+/// Write the configuration-qualified `test` and `install` utilities of
+/// `graph` into a Ninja Multi-Config implementation file.
+pub(super) fn emit_config_utilities(
     ninja: &mut Ninja,
     graph: &Graph<'_>,
     programs: &Programs,
     rebuild: &[u8],
 ) {
+    for spec in directory_utilities(graph, programs, rebuild) {
+        if spec.per_config && !graph.has_target(&graph.node(spec.name.as_bytes())) {
+            emit_qualified_utility(ninja, graph, &spec);
+        }
+    }
+}
+
+fn emit_directory_utilities(
+    ninja: &mut Ninja,
+    graph: &Graph<'_>,
+    programs: &Programs,
+    rebuild: &[u8],
+    scope: Scope<'_, '_>,
+) {
+    let specs = directory_utilities(graph, programs, rebuild);
+    let mut parallel = Vec::new();
+    for spec in &specs {
+        if spec.name.ends_with("install/local") {
+            parallel.push(graph.node(spec.name.as_bytes()));
+        }
+        match scope {
+            Scope::Entry { aliases, all } if spec.per_config => {
+                let name = graph.node(spec.name.as_bytes());
+                if graph.has_target(&name) {
+                    continue;
+                }
+                let inputs = |configs: &[&Graph<'_>]| {
+                    configs
+                        .iter()
+                        .map(|config| qualified(&name, config.config))
+                        .collect::<Vec<_>>()
+                };
+                ninja.phony(&name, &inputs(aliases));
+                if !all.is_empty() {
+                    ninja.phony(&qualified(&name, Some(b"all")), &inputs(all));
+                }
+            }
+            _ => emit_utility(
+                ninja,
+                graph,
+                Utility {
+                    name: &spec.name,
+                    command: &spec.command,
+                    cwd: spec.cwd.as_ref().map(|value| value.as_slice()),
+                    inputs: &spec.inputs,
+                    pool: spec.pool,
+                    rule: spec.rule,
+                },
+            ),
+        }
+    }
+    if programs.install && programs.parallel_install {
+        let name = graph.node(b"install/parallel");
+        ninja.phony(&name, &parallel);
+        if graph.config.is_some() {
+            let qualified_inputs: Vec<_> = parallel
+                .iter()
+                .map(|input| qualified(input, graph.config))
+                .collect();
+            ninja.phony(&qualified(&name, graph.config), &qualified_inputs);
+        }
+    }
+}
+
+/// One utility of a directory.
+struct Spec {
+    name: String,
+    command: Vec<u8>,
+    cwd: Option<BString>,
+    inputs: Vec<BString>,
+    pool: &'static [u8],
+    rule: &'static [u8],
+    /// The command uses the configuration of the manifest.
+    per_config: bool,
+}
+
+fn directory_utilities(graph: &Graph<'_>, programs: &Programs, rebuild: &[u8]) -> Vec<Spec> {
     let root_path = rcmake_host::path::from_native(graph.build_dir);
     let root = graph.commands.path(&root_path);
     let dirs =
@@ -90,7 +184,7 @@ fn emit_directory_utilities(
                 .beneath(&graph.commands.path(dir), &root)
                 .map(BString::from)
         }));
-    let mut parallel = Vec::new();
+    let mut specs = Vec::new();
     for directory in dirs {
         let prefix = if directory.is_empty() {
             ""
@@ -128,27 +222,21 @@ fn emit_directory_utilities(
             .commands
             .word(b"No interactive CMake dialog available.", &mut edit_cache);
 
-        for (utility, cmd, enabled) in [
-            ("test", test.as_slice(), programs.testing),
-            ("rebuild_cache", rebuild, true),
-            ("edit_cache", edit_cache.as_slice(), true),
+        for (utility, command, enabled, per_config) in [
+            ("test", test, programs.testing, true),
+            ("rebuild_cache", rebuild.to_vec(), true, false),
+            ("edit_cache", edit_cache, true, false),
         ] {
             if enabled {
-                emit_utility(
-                    ninja,
-                    graph,
-                    Utility {
-                        name: &name(utility),
-                        command: cmd,
-                        cwd: cwd
-                            .as_ref()
-                            .map(|value| value.as_slice())
-                            .filter(|_| utility != "rebuild_cache"),
-                        inputs: &[],
-                        pool: b"console",
-                        rule: b"CUSTOM_COMMAND",
-                    },
-                );
+                specs.push(Spec {
+                    name: name(utility),
+                    command,
+                    cwd: cwd.clone().filter(|_| utility != "rebuild_cache"),
+                    inputs: Vec::new(),
+                    pool: b"console",
+                    rule: b"CUSTOM_COMMAND",
+                    per_config,
+                });
             }
         }
         if !programs.install
@@ -186,35 +274,63 @@ fn emit_directory_utilities(
             if !enabled {
                 continue;
             }
-            let mut cmd = install.clone();
-            cmd.extend_from_slice(flags);
-            cmd.extend_from_slice(b" -P cmake_install.cmake");
-            emit_utility(
-                ninja,
-                graph,
-                Utility {
-                    name: &name(utility),
-                    command: &cmd,
-                    cwd: cwd.as_ref().map(|value| value.as_slice()),
-                    inputs: std::slice::from_ref(&all),
-                    pool: if utility == "install/local" && programs.parallel_install {
-                        b""
-                    } else {
-                        b"console"
-                    },
-                    rule: b"CUSTOM_COMMAND",
+            let mut command = install.clone();
+            command.extend_from_slice(flags);
+            command.extend_from_slice(b" -P cmake_install.cmake");
+            specs.push(Spec {
+                name: name(utility),
+                command,
+                cwd: cwd.clone(),
+                inputs: vec![all.clone()],
+                pool: if utility == "install/local" && programs.parallel_install {
+                    b""
+                } else {
+                    b"console"
                 },
-            );
-        }
-        parallel.push(graph.node(name("install/local").as_bytes()));
-    }
-    if programs.install && programs.parallel_install {
-        let name = graph.node(b"install/parallel");
-        ninja.phony(&name, &parallel);
-        if graph.config.is_some() {
-            ninja.phony(&qualified(&name, graph.config), &parallel);
+                rule: b"CUSTOM_COMMAND",
+                per_config: true,
+            });
         }
     }
+    specs
+}
+
+/// Write a utility with the output `CMakeFiles/<config>/<name>.util` and the
+/// alias `<name>:<config>`.
+fn emit_qualified_utility(ninja: &mut Ninja, graph: &Graph<'_>, spec: &Spec) {
+    let config = graph.config.unwrap_or_default();
+    let name = graph.node(spec.name.as_bytes());
+    let mut output_path = b"CMakeFiles/".to_vec();
+    output_path.extend_from_slice(config);
+    output_path.push(b'/');
+    output_path.extend_from_slice(spec.name.as_bytes());
+    output_path.extend_from_slice(b".util");
+    let output = graph.node(&output_path);
+    let inputs: Vec<_> = spec
+        .inputs
+        .iter()
+        .map(|input| qualified(&graph.node(input), graph.config))
+        .collect();
+    ninja.edge(
+        spec.rule,
+        Edge {
+            outputs: std::slice::from_ref(&output),
+            inputs: &inputs,
+            ..Edge::default()
+        },
+    );
+    write_command(
+        ninja,
+        graph,
+        &spec.name,
+        &spec.command,
+        spec.cwd.as_ref().map(|value| value.as_slice()),
+    );
+    if !spec.pool.is_empty() {
+        ninja.binding(b"pool", spec.pool);
+    }
+    write_description(ninja, &spec.name, &name);
+    ninja.phony(&qualified(&name, graph.config), &[output]);
 }
 
 struct Utility<'a> {
@@ -245,31 +361,43 @@ fn emit_utility(ninja: &mut Ninja, graph: &Graph<'_>, utility: Utility<'_>) {
             ..Edge::default()
         },
     );
-    if !utility.command.is_empty() {
-        if matches!(utility.name, "clean" | "help") {
-            ninja.binding(b"COMMAND", utility.command);
-        } else if let Some(directory) = utility.cwd {
-            ninja.binding(
-                b"COMMAND",
-                &graph.commands.in_directory(utility.command, directory),
-            );
-        } else {
-            ninja.binding(b"COMMAND", &graph.in_build_dir(utility.command));
-        }
-    }
+    write_command(ninja, graph, utility.name, utility.command, utility.cwd);
     if !utility.pool.is_empty() {
         ninja.binding(b"pool", utility.pool);
     }
     if utility.rule == b"CUSTOM_COMMAND" {
-        let description = if utility.name.ends_with("install/local") {
-            b"Installing only the local directory...".as_slice()
-        } else {
-            name.as_slice()
-        };
-        ninja.binding(b"DESC", description);
+        write_description(ninja, utility.name, &name);
     }
     ninja.phony(&name, std::slice::from_ref(&output));
     if graph.config.is_some() {
         ninja.phony(&qualified(&name, graph.config), &[output]);
     }
+}
+
+fn write_command(
+    ninja: &mut Ninja,
+    graph: &Graph<'_>,
+    name: &str,
+    command: &[u8],
+    cwd: Option<&[u8]>,
+) {
+    if command.is_empty() {
+        return;
+    }
+    if matches!(name, "clean" | "help") {
+        ninja.binding(b"COMMAND", command);
+    } else if let Some(directory) = cwd {
+        ninja.binding(b"COMMAND", &graph.commands.in_directory(command, directory));
+    } else {
+        ninja.binding(b"COMMAND", &graph.in_build_dir(command));
+    }
+}
+
+fn write_description(ninja: &mut Ninja, name: &str, node: &[u8]) {
+    let description = if name.ends_with("install/local") {
+        b"Installing only the local directory...".as_slice()
+    } else {
+        node
+    };
+    ninja.binding(b"DESC", description);
 }

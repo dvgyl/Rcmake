@@ -27,6 +27,7 @@ mod install;
 mod install_rpath;
 mod launcher;
 mod link;
+pub(crate) use link::framework_bundle_name;
 mod modules;
 mod pch;
 mod policy_flags;
@@ -58,9 +59,10 @@ pub use launcher::instrumentation_launcher;
 pub(crate) use link::{ide_rpaths, install_name_dir, install_name_prefix};
 pub(crate) use modules::scan_responses;
 pub use modules::{bmi_script_path, lower_modules};
+pub(crate) use pch::IdeLowering;
 pub(crate) use policy_flags::warn_about_wrappers;
 pub use shell::{rule_command_chain, simple_args as rule_arguments};
-pub(crate) use standard::required_standard;
+pub(crate) use standard::{cmp0128_warnings, required_standard};
 
 pub(crate) fn definition<'a>(
     model: &'a ProjectModel,
@@ -82,7 +84,7 @@ pub(crate) fn definition<'a>(
 /// Frames of included files have no line and no command. A call stack also
 /// ends at the `CMakeLists.txt` file of the directory, so it omits the
 /// `add_subdirectory` call of the parent directory.
-pub(crate) fn listed_backtrace(backtrace: &rcmake_diag::Backtrace) -> rcmake_diag::Backtrace {
+pub fn listed_backtrace(backtrace: &rcmake_diag::Backtrace) -> rcmake_diag::Backtrace {
     let frames: Vec<_> = backtrace
         .frames()
         .filter(|frame| frame.line != 0 || frame.name.is_some())

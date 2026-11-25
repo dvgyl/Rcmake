@@ -381,3 +381,75 @@ fn standard_options(flag: &[u8]) -> BString {
             .map(|flag| quote(&flag)),
     )
 }
+
+/// Write the optional `CMP0128` warnings that `CMAKE_POLICY_WARNING_CMP0128`
+/// enables.
+///
+/// Unless the policy is `NEW`, CMake keeps the old standard flag selection. The
+/// warning names the difference: the old behavior adds a flag for the default
+/// standard, or it ignores a non-default extension setting when the target has
+/// no standard.
+pub(crate) fn cmp0128_warnings(
+    model: &ProjectModel,
+    host: &dyn rcmake_host::Host,
+    targets: &[crate::ResolvedTarget],
+) {
+    let mut seen = std::collections::HashSet::new();
+    for facts in targets {
+        if !seen.insert(facts.id) {
+            continue;
+        }
+        let Some(target) = model.target(facts.id) else {
+            continue;
+        };
+        if target.policies.policies.get(PolicyId::new(128)) == PolicyStatus::New
+            || definition(model, target.dir, b"CMAKE_POLICY_WARNING_CMP0128")
+                .is_none_or(|value| !truth::is_on(value))
+        {
+            continue;
+        }
+        let languages: std::collections::BTreeSet<_> = facts
+            .compile_groups
+            .iter()
+            .map(|group| group.language.as_slice())
+            .filter(|language| matches!(*language, b"C" | b"CXX" | b"OBJC" | b"OBJCXX"))
+            .collect();
+        for language in languages {
+            if let Some(message) = cmp0128_message(model, target, language) {
+                crate::pipeline::policy_warning(model, host, PolicyId::new(128), target, message);
+            }
+        }
+    }
+}
+
+fn cmp0128_message(model: &ProjectModel, target: &Target, language: &[u8]) -> Option<&'static str> {
+    let setting = |prefix: &[u8], suffix: &[u8]| {
+        definition(model, target.dir, &[prefix, language, suffix].concat())
+    };
+    let default_extensions =
+        setting(b"CMAKE_", b"_EXTENSIONS_DEFAULT").is_none_or(|v| truth::is_on(v));
+    let extensions = target_property(model, target, &[language, b"_EXTENSIONS"].concat())
+        .map_or(default_extensions, |value| truth::is_on(value));
+    let standard = target_property(model, target, &[language, b"_STANDARD"].concat())
+        .filter(|value| !value.is_empty());
+    match standard {
+        None if extensions != default_extensions
+            && setting(b"CMAKE_", b"_EXTENSION_COMPILE_OPTION").is_none_or(|v| v.is_empty()) =>
+        {
+            Some(if extensions {
+                "For compatibility with older versions of CMake, compiler extensions won't be enabled."
+            } else {
+                "For compatibility with older versions of CMake, compiler extensions won't be disabled."
+            })
+        }
+        Some(standard)
+            if setting(b"CMAKE_", b"_STANDARD_DEFAULT") == Some(standard)
+                && extensions == default_extensions =>
+        {
+            Some(
+                "For compatibility with older versions of CMake, unnecessary flags for language standard or compiler extensions may be added.",
+            )
+        }
+        _ => None,
+    }
+}

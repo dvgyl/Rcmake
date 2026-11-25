@@ -1,5 +1,3 @@
-use std::collections::{BTreeMap, BTreeSet};
-
 use rcmake_base::{BString, list, path_lex::Lexical};
 use rcmake_diag::{Backtrace, DiagCategory, Effect, MessageKind, PolicyId, PolicyStatus};
 use rcmake_eval::{CmdError, CmdResult, Cx, Flow};
@@ -104,7 +102,6 @@ struct FileSetArgs<'a> {
 }
 
 const SYCL_GATE: &[u8] = b"c0d1fb10-2ece-420e-9d29-7d7f2b300f25";
-const CMP0211: PolicyId = PolicyId::new(211);
 
 fn add_file_set<'a>(
     cx: &mut Cx<'_>,
@@ -208,7 +205,6 @@ fn add_file_set<'a>(
         bases.push(BT::new(dir.into(), bt.clone()));
     }
     set.base_dirs.extend(bases);
-    let first_new_file = set.files.len();
     set.files.extend(args.files);
     if (kind != FileSetKind::Headers || scope != UsageScope::Interface)
         && let Err(error) = validate_file_set_paths(cx.project(), &set)
@@ -221,7 +217,6 @@ fn add_file_set<'a>(
             }
         });
     }
-    validate_file_set_membership(cx, &set, first_new_file)?;
     let model = cx.project();
     let target = model
         .target_mut(id)
@@ -508,55 +503,6 @@ fn validate_file_set_paths(model: &ProjectModel, set: &FileSet) -> Result<(), Pa
     Ok(())
 }
 
-fn validate_file_set_membership(
-    cx: &mut Cx<'_>,
-    set: &FileSet,
-    first_new_file: usize,
-) -> Result<(), CmdError> {
-    let model = cx.project();
-    let target = model
-        .target(set.target)
-        .ok_or_else(|| model_error(ModelError::UnknownObject))?;
-    let dir = model.dir(target.dir).source_dir.as_slice();
-    let policy = target.policies.policies.get(CMP0211);
-    if set.kind == FileSetKind::Headers || policy == PolicyStatus::Old {
-        return Ok(());
-    }
-    let mut owners = BTreeMap::new();
-    for other in target.file_sets.iter().filter_map(|id| model.file_set(*id)) {
-        if other.kind != FileSetKind::Headers
-            && other.name != set.name
-            && (other.scope != UsageScope::Interface && set.scope != UsageScope::Interface
-                || other.scope != UsageScope::Private && set.scope != UsageScope::Private)
-        {
-            for file in literal_paths(other.files.iter(), dir) {
-                owners.insert(path_key(&file), &other.name);
-            }
-        }
-    }
-    for file in literal_paths(set.files.iter().take(first_new_file), dir) {
-        owners.insert(path_key(&file), &set.name);
-    }
-    let mut warnings = BTreeSet::new();
-    for file in literal_paths(set.files.iter().skip(first_new_file), dir) {
-        if let Some(other) = owners.insert(path_key(&file), &set.name) {
-            let file = Lexical::new(&file).normalize();
-            let message = format!(
-                "In target \"{}\" the file\n  {file}\nalready belongs to file set \"{other}\".",
-                target.name
-            );
-            if policy == PolicyStatus::New {
-                return Err(CmdError::status(message));
-            }
-            warnings.insert(message);
-        }
-    }
-    for warning in warnings {
-        cx.issue_policy_warning(CMP0211, b"", warning.as_bytes());
-    }
-    Ok(())
-}
-
 /// Change the stored paths of a file set and its build-side sources.
 pub(crate) fn replace_file_set_paths(
     cx: &mut Cx<'_>,
@@ -571,7 +517,6 @@ pub(crate) fn replace_file_set_paths(
         .file_set(id)
         .ok_or_else(|| model_error(ModelError::UnknownObject))?
         .clone();
-    let file_count = set.files.len();
     let entries = if bases {
         &mut set.base_dirs
     } else {
@@ -580,13 +525,8 @@ pub(crate) fn replace_file_set_paths(
     if !append {
         entries.clear();
     }
-    let first_new_file = if bases { file_count } else { entries.len() };
     if let Some(value) = value {
         entries.push(BT::new(value, bt));
-    }
-    // A project can change the base directories and the sources in successive calls.
-    if !bases {
-        validate_file_set_membership(cx, &set, first_new_file)?;
     }
     let model = cx.project();
     *model

@@ -737,7 +737,7 @@ fn module_file_sets_follow_target_scope_rules() -> TestResult {
 }
 
 #[test]
-fn file_set_membership_checks_paths_and_cmp0211() -> TestResult {
+fn file_set_paths_are_checked_at_configure_time() -> TestResult {
     let (host, _) = configure(
         "add_library(lib STATIC)\ntarget_sources(lib PRIVATE FILE_SET SOURCES BASE_DIRS src FILES src-other/a.c)",
         &[],
@@ -749,32 +749,20 @@ fn file_set_membership_checks_paths_and_cmp0211() -> TestResult {
             .contains("must be in one of the file set's base directories")
     );
 
-    for (policy, exit, warning) in [("NEW", 1, true), ("OLD", 0, false), ("WARN", 0, true)] {
-        let change = if policy == "WARN" {
-            "cmake_policy(VERSION 4.3)".into()
-        } else {
-            format!("cmake_policy(SET CMP0211 {policy})")
-        };
-        let (host, _) = configure(
-            &format!(
-                "{change}\nadd_library(lib STATIC)\n\
-                 target_sources(lib PRIVATE FILE_SET SOURCES FILES a.c\n\
-                                    FILE_SET HEADERS FILES a.c\n\
-                                    FILE_SET other TYPE SOURCES FILES src/../a.c)"
-            ),
-            &[],
-            exit,
-        )?;
-        let stderr = host.stream_bytes(Stream::Stderr).to_string();
-        assert_eq!(
-            stderr.contains("already belongs to file set \"SOURCES\""),
-            warning,
-            "{stderr}"
-        );
-        if policy == "WARN" {
-            assert!(stderr.contains("Policy CMP0211 is not set"), "{stderr}");
-        }
-    }
+    // CMP0211 is a generation check of the resolver.
+    let (host, _) = configure(
+        "cmake_policy(SET CMP0211 NEW)\nadd_library(lib STATIC)\n\
+         target_sources(lib PRIVATE FILE_SET SOURCES FILES a.c\n\
+                            FILE_SET other TYPE SOURCES FILES a.c)",
+        &[],
+        0,
+    )?;
+    assert!(
+        !host
+            .stream_bytes(Stream::Stderr)
+            .to_string()
+            .contains("already belongs to file set")
+    );
     Ok(())
 }
 

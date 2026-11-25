@@ -13,6 +13,7 @@ use crate::{
     usage::{ResolvedLinkItem, ResolvedLinkKind, UsageResolver},
 };
 
+mod directories;
 mod features;
 use features::Features;
 
@@ -109,6 +110,7 @@ pub(crate) fn resolve_link(
     let directories = usage
         .collect_for_result(id, UsageField::LinkDirectories, &ctx)?
         .entries;
+    directories::check_relative(model, paths, target, &directories)?;
     let naming = LinkLibraryFlags::new(model, target, &language);
     let mut fragments = Vec::with_capacity(options.len() + directories.len() + items.len());
     for option in &options {
@@ -674,6 +676,10 @@ fn link_fragment(text: BString, origin: &BT<BString>, role: LinkFragmentRole) ->
 }
 
 fn build_path(model: &ProjectModel, path: &[u8]) -> BString {
+    // Xcode runs the linker outside the build tree, so it needs full paths.
+    if model.generator == Some(rcmake_model::GeneratorKind::Xcode) {
+        return path.into();
+    }
     let root = to_native(&model.dir(DirId::ROOT).binary_dir);
     let native = to_native(path);
     native

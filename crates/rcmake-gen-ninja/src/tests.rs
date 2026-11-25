@@ -1,6 +1,6 @@
 #![allow(clippy::panic)]
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use rcmake_base::BString;
 use rcmake_host::{Follow, Host, PureHost, ReadRange};
@@ -449,18 +449,21 @@ fn generator_commands_use_metadata_and_the_requested_build_cache() {
     generate_multi_config(&result, &host, dir).unwrap_or_else(|error| panic!("{error}"));
     for file in ["build.ninja", "build-Debug.ninja"] {
         let build = read(&host, file);
-        for line in [
-            "  COMMAND = '/current tools/rcmake' -DCMAKE_INSTALL_CONFIG_NAME=Debug",
-            "  COMMAND = '/current tools/rcmake' -S",
-            "  COMMAND = '/current tools/ctest' --force-new-ctest-process -C Debug",
-        ] {
-            assert!(build.contains(line), "Missing {line:?} in:\n{build}");
-        }
+        let line = "  COMMAND = '/current tools/rcmake' -S";
+        assert!(build.contains(line), "Missing {line:?} in:\n{build}");
     }
+    // The configuration utilities are in the implementation file.
     let implementation = read(&host, "CMakeFiles/impl-Debug.ninja");
-    assert!(
-        implementation.contains("  COMMAND = '/current tools/rcmake' --regenerate-during-build ")
-    );
+    for line in [
+        "  COMMAND = '/current tools/rcmake' --regenerate-during-build ",
+        "  COMMAND = '/current tools/rcmake' -DCMAKE_INSTALL_CONFIG_NAME=Debug",
+        "  COMMAND = '/current tools/ctest' --force-new-ctest-process -C Debug",
+    ] {
+        assert!(
+            implementation.contains(line),
+            "Missing {line:?} in:\n{implementation}"
+        );
+    }
 }
 
 #[test]
@@ -838,5 +841,61 @@ fn prep_targets_preserve_user_outputs_and_select_dependencies()
     assert!(release.contains("build test_prep/sample$:Release: phony generated\n"));
     let entry = read(&host, "build-Release.ninja");
     assert!(entry.contains("build test_prep/sample: phony test_prep/sample$:Release\n"));
+    Ok(())
+}
+
+#[test]
+fn multi_config_utilities_alias_default_and_cross_configurations()
+-> Result<(), Box<dyn std::error::Error>> {
+    let host = PureHost::default();
+    let root = if cfg!(windows) { "C:/work" } else { "/work" };
+    let dir = PathBuf::from(format!("{root}/build"));
+    let mut graphs = Vec::new();
+    for config in ["Debug", "Release", "RelWithDebInfo"] {
+        let mut graph = BuildGraph::default();
+        graph.config.0 = config.into();
+        graph.targets.push(GraphTarget {
+            name: "app".into(),
+            in_all: true,
+            ..GraphTarget::default()
+        });
+        graphs.push(graph);
+    }
+    let result = GenerationResult {
+        configs: graphs.iter().map(|graph| graph.config.clone()).collect(),
+        graphs,
+        ..GenerationResult::default()
+    };
+    host.seed_file(
+        &dir.join("CMakeCache.txt"),
+        b"CMAKE_CROSS_CONFIGS:STRING=all\nCMAKE_DEFAULT_CONFIGS:STRING=Debug;Release\n",
+    )?;
+    generate_multi_config(&result, &host, &dir)?;
+
+    let entry = read(&host, "build.ninja");
+    for utility in ["install", "install/local", "test"] {
+        assert!(entry.contains(&format!(
+            "build {utility}: phony {utility}$:Debug {utility}$:Release\n"
+        )));
+        assert!(entry.contains(&format!(
+            "build {utility}$:all: phony {utility}$:Debug {utility}$:RelWithDebInfo {utility}$:Release\n"
+        )));
+    }
+    assert!(!entry.contains("CMakeFiles/install.util"));
+
+    let implementation = read(&host, "CMakeFiles/impl-Debug.ninja");
+    for config in ["Debug", "Release", "RelWithDebInfo"] {
+        assert!(implementation.contains(&format!(
+            "build CMakeFiles/{config}/install.util: CUSTOM_COMMAND all$:{config}\n"
+        )));
+        assert!(implementation.contains(&format!(
+            "build install$:{config}: phony CMakeFiles/{config}/install.util\n"
+        )));
+    }
+    assert!(implementation.contains("-DCMAKE_INSTALL_CONFIG_NAME=Release -P cmake_install.cmake"));
+
+    let release = read(&host, "build-Release.ninja");
+    assert!(release.contains("build install: phony install$:Release\n"));
+    assert!(!release.contains("build install$:all:"));
     Ok(())
 }

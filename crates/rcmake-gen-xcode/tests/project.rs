@@ -833,3 +833,101 @@ fn applies_ide_facts_and_checks_config_source_lists() {
             .contains("source files which vary by configuration")
     );
 }
+
+/// Return the Debug build settings of the target whose product is `name`.
+fn debug_settings<'a>(pbx: &'a str, name: &str) -> &'a str {
+    let product = format!("PRODUCT_NAME = {name};");
+    pbx.split("buildSettings = {")
+        .skip(1)
+        .find(|block| {
+            block.contains(&product)
+                && block
+                    .split_once("};")
+                    .is_some_and(|(_, rest)| rest.trim_start().starts_with("name = Debug;"))
+        })
+        .and_then(|block| block.split_once("};"))
+        .map_or("", |(settings, _)| settings)
+}
+
+#[test]
+fn built_only_link_phase_searches_product_dirs_and_skips_libtool_flags() {
+    let host = PureHost::default();
+    let (source_root, build_root) = source_property_roots();
+    let source = Path::new(source_root);
+    let out = Path::new(build_root);
+    let mut model = model(source, out);
+    define(
+        &mut model,
+        "CMAKE_XCODE_LINK_BUILD_PHASE_MODE",
+        "BUILT_ONLY",
+    );
+    let core = add(
+        &mut model,
+        "core",
+        TargetKind::StaticLibrary,
+        Some("core.c"),
+    );
+    let bundle = add(
+        &mut model,
+        "bundle",
+        TargetKind::StaticLibrary,
+        Some("core.c"),
+    );
+    prop(&mut model, bundle, "FRAMEWORK", "TRUE");
+    add(
+        &mut model,
+        "plugin",
+        TargetKind::ModuleLibrary,
+        Some("core.c"),
+    );
+    let app = add(&mut model, "app", TargetKind::Executable, Some("main.c"));
+    for file in ["core.c", "main.c"] {
+        host.seed_file(&source.join(file), b"")
+            .expect("seed source");
+    }
+    model.target_mut(app).expect("app").usage.link_libraries = Some(
+        ["core", "bundle"]
+            .into_iter()
+            .map(|name| rcmake_model::LinkItem {
+                scope: None,
+                text: BT::new(name.into(), Default::default()),
+                lookup_dir: DirId::ROOT,
+            })
+            .collect(),
+    );
+    model.target_mut(core).expect("core").usage.link_libraries =
+        Some(vec![rcmake_model::LinkItem {
+            scope: None,
+            text: BT::new("m".into(), Default::default()),
+            lookup_dir: DirId::ROOT,
+        }]);
+    let result = resolved(&model, &host);
+    generate(&result, &model, &host, out).expect("generate");
+    let pbx = read(&host, &out.join("Demo.xcodeproj/project.pbxproj"));
+
+    let config_dir = format!("{build_root}/$(CONFIGURATION)$(EFFECTIVE_PLATFORM_NAME)");
+    let app = debug_settings(&pbx, "app");
+    let search = |key: &str| {
+        app.lines()
+            .find(|line| line.trim_start().starts_with(key))
+            .unwrap_or_default()
+            .to_owned()
+    };
+    assert!(
+        search("LIBRARY_SEARCH_PATHS").contains(&config_dir),
+        "{app}"
+    );
+    assert!(
+        search("FRAMEWORK_SEARCH_PATHS").contains(&config_dir),
+        "{app}"
+    );
+    assert!(pbx.contains("bundle.framework in Frameworks"), "{pbx}");
+    assert!(!search("OTHER_LDFLAGS").contains("bundle"), "{app}");
+
+    // Xcode passes OTHER_LDFLAGS to libtool, so a static library has none.
+    assert!(!debug_settings(&pbx, "core").contains("OTHER_LDFLAGS"));
+    // CMake builds a plain module as a tool that links with `-bundle`.
+    let plugin = debug_settings(&pbx, "plugin");
+    assert!(plugin.contains("LIBRARY_STYLE = BUNDLE;"), "{plugin}");
+    assert!(pbx.contains("productType = \"com.apple.product-type.tool\""));
+}

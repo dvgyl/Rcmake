@@ -178,19 +178,24 @@ impl Project<'_> {
                     if !has_link_features(facts.ide.as_deref()?) {
                         continue;
                     }
-                    let library = match item {
+                    // A framework links its versioned file, which is not
+                    // the linker file of the bundle root.
+                    let libraries: Vec<&BString> = match item {
                         IdeLinkItem::Target(id) => {
                             let producer = self.resolved.get(&(*id, config.clone()))?;
-                            producer
-                                .artifacts
+                            let artifacts = &producer.artifacts;
+                            artifacts
                                 .linker_file
-                                .as_ref()
-                                .or(producer.artifacts.file.as_ref())?
+                                .iter()
+                                .chain(artifacts.file.iter())
+                                .collect()
                         }
-                        IdeLinkItem::File(path) | IdeLinkItem::Framework(path) => path,
+                        IdeLinkItem::File(path) | IdeLinkItem::Framework(path) => vec![path],
                         _ => return None,
                     };
-                    let fragment = phase_fragment(facts, library, feature, self.bin)?;
+                    let fragment = libraries
+                        .into_iter()
+                        .find_map(|library| phase_fragment(facts, library, feature, self.bin))?;
                     fragments.insert(config.clone(), fragment);
                 }
                 used.insert((source_tree, path.clone())).then(|| PhaseLink {
@@ -378,6 +383,55 @@ fn configured_object_path(path: &str, config: &str, objects: &str) -> Option<Str
 }
 
 impl TargetSettings<'_> {
+    /// Return the product of a linked target in this configuration.
+    pub(crate) fn linked_product(&self, id: rcmake_model::TargetId) -> Option<Product> {
+        let producer = self.model.target(id)?;
+        if producer.is_imported() {
+            return None;
+        }
+        let resolved =
+            self.result.targets.iter().find(|target| {
+                target.id == id && target.config.0.as_slice() == self.config.as_bytes()
+            });
+        Some(Product::new(
+            self.model,
+            producer,
+            resolved,
+            self.config,
+            self.bin,
+        ))
+    }
+
+    /// Return the build directories of the targets in the Frameworks build
+    /// phase. Xcode searches these directories for the phase items. The
+    /// configuration directory becomes `$(CONFIGURATION)$(EFFECTIVE_PLATFORM_NAME)`.
+    pub(crate) fn phase_search_paths(&self, frameworks: bool) -> Vec<String> {
+        let mut paths = Vec::new();
+        for link in self.phase_links {
+            let IdeLinkItem::Target(id) = &link.item else {
+                continue;
+            };
+            if (link.file_type == "wrapper.framework") != frameworks {
+                continue;
+            }
+            let Some(product) = self.linked_product(*id) else {
+                continue;
+            };
+            let dir = product
+                .dir
+                .strip_suffix(self.config)
+                .filter(|parent| parent.ends_with('/'))
+                .map_or_else(
+                    || product.dir.clone(),
+                    |parent| format!("{parent}{CONFIG_DIR}"),
+                );
+            if !paths.contains(&dir) {
+                paths.push(dir);
+            }
+        }
+        paths
+    }
+
     pub(crate) fn rendered_link_flags(&self, ide: &IdeFacts) -> Option<Vec<String>> {
         let target = self.target.filter(|_| has_link_features(ide))?;
         let phase_fragments = self

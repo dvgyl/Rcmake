@@ -127,10 +127,15 @@ fn generate(
         Ok(result) => result,
         Err(rcmake_resolve::ResolveError::Reported(_)) => return Err(Failure::Reported),
         Err(err) => {
-            return Err(err
+            let message = err
                 .with_export_linker_language(interp.cx().project())
-                .to_string()
-                .into());
+                .to_string();
+            // CMake words the missing linker language this way.
+            let message = match message.strip_prefix("Cannot determine link language for target ") {
+                Some(name) => format!("CMake can not determine linker language for target: {name}"),
+                None => message,
+            };
+            return Err(message.into());
         }
     };
     if result.graphs.iter().flat_map(|graph| &graph.steps).any(|step| {

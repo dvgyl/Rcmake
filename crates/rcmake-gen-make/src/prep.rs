@@ -160,6 +160,7 @@ fn collect_install(
         manifest
             .actions
             .iter()
+            .filter(|action| !action.exclude_from_all)
             .flat_map(|action| install_dependencies(graph, owners, action)),
     );
 }

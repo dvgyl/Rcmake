@@ -59,7 +59,13 @@ impl PrepTargets {
         }
     }
 
-    pub(crate) fn emit_aliases(&self, ninja: &mut Ninja, graph: &Graph<'_>) {
+    /// Write each plain name as an alias of its names in `configs`.
+    pub(crate) fn emit_aliases(
+        &self,
+        ninja: &mut Ninja,
+        graph: &Graph<'_>,
+        configs: &[&Graph<'_>],
+    ) {
         let outputs: BTreeSet<_> = self
             .0
             .keys()
@@ -67,8 +73,23 @@ impl PrepTargets {
             .collect();
         for name in self.0.keys() {
             if !outputs.contains(name) {
-                ninja.phony(name, &[qualified(name, graph.config)]);
+                let inputs: Vec<_> = configs
+                    .iter()
+                    .map(|config| qualified(name, config.config))
+                    .collect();
+                ninja.phony(name, &inputs);
             }
+        }
+    }
+
+    /// Write the `<name>:all` aliases of the cross configurations.
+    pub(crate) fn emit_all_aliases(&self, ninja: &mut Ninja, configs: &[&Graph<'_>]) {
+        for name in self.0.keys() {
+            let inputs: Vec<_> = configs
+                .iter()
+                .map(|config| qualified(name, config.config))
+                .collect();
+            ninja.phony(&qualified(name, Some(b"all")), &inputs);
         }
     }
 }
@@ -138,9 +159,11 @@ fn collect_install(
             lower_install_manifest(&model, &result.targets)
         });
     let manifest = filtered.as_ref().unwrap_or(&result.install);
+    // An artifact group can be excluded from the default installation.
     let inputs = manifest
         .actions
         .iter()
+        .filter(|action| !action.exclude_from_all)
         .flat_map(|action| install_dependencies(graph, action))
         .collect();
     targets.insert(all, inputs);

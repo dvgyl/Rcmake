@@ -24,10 +24,12 @@ use crate::{
 };
 
 pub(super) mod driver;
+mod frameworks;
 use driver::{
     LinkerDriver, archive_commands, deduplicate_darwin_flags, definition_file, library_file,
     shared_library, without_empty_output_flags,
 };
+pub(crate) use frameworks::bundle_name as framework_bundle_name;
 
 #[expect(
     clippy::too_many_arguments,
@@ -548,7 +550,9 @@ fn link_libraries(
         .fragments
         .iter()
         .filter(|f| f.role != LinkFragmentRole::Flags);
-    let libraries = linked_libraries(step);
+    let mut libraries = linked_libraries(step);
+    let named = frameworks::named_framework_files(model, target, config, step, &libraries);
+    libraries.extend(named);
     let runtime = runtime_libraries(model, target, config, step, &libraries);
     let rpaths = rpaths(model, target, config, step, darwin, &runtime)?;
     inputs.extend(libraries);

@@ -18,7 +18,7 @@ mod fortran;
 mod graph;
 mod install;
 
-use install::emit_utilities;
+use install::{emit_config_utilities, emit_utilities};
 mod instrumented;
 mod modules;
 mod multi;
@@ -218,6 +218,7 @@ fn generate_single(
         b"build.ninja",
         &programs,
         &configure_command(result, build_dir, &programs.cmake, &commands, false),
+        install::Scope::Single,
     );
     if graph.prefix.is_empty() {
         ninja.0.extend_from_slice(b"default all\n");
@@ -424,6 +425,10 @@ fn generate_multi(
             )?;
             graph.emit_clean_inputs(&mut ninja);
             files.prep.emit(&mut ninja, graph);
+            emit_config_utilities(&mut ninja, output, &programs, &rebuild);
+        }
+        if !cross.is_empty() {
+            files.prep.emit_all_aliases(&mut ninja, &cross);
         }
         multi::emit_clean(
             &mut ninja,
@@ -455,7 +460,7 @@ fn generate_multi(
             graph,
             files,
             &files.entry,
-            &[graph],
+            (&[graph], &[]),
             &emitted,
             (&programs, &rebuild),
         )?;
@@ -466,7 +471,7 @@ fn generate_multi(
                 default,
                 default_files,
                 b"build.ninja",
-                &defaults,
+                (&defaults, &cross),
                 &emitted,
                 (&programs, &rebuild),
             )?;
@@ -512,7 +517,7 @@ fn write_entry(
     graph: &Graph<'_>,
     files: &ConfigFiles,
     entry: &[u8],
-    aliases: &[&Graph<'_>],
+    (aliases, all): (&[&Graph<'_>], &[&Graph<'_>]),
     emitted: &HashSet<BString>,
     (programs, rebuild): (&Programs, &[u8]),
 ) -> Result<(), GenError> {
@@ -528,8 +533,15 @@ fn write_entry(
             .collect::<Vec<_>>();
         ninja.phony(&graph.node(b"clean"), &targets);
     }
-    files.prep.emit_aliases(&mut ninja, graph);
-    emit_utilities(&mut ninja, graph, entry, programs, rebuild);
+    files.prep.emit_aliases(&mut ninja, graph, aliases);
+    emit_utilities(
+        &mut ninja,
+        graph,
+        entry,
+        programs,
+        rebuild,
+        install::Scope::Entry { aliases, all },
+    );
     if graph.prefix.is_empty() {
         ninja.0.extend_from_slice(b"default all\n");
     }

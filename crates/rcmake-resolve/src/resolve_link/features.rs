@@ -84,7 +84,21 @@ impl<'a, 'host> Features<'a, 'host> {
                     .filter(|fragment| fragment.role == LinkFragmentRole::Libraries)
                 {
                     let value = &fragment.text.value;
-                    let framework = value.strip_prefix(b"-framework ");
+                    // A feature names a framework by its bundle name.
+                    let framework = value
+                        .strip_prefix(b"-framework ")
+                        .map(|name| name.strip_suffix(b".framework").unwrap_or(name))
+                        .or_else(|| match item.kind {
+                            ResolvedLinkKind::Library(_) => {
+                                crate::lower::framework_bundle_name(value)
+                            }
+                            ResolvedLinkKind::Raw if !value.contains(&b'/') => item
+                                .text
+                                .value
+                                .strip_suffix(b".framework")
+                                .filter(|name| !name.is_empty()),
+                            _ => None,
+                        });
                     let use_path = framework.is_none()
                         && (value.contains(&b'/')
                             || matches!(item.kind, ResolvedLinkKind::Library(_)));

@@ -42,7 +42,7 @@ pub(super) fn warn_policy(
         effect: Effect::None,
         category: Some(DiagCategory::Policy),
         policy: Some(policy),
-        location: Location::Backtrace(target.backtrace.clone()),
+        location: Location::Backtrace(crate::lower::listed_backtrace(&target.backtrace)),
         body: format!("Policy {policy} is not set: {summary}  Run \"cmake --help-policy {policy}\" for policy details.  Use the cmake_policy command to set the policy and suppress this warning.\n\nSince the policy is not set, {behavior}").into(),
     };
     paths.host.write_out(

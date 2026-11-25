@@ -35,7 +35,9 @@ mod fortran;
 use crate::usage::provenance::Provenance;
 use cross::CrossPlan;
 
+mod file_set_membership;
 mod header_verify;
+mod intdir;
 mod rule_output_sets;
 
 /// Resolve and lower the project in configuration order.
@@ -76,6 +78,8 @@ fn resolve_project(
     let rules = crate::target::instantiate_rules(model, host)?;
     let model = rules.as_ref().unwrap_or(model);
     crate::exports::source_sets::validate(model)?;
+    intdir::validate(model, host)?;
+    file_set_membership::validate(model, host)?;
     lower::warn_about_wrappers(model, host);
     lower::custom::warn_depfile_policy(model, host);
     let configs = if configs.is_empty() {
@@ -188,6 +192,7 @@ fn resolve_project(
         autogen.write_info(host, &targets)?;
     }
     warn_link_flags(model, host, &targets);
+    lower::cmp0128_warnings(model, host, &targets);
     let mut install =
         lower::lower_install_manifest_with_configs(model, &targets, &configs, options.ide, host)
             .map_err(|error| match error {
@@ -500,7 +505,7 @@ pub fn validate_codegen_name(model: &ProjectModel, host: &dyn Host) -> Result<()
     }
 }
 
-fn policy_warning(
+pub(crate) fn policy_warning(
     model: &ProjectModel,
     host: &dyn Host,
     policy: PolicyId,
@@ -515,6 +520,12 @@ fn policy_warning(
     }
     let summary = match policy {
         id if id == PolicyId::new(171) => "'codegen' is a reserved target name.".into(),
+        id if id == PolicyId::new(128) => {
+            "Selection of language standard and extension flags improved.".into()
+        }
+        id if id == PolicyId::new(211) => {
+            "A file may belong to at most one non-HEADERS file set in a target.".into()
+        }
         id if id == PolicyId::new(210) => {
             "CMAKE_<LANG>_LINK_FLAGS adds link flags to all target types.".into()
         }
@@ -672,8 +683,9 @@ fn validate_link_items(
     }
     let mut reported = IndexSet::new();
     let mut checked_interfaces = IndexSet::new();
-    let mut failure = None;
-    let mut check = |id, interface, item: &ResolvedLinkItem| {
+    // CMake checks each target in model order: its links, then its interface.
+    let mut pending = Vec::new();
+    let mut check = |id: TargetId, interface, item: &ResolvedLinkItem| {
         let Some(target) = model.target(id) else {
             return;
         };
@@ -707,15 +719,10 @@ fn validate_link_items(
             format!("{head}\n\n  {name}\n\nbut the target was not found.")
         };
         let body = BString::from(format!(
-            "{message}  Possible reasons include:\n\n  * There is a typo in the target name.\n  * A find_package call is missing for an IMPORTED target.\n  * An ALIAS target is missing."
+            "{message}  Possible reasons include:\n\n  * There is a typo in the target name.\n  * A find_package call is missing for an IMPORTED target.\n  * An ALIAS target is missing.\n"
         ));
-        paths.emit(
-            model,
-            MessageKind::Error,
-            Location::Backtrace(item.text.backtrace.clone()),
-            body.clone(),
-        );
-        failure.get_or_insert(ResolveError::Reported(body));
+        let location = Location::Backtrace(item.text.backtrace.clone());
+        pending.push(((id.index(), interface), location, body));
     };
     fn with_members(item: &ResolvedLinkItem) -> impl Iterator<Item = &ResolvedLinkItem> {
         let members = match &item.kind {
@@ -777,6 +784,12 @@ fn validate_link_items(
         {
             check(id, true, item);
         }
+    }
+    pending.sort_by_key(|(order, ..)| *order);
+    let mut failure = None;
+    for (_, location, body) in pending {
+        paths.emit(model, MessageKind::Error, location, body.clone());
+        failure.get_or_insert(ResolveError::Reported(body));
     }
     failure.map_or(Ok(()), Err)
 }
@@ -865,7 +878,7 @@ fn resolve_config(
     }
     let fortran = fortran::prepare(model, paths, &mut usage, &mut resolved, &inputs, &ctx)?;
     let mut resolved = resolved.into_values().collect::<Vec<_>>();
-    let mut ide_custom = IndexMap::new();
+    let mut ide_lowering = lower::IdeLowering::default();
     let graph = lower::lower_with_inputs(
         model,
         &resolved,
@@ -873,7 +886,7 @@ fn resolve_config(
         &inputs,
         &fortran,
         &mut usage,
-        &mut ide_custom,
+        &mut ide_lowering,
         compile_inputs,
         None,
     )?;
@@ -887,7 +900,7 @@ fn resolve_config(
             &inputs,
             &fortran,
             &mut usage,
-            &mut IndexMap::new(),
+            &mut lower::IdeLowering::default(),
             &mut BTreeMap::new(),
             Some(settings),
         )?;
@@ -895,7 +908,11 @@ fn resolve_config(
     }
     for target in &mut resolved {
         if let Some(facts) = &mut target.ide {
-            facts.custom = ide_custom.swap_remove(&target.id).unwrap_or_default();
+            facts.custom = ide_lowering
+                .custom
+                .swap_remove(&target.id)
+                .unwrap_or_default();
+            facts.pch = ide_lowering.pch.swap_remove(&target.id).unwrap_or_default();
         }
     }
     Ok(ConfigOutput {
