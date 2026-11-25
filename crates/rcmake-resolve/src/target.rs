@@ -309,7 +309,7 @@ pub(crate) fn resolve_target<'a>(
                 )?;
                 if let Some(file) = unity_file {
                     file.apply_compile_properties(
-                        &model.dir(target.dir).source_dir,
+                        &model.dir(DirId::ROOT).source_dir,
                         &ctx.config,
                         &mut facts,
                     );

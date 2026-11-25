@@ -74,9 +74,14 @@ pub(in crate::lower) fn flags(
         (b"visionOS", _) => Some((b"xros".as_slice(), b"".as_slice())),
         _ => None,
     };
-    for arch in architectures.iter().filter(|arch| selected(arch)) {
-        flags.push("-arch".into());
-        flags.push(quote(arch));
+    if matches!(
+        language,
+        b"C" | b"CXX" | b"OBJC" | b"OBJCXX" | b"ASM" | b"SYCL"
+    ) {
+        for arch in architectures.iter().filter(|arch| selected(arch)) {
+            flags.push("-arch".into());
+            flags.push(quote(arch));
+        }
     }
     if let Some((platform, suffix)) = triple
         && compiler_target.is_none()

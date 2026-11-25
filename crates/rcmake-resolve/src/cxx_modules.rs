@@ -151,13 +151,6 @@ pub(crate) fn validate_module_scanning(
     inputs: &TargetInputs,
     has_module_sets: bool,
 ) -> Result<(), ResolveError> {
-    if has_module_sets && !allows_module_scanning(model, target, inputs) {
-        let standard = cxx_standard(model, target).map_or_else(|| "98".into(), BString::clone);
-        return Err(module_error(model, paths, target, format!(
-            "The target named \"{}\" has C++ sources that use modules, but does not include \"cxx_std_20\" (or newer) among its `target_compile_features`; found \"cxx_std_{standard}\".",
-            target.name,
-        ).into()));
-    }
     if !generator_supports_scanning(model, paths) {
         let generator = model.generator.map_or("Ninja", GeneratorKind::name);
         return Err(module_error(
@@ -165,10 +158,17 @@ pub(crate) fn validate_module_scanning(
             paths,
             target,
             format!(
-                "The target named \"{}\" has C++ sources that may use modules, but this generator does not support scanning them:\n\n  {generator}",
+                "The target named \"{}\" has C++ sources that may use modules, but modules are not supported by this generator:\n  {generator}\nModules are supported only by Ninja, Ninja Multi-Config, and Visual Studio generators for VS 17.4 and newer.  See the cmake-cxxmodules(7) manual for details.  Use the CMAKE_CXX_SCAN_FOR_MODULES variable to enable or disable scanning.",
                 target.name,
             ).into(),
         ));
+    }
+    if has_module_sets && !allows_module_scanning(model, target, inputs) {
+        let standard = cxx_standard(model, target).map_or_else(|| "98".into(), BString::clone);
+        return Err(module_error(model, paths, target, format!(
+            "The target named \"{}\" has C++ sources that use modules, but does not include \"cxx_std_20\" (or newer) among its `target_compile_features`; found \"cxx_std_{standard}\".",
+            target.name,
+        ).into()));
     }
     if scan_rule(model, target).is_none() {
         let error = missing_scanner(target);

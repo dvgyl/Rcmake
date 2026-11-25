@@ -688,7 +688,12 @@ fn vs_package_restore_uses_preset_and_cli_modes() {
         "/work/CMakePresets.json",
         r#"{
   "version": 6,
-  "configurePresets": [{"name": "c", "generator": "Visual Studio 17 2022", "binaryDir": "${sourceDir}/vs"}],
+  "configurePresets": [{
+    "name": "c",
+    "generator": "Visual Studio 17 2022",
+    "binaryDir": "${sourceDir}/vs",
+    "cacheVariables": {"CMAKE_MAKE_PROGRAM": "/tools/MSBuild.exe"}
+  }],
   "buildPresets": [
     {"name": "only", "configurePreset": "c", "targets": ["app"], "resolvePackageReferences": "only"},
     {"name": "off", "configurePreset": "c", "targets": ["app"], "resolvePackageReferences": "off"},

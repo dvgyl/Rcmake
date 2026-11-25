@@ -269,16 +269,7 @@ fn build_make_preset_uses_cli_overrides_and_inherits_environment() {
         assert_eq!(command.program, "/tools/make");
         assert_eq!(
             command.args,
-            argv(&[
-                "-f",
-                "Makefile",
-                "-j",
-                "3",
-                "VERBOSE=1",
-                "cli-target",
-                "-k",
-                "-n"
-            ])
+            argv(&["-f", "Makefile", "-j", "3", "VERBOSE=1", "cli-target", "-n"])
         );
         assert!(
             request

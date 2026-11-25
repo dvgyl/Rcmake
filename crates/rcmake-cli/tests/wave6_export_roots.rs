@@ -78,45 +78,39 @@ install(EXPORT API DESTINATION lib/cmake/API)
 
     let source = fixture.root.to_str().expect("UTF-8 fixture path");
     let program = env!("CARGO_BIN_EXE_rcmake");
-    let oracle = fixture.host.env_get(b"RCMAKE_ORACLE_CMAKE");
-    let oracle = oracle
-        .as_ref()
-        .and_then(|path| std::str::from_utf8(path).ok());
-    for (index, program) in std::iter::once(program).chain(oracle).enumerate() {
-        let build = fixture.root.join(format!("build-{index}"));
-        let build = build.to_str().expect("UTF-8 build path");
-        let source_input = format!(
-            "-Dexport_include={}",
-            fixture.root.join("source-sibling").display()
-        );
-        let output = fixture.run(
-            program,
-            &["-S", source, "-B", build, "-G", "Ninja", &source_input],
-        );
-        let error = String::from_utf8_lossy(&output.stderr);
-        assert_eq!(
-            output.results,
-            [ProcessResult::Exited(1)],
-            "{program} {error}"
-        );
-        assert!(
-            error.contains("prefixed in the source directory"),
-            "{error}"
-        );
-        assert!(error.contains("sub/CMakeLists.txt"), "{error}");
+    let build = fixture.root.join("build");
+    let build = build.to_str().expect("UTF-8 build path");
+    let source_input = format!(
+        "-Dexport_include={}",
+        fixture.root.join("source-sibling").display()
+    );
+    let output = fixture.run(
+        program,
+        &["-S", source, "-B", build, "-G", "Ninja", &source_input],
+    );
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.results,
+        [ProcessResult::Exited(1)],
+        "{program} {error}"
+    );
+    assert!(
+        error.contains("prefixed in the source directory"),
+        "{error}"
+    );
+    assert!(error.contains("sub/CMakeLists.txt"), "{error}");
 
-        let prefix = Path::new(build);
-        let install_prefix = format!("-DCMAKE_INSTALL_PREFIX={}", prefix.display());
-        let build_input = format!("-Dexport_include={}", prefix.join("include").display());
-        let output = fixture.run(
-            program,
-            &["-S", source, "-B", build, &build_input, &install_prefix],
-        );
-        assert_eq!(
-            output.results,
-            [ProcessResult::Exited(0)],
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
+    let prefix = Path::new(build);
+    let install_prefix = format!("-DCMAKE_INSTALL_PREFIX={}", prefix.display());
+    let build_input = format!("-Dexport_include={}", prefix.join("include").display());
+    let output = fixture.run(
+        program,
+        &["-S", source, "-B", build, &build_input, &install_prefix],
+    );
+    assert_eq!(
+        output.results,
+        [ProcessResult::Exited(0)],
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }

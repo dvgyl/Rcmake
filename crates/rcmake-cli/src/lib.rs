@@ -664,7 +664,8 @@ mod tests {
 
     #[test]
     fn parse_define_keeps_quoted_key_and_value_bytes() {
-        let cases: [(&[u8], &[u8], Option<CacheType>, &[u8]); 12] = [
+        type DefineCase<'a> = (&'a [u8], &'a [u8], Option<CacheType>, &'a [u8]);
+        let cases: [DefineCase<'_>; 12] = [
             (
                 b"\"a:b=c\":STRING=v",
                 b"a:b=c",

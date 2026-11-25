@@ -1,4 +1,4 @@
-use indexmap::IndexMap;
+use indexmap::{IndexMap, IndexSet};
 use rcmake_base::BString;
 
 use super::install::{cmake_quote, cmake_quoted_content};
@@ -84,8 +84,16 @@ impl RuntimeEdit {
                     command.extend_from_slice(&path);
                     command.extend_from_slice(b" COMMAND_ERROR_IS_FATAL ANY)");
                 }
-                let remove = edit.old.iter().filter(|path| !edit.new.contains(path));
-                let add = edit.new.iter().filter(|path| !edit.old.contains(path));
+                let old_set: IndexSet<&BString> = edit.old.iter().collect();
+                let new_set: IndexSet<&BString> = edit.new.iter().collect();
+                let remove = old_set
+                    .iter()
+                    .copied()
+                    .filter(|path| !new_set.contains(path));
+                let add = new_set
+                    .iter()
+                    .copied()
+                    .filter(|path| !old_set.contains(path));
                 let mut arguments = BString::default();
                 for (flag, path) in remove
                     .map(|path| (b"\n  -delete_rpath ".as_slice(), path))

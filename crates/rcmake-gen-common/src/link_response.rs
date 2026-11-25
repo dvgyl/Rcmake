@@ -76,7 +76,11 @@ pub fn rewrite(
         let contents = encode(invocation.argv.get(span.argv.clone())?, settings.quoting);
         let id = HashAlgo::Sha256.hex_digest(&[output, b"\0", config].concat());
         let path: BString = format!("CMakeFiles/rcmake-link-{id}-{index}-{ordinal}.rsp").into();
-        let reference_path = if invocation.working_dir.is_some() {
+        let reference_path = if invocation
+            .working_dir
+            .as_ref()
+            .is_some_and(|dir| path::to_native(dir) != build)
+        {
             path::from_native(&build.join(path::to_native(&path)))
         } else {
             path.clone()
@@ -88,7 +92,14 @@ pub fn rewrite(
         };
         let shell = references
             .iter()
-            .map(|argument| quote(argument))
+            .map(|argument| match settings.quoting {
+                ResponseQuoting::Gnu => quote(argument),
+                ResponseQuoting::Msvc => {
+                    let mut out = Vec::new();
+                    windows_argument(argument, &mut out, false);
+                    out.into()
+                }
+            })
             .collect::<Vec<_>>();
         revised.argv.splice(span.argv, references);
         revised.shell.splice(span.shell, shell.join(&b' '));

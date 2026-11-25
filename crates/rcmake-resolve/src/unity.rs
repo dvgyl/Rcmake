@@ -5,7 +5,7 @@ use rcmake_base::{BString, hash::HashAlgo, path_lex::Lexical, truth};
 use rcmake_diag::{Backtrace, MessageKind};
 use rcmake_genex::{ConfigId, EvalContext};
 use rcmake_host::{Host, ReadRange, WriteMode, path::to_native};
-use rcmake_model::{BT, ProjectModel, Target, TargetId, TargetKind};
+use rcmake_model::{BT, DirId, ProjectModel, Target, TargetId, TargetKind};
 
 use crate::{
     CompileGroup, InterfaceInclude, ResolveError,
@@ -315,7 +315,7 @@ struct UnityWriter<'a> {
 impl UnityWriter<'_> {
     fn write_files(&self, candidates: Candidates) -> Result<TargetUnity, ResolveError> {
         let mut plan = TargetUnity::default();
-        let root = self.model.dir(self.target.dir);
+        let root = self.model.dir(DirId::ROOT);
         let target_dir = lower::object_dir(self.model, self.target, &ConfigId::default());
         let unity_dir = absolute_path(
             &root.binary_dir,
@@ -408,7 +408,7 @@ impl UnityWriter<'_> {
             }
             content.push(b'\n');
         }
-        let root = self.model.dir(self.target.dir);
+        let root = self.model.dir(DirId::ROOT);
         let source_path = Lexical::new(source);
         let binary_root = Lexical::new(&root.binary_dir);
         let source_root = Lexical::new(&root.source_dir);

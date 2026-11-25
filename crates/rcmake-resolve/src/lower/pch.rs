@@ -57,23 +57,6 @@ impl<'a> PchFlags<'a> {
         language: &[u8],
     ) -> Vec<BString> {
         let policy = Flags::new(model, target, language);
-        let (plan, option): (_, &[u8]) = match self {
-            Self::Create(plan) => (plan, b"COMPILE_OPTIONS_CREATE_PCH"),
-            Self::Use([plan]) => (*plan, b"COMPILE_OPTIONS_USE_PCH"),
-            Self::Use(plans) => {
-                return plans
-                    .iter()
-                    .filter_map(|plan| {
-                        let arch = plan.arch.as_ref()?;
-                        Some([
-                            quote(&[b"-Xarch_", arch.as_slice()].concat()),
-                            quote(&[b"-include", plan.header.as_slice()].concat()),
-                        ])
-                    })
-                    .flatten()
-                    .collect();
-            }
-        };
         let mut flags = Vec::new();
         if target
             .props
@@ -88,6 +71,25 @@ impl<'a> PchFlags<'a> {
                     .map(|value| quote(&value)),
             );
         }
+        let (plan, option): (_, &[u8]) = match self {
+            Self::Create(plan) => (plan, b"COMPILE_OPTIONS_CREATE_PCH"),
+            Self::Use([plan]) => (*plan, b"COMPILE_OPTIONS_USE_PCH"),
+            Self::Use(plans) => {
+                flags.extend(
+                    plans
+                        .iter()
+                        .filter_map(|plan| {
+                            let arch = plan.arch.as_ref()?;
+                            Some([
+                                quote(&[b"-Xarch_", arch.as_slice()].concat()),
+                                quote(&[b"-include", plan.header.as_slice()].concat()),
+                            ])
+                        })
+                        .flatten(),
+                );
+                return flags;
+            }
+        };
         flags.extend(
             policy
                 .option(option)
@@ -253,11 +255,7 @@ impl Plans {
         let selected = if let [plan] = plans.as_slice()
             && plan.arch.is_none()
         {
-            let provider_archs = model
-                .target(owner)
-                .map(|provider| selected_architectures(model, provider, &resolved.config, language))
-                .unwrap_or_default();
-            if provider_archs != archs {
+            if archs.len() > 1 {
                 return Err(missing());
             }
             vec![plan]

@@ -149,26 +149,41 @@ pub(crate) fn has_package_references(target: &Target) -> bool {
         .is_some_and(|value| !value.is_empty())
 }
 
-/// Names of the projects whose target, or a direct project dependency of
+/// Names of the projects whose target, or any transitive project dependency of
 /// it, has package references.
 fn restore_requirements(projects: &[Project], model: &ProjectModel) -> Vec<String> {
-    let references = |project: &Project| {
-        project
-            .target
-            .and_then(|id| model.target(id))
-            .is_some_and(has_package_references)
-    };
+    let mut required: Vec<bool> = projects
+        .iter()
+        .map(|project| {
+            project
+                .target
+                .and_then(|id| model.target(id))
+                .is_some_and(has_package_references)
+        })
+        .collect();
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for (index, project) in projects.iter().enumerate() {
+            if required.get(index).copied().unwrap_or(false) {
+                continue;
+            }
+            if project
+                .dependencies
+                .iter()
+                .any(|&dep| required.get(dep).copied().unwrap_or(false))
+                && let Some(slot) = required.get_mut(index)
+            {
+                *slot = true;
+                changed = true;
+            }
+        }
+    }
     projects
         .iter()
-        .filter(|project| {
-            references(project)
-                || project
-                    .dependencies
-                    .iter()
-                    .filter_map(|&index| projects.get(index))
-                    .any(references)
-        })
-        .map(|project| project.name.clone())
+        .zip(required)
+        .filter(|&(_, needs)| needs)
+        .map(|(project, _)| project.name.clone())
         .collect()
 }
 

@@ -156,7 +156,8 @@ impl Context<'_> {
                         libraries.push(
                             template
                                 .replace("<LIBRARY>", &library)
-                                .replace("<LINK_ITEM>", &library),
+                                .replace("<LINK_ITEM>", &library)
+                                .replace("<LIB_ITEM>", &library),
                         );
                     }
                 }

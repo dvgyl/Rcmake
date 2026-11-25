@@ -411,7 +411,8 @@ mod tests {
 
     #[test]
     fn cache_records_use_the_command_line_entry_rules() {
-        let cases: [(&[u8], &[u8], CacheType, &[u8]); 7] = [
+        type EntryCase<'a> = (&'a [u8], &'a [u8], CacheType, &'a [u8]);
+        let cases: [EntryCase<'_>; 7] = [
             (
                 b"\"K:EY=1\":STRING='  sp  '",
                 b"K:EY=1",
