@@ -78,10 +78,11 @@ class Fixture:
     compiler: str
     probes: int
     alternate_developer_dir: str = ""
+    source_dir: str = "source"
 
     @property
     def source(self) -> Path:
-        return self.root / "source"
+        return self.root / self.source_dir
 
     @property
     def log(self) -> Path:
@@ -195,9 +196,13 @@ def environment(case: Fixture, store: Path) -> dict[str, str]:
 
 
 def command(binary: Path, case: Fixture, build: Path, no_cache: bool = False,
-            generator: str = "Ninja") -> list:
+            generator: str = "Ninja", fresh: bool = False) -> list:
     """Make a configure command for an empty build directory."""
-    flags = ["--no-probe-cache"] if no_cache else []
+    flags = []
+    if fresh:
+        flags.append("--fresh")
+    if no_cache:
+        flags.append("--no-probe-cache")
     return [binary, *flags, "-S", case.source, "-B", build, "-G", generator,
             f"-DCMAKE_TOOLCHAIN_FILE={case.root / 'toolchain.cmake'}"]
 
@@ -536,8 +541,8 @@ class PublishedProbe:
     artifact: tuple[str, int] | None
 
 
-def audit_store(store: Path) -> dict[Path, PublishedProbe]:
-    """Check published bytes. The runtime checks input stamps during recovery."""
+def audit_store_entries(store: Path) -> dict[Path, dict]:
+    """Validate published store frames and return decoded probe entry details."""
     blob_paths = list(cache_files(store / "blobs", ".blob"))
     entry_paths = list(cache_files(store / "entries/probe-v1", ".entry"))
     if not entry_paths and not blob_paths:
@@ -552,8 +557,25 @@ def audit_store(store: Path) -> dict[Path, PublishedProbe]:
     entries = {}
     for path in entry_paths:
         decoded = decoder.read(path, b"RCMENTRY", ENTRY_LIMIT)
-        entries[path] = PublishedProbe(hashlib.sha256(decoded).hexdigest(), probe_entry(decoded, path, blobs))
+        artifact = probe_entry(decoded, path, blobs)
+        record = json.loads(decoded)
+        entry = record["entry"]
+        entries[path] = {
+            "key": record["key"],
+            "digest": hashlib.sha256(decoded).hexdigest(),
+            "artifact": artifact,
+            "trace": entry["trace"],
+            "checks": entry["payload"]["checks"],
+        }
     return entries
+
+
+def audit_store(store: Path) -> dict[Path, PublishedProbe]:
+    """Check published bytes. The runtime checks input stamps during recovery."""
+    return {
+        path: PublishedProbe(details["digest"], details["artifact"])
+        for path, details in audit_store_entries(store).items()
+    }
 
 
 def require_artifacts(entries: dict[Path, PublishedProbe], copies: set, *, exact: bool) -> None:
@@ -944,24 +966,27 @@ def check_configure_streams(result: dict, case: Fixture, build: Path) -> dict[st
 
 def configure_raw(args, case: Fixture, name: str, env: dict, *, oracle: bool = False,
                   no_cache: bool = False, generator: str | None = None,
-                  cwd: Path | None = None) -> tuple[dict, int]:
+                  cwd: Path | None = None, fresh: bool = False) -> tuple[dict, int]:
     """Configure a custom fixture and return normalized streams, build path, and call count."""
     build = case.root / name
     binary = args.oracle if oracle else args.rcmake
     selected_generator = generator or getattr(args, "generator", "Ninja")
     before = len(case.invocations())
-    result = run_command(command(binary, case, build, no_cache, generator=selected_generator),
-                         cwd or case.root, args.timeout, env)
+    result = run_command(
+        command(binary, case, build, no_cache, generator=selected_generator, fresh=fresh),
+        cwd or case.root, args.timeout, env,
+    )
     data = check_configure_streams(result, case, build)
     data["build"] = build
     return data, len(case.invocations()) - before
 
 
 def _write_custom_fixture(root: Path, compiler: str, lists_text: str, *,
-                          language: str = "C", extra_files: dict[str, bytes] | None = None) -> Fixture:
+                          language: str = "C", extra_files: dict[str, bytes] | None = None,
+                          source_dir: str = "source") -> Fixture:
     """Create a minimal single-directory project with a logged compiler wrapper."""
-    case = Fixture(root, compiler, 1)
-    for name in ("source", "include", "empty"):
+    case = Fixture(root, compiler, 1, source_dir=source_dir)
+    for name in (source_dir, "include", "empty"):
         (root / name).mkdir(parents=True, exist_ok=True)
     case.wrapper()
     (root / "toolchain.cmake").write_text(
@@ -1467,6 +1492,825 @@ message(STATUS "Mispredict summary ${MISPREDICT_FIRST}|${MISPREDICT_SECOND}|${MI
     row["wasted_compiler_calls"] = max(0, calls["jobs8"] - calls["jobs1"])
 
 
+PRELUDE_STATS_CANDIDATES = (
+    Path("CMakeFiles/rcmake/prelude-stats.v1.json"),
+    Path("CMakeFiles/rcmake-prelude-stats.json"),
+    Path("CMakeFiles/rcmake/prelude-result.v1.json"),
+)
+
+
+def read_prelude_stats(build: Path) -> dict:
+    """Read optional prelude reuse counters emitted by a configure build tree."""
+    for relative in PRELUDE_STATS_CANDIDATES:
+        candidate = build / relative
+        if not candidate.is_file():
+            continue
+        raw = json.loads(candidate.read_bytes())
+        if not isinstance(raw, dict):
+            raise ValueError(f"Invalid prelude stats payload in {candidate}.")
+        refusals_raw = raw.get("prelude_refusals", raw.get("refusals", {}))
+        if refusals_raw is None:
+            refusals_raw = {}
+        if not isinstance(refusals_raw, dict):
+            raise ValueError(f"Invalid prelude refusals table in {candidate}.")
+        return {
+            "available": True,
+            "path": str(relative),
+            "prelude_hits": int(raw.get("prelude_hits", raw.get("hits", 0))),
+            "prelude_refusals": {str(key): int(val) for key, val in sorted(refusals_raw.items())},
+            "prelude_rerecords": int(raw.get("prelude_rerecords", raw.get("rerecords", 0))),
+        }
+    return {
+        "available": False,
+        "path": None,
+        "prelude_hits": 0,
+        "prelude_refusals": {},
+        "prelude_rerecords": 0,
+    }
+
+
+def _record_prelude_stats(row: dict, mode_stats: dict[str, dict]) -> None:
+    """Attach aggregated and per-mode prelude counters to a case report row."""
+    refusals: dict[str, int] = {}
+    hits = 0
+    rerecords = 0
+    available = False
+    for stats in mode_stats.values():
+        available = available or bool(stats["available"])
+        hits += int(stats["prelude_hits"])
+        rerecords += int(stats["prelude_rerecords"])
+        for reason, count in stats["prelude_refusals"].items():
+            refusals[reason] = refusals.get(reason, 0) + int(count)
+    row["prelude_stats_available"] = available
+    row["prelude_hits"] = hits
+    row["prelude_refusals"] = dict(sorted(refusals.items()))
+    row["prelude_rerecords"] = rerecords
+    row["prelude_modes"] = mode_stats
+
+
+def _require_prelude_hits(stats: dict, *, label: str, build: Path) -> None:
+    """Require non-vacuous prelude reuse (prelude_hits > 0)."""
+    if stats["prelude_hits"] > 0:
+        return
+    if not stats["available"]:
+        raise ValueError(
+            f"{label}: expected prelude reuse (prelude_hits > 0), found prelude_hits=0 "
+            f"(no prelude stats file emitted in {build})."
+        )
+    raise ValueError(
+        f"{label}: expected prelude reuse (prelude_hits > 0), found prelude_hits=0 "
+        f"(refusals={stats['prelude_refusals']}, rerecords={stats['prelude_rerecords']})."
+    )
+
+
+def _require_no_prelude_hits(stats: dict, *, label: str) -> None:
+    """Require zero prelude hits when stats report a miss or refusal."""
+    if stats["available"] and stats["prelude_hits"] != 0:
+        raise ValueError(
+            f"{label}: expected prelude miss or refusal (prelude_hits == 0), "
+            f"found prelude_hits={stats['prelude_hits']}."
+        )
+
+
+def _prelude_env(
+    case: Fixture,
+    store: Path,
+    *,
+    reuse_off: bool = False,
+    extra: dict[str, str] | None = None,
+) -> dict[str, str]:
+    """Build an isolated store environment with prelude measurement enabled."""
+    env = environment(case, store)
+    env["RCMAKE_MEASURE_PRELUDE"] = "1"
+    if reuse_off:
+        env["RCMAKE_NO_PRELUDE_REUSE"] = "1"
+    if extra:
+        env.update(extra)
+    return env
+
+
+def normalize_journal_check(check, source: Path, build: Path, store: Path | None = None):
+    """Normalize source, build, store, and scratch paths inside one serialized journal Check."""
+    if isinstance(check, str):
+        raw = normalize(check.encode("utf-8"), source, build)
+        if store is not None:
+            raw = raw.replace(os.fsencode(store), b"<STORE>")
+        return SCRATCH_ID.sub(b"<PROBE>", raw).decode("utf-8", errors="replace")
+    if isinstance(check, list):
+        return [normalize_journal_check(item, source, build, store) for item in check]
+    if isinstance(check, dict):
+        return {key: normalize_journal_check(val, source, build, store) for key, val in check.items()}
+    return check
+
+
+def resolve_vendored_cmake_root(rcmake: Path) -> Path:
+    """Locate the vendored CMake data root containing Modules/CMakeDetermineSystem.cmake."""
+    candidates: list[Path] = [
+        rcmake.parent.parent / "share/cmake-4.5",
+        Path(__file__).resolve().parents[2] / "modules/cmake-4.5",
+    ]
+    override = os.environ.get("RCMAKE_VENDORED_DATA_ROOT")
+    if override:
+        candidates.insert(0, Path(override))
+    for candidate in candidates:
+        if (candidate / "Modules/CMakeDetermineSystem.cmake").is_file():
+            return candidate.resolve()
+    raise ValueError(
+        "Could not locate vendored CMake Modules/ (expected share/cmake-4.5 or modules/cmake-4.5)."
+    )
+
+
+def pq_journal(args, root: Path, row: dict) -> None:
+    """Require an admitted probe's journal Check list to match with and without PlatformQueries (L1)."""
+    case = fixture(root, args.compiler, probes=1)
+    store_l1 = root / "store-l1"
+    store_no_l1 = root / "store-no-l1"
+    env_l1 = _prelude_env(case, store_l1)
+    env_no_l1 = _prelude_env(
+        case,
+        store_no_l1,
+        extra={"RCMAKE_NO_PLATFORM_QUERIES": "1"},
+    )
+    calls = row["compiler_calls"] = {}
+
+    with_l1, calls["with_l1"] = configure(args, case, "with-l1", env_l1)
+    check_result(with_l1, True)
+    require_calls(calls, "with_l1", 1)
+    oracle, calls["oracle"] = configure(args, case, "oracle", env_l1, oracle=True)
+    require_calls(calls, "oracle", 1)
+    compare(with_l1, oracle, PARITY_KEYS, "PQ-journal with-L1 CMake parity")
+    if args.smoke:
+        return
+
+    without_l1, calls["without_l1"] = configure(args, case, "without-l1", env_no_l1)
+    check_result(without_l1, True)
+    require_calls(calls, "without_l1", 1)
+    compare(without_l1, oracle, PARITY_KEYS, "PQ-journal without-L1 CMake parity")
+
+    entries_l1 = audit_store_entries(store_l1)
+    entries_no_l1 = audit_store_entries(store_no_l1)
+    row["published_with_l1"] = len(entries_l1)
+    row["published_without_l1"] = len(entries_no_l1)
+    if len(entries_l1) != 1 or len(entries_no_l1) != 1:
+        raise ValueError(
+            f"Expected one admitted probe entry in both L1 stores. "
+            f"Found with_l1={len(entries_l1)}, without_l1={len(entries_no_l1)}."
+        )
+    detail_l1 = next(iter(entries_l1.values()))
+    detail_no_l1 = next(iter(entries_no_l1.values()))
+    checks_l1 = [
+        normalize_journal_check(check, case.source, case.root / "with-l1", store_l1)
+        for check, _ in detail_l1["checks"]
+    ]
+    checks_no_l1 = [
+        normalize_journal_check(check, case.source, case.root / "without-l1", store_no_l1)
+        for check, _ in detail_no_l1["checks"]
+    ]
+    row["check_count"] = len(checks_l1)
+    row["checks_with_l1"] = checks_l1
+    row["checks_without_l1"] = checks_no_l1
+    _record_prelude_stats(row, {
+        "with_l1": read_prelude_stats(case.root / "with-l1"),
+        "without_l1": read_prelude_stats(case.root / "without-l1"),
+    })
+    if checks_l1 != checks_no_l1:
+        left = json.dumps(checks_l1, sort_keys=True, indent=2).encode("utf-8")
+        right = json.dumps(checks_no_l1, sort_keys=True, indent=2).encode("utf-8")
+        diff = diff_bytes(right, left, "without-l1/checks", "with-l1/checks")
+        raise ValueError(
+            "Admitted probe journal Check list differs between L1 and without-L1.\n"
+            + diff.decode(errors="replace")
+        )
+
+
+def prelude_env(args, root: Path, row: dict) -> None:
+    """Require set(ENV{CFLAGS} -DPRELUDE_TRAP) between two checks to reach the second probe."""
+    lists = """\
+cmake_minimum_required(VERSION 4.5)
+project(ProbePreludeEnv C)
+include(CheckCSourceCompiles)
+
+unset(CMAKE_C_FLAGS CACHE)
+unset(CMAKE_C_FLAGS)
+
+check_c_source_compiles(
+  "#ifdef PRELUDE_TRAP\\nint trap_must_not_be_set = ;\\n#endif\\nint main(void) { return 0; }"
+  PRELUDE_ENV_BEFORE)
+
+set(ENV{CFLAGS} "-DPRELUDE_TRAP=1")
+
+check_c_source_compiles(
+  "#ifndef PRELUDE_TRAP\\nint trap_must_be_set = ;\\n#endif\\nint main(void) { return 0; }"
+  PRELUDE_ENV_AFTER)
+
+set(summary "")
+foreach(var IN ITEMS PRELUDE_ENV_BEFORE PRELUDE_ENV_AFTER)
+  if(${var})
+    string(APPEND summary "${var}=1\\n")
+  else()
+    string(APPEND summary "${var}=0\\n")
+  endif()
+endforeach()
+file(WRITE "${CMAKE_BINARY_DIR}/prelude-env.txt" "${summary}")
+message(STATUS "PreludeEnv ${PRELUDE_ENV_BEFORE}|${PRELUDE_ENV_AFTER}")
+"""
+    cache_keys = ("PRELUDE_ENV_BEFORE", "PRELUDE_ENV_AFTER")
+    expected = b"PRELUDE_ENV_BEFORE=1\nPRELUDE_ENV_AFTER=1\n"
+    case = _write_custom_fixture(root, args.compiler, lists)
+    calls = row["compiler_calls"] = {}
+    compare_keys = ("results", "stdout", "stderr", "cache")
+
+    def run_lane(name: str, store: Path, *, oracle: bool = False, no_cache: bool = False,
+                 reuse_off: bool = False, fresh: bool = False) -> tuple[dict, int]:
+        lane_env = _prelude_env(case, store, reuse_off=reuse_off)
+        data, count = configure_raw(args, case, name, lane_env, oracle=oracle,
+                                    no_cache=no_cache, fresh=fresh)
+        build = data["build"]
+        data["results"] = (build / "prelude-env.txt").read_bytes()
+        data["cache"] = read_cache_entries(build, cache_keys)
+        data["prelude_stats"] = read_prelude_stats(build)
+        return data, count
+
+    cached, calls["cached"] = run_lane("cached", root / "store-cached")
+    oracle, calls["oracle"] = run_lane("oracle", root / "store-oracle", oracle=True)
+    require_calls(calls, "oracle", 2)
+    if cached["results"] != expected:
+        raise ValueError(f"Unexpected prelude-env results: {cached['results']!r}.")
+    compare(cached, oracle, compare_keys, "Prelude-env cached CMake parity")
+    mode_stats = {"cached": cached["prelude_stats"]}
+    if args.smoke:
+        _record_prelude_stats(row, mode_stats)
+        return
+
+    no_cache, calls["no_probe_cache"] = run_lane("no-probe-cache", root / "store-nocache", no_cache=True)
+    reuse_off, calls["reuse_off"] = run_lane("reuse-off", root / "store-reuse-off",
+                                             no_cache=True, reuse_off=True)
+    fresh_run, calls["fresh"] = run_lane("fresh", root / "store-fresh", fresh=True)
+    mode_stats["no_probe_cache"] = no_cache["prelude_stats"]
+    mode_stats["fresh"] = fresh_run["prelude_stats"]
+    _record_prelude_stats(row, mode_stats)
+
+    for label, data in (("no-probe-cache", no_cache), ("reuse-off", reuse_off), ("fresh", fresh_run)):
+        if data["results"] != expected:
+            raise ValueError(f"Unexpected prelude-env results in {label}: {data['results']!r}.")
+        compare(data, oracle, compare_keys, f"Prelude-env {label} CMake parity")
+    compare(cached, reuse_off, compare_keys, "Prelude-env cached vs reuse-off parity")
+    compare(cached, fresh_run, compare_keys, "Prelude-env cached vs --fresh parity")
+
+
+def prelude_policy(args, root: Path, row: dict) -> None:
+    """Require cmake_policy(SET CMP0128 OLD) between probes to select a distinct prelude key."""
+    lists = """\
+cmake_minimum_required(VERSION 4.5)
+project(ProbePreludePolicy C)
+include(CheckCSourceCompiles)
+
+set(CMAKE_C_EXTENSIONS OFF)
+cmake_policy(SET CMP0128 NEW)
+check_c_source_compiles(
+  "#ifdef __STRICT_ANSI__\\nint main(void) { return 0; }\\n#else\\nint need_strict_ansi = ;\\n#endif\\n"
+  PRELUDE_POL_NEW)
+
+cmake_policy(SET CMP0128 OLD)
+check_c_source_compiles(
+  "#ifdef __STRICT_ANSI__\\nint main(void) { return 0; }\\n#else\\nint need_strict_ansi = ;\\n#endif\\n"
+  PRELUDE_POL_OLD)
+
+set(summary "")
+foreach(var IN ITEMS PRELUDE_POL_NEW PRELUDE_POL_OLD)
+  if(${var})
+    string(APPEND summary "${var}=1\\n")
+  else()
+    string(APPEND summary "${var}=0\\n")
+  endif()
+endforeach()
+file(WRITE "${CMAKE_BINARY_DIR}/prelude-policy.txt" "${summary}")
+message(STATUS "PreludePolicy ${PRELUDE_POL_NEW}|${PRELUDE_POL_OLD}")
+"""
+    cache_keys = ("PRELUDE_POL_NEW", "PRELUDE_POL_OLD")
+    case = _write_custom_fixture(root, args.compiler, lists)
+    calls = row["compiler_calls"] = {}
+    compare_keys = ("results", "stdout", "stderr", "cache")
+
+    def run_lane(name: str, store: Path, *, oracle: bool = False, no_cache: bool = False,
+                 reuse_off: bool = False) -> tuple[dict, int]:
+        lane_env = _prelude_env(case, store, reuse_off=reuse_off)
+        data, count = configure_raw(args, case, name, lane_env, oracle=oracle, no_cache=no_cache)
+        build = data["build"]
+        data["results"] = (build / "prelude-policy.txt").read_bytes()
+        data["cache"] = read_cache_entries(build, cache_keys)
+        data["prelude_stats"] = read_prelude_stats(build)
+        return data, count
+
+    cached, calls["cached"] = run_lane("cached", root / "store-cached")
+    oracle, calls["oracle"] = run_lane("oracle", root / "store-oracle", oracle=True)
+    require_calls(calls, "oracle", 2)
+    compare(cached, oracle, compare_keys, "Prelude-policy cached CMake parity")
+    mode_stats = {"cached": cached["prelude_stats"]}
+    if args.smoke:
+        _record_prelude_stats(row, mode_stats)
+        return
+
+    no_cache, calls["no_probe_cache"] = run_lane("no-probe-cache", root / "store-nocache", no_cache=True)
+    reuse_off, calls["reuse_off"] = run_lane("reuse-off", root / "store-reuse-off",
+                                             no_cache=True, reuse_off=True)
+    mode_stats["no_probe_cache"] = no_cache["prelude_stats"]
+    _record_prelude_stats(row, mode_stats)
+
+    compare(no_cache, oracle, compare_keys, "Prelude-policy no-probe-cache CMake parity")
+    compare(cached, reuse_off, compare_keys, "Prelude-policy cached vs reuse-off parity")
+    _require_no_prelude_hits(cached["prelude_stats"], label="prelude-policy (cached)")
+    _require_no_prelude_hits(no_cache["prelude_stats"], label="prelude-policy (no-probe-cache)")
+
+
+def prelude_flags(args, root: Path, row: dict) -> None:
+    """Require non-vacuous prelude reuse across probes with different CMAKE_REQUIRED_DEFINITIONS."""
+    lists = """\
+cmake_minimum_required(VERSION 4.5)
+project(ProbePreludeFlags C)
+include(CheckCSourceCompiles)
+
+set(CMAKE_REQUIRED_DEFINITIONS "-DPRELUDE_FLAG_A=1")
+check_c_source_compiles(
+  "#ifndef PRELUDE_FLAG_A\\nint missing_a = ;\\n#endif\\n#ifdef PRELUDE_FLAG_B\\nint leaked_b = ;\\n#endif\\nint main(void) { return 0; }"
+  PRELUDE_FLAGS_A)
+
+set(CMAKE_REQUIRED_DEFINITIONS "-DPRELUDE_FLAG_B=1")
+check_c_source_compiles(
+  "#ifndef PRELUDE_FLAG_B\\nint missing_b = ;\\n#endif\\n#ifdef PRELUDE_FLAG_A\\nint leaked_a = ;\\n#endif\\nint main(void) { return 0; }"
+  PRELUDE_FLAGS_B)
+
+set(summary "")
+foreach(var IN ITEMS PRELUDE_FLAGS_A PRELUDE_FLAGS_B)
+  if(${var})
+    string(APPEND summary "${var}=1\\n")
+  else()
+    string(APPEND summary "${var}=0\\n")
+  endif()
+endforeach()
+file(WRITE "${CMAKE_BINARY_DIR}/prelude-flags.txt" "${summary}")
+message(STATUS "PreludeFlags ${PRELUDE_FLAGS_A}|${PRELUDE_FLAGS_B}")
+"""
+    cache_keys = ("PRELUDE_FLAGS_A", "PRELUDE_FLAGS_B")
+    expected = b"PRELUDE_FLAGS_A=1\nPRELUDE_FLAGS_B=1\n"
+    case = _write_custom_fixture(root, args.compiler, lists)
+    calls = row["compiler_calls"] = {}
+    compare_keys = ("results", "stdout", "stderr", "cache")
+
+    def run_lane(name: str, store: Path, *, oracle: bool = False, no_cache: bool = False,
+                 reuse_off: bool = False) -> tuple[dict, int]:
+        lane_env = _prelude_env(case, store, reuse_off=reuse_off)
+        data, count = configure_raw(args, case, name, lane_env, oracle=oracle, no_cache=no_cache)
+        build = data["build"]
+        data["results"] = (build / "prelude-flags.txt").read_bytes()
+        data["cache"] = read_cache_entries(build, cache_keys)
+        data["prelude_stats"] = read_prelude_stats(build)
+        return data, count
+
+    cached, calls["cached"] = run_lane("cached", root / "store-cached")
+    oracle, calls["oracle"] = run_lane("oracle", root / "store-oracle", oracle=True)
+    require_calls(calls, "oracle", 2)
+    if cached["results"] != expected:
+        raise ValueError(f"Unexpected prelude-flags results: {cached['results']!r}.")
+    compare(cached, oracle, compare_keys, "Prelude-flags cached CMake parity")
+    mode_stats = {"cached": cached["prelude_stats"]}
+    if args.smoke:
+        _record_prelude_stats(row, mode_stats)
+        return
+
+    no_cache, calls["no_probe_cache"] = run_lane("no-probe-cache", root / "store-nocache", no_cache=True)
+    reuse_off, calls["reuse_off"] = run_lane("reuse-off", root / "store-reuse-off",
+                                             no_cache=True, reuse_off=True)
+    mode_stats["no_probe_cache"] = no_cache["prelude_stats"]
+    _record_prelude_stats(row, mode_stats)
+
+    if no_cache["results"] != expected:
+        raise ValueError(f"Unexpected prelude-flags no-probe-cache results: {no_cache['results']!r}.")
+    compare(no_cache, oracle, compare_keys, "Prelude-flags no-probe-cache CMake parity")
+    compare(cached, reuse_off, compare_keys, "Prelude-flags cached vs reuse-off parity")
+    _require_prelude_hits(cached["prelude_stats"], label="prelude-flags (cached)", build=cached["build"])
+    _require_prelude_hits(
+        no_cache["prelude_stats"],
+        label="prelude-flags (no-probe-cache)",
+        build=no_cache["build"],
+    )
+
+
+def prelude_flag_collision(args, root: Path, row: dict) -> None:
+    """Require CMAKE_FLAGS -DCMAKE_C_FLAGS=-DX to bypass prelude reuse and match cold results."""
+    lists = """\
+cmake_minimum_required(VERSION 4.5)
+project(ProbePreludeFlagCollision C)
+
+try_compile(PRELUDE_COLLISION_BASE
+  SOURCE_FROM_CONTENT "probe_1.c"
+    "#ifdef X\\nint x_must_not_be_set = ;\\n#endif\\nint main(void) { return 0; }\\n"
+  OUTPUT_VARIABLE base_output
+  NO_CACHE)
+
+try_compile(PRELUDE_COLLISION_OVERRIDE
+  SOURCE_FROM_CONTENT "probe_2.c"
+    "#ifndef X\\nint x_must_be_set = ;\\n#endif\\nint main(void) { return 0; }\\n"
+  CMAKE_FLAGS "-DCMAKE_C_FLAGS=-DX"
+  OUTPUT_VARIABLE override_output
+  NO_CACHE)
+
+file(WRITE "${CMAKE_BINARY_DIR}/prelude-flag-collision.txt"
+  "BASE=${PRELUDE_COLLISION_BASE}\\nOVERRIDE=${PRELUDE_COLLISION_OVERRIDE}\\n")
+message(STATUS "PreludeFlagCollision ${PRELUDE_COLLISION_BASE}|${PRELUDE_COLLISION_OVERRIDE}")
+"""
+    expected = b"BASE=TRUE\nOVERRIDE=TRUE\n"
+    case = _write_custom_fixture(root, args.compiler, lists)
+    calls = row["compiler_calls"] = {}
+    compare_keys = ("results", "stdout", "stderr")
+
+    def run_lane(name: str, store: Path, *, oracle: bool = False, no_cache: bool = False,
+                 reuse_off: bool = False) -> tuple[dict, int]:
+        lane_env = _prelude_env(case, store, reuse_off=reuse_off)
+        data, count = configure_raw(args, case, name, lane_env, oracle=oracle, no_cache=no_cache)
+        build = data["build"]
+        data["results"] = (build / "prelude-flag-collision.txt").read_bytes()
+        data["prelude_stats"] = read_prelude_stats(build)
+        return data, count
+
+    cached, calls["cached"] = run_lane("cached", root / "store-cached")
+    oracle, calls["oracle"] = run_lane("oracle", root / "store-oracle", oracle=True)
+    require_calls(calls, "oracle", 2)
+    if cached["results"] != expected:
+        raise ValueError(f"Unexpected prelude-flag-collision results: {cached['results']!r}.")
+    compare(cached, oracle, compare_keys, "Prelude-flag-collision cached CMake parity")
+    mode_stats = {"cached": cached["prelude_stats"]}
+    if args.smoke:
+        _record_prelude_stats(row, mode_stats)
+        return
+
+    no_cache, calls["no_probe_cache"] = run_lane("no-probe-cache", root / "store-nocache", no_cache=True)
+    reuse_off, calls["reuse_off"] = run_lane("reuse-off", root / "store-reuse-off",
+                                             no_cache=True, reuse_off=True)
+    mode_stats["no_probe_cache"] = no_cache["prelude_stats"]
+    _record_prelude_stats(row, mode_stats)
+
+    if no_cache["results"] != expected:
+        raise ValueError(f"Unexpected prelude-flag-collision no-probe-cache results: {no_cache['results']!r}.")
+    compare(no_cache, oracle, compare_keys, "Prelude-flag-collision no-probe-cache CMake parity")
+    compare(cached, reuse_off, compare_keys, "Prelude-flag-collision cached vs reuse-off parity")
+    _require_no_prelude_hits(cached["prelude_stats"], label="prelude-flag-collision (cached)")
+    _require_no_prelude_hits(no_cache["prelude_stats"], label="prelude-flag-collision (no-probe-cache)")
+
+
+def prelude_dir_read(args, root: Path, row: dict) -> None:
+    """Require a propagated include reading CMAKE_BINARY_DIR to be refused and match cold results."""
+    hook = (
+        'file(WRITE "${CMAKE_BINARY_DIR}/prelude_bin_dir.h" "#define PRELUDE_HAS_BIN_DIR 1\\n")\n'
+        'include_directories("${CMAKE_BINARY_DIR}")\n'
+    )
+    lists = """\
+cmake_minimum_required(VERSION 4.5)
+project(ProbePreludeDirRead C)
+set(CMAKE_PROJECT_TOP_LEVEL_INCLUDES "${CMAKE_CURRENT_SOURCE_DIR}/dir_read_hook.cmake")
+set(CMAKE_TRY_COMPILE_PLATFORM_VARIABLES CMAKE_PROJECT_TOP_LEVEL_INCLUDES)
+
+try_compile(PRELUDE_DIR_FIRST
+  SOURCE_FROM_CONTENT "probe_1.c"
+    "#include \\"prelude_bin_dir.h\\"\\n#ifndef PRELUDE_HAS_BIN_DIR\\nint missing_dir = ;\\n#endif\\nint main(void) { return 0; }\\n"
+  OUTPUT_VARIABLE first_output
+  NO_CACHE)
+
+try_compile(PRELUDE_DIR_SECOND
+  SOURCE_FROM_CONTENT "probe_2.c"
+    "#include \\"prelude_bin_dir.h\\"\\n#ifndef PRELUDE_HAS_BIN_DIR\\nint missing_dir = ;\\n#endif\\nint main(void) { return 0; }\\n"
+  OUTPUT_VARIABLE second_output
+  NO_CACHE)
+
+file(WRITE "${CMAKE_BINARY_DIR}/prelude-dir-read.txt"
+  "FIRST=${PRELUDE_DIR_FIRST}\\nSECOND=${PRELUDE_DIR_SECOND}\\n")
+message(STATUS "PreludeDirRead ${PRELUDE_DIR_FIRST}|${PRELUDE_DIR_SECOND}")
+"""
+    expected = b"FIRST=TRUE\nSECOND=TRUE\n"
+    case = _write_custom_fixture(
+        root,
+        args.compiler,
+        lists,
+        extra_files={"source/dir_read_hook.cmake": hook.encode("utf-8")},
+    )
+    calls = row["compiler_calls"] = {}
+    compare_keys = ("results", "stdout", "stderr")
+
+    def run_lane(name: str, store: Path, *, oracle: bool = False, no_cache: bool = False,
+                 reuse_off: bool = False) -> tuple[dict, int]:
+        lane_env = _prelude_env(case, store, reuse_off=reuse_off)
+        data, count = configure_raw(args, case, name, lane_env, oracle=oracle, no_cache=no_cache)
+        build = data["build"]
+        data["results"] = (build / "prelude-dir-read.txt").read_bytes()
+        data["prelude_stats"] = read_prelude_stats(build)
+        return data, count
+
+    cached, calls["cached"] = run_lane("cached", root / "store-cached")
+    oracle, calls["oracle"] = run_lane("oracle", root / "store-oracle", oracle=True)
+    require_calls(calls, "oracle", 2)
+    if cached["results"] != expected:
+        raise ValueError(f"Unexpected prelude-dir-read results: {cached['results']!r}.")
+    compare(cached, oracle, compare_keys, "Prelude-dir-read cached CMake parity")
+    mode_stats = {"cached": cached["prelude_stats"]}
+    if args.smoke:
+        _record_prelude_stats(row, mode_stats)
+        return
+
+    no_cache, calls["no_probe_cache"] = run_lane("no-probe-cache", root / "store-nocache", no_cache=True)
+    reuse_off, calls["reuse_off"] = run_lane("reuse-off", root / "store-reuse-off",
+                                             no_cache=True, reuse_off=True)
+    mode_stats["no_probe_cache"] = no_cache["prelude_stats"]
+    _record_prelude_stats(row, mode_stats)
+
+    if no_cache["results"] != expected:
+        raise ValueError(f"Unexpected prelude-dir-read no-probe-cache results: {no_cache['results']!r}.")
+    compare(no_cache, oracle, compare_keys, "Prelude-dir-read no-probe-cache CMake parity")
+    compare(cached, reuse_off, compare_keys, "Prelude-dir-read cached vs reuse-off parity")
+    _require_no_prelude_hits(cached["prelude_stats"], label="prelude-dir-read (cached)")
+    _require_no_prelude_hits(no_cache["prelude_stats"], label="prelude-dir-read (no-probe-cache)")
+
+
+def prelude_module_write(args, root: Path, row: dict) -> None:
+    """Require a second probe to observe updated contents when the parent rewrites a propagated include."""
+    lists = """\
+cmake_minimum_required(VERSION 4.5)
+project(ProbePreludeModuleWrite C)
+set(HOOK_FILE "${CMAKE_BINARY_DIR}/propagated_hook.cmake")
+file(WRITE "${HOOK_FILE}" "add_compile_definitions(HOOK_VERSION=1)\\n")
+set(CMAKE_PROJECT_TOP_LEVEL_INCLUDES "${HOOK_FILE}")
+set(CMAKE_TRY_COMPILE_PLATFORM_VARIABLES CMAKE_PROJECT_TOP_LEVEL_INCLUDES)
+
+try_compile(PRELUDE_MOD_FIRST
+  SOURCE_FROM_CONTENT "probe_1.c"
+    "#if HOOK_VERSION != 1\\nint wrong_v1 = ;\\n#endif\\nint main(void) { return 0; }\\n"
+  OUTPUT_VARIABLE first_output
+  NO_CACHE)
+
+file(WRITE "${HOOK_FILE}" "add_compile_definitions(HOOK_VERSION=2)\\n")
+
+try_compile(PRELUDE_MOD_SECOND
+  SOURCE_FROM_CONTENT "probe_2.c"
+    "#if HOOK_VERSION != 2\\nint wrong_v2 = ;\\n#endif\\nint main(void) { return 0; }\\n"
+  OUTPUT_VARIABLE second_output
+  NO_CACHE)
+
+file(WRITE "${CMAKE_BINARY_DIR}/prelude-module-write.txt"
+  "FIRST=${PRELUDE_MOD_FIRST}\\nSECOND=${PRELUDE_MOD_SECOND}\\n")
+message(STATUS "PreludeModuleWrite ${PRELUDE_MOD_FIRST}|${PRELUDE_MOD_SECOND}")
+"""
+    expected = b"FIRST=TRUE\nSECOND=TRUE\n"
+    case = _write_custom_fixture(root, args.compiler, lists)
+    calls = row["compiler_calls"] = {}
+    compare_keys = ("results", "stdout", "stderr")
+
+    def run_lane(name: str, store: Path, *, oracle: bool = False, no_cache: bool = False,
+                 reuse_off: bool = False) -> tuple[dict, int]:
+        lane_env = _prelude_env(case, store, reuse_off=reuse_off)
+        data, count = configure_raw(args, case, name, lane_env, oracle=oracle, no_cache=no_cache)
+        build = data["build"]
+        data["results"] = (build / "prelude-module-write.txt").read_bytes()
+        data["prelude_stats"] = read_prelude_stats(build)
+        return data, count
+
+    cached, calls["cached"] = run_lane("cached", root / "store-cached")
+    oracle, calls["oracle"] = run_lane("oracle", root / "store-oracle", oracle=True)
+    require_calls(calls, "oracle", 2)
+    if cached["results"] != expected:
+        raise ValueError(f"Unexpected prelude-module-write results: {cached['results']!r}.")
+    compare(cached, oracle, compare_keys, "Prelude-module-write cached CMake parity")
+    mode_stats = {"cached": cached["prelude_stats"]}
+    if args.smoke:
+        _record_prelude_stats(row, mode_stats)
+        return
+
+    no_cache, calls["no_probe_cache"] = run_lane("no-probe-cache", root / "store-nocache", no_cache=True)
+    reuse_off, calls["reuse_off"] = run_lane("reuse-off", root / "store-reuse-off",
+                                             no_cache=True, reuse_off=True)
+    mode_stats["no_probe_cache"] = no_cache["prelude_stats"]
+    _record_prelude_stats(row, mode_stats)
+
+    if no_cache["results"] != expected:
+        raise ValueError(f"Unexpected prelude-module-write no-probe-cache results: {no_cache['results']!r}.")
+    compare(no_cache, oracle, compare_keys, "Prelude-module-write no-probe-cache CMake parity")
+    compare(cached, reuse_off, compare_keys, "Prelude-module-write cached vs reuse-off parity")
+
+
+def _stage_custom_cmake_root(source_root: Path, dest_root: Path) -> Path:
+    """Copy vendored Modules/ and Templates/ into a mutable content-based CMAKE_ROOT."""
+    dest_root.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(source_root / "Modules", dest_root / "Modules")
+    templates = source_root / "Templates"
+    if templates.is_dir():
+        shutil.copytree(templates, dest_root / "Templates")
+    backdate(*dest_root.rglob("*"), dest_root)
+    return dest_root
+
+
+def prelude_journal_store(args, root: Path, row: dict) -> None:
+    """Share a store across two projects, require reuse in run 1, and miss after editing CMAKE_ROOT."""
+    vendored = resolve_vendored_cmake_root(args.rcmake)
+    custom_root = _stage_custom_cmake_root(vendored, root / "custom-cmake-root")
+    row["custom_cmake_root"] = str(custom_root)
+
+    lists_a = """\
+cmake_minimum_required(VERSION 4.5)
+project(ProbePreludeStoreA C)
+include(CheckCSourceCompiles)
+
+check_c_source_compiles("int main(void) { return 0; }" STORE_A_OK)
+file(WRITE "${CMAKE_BINARY_DIR}/store-result.txt" "A=${STORE_A_OK}\\n")
+message(STATUS "PreludeStoreA ${STORE_A_OK}")
+"""
+    lists_b = """\
+cmake_minimum_required(VERSION 4.5)
+project(ProbePreludeStoreB C)
+include(CheckCSourceCompiles)
+
+set(CMAKE_REQUIRED_DEFINITIONS "-DSTORE_PROJECT_B=1")
+check_c_source_compiles(
+  "#ifndef STORE_MODULE_V2\\nint need_module_v2 = ;\\n#endif\\nint main(void) { return 0; }"
+  STORE_B_HAS_V2)
+if(STORE_B_HAS_V2)
+  set(_v2 "1")
+else()
+  set(_v2 "0")
+endif()
+file(WRITE "${CMAKE_BINARY_DIR}/store-result.txt" "HAS_V2=${_v2}\\n")
+message(STATUS "PreludeStoreB HAS_V2=${_v2}")
+"""
+    # Share one toolchain, compiler wrapper, and empty CPATH across both projects
+    # so project-b hits the store entry published by project-a in run 1.
+    case_a = _write_custom_fixture(
+        root,
+        args.compiler,
+        lists_a,
+        source_dir="source-a",
+        extra_files={"source-b/CMakeLists.txt": lists_b.encode("utf-8")},
+    )
+    case_b = Fixture(root, args.compiler, 1, source_dir="source-b")
+    calls = row["compiler_calls"] = {}
+
+    def run_project(case: Fixture, name: str, store: Path, *, oracle: bool = False,
+                    no_cache: bool = False, reuse_off: bool = False) -> tuple[dict, int]:
+        extra = {} if oracle else {"RCMAKE_VENDORED_DATA_ROOT": str(custom_root)}
+        lane_env = _prelude_env(case, store, reuse_off=reuse_off, extra=extra)
+        data, count = configure_raw(args, case, name, lane_env, oracle=oracle, no_cache=no_cache)
+        build = data["build"]
+        data["results"] = (build / "store-result.txt").read_bytes()
+        data["prelude_stats"] = read_prelude_stats(build)
+        return data, count
+
+    shared_store = root / "shared-store"
+    shared_nocache_store = root / "shared-store-nocache"
+    run1_a, calls["run1_project_a"] = run_project(case_a, "a-run1-cached", shared_store)
+    if run1_a["results"] != b"A=1\n":
+        raise ValueError(f"Unexpected project-a result in run 1: {run1_a['results']!r}.")
+    run1_b, calls["run1_project_b_cached"] = run_project(case_b, "b-run1-cached", shared_store)
+    oracle_b, calls["oracle_project_b"] = run_project(case_b, "b-oracle-before", root / "store-oracle", oracle=True)
+    if run1_b["results"] != b"HAS_V2=0\n":
+        raise ValueError(f"Unexpected project-b run 1 result before module edit: {run1_b['results']!r}.")
+    compare(run1_b, oracle_b, ("results", "stdout", "stderr"), "Prelude-journal-store run 1 CMake parity")
+
+    mode_stats = {
+        "run1_project_a": run1_a["prelude_stats"],
+        "run1_project_b_cached": run1_b["prelude_stats"],
+    }
+    if args.smoke:
+        _record_prelude_stats(row, mode_stats)
+        return
+
+    run1_a_nc, calls["run1_project_a_nocache"] = run_project(
+        case_a, "a-run1-nocache", shared_nocache_store, no_cache=True
+    )
+    run1_b_nc, calls["run1_project_b_nocache"] = run_project(
+        case_b, "b-run1-nocache", shared_nocache_store, no_cache=True
+    )
+    compare(run1_b_nc, oracle_b, ("results", "stdout", "stderr"),
+            "Prelude-journal-store run 1 no-probe-cache CMake parity")
+    mode_stats["run1_project_a_nocache"] = run1_a_nc["prelude_stats"]
+    mode_stats["run1_project_b_nocache"] = run1_b_nc["prelude_stats"]
+
+    # Mutate a copied module under the content-based CMAKE_ROOT and backdate it.
+    c_info = custom_root / "Modules/CMakeCInformation.cmake"
+    c_info.write_text(
+        c_info.read_text(encoding="utf-8")
+        + '\nset(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -DSTORE_MODULE_V2=1")\n',
+        encoding="utf-8",
+    )
+    backdate(c_info, c_info.parent)
+
+    run2_b, calls["run2_project_b_cached"] = run_project(case_b, "b-run2-cached", shared_store)
+    run2_b_nc, calls["run2_project_b_nocache"] = run_project(
+        case_b, "b-run2-nocache", shared_nocache_store, no_cache=True
+    )
+    run2_cold, calls["run2_project_b_reuse_off"] = run_project(
+        case_b, "b-run2-reuse-off", root / "store-reuse-off", no_cache=True, reuse_off=True
+    )
+    mode_stats["run2_project_b_cached"] = run2_b["prelude_stats"]
+    mode_stats["run2_project_b_nocache"] = run2_b_nc["prelude_stats"]
+    _record_prelude_stats(row, mode_stats)
+
+    if run2_cold["results"] != b"HAS_V2=1\n":
+        raise ValueError(f"Cold reuse-off run did not observe mutated CMAKE_ROOT module: {run2_cold['results']!r}.")
+    if run2_b["results"] != b"HAS_V2=1\n":
+        raise ValueError(f"Run 2 reused stale prelude after CMAKE_ROOT module edit: {run2_b['results']!r}.")
+    if run2_b_nc["results"] != b"HAS_V2=1\n":
+        raise ValueError(f"Run 2 (no-probe-cache) returned stale result after module edit: {run2_b_nc['results']!r}.")
+    compare(run2_b, run2_cold, ("results", "stdout", "stderr"),
+            "Prelude-journal-store run 2 cached vs reuse-off parity")
+    compare(run2_b_nc, run2_cold, ("results", "stdout", "stderr"),
+            "Prelude-journal-store run 2 no-probe-cache vs reuse-off parity")
+    _require_prelude_hits(
+        run1_b["prelude_stats"],
+        label="prelude-journal-store run 1 (project-b cached)",
+        build=run1_b["build"],
+    )
+    _require_no_prelude_hits(
+        run2_b["prelude_stats"],
+        label="prelude-journal-store run 2 after CMAKE_ROOT edit (cached)",
+    )
+    _require_no_prelude_hits(
+        run2_b_nc["prelude_stats"],
+        label="prelude-journal-store run 2 after CMAKE_ROOT edit (no-probe-cache)",
+    )
+
+
+def prelude_diagnostic(args, root: Path, row: dict) -> None:
+    """Require a prelude that emits a warning to be refused and preserve all warning output."""
+    hook = 'message(WARNING "PRELUDE_DIAG_TRAP_WARNING")\n'
+    lists = """\
+cmake_minimum_required(VERSION 4.5)
+project(ProbePreludeDiagnostic C)
+set(CMAKE_PROJECT_TOP_LEVEL_INCLUDES "${CMAKE_CURRENT_SOURCE_DIR}/warn_hook.cmake")
+set(CMAKE_TRY_COMPILE_PLATFORM_VARIABLES CMAKE_PROJECT_TOP_LEVEL_INCLUDES)
+
+try_compile(PRELUDE_DIAG_FIRST
+  SOURCE_FROM_CONTENT "probe_1.c" "int main(void) { return 0; }\\n"
+  OUTPUT_VARIABLE first_output
+  NO_CACHE)
+
+try_compile(PRELUDE_DIAG_SECOND
+  SOURCE_FROM_CONTENT "probe_2.c" "int main(void) { return 0; }\\n"
+  OUTPUT_VARIABLE second_output
+  NO_CACHE)
+
+file(WRITE "${CMAKE_BINARY_DIR}/prelude-diagnostic.txt"
+  "FIRST=${PRELUDE_DIAG_FIRST}\\nSECOND=${PRELUDE_DIAG_SECOND}\\n")
+message(STATUS "PreludeDiagnostic ${PRELUDE_DIAG_FIRST}|${PRELUDE_DIAG_SECOND}")
+"""
+    expected = b"FIRST=TRUE\nSECOND=TRUE\n"
+    warning_marker = b"PRELUDE_DIAG_TRAP_WARNING"
+    case = _write_custom_fixture(
+        root,
+        args.compiler,
+        lists,
+        extra_files={"source/warn_hook.cmake": hook.encode("utf-8")},
+    )
+    calls = row["compiler_calls"] = {}
+    compare_keys = ("results", "stdout", "stderr_norm")
+
+    def run_lane(name: str, store: Path, *, oracle: bool = False, no_cache: bool = False,
+                 reuse_off: bool = False) -> tuple[dict, int]:
+        lane_env = _prelude_env(case, store, reuse_off=reuse_off)
+        data, count = configure_raw(args, case, name, lane_env, oracle=oracle, no_cache=no_cache)
+        build = data["build"]
+        data["results"] = (build / "prelude-diagnostic.txt").read_bytes()
+        data["stderr_norm"] = SCRATCH_ID.sub(b"<PROBE>", data["stderr"])
+        data["prelude_stats"] = read_prelude_stats(build)
+        return data, count
+
+    cached, calls["cached"] = run_lane("cached", root / "store-cached")
+    oracle, calls["oracle"] = run_lane("oracle", root / "store-oracle", oracle=True)
+    require_calls(calls, "oracle", 2)
+    if cached["results"] != expected:
+        raise ValueError(f"Unexpected prelude-diagnostic results: {cached['results']!r}.")
+    if cached["stderr"].count(warning_marker) != 2:
+        raise ValueError(
+            f"Expected 2 prelude warnings in stderr. Found {cached['stderr'].count(warning_marker)}."
+        )
+    compare(cached, oracle, compare_keys, "Prelude-diagnostic cached CMake parity")
+    mode_stats = {"cached": cached["prelude_stats"]}
+    if args.smoke:
+        _record_prelude_stats(row, mode_stats)
+        return
+
+    no_cache, calls["no_probe_cache"] = run_lane("no-probe-cache", root / "store-nocache", no_cache=True)
+    reuse_off, calls["reuse_off"] = run_lane("reuse-off", root / "store-reuse-off",
+                                             no_cache=True, reuse_off=True)
+    mode_stats["no_probe_cache"] = no_cache["prelude_stats"]
+    _record_prelude_stats(row, mode_stats)
+
+    if no_cache["results"] != expected or no_cache["stderr"].count(warning_marker) != 2:
+        raise ValueError(
+            f"Unexpected prelude-diagnostic no-probe-cache output "
+            f"(results={no_cache['results']!r}, warnings={no_cache['stderr'].count(warning_marker)})."
+        )
+    compare(no_cache, oracle, compare_keys, "Prelude-diagnostic no-probe-cache CMake parity")
+    compare(cached, reuse_off, compare_keys, "Prelude-diagnostic cached vs reuse-off parity")
+    _require_no_prelude_hits(cached["prelude_stats"], label="prelude-diagnostic (cached)")
+    _require_no_prelude_hits(no_cache["prelude_stats"], label="prelude-diagnostic (no-probe-cache)")
+
+
 @dataclass(frozen=True)
 class CaseSpec:
     """Describe one selectable probe-cache evaluation case."""
@@ -1518,7 +2362,37 @@ EXTENDED_CASES: tuple[CaseSpec, ...] = (
              runahead_mispredict),
 )
 
-ALL_CASES: tuple[CaseSpec, ...] = BASELINE_CASES + EXTENDED_CASES
+PRELUDE_CASES: tuple[CaseSpec, ...] = (
+    CaseSpec("pq-journal", "G3", "prelude",
+             "Verify an admitted probe journal records the same Check list with and without PlatformQueries (L1).",
+             pq_journal),
+    CaseSpec("prelude-env", "G3", "prelude",
+             "Observe set(ENV{CFLAGS} -DPRELUDE_TRAP) between two probes against --fresh and reuse-off.",
+             prelude_env),
+    CaseSpec("prelude-policy", "G3", "prelude",
+             "Select a distinct prelude key when cmake_policy(SET CMP0128 OLD) changes between probes.",
+             prelude_policy),
+    CaseSpec("prelude-flags", "G3/G4", "prelude",
+             "Require non-vacuous prelude reuse (prelude_hits > 0) across different CMAKE_REQUIRED_DEFINITIONS.",
+             prelude_flags),
+    CaseSpec("prelude-flag-collision", "G3", "prelude",
+             "Send CMAKE_FLAGS -DCMAKE_C_FLAGS=-DX cold instead of reusing a colliding prelude.",
+             prelude_flag_collision),
+    CaseSpec("prelude-dir-read", "G3", "prelude",
+             "Refuse prelude reuse for a propagated include that reads CMAKE_BINARY_DIR.",
+             prelude_dir_read),
+    CaseSpec("prelude-module-write", "G3", "prelude",
+             "Observe rewritten propagated include contents on the second probe.",
+             prelude_module_write),
+    CaseSpec("prelude-journal-store", "G3/G4", "prelude",
+             "Reuse prelude across two projects sharing a store, then miss after mutating a copied CMAKE_ROOT module.",
+             prelude_journal_store),
+    CaseSpec("prelude-diagnostic", "G3", "prelude",
+             "Refuse prelude reuse when a propagated include emits warnings and preserve warning output.",
+             prelude_diagnostic),
+)
+
+ALL_CASES: tuple[CaseSpec, ...] = BASELINE_CASES + EXTENDED_CASES + PRELUDE_CASES
 CASE_INDEX: dict[str, CaseSpec] = {spec.name: spec for spec in ALL_CASES}
 
 
@@ -1527,14 +2401,24 @@ def select_cases(
     smoke: bool = False,
     cases: list[str] | None = None,
     extended: bool = False,
+    prelude: bool = False,
+    include_prelude: bool = False,
     all_cases: bool = False,
 ) -> list[CaseSpec]:
     """Resolve the requested evaluation cases without duplicating entries."""
-    if extended and all_cases:
-        raise ValueError("Use either --extended or --all-cases, not both.")
+    group_flags = [
+        flag for flag, active in (
+            ("--extended", extended),
+            ("--prelude", prelude),
+            ("--include-prelude", include_prelude),
+            ("--all-cases", all_cases),
+        ) if active
+    ]
+    if len(group_flags) > 1:
+        raise ValueError(f"Use only one of {', '.join(group_flags)}, not both.")
     if cases:
-        if extended or all_cases:
-            raise ValueError("Do not combine --case with --extended or --all-cases.")
+        if group_flags:
+            raise ValueError(f"Do not combine --case with {', '.join(group_flags)}.")
         requested: list[str] = []
         for item in cases:
             for part in item.split(","):
@@ -1555,25 +2439,33 @@ def select_cases(
                 selected.append(CASE_INDEX[name])
         return selected
     if smoke:
-        if extended or all_cases:
-            raise ValueError("--smoke cannot be combined with --extended or --all-cases.")
+        if group_flags:
+            raise ValueError(f"--smoke cannot be combined with {', '.join(group_flags)}.")
         return [CASE_INDEX["cache-control"], CASE_INDEX["transitive"]]
     if extended:
         return list(EXTENDED_CASES)
+    if prelude:
+        return list(PRELUDE_CASES)
+    if include_prelude:
+        return list(BASELINE_CASES + PRELUDE_CASES)
     if all_cases:
         return list(ALL_CASES)
     return list(BASELINE_CASES)
 
 
 def format_case_list() -> str:
-    """Format registered baseline and extended cases for CLI discovery."""
+    """Format registered baseline, extended, and prelude cases for CLI discovery."""
     lines = ["Baseline cases:"]
     for spec in BASELINE_CASES:
-        lines.append(f"  {spec.name:<22s} [{spec.gate}] {spec.description}")
+        lines.append(f"  {spec.name:<24s} [{spec.gate}] {spec.description}")
     lines.append("")
     lines.append("Extended cases:")
     for spec in EXTENDED_CASES:
-        lines.append(f"  {spec.name:<22s} [{spec.gate}] {spec.description}")
+        lines.append(f"  {spec.name:<24s} [{spec.gate}] {spec.description}")
+    lines.append("")
+    lines.append("Prelude and platform-query cases:")
+    for spec in PRELUDE_CASES:
+        lines.append(f"  {spec.name:<24s} [{spec.gate}] {spec.description}")
     return "\n".join(lines)
 
 
@@ -1591,6 +2483,8 @@ def evaluate(args, root: Path, report: dict) -> None:
         smoke=args.smoke,
         cases=getattr(args, "case", None),
         extended=getattr(args, "extended", False),
+        prelude=getattr(args, "prelude", False),
+        include_prelude=getattr(args, "include_prelude", False),
         all_cases=getattr(args, "all_cases", False),
     )
     control_ready = True
@@ -1641,6 +2535,13 @@ def render_markdown(report: dict) -> str:
             "",
             f"Extended cases available via `--extended`, `--all-cases`, or `--case`: {', '.join(available)}.",
         ))
+    available_prelude = report.get("available_prelude_cases")
+    if available_prelude:
+        lines.extend((
+            "",
+            "Prelude and platform-query cases available via `--prelude`, `--include-prelude`, "
+            f"`--all-cases`, or `--case`: {', '.join(available_prelude)}.",
+        ))
     if "error" in report:
         lines.extend(("", report["error"]))
     return "\n".join(lines) + "\n"
@@ -1663,10 +2564,14 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Run only the named case(s). Repeat or comma-separate names.")
     parser.add_argument("--extended", action="store_true",
                         help="Run only the extended soundness and runahead cases.")
+    parser.add_argument("--prelude", action="store_true",
+                        help="Run only the prelude and platform-query soundness cases.")
+    parser.add_argument("--include-prelude", action="store_true",
+                        help="Run all baseline cases plus the prelude and platform-query cases.")
     parser.add_argument("--all-cases", "--include-extended", dest="all_cases", action="store_true",
-                        help="Run all baseline and extended cases.")
+                        help="Run all baseline, extended, and prelude cases.")
     parser.add_argument("--list-cases", action="store_true",
-                        help="Print all registered baseline and extended cases and exit.")
+                        help="Print all registered baseline, extended, and prelude cases and exit.")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--timeout", type=int, default=120)
     parser.add_argument("--out-json", type=Path)
@@ -1692,14 +2597,18 @@ def main(argv: list[str] | None = None) -> int:
             smoke=args.smoke,
             cases=args.case,
             extended=args.extended,
+            prelude=args.prelude,
+            include_prelude=args.include_prelude,
             all_cases=args.all_cases,
         )
     except ValueError as error:
         parser.error(str(error))
     report = {"mode": "smoke" if args.smoke else "gate", "seed": args.seed,
               "rcmake": args.rcmake, "oracle": args.oracle, "cases": []}
-    if not args.smoke and not args.case and not args.extended and not args.all_cases:
+    if (not args.smoke and not args.case and not args.extended
+            and not args.prelude and not args.include_prelude and not args.all_cases):
         report["available_extended_cases"] = [spec.name for spec in EXTENDED_CASES]
+        report["available_prelude_cases"] = [spec.name for spec in PRELUDE_CASES]
     try:
         args.rcmake = executable(args.rcmake)
         args.oracle = executable(args.oracle)

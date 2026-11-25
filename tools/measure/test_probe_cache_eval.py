@@ -49,6 +49,8 @@ def _make_args(root: Path, **overrides) -> types.SimpleNamespace:
         "smoke": False,
         "case": None,
         "extended": False,
+        "prelude": False,
+        "include_prelude": False,
         "all_cases": False,
         "seed": 0,
         "timeout": 30,
@@ -96,17 +98,33 @@ class CaseRegistrationAndSelectionTests(unittest.TestCase):
             ],
         )
 
+        prelude_names = [spec.name for spec in pce.PRELUDE_CASES]
+        self.assertEqual(
+            prelude_names,
+            [
+                "pq-journal",
+                "prelude-env",
+                "prelude-policy",
+                "prelude-flags",
+                "prelude-flag-collision",
+                "prelude-dir-read",
+                "prelude-module-write",
+                "prelude-journal-store",
+                "prelude-diagnostic",
+            ],
+        )
+
         all_names = [spec.name for spec in pce.ALL_CASES]
         self.assertEqual(len(all_names), len(set(all_names)))
-        self.assertEqual(len(pce.ALL_CASES), 24)
+        self.assertEqual(len(pce.ALL_CASES), 33)
         for spec in pce.ALL_CASES:
             self.assertIn(spec.gate, {"G3", "G4", "G3/G4"})
-            self.assertIn(spec.group, {"baseline", "extended"})
+            self.assertIn(spec.group, {"baseline", "extended", "prelude"})
             self.assertTrue(spec.description.strip())
             if spec.name not in pce.TRIGGERS:
                 self.assertTrue(callable(spec.runner), spec.name)
 
-    def test_select_cases_default_smoke_extended_all_and_explicit(self):
+    def test_select_cases_default_smoke_extended_prelude_all_and_explicit(self):
         self.assertEqual([s.name for s in pce.select_cases()], [s.name for s in pce.BASELINE_CASES])
         self.assertEqual([s.name for s in pce.select_cases(smoke=True)], ["cache-control", "transitive"])
         self.assertEqual(
@@ -114,11 +132,19 @@ class CaseRegistrationAndSelectionTests(unittest.TestCase):
             [s.name for s in pce.EXTENDED_CASES],
         )
         self.assertEqual(
+            [s.name for s in pce.select_cases(prelude=True)],
+            [s.name for s in pce.PRELUDE_CASES],
+        )
+        self.assertEqual(
+            [s.name for s in pce.select_cases(include_prelude=True)],
+            [s.name for s in pce.BASELINE_CASES + pce.PRELUDE_CASES],
+        )
+        self.assertEqual(
             [s.name for s in pce.select_cases(all_cases=True)],
             [s.name for s in pce.ALL_CASES],
         )
-        picked = pce.select_cases(cases=["ninja-present,flag-plugin", "ninja-present", "run-file"])
-        self.assertEqual([s.name for s in picked], ["ninja-present", "flag-plugin", "run-file"])
+        picked = pce.select_cases(cases=["ninja-present,flag-plugin", "ninja-present", "pq-journal"])
+        self.assertEqual([s.name for s in picked], ["ninja-present", "flag-plugin", "pq-journal"])
 
     def test_select_cases_rejects_unknown_empty_and_conflicting_flags(self):
         with self.assertRaisesRegex(ValueError, "Unknown case.*no-such-trap"):
@@ -127,12 +153,20 @@ class CaseRegistrationAndSelectionTests(unittest.TestCase):
             pce.select_cases(cases=[" , "])
         with self.assertRaisesRegex(ValueError, "not both"):
             pce.select_cases(extended=True, all_cases=True)
+        with self.assertRaisesRegex(ValueError, "not both"):
+            pce.select_cases(prelude=True, include_prelude=True)
         with self.assertRaisesRegex(ValueError, "Do not combine --case"):
             pce.select_cases(cases=["ninja-present"], extended=True)
+        with self.assertRaisesRegex(ValueError, "Do not combine --case"):
+            pce.select_cases(cases=["pq-journal"], prelude=True)
         with self.assertRaisesRegex(ValueError, "Do not combine --case"):
             pce.select_cases(cases=["ninja-present"], all_cases=True)
         with self.assertRaisesRegex(ValueError, "--smoke cannot be combined"):
             pce.select_cases(smoke=True, extended=True)
+        with self.assertRaisesRegex(ValueError, "--smoke cannot be combined"):
+            pce.select_cases(smoke=True, prelude=True)
+        with self.assertRaisesRegex(ValueError, "--smoke cannot be combined"):
+            pce.select_cases(smoke=True, include_prelude=True)
         with self.assertRaisesRegex(ValueError, "--smoke cannot be combined"):
             pce.select_cases(smoke=True, all_cases=True)
 
@@ -157,6 +191,7 @@ class CliAndReportFormattingTests(unittest.TestCase):
         self.assertEqual(code, 0, stderr)
         self.assertIn("Baseline cases:", stdout)
         self.assertIn("Extended cases:", stdout)
+        self.assertIn("Prelude and platform-query cases:", stdout)
         for spec in pce.ALL_CASES:
             self.assertIn(spec.name, stdout)
 
@@ -212,11 +247,14 @@ class CliAndReportFormattingTests(unittest.TestCase):
         self.assertEqual(len(payload["cases"]), 16)
         self.assertTrue(all(row["status"] == "passed" for row in payload["cases"]))
         self.assertEqual(payload["available_extended_cases"], [spec.name for spec in pce.EXTENDED_CASES])
+        self.assertEqual(payload["available_prelude_cases"], [spec.name for spec in pce.PRELUDE_CASES])
 
         md = out_md.read_text(encoding="utf-8")
         self.assertIn("| G3/G4 | cache-control | Passed |", md)
         self.assertIn("ninja-present", md)
         self.assertIn("runahead-mispredict", md)
+        self.assertIn("pq-journal", md)
+        self.assertIn("prelude-diagnostic", md)
 
         fail_json = self.root / "ninja-fail.json"
         fail_md = self.root / "ninja-fail.md"
@@ -645,6 +683,371 @@ class ExtendedTrapBehaviorTests(unittest.TestCase):
                 else:
                     with self.assertRaisesRegex(ValueError, error_pattern):
                         pce.runahead_mispredict(args, case_root, row)
+
+
+def _write_prelude_stats(
+    build: Path,
+    *,
+    hits: int = 0,
+    refusals: dict[str, int] | None = None,
+    rerecords: int = 0,
+) -> None:
+    target = build / "CMakeFiles/rcmake/prelude-stats.v1.json"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(
+        json.dumps({
+            "prelude_hits": hits,
+            "prelude_refusals": refusals or {},
+            "prelude_rerecords": rerecords,
+        }),
+        encoding="utf-8",
+    )
+
+
+class PreludeAndPlatformQueryTrapTests(unittest.TestCase):
+    def setUp(self):
+        tmp = TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name).resolve()
+
+    def test_read_prelude_stats_handles_missing_and_present_files(self):
+        empty = self.root / "empty-build"
+        empty.mkdir()
+        absent = pce.read_prelude_stats(empty)
+        self.assertFalse(absent["available"])
+        self.assertEqual(absent["prelude_hits"], 0)
+        self.assertEqual(absent["prelude_refusals"], {})
+        self.assertEqual(absent["prelude_rerecords"], 0)
+
+        populated = self.root / "populated-build"
+        populated.mkdir()
+        _write_prelude_stats(populated, hits=2, refusals={"dir_read": 1}, rerecords=1)
+        present = pce.read_prelude_stats(populated)
+        self.assertTrue(present["available"])
+        self.assertEqual(present["prelude_hits"], 2)
+        self.assertEqual(present["prelude_refusals"], {"dir_read": 1})
+        self.assertEqual(present["prelude_rerecords"], 1)
+
+    def test_pq_journal_compares_normalized_checks_with_and_without_l1(self):
+        sample = _sample_probe_output()
+
+        for mismatch, error_pattern in ((False, None), (True, "journal Check list differs")):
+            case_root = self.root / f"pq-{mismatch}"
+            args = _make_args(case_root)
+            seen_envs = {}
+            row = {}
+
+            def fake_configure(_args, case, name, env, *, oracle=False, **_kw):
+                seen_envs[name] = dict(env)
+                (case.root / name).mkdir(parents=True, exist_ok=True)
+                return sample, 1
+
+            def fake_audit(store: Path):
+                is_l1 = store.name == "store-l1"
+                checks = [
+                    ["Environment", "1" * 64 if is_l1 else "2" * 64],
+                    ["System", "3" * 64],
+                    [{"Canonical": str(case_root / "source/leaf/CMakeLists.txt")}, "4" * 64],
+                ]
+                if mismatch and is_l1:
+                    checks.append([{"Metadata": ["/usr/bin/xcrun", True]}, "5" * 64])
+                return {
+                    store / "e.entry": {
+                        "key": "a" * 64,
+                        "digest": "b" * 64,
+                        "artifact": sample["copies"][0],
+                        "trace": [],
+                        "checks": checks,
+                    }
+                }
+
+            with (
+                mock.patch.object(pce, "configure", side_effect=fake_configure),
+                mock.patch.object(pce, "audit_store_entries", side_effect=fake_audit),
+            ):
+                if error_pattern is None:
+                    pce.pq_journal(args, case_root, row)
+                    self.assertEqual(row["check_count"], 3)
+                    self.assertNotIn("RCMAKE_NO_PLATFORM_QUERIES", seen_envs["with-l1"])
+                    self.assertEqual(seen_envs["without-l1"]["RCMAKE_NO_PLATFORM_QUERIES"], "1")
+                else:
+                    with self.assertRaisesRegex(ValueError, error_pattern):
+                        pce.pq_journal(args, case_root, row)
+
+    def test_prelude_env_detects_stale_cflags_and_checks_fresh_and_reuse_off(self):
+        for stale_after, error_pattern in ((False, None), (True, "Unexpected prelude-env results")):
+            case_root = self.root / f"penv-{stale_after}"
+            args = _make_args(case_root)
+            seen_modes = {}
+            row = {}
+
+            def fake_raw(_args, case, name, env, *, oracle=False, no_cache=False, fresh=False, **_kw):
+                seen_modes[name] = (no_cache, fresh, env.get("RCMAKE_NO_PRELUDE_REUSE"))
+                build = case.root / name
+                build.mkdir(parents=True, exist_ok=True)
+                after = "0" if (stale_after and name == "cached" and not oracle) else "1"
+                (build / "prelude-env.txt").write_text(
+                    f"PRELUDE_ENV_BEFORE=1\nPRELUDE_ENV_AFTER={after}\n",
+                    encoding="utf-8",
+                )
+                (build / "CMakeCache.txt").write_text(
+                    f"PRELUDE_ENV_BEFORE:INTERNAL=1\nPRELUDE_ENV_AFTER:INTERNAL={after}\n",
+                    encoding="utf-8",
+                )
+                if not oracle:
+                    _write_prelude_stats(build, hits=0, rerecords=1)
+                return {"stdout": b"-- PreludeEnv 1|1\n", "stderr": b"", "build": build}, 2
+
+            with mock.patch.object(pce, "configure_raw", side_effect=fake_raw):
+                if error_pattern is None:
+                    pce.prelude_env(args, case_root, row)
+                    self.assertEqual(seen_modes["cached"], (False, False, None))
+                    self.assertEqual(seen_modes["no-probe-cache"], (True, False, None))
+                    self.assertEqual(seen_modes["reuse-off"], (True, False, "1"))
+                    self.assertEqual(seen_modes["fresh"], (False, True, None))
+                    self.assertTrue(row["prelude_stats_available"])
+                    self.assertEqual(row["prelude_rerecords"], 3)
+                else:
+                    with self.assertRaisesRegex(ValueError, error_pattern):
+                        pce.prelude_env(args, case_root, row)
+
+    def test_prelude_policy_rejects_spurious_prelude_hit_across_cmp0128_change(self):
+        for spurious_hit, error_pattern in ((False, None), (True, "expected prelude miss or refusal")):
+            case_root = self.root / f"ppol-{spurious_hit}"
+            args = _make_args(case_root)
+            row = {}
+
+            def fake_raw(_args, case, name, _env, *, oracle=False, **_kw):
+                build = case.root / name
+                build.mkdir(parents=True, exist_ok=True)
+                (build / "prelude-policy.txt").write_text(
+                    "PRELUDE_POL_NEW=1\nPRELUDE_POL_OLD=0\n",
+                    encoding="utf-8",
+                )
+                (build / "CMakeCache.txt").write_text(
+                    "PRELUDE_POL_NEW:INTERNAL=1\nPRELUDE_POL_OLD:INTERNAL=\n",
+                    encoding="utf-8",
+                )
+                if not oracle:
+                    _write_prelude_stats(build, hits=1 if (spurious_hit and name == "cached") else 0)
+                return {"stdout": b"-- PreludePolicy 1|\n", "stderr": b"", "build": build}, 2
+
+            with mock.patch.object(pce, "configure_raw", side_effect=fake_raw):
+                if error_pattern is None:
+                    pce.prelude_policy(args, case_root, row)
+                    self.assertEqual(row["prelude_hits"], 0)
+                else:
+                    with self.assertRaisesRegex(ValueError, error_pattern):
+                        pce.prelude_policy(args, case_root, row)
+
+    def test_prelude_flags_enforces_non_vacuous_reuse_and_fails_when_hits_zero(self):
+        for stats_mode, error_pattern in (
+            ("hit", None),
+            ("zero", "expected prelude reuse.*found prelude_hits=0"),
+            ("absent", "no prelude stats file emitted"),
+        ):
+            case_root = self.root / f"pflags-{stats_mode}"
+            args = _make_args(case_root)
+            row = {}
+
+            def fake_raw(_args, case, name, _env, *, oracle=False, **_kw):
+                build = case.root / name
+                build.mkdir(parents=True, exist_ok=True)
+                (build / "prelude-flags.txt").write_text(
+                    "PRELUDE_FLAGS_A=1\nPRELUDE_FLAGS_B=1\n",
+                    encoding="utf-8",
+                )
+                (build / "CMakeCache.txt").write_text(
+                    "PRELUDE_FLAGS_A:INTERNAL=1\nPRELUDE_FLAGS_B:INTERNAL=1\n",
+                    encoding="utf-8",
+                )
+                if not oracle and stats_mode != "absent":
+                    _write_prelude_stats(build, hits=1 if stats_mode == "hit" else 0)
+                return {"stdout": b"-- PreludeFlags 1|1\n", "stderr": b"", "build": build}, 2
+
+            with mock.patch.object(pce, "configure_raw", side_effect=fake_raw):
+                if error_pattern is None:
+                    pce.prelude_flags(args, case_root, row)
+                    self.assertEqual(row["prelude_hits"], 2)
+                else:
+                    with self.assertRaisesRegex(ValueError, error_pattern):
+                        pce.prelude_flags(args, case_root, row)
+
+    def test_prelude_flag_collision_dir_read_module_write_and_diagnostic(self):
+        # prelude-flag-collision
+        for hit_on_collision, err in ((False, None), (True, "expected prelude miss or refusal")):
+            case_root = self.root / f"pcoll-{hit_on_collision}"
+            args = _make_args(case_root)
+            row = {}
+
+            def fake_coll(_args, case, name, _env, *, oracle=False, **_kw):
+                build = case.root / name
+                build.mkdir(parents=True, exist_ok=True)
+                (build / "prelude-flag-collision.txt").write_text("BASE=TRUE\nOVERRIDE=TRUE\n", encoding="utf-8")
+                if not oracle:
+                    _write_prelude_stats(
+                        build,
+                        hits=1 if (hit_on_collision and name == "cached") else 0,
+                        refusals={"flag_collision": 1},
+                    )
+                return {"stdout": b"-- PreludeFlagCollision TRUE|TRUE\n", "stderr": b"", "build": build}, 2
+
+            with mock.patch.object(pce, "configure_raw", side_effect=fake_coll):
+                if err is None:
+                    pce.prelude_flag_collision(args, case_root, row)
+                    self.assertEqual(row["prelude_refusals"], {"flag_collision": 2})
+                else:
+                    with self.assertRaisesRegex(ValueError, err):
+                        pce.prelude_flag_collision(args, case_root, row)
+
+        # prelude-dir-read
+        for reused_badly, err in ((False, None), (True, "Unexpected prelude-dir-read results")):
+            case_root = self.root / f"pdir-{reused_badly}"
+            args = _make_args(case_root)
+            row = {}
+
+            def fake_dir(_args, case, name, _env, *, oracle=False, **_kw):
+                build = case.root / name
+                build.mkdir(parents=True, exist_ok=True)
+                second = "FALSE" if (reused_badly and name == "cached" and not oracle) else "TRUE"
+                (build / "prelude-dir-read.txt").write_text(
+                    f"FIRST=TRUE\nSECOND={second}\n", encoding="utf-8"
+                )
+                if not oracle:
+                    _write_prelude_stats(build, hits=0, refusals={"dir_read": 1})
+                return {"stdout": b"-- PreludeDirRead TRUE|TRUE\n", "stderr": b"", "build": build}, 2
+
+            with mock.patch.object(pce, "configure_raw", side_effect=fake_dir):
+                if err is None:
+                    pce.prelude_dir_read(args, case_root, row)
+                    self.assertEqual(row["prelude_refusals"], {"dir_read": 2})
+                    lists_text = (case_root / "source/CMakeLists.txt").read_text(encoding="utf-8")
+                    self.assertIn("CMAKE_PROJECT_TOP_LEVEL_INCLUDES", lists_text)
+                    self.assertTrue((case_root / "source/dir_read_hook.cmake").is_file())
+                else:
+                    with self.assertRaisesRegex(ValueError, err):
+                        pce.prelude_dir_read(args, case_root, row)
+
+        # prelude-module-write
+        for stale_mod, err in ((False, None), (True, "Unexpected prelude-module-write no-probe-cache results")):
+            case_root = self.root / f"pmod-{stale_mod}"
+            args = _make_args(case_root)
+            row = {}
+
+            def fake_mod(_args, case, name, _env, *, oracle=False, **_kw):
+                build = case.root / name
+                build.mkdir(parents=True, exist_ok=True)
+                second = "FALSE" if (stale_mod and name == "no-probe-cache" and not oracle) else "TRUE"
+                (build / "prelude-module-write.txt").write_text(
+                    f"FIRST=TRUE\nSECOND={second}\n", encoding="utf-8"
+                )
+                if not oracle:
+                    _write_prelude_stats(build, hits=0, rerecords=1)
+                return {"stdout": b"-- PreludeModuleWrite TRUE|TRUE\n", "stderr": b"", "build": build}, 2
+
+            with mock.patch.object(pce, "configure_raw", side_effect=fake_mod):
+                if err is None:
+                    pce.prelude_module_write(args, case_root, row)
+                    self.assertEqual(row["prelude_rerecords"], 2)
+                    lists_text = (case_root / "source/CMakeLists.txt").read_text(encoding="utf-8")
+                    self.assertIn("CMAKE_PROJECT_TOP_LEVEL_INCLUDES", lists_text)
+                else:
+                    with self.assertRaisesRegex(ValueError, err):
+                        pce.prelude_module_write(args, case_root, row)
+
+        # prelude-diagnostic
+        for dropped_warn, err in ((False, None), (True, "Expected 2 prelude warnings")):
+            case_root = self.root / f"pdiag-{dropped_warn}"
+            args = _make_args(case_root)
+            row = {}
+
+            def fake_diag(_args, case, name, _env, *, oracle=False, **_kw):
+                build = case.root / name
+                build.mkdir(parents=True, exist_ok=True)
+                (build / "prelude-diagnostic.txt").write_text("FIRST=TRUE\nSECOND=TRUE\n", encoding="utf-8")
+                warn = (
+                    b"CMake Warning at TryCompile-abc/CMakeLists.txt:1:\n  PRELUDE_DIAG_TRAP_WARNING\n"
+                )
+                stderr = warn if (dropped_warn and name == "cached" and not oracle) else warn * 2
+                if not oracle:
+                    _write_prelude_stats(build, hits=0, refusals={"diagnostic": 1})
+                return {"stdout": b"-- PreludeDiagnostic TRUE|TRUE\n", "stderr": stderr, "build": build}, 2
+
+            with mock.patch.object(pce, "configure_raw", side_effect=fake_diag):
+                if err is None:
+                    pce.prelude_diagnostic(args, case_root, row)
+                    self.assertEqual(row["prelude_refusals"], {"diagnostic": 2})
+                    lists_text = (case_root / "source/CMakeLists.txt").read_text(encoding="utf-8")
+                    self.assertIn("CMAKE_PROJECT_TOP_LEVEL_INCLUDES", lists_text)
+                    self.assertTrue((case_root / "source/warn_hook.cmake").is_file())
+                else:
+                    with self.assertRaisesRegex(ValueError, err):
+                        pce.prelude_diagnostic(args, case_root, row)
+
+    def test_prelude_journal_store_reuses_in_run1_and_misses_after_cmake_root_edit(self):
+        fake_vendored = self.root / "vendored"
+        (fake_vendored / "Modules").mkdir(parents=True)
+        (fake_vendored / "Modules/CMakeDetermineSystem.cmake").write_text("# sys\n", encoding="utf-8")
+        (fake_vendored / "Modules/CMakeCInformation.cmake").write_text("# c info\n", encoding="utf-8")
+
+        for defect, error_pattern in (
+            ("none", None),
+            ("no-run1-hit", "run 1.*expected prelude reuse"),
+            ("stale-run2", "reused stale prelude after CMAKE_ROOT module edit"),
+            ("run2-hit", "run 2 after CMAKE_ROOT edit.*expected prelude miss"),
+        ):
+            case_root = self.root / f"pstore-{defect}"
+            args = _make_args(case_root)
+            seen_roots: set[Path] = set()
+            seen_sources: set[str] = set()
+            row = {}
+
+            def fake_raw(_args, case, name, env, *, oracle=False, **_kw):
+                seen_roots.add(case.root)
+                seen_sources.add(case.source.name)
+                build = case.root / name
+                build.mkdir(parents=True, exist_ok=True)
+                is_proj_a = case.source.name == "source-a"
+                if is_proj_a:
+                    (build / "store-result.txt").write_text("A=1\n", encoding="utf-8")
+                    _write_prelude_stats(build, hits=0)
+                    return {"stdout": b"-- PreludeStoreA 1\n", "stderr": b"", "build": build}, 1
+
+                if oracle:
+                    v2 = "0"
+                else:
+                    c_info = Path(env["RCMAKE_VENDORED_DATA_ROOT"]) / "Modules/CMakeCInformation.cmake"
+                    v2 = "1" if "STORE_MODULE_V2" in c_info.read_text(encoding="utf-8") else "0"
+                if defect == "stale-run2" and name == "b-run2-cached":
+                    v2 = "0"
+                (build / "store-result.txt").write_text(f"HAS_V2={v2}\n", encoding="utf-8")
+                if not oracle:
+                    hits = 0
+                    if name == "b-run1-cached" and defect != "no-run1-hit":
+                        hits = 1
+                    elif name == "b-run2-cached" and defect == "run2-hit":
+                        hits = 1
+                    _write_prelude_stats(build, hits=hits)
+                return {
+                    "stdout": f"-- PreludeStoreB HAS_V2={v2}\n".encode("utf-8"),
+                    "stderr": b"",
+                    "build": build,
+                }, 1
+
+            with (
+                mock.patch.object(pce, "resolve_vendored_cmake_root", return_value=fake_vendored),
+                mock.patch.object(pce, "configure_raw", side_effect=fake_raw),
+            ):
+                if error_pattern is None:
+                    pce.prelude_journal_store(args, case_root, row)
+                    self.assertEqual(seen_roots, {case_root})
+                    self.assertEqual(seen_sources, {"source-a", "source-b"})
+                    self.assertEqual(row["prelude_hits"], 1)
+                    mutated = Path(row["custom_cmake_root"]) / "Modules/CMakeCInformation.cmake"
+                    self.assertIn("STORE_MODULE_V2=1", mutated.read_text(encoding="utf-8"))
+                else:
+                    with self.assertRaisesRegex(ValueError, error_pattern):
+                        pce.prelude_journal_store(args, case_root, row)
 
 
 if __name__ == "__main__":
