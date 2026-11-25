@@ -258,6 +258,124 @@ class DashboardTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             builder.validate(self.base, self.schema, self.schema)
 
+    def test_giants_bench_ingests_per_giant_speedups_rss_and_build_verify(self):
+        reproducer = (
+            "python3 tools/measure/bench_giants.py "
+            "--projects duckdb,opencv,protobuf,qtbase,llvm-project --runs 3"
+        )
+        path = self.report("giants-bench.json", {
+            "schema_version": 1,
+            "generated_at": "2026-11-25T20:00:00Z",
+            "reproducer": reproducer,
+            "meta": {"runs": 3},
+            "projects": [
+                {
+                    "name": "duckdb",
+                    "repository": "duckdb/duckdb",
+                    "version": "v1.3.2",
+                    "status": "pass",
+                    "cold": {
+                        "cmake": {"median_ms": 4000.0, "peak_rss_mib": 210.5},
+                        "rcmake": {"median_ms": 1000.0, "peak_rss_mib": 92.4},
+                        "speedup": 4.0,
+                    },
+                    "warm_probe": {
+                        "cmake": {"median_ms": 4000.0, "peak_rss_mib": 208.0},
+                        "rcmake": {"median_ms": 500.0, "peak_rss_mib": 84.1},
+                        "speedup": 8.0,
+                        "probe_cache": {"hits": 44, "misses": 0},
+                    },
+                    "incremental_leaf": {
+                        "cmake": {"median_ms": 900.0, "peak_rss_mib": 195.0},
+                        "rcmake": {"median_ms": 45.0, "p95_ms": 52.0, "peak_rss_mib": 62.0},
+                        "speedup": 20.0,
+                        "leaf_file": "src/main/CMakeLists.txt",
+                    },
+                    "build_verify": {
+                        "status": "pass",
+                        "dry_run": {"step_count_match": True},
+                        "compile": {
+                            "target": "src/a.cpp.o",
+                            "cmake": {"wall_ms": 150.0},
+                            "rcmake": {"wall_ms": 148.0},
+                            "build_speedup": 1.01,
+                        },
+                    },
+                },
+                {
+                    "name": "qtbase",
+                    "repository": "qt/qtbase",
+                    "version": "v6.8.3",
+                    "status": "pass",
+                    "cold": {
+                        "cmake": {"median_ms": 9000.0, "peak_rss_mib": 320.0},
+                        "rcmake": {"median_ms": 2250.0, "peak_rss_mib": 140.0},
+                        "speedup": 4.0,
+                    },
+                    "warm_probe": {
+                        "cmake": {"median_ms": 9000.0, "peak_rss_mib": 318.0},
+                        "rcmake": {"median_ms": 1125.0, "peak_rss_mib": 135.0},
+                        "speedup": 8.0,
+                        "probe_cache": {"hits": 120, "misses": 0},
+                    },
+                    "incremental_leaf": {
+                        "cmake": {"median_ms": 1500.0, "peak_rss_mib": 300.0},
+                        "rcmake": {"median_ms": 75.0, "p95_ms": 88.5, "peak_rss_mib": 90.0},
+                        "speedup": 20.0,
+                        "leaf_file": "src/corelib/CMakeLists.txt",
+                    },
+                },
+                {
+                    "name": "vcpkg",
+                    "repository": "local/conformance/ecosystem/vcpkg-manifest",
+                    "version": "manifest",
+                    "status": "unavailable",
+                    "unavailable_reason": "vcpkg executable not found",
+                },
+            ],
+        })
+        section = self.build("--giants-bench", path)["tracks"]["benchmarksAndGates"]
+        giants = section["giantsBenchmark"]
+        self.assertEqual(giants["status"], "partial")
+        self.assertEqual(giants["runs"], 3)
+        self.assertEqual(giants["reproducer"], reproducer)
+        self.assertEqual(giants["summary"], {
+            "projectsTotal": 3,
+            "projectsPassed": 2,
+            "coldSpeedupGeomean": 4.0,
+            "warmProbeSpeedupGeomean": 8.0,
+            "incrementalLeafSpeedupGeomean": 20.0,
+            "incrementalLeafMaxP95Ms": 88.5,
+            "rcmakeMaxPeakRssMiB": 140.0,
+            "cmakeMaxPeakRssMiB": 320.0,
+        })
+        self.assertEqual(giants["projects"][0]["warmProbe"]["probeCacheHits"], 44)
+        self.assertEqual(giants["projects"][0]["buildVerify"]["target"], "src/a.cpp.o")
+        self.assertEqual(giants["projects"][2]["status"], "pending")
+        self.assertEqual(giants["projects"][2]["note"], "vcpkg executable not found")
+        # Existing top-level benchmark cards remain intact.
+        self.assertEqual(section["benchmarks"], self.base["tracks"]["benchmarksAndGates"]["benchmarks"])
+
+    def test_giants_bench_rejects_invalid_reports_without_writing(self):
+        self.output.write_text("keep original", encoding="utf-8")
+        bad = self.report("bad-giants.json", {
+            "schema_version": 1,
+            "reproducer": "python3 tools/measure/bench_giants.py --projects duckdb --runs 3",
+            "meta": {"runs": 3},
+            "projects": [{
+                "name": "duckdb",
+                "status": "pass",
+                "cold": {"cmake": {"median_ms": -5.0}, "rcmake": {"median_ms": 10.0}, "speedup": 1.0},
+                "warm_probe": {"cmake": {"median_ms": 10.0}, "rcmake": {"median_ms": 2.0}, "speedup": 5.0},
+                "incremental_leaf": {"cmake": {"median_ms": 5.0}, "rcmake": {"median_ms": 1.0}, "speedup": 5.0},
+            }],
+        })
+        with redirect_stderr(io.StringIO()) as err, self.assertRaises(SystemExit) as exit_code:
+            builder.main(["--out", str(self.output), "--giants-bench", bad])
+        self.assertEqual(exit_code.exception.code, 2)
+        self.assertIn("nonnegative", err.getvalue())
+        self.assertEqual(self.output.read_text(encoding="utf-8"), "keep original")
+
 
 if __name__ == "__main__":
     unittest.main()

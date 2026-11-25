@@ -9,6 +9,7 @@ JSON for their respective gates. Repeat --bench to combine reports from
 bench_configure.py and bench_eval.py.
 
 Use a large_projects_local.py run directory for --large-projects-dir.
+Use a bench_giants.py JSON report for --giants-bench.
 Use downloaded 64-shard workflow artifacts with shard.json and results.jsonl
 for --vcpkg-dir.
 For --fuzz-dir, supply JSON files with iterations and failures per run.
@@ -291,6 +292,145 @@ def benchmark_status(rows, value):
     return "pass"
 
 
+def optional_number(value, *, positive=False):
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError("Benchmark metric values must be numbers or null.")
+    if not math.isfinite(value):
+        raise ValueError("Benchmark metric values must be finite.")
+    if positive and value <= 0:
+        raise ValueError("Positive benchmark metric values must exceed zero.")
+    if not positive and value < 0:
+        raise ValueError("Benchmark metric values must be nonnegative.")
+    return round(float(value), 2)
+
+
+def merge_giants_bench(section, path):
+    report = read_json(path)
+    if report.get("schema_version") != 1:
+        raise ValueError("Giants benchmark report must use schema_version 1.")
+    raw_projects = report.get("projects")
+    if not isinstance(raw_projects, list) or not raw_projects:
+        raise ValueError("Giants benchmark report must include a non-empty projects list.")
+    meta = report.get("meta") or {}
+    runs = count(meta.get("runs", 0))
+    if runs < 1:
+        raise ValueError("Giants benchmark report must record a positive run count.")
+    reproducer = report.get("reproducer")
+    if not isinstance(reproducer, str) or not reproducer.strip():
+        raise ValueError("Giants benchmark report must include a reproducer command.")
+
+    status_map = {"pass": "pass", "fail": "fail", "unavailable": "pending"}
+    projects_out = []
+    cold_ratios = []
+    warm_ratios = []
+    inc_ratios = []
+    inc_p95s = []
+    rcmake_rss = []
+    cmake_rss = []
+
+    for item in raw_projects:
+        name = item["name"]
+        raw_status = item["status"]
+        if raw_status not in status_map:
+            raise ValueError(f"Unknown giants benchmark status {raw_status!r} for {name}.")
+        mapped_status = status_map[raw_status]
+        entry = {
+            "name": name,
+            "repository": item.get("repository", ""),
+            "version": item.get("version", ""),
+            "status": mapped_status,
+        }
+        if mapped_status == "pending":
+            if item.get("unavailable_reason"):
+                entry["note"] = str(item["unavailable_reason"])
+            projects_out.append(entry)
+            continue
+
+        cold = item["cold"]
+        warm = item["warm_probe"]
+        inc = item["incremental_leaf"]
+        cold_out = {
+            "cmakeMedianMs": optional_number(cold["cmake"].get("median_ms")),
+            "rcmakeMedianMs": optional_number(cold["rcmake"].get("median_ms")),
+            "speedup": optional_number(cold.get("speedup"), positive=True),
+            "cmakePeakRssMiB": optional_number(cold["cmake"].get("peak_rss_mib")),
+            "rcmakePeakRssMiB": optional_number(cold["rcmake"].get("peak_rss_mib")),
+        }
+        probe = warm.get("probe_cache") or {}
+        warm_out = {
+            "cmakeMedianMs": optional_number(warm["cmake"].get("median_ms")),
+            "rcmakeMedianMs": optional_number(warm["rcmake"].get("median_ms")),
+            "speedup": optional_number(warm.get("speedup"), positive=True),
+            "cmakePeakRssMiB": optional_number(warm["cmake"].get("peak_rss_mib")),
+            "rcmakePeakRssMiB": optional_number(warm["rcmake"].get("peak_rss_mib")),
+            "probeCacheHits": count(probe["hits"]) if probe.get("hits") is not None else None,
+            "probeCacheMisses": count(probe["misses"]) if probe.get("misses") is not None else None,
+        }
+        inc_out = {
+            "cmakeMedianMs": optional_number(inc["cmake"].get("median_ms")),
+            "rcmakeMedianMs": optional_number(inc["rcmake"].get("median_ms")),
+            "rcmakeP95Ms": optional_number(inc["rcmake"].get("p95_ms")),
+            "speedup": optional_number(inc.get("speedup"), positive=True),
+            "cmakePeakRssMiB": optional_number(inc["cmake"].get("peak_rss_mib")),
+            "rcmakePeakRssMiB": optional_number(inc["rcmake"].get("peak_rss_mib")),
+            "leafFile": inc.get("leaf_file"),
+        }
+        entry.update(cold=cold_out, warmProbe=warm_out, incrementalLeaf=inc_out)
+
+        bv = item.get("build_verify")
+        if isinstance(bv, dict):
+            dry = bv.get("dry_run") or {}
+            comp = bv.get("compile") or {}
+            entry["buildVerify"] = {
+                "status": status_map.get(bv.get("status", "fail"), "fail"),
+                "dryRunStepCountMatch": bool(dry.get("step_count_match")) if dry else None,
+                "target": comp.get("target") if comp else None,
+                "cmakeBuildMs": optional_number((comp.get("cmake") or {}).get("wall_ms")) if comp else None,
+                "rcmakeBuildMs": optional_number((comp.get("rcmake") or {}).get("wall_ms")) if comp else None,
+                "buildSpeedup": optional_number(comp.get("build_speedup"), positive=True) if comp else None,
+            }
+
+        for value, bucket in (
+            (cold_out["speedup"], cold_ratios),
+            (warm_out["speedup"], warm_ratios),
+            (inc_out["speedup"], inc_ratios),
+        ):
+            if value is not None:
+                bucket.append(value)
+        if inc_out["rcmakeP95Ms"] is not None:
+            inc_p95s.append(inc_out["rcmakeP95Ms"])
+        for phase_out in (cold_out, warm_out, inc_out):
+            if phase_out["rcmakePeakRssMiB"] is not None:
+                rcmake_rss.append(phase_out["rcmakePeakRssMiB"])
+            if phase_out["cmakePeakRssMiB"] is not None:
+                cmake_rss.append(phase_out["cmakePeakRssMiB"])
+        projects_out.append(entry)
+
+    def geomean(values):
+        return round(geometric_mean(values), 2) if values else None
+
+    section["giantsBenchmark"] = {
+        "label": "Real-World Giants Configure Benchmark",
+        "status": combined_status(row["status"] for row in projects_out),
+        "runs": runs,
+        "reproducer": reproducer,
+        "generatedAt": report.get("generated_at"),
+        "summary": {
+            "projectsTotal": len(projects_out),
+            "projectsPassed": sum(row["status"] == "pass" for row in projects_out),
+            "coldSpeedupGeomean": geomean(cold_ratios),
+            "warmProbeSpeedupGeomean": geomean(warm_ratios),
+            "incrementalLeafSpeedupGeomean": geomean(inc_ratios),
+            "incrementalLeafMaxP95Ms": max(inc_p95s) if inc_p95s else None,
+            "rcmakeMaxPeakRssMiB": max(rcmake_rss) if rcmake_rss else None,
+            "cmakeMaxPeakRssMiB": max(cmake_rss) if cmake_rss else None,
+        },
+        "projects": projects_out,
+    }
+
+
 def report_paths(directory, pattern):
     paths = sorted(path for path in directory.rglob(pattern) if not path.name.startswith("._"))
     if not paths:
@@ -453,8 +593,8 @@ def main(argv=None):
     parser.add_argument("--version", help="Version of the verified Rcmake binary.")
     for name in (
         "runcmake-macos", "runcmake-linux", "runcmake-windows", "independent", "probe-cache",
-        "mutation", "determinism", "wasm", "large-projects-dir", "unseen-holdout", "fuzz-dir",
-        "vcpkg-dir", "ci-status-json",
+        "mutation", "determinism", "wasm", "large-projects-dir", "giants-bench", "unseen-holdout",
+        "fuzz-dir", "vcpkg-dir", "ci-status-json",
     ):
         parser.add_argument(f"--{name}", type=Path)
     parser.add_argument("--bench", type=Path, action="append", default=[])
@@ -478,6 +618,8 @@ def main(argv=None):
             merge_runcmake(tracks, reports)
         section = tracks["benchmarksAndGates"]
         merge_benchmarks(section["benchmarks"], args.bench)
+        if args.giants_bench:
+            merge_giants_bench(section, args.giants_bench)
         merge_soundness(section, args)
         if args.large_projects_dir:
             merge_large_projects(tracks["bossFight"], args.large_projects_dir)
