@@ -147,16 +147,16 @@ incremental = false
 opt-level = "s"
 
 [profile.release.package.libbz2-rs-sys]
-opt-level = "s"
+opt-level = "z"
 
 [profile.release.package.liblzma-sys]
-opt-level = "s"
+opt-level = "z"
 
 [profile.release.package.lzma-rust2]
-opt-level = "s"
+opt-level = "z"
 
 [profile.release.package.ppmd-turbo]
-opt-level = "s"
+opt-level = "z"
 
 [profile.release.package.rcmake-archive]
 opt-level = "s"
@@ -195,19 +195,19 @@ opt-level = "s"
 opt-level = "s"
 
 [profile.release.package.sevenz-rust2]
-opt-level = "s"
+opt-level = "z"
 
 [profile.release.package.tar]
-opt-level = "s"
+opt-level = "z"
 
 [profile.release.package.zip]
-opt-level = "s"
+opt-level = "z"
 
 [profile.release.package.zlib-rs]
-opt-level = "s"
+opt-level = "z"
 
 [profile.release.package.zstd-sys]
-opt-level = "s"
+opt-level = "z"
 
 [profile.size-probe]
 inherits = "release"
