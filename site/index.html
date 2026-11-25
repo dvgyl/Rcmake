@@ -3,10 +3,10 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Rcmake: Drop-in CMake 4.5.1 in safe Rust</title>
-  <meta name="description" content="Rcmake is a native Rust drop-in replacement for CMake 4.5.1 across cmake, ctest, and cpack with #![forbid(unsafe_code)], 5 native generators, and deterministic host abstraction.">
-  <meta property="og:title" content="Rcmake: Drop-in CMake 4.5.1 in safe Rust">
-  <meta property="og:description" content="34 safe-Rust crates targeting CMake 4.5.1 parity across cmake, ctest, cpack, Presets v13, File-Based API v2.12, and 5 native build generators.">
+  <title>Rcmake</title>
+  <meta name="description" content="Rcmake is a clean-room CMake 4.5.1 replacement written in safe Rust. One binary for cmake, ctest, and cpack.">
+  <meta property="og:title" content="Rcmake">
+  <meta property="og:description" content="A clean-room CMake 4.5.1 replacement written in safe Rust. One binary for cmake, ctest, and cpack.">
   <meta property="og:type" content="website">
   <meta property="og:image" content="./assets/og-card.svg">
   <meta name="twitter:card" content="summary_large_image">
@@ -16,279 +16,130 @@
   <script>
     try {
       const saved = localStorage.getItem("rcmake-theme");
-      const preferred = window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
-      document.documentElement.dataset.theme = saved || preferred;
+      const dark = window.matchMedia("(prefers-color-scheme: dark)").matches;
+      document.documentElement.dataset.theme = saved || (dark ? "dark" : "light");
     } catch (_) {}
   </script>
 </head>
 <body>
-  <header class="site-header">
-    <div class="rgb-hairline" aria-hidden="true"><span></span><span></span><span></span></div>
-    <div class="container nav-inner">
-      <a class="nav-brand" href="./index.html">
-        <img class="brand-only-light" src="./assets/rcmake-mark.svg" alt="" width="26" height="26">
-        <img class="brand-only-dark" src="./assets/rcmake-mark-dark.svg" alt="" width="26" height="26">
-        <span>Rcmake</span>
+  <header class="topbar">
+    <div class="page topbar-inner">
+      <a class="brand" href="./index.html">
+        <img class="mark-light" src="./assets/rcmake-mark.svg" alt="" width="20" height="20">
+        <img class="mark-dark" src="./assets/rcmake-mark-dark.svg" alt="" width="20" height="20">
+        Rcmake
       </a>
-      <nav class="nav-links" aria-label="Primary">
-        <a class="nav-link" href="./index.html" aria-current="page">Overview</a>
-        <a class="nav-link" href="./playground.html">Playground</a>
-        <a class="nav-link" href="./dashboard.html">Dashboard</a>
-        <a class="nav-link" href="https://github.com/dvgyl/Rcmake" target="_blank" rel="noopener noreferrer">GitHub</a>
-        <button id="theme-toggle" class="theme-toggle" type="button" aria-label="Toggle color theme" title="Toggle light or dark theme">
-          <svg id="theme-icon-sun" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-            <circle cx="12" cy="12" r="4"></circle>
-            <path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"></path>
-          </svg>
-          <svg id="theme-icon-moon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-            <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"></path>
-          </svg>
-        </button>
+      <nav class="nav" aria-label="Primary">
+        <a class="opt" href="./index.html" aria-current="page">Overview</a>
+        <a href="./playground.html">Playground</a>
+        <a href="./dashboard.html">Compatibility</a>
+        <a href="https://github.com/dvgyl/Rcmake">GitHub</a>
+        <button id="theme-toggle" type="button">Dark</button>
       </nav>
     </div>
   </header>
 
-  <main>
-    <section class="hero">
-      <div class="container">
-        <div class="hero-top">
-          <img class="hero-mark brand-only-light" src="./assets/rcmake-mark.svg" alt="Rcmake mark" width="64" height="64">
-          <img class="hero-mark brand-only-dark" src="./assets/rcmake-mark-dark.svg" alt="Rcmake mark" width="64" height="64">
-          <div class="hero-kicker">
-            <span class="badge"><span class="badge-dot" style="background:var(--brand-green)"></span>CMake 4.5.1 Target</span>
-            <span class="badge mono">#![forbid(unsafe_code)]</span>
-            <span class="badge">MIT OR Apache-2.0</span>
-          </div>
-        </div>
-
-        <h1>Drop-in CMake 4.5.1 in safe Rust.</h1>
-        <p class="hero-sub">
-          A single multi-call binary implementing <code>cmake</code>, <code>ctest</code>, and <code>cpack</code> with deterministic host abstraction, fast incremental reconfigures, and clean-room parity against official CMake 4.5.1.
-        </p>
-
-        <div class="hero-actions">
-          <a class="btn btn-primary" href="./playground.html">Try WASM Playground</a>
-          <a class="btn btn-secondary" href="./dashboard.html">Compatibility Dashboard</a>
-          <a class="btn btn-secondary" href="https://github.com/dvgyl/Rcmake" target="_blank" rel="noopener noreferrer">GitHub</a>
-        </div>
-
-        <div class="cmd-card" aria-label="Install and stage commands">
-          <div class="cmd-tabs">
-            <div class="cmd-tab-group" role="tablist" aria-label="Installation method">
-              <button class="tab-btn" type="button" role="tab" aria-selected="true" data-cmd-tab="release">Install Release</button>
-              <button class="tab-btn" type="button" role="tab" aria-selected="false" data-cmd-tab="alias">Drop-In PATH Alias</button>
-              <button class="tab-btn" type="button" role="tab" aria-selected="false" data-cmd-tab="source">Build &amp; Stage from Source</button>
-            </div>
-            <button id="copy-cmd-btn" class="btn btn-secondary btn-sm" type="button">Copy</button>
-          </div>
-          <div class="cmd-body">
-            <pre><span class="cmd-prompt">$</span><code id="install-cmd-text">curl -fsSL https://raw.githubusercontent.com/dvgyl/Rcmake/main/scripts/install.sh | bash</code></pre>
-          </div>
-        </div>
+  <main class="page">
+    <section class="intro">
+      <h1>Rcmake</h1>
+      <p class="lede">A clean-room CMake 4.5.1 replacement written in safe Rust. Single binary for <code>cmake</code>, <code>ctest</code>, and <code>cpack</code>.</p>
+      <div class="shell">
+        <pre id="shell-quickstart"><span class="prompt">$ </span><span data-line>git clone https://github.com/dvgyl/Rcmake &amp;&amp; Rcmake/scripts/install.sh --alias-cmake</span>
+<span class="prompt">$ </span><span data-line>cmake -S . -B build -G Ninja &amp;&amp; cmake --build build</span></pre>
+        <button class="text copy" type="button" data-copy="shell-quickstart">copy</button>
       </div>
+      <p class="note">The installer downloads the latest release into <code>$HOME/.local</code>. <code>--alias-cmake</code> adds <code>cmake</code>, <code>ctest</code>, and <code>cpack</code> links to <code>rcmake</code>.</p>
     </section>
 
-    <section class="proof-section" aria-labelledby="proof-heading">
-      <div class="container">
-        <div class="section-head">
-          <div>
-            <h2 id="proof-heading">Verification Snapshot</h2>
-            <p>Live compatibility and soundness metrics hydrated directly from <code>data/latest.json</code>.</p>
-          </div>
-          <a class="section-link" href="./dashboard.html">Open full 7-track dashboard &rarr;</a>
-        </div>
+    <h2 id="status">Status</h2>
+    <p>Each row compares Rcmake output with the CMake 4.5.1 binary. A grey value shows the scope of a run that is not yet measured.</p>
+    <div class="table-scroll">
+      <table>
+        <thead>
+          <tr><th>Check</th><th>Result</th><th class="r">Status</th></tr>
+        </thead>
+        <tbody id="spec-rows">
+          <tr><td colspan="3" class="muted">Reading data/latest.json</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="meta"><span id="spec-meta">snapshot</span> · <a href="./data/latest.json">latest.json</a> · <a href="./dashboard.html">full report</a></p>
 
-        <div id="proof-strip" class="proof-grid">
-          <div class="proof-card">
-            <div class="proof-card-top">
-              <span class="proof-label">Loading snapshot</span>
-              <span class="badge badge-pending"><span class="badge-dot"></span>Loading</span>
-            </div>
-            <div class="proof-value tabular">...</div>
-            <div class="proof-sub">Reading <code>site/data/latest.json</code></div>
-          </div>
-        </div>
+    <h2 id="generators">Generators</h2>
+    <p>Rcmake writes the build system directly. It does not call CMake.</p>
+    <table>
+      <thead><tr><th>Generator</th><th>Output</th></tr></thead>
+      <tbody>
+        <tr><td><code>Ninja</code></td><td>Response files, depfiles, <code>dyndep</code> for C++20 modules</td></tr>
+        <tr><td><code>Ninja Multi-Config</code></td><td>Per-configuration files, <code>CMAKE_INTDIR</code>, <code>compile_commands.json</code></td></tr>
+        <tr><td><code>Unix Makefiles</code></td><td>Implicit dependency scanning, <code>--output-sync</code></td></tr>
+        <tr><td><code>Xcode</code></td><td><code>project.pbxproj</code>, schemes, <code>XCFramework</code> support</td></tr>
+        <tr><td><code>Visual Studio 17 2022</code>, <code>18 2026</code></td><td><code>.sln</code>, <code>.slnx</code>, <code>.vcxproj</code>, filters, stable GUIDs</td></tr>
+      </tbody>
+    </table>
 
-        <div class="proof-meta">
-          <span id="proof-meta-commit" class="mono">Source: data/latest.json</span>
-          <span id="proof-meta-note">Unmeasured frozen-binary metrics display explicit pending badges.</span>
-        </div>
-      </div>
-    </section>
+    <h2 id="languages">Languages and tooling</h2>
+    <table class="kv">
+      <tbody>
+        <tr><th>C, C++</th><td>C++20 and C++23 named modules: <code>CXX_MODULES</code> file sets, <code>CMAKE_CXX_STDLIB_MODULES_JSON</code></td></tr>
+        <tr><th>Objective-C</th><td>Objective-C and Objective-C++, Apple frameworks, Mach-O <code>RPATH</code></td></tr>
+        <tr><th>Fortran</th><td><code>.mod</code> dependency scanning and module order</td></tr>
+        <tr><th>CUDA, HIP</th><td>Architectures, separable compilation, device link</td></tr>
+        <tr><th>Other</th><td>ASM, MASM, NASM, RC, Qt <code>AUTOMOC</code>, <code>AUTOUIC</code>, <code>AUTORCC</code></td></tr>
+        <tr><th>Command line</th><td><code>cmake</code> with <code>-P</code>, <code>-E</code>, <code>--build</code>, <code>--install</code>, <code>--workflow</code>; <code>ctest</code>; <code>cpack</code></td></tr>
+        <tr><th>Presets</th><td>Schema v13: configure, build, test, package, and workflow presets</td></tr>
+        <tr><th>File API</th><td><code>codemodel</code> v2.12, <code>cache</code>, <code>toolchains</code>, <code>cmakeFiles</code>, <code>configureLog</code></td></tr>
+        <tr><th>Diagnostics</th><td><code>cmake_diagnostic()</code>, <code>--sarif-output</code>, policies <code>CMP0000</code> to <code>CMP0226</code></td></tr>
+        <tr><th>Packages</th><td>Common Package Specification (CPS), SBOM output, Instrumentation API</td></tr>
+      </tbody>
+    </table>
 
-    <section class="content-section" aria-labelledby="capabilities-heading">
-      <div class="container">
-        <div class="section-head">
-          <div>
-            <h2 id="capabilities-heading">Built for Full CMake 4.5.1 Workloads</h2>
-            <p>Native build generation, modern language rules, and complete CLI, test, package, and IDE tooling.</p>
-          </div>
-        </div>
+    <h2 id="architecture">Architecture</h2>
+    <p>The workspace has 34 crates. Each stage of a configure run is a separate crate.</p>
+<pre class="diagram" aria-label="Configure pipeline">CMakeLists.txt
+  -> rcmake-syntax     lex and parse
+  -> rcmake-eval       commands, variables, policies, generator expressions
+  -> rcmake-resolve    targets, usage requirements, link graph
+  -> rcmake-gen-*      build.ninja, Makefile, project.pbxproj, .vcxproj
 
-        <div class="cap-grid">
-          <article class="card">
-            <div class="card-accent accent-red" aria-hidden="true"></div>
-            <h3>5 Native Generators</h3>
-            <p>Direct build-graph emission with deterministic outputs and multi-config generator expression evaluation.</p>
-            <ul class="feature-list">
-              <li><strong>Ninja</strong>: rspfiles, depfiles, C++20/23 module <code>dyndep</code></li>
-              <li><strong>Ninja Multi-Config</strong>: per-config flags, <code>CMAKE_INTDIR</code>, <code>compile_commands.json</code></li>
-              <li><strong>Unix Makefiles</strong>: implicit dependency scanning and grouped <code>--output-sync</code></li>
-              <li><strong>Xcode</strong>: <code>.xcodeproj/project.pbxproj</code>, schemes, workspaces, <code>XcFramework</code></li>
-              <li><strong>Visual Studio 17 &amp; 18</strong>: <code>.sln</code>, <code>.slnx</code>, <code>.vcxproj</code>, filters, deterministic GUIDs</li>
-            </ul>
-          </article>
+   all stages read files, environment, processes, and time through Host
+   NativeHost = real builds          PureHost = tests, editors, wasm32</pre>
+    <p>Every crate has <code>#![forbid(unsafe_code)]</code>. Input from <code>CMakeLists.txt</code>, caches, presets, and process output is untrusted. The parsers have limits on recursion, expansion, and file size, and they do not panic.</p>
+    <p>The <code>Host</code> trait is the only access to the operating system. Tests use <code>PureHost</code>, an in-memory host, so they are fast and give the same result each time. The browser playground uses the same host.</p>
+    <table>
+      <thead><tr><th>Group</th><th>Crates</th></tr></thead>
+      <tbody>
+        <tr><td>Base</td><td class="mono">base json diag host regex archive</td></tr>
+        <tr><td>Language</td><td class="mono">syntax expr genex model eval commands presets</td></tr>
+        <tr><td>Build</td><td class="mono">resolve build cxxmodules fortran gen-common gen-ninja gen-make gen-xcode gen-vs</td></tr>
+        <tr><td>Drivers</td><td class="mono">cli api lsp ctest cpack tool-e store fetch instrument</td></tr>
+        <tr><td>Verification</td><td class="mono">cps harness fuzz</td></tr>
+      </tbody>
+    </table>
+    <p class="note">Each name has the prefix <code>rcmake-</code>.</p>
 
-          <article class="card">
-            <div class="card-accent accent-green" aria-hidden="true"></div>
-            <h3>Languages &amp; Toolchains</h3>
-            <p>Full multi-language compilation rules, module scanning, and cross-compilation toolchain support.</p>
-            <ul class="feature-list">
-              <li><strong>C &amp; C++20/23 Modules</strong>: <code>CXX_MODULES</code> file sets and <code>CMAKE_CXX_STDLIB_MODULES_JSON</code></li>
-              <li><strong>Objective-C &amp; Objective-C++</strong>: Apple frameworks, Mach-O RPATH, SDK resolution</li>
-              <li><strong>Fortran</strong>: <code>.mod</code> dependency scanning, preprocessing, module ordering</li>
-              <li><strong>CUDA &amp; HIP</strong>: architectures, separable compilation, device linking</li>
-              <li><strong>ASM / MASM / NASM, Swift, RC &amp; Qt AUTOGEN</strong>: <code>AUTOMOC</code>, <code>AUTOUIC</code>, <code>AUTORCC</code></li>
-            </ul>
-          </article>
+    <h2 id="differences">Known differences from CMake 4.5.1</h2>
+    <ul class="plain">
+      <li>There is no <code>ccmake</code> terminal interface, <code>cmake-gui</code>, DAP <code>--debugger</code>, or legacy extra generators (CodeBlocks, Eclipse CDT4, Kate, Sublime).</li>
+      <li><code>cmake -E tar</code> and CPack archive generators write reproducible uid/gid 0 instead of host file ownership.</li>
+      <li>Some <code>Tests/RunCMake</code> cases still give different output. The <a href="./dashboard.html">compatibility report</a> shows each suite.</li>
+      <li>Swift sources are accepted, but they are not yet verified against CMake 4.5.1.</li>
+      <li>When you run the binary as <code>rcmake</code>, it accepts extra options: <code>--profile</code>, <code>--no-probe-cache</code>, <code>--fetch-lock</code>, <code>--hermetic</code>, and the <code>rcmake explain</code> command. When you run it as <code>cmake</code>, output follows CMake format.</li>
+    </ul>
 
-          <article class="card">
-            <div class="card-accent accent-blue" aria-hidden="true"></div>
-            <h3>Modern Tooling &amp; Developer UX</h3>
-            <p>Drop-in compatibility across everyday build, test, packaging, and editor workflows.</p>
-            <ul class="feature-list">
-              <li><strong>Multi-Call CLI</strong>: <code>cmake</code> (<code>-P</code>, <code>-E</code>, <code>--build</code>, <code>--install</code>, <code>--workflow</code>), <code>ctest</code>, <code>cpack</code></li>
-              <li><strong>Presets v13 &amp; File-Based API v2.12</strong>: <code>codemodel</code>, <code>cache</code>, <code>toolchains</code>, <code>cmakeFiles</code>, <code>configureLog</code></li>
-              <li><strong>Interchange &amp; Diagnostics</strong>: Common Package Specification (CPS), SBOMs, SARIF (<code>--sarif-output</code>), policies <code>CMP0066</code> to <code>CMP0220+</code></li>
-              <li><strong>Speed &amp; Introspection</strong>: persistent probe cache, incremental replay, <code>rcmake-lsp</code>, and <code>rcmake explain</code> provenance</li>
-            </ul>
-          </article>
-        </div>
-      </div>
-    </section>
-
-    <section class="content-section" aria-labelledby="architecture-heading">
-      <div class="container">
-        <div class="section-head">
-          <div>
-            <h2 id="architecture-heading">34-Crate Safe-Rust Architecture</h2>
-            <p>Modular workspace mirroring CMake's configure, resolve, generate, and driver stages with strict safety boundaries.</p>
-          </div>
-        </div>
-
-        <div class="arch-layers" aria-label="Workspace crate layers">
-          <div class="arch-layer">
-            <div>
-              <span class="arch-layer-title">Foundation &amp; Safety</span>
-              <span class="arch-layer-count">6 crates</span>
-            </div>
-            <div class="crate-pills">
-              <span class="crate-pill">rcmake-base</span>
-              <span class="crate-pill">rcmake-json</span>
-              <span class="crate-pill">rcmake-diag</span>
-              <span class="crate-pill">rcmake-host</span>
-              <span class="crate-pill">rcmake-regex</span>
-              <span class="crate-pill">rcmake-archive</span>
-            </div>
-          </div>
-
-          <div class="arch-layer">
-            <div>
-              <span class="arch-layer-title">Language &amp; Evaluation</span>
-              <span class="arch-layer-count">7 crates</span>
-            </div>
-            <div class="crate-pills">
-              <span class="crate-pill">rcmake-syntax</span>
-              <span class="crate-pill">rcmake-expr</span>
-              <span class="crate-pill">rcmake-genex</span>
-              <span class="crate-pill">rcmake-model</span>
-              <span class="crate-pill">rcmake-eval</span>
-              <span class="crate-pill">rcmake-commands</span>
-              <span class="crate-pill">rcmake-presets</span>
-            </div>
-          </div>
-
-          <div class="arch-layer">
-            <div>
-              <span class="arch-layer-title">Resolution, Languages &amp; Generators</span>
-              <span class="arch-layer-count">9 crates</span>
-            </div>
-            <div class="crate-pills">
-              <span class="crate-pill">rcmake-resolve</span>
-              <span class="crate-pill">rcmake-build</span>
-              <span class="crate-pill">rcmake-cxxmodules</span>
-              <span class="crate-pill">rcmake-fortran</span>
-              <span class="crate-pill">rcmake-gen-common</span>
-              <span class="crate-pill">rcmake-gen-ninja</span>
-              <span class="crate-pill">rcmake-gen-make</span>
-              <span class="crate-pill">rcmake-gen-xcode</span>
-              <span class="crate-pill">rcmake-gen-vs</span>
-            </div>
-          </div>
-
-          <div class="arch-layer">
-            <div>
-              <span class="arch-layer-title">Platform, Drivers &amp; Caching</span>
-              <span class="arch-layer-count">9 crates</span>
-            </div>
-            <div class="crate-pills">
-              <span class="crate-pill">rcmake-cli</span>
-              <span class="crate-pill">rcmake-api</span>
-              <span class="crate-pill">rcmake-lsp</span>
-              <span class="crate-pill">rcmake-ctest</span>
-              <span class="crate-pill">rcmake-cpack</span>
-              <span class="crate-pill">rcmake-tool-e</span>
-              <span class="crate-pill">rcmake-store</span>
-              <span class="crate-pill">rcmake-fetch</span>
-              <span class="crate-pill">rcmake-instrument</span>
-            </div>
-          </div>
-
-          <div class="arch-layer">
-            <div>
-              <span class="arch-layer-title">Interchange &amp; Verification</span>
-              <span class="arch-layer-count">3 crates</span>
-            </div>
-            <div class="crate-pills">
-              <span class="crate-pill">rcmake-cps</span>
-              <span class="crate-pill">rcmake-harness</span>
-              <span class="crate-pill">rcmake-fuzz</span>
-            </div>
-          </div>
-        </div>
-
-        <div class="pillars-grid">
-          <div class="card">
-            <h3><code>#![forbid(unsafe_code)]</code></h3>
-            <p>Enforced across all 34 crates via workspace lints. Untrusted inputs forbid panics, <code>unwrap()</code>, and unbounded recursion across lexing, expressions, presets, and archive parsing.</p>
-          </div>
-          <div class="card">
-            <h3><code>Host</code> Trait Abstraction</h3>
-            <p>Filesystem, environment, process spawning, and clock access run through a unified <code>Host</code> trait. Native builds use <code>NativeHost</code>; tests, IDE indexing, and WebAssembly use deterministic in-memory <code>PureHost</code>.</p>
-          </div>
-          <div class="card">
-            <h3>Clean-Room Permissive Licensing</h3>
-            <p>All Rust engine crates and tooling are written from scratch under <code>MIT OR Apache-2.0</code>. Official CMake 4.5.1 <code>Modules/</code> and <code>Templates/</code> are bundled under <code>BSD-3-Clause</code> with full attribution.</p>
-          </div>
-        </div>
-      </div>
-    </section>
+    <h2 id="licence">Licence</h2>
+    <p>The Rust code is new and is licensed under <code>MIT OR Apache-2.0</code>. Rcmake includes the CMake 4.5.1 <code>Modules/</code> and <code>Templates/</code> directories under <code>BSD-3-Clause</code>, with the original copyright notices.</p>
+    <p>Rcmake is an independent project. It is not affiliated with or endorsed by Kitware. CMake is a trademark of Kitware, Inc.</p>
   </main>
 
-  <footer class="site-footer">
-    <div class="container footer-inner">
-      <div class="footer-left">
-        <img class="brand-only-light" src="./assets/rcmake-mark.svg" alt="" width="20" height="20">
-        <img class="brand-only-dark" src="./assets/rcmake-mark-dark.svg" alt="" width="20" height="20">
-        <span>Rcmake: Rust engine <code>MIT OR Apache-2.0</code>; bundled CMake 4.5.1 modules <code>BSD-3-Clause</code>.</span>
-      </div>
-      <div class="footer-links">
-        <a href="./index.html">Overview</a>
+  <footer class="footer">
+    <div class="page footer-inner">
+      <span>Rcmake · <code>MIT OR Apache-2.0</code></span>
+      <nav aria-label="Footer">
+        <a href="https://github.com/dvgyl/Rcmake">GitHub</a>
+        <a href="./dashboard.html">Compatibility</a>
         <a href="./playground.html">Playground</a>
-        <a href="./dashboard.html">Dashboard</a>
-        <a href="./data/latest.json">latest.json</a>
-        <a href="https://github.com/dvgyl/Rcmake" target="_blank" rel="noopener noreferrer">GitHub</a>
-      </div>
+      </nav>
     </div>
   </footer>
 

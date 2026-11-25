@@ -3,94 +3,59 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Compatibility Dashboard | Rcmake</title>
-  <meta name="description" content="Public nightly CMake 4.5.1 compatibility dashboard for Rcmake across Core-62, CMP policies, 3-OS Tests/RunCMake, 10 boss-fight projects, sealed 240-repo unseen holdout, 64-shard vcpkg matrix, and benchmarks.">
-  <meta property="og:title" content="Rcmake Nightly Compatibility Dashboard">
-  <meta property="og:description" content="7-track compatibility and soundness dashboard driven by site/data/latest.json.">
+  <title>Compatibility · Rcmake</title>
+  <meta name="description" content="Rcmake compatibility with CMake 4.5.1: Core-62, policies, Tests/RunCMake on 3 operating systems, large projects, sealed holdout, vcpkg, and benchmarks.">
+  <meta property="og:title" content="Rcmake compatibility report">
+  <meta property="og:description" content="Rcmake compared with CMake 4.5.1, from data/latest.json.">
   <meta property="og:image" content="./assets/og-card.svg">
   <link rel="icon" type="image/svg+xml" href="./assets/favicon.svg">
   <link rel="stylesheet" href="./styles.css">
   <script>
     try {
       const saved = localStorage.getItem("rcmake-theme");
-      const preferred = window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
-      document.documentElement.dataset.theme = saved || preferred;
+      const dark = window.matchMedia("(prefers-color-scheme: dark)").matches;
+      document.documentElement.dataset.theme = saved || (dark ? "dark" : "light");
     } catch (_) {}
   </script>
 </head>
 <body>
-  <header class="site-header">
-    <div class="rgb-hairline" aria-hidden="true"><span></span><span></span><span></span></div>
-    <div class="container nav-inner">
-      <a class="nav-brand" href="./index.html">
-        <img class="brand-only-light" src="./assets/rcmake-mark.svg" alt="" width="26" height="26">
-        <img class="brand-only-dark" src="./assets/rcmake-mark-dark.svg" alt="" width="26" height="26">
-        <span>Rcmake</span>
+  <header class="topbar">
+    <div class="page topbar-inner">
+      <a class="brand" href="./index.html">
+        <img class="mark-light" src="./assets/rcmake-mark.svg" alt="" width="20" height="20">
+        <img class="mark-dark" src="./assets/rcmake-mark-dark.svg" alt="" width="20" height="20">
+        Rcmake
       </a>
-      <nav class="nav-links" aria-label="Primary">
-        <a class="nav-link" href="./index.html">Overview</a>
-        <a class="nav-link" href="./playground.html">Playground</a>
-        <a class="nav-link" href="./dashboard.html" aria-current="page">Dashboard</a>
-        <a class="nav-link" href="https://github.com/dvgyl/Rcmake" target="_blank" rel="noopener noreferrer">GitHub</a>
-        <button id="theme-toggle" class="theme-toggle" type="button" aria-label="Toggle color theme" title="Toggle light or dark theme">
-          <svg id="theme-icon-sun" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-            <circle cx="12" cy="12" r="4"></circle>
-            <path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"></path>
-          </svg>
-          <svg id="theme-icon-moon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-            <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"></path>
-          </svg>
-        </button>
+      <nav class="nav" aria-label="Primary">
+        <a class="opt" href="./index.html">Overview</a>
+        <a href="./playground.html">Playground</a>
+        <a href="./dashboard.html" aria-current="page">Compatibility</a>
+        <a href="https://github.com/dvgyl/Rcmake">GitHub</a>
+        <button id="theme-toggle" type="button">Dark</button>
       </nav>
     </div>
   </header>
 
-  <main>
-    <section class="dash-hero">
-      <div class="container">
-        <h1>Nightly Compatibility Dashboard</h1>
-        <p id="dash-subtitle" style="margin:0;color:var(--ink-secondary);max-width:72ch;">
-          Seven independent verification tracks measured against official CMake 4.5.1. Driven directly by <code>data/latest.json</code> and validated by <code>data/dashboard.schema.json</code>.
-        </p>
-        <div id="dash-meta" class="dash-meta-row">
-          <span>Loading snapshot...</span>
-        </div>
-      </div>
-    </section>
-
-    <nav class="dash-nav" aria-label="Dashboard tracks">
-      <div class="container dash-nav-inner">
-        <a href="#track-core">1. Core-62</a>
-        <a href="#track-policies">2. Policies</a>
-        <a href="#track-runcmake">3. RunCMake (3 OS)</a>
-        <a href="#track-boss">4. Boss-Fight Giants</a>
-        <a href="#track-unseen">5. Sealed 240-Repo Holdout</a>
-        <a href="#track-vcpkg">6. 64-Shard vcpkg</a>
-        <a href="#track-benchmarks">7. Benchmarks &amp; Gates</a>
-      </div>
-    </nav>
-
-    <div id="dash-root">
-      <section class="track-section">
-        <div class="container">
-          <p style="color:var(--ink-muted);">Loading <code>data/latest.json</code>...</p>
-        </div>
-      </section>
+  <main class="page">
+    <header class="report-head">
+      <h1>Compatibility report</h1>
+      <p class="meta"><span id="report-meta">reading snapshot</span> · <a href="./data/latest.json">latest.json</a></p>
+      <p id="report-note"></p>
+      <p class="note">Each track compares Rcmake with the CMake 4.5.1 binary. A dash shows a value that is not yet measured.</p>
+    </header>
+    <div id="report">
+      <p class="muted">Reading data/latest.json</p>
     </div>
   </main>
 
-  <footer class="site-footer">
-    <div class="container footer-inner">
-      <div class="footer-left">
-        <img class="brand-only-light" src="./assets/rcmake-mark.svg" alt="" width="20" height="20">
-        <img class="brand-only-dark" src="./assets/rcmake-mark-dark.svg" alt="" width="20" height="20">
-        <span>Data contract: <a href="./data/latest.json"><code>data/latest.json</code></a> &middot; <a href="./data/dashboard.schema.json"><code>data/dashboard.schema.json</code></a></span>
-      </div>
-      <div class="footer-links">
+  <footer class="footer">
+    <div class="page footer-inner">
+      <span>Rcmake · <code>MIT OR Apache-2.0</code></span>
+      <nav aria-label="Footer">
+        <a href="https://github.com/dvgyl/Rcmake">GitHub</a>
         <a href="./index.html">Overview</a>
         <a href="./playground.html">Playground</a>
-        <a href="https://github.com/dvgyl/Rcmake" target="_blank" rel="noopener noreferrer">GitHub</a>
-      </div>
+      </nav>
     </div>
   </footer>
 

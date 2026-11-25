@@ -1,9 +1,12 @@
-/* Rcmake Browser Playground Controller.
- * Pure ES module, zero external dependencies. MIT OR Apache-2.0.
+/* Rcmake playground controller.
+ * Plain ES module, no dependencies. MIT OR Apache-2.0.
  */
 
-import { escapeHtml, statusBadgeHtml } from "./app.js";
+import { copyWithFeedback, escapeHtml } from "./app.js";
 import { PLAYGROUND_EXAMPLES, RcmakeWasmAdapter } from "./wasm-adapter.js";
+
+const BUNDLE_URL = "./wasm/rcmake_wasm.js";
+const SEVERITY_STATUS = { error: "fail", warning: "partial", info: "pass", note: "pass" };
 
 const adapter = new RcmakeWasmAdapter();
 
@@ -20,80 +23,69 @@ const state = {
   showRawExplainJson: false
 };
 
+const $ = (id) => document.getElementById(id);
+
 const els = {
-  modeBadge: document.getElementById("pg-mode-badge"),
-  runtimeMsg: document.getElementById("pg-runtime-msg"),
-  exampleDesc: document.getElementById("pg-example-desc"),
-  exampleSelect: document.getElementById("example-select"),
-  configSelect: document.getElementById("config-select"),
-  generatorSelect: document.getElementById("generator-select"),
-  resetBtn: document.getElementById("reset-btn"),
-  runBtn: document.getElementById("run-btn"),
-  fileTabs: document.getElementById("file-tabs"),
-  dirtyIndicator: document.getElementById("dirty-indicator"),
-  gutter: document.getElementById("editor-gutter"),
-  textarea: document.getElementById("editor-textarea"),
-  cursor: document.getElementById("editor-cursor"),
-  inspectorTabs: Array.from(document.querySelectorAll("[data-inspector-tab]")),
-  inspectorBody: document.getElementById("inspector-body"),
-  copyNinjaBtn: document.getElementById("copy-ninja-btn"),
-  diagCount: document.getElementById("tab-count-diag"),
-  targetCount: document.getElementById("tab-count-targets"),
-  runStatus: document.getElementById("run-status"),
-  runTiming: document.getElementById("run-timing")
+  runtime: $("runtime"),
+  exampleSelect: $("example-select"),
+  configSelect: $("config-select"),
+  generatorSelect: $("generator-select"),
+  resetBtn: $("reset-btn"),
+  runBtn: $("run-btn"),
+  fileTabs: $("file-tabs"),
+  dirty: $("dirty-indicator"),
+  gutter: $("editor-gutter"),
+  textarea: $("editor-textarea"),
+  cursor: $("editor-cursor"),
+  tabs: Array.from(document.querySelectorAll("[data-inspector-tab]")),
+  body: $("inspector-body"),
+  copyBtn: $("copy-file-btn"),
+  fileTabName: $("tab-file-name"),
+  diagCount: $("tab-count-diag"),
+  targetCount: $("tab-count-targets"),
+  runStatus: $("run-status"),
+  runTiming: $("run-timing")
 };
 
-function populateExampleSelect() {
-  els.exampleSelect.innerHTML = Object.values(PLAYGROUND_EXAMPLES)
-    .map((ex) => `<option value="${escapeHtml(ex.id)}">${escapeHtml(ex.title)}</option>`)
-    .join("");
+function muted(text) {
+  return `<p class="muted">${escapeHtml(text)}</p>`;
 }
 
-function updateGutter() {
-  const lines = els.textarea.value.split("\n").length;
-  const nums = [];
-  for (let i = 1; i <= lines; i += 1) {
-    nums.push(String(i));
+function formatLoc(loc) {
+  if (!loc) {
+    return "";
   }
-  els.gutter.textContent = nums.join("\n");
+  return `${loc.path || ""}:${loc.line || 0}${loc.command ? ` ${loc.command}()` : ""}`;
 }
 
-function updateCursor() {
+/* Editor */
+
+function syncEditorChrome() {
   const value = els.textarea.value;
-  const pos = els.textarea.selectionStart || 0;
-  const before = value.slice(0, pos);
-  const lines = before.split("\n");
-  const line = lines.length;
-  const col = lines[lines.length - 1].length + 1;
-  els.cursor.textContent = `Ln ${line}, Col ${col} | ${value.length} chars`;
-}
-
-function isDirty() {
+  const count = value.split("\n").length;
+  els.gutter.textContent = Array.from({ length: count }, (_, i) => i + 1).join("\n");
+  els.gutter.scrollTop = els.textarea.scrollTop;
+  const before = value.slice(0, els.textarea.selectionStart || 0).split("\n");
+  els.cursor.textContent = `Ln ${before.length}, Col ${before[before.length - 1].length + 1}`;
   const baseline = PLAYGROUND_EXAMPLES[state.exampleId]?.files || {};
-  return Object.entries(baseline).some(([path, content]) => (state.files[path] ?? "") !== content);
-}
-
-function updateDirtyIndicator() {
-  els.dirtyIndicator.textContent = isDirty() ? "Modified" : "Unmodified";
+  const dirty = Object.entries(baseline).some(([path, text]) => (state.files[path] ?? "") !== text);
+  els.dirty.textContent = dirty ? "modified" : "";
 }
 
 function renderFileTabs() {
-  const filenames = Object.keys(state.files);
-  els.fileTabs.innerHTML = filenames
+  els.fileTabs.innerHTML = Object.keys(state.files)
     .map(
       (name) =>
-        `<button class="tab-btn" type="button" role="tab" aria-selected="${String(name === state.activeFile)}" data-file-tab="${escapeHtml(name)}">${escapeHtml(name)}</button>`
+        `<button type="button" role="tab" aria-selected="${name === state.activeFile}" data-file-tab="${escapeHtml(name)}">${escapeHtml(name)}</button>`
     )
     .join("");
-
   for (const btn of els.fileTabs.querySelectorAll("[data-file-tab]")) {
     btn.addEventListener("click", () => {
       state.files[state.activeFile] = els.textarea.value;
       state.activeFile = btn.dataset.fileTab;
       els.textarea.value = state.files[state.activeFile] ?? "";
       renderFileTabs();
-      updateGutter();
-      updateCursor();
+      syncEditorChrome();
     });
   }
 }
@@ -105,283 +97,211 @@ function loadExample(exampleId) {
   state.activeFile = Object.keys(state.files)[0];
   state.explainSymbol = ex.defaultSymbol || "";
   state.explainReport = null;
-
   if (ex.id === "presets-v13") {
     state.generator = "Ninja Multi-Config";
     els.generatorSelect.value = state.generator;
   }
-
   els.exampleSelect.value = ex.id;
-  els.exampleDesc.textContent = ex.description;
+  els.exampleSelect.title = ex.description || "";
   els.textarea.value = state.files[state.activeFile] ?? "";
   renderFileTabs();
-  updateGutter();
-  updateCursor();
-  updateDirtyIndicator();
+  syncEditorChrome();
 }
 
+/* Output panes */
+
 function renderDiagnostics(result) {
-  if (!result || !result.diagnostics || result.diagnostics.length === 0) {
-    return `<p style="color:var(--ink-muted);margin:0;">No diagnostics emitted.</p>`;
+  const list = result?.diagnostics || [];
+  if (list.length === 0) {
+    return muted("No diagnostics.");
   }
-  return `<div class="diag-list">${result.diagnostics
+  return list
     .map((d) => {
-      const badgeStatus = d.severity === "error" ? "fail" : d.severity === "warning" ? "partial" : "pass";
-      return `
-        <article class="diag-item">
-          <div class="diag-head">
-            <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;">
-              ${statusBadgeHtml(badgeStatus, d.severity.toUpperCase())}
-              <span class="badge mono">${escapeHtml(d.category || "DIAGNOSTIC")}</span>
-            </div>
-            <span class="diag-loc">${escapeHtml(d.file || "CMakeLists.txt")}:${escapeHtml(d.line ?? 1)}:${escapeHtml(d.column ?? 1)}</span>
-          </div>
-          <p class="diag-msg">${escapeHtml(d.message)}</p>
-        </article>
-      `;
+      const sev = String(d.severity || "info");
+      const st = SEVERITY_STATUS[sev] || "pending";
+      return `<div class="block">
+        <div><span class="st st-${st}">${escapeHtml(sev)}</span>&nbsp;&nbsp;${escapeHtml(d.category || "")}&nbsp;&nbsp;<span class="muted">${escapeHtml(d.file || "CMakeLists.txt")}:${escapeHtml(d.line ?? 1)}:${escapeHtml(d.column ?? 1)}</span></div>
+        <div>${escapeHtml(d.message)}</div>
+      </div>`;
     })
-    .join("")}</div>`;
+    .join("");
 }
 
 function renderTargets(result) {
-  if (!result || !result.targets || result.targets.length === 0) {
-    return `<p style="color:var(--ink-muted);margin:0;">No targets resolved.</p>`;
+  const list = result?.targets || [];
+  if (list.length === 0) {
+    return muted("No targets.");
   }
-  return result.targets
-    .map((t) => {
-      const rows = [
-        ["Defined at", t.definedAt],
-        ["Sources", t.sources?.join(", ") || "(none)"],
-        ["Features", t.compileFeatures?.join(", ") || "(none)"],
-        ["Definitions", t.compileDefinitions?.join("; ") || "(none)"],
-        ["Options", t.compileOptions?.join(" ") || "(none)"],
-        ["Includes", t.includeDirectories?.join("; ") || "(none)"],
-        ["Link libs", t.linkLibraries?.join(", ") || "(none)"]
-      ];
-      return `
-        <article class="target-card">
-          <div class="target-card-head">
-            <span class="target-name">${escapeHtml(t.name)}</span>
-            <span class="badge mono">${escapeHtml(t.kind)}</span>
-          </div>
-          <div class="kv-grid">
-            ${rows
-              .map(
-                ([k, v]) =>
-                  `<span class="kv-key">${escapeHtml(k)}</span><span class="kv-val">${escapeHtml(v)}</span>`
-              )
-              .join("")}
-          </div>
-        </article>
-      `;
-    })
+  const fields = [
+    ["defined at", (t) => t.definedAt],
+    ["sources", (t) => t.sources?.join(" ")],
+    ["features", (t) => t.compileFeatures?.join(" ")],
+    ["definitions", (t) => t.compileDefinitions?.join(" ")],
+    ["options", (t) => t.compileOptions?.join(" ")],
+    ["includes", (t) => t.includeDirectories?.join(" ")],
+    ["links", (t) => t.linkLibraries?.join(" ")]
+  ];
+  return list
+    .map(
+      (t) => `<div class="block">
+        <h3>${escapeHtml(t.name)} <span class="muted">${escapeHtml(t.kind)}</span></h3>
+        <dl>${fields
+          .map(([k, get]) => `<dt>${k}</dt><dd>${escapeHtml(get(t) || "-")}</dd>`)
+          .join("")}</dl>
+      </div>`
+    )
     .join("");
 }
 
-function renderNinja(result) {
-  const ninja = result?.files?.["build.ninja"] || "# No build.ninja generated.";
-  return `<pre class="code-block"><code>${escapeHtml(ninja)}</code></pre>`;
+function primaryFile(result) {
+  const files = result?.files || {};
+  const name = "build.ninja" in files ? "build.ninja" : Object.keys(files)[0];
+  return name ? { name, text: files[name] } : null;
 }
 
-function renderExplainDetails(report) {
+function renderGeneratedFile(result) {
+  const file = primaryFile(result);
+  return file ? `<pre>${escapeHtml(file.text)}</pre>` : muted("No generated files.");
+}
+
+function renderExplainReport(report) {
   if (!report) {
-    return `<p style="color:var(--ink-muted);margin:0;">Select a target or variable symbol to inspect its provenance.</p>`;
+    return muted("Select a target or variable.");
   }
   if (state.showRawExplainJson) {
-    return `<pre class="code-block"><code>${escapeHtml(JSON.stringify(report, null, 2))}</code></pre>`;
+    return `<pre>${escapeHtml(JSON.stringify(report, null, 2))}</pre>`;
   }
-
+  const d = report.details || {};
   if (report.kind === "not_found") {
-    const suggestions = report.details?.suggestions || [];
-    return `
-      <div class="diag-item">
-        <div class="diag-head">
-          ${statusBadgeHtml("partial", "NOT FOUND")}
-          <span class="mono" style="font-size:0.78rem;">${escapeHtml(report.schema)}</span>
-        </div>
-        <p class="diag-msg">Symbol <code>${escapeHtml(report.name)}</code> was not found in the active configure model.</p>
-        ${
-          suggestions.length > 0
-            ? `<p style="margin:8px 0 0;font-size:0.82rem;color:var(--ink-muted);">Available: ${suggestions
-                .map((s) => `<code>${escapeHtml(s.name)}</code> (${escapeHtml(s.kind)})`)
-                .join(", ")}</p>`
-            : ""
-        }
-      </div>
-    `;
+    const names = (d.suggestions || []).map((s) => `${s.name} (${s.kind})`).join(", ");
+    return `<div class="block">
+      <div><span class="st st-partial">not found</span>&nbsp;&nbsp;${escapeHtml(report.name)}</div>
+      ${names ? `<div class="muted">available: ${escapeHtml(names)}</div>` : ""}
+    </div>`;
   }
-
   if (report.kind === "variable") {
-    const d = report.details;
-    const writes = d.writes || [];
-    return `
-      <div class="target-card">
-        <div class="target-card-head">
-          <span class="target-name">${escapeHtml(report.name)}</span>
-          <div style="display:flex;gap:6px;">
-            <span class="badge mono">VARIABLE</span>
-            <span class="badge mono">${escapeHtml(d.binding || "directory")}</span>
-          </div>
-        </div>
-        <div class="kv-grid">
-          <span class="kv-key">Value</span><span class="kv-val">${escapeHtml(d.value)}</span>
-          <span class="kv-key">Defined</span><span class="kv-val">${escapeHtml(`${d.location?.path || ""}:${d.location?.line || 0} (${d.location?.command || ""})`)}</span>
-          <span class="kv-key">History</span><span class="kv-val">${escapeHtml(d.history || "complete")}</span>
-          <span class="kv-key">Schema</span><span class="kv-val">${escapeHtml(report.schema)}</span>
-        </div>
-        <ul class="hop-list">
-          ${writes
-            .map(
-              (w) =>
-                `<li class="hop-item">#${escapeHtml(w.sequence)} [${escapeHtml(w.op)}] = ${escapeHtml(JSON.stringify(w.value))} @ ${escapeHtml(w.location)}</li>`
-            )
-            .join("")}
-        </ul>
-      </div>
-    `;
+    return `<div class="block">
+      <h3>${escapeHtml(report.name)} <span class="muted">variable, ${escapeHtml(d.binding || "directory")} scope</span></h3>
+      <dl>
+        <dt>value</dt><dd>${escapeHtml(d.value)}</dd>
+        <dt>defined at</dt><dd>${escapeHtml(formatLoc(d.location))}</dd>
+        <dt>history</dt><dd>${escapeHtml(d.history || "complete")}</dd>
+      </dl>
+      <ol>${(d.writes || [])
+        .map((w) => `<li>${escapeHtml(w.op)} = ${escapeHtml(JSON.stringify(w.value))} <span class="muted">${escapeHtml(w.location)}</span></li>`)
+        .join("")}</ol>
+    </div>`;
   }
-
-  const d = report.details;
   const cfg = d.configurations?.[0];
-  const entries = cfg?.entries || [];
-  return `
-    <div class="target-card">
-      <div class="target-card-head">
-        <span class="target-name">${escapeHtml(d.target || report.name)}</span>
-        <div style="display:flex;gap:6px;">
-          <span class="badge mono">${escapeHtml(d.target_kind || "TARGET")}</span>
-          <span class="badge mono">${escapeHtml(cfg?.name || state.buildType)}</span>
-        </div>
-      </div>
-      <div class="kv-grid">
-        <span class="kv-key">Definition</span><span class="kv-val">${escapeHtml(`${d.definition?.path || ""}:${d.definition?.line || 0} (${d.definition?.command || ""})`)}</span>
-        <span class="kv-key">Schema</span><span class="kv-val">${escapeHtml(report.schema)}</span>
-      </div>
-      <ul class="hop-list">
-        ${entries
-          .map((e) => {
-            const hops = (e.chain || [])
-              .map((h) => `${h.from} -[${h.edge}]-> ${h.via || h.to} (${h.location})`)
-              .join(" -> ");
-            return `
-              <li class="hop-item">
-                <div><strong>${escapeHtml(e.property)}</strong> (${escapeHtml(e.scope)}): ${escapeHtml(e.value)}</div>
-                <div style="color:var(--ink-muted);margin-top:3px;">Origin: ${escapeHtml(e.origin)}${hops ? ` | Link chain: ${escapeHtml(hops)}` : " | Direct"}</div>
-              </li>
-            `;
-          })
-          .join("")}
-      </ul>
-    </div>
-  `;
+  return `<div class="block">
+    <h3>${escapeHtml(d.target || report.name)} <span class="muted">${escapeHtml(d.target_kind || "target")}, ${escapeHtml(cfg?.name || state.buildType)}</span></h3>
+    <dl><dt>defined at</dt><dd>${escapeHtml(formatLoc(d.definition))}</dd></dl>
+    ${(cfg?.entries || [])
+      .map((e) => {
+        const chain = (e.chain || [])
+          .map((h) => `<br>&nbsp;&nbsp;${escapeHtml(`${h.from} -[${h.edge}]-> ${h.via || h.to} (${h.location})`)}`)
+          .join("");
+        return `<div class="block">
+          <div>${escapeHtml(e.property)} <span class="muted">${escapeHtml(e.scope)}</span></div>
+          <div>${escapeHtml(e.value)}</div>
+          <div class="muted">origin ${escapeHtml(e.origin)}${chain}</div>
+        </div>`;
+      })
+      .join("")}
+  </div>`;
 }
 
 function renderExplainTab(result) {
-  const symbols = result?.explainSymbols || [];
-  const chips = symbols
+  const symbols = (result?.explainSymbols || [])
     .map(
       (sym) =>
-        `<button class="chip-btn${sym === state.explainSymbol ? " active" : ""}" type="button" data-explain-sym="${escapeHtml(sym)}">${escapeHtml(sym)}</button>`
+        `<button type="button" data-explain-sym="${escapeHtml(sym)}" aria-pressed="${sym === state.explainSymbol}">${escapeHtml(sym)}</button>`
     )
     .join("");
-
-  return `
-    <div class="explain-controls">
-      <form id="explain-form" class="explain-search">
-        <input id="explain-input" type="text" value="${escapeHtml(state.explainSymbol)}" placeholder="Enter target or variable name..." aria-label="Explain symbol">
-        <button class="btn btn-secondary btn-sm" type="submit">Explain</button>
-        <button id="toggle-explain-json" class="btn btn-secondary btn-sm" type="button">${state.showRawExplainJson ? "Structured View" : "Raw JSON"}</button>
-      </form>
-      <div class="chip-row">${chips}</div>
-    </div>
-    <div id="explain-output">${renderExplainDetails(state.explainReport)}</div>
-  `;
+  return `<form id="explain-form">
+      <input id="explain-input" type="text" value="${escapeHtml(state.explainSymbol)}" placeholder="target or variable" aria-label="Symbol to explain">
+      <button class="btn ghost" type="submit">Explain</button>
+      <button id="toggle-explain-json" class="text" type="button">${state.showRawExplainJson ? "structured" : "raw json"}</button>
+    </form>
+    <div class="symbols">${symbols}</div>
+    ${renderExplainReport(state.explainReport)}`;
 }
 
-function wireExplainControls() {
-  const form = document.getElementById("explain-form");
-  const input = document.getElementById("explain-input");
-  const toggleJson = document.getElementById("toggle-explain-json");
+async function explain(symbol) {
+  state.explainSymbol = symbol;
+  state.explainReport = await adapter.explain(symbol, { config: state.buildType });
+  renderInspector();
+}
 
-  if (form && input) {
-    form.addEventListener("submit", async (e) => {
-      e.preventDefault();
-      state.explainSymbol = input.value.trim();
-      state.explainReport = await adapter.explain(state.explainSymbol, { config: state.buildType });
-      renderInspector();
-    });
-  }
-  if (toggleJson) {
-    toggleJson.addEventListener("click", () => {
-      state.showRawExplainJson = !state.showRawExplainJson;
-      renderInspector();
-    });
-  }
-  for (const chip of els.inspectorBody.querySelectorAll("[data-explain-sym]")) {
-    chip.addEventListener("click", async () => {
-      state.explainSymbol = chip.dataset.explainSym;
-      state.explainReport = await adapter.explain(state.explainSymbol, { config: state.buildType });
-      renderInspector();
-    });
+function wireExplain() {
+  const form = $("explain-form");
+  form?.addEventListener("submit", (event) => {
+    event.preventDefault();
+    explain($("explain-input").value.trim());
+  });
+  $("toggle-explain-json")?.addEventListener("click", () => {
+    state.showRawExplainJson = !state.showRawExplainJson;
+    renderInspector();
+  });
+  for (const btn of els.body.querySelectorAll("[data-explain-sym]")) {
+    btn.addEventListener("click", () => explain(btn.dataset.explainSym));
   }
 }
 
 function renderInspector() {
   const result = state.lastResult;
-  for (const tab of els.inspectorTabs) {
+  for (const tab of els.tabs) {
     tab.setAttribute("aria-selected", String(tab.dataset.inspectorTab === state.activeTab));
   }
-  els.copyNinjaBtn.style.display = state.activeTab === "ninja" ? "inline-flex" : "none";
+  const file = primaryFile(result);
+  els.fileTabName.textContent = file?.name || "build.ninja";
+  els.copyBtn.hidden = state.activeTab !== "ninja" || !file;
+  els.diagCount.textContent = result ? String(result.diagnostics?.length ?? 0) : "";
+  els.targetCount.textContent = result ? String(result.targets?.length ?? 0) : "";
 
-  els.diagCount.textContent = `(${result?.diagnostics?.length ?? 0})`;
-  els.targetCount.textContent = `(${result?.targets?.length ?? 0})`;
-
-  if (state.activeTab === "diagnostics") {
-    els.inspectorBody.innerHTML = renderDiagnostics(result);
-  } else if (state.activeTab === "targets") {
-    els.inspectorBody.innerHTML = renderTargets(result);
-  } else if (state.activeTab === "ninja") {
-    els.inspectorBody.innerHTML = renderNinja(result);
-  } else {
-    els.inspectorBody.innerHTML = renderExplainTab(result);
-    wireExplainControls();
+  const views = {
+    diagnostics: renderDiagnostics,
+    targets: renderTargets,
+    ninja: renderGeneratedFile,
+    explain: renderExplainTab
+  };
+  els.body.innerHTML = (views[state.activeTab] || renderDiagnostics)(result);
+  if (state.activeTab === "explain") {
+    wireExplain();
   }
 }
+
+/* Configure */
 
 async function runConfigure() {
   state.files[state.activeFile] = els.textarea.value;
-  updateDirtyIndicator();
-  els.runStatus.textContent = "Configuring...";
-
-  const result = await adapter.configure(state.files, {
-    exampleId: state.exampleId,
-    generator: state.generator,
-    buildType: state.buildType
-  });
-  state.lastResult = result;
-
-  if (!state.explainSymbol && result.explainSymbols?.length) {
-    state.explainSymbol = result.explainSymbols[0];
+  syncEditorChrome();
+  els.runStatus.textContent = "configuring";
+  try {
+    const result = await adapter.configure(state.files, {
+      exampleId: state.exampleId,
+      generator: state.generator,
+      buildType: state.buildType
+    });
+    state.lastResult = result;
+    if (!state.explainSymbol && result.explainSymbols?.length) {
+      state.explainSymbol = result.explainSymbols[0];
+    }
+    state.explainReport = state.explainSymbol
+      ? await adapter.explain(state.explainSymbol, { config: state.buildType })
+      : null;
+    if (result.mode === "wasm") {
+      els.runStatus.textContent = result.ok ? "configure done" : "configure failed";
+    } else {
+      els.runStatus.textContent = result.editedInPreview
+        ? "edited buffer: showing the saved output for this example"
+        : "saved output for this example";
+    }
+    els.runTiming.textContent = `${result.durationMs} ms · ${state.generator} · ${state.buildType}`;
+  } catch (error) {
+    els.runStatus.textContent = `error: ${error instanceof Error ? error.message : String(error)}`;
   }
-  if (state.explainSymbol) {
-    state.explainReport = await adapter.explain(state.explainSymbol, { config: state.buildType });
-  }
-
-  els.runStatus.textContent = result.mode === "wasm"
-    ? (result.ok ? "Configure succeeded (WASM)" : "Configure reported errors (WASM)")
-    : (result.editedInPreview ? "Preview baseline shown (edited buffer)" : "Precomputed example ready (Preview mode)");
-  els.runTiming.textContent = `${result.durationMs} ms | ${state.generator} | ${state.buildType}`;
   renderInspector();
-}
-
-function syncRuntimeModeUi(loadInfo) {
-  if (loadInfo.mode === "wasm") {
-    els.modeBadge.innerHTML = statusBadgeHtml("pass", "WASM Runtime Active");
-    els.runtimeMsg.innerHTML = `Running compiled <code>rcmake_wasm.js</code> directly in browser via <code>PureHost</code>.`;
-  } else {
-    els.modeBadge.innerHTML = statusBadgeHtml("pending", "Preview mode (WASM bundle pending)");
-    els.runtimeMsg.innerHTML = `Preview mode active with precomputed CMake 4.5.1 outputs. Drop a compiled bundle at <code>./wasm/rcmake_wasm.js</code> for live browser execution.`;
-  }
 }
 
 function wireEvents() {
@@ -389,89 +309,63 @@ function wireEvents() {
     loadExample(els.exampleSelect.value);
     runConfigure();
   });
-
   els.configSelect.addEventListener("change", () => {
     state.buildType = els.configSelect.value;
     runConfigure();
   });
-
   els.generatorSelect.addEventListener("change", () => {
     state.generator = els.generatorSelect.value;
     runConfigure();
   });
-
   els.resetBtn.addEventListener("click", () => {
     loadExample(state.exampleId);
     runConfigure();
   });
-
-  els.runBtn.addEventListener("click", () => {
-    runConfigure();
-  });
+  els.runBtn.addEventListener("click", runConfigure);
 
   els.textarea.addEventListener("input", () => {
     state.files[state.activeFile] = els.textarea.value;
-    updateGutter();
-    updateCursor();
-    updateDirtyIndicator();
+    syncEditorChrome();
   });
-
   els.textarea.addEventListener("scroll", () => {
     els.gutter.scrollTop = els.textarea.scrollTop;
   });
-
-  els.textarea.addEventListener("click", updateCursor);
-  els.textarea.addEventListener("keyup", updateCursor);
-
+  els.textarea.addEventListener("click", syncEditorChrome);
+  els.textarea.addEventListener("keyup", syncEditorChrome);
   els.textarea.addEventListener("keydown", (event) => {
     if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
       event.preventDefault();
       runConfigure();
-      return;
-    }
-    if (event.key === "Tab") {
+    } else if (event.key === "Tab" && !event.shiftKey) {
       event.preventDefault();
-      const start = els.textarea.selectionStart;
-      const end = els.textarea.selectionEnd;
-      const val = els.textarea.value;
-      els.textarea.value = `${val.slice(0, start)}  ${val.slice(end)}`;
-      els.textarea.selectionStart = start + 2;
-      els.textarea.selectionEnd = start + 2;
+      const { selectionStart: start, selectionEnd: end, value } = els.textarea;
+      els.textarea.value = `${value.slice(0, start)}  ${value.slice(end)}`;
+      els.textarea.selectionStart = els.textarea.selectionEnd = start + 2;
       state.files[state.activeFile] = els.textarea.value;
-      updateGutter();
-      updateCursor();
-      updateDirtyIndicator();
+      syncEditorChrome();
     }
   });
 
-  for (const tab of els.inspectorTabs) {
+  for (const tab of els.tabs) {
     tab.addEventListener("click", () => {
       state.activeTab = tab.dataset.inspectorTab;
       renderInspector();
     });
   }
-
-  els.copyNinjaBtn.addEventListener("click", async () => {
-    const ninja = state.lastResult?.files?.["build.ninja"] || "";
-    try {
-      await navigator.clipboard.writeText(ninja);
-      els.copyNinjaBtn.textContent = "Copied";
-      window.setTimeout(() => {
-        els.copyNinjaBtn.textContent = "Copy Ninja";
-      }, 1500);
-    } catch (_) {
-      els.copyNinjaBtn.textContent = "Copy failed";
-    }
+  els.copyBtn.addEventListener("click", () => {
+    copyWithFeedback(els.copyBtn, primaryFile(state.lastResult)?.text || "");
   });
 }
 
 async function init() {
-  populateExampleSelect();
-  loadExample("hello-cpp20");
+  els.exampleSelect.innerHTML = Object.values(PLAYGROUND_EXAMPLES)
+    .map((ex) => `<option value="${escapeHtml(ex.id)}">${escapeHtml(ex.title)}</option>`)
+    .join("");
+  loadExample(state.exampleId);
   wireEvents();
-
-  const loadInfo = await adapter.load("./wasm/rcmake_wasm.js");
-  syncRuntimeModeUi(loadInfo);
+  const info = await adapter.load(BUNDLE_URL);
+  els.runtime.textContent = info.mode === "wasm" ? "wasm32 live" : "preview mode, wasm bundle pending";
+  els.runtime.title = info.mode === "wasm" ? info.url : `${info.url}: ${info.reason || "not found"}`;
   await runConfigure();
 }
 
