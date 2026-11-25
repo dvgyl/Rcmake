@@ -26,6 +26,7 @@ pub(super) fn cat(args: &[BString], cx: &ToolCtx<'_>) -> i32 {
         if options && arg == b"--" {
             options = false;
         } else if arg == STDIO {
+            options = false;
             if stream_stdin(cx).is_err() {
                 status = error(
                     cx,

@@ -871,3 +871,5 @@ fn explicit_file_uses_the_working_directory_and_its_own_includes() {
         BString::from("/work/ci")
     );
 }
+
+mod wave6;

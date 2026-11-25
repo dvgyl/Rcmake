@@ -343,7 +343,7 @@ fn component_groups_select_install_components() {
         host.as_ref(),
         "/work/build/cmake_install.cmake",
         br#"
-file(WRITE "${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_COMPONENT}.txt" "${CMAKE_INSTALL_CONFIG_NAME}")
+file(WRITE "${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_COMPONENT}.txt" "${BUILD_TYPE}")
 "#,
     );
     write(
@@ -470,7 +470,7 @@ set(CMAKE_COMMAND "/other/bin/cmake")
         host.as_ref(),
         "/work/build/cmake_install.cmake",
         br#"
-file(WRITE "${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_CONFIG_NAME}" "staged")
+file(WRITE "${CMAKE_INSTALL_PREFIX}/${BUILD_TYPE}" "staged")
 "#,
     );
     host.set_command_handler(|host, request, _| {
@@ -968,3 +968,5 @@ set(CPACK_INSTALL_CMAKE_PROJECTS "/work/build;demo;ALL;/")
         b"CPack Error: CPACK_INSTALL_CMAKE_PROJECTS is specified, but CPACK_CMAKE_GENERATOR is not. CPACK_CMAKE_GENERATOR is required to install the project.\nCPack Error: Error when generating package: demo\n"
     );
 }
+
+mod wave6_staging;

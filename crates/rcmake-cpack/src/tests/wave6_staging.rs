@@ -1,0 +1,502 @@
+use super::*;
+
+fn stderr(host: &PureHost) -> String {
+    String::from_utf8_lossy(&host.stream_bytes(Stream::Stderr)).into_owned()
+}
+
+fn file_names(tree: &BTreeMap<String, Entry>) -> Vec<&str> {
+    tree.keys().map(String::as_str).collect()
+}
+
+fn kind(host: &dyn Host, path: &Path) -> Option<FileKind> {
+    host.metadata(path, Follow::No).ok().map(|meta| meta.kind)
+}
+
+#[test]
+fn package_preset_config_file_expands_environment_macros() {
+    let host = memory_host();
+    write(
+        host.as_ref(),
+        "/work/CMakePresets.json",
+        br#"{
+        "version": 13,
+        "configurePresets": [{"name": "cfg", "generator": "Ninja", "binaryDir": "out"}],
+        "packagePresets": [{
+            "name": "pkg", "configurePreset": "cfg", "generators": ["TGZ"],
+            "environment": {"PACK_CONFIG": "custom.cmake"},
+            "configFile": "${sourceDir}/out/$env{PACK_CONFIG}",
+            "variables": {"CPACK_PACKAGE_VENDOR": "$env{PACK_CONFIG}"}
+        }]
+    }"#,
+    );
+    write(
+        host.as_ref(),
+        "/work/out/custom.cmake",
+        br#"
+set(CPACK_PACKAGE_NAME demo)
+set(CPACK_PACKAGE_VERSION 1)
+set(CPACK_PACKAGE_FILE_NAME config)
+set(CPACK_PACKAGE_VENDOR from-config)
+set(CPACK_INSTALLED_DIRECTORIES "/work/input;/")
+set(CPACK_POST_BUILD_SCRIPTS "/work/check.cmake")
+"#,
+    );
+    write(
+        host.as_ref(),
+        "/work/check.cmake",
+        br#"
+if(NOT CPACK_PACKAGE_VENDOR STREQUAL "custom.cmake")
+  message(FATAL_ERROR "Unexpected vendor: ${CPACK_PACKAGE_VENDOR}")
+endif()
+"#,
+    );
+    write(host.as_ref(), "/work/input/content", b"data");
+    assert_eq!(
+        invoke(
+            host.clone(),
+            &["--preset", "pkg", "-DCPACK_PACKAGE_FILE_NAME=cli"]
+        ),
+        0,
+        "{}",
+        stderr(&host)
+    );
+    let tree = extract(
+        host.as_ref(),
+        Path::new("/work/out/cli.tar.gz"),
+        Path::new("/work/unpacked"),
+    );
+    assert_eq!(file_names(&tree), ["cli/content"]);
+    assert_eq!(
+        kind(host.as_ref(), Path::new("/work/out/config.tar.gz")),
+        None
+    );
+}
+
+#[test]
+fn installed_directory_pairs_use_packaging_prefix_without_destdir() {
+    let host = memory_host();
+    write(
+        host.as_ref(),
+        "/work/CPackConfig.cmake",
+        br#"
+set(CPACK_GENERATOR TGZ)
+set(CPACK_PACKAGE_NAME demo)
+set(CPACK_PACKAGE_VERSION 1)
+set(CPACK_PACKAGE_FILE_NAME demo)
+set(CPACK_INCLUDE_TOPLEVEL_DIRECTORY OFF)
+set(CPACK_INSTALLED_DIRECTORIES "/work/payload;/assets")
+"#,
+    );
+    write(host.as_ref(), "/work/payload/marker", b"marker");
+    for (index, (args, expected)) in [
+        (
+            &["-DCPACK_PACKAGING_INSTALL_PREFIX=/opt/demo"][..],
+            "opt/demo/assets/marker",
+        ),
+        (
+            &[
+                "-DCPACK_PACKAGING_INSTALL_PREFIX=/opt/demo",
+                "-DCPACK_SET_DESTDIR=ON",
+            ][..],
+            "assets/marker",
+        ),
+        (&[][..], "assets/marker"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let dir = format!("/work/out{index}");
+        let mut argv = vec!["-B", dir.as_str()];
+        argv.extend(args);
+        assert_eq!(invoke(host.clone(), &argv), 0, "{}", stderr(&host));
+        let tree = extract(
+            host.as_ref(),
+            &Path::new(&dir).join("demo.tar.gz"),
+            &Path::new(&dir).join("unpacked"),
+        );
+        assert_eq!(file_names(&tree), [expected], "{args:?}");
+    }
+
+    for (index, args) in [
+        &["-DCPACK_INSTALLED_DIRECTORIES=/work/payload;../escape"][..],
+        &["-DCPACK_PACKAGING_INSTALL_PREFIX=/opt/../escape"][..],
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let host = memory_host();
+        write(host.as_ref(), "/work/payload/marker", b"marker");
+        write(
+            host.as_ref(),
+            "/work/CPackConfig.cmake",
+            br#"
+set(CPACK_GENERATOR TGZ)
+set(CPACK_PACKAGE_NAME demo)
+set(CPACK_PACKAGE_VERSION 1)
+set(CPACK_INSTALLED_DIRECTORIES "/work/payload;/assets")
+"#,
+        );
+        let dir = format!("/work/bad{index}");
+        let mut argv = vec!["-B", dir.as_str()];
+        argv.extend(args);
+        assert_eq!(invoke(host.clone(), &argv), 1);
+        assert!(
+            stderr(&host).contains("Invalid CPack install path"),
+            "{}",
+            stderr(&host)
+        );
+    }
+
+    let host = memory_host();
+    write(host.as_ref(), "/work/payload/marker", b"marker");
+    write(
+        host.as_ref(),
+        "/work/link.cmake",
+        br#"
+file(MAKE_DIRECTORY "${CMAKE_INSTALL_PREFIX}")
+file(CREATE_LINK "/work/elsewhere" "${CMAKE_INSTALL_PREFIX}/assets" SYMBOLIC)
+"#,
+    );
+    write(
+        host.as_ref(),
+        "/work/CPackConfig.cmake",
+        br#"
+set(CPACK_GENERATOR TGZ)
+set(CPACK_PACKAGE_NAME demo)
+set(CPACK_PACKAGE_VERSION 1)
+set(CPACK_PACKAGING_INSTALL_PREFIX "/opt/demo")
+set(CPACK_INSTALL_SCRIPT "/work/link.cmake")
+set(CPACK_INSTALLED_DIRECTORIES "/work/payload;/assets")
+"#,
+    );
+    assert_eq!(invoke(host.clone(), &[]), 1);
+    assert!(
+        stderr(&host).contains("Expected a staging directory"),
+        "{}",
+        stderr(&host)
+    );
+    assert_eq!(
+        kind(host.as_ref(), Path::new("/work/elsewhere/marker")),
+        None
+    );
+}
+
+const BUILD_TYPE_INSTALL: &[u8] = br#"
+if(DEFINED CMAKE_INSTALL_CONFIG_NAME)
+  set(config defined)
+else()
+  set(config undefined)
+endif()
+if(DEFINED BUILD_TYPE)
+  set(build set)
+else()
+  set(build unset)
+endif()
+file(WRITE "${CMAKE_INSTALL_PREFIX}/marker-${BUILD_TYPE}.txt" "${config};${build}")
+"#;
+
+#[test]
+fn cpack_project_install_sets_build_type_for_each_configuration() {
+    let host = memory_host();
+    write(
+        host.as_ref(),
+        "/work/build/cmake_install.cmake",
+        BUILD_TYPE_INSTALL,
+    );
+    write(
+        host.as_ref(),
+        "/work/CPackConfig.cmake",
+        br#"
+set(CPACK_GENERATOR TAR)
+set(CPACK_PACKAGE_NAME demo)
+set(CPACK_PACKAGE_VERSION 1)
+set(CPACK_PACKAGE_FILE_NAME demo)
+set(CPACK_INCLUDE_TOPLEVEL_DIRECTORY OFF)
+set(CPACK_CMAKE_GENERATOR Ninja)
+set(CPACK_INSTALL_CMAKE_PROJECTS "/work/build;demo;ALL;/")
+"#,
+    );
+    for (dir, args, expected) in [
+        (
+            "/work/multi",
+            &["-C", "Debug;Release"][..],
+            &[
+                ("marker-Debug.txt", "undefined;set"),
+                ("marker-Release.txt", "undefined;set"),
+            ][..],
+        ),
+        (
+            "/work/none",
+            &[][..],
+            &[("marker-.txt", "undefined;unset")][..],
+        ),
+        (
+            "/work/custom",
+            &[
+                "-C",
+                "Debug",
+                "-DCPACK_CUSTOM_INSTALL_VARIABLES=BUILD_TYPE=Custom",
+            ][..],
+            &[("marker-Custom.txt", "undefined;set")][..],
+        ),
+    ] {
+        let mut argv = vec!["-B", dir];
+        argv.extend(args);
+        assert_eq!(invoke(host.clone(), &argv), 0, "{}", stderr(&host));
+        let unpacked = Path::new(dir).join("unpacked");
+        let tree = extract(host.as_ref(), &Path::new(dir).join("demo.tar"), &unpacked);
+        assert_eq!(
+            file_names(&tree),
+            expected.iter().map(|(name, _)| *name).collect::<Vec<_>>()
+        );
+        for (name, contents) in expected {
+            assert_eq!(
+                read(host.as_ref(), &unpacked.join(name)),
+                contents.as_bytes()
+            );
+        }
+    }
+
+    write(
+        host.as_ref(),
+        "/work/build/cmake_install.cmake",
+        br#"
+if(NOT DEFINED CMAKE_INSTALL_CONFIG_NAME)
+  if(BUILD_TYPE)
+    string(REGEX REPLACE "^[^A-Za-z0-9_]+" "" CMAKE_INSTALL_CONFIG_NAME "${BUILD_TYPE}")
+  else()
+    set(CMAKE_INSTALL_CONFIG_NAME "Debug")
+  endif()
+endif()
+if(CMAKE_INSTALL_CONFIG_NAME MATCHES "^([Rr][Ee][Ll][Ee][Aa][Ss][Ee])$")
+  file(WRITE "${CMAKE_INSTALL_PREFIX}/release-only.txt" "${CMAKE_INSTALL_CONFIG_NAME}")
+endif()
+file(WRITE "${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_CONFIG_NAME}.txt" "${CMAKE_INSTALL_CONFIG_NAME}")
+"#,
+    );
+    for (dir, args, expected) in [
+        (
+            "/work/generated",
+            &["-C", "Release;Debug"][..],
+            &["Debug.txt", "Release.txt", "release-only.txt"][..],
+        ),
+        ("/work/default", &[][..], &["Debug.txt"][..]),
+    ] {
+        let mut argv = vec!["-B", dir];
+        argv.extend(args);
+        assert_eq!(invoke(host.clone(), &argv), 0, "{}", stderr(&host));
+        let tree = extract(
+            host.as_ref(),
+            &Path::new(dir).join("demo.tar"),
+            &Path::new(dir).join("unpacked"),
+        );
+        assert_eq!(file_names(&tree), expected);
+    }
+}
+
+const COMPONENT_CONFIG: &[u8] = br#"
+set(CPACK_GENERATOR TGZ)
+set(CPACK_PACKAGE_NAME demo)
+set(CPACK_PACKAGE_VERSION 1)
+set(CPACK_PACKAGE_FILE_NAME demo)
+set(CPACK_CMAKE_GENERATOR Ninja)
+set(CPACK_INSTALL_CMAKE_PROJECTS "/work/build;demo;ALL;/")
+set(CPACK_ARCHIVE_COMPONENT_INSTALL ON)
+set(CPACK_COMPONENTS_ALL "runtime;docs")
+set(CPACK_COMPONENTS_GROUPING IGNORE)
+set(CPACK_PACKAGING_INSTALL_PREFIX "/usr")
+set(CPACK_INCLUDE_TOPLEVEL_DIRECTORY OFF)
+set(CPACK_PRE_BUILD_SCRIPTS "/work/pre.cmake")
+"#;
+
+const COMPONENT_INSTALL: &[u8] = br#"
+if(NOT DEFINED CMAKE_INSTALL_COMPONENT OR CMAKE_INSTALL_COMPONENT STREQUAL "runtime")
+  file(WRITE "${CMAKE_INSTALL_PREFIX}/nested/before" "installed")
+  file(MAKE_DIRECTORY "${CMAKE_INSTALL_PREFIX}/empty")
+  file(CREATE_LINK "nested/before" "${CMAKE_INSTALL_PREFIX}/link" SYMBOLIC)
+endif()
+if(NOT DEFINED CMAKE_INSTALL_COMPONENT OR CMAKE_INSTALL_COMPONENT STREQUAL "docs")
+  file(WRITE "${CMAKE_INSTALL_PREFIX}/doc.txt" "docs")
+endif()
+"#;
+
+#[test]
+fn component_archives_use_install_membership_and_post_hook_bytes() {
+    let host = memory_host();
+    write(host.as_ref(), "/work/CPackConfig.cmake", COMPONENT_CONFIG);
+    write(
+        host.as_ref(),
+        "/work/build/cmake_install.cmake",
+        COMPONENT_INSTALL,
+    );
+    write(
+        host.as_ref(),
+        "/work/pre.cmake",
+        br#"
+set(root "${CPACK_TEMPORARY_DIRECTORY}/runtime/usr")
+file(WRITE "${root}/nested/before" "updated")
+file(WRITE "${root}/nested/after" "hook")
+file(WRITE "${CPACK_TEMPORARY_DIRECTORY}/runtime/marker" "hook")
+file(WRITE "${CPACK_TEMPORARY_DIRECTORY}/docs/usr/extra.txt" "hook")
+"#,
+    );
+    assert_eq!(invoke(host.clone(), &[]), 0, "{}", stderr(&host));
+
+    let unpacked = Path::new("/work/unpacked/runtime");
+    let runtime = extract(
+        host.as_ref(),
+        Path::new("/work/demo-runtime.tar.gz"),
+        unpacked,
+    );
+    assert_eq!(file_names(&runtime), ["usr/link", "usr/nested/before"]);
+    assert_eq!(
+        runtime["usr/link"].target.as_deref(),
+        Some(Path::new("nested/before"))
+    );
+    assert_eq!(
+        read(host.as_ref(), &unpacked.join("usr/nested/before")),
+        b"updated"
+    );
+    assert_eq!(
+        kind(host.as_ref(), &unpacked.join("usr/empty")),
+        Some(FileKind::Dir)
+    );
+    assert_eq!(
+        kind(host.as_ref(), &unpacked.join("usr/nested/after")),
+        None
+    );
+    assert_eq!(kind(host.as_ref(), &unpacked.join("marker")), None);
+
+    let docs = extract(
+        host.as_ref(),
+        Path::new("/work/demo-docs.tar.gz"),
+        Path::new("/work/unpacked/docs"),
+    );
+    assert_eq!(file_names(&docs), ["usr/doc.txt"]);
+
+    write(
+        host.as_ref(),
+        "/work/pre.cmake",
+        br#"file(REMOVE "${CPACK_TEMPORARY_DIRECTORY}/runtime/usr/nested/before")"#,
+    );
+    assert_eq!(invoke(host.clone(), &["-B", "/work/removed"]), 1);
+    assert!(
+        stderr(&host).contains("CPack cannot read the installed component file"),
+        "{}",
+        stderr(&host)
+    );
+}
+
+#[test]
+fn monolithic_archives_include_pre_build_hook_output() {
+    let host = memory_host();
+    write(host.as_ref(), "/work/CPackConfig.cmake", COMPONENT_CONFIG);
+    write(
+        host.as_ref(),
+        "/work/build/cmake_install.cmake",
+        COMPONENT_INSTALL,
+    );
+    write(
+        host.as_ref(),
+        "/work/pre.cmake",
+        br#"file(WRITE "${CPACK_TEMPORARY_DIRECTORY}/usr/added" "hook")"#,
+    );
+    assert_eq!(
+        invoke(host.clone(), &["-DCPACK_ARCHIVE_COMPONENT_INSTALL=OFF"]),
+        0,
+        "{}",
+        stderr(&host)
+    );
+    let tree = extract(
+        host.as_ref(),
+        Path::new("/work/demo.tar.gz"),
+        Path::new("/work/unpacked"),
+    );
+    assert_eq!(
+        file_names(&tree),
+        ["usr/added", "usr/doc.txt", "usr/link", "usr/nested/before"]
+    );
+}
+
+#[test]
+fn component_groups_merge_only_recorded_members() {
+    let host = memory_host();
+    write(
+        host.as_ref(),
+        "/work/CPackConfig.cmake",
+        br#"
+set(CPACK_GENERATOR TGZ)
+set(CPACK_PACKAGE_NAME demo)
+set(CPACK_PACKAGE_VERSION 1)
+set(CPACK_PACKAGE_FILE_NAME demo)
+set(CPACK_CMAKE_GENERATOR Ninja)
+set(CPACK_INSTALL_CMAKE_PROJECTS "/work/one;One;ALL;/;/work/two;Two;ALL;/sub")
+set(CPACK_ARCHIVE_COMPONENT_INSTALL ON)
+set(CPACK_COMPONENTS_ALL "runtime;docs")
+set(CPACK_COMPONENT_RUNTIME_GROUP Main)
+set(CPACK_COMPONENT_DOCS_GROUP Main)
+set(CPACK_COMPONENT_INCLUDE_TOPLEVEL_DIRECTORY ON)
+set(CPACK_PACKAGING_INSTALL_PREFIX "/usr")
+set(CPACK_PRE_BUILD_SCRIPTS "/work/pre.cmake")
+"#,
+    );
+    let install = |project: &str, shared: &str| {
+        format!(
+            r#"
+if(CMAKE_INSTALL_COMPONENT STREQUAL "runtime")
+  file(WRITE "${{CMAKE_INSTALL_PREFIX}}/shared.txt" "{shared}")
+  file(WRITE "${{CMAKE_INSTALL_PREFIX}}/{project}.txt" "{project}")
+else()
+  file(WRITE "${{CMAKE_INSTALL_PREFIX}}/{project}-doc.txt" "{project}")
+endif()
+"#
+        )
+    };
+    write(
+        host.as_ref(),
+        "/work/one/cmake_install.cmake",
+        install("one", "same").as_bytes(),
+    );
+    write(
+        host.as_ref(),
+        "/work/two/cmake_install.cmake",
+        install("two", "same").as_bytes(),
+    );
+    write(
+        host.as_ref(),
+        "/work/pre.cmake",
+        br#"
+file(WRITE "${CPACK_TEMPORARY_DIRECTORY}/runtime/demo/usr/hook-only" "one")
+file(WRITE "${CPACK_TEMPORARY_DIRECTORY}/sub/runtime/demo/usr/hook-only" "two")
+"#,
+    );
+    assert_eq!(invoke(host.clone(), &[]), 0, "{}", stderr(&host));
+    let unpacked = Path::new("/work/unpacked");
+    let tree = extract(host.as_ref(), Path::new("/work/demo-Main.tar.gz"), unpacked);
+    assert_eq!(
+        file_names(&tree),
+        [
+            "demo/usr/one-doc.txt",
+            "demo/usr/one.txt",
+            "demo/usr/shared.txt",
+            "demo/usr/two-doc.txt",
+            "demo/usr/two.txt",
+        ]
+    );
+    assert_eq!(
+        read(host.as_ref(), &unpacked.join("demo/usr/shared.txt")),
+        b"same"
+    );
+
+    write(
+        host.as_ref(),
+        "/work/two/cmake_install.cmake",
+        install("two", "different").as_bytes(),
+    );
+    assert_eq!(invoke(host.clone(), &["-B", "/work/conflict"]), 1);
+    assert!(
+        stderr(&host).contains("The data in files with the same filename is different"),
+        "{}",
+        stderr(&host)
+    );
+}

@@ -15,7 +15,7 @@
 
 #![forbid(unsafe_code)]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
@@ -107,6 +107,12 @@ pub enum ComponentGrouping {
     Ignore,
 }
 
+/// Paths that each archive component install added before the pre-build scripts ran.
+///
+/// Each key is a component root relative to the staging directory. Each value holds
+/// paths relative to that root, including directories and symbolic links.
+pub type ComponentMembers = BTreeMap<PathBuf, BTreeSet<PathBuf>>;
+
 /// Everything a [`PackageGenerator`] needs for one package run.
 pub struct PackageContext<'a> {
     /// Host for file, process, and clock operations.
@@ -138,6 +144,23 @@ pub trait PackageGenerator {
     ///
     /// Returns a [`CpackError`] when the package can not be created.
     fn package(&self, cx: &PackageContext<'_>) -> Result<Vec<PathBuf>, CpackError>;
+
+    /// Create the package files from the staging directory and the component members
+    /// that the install recorded. Returns the paths of the package files.
+    ///
+    /// The default implementation ignores `members` and calls [`PackageGenerator::package`].
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`CpackError`] when the package can not be created.
+    fn package_from_stage(
+        &self,
+        cx: &PackageContext<'_>,
+        members: &ComponentMembers,
+    ) -> Result<Vec<PathBuf>, CpackError> {
+        let _ = members;
+        self.package(cx)
+    }
 }
 
 /// Run `cpack` with `argv` (including `argv[0]`) and return the process exit code.
@@ -341,17 +364,20 @@ fn package(
             format!("CPack {level}: Staging files in {}\n", staging.display()).as_bytes(),
         );
     }
-    stage::install(host, cwd, cli, interp, &staging)?;
+    let members = stage::install(host, cwd, cli, interp, &staging)?;
     let vars = snapshot(interp);
     log(host.as_ref(), "Create package");
-    let mut packages = generator.package(&PackageContext {
-        host: host.as_ref(),
-        vars: &vars.vars,
-        staging_dir: &staging,
-        output_dir: &work,
-        file_name: name,
-        grouping: stage::grouping(&vars),
-    })?;
+    let mut packages = generator.package_from_stage(
+        &PackageContext {
+            host: host.as_ref(),
+            vars: &vars.vars,
+            staging_dir: &staging,
+            output_dir: &work,
+            file_name: name,
+            grouping: stage::grouping(&vars),
+        },
+        &members,
+    )?;
     if generator.name() == "External" {
         generators::external::run_script(host.as_ref(), cwd, interp, &mut packages)?;
     }

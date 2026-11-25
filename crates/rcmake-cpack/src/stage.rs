@@ -10,10 +10,13 @@ use rcmake_eval::Interp;
 use rcmake_host::path::{from_native, to_native};
 use rcmake_host::{CommandSpec, FileKind, Follow, Host, Input, Output, ProcessResult, RunRequest};
 
+use crate::archive_gen::ArchiveKind;
 use crate::config::{
     CpackConfig, Environment, absolute, cmake_executable, interpreter, script, snapshot,
 };
-use crate::{CPackOptions, ComponentGrouping, CpackError, error, log, safe_name};
+use crate::{CPackOptions, ComponentGrouping, ComponentMembers, CpackError, error, log, safe_name};
+
+mod component_files;
 
 /// Install the configured files into the staging directory.
 ///
@@ -32,16 +35,20 @@ pub fn stage(
         interp.cx().set_var(name, value.clone());
     }
     host.create_dir_all(staging_dir)?;
-    install(host, &cwd, &options, &mut interp, staging_dir)
+    install(host, &cwd, &options, &mut interp, staging_dir).map(|_| ())
 }
 
+/// Stage the configured files and run the pre-build scripts.
+///
+/// Returns the paths that each archive component install added, recorded before the
+/// pre-build scripts ran.
 pub(crate) fn install(
     host: &Arc<dyn Host>,
     cwd: &Path,
     options: &CPackOptions,
     interp: &mut Interp,
     staging: &Path,
-) -> Result<(), CpackError> {
+) -> Result<ComponentMembers, CpackError> {
     let cfg = snapshot(interp);
     let stage_files = cfg.get(b"CPACK_GENERATOR") != Some(b"External")
         || cfg.on(b"CPACK_EXTERNAL_ENABLE_STAGING");
@@ -78,14 +85,15 @@ pub(crate) fn install(
     } else {
         cfg
     };
-    install_projects(host, cwd, options, &cfg, staging)?;
+    let members = install_projects(host, cwd, options, &cfg, staging)?;
     run_hooks(
         host.as_ref(),
         cwd,
         interp,
         b"CPACK_PRE_BUILD_SCRIPTS",
         "Executing pre-build script",
-    )
+    )?;
+    Ok(members)
 }
 
 pub(crate) fn run_hooks(
@@ -108,10 +116,11 @@ fn install_projects(
     options: &CPackOptions,
     cfg: &CpackConfig,
     staging: &Path,
-) -> Result<(), CpackError> {
+) -> Result<ComponentMembers, CpackError> {
+    let mut members = ComponentMembers::new();
     let project_key = b"CPACK_INSTALL_CMAKE_PROJECTS";
     if cfg.get(project_key).is_none_or(<[u8]>::is_empty) {
-        return Ok(());
+        return Ok(members);
     }
     let generator = cfg.get(b"CPACK_CMAKE_GENERATOR").ok_or_else(|| {
         error(
@@ -126,7 +135,7 @@ fn install_projects(
         ));
     }
     if tuples.is_empty() {
-        return Ok(());
+        return Ok(members);
     }
     let build_generator = build_generator(generator).ok_or_else(|| {
         error("Specified package generator not found. CPACK_CMAKE_GENERATOR value is invalid.")
@@ -140,6 +149,7 @@ fn install_projects(
     let external = cfg.get(b"CPACK_GENERATOR") == Some(b"External");
     let stage_project = !external || cfg.on(b"CPACK_EXTERNAL_ENABLE_STAGING");
     let prefix = project_install_prefix(cfg);
+    let record = records_members(cfg);
     for [build, project, component, subdir] in tuples {
         let build = absolute(cwd, build);
         for config in &configs {
@@ -161,11 +171,40 @@ fn install_projects(
                 }
                 let location = InstallLocation::new(cfg, destination, prefix)?;
                 ensure_dir(host.as_ref(), staging, &location.directory)?;
+                // DESTDIR installs can write outside the install prefix.
+                let scanned = if location.destdir.is_some() {
+                    destination.clone()
+                } else {
+                    location.directory.clone()
+                };
+                let before = (record && separate)
+                    .then(|| component_files::snapshot(host.as_ref(), &scanned))
+                    .transpose()?;
                 install_project(host, options, cfg, &build, config, component, location)?;
+                if let Some(before) = before {
+                    let after = component_files::snapshot(host.as_ref(), &scanned)?;
+                    let root = relative_install_path(subdir)?.join(component_dir(component));
+                    let offset = scanned
+                        .strip_prefix(staging.join(&root))
+                        .map_err(|err| error(err.to_string()))?;
+                    members
+                        .entry(root)
+                        .or_default()
+                        .extend(after.difference(&before).map(|path| offset.join(path)));
+                }
             }
         }
     }
-    Ok(())
+    Ok(members)
+}
+
+// Archive generators package only the paths that each component install added.
+fn records_members(cfg: &CpackConfig) -> bool {
+    cfg.get(b"CPACK_GENERATOR").is_some_and(|name| {
+        ArchiveKind::ALL
+            .iter()
+            .any(|kind| kind.name().as_bytes() == name)
+    })
 }
 
 fn install_destinations(
@@ -211,7 +250,7 @@ fn install_prefix<'a>(cfg: &'a CpackConfig, destdir_key: &[u8]) -> &'a [u8] {
     cfg.get(key).unwrap_or_default()
 }
 
-fn uses_destdir(cfg: &CpackConfig) -> bool {
+pub(crate) fn uses_destdir(cfg: &CpackConfig) -> bool {
     cfg.on(b"CPACK_SET_DESTDIR") || cfg.get(b"CPACK_SET_DESTDIR") == Some(b"I_ON")
 }
 
@@ -258,15 +297,10 @@ fn install_project(
     let mut interp = interpreter(host, build, options, None)?;
     let _env = location.environment(host.as_ref());
     let mut cx = interp.cx();
-    for entry in cfg.list(b"CPACK_CUSTOM_INSTALL_VARIABLES") {
-        let (name, value) = entry.split_once_str(b"=").unwrap_or((&entry, b""));
-        if !name.is_empty() {
-            cx.set_var(name, value.into());
-        }
-    }
     cx.set_var(b"CMAKE_INSTALL_PREFIX", location.prefix);
+    // The install script derives CMAKE_INSTALL_CONFIG_NAME from BUILD_TYPE.
     if !config.is_empty() {
-        cx.set_var(b"CMAKE_INSTALL_CONFIG_NAME", config.into());
+        cx.set_var(b"BUILD_TYPE", config.into());
     }
     if !component.is_empty() && component != b"ALL" {
         cx.set_var(b"CMAKE_INSTALL_COMPONENT", component.into());
@@ -282,6 +316,12 @@ fn install_project(
         .is_some_and(|value| !truth::is_off(value))
     {
         cx.set_var(b"CMAKE_INSTALL_DO_STRIP", "1".into());
+    }
+    for entry in cfg.list(b"CPACK_CUSTOM_INSTALL_VARIABLES") {
+        let (name, value) = entry.split_once_str(b"=").unwrap_or((&entry, b""));
+        if !name.is_empty() {
+            cx.set_var(name, value.into());
+        }
     }
     let file = build.join("cmake_install.cmake");
     if interp.run_script(&file).exit_code != 0 {

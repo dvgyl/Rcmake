@@ -562,7 +562,6 @@ fn merge_fields(child: &mut Fields, parent: &Fields, prefix: &str) -> Result<(),
                     | b"filter"
                     | b"execution"
             ) | ("filter", b"include" | b"exclude")
-                | ("exclude", b"fixtures")
         );
         let is_map = matches!(prefix, "environment" | "cacheVariables" | "variables");
         let empty = match own.value.as_ref() {

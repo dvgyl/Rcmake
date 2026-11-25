@@ -612,7 +612,7 @@ fn string_map(
 ) -> Result<BTreeMap<BString, BString>, PresetsError> {
     schema::fields(field)?
         .into_iter()
-        .map(|(key, field)| Ok((key, BString::decode(&field, expand)?)))
+        .map(|(key, field)| Ok((key, expanded(&field, expand)?)))
         .collect()
 }
 
@@ -626,17 +626,17 @@ settings! {
         /// Variables to pass to CPack.
         variables: BTreeMap<BString, BString> = "variables" => string_map,
         /// CPack configuration file.
-        config_file: BString = "configFile",
+        config_file: BString = "configFile" => expanded,
         /// Package output settings.
         output: PackageOutput = "output",
         /// Package name.
-        package_name: BString = "packageName",
+        package_name: BString = "packageName" => expanded,
         /// Package version.
-        package_version: BString = "packageVersion",
+        package_version: BString = "packageVersion" => expanded,
         /// Output directory for packages.
-        package_directory: BString = "packageDirectory",
+        package_directory: BString = "packageDirectory" => expanded,
         /// Package vendor name.
-        vendor_name: BString = "vendorName",
+        vendor_name: BString = "vendorName" => expanded,
     }
 }
 

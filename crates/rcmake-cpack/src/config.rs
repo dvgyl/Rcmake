@@ -6,7 +6,7 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
 use rcmake_base::list::{self, Empty};
-use rcmake_base::{BString, ByteSlice, Limits, truth};
+use rcmake_base::{BString, Limits, truth};
 use rcmake_eval::{
     BuiltinFn, Flow, IncludeOptions, Interp, InterpConfig, Registry, RunMode, TraceConfig,
 };
@@ -112,19 +112,6 @@ pub(crate) fn resolve_options(
                 }
             }
         } else if let Some(name) = &cli.preset {
-            let source_dir = from_native_cmake(&cwd);
-            // The preset resolver returns the package fields as literal strings.
-            let mut remaining = Limits::default().max_value_bytes;
-            let mut expand = |value: BString| -> Result<BString, CpackError> {
-                let token = b"${sourceDir}";
-                let count = value.find_iter(token).count();
-                let length = (value.len() - count * token.len())
-                    .saturating_add(count.saturating_mul(source_dir.len()));
-                remaining = remaining.checked_sub(length).ok_or_else(|| {
-                    error("CPack package preset expansion exceeds the size limit")
-                })?;
-                Ok(BString::from(value.replace(token, source_dir.as_slice())))
-            };
             let preset = presets
                 .resolve(PresetKind::Package, name, &env)
                 .map_err(|err| error(err.to_string()))?;
@@ -133,33 +120,19 @@ pub(crate) fn resolve_options(
             }
             environment = preset.environment;
             if let PresetSettings::Package(settings) = preset.settings {
-                cli.config_file = cli
-                    .config_file
-                    .or(settings.config_file.map(&mut expand).transpose()?);
+                cli.config_file = cli.config_file.or(settings.config_file);
                 cli.generators = cli
                     .generators
                     .or_else(|| settings.generators.as_ref().map(list::join));
                 cli.build_config = cli
                     .build_config
                     .or_else(|| settings.configurations.as_ref().map(list::join));
-                cli.package_name = cli
-                    .package_name
-                    .or(settings.package_name.map(&mut expand).transpose()?);
-                cli.package_version = cli
-                    .package_version
-                    .or(settings.package_version.map(&mut expand).transpose()?);
-                cli.package_directory = cli
-                    .package_directory
-                    .or(settings.package_directory.map(&mut expand).transpose()?);
-                cli.vendor = cli
-                    .vendor
-                    .or(settings.vendor_name.map(&mut expand).transpose()?);
-                let mut defines: Vec<_> = settings
-                    .variables
-                    .unwrap_or_default()
-                    .into_iter()
-                    .map(|(name, value)| Ok((name, expand(value)?)))
-                    .collect::<Result<_, CpackError>>()?;
+                cli.package_name = cli.package_name.or(settings.package_name);
+                cli.package_version = cli.package_version.or(settings.package_version);
+                cli.package_directory = cli.package_directory.or(settings.package_directory);
+                cli.vendor = cli.vendor.or(settings.vendor_name);
+                let mut defines: Vec<_> =
+                    settings.variables.unwrap_or_default().into_iter().collect();
                 defines.append(&mut cli.defines);
                 cli.defines = defines;
                 if let Some(output) = settings.output {

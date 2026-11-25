@@ -11,13 +11,16 @@ use rcmake_archive::{
 use rcmake_base::BString;
 use rcmake_base::parse_source_date_epoch;
 use rcmake_host::path::to_native;
-use rcmake_host::{Follow, Host};
+use rcmake_host::{FileKind, Follow, Host};
 
 use crate::config::CpackConfig;
 
 mod stgz;
 
-use crate::{ComponentGrouping, CpackError, PackageContext, PackageGenerator, error, safe_name};
+use crate::{
+    ComponentGrouping, ComponentMembers, CpackError, PackageContext, PackageGenerator, error,
+    safe_name,
+};
 
 /// Archive format of an [`ArchiveGenerator`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -180,6 +183,24 @@ impl PackageGenerator for ArchiveGenerator {
     }
 
     fn package(&self, cx: &PackageContext<'_>) -> Result<Vec<PathBuf>, CpackError> {
+        self.package_with(cx, None)
+    }
+
+    fn package_from_stage(
+        &self,
+        cx: &PackageContext<'_>,
+        members: &ComponentMembers,
+    ) -> Result<Vec<PathBuf>, CpackError> {
+        self.package_with(cx, Some(members))
+    }
+}
+
+impl ArchiveGenerator {
+    fn package_with(
+        &self,
+        cx: &PackageContext<'_>,
+        members: Option<&ComponentMembers>,
+    ) -> Result<Vec<PathBuf>, CpackError> {
         let cfg = CpackConfig {
             vars: cx.vars.clone(),
         };
@@ -271,10 +292,31 @@ impl PackageGenerator for ArchiveGenerator {
             .collect::<Result<Vec<_>, _>>()?;
         let prefix = component_prefix(cx, &cfg)?;
         for (archive, path) in archives.iter().zip(&paths) {
-            write_component_archive(cx, path, &prefix, &archive.roots, &options, header)?;
+            let roots = archive
+                .roots
+                .iter()
+                .map(|root| members.and_then(|members| members.get(root)))
+                .collect::<Option<Vec<_>>>();
+            let output = ArchiveOutput {
+                path,
+                options: &options,
+                header,
+            };
+            match roots {
+                Some(recorded) => {
+                    write_recorded_archive(cx, &output, &archive.roots, &recorded)?;
+                }
+                None => write_component_archive(cx, &output, &prefix, &archive.roots)?,
+            }
         }
         Ok(paths)
     }
+}
+
+struct ArchiveOutput<'a> {
+    path: &'a Path,
+    options: &'a CreateOptions,
+    header: Option<&'a [u8]>,
 }
 
 struct ComponentArchive {
@@ -390,31 +432,39 @@ fn component_prefix(cx: &PackageContext<'_>, cfg: &CpackConfig) -> Result<PathBu
     Ok(prefix)
 }
 
+fn component_root(cx: &PackageContext<'_>, root: &Path) -> Result<(), CpackError> {
+    let metadata = cx.host.metadata(root, Follow::No).map_err(|err| {
+        error(format!(
+            "Failed to change working directory to {}: {err}",
+            root.display()
+        ))
+    })?;
+    if metadata.kind != FileKind::Dir {
+        return Err(error(format!(
+            "Failed to change working directory to {}",
+            root.display()
+        )));
+    }
+    Ok(())
+}
+
 fn write_component_archive(
     cx: &PackageContext<'_>,
-    path: &Path,
+    output: &ArchiveOutput<'_>,
     prefix: &Path,
     roots: &[PathBuf],
-    options: &CreateOptions,
-    header: Option<&[u8]>,
 ) -> Result<(), CpackError> {
+    let ArchiveOutput {
+        path,
+        options,
+        header,
+    } = *output;
     let mut roots = roots.iter().map(|root| cx.staging_dir.join(root));
     let first = roots
         .next()
         .ok_or_else(|| error("CPack component group is empty"))?;
     let component_inputs = |root: &Path| {
-        let metadata = cx.host.metadata(root, Follow::No).map_err(|err| {
-            error(format!(
-                "Failed to change working directory to {}: {err}",
-                root.display()
-            ))
-        })?;
-        if metadata.kind != rcmake_host::FileKind::Dir {
-            return Err(error(format!(
-                "Failed to change working directory to {}",
-                root.display()
-            )));
-        }
+        component_root(cx, root)?;
         children(cx.host, &root.join(prefix))
             .map(|files| files.into_iter().map(|file| prefix.join(file)))
     };
@@ -436,6 +486,108 @@ fn write_component_archive(
     result?;
     cleanup?;
     Ok(())
+}
+
+// Archive only the paths that the component installs recorded, with their current data.
+fn write_recorded_archive(
+    cx: &PackageContext<'_>,
+    output: &ArchiveOutput<'_>,
+    roots: &[PathBuf],
+    recorded: &[&BTreeSet<PathBuf>],
+) -> Result<(), CpackError> {
+    let roots = roots
+        .iter()
+        .map(|root| cx.staging_dir.join(root))
+        .collect::<Vec<_>>();
+    let mut members = BTreeSet::new();
+    let mut complete = true;
+    for (root, recorded) in roots.iter().zip(recorded) {
+        component_root(cx, root)?;
+        complete &= check_recorded(cx.host, root, recorded)?;
+        members.extend(recorded.iter().cloned());
+    }
+    let inputs = top_members(&members, recorded);
+    if complete && let [root] = roots.as_slice() {
+        return write_archive(
+            cx,
+            output.path,
+            root,
+            &inputs,
+            output.options,
+            output.header,
+        );
+    }
+    let merged = component_workspace(cx)?;
+    let result: Result<(), CpackError> = (|| {
+        for (root, recorded) in roots.iter().zip(recorded) {
+            crate::source::merge_recorded(cx.host, root, recorded, &merged)?;
+        }
+        write_archive(
+            cx,
+            output.path,
+            &merged,
+            &inputs,
+            output.options,
+            output.header,
+        )
+    })();
+    let cleanup = cx.host.remove_dir_all(&merged);
+    result?;
+    cleanup?;
+    Ok(())
+}
+
+// Check that each recorded path exists below real directories. Returns whether every
+// child of each recorded directory is also recorded.
+fn check_recorded(
+    host: &dyn Host,
+    root: &Path,
+    recorded: &BTreeSet<PathBuf>,
+) -> Result<bool, CpackError> {
+    let mut complete = true;
+    for member in recorded {
+        let mut path = root.to_owned();
+        let mut parts = member.components().peekable();
+        while let Some(part) = parts.next() {
+            path.push(part);
+            let missing = |err: rcmake_host::HostError| {
+                error(format!(
+                    "CPack cannot read the installed component file {}: {err}",
+                    path.display()
+                ))
+            };
+            let kind = host.metadata(&path, Follow::No).map_err(missing)?.kind;
+            if parts.peek().is_some() && kind != FileKind::Dir {
+                return Err(error(format!(
+                    "CPack expected a directory at {}",
+                    path.display()
+                )));
+            }
+            if parts.peek().is_none() && kind == FileKind::Dir {
+                complete &= children(host, &path)?
+                    .iter()
+                    .all(|child| recorded.contains(&member.join(child)));
+            }
+        }
+    }
+    Ok(complete)
+}
+
+// List the recorded paths without a recorded ancestor, one root after another. The
+// archive adds each recorded directory with its recorded children.
+fn top_members(members: &BTreeSet<PathBuf>, recorded: &[&BTreeSet<PathBuf>]) -> Vec<PathBuf> {
+    let mut seen = BTreeSet::new();
+    recorded
+        .iter()
+        .flat_map(|paths| paths.iter())
+        .filter(|path| {
+            path.ancestors()
+                .skip(1)
+                .all(|ancestor| !members.contains(ancestor))
+                && seen.insert(*path)
+        })
+        .cloned()
+        .collect()
 }
 
 fn level_number<T: std::str::FromStr>(value: &[u8], variable: &str) -> Result<T, CpackError> {

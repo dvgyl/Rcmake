@@ -81,7 +81,7 @@ impl Presets {
         let mut result = self.resolve_definition(kind, name, env)?;
         if let Some(associated) = &result.configure_preset {
             result.binary_dir = self
-                .resolve(PresetKind::Configure, associated.as_slice(), env)?
+                .resolve_ignoring_condition(PresetKind::Configure, associated.as_slice(), env)?
                 .binary_dir;
         }
         if let PresetSettings::Workflow(workflow) = &result.settings {
@@ -101,6 +101,38 @@ impl Presets {
         name: &[u8],
         env: &EnvSnapshot,
     ) -> Result<ResolvedPreset, PresetsError> {
+        let (result, enabled) = self.resolve_record(kind, name, env)?;
+        if !enabled {
+            return Err(PresetsError::new(format!(
+                "Cannot use disabled {} preset in {}: \"{}\"",
+                kind.label(),
+                path::from_native_cmake(&self.source_dir),
+                result.name
+            )));
+        }
+        Ok(result)
+    }
+
+    /// Resolve the fields of one preset without rejecting a false condition.
+    ///
+    /// A build, test, or package preset uses this rule for its configure preset.
+    /// A missing or hidden preset, an invalid macro, and an unsupported vendor
+    /// macro in the preset or its condition still cause an error.
+    pub fn resolve_ignoring_condition(
+        &self,
+        kind: PresetKind,
+        name: &[u8],
+        env: &EnvSnapshot,
+    ) -> Result<ResolvedPreset, PresetsError> {
+        Ok(self.resolve_record(kind, name, env)?.0)
+    }
+
+    fn resolve_record(
+        &self,
+        kind: PresetKind,
+        name: &[u8],
+        env: &EnvSnapshot,
+    ) -> Result<(ResolvedPreset, bool), PresetsError> {
         let record = self.get(kind, name).ok_or_else(|| {
             PresetsError::new(format!(
                 "No such {} preset in {}: \"{}\"",
@@ -117,7 +149,7 @@ impl Presets {
                 record.summary.name
             )));
         }
-        let (result, enabled) = self.expand_record(record, env).map_err(|error| {
+        self.expand_record(record, env).map_err(|error| {
             if expand::is_vendor_error(&error) {
                 PresetsError::new(format!(
                     "Could not evaluate {} preset \"{}\": Invalid macro expansion",
@@ -127,16 +159,7 @@ impl Presets {
             } else {
                 error
             }
-        })?;
-        if !enabled {
-            return Err(PresetsError::new(format!(
-                "Cannot use disabled {} preset in {}: \"{}\"",
-                kind.label(),
-                path::from_native_cmake(&self.source_dir),
-                record.summary.name
-            )));
-        }
-        Ok(result)
+        })
     }
 
     pub(crate) fn validate_expansions(&self, env: &EnvSnapshot) -> Result<(), PresetsError> {
@@ -321,9 +344,6 @@ impl Presets {
         let environment = macros
             .environment()
             .map_err(|error| expansion_error(record, error, Some("Invalid macro expansion")))?;
-        let mut settings = record
-            .read(&mut |field| macros.expand(field))
-            .map_err(|error| expansion_error(record, error, None))?;
         let enabled = record
             .condition
             .as_ref()
@@ -335,6 +355,9 @@ impl Presets {
             })
             .transpose()?
             .unwrap_or(true);
+        let mut settings = record
+            .read(&mut |field| macros.expand(field))
+            .map_err(|error| expansion_error(record, error, None))?;
         let binary_dir = if let PresetSettings::Configure(configure) = &mut settings {
             self.source_relative(&mut configure.binary_dir);
             self.source_relative(&mut configure.install_dir);

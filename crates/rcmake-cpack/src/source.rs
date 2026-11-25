@@ -1,7 +1,8 @@
 //! Stage source files and apply CMake regular expressions to source paths.
 
+use std::collections::BTreeSet;
 use std::io::ErrorKind;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use rcmake_eval::Interp;
@@ -9,7 +10,7 @@ use rcmake_host::path::{from_native_cmake, to_native};
 use rcmake_host::{CopyOptions, FileKind, Follow, Host, ReadRange};
 
 use crate::config::{CpackConfig, absolute, interpreter};
-use crate::stage::{clear_output_file, ensure_dir, relative_install_path};
+use crate::stage::{clear_output_file, ensure_dir, relative_install_path, uses_destdir};
 use crate::{CpackError, error};
 
 /// Copy the configured source directories and apply `CPACK_SOURCE_IGNORE_FILES`.
@@ -86,10 +87,22 @@ pub(crate) fn copy_directories(
                 .is_some_and(|name| name == "_CPack_Packages")
         })
         .unwrap_or(&staging);
+    // Without DESTDIR staging, directory pairs install below the packaging prefix.
+    let mut base = staging.clone();
+    if !uses_destdir(config) {
+        base.extend(
+            relative_install_path(
+                config
+                    .get(b"CPACK_PACKAGING_INSTALL_PREFIX")
+                    .unwrap_or_default(),
+            )?
+            .iter(),
+        );
+    }
     let mut remaining = 100_000;
     for [src, dest] in pairs {
         let src = host.canonicalize(&absolute(cwd, src))?;
-        let dest = staging.join(relative_install_path(dest)?);
+        let dest = base.join(relative_install_path(dest)?);
         ensure_dir(host, &staging, &dest)?;
         copy_tree(
             host,
@@ -119,6 +132,60 @@ pub(crate) fn merge_component(
         Some(source),
         &mut |_, _| Ok(false),
     )
+}
+
+/// Copy the recorded `members` of the component at `source` into `dest`.
+///
+/// Missing ancestors of a member become plain directories. Identical files and
+/// symbolic links that already exist in `dest` are accepted. Other existing entries
+/// with the same name cause an error.
+pub(crate) fn merge_recorded(
+    host: &dyn Host,
+    source: &Path,
+    members: &BTreeSet<PathBuf>,
+    dest: &Path,
+) -> Result<(), CpackError> {
+    let mut directories = Vec::new();
+    for member in members {
+        let input = source.join(member);
+        let output = dest.join(member);
+        let kind = host.metadata(&input, Follow::No)?.kind;
+        if let Some(parent) = output.parent() {
+            ensure_dir(host, dest, parent)?;
+        }
+        if existing_component_entry(host, source, &input, &output, kind)? {
+            continue;
+        }
+        match kind {
+            FileKind::File => {
+                clear_output_file(host, &output)?;
+                host.copy_file(
+                    &input,
+                    &output,
+                    CopyOptions {
+                        preserve_permissions: true,
+                        preserve_mtime: true,
+                    },
+                )?;
+            }
+            FileKind::Symlink => {
+                clear_output_file(host, &output)?;
+                host.symlink(&host.read_link(&input)?, &output)?;
+            }
+            FileKind::Dir => {
+                ensure_dir(host, dest, &output)?;
+                directories.push((input, output));
+            }
+            FileKind::Other => {}
+        }
+    }
+    // Children change the times of a directory, so apply directory metadata last.
+    for (input, output) in directories.iter().rev() {
+        let metadata = host.metadata(input, Follow::No)?;
+        host.set_permissions(output, metadata.mode & 0o7777)?;
+        host.set_times(output, Some(metadata.atime), Some(metadata.mtime))?;
+    }
+    Ok(())
 }
 
 fn copy_tree(

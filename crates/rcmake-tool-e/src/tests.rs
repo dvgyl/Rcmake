@@ -112,6 +112,36 @@ fn cat_copies_binary_data_and_continues_after_failures() -> HostResult<()> {
         [vec![0xff; 70_000], b"stdin\x00\r\n".to_vec()].concat()
     );
     assert_eq!(f.err(), b"CMake Error: missing: no such file or directory (ignoring)\nCMake Error: -x: option not handled\n");
+
+    let f = Fixture::new();
+    f.seed("-generated", b"tail\n")?;
+    f.host.seed_stdin(b"head\n")?;
+    assert_eq!(f.run(&["cat", "-", "-generated"]), 0);
+    assert_eq!(f.out(), b"head\ntail\n");
+    assert_eq!(f.err(), b"");
+
+    let f = Fixture::new();
+    f.seed("-generated", b"tail\n")?;
+    f.seed("--", b"dashes\n")?;
+    f.host.seed_stdin(b"head\n")?;
+    assert_eq!(
+        f.run(&[
+            "cat",
+            "-generated",
+            "--",
+            "-generated",
+            "-",
+            "missing",
+            "--",
+            "-y"
+        ]),
+        1
+    );
+    assert_eq!(f.out(), b"tail\nhead\ndashes\n");
+    assert_eq!(
+        f.err(),
+        b"CMake Error: -generated: option not handled\nCMake Error: missing: no such file or directory (ignoring)\nCMake Error: -y: no such file or directory (ignoring)\n"
+    );
     Ok(())
 }
 
