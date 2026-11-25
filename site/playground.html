@@ -84,7 +84,6 @@
       <div class="seg" role="radiogroup" aria-label="Generator" id="generator-group" data-test="generator-group">
         <button type="button" role="radio" aria-checked="true" data-gen="Ninja"><svg class="i" aria-hidden="true"><use href="#i-graph"/></svg>Ninja</button>
         <button type="button" role="radio" aria-checked="false" data-gen="Ninja Multi-Config"><svg class="i" aria-hidden="true"><use href="#i-multi"/></svg>Ninja Multi-Config</button>
-        <button type="button" role="radio" aria-checked="false" data-gen="Unix Makefiles"><svg class="i" aria-hidden="true"><use href="#i-layers"/></svg>Unix Makefiles</button>
       </div>
       <label>Build type
         <select id="config-select" data-test="config-select">
@@ -103,7 +102,7 @@
         <svg class="i" aria-hidden="true"><use href="#i-replay"/></svg>
         <span>Reset</span>
       </button>
-      <span id="mode-badge" class="mode-badge" data-test="mode-badge" aria-live="polite">preview</span>
+      <span id="mode-badge" class="mode-badge" data-test="mode-badge" aria-live="polite"><span class="mode-dot" aria-hidden="true"></span><span id="mode-badge-text">loading</span></span>
     </div>
 
     <div class="panes" id="panes">
@@ -128,9 +127,9 @@
 
       <section class="pane pane-output" id="pane-output" aria-label="Output">
         <div class="pane-tabs" role="tablist" aria-label="Output" id="output-tabs" data-test="output-tabs">
-          <button type="button" role="tab" data-inspector-tab="diagnostics" aria-selected="true">Diagnostics <span id="tab-count-diag" class="tab-count"></span></button>
+          <button type="button" role="tab" data-inspector-tab="ninja" aria-selected="true"><span id="tab-file-name">build.ninja</span> <span id="tab-count-files" class="tab-count"></span></button>
           <button type="button" role="tab" data-inspector-tab="targets" aria-selected="false">Targets <span id="tab-count-targets" class="tab-count"></span></button>
-          <button type="button" role="tab" data-inspector-tab="ninja" aria-selected="false" id="tab-file-name">build.ninja</button>
+          <button type="button" role="tab" data-inspector-tab="diagnostics" aria-selected="false">Diagnostics <span id="tab-count-diag" class="tab-count"></span></button>
           <button type="button" role="tab" data-inspector-tab="explain" aria-selected="false">Explain</button>
           <button id="copy-file-btn" class="ctrl-btn end-btn" type="button" hidden data-test="copy-file-btn">
             <svg class="i" aria-hidden="true"><use href="#i-copy"/></svg>

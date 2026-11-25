@@ -9,61 +9,176 @@ const SPLIT_KEY = "rcmake-split";
 const LINE_H = 21;
 const adapter = new RcmakeWasmAdapter();
 
+const BOILERPLATE_PREFIXES = [
+  "CMAKE_CURRENT_LIST_",
+  "CMAKE_CXX_FLAGS_",
+  "CMAKE_C_FLAGS_",
+  "CMAKE_INSTALL_FULL_",
+  "_GNUInstallDirs_"
+];
+const BOILERPLATE_EXACT = new Set([
+  "CMAKE_MAKE_PROGRAM",
+  "CMAKE_MINIMUM_REQUIRED_VERSION",
+  "CMAKE_INSTALL_BINDIR",
+  "CMAKE_INSTALL_DATADIR",
+  "CMAKE_INSTALL_DATAROOTDIR",
+  "CMAKE_INSTALL_DOCDIR",
+  "CMAKE_INSTALL_INFODIR",
+  "CMAKE_INSTALL_LIBEXECDIR",
+  "CMAKE_INSTALL_LOCALEDIR",
+  "CMAKE_INSTALL_LOCALSTATEDIR",
+  "CMAKE_INSTALL_MANDIR",
+  "CMAKE_INSTALL_OLDINCLUDEDIR",
+  "CMAKE_INSTALL_RUNSTATEDIR",
+  "CMAKE_INSTALL_SBINDIR",
+  "CMAKE_INSTALL_SHAREDSTATEDIR",
+  "CMAKE_INSTALL_SYSCONFDIR"
+]);
+
 const state = {
-  exampleId: "hello-cpp20", activeFile: "CMakeLists.txt", files: {},
-  generator: "Ninja", buildType: "Debug", activeTab: "diagnostics",
-  lastResult: null, explainSymbol: "", explainReport: null, showRawJson: false
+  exampleId: "hello-cpp20",
+  activeFile: "CMakeLists.txt",
+  files: {},
+  generator: "Ninja",
+  buildType: "Debug",
+  activeTab: "ninja",
+  lastManualTab: "ninja",
+  autoSwitchedToDiag: false,
+  activeGenFile: "build.ninja",
+  lastResult: null,
+  explainSymbol: "",
+  explainReport: null,
+  showRawJson: false,
+  showAllSymbols: false
 };
 
 const $ = (id) => document.getElementById(id);
 const els = {
-  modeBadge: $("mode-badge"), exampleSelect: $("example-select"), genGroup: $("generator-group"),
-  configSelect: $("config-select"), runBtn: $("run-btn"), runIcon: $("run-icon"), runKbd: $("run-kbd"),
-  resetBtn: $("reset-btn"), panes: $("panes"), paneEditor: $("pane-editor"), paneOutput: $("pane-output"),
-  splitHandle: $("split-handle"), fileTabs: $("file-tabs"), gutter: $("editor-gutter"), flash: $("editor-flash"),
-  textarea: $("editor-textarea"), cursor: $("editor-cursor"), dirty: $("dirty-indicator"),
-  outputTabs: $("output-tabs"), runLine: $("run-line"), body: $("inspector-body"), copyBtn: $("copy-file-btn"),
-  fileTabName: $("tab-file-name"), diagCount: $("tab-count-diag"), targetCount: $("tab-count-targets"),
-  runStatus: $("run-status"), runSummary: $("run-summary")
+  modeBadge: $("mode-badge"),
+  modeBadgeText: $("mode-badge-text"),
+  exampleSelect: $("example-select"),
+  genGroup: $("generator-group"),
+  configSelect: $("config-select"),
+  runBtn: $("run-btn"),
+  runIcon: $("run-icon"),
+  runKbd: $("run-kbd"),
+  resetBtn: $("reset-btn"),
+  panes: $("panes"),
+  paneEditor: $("pane-editor"),
+  paneOutput: $("pane-output"),
+  splitHandle: $("split-handle"),
+  fileTabs: $("file-tabs"),
+  gutter: $("editor-gutter"),
+  flash: $("editor-flash"),
+  textarea: $("editor-textarea"),
+  cursor: $("editor-cursor"),
+  dirty: $("dirty-indicator"),
+  outputTabs: $("output-tabs"),
+  runLine: $("run-line"),
+  body: $("inspector-body"),
+  copyBtn: $("copy-file-btn"),
+  fileTabName: $("tab-file-name"),
+  fileCount: $("tab-count-files"),
+  diagCount: $("tab-count-diag"),
+  targetCount: $("tab-count-targets"),
+  runStatus: $("run-status"),
+  runSummary: $("run-summary")
 };
 
 let flashTimer = null;
 
-function parseLoc(loc) {
-  if (!loc) return null;
-  if (typeof loc === "object") {
-    const path = loc.path || loc.file || "";
-    const line = Number(loc.line || 0);
-    return path && Number.isFinite(line) && line >= 1 ? { path, line, label: `${path}:${line}${loc.command ? ` ${loc.command}` : ""}` } : null;
-  }
-  const m = String(loc).match(/^([^:\s]+):(\d+)/);
-  return m ? { path: m[1], line: Number(m[2]), label: String(loc) } : null;
+function formatMs(ms) {
+  if (typeof ms !== "number" || !Number.isFinite(ms)) return "";
+  return ms < 10 ? `${ms.toFixed(1)} ms` : `${Math.round(ms)} ms`;
 }
 
-const locBtn = (loc) => {
-  const p = parseLoc(loc);
-  return p ? `<button type="button" class="loc-btn" data-jump-file="${escapeHtml(p.path)}" data-jump-line="${p.line}">${escapeHtml(p.label)}</button>` : "";
-};
+function updateModeBadge(mode, durationMs = null) {
+  const wasm = mode === "wasm";
+  els.modeBadge.classList.toggle("is-wasm", wasm);
+  els.modeBadge.classList.toggle("is-preview", mode === "preview");
+  const timing = wasm && typeof durationMs === "number" && Number.isFinite(durationMs)
+    ? ` \u00b7 ${formatMs(durationMs)}`
+    : "";
+  const label = mode === "loading" ? "loading" : wasm ? `wasm${timing}` : "preview";
+  if (els.modeBadgeText) els.modeBadgeText.textContent = label;
+  else els.modeBadge.textContent = label;
+}
 
-function jumpTo(file, line) {
-  const target = Math.max(1, Number(line) || 1);
-  if (file && file in state.files && file !== state.activeFile) {
+function normalizePath(raw) {
+  const str = String(raw || "");
+  if (str.startsWith("/src/")) return str.slice(5);
+  if (str.startsWith("/cmake/")) return str.slice(7);
+  return str;
+}
+
+function stripSrc(raw) {
+  const str = String(raw ?? "");
+  return str.startsWith("/src/") ? str.slice(5) : str;
+}
+
+function parseLoc(loc) {
+  if (!loc) return null;
+  if (Array.isArray(loc)) {
+    const withPath = loc.filter((f) => f && typeof f === "object" && (f.path || f.file));
+    if (!withPath.length) return null;
+    const preferred = withPath.find((f) => Number(f.line || 0) >= 1 && normalizePath(f.path || f.file) in state.files)
+      || withPath.find((f) => Number(f.line || 0) >= 1)
+      || withPath[0];
+    return parseLoc(preferred);
+  }
+  if (typeof loc === "object") {
+    const rawPath = String(loc.path || loc.file || "");
+    if (!rawPath) return null;
+    const path = normalizePath(rawPath);
+    const line = Number(loc.line || 0);
+    const col = Number(loc.column || loc.col || 0);
+    const command = loc.command ? String(loc.command) : "";
+    const editable = path in state.files;
+    const coords = line >= 1 ? (col >= 1 && !command ? `${path}:${line}:${col}` : `${path}:${line}`) : path;
+    const label = command ? `${coords} (${command})` : coords;
+    return { path, rawPath, line: Number.isFinite(line) ? line : 0, col: Number.isFinite(col) ? col : 0, command, editable, label };
+  }
+  const m = String(loc).match(/^([^:\s]+):(\d+)(?::(\d+))?(?:\s+(.*))?$/);
+  if (!m) return null;
+  const path = normalizePath(m[1]);
+  const line = Number(m[2]);
+  const col = m[3] ? Number(m[3]) : 0;
+  const extra = m[4] ? ` ${m[4]}` : "";
+  const coords = col >= 1 ? `${path}:${line}:${col}` : `${path}:${line}`;
+  return { path, rawPath: m[1], line, col, command: "", editable: path in state.files, label: `${coords}${extra}` };
+}
+
+function locBtn(loc) {
+  const p = parseLoc(loc);
+  if (!p) return "";
+  if (p.editable && p.line >= 1) {
+    return `<button type="button" class="loc-btn" data-jump-file="${escapeHtml(p.path)}" data-jump-line="${p.line}" data-jump-col="${p.col || 1}" title="Jump to ${escapeHtml(p.path)}:${p.line}">${escapeHtml(p.label)}</button>`;
+  }
+  return `<span class="loc-tag" title="${escapeHtml(p.rawPath || p.path)}">${escapeHtml(p.label)}</span>`;
+}
+
+function jumpTo(file, line, col = 1) {
+  const targetLine = Math.max(1, Number(line) || 1);
+  const targetCol = Math.max(1, Number(col) || 1);
+  const norm = normalizePath(file);
+  if (norm && norm in state.files && norm !== state.activeFile) {
     state.files[state.activeFile] = els.textarea.value;
-    state.activeFile = file;
-    els.textarea.value = state.files[file] ?? "";
+    state.activeFile = norm;
+    els.textarea.value = state.files[norm] ?? "";
     renderFileTabs();
   }
   const lines = els.textarea.value.split("\n");
-  const clamped = Math.min(target, Math.max(1, lines.length));
+  const clampedLine = Math.min(targetLine, Math.max(1, lines.length));
   let offset = 0;
-  for (let i = 0; i < clamped - 1; i += 1) offset += lines[i].length + 1;
+  for (let i = 0; i < clampedLine - 1; i += 1) offset += lines[i].length + 1;
+  offset += Math.min(targetCol - 1, lines[clampedLine - 1].length);
   els.textarea.focus();
   els.textarea.setSelectionRange(offset, offset);
-  els.textarea.scrollTop = Math.max(0, (clamped - 3) * LINE_H);
+  els.textarea.scrollTop = Math.max(0, (clampedLine - 3) * LINE_H);
   els.gutter.scrollTop = els.textarea.scrollTop;
   syncEditor();
   if (els.flash) {
-    els.flash.style.top = `${12 + (clamped - 1) * LINE_H - els.textarea.scrollTop}px`;
+    els.flash.style.top = `${12 + (clampedLine - 1) * LINE_H - els.textarea.scrollTop}px`;
     els.flash.classList.add("is-on");
     clearTimeout(flashTimer);
     requestAnimationFrame(() => { flashTimer = setTimeout(() => els.flash.classList.remove("is-on"), 40); });
@@ -78,12 +193,18 @@ function syncEditor() {
   const before = v.slice(0, els.textarea.selectionStart || 0).split("\n");
   els.cursor.textContent = `Ln ${before.length}, Col ${before[before.length - 1].length + 1}`;
   const base = PLAYGROUND_EXAMPLES[state.exampleId]?.files || {};
-  els.dirty.textContent = Object.entries(base).some(([p, t]) => (state.files[p] ?? "") !== t) ? "modified" : "";
+  const dirty = Object.entries(base).some(([p, t]) => (state.files[p] ?? "") !== t);
+  els.dirty.textContent = dirty ? "modified" : "";
+  els.dirty.classList.toggle("is-dirty", dirty);
 }
 
 function renderFileTabs() {
+  const base = PLAYGROUND_EXAMPLES[state.exampleId]?.files || {};
   els.fileTabs.innerHTML = Object.keys(state.files)
-    .map((n) => `<button type="button" role="tab" aria-selected="${n === state.activeFile}" data-file-tab="${escapeHtml(n)}"><svg class="i" aria-hidden="true"><use href="#i-file"/></svg>${escapeHtml(n)}</button>`)
+    .map((n) => {
+      const mod = (state.files[n] ?? "") !== (base[n] ?? "");
+      return `<button type="button" role="tab" aria-selected="${n === state.activeFile}" data-file-tab="${escapeHtml(n)}"><svg class="i" aria-hidden="true"><use href="#i-file"/></svg>${escapeHtml(n)}${mod ? '<span class="file-mod-dot" aria-label="modified"></span>' : ""}</button>`;
+    })
     .join("");
 }
 
@@ -96,82 +217,234 @@ function loadExample(id) {
   state.activeFile = Object.keys(state.files)[0];
   state.explainSymbol = ex.defaultSymbol || "";
   state.explainReport = null;
-  if (ex.id === "presets-v13") { state.generator = "Ninja Multi-Config"; syncGen(); }
+  state.showAllSymbols = false;
+  state.activeGenFile = "build.ninja";
+  state.generator = ex.id === "presets-v13" ? "Ninja Multi-Config" : "Ninja";
+  syncGen();
   els.exampleSelect.value = ex.id;
   els.exampleSelect.title = ex.description || "";
   els.textarea.value = state.files[state.activeFile] ?? "";
+  els.textarea.selectionStart = 0;
+  els.textarea.selectionEnd = 0;
+  els.textarea.scrollTop = 0;
   renderFileTabs();
   syncEditor();
 }
 
-function primaryFile(res) {
-  const f = res?.files || {};
-  const name = "build.ninja" in f ? "build.ninja" : Object.keys(f)[0];
-  return name ? { name, text: f[name] } : null;
+function orderedGenFiles(res) {
+  const names = Object.keys(res?.files || {});
+  const rank = (name) => {
+    if (name === "build.ninja") return 0;
+    if (name === `build-${state.buildType}.ninja`) return 1;
+    if (/^build-.*\.ninja$/.test(name)) return 2;
+    if (name === "CMakeFiles/rules.ninja") return 3;
+    if (name === "compile_commands.json") return 4;
+    if (name === "cmake_install.cmake") return 5;
+    if (name.startsWith("CMakeFiles/Export/")) return 6;
+    if (name.startsWith("CMakeFiles/impl-")) return 7;
+    return 8;
+  };
+  return names.sort((a, b) => rank(a) - rank(b) || a.localeCompare(b));
 }
 
-const hlLine = (line) => line.trimStart().startsWith("#")
-  ? `<span class="hl-cm">${escapeHtml(line)}</span>`
-  : escapeHtml(line)
-      .replace(/^(\s*)(rule|build|pool|default|subninja|include)\b/, '$1<span class="hl-kw">$2</span>')
-      .replace(/(\$(?:in|out|[A-Z_][A-Z0-9_]*|\{[^}]+\}))/g, '<span class="hl-var">$1</span>');
+function currentGenFile(res) {
+  const files = res?.files || {};
+  const list = orderedGenFiles(res);
+  if (!list.length) return null;
+  const name = state.activeGenFile in files ? state.activeGenFile : list[0];
+  return { name, text: files[name], all: list };
+}
 
-const chips = (raw) => {
-  const parts = String(raw ?? "").split(";").map((s) => s.trim()).filter(Boolean);
-  return (parts.length ? parts : [String(raw ?? "")]).map((p) => `<span class="chip is-ink">${escapeHtml(p)}</span>`).join("");
-};
+function hlLine(line, filename = "build.ninja") {
+  if (filename.endsWith(".json")) return escapeHtml(line);
+  if (line.trimStart().startsWith("#")) return `<span class="hl-cm">${escapeHtml(line)}</span>`;
+  if (filename.endsWith(".cmake")) {
+    return escapeHtml(line)
+      .replace(/^(\s*)([A-Za-z_][A-Za-z0-9_]*)(\s*\()/, '$1<span class="hl-kw">$2</span>$3')
+      .replace(/(\$\{[^}]+\})/g, '<span class="hl-var">$1</span>');
+  }
+  return escapeHtml(line)
+    .replace(/^(\s*)(rule|build|pool|default|subninja|include)\b/, '$1<span class="hl-kw">$2</span>')
+    .replace(/^(\s+)([A-Za-z_][A-Za-z0-9_]*)(\s*=)/, '$1<span class="hl-assign">$2</span>$3')
+    .replace(/(\$(?:in|out|[A-Z_][A-Z0-9_]*|\{[^}]+\}))/g, '<span class="hl-var">$1</span>');
+}
+
+function previewText(val) {
+  if (val === null || val === undefined) return "(unset)";
+  if (typeof val === "object") {
+    if (typeof val.prefix === "string") return val.truncated ? `${val.prefix}...` : val.prefix;
+    if (typeof val.bytes_hex === "string") return `0x${val.bytes_hex}`;
+    return JSON.stringify(val);
+  }
+  return String(val);
+}
+
+function chips(raw) {
+  const str = previewText(raw);
+  const parts = str.split(";").map((s) => s.trim()).filter(Boolean);
+  return (parts.length ? parts : [str]).map((p) => `<span class="chip is-ink">${escapeHtml(stripSrc(p))}</span>`).join("");
+}
 
 function renderDiagnostics(res) {
   const list = res?.diagnostics || [];
-  if (!list.length) return '<p class="dim">No diagnostics.</p>';
+  if (!list.length) {
+    if (res?.ok) {
+      const nTargets = res.targets?.length ?? 0;
+      const nFiles = Object.keys(res.files || {}).length;
+      const dur = typeof res.durationMs === "number" ? ` \u00b7 ${formatMs(res.durationMs)}` : "";
+      return `<div class="diag-empty" data-test="diag-clean"><span class="st-pass"><svg class="i" aria-hidden="true"><use href="#i-check"/></svg></span><div><div class="diag-msg">Configure succeeded with 0 errors and 0 warnings.</div><span class="diag-cat">${nTargets} ${nTargets === 1 ? "target" : "targets"} \u00b7 ${nFiles} generated ${nFiles === 1 ? "file" : "files"}${dur}</span></div></div>`;
+    }
+    return '<p class="dim">No diagnostics.</p>';
+  }
   return list.map((d) => {
     const sev = String(d.severity || "info");
     const [ic, cls] = sev === "error" ? ["i-cross", "st-fail"] : sev === "warning" ? ["i-differs", "st-partial"] : ["i-check", "st-pass"];
-    return `<div class="diag-row"><span class="${cls}"><svg class="i" aria-hidden="true"><use href="#${ic}"/></svg><span class="visually-hidden">${escapeHtml(sev)}</span></span><div class="diag-msg">${escapeHtml(d.message)}${d.category ? `<span class="diag-cat">${escapeHtml(d.category)}</span>` : ""}</div><div>${d.file && d.line ? locBtn({ path: d.file, line: d.line }) : ""}</div></div>`;
+    const loc = d.file && d.line ? locBtn({ path: d.file, line: d.line, col: d.column }) : "";
+    return `<div class="diag-row" data-diag-severity="${escapeHtml(sev)}"><span class="${cls}"><svg class="i" aria-hidden="true"><use href="#${ic}"/></svg><span class="visually-hidden">${escapeHtml(sev)}</span></span><div class="diag-msg">${escapeHtml(d.message)}${d.category ? `<span class="diag-cat">${escapeHtml(d.category)}</span>` : ""}</div><div>${loc}</div></div>`;
   }).join("");
 }
 
 function renderTargets(res) {
   const list = res?.targets || [];
   if (!list.length) return '<p class="dim">No targets.</p>';
-  const fields = [["defined at", (t) => t.definedAt], ["sources", (t) => t.sources?.join(" ")], ["features", (t) => t.compileFeatures?.join(" ")], ["definitions", (t) => t.compileDefinitions?.join(" ")], ["options", (t) => t.compileOptions?.join(" ")], ["includes", (t) => t.includeDirectories?.join(" ")], ["links", (t) => t.linkLibraries?.join(" ")]];
+  const fields = [
+    ["defined at", (t) => t.definedAt, true],
+    ["sources", (t) => t.sources?.join(" "), false],
+    ["features", (t) => t.compileFeatures?.join(" "), false],
+    ["definitions", (t) => t.compileDefinitions?.join(" "), false],
+    ["options", (t) => t.compileOptions?.join(" "), false],
+    ["includes", (t) => t.includeDirectories?.join(" "), false],
+    ["links", (t) => t.linkLibraries?.join(" "), false]
+  ];
   return list.map((t) => {
     const n = t.sources?.length || 0;
-    const rows = fields.filter(([, get]) => get(t)).map(([k, get]) => `<dt>${k}</dt><dd>${escapeHtml(get(t))}</dd>`).join("");
-    return `<div class="target-card"><div class="target-head"><svg class="i" aria-hidden="true"><use href="#i-target"/></svg><span class="target-name">${escapeHtml(t.name)}</span><span class="chip is-ink">${escapeHtml(t.kind)}</span><span class="dim">${n} ${n === 1 ? "source" : "sources"}</span></div>${rows ? `<dl class="target-meta">${rows}</dl>` : ""}</div>`;
+    const rows = fields
+      .filter(([, get]) => get(t))
+      .map(([k, get, isLoc]) => `<dt>${k}</dt><dd>${isLoc ? (locBtn(get(t)) || escapeHtml(get(t))) : escapeHtml(get(t))}</dd>`)
+      .join("");
+    return `<div class="target-card" data-target-name="${escapeHtml(t.name)}"><div class="target-head"><svg class="i" aria-hidden="true"><use href="#i-target"/></svg><span class="target-name">${escapeHtml(t.name)}</span><span class="chip is-ink">${escapeHtml(t.kind)}</span><span class="dim">${n} ${n === 1 ? "source" : "sources"}</span><button type="button" class="ctrl-btn target-explain-btn" data-target-explain="${escapeHtml(t.name)}"><svg class="i" aria-hidden="true"><use href="#i-tree"/></svg>Explain</button></div>${rows ? `<dl class="target-meta">${rows}</dl>` : ""}</div>`;
   }).join("");
 }
 
 function renderGenerated(res) {
-  const f = primaryFile(res);
+  const f = currentGenFile(res);
   if (!f) return '<p class="dim">No generated files.</p>';
-  return `<div class="code-table" data-test="generated-code">${String(f.text || "").split("\n").map((l, i) => `<div class="code-line"><span class="code-ln">${i + 1}</span><span>${hlLine(l)}</span></div>`).join("")}</div>`;
+  const lines = String(f.text || "").split("\n");
+  const bar = f.all.length > 1
+    ? `<div class="gen-file-bar"><label class="gen-file-label">File <select id="gen-file-select" data-test="gen-file-select">${f.all.map((n) => `<option value="${escapeHtml(n)}"${n === f.name ? " selected" : ""}>${escapeHtml(n)}</option>`).join("")}</select></label><span class="dim">${lines.length} lines \u00b7 ${f.all.length} files</span></div>`
+    : "";
+  const code = `<div class="code-table" data-test="generated-code">${lines.map((l, i) => `<div class="code-line"><span class="code-ln">${i + 1}</span><span>${hlLine(l, f.name)}</span></div>`).join("")}</div>`;
+  return `${bar}${code}`;
+}
+
+function curateExplainSymbols(res) {
+  const all = Array.isArray(res?.explainSymbols) ? res.explainSymbols : [];
+  const targets = (res?.targets || []).map((t) => t.name);
+  const targetSet = new Set(targets);
+  const projectName = (() => {
+    const m = String(state.files["CMakeLists.txt"] || "").match(/\bproject\s*\(\s*([A-Za-z0-9_.-]+)/i);
+    return m ? m[1] : "";
+  })();
+  const exDefault = PLAYGROUND_EXAMPLES[state.exampleId]?.defaultSymbol || "";
+
+  const isUsefulVar = (s) => {
+    if (targetSet.has(s)) return false;
+    if (s === exDefault || s === "PROJECT_VERSION" || s === "CMAKE_EXPORT_COMPILE_COMMANDS") return true;
+    if (BOILERPLATE_EXACT.has(s)) return false;
+    if (BOILERPLATE_PREFIXES.some((p) => s.startsWith(p))) return false;
+    if (s.startsWith("PROJECT_")) return false;
+    if (projectName && s.startsWith(`${projectName}_`)) return false;
+    return true;
+  };
+
+  const quick = [];
+  const push = (s) => { if (s && !quick.includes(s)) quick.push(s); };
+  targets.forEach(push);
+  if (exDefault && (all.includes(exDefault) || state.explainSymbol === exDefault)) push(exDefault);
+  all.filter(isUsefulVar).forEach(push);
+  if (state.explainSymbol && !quick.includes(state.explainSymbol)) push(state.explainSymbol);
+  return { quick: quick.slice(0, 12), all: Array.from(new Set([...quick, ...all])) };
+}
+
+function renderExplainChain(chain) {
+  if (!Array.isArray(chain) || !chain.length) return "";
+  return chain.map((h) => {
+    if (h.from !== undefined) {
+      return `<div class="ex-chain"><span>${escapeHtml(`${h.from} -> ${h.via || h.to}`)}</span>${h.edge ? `<span class="chip">${escapeHtml(h.edge)}</span>` : ""}${locBtn(h.location)}</div>`;
+    }
+    const targetLabel = h.target ? `via ${h.target}` : `via target#${h.target_id}`;
+    return `<div class="ex-chain"><span>${escapeHtml(targetLabel)}</span>${h.scope ? `<span class="chip">${escapeHtml(h.scope)}</span>` : ""}${locBtn(h.origin)}</div>`;
+  }).join("");
+}
+
+function renderExplainSources(sources) {
+  if (!Array.isArray(sources) || !sources.length) return "";
+  return sources.map((s) => {
+    if (typeof s === "string") return `<span class="chip is-ink">${escapeHtml(stripSrc(s))}</span>`;
+    const name = stripSrc(s?.value || "");
+    return `<span class="ex-src-item"><span class="chip is-ink">${escapeHtml(name)}</span>${locBtn(s?.origin)}</span>`;
+  }).join("");
 }
 
 function renderExplainReport(rep) {
   if (!rep) return '<p class="dim">Pick a target or variable.</p>';
-  if (state.showRawJson) return `<pre class="code-table">${escapeHtml(JSON.stringify(rep, null, 2))}</pre>`;
+  if (state.showRawJson) return `<pre class="code-table" data-test="explain-raw-json">${escapeHtml(JSON.stringify(rep, null, 2))}</pre>`;
   const d = rep.details || {};
   if (rep.kind === "not_found") {
     const sugs = (d.suggestions || []).map((s) => `<button type="button" class="ctrl-btn" data-explain-sym="${escapeHtml(s.name)}">${escapeHtml(s.name)} <span class="dim">${escapeHtml(s.kind)}</span></button>`).join("");
-    return `<div class="explain-tree" data-test="explain-not-found"><div class="ex-root"><span class="st st-partial"><svg class="i" aria-hidden="true"><use href="#i-differs"/></svg><span>not found</span></span><span>${escapeHtml(rep.name)}</span></div>${sugs ? `<div class="explain-syms">${sugs}</div>` : ""}</div>`;
+    return `<div class="explain-tree" data-test="explain-not-found"><div class="ex-root"><span class="st st-partial"><svg class="i" aria-hidden="true"><use href="#i-differs"/></svg><span>not found</span></span><span class="target-name">${escapeHtml(rep.name)}</span></div>${sugs ? `<div class="explain-syms">${sugs}</div>` : '<p class="dim">Symbol not found in the current configure graph. Pick a target or variable above.</p>'}</div>`;
+  }
+  if (rep.kind === "ambiguous") {
+    const kinds = (d.kinds || []).map((k) => `<span class="chip is-ink">${escapeHtml(k)}</span>`).join("");
+    return `<div class="explain-tree" data-test="explain-ambiguous"><div class="ex-root"><span class="st st-partial"><svg class="i" aria-hidden="true"><use href="#i-differs"/></svg><span>ambiguous</span></span><span class="target-name">${escapeHtml(rep.name)}</span>${kinds}</div></div>`;
   }
   if (rep.kind === "variable") {
-    const writes = (d.writes || []).map((w) => `<li class="var-step"><span class="muted">${escapeHtml(w.op || "set")}</span>${chips(w.value)}${locBtn(w.location)}</li>`).join("");
-    return `<div class="explain-tree" data-test="explain-variable"><div class="ex-root"><span class="target-name">${escapeHtml(rep.name)}</span><span class="chip is-ink">${escapeHtml(d.binding || "directory")}</span>${chips(d.value)}${locBtn(d.location)}</div><ol class="var-timeline">${writes}</ol></div>`;
+    const writesList = Array.isArray(d.writes) ? d.writes : [];
+    const rootLoc = (d.location && Number(d.location.line || 0) >= 1)
+      ? d.location
+      : (writesList.length ? writesList[writesList.length - 1].origin || writesList[writesList.length - 1].location : d.location);
+    const cacheMeta = d.cache
+      ? `<div class="ex-meta-row"><span class="dim">cache ${escapeHtml(d.cache.type || "STRING")}</span>${d.cache.help ? `<span class="dim">${escapeHtml(d.cache.help)}</span>` : ""}${d.history ? `<span class="dim">history: ${escapeHtml(d.history)}</span>` : ""}</div>`
+      : "";
+    const writes = writesList.map((w) => {
+      const op = w.operation || w.op || w.command || "set";
+      const val = chips(w.value);
+      const scopeTag = w.in_queried_scope === false ? '<span class="chip">block scope</span>' : "";
+      const loc = locBtn(w.origin?.length ? w.origin : w.location);
+      return `<li class="var-step"><span class="muted">${escapeHtml(op)}</span>${val}${scopeTag}${loc}</li>`;
+    }).join("");
+    const timeline = writes
+      ? `<ol class="var-timeline">${writes}</ol>`
+      : '<p class="dim ex-note">Set via cache or preset before script evaluation (no listfile writes).</p>';
+    return `<div class="explain-tree" data-test="explain-variable"><div class="ex-root"><span class="target-name">${escapeHtml(rep.name)}</span>${d.binding ? `<span class="chip is-ink">${escapeHtml(d.binding)}</span>` : ""}${chips(d.value)}${locBtn(rootLoc)}</div>${cacheMeta}${timeline}</div>`;
   }
-  const cfg = d.configurations?.[0];
-  const srcs = (cfg?.sources || []).map((s) => `<span class="chip is-ink">${escapeHtml(s)}</span>`).join("");
+
+  const cfg = d.configurations?.find((c) => c.name === state.buildType) || d.configurations?.[0];
+  const srcs = renderExplainSources(cfg?.sources?.length ? cfg.sources : d.sources);
   const entries = (cfg?.entries || []).map((e) => {
-    const chain = (e.chain || []).map((h) => `<div class="ex-chain"><span>${escapeHtml(`${h.from} -> ${h.via || h.to}`)}</span><span class="chip">${escapeHtml(h.edge)}</span>${locBtn(h.location)}</div>`).join("");
-    return `<div class="ex-entry"><div class="ex-entry-row"><span class="ex-prop">${escapeHtml(e.property)}</span>${chips(e.value)}<span class="chip">${escapeHtml(e.scope)}</span>${locBtn(e.origin)}</div>${chain}</div>`;
+    const prop = e.kind || e.property || "";
+    const scopeText = e.scope || e.link_role || e.input?.name || "";
+    const scopeChip = scopeText ? `<span class="chip">${escapeHtml(scopeText)}</span>` : "";
+    const originLoc = (Array.isArray(e.origin) ? e.origin.length > 0 : Boolean(e.origin)) ? e.origin : e.input?.location;
+    const chain = renderExplainChain(e.chain);
+    return `<div class="ex-entry"><div class="ex-entry-row"><span class="ex-prop">${escapeHtml(prop)}</span>${chips(e.value)}${scopeChip}${locBtn(originLoc)}</div>${chain}</div>`;
   }).join("");
-  return `<div class="explain-tree" data-test="explain-tree"><div class="ex-root"><svg class="i" aria-hidden="true"><use href="#i-target"/></svg><span class="target-name">${escapeHtml(d.target || rep.name)}</span><span class="chip is-ink">${escapeHtml(d.target_kind || "TARGET")}</span>${locBtn(d.definition)}</div><div class="ex-branch"><div class="ex-entry"><div class="ex-entry-row"><span class="ex-prop">${escapeHtml(cfg?.name || state.buildType)}</span><span class="dim">${escapeHtml(d.configuration_selection?.status || "matched")}</span></div></div><div class="ex-branch">${srcs ? `<div class="ex-entry"><div class="ex-entry-row"><span class="ex-prop">sources</span>${srcs}</div></div>` : ""}${entries}</div></div></div>`;
+  const aliasLoc = d.alias_definition ? `<span class="chip">alias</span>${locBtn(d.alias_definition)}` : "";
+  return `<div class="explain-tree" data-test="explain-tree"><div class="ex-root"><svg class="i" aria-hidden="true"><use href="#i-target"/></svg><span class="target-name">${escapeHtml(d.target || rep.name)}</span><span class="chip is-ink">${escapeHtml(d.target_kind || "TARGET")}</span>${locBtn(d.definition)}${aliasLoc}</div><div class="ex-branch"><div class="ex-entry"><div class="ex-entry-row"><span class="ex-prop">${escapeHtml(cfg?.name || state.buildType)}</span><span class="dim">${escapeHtml(d.configuration_selection?.status || "matched")}</span></div></div><div class="ex-branch">${srcs ? `<div class="ex-entry"><div class="ex-entry-row"><span class="ex-prop">SOURCES</span>${srcs}</div></div>` : ""}${entries || '<div class="ex-entry"><span class="dim">No resolved compile or link entries.</span></div>'}</div></div></div>`;
 }
 
 function renderExplainTab(res) {
-  const syms = (res?.explainSymbols || []).map((s) => `<button type="button" class="ctrl-btn" data-explain-sym="${escapeHtml(s)}" aria-pressed="${s === state.explainSymbol}" style="${s === state.explainSymbol ? "background:var(--s3);color:var(--ink);border-color:var(--line-strong)" : ""}">${escapeHtml(s)}</button>`).join("");
-  return `<form id="explain-form" class="explain-bar"><input id="explain-input" class="search-input" type="text" value="${escapeHtml(state.explainSymbol)}" placeholder="Target or variable" aria-label="Symbol to explain" data-test="explain-input"><button class="ctrl-btn" type="submit" data-test="explain-submit">Explain</button><button id="toggle-explain-json" class="ctrl-btn" type="button" data-test="toggle-explain-json">${state.showRawJson ? "Structured" : "Raw JSON"}</button></form><div class="explain-syms" data-test="explain-symbols">${syms}</div>${renderExplainReport(state.explainReport)}`;
+  const { quick, all } = curateExplainSymbols(res);
+  const visible = state.showAllSymbols ? all : quick;
+  const hiddenCount = Math.max(0, all.length - quick.length);
+  const syms = visible
+    .map((s) => `<button type="button" class="ctrl-btn sym-btn${s === state.explainSymbol ? " is-active" : ""}" data-explain-sym="${escapeHtml(s)}" aria-pressed="${s === state.explainSymbol}">${escapeHtml(s)}</button>`)
+    .join("");
+  const moreBtn = hiddenCount > 0
+    ? `<button id="toggle-all-syms" type="button" class="ctrl-btn sym-more-btn" data-test="toggle-all-syms">${state.showAllSymbols ? "Fewer" : `+${hiddenCount} more`}</button>`
+    : "";
+  const datalist = `<datalist id="explain-datalist">${all.map((s) => `<option value="${escapeHtml(s)}"></option>`).join("")}</datalist>`;
+  return `<form id="explain-form" class="explain-bar"><input id="explain-input" class="search-input" type="text" list="explain-datalist" value="${escapeHtml(state.explainSymbol)}" placeholder="Target or variable" aria-label="Symbol to explain" data-test="explain-input">${datalist}<button class="ctrl-btn" type="submit" data-test="explain-submit">Explain</button><button id="toggle-explain-json" class="ctrl-btn" type="button" data-test="toggle-explain-json">${state.showRawJson ? "Structured" : "Raw JSON"}</button></form><div class="explain-syms" data-test="explain-symbols">${syms}${moreBtn}</div>${renderExplainReport(state.explainReport)}`;
 }
 
 async function explain(sym) {
@@ -183,18 +456,40 @@ async function explain(sym) {
 function renderInspector(fade = false) {
   const res = state.lastResult;
   els.outputTabs.querySelectorAll("[data-inspector-tab]").forEach((t) => t.setAttribute("aria-selected", String(t.dataset.inspectorTab === state.activeTab)));
-  const f = primaryFile(res);
-  els.fileTabName.textContent = f?.name || "build.ninja";
-  els.copyBtn.hidden = state.activeTab !== "ninja" || !f;
-  els.diagCount.textContent = res ? String(res.diagnostics?.length ?? 0) : "";
+  const f = currentGenFile(res);
+  const genFiles = orderedGenFiles(res);
+  els.fileTabName.textContent = genFiles.includes("build.ninja") ? "build.ninja" : (f?.name || "build.ninja");
+  if (els.fileCount) els.fileCount.textContent = genFiles.length > 1 ? String(genFiles.length) : "";
+  els.copyBtn.hidden = !((state.activeTab === "ninja" && f) || (state.activeTab === "explain" && state.showRawJson && state.explainReport));
+  const diags = res?.diagnostics || [];
+  const errCount = diags.filter((d) => d.severity === "error").length;
+  els.diagCount.textContent = res ? String(diags.length) : "";
+  els.diagCount.classList.toggle("is-error", errCount > 0);
   els.targetCount.textContent = res ? String(res.targets?.length ?? 0) : "";
+
   const views = { diagnostics: renderDiagnostics, targets: renderTargets, ninja: renderGenerated, explain: renderExplainTab };
-  if (fade && !prefersReducedMotion()) { els.body.classList.add("is-fading"); requestAnimationFrame(() => els.body.classList.remove("is-fading")); }
-  els.body.innerHTML = (views[state.activeTab] || renderDiagnostics)(res);
-  els.body.querySelectorAll("[data-jump-line]").forEach((b) => b.addEventListener("click", () => jumpTo(b.dataset.jumpFile, b.dataset.jumpLine)));
+  if (fade && !prefersReducedMotion()) {
+    els.body.classList.add("is-fading");
+    requestAnimationFrame(() => els.body.classList.remove("is-fading"));
+  }
+  els.body.innerHTML = (views[state.activeTab] || renderGenerated)(res);
+  els.body.querySelectorAll("[data-jump-line]").forEach((b) => b.addEventListener("click", () => jumpTo(b.dataset.jumpFile, b.dataset.jumpLine, b.dataset.jumpCol)));
+  els.body.querySelectorAll("[data-target-explain]").forEach((b) => b.addEventListener("click", () => {
+    state.activeTab = "explain";
+    state.lastManualTab = "explain";
+    state.autoSwitchedToDiag = false;
+    explain(b.dataset.targetExplain);
+  }));
+  if (state.activeTab === "ninja") {
+    $("gen-file-select")?.addEventListener("change", (e) => {
+      state.activeGenFile = e.target.value;
+      renderInspector(false);
+    });
+  }
   if (state.activeTab === "explain") {
     $("explain-form")?.addEventListener("submit", (e) => { e.preventDefault(); explain($("explain-input").value.trim()); });
     $("toggle-explain-json")?.addEventListener("click", () => { state.showRawJson = !state.showRawJson; renderInspector(); });
+    $("toggle-all-syms")?.addEventListener("click", () => { state.showAllSymbols = !state.showAllSymbols; renderInspector(); });
     els.body.querySelectorAll("[data-explain-sym]").forEach((b) => b.addEventListener("click", () => explain(b.dataset.explainSym)));
   }
 }
@@ -203,6 +498,7 @@ function setRunning(on) {
   const reduced = prefersReducedMotion();
   if (on) {
     els.runStatus.textContent = "running";
+    els.runStatus.classList.remove("st-pass", "st-fail");
     if (!reduced) {
       els.runIcon.innerHTML = '<svg class="spin-ring" viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="6"/></svg>';
       els.runLine.classList.remove("is-done");
@@ -220,18 +516,50 @@ function setRunning(on) {
 
 async function runConfigure() {
   state.files[state.activeFile] = els.textarea.value;
+  renderFileTabs();
   syncEditor();
   setRunning(true);
   try {
     const res = await adapter.configure(state.files, { exampleId: state.exampleId, generator: state.generator, buildType: state.buildType });
     state.lastResult = res;
-    if (!state.explainSymbol && res.explainSymbols?.length) state.explainSymbol = res.explainSymbols[0];
-    state.explainReport = state.explainSymbol ? await adapter.explain(state.explainSymbol, { config: state.buildType }) : null;
+    updateModeBadge(res.mode, res.durationMs);
+
+    const errCount = (res.diagnostics || []).filter((d) => d.severity === "error").length;
+    if (!res.ok || errCount > 0) {
+      state.explainReport = null;
+      if (state.activeTab !== "diagnostics") {
+        state.activeTab = "diagnostics";
+        state.autoSwitchedToDiag = true;
+      }
+      els.runStatus.textContent = `configure failed (${errCount || 1} ${errCount === 1 ? "error" : "errors"}) \u00b7 ${formatMs(res.durationMs)}`;
+      els.runStatus.classList.add("st-fail");
+      els.runStatus.classList.remove("st-pass");
+    } else {
+      if (state.autoSwitchedToDiag) {
+        state.activeTab = state.lastManualTab || "ninja";
+        state.autoSwitchedToDiag = false;
+      }
+      if (!(state.activeGenFile in (res.files || {}))) {
+        state.activeGenFile = orderedGenFiles(res)[0] || "build.ninja";
+      }
+      let report = state.explainSymbol ? await adapter.explain(state.explainSymbol, { config: state.buildType }) : null;
+      if (!report || report.kind === "not_found") {
+        const fallback = res.targets?.[0]?.name || curateExplainSymbols(res).quick[0] || res.explainSymbols?.[0] || "";
+        if (fallback && fallback !== state.explainSymbol) {
+          state.explainSymbol = fallback;
+          report = await adapter.explain(fallback, { config: state.buildType });
+        }
+      }
+      state.explainReport = report;
+      els.runStatus.textContent = res.mode === "wasm" ? `configured in ${formatMs(res.durationMs)}` : "precomputed output";
+      els.runStatus.classList.toggle("st-pass", res.mode === "wasm");
+      els.runStatus.classList.remove("st-fail");
+    }
     const n = res.targets?.length ?? 0;
-    els.runStatus.textContent = res.mode === "wasm" ? `configured in ${res.durationMs} ms` : "precomputed output";
     els.runSummary.textContent = `${n} ${n === 1 ? "target" : "targets"} \u00b7 ${state.generator} \u00b7 ${state.buildType}`;
   } catch (err) {
     els.runStatus.textContent = `error: ${err instanceof Error ? err.message : String(err)}`;
+    els.runStatus.classList.add("st-fail");
   } finally {
     setRunning(false);
   }
@@ -281,8 +609,13 @@ async function init() {
     renderFileTabs();
     syncEditor();
   });
-  initRovingGroup(els.outputTabs, "[data-inspector-tab]", (b) => { state.activeTab = b.dataset.inspectorTab; renderInspector(false); });
-  els.textarea.addEventListener("input", () => { state.files[state.activeFile] = els.textarea.value; syncEditor(); });
+  initRovingGroup(els.outputTabs, "[data-inspector-tab]", (b) => {
+    state.activeTab = b.dataset.inspectorTab;
+    state.lastManualTab = state.activeTab;
+    state.autoSwitchedToDiag = false;
+    renderInspector(false);
+  });
+  els.textarea.addEventListener("input", () => { state.files[state.activeFile] = els.textarea.value; renderFileTabs(); syncEditor(); });
   els.textarea.addEventListener("scroll", () => { els.gutter.scrollTop = els.textarea.scrollTop; });
   ["click", "keyup"].forEach((ev) => els.textarea.addEventListener(ev, syncEditor));
   els.textarea.addEventListener("keydown", (e) => {
@@ -293,16 +626,22 @@ async function init() {
       els.textarea.value = `${v.slice(0, s)}  ${v.slice(end)}`;
       els.textarea.selectionStart = els.textarea.selectionEnd = s + 2;
       state.files[state.activeFile] = els.textarea.value;
+      renderFileTabs();
       syncEditor();
     }
   });
-  els.copyBtn.addEventListener("click", () => copyWithFeedback(els.copyBtn, primaryFile(state.lastResult)?.text || "", "Copy"));
+  els.copyBtn.addEventListener("click", () => {
+    const text = state.activeTab === "explain" && state.showRawJson && state.explainReport
+      ? JSON.stringify(state.explainReport, null, 2)
+      : currentGenFile(state.lastResult)?.text || "";
+    copyWithFeedback(els.copyBtn, text, "Copy");
+  });
   initSplit();
 
+  updateModeBadge("loading");
   const info = await adapter.load(BUNDLE_URL);
   const wasm = info.mode === "wasm";
-  els.modeBadge.textContent = wasm ? "wasm" : "preview";
-  els.modeBadge.classList.toggle("is-wasm", wasm);
+  updateModeBadge(info.mode);
   els.modeBadge.title = adapter.loadReason || (wasm ? info.url : `Preview mode (${info.reason || "bundle pending"})`);
   await runConfigure();
 }
