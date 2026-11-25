@@ -1,0 +1,13 @@
+
+Rcmake extensions
+  rcmake explain <name> [-B <build>] [--target|--var]
+                 [--config <name>] [--filter <value>] [--json]
+                 [--verbose] [--color=auto|always|never]
+  --diagnostics=cmake|rich     Select the diagnostic format.
+  --profile[=<dir>]            Write a profile to <dir>. The default is
+                               rcmake-profile in the build directory.
+  --no-probe-cache             Disable the probe cache for this configure.
+  --fetch-lock=off|auto|update|frozen
+                               Select the fetch lock mode.
+  --hermetic[=warn|strict]     Check for undeclared inputs. The default mode
+                               for this option is warn.

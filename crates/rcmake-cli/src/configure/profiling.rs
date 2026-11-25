@@ -6,7 +6,7 @@ use rcmake_eval::Interp;
 use rcmake_host::Host;
 
 use crate::options::{Options, extensions::ProfileRequest};
-use crate::persona::{Persona, oracle_mode};
+use crate::persona::Persona;
 use crate::profile::{self, ProfilePhase, ProfileRecorder, Recorder};
 
 use super::Exit;
@@ -22,7 +22,7 @@ impl Profilers {
             .profile_output
             .as_ref()
             .map(|path| (Arc::new(Recorder::new(host)), path.clone()));
-        let native = if opts.persona == Persona::Native && !oracle_mode(host) && !opts.view {
+        let native = if opts.persona == Persona::Native && !opts.view {
             opts.extensions
                 .profile
                 .clone()

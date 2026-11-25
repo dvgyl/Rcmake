@@ -4,51 +4,71 @@ use rcmake_eval::{FetchLockMode, HermeticMode, ProbeCacheMode, SpeedOptions};
 use rcmake_host::Host;
 
 use crate::options::{CacheEdit, Options};
-use crate::persona::{Persona, oracle_mode};
+use crate::persona::Persona;
 
 pub(super) fn settings(host: &dyn Host, opts: &Options, profiled: bool) -> (SpeedOptions, bool) {
-    if opts.persona != Persona::Native || oracle_mode(host) || opts.view {
+    if opts.persona != Persona::Native || opts.view {
         return (SpeedOptions::default(), false);
     }
 
     let env = |key: &[u8]| host.env_get(key);
     let enabled = |key: &[u8]| env(key).is_some_and(|value| value == b"1");
-    let jobs =
-        |key: &[u8]| -> Option<NonZeroUsize> { std::str::from_utf8(&env(key)?).ok()?.parse().ok() };
-    let probe_cache = if opts.extensions.no_probe_cache || enabled(b"RCMAKE_NO_PROBE_CACHE") {
+    let no_probe_cache = env_mode(
+        host,
+        "RCMAKE_NO_PROBE_CACHE",
+        false,
+        true,
+        |value| match value {
+            b"0" => Some(false),
+            b"1" => Some(true),
+            _ => None,
+        },
+    );
+    let probe_cache = env_mode(
+        host,
+        "RCMAKE_PROBE_CACHE",
+        ProbeCacheMode::ReadWrite,
+        ProbeCacheMode::Off,
+        |value| match value {
+            b"off" | b"0" => Some(ProbeCacheMode::Off),
+            b"on" | b"1" | b"readwrite" => Some(ProbeCacheMode::ReadWrite),
+            b"readonly" => Some(ProbeCacheMode::ReadOnly),
+            b"verify" => Some(ProbeCacheMode::Verify),
+            _ => None,
+        },
+    );
+    let probe_cache = if opts.extensions.no_probe_cache || no_probe_cache {
         ProbeCacheMode::Off
     } else {
-        match env(b"RCMAKE_PROBE_CACHE")
-            .as_ref()
-            .map(|value| value.as_slice())
-        {
-            Some(b"off" | b"0") => ProbeCacheMode::Off,
-            Some(b"readonly") => ProbeCacheMode::ReadOnly,
-            Some(b"verify") => ProbeCacheMode::Verify,
-            _ => ProbeCacheMode::ReadWrite,
-        }
+        probe_cache
     };
-    let fetch_lock = opts.extensions.fetch_lock.unwrap_or_else(|| {
-        match env(b"RCMAKE_FETCH_LOCK")
-            .as_ref()
-            .map(|value| value.as_slice())
-        {
-            Some(b"off") => FetchLockMode::Off,
-            Some(b"update") => FetchLockMode::Update,
-            Some(b"frozen") => FetchLockMode::Frozen,
-            _ => FetchLockMode::Auto,
-        }
-    });
-    let hermetic = opts.extensions.hermetic.unwrap_or_else(|| {
-        match env(b"RCMAKE_HERMETIC")
-            .as_ref()
-            .map(|value| value.as_slice())
-        {
-            Some(b"1" | b"warn") => HermeticMode::Warn,
-            Some(b"strict") => HermeticMode::Strict,
-            _ => HermeticMode::Off,
-        }
-    });
+    let fetch_lock = env_mode(
+        host,
+        "RCMAKE_FETCH_LOCK",
+        FetchLockMode::Auto,
+        FetchLockMode::Off,
+        |value| match value {
+            b"off" => Some(FetchLockMode::Off),
+            b"auto" => Some(FetchLockMode::Auto),
+            b"update" => Some(FetchLockMode::Update),
+            b"frozen" => Some(FetchLockMode::Frozen),
+            _ => None,
+        },
+    );
+    let fetch_lock = opts.extensions.fetch_lock.unwrap_or(fetch_lock);
+    let hermetic = env_mode(
+        host,
+        "RCMAKE_HERMETIC",
+        HermeticMode::Off,
+        HermeticMode::Off,
+        |value| match value {
+            b"off" | b"0" => Some(HermeticMode::Off),
+            b"1" | b"warn" => Some(HermeticMode::Warn),
+            b"strict" => Some(HermeticMode::Strict),
+            _ => None,
+        },
+    );
+    let hermetic = opts.extensions.hermetic.unwrap_or(hermetic);
 
     // The runtime reads path overrides, offline mode and allowlists from this host.
     let fetch_prefetch = fetch_lock != FetchLockMode::Off
@@ -59,7 +79,12 @@ pub(super) fn settings(host: &dyn Host, opts: &Options, profiled: bool) -> (Spee
         && !opts.fresh
         && opts.trace.is_none()
         && opts.preset.is_none()
-        && opts.extensions.diagnostics.is_none()
+        && !opts.check_system_vars
+        && !opts.log_context
+        && !opts.debug_output
+        && !opts.debug_find
+        && opts.debug_find_variables.is_empty()
+        && opts.debug_find_packages.is_empty()
         && !opts.cache_edits.iter().any(|edit| match edit {
             CacheEdit::Preload(_) => true,
             CacheEdit::Define(define) => define.name == b"CMAKE_TOOLCHAIN_FILE",
@@ -70,21 +95,44 @@ pub(super) fn settings(host: &dyn Host, opts: &Options, profiled: bool) -> (Spee
     (
         SpeedOptions {
             probe_cache,
-            probe_jobs: jobs(b"RCMAKE_PROBE_JOBS"),
+            probe_jobs: jobs(host, "RCMAKE_PROBE_JOBS"),
             incremental,
             fetch_lock,
             fetch_prefetch,
-            fetch_jobs: jobs(b"RCMAKE_FETCH_JOBS"),
+            fetch_jobs: jobs(host, "RCMAKE_FETCH_JOBS"),
             hermetic,
         },
         true,
     )
 }
 
+fn env_mode<T>(
+    host: &dyn Host,
+    key: &str,
+    default: T,
+    invalid: T,
+    parse: impl FnOnce(&[u8]) -> Option<T>,
+) -> T {
+    let Some(value) = host.env_get(key.as_bytes()) else {
+        return default;
+    };
+    parse(&value).unwrap_or_else(|| {
+        let message = format!("Rcmake Warning: Unrecognized value for {key}.\n");
+        host.write_out(rcmake_host::Stream::Stderr, message.as_bytes());
+        invalid
+    })
+}
+
+fn jobs(host: &dyn Host, key: &str) -> Option<NonZeroUsize> {
+    env_mode(host, key, None, None, |value| {
+        std::str::from_utf8(value).ok()?.parse().ok().map(Some)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rcmake_host::PureHost;
+    use rcmake_host::{PureHost, Stream};
 
     #[test]
     fn resolves_native_speed_modes_and_keeps_compat_stateless() {
@@ -119,17 +167,62 @@ mod tests {
         let (speed, _) = settings(&host, &opts, false);
         assert_eq!(speed.probe_cache, ProbeCacheMode::Off);
         assert_eq!(speed.fetch_lock, FetchLockMode::Off);
-        for persona in [Persona::Compat, Persona::Native] {
-            if persona == Persona::Native {
-                host.env_set(b"RCMAKE_ORACLE_MODE", Some(b"1"));
-            }
-            opts.persona = persona;
-            let (speed, persistent) = settings(&host, &opts, false);
-            assert!(!persistent && !speed.incremental && !speed.fetch_prefetch);
-            assert!(speed.probe_jobs.is_none() && speed.fetch_jobs.is_none());
-            assert_eq!(speed.probe_cache, ProbeCacheMode::Off);
-            assert_eq!(speed.fetch_lock, FetchLockMode::Off);
-            assert_eq!(speed.hermetic, HermeticMode::Off);
+        opts.persona = Persona::Compat;
+        let (speed, persistent) = settings(&host, &opts, false);
+        assert!(!persistent && !speed.incremental && !speed.fetch_prefetch);
+        assert!(speed.probe_jobs.is_none() && speed.fetch_jobs.is_none());
+        assert_eq!(speed.probe_cache, ProbeCacheMode::Off);
+        assert_eq!(speed.fetch_lock, FetchLockMode::Off);
+        assert_eq!(speed.hermetic, HermeticMode::Off);
+    }
+
+    #[test]
+    fn invalid_settings_warn_and_disable_probe_cache() {
+        let host = PureHost::default();
+        let opts = Options {
+            persona: Persona::Native,
+            ..Options::default()
+        };
+        let invalid: [(&[u8], &[u8]); 5] = [
+            (b"RCMAKE_PROBE_CACHE", b"false"),
+            (b"RCMAKE_NO_PROBE_CACHE", b"true"),
+            (b"RCMAKE_HERMETIC", b"on"),
+            (b"RCMAKE_FETCH_LOCK", b"bogus"),
+            (b"RCMAKE_PROBE_JOBS", b" 4"),
+        ];
+        for (key, value) in invalid {
+            host.env_set(key, Some(value));
+        }
+        let (speed, _) = settings(&host, &opts, false);
+        assert_eq!(speed.probe_cache, ProbeCacheMode::Off);
+        assert_eq!(speed.fetch_lock, FetchLockMode::Off);
+        assert_eq!(speed.hermetic, HermeticMode::Off);
+        assert!(speed.probe_jobs.is_none());
+        let stderr = host.stream_bytes(Stream::Stderr);
+        for (key, _) in invalid {
+            assert_eq!(
+                stderr
+                    .windows(key.len())
+                    .filter(|window| *window == key)
+                    .count(),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn diagnostic_format_keeps_incremental_evaluation_enabled() {
+        let host = PureHost::default();
+        for style in [
+            crate::persona::DiagStyle::Cmake,
+            crate::persona::DiagStyle::Rich,
+        ] {
+            let mut opts = Options {
+                persona: Persona::Native,
+                ..Options::default()
+            };
+            opts.extensions.diagnostics = Some(style);
+            assert!(settings(&host, &opts, false).0.incremental);
         }
     }
 }

@@ -128,8 +128,10 @@ impl PreparedConfigure {
             services,
         };
         let mut interp = Interp::new(config.clone(), register);
+        runtime.attach(&mut interp);
         seed_cache(&mut interp, prepared);
-        let (preload_diagnostics, preload_sources) = run_preloads(&mut interp, prepared, &config)?;
+        let (preload_diagnostics, preload_sources) =
+            run_preloads(runtime, &mut interp, prepared, &config)?;
         initialize(&mut interp, prepared, generator);
         set_directory_vars(&mut interp, prepared);
         if let Some(toolchain) = toolchain_file(&mut interp, prepared, host.as_ref()) {
@@ -137,7 +139,9 @@ impl PreparedConfigure {
                 .cx()
                 .include_file(&toolchain, IncludeOptions::default());
         }
-        let outcome = if interp.fatal_occurred() {
+        let outcome = if runtime.denied() {
+            1
+        } else if interp.fatal_occurred() {
             interp.exit_code()
         } else {
             runtime.run(&mut interp, &[]).exit_code
@@ -412,6 +416,7 @@ fn set_directory_vars(interp: &mut Interp, prepared: &PreparedConfigure) {
 }
 
 fn run_preloads(
+    runtime: &rcmake_commands::ConfigureRuntime,
     interp: &mut Interp,
     prepared: &PreparedConfigure,
     config: &InterpConfig,
@@ -426,6 +431,7 @@ fn run_preloads(
             continue;
         }
         let mut preload = Interp::new(config.clone(), register);
+        runtime.attach(&mut preload);
         set_directory_vars(&mut preload, prepared);
         *preload.cx().cache() = std::mem::take(interp.cx().cache());
         let _ = preload.cx().include_file(&file, IncludeOptions::default());
@@ -447,9 +453,13 @@ fn run_preloads(
                     commands: prepared.denied_processes(),
                 });
             }
-            None if preload.fatal_occurred() || preload.exit_code() != 0 => {
+            None if runtime.denied() || preload.fatal_occurred() || preload.exit_code() != 0 => {
                 return Err(ApiError::ConfigureFailed {
-                    exit_code: preload.exit_code(),
+                    exit_code: if runtime.denied() {
+                        1
+                    } else {
+                        preload.exit_code()
+                    },
                     diagnostics,
                     sources: Some(Arc::new(sources)),
                 });

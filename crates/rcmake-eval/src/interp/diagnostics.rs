@@ -1,6 +1,5 @@
 use std::ops::Range;
 use std::path::Path;
-use std::sync::Arc;
 
 use rcmake_base::BString;
 use rcmake_diag::{
@@ -8,10 +7,9 @@ use rcmake_diag::{
     MessageKind, PolicyId, SourceFile, SourceId, SourceMap,
     annotate::{Annotations, Confidence, Edit, Fix, SourceSpan},
     rich::{RichOptions, SourceLookup, render_rich},
-    source::SourceKind,
     suggest::{Namespace, suggest_candidates_in},
 };
-use rcmake_host::{ReadRange, Stream, path::to_native};
+use rcmake_host::{Stream, path::to_native};
 use rcmake_syntax::CommandInvocation;
 
 use crate::util::cat;
@@ -66,6 +64,18 @@ impl Interp {
             diag
         };
         if let Some(options) = self.engine.rich_options() {
+            let annotated;
+            let diag = if diag.annotations.is_none()
+                && let Some(annotations) = self.annotate(&diag.location, &diag.body)
+            {
+                annotated = Diagnostic {
+                    annotations: Some(Box::new(annotations)),
+                    ..diag.clone()
+                };
+                &annotated
+            } else {
+                diag
+            };
             if self.engine.record(diag, state) {
                 self.write_rich(diag, options);
             }
@@ -169,7 +179,7 @@ impl Interp {
         self.emit(&diag, &state);
     }
 
-    fn annotate(&mut self, location: &Location, body: &[u8]) -> Option<Annotations> {
+    fn annotate(&self, location: &Location, body: &[u8]) -> Option<Annotations> {
         let Location::Backtrace(trace) = location else {
             return None;
         };
@@ -179,41 +189,19 @@ impl Interp {
         if frame.line != command.line || frame.name.as_deref() != Some(command.name.as_slice()) {
             return None;
         }
-        let path = to_native(&frame.file);
-        if !path.is_absolute() {
-            return None;
-        }
-        let limit = self
-            .engine
-            .annotation_bytes_left()
-            .min(self.config.limits.max_file_read)
-            .min(1024 * 1024);
-        if limit == 0 {
-            return None;
-        }
-        let bytes = self
-            .config
-            .host
-            .read(&path, ReadRange::All { limit })
-            .ok()?;
+        let source = self.sources.latest_file(&frame.file)?;
+        let bytes = &self.sources.get(source)?.text;
         let name_span = command.span.start..command.span.start.checked_add(command.name.len())?;
         if bytes.get(name_span.clone())? != command.name.as_slice() {
             return None;
         }
 
-        let suggestion = self.suggestion(body, command, &bytes, name_span.clone());
+        let suggestion = self.suggestion(body, command, bytes, name_span.clone());
         let selected = suggestion
             .as_ref()
             .map_or(name_span, |suggestions| suggestions.range.clone());
         let start = u32::try_from(selected.start).ok()?;
         let end = u32::try_from(selected.end).ok()?;
-        self.engine
-            .count_annotation_bytes(u64::try_from(bytes.len()).ok()?);
-        let source = self.sources.add(
-            BString::from(frame.file.as_ref()),
-            SourceKind::File,
-            Arc::from(bytes),
-        )?;
         let span = SourceSpan { source, start, end };
         let mut annotations = Annotations::primary(span, "");
         if let Some(suggestions) = suggestion {
@@ -378,16 +366,29 @@ impl SourceLookup for DiagnosticSources<'_> {
     }
 
     fn is_bundled_module(&self, path: &[u8]) -> bool {
-        !self.cmake_root.as_os_str().is_empty()
-            && to_native(path).starts_with(self.cmake_root.join("Modules"))
+        is_bundled_module(self.cmake_root, path)
     }
 }
 
+fn is_bundled_module(cmake_root: &Path, path: &[u8]) -> bool {
+    !cmake_root.as_os_str().is_empty() && to_native(path).starts_with(cmake_root.join("Modules"))
+}
+
 impl crate::Cx<'_> {
+    /// Return whether the active command comes from a bundled CMake module.
+    #[must_use]
+    pub fn is_bundled_module(&self) -> bool {
+        self.interp
+            .bt
+            .top()
+            .is_some_and(|frame| is_bundled_module(&self.interp.config.cmake_root, &frame.file))
+    }
+
     /// Return whether this session collects diagnostic annotations.
     #[must_use]
     pub fn collects_diagnostic_annotations(&self) -> bool {
         self.interp.config.services.collect_annotations
+            || self.interp.engine.rich_options().is_some()
     }
 
     /// Supply advice for a successful command that can still contain a typo.

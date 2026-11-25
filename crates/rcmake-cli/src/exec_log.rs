@@ -12,15 +12,17 @@ use rcmake_host::{
 };
 use rcmake_json::{Value, write_compact};
 
-use crate::{Tool, object};
+use crate::{Tool, object, persona::Persona};
 
 /// Records one completed invocation.
 pub(crate) struct ExecLogEntry<'a> {
     /// Original arguments, including the executable argument if available.
     /// Secret cache definitions are redacted and invalid UTF-8 is replaced.
     pub(crate) argv: &'a [BString],
-    /// Tool name recorded as `persona` by the PATH-swap checker.
-    pub(crate) persona: Tool,
+    /// Name of the selected tool.
+    pub(crate) tool: Tool,
+    /// Effective command-line persona.
+    pub(crate) persona: Persona,
     /// Working directory at startup.
     pub(crate) cwd: &'a Path,
     /// Process ID.
@@ -308,7 +310,14 @@ fn json_line(entry: &ExecLogEntry<'_>) -> BString {
                 .parent_pid
                 .map_or(Value::Null, |pid| Value::UInt(u64::from(pid))),
         ),
-        ("persona", Value::string(entry.persona.name())),
+        ("tool", Value::string(entry.tool.name())),
+        (
+            "persona",
+            Value::string(match entry.persona {
+                Persona::Compat => "compat",
+                Persona::Native => "native",
+            }),
+        ),
         ("pid", Value::UInt(u64::from(entry.pid))),
     ]));
     line.push(b'\n');
@@ -410,7 +419,8 @@ mod tests {
         let argv = ["/shim/cmake".into(), "-DAPI_KEY=secret".into()];
         let entry = ExecLogEntry {
             argv: &argv,
-            persona: Tool::Cmake,
+            tool: Tool::Cmake,
+            persona: Persona::Compat,
             cwd: root,
             pid: host.system().pid,
             parent_pid: Some(7),
@@ -442,7 +452,8 @@ mod tests {
         let first = host.read(&path, range)?;
         assert!(
             matches!(parse(&first, &ReadOptions::default()), Ok(Value::Object(fields))
-            if fields.get(b"persona".as_slice()) == Some(&Value::string("cmake")))
+            if fields.get(b"tool".as_slice()) == Some(&Value::string("cmake"))
+                && fields.get(b"persona".as_slice()) == Some(&Value::string("compat")))
         );
         assert!(!String::from_utf8_lossy(&first).contains("secret"));
         host.write(&path, b"{\"argv\":[", WriteMode::Append)?;

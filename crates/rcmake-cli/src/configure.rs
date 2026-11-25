@@ -14,7 +14,7 @@ use rcmake_model::{Cache, CacheType, GeneratorKind};
 
 use crate::options::{self, DirectoryArg, Options};
 use crate::persona::{
-    DiagStyle, Persona, oracle_mode, resolve_diag_style, resolve_rich_color, stick_diag_style,
+    DiagStyle, Persona, resolve_diag_style, resolve_rich_color, stick_diag_style,
 };
 use crate::profile::ProfilePhase;
 use crate::{cache, emit_cli_error, new_interp_with_paths, presets};
@@ -108,7 +108,6 @@ struct ConfigureSession<'a> {
     bin: PathBuf,
     preset: presets::Application,
     profiling: Profilers,
-    services: Services,
 }
 
 struct Configured {
@@ -129,9 +128,12 @@ fn configure_project(
         session.initialize(saved, cmake_command, cmake_root)?;
     let configure_start = session.host.monotonic();
     let time = session.host.now();
-    let mut preloads = session.apply_cache_edits(&mut interp);
+    let mut preloads = session.apply_cache_edits(&runtime, &mut interp);
     let mut results = std::mem::take(&mut preloads.results);
     let outcome = (|| {
+        if runtime.denied() {
+            return Err(Exit::Code(1));
+        }
         if session.opts.view {
             session.list_cache(&mut interp);
             return Ok(());
@@ -243,14 +245,13 @@ impl<'a> ConfigureSession<'a> {
                 bin,
                 preset,
                 profiling,
-                services: Services::default(),
             },
             saved,
         ))
     }
 
     fn initialize(
-        &mut self,
+        &self,
         saved: Cache,
         cmake_command: PathBuf,
         cmake_root: PathBuf,
@@ -307,12 +308,11 @@ impl<'a> ConfigureSession<'a> {
         };
         let (mut speed, persistent) = speed::settings(host, &self.opts, self.profiling.active());
         let style = resolve_diag_style(self.opts.persona, self.opts.extensions.diagnostics, host);
-        if self.opts.persona == Persona::Native && !oracle_mode(host) {
+        if self.opts.persona == Persona::Native {
             stick_diag_style(host, style);
         }
         if speed.incremental
-            && (style == DiagStyle::Rich
-                || saved.contains(b"CMAKE_TOOLCHAIN_FILE")
+            && (saved.contains(b"CMAKE_TOOLCHAIN_FILE")
                 || host.env_get(b"CMAKE_TOOLCHAIN_FILE").is_some()
                 || [&self.src, &self.bin]
                     .into_iter()
@@ -320,16 +320,17 @@ impl<'a> ConfigureSession<'a> {
         {
             speed.incremental = false;
         }
-        self.services = Services {
+        // Rich formatting annotates live diagnostics during emission. Replay keeps its
+        // normal eligibility checks for regions that issue diagnostics.
+        let services = Services {
             speed,
-            collect_annotations: style == DiagStyle::Rich,
             ..Services::default()
         };
         let runtime = ConfigureRuntime::new(
             Arc::clone(&self.host),
             &self.src,
             &self.bin,
-            &self.services,
+            &services,
             persistent,
         );
         let mut interp = new_interp_with_paths(
@@ -339,9 +340,9 @@ impl<'a> ConfigureSession<'a> {
             cmake_command,
             cmake_root,
             self.argv,
-            self.services.clone(),
+            services,
         );
-        self.prepare_presentation(&mut interp);
+        self.prepare_presentation(&mut interp, style);
         *interp.cx().cache() = saved;
         interp.cx().project().generator = generator_kind;
         interp.cx().project().generator_spec = generator_spec;
@@ -379,9 +380,9 @@ impl<'a> ConfigureSession<'a> {
         Ok((runtime, interp, has_cache))
     }
 
-    fn prepare_presentation(&self, interp: &mut Interp) {
+    fn prepare_presentation(&self, interp: &mut Interp, style: DiagStyle) {
         self.profiling.attach(interp);
-        if self.services.collect_annotations {
+        if style == DiagStyle::Rich {
             let host = self.host.as_ref();
             interp.set_rich_diagnostics(rcmake_diag::rich::RichOptions {
                 color: resolve_rich_color(host, host.is_terminal(Stream::Stderr), DiagStyle::Rich),

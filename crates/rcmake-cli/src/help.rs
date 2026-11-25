@@ -3,8 +3,8 @@ use rcmake_host::{Host, ReadRange, Stream, WriteMode, discover_cmake_root};
 
 use crate::{options, resolve_cli_path};
 
-const NATIVE_USAGE: &[u8] = include_bytes!("../help/usage.txt");
-const NATIVE_MARKER: &[u8] = b"\nRcmake extensions\n";
+const COMPAT_USAGE: &[u8] = include_bytes!("../help/usage.txt");
+const NATIVE_USAGE: &[u8] = include_bytes!("../help/native_usage.txt");
 
 const MISSING_MANUAL: &str =
     "is not an available manual.  Use --help-manual-list to see all available manuals.";
@@ -140,12 +140,11 @@ pub(crate) fn run(
     for (request, output) in requests {
         if matches!(request, Request::Usage) {
             separate(host, &mut stdout);
-            let (compat, native) = usage();
-            host.write_out(Stream::Stdout, compat);
+            host.write_out(Stream::Stdout, COMPAT_USAGE);
             options::print_help_generators(host);
             host.write_out(Stream::Stdout, b"\n");
-            if persona == crate::persona::Persona::Native && !crate::persona::oracle_mode(host) {
-                host.write_out(Stream::Stdout, native);
+            if persona == crate::persona::Persona::Native {
+                host.write_out(Stream::Stdout, NATIVE_USAGE);
             }
             continue;
         }
@@ -173,14 +172,6 @@ pub(crate) fn run(
         }
     }
     Some(status)
-}
-
-fn usage() -> (&'static [u8], &'static [u8]) {
-    let split = NATIVE_USAGE
-        .windows(NATIVE_MARKER.len())
-        .position(|bytes| bytes == NATIVE_MARKER)
-        .unwrap_or(NATIVE_USAGE.len());
-    NATIVE_USAGE.split_at(split)
 }
 
 fn separate(host: &dyn Host, seen: &mut bool) {
@@ -222,7 +213,7 @@ impl Request<'_> {
                 lookup(reference, &format!("{kind}-list"), "").ok_or_else(missing_help)
             }
             Self::Full => lookup(reference, "full", "").ok_or_else(missing_help),
-            Self::Usage => Ok(usage().0),
+            Self::Usage => Ok(COMPAT_USAGE),
         }
     }
 }

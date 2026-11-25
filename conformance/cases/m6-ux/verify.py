@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import queue
 import re
+import shutil
 import subprocess
 import tempfile
 import threading
@@ -40,22 +41,36 @@ def check_cli(native, oracle, source, root, env):
                               capture_output=True, check=check, timeout=30)
 
     run(native, *options, RCMAKE_EXEC_LOG=str(log))
-    version_records = []
+    aliases = {}
     for name in ("cmake", "ctest", "cpack"):
-        alias = native.with_name(name)
-        if not alias.exists():
-            alias.symlink_to(native.name)
+        alias = root / f"{name}{native.suffix}"
+        try:
+            alias.symlink_to(native.resolve())
+        except OSError:
+            if os.name != "nt":
+                raise
+            shutil.copy2(native, alias)
         run(alias, "--version", RCMAKE_EXEC_LOG=str(log))
-        version_records.append(name)
-    assert {entry["persona"] for entry in map(json.loads, log.read_text().splitlines())} == set(version_records)
+        aliases[name] = alias
+    records = [json.loads(line) for line in log.read_text().splitlines()]
+    assert [(entry["tool"], entry["persona"]) for entry in records] == [
+        ("cmake", "native"), *((name, "compat") for name in aliases)
+    ], records
     assert b"rcmake explain" in run(native, "--help").stdout
-    assert b"Rcmake extensions" not in run(native.with_name("cmake"), "--help").stdout
+    assert b"Rcmake extensions" not in run(aliases["cmake"], "--help").stdout
+
+    preload = root / "external-cache.cmake"
+    preload.write_text("message(FATAL_ERROR [[Do not evaluate this file]])\n", encoding="utf-8")
+    denied = run(native, "-S", source, "-B", root / "strict", "-G", "Ninja",
+                 "-C", preload, "--hermetic=strict", check=False)
+    assert denied.returncode == 1 and b"RCMAKE_HERMETIC_READ" in denied.stderr, denied
+    assert b"Do not evaluate this file" not in denied.stderr, denied
 
     script = root / "args.cmake"
     script.write_text('message("${CMAKE_ARGV3}|${CMAKE_ARGV4}|${CMAKE_ARGV5}")\n', encoding="utf-8")
     arguments = ["-P", script, "--", "--profile", "with spaces"]
     assert run(native, *arguments).stderr == run(oracle, *arguments).stderr
-    assert run(native.with_name("cmake"), *arguments).stderr == run(oracle, *arguments).stderr
+    assert run(aliases["cmake"], *arguments).stderr == run(oracle, *arguments).stderr
 
     explained_target = run(native, "explain", "Demo::component", "-B", done,
                            "--target", "--json", "--filter", "missing")
@@ -92,8 +107,58 @@ def check_cli(native, oracle, source, root, env):
     rich = run(native, *options, "--diagnostics=rich", check=False, CLICOLOR_FORCE="1")
     assert rich.returncode and b"\x1b[" in rich.stderr and b"Use `message`" in rich.stderr, rich
     compat = run(native, *options, "--diagnostics=rich", check=False, RCMAKE_ORACLE_MODE="1")
-    assert compat.returncode and b"CMake Error" in compat.stderr and b"\x1b[" not in compat.stderr, compat
+    assert compat.returncode == 1 and b"Unknown argument --diagnostics=rich" in compat.stderr, compat
     source.joinpath("CMakeLists.txt").write_text(PROJECT, encoding="utf-8")
+
+
+def check_replay(native, root, env):
+    source = root / "replay"
+    leaf = source / "leaf" / "CMakeLists.txt"
+    leaf.parent.mkdir(parents=True)
+    leaf.write_text("set(LEAF value)\n", encoding="utf-8")
+    source.joinpath("CMakeLists.txt").write_text(
+        "cmake_minimum_required(VERSION 4.5)\n"
+        "project(Replay LANGUAGES NONE)\n"
+        "add_subdirectory(leaf)\n"
+        "add_library(example INTERFACE)\n"
+        "set_property(TARGET example PROPERTY C_STANDARD 17)\n"
+        "get_target_property(query example CXX_STANDARD)\n"
+        "get_target_property(query example C_STANDRD)\n"
+        "message(WARNING [[Live warning]])\n",
+        encoding="utf-8",
+    )
+
+    for style in ("cmake", "rich"):
+        build = root / f"replay-{style}"
+        command = [native, "-S", source, "-B", build, "-G", "Ninja", f"--diagnostics={style}"]
+        measure_env = env | {"RCMAKE_MEASURE_REPLAY": "1"}
+        for _ in range(3):
+            result = subprocess.run(command, cwd=root, env=measure_env,
+                                    capture_output=True, check=True, timeout=30)
+        report = json.loads(build.joinpath("CMakeFiles/rcmake/replay-result.v1.json").read_bytes())
+        assert leaf.as_posix() in report["replayed"], report
+        assert b"Live warning" in result.stderr, result
+        if style == "rich":
+            assert b"message(WARNING [[Live warning]])" in result.stderr, result
+            assert b'Unknown target property "C_STANDRD"' in result.stderr, result
+            assert b'Unknown target property "CXX_STANDARD"' not in result.stderr, result
+
+
+def check_rich_source_reuse(native, root, env):
+    source = root / "rich-source"
+    source.mkdir()
+    warning = "message(WARNING [[Repeat warning]])"
+    warnings = 20
+    source.joinpath("CMakeLists.txt").write_text(
+        "cmake_minimum_required(VERSION 4.5)\nproject(Repeated LANGUAGES NONE)\n#"
+        + ("x" * 900_000) + "\n" + ((warning + "\n") * warnings),
+        encoding="utf-8",
+    )
+    command = [native, "-S", source, "-B", root / "rich-source-build",
+               "-G", "Ninja", "--diagnostics=rich"]
+    result = subprocess.run(command, cwd=root, env=env,
+                            capture_output=True, check=True, timeout=30)
+    assert result.stderr.count(warning.encode()) == warnings, result
 
 
 
@@ -180,8 +245,9 @@ def check_lsp(binary, source, env):
             open_doc(top, lists)
             assert "message" in json.dumps(query("hover", 3, 2))
             wait_for("from-disk")
+            assert "Value at end of directory" in hover()
             open_doc(settings, SETTINGS)
-            # The loop keeps a configure active while the previous snapshot is available.
+            # Request hover while a newer edit is pending.
             change(2, "foreach(item RANGE 250000)\nendforeach()\n" + SETTINGS.replace('"disk"', '"obsolete"'))
             stale = hover().lower()
             assert "provisional" in stale and "from-disk" in stale, stale
@@ -237,8 +303,11 @@ def main():
         source.joinpath("settings.cmake").write_text(SETTINGS, encoding="utf-8")
         check_cli(args.rcmake, args.oracle, source, root, env)
         print("PASS Native CLI, Explain, profiles, diagnostic modes, and execution logging.")
+        check_replay(args.rcmake, root, env)
+        check_rich_source_reuse(args.rcmake, root, env)
+        print("PASS Replay in both diagnostic formats, rich warnings, and source reuse.")
         check_lsp(args.lsp, source, env)
-        print("PASS LSP framing, evaluated hover and definition, stale results, cancellation on a new edit, diagnostics, quick fixes, and overlay isolation.")
+        print("PASS LSP framing, evaluated hover and definition, stale results, successive edits, diagnostics, quick fixes, and overlay isolation.")
 
 
 if __name__ == "__main__":

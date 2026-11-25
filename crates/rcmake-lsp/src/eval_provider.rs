@@ -13,6 +13,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     path::{Component, Path, PathBuf},
     sync::{Arc, Mutex},
+    time::Duration,
 };
 
 use rcmake_api::{
@@ -27,6 +28,7 @@ use rcmake_host::{
 
 use crate::{SemanticUpdate, analysis::Document, uri};
 
+const MAX_WALL_BUDGET: Duration = Duration::from_secs(5);
 const DEFAULT_STEP_BUDGET: u64 = 250_000;
 const MAX_TRACKED_FILES: usize = 4096;
 const MAX_TRACKED_BYTES: usize = 32 * 1024 * 1024;
@@ -321,6 +323,19 @@ impl SnapshotProvider {
     /// Return a preparation, evaluation, or cancellation error. Evaluation
     /// errors with configure diagnostics also publish a partial snapshot.
     pub fn refresh(&self) -> Result<RefreshStatus, ApiError> {
+        self.refresh_pending(true)
+    }
+
+    /// Evaluate one generation. Leave a newer edit pending for the worker's debounce.
+    ///
+    /// # Errors
+    ///
+    /// Return a preparation, evaluation, or cancellation error.
+    pub fn refresh_once(&self) -> Result<RefreshStatus, ApiError> {
+        self.refresh_pending(false)
+    }
+
+    fn refresh_pending(&self, drain_updates: bool) -> Result<RefreshStatus, ApiError> {
         let mut state = self.lock();
         if state.running.is_some() {
             state.draining = true;
@@ -338,7 +353,7 @@ impl SnapshotProvider {
             state = self.lock();
             state.running = None;
             if token.is_cancelled() {
-                if state.draining && state.dirty {
+                if drain_updates && state.draining && state.dirty {
                     continue;
                 }
                 return Err(ApiError::Cancelled);
@@ -406,6 +421,7 @@ impl SnapshotProvider {
             if !path.starts_with(buffer_path(self.request.host.as_ref(), &self.project_root)) {
                 return;
             }
+            // LSP document versions are signed 32-bit integers.
             Some(Arc::new(Buffer {
                 uri: uri.to_owned(),
                 path,
@@ -448,12 +464,20 @@ impl SnapshotProvider {
         }
         let mut services = self.request.services.clone();
         services.collect_annotations = true;
+        let mut limits = self.request.limits.clone();
+        limits.wall_budget = Some(
+            limits
+                .wall_budget
+                .unwrap_or(MAX_WALL_BUDGET)
+                .min(MAX_WALL_BUDGET),
+        );
         let request = self
             .request
             .clone()
             .process_policy(ProcessPolicy::Deny)
             .write_mode(WriteMode::Overlay)
             .collect_index(true)
+            .limits(limits)
             .services(services)
             .cancel(token.clone())
             .step_budget(

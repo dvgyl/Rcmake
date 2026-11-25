@@ -93,7 +93,11 @@ pub fn run(argv: &[BString], host: Arc<dyn Host>) -> i32 {
     let invoked = argv.first().map(|a| rcmake_host::path::to_native(a));
     let name = invoked.as_deref().map(Path::as_os_str).unwrap_or_default();
     let tool = tool_from_argv0(name);
-    let persona = persona::persona_from_argv0(name);
+    let persona = if persona::oracle_mode(host.as_ref()) {
+        persona::Persona::Compat
+    } else {
+        persona::persona_from_argv0(name)
+    };
     let Some(log) = host
         .env_get(b"RCMAKE_EXEC_LOG")
         .filter(|value| !value.is_empty())
@@ -107,7 +111,8 @@ pub fn run(argv: &[BString], host: Arc<dyn Host>) -> i32 {
         &log,
         &exec_log::ExecLogEntry {
             argv,
-            persona: tool,
+            tool,
+            persona,
             cwd: &host.initial_cwd(),
             pid: host.system().pid,
             parent_pid: None,
@@ -236,7 +241,6 @@ fn run_cmake(
     host: Arc<dyn Host>,
 ) -> i32 {
     if persona == persona::Persona::Native
-        && !persona::oracle_mode(host.as_ref())
         && let Some(args) = rest.strip_prefix(&[BString::from("explain")])
     {
         return explain_cmd::run(argv.first(), args, host);

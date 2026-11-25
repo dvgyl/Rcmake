@@ -2,6 +2,7 @@ use std::io;
 use std::process::ExitCode;
 use std::sync::{Arc, mpsc};
 use std::thread;
+use std::time::Duration;
 
 use rcmake_host::native::NativeHost;
 use rcmake_lsp::{
@@ -17,6 +18,8 @@ enum Event {
     EndOfInput,
     SnapshotReady,
 }
+
+const EDIT_DEBOUNCE: Duration = Duration::from_millis(250);
 
 struct Worker {
     provider: Arc<EvalSemanticProvider>,
@@ -35,7 +38,14 @@ impl Worker {
             .stack_size(32 * 1024 * 1024)
             .spawn(move || {
                 while work.recv().is_ok() {
-                    let result = evaluator.snapshots().refresh();
+                    loop {
+                        match work.recv_timeout(EDIT_DEBOUNCE) {
+                            Ok(()) => continue,
+                            Err(mpsc::RecvTimeoutError::Timeout) => break,
+                            Err(mpsc::RecvTimeoutError::Disconnected) => return,
+                        }
+                    }
+                    let result = evaluator.snapshots().refresh_once();
                     if matches!(
                         result,
                         Ok(RefreshStatus::Busy | RefreshStatus::UpToDate)

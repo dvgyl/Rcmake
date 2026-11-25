@@ -2,9 +2,9 @@ use rcmake_eval::IncludeOptions;
 
 use std::collections::BTreeSet;
 use std::path::Path;
-use std::sync::Arc;
 
 use rcmake_base::BString;
+use rcmake_commands::ConfigureRuntime;
 use rcmake_eval::{Interp, RunMode, Services};
 use rcmake_host::{FileKind, Follow, Host};
 use rcmake_json::Value;
@@ -27,7 +27,12 @@ pub(super) struct Preloads {
 }
 
 impl ConfigureSession<'_> {
-    pub(super) fn apply_cache_edits(&mut self, interp: &mut Interp) -> Preloads {
+    pub(super) fn apply_cache_edits(
+        &mut self,
+        runtime: &ConfigureRuntime,
+        interp: &mut Interp,
+    ) -> Preloads {
+        let evaluated = runtime.host();
         let host = self.host.as_ref();
         let mut preloads = Preloads::default();
         let mut configured_diagnostics = false;
@@ -51,9 +56,9 @@ impl ConfigureSession<'_> {
                         configured_diagnostics = true;
                     }
                     let path = host.initial_cwd().join(&script);
-                    if is_preload_file(host, &path) {
-                        self.run_preload(interp, &script, true, &mut preloads);
-                    } else {
+                    if is_preload_file(evaluated.as_ref(), &path) {
+                        self.run_preload(runtime, interp, &script, true, &mut preloads);
+                    } else if !runtime.denied() {
                         options::out(
                             host,
                             &format!("loading initial cache file {}\n", script.display()),
@@ -69,7 +74,7 @@ impl ConfigureSession<'_> {
                     }
                 }
             }
-            if preloads.fatal {
+            if preloads.fatal || runtime.denied() {
                 break;
             }
         }
@@ -80,12 +85,12 @@ impl ConfigureSession<'_> {
             options::out(host, &self.preset.log);
         }
         for (index, dir) in [&self.src, &self.bin].into_iter().enumerate() {
-            if index == 1 && self.src == self.bin {
+            if runtime.denied() || (index == 1 && self.src == self.bin) {
                 break;
             }
             let file = dir.join("PreLoad.cmake");
-            if is_file(host, &file) {
-                self.run_preload(interp, &file, false, &mut preloads);
+            if is_file(evaluated.as_ref(), &file) {
+                self.run_preload(runtime, interp, &file, false, &mut preloads);
             }
         }
         preloads
@@ -93,6 +98,7 @@ impl ConfigureSession<'_> {
 
     fn run_preload(
         &self,
+        runtime: &ConfigureRuntime,
         configure: &mut Interp,
         script: &Path,
         initial_cache: bool,
@@ -103,16 +109,17 @@ impl ConfigureSession<'_> {
         let mut interp = new_interp_with_paths(
             &self.opts,
             RunMode::Configure,
-            Arc::clone(&self.host),
+            runtime.host(),
             command,
             root.unwrap_or_default(),
             self.argv,
-            Services {
-                collect_annotations: self.services.collect_annotations,
-                ..Services::default()
-            },
+            Services::default(),
         );
-        self.prepare_presentation(&mut interp);
+        runtime.attach(&mut interp);
+        self.profiling.attach(&mut interp);
+        if let Some(options) = configure.diag_engine().rich_options() {
+            interp.set_rich_diagnostics(options);
+        }
         *interp.cx().diag_state_mut() = *configure.cx().diag_state();
         *interp.cx().cache() = std::mem::take(configure.cx().cache());
         set_directory_vars(&mut interp, &self.src, &self.bin);

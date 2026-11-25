@@ -27,7 +27,8 @@ use crate::{
 };
 
 use super::{
-    Buffers, EvalSemanticProvider, Snapshot, SnapshotReply, buffer_path, presentation::Binding,
+    Buffers, EvalSemanticProvider, Snapshot, SnapshotReply, buffer_path,
+    presentation::{Binding, ValueAt},
     read_file,
 };
 
@@ -279,10 +280,15 @@ impl EvalSemanticProvider {
                     (Kind::Callable, CompletionKind::Callable) => {
                         query.index.lookup_callable(name).map(Binding::Callable)
                     }
-                    (Kind::Variable(Variable::Normal), CompletionKind::Variable) => query
-                        .index
-                        .lookup_variable(*dir, name)
-                        .map(|var| Binding::variable(name, var)),
+                    (Kind::Variable(Variable::Normal), CompletionKind::Variable) => {
+                        query.index.lookup_variable(*dir, name).map(|var| {
+                            Binding::snapshot_variable(
+                                name,
+                                var,
+                                &query.snapshot.result.model.dir(*dir).source_dir,
+                            )
+                        })
+                    }
                     (Kind::Variable(Variable::Cache), CompletionKind::Variable) => {
                         query.cache(name)
                     }
@@ -520,7 +526,7 @@ impl<'a> Query<'a> {
                         Some(
                             definition
                                 .as_ref()
-                                .map(|value| Binding::variable(name, value)),
+                                .map(|value| Binding::variable(name, value, ValueAt::WriteSite)),
                         )
                     }
                     _ => None,
@@ -558,9 +564,13 @@ impl<'a> Query<'a> {
             Kind::Variable(Variable::Cache) => self.cache(name).into_iter().collect(),
             Kind::Variable(Variable::Normal) => dirs
                 .filter_map(|dir| {
-                    self.index
-                        .lookup_variable(dir, name)
-                        .map(|var| Binding::variable(name, var))
+                    self.index.lookup_variable(dir, name).map(|var| {
+                        Binding::snapshot_variable(
+                            name,
+                            var,
+                            &self.snapshot.result.model.dir(dir).source_dir,
+                        )
+                    })
                 })
                 .collect(),
             Kind::Variable(Variable::Environment) => Vec::new(),
@@ -575,6 +585,7 @@ impl<'a> Query<'a> {
             value: &entry.value,
             origin: result.facts.cache_sites.get(name),
             cached: true,
+            value_at: ValueAt::FinalCache,
         })
     }
 

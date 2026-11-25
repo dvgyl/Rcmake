@@ -670,3 +670,107 @@ include("${CMAKE_BINARY_DIR}/CMakeFiles/check.cmake")
         "{stderr}"
     );
 }
+
+#[test]
+fn help_shows_extensions_only_for_native_persona() {
+    for (name, native) in [("cmake", false), ("rcmake", true)] {
+        let host = Arc::new(PureHost::default());
+        assert_eq!(invoke(&host, &[name, "--help"]), 0);
+        let output = host.stream_bytes(Stream::Stdout);
+        let heading = b"Rcmake extensions";
+        assert_eq!(
+            output.windows(heading.len()).any(|line| line == heading),
+            native
+        );
+    }
+}
+
+#[test]
+fn oracle_mode_rejects_native_diagnostics_flag() {
+    let host = Arc::new(PureHost::default());
+    host.env_set(b"RCMAKE_ORACLE_MODE", Some(b"1"));
+    assert_eq!(
+        invoke(
+            &host,
+            &["rcmake", "--diagnostics=rich", "-S", ".", "-B", "out"]
+        ),
+        1
+    );
+    assert!(
+        host.stream_bytes(Stream::Stderr)
+            .to_string()
+            .contains("Unknown argument --diagnostics=rich")
+    );
+}
+
+#[test]
+fn native_profile_flag_obeys_script_argument_boundary() -> rcmake_host::HostResult<()> {
+    let root = Path::new(if cfg!(windows) { "C:/work" } else { "/work" });
+    let host = Arc::new(PureHost::new(root.into(), root.join("rcmake")));
+    host.seed_file(
+        &root.join("args.cmake"),
+        b"message(\"Script argument: ${CMAKE_ARGV3}\")\n",
+    )?;
+    assert_eq!(
+        invoke(&host, &["rcmake", "--profile", "-P", "args.cmake"]),
+        1
+    );
+    assert!(
+        host.stream_bytes(Stream::Stderr)
+            .to_string()
+            .contains("Unknown argument --profile")
+    );
+    assert_eq!(
+        invoke(&host, &["rcmake", "-P", "args.cmake", "--profile"]),
+        0
+    );
+    assert!(
+        host.stream_bytes(Stream::Stderr)
+            .to_string()
+            .contains("Script argument: --profile")
+    );
+    Ok(())
+}
+
+#[test]
+fn strict_hermetic_configure_exits_on_undeclared_read() -> rcmake_host::HostResult<()> {
+    let root = Path::new(if cfg!(windows) { "C:/work" } else { "/work" });
+    let host = Arc::new(PureHost::new(root.into(), root.join("rcmake")));
+    let data = root.join("cmake-data");
+    for (file, text) in [
+        ("CMakeDetermineSystem.cmake", ""),
+        ("CMakeSystemSpecificInitialize.cmake", ""),
+        ("CMakeSystemSpecificInformation.cmake", ""),
+        (
+            "CMakeNinjaFindMake.cmake",
+            "set(CMAKE_MAKE_PROGRAM ninja CACHE FILEPATH \"\")\n",
+        ),
+    ] {
+        host.seed_file(&data.join("Modules").join(file), text.as_bytes())?;
+    }
+    host.env_set(
+        b"RCMAKE_VENDORED_DATA_ROOT",
+        Some(data.to_string_lossy().as_bytes()),
+    );
+    host.seed_file(&root.join("CMakeLists.txt"), b"cmake_minimum_required(VERSION 4.5)\nproject(Audit NONE)\nif(DEFINED ENV{RCMAKE_TEST_UNDECLARED})\nendif()\n")?;
+    host.env_set(b"RCMAKE_TEST_UNDECLARED", Some(b"input"));
+    assert_eq!(
+        invoke(
+            &host,
+            &[
+                "rcmake",
+                "--hermetic=strict",
+                "-S",
+                ".",
+                "-B",
+                "out",
+                "-G",
+                "Ninja"
+            ]
+        ),
+        1
+    );
+    let output = host.stream_bytes(Stream::Stderr).to_string();
+    assert!(output.contains("RCMAKE_HERMETIC_ENV"), "{output}");
+    Ok(())
+}

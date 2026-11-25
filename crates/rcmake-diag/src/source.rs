@@ -1,6 +1,7 @@
 //! Source file registry and byte-offset-to-line/column mapping.
 
 use core::num::NonZeroU32;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use rcmake_base::BString;
@@ -58,6 +59,7 @@ impl SourceFile {
 #[derive(Default, Debug)]
 pub struct SourceMap {
     files: Vec<SourceFile>,
+    latest_files: BTreeMap<BString, SourceId>,
 }
 
 impl SourceMap {
@@ -71,6 +73,9 @@ impl SourceMap {
         }
         let next_idx = u32::try_from(self.files.len() + 1).ok()?;
         let id = SourceId(NonZeroU32::new(next_idx)?);
+        if kind == SourceKind::File {
+            self.latest_files.insert(path.clone(), id);
+        }
         self.files.push(SourceFile {
             path,
             kind,
@@ -78,6 +83,12 @@ impl SourceMap {
             line_starts,
         });
         Some(id)
+    }
+
+    /// Return the identifier of the most recently parsed file with this path.
+    #[must_use]
+    pub fn latest_file(&self, path: &[u8]) -> Option<SourceId> {
+        self.latest_files.get(path).copied()
     }
 
     /// Look up a source file by [`SourceId`].

@@ -246,6 +246,7 @@ fn env_cost(key: &[u8], value_len: usize) -> usize {
 
 pub(super) struct State<H: Host + ?Sized> {
     base: Arc<H>,
+    // The LSP creates a new overlay for each evaluation so it reads fresh base directory entries.
     base_names: Mutex<BaseNames>,
     pub(super) paths: BTreeMap<Key, Entry>,
     pub(super) overrides: BTreeMap<Inode, Override>,

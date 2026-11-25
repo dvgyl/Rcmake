@@ -129,6 +129,12 @@ fn diagnostic(line: usize, severity: usize, text: &str) -> Value {
     ])
 }
 
+pub(super) enum ValueAt<'a> {
+    WriteSite,
+    Directory(&'a [u8]),
+    FinalCache,
+}
+
 pub(super) enum Binding<'a> {
     Target(&'a TargetDefinition),
     Callable(&'a CallableDefinition),
@@ -137,17 +143,36 @@ pub(super) enum Binding<'a> {
         value: &'a [u8],
         origin: Option<&'a SourceLocation>,
         cached: bool,
+        value_at: ValueAt<'a>,
     },
 }
 
 impl<'a> Binding<'a> {
-    pub(super) fn variable(name: &'a [u8], value: &'a VariableDefinition) -> Self {
+    pub(super) fn variable(
+        name: &'a [u8],
+        value: &'a VariableDefinition,
+        value_at: ValueAt<'a>,
+    ) -> Self {
         Self::Variable {
             name,
             value: &value.value,
             origin: value.location.as_ref(),
             cached: value.cached,
+            value_at,
         }
+    }
+
+    pub(super) fn snapshot_variable(
+        name: &'a [u8],
+        value: &'a VariableDefinition,
+        directory: &'a [u8],
+    ) -> Self {
+        let value_at = if value.cached {
+            ValueAt::FinalCache
+        } else {
+            ValueAt::Directory(directory)
+        };
+        Self::variable(name, value, value_at)
     }
 
     pub(super) fn origin(&self) -> Option<&'a SourceLocation> {
@@ -248,6 +273,7 @@ impl<'a> Binding<'a> {
                 name,
                 value,
                 cached,
+                value_at,
                 ..
             } => {
                 let kind = if *cached {
@@ -255,8 +281,18 @@ impl<'a> Binding<'a> {
                 } else {
                     "Variable"
                 };
+                let label = match value_at {
+                    ValueAt::WriteSite => kind.to_owned(),
+                    ValueAt::Directory(dir) => {
+                        format!(
+                            "{kind}\n\nValue at end of directory {}",
+                            prose(&single_line(dir), markdown)
+                        )
+                    }
+                    ValueAt::FinalCache => "Cache value at end of evaluation".to_owned(),
+                };
                 format!(
-                    "{}\n\n{kind}",
+                    "{}\n\n{label}",
                     code(
                         &format!("{} = {}", single_line(name), preview(value, 1024)),
                         markdown

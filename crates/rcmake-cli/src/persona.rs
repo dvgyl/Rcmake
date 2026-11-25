@@ -46,9 +46,15 @@ impl DiagStyle {
     }
 }
 
-/// Select Native only if the executable name has the exact stem `rcmake`.
+/// Select Native for the stem `rcmake`. Ignore ASCII case on Windows.
 pub(crate) fn persona_from_argv0(argv0: &OsStr) -> Persona {
-    if Path::new(argv0).file_stem() == Some(OsStr::new("rcmake")) {
+    if Path::new(argv0).file_stem().is_some_and(|stem| {
+        if cfg!(windows) {
+            stem.eq_ignore_ascii_case("rcmake")
+        } else {
+            stem == "rcmake"
+        }
+    }) {
         Persona::Native
     } else {
         Persona::Compat
@@ -61,13 +67,13 @@ pub(crate) fn oracle_mode(host: &dyn Host) -> bool {
         .is_some_and(|value| value.as_slice() == b"1")
 }
 
-/// Select the style from oracle mode, a Native flag, the environment, or the terminal.
+/// Select the style for the effective persona.
 pub(crate) fn resolve_diag_style(
     persona: Persona,
     cli_override: Option<DiagStyle>,
     host: &dyn Host,
 ) -> DiagStyle {
-    if persona == Persona::Compat || oracle_mode(host) {
+    if persona == Persona::Compat {
         return DiagStyle::Cmake;
     }
     if let Some(style) = cli_override {
@@ -83,10 +89,9 @@ pub(crate) fn resolve_diag_style(
 }
 
 /// Select ANSI color for rich diagnostics on standard error.
-/// Oracle mode disables color. `CLICOLOR_FORCE=1` takes precedence over `NO_COLOR`.
+/// `CLICOLOR_FORCE=1` takes precedence over `NO_COLOR`.
 pub(crate) fn resolve_rich_color(host: &dyn Host, stderr_is_tty: bool, style: DiagStyle) -> bool {
     style == DiagStyle::Rich
-        && !oracle_mode(host)
         && (host
             .env_get(b"CLICOLOR_FORCE")
             .is_some_and(|value| value.as_slice() == b"1")
@@ -114,17 +119,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn only_exact_rcmake_stem_uses_native() {
+    fn native_stem_obeys_platform_case_rules() {
         for name in ["rcmake", "/shim/rcmake", "rcmake.exe"] {
             assert_eq!(persona_from_argv0(OsStr::new(name)), Persona::Native);
         }
-        for name in ["", "cmake", "cpack", "ctest", "Rcmake.exe", "rcmake-debug"] {
+        for name in ["", "cmake", "cpack", "ctest", "rcmake-debug"] {
             assert_eq!(persona_from_argv0(OsStr::new(name)), Persona::Compat);
         }
+        let mixed_case = if cfg!(windows) {
+            Persona::Native
+        } else {
+            Persona::Compat
+        };
+        assert_eq!(persona_from_argv0(OsStr::new("Rcmake.exe")), mixed_case);
     }
 
     #[test]
-    fn style_obeys_oracle_flag_environment_and_terminal_precedence() {
+    fn style_obeys_persona_flag_environment_and_terminal_precedence() {
         let host = PureHost::default();
         let resolve = |persona, cli| resolve_diag_style(persona, cli, &host);
         assert_eq!(resolve(Persona::Native, None), DiagStyle::Cmake);
@@ -140,13 +151,6 @@ mod tests {
             resolve(Persona::Native, Some(DiagStyle::Cmake)),
             DiagStyle::Cmake
         );
-        host.env_set(b"RCMAKE_ORACLE_MODE", Some(b"1"));
-        assert_eq!(
-            resolve(Persona::Native, Some(DiagStyle::Rich)),
-            DiagStyle::Cmake
-        );
-
-        host.env_set(b"RCMAKE_ORACLE_MODE", Some(b"0"));
         host.env_set(b"RCMAKE_DIAGNOSTICS", Some(b"RICH"));
         assert_eq!(resolve(Persona::Native, None), DiagStyle::Cmake);
         for style in [DiagStyle::Cmake, DiagStyle::Rich] {
@@ -155,7 +159,7 @@ mod tests {
     }
 
     #[test]
-    fn rich_color_obeys_oracle_force_and_terminal_precedence() {
+    fn rich_color_obeys_force_and_terminal_precedence() {
         let host = PureHost::default();
         let color = |tty, style| resolve_rich_color(&host, tty, style);
         assert!(!color(false, DiagStyle::Rich));
@@ -168,9 +172,6 @@ mod tests {
         host.env_set(b"CLICOLOR_FORCE", Some(b"1"));
         assert!(color(false, DiagStyle::Rich));
         assert!(!color(true, DiagStyle::Cmake));
-
-        host.env_set(b"RCMAKE_ORACLE_MODE", Some(b"1"));
-        assert!(!color(true, DiagStyle::Rich));
     }
 
     #[test]
@@ -181,10 +182,5 @@ mod tests {
             resolve_diag_style(Persona::Native, None, &host),
             DiagStyle::Rich
         );
-
-        host.env_set(b"RCMAKE_ORACLE_MODE", Some(b"1"));
-        let style = resolve_diag_style(Persona::Native, Some(DiagStyle::Rich), &host);
-        stick_diag_style(&host, style);
-        assert_eq!(host.env_get(b"RCMAKE_DIAGNOSTICS"), Some("cmake".into()));
     }
 }

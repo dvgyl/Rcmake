@@ -119,6 +119,12 @@ impl Properties {
 }
 
 impl UsageResolver<'_> {
+    /// Return whether CMake documents this name as a built-in target property.
+    #[must_use]
+    pub fn is_builtin_target_property(name: &[u8]) -> bool {
+        builtin::contains(name)
+    }
+
     pub(super) fn scalar_property(
         &mut self,
         id: TargetId,

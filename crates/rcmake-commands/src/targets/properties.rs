@@ -181,6 +181,8 @@ pub(super) fn get(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
     };
     if value.is_none()
         && cx.collects_diagnostic_annotations()
+        && !cx.is_bundled_module()
+        && !UsageResolver::is_builtin_target_property(property)
         && let Some((candidate, _)) = cx.project().suggest_target_property(binding.id(), property)
     {
         cx.advise(
