@@ -623,6 +623,7 @@ pub(crate) fn warn_depfile_policy(model: &ProjectModel, host: &dyn rcmake_host::
         let frames: Vec<_> = command
             .backtrace
             .frames()
+            .filter(|frame| frame.line != 0 || frame.name.is_some())
             .take_while(|frame| {
                 !frame
                     .name
