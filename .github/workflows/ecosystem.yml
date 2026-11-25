@@ -148,7 +148,10 @@ jobs:
               if ref_sha != sha:
                   raise SystemExit("::error::The selected ref moved before CI published the binary.")
               previous = {run["id"] for run in initial}
-              dispatched = dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
+              dispatched = (
+                  dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
+                  - dt.timedelta(seconds=60)
+              )
               # A dispatch can succeed even if the client loses the response.
               # Do not retry the POST. The next run can detect an existing run.
               response = api(f"{workflow}/dispatches", "-f", f"ref={ref}", method="POST", attempts=1)

@@ -124,7 +124,11 @@ impl LockEntry {
                     || matches!(path.as_bytes(), [letter, b':', b'/' | b'\\', ..] if letter.is_ascii_alphabetic())
                     || rooted_unc(path)
             }
-            "file" => matches!(host, "" | "localhost"),
+            "file" => {
+                matches!(host, "" | "localhost")
+                    || (matches!(host.as_bytes(), [letter, b':'] if letter.is_ascii_alphabetic())
+                        && path.starts_with('/'))
+            }
             "ssh" => valid_host(&percent_decode(ssh_host(host))),
             "http" | "https" | "ftp" | "ftps" | "git" => valid_host(&percent_decode(host)),
             _ => false,
@@ -836,7 +840,11 @@ mod tests {
             "https://gitlab.gnome.org/GNOME/libsecret.git".into(),
             format!("https://codeload.github.com/fmtlib/fmt/tar.gz/{COMMIT}"),
             "https://example.invalid/release/jdk-17.0.16%2B8".into(),
+            "file://C:/fetch-test/origin/payload".into(),
         ];
+        assert!(!LockEntry::is_portable_source(
+            "file://evil.example/payload"
+        ));
         let entry = LockEntry::Url(UrlEntry::from_bytes(public, b"archive"));
         lock.insert("public", entry)?;
         assert_eq!(LockFile::parse(&lock.to_json()?)?, lock);
