@@ -237,35 +237,160 @@ pub(super) fn pure_flag(value: &[u8]) -> bool {
             | b"-Og"
             | b"-O"
             | b"-pthread"
-            | b"-fPIC"
-            | b"-fPIE"
-            | b"-fcolor-diagnostics"
-            | b"-fno-color-diagnostics"
-            | b"-fdiagnostics-color"
-            | b"-fdiagnostics-color=always"
-            | b"-fdiagnostics-color=never"
-            | b"-fexceptions"
-            | b"-fno-exceptions"
-            | b"-frtti"
-            | b"-fno-rtti"
-            | b"-fvisibility=hidden"
-            | b"-fvisibility-inlines-hidden"
-            | b"-fno-common"
-            | b"-fcommon"
             | b"-pedantic"
             | b"-pedantic-errors"
             | b"-pipe"
-            | b"-fno-omit-frame-pointer"
-            | b"-m64"
-            | b"-m32"
             | b"-stdlib=libc++"
             | b"-stdlib=libstdc++"
-    ) || value.strip_prefix(b"-std=").is_some_and(|name| {
-        !name.is_empty()
-            && name
-                .iter()
-                .all(|byte| byte.is_ascii_alphanumeric() || b"+-".contains(byte))
-    })
+    ) || codegen_flag(value)
+        || value.strip_prefix(b"-std=").is_some_and(|name| {
+            !name.is_empty()
+                && name
+                    .iter()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b"+-".contains(byte))
+        })
+}
+
+/// Accept code generation options with no external inputs or outputs.
+fn codegen_flag(flag: &[u8]) -> bool {
+    if matches!(flag, b"-fPIC" | b"-fPIE" | b"-fno-PIC" | b"-fno-PIE") {
+        return true;
+    }
+    let Some(body) = flag
+        .strip_prefix(b"-f")
+        .or_else(|| flag.strip_prefix(b"-m"))
+    else {
+        return false;
+    };
+    let body = body.strip_prefix(b"no-").unwrap_or(body);
+    let mut parts = body.splitn(2, |&byte| byte == b'=');
+    let name = parts.next().unwrap_or_default();
+    let codegen_byte =
+        |byte: &u8| byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"+_.-".contains(byte);
+    if !name
+        .first()
+        .is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+        || !name.iter().all(codegen_byte)
+        || parts.next().is_some_and(|value| {
+            value.is_empty()
+                || value
+                    .split(|&byte| byte == b'+')
+                    .any(|part| part == b"native")
+                || !value.iter().all(codegen_byte)
+        })
+    {
+        return false;
+    }
+
+    // These options can forward arguments, select other tools, read extra
+    // files or CPU settings, or write files outside the normal outputs.
+    const DENIED_PREFIXES: &[&[u8]] = &[
+        b"auto-profile",
+        b"build-session",
+        b"cas",
+        b"config",
+        b"coverage",
+        b"crash-diagnostics",
+        b"debug",
+        b"dependency",
+        b"diagnostics-",
+        b"dump",
+        b"embed-bitcode",
+        b"external-",
+        b"file-compilation-dir",
+        b"file-prefix-map",
+        b"implicit-module",
+        b"inventory",
+        b"lto",
+        b"load",
+        b"macro-prefix-map",
+        b"module",
+        b"objc",
+        b"offload",
+        b"openacc",
+        b"openmp",
+        b"opt-info",
+        b"pass-plugin",
+        b"pch",
+        b"plugin",
+        b"prebuilt-module",
+        b"profile",
+        b"record",
+        b"rtlib",
+        b"sanitize",
+        b"save-",
+        b"split-dwarf",
+        b"suite",
+        b"system-",
+        b"thinlto",
+        b"unwindlib",
+        b"use-ld",
+        b"xray",
+    ];
+    !matches!(
+        name,
+        b"integrated-as"
+            | b"integrated-cc1"
+            | b"ld-path"
+            | b"linker"
+            | b"driver-mode"
+            | b"llvm"
+            | b"mlir"
+            | b"read-main-file-name"
+            | b"object-file-name"
+            | b"codegen-data-generate"
+            | b"codegen-data-use"
+            | b"deps-format"
+    ) && (!DENIED_PREFIXES
+        .iter()
+        .any(|prefix| name.starts_with(prefix))
+        || matches!(name, b"diagnostics-color"))
+}
+
+#[cfg(test)]
+mod codegen_tests {
+    use super::pure_flag;
+
+    #[test]
+    fn codegen_grammar_rejects_external_effects() {
+        for flag in [
+            "-fstrict-aliasing",
+            "-fno-strict-aliasing",
+            "-fvisibility=hidden",
+            "-ffunction-sections",
+            "-fno-omit-frame-pointer",
+            "-mavx2",
+            "-march=armv8.2-a",
+            "-fmacro-backtrace-limit=0",
+        ] {
+            assert!(pure_flag(flag.as_bytes()), "{flag}");
+        }
+        for flag in [
+            "-fplugin=/x.so",
+            "-fno-plugin=relative",
+            "-fuse-ld=lld",
+            "-Xclang",
+            "-march=native+sve",
+            "-mcpu=native",
+            "-fprofile-use",
+            "-fauto-profile",
+            "-fsanitize-ignorelist=x",
+            "-fmodules-cache-path=x",
+            "-fmodule-map-file=x",
+            "-fbuild-session-file=x",
+            "-flto=thin",
+            "@rsp",
+            "-fdebug-prefix-map=a=b",
+            "-mllvm",
+            "-fcas-path=cas",
+            "-fopt-info=out",
+            "-fprofile-arcs",
+            "-fsanitize=address",
+            "-fcodegen-data-use=data",
+        ] {
+            assert!(!pure_flag(flag.as_bytes()), "{flag}");
+        }
+    }
 }
 
 pub(super) fn attached_search(value: &[u8]) -> Option<(&'static [u8], &[u8])> {
