@@ -5,6 +5,11 @@ fn work() -> &'static Path {
     Path::new(if cfg!(windows) { "C:/work" } else { "/work" })
 }
 
+/// A file under [`work`] with `/` separators only, as the dependency trace records it.
+fn work_file(name: &str) -> std::path::PathBuf {
+    std::path::PathBuf::from(format!("{}/{name}", work().display()))
+}
+
 #[test]
 fn limits_total_jobs_and_uses_explicit_settings_first() {
     let host = PureHost::default();
@@ -52,7 +57,7 @@ impl ProcessVerifier for TestCompiler {
     ) -> Option<super::super::try_compile::journal::DependencyClosure> {
         use super::super::try_compile::journal::DependencyClosure;
         Some(DependencyClosure {
-            files: [work().join("header.h")].into(),
+            files: [work_file("header.h")].into(),
             searches: Vec::new(),
         })
     }
@@ -69,8 +74,8 @@ fn owns_the_request_and_recovers_after_a_worker_panics() -> HostResult<()> {
     let host = PureHost::default();
     let root = work().join("spec");
     host.create_dir_all(&root)?;
-    host.seed_file(&work().join("header.h"), b"header")?;
-    host.seed_file(&work().join("compiler"), b"compiler")?;
+    host.seed_file(&work_file("header.h"), b"header")?;
+    host.seed_file(&work_file("compiler"), b"compiler")?;
     host.sleep(Duration::from_secs(3));
     host.env_set(b"LANG", Some(b"C"));
     let environment = host.env_all();

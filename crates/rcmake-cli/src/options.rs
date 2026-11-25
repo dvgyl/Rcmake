@@ -60,6 +60,7 @@ pub(crate) struct Options {
     pub profile_output: Option<PathBuf>,
     pub graphviz: Option<PathBuf>,
     pub trace: Option<TraceConfig>,
+    pub project_file: Option<BString>,
 }
 
 #[derive(Default)]
@@ -113,6 +114,7 @@ const LONG_OPTIONS: &[&[u8]] = &[
     b"--profiling-format",
     b"--profiling-output",
     b"--print-config-dir",
+    b"--project-file",
 ];
 
 pub(crate) fn parse(args: &[BString], persona: Persona, host: &dyn Host) -> ParseResult {
@@ -285,6 +287,13 @@ fn parse_project(
                 ));
             }
             b"-S" | b"-H" | b"-B" => parse_directory(arg, opts, host)?,
+            b"--project-file" => {
+                let name = arg.required("No filename specified for --project-file")?;
+                if opts.project_file.is_some() {
+                    return Err("Multiple --project-file options not allowed".into());
+                }
+                opts.project_file = Some(name.into());
+            }
             b"-P" => {
                 let Some(script) = arg.value() else {
                     crate::emit_cli_error(host, "No script specified for argument -P");

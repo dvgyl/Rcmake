@@ -32,7 +32,103 @@ pub struct FindEvent<'a> {
     pub found: Option<&'a [u8]>,
 }
 
+/// Fields recorded for a `try_compile()` or `try_run()` call.
+pub struct TryCompileEvent<'a> {
+    /// `try_compile-v1` or `try_run-v1`.
+    pub kind: &'a str,
+    /// `LOG_DESCRIPTION` text.
+    pub description: Option<&'a [u8]>,
+    /// Source directory of the test project.
+    pub source_dir: &'a [u8],
+    /// Binary directory of the test project.
+    pub binary_dir: &'a [u8],
+    /// Variables that the call passes to the test project, sorted by name.
+    pub variables: &'a [(BString, BString)],
+    /// Build result of the test project.
+    pub build: TryBuildOutcome<'a>,
+    /// Run result of a `try_run()` call whose build succeeded or failed.
+    pub run: Option<TryRunOutcome<'a>>,
+}
+
+/// Result variable, cache flag, captured output, and exit code of one step.
+pub struct TryBuildOutcome<'a> {
+    /// Result variable name.
+    pub variable: &'a [u8],
+    /// `true` when the result is stored in the cache.
+    pub cached: bool,
+    /// Captured build output.
+    pub stdout: &'a [u8],
+    /// Build tool exit code.
+    pub exit_code: i32,
+}
+
+/// Run step of a `try_run()` event.
+pub struct TryRunOutcome<'a> {
+    /// Result variable name.
+    pub variable: &'a [u8],
+    /// `true` when the result is stored in the cache.
+    pub cached: bool,
+    /// Standard output, or the merged output.
+    pub stdout: Option<&'a [u8]>,
+    /// Standard error when it is captured separately.
+    pub stderr: Option<&'a [u8]>,
+    /// Exit code text. It is absent when the test executable did not run.
+    pub exit_code: Option<&'a [u8]>,
+}
+
 impl Cx<'_> {
+    /// Add a `try_compile-v1` or `try_run-v1` event to the configure log.
+    pub fn log_configure_try_compile(&mut self, event: TryCompileEvent<'_>) {
+        if self.mode() != RunMode::Configure {
+            return;
+        }
+        self.interp.start_configure_event(event.kind.as_bytes());
+        self.interp.write_configure_checks();
+        let out = &mut self.interp.configure_log;
+        if let Some(description) = event.description {
+            yaml_value(out, b"    description", description);
+        }
+        out.extend_from_slice(b"    directories:\n");
+        yaml_value(out, b"      source", event.source_dir);
+        yaml_value(out, b"      binary", event.binary_dir);
+        if !event.variables.is_empty() {
+            out.extend_from_slice(b"    cmakeVariables:\n");
+            for (name, value) in event.variables {
+                let mut key = b"      ".to_vec();
+                if name
+                    .iter()
+                    .all(|&byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+                {
+                    key.extend_from_slice(name);
+                } else {
+                    json_string(&mut key, name);
+                }
+                yaml_value(out, &key, value);
+            }
+        }
+        out.extend_from_slice(b"    buildResult:\n");
+        yaml_value(out, b"      variable", event.build.variable);
+        yaml_bool(out, b"      cached", event.build.cached);
+        yaml_block(out, b"      stdout", event.build.stdout);
+        out.extend_from_slice(format!("      exitCode: {}\n", event.build.exit_code).as_bytes());
+        if let Some(run) = event.run {
+            out.extend_from_slice(b"    runResult:\n");
+            yaml_value(out, b"      variable", run.variable);
+            yaml_bool(out, b"      cached", run.cached);
+            if let Some(stdout) = run.stdout {
+                yaml_block(out, b"      stdout", stdout);
+            }
+            if let Some(stderr) = run.stderr {
+                yaml_block(out, b"      stderr", stderr);
+            }
+            if let Some(code) = run.exit_code {
+                out.extend_from_slice(b"      exitCode: ");
+                out.extend_from_slice(code);
+                out.push(b'\n');
+            }
+        }
+    }
+
     /// Add a find event to the configure log.
     pub fn log_configure_find(&mut self, event: FindEvent<'_>) {
         if self.mode() != RunMode::Configure {
@@ -84,13 +180,8 @@ impl Interp {
             return;
         }
         self.start_configure_event(b"message-v1");
+        self.write_configure_checks();
         let out = &mut self.configure_log;
-        if !self.checks.is_empty() {
-            out.extend_from_slice(b"    checks:\n");
-            for check in self.checks.iter().rev() {
-                yaml_item(out, check);
-            }
-        }
         out.extend_from_slice(b"    message: |\n");
         let message = message.strip_suffix(b"\n").unwrap_or(message);
         if !message.is_empty() {
@@ -98,6 +189,16 @@ impl Interp {
                 out.extend_from_slice(b"      ");
                 out.extend_from_slice(line);
                 out.push(b'\n');
+            }
+        }
+    }
+
+    /// Active `message(CHECK_START)` checks, innermost first.
+    fn write_configure_checks(&mut self) {
+        if !self.checks.is_empty() {
+            self.configure_log.extend_from_slice(b"    checks:\n");
+            for check in self.checks.iter().rev() {
+                yaml_item(&mut self.configure_log, check);
             }
         }
     }
@@ -173,5 +274,34 @@ fn yaml_list(out: &mut Vec<u8>, name: &[u8], values: &[BString]) {
         for value in values {
             yaml_item(out, value);
         }
+    }
+}
+
+fn yaml_bool(out: &mut Vec<u8>, key: &[u8], value: bool) {
+    out.extend_from_slice(key);
+    out.extend_from_slice(if value { b": true\n" } else { b": false\n" });
+}
+
+/// Literal block scalar (`key: |`). Backslashes and control characters other than tab
+/// are escaped.
+fn yaml_block(out: &mut Vec<u8>, key: &[u8], text: &[u8]) {
+    out.extend_from_slice(key);
+    out.extend_from_slice(b": |\n");
+    let text = text.strip_suffix(b"\n").unwrap_or(text);
+    if text.is_empty() {
+        return;
+    }
+    for line in text.split(|&byte| byte == b'\n') {
+        out.extend_from_slice(b"        ");
+        for &byte in line.strip_suffix(b"\r").unwrap_or(line) {
+            if byte == b'\\' {
+                out.extend_from_slice(b"\\\\");
+            } else if byte < b' ' && byte != b'\t' {
+                out.extend_from_slice(format!("\\x{byte:02x}").as_bytes());
+            } else {
+                out.push(byte);
+            }
+        }
+        out.push(b'\n');
     }
 }

@@ -20,7 +20,7 @@ pub(super) fn write_project(
     directory: &Path,
     target: &str,
     run: bool,
-) -> Result<(), CmdError> {
+) -> Result<Vec<BString>, CmdError> {
     let target_type = cx.var_or_empty(b"CMAKE_TRY_COMPILE_TARGET_TYPE");
     let archive = match (run, target_type.as_slice()) {
         (true, _) | (_, b"" | b"EXECUTABLE") => false,
@@ -111,7 +111,9 @@ pub(super) fn write_project(
     }
 
     let compile_flags = compile_flags(cx, options);
+    super::seed::warn_ignored_standards(cx, options, &languages);
     let properties = language_properties(cx, options, &languages);
+    let probe_languages = languages.iter().map(|&lang| BString::from(lang)).collect();
     let code = render_project(
         ProjectInputs {
             archive,
@@ -119,7 +121,7 @@ pub(super) fn write_project(
             languages,
             compile_flags,
             language,
-            extensions_policy: cx.policy(PolicyId::new(128)),
+            policies: outer_policies(cx),
             properties: &properties,
         },
         options,
@@ -172,7 +174,7 @@ pub(super) fn write_project(
         cx.set_fatal();
         return Err(error);
     }
-    Ok(())
+    Ok(probe_languages)
 }
 
 fn compile_flags(cx: &mut Cx<'_>, options: &Options<'_>) -> Vec<BString> {
@@ -197,7 +199,7 @@ pub(super) fn render_literal_probe(cx: &mut Cx<'_>, file: &Path, target: &str) -
             languages,
             compile_flags: Vec::new(),
             language: None,
-            extensions_policy: cx.policy(PolicyId::new(128)),
+            policies: outer_policies(cx),
             properties: &properties,
         },
         &options,
@@ -235,13 +237,20 @@ fn source_copy_error(cx: &mut Cx<'_>, file: &[u8], error: &rcmake_host::HostErro
     )
 }
 
+/// Policies that the test project takes from the calling project. They can affect the
+/// toolchain file (`CMP0126`), language extensions (`CMP0128`), and the linker flags
+/// (`CMP0181`, `CMP0210`).
+fn outer_policies(cx: &mut Cx<'_>) -> [(u16, PolicyStatus); 4] {
+    [126, 128, 181, 210].map(|id| (id, cx.policy(PolicyId::new(id))))
+}
+
 struct ProjectInputs<'a> {
     archive: bool,
     files: Vec<BString>,
     languages: Vec<&'a [u8]>,
     compile_flags: Vec<BString>,
     language: Option<&'a [u8]>,
-    extensions_policy: PolicyStatus,
+    policies: [(u16, PolicyStatus); 4],
     properties: &'a [(BString, BString)],
 }
 
@@ -252,12 +261,14 @@ fn render_project(inputs: ProjectInputs<'_>, options: &Options<'_>, target: &str
         languages,
         compile_flags,
         language,
-        extensions_policy,
+        policies,
         properties,
     } = inputs;
     let mut code = BString::from("cmake_minimum_required(VERSION 4.5)\n");
-    if extensions_policy != PolicyStatus::New {
-        code.extend_from_slice(b"cmake_policy(SET CMP0128 OLD)\n");
+    for (id, status) in policies {
+        if status != PolicyStatus::New {
+            code.extend_from_slice(format!("cmake_policy(SET CMP{id:04} OLD)\n").as_bytes());
+        }
     }
     code.extend_from_slice(b"project(CMAKE_TRY_COMPILE LANGUAGES");
     for &lang in &languages {

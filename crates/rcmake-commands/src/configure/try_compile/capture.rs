@@ -14,6 +14,9 @@ use super::TIMEOUT;
 pub(super) struct CapturingHost {
     parent: Arc<dyn Host>,
     output: Mutex<BString>,
+    /// Messages that the test project configure wrote to standard error. CMake shows
+    /// them in the calling project's output.
+    diagnostics: Mutex<BString>,
     pub(super) trace_output: OnceLock<Option<PathBuf>>,
     system: SystemInfo,
     cwd: PathBuf,
@@ -25,6 +28,7 @@ impl CapturingHost {
             system,
             parent,
             output: Mutex::default(),
+            diagnostics: Mutex::default(),
             trace_output: OnceLock::new(),
             cwd: cwd.to_owned(),
         })
@@ -35,21 +39,32 @@ impl CapturingHost {
         Self::new(parent, cwd, system)
     }
 
+    /// Run `configure` and return its result, all captured output, and the messages
+    /// that the test project wrote to standard error.
     pub(super) fn capture<T>(
         parent: Arc<dyn Host>,
         cwd: &Path,
         configure: impl FnOnce(Arc<Self>) -> T,
-    ) -> (T, BString) {
+    ) -> (T, BString, BString) {
         let system = parent.system();
         let host = Self::new(parent, cwd, system);
         let outcome = configure(Arc::clone(&host));
-        let output = std::mem::take(
-            &mut *host
-                .output
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
-        );
-        (outcome, output)
+        let take = |buffer: &Mutex<BString>| {
+            std::mem::take(
+                &mut *buffer
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            )
+        };
+        (outcome, take(&host.output), take(&host.diagnostics))
+    }
+
+    /// Keep process output for the test result only.
+    fn capture_process_output(&self, bytes: &[u8]) {
+        self.output
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .extend_from_slice(bytes);
     }
 
     fn run_captured(
@@ -61,7 +76,7 @@ impl CapturingHost {
         let (request, stdout, stderr) = capture_request(request);
         let mut output = run(&request, &mut |stream, bytes| {
             if (stream == Stream::Stdout && stdout) || (stream == Stream::Stderr && stderr) {
-                self.write_out(stream, bytes);
+                self.capture_process_output(bytes);
             } else {
                 on_output(stream, bytes);
             }
@@ -178,19 +193,22 @@ impl Host for CapturingHost {
         req.tee = false;
         let mut result = self.parent.run_bounded(&req, limit)?;
         if stdout {
-            self.write_out(Stream::Stdout, &std::mem::take(&mut result.stdout));
+            self.capture_process_output(&std::mem::take(&mut result.stdout));
         }
         if stderr {
-            self.write_out(Stream::Stderr, &std::mem::take(&mut result.stderr));
+            self.capture_process_output(&std::mem::take(&mut result.stderr));
         }
         Ok(result)
     }
 
-    fn write_out(&self, _stream: Stream, bytes: &[u8]) {
-        self.output
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .extend_from_slice(bytes);
+    fn write_out(&self, stream: Stream, bytes: &[u8]) {
+        if stream == Stream::Stderr {
+            self.diagnostics
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .extend_from_slice(bytes);
+        }
+        self.capture_process_output(bytes);
     }
 
     forward_host!(read_stdin(limit: u64) -> HostResult<Vec<u8>>);

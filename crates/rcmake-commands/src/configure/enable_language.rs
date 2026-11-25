@@ -33,6 +33,8 @@ const ENABLED_LANGUAGES: &[u8] = b"ENABLED_LANGUAGES";
 const IN_TRY_COMPILE: &[u8] = b"IN_TRY_COMPILE";
 const PLATFORM_INFO_DIR: &[u8] = b"CMAKE_PLATFORM_INFO_DIR";
 const PLATFORM_INFO_INITIALIZED: &[u8] = b"CMAKE_PLATFORM_INFO_INITIALIZED";
+/// Private global property with the languages that an active bootstrap enables.
+const LANGUAGES_IN_PROGRESS: &[u8] = b"\0RCMAKE_LANGUAGES_IN_PROGRESS";
 
 /// `enable_language(<lang>... [OPTIONAL])`.
 pub(super) fn enable_language(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
@@ -154,16 +156,41 @@ pub(crate) fn enable_languages(
         );
     }
 
+    // `cmGlobalGenerator::LanguagesInProgress`: a toolchain file or bootstrap module
+    // must not enable a language that is still being enabled.
+    let in_progress = cx
+        .global()
+        .props
+        .get(LANGUAGES_IN_PROGRESS)
+        .map(|value| list::split(value, Empty::Drop))
+        .unwrap_or_default();
+    if let Some(lang) = unique.iter().find(|lang| in_progress.contains(lang)) {
+        let body = format!(
+            "Language '{}' is currently being enabled.  Recursive call not allowed.",
+            String::from_utf8_lossy(lang)
+        );
+        cx.issue(MessageKind::Error, Effect::Fatal, None, body.into());
+        return Err(CmdError::Reported);
+    }
+    let active = list::join(in_progress.iter().chain(&unique));
+    cx.global().props.set(LANGUAGES_IN_PROGRESS.into(), active);
     // RC is enabled after the other languages so that an implicit RC enable does not
     // look like a recursive enable_language(RC).
     let (rc, other): (Vec<BString>, Vec<BString>) =
         unique.into_iter().partition(|lang| lang == b"RC");
+    let mut result = Ok(());
     for group in [other, rc] {
         if !group.is_empty() {
-            Bootstrap::new(cx, generator, optional).run(cx, group)?;
+            result = Bootstrap::new(cx, generator, optional).run(cx, group);
+            if result.is_err() {
+                break;
+            }
         }
     }
-    Ok(())
+    cx.global()
+        .props
+        .set(LANGUAGES_IN_PROGRESS.into(), list::join(in_progress));
+    result
 }
 
 /// The generator of this configure run: the project model's generator, then

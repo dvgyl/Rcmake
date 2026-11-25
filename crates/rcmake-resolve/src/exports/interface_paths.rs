@@ -36,7 +36,9 @@ pub(super) fn validate(
             "build"
         } else if source {
             "source"
-        } else if rcmake_genex::parse(value).is_ok_and(|ast| !ast.is_plain()) {
+        } else if rcmake_genex::genex_strip(value).as_slice() != value.as_slice() {
+            // Only a complete `$<...>` makes a mixed path. CMake keeps an unterminated
+            // expression as plain text.
             return Err(ResolveError::Message(
                 "Install interface contains a mixed path.".into(),
             ));

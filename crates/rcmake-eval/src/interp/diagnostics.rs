@@ -10,6 +10,7 @@ use rcmake_diag::{
     suggest::{Namespace, suggest_candidates_in},
 };
 use rcmake_host::{Stream, path::to_native};
+use rcmake_model::DirId;
 use rcmake_syntax::CommandInvocation;
 
 use crate::util::cat;
@@ -322,6 +323,32 @@ impl Interp {
     }
 
     pub(crate) fn issue_policy_warning(&mut self, id: PolicyId, preface: &[u8], postface: &[u8]) {
+        let location = Location::Backtrace(self.bt.clone());
+        self.issue_policy_warning_at(id, preface, postface, location);
+    }
+
+    /// Current backtrace of directory `dir` (`cmMakefile::GetBacktrace` of that
+    /// directory). An active ancestor directory is at the `add_subdirectory` call that
+    /// leads to the current directory. Other directories use the current backtrace.
+    pub(crate) fn directory_backtrace(&self, dir: DirId) -> Backtrace {
+        let mut frames = core::iter::once(&self.root_frame)
+            .chain(&self.dir_stack)
+            .skip_while(|frame| frame.id != dir);
+        match (frames.next(), frames.next()) {
+            (Some(_), Some(child)) if child.id != dir => {
+                self.project.dir(child.id).backtrace.clone()
+            }
+            _ => self.bt.clone(),
+        }
+    }
+
+    pub(crate) fn issue_policy_warning_at(
+        &mut self,
+        id: PolicyId,
+        preface: &[u8],
+        postface: &[u8],
+        location: Location,
+    ) {
         let warning = Self::policy_warning_text(id);
         let mut body = Vec::new();
         if !preface.is_empty() {
@@ -333,7 +360,6 @@ impl Interp {
             body.push(b'\n');
             body.extend_from_slice(postface);
         }
-        let location = Location::Backtrace(self.bt.clone());
         self.issue_at(
             MessageKind::AuthorWarning,
             Effect::None,

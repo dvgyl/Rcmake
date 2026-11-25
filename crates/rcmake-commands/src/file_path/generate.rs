@@ -103,17 +103,21 @@ pub(super) fn run(cx: &mut Cx<'_>, args: &[&[u8]]) -> Result {
     }
     record.extend(permissions.iter().map(|value| value.as_slice()));
     let request = crate::install::record_request(cx, "_RCMAKE_FILE_GENERATE", &record);
-    let policy = match cx.policy(PolicyId::new(70)) {
+    let status = |status| match status {
         PolicyStatus::New => "New",
         PolicyStatus::Old => "Old",
         PolicyStatus::Warn => "Warn",
     };
+    // Generation evaluates the call with the policies at the call site.
+    let policies = [70, 189].map(|id| (id, status(cx.policy(PolicyId::new(id)))));
     let backtrace = cx.backtrace();
     let props = &mut cx.global().props;
-    props.set(
-        format!("_RCMAKE_FILE_GENERATE_{request}_CMP0070").into(),
-        policy.into(),
-    );
+    for (id, value) in policies {
+        props.set(
+            format!("_RCMAKE_FILE_GENERATE_{request}_CMP{id:04}").into(),
+            value.into(),
+        );
+    }
     for (index, frame) in backtrace.frames().enumerate() {
         let key = format!("_RCMAKE_FILE_GENERATE_{request}_FRAME_{index}");
         props.set(

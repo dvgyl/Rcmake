@@ -90,7 +90,7 @@ impl ChildConfig {
             source_signature,
         } = build;
         let mut recursion_exceeded = false;
-        let (built, mut output) = CapturingHost::capture(host, &dirs.binary, |host| {
+        let (built, mut output, diagnostics) = CapturingHost::capture(host, &dirs.binary, |host| {
             let mut config = self.config;
             config.cwd = dirs.binary.clone();
             config.host = host.clone();
@@ -160,6 +160,7 @@ impl ChildConfig {
         (
             ProbeResult {
                 output,
+                diagnostics,
                 outcome,
                 artifact,
             },

@@ -66,20 +66,19 @@ pub(super) fn build_child(
     Ok((outcome, artifact))
 }
 
-pub(super) struct RunResult<'a> {
-    pub(super) variable: &'a [u8],
+pub(super) struct RunResult {
     pub(super) value: BString,
     pub(super) stdout: Vec<u8>,
     pub(super) stderr: Vec<u8>,
 }
 
-pub(super) fn run_executable<'a>(
+pub(super) fn run_executable(
     cx: &mut Cx<'_>,
     options: &Options<'_>,
     artifact: Option<&Path>,
-    variable: &'a [u8],
+    variable: &[u8],
     build_output: &[u8],
-) -> RunResult<'a> {
+) -> RunResult {
     let default_cwd = cx.host().initial_cwd();
     let working_dir = options
         .one(b"WORKING_DIRECTORY")
@@ -157,7 +156,6 @@ pub(super) fn run_executable<'a>(
         );
     }
     RunResult {
-        variable,
         value,
         stdout: result.stdout,
         stderr: result.stderr,

@@ -1,5 +1,6 @@
 use rcmake_base::{BString, truth::is_on};
 use rcmake_diag::{DiagAction, DiagCategory, DiagState};
+use rcmake_eval::Interp;
 use rcmake_host::{Host, Stream};
 use rcmake_model::{Cache, CacheType};
 
@@ -180,4 +181,29 @@ pub(super) fn warn_legacy_define(host: &dyn Host, name: &[u8]) {
             format!("The {variable} variable is deprecated.  Use {option} instead.\n").as_bytes(),
         );
     }
+}
+
+/// `cmGlobalGenerator::Compute`: the multi-configuration variables are an error with
+/// a generator that does not support them, even when they are set to an empty value.
+pub(super) fn unsupported_config_variable(interp: &mut Interp) -> Option<String> {
+    const VARIABLES: [&str; 3] = [
+        "CMAKE_DEFAULT_BUILD_TYPE",
+        "CMAKE_CROSS_CONFIGS",
+        "CMAKE_DEFAULT_CONFIGS",
+    ];
+    let mut cx = interp.cx();
+    let generator = cx.project().generator?;
+    if generator == rcmake_model::GeneratorKind::NinjaMultiConfig {
+        return None;
+    }
+    let cached = VARIABLES.map(|name| cx.cache().get(name.as_bytes()).is_some());
+    let vars = &cx.project().dir(rcmake_model::DirId::ROOT).vars;
+    let (name, _) = VARIABLES
+        .into_iter()
+        .zip(cached)
+        .find(|(name, cached)| *cached || vars.contains_key(name.as_bytes()))?;
+    Some(format!(
+        "CMake Error:\n  Generator\n\n    {}\n\n  does not support variable\n\n    {name}\n\n  but it has been specified.\n\n\n",
+        generator.name()
+    ))
 }

@@ -14,6 +14,7 @@ use rcmake_model::{
     UsageScope,
 };
 
+mod destinations;
 mod export_options;
 mod mapped_package;
 mod metadata;
@@ -183,16 +184,18 @@ fn type_destination(cx: &Cx<'_>, kind: &[u8]) -> Result<BString> {
     if !configured.is_empty() {
         return Ok(configured);
     }
+    if kind == b"RUNSTATE" {
+        let mut local = type_destination(cx, b"LOCALSTATE")?;
+        local.extend_from_slice(b"/run");
+        return Ok(local);
+    }
     let mut root = cx.var_or_empty(b"CMAKE_INSTALL_DATAROOTDIR");
     if root.is_empty() {
         root = b"share".as_slice().into();
     }
     Ok(match kind {
         b"DATA" => root,
-        b"DOC" => [root.as_slice(), b"/doc/", &cx.var_or_empty(b"PROJECT_NAME")]
-            .concat()
-            .into(),
-        b"INFO" | b"LOCALE" | b"MAN" => [root.as_slice(), b"/", default].concat().into(),
+        b"DOC" | b"INFO" | b"LOCALE" | b"MAN" => [root.as_slice(), b"/", default].concat().into(),
         _ => default.into(),
     })
 }
@@ -211,6 +214,7 @@ fn install(cx: &mut Cx<'_>, input: &[ExpandedArg]) -> CmdResult {
     if matches!(*signature, b"CODE" | b"SCRIPT") {
         return scripts(cx, signature, rest);
     }
+    destinations::warn_unnormalized(cx, rest);
     let mut args = rest.iter().copied().peekable();
     let mut options = InstallOptions::default();
     let mut extra_destinations = Vec::new();
@@ -309,6 +313,7 @@ fn install(cx: &mut Cx<'_>, input: &[ExpandedArg]) -> CmdResult {
     } else {
         Vec::new()
     };
+    let snapshots = destinations::drop_headers_without_destination(cx, rest, snapshots);
     for rule in mapped {
         cx.project().add_install(rule);
     }
@@ -693,13 +698,8 @@ fn target_ids(cx: &mut Cx<'_>, names: Vec<&[u8]>, install: bool) -> Result<Vec<T
     names
         .into_iter()
         .map(|name| {
+            // CMake 4.5 installs the target that an ALIAS target references.
             let binding = project.lookup_target(dir, name);
-            if install && matches!(binding, Some(TargetBinding::Alias(_))) {
-                return Err(fail(format!(
-                    "TARGETS given ALIAS target \"{}\".",
-                    BString::from(name)
-                )));
-            }
             if let Some((id, target)) = binding
                 .map(TargetBinding::id)
                 .and_then(|id| project.target(id).map(|target| (id, target)))

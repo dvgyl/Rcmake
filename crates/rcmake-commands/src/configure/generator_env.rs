@@ -16,8 +16,37 @@ const INSTANCE: &[u8] = b"CMAKE_GENERATOR_INSTANCE";
 const CONFIGURATIONS: &[u8] = b"CMAKE_CONFIGURATION_TYPES";
 const XCODE_VERSION_PROBE: &[u8] = b"_RCMAKE_XCODE_VERSION_PROBE";
 
+/// `cmMakefile::InitCMAKE_CONFIGURATION_TYPES` for `Ninja Multi-Config`. The
+/// `CMAKE_CONFIGURATION_TYPES` environment variable selects the initial value outside
+/// `try_compile()`.
+fn init_configuration_types(cx: &mut Cx<'_>, generator: GeneratorKind) {
+    if cx.var_defined(CONFIGURATIONS) {
+        return;
+    }
+    let in_try_compile = cx
+        .global()
+        .props
+        .get(b"IN_TRY_COMPILE")
+        .is_some_and(|value| rcmake_base::truth::is_on(value));
+    let value = cx
+        .host()
+        .env_get(CONFIGURATIONS)
+        .filter(|_| !in_try_compile)
+        .unwrap_or_else(|| generator.default_configuration_types().join(";").into());
+    add_cache(
+        cx,
+        CONFIGURATIONS,
+        value,
+        CacheType::String,
+        "Semicolon separated list of supported configuration types, only supports Debug, Release, MinSizeRel, and RelWithDebInfo, anything else will be ignored.",
+    );
+}
+
 /// Set the IDE generator variables before the language bootstrap runs.
 pub(super) fn initialize(cx: &mut Cx<'_>, generator: GeneratorKind) -> Result<(), CmdError> {
+    if generator == GeneratorKind::NinjaMultiConfig {
+        init_configuration_types(cx, generator);
+    }
     if !generator.is_ide() {
         return Ok(());
     }

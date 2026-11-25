@@ -81,3 +81,74 @@ add_custom_target(nested ALL COMMAND "$(MAKE)" -f "nested file.mk" "value=$liter
     );
     Ok(())
 }
+
+#[test]
+fn project_file_is_validated_recorded_and_reused() -> HostResult<()> {
+    let host = crate::driver_tests::project_host();
+    host.seed_file(
+        Path::new("/work/CMakeLists.txt"),
+        b"message(FATAL_ERROR \"wrong file\")\n",
+    )?;
+    host.seed_file(
+        Path::new("/work/other.cmake"),
+        b"cmake_minimum_required(VERSION 4.5)\nproject(demo NONE)\nmessage(STATUS \"other file\")\n",
+    )?;
+    let run = |extra: &[&str]| {
+        let mut args = vec!["cmake", "-S", ".", "-B", "out"];
+        args.extend_from_slice(extra);
+        let args: Vec<_> = args.into_iter().map(BString::from).collect();
+        crate::run(&args, host.clone())
+    };
+    let warning = "This project has been configured with a project file other than";
+
+    assert_eq!(run(&["--project-file", "missing.cmake"]), 1);
+    let stderr = host.stream_bytes(Stream::Stderr).to_string();
+    assert!(stderr.contains(warning), "{stderr}");
+    assert!(
+        stderr.contains("does not appear to contain missing.cmake."),
+        "{stderr}"
+    );
+
+    assert_eq!(run(&["--project-file", "other.cmake"]), 0);
+    let cache = BString::from(host.read(
+        Path::new("/work/out/CMakeCache.txt"),
+        ReadRange::All { limit: 64 * 1024 },
+    )?);
+    assert!(
+        cache
+            .to_string()
+            .contains("CMAKE_LIST_FILE_NAME:INTERNAL=other.cmake"),
+        "{cache}"
+    );
+    // A later run without the option reuses the cached name.
+    assert_eq!(run(&[]), 0, "{}", host.stream_bytes(Stream::Stderr));
+    assert_eq!(run(&["--project-file", "another.cmake"]), 1);
+    let stderr = host.stream_bytes(Stream::Stderr).to_string();
+    assert!(
+        stderr.contains(
+            "CMakeLists filename : \"another.cmake\"\nDoes not match the previous: \"other.cmake\""
+        ),
+        "{stderr}"
+    );
+    Ok(())
+}
+
+#[test]
+fn project_file_option_requires_one_value() {
+    let host = crate::driver_tests::project_host();
+    for (args, message) in [
+        (
+            vec!["cmake", "--project-file"],
+            "No filename specified for --project-file",
+        ),
+        (
+            vec!["cmake", "--project-file", "a", "--project-file", "b"],
+            "Multiple --project-file options not allowed",
+        ),
+    ] {
+        let args: Vec<_> = args.into_iter().map(BString::from).collect();
+        assert_eq!(crate::run(&args, host.clone()), 1);
+        let stderr = host.stream_bytes(Stream::Stderr).to_string();
+        assert!(stderr.contains(message), "{stderr}");
+    }
+}

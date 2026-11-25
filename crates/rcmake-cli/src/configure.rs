@@ -106,6 +106,7 @@ struct ConfigureSession<'a> {
     opts: Options,
     src: PathBuf,
     bin: PathBuf,
+    list_file: BString,
     preset: presets::Application,
     profiling: Profilers,
 }
@@ -245,6 +246,8 @@ impl<'a> ConfigureSession<'a> {
                 &mut saved,
             )?;
         }
+        let list_file =
+            cache_setup::select_list_file(host.as_ref(), opts.project_file.as_ref(), &saved)?;
         let profiling = Profilers::new(host.as_ref(), &opts, &bin);
         Ok((
             Self {
@@ -253,6 +256,7 @@ impl<'a> ConfigureSession<'a> {
                 opts,
                 src,
                 bin,
+                list_file,
                 preset,
                 profiling,
             },
@@ -364,6 +368,13 @@ impl<'a> ConfigureSession<'a> {
         );
         cache::insert(
             interp.cx().cache(),
+            cache_setup::LIST_FILE_NAME,
+            self.list_file.clone(),
+            Some(CacheType::Internal),
+        );
+        interp.set_list_file_name(self.list_file.clone());
+        cache::insert(
+            interp.cx().cache(),
             HOME_DIR,
             path::from_native_cmake(&self.src),
             Some(CacheType::Internal),
@@ -403,13 +414,14 @@ impl<'a> ConfigureSession<'a> {
 
     fn check_source(&self) -> Result<(), Exit> {
         let host = self.host.as_ref();
-        if is_file(host, &self.src.join("CMakeLists.txt")) {
+        let name = String::from_utf8_lossy(&self.list_file);
+        if is_file(host, &self.src.join(name.as_ref())) {
             return Ok(());
         }
         let problem = if is_dir(host, &self.src) {
-            "does not appear to contain CMakeLists.txt"
+            format!("does not appear to contain {name}")
         } else {
-            "does not exist"
+            "does not exist".into()
         };
         Err(Exit::Message(format!(
             "The source directory \"{}\" {problem}.\nSpecify --help for usage, or press the help button on the CMake GUI.",
@@ -464,10 +476,11 @@ impl<'a> ConfigureSession<'a> {
                 path::from_native_cmake(&host.initial_cwd().join(path::to_native(&entry.value)));
         }
         let result = self.profiling.measure(host, ProfilePhase::Eval, || {
-            self.profiling
-                .measure_listfile(host, &self.src.join("CMakeLists.txt"), || {
-                    runtime.run(interp, &[])
-                })
+            self.profiling.measure_listfile(
+                host,
+                &self.src.join(path::to_native(&self.list_file)),
+                || runtime.run(interp, &[]),
+            )
         });
         if result.exit_code == 0
             && rcmake_resolve::validate_codegen_name(interp.cx().project(), host).is_err()
@@ -542,6 +555,11 @@ impl<'a> ConfigureSession<'a> {
                     self.src.join("CMakeLists.txt").display()
                 ),
             );
+        }
+        if let Some(message) = diagnostics::unsupported_config_variable(interp) {
+            host.write_out(Stream::Stderr, message.as_bytes());
+            generation_failed(host);
+            return Err(Exit::Code(1));
         }
         let start = host.monotonic();
         let generate_step = crate::InstrumentationStep::start(host, sample);

@@ -577,10 +577,7 @@ fn local_directory_copy(
             return None;
         };
         let [url] = urls.as_slice() else { return None };
-        let source = url.strip_prefix("file://").unwrap_or(url);
-        if source.contains("://") {
-            return None;
-        }
+        let source = super::archive::local_url_path(url)?;
         let source = cx.resolve_path(source.as_bytes());
         cx.host()
             .metadata(&source, Follow::Yes)

@@ -71,7 +71,10 @@ pub(super) fn policy(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
             if let Err(error) = cx.set_policy(id, state) {
                 return Err(policy_error(cx, error));
             }
-            if state == PolicyStatus::Old && id.number() <= 161 {
+            if state == PolicyStatus::Old
+                && id.number() <= 161
+                && !(in_try_compile(cx) && TRY_COMPILE_POLICIES.contains(&id.number()))
+            {
                 cx.issue(
                     MessageKind::DeprecationWarning,
                     Effect::None,
@@ -464,4 +467,15 @@ fn category(op: &[u8], cat: &[u8]) -> Result<DiagCategory, CmdError> {
 fn subcommand_error(args: &[ExpandedArg], message: &str) -> CmdError {
     let op = args.first().map_or(b"".as_slice(), |a| a.value.as_slice());
     CmdError::status([op, b" ", message.as_bytes()].concat())
+}
+
+/// Policies that the generated `try_compile()` test project sets. CMake does not warn
+/// when that project sets them to `OLD`.
+const TRY_COMPILE_POLICIES: [u16; 11] = [65, 83, 91, 104, 123, 126, 128, 136, 141, 155, 157];
+
+fn in_try_compile(cx: &mut Cx<'_>) -> bool {
+    cx.global()
+        .props
+        .get(b"IN_TRY_COMPILE")
+        .is_some_and(|value| rcmake_base::truth::is_on(value))
 }

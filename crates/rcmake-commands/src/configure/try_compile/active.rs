@@ -313,6 +313,7 @@ impl PreparedProbe {
             },
             artifact,
             output: result.output.into(),
+            diagnostics: BString::default(),
         })
     }
 

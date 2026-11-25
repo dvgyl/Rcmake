@@ -55,7 +55,7 @@ mod util;
 #[cfg(test)]
 mod tests;
 
-pub use configure_log::FindEvent;
+pub use configure_log::{FindEvent, TryBuildOutcome, TryCompileEvent, TryRunOutcome};
 pub use cx::Cx;
 pub use file_lock::FileLockScope;
 pub use hooks::{TraceConfig, TraceFormat, WatchAccess};
@@ -413,6 +413,9 @@ impl Default for Frontend {
 /// `CMAKE_MAXIMUM_RECURSION_DEPTH` can not exhaust the native stack.
 pub const HARD_RECURSION_CEILING: u32 = 20_000;
 
+/// Default project file name of a directory.
+pub const DEFAULT_LIST_FILE_NAME: &str = "CMakeLists.txt";
+
 /// Core CMake 4.5.1 interpreter.
 pub struct Interp {
     config: InterpConfig,
@@ -432,6 +435,8 @@ pub struct Interp {
     engine: DiagEngine,
     render: RenderOptions,
     bt: Backtrace,
+    /// Name of the project file read in each directory (`cmake --project-file`).
+    list_file_name: BString,
     depth: u32,
     recursion_exceeded: bool,
     check_system_vars: bool,
@@ -557,6 +562,7 @@ impl Interp {
             engine,
             render,
             bt: Backtrace::default(),
+            list_file_name: BString::from(DEFAULT_LIST_FILE_NAME),
             depth: 0,
             recursion_exceeded: false,
             check_system_vars: false,
@@ -667,6 +673,13 @@ impl Interp {
     /// Include system files in variable usage diagnostics.
     pub fn set_check_system_vars(&mut self, check: bool) {
         self.check_system_vars = check;
+    }
+
+    /// Select the project file name that each directory reads (`cmake --project-file`).
+    ///
+    /// A directory without this file reads `CMakeLists.txt`.
+    pub fn set_list_file_name(&mut self, name: BString) {
+        self.list_file_name = name;
     }
 
     /// Return whether a command exceeded the recursion limit.

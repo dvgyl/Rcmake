@@ -223,6 +223,41 @@ pub(super) fn apply_environment_identity(
     Ok(())
 }
 
+/// Cache entry that records the project file name (`cmake --project-file`).
+pub(super) const LIST_FILE_NAME: &[u8] = b"CMAKE_LIST_FILE_NAME";
+
+/// Select the project file name from `--project-file` or the existing cache.
+///
+/// A different name than the cached name is an error. A name other than
+/// `CMakeLists.txt` gives the development-only warning.
+pub(super) fn select_list_file(
+    host: &dyn Host,
+    given: Option<&BString>,
+    saved: &Cache,
+) -> Result<BString, Exit> {
+    let previous = saved.get(LIST_FILE_NAME).map(|entry| &entry.value);
+    if let (Some(given), Some(previous)) = (given, previous)
+        && given != previous
+    {
+        return Err(Exit::Message(format!(
+            "CMakeLists filename : \"{}\"\nDoes not match the previous: \"{}\"\nEither remove the CMakeCache.txt file and CMakeFiles directory or choose a different binary directory.",
+            String::from_utf8_lossy(given),
+            String::from_utf8_lossy(previous)
+        )));
+    }
+    let name = given
+        .or(previous)
+        .cloned()
+        .unwrap_or_else(|| rcmake_eval::DEFAULT_LIST_FILE_NAME.into());
+    if name.as_slice() != rcmake_eval::DEFAULT_LIST_FILE_NAME.as_bytes() {
+        crate::options::warn(
+            host,
+            "This project has been configured with a project file other than\n  CMakeLists.txt.  This feature is intended for temporary use during\n  development and not for publication of a final product.",
+        );
+    }
+    Ok(name)
+}
+
 #[cfg(test)]
 mod tests {
     use rcmake_host::PureHost;

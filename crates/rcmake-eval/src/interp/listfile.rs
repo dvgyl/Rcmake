@@ -130,7 +130,7 @@ impl Interp {
         if self.policy_status(CMP0198) == PolicyStatus::New {
             self.undefine(b"CMAKE_PARENT_LIST_FILE");
         } else {
-            let lists = cat(&[&self.current_source_dir_bytes(), b"/CMakeLists.txt"]);
+            let lists = self.directory_list_file(&self.current_source_dir_bytes());
             self.define(b"CMAKE_PARENT_LIST_FILE", lists);
         }
     }
@@ -151,7 +151,7 @@ impl Interp {
         let cwd = rcmake_host::path::from_native_cmake(&self.config.cwd);
         let src_abs = collapse_full_path(&rcmake_host::path::from_native_cmake(source_dir), &cwd);
         let bin_abs = collapse_full_path(&rcmake_host::path::from_native_cmake(binary_dir), &cwd);
-        let src_native = rcmake_host::path::to_native(&src_abs);
+
         let bin_native = rcmake_host::path::to_native(&bin_abs);
 
         self.init_policy_minimum();
@@ -181,23 +181,25 @@ impl Interp {
             }
         }
 
-        let lists_path = src_native.join("CMakeLists.txt");
-        let lists_bytes = rcmake_host::path::from_native_cmake(&lists_path);
+        let lists_bytes = self.directory_list_file(&src_abs);
         if !self.is_regular_file(&lists_bytes) {
+            let name = self.list_file_name.clone();
             self.error_no_location(cat(&[
                 b"The source directory \"",
                 &src_abs,
-                b"\" does not appear to contain CMakeLists.txt.\nSpecify --help for usage, or press the help button on the CMake GUI.",
+                b"\" does not appear to contain ",
+                &name,
+                b".\nSpecify --help for usage, or press the help button on the CMake GUI.",
             ]));
             return RunOutcome {
                 exit_code: self.exit_code(),
             };
         }
 
-        if let Err(error) = self.reset_package_redirects(&bin_native) {
+        if self.reset_package_redirects(&bin_native).is_err() {
             self.error_no_location(
                 format!(
-                    "Unable to (re)create the private pkgRedirects directory:\n  {}\n  {error}",
+                    "Unable to (re)create the private pkgRedirects directory:\n  {}\nThis may be caused by not having read/write access to the build directory.\nTry specifying a location with read/write access like:\n  cmake -B build\nIf using a CMake presets file, ensure that preset parameter\n'binaryDir' expands to a writable directory.\n",
                     path::from_native_cmake(&bin_native.join("CMakeFiles/pkgRedirects"))
                 )
                 .into(),
@@ -328,6 +330,18 @@ impl Interp {
         rcmake_host::path::to_native(&dir.binary_dir)
     }
 
+    /// Project file of the source directory `dir` (`cmake::GetCMakeListFile`). A
+    /// directory without the selected `--project-file` reads `CMakeLists.txt`.
+    pub(crate) fn directory_list_file(&self, dir: &[u8]) -> BString {
+        let selected = cat(&[dir, b"/", &self.list_file_name]);
+        if self.list_file_name.as_slice() == crate::DEFAULT_LIST_FILE_NAME.as_bytes()
+            || self.is_regular_file(&selected)
+        {
+            return selected;
+        }
+        cat(&[dir, b"/", crate::DEFAULT_LIST_FILE_NAME.as_bytes()])
+    }
+
     /// Record a listfile read in the current directory (`cmMakefile::ListFiles`).
     pub(super) fn record_list_file(&mut self, abs: &[u8]) {
         let id = self.current_dir_id();
@@ -355,7 +369,7 @@ impl Interp {
         );
         let bin_base = rcmake_host::path::from_native_cmake(&self.current_binary_dir());
         let bin_abs = collapse_full_path(&rcmake_host::path::from_native_cmake(bin), &bin_base);
-        let lists = cat(&[&src_abs, b"/CMakeLists.txt"]);
+        let lists = self.directory_list_file(&src_abs);
         if !self.is_regular_file(&lists) {
             // CMake reports this from the new directory, so processing continues.
             self.error_here(cat(&[
@@ -401,8 +415,12 @@ impl Interp {
         self.define(b"CMAKE_CURRENT_SOURCE_DIR", src_abs);
         self.define(b"CMAKE_CURRENT_BINARY_DIR", bin_abs);
 
+        // A new directory starts a new backtrace: diagnostics and target backtraces in
+        // the subdirectory do not show the parent `add_subdirectory` call.
+        let parent_bt = core::mem::take(&mut self.bt);
         let _ = self.run_list_file(&lists, true);
         self.snapshot_dir_vars(id);
+        self.bt = parent_bt;
 
         self.dir_stack.pop();
         self.diags.pop_above(diag_base);

@@ -795,7 +795,8 @@ fn exported_location(
             }
             _ => return None,
         };
-        Some(absolute_path(&action.destination, installed))
+        // CMake keeps a destination that is not normalized (`CMP0177` OLD) as written.
+        Some(Lexical::new(&action.destination).append(installed))
     })
 }
 

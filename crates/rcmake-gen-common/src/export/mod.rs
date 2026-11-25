@@ -248,17 +248,13 @@ fn render_prefix(
     out.extend_from_slice(
         b"get_filename_component(_IMPORT_PREFIX \"${CMAKE_CURRENT_LIST_FILE}\" PATH)\n",
     );
-    let normalized = Lexical::new(destination).normalize();
-    for component in Lexical::new(&normalized).components() {
-        if component == b"." {
-            continue;
-        }
-        if component == b".." {
-            return Err(output_error(
-                &plan.file,
-                "the export destination is outside the install prefix",
-            ));
-        }
+    // CMake goes up one level for each non-empty destination component, which includes
+    // `.` and `..` components of a destination that is not normalized (`CMP0177`).
+    let levels = destination
+        .split(|&byte| byte == b'/')
+        .filter(|component| !component.is_empty())
+        .count();
+    for _ in 0..levels {
         out.extend_from_slice(
             b"get_filename_component(_IMPORT_PREFIX \"${_IMPORT_PREFIX}\" PATH)\n",
         );
@@ -526,7 +522,15 @@ unset(_IMPORT_PREFIX)
 foreach(_cmake_target IN LISTS _cmake_import_check_targets)
   foreach(_cmake_file IN LISTS "_cmake_import_check_files_for_${_cmake_target}")
     if(NOT EXISTS "${_cmake_file}")
-      message(FATAL_ERROR "The imported target \"${_cmake_target}\" references the file \"${_cmake_file}\", but this file does not exist.")
+      message(FATAL_ERROR "The imported target \"${_cmake_target}\" references the file
+   \"${_cmake_file}\"
+but this file does not exist.  Possible reasons include:
+* The file was deleted, renamed, or moved to another location.
+* An install or uninstall procedure did not complete successfully.
+* The installation package was faulty and contained
+   \"${CMAKE_CURRENT_LIST_FILE}\"
+but not all the files it references.
+")
     endif()
   endforeach()
   unset("_cmake_import_check_files_for_${_cmake_target}")

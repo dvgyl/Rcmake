@@ -759,3 +759,108 @@ install(CODE "message(STATUS installed)" COMPONENT EXCLUDE_FROM_ALL)
     assert!(rule.options.exclude_from_all);
     Ok(())
 }
+
+#[test]
+fn type_destinations_use_cmake_defaults() -> TestResult {
+    let (_, mut interp) = configure(
+        r#"
+install(FILES f TYPE DOC)
+install(FILES f TYPE RUNSTATE)
+set(CMAKE_INSTALL_LOCALSTATEDIR state)
+install(FILES f TYPE RUNSTATE)
+"#,
+        0,
+    )?;
+    let mut cx = interp.cx();
+    let destinations: Vec<_> = cx
+        .project()
+        .installs
+        .iter()
+        .map(|rule| rule.options.destination.clone())
+        .collect();
+    assert_eq!(
+        destinations,
+        [
+            Some("share/doc".into()),
+            Some("var/run".into()),
+            Some("state/run".into())
+        ]
+    );
+    Ok(())
+}
+
+#[test]
+fn install_accepts_an_alias_target_and_installs_the_referenced_target() -> TestResult {
+    let (host, mut interp) = configure(
+        "add_library(real INTERFACE)\nadd_library(nick ALIAS real)\ninstall(TARGETS nick EXPORT set)\n",
+        0,
+    )?;
+    assert_eq!(host.stream_bytes(Stream::Stderr).to_string(), "");
+    let mut cx = interp.cx();
+    let model = cx.project();
+    let InstallKind::Targets { targets, .. } = &model.installs[0].kind else {
+        return Err("expected a target rule".into());
+    };
+    let names: Vec<_> = targets
+        .iter()
+        .filter_map(|id| model.target(*id).map(|target| target.name.clone()))
+        .collect();
+    assert_eq!(names, [BString::from("real")]);
+    Ok(())
+}
+
+#[test]
+fn cmp0177_warns_for_each_destination_that_normalization_changes() -> TestResult {
+    let (host, _) = configure(
+        r#"
+cmake_policy(VERSION 3.30)
+install(FILES f DESTINATION a/../b)
+install(FILES f DESTINATION plain)
+install(FILES f DESTINATION "x/$<CONFIG>/../y")
+install(TARGETS core ARCHIVE DESTINATION ./lib INCLUDES DESTINATION ./include)
+"#,
+        0,
+    )?;
+    let stderr = host.stream_bytes(Stream::Stderr).to_string();
+    assert_eq!(
+        stderr.matches("Policy CMP0177 is not set").count(),
+        2,
+        "{stderr}"
+    );
+    Ok(())
+}
+
+#[test]
+fn headers_without_a_destination_warn_when_artifact_groups_are_named() -> TestResult {
+    let (host, mut interp) = configure(
+        r#"
+set_property(TARGET core PROPERTY PUBLIC_HEADER core.h)
+set_property(TARGET api PROPERTY PUBLIC_HEADER api.h)
+install(TARGETS core LIBRARY DESTINATION lib)
+install(TARGETS api)
+"#,
+        0,
+    )?;
+    let stderr = host.stream_bytes(Stream::Stderr).to_string();
+    assert_eq!(
+        stderr
+            .matches("has PUBLIC_HEADER files but no PUBLIC_HEADER DESTINATION")
+            .count(),
+        1,
+        "{stderr}"
+    );
+    assert!(stderr.contains("Target core"), "{stderr}");
+    let mut cx = interp.cx();
+    let model = cx.project();
+    let snapshot = |rule: usize, name: &str| {
+        let id = model.find_target(rcmake_model::DirId::ROOT, name.as_bytes())?;
+        model
+            .global
+            .props
+            .get(format!("_RCMAKE_INSTALL_{rule}_PUBLIC_HEADER_{}", id.index()).as_bytes())
+            .cloned()
+    };
+    assert_eq!(snapshot(0, "core"), Some(BString::default()));
+    assert_eq!(snapshot(1, "api"), Some(BString::from("api.h")));
+    Ok(())
+}

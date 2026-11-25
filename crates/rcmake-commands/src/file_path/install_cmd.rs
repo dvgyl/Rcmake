@@ -85,9 +85,27 @@ impl Install<'_> {
     }
 }
 
+/// Remove trailing `.` components from a destination (`DESTINATION prefix/.` installs
+/// to `prefix`). Other `.` and `..` components stay unchanged.
+fn without_trailing_dot(path: std::path::PathBuf) -> std::path::PathBuf {
+    let mut text = from_native_cmake(&path);
+    let original = text.len();
+    while text.ends_with(b"/.") {
+        let keep = text.len().saturating_sub(2);
+        text.truncate(keep);
+    }
+    if text.len() == original {
+        return path;
+    }
+    if text.is_empty() || text.ends_with(b":") {
+        text.push(b'/');
+    }
+    to_native(&text)
+}
+
 pub(super) fn run(cx: &mut Cx<'_>, args: &[&[u8]]) -> Result {
     let install = parse(cx, args)?;
-    let unstaged = binary_destination(cx, install.destination);
+    let unstaged = without_trailing_dot(binary_destination(cx, install.destination));
     let destdir = cx
         .host()
         .env_get(b"DESTDIR")

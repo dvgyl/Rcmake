@@ -53,6 +53,21 @@ pub(crate) fn prepare_archive(
     archive_plan(cx, runtime, &pop, url, args)
 }
 
+/// Local path of a `file://` URL or of a plain path. A Windows URL such as
+/// `file:///C:/dir/file` names `C:/dir/file`. Returns `None` for other schemes.
+pub(super) fn local_url_path(url: &str) -> Option<&str> {
+    let Some(rest) = url.strip_prefix("file://") else {
+        return (!url.contains("://")).then_some(url);
+    };
+    let drive = rest.as_bytes();
+    if let [b'/', letter, b':', b'/' | b'\\', ..] = drive
+        && letter.is_ascii_alphabetic()
+    {
+        return rest.get(1..);
+    }
+    Some(rest)
+}
+
 pub(super) fn prepare_local_archive(
     cx: &mut Cx<'_>,
     runtime: Arc<Runtime>,
@@ -62,9 +77,9 @@ pub(super) fn prepare_local_archive(
     let Ok(url) = std::str::from_utf8(&url) else {
         return Ok(());
     };
-    if url.is_empty() || url.contains(';') || url.contains("://") && !url.starts_with("file://") {
+    let Some(local) = local_url_path(url).filter(|_| !url.is_empty() && !url.contains(';')) else {
         return Ok(());
-    }
+    };
     let archive = runtime.with_fetch(pop, |fetch| {
         fetch.get(&pop.dependency).is_some_and(|declaration| {
             declaration.supported()
@@ -75,7 +90,7 @@ pub(super) fn prepare_local_archive(
     if !archive {
         return Ok(());
     }
-    let path = cx.resolve_path(url.strip_prefix("file://").unwrap_or(url).as_bytes());
+    let path = cx.resolve_path(local.as_bytes());
     if runtime
         .host
         .metadata(&path, Follow::Yes)

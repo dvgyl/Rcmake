@@ -282,24 +282,26 @@ fn build_probe(
         Vec::new()
     };
     let probe_target;
+    let mut probe_languages = None;
     let target = match signature {
         Signature::Sources { sources, .. } => {
             static NEXT_TARGET: AtomicU64 = AtomicU64::new(0);
             let suffix = NEXT_TARGET.fetch_add(1, Ordering::Relaxed);
             probe_target = format!("cmTC_{suffix:05x}");
-            write_project(
+            probe_languages = Some(write_project(
                 cx,
                 options,
                 sources,
                 &dirs.source,
                 &probe_target,
                 run_var.is_some(),
-            )?;
+            )?);
             Some(probe_target.as_bytes())
         }
         Signature::Project { target, .. } => *target,
     };
     let mut seed = TryCompileSeed::new(cx, options, source_signature);
+    let variables = seed::logged_variables(cx, probe_languages.as_deref());
     let limit = b"CMAKE_MAXIMUM_RECURSION_DEPTH";
     if let Some(value) = cx.var(limit)
         && !seed
@@ -331,7 +333,7 @@ fn build_probe(
     if let Some(probe) = &mut cached_probe
         && let Some(hit) = probe.hit(cx, dirs, options)
     {
-        return apply_probe(cx, options, dirs, build_var, run_var, hit);
+        return apply_probe(cx, options, dirs, (build_var, run_var), &variables, hit);
     }
 
     let parent = cx.host_arc();
@@ -359,18 +361,24 @@ fn build_probe(
         cx.fail_nested_recursion();
         return Err(CmdError::Reported);
     }
+    cx.host()
+        .write_out(rcmake_host::Stream::Stderr, &result.diagnostics);
+    // A cache hit does not configure the test project, so only silent probes are kept.
     #[cfg(all(feature = "native", any(unix, windows)))]
     if let Some(probe) = cached_probe
+        && result.diagnostics.is_empty()
         && let Some(journal) = journal.and_then(|host| std::sync::Arc::try_unwrap(host).ok())
     {
         probe.record(cx, dirs, build_var, &result, journal.finish());
     }
-    apply_probe(cx, options, dirs, build_var, run_var, result)
+    apply_probe(cx, options, dirs, (build_var, run_var), &variables, result)
 }
 
 struct ProbeResult {
     outcome: BuildOutcome,
     output: BString,
+    /// Standard error of the test project configure, which CMake shows to the user.
+    diagnostics: BString,
     artifact: Option<PathBuf>,
 }
 
@@ -378,14 +386,15 @@ fn apply_probe(
     cx: &mut Cx<'_>,
     options: &Options<'_>,
     dirs: &ProbeDirs,
-    build_var: &[u8],
-    run_var: Option<&[u8]>,
+    (build_var, run_var): (&[u8], Option<&[u8]>),
+    variables: &[(BString, BString)],
     result: ProbeResult,
 ) -> Result<(), CmdError> {
     let ProbeResult {
         outcome,
         output,
         artifact,
+        ..
     } = result;
     set_build_result(cx, build_var, options, outcome.success, &output);
     let run_result = if outcome.success
@@ -406,10 +415,11 @@ fn apply_probe(
             cx,
             dirs,
             options,
+            variables,
             build_var,
             outcome.exit_code,
             &output,
-            run_result.as_ref(),
+            run_var.map(|var| (var, run_result.as_ref())),
         )?;
     }
     if let Some(destination) = options.one(b"COPY_FILE") {

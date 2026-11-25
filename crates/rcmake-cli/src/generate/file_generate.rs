@@ -20,6 +20,10 @@ use rcmake_resolve::{
     usage::{ObjectPaths, UsageResolver},
 };
 
+mod call_site;
+
+use call_site::CallSitePolicies;
+
 pub(super) fn write(
     model: &ProjectModel,
     result: &GenerationResult,
@@ -84,7 +88,10 @@ pub(super) fn write(
                 warn_relative_path(model, host, *id, "INPUT", input);
             }
         }
-        request_dirs.push((*id, origin(props, &section), policy));
+        let cmp0189 = props
+            .get(format!("{section}_CMP0189").as_bytes())
+            .map(|value| value.as_slice() == b"New");
+        request_dirs.push((*id, origin(props, &section), policy, cmp0189));
         requests.push(request);
     }
 
@@ -113,7 +120,7 @@ pub(super) fn write(
     let evaluate = |value: &[u8],
                     request: &FileGenerateRequest<'_>,
                     context: FileGenerateContext<'_>| {
-        let (dir, backtrace, policy) = request_dirs
+        let (dir, backtrace, policy, cmp0189) = request_dirs
             .get(&std::ptr::from_ref(request))
             .ok_or_else(invalid_record)?;
         request_dir = Some(*dir);
@@ -133,6 +140,14 @@ pub(super) fn write(
                 })
             })
             .transpose()?;
+        let policies: Vec<(&'static [u8], bool)> = cmp0189
+            .map(|new| (b"CMP0189".as_slice(), new))
+            .into_iter()
+            .collect();
+        let mut genex_host = CallSitePolicies {
+            inner: &mut genex_host,
+            policies: &policies,
+        };
         let ctx = EvalContext {
             config: ConfigId(context.configuration.into()),
             language: context.language.map(BString::from),

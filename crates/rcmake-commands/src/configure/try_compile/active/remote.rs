@@ -114,6 +114,11 @@ mod tests {
         });
         host.seed_file(curl, b"curl fixture")?;
         host.set_permissions(curl, 0o755)?;
+        // `PureHost` reports a Unix system on every platform, so name the fixture.
+        host.env_set(
+            b"RCMAKE_CACHE_REMOTE_CURL",
+            Some(rcmake_host::path::from_native(curl).as_slice()),
+        );
         let runs = Arc::new(AtomicUsize::new(0));
         let seen = Arc::clone(&runs);
         host.set_command_handler(move |_, _, _| {

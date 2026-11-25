@@ -1974,3 +1974,28 @@ fn install_directory_replaces_the_destination_symlink() -> TestResult {
     );
     Ok(())
 }
+
+#[test]
+fn file_install_drops_a_trailing_dot_from_the_destination() -> TestResult {
+    let (host, mut interp) = interpreter();
+    host.seed_file(Path::new("/work/src/one.txt"), b"one")?;
+    script(
+        &host,
+        &mut interp,
+        "file(INSTALL DESTINATION /work/prefix/. TYPE FILE FILES src/one.txt)\n",
+    )?;
+    assert_eq!(
+        host.read(
+            Path::new("/work/prefix/one.txt"),
+            ReadRange::All { limit: 16 }
+        )?,
+        b"one"
+    );
+    let stdout = host.stream_bytes(Stream::Stdout).to_string();
+    assert!(
+        stdout.contains("Installing: /work/prefix/one.txt"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("/./"), "{stdout}");
+    Ok(())
+}

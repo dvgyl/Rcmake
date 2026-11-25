@@ -656,6 +656,21 @@ impl Cx<'_> {
         );
     }
 
+    /// Issue a diagnostic at the current backtrace of directory `dir`
+    /// (`cmMakefile::IssueMessage` on the makefile of that directory).
+    pub fn issue_for_directory(
+        &mut self,
+        dir: DirId,
+        kind: MessageKind,
+        effect: Effect,
+        category: Option<DiagCategory>,
+        body: BString,
+    ) {
+        let location = Location::Backtrace(self.interp.directory_backtrace(dir));
+        self.interp
+            .issue_at(kind, effect, category, None, location, body, true);
+    }
+
     /// Report an error associated with a directory's main listfile.
     pub fn issue_directory_error(&mut self, dir: DirId, body: BString) {
         let source = &self.interp.project.dir(dir).source_dir;
@@ -680,6 +695,23 @@ impl Cx<'_> {
     /// with optional text before and after it.
     pub fn issue_policy_warning(&mut self, id: PolicyId, preface: &[u8], postface: &[u8]) {
         self.interp.issue_policy_warning(id, preface, postface);
+    }
+
+    /// Issue a policy warning at the current backtrace of directory `dir`.
+    ///
+    /// CMake issues some property diagnostics through the makefile of the directory that
+    /// owns the property. An active ancestor directory reports at its
+    /// `add_subdirectory` call.
+    pub fn issue_policy_warning_in(
+        &mut self,
+        dir: DirId,
+        id: PolicyId,
+        preface: &[u8],
+        postface: &[u8],
+    ) {
+        let location = Location::Backtrace(self.interp.directory_backtrace(dir));
+        self.interp
+            .issue_policy_warning_at(id, preface, postface, location);
     }
 
     /// Mark processing as stopped (`cmSystemTools::SetFatalErrorOccurred`).

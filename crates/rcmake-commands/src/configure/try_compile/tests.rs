@@ -193,6 +193,29 @@ try_compile(PROJECT_OLD /work/project-old /work/sub Child app OUTPUT_VARIABLE CH
     let log = std::str::from_utf8(&log)?;
     assert_eq!(log.matches("try_compile-v1").count(), 1);
     assert!(log.contains("description: \"Child build\""));
+    // One document holds every event, in the CMake 4.5.1 field order.
+    assert_eq!(log.matches("\n---\nevents:\n").count(), 1, "{log}");
+    let event = log
+        .split("  -\n")
+        .find(|event| event.contains("try_compile-v1"))
+        .ok_or("missing try_compile event")?;
+    let order = [
+        "kind:",
+        "backtrace:",
+        "description:",
+        "directories:",
+        "buildResult:",
+    ]
+    .map(|key| event.find(key));
+    assert!(order.iter().all(Option::is_some), "{event}");
+    assert!(order.windows(2).all(|pair| pair[0] < pair[1]), "{event}");
+    let result = event
+        .split("buildResult:\n")
+        .nth(1)
+        .ok_or("missing build result")?;
+    let fields = ["variable:", "cached:", "stdout: |", "exitCode:"].map(|key| result.find(key));
+    assert!(fields.iter().all(Option::is_some), "{event}");
+    assert!(fields.windows(2).all(|pair| pair[0] < pair[1]), "{event}");
     Ok(())
 }
 

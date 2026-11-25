@@ -11,6 +11,7 @@ use super::{probe_error, split_byte};
 const PROBE_LANGUAGES: &[&str] = &[
     "C", "CXX", "CUDA", "HIP", "OBJC", "OBJCXX", "SYCL", "Fortran", "ASM", "ISPC", "Swift",
 ];
+const CMP0056: PolicyId = PolicyId::new(56);
 const CMP0066: PolicyId = PolicyId::new(66);
 const CMP0067: PolicyId = PolicyId::new(67);
 const CMP0137: PolicyId = PolicyId::new(137);
@@ -123,6 +124,16 @@ impl TryCompileSeed {
         let config = cx.var_or_empty(b"CMAKE_TRY_COMPILE_CONFIGURATION");
         let honor_link_flags = !source_signature || cx.policy(CMP0210) == PolicyStatus::New;
         let honor_config_flags = cx.policy(CMP0066) == PolicyStatus::New;
+        if source_signature
+            && cx.policy(CMP0066) == PolicyStatus::Warn
+            && cx.var_is_on(b"CMAKE_POLICY_WARNING_CMP0066")
+        {
+            cx.issue_policy_warning(
+                CMP0066,
+                b"",
+                b"For compatibility with older versions of CMake, try_compile is not honoring caller config-specific compiler flags (e.g. CMAKE_C_FLAGS_DEBUG) in the test project.",
+            );
+        }
         let forward_platform = (source_signature || cx.policy(CMP0137) == PolicyStatus::New)
             && !cx.var_is_on(b"CMAKE_TRY_COMPILE_NO_PLATFORM_VARIABLES");
         let selected_config = if config.is_empty() {
@@ -249,6 +260,99 @@ fn is_platform_variable(name: &[u8]) -> bool {
         || name
             .windows(b"_USING_LINKER_".len())
             .any(|word| word == b"_USING_LINKER_")
+}
+
+/// Variables that the configure log records as passed to the test project, sorted by
+/// name. `languages` is `Some` for the source file signature. `CMAKE_FLAGS` entries are
+/// not recorded.
+pub(super) fn logged_variables(
+    cx: &mut Cx<'_>,
+    languages: Option<&[BString]>,
+) -> Vec<(BString, BString)> {
+    let mut variables = BTreeMap::new();
+    if let Some(languages) = languages {
+        let config = cx.var_or_empty(b"CMAKE_TRY_COMPILE_CONFIGURATION");
+        let config = if config.is_empty() {
+            b"DEBUG".to_vec()
+        } else {
+            config.to_ascii_uppercase()
+        };
+        let honor_config_flags = cx.policy(CMP0066) == PolicyStatus::New;
+        for lang in languages {
+            let flags = [b"CMAKE_", lang.as_slice(), b"_FLAGS"].concat();
+            if honor_config_flags {
+                let name = [flags.as_slice(), b"_", &config].concat();
+                let value = cx.var_or_empty(&name);
+                variables.insert(BString::from(name), value);
+            }
+            let value = cx.var_or_empty(&flags);
+            variables.insert(BString::from(flags), value);
+        }
+        if cx.policy(CMP0056) == PolicyStatus::New {
+            let name = b"CMAKE_EXE_LINKER_FLAGS";
+            variables.insert(BString::from(name.as_slice()), cx.var_or_empty(name));
+        }
+        if !cx.var_is_on(b"CMAKE_TRY_COMPILE_NO_PLATFORM_VARIABLES") {
+            let extra = list::split(
+                &cx.var_or_empty(b"CMAKE_TRY_COMPILE_PLATFORM_VARIABLES"),
+                list::Empty::Drop,
+            );
+            for name in PLATFORM_VARIABLES
+                .iter()
+                .map(|&name| BString::from(name))
+                .chain(extra)
+            {
+                if let Some(value) = cx.var(&name) {
+                    variables.insert(name, value);
+                }
+            }
+        }
+    }
+    let top_level = b"CMAKE_PROJECT_TOP_LEVEL_INCLUDES";
+    if cx
+        .global()
+        .props
+        .get(b"PROPAGATE_TOP_LEVEL_INCLUDES_TO_TRY_COMPILE")
+        .is_some_and(|value| truth::is_on(value))
+        && let Some(value) = cx.var(top_level)
+    {
+        variables.insert(BString::from(top_level.as_slice()), value);
+    }
+    variables.into_iter().collect()
+}
+
+/// `CMP0067` `WARN` with `CMAKE_POLICY_WARNING_CMP0067`: name the language standard
+/// variables that the test project does not honor.
+pub(super) fn warn_ignored_standards(cx: &mut Cx<'_>, options: &Options<'_>, languages: &[&[u8]]) {
+    if cx.policy(CMP0067) != PolicyStatus::Warn
+        || !cx.var_is_on(b"CMAKE_POLICY_WARNING_CMP0067")
+        || STANDARD_OPTIONS.iter().any(|name| options.has(name))
+    {
+        return;
+    }
+    let mut ignored = Vec::new();
+    for &lang in languages {
+        for suffix in [
+            b"_STANDARD".as_slice(),
+            b"_STANDARD_REQUIRED",
+            b"_EXTENSIONS",
+        ] {
+            let name = [b"CMAKE_".as_slice(), lang, suffix].concat();
+            if !cx.var_or_empty(&name).is_empty() {
+                ignored.push(name);
+            }
+        }
+    }
+    if ignored.is_empty() {
+        return;
+    }
+    let mut text = b"For compatibility with older versions of CMake, try_compile is not honoring language standard variables in the test project:\n".to_vec();
+    for name in ignored {
+        text.extend_from_slice(b"  ");
+        text.extend_from_slice(&name);
+        text.push(b'\n');
+    }
+    cx.issue_policy_warning(CMP0067, b"", &text);
 }
 
 pub(super) fn language_properties(

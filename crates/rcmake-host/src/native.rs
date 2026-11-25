@@ -254,7 +254,9 @@ impl Host for NativeHost {
 
     fn create_dir_all(&self, p: &Path) -> HostResult<()> {
         require_absolute(p)?;
-        io_at(fs::create_dir_all(p), p)
+        // `fs::create_dir_all` fails for a missing parent when the path ends in `/.`.
+        let clean: PathBuf = p.components().collect();
+        io_at(fs::create_dir_all(clean), p)
     }
 
     fn remove_file(&self, p: &Path) -> HostResult<()> {
@@ -618,5 +620,16 @@ mod tests {
         })();
         let cleanup = fs::remove_dir_all(&dir);
         result.and(cleanup)
+    }
+
+    #[test]
+    fn creates_missing_parents_for_a_path_that_ends_in_a_dot() -> HostResult<()> {
+        let dir = tempfile::tempdir().map_err(|err| HostError::from_io(err, None))?;
+        let host = NativeHost::new()?;
+        let target = dir.path().join("prefix").join("nested").join(".");
+        host.create_dir_all(&target)?;
+        let created = host.metadata(&dir.path().join("prefix").join("nested"), Follow::No)?;
+        assert_eq!(created.kind, FileKind::Dir);
+        Ok(())
     }
 }

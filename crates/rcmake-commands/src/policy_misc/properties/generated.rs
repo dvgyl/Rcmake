@@ -54,21 +54,23 @@ pub(super) fn set(
     let non_boolean = !unset && !truth::is_on(value);
     if status == PolicyStatus::Warn {
         if non_boolean {
-            cx.issue_policy_warning(CMP0118, b"", &[
+            cx.issue_policy_warning_in(dir, CMP0118, b"", &[
                 b"Attempt to set property 'GENERATED' with the following non-boolean value (which will be interpreted as \"0\"):\n",
                 value,
                 b"\nThat exact value will not be retrievable. A value of \"0\" will be returned instead.\nThis will be an error under policy CMP0118.",
             ].concat());
         }
         if unset {
-            cx.issue_policy_warning(
+            cx.issue_policy_warning_in(
+                dir,
                 CMP0118,
                 b"",
                 b"Unsetting property 'GENERATED' will not be allowed under policy CMP0118!",
             );
         }
         if appending {
-            cx.issue_policy_warning(
+            cx.issue_policy_warning_in(
+                dir,
                 CMP0118,
                 b"",
                 b"Appending to property 'GENERATED' will not be allowed under policy CMP0118!",
@@ -95,7 +97,8 @@ pub(super) fn set(
         return true;
     };
     let _ = select_source(cx, dir, source, scoped, true);
-    cx.issue_in_directory(
+    cx.issue_for_directory(
+        dir,
         MessageKind::AuthorWarning,
         Effect::None,
         Some(DiagCategory::Author),

@@ -652,6 +652,21 @@ mod tests {
             .collect()
     }
     #[test]
+    fn maps_file_urls_with_and_without_a_drive_letter() {
+        use archive::local_url_path;
+        assert_eq!(local_url_path("file:///work/a.tgz"), Some("/work/a.tgz"));
+        assert_eq!(
+            local_url_path("file:///C:/work/a.tgz"),
+            Some("C:/work/a.tgz")
+        );
+        assert_eq!(
+            local_url_path("file://C:/work/a.tgz"),
+            Some("C:/work/a.tgz")
+        );
+        assert_eq!(local_url_path("relative/a.tgz"), Some("relative/a.tgz"));
+        assert_eq!(local_url_path("https://example.org/a.tgz"), None);
+    }
+    #[test]
     fn parses_mirrors_and_md5_with_an_explicit_destination()
     -> Result<(), Box<dyn std::error::Error>> {
         let host = rcmake_host::PureHost::default();

@@ -253,3 +253,99 @@ fn source_group_tree_rejects_paths_outside_the_root() -> TestResult {
     );
     Ok(())
 }
+
+/// Configure `files` (relative path, content) with an optional project file name.
+fn configure_tree(
+    files: &[(&str, &str)],
+    list_file: Option<&str>,
+) -> Result<(Arc<PureHost>, i32), Box<dyn std::error::Error>> {
+    let root = PathBuf::from(if cfg!(windows) { "C:/work" } else { "/work" });
+    let source = root.join("src");
+    let command = root.join("bin/cmake");
+    let host = Arc::new(PureHost::new(source.clone(), command.clone()));
+    for (name, content) in files {
+        host.seed_file(&source.join(name), content.as_bytes())?;
+    }
+    let mut interp = Interp::new(
+        InterpConfig {
+            services: Default::default(),
+            host: host.clone(),
+            mode: RunMode::Configure,
+            cmake_root: root.join("share/cmake-4.5"),
+            cmake_command: command,
+            cwd: source.clone(),
+            limits: Default::default(),
+            diag: Default::default(),
+            defines: Vec::new(),
+            script_args: Vec::new(),
+        },
+        crate::register_all,
+    );
+    if let Some(name) = list_file {
+        interp.set_list_file_name(name.into());
+    }
+    let outcome = interp.run_configure(&source, &root.join("build"), &[]);
+    Ok((host, outcome.exit_code))
+}
+
+#[test]
+fn subdirectory_diagnostics_start_a_new_call_stack() -> TestResult {
+    let (host, code) = configure_tree(
+        &[
+            (
+                "CMakeLists.txt",
+                "cmake_minimum_required(VERSION 3.10)\nproject(p NONE)\nadd_subdirectory(sub)\n",
+            ),
+            (
+                "sub/CMakeLists.txt",
+                "message(AUTHOR_WARNING \"in sub\")\n\
+                 set_property(SOURCE \"${CMAKE_CURRENT_BINARY_DIR}/../gen.txt\"\n\
+                   DIRECTORY \"${CMAKE_CURRENT_BINARY_DIR}/..\" PROPERTY GENERATED 0)\n",
+            ),
+        ],
+        None,
+    )?;
+    assert_eq!(code, 0);
+    let stderr = host.stream_bytes(Stream::Stderr).to_string();
+    let sub_warning = stderr
+        .split("CMake Warning")
+        .find(|warning| warning.contains("in sub"))
+        .ok_or("missing subdirectory warning")?;
+    assert!(!sub_warning.contains("Call Stack"), "{stderr}");
+    // A GENERATED warning for the parent directory uses the parent's current call site.
+    assert!(
+        stderr.contains("at CMakeLists.txt:3 (add_subdirectory):"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("Unsetting property 'GENERATED' will not be allowed"),
+        "{stderr}"
+    );
+    Ok(())
+}
+
+#[test]
+fn project_file_name_selects_each_directory_listfile() -> TestResult {
+    let (host, code) = configure_tree(
+        &[
+            ("CMakeLists.txt", "message(FATAL_ERROR \"wrong root\")\n"),
+            (
+                "other.cmake",
+                "cmake_minimum_required(VERSION 4.5)\nproject(p NONE)\n\
+                 add_subdirectory(a)\nadd_subdirectory(b)\n",
+            ),
+            (
+                "a/other.cmake",
+                "message(STATUS \"a: ${CMAKE_CURRENT_LIST_FILE}\")\n",
+            ),
+            ("a/CMakeLists.txt", "message(FATAL_ERROR \"wrong a\")\n"),
+            ("b/CMakeLists.txt", "message(STATUS \"b: fallback\")\n"),
+        ],
+        Some("other.cmake"),
+    )?;
+    assert_eq!(code, 0, "{}", host.stream_bytes(Stream::Stderr));
+    let stdout = host.stream_bytes(Stream::Stdout).to_string();
+    assert!(stdout.contains("a/other.cmake"), "{stdout}");
+    assert!(stdout.contains("b: fallback"), "{stdout}");
+    Ok(())
+}

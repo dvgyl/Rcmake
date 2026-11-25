@@ -198,10 +198,11 @@ fn install_export_writes_relocatable_configuration_files() {
         ]
     );
     let main = read_text(&host, &out.join("fmt-targets.cmake"));
+    // CMake goes up once per non-empty destination component, `.` included.
     assert_eq!(
         main.matches("get_filename_component(_IMPORT_PREFIX ")
             .count(),
-        4
+        5
     );
     assert!(main.contains("add_library(\"fmt::headers\" INTERFACE IMPORTED)"));
     assert!(main.contains("add_executable(\"fmt::tool\" IMPORTED)"));
