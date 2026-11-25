@@ -136,6 +136,119 @@ fn read(host: &dyn Host, path: &Path) -> HostResult<Vec<u8>> {
 }
 
 #[test]
+fn evaluates_generator_hover_and_preserves_target_definition() -> TestResult {
+    let project = Project::new();
+    let lists = r#"include(defs.cmake)
+add_library(app INTERFACE)
+target_compile_definitions(app INTERFACE "$<$<CONFIG:Debug>:DEBUG_ONLY>")
+set(output "$<TARGET_FILE:tool>")
+set_target_properties(app PROPERTIES CUSTOM "$<TARGET_PROPERTY:NAME>")
+set_property(TARGET app PROPERTY OTHER "$<TARGET_PROPERTY:tool,NAME>")
+"#;
+    let defs = "add_executable(tool IMPORTED)\n";
+    project.file("defs.cmake", defs)?;
+    let provider = project
+        .provider(|session| {
+            let mut result = model_at(session);
+            result.model.generator = Some(rcmake_model::GeneratorKind::NinjaMultiConfig);
+            result
+                .model
+                .dir_mut(DirId::ROOT)
+                .vars
+                .insert("CMAKE_CONFIGURATION_TYPES".into(), "Debug;Release".into());
+            let defs = session.source_dir.join("defs.cmake");
+            read(session.host().as_ref(), &defs)?;
+            let mut tool = Target::new(
+                "tool".into(),
+                TargetKind::Executable,
+                TargetOrigin::Imported(rcmake_model::ImportedVisibility::Global),
+                DirId::ROOT,
+                Backtrace::default(),
+                PolicyMap::default(),
+            );
+            tool.props.set(
+                "IMPORTED_LOCATION".into(),
+                from_native_cmake(&session.build_dir.join("bin/tool")),
+            );
+            let id = result
+                .model
+                .add_target(tool)
+                .map_err(|_| invalid_fixture())?;
+            result.facts.target_sites.insert(id, location(&defs, 1));
+            result
+                .model
+                .add_target(Target::new(
+                    "app".into(),
+                    TargetKind::InterfaceLibrary,
+                    TargetOrigin::Normal,
+                    DirId::ROOT,
+                    Backtrace::default(),
+                    PolicyMap::default(),
+                ))
+                .map_err(|_| invalid_fixture())?;
+            Ok(result)
+        })
+        .with_explicit_refresh();
+    let root_uri = project.uri("CMakeLists.txt");
+    open(&provider, &root_uri, lists, 1);
+    provider.snapshots().refresh()?;
+
+    for (word, expected) in [
+        (
+            "DEBUG_ONLY",
+            [
+                r"$<$<CONFIG:Debug>:DEBUG_ONLY>",
+                r"Target: app",
+                r"Debug: DEBUG_ONLY",
+                "Release: (empty)",
+            ],
+        ),
+        (
+            "$<TARGET_FILE",
+            [
+                "$<TARGET_FILE:tool>",
+                "Target: None",
+                "bin/tool",
+                r"CMakeLists.txt:4",
+            ],
+        ),
+        (
+            "$<TARGET_PROPERTY:NAME>",
+            [
+                "$<TARGET_PROPERTY:NAME>",
+                "Target: app",
+                "Debug: app",
+                "Release: app",
+            ],
+        ),
+        (
+            "$<TARGET_PROPERTY:tool",
+            [
+                "$<TARGET_PROPERTY:tool,NAME>",
+                "Target: app",
+                "Debug: tool",
+                "Release: tool",
+            ],
+        ),
+    ] {
+        let (hover, version) = provider
+            .hover_markdown(&cursor(&root_uri, lists, 1, word))
+            .ok_or("Missing generator expression hover")?;
+        assert_eq!(version, Some(1));
+        for value in expected {
+            assert!(hover.contains(value), "{value:?} missing from {hover:?}");
+        }
+    }
+    for word in ["tool>", "tool,NAME>"] {
+        let definitions = provider.definitions(&cursor(&root_uri, lists, 1, word));
+        assert_eq!(definitions.len(), 1);
+        assert_eq!(definitions[0].uri, project.uri("defs.cmake"));
+        assert_eq!(definitions[0].start.line, 0);
+    }
+    Ok(())
+}
+
+#[test]
 fn defines_unopened_functions_targets_and_aliases() -> TestResult {
     let project = Project::new();
     let root = "include(defs.cmake)\nMY_HELPER(arg)\ntarget_link_libraries(app PRIVATE tools tools_alias)\n";

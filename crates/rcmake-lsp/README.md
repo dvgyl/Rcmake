@@ -4,7 +4,7 @@ Build the native language server from the repository root.
 
 ```sh
 source env/env.sh
-cargo build --locked --release -p rcmake-lsp --features stdio
+cargo build --locked --release -p rcmake-lsp --features eval,stdio
 ```
 
 The executable is `target/release/rcmake-lsp` or `rcmake-lsp.exe` on Windows.
@@ -26,14 +26,21 @@ path to `modules/cmake-4.5`.
 
 ## Editor behavior
 
-The standalone server reads CMake source text and gives lexical results.
+With `eval,stdio`, the server evaluates the project in memory when it finds
+the workspace listfile and CMake modules. It uses unsaved changes and prevents
+configure from starting external processes. Hover can show evaluated variables,
+targets, and generator expressions. Generator expression hover shows the result
+for each build configuration in the snapshot. The server marks results from an
+incomplete configure or an earlier edit as provisional.
+
+With `stdio` alone, the server uses lexical analysis. The evaluated server also
+uses lexical analysis when it has no evaluated result for a query.
 It follows literal `include()` and `add_subdirectory()` calls from the project
 root. It uses open document text in place of disk text, including unsaved
 changes. It recognizes literal module search paths and the
 `${CMAKE_CURRENT_LIST_DIR}` and `${CMAKE_CURRENT_SOURCE_DIR}` path prefixes.
 It can return more than one possible definition when the source has conditional
-declarations or path choices. It cannot resolve general CMake expressions or
-show evaluated values.
+declarations or path choices.
 
 Document symbols, completion, navigation, and semantic tokens use available
 source text while a call or block is incomplete. Formatting changes only the

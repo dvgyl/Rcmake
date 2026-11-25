@@ -367,7 +367,7 @@ fn prose(text: &str, markdown: bool) -> String {
     }
 }
 
-fn code(text: &str, markdown: bool) -> String {
+pub(super) fn code(text: &str, markdown: bool) -> String {
     if !markdown {
         return text.to_owned();
     }
@@ -385,7 +385,7 @@ fn single_line(bytes: &[u8]) -> String {
     preview(bytes, 160).replace(['\r', '\n'], " ")
 }
 
-fn preview(bytes: &[u8], limit: usize) -> String {
+pub(super) fn preview(bytes: &[u8], limit: usize) -> String {
     let prefix = bytes.get(..limit.saturating_add(3)).unwrap_or(bytes);
     let mut text = String::from_utf8_lossy(prefix).into_owned();
     clip(&mut text, limit);

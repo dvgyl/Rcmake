@@ -5,19 +5,23 @@ use std::{
 };
 
 use rcmake_api::{CompletionKind, ExecutedSymbol, SourceLocation, WorkspaceIndex};
-use rcmake_base::BString;
+use rcmake_base::{BString, list};
 use rcmake_diag::{SourceId, source::SourceKind};
+use rcmake_genex::{ConfigId, EvalContext, GenexHost, UsageTraversal};
 use rcmake_host::{
     Host,
     path::{from_native_cmake, to_native},
 };
 use rcmake_json::Value;
+use rcmake_model::DirId;
+use rcmake_resolve::usage::{ObjectPaths, UsageResolver};
 use rcmake_syntax::{ArgKind, Argument, CommandInvocation};
 
 use crate::{
     Position, PositionEncoding, SemanticContext, SemanticDefinition, SemanticLocation,
     SemanticResult,
     analysis::Document,
+    catalog::escape_markdown,
     expression::{self, Kind as ExprKind},
     json::{object, uint},
     lexical,
@@ -28,7 +32,7 @@ use crate::{
 
 use super::{
     Buffers, EvalSemanticProvider, Snapshot, SnapshotReply, buffer_path,
-    presentation::{Binding, ValueAt},
+    presentation::{Binding, ValueAt, code, preview},
     read_file,
 };
 
@@ -74,7 +78,6 @@ impl EvalSemanticProvider {
     ) -> Option<SnapshotReply<Option<T>>> {
         self.snapshots.query(|snapshot, buffers| {
             let query = Query::new(self.host(), snapshot, buffers, context)?;
-            let (kind, name) = query.subject()?;
             let label = if !query.fresh || query.index.is_provisional() {
                 if markdown {
                     "*(provisional snapshot)*\n\n"
@@ -84,6 +87,15 @@ impl EvalSemanticProvider {
             } else {
                 ""
             };
+            let version = snapshot
+                .inputs
+                .by_uri
+                .get(context.uri)
+                .map(|buffer| buffer.document.version);
+            if let Some((raw, hover)) = query.generator_hover(markdown) {
+                return Some(format(raw.as_bytes(), version, format!("{label}{hover}")));
+            }
+            let (kind, name) = query.subject()?;
             let separator = if markdown { "\n\n---\n\n" } else { "\n\n" };
             let mut sections = Vec::new();
             let mut used = label.len();
@@ -110,11 +122,6 @@ impl EvalSemanticProvider {
             if sections.is_empty() {
                 return None;
             }
-            let version = snapshot
-                .inputs
-                .by_uri
-                .get(context.uri)
-                .map(|buffer| buffer.document.version);
             Some(format(
                 name,
                 version,
@@ -332,6 +339,55 @@ enum Kind {
     Variable(Variable),
 }
 
+fn generator_context(command: &CommandInvocation, index: usize) -> (&[Argument], UsageTraversal) {
+    let name = command.lower.as_slice();
+    let args = &command.args;
+    let first = args
+        .first()
+        .map_or(b"".as_slice(), |arg| arg.text.as_slice());
+    let (names, property) = match name {
+        b"set_target_properties" => args
+            .iter()
+            .position(|arg| arg.text == "PROPERTIES")
+            .filter(|&marker| index > marker)
+            .map_or((&[][..], None), |marker| {
+                let property = marker + 1 + (index - marker - 1) / 2 * 2;
+                (args.get(..marker).unwrap_or_default(), args.get(property))
+            }),
+        b"set_property" if first == b"TARGET" => {
+            let end = args.iter().position(|arg| arg.text == "PROPERTY");
+            end.filter(|&marker| index > marker)
+                .map_or((&[][..], None), |marker| {
+                    let names = args.get(1..marker).unwrap_or_default();
+                    let end = names
+                        .iter()
+                        .position(|arg| matches!(arg.text.as_slice(), b"APPEND" | b"APPEND_STRING"))
+                        .unwrap_or(names.len());
+                    (names.get(..end).unwrap_or_default(), args.get(marker + 1))
+                })
+        }
+        _ if name.starts_with(b"target_")
+            || name == b"add_executable"
+            || name == b"add_library" =>
+        {
+            (args.get(..1).unwrap_or_default(), None)
+        }
+        _ => (&[][..], None),
+    };
+    let traversal = if name.starts_with(b"target_link_")
+        || property.is_some_and(|arg| {
+            arg.text
+                .strip_prefix(b"INTERFACE_")
+                .unwrap_or(&arg.text)
+                .starts_with(b"LINK_")
+        }) {
+        UsageTraversal::Link
+    } else {
+        UsageTraversal::Compile
+    };
+    (names, traversal)
+}
+
 impl Kind {
     fn expression(kind: ExprKind) -> Option<Self> {
         match kind {
@@ -440,6 +496,135 @@ impl<'a> Query<'a> {
                     .first()
                     .is_some_and(|arg| arg.span.contains(&self.offset))
         })
+    }
+
+    fn generator_hover(&self, markdown: bool) -> Option<(&'a str, String)> {
+        self.same_buffer.then_some(())?;
+        let command = self.doc.command_at(self.offset)?;
+        let (index, arg) = command
+            .args
+            .iter()
+            .enumerate()
+            .find(|(_, arg)| arg.span.contains(&self.offset))?;
+        let span = argument_payload(&self.doc.text, arg)?;
+        let payload = self.doc.text.get(span.clone())?;
+        let expression = expression::generator_at(payload, self.offset.checked_sub(span.start)?)?;
+        let line = self.doc.lines.line_at(span.start + expression.start) + 1;
+        let raw = payload.get(expression)?;
+        if raw.len() > MAX_HOVER_BYTES / 2 {
+            return None;
+        }
+        let ast = rcmake_genex::parse(raw.as_bytes()).ok()?;
+        let result = &self.snapshot.result;
+        let model = &result.model;
+        let configs = result.generation.as_ref().map_or_else(
+            || {
+                if let Some(generator) = model.generator.filter(|kind| kind.multi_config()) {
+                    if let Some(value) = model.definition(DirId::ROOT, b"CMAKE_CONFIGURATION_TYPES")
+                    {
+                        return list::split(value, list::Empty::Drop)
+                            .into_iter()
+                            .map(ConfigId)
+                            .collect();
+                    }
+                    return generator
+                        .default_configuration_types()
+                        .iter()
+                        .map(|name| ConfigId((*name).into()))
+                        .collect();
+                }
+                vec![ConfigId(
+                    model
+                        .definition(DirId::ROOT, b"CMAKE_BUILD_TYPE")
+                        .cloned()
+                        .unwrap_or_default(),
+                )]
+            },
+            |generation| generation.configs.clone(),
+        );
+        let (names, traversal) = generator_context(command, index);
+        let mut usage = UsageResolver::new(model);
+        let objects = result
+            .generation
+            .as_ref()
+            .map(|generation| ObjectPaths::new(&generation.targets));
+        let display = |text: &str| {
+            if markdown {
+                escape_markdown(text)
+            } else {
+                text.to_owned()
+            }
+        };
+        let mut seen = BTreeSet::new();
+        let mut text = code(raw, markdown);
+        for path in &self.spellings {
+            for &dir in self.index.scopes_for_file(path) {
+                if !seen.insert(dir) {
+                    continue;
+                }
+                let mut host = usage.host(dir);
+                if let Some(objects) = &objects {
+                    host = host.with_object_paths(objects);
+                }
+                let targets: Vec<_> = if names.is_empty() {
+                    vec![(None, None)]
+                } else {
+                    names
+                        .iter()
+                        .map(|arg| {
+                            let name = arg.text.as_slice();
+                            let name = name
+                                .strip_prefix(b"${")
+                                .and_then(|name| name.strip_suffix(b"}"))
+                                .and_then(|name| self.index.lookup_variable(dir, name))
+                                .map_or(name, |var| var.value.as_slice());
+                            (Some(name), host.find_target(name))
+                        })
+                        .collect()
+                };
+                for (name, target) in targets {
+                    let name =
+                        name.map_or_else(|| "None".to_owned(), |name| display(&preview(name, 160)));
+                    text.push_str(&format!(
+                        "\n\nTarget: {name}\n\nSource: {}:{line}",
+                        display(&preview(path, 320)),
+                    ));
+                    for config in &configs {
+                        let ctx = EvalContext {
+                            config: config.clone(),
+                            current: target,
+                            head: target,
+                            traversal,
+                            quiet: true,
+                            ..EvalContext::default()
+                        };
+                        let value = match rcmake_genex::evaluate(&ast, &ctx, &mut host) {
+                            Ok((value, _)) => {
+                                if value.is_empty() {
+                                    "(empty)".to_owned()
+                                } else {
+                                    preview(&value, 800)
+                                }
+                            }
+                            Err(error) => format!(
+                                "Cannot evaluate. {}",
+                                preview(error.to_string().as_bytes(), 800)
+                            ),
+                        };
+                        let config = if config.0.is_empty() {
+                            "Default".to_owned()
+                        } else {
+                            preview(&config.0, 100)
+                        };
+                        text.push_str(&format!("\n\n{}: {}", display(&config), display(&value)));
+                        if text.len() > MAX_HOVER_BYTES - 64 {
+                            return Some((raw, preview(text.as_bytes(), MAX_HOVER_BYTES - 64)));
+                        }
+                    }
+                }
+            }
+        }
+        (!seen.is_empty()).then_some((raw, text))
     }
 
     fn subject(&self) -> Option<(Kind, &'a [u8])> {

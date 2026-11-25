@@ -306,12 +306,14 @@ class Protocol:
 def check_lsp(binary, source, env):
     settings = source / "settings.cmake"
     top = source / "CMakeLists.txt"
-    lists = PROJECT + 'message(STATUS "${EVALUATED}")\n'
+    genex = 'target_compile_definitions(component INTERFACE "$<$<CONFIG:Debug>:DEBUG_MODE>")'
+    lists = PROJECT + f"set(CMAKE_BUILD_TYPE Debug)\n{genex}\n" + 'message(STATUS "${EVALUATED}")\n'
     top.write_text(lists, encoding="utf-8")
     with subprocess.Popen([binary], cwd=source, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE) as process:
         try:
             client = Protocol(process)
-            client.request("initialize", {"rootUri": source.as_uri(), "capabilities": {}})
+            client.request("initialize", {"rootUri": source.as_uri(), "capabilities": {
+                "textDocument": {"hover": {"contentFormat": ["markdown"]}}}})
             client.send("initialized", {})
             def open_doc(path, text):
                 client.send("textDocument/didOpen", {"textDocument": {
@@ -338,6 +340,12 @@ def check_lsp(binary, source, env):
             assert "message" in json.dumps(query("hover", 3, 2))
             wait_for("from-disk")
             assert "Value at end of directory" in hover()
+            result = query("hover", len(lists.splitlines()) - 2, genex.index("DEBUG_MODE"))
+            assert result["contents"]["kind"] == "markdown", result
+            value = result["contents"]["value"]
+            assert "$<$<CONFIG:Debug>:DEBUG_MODE>" in value, result
+            assert "Debug: DEBUG_MODE" in value and "Target: component" in value, result
+            assert f"CMakeLists.txt:{len(lists.splitlines()) - 1}" in value, result
             open_doc(settings, SETTINGS)
             # Request hover while a newer edit is pending.
             change(2, "foreach(item RANGE 250000)\nendforeach()\n" + SETTINGS.replace('"disk"', '"obsolete"'))

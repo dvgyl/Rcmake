@@ -872,9 +872,11 @@ dependencies = [
  "rcmake-base",
  "rcmake-diag",
  "rcmake-eval",
+ "rcmake-genex",
  "rcmake-host",
  "rcmake-json",
  "rcmake-model",
+ "rcmake-resolve",
  "rcmake-syntax",
 ]
 

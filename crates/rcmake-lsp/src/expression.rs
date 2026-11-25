@@ -75,6 +75,21 @@ impl Frame {
 }
 
 pub(crate) fn expressions(text: &str) -> Vec<Expression> {
+    scan(text, |_| {})
+}
+
+#[cfg(feature = "eval")]
+pub(crate) fn generator_at(text: &str, offset: usize) -> Option<Range<usize>> {
+    let mut found = None;
+    scan(text, |span| {
+        if span.contains(&offset) {
+            found = Some(span);
+        }
+    });
+    found
+}
+
+fn scan(text: &str, mut generator: impl FnMut(Range<usize>)) -> Vec<Expression> {
     let mut found = Vec::new();
     let mut stack: Vec<Frame> = Vec::new();
     let mut cursor = 0;
@@ -117,6 +132,9 @@ pub(crate) fn expressions(text: &str) -> Vec<Expression> {
             match (frame.kind, byte) {
                 (Kind::Reference(_), b'}') | (Kind::Generator, b'>') => {
                     if let Some(frame) = stack.pop() {
+                        if frame.kind == Kind::Generator {
+                            generator(frame.start..cursor + 1);
+                        }
                         frame.emit(text, cursor, true, &mut found);
                     }
                 }
