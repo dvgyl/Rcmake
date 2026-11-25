@@ -1,8 +1,8 @@
 # Architecture
 
-Rcmake follows the execution model of CMake 4.5.1. The work goes through four
+`rcmake` follows the execution model of CMake 4.5.1. The work goes through four
 stages: command line, configure, generate, and build, test, or package. The
-workspace has 34 crates. Each crate has one responsibility, and the crate graph
+workspace has 35 crates. Each crate has one responsibility, and the crate graph
 has no cycles.
 
 ## Execution pipeline
@@ -51,6 +51,8 @@ has no cycles.
 
 The `rcmake-api` crate runs stage 2 and stage 3 in-process for other programs.
 The `rcmake-lsp` language server uses `rcmake-api` to evaluate open files.
+The `rcmake-wasm` crate uses `rcmake-api` on `PureHost` to run the browser
+playground.
 
 ## Resolution layers
 
@@ -142,7 +144,8 @@ The "Depends on" column lists only workspace crates. All crates except
 | --- | --- | --- |
 | `rcmake-cli` | The `rcmake` binary. Dispatches `cmake`, `ctest`, and `cpack` by name. Owns `--build`, `--install`, `--workflow`, `--find-package`, SARIF output, profiles, the `explain` subcommand, and the panic hook. | `api`, `base`, `commands`, `cpack`, `ctest`, `diag`, `eval`, `gen-common`, `gen-make`, `gen-ninja`, `gen-vs`, `gen-xcode`, `genex`, `host`, `instrument`, `json`, `model`, `presets`, `resolve`, `syntax`, `tool-e` |
 | `rcmake-api` | In-process configure (`run_configure`), workspace index, provenance, and `explain` queries. Builds for WebAssembly with `--no-default-features` (ADR-023, ADR-024). | `base`, `commands`, `diag`, `eval`, `genex`, `host`, `json`, `model`, `resolve`, `syntax` |
-| `rcmake-lsp` | Language server for CMake files. Gives lexical results by default. The `eval` feature adds evaluated results through `rcmake-api`. The `stdio` feature builds the `rcmake-lsp` binary. | `api` (optional), `base`, `diag`, `host`, `json`, `syntax` |
+| `rcmake-lsp` | Language server for CMake files. Gives lexical results by default. The `eval` feature adds evaluated results through `rcmake-api`. The `stdio` feature builds the `rcmake-lsp` binary. | `api` (optional), `base`, `diag`, `genex` (optional), `host`, `json`, `model` (optional), `resolve` (optional), `syntax` |
+| `rcmake-wasm` | The browser playground runtime. Reads a JSON request on standard input, configures the project on `PureHost`, and returns generated Ninja files, diagnostics, and `explain` results as JSON. `scripts/build-wasm.sh` builds it into `site/wasm/` with no `unsafe` code and no `wasm-bindgen`. | `api`, `base`, `diag`, `gen-common`, `gen-ninja`, `host`, `model`, `presets`, `resolve` |
 
 ### Verification
 
@@ -201,19 +204,19 @@ inputs, and the overlay host that the language server uses for unsaved files.
 4. **Regular expressions.** CMake uses its own dialect, with no non-greedy
    operators, its own anchor rules, and the `CMAKE_MATCH_<n>` and
    `CMAKE_MATCH_COUNT` side effects. `rcmake-regex` implements this dialect.
-   Rcmake does not use the Rust `regex` crate.
+   `rcmake` does not use the Rust `regex` crate.
 5. **Generator expressions.** Configure keeps unevaluated generator
    expressions. The parser handles nested `$<...>`, semicolons, and the full
    operator set. Multi-config generators evaluate them once for each
    configuration.
 6. **macOS defaults.** The compiler stays `/usr/bin/cc` and is not mapped into
-   Xcode. Rcmake adds `-isysroot` only when `CMAKE_OSX_SYSROOT` is set.
+   Xcode. `rcmake` adds `-isysroot` only when `CMAKE_OSX_SYSROOT` is set.
 7. **Lists.** A list is a string with `;` separators. `\;` is a literal
    semicolon, and square brackets change splitting. `rcmake-base::list`
    implements one splitting rule for all callers.
 8. **Bundled modules.** `CMAKE_ROOT` is `share/cmake-4.5` next to the binary.
    `project()` and `enable_language()` run the bundled CMake 4.5.1 modules.
-   Rcmake does not hard-code compiler flags or platform tables in Rust.
+   `rcmake` does not hard-code compiler flags or platform tables in Rust.
 
 ## Verification
 
@@ -225,16 +228,21 @@ and related variables. Only `rcmake-harness`, `tools/`, and the
 differential tests read these variables. The `rcmake` binary never runs the
 oracle. The licence scanner checks this rule.
 
-Rcmake is checked in four layers:
+`rcmake` is checked in seven layers. The
+[build write-up](BUILD_WRITEUP.md#4-the-differential-oracle-method) uses the
+same numbers.
 
 | Layer | Scope | Pass criterion |
 | --- | --- | --- |
-| 1. CLI and script output | `cmake -P`, `cmake -E`, CLI flags, `configure_file`, diagnostics, SARIF, presets | Byte-for-byte stdout, stderr, generated files, and exit code after path normalization |
-| 2. Upstream `Tests/RunCMake` | The CMake 4.5.1 conformance suite: scripts, policies, diagnostics, targets, generator expressions, presets, File API | Same pass or fail result and same diagnostic matches |
-| 3. Structured output | File API replies, `compile_commands.json`, `CMakeCache.txt` | Normalized structural equality |
-| 4. Real projects | Configure, build, install, and `ctest` of open-source C and C++ projects | No build errors, same installed files, same `ctest` results |
+| 1. Unit and integration tests | `cargo test --workspace` on `PureHost` and `NativeHost` | All tests pass on Linux, macOS, and Windows |
+| 2. Recorded CLI and script cases | `cmake -P`, `cmake -E`, CLI flags, `configure_file`, diagnostics, SARIF, presets | Byte-for-byte stdout, stderr, generated files, and exit code after path normalization |
+| 3. Upstream `Tests/RunCMake` | The CMake 4.5.1 conformance suite: scripts, policies, diagnostics, targets, generator expressions, presets, File API | Same pass or fail result and same diagnostic matches |
+| 4. Independent black-box suite | Small C, C++, Objective-C++, Fortran, and presets projects that both tools build, install, test, and package | All explicit checks pass for both tools, and normalized observations match |
+| 5. Large C++ projects | 10 unmodified open-source projects | L1: configure succeeds with the same stderr. L2: the same `CMakeCache.txt`, Ninja commands, graph edges, and File API replies. |
+| 6. Fuzzing and ecosystem lanes | 14 fuzz targets, `vcpkg`, Conan, and Qt 6 | No panics or resource exhaustion, and package-manager builds match |
+| 7. Sealed unseen holdout | 240 repositories that no one opened during development | L2 parity on the frozen release binary |
 
-For IDE generators, Rcmake compares canonical forms, not raw bytes. CMake
+For IDE generators, `rcmake` compares canonical forms, not raw bytes. CMake
 4.5.1 Xcode output changes between two runs, and Visual Studio output needs
 MSBuild to build. `tools/measure/pbxproj_canon.py` and
 `tools/measure/vs_canon.py` make the canonical forms.
@@ -243,13 +251,13 @@ MSBuild to build. `tools/measure/pbxproj_canon.py` and
 
 | Tool | Purpose |
 | --- | --- |
-| `rcmake-harness` | Layer 1. Runs `.case` files from `conformance/cases/` and compares with the oracle or with the baselines in `conformance/baselines/`. |
-| `tools/measure/runcmake_eval.py` | Layer 2. Runs upstream `Tests/RunCMake` suites with the staged binary. |
-| `tools/measure/independent_verify.py` | Black-box scenarios that build small C, C++, Objective-C++, Fortran, and presets projects with both tools. |
-| `tools/measure/corpus_eval.py`, `tools/corpus/` | Layer 4. Real projects from `conformance/corpus/`, with PATH replacement and Ninja command comparison. |
-| `tools/measure/bench_eval.py` | Median and p95 wall time and peak memory for Rcmake and the oracle. |
+| `rcmake-harness` | Layer 2. Runs `.case` files from `conformance/cases/` and compares with the oracle or with the baselines in `conformance/baselines/`. |
+| `tools/measure/runcmake_eval.py` | Layer 3. Runs upstream `Tests/RunCMake` suites with the staged binary. |
+| `tools/measure/independent_verify.py` | Layer 4. Black-box scenarios that build small C, C++, Objective-C++, Fortran, and presets projects with both tools. |
+| `tools/measure/corpus_eval.py`, `tools/corpus/` | Layers 5 and 7. Real projects from `conformance/corpus/`, with PATH replacement and Ninja command comparison. |
+| `tools/measure/bench_eval.py` | Median and p95 wall time and peak memory for `rcmake` and the oracle. |
 | `tools/measure/determinism.py` | Checks that two build directories get the same generated files. |
-| `rcmake-fuzz` | Random and adversarial input with a time budget for each case. Each failure can be replayed from its seed. |
+| `rcmake-fuzz` | Layer 6. Random and adversarial input with a time budget for each case. Each failure can be replayed from its seed. |
 
 ### Unit tests
 

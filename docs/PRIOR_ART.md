@@ -1,8 +1,8 @@
-# Prior Art and Dependency Licence Log
+# Prior art and dependency licence log
 
 This log records the licences and purpose of the vendored assets and direct workspace dependencies. The crate versions and licence expressions come from the locked Cargo graph.
 
-## Vendored Third-Party Assets
+## Vendored third-party assets
 
 | Asset | Upstream version | Licence | Location | Purpose |
 | --- | --- | --- | --- | --- |
@@ -15,9 +15,9 @@ This log records the licences and purpose of the vendored assets and direct work
 
 The [third-party notices](../THIRD_PARTY_NOTICES.md#1-cmake-451-modules-templates-help-and-derived-tables-bsd-3-clause) list the CMake licence and contributor files.
 
-## Direct Third-Party Dependencies
+## Direct third-party dependencies
 
-The licence expression lists the upstream terms. Rcmake uses an option on the scanner's allowlist when the expression offers a choice. [Third-party notices](../THIRD_PARTY_NOTICES.md)
+The licence expression lists the upstream terms. When the expression offers a choice, `rcmake` uses an option on the scanner's allowlist. The [third-party notices](../THIRD_PARTY_NOTICES.md) have the full licence texts.
 
 | Crate | Locked version | SPDX licence | Purpose |
 | --- | --- | --- | --- |
@@ -44,23 +44,24 @@ The licence expression lists the upstream terms. Rcmake uses an option on the sc
 
 The archive feature selection removes `zopfli`, `bumpalo`, and `xattr` from the lockfile. The lockfile still lists `log` for optional Jiff features. The macOS ARM64 build does not use it. On AArch64 targets that use an ABI other than MSVC, `sha2` enables `sha2-asm` (version 0.6.4, `MIT OR Apache-2.0`). This backend uses the ARMv8 SHA-2 instructions when the processor supports them.
 
-## Archive Codec Dependencies
+## Archive codec dependencies
 
 | Component | Locked version | SPDX licence | Purpose |
 | --- | --- | --- | --- |
 | `zstd-safe` | `8.3.0` | `BSD-3-Clause` | Give `zstd` safe access to the Zstandard library. |
-| `zstd-sys` | `2.1.3+zstd.1.5.7` | `BSD-3-Clause AND BSD-2-Clause` | Compile and bind Zstandard 1.5.7. Rcmake uses the C library under its BSD option. |
+| `zstd-sys` | `2.1.3+zstd.1.5.7` | `BSD-3-Clause AND BSD-2-Clause` | Compile and bind Zstandard 1.5.7. `rcmake` uses the C library under its BSD option. |
 | `liblzma-sys` | `0.4.9` | `MIT OR Apache-2.0` | Compile and bind the XZ Utils `liblzma` library. |
 | XZ Utils `liblzma` C sources | `5.8` | `0BSD` | Supply the xz codec in `src/liblzma` and `src/common/tuklib_*`. |
 | `libbz2-rs-sys` | `0.2.7` | `bzip2-1.0.6` | Supply the Rust port of libbzip2. |
 | `cc`, `jobserver`, `find-msvc-tools`, `shlex`, `pkg-config` | `1.11.3`, `0.1.35`, `0.1.15`, `2.0.1`, `0.3.34` | `MIT OR Apache-2.0` | Configure and compile the bundled C codec sources. |
 
-## Internal Workspace Dependencies
+## Internal workspace dependencies
 
-The direct path dependencies in the root manifest are Rcmake crates. Each uses `MIT OR Apache-2.0`.
+The path dependencies in `[workspace.dependencies]` of the root `Cargo.toml` are `rcmake` crates. Each uses `MIT OR Apache-2.0`. The leaf crates `rcmake-cli`, `rcmake-harness`, `rcmake-fuzz`, and `rcmake-wasm` are workspace members but not dependencies, so this table omits them.
 
 | Crate | Purpose |
 | --- | --- |
+| `rcmake-api` | Run configure in process and answer workspace, provenance, and `explain` queries. |
 | `rcmake-archive` | Create, list, and extract archives. |
 | `rcmake-base` | Provide shared primitives for strings, lists, versions, hashes, and resource limits. |
 | `rcmake-build` | Run build graphs in process for compiler probes and build fallbacks. |
@@ -72,6 +73,8 @@ The direct path dependencies in the root manifest are Rcmake crates. Each uses `
 | `rcmake-diag` | Report diagnostics and track CMake policies. |
 | `rcmake-eval` | Run CMake scripts and manage their scopes and control flow. |
 | `rcmake-expr` | Expand variables and evaluate conditions. |
+| `rcmake-fetch` | Store FetchContent sources by content hash and read and write project lockfiles. |
+| `rcmake-fortran` | Scan Fortran sources and collate module dependencies. |
 | `rcmake-gen-common` | Write outputs shared by the build system generators. |
 | `rcmake-gen-make` | Generate Unix Makefiles. |
 | `rcmake-gen-ninja` | Generate Ninja and Ninja Multi-Config build files. |
@@ -81,10 +84,12 @@ The direct path dependencies in the root manifest are Rcmake crates. Each uses `
 | `rcmake-host` | Give the engine access to files, processes, the environment, and time. |
 | `rcmake-instrument` | Collect and report CMake instrumentation data. |
 | `rcmake-json` | Parse and write JSON with JsonCpp-compatible behavior. |
+| `rcmake-lsp` | Answer Language Server Protocol requests for CMake listfiles. |
 | `rcmake-model` | Store project state, target properties, and cache entries. |
 | `rcmake-presets` | Load and resolve CMake presets. |
 | `rcmake-regex` | Match CMake regular expressions and convert glob patterns. |
 | `rcmake-resolve` | Resolve target dependencies and construct build graphs. |
+| `rcmake-store` | Store probe cache entries by content hash and verify their recorded inputs. |
 | `rcmake-syntax` | Parse CMake listfiles and preserve their input bytes. |
 | `rcmake-tool-e` | Run `cmake -E` utilities. |
 

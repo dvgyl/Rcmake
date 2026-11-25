@@ -4,7 +4,7 @@
 
 The goal is drop-in compatibility. A project should configure, build, install, test, and package with `rcmake` first on `PATH` and produce the same outputs as CMake 4.5.1.
 
-This write-up covers the architecture, how a human owner and three coding agents divided the work over three calendar days, the differential oracle method, hard bugs that testing exposed, honest limitations, and one command to reproduce every claim locally.
+This write-up covers the architecture, how a human owner and three coding agents divided the work over three calendar days, the differential oracle method, hard bugs that testing exposed, limitations, and one command to reproduce every claim locally.
 
 All numbers that depend on the final frozen release binary stay inside machine-readable metric markers until one frozen-binary verification run stamps them. We never estimate unreleased numbers. Immutable architectural counts and verified pre-freeze soundness baselines are labeled explicitly.
 
@@ -88,11 +88,11 @@ Putting every system boundary behind one trait made six higher-level features sm
 
 ## 3. Timeline and multi-agent division of work
 
-One human maintainer set the goals, clean-room rules, and review gates, and coordinated coding agents across 338 commits on `HEAD` in three calendar days:
+One human maintainer set the goals, clean-room rules, and review gates, and coordinated coding agents over three calendar days:
 
-- **2026-11-23 (`160c701` to `3e2cc7d` and beyond):** initial specification, workspace bootstrap, `Host` and `rcmake-syntax` contracts, oracle tooling, `rcmake-regex`, `rcmake-expr`, `rcmake-eval`, presets v13, and `-P` script parity.
+- **2026-11-23:** initial specification, workspace bootstrap, `Host` and `rcmake-syntax` contracts, oracle tooling, `rcmake-regex`, `rcmake-expr`, `rcmake-eval`, presets v13, and `-P` script parity.
 - **2026-11-24:** full configure and resolution pipeline, Ninja, Unix Makefiles, Xcode, Visual Studio, File API, `ctest`, `cpack`, CPS, SBOM, C++20 modules, Fortran, CUDA, Qt `AUTOGEN`, persistent probe cache, incremental replay, FetchContent lockfiles, `rcmake-api`, `rcmake-lsp`, and safe-Rust fuzzing.
-- **2026-11-25 (`3778695`):** large-project corpus parity, 20 independent black-box scenarios, cross-platform Windows and Linux CI recovery, diagnostic formatting and File API v2.12 alignment, WebAssembly verification, brand kit, static site, and public documentation polish.
+- **2026-11-25:** large-project corpus parity, 20 independent black-box scenarios, cross-platform Windows and Linux CI recovery, diagnostic formatting and File API v2.12 alignment, WebAssembly verification, brand kit, static site, and public documentation polish.
 
 ### How work was divided across models
 
@@ -124,6 +124,8 @@ No single test suite catches every class of incompatibility. We stacked seven ve
 | 5 | Large C++ projects | 10 unmodified open-source giants (`large_projects.toml`) | Real module scripts, configure stderr (L1), Ninja build-graph identity (L2) |
 | 6 | Fuzzing and ecosystem lanes | 14 fuzz targets at 1,000,000 inputs each, plus 64-shard `vcpkg`, Conan, and Qt 6 | Panics, resource exhaustion, broad package-manager compatibility |
 | 7 | Sealed unseen holdout | 240 repositories never opened during development | Overfitting to known test suites |
+
+[`ARCHITECTURE.md`](ARCHITECTURE.md#verification) uses the same layer numbers. L1 and L2 are parity levels inside layers 5 and 7, not layer numbers. L1 checks configure success and standard error. L2 also compares the Ninja build graph, `CMakeCache.txt`, and File API replies.
 
 ### Why independent black-box tests were essential
 
@@ -188,7 +190,7 @@ Running unmodified large C++ projects exposed rules that documentation never spe
 - **Bounded ZIP scanning and LZW `.Z` clear codes (`8f5188f`).** The old ZIP end-of-central-directory reader scanned backward across an entire archive in 64 KiB chunks, giving worst-case quadratic work on truncated files with false `PK\x05\x06` signatures. Because the end record is 22 bytes with at most a 65,535-byte comment, the fix reads the last 65,557 bytes once. In the same commit, the Unix `compress` (`.Z`) decoder fixed a bug comparing the fixed 16-byte array length `group.len()` instead of the active byte count `len`, which had rejected valid 12-bit clear codes.
 - **Cross-compiling `try_run` and CPS alignment (`2043177`).** `try_compile` now resolves imported targets using `CMAKE_TRY_COMPILE_CONFIGURATION` rather than `CMAKE_BUILD_TYPE` passed in `CMAKE_FLAGS`, `file(INSTALL)` prints `Installing:` for directory symlinks, and CPS definitions preserve alphabetical ordering and case-insensitive language mapping.
 
-## 6. Scorecard and honest limitations
+## 6. Scorecard and limitations
 
 ### Frozen release scorecard
 
@@ -196,7 +198,7 @@ Every metric in the "Frozen release binary" column is stamped mechanically from 
 
 | Area | Scope | Verified pre-freeze baseline | Frozen release binary |
 | --- | --- | --- | --- |
-| Release commit | Git SHA and date | `HEAD = 3778695` (`2026-11-25`) | <!-- METRIC:release_commit -->pending frozen release run<!-- /METRIC --> (<!-- METRIC:release_date -->pending frozen release run<!-- /METRIC -->) |
+| Release commit | Git SHA and date | Pre-freeze development builds (`2026-11-25`) | <!-- METRIC:release_commit -->pending frozen release run<!-- /METRIC --> (<!-- METRIC:release_date -->pending frozen release run<!-- /METRIC -->) |
 | 3-OS CI + corpus smoke | `ubuntu-24.04`, `macos-15`, `windows-2025` | 6 of 6 jobs green | <!-- METRIC:ci_jobs -->pending frozen release run<!-- /METRIC --> |
 | Upstream `Tests/RunCMake`, macOS arm64 | 371 OS-applicable suites (`all-macos`) | Pre-freeze run in progress | <!-- METRIC:runcmake_macos -->pending frozen release run<!-- /METRIC --> |
 | Upstream `Tests/RunCMake`, Linux | 362 OS-applicable suites (`linux`) | Pre-freeze run in progress | <!-- METRIC:runcmake_linux -->pending frozen release run<!-- /METRIC --> |
@@ -206,7 +208,7 @@ Every metric in the "Frozen release binary" column is stamped mechanically from 
 | Independent black-box suite | 20 scenarios, 679 checks | 20 scenarios, 679 checks implemented | <!-- METRIC:independent_scenarios -->pending frozen release run<!-- /METRIC --> |
 | Large C++ projects (L1) | 10 projects, configure stderr parity | Unmodified pinned commits | <!-- METRIC:large_projects_l1 -->pending frozen release run<!-- /METRIC --> |
 | Large C++ projects (L2) | 10 projects, Ninja graph and File API parity | Unmodified pinned commits | <!-- METRIC:large_projects_l2 -->pending frozen release run<!-- /METRIC --> |
-| Sealed unseen holdout | 240 repositories, Layer 2 dry-run parity | Sealed (never opened during dev) | <!-- METRIC:unseen_holdout -->pending frozen release run<!-- /METRIC --> |
+| Sealed unseen holdout | 240 repositories, L2 dry-run parity | Sealed (never opened during dev) | <!-- METRIC:unseen_holdout -->pending frozen release run<!-- /METRIC --> |
 | `vcpkg` ecosystem matrix | 64 shards on Linux | Workflow ready | <!-- METRIC:vcpkg_matrix -->pending frozen release run<!-- /METRIC --> |
 | Conan and ecosystem fixtures | `ecosystem_eval.py` | Workflow ready | <!-- METRIC:conan_ecosystem -->pending frozen release run<!-- /METRIC --> |
 | Silent `PATH` swap | `path_swap_eval.py` | Smoke green on CI | <!-- METRIC:path_swap_eval -->pending frozen release run<!-- /METRIC --> |
@@ -253,7 +255,7 @@ Then run any verification check directly:
 | 3-OS `Tests/RunCMake` (replace `all-macos` with `linux` or `windows`) | `python3 tools/measure/runcmake_eval.py --profile all-macos --all --json runcmake.json` |
 | Independent 20-scenario black-box suite (679 checks) | `python3 tools/measure/independent_verify.py --stage target/stage --json independent.json` |
 | 10 large C++ projects (5 local macOS projects, full 10 in `ecosystem.yml`) | `python3 tools/corpus/large_projects_local.py --project all --rcmake-stage target/stage --oracle "$RCMAKE_ORACLE_CMAKE" --mode parity --run-dir /tmp/rcmake-large` |
-| Sealed 240-repository unseen holdout (Layer 2) | `python3 tools/corpus/unseen_eval.py --split holdout --stage target/stage --oracle "$RCMAKE_ORACLE_CMAKE" --level L2 --out-json unseen.json --out-md unseen.md` |
+| Sealed 240-repository unseen holdout (L2) | `python3 tools/corpus/unseen_eval.py --split holdout --stage target/stage --oracle "$RCMAKE_ORACLE_CMAKE" --level L2 --out-json unseen.json --out-md unseen.md` |
 | Conan and ecosystem fixtures (`gh workflow run ecosystem.yml -f lane=vcpkg` for 64-shard `vcpkg`) | `python3 tools/corpus/ecosystem_eval.py --stage target/stage --oracle "$RCMAKE_ORACLE_CMAKE" --out-json ecosystem.json --out-md ecosystem.md` |
 | Silent `PATH` swap (`cmake`, `ctest`, `cpack` on `PATH`) | `python3 tools/measure/path_swap_eval.py --rcmake-bin target/stage/bin/rcmake --out path-swap.json` |
 | Cold configure latency and peak RSS compared to CMake 4.5.1 | `python3 tools/measure/bench_eval.py --include-corpus --json bench.json --markdown bench.md` |
@@ -263,7 +265,7 @@ Then run any verification check directly:
 | Target and variable provenance (`rcmake explain`) | `target/stage/bin/rcmake explain app -B build --json` |
 | Configure flame graph and trace (`--profile`) | `target/stage/bin/rcmake -S . -B build -G Ninja --profile=profile-out` |
 | Hermetic input auditing (`--hermetic`) | `target/stage/bin/rcmake -S . -B build -G Ninja --hermetic=strict` |
-| Build the `rcmake-lsp` language server | `cargo build --locked --release -p rcmake-lsp --features stdio` |
+| Build the `rcmake-lsp` language server | `cargo build --locked --release -p rcmake-lsp --features eval,stdio` |
 | WebAssembly dependency audit and WASI `PureHost` smoke (`rcmake.wasm`) | `python3 tools/measure/wasm_smoke.py --require-wasi --json wasm-smoke.json` |
 | Safe-Rust adversarial fuzzing (all 14 targets, 1,000,000 inputs each) | `for s in syntax expr regex genex json presets cps archive path tolerant binfmt diagnostics fortran store-frame; do cargo run --release --bin rcmake-fuzz -- "$s" --iterations 1000000; done` |
 | Upstream CMake release and policy drift tracker | `python3 tools/measure/upstream_track.py --out-json upstream.json --out-md upstream.md` |

@@ -1,8 +1,8 @@
 # Contributing to rcmake
 
 Thank you for your interest in rcmake. This guide gives the rules and checks
-for every change. Read [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) first for
-the crate structure and the data flow.
+for every change. [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) describes the
+crate structure and the data flow.
 
 ## Goal of the project
 
@@ -30,9 +30,79 @@ crashes.
    ```
 
 `env/env.sh` sets `RCMAKE_ORACLE_CMAKE`, `RCMAKE_ORACLE_SRC`, and the other
-oracle variables. It also limits Cargo to 2 build jobs and 3 test threads.
-Increase `CARGO_BUILD_JOBS` and `RUST_TEST_THREADS` if your machine has more
-memory.
+oracle variables. It also sets default limits of 2 Cargo build jobs and 3 test
+threads, which keep memory use low. To build faster on a machine with more
+memory, set larger `CARGO_BUILD_JOBS` and `RUST_TEST_THREADS` values before you
+source the file.
+
+## First contribution in 2 minutes
+
+This path takes you from a clone to a pull request. It assumes that you
+finished [Set up](#set-up).
+
+1. Build `rcmake` and stage it with the bundled CMake modules:
+
+   ```sh
+   source env/env.sh
+   scripts/stage.sh
+   ```
+
+   The staged tree is in `target/stage`. `target/stage/bin/cmake` is a link to
+   `rcmake`.
+
+2. Run one unit test. Give the crate with `-p` and a part of the test name:
+
+   ```sh
+   cargo test -p rcmake-commands search_replace_and_join
+   ```
+
+3. Find the code for a CMake command. Each command family is a module in
+   `crates/rcmake-commands/src/`, for example `string_math/` for `string()` and
+   `math()`, and `file_path/` for `file()` and `cmake_path()`. The `register()`
+   function of the family adds each command name:
+
+   ```rust
+   registry.add("cmake_path", path_cmd::run, flags);
+   ```
+
+4. Compare one behavior with CMake 4.5.1. Write a small script, run it with
+   both binaries, and compare the output:
+
+   ```sh
+   printf 'string(TOUPPER "abc" out)\nmessage(STATUS "${out}")\n' > probe.cmake
+   "$RCMAKE_ORACLE_CMAKE" -P probe.cmake > oracle.txt 2>&1
+   target/stage/bin/cmake -P probe.cmake > rcmake.txt 2>&1
+   diff oracle.txt rcmake.txt
+   ```
+
+   No output from `diff` means that the two tools agree.
+
+5. Run a recorded differential suite. The suite name is the file name in
+   `conformance/cases/` without `.case`. `--filter` selects one case:
+
+   ```sh
+   cargo run --bin rcmake-harness -- --suite string_math --filter string-combine
+   ```
+
+6. Run the [quality gates](#quality-gates), then open a pull request. The pull
+   request template asks which CMake 4.5.1 behavior you matched and how you
+   checked it.
+
+### Add or change a CMake command
+
+1. Write or change the handler in the command family module, for example
+   `crates/rcmake-commands/src/string_math/`. A handler is a
+   `rcmake_eval::BuiltinFn`: `fn(&mut Cx<'_>, &[ExpandedArg]) -> CmdResult`.
+2. For a new command, call `registry.add` in the `register()` function of the
+   family. Set `CmdFlags { scriptable: true }` if the command works in
+   `cmake -P` scripts.
+3. For a new command, add its name to the `PROJECT` list in
+   `crates/rcmake-commands/src/registry_tests.rs`. If it does not work in
+   scripts, also add it to `PROJECT_ONLY`.
+4. Add a unit test to the `tests.rs` file of the family. Use `PureHost`.
+5. Add a case to the matching `conformance/cases/<suite>.case` file. Record its
+   baseline from the oracle with
+   `cargo run --bin rcmake-harness -- --suite <suite> --record`.
 
 ## Clean-room rules
 
@@ -115,7 +185,7 @@ cargo test --workspace
 python3 tools/measure/licence_scan.py --check-hygiene
 ```
 
-`scripts/gate.sh` runs all of these checks and the Layer 1 oracle suites.
+`scripts/gate.sh` runs all of these checks and the recorded CLI and script cases.
 
 If you change `rcmake-gen-xcode` or `rcmake-gen-vs`, also run Clippy with
 the cross-platform generators:
@@ -145,7 +215,7 @@ Every change in behavior needs a test. Choose the test type from this table:
 | Upstream `Tests/RunCMake` behavior | Run `tools/measure/runcmake_eval.py` for the affected suites |
 | A crash found by fuzzing | Regression test in the crate that owns the code |
 
-To record a Layer 1 baseline from the oracle:
+To record a baseline for a CLI or script case from the oracle:
 
 ```sh
 scripts/stage.sh
@@ -189,6 +259,7 @@ test(presets): cover schema 13 include cycles
 ## Pull requests
 
 - Keep each pull request to one subject.
+- Fill in the pull request template.
 - Tell which CMake 4.5.1 behavior the change matches, and how you checked it.
 - Include the commands that you ran and their results.
 - A change to a shared contract in `rcmake-base`, `rcmake-diag`,
@@ -197,8 +268,8 @@ test(presets): cover schema 13 include cycles
 ## Report a security problem
 
 rcmake reads untrusted project files and archives. Do not open a public issue
-for a security problem. Use GitHub private vulnerability reporting for this
-repository.
+for a security problem. Follow [`SECURITY.md`](SECURITY.md) to report it
+privately.
 
 ## Licence of contributions
 

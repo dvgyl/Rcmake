@@ -1,7 +1,10 @@
-# Rcmake environment variables
+# rcmake environment variables
 
-Project configure uses the speed settings in the Native persona. The executable
-name `rcmake` selects Native unless `RCMAKE_ORACLE_MODE=1` selects Compat.
+`rcmake` has two modes. The executable name `rcmake` selects native mode, unless
+`RCMAKE_ORACLE_MODE=1` selects compatibility mode. The names `cmake`, `ctest`,
+and `cpack` always select compatibility mode, which matches CMake 4.5.1.
+Project configure uses the speed settings below only in native mode.
+
 An applicable command-line option takes precedence over its environment setting.
 
 ## Configure and probe cache
@@ -25,12 +28,12 @@ reserves 2 GiB for configure and allows 1 GiB per job. If the memory size is
 unknown, the pool allows one job.
 
 An invalid probe cache mode or disable value turns off the probe cache.
-An invalid job count uses the default. The Native command-line interface
-prints a warning for each invalid setting.
+An invalid job count uses the default. In native mode, `rcmake` prints a
+warning for each invalid setting.
 
 ### Incremental replay
 
-Native project configure can replay eligible regions from a prior configure.
+In native mode, project configure can replay eligible regions from a prior configure.
 These inputs and options disable replay for the invocation.
 
 - A configure preset or an explicit `-C` preload script.
@@ -69,28 +72,28 @@ The `s3` mode uses `AWS_REGION`, `AWS_ACCESS_KEY_ID`,
 
 | Variable | Effect |
 | --- | --- |
-| `RCMAKE_FETCH_LOCK` | Select `auto` (default), `off`, `update`, or `frozen`. An invalid value makes the Native command-line interface print a warning and use `off`. The standalone fetch parser returns an error. |
+| `RCMAKE_FETCH_LOCK` | Select `auto` (default), `off`, `update`, or `frozen`. In native mode, an invalid value prints a warning and selects `off`. The standalone fetch parser returns an error. |
 | `RCMAKE_FETCH_LOCK_FILE` | Select the lockfile path. Relative paths start at the project source directory. An empty or unset value uses `rcmake-fetch.lock`. |
 | `RCMAKE_FETCH_OFFLINE` | Set to `1` to disable remote probe access and network transfers through FetchContent and ExternalProject. FetchContent can still use local sources and verified cached sources. |
 | `RCMAKE_FETCH_PREFETCH` | Set to `0` to disable prefetch. Prefetch requires a fetch lock mode other than `off`, hermetic mode `off`, and online fetch. |
-| `RCMAKE_FETCH_JOBS` | Request a positive integer number of fetch workers. The default is 4. The pool clamps the count to 1 through 32. An invalid value makes the Native command-line interface print a warning and use the default. |
+| `RCMAKE_FETCH_JOBS` | Request a positive integer number of fetch workers. The default is 4. The pool clamps the count to 1 through 32. In native mode, an invalid value prints a warning and selects the default. |
 | `RCMAKE_FETCH_GIT_READ_ONLY` | Set to `1` with `RCMAKE_FETCH_OFFLINE=1` to use an immutable Git mirror cache. |
 | `RCMAKE_FETCH_GIT_MAX_SIZE` | Set the Git mirror cache size limit in bytes. The default is 2 GiB. Offline and read-only cache instances leave mirrors intact. |
-| `RCMAKE_HERMETIC` | Select `off` (default), `warn`, or `strict`. `0` selects `off`. `1` selects `warn`. Warn mode reports undeclared inputs. Strict mode rejects them. An invalid value makes the Native command-line interface print a warning and use `off`. |
+| `RCMAKE_HERMETIC` | Select `off` (default), `warn`, or `strict`. `0` selects `off`. `1` selects `warn`. Warn mode reports undeclared inputs. Strict mode rejects them. In native mode, an invalid value prints a warning and selects `off`. |
 | `RCMAKE_HERMETIC_ALLOW_ENV` | Set a semicolon-separated list of permitted environment variable names. |
 | `RCMAKE_HERMETIC_ALLOW_PATHS` | Set a semicolon-separated list of resolvable, permitted absolute paths. |
 | `RCMAKE_HERMETIC_ALLOW_PROGRAMS` | Set a semicolon-separated list of resolvable, permitted absolute executable paths. |
 
-Rcmake reports invalid allowlist entries and ignores them.
+`rcmake` reports invalid allowlist entries and ignores them.
 
 ## Command-line output and data discovery
 
 | Variable | Effect |
 | --- | --- |
-| `RCMAKE_ORACLE_MODE` | Set to `1` to select Compat, including when the executable name is `rcmake`. |
-| `RCMAKE_DIAGNOSTICS` | Native accepts `cmake` or `rich`. An invalid or unset value selects rich output when standard error goes to a terminal and CMake formatting otherwise. Compat always uses CMake formatting. |
-| `RCMAKE_PROFILE` | Set the Native configure profile directory. Relative paths start at the invocation directory. An empty value disables the environment setting. Rcmake writes `trace.json`, `stacks.folded`, and `flamegraph.html` directly in the selected directory. |
-| `RCMAKE_EXEC_LOG` | Set the path of a JSON Lines invocation log. Relative paths start at the invocation directory. An empty value disables logging. Each record has separate tool and effective persona fields. |
+| `RCMAKE_ORACLE_MODE` | Set to `1` to select compatibility mode, including when the executable name is `rcmake`. |
+| `RCMAKE_DIAGNOSTICS` | Native mode accepts `cmake` or `rich`. An invalid or unset value selects rich output when standard error goes to a terminal and CMake formatting otherwise. Compatibility mode always uses CMake formatting. |
+| `RCMAKE_PROFILE` | Set the native-mode configure profile directory. Relative paths start at the invocation directory. An empty value disables the environment setting. Each run writes `trace.json`, `stacks.folded`, and `flamegraph.html` to a new `run-<id>` subdirectory. The `current` file in the profile directory holds the name of the latest run subdirectory. `--profile=<dir>` uses the same layout. Without `<dir>`, `--profile` uses `rcmake-profile` in the build directory. |
+| `RCMAKE_EXEC_LOG` | Set the path of a JSON Lines invocation log. Relative paths start at the invocation directory. An empty value disables logging. Each record has a `tool` field and a `persona` field. The `persona` field holds the effective mode (`native` or `compat`). |
 | `RCMAKE_VENDORED_DATA_ROOT` | Select the directory that contains the bundled CMake data. Relative paths start at the invocation directory. Discovery checks for `Modules/CMakeDetermineSystem.cmake` and falls back to installed or checkout paths if the override fails that check. The File API can also use this value as its reported root when the cache lacks `CMAKE_ROOT`. |
 
 ## CTest script process state
@@ -103,7 +106,7 @@ Rcmake reports invalid allowlist entries and ignores them.
 
 | Variable | Effect |
 | --- | --- |
-| `RCMAKE_MEASURE_REPLAY` | Set to `1` to record executed and replayed listfiles in `CMakeFiles/rcmake/replay-result.v1.json` after a successful Native configure. The path is relative to the build directory. |
+| `RCMAKE_MEASURE_REPLAY` | Set to `1` to record executed and replayed listfiles in `CMakeFiles/rcmake/replay-result.v1.json` after a successful native-mode configure. The path is relative to the build directory. |
 | `RCMAKE_MEASURE_PROBE_INTERVALS` | Set to `1` to write intervals for verified speculative compiler runs that exit normally. The output is `CMakeFiles/rcmake-probe-intervals.txt` in the build directory. Each line has the scratch directory name, monotonic start and end times in nanoseconds, and exit code. The measurement requires active speculative workers. |
 | `RCMAKE_MEASURE_ENTRY` | Set the positive, one-based cache entry publication number for the interruption test. Use with the arm and checkpoint paths. |
 | `RCMAKE_MEASURE_ARM` | Set the absolute path to the regular file that enables the cache publication pause. Remove the file to resume publication. The pause lasts at most 60 seconds. |
