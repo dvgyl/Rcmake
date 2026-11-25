@@ -76,7 +76,7 @@ def project_xml(path: Path, root: ET.Element) -> dict:
     require(metadata is not None, "Missing Globals property group")
     identifier = guid(metadata.findtext(f"{MSBUILD}ProjectGuid"))
     configs = {}
-    for entry in root.findall(f"./*/{MSBUILD}ProjectConfiguration"):
+    for entry in root.findall(f"./{MSBUILD}ItemGroup/{MSBUILD}ProjectConfiguration"):
         name = entry.get("Include", "")
         config = entry.findtext(f"{MSBUILD}Configuration", "")
         platform = entry.findtext(f"{MSBUILD}Platform", "")
@@ -116,7 +116,7 @@ def project_xml(path: Path, root: ET.Element) -> dict:
         require(matrix == configs.keys(), f"Incomplete {name} configuration matrix")
 
     refs = {}
-    for reference in root.findall(f"./*/{MSBUILD}ProjectReference"):
+    for reference in root.findall(f"./{MSBUILD}ItemGroup/{MSBUILD}ProjectReference"):
         target = unquote(reference.get("Include", ""))
         require(bool(target), "Missing ProjectReference Include")
         identifier_ref = guid(reference.findtext(f"{MSBUILD}Project"))
