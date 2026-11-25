@@ -703,6 +703,8 @@ pub struct ExportPlan {
     pub cxx_modules_directory: Option<BString>,
     /// `true` for `install(EXPORT)`, `false` for `export()`.
     pub install: bool,
+    /// Path syntax of the target system. An absent value uses the host syntax.
+    pub windows_paths: Option<bool>,
     /// Targets in order.
     pub targets: Vec<ExportedTarget>,
     /// Package names and extra arguments in lookup order.

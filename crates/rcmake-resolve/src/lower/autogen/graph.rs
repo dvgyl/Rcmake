@@ -21,7 +21,7 @@ use super::scan::{
 };
 use super::{AutogenPlan, ConfiguredSources, ResourceJob, TargetPlan};
 use crate::ResolveError;
-use crate::lower::{definition, join, object_dir, short_object_paths};
+use crate::lower::{artifacts::short_support_dir, definition, join};
 use crate::sources::{SourcePaths, absolute_path};
 use source::{GeneratedSource, add_source, mark_configured, mark_source};
 
@@ -198,11 +198,13 @@ impl PlanContext<'_, '_> {
         }
         .scan(self.inventory, &checksums, diagnostics)?;
         let name = &target.name;
-        let (info_dir, default_build) = if short_object_paths(model) {
-            let support = absolute_path(
-                &root.binary_dir,
-                &object_dir(model, target, &ConfigId::default()),
-            );
+        let short = model.generator.is_some()
+            && model
+                .cache
+                .get(b"CMAKE_AUTOGEN_INTERMEDIATE_DIR_STRATEGY")
+                .is_some_and(|entry| entry.value == "SHORT");
+        let (info_dir, default_build) = if short {
+            let support = absolute_path(&root.binary_dir, &short_support_dir(model, target));
             (join(&support, b"autogen_info"), join(&support, b"autogen"))
         } else {
             (

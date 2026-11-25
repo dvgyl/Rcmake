@@ -63,23 +63,47 @@ impl UsageResolver<'_> {
         resolved: &IndexMap<TargetId, ResolvedTarget>,
         ctx: &EvalContext,
     ) -> Result<(Option<BString>, EvalFlags), ResolveError> {
+        let (_, preferred, flags) =
+            self.language_closure(id, &|id| resolved.get(&id), ctx, true)?;
+        Ok((
+            lower::linker_language(
+                self.model,
+                target,
+                preferred.iter().map(|language| language.as_slice()),
+            ),
+            flags,
+        ))
+    }
+
+    pub(crate) fn language_closure<'facts>(
+        &mut self,
+        id: TargetId,
+        facts: &impl Fn(TargetId) -> Option<&'facts ResolvedTarget>,
+        ctx: &EvalContext,
+        object_dependencies: bool,
+    ) -> Result<(IndexSet<BString>, IndexSet<BString>, EvalFlags), ResolveError> {
+        let ctx = &link_context(id, ctx);
+        let target = self.target(id)?;
         let mut languages = IndexSet::new();
         let mut dependencies = Vec::new();
-        if let Some(facts) = resolved.get(&id) {
+        if let Some(facts) = facts(id) {
             languages.extend(
                 facts
                     .compile_groups
                     .iter()
                     .map(|group| group.language.clone()),
             );
-            dependencies.extend(
-                facts
-                    .dependencies
-                    .iter()
-                    .copied()
-                    .map(|id| (id, Contribution::DirectObject)),
-            );
+            if object_dependencies {
+                dependencies.extend(
+                    facts
+                        .dependencies
+                        .iter()
+                        .copied()
+                        .map(|id| (id, Contribution::DirectObject)),
+                );
+            }
         }
+        let mut preferred = languages.clone();
         let (direct, mut flags) = self.direct_links(id, ctx)?;
         self.language_dependencies(&direct, &mut dependencies);
 
@@ -97,8 +121,7 @@ impl UsageResolver<'_> {
                 let inherited = if library.is_imported() {
                     imported_languages(library, ctx)
                 } else {
-                    resolved
-                        .get(&dependency)
+                    facts(dependency)
                         .into_iter()
                         .flat_map(|facts| {
                             facts
@@ -108,7 +131,8 @@ impl UsageResolver<'_> {
                         })
                         .collect()
                 };
-                languages.extend(inherited.into_iter().filter(|language| {
+                languages.extend(inherited.iter().cloned());
+                preferred.extend(inherited.into_iter().filter(|language| {
                     contribution == Contribution::DirectObject
                         || lower::definition(
                             self.model,
@@ -123,7 +147,13 @@ impl UsageResolver<'_> {
                         .map_or(language == "CXX", |value| truth::is_on(value))
                 }));
             }
-            if let Some(facts) = resolved.get(&dependency) {
+            if object_dependencies
+                && matches!(
+                    library.kind,
+                    TargetKind::StaticLibrary | TargetKind::ObjectLibrary
+                )
+                && let Some(facts) = facts(dependency)
+            {
                 let objects = if contribution == Contribution::DirectObject {
                     Contribution::DirectObject
                 } else {
@@ -136,14 +166,7 @@ impl UsageResolver<'_> {
             self.language_dependencies(&links, &mut dependencies);
         }
 
-        Ok((
-            lower::linker_language(
-                self.model,
-                target,
-                languages.iter().map(|language| language.as_slice()),
-            ),
-            flags,
-        ))
+        Ok((languages, preferred, flags))
     }
 
     fn language_dependencies(

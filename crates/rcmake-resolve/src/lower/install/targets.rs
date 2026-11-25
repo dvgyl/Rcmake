@@ -6,12 +6,12 @@ use rcmake_diag::{
 use rcmake_host::{Host, Stream};
 use rcmake_model::{InstallKind, Target, TargetId, TargetKind};
 
-use super::super::{compute_artifacts, link::install_rpath};
+use super::super::compute_artifacts;
 use super::{
     BString, Backtrace, ConfigId, DirId, GeneratorKind, Group, InstallAction, InstallActionKind,
     InstallManifest, InstallOptions, InstallRule, Lexical, ProjectModel, ResolvedTarget,
-    action_configs, add_bmi_include, definition, eval_destination, file_action, join, list,
-    matches_config, target_options,
+    RuntimeEdits, action_configs, add_bmi_include, definition, eval_destination, file_action, join,
+    list, matches_config, target_options,
 };
 
 pub(super) fn warn_framework_change(
@@ -107,7 +107,7 @@ fn framework_added_after_install(
 pub(super) fn lower<E>(
     model: &ProjectModel,
     (index, rule): (usize, &InstallRule),
-    (targets, configs, ids): (&[ResolvedTarget], &[ConfigId], &[TargetId]),
+    (targets, configs, ids, edits): (&[ResolvedTarget], &[ConfigId], &[TargetId], &RuntimeEdits),
     recorded: &[&[u8]],
     manifest: &mut InstallManifest,
     make_action: &impl Fn(&InstallOptions, &[u8], InstallActionKind) -> InstallAction,
@@ -280,19 +280,27 @@ pub(super) fn lower<E>(
             }
             let namelink = take_namelink(&artifacts, extra, &mut files);
             if !files.is_empty() {
-                let macho_rpath = if let Some(file) = artifacts.file.as_ref()
-                    && files.contains(file)
-                {
-                    let name = options
-                        .rename
-                        .as_ref()
-                        .map_or_else(|| Lexical::new(file).filename(), |name| name.as_slice());
-                    install_rpath(model, raw, target, name, |value| {
-                        eval(raw.dir, &target.config, &rule.backtrace, value)
-                    })?
-                } else {
-                    None
-                };
+                let edit = artifacts.file.as_ref().and_then(|file| {
+                    let edit = edits.get(&(*id, target.config.clone()))?;
+                    if files.contains(file) {
+                        let name = options
+                            .rename
+                            .clone()
+                            .unwrap_or_else(|| Lexical::new(file).filename().into());
+                        Some((edit, name))
+                    } else if let Some(root) =
+                        bundle_root.as_ref().filter(|root| files.contains(root))
+                    {
+                        let relative = Lexical::new(file).relative(Lexical::new(root))?;
+                        let name = options
+                            .rename
+                            .as_deref()
+                            .map_or_else(|| Lexical::new(root).filename(), Vec::as_slice);
+                        Some((edit, join(name, &relative)))
+                    } else {
+                        None
+                    }
+                });
                 let files = files.into_iter().map(|path| join(bin, path)).collect();
                 let action = make_action(
                     &options,
@@ -306,14 +314,21 @@ pub(super) fn lower<E>(
                         }
                     },
                 );
-                let edit_action = macho_rpath.map(|edit| InstallAction {
-                    kind: InstallActionKind::Code(
-                        edit.render(&action.destination, !action.configurations.is_empty()),
-                    ),
+                let configured = !action.configurations.is_empty();
+                let as_code = |code| InstallAction {
+                    kind: InstallActionKind::Code(code),
                     ..action.clone()
+                };
+                let (check, change) = edit.map_or((None, None), |(edit, name)| {
+                    let check = edit
+                        .check(&action.destination, &name, configured)
+                        .map(as_code);
+                    let change = as_code(edit.render(&action.destination, &name, configured));
+                    (check, Some(change))
                 });
+                manifest.actions.extend(check);
                 manifest.actions.push(action);
-                manifest.actions.extend(edit_action);
+                manifest.actions.extend(change);
             }
             if layout == crate::ide::BundleKind::None
                 && let Some(stub) = &artifacts.import_file

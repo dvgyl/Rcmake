@@ -8,9 +8,7 @@ use rcmake_diag::{
 };
 use rcmake_genex::{ConfigId, EvalContext, UsageTraversal};
 use rcmake_host::{Host, Stream};
-use rcmake_model::{
-    CustomCommandKind, DirId, FileSetKind, GeneratorKind, ProjectModel, Target, TargetId,
-};
+use rcmake_model::{CustomCommandKind, DirId, GeneratorKind, ProjectModel, Target, TargetId};
 
 use crate::{
     BuildGraph, BuildStep, GenerationResult, InstallActionKind, ResolveError, ResolveOptions,
@@ -35,7 +33,8 @@ mod fortran;
 use crate::usage::provenance::Provenance;
 use cross::CrossPlan;
 
-mod file_set_membership;
+pub(crate) mod file_set_membership;
+use file_set_membership::validate_file_sets;
 mod header_verify;
 mod intdir;
 mod link_tags;
@@ -79,9 +78,9 @@ fn resolve_project(
     let rules = crate::target::instantiate_rules(model, host)?;
     let model = rules.as_ref().unwrap_or(model);
     crate::exports::source_sets::validate(model)?;
-    intdir::validate(model, host)?;
+    let strategies = intdir::prepare(model, host)?;
+    let model = strategies.as_ref().unwrap_or(model);
     link_tags::validate(model, host)?;
-    file_set_membership::validate(model, host)?;
     lower::warn_about_wrappers(model, host);
     lower::custom::warn_depfile_policy(model, host);
     let configs = if configs.is_empty() {
@@ -154,6 +153,7 @@ fn resolve_project(
     };
     let mut provenance = Provenance::default();
     let mut targets = Vec::new();
+    let mut runtime_languages = IndexMap::new();
     let mut graphs = Vec::with_capacity(configs.len());
     let mut cross_graphs = IndexMap::new();
     let mut compile_inputs = BTreeMap::new();
@@ -174,6 +174,12 @@ fn resolve_project(
             &plan,
         )?;
         provenance.extend(output.provenance.unwrap_or_default());
+        runtime_languages.extend(
+            output
+                .runtime_languages
+                .into_iter()
+                .map(|(id, languages)| ((id, config.clone()), languages)),
+        );
         targets.extend(output.targets);
         cross_graphs.extend(output.cross_graphs);
         match output.graph {
@@ -195,12 +201,18 @@ fn resolve_project(
     }
     warn_link_flags(model, host, &targets);
     lower::cmp0128_warnings(model, host, &targets);
-    let mut install =
-        lower::lower_install_manifest_with_configs(model, &targets, &configs, options.ide, host)
-            .map_err(|error| match error {
-                ResolveError::Genex(error) => ResolveError::Genex(error.without_location()),
-                other => other,
-            })?;
+    let mut install = lower::lower_install_manifest_with_configs(
+        model,
+        &targets,
+        &configs,
+        options.ide,
+        host,
+        &runtime_languages,
+    )
+    .map_err(|error| match error {
+        ResolveError::Genex(error) => ResolveError::Genex(error.without_location()),
+        other => other,
+    })?;
     let exports = resolve_exports(
         model,
         &mut UsageResolver::new(model).with_ide(options.ide),
@@ -288,6 +300,7 @@ fn resolve_project(
 struct ConfigOutput {
     provenance: Option<Provenance>,
     targets: Vec<ResolvedTarget>,
+    runtime_languages: IndexMap<TargetId, IndexSet<BString>>,
     graph: Result<BuildGraph, ResolveError>,
     cross_graphs: IndexMap<(ConfigId, ConfigId), BuildGraph>,
 }
@@ -856,6 +869,7 @@ fn resolve_config(
             return Ok(ConfigOutput {
                 provenance: usage.provenance,
                 targets: resolved.into_values().collect(),
+                runtime_languages: IndexMap::new(),
                 graph: Err(error),
                 cross_graphs: IndexMap::new(),
             });
@@ -920,69 +934,11 @@ fn resolve_config(
     Ok(ConfigOutput {
         provenance: usage.provenance,
         targets: resolved,
+        runtime_languages: inputs
+            .into_iter()
+            .map(|(id, input)| (id, input.link_languages))
+            .collect(),
         graph: Ok(graph),
         cross_graphs,
     })
-}
-
-fn validate_file_sets(
-    model: &ProjectModel,
-    paths: &SourcePaths<'_>,
-    config: &ConfigId,
-) -> Result<(), ResolveError> {
-    let mut usage = UsageResolver::new(model).with_ide(paths.ide);
-    let ctx = EvalContext {
-        config: config.clone(),
-        ..EvalContext::default()
-    };
-    for (id, target) in model.targets().filter(|(_, target)| !target.is_imported()) {
-        for set in target.file_sets.iter().filter_map(|id| model.file_set(*id)) {
-            if set.kind != FileSetKind::Headers {
-                continue;
-            }
-            if target
-                .props
-                .get(b"FRAMEWORK")
-                .is_some_and(|value| truth::is_on(value))
-            {
-                let body = format!(
-                    "The file set \"{}\", of type \"HEADERS\", is incompatible with the \"FRAMEWORK\" target \"{}\".",
-                    set.name, target.name,
-                );
-                paths.emit(
-                    model,
-                    MessageKind::Error,
-                    generation_location(model, target),
-                    body.clone().into(),
-                );
-                return Err(ResolveError::Message(body.into()));
-            }
-            if lower::definition(model, target.dir, b"CMAKE_GENERATOR")
-                .is_none_or(|value| !value.starts_with(b"Ninja"))
-                || !set
-                    .props
-                    .get(b"INDEPENDENT_FILES")
-                    .is_some_and(|value| truth::is_on(value))
-                || lower::definition(model, target.dir, b"CMAKE_SUPPRESS_DEVELOPER_WARNINGS")
-                    .is_some_and(|value| truth::is_on(value))
-            {
-                continue;
-            }
-            let dir = model.dir(target.dir);
-            if usage
-                .file_set_paths(id, b"SOURCES", &set.files, &ctx)?
-                .iter()
-                .any(|file| paths.is_generated(dir, &file.value))
-            {
-                paths.emit(
-                    model, MessageKind::AuthorWarning, generation_location(model, target),
-                    format!(
-                        "the \"INDEPENDENT_FILES\" property of the file set \"{}\" of the target \"{}\" will be ignored because it is incompatible with the file set type \"HEADERS\".",
-                        set.name, target.name,
-                    ).into(),
-                );
-            }
-        }
-    }
-    Ok(())
 }

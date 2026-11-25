@@ -1,58 +1,168 @@
+use indexmap::IndexMap;
 use rcmake_base::{BString, list};
 
 use super::install::{cmake_quote, cmake_quoted_content};
 
+pub(super) enum RuntimeEdit {
+    Elf(ElfRpathEdit),
+    MachO(MachORpathEdit),
+}
+
+pub(super) struct ElfRpathEdit {
+    pub(super) old: BString,
+    pub(super) new: BString,
+    pub(super) strip: bool,
+    pub(super) escape_new: bool,
+}
+
 pub(super) struct MachORpathEdit {
-    pub(super) file_name: BString,
     pub(super) tool: BString,
+    pub(super) install_name: Option<BString>,
+    pub(super) changes: IndexMap<BString, BString>,
     pub(super) old: Vec<BString>,
     pub(super) new: Vec<BString>,
 }
 
-impl MachORpathEdit {
-    pub(super) fn render(&self, dir: &[u8], configured: bool) -> BString {
-        let mut path = BString::from("\"$ENV{DESTDIR}");
-        if !rcmake_host::path::to_native(dir).is_absolute() {
-            path.extend_from_slice(b"${CMAKE_INSTALL_PREFIX}/");
-        }
-        cmake_quoted_content(&mut path, dir);
-        if !dir.ends_with(b"/") {
-            path.push(b'/');
-        }
-        cmake_quoted_content(&mut path, &self.file_name);
-        path.push(b'"');
-
-        let indent = if configured {
-            b"    ".as_slice()
-        } else {
-            b"  "
-        };
-        let mut out = BString::from("if(EXISTS ");
-        out.extend_from_slice(&path);
-        out.extend_from_slice(b" AND NOT IS_SYMLINK ");
-        out.extend_from_slice(&path);
-        out.extend_from_slice(b")\n");
-        out.extend_from_slice(indent);
-        let action = if self.new.is_empty() {
-            b"  file(RPATH_REMOVE FILE ".as_slice()
-        } else {
-            b"  file(RPATH_CHANGE FILE "
-        };
-        out.extend_from_slice(action);
-        out.extend_from_slice(&path);
-        out.extend_from_slice(b" OLD_RPATH ");
-        cmake_quote(&mut out, &runtime_list(&self.old));
-        if !self.new.is_empty() {
-            out.extend_from_slice(b" NEW_RPATH ");
-            cmake_quote(&mut out, &runtime_list(&self.new));
-        }
-        out.extend_from_slice(b" INSTALL_NAME_TOOL ");
-        cmake_quote(&mut out, &self.tool);
-        out.extend_from_slice(b")\n");
-        out.extend_from_slice(indent);
-        out.extend_from_slice(b"endif()");
-        out
+impl RuntimeEdit {
+    pub(super) fn check(&self, dir: &[u8], name: &[u8], configured: bool) -> Option<BString> {
+        let Self::Elf(edit) = self else { return None };
+        let path = installed_file(dir, name);
+        let mut command = BString::from("file(RPATH_CHECK FILE ");
+        command.extend_from_slice(&path);
+        command.extend_from_slice(b" RPATH ");
+        quote_rpath(&mut command, &edit.new, true);
+        command.push(b')');
+        Some(guard(&path, &command, configured))
     }
+
+    pub(super) fn render(&self, dir: &[u8], name: &[u8], configured: bool) -> BString {
+        let path = installed_file(dir, name);
+        let mut command = BString::default();
+        match self {
+            Self::Elf(edit) => {
+                command.extend_from_slice(b"file(RPATH_CHANGE FILE ");
+                command.extend_from_slice(&path);
+                command.extend_from_slice(b" OLD_RPATH ");
+                cmake_quote(&mut command, &edit.old);
+                command.extend_from_slice(b" NEW_RPATH ");
+                quote_rpath(&mut command, &edit.new, edit.escape_new);
+                if edit.strip {
+                    command.extend_from_slice(b" INSTALL_REMOVE_ENVIRONMENT_RPATH");
+                }
+                command.push(b')');
+            }
+            Self::MachO(edit) => {
+                if edit.old != edit.new {
+                    let name = if edit.new.is_empty() {
+                        b"RPATH_REMOVE".as_slice()
+                    } else {
+                        b"RPATH_CHANGE"
+                    };
+                    command.extend_from_slice(
+                        &[b"file(".as_slice(), name, b" FILE ", &path, b" OLD_RPATH "].concat(),
+                    );
+                    cmake_quote(&mut command, &runtime_list(&edit.old));
+                    if !edit.new.is_empty() {
+                        command.extend_from_slice(b" NEW_RPATH ");
+                        cmake_quote(&mut command, &runtime_list(&edit.new));
+                    }
+                    command.extend_from_slice(b" INSTALL_NAME_TOOL ");
+                    cmake_quote(&mut command, &edit.tool);
+                    command.push(b')');
+                }
+                if edit.install_name.is_some() || !edit.changes.is_empty() {
+                    if !command.is_empty() {
+                        command.push(b'\n');
+                    }
+                    command.extend_from_slice(b"execute_process(COMMAND ");
+                    cmake_quote(&mut command, &edit.tool);
+                    if let Some(name) = &edit.install_name {
+                        command.extend_from_slice(b" -id ");
+                        command.extend_from_slice(&escaped_name(name));
+                    }
+                    for (old, new) in &edit.changes {
+                        command.extend_from_slice(b" -change ");
+                        cmake_quote(&mut command, old);
+                        command.push(b' ');
+                        command.extend_from_slice(&escaped_name(new));
+                    }
+                    command.push(b' ');
+                    command.extend_from_slice(&path);
+                    command.extend_from_slice(b" COMMAND_ERROR_IS_FATAL ANY)");
+                }
+            }
+        }
+        guard(&path, &command, configured)
+    }
+}
+
+fn escaped_name(name: &[u8]) -> BString {
+    let mut out = BString::from("\"");
+    let mut remaining = name;
+    let variable = b"${CMAKE_INSTALL_PREFIX}";
+    while let Some(index) = remaining
+        .windows(variable.len())
+        .position(|part| part == variable)
+    {
+        let (left, right) = remaining.split_at(index);
+        cmake_quoted_content(&mut out, left);
+        out.extend_from_slice(variable);
+        remaining = right.strip_prefix(variable).unwrap_or_default();
+    }
+    cmake_quoted_content(&mut out, remaining);
+    out.push(b'"');
+    out
+}
+
+fn quote_rpath(out: &mut BString, value: &[u8], escape_dollars: bool) {
+    if escape_dollars {
+        cmake_quote(out, value);
+    } else {
+        out.push(b'"');
+        for &byte in value {
+            if matches!(byte, b'\\' | b'"') {
+                out.push(b'\\');
+            }
+            out.push(byte);
+        }
+        out.push(b'"');
+    }
+}
+
+fn installed_file(dir: &[u8], name: &[u8]) -> BString {
+    let mut path = BString::from("\"$ENV{DESTDIR}");
+    if !super::artifacts::model_path(dir).absolute() && !dir.starts_with(b"/") {
+        path.extend_from_slice(b"${CMAKE_INSTALL_PREFIX}/");
+    }
+    cmake_quoted_content(&mut path, dir);
+    if !dir.is_empty() && !dir.ends_with(b"/") {
+        path.push(b'/');
+    }
+    cmake_quoted_content(&mut path, name);
+    path.push(b'"');
+    path
+}
+
+fn guard(path: &[u8], command: &[u8], configured: bool) -> BString {
+    let indent = if configured {
+        b"    ".as_slice()
+    } else {
+        b"  "
+    };
+    let mut out = [
+        b"if(EXISTS ".as_slice(),
+        path,
+        b" AND NOT IS_SYMLINK ",
+        path,
+        b")\n",
+    ]
+    .concat();
+    for line in command.split(|&byte| byte == b'\n') {
+        out.extend_from_slice(&[indent, b"  ", line, b"\n"].concat());
+    }
+    out.extend_from_slice(indent);
+    out.extend_from_slice(b"endif()");
+    out.into()
 }
 
 fn runtime_list(paths: &[BString]) -> BString {
@@ -167,13 +277,14 @@ mod tests {
 
     #[test]
     fn renders_edit_for_staged_install_path() {
-        let edit = MachORpathEdit {
-            file_name: "libsample.1.dylib".into(),
+        let edit = RuntimeEdit::MachO(MachORpathEdit {
+            install_name: None,
+            changes: IndexMap::new(),
             tool: "/tools/install name tool".into(),
             old: vec!["/tmp/lib".into()],
             new: vec!["@loader_path/../lib".into()],
-        };
-        let output = edit.render(b"relative lib", false);
+        });
+        let output = edit.render(b"relative lib", b"libsample.1.dylib", false);
         assert_eq!(output, br#"if(EXISTS "$ENV{DESTDIR}${CMAKE_INSTALL_PREFIX}/relative lib/libsample.1.dylib" AND NOT IS_SYMLINK "$ENV{DESTDIR}${CMAKE_INSTALL_PREFIX}/relative lib/libsample.1.dylib")
     file(RPATH_CHANGE FILE "$ENV{DESTDIR}${CMAKE_INSTALL_PREFIX}/relative lib/libsample.1.dylib" OLD_RPATH "/tmp/lib" NEW_RPATH "@loader_path/../lib" INSTALL_NAME_TOOL "/tools/install name tool")
   endif()"#.as_slice());

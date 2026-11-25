@@ -107,6 +107,7 @@ pub(crate) fn resolve_exports(
             file: file.clone().unwrap_or_else(|| export_filename(set)),
             cxx_modules_directory: cxx_modules_directory.clone(),
             install: true,
+            windows_paths: export_windows_paths(model, rule.dir),
             ..ExportPlan::default()
         };
         let mut packages = IndexSet::new();
@@ -315,6 +316,7 @@ fn build_exports(model: &ProjectModel) -> Result<IndexMap<BString, BuildExport>,
                         namespace,
                         file,
                         cxx_modules_directory,
+                        windows_paths: export_windows_paths(model, dir),
                         ..ExportPlan::default()
                     },
                     members: ids,
@@ -325,6 +327,18 @@ fn build_exports(model: &ProjectModel) -> Result<IndexMap<BString, BuildExport>,
         }
     }
     Ok(build_plans)
+}
+
+fn export_windows_paths(model: &ProjectModel, dir: DirId) -> Option<bool> {
+    if model
+        .generator
+        .is_some_and(|generator| matches!(generator, rcmake_model::GeneratorKind::VisualStudio(_)))
+    {
+        return Some(true);
+    }
+    crate::lower::definition(model, dir, b"CMAKE_SYSTEM_NAME")
+        .or_else(|| crate::lower::definition(model, dir, b"WIN32"))
+        .map(|_| crate::lower::artifacts::is_dll_platform(model, dir))
 }
 
 fn package_dependencies(
@@ -669,7 +683,13 @@ fn export_target<'a>(
         if properties.contains_key(b"IMPORTED_LOCATION".as_slice()) {
             if let Some(soname) = &facts.artifacts.soname_file {
                 let mut value = if darwin {
-                    crate::lower::install_name_prefix(model, target, &facts.artifacts)
+                    crate::lower::install_name_prefix(
+                        model,
+                        target,
+                        &facts.artifacts,
+                        &facts.config,
+                        install.map(|_| b"${_IMPORT_PREFIX}".as_slice()),
+                    )?
                 } else {
                     BString::default()
                 };

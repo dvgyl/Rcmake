@@ -193,7 +193,6 @@ pub(crate) fn lower_with_inputs(
                 .into_iter()
                 .collect(),
             in_all: !resolved.metadata.exclude_from_all
-                && !model.excluded_from_all(target)
                 && (target.kind != TargetKind::InterfaceLibrary
                     || !resolved.compile_units.is_empty()),
         });
@@ -518,7 +517,13 @@ impl<'a> TargetPlan<'a> {
             self.steps.insert(push(graph_steps, step));
         }
         if let Some(plan) = fortran {
-            for step in plan.scan_steps(model, target, resolved, position_independent)? {
+            for step in plan.scan_steps(
+                model,
+                target,
+                resolved,
+                position_independent,
+                usage.source_paths().map(|paths| paths.host),
+            )? {
                 self.steps.insert(push(graph_steps, step));
             }
         }
@@ -696,8 +701,26 @@ impl<'a> TargetPlan<'a> {
                         .clone_from(&linker_artifacts.file);
                 }
             }
-            let languages = device::link_languages(resolved, resolved_targets);
-            let device = device::plan(model, target, resolved, &step, &languages, &objects, usage)?;
+            let fallback;
+            let languages = if let Some(inputs) = self.inputs {
+                &inputs.link_languages
+            } else {
+                let ctx = rcmake_genex::EvalContext {
+                    config: config.clone(),
+                    link_language: Some(step.language.clone()),
+                    ..Default::default()
+                };
+                fallback = usage
+                    .language_closure(
+                        resolved.id,
+                        &|id| resolved_targets.get(&id).copied(),
+                        &ctx,
+                        false,
+                    )?
+                    .0;
+                &fallback
+            };
+            let device = device::plan(model, target, resolved, &step, languages, &objects, usage)?;
             if let Some(device) = &device
                 && !objects.contains(&device.output)
             {
@@ -712,7 +735,7 @@ impl<'a> TargetPlan<'a> {
                 objects,
                 self.inputs.map(|inputs| &inputs.sources),
                 position_independent,
-                &languages,
+                languages,
                 usage,
             )
             .map_err(|error| {

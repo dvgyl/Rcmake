@@ -297,6 +297,7 @@ impl FortranPlan {
         target: &Target,
         resolved: &ResolvedTarget,
         position_independent: Option<bool>,
+        host: Option<&dyn Host>,
     ) -> Result<Vec<BuildStep>, ResolveError> {
         if !self.ninja {
             return Ok(Vec::new());
@@ -335,7 +336,7 @@ impl FortranPlan {
                     position_independent,
                 };
                 let preprocess = compiler.commands(&group, source, output, &depfile)?;
-                chain_commands(preprocess.into_iter().chain([invocation]))?
+                chain_commands(preprocess.into_iter().chain([invocation]), host)?
             } else {
                 invocation
             };
@@ -765,13 +766,15 @@ impl Preprocessor<'_> {
 
 fn chain_commands(
     invocations: impl IntoIterator<Item = Invocation>,
+    host: Option<&dyn Host>,
 ) -> Result<Invocation, ResolveError> {
+    let windows = host.map_or(cfg!(windows), |host| host.system().sysname == b"Windows");
     let mut shell = BString::default();
     for invocation in invocations {
         if !shell.is_empty() {
             shell.extend_from_slice(b" && ");
         }
-        if cfg!(windows) {
+        if windows {
             if invocation.argv.starts_with(&["sh".into(), "-c".into()]) {
                 return Err(ResolveError::Message(
                     "The Fortran preprocessing rule requires a POSIX shell.".into(),
@@ -785,9 +788,11 @@ fn chain_commands(
             shell.push(b')');
         }
     }
-    if cfg!(windows) {
+    if windows {
         let argv = vec![
-            "cmd.exe".into(),
+            host.and_then(|host| host.env_get(b"COMSPEC"))
+                .filter(|path| !path.is_empty())
+                .unwrap_or_else(|| "cmd.exe".into()),
             "/D".into(),
             "/S".into(),
             "/V:OFF".into(),
@@ -922,7 +927,7 @@ mod tests {
             plan.tdi.forward_modules_from_target_dirs,
             ["/build/CMakeFiles/provider.dir"]
         );
-        let steps = plan.scan_steps(&model, target, &consumer, None)?;
+        let steps = plan.scan_steps(&model, target, &consumer, None, None)?;
         let [
             BuildStep::Scan {
                 preprocessed: Some(pp),

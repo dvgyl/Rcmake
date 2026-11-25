@@ -35,7 +35,7 @@ pub(crate) fn resolve_target<'a>(
         binary_dir: dir.binary_dir.clone(),
         backtrace: target.backtrace.clone(),
         folder: target.props.get(b"FOLDER").cloned(),
-        exclude_from_all: excluded_from_all(model, usage, id, target, ctx),
+        exclude_from_all: excluded_from_all(model, usage, id, target, ctx)?,
         generator_provided: target.kind == TargetKind::GlobalTarget
             || target.name == STD_MODULE_TARGET,
     };
@@ -93,8 +93,17 @@ pub(crate) fn resolve_target<'a>(
     let mut inputs = TargetInputs::default();
     let mut groups = IndexMap::new();
     let mut ide_compile = flavor.map(IdeCompile::new);
-    let (file_sets, members) = collect_file_sets(model, paths, usage, id, ctx)?;
     let sources = usage.collect_property(id, b"SOURCES", ctx)?.entries;
+    let mut membership = crate::pipeline::file_set_membership::Membership::default();
+    let (file_sets, members) = collect_file_sets(model, paths, usage, id, ctx, &mut membership)?;
+    if !membership.is_empty() {
+        for source in &sources {
+            if let Some(value) = paths.resolve_at(model, dir, source)? {
+                membership.source(&value);
+            }
+        }
+        membership.validate(model, paths, target)?;
+    }
     let unity = paths.unity.as_ref().and_then(|plan| plan.get(&id));
     let collect_unity = paths.unity.is_none() && unity::enabled(target);
     let unity_sources = unity.into_iter().flat_map(|plan| {
@@ -432,6 +441,7 @@ pub(crate) fn collect_file_sets<'a>(
     usage: &mut UsageResolver<'a>,
     id: TargetId,
     ctx: &EvalContext,
+    membership: &mut crate::pipeline::file_set_membership::Membership,
 ) -> Result<(bool, IndexMap<BString, FileSetMember<'a>>), ResolveError> {
     let mut has_modules = false;
     let mut members = IndexMap::new();
@@ -456,6 +466,9 @@ pub(crate) fn collect_file_sets<'a>(
             let Some(value) = paths.resolve_at(model, dir, &file)? else {
                 continue;
             };
+            if set.kind != FileSetKind::Headers {
+                membership.member(&value, set_id, &set.name);
+            }
             let parent = Lexical::new(&value).parent();
             let relative_directory = bases.iter().find_map(|base| {
                 let base = Lexical::new(base);
@@ -860,22 +873,22 @@ fn excluded_from_all(
     id: TargetId,
     target: &Target,
     ctx: &EvalContext,
-) -> bool {
+) -> Result<bool, ResolveError> {
     let Some(value) = target
         .props
         .get(b"EXCLUDE_FROM_ALL")
         .filter(|value| value.windows(2).any(|pair| pair == b"$<"))
     else {
-        return model.excluded_from_all(target);
+        return Ok(model.excluded_from_all(target));
     };
     let ctx = EvalContext {
         head: Some(usage::handle(id)),
         current: Some(usage::handle(id)),
         ..ctx.clone()
     };
-    rcmake_genex::parse(value)
-        .and_then(|ast| rcmake_genex::evaluate(&ast, &ctx, &mut usage.host(target.dir)))
-        .is_ok_and(|(value, _)| truth::is_on(&value))
+    usage
+        .eval_ide_property(id, b"EXCLUDE_FROM_ALL", value, &ctx)
+        .map(|value| truth::is_on(&value))
 }
 
 #[cfg(test)]

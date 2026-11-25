@@ -1101,3 +1101,19 @@ fn writes_the_configured_module_definition_pre_link_command()
     assert!(xml.contains("__create_def dll.dir/exports.def dll.dir/exports.def.objs"));
     Ok(())
 }
+
+#[test]
+fn relative_solution_paths_keep_windows_drive_and_share_roots() {
+    assert_eq!(relative(r"C:\work", "c:/work/lib"), "lib");
+    assert_eq!(relative(r"C:\work", "D:/work/lib"), "D:/work/lib");
+    assert_eq!(
+        relative(r"\\server\one\work", "//SERVER/ONE/work/lib"),
+        "lib"
+    );
+    assert_eq!(
+        relative("//server/one/work", "//server/two/lib"),
+        "//server/two/lib"
+    );
+    assert_eq!(relative("/work", "D:/work/lib"), "D:/work/lib");
+    assert_eq!(relative("/work", "/work/lib"), "lib");
+}

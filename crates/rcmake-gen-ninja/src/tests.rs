@@ -903,3 +903,103 @@ fn multi_config_utilities_alias_default_and_cross_configurations()
     assert!(!release.contains("build install$:all:"));
     Ok(())
 }
+
+#[test]
+fn custom_link_recipe_orders_utility_dependencies_on_the_link_edge()
+-> Result<(), Box<dyn std::error::Error>> {
+    let input = BuildGraph {
+        steps: vec![
+            BuildStep::Custom(CustomStep {
+                outputs: vec!["bin/app".into()],
+                byproducts: vec!["bin/note".into()],
+                invocations: vec![Invocation {
+                    argv: vec!["cc".into()],
+                    shell: "cc".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            BuildStep::Custom(CustomStep {
+                outputs: vec!["tool".into()],
+                ..Default::default()
+            }),
+        ],
+        targets: vec![
+            GraphTarget {
+                name: "app".into(),
+                depends: vec![1],
+                steps: vec![0],
+                ..Default::default()
+            },
+            GraphTarget {
+                name: "tool".into(),
+                steps: vec![1],
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+    let artifacts = ArtifactSet {
+        file: Some("bin/app".into()),
+        ..Default::default()
+    };
+    let graph = Graph::new(
+        &input,
+        &[(b"app".as_slice(), &artifacts)].into(),
+        Path::new("/work/build"),
+        None,
+    )?;
+    let mut ninja = Ninja::default();
+    graph.emit(&mut ninja, b"cmake", b"", &[])?;
+    let manifest = String::from_utf8(ninja.0)?;
+    assert!(
+        manifest
+            .lines()
+            .any(|line| line.starts_with("build bin/app ")
+                && line.contains("bin/note")
+                && line.ends_with("|| tool")),
+        "{manifest}"
+    );
+    Ok(())
+}
+
+#[test]
+fn directory_all_omits_targets_excluded_by_expressions() -> Result<(), Box<dyn std::error::Error>> {
+    use rcmake_model::{DirId, GeneratorKind, ProjectModel, Target, TargetKind, TargetOrigin};
+
+    let root = if cfg!(windows) { "C:/work" } else { "/work" };
+    let source = format!("{root}/src");
+    let build = format!("{root}/build");
+    let host = PureHost::default();
+    let mut model = ProjectModel::default();
+    model.set_root_dirs(source.as_str().into(), build.as_str().into());
+    model.generator = Some(GeneratorKind::Ninja);
+    let sub = model.add_directory(
+        DirId::ROOT,
+        format!("{source}/sub").into(),
+        format!("{build}/sub").into(),
+        Default::default(),
+    )?;
+    let mut exe = Target::new(
+        "exe".into(),
+        TargetKind::Executable,
+        TargetOrigin::Normal,
+        sub,
+        Default::default(),
+        Default::default(),
+    );
+    exe.sources
+        .push(rcmake_model::BT::new("main.c".into(), Default::default()));
+    exe.props.set("EXCLUDE_FROM_ALL".into(), "$<BOOL:1>".into());
+    model.add_target(exe)?;
+    host.seed_file(&Path::new(&source).join("sub/main.c"), b"")?;
+    let result = rcmake_resolve::resolve(&model, &host, &[])?;
+    let dir = Path::new(&build);
+    super::generate_single_config_with_model(&result, &host, dir, &model)?;
+    let manifest = read_in(&host, dir, "build.ninja");
+    assert!(
+        manifest.lines().any(|line| line == "build sub/all: phony"),
+        "{manifest}"
+    );
+    Ok(())
+}

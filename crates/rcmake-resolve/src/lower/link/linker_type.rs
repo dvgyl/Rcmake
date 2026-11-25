@@ -9,40 +9,49 @@ use crate::{
     usage::UsageResolver,
 };
 
-/// Return the `CMAKE_<LANG>_USING_LINKER_<TYPE>` flags of `target`.
-///
-/// CMake applies these flags only when the compiler driver links
-/// (`CMAKE_<LANG>_LINK_MODE` is unset or `DRIVER`). A type without flags is an
-/// error unless it is `DEFAULT`.
-///
-/// # Errors
-///
-/// Reports an unknown linker type at the directory of the target.
-pub(super) fn linker_type_flags(
+#[derive(Default)]
+pub(super) struct LinkerSelection {
+    pub(super) flags: Vec<BString>,
+    pub(super) executable: Option<BString>,
+}
+
+pub(super) fn select(
     model: &ProjectModel,
     target: &Target,
     config: &ConfigId,
     language: &[u8],
     kind: LinkKind,
     usage: &mut UsageResolver<'_>,
-) -> Result<Vec<BString>, ResolveError> {
+) -> Result<LinkerSelection, ResolveError> {
     if !matches!(
         kind,
         LinkKind::Executable | LinkKind::SharedLibrary | LinkKind::ModuleLibrary
     ) {
-        return Ok(Vec::new());
+        return Ok(LinkerSelection::default());
     }
     let mode_key = [b"CMAKE_", language, b"_LINK_MODE"].concat();
-    if definition(model, target.dir, &mode_key).is_some_and(|mode| mode != "DRIVER") {
-        return Ok(Vec::new());
-    }
-    let linker_type = match target
-        .props
-        .get(b"LINKER_TYPE")
-        .filter(|value| !value.is_empty())
+    let direct = definition(model, target.dir, &mode_key).is_some_and(|mode| mode == "LINKER");
+    let linker_type = if let Some(value) = target.props.get(b"LINKER_TYPE")
+        && let Some(id) = model.find_target(target.dir, &target.name)
     {
-        Some(value) => evaluate(model, target, config, language, value, usage),
-        None => BString::default(),
+        usage.eval_ide_property(
+            id,
+            b"LINKER_TYPE",
+            value,
+            &EvalContext {
+                config: config.clone(),
+                head: Some(crate::usage::handle(id)),
+                link_language: Some(language.into()),
+                traversal: rcmake_genex::UsageTraversal::Link,
+                ..EvalContext::default()
+            },
+        )?
+    } else {
+        target
+            .props
+            .get(b"LINKER_TYPE")
+            .cloned()
+            .unwrap_or_default()
     };
     let linker_type = if linker_type.is_empty() {
         BString::from("DEFAULT")
@@ -58,10 +67,20 @@ pub(super) fn linker_type_flags(
     .concat()
     .into();
     if let Some(flags) = definition(model, target.dir, &variable) {
-        return Ok(list::split(flags, list::Empty::Drop));
+        return Ok(if direct {
+            LinkerSelection {
+                executable: (!flags.is_empty()).then(|| flags.clone()),
+                ..LinkerSelection::default()
+            }
+        } else {
+            LinkerSelection {
+                flags: list::split(flags, list::Empty::Drop),
+                ..LinkerSelection::default()
+            }
+        });
     }
     if linker_type == "DEFAULT" {
-        return Ok(Vec::new());
+        return Ok(LinkerSelection::default());
     }
     let body: BString = if linker_type.iter().all(u8::is_ascii_uppercase) {
         format!("LINKER_TYPE '{linker_type}' is unknown or not supported by this toolchain.")
@@ -80,31 +99,4 @@ pub(super) fn linker_type_flags(
         );
     }
     Err(ResolveError::Reported(body))
-}
-
-fn evaluate(
-    model: &ProjectModel,
-    target: &Target,
-    config: &ConfigId,
-    language: &[u8],
-    value: &[u8],
-    usage: &mut UsageResolver<'_>,
-) -> BString {
-    if !value.windows(2).any(|pair| pair == b"$<") {
-        return value.into();
-    }
-    let handle = model
-        .find_target(target.dir, &target.name)
-        .map(crate::usage::handle);
-    let ctx = EvalContext {
-        config: config.clone(),
-        head: handle,
-        current: handle,
-        language: Some(language.into()),
-        ..EvalContext::default()
-    };
-    rcmake_genex::parse(value)
-        .and_then(|ast| rcmake_genex::evaluate(&ast, &ctx, &mut usage.host(target.dir)))
-        .map(|(value, _)| value)
-        .unwrap_or_default()
 }

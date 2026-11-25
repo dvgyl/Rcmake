@@ -345,6 +345,7 @@ impl<'a> Graph<'a> {
         &mut self,
         artifacts: &BTreeMap<&[u8], &ArtifactSet>,
         model: Option<&ProjectModel>,
+        result: &GenerationResult,
     ) {
         let mut ambiguous = BTreeSet::new();
         for (name, artifact) in artifacts {
@@ -438,6 +439,12 @@ impl<'a> Graph<'a> {
         for name in directories.values() {
             self.extra_aliases.entry(name.clone()).or_default();
         }
+        let excluded_targets: HashSet<_> = result
+            .targets
+            .iter()
+            .filter(|target| target.config == self.input.config && target.metadata.exclude_from_all)
+            .map(|target| target.metadata.name.as_slice())
+            .collect();
         for (build_target, alias) in self.input.targets.iter().zip(&self.aliases) {
             let Some(target) = model
                 .find_target(DirId::ROOT, &build_target.name)
@@ -446,7 +453,11 @@ impl<'a> Graph<'a> {
                 continue;
             };
             let excluded = target.props.get(b"EXCLUDE_FROM_ALL");
-            if build_target.steps.is_empty() || excluded.is_some_and(|value| truth::is_on(value)) {
+            if build_target.steps.is_empty()
+                || excluded.is_some_and(|value| {
+                    excluded_targets.contains(build_target.name.as_slice()) || truth::is_on(value)
+                })
+            {
                 continue;
             }
             for ancestor in model.ancestors(target.dir) {
@@ -543,10 +554,10 @@ impl<'a> Graph<'a> {
                 }
                 // As in CMake, the link step runs after the target dependencies, so a
                 // tool target that the link rule runs is ready.
-                if matches!(step, BuildStep::Link { .. })
-                    && !dependencies.is_empty()
+                if !dependencies.is_empty()
                     && self.producers.get(alias) != Some(&index)
                     && let Some(nodes) = self.steps.get_mut(index)
+                    && (matches!(step, BuildStep::Link { .. }) || nodes.link)
                 {
                     nodes
                         .order_only

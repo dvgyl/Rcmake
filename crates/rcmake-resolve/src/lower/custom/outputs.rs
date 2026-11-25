@@ -22,6 +22,7 @@ pub(crate) fn checked_command_outputs(
     command: &CustomCommand,
     config: &ConfigId,
     usage: &mut UsageResolver<'_>,
+    host: &dyn rcmake_host::Host,
 ) -> Result<(Vec<BString>, Vec<BString>), ResolveError> {
     let binary = &model.dir(command.dir).binary_dir;
     let source_root = model.dir(DirId::ROOT).source_dir.clone();
@@ -43,7 +44,7 @@ pub(crate) fn checked_command_outputs(
             };
             for path in list::split(&value, list::Empty::Drop) {
                 let path = Lexical::new(&join(binary, &path)).normalize();
-                if let Some(body) = output_problem(model, command.dir, keyword, &path) {
+                if let Some(body) = output_problem(model, command.dir, keyword, &path, Some(host)) {
                     let error = GenexError::Message {
                         expression: BString::default(),
                         message: body.into(),
@@ -64,8 +65,9 @@ pub(crate) fn output_problem(
     dir: DirId,
     keyword: &str,
     path: &[u8],
+    host: Option<&dyn rcmake_host::Host>,
 ) -> Option<String> {
-    if !can_write_project_file(model, dir, path) {
+    if !can_write_project_file(model, dir, path, host) {
         return Some(format!(
             "{keyword} path\n  {}\nin a source directory as an output of custom command.",
             BString::from(path)
@@ -79,18 +81,53 @@ pub(crate) fn output_problem(
 }
 
 /// Apply `CMAKE_DISABLE_SOURCE_CHANGES` and `CMAKE_DISABLE_IN_SOURCE_BUILD` to `path`.
-fn can_write_project_file(model: &ProjectModel, dir: DirId, path: &[u8]) -> bool {
+fn can_write_project_file(
+    model: &ProjectModel,
+    dir: DirId,
+    path: &[u8],
+    host: Option<&dyn rcmake_host::Host>,
+) -> bool {
     let on = |name: &[u8]| definition(model, dir, name).is_some_and(|value| truth::is_on(value));
     if !on(b"CMAKE_DISABLE_SOURCE_CHANGES") {
         return true;
     }
     let root = model.dir(DirId::ROOT);
-    let source = Lexical::new(&root.source_dir).normalize();
-    let binary = Lexical::new(&root.binary_dir).normalize();
-    if source == binary {
+    let insensitive = host.map_or(cfg!(any(windows, target_os = "macos")), |host| {
+        matches!(host.system().sysname.as_slice(), b"Windows" | b"Darwin")
+    });
+    let normalize = |value: &[u8]| {
+        let mut value = Lexical::new(value).normalize();
+        if insensitive {
+            value.make_ascii_lowercase();
+        }
+        value
+    };
+    let source = normalize(&root.source_dir);
+    let binary = normalize(&root.binary_dir);
+    let same_directory = source == binary
+        || host.is_some_and(|host| {
+            let source = rcmake_host::path::to_native(&root.source_dir);
+            let binary = rcmake_host::path::to_native(&root.binary_dir);
+            let identity = |path| {
+                host.metadata(path, rcmake_host::Follow::Yes)
+                    .ok()
+                    .filter(|metadata| metadata.ino != 0)
+                    .map(|metadata| (metadata.dev, metadata.ino))
+            };
+            identity(source.as_path())
+                .zip(identity(binary.as_path()))
+                .is_some_and(|(source, binary)| source == binary)
+                || host
+                    .canonicalize(&source)
+                    .ok()
+                    .zip(host.canonicalize(&binary).ok())
+                    .is_some_and(|(source, binary)| source == binary)
+        });
+    if same_directory {
         return !on(b"CMAKE_DISABLE_IN_SOURCE_BUILD");
     }
-    path == source.as_slice() || !within(path, &source) || within(path, &binary)
+    let path = normalize(path);
+    path == source || !within(&path, &source) || within(&path, &binary)
 }
 
 fn within(path: &[u8], base: &[u8]) -> bool {
@@ -122,18 +159,18 @@ mod tests {
         let source = format!("{root}/src/out.txt");
         let binary = format!("{root}/build/a>");
         assert_eq!(
-            output_problem(&model, DirId::ROOT, "OUTPUT", source.as_bytes()),
+            output_problem(&model, DirId::ROOT, "OUTPUT", source.as_bytes(), None),
             Some(format!(
                 "OUTPUT path\n  {source}\nin a source directory as an output of custom command."
             ))
         );
         assert_eq!(
-            output_problem(&model, DirId::ROOT, "BYPRODUCTS", binary.as_bytes()),
+            output_problem(&model, DirId::ROOT, "BYPRODUCTS", binary.as_bytes(), None),
             Some("BYPRODUCTS containing a \">\" is not allowed.".into())
         );
         let good = format!("{root}/build/out.txt");
         assert_eq!(
-            output_problem(&model, DirId::ROOT, "OUTPUT", good.as_bytes()),
+            output_problem(&model, DirId::ROOT, "OUTPUT", good.as_bytes(), None),
             None
         );
     }
@@ -144,7 +181,7 @@ mod tests {
         let model = project(false);
         let source = format!("{root}/src/out.txt");
         assert_eq!(
-            output_problem(&model, DirId::ROOT, "OUTPUT", source.as_bytes()),
+            output_problem(&model, DirId::ROOT, "OUTPUT", source.as_bytes(), None),
             None
         );
         assert!(within(b"/a/b/c", b"/a/b"));

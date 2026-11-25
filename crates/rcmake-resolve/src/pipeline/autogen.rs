@@ -43,7 +43,14 @@ pub(super) fn prepare(
         };
         for (id, target) in model.targets().filter(|(_, target)| requested(target)) {
             let dir = model.dir(target.dir);
-            let (_, members) = collect_file_sets(model, paths, &mut usage, id, &context)?;
+            let (_, members) = collect_file_sets(
+                model,
+                paths,
+                &mut usage,
+                id,
+                &context,
+                &mut Default::default(),
+            )?;
             let mut sources = IndexMap::new();
             for source in usage.collect_property(id, b"SOURCES", &context)?.entries {
                 let path = paths

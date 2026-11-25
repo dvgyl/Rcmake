@@ -1,6 +1,6 @@
 //! Policy `CMP0081`: relative paths in the `LINK_DIRECTORIES` target property.
 
-use rcmake_base::{BString, path_lex::Lexical};
+use rcmake_base::BString;
 use rcmake_diag::{MessageKind, PolicyId, PolicyStatus};
 use rcmake_model::{BT, ProjectModel, Target};
 
@@ -10,16 +10,22 @@ use crate::{ResolveError, cxx_modules::generation_location, sources::SourcePaths
 ///
 /// With `NEW`, the relative path is an error. Without a setting, it is a policy
 /// warning. With `OLD`, the path stays as given.
-pub(super) fn check_relative(
+pub(crate) fn check_relative(
     model: &ProjectModel,
     paths: &SourcePaths<'_>,
     target: &Target,
+    provider: &Target,
     directories: &[BT<BString>],
 ) -> Result<(), ResolveError> {
     let Some(relative) = directories.iter().find(|directory| {
         !directory.value.is_empty()
             && !directory.value.starts_with(b"$<")
-            && !Lexical::new(&directory.value).absolute()
+            && !crate::usage::paths::usage_path_is_full(
+                model,
+                paths,
+                provider.dir,
+                &directory.value,
+            )
     }) else {
         return Ok(());
     };
@@ -27,6 +33,20 @@ pub(super) fn check_relative(
         "Found relative path while evaluating link directories of \"{}\":\n\n  \"{}\"\n",
         target.name, relative.value
     );
+    if provider.name != target.name {
+        let body = format!(
+            "Target \"{}\" contains relative path in its INTERFACE_LINK_DIRECTORIES:\n\n  \"{}\"",
+            provider.name, relative.value
+        )
+        .into();
+        paths.emit(
+            model,
+            MessageKind::Error,
+            generation_location(model, target),
+            BString::clone(&body),
+        );
+        return Err(ResolveError::Reported(body));
+    }
     let policy = PolicyId::new(81);
     match target.policies.policies.get(policy) {
         PolicyStatus::Old => Ok(()),

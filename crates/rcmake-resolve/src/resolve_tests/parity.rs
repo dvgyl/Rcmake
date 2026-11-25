@@ -262,3 +262,48 @@ fn cmp0128_optional_warning_names_the_old_behavior() -> TestResult {
     }
     Ok(())
 }
+
+#[test]
+fn cmp0211_checks_only_the_file_sets_active_in_each_configuration() -> TestResult {
+    for overlap in [false, true] {
+        let (mut model, host) = fixture()?;
+        let mut lib = target("lib", TargetKind::StaticLibrary, &[]);
+        lib.policies
+            .policies
+            .set(PolicyId::new(211), PolicyStatus::New)?;
+        let id = model.add_target(lib)?;
+        for (name, expression) in [
+            ("s1", "$<$<CONFIG:Debug>:main.c>"),
+            (
+                "s2",
+                if overlap {
+                    "$<$<CONFIG:Debug>:./main.c>"
+                } else {
+                    "$<$<CONFIG:Release>:main.c>"
+                },
+            ),
+        ] {
+            model.add_file_set(FileSet {
+                target: id,
+                name: name.into(),
+                kind: FileSetKind::Sources,
+                scope: UsageScope::Private,
+                base_dirs: Vec::new(),
+                files: vec![entry(expression)],
+                props: Default::default(),
+            })?;
+        }
+        let configs = if overlap {
+            vec![ConfigId("Debug".into())]
+        } else {
+            vec![ConfigId("Debug".into()), ConfigId("Release".into())]
+        };
+        let result = resolve(&model, &host, &configs);
+        assert_eq!(result.is_err(), overlap, "{result:?}");
+        assert_eq!(
+            stderr(&host).contains("already belongs to file set \"s1\""),
+            overlap
+        );
+    }
+    Ok(())
+}

@@ -1,7 +1,7 @@
 //! Validate the target intermediate directory strategies.
 
 use rcmake_host::{Host, Stream};
-use rcmake_model::ProjectModel;
+use rcmake_model::{CacheEntry, CacheType, ProjectModel};
 
 use crate::ResolveError;
 
@@ -10,17 +10,33 @@ use crate::ResolveError;
 ///
 /// The cache entry has priority over the environment variable. The supported
 /// strategies are `FULL` and `SHORT`.
-pub(super) fn validate(model: &ProjectModel, host: &dyn Host) -> Result<(), ResolveError> {
+pub(super) fn prepare(
+    model: &ProjectModel,
+    host: &dyn Host,
+) -> Result<Option<ProjectModel>, ResolveError> {
+    let mut initialized = None;
     for (name, kind) in [
         (b"CMAKE_INTERMEDIATE_DIR_STRATEGY".as_slice(), ""),
         (b"CMAKE_AUTOGEN_INTERMEDIATE_DIR_STRATEGY", "autogen "),
     ] {
-        let value = model
-            .cache
-            .get(name)
-            .map(|entry| entry.value.clone())
-            .or_else(|| host.env_get(name));
-        let Some(value) = value.filter(|value| !value.is_empty()) else {
+        let value = if let Some(entry) = model.cache.get(name) {
+            entry.value.clone()
+        } else if let Some(value) = host.env_get(name) {
+            initialized
+                .get_or_insert_with(|| model.clone())
+                .cache
+                .insert(
+                    name.into(),
+                    CacheEntry {
+                        value: value.clone(),
+                        ty: CacheType::String,
+                        help: Default::default(),
+                        advanced: false,
+                        props: Default::default(),
+                    },
+                );
+            value
+        } else {
             continue;
         };
         if matches!(value.as_slice(), b"FULL" | b"SHORT") {
@@ -33,5 +49,5 @@ pub(super) fn validate(model: &ProjectModel, host: &dyn Host) -> Result<(), Reso
         );
         return Err(ResolveError::Reported(body.into()));
     }
-    Ok(())
+    Ok(initialized)
 }

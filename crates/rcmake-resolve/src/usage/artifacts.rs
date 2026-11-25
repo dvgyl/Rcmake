@@ -828,7 +828,11 @@ fn imported_artifact(
     })
 }
 
-fn imported_for_config(target: &Target, property: &[u8], config: &[u8]) -> Option<BString> {
+pub(crate) fn imported_for_config(
+    target: &Target,
+    property: &[u8],
+    config: &[u8],
+) -> Option<BString> {
     if config.is_empty() {
         return target.props.get(property).cloned();
     }
@@ -838,7 +842,7 @@ fn imported_for_config(target: &Target, property: &[u8], config: &[u8]) -> Optio
         .cloned()
 }
 
-fn imported_property(
+pub(crate) fn imported_property(
     target: &Target,
     property: &[u8],
     config: &ConfigId,

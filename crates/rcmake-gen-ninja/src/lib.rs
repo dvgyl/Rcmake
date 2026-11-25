@@ -158,7 +158,7 @@ fn generate_single(
         &prefix,
         commands.clone(),
     )?;
-    graph.add_aliases(&artifacts, model);
+    graph.add_aliases(&artifacts, model, result);
     graph.resolve_custom_inputs(model, host);
     graph.connect_custom_dependencies(model);
     graph.set_compile_metadata(result);
@@ -300,7 +300,7 @@ fn generate_multi(
             &prefix,
             commands.clone(),
         )?;
-        graph.add_aliases(&artifacts, model);
+        graph.add_aliases(&artifacts, model, result);
         graph.resolve_custom_inputs(model, host);
         graph.set_compile_metadata(result);
         graph.set_command_settings(model, host);
@@ -407,7 +407,7 @@ fn generate_multi(
                         &prefix,
                         commands.clone(),
                     )?;
-                    variant.add_aliases(&artifacts, model);
+                    variant.add_aliases(&artifacts, model, result);
                     variant.resolve_custom_inputs(model, host);
                     variant.set_compile_metadata(result);
                     variant.set_command_settings(model, host);

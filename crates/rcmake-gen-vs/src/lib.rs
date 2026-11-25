@@ -316,9 +316,26 @@ fn absolute(base: &str, path: &str) -> String {
 }
 
 fn relative(base: &str, path: &str) -> String {
-    Lexical::new(path.as_bytes())
-        .relative(Lexical::new(base.as_bytes()))
-        .map_or_else(|| path.into(), |result| string(&result))
+    let path = path.replace('\\', "/");
+    let base = base.replace('\\', "/");
+    let split = |text: &str| {
+        let root = Lexical::windows(text.as_bytes()).root_name();
+        if root.starts_with(b"//") {
+            text.get(root.len() + 1..)
+                .and_then(|tail| tail.split('/').next())
+                .map_or(root.len(), |share| root.len() + 1 + share.len())
+        } else {
+            root.len()
+        }
+    };
+    let (path_root, path_tail) = path.split_at(split(&path));
+    let (base_root, base_tail) = base.split_at(split(&base));
+    if !path_root.eq_ignore_ascii_case(base_root) {
+        return path;
+    }
+    Lexical::new(path_tail.as_bytes())
+        .relative(Lexical::new(base_tail.as_bytes()))
+        .map_or(path, |result| string(&result))
 }
 
 fn folder(path: &str) -> String {

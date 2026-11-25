@@ -322,23 +322,10 @@ fn multi_config(model: &ProjectModel) -> bool {
 }
 
 pub(crate) fn object_dir(model: &ProjectModel, target: &Target, config: &ConfigId) -> BString {
-    let binary = &model.dir(target.dir).binary_dir;
-    let relative = build_relative(model, binary);
     let dir = if short_object_paths(model) {
-        let directory = if relative.is_empty() {
-            b".".as_slice()
-        } else {
-            &relative
-        };
-        let name_hash = sha3_prefix(&target.name, 4);
-        let directory_hash = sha3_prefix(directory, 4);
-        let short = format!(".o/{name_hash}{directory_hash}");
-        if model.generator == Some(GeneratorKind::UnixMakefiles) {
-            join(&relative, short.as_bytes())
-        } else {
-            short.into()
-        }
+        short_support_dir(model, target)
     } else {
+        let relative = build_relative(model, &model.dir(target.dir).binary_dir);
         join(
             &relative,
             &[b"CMakeFiles/", target.name.as_slice(), b".dir"].concat(),
@@ -348,6 +335,23 @@ pub(crate) fn object_dir(model: &ProjectModel, target: &Target, config: &ConfigI
         join(&dir, &config.0)
     } else {
         dir
+    }
+}
+
+pub(super) fn short_support_dir(model: &ProjectModel, target: &Target) -> BString {
+    let relative = build_relative(model, &model.dir(target.dir).binary_dir);
+    let directory = if relative.is_empty() {
+        b".".as_slice()
+    } else {
+        &relative
+    };
+    let name_hash = sha3_prefix(&target.name, 4);
+    let directory_hash = sha3_prefix(directory, 4);
+    let short = format!(".o/{name_hash}{directory_hash}");
+    if model.generator == Some(GeneratorKind::UnixMakefiles) {
+        join(&relative, short.as_bytes())
+    } else {
+        short.into()
     }
 }
 

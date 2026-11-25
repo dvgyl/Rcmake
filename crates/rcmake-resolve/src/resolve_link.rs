@@ -13,13 +13,14 @@ use crate::{
     usage::{ResolvedLinkItem, ResolvedLinkKind, UsageResolver},
 };
 
-mod directories;
+pub(crate) mod directories;
 mod features;
 use features::Features;
 
 #[derive(Default)]
 pub(crate) struct ResolvedLink {
     step: Option<LinkStep>,
+    languages: IndexSet<BString>,
     position_independent: Option<bool>,
     dependencies: Vec<TargetId>,
     module_links: Vec<TargetId>,
@@ -110,7 +111,9 @@ pub(crate) fn resolve_link(
     let directories = usage
         .collect_for_result(id, UsageField::LinkDirectories, &ctx)?
         .entries;
-    directories::check_relative(model, paths, target, &directories)?;
+    link.languages = usage
+        .language_closure(id, &|id| resolved.get(&id), &ctx, true)?
+        .0;
     let naming = LinkLibraryFlags::new(model, target, &language);
     let mut fragments = Vec::with_capacity(options.len() + directories.len() + items.len());
     for option in &options {
@@ -228,10 +231,19 @@ pub(crate) fn resolve_link(
                     _ => None,
                 })
                 .collect::<Vec<_>>();
-            let rpaths = lower::ide_rpaths(model, target, id, &ctx, usage, &step, &libraries)?;
+            let rpaths = lower::ide_rpaths(
+                model,
+                target,
+                &ctx.config,
+                &step,
+                &libraries,
+                &link.languages,
+                usage,
+            )?;
             let install_name_dir = (kind == LinkKind::SharedLibrary)
-                .then(|| lower::install_name_dir(model, target, &facts.artifacts))
-                .map(|dir| usage.eval_ide_property(id, b"INSTALL_NAME_DIR", &dir, &ctx))
+                .then(|| {
+                    lower::install_name_dir(model, target, &facts.artifacts, &ctx.config, None)
+                })
                 .transpose()?;
             (rpaths, install_name_dir)
         } else {
@@ -306,6 +318,7 @@ pub(crate) fn attach_links(
                 }
             }
         }
+        inputs.link_languages = link.languages;
         inputs.xcframework_inputs = link.xcframework_inputs;
         target.link = link.step;
         target.dependencies = link.dependencies;

@@ -82,13 +82,13 @@ fn fortran_uses_typed_scans_and_preserves_source_identity() -> TestResult {
 fn cuda_device_link_and_host_link_use_separate_options() -> TestResult {
     let (mut model, host, src) = fixture(GeneratorKind::Ninja);
     for (key, value) in [
-        ("ENABLED_LANGUAGES", "CUDA"),
+        ("ENABLED_LANGUAGES", "CUDA;CXX"),
         ("CMAKE_CUDA_COMPILER", "nvcc"),
         ("CMAKE_CUDA_COMPILER_ID", "NVIDIA"),
         ("CMAKE_CUDA_COMPILER_VERSION", "12.6.85"),
         ("CMAKE_CUDA_COMPILER_HAS_DEVICE_LINK_PHASE", "ON"),
         (
-            "CMAKE_CUDA_LINK_EXECUTABLE",
+            "CMAKE_CXX_LINK_EXECUTABLE",
             "cc <LINK_FLAGS> <OBJECTS> -o <TARGET> <LINK_LIBRARIES>",
         ),
         (
@@ -111,6 +111,7 @@ fn cuda_device_link_and_host_link_use_separate_options() -> TestResult {
         .policies
         .set(PolicyId::new(105), PolicyStatus::New)?;
     for (property, value) in [
+        ("LINKER_LANGUAGE", "CXX"),
         ("CUDA_ARCHITECTURES", "90a-real"),
         ("CUDA_SEPARABLE_COMPILATION", "ON"),
         ("CUDA_RUNTIME_LIBRARY", "Shared"),
@@ -118,12 +119,21 @@ fn cuda_device_link_and_host_link_use_separate_options() -> TestResult {
     ] {
         app.props.set(property.into(), value.into());
     }
-    app.usage
-        .push(UsageField::LinkOptions, entry("$<HOST_LINK:--host-flag>"));
     app.usage.push(
         UsageField::LinkOptions,
-        entry("$<DEVICE_LINK:--device-flag>"),
+        entry("$<HOST_LINK:$<$<LINK_LANGUAGE:CXX>:--host-flag>>"),
     );
+    app.usage.push(
+        UsageField::LinkOptions,
+        entry("$<DEVICE_LINK:$<$<LINK_LANGUAGE:CUDA>:--device-flag>>"),
+    );
+    let mut iface = target("device_options", TargetKind::InterfaceLibrary, &[]);
+    iface.usage.push(
+        UsageField::InterfaceLinkOptions,
+        entry("$<DEVICE_LINK:$<$<LINK_LANGUAGE:CUDA>:--inherited-device>>"),
+    );
+    model.add_target(iface)?;
+    app.usage.link_libraries = Some(vec![link_item("device_options")]);
     model.add_target(app)?;
     let output = resolve(&model, &host, &[])?;
     let graph = output.graphs.first().ok_or("Missing CUDA graph.")?;
@@ -143,6 +153,7 @@ fn cuda_device_link_and_host_link_use_separate_options() -> TestResult {
     let Some(BuildStep::Link {
         inputs,
         implicit_inputs,
+        step,
         invocations,
         ..
     }) = steps.next()
@@ -155,6 +166,13 @@ fn cuda_device_link_and_host_link_use_separate_options() -> TestResult {
     assert!(link.argv.iter().any(|arg| arg == b"-lcudart"));
     assert!(link.argv.iter().any(|arg| arg == b"--host-flag"));
     assert!(invocation.argv.iter().any(|arg| arg == b"--device-flag"));
+    assert!(
+        invocation
+            .argv
+            .iter()
+            .any(|arg| arg == b"--inherited-device")
+    );
+    assert_eq!(step.language, "CXX");
     assert!(
         invocation
             .argv
@@ -291,5 +309,75 @@ fn autogen_writes_metadata_for_the_generated_sources() -> TestResult {
 
     resolve(&model, &host, &[])?;
     assert_eq!(read()?, data);
+    Ok(())
+}
+
+#[test]
+fn autogen_and_object_intermediate_directory_strategies_are_independent() -> TestResult {
+    for short_autogen in [false, true] {
+        let (mut model, host, src) = fixture(GeneratorKind::NinjaMultiConfig);
+        host.env_set(b"CMAKE_AUTOGEN_INTERMEDIATE_DIR_STRATEGY", Some(b"SHORT"));
+        host.env_set(b"CMAKE_INTERMEDIATE_DIR_STRATEGY", Some(b"SHORT"));
+        let key = if short_autogen {
+            "CMAKE_INTERMEDIATE_DIR_STRATEGY"
+        } else {
+            "CMAKE_AUTOGEN_INTERMEDIATE_DIR_STRATEGY"
+        };
+        model.cache.insert(
+            key.into(),
+            CacheEntry {
+                value: "FULL".into(),
+                ty: CacheType::String,
+                help: Default::default(),
+                advanced: false,
+                props: Default::default(),
+            },
+        );
+        let build = model.dir(DirId::ROOT).binary_dir.clone();
+        let sub = model.add_directory(
+            DirId::ROOT,
+            format!("{src}/sub").into(),
+            format!("{build}/sub").into(),
+            Backtrace::default(),
+        )?;
+        model.dir_mut(sub).vars.extend([
+            ("QT_VERSION_MAJOR".into(), "6".into()),
+            ("QT_VERSION_MINOR".into(), "8".into()),
+        ]);
+        let mut app = target("app", TargetKind::Executable, &["main.cpp"]);
+        app.dir = sub;
+        app.props.set("AUTOMOC".into(), "ON".into());
+        app.props.set("AUTOMOC_EXECUTABLE".into(), "moc".into());
+        model.add_target(app)?;
+        host.seed_file(&Path::new(&src).join("sub/main.cpp"), b"int main() {}")?;
+        let result = resolve(
+            &model,
+            &host,
+            &[ConfigId("Debug".into()), ConfigId("Release".into())],
+        )?;
+        let info = result
+            .metadata
+            .generated_files
+            .iter()
+            .find(|path| path.ends_with(b"AutogenInfo.json"))
+            .ok_or("Missing autogen information.")?;
+        assert_eq!(info.to_string().contains("/.o/"), short_autogen, "{info}");
+        for app in result
+            .targets
+            .iter()
+            .filter(|target| target.metadata.name == "app")
+        {
+            let dir = app
+                .artifacts
+                .object_dir
+                .as_ref()
+                .ok_or("Missing object directory.")?;
+            assert_eq!(dir.starts_with(b".o/"), !short_autogen, "{dir}");
+            assert!(dir.ends_with(&app.config.0), "{dir}");
+        }
+    }
+    let (model, host, _) = fixture(GeneratorKind::Ninja);
+    host.env_set(b"CMAKE_AUTOGEN_INTERMEDIATE_DIR_STRATEGY", Some(b""));
+    assert!(resolve(&model, &host, &[]).is_err());
     Ok(())
 }

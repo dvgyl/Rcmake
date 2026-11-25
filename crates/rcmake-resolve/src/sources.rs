@@ -55,7 +55,14 @@ impl SourceUsage {
                     group.source_define_start = Some(group.defines.len());
                     group
                         .defines
-                        .extend(source_values.into_iter().chain(set_values));
+                        .extend(source_values.into_iter().chain(set_values).filter_map(
+                            |mut entry| {
+                                if let Some(value) = entry.value.strip_prefix(b"-D") {
+                                    entry.value = value.into();
+                                }
+                                (!entry.value.is_empty()).then_some(entry)
+                            },
+                        ));
                 }
             }
             Self::Includes => {
@@ -258,6 +265,7 @@ pub(crate) fn append_compile_flags(
 
 #[derive(Default)]
 pub(crate) struct TargetInputs {
+    pub(crate) link_languages: IndexSet<BString>,
     pub(crate) xcframework_inputs: IndexSet<BString>,
     pub(crate) sources: IndexSet<BString>,
     pub(crate) objects: IndexSet<BString>,
@@ -276,6 +284,7 @@ pub(crate) struct SourcePaths<'a> {
     missing: RefCell<IndexSet<(BString, BString)>>,
     /// Rendered generation warnings, so that a repeated evaluation warns once.
     warnings: RefCell<IndexSet<BString>>,
+    file_set_warnings: RefCell<IndexSet<(DirId, BString, BString, usize)>>,
     root_source_dir: Option<BString>,
     absolute_sources: IndexMap<BString, IndexSet<BString>>,
     generated: IndexMap<BString, IndexSet<BString>>,
@@ -293,6 +302,7 @@ impl<'a> SourcePaths<'a> {
             extension_warnings: RefCell::default(),
             missing: RefCell::default(),
             warnings: RefCell::default(),
+            file_set_warnings: RefCell::default(),
             root_source_dir: None,
             absolute_sources: IndexMap::new(),
             generated: IndexMap::new(),
@@ -330,14 +340,15 @@ impl<'a> SourcePaths<'a> {
         let mut usage = UsageResolver::new(model).with_ide(self.ide);
         let mut errors = Vec::new();
         for (_, command) in model.commands() {
-            let (outputs, byproducts) =
-                match crate::lower::checked_command_outputs(model, command, config, &mut usage) {
-                    Ok(paths) => paths,
-                    Err(error) => {
-                        errors.push(error);
-                        continue;
-                    }
-                };
+            let (outputs, byproducts) = match crate::lower::checked_command_outputs(
+                model, command, config, &mut usage, self.host,
+            ) {
+                Ok(paths) => paths,
+                Err(error) => {
+                    errors.push(error);
+                    continue;
+                }
+            };
             let dir = model.dir(command.dir);
             for path in outputs.into_iter().chain(byproducts) {
                 self.generated
@@ -580,6 +591,20 @@ impl<'a> SourcePaths<'a> {
             self.emit(model, MessageKind::Error, Location::Backtrace(trace), body);
         }
         Ok(None)
+    }
+
+    pub(crate) fn first_file_set_warning(
+        &self,
+        target: &rcmake_model::Target,
+        body: &BString,
+        occurrence: usize,
+    ) -> bool {
+        self.file_set_warnings.borrow_mut().insert((
+            target.dir,
+            target.name.clone(),
+            body.clone(),
+            occurrence,
+        ))
     }
 
     pub(crate) fn emit(

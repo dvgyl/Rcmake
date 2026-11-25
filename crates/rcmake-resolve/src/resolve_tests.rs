@@ -3,6 +3,7 @@ mod excluded_export;
 mod generation_rules;
 mod languages;
 mod parity;
+mod runtime_paths;
 
 use std::path::Path;
 use std::sync::Arc;

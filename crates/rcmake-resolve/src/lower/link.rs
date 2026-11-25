@@ -1,36 +1,34 @@
 //! Link and archive rules.
 
-use std::borrow::Cow;
-use std::collections::BTreeMap;
-
 use indexmap::IndexSet;
 use rcmake_base::{BString, list, path_lex::Lexical, shell::quote, truth};
 use rcmake_diag::{PolicyId, PolicyStatus};
-use rcmake_genex::{
-    ArtifactKind, ArtifactPart, ConfigId, EvalContext, UsageTraversal, evaluate, parse,
-};
-use rcmake_model::{DirId, ProjectModel, Target, TargetId};
+use rcmake_genex::{ConfigId, EvalContext, UsageTraversal, evaluate, parse};
+use rcmake_model::{DirId, ProjectModel, Target};
 
 use super::artifacts::{build_relative, is_darwin, is_msvc};
 use super::compile::{apple_flags, language_flags};
-use super::install_rpath::MachORpathEdit;
 use super::launcher;
 use super::policy_flags::Flags;
 use super::shell::{command as shell_command, direct, join_words, rule_invocations, simple_args};
-use super::{definition, join, target_property};
+use super::{definition, join};
 use crate::{
-    ArtifactSet, BuildStep, LinkFragmentRole, LinkKind, LinkStep, ResolveError, ResolvedTarget,
+    ArtifactSet, BuildStep, LinkFragmentRole, LinkKind, LinkStep, ResolveError,
     usage::UsageResolver,
 };
 
 pub(super) mod driver;
 mod frameworks;
+mod install_name;
 mod linker_type;
+pub(crate) use install_name::{install_name_dir, install_name_prefix, warn_install_name_policy};
+pub(super) mod rpath;
 use driver::{
     LinkerDriver, archive_commands, deduplicate_darwin_flags, definition_file, library_file,
     shared_library, without_empty_output_flags,
 };
 pub(crate) use frameworks::bundle_name as framework_bundle_name;
+pub(crate) use rpath::ide_rpaths;
 
 #[expect(
     clippy::too_many_arguments,
@@ -175,7 +173,8 @@ pub(super) fn link(
         });
     }
     // CMake adds the linker type flags after the link options.
-    for flag in linker_type::linker_type_flags(model, target, config, language, kind, usage)? {
+    let linker = linker_type::select(model, target, config, language, kind, usage)?;
+    for flag in linker.flags {
         flags.push(wrapper.argument(&flag)?);
     }
     if kind != LinkKind::StaticArchive {
@@ -255,6 +254,8 @@ pub(super) fn link(
         &mut inputs,
         &wrapper,
         runtime,
+        link_languages,
+        usage,
     )?;
     let mut implicit_inputs = Vec::new();
     if kind != LinkKind::StaticArchive
@@ -300,7 +301,7 @@ pub(super) fn link(
         })
     });
     let install_name_dir = if darwin && soname.is_some() {
-        install_name_prefix(model, target, artifacts)
+        install_name_prefix(model, target, artifacts, config, None)?
     } else {
         BString::default()
     };
@@ -310,6 +311,7 @@ pub(super) fn link(
     let output_base = quote(step.output.strip_suffix(output_ext).unwrap_or(&step.output));
     let object_dir = super::object_dir(model, target, config);
     let lookup = |key: &[u8]| match key {
+        b"CMAKE_LINKER" => linker.executable.as_ref().map(|path| quote(path)),
         b"TARGET" => Some(output.clone()),
         b"TARGET_BASE" => Some(output_base.clone()),
         b"OBJECT_DIR" | b"TARGET_SUPPORT_DIR" => Some(quote(&object_dir)),
@@ -547,6 +549,8 @@ fn link_libraries(
     inputs: &mut Vec<BString>,
     wrapper: &LinkerDriver<'_>,
     runtime_args: Vec<BString>,
+    link_languages: &IndexSet<BString>,
+    usage: &mut UsageResolver<'_>,
 ) -> Result<BString, ResolveError> {
     if step.kind == LinkKind::StaticArchive {
         return Ok(BString::default());
@@ -558,8 +562,16 @@ fn link_libraries(
     let mut libraries = linked_libraries(step);
     let named = frameworks::named_framework_files(model, target, config, step, &libraries);
     libraries.extend(named);
-    let runtime = runtime_libraries(model, target, config, step, &libraries);
-    let rpaths = rpaths(model, target, config, step, darwin, &runtime)?;
+    let runtime = rpath::runtime_libraries(model, target, config, step, &libraries, usage)?;
+    let rpaths = rpath::link_flags(
+        model,
+        target,
+        config,
+        step,
+        darwin,
+        &runtime,
+        link_languages,
+    )?;
     inputs.extend(libraries);
     let (mut arguments, mut rpaths) = if darwin {
         (Vec::new(), Some(rpaths))
@@ -631,121 +643,6 @@ fn macho_version(value: &[u8]) -> Option<BString> {
     (major != 0 || minor != 0 || patch != 0).then(|| format!("{major}.{minor}.{patch}").into())
 }
 
-pub(crate) fn install_name_dir(
-    model: &ProjectModel,
-    target: &Target,
-    artifacts: &ArtifactSet,
-) -> BString {
-    let property = |key| target_property(model, target, key);
-    let install = property(b"BUILD_WITH_INSTALL_NAME_DIR").is_some_and(|v| truth::is_on(v));
-    let rpath = property(b"MACOSX_RPATH").map_or_else(
-        || {
-            rcmake_diag::PolicyId::parse(b"CMP0042")
-                .is_none_or(|id| target.policies.policies.get(id) != rcmake_diag::PolicyStatus::Old)
-        },
-        |v| truth::is_on(v),
-    );
-    let mut dir = if install {
-        property(b"INSTALL_NAME_DIR").cloned().unwrap_or_else(|| {
-            if rpath {
-                "@rpath".into()
-            } else {
-                BString::default()
-            }
-        })
-    } else if rpath {
-        "@rpath".into()
-    } else {
-        artifacts
-            .file
-            .as_ref()
-            .map(|file| Lexical::new(file).parent().into())
-            .unwrap_or_else(|| model.dir(target.dir).binary_dir.clone())
-    };
-    if !dir.is_empty() && !dir.ends_with(b"/") {
-        dir.push(b'/');
-    }
-    dir
-}
-
-pub(crate) fn install_name_prefix(
-    model: &ProjectModel,
-    target: &Target,
-    artifacts: &ArtifactSet,
-) -> BString {
-    let mut dir = install_name_dir(model, target, artifacts);
-    if let layout @ crate::ide::BundleKind::Framework { .. } = crate::ide::bundle_kind(target)
-        && let Some(file) = &artifacts.file
-        && let Some(root) = layout.root(file)
-        && let Some(relative) = Lexical::new(Lexical::new(file).parent())
-            .relative(Lexical::new(Lexical::new(root).parent()))
-        && !dir
-            .strip_suffix(b"/")
-            .is_some_and(|dir| Lexical::new(dir).normalize() == Lexical::new(file).parent())
-    {
-        dir.extend_from_slice(&relative);
-        dir.push(b'/');
-    }
-    dir
-}
-
-fn rpaths(
-    model: &ProjectModel,
-    target: &Target,
-    config: &ConfigId,
-    step: &LinkStep,
-    darwin: bool,
-    libraries: &[BString],
-) -> Result<Vec<BString>, ResolveError> {
-    let Some((property, installs)) = rpath_property(model, target) else {
-        return Ok(Vec::new());
-    };
-    let prefix = runtime_flag(model, target, &step.language);
-    if prefix.is_empty() {
-        return Ok(Vec::new());
-    }
-    let value = rpath_value(model, target, config, step, property)?;
-    let paths = rpath_entries(model, target, step, darwin, libraries, installs, &value);
-    Ok(if darwin {
-        paths
-            .iter()
-            .map(|path| [prefix, quote(path).as_slice()].concat().into())
-            .collect()
-    } else if paths.is_empty() {
-        Vec::new()
-    } else {
-        let paths = paths
-            .iter()
-            .map(|v| v.as_slice())
-            .collect::<Vec<_>>()
-            .join(&b':');
-        vec![[prefix, quote(&paths).as_slice()].concat().into()]
-    })
-}
-
-fn rpath_value(
-    model: &ProjectModel,
-    target: &Target,
-    config: &ConfigId,
-    link: &LinkStep,
-    property: &[u8],
-) -> Result<BString, ResolveError> {
-    let Some(value) = target_property(model, target, property) else {
-        return Ok(BString::default());
-    };
-    if let Some(id) = model.find_target(target.dir, &target.name)
-        && value.windows(2).any(|part| part == b"$<")
-    {
-        let ctx = EvalContext {
-            config: config.clone(),
-            link_language: Some(link.language.clone()),
-            ..EvalContext::default()
-        };
-        return UsageResolver::new(model).eval_ide_property(id, property, value, &ctx);
-    }
-    Ok(value.clone())
-}
-
 fn linked_libraries(step: &LinkStep) -> Vec<BString> {
     step.fragments
         .iter()
@@ -753,232 +650,4 @@ fn linked_libraries(step: &LinkStep) -> Vec<BString> {
         .flat_map(|fragment| simple_args(&fragment.text.value).into_iter().flatten())
         .filter(|arg| library_file(arg))
         .collect()
-}
-
-fn runtime_libraries<'a>(
-    model: &ProjectModel,
-    target: &Target,
-    config: &ConfigId,
-    step: &LinkStep,
-    libraries: &'a [BString],
-) -> Cow<'a, [BString]> {
-    if !is_darwin(model, target.dir) || !libraries.iter().any(|file| file.ends_with(b".tbd")) {
-        return Cow::Borrowed(libraries);
-    }
-    let Some(id) = model.find_target(target.dir, &target.name) else {
-        return Cow::Borrowed(libraries);
-    };
-    let mut usage = UsageResolver::new(model);
-    let ctx = EvalContext {
-        config: config.clone(),
-        link_language: Some(step.language.clone()),
-        ..EvalContext::default()
-    };
-    let Ok(dependencies) = usage.link_targets(id, &ctx) else {
-        return Cow::Borrowed(libraries);
-    };
-    let build = &model.dir(DirId::ROOT).binary_dir;
-    let absolute = |path: &[u8]| Lexical::new(&join(build, path)).normalize();
-    let runtimes: BTreeMap<_, _> = dependencies
-        .into_iter()
-        .filter_map(|id| {
-            let stub = usage.artifact(id, ArtifactKind::ImportFile, ArtifactPart::Full, config)?;
-            let file = usage.artifact(id, ArtifactKind::File, ArtifactPart::Full, config)?;
-            Some((absolute(&stub), file))
-        })
-        .collect();
-    Cow::Owned(
-        libraries
-            .iter()
-            .map(|file| runtimes.get(&absolute(file)).unwrap_or(file).clone())
-            .collect(),
-    )
-}
-
-fn runtime_flag<'a>(model: &'a ProjectModel, target: &Target, language: &[u8]) -> &'a [u8] {
-    definition(
-        model,
-        target.dir,
-        &[b"CMAKE_SHARED_LIBRARY_RUNTIME_", language, b"_FLAG"].concat(),
-    )
-    .or_else(|| definition(model, target.dir, b"CMAKE_SHARED_LIBRARY_RUNTIME_C_FLAG"))
-    .map_or(b"-Wl,-rpath,".as_slice(), |v| v.as_slice())
-}
-
-pub(super) fn install_rpath<E>(
-    model: &ProjectModel,
-    target: &Target,
-    resolved: &ResolvedTarget,
-    file_name: &[u8],
-    mut eval: impl FnMut(&[u8]) -> Result<BString, E>,
-) -> Result<Option<MachORpathEdit>, E> {
-    let Some(link) = resolved.link.as_ref() else {
-        return Ok(None);
-    };
-    if link.kind == LinkKind::StaticArchive
-        || !is_darwin(model, target.dir)
-        || runtime_flag(model, target, &link.language).is_empty()
-        || [b"CMAKE_SKIP_RPATH".as_slice(), b"CMAKE_NO_BUILTIN_CHRPATH"]
-            .into_iter()
-            .any(|key| definition(model, target.dir, key).is_some_and(|v| truth::is_on(v)))
-        || target_property(model, target, b"BUILD_WITH_INSTALL_RPATH")
-            .is_some_and(|v| truth::is_on(v))
-    {
-        return Ok(None);
-    }
-    let link_libraries = linked_libraries(link);
-    let libraries = runtime_libraries(model, target, &resolved.config, link, &link_libraries);
-    let mut property = |key| {
-        target_property(model, target, key)
-            .map_or_else(|| Ok(BString::default()), |value| eval(value))
-    };
-    let old = if rpath_property(model, target).is_some() {
-        let value = property(b"BUILD_RPATH")?;
-        rpath_entries(model, target, link, true, &libraries, false, &value)
-    } else {
-        IndexSet::new()
-    };
-    let new =
-        if target_property(model, target, b"SKIP_INSTALL_RPATH").is_some_and(|v| truth::is_on(v)) {
-            IndexSet::new()
-        } else {
-            let value = property(b"INSTALL_RPATH")?;
-            rpath_entries(model, target, link, true, &libraries, true, &value)
-        };
-    if old == new {
-        return Ok(None);
-    }
-    let tool = definition(model, target.dir, b"CMAKE_INSTALL_NAME_TOOL")
-        .filter(|tool| !truth::is_off(tool.as_slice()))
-        .cloned()
-        .unwrap_or_else(|| "install_name_tool".into());
-    Ok(Some(MachORpathEdit {
-        file_name: file_name.into(),
-        tool,
-        old: old.into_iter().collect(),
-        new: new.into_iter().collect(),
-    }))
-}
-
-pub(crate) fn ide_rpaths(
-    model: &ProjectModel,
-    target: &Target,
-    id: TargetId,
-    ctx: &EvalContext,
-    usage: &mut UsageResolver<'_>,
-    step: &LinkStep,
-    libraries: &[BString],
-) -> Result<Vec<BString>, ResolveError> {
-    let Some((property, installs)) = rpath_property(model, target) else {
-        return Ok(Vec::new());
-    };
-    let value = target_property(model, target, property)
-        .map(|value| usage.eval_ide_property(id, property, value, ctx))
-        .transpose()?
-        .unwrap_or_default();
-    Ok(
-        rpath_entries(model, target, step, true, libraries, installs, &value)
-            .into_iter()
-            .collect(),
-    )
-}
-
-fn rpath_property(model: &ProjectModel, target: &Target) -> Option<(&'static [u8], bool)> {
-    if definition(model, target.dir, b"CMAKE_SKIP_RPATH").is_some_and(|value| truth::is_on(value)) {
-        return None;
-    }
-    let installs = target_property(model, target, b"BUILD_WITH_INSTALL_RPATH")
-        .is_some_and(|value| truth::is_on(value));
-    let (property, skip): (&[u8], &[u8]) = if installs {
-        (b"INSTALL_RPATH", b"SKIP_INSTALL_RPATH")
-    } else {
-        (b"BUILD_RPATH", b"SKIP_BUILD_RPATH")
-    };
-    (!target_property(model, target, skip).is_some_and(|value| truth::is_on(value)))
-        .then_some((property, installs))
-}
-
-fn rpath_entries(
-    model: &ProjectModel,
-    target: &Target,
-    step: &LinkStep,
-    darwin: bool,
-    libraries: &[BString],
-    installs: bool,
-    value: &[u8],
-) -> IndexSet<BString> {
-    let mut paths: IndexSet<BString> = list::split(value, list::Empty::Drop).into_iter().collect();
-    if !installs {
-        if darwin
-            && definition(model, target.dir, b"CMAKE_PLATFORM_HAS_INSTALLNAME")
-                .is_some_and(|value| truth::is_on(value))
-        {
-            paths.extend(
-                step.fragments
-                    .iter()
-                    .filter(|fragment| fragment.role == LinkFragmentRole::LibraryPath)
-                    .flat_map(|fragment| simple_args(&fragment.text.value).into_iter().flatten())
-                    .filter_map(|arg| {
-                        arg.strip_prefix(b"-L")
-                            .filter(|path| !path.is_empty())
-                            .map(BString::from)
-                    }),
-            );
-        }
-        let build = &model.dir(DirId::ROOT).binary_dir;
-        let build_path = Lexical::new(build);
-        let output = join(build, &step.output);
-        let output_dir = Lexical::new(Lexical::new(&output).parent());
-        let origin = !darwin
-            && target_property(model, target, b"BUILD_RPATH_USE_ORIGIN")
-                .is_some_and(|value| truth::is_on(value));
-        for library in libraries {
-            let path = Lexical::new(&join(build, library)).normalize();
-            let file = Lexical::new(&path);
-            if darwin
-                && let Some(parent) =
-                    super::install_rpath::framework_runtime_directory(model, target, &path)
-            {
-                let directory =
-                    super::install_rpath::translated_link_directory(model, target, parent);
-                paths.insert(directory.unwrap_or_else(|| parent.into()));
-            } else if shared_library(file.filename())
-                && (build_path.prefix(file)
-                    || super::install_rpath::translated_link_directory(
-                        model,
-                        target,
-                        file.parent(),
-                    )
-                    .is_some())
-            {
-                let parent = Lexical::new(file.parent());
-                let translated =
-                    super::install_rpath::translated_link_directory(model, target, file.parent());
-                let path = if let Some(directory) = translated {
-                    directory
-                } else if origin {
-                    parent.relative(output_dir).map_or_else(
-                        || file.parent().into(),
-                        |rel| {
-                            if rel == b"." {
-                                "$ORIGIN".into()
-                            } else {
-                                join(b"$ORIGIN", &rel)
-                            }
-                        },
-                    )
-                } else {
-                    file.parent().into()
-                };
-                paths.insert(path);
-            }
-        }
-    } else if target_property(model, target, b"INSTALL_RPATH_USE_LINK_PATH")
-        .is_some_and(|value| truth::is_on(value))
-    {
-        paths.extend(super::install_rpath::external_link_directories(
-            model, target, libraries,
-        ));
-    }
-    paths
 }

@@ -931,3 +931,40 @@ fn built_only_link_phase_searches_product_dirs_and_skips_libtool_flags() {
     assert!(plugin.contains("LIBRARY_STYLE = BUNDLE;"), "{plugin}");
     assert!(pbx.contains("productType = \"com.apple.product-type.tool\""));
 }
+
+#[test]
+fn known_location_uses_darwin_absolute_framework_paths() {
+    let host = PureHost::default();
+    let root = if cfg!(windows) { "C:/work" } else { "/work" };
+    let source = Path::new(root).join("src");
+    let out = Path::new(root).join("out");
+    let mut model = model(&source, &out);
+    define(
+        &mut model,
+        "CMAKE_XCODE_LINK_BUILD_PHASE_MODE",
+        "KNOWN_LOCATION",
+    );
+    let app = add(&mut model, "app", TargetKind::Executable, Some("main.c"));
+    host.seed_file(&source.join("main.c"), b"")
+        .expect("seed source");
+    model.target_mut(app).expect("app").usage.link_libraries = Some(
+        [
+            "/System/Library/Frameworks/Kit.framework",
+            "/System/Library/Frameworks/Versioned.framework/Versions/A/Versioned",
+            "relative/libcontrol.a",
+        ]
+        .into_iter()
+        .map(|path| rcmake_model::LinkItem {
+            scope: None,
+            text: BT::new(path.into(), Default::default()),
+            lookup_dir: DirId::ROOT,
+        })
+        .collect(),
+    );
+    let result = resolved(&model, &host);
+    generate(&result, &model, &host, &out).expect("generate");
+    let pbx = read(&host, &out.join("Demo.xcodeproj/project.pbxproj"));
+    assert!(pbx.contains("Kit.framework in Frameworks"), "{pbx}");
+    assert!(pbx.contains("Versioned.framework in Frameworks"), "{pbx}");
+    assert!(!pbx.contains("libcontrol.a in Frameworks"), "{pbx}");
+}

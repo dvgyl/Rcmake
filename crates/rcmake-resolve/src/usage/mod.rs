@@ -26,10 +26,12 @@ use crate::{
     sources::SourcePaths,
 };
 
-mod artifacts;
+pub(crate) mod artifacts;
 mod compatible;
 mod host;
 mod includes;
+pub(crate) mod paths;
+use paths::{PathProblem, interface_path_problem, usage_path_is_full, windows_path_rules};
 mod link;
 pub(crate) mod link_options;
 pub(crate) mod provenance;
@@ -304,6 +306,18 @@ impl<'a> UsageResolver<'a> {
                 flags: result.flags,
             };
             for (owner, entries) in &result.contributions {
+                if field == UsageField::LinkDirectories
+                    && self.property_reads == 0
+                    && let Some(paths) = self.source_paths()
+                {
+                    crate::resolve_link::directories::check_relative(
+                        self.model,
+                        paths,
+                        self.target(target)?,
+                        self.target(*owner)?,
+                        entries,
+                    )?;
+                }
                 for entry in &**entries {
                     if seen.insert(entry.value.clone()) {
                         value.entries.push(entry.clone());
@@ -637,7 +651,22 @@ impl<'a> UsageResolver<'a> {
         ctx: &EvalContext,
     ) -> Result<Vec<BT<BString>>, ResolveError> {
         let mut result = UsageValue::default();
-        self.eval_entries(owner, property, entries, ctx, &mut result)?;
+        for entry in entries {
+            let dir = self.target(owner)?.dir;
+            let (value, _) = self.eval_entry(owner, dir, property, entry, ctx, false)?;
+            result
+                .entries
+                .extend(
+                    list::split(&value, list::Empty::Drop)
+                        .into_iter()
+                        .map(|value| {
+                            BT::new(
+                                self.usage_path(dir, property, value),
+                                entry.backtrace.clone(),
+                            )
+                        }),
+                );
+        }
         Ok(result.entries)
     }
 
@@ -678,7 +707,10 @@ impl<'a> UsageResolver<'a> {
         for entry in entries {
             let (value, flags) = self.eval_entry(target, dir, property, entry, ctx, false)?;
             result.flags = result.flags.union(flags);
-            let values = list::split(&value, list::Empty::Drop);
+            let values = list::split(&value, list::Empty::Drop)
+                .into_iter()
+                .map(|value| self.usage_path(dir, property, value))
+                .collect::<Vec<_>>();
             if matches!(
                 property,
                 b"INTERFACE_INCLUDE_DIRECTORIES" | b"INTERFACE_SOURCES"
@@ -686,10 +718,11 @@ impl<'a> UsageResolver<'a> {
                 && let Some(paths) = self.source_paths()
                 && let Some(problem) = interface_path_problem(
                     paths,
-                    self.model,
                     self.target(target)?,
                     property,
                     &values,
+                    property != b"INTERFACE_SOURCES"
+                        && windows_path_rules(self.model, dir, Some(paths)),
                 )
             {
                 result.flags.head_sensitive = true;
@@ -728,7 +761,9 @@ impl<'a> UsageResolver<'a> {
                 && self.property_reads == 0
                 && ctx.head.is_none_or(|head| head == handle(target))
                 && let Some(paths) = self.source_paths()
-                && let Some(path) = values.iter().find(|value| !crate::file_is_full_path(value))
+                && let Some(path) = values
+                    .iter()
+                    .find(|value| !usage_path_is_full(self.model, paths, dir, value))
             {
                 let owner = self.target(target)?;
                 let body: BString = format!(
@@ -905,62 +940,6 @@ fn prepare_nodes(nodes: &mut Vec<GenexNode>, traversal: UsageTraversal, link_edg
         expanded.push(node);
     }
     *nodes = expanded;
-}
-
-/// A path in an interface property that CMake rejects for a consumer.
-enum PathProblem<'a> {
-    /// An include directory of an imported target does not exist.
-    Missing(&'a BString),
-    /// The path is not a full path.
-    Relative(&'a BString),
-}
-
-/// Find the first rejected path in the evaluated `INTERFACE_INCLUDE_DIRECTORIES` or
-/// `INTERFACE_SOURCES` of `target`, in CMake's order of checks.
-fn interface_path_problem<'a>(
-    paths: &SourcePaths<'_>,
-    model: &ProjectModel,
-    target: &rcmake_model::Target,
-    property: &[u8],
-    values: &'a [BString],
-) -> Option<PathProblem<'a>> {
-    let imported = property == b"INTERFACE_INCLUDE_DIRECTORIES" && target.is_imported();
-    // CMake checks only the target property. Directories of the file sets do not count.
-    let file_set_dirs: HashSet<BString> = if imported {
-        target
-            .file_sets
-            .iter()
-            .filter_map(|&id| model.file_set(id))
-            .flat_map(|set| {
-                set.props
-                    .get(b"INTERFACE_INCLUDE_DIRECTORIES")
-                    .map(|value| list::split(value, list::Empty::Drop))
-                    .unwrap_or_default()
-                    .into_iter()
-                    .chain(set.base_dirs.iter().map(|dir| dir.value.clone()))
-            })
-            .collect()
-    } else {
-        HashSet::new()
-    };
-    values.iter().find_map(|value| {
-        if imported
-            && !file_set_dirs.contains(value)
-            && paths
-                .host
-                .metadata(
-                    &rcmake_host::path::to_native(value),
-                    rcmake_host::Follow::Yes,
-                )
-                .is_err()
-        {
-            Some(PathProblem::Missing(value))
-        } else if !crate::file_is_full_path(value) {
-            Some(PathProblem::Relative(value))
-        } else {
-            None
-        }
-    })
 }
 
 #[cfg(test)]

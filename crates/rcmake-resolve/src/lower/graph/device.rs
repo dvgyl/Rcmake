@@ -1,7 +1,7 @@
-use indexmap::{IndexMap, IndexSet};
+use indexmap::IndexSet;
 use rcmake_base::BString;
 use rcmake_genex::{EvalContext, UsageTraversal};
-use rcmake_model::{GeneratorKind, ProjectModel, Target, TargetId, UsageField};
+use rcmake_model::{GeneratorKind, ProjectModel, Target, UsageField};
 
 use crate::{
     LinkStep, ResolveError, ResolvedTarget,
@@ -11,32 +11,6 @@ use crate::{
     },
     usage::{UsageResolver, link_options::shell_arguments},
 };
-
-pub(super) fn link_languages(
-    resolved: &ResolvedTarget,
-    targets: &IndexMap<TargetId, &ResolvedTarget>,
-) -> IndexSet<BString> {
-    let mut languages = IndexSet::new();
-    let mut seen = IndexSet::new();
-    let mut pending = vec![resolved];
-    while let Some(target) = pending.pop() {
-        if seen.insert(target.id) {
-            languages.extend(
-                target
-                    .compile_groups
-                    .iter()
-                    .map(|group| group.language.clone()),
-            );
-            pending.extend(
-                target
-                    .dependencies
-                    .iter()
-                    .filter_map(|id| targets.get(id).copied()),
-            );
-        }
-    }
-    languages
-}
 
 pub(super) fn plan(
     model: &ProjectModel,
@@ -71,8 +45,12 @@ pub(super) fn plan(
         return Ok(None);
     };
     let libraries = device_link::device_libraries(model, target, config, &items, language);
+    let option_context = EvalContext {
+        link_language: Some(language.into()),
+        ..context.clone()
+    };
     let options = usage
-        .collect(resolved.id, UsageField::LinkOptions, &context)?
+        .collect(resolved.id, UsageField::LinkOptions, &option_context)?
         .entries;
     let options = options
         .into_iter()

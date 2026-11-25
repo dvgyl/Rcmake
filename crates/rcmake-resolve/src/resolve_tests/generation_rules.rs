@@ -24,6 +24,12 @@ fn strips_a_leading_define_flag_after_evaluation() -> TestResult {
     for value in ["$<1:-DGENEX>", "PLAIN", "-DPLAIN"] {
         lib.usage.push(UsageField::CompileDefinitions, entry(value));
     }
+    model
+        .dir_mut(DirId::ROOT)
+        .source_props
+        .entry(format!("{source}/a.c").into())
+        .or_default()
+        .set("COMPILE_DEFINITIONS".into(), "$<1:-DFROM_SOURCE>".into());
     model.add_target(lib)?;
     let result = resolve(&model, &seeded(&source, &["a.c"])?, &[])?;
     let defines: Vec<_> = result.targets[0].compile_groups[0]
@@ -31,7 +37,7 @@ fn strips_a_leading_define_flag_after_evaluation() -> TestResult {
         .iter()
         .map(|define| define.value.clone())
         .collect();
-    assert_eq!(defines, ["GENEX", "PLAIN"]);
+    assert_eq!(defines, ["GENEX", "PLAIN", "FROM_SOURCE"]);
     Ok(())
 }
 
@@ -200,9 +206,6 @@ fn ignores_missing_include_directories_of_imported_file_sets() -> TestResult {
         "IMPORTED_LOCATION".into(),
         format!("{source}/libimported.a").into(),
     );
-    imported
-        .usage
-        .push(UsageField::InterfaceIncludeDirectories, entry(&missing));
     let imported = model.add_target(imported)?;
     let mut props = rcmake_model::PropertyMap::default();
     props.set(
@@ -221,7 +224,19 @@ fn ignores_missing_include_directories_of_imported_file_sets() -> TestResult {
     let mut app = target("app", TargetKind::Executable, &["main.c"]);
     app.usage.link_libraries = Some(vec![link_item("imported")]);
     model.add_target(app)?;
-    resolve(&model, &seeded(&source, &["main.c", "libimported.a"])?, &[])?;
+    let host = seeded(&source, &["main.c", "libimported.a"])?;
+    resolve(&model, &host, &[])?;
+    let target = model
+        .target_mut(imported)
+        .ok_or("Missing imported target")?;
+    target
+        .usage
+        .push(UsageField::InterfaceIncludeDirectories, entry(&missing));
+    assert!(resolve(&model, &host, &[]).is_err());
+    assert!(
+        String::from_utf8_lossy(&host.stream_bytes(rcmake_host::Stream::Stderr))
+            .contains("includes non-existent path")
+    );
     Ok(())
 }
 
@@ -298,7 +313,119 @@ fn rejects_literal_link_tags_in_link_properties() -> TestResult {
 fn full_paths_follow_the_cmake_host_rules() {
     assert!(crate::file_is_full_path(b"/src/include"));
     assert!(!crate::file_is_full_path(b"include"));
+    assert!(!crate::file_is_full_path(b"foo/bar"));
+    assert!(crate::file_is_full_path(b"/work/src/include"));
+    assert_eq!(crate::file_is_full_path(b"C:foo"), cfg!(windows));
     assert!(!crate::file_is_full_path(b""));
     assert_eq!(crate::file_is_full_path(b"C:/src"), cfg!(windows));
     assert_eq!(crate::file_is_full_path(b"~/src"), !cfg!(windows));
+}
+
+#[test]
+fn reports_invalid_exclude_from_all_expression() -> TestResult {
+    let (source, build) = roots();
+    let mut model = project_with_roots(&source, &build);
+    let mut tool = target("tool", TargetKind::Executable, &["main.c"]);
+    tool.props
+        .set("EXCLUDE_FROM_ALL".into(), "$<NO_SUCH_EXPRESSION>".into());
+    model.add_target(tool)?;
+    let error = resolve(&model, &seeded(&source, &["main.c"])?, &[])
+        .err()
+        .ok_or("Expected an expression error.")?;
+    assert!(error.to_string().contains("NO_SUCH_EXPRESSION"), "{error}");
+    Ok(())
+}
+
+#[test]
+fn normalizes_evaluated_windows_usage_paths() -> TestResult {
+    let (source, build) = roots();
+    let mut model = project_with_roots(&source, &build);
+    model
+        .global
+        .props
+        .set("CMAKE_SYSTEM_NAME".into(), "Windows".into());
+    let mut iface = target("iface", TargetKind::InterfaceLibrary, &[]);
+    iface.usage.push(
+        UsageField::InterfaceIncludeDirectories,
+        entry(r"$<1:C:\SDK\include>"),
+    );
+    iface.usage.push(
+        UsageField::InterfaceLinkDirectories,
+        entry(r"$<1:C:\SDK\lib>"),
+    );
+    model.add_target(iface)?;
+    let mut exe = target("exe", TargetKind::Executable, &["main.c"]);
+    exe.usage.link_libraries = Some(vec![link_item("iface")]);
+    model.add_target(exe)?;
+    let result = resolve(&model, &seeded(&source, &["main.c"])?, &[])?;
+    assert_eq!(library_paths(&result, "exe"), ["-LC:/SDK/lib"]);
+    let includes = result
+        .targets
+        .iter()
+        .find(|target| target.metadata.name == "exe")
+        .and_then(|target| target.compile_groups.first())
+        .ok_or("Missing compile group.")?;
+    assert!(
+        includes
+            .includes
+            .iter()
+            .any(|entry| entry.path.value == "C:/SDK/include")
+    );
+    Ok(())
+}
+
+#[test]
+fn relative_interface_link_directories_fail_under_every_cmp0081_setting() -> TestResult {
+    let (source, build) = roots();
+    for status in [PolicyStatus::Old, PolicyStatus::Warn, PolicyStatus::New] {
+        let mut model = project_with_roots(&source, &build);
+        let mut iface = target("iface", TargetKind::InterfaceLibrary, &[]);
+        iface
+            .usage
+            .push(UsageField::InterfaceLinkDirectories, entry("$<1:relative>"));
+        model.add_target(iface)?;
+        let mut exe = target("exe", TargetKind::Executable, &["main.c"]);
+        exe.usage.link_libraries = Some(vec![link_item("iface")]);
+        exe.policies.policies.set(PolicyId::new(81), status)?;
+        model.add_target(exe)?;
+        let host = seeded(&source, &["main.c"])?;
+        assert!(resolve(&model, &host, &[]).is_err());
+        let text = host.stream_bytes(rcmake_host::Stream::Stderr).to_string();
+        assert!(
+            text.contains("Target \"iface\" contains relative path"),
+            "{text}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn selects_direct_linker_in_the_link_language_context() -> TestResult {
+    let (source, build) = roots();
+    let mut model = project_with_roots(&source, &build);
+    for (name, value) in [
+        ("CMAKE_C_LINK_MODE", "LINKER"),
+        ("CMAKE_C_USING_LINKER_custom", "/tools/custom linker"),
+        (
+            "CMAKE_C_LINK_EXECUTABLE",
+            "<CMAKE_LINKER> <OBJECTS> -o <TARGET>",
+        ),
+    ] {
+        model.global.props.set(name.into(), value.into());
+    }
+    let mut exe = target("exe", TargetKind::Executable, &["main.c"]);
+    exe.props
+        .set("LINKER_TYPE".into(), "$<$<LINK_LANGUAGE:C>:custom>".into());
+    model.add_target(exe)?;
+    let result = resolve(&model, &seeded(&source, &["main.c"])?, &[])?;
+    assert!(
+        result
+            .graphs
+            .iter()
+            .flat_map(|graph| &graph.steps)
+            .any(|step| matches!(step,
+        BuildStep::Link { invocations, .. } if invocations.iter().any(|command| command.argv.first()
+            .is_some_and(|path| path == "/tools/custom linker"))))
+    );
+    Ok(())
 }

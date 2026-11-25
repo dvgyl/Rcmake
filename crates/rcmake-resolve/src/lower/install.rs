@@ -11,7 +11,10 @@ use rcmake_diag::{
 };
 use rcmake_genex::{ConfigId, EvalContext, EvalSite, evaluate, parse};
 use rcmake_host::{Host, Stream};
-use rcmake_model::{DirId, GeneratorKind, InstallKind, InstallOptions, InstallRule, ProjectModel};
+use rcmake_model::{
+    DirId, GeneratorKind, InstallKind, InstallOptions, InstallRule, ProjectModel, Target, TargetId,
+    TargetKind,
+};
 
 use super::{definition, join};
 use crate::{
@@ -19,6 +22,7 @@ use crate::{
     usage::UsageResolver,
 };
 
+mod imported_runtime;
 mod objects;
 mod targets;
 
@@ -32,10 +36,11 @@ pub use super::artifacts::collect_metadata;
 /// same order.
 #[must_use]
 pub fn lower_install_manifest(model: &ProjectModel, targets: &[ResolvedTarget]) -> InstallManifest {
+    let edits = runtime_edits(model, targets, &IndexMap::new(), |_, _| {}).unwrap_or_default();
     match lower_install_rules(
         model,
         targets,
-        &[],
+        (&[], &edits),
         |_, _, _, value| Ok::<_, Infallible>(value.into()),
         |dir, config, source| {
             Ok(crate::sources::install_object_name(model, dir, source, config).unwrap_or_default())
@@ -52,15 +57,32 @@ pub(crate) fn lower_install_manifest_with_configs(
     configs: &[ConfigId],
     ide: Option<crate::ide::IdeFlavor>,
     host: &dyn Host,
+    languages: &IndexMap<(TargetId, ConfigId), IndexSet<BString>>,
 ) -> Result<InstallManifest, ResolveError> {
     for (index, rule, _) in ordered_install_rules(model) {
         targets::warn_framework_change(model, index, rule, host)?;
     }
+    super::warn_install_name_policy(model, host);
+    let edits = runtime_edits(model, targets, languages, |raw, edit| {
+        if let super::install_rpath::RuntimeEdit::Elf(elf) = edit
+            && raw.policies.policies.get(rcmake_diag::PolicyId::new(95))
+                == rcmake_diag::PolicyStatus::Warn
+            && elf.new.windows(2).any(|pair| pair == b"${")
+        {
+            crate::pipeline::policy_warning(
+                model,
+                host,
+                rcmake_diag::PolicyId::new(95),
+                raw,
+                "RPATH entries for the install tree may be accidentally evaluated as CMake variables.",
+            );
+        }
+    })?;
     let mut usage = UsageResolver::new(model).with_ide(ide);
     lower_install_rules(
         model,
         targets,
-        configs,
+        (configs, &edits),
         |dir, config, backtrace, value| {
             if !has_genex(value) {
                 return Ok(value.into());
@@ -292,10 +314,85 @@ fn ordered_entries(model: &ProjectModel) -> Vec<InstallEntry<'_>> {
     ordered
 }
 
+type RuntimeEdits = IndexMap<(TargetId, ConfigId), super::install_rpath::RuntimeEdit>;
+
+fn runtime_edits(
+    model: &ProjectModel,
+    targets: &[ResolvedTarget],
+    languages: &IndexMap<(TargetId, ConfigId), IndexSet<BString>>,
+    mut warn: impl FnMut(&Target, &super::install_rpath::RuntimeEdit),
+) -> Result<RuntimeEdits, ResolveError> {
+    let facts: IndexMap<_, _> = targets
+        .iter()
+        .map(|target| ((target.id, &target.config), target))
+        .collect();
+    let mut edits = IndexMap::new();
+    for target in targets {
+        let Some(raw) = model
+            .target(target.id)
+            .filter(|raw| has_runtime_install(model, raw, &target.config))
+        else {
+            continue;
+        };
+        let key = (target.id, target.config.clone());
+        let fallback;
+        let languages = if let Some(languages) = languages.get(&key) {
+            languages
+        } else {
+            fallback = target
+                .compile_groups
+                .iter()
+                .map(|group| group.language.clone())
+                .collect();
+            &fallback
+        };
+        if let Some(edit) =
+            super::link::rpath::install_rpath(model, raw, target, languages, &facts)?
+        {
+            warn(raw, &edit);
+            edits.insert(key, edit);
+        }
+    }
+    Ok(edits)
+}
+
+pub(super) fn has_runtime_install(
+    model: &ProjectModel,
+    target: &Target,
+    config: &ConfigId,
+) -> bool {
+    let Some(id) = model.find_target(target.dir, &target.name) else {
+        return false;
+    };
+    let group = match (target.kind, crate::ide::bundle_kind(target)) {
+        (TargetKind::SharedLibrary, crate::ide::BundleKind::Framework { .. }) => {
+            b"FRAMEWORK".as_slice()
+        }
+        (TargetKind::Executable, crate::ide::BundleKind::App { .. })
+        | (TargetKind::ModuleLibrary, crate::ide::BundleKind::Bundle { .. }) => b"BUNDLE",
+        (TargetKind::Executable, _) => b"RUNTIME",
+        (TargetKind::SharedLibrary | TargetKind::ModuleLibrary, _) => b"LIBRARY",
+        _ => return false,
+    };
+    model.installs.iter().enumerate().any(|(index, rule)| {
+        let InstallKind::Targets { targets, .. } = &rule.kind else {
+            return false;
+        };
+        if !targets.contains(&id) {
+            return false;
+        }
+        let recorded = recorded_args(model, index);
+        target_options(&recorded).get(group).map_or_else(
+            || matches_config(&rule.options, config),
+            |group| !group.namelink_only && matches_config(&group.merge(&rule.options), config),
+        )
+    })
+}
+
 fn lower_install_rules<E>(
     model: &ProjectModel,
     targets: &[ResolvedTarget],
-    configs: &[ConfigId],
+    (configs, edits): (&[ConfigId], &RuntimeEdits),
     mut eval: impl FnMut(DirId, &ConfigId, &Backtrace, &[u8]) -> Result<BString, E>,
     mut object_name: impl FnMut(DirId, &ConfigId, &[u8]) -> Result<BString, E>,
 ) -> Result<InstallManifest, E> {
@@ -337,7 +434,7 @@ fn lower_install_rules<E>(
                     targets::lower(
                         model,
                         (index, rule),
-                        (targets, configs, ids),
+                        (targets, configs, ids, edits),
                         &recorded,
                         &mut manifest,
                         &make_action,
@@ -348,6 +445,19 @@ fn lower_install_rules<E>(
                 InstallKind::Files(paths)
                 | InstallKind::Programs(paths)
                 | InstallKind::Directory(paths) => {
+                    if let [b"IMPORTED_RUNTIME_ARTIFACTS", name, ..] = recorded.as_slice() {
+                        imported_runtime::lower(
+                            model,
+                            rule,
+                            name,
+                            configs,
+                            &mut eval,
+                            |options, kind| {
+                                manifest.actions.push(make_action(options, b"", kind));
+                            },
+                        )?;
+                        return Ok(());
+                    }
                     let expand_paths = paths.iter().any(|path| has_genex(&path.value));
                     for config in action_configs(configs, options, expand_paths, multi) {
                         let mut options = options.clone();

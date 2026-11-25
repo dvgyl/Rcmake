@@ -56,7 +56,9 @@ pub(crate) use graph::lower_with_inputs;
 pub(crate) use install::lower_install_manifest_with_configs;
 pub use install::{collect_metadata, lower_install_manifest};
 pub use launcher::instrumentation_launcher;
-pub(crate) use link::{ide_rpaths, install_name_dir, install_name_prefix};
+pub(crate) use link::{
+    ide_rpaths, install_name_dir, install_name_prefix, warn_install_name_policy,
+};
 pub(crate) use modules::scan_responses;
 pub use modules::{bmi_script_path, lower_modules};
 pub(crate) use pch::IdeLowering;

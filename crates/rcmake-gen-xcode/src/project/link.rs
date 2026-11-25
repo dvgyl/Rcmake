@@ -158,7 +158,7 @@ impl Project<'_> {
                     {
                         let path = text(path);
                         let path = framework_root(&path).unwrap_or(&path);
-                        if !Path::new(path).is_absolute() {
+                        if !path.starts_with('/') {
                             return None;
                         }
                         let file_type = match Path::new(path).extension()?.to_str()? {

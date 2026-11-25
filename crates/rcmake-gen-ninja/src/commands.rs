@@ -156,7 +156,11 @@ impl Commands {
         let name = program
             .rsplit(|&byte| matches!(byte, b'/' | b'\\'))
             .next()?;
-        (name.eq_ignore_ascii_case(b"cmd.exe")
+        let configured_shell = self
+            .comspec
+            .as_ref()
+            .is_some_and(|comspec| self.path(program).eq_ignore_ascii_case(&self.path(comspec)));
+        ((name.eq_ignore_ascii_case(b"cmd.exe") || configured_shell)
             && d == b"/D"
             && s == b"/S"
             && v == b"/V:OFF"
