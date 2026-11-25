@@ -8,15 +8,18 @@ probe_cache_eval.py, mutation_eval.py, path_swap_eval.py, and wasm_smoke.py
 JSON for their respective gates. Repeat --bench to combine reports from
 bench_configure.py and bench_eval.py.
 
-Use a large_projects_local.py run directory for --large-projects-dir.
+Use a large_projects_local.py or ecosystem workflow result.json directory for
+--large-projects-dir (L1 configure, L2 dry-run, L3 build, and L4 test/install).
 Use a bench_giants.py JSON report for --giants-bench.
 Use downloaded 64-shard workflow artifacts with shard.json and results.jsonl
 for --vcpkg-dir.
 For --fuzz-dir, supply JSON files with iterations and failures per run.
-Failures can be a count or a list. For --unseen-holdout, supply an aggregate
-object and a categories array. Use reposTotal and reposPassed for the counts
-and category for the public category label. For --ci-status-json, use the
-output of gh run list --json status,conclusion or the Actions REST response.
+Failures can be a count or a list. For --differential-fuzz, supply one or more
+oracle_prop_test.py JSON reports (or a directory of reports) with total, counts,
+and cases. For --unseen-holdout / --holdout, supply either unseen_eval.py JSON
+(holdout.pass_rates and holdout.failure_categories) or an aggregate/categories
+report. For --ci-status-json, use the output of gh run list --json
+status,conclusion or the Actions REST response.
 """
 
 import argparse
@@ -42,6 +45,39 @@ PLATFORMS = {
     "linux": "linux-x86_64",
     "windows": "windows-x86_64",
 }
+EXPECTED_OS_SUITES = {
+    "macos-arm64": 371,
+    "linux-x86_64": 362,
+    "windows-x86_64": 367,
+}
+RUNCMAKE_MIN_PASS_RATE = 99.0
+SHA_HEX = re.compile(r"^[0-9a-fA-F]{7,40}$")
+SHA256_HEX = re.compile(r"^[0-9a-fA-F]{64}$")
+DIFF_FUZZ_STATUSES = frozenset({"pass", "fail", "oracle_error"})
+HOLDOUT_LEVELS = ("L1", "L2", "L3", "L4")
+HOLDOUT_FAILURE_CATEGORIES = frozenset({
+    "build", "configure", "crash", "evaluation", "find-module", "generator",
+    "genex", "oracle-red", "other", "policy", "source", "timeout",
+    "unknown-command",
+})
+LARGE_PROJECT_STATES = {
+    "equal": "pass",
+    "pass": "pass",
+    "different": "fail",
+    "fail": "fail",
+    "oracle_error": "fail",
+    "oracle-red": "fail",
+    "error": "fail",
+    "incomplete": "partial",
+    "partial": "partial",
+    "pending": "pending",
+    "not_requested": "pending",
+    "not-requested": "pending",
+    "skipped": "pending",
+    "skip": "pending",
+}
+REPORT_SHA_KEYS = ("commit", "git_sha", "release_sha", "releaseSha", "rcmake_sha", "rcmake_commit")
+REPORT_DIGEST_KEYS = ("binary_sha256", "binarySha256", "rcmake_sha256", "rcmakeBinarySha256")
 JSON_TYPES = {
     "object": (dict,), "array": (list,), "string": (str,), "integer": (int,),
     "number": (int, float), "boolean": (bool,), "null": (type(None),),
@@ -91,6 +127,168 @@ def read_json(path):
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def sha_matches(left, right):
+    left, right = left.strip().lower(), right.strip().lower()
+    if left == right:
+        return True
+    return min(len(left), len(right)) >= 7 and (left.startswith(right) or right.startswith(left))
+
+
+def verify_report_identity(report, expected_sha, expected_digest, source):
+    if not isinstance(report, dict) or (expected_sha is None and expected_digest is None):
+        return
+    containers = [report]
+    if isinstance(report.get("meta"), dict):
+        containers.append(report["meta"])
+    for container in containers:
+        if expected_sha is not None:
+            for key in REPORT_SHA_KEYS:
+                value = container.get(key)
+                if isinstance(value, str) and value.strip():
+                    if not sha_matches(value, expected_sha):
+                        raise ValueError(f"{source} reports commit {value!r}, expected {expected_sha!r}.")
+        if expected_digest is not None:
+            for key in REPORT_DIGEST_KEYS:
+                value = container.get(key)
+                if isinstance(value, str) and value.strip():
+                    if value.strip().lower() != expected_digest.lower():
+                        raise ValueError(
+                            f"{source} reports binary SHA-256 {value!r}, expected {expected_digest!r}."
+                        )
+
+
+def read_report(path, identity=(None, None)):
+    report = read_json(path)
+    verify_report_identity(report, identity[0], identity[1], str(path))
+    return report
+
+
+def validate_sha(value, flag_name):
+    cleaned = value.strip()
+    if not cleaned or not SHA_HEX.fullmatch(cleaned):
+        raise ValueError(f"{flag_name} must be a 7 to 40 character hexadecimal commit SHA.")
+    return cleaned
+
+
+def validate_sha256(value):
+    cleaned = value.strip().lower()
+    if not SHA256_HEX.fullmatch(cleaned):
+        raise ValueError("--binary-sha256 must be a 64-character hexadecimal SHA-256 digest.")
+    return cleaned
+
+
+def reset_tracks_to_pending(snapshot):
+    pending_note = "Pending verification for this commit."
+    snapshot.pop("binarySha256", None)
+    snapshot.pop("releaseSha", None)
+    snapshot["statusNote"] = "Verification metrics reset to pending for the updated commit."
+    tracks = snapshot["tracks"]
+
+    core = tracks["coreConformance"]
+    core.update(status="pending", suitesAt100=None, casesPassed=None, casesTotal=None,
+                passRate=None, note=pending_note)
+    for highlight in core["highlights"]:
+        highlight.update(passed=None, total=None, status="pending")
+        highlight.pop("note", None)
+
+    policies = tracks["policies"]
+    policies.update(status="pending", suitesPassed=None, casesPassed=None, casesTotal=None,
+                    passRate=None, note=pending_note)
+
+    run_cmake = tracks["runCmakeOs"]
+    run_cmake.update(status="pending", note=pending_note)
+    for platform in run_cmake["platforms"]:
+        expected = EXPECTED_OS_SUITES.get(platform["id"], platform["suitesTotal"])
+        platform.update(suitesTotal=expected, suitesPassed=None, casesPassed=None,
+                        casesTotal=None, passRate=None, status="pending", note=pending_note)
+        for key in ("partial", "expectedSuites", "completedSuites"):
+            platform.pop(key, None)
+
+    boss = tracks["bossFight"]
+    boss.update(status="pending", projectsTotal=len(boss["projects"]), l1Passed=None,
+                l2Passed=None, note=pending_note)
+    boss.pop("l3Passed", None)
+    boss.pop("l4Passed", None)
+    for project in boss["projects"]:
+        project.update(l1="pending", l2="pending")
+        for key in ("l3", "l4", "note"):
+            project.pop(key, None)
+
+    holdout = tracks["unseenHoldout"]
+    holdout.update(sealed=True, status="pending", reposPassed=None, passRate=None, note=pending_note)
+    holdout.pop("levelPassRates", None)
+    holdout.pop("failureCategories", None)
+    for row in holdout["categories"]:
+        row.update(reposTotal=None, reposPassed=None, passRate=None, status="pending")
+
+    vcpkg = tracks["vcpkgMatrix"]
+    vcpkg.update(status="pending", shardsCompleted=0, shardsPassed=None, portsTotal=None,
+                 portsPassed=None, passRate=None, note=pending_note)
+    for shard in vcpkg["shards"]:
+        shard.update(status="pending", portsTotal=None, portsPassed=None, portsFailed=None,
+                     durationSeconds=None, note=pending_note)
+
+    bench_section = tracks["benchmarksAndGates"]
+    for metric in bench_section["benchmarks"].values():
+        metric.update(value=None, status="pending", note=pending_note)
+    for row in bench_section["gates"]:
+        row.update(status="pending", passed=None, failures=None, summary=pending_note)
+        if "scenariosPassed" in row:
+            row["scenariosPassed"] = None
+    bench_section.pop("giantsBenchmark", None)
+    bench_section.pop("differentialFuzz", None)
+
+
+def resolve_release_identity(snapshot, args):
+    if args.strict_same_sha and args.allow_stale_base:
+        raise ValueError("--strict-same-sha cannot be combined with --allow-stale-base.")
+    commit_arg = args.commit.strip() if args.commit is not None else None
+    if args.commit is not None and not commit_arg:
+        raise ValueError("--commit must not be empty.")
+    release_sha = validate_sha(args.release_sha, "--release-sha") if args.release_sha is not None else None
+    if commit_arg is not None and release_sha is not None and not sha_matches(commit_arg, release_sha):
+        raise ValueError("--commit and --release-sha must match when both are provided.")
+    requested_sha = release_sha or commit_arg
+    requested_digest = validate_sha256(args.binary_sha256) if args.binary_sha256 is not None else None
+
+    base_sha = snapshot.get("commit") or snapshot.get("releaseSha")
+    base_digest = snapshot.get("binarySha256")
+    effective_sha = requested_sha or base_sha
+    effective_digest = requested_digest or base_digest
+
+    if args.strict_same_sha and not effective_sha:
+        raise ValueError("--strict-same-sha requires --release-sha or --commit.")
+
+    sha_differs = requested_sha is not None and (
+        base_sha is None or not sha_matches(base_sha, requested_sha)
+    )
+    digest_differs = requested_digest is not None and (
+        base_digest is not None and base_digest.lower() != requested_digest.lower()
+    )
+    strict_unverified_digest = (
+        args.strict_same_sha and requested_digest is not None and base_digest is None
+    )
+
+    if (sha_differs or digest_differs or strict_unverified_digest) and not args.allow_stale_base:
+        reset_tracks_to_pending(snapshot)
+        effective_digest = requested_digest
+    elif sha_differs:
+        if requested_digest is None:
+            snapshot.pop("binarySha256", None)
+            effective_digest = None
+        if release_sha is None:
+            snapshot.pop("releaseSha", None)
+
+    if requested_sha is not None:
+        snapshot["commit"] = requested_sha
+    if release_sha is not None:
+        snapshot["releaseSha"] = release_sha
+    if requested_digest is not None:
+        snapshot["binarySha256"] = requested_digest
+
+    return effective_sha, effective_digest
+
+
 def count(value):
     if type(value) is not int or value < 0:
         raise ValueError("Report counts must be nonnegative integers.")
@@ -129,7 +327,7 @@ def suite_metrics(row):
     passed_suite = (0 < passed == total and drivers_ok
                     and not row.get("reference_failed") and not row.get("no_reference"))
     status = "pass" if passed_suite else "fail"
-    return passed, total, status
+    return passed, total, status, drivers_ok
 
 
 def suite_totals(results):
@@ -152,9 +350,30 @@ def merge_runcmake(tracks, reports):
             observations[name].append(result)
         results = list(suites.values())
         statuses = [row[2] for row in results]
-        platform.update(suite_totals(results), suitesTotal=len(results),
-                        suitesPassed=statuses.count("pass"), status=combined_status(statuses),
-                        note="Results for suites in the supplied OS report.")
+        totals = suite_totals(results)
+        expected_suites = EXPECTED_OS_SUITES[platform["id"]]
+        completed_suites = len(results)
+        is_partial = completed_suites < expected_suites
+        all_drivers_ok = all(row[3] for row in results)
+        if is_partial:
+            platform_status = "fail" if "fail" in statuses else "partial"
+            note = f"Partial OS report: {completed_suites:,} of {expected_suites:,} expected suites completed."
+        elif all_drivers_ok and totals["passRate"] is not None and totals["passRate"] >= RUNCMAKE_MIN_PASS_RATE:
+            platform_status = "pass"
+            note = f"Full OS report: {completed_suites:,} suites completed (minimum {expected_suites:,})."
+        else:
+            platform_status = "fail"
+            note = f"Full OS report: {completed_suites:,} suites completed (minimum {expected_suites:,})."
+        platform.update(
+            totals,
+            suitesTotal=max(expected_suites, completed_suites),
+            suitesPassed=statuses.count("pass"),
+            expectedSuites=expected_suites,
+            completedSuites=completed_suites,
+            partial=is_partial,
+            status=platform_status,
+            note=note,
+        )
     track.update(status=combined_status(row["status"] for row in track["platforms"]),
                  note="Results from the OS reports.")
 
@@ -214,11 +433,11 @@ def merge_independent(section, report):
          scenariosPassed=results["pass"], scenariosTotal=len(scenarios))
 
 
-def merge_soundness(section, args):
+def merge_soundness(section, args, identity=(None, None)):
     if args.independent:
-        merge_independent(section, read_json(args.independent))
+        merge_independent(section, read_report(args.independent, identity))
     if args.probe_cache:
-        report = read_json(args.probe_cache)
+        report = read_report(args.probe_cache, identity)
         cases = [row for row in report["cases"] if row["status"] != "skipped"]
         passed = sum(flag(row["passed"]) for row in cases)
         status = "fail" if not flag(report["passed"]) else (
@@ -227,7 +446,7 @@ def merge_soundness(section, args):
         gate(section, "probe-cache", "Persistent Probe Cache", passed, len(cases), status,
              "Counts include the compiler probe cache checks that ran.")
     if args.mutation:
-        report = read_json(args.mutation)
+        report = read_report(args.mutation, identity)
         steps = [row for row in report["steps"] if row["step"] > 0]
         status = "fail" if not flag(report["passed"]) else (
             "pass" if report["replay_verified"] else "partial"
@@ -236,12 +455,12 @@ def merge_soundness(section, args):
              sum(flag(row.get("passed", False)) for row in steps), len(steps), status,
              "Counts include the edit comparisons and exclude the initial configure.")
     if args.determinism:
-        report = read_json(args.determinism)
+        report = read_report(args.determinism, identity)
         passed = int(report["status"] == "pass")
         gate(section, "determinism", "Path-Swap Determinism", passed, 1,
              "pass" if passed else "fail", "Compares output from isolated runs at the same project path.")
     if args.wasm:
-        report = read_json(args.wasm)
+        report = read_report(args.wasm, identity)
         checks = [row for row in report["checks"] if row["status"] != "planned"]
         status = {"pass": "pass", "fail": "fail", "incomplete": "partial", "planned": "pending"}
         gate(section, "wasi", "WebAssembly & WASI Gate",
@@ -249,8 +468,8 @@ def merge_soundness(section, args):
              "Checks WebAssembly dependencies, compilation, and WASI execution.")
 
 
-def merge_benchmarks(metrics, paths):
-    rows = [row for path in paths for row in read_json(path)["results"]]
+def merge_benchmarks(metrics, paths, identity=(None, None)):
+    rows = [row for path in paths for row in read_report(path, identity)["results"]]
 
     def record(key, value, status, note):
         metrics[key].update(value=value, status=status, note=note)
@@ -306,8 +525,8 @@ def optional_number(value, *, positive=False):
     return round(float(value), 2)
 
 
-def merge_giants_bench(section, path):
-    report = read_json(path)
+def merge_giants_bench(section, path, identity=(None, None)):
+    report = read_report(path, identity)
     if report.get("schema_version") != 1:
         raise ValueError("Giants benchmark report must use schema_version 1.")
     raw_projects = report.get("projects")
@@ -438,10 +657,10 @@ def report_paths(directory, pattern):
     return paths
 
 
-def merge_fuzz(section, directory):
+def merge_fuzz(section, directory, identity=(None, None)):
     total = failures = 0
     for path in report_paths(directory, "*.json"):
-        report = read_json(path)
+        report = read_report(path, identity)
         failed = report["failures"]
         failed = len(failed) if isinstance(failed, list) else count(failed)
         iterations = count(report["iterations"])
@@ -453,65 +672,371 @@ def merge_fuzz(section, directory):
          "Counts include all inputs in the supplied fuzz reports.")
 
 
+def differential_fuzz_paths(inputs):
+    paths = []
+    for item in inputs:
+        if item.is_dir():
+            found = sorted(
+                path for path in item.rglob("*.json")
+                if not path.name.startswith("._") and path.name != "outcomes.json"
+            )
+            if not found:
+                raise ValueError("No differential fuzz reports in the supplied directory.")
+            paths.extend(found)
+        else:
+            paths.append(item)
+    return paths
+
+
+def merge_differential_fuzz(section, inputs, identity=(None, None)):
+    total = passed = mismatches = oracle_errors = 0
+    script_cases = configure_cases = 0
+    saw_cases = False
+    families = set()
+    seeds = []
+    reports = differential_fuzz_paths(inputs)
+    for path in reports:
+        report = read_report(path, identity)
+        if not isinstance(report, dict) or ("counts" not in report and "cases" not in report):
+            raise ValueError("Differential fuzz reports must include counts or cases.")
+        raw_cases = report.get("cases")
+        if raw_cases is not None and not isinstance(raw_cases, list):
+            raise ValueError("Differential fuzz cases must be a list.")
+
+        case_counts = Counter()
+        if raw_cases:
+            saw_cases = True
+            for case in raw_cases:
+                if not isinstance(case, dict):
+                    raise ValueError("Each differential fuzz case must be an object.")
+                status_value = case.get("status")
+                if status_value not in DIFF_FUZZ_STATUSES:
+                    raise ValueError(f"Unknown differential fuzz case status {status_value!r}.")
+                case_counts[status_value] += 1
+                mode = case.get("mode")
+                if mode == "script":
+                    script_cases += 1
+                elif mode == "configure":
+                    configure_cases += 1
+                family = case.get("family")
+                if isinstance(family, str) and family:
+                    families.add(family)
+
+        raw_counts = report.get("counts")
+        if raw_counts is not None:
+            if not isinstance(raw_counts, dict):
+                raise ValueError("Differential fuzz counts must be an object.")
+            unknown = set(raw_counts) - DIFF_FUZZ_STATUSES
+            if unknown:
+                raise ValueError(f"Unknown differential fuzz count keys: {', '.join(sorted(unknown))}.")
+            report_passed = count(raw_counts.get("pass", 0))
+            report_mismatches = count(raw_counts.get("fail", 0))
+            report_oracle_errors = count(raw_counts.get("oracle_error", 0))
+            if raw_cases and (
+                case_counts["pass"] != report_passed
+                or case_counts["fail"] != report_mismatches
+                or case_counts["oracle_error"] != report_oracle_errors
+            ):
+                raise ValueError("Differential fuzz cases do not match counts.")
+        else:
+            report_passed = case_counts["pass"]
+            report_mismatches = case_counts["fail"]
+            report_oracle_errors = case_counts["oracle_error"]
+
+        summed = report_passed + report_mismatches + report_oracle_errors
+        report_total = count(report["total"]) if "total" in report else summed
+        if report_total < 1:
+            raise ValueError("Differential fuzz report must contain at least one case.")
+        if summed != report_total:
+            raise ValueError("Differential fuzz total must equal pass, fail, and oracle_error counts.")
+
+        if "seed" in report and report["seed"] is not None:
+            seed = report["seed"]
+            if type(seed) is not int:
+                raise ValueError("Differential fuzz seed must be an integer.")
+            if seed not in seeds:
+                seeds.append(seed)
+
+        total += report_total
+        passed += report_passed
+        mismatches += report_mismatches
+        oracle_errors += report_oracle_errors
+
+    status = "fail" if (mismatches or oracle_errors) else "pass"
+    entry = {
+        "label": "Oracle Differential Fuzzing",
+        "status": status,
+        "casesTotal": total,
+        "casesPassed": passed,
+        "mismatches": mismatches,
+        "oracleErrors": oracle_errors,
+        "passRate": rate(passed, total),
+        "reportsCount": len(reports),
+        "seeds": seeds,
+        "summary": (
+            f"{passed:,} / {total:,} differential cases passed "
+            f"({mismatches:,} mismatches, {oracle_errors:,} oracle errors)"
+        ),
+        "note": "Seeded CMake script and configure differential runs against CMake 4.5.1.",
+    }
+    if saw_cases:
+        entry["scriptCases"] = script_cases
+        entry["configureCases"] = configure_cases
+        entry["families"] = len(families)
+    section["differentialFuzz"] = entry
+
+
+def map_large_project_state(value):
+    if isinstance(value, bool):
+        return "pass" if value else "fail"
+    if isinstance(value, str):
+        key = value.strip().lower()
+        if key in LARGE_PROJECT_STATES:
+            return LARGE_PROJECT_STATES[key]
+    raise ValueError(f"Unknown large-project level state {value!r}.")
+
+
+def collect_large_project_states(raw):
+    if isinstance(raw, (bool, str)):
+        return [map_large_project_state(raw)]
+    if isinstance(raw, dict):
+        if not raw:
+            return []
+        if "status" in raw or "checks" in raw:
+            states = []
+            if raw.get("status") is not None:
+                states.append(map_large_project_state(raw["status"]))
+            checks = raw.get("checks")
+            if isinstance(checks, dict):
+                for item in checks.values():
+                    states.extend(collect_large_project_states(item))
+            elif isinstance(checks, list):
+                for item in checks:
+                    states.extend(collect_large_project_states(item))
+            elif checks is not None:
+                states.extend(collect_large_project_states(checks))
+            return states
+        states = []
+        for item in raw.values():
+            states.extend(collect_large_project_states(item))
+        return states
+    if isinstance(raw, list):
+        states = []
+        for item in raw:
+            states.extend(collect_large_project_states(item))
+        return states
+    raise ValueError(f"Invalid large-project level value {raw!r}.")
+
+
 def large_project_level(values):
-    states = {"equal": "pass", "different": "fail", "incomplete": "partial",
-              "pass": "pass", "fail": "fail"}
-    return combined_status(states[value] for value in values)
+    mapped = []
+    for item in values:
+        mapped.extend(collect_large_project_states(item))
+    if not mapped:
+        return "partial"
+    statuses = set(mapped)
+    if "fail" in statuses:
+        return "fail"
+    if statuses == {"pass"}:
+        return "pass"
+    if statuses == {"pending"}:
+        return "pending"
+    return "partial"
 
 
-def merge_large_projects(track, directory):
+def extract_large_project_level(result, level_key, *, lane_keys=(), default="partial"):
+    levels = result.get("levels") if isinstance(result.get("levels"), dict) else {}
+    for container in (result, levels):
+        for candidate in (level_key, level_key.upper()):
+            if candidate in container and container[candidate] is not None:
+                return large_project_level([container[candidate]])
+    lanes = result.get("lanes")
+    if lane_keys and isinstance(lanes, dict) and lanes:
+        observed = [
+            lane[key]
+            for lane in lanes.values()
+            if isinstance(lane, dict)
+            for key in lane_keys
+            if key in lane and lane[key] is not None
+        ]
+        if observed:
+            return large_project_level(observed)
+    return default
+
+
+def large_project_name(result):
+    name = result.get("project") or result.get("name")
+    if not isinstance(name, str) or not name:
+        raise ValueError("Large-project result must include a project name.")
+    return name
+
+
+def merge_large_projects(track, directory, identity=(None, None)):
     projects = {row["name"]: row for row in track["projects"]}
     # A local run stores the same project results in the summary and per-project files.
     summaries = {}
     individuals = {}
     for path in report_paths(directory, "result.json"):
-        report = read_json(path)
+        report = read_report(path, identity)
         if "projects" in report:
-            for result in report["projects"]:
-                summaries[result["project"]] = result
+            raw_projects = report["projects"]
+            if isinstance(raw_projects, dict):
+                for name, result in raw_projects.items():
+                    summaries[name] = {**result, "project": result.get("project", name)}
+            elif isinstance(raw_projects, list):
+                for result in raw_projects:
+                    summaries[large_project_name(result)] = result
+            else:
+                raise ValueError("Large-project summary projects field must be a list or object.")
         else:
-            individuals[report["project"]] = report
+            individuals[large_project_name(report)] = report
     results = {**summaries, **individuals}
     if not results or results.keys() - projects.keys():
         raise ValueError("Large-project reports must match the published project list.")
     for name, result in results.items():
-        levels = result.get("l1", {})
-        checks = levels.values() if isinstance(levels, dict) else [levels]
-        l1 = large_project_level(checks)
-        l2 = large_project_level([result.get("l2", "incomplete")])
-        if result.get("status") in {"fail", "oracle_error"} or result.get("error"):
+        l1 = extract_large_project_level(result, "l1", default="partial")
+        l2 = extract_large_project_level(result, "l2", default="partial")
+        l3 = extract_large_project_level(result, "l3", lane_keys=("build",), default="pending")
+        l4 = extract_large_project_level(
+            result, "l4", lane_keys=("test", "manifest_l4", "install"), default="pending"
+        )
+        failed_run = result.get("status") in {"fail", "oracle_error", "oracle-red", "error"} or bool(
+            result.get("error")
+        )
+        if failed_run:
             l1 = "fail" if l1 == "partial" else l1
             l2 = "fail" if l2 == "partial" else l2
-        projects[name].update(l1=l1, l2=l2)
+            l3 = "fail" if l3 == "partial" else l3
+            l4 = "fail" if l4 == "partial" else l4
+        projects[name].update(l1=l1, l2=l2, l3=l3, l4=l4)
         projects[name].pop("note", None)
-    track.update(projectsTotal=len(projects),
-                 l1Passed=sum(project["l1"] == "pass" for project in projects.values()),
-                 l2Passed=sum(project["l2"] == "pass" for project in projects.values()),
-                 status=combined_status(project[level] for project in projects.values()
-                                        for level in ("l1", "l2")),
-                 note="L1 compares configure output. L2 compares Ninja dry-run commands.")
+
+    l3_reported = any(project.get("l3", "pending") != "pending" for project in projects.values())
+    l4_reported = any(project.get("l4", "pending") != "pending" for project in projects.values())
+    track.update(
+        projectsTotal=len(projects),
+        l1Passed=sum(project["l1"] == "pass" for project in projects.values()),
+        l2Passed=sum(project["l2"] == "pass" for project in projects.values()),
+        l3Passed=sum(project.get("l3") == "pass" for project in projects.values()) if l3_reported else None,
+        l4Passed=sum(project.get("l4") == "pass" for project in projects.values()) if l4_reported else None,
+        status=combined_status(
+            project.get(level, "pending")
+            for project in projects.values()
+            for level in ("l1", "l2", "l3", "l4")
+        ),
+        note="L1 compares configure output. L2 compares Ninja dry-run commands. L3 builds targets. L4 runs tests and install checks.",
+    )
 
 
 def holdout_counts(row):
     total = count(row.get("reposTotal", row.get("repos_total")))
     passed = count(row.get("reposPassed", row.get("repos_passed")))
     return dict(reposTotal=total, reposPassed=passed, passRate=rate(passed, total),
-                status="pass" if passed == total else "fail")
+                status="pass" if total > 0 and passed == total else "fail")
 
 
-def merge_holdout(track, path):
-    # Publish only numeric metrics and reuse category labels from the base.
+def parse_holdout_pass_rates(raw_rates):
+    if not isinstance(raw_rates, dict) or not raw_rates:
+        raise ValueError("Holdout pass_rates must be a non-empty object.")
+    unknown = set(raw_rates) - set(HOLDOUT_LEVELS)
+    if unknown:
+        raise ValueError("Holdout pass_rates contains unsupported level keys.")
+    level_rates = {}
+    ordered = [level for level in HOLDOUT_LEVELS if level in raw_rates]
+    for level in ordered:
+        stats = raw_rates[level]
+        if not isinstance(stats, dict):
+            raise ValueError("Each holdout pass_rates entry must be an object.")
+        passed = count(stats["passed"])
+        eligible = count(stats["eligible"])
+        level_rates[level] = {
+            "passed": passed,
+            "eligible": eligible,
+            "passRate": rate(passed, eligible),
+        }
+    failed_total = sum(row["eligible"] - row["passed"] for row in level_rates.values())
+    deepest_passed = level_rates[ordered[-1]]["passed"]
+    repos_total = deepest_passed + failed_total
+    aggregate = {
+        "reposTotal": repos_total,
+        "reposPassed": deepest_passed,
+        "passRate": rate(deepest_passed, repos_total),
+        "status": "pass" if repos_total > 0 and deepest_passed == repos_total else "fail",
+    }
+    return aggregate, level_rates
+
+
+def sanitize_holdout_failure_categories(raw_failures):
+    if not isinstance(raw_failures, dict):
+        raise ValueError("Holdout failure_categories must be an object.")
+    cleaned = Counter()
+    for raw_key, raw_count in raw_failures.items():
+        if not isinstance(raw_key, str):
+            raise ValueError("Holdout failure category keys must be strings.")
+        bucket = raw_key if raw_key in HOLDOUT_FAILURE_CATEGORIES else "other"
+        cleaned[bucket] += count(raw_count)
+    return dict(sorted(cleaned.items()))
+
+
+def merge_holdout(track, path, identity=(None, None)):
+    # Publish only numeric metrics and fixed public labels so no repo names or URLs can leak.
     try:
-        report = read_json(path)
-        aggregate = holdout_counts(report.get("aggregate", report))
-        categories = report.get("categories", [])
-        if isinstance(categories, list):
-            categories = {row["category"]: row for row in categories}
+        report = read_report(path, identity)
+        if not isinstance(report, dict):
+            raise ValueError("The holdout report must be an object.")
+        if "holdout" in report:
+            payload = report["holdout"]
+            if not isinstance(payload, dict):
+                raise ValueError("The holdout split must be an object.")
+        elif "dev" in report and not any(
+            key in report for key in ("pass_rates", "aggregate", "reposTotal", "repos_total")
+        ):
+            raise ValueError("The holdout report is missing the holdout split.")
+        else:
+            payload = report
+
+        level_rates = None
+        if "pass_rates" in payload:
+            aggregate, level_rates = parse_holdout_pass_rates(payload["pass_rates"])
+        else:
+            source = payload.get("aggregate", payload)
+            if not isinstance(source, dict):
+                raise ValueError("Holdout aggregate counts must be an object.")
+            aggregate = holdout_counts(source)
+
+        failure_categories = None
+        raw_failures = payload.get("failure_categories", report.get("failure_categories"))
+        if raw_failures is not None:
+            failure_categories = sanitize_holdout_failure_categories(raw_failures)
+
+        raw_categories = payload.get("categories", report.get("categories", []))
+        if isinstance(raw_categories, list):
+            categories = {
+                row["category"]: row for row in raw_categories
+                if isinstance(row, dict) and isinstance(row.get("category"), str)
+            }
+        elif isinstance(raw_categories, dict):
+            categories = raw_categories
+        else:
+            raise ValueError("Holdout categories must be an array or object.")
+
         for row in track["categories"]:
             if row["category"] in categories:
                 row.update(holdout_counts(categories[row["category"]]))
-        track.update(aggregate, note="Repository counts from the blind holdout report.")
-    except (AttributeError, KeyError, OSError, TypeError, ValueError):
+
+        if level_rates is not None:
+            track["levelPassRates"] = level_rates
+        else:
+            track.pop("levelPassRates", None)
+        if failure_categories is not None:
+            track["failureCategories"] = failure_categories
+        else:
+            track.pop("failureCategories", None)
+
+        track.update(aggregate, sealed=True, note="Repository counts from the blind holdout report.")
+    except (AttributeError, KeyError, OSError, TypeError, ValueError) as error:
+        if "reports commit" in str(error) or "reports binary SHA-256" in str(error):
+            raise
         raise ValueError("The holdout report must contain valid aggregate and category counts.") from None
 
 
@@ -526,11 +1051,11 @@ def shard_results(path):
     return counts
 
 
-def merge_vcpkg(track, directory):
+def merge_vcpkg(track, directory, identity=(None, None)):
     shards = {row["shard"]: row for row in track["shards"]}
     seen = set()
     for path in report_paths(directory, "shard.json"):
-        report = read_json(path)
+        report = read_report(path, identity)
         index = count(report["shard_index"])
         if count(report["shard_count"]) != track["shardsTotal"] or index not in shards or index in seen:
             raise ValueError("Each vcpkg report must identify a distinct shard in the 64-shard matrix.")
@@ -590,13 +1115,27 @@ def main(argv=None):
     parser.add_argument("--base", type=Path, default=DATA / "latest.json")
     parser.add_argument("--out", type=Path, default=DATA / "latest.json")
     parser.add_argument("--commit", help="Commit SHA for the verified binary.")
+    parser.add_argument("--release-sha", help="Exact Git commit SHA for the verified release binary.")
+    parser.add_argument("--binary-sha256", help="SHA-256 hex digest of the verified release binary.")
+    parser.add_argument(
+        "--strict-same-sha",
+        action="store_true",
+        help="Require commit identity and reset stale base tracks instead of carrying them across commits.",
+    )
+    parser.add_argument(
+        "--allow-stale-base",
+        action="store_true",
+        help="Explicitly allow carrying untouched base tracks across commit changes.",
+    )
     parser.add_argument("--version", help="Version of the verified Rcmake binary.")
     for name in (
         "runcmake-macos", "runcmake-linux", "runcmake-windows", "independent", "probe-cache",
-        "mutation", "determinism", "wasm", "large-projects-dir", "giants-bench", "unseen-holdout",
+        "mutation", "determinism", "wasm", "large-projects-dir", "giants-bench",
         "fuzz-dir", "vcpkg-dir", "ci-status-json",
     ):
         parser.add_argument(f"--{name}", type=Path)
+    parser.add_argument("--unseen-holdout", "--holdout", dest="unseen_holdout", type=Path)
+    parser.add_argument("--differential-fuzz", type=Path, action="append", default=[])
     parser.add_argument("--bench", type=Path, action="append", default=[])
     args = parser.parse_args(argv)
 
@@ -604,31 +1143,32 @@ def main(argv=None):
         schema = read_json(DATA / "dashboard.schema.json")
         snapshot = read_json(args.base)
         validate(snapshot, schema, schema)
+        identity = resolve_release_identity(snapshot, args)
         snapshot["generatedAt"] = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
-        if args.commit is not None:
-            snapshot["commit"] = args.commit
         if args.version is not None:
             snapshot["rcmakeVersion"] = args.version
         tracks = snapshot["tracks"]
         reports = {
-            identifier: read_json(path) for os_name, identifier in PLATFORMS.items()
+            identifier: read_report(path, identity) for os_name, identifier in PLATFORMS.items()
             if (path := getattr(args, f"runcmake_{os_name}")) is not None
         }
         if reports:
             merge_runcmake(tracks, reports)
         section = tracks["benchmarksAndGates"]
-        merge_benchmarks(section["benchmarks"], args.bench)
+        merge_benchmarks(section["benchmarks"], args.bench, identity)
         if args.giants_bench:
-            merge_giants_bench(section, args.giants_bench)
-        merge_soundness(section, args)
+            merge_giants_bench(section, args.giants_bench, identity)
+        merge_soundness(section, args, identity)
         if args.large_projects_dir:
-            merge_large_projects(tracks["bossFight"], args.large_projects_dir)
+            merge_large_projects(tracks["bossFight"], args.large_projects_dir, identity)
         if args.unseen_holdout:
-            merge_holdout(tracks["unseenHoldout"], args.unseen_holdout)
+            merge_holdout(tracks["unseenHoldout"], args.unseen_holdout, identity)
         if args.fuzz_dir:
-            merge_fuzz(section, args.fuzz_dir)
+            merge_fuzz(section, args.fuzz_dir, identity)
+        if args.differential_fuzz:
+            merge_differential_fuzz(section, args.differential_fuzz, identity)
         if args.vcpkg_dir:
-            merge_vcpkg(tracks["vcpkgMatrix"], args.vcpkg_dir)
+            merge_vcpkg(tracks["vcpkgMatrix"], args.vcpkg_dir, identity)
         if args.ci_status_json:
             merge_ci(snapshot, read_json(args.ci_status_json))
         validate(snapshot, schema, schema)

@@ -1,6 +1,6 @@
 /* rcmake home page controller. MIT OR Apache-2.0. */
 
-import { copyWithFeedback, escapeHtml, formatNumber, initRovingGroup, loadLatestData } from "./app.js";
+import { copyWithFeedback, escapeHtml, formatNumber, initRovingGroup, loadLatestData, normalizeStatus, statusHtml } from "./app.js";
 import { formatSpeed, fuzzGaugeCard, isMeasured, ringGaugeCard, speedupBars, statRow, waffleRowsHtml } from "./charts.js";
 import { animateCountUp, createMotionController, prefersReducedMotion } from "./motion.js";
 import { initPipeline } from "./pipeline.js";
@@ -140,13 +140,33 @@ function renderGauges(el, data, motion) {
   }
 }
 
-function renderSpeed(el, bench, motion) {
+function renderGiantsTable(giants) {
+  if (!giants || !Array.isArray(giants.projects) || giants.projects.length === 0) return "";
+  if (!giants.projects.some((p) => normalizeStatus(p?.status) !== "pending")) return "";
+  const fmtRatio = (v) => (formatSpeed(v) ? `${formatSpeed(v)}\u00d7` : "-");
+  const fmtRss = (p) => {
+    const rc = [p?.cold?.rcmakePeakRssMiB, p?.warmProbe?.rcmakePeakRssMiB, p?.incrementalLeaf?.rcmakePeakRssMiB].filter(isMeasured);
+    const cm = [p?.cold?.cmakePeakRssMiB, p?.warmProbe?.cmakePeakRssMiB, p?.incrementalLeaf?.cmakePeakRssMiB].filter(isMeasured);
+    if (rc.length && cm.length) return `${formatNumber(Math.max(...rc))} / ${formatNumber(Math.max(...cm))} MiB`;
+    if (rc.length) return `${formatNumber(Math.max(...rc))} MiB`;
+    return "-";
+  };
+  const rows = giants.projects.map((p) => {
+    const st = normalizeStatus(p?.status);
+    const leafP95 = isMeasured(p?.incrementalLeaf?.rcmakeP95Ms) ? ` (${formatNumber(p.incrementalLeaf.rcmakeP95Ms)} ms)` : "";
+    const leaf = formatSpeed(p?.incrementalLeaf?.speedup) ? `${formatSpeed(p.incrementalLeaf.speedup)}\u00d7${leafP95}` : (leafP95 ? leafP95.slice(2, -1) : "-");
+    return `<tr data-status="${st}"><td>${escapeHtml(p?.name || "")}</td><td>${escapeHtml(fmtRatio(p?.cold?.speedup))}</td><td>${escapeHtml(fmtRatio(p?.warmProbe?.speedup))}</td><td>${escapeHtml(leaf)}</td><td>${escapeHtml(fmtRss(p))}</td><td>${statusHtml(st)}</td></tr>`;
+  }).join("");
+  return `<div style="border-top:1px solid var(--line);overflow-x:auto" data-test="home-giants-bench"><table class="runner-table"><thead><tr><th>Project</th><th>Cold</th><th>Warm probe</th><th>Leaf edit</th><th>Peak RSS</th><th>Status</th></tr></thead><tbody>${rows}</tbody></table></div>`;
+}
+
+function renderSpeed(el, bench, motion, giants = null) {
   const b = bench || {};
   const w = b.warmProbeSpeedup || {};
   const c = b.coldConfigureSpeedup || {};
   const l = b.incrementalLeafP95Ms || { baseline: "single-file change replay" };
   const r = b.peakRssMiB || { baseline: "native release binary" };
-  el.innerHTML = `${speedupBars({ label: "Warm configure", value: w.value, unit: w.unit, status: w.status, testId: "speed-warm" })}${speedupBars({ label: "Cold configure, 500 targets", value: c.value, unit: c.unit, status: c.status, testId: "speed-cold" })}<div class="speed-stats">${statRow({ label: "Leaf edit reconfigure, p95", value: l.value, unit: l.unit, baseline: l.baseline, status: l.status, testId: "speed-leaf" })}${statRow({ label: "Peak memory, 500 targets", value: r.value, unit: r.unit, baseline: r.baseline, status: r.status, testId: "speed-rss" })}</div>`;
+  el.innerHTML = `${speedupBars({ label: "Warm configure", value: w.value, unit: w.unit, status: w.status, testId: "speed-warm" })}${speedupBars({ label: "Cold configure, 500 targets", value: c.value, unit: c.unit, status: c.status, testId: "speed-cold" })}<div class="speed-stats">${statRow({ label: "Leaf edit reconfigure, p95", value: l.value, unit: l.unit, baseline: l.baseline, status: l.status, testId: "speed-leaf" })}${statRow({ label: "Peak memory, 500 targets", value: r.value, unit: r.unit, baseline: r.baseline, status: r.status, testId: "speed-rss" })}</div>${renderGiantsTable(giants)}`;
   motion.scan(el);
 }
 
@@ -193,7 +213,7 @@ async function init() {
     if (range) document.querySelectorAll("[data-policy-range]").forEach((el) => { el.textContent = range; });
     waffles.innerHTML = waffleRowsHtml(data?.tracks?.runCmakeOs?.platforms || DEFAULT_PLATFORMS);
     renderGauges(gauges, data, motion);
-    renderSpeed(speed, data?.tracks?.benchmarksAndGates?.benchmarks, motion);
+    renderSpeed(speed, data?.tracks?.benchmarksAndGates?.benchmarks, motion, data?.tracks?.benchmarksAndGates?.giantsBenchmark || null);
     race.setData(data?.tracks?.benchmarksAndGates?.benchmarks || null);
     motion.scan(document);
   } catch (_) {

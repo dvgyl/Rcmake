@@ -1,7 +1,7 @@
 /* rcmake compatibility report controller. MIT OR Apache-2.0. */
 
-import { cleanNote, escapeHtml, formatNumber, formatRatio, initRovingGroup, loadLatestData, normalizeStatus, overviewRows, snapshotMeta, statusHtml } from "./app.js";
-import { fuzzGaugeCard, horizontalBar, inlineBar, isMeasured, ringGaugeCard, segmentRing, shardHeatmap, speedupBars, statRow, statusIcon, waffleRowsHtml } from "./charts.js";
+import { cleanNote, escapeHtml, formatNumber, formatPercent, formatRatio, initRovingGroup, loadLatestData, normalizeStatus, overviewRows, snapshotMeta, statusHtml } from "./app.js";
+import { formatSpeed, fuzzGaugeCard, horizontalBar, inlineBar, isMeasured, ringGaugeCard, segmentRing, shardHeatmap, speedupBars, statRow, statusIcon, waffleRowsHtml } from "./charts.js";
 import { animateCountUp, createMotionController } from "./motion.js";
 
 export function renderSummary(data) {
@@ -58,10 +58,66 @@ export function renderVcpkg(track) {
   return `<section id="vcpkg" class="report-section" data-animate data-test="section-vcpkg"><h2>vcpkg ports</h2><figure class="panel vcpkg-wrap" aria-label="${escapeHtml(`vcpkg ports across ${shards.length} shards. ${legend}.`)}"><div class="heatmap-area"><div class="heatmap-grid" id="vcpkg-grid" role="group" aria-label="vcpkg shards" data-test="vcpkg-heatmap">${shardHeatmap(shards, { cols: 8 })}</div><div class="hm-detail" id="shard-detail" data-test="shard-detail" aria-live="polite">Select a shard to inspect its counts.</div></div><div class="hm-legend" data-test="vcpkg-legend">${escapeHtml(legend)}</div></figure></section>`;
 }
 
+function maxProjectRss(project, key) {
+  const vals = [project?.cold?.[key], project?.warmProbe?.[key], project?.incrementalLeaf?.[key]].filter(isMeasured);
+  return vals.length ? Math.max(...vals) : null;
+}
+
+function formatGiantsPhase(phase, extra = null) {
+  const sp = formatSpeed(phase?.speedup);
+  const ms = isMeasured(phase?.rcmakeMedianMs) ? `${formatNumber(phase.rcmakeMedianMs)} ms` : null;
+  const detail = extra || ms;
+  if (sp && detail) return `${sp}\u00d7 (${detail})`;
+  if (sp) return `${sp}\u00d7`;
+  return detail || "-";
+}
+
+function formatRssPair(rcmakeMiB, cmakeMiB) {
+  if (isMeasured(rcmakeMiB) && isMeasured(cmakeMiB)) return `${formatNumber(rcmakeMiB)} / ${formatNumber(cmakeMiB)} MiB`;
+  if (isMeasured(rcmakeMiB)) return `${formatNumber(rcmakeMiB)} MiB`;
+  return "-";
+}
+
+export function renderGiantsBench(giants) {
+  if (!giants || !Array.isArray(giants.projects) || giants.projects.length === 0) return "";
+  const hasMeasured = giants.projects.some((p) => normalizeStatus(p?.status) !== "pending");
+  if (!hasMeasured && normalizeStatus(giants.status) === "pending") return "";
+  const rows = giants.projects.map((p) => {
+    const st = normalizeStatus(p?.status);
+    const leafExtra = isMeasured(p?.incrementalLeaf?.rcmakeP95Ms) ? `${formatNumber(p.incrementalLeaf.rcmakeP95Ms)} ms p95` : null;
+    const rcRss = maxProjectRss(p, "rcmakePeakRssMiB");
+    const cmRss = maxProjectRss(p, "cmakePeakRssMiB");
+    const sub = p?.version || p?.repository || "";
+    return `<tr data-status="${st}"><td><span>${escapeHtml(p?.name || "")}</span>${sub ? `<span class="proj-repo">${escapeHtml(sub)}</span>` : ""}</td><td class="mono nowrap">${escapeHtml(formatGiantsPhase(p?.cold))}</td><td class="mono nowrap">${escapeHtml(formatGiantsPhase(p?.warmProbe))}</td><td class="mono nowrap">${escapeHtml(formatGiantsPhase(p?.incrementalLeaf, leafExtra))}</td><td class="mono nowrap">${escapeHtml(formatRssPair(rcRss, cmRss))}</td><td>${statusHtml(st)}</td></tr>`;
+  }).join("");
+  const s = giants.summary;
+  let summaryRow = "";
+  if (s && (isMeasured(s.coldSpeedupGeomean) || isMeasured(s.warmProbeSpeedupGeomean) || isMeasured(s.incrementalLeafSpeedupGeomean))) {
+    const st = normalizeStatus(giants.status);
+    const fmtG = (v) => (formatSpeed(v) ? `${formatSpeed(v)}\u00d7` : "-");
+    const incP95 = isMeasured(s.incrementalLeafMaxP95Ms) ? ` (${formatNumber(s.incrementalLeafMaxP95Ms)} ms max p95)` : "";
+    const incTxt = formatSpeed(s.incrementalLeafSpeedupGeomean) ? `${formatSpeed(s.incrementalLeafSpeedupGeomean)}\u00d7${incP95}` : (incP95 ? incP95.slice(2, -1) : "-");
+    const scope = isMeasured(s.projectsPassed) && isMeasured(s.projectsTotal) ? `${formatNumber(s.projectsPassed)} / ${formatNumber(s.projectsTotal)} passed` : "";
+    summaryRow = `<tr class="cmp-group-note" data-status="${st}" data-test="dash-giants-summary"><td><span>Geomean</span>${scope ? `<span class="proj-repo">${escapeHtml(scope)}</span>` : ""}</td><td class="mono nowrap">${escapeHtml(fmtG(s.coldSpeedupGeomean))}</td><td class="mono nowrap">${escapeHtml(fmtG(s.warmProbeSpeedupGeomean))}</td><td class="mono nowrap">${escapeHtml(incTxt)}</td><td class="mono nowrap">${escapeHtml(formatRssPair(s.rcmakeMaxPeakRssMiB, s.cmakeMaxPeakRssMiB))}</td><td>${statusHtml(st)}</td></tr>`;
+  }
+  return `<div class="table-panel" style="margin-top:16px" data-test="dash-giants-bench"><table class="bench-table"><thead><tr><th>Real-world project</th><th>Cold</th><th>Warm probe</th><th>Incremental leaf</th><th>Peak RSS (rcmake / CMake)</th><th>Status</th></tr></thead><tbody>${rows}${summaryRow}</tbody></table></div>`;
+}
+
+export function renderDifferentialFuzz(diff) {
+  if (!diff || !isMeasured(diff.casesTotal) || diff.casesTotal <= 0) return "";
+  const st = normalizeStatus(diff.status);
+  const ratio = formatRatio(diff.casesPassed, diff.casesTotal) || "-";
+  const pct = isMeasured(diff.passRate) ? ` (${formatPercent(diff.passRate)})` : "";
+  const mismatches = formatNumber(diff.mismatches) ?? "0";
+  const oracleErrors = formatNumber(diff.oracleErrors) ?? "0";
+  const seeds = Array.isArray(diff.seeds) && diff.seeds.length ? diff.seeds.join(", ") : "-";
+  return `<div class="table-panel" style="margin-top:16px" data-test="dash-differential-fuzz"><table class="runner-table"><thead><tr><th>Differential fuzzing</th><th>Cases passed</th><th>Mismatches</th><th>Oracle errors</th><th>Seeds</th><th>Status</th></tr></thead><tbody><tr data-status="${st}"><td>${escapeHtml(diff.label || "Oracle differential fuzzing")}</td><td><span data-value>${escapeHtml(`${ratio}${pct}`)}</span></td><td>${escapeHtml(mismatches)}</td><td>${escapeHtml(oracleErrors)}</td><td class="dim">${escapeHtml(seeds)}</td><td>${statusHtml(st)}</td></tr></tbody></table></div>`;
+}
+
 export function renderSpeed(benchTrack) {
   const b = benchTrack?.benchmarks || {};
   const [w, c, l, r] = [b.warmProbeSpeedup || {}, b.coldConfigureSpeedup || {}, b.incrementalLeafP95Ms || {}, b.peakRssMiB || {}];
-  return `<section id="speed" class="report-section" data-animate data-test="section-speed"><h2>Speed and memory</h2><div class="panel speed-panel">${speedupBars({ label: "Warm configure", value: w.value, unit: w.unit, status: w.status, testId: "dash-speed-warm" })}${speedupBars({ label: "Cold configure, 500 targets", value: c.value, unit: c.unit, status: c.status, testId: "dash-speed-cold" })}<div class="speed-stats">${statRow({ label: "Leaf edit reconfigure, p95", value: l.value, unit: l.unit, baseline: l.baseline, status: l.status, testId: "dash-speed-leaf" })}${statRow({ label: "Peak memory, 500 targets", value: r.value, unit: r.unit, baseline: r.baseline, status: r.status, testId: "dash-speed-rss" })}</div></div></section>`;
+  return `<section id="speed" class="report-section" data-animate data-test="section-speed"><h2>Speed and memory</h2><div class="panel speed-panel">${speedupBars({ label: "Warm configure", value: w.value, unit: w.unit, status: w.status, testId: "dash-speed-warm" })}${speedupBars({ label: "Cold configure, 500 targets", value: c.value, unit: c.unit, status: c.status, testId: "dash-speed-cold" })}<div class="speed-stats">${statRow({ label: "Leaf edit reconfigure, p95", value: l.value, unit: l.unit, baseline: l.baseline, status: l.status, testId: "dash-speed-leaf" })}${statRow({ label: "Peak memory, 500 targets", value: r.value, unit: r.unit, baseline: r.baseline, status: r.status, testId: "dash-speed-rss" })}</div></div>${renderGiantsBench(benchTrack?.giantsBenchmark)}</section>`;
 }
 
 export function renderBenchmarks(benchTrack) {
@@ -77,7 +133,7 @@ export function renderBenchmarks(benchTrack) {
       testId: `dash-gate-${g.id}`
     });
   }).join("");
-  return `<section id="gates" class="report-section" data-animate data-test="section-gates"><h2>Soundness gates</h2><div class="panel gates-shell"><div class="gates-grid">${cards}</div></div></section>`;
+  return `<section id="gates" class="report-section" data-animate data-test="section-gates"><h2>Soundness gates</h2><div class="panel gates-shell"><div class="gates-grid">${cards}</div></div>${renderDifferentialFuzz(benchTrack?.differentialFuzz)}</section>`;
 }
 
 export function renderReport(data) {
@@ -87,8 +143,16 @@ export function renderReport(data) {
 
 function buildRail(doc, data) {
   const t = data.tracks;
-  const gList = t.benchmarksAndGates?.gates || [];
-  const bList = Object.values(t.benchmarksAndGates?.benchmarks || {});
+  const diff = t.benchmarksAndGates?.differentialFuzz;
+  const giants = t.benchmarksAndGates?.giantsBenchmark;
+  const gList = [
+    ...(t.benchmarksAndGates?.gates || []),
+    ...(diff && isMeasured(diff.casesTotal) && diff.casesTotal > 0 ? [diff] : [])
+  ];
+  const bList = [
+    ...Object.values(t.benchmarksAndGates?.benchmarks || {}),
+    ...(giants && Array.isArray(giants.projects) && giants.projects.some((p) => normalizeStatus(p?.status) !== "pending") ? [giants] : [])
+  ];
   const fold = (arr) => arr.every((x) => x.status === "pass") ? "pass" : arr.some((x) => x.status === "fail") ? "fail" : arr.some((x) => x.status === "pass") ? "partial" : "pending";
   const items = [
     { id: "summary", label: "Summary", status: "pending" },
