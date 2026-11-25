@@ -70,8 +70,7 @@ pub struct RemoteCacheConfig {
     pub auth: RemoteAuth,
     /// Trusted absolute curl executable. The default uses the system installation.
     pub curl_path: Option<PathBuf>,
-    /// Existing private directory for curl input. Only the current user may access it.
-    /// On Windows the caller must set and verify a private directory access list.
+    /// Existing private directory for curl input on Unix.
     pub private_dir: Option<PathBuf>,
     /// Permit publication of the complete probe capture and artifact bytes.
     pub export_captured_output: bool,
@@ -224,6 +223,7 @@ pub struct RemoteStoreClient<'a> {
     blob_bytes: usize,
     failures: u32,
     diagnostic: Option<RemoteError>,
+    pipe_config: bool,
 }
 impl<'a> RemoteStoreClient<'a> {
     /// Create a client with bounded process capture and verify its HTTPS and directory settings.
@@ -254,17 +254,18 @@ impl<'a> RemoteStoreClient<'a> {
         if config.session_timeout.is_zero() {
             return Err(RemoteError::Setting("session_timeout"));
         }
-        config.private_dir = if needs_private_dir {
+        config.private_dir = if needs_private_dir && !windows {
             Some(resolve(
                 host,
                 config.private_dir.as_deref(),
                 "RCMAKE_CACHE_REMOTE_PRIVATE_DIR",
-                |m| m.kind == FileKind::Dir && (windows || m.mode & 0o077 == 0),
+                |m| m.kind == FileKind::Dir && m.mode & 0o077 == 0,
             )?)
         } else {
             None
         };
         Ok(Self {
+            pipe_config: needs_private_dir && windows,
             host,
             curl,
             read_time_left: config.session_timeout,
@@ -444,19 +445,23 @@ impl<'a> RemoteStoreClient<'a> {
         let url = format!("{}/{suffix}", config.endpoint);
         let scratch = config.private_dir.as_deref();
         let path = scratch.map(|dir| temporary_path(self.host, dir));
-        let staged = if let Some(path) = &path {
+        let mut staged = None;
+        let stdin = if config.private_dir.is_some() || self.pipe_config {
             let mut input = credentials(self.host, &config.auth, &mut args)?;
             append_config(&mut input, b"url", &[url.as_bytes()]);
             args.extend(["--config".into(), "-".into()]);
-            let error = RemoteError::Setting("RCMAKE_CACHE_REMOTE_PRIVATE_DIR");
-            Some(stage(self.host, path, &input).map_err(|_| error)?)
+            if let Some(path) = &path {
+                let error = RemoteError::Setting("RCMAKE_CACHE_REMOTE_PRIVATE_DIR");
+                staged = Some(stage(self.host, path, &input).map_err(|_| error)?);
+                Input::File(path.to_owned())
+            } else {
+                Input::Bytes(input)
+            }
         } else {
             args.extend(["--url".into(), url.into()]);
-            None
+            Input::Null
         };
-        let stdin = staged
-            .as_ref()
-            .map_or(Input::Null, |file| Input::File(file.path.into()));
+        let _cleanup = staged;
         let env = "SystemRoot HTTPS_PROXY https_proxy HTTP_PROXY http_proxy NO_PROXY no_proxy SSL_CERT_FILE CURL_CA_BUNDLE"
             .split_ascii_whitespace()
             .filter_map(|key| self.host.env_get(key.as_bytes()).map(|value| (key.into(), value)))

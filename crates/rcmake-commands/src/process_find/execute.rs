@@ -120,7 +120,10 @@ pub(super) fn execute_process(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResul
         })
     };
     #[cfg(all(feature = "native", any(unix, windows)))]
-    let run = fetch.result.take().map_or_else(execute, Ok);
+    let run = fetch.result.take().map_or_else(
+        || crate::configure::platform_queries::run(cx, &request).unwrap_or_else(execute),
+        Ok,
+    );
     #[cfg(not(all(feature = "native", any(unix, windows))))]
     let run = execute();
     let run = run.unwrap_or_else(|error| RunOutput {

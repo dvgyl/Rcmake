@@ -712,7 +712,8 @@ def markdown(report):
         "",
         "Cold configure starts with an empty build directory and probe cache. "
         "Warm probe and FetchContent runs use a fresh build directory and the same store. "
-        "Untimed runs check Rcmake replay results and trace the CMake leaf edit. "
+        "Both tools time the first edit after the cold configure. "
+        "Both tools check the edited leaf and unchanged control in separate, untimed runs. "
         "Both tools record compiler calls during probe timings. "
         "The operating system keeps its file cache across runs.",
         "Each tool and trial uses a private home and XDG cache. "

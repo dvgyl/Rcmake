@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use rcmake_eval::ProbeCacheMode;
 use rcmake_host::{FileKind, Follow, Host, HostError, HostResult, ReadRange, WriteMode, path};
-use rcmake_store::{Digest, Domain, Entry, InputStamp, Store, StoreConfig, StoreMode};
+use rcmake_store::{Digest, Domain, Entry, InputStamp, Store, StoreConfig, StoreMode, TraceMemo};
 use serde::{Deserialize, Serialize};
 
 use super::journal::{ImpureReason, Journal, JournalChecks};
@@ -19,6 +19,8 @@ use super::plan::{
     compute_probe_key, environment_fingerprint,
 };
 use super::template::{Templated, round_trip_verify};
+
+mod compare_artifact;
 
 const MAX_ARTIFACT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_ENTRY_BYTES: usize = 16 * 1024 * 1024;
@@ -95,7 +97,7 @@ impl Artifact {
     }
 
     /// Restore the artifact in private scratch space and copy it to the caller's destination.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn copy_to(
         &self,
         host: &dyn Host,
@@ -227,6 +229,7 @@ impl fmt::Display for VerifyMismatchReport {
 /// Compile probe cache policy and counters. The store owns atomic publication.
 pub(crate) struct ProbeCache {
     mode: StoreMode,
+    pub(super) memo: std::sync::Arc<TraceMemo>,
     hits: AtomicU64,
     misses: AtomicU64,
     bypassed: AtomicU64,
@@ -250,6 +253,7 @@ impl ProbeCache {
     pub(crate) fn new(mode: StoreMode) -> Self {
         Self {
             mode,
+            memo: Default::default(),
             hits: AtomicU64::default(),
             misses: AtomicU64::default(),
             bypassed: AtomicU64::default(),
@@ -324,7 +328,7 @@ impl ProbeCache {
             (StoreMode::ReadWrite, mode) | (_, mode @ StoreMode::Verify) => mode,
             (mode, _) => mode,
         };
-        let store = Store::new(host, config).ok()?;
+        let store = Store::new(host, config).ok()?.with_trace_memo(&self.memo);
         read_outcome(host, &store, recipe)
     }
 
@@ -390,7 +394,7 @@ impl ProbeCache {
                 return Ok(ProbePublishOutcome::Skipped(SkipReason::Outcome));
             }
             let key = compute_probe_key(recipe);
-            let store = Store::new(host, config.clone())?;
+            let store = Store::new(host, config.clone())?.with_trace_memo(&self.memo);
             let markers = config.root.join("probe-generations");
             ensure_directory(host, &config.root)?;
             ensure_directory(host, &markers)?;
@@ -526,7 +530,7 @@ impl ProbeCache {
                 after.len()
             ));
         }
-        if cached.artifact != fresh.artifact {
+        if !compare_artifact::matches(cached.artifact.as_ref(), fresh.artifact.as_ref()) {
             let describe = |artifact: Option<&Artifact>| {
                 artifact.map_or_else(
                     || "absent".to_owned(),
@@ -691,6 +695,7 @@ fn entry_fits(trace: &[InputStamp], checks: &JournalChecks, outcome: &ProbeOutco
                 InputStamp::FileStat { path, .. }
                 | InputStamp::FileHash { path, .. }
                 | InputStamp::DirEntries { path, .. }
+                | InputStamp::TreeListing { path, .. }
                 | InputStamp::Missing { path } => path_size(path),
                 InputStamp::EnvVar { name, .. } => name.len().saturating_mul(4),
                 InputStamp::NegativeLookup {
@@ -730,12 +735,14 @@ pub(super) fn verify_remote_payload(
     if !entry_fits(&entry.trace, checks, outcome) || !checks.verify(host) {
         return false;
     }
+    if !outcome.compiled {
+        return outcome.artifact.is_none() && entry.blobs.is_empty();
+    }
     let (Some(artifact), [blob]) = (&outcome.artifact, entry.blobs.as_slice()) else {
         return false;
     };
     let bindings = recipe.bindings.clone().with_canonical(host);
-    outcome.compiled
-        && artifact.blob == *blob
+    artifact.blob == *blob
         && artifact
             .relative_path
             .render(&bindings)
@@ -786,14 +793,49 @@ pub(super) fn decode_outcome(
         }
         _ => return None,
     };
+    render_outcome(outcome, &bindings, artifact)
+}
+
+pub(super) fn rebind_speculation(
+    host: &dyn Host,
+    recipe: &ProbeRecipe,
+    spec: crate::configure::probe_pool::ChildResult,
+) -> Option<ObservedOutcome> {
+    if compute_probe_key(&spec.recipe) != compute_probe_key(recipe)
+        || recipe.environment != environment_fingerprint(&host.env_all())
+        || spec.journal.verified_inputs(host).is_none()
+    {
+        return None;
+    }
+    let templated = template_outcome(&spec.recipe, &spec.recipe.bindings, &spec.outcome)?;
+    let bindings = recipe.bindings.clone().with_canonical(host);
+    let artifact = match (&templated.artifact, spec.outcome.artifact) {
+        (None, None) => None,
+        (Some(reference), Some(mut artifact)) => {
+            artifact.relative_path = path::to_native(&reference.relative_path.render(&bindings)?);
+            if !is_relative_artifact(&artifact.relative_path) {
+                return None;
+            }
+            Some(artifact)
+        }
+        _ => return None,
+    };
+    render_outcome(templated, &bindings, artifact)
+}
+
+fn render_outcome(
+    outcome: ProbeOutcome,
+    bindings: &super::template::PathBindings,
+    artifact: Option<Artifact>,
+) -> Option<ObservedOutcome> {
     if outcome.diagnostics.len() > MAX_DIAGNOSTICS {
         return None;
     }
-    let output = outcome.output.render(&bindings)?;
+    let output = outcome.output.render(bindings)?;
     let mut remaining = MAX_ARTIFACT_BYTES.checked_sub(output.len())?;
     let mut diagnostics = Vec::with_capacity(outcome.diagnostics.len());
     for diagnostic in outcome.diagnostics {
-        let message = diagnostic.message.render_bounded(&bindings, remaining)?;
+        let message = diagnostic.message.render_bounded(bindings, remaining)?;
         remaining -= message.len();
         diagnostics.push(ProbeDiagnostic {
             stream: diagnostic.stream,
@@ -859,7 +901,7 @@ fn template_outcome(
                 && artifact.bytes.len() <= MAX_ARTIFACT_BYTES
                 && is_relative_artifact(&artifact.relative_path)
                 && (recipe.scope == ReuseScope::ExactBindings
-                    || !bindings.has_leak(&artifact.bytes)) =>
+                    || !bindings.has_path_leak(&artifact.bytes)) =>
         {
             Some(ArtifactRef {
                 blob: Digest::hash(&artifact.bytes),
@@ -877,6 +919,10 @@ fn template_outcome(
         diagnostics,
     })
 }
+
+#[cfg(test)]
+#[path = "cache_test_support.rs"]
+pub(crate) mod test_support;
 
 #[cfg(all(test, unix))]
 #[path = "cache_tests.rs"]

@@ -183,6 +183,9 @@ pub(crate) fn check_network(cx: &Cx<'_>, url: &str, pinned: bool) -> Result<(), 
     transfer::check(cx, url, pinned, None)
 }
 
+#[cfg(all(feature = "native", any(unix, windows)))]
+pub(crate) use transfer::local_file;
+
 pub(crate) fn inherit(cx: &Cx<'_>, interp: &mut Interp) {
     if let Some(host) = cx.session_data::<Arc<HermeticHost>>() {
         interp.add_session_data(host.context.clone());

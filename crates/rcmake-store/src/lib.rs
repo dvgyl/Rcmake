@@ -27,8 +27,8 @@ use serde::{
 pub use digest::{Digest, Domain, KeyHasher};
 pub use gc::{GcReport, gc};
 pub use stamp::{
-    FastStat, InputStamp, MissReason, Trace, VerifyOutcome, directory_digest, file_digest,
-    verify_trace,
+    FastStat, InputStamp, MissReason, Trace, TraceMemo, VerifyOutcome, directory_digest,
+    file_digest, tree_listing_digest, verify_trace,
 };
 
 use frame::{BLOB_MAGIC, ENTRY_LIMIT, ENTRY_MAGIC};
@@ -150,6 +150,7 @@ pub(crate) struct Record<T> {
 pub struct Store<'a> {
     host: &'a dyn Host,
     config: StoreConfig,
+    memo: Option<&'a TraceMemo>,
     rename_fallback: AtomicBool,
     #[cfg(test)]
     test_hook: Option<&'a TestHook<'a>>,
@@ -186,10 +187,25 @@ impl<'a> Store<'a> {
         Ok(Self {
             host,
             config,
+            memo: None,
             rename_fallback: AtomicBool::new(false),
             #[cfg(test)]
             test_hook: None,
         })
+    }
+
+    /// Share file digests with the other trace checks in this session.
+    #[must_use]
+    pub fn with_trace_memo(mut self, memo: &'a TraceMemo) -> Self {
+        self.memo = Some(memo);
+        self
+    }
+
+    fn verify_inputs(&self, trace: &[InputStamp]) -> VerifyOutcome {
+        self.memo.map_or_else(
+            || verify_trace(self.host, trace),
+            |memo| memo.verify(self.host, trace),
+        )
     }
 
     /// Return the configured cache directory.
@@ -353,7 +369,7 @@ impl<'a> Store<'a> {
             {
                 return Ok(PublishOutcome::AlreadyPresent);
             }
-            if verify_trace(self.host, &entry.trace) != VerifyOutcome::Hit {
+            if self.verify_inputs(&entry.trace) != VerifyOutcome::Hit {
                 return Ok(PublishOutcome::Stale);
             }
             locked.publish(&path, &frame, !matches!(previous, CacheRead::Missing))?;
@@ -431,7 +447,7 @@ impl<'a> Store<'a> {
         blob_limit: usize,
         diagnose: bool,
     ) -> HostResult<bool> {
-        if verify_trace(self.host, &entry.trace) != VerifyOutcome::Hit {
+        if self.verify_inputs(&entry.trace) != VerifyOutcome::Hit {
             return Ok(false);
         }
         for &digest in &entry.blobs {
@@ -796,6 +812,14 @@ impl LockedStore<'_, '_> {
                 }
                 Err(error) => return Err(error),
             }
+            if path
+                .ancestors()
+                .nth(2)
+                .and_then(Path::file_name)
+                .is_some_and(|name| name == "probe-v1")
+            {
+                publication_checkpoint(store.host, &temp, bytes);
+            }
             let renamed = if replace {
                 store.host.rename(&temp, path)
             } else {
@@ -847,6 +871,46 @@ impl LockedStore<'_, '_> {
             Err(error) if error.kind == ErrorKind::NotFound => Ok(false),
             Err(error) => Err(error),
         }
+    }
+}
+
+fn publication_checkpoint(host: &dyn Host, staged: &Path, bytes: &[u8]) {
+    static ENTRIES: AtomicU64 = AtomicU64::new(0);
+    if !bytes.starts_with(ENTRY_MAGIC) {
+        return;
+    }
+    let Some(target) = host
+        .env_get(b"RCMAKE_MEASURE_ENTRY")
+        .and_then(|value| std::str::from_utf8(&value).ok()?.parse::<u64>().ok())
+        .filter(|target| *target > 0)
+    else {
+        return;
+    };
+    let Some(arm) = host
+        .env_get(b"RCMAKE_MEASURE_ARM")
+        .map(|value| rcmake_host::path::to_native(&value))
+    else {
+        return;
+    };
+    let Some(checkpoint) = host
+        .env_get(b"RCMAKE_MEASURE_CHECKPOINT")
+        .map(|value| rcmake_host::path::to_native(&value))
+    else {
+        return;
+    };
+    if !arm.is_absolute()
+        || !checkpoint.is_absolute()
+        || !host
+            .metadata(&arm, Follow::No)
+            .is_ok_and(|entry| entry.kind == FileKind::File)
+        || ENTRIES.fetch_add(1, Ordering::Relaxed) != target - 1
+        || host.symlink(staged, &checkpoint).is_err()
+    {
+        return;
+    }
+    let deadline = host.monotonic().saturating_add(Duration::from_secs(60));
+    while host.monotonic() < deadline && host.metadata(&arm, Follow::No).is_ok() {
+        host.sleep(Duration::from_millis(10));
     }
 }
 

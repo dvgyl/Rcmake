@@ -13,6 +13,8 @@ mod generator_env;
 #[cfg(all(feature = "native", any(unix, windows)))]
 mod lookahead;
 #[cfg(all(feature = "native", any(unix, windows)))]
+pub(crate) mod platform_queries;
+#[cfg(all(feature = "native", any(unix, windows)))]
 mod probe_pool;
 mod session;
 pub use session::ConfigureRuntime;

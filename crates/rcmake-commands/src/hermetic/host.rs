@@ -59,10 +59,12 @@ impl Host for HermeticHost {
     }
 
     fn rename(&self, from: &Path, to: &Path) -> HostResult<()> {
+        self.guard_path(from)?;
         self.inner.rename(from, to)
     }
 
     fn rename_noreplace(&self, from: &Path, to: &Path) -> HostResult<()> {
+        self.guard_path(from)?;
         self.inner.rename_noreplace(from, to)
     }
 
@@ -296,6 +298,21 @@ impl HermeticHost {
                 if is_executable(&executable) {
                     return self.inner.canonicalize(&executable).ok();
                 }
+                let extensions = self
+                    .inner
+                    .env_get(b"PATHEXT")
+                    .unwrap_or_else(|| ".EXE;.COM;.BAT;.CMD".into());
+                for extension in extensions.split(|&byte| byte == b';') {
+                    let Some(extension) = extension.strip_prefix(b".").filter(|extension| {
+                        !extension.is_empty() && extension.iter().all(u8::is_ascii_alphanumeric)
+                    }) else {
+                        continue;
+                    };
+                    let executable = file.with_extension(path::to_native(extension));
+                    if is_executable(&executable) {
+                        return self.inner.canonicalize(&executable).ok();
+                    }
+                }
             }
             None
         };
@@ -307,16 +324,44 @@ impl HermeticHost {
         {
             return candidate(cwd.join(program));
         }
-        let path_value = path_value?;
-        #[cfg(any(unix, windows))]
-        let native_path = path::to_native(path_value);
-        #[cfg(any(unix, windows))]
-        let directories = std::env::split_paths(native_path.as_os_str());
-        #[cfg(not(any(unix, windows)))]
-        let directories = path_value.split(|&byte| byte == b':').map(path::to_native);
-        directories
-            .map(|dir| cwd.join(dir).join(program))
-            .find_map(candidate)
+        let from_search_path = |value: &[u8]| {
+            #[cfg(any(unix, windows))]
+            let native_path = path::to_native(value);
+            #[cfg(any(unix, windows))]
+            let directories = std::env::split_paths(native_path.as_os_str());
+            #[cfg(not(any(unix, windows)))]
+            let directories = value.split(|&byte| byte == b':').map(path::to_native);
+            directories
+                .map(|dir| cwd.join(dir).join(program))
+                .find_map(candidate)
+        };
+        if let Some(executable) = path_value.and_then(from_search_path) {
+            return Some(executable);
+        }
+        if self.windows {
+            let exe = self.inner.current_exe().ok();
+            let system_root = self
+                .inner
+                .env_get(b"SYSTEMROOT")
+                .map(|value| path::to_native(&value))
+                .filter(|path| path.is_absolute());
+            let system_directories = system_root
+                .as_ref()
+                .into_iter()
+                .flat_map(|root| [root.join("System32"), root.clone()]);
+            if let Some(resolved) = exe
+                .as_deref()
+                .and_then(Path::parent)
+                .map(Path::to_owned)
+                .into_iter()
+                .chain(system_directories)
+                .find_map(|dir| candidate(dir.join(program)))
+            {
+                return Some(resolved);
+            }
+            return from_search_path(&self.inner.env_get(b"PATH")?);
+        }
+        None
     }
 }
 

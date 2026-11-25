@@ -36,17 +36,24 @@ from oracle_prop_test import clean_environment, executable, run_command, write_j
 WORKERS = 8
 TRIGGERS = {
     "cpath": '#include <rcmake_m6_cpath.h>\n',
-    "lang": "#ifndef RCMAKE_M6_POSIX\n#error Expected POSIX LANG\n#endif\n",
-    "compiler": "#ifndef RCMAKE_M6_SWAP\n#error Expected the new compiler wrapper\n#endif\n",
+    "cpath-add": '#include <rcmake_m6_cpath_add.h>\n',
+    "has-include": ('#if !__has_include(<rcmake_m6_optional.h>)\n'
+                    'int rcmake_m6_header_required = ;\n#endif\n'),
+    "header-shadow": ('#include <limits.h>\n#ifndef RCMAKE_M6_SHADOW\n'
+                      'int rcmake_m6_shadow_required = ;\n#endif\n'),
+    "lang": "#ifndef RCMAKE_M6_POSIX\nint rcmake_m6_posix_required = ;\n#endif\n",
+    "compiler": "#ifndef RCMAKE_M6_SWAP\nint rcmake_m6_wrapper_change_required = ;\n#endif\n",
     "header-root": '#include <rcmake_m6_root.h>\n',
     "header-subdir": '#include <existing/rcmake_m6_subdir.h>\n',
     "library": "int m6_archive(void);\n",
-    "toolchain": "#ifndef RCMAKE_M6_TOOLCHAIN\n#error Expected the new toolchain\n#endif\n",
-    "developer-dir": "#ifndef RCMAKE_M6_DEVELOPER\n#error Expected the new developer directory\n#endif\n",
+    "toolchain": "#ifndef RCMAKE_M6_TOOLCHAIN\nint rcmake_m6_toolchain_change_required = ;\n#endif\n",
+    "developer-dir": "#ifndef RCMAKE_M6_DEVELOPER\nint rcmake_m6_developer_change_required = ;\n#endif\n",
     "transitive": '#include <rcmake_m6_outer.h>\n',
 }
 PROBE_STATUS = b"-- M6 probe results "
 COMPILER_MARKER = b"M6 compiler reached the probe"
+PRIVATE_EVIDENCE = (b".rcmake-compile-dependencies", b".rcmake-link-dependencies",
+                    b".rcmake-source-dependencies", b".rcmake-failed-dependencies")
 SCRATCH_ID = re.compile(rb"\b(?:TryCompile-[A-Za-z0-9]+|cmTC_[A-Za-z0-9]+)\b")
 PANIC = re.compile(rb"(?im)thread [^\n]+ panicked at|(?:^|\n)fatal runtime error:|RUST_BACKTRACE")
 PARITY_KEYS = ("result", "probe stdout", "stdout", "stderr")
@@ -148,7 +155,19 @@ string(REPLACE "\\n" " " display "${{results}}")
 message(STATUS "M6 probe results ${{display}}")
 """
     (case.source / "leaf/CMakeLists.txt").write_text(leaf, encoding="utf-8")
+    backdate(*root.rglob("*"), root)
     return case
+
+
+def backdate(*paths: Path) -> None:
+    """Model inputs that existed before the build.
+
+    Rcmake does not publish a probe that read a file or directory changed
+    within its 2 s timestamp window.
+    """
+    old = time.time() - 10
+    for path in paths:
+        os.utime(path, (old, old), follow_symlinks=False)
 
 
 def environment(case: Fixture, store: Path) -> dict[str, str]:
@@ -191,8 +210,15 @@ def output(result: dict, case: Fixture, build: Path, args, env: dict) -> dict:
         raise ValueError(f"Invalid probe results in {result_file}.")
     logs = []
     copies = []
+    configure_log = build / "CMakeFiles/CMakeConfigureLog.yaml"
+    if configure_log.is_file():
+        contents = configure_log.read_bytes()
+        if any(name in contents for name in PRIVATE_EVIDENCE):
+            raise ValueError("The configure log contains private probe evidence flags.")
     for index, value in enumerate(values, 1):
         log = (build / f"probe-{index}.log").read_bytes()
+        if any(name in log for name in PRIVATE_EVIDENCE):
+            raise ValueError(f"OUTPUT_VARIABLE contains private probe evidence flags for probe {index}.")
         if COMPILER_MARKER not in log:
             raise ValueError(f"OUTPUT_VARIABLE did not contain the compiler output for probe {index}.")
         logs.append(SCRATCH_ID.sub(b"<PROBE>", normalize(log, case.source, build)))
@@ -244,9 +270,13 @@ def change_input(name: str, case: Fixture, env: dict, args) -> None:
         "header-root": "include/rcmake_m6_root.h",
         "header-subdir": "include/existing/rcmake_m6_subdir.h",
         "transitive": "include/existing/rcmake_m6_inner.h",
+        "cpath-add": "empty/rcmake_m6_cpath_add.h",
+        "has-include": "include/rcmake_m6_optional.h",
     }
     if name in headers:
         (case.root / headers[name]).write_text("#define RCMAKE_M6_HEADER 1\n", encoding="utf-8")
+    elif name == "header-shadow":
+        (case.root / "include/limits.h").write_text("#define RCMAKE_M6_SHADOW 1\n", encoding="utf-8")
     elif name == "cpath":
         env["CPATH"] = str(case.root / "alternate")
     elif name == "lang":
@@ -278,8 +308,9 @@ def invalidation(args, root: Path, name: str, row: dict) -> None:
         (root / "alternate/rcmake_m6_cpath.h").write_text(
             "#define RCMAKE_M6_HEADER 1\n", encoding="utf-8")
     if name == "transitive":
-        (root / "include/rcmake_m6_outer.h").write_text(
-            "#include <existing/rcmake_m6_inner.h>\n", encoding="utf-8")
+        outer = root / "include/rcmake_m6_outer.h"
+        outer.write_text("#include <existing/rcmake_m6_inner.h>\n", encoding="utf-8")
+        backdate(outer, outer.parent)
     store = root / "store"
     env = environment(case, store)
     if name == "developer-dir":
@@ -443,7 +474,8 @@ def probe_entry(decoded: bytes, path: Path, blobs: dict) -> tuple[str, int] | No
         trace, references, payload = entry["trace"], entry["blobs"], entry["payload"]
         if not isinstance(trace, list) or not all(
                 isinstance(stamp, dict) and len(stamp) == 1 and isinstance(next(iter(stamp.values())), dict)
-                and next(iter(stamp)) in ("FileStat", "FileHash", "DirEntries", "Missing", "EnvVar", "NegativeLookup")
+                and next(iter(stamp)) in ("FileStat", "FileHash", "DirEntries", "TreeListing", "Missing", "EnvVar",
+                                     "NegativeLookup")
                 for stamp in trace):
             raise ValueError("Invalid trace.")
         checks = payload["checks"]
@@ -574,86 +606,13 @@ def concurrency(args, root: Path, row: dict) -> None:
 
 # Stop at the close of an entry's staging file. Store publication calls
 # rename after this close. The checkpoint is an atomic symlink to that file.
-PUBLICATION_HOOK = r"""
-#define _GNU_SOURCE
-#include <fcntl.h>
-#include <limits.h>
-#include <stdatomic.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <unistd.h>
-#ifndef __APPLE__
-#include <dlfcn.h>
-#endif
-
-static _Atomic unsigned entries;
-
-static void before_close(int fd, int (*real_close)(int)) {
-    const char *arm = getenv("RCMAKE_MEASURE_ARM");
-    if (!arm || access(arm, F_OK) != 0) return;
-    const char *prefix = getenv("RCMAKE_MEASURE_TMP");
-    const char *checkpoint = getenv("RCMAKE_MEASURE_CHECKPOINT");
-    const char *entry = getenv("RCMAKE_MEASURE_ENTRY");
-    if (!prefix || !checkpoint || !entry) return;
-    char path[PATH_MAX];
-#ifdef __APPLE__
-    if (fcntl(fd, F_GETPATH, path) != 0) return;
-#else
-    char proc_fd[64];
-    snprintf(proc_fd, sizeof proc_fd, "/proc/self/fd/%d", fd);
-    ssize_t size = readlink(proc_fd, path, sizeof path - 1);
-    if (size < 0 || size == sizeof path - 1) return;
-    path[size] = '\0';
-#endif
-    if (strncmp(path, prefix, strlen(prefix)) != 0) return;
-    int staged = open(path, O_RDONLY | O_CLOEXEC);
-    if (staged < 0) return;
-    char magic[8];
-    ssize_t length = read(staged, magic, sizeof magic);
-    real_close(staged);
-    if (length != sizeof magic || memcmp(magic, "RCMENTRY", sizeof magic) != 0) return;
-    unsigned target = (unsigned)strtoul(entry, NULL, 10);
-    if (atomic_fetch_add(&entries, 1) + 1 == target && symlink(path, checkpoint) == 0) {
-        for (;;) pause();
-    }
-}
-
-#ifdef __APPLE__
-static int checkpoint_close(int fd) {
-    before_close(fd, close);
-    return close(fd);
-}
-__attribute__((used, section("__DATA,__interpose")))
-static const void *const interpose[] = {checkpoint_close, close};
-#else
-int close(int fd) {
-    int (*real_close)(int) = dlsym(RTLD_NEXT, "close");
-    before_close(fd, real_close);
-    return real_close(fd);
-}
-#endif
-"""
-
-
-def publication_hook(args, case: Fixture, store: Path, env: dict, target: int) -> Path:
-    """Build and arm a checkpoint for one store entry publication."""
-    source = case.root / "publication.c"
-    library = case.root / "publication-hook.so"
-    source.write_text(PUBLICATION_HOOK, encoding="utf-8")
-    flags = ["-dynamiclib"] if sys.platform == "darwin" else ["-shared", "-fPIC"]
-    libs = [] if sys.platform == "darwin" else ["-ldl"]
-    result = run_command([case.compiler, *flags, source, "-o", library, *libs], case.root,
-                         args.timeout, env)
-    if result["error"] or result["returncode"]:
-        raise ValueError(f"Could not build the publication checkpoint. {result}")
-    loader = "DYLD_INSERT_LIBRARIES" if sys.platform == "darwin" else "LD_PRELOAD"
+def publication_hook(case: Fixture, env: dict, target: int) -> Path:
+    """Arm a checkpoint after staging a probe entry and before publishing it."""
     arm = case.root / "armed"
     checkpoint = case.root / "checkpoint"
     arm.touch()
-    env.update({loader: str(library), "RCMAKE_MEASURE_ARM": str(arm),
-                "RCMAKE_MEASURE_TMP": str(store / "tmp") + os.sep,
-                "RCMAKE_MEASURE_CHECKPOINT": str(checkpoint), "RCMAKE_MEASURE_ENTRY": str(target)})
+    env.update(RCMAKE_MEASURE_ARM=str(arm), RCMAKE_MEASURE_CHECKPOINT=str(checkpoint),
+               RCMAKE_MEASURE_ENTRY=str(target))
     return checkpoint
 
 
@@ -695,7 +654,7 @@ def crash_recovery(args, root: Path, row: dict) -> None:
     env = environment(case, store)
     oracle, _ = configure(args, case, "oracle", env, oracle=True)
     check_result(oracle, True, probes)
-    checkpoint = publication_hook(args, case, store, env, intact + 1)
+    checkpoint = publication_hook(case, env, intact + 1)
     victim = interrupt(args, case, env, checkpoint)
     Path(env["RCMAKE_MEASURE_ARM"]).unlink()
     stage = checkpoint.readlink()

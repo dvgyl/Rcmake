@@ -15,6 +15,7 @@ mod runtime;
 pub(crate) use archive::prepare_archive;
 pub(crate) use git::{after_process, before_process};
 pub(crate) use runtime::FetchRuntime;
+pub(crate) use runtime::{check_unmatched_url, check_upload};
 
 use rcmake_base::{
     BString,
@@ -659,6 +660,11 @@ mod tests {
         let url = "https://example.org/b";
         let md5 = "900150983cd24fb0d6963f7d28e17f72";
         let mirrors = format!("https://example.org/a;{url}");
+        let destination = if cfg!(windows) {
+            "C:/destination"
+        } else {
+            "/destination"
+        };
         let input = args(&[
             "Pkg",
             "URL",
@@ -666,7 +672,7 @@ mod tests {
             "URL_MD5",
             md5,
             "SOURCE_DIR",
-            "/destination",
+            destination,
         ]);
         assert!(session.observe(&input)?.is_some());
         assert!(session.observe(&input)?.is_none());

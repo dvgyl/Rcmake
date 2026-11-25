@@ -5,7 +5,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::ErrorKind;
 use std::path::{Component, Path, PathBuf};
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use jiff::tz::TimeZone;
@@ -17,19 +17,19 @@ use rcmake_host::{
     RunRequest, Stream, SystemInfo, WriteMode, path,
 };
 use rcmake_store::{
-    Digest, Domain, InputStamp, KeyHasher, Trace, VerifyOutcome, directory_digest, file_digest,
-    verify_trace,
+    Digest, Domain, InputStamp, KeyHasher, Trace, TraceMemo, VerifyOutcome, directory_digest,
+    file_digest, verify_trace,
 };
 use serde::{Deserialize, Serialize};
 
 use super::plan::{environment_fingerprint, request_digest};
-use depfile::missing_input_diagnostic;
 use host_impl::SharedOrBorrowed;
 
 #[path = "depfile.rs"]
 pub(super) mod depfile;
 #[path = "journal_host.rs"]
 mod host_impl;
+mod process;
 
 /// Total time budget for one queued and running speculative job.
 pub(crate) const SPECULATIVE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -104,6 +104,11 @@ pub(crate) struct SearchObservation {
 /// step verifies fresh dependency evidence from the completed request. A depfile
 /// alone cannot certify the complete process tree.
 pub(crate) trait ProcessVerifier: Send + Sync {
+    /// Return a certified platform query sampled during this configure.
+    fn recorded_platform_query(&self, _request: &RunRequest) -> Option<RunOutput> {
+        None
+    }
+
     /// Request dependency evidence from a known tool.
     fn instrument(&self, _request: &mut RunRequest) {}
 
@@ -126,6 +131,7 @@ enum StampKey {
     Stat(PathBuf),
     File(PathBuf),
     Directory(PathBuf),
+    Tree(PathBuf),
     Missing(PathBuf),
     Env(Vec<u8>),
     Lookup(PathBuf, PathBuf),
@@ -137,6 +143,7 @@ impl From<&InputStamp> for StampKey {
             InputStamp::FileStat { path, .. } => Self::Stat(path.clone()),
             InputStamp::FileHash { path, .. } => Self::File(path.clone()),
             InputStamp::DirEntries { path, .. } => Self::Directory(path.clone()),
+            InputStamp::TreeListing { path, .. } => Self::Tree(path.clone()),
             InputStamp::Missing { path } => Self::Missing(path.clone()),
             InputStamp::EnvVar { name, .. } => Self::Env(name.clone()),
             InputStamp::NegativeLookup { root, relative, .. } => {
@@ -356,10 +363,11 @@ impl JournalChecks {
 /// Evidence collected from one execution. Raw environment values stay in memory.
 pub(crate) struct Journal {
     trace: Trace,
+    memo: Option<Arc<TraceMemo>>,
     checks: JournalChecks,
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     environment: BTreeMap<Vec<u8>, Option<BString>>,
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     full_environment: Option<Vec<(BString, BString)>>,
     processes: Vec<RunRequest>,
     output: Vec<(Stream, Vec<u8>)>,
@@ -373,13 +381,13 @@ impl Journal {
     }
 
     /// Return recorded scalar environment reads, including absent values.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn environment(&self) -> &BTreeMap<Vec<u8>, Option<BString>> {
         &self.environment
     }
 
     /// Return the exact environment from the first enumeration.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn full_environment(&self) -> Option<&[(BString, BString)]> {
         self.full_environment.as_deref()
     }
@@ -398,9 +406,16 @@ impl Journal {
     pub(crate) fn verified_inputs(&self, host: &dyn Host) -> Option<(&Trace, &JournalChecks)> {
         (self.impure.is_none()
             && self.checks.verify(host)
-            && verify_trace(host, &self.trace) == VerifyOutcome::Hit)
+            && verify_inputs(host, &self.trace, self.memo.as_deref()) == VerifyOutcome::Hit)
             .then_some((&self.trace, &self.checks))
     }
+}
+
+fn verify_inputs(host: &dyn Host, trace: &[InputStamp], memo: Option<&TraceMemo>) -> VerifyOutcome {
+    memo.map_or_else(
+        || verify_trace(host, trace),
+        |memo| memo.verify(host, trace),
+    )
 }
 
 /// Host adapter for a single probe.
@@ -413,7 +428,11 @@ pub(crate) struct JournalHost<'a> {
     canonical_scratch: PathBuf,
     mode: JournalMode,
     verify_process: Option<SharedOrBorrowed<'a, dyn ProcessVerifier + 'a>>,
+    memo: Option<Arc<TraceMemo>>,
     speculation: Option<Speculation>,
+    sorted_listings: bool,
+    /// Files whose contents the probe key binds. Reads do not stamp them.
+    bound: BTreeSet<PathBuf>,
     state: Mutex<State>,
 }
 
@@ -466,9 +485,33 @@ impl<'a> JournalHost<'a> {
             canonical_scratch,
             mode,
             verify_process,
+            memo: None,
             speculation: None,
+            sorted_listings: false,
+            bound: BTreeSet::new(),
             state: Mutex::default(),
         })
+    }
+
+    /// Skip read evidence for files whose contents the probe key binds.
+    ///
+    /// The key binds the generated platform files with their paths templated.
+    /// Compiler identification rewrites them after the ABI probe, so a stamp
+    /// on the absolute path would reject a later relocated hit.
+    pub(super) fn with_bound_inputs(mut self, files: BTreeSet<PathBuf>) -> Self {
+        self.bound = files;
+        self
+    }
+
+    /// Return whether reads of the path need no evidence.
+    fn unobserved_read(&self, path: &Path) -> bool {
+        self.private_path(path) || self.bound.contains(path)
+    }
+
+    pub(super) fn with_trace_memo(mut self, memo: Arc<TraceMemo>) -> Self {
+        self.memo = Some(memo);
+        self.sorted_listings = true;
+        self
     }
 
     /// Use the owned job environment and the session's speculative deadline.
@@ -497,7 +540,7 @@ impl<'a> JournalHost<'a> {
     }
 
     fn record_dependency_since(&self, path: &Path, cutoff: Option<i128>) -> HostResult<()> {
-        if !is_absolute(path) {
+        if !path.is_absolute() {
             return Err(HostError::not_absolute(path.to_owned()));
         }
         if self.private_path(path) {
@@ -515,7 +558,10 @@ impl<'a> JournalHost<'a> {
         }) {
             self.mark_impure(ImpureReason::ChangedInput);
         }
-        let result = file_digest(&*self.inner, path);
+        let result = self.memo.as_ref().map_or_else(
+            || file_digest(&*self.inner, path),
+            |memo| memo.file_digest(&*self.inner, path),
+        );
         if let Ok(digest) = result {
             let mut state = self.state();
             state.check(Check::Canonical(path.to_owned()), path_digest(&canonical));
@@ -538,7 +584,7 @@ impl<'a> JournalHost<'a> {
     ///
     /// A miss stamps the deepest existing directory. A missing search root
     /// gets its own stamp, so creating it also invalidates the result.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn record_search(&self, root: &Path, relative: &Path) -> HostResult<bool> {
         self.record_search_since(root, relative, None)
     }
@@ -726,192 +772,6 @@ impl<'a> JournalHost<'a> {
             let index = state.processes.len() as u32;
             state.check(Check::Request(index), request_digest(request));
             state.processes.push(request.clone());
-        }
-    }
-
-    fn limit_speculative_request(&self, request: &mut RunRequest) -> HostResult<()> {
-        let Some(spec) = &self.speculation else {
-            return Ok(());
-        };
-        let remaining = spec.deadline.saturating_duration_since(speculative_now());
-        if spec.cancel.is_cancelled() || spec.shutdown.is_cancelled() || remaining.is_zero() {
-            self.mark_impure(ImpureReason::ProcessFailure);
-            return Err(HostError::unsupported(
-                "Speculative probe was cancelled or expired.",
-            ));
-        }
-        request.timeout = Some(
-            request
-                .timeout
-                .map_or(remaining, |timeout| timeout.min(remaining)),
-        );
-        Ok(())
-    }
-
-    fn process_request<'request>(
-        &self,
-        request: &'request RunRequest,
-    ) -> HostResult<std::borrow::Cow<'request, RunRequest>> {
-        use std::borrow::Cow;
-
-        let mut request = Cow::Borrowed(request);
-        if let Some(spec) = &self.speculation {
-            let request = request.to_mut();
-            request.env.clone_from(&spec.environment);
-            self.limit_speculative_request(request)?;
-        }
-        if let Some(verifier) = self.verify_process.as_deref() {
-            verifier.instrument(request.to_mut());
-        }
-        if let Err(error) = self.before_process(&request) {
-            self.record_request(&request);
-            return Err(error);
-        }
-        if let Cow::Owned(request) = &mut request {
-            self.limit_speculative_request(request)?;
-        }
-        self.record_request(&request);
-        if self.mode == JournalMode::Speculate && self.state().impure.is_some() {
-            return Err(HostError::unsupported(
-                "Cannot verify speculative probe inputs.",
-            ));
-        }
-        Ok(request)
-    }
-
-    fn before_process(&self, request: &RunRequest) -> HostResult<()> {
-        if let Input::File(path) = &request.stdin {
-            self.record_dependency(path)
-                .or_else(|_| self.guard_effect(ImpureReason::UnverifiableInput))?;
-        }
-        for output in [&request.stdout, &request.stderr] {
-            if let Output::File { path, .. } = output {
-                self.guard_write(path)?;
-            }
-        }
-
-        let bounded = request.timeout.is_some_and(|time| {
-            !time.is_zero() && (self.mode == JournalMode::Observe || time <= SPECULATIVE_TIMEOUT)
-        });
-        let private = self.private_path(&request.cwd)
-            && request.stdin != Input::Inherit
-            && request.stdout != Output::Inherit
-            && request.stderr != Output::Inherit
-            && (self.mode == JournalMode::Observe || !request.tee);
-        if !bounded || !private {
-            return self.guard_effect(ImpureReason::UnverifiedProcess);
-        }
-        let Some(trace) = self
-            .verify_process
-            .as_deref()
-            .and_then(|verify| verify.preflight(request))
-        else {
-            return self.guard_effect(ImpureReason::UnverifiedProcess);
-        };
-        // A pipeline needs separate evidence for every stage.
-        if request.pipeline.len() != 1 {
-            return self.guard_effect(ImpureReason::UnverifiedProcess);
-        }
-        for command in &request.pipeline {
-            let program = path::to_native(&command.program);
-            if !is_absolute(&program) || self.record_dependency(&program).is_err() {
-                return self.guard_effect(ImpureReason::UnverifiedProcess);
-            }
-        }
-        if trace
-            .iter()
-            .any(|stamp| matches!(stamp, InputStamp::FileStat { .. }))
-            || verify_trace(&*self.inner, &trace) != VerifyOutcome::Hit
-        {
-            return self.guard_effect(ImpureReason::ChangedInput);
-        }
-        for stamp in &trace {
-            if let InputStamp::FileHash { path, .. } = stamp
-                && self.record_dependency(path).is_err()
-            {
-                return self.guard_effect(ImpureReason::UnverifiedProcess);
-            }
-        }
-        let mut state = self.state();
-        for stamp in trace {
-            state.stamp(stamp);
-        }
-        Ok(())
-    }
-
-    fn after_process(&self, request: &RunRequest, spawn: FileTime, result: &HostResult<RunOutput>) {
-        let Ok(output) = result else {
-            self.mark_impure(ImpureReason::ProcessFailure);
-            return;
-        };
-        if output.results.len() != request.pipeline.len()
-            || !output
-                .results
-                .iter()
-                .all(|result| matches!(result, ProcessResult::Exited(_)))
-        {
-            self.mark_impure(ImpureReason::ProcessFailure);
-            return;
-        }
-        let Some(verifier) = self.verify_process.as_deref() else {
-            self.mark_impure(ImpureReason::UnverifiedProcess);
-            return;
-        };
-        let Some(closure) = verifier.dependencies(request, output) else {
-            self.mark_impure(ImpureReason::UnverifiedProcess);
-            return;
-        };
-        let only_tools = closure.files.iter().all(|file| {
-            request
-                .pipeline
-                .iter()
-                .any(|command| path::to_native(&command.program) == *file)
-        });
-        if (only_tools && closure.searches.is_empty())
-            || closure.files.len().saturating_add(closure.searches.len()) > MAX_OBSERVATIONS
-        {
-            self.mark_impure(ImpureReason::UnverifiedProcess);
-            return;
-        }
-        let failed = output
-            .results
-            .iter()
-            .any(|result| matches!(result, ProcessResult::Exited(code) if *code != 0));
-        if failed
-            && missing_input_diagnostic(output)
-            && !closure.searches.iter().any(|search| !search.found)
-        {
-            self.mark_impure(ImpureReason::UnverifiedProcess);
-            return;
-        }
-        let cutoff = time_nanos(spawn) - verifier.timestamp_granularity().as_nanos() as i128;
-        for file in &closure.files {
-            if self.record_dependency_since(file, Some(cutoff)).is_err() {
-                self.mark_impure(ImpureReason::UnverifiableInput);
-            }
-        }
-        for search in &closure.searches {
-            if self.record_search_since(&search.root, &search.relative, Some(cutoff))
-                != Ok(search.found)
-            {
-                self.mark_impure(ImpureReason::ChangedInput);
-            }
-        }
-        // Include preflight dependencies and inputs recorded by earlier stages.
-        let state = self.state();
-        let racy = state.stamps.values().any(|stamp| {
-            let path = match stamp {
-                InputStamp::FileHash { path, .. } | InputStamp::DirEntries { path, .. } => path,
-                InputStamp::NegativeLookup { deepest, .. } => deepest,
-                _ => return false,
-            };
-            self.inner
-                .metadata(path, Follow::Yes)
-                .map_or(true, |meta| time_nanos(meta.mtime) >= cutoff)
-        });
-        drop(state);
-        if racy {
-            self.mark_impure(ImpureReason::ChangedInput);
         }
     }
 }

@@ -197,8 +197,9 @@ impl HermeticPolicy {
     ) -> Option<PathBuf> {
         resolve_path(host, path).filter(|path| {
             let contains = |root: &Path| {
-                path.starts_with(root)
-                    || (self.case_insensitive_roots && same_root(host, path, root))
+                let (path, root) = (windows_path_spelling(path), windows_path_spelling(root));
+                path.starts_with(root.as_ref())
+                    || (self.case_insensitive_roots && same_root(host, &path, &root))
             };
             self.roots.iter().any(|root| contains(root))
                 || fetch_cache
@@ -213,6 +214,22 @@ impl HermeticPolicy {
                 .canonicalize(path)
                 .is_ok_and(|path| self.programs.contains(&path))
     }
+}
+
+/// Return a drive or network path without its verbatim Windows prefix.
+pub fn windows_path_spelling(path: &Path) -> std::borrow::Cow<'_, Path> {
+    use std::borrow::Cow;
+    if cfg!(windows)
+        && let Some(text) = path.to_str().and_then(|text| text.strip_prefix(r"\\?\"))
+    {
+        if let Some(network) = text.strip_prefix(r"UNC\") {
+            return Cow::Owned(PathBuf::from(format!(r"\\{network}")));
+        }
+        if matches!(text.as_bytes(), [drive, b':', b'\\', ..] if drive.is_ascii_alphabetic()) {
+            return Cow::Borrowed(Path::new(text));
+        }
+    }
+    Cow::Borrowed(path)
 }
 
 fn same_root(host: &dyn Host, path: &Path, root: &Path) -> bool {

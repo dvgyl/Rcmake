@@ -170,7 +170,23 @@ impl PathBindings {
 
     /// Detect a binding that remains in a literal or executable.
     pub(crate) fn has_leak(&self, bytes: &[u8]) -> bool {
+        self.leaks(bytes, true)
+    }
+
+    /// Detect a path binding that remains in a compiled artifact.
+    ///
+    /// CMake gives each probe target a random name, and Apple linkers sign an
+    /// executable with that name. No caller can depend on the name in the
+    /// artifact, but an embedded path can change behavior after relocation.
+    pub(crate) fn has_path_leak(&self, bytes: &[u8]) -> bool {
+        self.leaks(bytes, false)
+    }
+
+    fn leaks(&self, bytes: &[u8], target: bool) -> bool {
         self.0.iter().any(|(&token, value)| {
+            if token == Token::Target && !target {
+                return false;
+            }
             spellings(token, value).into_iter().any(|(_, spelling)| {
                 let insensitive =
                     (cfg!(windows) || cfg!(target_os = "macos")) && token != Token::Target;
@@ -410,14 +426,49 @@ fn delimiter(byte: u8) -> bool {
         )
 }
 
-fn boundary(bytes: &[u8], offset: usize, len: usize, token: Token) -> bool {
+fn boundary(
+    bytes: &[u8],
+    offset: usize,
+    len: usize,
+    token: Token,
+    object_directory: Option<&[u8]>,
+) -> bool {
     let previous = offset
         .checked_sub(1)
         .and_then(|index| bytes.get(index))
         .copied();
     let next = bytes.get(offset + len).copied();
     let separator = |byte| matches!(byte, b'/' | b'\\');
-    previous.is_none_or(|byte| delimiter(byte) || (token == Token::Target && separator(byte)))
+    let inside_object_name = matches!(
+        token,
+        Token::Source
+            | Token::NativeSource
+            | Token::CanonicalSource
+            | Token::AlternateSource
+            | Token::CmakeRoot
+            | Token::NativeCmakeRoot
+            | Token::CanonicalCmakeRoot
+            | Token::AlternateCmakeRoot
+    ) && object_directory.is_some_and(|directory| {
+        bytes
+            .get(..offset)
+            .is_some_and(|prefix| prefix.rsplit(|&byte| delimiter(byte)).next() == Some(directory))
+    });
+    // An attached option such as `-I` or `-isystem` starts a path argument.
+    let attached_option = token != Token::Target
+        && bytes.get(..offset).is_some_and(|prefix| {
+            prefix
+                .rsplit(|&byte| delimiter(byte))
+                .next()
+                .and_then(|word| word.strip_prefix(b"-"))
+                .is_some_and(|name| {
+                    (1..=16).contains(&name.len()) && name.iter().all(u8::is_ascii_alphabetic)
+                })
+        });
+    (inside_object_name
+        || attached_option
+        || previous
+            .is_none_or(|byte| delimiter(byte) || (token == Token::Target && separator(byte))))
         && next.is_none_or(|byte| {
             delimiter(byte) || separator(byte) || (token == Token::Target && byte == b'.')
         })
@@ -457,13 +508,23 @@ impl Templated {
         let mut segments = Vec::new();
         let mut literal = Vec::new();
         let mut rest = bytes;
+        let object_directory = bindings
+            .0
+            .get(&Token::Target)
+            .map(|target| [b"CMakeFiles/".as_slice(), target, b".dir"].concat());
         while let Some((&byte, tail)) = rest.split_first() {
             let offset = bytes.len() - rest.len();
             if let Some((value, tokens)) = matches.iter().find(|(value, tokens)| {
                 rest.starts_with(value)
-                    && tokens
-                        .iter()
-                        .all(|binding| boundary(bytes, offset, value.len(), binding.token))
+                    && tokens.iter().all(|binding| {
+                        boundary(
+                            bytes,
+                            offset,
+                            value.len(),
+                            binding.token,
+                            object_directory.as_deref(),
+                        )
+                    })
             }) {
                 if !literal.is_empty() {
                     segments.push(Segment::Literal(std::mem::take(&mut literal)));
@@ -590,6 +651,33 @@ mod tests {
             &root.join("cmake"),
         )?
         .with_target(b"cmTC_1")
+    }
+
+    #[test]
+    fn artifact_path_leaks_ignore_the_probe_target_name() -> Result<(), &'static str> {
+        let paths = bindings(Path::new("/old")).ok_or("Missing bindings.")?;
+        assert!(paths.has_leak(b"\0cmTC_1\0"));
+        assert!(!paths.has_path_leak(b"\0cmTC_1\0"));
+        assert!(paths.has_path_leak(b"\0/old/build/scratch/x.o\0"));
+        Ok(())
+    }
+
+    #[test]
+    fn attached_options_rebind_paths_and_keep_other_words() -> Result<(), &'static str> {
+        let old = bindings(Path::new("/old")).ok_or("Missing original bindings.")?;
+        let new = bindings(Path::new("/new")).ok_or("Missing new bindings.")?;
+        let original = b"cc -I/old/source/inc -isystem/old/cmake/x -L/old/build x/old/source";
+        let template = Templated::capture(original, &old).ok_or("Cannot capture output.")?;
+        let rendered = template.render(&new).ok_or("Cannot render output.")?;
+        assert_eq!(
+            rendered.as_slice(),
+            b"cc -I/new/source/inc -isystem/new/cmake/x -L/new/build x/old/source".as_slice()
+        );
+        assert!(template.has_leak(&old));
+        let attached = Templated::capture(b"-I/old/source/inc -D1/old/source", &old)
+            .ok_or("Cannot capture attached output.")?;
+        assert!(attached.has_leak(&old));
+        Ok(())
     }
 
     #[test]

@@ -112,6 +112,9 @@ impl Cx<'_> {
 
     /// Insert a cache entry and record the write if history is enabled.
     pub fn insert_cache_entry(&mut self, name: BString, entry: CacheEntry) {
+        if let Some(observed) = &mut self.interp.replay_observations {
+            observed.cache.insert(name.clone());
+        }
         self.interp
             .record_var_write(&name, crate::VarOp::CacheSet, Some(&entry.value));
         self.cache().insert(name, entry);
@@ -120,6 +123,9 @@ impl Cx<'_> {
     /// Remove an existing cache entry and record the write if history is enabled.
     pub fn remove_cache_entry(&mut self, name: &[u8]) {
         if self.cache().get(name).is_some() {
+            if let Some(observed) = &mut self.interp.replay_observations {
+                observed.cache.insert(name.into());
+            }
             self.interp
                 .record_var_write(name, crate::VarOp::CacheUnset, None);
             self.cache().remove(name);
@@ -239,36 +245,42 @@ impl Cx<'_> {
     /// Look up a normal variable (falling back to cache). Notifies variable watches
     /// (`READ_ACCESS` or `UNKNOWN_READ_ACCESS`).
     pub fn var(&mut self, name: &[u8]) -> Option<BString> {
+        self.interp.observe_replay_variable_access(name);
         self.interp.read_var(name)
     }
 
     /// Look up a normal variable only (no cache fallback).
     #[must_use]
     pub fn var_normal_only(&self, name: &[u8]) -> Option<BString> {
+        self.interp.observe_replay_variable(name);
         self.interp.vars.get(name).cloned()
     }
 
     /// Innermost normal binding of `name` (`None` if no scope binds it).
     #[must_use]
     pub fn binding(&self, name: &[u8]) -> Option<Binding> {
+        self.interp.observe_replay_variable(name);
         self.interp.vars.lookup(name).cloned()
     }
 
     /// `if(DEFINED name)`: a normal binding or a cache entry exists.
     #[must_use]
     pub fn var_defined(&self, name: &[u8]) -> bool {
+        self.interp.observe_replay_variable(name);
         self.interp.vars.get(name).is_some() || self.interp.project.cache.contains(name)
     }
 
     /// Value of `name` or an empty string (`GetSafeDefinition`).
     #[must_use]
     pub fn var_or_empty(&self, name: &[u8]) -> BString {
+        self.interp.observe_replay_variable_access(name);
         self.interp.lookup_var(name).cloned().unwrap_or_default()
     }
 
     /// `true` if the value of `name` is a true constant (`cmMakefile::IsOn`).
     #[must_use]
     pub fn var_is_on(&self, name: &[u8]) -> bool {
+        self.interp.observe_replay_variable_access(name);
         self.interp
             .lookup_var(name)
             .is_some_and(|v| rcmake_base::truth::is_on(v))
@@ -292,6 +304,9 @@ impl Cx<'_> {
                 .error_here(b"Variable value exceeded maximum allowed byte length.".into());
             self.interp.fatal = true;
             return;
+        }
+        if let Some(observed) = &mut self.interp.replay_observations {
+            observed.vars.insert(name.into());
         }
         self.interp.define(name, value);
     }
@@ -333,6 +348,9 @@ impl Cx<'_> {
     /// Unset a normal variable in the current scope. Notifies variable watches
     /// (`REMOVED_ACCESS`).
     pub fn unset_var(&mut self, name: &[u8]) {
+        if let Some(observed) = &mut self.interp.replay_observations {
+            observed.vars.insert(name.into());
+        }
         self.interp.undefine(name);
     }
 
@@ -342,6 +360,7 @@ impl Cx<'_> {
     /// `Cannot set "<name>": current scope has no parent.`. Otherwise this notifies
     /// variable watches (`MODIFIED_ACCESS`).
     pub fn set_parent_scope(&mut self, name: &[u8], value: Option<BString>) {
+        self.interp.mark_replay_opaque();
         self.interp.raise_var(name, value);
     }
 
@@ -896,7 +915,25 @@ impl Cx<'_> {
         command: &[u8],
         args: &[Argument],
     ) -> bool {
-        self.interp.queue_deferred(dir, id, command, args)
+        let queued = self.interp.queue_deferred(dir, id, command, args);
+        if queued && self.interp.replay_observations.is_some() {
+            if dir == DirId::ROOT
+                && command == b"target_link_libraries"
+                && matches!(args, [arg] if arg.kind == rcmake_syntax::ArgKind::Bracket
+                    && arg.text == crate::journal::REPLAY_LINK_CHECK)
+            {
+                let origin = crate::journal::PropertyOrigin::new(
+                    self.current_binary_dir(),
+                    &self.backtrace(),
+                );
+                if let Some(observed) = &mut self.interp.replay_observations {
+                    observed.link_check = Some(origin);
+                }
+            } else {
+                self.interp.mark_replay_opaque();
+            }
+        }
+        queued
     }
 
     /// Identifiers of the queued calls that are not canceled, in queue order. `None`

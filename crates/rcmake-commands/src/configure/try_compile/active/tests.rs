@@ -46,7 +46,9 @@ impl Fixture {
             executable,
             "/usr/bin/xcrun".into(),
             "/usr/bin/cc".into(),
+            "/usr/bin/c++".into(),
             Path::new(TOOLCHAIN).join("clang"),
+            Path::new(TOOLCHAIN).join("clang++"),
             Path::new(TOOLCHAIN).join("ld"),
             Path::new(SDK).join("SDKSettings.json"),
             Path::new(SDK).join("usr/lib/libSystem.tbd"),
@@ -71,7 +73,20 @@ impl Fixture {
                     .ok_or_else(|| HostError::unsupported("Expected a tool name."))?;
                 return Ok(success(format!("{TOOLCHAIN}/{tool}\n").into_bytes()));
             }
-            if command.program != "/usr/bin/cc" {
+            if command.program == format!("{TOOLCHAIN}/clang").as_str()
+                || command.program == format!("{TOOLCHAIN}/clang++").as_str()
+            {
+                let data = match command.args.as_slice() {
+                    [flag] if flag == "-print-resource-dir" => {
+                        b"/fixture/clang/resource\n".to_vec()
+                    }
+                    [flag] if flag == "-print-target-triple" => b"arm64-apple-darwin\n".to_vec(),
+                    [flag] if flag == "-v" => Vec::new(),
+                    _ => return Err(HostError::unsupported("Unexpected compiler query.")),
+                };
+                return Ok(success(data));
+            }
+            if command.program != "/usr/bin/cc" && command.program != "/usr/bin/c++" {
                 return Err(HostError::unsupported(format!(
                     "Unexpected process: {}",
                     command.program
@@ -96,7 +111,7 @@ impl Fixture {
                 let source = command
                     .args
                     .iter()
-                    .find(|arg| arg.ends_with(b".c"))
+                    .find(|arg| arg.ends_with(b".c") || arg.ends_with(b".cpp"))
                     .ok_or_else(|| HostError::unsupported("Expected a source file."))?;
                 host.seed_file(&deps, format!("out.o: {source}\n").as_bytes())?;
             }
@@ -132,8 +147,18 @@ impl Fixture {
         jobs: usize,
         names: &[&[u8]],
     ) -> TestResult<Vec<BString>> {
+        self.configure_in("/work/build", mode, jobs, names)
+    }
+
+    fn configure_in(
+        &self,
+        build: &str,
+        mode: ProbeCacheMode,
+        jobs: usize,
+        names: &[&[u8]],
+    ) -> TestResult<Vec<BString>> {
         let root = Path::new("/work/probes");
-        let build = Path::new("/work/build");
+        let build = Path::new(build);
         let mut services = Services::default();
         services.speed.probe_cache = mode;
         services.speed.probe_jobs = NonZeroUsize::new(jobs);
@@ -157,6 +182,44 @@ fn success(stdout: Vec<u8>) -> RunOutput {
         results: vec![ProcessResult::Exited(0)],
         ..Default::default()
     }
+}
+
+#[test]
+fn warm_probe_hits_in_a_different_build_directory() -> TestResult {
+    let fixture = Fixture::new(
+        "try_compile(OK SOURCE_FROM_CONTENT main.c [[int main(void) { return 0; }]] NO_CACHE)\n",
+    )?;
+    for build in ["/work/cold", "/work/warm"] {
+        assert_eq!(
+            fixture.configure_in(build, ProbeCacheMode::ReadWrite, 1, &[b"OK"])?,
+            vec![BString::from("TRUE")]
+        );
+        assert_eq!(fixture.runs.load(Ordering::Relaxed), 2);
+    }
+    Ok(())
+}
+
+#[test]
+fn external_source_content_invalidates_a_relocated_probe() -> TestResult {
+    let source = Path::new("/work/probes/external.c");
+    let fixture = Fixture::new("try_compile(OK SOURCES /work/probes/external.c NO_CACHE)\n")?;
+    fixture
+        .inner
+        .seed_file(source, b"int main(void) { return 0; }\n")?;
+    fixture.inner.sleep(Duration::from_secs(4));
+    for build in ["/work/cold", "/work/warm"] {
+        let values = fixture.configure_in(build, ProbeCacheMode::ReadWrite, 1, &[b"OK"])?;
+        assert_eq!(values, [BString::from("TRUE")]);
+        assert_eq!(fixture.runs.load(Ordering::Relaxed), 2);
+    }
+    fixture
+        .inner
+        .seed_file(source, b"int main(void) { return 1; }\n")?;
+    fixture.inner.sleep(Duration::from_secs(4));
+    let values = fixture.configure_in("/work/edited", ProbeCacheMode::ReadWrite, 1, &[b"OK"])?;
+    assert_eq!(values, [BString::from("TRUE")]);
+    assert_eq!(fixture.runs.load(Ordering::Relaxed), 4);
+    Ok(())
 }
 
 #[test]
@@ -201,21 +264,34 @@ fn warm_probe_replays_output_and_copy_without_a_compiler() -> TestResult {
 #[test]
 fn speculative_jobs_match_serial_probe_results() -> TestResult {
     let script = "\
+set(CMAKE_CXX_COMPILER /usr/bin/c++)
+set(CMAKE_CXX_COMPILER_ID AppleClang)
+set(CMAKE_CXX_COMPILE_OBJECT \"<CMAKE_CXX_COMPILER> -isysroot /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk -o <OBJECT> -c <SOURCE>\")
+set(CMAKE_CXX_LINK_EXECUTABLE \"<CMAKE_CXX_COMPILER> -isysroot /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk -o <TARGET> <OBJECTS>\")
 try_compile(FIRST SOURCE_FROM_CONTENT main.c [[int main(void) { return 1; }]] NO_CACHE NO_LOG)
-try_compile(SECOND SOURCE_FROM_CONTENT main.c [[int main(void) { return 2; }]] NO_CACHE NO_LOG)
-try_compile(THIRD SOURCE_FROM_CONTENT main.c [[int main(void) { return 3; }]] NO_CACHE NO_LOG)
+try_compile(SECOND SOURCE_FROM_CONTENT second.cpp [[int main() { return 2; }]] NO_CACHE NO_LOG)
+try_compile(THIRD SOURCE_FROM_CONTENT third.c [[int main(void) { return 3; }]] NO_CACHE NO_LOG)
 ";
     let serial = Fixture::new(script)?;
-    let parallel = Fixture::new(script)?;
     let names = [b"FIRST".as_slice(), b"SECOND", b"THIRD"];
     let expected = serial.configure(ProbeCacheMode::ReadWrite, 1, &names)?;
-    let actual = parallel.configure(ProbeCacheMode::ReadWrite, 4, &names)?;
-    assert_eq!(actual, expected);
     assert_eq!(serial.speculative.load(Ordering::Relaxed), 0);
-    assert!(parallel.speculative.load(Ordering::Relaxed) >= 2);
-    assert_eq!(
-        parallel.runs.load(Ordering::Relaxed),
-        serial.runs.load(Ordering::Relaxed)
-    );
+    for mode in [ProbeCacheMode::ReadWrite, ProbeCacheMode::Off] {
+        let parallel = Fixture::new(script)?;
+        assert_eq!(parallel.configure(mode, 4, &names)?, expected);
+        assert!(parallel.speculative.load(Ordering::Relaxed) >= 2);
+        assert_eq!(
+            parallel.runs.load(Ordering::Relaxed),
+            serial.runs.load(Ordering::Relaxed)
+        );
+        if mode == ProbeCacheMode::Off {
+            assert!(
+                parallel
+                    .inner
+                    .metadata(Path::new("/work/probe-cache"), rcmake_host::Follow::No)
+                    .is_err()
+            );
+        }
+    }
     Ok(())
 }

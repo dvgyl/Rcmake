@@ -110,14 +110,8 @@ pub(super) fn write_project(
         languages.push(language);
     }
 
-    let compile_flags: Vec<_> = options
-        .many(b"COMPILE_DEFINITIONS")
-        .iter()
-        .flat_map(|arg| list::iter(arg, list::Empty::Drop))
-        .flat_map(|arg| compile_definition_words(cx, &arg))
-        .collect();
+    let compile_flags = compile_flags(cx, options);
     let properties = language_properties(cx, options, &languages);
-    let extensions_policy = cx.policy(PolicyId::new(128));
     let code = render_project(
         ProjectInputs {
             archive,
@@ -125,7 +119,7 @@ pub(super) fn write_project(
             languages,
             compile_flags,
             language,
-            extensions_policy,
+            extensions_policy: cx.policy(PolicyId::new(128)),
             properties: &properties,
         },
         options,
@@ -179,6 +173,36 @@ pub(super) fn write_project(
         return Err(error);
     }
     Ok(())
+}
+
+fn compile_flags(cx: &mut Cx<'_>, options: &Options<'_>) -> Vec<BString> {
+    options
+        .many(b"COMPILE_DEFINITIONS")
+        .iter()
+        .flat_map(|arg| list::iter(arg, list::Empty::Drop))
+        .flat_map(|arg| compile_definition_words(cx, &arg))
+        .collect()
+}
+
+#[cfg(all(feature = "native", any(unix, windows)))]
+pub(super) fn render_literal_probe(cx: &mut Cx<'_>, file: &Path, target: &str) -> Option<BString> {
+    let enabled = enabled_languages(cx);
+    let languages = vec![source_language(cx, file, &enabled)?];
+    let options = Options::default();
+    let properties = language_properties(cx, &options, &languages);
+    Some(render_project(
+        ProjectInputs {
+            archive: cx.var_or_empty(b"CMAKE_TRY_COMPILE_TARGET_TYPE") == "STATIC_LIBRARY",
+            files: vec![path::from_native_cmake(file)],
+            languages,
+            compile_flags: Vec::new(),
+            language: None,
+            extensions_policy: cx.policy(PolicyId::new(128)),
+            properties: &properties,
+        },
+        &options,
+        target,
+    ))
 }
 
 fn valid_standard(language: &[u8], value: &[u8]) -> bool {

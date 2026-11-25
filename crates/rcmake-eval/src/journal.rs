@@ -3,15 +3,19 @@
 #![forbid(unsafe_code)]
 
 mod activate;
+pub(crate) use activate::ReplayObservations;
+pub(crate) use leaf::REPLAY_LINK_CHECK;
 mod frame;
 mod leaf;
 mod path_bytes;
+mod receipts;
 mod region;
 mod replay;
 mod trace;
 
 pub use activate::ReplayHost;
 pub(crate) use activate::ReplaySession;
+pub use receipts::ReplayReceipts;
 
 pub use region::{
     CacheValue, ChildScope, CommandClass, EntryContext, Journal, JournalEffect, OpaqueOperation,

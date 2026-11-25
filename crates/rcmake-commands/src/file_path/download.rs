@@ -82,6 +82,7 @@ pub(super) fn run(cx: &mut Cx<'_>, args: &[&[u8]]) -> Result {
         if let Some(fetch) = &fetch {
             fetch.check_network(cx)?;
         } else {
+            crate::fetch_observe::check_unmatched_url(cx, url)?;
             crate::hermetic::check_network(cx, transfer_url, download.expected.is_some())?;
         }
         #[cfg(not(all(feature = "native", any(unix, windows))))]

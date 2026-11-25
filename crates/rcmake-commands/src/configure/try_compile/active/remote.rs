@@ -89,7 +89,7 @@ impl RemoteProbe {
     }
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
     use std::path::Path;
     use std::sync::Arc;
@@ -100,14 +100,18 @@ mod tests {
 
     use super::*;
     use crate::configure::try_compile::{
-        cache::{ProbeCache, tests::recipe},
+        cache::{ProbeCache, test_support::recipe},
         journal::{JournalHost, JournalMode},
     };
 
     #[test]
     fn requires_a_local_pin_and_both_upload_settings() -> HostResult<()> {
         let host = PureHost::default();
-        let curl = Path::new("/usr/bin/curl");
+        let curl = Path::new(if cfg!(windows) {
+            "C:/Windows/System32/curl.exe"
+        } else {
+            "/usr/bin/curl"
+        });
         host.seed_file(curl, b"curl fixture")?;
         host.set_permissions(curl, 0o755)?;
         let runs = Arc::new(AtomicUsize::new(0));

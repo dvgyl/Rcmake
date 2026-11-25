@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use rcmake_base::BString;
-use rcmake_eval::journal::{ConfigureSnapshot, ReplayHost};
+use rcmake_eval::journal::{ConfigureSnapshot, ReplayHost, ReplayReceipts};
 use rcmake_eval::{
     FetchLockMode, HermeticMode, Interp, LedgerLevel, ProbeCacheMode, RunOutcome, Services,
 };
@@ -42,6 +42,7 @@ impl NativeSession {
             .is_some_and(|value| value == "1");
         let enabled = speed.incremental
             || speed.probe_cache != ProbeCacheMode::Off
+            || speed.probe_jobs.is_some_and(|jobs| jobs.get() > 1)
             || speed.fetch_prefetch
             || speed.fetch_lock != FetchLockMode::Off
             || measure
@@ -83,6 +84,15 @@ impl NativeSession {
     }
 
     pub(super) fn attach(&self, interp: &mut Interp) {
+        let replay = self.replay_enabled(interp);
+        if (self.probe.is_some() || replay) && cfg!(target_os = "macos") {
+            let queries = super::super::platform_queries::PlatformQueries::default();
+            queries.prefetch(&self.host());
+            interp.add_session_data(Arc::new(queries));
+            if replay {
+                interp.add_session_data(Arc::new(ReplayReceipts::default()));
+            }
+        }
         if let Some(fetch) = &self.fetch {
             fetch.install(interp);
         }
@@ -95,6 +105,9 @@ impl NativeSession {
         build: &Path,
         preloads: &[PathBuf],
     ) -> RunOutcome {
+        if self.measure {
+            interp.track_executed_listfiles();
+        }
         if let Some(memo) = &self.memo {
             memo.clear();
         }
@@ -186,19 +199,15 @@ impl NativeSession {
     }
 }
 
-fn replay_report(interp: &mut Interp) -> BString {
+fn replay_report(interp: &Interp) -> BString {
     let replayed = interp.replayed_listfiles();
     let replayed: BTreeSet<_> = replayed
         .iter()
         .map(|path| rcmake_host::path::from_native_cmake(path))
         .collect();
     let executed: BTreeSet<_> = interp
-        .cx()
-        .project()
-        .dirs()
-        .flat_map(|(_, dir)| dir.listfiles.iter())
-        .filter(|file| !replayed.contains(*file))
-        .cloned()
+        .executed_listfiles()
+        .map(rcmake_host::path::from_native_cmake)
         .collect();
     let paths = |set: BTreeSet<BString>| Value::Array(set.into_iter().map(Value::String).collect());
     write_compact(&Value::Object(BTreeMap::from([

@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use rcmake_eval::HermeticMode;
-use rcmake_eval::hermetic::{ViolationKind, display_remote};
+use rcmake_eval::hermetic::{ViolationKind, display_remote, windows_path_spelling};
 use rcmake_host::{FileKind, Follow, Host, HostError, HostResult, WriteMode};
 use rcmake_json::{Value, write_compact};
 
@@ -92,14 +92,14 @@ impl Observations {
     pub(super) fn project_file(&self, file: &Path) -> bool {
         self.roots
             .iter()
-            .any(|(label, root)| *label == "{source}" && file.starts_with(root))
+            .any(|(label, root)| *label == "{source}" && relative_path(file, root).is_some())
     }
 
     fn path_label(&self, path: &Path) -> String {
         self.roots
             .iter()
             .find_map(|(label, root)| {
-                let relative = path.strip_prefix(root).ok()?;
+                let relative = relative_path(path, root)?;
                 if relative.as_os_str().is_empty() {
                     return Some((*label).into());
                 }
@@ -127,6 +127,29 @@ impl Observations {
             self.truncated = true;
         }
     }
+}
+
+fn relative_path(path: &Path, root: &Path) -> Option<PathBuf> {
+    let path = windows_path_spelling(path);
+    let root = windows_path_spelling(root);
+    if let Ok(relative) = path.strip_prefix(root.as_ref()) {
+        return Some(relative.to_owned());
+    }
+    if !cfg!(windows) {
+        return None;
+    }
+    let mut components = path.components();
+    for prefix in root.components() {
+        if !components
+            .next()?
+            .as_os_str()
+            .as_encoded_bytes()
+            .eq_ignore_ascii_case(prefix.as_os_str().as_encoded_bytes())
+        {
+            return None;
+        }
+    }
+    Some(components.as_path().to_owned())
 }
 
 pub(super) fn render(state: &AuditState, mode: HermeticMode, denied: bool) -> Vec<u8> {

@@ -7,7 +7,7 @@ use super::*;
 impl Host for JournalHost<'_> {
     fn metadata(&self, path: &Path, follow: Follow) -> HostResult<Metadata> {
         let result = self.inner.metadata(path, follow);
-        if !self.private_path(path) {
+        if !self.unobserved_read(path) {
             match &result {
                 Ok(meta) if is_absolute(path) && meta.kind != FileKind::Other => {
                     let mut state = self.state();
@@ -35,7 +35,7 @@ impl Host for JournalHost<'_> {
 
     fn read(&self, path: &Path, range: ReadRange) -> HostResult<Vec<u8>> {
         let result = self.inner.read(path, range);
-        if !self.private_path(path) {
+        if !self.unobserved_read(path) {
             match (&result, range) {
                 (Ok(bytes), ReadRange::All { .. }) if is_absolute(path) => {
                     self.state().stamp(InputStamp::FileHash {
@@ -88,7 +88,12 @@ impl Host for JournalHost<'_> {
     }
 
     fn read_dir(&self, path: &Path) -> HostResult<Vec<DirEntry>> {
-        let result = self.inner.read_dir(path);
+        let mut result = self.inner.read_dir(path);
+        if self.sorted_listings
+            && let Ok(entries) = &mut result
+        {
+            entries.sort_unstable_by(|left, right| left.name.cmp(&right.name));
+        }
         if !self.private_path(path) {
             match &result {
                 Ok(entries) if is_absolute(path) => {
@@ -97,10 +102,12 @@ impl Host for JournalHost<'_> {
                         path: path.to_owned(),
                         digest: listing_digest(entries, true),
                     });
-                    state.check(
-                        Check::DirectoryOrder(path.to_owned()),
-                        listing_digest(entries, false),
-                    );
+                    if !self.sorted_listings {
+                        state.check(
+                            Check::DirectoryOrder(path.to_owned()),
+                            listing_digest(entries, false),
+                        );
+                    }
                 }
                 Err(error) if is_absolute(path) && error.kind == ErrorKind::NotFound => {
                     self.state().check(
@@ -201,7 +208,7 @@ impl Host for JournalHost<'_> {
 
     fn canonicalize(&self, path: &Path) -> HostResult<PathBuf> {
         let result = self.inner.canonicalize(path);
-        if !self.private_path(path) {
+        if !self.unobserved_read(path) {
             match &result {
                 Ok(target) if is_absolute(path) => {
                     self.state()
@@ -276,6 +283,14 @@ impl Host for JournalHost<'_> {
         request: &RunRequest,
         on_output: &mut dyn FnMut(Stream, &[u8]),
     ) -> HostResult<RunOutput> {
+        if let Some(result) = self.verified_platform_query(request) {
+            // A process with `tee` also streams its captured output.
+            if request.tee {
+                on_output(Stream::Stdout, &result.stdout);
+                on_output(Stream::Stderr, &result.stderr);
+            }
+            return Ok(result);
+        }
         let request = self.process_request(request)?;
         let spawn = self.inner.now();
         let result = if self.mode == JournalMode::Speculate {
@@ -288,6 +303,11 @@ impl Host for JournalHost<'_> {
     }
 
     fn run_bounded(&self, request: &RunRequest, limit: usize) -> HostResult<RunOutput> {
+        if let Some(result) = self.verified_platform_query(request)
+            && result.stdout.len().saturating_add(result.stderr.len()) <= limit
+        {
+            return Ok(result);
+        }
         let request = self.process_request(request)?;
         let limit = if self.mode == JournalMode::Speculate {
             limit.min(MAX_PROCESS_OUTPUT)
@@ -429,10 +449,11 @@ impl JournalHost<'_> {
             .unwrap_or_else(PoisonError::into_inner);
         Journal {
             trace: state.stamps.into_values().collect(),
+            memo: self.memo,
             checks: JournalChecks(state.checks.into_iter().collect()),
-            #[cfg(test)]
+            #[cfg(all(test, unix))]
             environment: state.environment,
-            #[cfg(test)]
+            #[cfg(all(test, unix))]
             full_environment: state.full_environment,
             processes: state.processes,
             output: state.output,

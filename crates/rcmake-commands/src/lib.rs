@@ -32,6 +32,8 @@ pub fn register_all(registry: &mut Registry) {
     vars_list::register(registry);
     string_math::register(registry);
     file_path::register(registry);
+    #[cfg(all(feature = "native", any(unix, windows)))]
+    registry.guard("file", fetch_observe::check_upload);
     process_find::register(registry);
     policy_misc::register(registry);
     targets::register(registry);

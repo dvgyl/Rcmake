@@ -75,6 +75,9 @@ use stack::LayeredStack;
 /// Signature of every built-in CMake command registered in [`Registry`].
 pub type BuiltinFn = fn(&mut Cx<'_>, &[ExpandedArg]) -> CmdResult;
 
+/// Check expanded arguments before a built-in command runs.
+pub type BuiltinGuard = fn(&mut Cx<'_>, &[ExpandedArg]) -> Result<(), CmdError>;
+
 /// Result returned by every built-in command.
 pub type CmdResult = Result<Flow, CmdError>;
 
@@ -123,6 +126,7 @@ pub struct CmdFlags {
 #[derive(Default)]
 pub struct Registry {
     builtins: BTreeMap<BString, Builtin>,
+    guards: BTreeMap<BString, BuiltinGuard>,
 }
 
 #[derive(Clone, Copy)]
@@ -134,6 +138,12 @@ struct Builtin {
 }
 
 impl Registry {
+    /// Set the guard for a built-in command.
+    pub fn guard(&mut self, name: &'static str, check: BuiltinGuard) {
+        self.guards
+            .insert(fold_command_name(name.as_bytes()), check);
+    }
+
     /// Register a built-in command under its canonical lowercase name.
     ///
     /// A later registration of the same name replaces the earlier one (also one from
@@ -475,6 +485,8 @@ pub struct Interp {
     replay_session: Option<journal::ReplaySession>,
     replay_hits: u64,
     replayed_listfiles: BTreeSet<PathBuf>,
+    executed_listfiles: Option<BTreeSet<PathBuf>>,
+    replay_observations: Option<journal::ReplayObservations>,
     /// `--trace-expand` is expanding the arguments of a traced command.
     trace_expanding: bool,
     /// Listfile of each file and function call scope (`LISTFILE_STACK`).
@@ -583,6 +595,8 @@ impl Interp {
             replay_session: None,
             replay_hits: 0,
             replayed_listfiles: BTreeSet::new(),
+            executed_listfiles: None,
+            replay_observations: None,
             trace_expanding: false,
             listfiles: Vec::new(),
             file_locks: Vec::new(),

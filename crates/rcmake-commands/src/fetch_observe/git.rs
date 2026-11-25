@@ -13,7 +13,10 @@ use rcmake_host::{
     CommandSpec, Follow, Host, ProcessResult, RunOutput, RunRequest, path::to_native,
 };
 
-use super::runtime::{Population, Runtime, Script, blocked, lock_mutex, required, runtime, stop};
+use super::runtime::{
+    Population, Runtime, Script, blocked, check_unmatched, lock_mutex, module_is, required,
+    runtime, stop,
+};
 use super::{BlockReason, DeclaredSource, GitTransfer, portable_source, relative_repo};
 
 #[derive(Default)]
@@ -48,10 +51,20 @@ pub(crate) fn before_process(
     if !cx.host().supports_process_execution() {
         return Ok(ProcessAction::default());
     }
-    let Some(runtime) = runtime(cx) else {
-        return Ok(ProcessAction::default());
-    };
-    let Some(pop) = runtime.population(cx) else {
+    let active = runtime(cx).and_then(|runtime| runtime.population(cx).map(|pop| (runtime, pop)));
+    let Some((runtime, pop)) = active else {
+        let executable = cx.var_or_empty(b"GIT_EXECUTABLE");
+        if request.pipeline.iter().any(|command| {
+            let program = to_native(&command.program);
+            let is_git = (!executable.is_empty() && command.program == executable)
+                || program
+                    .file_stem()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.eq_ignore_ascii_case("git"));
+            is_git && may_transfer(&command.args)
+        }) {
+            check_unmatched(cx)?;
+        }
         return Ok(ProcessAction::default());
     };
     if pop.subbuild {
@@ -484,6 +497,35 @@ fn git_operation(mut args: &[BString]) -> &[u8] {
     }
 }
 
+fn may_transfer(mut args: &[BString]) -> bool {
+    loop {
+        match args {
+            [flag, _, rest @ ..]
+                if matches!(
+                    flag.as_slice(),
+                    b"-c"
+                        | b"-C"
+                        | b"--config-env"
+                        | b"--git-dir"
+                        | b"--work-tree"
+                        | b"--namespace"
+                        | b"--super-prefix"
+                ) =>
+            {
+                args = rest;
+            }
+            [flag, rest @ ..] if flag.starts_with(b"-") => args = rest,
+            [operation, ..] => {
+                return matches!(
+                    operation.as_slice(),
+                    b"clone" | b"fetch" | b"ls-remote" | b"submodule"
+                );
+            }
+            [] => return false,
+        }
+    }
+}
+
 fn success(stdout: Vec<u8>) -> ProcessAction {
     ProcessAction {
         result: Some(RunOutput {
@@ -497,9 +539,10 @@ fn success(stdout: Vec<u8>) -> ProcessAction {
 
 fn local_git_version(cx: &Cx<'_>, command: &CommandSpec) -> bool {
     let trace = cx.backtrace();
-    trace.top().is_some_and(|frame| {
-        to_native(&frame.file) == cx.cmake_root().join("Modules/FindGit.cmake")
-    }) && matches!(command.args.as_slice(), [version] if version == "--version")
+    trace
+        .top()
+        .is_some_and(|frame| module_is(cx, &frame.file, "Modules/FindGit.cmake"))
+        && matches!(command.args.as_slice(), [version] if version == "--version")
         && cx.var_or_empty(b"GIT_EXECUTABLE") == command.program
 }
 

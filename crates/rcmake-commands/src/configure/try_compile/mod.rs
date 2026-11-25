@@ -316,14 +316,16 @@ fn build_probe(
     let save_cache = dirs.scratch.is_none() || cx.var_is_on(b"CMAKE_DEBUG_TRY_COMPILE");
     #[cfg(all(feature = "native", any(unix, windows)))]
     let mut cached_probe = if run_var.is_none() {
-        active::PreparedProbe::prepare(cx, signature, options, dirs, target, &seed)
+        active::PreparedProbe::prepare(cx, signature, options, dirs, target, &seed, &imports)
     } else {
         None
     };
     let child = ChildConfig::new(cx, dirs, seed);
     #[cfg(all(feature = "native", any(unix, windows)))]
-    if let Some(probe) = &cached_probe {
-        probe.queue(cx, signature, target, &child);
+    if let Some(probe) = &cached_probe
+        && imports.is_empty()
+    {
+        probe.queue(cx, signature, target, &child, &dirs.source);
     }
     #[cfg(all(feature = "native", any(unix, windows)))]
     if let Some(probe) = &mut cached_probe

@@ -2,12 +2,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use rcmake_base::BString;
-use rcmake_eval::{Cx, Interp, Services};
+use rcmake_eval::{Cx, Interp, ProbeCacheMode, Services};
 use rcmake_host::{Host, HostError, HostResult, WriteMode, path};
 
 use crate::configure::lookahead::{ProbeKind, lookahead};
 use crate::configure::probe_pool::{
-    ChildBudget, ProbePool, ProbeQueue, WorkerContext, job_limit, physical_memory,
+    ChildBudget, ProbePool, ProbeQueue, WorkerContext, job_limit, physical_memory, reap_scratch,
 };
 
 use super::super::args::{Signature, Source};
@@ -25,16 +25,17 @@ impl ProbeRuntime {
         services: &Services,
         evaluate: impl FnOnce(&mut Interp) -> R,
     ) -> R {
-        if !self.cache.writable() || interp.has_command_observers() {
-            return evaluate(interp);
-        }
-        let host = self.host.as_ref();
-        if host.system().sysname != "Darwin"
-            || job_limit(host, 0, services.speed.probe_jobs).requested == 1
+        if matches!(self.mode, ProbeCacheMode::Verify | ProbeCacheMode::ReadOnly)
+            || interp.has_command_observers()
         {
             return evaluate(interp);
         }
+        let host = self.host.as_ref();
         let scratch_root = self.build.join("CMakeFiles/CMakeScratch");
+        reap_scratch(host, &scratch_root);
+        if job_limit(host, 0, services.speed.probe_jobs).requested == 1 {
+            return evaluate(interp);
+        }
         let context = WorkerContext {
             host,
             store: &self.store,
@@ -58,35 +59,39 @@ impl ProbeRuntime {
 impl PreparedProbe {
     pub(in crate::configure::try_compile) fn queue(
         &self,
-        cx: &Cx<'_>,
+        cx: &mut Cx<'_>,
         signature: &Signature<'_>,
         target: Option<&[u8]>,
         child: &ChildConfig,
+        directory: &Path,
     ) {
-        let Some(queue) = cx
+        if !cx
             .session_data::<ProbeQueue>()
-            .filter(|queue| queue.available())
-        else {
+            .is_some_and(ProbeQueue::available)
+        {
             return;
-        };
+        }
         let Some((current, remaining)) = cx.lookahead() else {
             return;
         };
         let Signature::Sources { sources, .. } = signature else {
             return;
         };
-        let [Source::Content(name, _)] = sources.as_slice() else {
+        let [Source::Content(..)] = sources.as_slice() else {
             return;
         };
-        let Some(target) = target else { return };
+        let Some(target) = target.and_then(|target| std::str::from_utf8(target).ok()) else {
+            return;
+        };
         let candidates = lookahead(Some(current), remaining, |kind, candidate, results| {
             kind == ProbeKind::TryCompile
                 && cx.is_builtin(&candidate.lower)
                 && matches!(
                     candidate.args.as_slice(),
-                    [result, _, source, content, ..]
+                    [result, keyword, source, content, ..]
                         if !result.text.starts_with(b"CMAKE_")
-                            && source.text == *name
+                            && keyword.text == "SOURCE_FROM_CONTENT"
+                            && content.text.len() <= 1 << 20
                             && compiler::admit_source(&source.text, &content.text)
                             && !results.contains(content.text.as_slice())
                 )
@@ -94,24 +99,56 @@ impl PreparedProbe {
         if candidates.is_empty() {
             return;
         }
+        let candidates: Vec<_> = candidates
+            .into_iter()
+            .skip(1)
+            .filter_map(|candidate| {
+                let [_, _, source, content, ..] = candidate.command.args.as_slice() else {
+                    return None;
+                };
+                Some((source.text.clone(), content.text.clone()))
+            })
+            .collect();
+        let Some(queue) = cx.session_data::<ProbeQueue>().cloned() else {
+            return;
+        };
         let environment = self.runtime.host.env_all();
-        for candidate in candidates.into_iter().skip(1) {
-            let [_, _, _, content, ..] = candidate.command.args.as_slice() else {
+        for (name, content) in candidates {
+            let Some(project) = super::super::project::render_literal_probe(
+                cx,
+                &directory.join(path::to_native(&name)),
+                target,
+            )
+            .and_then(|project| Templated::capture(&project, &self.recipe.bindings)) else {
                 continue;
             };
-            let Some(source) = Templated::literal(&content.text) else {
+            let Some(source) = Templated::literal(&content) else {
+                continue;
+            };
+            let Some(compiler) = compiler::ProbeCompiler::select(
+                Arc::clone(&self.runtime.host),
+                cx,
+                &self.runtime.compiler,
+                &name,
+                &self.runtime.cache.memo,
+                None,
+                self.runtime.mode == ProbeCacheMode::Off,
+            ) else {
                 continue;
             };
             let mut recipe = self.recipe.clone();
-            recipe.files.insert((*name).into(), source);
+            recipe.files = [(BString::from("CMakeLists.txt"), project), (name, source)].into();
+            recipe.tools = compiler.identity;
             if compute_probe_key(&recipe) == compute_probe_key(&self.recipe) {
                 continue;
             }
             let host = Arc::clone(&self.runtime.host);
-            let compiler = Arc::clone(&self.compiler);
+            let compiler = compiler.verifier;
+            let memo = Arc::clone(&self.runtime.cache.memo);
             let target = BString::from(target);
             let child_bytes = child.retained_bytes();
             let child = child.clone();
+            let bound = self.bound.clone();
             queue.submit(
                 recipe,
                 environment.clone(),
@@ -119,8 +156,10 @@ impl PreparedProbe {
                     let execution = SpeculativeExecution {
                         host,
                         compiler,
+                        memo,
                         target,
                         child,
+                        bound,
                     };
                     execution.run(scratch, recipe, environment, budget)
                 })),
@@ -132,9 +171,11 @@ impl PreparedProbe {
 
 struct SpeculativeExecution {
     host: Arc<dyn Host>,
-    compiler: Arc<compiler::CompilerEvidence>,
+    compiler: Arc<dyn ProcessVerifier>,
+    memo: Arc<rcmake_store::TraceMemo>,
     target: BString,
     child: ChildConfig,
+    bound: std::collections::BTreeSet<PathBuf>,
 }
 
 impl SpeculativeExecution {
@@ -151,18 +192,10 @@ impl SpeculativeExecution {
             budget.shutdown.clone(),
         );
         let journal = Arc::new(
-            JournalHost::from_shared(
-                self.host,
-                scratch,
-                self.compiler as Arc<dyn ProcessVerifier>,
-                JournalMode::Speculate,
-            )?
-            .with_speculation(
-                environment,
-                budget.cancel,
-                budget.shutdown,
-                budget.deadline,
-            ),
+            JournalHost::from_shared(self.host, scratch, self.compiler, JournalMode::Speculate)?
+                .with_trace_memo(self.memo)
+                .with_bound_inputs(self.bound)
+                .with_speculation(environment, budget.cancel, budget.shutdown, budget.deadline),
         );
         for (name, template) in &recipe.files {
             let file = path::to_native(name);

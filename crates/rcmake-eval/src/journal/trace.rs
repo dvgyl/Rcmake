@@ -339,32 +339,14 @@ fn hash_file(host: &dyn Host, path: &Path) -> HostResult<(JournalFileStat, Journ
             "Journal file exceeds the read limit.",
         ));
     }
-    let mut hasher = Sha256::new();
-    let mut offset = 0;
-    loop {
-        // Check one byte beyond the recorded size to detect a file that grew.
-        let len = (256 * 1024).min(stat.len - offset + 1);
-        let chunk = host.read(
-            path,
-            ReadRange::Slice {
-                offset,
-                len: Some(len),
-            },
-        )?;
-        let read = chunk.len() as u64;
-        offset += read;
-        hasher.update(&chunk);
-        if read < len || offset > stat.len {
-            break;
-        }
-    }
-    if offset != stat.len || JournalFileStat::read(host, path)? != stat {
+    let bytes = host.read(path, ReadRange::All { limit: stat.len })?;
+    if bytes.len() as u64 != stat.len || JournalFileStat::read(host, path)? != stat {
         return Err(error(
             ErrorKind::InvalidData,
             "Journal file changed during the read.",
         ));
     }
-    Ok((stat, JournalDigest(hasher.finalize().into())))
+    Ok((stat, JournalDigest::hash(&bytes)))
 }
 
 /// Variable scope relative to the region entry.

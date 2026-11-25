@@ -141,7 +141,7 @@ fn check_url(
     Ok(())
 }
 
-fn local_file(rest: &str, windows: bool) -> Option<PathBuf> {
+pub(crate) fn local_file(rest: &str, windows: bool) -> Option<PathBuf> {
     let rest = rest.strip_prefix("//")?;
     let start = rest.find('/')?;
     let (authority, path) = rest.split_at(start);

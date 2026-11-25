@@ -58,15 +58,17 @@ impl<M> ConfigureSnapshot<M> {
 impl<M: Serialize> ConfigureSnapshot<M> {
     /// Encode this snapshot in a length-checked native-path frame.
     pub fn encode(&self) -> Result<Vec<u8>, ReplayCodecError> {
-        let len = encoded_size(self, MAX_FRAME_BYTES).ok_or(ReplayCodecError::Payload)?;
-        let mut bytes = Vec::with_capacity(FRAME_HEADER + len + FRAME_CHECKSUM);
+        let mut bytes = Vec::new();
         bytes.extend_from_slice(FRAME_MAGIC);
         bytes.push(PATH_ENCODING);
-        bytes.extend_from_slice(&(len as u32).to_le_bytes());
-        write_json(self, &mut bytes, len).map_err(|_| ReplayCodecError::Payload)?;
-        if bytes.len() != FRAME_HEADER + len {
-            return Err(ReplayCodecError::Payload);
-        }
+        let length_field = bytes.len()..FRAME_HEADER;
+        bytes.extend_from_slice(&0_u32.to_le_bytes());
+        write_json(self, &mut bytes, MAX_FRAME_BYTES).map_err(|_| ReplayCodecError::Payload)?;
+        let len = (bytes.len() - FRAME_HEADER) as u32;
+        bytes
+            .get_mut(length_field)
+            .ok_or(ReplayCodecError::Payload)?
+            .copy_from_slice(&len.to_le_bytes());
         let checksum = JournalDigest::hash(&bytes);
         bytes.extend_from_slice(checksum.as_bytes());
         Ok(bytes)

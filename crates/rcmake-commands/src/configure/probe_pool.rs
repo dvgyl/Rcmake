@@ -15,8 +15,8 @@ use std::time::{Duration, Instant};
 use rcmake_base::BString;
 use rcmake_eval::CancelToken;
 use rcmake_host::{
-    CommandSpec, FileKind, Follow, Host, HostError, HostResult, Input, Output, ProcessResult,
-    ReadRange, RunRequest, WriteMode, path,
+    CommandSpec, FileKind, FileLockGuard, Follow, Host, HostError, HostResult, Input, Output,
+    ProcessResult, ReadRange, RunRequest, WriteMode, path,
 };
 use rcmake_store::{Digest, StoreConfig};
 
@@ -236,7 +236,7 @@ pub(crate) struct WorkerContext<'a> {
 
 /// Counts for speculative work. These do not change foreground cache counters.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[cfg(all(test, unix))]
+#[cfg(test)]
 pub(crate) struct WorkerStats {
     /// Jobs rejected by admission, deduplication, or queue limits.
     pub(crate) rejected: u64,
@@ -292,22 +292,20 @@ impl ProbePool {
                 workers: 0,
                 limit,
             };
-            if context.cache.writable() {
-                for _ in 1..limit.effective {
-                    let shared = Arc::clone(&pool.shared);
-                    if thread::Builder::new()
-                        .name("rcmake-probe".to_owned())
-                        .spawn_scoped(scope, move || worker(context, &shared))
-                        .is_err()
-                    {
-                        pool.shared
-                            .counters
-                            .startup_failures
-                            .fetch_add(1, Ordering::Relaxed);
-                        break;
-                    }
-                    pool.workers += 1;
+            for _ in 1..limit.effective {
+                let shared = Arc::clone(&pool.shared);
+                if thread::Builder::new()
+                    .name("rcmake-probe".to_owned())
+                    .spawn_scoped(scope, move || worker(context, &shared))
+                    .is_err()
+                {
+                    pool.shared
+                        .counters
+                        .startup_failures
+                        .fetch_add(1, Ordering::Relaxed);
+                    break;
                 }
+                pool.workers += 1;
             }
             if pool.workers + 1 < pool.limit.effective {
                 pool.limit.effective = pool.workers + 1;
@@ -318,13 +316,13 @@ impl ProbePool {
     }
 
     /// Return the requested limit and its effective value.
-    #[cfg(all(test, unix))]
+    #[cfg(test)]
     pub(crate) fn limit(&self) -> JobLimit {
         self.limit
     }
 
     /// Read the counts for this pool.
-    #[cfg(all(test, unix))]
+    #[cfg(test)]
     pub(crate) fn stats(&self) -> WorkerStats {
         let counters = &self.shared.counters;
         WorkerStats {
@@ -474,6 +472,7 @@ struct Scratch<'a> {
     host: &'a dyn Host,
     path: PathBuf,
     claim: PathBuf,
+    lock: Option<Box<dyn FileLockGuard>>,
 }
 
 impl<'a> Scratch<'a> {
@@ -492,7 +491,18 @@ impl<'a> Scratch<'a> {
         let nonce = RandomState::new().hash_one((host.system().pid, id));
         let path = root.join(format!("Spec-{nonce:016x}-{id:x}"));
         let claim = path.with_extension("claim");
-        host.write(&claim, b"", WriteMode::CreateNew)?;
+        host.write(
+            &claim,
+            b"rcmake speculative scratch v1\n",
+            WriteMode::CreateNew,
+        )?;
+        let lock = match host.lock_file(&claim, Some(Duration::ZERO)) {
+            Ok(lock) => lock,
+            Err(error) => {
+                let _ = host.remove_file(&claim);
+                return Err(error);
+            }
+        };
         if !host
             .metadata(&path, Follow::No)
             .is_err_and(|error| error.kind == std::io::ErrorKind::NotFound)
@@ -502,7 +512,12 @@ impl<'a> Scratch<'a> {
                 "Speculative scratch path is already in use.",
             ));
         }
-        let scratch = Self { host, path, claim };
+        let scratch = Self {
+            host,
+            path,
+            claim,
+            lock: Some(lock),
+        };
         host.create_dir_all(&scratch.path)?;
         Ok(scratch)
     }
@@ -511,7 +526,57 @@ impl<'a> Scratch<'a> {
 impl Drop for Scratch<'_> {
     fn drop(&mut self) {
         let _ = self.host.remove_dir_all(&self.path);
+        drop(self.lock.take());
         let _ = self.host.remove_file(&self.claim);
+    }
+}
+
+pub(super) fn reap_scratch(host: &dyn Host, root: &Path) {
+    if !host
+        .metadata(root, Follow::No)
+        .is_ok_and(|entry| entry.kind == FileKind::Dir)
+    {
+        return;
+    }
+    let Ok(entries) = host.read_dir(root) else {
+        return;
+    };
+    for entry in entries.into_iter().take(20_000) {
+        let Some(name) = entry.name.strip_prefix(b"Spec-") else {
+            continue;
+        };
+        let dir_name = name.strip_suffix(b".claim").unwrap_or(name);
+        let mut parts = dir_name.split(|&byte| byte == b'-');
+        if !matches!((parts.next(), parts.next(), parts.next()), (Some(nonce), Some(serial), None)
+            if nonce.len() == 16 && !serial.is_empty()
+                && nonce.iter().chain(serial).all(u8::is_ascii_hexdigit))
+        {
+            continue;
+        }
+        let name = entry.name.strip_suffix(b".claim").unwrap_or(&entry.name);
+        let dir = root.join(path::to_native(name));
+        let claim = dir.with_extension("claim");
+        match host.metadata(&claim, Follow::No) {
+            Ok(meta) if meta.kind == FileKind::File => {
+                let age = host.now().secs.saturating_sub(meta.mtime.secs);
+                if age < 2 * SPECULATIVE_TIMEOUT.as_secs() as i64 {
+                    continue;
+                }
+            }
+            Err(error) if error.kind == std::io::ErrorKind::NotFound => {}
+            _ => continue,
+        }
+        let Ok(lock) = host.lock_file(&claim, Some(Duration::ZERO)) else {
+            continue;
+        };
+        if host
+            .metadata(&dir, Follow::No)
+            .is_ok_and(|meta| meta.kind == FileKind::Dir)
+        {
+            let _ = host.remove_dir_all(&dir);
+        }
+        drop(lock);
+        let _ = host.remove_file(&claim);
     }
 }
 
@@ -560,6 +625,9 @@ fn execute(context: &WorkerContext<'_>, job: Job, shared: &Shared) -> HostResult
         .is_some()
     {
         return Ok(JobResult::Cached);
+    }
+    if child.is_none() && !context.cache.writable() {
+        return Ok(JobResult::Failed);
     }
     let scratch = Scratch::create(context.host, context.scratch_root)?;
     recipe.bindings = recipe
@@ -793,5 +861,5 @@ fn checked_relative(bytes: &[u8]) -> HostResult<PathBuf> {
     Ok(file)
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests;

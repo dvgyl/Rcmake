@@ -251,7 +251,10 @@ impl Bootstrap {
                 "Platform information initialized",
             );
         }
-        let _ = cx.host().create_dir_all(&path::to_native(&self.root_bin));
+        let platform_dir = path::to_native(&self.root_bin);
+        if !is_dir(cx, &platform_dir) {
+            let _ = cx.host().create_dir_all(&platform_dir);
+        }
 
         self.determine_system(cx)?;
 

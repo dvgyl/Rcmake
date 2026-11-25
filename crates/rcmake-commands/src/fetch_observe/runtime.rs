@@ -225,8 +225,11 @@ impl Runtime {
     pub(super) fn script(&self, cx: &Cx<'_>, pop: &Population) -> Option<Script> {
         let trace = cx.backtrace();
         let frame = trace.top()?;
-        let path = to_native(&frame.file);
-        let wrapper = to_native(&cx.var_or_empty(b"arg_SCRIPT_FILE"));
+        let path = canonical(self.host.as_ref(), &to_native(&frame.file));
+        let wrapper = canonical(
+            self.host.as_ref(),
+            &to_native(&cx.var_or_empty(b"arg_SCRIPT_FILE")),
+        );
         let (kind, expected, expected_wrapper) = {
             let state = self.state();
             let generated = state.generated.get(&path)?;
@@ -242,7 +245,7 @@ impl Runtime {
                 .any(|frame| frame_is(cx, frame, FETCH_CONTENT, b"include"))
             && trace
                 .frames()
-                .any(|frame| to_native(&frame.file) == wrapper);
+                .any(|frame| canonical(self.host.as_ref(), &to_native(&frame.file)) == wrapper);
         (trusted_wrapper
             && self.script_digest(&path) == Some(expected)
             && self.script_digest(&wrapper) == Some(expected_wrapper))
@@ -264,11 +267,11 @@ impl Runtime {
 
     fn generated_script(&self, cx: &Cx<'_>, frame: &Frame, args: &[ExpandedArg]) {
         if !named(frame, b"configure_file")
-            || to_native(&frame.file)
-                != cx
-                    .cmake_root()
-                    .join(EXTERNAL_PROJECT)
-                    .join("shared_internal_commands.cmake")
+            || !module_is(
+                cx,
+                &frame.file,
+                "Modules/ExternalProject/shared_internal_commands.cmake",
+            )
             || !cx.is_builtin(b"configure_file")
         {
             return;
@@ -277,7 +280,10 @@ impl Runtime {
             return;
         };
         let input = to_native(&input.value);
-        if input.parent() != Some(cx.cmake_root().join(EXTERNAL_PROJECT).as_path()) {
+        if !input.parent().is_some_and(|parent| {
+            canonical(cx.host(), parent)
+                == canonical(cx.host(), &cx.cmake_root().join(EXTERNAL_PROJECT))
+        }) {
             return;
         }
         let kind = match input.file_name().and_then(|name| name.to_str()) {
@@ -293,7 +299,9 @@ impl Runtime {
             && let Some(pop) = self.population(cx)
         {
             let mut state = self.state();
-            state.generated.remove(&output);
+            state
+                .generated
+                .remove(&canonical(self.host.as_ref(), &output));
             state.pending = Some((output, kind, pop.site));
         }
     }
@@ -303,6 +311,7 @@ impl Runtime {
         if let Some((path, kind, site)) = state.pending.take()
             && let Some(digest) = self.script_digest(&path)
         {
+            let path = canonical(self.host.as_ref(), &path);
             state
                 .generated
                 .insert(path, GeneratedScript { site, kind, digest });
@@ -486,11 +495,11 @@ fn observe(cx: &mut Cx<'_>, args: &[ExpandedArg]) {
         && cx
             .user_command_file(b"_ep_add_download_command")
             .is_some_and(|path| {
-                to_native(path)
-                    == cx
-                        .cmake_root()
-                        .join(EXTERNAL_PROJECT)
-                        .join("shared_internal_commands.cmake")
+                module_is(
+                    cx,
+                    path,
+                    "Modules/ExternalProject/shared_internal_commands.cmake",
+                )
             })
         && let Some(pop) = runtime.population(cx)
         && !pop.subbuild
@@ -527,7 +536,7 @@ fn observe(cx: &mut Cx<'_>, args: &[ExpandedArg]) {
             .frames()
             .skip(1)
             .find(|frame| named(frame, b"__fetchcontent_dopopulation"))
-            .is_some_and(|calling| to_native(&calling.file) == cx.cmake_root().join(FETCH_CONTENT));
+            .is_some_and(|calling| module_is(cx, &calling.file, FETCH_CONTENT));
         let name = cx.var_or_empty(b"contentName");
         let values = std::iter::once(name).chain(rcmake_base::list::split(
             cx.var_or_empty(b"ARG_UNPARSED_ARGUMENTS").as_slice(),
@@ -590,12 +599,78 @@ fn named(frame: &Frame, name: &[u8]) -> bool {
 }
 
 fn frame_is(cx: &Cx<'_>, frame: &Frame, relative: &str, name: &[u8]) -> bool {
-    named(frame, name) && to_native(&frame.file) == cx.cmake_root().join(relative)
+    named(frame, name) && module_is(cx, &frame.file, relative)
 }
 
 fn bundled_command(cx: &Cx<'_>, name: &[u8]) -> bool {
     cx.user_command_file(name)
-        .is_some_and(|path| to_native(path) == cx.cmake_root().join(FETCH_CONTENT))
+        .is_some_and(|path| module_is(cx, path, FETCH_CONTENT))
+}
+
+pub(super) fn module_is(cx: &Cx<'_>, file: &[u8], relative: &str) -> bool {
+    let file = to_native(file);
+    let module = cx.cmake_root().join(relative);
+    file == module || canonical(cx.host(), &file) == canonical(cx.host(), &module)
+}
+
+fn canonical(host: &dyn Host, path: &Path) -> PathBuf {
+    host.canonicalize(path).unwrap_or_else(|_| path.to_owned())
+}
+
+pub(super) fn check_unmatched(cx: &mut Cx<'_>) -> Result<(), CmdError> {
+    let offline = runtime(cx).map_or_else(
+        || {
+            cx.host()
+                .env_get(b"RCMAKE_FETCH_OFFLINE")
+                .is_some_and(|value| value == "1")
+        },
+        |runtime| runtime.offline,
+    );
+    if offline {
+        return Err(stop(
+            cx,
+            "Offline fetch blocks remote transfers outside a pinned population.",
+        ));
+    }
+    if cx.services().speed.fetch_lock == FetchLockMode::Frozen {
+        let host = cx.host();
+        let external = canonical(host, &cx.cmake_root().join(EXTERNAL_PROJECT));
+        let trace = cx.backtrace();
+        if trace.frames().any(|frame| {
+            module_is(cx, &frame.file, FETCH_CONTENT)
+                || module_is(cx, &frame.file, "Modules/ExternalProject.cmake")
+                || canonical(host, &to_native(&frame.file)).starts_with(&external)
+        }) {
+            return Err(stop(
+                cx,
+                "Frozen fetch blocks transfers outside a matching locked population.",
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn check_unmatched_url(cx: &mut Cx<'_>, url: &[u8]) -> Result<(), CmdError> {
+    let local = std::str::from_utf8(url)
+        .ok()
+        .and_then(|url| url.split_once(':'))
+        .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("file"))
+        .and_then(|(_, rest)| crate::hermetic::local_file(rest, cfg!(windows)))
+        .is_some();
+    if !local {
+        check_unmatched(cx)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn check_upload(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> Result<(), CmdError> {
+    if let [op, _, url, ..] = args
+        && op.value == "UPLOAD"
+        && cx.host().supports_process_execution()
+    {
+        check_unmatched_url(cx, &url.value)?;
+    }
+    Ok(())
 }
 
 fn enabled(cx: &Cx<'_>, name: &[u8]) -> bool {

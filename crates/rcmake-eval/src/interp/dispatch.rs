@@ -25,16 +25,19 @@ struct CommandExpansion<'a>(&'a mut Interp);
 
 impl ExpandEnv for CommandExpansion<'_> {
     fn var(&mut self, name: &[u8]) -> Option<BString> {
+        self.0.observe_replay_variable_access(name);
         let value = self.0.var(name);
         self.0.warn_deprecated_variable(name);
         value
     }
 
     fn cache_var(&mut self, name: &[u8]) -> Option<BString> {
+        self.0.observe_replay_variable(name);
         self.0.cache_var(name)
     }
 
     fn env_var(&mut self, name: &[u8]) -> Option<BString> {
+        self.0.observe_replay_env(name);
         self.0.env_var(name)
     }
 
@@ -49,6 +52,7 @@ impl ExpandEnv for CommandExpansion<'_> {
 
 impl CondEnv for CommandExpansion<'_> {
     fn is_defined(&mut self, name: &[u8]) -> bool {
+        self.0.observe_replay_variable(name);
         let defined = self.0.is_defined(name);
         if !defined {
             self.0.warn_deprecated_variable(name);
@@ -57,10 +61,12 @@ impl CondEnv for CommandExpansion<'_> {
     }
 
     fn cache_defined(&mut self, name: &[u8]) -> bool {
+        self.0.observe_replay_variable(name);
         self.0.cache_defined(name)
     }
 
     fn env_defined(&mut self, name: &[u8]) -> bool {
+        self.0.observe_replay_env(name);
         self.0.env_defined(name)
     }
 
@@ -409,6 +415,7 @@ impl Interp {
         &mut self,
         args: &[ExpandedArg],
     ) -> Result<bool, CondError> {
+        self.observe_replay_condition(args);
         (self.frontend.cond)(args, &mut CommandExpansion(self))
     }
 
@@ -532,6 +539,14 @@ impl Interp {
             Command::Builtin(f, flags, _) => {
                 if self.config.mode == RunMode::Script && !flags.scriptable {
                     return Err(CmdError::Status("command is not scriptable".into()));
+                }
+                let guard = self
+                    .registry
+                    .guards
+                    .get(name)
+                    .or_else(|| self.registry.guards.get(name.strip_prefix(b"_")?));
+                if let Some(check) = guard.copied() {
+                    check(&mut self.cx(), args)?;
                 }
                 if matches!(name, b"mark_as_advanced" | b"_mark_as_advanced") {
                     self.warn_missing_advanced_entries(args);
@@ -681,6 +696,13 @@ impl Interp {
         end: usize,
         mode: BodyMode,
     ) -> CmdResult {
+        if mode == BodyMode::File
+            && !self.fatal
+            && !code.file.is_empty()
+            && let Some(paths) = &mut self.executed_listfiles
+        {
+            paths.insert(rcmake_host::path::to_native(&code.file));
+        }
         let mut i = start;
         while i < end {
             if self.fatal || self.over_budget() {
@@ -733,7 +755,21 @@ impl Interp {
         };
         let result = match cmd.lower.as_slice() {
             b"if" => self.exec_if(code, i),
-            b"foreach" => self.exec_foreach(code, i),
+            b"foreach" => {
+                let name = cmd.args.first().map(|arg| arg.text.as_slice());
+                let before = name
+                    .filter(|_| self.replay_observations.is_some())
+                    .and_then(|name| self.vars.lookup(name))
+                    .cloned();
+                let result = self.exec_foreach(code, i);
+                if let Some(name) = name
+                    && before.as_ref() != self.vars.lookup(name)
+                    && let Some(observed) = &mut self.replay_observations
+                {
+                    observed.vars.insert(name.into());
+                }
+                result
+            }
             b"while" => self.exec_while(code, i),
             b"function" => self.exec_define(code, i, UserCommandKind::Function),
             b"macro" => self.exec_define(code, i, UserCommandKind::Macro),

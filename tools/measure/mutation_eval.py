@@ -215,7 +215,7 @@ def make_edit(kind: str, leaf: Leaf, source: Path, step: int, rng: random.Random
     return Edit(kind, leaf.lists, files, effects)
 
 
-def configure(args, source: Path, build: Path, env: dict[str, str]) -> dict:
+def configure(args, source: Path, build: Path, env: dict[str, str], *, fresh=False) -> dict:
     """Request File API replies and configure one source copy."""
     query = build / API / "query"
     query.mkdir(parents=True, exist_ok=True)
@@ -229,8 +229,9 @@ def configure(args, source: Path, build: Path, env: dict[str, str]) -> dict:
     if not args.smoke:
         (build / REPLAY_RESULT).unlink(missing_ok=True)
         env = {**env, "RCMAKE_MEASURE_REPLAY": "1"}
+    flags = ["--fresh"] if fresh else []
     return run_command(
-        [args.rcmake, "-S", source, "-B", build, "-G", "Ninja",
+        [args.rcmake, *flags, "-S", source, "-B", build, "-G", "Ninja",
          "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON", *args.cmake_arg],
         source, args.timeout, env,
     )
@@ -404,8 +405,8 @@ def compare(args, report: dict, sources, builds, envs, step: int, edit: Edit | N
             previous: list[Observation]) -> list[Observation]:
     """Stop at the first divergence and save the edit and output differences."""
     lanes = ("incremental", "replay-off", "fresh-clean")
-    results = [configure(args, source, build, env)
-               for source, build, env in zip(sources, builds, envs)]
+    results = [configure(args, source, build, env, fresh=lane == "fresh-clean")
+               for lane, source, build, env in zip(lanes, sources, builds, envs)]
     row = {"step": step, "edit": edit.kind if edit else "initial configure",
            "files": [str(path) for path in edit.files] if edit else [],
            "exit_status": [result["returncode"] for result in results[:2]]}
@@ -557,6 +558,7 @@ def main() -> int:
     parser.add_argument("--model-dump")
     parser.add_argument("--timeout", type=int, default=120)
     args = parser.parse_args()
+    args.fresh_clean = args.fresh_clean or not args.smoke
     if args.out_json.resolve() == args.out_md.resolve():
         parser.error("Use different paths for the JSON and Markdown reports.")
     if args.edits < 1 or args.timeout < 1:

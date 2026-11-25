@@ -2,7 +2,9 @@ use std::io::ErrorKind;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use rcmake_eval::{InterpConfig, RunMode};
-use rcmake_host::{CommandSpec, HostResult, Input, Output, PureHost, ReadRange, RunRequest, path};
+use rcmake_host::{
+    CommandSpec, Follow, HostResult, Input, Output, PureHost, ReadRange, RunRequest, path,
+};
 
 use super::*;
 
@@ -61,6 +63,25 @@ fn strict_denies_a_symlink_escape_before_reading() -> HostResult<()> {
     let error = host.read(&path, ReadRange::All { limit: 100 }).unwrap_err();
     assert_eq!(error.kind, ErrorKind::PermissionDenied);
     assert!(runtime.denied());
+    Ok(())
+}
+
+#[test]
+fn strict_denies_both_rename_operations_with_an_external_source() -> HostResult<()> {
+    let (inner, runtime) = setup(HermeticMode::Strict)?;
+    let source = absolute("/private/data");
+    let target = absolute("/build/moved");
+    let host = runtime.host();
+    assert_eq!(
+        host.rename(&source, &target).unwrap_err().kind,
+        ErrorKind::PermissionDenied
+    );
+    assert_eq!(
+        host.rename_noreplace(&source, &target).unwrap_err().kind,
+        ErrorKind::PermissionDenied
+    );
+    assert!(inner.metadata(&source, Follow::No).is_ok());
+    assert!(inner.metadata(&target, Follow::No).is_err());
     Ok(())
 }
 
@@ -230,12 +251,18 @@ fn warn_substitutes_environment_values_and_writes_a_redacted_report() -> HostRes
     ] {
         assert!(report.contains(expected));
     }
+    let private_path = absolute("/private/data");
+    let native = path::from_native(&private_path).to_string();
+    let portable = path::from_native_cmake(&private_path).to_string();
+    let escaped = native.replace('\\', "\\\\");
     for private in [
         "password",
         "token=hidden",
         "private env value",
         "private file content",
-        "/private/data",
+        &native,
+        &portable,
+        &escaped,
     ] {
         assert!(!report.contains(private));
     }

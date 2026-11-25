@@ -127,6 +127,61 @@ FetchContent_Populate(archive
 }
 
 #[test]
+fn offline_blocks_direct_transfers_before_starting_a_process() -> TestResult {
+    let host = host()?;
+    host.env_set(b"RCMAKE_FETCH_OFFLINE", Some(b"1"));
+    let count = Arc::new(AtomicUsize::new(0));
+    let runs = Arc::clone(&count);
+    host.set_command_handler(move |_, _, _| {
+        runs.fetch_add(1, Ordering::Relaxed);
+        Ok(Default::default())
+    })?;
+    for command in [
+        "file(DOWNLOAD https://example.org/payload output)",
+        "file(UPLOAD input https://example.org/payload)",
+        "execute_process(COMMAND git clone https://example.org/repo)",
+        "execute_process(COMMAND git -C checkout fetch origin)",
+        "execute_process(COMMAND git ls-remote origin)",
+        "execute_process(COMMAND git submodule update --init)",
+    ] {
+        assert_ne!(
+            run(Arc::clone(&host), FetchLockMode::Off, command.as_bytes())?,
+            0
+        );
+    }
+    assert_eq!(count.load(Ordering::Relaxed), 0);
+    assert!(
+        host.stream_bytes(Stream::Stderr)
+            .to_string()
+            .contains("Offline fetch blocks remote transfers")
+    );
+    Ok(())
+}
+
+#[test]
+fn frozen_blocks_an_unmatched_external_project_transfer_via_a_symlink() -> TestResult {
+    let host = host()?;
+    let module = absolute("cmake/Modules/ExternalProject/custom.cmake");
+    host.seed_file(
+        &module,
+        b"file(DOWNLOAD https://example.org/payload output)\n",
+    )?;
+    let alias = absolute("project/custom.cmake");
+    host.symlink(&module, &alias)?;
+    let command = format!("include([[{}]])", path::from_native_cmake(&alias));
+    assert_ne!(
+        run(Arc::clone(&host), FetchLockMode::Frozen, command.as_bytes())?,
+        0
+    );
+    assert!(
+        host.stream_bytes(Stream::Stderr)
+            .to_string()
+            .contains("Frozen fetch blocks transfers")
+    );
+    Ok(())
+}
+
+#[test]
 fn updates_the_lock_and_populates_an_offline_archive() -> TestResult {
     let host = host()?;
     let launches = Arc::new(AtomicUsize::new(0));
