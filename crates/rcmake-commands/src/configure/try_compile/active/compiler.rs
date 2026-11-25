@@ -93,10 +93,13 @@ pub(super) fn admit_cmake_flag(flag: &[u8]) -> bool {
         return false;
     };
     let mut parts = define.splitn(2, |&byte| byte == b'=');
-    let Some(name) = parts.next().filter(|_| parts.next().is_some()) else {
+    let (Some(name), Some(value)) = (parts.next(), parts.next()) else {
         return false;
     };
     let key = name.split(|&byte| byte == b':').next().unwrap_or_default();
+    if key == b"CMAKE_SKIP_RPATH" {
+        return rcmake_base::truth::is_on(value) || rcmake_base::truth::is_off(value);
+    }
     matches!(
         key,
         b"COMPILE_DEFINITIONS"
