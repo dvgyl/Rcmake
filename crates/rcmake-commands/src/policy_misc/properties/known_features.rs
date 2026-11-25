@@ -31,7 +31,7 @@ const CUDA: &str =
     "cuda_std_03;cuda_std_11;cuda_std_14;cuda_std_17;cuda_std_20;cuda_std_23;cuda_std_26";
 const HIP: &str = "hip_std_98;hip_std_11;hip_std_14;hip_std_17;hip_std_20;hip_std_23;hip_std_26";
 
-pub(super) const STANDARD_FEATURES: &[(&str, &str)] = &[
+pub(crate) const STANDARD_FEATURES: &[(&str, &str)] = &[
     ("CMAKE_C90_KNOWN_FEATURES", C90),
     ("CMAKE_C99_KNOWN_FEATURES", C99),
     ("CMAKE_C11_KNOWN_FEATURES", C11),
@@ -40,7 +40,7 @@ pub(super) const STANDARD_FEATURES: &[(&str, &str)] = &[
     ("CMAKE_CXX14_KNOWN_FEATURES", CXX14),
 ];
 
-pub(super) const LANGUAGES: &[&str] = &[
+pub(crate) const LANGUAGES: &[&str] = &[
     "CMAKE_C_KNOWN_FEATURES",
     "CMAKE_CXX_KNOWN_FEATURES",
     "CMAKE_CUDA_KNOWN_FEATURES",
@@ -48,7 +48,7 @@ pub(super) const LANGUAGES: &[&str] = &[
     "CMAKE_SYCL_KNOWN_FEATURES",
 ];
 
-pub(super) fn known_features(name: &[u8]) -> Option<String> {
+pub(crate) fn known_features(name: &[u8]) -> Option<String> {
     if !LANGUAGES.iter().any(|key| key.as_bytes() == name) {
         return STANDARD_FEATURES
             .iter()

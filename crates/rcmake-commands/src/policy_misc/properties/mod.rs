@@ -15,7 +15,7 @@ mod define;
 mod file_set;
 mod generated;
 mod get;
-mod known_features;
+pub(crate) mod known_features;
 mod print;
 mod rule;
 mod scope;

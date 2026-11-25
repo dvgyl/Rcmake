@@ -2377,11 +2377,12 @@ fn xcode_uses_root_object_directory_for_subdirectory_targets() -> TestResult {
 }
 
 #[test]
-fn xcode_evaluates_embed_paths_and_rejects_per_config_embed_paths() -> TestResult {
+fn xcode_resolves_embed_paths_and_records_per_config_diagnostic() -> TestResult {
     use ide::IdeFlavor;
 
     let mut model = project();
     let mut app = target("app", TargetKind::Executable, &["main.c"]);
+    app.props.set("MACOSX_BUNDLE".into(), "ON".into());
     app.props.set(
         "XCODE_EMBED_FRAMEWORKS".into(),
         "$<1:Vendor.framework>".into(),
@@ -2401,24 +2402,31 @@ fn xcode_evaluates_embed_paths_and_rejects_per_config_embed_paths() -> TestResul
         .and_then(|target| target.ide.as_deref())
         .ok_or("Missing IDE facts.")?;
     assert_eq!(
-        facts.attributes[b"XCODE_EMBED_FRAMEWORKS".as_slice()],
-        "Vendor.framework"
+        facts.attributes.get(b"XCODE_EMBED_FRAMEWORKS".as_slice()),
+        Some(&"Vendor.framework".into())
     );
+    assert_eq!(facts.xcode_config_sensitive_embed, None);
     model.target_mut(app).ok_or("Missing target.")?.props.set(
         "XCODE_EMBED_FRAMEWORKS".into(),
         "$<$<CONFIG:Debug>:Vendor.framework>".into(),
     );
-    let error = resolve_with_options(&model, &host, &configs, &options).err();
+    let result = resolve_with_options(&model, &host, &configs, &options)?;
+    let facts = result
+        .targets
+        .iter()
+        .find(|target| target.id == app)
+        .and_then(|target| target.ide.as_deref())
+        .ok_or("Missing IDE facts.")?;
     assert_eq!(
-        error,
-        Some(ResolveError::Message(
+        facts.xcode_config_sensitive_embed,
+        Some(
             concat!(
                 "Xcode does not support per-config XCODE_EMBED_FRAMEWORKS:",
                 "\n\n  $<$<CONFIG:Debug>:Vendor.framework>",
                 "\n\nspecified for target:\n\n  app",
             )
             .into()
-        ))
+        )
     );
     Ok(())
 }

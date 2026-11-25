@@ -1421,7 +1421,7 @@ fn script_recursion_and_expansion_caps() {
             ),
             // An undefined list gives NOTFOUND and exit code 0, the same as CMake 4.5.1.
             (b"list(GET x 99999999999999999999 y)\nlist(SUBLIST x -5 -5 y)\n".to_vec(), &[0]),
-            (b"set(x a;b)\nlist(GET x 99999999999999999999 y)\n".to_vec(), &[1]),
+            (b"cmake_policy(SET CMP0121 NEW)\nset(x a;b)\nlist(GET x 99999999999999999999 y)\n".to_vec(), &[1]),
             (b"foreach(i RANGE 5 0 -1)\nendforeach()\nforeach(i RANGE 0 5 0)\nendforeach()\n".to_vec(), &[0, 1]),
             (b"cmake_language(EXIT 300)\n".to_vec(), &[0, 1, 44, 255, 300]),
             (b"message(FATAL_ERROR \"\0\")\n".to_vec(), &[1]),

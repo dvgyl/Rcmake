@@ -670,7 +670,7 @@ fn errors_match_oracle_status_text() {
         ),
         ("set(a \"\")\nlist(GET a 0 o)", "list GET given empty list"),
         (
-            "set(a x y)\nlist(GET a 1.x o)",
+            "cmake_policy(SET CMP0121 NEW)\nset(a x y)\nlist(GET a 1.x o)",
             "list index: 1.x is not a valid index",
         ),
         (

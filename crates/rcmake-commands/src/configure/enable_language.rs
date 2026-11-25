@@ -23,6 +23,8 @@ use rcmake_expr::ExpandedArg;
 use rcmake_host::{Follow, Stream, path};
 use rcmake_model::{CacheEntry, CacheType, GeneratorKind};
 
+use crate::policy_misc::properties::known_features;
+
 const CMP0132: PolicyId = PolicyId::new(132);
 const CMP0165: PolicyId = PolicyId::new(165);
 const CMP0220: PolicyId = PolicyId::new(220);
@@ -31,9 +33,6 @@ const ENABLED_LANGUAGES: &[u8] = b"ENABLED_LANGUAGES";
 const IN_TRY_COMPILE: &[u8] = b"IN_TRY_COMPILE";
 const PLATFORM_INFO_DIR: &[u8] = b"CMAKE_PLATFORM_INFO_DIR";
 const PLATFORM_INFO_INITIALIZED: &[u8] = b"CMAKE_PLATFORM_INFO_INITIALIZED";
-
-#[path = "../policy_misc/properties/known_features.rs"]
-mod known_features;
 
 /// `enable_language(<lang>... [OPTIONAL])`.
 pub(super) fn enable_language(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {

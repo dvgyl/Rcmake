@@ -17,8 +17,12 @@ use rcmake_eval::Interp;
 use rcmake_host::{FileKind, Follow, Host, HostError, HostResult, Stream, WriteMode};
 use rcmake_json::{Value, write_compact};
 
+// Activated in Milestone 6 Wave 1B
+#[allow(dead_code)]
 mod flamegraph;
+#[allow(dead_code)]
 mod terminal;
+#[allow(dead_code)]
 mod trace;
 
 /// Record a CMake-compatible Google Trace.
@@ -367,6 +371,8 @@ impl Coverage {
 
 impl ProfileRecorder {
     /// Start an empty native profile.
+    // Activated in Milestone 6 Wave 1B
+    #[allow(dead_code)]
     pub(crate) fn new() -> Self {
         Self::with_limits(
             MAX_SAMPLES.min(MAX_SAMPLE_BYTES / size_of::<Span>()),
@@ -435,6 +441,8 @@ impl ProfileRecorder {
     }
 
     /// Store a phase sample with times from the host's monotonic clock.
+    // Activated in Milestone 6 Wave 1B
+    #[allow(dead_code)]
     pub(crate) fn record_phase(&self, phase: ProfilePhase, start: Duration, finish: Duration) {
         self.record(ProfileSample {
             name: phase.name().as_bytes(),
@@ -448,6 +456,8 @@ impl ProfileRecorder {
     }
 
     /// Write the terminal summary and publish the complete native profile files.
+    // Activated in Milestone 6 Wave 1B
+    #[allow(dead_code)]
     pub(crate) fn write(
         &self,
         host: &dyn Host,
@@ -642,7 +652,7 @@ impl EnclosingSpans {
         let eligible = self.spans.partition_point(|&(_, candidate_end, _)| {
             candidate_end >= end && candidate_end > child.start
         });
-        let mut candidates = self.spans[..eligible].iter().rev();
+        let mut candidates = self.spans.get(..eligible)?.iter().rev();
         let &(start, candidate_end, index) = candidates.next()?;
         if strict && (start, candidate_end) == (child.start, end) {
             candidates.next().map(|&(_, _, index)| index)
@@ -676,8 +686,12 @@ impl Tracks {
                 break;
             }
             self.finishing.pop();
-            let finished = &spans[previous];
-            let top = &mut self.tops[finished.tid as usize];
+            let Some(finished) = spans.get(previous) else {
+                continue;
+            };
+            let Some(top) = self.tops.get_mut(finished.tid as usize) else {
+                continue;
+            };
             if *top != Some(previous) {
                 continue;
             }
@@ -685,14 +699,15 @@ impl Tracks {
             // together so the next sibling finds the right top frame.
             *top = finished.parent;
             while let Some(parent) = *top {
-                let enclosing = &spans[parent];
-                if enclosing.tid != finished.tid {
+                let Some(enclosing) = spans.get(parent).filter(|span| span.tid == finished.tid)
+                else {
                     *top = None;
-                } else if enclosing.end() <= span.start {
-                    *top = enclosing.parent;
-                } else {
+                    break;
+                };
+                if enclosing.end() > span.start {
                     break;
                 }
+                *top = enclosing.parent;
             }
             if top.is_none() {
                 self.free
@@ -702,21 +717,27 @@ impl Tracks {
             }
         }
 
-        let parent_track = span.parent.map(|parent| spans[parent].tid);
-        let tid = parent_track
-            .filter(|&tid| self.tops[tid as usize] == span.parent)
+        let tid = span
+            .parent
+            .and_then(|parent| spans.get(parent))
+            .map(|parent| parent.tid)
+            .filter(|&tid| self.tops.get(tid as usize) == Some(&span.parent))
             .or_else(|| {
                 self.free
                     .get_mut(&span.thread)?
                     .pop()
                     .map(|Reverse(tid)| tid)
-            })
-            .unwrap_or_else(|| {
-                let tid = self.tops.len() as u32;
-                self.tops.push(None);
-                tid
             });
-        self.tops[tid as usize] = Some(index);
+        let tid = if let Some(tid) = tid
+            && let Some(top) = self.tops.get_mut(tid as usize)
+        {
+            *top = Some(index);
+            tid
+        } else {
+            let tid = self.tops.len() as u32;
+            self.tops.push(Some(index));
+            tid
+        };
         self.finishing.push(Reverse((span.end(), index)));
         tid
     }
@@ -729,19 +750,23 @@ fn resolve_spans(spans: &mut [Span]) -> Duration {
     let mut root = Coverage::default();
     for index in 0..spans.len() {
         let (prior, remaining) = spans.split_at_mut(index);
-        let span = &mut remaining[0];
+        let [span, ..] = remaining else {
+            break;
+        };
         let thread = ancestry.entry(span.thread).or_default();
         span.parent = thread.parent(span);
         if span.infer_depth {
-            span.depth = span.parent.map_or(0, |parent| {
-                let enclosing = &prior[parent];
-                enclosing
-                    .depth
-                    .saturating_add(u32::from(enclosing.site.kind.is_command()))
-            });
+            span.depth = span
+                .parent
+                .and_then(|parent| prior.get(parent))
+                .map_or(0, |parent| {
+                    parent
+                        .depth
+                        .saturating_add(u32::from(parent.site.kind.is_command()))
+                });
         }
-        if let Some(parent) = span.parent {
-            covered[parent].add(span.start, span.end());
+        if let Some(coverage) = span.parent.and_then(|parent| covered.get_mut(parent)) {
+            coverage.add(span.start, span.end());
         }
         root.add(span.start, span.end());
         thread.insert(span, index);

@@ -13,7 +13,7 @@ pub(crate) mod introspection;
 mod language;
 mod policies;
 mod project;
-mod properties;
+pub(crate) mod properties;
 mod system;
 
 pub(crate) use policies::issue_warning;

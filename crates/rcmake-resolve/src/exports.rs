@@ -3,7 +3,7 @@ mod interface_paths;
 use indexmap::{IndexMap, IndexSet, map::Entry};
 use rcmake_base::{BString, list, path_lex::Lexical};
 use rcmake_diag::{
-    Diagnostic, Effect, Location, MessageKind, PolicyId, PolicyStatus, RenderOptions,
+    Diagnostic, Effect, MessageKind, PolicyId, PolicyStatus, RenderOptions,
     render as render_diagnostic,
 };
 use rcmake_genex::{ConfigId, EvalContext, GenexNode, PreprocessMode, TargetHandle, render};

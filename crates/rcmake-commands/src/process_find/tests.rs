@@ -972,33 +972,41 @@ get_property(missing GLOBAL PROPERTY PACKAGES_NOT_FOUND)
 
 #[test]
 fn find_package_handles_disabled_optional_and_required_packages() -> HostResult<()> {
-    for (script, code, message) in [
-        ("find_package(Missing CONFIG QUIET)", 0, ""),
-        ("find_package(Missing CONFIG OPTIONAL)", 0, ""),
+    for (script, code, found, message) in [
+        ("find_package(Missing CONFIG QUIET)", 0, Some("0"), ""),
+        ("find_package(Missing CONFIG OPTIONAL)", 0, Some("0"), ""),
         (
             "find_package(Missing CONFIG REQUIRED)",
             1,
+            Some("0"),
             "Could not find a package configuration file provided by \"Missing\"",
         ),
         (
             "set(CMAKE_REQUIRE_FIND_PACKAGE_Missing ON)\nfind_package(Missing CONFIG OPTIONAL)",
             1,
+            Some("0"),
             "Could not find a package configuration file provided by \"Missing\"",
         ),
         (
             "set(CMAKE_DISABLE_FIND_PACKAGE_Missing ON)\nfind_package(Missing)",
             0,
+            None,
             "",
         ),
         (
             "set(CMAKE_DISABLE_FIND_PACKAGE_Missing ON)\nfind_package(Missing REQUIRED)",
             1,
+            None,
             "A REQUIRED package cannot",
         ),
     ] {
         let (host, mut interp) = setup_package();
         assert_eq!(run(&host, &mut interp, script)?, code, "{script}");
-        assert_eq!(var(&mut interp, b"Missing_FOUND"), "0", "{script}");
+        assert_eq!(
+            interp.cx().var(b"Missing_FOUND"),
+            found.map(BString::from),
+            "{script}"
+        );
         let stderr = host.stream_bytes(Stream::Stderr);
         if message.is_empty() {
             assert!(stderr.is_empty(), "{stderr}");
