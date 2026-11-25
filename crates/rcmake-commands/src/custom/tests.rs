@@ -402,3 +402,29 @@ fn append_to_a_plain_missing_output_fails_at_the_call() -> TestResult {
     assert!(!text.contains("DEFERRED"), "{text}");
     Ok(())
 }
+
+#[test]
+fn if_rule_uses_directory_and_global_visibility() -> TestResult {
+    let mut f = Fixture::new();
+    f.host.seed_file(
+        &f.source.join("sub/CMakeLists.txt"),
+        br#"
+        if(NOT RULE parent_rule)
+          message(FATAL_ERROR "Parent rule is missing")
+        endif()
+        add_custom_rule(local_rule OUTPUT local.out COMMAND tool)
+        add_custom_rule(global_rule OUTPUT global.out COMMAND tool GLOBAL)
+        "#,
+    )?;
+    f.configure(
+        r#"
+        project(Rules LANGUAGES NONE)
+        add_custom_rule(parent_rule OUTPUT parent.out COMMAND tool)
+        add_subdirectory(sub)
+        if(NOT RULE parent_rule OR NOT RULE global_rule OR RULE local_rule OR RULE absent_rule)
+          message(FATAL_ERROR "Incorrect rule visibility")
+        endif()
+        "#,
+        0,
+    )
+}

@@ -1072,3 +1072,51 @@ fn file_set_diagnostics_follow_cmake_text() -> TestResult {
     assert!(!text.contains("target_sources File:"), "{text}");
     Ok(())
 }
+
+#[test]
+fn rule_file_sets_have_their_own_target_properties() -> TestResult {
+    let (_, mut interp) = configure(
+        r#"
+        add_custom_rule(generate OUTPUT out COMMAND tool)
+        add_library(lib STATIC first.c)
+        target_sources(lib PUBLIC FILE_SET native TYPE SOURCES FILES normal.c
+                                  FILE_SET shared TYPE generate FILES shared.in
+                           PRIVATE FILE_SET local TYPE generate FILES local.in
+                           INTERFACE FILE_SET api TYPE generate FILES api.in)
+        get_target_property(types lib FILE_SET_TYPES)
+        get_target_property(native lib FILE_SETS_SOURCES)
+        get_target_property(own lib FILE_SETS_generate)
+        get_target_property(api lib INTERFACE_FILE_SETS_generate)
+        get_target_property(sources lib SOURCE_SETS)
+        get_target_property(interface_sources lib INTERFACE_SOURCE_SETS)
+        get_target_property(files lib SOURCE_SET_shared)
+        get_target_property(dirs lib SOURCE_DIRS_shared)
+        "#,
+        &[],
+        0,
+    )?;
+    for (name, value) in [
+        ("types", "SOURCES;generate"),
+        ("native", "native"),
+        ("own", "shared;local"),
+        ("api", "shared;api"),
+        ("sources", "native"),
+        ("interface_sources", "native"),
+        ("files", "files-NOTFOUND"),
+        ("dirs", "dirs-NOTFOUND"),
+    ] {
+        var(&mut interp, name, value);
+    }
+    let mut cx = interp.cx();
+    let model = cx.project();
+    let id = model
+        .find_target(DirId::ROOT, b"lib")
+        .ok_or("missing target")?;
+    let target = model.target(id).ok_or("missing target")?;
+    assert_eq!(
+        target.props.get(b"FILE_SETS_generate"),
+        Some(&"shared;local".into())
+    );
+    assert!(target.props.get(b"SOURCE_SET_shared").is_none());
+    Ok(())
+}

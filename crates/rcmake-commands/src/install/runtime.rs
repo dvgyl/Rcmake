@@ -1,6 +1,7 @@
 use rcmake_base::{BString, path_lex::Lexical};
 use rcmake_eval::{CmdResult, Cx, Flow};
-use rcmake_model::{InstallOptions, RuntimeDependencyInstall};
+use rcmake_model::{InstallOptions, RuntimeDependencyInstall, TargetId, TargetKind};
+use rcmake_resolve::ide::{BundleKind, bundle_kind};
 
 use super::{Result, common, fail, keyword, record_request, values, warn_absolute_destination};
 
@@ -46,7 +47,7 @@ pub(super) fn set(cx: &mut Cx<'_>, input: &[&[u8]]) -> CmdResult {
         }
     }
 
-    let libraries = if system == b"Windows" {
+    let libraries = if uses_runtime_group(cx) {
         groups.runtime
     } else {
         groups.library
@@ -87,13 +88,8 @@ pub(super) fn set(cx: &mut Cx<'_>, input: &[&[u8]]) -> CmdResult {
     Ok(Flow::Normal)
 }
 
-pub(super) fn require_supported(cx: &Cx<'_>, signature: &[u8]) -> Result<BString> {
-    let system = cx.var_or_empty(b"CMAKE_SYSTEM_NAME");
-    let system = if system.is_empty() {
-        cx.host().system().sysname
-    } else {
-        system
-    };
+fn require_supported(cx: &Cx<'_>, signature: &[u8]) -> Result<BString> {
+    let system = cx.var_or_empty(b"CMAKE_HOST_SYSTEM_NAME");
     if matches!(system.as_slice(), b"Linux" | b"Darwin" | b"Windows") {
         Ok(system)
     } else {
@@ -101,6 +97,89 @@ pub(super) fn require_supported(cx: &Cx<'_>, signature: &[u8]) -> Result<BString
             [signature, b" is not supported on system \"", &system, b"\""].concat(),
         ))
     }
+}
+
+pub(super) fn uses_runtime_group(cx: &Cx<'_>) -> bool {
+    !cx.var_or_empty(b"CMAKE_IMPORT_LIBRARY_SUFFIX").is_empty()
+}
+
+pub(super) fn validate_target_dependencies(
+    cx: &Cx<'_>,
+    anonymous: bool,
+    named: Option<&[u8]>,
+    options: &InstallOptions,
+    apple_destinations: &[(BString, BString)],
+) -> Result<()> {
+    if !anonymous {
+        if named.is_some() {
+            require_supported(cx, b"TARGETS RUNTIME_DEPENDENCY_SET")?;
+        }
+        return Ok(());
+    }
+    if named.is_some() {
+        return Err(fail(
+            "TARGETS cannot have both RUNTIME_DEPENDENCIES and RUNTIME_DEPENDENCY_SET.",
+        ));
+    }
+    let system = require_supported(cx, b"TARGETS RUNTIME_DEPENDENCIES")?;
+    if cx.var_is_on(b"CMAKE_CROSSCOMPILING") {
+        return Err(fail(
+            "TARGETS RUNTIME_DEPENDENCIES is not supported when cross-compiling.",
+        ));
+    }
+    if system == b"Darwin"
+        && options
+            .destination
+            .as_ref()
+            .is_none_or(|path| path.is_empty())
+        && apple_destinations
+            .iter()
+            .rev()
+            .find(|(group, _)| group == b"FRAMEWORK")
+            .is_none_or(|(_, path)| path.is_empty())
+    {
+        return Err(fail(
+            "TARGETS RUNTIME_DEPENDENCIES given no FRAMEWORK DESTINATION",
+        ));
+    }
+    Ok(())
+}
+
+pub(super) fn register_target_bundles(
+    cx: &mut Cx<'_>,
+    set: Option<&[u8]>,
+    targets: &[TargetId],
+) -> Result<()> {
+    if !super::apple::is_apple(cx) {
+        return Ok(());
+    }
+    let model = cx.project();
+    let count = targets
+        .iter()
+        .filter_map(|&id| model.target(id))
+        .filter(|target| {
+            target.kind == TargetKind::Executable
+                && matches!(bundle_kind(target), BundleKind::App { .. })
+        })
+        .count();
+    register_bundles(cx, set, count)
+}
+
+fn register_bundles(cx: &mut Cx<'_>, set: Option<&[u8]>, count: usize) -> Result<()> {
+    if count == 0 {
+        return Ok(());
+    }
+    let key = set.map(|name| BString::from([b"_RCMAKE_RDS_BUNDLE_", name].concat()));
+    let props = &mut cx.global().props;
+    if count > 1 || key.as_ref().is_some_and(|key| props.get(key).is_some()) {
+        return Err(fail(
+            "A runtime dependency set may only have one bundle executable.",
+        ));
+    }
+    if let Some(key) = key {
+        props.set(key, "1".into());
+    }
+    Ok(())
 }
 
 pub(super) fn filter_keyword(key: &[u8]) -> bool {
@@ -119,7 +198,7 @@ pub(super) fn filter_keyword(key: &[u8]) -> bool {
 const IMPORTED: &[u8] = b"IMPORTED_RUNTIME_ARTIFACTS";
 
 pub(super) fn imported(cx: &mut Cx<'_>, input: &[&[u8]]) -> CmdResult {
-    use rcmake_model::{BT, InstallKind, InstallRule, TargetKind};
+    use rcmake_model::{BT, InstallKind, InstallRule};
 
     let mut args = input.iter().copied().peekable();
     let names = values(&mut args);
@@ -129,7 +208,8 @@ pub(super) fn imported(cx: &mut Cx<'_>, input: &[&[u8]]) -> CmdResult {
     while let Some(key) = args.next() {
         match key {
             b"RUNTIME_DEPENDENCY_SET" if group.is_empty() => {
-                dependency_set = Some(super::value(&mut args, key)?);
+                dependency_set =
+                    Some(super::value(&mut args, key)?).filter(|name| !name.is_empty());
             }
             b"LIBRARY" | b"RUNTIME" | b"FRAMEWORK" | b"BUNDLE" => group = key,
             _ if common(
@@ -148,8 +228,11 @@ pub(super) fn imported(cx: &mut Cx<'_>, input: &[&[u8]]) -> CmdResult {
         }
     }
 
+    if dependency_set.is_some() {
+        require_supported(cx, b"IMPORTED_RUNTIME_ARTIFACTS RUNTIME_DEPENDENCY_SET")?;
+    }
     let system = cx.var_or_empty(b"CMAKE_SYSTEM_NAME");
-    let apple = system == b"Darwin";
+    let apple = super::apple::is_apple(cx);
     let dll = system.starts_with(b"Windows") || system == b"CYGWIN";
     let dir = cx.current_dir_id();
     let trace = cx.backtrace();
@@ -157,6 +240,7 @@ pub(super) fn imported(cx: &mut Cx<'_>, input: &[&[u8]]) -> CmdResult {
     let base = groups.remove(b"".as_slice()).unwrap_or_default();
     let dist = cx.project();
     let mut rules = Vec::new();
+    let mut bundle_count = 0;
     for name in names {
         let Some(target) = dist
             .find_target(dir, name)
@@ -191,22 +275,25 @@ pub(super) fn imported(cx: &mut Cx<'_>, input: &[&[u8]]) -> CmdResult {
         let grouped = groups.get(kind).cloned().unwrap_or_default();
         let options = merge_imported_options(&base, grouped, &default_component, target);
         let program = target.kind == TargetKind::Executable || dll;
+        if target.kind == TargetKind::Executable && kind == b"BUNDLE" {
+            bundle_count += 1;
+        }
         rules.push((name, kind, program, options));
     }
-    for (name, kind, program, mut options) in rules {
+    for (name, kind, _, options) in &mut rules {
         if options
             .destination
             .as_ref()
             .is_none_or(|path| path.is_empty())
         {
-            options.destination = Some(match kind {
+            options.destination = Some(match *kind {
                 b"RUNTIME" => super::type_destination(cx, b"BIN")?,
                 b"LIBRARY" => super::type_destination(cx, b"LIB")?,
                 _ => {
                     return Err(fail(format!(
                         "IMPORTED_RUNTIME_ARTIFACTS given no {} DESTINATION for imported target \"{}\".",
-                        BString::from(kind),
-                        BString::from(name)
+                        BString::from(*kind),
+                        BString::from(*name)
                     )));
                 }
             });
@@ -218,6 +305,11 @@ pub(super) fn imported(cx: &mut Cx<'_>, input: &[&[u8]]) -> CmdResult {
         {
             warn_absolute_destination(cx, path);
         }
+    }
+    if dependency_set.is_some() {
+        register_bundles(cx, dependency_set, bundle_count)?;
+    }
+    for (name, _, program, options) in rules {
         let file = BT::new(
             [b"$<TARGET_FILE:".as_slice(), name, b">"].concat().into(),
             trace.clone(),

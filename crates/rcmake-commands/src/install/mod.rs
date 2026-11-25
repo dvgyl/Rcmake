@@ -14,6 +14,7 @@ use rcmake_model::{
     UsageScope,
 };
 
+mod android_mk;
 mod apple;
 mod components;
 mod destinations;
@@ -98,6 +99,7 @@ fn keyword(token: &[u8]) -> bool {
                 | b"APPEND"
                 | b"RUNTIME_DEPENDENCY_SET"
                 | b"RUNTIME_DEPENDENCIES"
+                | b"RUNTIME_DEPENDENCY_TARGETS"
                 | b"BUILD_DEPENDS"
         )
         || runtime::filter_keyword(token)
@@ -235,6 +237,7 @@ fn install(cx: &mut Cx<'_>, input: &[ExpandedArg]) -> CmdResult {
             paths::parse(cx, signature, &mut args, &mut options)?
         }
         b"EXPORT" => install_export(cx, &mut args, &mut options)?,
+        b"EXPORT_ANDROID_MK" => android_mk::parse(cx, &mut args, &mut options)?,
         b"PACKAGE_INFO" | b"SBOM" => metadata::install(cx, signature, rest, &mut options)?,
         _ => {
             return Err(fail(
@@ -262,6 +265,7 @@ fn install(cx: &mut Cx<'_>, input: &[ExpandedArg]) -> CmdResult {
         .destination
         .iter()
         .chain(destinations)
+        .filter(|_| *signature != b"EXPORT_ANDROID_MK")
         .filter(|path| Lexical::new(path).absolute())
         .cloned()
         .collect::<Vec<_>>();
@@ -399,8 +403,13 @@ fn warn_absolute_destination(cx: &mut Cx<'_>, path: &[u8]) {
 }
 
 pub(crate) fn default_component(cx: &mut Cx<'_>) -> BString {
-    cx.var(b"CMAKE_INSTALL_DEFAULT_COMPONENT_NAME")
-        .filter(|name| !name.is_empty())
+    let name = cx.var(b"CMAKE_INSTALL_DEFAULT_COMPONENT_NAME");
+    let name = if name.as_ref().is_some_and(|name| name == b"<PROJECT_NAME>") {
+        cx.var(b"PROJECT_NAME")
+    } else {
+        name
+    };
+    name.filter(|name| !name.is_empty())
         .unwrap_or_else(|| "Unspecified".into())
 }
 
@@ -411,12 +420,14 @@ fn targets(
     destinations: &mut Vec<(usize, BString, bool)>,
 ) -> Result<(InstallKind, bool, std::collections::BTreeSet<BString>)> {
     let argument_count = args.len() + 1;
-    let targets = target_ids(cx, values(args), true)?;
+    let names = values(args);
     let mut export = None;
     let mut artifact_options = InstallOptions::default();
     let mut destination_argument = None;
     let mut group: Option<&[u8]> = None;
-    let mut dependencies = None;
+    let mut anonymous_dependencies = false;
+    let mut dependency_set = None;
+    let mut transitive = false;
     let mut namelink = None;
     let mut namelink_component = None;
     let mut component_groups = Vec::new();
@@ -427,24 +438,12 @@ fn targets(
     while let Some(key) = args.next() {
         match key {
             b"EXPORT" if group.is_none() => export = Some(value(args, key)?.into()),
-            b"RUNTIME_DEPENDENCY_SET" | b"RUNTIME_DEPENDENCIES" if group.is_none() => {
-                if dependencies
-                    .replace(key)
-                    .is_some_and(|previous| previous != key)
-                {
-                    return Err(fail(
-                        "TARGETS cannot have both RUNTIME_DEPENDENCIES and RUNTIME_DEPENDENCY_SET.",
-                    ));
-                }
-                runtime::require_supported(cx, &[b"TARGETS ", key].concat())?;
-                if key == b"RUNTIME_DEPENDENCY_SET" {
-                    value(args, key)?;
-                }
+            b"RUNTIME_DEPENDENCY_SET" if group.is_none() => {
+                dependency_set = Some(value(args, key)?).filter(|name| !name.is_empty());
             }
-            key if dependencies == Some(b"RUNTIME_DEPENDENCIES")
-                && group.is_none()
-                && runtime::filter_keyword(key) =>
-            {
+            b"RUNTIME_DEPENDENCIES" if group.is_none() => anonymous_dependencies = true,
+            b"RUNTIME_DEPENDENCY_TARGETS" if group.is_none() => transitive = true,
+            key if anonymous_dependencies && group.is_none() && runtime::filter_keyword(key) => {
                 values(args);
             }
             b"INCLUDES" => {
@@ -526,6 +525,19 @@ fn targets(
             }
         }
     }
+    if transitive && export.is_some() {
+        return Err(fail(
+            "TARGETS RUNTIME_DEPENDENCY_TARGETS cannot be used with EXPORT.",
+        ));
+    }
+    runtime::validate_target_dependencies(
+        cx,
+        anonymous_dependencies,
+        dependency_set,
+        options,
+        &apple_destinations,
+    )?;
+    let targets = target_ids(cx, names, true)?;
     if let Some(group) = group {
         component_groups.push(components::Group {
             key: group,
@@ -550,7 +562,16 @@ fn targets(
     if export.is_some() {
         require_exported_file_sets(cx, &targets, &file_sets)?;
     }
-    let components = components::for_targets(cx, &targets, options, &component_groups);
+    if anonymous_dependencies || dependency_set.is_some() {
+        runtime::register_target_bundles(cx, dependency_set, &targets)?;
+    }
+    let components = components::for_targets(
+        cx,
+        &targets,
+        options,
+        &component_groups,
+        anonymous_dependencies,
+    );
     Ok((
         InstallKind::Targets { targets, export },
         library_namelink_only,

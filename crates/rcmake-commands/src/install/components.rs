@@ -19,6 +19,7 @@ pub(super) fn for_targets(
     targets: &[TargetId],
     options: &InstallOptions,
     groups: &[Group<'_>],
+    anonymous_dependencies: bool,
 ) -> BTreeSet<BString> {
     let default = options
         .component
@@ -27,8 +28,38 @@ pub(super) fn for_targets(
         .cloned()
         .unwrap_or_else(|| super::default_component(cx));
     let dll = cx.var_is_on(b"WIN32") || cx.var_is_on(b"CYGWIN");
+    let dependency_group = if super::runtime::uses_runtime_group(cx) {
+        b"RUNTIME".as_slice()
+    } else {
+        b"LIBRARY"
+    };
+    let darwin_host = cx.var_or_empty(b"CMAKE_HOST_SYSTEM_NAME") == b"Darwin";
     let model = cx.project();
     let mut components = BTreeSet::new();
+    if anonymous_dependencies
+        && targets
+            .iter()
+            .filter_map(|&id| model.target(id))
+            .any(|target| {
+                matches!(
+                    target.kind,
+                    TargetKind::Executable | TargetKind::SharedLibrary | TargetKind::ModuleLibrary
+                )
+            })
+    {
+        for key in
+            std::iter::once(dependency_group).chain(darwin_host.then_some(b"FRAMEWORK".as_slice()))
+        {
+            let component = groups
+                .iter()
+                .rev()
+                .find(|group| group.key == key)
+                .and_then(|group| group.component.as_ref())
+                .filter(|name| !name.is_empty())
+                .unwrap_or(&default);
+            components.insert(component.clone());
+        }
+    }
     for target in targets.iter().filter_map(|&id| model.target(id)) {
         let on = |key: &[u8]| {
             target
@@ -120,6 +151,10 @@ pub(crate) fn registered(model: &ProjectModel) -> BTreeSet<BString> {
                     .unwrap_or_else(|| "Unspecified".into())
             }));
         }
+    }
+    for install in &model.runtime_dependency_installs {
+        let options = std::iter::once(&install.library).chain(install.framework.as_ref());
+        components.extend(options.filter_map(|options| options.component.clone()));
     }
     components
 }

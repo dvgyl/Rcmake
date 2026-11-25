@@ -119,9 +119,10 @@ impl CondEnv for Interp {
             .is_some()
     }
 
-    fn rule_exists(&self, _name: &[u8]) -> bool {
-        // No command creates custom rules yet.
-        false
+    fn rule_exists(&self, name: &[u8]) -> bool {
+        self.project
+            .custom_rule(self.current_dir_id(), name)
+            .is_some()
     }
 
     fn policy(&self, id: PolicyId) -> PolicyStatus {

@@ -5,8 +5,8 @@ use rcmake_diag::{Effect, MessageKind, PolicyId, PolicyStatus};
 use rcmake_eval::{CmdError, CmdResult, Cx, Flow};
 use rcmake_expr::ExpandedArg;
 use rcmake_model::{
-    BT, DirId, FileSetId, FileSetKind, ModelError, ProjectModel, PropOrigin, PropScope, Target,
-    TargetBinding, TargetId, TargetKind, UsageScope,
+    BT, DirId, FileSet, FileSetId, FileSetKind, ModelError, ProjectModel, PropOrigin, PropScope,
+    Target, TargetBinding, TargetId, TargetKind, UsageScope,
 };
 
 use rcmake_resolve::usage::UsageResolver;
@@ -240,13 +240,28 @@ const FILE_SET_KINDS: [(FileSetKind, &[u8]); 3] = [
 ];
 
 fn file_set_list_properties(kind: FileSetKind, prefix: &[u8]) -> [BString; 4] {
-    let kind = kind.as_str().as_bytes();
+    let [own, interface] = type_list_properties(kind.as_str().as_bytes());
     [
         [prefix, b"_SETS"].concat().into(),
         [b"INTERFACE_", prefix, b"_SETS"].concat().into(),
-        [b"FILE_SETS_", kind].concat().into(),
-        [b"INTERFACE_FILE_SETS_", kind].concat().into(),
+        own,
+        interface,
     ]
+}
+
+fn type_list_properties(name: &[u8]) -> [BString; 2] {
+    [
+        [b"FILE_SETS_", name].concat().into(),
+        [b"INTERFACE_FILE_SETS_", name].concat().into(),
+    ]
+}
+
+fn rule_name(set: &FileSet) -> Option<&[u8]> {
+    set.props.get(b"_RCMAKE_RULE").map(|name| name.as_slice())
+}
+
+fn type_name(set: &FileSet) -> &[u8] {
+    rule_name(set).unwrap_or_else(|| set.kind.as_str().as_bytes())
 }
 
 pub(super) fn initialize_file_set_properties(target: &mut Target) {
@@ -266,18 +281,19 @@ pub(super) fn store_file_set_properties(model: &mut ProjectModel, set: FileSetId
         return;
     };
     let id = set.target;
-    let Some((kind, prefix)) = FILE_SET_KINDS
+    let mut names = vec!["FILE_SET_TYPES".into()];
+    if let Some(rule) = rule_name(set) {
+        names.extend(type_list_properties(rule));
+    } else if let Some((kind, prefix)) = FILE_SET_KINDS
         .into_iter()
         .find(|(kind, _)| *kind == set.kind)
-    else {
-        return;
-    };
-    let mut names = Vec::from(file_set_list_properties(kind, prefix));
-    names.push("FILE_SET_TYPES".into());
-    for field in [b"_SET".as_slice(), b"_DIRS"] {
-        names.push([prefix, field, b"_", set.name.as_slice()].concat().into());
-        if set.name == kind.as_str() {
-            names.push([prefix, field].concat().into());
+    {
+        names.extend(file_set_list_properties(kind, prefix));
+        for field in [b"_SET".as_slice(), b"_DIRS"] {
+            names.push([prefix, field, b"_", set.name.as_slice()].concat().into());
+            if set.name == kind.as_str() {
+                names.push([prefix, field].concat().into());
+            }
         }
     }
     let values: Vec<_> = names
@@ -298,7 +314,7 @@ fn file_set_property(model: &ProjectModel, id: TargetId, property: &[u8]) -> Opt
     let target = model.target(id)?;
     let sets = || target.file_sets.iter().filter_map(|&id| model.file_set(id));
     if property == b"FILE_SET_TYPES" {
-        let types: BTreeSet<_> = sets().map(|set| set.kind.as_str()).collect();
+        let types: BTreeSet<_> = sets().map(type_name).collect();
         return Some(list::join(types));
     }
     for (prefix, interface) in [
@@ -308,14 +324,14 @@ fn file_set_property(model: &ProjectModel, id: TargetId, property: &[u8]) -> Opt
         if let Some(kind) = property.strip_prefix(prefix) {
             return Some(list::join(
                 sets()
-                    .filter(|set| set.kind.as_str().as_bytes() == kind)
+                    .filter(|set| type_name(set) == kind)
                     .filter(|set| visible(set.scope, interface))
                     .map(|set| &set.name),
             ));
         }
     }
     for (kind, prefix) in FILE_SET_KINDS {
-        let sets = || sets().filter(|set| set.kind == kind);
+        let sets = || sets().filter(|set| set.kind == kind && rule_name(set).is_none());
         let own = [prefix, b"_SETS"].concat();
         let interface = [b"INTERFACE_".as_slice(), &own].concat();
         if property == own || property == interface {

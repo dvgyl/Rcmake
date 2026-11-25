@@ -68,20 +68,7 @@ pub(super) fn policy(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
                     )));
                 }
             };
-            if let Err(error) = cx.set_policy(id, state) {
-                return Err(policy_error(cx, error));
-            }
-            if state == PolicyStatus::Old
-                && id.number() <= 161
-                && !(in_try_compile(cx) && TRY_COMPILE_POLICIES.contains(&id.number()))
-            {
-                cx.issue(
-                    MessageKind::DeprecationWarning,
-                    Effect::None,
-                    Some(DiagCategory::Deprecated),
-                    format!("The OLD behavior for policy {id} will be removed from a future version of CMake.\n\nThe cmake-policies(7) manual explains that the OLD behaviors of all policies are deprecated and that a policy should be set to OLD only under specific short-term circumstances.  Projects should be ported to the NEW behavior and not rely on setting a policy to OLD.").into(),
-                );
-            }
+            set_policy(cx, id, state)?;
         }
         [b"GET", name, var] => {
             let state = match cx.policy(policy_id(name, "GET")?) {
@@ -307,6 +294,14 @@ fn apply_version(cx: &mut Cx<'_>, raw: &[u8], required: bool) -> CmdResult {
     }
     cx.apply_policy_version(&effective)
         .map_err(|error| policy_error(cx, error))?;
+    if !legacy_export && effective < Version::from_tuple(3, 10, 0) {
+        cx.issue(
+            MessageKind::DeprecationWarning,
+            Effect::None,
+            Some(DiagCategory::Deprecated),
+            format!("Compatibility with CMake < 3.10 will be removed from a future version of CMake.\n\n{VERSION_ADVICE}").into(),
+        );
+    }
     for policy in POLICIES {
         if cx.policy(policy.id) != PolicyStatus::Warn {
             continue;
@@ -328,18 +323,26 @@ fn apply_version(cx: &mut Cx<'_>, raw: &[u8], required: bool) -> CmdResult {
                 ));
             }
         };
-        cx.set_policy(policy.id, state)
-            .map_err(|error| policy_error(cx, error))?;
+        set_policy(cx, policy.id, state)?;
     }
-    if !legacy_export && effective < Version::from_tuple(3, 10, 0) {
+    Ok(Flow::Normal)
+}
+
+fn set_policy(cx: &mut Cx<'_>, id: PolicyId, state: PolicyStatus) -> Result<(), CmdError> {
+    cx.set_policy(id, state)
+        .map_err(|error| policy_error(cx, error))?;
+    if state == PolicyStatus::Old
+        && id.number() <= 161
+        && !(in_try_compile(cx) && TRY_COMPILE_POLICIES.contains(&id.number()))
+    {
         cx.issue(
             MessageKind::DeprecationWarning,
             Effect::None,
             Some(DiagCategory::Deprecated),
-            format!("Compatibility with CMake < 3.10 will be removed from a future version of CMake.\n\n{VERSION_ADVICE}").into(),
+            format!("The OLD behavior for policy {id} will be removed from a future version of CMake.\n\nThe cmake-policies(7) manual explains that the OLD behaviors of all policies are deprecated and that a policy should be set to OLD only under specific short-term circumstances.  Projects should be ported to the NEW behavior and not rely on setting a policy to OLD.").into(),
         );
     }
-    Ok(Flow::Normal)
+    Ok(())
 }
 
 fn invalid_version(cx: &mut Cx<'_>, field: &str, raw: &[u8]) -> CmdError {

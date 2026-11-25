@@ -5,14 +5,8 @@ use rcmake_resolve::ide::{BundleKind, bundle_kind};
 
 use super::{Result, fail};
 
-pub(super) fn validate_destinations(
-    cx: &mut Cx<'_>,
-    targets: &[TargetId],
-    generic: &InstallOptions,
-    groups: &[(BString, BString)],
-    namelink_only: bool,
-) -> Result<()> {
-    let apple = cx.var(b"CMAKE_SYSTEM_NAME").map_or_else(
+pub(super) fn is_apple(cx: &mut Cx<'_>) -> bool {
+    cx.var(b"CMAKE_SYSTEM_NAME").map_or_else(
         || cx.var_is_on(b"APPLE"),
         |system| {
             matches!(
@@ -20,8 +14,17 @@ pub(super) fn validate_destinations(
                 b"Darwin" | b"iOS" | b"tvOS" | b"watchOS" | b"visionOS"
             )
         },
-    );
-    if !apple
+    )
+}
+
+pub(super) fn validate_destinations(
+    cx: &mut Cx<'_>,
+    targets: &[TargetId],
+    generic: &InstallOptions,
+    groups: &[(BString, BString)],
+    namelink_only: bool,
+) -> Result<()> {
+    if !is_apple(cx)
         || generic
             .destination
             .as_ref()

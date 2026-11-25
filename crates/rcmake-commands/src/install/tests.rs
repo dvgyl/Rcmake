@@ -681,6 +681,7 @@ fn records_imported_runtime_artifact_options_and_build_dependencies() -> TestRes
     let (_, mut interp) = configure_in(
         work,
         r#"
+set(CMAKE_HOST_SYSTEM_NAME Linux)
 add_executable(tool IMPORTED)
 set_property(TARGET tool PROPERTY IMPORTED_LOCATION "${CMAKE_CURRENT_BINARY_DIR}/tool")
 add_dependencies(tool core)
@@ -862,5 +863,187 @@ install(TARGETS api)
     };
     assert_eq!(snapshot(0, "core"), Some(BString::default()));
     assert_eq!(snapshot(1, "api"), Some(BString::from("api.h")));
+    Ok(())
+}
+
+#[test]
+fn runtime_dependencies_check_host_before_target_platform() -> TestResult {
+    for (variables, expected) in [
+        (
+            "set(CMAKE_HOST_SYSTEM_NAME Unsupported)\nset(CMAKE_CROSSCOMPILING ON)",
+            "is not supported on system \"Unsupported\"",
+        ),
+        (
+            "set(CMAKE_HOST_SYSTEM_NAME Linux)\nset(CMAKE_CROSSCOMPILING ON)",
+            "is not supported when cross-compiling.",
+        ),
+        (
+            "set(CMAKE_HOST_SYSTEM_NAME Darwin)\nset(CMAKE_CROSSCOMPILING OFF)",
+            "given no FRAMEWORK DESTINATION",
+        ),
+    ] {
+        let (host, _) = configure(
+            &format!(
+                "set(CMAKE_SYSTEM_NAME Generic)\n{variables}\ninstall(TARGETS core RUNTIME_DEPENDENCIES)"
+            ),
+            1,
+        )?;
+        let stderr = host.stream_bytes(Stream::Stderr).to_string();
+        let diagnostic = stderr.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(diagnostic.contains(expected), "{stderr}");
+    }
+    configure(
+        r#"
+        set(CMAKE_HOST_SYSTEM_NAME Darwin)
+        set(CMAKE_CROSSCOMPILING OFF)
+        install(TARGETS core RUNTIME_DEPENDENCIES DESTINATION lib)
+        "#,
+        0,
+    )?;
+    Ok(())
+}
+
+#[test]
+fn runtime_dependency_sets_allow_one_bundle_executable() -> TestResult {
+    let setup = r#"
+        set(CMAKE_SYSTEM_NAME Darwin)
+        set(CMAKE_HOST_SYSTEM_NAME Darwin)
+        set(CMAKE_CROSSCOMPILING OFF)
+        add_executable(one MACOSX_BUNDLE one.c)
+        add_executable(two MACOSX_BUNDLE two.c)
+        add_executable(imported IMPORTED)
+        set_property(TARGET imported PROPERTY MACOSX_BUNDLE ON)
+    "#;
+    for rules in [
+        "install(TARGETS one two RUNTIME_DEPENDENCIES DESTINATION apps)",
+        "install(TARGETS one RUNTIME_DEPENDENCY_SET deps DESTINATION apps)
+         install(TARGETS two RUNTIME_DEPENDENCY_SET deps DESTINATION apps)",
+        "install(TARGETS one RUNTIME_DEPENDENCY_SET deps DESTINATION apps)
+         install(IMPORTED_RUNTIME_ARTIFACTS imported RUNTIME_DEPENDENCY_SET deps DESTINATION apps)",
+    ] {
+        let (host, _) = configure(&format!("{setup}\n{rules}"), 1)?;
+        let stderr = host.stream_bytes(Stream::Stderr).to_string();
+        assert!(
+            stderr.contains("A runtime dependency set may only have one bundle executable."),
+            "{stderr}"
+        );
+    }
+    configure(
+        &format!(
+            "{setup}
+            install(TARGETS one RUNTIME_DEPENDENCIES DESTINATION apps)
+            install(TARGETS two RUNTIME_DEPENDENCIES DESTINATION apps)
+            install(TARGETS one RUNTIME_DEPENDENCY_SET one_set DESTINATION apps)
+            install(TARGETS two RUNTIME_DEPENDENCY_SET two_set DESTINATION apps)"
+        ),
+        0,
+    )?;
+    Ok(())
+}
+
+#[test]
+fn runtime_dependency_installs_register_components() -> TestResult {
+    let (_, mut interp) = configure(
+        r#"
+        project(Demo LANGUAGES NONE)
+        set(CMAKE_HOST_SYSTEM_NAME Darwin)
+        set(CMAKE_CROSSCOMPILING OFF)
+        set(CMAKE_INSTALL_DEFAULT_COMPONENT_NAME "<PROJECT_NAME>")
+        add_executable(app main.c)
+        install(TARGETS core RUNTIME_DEPENDENCIES
+                LIBRARY COMPONENT Empty FRAMEWORK DESTINATION fw COMPONENT Empty)
+        install(TARGETS app RUNTIME_DEPENDENCIES
+                LIBRARY COMPONENT Libraries FRAMEWORK DESTINATION fw COMPONENT Frameworks)
+        install(RUNTIME_DEPENDENCY_SET deps
+                LIBRARY COMPONENT NamedLibraries FRAMEWORK COMPONENT NamedFrameworks)
+        set(CMAKE_HOST_SYSTEM_NAME Windows)
+        set(CMAKE_IMPORT_LIBRARY_SUFFIX .lib)
+        install(RUNTIME_DEPENDENCY_SET dlls LIBRARY COMPONENT Unused RUNTIME COMPONENT Dlls)
+        set(PROJECT_NAME "")
+        install(FILES readme DESTINATION doc)
+        "#,
+        0,
+    )?;
+    let actual: Vec<_> = registered(interp.cx().project()).into_iter().collect();
+    assert_eq!(
+        actual,
+        [
+            "Demo",
+            "Dlls",
+            "Frameworks",
+            "Libraries",
+            "NamedFrameworks",
+            "NamedLibraries",
+            "Unspecified",
+        ]
+    );
+    Ok(())
+}
+
+#[test]
+fn runtime_dependency_targets_flag_is_recorded_and_rejects_export() -> TestResult {
+    let (_, mut interp) = configure(
+        "install(TARGETS core RUNTIME_DEPENDENCY_TARGETS DESTINATION lib)",
+        0,
+    )?;
+    assert_eq!(
+        interp.cx().global().props.get(b"_RCMAKE_INSTALL_0_ARG2"),
+        Some(&BString::from("RUNTIME_DEPENDENCY_TARGETS"))
+    );
+
+    let (host, _) = configure(
+        "install(TARGETS core RUNTIME_DEPENDENCY_TARGETS EXPORT sdk)",
+        1,
+    )?;
+    let stderr = host.stream_bytes(Stream::Stderr).to_string();
+    assert!(
+        stderr.contains("TARGETS RUNTIME_DEPENDENCY_TARGETS cannot be used with EXPORT."),
+        "{stderr}"
+    );
+    Ok(())
+}
+
+#[test]
+fn android_mk_install_validates_options_and_registers_component() -> TestResult {
+    let destination = if cfg!(windows) {
+        "C:/absolute/sdk"
+    } else {
+        "/absolute/sdk"
+    };
+    let (host, mut interp) = configure(
+        &format!(
+            "cmake_diagnostic(SET CMD_INSTALL_ABSOLUTE_DESTINATION WARN)
+            install(EXPORT_ANDROID_MK sdk DESTINATION {destination} FILE kit.mk
+                    NAMESPACE sdk:: COMPONENT Dev PERMISSIONS OWNER_READ CONFIGURATIONS Debug
+                    EXCLUDE_FROM_ALL EXPORT_LINK_INTERFACE_LIBRARIES)"
+        ),
+        0,
+    )?;
+    let stderr = host.stream_bytes(Stream::Stderr).to_string();
+    assert_eq!(stderr.matches(destination).count(), 1, "{stderr}");
+    assert_eq!(registered(interp.cx().project()), ["Dev".into()].into());
+    for (args, expected) in [
+        ("FILE kit.mk", "given no DESTINATION!"),
+        ("DESTINATION lib WRONG", "given unknown argument \"WRONG\"."),
+        (
+            "DESTINATION lib FILE sub/kit.mk",
+            "The FILE argument may not contain a path.",
+        ),
+        (
+            "DESTINATION lib FILE kit.cmake",
+            "must specify a name ending in \".mk\".",
+        ),
+    ] {
+        let (host, _) = configure(&format!("install(EXPORT_ANDROID_MK sdk {args})"), 1)?;
+        let stderr = host.stream_bytes(Stream::Stderr).to_string();
+        assert!(
+            stderr
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .contains(expected),
+            "{stderr}"
+        );
+    }
     Ok(())
 }

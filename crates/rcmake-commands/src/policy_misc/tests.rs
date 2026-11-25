@@ -1243,3 +1243,34 @@ fn install_properties_use_the_exact_file_name() -> TestResult {
     assert_var(&mut interp, "global", Some("global"));
     Ok(())
 }
+
+#[test]
+fn policy_version_warns_for_old_defaults_in_order() -> TestResult {
+    let (host, mut interp) = context(RunMode::Script);
+    run(
+        &host,
+        &mut interp,
+        r#"
+        set(CMAKE_POLICY_DEFAULT_CMP0116 OLD)
+        set(CMAKE_POLICY_DEFAULT_CMP0085 OLD)
+        set(CMAKE_POLICY_DEFAULT_CMP0083 NEW)
+        cmake_minimum_required(VERSION 3.9)
+        cmake_policy(GET CMP0116 actual)
+        "#,
+        0,
+    )?;
+    let stderr = host.stream_bytes(Stream::Stderr).to_string();
+    let version = stderr
+        .find("Compatibility with CMake < 3.10")
+        .ok_or_else(|| stderr.clone())?;
+    let first = stderr
+        .find("OLD behavior for policy CMP0085")
+        .ok_or_else(|| stderr.clone())?;
+    let second = stderr
+        .find("OLD behavior for policy CMP0116")
+        .ok_or_else(|| stderr.clone())?;
+    assert!(version < first && first < second, "{stderr}");
+    assert!(!stderr.contains("CMP0083"), "{stderr}");
+    assert_var(&mut interp, "actual", Some("OLD"));
+    Ok(())
+}

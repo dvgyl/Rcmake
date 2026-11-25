@@ -39,6 +39,7 @@ pub(super) fn install_targets<'a>(args: &[&'a [u8]]) -> Option<Vec<&'a [u8]>> {
                 | b"CXX_MODULES_BMI"
                 | b"RUNTIME_DEPENDENCIES"
                 | b"RUNTIME_DEPENDENCY_SET"
+                | b"RUNTIME_DEPENDENCY_TARGETS"
                 | b"NAMELINK_ONLY"
         )
     }) {
