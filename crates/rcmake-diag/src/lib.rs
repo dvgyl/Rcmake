@@ -113,7 +113,6 @@ pub struct DiagEngine {
     sarif_results: Vec<Value>,
     history: history::History,
     rich_options: Option<rich::RichOptions>,
-    annotation_bytes_left: u64,
 }
 
 impl DiagEngine {
@@ -127,7 +126,6 @@ impl DiagEngine {
             sarif_results: Vec::new(),
             history: history::History::default(),
             rich_options: None,
-            annotation_bytes_left: 16 * 1024 * 1024,
         }
     }
 
@@ -151,17 +149,6 @@ impl DiagEngine {
     #[must_use]
     pub fn rich_options(&self) -> Option<rich::RichOptions> {
         self.rich_options
-    }
-
-    /// Get the remaining budget for source excerpts retained by annotations.
-    #[must_use]
-    pub fn annotation_bytes_left(&self) -> u64 {
-        self.annotation_bytes_left
-    }
-
-    /// Count retained source bytes against the annotation budget.
-    pub fn count_annotation_bytes(&mut self, bytes: u64) {
-        self.annotation_bytes_left = self.annotation_bytes_left.saturating_sub(bytes);
     }
 
     /// Record an issued diagnostic without rendering it. Return true if visible.

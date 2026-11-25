@@ -9,7 +9,7 @@
 #![forbid(unsafe_code)]
 
 use indexmap::IndexMap;
-use rcmake_base::{BString, list};
+use rcmake_base::BString;
 use rcmake_diag::Backtrace;
 
 mod command;
@@ -204,12 +204,6 @@ impl Cache {
     #[must_use]
     pub fn contains(&self, name: &[u8]) -> bool {
         self.entries.contains_key(name)
-    }
-
-    /// All cache variable names joined as a CMake list (`CACHE_VARIABLES` directory property).
-    #[must_use]
-    pub fn variable_names_list(&self) -> BString {
-        list::join(self.entries.keys().map(|k| k.as_slice()))
     }
 
     /// Iterate over all cache entries in deterministic insertion order.

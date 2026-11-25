@@ -109,13 +109,6 @@ impl<H: Host + ?Sized> MemoHost<H> {
         }
     }
 
-    /// Return the current generation while no mutation or process is active.
-    #[must_use]
-    pub fn stable_generation(&self) -> Option<u64> {
-        let cache = self.read_cache();
-        (cache.active_changes == 0).then_some(cache.generation)
-    }
-
     /// Return the generation for a canonical path while no change is active.
     ///
     /// Changes to intersecting paths and calls that can change any path invalidate

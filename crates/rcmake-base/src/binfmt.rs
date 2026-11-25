@@ -22,8 +22,6 @@ pub enum BinFormat {
     Pe32,
     /// Portable Executable with a PE32+ optional header.
     Pe32Plus,
-    /// An image outside the formats that this module reads.
-    Unknown,
 }
 
 /// Runtime dependency metadata for a recognized image.

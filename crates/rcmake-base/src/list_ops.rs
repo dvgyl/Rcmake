@@ -71,7 +71,7 @@ pub struct SortOptions {
 
 /// Compare two list items with `options`.
 #[must_use]
-pub fn compare_items(a: &[u8], b: &[u8], options: SortOptions) -> Ordering {
+fn compare_items(a: &[u8], b: &[u8], options: SortOptions) -> Ordering {
     let (a, b) = if options.compare == SortCompare::FileBasename {
         (file_basename(a), file_basename(b))
     } else {
