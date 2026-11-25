@@ -95,6 +95,7 @@ def check_source(errors: list[str]) -> None:
         CMAKE_LICENCE.with_name("CMake-CONTRIBUTORS.rst"),
         VENDORED_CMAKE / "Modules/CMake.cmake",
         VENDORED_CMAKE / "Templates/CPackConfig.cmake.in",
+        VENDORED_CMAKE / "Help/reference.zst",
     ):
         if not (ROOT / required).is_file():
             errors.append(f"Missing required file: {required}")

@@ -201,6 +201,7 @@ jobs:
       VCPKG_DISABLE_METRICS: "1"
       VCPKG_MAX_CONCURRENCY: "2"
       VCPKG_BINARY_SOURCES: clear
+      VCPKG_COMPARE_MINUTES: "320"
     steps:
       - *checkout
       - &python
@@ -214,8 +215,19 @@ jobs:
           path: target/stage/bin
           run-id: ${{ needs.prepare.outputs.run_id }}
           github-token: ${{ github.token }}
+      - &stage
+        name: Stage the Rcmake tools and data
+        run: |
+          timeout 10s chmod +x target/stage/bin/rcmake
+          for tool in cmake ctest cpack; do
+            timeout 10s ln -sfn rcmake "target/stage/bin/$tool"
+          done
+          timeout 10s mkdir -p target/stage/share
+          timeout 10s ln -sfn "$GITHUB_WORKSPACE/modules/cmake-4.5" target/stage/share/cmake-4.5
+          timeout 10s target/stage/bin/cmake --version
+          printf 'ECOSYSTEM_RCMAKE=%s\n' "$GITHUB_WORKSPACE/target/stage/bin/cmake" >> "$GITHUB_ENV"
       - &oracle
-        name: Set up CMake 4.5.1 and the Rcmake shim
+        name: Fetch the CMake 4.5.1 oracle binary
         run: |
           source env/env.sh
           archive="$RUNNER_TEMP/cmake-linux.tar.gz"
@@ -224,16 +236,8 @@ jobs:
             "https://github.com/Kitware/CMake/releases/download/v$ORACLE_VERSION/cmake-$ORACLE_VERSION-linux-x86_64.tar.gz"
           timeout 15s sha256sum --check <<< "$ORACLE_LINUX_SHA256  $archive"
           timeout 60s tar -xzf "$archive" -C "$RUNNER_TEMP"
-          timeout 10s chmod +x target/stage/bin/rcmake
-          timeout 10s ln -s rcmake target/stage/bin/cmake
-          timeout 10s ln -s rcmake target/stage/bin/ctest
-          timeout 10s ln -s rcmake target/stage/bin/cpack
-          timeout 10s mkdir -p target/stage/share
-          timeout 10s ln -s "$GITHUB_WORKSPACE/modules/cmake-4.5" target/stage/share/cmake-4.5
           timeout 10s "$oracle/bin/cmake" --version
-          timeout 10s target/stage/bin/cmake --version
-          printf 'ECOSYSTEM_ORACLE=%s\nECOSYSTEM_RCMAKE=%s\n' \
-            "$oracle/bin/cmake" "$GITHUB_WORKSPACE/target/stage/bin/cmake" >> "$GITHUB_ENV"
+          printf 'ECOSYSTEM_ORACLE=%s\n' "$oracle/bin/cmake" >> "$GITHUB_ENV"
       - name: Install vcpkg tools
         run: |
           source env/env.sh
@@ -249,7 +253,7 @@ jobs:
       - name: Compare port configure results
         run: |
           source env/env.sh
-          timeout --kill-after=15s 320m python3 - <<'PY'
+          timeout --kill-after=15s "${VCPKG_COMPARE_MINUTES}m" python3 - <<'PY'
           from collections import Counter
           import json
           import os
@@ -265,9 +269,26 @@ jobs:
           report.mkdir()
           count = int(os.environ["SHARD_COUNT"] or "64")
           index = int(os.environ["SHARD_INDEX"])
-          ports = sorted(path.name for path in (vcpkg / "ports").iterdir()
-                         if (path / "portfile.cmake").is_file())
-          ports = ports[index::count]
+          all_ports = sorted(path.name for path in (vcpkg / "ports").iterdir()
+                             if (path / "portfile.cmake").is_file())
+          ports = all_ports[index::count]
+          engine_timeout = 120
+          kill_wait = 10
+          seconds_per_port = 2 * (engine_timeout + kill_wait)
+          budget = 60 * int(os.environ["VCPKG_COMPARE_MINUTES"])
+          worst_case = len(ports) * seconds_per_port
+          (report / "shard.json").write_text(json.dumps({
+              "shard_index": index, "shard_count": count, "expected_ports": len(ports),
+              "worst_case_seconds": worst_case, "budget_seconds": budget,
+          }) + "\n", encoding="utf-8")
+          print(f"vcpkg shard {index}/{count} has {len(ports)} ports. "
+                f"Allow up to {worst_case} seconds for the two engines.", flush=True)
+          # Reserve time for report and build directory cleanup.
+          max_ports = (budget - 60) // seconds_per_port
+          if len(ports) > max_ports:
+              minimum_shards = (len(all_ports) + max_ports - 1) // max_ports
+              raise SystemExit(f"The shard exceeds the comparison time budget. "
+                               f"Set vcpkg_shard_count to at least {minimum_shards}.")
 
           engines = {}
           for name, variable in (("oracle", "ECOSYSTEM_ORACLE"), ("rcmake", "ECOSYSTEM_RCMAKE")):
@@ -313,13 +334,13 @@ jobs:
                   with subprocess.Popen(command, cwd=vcpkg, env=env, stdout=log,
                                         stderr=subprocess.STDOUT, start_new_session=True) as proc:
                       try:
-                          result = proc.wait(timeout=120)
+                          result = proc.wait(timeout=engine_timeout)
                       except subprocess.TimeoutExpired:
                           try:
                               os.killpg(proc.pid, signal.SIGKILL)
                           except ProcessLookupError:
                               pass
-                          proc.wait(timeout=10)
+                          proc.wait(timeout=kill_wait)
                           result = 124
               profiles, identity_errors = observe(buildtrees / port, expected)
               return {"configure_profiles": profiles, "identity_errors": identity_errors, "install_exit": result}
@@ -374,6 +395,7 @@ jobs:
       - *checkout
       - *python
       - *binary
+      - *stage
       - *oracle
       - name: Install Conan and Ninja
         run: |
@@ -491,7 +513,12 @@ jobs:
       - *checkout
       - *python
       - *binary
+      - *stage
       - *oracle
+      - name: Report available disk space and memory
+        run: |
+          df -h "$GITHUB_WORKSPACE" "$RUNNER_TEMP"
+          free -h
       - name: Set up project prerequisites
         run: |
           source env/env.sh
@@ -684,21 +711,31 @@ jobs:
     if: github.event_name == 'schedule' || inputs.lane == 'all' || inputs.lane == 'toolchains'
     needs: prepare
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 75
     steps:
       - *checkout
       - *python
       - *binary
-      - *oracle
-      - name: Check ELF dependencies, Fortran modules, and registered RunCMake suites
-        timeout-minutes: 50
+      - *stage
+      - name: Install Linux prerequisites and fetch the oracle
+        timeout-minutes: 15
         run: |
           source env/env.sh
-          timeout 120s sudo apt-get update
-          timeout 300s sudo apt-get install -y --no-install-recommends gcc g++ gfortran ninja-build make binutils
-          oracle_env="$(scripts/fetch-oracle.sh --print-env)"
-          eval "$oracle_env"
-          timeout --kill-after=30s 45m scripts/linux-vm-test.sh --extended-only target/stage/bin
+          timeout --kill-after=10s 120s sudo apt-get update
+          timeout --kill-after=10s 300s sudo apt-get install -y --no-install-recommends gcc g++ gfortran ninja-build make binutils
+          timeout --kill-after=10s 15m scripts/fetch-oracle.sh --print-env > "$RUNNER_TEMP/rcmake-linux-oracle.env"
+      - name: Check ELF dependencies, Fortran modules, and RunCMake suites
+        timeout-minutes: 47
+        run: |
+          source env/env.sh
+          source "$RUNNER_TEMP/rcmake-linux-oracle.env"
+          scripts/linux-vm-test.sh --extended-only target/stage/bin "$RUNNER_TEMP/runcmake-linux.json"
+      - uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: runcmake-linux
+          path: ${{ runner.temp }}/runcmake-linux.json
+          if-no-files-found: ignore
 
   qt:
     name: Linux Qt 6 AUTOGEN
@@ -709,6 +746,7 @@ jobs:
     steps:
       - *checkout
       - *binary
+      - *stage
       - name: Build and test Qt 6 offscreen
         run: |
           timeout 120s sudo apt-get update
@@ -727,6 +765,7 @@ jobs:
       - *checkout
       - *python
       - *binary
+      - *stage
       - *oracle
       - name: Install Linux toolchains
         run: |

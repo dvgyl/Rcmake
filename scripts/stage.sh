@@ -29,8 +29,9 @@ ln -sf rcmake "$STAGE/bin/cmake"
 ln -sf rcmake "$STAGE/bin/ctest"
 ln -sf rcmake "$STAGE/bin/cpack"
 
-# Symlink vendored CMake 4.5.1 Modules/ and Templates/ so CMAKE_ROOT resolves cleanly on disk.
+# Make the bundled CMake data available under CMAKE_ROOT.
 ln -s "$ROOT/modules/cmake-4.5/Modules" "$STAGE/share/cmake-4.5/Modules"
 ln -s "$ROOT/modules/cmake-4.5/Templates" "$STAGE/share/cmake-4.5/Templates"
+ln -s "$ROOT/modules/cmake-4.5/Help" "$STAGE/share/cmake-4.5/Help"
 
 echo "Staged Rcmake at $STAGE/bin/{rcmake,cmake,ctest,cpack} with share/cmake-4.5"

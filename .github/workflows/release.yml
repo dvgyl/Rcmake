@@ -10,6 +10,8 @@ permissions:
 
 env:
   RUSTUP_TOOLCHAIN: "1.99.1"
+  CARGO_BUILD_JOBS: "2"
+  RELEASE_TAG: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
 
 jobs:
   package:
@@ -31,9 +33,29 @@ jobs:
     env:
       RELEASE_TARGET: ${{ matrix.target }}
     steps:
-      - uses: actions/checkout@v6
+      - &checkout
+        uses: actions/checkout@v6
         with:
           persist-credentials: false
+      - &python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - &version
+        name: Read the workspace version and check the release tag
+        id: version
+        shell: bash
+        run: |
+          version="$(python -c "import tomllib; print(tomllib.load(open('Cargo.toml', 'rb'))['workspace']['package']['version'])")"
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-+][A-Za-z0-9.+-]+)?$ ]]; then
+            printf 'Invalid version in Cargo.toml.\n' >&2
+            exit 1
+          fi
+          if [[ "$GITHUB_REF_TYPE" == tag && "$RELEASE_TAG" != "v$version" ]]; then
+            printf 'Expected release tag v%s. Found %s.\n' "$version" "$RELEASE_TAG" >&2
+            exit 1
+          fi
+          printf 'value=%s\n' "$version" >> "$GITHUB_OUTPUT"
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.99.1"
@@ -42,39 +64,22 @@ jobs:
         with:
           key: release-${{ matrix.target }}
 
-      - name: Build the tarball
+      - name: Build and test the extracted tarball
         if: runner.os != 'Windows'
         shell: bash
         run: scripts/dist.sh --target "$RELEASE_TARGET"
 
-      - name: Test the extracted tarball
-        if: runner.os != 'Windows'
-        shell: bash
-        run: |
-          work="$(mktemp -d)"
-          trap 'rm -rf "$work"' EXIT
-          tar -xzf dist/*.tar.gz -C "$work"
-          for tool in rcmake cmake ctest cpack; do
-            "$work"/rcmake-*/bin/"$tool" --version
-          done
-
-      - uses: actions/setup-python@v6
-        if: runner.os == 'Windows'
-        with:
-          python-version: "3.12"
       - uses: ilammy/msvc-dev-cmd@v1
         if: runner.os == 'Windows'
         with:
           arch: x64
-      - name: Build the ZIP archive
+      - name: Build and test the extracted ZIP archive
         if: runner.os == 'Windows'
         shell: pwsh
+        env:
+          RELEASE_VERSION: ${{ steps.version.outputs.value }}
         run: |
           $root = (Get-Location).Path
-          $version = python -c "import tomllib; print(tomllib.load(open('Cargo.toml', 'rb'))['workspace']['package']['version'])"
-          if ($version -cnotmatch '^[0-9]+\.[0-9]+\.[0-9]+([-+][A-Za-z0-9.+-]+)?$') {
-            throw 'Invalid version in Cargo.toml.'
-          }
           $cargoHome = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { Join-Path $HOME '.cargo' }
           $cargoHome = [IO.Path]::GetFullPath($cargoHome, $root)
           $rustupHome = if ($env:RUSTUP_HOME) { $env:RUSTUP_HOME } else { Join-Path $HOME '.rustup' }
@@ -96,10 +101,12 @@ jobs:
               $env:RUSTFLAGS -split '[ \t\r\n\v\f]+' | Where-Object { $_ }
             }
             foreach ($mapping in $remap) {
-              foreach ($path in @($mapping.Source, $mapping.Source.Replace('\', '/')) | Select-Object -Unique) {
+              foreach ($path in @($mapping.Source, $mapping.Source.Replace('\', '/'),
+                                  $mapping.Source.Replace('/', '\')) | Select-Object -Unique) {
                 "--remap-path-prefix=$path=$($mapping.Destination)"
               }
             }
+            '-Clink-arg=/PDBALTPATH:%_PDB%'
           )
           Remove-Item Env:RUSTFLAGS -ErrorAction SilentlyContinue
           $env:CARGO_ENCODED_RUSTFLAGS = $flags -join [char]31
@@ -107,23 +114,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
           $binary = "$targetDir/$env:RELEASE_TARGET/release/rcmake.exe"
-          $env:RCMAKE_RELEASE_BINARY = $binary
-          $env:RCMAKE_RELEASE_PATHS = ($homePaths + @($root, $targetDir, $cargoHome, $rustupHome)) -join [char]31
-          @'
-          import os
-          from pathlib import Path
-          import sys
-
-          contents = Path(os.environ["RCMAKE_RELEASE_BINARY"]).read_bytes().lower()
-          for home in filter(None, os.environ["RCMAKE_RELEASE_PATHS"].split("\x1f")):
-              for path in {home, home.replace("\\", "/"), home.replace("/", "\\")}:
-                  for encoding in ("utf-8", "utf-16le"):
-                      if path.encode(encoding).lower() in contents:
-                          sys.exit("The release binary contains a build path.")
-          '@ | python -
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-
-          $name = "rcmake-$version-$env:RELEASE_TARGET"
+          $name = "rcmake-$env:RELEASE_VERSION-$env:RELEASE_TARGET"
           $work = Join-Path $env:RUNNER_TEMP ([Guid]::NewGuid().ToString())
           $package = Join-Path $work $name
           try {
@@ -136,7 +127,10 @@ jobs:
             Copy-Item LICENSE-MIT, LICENSE-APACHE, THIRD_PARTY_NOTICES.md $package
 
             [string[]]$files = @(Get-ChildItem -LiteralPath $package -File -Recurse -Force | ForEach-Object {
-              [IO.Path]::GetRelativePath($work, $_.FullName)
+              $relative = [IO.Path]::GetRelativePath($work, $_.FullName)
+              if (-not ($relative -split '[\\/]' | Where-Object { $_ -clike '._*' -or $_ -ceq '.DS_Store' })) {
+                $relative
+              }
             })
             [Array]::Sort($files, [StringComparer]::Ordinal)
             $archive = Join-Path $work "$name.zip"
@@ -159,10 +153,16 @@ jobs:
             }
             $extracted = Join-Path $work 'extracted'
             Expand-Archive -LiteralPath $archive -DestinationPath $extracted
-            foreach ($tool in 'rcmake', 'cmake', 'ctest', 'cpack') {
-              & "$extracted/$name/bin/$tool.exe" --version
-              if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-            }
+            $roots = @(
+              foreach ($path in $homePaths) { "home=$path" }
+              "repository=$root"
+              "repository=$env:GITHUB_WORKSPACE"
+              "target directory=$targetDir"
+              "Cargo home=$cargoHome"
+              "Rustup home=$rustupHome"
+            )
+            bash scripts/dist.sh --verify-extracted "$extracted/$name" "$env:RELEASE_TARGET" @roots
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
             $digest = (Get-FileHash -Algorithm SHA256 -LiteralPath $archive).Hash.ToLowerInvariant()
             "$digest  $name.zip`n" | Set-Content -LiteralPath "dist/$name.zip.sha256" -Encoding ascii -NoNewline
             Move-Item -LiteralPath $archive -Destination "dist/$name.zip" -Force
@@ -174,9 +174,8 @@ jobs:
         with:
           name: rcmake-${{ matrix.target }}
           path: |
-            dist/*.tar.gz
-            dist/*.zip
-            dist/*.sha256
+            dist/rcmake-${{ steps.version.outputs.value }}-${{ matrix.target }}.${{ runner.os == 'Windows' && 'zip' || 'tar.gz' }}
+            dist/rcmake-${{ steps.version.outputs.value }}-${{ matrix.target }}.${{ runner.os == 'Windows' && 'zip' || 'tar.gz' }}.sha256
           if-no-files-found: error
 
   release:
@@ -187,6 +186,9 @@ jobs:
     permissions:
       contents: write
     steps:
+      - *checkout
+      - *python
+      - *version
       - uses: actions/download-artifact@v7
         with:
           pattern: rcmake-*
@@ -195,17 +197,27 @@ jobs:
       - name: Verify package checksums
         working-directory: dist
         shell: bash
+        env:
+          RELEASE_VERSION: ${{ steps.version.outputs.value }}
         run: |
-          shopt -s nullglob
-          archives=(*.tar.gz *.zip)
-          if [[ ${#archives[@]} -ne 4 ]]; then
-            printf 'Expected four release archives.\n' >&2
+          shopt -s dotglob nullglob
+          prefix="rcmake-$RELEASE_VERSION"
+          archives=(
+            "$prefix-aarch64-apple-darwin.tar.gz"
+            "$prefix-x86_64-unknown-linux-gnu.tar.gz"
+            "$prefix-aarch64-unknown-linux-gnu.tar.gz"
+            "$prefix-x86_64-pc-windows-msvc.zip"
+          )
+          files=(*)
+          if [[ ${#files[@]} -ne $((${#archives[@]} * 2)) ]]; then
+            printf 'Expected four archives and four matching checksum files.\n' >&2
             exit 1
           fi
           for archive in "${archives[@]}"; do
-            sha256sum "$archive"
+            checksum="$(sha256sum -- "$archive")"
+            printf '%s\n' "$checksum" | diff -u "$archive.sha256" - >&2
+            printf '%s\n' "$checksum"
           done | LC_ALL=C sort -k2 > SHA256SUMS.txt
-          LC_ALL=C sort -k2 -- *.sha256 | diff -u SHA256SUMS.txt -
       - uses: actions/upload-artifact@v6
         with:
           name: release
@@ -215,13 +227,12 @@ jobs:
             dist/SHA256SUMS.txt
           if-no-files-found: error
       - name: Attach archives to the GitHub Release
-        if: github.ref_type == 'tag' && startsWith(github.ref_name, 'v')
+        if: github.ref_type == 'tag'
         working-directory: dist
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-          RELEASE_TAG: ${{ github.ref_name }}
         run: |
           shopt -s nullglob
           assets=(*.tar.gz *.zip SHA256SUMS.txt)

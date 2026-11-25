@@ -45,10 +45,20 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y gcc g++ clang ninja-build make patchelf binutils
-      - name: Install Ninja on macOS
+          sudo apt-get install -y gcc g++ clang ninja-build make binutils libzstd1
+      - &macos_tools
+        name: Check macOS build tools
         if: runner.os == 'macOS'
-        run: brew install ninja
+        shell: bash
+        run: |
+          if ! command -v ninja >/dev/null 2>&1; then
+            brew install ninja
+          fi
+          xcodebuild -version
+          for tool in otool codesign python3 ninja; do
+            command -v "$tool"
+          done
+          ninja --version
       - &vs2022
         name: Install Visual Studio 2022 Build Tools
         if: runner.os == 'Windows'
@@ -161,7 +171,18 @@ jobs:
           fi
       - name: Test native C and C++ builds
         timeout-minutes: 15
-        run: scripts/linux-vm-test.sh --smoke-only target/stage/bin
+        run: |
+          if [[ "$RUNNER_OS" == Windows ]]; then
+            command -v cygpath
+            msvc_bin="$(cygpath -u "${VCToolsInstallDir%\\}/bin/Hostx64/x64")"
+            export PATH="$msvc_bin:$PATH"
+            for tool in link.exe cl.exe; do
+              test "$(command -v "$tool")" = "$msvc_bin/$tool"
+            done
+            command -v ninja
+            command -v python
+          fi
+          scripts/linux-vm-test.sh --smoke-only target/stage/bin
       - name: Run measurement smoke tests with CMake 4.5.1
         if: runner.os == 'Linux'
         timeout-minutes: 12
@@ -244,9 +265,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y ninja-build
-      - if: runner.os == 'macOS'
-        name: Install Ninja on macOS
-        run: brew install ninja
+      - *macos_tools
       - name: Build, test, and install zlib and cJSON
         shell: bash
         run: |
