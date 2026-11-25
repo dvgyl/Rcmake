@@ -347,7 +347,7 @@ impl Application {
             log.push_str("Preset CMake variables:\n\n");
             for (name, (ty, value)) in report {
                 log.push_str(&format!("  {name}"));
-                if let Some(ty) = ty {
+                if let Some(ty) = ty.filter(|ty| *ty != CacheType::Uninitialized) {
                     log.push_str(&format!(":{}", ty.as_str()));
                 }
                 log.push_str(&format!("=\"{value}\"\n"));
@@ -431,8 +431,12 @@ pub(crate) fn apply(host: &dyn Host, src: &Path, opts: &mut Options) -> Result<A
     let mut definitions = BTreeMap::new();
     if let Some(vars) = &settings.cache_variables {
         for (name, entry) in vars {
-            let ty = entry.kind.as_ref().and_then(|ty| CacheType::parse(ty));
-            definitions.insert(name.clone(), (ty, entry.value.clone()));
+            // `cmake::ProcessPresetVariables`: no type gives `UNINITIALIZED`
+            // and an unknown type gives `STRING`.
+            let ty = entry.kind.as_ref().map_or(CacheType::Uninitialized, |ty| {
+                CacheType::parse(ty).unwrap_or(CacheType::String)
+            });
+            definitions.insert(name.clone(), (Some(ty), entry.value.clone()));
         }
     }
     for (name, value, ty) in [

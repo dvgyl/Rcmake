@@ -3,7 +3,7 @@ use std::io::ErrorKind;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use rcmake_base::BString;
+use rcmake_base::{BString, list};
 use rcmake_eval::CacheDefine;
 use rcmake_host::{FileKind, Follow, Host, HostResult, ReadRange, Stream, WriteMode};
 use rcmake_model::{Cache, CacheEntry, CacheType};
@@ -186,6 +186,68 @@ fn clean_value(value: &[u8]) -> &[u8] {
     }
 }
 
+/// Normalize a command-line or preset definition before it is stored.
+///
+/// `cmCacheManager::AddCacheEntry` converts a `PATH` or `FILEPATH` value
+/// with `cmSystemTools::ConvertToUnixSlashes`. Call this when the edit
+/// runs, so that `~` uses the `HOME` of the preset environment.
+pub(crate) fn normalize_definition(host: &dyn Host, mut def: CacheDefine) -> CacheDefine {
+    def.value = typed_value(host, def.ty, &def.value);
+    def
+}
+
+/// Return `value` as CMake stores it for an entry of type `ty`.
+pub(crate) fn typed_value(host: &dyn Host, ty: Option<CacheType>, value: &[u8]) -> BString {
+    if !matches!(ty, Some(CacheType::Path | CacheType::Filepath)) {
+        return value.into();
+    }
+    if !value.contains(&b';') {
+        return unix_path(host, value);
+    }
+    // A list value loses its empty elements, as `cmList` does.
+    list::join(
+        list::split(value, list::Empty::Drop)
+            .iter()
+            .map(|element| unix_path(host, element)),
+    )
+}
+
+/// `cmSystemTools::ConvertToUnixSlashes` for one path.
+///
+/// Backslashes become slashes. Repeated slashes collapse, except exactly two
+/// leading slashes. A leading `~` alone or before `/` becomes `HOME`. A
+/// trailing slash goes, except for `/`, `c:/`, and `//`. The `~user` form
+/// needs an account lookup that `Host` does not offer, so it stays as is.
+fn unix_path(host: &dyn Host, path: &[u8]) -> BString {
+    let converted: Vec<u8> = path
+        .iter()
+        .map(|&byte| if byte == b'\\' { b'/' } else { byte })
+        .collect();
+    let keep_double = converted.starts_with(b"//") && converted.get(2) != Some(&b'/');
+    let mut out = Vec::with_capacity(converted.len());
+    for (index, &byte) in converted.iter().enumerate() {
+        if byte == b'/' && out.last() == Some(&b'/') && !(keep_double && index == 1) {
+            continue;
+        }
+        out.push(byte);
+    }
+    if out.first() == Some(&b'~')
+        && matches!(out.get(1), None | Some(b'/'))
+        && let Some(home) = host.env_get(b"HOME")
+    {
+        out.splice(0..1, home.iter().copied());
+    }
+    let size = out.len();
+    if size > 1
+        && out.last() == Some(&b'/')
+        && !(size == 3 && out.get(1) == Some(&b':'))
+        && out.get(size - 2) != Some(&b'/')
+    {
+        out.pop();
+    }
+    out.into()
+}
+
 pub(crate) fn apply(cache: &mut Cache, def: CacheDefine) {
     insert(cache, &def.name, def.value, def.ty);
     if let Some(entry) = cache.get_mut(&def.name)
@@ -342,7 +404,10 @@ pub(crate) fn sorted(cache: &Cache) -> BTreeMap<&BString, &CacheEntry> {
 mod tests {
     use rcmake_model::CacheType;
 
-    use super::parse_entry;
+    use rcmake_base::BString;
+    use rcmake_host::{Host, PureHost};
+
+    use super::{parse_entry, typed_value};
 
     #[test]
     fn cache_records_use_the_command_line_entry_rules() {
@@ -370,5 +435,40 @@ mod tests {
         }
         assert_eq!(parse_entry(b"# comment=1"), None);
         assert_eq!(parse_entry(b"NOVALUE"), None);
+    }
+
+    #[test]
+    fn path_values_convert_like_cmake() {
+        let host = PureHost::default();
+        host.env_set(b"HOME", Some(b"/hh"));
+        let path = |ty, value: &str| typed_value(&host, ty, value.as_bytes());
+        let typed = Some(CacheType::Path);
+        for (value, expected) in [
+            ("~/q", "/hh/q"),
+            ("~", "/hh"),
+            ("~\\x", "/hh/x"),
+            ("~x", "~x"),
+            ("a\\\\b//c/", "a/b/c"),
+            ("//server//share/", "//server/share"),
+            ("///x", "/x"),
+            ("/", "/"),
+            ("c:/", "c:/"),
+            ("~/a;;~/b", "/hh/a;/hh/b"),
+            ("[x;~/b];~/c", "[x;~/b];/hh/c"),
+            ("", ""),
+        ] {
+            assert_eq!(path(typed, value), BString::from(expected), "{value}");
+        }
+        assert_eq!(
+            path(Some(CacheType::Filepath), "~/f"),
+            BString::from("/hh/f")
+        );
+        for ty in [
+            None,
+            Some(CacheType::String),
+            Some(CacheType::Uninitialized),
+        ] {
+            assert_eq!(path(ty, "~/a;;b\\"), BString::from("~/a;;b\\"));
+        }
     }
 }

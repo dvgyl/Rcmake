@@ -43,6 +43,9 @@ impl ConfigureSession<'_> {
         for (index, edit) in self.opts.cache_edits.clone().into_iter().enumerate() {
             match edit {
                 CacheEdit::Define(def) => {
+                    // The preset environment is active now, so `~` in a path
+                    // value uses its `HOME`.
+                    let def = crate::cache::normalize_definition(host, def);
                     let name = def.name.clone();
                     if index >= self.preset.definitions {
                         report.remove(&name);

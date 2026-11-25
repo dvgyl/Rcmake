@@ -320,7 +320,10 @@ fn run_cmake(
         }
         for edit in opts.cache_edits {
             if let options::CacheEdit::Define(def) = edit {
-                cache::apply(interp.cx().cache(), def);
+                cache::apply(
+                    interp.cx().cache(),
+                    cache::normalize_definition(host.as_ref(), def),
+                );
             }
         }
         let state = configure::initialize_diagnostics(
@@ -449,8 +452,9 @@ fn new_interp_with_paths(
 
 /// Parse a command-line `-D` definition with the shared cache-entry rules.
 ///
-/// An untyped definition needs a name. An unknown type text gives `STRING`,
-/// as in `cmState::StringToCacheEntryType`.
+/// An untyped definition needs a name and gets `UNINITIALIZED`, as the CMake
+/// `-D` callback passes it. An unknown type text gives `STRING`, as in
+/// `cmState::StringToCacheEntryType`.
 fn parse_define(raw: &[u8]) -> Option<CacheDefine> {
     let parsed = cache::parse_definition(raw)?;
     if parsed.ty.is_none() && parsed.name.is_empty() {
@@ -458,9 +462,9 @@ fn parse_define(raw: &[u8]) -> Option<CacheDefine> {
     }
     Some(CacheDefine {
         name: BString::from(parsed.name),
-        ty: parsed
-            .ty
-            .map(|text| CacheType::parse(text).unwrap_or(CacheType::String)),
+        ty: Some(parsed.ty.map_or(CacheType::Uninitialized, |text| {
+            CacheType::parse(text).unwrap_or(CacheType::String)
+        })),
         value: BString::from(parsed.value),
     })
 }
@@ -669,14 +673,19 @@ mod tests {
             ),
             // The typed form wins, as in CMake: the name is `"a`.
             (b"\"a:b=c\"=v", b"\"a", Some(CacheType::String), b"c\"=v"),
-            (b"\"q=r\"=x=y", b"q=r", None, b"x=y"),
+            (
+                b"\"q=r\"=x=y",
+                b"q=r",
+                Some(CacheType::Uninitialized),
+                b"x=y",
+            ),
             (b"K:PATH='  x  ' \t", b"K", Some(CacheType::Path), b"  x  "),
-            (b"K=  x \t\r", b"K", None, b"  x"),
+            (b"K=  x \t\r", b"K", Some(CacheType::Uninitialized), b"  x"),
             (b"K:BOOL=   ", b"K", Some(CacheType::Bool), b"   "),
-            (b"K=", b"K", None, b""),
-            (b"K='x", b"K", None, b"'x"),
-            (b"K=a'b'c", b"K", None, b"a'b'c"),
-            (b"K=B:C=D", b"K", None, b"B:C=D"),
+            (b"K=", b"K", Some(CacheType::Uninitialized), b""),
+            (b"K='x", b"K", Some(CacheType::Uninitialized), b"'x"),
+            (b"K=a'b'c", b"K", Some(CacheType::Uninitialized), b"a'b'c"),
+            (b"K=B:C=D", b"K", Some(CacheType::Uninitialized), b"B:C=D"),
             (b":STRING=x", b"", Some(CacheType::String), b"x"),
             (b"\"un:closed=v", b"\"un", Some(CacheType::String), b"v"),
         ];

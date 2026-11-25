@@ -199,13 +199,16 @@ fn parse(host: &dyn Host, args: &[BString]) -> Result<Options, String> {
             }
             b"--config" => opts.config = Some(required(None)?.into()),
             b"--target" | b"-t" => {
-                // Each value is a CMake list of target names.
-                let first = required(None)?;
-                for value in
-                    std::iter::once(first).chain(std::iter::from_fn(|| take_value(&mut args)))
-                {
-                    opts.targets.extend(list::split(value, list::Empty::Drop));
+                // An attached value is one argument. Separate values join
+                // with `;` into one CMake list, as in `cmCommandLineArgument`.
+                let attached = inline.is_some();
+                let mut targets = BString::from(required(None)?);
+                while !attached && let Some(next) = take_value(&mut args) {
+                    targets.push(b';');
+                    targets.extend_from_slice(next);
                 }
+                opts.targets
+                    .extend(list::split(&targets, list::Empty::Drop));
             }
             b"--resolve-package-references" => {
                 let mode = inline.or_else(|| take_value(&mut args)).and_then(|mode| {

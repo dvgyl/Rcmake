@@ -77,8 +77,14 @@ fn cache_value(host: &PureHost, dir: &str, name: &str) -> Option<String> {
     })
 }
 
+/// One native command: its working directory and its argv.
+type Recorded = (String, Vec<String>);
+
+/// The shared log of native commands.
+type CommandLog = Arc<Mutex<Vec<Recorded>>>;
+
 /// Capture the native build commands that `--build` runs.
-fn record_commands(host: &PureHost) -> Arc<Mutex<Vec<(String, Vec<String>)>>> {
+fn record_commands(host: &PureHost) -> CommandLog {
     let commands = Arc::new(Mutex::new(Vec::new()));
     let recorded = commands.clone();
     host.set_command_handler(move |_, request, _| {
@@ -99,7 +105,7 @@ fn record_commands(host: &PureHost) -> Arc<Mutex<Vec<(String, Vec<String>)>>> {
     commands
 }
 
-fn take(commands: &Mutex<Vec<(String, Vec<String>)>>) -> Vec<(String, Vec<String>)> {
+fn take(commands: &Mutex<Vec<Recorded>>) -> Vec<Recorded> {
     std::mem::take(&mut *commands.lock().expect("command log"))
 }
 
@@ -254,10 +260,17 @@ fn unset_glob_removes_matching_cache_and_report_entries() {
         );
     }
 
-    // A bracket expression matches the toolchain file. The toolchain check
-    // and the report use the same matcher.
+    // A bracket expression matches the toolchain file. The removal is not a
+    // toolchain change: unrelated cache entries and `CMakeFiles` stay.
     success(&host, &["--preset", "p"]);
     assert!(cache_value(&host, "/work/build-p", "CMAKE_TOOLCHAIN_FILE").is_some());
+    host.write(
+        Path::new("/work/build-p/CMakeCache.txt"),
+        b"SAVED:STRING=keep\n",
+        WriteMode::Append,
+    )
+    .expect("append unrelated entry");
+    seed(&host, "/work/build-p/CMakeFiles/marker.txt", "keep\n");
     let run = success(
         &host,
         &[
@@ -268,11 +281,15 @@ fn unset_glob_removes_matching_cache_and_report_entries() {
         ],
     );
     assert!(
-        run.stderr
-            .contains("The following variables have changed:\nCMAKE_TOOLCHAIN_FILE= \n"),
+        !run.stderr.contains("require your cache to be deleted"),
         "{}",
         run.stderr
     );
+    assert_eq!(
+        cache_value(&host, "/work/build-p", "SAVED").as_deref(),
+        Some("keep")
+    );
+    assert!(exists(&host, "/work/build-p/CMakeFiles/marker.txt"));
     assert!(
         run.stdout.contains(&report(&[
             "KEEP=\"k\"",
@@ -356,9 +373,18 @@ fn fresh_clears_build_metadata_only_when_cache_exists() {
     let host = new_host();
     seed(&host, "/work/CMakeLists.txt", PROJECT);
     seed(&host, "/work/build/CMakeFiles/marker.txt", "keep\n");
+    seed(&host, "/work/build/CMakeFiles/stale.cmake", "# stale\n");
+    seed(
+        &host,
+        "/work/build/CMakeFiles/sub/nested.cmake",
+        "# nested\n",
+    );
     let args = ["-S", ".", "-B", "build", "-G", "Ninja", "--fresh"];
+    // Without a cache, only the `CMakeFiles/*.cmake` scripts go.
     success(&host, &args);
     assert!(exists(&host, "/work/build/CMakeFiles/marker.txt"));
+    assert!(!exists(&host, "/work/build/CMakeFiles/stale.cmake"));
+    assert!(exists(&host, "/work/build/CMakeFiles/sub/nested.cmake"));
     assert!(exists(&host, "/work/build/CMakeCache.txt"));
 
     success(&host, &args);
@@ -377,6 +403,64 @@ fn fresh_clears_build_metadata_only_when_cache_exists() {
     success(&host, &args);
     assert!(exists(&host, "/work/elsewhere/marker.txt"));
     assert!(exists(&host, "/work/build/CMakeCache.txt"));
+}
+
+#[test]
+fn path_definitions_use_the_preset_home() {
+    let host = new_host();
+    host.env_set(b"HOME", Some(b"/process-home"));
+    seed(&host, "/work/CMakeLists.txt", PROJECT);
+    seed(
+        &host,
+        "/work/CMakePresets.json",
+        r#"{
+  "version": 6,
+  "configurePresets": [
+    {"name": "p", "generator": "Ninja", "binaryDir": "${sourceDir}/build",
+     "environment": {"HOME": "/preset-home"},
+     "cacheVariables": {"PV": {"type": "PATH", "value": "~/pv/"}, "SV": "~/sv"}}
+  ]
+}"#,
+    );
+    success(
+        &host,
+        &[
+            "--preset",
+            "p",
+            "-DA=~/q",
+            "-DB:PATH=~/q",
+            "-DC:FILEPATH=~\\c",
+            "-DL:PATH=~/a;;~/b",
+            "-DK:PATH=[x;~/b]",
+        ],
+    );
+    for (name, value) in [
+        ("A", "~/q"),
+        ("B", "/preset-home/q"),
+        ("C", "/preset-home/c"),
+        ("L", "/preset-home/a;/preset-home/b"),
+        ("K", "[x;~/b]"),
+        ("PV", "/preset-home/pv"),
+        ("SV", "~/sv"),
+    ] {
+        assert_eq!(
+            cache_value(&host, "/work/build", name).as_deref(),
+            Some(value),
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn untyped_definition_resets_the_cache_type() {
+    let host = new_host();
+    seed(&host, "/work/CMakeLists.txt", PROJECT);
+    let args = ["-S", ".", "-B", "build", "-G", "Ninja"];
+    success(&host, &[&args[..], &["-DFIRST:BOOL=ON"]].concat());
+    assert!(read(&host, "/work/build/CMakeCache.txt").contains("FIRST:BOOL=ON\n"));
+    success(&host, &[&args[..], &["-DFIRST=second"]].concat());
+    let cache = read(&host, "/work/build/CMakeCache.txt");
+    assert!(cache.contains("FIRST:UNINITIALIZED=second\n"), "{cache}");
 }
 
 #[test]
@@ -495,7 +579,16 @@ fn build_target_arguments_expand_cmake_lists() {
         .collect();
     assert_eq!(targets, ["a", "b", "c", "d", "e"]);
 
+    // Separate values join into one list, so a bracket can span them.
+    let commands = build_args(&host, &["out", "--target", "[x", "y]"]);
+    assert!(commands.iter().flatten().any(|arg| arg == "[x;y]"));
+
+    // An attached value consumes only its own argument.
     let commands = record_commands(&host);
+    let run = cmake(&host, &["--build", "out", "--target=clean", "other"]);
+    assert_eq!(run.code, 1, "{}", run.stderr);
+    assert!(take(&commands).is_empty());
+
     let run = cmake(&host, &["--build", "out", "--target", "clean;a"]);
     assert_eq!(run.code, 1);
     assert!(
@@ -584,7 +677,7 @@ fn build_preset_jobs_fill_default_states() {
     }
 }
 
-#[cfg(feature = "vs-cross")]
+#[cfg(any(windows, feature = "vs-cross"))]
 #[test]
 fn vs_package_restore_uses_preset_and_cli_modes() {
     let host = new_host();

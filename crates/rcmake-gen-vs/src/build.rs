@@ -22,7 +22,9 @@ pub enum RestoreMode {
     On,
     /// `off`: build without a restore.
     Off,
-    /// `only`: restore the packages and do not build.
+    /// `only`: run only the `Restore` target (`/t:Restore`) for a project
+    /// that needs a restore. A project without the restore mark still builds
+    /// normally, as in CMake.
     Only,
 }
 
@@ -45,8 +47,9 @@ pub fn build_commands(
 /// package restore mode, in run order.
 ///
 /// A restore applies only to an MSBuild project whose
-/// `<target>_REQUIRES_VS_PACKAGE_RESTORE` cache entry is on. `only` adds
-/// `/t:Restore`. `on` adds `/restore`. The default mode adds `/restore`
+/// `<target>_REQUIRES_VS_PACKAGE_RESTORE` cache entry is on. For such a
+/// project, `only` adds `/t:Restore`, so MSBuild restores and does not build.
+/// `on` adds `/restore`. The default mode adds `/restore`
 /// unless the cache sets `CMAKE_VS_NUGET_PACKAGE_RESTORE` to a false value.
 /// `devenv` and `clean` commands do not change.
 ///

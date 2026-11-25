@@ -13,12 +13,16 @@ use crate::{cache, options::CacheEdit};
 /// Delete the cache for `--fresh`.
 ///
 /// CMake removes `CMakeFiles` only when it removed `CMakeCache.txt`. A
-/// missing cache is not an error and leaves `CMakeFiles` in place. A
-/// `CMakeFiles` symlink is removed without following it.
+/// missing cache is not an error. Then only the stale `CMakeFiles/*.cmake`
+/// scripts go, as in `cmCacheManager::CleanCMakeFiles`. A `CMakeFiles`
+/// symlink is removed without following it. Unlike CMake, the cleanup of a
+/// missing cache does not follow a `CMakeFiles` symlink either.
 pub(super) fn clear(host: &dyn Host, bin: &Path) -> rcmake_host::HostResult<()> {
     match host.remove_file(&bin.join("CMakeCache.txt")) {
         Ok(()) => {}
-        Err(err) if err.kind == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) if err.kind == std::io::ErrorKind::NotFound => {
+            return clean_cmake_files(host, bin);
+        }
         Err(err) => return Err(err),
     }
     let files = bin.join("CMakeFiles");
@@ -37,6 +41,44 @@ pub(super) fn clear(host: &dyn Host, bin: &Path) -> rcmake_host::HostResult<()> 
             Err(err)
         }
     })
+}
+
+/// Remove the `*.cmake` files directly in `<bin>/CMakeFiles`.
+fn clean_cmake_files(host: &dyn Host, bin: &Path) -> rcmake_host::HostResult<()> {
+    let files = bin.join("CMakeFiles");
+    if !host
+        .metadata(&files, Follow::No)
+        .is_ok_and(|meta| meta.kind == FileKind::Dir)
+    {
+        return Ok(());
+    }
+    for entry in host.read_dir(&files)? {
+        if entry.kind == FileKind::Dir || !is_cmake_script(&entry.name) {
+            continue;
+        }
+        if let Err(err) = host.remove_file(&files.join(to_native(&entry.name)))
+            && err.kind != std::io::ErrorKind::NotFound
+        {
+            return Err(err);
+        }
+    }
+    Ok(())
+}
+
+/// The `*.cmake` glob of CMake ignores case on Windows and macOS.
+fn is_cmake_script(name: &[u8]) -> bool {
+    let Some(suffix) = name
+        .len()
+        .checked_sub(6)
+        .and_then(|start| name.get(start..))
+    else {
+        return false;
+    };
+    if cfg!(any(windows, target_os = "macos")) {
+        suffix.eq_ignore_ascii_case(b".cmake")
+    } else {
+        suffix == b".cmake"
+    }
 }
 
 pub(super) fn apply_environment_defaults(host: &dyn Host, cache: &mut Cache, has_cache: bool) {
@@ -113,12 +155,12 @@ pub(super) fn refresh_toolchain(
         return Ok(());
     }
     let selection = edits.iter().rev().find_map(|edit| match edit {
-        CacheEdit::Define(definition) if definition.name == TOOLCHAIN_FILE => {
-            Some(Some(definition.value.as_slice()))
-        }
-        CacheEdit::Remove(pattern) if CacheGlob::new(pattern).matches(TOOLCHAIN_FILE) => {
-            Some(Some(b""))
-        }
+        CacheEdit::Define(definition) if definition.name == TOOLCHAIN_FILE => Some(Some(
+            cache::typed_value(host, definition.ty, &definition.value),
+        )),
+        // A removal is not a toolchain change. CMake removes only the
+        // matching entries and keeps the rest of the cache.
+        CacheEdit::Remove(pattern) if CacheGlob::new(pattern).matches(TOOLCHAIN_FILE) => Some(None),
         CacheEdit::Preload(_) => Some(None),
         _ => None,
     });
@@ -146,7 +188,7 @@ pub(super) fn refresh_toolchain(
         let resolved = host.canonicalize(&absolute).unwrap_or(absolute);
         Lexical::new(&from_native_cmake(&resolved)).normalize()
     };
-    let selected = resolve(selected);
+    let selected = resolve(&selected);
     if selected == resolve(previous) {
         return Ok(());
     }

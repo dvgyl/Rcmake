@@ -95,14 +95,16 @@ fn parse(args: &[BString], host: &dyn Host) -> Result<Options, ParseError> {
                 permissions(value()?).ok_or(ParseError::Permissions)?,
             ),
             b"--component" => {
-                // Each value is a CMake list of component names.
-                let first = value()?;
-                for value in
-                    std::iter::once(first).chain(std::iter::from_fn(|| take_value(&mut args)))
-                {
-                    opts.components
-                        .extend(list::split(value, list::Empty::Drop));
+                // An attached value is one argument. Separate values join
+                // with `;` into one CMake list, as in `cmCommandLineArgument`.
+                let attached = inline.is_some();
+                let mut components = BString::from(value()?);
+                while !attached && let Some(next) = take_value(&mut args) {
+                    components.push(b';');
+                    components.extend_from_slice(next);
                 }
+                opts.components
+                    .extend(list::split(&components, list::Empty::Drop));
                 continue;
             }
             b"--parallel" | b"-j" => {
@@ -295,5 +297,16 @@ mod tests {
             ["a;b", "[x;y]"]
         );
         assert!(components(&["build", "--component", ";"]).is_empty());
+        // Separate values join into one list, so a bracket can span them.
+        assert_eq!(components(&["build", "--component", "[x", "y]"]), ["[x;y]"]);
+        // An attached value consumes only its own argument.
+        let args: Vec<BString> = ["build", "--component=a", "b"]
+            .into_iter()
+            .map(BString::from)
+            .collect();
+        assert!(matches!(
+            parse(&args, &PureHost::default()),
+            Err(ParseError::Usage(_))
+        ));
     }
 }
