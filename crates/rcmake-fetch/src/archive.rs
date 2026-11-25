@@ -69,6 +69,11 @@ impl ContentHash {
         }
     }
 
+    /// Return the digest algorithm used to verify the archive.
+    pub fn algorithm(&self) -> HashAlgo {
+        self.algorithm
+    }
+
     pub(crate) fn identity(&self) -> String {
         format!("{}={}", self.name, self.hex)
     }

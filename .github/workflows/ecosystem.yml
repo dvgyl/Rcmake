@@ -9,7 +9,7 @@ name: Ecosystem parity
       lane:
         description: "Select the tests to run."
         type: choice
-        options: [all, vcpkg, conan, boss-fight, toolchains]
+        options: [all, vcpkg, conan, boss-fight, toolchains, qt]
         default: all
       vcpkg_shard_count:
         description: "Number of vcpkg shards (1 to 128)."
@@ -84,39 +84,101 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           source env/env.sh
-          deadline=$((SECONDS + 5200))
-          dispatched=false
-          while (( SECONDS < deadline )); do
-            runs=$(timeout 30s gh api --method GET \
-            "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs" \
-            -f head_sha="$GITHUB_SHA" -F per_page=20 \
-              --jq '.workflow_runs[] | select(.event == "push" or .event == "workflow_dispatch") | [.id, .status] | @tsv')
-            pending=false
-            while IFS=$'\t' read -r run_id status; do
-              [[ -n "$run_id" ]] || continue
-              artifact=$(timeout 30s gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run_id/artifacts" \
-                --jq '.artifacts[] | select(.name == "rcmake-ci-ubuntu-24.04" and (.expired | not)) | .id')
-              if [[ -n "$artifact" ]]; then
-                printf 'run_id=%s\n' "$run_id" >> "$GITHUB_OUTPUT"
-                exit 0
-              fi
-              if [[ "$status" != completed ]]; then
-                pending=true
-              fi
-            done <<< "$runs"
-            if [[ "$pending" == false && "$dispatched" == false ]]; then
-              ref_sha=$(timeout 30s gh api "repos/$GITHUB_REPOSITORY/commits/$GITHUB_REF_NAME" --jq .sha)
-              if [[ "$ref_sha" != "$GITHUB_SHA" ]]; then
-                echo '::error::The selected ref moved before CI published the binary.'
-                exit 1
-              fi
-              timeout 30s gh workflow run ci.yml --repo "$GITHUB_REPOSITORY" --ref "$GITHUB_REF_NAME"
-              dispatched=true
-            fi
-            timeout 50s sleep 45
-          done
-          echo '::error::CI did not publish the Ubuntu binary for this commit.'
-          exit 1
+          python3 - <<'PY'
+          import datetime as dt
+          import json
+          import os
+          import subprocess
+          import time
+
+          repo = f"repos/{os.environ['GITHUB_REPOSITORY']}"
+          workflow = f"{repo}/actions/workflows/ci.yml"
+          sha = os.environ["GITHUB_SHA"]
+          ref = os.environ["GITHUB_REF_NAME"]
+          artifact_name = "rcmake-ci-ubuntu-24.04"
+          deadline = time.monotonic() + 5200
+
+          def pause(seconds):
+              remaining = deadline - time.monotonic()
+              if remaining <= 0:
+                  raise SystemExit(f"::error::Timed out waiting for {artifact_name} at {sha}.")
+              time.sleep(min(seconds, remaining))
+
+          def api(path, *args, method="GET", attempts=3):
+              for attempt in range(attempts):
+                  remaining = deadline - time.monotonic()
+                  if remaining <= 0:
+                      pause(0)
+                  try:
+                      result = subprocess.run(
+                          ["gh", "api", "--method", method, "-H", "X-GitHub-Api-Version: 2026-03-10",
+                           path, *args], timeout=min(30, remaining), check=True,
+                          text=True, stdout=subprocess.PIPE)
+                      return json.loads(result.stdout) if result.stdout.strip() else None
+                  except (subprocess.SubprocessError, OSError, ValueError) as error:
+                      if attempt + 1 == attempts:
+                          raise SystemExit(f"::error::GitHub API request failed for {path}. {error}")
+                      pause(2 ** attempt)
+
+          def runs():
+              return api(f"{workflow}/runs", "-f", f"head_sha={sha}", "-F", "per_page=50")["workflow_runs"]
+
+          def available(run_id):
+              artifacts = api(f"{repo}/actions/runs/{run_id}/artifacts",
+                              "-f", f"name={artifact_name}")["artifacts"]
+              return any(row["name"] == artifact_name and not row["expired"] for row in artifacts)
+
+          def publish(run_id):
+              with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+                  print(f"run_id={run_id}", file=output)
+
+          initial = runs()
+          candidates = [run for run in initial
+                        if run["event"] in ("push", "workflow_dispatch") and run["head_sha"] == sha]
+          for candidate in candidates:
+              if available(candidate["id"]):
+                  publish(candidate["id"])
+                  raise SystemExit(0)
+
+          pending = next((run for run in candidates if run["status"] != "completed"), None)
+          if pending:
+              run_id = pending["id"]
+          else:
+              ref_sha = api(f"{repo}/commits/{ref}")["sha"]
+              if ref_sha != sha:
+                  raise SystemExit("::error::The selected ref moved before CI published the binary.")
+              previous = {run["id"] for run in initial}
+              dispatched = dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
+              # A dispatch can succeed even if the client loses the response.
+              # Do not retry the POST. The next run can detect an existing run.
+              response = api(f"{workflow}/dispatches", "-f", f"ref={ref}", method="POST", attempts=1)
+              run_id = (response or {}).get("workflow_run_id")
+              while run_id is None:
+                  candidates = [run for run in runs()
+                                if run["id"] not in previous and run["event"] == "workflow_dispatch"
+                                and run["head_branch"] == ref and run["head_sha"] == sha
+                                and dt.datetime.fromisoformat(run["created_at"]) >= dispatched]
+                  if len(candidates) > 1:
+                      raise SystemExit("::error::More than one CI run matches the dispatch.")
+                  if candidates:
+                      run_id = candidates[0]["id"]
+                  else:
+                      if api(f"{repo}/commits/{ref}")["sha"] != sha:
+                          raise SystemExit("::error::The selected ref moved before CI published the binary.")
+                      pause(15)
+
+          while True:
+              run = api(f"{repo}/actions/runs/{run_id}")
+              if run["head_sha"] != sha:
+                  raise SystemExit(f"::error::CI run {run_id} uses {run['head_sha']}. Expected {sha}.")
+              if available(run_id):
+                  publish(run_id)
+                  break
+              if run["status"] == "completed":
+                  raise SystemExit(f"::error::CI run {run_id} concluded with {run['conclusion']} "
+                                   f"and did not publish {artifact_name}.")
+              pause(30)
+          PY
 
   vcpkg:
     name: vcpkg shard ${{ matrix.shard }}
@@ -634,6 +696,21 @@ jobs:
           oracle_env="$(scripts/fetch-oracle.sh --print-env)"
           eval "$oracle_env"
           timeout --kill-after=30s 45m scripts/linux-vm-test.sh --extended-only target/stage/bin
+
+  qt:
+    name: Linux Qt 6 AUTOGEN
+    if: github.event_name == 'schedule' || inputs.lane == 'all' || inputs.lane == 'qt'
+    needs: prepare
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - *checkout
+      - *binary
+      - name: Build and test Qt 6 offscreen
+        run: |
+          timeout 120s sudo apt-get update
+          timeout 300s sudo apt-get install -y --no-install-recommends ninja-build g++ qt6-base-dev qt6-base-dev-tools
+          scripts/linux-vm-test.sh --qt-only target/stage/bin
 
   toolchains:
     name: Linux T2 toolchains

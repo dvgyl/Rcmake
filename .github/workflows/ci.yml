@@ -152,7 +152,7 @@ jobs:
             scripts/stage.sh
           else
             source env/env.sh
-            cargo build --locked --bin rcmake
+            cargo build --locked --bin rcmake --target-dir target
             mkdir -p target/stage/bin target/stage/share
             for tool in rcmake cmake ctest cpack; do
               cp target/debug/rcmake.exe "target/stage/bin/$tool.exe"

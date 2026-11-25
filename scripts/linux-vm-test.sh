@@ -109,7 +109,7 @@ CPP
     "$bin/cmake$exe" --build "$build" --config Release --parallel 2
     "$bin/ctest$exe" --test-dir "$build" -C Release --output-on-failure --no-tests=error
     if [[ "$platform" == Linux ]]; then
-      dynamic="$(readelf -d "$build/wave_test")"
+      dynamic="$(LC_ALL=C readelf -d "$build/wave_test")"
       if [[ "$dynamic" != *build-only* ]]; then
         printf 'The build executable has no build-only ELF runtime path.\n' >&2
         exit 1
@@ -121,7 +121,7 @@ CPP
       Linux)
         static_library=lib/libwave_static.a
         shared_library=lib/libwave_shared.so
-        dynamic="$(readelf -d "$prefix/bin/wave_test")"
+        dynamic="$(LC_ALL=C readelf -d "$prefix/bin/wave_test")"
         rpaths="$(awk '/\((RPATH|RUNPATH)\)/ { sub(/^.*\[/, ""); sub(/\].*$/, ""); print }' <<< "$dynamic")"
         if [[ "$rpaths" != "\$ORIGIN/../lib" ]]; then
           printf 'Unexpected installed ELF runtime path %s.\n' "$rpaths" >&2
@@ -173,7 +173,11 @@ PY
 )
 
 linux_integration() (
-  local bin="$1"
+  local bin="$1" work generator build
+  if ! command -v gfortran >/dev/null 2>&1; then
+    printf 'The Linux integration tests require gfortran.\n' >&2
+    exit 1
+  fi
   work="$(mktemp -d)"
   trap 'rm -rf "$work"' EXIT
   cd "$work"
@@ -200,6 +204,9 @@ endif()
 file(WRITE "${CMAKE_CURRENT_LIST_DIR}/resolved.txt" "${resolved}")
 CMAKE
   "$bin/cmake" -P dependencies.cmake
+  mv resolved.txt resolved-rcmake.txt
+  timeout 30s "${RCMAKE_ORACLE_CMAKE:?Set RCMAKE_ORACLE_CMAKE to CMake 4.5.1.}" -P dependencies.cmake
+  cmp resolved.txt resolved-rcmake.txt
   LC_ALL=C python3 - <<'PY'
 from pathlib import Path
 import re
@@ -220,31 +227,40 @@ if sorted(Path(name).resolve(strict=True) for name in resolved if name) != expec
     sys.exit(f"ELF dependency paths differ from readelf. Found {resolved}. Expected {expected}.")
 PY
 
-  if command -v gfortran >/dev/null 2>&1; then
-    mkdir fortran
-    cat > fortran/CMakeLists.txt <<'CMAKE'
+  mkdir fortran
+  cat > fortran/CMakeLists.txt <<'CMAKE'
 cmake_minimum_required(VERSION 4.5)
 project(FortranModules LANGUAGES Fortran)
 add_executable(probe main.f90 number.f90)
 CMAKE
-    cat > fortran/main.f90 <<'FORTRAN'
+  cat > fortran/main.f90 <<'FORTRAN'
 program main
 use number
 if (value /= 42) stop 1
 end program
 FORTRAN
-    cat > fortran/number.f90 <<'FORTRAN'
+  cat > fortran/number.f90 <<'FORTRAN'
 module number
 integer, parameter :: value = 42
 end module
 FORTRAN
-    "$bin/cmake" -S fortran -B fortran-build -G Ninja -DCMAKE_Fortran_COMPILER=gfortran
-    "$bin/cmake" --build fortran-build --parallel 2
-    test -n "$(find fortran-build -type f -iname number.mod -print -quit)"
-    ./fortran-build/probe
-  else
-    printf 'Skip the Fortran check because gfortran is unavailable.\n'
-  fi
+  for generator in Ninja "Unix Makefiles"; do
+    build="fortran-${generator// /-}"
+    "$bin/cmake" -S fortran -B "$build" -G "$generator" -DCMAKE_Fortran_COMPILER=gfortran
+    "$bin/cmake" --build "$build" --parallel 2
+    test -n "$(find "$build" -type f -iname number.mod -print -quit)"
+    "$build/probe"
+  done
+)
+
+linux_qt() (
+  local bin="$1" work
+  work="$(mktemp -d)"
+  trap 'rm -rf "$work"' EXIT
+  timeout --kill-after=10s 120s "$bin/cmake" -S "$root/conformance/cases/m6-langs/autogen" -B "$work" -G Ninja
+  timeout --kill-after=10s 180s "$bin/cmake" --build "$work" --parallel 2
+  QT_QPA_PLATFORM=offscreen timeout --kill-after=10s 60s \
+    "$bin/ctest" --test-dir "$work" --output-on-failure --no-tests=error
 )
 
 linux_runcmake() (
@@ -300,7 +316,7 @@ case "$(uname -s)" in
 esac
 case "${1:-}" in
   -h|--help)
-    printf 'Usage: %s [--smoke-only <staged-bin-dir> | --extended-only <staged-bin-dir>]\n' "$0"
+    printf 'Usage: %s [--smoke-only | --extended-only | --qt-only] <staged-bin-dir>\n' "$0"
     printf 'Run the full test on Ubuntu 24.04. Use --smoke-only on Linux, macOS, or Windows.\n'
     printf 'Use --extended-only on Linux with a staged binary and a configured oracle.\n'
     exit 0
@@ -311,6 +327,14 @@ case "${1:-}" in
       exit 2
     fi
     smoke "$2" "$platform"
+    exit
+    ;;
+  --qt-only)
+    if [[ $# != 2 || "$platform" != Linux ]]; then
+      printf 'Use --qt-only with a staged bin directory on Linux.\n' >&2
+      exit 2
+    fi
+    linux_qt "$(cd "$2" && pwd -P)"
     exit
     ;;
   --extended-only)
@@ -344,12 +368,13 @@ if [[ "$( . /etc/os-release && printf '%s:%s' "$ID" "$VERSION_ID" )" != ubuntu:2
   exit 2
 fi
 
-for tool in gcc g++ clang clang++ gfortran ninja make patchelf readelf python3 curl git; do
+for tool in gcc g++ clang clang++ gfortran ninja make patchelf readelf python3 curl git \
+  /usr/lib/qt6/libexec/moc; do
   if ! command -v "$tool" >/dev/null 2>&1; then
     apt=(apt-get)
     if [[ "$EUID" != 0 ]]; then apt=(sudo apt-get); fi
     "${apt[@]}" update
-    "${apt[@]}" install -y gcc g++ clang gfortran ninja-build make patchelf binutils python3 curl git ca-certificates
+    "${apt[@]}" install -y gcc g++ clang gfortran ninja-build make patchelf binutils python3 curl git ca-certificates qt6-base-dev qt6-base-dev-tools
     break
   fi
 done
@@ -381,6 +406,8 @@ run_gate timeout --kill-after=30s 15m "$root/scripts/linux-vm-test.sh" --smoke-o
 run_gate timeout --kill-after=30s 15m "$CARGO_TARGET_DIR/debug/rcmake-harness" --suite all
 
 run_gate timeout --kill-after=30s 45m "$root/scripts/linux-vm-test.sh" --extended-only "$root/target/stage/bin"
+
+run_gate "$root/scripts/linux-vm-test.sh" --qt-only "$root/target/stage/bin"
 
 for project in zlib cJSON pugixml lz4; do
   run_gate python3 tools/measure/corpus_eval.py --project "$project" --generator Ninja --timeout 300

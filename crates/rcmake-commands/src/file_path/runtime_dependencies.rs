@@ -1,3 +1,5 @@
+mod elf;
+
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -28,12 +30,14 @@ pub(super) fn run(cx: &mut Cx<'_>, args: &[&[u8]]) -> Result {
 }
 
 fn run_command(cx: &mut Cx<'_>, args: &[&[u8]]) -> Result {
+    let platform = cx.var_or_empty(b"CMAKE_GET_RUNTIME_DEPENDENCIES_PLATFORM");
     let system = cx.var_or_empty(b"CMAKE_HOST_SYSTEM_NAME");
     let host_platform = match system.as_slice() {
         b"Darwin" => b"macos+macho".as_slice(),
         b"Linux" => b"linux+elf",
         b"FreeBSD" => b"freebsd+elf",
         b"Windows" => b"windows+pe",
+        _ if !platform.is_empty() => b"",
         _ => {
             return Err(error(
                 [
@@ -81,7 +85,6 @@ fn run_command(cx: &mut Cx<'_>, args: &[&[u8]]) -> Result {
         return Err(crate::command_error(cx, message));
     }
 
-    let platform = cx.var_or_empty(b"CMAKE_GET_RUNTIME_DEPENDENCIES_PLATFORM");
     let platform = if platform.is_empty() {
         host_platform
     } else {
@@ -113,7 +116,12 @@ fn run_command(cx: &mut Cx<'_>, args: &[&[u8]]) -> Result {
     }
 
     let mut scan = Scan::new(cx, &args);
-    if INPUTS.iter().any(|key| !args.multi(key).is_empty()) {
+    if !INPUTS.iter().any(|key| !args.multi(key).is_empty()) {
+        return scan.report(&args);
+    }
+    if matches!(platform, b"linux+elf" | b"freebsd+elf") {
+        elf::scan(&mut scan, &args, platform)?;
+    } else {
         if platform != b"macos+macho" {
             return Err(error(
                 [
@@ -123,7 +131,7 @@ fn run_command(cx: &mut Cx<'_>, args: &[&[u8]]) -> Result {
                 .concat(),
             ));
         }
-        let tool = Otool::find(scan.cx)?;
+        let mut tool = Otool::find(scan.cx)?;
         let bundle = option(&args, "BUNDLE_EXECUTABLE").unwrap_or_default();
         for key in INPUTS {
             for input in args.multi(key) {
@@ -132,9 +140,9 @@ fn run_command(cx: &mut Cx<'_>, args: &[&[u8]]) -> Result {
                 } else {
                     bundle
                 };
-                let image = scan.image(&tool, input)?;
+                let image = tool.image(scan.cx, input)?;
                 scan.visit(
-                    &tool,
+                    &mut tool,
                     input,
                     &image,
                     Lexical::new(executable).parent(),
@@ -156,10 +164,13 @@ fn option<'a>(args: &'a Parsed, key: &str) -> Option<&'a [u8]> {
 #[derive(Default)]
 struct Image {
     libs: Vec<BString>,
-    rpaths: Vec<BString>,
+    rpaths: Arc<[BString]>,
 }
 
-struct Otool(CommandSpec);
+struct Otool {
+    command: CommandSpec,
+    images: HashMap<BString, Arc<Image>>,
+}
 
 impl Otool {
     fn find(cx: &Cx<'_>) -> Result<Self> {
@@ -179,13 +190,25 @@ impl Otool {
                 args: words.collect(),
             }
         };
-        Ok(Self(spec))
+        Ok(Self {
+            command: spec,
+            images: HashMap::new(),
+        })
+    }
+
+    fn image(&mut self, cx: &Cx<'_>, path: &[u8]) -> Result<Arc<Image>> {
+        if let Some(image) = self.images.get(path) {
+            return Ok(Arc::clone(image));
+        }
+        let image = Arc::new(self.read(cx, path)?);
+        self.images.insert(path.into(), Arc::clone(&image));
+        Ok(image)
     }
 
     fn read(&self, cx: &Cx<'_>, file: &[u8]) -> Result<Image> {
         let failure = |message: &[u8]| error([message, b":\n  ", file].concat());
         let host = cx.host();
-        let mut command = self.0.clone();
+        let mut command = self.command.clone();
         let operand = if file.starts_with(b"-") {
             from_native(&host.initial_cwd().join(to_native(file)))
         } else {
@@ -222,16 +245,15 @@ impl Otool {
 }
 
 fn parse_otool(bytes: &[u8]) -> Option<Image> {
-    let mut image = Image::default();
+    let mut libs = Vec::new();
+    let mut rpaths = Vec::new();
     let mut lines = bytes
         .split(|&byte| byte == b'\n')
         .map(|line| line.strip_suffix(b"\r").unwrap_or(line).trim_ascii_start());
     while let Some(line) = lines.next() {
         let (values, prefix) = match line {
-            b"cmd LC_RPATH" => (&mut image.rpaths, b"path ".as_slice()),
-            b"cmd LC_LOAD_DYLIB" | b"cmd LC_LOAD_WEAK_DYLIB" => {
-                (&mut image.libs, b"name ".as_slice())
-            }
+            b"cmd LC_RPATH" => (&mut rpaths, b"path ".as_slice()),
+            b"cmd LC_LOAD_DYLIB" | b"cmd LC_LOAD_WEAK_DYLIB" => (&mut libs, b"name ".as_slice()),
             _ => continue,
         };
         lines.next()?;
@@ -245,7 +267,10 @@ fn parse_otool(bytes: &[u8]) -> Option<Image> {
         }
         values.push(value.get(..offset)?.into());
     }
-    Some(image)
+    Some(Image {
+        libs,
+        rpaths: rpaths.into(),
+    })
 }
 
 type Regexes = Vec<Arc<Regex>>;
@@ -327,13 +352,12 @@ fn matches_regex(regexes: &[Arc<Regex>], subject: &[u8], budget: &mut u64) -> Re
 
 struct Resolved {
     file: Option<(u64, u64)>,
-    image: Arc<Image>,
+    rpaths: Option<Arc<[BString]>>,
 }
 
 struct Scan<'cx, 'eval, 'args> {
     cx: &'cx mut Cx<'eval>,
     filters: Filters<'args>,
-    images: HashMap<BString, Arc<Image>>,
     resolved: BTreeMap<BString, BTreeMap<BString, Resolved>>,
     unresolved: BTreeSet<BString>,
 }
@@ -343,24 +367,14 @@ impl<'cx, 'eval, 'args> Scan<'cx, 'eval, 'args> {
         Self {
             filters: Filters::new(cx, args),
             cx,
-            images: HashMap::new(),
             resolved: BTreeMap::new(),
             unresolved: BTreeSet::new(),
         }
     }
 
-    fn image(&mut self, tool: &Otool, path: &[u8]) -> Result<Arc<Image>> {
-        if let Some(image) = self.images.get(path) {
-            return Ok(Arc::clone(image));
-        }
-        let image = Arc::new(tool.read(self.cx, path)?);
-        self.images.insert(path.into(), Arc::clone(&image));
-        Ok(image)
-    }
-
     fn visit(
         &mut self,
-        tool: &Otool,
+        tool: &mut Otool,
         path: &[u8],
         image: &Image,
         executable: &[u8],
@@ -371,7 +385,7 @@ impl<'cx, 'eval, 'args> Scan<'cx, 'eval, 'args> {
             return Err(error("Runtime dependency scan exceeds the depth limit"));
         }
         let loader = Lexical::new(path).parent();
-        let mut rpaths = image.rpaths.clone();
+        let mut rpaths = image.rpaths.to_vec();
         rpaths.extend_from_slice(inherited);
         for name in &image.libs {
             if self.filters.pre_excluded(name)? {
@@ -384,7 +398,7 @@ impl<'cx, 'eval, 'args> Scan<'cx, 'eval, 'args> {
             if self.filters.post_excluded(self.cx, &path)? || missing_system_dylib(self.cx, &path) {
                 continue;
             }
-            let image = self.image(tool, &path)?;
+            let image = tool.image(self.cx, &path)?;
             let name = Lexical::new(&path).filename();
             let paths = self.resolved.entry(name.into()).or_default();
             let file = identity(self.cx, &path);
@@ -394,7 +408,7 @@ impl<'cx, 'eval, 'args> Scan<'cx, 'eval, 'args> {
                 path.clone(),
                 Resolved {
                     file,
-                    image: Arc::clone(&image),
+                    rpaths: Some(Arc::clone(&image.rpaths)),
                 },
             );
             if !seen {
@@ -422,7 +436,7 @@ impl<'cx, 'eval, 'args> Scan<'cx, 'eval, 'args> {
                     set(
                         self.cx,
                         &[prefix, b"_", first].concat(),
-                        list::join(&entry.image.rpaths),
+                        list::join(entry.rpaths.as_deref().unwrap_or_default()),
                     )?;
                 }
             } else if let Some(prefix) = conflict_prefix {
@@ -484,7 +498,7 @@ fn native(cx: &Cx<'_>, path: &[u8]) -> PathBuf {
 
 fn identity(cx: &Cx<'_>, path: &[u8]) -> Option<(u64, u64)> {
     let meta = cx.host().metadata(&native(cx, path), Follow::Yes).ok()?;
-    Some((meta.dev, meta.ino))
+    (meta.dev != 0 || meta.ino != 0).then_some((meta.dev, meta.ino))
 }
 
 fn exists(cx: &Cx<'_>, path: &[u8]) -> bool {
@@ -550,6 +564,10 @@ fn normalize(cx: &mut Cx<'_>, path: BString) -> BString {
             normalized.push(b'/');
         }
     }
+    apply_normalization(cx, path, normalized)
+}
+
+fn apply_normalization(cx: &mut Cx<'_>, path: BString, normalized: Vec<u8>) -> BString {
     if path.as_slice() == normalized.as_slice() {
         return path;
     }

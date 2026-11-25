@@ -349,3 +349,84 @@ fn project_file_name_selects_each_directory_listfile() -> TestResult {
     assert!(stdout.contains("b: fallback"), "{stdout}");
     Ok(())
 }
+
+#[test]
+fn directory_usage_preserves_native_path_meaning_and_inherits_paths() -> TestResult {
+    let (
+        root,
+        include,
+        include_system,
+        library,
+        expected_include,
+        expected_system,
+        expected_library,
+    ) = if cfg!(windows) {
+        (
+            "C:/usage-paths",
+            r"C:\SDK\include",
+            "C:/SDK/system",
+            r"C:\SDK\lib",
+            "C:/SDK/include",
+            "C:/SDK/system",
+            "C:/SDK/lib",
+        )
+    } else {
+        (
+            "/usage-paths",
+            r"/sdk/include\literal",
+            "/sdk/system",
+            r"/sdk/lib\literal",
+            r"/sdk/include\literal",
+            "/sdk/system",
+            r"/sdk/lib\literal",
+        )
+    };
+    let source = Path::new(root).join("source");
+    let binary = Path::new(root).join("build");
+    let command = Path::new(root).join("bin/cmake");
+    let host = Arc::new(PureHost::new(source.clone(), command.clone()));
+    let script = format!(
+        "cmake_minimum_required(VERSION 4.5)\nproject(Usage NONE)\ninclude_directories([[{include}]])\ninclude_directories(SYSTEM [[{include_system}]])\nlink_directories([[{library}]])\nadd_subdirectory(child)\n"
+    );
+    host.seed_file(&source.join("CMakeLists.txt"), script.as_bytes())?;
+    host.seed_file(&source.join("child/CMakeLists.txt"), b"")?;
+    let mut interp = Interp::new(
+        InterpConfig {
+            services: Default::default(),
+            host: host.clone(),
+            mode: RunMode::Configure,
+            cmake_root: Path::new(root).join("share/cmake"),
+            cmake_command: command,
+            cwd: source.clone(),
+            limits: Default::default(),
+            diag: Default::default(),
+            defines: Vec::new(),
+            script_args: Vec::new(),
+        },
+        crate::register_all,
+    );
+    assert_eq!(
+        interp.run_configure(&source, &binary, &[]).exit_code,
+        0,
+        "{}",
+        host.stream_bytes(Stream::Stderr)
+    );
+    let mut cx = interp.cx();
+    let model = cx.project();
+    let root = model.dir(DirId::ROOT);
+    let [child_id] = root.children.as_slice() else {
+        return Err("Expected a child directory".into());
+    };
+    let child = model.dir(*child_id);
+    for dir in [root, child] {
+        assert_eq!(
+            dir.usage.joined(UsageField::IncludeDirectories),
+            Some(format!("{expected_include};{expected_system}").into())
+        );
+        assert_eq!(
+            dir.usage.joined(UsageField::LinkDirectories),
+            Some(expected_library.into())
+        );
+    }
+    Ok(())
+}

@@ -384,8 +384,12 @@ fn placement(args: &[ExpandedArg], default: bool) -> (bool, &[ExpandedArg]) {
 }
 
 fn usage_path(cx: &Cx<'_>, value: &[u8]) -> BString {
-    if value.starts_with(b"$<") || path::to_native(value).is_absolute() {
-        value.into()
+    if value.starts_with(b"$<") {
+        return value.into();
+    }
+    let native = path::to_native(value);
+    if native.is_absolute() {
+        path::from_native_cmake(&native)
     } else {
         path::from_native_cmake(&cx.resolve_path(value))
     }

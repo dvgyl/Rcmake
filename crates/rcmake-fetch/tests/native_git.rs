@@ -118,7 +118,11 @@ fn mirror_clones_updates_and_checks_out_old_pins() -> Result<(), Box<dyn std::er
     let clone = classify_git_clone(&template_args).ok_or("Invalid Git clone arguments.")?;
     mirrors.clone_template(&clone, root, None)?;
     let latest = root.join("latest");
-    assert_eq!(mirrors.head(&latest)?, second);
+    assert_eq!(mirrors.checkout_head(&latest)?, second);
+    let nested = latest.join("nested");
+    host.create_dir_all(&nested)?;
+    assert_eq!(mirrors.head(&nested)?, second);
+    assert!(mirrors.checkout_head(&nested).is_err());
     assert_eq!(
         git(&host, &latest, &["symbolic-ref", "--short", "HEAD"])?,
         "stable"
@@ -149,7 +153,7 @@ fn mirror_clones_updates_and_checks_out_old_pins() -> Result<(), Box<dyn std::er
     mirrors.clone_template(&frozen_clone, root, Some(&first))?;
     let frozen = root.join("frozen");
     mirrors.checkout_commit(&frozen, &first)?;
-    assert_eq!(mirrors.head(&frozen)?, first);
+    assert_eq!(mirrors.checkout_head(&frozen)?, first);
     let source = root.join("pinned");
     mirrors.checkout(repository, &first, &source)?;
     assert_eq!(mirrors.head(&source)?, first);

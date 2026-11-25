@@ -101,8 +101,15 @@ impl PreparedConfigure {
         let complete = result.as_ref().is_ok_and(|result| {
             result.completion == CompletionState::Complete && prepared.denied_processes().is_empty()
         });
-        runtime.finish(complete);
-        result
+        let finish = runtime.finish(complete);
+        match (result, finish) {
+            (Ok(result), Some(error)) => Err(ApiError::GenerateFailed {
+                message: error.to_string(),
+                diagnostics: result.diagnostics,
+                sources: result.facts.source_map,
+            }),
+            (result, _) => result,
+        }
     }
 
     fn evaluate_in(

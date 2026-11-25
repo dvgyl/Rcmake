@@ -182,11 +182,12 @@ fn matching_paths(cx: &mut Cx<'_>, pattern: &[u8]) -> Result<Vec<BString>, CmdEr
             return Ok(Vec::new());
         }
     };
-    let Ok(entries) = cx.host().read_dir(&cx.current_source_dir()) else {
+    let Ok(mut entries) = cx.host().read_dir(&cx.current_source_dir()) else {
         return Ok(Vec::new());
     };
     let mut budget = cx.limits().regex_steps;
     let mut paths = Vec::new();
+    entries.sort_unstable_by(|left, right| left.name.cmp(&right.name));
     for entry in entries {
         if regex
             .find_at(&entry.name, 0, MatchOptions::default(), &mut budget)
@@ -277,5 +278,68 @@ fn add_rule(cx: &mut Cx<'_>, kind: InstallKind, destination: BString, runtime: O
         cx.global()
             .props
             .unset(format!("{section}_MESSAGE").as_bytes());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rcmake_eval::{Interp, InterpConfig, RunMode};
+    use rcmake_host::PureHost;
+    use std::sync::Arc;
+
+    #[test]
+    fn legacy_install_regex_records_paths_in_byte_order() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let root = Path::new(if cfg!(windows) {
+            "C:/legacy-install"
+        } else {
+            "/legacy-install"
+        });
+        let source = root.join("source");
+        let build = root.join("build");
+        let command = root.join("bin/cmake");
+        let host = Arc::new(PureHost::new(source.clone(), command.clone()));
+        for name in ["z.txt", "b.txt", "a.txt", "skip.md"] {
+            host.seed_file(&source.join(name), b"")?;
+        }
+        host.seed_file(&source.join("CMakeLists.txt"),
+            b"cmake_minimum_required(VERSION 4.5)\nproject(Legacy NONE)\ninstall_files(/share \"^[a-z][.]txt$\")\n")?;
+        let mut interp = Interp::new(
+            InterpConfig {
+                services: Default::default(),
+                host: host.clone(),
+                mode: RunMode::Configure,
+                cmake_root: root.join("share/cmake"),
+                cmake_command: command,
+                cwd: source.clone(),
+                limits: Default::default(),
+                diag: Default::default(),
+                defines: Vec::new(),
+                script_args: Vec::new(),
+            },
+            crate::register_all,
+        );
+        assert_eq!(
+            interp.run_configure(&source, &build, &[]).exit_code,
+            0,
+            "{}",
+            host.stream_bytes(Stream::Stderr)
+        );
+        let mut cx = interp.cx();
+        let [rule] = cx.project().installs.as_slice() else {
+            return Err("Expected one install rule".into());
+        };
+        let InstallKind::Files(files) = &rule.kind else {
+            return Err("Expected a file install rule".into());
+        };
+        let expected: Vec<_> = ["a.txt", "b.txt", "z.txt"]
+            .map(|name| from_native(&source.join(name)))
+            .into();
+        assert_eq!(
+            files.iter().map(|file| &file.value).collect::<Vec<_>>(),
+            expected.iter().collect::<Vec<_>>()
+        );
+        Ok(())
     }
 }

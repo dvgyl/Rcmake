@@ -45,30 +45,45 @@ if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-+][A-Za-z0-9.+-]+)?$ ]]; then
   exit 1
 fi
 
-registry="${CARGO_HOME:-$HOME/.cargo}/registry/src"
+cargo_dir="${CARGO_HOME:-$HOME/.cargo}"
+rustup_dir="${RUSTUP_HOME:-$HOME/.rustup}"
 target_dir="${CARGO_TARGET_DIR:-$root/target}"
-case "$registry" in /*) ;; *) registry="$root/$registry" ;; esac
+case "$cargo_dir" in /*) ;; *) cargo_dir="$root/$cargo_dir" ;; esac
+case "$rustup_dir" in /*) ;; *) rustup_dir="$root/$rustup_dir" ;; esac
+case "$target_dir" in /*) ;; *) target_dir="$root/$target_dir" ;; esac
+mkdir -p "$target_dir"
+target_dir="$(cd "$target_dir" && pwd -P)"
 remap=(
   "--remap-path-prefix=$HOME=/rust-home"
   "--remap-path-prefix=$root=/rcmake"
-  "--remap-path-prefix=$registry=/cargo/registry/src"
-  "--remap-path-prefix=$HOME/.cargo/registry/src=/cargo/registry/src"
+  "--remap-path-prefix=$target_dir=/target"
+  "--remap-path-prefix=$cargo_dir=/cargo"
+  "--remap-path-prefix=$rustup_dir=/rustup"
 )
-# Cargo splits RUSTFLAGS at spaces. Encoded flags keep each path in one argument.
+# Cargo uses the encoded value when the variable exists, even if it is empty.
 separator=$'\x1f'
-flags="${CARGO_ENCODED_RUSTFLAGS:-${RUSTFLAGS:-}}"
-if [[ -z "${CARGO_ENCODED_RUSTFLAGS:-}" ]]; then
-  flags="${flags// /$separator}"
+if [[ ${CARGO_ENCODED_RUSTFLAGS+x} ]]; then
+  flags="$CARGO_ENCODED_RUSTFLAGS"
+else
+  flags="$(python3 - <<'PYFLAGS'
+import os
+import re
+import sys
+
+words = re.findall(r"[^ \t\n\r\v\f]+", os.environ.get("RUSTFLAGS", ""))
+sys.stdout.write("\x1f".join(words))
+PYFLAGS
+)"
 fi
 for flag in "${remap[@]}"; do
   flags="${flags:+$flags$separator}$flag"
 done
 export CARGO_ENCODED_RUSTFLAGS="$flags"
-export RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }${remap[*]}"
+unset RUSTFLAGS
 
 cargo build --locked --release --bin rcmake --target "$target" --target-dir "$target_dir"
 
-python3 - "$root" "$out_dir" "$version" "$target" "$target_dir/$target/release/rcmake" <<'PY'
+python3 - "$root" "$out_dir" "$version" "$target" "$target_dir/$target/release/rcmake" "$target_dir" "$cargo_dir" "$rustup_dir" <<'PY'
 import gzip
 import hashlib
 import os
@@ -78,12 +93,14 @@ import sys
 import tarfile
 import tempfile
 
-root, out_dir, version, target, binary = sys.argv[1:]
+root, out_dir, version, target, binary, *build_paths = sys.argv[1:]
 root, out_dir, binary = map(Path, (root, out_dir, binary))
 home = Path(os.environ["HOME"])
 contents = binary.read_bytes()
-if any(os.fsencode(path) in contents for path in {home, home.resolve()}):
-    sys.exit("The release binary contains a home directory path.")
+for directory in (home, root, *map(Path, build_paths)):
+    paths = {directory, directory.resolve()}
+    if any(path != Path("/") and os.fsencode(path) in contents for path in paths):
+        sys.exit(f"The release binary contains the build path {directory}.")
 
 name = f"rcmake-{version}-{target}"
 with tempfile.TemporaryDirectory(dir=out_dir, prefix=".rcmake-dist-") as temporary:

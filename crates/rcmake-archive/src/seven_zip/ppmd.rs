@@ -227,21 +227,66 @@ pub(super) fn decode(
     let start = usize::try_from(offset).map_err(archive_error)?;
     let end = usize::try_from(end).map_err(archive_error)?;
     let data = bytes.get(start..end).ok_or_else(invalid)?;
-    let mut output = vec![0; usize::try_from(size).map_err(archive_error)?];
+    const CHUNK: usize = 64 * 1024;
+    let size_usize = usize::try_from(size).map_err(archive_error)?;
+    let mut output = Vec::with_capacity(size_usize.min(CHUNK));
     let mut decoder = SevenZDecoder::new(params, Some(size)).map_err(archive_error)?;
-    let step = decoder
-        .decode(data, true, &mut output)
-        .map_err(archive_error)?;
-    if step.produced != output.len()
-        || !matches!(
-            step.status,
-            SevenZStatus::ReachedSize | SevenZStatus::OutputFull
-        )
-    {
-        return Err(invalid());
+    let mut input = data;
+    let mut chunk = vec![0; size_usize.min(CHUNK)];
+    loop {
+        let remaining = size_usize - output.len();
+        let limit = remaining.min(chunk.len());
+        let target = chunk.get_mut(..limit).ok_or_else(invalid)?;
+        let step = decoder.decode(input, true, target).map_err(archive_error)?;
+        output.extend_from_slice(target.get(..step.produced).ok_or_else(invalid)?);
+        if output.len() == size_usize
+            && matches!(
+                step.status,
+                SevenZStatus::ReachedSize | SevenZStatus::OutputFull
+            )
+        {
+            break;
+        }
+        if step.produced == 0 || step.status != SevenZStatus::OutputFull {
+            return Err(invalid());
+        }
+        input = input.get(step.consumed..).ok_or_else(invalid)?;
     }
     if block.has_crc && u64::from(crc32fast::hash(&output)) != block.crc {
         return Err(ArchiveError::new("7-Zip PPMd block checksum mismatch"));
     }
     Ok(output)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Cursor;
+
+    use sevenz_rust2::Password;
+
+    use super::*;
+
+    #[test]
+    fn decodes_a_block_across_chunks_and_rejects_a_false_size()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let data: Vec<u8> = (0..200_000_u32).map(|value| (value % 251) as u8).collect();
+        let mut writer = Writer::new(Some(1))?;
+        writer.add(ArchiveEntry::new_file("payload"), &data)?;
+        let props = writer.params.to_7z_props();
+        let bytes = writer.finish();
+        let archive = Archive::read(&mut Cursor::new(&bytes), &Password::empty())?;
+        assert_eq!(decode(&bytes, &archive, 0, &props)?, data);
+
+        let mut writer = Writer::new(Some(1))?;
+        writer.add(ArchiveEntry::new_file("payload"), b"abc")?;
+        let [entry] = writer.files.as_mut_slice() else {
+            return Err("Expected one file".into());
+        };
+        entry.size = size_limit();
+        let bytes = writer.finish();
+        let archive = Archive::read(&mut Cursor::new(&bytes), &Password::empty())?;
+        assert!(bytes.len() < 512);
+        assert!(decode(&bytes, &archive, 0, &props).is_err());
+        Ok(())
+    }
 }

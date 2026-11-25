@@ -174,10 +174,30 @@ fn split(value: &[u8], separator: u8) -> Option<(&[u8], &[u8])> {
 }
 
 pub(crate) fn environment(host: &dyn Host, test: &Test) -> Result<Environment, String> {
-    let mut env: Environment = host.env_all().into_iter().collect();
+    environment_for_system(host, test, host.system().sysname == "Windows")
+}
+
+fn environment_for_system(
+    host: &dyn Host,
+    test: &Test,
+    windows: bool,
+) -> Result<Environment, String> {
+    let key = |key: &[u8]| -> BString {
+        if windows {
+            key.to_ascii_uppercase().into()
+        } else {
+            key.into()
+        }
+    };
+    let path_separator = if windows { b";" } else { b":" };
+    let mut env: Environment = host
+        .env_all()
+        .into_iter()
+        .map(|(name, value)| (key(&name), value))
+        .collect();
     for assignment in test.list(b"ENVIRONMENT") {
-        if let Some((key, value)) = split(&assignment, b'=') {
-            env.insert(key.into(), value.into());
+        if let Some((name, value)) = split(&assignment, b'=') {
+            env.insert(key(name), value.into());
         }
     }
     let modifications = test.list(b"ENVIRONMENT_MODIFICATION");
@@ -190,10 +210,10 @@ pub(crate) fn environment(host: &dyn Host, test: &Test) -> Result<Environment, S
             let (op, value) = split(action, b':')?;
             (!key.is_empty()).then_some((key, op, value))
         });
-        let Some((key, op, value)) = fields else {
+        let Some((name, op, value)) = fields else {
             return Err(format!("Invalid environment modification: {entry}"));
         };
-        modify_env(&mut env, &initial, key, op, value)?;
+        modify_env(&mut env, &initial, &key(name), op, value, path_separator)?;
     }
     Ok(env)
 }
@@ -204,11 +224,11 @@ fn modify_env(
     key: &[u8],
     op: &[u8],
     value: &[u8],
+    path_separator: &[u8],
 ) -> Result<(), String> {
     let old = env
         .get(key)
         .map_or(b"".as_slice(), |value| value.as_slice());
-    let path_separator = if cfg!(windows) { b";" } else { b":" };
     let value = match op {
         b"reset" => initial.get(key).cloned(),
         b"set" => Some(value.into()),
@@ -372,7 +392,58 @@ fn exited(test: &PlannedTest, code: i32, output: &[u8]) -> ResultLine {
 
 #[cfg(test)]
 mod tests {
-    use super::find_local_program;
+    use super::{environment_for_system, find_local_program};
+    use crate::discovery::Test;
+    use rcmake_host::{CommandSpec, Host};
+
+    #[test]
+    fn environment_uses_host_case_and_path_list_rules() -> Result<(), String> {
+        let host = PureHost::default();
+        host.env_set(b"PATH", Some(b"original"));
+        let mut test = Test {
+            name: "env".into(),
+            command: CommandSpec {
+                program: "tool".into(),
+                args: Vec::new(),
+            },
+            directory: host.initial_cwd(),
+            properties: [
+                ("ENVIRONMENT".into(), "Path=declared".into()),
+                (
+                    "ENVIRONMENT_MODIFICATION".into(),
+                    "path=unset:;Path=set:local;PATH=reset:;path=path_list_prepend:prefix".into(),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+            timeout: Default::default(),
+        };
+        let env = environment_for_system(&host, &test, true)?;
+        assert_eq!(env.len(), 1);
+        assert_eq!(
+            env.get(b"PATH".as_slice()).map(|value| value.as_slice()),
+            Some(&b"prefix;declared"[..])
+        );
+        test.properties.insert(
+            "ENVIRONMENT_MODIFICATION".into(),
+            "PATH=path_list_prepend:prefix;path=set:local".into(),
+        );
+        let env = environment_for_system(&host, &test, false)?;
+        assert_eq!(
+            env.get(b"PATH".as_slice()).map(|value| value.as_slice()),
+            Some(&b"prefix:original"[..])
+        );
+        assert_eq!(
+            env.get(b"Path".as_slice()).map(|value| value.as_slice()),
+            Some(&b"declared"[..])
+        );
+        assert_eq!(
+            env.get(b"path".as_slice()).map(|value| value.as_slice()),
+            Some(&b"local"[..])
+        );
+        Ok(())
+    }
+
     use rcmake_host::{HostResult, PureHost};
     use std::path::Path;
 

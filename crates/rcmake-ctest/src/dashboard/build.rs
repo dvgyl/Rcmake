@@ -101,13 +101,22 @@ pub(super) fn run(
     if !invocation.options.quiet {
         host.write_out(Stream::Stdout, b"Build project\n");
     }
+    let launchers = setting(b"CTEST_USE_LAUNCHERS").is_some_and(rcmake_base::truth::is_on);
+    let mut env = host.env_all();
+    if launchers {
+        env.retain(|(key, _)| !key.eq_ignore_ascii_case(b"CTEST_LAUNCH_LOGS"));
+        env.push((
+            "CTEST_LAUNCH_LOGS".into(),
+            path::from_native(&build.join("Testing/Temporary/Launch")),
+        ));
+    }
     let start = host.now();
     let output = crate::script::run_process(
         host.as_ref(),
         cwd.clone(),
         program.clone(),
         args.to_vec(),
-        host.env_all(),
+        env,
         false,
     )
     .map_err(|error| error.to_string())?;
@@ -115,8 +124,8 @@ pub(super) fn run(
         Some(ProcessResult::Exited(code)) => *code,
         _ => -1,
     };
-    let launch = crate::launch::diagnostics(host.as_ref(), build, start);
-    let (errors, warnings, abnormal) = diagnostics(&output, code, &launch);
+    let launch = launchers.then(|| crate::launch::diagnostics(host.as_ref(), build, start));
+    let (errors, warnings, abnormal) = diagnostics(&output, code, launch.as_deref());
     write_build_report(
         host.as_ref(),
         build,
@@ -125,13 +134,15 @@ pub(super) fn run(
             source,
             config,
             command: &command_line,
+            cwd,
+            arguments: &command,
             output: &output,
             start,
             code,
             errors,
             warnings,
             abnormal,
-            launch: &launch,
+            launch: launch.as_deref(),
         },
     )?;
     if !invocation.options.quiet {

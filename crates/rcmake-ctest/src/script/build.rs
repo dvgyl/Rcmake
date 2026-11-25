@@ -100,11 +100,12 @@ pub(super) fn ctest_build(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
                 cx.host().write_out(Stream::Stdout, b"Build project\n");
             }
             let command_line = render_command(&command);
+            let launchers = cx.var_is_on(b"CTEST_USE_LAUNCHERS");
             let start = cx.host().now();
-            let output = handler_process(cx, args, cwd, &build, command)?;
+            let output = handler_process(cx, args, cwd.clone(), &build, command.clone())?;
             let code = process_code(&output).unwrap_or(-1);
-            let launch = crate::launch::diagnostics(cx.host(), &build, start);
-            let (errors, warnings, abnormal) = diagnostics(&output, code, &launch);
+            let launch = launchers.then(|| crate::launch::diagnostics(cx.host(), &build, start));
+            let (errors, warnings, abnormal) = diagnostics(&output, code, launch.as_deref());
             args.set(cx, b"NUMBER_ERRORS", errors.to_string());
             args.set(cx, b"NUMBER_WARNINGS", warnings.to_string());
             if code != 0 {
@@ -135,13 +136,15 @@ pub(super) fn ctest_build(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
                         source: &source,
                         config: &config,
                         command: &command_line,
+                        cwd: &cwd,
+                        arguments: &command,
                         output: &output,
                         start,
                         code,
                         errors,
                         warnings,
                         abnormal,
-                        launch: &launch,
+                        launch: launch.as_deref(),
                     },
                 )
                 .map_err(error)?;
@@ -158,53 +161,38 @@ pub(crate) fn custom_command(preset: bool, command: &[u8]) -> Option<&[u8]> {
     (!preset && !command.is_empty()).then_some(command)
 }
 
-pub(crate) fn diagnostics(output: &RunOutput, code: i32, launch: &str) -> (usize, usize, bool) {
-    let launch_errors = launch.matches("<Failure type=\"Error\">").count();
-    let mut warnings = launch.matches("<Failure type=\"Warning\">").count();
-    let mut errors = launch_errors;
+pub(crate) fn diagnostics(
+    output: &RunOutput,
+    code: i32,
+    launch: Option<&str>,
+) -> (usize, usize, bool) {
+    let abnormal = matches!(output.results.last(), Some(ProcessResult::Signaled(_)))
+        || cfg!(unix) && (129..=192).contains(&code);
+    if let Some(launch) = launch {
+        let errors = launch.matches("<Failure type=\"Error\">").count();
+        let warnings = launch.matches("<Failure type=\"Warning\">").count();
+        return (
+            errors.max(usize::from(code != 0 || abnormal)),
+            warnings,
+            abnormal,
+        );
+    }
+    let mut errors = 0;
+    let mut warnings = 0;
     for line in output
         .stdout
         .split(|&byte| byte == b'\n')
         .chain(output.stderr.split(|&byte| byte == b'\n'))
     {
-        if recorded_by_launcher(launch, line) {
-            continue;
-        }
         let text = String::from_utf8_lossy(line).to_ascii_lowercase();
         errors += usize::from(text.contains("error:") || text.contains(" error "));
         warnings += usize::from(text.contains("warning:") || text.contains(" warning "));
     }
-    let abnormal = matches!(output.results.last(), Some(ProcessResult::Signaled(_)))
-        || cfg!(unix) && (129..=192).contains(&code);
-    if abnormal && errors == 0 {
-        errors = 1;
-    }
     (
-        errors,
-        warnings + usize::from(code != 0 && launch_errors == 0),
+        errors.max(usize::from(abnormal)),
+        warnings + usize::from(code != 0),
         abnormal,
     )
-}
-
-fn recorded_by_launcher(launch: &str, line: &[u8]) -> bool {
-    if launch.is_empty() || line.is_empty() {
-        return false;
-    }
-    let line = escape(line, false);
-    ["StdOut", "StdErr"].into_iter().any(|tag| {
-        let start = format!("<{tag}>");
-        let end = format!("</{tag}>");
-        launch.split(&start).skip(1).any(|record| {
-            record.split_once(&end).is_some_and(|(output, _)| {
-                output.lines().any(|entry| {
-                    entry
-                        .strip_prefix("[CTest: warning matched] ")
-                        .unwrap_or(entry)
-                        == line
-                })
-            })
-        })
-    })
 }
 
 fn setting(cx: &Cx<'_>, name: &[u8]) -> Option<BString> {
@@ -232,13 +220,15 @@ pub(crate) struct BuildReport<'a> {
     pub(crate) source: &'a Path,
     pub(crate) config: &'a crate::dart::Configuration,
     pub(crate) command: &'a str,
+    pub(crate) cwd: &'a Path,
+    pub(crate) arguments: &'a [BString],
     pub(crate) output: &'a RunOutput,
     pub(crate) start: rcmake_host::FileTime,
     pub(crate) code: i32,
     pub(crate) errors: usize,
     pub(crate) warnings: usize,
     pub(crate) abnormal: bool,
-    pub(crate) launch: &'a str,
+    pub(crate) launch: Option<&'a str>,
 }
 
 pub(crate) fn write_build_report(
@@ -271,16 +261,17 @@ pub(crate) fn write_build_report(
         "<Build>\n<StartBuildTime>{}</StartBuildTime>\n<BuildCommand>{command}</BuildCommand>\n<SourceDirectory>{source}</SourceDirectory>\n<BinaryDirectory>{binary}</BinaryDirectory>\n",
         report.start.secs
     );
-    for line in [
-        report.output.stdout.as_slice(),
-        report.output.stderr.as_slice(),
-    ]
-    .into_iter()
-    .flat_map(|output| output.split(|&byte| byte == b'\n'))
+    for line in report
+        .launch
+        .is_none()
+        .then_some([
+            report.output.stdout.as_slice(),
+            report.output.stderr.as_slice(),
+        ])
+        .into_iter()
+        .flatten()
+        .flat_map(|output| output.split(|&byte| byte == b'\n'))
     {
-        if recorded_by_launcher(report.launch, line) {
-            continue;
-        }
         let lower = line.to_ascii_lowercase();
         let diagnostic = if lower.windows(6).any(|part| part == b"error:") {
             "Error"
@@ -297,8 +288,12 @@ pub(crate) fn write_build_report(
     {
         xml.push_str(&instrumentation.build(host, dir, report.start.secs));
     }
-    xml.push_str(report.launch);
-    if report.abnormal && !report.launch.contains("<Failure type=\"Error\">") {
+    if let Some(launch) = report.launch {
+        xml.push_str(launch);
+        if (report.code != 0 || report.abnormal) && !launch.contains("<Failure type=\"Error\">") {
+            crate::launch::build_failure(&mut xml, report.cwd, report.arguments, report.output);
+        }
+    } else if report.abnormal {
         xml.push_str("<Failure type=\"Error\"><Result>Terminated abnormally</Result></Failure>\n");
     }
     let _ = writeln!(xml, "<Log>{stdout}{stderr}</Log>");
@@ -311,4 +306,41 @@ pub(crate) fn write_build_report(
         host.now().secs
     );
     write_file(host, &file, xml.as_bytes()).map_err(|failure| failure.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn launcher_mode_uses_only_records_and_reports_unrecorded_failure() {
+        let mut output = RunOutput {
+            stdout: b"driver.c:1: warning: raw output\n".to_vec(),
+            results: vec![ProcessResult::Exited(0)],
+            ..RunOutput::default()
+        };
+        assert_eq!(diagnostics(&output, 0, None), (0, 1, false));
+        assert_eq!(diagnostics(&output, 0, Some("")), (0, 0, false));
+        let warning = "<Failure type=\"Warning\"><Result><StdOut>driver.c:1: warning: raw output</StdOut></Result></Failure>";
+        assert_eq!(diagnostics(&output, 0, Some(warning)), (0, 1, false));
+        assert_eq!(diagnostics(&output, 2, Some("")), (1, 0, false));
+        output.results = vec![ProcessResult::Exited(2)];
+        let mut xml = String::new();
+        crate::launch::build_failure(
+            &mut xml,
+            Path::new("/work"),
+            &["builder".into(), "arg with spaces".into()],
+            &output,
+        );
+        assert!(xml.contains("<WorkingDirectory>/work</WorkingDirectory>"));
+        assert!(xml.contains("<Argument>builder</Argument>\n<Argument>arg with spaces</Argument>"));
+        assert!(
+            xml.contains(
+                "<StdOut>[CTest: warning matched] driver.c:1: warning: raw output</StdOut>"
+            )
+        );
+        assert!(xml.contains("<ExitCondition>2</ExitCondition>"));
+        output.results = vec![ProcessResult::Signaled(11)];
+        assert_eq!(diagnostics(&output, -1, Some("")), (1, 0, true));
+    }
 }

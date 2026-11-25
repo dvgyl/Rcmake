@@ -39,7 +39,7 @@ fn configure(
         crate::register_all,
     );
     let outcome = runtime.run(&mut interp, &[]);
-    runtime.finish(complete);
+    assert!(runtime.finish(complete).is_none());
     assert!(
         interp
             .cx()

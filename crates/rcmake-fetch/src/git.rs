@@ -238,6 +238,46 @@ impl<'a> GitMirror<'a> {
         check_commit(std::str::from_utf8(&bytes).unwrap_or_default().trim())
     }
 
+    /// Read HEAD only if Git confirms the expected checkout root.
+    ///
+    /// # Errors
+    ///
+    /// Return an error if the directory has no checkout or Git cannot read HEAD.
+    pub fn checkout_head(&self, source_dir: &Path) -> Result<String, FetchError> {
+        let root = self.host.canonicalize(source_dir)?;
+        let metadata = self
+            .host
+            .metadata(&root.join(".git"), rcmake_host::Follow::Yes)?;
+        if !matches!(
+            metadata.kind,
+            rcmake_host::FileKind::Dir | rcmake_host::FileKind::File
+        ) {
+            return Err(invalid("Missing Git checkout metadata."));
+        }
+        let bytes = self.git(
+            &root,
+            vec![
+                "rev-parse".into(),
+                "--show-toplevel".into(),
+                "--verify".into(),
+                "HEAD".into(),
+            ],
+            true,
+        )?;
+        let bytes = bytes.strip_suffix(b"\n").unwrap_or(&bytes);
+        let split = bytes
+            .iter()
+            .rposition(|&byte| byte == b'\n')
+            .ok_or_else(|| invalid("Git did not report the checkout root and HEAD."))?;
+        let (worktree, head) = bytes.split_at(split);
+        let worktree = worktree.strip_suffix(b"\r").unwrap_or(worktree);
+        let worktree = rcmake_host::path::to_native(worktree);
+        if !worktree.is_absolute() || self.host.canonicalize(&worktree)? != root {
+            return Err(invalid("Git reported a different checkout root."));
+        }
+        check_commit(std::str::from_utf8(head).unwrap_or_default().trim())
+    }
+
     fn restore_remote(
         &self,
         source_dir: &Path,

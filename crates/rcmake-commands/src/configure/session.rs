@@ -104,16 +104,24 @@ impl ConfigureRuntime {
     }
 
     /// Publish session records after successful evaluation and generation.
-    pub fn finish(self, complete: bool) {
+    ///
+    /// Return the publication error, if any.
+    pub fn finish(self, complete: bool) -> Option<Box<dyn std::error::Error + Send + Sync>> {
         #[cfg(all(feature = "native", any(unix, windows)))]
-        if let Some(native) = self.native {
-            native.finish(complete && self.evaluated);
-        }
+        let result = self
+            .native
+            .map_or(Ok(()), |native| native.finish(complete && self.evaluated))
+            .err()
+            .map(|error| Box::new(error) as Box<dyn std::error::Error + Send + Sync>);
         #[cfg(not(all(feature = "native", any(unix, windows))))]
-        let _ = complete;
+        let result = {
+            let _ = complete;
+            None
+        };
         if let Some(hermetic) = self.hermetic {
             hermetic.finish();
         }
+        result
     }
 }
 

@@ -118,7 +118,12 @@ impl LockEntry {
         }
         let (scheme, host, path) = source_parts(source);
         let valid = match scheme {
-            "" => !path.contains(':') || Path::new(path).is_absolute(),
+            "" => {
+                !path.contains(':')
+                    || path.starts_with('/')
+                    || matches!(path.as_bytes(), [letter, b':', b'/' | b'\\', ..] if letter.is_ascii_alphabetic())
+                    || rooted_unc(path)
+            }
             "file" => matches!(host, "" | "localhost"),
             "ssh" => valid_host(&percent_decode(ssh_host(host))),
             "http" | "https" | "ftp" | "ftps" | "git" => valid_host(&percent_decode(host)),
@@ -198,6 +203,12 @@ impl LockEntry {
 
 fn valid_text(value: &str) -> bool {
     !value.is_empty() && value.len() <= 8192 && !value.chars().any(char::is_control)
+}
+
+fn rooted_unc(path: &str) -> bool {
+    let mut parts = path.split(['/', '\\']);
+    matches!((parts.next(), parts.next(), parts.next(), parts.next()),
+        (Some(""), Some(""), Some(server), Some(share)) if !server.is_empty() && !share.is_empty())
 }
 
 fn source_parts(source: &str) -> (&str, &str, &str) {
@@ -749,7 +760,13 @@ impl<'a> LockSession<'a> {
         }
         let lock = self.path.with_added_extension("guard");
         let host = self.host.host();
-        let _guard = host.lock_file(&lock, Some(Duration::from_secs(10)))?;
+        let write_error = |cause| FetchError::LockWrite {
+            path: self.path.clone(),
+            cause: Box::new(cause),
+        };
+        let _guard = host
+            .lock_file(&lock, Some(Duration::from_secs(10)))
+            .map_err(|error| write_error(error.into()))?;
         let mut current = read(host, &self.path)?.unwrap_or_default();
         let mut changed = false;
         for (name, entry) in self.updates.entries {
@@ -767,7 +784,8 @@ impl<'a> LockSession<'a> {
             changed = true;
         }
         if changed {
-            atomic_write(host, &self.path, &current.to_json()?)?;
+            let bytes = current.to_json().map_err(write_error)?;
+            atomic_write(host, &self.path, &bytes).map_err(write_error)?;
         }
         Ok(())
     }
@@ -848,6 +866,87 @@ mod tests {
             assert!(lock.insert("private", git).is_err());
         }
         assert!(lock.get("private").is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn lexical_lock_paths_round_trip_on_every_host() -> Result<(), FetchError> {
+        let mut lock = LockFile::default();
+        let paths = [
+            r"C:\SDK\archive.tgz",
+            "C:/SDK/archive.tgz",
+            r"\\server\share\archive.tgz",
+            "//server/share/archive.tgz",
+            "/opt/data/a:b/archive.tgz",
+            "archives/local.tar",
+            "file://localhost/work/archive.tgz",
+            "git@example.org:team/archive.tgz",
+        ];
+        lock.insert(
+            "dep",
+            LockEntry::Url(UrlEntry::from_bytes(
+                paths.map(str::to_owned).to_vec(),
+                b"data",
+            )),
+        )?;
+        assert_eq!(LockFile::parse(&lock.to_json()?)?, lock);
+        assert!(!LockEntry::is_portable_source("C:archive.tar"));
+        assert!(!LockEntry::is_portable_source(
+            "https://name:password@example.org/archive.tar"
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn concurrent_lock_updates_merge_disjoint_names_and_reject_a_changed_pin()
+    -> Result<(), FetchError> {
+        let root = PathBuf::from(if cfg!(windows) { "C:/work" } else { "/work" });
+        let host = PureHost::new(root.clone(), root.join("rcmake"));
+        let mut first = LockSession::open(&host, &root, LockMode::Update)?;
+        let mut second = LockSession::open(&host, &root, LockMode::Update)?;
+        let mut third = LockSession::open(&host, &root, LockMode::Update)?;
+        let lock_path = root.join("rcmake-fetch.lock");
+        let entry = |bytes: &[u8]| {
+            LockEntry::Url(UrlEntry::from_bytes(
+                vec!["file:///work/archive".into()],
+                bytes,
+            ))
+        };
+        first.record("dep", entry(b"first"))?;
+        second.record("dep", entry(b"second"))?;
+        third.record("other", entry(b"third"))?;
+        first.commit()?;
+        assert!(
+            matches!(second.commit(), Err(FetchError::LockConflict { path, dependency })
+            if path == lock_path && dependency == "dep")
+        );
+        third.commit()?;
+        let lock = read(&host, &lock_path)?.unwrap_or_default();
+        assert_eq!(lock.get("dep"), Some(&entry(b"first")));
+        assert_eq!(lock.get("other"), Some(&entry(b"third")));
+        Ok(())
+    }
+
+    #[test]
+    fn guard_failure_reports_the_lockfile_and_preserves_the_original() -> Result<(), FetchError> {
+        let root = PathBuf::from(if cfg!(windows) { "C:/work" } else { "/work" });
+        let host = PureHost::new(root.clone(), root.join("rcmake"));
+        let lock_path = root.join("rcmake-fetch.lock");
+        let old = LockFile::default().to_json()?;
+        host.seed_file(&lock_path, &old)?;
+        let mut lock = LockSession::open(&host, &root, LockMode::Update)?;
+        lock.record(
+            "dep",
+            LockEntry::Url(UrlEntry::from_bytes(
+                vec!["file:///work/archive".into()],
+                b"data",
+            )),
+        )?;
+        host.create_dir_all(&lock_path.with_added_extension("guard"))?;
+        assert!(
+            matches!(lock.commit(), Err(FetchError::LockWrite { path, .. }) if path == lock_path)
+        );
+        assert_eq!(host.read(&lock_path, ReadRange::All { limit: 1024 })?, old);
         Ok(())
     }
 

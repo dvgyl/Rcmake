@@ -84,12 +84,21 @@ fn run(
     mode: FetchLockMode,
     script: &[u8],
 ) -> Result<i32, Box<dyn std::error::Error>> {
+    evaluate(host, mode, RunMode::Script, script)
+}
+
+fn evaluate(
+    host: Arc<PureHost>,
+    mode: FetchLockMode,
+    run_mode: RunMode,
+    source: &[u8],
+) -> Result<i32, Box<dyn std::error::Error>> {
     let mut services = Services::default();
     services.speed.fetch_lock = mode;
     let config = InterpConfig {
         services: Arc::new(services),
         host: host.clone(),
-        mode: RunMode::Script,
+        mode: run_mode,
         cmake_root: absolute("cmake"),
         cmake_command: absolute("bin/rcmake"),
         cwd: absolute("project"),
@@ -99,14 +108,22 @@ fn run(
         script_args: Vec::new(),
     };
     let project = absolute("project");
-    let entry = project.join("populate.cmake");
-    host.seed_file(&entry, script)?;
+    let entry = project.join(if run_mode == RunMode::Script {
+        "populate.cmake"
+    } else {
+        "CMakeLists.txt"
+    });
+    host.seed_file(&entry, source)?;
     let runtime =
         FetchRuntime::new(host, &project, &config.services).ok_or("missing fetch runtime")?;
     let mut interp = Interp::new(config, crate::register_all);
     runtime.install(&mut interp);
-    let result = interp.run_script(&entry);
-    runtime.finish(result.exit_code == 0);
+    let result = if run_mode == RunMode::Script {
+        interp.run_script(&entry)
+    } else {
+        interp.run_configure(&project, &absolute("build"), &[])
+    };
+    runtime.finish(result.exit_code == 0)?;
     Ok(result.exit_code)
 }
 
@@ -334,6 +351,114 @@ fn offline_local_archive_uses_verified_bytes_when_the_origin_is_missing() -> Tes
             ReadRange::All { limit: 3 }
         )?,
         b"abc"
+    );
+    Ok(())
+}
+
+#[test]
+fn frozen_archive_checks_warm_stamp_hash_skip_and_disconnected_reuse() -> TestResult {
+    use rcmake_fetch::{ArchiveCache, ContentHash, LockEntry, LockFile, UrlEntry};
+    use rcmake_store::{Store, StoreConfig};
+
+    let host = host()?;
+    let url = "https://example.org/payload";
+    let entry = UrlEntry::from_bytes(vec![url.into()], b"abc");
+    let hash = ContentHash::sha256(entry.sha256);
+    let mut lock = LockFile::default();
+    lock.insert("archive", LockEntry::Url(entry.clone()))?;
+    let lock_path = absolute("project/rcmake-fetch.lock");
+    let alternate = absolute("project/alternate.lock");
+    host.seed_file(&lock_path, &lock.to_json()?)?;
+    let store = Store::new(host.as_ref(), StoreConfig::from_host(host.as_ref()))?;
+    ArchiveCache::new(host.as_ref(), &store).insert(url, &hash, b"abc")?;
+    host.set_command_handler(|_, _, _| Err(HostError::unsupported("Unexpected process.")))?;
+    host.env_set(b"RCMAKE_FETCH_OFFLINE", Some(b"1"));
+
+    let work = absolute("warm");
+    let declared = format!("URL_HASH SHA256={}", entry.sha256);
+    let script = format!(
+        "cmake_minimum_required(VERSION 4.5)\nproject(Frozen NONE)\n{}\nFetchContent_MakeAvailable(archive)\nfile(WRITE \"{}/used\" yes)\n",
+        declaration(&work, &declared).replace(
+            "FetchContent_Populate(archive\n",
+            "FetchContent_Declare(archive\n"
+        ),
+        path::from_native_cmake(&work),
+    );
+    let run_frozen = |script: &str| {
+        evaluate(
+            host.clone(),
+            FetchLockMode::Frozen,
+            RunMode::Configure,
+            script.as_bytes(),
+        )
+    };
+    for _ in 0..2 {
+        assert_eq!(
+            run_frozen(&script)?,
+            0,
+            "{}",
+            host.stream_bytes(Stream::Stderr)
+        );
+    }
+    let stamp = absolute("build/CMakeFiles/fc-stamp/archive/download.stamp");
+    let receipt = stamp.with_added_extension("rcmake");
+    let retained = work.join("archive-tmp/payload");
+    let copied = work.join("archive-src/payload");
+    host.remove_file(&receipt)?;
+    host.seed_file(&copied, b"old source")?;
+    assert_eq!(
+        run_frozen(&script)?,
+        0,
+        "{}",
+        host.stream_bytes(Stream::Stderr)
+    );
+    assert_eq!(host.read(&copied, ReadRange::All { limit: 16 })?, b"abc");
+
+    let disconnected = script.replace(
+        "FetchContent_MakeAvailable",
+        "set(FETCHCONTENT_FULLY_DISCONNECTED TRUE)\nFetchContent_MakeAvailable",
+    );
+    assert_eq!(
+        run_frozen(&disconnected)?,
+        0,
+        "{}",
+        host.stream_bytes(Stream::Stderr)
+    );
+
+    host.remove_file(&work.join("used"))?;
+    host.seed_file(&alternate, &LockFile::default().to_json()?)?;
+    host.env_set(
+        b"RCMAKE_FETCH_LOCK_FILE",
+        Some(&path::from_native(&alternate)),
+    );
+    assert_ne!(run_frozen(&script)?, 0);
+    assert!(
+        host.metadata(&work.join("used"), rcmake_host::Follow::Yes)
+            .is_err()
+    );
+    host.env_set(b"RCMAKE_FETCH_LOCK_FILE", None);
+
+    host.remove_file(&lock_path)?;
+    assert_ne!(run_frozen(&script)?, 0);
+    for mut changed in [UrlEntry::from_bytes(vec![url.into()], b"def"), entry] {
+        changed.size += 1;
+        let mut lock = LockFile::default();
+        lock.insert("archive", LockEntry::Url(changed))?;
+        host.seed_file(&lock_path, &lock.to_json()?)?;
+        assert_ne!(run_frozen(&script)?, 0);
+    }
+    host.remove_file(&stamp)?;
+    assert_ne!(run_frozen(&script)?, 0);
+    let stderr = host.stream_bytes(Stream::Stderr);
+    assert!(
+        diagnostic_words(&stderr).contains("matches the declared hash but differs from the lock"),
+        "{stderr}"
+    );
+    assert_eq!(host.read(&retained, ReadRange::All { limit: 16 })?, b"abc");
+    assert_ne!(run_frozen(&disconnected)?, 0);
+    assert!(
+        host.metadata(&work.join("used"), rcmake_host::Follow::Yes)
+            .is_err()
     );
     Ok(())
 }

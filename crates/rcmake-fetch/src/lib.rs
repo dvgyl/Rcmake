@@ -154,6 +154,16 @@ pub enum FetchError {
         #[source]
         cause: rcmake_host::HostError,
     },
+    /// The host could not publish the lockfile.
+    #[cfg(all(feature = "native", any(unix, windows)))]
+    #[error("Cannot write fetch lockfile {path:?}. {cause}")]
+    LockWrite {
+        /// Lockfile path.
+        path: PathBuf,
+        /// Host or serialization error.
+        #[source]
+        cause: Box<Self>,
+    },
     /// The store could not confirm that the archive is ready for offline use.
     #[cfg(all(feature = "native", any(unix, windows)))]
     #[error(
@@ -341,7 +351,12 @@ fn staging_path(host: &dyn Host, destination: &Path) -> PathBuf {
 }
 
 #[cfg(all(feature = "native", any(unix, windows)))]
-fn atomic_write(host: &dyn Host, path: &Path, bytes: &[u8]) -> Result<(), FetchError> {
+/// Publish a fetch file through a staging file in the destination directory.
+///
+/// # Errors
+///
+/// Return the host error if the staging write or rename fails.
+pub fn atomic_write(host: &dyn Host, path: &Path, bytes: &[u8]) -> Result<(), FetchError> {
     atomic_write_with(host, path, |staging| {
         host.write(staging, bytes, WriteMode::CreateNew)
     })

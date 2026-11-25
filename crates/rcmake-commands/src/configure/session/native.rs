@@ -176,7 +176,7 @@ impl NativeSession {
             .ok()
     }
 
-    pub(super) fn finish(self, complete: bool) {
+    pub(super) fn finish(self, complete: bool) -> Result<(), rcmake_fetch::FetchError> {
         let complete = complete
             && self
                 .services
@@ -184,7 +184,7 @@ impl NativeSession {
                 .as_ref()
                 .is_none_or(|token| !token.is_cancelled());
         if let Some(fetch) = self.fetch {
-            fetch.finish(complete);
+            fetch.finish(complete)?;
         }
         if complete && let Some(bytes) = self.pending {
             publish(self.base.as_ref(), &self.snapshot, &bytes);
@@ -196,6 +196,7 @@ impl NativeSession {
                 &report,
             );
         }
+        Ok(())
     }
 }
 

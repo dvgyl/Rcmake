@@ -11,9 +11,10 @@ use rcmake_diag::{Effect, Frame, MessageKind};
 use rcmake_eval::{CmdError, Cx, FetchLockMode, HermeticMode, Interp, Services};
 use rcmake_expr::ExpandedArg;
 use rcmake_fetch::{ContentHash, FetchError, FetchPool, LockSession, PrefetchSource, Ticket};
-use rcmake_host::{Host, ReadRange, Stream, path::to_native};
+use rcmake_host::{Host, ReadRange, path::to_native};
 use rcmake_store::{Digest, StoreConfig, StoreMode};
 
+use super::frozen::Frozen;
 use super::{BlockReason, BlockedFetch, DeclaredSource, FetchSession, PopulationSite};
 use super::{lock_mode, parse_fetchcontent_declare, relative_repo, text};
 
@@ -30,6 +31,10 @@ const OBSERVED_COMMANDS: &[&[u8]] = &[
     b"__fetchcontent_populatedirect",
     b"__fetchcontent_populatesubbuild",
     b"_ep_add_download_command",
+    b"_ep_write_downloadfile_script",
+    b"_ep_write_gitclone_script",
+    b"__fetchcontent_dostepdirect",
+    b"fetchcontent_setpopulated",
     b"configure_file",
     b"include",
     b"file",
@@ -66,6 +71,7 @@ struct ActivePopulation {
     site: CallSite,
     dependency: String,
     fetch: FetchSession,
+    frozen: Option<Frozen>,
 }
 
 struct GeneratedScript {
@@ -94,6 +100,7 @@ pub(super) struct Runtime {
     pub(super) lock: Mutex<Option<Result<LockSession<'static>, FetchError>>>,
     services: Services,
     offline: bool,
+    frozen: bool,
     state: Mutex<State>,
     declarations: Mutex<FetchSession>,
 }
@@ -119,6 +126,7 @@ impl FetchRuntime {
             lock: Mutex::new(Some(lock)),
             services: services.clone(),
             offline: declarations.offline,
+            frozen: declarations.mode == FetchLockMode::Frozen,
             state: Mutex::default(),
             declarations: Mutex::new(declarations),
         })))
@@ -129,18 +137,14 @@ impl FetchRuntime {
         interp.set_expanded_observer(OBSERVED_COMMANDS, observe);
     }
 
-    pub(crate) fn finish(self, complete: bool) {
+    pub(crate) fn finish(self, complete: bool) -> Result<(), FetchError> {
         let pool = self.0.state().pool.take();
         drop(pool);
         let lock = lock_mutex(&self.0.lock).take();
-        if complete
-            && let Some(Ok(lock)) = lock
-            && lock.commit().is_err()
-        {
-            self.0
-                .host
-                .write_out(Stream::Stderr, b"Could not write the fetch lockfile.\n");
+        if complete && let Some(Ok(lock)) = lock {
+            lock.commit()?;
         }
+        Ok(())
     }
 }
 
@@ -252,7 +256,44 @@ impl Runtime {
         .then_some(kind)
     }
 
-    fn script_digest(&self, path: &Path) -> Option<Digest> {
+    pub(super) fn generated_digest(
+        &self,
+        pop: &Population,
+        path: &Path,
+        kind: Script,
+    ) -> Option<Digest> {
+        let path = canonical(self.host.as_ref(), path);
+        let expected = {
+            let state = self.state();
+            let generated = state.generated.get(&path)?;
+            (generated.site == pop.site && generated.kind == kind).then_some(generated.digest)?
+        };
+        (self.script_digest(&path)? == expected).then_some(expected)
+    }
+
+    fn set_frozen(&self, pop: &Population, frozen: Option<Frozen>) {
+        if let Some(active) = self
+            .state()
+            .active
+            .iter_mut()
+            .rev()
+            .find(|active| active.site == pop.site)
+        {
+            active.frozen = frozen;
+        }
+    }
+
+    fn take_frozen(&self, pop: &Population) -> Option<Frozen> {
+        self.state()
+            .active
+            .iter_mut()
+            .rev()
+            .find(|active| active.site == pop.site)?
+            .frozen
+            .take()
+    }
+
+    pub(super) fn script_digest(&self, path: &Path) -> Option<Digest> {
         let bytes = self
             .host
             .read(
@@ -449,11 +490,15 @@ impl Runtime {
         }
     }
 
-    fn begin_population(&self, frame: &Frame, depth: usize, args: &[ExpandedArg], explicit: bool) {
-        let Some(name) = args.first().and_then(|arg| text(&arg.value)) else {
-            return;
-        };
-        let name = name.to_ascii_lowercase();
+    fn begin_population(
+        &self,
+        frame: &Frame,
+        depth: usize,
+        args: &[ExpandedArg],
+        explicit: bool,
+        source: PathBuf,
+    ) -> Option<Population> {
+        let name = text(&args.first()?.value)?.to_ascii_lowercase();
         let declarations = lock_mutex(&self.declarations);
         let raw = declarations.get(&name).cloned();
         let mut state = self.state();
@@ -477,11 +522,19 @@ impl Runtime {
         }
         // Keep the same key that the transfer will obtain from the backtrace.
         state.active.retain(|active| active.site.depth < depth);
+        let site = CallSite::new(depth, frame);
         state.active.push(ActivePopulation {
-            site: CallSite::new(depth, frame),
-            dependency,
+            site: site.clone(),
+            dependency: dependency.clone(),
             fetch,
+            frozen: None,
         });
+        Some(Population {
+            site,
+            dependency,
+            source,
+            subbuild: named(frame, b"__fetchcontent_populatesubbuild"),
+        })
     }
 }
 
@@ -504,7 +557,13 @@ fn observe(cx: &mut Cx<'_>, args: &[ExpandedArg]) {
         && let Some(pop) = runtime.population(cx)
         && !pop.subbuild
     {
-        let _ = super::archive::prepare_local_archive(cx, Arc::clone(&runtime), &pop);
+        if super::archive::prepare_local_archive(cx, Arc::clone(&runtime), &pop).is_err() {
+            return;
+        }
+        if let Some(mut frozen) = runtime.take_frozen(&pop) {
+            frozen.local_archive(cx);
+            runtime.set_frozen(&pop, Some(frozen));
+        }
     }
     if named(frame, b"fetchcontent_declare") && bundled_command(cx, b"fetchcontent_declare") {
         runtime.observe_declare(args);
@@ -549,7 +608,125 @@ fn observe(cx: &mut Cx<'_>, args: &[ExpandedArg]) {
                 line: frame.line,
             })
             .collect();
-        runtime.begin_population(frame, trace.frames().count() - 1, &values, explicit);
+        let source = to_native(&cx.var_or_empty(b"ARG_SOURCE_DIR"));
+        if let Some(pop) =
+            runtime.begin_population(frame, trace.frames().count() - 1, &values, explicit, source)
+            && runtime.frozen
+            && let Ok(frozen) = Frozen::select(cx, &runtime, &pop)
+        {
+            runtime.set_frozen(&pop, frozen);
+        }
+    } else if runtime.frozen
+        && frame_is(cx, frame, FETCH_CONTENT, b"fetchcontent_setpopulated")
+        && bundled_command(cx, b"fetchcontent_setpopulated")
+        && bundled_command(cx, b"__fetchcontent_populate")
+        && trace
+            .frames()
+            .nth(1)
+            .is_some_and(|parent| named(parent, b"__fetchcontent_populate"))
+        && enabled(cx, b"FETCHCONTENT_FULLY_DISCONNECTED")
+        && !enabled(
+            cx,
+            &[
+                b"FETCHCONTENT_SOURCE_DIR_".as_slice(),
+                &cx.var_or_empty(b"contentNameUpper"),
+            ]
+            .concat(),
+        )
+        && let [_, source_key, source, ..] = args
+        && source_key.value == "SOURCE_DIR"
+        && let Some(pop) = runtime.begin_population(
+            frame,
+            trace.frames().count() - 1,
+            args,
+            false,
+            to_native(&source.value),
+        )
+    {
+        if let Ok(Some(frozen)) = Frozen::select(cx, &runtime, &pop) {
+            let _ = frozen.disconnected(cx, &runtime, &pop);
+        }
+    } else if runtime.frozen
+        && [
+            b"_ep_write_downloadfile_script".as_slice(),
+            b"_ep_write_gitclone_script",
+            b"__fetchcontent_dostepdirect",
+            b"include",
+        ]
+        .into_iter()
+        .any(|name| named(frame, name))
+        && let Some(pop) = runtime.population(cx)
+        && let Some(mut frozen) = runtime.take_frozen(&pop)
+    {
+        observe_step(cx, &runtime, &pop, frame, args, &mut frozen);
+        runtime.set_frozen(&pop, Some(frozen));
+    }
+}
+
+fn observe_step(
+    cx: &mut Cx<'_>,
+    runtime: &Runtime,
+    pop: &Population,
+    frame: &Frame,
+    args: &[ExpandedArg],
+    frozen: &mut Frozen,
+) {
+    let shared = "Modules/ExternalProject/shared_internal_commands.cmake";
+    let defined_in = |name, file| {
+        cx.user_command_file(name)
+            .is_some_and(|path| module_is(cx, path, file))
+    };
+    if frame_is(cx, frame, shared, b"_ep_write_downloadfile_script")
+        && defined_in(b"_ep_write_downloadfile_script", shared)
+        && let [script, _, file, ..] = args
+    {
+        let _ = frozen.remote_archive(cx, pop, to_native(&script.value), to_native(&file.value));
+    } else if frame_is(cx, frame, shared, b"_ep_write_gitclone_script")
+        && defined_in(b"_ep_write_gitclone_script", shared)
+        && let [_, _, program, ..] = args
+    {
+        frozen.git_executable(&program.value);
+    } else if frame_is(cx, frame, FETCH_CONTENT, b"__fetchcontent_dostepdirect")
+        && bundled_command(cx, b"__fetchcontent_dostepdirect")
+        && let [script_key, script, stamp_key, stamp, ..] = args
+        && script_key.value == "SCRIPT_FILE"
+        && stamp_key.value == "STAMP_FILE"
+    {
+        let path = to_native(&script.value);
+        let stamp = to_native(&stamp.value);
+        let stamp_dir = to_native(&cx.var_or_empty(b"_EP_STAMP_DIR"));
+        let tmp_dir = to_native(&cx.var_or_empty(b"_EP_TMP_DIR"));
+        let step = ["download", "update", "patch"].into_iter().any(|step| {
+            path == tmp_dir.join(format!("{step}.cmake"))
+                && stamp == stamp_dir.join(format!("{step}.stamp"))
+        });
+        if step && let Some(digest) = runtime.generated_digest(pop, &path, Script::Step) {
+            let _ = frozen.step(cx, runtime, pop, &stamp, digest);
+        } else {
+            stop(cx, "Could not verify the generated FetchContent step.");
+        }
+    } else if named(frame, b"include")
+        && cx.is_builtin(b"include")
+        && bundled_command(cx, b"__fetchcontent_dostepdirect")
+        && let [script] = args
+    {
+        let inner = to_native(&script.value);
+        let outer = to_native(&frame.file);
+        let tmp = to_native(&cx.var_or_empty(b"_EP_TMP_DIR"));
+        for (wrapper, kind) in [
+            ("update.cmake", Script::GitUpdate),
+            ("download.cmake", Script::GitClone),
+        ] {
+            if outer == tmp.join(wrapper)
+                && to_native(&cx.var_or_empty(b"arg_SCRIPT_FILE")) == outer
+                && runtime
+                    .generated_digest(pop, &outer, Script::Step)
+                    .is_some()
+                && runtime.generated_digest(pop, &inner, kind).is_some()
+            {
+                frozen.ran_update();
+            }
+        }
     }
 }
 
@@ -571,7 +748,7 @@ pub(super) fn blocked(cx: &mut Cx<'_>, blocked: Option<BlockedFetch>) -> Result<
     }
 }
 
-pub(super) fn stop(cx: &mut Cx<'_>, reason: &'static str) -> CmdError {
+pub(super) fn stop(cx: &mut Cx<'_>, reason: impl Into<rcmake_base::BString>) -> CmdError {
     cx.issue(MessageKind::Error, Effect::Fatal, None, reason.into());
     CmdError::Reported
 }

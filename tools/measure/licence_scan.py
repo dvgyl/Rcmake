@@ -48,6 +48,7 @@ HYGIENE_SUFFIXES = {
     ".py", ".rb", ".rst", ".sh", ".toml", ".ts", ".txt", ".xml", ".yaml",
     ".yml", ".zsh",
 }
+SEALED_INPUTS = {pathlib.Path("conformance/corpus/unseen.toml")}
 HYGIENE_NAMES = {".editorconfig", ".gitattributes", ".gitignore", "GNUmakefile", "Makefile"}
 
 
@@ -321,6 +322,8 @@ def check_hygiene(errors: list[str]) -> None:
         fields, filename = entry.split(b"\t", 1)
         mode, _, stage = fields.split()
         rel = pathlib.Path(os.fsdecode(filename))
+        if rel in SEALED_INPUTS:
+            continue
         if any(part.startswith("._") or part == ".DS_Store" for part in rel.parts):
             errors.append(f"Tracked macOS metadata file: {rel}")
         if stage != b"0" or mode not in {b"100644", b"100755"}:
@@ -355,18 +358,22 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--generate-notices", action="store_true", help="Regenerate the Cargo notices.")
     parser.add_argument("--check-hygiene", action="store_true", help="Also check Git modes and tracked paths.")
+    parser.add_argument("--hygiene-only", action="store_true", help="Check only Git modes and tracked paths.")
     args = parser.parse_args()
+    if args.hygiene_only and args.generate_notices:
+        parser.error("--hygiene-only cannot regenerate Cargo notices.")
 
     errors: list[str] = []
-    try:
-        check_source(errors)
-        packages, normal_count, workspace_count = audit_dependencies(errors)
-        if not errors:
-            check_notices(packages, args.generate_notices, errors)
-    except (OSError, ValueError, KeyError, subprocess.SubprocessError) as exc:
-        errors.append(f"Could not complete the licence scan: {exc}")
+    if not args.hygiene_only:
+        try:
+            check_source(errors)
+            packages, normal_count, workspace_count = audit_dependencies(errors)
+            if not errors:
+                check_notices(packages, args.generate_notices, errors)
+        except (OSError, ValueError, KeyError, subprocess.SubprocessError) as exc:
+            errors.append(f"Could not complete the licence scan: {exc}")
 
-    if args.check_hygiene:
+    if args.check_hygiene or args.hygiene_only:
         try:
             check_hygiene(errors)
         except (OSError, ValueError, subprocess.SubprocessError) as exc:
@@ -378,12 +385,13 @@ def main() -> int:
             print(f"  - {error}", file=sys.stderr)
         return 1
 
-    print(
-        f"Licence scan passed for {workspace_count} workspace dependencies. "
-        f"Cargo notices cover {normal_count} normal and {len(packages) - normal_count} "
-        "build-only rcmake-cli dependencies."
-    )
-    if args.check_hygiene:
+    if not args.hygiene_only:
+        print(
+            f"Licence scan passed for {workspace_count} workspace dependencies. "
+            f"Cargo notices cover {normal_count} normal and {len(packages) - normal_count} "
+            "build-only rcmake-cli dependencies."
+        )
+    if args.check_hygiene or args.hygiene_only:
         print("Git hygiene scan passed.")
     return 0
 

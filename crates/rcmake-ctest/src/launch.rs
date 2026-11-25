@@ -62,26 +62,7 @@ fn run_command(
         .map_err(|error| error.to_string())?;
     host.write_out(Stream::Stdout, &output.stdout);
     host.write_out(Stream::Stderr, &output.stderr);
-    let (code, exit) = match output.results.as_slice() {
-        [ProcessResult::Exited(code)] => (*code, code.to_string()),
-        [ProcessResult::Signaled(signal)] => {
-            let reason = match signal {
-                2 => "User interrupt",
-                9 => "Subprocess killed",
-                15 => "Subprocess terminated",
-                _ => "Subprocess received a signal",
-            };
-            (1, format!("Terminated abnormally: {reason}"))
-        }
-        [ProcessResult::SpawnFailed(error)] => (
-            1,
-            format!(
-                "Error administrating child process: {}",
-                error.os_message.to_ascii_lowercase()
-            ),
-        ),
-        _ => (1, "Child process timeout".into()),
-    };
+    let (code, exit) = process_exit(&output.results);
     if let Some(logs) = host
         .env_get(b"CTEST_LAUNCH_LOGS")
         .filter(|dir| !dir.is_empty())
@@ -105,20 +86,16 @@ fn run_command(
                     }
                 }
             }
-            xml.push_str("</Action>\n<Command>\n");
+            xml.push_str("</Action>\n");
             let canonical = host.canonicalize(&cwd).unwrap_or_else(|_| cwd.clone());
             let cwd_value = path::from_native_cmake(&canonical);
-            element(&mut xml, "WorkingDirectory", &cwd_value);
+            let command = || std::iter::once(program).chain(arguments);
+            write_command(&mut xml, &cwd_value, command());
+            write_result(&mut xml, &stdout.0, &stderr.0, &exit);
             let mut identity = cwd_value;
-            for arg in std::iter::once(program).chain(arguments) {
-                element(&mut xml, "Argument", arg);
+            for arg in command() {
                 identity.extend_from_slice(arg);
             }
-            xml.push_str("</Command>\n<Result>\n");
-            element(&mut xml, "StdOut", &stdout.0);
-            element(&mut xml, "StdErr", &stderr.0);
-            element(&mut xml, "ExitCondition", exit.as_bytes());
-            xml.push_str("</Result>\n");
             let build = option(args, b"--build-dir").map(|dir| cwd.join(path::to_native(dir)));
             if let Some((build, target)) = build.as_deref().zip(option(args, b"--target-name")) {
                 let labels = instrumentation_xml::target_labels(host, build, target);
@@ -141,6 +118,61 @@ fn run_command(
         }
     }
     Ok(code)
+}
+
+pub(crate) fn build_failure(
+    xml: &mut String,
+    cwd: &Path,
+    command: &[BString],
+    output: &rcmake_host::RunOutput,
+) {
+    let (_, exit) = process_exit(&output.results);
+    let (stdout, _) = diagnostic_output(&output.stdout);
+    let (stderr, _) = diagnostic_output(&output.stderr);
+    xml.push_str("<Failure type=\"Error\">\n<Action/>\n");
+    write_command(xml, &path::from_native_cmake(cwd), command);
+    write_result(xml, &stdout, &stderr, &exit);
+    xml.push_str("</Failure>\n");
+}
+
+fn process_exit(results: &[ProcessResult]) -> (i32, String) {
+    match results {
+        [ProcessResult::Exited(code)] => (*code, code.to_string()),
+        [ProcessResult::Signaled(signal)] => {
+            let reason = match signal {
+                2 => "User interrupt",
+                9 => "Subprocess killed",
+                15 => "Subprocess terminated",
+                _ => "Subprocess received a signal",
+            };
+            (1, format!("Terminated abnormally: {reason}"))
+        }
+        [ProcessResult::SpawnFailed(error)] => (
+            1,
+            format!(
+                "Error administrating child process: {}",
+                error.os_message.to_ascii_lowercase()
+            ),
+        ),
+        _ => (1, "Child process timeout".into()),
+    }
+}
+
+fn write_command<'a>(xml: &mut String, cwd: &[u8], args: impl IntoIterator<Item = &'a BString>) {
+    xml.push_str("<Command>\n");
+    element(xml, "WorkingDirectory", cwd);
+    for arg in args {
+        element(xml, "Argument", arg);
+    }
+    xml.push_str("</Command>\n");
+}
+
+fn write_result(xml: &mut String, stdout: &[u8], stderr: &[u8], exit: &str) {
+    xml.push_str("<Result>\n");
+    element(xml, "StdOut", stdout);
+    element(xml, "StdErr", stderr);
+    element(xml, "ExitCondition", exit.as_bytes());
+    xml.push_str("</Result>\n");
 }
 
 fn diagnostic_output(bytes: &[u8]) -> (BString, bool) {

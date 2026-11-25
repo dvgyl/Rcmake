@@ -167,22 +167,52 @@ fn archive_plan(
     Ok(Some(plan))
 }
 
+pub(super) fn frozen_pin(
+    cx: &mut Cx<'_>,
+    runtime: Arc<Runtime>,
+    pop: &Population,
+    urls: Vec<String>,
+    expected: Option<ContentHash>,
+) -> Result<Option<UrlEntry>, CmdError> {
+    let url = urls.first().cloned().unwrap_or_default();
+    let mut plan = ArchivePlan {
+        runtime,
+        dependency: pop.dependency.clone(),
+        urls,
+        url,
+        expected,
+        locked: None,
+        mode: FetchLockMode::Frozen,
+        offline: false,
+    };
+    plan.find_lock(cx, pop)?;
+    if let (Some(expected), Some(pin)) = (&plan.expected, &plan.locked)
+        && expected.algorithm() == HashAlgo::Sha256
+        && *expected != ContentHash::sha256(pin.sha256)
+    {
+        required(cx, &plan.runtime, pop, BlockReason::LockMismatch)?;
+    }
+    Ok(plan.locked)
+}
+
 impl ArchivePlan {
     fn find_lock(&mut self, cx: &mut Cx<'_>, pop: &Population) -> Result<(), CmdError> {
-        let session = lock_mutex(&self.runtime.lock);
-        match session.as_ref() {
-            Some(Ok(lock)) => {
-                if let Some(LockEntry::Url(entry)) = lock.snapshot().get(&self.dependency)
-                    && entry.urls == self.urls
+        let selection = {
+            let session = lock_mutex(&self.runtime.lock);
+            match session.as_ref() {
+                Some(Ok(lock)) => Ok(match lock.snapshot().get(&self.dependency) {
+                    Some(LockEntry::Url(entry)) if entry.urls == self.urls => Some(entry.clone()),
+                    _ => None,
+                }),
+                Some(Err(error))
+                    if matches!(self.mode, FetchLockMode::Update | FetchLockMode::Frozen) =>
                 {
-                    self.locked = Some(entry.clone());
+                    Err(error.to_string())
                 }
+                _ => Ok(None),
             }
-            _ if matches!(self.mode, FetchLockMode::Update | FetchLockMode::Frozen) => {
-                return Err(stop(cx, "Could not read the fetch lockfile."));
-            }
-            _ => {}
-        }
+        };
+        self.locked = selection.map_err(|error| stop(cx, error))?;
         if self.mode == FetchLockMode::Frozen && self.locked.is_none() {
             required(cx, &self.runtime, pop, BlockReason::LockMismatch)?;
         }

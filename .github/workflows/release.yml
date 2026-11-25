@@ -9,7 +9,7 @@ permissions:
   contents: read
 
 env:
-  RUSTUP_TOOLCHAIN: stable
+  RUSTUP_TOOLCHAIN: "1.99.1"
 
 jobs:
   package:
@@ -34,8 +34,9 @@ jobs:
       - uses: actions/checkout@v6
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: "1.99.1"
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
         with:
@@ -46,6 +47,21 @@ jobs:
         shell: bash
         run: scripts/dist.sh --target "$RELEASE_TARGET"
 
+      - name: Test the extracted tarball
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          work="$(mktemp -d)"
+          trap 'rm -rf "$work"' EXIT
+          tar -xzf dist/*.tar.gz -C "$work"
+          for tool in rcmake cmake ctest cpack; do
+            "$work"/rcmake-*/bin/"$tool" --version
+          done
+
+      - uses: actions/setup-python@v6
+        if: runner.os == 'Windows'
+        with:
+          python-version: "3.12"
       - uses: ilammy/msvc-dev-cmd@v1
         if: runner.os == 'Windows'
         with:
@@ -60,39 +76,50 @@ jobs:
             throw 'Invalid version in Cargo.toml.'
           }
           $cargoHome = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { Join-Path $HOME '.cargo' }
+          $cargoHome = [IO.Path]::GetFullPath($cargoHome, $root)
+          $rustupHome = if ($env:RUSTUP_HOME) { $env:RUSTUP_HOME } else { Join-Path $HOME '.rustup' }
+          $rustupHome = [IO.Path]::GetFullPath($rustupHome, $root)
+          $targetDir = if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { 'target' }
+          $targetDir = [IO.Path]::GetFullPath($targetDir, $root)
           $homePaths = @($HOME, $env:USERPROFILE, $env:HOME) | Where-Object { $_ } | Select-Object -Unique
           $remap = @(
             foreach ($path in $homePaths) { @{ Source = $path; Destination = '/rust-home' } }
             @{ Source = $root; Destination = '/rcmake' }
-            @{ Source = (Join-Path $cargoHome 'registry\src'); Destination = '/cargo/registry/src' }
-            @{ Source = (Join-Path $HOME '.cargo\registry\src'); Destination = '/cargo/registry/src' }
+            @{ Source = $targetDir; Destination = '/target' }
+            @{ Source = $cargoHome; Destination = '/cargo' }
+            @{ Source = $rustupHome; Destination = '/rustup' }
           )
           $flags = @(
+            if (Test-Path Env:CARGO_ENCODED_RUSTFLAGS) {
+              if ($env:CARGO_ENCODED_RUSTFLAGS) { $env:CARGO_ENCODED_RUSTFLAGS -split [char]31 }
+            } elseif ($env:RUSTFLAGS) {
+              $env:RUSTFLAGS -split '[ \t\r\n\v\f]+' | Where-Object { $_ }
+            }
             foreach ($mapping in $remap) {
               foreach ($path in @($mapping.Source, $mapping.Source.Replace('\', '/')) | Select-Object -Unique) {
                 "--remap-path-prefix=$path=$($mapping.Destination)"
               }
             }
           )
-          $env:RUSTFLAGS = $flags -join ' '
+          Remove-Item Env:RUSTFLAGS -ErrorAction SilentlyContinue
           $env:CARGO_ENCODED_RUSTFLAGS = $flags -join [char]31
-          cargo build --locked --release --bin rcmake --target $env:RELEASE_TARGET --target-dir target
+          cargo build --locked --release --bin rcmake --target $env:RELEASE_TARGET --target-dir $targetDir
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-          $binary = "target/$env:RELEASE_TARGET/release/rcmake.exe"
+          $binary = "$targetDir/$env:RELEASE_TARGET/release/rcmake.exe"
           $env:RCMAKE_RELEASE_BINARY = $binary
-          $env:RCMAKE_RELEASE_HOMES = $homePaths -join [char]31
+          $env:RCMAKE_RELEASE_PATHS = ($homePaths + @($root, $targetDir, $cargoHome, $rustupHome)) -join [char]31
           @'
           import os
           from pathlib import Path
           import sys
 
           contents = Path(os.environ["RCMAKE_RELEASE_BINARY"]).read_bytes().lower()
-          for home in os.environ["RCMAKE_RELEASE_HOMES"].split("\x1f"):
+          for home in filter(None, os.environ["RCMAKE_RELEASE_PATHS"].split("\x1f")):
               for path in {home, home.replace("\\", "/"), home.replace("/", "\\")}:
                   for encoding in ("utf-8", "utf-16le"):
                       if path.encode(encoding).lower() in contents:
-                          sys.exit("The release binary contains a home directory path.")
+                          sys.exit("The release binary contains a build path.")
           '@ | python -
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
@@ -129,6 +156,12 @@ jobs:
               }
             } finally {
               $zip.Dispose()
+            }
+            $extracted = Join-Path $work 'extracted'
+            Expand-Archive -LiteralPath $archive -DestinationPath $extracted
+            foreach ($tool in 'rcmake', 'cmake', 'ctest', 'cpack') {
+              & "$extracted/$name/bin/$tool.exe" --version
+              if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
             }
             $digest = (Get-FileHash -Algorithm SHA256 -LiteralPath $archive).Hash.ToLowerInvariant()
             "$digest  $name.zip`n" | Set-Content -LiteralPath "dist/$name.zip.sha256" -Encoding ascii -NoNewline

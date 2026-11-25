@@ -9,13 +9,15 @@ if [[ -f "$ROOT/env/env.sh" ]]; then
   source "$ROOT/env/env.sh"
 fi
 
+TARGET_DIR="${CARGO_TARGET_DIR:-$ROOT/target}"
+case "$TARGET_DIR" in /*) ;; *) TARGET_DIR="$ROOT/$TARGET_DIR" ;; esac
 PROFILE="${RCMAKE_STAGE_PROFILE:-debug}"
 if [[ "$PROFILE" == "release" ]]; then
-  cargo build --locked --release --bin rcmake
-  BIN_SRC="$ROOT/target/release/rcmake"
+  cargo build --locked --release --bin rcmake --target-dir "$TARGET_DIR"
+  BIN_SRC="$TARGET_DIR/release/rcmake"
 else
-  cargo build --locked --bin rcmake
-  BIN_SRC="$ROOT/target/debug/rcmake"
+  cargo build --locked --bin rcmake --target-dir "$TARGET_DIR"
+  BIN_SRC="$TARGET_DIR/debug/rcmake"
 fi
 
 STAGE="$ROOT/target/stage"

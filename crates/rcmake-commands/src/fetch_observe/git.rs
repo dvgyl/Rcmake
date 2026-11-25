@@ -174,6 +174,14 @@ pub(crate) fn after_process(
     Ok(())
 }
 
+pub(super) fn frozen_pin(
+    cx: &mut Cx<'_>,
+    runtime: Arc<Runtime>,
+    pop: Population,
+) -> Result<Option<String>, CmdError> {
+    Ok(GitPlan::new(cx, runtime, pop)?.and_then(|plan| plan.pin))
+}
+
 impl GitPlan {
     fn new(
         cx: &mut Cx<'_>,
@@ -214,45 +222,11 @@ impl GitPlan {
     }
 
     fn find_pin(&mut self, cx: &mut Cx<'_>) -> Result<(), CmdError> {
-        let lock = lock_mutex(&self.runtime.lock);
-        let session = match lock.as_ref() {
-            Some(Ok(lock)) => lock,
-            _ if matches!(self.mode, FetchLockMode::Update | FetchLockMode::Frozen) => {
-                return Err(stop(cx, "Could not read the fetch lockfile."));
-            }
-            _ => return Ok(()),
-        };
-        let locked = if self.mode == FetchLockMode::Frozen {
-            match session.git_pin(
-                &self.population.dependency,
-                &self.repository,
-                self.tag.as_deref(),
-            ) {
-                Ok(pin) => pin,
-                Err(_) => {
-                    return required(
-                        cx,
-                        &self.runtime,
-                        &self.population,
-                        BlockReason::LockMismatch,
-                    );
-                }
-            }
-        } else if self.offline && self.pin.is_none() {
-            match session.snapshot().get(&self.population.dependency) {
-                Some(LockEntry::Git(entry))
-                    if GitEntry::same_repository(&entry.repository, &self.repository)
-                        && entry.tag == self.tag =>
-                {
-                    Some(entry.commit.as_str())
-                }
-                _ => None,
-            }
-        } else {
-            None
-        };
-        if let Some(locked) = locked {
-            if self.pin.as_ref().is_some_and(|pin| pin != locked) {
+        let selection = self.locked_revision();
+        let locked = match selection {
+            Ok(pin) => pin,
+            Err(Some(error)) => return Err(stop(cx, error)),
+            Err(None) => {
                 return required(
                     cx,
                     &self.runtime,
@@ -260,12 +234,54 @@ impl GitPlan {
                     BlockReason::LockMismatch,
                 );
             }
-            self.pin = Some(locked.into());
+        };
+        if let Some(locked) = locked {
+            if self.pin.as_ref().is_some_and(|pin| *pin != locked) {
+                return required(
+                    cx,
+                    &self.runtime,
+                    &self.population,
+                    BlockReason::LockMismatch,
+                );
+            }
+            self.pin = Some(locked);
         }
         if self.offline && self.pin.is_none() {
             required(cx, &self.runtime, &self.population, BlockReason::Unpinned)?;
         }
         Ok(())
+    }
+
+    fn locked_revision(&self) -> Result<Option<String>, Option<String>> {
+        let lock = lock_mutex(&self.runtime.lock);
+        let session = match lock.as_ref() {
+            Some(Ok(lock)) => lock,
+            Some(Err(error))
+                if matches!(self.mode, FetchLockMode::Update | FetchLockMode::Frozen) =>
+            {
+                return Err(Some(error.to_string()));
+            }
+            _ => return Ok(None),
+        };
+        if self.mode == FetchLockMode::Frozen {
+            return session
+                .git_pin(
+                    &self.population.dependency,
+                    &self.repository,
+                    self.tag.as_deref(),
+                )
+                .map(|pin| pin.map(str::to_ascii_lowercase))
+                .map_err(|_| None);
+        }
+        if self.offline
+            && self.pin.is_none()
+            && let Some(LockEntry::Git(entry)) = session.snapshot().get(&self.population.dependency)
+            && GitEntry::same_repository(&entry.repository, &self.repository)
+            && entry.tag == self.tag
+        {
+            return Ok(Some(entry.commit.to_ascii_lowercase()));
+        }
+        Ok(None)
     }
 
     fn enforce(&self) -> bool {

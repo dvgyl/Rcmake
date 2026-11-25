@@ -155,7 +155,19 @@ fn configure_project(
         )?;
         session.generate(&mut interp, configured, &mut results)
     })();
-    runtime.finish(outcome.is_ok() && !session.opts.view);
+    let finish = runtime.finish(outcome.is_ok() && !session.opts.view);
+    let outcome = match (outcome, finish) {
+        (Ok(()), Some(error)) => {
+            interp.cx().issue(
+                MessageKind::Error,
+                Effect::Fatal,
+                None,
+                error.to_string().into(),
+            );
+            Err(Exit::Code(1))
+        }
+        (outcome, _) => outcome,
+    };
     let code = match &outcome {
         Ok(()) => 0,
         Err(Exit::Code(code)) => *code,

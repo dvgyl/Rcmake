@@ -10,6 +10,8 @@ use std::{
 };
 
 mod archive;
+#[cfg(all(feature = "native", any(unix, windows)))]
+mod frozen;
 mod git;
 mod runtime;
 pub(crate) use archive::prepare_archive;
@@ -67,6 +69,7 @@ pub(crate) struct DeclaredFetch {
     /// Nonempty SOURCE_DIR specified in the declaration.
     pub(crate) source_dir: Option<BString>,
     transfer_settings: bool,
+    no_extract: bool,
     custom_update: bool,
     package_lookup: bool,
 }
@@ -158,6 +161,8 @@ pub(crate) fn parse_fetchcontent_declare(args: &[ExpandedArg]) -> Option<Declare
         custom_download,
         source_dir: one(b"SOURCE_DIR").filter(|path| !path.is_empty()).cloned(),
         transfer_settings,
+        no_extract: one(b"DOWNLOAD_NO_EXTRACT")
+            .is_some_and(|value| rcmake_base::truth::is_on(value)),
         custom_update,
         package_lookup: package_args || override_package,
     })
