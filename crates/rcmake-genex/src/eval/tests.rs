@@ -29,6 +29,7 @@ struct Host {
     visits: Vec<TargetHandle>,
     link_queries: Vec<TargetHandle>,
     limits: Limits,
+    warnings: Vec<BString>,
 }
 
 impl Host {
@@ -180,6 +181,10 @@ impl GenexHost for Host {
 
     fn timestamp(&self, format: Option<&[u8]>, utc: bool) -> Option<BString> {
         (format == Some(b"%Y") && utc).then(|| "2000".into())
+    }
+
+    fn warning(&mut self, body: BString, _ctx: &EvalContext) {
+        self.warnings.push(body);
     }
 }
 
@@ -845,4 +850,25 @@ fn remove_at_parses_all_indices_before_checking_bounds() {
         let error = error_text(run(expression.as_bytes(), &context(), &mut Host::default()));
         assert!(error.contains(expected), "{error:?}");
     }
+}
+
+#[test]
+fn config_rejects_only_an_invalid_first_name() {
+    let mut host = Host::default();
+    let ctx = context();
+    assert_eq!(
+        error_text(run(b"$<CONFIG:Foo-Bar>", &ctx, &mut host)),
+        "Expression syntax not recognized."
+    );
+    assert!(host.warnings.is_empty());
+    assert_eq!(
+        run(b"$<CONFIG:Debug,Foo-Second>", &ctx, &mut host).map(|(value, _)| value),
+        Ok("1".into())
+    );
+    assert_eq!(
+        host.warnings,
+        [BString::from(
+            "Warning evaluating generator expression:\n\n  $<CONFIG:Debug,Foo-Second>\n\nThe config name of \"Foo-Second\" is invalid"
+        )]
+    );
 }

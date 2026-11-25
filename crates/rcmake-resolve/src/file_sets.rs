@@ -217,7 +217,7 @@ pub(crate) fn validate_source_includes(
         )?;
         if let Some(relative) = includes
             .iter()
-            .find(|path| !Lexical::new(&path.value).absolute())
+            .find(|path| !crate::file_is_full_path(&path.value))
         {
             let root = Lexical::new(&model.dir(DirId::ROOT).source_dir);
             let source = Lexical::new(&dir.source_dir);

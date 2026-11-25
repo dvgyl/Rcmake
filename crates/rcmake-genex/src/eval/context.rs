@@ -78,8 +78,16 @@ impl Evaluator<'_> {
             return Ok(call.ctx.config.0.clone());
         }
         let values = self.arguments(call)?;
-        if values.iter().any(|v| !valid_id(v)) {
+        // Only the first name must be valid. CMake warns about the others for compatibility.
+        if values.first().is_some_and(|v| !valid_id(v)) {
             return Err(call.error("Expression syntax not recognized."));
+        }
+        for value in values.iter().skip(1).filter(|v| !valid_id(v)) {
+            let body = format!(
+                "Warning evaluating generator expression:\n\n  {}\n\nThe config name of \"{value}\" is invalid",
+                crate::parse::render_expr(call.expr)
+            );
+            self.host.warning(body.into(), call.ctx);
         }
         if let Some(configs) = call.ctx.current.and_then(|target| {
             self.host

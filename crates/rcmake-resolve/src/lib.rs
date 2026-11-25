@@ -36,5 +36,19 @@ pub use install_manifest::{InstallAction, InstallActionKind, InstallEntry, Insta
 pub use model::*;
 pub use pipeline::{resolve, resolve_with_options, validate_codegen_name};
 
+/// Return `true` when CMake treats `path` as a full path (`cmSystemTools::FileIsFullPath`).
+///
+/// A leading `/` is a full path on all hosts (a network or root path on Windows).
+/// A Windows host also accepts a drive letter (`C:`) and a leading `\\`.
+/// A POSIX host also accepts a leading `~`. The host decides, not the model.
+pub(crate) fn file_is_full_path(path: &[u8]) -> bool {
+    if cfg!(windows) {
+        path.len() >= 2
+            && (path.get(1) == Some(&b':') || matches!(path.first(), Some(b'\\' | b'/')))
+    } else {
+        matches!(path.first(), Some(b'/' | b'~'))
+    }
+}
+
 #[cfg(test)]
 mod resolve_tests;

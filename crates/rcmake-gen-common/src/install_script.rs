@@ -4,6 +4,9 @@ use std::path::Path;
 
 pub(crate) mod file_sets;
 mod supplementary;
+
+#[cfg(test)]
+mod file_set_tests;
 pub use supplementary::write_supplementary_outputs;
 
 use rcmake_base::BString;

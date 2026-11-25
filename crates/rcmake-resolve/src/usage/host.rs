@@ -1,9 +1,10 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::rc::Rc;
 
 use indexmap::IndexSet;
-use rcmake_base::{BString, list, path_lex::Lexical};
-use rcmake_diag::{PolicyId, PolicyStatus};
+use rcmake_base::{BString, list, path_lex::Lexical, truth};
+use rcmake_diag::{Backtrace, Location, MessageKind, PolicyId, PolicyStatus};
 use rcmake_genex::{
     ArtifactKind, ArtifactPart, ConfigId, EvalContext, GenexError, GenexHost, InterfaceView,
     RuleProperty, TargetHandle, UsageTraversal,
@@ -41,6 +42,11 @@ pub struct ModelGenexHost<'model, 'resolver> {
     objects: Option<&'resolver ObjectPaths<'resolver>>,
     clock: Option<&'resolver dyn Host>,
     timestamp: Option<&'resolver TimestampFormatter<'resolver>>,
+    /// Call site for warnings that a host callback issues without a context.
+    pub(crate) warning_site: Option<Backtrace>,
+    /// Keep warnings here instead of writing them, so that the caller can order them
+    /// with the errors of the same command.
+    pub(crate) deferred_warnings: Option<Rc<RefCell<Vec<BString>>>>,
 }
 
 impl<'model, 'resolver> ModelGenexHost<'model, 'resolver> {
@@ -54,6 +60,8 @@ impl<'model, 'resolver> ModelGenexHost<'model, 'resolver> {
             objects: None,
             clock: None,
             timestamp: None,
+            warning_site: None,
+            deferred_warnings: None,
         }
     }
 
@@ -471,6 +479,9 @@ impl GenexHost for ModelGenexHost<'_, '_> {
                     ArtifactKind::BundleDir | ArtifactKind::BundleContentDir
                 );
             if full_file || self.target_policy(target, b"CMP0112") == Some(false) {
+                if !full_file {
+                    self.warn_cmp0112(id);
+                }
                 dependencies.borrow_mut().insert((id, config.clone()));
             }
         }
@@ -579,9 +590,77 @@ impl GenexHost for ModelGenexHost<'_, '_> {
         Some(configurations)
     }
 
+    fn warning(&mut self, body: BString, ctx: &EvalContext) {
+        let Some(paths) = self.resolver.source_paths() else {
+            return;
+        };
+        let location = Location::Backtrace(ctx.site.backtrace.clone());
+        let Some(text) = paths.render_once(
+            self.resolver.model,
+            MessageKind::Warning,
+            None,
+            location,
+            body,
+        ) else {
+            return;
+        };
+        match &self.deferred_warnings {
+            Some(deferred) => deferred.borrow_mut().push(text),
+            None => paths.host.write_out(rcmake_host::Stream::Stderr, &text),
+        }
+    }
+
     fn target_policy(&self, target: TargetHandle, policy: &[u8]) -> Option<bool> {
         let target = self.resolver.model.target(self.id(target)?)?;
         Some(target.policies.policies.get(PolicyId::parse(policy)?) == PolicyStatus::New)
+    }
+}
+
+impl ModelGenexHost<'_, '_> {
+    /// Write warnings that `deferred_warnings` kept.
+    pub(crate) fn write_warnings(&self, texts: impl IntoIterator<Item = BString>) {
+        if let Some(paths) = self.resolver.source_paths() {
+            for text in texts {
+                paths.host.write_out(rcmake_host::Stream::Stderr, &text);
+            }
+        }
+    }
+
+    /// Warn that a target file component expression adds a target dependency while
+    /// `CMP0112` is not set. CMake issues this optional warning only when
+    /// `CMAKE_POLICY_WARNING_CMP0112` is true in the evaluating directory.
+    fn warn_cmp0112(&self, id: TargetId) {
+        let model = self.resolver.model;
+        let (Some(paths), Some(site), Some(target), Some(policy)) = (
+            self.resolver.source_paths(),
+            self.warning_site.as_ref(),
+            model.target(id),
+            PolicyId::parse(b"CMP0112"),
+        ) else {
+            return;
+        };
+        let unset = target.policies.policies.get(policy) == PolicyStatus::Warn;
+        let enabled = model
+            .definition(self.lookup_dir, b"CMAKE_POLICY_WARNING_CMP0112")
+            .is_some_and(|value| truth::is_on(value));
+        if !unset || !enabled {
+            return;
+        }
+        let summary = policy
+            .info()
+            .map_or("", |info| info.summary)
+            .replace("``", "");
+        let body = format!(
+            "Policy {policy} is not set: {summary}  Run \"cmake --help-policy {policy}\" for policy details.  Use the cmake_policy command to set the policy and suppress this warning.\n\nDependency being added to target:\n\n  \"{}\"\n",
+            target.name
+        );
+        paths.warn_once(
+            model,
+            MessageKind::AuthorWarning,
+            Some(policy),
+            Location::Backtrace(site.clone()),
+            body.into(),
+        );
     }
 }
 

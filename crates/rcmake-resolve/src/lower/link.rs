@@ -25,6 +25,7 @@ use crate::{
 
 pub(super) mod driver;
 mod frameworks;
+mod linker_type;
 use driver::{
     LinkerDriver, archive_commands, deduplicate_darwin_flags, definition_file, library_file,
     shared_library, without_empty_output_flags,
@@ -172,6 +173,10 @@ pub(super) fn link(
         } else {
             value.clone()
         });
+    }
+    // CMake adds the linker type flags after the link options.
+    for flag in linker_type::linker_type_flags(model, target, config, language, kind, usage)? {
+        flags.push(wrapper.argument(&flag)?);
     }
     if kind != LinkKind::StaticArchive {
         let modes = crate::usage::link_options::warning_as_error_options(model, target)

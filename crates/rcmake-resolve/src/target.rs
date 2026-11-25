@@ -35,7 +35,7 @@ pub(crate) fn resolve_target<'a>(
         binary_dir: dir.binary_dir.clone(),
         backtrace: target.backtrace.clone(),
         folder: target.props.get(b"FOLDER").cloned(),
-        exclude_from_all: model.excluded_from_all(target),
+        exclude_from_all: excluded_from_all(model, usage, id, target, ctx),
         generator_provided: target.kind == TargetKind::GlobalTarget
             || target.name == STD_MODULE_TARGET,
     };
@@ -257,9 +257,11 @@ pub(crate) fn resolve_target<'a>(
                         .collect_for_result(id, UsageField::CompileOptions, &compile_ctx)?
                         .entries,
                 );
-                let mut defines = usage
-                    .collect_for_result(id, UsageField::CompileDefinitions, &compile_ctx)?
-                    .entries;
+                let mut defines = strip_define_flags(
+                    usage
+                        .collect_for_result(id, UsageField::CompileDefinitions, &compile_ctx)?
+                        .entries,
+                );
                 if let Some(symbol) = &export_symbol
                     && !defines.iter().any(|define| define.value == *symbol)
                 {
@@ -831,6 +833,49 @@ fn expand_rule_patterns(
     }
     expanded.extend_from_slice(remaining);
     expanded
+}
+
+/// Remove a leading `-D` from each definition, as CMake does when it adds definitions
+/// to a compile line. A generator expression can produce such a value after the
+/// `target_compile_definitions()` command has removed the literal ones.
+fn strip_define_flags(defines: Vec<BT<BString>>) -> Vec<BT<BString>> {
+    let mut seen = std::collections::HashSet::new();
+    defines
+        .into_iter()
+        .map(|mut define| {
+            if let Some(name) = define.value.strip_prefix(b"-D") {
+                define.value = name.into();
+            }
+            define
+        })
+        .filter(|define| seen.insert(define.value.clone()))
+        .collect()
+}
+
+/// Evaluate `EXCLUDE_FROM_ALL` for one configuration. The property can hold a
+/// generator expression, for example `$<NOT:$<CONFIG:Release>>`.
+fn excluded_from_all(
+    model: &ProjectModel,
+    usage: &mut UsageResolver<'_>,
+    id: TargetId,
+    target: &Target,
+    ctx: &EvalContext,
+) -> bool {
+    let Some(value) = target
+        .props
+        .get(b"EXCLUDE_FROM_ALL")
+        .filter(|value| value.windows(2).any(|pair| pair == b"$<"))
+    else {
+        return model.excluded_from_all(target);
+    };
+    let ctx = EvalContext {
+        head: Some(usage::handle(id)),
+        current: Some(usage::handle(id)),
+        ..ctx.clone()
+    };
+    rcmake_genex::parse(value)
+        .and_then(|ast| rcmake_genex::evaluate(&ast, &ctx, &mut usage.host(target.dir)))
+        .is_ok_and(|(value, _)| truth::is_on(&value))
 }
 
 #[cfg(test)]

@@ -33,8 +33,6 @@ mod includes;
 mod link;
 pub(crate) mod link_options;
 pub(crate) mod provenance;
-#[cfg(test)]
-mod tests;
 mod wrappers;
 
 pub use host::{ModelGenexHost, ObjectPaths};
@@ -296,7 +294,8 @@ impl<'a> UsageResolver<'a> {
             }
             value
         } else {
-            if field == UsageField::LinkOptions {
+            // CMP0099 makes link properties transitive over private static dependencies.
+            if matches!(field, UsageField::LinkOptions | UsageField::LinkDirectories) {
                 ctx.traversal = link_options::traversal(self.target(target)?);
             }
             let result = self.walk(target, name, &ctx)?;
@@ -610,7 +609,14 @@ impl<'a> UsageResolver<'a> {
             .filter(|(_, set)| {
                 let own = set.target == target;
                 match set.kind {
-                    FileSetKind::Headers => own && self.ide.is_some(),
+                    // An interface library has no other sources, so its header files
+                    // carry its dependencies on generated headers.
+                    FileSetKind::Headers => {
+                        own && (self.ide.is_some()
+                            || model
+                                .target(target)
+                                .is_some_and(|target| target.kind == TargetKind::InterfaceLibrary))
+                    }
                     FileSetKind::Sources if !own => set.scope != UsageScope::Private,
                     _ => {
                         own && (set.scope != UsageScope::Interface
@@ -678,7 +684,13 @@ impl<'a> UsageResolver<'a> {
                 b"INTERFACE_INCLUDE_DIRECTORIES" | b"INTERFACE_SOURCES"
             ) && self.property_reads == 0
                 && let Some(paths) = self.source_paths()
-                && let Some(path) = values.iter().find(|value| !Lexical::new(value).absolute())
+                && let Some(problem) = interface_path_problem(
+                    paths,
+                    self.model,
+                    self.target(target)?,
+                    property,
+                    &values,
+                )
             {
                 result.flags.head_sensitive = true;
                 if let Some(head) = ctx.head.filter(|head| *head != handle(target))
@@ -689,9 +701,15 @@ impl<'a> UsageResolver<'a> {
                 {
                     let name = &self.target(target)?.name;
                     let property = BString::from(property);
-                    let body: BString = format!(
-                        "Target \"{name}\" contains relative path in its {property}:\n\n  \"{path}\""
-                    ).into();
+                    let body: BString = match problem {
+                        PathProblem::Missing(path) => format!(
+                            "Imported target \"{name}\" includes non-existent path\n  \"{path}\"\nin its INTERFACE_INCLUDE_DIRECTORIES. Possible reasons include:\n* The path was deleted, renamed, or moved to another location.\n* An install or uninstall procedure did not complete successfully.\n* The installation package was faulty and references files it does not provide.\n"
+                        ),
+                        PathProblem::Relative(path) => format!(
+                            "Target \"{name}\" contains relative path in its {property}:\n\n  \"{path}\""
+                        ),
+                    }
+                    .into();
                     let file = Lexical::new(&self.model.dir(consumer.dir).source_dir)
                         .append(b"CMakeLists.txt");
                     paths.emit(
@@ -710,7 +728,7 @@ impl<'a> UsageResolver<'a> {
                 && self.property_reads == 0
                 && ctx.head.is_none_or(|head| head == handle(target))
                 && let Some(paths) = self.source_paths()
-                && let Some(path) = values.iter().find(|value| !Lexical::new(value).absolute())
+                && let Some(path) = values.iter().find(|value| !crate::file_is_full_path(value))
             {
                 let owner = self.target(target)?;
                 let body: BString = format!(
@@ -766,10 +784,18 @@ impl<'a> UsageResolver<'a> {
         host.current = ctx.current;
         evaluate(&ast, &ctx, &mut host).map_err(|error| {
             if matches!(property, b"LINK_DEPENDS" | b"INTERFACE_LINK_DEPENDS") {
-                error.without_location().into()
-            } else {
-                error.at(&entry.backtrace, root).into()
+                return error.without_location().into();
             }
+            // CMake reports a sources cycle at the call that created the target.
+            let backtrace = match &error {
+                GenexError::SourcesCycle { target } => self
+                    .model
+                    .find_target(dir, target)
+                    .and_then(|id| self.model.target(id))
+                    .map_or(&entry.backtrace, |target| &target.backtrace),
+                _ => &entry.backtrace,
+            };
+            error.at(backtrace, root).into()
         })
     }
 }
@@ -880,3 +906,62 @@ fn prepare_nodes(nodes: &mut Vec<GenexNode>, traversal: UsageTraversal, link_edg
     }
     *nodes = expanded;
 }
+
+/// A path in an interface property that CMake rejects for a consumer.
+enum PathProblem<'a> {
+    /// An include directory of an imported target does not exist.
+    Missing(&'a BString),
+    /// The path is not a full path.
+    Relative(&'a BString),
+}
+
+/// Find the first rejected path in the evaluated `INTERFACE_INCLUDE_DIRECTORIES` or
+/// `INTERFACE_SOURCES` of `target`, in CMake's order of checks.
+fn interface_path_problem<'a>(
+    paths: &SourcePaths<'_>,
+    model: &ProjectModel,
+    target: &rcmake_model::Target,
+    property: &[u8],
+    values: &'a [BString],
+) -> Option<PathProblem<'a>> {
+    let imported = property == b"INTERFACE_INCLUDE_DIRECTORIES" && target.is_imported();
+    // CMake checks only the target property. Directories of the file sets do not count.
+    let file_set_dirs: HashSet<BString> = if imported {
+        target
+            .file_sets
+            .iter()
+            .filter_map(|&id| model.file_set(id))
+            .flat_map(|set| {
+                set.props
+                    .get(b"INTERFACE_INCLUDE_DIRECTORIES")
+                    .map(|value| list::split(value, list::Empty::Drop))
+                    .unwrap_or_default()
+                    .into_iter()
+                    .chain(set.base_dirs.iter().map(|dir| dir.value.clone()))
+            })
+            .collect()
+    } else {
+        HashSet::new()
+    };
+    values.iter().find_map(|value| {
+        if imported
+            && !file_set_dirs.contains(value)
+            && paths
+                .host
+                .metadata(
+                    &rcmake_host::path::to_native(value),
+                    rcmake_host::Follow::Yes,
+                )
+                .is_err()
+        {
+            Some(PathProblem::Missing(value))
+        } else if !crate::file_is_full_path(value) {
+            Some(PathProblem::Relative(value))
+        } else {
+            None
+        }
+    })
+}
+
+#[cfg(test)]
+mod tests;

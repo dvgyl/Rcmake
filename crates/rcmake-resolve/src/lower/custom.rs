@@ -19,6 +19,10 @@ use crate::sources::{self, SourcePaths, absolute_path};
 use crate::usage::{ModelGenexHost, ObjectPaths, UsageResolver, handle};
 use crate::{ArtifactSet, BuildStep, CrossConfiguration, CustomStep, ResolveError, ResolvedTarget};
 
+mod outputs;
+
+pub(crate) use outputs::checked_command_outputs;
+
 pub(super) struct Commands<'a> {
     model: &'a ProjectModel,
     targets: &'a IndexMap<TargetId, &'a ResolvedTarget>,
@@ -31,13 +35,21 @@ pub(super) struct Commands<'a> {
     dependencies: Vec<IndexSet<TargetId>>,
 }
 
+/// Combine the errors of several commands into one error, in order.
+pub(crate) fn combine_errors(errors: Vec<ResolveError>) -> Result<(), ResolveError> {
+    command_result((), errors)
+}
+
 fn command_result<T>(result: T, errors: Vec<ResolveError>) -> Result<T, ResolveError> {
+    combine(errors).map_or(Ok(result), Err)
+}
+
+/// Join errors in order. Return `None` when there is no error.
+fn combine(errors: Vec<ResolveError>) -> Option<ResolveError> {
     let mut errors = errors.into_iter();
-    let Some(first) = errors.next() else {
-        return Ok(result);
-    };
+    let first = errors.next()?;
     if errors.len() == 0 {
-        return Err(first);
+        return Some(first);
     }
     let mut diagnostics = first.to_string();
     for error in errors {
@@ -46,7 +58,7 @@ fn command_result<T>(result: T, errors: Vec<ResolveError>) -> Result<T, ResolveE
         }
         diagnostics.push_str(&error.to_string());
     }
-    Err(ResolveError::Message(diagnostics.into()))
+    Some(ResolveError::Message(diagnostics.into()))
 }
 
 impl<'a> Commands<'a> {
@@ -69,11 +81,19 @@ impl<'a> Commands<'a> {
             codegen: IndexSet::new(),
             dependencies: Vec::new(),
         };
+        let mut errors = Vec::new();
         for (id, command) in model
             .commands()
             .filter(|(_, command)| command.kind == CustomCommandKind::Output)
         {
-            let (step, dependencies) = commands.lower_command(id, command, usage)?;
+            // CMake reports the errors of every command, not only of the first one.
+            let (step, dependencies) = match commands.lower_command(id, command, usage) {
+                Ok(lowered) => lowered,
+                Err(error) => {
+                    errors.push(error);
+                    continue;
+                }
+            };
             let index = steps.len();
             if command.codegen {
                 commands.codegen.insert(index);
@@ -85,7 +105,7 @@ impl<'a> Commands<'a> {
             commands.dependencies.push(dependencies);
             push(steps, BuildStep::Custom(step));
         }
-        Ok(commands)
+        command_result(commands, errors)
     }
 
     pub(super) fn producer(&self, path: &BString) -> Option<usize> {
@@ -133,6 +153,7 @@ impl<'a> Commands<'a> {
         let mut dependencies = IndexSet::new();
         let mut depends = IndexSet::new();
         eval.host.artifact_dependencies = Some(&artifact_dependencies);
+        eval.host.warning_site = Some(command.backtrace.clone());
 
         for dep in command
             .main_dependency
@@ -151,7 +172,14 @@ impl<'a> Commands<'a> {
             }
         }
         let mut invocations = Vec::new();
+        // Errors and warnings of the arguments, in evaluation order, as CMake reports them.
         let mut errors = Vec::new();
+        let mut failed = false;
+        let warnings = std::rc::Rc::new(RefCell::new(Vec::new()));
+        eval.host.deferred_warnings = Some(warnings.clone());
+        let take_warnings = |errors: &mut Vec<ResolveError>| {
+            errors.extend(warnings.borrow_mut().drain(..).map(ResolveError::Message));
+        };
         for line in &command.command_lines {
             let mut argv = Vec::new();
             for (index, arg) in line.iter().enumerate() {
@@ -161,10 +189,13 @@ impl<'a> Commands<'a> {
                     argument_config
                 }
                 .clone();
-                let mut value = match eval.value(arg) {
+                let value = eval.value(arg);
+                take_warnings(&mut errors);
+                let mut value = match value {
                     Ok(value) => value,
                     Err(error) => {
                         errors.push(error);
+                        failed = true;
                         continue;
                     }
                 };
@@ -178,7 +209,7 @@ impl<'a> Commands<'a> {
                     argv.push(value);
                 }
             }
-            if !errors.is_empty() {
+            if failed {
                 continue;
             }
             let Some(program) = argv.first_mut().filter(|program| !program.is_empty()) else {
@@ -207,7 +238,15 @@ impl<'a> Commands<'a> {
             }
             invocations.push(direct(argv, working_dir.clone()));
         }
-        command_result((), errors)?;
+        take_warnings(&mut errors);
+        if failed {
+            return Err(
+                combine(errors).unwrap_or_else(|| ResolveError::Message(BString::default()))
+            );
+        }
+        eval.host
+            .write_warnings(errors.into_iter().map(|warning| warning.to_string().into()));
+        eval.host.deferred_warnings = None;
         let mut artifact_dependencies = artifact_dependencies.into_inner();
         let mut next = 0;
         while let Some((id, config)) = artifact_dependencies.get_index(next).cloned() {

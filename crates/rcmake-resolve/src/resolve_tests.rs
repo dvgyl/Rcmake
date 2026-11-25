@@ -1,5 +1,6 @@
 mod app_bundle;
 mod excluded_export;
+mod generation_rules;
 mod languages;
 mod parity;
 

@@ -124,7 +124,7 @@ pub(crate) fn apply_compile_properties(
         if matches!(field, SourceUsage::Includes)
             && let Some(include) = source_values
                 .iter()
-                .find(|entry| !Lexical::new(&entry.value).absolute())
+                .find(|entry| !crate::file_is_full_path(&entry.value))
         {
             let file = BString::from(Lexical::new(&source.value).filename());
             let body = BString::from(format!(
@@ -274,6 +274,8 @@ pub(crate) struct SourcePaths<'a> {
     pub(crate) collect_source_errors: bool,
     extension_warnings: RefCell<IndexSet<(BString, BString)>>,
     missing: RefCell<IndexSet<(BString, BString)>>,
+    /// Rendered generation warnings, so that a repeated evaluation warns once.
+    warnings: RefCell<IndexSet<BString>>,
     root_source_dir: Option<BString>,
     absolute_sources: IndexMap<BString, IndexSet<BString>>,
     generated: IndexMap<BString, IndexSet<BString>>,
@@ -290,6 +292,7 @@ impl<'a> SourcePaths<'a> {
             collect_source_errors: true,
             extension_warnings: RefCell::default(),
             missing: RefCell::default(),
+            warnings: RefCell::default(),
             root_source_dir: None,
             absolute_sources: IndexMap::new(),
             generated: IndexMap::new(),
@@ -325,9 +328,16 @@ impl<'a> SourcePaths<'a> {
     ) -> Result<(), ResolveError> {
         self.generated.clear();
         let mut usage = UsageResolver::new(model).with_ide(self.ide);
+        let mut errors = Vec::new();
         for (_, command) in model.commands() {
             let (outputs, byproducts) =
-                crate::lower::command_outputs(model, command, config, &mut usage)?;
+                match crate::lower::checked_command_outputs(model, command, config, &mut usage) {
+                    Ok(paths) => paths,
+                    Err(error) => {
+                        errors.push(error);
+                        continue;
+                    }
+                };
             let dir = model.dir(command.dir);
             for path in outputs.into_iter().chain(byproducts) {
                 self.generated
@@ -336,6 +346,7 @@ impl<'a> SourcePaths<'a> {
                     .insert(dir.binary_dir.clone());
             }
         }
+        crate::lower::custom::combine_errors(errors)?;
         for (_, dir) in model.dirs() {
             for path in &dir.generated_sources {
                 self.generated
@@ -584,6 +595,49 @@ impl<'a> SourcePaths<'a> {
             location,
             body,
         );
+    }
+
+    /// Write a warning once, even when evaluation repeats for each configuration.
+    pub(crate) fn warn_once(
+        &self,
+        model: &ProjectModel,
+        kind: MessageKind,
+        policy: Option<rcmake_diag::PolicyId>,
+        location: Location,
+        body: BString,
+    ) {
+        if let Some(text) = self.render_once(model, kind, policy, location, body) {
+            self.host.write_out(Stream::Stderr, &text);
+        }
+    }
+
+    /// Render a warning, or return `None` when this run already reported the same text.
+    pub(crate) fn render_once(
+        &self,
+        model: &ProjectModel,
+        kind: MessageKind,
+        policy: Option<rcmake_diag::PolicyId>,
+        location: Location,
+        body: BString,
+    ) -> Option<BString> {
+        let options = RenderOptions {
+            relative_base: Some(model.dir(DirId::ROOT).source_dir.clone()),
+            ..RenderOptions::default()
+        };
+        let diagnostic = Diagnostic {
+            annotations: None,
+            kind,
+            effect: Effect::None,
+            category: policy.map(|_| rcmake_diag::DiagCategory::Policy),
+            policy,
+            location: generation_source_location(location),
+            body,
+        };
+        let text = render(&diagnostic, &options);
+        self.warnings
+            .borrow_mut()
+            .insert(text.clone())
+            .then_some(text)
     }
 
     fn emit_with_base(

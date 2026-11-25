@@ -541,6 +541,19 @@ impl<'a> Graph<'a> {
                         .order_only
                         .push(OrderOnly::CompilePrerequisites(target_index));
                 }
+                // As in CMake, the link step runs after the target dependencies, so a
+                // tool target that the link rule runs is ready.
+                if matches!(step, BuildStep::Link { .. })
+                    && !dependencies.is_empty()
+                    && self.producers.get(alias) != Some(&index)
+                    && let Some(nodes) = self.steps.get_mut(index)
+                {
+                    nodes
+                        .order_only
+                        .push(OrderOnly::Targets(Cow::Borrowed(dependencies)));
+                    self.order_only_alias_bytes =
+                        self.order_only_alias_bytes.saturating_add(alias_bytes);
+                }
             }
             if let Some(&producer) = self.producers.get(alias)
                 && let Some(nodes) = self.steps.get_mut(producer)

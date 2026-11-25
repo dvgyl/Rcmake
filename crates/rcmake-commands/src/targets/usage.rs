@@ -1,4 +1,5 @@
 use rcmake_base::{BString, list, truth};
+use rcmake_diag::{PolicyId, PolicyStatus};
 use rcmake_eval::{CmdError, CmdResult, Cx, Flow};
 use rcmake_expr::ExpandedArg;
 use rcmake_model::{BT, ModelError, Target, TargetKind, UsageField, UsageScope};
@@ -105,6 +106,9 @@ fn add(cx: &mut Cx<'_>, args: &[ExpandedArg], own: Field, interface: Field) -> C
         BString::default()
     };
     let bt = cx.backtrace();
+    // Before CMP0101, target_compile_options() ignores BEFORE for the target's own options.
+    let own_before = before
+        && (own != Field::CompileOptions || cx.policy(PolicyId::new(101)) == PolicyStatus::New);
     let feature_tables = (own == Field::CompileFeatures).then(|| {
         [
             b"CMAKE_C_COMPILE_FEATURES".as_slice(),
@@ -205,7 +209,7 @@ fn add(cx: &mut Cx<'_>, args: &[ExpandedArg], own: Field, interface: Field) -> C
         cx.project()
             .update_target_properties(id, fields, origin, |target| {
                 if scope != UsageScope::Interface {
-                    record(target, own, BT::new(value.clone(), bt.clone()), before);
+                    record(target, own, BT::new(value.clone(), bt.clone()), own_before);
                     if system && scope == UsageScope::Private && !value.is_empty() {
                         target
                             .props

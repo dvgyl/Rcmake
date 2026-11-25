@@ -227,9 +227,21 @@ impl UsageResolver<'_> {
                     output_dir: BString::default(),
                 }));
             }
-            return Ok(imported_artifact(
-                target, kind, config, import, prefix, suffix,
-            ));
+            let artifact =
+                imported_artifact(target, kind, config, import, prefix.clone(), suffix.clone());
+            // A stub library in IMPORTED_IMPLIB can replace IMPORTED_LOCATION for linking
+            // on platforms without DLLs.
+            let stub = artifact.is_none()
+                && !import
+                && kind == LinkerFile
+                && (target.kind == SharedLibrary
+                    || (target.kind == Executable && on(target, b"ENABLE_EXPORTS")));
+            if stub {
+                return Ok(imported_artifact(
+                    target, kind, config, true, prefix, suffix,
+                ));
+            }
+            return Ok(artifact);
         }
 
         self.local_artifact(

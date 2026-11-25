@@ -189,6 +189,11 @@ fn runtime_dll_queries_validate_targets_and_evaluate_links_on_darwin() {
         error_text(run(b"$<TARGET_RUNTIME_DLLS:head>", &ctx, &mut host)),
         "The SOURCES of \"head\" use a generator expression that depends on the SOURCES themselves."
     );
+    // The caller reports this error at the target that it names.
+    assert!(matches!(
+        run(b"$<TARGET_RUNTIME_DLLS:head>", &ctx, &mut host),
+        Err(GenexError::SourcesCycle { target }) if target == "head"
+    ));
 }
 
 #[test]

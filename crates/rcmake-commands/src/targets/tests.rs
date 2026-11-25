@@ -341,6 +341,7 @@ fn local_imports_and_aliases_follow_directory_visibility() -> TestResult {
 fn sets_properties_and_applies_usage_scopes_and_order() -> TestResult {
     let (_, mut interp) = configure(
         r#"
+        cmake_policy(SET CMP0101 NEW)
         add_library(lib STATIC lib.c)
         add_library(other INTERFACE)
         add_library(ns::lib ALIAS lib)
@@ -389,6 +390,35 @@ fn sets_properties_and_applies_usage_scopes_and_order() -> TestResult {
         ("compile", "-Wall;SHELL:-I path"),
         ("link", "SHELL:-X foo"),
         ("dirs", "/work/src/./lib;$<1:unchanged>"),
+    ] {
+        var(&mut interp, name, value);
+    }
+    Ok(())
+}
+
+#[test]
+fn compile_options_honor_before_only_with_cmp0101() -> TestResult {
+    let (_, mut interp) = configure(
+        r#"
+        cmake_policy(SET CMP0101 OLD)
+        add_library(old STATIC lib.c)
+        target_compile_options(old PRIVATE -UX)
+        target_compile_options(old BEFORE PUBLIC -DX)
+        cmake_policy(SET CMP0101 NEW)
+        add_library(new STATIC lib.c)
+        target_compile_options(new PRIVATE -UX)
+        target_compile_options(new BEFORE PRIVATE -DX)
+        get_target_property(old_own old COMPILE_OPTIONS)
+        get_target_property(old_api old INTERFACE_COMPILE_OPTIONS)
+        get_target_property(new_own new COMPILE_OPTIONS)
+    "#,
+        &[],
+        0,
+    )?;
+    for (name, value) in [
+        ("old_own", "-UX;-DX"),
+        ("old_api", "-DX"),
+        ("new_own", "-DX;-UX"),
     ] {
         var(&mut interp, name, value);
     }

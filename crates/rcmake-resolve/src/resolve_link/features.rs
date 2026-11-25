@@ -222,7 +222,13 @@ impl<'a, 'host> Features<'a, 'host> {
             return Err(describe("supported"));
         }
         let value = find(&variable).ok_or_else(|| describe("defined"))?;
-        let mut elements = list::split(value, list::Empty::Keep).into_iter();
+        // CMake keeps empty elements here, so an empty value is one empty element.
+        let mut elements = if value.is_empty() {
+            vec![BString::default()]
+        } else {
+            list::split(value, list::Empty::Keep)
+        }
+        .into_iter();
         let malformed = |reason| {
             self.error(format!(
             "Feature '{feature}', specified by variable '{variable}', is malformed ({reason}) and cannot be used to link target '{target}'."

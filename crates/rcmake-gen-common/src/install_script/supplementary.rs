@@ -13,7 +13,7 @@ use rcmake_host::{
 };
 use rcmake_model::{
     DirId, ExportKind, InstallKind, InstallOptions, InstallRule, ProjectMetadata, ProjectModel,
-    SbomSpec,
+    SbomSpec, UsageScope,
 };
 use rcmake_resolve::{
     BuildStep, GenerationResult, InstallAction, InstallActionKind, InstallManifest,
@@ -402,7 +402,13 @@ impl Outputs {
             .definition(rule.dir, b"CMAKE_INSTALL_INCLUDEDIR")
             .map_or(b"include".as_slice(), |value| value.as_slice());
         for target in targets.iter().filter_map(|&id| model.target(id)) {
-            for set in target.file_sets.iter().filter_map(|&id| model.file_set(id)) {
+            // CMake installs only the file sets that consumers see (the interface sets).
+            for set in target
+                .file_sets
+                .iter()
+                .filter_map(|&id| model.file_set(id))
+                .filter(|set| set.scope != UsageScope::Private)
+            {
                 let Some(options) = options_for_set(model, index, &set.name) else {
                     continue;
                 };

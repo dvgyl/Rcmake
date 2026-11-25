@@ -525,10 +525,7 @@ impl Evaluator<'_> {
         )? {
             DAGEntry::Entered(active) => active,
             DAGEntry::SelfReference | DAGEntry::CyclicReference => {
-                return Err(GenexError::Message {
-                    expression: BString::default(),
-                    message: format!("The SOURCES of \"{name}\" use a generator expression that depends on the SOURCES themselves.").into(),
-                });
+                return Err(GenexError::SourcesCycle { target: name });
             }
         };
         let ctx = EvalContext {

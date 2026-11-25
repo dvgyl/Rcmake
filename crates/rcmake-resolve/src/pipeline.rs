@@ -38,6 +38,7 @@ use cross::CrossPlan;
 mod file_set_membership;
 mod header_verify;
 mod intdir;
+mod link_tags;
 mod rule_output_sets;
 
 /// Resolve and lower the project in configuration order.
@@ -79,6 +80,7 @@ fn resolve_project(
     let model = rules.as_ref().unwrap_or(model);
     crate::exports::source_sets::validate(model)?;
     intdir::validate(model, host)?;
+    link_tags::validate(model, host)?;
     file_set_membership::validate(model, host)?;
     lower::warn_about_wrappers(model, host);
     lower::custom::warn_depfile_policy(model, host);

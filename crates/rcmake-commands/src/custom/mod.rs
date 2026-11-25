@@ -7,7 +7,7 @@ use rcmake_diag::{DiagCategory, Effect, MessageKind, PolicyId, PolicyStatus};
 use rcmake_eval::{CmdError, CmdFlags, CmdResult, Cx, Flow, Registry};
 use rcmake_expr::ExpandedArg;
 use rcmake_genex::{ConfigId, EvalContext, EvalSite, evaluate, find_genex, parse};
-use rcmake_host::path::{from_native, to_native};
+use rcmake_host::path::from_native;
 use rcmake_model::{
     BT, CommandId, CustomCommand, CustomCommandKind, DirId, Directory, GeneratorKind, ModelError,
     ProjectModel, Target, TargetBinding, TargetEvent, TargetKind, TargetOrigin,
@@ -811,16 +811,9 @@ fn resolve_paths(
         return Err(CmdError::Reported);
     }
     let base = from_native(&cx.current_binary_dir());
-    for (keyword, paths) in [
-        ("OUTPUT", &mut body.outputs),
-        ("BYPRODUCTS", &mut body.byproducts),
-    ] {
-        for entry in paths {
-            entry.value = binary_path(&base, &entry.value);
-            if validate_outputs && rcmake_genex::find_genex(&entry.value).is_none() {
-                validate_output(cx, keyword, &entry.value)?;
-            }
-        }
+    // The generator checks each path after it evaluates generator expressions.
+    for entry in body.outputs.iter_mut().chain(body.byproducts.iter_mut()) {
+        entry.value = binary_path(&base, &entry.value);
     }
     if let Some(dir) = &mut body.working_directory
         && !dir.is_empty()
@@ -828,21 +821,6 @@ fn resolve_paths(
         *dir = binary_path(&base, dir);
     }
     Ok(())
-}
-
-fn validate_output(cx: &mut Cx<'_>, keyword: &str, path: &BString) -> Result<(), CmdError> {
-    let problem = if !crate::compat::can_write_project_file(cx, &to_native(path)) {
-        format!("{keyword} path\n  {path}\nin a source directory as an output of custom command.")
-    } else if let Some(&invalid) = path.iter().find(|byte| matches!(byte, b'<' | b'>')) {
-        format!(
-            "{keyword} containing a \"{}\" is not allowed.",
-            char::from(invalid)
-        )
-    } else {
-        return Ok(());
-    };
-    cx.issue(MessageKind::Error, Effect::SetError, None, problem.into());
-    Err(CmdError::Reported)
 }
 
 fn binary_path(base: &[u8], value: &[u8]) -> BString {

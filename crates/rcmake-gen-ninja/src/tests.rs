@@ -13,11 +13,13 @@ use super::{
 };
 
 pub(super) fn read(host: &PureHost, file: &str) -> String {
+    read_in(host, Path::new("/work/build"), file)
+}
+
+/// Read a generated file below `dir`, which can be a Windows-style root.
+pub(super) fn read_in(host: &PureHost, dir: &Path, file: &str) -> String {
     let bytes = host
-        .read(
-            &Path::new("/work/build").join(file),
-            ReadRange::All { limit: 100_000 },
-        )
+        .read(&dir.join(file), ReadRange::All { limit: 100_000 })
         .unwrap_or_else(|error| panic!("{file}: {error}"));
     String::from_utf8(bytes).unwrap_or_else(|error| panic!("{error}"))
 }
@@ -126,7 +128,7 @@ fn single_config_writes_rules_edges_and_utilities() {
         "  pool = slow",
         "build obj/a$ $$$:file.o: COMPILE_DEPFILE /work/src/a$ $$$:file.c || generated$ $$$:file",
         "  DEP_FILE = obj/a $$:file.d",
-        "build libshared.so: LINK_SHARED_LIBRARY obj/a$ $$$:file.o",
+        "build libshared.so: LINK_SHARED_LIBRARY obj/a$ $$$:file.o || generate",
         "  DESC = Linking C shared library libshared.so",
         "build shared: phony obj/a$ $$$:file.o libshared.so generate",
         "build generate: phony generated$ $$$:file include${ninja_pipe}generated.h",
@@ -394,7 +396,9 @@ fn target_dependencies_use_the_library_when_its_name_matches_an_executable_outpu
         for line in [
             format!("build {library_alias}: phony libsqlite3.a"),
             "build shell.o: COMPILE shell.c".to_owned(),
-            format!("build {executable_node}: LINK_EXECUTABLE shell.o libsqlite3.a"),
+            format!(
+                "build {executable_node}: LINK_EXECUTABLE shell.o libsqlite3.a || {library_alias}"
+            ),
             format!("build all{suffix}: phony {library_alias} sqlite_shell{suffix}"),
         ] {
             assert!(
@@ -872,7 +876,7 @@ fn multi_config_utilities_alias_default_and_cross_configurations()
     )?;
     generate_multi_config(&result, &host, &dir)?;
 
-    let entry = read(&host, "build.ninja");
+    let entry = read_in(&host, &dir, "build.ninja");
     for utility in ["install", "install/local", "test"] {
         assert!(entry.contains(&format!(
             "build {utility}: phony {utility}$:Debug {utility}$:Release\n"
@@ -883,7 +887,7 @@ fn multi_config_utilities_alias_default_and_cross_configurations()
     }
     assert!(!entry.contains("CMakeFiles/install.util"));
 
-    let implementation = read(&host, "CMakeFiles/impl-Debug.ninja");
+    let implementation = read_in(&host, &dir, "CMakeFiles/impl-Debug.ninja");
     for config in ["Debug", "Release", "RelWithDebInfo"] {
         assert!(implementation.contains(&format!(
             "build CMakeFiles/{config}/install.util: CUSTOM_COMMAND all$:{config}\n"
@@ -894,7 +898,7 @@ fn multi_config_utilities_alias_default_and_cross_configurations()
     }
     assert!(implementation.contains("-DCMAKE_INSTALL_CONFIG_NAME=Release -P cmake_install.cmake"));
 
-    let release = read(&host, "build-Release.ninja");
+    let release = read_in(&host, &dir, "build-Release.ninja");
     assert!(release.contains("build install: phony install$:Release\n"));
     assert!(!release.contains("build install$:all:"));
     Ok(())

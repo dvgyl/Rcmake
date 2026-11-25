@@ -395,6 +395,10 @@ pub trait GenexHost {
         None
     }
 
+    /// Report a warning from evaluation, for example an invalid configuration name that
+    /// CMake accepts for compatibility. The body is the complete message text.
+    fn warning(&mut self, _body: BString, _ctx: &EvalContext) {}
+
     /// Return the execution limits for generator expressions.
     fn limits(&self) -> rcmake_base::Limits {
         rcmake_base::Limits::default()
@@ -469,6 +473,15 @@ pub enum GenexError {
         target: BString,
         /// Output property class.
         property: &'static str,
+    },
+    /// `$<TARGET_RUNTIME_DLLS>` needs the link closure of a target that is still being
+    /// computed. CMake reports this at the call that created the target.
+    #[error(
+        "The SOURCES of \"{target}\" use a generator expression that depends on the SOURCES themselves."
+    )]
+    SourcesCycle {
+        /// Name of the target whose sources depend on themselves.
+        target: BString,
     },
     /// A generator expression failure with its originating call stack.
     #[error("{0}")]

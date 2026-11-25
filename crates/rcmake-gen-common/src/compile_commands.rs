@@ -12,10 +12,13 @@ use crate::{GenError, write_if_changed};
 
 /// Render `compile_commands.json` for one build graph.
 pub fn render(graph: &BuildGraph, build_dir: &[u8]) -> Result<BString, GenError> {
-    render_with_directories(std::iter::once(graph), build_dir, &HashMap::new())
+    render_with_directories(std::iter::once(graph), build_dir, &HashMap::new(), false)
 }
 
 /// Render `compile_commands.json` with the selected generator's path conventions.
+///
+/// The Ninja generators write an absolute `output` path and end the file with a
+/// newline. Makefiles write the object path relative to the build root.
 pub fn render_for_generator(
     result: &GenerationResult,
     graph: &BuildGraph,
@@ -23,10 +26,10 @@ pub fn render_for_generator(
     generator: GeneratorKind,
 ) -> Result<BString, GenError> {
     if generator == GeneratorKind::NinjaMultiConfig {
-        return render_with_directories(&result.graphs, build_dir, &HashMap::new());
+        return render_with_directories(&result.graphs, build_dir, &HashMap::new(), true);
     }
     if generator != GeneratorKind::UnixMakefiles {
-        return render(graph, build_dir);
+        return render_with_directories(std::iter::once(graph), build_dir, &HashMap::new(), true);
     }
 
     let directories = result
@@ -42,13 +45,14 @@ pub fn render_for_generator(
             })
         })
         .collect();
-    render_with_directories(std::iter::once(graph), build_dir, &directories)
+    render_with_directories(std::iter::once(graph), build_dir, &directories, false)
 }
 
 fn render_with_directories<'a>(
     graphs: impl IntoIterator<Item = &'a BuildGraph>,
     build_dir: &[u8],
     directories: &HashMap<&[u8], &[u8]>,
+    ninja_style: bool,
 ) -> Result<BString, GenError> {
     let mut out = BString::from("[");
     let mut separator = b"\n".as_slice();
@@ -98,13 +102,20 @@ fn render_with_directories<'a>(
         out.extend_from_slice(b",\n  \"file\": ");
         json_string(&mut out, source);
         out.extend_from_slice(b",\n  \"output\": ");
-        json_string(&mut out, object);
+        if ninja_style && !Lexical::new(object).absolute() {
+            json_string(&mut out, &Lexical::new(build_dir).append(object));
+        } else {
+            json_string(&mut out, object);
+        }
         out.extend_from_slice(b"\n}");
     }
     if separator == b",\n" {
         out.push(b'\n');
     }
     out.push(b']');
+    if ninja_style {
+        out.push(b'\n');
+    }
     Ok(out)
 }
 
@@ -268,7 +279,6 @@ mod tests {
         let result = subdirectory_project(generator, "/out/sub");
         let graph = &result.graphs[0];
         let output = render_for_generator(&result, graph, b"/out", generator).unwrap();
-        assert_eq!(output, render(graph, b"/out").unwrap());
         assert_eq!(
             output.to_string(),
             r#"[
@@ -276,9 +286,10 @@ mod tests {
   "directory": "/out",
   "command": "cc   -o sub/CMakeFiles/sublib.dir/a.c.o -c /src/sub/a.c",
   "file": "/src/sub/a.c",
-  "output": "sub/CMakeFiles/sublib.dir/a.c.o"
+  "output": "/out/sub/CMakeFiles/sublib.dir/a.c.o"
 }
-]"#
+]
+"#
         );
     }
 

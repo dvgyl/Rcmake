@@ -50,7 +50,7 @@ pub(crate) use artifacts::{
 pub use artifacts::{compute_artifacts, linker_language, object_path, source_language};
 pub(crate) use artifacts::{object_dir, short_object_paths};
 pub(crate) use compile::language_flags;
-pub(crate) use custom::command_outputs;
+pub(crate) use custom::{checked_command_outputs, command_outputs};
 pub use graph::lower;
 pub(crate) use graph::lower_with_inputs;
 pub(crate) use install::lower_install_manifest_with_configs;
