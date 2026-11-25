@@ -16,7 +16,7 @@
 
 # rcmake
 
-`rcmake` is a clean-room replacement for CMake 4.5.1 written in safe Rust (`#![forbid(unsafe_code)]`, 34 crates). One binary provides `cmake`, `ctest`, and `cpack`. It reads the same `CMakeLists.txt` files, presets, and cache files as CMake 4.5.1 and writes compatible build trees. A companion binary, `rcmake-lsp`, provides Language Server Protocol support for CMake files.
+`rcmake` is a clean-room replacement for CMake 4.5.1 written in safe Rust (`#![forbid(unsafe_code)]`, 35 crates). One binary provides `cmake`, `ctest`, and `cpack`. It reads the same `CMakeLists.txt` files, presets, and cache files as CMake 4.5.1 and writes compatible build trees. A companion binary, `rcmake-lsp`, provides Language Server Protocol support for CMake files.
 
 The Rust engine in `crates/` and tooling in `tools/` are licensed under `MIT OR Apache-2.0`. `rcmake` bundles the CMake 4.5.1 `Modules/`, `Templates/`, and rendered `Help/` files under their original `BSD-3-Clause` licence with all copyright notices preserved.
 
