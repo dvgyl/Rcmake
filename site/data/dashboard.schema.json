@@ -393,14 +393,21 @@
     },
     "differentialFuzzReport": {
       "type": "object",
-      "required": ["status", "total", "passed", "failed", "oracleErrors"],
+      "required": ["status", "oracleErrors"],
       "properties": {
         "label": { "type": "string" },
         "status": { "$ref": "#/$defs/status" },
         "seed": { "type": ["integer", "null"] },
+        "seeds": {
+          "type": "array",
+          "items": { "type": "integer" }
+        },
         "total": { "type": ["integer", "null"], "minimum": 0 },
         "passed": { "type": ["integer", "null"], "minimum": 0 },
         "failed": { "type": ["integer", "null"], "minimum": 0 },
+        "casesTotal": { "type": ["integer", "null"], "minimum": 0 },
+        "casesPassed": { "type": ["integer", "null"], "minimum": 0 },
+        "mismatches": { "type": ["integer", "null"], "minimum": 0 },
         "oracleErrors": { "type": ["integer", "null"], "minimum": 0 },
         "scriptCases": { "type": ["integer", "null"], "minimum": 0 },
         "configureCases": { "type": ["integer", "null"], "minimum": 0 },
