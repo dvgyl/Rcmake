@@ -281,6 +281,7 @@ pub(crate) struct SourcePaths<'a> {
     pub(crate) xcframeworks: crate::xcframework::Plists,
     pub(crate) ide: Option<crate::ide::IdeFlavor>,
     pub(crate) collect_source_errors: bool,
+    pub(crate) ninja_cxx_dyndep: Option<bool>,
     extension_warnings: RefCell<IndexSet<(BString, BString)>>,
     missing: RefCell<IndexSet<(BString, BString)>>,
     /// Rendered generation warnings, so that a repeated evaluation warns once.
@@ -300,6 +301,7 @@ impl<'a> SourcePaths<'a> {
             xcframeworks: crate::xcframework::Plists::default(),
             ide: None,
             collect_source_errors: true,
+            ninja_cxx_dyndep: None,
             extension_warnings: RefCell::default(),
             missing: RefCell::default(),
             warnings: RefCell::default(),

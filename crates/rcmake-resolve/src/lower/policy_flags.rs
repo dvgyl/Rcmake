@@ -63,7 +63,10 @@ impl<'a> Flags<'a> {
                 self.extend(&mut flags, b"COMPILE_OPTIONS_PIE");
             } else if self.option(b"COMPILE_OPTIONS_PIC").is_some() {
                 self.extend(&mut flags, b"COMPILE_OPTIONS_PIC");
-            } else if self.option(b"COMPILER_ID").is_none() {
+            } else if self.option(b"COMPILER_ID").is_none()
+                && !matches!(self.language, b"RC" | b"ASM_MASM" | b"ASM_NASM")
+                && !super::artifacts::is_dll_platform(self.model, self.target.dir)
+            {
                 flags.push(if self.target.kind == TargetKind::Executable {
                     "-fPIE".into()
                 } else {

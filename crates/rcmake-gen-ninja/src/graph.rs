@@ -19,8 +19,10 @@ use crate::{generation_error, modules};
 
 mod aliases;
 mod implicit;
+pub(crate) use implicit::CustomOwners;
 mod order;
 mod plan;
+mod response;
 
 pub(crate) struct Graph<'a> {
     pub(crate) input: &'a BuildGraph,
@@ -32,6 +34,7 @@ pub(crate) struct Graph<'a> {
     pub(crate) clean_files: BTreeSet<BString>,
     pub(crate) command_settings: crate::response::Settings<'a>,
     custom_scripts: HashMap<BString, BString>,
+    link_commands: HashMap<BString, response::LinkCommand>,
     names: HashMap<BString, usize>,
     fortran_info: HashMap<&'a [u8], &'a rcmake_resolve::FortranTargetInfo>,
     scan_responses: HashMap<&'a [u8], &'a ScanResponse>,
@@ -99,6 +102,7 @@ impl<'a> Graph<'a> {
             clean_files: BTreeSet::new(),
             command_settings: crate::response::Settings::default(),
             custom_scripts: HashMap::new(),
+            link_commands: HashMap::new(),
             names: HashMap::with_capacity(input.targets.len()),
             fortran_info: HashMap::new(),
             scan_responses: HashMap::new(),
@@ -134,7 +138,14 @@ impl<'a> Graph<'a> {
         for (index, step) in input.steps.iter().enumerate() {
             let mut nodes = StepNodes::default();
             match step {
-                BuildStep::Compile { object, .. } => nodes.outputs.push(graph.node(object)),
+                BuildStep::Compile {
+                    object, byproducts, ..
+                } => {
+                    nodes.outputs.push(graph.node(object));
+                    nodes
+                        .byproducts
+                        .extend(byproducts.iter().map(|output| graph.node(output)));
+                }
                 BuildStep::Link { step, .. } => nodes.outputs.push(graph.node(&step.output)),
                 BuildStep::DeviceLink { output, mode, .. } => {
                     nodes.outputs.push(graph.node(output));
@@ -312,30 +323,6 @@ impl<'a> Graph<'a> {
             &path::from_native(self.build_dir),
             !self.prefix.is_empty(),
         )
-    }
-
-    pub(crate) fn prepare_custom_scripts(&mut self, host: &dyn Host) -> Result<(), GenError> {
-        let build = path::from_native(self.build_dir);
-        for (step, nodes) in self.input.steps.iter().zip(&self.steps) {
-            let BuildStep::Custom(custom) = step else {
-                continue;
-            };
-            let Some(output) = nodes.outputs.first() else {
-                continue;
-            };
-            let Some(script) =
-                self.commands
-                    .custom_script(&custom.invocations, &build, !self.prefix.is_empty())
-            else {
-                continue;
-            };
-            let digest = rcmake_base::hash::HashAlgo::Sha256.hex_digest(&script);
-            let name = format!("CMakeFiles/rcmake-custom-{digest}.cmd");
-            crate::write_if_changed(host, &self.build_dir.join(&name), &script)?;
-            self.custom_scripts
-                .insert(output.clone(), self.node(name.as_bytes()));
-        }
-        Ok(())
     }
 
     pub(crate) fn has_target(&self, name: &BString) -> bool {
@@ -563,7 +550,9 @@ impl<'a> Graph<'a> {
         modmap_flag: &[u8],
         exports: &[ModuleExportJob],
     ) -> Result<(), GenError> {
-        self.emit_into(ninja, cmake, modmap_flag, exports, None)
+        let owners = CustomOwners::new(std::iter::once(self));
+        let inputs = self.inherited_custom_inputs(self, &owners, false);
+        self.emit_into(ninja, cmake, modmap_flag, exports, None, &inputs)
     }
 
     pub(crate) fn emit_into(
@@ -573,6 +562,7 @@ impl<'a> Graph<'a> {
         modmap_flag: &[u8],
         exports: &[ModuleExportJob],
         mut emitted: Option<&mut HashSet<BString>>,
+        custom_inputs: &BTreeMap<usize, Vec<BString>>,
     ) -> Result<(), GenError> {
         for (index, (step, nodes)) in self.input.steps.iter().zip(&self.steps).enumerate() {
             if self.input.native_custom_steps.contains(&index) {
@@ -590,12 +580,28 @@ impl<'a> Graph<'a> {
                     let mut unique = nodes.clone();
                     unique.byproducts.retain(|node| !emitted.contains(node));
                     emitted.extend(unique.outputs.iter().chain(&unique.byproducts).cloned());
-                    self.emit_step(ninja, step, &unique, cmake, modmap_flag, exports)?;
+                    self.emit_step(
+                        ninja,
+                        step,
+                        &unique,
+                        cmake,
+                        modmap_flag,
+                        exports,
+                        custom_inputs.get(&index),
+                    )?;
                     continue;
                 }
                 emitted.extend(nodes.outputs.iter().chain(&nodes.byproducts).cloned());
             }
-            self.emit_step(ninja, step, nodes, cmake, modmap_flag, exports)?;
+            self.emit_step(
+                ninja,
+                step,
+                nodes,
+                cmake,
+                modmap_flag,
+                exports,
+                custom_inputs.get(&index),
+            )?;
         }
 
         let mut all = Vec::new();
@@ -713,6 +719,7 @@ impl<'a> Graph<'a> {
         cmake: &[u8],
         modmap_flag: &[u8],
         exports: &[ModuleExportJob],
+        custom_inputs: Option<&Vec<BString>>,
     ) -> Result<(), GenError> {
         let mut language_inputs = Vec::new();
         let mut plan = match step {
@@ -757,7 +764,11 @@ impl<'a> Graph<'a> {
             .as_ref()
             .map_or(&[][..], |plan| plan.order_only.as_slice());
         let mut order_only = Vec::new();
-        if dyndep.is_some() || !nodes.order_only.is_empty() || !planned.is_empty() {
+        if dyndep.is_some()
+            || !nodes.order_only.is_empty()
+            || !planned.is_empty()
+            || custom_inputs.is_some()
+        {
             let mut seen: HashSet<_> = inputs
                 .iter()
                 .chain(&implicit)
@@ -766,6 +777,12 @@ impl<'a> Graph<'a> {
                 .collect();
             order_only.extend(dyndep.into_iter().filter(|node| seen.insert(node)));
             order_only.extend(planned.iter().filter(|node| seen.insert(node)));
+            order_only.extend(
+                custom_inputs
+                    .into_iter()
+                    .flatten()
+                    .filter(|node| seen.insert(node)),
+            );
             for entry in &nodes.order_only {
                 match entry {
                     OrderOnly::Targets(indices) => order_only.extend(

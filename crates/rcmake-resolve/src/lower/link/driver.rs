@@ -313,6 +313,11 @@ fn archive_invocations(
         if start == 0 { create } else { append },
         objects.get(start..).unwrap_or_default(),
     ));
+    for command in &mut commands {
+        if let Some(response) = &mut command.link_response {
+            response.archive_batch = true;
+        }
+    }
     commands.extend(expand(finish, &[]));
     commands
 }

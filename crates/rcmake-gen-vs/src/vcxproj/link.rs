@@ -144,12 +144,36 @@ impl Context<'_> {
                 }
                 IdeLinkItem::Library(name) if !archive => libraries.push(library(&string(name))),
                 IdeLinkItem::Flag(flag) => flags.push(string(flag)),
+                IdeLinkItem::VisualStudioFeature { item, template } if !archive => {
+                    let library = match item.as_ref() {
+                        IdeLinkItem::Target(id) => self.target_library(*id, config),
+                        IdeLinkItem::File(file) => Some(windows(&string(file))),
+                        _ => None,
+                    };
+                    if let Some(library) = library {
+                        let template = string(template);
+                        let template = template.strip_prefix("LINKER:").unwrap_or(&template);
+                        libraries.push(
+                            template
+                                .replace("<LIBRARY>", &library)
+                                .replace("<LINK_ITEM>", &library),
+                        );
+                    }
+                }
                 _ => {}
             }
         }
         let mut out = flags_table::link(flags, archive);
         for library in libraries {
-            out.list("AdditionalDependencies", msbuild(&library));
+            if ide.pch.iter().any(|pch| {
+                pch.companion
+                    .as_ref()
+                    .is_some_and(|path| windows(&string(path)) == library)
+            }) {
+                out.list_unique("AdditionalDependencies", msbuild(&library));
+            } else {
+                out.list("AdditionalDependencies", msbuild(&library));
+            }
         }
         for dir in &ide.link_directories {
             out.list(
@@ -229,11 +253,13 @@ impl Context<'_> {
             .targets
             .iter()
             .find(|fact| fact.id == id && fact.config.0.as_slice() == config.as_bytes());
-        let sources: Vec<_> = if let Some(ide) = fact.and_then(|fact| fact.ide.as_deref()) {
+        let ide = fact.and_then(|fact| fact.ide.as_deref());
+        let sources: Vec<_> = if let Some(ide) = ide {
             ide.sources
                 .iter()
                 .filter(|source| {
                     matches!(source.kind, IdeSourceKind::Compile { .. })
+                        && !ide.pch.iter().any(|pch| pch.source == source.path)
                         && !source
                             .excluded_configs
                             .iter()
@@ -299,6 +325,18 @@ impl Context<'_> {
                     fact,
                 ))
             })
+            .chain(
+                ide.into_iter()
+                    .flat_map(|ide| &ide.pch)
+                    .filter(|pch| {
+                        pch.reuse_from.is_none_or(|owner| {
+                            self.model
+                                .target(owner)
+                                .is_some_and(|target| target.kind == TargetKind::ObjectLibrary)
+                        })
+                    })
+                    .filter_map(|pch| pch.companion.as_ref().map(|path| windows(&string(path)))),
+            )
             .collect()
     }
 }

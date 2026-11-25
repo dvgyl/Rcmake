@@ -146,6 +146,27 @@ fn path_list(paths: &[String]) -> String {
         .join(";")
 }
 
+pub(crate) fn verify_globs(
+    settings: &Settings,
+    project: &Project,
+    inputs: &[String],
+) -> Option<Rule> {
+    inputs
+        .contains(&join(&settings.bin, rcmake_gen_common::glob::STAMP))
+        .then(|| Rule {
+            commands: vec![Command {
+                argv: vec![
+                    settings.cmake.clone(),
+                    "-P".into(),
+                    join(&settings.bin, rcmake_gen_common::glob::SCRIPT),
+                ],
+                dir: project.dir.clone(),
+            }],
+            message: "Check glob results".into(),
+            ..Rule::default()
+        })
+}
+
 pub(crate) fn regeneration(settings: &Settings, project: &Project, inputs: &[String]) -> Rule {
     let stamp = join(&settings.bin, "CMakeFiles/generate.stamp");
     Rule {

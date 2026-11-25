@@ -1,5 +1,5 @@
 use indexmap::IndexMap;
-use rcmake_base::{BString, list};
+use rcmake_base::BString;
 
 use super::install::{cmake_quote, cmake_quoted_content};
 
@@ -67,28 +67,7 @@ impl RuntimeEdit {
                 });
             }
             Self::MachO(edit) => {
-                if edit.old != edit.new {
-                    let name = if edit.new.is_empty() {
-                        b"RPATH_REMOVE".as_slice()
-                    } else {
-                        b"RPATH_CHANGE"
-                    };
-                    command.extend_from_slice(
-                        &[b"file(".as_slice(), name, b" FILE ", &path, b" OLD_RPATH "].concat(),
-                    );
-                    cmake_quote(&mut command, &runtime_list(&edit.old));
-                    if !edit.new.is_empty() {
-                        command.extend_from_slice(b" NEW_RPATH ");
-                        cmake_quote(&mut command, &runtime_list(&edit.new));
-                    }
-                    command.extend_from_slice(b" INSTALL_NAME_TOOL ");
-                    cmake_quote(&mut command, &edit.tool);
-                    command.push(b')');
-                }
                 if edit.install_name.is_some() || !edit.changes.is_empty() {
-                    if !command.is_empty() {
-                        command.push(b'\n');
-                    }
                     command.extend_from_slice(b"execute_process(COMMAND ");
                     cmake_quote(&mut command, &edit.tool);
                     if let Some(name) = &edit.install_name {
@@ -104,6 +83,27 @@ impl RuntimeEdit {
                     command.push(b' ');
                     command.extend_from_slice(&path);
                     command.extend_from_slice(b" COMMAND_ERROR_IS_FATAL ANY)");
+                }
+                let remove = edit.old.iter().filter(|path| !edit.new.contains(path));
+                let add = edit.new.iter().filter(|path| !edit.old.contains(path));
+                let mut arguments = BString::default();
+                for (flag, path) in remove
+                    .map(|path| (b"\n  -delete_rpath ".as_slice(), path))
+                    .chain(add.map(|path| (b"\n  -add_rpath ".as_slice(), path)))
+                {
+                    arguments.extend_from_slice(flag);
+                    cmake_quote(&mut arguments, path);
+                }
+                if !arguments.is_empty() {
+                    if !command.is_empty() {
+                        command.push(b'\n');
+                    }
+                    command.extend_from_slice(b"execute_process(COMMAND ");
+                    cmake_quote(&mut command, &edit.tool);
+                    command.extend_from_slice(&arguments);
+                    command.extend_from_slice(b"\n  ");
+                    command.extend_from_slice(&path);
+                    command.push(b')');
                 }
             }
         }
@@ -227,19 +227,6 @@ fn guard(path: &[u8], command: &[u8], configured: bool) -> BString {
     out.into()
 }
 
-fn runtime_list(paths: &[BString]) -> BString {
-    list::join(paths.iter().map(|path| {
-        let mut encoded = Vec::new();
-        for &byte in path.as_slice() {
-            if byte == b';' {
-                encoded.push(b'\\');
-            }
-            encoded.push(byte);
-        }
-        encoded
-    }))
-}
-
 /// Translate a runtime directory taken from a linker input.
 pub(super) fn translated_link_directory(
     model: &rcmake_model::ProjectModel,
@@ -348,7 +335,10 @@ mod tests {
         });
         let output = edit.render(b"relative lib", b"libsample.1.dylib", false);
         assert_eq!(output, br#"if(EXISTS "$ENV{DESTDIR}${CMAKE_INSTALL_PREFIX}/relative lib/libsample.1.dylib" AND NOT IS_SYMLINK "$ENV{DESTDIR}${CMAKE_INSTALL_PREFIX}/relative lib/libsample.1.dylib")
-    file(RPATH_CHANGE FILE "$ENV{DESTDIR}${CMAKE_INSTALL_PREFIX}/relative lib/libsample.1.dylib" OLD_RPATH "/tmp/lib" NEW_RPATH "@loader_path/../lib" INSTALL_NAME_TOOL "/tools/install name tool")
+    execute_process(COMMAND "/tools/install name tool"
+      -delete_rpath "/tmp/lib"
+      -add_rpath "@loader_path/../lib"
+      "$ENV{DESTDIR}${CMAKE_INSTALL_PREFIX}/relative lib/libsample.1.dylib")
   endif()"#.as_slice());
     }
 }

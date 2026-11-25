@@ -354,6 +354,7 @@ fn lowered_chain(invocations: &[Invocation]) -> Option<Vec<Invocation>> {
                             .map(|argv| Invocation {
                                 argv,
                                 working_dir: invocation.working_dir.clone(),
+
                                 ..Default::default()
                             })
                             .collect()
@@ -474,30 +475,7 @@ fn shell_argument(word: &[u8], out: &mut Vec<u8>, batch: bool, called: bool) {
     }
 }
 
-pub(crate) fn windows_argument(word: &[u8], out: &mut Vec<u8>, force_quote: bool) {
-    if !force_quote && !word.is_empty() && !word.iter().any(|b| matches!(b, b' ' | b'\t' | b'"')) {
-        out.extend_from_slice(word);
-        return;
-    }
-    out.push(b'"');
-    let mut slashes = 0;
-    for &byte in word {
-        if byte == b'\\' {
-            slashes += 1;
-        } else {
-            let count = if byte == b'"' {
-                2 * slashes + 1
-            } else {
-                slashes
-            };
-            out.extend(std::iter::repeat_n(b'\\', count));
-            slashes = 0;
-            out.push(byte);
-        }
-    }
-    out.extend(std::iter::repeat_n(b'\\', 2 * slashes));
-    out.push(b'"');
-}
+pub(crate) use rcmake_gen_common::link_response::windows_argument;
 
 fn posix_line(invocations: &[Invocation], custom: bool) -> Vec<u8> {
     let mut result = Vec::new();

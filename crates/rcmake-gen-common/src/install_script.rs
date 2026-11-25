@@ -3,10 +3,13 @@
 use std::path::Path;
 
 pub(crate) mod file_sets;
+mod strip;
 mod supplementary;
 
 #[cfg(test)]
 mod file_set_tests;
+#[cfg(test)]
+mod strip_tests;
 pub use supplementary::write_supplementary_outputs;
 
 use rcmake_base::BString;
@@ -228,6 +231,13 @@ fn render_payload(
             }
             directory_options(out, options);
             out.extend_from_slice(b")\n");
+        }
+        InstallActionKind::Strip {
+            program,
+            flags,
+            name,
+        } => {
+            strip::render(out, action, indent, program, flags, name);
         }
         InstallActionKind::Script(script) => {
             out.extend_from_slice(b"include(");

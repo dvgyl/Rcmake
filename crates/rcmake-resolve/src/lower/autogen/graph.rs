@@ -307,7 +307,14 @@ impl PlanContext<'_, '_> {
                 .entry(Lexical::new(source).stem_extension(true).0)
                 .or_insert(0usize) += 1;
         }
-        let base_options = target_list(target, b"AUTORCC_OPTIONS");
+        let mut base_options = target_list(target, b"AUTORCC_OPTIONS");
+        if plan.version.0 >= 6
+            && definition(self.model, target.dir, b"QT_FEATURE_zstd")
+                .is_some_and(|value| truth::is_off(value))
+            && !base_options.iter().any(|option| option == b"--no-zstd")
+        {
+            base_options.push("--no-zstd".into());
+        }
         let mut jobs = Vec::new();
         let mut artifacts = BTreeSet::new();
         for (source, file) in &plan.scan.qrc {

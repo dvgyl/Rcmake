@@ -27,6 +27,7 @@ mod legacy;
 mod objects;
 mod projection;
 mod script_policy;
+mod strip;
 mod targets;
 
 pub(crate) use objects::exported_path as exported_object_path;
@@ -43,7 +44,7 @@ pub fn lower_install_manifest(model: &ProjectModel, targets: &[ResolvedTarget]) 
     match lower_install_rules(
         model,
         targets,
-        (&[], &edits),
+        (&[], &edits, None),
         |_, _, _, value| Ok::<_, Infallible>(value.into()),
         |dir, config, source| {
             Ok(crate::sources::install_object_name(model, dir, source, config).unwrap_or_default())
@@ -80,7 +81,7 @@ pub(crate) fn lower_install_manifest_with_configs(
     lower_install_rules(
         model,
         targets,
-        (configs, &edits),
+        (configs, &edits, Some(host)),
         |dir, config, backtrace, value| {
             if !has_genex(value) {
                 return Ok(value.into());
@@ -446,11 +447,12 @@ fn runtime_install_rules<'a>(
 fn lower_install_rules<E>(
     model: &ProjectModel,
     targets: &[ResolvedTarget],
-    (configs, edits): (&[ConfigId], &RuntimeEdits),
+    (configs, edits, host): (&[ConfigId], &RuntimeEdits, Option<&dyn Host>),
     mut eval: impl FnMut(DirId, &ConfigId, &Backtrace, &[u8]) -> Result<BString, E>,
     mut object_name: impl FnMut(DirId, &ConfigId, &[u8]) -> Result<BString, E>,
 ) -> Result<InstallManifest, E> {
     let mut manifest = InstallManifest::default();
+    let mut strip = strip::Tools::new(host);
     let multi = configs.len() > 1 || model.generator.is_some_and(GeneratorKind::multi_config);
     for entry in ordered_entries(model) {
         let (index, rule, export_plan) = match entry {
@@ -488,7 +490,7 @@ fn lower_install_rules<E>(
                     targets::lower(
                         model,
                         (index, rule),
-                        (targets, configs, ids, edits),
+                        (targets, configs, ids, edits, &mut strip),
                         &recorded,
                         &mut manifest,
                         &make_action,

@@ -70,6 +70,7 @@ pub fn generate(
         .iter()
         .any(|target| target.kind == UtilityKind::ZeroCheck)
     {
+        let verify_globs = rcmake_gen_common::glob::write_verification(Some(model), bin, host)?;
         let source = text(&model.dir(DirId::ROOT).source_dir);
         rerun::write(
             host,
@@ -77,6 +78,7 @@ pub fn generate(
             &source,
             &result.metadata,
             &project::cmake(result, model),
+            verify_globs,
         )?;
     }
     Ok(())

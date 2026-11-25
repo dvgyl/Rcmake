@@ -55,6 +55,7 @@ impl DeviceLinkResponseFile {
                 argv,
                 shell: BString::default(),
                 working_dir: invocation.working_dir.clone(),
+                link_response: None,
             },
             arguments,
         ))

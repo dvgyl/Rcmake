@@ -12,9 +12,10 @@ use rcmake_host::{
     CommandSpec, Follow, Host, Input, NativeHost, Output, ProcessResult, ReadRange, RunRequest,
     WriteMode, path,
 };
+use rcmake_model::{BT, DirId, GeneratorKind, ProjectModel, Target, TargetKind, TargetOrigin};
 use rcmake_resolve::{
     BuildGraph, BuildStep, CustomStep, GenerationResult, GraphTarget, Invocation, LinkKind,
-    LinkStep,
+    LinkStep, resolve,
 };
 
 fn invocation(shell: &str) -> Invocation {
@@ -90,6 +91,7 @@ fn run(host: &NativeHost, cwd: &Path, program: &str, args: &[&str]) -> String {
 fn compile(source: &str, object: &str) -> BuildStep {
     let depfile = format!("{object}.d");
     BuildStep::Compile {
+        byproducts: Vec::new(),
         compile_input: None,
         object: object.into(),
         source: source.into(),
@@ -456,4 +458,121 @@ fn native_make_builds_install_and_test_inputs_on_demand() {
     run(&host, root, "/usr/bin/make", &["test_prep"]);
     assert!(exists("user.txt"));
     assert!(read(&host, &root.join("Makefile")).contains("install_prep/runtime:"));
+}
+
+#[test]
+fn long_posix_link_uses_ordered_response_arguments() {
+    long_posix_link_or_archive(false);
+}
+
+#[test]
+fn batched_archive_keeps_each_shell_command_bounded() {
+    long_posix_link_or_archive(true);
+}
+
+fn long_posix_link_or_archive(archive: bool) {
+    let host = NativeHost::new().expect("native host");
+    let temp = TempDir {
+        host: &host,
+        path: run(
+            &host,
+            Path::new("/tmp"),
+            "/usr/bin/mktemp",
+            &["-d", "/tmp/rcmake-make-link.XXXXXX"],
+        )
+        .trim_end()
+        .into(),
+    };
+    let root = &temp.path;
+    let build = root.join("build space");
+    host.create_dir_all(&build).expect("create build directory");
+    let write = |name: &str, content: &[u8]| {
+        host.write(&root.join(name), content, WriteMode::Truncate)
+            .expect("write source");
+    };
+    let build_run = |program, args: &[&str]| run(&host, &build, program, args);
+    write("empty.c", b"/* Empty translation unit. */\n");
+    write("main.c", b"int main(void) { return 0; }\n");
+    build_run("cc", &["-c", "../empty.c", "-o", "empty.o"]);
+    let bytes = host
+        .read(&build.join("empty.o"), ReadRange::All { limit: 64 * 1024 })
+        .expect("read object");
+    let mut model = ProjectModel::default();
+    model.generator = Some(GeneratorKind::UnixMakefiles);
+    model.set_root_dirs(path::from_native(root), path::from_native(&build));
+    for (key, value) in [
+        ("CMAKE_COMMAND", "cmake"),
+        ("CMAKE_C_COMPILER", "cc"),
+        ("CMAKE_AR", "ar"),
+        ("CMAKE_RANLIB", "ranlib"),
+    ] {
+        model
+            .dir_mut(DirId::ROOT)
+            .vars
+            .insert(key.into(), value.into());
+    }
+    let kind = if archive {
+        TargetKind::StaticLibrary
+    } else {
+        TargetKind::Executable
+    };
+    let mut target = Target::new(
+        "long_input".into(),
+        kind,
+        TargetOrigin::Normal,
+        DirId::ROOT,
+        Default::default(),
+        Default::default(),
+    );
+    target
+        .sources
+        .push(BT::new("main.c".into(), Default::default()));
+    const COUNT: usize = 680;
+    let mut last = String::new();
+    let mut total = 0;
+    for index in 0..COUNT {
+        last = format!("object {index:04} $ '.{}.o", "p".repeat(186));
+        let path = build.join(&last);
+        host.write(&path, &bytes, WriteMode::Truncate)
+            .expect("write object");
+        total += last.len();
+        target
+            .sources
+            .push(BT::new(path::from_native(&path), Default::default()));
+    }
+    assert!(total > 128 * 1024);
+    model.add_target(target).expect("add target");
+    let result = resolve(&model, &host, &[]).expect("resolve model");
+    rcmake_gen_make::generate_with_model(&result, &host, &build, &model)
+        .expect("generate build files");
+    let stdout = build_run("make", &["-j2"]);
+    assert!(!stdout.is_empty());
+    if archive {
+        let members = build_run("ar", &["t", "liblong_input.a"]);
+        assert_eq!(
+            members
+                .lines()
+                .filter(|member| !member.starts_with("__.SYMDEF"))
+                .count(),
+            COUNT + 1
+        );
+        assert!(members.lines().any(|member| member == last));
+    } else {
+        build_run("./long_input", &[]);
+    }
+    let output = if archive {
+        "liblong_input.a"
+    } else {
+        "long_input"
+    };
+    let before = host
+        .metadata(&build.join(output), Follow::Yes)
+        .expect("read output")
+        .mtime;
+    build_run("make", &["-j2"]);
+    let after = host
+        .metadata(&build.join(output), Follow::Yes)
+        .expect("read output again")
+        .mtime;
+    assert_eq!(before, after);
 }

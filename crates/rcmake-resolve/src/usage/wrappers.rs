@@ -271,6 +271,7 @@ impl UsageResolver<'_> {
             traversal: Default::default(),
             link_language: None,
             device_link: false,
+            property_read: false,
             command_config: None,
             output_config: None,
         };

@@ -471,6 +471,52 @@ pub struct LinkStep {
     pub output: BString,
 }
 
+/// The quoting rules of the tool that reads a response file.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResponseQuoting {
+    /// GCC-compatible response-file quoting.
+    Gnu,
+    /// Microsoft command-line argument quoting.
+    Msvc,
+}
+
+/// The inputs represented by a response-file span.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResponseRole {
+    /// Object files in link order.
+    Objects,
+    /// Libraries and their accompanying flags in link order.
+    Libraries,
+}
+
+/// An expansion of one link-rule placeholder.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResponseSpan {
+    /// Input role.
+    pub role: ResponseRole,
+    /// Argument indices in the invocation, including any launcher prefix.
+    pub argv: std::ops::Range<usize>,
+    /// Byte indices in the POSIX shell command.
+    pub shell: std::ops::Range<usize>,
+}
+
+/// Response-file settings of a link or archive rule.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LinkResponse {
+    /// Flag that precedes the response path. Trailing whitespace separates the arguments.
+    pub flag: BString,
+    /// Argument quoting used within the response file.
+    pub quoting: ResponseQuoting,
+    /// Explicit object response-file setting, when present.
+    pub objects: Option<bool>,
+    /// Explicit library response-file setting, when present.
+    pub libraries: Option<bool>,
+    /// Ordered input expansions.
+    pub spans: Vec<ResponseSpan>,
+    /// The command is part of an archive create, append, and finish sequence.
+    pub archive_batch: bool,
+}
+
 /// One process invocation.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Invocation {
@@ -480,6 +526,8 @@ pub struct Invocation {
     pub shell: BString,
     /// Working directory (`None` means the build directory).
     pub working_dir: Option<BString>,
+    /// Input spans and tool settings for link response files.
+    pub link_response: Option<Box<LinkResponse>>,
 }
 
 /// A lowered custom command.
@@ -503,6 +551,10 @@ pub struct CustomStep {
     pub job_pool: Option<BString>,
     /// The primary output is a symbolic name, with no file to update.
     pub symbolic: bool,
+    /// Declared outputs that have no file to update.
+    pub symbolic_outputs: Vec<BString>,
+    /// Target dependencies with the configuration used by this command.
+    pub target_dependencies: Vec<(TargetId, ConfigId)>,
 }
 
 /// How the device object is built.
@@ -559,6 +611,8 @@ pub enum BuildStep {
     Compile {
         /// Output object path.
         object: BString,
+        /// Additional files that the compiler creates with the object.
+        byproducts: Vec<BString>,
         /// Source path.
         source: BString,
         /// Preprocessed input used by the compiler, when present.
@@ -649,6 +703,19 @@ pub struct GraphTarget {
     pub in_all: bool,
 }
 
+/// Owners of one registered custom output command.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CustomOutputOwners {
+    /// Command identity in the project model.
+    pub command: rcmake_model::CommandId,
+    /// Target identities of the actual owners.
+    pub targets: IndexSet<TargetId>,
+    /// Use only the command's explicit dependencies.
+    pub explicit_only: bool,
+    /// The command uses a shared output in Ninja Multi-Config.
+    pub shared_output: bool,
+}
+
 /// Lowered build graph of one configuration (layer 3).
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct BuildGraph {
@@ -666,6 +733,10 @@ pub struct BuildGraph {
     pub link_descriptions: IndexMap<BString, BString>,
     /// Custom rule indices that use the native configuration in a cross-config graph.
     pub native_custom_steps: IndexSet<usize>,
+    /// Output command ownership indexed by graph step.
+    pub custom_output_owners: IndexMap<usize, CustomOutputOwners>,
+    /// Project target identities in graph order, before synthetic targets.
+    pub target_ids: Vec<TargetId>,
     /// Steps that run custom target commands.
     pub utility_steps: IndexSet<usize>,
 }

@@ -201,6 +201,7 @@ pub(crate) fn emit_compile(
         depfile,
         modmap: None,
         dyndep: Some(dd),
+        ..
     } = step
     else {
         return false;
@@ -300,6 +301,7 @@ mod tests {
         };
         assert!(emit_scan(&mut ninja, &graph, &scan, &info, &[], &[]));
         let compile = BuildStep::Compile {
+            byproducts: Vec::new(),
             object: "obj/a.o".into(),
             source: "/src/a $.F90".into(),
             compile_input: Some("obj/a.F90-pp.f90".into()),
@@ -332,6 +334,7 @@ mod tests {
         let compile = BuildStep::Compile {
             object: "obj/a.o".into(),
             source: "src/a.f90".into(),
+            byproducts: Vec::new(),
             compile_input: None,
             invocation: Invocation::default(),
             depfile: None,

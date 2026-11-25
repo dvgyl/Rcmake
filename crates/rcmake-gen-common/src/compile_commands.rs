@@ -325,7 +325,7 @@ mod tests {
     fn omits_dependency_flags_from_the_database_command() {
         for flag in ["-MD", "-MMD"] {
             let graph = BuildGraph {
-                steps: vec![BuildStep::Compile { compile_input: None,
+                steps: vec![BuildStep::Compile { byproducts: Vec::new(), compile_input: None,
                     object: "obj file.o".into(),
                     source: "source file.c".into(),
                     depfile: Some("obj file.o.d".into()),

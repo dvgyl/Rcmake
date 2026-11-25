@@ -196,6 +196,12 @@ impl<'a, 'host> Features<'a, 'host> {
         Ok(())
     }
 
+    pub(super) fn visual_studio_whole_archive(&self) -> Option<BString> {
+        let definition = self.definitions.get(&(false, "WHOLE_ARCHIVE".into()))?;
+        let template = alternative(definition.template.as_ref()?, true);
+        (!template.is_empty()).then(|| template.into())
+    }
+
     fn definition(&mut self, group: bool, feature: &BString) -> Result<Definition, ResolveError> {
         let key = (group, feature.clone());
         if let Some(definition) = self.definitions.get(&key) {

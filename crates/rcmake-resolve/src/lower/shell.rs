@@ -80,6 +80,7 @@ pub(super) fn direct(argv: Vec<BString>, working_dir: Option<BString>) -> Invoca
         argv,
         shell,
         working_dir,
+        link_response: None,
     }
 }
 
@@ -94,6 +95,7 @@ pub(super) fn command(shell: BString) -> Invocation {
         argv,
         shell,
         working_dir: None,
+        link_response: None,
     }
 }
 
@@ -112,12 +114,28 @@ fn is_shell_prefix(program: &[u8]) -> bool {
 
 /// Read a simple shell command. Require the shell when an expansion or operator is present.
 pub fn simple_args(shell: &[u8]) -> Option<Vec<BString>> {
+    parse_simple_args(shell, |_, _| {})
+}
+
+pub(super) fn simple_args_spanned(
+    shell: &[u8],
+) -> Option<(Vec<BString>, Vec<std::ops::Range<usize>>)> {
+    let mut ranges = Vec::new();
+    let args = parse_simple_args(shell, |start, end| ranges.push(start..end))?;
+    Some((args, ranges))
+}
+
+fn parse_simple_args(shell: &[u8], mut span: impl FnMut(usize, usize)) -> Option<Vec<BString>> {
     let mut args = Vec::new();
+    let mut start = 0;
     let mut word = BString::default();
     let mut active = false;
     let mut delimiter = None;
-    let mut bytes = shell.iter().copied();
-    while let Some(byte) = bytes.next() {
+    let mut bytes = shell.iter().copied().enumerate();
+    while let Some((index, byte)) = bytes.next() {
+        if !active {
+            start = index;
+        }
         match (delimiter, byte) {
             (Some(b'\''), b'\'') | (Some(b'"'), b'"') => delimiter = None,
             (Some(b'\''), _) => word.push(byte),
@@ -126,7 +144,7 @@ pub fn simple_args(shell: &[u8]) -> Option<Vec<BString>> {
                 active = true;
             }
             (_, b'\\') => {
-                let next = bytes.next()?;
+                let (_, next) = bytes.next()?;
                 if next != b'\n' {
                     if delimiter.is_some() && !matches!(next, b'$' | 0x60 | 0x5c | b'"') {
                         word.push(byte);
@@ -144,6 +162,7 @@ pub fn simple_args(shell: &[u8]) -> Option<Vec<BString>> {
             (None, b' ' | b'\t') => {
                 if active {
                     args.push(std::mem::take(&mut word));
+                    span(start, index);
                     active = false;
                 }
             }
@@ -158,6 +177,7 @@ pub fn simple_args(shell: &[u8]) -> Option<Vec<BString>> {
     }
     if active {
         args.push(word);
+        span(start, shell.len());
     }
     Some(args)
 }

@@ -19,6 +19,7 @@ use crate::sources::{self, SourcePaths, absolute_path};
 use crate::usage::{ModelGenexHost, ObjectPaths, UsageResolver, handle};
 use crate::{ArtifactSet, BuildStep, CrossConfiguration, CustomStep, ResolveError, ResolvedTarget};
 
+mod attachments;
 mod outputs;
 
 pub(crate) use outputs::checked_command_outputs;
@@ -30,9 +31,14 @@ pub(super) struct Commands<'a> {
     config: &'a ConfigId,
     cross: Option<CrossConfiguration<'a>>,
     outputs: IndexMap<BString, usize>,
+    file_outputs: IndexMap<BString, usize>,
+    pub(super) byproduct_owners: IndexMap<BString, TargetId>,
+    attachments: attachments::Attachments,
+    command_dirs: Vec<DirId>,
     inputs: Vec<Vec<BString>>,
     pub(super) codegen: IndexSet<usize>,
     pub(super) native_steps: IndexSet<usize>,
+    pub(super) owners: IndexMap<usize, crate::CustomOutputOwners>,
     dependencies: Vec<IndexSet<TargetId>>,
 }
 
@@ -78,9 +84,14 @@ impl<'a> Commands<'a> {
             config,
             cross,
             outputs: IndexMap::new(),
+            file_outputs: IndexMap::new(),
+            byproduct_owners: attachments::byproduct_owners(model, config, usage)?,
+            attachments: attachments::Attachments::default(),
+            command_dirs: Vec::new(),
             inputs: Vec::new(),
             codegen: IndexSet::new(),
             native_steps: IndexSet::new(),
+            owners: IndexMap::new(),
             dependencies: Vec::new(),
         };
         let mut errors = Vec::new();
@@ -97,7 +108,32 @@ impl<'a> Commands<'a> {
                 }
             };
             let index = steps.len();
-            if commands.shared_output(id) && commands.is_cross() {
+            if !commands
+                .attachments
+                .register(model, (id, command), usage.source_paths(), index)
+            {
+                continue;
+            }
+            let shared_output = commands.shared_output(id);
+            let key = format!(
+                "_RCMAKE_CUSTOM_COMMAND_{}_DEPENDS_EXPLICIT_ONLY",
+                id.index()
+            );
+            let explicit_only = model
+                .dir(command.dir)
+                .props
+                .get(key.as_bytes())
+                .is_some_and(|value| truth::is_on(value));
+            commands.owners.insert(
+                index,
+                crate::CustomOutputOwners {
+                    command: id,
+                    targets: IndexSet::new(),
+                    explicit_only,
+                    shared_output,
+                },
+            );
+            if shared_output && commands.is_cross() {
                 commands.native_steps.insert(index);
             }
             if command.codegen {
@@ -106,6 +142,15 @@ impl<'a> Commands<'a> {
             for path in step.outputs.iter().chain(&step.byproducts) {
                 commands.outputs.entry(path.clone()).or_insert(index);
             }
+            let file_outputs = step.outputs.iter().chain(
+                step.byproducts
+                    .iter()
+                    .filter(|_| model.generator != Some(GeneratorKind::UnixMakefiles)),
+            );
+            for path in file_outputs {
+                commands.file_outputs.entry(path.clone()).or_insert(index);
+            }
+            commands.command_dirs.push(command.dir);
             commands.inputs.push(step.depends.clone());
             commands.dependencies.push(dependencies);
             push(steps, BuildStep::Custom(step));
@@ -115,6 +160,14 @@ impl<'a> Commands<'a> {
 
     pub(super) fn producer(&self, path: &BString) -> Option<usize> {
         self.outputs.get(path).copied()
+    }
+
+    pub(super) fn file_producer(&self, path: &BString) -> Option<usize> {
+        self.file_outputs.get(path).copied()
+    }
+
+    pub(super) fn source_attachment(&self, dir: DirId, path: &BString) -> Option<usize> {
+        self.attachments.get(dir, path)
     }
 
     fn shared_output(&self, id: CommandId) -> bool {
@@ -168,20 +221,25 @@ impl<'a> Commands<'a> {
         eval.host.artifact_dependencies = Some(&artifact_dependencies);
         eval.host.warning_site = Some(command.backtrace.clone());
 
-        for dep in command
-            .main_dependency
-            .iter()
-            .chain(command.depends.iter().map(|entry| &entry.value))
-            .chain(command.implicit_depends.iter().map(|(_, file)| file))
-        {
+        let mut target_dependencies = IndexSet::new();
+        for dep in command.depends.iter().map(|entry| &entry.value) {
             for dep in list::split(&eval.value(dep)?, list::Empty::Drop) {
                 depends.insert(self.dependency_path(
                     command.dir,
                     &dep,
                     paths,
                     command_config,
-                    &mut dependencies,
+                    &mut target_dependencies,
                 ));
+            }
+        }
+        for dep in command
+            .main_dependency
+            .iter()
+            .chain(command.implicit_depends.iter().map(|(_, file)| file))
+        {
+            for dep in list::split(&eval.value(dep)?, list::Empty::Drop) {
+                depends.insert(self.file_dependency(command.dir, &dep, paths));
             }
         }
         let mut invocations = Vec::new();
@@ -278,14 +336,18 @@ impl<'a> Commands<'a> {
                 }));
                 continue;
             }
-            if config == *self.config {
-                dependencies.insert(id);
-            }
+            target_dependencies.insert((id, config.clone()));
             // File inputs also order custom commands whose target has no compile steps.
             if let Some(file) = self.artifact(id, target, &config) {
                 depends.insert(build_relative(self.model, &file));
             }
         }
+        dependencies.extend(
+            target_dependencies
+                .iter()
+                .filter(|(_, config)| config == self.config)
+                .map(|(id, _)| *id),
+        );
         let relative = |paths: Vec<BString>| {
             paths
                 .into_iter()
@@ -294,11 +356,19 @@ impl<'a> Commands<'a> {
                 .into_iter()
                 .collect()
         };
-        let symbolic = outputs.first().is_some_and(|output| {
+        let symbolic = |output: &BString| {
             sources::properties(self.model.dir(command.dir), output)
                 .get(b"SYMBOLIC")
                 .is_some_and(|value| truth::is_on(value))
-        });
+        };
+        let symbolic_outputs = relative(
+            outputs
+                .iter()
+                .filter(|output| symbolic(output))
+                .cloned()
+                .collect(),
+        );
+        let symbolic = outputs.first().is_some_and(symbolic);
         let depfile = depfile.map(|path| self.depfile(command, &path, &outputs, &mut invocations));
         let mut step = CustomStep {
             outputs: relative(outputs),
@@ -310,6 +380,8 @@ impl<'a> Commands<'a> {
             uses_terminal: command.uses_terminal,
             job_pool: command.job_pool.clone(),
             symbolic,
+            symbolic_outputs,
+            target_dependencies: target_dependencies.into_iter().collect(),
         };
         step.byproducts.retain(|path| !step.outputs.contains(path));
         Ok((step, dependencies))
@@ -412,14 +484,12 @@ impl<'a> Commands<'a> {
         dep: &BString,
         paths: Option<&SourcePaths<'_>>,
         command_config: &ConfigId,
-        dependencies: &mut IndexSet<TargetId>,
+        dependencies: &mut IndexSet<(TargetId, ConfigId)>,
     ) -> BString {
         if let Some(id) = self.model.find_target(dir, dep)
             && let Some(target) = self.model.target(id)
         {
-            if command_config == self.config {
-                dependencies.insert(id);
-            }
+            dependencies.insert((id, command_config.clone()));
             return self.artifact(id, target, command_config).map_or_else(
                 || {
                     if command_config == self.config {
@@ -431,6 +501,15 @@ impl<'a> Commands<'a> {
                 |path| build_relative(self.model, &path),
             );
         }
+        self.file_dependency(dir, dep, paths)
+    }
+
+    fn file_dependency(
+        &self,
+        dir: DirId,
+        dep: &BString,
+        paths: Option<&SourcePaths<'_>>,
+    ) -> BString {
         let dir = self.model.dir(dir);
         let source = absolute_path(&dir.source_dir, dep);
         let binary = absolute_path(&dir.binary_dir, dep);
@@ -540,11 +619,17 @@ impl<'a> Commands<'a> {
                 }
                 pending.push((step, true));
                 if let Some(inputs) = self.inputs.get(step) {
-                    pending.extend(
-                        inputs.iter().rev().filter_map(|path| {
-                            self.producer(path).map(|producer| (producer, false))
-                        }),
-                    );
+                    pending.extend(inputs.iter().rev().flat_map(|path| {
+                        self.producer(path)
+                            .into_iter()
+                            .chain(
+                                self.command_dirs
+                                    .get(step)
+                                    .and_then(|dir| self.source_attachment(*dir, path))
+                                    .filter(|attached| *attached != step),
+                            )
+                            .map(|producer| (producer, false))
+                    }));
                 }
             }
         }
@@ -756,10 +841,15 @@ fn merge(recipe: &mut CustomStep, step: CustomStep) {
     recipe.uses_terminal |= step.uses_terminal;
     recipe.job_pool = recipe.job_pool.take().or(step.job_pool);
     recipe.symbolic |= step.symbolic;
+    recipe.symbolic_outputs.extend(step.symbolic_outputs);
+    recipe.target_dependencies.extend(step.target_dependencies);
 }
 
 pub(super) fn remove_own_outputs(recipe: &mut CustomStep) {
     recipe.outputs = unique(std::mem::take(&mut recipe.outputs));
+    recipe
+        .symbolic_outputs
+        .retain(|path| recipe.outputs.contains(path));
     recipe.byproducts = unique(std::mem::take(&mut recipe.byproducts));
     recipe
         .byproducts

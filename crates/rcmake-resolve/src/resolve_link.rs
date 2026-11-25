@@ -39,6 +39,10 @@ struct IdeLinkSettings {
     install_name_dir: Option<BString>,
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Link resolution consumes target, usage, and precompiled-header plans."
+)]
 pub(crate) fn resolve_link(
     model: &ProjectModel,
     usage: &mut UsageResolver<'_>,
@@ -47,6 +51,7 @@ pub(crate) fn resolve_link(
     id: TargetId,
     target: &Target,
     ctx: &EvalContext,
+    precompiled: &lower::PchPlans,
 ) -> Result<ResolvedLink, ResolveError> {
     let facts = resolved
         .get(&id)
@@ -196,6 +201,8 @@ pub(crate) fn resolve_link(
             if let Some(facts) = resolved.get(&id) {
                 link.objects
                     .extend(facts.compile_units.iter().map(|unit| unit.object.clone()));
+                link.objects
+                    .extend(precompiled.object_library_companions(model, id).cloned());
             } else if let Some(objects) = usage.target_objects(id, &ctx.config, None) {
                 link.objects
                     .extend(list::split(&objects, list::Empty::Drop));
@@ -207,6 +214,10 @@ pub(crate) fn resolve_link(
         .file
         .as_ref()
         .map_or_else(BString::default, |path| build_path(model, path));
+    let vs_template = (usage.ide() == Some(ide::IdeFlavor::VisualStudio)
+        && kind != LinkKind::StaticArchive)
+        .then(|| features.visual_studio_whole_archive())
+        .flatten();
     let step = LinkStep {
         kind,
         language,
@@ -214,7 +225,13 @@ pub(crate) fn resolve_link(
         output,
     };
     if let Some(flavor) = usage.ide() {
-        let mut items = ide::collect_link_items(usage, model, &ctx.config, link_items(&items));
+        let mut items = ide::collect_link_items(
+            usage,
+            model,
+            &ctx.config,
+            link_items(&items),
+            vs_template.as_ref(),
+        );
         for item in &mut items {
             if let ide::IdeLinkItem::File(path) = item
                 && let Some(slice) = slices.get(&Lexical::new(path).normalize())
@@ -268,21 +285,27 @@ pub(crate) fn resolve_link(
 pub(crate) fn attach_links(
     resolved: &mut IndexMap<TargetId, ResolvedTarget>,
     inputs: &mut IndexMap<TargetId, TargetInputs>,
-    links: Vec<ResolvedLink>,
-    std_id: Option<TargetId>,
+    links: Vec<(TargetId, ResolvedLink)>,
+    providers: Option<&IndexMap<TargetId, TargetId>>,
 ) {
-    let std_objects = std_id
-        .and_then(|id| resolved.get(&id))
-        .and_then(|target| Some((target, target.cxx_modules.as_ref()?)))
+    let std_objects: IndexMap<_, Vec<_>> = providers
         .into_iter()
-        .flat_map(|(target, info)| {
-            info.units
+        .flat_map(|providers| providers.values().copied())
+        .collect::<IndexSet<_>>()
+        .into_iter()
+        .filter_map(|id| {
+            let target = resolved.get(&id)?;
+            let info = target.cxx_modules.as_ref()?;
+            let objects = info
+                .units
                 .iter()
                 .filter(|unit| !unit.bmi_only)
                 .filter_map(|unit| target.compile_units.get(unit.unit))
                 .map(|unit| unit.object.clone())
+                .collect();
+            Some((id, objects))
         })
-        .collect::<Vec<_>>();
+        .collect();
     let module_dirs: IndexMap<_, _> = resolved
         .values()
         .filter_map(|target| {
@@ -290,7 +313,10 @@ pub(crate) fn attach_links(
             (!info.units.is_empty()).then(|| (target.id, info.module_dir.clone()))
         })
         .collect();
-    for ((target, inputs), link) in resolved.values_mut().zip(inputs.values_mut()).zip(links) {
+    for (id, link) in links {
+        let (Some(target), Some(inputs)) = (resolved.get_mut(&id), inputs.get_mut(&id)) else {
+            continue;
+        };
         if let (Some(facts), Some(settings)) = (&mut target.ide, link.ide) {
             facts.link_items = settings.items;
             facts.xcframeworks = settings.xcframeworks;
@@ -326,12 +352,12 @@ pub(crate) fn attach_links(
         inputs.objects.extend(link.objects);
         if let Some(info) = &mut target.cxx_modules {
             let mut linked = link.module_links.into_iter().collect::<IndexSet<_>>();
-            if let Some(id) = std_id
-                .filter(|id| *id != target.id && target.compile_units.iter().any(|unit| unit.scan))
-            {
+            if let Some(&id) = providers.and_then(|providers| providers.get(&target.id)) {
                 linked.insert(id);
                 target.dependencies.push(id);
-                inputs.objects.extend(std_objects.iter().cloned());
+                inputs
+                    .objects
+                    .extend(std_objects.get(&id).into_iter().flatten().cloned());
             }
             info.linked_target_dirs.extend(
                 linked

@@ -49,7 +49,7 @@ pub(crate) use artifacts::{
 };
 pub use artifacts::{compute_artifacts, linker_language, object_path, source_language};
 pub(crate) use artifacts::{object_dir, short_object_paths};
-pub(crate) use compile::language_flags;
+pub(crate) use compile::{language_flags, msvc::debug_options as msvc_debug_options};
 pub(crate) use custom::{checked_command_outputs, command_outputs};
 pub use graph::lower;
 pub(crate) use graph::lower_with_inputs;
@@ -64,10 +64,12 @@ pub(crate) use link::{
 };
 pub(crate) use modules::scan_responses;
 pub use modules::{bmi_script_path, lower_modules};
-pub(crate) use pch::IdeLowering;
+pub(crate) use pch::{IdeLowering, Plans as PchPlans};
 pub(crate) use policy_flags::warn_about_wrappers;
 pub use shell::{rule_command_chain, simple_args as rule_arguments};
-pub(crate) use standard::{checked_standard_flag, cmp0128_warnings, required_standard};
+pub(crate) use standard::{
+    checked_standard_flag, cmp0128_warnings, cxx_standard_mode, required_standard,
+};
 
 pub(crate) fn definition<'a>(
     model: &'a ProjectModel,

@@ -429,9 +429,8 @@ pub(in crate::lower) fn install_rpath(
             return Ok(None);
         }
         let tool = definition(model, target.dir, b"CMAKE_INSTALL_NAME_TOOL")
-            .filter(|tool| !truth::is_off(tool.as_slice()))
             .cloned()
-            .unwrap_or_else(|| "install_name_tool".into());
+            .unwrap_or_default();
         return Ok(Some(RuntimeEdit::MachO(MachORpathEdit {
             tool,
             install_name: name,

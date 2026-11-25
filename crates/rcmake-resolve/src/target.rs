@@ -10,7 +10,7 @@ use rcmake_model::{
 use crate::{
     ArtifactSet, CompileGroup, CompileUnit, ResolveError, ResolvedTarget, TargetMetadata,
     cxx_modules::{
-        STD_MODULE_TARGET, resolve_module_info, validate_module_scanning, validate_module_source,
+        is_std_provider, resolve_module_info, validate_module_scanning, validate_module_source,
     },
     ide::{self, IdeCompile},
     lower,
@@ -36,8 +36,7 @@ pub(crate) fn resolve_target<'a>(
         backtrace: target.backtrace.clone(),
         folder: target.props.get(b"FOLDER").cloned(),
         exclude_from_all: excluded_from_all(model, usage, id, target, ctx)?,
-        generator_provided: target.kind == TargetKind::GlobalTarget
-            || target.name == STD_MODULE_TARGET,
+        generator_provided: target.kind == TargetKind::GlobalTarget || is_std_provider(target),
     };
     if let Some(strategy) = lower::install_object_name_strategy(model, target)
         && !matches!(strategy.as_slice(), b"FULL" | b"SHORT")
@@ -165,7 +164,7 @@ pub(crate) fn resolve_target<'a>(
         if matches!(
             target.kind,
             TargetKind::Utility | TargetKind::GlobalTarget | TargetKind::InterfaceLibrary
-        ) && target.name != STD_MODULE_TARGET
+        ) && !is_std_provider(target)
         {
             continue;
         }
@@ -309,7 +308,11 @@ pub(crate) fn resolve_target<'a>(
                     &mut facts,
                 )?;
                 if let Some(file) = unity_file {
-                    file.apply_compile_properties(model, &ctx.config, &mut facts);
+                    file.apply_compile_properties(
+                        &model.dir(target.dir).source_dir,
+                        &ctx.config,
+                        &mut facts,
+                    );
                 }
                 if let (Some(ide), Some(base)) = (&mut ide_compile, base) {
                     ide.record_group(group, base, &facts);
@@ -372,6 +375,7 @@ pub(crate) fn resolve_target<'a>(
     }
     resolve_module_info(
         model,
+        paths,
         target,
         &inputs,
         &mut resolved,

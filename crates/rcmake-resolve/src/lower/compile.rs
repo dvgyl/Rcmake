@@ -1,6 +1,7 @@
 //! Compile flags and compiler rule expansion.
 
 mod lint;
+pub(crate) mod msvc;
 
 use indexmap::IndexSet;
 use rcmake_base::{BString, list, path_lex::Lexical, shell::quote, truth};
@@ -36,109 +37,6 @@ pub(crate) fn language_flags(
         .collect()
 }
 
-pub(super) fn apple_flags(
-    model: &ProjectModel,
-    target: &Target,
-    config: &ConfigId,
-    language: &[u8],
-) -> Vec<BString> {
-    if !is_darwin(model, target.dir) {
-        return Vec::new();
-    }
-    let key = [&b"OSX_ARCHITECTURES_"[..], &config.0.to_ascii_uppercase()].concat();
-    let mut architectures = (!config.0.is_empty())
-        .then(|| target.props.get(&key))
-        .flatten()
-        .or_else(|| target_property(model, target, b"OSX_ARCHITECTURES"))
-        .map_or_else(Vec::new, |value| list::split(value, list::Empty::Drop));
-    let compiler_target = definition(
-        model,
-        target.dir,
-        &[b"CMAKE_", language, b"_COMPILER_TARGET"].concat(),
-    )
-    .filter(|value| !value.is_empty());
-    if architectures.is_empty()
-        && matches!(
-            language,
-            b"C" | b"CXX" | b"OBJC" | b"OBJCXX" | b"ASM" | b"SYCL"
-        )
-        && compiler_target.is_none()
-        && let Some(default) = definition(model, target.dir, b"_CMAKE_APPLE_ARCHS_DEFAULT")
-    {
-        architectures = list::split(default, list::Empty::Drop);
-    }
-    let system = super::apple::system(model, target.dir);
-    let variant = super::apple::variant(model, target.dir);
-    let mut flags = Vec::new();
-    let version = definition(model, target.dir, b"CMAKE_OSX_DEPLOYMENT_TARGET")
-        .map_or(b"".as_slice(), |value| value.as_slice());
-    let triple = match (system, variant) {
-        (b"iOS", Some(super::apple::Variant::Catalyst)) => {
-            Some((b"ios".as_slice(), b"-macabi".as_slice()))
-        }
-        (b"visionOS", Some(super::apple::Variant::Simulator)) => {
-            Some((b"xros".as_slice(), b"-simulator".as_slice()))
-        }
-        (b"visionOS", _) => Some((b"xros".as_slice(), b"".as_slice())),
-        _ => None,
-    };
-    for arch in &architectures {
-        flags.push("-arch".into());
-        flags.push(quote(arch));
-    }
-    if let Some((platform, suffix)) = triple
-        && compiler_target.is_none()
-        && !version.is_empty()
-    {
-        let arch = architectures
-            .iter()
-            .find(|arch| *arch == "arm64")
-            .or_else(|| architectures.first())
-            .map_or(b"arm64".as_slice(), |arch| arch.as_slice());
-        flags.push(quote(
-            &[b"--target=", arch, b"-apple-", platform, version, suffix].concat(),
-        ));
-    }
-    let sysroot = definition(model, target.dir, b"CMAKE_OSX_SYSROOT")
-        .filter(|value| !value.is_empty())
-        .or_else(|| {
-            definition(
-                model,
-                target.dir,
-                &[b"CMAKE_", language, b"_COMPILER_APPLE_SYSROOT_REQUIRED"].concat(),
-            )
-            .filter(|value| truth::is_on(value))
-            .and_then(|_| definition(model, target.dir, b"_CMAKE_OSX_SYSROOT_PATH"))
-        });
-    let sysroot_flag = definition(
-        model,
-        target.dir,
-        &[b"CMAKE_", language, b"_SYSROOT_FLAG"].concat(),
-    )
-    .map_or(b"-isysroot".as_slice(), |value| value.as_slice());
-    if let Some(sdk) = sysroot.filter(|value| !value.is_empty() && value.as_slice() != b"/")
-        && !sysroot_flag.is_empty()
-    {
-        flags.push(sysroot_flag.into());
-        flags.push(quote(sdk));
-    }
-    if !version.is_empty() && triple.is_none() {
-        let prefix: &[u8] = match (system, variant) {
-            (b"iOS", Some(super::apple::Variant::Simulator)) => b"-mios-simulator-version-min=",
-            (b"iOS", _) => b"-miphoneos-version-min=",
-            (b"tvOS", Some(super::apple::Variant::Simulator)) => b"-mtvos-simulator-version-min=",
-            (b"tvOS", _) => b"-mtvos-version-min=",
-            (b"watchOS", Some(super::apple::Variant::Simulator)) => {
-                b"-mwatchos-simulator-version-min="
-            }
-            (b"watchOS", _) => b"-mwatchos-version-min=",
-            _ => b"-mmacosx-version-min=",
-        };
-        flags.push(quote(&[prefix, version].concat()));
-    }
-    flags
-}
-
 fn compile_flags(
     model: &ProjectModel,
     target: &Target,
@@ -146,12 +44,19 @@ fn compile_flags(
     group: &CompileGroup,
     required_standard: Option<&[u8]>,
     position_independent: Option<bool>,
+    architecture: Option<&[u8]>,
 ) -> Result<Vec<BString>, ResolveError> {
     let language = group.language.as_slice();
     let mut flags = language_flags(model, target, config, language);
     let standard = checked_standard_flag(model, target, language, required_standard)?;
     flags.extend(standard);
-    flags.extend(apple_flags(model, target, config, language));
+    flags.extend(super::apple::arch::flags(
+        model,
+        target,
+        config,
+        language,
+        architecture,
+    )?);
     let policy = Flags::new(model, target, language);
     let ipo = if language == b"CUDA" {
         super::cuda::arch::ipo_enabled(model, target, config, language)
@@ -159,6 +64,11 @@ fn compile_flags(
         policy.ipo(config)
     };
     flags.extend(policy.compile(ipo, position_independent));
+    flags.extend(
+        msvc::debug_options(model, target, config, language)?
+            .iter()
+            .map(|option| quote(option)),
+    );
     if language == b"CUDA" {
         flags.extend(
             super::cuda::compile_flags(model, target, config)
@@ -362,6 +272,32 @@ pub(super) fn compile_arguments(
     source: &[u8],
     position_independent: Option<bool>,
 ) -> Result<(Vec<BString>, BString, BString), ResolveError> {
+    compile_arguments_for_arch(
+        model,
+        target,
+        config,
+        group,
+        required_standard,
+        source,
+        position_independent,
+        None,
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Architecture-specific compilation uses the normal flag inputs."
+)]
+fn compile_arguments_for_arch(
+    model: &ProjectModel,
+    target: &Target,
+    config: &ConfigId,
+    group: &CompileGroup,
+    required_standard: Option<&[u8]>,
+    source: &[u8],
+    position_independent: Option<bool>,
+    architecture: Option<&[u8]>,
+) -> Result<(Vec<BString>, BString, BString), ResolveError> {
     let language = group.language.as_slice();
     let mut flags = compile_flags(
         model,
@@ -370,6 +306,7 @@ pub(super) fn compile_arguments(
         group,
         required_standard,
         position_independent,
+        architecture,
     )?;
     let boundary = group.source_define_start.unwrap_or(group.defines.len());
     let (target_defines, source_defines) = group
@@ -440,6 +377,7 @@ pub(super) struct Settings<'a> {
     pub(super) pch: Option<PchFlags<'a>>,
     pub(super) position_independent: Option<bool>,
     pub(super) skip_file_set_linting: Option<bool>,
+    pub(super) pch_compile_pdb: Option<&'a BString>,
     pub(super) compile_input: Option<&'a BString>,
     pub(super) extra_framework_dirs: &'a [(BString, bool)],
 }
@@ -460,7 +398,7 @@ pub(super) fn compile(
 ) -> Result<BuildStep, ResolveError> {
     let language = group.language.as_slice();
     let source = join(&model.dir(target.dir).source_dir, &unit.source.value);
-    let (mut flags, defines, includes) = compile_arguments(
+    let (mut flags, defines, includes) = compile_arguments_for_arch(
         model,
         target,
         config,
@@ -468,6 +406,7 @@ pub(super) fn compile(
         settings.standard,
         &source,
         settings.position_independent,
+        settings.pch.and_then(PchFlags::architecture),
     )?;
     let includes = join_words([
         includes,
@@ -518,7 +457,9 @@ pub(super) fn compile(
         flags.push(super::modules::module_map_flag(model, target, path));
     }
     let template_text = template.map_or(fallback.as_slice(), |v| v.as_slice());
-    let compile_pdb = if has_placeholder(template_text, b"<TARGET_COMPILE_PDB>") {
+    let compile_pdb = if let Some(path) = settings.pch_compile_pdb {
+        path.clone()
+    } else if has_placeholder(template_text, b"<TARGET_COMPILE_PDB>") {
         compile_pdb(model, target, config, usage)?
     } else {
         BString::default()
@@ -632,7 +573,14 @@ pub(super) fn compile(
     let writes_depfile = compiler_depfile
         && (dep_flags.is_some_and(|f| has_placeholder(f, b"<DEP_FILE>"))
             || has_placeholder(template_text, b"<DEP_FILE>"));
+    let byproducts = match settings.pch {
+        Some(PchFlags::Create(plan)) if plan.companion_object.is_some() => {
+            vec![plan.artifact.clone()]
+        }
+        _ => Vec::new(),
+    };
     Ok(BuildStep::Compile {
+        byproducts,
         compile_input: None,
         object,
         source,

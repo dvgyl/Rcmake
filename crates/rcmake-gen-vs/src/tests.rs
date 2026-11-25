@@ -77,7 +77,7 @@ fn xml_preserves_utf8_and_escapes_values() {
 #[test]
 fn compile_flags_use_last_values_and_inherit_options() {
     let mut xml = xml::Writer::new(false, "utf-8");
-    flags_table::compile(flags_table::split(r#"/Od /O2 /W4 /WX /MDd /Zi /EHsc /GR- /std:c++20 /Zc:preprocessor /Zc:__cplusplus /D"NAME=two words" /I "C:\Program Files\SDK""#)).write(&mut xml);
+    flags_table::compile(flags_table::split(r#"/Od /O2 /W4 /WX /MDd /Zi /EHsc /GR- /std:c++20 /Zc:preprocessor /Zc:__cplusplus /D"NAME=two words" /I "C:\Program Files\SDK""#), "v143").write(&mut xml);
     let xml = xml.finish();
     for element in [
         "<Optimization>MaxSpeed",
@@ -108,7 +108,8 @@ fn selects_msvc_language_standard_properties() {
     ] {
         for prefix in ["", "-", "/"] {
             let mut xml = xml::Writer::new(false, "utf-8");
-            flags_table::compile(std::iter::once(format!("{prefix}{flag}"))).write(&mut xml);
+            flags_table::compile(std::iter::once(format!("{prefix}{flag}")), "v143")
+                .write(&mut xml);
             assert!(
                 xml.finish()
                     .contains(&format!("<{property}>{value}</{property}>")),
@@ -577,6 +578,7 @@ fn fixture(
                 },
                 sources: vec![
                     IdeSource {
+                        skip_precompile_headers: false,
                         path: "/source tree/main.cpp".into(),
                         kind: IdeSourceKind::Compile {
                             language: "CXX".into(),
@@ -598,6 +600,7 @@ fn fixture(
                         }),
                     },
                     IdeSource {
+                        skip_precompile_headers: false,
                         path: from_native(&bin.join("generated.cpp")),
                         kind: IdeSourceKind::Compile {
                             language: "CXX".into(),
@@ -610,6 +613,7 @@ fn fixture(
                         compile: None,
                     },
                     IdeSource {
+                        skip_precompile_headers: false,
                         path: "/source tree/main.hpp".into(),
                         kind: IdeSourceKind::Header,
                         group: BString::default(),
@@ -680,6 +684,7 @@ fn fixture(
 fn fallback_steps(bin: &Path, name: &str) -> Vec<BuildStep> {
     vec![
         BuildStep::Compile {
+            byproducts: Vec::new(),
             compile_input: None,
             object: format!("{name}/fallback.obj").into(),
             source: "/source tree/fallback.c".into(),
@@ -895,7 +900,7 @@ fn clcompile_emits_defaults_and_source_overrides_with_msbuild_properties() {
 
 #[test]
 fn v142_conditions_suppress_startup_banner_on_toolset_version() {
-    let mut settings = flags_table::compile(["/nologo".into()]);
+    let mut settings = flags_table::compile(["/nologo".into()], "v143");
     settings.compiler_defaults("v142");
     let mut xml = xml::Writer::new(false, "utf-8");
     settings.write(&mut xml);
@@ -1011,6 +1016,7 @@ fn writes_windows_link_artifacts_and_resource_options() {
         .link_items
         .push(IdeLinkItem::Target(shared));
     let source = |path: &str, kind| IdeSource {
+        skip_precompile_headers: false,
         path: path.into(),
         kind,
         group: BString::default(),
@@ -1205,4 +1211,48 @@ fn relative_solution_paths_keep_windows_drive_and_share_roots() {
     );
     assert_eq!(relative("/work", "D:/work/lib"), "D:/work/lib");
     assert_eq!(relative("/work", "/work/lib"), "lib");
+}
+
+#[test]
+fn cxx23_standard_switches_follow_toolset() {
+    for toolset in ["v143", "v145"] {
+        let preview = flags_table::compile(["/std:c++23preview".into()], toolset);
+        assert!(preview.has("LanguageStandard"));
+        let stable = flags_table::compile(["/std:c++23".into()], toolset);
+        assert_eq!(stable.has("LanguageStandard"), toolset == "v145");
+    }
+}
+
+#[test]
+fn whole_archive_uses_final_library_path_and_keeps_project_reference() {
+    let host = PureHost::default();
+    let bin = Path::new("/build tree");
+    host.create_dir_all(bin).expect("build directory");
+    let version = VsVersion::Vs17;
+    let (model, mut result) = fixture(version, "x64", bin, &host);
+    let library = model
+        .find_target(DirId::ROOT, b"static_lib")
+        .expect("static library");
+    let feature = |item| IdeLinkItem::VisualStudioFeature {
+        item: Box::new(item),
+        template: "LINKER:/WHOLEARCHIVE:<LIBRARY>".into(),
+    };
+    for target in result
+        .targets
+        .iter_mut()
+        .filter(|target| target.metadata.name == "app")
+    {
+        let ide = target.ide.as_mut().expect("app IDE facts");
+        ide.link_items = vec![
+            feature(IdeLinkItem::Target(library)),
+            feature(IdeLinkItem::File("C:/vendor files/external.lib".into())),
+            IdeLinkItem::Library("kernel32".into()),
+        ];
+    }
+    generate(version, &result, &model, &host, bin).expect("generate projects");
+    let project = contents(&host, bin, "app.vcxproj");
+    assert!(project.contains(r"/WHOLEARCHIVE:C:\vendor files\external.lib;kernel32.lib"));
+    assert!(project.contains(r"Debug\static_lib.lib;/WHOLEARCHIVE:"));
+    assert!(project.contains(r"Release\static_lib.lib;/WHOLEARCHIVE:"));
+    assert!(project.contains(r#"<ProjectReference Include="static_lib.vcxproj">"#));
 }

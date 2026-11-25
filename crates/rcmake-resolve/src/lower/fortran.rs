@@ -422,17 +422,16 @@ impl FortranPlan {
                 group.defines.clear();
             }
             let original_dir = Lexical::new(&source.source).parent();
-            if !original_dir.is_empty()
-                && !group
+            if !original_dir.is_empty() {
+                let system = group
                     .includes
                     .iter()
-                    .any(|include| include.path.value == original_dir)
-            {
+                    .any(|include| include.path.value == original_dir && include.system);
                 group.includes.insert(
                     0,
                     crate::InterfaceInclude {
                         path: BT::new(original_dir.into(), target.backtrace.clone()),
-                        system: false,
+                        system,
                     },
                 );
             }
@@ -803,6 +802,7 @@ fn chain_commands(
             argv,
             shell,
             working_dir: None,
+            link_response: None,
         })
     } else {
         Ok(command(shell))
@@ -944,6 +944,30 @@ mod tests {
         else {
             return Err("Expected a Fortran scan and collation".into());
         };
+        let unit = consumer.compile_units.first().ok_or("Missing source")?;
+        let mut group = consumer
+            .compile_groups
+            .first()
+            .ok_or("Missing compile group")?
+            .clone();
+        group.includes = [("/other", false), ("/src", true)]
+            .map(|(path, system)| crate::InterfaceInclude {
+                path: BT::new(path.into(), Backtrace::default()),
+                system,
+            })
+            .into();
+        let compiled = plan.compile_group(&model, target, unit, &group);
+        assert_eq!(
+            compiled
+                .includes
+                .first()
+                .map(|include| (&include.path.value, include.system)),
+            Some((&BString::from("/src"), true))
+        );
+        assert_eq!(
+            group.includes.first().map(|include| &include.path.value),
+            Some(&BString::from("/other"))
+        );
         assert_eq!(pp, "CMakeFiles/consumer.dir/consumer.F90-pp.f90");
         assert!(invocation.shell.to_string().contains("-Jmodule files"));
         assert_eq!(

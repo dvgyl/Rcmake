@@ -46,6 +46,15 @@ pub enum InstallActionKind {
         /// Raw `install(DIRECTORY)` options (`PATTERN`, `FILES_MATCHING`, ...).
         options: Vec<BString>,
     },
+    /// Strip debug information from an installed target binary.
+    Strip {
+        /// Configured strip program.
+        program: BString,
+        /// Options passed to the strip program.
+        flags: Vec<BString>,
+        /// Binary path relative to the action destination.
+        name: BString,
+    },
     /// Include a script.
     Script(BString),
     /// Run code.

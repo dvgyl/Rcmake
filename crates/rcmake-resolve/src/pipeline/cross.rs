@@ -31,6 +31,15 @@ impl<'a> CrossPlan<'a> {
         let mut shared_outputs = IndexSet::new();
         let mut usage = UsageResolver::new(model);
         for (id, command) in model.commands() {
+            let has_plain_output = command
+                .outputs
+                .iter()
+                .chain(&command.byproducts)
+                .any(|output| !output.value.windows(2).any(|part| part == b"$<"));
+            if has_plain_output {
+                shared_outputs.insert(id);
+                continue;
+            }
             let mut seen = IndexSet::new();
             for config in configs {
                 let (outputs, byproducts) =

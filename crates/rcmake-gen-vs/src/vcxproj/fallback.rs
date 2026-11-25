@@ -36,7 +36,7 @@ impl Context<'_> {
                             .iter()
                             .flat_map(|flag| ide_flags(&string(&flag.value))),
                     );
-                let mut settings = flags_table::compile(flags);
+                let mut settings = flags_table::compile(flags, &self.settings.toolset);
                 for define in &group.defines {
                     settings.list(
                         "PreprocessorDefinitions",
@@ -109,8 +109,13 @@ impl Context<'_> {
                         continue;
                     }
                     item.language = source_language(&path).into();
-                    item.compile = invocation_settings(invocation, source, object.as_bytes())
-                        .or_else(|| Some(self.compile_settings(target, name, &item.language)));
+                    item.compile = invocation_settings(
+                        invocation,
+                        source,
+                        object.as_bytes(),
+                        &self.settings.toolset,
+                    )
+                    .or_else(|| Some(self.compile_settings(target, name, &item.language)));
                     per_source_settings = true;
                     language.clone_from(&item.language);
                 }
@@ -273,7 +278,7 @@ impl Context<'_> {
                     .flat_map(|usage| usage.entries(UsageField::CompileOptions))
                     .flat_map(|entry| ide_flags(&string(&entry.value))),
             );
-        let mut out = flags_table::compile(flags);
+        let mut out = flags_table::compile(flags, &self.settings.toolset);
         for usage in [&dir.usage, &target.usage] {
             for entry in usage.entries(UsageField::CompileDefinitions) {
                 out.list(
@@ -488,6 +493,7 @@ fn invocation_settings(
     invocation: &Invocation,
     source: &[u8],
     object: &[u8],
+    toolset: &str,
 ) -> Option<flags_table::Settings> {
     let (compiler, args) = invocation.argv.split_first()?;
     let compiler = string(compiler);
@@ -513,7 +519,7 @@ fn invocation_settings(
             flags.push(arg);
         }
     }
-    Some(flags_table::compile(flags))
+    Some(flags_table::compile(flags, toolset))
 }
 
 fn invocation_rule(step: &CustomStep) -> Rule {

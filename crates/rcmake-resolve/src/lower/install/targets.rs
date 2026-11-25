@@ -109,7 +109,13 @@ fn framework_added_after_install(
 pub(super) fn lower<E>(
     model: &ProjectModel,
     (index, rule): (usize, &InstallRule),
-    (targets, configs, ids, edits): (&[ResolvedTarget], &[ConfigId], &[TargetId], &RuntimeEdits),
+    (targets, configs, ids, edits, strip): (
+        &[ResolvedTarget],
+        &[ConfigId],
+        &[TargetId],
+        &RuntimeEdits,
+        &mut super::strip::Tools<'_>,
+    ),
     recorded: &[&[u8]],
     manifest: &mut InstallManifest,
     make_action: &impl Fn(&InstallOptions, &[u8], InstallActionKind) -> InstallAction,
@@ -252,7 +258,20 @@ pub(super) fn lower<E>(
                         NamelinkMode::None,
                         vec![path],
                     );
+                    let strip_action = (file_type == b"SHARED_LIBRARY")
+                        .then(|| {
+                            strip.action(
+                                model,
+                                raw,
+                                &action,
+                                options
+                                    .rename
+                                    .unwrap_or_else(|| Lexical::new(file).filename().into()),
+                            )
+                        })
+                        .flatten();
                     manifest.actions.push(action);
+                    manifest.actions.extend(strip_action);
                 }
                 continue;
             }
@@ -351,14 +370,13 @@ pub(super) fn lower<E>(
             }
             let namelink = take_namelink(&artifacts, extra, &mut files);
             if !files.is_empty() {
-                let edit = artifacts.file.as_ref().and_then(|file| {
-                    let edit = edits.get(&(*id, target.config.clone()))?;
+                let installed = artifacts.file.as_ref().and_then(|file| {
                     if files.contains(file) {
                         let name = options
                             .rename
                             .clone()
                             .unwrap_or_else(|| Lexical::new(file).filename().into());
-                        Some((edit, name))
+                        Some(name)
                     } else if let Some(root) =
                         bundle_root.as_ref().filter(|root| files.contains(root))
                     {
@@ -367,11 +385,14 @@ pub(super) fn lower<E>(
                             .rename
                             .as_deref()
                             .map_or_else(|| Lexical::new(root).filename(), Vec::as_slice);
-                        Some((edit, join(name, &relative)))
+                        Some(join(name, &relative))
                     } else {
                         None
                     }
                 });
+                let edit = edits
+                    .get(&(*id, target.config.clone()))
+                    .zip(installed.as_ref());
                 let files = files.into_iter().map(|path| join(bin, path)).collect();
                 let action = make_action(
                     &options,
@@ -392,14 +413,20 @@ pub(super) fn lower<E>(
                 };
                 let (check, change) = edit.map_or((None, None), |(edit, name)| {
                     let check = edit
-                        .check(&action.destination, &name, configured)
+                        .check(&action.destination, name, configured)
                         .map(as_code);
-                    let change = as_code(edit.render(&action.destination, &name, configured));
+                    let change = as_code(edit.render(&action.destination, name, configured));
                     (check, Some(change))
                 });
+                let strip_action = if matches!(layout, crate::ide::BundleKind::App { .. }) {
+                    None
+                } else {
+                    installed.and_then(|name| strip.action(model, raw, &action, name))
+                };
                 manifest.actions.extend(check);
                 manifest.actions.push(action);
                 manifest.actions.extend(change);
+                manifest.actions.extend(strip_action);
             }
             if layout == crate::ide::BundleKind::None
                 && let Some(stub) = &artifacts.import_file

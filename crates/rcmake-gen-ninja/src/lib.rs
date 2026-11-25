@@ -160,7 +160,6 @@ fn generate_single(
     )?;
     graph.add_aliases(&artifacts, model, result);
     graph.resolve_custom_inputs(model, host);
-    graph.connect_custom_dependencies(model);
     graph.set_compile_metadata(result);
     graph.set_command_settings(model, host);
     graph.set_clean_files(model, &result.metadata.clean_files)?;
@@ -388,6 +387,11 @@ fn generate_multi(
                 .copied()
                 .filter(|&other| other != index),
         );
+        let owners = graph::CustomOwners::new(
+            included
+                .clone()
+                .filter_map(|index| configs.get(index).map(|(graph, _)| graph)),
+        );
         for (output_index, (output, files)) in included
             .clone()
             .filter_map(|selected| configs.get(selected).map(|config| (selected, config)))
@@ -417,13 +421,17 @@ fn generate_multi(
                     Ok::<_, GenError>(variant)
                 })
                 .transpose()?;
-            let graph = cross.as_ref().unwrap_or(output);
+            let output_graph = cross.as_ref().unwrap_or(output);
+            let custom_inputs =
+                output_graph.inherited_custom_inputs(graph, &owners, !selection.cross.is_empty());
+            let graph = output_graph;
             graph.emit_into(
                 &mut ninja,
                 &programs.cmake,
                 &module_flag,
                 &exports,
                 Some(&mut emitted),
+                &custom_inputs,
             )?;
             graph.emit_clean_inputs(&mut ninja);
             files.prep.emit(&mut ninja, graph);

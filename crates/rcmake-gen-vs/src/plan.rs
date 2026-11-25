@@ -3,7 +3,7 @@ use std::path::Path;
 
 use rcmake_base::truth;
 use rcmake_gen_common::{
-    GenError,
+    GenError, glob,
     ide::{
         IdeProject, UtilityKind, UtilityTarget, project_roots, rerun_inputs, targets_for_root,
         utility_targets,
@@ -142,7 +142,11 @@ pub(super) fn plan<'a>(
         &utilities,
         &scoped_targets,
     )?;
-    let inputs = regeneration_inputs(result, &settings);
+    let regenerate = utilities.root.contains_key("ZERO_CHECK");
+    let mut inputs = regeneration_inputs(result, &settings);
+    if regenerate && glob::write_verification(Some(model), bin, host)? {
+        inputs.push(join(&settings.bin, glob::STAMP));
+    }
     let solutions = roots
         .iter()
         .map(|root| {
@@ -162,7 +166,7 @@ pub(super) fn plan<'a>(
         resolved,
         inputs,
         solutions,
-        regenerate: utilities.root.contains_key("ZERO_CHECK"),
+        regenerate,
     })
 }
 
@@ -335,9 +339,16 @@ fn target_dependencies(
                     .values()
                     .filter_map(|fact| fact.ide.as_ref())
                     .flat_map(|ide| &ide.link_items)
-                    .filter_map(|item| match item {
-                        IdeLinkItem::Target(id) => Some(*id),
-                        _ => None,
+                    .filter_map(|item| {
+                        let item = match item {
+                            IdeLinkItem::VisualStudioFeature { item, .. } => item.as_ref(),
+                            item => item,
+                        };
+                        if let IdeLinkItem::Target(id) = item {
+                            Some(*id)
+                        } else {
+                            None
+                        }
                     }),
             );
         }

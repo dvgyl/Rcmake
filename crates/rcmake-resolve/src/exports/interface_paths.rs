@@ -13,7 +13,7 @@ pub(super) fn validate(
     if value.is_empty() || value.starts_with(b"$<") || value.starts_with(b"${_IMPORT_PREFIX}/") {
         return Ok(());
     }
-    let dir = model.dir(target.dir);
+    let root = model.dir(DirId::ROOT);
     let inside = |parent: &[u8], child: &[u8]| {
         !parent.is_empty()
             && Lexical::new(&Lexical::new(parent).normalize())
@@ -22,19 +22,19 @@ pub(super) fn validate(
     let body = if !Lexical::new(value).absolute() {
         format!("contains relative path:\n\n  \"{value}\"")
     } else {
-        let binary = inside(&dir.binary_dir, value);
-        let source = inside(&dir.source_dir, value);
+        let binary = inside(&root.binary_dir, value);
+        let source = inside(&root.source_dir, value);
         let install = model.definition(target.dir, b"CMAKE_INSTALL_PREFIX");
         if install.is_some_and(|install| {
             inside(install, value)
-                && (!binary || inside(&dir.binary_dir, install))
-                && (!source || inside(&dir.source_dir, install))
+                && (!binary || inside(&root.binary_dir, install))
+                && (!source || inside(&root.source_dir, install))
         }) {
             return Ok(());
         }
         let kind = if binary {
             "build"
-        } else if source {
+        } else if source && root.source_dir != root.binary_dir {
             "source"
         } else if rcmake_genex::genex_strip(value).as_slice() != value.as_slice() {
             // Only a complete `$<...>` makes a mixed path. CMake keeps an unterminated
@@ -54,7 +54,7 @@ pub(super) fn validate(
         category: None,
         policy: None,
         location: Location::FileLine {
-            file: Lexical::new(&dir.source_dir)
+            file: Lexical::new(&model.dir(target.dir).source_dir)
                 .append(b"CMakeLists.txt")
                 .as_slice()
                 .into(),

@@ -3,7 +3,7 @@
 use indexmap::{IndexMap, IndexSet};
 use rcmake_base::{BString, ByteSlice, hash::HashAlgo, list, path_lex::Lexical, truth};
 use rcmake_genex::ConfigId;
-use rcmake_model::{DirId, GeneratorKind, ProjectModel, Target, TargetKind};
+use rcmake_model::{DirId, GeneratorKind, ProjectModel, Target, TargetId, TargetKind};
 
 use super::{definition, join, target_property};
 use crate::{
@@ -45,6 +45,17 @@ pub(super) fn compile_pdb(
         || (model.find_target(target.dir, &target.name), target),
         |(id, owner)| (Some(id), owner),
     );
+    compile_pdb_path(model, owner, id, reuse.is_some(), config, usage)
+}
+
+pub(super) fn compile_pdb_path(
+    model: &ProjectModel,
+    owner: &Target,
+    id: Option<TargetId>,
+    reused: bool,
+    config: &ConfigId,
+    usage: &mut UsageResolver<'_>,
+) -> Result<BString, ResolveError> {
     let ctx = rcmake_genex::EvalContext {
         config: config.clone(),
         ..Default::default()
@@ -69,7 +80,7 @@ pub(super) fn compile_pdb(
             .transpose()
     };
     let name = property(b"COMPILE_PDB_NAME")?.map(|(name, _)| name);
-    let reused = reuse.is_some()
+    let reused = reused
         || (!owner
             .usage
             .entries(rcmake_model::UsageField::PrecompileHeaders)

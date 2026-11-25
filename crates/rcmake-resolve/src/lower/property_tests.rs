@@ -210,3 +210,196 @@ fn creates_and_reuses_a_language_specific_pch() -> TestResult {
     }
     Ok(())
 }
+
+#[test]
+fn windows_shared_library_does_not_pass_pic_flags_to_resource_compiler() -> TestResult {
+    let mut model = model(
+        "Windows",
+        &[
+            ("CMAKE_C_COMPILER", "cl.exe"),
+            ("CMAKE_C_COMPILER_ID", "MSVC"),
+            ("CMAKE_RC_COMPILER", "rc.exe"),
+            (
+                "CMAKE_RC_COMPILE_OBJECT",
+                "<CMAKE_RC_COMPILER> <DEFINES> <FLAGS> /fo <OBJECT> <SOURCE>",
+            ),
+        ],
+    );
+    let mut library = target("zlib", TargetKind::SharedLibrary, "zlib.c");
+    library
+        .sources
+        .push(BT::new("win32/zlib1.rc".into(), Default::default()));
+    model.add_target(library)?;
+    let host = PureHost::default();
+    host.seed_file(Path::new("/project/zlib.c"), b"void version(void) {}")?;
+    host.seed_file(Path::new("/project/win32/zlib1.rc"), b"")?;
+
+    let result = resolve(&model, &host, &[])?;
+    let invocation = result.graphs[0]
+        .steps
+        .iter()
+        .find_map(|step| match step {
+            BuildStep::Compile {
+                source, invocation, ..
+            } if source.ends_with(b"/win32/zlib1.rc") => Some(invocation),
+            _ => None,
+        })
+        .ok_or("Missing resource compile step")?;
+    assert_eq!(
+        invocation.argv.first().map(|word| word.as_slice()),
+        Some(b"rc.exe".as_slice())
+    );
+    assert!(!has(invocation, "-fPIC"));
+    assert!(!has(invocation, "-fPIE"));
+    Ok(())
+}
+
+#[test]
+fn apple_universal_pch_uses_one_create_per_architecture() -> TestResult {
+    let mut model = model(
+        "Darwin",
+        &[
+            ("CMAKE_CXX_COMPILER", "clang++"),
+            ("CMAKE_PCH_EXTENSION", ".pch"),
+            (
+                "CMAKE_CXX_COMPILE_OPTIONS_CREATE_PCH",
+                "-x;c++-header;-include;<PCH_HEADER>",
+            ),
+            ("CMAKE_CXX_COMPILE_OPTIONS_USE_PCH", "-include;<PCH_HEADER>"),
+            ("CMAKE_OSX_ARCHITECTURES", "arm64;x86_64"),
+            ("CMAKE_APPLE_ARCH_SYSROOTS", "/arm SDK;/intel SDK"),
+        ],
+    );
+    let mut library = target("lib", TargetKind::StaticLibrary, "lib.cpp");
+    library
+        .props
+        .set("OSX_ARCHITECTURES".into(), "x86_64;arm64".into());
+    library.usage.push(
+        UsageField::PrecompileHeaders,
+        BT::new("<vector>".into(), Default::default()),
+    );
+    model.add_target(library)?;
+    let host = PureHost::default();
+    host.seed_file(Path::new("/project/lib.cpp"), b"int one() { return 1; }")?;
+    let result = resolve(&model, &host, &[])?;
+    let compiles = result.graphs[0]
+        .steps
+        .iter()
+        .filter_map(|step| match step {
+            BuildStep::Compile {
+                object, invocation, ..
+            } => Some((object, invocation)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(compiles.len(), 3);
+    for ((object, invocation), (arch, sdk)) in compiles.iter().zip([
+        ("x86_64", "-isysroot/intel SDK"),
+        ("arm64", "-isysroot/arm SDK"),
+    ]) {
+        assert!(object.to_string().contains(arch));
+        let args = &invocation.argv;
+        assert_eq!(args.iter().filter(|arg| *arg == b"-arch").count(), 1);
+        assert!(has(invocation, arch));
+        assert!(has(invocation, &format!("-Xarch_{arch}")));
+        assert!(has(invocation, sdk));
+    }
+    let (object, consumer) = compiles[2];
+    assert!(has(
+        consumer,
+        "-include/build/CMakeFiles/lib.dir/cmake_pch_x86_64.hxx"
+    ));
+    assert!(has(
+        consumer,
+        "-include/build/CMakeFiles/lib.dir/cmake_pch_arm64.hxx"
+    ));
+    assert_eq!(result.compile_inputs[object].len(), 4);
+    Ok(())
+}
+
+#[test]
+fn linked_pch_has_two_outputs_and_reuse_links_the_provider_object_once() -> TestResult {
+    let mut model = model(
+        "Windows",
+        &[
+            ("CMAKE_CXX_COMPILER", "cl.exe"),
+            ("CMAKE_CXX_COMPILER_ID", "MSVC"),
+            ("CMAKE_LINK_PCH", "ON"),
+            ("CMAKE_PCH_COPY_COMPILE_PDB", "ON"),
+            ("CMAKE_BUILD_TYPE", "Debug"),
+            (
+                "CMAKE_MSVC_DEBUG_INFORMATION_FORMAT_DEFAULT",
+                "$<$<CONFIG:Debug>:ProgramDatabase>",
+            ),
+            (
+                "CMAKE_CXX_COMPILE_OPTIONS_MSVC_DEBUG_INFORMATION_FORMAT_ProgramDatabase",
+                "-Zi",
+            ),
+            ("CMAKE_PCH_EXTENSION", ".pch"),
+            ("CMAKE_CXX_OUTPUT_EXTENSION", ".obj"),
+            (
+                "CMAKE_CXX_COMPILE_OBJECT",
+                "<CMAKE_CXX_COMPILER> <FLAGS> /Fo<OBJECT> -c <SOURCE>",
+            ),
+            (
+                "CMAKE_CXX_COMPILE_OPTIONS_CREATE_PCH",
+                "/Yc<PCH_HEADER>;/FI<PCH_HEADER>;/Fp<PCH_FILE>",
+            ),
+            (
+                "CMAKE_CXX_COMPILE_OPTIONS_USE_PCH",
+                "/Yu<PCH_HEADER>;/FI<PCH_HEADER>;/Fp<PCH_FILE>",
+            ),
+        ],
+    );
+    let mut provider = target("provider", TargetKind::ObjectLibrary, "provider.cpp");
+    provider.usage.push(
+        UsageField::PrecompileHeaders,
+        BT::new("<vector>".into(), Default::default()),
+    );
+    model.add_target(provider)?;
+    let mut consumer = target("consumer", TargetKind::Executable, "consumer.cpp");
+    consumer
+        .props
+        .set("PRECOMPILE_HEADERS_REUSE_FROM".into(), "provider".into());
+    model.add_target(consumer)?;
+    let host = PureHost::default();
+    for file in ["provider.cpp", "consumer.cpp"] {
+        host.seed_file(&Path::new("/project").join(file), b"int main() {}")?;
+    }
+    let result = resolve(&model, &host, &[])?;
+    let graph = &result.graphs[0];
+    let (object, pch) = graph
+        .steps
+        .iter()
+        .find_map(|step| match step {
+            BuildStep::Compile {
+                object,
+                byproducts,
+                invocation,
+                ..
+            } => {
+                let pch = byproducts.first()?;
+                assert!(has(invocation, &format!("/Fo{object}")));
+                assert!(has(invocation, &format!("/Fp{pch}")));
+                assert!(has(invocation, "-Zi"));
+                Some((object, pch))
+            }
+            _ => None,
+        })
+        .ok_or("Missing precompiled header creation")?;
+    assert!(object.ends_with(b".obj") && pch.ends_with(b".pch"));
+    assert!(
+        graph
+            .steps
+            .iter()
+            .any(|step| matches!(step, BuildStep::Link { inputs, .. }
+        if inputs.iter().filter(|path| *path == object).count() == 1 && !inputs.contains(pch)))
+    );
+    assert!(
+        result
+            .compile_inputs
+            .values()
+            .any(|files| files.contains(pch))
+    );
+    Ok(())
+}

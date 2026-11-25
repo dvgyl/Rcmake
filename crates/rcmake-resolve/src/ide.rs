@@ -133,6 +133,8 @@ pub struct IdeSource {
     pub file_set: Option<BString>,
     /// Bundle subdirectory from `MACOSX_PACKAGE_LOCATION`.
     pub package_location: Option<BString>,
+    /// Compile the source without the target precompiled header.
+    pub skip_precompile_headers: bool,
     /// Compile settings that apply to this source only.
     pub compile: Option<IdeCompileSettings>,
 }
@@ -176,6 +178,13 @@ pub enum IdeLinkItem {
     Flag(BString),
     /// The resolved `LINK_LIBRARY` feature of the next Xcode link item.
     XcodeFeature(BString),
+    /// Visual Studio link item with its resolved link-library feature format.
+    VisualStudioFeature {
+        /// Library or project reference.
+        item: Box<IdeLinkItem>,
+        /// Format with a library placeholder.
+        template: BString,
+    },
 }
 
 /// When a custom step runs.
@@ -221,6 +230,12 @@ pub struct IdePch {
     pub header: BString,
     /// Absolute path of the source that makes the precompiled header.
     pub source: BString,
+    /// Absolute path of the precompiled header output.
+    pub artifact: BString,
+    /// Absolute path of the companion object, when the compiler creates one.
+    pub companion: Option<BString>,
+    /// Absolute path of the compiler program database, if configured.
+    pub compile_pdb: Option<BString>,
     /// Target whose precompiled header this target uses (`REUSE_FROM`).
     pub reuse_from: Option<TargetId>,
 }
@@ -582,15 +597,20 @@ impl IdeCompile {
                 {
                     append_compile_flags(&mut flags, &value, Backtrace::default());
                 }
-                if self.flavor == IdeFlavor::VisualStudio
-                    && let Some(standard) = lower::checked_standard_flag(
-                        model,
-                        target,
-                        &base.language,
-                        inputs.standard_requirements.get(&base.language).copied(),
-                    )?
-                {
+                if let Some(standard) = lower::checked_standard_flag(
+                    model,
+                    target,
+                    &base.language,
+                    inputs.standard_requirements.get(&base.language).copied(),
+                )? {
                     append_compile_flags(&mut flags, &standard, Backtrace::default());
+                }
+                if self.flavor == IdeFlavor::VisualStudio {
+                    flags.extend(
+                        lower::msvc_debug_options(model, target, &resolved.config, &base.language)?
+                            .into_iter()
+                            .map(|option| BT::new(option, Backtrace::default())),
+                    );
                 }
                 flags.append(&mut base.flags);
                 base.flags = flags;
@@ -720,7 +740,12 @@ fn collect_sources(
             } else {
                 (IdeSourceKind::Other, None)
             };
+            let skip_precompile_headers = inputs.sources_without_pch.contains(&path)
+                || props
+                    .get(b"SKIP_PRECOMPILE_HEADERS")
+                    .is_some_and(|value| truth::is_on(value));
             IdeSource {
+                skip_precompile_headers,
                 group: props.get(b"SOURCE_GROUP").cloned().unwrap_or_default(),
                 generated,
                 file_set: member.map(|set| set.name.clone()),
@@ -739,6 +764,7 @@ pub(crate) fn collect_link_items<'a>(
     model: &ProjectModel,
     config: &ConfigId,
     items: impl Iterator<Item = &'a ResolvedLinkItem>,
+    vs_template: Option<&BString>,
 ) -> Vec<IdeLinkItem> {
     use rcmake_genex::{ArtifactKind, ArtifactPart};
     items
@@ -783,6 +809,20 @@ pub(crate) fn collect_link_items<'a>(
                 ResolvedLinkKind::ObjectFile => Some(IdeLinkItem::File(value.clone())),
                 _ => None,
             }?;
+            let link = if let Some(template) = vs_template
+                && item
+                    .feature
+                    .as_ref()
+                    .is_some_and(|name| name == b"WHOLE_ARCHIVE")
+                && matches!(link, IdeLinkItem::File(_) | IdeLinkItem::Target(_))
+            {
+                IdeLinkItem::VisualStudioFeature {
+                    item: Box::new(link),
+                    template: template.clone(),
+                }
+            } else {
+                link
+            };
             let feature = item
                 .feature
                 .as_ref()
@@ -796,6 +836,28 @@ pub(crate) fn collect_link_items<'a>(
         .flatten()
         .flatten()
         .collect()
+}
+
+pub(crate) fn add_pch_sources(facts: &mut IdeFacts) {
+    facts.sources.extend(
+        facts
+            .pch
+            .iter()
+            .filter(|pch| pch.reuse_from.is_none() && pch.companion.is_some())
+            .map(|pch| IdeSource {
+                path: pch.source.clone(),
+                kind: IdeSourceKind::Compile {
+                    language: pch.language.clone(),
+                },
+                group: BString::default(),
+                generated: true,
+                excluded_configs: Vec::new(),
+                file_set: None,
+                package_location: None,
+                skip_precompile_headers: false,
+                compile: None,
+            }),
+    );
 }
 
 pub(crate) fn check_xcode_sources(

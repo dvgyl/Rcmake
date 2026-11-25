@@ -2,7 +2,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use rcmake_host::{Follow, PureHost, ReadRange};
-use rcmake_resolve::{CustomStep, GraphTarget};
+use rcmake_resolve::{CustomStep, GraphTarget, Invocation};
 
 use super::*;
 
@@ -49,6 +49,7 @@ fn writes_hierarchy_and_escapes_make_and_shell_words() {
                     ..CustomStep::default()
                 }),
                 BuildStep::Compile {
+                    byproducts: Vec::new(),
                     compile_input: None,
                     object: "obj $/foo.o".into(),
                     source: "/src/source file.c".into(),

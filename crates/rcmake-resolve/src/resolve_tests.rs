@@ -2581,3 +2581,77 @@ fn xcode_resolves_embed_paths_and_records_per_config_diagnostic() -> TestResult 
     );
     Ok(())
 }
+
+#[test]
+fn std_module_providers_follow_effective_consumer_settings() -> TestResult {
+    let mut model = project();
+    clang_scan(&mut model);
+    for (key, value) in [
+        ("CMAKE_CXX_COMPILER_FRONTEND_VARIANT", "GNU"),
+        ("CMAKE_CXX_STDLIB_MODULES_JSON", "/toolchain/modules.json"),
+    ] {
+        model.global.props.set(key.into(), value.into());
+    }
+    let host = PureHost::default();
+    host.seed_file(Path::new("/src/main.cpp"), b"import std;")?;
+    host.seed_file(Path::new("/toolchain/std.cppm"), b"export module std;")?;
+    host.seed_file(
+        Path::new("/toolchain/modules.json"),
+        br#"{"version":1,"modules":[{"logical-name":"std","source-path":"std.cppm"}]}"#,
+    )?;
+    let mut features = target("features", TargetKind::InterfaceLibrary, &[]);
+    features
+        .usage
+        .push(UsageField::InterfaceCompileFeatures, entry("cxx_std_23"));
+    model.add_target(features)?;
+    let add = |model: &mut ProjectModel, name, standard, extra, options: &[&str]| {
+        let mut library = target(name, TargetKind::StaticLibrary, &["main.cpp"]);
+        library
+            .props
+            .set("CXX_STANDARD".into(), BString::from(standard));
+        library
+            .props
+            .set("CXX_SCAN_FOR_MODULES".into(), "ON".into());
+        if extra {
+            library.usage.link_libraries = Some(vec![link_item("features")]);
+        }
+        for flag in options {
+            library.usage.push(UsageField::CompileOptions, entry(flag));
+        }
+        model.add_target(library)
+    };
+    let twenty = add(&mut model, "twenty", "20", false, &[])?;
+    let transitive = add(
+        &mut model,
+        "transitive",
+        "20",
+        true,
+        &["-Wall", "-isystem", "/a"],
+    )?;
+    let same = add(&mut model, "same", "23", false, &["-Wextra", "-I/b"])?;
+    let different = add(&mut model, "different", "23", false, &["-fno-exceptions"])?;
+    let result = resolve(&model, &host, &[])?;
+    let module_dir = |id| -> Option<&BString> {
+        result
+            .targets
+            .iter()
+            .find(|target| target.id == id)?
+            .cxx_modules
+            .as_ref()?
+            .linked_target_dirs
+            .first()
+    };
+    assert!(module_dir(twenty).is_some());
+    assert_eq!(module_dir(transitive), module_dir(same));
+    assert_ne!(module_dir(twenty), module_dir(same));
+    assert_ne!(module_dir(different), module_dir(same));
+    assert_eq!(
+        result
+            .targets
+            .iter()
+            .filter(|target| target.metadata.generator_provided)
+            .count(),
+        3
+    );
+    Ok(())
+}

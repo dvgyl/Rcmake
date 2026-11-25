@@ -3,10 +3,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
-use rcmake_base::{hash::HashAlgo, list, truth::is_on};
+use rcmake_base::{hash::HashAlgo, list, path_lex::Lexical, truth::is_on};
 use rcmake_diag::{Backtrace, Frame, FrameKind};
 use rcmake_host::path::{from_native, from_native_cmake, to_native};
-use rcmake_model::{BT, DirId, Directory, ProjectModel, Target, TargetId, TargetKind};
+use rcmake_model::{
+    BT, DirId, Directory, GeneratorKind, ProjectModel, Target, TargetId, TargetKind,
+};
 use rcmake_resolve::{
     ArtifactSet, CompileGroup, LinkFragmentRole, LinkKind, ResolvedTarget, TargetMetadata,
     usage::UsageResolver,
@@ -328,6 +330,21 @@ impl FileApi<'_, '_> {
                 self.relative_paths(&metadata.source_dir, &metadata.binary_dir),
             ),
         ]);
+        if let Some(raw) = raw.filter(|raw| !raw.is_imported()) {
+            let specific = match self.model.generator {
+                Some(GeneratorKind::VisualStudio(_)) => {
+                    raw.props.get(b"VS_DEBUGGER_WORKING_DIRECTORY")
+                }
+                Some(GeneratorKind::Xcode) => raw.props.get(b"XCODE_SCHEME_WORKING_DIRECTORY"),
+                _ => None,
+            };
+            if let Some(path) = specific.or_else(|| raw.props.get(b"DEBUGGER_WORKING_DIRECTORY")) {
+                body.insert(
+                    "debugger".into(),
+                    object([("workingDirectory", Value::string(path.clone()))]),
+                );
+            }
+        }
         graph.tag(&mut body, &metadata.backtrace);
         if let Some(folder) = &metadata.folder {
             body.insert(
@@ -484,7 +501,7 @@ impl FileApi<'_, '_> {
         for (source, group) in units.chain(raw_sources) {
             let file = to_native(&target.metadata.source_dir).join(to_native(&source.value));
             let file = from_native_cmake(&file);
-            if !seen.insert(file.clone()) {
+            if !seen.insert(Lexical::new(&file).normalize()) {
                 continue;
             }
             let mut entry = members([("path", Value::string(relative(&file, self.source)))]);

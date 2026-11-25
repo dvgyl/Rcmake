@@ -169,12 +169,16 @@ pub fn execute(
                 }
                 BuildStep::Compile {
                     object,
+                    byproducts,
                     invocation,
                     depfile,
                     ..
                 } => {
                     if let Some(depfile) = depfile {
                         create_output_parent(host, &build_dir, depfile)?;
+                    }
+                    for byproduct in byproducts {
+                        create_output_parent(host, &build_dir, byproduct)?;
                     }
                     (
                         std::slice::from_ref(object),

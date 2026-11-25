@@ -87,6 +87,7 @@ struct MemoKey<'a> {
     traversal: UsageTraversal,
     link_language: Option<Cow<'a, [u8]>>,
     device_link: bool,
+    property_read: bool,
     command_config: Option<Cow<'a, [u8]>>,
     output_config: Option<Cow<'a, [u8]>>,
 }
@@ -103,6 +104,7 @@ impl MemoKey<'_> {
             traversal: self.traversal,
             link_language: self.link_language.map(owned),
             device_link: self.device_link,
+            property_read: self.property_read,
             command_config: self.command_config.map(owned),
             output_config: self.output_config.map(owned),
         }
@@ -117,6 +119,7 @@ const MAX_WALK_DEPTH: usize = 128;
 pub struct UsageResolver<'a> {
     model: &'a ProjectModel,
     ide: Option<crate::ide::IdeFlavor>,
+    pub(crate) pch_objects: IndexMap<(TargetId, rcmake_genex::ConfigId), Vec<BString>>,
     artifact_properties: Vec<(TargetId, rcmake_genex::ConfigId, BString)>,
     source_paths: Option<&'a SourcePaths<'a>>,
     ids: Arc<[TargetId]>,
@@ -143,6 +146,7 @@ impl<'a> UsageResolver<'a> {
             model,
             ide: crate::ide::IdeFlavor::from_model(model),
             artifact_properties: Vec::new(),
+            pch_objects: IndexMap::new(),
             source_paths: None,
             ids: model.targets().map(|(id, _)| id).collect(),
             memo: HashMap::new(),
@@ -181,6 +185,7 @@ impl<'a> UsageResolver<'a> {
             model: self.model,
             ide: self.ide,
             artifact_properties: self.artifact_properties.clone(),
+            pch_objects: self.pch_objects.clone(),
             source_paths: None,
             ids: Arc::clone(&self.ids),
             memo: HashMap::new(),
@@ -499,6 +504,7 @@ impl<'a> UsageResolver<'a> {
                 .as_ref()
                 .map(|value| Cow::Borrowed(value.as_slice())),
             device_link: ctx.device_link,
+            property_read: self.property_reads > 0,
             command_config: ctx
                 .command_config
                 .as_ref()
@@ -508,19 +514,18 @@ impl<'a> UsageResolver<'a> {
                 .as_ref()
                 .map(|value| Cow::Borrowed(value.0.as_slice())),
         };
-        let cached = self.property_reads == 0;
-        if cached && let Some(value) = self.memo.get(&key) {
+        if let Some(value) = self.memo.get(&key) {
             return Ok(Arc::clone(value));
         }
         key.head = ctx.head.and_then(|id| self.ids.get(id.0 as usize).copied());
-        if cached && let Some(value) = self.memo.get(&key) {
+        if let Some(value) = self.memo.get(&key) {
             return Ok(Arc::clone(value));
         }
         let cycle_count = self.cycle_count;
         let value = Arc::new(
             self.with_property(target, name, |this| this.walk_uncached(target, name, ctx))?,
         );
-        if cached && self.cycle_count == cycle_count {
+        if self.cycle_count == cycle_count {
             if !value.flags.head_sensitive {
                 key.head = None;
             }
@@ -638,9 +643,9 @@ impl<'a> UsageResolver<'a> {
                     FileSetKind::Sources if !own => set.scope != UsageScope::Private,
                     _ => {
                         own && (set.scope != UsageScope::Interface
-                            || model.target(target).is_some_and(|target| {
-                                target.name == crate::cxx_modules::STD_MODULE_TARGET
-                            }))
+                            || model
+                                .target(target)
+                                .is_some_and(crate::cxx_modules::is_std_provider))
                     }
                 }
             })

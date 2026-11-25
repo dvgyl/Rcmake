@@ -7,10 +7,10 @@ use rcmake_genex::{ConfigId, EvalContext, UsageTraversal, evaluate, parse};
 use rcmake_model::{DirId, ProjectModel, Target};
 
 use super::artifacts::{build_relative, is_darwin, is_msvc};
-use super::compile::{apple_flags, language_flags};
+use super::compile::language_flags;
 use super::launcher;
 use super::policy_flags::Flags;
-use super::shell::{command as shell_command, direct, join_words, rule_invocations, simple_args};
+use super::shell::{command as shell_command, direct, join_words, simple_args};
 use super::{definition, join};
 use crate::{
     ArtifactSet, BuildStep, LinkFragmentRole, LinkKind, LinkStep, ResolveError,
@@ -22,6 +22,7 @@ mod frameworks;
 mod install_name;
 mod linker_type;
 pub(crate) use install_name::{install_name_dir, install_name_prefix, warn_install_name_policy};
+mod response;
 pub(super) mod rpath;
 use driver::{
     LinkerDriver, archive_commands, deduplicate_darwin_flags, definition_file, library_file,
@@ -73,7 +74,9 @@ pub(super) fn link(
     };
     let mut driver = language_flags(model, target, config, language);
     if kind != LinkKind::StaticArchive {
-        driver.extend(apple_flags(model, target, config, language));
+        driver.extend(super::apple::arch::flags(
+            model, target, config, language, None,
+        )?);
     }
     let driver = join_words(driver);
     let option = |key: &[u8]| policy.option(key);
@@ -356,13 +359,14 @@ pub(super) fn link(
     let expand = |template: &[u8], objects: &[BString]| {
         let objects = join_words(objects.iter().map(|v| quote(v)));
         let template = without_empty_output_flags(template, artifacts);
-        rule_invocations(model, target.dir, &template, |key| {
+        let lookup = |key: &[u8]| {
             if key == b"OBJECTS" {
                 Some(objects.clone())
             } else {
                 lookup(key)
             }
-        })
+        };
+        response::expand(model, target, &step, msvc, &template, lookup)
     };
 
     let compiler = [b"<CMAKE_", language, b"_COMPILER>"].concat();
@@ -483,6 +487,10 @@ pub(super) fn link(
             language: &step.language,
         };
         let mut link = std::mem::take(invocation);
+        let annotated = link
+            .link_response
+            .take()
+            .map(|response| (link.argv.clone(), response));
         if kind != LinkKind::StaticArchive {
             link = command.launch_tool(model, target, b"_LINKER_LAUNCHER", link, usage)?;
         }
@@ -490,6 +498,9 @@ pub(super) fn link(
             link = shell_command(join_words([prefix.clone(), link.shell]));
         }
         *invocation = command.wrap(model, target, link);
+        if let Some((original, response)) = annotated {
+            response::rebase(invocation, &original, response);
+        }
     }
     if kind == LinkKind::SharedLibrary
         && let (Some(file), Some(soname), Some(linker)) = (

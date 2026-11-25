@@ -19,6 +19,7 @@ pub mod fileapi;
 pub mod glob;
 pub mod ide;
 pub mod install_script;
+pub mod link_response;
 pub mod sbom;
 
 pub use install_script::write_supplementary_outputs;

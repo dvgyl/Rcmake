@@ -131,6 +131,7 @@ impl<'a> Graph<'a> {
         Some(Invocation {
             argv,
             working_dir: invocation.working_dir.clone(),
+
             ..Default::default()
         })
     }
@@ -192,16 +193,17 @@ impl<'a> Graph<'a> {
     ) -> Option<Response> {
         let dir = self.target_dir_for_output(&step.output);
         let language = &step.language;
-        if !self.use_response(dir, ordinary) || language == b"RC" {
+        if self.command_settings.model.is_some()
+            || !self.use_response(dir, ordinary)
+            || language == b"RC"
+        {
             return None;
         }
         let archive = step.kind == LinkKind::StaticArchive;
         let msvc = invocations
             .iter()
             .any(|invocation| msvc_link_program(&invocation.argv).is_some());
-        if !self.commands.windows() && !msvc {
-            return None;
-        }
+
         let flag = archive
             .then(|| self.language_setting(dir, language, b"_RESPONSE_FILE_ARCHIVE_FLAG"))
             .flatten()
@@ -222,17 +224,15 @@ impl<'a> Graph<'a> {
                     return None;
                 }
                 let argv = &invocation.argv;
+                let (program, wrapped) = link_program(argv)?;
                 let native = msvc_link_program(argv);
-                let wrapped = argv
-                    .iter()
-                    .any(|arg| matches!(arg.as_slice(), b"vs_link_exe" | b"vs_link_dll"));
                 if let Some(program) = native.filter(|_| library_response) {
                     return Some((index, program + 1..argv.len(), wrapped));
                 }
                 let start = argv
                     .iter()
                     .enumerate()
-                    .skip(native.map_or(1, |n| n + 1))
+                    .skip(program + 1)
                     .find_map(|(index, arg)| inputs.contains(arg).then_some(index))?;
                 let count = argv
                     .iter()
@@ -319,20 +319,30 @@ impl<'a> Graph<'a> {
         })
     }
 
-    fn use_response(&self, dir: DirId, ordinary: &[u8]) -> bool {
+    pub(super) fn use_response(&self, dir: DirId, ordinary: &[u8]) -> bool {
+        self.force_response(dir) || self.command_exceeds_budget(ordinary)
+    }
+
+    pub(super) fn force_response(&self, dir: DirId) -> bool {
         self.command_settings.force
             || self.command_settings.model.is_some_and(|model| {
                 model
                     .definition(dir, b"CMAKE_NINJA_FORCE_RESPONSE_FILE")
                     .is_some()
             })
-            || (self.commands.windows()
-                && String::from_utf8_lossy(ordinary).encode_utf16().count()
-                    >= if self.commands.is_cmd(ordinary) {
-                        8191
-                    } else {
-                        32767
-                    })
+    }
+
+    pub(super) fn command_exceeds_budget(&self, command: &[u8]) -> bool {
+        if self.commands.windows() {
+            String::from_utf8_lossy(command).encode_utf16().count()
+                >= if self.commands.is_cmd(command) {
+                    8180
+                } else {
+                    32756
+                }
+        } else {
+            command.len() >= rcmake_gen_common::link_response::POSIX_BUDGET
+        }
     }
 
     fn compile_location(&self, object: &BString) -> (DirId, &[u8]) {
@@ -344,7 +354,7 @@ impl<'a> Graph<'a> {
         (self.target_dir_for_output(object), language)
     }
 
-    fn target_dir_for_output(&self, output: &BString) -> DirId {
+    pub(super) fn target_dir_for_output(&self, output: &BString) -> DirId {
         self.command_settings
             .dirs
             .get(output.as_slice())
@@ -407,30 +417,56 @@ fn msvc_compile_program(arg: &[u8]) -> bool {
         .any(|name| tool_name(arg).eq_ignore_ascii_case(name))
 }
 
+fn link_program(argv: &[BString]) -> Option<(usize, bool)> {
+    let wrapper = argv.windows(2).position(|pair| {
+        matches!(pair, [option, helper] if option == b"-E" && matches!(helper.as_slice(), b"vs_link_exe" | b"vs_link_dll"))
+    });
+    let index = if let Some(wrapper) = wrapper {
+        argv.iter()
+            .enumerate()
+            .skip(wrapper + 2)
+            .find(|(_, arg)| *arg == b"--")?
+            .0
+            + 1
+    } else {
+        0
+    };
+    let name = tool_name(argv.get(index)?);
+    let name = name.strip_suffix(b".exe").unwrap_or(name);
+    let known = [
+        b"link".as_slice(),
+        b"lld-link",
+        b"lib",
+        b"llvm-lib",
+        b"cc",
+        b"c++",
+        b"gcc",
+        b"g++",
+        b"clang",
+        b"clang++",
+        b"ar",
+        b"llvm-ar",
+        b"ld",
+        b"ld.lld",
+    ];
+    known
+        .iter()
+        .any(|known| name.eq_ignore_ascii_case(known))
+        .then_some((index, wrapper.is_some()))
+}
+
 fn msvc_link_program(argv: &[BString]) -> Option<usize> {
-    if argv
+    let (index, _) = link_program(argv)?;
+    let name = tool_name(argv.get(index)?).to_ascii_lowercase();
+    let name = name.strip_suffix(b".exe").unwrap_or(&name);
+    matches!(name, b"link" | b"lld-link" | b"lib" | b"llvm-lib").then_some(index)
+}
+
+pub(super) fn response_rule(rule: &[u8]) -> Option<&'static [u8]> {
+    RESPONSE_RULES
         .iter()
-        .any(|arg| matches!(arg.as_slice(), b"vs_link_exe" | b"vs_link_dll"))
-    {
-        return argv
-            .iter()
-            .position(|arg| arg == b"--")
-            .map(|index| index + 1);
-    }
-    argv.iter().position(|arg| {
-        [
-            b"link.exe".as_slice(),
-            b"link",
-            b"lld-link",
-            b"lld-link.exe",
-            b"lib.exe",
-            b"lib",
-            b"llvm-lib",
-            b"llvm-lib.exe",
-        ]
-        .iter()
-        .any(|name| tool_name(arg).eq_ignore_ascii_case(name))
-    })
+        .find(|(base, _, _)| *base == rule)
+        .map(|entry| entry.1)
 }
 
 type Rule = (&'static [u8], &'static [u8], &'static [u8]);

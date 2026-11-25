@@ -2,7 +2,7 @@
 
 use std::{fmt::Write as _, path::Path};
 
-use rcmake_gen_common::{GenError, ide::rerun_inputs};
+use rcmake_gen_common::{GenError, glob, ide::rerun_inputs};
 use rcmake_host::{Host, path::to_native};
 use rcmake_resolve::ConfigureMetadata;
 
@@ -16,6 +16,7 @@ pub(crate) fn write(
     source: &str,
     metadata: &ConfigureMetadata,
     cmake: &str,
+    verify_globs: bool,
 ) -> Result<(), GenError> {
     let stamp = bin.join("CMakeFiles/cmake.check_cache");
     let stamp = quote(&stamp.to_string_lossy());
@@ -34,6 +35,17 @@ pub(crate) fn write(
             let _ = write!(script, " {}", quote(&to_native(&input).to_string_lossy()));
         }
         script.push('\n');
+    }
+    if verify_globs {
+        let marker = bin.join("CMakeFiles/rcmake-xcode-glob-mismatch");
+        let _ = writeln!(
+            script,
+            "marker={}\nrm -f \"$marker\"\n{} \"-D_RCMAKE_GLOB_MISMATCH_MARKER=$marker\" -P {}\nif [ -f \"$marker\" ]; then regen=1; fi\nset -- \"$@\" {}",
+            quote(&marker.to_string_lossy()),
+            quote(cmake),
+            quote(&bin.join(glob::SCRIPT).to_string_lossy()),
+            quote(&bin.join(glob::STAMP).to_string_lossy()),
+        );
     }
     script.push_str("for input do\n  if [ -f \"$input\" ] && [ \"$input\" -nt \"$stamp\" ]; then regen=1; fi\ndone\n");
     // Establish the first timestamp after generation, even when ZERO_CHECK has not run.

@@ -19,6 +19,7 @@ use crate::{
 mod extensions;
 mod fallback;
 mod link;
+mod pch;
 mod render;
 
 use fallback::source_language;
@@ -213,7 +214,7 @@ impl Context<'_> {
 
             if let Some(ide) = fact.and_then(|fact| fact.ide.as_deref()) {
                 let target_compile = |settings: &IdeCompileSettings| {
-                    let mut compiled = visual_studio_compile(settings);
+                    let mut compiled = visual_studio_compile(settings, &self.settings.toolset);
                     if matches!(settings.language.as_slice(), b"C" | b"CXX") {
                         compiled.take("CompileAs");
                     }
@@ -286,15 +287,23 @@ impl Context<'_> {
                             (Some(settings), overrides) => {
                                 let mut compiled = target_compile(settings);
                                 if let Some(overrides) = overrides {
-                                    compiled.append(visual_studio_compile(overrides));
+                                    compiled.append(visual_studio_compile(
+                                        overrides,
+                                        &self.settings.toolset,
+                                    ));
                                 }
                                 Some(compiled)
                             }
-                            (None, overrides) => overrides.as_ref().map(visual_studio_compile),
+                            (None, overrides) => overrides.as_ref().map(|settings| {
+                                visual_studio_compile(settings, &self.settings.toolset)
+                            }),
                         };
+                        pch::configure_source(item, source, ide, language.as_bytes());
                         item.language = language;
                     } else if kind == Kind::Resource {
-                        item.compile = source.compile.as_ref().map(visual_studio_compile);
+                        item.compile = source.compile.as_ref().map(|settings| {
+                            visual_studio_compile(settings, &self.settings.toolset)
+                        });
                     } else if kind.compiles() {
                         item.object = self.object_path(&path, name, fact);
                         item.tool_compile.clone_from(&source.compile);
@@ -305,7 +314,7 @@ impl Context<'_> {
                     .iter()
                     .find(|settings| settings.language == b"RC")
                 {
-                    config.resource = visual_studio_compile(resource);
+                    config.resource = visual_studio_compile(resource, &self.settings.toolset);
                     for settings in languages {
                         for define in &settings.defines {
                             let value = msbuild_value(&string(&define.value));
@@ -318,6 +327,7 @@ impl Context<'_> {
                     config.resource = include_definitions(settings);
                 }
                 config.link = self.ide_link(ide, name);
+                pch::link_reused(self.project.kind, ide, &mut config.link);
                 for (index, step) in ide.custom.iter().enumerate() {
                     let rule = Rule::from(step);
                     match step.phase {
@@ -485,6 +495,11 @@ impl Context<'_> {
         let command = match utility {
             UtilityKind::AllBuild => return,
             UtilityKind::ZeroCheck => {
+                config.events[0].extend(rules::verify_globs(
+                    self.settings,
+                    self.project,
+                    self.inputs,
+                ));
                 let list = join(&self.settings.source, "CMakeLists.txt");
                 plan.rule(
                     list,
@@ -576,12 +591,13 @@ fn source_kind(path: &str, otherwise: Kind) -> Kind {
     }
 }
 
-fn visual_studio_compile(settings: &IdeCompileSettings) -> flags_table::Settings {
+fn visual_studio_compile(settings: &IdeCompileSettings, toolset: &str) -> flags_table::Settings {
     let mut out = flags_table::compile(
         settings
             .flags
             .iter()
             .flat_map(|flag| ide_flags(&string(&flag.value))),
+        toolset,
     );
     out.append(include_definitions(settings));
     out

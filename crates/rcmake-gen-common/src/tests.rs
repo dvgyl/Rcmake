@@ -34,6 +34,7 @@ fn compile_step(
     object: BString,
 ) -> BuildStep {
     BuildStep::Compile {
+        byproducts: Vec::new(),
         compile_input: None,
         object,
         source,

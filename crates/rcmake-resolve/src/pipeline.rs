@@ -13,7 +13,7 @@ use rcmake_model::{CustomCommandKind, DirId, GeneratorKind, ProjectModel, Target
 use crate::{
     BuildGraph, BuildStep, GenerationResult, InstallActionKind, ResolveError, ResolveOptions,
     ResolvedTarget,
-    cxx_modules::{generation_location, module_error, std_module_model},
+    cxx_modules::{generation_location, module_error, stdlib},
     exports::resolve_exports,
     ide, lower,
     resolve_link::{attach_links, resolve_link},
@@ -106,7 +106,11 @@ fn resolve_project(
     crate::InstallManifest::validate_bmi_destinations(model, &configs, host)?;
     let mut paths = SourcePaths::new(host);
     paths.ide = options.ide;
+    paths.ninja_cxx_dyndep = crate::cxx_modules::ninja_cxx_dyndep(model, host);
     paths.collect_source_errors = collect_source_errors;
+    for (dir, _) in model.dirs().filter(|(id, _)| lower::is_darwin(model, *id)) {
+        lower::apple::arch::sdk_map(model, dir)?;
+    }
     paths.index_source_records(model);
     let autogen = autogen::prepare(model, &mut paths, &configs)?;
     let model = autogen.as_ref().map_or(model, |plan| &plan.model);
@@ -836,29 +840,35 @@ fn resolve_config(
         config: config.clone(),
         ..EvalContext::default()
     };
-    let std_model = if resolved
-        .values()
-        .any(|target| target.compile_units.iter().any(|unit| unit.scan))
-    {
-        std_module_model(model, paths.host)?
-    } else {
-        None
-    };
+    let std_model = stdlib::providers(model, paths.host, &resolved, config)?;
     let model = std_model.as_ref().map_or(model, |(model, _)| model);
     let mut usage = UsageResolver::with_source_paths(model, paths);
     usage.provenance = provenance;
-    let std_id = std_model.as_ref().map(|(_, id)| *id);
-    if let Some(id) = std_id
-        && let Some(target) = model.target(id)
-    {
-        let (facts, target_inputs) = resolve_target(model, paths, &mut usage, id, target, &ctx)?;
-        resolved.insert(id, facts);
-        inputs.insert(id, target_inputs);
+    let providers = std_model.as_ref().map(|(_, bindings)| bindings);
+    let provider_ids = providers
+        .into_iter()
+        .flat_map(|bindings| bindings.values().copied())
+        .collect::<IndexSet<_>>();
+    for id in provider_ids {
+        if let Some(target) = model.target(id) {
+            let (facts, target_inputs) =
+                resolve_target(model, paths, &mut usage, id, target, &ctx)?;
+            resolved.insert(id, facts);
+            inputs.insert(id, target_inputs);
+        }
     }
     if paths.ide == Some(ide::IdeFlavor::Xcode) {
         ide::check_xcode_sources(model, paths, xcode_sources, &inputs, config)?;
     }
     validate_link_items(model, paths, &mut usage, &resolved, &ctx, plan)?;
+    let precompiled = lower::PchPlans::new(
+        model,
+        &resolved.iter().map(|(id, target)| (*id, target)).collect(),
+        &inputs,
+        config,
+        &mut usage,
+    )?;
+    precompiled.register_objects(model, config, &mut usage);
     let links = model
         .targets()
         .filter(|(_, target)| !target.is_imported())
@@ -867,7 +877,17 @@ fn resolve_config(
                 link_language: plan.link_languages.get(&id).cloned(),
                 ..ctx.clone()
             };
-            resolve_link(model, &mut usage, paths, &resolved, id, target, &ctx)
+            resolve_link(
+                model,
+                &mut usage,
+                paths,
+                &resolved,
+                id,
+                target,
+                &ctx,
+                &precompiled,
+            )
+            .map(|link| (id, link))
         })
         .collect::<Result<Vec<_>, _>>();
     let links = match links {
@@ -884,7 +904,7 @@ fn resolve_config(
         }
         result => result?,
     };
-    attach_links(&mut resolved, &mut inputs, links, std_id);
+    attach_links(&mut resolved, &mut inputs, links, providers);
     if let Some(verification) = plan.verification {
         verification.add_header_inputs(config, &mut resolved, &mut inputs);
     }
@@ -910,7 +930,7 @@ fn resolve_config(
         &inputs,
         &fortran,
         &mut usage,
-        &mut ide_lowering,
+        (&mut ide_lowering, Some(&precompiled)),
         compile_inputs,
         plan.cross.native_for(config),
         plan.trace_config
@@ -927,7 +947,7 @@ fn resolve_config(
             &inputs,
             &fortran,
             &mut usage,
-            &mut lower::IdeLowering::default(),
+            (&mut lower::IdeLowering::default(), Some(&precompiled)),
             &mut BTreeMap::new(),
             Some(settings),
             None,
@@ -941,6 +961,9 @@ fn resolve_config(
                 .swap_remove(&target.id)
                 .unwrap_or_default();
             facts.pch = ide_lowering.pch.swap_remove(&target.id).unwrap_or_default();
+            if paths.ide == Some(ide::IdeFlavor::VisualStudio) {
+                ide::add_pch_sources(facts);
+            }
         }
     }
     Ok(ConfigOutput {

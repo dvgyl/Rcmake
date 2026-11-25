@@ -1,12 +1,11 @@
-use indexmap::{IndexMap, IndexSet};
+use indexmap::IndexMap;
 use rcmake_base::{BString, path_lex::Lexical, truth};
 use rcmake_cxxmodules::ModuleVisibility;
-use rcmake_diag::{Backtrace, Location, MessageKind, PolicyId, PolicyStatus};
+use rcmake_diag::{Location, MessageKind, PolicyId, PolicyStatus};
 use rcmake_genex::ConfigId;
 use rcmake_host::{Host, path::to_native};
 use rcmake_model::{
-    BT, DirId, FileSet, FileSetKind, InstallKind, ProjectModel, Target, TargetId, TargetKind,
-    TargetOrigin, UsageField, UsageScope,
+    DirId, FileSetKind, GeneratorKind, InstallKind, ProjectModel, Target, TargetId, UsageScope,
 };
 
 use crate::{
@@ -16,10 +15,71 @@ use crate::{
     unity,
 };
 
+pub(crate) mod stdlib;
+
 pub(crate) const STD_MODULE_TARGET: &[u8] = b"@cmake_cxx_std";
+
+pub(crate) fn is_std_provider(target: &Target) -> bool {
+    target.name == STD_MODULE_TARGET
+        || target
+            .name
+            .strip_prefix(b"@cmake_cxx_std_")
+            .is_some_and(|suffix| !suffix.is_empty() && suffix.iter().all(u8::is_ascii_digit))
+}
 
 fn scan_rule<'a>(model: &'a ProjectModel, target: &Target) -> Option<&'a BString> {
     lower::definition(model, target.dir, b"CMAKE_CXX_SCANDEP_SOURCE")
+}
+
+fn generator_supports_scanning(model: &ProjectModel, paths: &SourcePaths<'_>) -> bool {
+    match model.generator {
+        None | Some(GeneratorKind::VisualStudio(_)) => true,
+        Some(GeneratorKind::Ninja | GeneratorKind::NinjaMultiConfig) => {
+            paths.ninja_cxx_dyndep.unwrap_or(true)
+        }
+        _ => false,
+    }
+}
+
+pub(crate) fn ninja_cxx_dyndep(model: &ProjectModel, host: &dyn Host) -> Option<bool> {
+    use rcmake_host::{CommandSpec, Input, Output, ProcessResult, RunRequest};
+
+    if !matches!(
+        model.generator,
+        Some(GeneratorKind::Ninja | GeneratorKind::NinjaMultiConfig)
+    ) {
+        return None;
+    }
+    let program = lower::definition(model, DirId::ROOT, b"CMAKE_MAKE_PROGRAM")
+        .filter(|program| !truth::is_off(program))?;
+    let result = host
+        .run_bounded(
+            &RunRequest {
+                pipeline: vec![CommandSpec {
+                    program: program.clone(),
+                    args: vec!["--version".into()],
+                }],
+                cwd: to_native(&model.dir(DirId::ROOT).binary_dir),
+                env: host.env_all(),
+                stdin: Input::Null,
+                stdout: Output::Capture,
+                stderr: Output::Capture,
+                timeout: Some(std::time::Duration::from_secs(5)),
+                tee: false,
+            },
+            4096,
+        )
+        .ok()?;
+    if result.results != [ProcessResult::Exited(0)] {
+        return None;
+    }
+    let version = rcmake_base::version::Version::parse_strict(
+        result
+            .stdout
+            .split(|byte| !byte.is_ascii_digit() && *byte != b'.')
+            .next()?,
+    )?;
+    Some((version.major(), version.minor()) >= (1, 11))
 }
 
 fn missing_scanner(target: &Target) -> ResolveError {
@@ -98,6 +158,18 @@ pub(crate) fn validate_module_scanning(
             target.name,
         ).into()));
     }
+    if !generator_supports_scanning(model, paths) {
+        let generator = model.generator.map_or("Ninja", GeneratorKind::name);
+        return Err(module_error(
+            model,
+            paths,
+            target,
+            format!(
+                "The target named \"{}\" has C++ sources that may use modules, but this generator does not support scanning them:\n\n  {generator}",
+                target.name,
+            ).into(),
+        ));
+    }
     if scan_rule(model, target).is_none() {
         let error = missing_scanner(target);
         paths.emit(
@@ -127,8 +199,13 @@ fn allows_module_scanning(model: &ProjectModel, target: &Target, inputs: &Target
             .is_some_and(|value| supports_modules(value))
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Module resolution uses source and target facts."
+)]
 pub(crate) fn resolve_module_info(
     model: &ProjectModel,
+    paths: &SourcePaths<'_>,
     target: &Target,
     inputs: &TargetInputs,
     resolved: &mut ResolvedTarget,
@@ -138,6 +215,7 @@ pub(crate) fn resolve_module_info(
 ) {
     let allows_scanning = allows_module_scanning(model, target, inputs);
     let by_default = target.policies.policies.get(PolicyId::new(155)) == PolicyStatus::New
+        && generator_supports_scanning(model, paths)
         && scan_rule(model, target).is_some();
     let target_setting = target
         .props
@@ -157,7 +235,7 @@ pub(crate) fn resolve_module_info(
                 UsageScope::Public => ModuleVisibility::Public,
                 UsageScope::Interface => ModuleVisibility::Interface,
             };
-            let bmi_only = target.name == STD_MODULE_TARGET
+            let bmi_only = is_std_provider(target)
                 && lower::definition(model, target.dir, b"CMAKE_CXX_COMPILER_ID")
                     .is_none_or(|id| id != b"MSVC".as_slice());
             units.push(ModuleUnit {
@@ -326,200 +404,4 @@ fn module_install(
             && (configs.is_empty() || configs.iter().any(|name| config.matches(name))))
         .then_some(install)
     })
-}
-
-pub(crate) fn std_module_model(
-    model: &ProjectModel,
-    host: &dyn Host,
-) -> Result<Option<(ProjectModel, TargetId)>, ResolveError> {
-    use rcmake_json::{ReadOptions, Value};
-
-    let dir = model.dir(DirId::ROOT);
-    let Some(manifest) = lower::definition(model, DirId::ROOT, b"CMAKE_CXX_STDLIB_MODULES_JSON")
-        .filter(|path| !truth::is_off(path))
-    else {
-        return Ok(None);
-    };
-    let error = |reason: &dyn std::fmt::Display| {
-        ResolveError::Message(
-            format!(
-                "Failed to load C++ standard library modules metadata from \"{manifest}\": {reason}"
-            )
-            .into(),
-        )
-    };
-    let path = absolute_path(&dir.source_dir, manifest);
-    let data = host
-        .read(
-            &to_native(&path),
-            rcmake_host::ReadRange::All {
-                limit: rcmake_base::limits::Limits::default().max_value_bytes as u64,
-            },
-        )
-        .map_err(|err| error(&err))?;
-    let Value::Object(root) =
-        rcmake_json::parse(&data, &ReadOptions::default()).map_err(|err| error(&err))?
-    else {
-        return Err(error(&"Expected a JSON object."));
-    };
-    if !matches!(
-        root.get(b"version".as_slice()),
-        Some(Value::Int(1) | Value::UInt(1))
-    ) {
-        return Err(error(&"The manifest version must be 1."));
-    }
-    let Some(Value::Array(entries)) = root.get(b"modules".as_slice()) else {
-        return Err(error(&"The manifest has no modules array."));
-    };
-    let base = Lexical::new(&path).parent();
-    let mut sources = Vec::new();
-    let mut bases = IndexSet::new();
-    let mut target = Target::new(
-        STD_MODULE_TARGET.into(),
-        TargetKind::ObjectLibrary,
-        TargetOrigin::Normal,
-        DirId::ROOT,
-        Backtrace::default(),
-        Default::default(),
-    );
-    for entry in entries {
-        let Value::Object(entry) = entry else {
-            return Err(error(&"Expected a module object."));
-        };
-        if !matches!(entry.get(b"logical-name".as_slice()), Some(Value::String(name)) if !name.is_empty())
-        {
-            return Err(error(&"A module has no logical name."));
-        }
-        let Some(Value::String(source)) = entry
-            .get(b"source-path".as_slice())
-            .filter(|value| matches!(value, Value::String(path) if !path.is_empty()))
-        else {
-            return Err(error(&"A module has no source path."));
-        };
-        let source = absolute_path(base, source);
-        let lexical = Lexical::new(&source);
-        bases.insert(BString::from(
-            [lexical.root_name(), lexical.root_directory()].concat(),
-        ));
-        sources.push(BT::new(source, Backtrace::default()));
-        if let Some(local) = entry.get(b"local-arguments".as_slice()) {
-            std_module_arguments(&mut target, base, local).map_err(|reason| error(&reason))?;
-        }
-    }
-    if sources.is_empty() {
-        return Ok(None);
-    }
-    let mut model = model.clone();
-    target.props.set("EXCLUDE_FROM_ALL".into(), "ON".into());
-    target.usage.push(
-        UsageField::CompileFeatures,
-        BT::new("cxx_std_20".into(), Backtrace::default()),
-    );
-    if lower::definition(&model, DirId::ROOT, b"CMAKE_CXX_COMPILER_ID")
-        .is_some_and(|id| id.ends_with(b"Clang"))
-    {
-        target.usage.push(
-            UsageField::CompileOptions,
-            BT::new(
-                "-Wno-reserved-module-identifier".into(),
-                Backtrace::default(),
-            ),
-        );
-    }
-    let id = model.add_target(target).map_err(|err| error(&err))?;
-    model
-        .add_file_set(FileSet {
-            target: id,
-            name: "CXX_MODULES".into(),
-            kind: FileSetKind::CxxModules,
-            scope: UsageScope::Public,
-            base_dirs: bases
-                .into_iter()
-                .map(|path| BT::new(path, Backtrace::default()))
-                .collect(),
-            files: sources,
-            props: Default::default(),
-        })
-        .map_err(|err| error(&err))?;
-    Ok(Some((model, id)))
-}
-
-fn std_module_arguments(
-    target: &mut Target,
-    base: &[u8],
-    value: &rcmake_json::Value,
-) -> Result<(), &'static str> {
-    use rcmake_json::Value;
-
-    let Value::Object(local) = value else {
-        return Err("Expected a local-arguments object.");
-    };
-    for key in [
-        b"include-directories".as_slice(),
-        b"system-include-directories",
-    ] {
-        if let Some(value) = local.get(key) {
-            let Value::Array(dirs) = value else {
-                return Err("Expected an array of include paths.");
-            };
-            for dir in dirs {
-                let Value::String(dir) = dir else {
-                    return Err("Expected an include path.");
-                };
-                let path = absolute_path(base, dir);
-                target.usage.push(
-                    UsageField::IncludeDirectories,
-                    BT::new(path, Backtrace::default()),
-                );
-            }
-        }
-    }
-    if let Some(value) = local.get(b"definitions".as_slice()) {
-        let Value::Array(definitions) = value else {
-            return Err("Expected an array of definitions.");
-        };
-        for definition in definitions {
-            let Value::Object(definition) = definition else {
-                return Err("Expected a definition object.");
-            };
-            let Some(Value::String(name)) = definition.get(b"name".as_slice()) else {
-                return Err("A definition has no name.");
-            };
-            if matches!(definition.get(b"undef".as_slice()), Some(Value::Bool(true))) {
-                continue;
-            }
-            let value = match definition.get(b"value".as_slice()) {
-                Some(Value::String(value)) => [name.as_slice(), b"=", value].concat().into(),
-                None => name.clone(),
-                _ => return Err("Expected a string definition value."),
-            };
-            target.usage.push(
-                UsageField::CompileDefinitions,
-                BT::new(value, Backtrace::default()),
-            );
-        }
-    }
-    if let Some(Value::Object(vendor)) = local.get(b"vendor".as_slice())
-        && let Some(Value::Object(cmake)) = vendor.get(b"cmake".as_slice())
-    {
-        for (key, field) in [
-            (b"compile-options".as_slice(), UsageField::CompileOptions),
-            (b"compile-features".as_slice(), UsageField::CompileFeatures),
-        ] {
-            if let Some(value) = cmake.get(key) {
-                let Value::Array(values) = value else {
-                    return Err("Expected an array of compiler arguments.");
-                };
-                for value in values {
-                    let Value::String(value) = value else {
-                        return Err("Expected a compiler argument.");
-                    };
-                    target
-                        .usage
-                        .push(field, BT::new(value.clone(), Backtrace::default()));
-                }
-            }
-        }
-    }
-    Ok(())
 }

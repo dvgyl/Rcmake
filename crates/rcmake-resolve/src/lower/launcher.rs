@@ -70,6 +70,7 @@ impl Command<'_> {
             argv: args,
             shell,
             working_dir: invocation.working_dir,
+            link_response: None,
         })
     }
 

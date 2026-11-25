@@ -520,7 +520,16 @@ impl GenexHost for ModelGenexHost<'_, '_> {
                             filter.contains(&Lexical::new(&unit.source.value).normalize())
                         })
                     })
-                    .map(|unit| absolute_path(binary_root, &unit.object)),
+                    .map(|unit| absolute_path(binary_root, &unit.object))
+                    .chain(
+                        sources
+                            .is_none()
+                            .then(|| self.resolver.pch_objects.get(&(id, config.clone())))
+                            .flatten()
+                            .into_iter()
+                            .flatten()
+                            .map(|object| absolute_path(binary_root, object)),
+                    ),
             )
         } else {
             self.resolver.target_objects(id, config, sources)?

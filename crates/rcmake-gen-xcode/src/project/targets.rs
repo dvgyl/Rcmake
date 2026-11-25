@@ -45,6 +45,11 @@ impl Project<'_> {
         let mut config_files = Group::default();
         let mut sources: Option<Vec<Source<'_>>> = None;
         let native = matches!(isa, Isa::PBXNativeTarget);
+        let per_language_flags = self
+            .configs
+            .iter()
+            .filter_map(|config| self.resolved.get(&(*id, config.clone())))
+            .any(|target| crate::settings::compile::needs_per_language_flags(target));
         let first = self.configs.first().cloned().unwrap_or_default();
         let first_target = self.resolved.get(&(*id, first.clone())).copied();
         let plist = if native {
@@ -104,7 +109,7 @@ impl Project<'_> {
                         graph.and_then(|graph| graph.steps.get(index).map(|step| (index, step)))
                     });
                 custom.collect(facts, self.model, self.bin, steps);
-                let items = source_files(self.model, raw, facts)
+                let items = source_files(self.model, raw, facts, per_language_flags)
                     .map_err(|error| self.source_error(raw.dir, error))?;
                 if let Some(original) = &sources {
                     validate_source_flags(original, &items)
@@ -134,6 +139,7 @@ impl Project<'_> {
                     target: facts,
                     xcframeworks: &xcframeworks,
                     phase_links: &phase_links,
+                    per_language_flags,
                 }
                 .build(&configured_product, plist.as_deref())
             } else {

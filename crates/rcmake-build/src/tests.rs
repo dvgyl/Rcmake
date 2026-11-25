@@ -187,6 +187,7 @@ fn uses_argv_and_shell_fallback_and_stops_at_first_failed_invocation() -> Result
     let graph = BuildGraph {
         steps: vec![
             BuildStep::Compile {
+                byproducts: Vec::new(),
                 compile_input: None,
                 object: "obj/main.o".into(),
                 source: "main.c".into(),
@@ -271,6 +272,7 @@ fn builds_and_links_c_with_native_host() -> Result<(), Box<dyn std::error::Error
     let graph = BuildGraph {
         steps: vec![
             BuildStep::Compile {
+                byproducts: Vec::new(),
                 compile_input: None,
                 object: "obj/main.o".into(),
                 source: "main.c".into(),
@@ -345,6 +347,7 @@ fn scans_and_collates_before_compiling_module_providers() -> Result<(), Box<dyn 
         depfile: None,
     };
     let compile = |source: &str, object: &str, map: &str| BuildStep::Compile {
+        byproducts: Vec::new(),
         compile_input: None,
         source: source.into(),
         object: object.into(),
@@ -577,6 +580,7 @@ fn windows_compound_rule_uses_comspec_and_preserves_literal_arguments() -> Resul
         argv: vec!["sh".into(), "-c".into(), shell.clone()],
         shell,
         working_dir: None,
+        link_response: None,
     };
     assert_eq!(
         run(

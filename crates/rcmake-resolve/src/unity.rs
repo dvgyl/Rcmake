@@ -5,7 +5,7 @@ use rcmake_base::{BString, hash::HashAlgo, path_lex::Lexical, truth};
 use rcmake_diag::{Backtrace, MessageKind};
 use rcmake_genex::{ConfigId, EvalContext};
 use rcmake_host::{Host, ReadRange, WriteMode, path::to_native};
-use rcmake_model::{BT, DirId, ProjectModel, Target, TargetId, TargetKind};
+use rcmake_model::{BT, ProjectModel, Target, TargetId, TargetKind};
 
 use crate::{
     CompileGroup, InterfaceInclude, ResolveError,
@@ -61,25 +61,23 @@ impl UnityFile {
 
     pub(crate) fn apply_compile_properties(
         &self,
-        model: &ProjectModel,
+        source_dir: &BString,
         config: &ConfigId,
         group: &mut CompileGroup,
     ) {
-        if self.relocatable {
-            let source_root = &model.dir(DirId::ROOT).source_dir;
-            if !group
+        if self.relocatable
+            && !group
                 .includes
                 .iter()
-                .any(|entry| entry.path.value == *source_root)
-            {
-                group.includes.insert(
-                    0,
-                    InterfaceInclude {
-                        path: BT::new(source_root.clone(), Backtrace::default()),
-                        system: false,
-                    },
-                );
-            }
+                .any(|entry| entry.path.value == *source_dir)
+        {
+            group.includes.insert(
+                0,
+                InterfaceInclude {
+                    path: BT::new(source_dir.clone(), Backtrace::default()),
+                    system: false,
+                },
+            );
         }
         if self.config_guard {
             group
@@ -276,6 +274,11 @@ pub(crate) fn prepare(
                     continue;
                 };
                 let language = &compile_group.language;
+                if lower::source_language(model, target, &unit.source.value).as_ref()
+                    != Some(language)
+                {
+                    continue;
+                }
                 let candidate = candidates
                     .entry(language.clone())
                     .or_default()
@@ -312,7 +315,7 @@ struct UnityWriter<'a> {
 impl UnityWriter<'_> {
     fn write_files(&self, candidates: Candidates) -> Result<TargetUnity, ResolveError> {
         let mut plan = TargetUnity::default();
-        let root = self.model.dir(DirId::ROOT);
+        let root = self.model.dir(self.target.dir);
         let target_dir = lower::object_dir(self.model, self.target, &ConfigId::default());
         let unity_dir = absolute_path(
             &root.binary_dir,
@@ -405,7 +408,7 @@ impl UnityWriter<'_> {
             }
             content.push(b'\n');
         }
-        let root = self.model.dir(DirId::ROOT);
+        let root = self.model.dir(self.target.dir);
         let source_path = Lexical::new(source);
         let binary_root = Lexical::new(&root.binary_dir);
         let source_root = Lexical::new(&root.source_dir);

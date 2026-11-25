@@ -1,7 +1,7 @@
 //! End-to-end checks with the pinned Ninja binary on PATH.
 
 #![cfg(unix)]
-#![allow(clippy::panic)]
+#![allow(clippy::panic, clippy::expect_used)]
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -108,6 +108,7 @@ fn compile(source: BString, object: BString) -> BuildStep {
         ..Invocation::default()
     };
     BuildStep::Compile {
+        byproducts: Vec::new(),
         compile_input: None,
         object,
         source,
@@ -559,6 +560,7 @@ printf '%s\n' 'module\ state/unit.o.ddi: main.c' > "$2"
                     implicit_inputs: vec![],
                 },
                 BuildStep::Compile {
+                    byproducts: Vec::new(),
                     compile_input: None,
                     object: object.clone(),
                     source: "main.c".into(),
@@ -624,4 +626,122 @@ printf '%s\n' 'module\ state/unit.o.ddi: main.c' > "$2"
         project.run(build, "ninja", &["-n", "demo"]);
     }
     Ok(())
+}
+
+#[test]
+fn long_posix_link_uses_ordered_response_arguments() {
+    long_posix_link_or_archive(false);
+}
+
+#[test]
+fn batched_archive_keeps_each_shell_command_bounded() {
+    long_posix_link_or_archive(true);
+}
+
+fn long_posix_link_or_archive(archive: bool) {
+    let project = Project::new();
+    let root = &project.dir;
+    let build = root.join("build space");
+    project
+        .host
+        .create_dir_all(&build)
+        .expect("create build directory");
+    let write = |name: &str, content: &[u8]| {
+        project
+            .host
+            .write(&root.join(name), content, WriteMode::Truncate)
+            .expect("write source");
+    };
+    let run = |program, args: &[&str]| {
+        String::from_utf8(project.run(&build, program, args).stdout).expect("read command output")
+    };
+    write("empty.c", b"/* Empty translation unit. */\n");
+    write("main.c", b"int main(void) { return 0; }\n");
+    run("cc", &["-c", "../empty.c", "-o", "empty.o"]);
+    let bytes = project
+        .host
+        .read(&build.join("empty.o"), ReadRange::All { limit: 64 * 1024 })
+        .expect("read object");
+    let mut model = ProjectModel::default();
+    model.generator = Some(GeneratorKind::Ninja);
+    model.set_root_dirs(path::from_native(root), path::from_native(&build));
+    for (key, value) in [
+        ("CMAKE_COMMAND", "cmake"),
+        ("CMAKE_C_COMPILER", "cc"),
+        ("CMAKE_AR", "ar"),
+        ("CMAKE_RANLIB", "ranlib"),
+    ] {
+        model
+            .dir_mut(DirId::ROOT)
+            .vars
+            .insert(key.into(), value.into());
+    }
+    let kind = if archive {
+        TargetKind::StaticLibrary
+    } else {
+        TargetKind::Executable
+    };
+    let mut target = Target::new(
+        "long_input".into(),
+        kind,
+        TargetOrigin::Normal,
+        DirId::ROOT,
+        Default::default(),
+        Default::default(),
+    );
+    target
+        .sources
+        .push(BT::new("main.c".into(), Default::default()));
+    const COUNT: usize = 680;
+    let mut last = String::new();
+    let mut total = 0;
+    for index in 0..COUNT {
+        last = format!("object {index:04} $ '.{}.o", "p".repeat(186));
+        let path = build.join(&last);
+        project
+            .host
+            .write(&path, &bytes, WriteMode::Truncate)
+            .expect("write object");
+        total += last.len();
+        target
+            .sources
+            .push(BT::new(path::from_native(&path), Default::default()));
+    }
+    assert!(total > 128 * 1024);
+    model.add_target(target).expect("add target");
+    let result = resolve(&model, &project.host, &[]).expect("resolve model");
+    rcmake_gen_ninja::generate_single_config_with_model(&result, &project.host, &build, &model)
+        .expect("generate build files");
+    let stdout = run("ninja", &["-j2"]);
+    assert!(!stdout.is_empty());
+    if archive {
+        let members = run("ar", &["t", "liblong_input.a"]);
+        assert_eq!(
+            members
+                .lines()
+                .filter(|member| !member.starts_with("__.SYMDEF"))
+                .count(),
+            COUNT + 1
+        );
+        assert!(members.lines().any(|member| member == last));
+    } else {
+        run("./long_input", &[]);
+    }
+    let output = if archive {
+        "liblong_input.a"
+    } else {
+        "long_input"
+    };
+    let before = project
+        .host
+        .metadata(&build.join(output), Follow::Yes)
+        .expect("read output")
+        .mtime;
+    run("ninja", &["-j2"]);
+    let after = project
+        .host
+        .metadata(&build.join(output), Follow::Yes)
+        .expect("read output again")
+        .mtime;
+    assert_eq!(before, after);
 }

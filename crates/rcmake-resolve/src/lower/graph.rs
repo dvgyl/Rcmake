@@ -9,10 +9,9 @@ use rcmake_genex::{ConfigId, EvalContext};
 use rcmake_model::{BT, DirId, GeneratorKind, ProjectModel, Target, TargetEvent, TargetId};
 
 use super::artifacts::build_relative;
-use super::compile::{Settings, compile};
 use super::custom::{Commands, attach_link_events, command_path, ide_custom_step};
 use super::link::link;
-use super::pch::{self, PchFlags};
+use super::pch;
 use super::{compute_artifacts, linker_language};
 use crate::ide::{IdeCustomPhase, IdeCustomStep};
 use crate::{
@@ -21,10 +20,12 @@ use crate::{
     unity::TargetUnity, usage::UsageResolver,
 };
 
+mod compile;
 mod debug;
 mod device;
 mod membership;
 mod order;
+mod source_commands;
 mod utility;
 
 /// Lower resolved targets for one configuration.
@@ -42,7 +43,7 @@ pub fn lower(
         &IndexMap::new(),
         &IndexMap::new(),
         &mut UsageResolver::new(model),
-        &mut pch::IdeLowering::default(),
+        (&mut pch::IdeLowering::default(), None),
         &mut BTreeMap::new(),
         None,
         None,
@@ -60,7 +61,7 @@ pub(crate) fn lower_with_inputs(
     inputs: &IndexMap<TargetId, TargetInputs>,
     fortran: &IndexMap<TargetId, super::fortran::FortranPlan>,
     usage: &mut UsageResolver<'_>,
-    ide: &mut pch::IdeLowering,
+    (ide, precompiled): (&mut pch::IdeLowering, Option<&pch::Plans>),
     compile_inputs: &mut BTreeMap<BString, Vec<BString>>,
     cross: Option<CrossConfiguration<'_>>,
     trace_host: Option<&dyn rcmake_host::Host>,
@@ -80,6 +81,13 @@ pub(crate) fn lower_with_inputs(
         config: config.clone(),
         ..BuildGraph::default()
     };
+    let owned;
+    let precompiled = if let Some(precompiled) = precompiled {
+        precompiled
+    } else {
+        owned = pch::Plans::new(model, &resolved_targets, inputs, config, usage)?;
+        &owned
+    };
     let commands = Commands::new(
         model,
         &resolved_targets,
@@ -88,10 +96,9 @@ pub(crate) fn lower_with_inputs(
         usage,
         &mut graph.steps,
     )?;
-    let precompiled = pch::Plans::new(model, &resolved_targets, inputs, config, usage)?;
     if usage.ide().is_some() {
         for &(_, resolved) in &local {
-            let headers = precompiled.ide(resolved);
+            let headers = precompiled.ide(model, resolved);
             if !headers.is_empty() {
                 ide.pch.insert(resolved.id, headers);
             }
@@ -100,6 +107,8 @@ pub(crate) fn lower_with_inputs(
     let rule_count = graph.steps.len();
     let mut unity_prerequisites = Vec::new();
     let mut strong_edges = Vec::new();
+    graph.custom_output_owners = commands.owners.clone();
+    graph.target_ids = local.iter().map(|(_, target)| target.id).collect();
     for (index, &(target, resolved)) in local.iter().enumerate() {
         let mut plan = TargetPlan::new(model, config, target, resolved, inputs.get(&resolved.id));
         let unity = usage
@@ -112,6 +121,7 @@ pub(crate) fn lower_with_inputs(
             &target_indices,
             &mut unity_prerequisites,
             &mut graph.steps,
+            &mut graph.custom_output_owners,
         )?;
         if let Some(order) = plan
             .inputs
@@ -143,12 +153,12 @@ pub(crate) fn lower_with_inputs(
         let objects = plan.add_compile_steps(
             &artifacts,
             &commands,
-            &precompiled,
+            precompiled,
             (&lint, &framework_dirs),
             fortran.get(&resolved.id),
             usage,
             &mut graph.steps,
-            compile_inputs,
+            (compile_inputs, ide.pch.get_mut(&resolved.id)),
         )?;
         plan.add_link_and_target_commands(
             &artifacts,
@@ -159,6 +169,7 @@ pub(crate) fn lower_with_inputs(
             &mut graph,
         )?;
 
+        source_commands::record_owners(&mut graph.custom_output_owners, resolved.id, &plan.steps);
         if let Some(events) = plan.ide_steps {
             let rules = plan
                 .steps
@@ -368,6 +379,7 @@ struct TargetPlan<'a> {
     resolved: &'a ResolvedTarget,
     inputs: Option<&'a TargetInputs>,
     steps: IndexSet<usize>,
+    source_file_inputs: IndexMap<BString, IndexSet<BString>>,
     dependencies: IndexSet<TargetId>,
     ide_steps: Option<Vec<IdeCustomStep>>,
 }
@@ -392,6 +404,7 @@ impl<'a> TargetPlan<'a> {
             resolved,
             inputs,
             steps: IndexSet::new(),
+            source_file_inputs: IndexMap::new(),
             dependencies,
             ide_steps: resolved.ide.as_ref().map(|_| Vec::new()),
         }
@@ -404,45 +417,11 @@ impl<'a> TargetPlan<'a> {
         target_indices: &IndexMap<TargetId, usize>,
         unity_prerequisites: &mut Vec<GraphTarget>,
         graph_steps: &mut Vec<BuildStep>,
+        owners: &mut IndexMap<usize, crate::CustomOutputOwners>,
     ) -> Result<Option<usize>, ResolveError> {
-        let (model, config, target, resolved) =
-            (self.model, self.config, self.target, self.resolved);
-        let dir = model.dir(target.dir);
-        let mut unity_inputs = IndexMap::<_, IndexSet<_>>::new();
-        let ninja = matches!(
-            model.generator,
-            Some(GeneratorKind::Ninja | GeneratorKind::NinjaMultiConfig)
-        );
-        let paths = if let Some(inputs) = self.inputs {
-            Box::new(inputs.sources.iter().cloned()) as Box<dyn Iterator<Item = BString>>
-        } else {
-            Box::new(
-                resolved
-                    .compile_units
-                    .iter()
-                    .map(|unit| unit.source.value.clone())
-                    .chain(
-                        target
-                            .sources
-                            .iter()
-                            .flat_map(|source| list::split(&source.value, list::Empty::Drop)),
-                    ),
-            )
-        };
-        for path in paths {
-            for base in [&dir.source_dir, &dir.binary_dir] {
-                let input = command_path(model, base, &path);
-                if let Some(step) = commands.producer(&input) {
-                    commands.add_producers([step], &mut self.steps, &mut self.dependencies)?;
-                    if ninja
-                        && let Some(file) =
-                            unity.and_then(|plan| plan.file_for_source(&path, config))
-                    {
-                        unity_inputs.entry(file).or_default().insert(input);
-                    }
-                }
-            }
-        }
+        let (model, resolved) = (self.model, self.resolved);
+        let unity_inputs = self.trace_source_commands(commands, unity)?;
+        source_commands::record_owners(owners, resolved.id, &self.steps);
 
         let unity_prerequisite =
             if !self.steps.is_empty() && unity.is_some_and(|plan| !plan.files.is_empty()) {
@@ -483,157 +462,6 @@ impl<'a> TargetPlan<'a> {
             ));
         }
         Ok(unity_prerequisite)
-    }
-
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "Compile lowering writes graph steps and prerequisite inputs."
-    )]
-    fn add_compile_steps(
-        &mut self,
-        artifacts: &ArtifactSet,
-        commands: &Commands<'_>,
-        precompiled: &pch::Plans,
-        (lint, framework_dirs): (&IndexMap<BString, bool>, &[(BString, bool)]),
-        fortran: Option<&super::fortran::FortranPlan>,
-        usage: &mut UsageResolver<'_>,
-        graph_steps: &mut Vec<BuildStep>,
-        compile_inputs: &mut BTreeMap<BString, Vec<BString>>,
-    ) -> Result<Vec<BString>, ResolveError> {
-        let (model, config, target, resolved) =
-            (self.model, self.config, self.target, self.resolved);
-        let dir = model.dir(target.dir);
-        let mut objects = self
-            .inputs
-            .into_iter()
-            .flat_map(|inputs| inputs.objects.iter().cloned())
-            .collect::<Vec<_>>();
-        let cxx_standard = self
-            .inputs
-            .and_then(|inputs| inputs.standard_requirements.get(b"CXX".as_slice()).copied());
-        let position_independent = self.inputs.and_then(|inputs| inputs.position_independent);
-        for step in super::modules::lower_modules_with_standard(
-            model,
-            resolved,
-            cxx_standard,
-            position_independent,
-        )? {
-            self.steps.insert(push(graph_steps, step));
-        }
-        if let Some(plan) = fortran {
-            for step in plan.scan_steps(
-                model,
-                target,
-                resolved,
-                position_independent,
-                usage.source_paths().map(|paths| paths.host),
-            )? {
-                self.steps.insert(push(graph_steps, step));
-            }
-        }
-        let mut pch_languages = IndexSet::new();
-        for unit in &resolved.compile_units {
-            let Some(group) = resolved.compile_groups.get(unit.group) else {
-                return Err(ResolveError::Message(
-                    [
-                        b"The compile group is missing for ",
-                        unit.source.value.as_slice(),
-                    ]
-                    .concat()
-                    .into(),
-                ));
-            };
-            let required_standard = self
-                .inputs
-                .and_then(|inputs| inputs.standard_requirements.get(&group.language).copied());
-            let pch = precompiled
-                .find(resolved.id, &group.language)
-                .filter(|_| !pch::skip_unit(model, target, unit, self.inputs));
-            if let Some((owner, plan)) = pch {
-                if owner != resolved.id {
-                    self.dependencies.insert(owner);
-                } else if pch_languages.insert(&group.language) {
-                    let unit = CompileUnit {
-                        source: BT::new(plan.source.clone(), target.backtrace.clone()),
-                        object: plan.artifact.clone(),
-                        ..CompileUnit::default()
-                    };
-                    let step = compile(
-                        model,
-                        target,
-                        config,
-                        artifacts,
-                        &unit,
-                        group,
-                        Settings {
-                            standard: required_standard,
-                            pch: Some(PchFlags::Create(plan)),
-                            position_independent,
-                            skip_file_set_linting: None,
-                            extra_framework_dirs: framework_dirs,
-                            compile_input: None,
-                        },
-                        usage,
-                    )?;
-                    let mut requires = vec![plan.header.clone()];
-                    for header in &plan.project_headers {
-                        let path = command_path(model, &dir.binary_dir, header);
-                        if commands
-                            .producer(&path)
-                            .is_some_and(|producer| self.steps.contains(&producer))
-                        {
-                            requires.push(path);
-                        }
-                    }
-                    compile_inputs.insert(plan.artifact.clone(), requires);
-                    self.steps.insert(push(graph_steps, step));
-                }
-            }
-            let fortran_group = fortran
-                .filter(|_| group.language == "Fortran")
-                .map(|plan| plan.compile_group(model, target, unit, group));
-            let mut step = compile(
-                model,
-                target,
-                config,
-                artifacts,
-                unit,
-                fortran_group.as_ref().unwrap_or(group),
-                Settings {
-                    standard: required_standard,
-                    pch: pch.map(|(_, plan)| PchFlags::Use(plan)),
-                    position_independent,
-                    skip_file_set_linting: lint
-                        .get(&Lexical::new(&unit.source.value).normalize())
-                        .copied(),
-                    extra_framework_dirs: framework_dirs,
-                    compile_input: fortran.and_then(|plan| plan.compile_input(&unit.object)),
-                },
-                usage,
-            )?;
-            if let BuildStep::Compile { object, dyndep, .. } = &mut step {
-                if let Some((_, plan)) = pch {
-                    compile_inputs.insert(
-                        object.clone(),
-                        vec![plan.header.clone(), plan.artifact.clone()],
-                    );
-                }
-                if !super::modules::is_std_bmi(model, target) {
-                    objects.push(object.clone());
-                }
-                if unit.scan {
-                    *dyndep = resolved
-                        .cxx_modules
-                        .as_ref()
-                        .map(|info| info.dyndep.clone());
-                }
-            }
-            if let Some(plan) = fortran {
-                plan.bind_compile(&mut step);
-            }
-            self.steps.insert(push(graph_steps, step));
-        }
-        Ok(objects)
     }
 
     fn add_link_and_target_commands(

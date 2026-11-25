@@ -44,9 +44,10 @@ fn single_config_writes_rules_edges_and_utilities() {
                     depfile: Some("a $:file.d".into()),
                     uses_terminal: true,
                     job_pool: Some("ignored".into()),
-                    symbolic: false,
+                    ..CustomStep::default()
                 }),
                 BuildStep::Compile {
+                    byproducts: Vec::new(),
                     compile_input: None,
                     object: "obj/a $:file.o".into(),
                     source: "/work/src/a $:file.c".into(),
@@ -339,6 +340,7 @@ fn target_dependencies_use_the_library_when_its_name_matches_an_executable_outpu
             steps: vec![
                 link(LinkKind::StaticArchive, "libsqlite3.a", Vec::new()),
                 BuildStep::Compile {
+                    byproducts: Vec::new(),
                     compile_input: None,
                     object: "shell.o".into(),
                     source: "shell.c".into(),
@@ -604,6 +606,7 @@ fn module_pipeline_writes_edges_and_target_metadata() -> Result<(), Box<dyn std:
                     implicit_inputs,
                 },
                 BuildStep::Compile {
+                    byproducts: Vec::new(),
                     compile_input: None,
                     object,
                     source,

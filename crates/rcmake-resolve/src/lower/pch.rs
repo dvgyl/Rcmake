@@ -3,7 +3,7 @@ use rcmake_base::{BString, list, shell::quote, truth};
 use rcmake_diag::MessageKind;
 use rcmake_genex::{ConfigId, EvalContext};
 use rcmake_host::{Host, ReadRange, WriteMode, path::to_native};
-use rcmake_model::{DirId, ProjectModel, Target, TargetId, UsageField};
+use rcmake_model::{DirId, GeneratorKind, ProjectModel, Target, TargetId, TargetKind, UsageField};
 
 use super::{definition, expand_rule, join, object_dir, policy_flags::Flags};
 use crate::{
@@ -23,9 +23,13 @@ pub(crate) struct IdeLowering {
     pub(crate) pch: IndexMap<TargetId, Vec<IdePch>>,
 }
 
+pub(super) mod pdb;
+
 const REUSE: &[u8] = b"PRECOMPILE_HEADERS_REUSE_FROM";
 
 pub(super) struct Plan {
+    pub(super) arch: Option<BString>,
+    pub(super) companion_object: Option<BString>,
     pub(super) header: BString,
     pub(super) source: BString,
     pub(super) artifact: BString,
@@ -35,10 +39,17 @@ pub(super) struct Plan {
 #[derive(Clone, Copy)]
 pub(super) enum PchFlags<'a> {
     Create(&'a Plan),
-    Use(&'a Plan),
+    Use(&'a [&'a Plan]),
 }
 
-impl PchFlags<'_> {
+impl<'a> PchFlags<'a> {
+    pub(super) fn architecture(self) -> Option<&'a [u8]> {
+        match self {
+            Self::Create(plan) => plan.arch.as_ref().map(|value| value.as_slice()),
+            Self::Use(_) => None,
+        }
+    }
+
     pub(super) fn options(
         self,
         model: &ProjectModel,
@@ -48,7 +59,20 @@ impl PchFlags<'_> {
         let policy = Flags::new(model, target, language);
         let (plan, option): (_, &[u8]) = match self {
             Self::Create(plan) => (plan, b"COMPILE_OPTIONS_CREATE_PCH"),
-            Self::Use(plan) => (plan, b"COMPILE_OPTIONS_USE_PCH"),
+            Self::Use([plan]) => (*plan, b"COMPILE_OPTIONS_USE_PCH"),
+            Self::Use(plans) => {
+                return plans
+                    .iter()
+                    .filter_map(|plan| {
+                        let arch = plan.arch.as_ref()?;
+                        Some([
+                            quote(&[b"-Xarch_", arch.as_slice()].concat()),
+                            quote(&[b"-include", plan.header.as_slice()].concat()),
+                        ])
+                    })
+                    .flatten()
+                    .collect();
+            }
         };
         let mut flags = Vec::new();
         if target
@@ -82,13 +106,13 @@ impl PchFlags<'_> {
 }
 
 #[derive(Default)]
-pub(super) struct Plans {
+pub(crate) struct Plans {
     owners: IndexMap<TargetId, TargetId>,
-    units: IndexMap<(TargetId, BString), Plan>,
+    units: IndexMap<(TargetId, BString), Vec<Plan>>,
 }
 
 impl Plans {
-    pub(super) fn new(
+    pub(crate) fn new(
         model: &ProjectModel,
         targets: &IndexMap<TargetId, &ResolvedTarget>,
         inputs: &IndexMap<TargetId, sources::TargetInputs>,
@@ -152,8 +176,22 @@ impl Plans {
                 .map(|group| &group.language)
                 .collect::<IndexSet<_>>();
             for language in languages {
-                if let Some(plan) = plan(model, host, usage, id, target, config, language)? {
-                    plans.units.insert((id, language.clone()), plan);
+                let architectures = selected_architectures(model, target, config, language);
+                let architectures = if architectures.len() > 1 {
+                    architectures.into_iter().map(Some).collect()
+                } else {
+                    vec![None]
+                };
+                let mut units = Vec::new();
+                for arch in architectures {
+                    if let Some(plan) =
+                        plan(model, host, usage, id, target, config, language, arch)?
+                    {
+                        units.push(plan);
+                    }
+                }
+                if !units.is_empty() {
+                    plans.units.insert((id, language.clone()), units);
                 }
             }
         }
@@ -161,7 +199,7 @@ impl Plans {
     }
 
     /// Return the precompiled headers of `target` for an IDE generator.
-    pub(super) fn ide(&self, target: &ResolvedTarget) -> Vec<IdePch> {
+    pub(super) fn ide(&self, model: &ProjectModel, target: &ResolvedTarget) -> Vec<IdePch> {
         let languages: IndexSet<_> = target
             .compile_groups
             .iter()
@@ -170,23 +208,125 @@ impl Plans {
         languages
             .into_iter()
             .filter_map(|language| {
-                let (owner, plan) = self.find(target.id, language)?;
+                let owner = self.owner(target.id);
+                let plan = self.units.get(&(owner, language.clone()))?.first()?;
                 Some(IdePch {
                     language: language.clone(),
                     header: plan.header.clone(),
                     source: plan.source.clone(),
+                    artifact: join(&model.dir(DirId::ROOT).binary_dir, &plan.artifact),
+                    compile_pdb: None,
+                    companion: plan
+                        .companion_object
+                        .as_ref()
+                        .map(|file| join(&model.dir(DirId::ROOT).binary_dir, file)),
                     reuse_from: (owner != target.id).then_some(owner),
                 })
             })
             .collect()
     }
 
-    pub(super) fn find(&self, target: TargetId, language: &BString) -> Option<(TargetId, &Plan)> {
-        let owner = self.owners.get(&target).copied().unwrap_or(target);
-        self.units
-            .get(&(owner, language.clone()))
-            .map(|plan| (owner, plan))
+    fn owner(&self, target: TargetId) -> TargetId {
+        self.owners.get(&target).copied().unwrap_or(target)
     }
+
+    pub(super) fn find(
+        &self,
+        model: &ProjectModel,
+        target: &Target,
+        resolved: &ResolvedTarget,
+        language: &BString,
+    ) -> Result<Option<(TargetId, Vec<&Plan>)>, ResolveError> {
+        let owner = self.owner(resolved.id);
+        let Some(plans) = self.units.get(&(owner, language.clone())) else {
+            return Ok(None);
+        };
+        if owner == resolved.id {
+            return Ok(Some((owner, plans.iter().collect())));
+        }
+        let archs = selected_architectures(model, target, &resolved.config, language);
+        let missing = || {
+            ResolveError::Message(
+            format!("Target \"{}\" cannot reuse a precompiled header for its selected architectures.", target.name).into()
+        )
+        };
+        let selected = if let [plan] = plans.as_slice()
+            && plan.arch.is_none()
+        {
+            let provider_archs = model
+                .target(owner)
+                .map(|provider| selected_architectures(model, provider, &resolved.config, language))
+                .unwrap_or_default();
+            if provider_archs != archs {
+                return Err(missing());
+            }
+            vec![plan]
+        } else {
+            if archs.is_empty() {
+                return Err(missing());
+            }
+            archs
+                .iter()
+                .map(|arch| {
+                    plans
+                        .iter()
+                        .find(|plan| plan.arch.as_ref() == Some(arch))
+                        .ok_or_else(missing)
+                })
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        Ok(Some((owner, selected)))
+    }
+
+    pub(crate) fn register_objects(
+        &self,
+        model: &ProjectModel,
+        config: &ConfigId,
+        usage: &mut UsageResolver<'_>,
+    ) {
+        usage.pch_objects.extend(
+            model
+                .targets()
+                .filter(|(_, target)| target.kind == TargetKind::ObjectLibrary)
+                .filter_map(|(id, _)| {
+                    let objects: Vec<_> =
+                        self.object_library_companions(model, id).cloned().collect();
+                    (!objects.is_empty()).then(|| ((id, config.clone()), objects))
+                }),
+        );
+    }
+
+    pub(crate) fn object_library_companions(
+        &self,
+        model: &ProjectModel,
+        id: TargetId,
+    ) -> impl Iterator<Item = &BString> {
+        let owner = self.owner(id);
+        let include = owner == id
+            || model
+                .target(owner)
+                .is_some_and(|target| target.kind == TargetKind::ObjectLibrary);
+        self.units
+            .iter()
+            .filter(move |((id, _), _)| include && *id == owner)
+            .flat_map(|(_, plans)| {
+                plans
+                    .iter()
+                    .filter_map(|plan| plan.companion_object.as_ref())
+            })
+    }
+}
+
+fn selected_architectures(
+    model: &ProjectModel,
+    target: &Target,
+    config: &ConfigId,
+    language: &[u8],
+) -> Vec<BString> {
+    if model.generator == Some(GeneratorKind::Xcode) {
+        return Vec::new();
+    }
+    super::apple::arch::architectures(model, target, config, language)
 }
 
 fn disabled(target: &Target) -> bool {
@@ -245,6 +385,10 @@ const LANGUAGES: &[(&[u8], &[u8], &[u8])] = &[
     (b"OBJCXX", b"cmake_pch.objcxx.hxx", b".mm"),
 ];
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Each precompiled header is configured per language and architecture."
+)]
 fn plan(
     model: &ProjectModel,
     host: &dyn Host,
@@ -253,6 +397,7 @@ fn plan(
     target: &Target,
     config: &ConfigId,
     language: &BString,
+    arch: Option<BString>,
 ) -> Result<Option<Plan>, ResolveError> {
     let Some(&(_, name, suffix)) = LANGUAGES
         .iter()
@@ -269,7 +414,6 @@ fn plan(
     if Flags::new(model, target, language)
         .option(b"COMPILE_OPTIONS_CREATE_PCH")
         .is_none()
-        || property(b"CMAKE_LINK_PCH").is_some_and(|value| truth::is_on(value))
     {
         return Ok(None);
     }
@@ -284,18 +428,42 @@ fn plan(
     if entries.is_empty() {
         return Ok(None);
     }
-    let relative = join(&object_dir(model, target, config), name);
-    let header = join(&model.dir(DirId::ROOT).binary_dir, &relative);
-    let source = BString::from([header.as_slice(), suffix].concat());
-    let artifact = BString::from([relative.as_slice(), extension.as_slice()].concat());
+    let linked = property(b"CMAKE_LINK_PCH").is_some_and(|value| truth::is_on(value));
+    let stem = arch.as_ref().map_or_else(
+        || BString::from("cmake_pch"),
+        |arch| [b"cmake_pch_", arch.as_slice()].concat().into(),
+    );
+    let name = [&stem, name.strip_prefix(b"cmake_pch").unwrap_or(name)].concat();
+    let dir = object_dir(model, target, config);
+    let relative = join(&dir, &name);
+    let root = &model.dir(DirId::ROOT).binary_dir;
+    let header = join(root, &relative);
+    let source = if linked {
+        join(root, &join(&dir, &[stem.as_slice(), suffix].concat()))
+    } else {
+        [header.as_slice(), suffix].concat().into()
+    };
+    let companion_object = linked.then(|| super::object_path(model, target, config, &source));
+    let artifact = if let Some(object) = &companion_object {
+        let stem = object
+            .iter()
+            .rposition(|&byte| byte == b'.')
+            .and_then(|index| object.get(..index))
+            .unwrap_or(object.as_slice());
+        [stem, extension.as_slice()].concat().into()
+    } else {
+        [relative.as_slice(), extension.as_slice()].concat().into()
+    };
     let mut content = Vec::new();
     let mut project_headers = Vec::new();
     if let Some(prologue) = property(b"CMAKE_PCH_PROLOGUE") {
         content.extend_from_slice(prologue);
         content.push(b'\n');
     }
-    let cxx = matches!(language.as_slice(), b"CXX" | b"OBJCXX");
-    if cxx {
+    let xcode = model.generator == Some(rcmake_model::GeneratorKind::Xcode);
+    if xcode {
+        content.extend_from_slice(b"#ifndef CMAKE_SKIP_PRECOMPILE_HEADERS\n");
+    } else if language == b"CXX" {
         content.extend_from_slice(b"#ifdef __cplusplus\n");
     }
     for entry in entries {
@@ -312,7 +480,7 @@ fn plan(
         }
         content.push(b'\n');
     }
-    if cxx {
+    if xcode || language == b"CXX" {
         content.extend_from_slice(b"#endif\n");
     }
     if let Some(epilogue) = property(b"CMAKE_PCH_EPILOGUE") {
@@ -322,6 +490,8 @@ fn plan(
     write_source(host, &header, &content)?;
     write_source(host, &source, b"")?;
     Ok(Some(Plan {
+        arch,
+        companion_object,
         header,
         source,
         artifact,

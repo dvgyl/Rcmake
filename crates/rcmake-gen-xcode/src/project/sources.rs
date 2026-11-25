@@ -209,73 +209,101 @@ pub(super) fn source_files<'a>(
     model: &ProjectModel,
     raw: &Target,
     target: &'a ResolvedTarget,
+    per_language_flags: bool,
 ) -> Result<Vec<Source<'a>>, GenError> {
     let dir = model.dir(raw.dir);
     let mut files = Vec::new();
     let mut seen = BTreeSet::new();
-    let mut add =
-        |path: String, mut kind, group, compile: Option<&'a IdeCompileSettings>, explicit| {
-            if !seen.insert(path.clone()) {
-                return Ok(());
-            }
-            let props = dir.source_props.get(path.as_bytes());
-            if props
-                .and_then(|props| props.get(b"MACOSX_PACKAGE_LOCATION"))
-                .is_some_and(|location| {
-                    location.as_slice() == b"Resources" || location.starts_with(b"Resources/")
-                })
-            {
-                kind = IdeSourceKind::Resource;
-            }
-            let visibility = [
-                (b"PUBLIC_HEADER".as_slice(), "Public"),
-                (b"PRIVATE_HEADER", "Private"),
-            ]
-            .into_iter()
-            .find_map(|(key, visibility)| {
-                let names = settings::strings(raw.props.get(key)?);
-                names
-                    .iter()
-                    .any(|name| Path::new(&path) == to_native(&dir.source_dir).join(name))
-                    .then_some(visibility)
-            });
-            if matches!(kind, IdeSourceKind::Compile { .. }) {
-                let relative_props = Path::new(&path)
-                    .strip_prefix(to_native(&dir.binary_dir))
-                    .ok()
-                    .and_then(|relative| {
-                        let path = to_native(&dir.source_dir).join(relative);
-                        dir.source_props.get(path.to_str()?.as_bytes())
-                    });
-                for name in SOURCE_COMPILE_PROPERTIES {
-                    let value = props
-                        .and_then(|props| props.get(name.as_bytes()))
-                        .or_else(|| relative_props.and_then(|props| props.get(name.as_bytes())));
-                    if let Some(value) = value {
-                        let value = text(value);
-                        if references_config(&value) {
-                            return Err(per_config_source_error(name, &value, &path));
-                        }
+    let prefix = settings::compile::prefix_header(target);
+    let mut add = |path: String,
+                   mut kind,
+                   group,
+                   compile: Option<&'a IdeCompileSettings>,
+                   explicit,
+                   skip_pch| {
+        if !seen.insert(path.clone()) {
+            return Ok(());
+        }
+        let props = dir.source_props.get(path.as_bytes());
+        if props
+            .and_then(|props| props.get(b"MACOSX_PACKAGE_LOCATION"))
+            .is_some_and(|location| {
+                location.as_slice() == b"Resources" || location.starts_with(b"Resources/")
+            })
+        {
+            kind = IdeSourceKind::Resource;
+        }
+        let visibility = [
+            (b"PUBLIC_HEADER".as_slice(), "Public"),
+            (b"PRIVATE_HEADER", "Private"),
+        ]
+        .into_iter()
+        .find_map(|(key, visibility)| {
+            let names = settings::strings(raw.props.get(key)?);
+            names
+                .iter()
+                .any(|name| Path::new(&path) == to_native(&dir.source_dir).join(name))
+                .then_some(visibility)
+        });
+        if matches!(kind, IdeSourceKind::Compile { .. }) {
+            let relative_props = Path::new(&path)
+                .strip_prefix(to_native(&dir.binary_dir))
+                .ok()
+                .and_then(|relative| {
+                    let path = to_native(&dir.source_dir).join(relative);
+                    dir.source_props.get(path.to_str()?.as_bytes())
+                });
+            for name in SOURCE_COMPILE_PROPERTIES {
+                let value = props
+                    .and_then(|props| props.get(name.as_bytes()))
+                    .or_else(|| relative_props.and_then(|props| props.get(name.as_bytes())));
+                if let Some(value) = value {
+                    let value = text(value);
+                    if references_config(&value) {
+                        return Err(per_config_source_error(name, &value, &path));
                     }
                 }
             }
-            let path = if kind == IdeSourceKind::Object {
-                object_reference_path(&path, &text(&target.config.0))
-            } else {
-                path
-            };
-            let flags = compile.map_or_else(String::new, settings::source_flags);
-            files.push(Source {
-                path,
-                kind,
-                group,
-                visibility,
-                flags,
-                compile,
-                explicit,
-            });
-            Ok(())
+        }
+        let path = if kind == IdeSourceKind::Object {
+            object_reference_path(&path, &text(&target.config.0))
+        } else {
+            path
         };
+        let mut flags = compile.map_or_else(String::new, settings::source_flags);
+        if let IdeSourceKind::Compile { language } = &kind
+            && settings::compile::supported(language)
+        {
+            if prefix.is_some() {
+                if flags.contains("-include")
+                    && let Some(hidden) = settings::compile::hide_force_includes(&flags)
+                {
+                    flags = hidden;
+                }
+                if skip_pch
+                    || target
+                        .ide
+                        .as_ref()
+                        .is_none_or(|ide| !ide.pch.iter().any(|pch| pch.language == *language))
+                {
+                    flags.push_str(" -DCMAKE_SKIP_PRECOMPILE_HEADERS");
+                }
+            }
+            if per_language_flags {
+                flags = format!("$({}) {flags}", settings::compile::setting(language));
+            }
+        }
+        files.push(Source {
+            path,
+            kind,
+            group,
+            visibility,
+            flags,
+            compile,
+            explicit,
+        });
+        Ok(())
+    };
     if let Some(ide) = target.ide.as_deref() {
         for source in &ide.sources {
             let path = std::str::from_utf8(&source.path).map_err(|_| {
@@ -289,6 +317,7 @@ pub(super) fn source_files<'a>(
                 text(&source.group),
                 source.compile.as_ref(),
                 true,
+                source.skip_precompile_headers,
             )?;
         }
     }
@@ -298,6 +327,7 @@ pub(super) fn source_files<'a>(
         IdeSourceKind::ListFile,
         String::new(),
         None,
+        false,
         false,
     )?;
     Ok(files)

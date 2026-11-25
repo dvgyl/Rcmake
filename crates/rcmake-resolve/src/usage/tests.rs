@@ -1156,3 +1156,70 @@ fn archive_deduplication_keeps_raw_link_flags_in_place() -> Result<(), Box<dyn s
     );
     Ok(())
 }
+
+#[test]
+fn target_property_read_memoizes_layered_diamond() {
+    let mut model = model("Linux");
+    let root = add(&mut model, "root", TargetKind::InterfaceLibrary);
+    let mut parents = vec![root];
+    for depth in 0..20 {
+        let names = std::array::from_fn::<_, 3, _>(|index| format!("level_{depth}_{index}"));
+        let children = names.map(|name| {
+            let id = add(&mut model, &name, TargetKind::InterfaceLibrary);
+            usage(
+                &mut model,
+                id,
+                UsageField::InterfaceIncludeDirectories,
+                &format!("/include/{name}"),
+            );
+            (name, id)
+        });
+        for parent in parents {
+            link(
+                &mut model,
+                parent,
+                true,
+                &children.each_ref().map(|(name, _)| name.as_str()),
+            );
+        }
+        parents = children.into_iter().map(|(_, id)| id).collect();
+    }
+    let mut resolver = UsageResolver::new(&model);
+    let expr =
+        rcmake_genex::parse(b"$<TARGET_PROPERTY:root,INTERFACE_INCLUDE_DIRECTORIES>").unwrap();
+    let run = |resolver: &mut UsageResolver<'_>| {
+        let (result, _) = rcmake_genex::evaluate(
+            &expr,
+            &EvalContext::default(),
+            &mut resolver.host(DirId::ROOT),
+        )
+        .unwrap();
+        result
+    };
+    use rcmake_host::{Host, NativeHost};
+    let clock = NativeHost::new().unwrap();
+    let start = clock.monotonic();
+    let result = run(&mut resolver);
+    assert!(clock.monotonic().saturating_sub(start) < std::time::Duration::from_secs(1));
+    let paths = rcmake_base::list::split(&result, rcmake_base::list::Empty::Drop);
+    assert_eq!(paths.len(), 60);
+    let expected = (0..20)
+        .map(|depth| format!("/include/level_{depth}_0"))
+        .chain(
+            (0..20)
+                .rev()
+                .flat_map(|depth| [1, 2].map(|index| format!("/include/level_{depth}_{index}"))),
+        )
+        .map(BString::from)
+        .collect::<Vec<_>>();
+    assert_eq!(paths, expected);
+    let cached = resolver
+        .memo
+        .keys()
+        .filter(|key| {
+            key.property_read && key.property.as_ref() == b"INTERFACE_INCLUDE_DIRECTORIES"
+        })
+        .count();
+    assert_eq!(cached, 61);
+    assert_eq!(run(&mut resolver), result);
+}

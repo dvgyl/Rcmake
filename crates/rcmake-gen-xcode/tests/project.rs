@@ -976,3 +976,73 @@ fn known_location_uses_darwin_absolute_framework_paths() {
     assert!(pbx.contains("Versioned.framework in Frameworks"), "{pbx}");
     assert!(!pbx.contains("libcontrol.a in Frameworks"), "{pbx}");
 }
+
+#[test]
+fn objc_targets_preserve_language_settings() {
+    let host = PureHost::default();
+    let source = Path::new("/source");
+    let build = Path::new("/build");
+    let mut model = model(source, build);
+    define(&mut model, "CMAKE_OBJC_COMPILER", "/usr/bin/clang");
+    define(&mut model, "CMAKE_OBJC_SOURCE_FILE_EXTENSIONS", "m");
+    define(&mut model, "CMAKE_OBJC_FLAGS", "-fobjc-arc");
+    define(&mut model, "CMAKE_CXX_COMPILER", "/usr/bin/clang++");
+    define(
+        &mut model,
+        "CMAKE_CXX20_EXTENSION_COMPILE_OPTION",
+        "-std=gnu++20",
+    );
+    let target = add(&mut model, "mixed", TargetKind::Executable, Some("main.c"));
+    let target = model.target_mut(target).expect("target");
+    target
+        .sources
+        .push(BT::new("objc.m".into(), Default::default()));
+    target
+        .sources
+        .push(BT::new("feature.cpp".into(), Default::default()));
+    for (field, expression) in [
+        (
+            rcmake_model::UsageField::CompileDefinitions,
+            "$<$<COMPILE_LANGUAGE:OBJC>:OBJC_ONLY>",
+        ),
+        (
+            rcmake_model::UsageField::IncludeDirectories,
+            "$<$<COMPILE_LANGUAGE:OBJC>:/source/objc-include>",
+        ),
+        (rcmake_model::UsageField::CompileFeatures, "cxx_std_20"),
+    ] {
+        target
+            .usage
+            .push(field, BT::new(expression.into(), Default::default()));
+    }
+    for name in ["main.c", "objc.m", "feature.cpp"] {
+        host.seed_file(&source.join(name), b"")
+            .expect("seed source");
+    }
+    let result = resolve_with_options(
+        &model,
+        &host,
+        &[],
+        &ResolveOptions {
+            ide: Some(IdeFlavor::Xcode),
+            ..Default::default()
+        },
+    )
+    .expect("resolve project");
+    generate(&result, &model, &host, build).expect("generate project");
+    let project = read(&host, &build.join("Demo.xcodeproj/project.pbxproj"));
+    for expected in [
+        "RCMAKE_OBJC_COMPILE_FLAGS",
+        "RCMAKE_C_COMPILE_FLAGS",
+        "OBJC_ONLY",
+        "/source/objc-include",
+        "-fobjc-arc",
+        "-std=gnu++20",
+    ] {
+        assert!(
+            project.contains(expected),
+            "Missing {expected} in {project}"
+        );
+    }
+    assert!(!project.contains("CLANG_CXX_LANGUAGE_STANDARD"));
+}

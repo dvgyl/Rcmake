@@ -227,21 +227,11 @@ fn other_standard_flag(
     .is_none_or(|value| truth::is_on(value));
     let extensions =
         property(b"_EXTENSIONS").map_or(default_extensions, |value| truth::is_on(value));
-    let standard = match (explicit, required) {
-        (Some(explicit), _)
-            if rank(language, explicit) >= required.and_then(|s| rank(language, s)) =>
-        {
-            explicit
-        }
-        (Some(_), Some(required)) => required,
-        (None, Some(required))
-            if rank(language, required) > default.and_then(|s| rank(language, s)) =>
-        {
-            required
-        }
-        (None, _) if new_policy && extensions != default_extensions => default?,
-        _ => return None,
-    };
+    let standard = selected_standard(language, explicit, required, default).or_else(|| {
+        (new_policy && extensions != default_extensions)
+            .then_some(default)
+            .flatten()
+    })?;
     let standard_required =
         property(b"_STANDARD_REQUIRED").is_some_and(|value| truth::is_on(value));
     if new_policy
@@ -279,6 +269,54 @@ fn other_standard_flag(
         _ => return None,
     };
     Some([b"-std=", dialect, standard].concat().into())
+}
+
+fn selected_standard<'a>(
+    language: &[u8],
+    explicit: Option<&'a [u8]>,
+    required: Option<&'a [u8]>,
+    default: Option<&[u8]>,
+) -> Option<&'a [u8]> {
+    match (explicit, required) {
+        (Some(explicit), _)
+            if rank(language, explicit) >= required.and_then(|value| rank(language, value)) =>
+        {
+            Some(explicit)
+        }
+        (Some(_), Some(required)) => Some(required),
+        (None, Some(required))
+            if rank(language, required) > default.and_then(|value| rank(language, value)) =>
+        {
+            Some(required)
+        }
+        _ => None,
+    }
+}
+
+pub(crate) fn cxx_standard_mode(
+    model: &ProjectModel,
+    target: &Target,
+    features: &[BT<BString>],
+) -> (BString, bool, bool) {
+    let property = |name| target_property(model, target, name);
+    let default =
+        definition(model, target.dir, b"CMAKE_CXX_STANDARD_DEFAULT").map(|value| value.as_slice());
+    let explicit = property(b"CXX_STANDARD")
+        .map(|value| value.as_slice())
+        .filter(|value| rank(b"CXX", value).is_some());
+    let standard = selected_standard(
+        b"CXX",
+        explicit,
+        required_standard(b"CXX", features),
+        default,
+    )
+    .or(default)
+    .unwrap_or(b"20");
+    let extensions = property(b"CXX_EXTENSIONS")
+        .or_else(|| definition(model, target.dir, b"CMAKE_CXX_EXTENSIONS_DEFAULT"))
+        .is_none_or(|value| truth::is_on(value));
+    let required = property(b"CXX_STANDARD_REQUIRED").is_some_and(|value| truth::is_on(value));
+    (standard.into(), extensions, required)
 }
 
 fn cuda_standard_flag(

@@ -37,6 +37,7 @@ fn msvc_compile() -> BuildStep {
     ]);
     invocation.shell = "cl.exe -c 'POSIX shell text'".into();
     BuildStep::Compile {
+        byproducts: Vec::new(),
         compile_input: None,
         object: object.into(),
         source: source.into(),
@@ -444,5 +445,82 @@ else:
         "{failed:?}"
     );
     assert!(host.metadata(&marker, Follow::Yes).is_err());
+    Ok(())
+}
+
+#[test]
+fn windows_export_helper_keeps_literal_object_list() -> Result<(), Box<dyn std::error::Error>> {
+    use rcmake_model::{BT, GeneratorKind, Target, TargetKind, TargetOrigin};
+
+    let build = Path::new("/work/build");
+    for (force, count) in [(true, 3), (false, 100)] {
+        let host = PureHost::default();
+        host.env_set(b"CMAKE_NINJA_FORCE_RESPONSE_FILE", force.then_some(b""));
+        let mut model = ProjectModel::default();
+        model.generator = Some(GeneratorKind::Ninja);
+        model.set_root_dirs("/work/source".into(), "/work/build".into());
+        for (key, value) in [
+            ("CMAKE_HOST_SYSTEM_NAME", "Windows"),
+            ("CMAKE_SYSTEM_NAME", "Windows"),
+            ("CMAKE_COMMAND", "rcmake.exe"),
+            ("CMAKE_CXX_COMPILER", "C:/VC/cl.exe"),
+            ("CMAKE_CXX_COMPILER_ID", "MSVC"),
+            ("CMAKE_CXX_OUTPUT_EXTENSION", ".obj"),
+            ("CMAKE_CXX_LINK_DEF_FILE_FLAG", "/DEF:"),
+            ("CMAKE_SHARED_LIBRARY_SUFFIX", ".dll"),
+            (
+                "CMAKE_CXX_CREATE_SHARED_LIBRARY",
+                "rcmake.exe -E vs_link_dll --intdir=CMakeFiles/lib.dir -- C:/VC/link.exe /out:<TARGET> <LINK_FLAGS> <OBJECTS> <LINK_LIBRARIES>",
+            ),
+        ] {
+            model
+                .dir_mut(DirId::ROOT)
+                .vars
+                .insert(key.into(), value.into());
+        }
+        let mut target = Target::new(
+            "exported".into(),
+            TargetKind::SharedLibrary,
+            TargetOrigin::Normal,
+            DirId::ROOT,
+            Default::default(),
+            Default::default(),
+        );
+        target
+            .props
+            .set("WINDOWS_EXPORT_ALL_SYMBOLS".into(), "ON".into());
+        target
+            .sources
+            .push(BT::new("main.cpp".into(), Default::default()));
+        host.seed_file(
+            Path::new("/work/source/main.cpp"),
+            b"int exported() { return 42; }",
+        )?;
+        let mut last = String::new();
+        for index in 0..count {
+            last = format!("object inputs/obj-{index}-{}.obj", "path".repeat(30));
+            host.seed_file(&build.join(&last), b"")?;
+            target.sources.push(BT::new(
+                format!("/work/build/{last}").into(),
+                Default::default(),
+            ));
+        }
+        model.add_target(target)?;
+        let result = rcmake_resolve::resolve(&model, &host, &[])?;
+        generate_single(&result, &host, build, Some(&model), windows())?;
+        let manifest = read(&host, "build.ninja");
+        let files = read(&host, "CMakeFiles/exported.dir/exports.def.objs");
+        assert_eq!(files.lines().count(), count + 1);
+        assert!(files.lines().any(|name| name == last));
+        assert!(manifest.contains("__create_def CMakeFiles/exported.dir/exports.def CMakeFiles/exported.dir/exports.def.objs"));
+        assert!(manifest.contains("vs_link_dll --intdir=CMakeFiles/lib.dir -- C:/VC/link.exe"));
+        assert!(manifest.contains("/out:"));
+        assert!(manifest.contains("@CMakeFiles/rcmake-link-"));
+        assert!(
+            manifest
+                .lines()
+                .any(|line| line.starts_with("  RSP_ARGS =") && line.contains(&last))
+        );
+    }
     Ok(())
 }

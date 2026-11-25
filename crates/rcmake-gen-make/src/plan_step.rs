@@ -16,14 +16,20 @@ pub(super) fn plan_step<'a>(
     let step = match action {
         BuildStep::Compile {
             object,
+            byproducts,
             source,
             compile_input,
             depfile,
             ..
         } => Step {
             action,
+            revised_invocations: None,
+            symbolic_outputs: Vec::new(),
             goal: make_path(object),
-            outputs: vec![make_path(object)],
+            outputs: std::iter::once(object)
+                .chain(byproducts)
+                .map(make_path)
+                .collect(),
             inputs: std::iter::once(compile_input.as_ref().unwrap_or(source))
                 .chain(result.compile_inputs.get(object).into_iter().flatten())
                 .map(make_path)
@@ -41,6 +47,8 @@ pub(super) fn plan_step<'a>(
             ..
         } => Step {
             action,
+            revised_invocations: None,
+            symbolic_outputs: Vec::new(),
             goal: make_path(&step.output),
             outputs: vec![make_path(&step.output)],
             inputs: inputs
@@ -56,6 +64,8 @@ pub(super) fn plan_step<'a>(
         },
         BuildStep::Custom(custom) => Step {
             action,
+            revised_invocations: None,
+            symbolic_outputs: custom.symbolic_outputs.iter().map(make_path).collect(),
             goal: custom.outputs.first().map_or_else(
                 || format!("CMakeFiles/rcmake-step-{step_index}").into(),
                 make_path,
@@ -75,6 +85,8 @@ pub(super) fn plan_step<'a>(
         },
         BuildStep::DeviceLink { output, inputs, .. } => Step {
             action,
+            revised_invocations: None,
+            symbolic_outputs: Vec::new(),
             goal: make_path(output),
             outputs: super::cuda::clean_artifacts(action, build_dir),
             inputs: inputs.iter().map(make_path).collect(),

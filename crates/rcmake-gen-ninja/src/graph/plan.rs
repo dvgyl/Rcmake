@@ -28,7 +28,7 @@ impl EdgePlan {
         }
     }
 
-    fn bind_command(&mut self, command: Vec<u8>, response: Option<Response>) {
+    pub(super) fn bind_command(&mut self, command: Vec<u8>, response: Option<Response>) {
         if let Some(response) = response {
             self.rule = response.rule;
             self.bind(b"COMMAND", response.command);
@@ -62,6 +62,7 @@ impl<'a> Graph<'a> {
                 depfile,
                 modmap,
                 dyndep,
+                ..
             } => {
                 let scan = self.resource_dependency_scan(object, source, invocation);
                 let msvc = scan.is_some() || self.msvc_deps(object, invocation);
@@ -130,6 +131,7 @@ impl<'a> Graph<'a> {
             BuildStep::Scan {
                 source,
                 ddi,
+                object,
                 invocation,
                 depfile,
                 ..
@@ -152,6 +154,13 @@ impl<'a> Graph<'a> {
                     (false, false) => b"CXX_SCAN_NO_DEPFILE",
                 };
                 let mut plan = EdgePlan::new(rule, vec![self.node(source)], nodes);
+                plan.implicit_inputs.extend(
+                    self.compile_inputs
+                        .and_then(|inputs| inputs.get(object))
+                        .into_iter()
+                        .flatten()
+                        .map(|input| self.node(input)),
+                );
                 let invocation = response
                     .as_ref()
                     .map_or(invocation, |(response, _)| &response.invocation);
@@ -263,9 +272,13 @@ impl<'a> Graph<'a> {
                 let mut plan = EdgePlan::new(step.kind.ninja_rule(), path_inputs, nodes);
                 plan.implicit_inputs
                     .extend(implicit_inputs.iter().map(|input| self.node(input)));
-                let command = self.command_line(invocations, false);
-                let response = self.link_response(step, inputs, invocations, &command);
-                plan.bind_command(command, response);
+                if let Some(prepared) = self.prepared_link(nodes) {
+                    prepared.bind(&mut plan);
+                } else {
+                    let command = self.command_line(invocations, false);
+                    let response = self.link_response(step, inputs, invocations, &command);
+                    plan.bind_command(command, response);
+                }
                 if let Some(pool) = self.pools.get(&step.output) {
                     plan.bind(b"pool", pool.clone());
                 }
@@ -328,7 +341,11 @@ impl<'a> Graph<'a> {
                         self.commands.cmd(&argument)
                     },
                 );
-                plan.bind(b"COMMAND", command);
+                if let Some(prepared) = self.prepared_link(nodes) {
+                    prepared.bind(&mut plan);
+                } else {
+                    plan.bind(b"COMMAND", command);
+                }
                 if let Some(script) = script {
                     plan.implicit_inputs.push(script.clone());
                 }

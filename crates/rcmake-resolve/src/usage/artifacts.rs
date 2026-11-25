@@ -654,7 +654,7 @@ impl UsageResolver<'_> {
                 ));
             }
         }
-        let files = unity
+        let mut files = unity
             .into_iter()
             .flat_map(|plan| plan.files.keys())
             .map(|path| (path.clone(), true))
@@ -693,6 +693,15 @@ impl UsageResolver<'_> {
                 absolute_path(binary_root, &object)
             })
             .collect::<IndexSet<_>>();
+        if sources.is_none() {
+            files.extend(
+                self.pch_objects
+                    .get(&(id, config.clone()))
+                    .into_iter()
+                    .flatten()
+                    .map(|object| absolute_path(binary_root, object)),
+            );
+        }
         Some(list::join(files))
     }
 }

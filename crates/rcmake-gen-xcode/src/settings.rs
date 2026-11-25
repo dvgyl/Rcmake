@@ -23,6 +23,8 @@ use crate::{
 };
 
 pub(crate) const CONFIG_DIR: &str = "$(CONFIGURATION)$(EFFECTIVE_PLATFORM_NAME)";
+pub(crate) mod compile;
+
 const INHERITED: &str = "$(inherited)";
 
 pub(crate) struct Product {
@@ -324,6 +326,7 @@ pub(crate) struct TargetSettings<'a> {
     pub(crate) raw: &'a Target,
     pub(crate) target: Option<&'a ResolvedTarget>,
     pub(crate) xcframeworks: &'a BTreeSet<BString>,
+    pub(crate) per_language_flags: bool,
     pub(crate) phase_links: &'a [PhaseLink],
 }
 
@@ -492,120 +495,6 @@ impl TargetSettings<'_> {
         }
     }
 
-    fn add_compile_settings(&self, settings: &mut Attrs, ide: Option<&IdeFacts>) {
-        let pch = ide.and_then(|ide| {
-            ["CXX", "C", "OBJCXX", "OBJC"]
-                .into_iter()
-                .find_map(|language| ide.pch.iter().find(|pch| pch.language == language))
-        });
-        if let Some(pch) = pch {
-            settings.insert("GCC_PREFIX_HEADER".into(), text(&pch.header).into());
-            settings.insert("GCC_PRECOMPILE_PREFIX_HEADER".into(), "YES".into());
-        }
-        let mut headers = Vec::new();
-        let mut frameworks = Vec::new();
-        let mut defines = vec![format!("CMAKE_INTDIR=\"{CONFIG_DIR}\"")];
-        let mut cflags = Vec::new();
-        let mut cxxflags = Vec::new();
-
-        for (language, key, flags) in [
-            ("C", "OTHER_CFLAGS", &mut cflags),
-            ("CXX", "OTHER_CPLUSPLUSFLAGS", &mut cxxflags),
-        ] {
-            let mut include = |flags: &mut Vec<String>, path: &[u8], system, framework| {
-                if framework {
-                    unique(&mut frameworks, text(path));
-                } else if system {
-                    flags.push(format!("-isystem {}", xcode_flag(&text(path))));
-                } else {
-                    unique(&mut headers, text(path));
-                }
-            };
-            if let Some(ide) = ide {
-                for group in ide
-                    .compile
-                    .iter()
-                    .filter(|group| group.language.as_slice() == language.as_bytes())
-                {
-                    for dir in &group.includes {
-                        include(flags, &dir.path, dir.system, dir.framework);
-                    }
-                    for define in &group.defines {
-                        unique(&mut defines, text(&define.value));
-                    }
-                    flags.extend(group.flags.iter().map(|flag| flag_text(&flag.value)));
-                }
-                if let Some(language_pch) = ide
-                    .pch
-                    .iter()
-                    .find(|pch| pch.language.as_slice() == language.as_bytes())
-                    && pch.is_none_or(|pch| pch.header != language_pch.header)
-                {
-                    flags.push(format!(
-                        "-include {}",
-                        xcode_flag(&text(&language_pch.header))
-                    ));
-                }
-            }
-            settings.insert(key.into(), flags_with_inherited(flags));
-        }
-        if let Some(ide) = ide {
-            for item in &ide.link_items {
-                if let IdeLinkItem::File(path) | IdeLinkItem::Framework(path) = item
-                    && let Some(parent) = framework_search_path(path)
-                {
-                    unique(&mut frameworks, parent);
-                }
-                if let IdeLinkItem::Target(id) = item
-                    && let Some(product) = self.linked_product(*id)
-                    && matches!(product.bundle, BundleKind::Framework { .. })
-                {
-                    unique(&mut frameworks, product.dir);
-                }
-            }
-        }
-        for dir in self.phase_search_paths(true) {
-            unique(&mut frameworks, dir);
-        }
-        settings.insert(
-            "GCC_PREPROCESSOR_DEFINITIONS".into(),
-            inherited_values(
-                defines
-                    .into_iter()
-                    .map(|value| xcode_flag(&value))
-                    .collect(),
-            ),
-        );
-        for (key, values) in [
-            ("HEADER_SEARCH_PATHS", headers),
-            ("FRAMEWORK_SEARCH_PATHS", frameworks),
-        ] {
-            if !values.is_empty() {
-                settings.insert(key.into(), inherited_paths(values));
-            }
-        }
-        let raw = self.raw;
-        if let Some(standard) = raw
-            .props
-            .get(b"CXX_STANDARD")
-            .filter(|value| !value.is_empty())
-        {
-            let dialect = if raw
-                .props
-                .get(b"CXX_EXTENSIONS")
-                .is_some_and(|v| !truth::is_on(v))
-            {
-                "c++"
-            } else {
-                "gnu++"
-            };
-            settings.insert(
-                "CLANG_CXX_LANGUAGE_STANDARD".into(),
-                format!("{dialect}{}", text(standard)).into(),
-            );
-        }
-    }
-
     fn add_link_settings(&self, settings: &mut Attrs, product: &Product, ide: Option<&IdeFacts>) {
         let Self {
             model,
@@ -713,7 +602,7 @@ impl TargetSettings<'_> {
                         }
                     }
                     IdeLinkItem::Flag(flag) => ldflags.push(flag_text(flag)),
-                    IdeLinkItem::XcodeFeature(_) => {}
+                    IdeLinkItem::XcodeFeature(_) | IdeLinkItem::VisualStudioFeature { .. } => {}
                 }
             }
             if let Some(dir) = &ide.install_name_dir {

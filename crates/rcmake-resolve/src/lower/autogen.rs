@@ -313,6 +313,48 @@ mod tests {
     }
 
     #[test]
+    fn autorcc_no_zstd_uses_target_qt_feature() -> Result<(), Box<dyn std::error::Error>> {
+        for (feature, explicit, expected) in [
+            (None, false, 0),
+            (Some("ON"), false, 0),
+            (Some(""), false, 1),
+            (Some("OFF"), false, 1),
+            (Some("OFF"), true, 1),
+        ] {
+            let host = PureHost::default();
+            let plan = fixture_with(&host, GeneratorKind::Ninja, "8", None, |model, id, _| {
+                if let Some(value) = feature {
+                    model
+                        .dir_mut(DirId::ROOT)
+                        .vars
+                        .insert("QT_FEATURE_zstd".into(), value.into());
+                }
+                if explicit {
+                    model
+                        .target_mut(id)
+                        .ok_or("Missing target")?
+                        .props
+                        .set("AUTORCC_OPTIONS".into(), "--no-zstd".into());
+                }
+                Ok(())
+            })?;
+            plan.write_info(&host, &[])?;
+            let rcc = read_info(&host, b"AutoRcc_sample_EWIEGA46WW_Info.json")?;
+            let Some(Value::Array(options)) = rcc.get(b"OPTIONS".as_slice()) else {
+                return Err("Missing RCC options".into());
+            };
+            assert_eq!(
+                options
+                    .iter()
+                    .filter(|option| **option == Value::String("--no-zstd".into()))
+                    .count(),
+                expected
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn metadata_matches_the_single_config_schema() -> Result<(), Box<dyn std::error::Error>> {
         let host = PureHost::new("/".into(), "/cmake".into());
         let plan = fixture(&host, GeneratorKind::Ninja, "8", None)?;

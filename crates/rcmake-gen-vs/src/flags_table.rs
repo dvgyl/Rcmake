@@ -104,7 +104,7 @@ impl Settings {
     }
 }
 
-pub(crate) fn compile(flags: impl IntoIterator<Item = String>) -> Settings {
+pub(crate) fn compile(flags: impl IntoIterator<Item = String>, toolset: &str) -> Settings {
     let mut flags = flags.into_iter();
     let mut settings = Settings::default();
     while let Some(flag) = flags.next() {
@@ -141,7 +141,7 @@ pub(crate) fn compile(flags: impl IntoIterator<Item = String>) -> Settings {
                     msbuild_value(&windows(key.strip_prefix('I').unwrap_or_default())),
                 );
             }
-            Some(key) => match compile_property(key) {
+            Some(key) => match compile_property(key, toolset) {
                 Some((property, value)) => settings.set(property, value),
                 None => settings.option(&flag),
             },
@@ -151,7 +151,7 @@ pub(crate) fn compile(flags: impl IntoIterator<Item = String>) -> Settings {
     settings
 }
 
-fn compile_property(flag: &str) -> Option<(&'static str, &'static str)> {
+fn compile_property(flag: &str, toolset: &str) -> Option<(&'static str, &'static str)> {
     Some(match flag {
         "Od" | "O0" => ("Optimization", "Disabled"),
         "O1" => ("Optimization", "MinSpace"),
@@ -195,7 +195,8 @@ fn compile_property(flag: &str) -> Option<(&'static str, &'static str)> {
         "std:c++14" => ("LanguageStandard", "stdcpp14"),
         "std:c++17" => ("LanguageStandard", "stdcpp17"),
         "std:c++20" => ("LanguageStandard", "stdcpp20"),
-        "std:c++23latest" => ("LanguageStandard", "stdcpp23"),
+        "std:c++23preview" => ("LanguageStandard", "stdcpp23"),
+        "std:c++23" if toolset == "v145" => ("LanguageStandard", "stdcpp23"),
         "std:c++latest" => ("LanguageStandard", "stdcpplatest"),
         "std:c11" => ("LanguageStandard_C", "stdc11"),
         "std:c17" => ("LanguageStandard_C", "stdc17"),

@@ -1,3 +1,5 @@
+pub(crate) mod arch;
+
 use rcmake_base::path_lex::Lexical;
 use rcmake_model::{DirId, ProjectModel};
 
