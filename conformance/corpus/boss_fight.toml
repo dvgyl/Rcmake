@@ -62,7 +62,12 @@ repository = "boostorg/boost"
 version = "boost-1.88.0"
 commit = "199ef13d6034c85232431130142159af3adfce22"
 submodules = true
-configure_args = ["-DBOOST_INCLUDE_LIBRARIES=filesystem;system", "-DBUILD_TESTING=ON"]
+# Boost 1.88 libs/locale fails on CMake 4.5.1 too: source_group(TREE) rejects
+# boost/locale as a prefix of boost/locale.hpp. Exclude it from both engines.
+configure_args = [
+    "-DBOOST_INCLUDE_LIBRARIES=filesystem;system", "-DBOOST_EXCLUDE_LIBRARIES=locale",
+    "-DBUILD_TESTING=ON",
+]
 l1 = true
 l2_targets = ["boost_filesystem"]
 l3_targets = ["boost_filesystem"]

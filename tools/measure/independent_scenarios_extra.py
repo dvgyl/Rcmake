@@ -27,7 +27,7 @@ import stat
 import subprocess
 import tarfile
 import textwrap
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 import zipfile
 
 import independent_verify as iv
@@ -189,6 +189,21 @@ def cmake_errors(text: str) -> list[str]:
     if current is not None:
         blocks.append(" ".join(" ".join(current).split()))
     return blocks
+
+
+def collapse_repeats(blocks: Sequence[str]) -> list[str]:
+    """Return the diagnostic blocks with consecutive identical blocks given once.
+
+    Some CMake errors come from internal functions that several call sites
+    use, with no deduplication. For example, cmTarget::ImportedGetFullPath
+    gives the same CMP0111 error one time for each caller. The number of
+    copies is an implementation detail. The text and the order are not.
+    """
+    out: list[str] = []
+    for block in blocks:
+        if not out or out[-1] != block:
+            out.append(block)
+    return out
 
 
 # --------------------------------------------------------------------------
@@ -620,7 +635,7 @@ def s16_file_sets(ctx: Ctx) -> None:
         blocks = cmake_errors(proc.output)
         ctx.check(f"{name}: configure fails", proc.returncode != 0, proc.tail())
         ctx.check(f"{name}: diagnostic", any(FILE_SET_ERROR_TEXT[name] in block for block in blocks), blocks)
-        ctx.observe(f"file set error {name}", [proc.returncode, blocks])
+        ctx.observe(f"file set error {name}", [proc.returncode, collapse_repeats(blocks)])
 
     # (b) A HEADERS file set: build, verify, install, export, and consume.
     src = ctx.tree(r / "fsh", HEADER_SET_PROJECT)
@@ -803,6 +818,66 @@ def without_install_layout(value: Any) -> Any:
     return value
 
 
+def backtrace_chain(graph: Mapping[str, Any], index: Any) -> list[str]:
+    """Return the frames of a backtraceGraph node, from the node to the root.
+
+    Each frame is "file:line (command)", or only "file" for a file node.
+    A bad index or a parent loop gives a "<bad node ...>" frame.
+    """
+    nodes, files, commands = (graph.get(key) or [] for key in ("nodes", "files", "commands"))
+    chain: list[str] = []
+    while index is not None:
+        if isinstance(index, bool) or not isinstance(index, int) or not 0 <= index < len(nodes) \
+                or len(chain) > len(nodes) or not isinstance(nodes[index], Mapping):
+            chain.append(f"<bad node {index}>")
+            break
+        node = nodes[index]
+        file, command = node.get("file"), node.get("command")
+        frame = files[file] if isinstance(file, int) and 0 <= file < len(files) else f"<bad file {file}>"
+        if "line" in node:
+            frame += f":{node['line']}"
+        if command is not None:
+            frame += f" ({commands[command]})" if isinstance(command, int) and 0 <= command < len(commands) \
+                else f" (<bad command {command}>)"
+        chain.append(frame)
+        index = node.get("parent")
+    return chain
+
+
+def canonical_codemodel(value: Any, graph: Mapping[str, Any] | None = None) -> Any:
+    """Make a File API reply independent of two orders that CMake does not specify.
+
+    - A target's "dependencies" array is sorted by "id". CMake writes it from
+      a std::set that is ordered by object address (cmTargetDepend.h).
+    - Each "backtrace" index and each "backtraces" index list becomes the
+      resolved chain of frames. An index is the position of a node in
+      "backtraceGraph", so it moves when an earlier node changes. The graph
+      itself becomes the sorted list of the chains of all its nodes. Thus
+      an extra, missing, or different frame is still a difference.
+    """
+    if isinstance(value, list):
+        return [canonical_codemodel(item, graph) for item in value]
+    if not isinstance(value, Mapping):
+        return value
+    own = value.get("backtraceGraph")
+    if isinstance(own, Mapping):
+        graph = own
+    out: dict[str, Any] = {}
+    for key, item in value.items():
+        if key == "backtraceGraph" and isinstance(item, Mapping):
+            nodes = item.get("nodes") if isinstance(item.get("nodes"), list) else []
+            out[key] = [list(chain) for chain in sorted({tuple(backtrace_chain(item, i)) for i in range(len(nodes))})]
+        elif key == "backtrace" and graph is not None and isinstance(item, int) and not isinstance(item, bool):
+            out[key] = backtrace_chain(graph, item)
+        elif key == "backtraces" and graph is not None and isinstance(item, list):
+            out[key] = [backtrace_chain(graph, index) for index in item]
+        elif key == "dependencies" and isinstance(item, list) and all(isinstance(d, Mapping) for d in item):
+            out[key] = sorted((canonical_codemodel(d, graph) for d in item), key=lambda d: str(d.get("id", "")))
+        else:
+            out[key] = canonical_codemodel(item, graph)
+    return out
+
+
 def find_target(config: Mapping[str, Any], name: str) -> dict[str, Any]:
     """Return the resolved target object of a codemodel configuration."""
     for item in config.get("targets", []) + config.get("abstractTargets", []):
@@ -893,7 +968,7 @@ def s17_file_api(ctx: Ctx) -> None:
 
     ctx.observe("index", {key: value for key, value in index.items() if key != "reply"})
     for key in sorted(reply):
-        ctx.observe(f"reply {key}", without_install_layout(reply[key]))
+        ctx.observe(f"reply {key}", canonical_codemodel(without_install_layout(reply[key])))
 
     # The model must match the build: build Release and look for each artifact.
     ctx.ok("build Release", ctx.build(build, "Ninja Multi-Config"))
@@ -1165,7 +1240,8 @@ def s18_adversarial(ctx: Ctx) -> None:
         proc = ctx.configure(nsrc, base / f"neg-b {name}", gens[0])
         blocks = cmake_errors(proc.output)
         ctx.check(f"{name}: configure fails", proc.returncode != 0, proc.tail())
-        ctx.observe(f"{name}: diagnostics", [proc.returncode, message_lines(proc.stdout, "-- POLICY"), blocks])
+        ctx.observe(f"{name}: diagnostics",
+                    [proc.returncode, message_lines(proc.stdout, "-- POLICY"), collapse_repeats(blocks)])
         if name == "cmp0220-old":
             ctx.check("CMP0220 OLD keeps CXX in the block",
                       "-- POLICY CMP0220 OLD gives CXX_LOADED=[]" in proc.stdout, proc.tail())
@@ -1200,6 +1276,43 @@ E_ARCHIVES = (
 )
 E_MEMBERS = ["d", "d/a.txt", "d/link", "d/sp ace.txt", "d/sub", "d/sub/b.txt"]
 HASH_ALGOS = ("md5", "sha1", "sha224", "sha256", "sha384", "sha512")
+
+
+# The generators that Rcmake implements. Rcmake has no Watcom WMake, no
+# FASTBuild, and no legacy extra generators (CodeBlocks, Kate, ...).
+RCMAKE_GENERATORS = ("Ninja", "Ninja Multi-Config", "Unix Makefiles", "Xcode")
+
+
+def supported_capabilities(data: Any) -> Any:
+    """Return "cmake -E capabilities" output without the parts Rcmake omits by design.
+
+    Rcmake has no DAP debugger ("debugger") and no extra generators. Only
+    the generators that Rcmake implements stay, sorted by name. Visual
+    Studio generators stay too. All other members stay as they are.
+    """
+    if not isinstance(data, Mapping):
+        return data
+    out = {key: value for key, value in data.items() if key != "debugger"}
+    if isinstance(data.get("generators"), list):
+        gens = [{key: value for key, value in gen.items() if key != "extraGenerators"}
+                for gen in data["generators"] if isinstance(gen, Mapping)
+                and (gen.get("name") in RCMAKE_GENERATORS or str(gen.get("name", "")).startswith("Visual Studio"))]
+        out["generators"] = sorted(gens, key=lambda gen: str(gen.get("name", "")))
+    return out
+
+
+def without_tar_owner(line: str) -> str:
+    """Return a "tar tvf" line with collapsed spaces and no owner or group names.
+
+    Columns 3 and 4 are the owner and the group. CMake stores the owner of
+    the file on disk, so the value depends on the host. Rcmake stores uid 0
+    and gid 0 for reproducible archives. The mode, link count, size, date,
+    path, and link target stay.
+    """
+    parts = re.sub(r"\s+", " ", line).split(" ", 4)
+    if len(parts) == 5:
+        parts[2:4] = ["<OWNER>", "<GROUP>"]
+    return " ".join(parts)
 
 
 def e_fixture(ctx: Ctx) -> None:
@@ -1262,7 +1375,7 @@ def s19_cmake_e(ctx: Ctx) -> None:
     ctx.check("tar tvf shows the link and the fixed date",
               verbose.ok and any(line.endswith("d/link -> a.txt") for line in lines)
               and all("2001" in line for line in lines), verbose.tail())
-    ctx.observe("tar tvf", [verbose.returncode, [re.sub(r"\s+", " ", line) for line in lines]])
+    ctx.observe("tar tvf", [verbose.returncode, [without_tar_owner(line) for line in lines]])
 
     # Selective extraction and extraction errors.
     sel = r / "x-select"
@@ -1395,7 +1508,7 @@ def s19_cmake_e(ctx: Ctx) -> None:
     names = sorted(gen.get("name", "") for gen in data.get("generators", []))
     ctx.check("capabilities lists Ninja and Unix Makefiles",
               {"Ninja", "Ninja Multi-Config", "Unix Makefiles"} <= set(names), names)
-    ctx.observe("capabilities", data)
+    ctx.observe("capabilities", supported_capabilities(data))
 
 
 # --------------------------------------------------------------------------

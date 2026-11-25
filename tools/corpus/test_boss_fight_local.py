@@ -119,6 +119,31 @@ class BossFightTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "schema version"):
             boss.load_projects("all", path)
 
+    def test_model_data_drops_backtrace_indexes(self):
+        reply = self.root / "reply"
+        reply.mkdir()
+        (reply / "index-1.json").write_text(json.dumps({"reply": {"codemodel-v2": {"jsonFile": "m.json"}}}))
+        target = {"name": "app", "backtrace": 1, "backtraceGraph": {"nodes": []},
+                  "sources": [{"path": "a.c", "backtrace": 2, "backtraces": [2, 3]}],
+                  "dependencies": [{"id": "b", "backtrace": 4}, {"id": "a", "backtrace": 5}]}
+        (reply / "t.json").write_text(json.dumps(target))
+        (reply / "m.json").write_text(json.dumps({"targets": [{"name": "app", "jsonFile": "t.json"}]}))
+        self.assertEqual(boss.model_data(reply, Normalizer(self.root)), {"targets": [{"name": "app", "data": {
+            "name": "app", "sources": [{"path": "a.c"}], "dependencies": [{"id": "a"}, {"id": "b"}]}}]})
+
+    def test_save_l1_hides_only_the_value_of_nondeterministic_cache_entries(self):
+        log = self.root / "log"
+        log.mkdir()
+        (log / "CMakeCache.txt").write_text(
+            "// comment\nOPENCV_TIMESTAMP:INTERNAL=2026-11-25T10:00:00Z\nOTHER:STRING=x\n")
+        (log / "configure.stderr").write_text("")
+        tc = boss.Toolchain(self.root, self.root, Path("/usr/bin/cc"), Path("/usr/bin/c++"),
+                            Path("ninja"), Path(sys.executable))
+        with patch("boss_fight_local.run_command"):
+            boss.save_l1(log, Normalizer(self.root), tc, {})
+        self.assertEqual(json.loads((log / "cache.json").read_text()), {
+            "OPENCV_TIMESTAMP:INTERNAL": "<nondeterministic>", "OTHER:STRING": "x"})
+
     def test_ninja_helper_preserves_duplicates_and_argument_order(self):
         output = "[1/3] cc -Ia -Ib\n[2/3] cc -Ib -Ia\n[3/3] cc -Ia -Ib\n"
         result = subprocess.CompletedProcess(["ninja"], 0, stdout=output, stderr="")

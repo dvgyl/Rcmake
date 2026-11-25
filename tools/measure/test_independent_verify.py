@@ -453,6 +453,114 @@ class ExtraHelperTest(TempDirTest):
                                       {"name": "A", "value": "1"}]}}
         self.assertEqual(ix.without_install_layout(value), {"json": {"entries": [{"name": "A", "value": "1"}]}})
 
+    def test_collapse_repeats_keeps_text_order_and_distinct_blocks(self) -> None:
+        err, warn = "CMake Error in CMakeLists.txt: E", "CMake Warning at a:1 (x): W"
+        self.assertEqual(ix.collapse_repeats([warn, err, err, err]), [warn, err])
+        self.assertEqual(ix.collapse_repeats([err, warn, err]), [err, warn, err])
+        self.assertEqual(ix.collapse_repeats([]), [])
+        # The oracle repeats the error, Rcmake gives it once: the observations are equal.
+        self.assertEqual(ix.collapse_repeats([err] * 4), ix.collapse_repeats([err]))
+        # Different text stays different.
+        self.assertNotEqual(ix.collapse_repeats([err, err]), ix.collapse_repeats([err + "x"]))
+
+    def test_without_tar_owner(self) -> None:
+        oracle = "-rw-------  0 devg   wheel      11  3 Feb 2001 d/sp ace.txt"
+        rcmake = "-rw-------  0 0      0          11  3 Feb 2001 d/sp ace.txt"
+        self.assertEqual(ix.without_tar_owner(oracle), "-rw------- 0 <OWNER> <GROUP> 11 3 Feb 2001 d/sp ace.txt")
+        self.assertEqual(ix.without_tar_owner(oracle), ix.without_tar_owner(rcmake))
+        self.assertEqual(ix.without_tar_owner("lrwxr-xr-x 0 devg wheel 0 3 Feb 2001 d/link -> a.txt"),
+                         "lrwxr-xr-x 0 <OWNER> <GROUP> 0 3 Feb 2001 d/link -> a.txt")
+        # The mode, size, date, path, and link target are still compared.
+        for other in ("-rw-r--r-- 0 0 0 11 3 Feb 2001 d/sp ace.txt", "-rw------- 0 0 0 12 3 Feb 2001 d/sp ace.txt",
+                      "-rw------- 0 0 0 11 4 Feb 2001 d/sp ace.txt", "-rw------- 0 0 0 11 3 Feb 2001 d/space.txt"):
+            self.assertNotEqual(ix.without_tar_owner(other), ix.without_tar_owner(oracle))
+        self.assertNotEqual(ix.without_tar_owner("l 0 a b 0 d/link -> a.txt"),
+                            ix.without_tar_owner("l 0 a b 0 d/link -> b.txt"))
+        self.assertEqual(ix.without_tar_owner("short line"), "short line")
+
+    def test_supported_capabilities(self) -> None:
+        def gen(name: str, extra: list[str], toolset: bool = False) -> dict:
+            return {"extraGenerators": extra, "name": name, "platformSupport": False, "toolsetSupport": toolset}
+
+        common = {"fileApi": {"requests": []}, "instrumentation": {"apiVersion": 1}, "serverMode": False,
+                  "tls": True, "version": {"string": "4.5.1"}}
+        oracle = common | {"debugger": True, "generators": [
+            gen("Ninja Multi-Config", ["Kate"]), gen("Watcom WMake", []), gen("FASTBuild", []),
+            gen("Xcode", [], True), gen("Ninja", ["CodeBlocks"]), gen("Unix Makefiles", ["Kate"]),
+            gen("Visual Studio 17 2022", [])]}
+        rcmake = common | {"debugger": False, "generators": [
+            gen("Unix Makefiles", []), gen("Ninja", []), gen("Ninja Multi-Config", []), gen("Xcode", [], True),
+            gen("Visual Studio 17 2022", [])]}
+        self.assertEqual(ix.supported_capabilities(oracle), ix.supported_capabilities(rcmake))
+        self.assertEqual([g["name"] for g in ix.supported_capabilities(oracle)["generators"]],
+                         ["Ninja", "Ninja Multi-Config", "Unix Makefiles", "Visual Studio 17 2022", "Xcode"])
+        # tls, version, fileApi, instrumentation, serverMode, and generator details stay strict.
+        for key, value in (("tls", False), ("version", {"string": "4.5.0"}), ("fileApi", {}),
+                           ("instrumentation", {}), ("serverMode", True)):
+            self.assertNotEqual(ix.supported_capabilities(rcmake | {key: value}),
+                                ix.supported_capabilities(oracle), key)
+        no_xcode = rcmake | {"generators": rcmake["generators"][:3]}
+        self.assertNotEqual(ix.supported_capabilities(no_xcode), ix.supported_capabilities(oracle))
+        no_toolset = rcmake | {"generators": rcmake["generators"][:3] + [gen("Xcode", [])]}
+        self.assertNotEqual(ix.supported_capabilities(no_toolset), ix.supported_capabilities(oracle))
+        self.assertEqual(ix.supported_capabilities({}), {})
+
+    def test_backtrace_chain(self) -> None:
+        graph = {"commands": ["add_executable", "include"], "files": ["CMakeLists.txt", "x.cmake"],
+                 "nodes": [{"file": 0}, {"command": 1, "file": 0, "line": 3, "parent": 0},
+                           {"file": 1, "parent": 1}, {"command": 0, "file": 1, "line": 2, "parent": 2},
+                           {"file": 0, "parent": 4}]}
+        self.assertEqual(ix.backtrace_chain(graph, 3),
+                         ["x.cmake:2 (add_executable)", "x.cmake", "CMakeLists.txt:3 (include)", "CMakeLists.txt"])
+        self.assertEqual(ix.backtrace_chain(graph, 9), ["<bad node 9>"])
+        self.assertEqual(ix.backtrace_chain(graph, 4)[-1], "<bad node 4>")
+        self.assertEqual(ix.backtrace_chain(graph, True), ["<bad node True>"])
+
+    def test_canonical_codemodel_sorts_dependencies_and_resolves_backtraces(self) -> None:
+        # The same target as CMake writes it and with a different node order.
+        oracle = {"name": "app", "backtrace": 1, "dependencies": [
+            {"backtrace": 2, "id": "core::@1"}, {"backtrace": 3, "id": "stamp::@2"}],
+            "sources": [{"backtrace": 1, "backtraces": [1], "path": "main.cpp"}],
+            "backtraceGraph": {"commands": ["add_executable", "target_link_libraries", "add_dependencies"],
+                               "files": ["CMakeLists.txt"],
+                               "nodes": [{"file": 0}, {"command": 0, "file": 0, "line": 12, "parent": 0},
+                                         {"command": 1, "file": 0, "line": 14, "parent": 0},
+                                         {"command": 2, "file": 0, "line": 15, "parent": 0}]}}
+        rcmake = {"name": "app", "backtrace": 3, "dependencies": [
+            {"backtrace": 1, "id": "stamp::@2"}, {"backtrace": 2, "id": "core::@1"}],
+            "sources": [{"backtrace": 3, "backtraces": [3], "path": "main.cpp"}],
+            "backtraceGraph": {"commands": ["add_dependencies", "target_link_libraries", "add_executable"],
+                               "files": ["CMakeLists.txt"],
+                               "nodes": [{"file": 0}, {"command": 0, "file": 0, "line": 15, "parent": 0},
+                                         {"command": 1, "file": 0, "line": 14, "parent": 0},
+                                         {"command": 2, "file": 0, "line": 12, "parent": 0}]}}
+        left, right = ix.canonical_codemodel({"t": [oracle]}), ix.canonical_codemodel({"t": [rcmake]})
+        self.assertEqual(left, right)
+        target = left["t"][0]
+        self.assertEqual([d["id"] for d in target["dependencies"]], ["core::@1", "stamp::@2"])
+        self.assertEqual(target["dependencies"][0]["backtrace"],
+                         ["CMakeLists.txt:14 (target_link_libraries)", "CMakeLists.txt"])
+        self.assertEqual(target["sources"][0]["backtraces"], [["CMakeLists.txt:12 (add_executable)", "CMakeLists.txt"]])
+        # A wrong frame, a wrong dependency backtrace, or an extra node is still a difference.
+        wrong_line = json.loads(json.dumps(rcmake))
+        wrong_line["backtraceGraph"]["nodes"][3]["line"] = 13
+        wrong_dep = json.loads(json.dumps(rcmake))
+        wrong_dep["dependencies"][0]["backtrace"] = 2
+        extra_node = json.loads(json.dumps(rcmake))
+        extra_node["backtraceGraph"]["nodes"].append({"command": 0, "file": 0, "line": 99, "parent": 0})
+        missing_dep = json.loads(json.dumps(rcmake))
+        missing_dep["dependencies"].pop()
+        for bad in (wrong_line, wrong_dep, extra_node, missing_dep):
+            self.assertNotEqual(ix.canonical_codemodel({"t": [bad]}), left)
+        # Each object uses its own graph. Other orders and values do not change.
+        nested = {"backtraceGraph": {"commands": [], "files": ["a"], "nodes": [{"file": 0}]},
+                  "inner": [{"backtrace": 0}], "linkLibraries": [{"id": "z"}, {"id": "a"}], "other": {"backtrace": 5}}
+        out = ix.canonical_codemodel(nested)
+        self.assertEqual(out["inner"], [{"backtrace": ["a"]}])
+        self.assertEqual(out["linkLibraries"], [{"id": "z"}, {"id": "a"}])
+        self.assertEqual(out["other"], {"backtrace": ["<bad node 5>"]})
+        self.assertEqual(ix.canonical_codemodel({"backtrace": 2}), {"backtrace": 2})
+
     def test_build_ninja_rules(self) -> None:
         (self.tmp / "build.ninja").write_text(textwrap.dedent("""\
             build dep$ sub/new.txt | ${cmake_ninja_workdir}dep$ sub/new.txt: CUSTOM_COMMAND

@@ -562,6 +562,7 @@ jobs:
             source /opt/ros/jazzy/setup.bash
           fi
           timeout --kill-after=15s 44m python3 - <<'PY'
+          from collections import Counter
           import itertools
           import json
           import os
@@ -572,7 +573,14 @@ jobs:
           import tomllib
 
           sys.path.insert(0, "tools/measure")
-          from ninja_canon import Normalizer, canonicalize, differences, dry_run
+          from ninja_canon import Normalizer, canonicalize, differences, dry_run, row_key
+
+          # The File API members with backtrace indexes or reply file names.
+          # An index changes when an unrelated node changes.
+          MODEL_IGNORED_KEYS = {"backtrace", "backtraces", "backtraceGraph", "jsonFile"}
+          # Cache entries whose value is the configure time. Only the value is hidden.
+          NONDETERMINISTIC_CACHE_KEYS = ("OPENCV_TIMESTAMP",)
+          DIFF_LINES = 2000
 
           with open("conformance/corpus/boss_fight.toml", "rb") as stream:
               pin = next(row for row in tomllib.load(stream)["project"]
@@ -627,7 +635,7 @@ jobs:
                       return [read(item) for item in value]
                   if isinstance(value, dict):
                       row = {key: read(item) for key, item in value.items()
-                             if key not in {"backtrace", "backtraceGraph", "jsonFile"}}
+                             if key not in MODEL_IGNORED_KEYS}
                       if "jsonFile" in value:
                           row["data"] = read(json.loads((reply / value["jsonFile"]).read_text()))
                       # CMake can emit target dependency IDs in a different order on each run.
@@ -645,7 +653,10 @@ jobs:
               query = build / ".cmake/api/v1/query"
               query.mkdir(parents=True)
               (query / "codemodel-v2").touch()
+              # The tool labels come before <cmake>. The Rcmake tools are symbolic
+              # links to one program, so the resolved path must keep <cmake>.
               normalize = Normalizer(build, source, {
+                  **{cmake.with_name(tool): f"<{tool}>" for tool in ("ctest", "cpack", "ccmake")},
                   cmake: "<cmake>", install: "<install>",
                   cmake.parent.parent / "share/cmake-4.5": "<cmake-data>",
               })
@@ -659,9 +670,12 @@ jobs:
               try:
                   with (report / f"{name}.stderr").open("w") as log:
                       subprocess.run(command, timeout=600, check=True, stderr=log)
-                  cache = sorted(normalize.text(line) for line in
-                                 (build / "CMakeCache.txt").read_text().splitlines()
-                                 if line and not line.startswith(("#", "//")))
+                  cache = sorted(
+                      line.partition("=")[0] + "=<nondeterministic>"
+                      if line.startswith(tuple(f"{key}:" for key in NONDETERMINISTIC_CACHE_KEYS))
+                      else normalize.text(line)
+                      for line in (build / "CMakeCache.txt").read_text().splitlines()
+                      if line and not line.startswith(("#", "//")))
                   diagnostics = [normalize.text((report / f"{name}.stderr").read_text())]
                   return {
                       "diagnostics": diagnostics,
@@ -694,9 +708,19 @@ jobs:
                       continue
                   mismatches.add(key)
                   with (report / f"{key}.diff").open("w") as output:
-                      for line in itertools.islice(differences(left, right), 500):
+                      for line in itertools.islice(differences(left, right), DIFF_LINES):
                           print(line, file=output)
-                  print(f"- {level} {key}: different", file=summary)
+                  # The diff can stop before the Rcmake side. The counts and samples show both sides.
+                  first, second = Counter(map(row_key, left)), Counter(map(row_key, right))
+                  oracle_only, rcmake_only = first - second, second - first
+                  (report / f"{key}.summary.json").write_text(json.dumps({
+                      "oracle_rows": sum(first.values()), "rcmake_rows": sum(second.values()),
+                      "oracle_only": sum(oracle_only.values()), "rcmake_only": sum(rcmake_only.values()),
+                      "oracle_only_sample": list(itertools.islice(oracle_only.elements(), 50)),
+                      "rcmake_only_sample": list(itertools.islice(rcmake_only.elements(), 50)),
+                  }, indent=2) + "\n")
+                  print(f"- {level} {key}: different ({sum(oracle_only.values())} oracle-only, "
+                        f"{sum(rcmake_only.values())} Rcmake-only rows)", file=summary)
           raise SystemExit(bool(mismatches))
           PY
       - uses: actions/upload-artifact@v6

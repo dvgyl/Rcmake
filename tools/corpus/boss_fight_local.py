@@ -44,6 +44,11 @@ CONFIGURE_LIMIT = 600
 DRY_RUN_LIMIT = 120
 L1_FILES = ("cache.json", "codemodel.json", "edges.stdout", "diagnostics.txt")
 RUN_ERRORS = (OSError, RuntimeError, ValueError, KeyError, ParseError, subprocess.SubprocessError)
+# File API members that hold backtrace indexes or reply file names. The
+# comparison drops them because they change when an unrelated node changes.
+MODEL_IGNORED_KEYS = frozenset({"backtrace", "backtraces", "backtraceGraph", "jsonFile"})
+# Cache entries whose value is the configure time. Only the value is hidden.
+NONDETERMINISTIC_CACHE_KEYS = frozenset({"OPENCV_TIMESTAMP"})
 
 GRAPH_SCRIPT = """
 import json
@@ -356,7 +361,7 @@ def model_data(reply: Path, normalizer: Normalizer) -> dict:
             return [expand(item) for item in value]
         if isinstance(value, dict):
             row = {key: expand(item) for key, item in value.items()
-                   if key not in {"backtrace", "backtraceGraph", "jsonFile"}}
+                   if key not in MODEL_IGNORED_KEYS}
             if "jsonFile" in value:
                 row["data"] = expand(read(value["jsonFile"]))
             for key in ("dependencies", "orderDependencies"):
@@ -400,7 +405,11 @@ def save_l1(log: Path, normalizer: Normalizer, tc: Toolchain, env: dict[str, str
         for line in cache_path.read_text(errors="replace").splitlines():
             key, sep, value = line.partition("=")
             if sep and not key.startswith(("#", "//")):
-                cache[key] = tool_labels.get(key.split(":", 1)[0], normalizer.text(value))
+                name = key.split(":", 1)[0]
+                if name in NONDETERMINISTIC_CACHE_KEYS:
+                    cache[key] = "<nondeterministic>"
+                else:
+                    cache[key] = tool_labels.get(name, normalizer.text(value))
         write_json(log / "cache.json", cache)
     (log / "diagnostics.txt").write_text(normalizer.text(
         (log / "configure.stderr").read_text(errors="replace")))
