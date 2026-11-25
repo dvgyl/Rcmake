@@ -70,6 +70,12 @@ fn write_index(
         host,
         dir: &reply_dir,
         files: BTreeSet::new(),
+        existing: old_entries
+            .iter()
+            .filter(|entry| entry.kind == FileKind::File)
+            .map(|entry| entry.name.clone())
+            .collect(),
+        dir_ready: false,
     };
     let mut api = FileApi {
         model,
@@ -132,13 +138,22 @@ struct ReplyWriter<'a> {
     host: &'a dyn Host,
     dir: &'a Path,
     files: BTreeSet<BString>,
+    /// Regular files in the reply directory before this run.
+    existing: BTreeSet<BString>,
+    /// The reply directory exists.
+    dir_ready: bool,
 }
 
 impl ReplyWriter<'_> {
     fn hashed(&mut self, prefix: &str, value: &Value) -> Result<Value, GenError> {
         let bytes = json_bytes(value);
         let name = format!("{prefix}-{}.json", hash_prefix(&bytes));
-        self.write(&name, &bytes)?;
+        // The name holds the content hash. Like CMake, keep an existing file with this name.
+        if self.existing.contains(name.as_bytes()) {
+            self.files.insert(name.as_str().into());
+        } else {
+            self.write(&name, &bytes)?;
+        }
         Ok(Value::string(name.as_str()))
     }
 
@@ -146,9 +161,12 @@ impl ReplyWriter<'_> {
         if self.files.contains(name.as_bytes()) {
             return Ok(());
         }
-        self.host
-            .create_dir_all(self.dir)
-            .map_err(|err| write_error(self.dir, err))?;
+        if !self.dir_ready {
+            self.host
+                .create_dir_all(self.dir)
+                .map_err(|err| write_error(self.dir, err))?;
+            self.dir_ready = true;
+        }
         let path = self.dir.join(name);
         let pid = self.host.system().pid;
         for attempt in 0..64 {

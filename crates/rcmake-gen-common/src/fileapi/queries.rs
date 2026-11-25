@@ -251,6 +251,8 @@ fn preserves_unicode_case_aliases_during_reply_cleanup() -> Result<(), Box<dyn s
         host: &host,
         dir,
         files: BTreeSet::from([new_name.into()]),
+        existing: BTreeSet::new(),
+        dir_ready: true,
     };
     writer.retain_file_aliases(&old_entries)?;
     writer.remove_stale(old_entries)?;
