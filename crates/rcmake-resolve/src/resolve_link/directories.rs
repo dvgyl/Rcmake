@@ -30,12 +30,12 @@ pub(crate) fn check_relative(
         return Ok(());
     };
     let message = format!(
-        "Found relative path while evaluating link directories of \"{}\":\n\n  \"{}\"\n",
+        "Found relative path while evaluating link directories of \"{}\":\n  \"{}\"\n",
         target.name, relative.value
     );
     if provider.name != target.name {
         let body = format!(
-            "Target \"{}\" contains relative path in its INTERFACE_LINK_DIRECTORIES:\n\n  \"{}\"",
+            "Target \"{}\" contains relative path in its INTERFACE_LINK_DIRECTORIES:\n  \"{}\"",
             provider.name, relative.value
         )
         .into();

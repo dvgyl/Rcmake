@@ -381,7 +381,7 @@ impl Project<'_> {
                     .collect::<Vec<_>>()
                     .join("\n  ");
                 return Err(self.project_error(dir, GenError::Invalid(format!(
-                    "The custom command generating\n\n  {output}\n\nis attached to multiple targets:\n\n  {names}\n\nbut none of these is a common dependency of the other(s).  This is not allowed by the Xcode \"new build system\"."
+                    "The custom command generating\n  {output}\nis attached to multiple targets:\n  {names}\nbut none of these is a common dependency of the other(s).  This is not allowed by the Xcode \"new build system\"."
                 ).into())));
             }
         }

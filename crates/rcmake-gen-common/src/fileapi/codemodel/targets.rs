@@ -1,18 +1,20 @@
 //! Write target replies and assign their indexes.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
 
-use rcmake_base::{BString, hash::HashAlgo, list, path_lex::Lexical, truth::is_on};
+use rcmake_base::{
+    hash::HashAlgo,
+    list,
+    path_lex::{Lexical, cmake_style},
+    truth::is_on,
+};
 use rcmake_diag::{Backtrace, Frame, FrameKind};
 use rcmake_genex::{ArtifactKind, ArtifactPart, EvalContext};
-use rcmake_host::path::{from_native, from_native_cmake, to_native};
-use rcmake_model::{
-    BT, DirId, Directory, GeneratorKind, ProjectModel, Target, TargetId, TargetKind, UsageField,
-};
+use rcmake_host::path::{from_native_cmake, to_native};
+use rcmake_model::{DirId, Directory, GeneratorKind, ProjectModel, Target, TargetId, TargetKind};
 use rcmake_resolve::{
-    ArtifactSet, CompileGroup, LinkFragmentRole, LinkKind, ResolvedTarget, TargetMetadata,
-    usage::UsageResolver,
+    ArtifactSet, LinkFragmentRole, LinkKind, ResolvedTarget, TargetMetadata,
+    lower::codemodel_link_flags, usage::UsageResolver,
 };
 
 use crate::{
@@ -21,8 +23,7 @@ use crate::{
 };
 
 use super::super::{
-    Bool, FileApi, Kind, Members, Object, UInt, Value, array, cache_value, members, object,
-    relative,
+    Bool, FileApi, Kind, Members, Object, Value, array, cache_value, members, object, relative,
 };
 use super::{
     backtraces::Backtraces, file_prefix, includes::interface_includes, indices, number,
@@ -303,7 +304,7 @@ impl FileApi<'_, '_> {
         ids: &[TargetId],
         targets: &BTreeMap<TargetId, TargetRef<'_>>,
     ) -> Result<Vec<Value>, GenError> {
-        let mut usage = UsageResolver::new(self.model);
+        let mut usage = UsageResolver::for_codemodel(self.model);
         ids.iter()
             .filter_map(|id| targets.get(id))
             .map(|reference| {
@@ -391,19 +392,40 @@ impl FileApi<'_, '_> {
         }
 
         let artifacts = &target.artifacts;
-        if let Some(file) = &artifacts.file {
-            body.insert("nameOnDisk".into(), Value::string(file_name(file)));
+        let framework = raw.is_some_and(|raw| {
+            raw.props
+                .get(b"FRAMEWORK")
+                .is_some_and(|value| is_on(value))
+        });
+        let main = if framework
+            || metadata.kind == TargetKind::SharedLibrary
+                && artifacts
+                    .linker_file
+                    .as_ref()
+                    .is_some_and(|file| file.ends_with(b".dylib") || file.ends_with(b".so"))
+        {
+            artifacts.linker_file.as_ref().or(artifacts.file.as_ref())
+        } else {
+            artifacts.file.as_ref()
+        };
+        if let Some(file) = main {
+            let name = if framework {
+                let wrapper = Lexical::new(file).parent();
+                let wrapper = file_name(wrapper);
+                [wrapper, b"/", file_name(file)].concat().into()
+            } else {
+                rcmake_base::BString::from(file_name(file))
+            };
+            body.insert("nameOnDisk".into(), Value::string(name));
         }
         let mut seen = BTreeSet::new();
         let artifact_paths = [
-            &artifacts.file,
-            &artifacts.linker_file,
-            &artifacts.soname_file,
-            &artifacts.import_file,
-            &artifacts.pdb_file,
+            main,
+            artifacts.import_file.as_ref(),
+            artifacts.pdb_file.as_ref(),
         ]
         .into_iter()
-        .filter_map(Option::as_ref)
+        .flatten()
         .map(|value| value.as_slice())
         .chain(
             target
@@ -456,160 +478,134 @@ impl FileApi<'_, '_> {
             if !static_archive {
                 step.insert("language".into(), Value::string(link.language.clone()));
             }
-            optional_array(
-                &mut step,
-                "commandFragments",
-                link.fragments.iter().map(|fragment| {
+            let mut fragments = Vec::new();
+            if let Some(raw) = raw {
+                let (flags, ipo) = codemodel_link_flags(self.model, raw, &target.config, link)
+                    .map_err(|error| GenError::Invalid(error.to_string().into()))?;
+                if ipo {
+                    step.insert("lto".into(), Bool(true));
+                }
+                fragments.extend(flags.into_iter().map(|flags| {
+                    object([
+                        ("role", Value::string("flags")),
+                        ("fragment", Value::string(flags)),
+                    ])
+                }));
+            }
+            let framework_flags: Vec<_> = link
+                .fragments
+                .iter()
+                .filter(|fragment| fragment.role == LinkFragmentRole::FrameworkPath)
+                .map(|fragment| fragment.text.value.as_slice())
+                .collect();
+            let framework_flags = (!framework_flags.is_empty()).then(|| {
+                object([
+                    ("role", Value::string("frameworkPath")),
+                    (
+                        "fragment",
+                        Value::string(rcmake_base::BString::from(framework_flags.join(&b' '))),
+                    ),
+                ])
+            });
+            fragments.extend(
+                link.fragments
+                    .iter()
+                    .filter(|fragment| fragment.role == LinkFragmentRole::Flags)
+                    .map(|fragment| {
+                        let mut item = members([("role", Value::string("flags"))]);
+                        if static_archive {
+                            item.insert(
+                                "fragment".into(),
+                                Value::string(fragment.text.value.clone()),
+                            );
+                        } else {
+                            graph.tagged_value(&mut item, "fragment", &fragment.text);
+                        }
+                        Object(item)
+                    }),
+            );
+            if !static_archive {
+                fragments.extend(framework_flags);
+                fragments.extend(link.fragments.iter().filter_map(|fragment| {
                     let role = match fragment.role {
-                        LinkFragmentRole::Flags => "flags",
-                        LinkFragmentRole::Libraries => "libraries",
                         LinkFragmentRole::LibraryPath => "libraryPath",
-                        LinkFragmentRole::FrameworkPath => "frameworkPath",
+                        LinkFragmentRole::Libraries => "libraries",
+                        _ => return None,
                     };
                     let mut item = members([("role", Value::string(role))]);
                     graph.tagged_value(&mut item, "fragment", &fragment.text);
-                    Object(item)
-                }),
-            );
+                    Some(Object(item))
+                }));
+            }
+            optional_array(&mut step, "commandFragments", fragments);
             body.insert(
                 if static_archive { "archive" } else { "link" }.into(),
                 Object(step),
             );
         }
 
-        optional_array(
-            &mut body,
-            "dependencies",
-            target.dependencies.iter().filter_map(|id| {
-                let dependency = targets.get(id).filter(|target| !target.abstract_target)?;
-                let mut item = members([("id", Value::string(dependency.id.as_str()))]);
-                if let Some(backtrace) = dependency_backtrace(self.model, raw, *id) {
-                    graph.tag(&mut item, backtrace);
+        if let Some(raw) = raw.filter(|raw| raw.kind == TargetKind::Executable) {
+            let cross = self
+                .model
+                .definition(raw.dir, b"CMAKE_CROSSCOMPILING")
+                .is_some_and(|value| is_on(value));
+            let context = EvalContext {
+                config: target.config.clone(),
+                ..Default::default()
+            };
+            let mut launchers = Vec::new();
+            for (property, kind) in [
+                (b"TEST_LAUNCHER".as_slice(), "test"),
+                (b"CROSSCOMPILING_EMULATOR", "emulator"),
+            ] {
+                if kind == "emulator" && !cross {
+                    continue;
                 }
-                Some(Object(item))
-            }),
-        );
-        self.target_sources(target, raw, &mut body, &mut graph, usage)?;
+                let Some(value) = raw.props.get(property) else {
+                    continue;
+                };
+                let expanded = crate::genex(usage, raw.dir, &context, value, None)?;
+                let args = list::split(&expanded, list::Empty::Keep);
+                let Some((command, args)) = args
+                    .split_first()
+                    .filter(|(command, _)| !command.is_empty())
+                else {
+                    continue;
+                };
+                let mut launcher = members([
+                    ("type", Value::string(kind)),
+                    (
+                        "command",
+                        Value::string(relative(&cmake_style(command), self.source)),
+                    ),
+                ]);
+                optional_array(
+                    &mut launcher,
+                    "arguments",
+                    args.iter().cloned().map(Value::string),
+                );
+                launchers.push(Object(launcher));
+            }
+            optional_array(&mut body, "launchers", launchers);
+        }
+        if let Some(raw) = raw {
+            super::dependencies::write(
+                self.model, reference, targets, raw, usage, &mut graph, &mut body,
+            )?;
+        }
+        if raw.is_none() {
+            optional_array(
+                &mut body,
+                "dependencies",
+                target.dependencies.iter().filter_map(|id| {
+                    let entry = targets.get(id).filter(|entry| !entry.abstract_target)?;
+                    Some(object([("id", Value::string(entry.id.as_str()))]))
+                }),
+            );
+        }
+        self.write_target_sources(target, raw, targets, &mut body, &mut graph, usage)?;
         body.insert("backtraceGraph".into(), graph.into_json());
         Ok(body)
-    }
-
-    fn target_sources(
-        &self,
-        target: &ResolvedTarget,
-        raw: Option<&Target>,
-        body: &mut Members,
-        graph: &mut Backtraces<'_>,
-        usage: &mut UsageResolver<'_>,
-    ) -> Result<(), GenError> {
-        let mut sources = Vec::new();
-        let mut source_groups = [Vec::new(), Vec::new(), Vec::new()];
-        let mut seen = BTreeSet::new();
-        let raw_sources = raw
-            .into_iter()
-            .flat_map(|target| &target.sources)
-            .flat_map(|entry| {
-                list::split(&entry.value, list::Empty::Drop)
-                    .into_iter()
-                    .filter(|file| !file.windows(2).any(|pair| pair == b"$<"))
-                    .map(|file| (BT::new(file, entry.backtrace.clone()), None))
-            });
-        let units = target
-            .compile_units
-            .iter()
-            .map(|unit| (unit.source.clone(), Some(unit.group)));
-        for (source, group) in units.chain(raw_sources) {
-            let file = to_native(&target.metadata.source_dir).join(to_native(&source.value));
-            let file = from_native_cmake(&file);
-            if !seen.insert(Lexical::new(&file).normalize()) {
-                continue;
-            }
-            let mut entry = members([("path", Value::string(relative(&file, self.source)))]);
-            if let Some(group) = group.filter(|&index| index < target.compile_groups.len()) {
-                entry.insert("compileGroupIndex".into(), number(group));
-            }
-            let extension = to_native(&file)
-                .extension()
-                .map(|ext| from_native(Path::new(ext)));
-            let group = match extension.as_deref().map(|ext| ext.as_slice()) {
-                Some(b"h" | b"hh" | b"hpp" | b"hxx" | b"inl") => 1,
-                _ if group.is_some() => 0,
-                _ => 2,
-            };
-            if let Some(indices) = source_groups.get_mut(group) {
-                indices.push(sources.len());
-            }
-            if let Some(index) = graph.add(&source.backtrace) {
-                entry.insert("backtrace".into(), number(index));
-                entry.insert("backtraces".into(), array([number(index)]));
-            }
-            if raw
-                .and_then(|target| self.model.dir(target.dir).source_props.get(&file))
-                .and_then(|props| props.get(b"GENERATED"))
-                .is_some_and(|value| is_on(value))
-            {
-                entry.insert("isGenerated".into(), Bool(true));
-            }
-            sources.push(entry);
-        }
-        let mut groups = Vec::new();
-        for (name, indices) in ["Source Files", "Header Files", ""]
-            .into_iter()
-            .zip(source_groups)
-        {
-            if indices.is_empty() {
-                continue;
-            }
-            for &index in &indices {
-                if let Some(source) = sources.get_mut(index) {
-                    source.insert("sourceGroupIndex".into(), number(groups.len()));
-                }
-            }
-            groups.push(object([
-                ("name", Value::string(name)),
-                ("sourceIndexes", array(indices.into_iter().map(number))),
-            ]));
-        }
-        optional_array(body, "sourceGroups", groups);
-        let mut units_by_group = vec![Vec::new(); target.compile_groups.len()];
-        for (index, source) in sources.iter().enumerate() {
-            if let Some(UInt(group)) = source.get(b"compileGroupIndex".as_slice())
-                && let Some(units) = units_by_group.get_mut(*group as usize)
-            {
-                units.push(index);
-            }
-        }
-        let mut headers = BTreeMap::new();
-        let mut compile_groups = Vec::new();
-        for (group, units) in target.compile_groups.iter().zip(units_by_group) {
-            let entries = match headers.entry(&group.language) {
-                std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
-                std::collections::btree_map::Entry::Vacant(entry) => {
-                    let context = EvalContext {
-                        config: target.config.clone(),
-                        language: Some(group.language.clone()),
-                        ..EvalContext::default()
-                    };
-                    let collected = usage
-                        .collect(target.id, UsageField::PrecompileHeaders, &context)
-                        .map_err(|error| GenError::Invalid(error.to_string().into()))?;
-                    let mut seen = BTreeSet::new();
-                    entry.insert(
-                        collected
-                            .entries
-                            .into_iter()
-                            .filter(|header| {
-                                !header.value.is_empty() && seen.insert(header.value.clone())
-                            })
-                            .collect::<Vec<_>>(),
-                    )
-                }
-            };
-            compile_groups.push(compile_group(group, units, entries, graph));
-        }
-        optional_array(body, "compileGroups", compile_groups);
-        body.insert("sources".into(), array(sources.into_iter().map(Object)));
-        Ok(())
     }
 }
 
@@ -618,7 +614,7 @@ fn target_id(name: &rcmake_base::BString, dir: &[u8]) -> String {
     format!("{name}::@{:.20}", hash)
 }
 
-fn dependency_backtrace<'a>(
+pub(super) fn dependency_backtrace<'a>(
     model: &ProjectModel,
     raw: Option<&'a Target>,
     id: TargetId,
@@ -636,50 +632,6 @@ fn dependency_backtrace<'a>(
                 .find(|item| model.find_target(item.lookup_dir, &item.text.value) == Some(id))
                 .map(|item| &item.text.backtrace)
         })
-}
-
-fn compile_group(
-    group: &CompileGroup,
-    sources: Vec<usize>,
-    headers: &[BT<BString>],
-    graph: &mut Backtraces<'_>,
-) -> Value {
-    let mut body = members([
-        ("language", Value::string(group.language.clone())),
-        ("sourceIndexes", array(sources.into_iter().map(number))),
-    ]);
-    let mut defines: Vec<_> = group.defines.iter().collect();
-    defines.sort_by(|a, b| a.value.cmp(&b.value));
-    let flags: Vec<_> = group.flags.iter().collect();
-    let headers: Vec<_> = headers.iter().collect();
-    for (field, key, items) in [
-        ("compileCommandFragments", "fragment", flags),
-        ("defines", "define", defines),
-        ("precompileHeaders", "header", headers),
-    ] {
-        optional_array(
-            &mut body,
-            field,
-            items.into_iter().map(|value| {
-                let mut item = Members::new();
-                graph.tagged_value(&mut item, key, value);
-                Object(item)
-            }),
-        );
-    }
-    optional_array(
-        &mut body,
-        "includes",
-        group.includes.iter().map(|value| {
-            let mut item = Members::new();
-            graph.tagged_value(&mut item, "path", &value.path);
-            if value.system {
-                item.insert("isSystem".into(), Bool(true));
-            }
-            Object(item)
-        }),
-    );
-    Object(body)
 }
 
 fn file_name(path: &[u8]) -> &[u8] {

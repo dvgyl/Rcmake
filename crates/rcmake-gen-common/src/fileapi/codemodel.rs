@@ -1,9 +1,12 @@
 mod backtraces;
+mod dependencies;
 mod directories;
+mod file_sets;
 mod includes;
 mod installers;
 mod other_installers;
 mod projects;
+mod sources;
 mod targets;
 
 use rcmake_base::BString;

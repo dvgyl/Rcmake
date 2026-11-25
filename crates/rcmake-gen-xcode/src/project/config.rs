@@ -86,7 +86,7 @@ impl Project<'_> {
             let source = Lexical::new(&directory.source_dir).append(path.as_bytes());
             return Err(self.project_error(
                 dir,
-                GenError::Invalid(format!("Cannot find source file:\n\n  {source}").into()),
+                GenError::Invalid(format!("Cannot find source file:\n  {source}").into()),
             ));
         };
         let reference = file_ref(

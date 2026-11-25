@@ -32,6 +32,81 @@ use driver::{
 pub(crate) use frameworks::bundle_name as framework_bundle_name;
 pub(crate) use rpath::ide_rpaths;
 
+fn creation_flags<'a>(
+    model: &'a ProjectModel,
+    target: &Target,
+    kind: LinkKind,
+    language: &[u8],
+) -> Option<&'a BString> {
+    let key = if kind == LinkKind::Executable
+        && target.policies.policies.get(PolicyId::new(210)) != PolicyStatus::New
+    {
+        BString::from([b"CMAKE_", language, b"_LINK_FLAGS"].concat())
+    } else {
+        kind.create_flags_key(language)
+    };
+    definition(model, target.dir, &key).or_else(|| {
+        if kind == LinkKind::ModuleLibrary {
+            definition(
+                model,
+                target.dir,
+                &LinkKind::SharedLibrary.create_flags_key(language),
+            )
+        } else {
+            None
+        }
+    })
+}
+
+/// Return the untagged flag fragments and IPO status of a codemodel link step.
+pub fn codemodel_link_flags(
+    model: &ProjectModel,
+    target: &Target,
+    config: &ConfigId,
+    link: &LinkStep,
+) -> Result<(Vec<BString>, bool), ResolveError> {
+    let kind = link.kind;
+    let language = link.language.as_slice();
+    let mut flags = Vec::new();
+    let policy = Flags::new(model, target, language);
+    let ipo = policy.ipo(config);
+    if kind == LinkKind::StaticArchive {
+        return Ok((flags, ipo));
+    }
+    if kind == LinkKind::Executable {
+        let mut language_flags = language_flags(model, target, config, language);
+        if ipo {
+            language_flags.extend(
+                policy
+                    .option(b"COMPILE_OPTIONS_IPO")
+                    .into_iter()
+                    .flat_map(|value| list::split(value, list::Empty::Drop)),
+            );
+        }
+        flags.push(join_words(language_flags));
+    }
+    let wrapper = LinkerDriver::new(model, target, language);
+    if let Some(value) = creation_flags(model, target, kind, language) {
+        let value = if target.policies.policies.get(PolicyId::new(181)) == PolicyStatus::New {
+            wrapper.flag_string(value)?
+        } else {
+            wrapper.driver_flags(value)
+        };
+        flags.push(value);
+    }
+    let base = [b"CMAKE_", kind.flag_class(), b"_LINKER_FLAGS"].concat();
+    let configured = [base.as_slice(), b"_", &config.0.to_ascii_uppercase()].concat();
+    flags.push(join_words(
+        [base.as_slice(), &configured]
+            .into_iter()
+            .filter_map(|key| {
+                definition(model, target.dir, key).map(|value| wrapper.driver_flags(value))
+            }),
+    ));
+    flags.retain(|value| !value.is_empty());
+    Ok((flags, ipo))
+}
+
 #[expect(
     clippy::too_many_arguments,
     reason = "Link lowering uses configured artifacts, objects, and usage requirements."
@@ -86,26 +161,9 @@ pub(super) fn link(
     };
     let mut flags = Vec::new();
     let language_flags = [b"CMAKE_", language, b"_LINK_FLAGS"].concat();
-    let key = if kind == LinkKind::Executable && !policy_new(210) {
-        BString::from(language_flags.clone())
-    } else {
-        kind.create_flags_key(language)
-    };
-    flags.push(parse_flags(
-        definition(model, target.dir, &key)
-            .or_else(|| {
-                (kind == LinkKind::ModuleLibrary)
-                    .then(|| {
-                        definition(
-                            model,
-                            target.dir,
-                            &LinkKind::SharedLibrary.create_flags_key(language),
-                        )
-                    })
-                    .flatten()
-            })
-            .map_or_else(|| kind.default_create_flag(darwin).into(), Clone::clone),
-    )?);
+    let create = creation_flags(model, target, step.kind, language)
+        .map_or_else(|| kind.default_create_flag(darwin).into(), Clone::clone);
+    flags.push(parse_flags(create)?);
     let base = if kind == LinkKind::SharedLibrary
         && darwin
         && target

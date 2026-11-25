@@ -381,28 +381,36 @@ impl FileApi<'_, '_> {
 
     fn cmake_files(&self) -> Members {
         let cmake_root = self.cmake_root();
-        let mut seen = BTreeSet::new();
-        let inputs = self
-            .result
-            .metadata
-            .listfiles
-            .iter()
-            .filter(|file| seen.insert(file.as_slice()))
-            .map(|file| {
-                let in_source = is_under(file, self.source);
-                let in_build = is_under(file, self.build);
-                let mut input = members([("path", Value::string(relative(file, self.source)))]);
-                if in_build && self.build != self.source {
-                    input.insert("isGenerated".into(), Bool(true));
-                }
-                if !in_source && !in_build {
-                    input.insert("isExternal".into(), Bool(true));
-                }
-                if is_under(file, &cmake_root) {
-                    input.insert("isCMake".into(), Bool(true));
-                }
-                Object(input)
-            });
+        let mut inputs: Vec<_> = self
+            .model
+            .dirs()
+            .flat_map(|(_, dir)| &dir.listfiles)
+            .collect();
+        if inputs.is_empty() {
+            inputs.extend(&self.result.metadata.listfiles);
+        }
+        let inputs = inputs.into_iter().map(|file| {
+            let in_source = is_under(file, self.source);
+            let in_build = is_under(file, self.build);
+            let is_cmake = is_under(file, &cmake_root)
+                && to_native(file).starts_with(to_native(&cmake_root).join("Modules"));
+            let path = if is_cmake {
+                file.clone()
+            } else {
+                relative(file, self.source)
+            };
+            let mut input = members([("path", Value::string(path))]);
+            if in_build && self.build != self.source {
+                input.insert("isGenerated".into(), Bool(true));
+            }
+            if !in_source && !in_build {
+                input.insert("isExternal".into(), Bool(true));
+            }
+            if is_cmake {
+                input.insert("isCMake".into(), Bool(true));
+            }
+            Object(input)
+        });
         let mut body = members([
             ("paths", paths(self.source, self.build)),
             ("inputs", array(inputs)),

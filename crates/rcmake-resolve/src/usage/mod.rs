@@ -127,6 +127,7 @@ pub struct UsageResolver<'a> {
     link_memo: HashMap<link::LinkMemoKey, link::SharedLinks>,
     debug_configs: Vec<BString>,
     debug_properties: bool,
+    codemodel_backtraces: bool,
     active: Vec<(TargetId, BString)>,
     cycle_count: usize,
     has_injections: bool,
@@ -162,6 +163,7 @@ impl<'a> UsageResolver<'a> {
                 definition(model, id, b"CMAKE_DEBUG_TARGET_PROPERTIES")
                     .is_some_and(|value| !value.is_empty())
             }),
+            codemodel_backtraces: false,
             active: Vec::new(),
             cycle_count: 0,
             compatible: compatible::Properties::default(),
@@ -171,6 +173,15 @@ impl<'a> UsageResolver<'a> {
                 target.props.get(link::DIRECT).is_some()
                     || target.props.get(link::EXCLUDE).is_some()
             }),
+        }
+    }
+
+    /// Attribute inherited usage to the consumer's first link edge for the File API.
+    #[must_use]
+    pub fn for_codemodel(model: &'a ProjectModel) -> Self {
+        Self {
+            codemodel_backtraces: true,
+            ..Self::new(model)
         }
     }
 
@@ -195,6 +206,7 @@ impl<'a> UsageResolver<'a> {
             link_memo: HashMap::new(),
             debug_configs: self.debug_configs.clone(),
             debug_properties: self.debug_properties,
+            codemodel_backtraces: false,
             active: Vec::new(),
             cycle_count: 0,
             compatible: compatible::Properties::default(),
@@ -336,7 +348,17 @@ impl<'a> UsageResolver<'a> {
                 }
                 for entry in &**entries {
                     if seen.insert(entry.value.clone()) {
-                        value.entries.push(entry.clone());
+                        let mut entry = entry.clone();
+                        if self.codemodel_backtraces
+                            && let Some(edge) = result
+                                .chains
+                                .as_ref()
+                                .and_then(|paths| paths.get(owner))
+                                .and_then(|path| path.first())
+                        {
+                            entry.backtrace.clone_from(&edge.link_bt);
+                        }
+                        value.entries.push(entry);
                         if let Some(chains) = &mut chains {
                             chains.push(
                                 result
@@ -609,7 +631,7 @@ impl<'a> UsageResolver<'a> {
                     continue;
                 }
                 result.contributions.push((*owner, Arc::clone(entries)));
-                if self.provenance.is_some() || self.debug_properties {
+                if self.provenance.is_some() || self.debug_properties || self.codemodel_backtraces {
                     let mut chain = vec![edge.hop(dependency)];
                     if let Some(path) = value.chains.as_ref().and_then(|chains| chains.get(owner)) {
                         chain.extend_from_slice(path);
@@ -655,7 +677,8 @@ impl<'a> UsageResolver<'a> {
             .collect())
     }
 
-    pub(crate) fn file_set_paths(
+    /// Evaluate file set paths in the property owner and consumer contexts.
+    pub fn file_set_paths(
         &mut self,
         owner: TargetId,
         property: &[u8],
@@ -751,7 +774,7 @@ impl<'a> UsageResolver<'a> {
                             "Imported target \"{name}\" includes non-existent path\n  \"{path}\"\nin its INTERFACE_INCLUDE_DIRECTORIES. Possible reasons include:\n* The path was deleted, renamed, or moved to another location.\n* An install or uninstall procedure did not complete successfully.\n* The installation package was faulty and references files it does not provide.\n"
                         ),
                         PathProblem::Relative(path) => format!(
-                            "Target \"{name}\" contains relative path in its {property}:\n\n  \"{path}\""
+                            "Target \"{name}\" contains relative path in its {property}:\n  \"{path}\""
                         ),
                     }
                     .into();
@@ -779,7 +802,7 @@ impl<'a> UsageResolver<'a> {
             {
                 let owner = self.target(target)?;
                 let body: BString = format!(
-                    "Found relative path while evaluating include directories of \"{}\":\n\n  \"{path}\"\n",
+                    "Found relative path while evaluating include directories of \"{}\":\n  \"{path}\"\n",
                     owner.name
                 )
                 .into();

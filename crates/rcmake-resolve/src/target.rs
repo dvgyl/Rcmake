@@ -294,7 +294,7 @@ pub(crate) fn resolve_target<'a>(
                 if let Some(symbol) = &export_symbol
                     && !defines.iter().any(|define| define.value == *symbol)
                 {
-                    defines.insert(0, BT::new(symbol.clone(), target.backtrace.clone()));
+                    defines.insert(0, BT::new(symbol.clone(), Backtrace::default()));
                 }
                 let includes = usage.collect_includes_for_result(id, &compile_ctx)?;
                 let group = entry.index();
@@ -532,10 +532,15 @@ pub(crate) fn collect_file_sets<'a>(
 }
 
 fn export_symbol(target: &Target) -> Option<BString> {
-    if !matches!(
+    let exports = matches!(
         target.kind,
         TargetKind::SharedLibrary | TargetKind::ModuleLibrary
-    ) {
+    ) || (target.kind == TargetKind::Executable
+        && target
+            .props
+            .get(b"ENABLE_EXPORTS")
+            .is_some_and(|value| truth::is_on(value)));
+    if !exports {
         return None;
     }
     if let Some(symbol) = target.props.get(b"DEFINE_SYMBOL") {
@@ -643,7 +648,7 @@ pub(crate) fn instantiate_rules(
         });
         let invalid = if output_name.contains(&b'<') || output_name.contains(&b'>') {
             Some(format!(
-                "Output File Set name, for rule \"{name}\", did not expand correctly:\n\n  \"{output_name}\""
+                "Output File Set name, for rule \"{name}\", did not expand correctly:\n  \"{output_name}\""
             ))
         } else {
             existing.and_then(|id| model.file_set(id)).filter(|set| set.kind != output_kind).map(|set| {

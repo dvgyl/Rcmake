@@ -6,7 +6,7 @@ use indexmap::{IndexMap, IndexSet};
 use rcmake_base::{BString, list, path_lex::Lexical, shell::quote, truth};
 use rcmake_diag::{Location, MessageKind};
 use rcmake_genex::{ArtifactKind, ArtifactPart, ConfigId, EvalContext};
-use rcmake_model::{DirId, ProjectModel, Target, TargetId, TargetKind};
+use rcmake_model::{DirId, ProjectModel, Target, TargetId, TargetKind, UsageField};
 
 use super::{frameworks, linked_libraries, shared_library};
 use crate::{
@@ -69,15 +69,7 @@ pub(super) fn link_flags(
         return Err(ResolveError::Message(message));
     }
     let prefix = runtime_setting(model, target, step, b"_FLAG").unwrap_or(b"-Wl,-rpath,");
-    let paths = RuntimePaths::new(
-        model,
-        target,
-        config,
-        step,
-        darwin,
-        &libraries.files,
-        languages,
-    )?;
+    let paths = RuntimePaths::new(model, target, config, step, darwin, libraries, languages)?;
     let build = if build_with_install_rpath(model, target) {
         &paths.install
     } else {
@@ -126,7 +118,7 @@ impl RuntimePaths {
         config: &ConfigId,
         step: &LinkStep,
         darwin: bool,
-        libraries: &[BString],
+        libraries: &RuntimeLibraries,
         languages: &IndexSet<BString>,
     ) -> Result<Self, ResolveError> {
         let implicit = implicit_directories(model, target, &step.language);
@@ -285,6 +277,7 @@ fn rpath_value(
 
 pub(super) struct RuntimeLibraries {
     files: Vec<BString>,
+    user_dirs: IndexSet<BString>,
     dependent_dirs: IndexSet<BString>,
     pub(super) link_stubs: IndexSet<BString>,
 }
@@ -299,6 +292,7 @@ pub(super) fn runtime_libraries(
 ) -> Result<RuntimeLibraries, ResolveError> {
     let mut result = RuntimeLibraries {
         files: libraries.to_vec(),
+        user_dirs: IndexSet::new(),
         dependent_dirs: IndexSet::new(),
         link_stubs: IndexSet::new(),
     };
@@ -310,11 +304,23 @@ pub(super) fn runtime_libraries(
         link_language: Some(step.language.clone()),
         ..EvalContext::default()
     };
+    let implicit = implicit_directories(model, target, &step.language);
+    let dll = crate::lower::artifacts::is_dll_platform(model, target.dir);
+    if !dll || runtime_setting(model, target, step, b"_FLAG").is_some() {
+        result.user_dirs.extend(
+            usage
+                .collect(id, UsageField::LinkDirectories, &ctx)?
+                .entries
+                .into_iter()
+                .filter(|entry| !entry.value.is_empty())
+                .map(|entry| Lexical::new(&entry.value).normalize())
+                .filter(|dir| !implicit.contains(dir)),
+        );
+    }
     let build = &model.dir(DirId::ROOT).binary_dir;
     let absolute = |path: &[u8]| Lexical::new(&join(build, path)).normalize();
     let apple = on(model, target, b"CMAKE_PLATFORM_HAS_INSTALLNAME");
     let rpath_link = rpath_link_flag(model, target, step).is_some();
-    let dll = crate::lower::artifacts::is_dll_platform(model, target.dir);
     let mut runtimes = BTreeMap::new();
     let mut shared = IndexSet::new();
     for id in usage.link_targets(id, &ctx)? {
@@ -372,7 +378,6 @@ pub(super) fn runtime_libraries(
         true
     });
     if rpath_link {
-        let implicit = implicit_directories(model, target, &step.language);
         let linker = [b"CMAKE_", step.language.as_slice(), b"_COMPILER_LINKER_ID"].concat();
         let link_stub = definition(model, target.dir, &linker)
             .is_some_and(|name| matches!(name.as_slice(), b"GNU" | b"Solaris"));
@@ -398,12 +403,6 @@ pub(super) fn runtime_libraries(
                     }
                 }
             } else {
-                let (links, _) = usage.direct_links(id, &ctx)?;
-                for link in links.iter() {
-                    if matches!(link.kind, crate::usage::ResolvedLinkKind::Raw) {
-                        files.push((link.text.value.clone(), false));
-                    }
-                }
                 for id in usage.link_targets(id, &ctx)? {
                     add_shared_file(model, usage, config, id, &mut shared, &mut files);
                 }
@@ -614,7 +613,7 @@ pub(in crate::lower) fn install_rpath(
         &resolved.config,
         link,
         darwin,
-        &libraries.files,
+        &libraries,
         languages,
     )?;
     if darwin {
@@ -727,15 +726,7 @@ pub(crate) fn ide_rpaths(
     usage: &mut UsageResolver<'_>,
 ) -> Result<Vec<BString>, ResolveError> {
     let libraries = runtime_libraries(model, target, config, step, libraries, usage)?;
-    let paths = RuntimePaths::new(
-        model,
-        target,
-        config,
-        step,
-        true,
-        &libraries.files,
-        languages,
-    )?;
+    let paths = RuntimePaths::new(model, target, config, step, true, &libraries, languages)?;
     Ok(if build_with_install_rpath(model, target) {
         paths.install
     } else {
@@ -754,7 +745,7 @@ fn rpath_entries(
     target: &Target,
     step: &LinkStep,
     darwin: bool,
-    libraries: &[BString],
+    libraries: &RuntimeLibraries,
     installs: bool,
     value: &[u8],
     implicit: &IndexSet<BString>,
@@ -768,7 +759,27 @@ fn rpath_entries(
         let origin = !darwin
             && target_property(model, target, b"BUILD_RPATH_USE_ORIGIN")
                 .is_some_and(|value| truth::is_on(value));
-        for library in libraries {
+        let runtime_directory = |directory: &[u8]| {
+            if let Some(translated) =
+                crate::lower::install_rpath::translated_link_directory(model, target, directory)
+            {
+                return translated;
+            }
+            let parent = Lexical::new(directory);
+            if origin
+                && build_path.prefix(parent)
+                && let Some(relative) = parent.relative(output_dir)
+            {
+                return if relative == b"." {
+                    "$ORIGIN".into()
+                } else {
+                    join(b"$ORIGIN", &relative)
+                };
+            }
+            directory.into()
+        };
+        paths.extend(libraries.user_dirs.iter().map(|dir| runtime_directory(dir)));
+        for library in &libraries.files {
             let path = Lexical::new(&join(build, library)).normalize();
             let file = Lexical::new(&path);
             if implicit.contains(&Lexical::new(file.parent()).normalize()) {
@@ -782,36 +793,32 @@ fn rpath_entries(
                     crate::lower::install_rpath::translated_link_directory(model, target, parent);
                 paths.insert(directory.unwrap_or_else(|| parent.into()));
             } else if shared_library(file.filename()) && file.absolute() {
-                let parent = Lexical::new(file.parent());
-                let translated = crate::lower::install_rpath::translated_link_directory(
-                    model,
-                    target,
-                    file.parent(),
-                );
-                let path = if let Some(directory) = translated {
-                    directory
-                } else if origin && build_path.prefix(parent) {
-                    parent.relative(output_dir).map_or_else(
-                        || file.parent().into(),
-                        |rel| {
-                            if rel == b"." {
-                                "$ORIGIN".into()
-                            } else {
-                                join(b"$ORIGIN", &rel)
-                            }
-                        },
-                    )
-                } else {
-                    file.parent().into()
-                };
-                paths.insert(path);
+                paths.insert(runtime_directory(file.parent()));
             }
         }
     } else if target_property(model, target, b"INSTALL_RPATH_USE_LINK_PATH")
         .is_some_and(|value| truth::is_on(value))
     {
+        let root = model.dir(DirId::ROOT);
+        for directory in &libraries.user_dirs {
+            let path = Lexical::new(directory);
+            if path.absolute()
+                && !Lexical::new(&root.source_dir).prefix(path)
+                && !Lexical::new(&root.binary_dir).prefix(path)
+            {
+                paths.insert(
+                    crate::lower::install_rpath::translated_link_directory(
+                        model, target, directory,
+                    )
+                    .unwrap_or_else(|| directory.clone()),
+                );
+            }
+        }
         paths.extend(crate::lower::install_rpath::external_link_directories(
-            model, target, libraries, implicit,
+            model,
+            target,
+            &libraries.files,
+            implicit,
         ));
     }
     paths

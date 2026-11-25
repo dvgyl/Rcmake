@@ -7,7 +7,7 @@ use rcmake_model::{DirId, GeneratorKind, ProjectModel, Target, TargetId, TargetK
 
 use super::{definition, expand_rule, join, object_dir, policy_flags::Flags};
 use crate::{
-    CompileUnit, ResolveError, ResolvedTarget,
+    CompileUnit, PchDetails, PchSource, ResolveError, ResolvedTarget,
     cxx_modules::generation_location,
     ide::{IdeCustomStep, IdePch},
     sources,
@@ -56,6 +56,16 @@ impl<'a> PchFlags<'a> {
         target: &Target,
         language: &[u8],
     ) -> Vec<BString> {
+        self.options_with_root(model, target, language, None)
+    }
+
+    fn options_with_root(
+        self,
+        model: &ProjectModel,
+        target: &Target,
+        language: &[u8],
+        build: Option<&[u8]>,
+    ) -> Vec<BString> {
         let policy = Flags::new(model, target, language);
         let mut flags = Vec::new();
         if target
@@ -98,7 +108,10 @@ impl<'a> PchFlags<'a> {
                 .map(|option| {
                     expand_rule(&option, |key| match key {
                         b"PCH_HEADER" => Some(quote(&plan.header)),
-                        b"PCH_FILE" => Some(quote(&plan.artifact)),
+                        b"PCH_FILE" => Some(build.map_or_else(
+                            || quote(&plan.artifact),
+                            |build| quote(&join(build, &plan.artifact)),
+                        )),
                         _ => None,
                     })
                 }),
@@ -207,6 +220,52 @@ impl Plans {
             }
         }
         Ok(plans)
+    }
+
+    pub(super) fn details(
+        &self,
+        model: &ProjectModel,
+        target: &Target,
+        resolved: &ResolvedTarget,
+        inputs: Option<&sources::TargetInputs>,
+    ) -> Result<PchDetails, ResolveError> {
+        let mut result = PchDetails::default();
+        if self.units.is_empty() {
+            return Ok(result);
+        }
+        let build = &model.dir(DirId::ROOT).binary_dir;
+        let mut languages = IndexSet::new();
+        for unit in &resolved.compile_units {
+            let Some(group) = resolved.compile_groups.get(unit.group) else {
+                continue;
+            };
+            if skip_unit(model, target, unit, inputs) {
+                continue;
+            }
+            let Some((owner, plans)) = self.find(model, target, resolved, &group.language)? else {
+                continue;
+            };
+            let flags = |flags: PchFlags<'_>| {
+                super::shell::join_words(flags.options_with_root(
+                    model,
+                    target,
+                    &group.language,
+                    Some(build),
+                ))
+            };
+            if owner == resolved.id && languages.insert(&group.language) {
+                result.create.extend(plans.iter().map(|plan| PchSource {
+                    path: plan.source.clone(),
+                    header: plan.header.clone(),
+                    group: unit.group,
+                    flags: flags(PchFlags::Create(plan)),
+                }));
+            }
+            result
+                .use_flags
+                .insert(unit.source.value.clone(), flags(PchFlags::Use(&plans)));
+        }
+        Ok(result)
     }
 
     /// Return the precompiled headers of `target` for an IDE generator.
@@ -446,11 +505,18 @@ fn plan(
     let relative = join(&dir, &arch_name);
     let root = &model.dir(DirId::ROOT).binary_dir;
     let header = join(root, &relative);
-    let source = if linked {
-        join(root, &join(&dir, &[stem.as_slice(), suffix].concat()))
+    let support_dir =
+        if model.generator.is_some_and(GeneratorKind::multi_config) && !config.0.is_empty() {
+            rcmake_base::path_lex::Lexical::new(&dir).parent()
+        } else {
+            dir.as_slice()
+        };
+    let source_stem = if linked {
+        stem.as_slice()
     } else {
-        [header.as_slice(), suffix].concat().into()
+        arch_name.as_slice()
     };
+    let source = join(root, &join(support_dir, &[source_stem, suffix].concat()));
     let companion_object = linked.then(|| super::object_path(model, target, config, &source));
     let artifact = if let Some(object) = &companion_object {
         let stem = object

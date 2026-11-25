@@ -125,18 +125,28 @@ fn compile_flags(
         flags.push("-fvisibility-inlines-hidden".into());
     }
     policy.append_color(&mut flags);
-    flags.extend(
-        group
-            .flags
-            .iter()
-            .filter(|flag| !flag.value.is_empty())
-            .map(|flag| {
-                flag.value
-                    .strip_prefix(b"SHELL:")
-                    .map_or_else(|| quote(&flag.value), BString::from)
-            }),
-    );
     Ok(flags)
+}
+
+/// Compute the compiler flags that apply to a target's language as a whole.
+pub fn codemodel_compile_flags(
+    model: &ProjectModel,
+    target: &Target,
+    config: &ConfigId,
+    group: &CompileGroup,
+    usage: &mut UsageResolver<'_>,
+) -> Result<BString, ResolveError> {
+    let Some(id) = model.find_target(target.dir, &target.name) else {
+        return Ok(BString::default());
+    };
+    let context = EvalContext {
+        config: config.clone(),
+        language: Some(group.language.clone()),
+        ..Default::default()
+    };
+    let features = usage.collect(id, rcmake_model::UsageField::CompileFeatures, &context)?;
+    let standard = super::required_standard(&group.language, &features.entries);
+    compile_flags(model, target, config, group, standard, None, None).map(join_words)
 }
 
 fn compile_argument(model: &ProjectModel, target: &Target, prefix: &[u8], value: &[u8]) -> BString {
@@ -320,6 +330,17 @@ fn compile_arguments_for_arch(
         position_independent,
         architecture,
     )?;
+    flags.extend(
+        group
+            .flags
+            .iter()
+            .filter(|flag| !flag.value.is_empty())
+            .map(|flag| {
+                flag.value
+                    .strip_prefix(b"SHELL:")
+                    .map_or_else(|| quote(&flag.value), BString::from)
+            }),
+    );
     let boundary = group.source_define_start.unwrap_or(group.defines.len());
     let (target_defines, source_defines) = group
         .defines

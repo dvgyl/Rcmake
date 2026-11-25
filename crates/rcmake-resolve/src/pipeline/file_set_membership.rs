@@ -58,7 +58,7 @@ impl Membership {
         let mut warnings = IndexMap::<BString, usize>::new();
         for (file, owner) in self.conflicts {
             let body: BString = format!(
-                "In target \"{}\" the file\n\n  {file}\n\nalready belongs to file set \"{owner}\".",
+                "In target \"{}\" the file\n  {file}\nalready belongs to file set \"{owner}\".",
                 target.name
             )
             .into();

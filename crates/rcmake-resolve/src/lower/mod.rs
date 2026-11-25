@@ -49,6 +49,7 @@ pub(crate) use artifacts::{
 };
 pub use artifacts::{compute_artifacts, linker_language, object_path, source_language};
 pub(crate) use artifacts::{object_dir, short_object_paths};
+pub use compile::codemodel_compile_flags;
 pub(crate) use compile::{language_flags, msvc::debug_options as msvc_debug_options};
 pub(crate) use custom::{checked_command_outputs, command_outputs};
 pub use graph::lower;
@@ -59,6 +60,7 @@ pub use install::{
     lower_install_manifest,
 };
 pub use launcher::instrumentation_launcher;
+pub use link::codemodel_link_flags;
 pub(crate) use link::{
     ide_rpaths, install_name_dir, install_name_prefix, warn_install_name_policy,
 };
@@ -66,7 +68,9 @@ pub(crate) use modules::scan_responses;
 pub use modules::{bmi_script_path, lower_modules};
 pub(crate) use pch::{IdeLowering, Plans as PchPlans};
 pub(crate) use policy_flags::warn_about_wrappers;
-pub use shell::{cmake_posix_quote, rule_command_chain, simple_args as rule_arguments};
+pub use shell::{
+    cmake_posix_quote, custom_shell_operator, rule_command_chain, simple_args as rule_arguments,
+};
 pub(crate) use standard::{
     checked_standard_flag, cmp0128_warnings, cxx_standard_mode, required_standard,
 };

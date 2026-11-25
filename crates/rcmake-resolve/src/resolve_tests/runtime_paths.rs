@@ -579,3 +579,58 @@ fn elf_links_private_import_stubs_without_adding_them_to_the_runtime_path() -> T
     assert!(!link.contains("-Wl,-rpath,/opt/vendor/stubs"), "{link}");
     Ok(())
 }
+
+#[cfg(unix)]
+#[test]
+fn runtime_path_starts_with_non_implicit_user_link_directories() -> TestResult {
+    for (system, separator, expected) in [
+        ("Linux", ":", "-Wl,-rpath,/first:/second"),
+        ("Darwin", "", "-Wl,-rpath,/first -Wl,-rpath,/second"),
+    ] {
+        let (mut model, host) = fixture(system)?;
+        for (key, value) in [
+            ("CMAKE_EXECUTABLE_RUNTIME_C_FLAG", "-Wl,-rpath,"),
+            ("CMAKE_EXECUTABLE_RUNTIME_C_FLAG_SEP", separator),
+            ("CMAKE_C_IMPLICIT_LINK_DIRECTORIES", "/system"),
+            ("CMAKE_C_STANDARD_LINK_DIRECTORIES", "/standard"),
+        ] {
+            model.global.props.set(key.into(), value.into());
+        }
+        let mut app = target("app", TargetKind::Executable, &["main.c"]);
+        app.usage.push(
+            UsageField::LinkDirectories,
+            entry("/first;/system;$<1:/second>"),
+        );
+        model.add_target(app)?;
+        let result = resolve(&model, &host, &[])?;
+        let link = recipe(&result, b"app")?;
+        assert!(link.contains(expected), "{link}");
+        assert!(!link.contains("-rpath,/system"), "{link}");
+        assert!(!link.contains("-rpath,/standard"), "{link}");
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn private_raw_shared_library_does_not_add_consumer_runtime_paths() -> TestResult {
+    let (mut model, host) = fixture("Linux")?;
+    model.global.props.set(
+        "CMAKE_SHARED_LIBRARY_RPATH_LINK_C_FLAG".into(),
+        "-Wl,-rpath-link,".into(),
+    );
+    let mut library = target("driver", TargetKind::SharedLibrary, &["lib.c"]);
+    let mut private = link_item("/opt/x/lib/libz.so");
+    private.scope = Some(rcmake_model::UsageScope::Private);
+    library.usage.link_libraries = Some(vec![private]);
+    model.add_target(library)?;
+    let mut app = target("app", TargetKind::Executable, &["main.c"]);
+    app.usage.link_libraries = Some(vec![link_item("driver")]);
+    model.add_target(app)?;
+    let result = resolve(&model, &host, &[])?;
+    let driver = recipe(&result, b"driver")?;
+    let app = recipe(&result, b"app")?;
+    assert!(driver.contains("-rpath,/opt/x/lib"), "{driver}");
+    assert!(!app.contains("/opt/x/lib"), "{app}");
+    Ok(())
+}

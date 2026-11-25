@@ -40,6 +40,25 @@ pub fn cmake_posix_quote(argument: &[u8]) -> BString {
     result
 }
 
+/// Return whether CMake passes a custom command argument to the shell as an operator.
+#[must_use]
+pub fn custom_shell_operator(argument: &[u8]) -> bool {
+    matches!(
+        argument,
+        b"<" | b">"
+            | b"<<"
+            | b">>"
+            | b"|"
+            | b"||"
+            | b"&&"
+            | b"&>"
+            | b"1>"
+            | b"2>"
+            | b"2>&1"
+            | b"1>&2"
+    )
+}
+
 pub(super) fn ninja_custom(
     argv: Vec<BString>,
     working_dir: Option<BString>,
@@ -49,22 +68,7 @@ pub(super) fn ninja_custom(
         if index == 0 {
             return cmake_posix_quote(arg);
         }
-        if matches!(
-            arg.as_slice(),
-            b"<" | b">"
-                | b"<<"
-                | b">>"
-                | b"|"
-                | b"||"
-                | b"&&"
-                | b"&"
-                | b"2>"
-                | b"2>>"
-                | b"1>"
-                | b"1>>"
-                | b"2>&1"
-                | b"1>&2"
-        ) {
+        if custom_shell_operator(arg) {
             return arg.clone();
         }
         if verbatim {
@@ -561,5 +565,23 @@ mod tests {
             );
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod custom_tests {
+    use super::*;
+
+    #[test]
+    fn verbatim_custom_command_quotes_only_non_operators() {
+        for (args, expected) in [
+            (vec!["tool", "&"], "tool \"&\""),
+            (vec!["tool", "&>", "log"], "tool &> log"),
+            (vec!["tool", "1>>", "2>>"], "tool \"1>>\" \"2>>\""),
+        ] {
+            let invocation =
+                ninja_custom(args.into_iter().map(BString::from).collect(), None, true);
+            assert_eq!(invocation.shell, expected);
+        }
     }
 }

@@ -487,7 +487,7 @@ fn dependency_identity(
                 "that is in an export set which is exported multiple times with different namespaces"
             };
             return Err(generation_error([format!(
-                "Target \"{}\" references target \"{}\" {reason}: {}.\n\nAn SBOM cannot attribute a dependency exported in more than one export set or with more than one namespace.  Consider consolidating the exports of the \"{}\" target to a single export.",
+                "Target \"{}\" references target \"{}\" {reason}: {}.\nAn SBOM cannot attribute a dependency exported in more than one export set or with more than one namespace.  Consider consolidating the exports of the \"{}\" target to a single export.",
                 consumer.name, target.name, BString::from(files), target.name,
             ).into()]));
         }

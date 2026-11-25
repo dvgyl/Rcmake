@@ -24,6 +24,8 @@ pub struct ResolvedLinkItem {
     pub direct: bool,
     /// Scope of the original dependency edge.
     pub scope: UsageScope,
+    /// Target that injected this item through INTERFACE_LINK_LIBRARIES_DIRECT.
+    pub injected_by: Option<TargetId>,
 }
 
 /// The role of one resolved link item.
@@ -191,6 +193,19 @@ impl<'a> UsageResolver<'a> {
         ctx: &EvalContext,
     ) -> Result<SharedLinks, ResolveError> {
         self.usage_links(target, false, &link_context(target, ctx))
+    }
+
+    /// Read the direct entries of a target's link implementation or interface.
+    pub fn direct_link_items(
+        &mut self,
+        target: TargetId,
+        interface: bool,
+        ctx: &EvalContext,
+    ) -> Result<Arc<[Arc<ResolvedLinkItem>]>, ResolveError> {
+        let mut ctx = context(target, ctx, ctx.traversal);
+        ctx.head.get_or_insert(handle(target));
+        let (items, _) = self.usage_links(target, interface, &ctx)?;
+        Ok(items)
     }
 
     pub(crate) fn graphviz_interface_links(
@@ -523,6 +538,7 @@ impl<'a> UsageResolver<'a> {
                     },
                     feature: None,
                     direct,
+                    injected_by: None,
                     scope,
                 });
                 continue;
@@ -553,6 +569,7 @@ impl<'a> UsageResolver<'a> {
                 kind,
                 feature: feature.clone(),
                 direct,
+                injected_by: None,
                 scope,
             };
             if let Some(ResolvedLinkItem {
@@ -707,11 +724,12 @@ impl Injection {
                     .collect();
                 let links = resolver.evaluate_links(id, property, &items, ctx, true, false)?;
                 self.flags = self.flags.union(links.value.flags);
-                for link in links.items {
+                for mut link in links.items {
                     if property == EXCLUDE {
                         self.excluded.insert(link.key());
                     } else if self.emitted.insert(link.key()) {
                         self.follow(resolver, &link, ctx, depth + 1)?;
+                        link.injected_by = Some(id);
                         self.output.push(link);
                     }
                 }

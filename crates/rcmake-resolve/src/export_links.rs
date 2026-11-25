@@ -146,7 +146,7 @@ pub(crate) fn qualify(
                         dependency,
                         scope,
                         format!(
-                            "that is not in this export set, but {scenario}: {files}.\n\nAn exported target cannot depend upon another target which is exported in more than one export set or with more than one namespace.  Consider consolidating the exports of the \"{}\" target to a single export.",
+                            "that is not in this export set, but {scenario}: {files}.\nAn exported target cannot depend upon another target which is exported in more than one export set or with more than one namespace.  Consider consolidating the exports of the \"{}\" target to a single export.",
                             dependency.name
                         ),
                     ));

@@ -584,7 +584,7 @@ fn links_object_replies_and_backtraces() -> TestResult {
             .iter()
             .filter(|input| string(get(input, "path")) == b"/elsewhere/module.cmake")
             .count(),
-        1
+        2
     );
     for (path, flag) in [
         ("/build/generated.cmake", "isGenerated"),

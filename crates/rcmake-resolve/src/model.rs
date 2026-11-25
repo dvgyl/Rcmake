@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use indexmap::{IndexMap, IndexSet};
 use rcmake_base::BString;
 use rcmake_cxxmodules::{ModmapFormat, ModuleVisibility, TargetDependInfo};
@@ -716,6 +718,28 @@ pub struct CustomOutputOwners {
     pub shared_output: bool,
 }
 
+/// Precompiled header files and flags for the File API.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PchDetails {
+    /// Generated sources and the flags that compile them.
+    pub create: Vec<PchSource>,
+    /// Flags used by each translation unit that consumes a precompiled header.
+    pub use_flags: BTreeMap<BString, BString>,
+}
+
+/// A generated source that creates a precompiled header.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PchSource {
+    /// Absolute source path.
+    pub path: BString,
+    /// Absolute precompiled header path.
+    pub header: BString,
+    /// Compile group of the units that use this header.
+    pub group: usize,
+    /// Shell-escaped PCH creation flags.
+    pub flags: BString,
+}
+
 /// Lowered build graph of one configuration (layer 3).
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct BuildGraph {
@@ -739,6 +763,8 @@ pub struct BuildGraph {
     pub target_ids: Vec<TargetId>,
     /// Steps that run custom target commands.
     pub utility_steps: IndexSet<usize>,
+    /// Generated precompiled header files and flags by target.
+    pub pch_details: IndexMap<TargetId, PchDetails>,
 }
 
 /// File set members that affect compile ordering under CMP0154.

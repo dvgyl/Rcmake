@@ -158,6 +158,10 @@ pub(crate) fn lower_with_inputs(
         } else {
             Vec::new()
         };
+        let pch = precompiled.details(model, target, resolved, inputs.get(&resolved.id))?;
+        if !pch.create.is_empty() || !pch.use_flags.is_empty() {
+            graph.pch_details.insert(resolved.id, pch);
+        }
         let objects = plan.add_compile_steps(
             &artifacts,
             &commands,

@@ -25,6 +25,7 @@ fn item(value: &str, kind: ResolvedLinkKind) -> ResolvedLinkItem {
         kind,
         feature: None,
         direct: true,
+        injected_by: None,
     }
 }
 

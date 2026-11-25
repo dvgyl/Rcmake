@@ -481,7 +481,13 @@ fn resolves_build_install_and_export_for_each_config() -> TestResult {
             if inputs.contains(&archive_path)
                 && invocations.iter().any(|invocation| invocation.argv.contains(&library_arg))
     ));
-    let [archive, executable, export] = result.install.actions.as_slice() else {
+    let install_entries = result
+        .install
+        .actions
+        .iter()
+        .filter(|action| !matches!(action.kind, InstallActionKind::Code(_)))
+        .collect::<Vec<_>>();
+    let [archive, executable, export] = install_entries.as_slice() else {
         return Err("Expected three install actions.".into());
     };
     assert!(
@@ -807,7 +813,7 @@ fn checks_sources_and_resolves_generated_files_in_the_binary_directory() -> Test
     host.seed_file(Path::new("/src/header.c"), b"")?;
     assert_eq!(
         resolve(&model, &host, &[]).expect_err("The source is missing."),
-        ResolveError::Message("Cannot find source file:\n\n  main.c".into())
+        ResolveError::Message("Cannot find source file:\n  main.c".into())
     );
     host.seed_file(Path::new("/src/main.c"), b"")?;
     let result = resolve(&model, &host, &[])?;
@@ -2632,8 +2638,8 @@ fn xcode_resolves_embed_paths_and_records_per_config_diagnostic() -> TestResult 
         Some(
             concat!(
                 "Xcode does not support per-config XCODE_EMBED_FRAMEWORKS:",
-                "\n\n  $<$<CONFIG:Debug>:Vendor.framework>",
-                "\n\nspecified for target:\n\n  app",
+                "\n  $<$<CONFIG:Debug>:Vendor.framework>",
+                "\nspecified for target:\n  app",
             )
             .into()
         )

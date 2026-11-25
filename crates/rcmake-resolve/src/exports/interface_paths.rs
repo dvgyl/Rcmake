@@ -20,7 +20,7 @@ pub(super) fn validate(
                 .prefix(Lexical::new(&Lexical::new(child).normalize()))
     };
     let body = if !Lexical::new(value).absolute() {
-        format!("contains relative path:\n\n  \"{value}\"")
+        format!("contains relative path:\n  \"{value}\"")
     } else {
         let binary = inside(&root.binary_dir, value);
         let source = inside(&root.source_dir, value);
@@ -45,7 +45,7 @@ pub(super) fn validate(
         } else {
             return Ok(());
         };
-        format!("contains path:\n\n  \"{value}\"\n\nwhich is prefixed in the {kind} directory.")
+        format!("contains path:\n  \"{value}\"\nwhich is prefixed in the {kind} directory.")
     };
     let diagnostic = Diagnostic {
         annotations: None,

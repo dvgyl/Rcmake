@@ -135,7 +135,7 @@ pub(crate) fn apply_compile_properties(
         {
             let file = BString::from(Lexical::new(&source.value).filename());
             let body = BString::from(format!(
-                "Found relative path while evaluating include directories of \"{file}\":\n\n  \"{}\"",
+                "Found relative path while evaluating include directories of \"{file}\":\n  \"{}\"",
                 include.value
             ));
             if let Some(paths) = usage.source_paths() {
@@ -513,7 +513,7 @@ impl<'a> SourcePaths<'a> {
             .final_policies
             .map_or(PolicyStatus::New, |policies| policies.get(policy));
         let (identity, display_path) = self.missing_identity(dir, &source.value);
-        let mut body: BString = [b"Cannot find source file:\n\n  ", display_path.as_slice()]
+        let mut body: BString = [b"Cannot find source file:\n  ", display_path.as_slice()]
             .concat()
             .into();
         if status != PolicyStatus::New {
@@ -561,7 +561,7 @@ impl<'a> SourcePaths<'a> {
                     }
                 }
             }
-            body.extend_from_slice(b"\n\nTried extensions");
+            body.extend_from_slice(b"\nTried extensions");
             for extension in extensions {
                 body.extend_from_slice(b" .");
                 body.extend_from_slice(extension.as_bytes());
@@ -789,7 +789,7 @@ pub(crate) fn validate_object_sources(
         body.extend_from_slice(b"\n  ");
         body.extend_from_slice(Lexical::new(source).filename());
     }
-    body.extend_from_slice(b"\n\nbut may contain only sources that compile, header files, and other files that would not affect linking of a normal library.");
+    body.extend_from_slice(b"\nbut may contain only sources that compile, header files, and other files that would not affect linking of a normal library.");
     Err(paths.target_error(model, target, body))
 }
 
@@ -902,7 +902,7 @@ fn object_property(
             raw
         )
     } else if path.absolute() || !path.root_name().is_empty() {
-        format!("resolves to an absolute path which is not supported:\n\n  {name}")
+        format!("resolves to an absolute path which is not supported:\n  {name}")
     } else if path.components().any(|part| part == b"..") {
         format!("contains an invalid component ({name}).")
     } else {
@@ -910,7 +910,7 @@ fn object_property(
     };
     Err(crate::ResolveError::Message(
         format!(
-            "The \"{}\" property for\n\n  {}\n\n{reason}",
+            "The \"{}\" property for\n  {}\n{reason}",
             BString::from(property),
             BString::from(source)
         )

@@ -350,11 +350,8 @@ fn per_config_source_error(property: &str, value: &str, path: &str) -> GenError 
     GenError::Invalid(
         format!(
             "Xcode does not support per-config per-source {property}:
-
   {value}
-
 specified for source:
-
   {path}"
         )
         .into(),

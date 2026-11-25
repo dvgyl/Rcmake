@@ -408,7 +408,7 @@ impl IdeFacts {
                     let name = &target.name;
                     self.xcode_config_sensitive_embed.get_or_insert_with(|| {
                         format!(
-                            "Xcode does not support per-config {property}:\n\n  {value}\n\nspecified for target:\n\n  {name}"
+                            "Xcode does not support per-config {property}:\n  {value}\nspecified for target:\n  {name}"
                         ).into()
                     });
                 }

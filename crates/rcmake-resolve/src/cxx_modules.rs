@@ -126,7 +126,7 @@ pub(crate) fn validate_module_source(
         .any(|key| lower::definition(model, target.dir, key).is_some());
     let unscheduled = || {
         format!(
-            "Target \"{name}\" has source file\n\n  {source}\n\nin a \"FILE_SET TYPE CXX_MODULES\" but it is not scheduled for compilation."
+            "Target \"{name}\" has source file\n  {source}\nin a \"FILE_SET TYPE CXX_MODULES\" but it is not scheduled for compilation."
         )
     };
     if !cxx_enabled {
@@ -138,7 +138,7 @@ pub(crate) fn validate_module_source(
     match language {
         Some(language) if language == b"CXX" => Ok(()),
         Some(_) => Err(module_error(model, paths, target, format!(
-            "Target \"{name}\" contains the source\n\n  {source}\n\nin a file set of type \"CXX_MODULES\" but the source is not classified as a \"CXX\" source."
+            "Target \"{name}\" contains the source\n  {source}\nin a file set of type \"CXX_MODULES\" but the source is not classified as a \"CXX\" source."
         ).into())),
         None => Err(module_error(model, paths, target, unscheduled().into())),
     }

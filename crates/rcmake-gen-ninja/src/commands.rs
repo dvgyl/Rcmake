@@ -1,6 +1,9 @@
 use rcmake_base::{BString, path_lex::Lexical};
 use rcmake_host::Host;
-use rcmake_resolve::{Invocation, lower::cmake_posix_quote};
+use rcmake_resolve::{
+    Invocation,
+    lower::{cmake_posix_quote, custom_shell_operator},
+};
 
 use crate::syntax::shell_word;
 
@@ -312,7 +315,7 @@ impl Commands {
                 shell_argument(program, &mut out, batch, is_batch(program));
                 for arg in arguments {
                     out.push(b' ');
-                    if custom && operator(arg) {
+                    if custom && custom_shell_operator(arg) {
                         out.extend_from_slice(arg);
                     } else {
                         shell_argument(arg, &mut out, batch, is_batch(program));
@@ -391,7 +394,12 @@ fn needs_cmd(invocation: &Invocation, custom: bool) -> bool {
         .argv
         .first()
         .is_none_or(|program| is_batch(program) || builtin(program))
-        || custom && invocation.argv.iter().skip(1).any(|arg| operator(arg))
+        || custom
+            && invocation
+                .argv
+                .iter()
+                .skip(1)
+                .any(|arg| custom_shell_operator(arg))
 }
 
 fn is_batch(program: &[u8]) -> bool {
@@ -425,23 +433,6 @@ fn builtin(program: &[u8]) -> bool {
     ]
     .iter()
     .any(|name| program.eq_ignore_ascii_case(name))
-}
-
-fn operator(arg: &[u8]) -> bool {
-    matches!(
-        arg,
-        b"<" | b">"
-            | b"<<"
-            | b">>"
-            | b"1>"
-            | b"2>"
-            | b"2>>"
-            | b"2>&1"
-            | b"1>&2"
-            | b"|"
-            | b"||"
-            | b"&&"
-    )
 }
 
 fn finish_command(out: &mut Vec<u8>, batch: bool) {
@@ -512,7 +503,7 @@ fn posix_custom_line(invocations: &[Invocation], build_dir: &[u8], prefix: bool)
                 result.extend_from_slice(&cmake_posix_quote(program));
                 for arg in args {
                     result.push(b' ');
-                    if operator(arg) {
+                    if custom_shell_operator(arg) {
                         result.extend_from_slice(arg);
                     } else {
                         result.extend_from_slice(&cmake_posix_quote(arg));

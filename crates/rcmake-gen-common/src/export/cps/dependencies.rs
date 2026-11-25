@@ -161,7 +161,7 @@ impl<'a> Dependencies<'a> {
                 "in another export set which is exported multiple times with different namespaces"
             };
             let details = format!(
-                "that is not in this export set, but {reason}: {}.\n\nAn exported target cannot depend upon another target which is exported in more than one export set or with more than one namespace.  Consider consolidating the exports of the \"{}\" target to a single export.",
+                "that is not in this export set, but {reason}: {}.\nAn exported target cannot depend upon another target which is exported in more than one export set or with more than one namespace.  Consider consolidating the exports of the \"{}\" target to a single export.",
                 BString::from(files),
                 target.name,
             );

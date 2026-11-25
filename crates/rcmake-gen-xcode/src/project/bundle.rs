@@ -132,7 +132,7 @@ impl Project<'_> {
                 || values.any(|value| value.as_ref() != Some(&items))
             {
                 return Err(GenError::Invalid(format!(
-                    "Xcode does not support per-config {property}:\n\n  {expression}\n\nspecified for target:\n\n  {}", raw.name
+                    "Xcode does not support per-config {property}:\n  {expression}\nspecified for target:\n  {}", raw.name
                 ).into()));
             }
             let key = format!("{key}/embed/{kind}");
