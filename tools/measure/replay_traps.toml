@@ -1,0 +1,991 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+# Scripted replay soundness traps T01-T25 for tools/measure/mutation_eval.py --traps.
+schema_version = 1
+
+[[trap]]
+id = "T01"
+name = "func-body"
+stage = "HB.1"
+description = "Leaf calls helper() defined in cmake/helpers.cmake; changing helper body must execute helper."
+skip_reason = "Pending call-level replay and executed_calls/replayed_calls receipts (HB.1)."
+expect_executed = ["leaf/CMakeLists.txt", "cmake/helpers.cmake"]
+expect_replayed = ["control/CMakeLists.txt"]
+expect_executed_calls = ["helper"]
+
+[trap.files]
+"CMakeLists.txt" = """\
+cmake_minimum_required(VERSION 4.5)
+project(TrapFuncBody C)
+include(cmake/helpers.cmake)
+add_subdirectory(control)
+add_subdirectory(leaf)
+"""
+"cmake/helpers.cmake" = """\
+function(helper tgt)
+  target_compile_definitions(${tgt} PRIVATE HELPER_VAL=1)
+endfunction()
+"""
+"control/CMakeLists.txt" = "add_library(control STATIC control.c)\n"
+"control/control.c" = "int control_fn(void) { return 0; }\n"
+"leaf/CMakeLists.txt" = """\
+add_library(leaf STATIC leaf.c)
+helper(leaf)
+"""
+"leaf/leaf.c" = "int leaf_fn(void) { return 1; }\n"
+
+[[trap.mutate.replace]]
+path = "cmake/helpers.cmake"
+old = "HELPER_VAL=1"
+new = "HELPER_VAL=2"
+
+[trap.expect_build_contains]
+"build.ninja" = ["HELPER_VAL=2"]
+
+
+[[trap]]
+id = "T02"
+name = "func-redefine"
+stage = "HB.1"
+description = "helper() defined in two files where second wins; removing second restores first definition."
+skip_reason = "Pending call-level replay and executed_calls/replayed_calls receipts (HB.1)."
+expect_executed = ["leaf/CMakeLists.txt"]
+expect_replayed = ["control/CMakeLists.txt"]
+expect_executed_calls = ["helper"]
+
+[trap.files]
+"CMakeLists.txt" = """\
+cmake_minimum_required(VERSION 4.5)
+project(TrapFuncRedefine C)
+include(cmake/first.cmake)
+include(cmake/second.cmake OPTIONAL)
+add_subdirectory(control)
+add_subdirectory(leaf)
+"""
+"cmake/first.cmake" = """\
+function(helper tgt)
+  target_compile_definitions(${tgt} PRIVATE HELPER_SRC=1)
+endfunction()
+"""
+"cmake/second.cmake" = """\
+function(helper tgt)
+  target_compile_definitions(${tgt} PRIVATE HELPER_SRC=2)
+endfunction()
+"""
+"control/CMakeLists.txt" = "add_library(control STATIC control.c)\n"
+"control/control.c" = "int control_fn(void) { return 0; }\n"
+"leaf/CMakeLists.txt" = """\
+add_library(leaf STATIC leaf.c)
+helper(leaf)
+"""
+"leaf/leaf.c" = "int leaf_fn(void) { return 1; }\n"
+
+[trap.mutate]
+remove = ["cmake/second.cmake"]
+
+[trap.expect_build_contains]
+"build.ninja" = ["HELPER_SRC=1"]
+
+
+[[trap]]
+id = "T03"
+name = "func-env"
+stage = "HB.1"
+description = "helper() reads $ENV{RCMAKE_TRAP}; changing the environment variable must re-run helper."
+skip_reason = "Pending call-level replay and executed_calls/replayed_calls receipts (HB.1)."
+expect_executed = ["leaf/CMakeLists.txt"]
+expect_replayed = ["control/CMakeLists.txt"]
+expect_executed_calls = ["helper"]
+
+[trap.initial_env]
+RCMAKE_TRAP = "before"
+
+[trap.files]
+"CMakeLists.txt" = """\
+cmake_minimum_required(VERSION 4.5)
+project(TrapFuncEnv C)
+include(cmake/helpers.cmake)
+add_subdirectory(control)
+add_subdirectory(leaf)
+"""
+"cmake/helpers.cmake" = """\
+function(helper tgt)
+  target_compile_definitions(${tgt} PRIVATE "ENV_SEEN=$ENV{RCMAKE_TRAP}")
+endfunction()
+"""
+"control/CMakeLists.txt" = "add_library(control STATIC control.c)\n"
+"control/control.c" = "int control_fn(void) { return 0; }\n"
+"leaf/CMakeLists.txt" = """\
+add_library(leaf STATIC leaf.c)
+helper(leaf)
+"""
+"leaf/leaf.c" = "int leaf_fn(void) { return 1; }\n"
+
+[trap.mutate.env]
+RCMAKE_TRAP = "after"
+
+[trap.expect_build_contains]
+"build.ninja" = ["ENV_SEEN=after"]
+
+
+[[trap]]
+id = "T04"
+name = "macro-target-prop"
+stage = "HB.2"
+description = "Macro reads get_target_property(x core COMPILE_DEFINITIONS) from another directory."
+skip_reason = "Pending macro call-level replay and executed_calls/replayed_calls receipts (HB.2)."
+expect_executed = ["core/CMakeLists.txt", "consumer/CMakeLists.txt"]
+expect_replayed = ["control/CMakeLists.txt"]
+expect_executed_calls = ["read_core_defs"]
+
+[trap.files]
+"CMakeLists.txt" = """\
+cmake_minimum_required(VERSION 4.5)
+project(TrapMacroTargetProp C)
+add_subdirectory(control)
+add_subdirectory(core)
+add_subdirectory(consumer)
+"""
+"control/CMakeLists.txt" = "add_library(control STATIC control.c)\n"
+"control/control.c" = "int control_fn(void) { return 0; }\n"
+"core/CMakeLists.txt" = """\
+add_library(core STATIC core.c)
+target_compile_definitions(core PRIVATE CORE_TAG=before)
+"""
+"core/core.c" = "int core_fn(void) { return 0; }\n"
+"consumer/CMakeLists.txt" = """\
+macro(read_core_defs out_tgt)
+  get_target_property(_core_defs core COMPILE_DEFINITIONS)
+  string(REPLACE "=" "_" _safe_defs "${_core_defs}")
+  target_compile_definitions(${out_tgt} PRIVATE "OBSERVED=${_safe_defs}")
+endmacro()
+add_library(consumer STATIC consumer.c)
+read_core_defs(consumer)
+"""
+"consumer/consumer.c" = "int consumer_fn(void) { return 1; }\n"
+
+[[trap.mutate.replace]]
+path = "core/CMakeLists.txt"
+old = "CORE_TAG=before"
+new = "CORE_TAG=after"
+
+[trap.expect_build_contains]
+"build.ninja" = ["OBSERVED=CORE_TAG_after"]
+
+
+[[trap]]
+id = "T05"
+name = "parent-scope"
+stage = "HB.1"
+description = "Function sets V PARENT_SCOPE from top-level INPUT; changing -DINPUT must propagate new V."
+skip_reason = "Pending call-level replay and per-region CLI define tracking (HB.1)."
+expect_executed = ["leaf/CMakeLists.txt"]
+expect_replayed = ["control/CMakeLists.txt"]
+expect_executed_calls = ["compute_v"]
+
+[trap.initial_defines]
+INPUT = "before"
+
+[trap.files]
+"CMakeLists.txt" = """\
+cmake_minimum_required(VERSION 4.5)
+project(TrapParentScope C)
+add_subdirectory(control)
+add_subdirectory(leaf)
+"""
+"control/CMakeLists.txt" = "add_library(control STATIC control.c)\n"
+"control/control.c" = "int control_fn(void) { return 0; }\n"
+"leaf/CMakeLists.txt" = """\
+function(compute_v)
+  set(V "val_${INPUT}" PARENT_SCOPE)
+endfunction()
+compute_v()
+add_library(leaf STATIC leaf.c)
+target_compile_definitions(leaf PRIVATE "PROP_V=${V}")
+"""
+"leaf/leaf.c" = "int leaf_fn(void) { return 1; }\n"
+
+[trap.mutate.defines]
+INPUT = "after"
+
+[trap.expect_build_contains]
+"build.ninja" = ["PROP_V=val_after"]
+
+
+[[trap]]
+id = "T06"
+name = "block-propagate"
+stage = "HA.1"
+description = "block(PROPAGATE X) in a leaf; changing the inner value must propagate new X after the block."
+expect_executed = ["leaf/CMakeLists.txt"]
+expect_replayed = ["control/CMakeLists.txt"]
+
+[trap.files]
+"CMakeLists.txt" = """\
+cmake_minimum_required(VERSION 4.5)
+project(TrapBlockPropagate C)
+add_subdirectory(control)
+add_subdirectory(leaf)
+"""
+"control/CMakeLists.txt" = "add_library(control STATIC control.c)\n"
+"control/control.c" = "int control_fn(void) { return 0; }\n"
+"leaf/CMakeLists.txt" = """\
+set(X "outer")
+block(PROPAGATE X)
+  set(X "inner_before")
+endblock()
+add_library(leaf STATIC leaf.c)
+target_compile_definitions(leaf PRIVATE "BLOCK_X=${X}")
+"""
+"leaf/leaf.c" = "int leaf_fn(void) { return 1; }\n"
+
+[[trap.mutate.replace]]
+path = "leaf/CMakeLists.txt"
+old = "inner_before"
+new = "inner_after"
+
+[trap.expect_build_contains]
+"build.ninja" = ["BLOCK_X=inner_after"]
+
+
+[[trap]]
+id = "T07"
+name = "return-propagate"
+stage = "HA.2"
+description = "include()d file uses return(PROPAGATE V) under CMP0140 NEW; changing V must reach caller."
+expect_executed = ["leaf/CMakeLists.txt", "leaf/part.cmake"]
+expect_replayed = ["control/CMakeLists.txt"]
+
+[trap.files]
+"CMakeLists.txt" = """\
+cmake_minimum_required(VERSION 4.5)
+project(TrapReturnPropagate C)
+add_subdirectory(control)
+add_subdirectory(leaf)
+"""
+"control/CMakeLists.txt" = "add_library(control STATIC control.c)\n"
+"control/control.c" = "int control_fn(void) { return 0; }\n"
+"leaf/CMakeLists.txt" = """\
+cmake_policy(SET CMP0140 NEW)
+set(V "initial")
+include("${CMAKE_CURRENT_SOURCE_DIR}/part.cmake")
+add_library(leaf STATIC leaf.c)
+target_compile_definitions(leaf PRIVATE "RET_V=${V}")
+"""
+"leaf/part.cmake" = """\
+set(V "from_part_before")
+return(PROPAGATE V)
+set(V "unreachable")
+"""
+"leaf/leaf.c" = "int leaf_fn(void) { return 1; }\n"
+
+[[trap.mutate.replace]]
+path = "leaf/part.cmake"
+old = "from_part_before"
+new = "from_part_after"
+
+[trap.expect_build_contains]
+"build.ninja" = ["RET_V=from_part_after"]
+
+
+[[trap]]
+id = "T08"
+name = "configure-depends-glob"
+stage = "HA.3"
+description = "file(GLOB CONFIGURE_DEPENDS *.c); adding a .c file without editing listfiles updates build and VerifyGlobs."
+expect_executed = ["leaf/CMakeLists.txt"]
+expect_replayed = ["control/CMakeLists.txt"]
+
+[trap.files]
+"CMakeLists.txt" = """\
+cmake_minimum_required(VERSION 4.5)
+project(TrapGlobConfigureDepends C)
+add_subdirectory(control)
+add_subdirectory(leaf)
+"""
+"control/CMakeLists.txt" = "add_library(control STATIC control.c)\n"
+"control/control.c" = "int control_fn(void) { return 0; }\n"
+"leaf/CMakeLists.txt" = """\
+file(GLOB LEAF_SRCS CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/*.c")
+add_library(leaf STATIC ${LEAF_SRCS})
+"""
+"leaf/a.c" = "int leaf_a(void) { return 1; }\n"
+
+[trap.mutate.write]
+"leaf/b.c" = "int leaf_b(void) { return 2; }\n"
+
+[trap.expect_build_contains]
+"build.ninja" = ["VerifyGlobs.cmake", "b.c"]
+"CMakeFiles/VerifyGlobs.cmake" = ["leaf/*.c", "b.c"]
+
+
+[[trap]]
+id = "T09"
+name = "glob-plain"
+stage = "HA.3"
+description = "file(GLOB *.c) without CONFIGURE_DEPENDS; adding a .c file and reconfiguring matches --fresh."
+expect_executed = ["leaf/CMakeLists.txt"]
+expect_replayed = ["control/CMakeLists.txt"]
+
+[trap.files]
+"CMakeLists.txt" = """\
+cmake_minimum_required(VERSION 4.5)
+project(TrapGlobPlain C)
+add_subdirectory(control)
+add_subdirectory(leaf)
+"""
+"control/CMakeLists.txt" = "add_library(control STATIC control.c)\n"
+"control/control.c" = "int control_fn(void) { return 0; }\n"
+"leaf/CMakeLists.txt" = """\
+file(GLOB LEAF_SRCS "${CMAKE_CURRENT_SOURCE_DIR}/*.c")
+add_library(leaf STATIC ${LEAF_SRCS})
+"""
+"leaf/a.c" = "int leaf_a(void) { return 1; }\n"
+
+[trap.mutate.write]
+"leaf/b.c" = "int leaf_b(void) { return 2; }\n"
+
+[trap.expect_build_contains]
+"build.ninja" = ["b.c"]
+
+
+[[trap]]
+id = "T10"
+name = "cache-arg"
+stage = "HB.1"
+description = "Function reads cache option OPT; switching -DOPT=OFF must re-run the call."
+skip_reason = "Pending call-level replay and per-region CLI define tracking (HB.1)."
+expect_executed = ["leaf/CMakeLists.txt"]
+expect_replayed = ["control/CMakeLists.txt"]
+expect_executed_calls = ["apply_opt"]
+
+[trap.initial_defines]
+OPT = "ON"
+
+[trap.files]
+"CMakeLists.txt" = """\
+cmake_minimum_required(VERSION 4.5)
+project(TrapCacheArg C)
+option(OPT "Feature toggle" ON)
+add_subdirectory(control)
+add_subdirectory(leaf)
+"""
+"control/CMakeLists.txt" = "add_library(control STATIC control.c)\n"
+"control/control.c" = "int control_fn(void) { return 0; }\n"
+"leaf/CMakeLists.txt" = """\
+function(apply_opt tgt)
+  if(OPT)
+    target_compile_definitions(${tgt} PRIVATE OPT_ENABLED=1)
+  else()
+    target_compile_definitions(${tgt} PRIVATE OPT_ENABLED=0)
+  endif()
+endfunction()
+add_library(leaf STATIC leaf.c)
+apply_opt(leaf)
+"""
+"leaf/leaf.c" = "int leaf_fn(void) { return 1; }\n"
+
+[trap.mutate.defines]
+OPT = "OFF"
+
+[trap.expect_build_contains]
+"build.ninja" = ["OPT_ENABLED=0"]
+
+
+[[trap]]
+id = "T11"
+name = "policy-at-call"
+stage = "HB.2"
+description = "cmake_policy(SET CMP0057 NEW) before a call using IN_LIST; switching to OLD must match diagnostics."
+skip_reason = "Pending call-level replay and policy-at-call keying (HB.2)."
+expect_initial_exit_code = 0
+expect_exit_code = 1
+expect_executed = ["leaf/CMakeLists.txt"]
+expect_replayed = ["control/CMakeLists.txt"]
+expect_executed_calls = ["check_in_list"]
+expect_stderr_contains = ["CMP0057"]
+
+[trap.files]
+"CMakeLists.txt" = """\
+cmake_minimum_required(VERSION 4.5)
+project(TrapPolicyAtCall C)
+add_subdirectory(control)
+add_subdirectory(leaf)
+"""
+"control/CMakeLists.txt" = "add_library(control STATIC control.c)\n"
+"control/control.c" = "int control_fn(void) { return 0; }\n"
+"leaf/CMakeLists.txt" = """\
+macro(check_in_list tgt)
+  set(_items a b c)
+  set(_needle b)
+  if(_needle IN_LIST _items)
+    target_compile_definitions(${tgt} PRIVATE IN_LIST_RES=1)
+  else()
+    target_compile_definitions(${tgt} PRIVATE IN_LIST_RES=0)
+  endif()
+endmacro()
+add_library(leaf STATIC leaf.c)
+cmake_policy(PUSH)
+cmake_policy(SET CMP0057 NEW)
+check_in_list(leaf)
+cmake_policy(POP)
+"""
+"leaf/leaf.c" = "int leaf_fn(void) { return 1; }\n"
+
+[[trap.mutate.replace]]
+path = "leaf/CMakeLists.txt"
+old = "cmake_policy(SET CMP0057 NEW)"
+new = "cmake_policy(SET CMP0057 OLD)"
+
+
+[[trap]]
+id = "T12"
+name = "macro-double-expansion"
+stage = "HB.2"
+description = "Macro expands ${ARGN} holding ${var}; changing var must re-run the macro."
+skip_reason = "Pending macro call-level replay and executed_calls/replayed_calls receipts (HB.2)."
+expect_executed = ["leaf/CMakeLists.txt", "leaf/var.cmake"]
+expect_replayed = ["control/CMakeLists.txt"]
+expect_executed_calls = ["expand_twice"]
+
+[trap.files]
+"CMakeLists.txt" = """\
+cmake_minimum_required(VERSION 4.5)
+project(TrapMacroDoubleExpand C)
+add_subdirectory(control)
+add_subdirectory(leaf)
+"""
+"control/CMakeLists.txt" = "add_library(control STATIC control.c)\n"
+"control/control.c" = "int control_fn(void) { return 0; }\n"
+"leaf/var.cmake" = "set(var \"before\")\n"
+"leaf/CMakeLists.txt" = """\
+include("${CMAKE_CURRENT_SOURCE_DIR}/var.cmake")
+macro(expand_twice tgt)
+  foreach(_item ${ARGN})
+    target_compile_definitions(${tgt} PRIVATE "EXPANDED=${_item}")
+  endforeach()
+endmacro()
+add_library(leaf STATIC leaf.c)
+expand_twice(leaf "\\${var}")
+"""
+"leaf/leaf.c" = "int leaf_fn(void) { return 1; }\n"
+
+[[trap.mutate.replace]]
+path = "leaf/var.cmake"
+old = "before"
+new = "after"
+
+[trap.expect_build_contains]
+"build.ninja" = ["EXPANDED=after"]
+
+
+[[trap]]
+id = "T13"
+name = "include-guard-global"
+stage = "HA.4"
+description = "include_guard(GLOBAL) included from two directories; removing first include runs body in second."
+expect_executed = ["first/CMakeLists.txt", "second/CMakeLists.txt", "cmake/guarded.cmake"]
+expect_replayed = ["control/CMakeLists.txt"]
+expect_stdout_contains = ["-- GUARDED_FROM=<SOURCE>/second"]
+
+[trap.files]
+"CMakeLists.txt" = """\
+cmake_minimum_required(VERSION 4.5)
+project(TrapIncludeGuardGlobal C)
+add_subdirectory(control)
+add_subdirectory(first)
+add_subdirectory(second)
+"""
+"cmake/guarded.cmake" = """\
+include_guard(GLOBAL)
+add_compile_definitions(GUARDED_BODY=1)
+message(STATUS "GUARDED_FROM=${CMAKE_CURRENT_SOURCE_DIR}")
+"""
+"control/CMakeLists.txt" = "add_library(control STATIC control.c)\n"
+"control/control.c" = "int control_fn(void) { return 0; }\n"
+"first/CMakeLists.txt" = """\
+include("${CMAKE_SOURCE_DIR}/cmake/guarded.cmake")
+add_library(first STATIC first.c)
+"""
+"first/first.c" = "int first_fn(void) { return 1; }\n"
+"second/CMakeLists.txt" = """\
+include("${CMAKE_SOURCE_DIR}/cmake/guarded.cmake")
+add_library(second STATIC second.c)
+"""
+"second/second.c" = "int second_fn(void) { return 2; }\n"
+
+[[trap.mutate.replace]]
+path = "first/CMakeLists.txt"
+old = 'include("${CMAKE_SOURCE_DIR}/cmake/guarded.cmake")'
+new = "# removed first include"
+
+
+[[trap]]
+id = "T14"
+name = "message-bytes"
+stage = "HB.1"
+description = "message(STATUS \"${V}\") in a call; changing V must match replay-off stdout byte-for-byte."
+skip_reason = "Pending call-level replay and executed_calls/replayed_calls receipts (HB.1)."
+expect_executed = ["leaf/CMakeLists.txt", "leaf/msg.cmake"]
+expect_replayed = ["control/CMakeLists.txt"]
+expect_executed_calls = ["emit_msg"]
+expect_stdout_contains = ["-- MSG_BYTES=beta-2"]
+
+[trap.files]
+"CMakeLists.txt" = """\
+cmake_minimum_required(VERSION 4.5)
+project(TrapMessageBytes C)
+add_subdirectory(control)
+add_subdirectory(leaf)
+"""
+"control/CMakeLists.txt" = "add_library(control STATIC control.c)\n"
+"control/control.c" = "int control_fn(void) { return 0; }\n"
+"leaf/msg.cmake" = "set(V \"alpha-1\")\n"
+"leaf/CMakeLists.txt" = """\
+include("${CMAKE_CURRENT_SOURCE_DIR}/msg.cmake")
+function(emit_msg)
+  message(STATUS "MSG_BYTES=${V}")
+endfunction()
+emit_msg()
+add_library(leaf STATIC leaf.c)
+"""
+"leaf/leaf.c" = "int leaf_fn(void) { return 1; }\n"
+
+[[trap.mutate.replace]]
+path = "leaf/msg.cmake"
+old = "alpha-1"
+new = "beta-2"
+
+
+[[trap]]
+id = "T15"
+name = "nested-opaque"
+stage = "HB.3"
+description = "Function calls a function running execute_process; changing script output must run both calls."
+skip_reason = "Pending call-level replay opacity propagation and executed_calls receipts (HB.3)."
+expect_executed = ["leaf/CMakeLists.txt"]
+expect_replayed = ["control/CMakeLists.txt"]
+expect_executed_calls = ["outer_wrap", "inner_proc"]
+expect_not_replayed_calls = ["outer_wrap", "inner_proc"]
+
+[trap.files]
+"CMakeLists.txt" = """\
+cmake_minimum_required(VERSION 4.5)
+project(TrapNestedOpaque C)
+add_subdirectory(control)
+add_subdirectory(leaf)
+"""
+"control/CMakeLists.txt" = "add_library(control STATIC control.c)\n"
+"control/control.c" = "int control_fn(void) { return 0; }\n"
+"leaf/script.cmake" = "message(STATUS \"script_out_before\")\n"
+"leaf/CMakeLists.txt" = """\
+function(inner_proc out_var)
+  execute_process(
+    COMMAND "${CMAKE_COMMAND}" -P "${CMAKE_CURRENT_SOURCE_DIR}/script.cmake"
+    OUTPUT_VARIABLE _out
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+  )
+  string(REPLACE "-- " "" _out "${_out}")
+  set(${out_var} "${_out}" PARENT_SCOPE)
+endfunction()
+function(outer_wrap tgt)
+  inner_proc(_res)
+  target_compile_definitions(${tgt} PRIVATE "PROC_RES=${_res}")
+endfunction()
+add_library(leaf STATIC leaf.c)
+outer_wrap(leaf)
+"""
+"leaf/leaf.c" = "int leaf_fn(void) { return 1; }\n"
+
+[[trap.mutate.replace]]
+path = "leaf/script.cmake"
+old = "script_out_before"
+new = "script_out_after"
+
+[trap.expect_build_contains]
+"build.ninja" = ["PROC_RES=script_out_after"]
+
+
+[[trap]]
+id = "T16"
+name = "file-read"
+stage = "HB.1"
+description = "file(READ data.txt ...) inside a function; editing data.txt must re-run the call."
+skip_reason = "Pending call-level replay and executed_calls/replayed_calls receipts (HB.1)."
+expect_executed = ["leaf/CMakeLists.txt"]
+expect_replayed = ["control/CMakeLists.txt"]
+expect_executed_calls = ["load_data"]
+
+[trap.files]
+"CMakeLists.txt" = """\
+cmake_minimum_required(VERSION 4.5)
+project(TrapFileRead C)
+add_subdirectory(control)
+add_subdirectory(leaf)
+"""
+"control/CMakeLists.txt" = "add_library(control STATIC control.c)\n"
+"control/control.c" = "int control_fn(void) { return 0; }\n"
+"leaf/data.txt" = "payload_before\n"
+"leaf/CMakeLists.txt" = """\
+function(load_data tgt)
+  file(READ "${CMAKE_CURRENT_SOURCE_DIR}/data.txt" _content)
+  string(STRIP "${_content}" _content)
+  target_compile_definitions(${tgt} PRIVATE "DATA_VAL=${_content}")
+endfunction()
+add_library(leaf STATIC leaf.c)
+load_data(leaf)
+"""
+"leaf/leaf.c" = "int leaf_fn(void) { return 1; }\n"
+
+[trap.mutate.write]
+"leaf/data.txt" = "payload_after\n"
+
+[trap.expect_build_contains]
+"build.ninja" = ["DATA_VAL=payload_after"]
+
+
+[[trap]]
+id = "T17"
+name = "list-dir"
+stage = "HB.1"
+description = "Function reads CMAKE_CURRENT_LIST_DIR and CMAKE_CURRENT_FUNCTION_LIST_DIR from a new directory."
+skip_reason = "Pending call-level replay and executed_calls/replayed_calls receipts (HB.1)."
+expect_executed = ["dir_b/CMakeLists.txt"]
+expect_replayed = ["control/CMakeLists.txt"]
+expect_executed_calls = ["record_dirs"]
+
+[trap.files]
+"CMakeLists.txt" = """\
+cmake_minimum_required(VERSION 4.5)
+project(TrapListDir C)
+include(cmake/funcs.cmake)
+add_subdirectory(control)
+add_subdirectory(dir_a)
+# EXTRA_DIR_SLOT
+"""
+"cmake/funcs.cmake" = """\
+function(record_dirs tgt)
+  get_filename_component(_list_name "${CMAKE_CURRENT_LIST_DIR}" NAME)
+  get_filename_component(_fn_name "${CMAKE_CURRENT_FUNCTION_LIST_DIR}" NAME)
+  target_compile_definitions(${tgt} PRIVATE "LIST_DIR=${_list_name}" "FN_DIR=${_fn_name}")
+endfunction()
+"""
+"control/CMakeLists.txt" = "add_library(control STATIC control.c)\n"
+"control/control.c" = "int control_fn(void) { return 0; }\n"
+"dir_a/CMakeLists.txt" = """\
+add_library(dir_a STATIC a.c)
+record_dirs(dir_a)
+"""
+"dir_a/a.c" = "int dir_a_fn(void) { return 1; }\n"
+
+[trap.mutate.write]
+"dir_b/CMakeLists.txt" = """\
+add_library(dir_b STATIC b.c)
+record_dirs(dir_b)
+"""
+"dir_b/b.c" = "int dir_b_fn(void) { return 2; }\n"
+
+[[trap.mutate.replace]]
+path = "CMakeLists.txt"
+old = "# EXTRA_DIR_SLOT"
+new = "add_subdirectory(dir_b)"
+
+[trap.expect_build_contains]
+"build.ninja" = ["LIST_DIR=dir_b", "FN_DIR=cmake"]
+
+
+[[trap]]
+id = "T18"
+name = "watch"
+stage = "current"
+description = "Adding variable_watch(V) in root must make subsequent watched leaf opaque and never replayed."
+expect_executed = ["watched/CMakeLists.txt"]
+expect_replayed = ["control/CMakeLists.txt"]
+expect_not_replayed = ["watched/CMakeLists.txt"]
+
+[trap.files]
+"CMakeLists.txt" = """\
+cmake_minimum_required(VERSION 4.5)
+project(TrapWatch C)
+add_subdirectory(control)
+# WATCH_SLOT
+add_subdirectory(watched)
+"""
+"control/CMakeLists.txt" = "add_library(control STATIC control.c)\n"
+"control/control.c" = "int control_fn(void) { return 0; }\n"
+"watched/CMakeLists.txt" = """\
+set(WATCHED_VAR "ok")
+add_library(watched STATIC watched.c)
+"""
+"watched/watched.c" = "int watched_fn(void) { return 1; }\n"
+
+[[trap.mutate.replace]]
+path = "CMakeLists.txt"
+old = "# WATCH_SLOT"
+new = "variable_watch(WATCHED_VAR)"
+
+
+[[trap]]
+id = "T19"
+name = "defines-command"
+stage = "HB.1"
+description = "Function defines inner() called by a sibling directory; changing inner body must re-run sibling call."
+skip_reason = "Pending call-level replay and executed_calls/replayed_calls receipts (HB.1)."
+expect_executed = ["definer/CMakeLists.txt", "caller/CMakeLists.txt"]
+expect_replayed = ["control/CMakeLists.txt"]
+expect_executed_calls = ["define_inner", "inner"]
+
+[trap.files]
+"CMakeLists.txt" = """\
+cmake_minimum_required(VERSION 4.5)
+project(TrapDefinesCommand C)
+add_subdirectory(control)
+add_subdirectory(definer)
+add_subdirectory(caller)
+"""
+"control/CMakeLists.txt" = "add_library(control STATIC control.c)\n"
+"control/control.c" = "int control_fn(void) { return 0; }\n"
+"definer/CMakeLists.txt" = """\
+function(define_inner)
+  function(inner tgt)
+    target_compile_definitions(${tgt} PRIVATE INNER_VAL=before)
+  endfunction()
+endfunction()
+define_inner()
+"""
+"caller/CMakeLists.txt" = """\
+add_library(caller STATIC caller.c)
+inner(caller)
+"""
+"caller/caller.c" = "int caller_fn(void) { return 1; }\n"
+
+[[trap.mutate.replace]]
+path = "definer/CMakeLists.txt"
+old = "INNER_VAL=before"
+new = "INNER_VAL=after"
+
+[trap.expect_build_contains]
+"build.ninja" = ["INNER_VAL=after"]
+
+
+[[trap]]
+id = "T20"
+name = "cmake-match"
+stage = "HA.5"
+description = "string(REGEX MATCH ...) followed by ${CMAKE_MATCH_1}; changing subject must produce new match."
+expect_executed = ["leaf/CMakeLists.txt", "leaf/subject.cmake"]
+expect_replayed = ["control/CMakeLists.txt"]
+
+[trap.files]
+"CMakeLists.txt" = """\
+cmake_minimum_required(VERSION 4.5)
+project(TrapCMakeMatch C)
+add_subdirectory(control)
+add_subdirectory(leaf)
+"""
+"control/CMakeLists.txt" = "add_library(control STATIC control.c)\n"
+"control/control.c" = "int control_fn(void) { return 0; }\n"
+"leaf/subject.cmake" = "set(SUBJECT_TEXT \"item=before42\")\n"
+"leaf/CMakeLists.txt" = """\
+include("${CMAKE_CURRENT_SOURCE_DIR}/subject.cmake")
+string(REGEX MATCH "item=([a-z0-9]+)" _ "${SUBJECT_TEXT}")
+add_library(leaf STATIC leaf.c)
+target_compile_definitions(leaf PRIVATE "MATCHED=${CMAKE_MATCH_1}")
+"""
+"leaf/leaf.c" = "int leaf_fn(void) { return 1; }\n"
+
+[[trap.mutate.replace]]
+path = "leaf/subject.cmake"
+old = "before42"
+new = "after99"
+
+[trap.expect_build_contains]
+"build.ninja" = ["MATCHED=after99"]
+
+
+[[trap]]
+id = "T21"
+name = "math-error"
+stage = "HB.3"
+description = "math(EXPR) divide by zero in a call; call must stay opaque and fail consistently."
+skip_reason = "Pending call-level replay opacity enforcement for erroring calls (HB.3)."
+expect_exit_code = 1
+expect_executed = []
+expect_replayed = []
+expect_not_replayed_calls = ["bad_math"]
+expect_stderr_contains = ["divide by zero"]
+
+[trap.files]
+"CMakeLists.txt" = """\
+cmake_minimum_required(VERSION 4.5)
+project(TrapMathError C)
+add_subdirectory(control)
+add_subdirectory(leaf)
+"""
+"control/CMakeLists.txt" = "add_library(control STATIC control.c)\n"
+"control/control.c" = "int control_fn(void) { return 0; }\n"
+"leaf/CMakeLists.txt" = """\
+function(bad_math)
+  math(EXPR _out "1 / 0")
+endfunction()
+bad_math()
+add_library(leaf STATIC leaf.c)
+"""
+"leaf/leaf.c" = "int leaf_fn(void) { return 1; }\n"
+
+[trap.mutate]
+
+
+[[trap]]
+id = "T22"
+name = "enumerate"
+stage = "HB.3"
+description = "get_cmake_property(VARIABLES) inside a call; call must stay opaque and never replay."
+skip_reason = "Pending call-level replay opacity enforcement and executed_calls receipts (HB.3)."
+expect_executed = ["leaf/CMakeLists.txt"]
+expect_replayed = ["control/CMakeLists.txt"]
+expect_executed_calls = ["enum_vars"]
+expect_not_replayed_calls = ["enum_vars"]
+
+[trap.files]
+"CMakeLists.txt" = """\
+cmake_minimum_required(VERSION 4.5)
+project(TrapEnumerate C)
+add_subdirectory(control)
+add_subdirectory(leaf)
+"""
+"control/CMakeLists.txt" = "add_library(control STATIC control.c)\n"
+"control/control.c" = "int control_fn(void) { return 0; }\n"
+"leaf/CMakeLists.txt" = """\
+function(enum_vars tgt)
+  get_cmake_property(_vars VARIABLES)
+  list(LENGTH _vars _count)
+  target_compile_definitions(${tgt} PRIVATE "VAR_COUNT=${_count}")
+endfunction()
+add_library(leaf STATIC leaf.c)
+enum_vars(leaf)
+"""
+"leaf/leaf.c" = "int leaf_fn(void) { return 1; }\n"
+
+[trap.mutate]
+
+
+[[trap]]
+id = "T23"
+name = "dir-prop-inherit"
+stage = "HA.6"
+description = "get_property(DIRECTORY PROPERTY COMPILE_DEFINITIONS) reads parent add_compile_definitions."
+expect_executed = ["leaf/CMakeLists.txt"]
+expect_replayed = ["control/CMakeLists.txt"]
+expect_stdout_contains = ["-- INHERITED_DEFS=PARENT_DEF=after"]
+
+[trap.files]
+"CMakeLists.txt" = """\
+cmake_minimum_required(VERSION 4.5)
+project(TrapDirPropInherit C)
+add_subdirectory(control)
+add_compile_definitions(PARENT_DEF=before)
+add_subdirectory(leaf)
+"""
+"control/CMakeLists.txt" = "add_library(control STATIC control.c)\n"
+"control/control.c" = "int control_fn(void) { return 0; }\n"
+"leaf/CMakeLists.txt" = """\
+get_property(_inherited DIRECTORY PROPERTY COMPILE_DEFINITIONS)
+string(REPLACE "=" "_" _safe "${_inherited}")
+add_library(leaf STATIC leaf.c)
+target_compile_definitions(leaf PRIVATE "INHERITED_SEEN=${_safe}")
+message(STATUS "INHERITED_DEFS=${_inherited}")
+"""
+"leaf/leaf.c" = "int leaf_fn(void) { return 1; }\n"
+
+[[trap.mutate.replace]]
+path = "CMakeLists.txt"
+old = "PARENT_DEF=before"
+new = "PARENT_DEF=after"
+
+[trap.expect_build_contains]
+"build.ninja" = ["INHERITED_SEEN=PARENT_DEF_after"]
+
+
+[[trap]]
+id = "T24"
+name = "parse-argv-empty"
+stage = "HB.2"
+description = "cmake_parse_arguments(PARSE_ARGV ...) with empty and semicolon arguments under CMP0174."
+skip_reason = "Pending call-level replay and CMP0174 tracking (HB.2)."
+expect_executed = ["leaf/CMakeLists.txt"]
+expect_replayed = ["control/CMakeLists.txt"]
+expect_executed_calls = ["parse_empty"]
+
+[trap.files]
+"CMakeLists.txt" = """\
+cmake_minimum_required(VERSION 4.5)
+project(TrapParseArgvEmpty C)
+add_subdirectory(control)
+add_subdirectory(leaf)
+"""
+"control/CMakeLists.txt" = "add_library(control STATIC control.c)\n"
+"control/control.c" = "int control_fn(void) { return 0; }\n"
+"leaf/CMakeLists.txt" = """\
+function(parse_empty tgt)
+  cmake_policy(PUSH)
+  cmake_policy(SET CMP0174 NEW)
+  cmake_parse_arguments(PARSE_ARGV 1 P "" "KEY" "MULTI")
+  cmake_policy(POP)
+  if(DEFINED P_KEY)
+    set(_k "defined")
+  else()
+    set(_k "undefined")
+  endif()
+  list(LENGTH P_MULTI _mlen)
+  target_compile_definitions(${tgt} PRIVATE "KEY_STATE=${_k}" "MULTI_LEN=${_mlen}")
+endfunction()
+add_library(leaf STATIC leaf.c)
+parse_empty(leaf KEY "" MULTI "a;b" "")
+"""
+"leaf/leaf.c" = "int leaf_fn(void) { return 1; }\n"
+
+[[trap.mutate.replace]]
+path = "leaf/CMakeLists.txt"
+old = "cmake_policy(SET CMP0174 NEW)"
+new = "cmake_policy(SET CMP0174 OLD)"
+
+[trap.expect_build_contains]
+"build.ninja" = ["KEY_STATE=undefined"]
+
+
+[[trap]]
+id = "T25"
+name = "defer"
+stage = "HB.3"
+description = "cmake_language(DEFER CALL ...) inside a call; call must stay opaque and never replay."
+skip_reason = "Pending call-level replay opacity enforcement and executed_calls receipts (HB.3)."
+expect_executed = ["leaf/CMakeLists.txt"]
+expect_replayed = ["control/CMakeLists.txt"]
+expect_executed_calls = ["schedule_defer", "deferred_apply"]
+expect_not_replayed_calls = ["schedule_defer"]
+
+[trap.files]
+"CMakeLists.txt" = """\
+cmake_minimum_required(VERSION 4.5)
+project(TrapDefer C)
+add_subdirectory(control)
+add_subdirectory(leaf)
+"""
+"control/CMakeLists.txt" = "add_library(control STATIC control.c)\n"
+"control/control.c" = "int control_fn(void) { return 0; }\n"
+"leaf/CMakeLists.txt" = """\
+function(deferred_apply tgt)
+  target_compile_definitions(${tgt} PRIVATE DEFERRED_RAN=1)
+endfunction()
+function(schedule_defer tgt)
+  cmake_language(DEFER CALL deferred_apply ${tgt})
+endfunction()
+add_library(leaf STATIC leaf.c)
+schedule_defer(leaf)
+"""
+"leaf/leaf.c" = "int leaf_fn(void) { return 1; }\n"
+
+[trap.mutate]
+
+[trap.expect_build_contains]
+"build.ninja" = ["DEFERRED_RAN=1"]
