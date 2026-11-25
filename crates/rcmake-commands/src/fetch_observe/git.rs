@@ -9,7 +9,9 @@ use std::{
 use rcmake_base::BString;
 use rcmake_eval::{CmdError, Cx, FetchLockMode};
 use rcmake_fetch::{GitClone, GitEntry, GitMirror, LockEntry};
-use rcmake_host::{CommandSpec, Follow, ProcessResult, RunOutput, RunRequest, path::to_native};
+use rcmake_host::{
+    CommandSpec, Follow, Host, ProcessResult, RunOutput, RunRequest, path::to_native,
+};
 
 use super::runtime::{Population, Runtime, Script, blocked, lock_mutex, required, runtime, stop};
 use super::{BlockReason, DeclaredSource, GitTransfer, portable_source, relative_repo};
@@ -574,9 +576,9 @@ fn local_directory_copy(
 }
 
 fn bundled_executable(cx: &Cx<'_>, command: &CommandSpec) -> bool {
-    cx.host()
-        .current_exe()
-        .is_ok_and(|exe| same_file(cx, &exe, &to_native(&command.program)))
+    let host = cx.host();
+    host.current_exe()
+        .is_ok_and(|exe| same_file(host, &exe, &to_native(&command.program)))
 }
 
 fn cache_root(cx: &Cx<'_>, runtime: &Runtime) -> PathBuf {
@@ -587,6 +589,36 @@ fn cache_root(cx: &Cx<'_>, runtime: &Runtime) -> PathBuf {
     }
 }
 
-fn same_file(cx: &Cx<'_>, left: &Path, right: &Path) -> bool {
-    left == right || cx.host().canonicalize(right).is_ok_and(|path| path == left)
+fn same_file(host: &dyn Host, left: &Path, right: &Path) -> bool {
+    if left == right {
+        return true;
+    }
+    let (Ok(left), Ok(right)) = (host.canonicalize(left), host.canonicalize(right)) else {
+        return false;
+    };
+    left == right
+}
+
+#[cfg(test)]
+mod tests {
+    use rcmake_host::{HostResult, PureHost};
+
+    use super::*;
+
+    #[test]
+    fn matches_the_running_executable_through_a_path_alias() -> HostResult<()> {
+        let root = Path::new(if cfg!(windows) { "C:/work" } else { "/work" });
+        let executable = root.join("real/rcmake");
+        let other = root.join("real/other");
+        let alias = root.join("alias");
+        let host = PureHost::new(root.into(), alias.join("rcmake"));
+        host.seed_file(&executable, b"rcmake")?;
+        host.seed_file(&other, b"other")?;
+        host.symlink(&root.join("real"), &alias)?;
+
+        let invoked = host.current_exe()?;
+        assert!(same_file(&host, &invoked, &executable));
+        assert!(!same_file(&host, &invoked, &other));
+        Ok(())
+    }
 }
